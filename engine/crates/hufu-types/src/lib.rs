@@ -184,6 +184,9 @@ pub struct SessionState {
     pub page: usize,
     /// 总页数
     pub page_count: usize,
+    /// ↑↓ 高亮候选（当前页内 0 起；默认 0=首选）
+    #[serde(default)]
+    pub selected: usize,
     /// 辅助提示（反查提示〔拼音〕、命令帮助、错误提示等）
     #[serde(default)]
     pub aux: String,

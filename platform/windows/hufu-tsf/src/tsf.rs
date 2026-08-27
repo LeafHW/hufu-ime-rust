@@ -620,6 +620,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 .collect()
         })
         .unwrap_or_default();
+    let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     trace(&format!("cands={} raw='{}' cand2={} dead={}", cands.len(), raw, g.cand2.is_some(), g.cand2_dead));
 
     g.load_skin();
@@ -641,7 +642,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let skin = g.skin.clone();
         let caret = g.caret;
         match g.cand2.as_mut() {
-            Some(c) => c.show(&cands, &raw, &skin, caret.as_ref()),
+            Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
             None => {}
         }
         if g.cand2_dead {
@@ -649,7 +650,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 g.cand = Some(CandidateWindow::new());
             }
             if let Some(c) = g.cand.as_ref() {
-                c.show(&cands, &raw, &g.skin, caret.as_ref());
+                c.show(&cands, &raw, &g.skin, caret.as_ref(), sel);
             }
         }
     } else {
@@ -658,7 +659,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         let caret = g.caret;
         if let Some(c) = g.cand.as_ref() {
-            c.show(&cands, &raw, &g.skin, caret.as_ref());
+            c.show(&cands, &raw, &g.skin, caret.as_ref(), sel);
         }
     }
     Ok(())

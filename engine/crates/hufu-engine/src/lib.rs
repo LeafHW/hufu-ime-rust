@@ -472,14 +472,9 @@ impl Engine {
                     self.on_page(session, 1)
                 }
             }
-            KeyCode::Up => {
-                if session.raw.is_empty() {
-                    KeyOutcome::passthrough()
-                } else {
-                    self.on_page(session, -1)
-                }
-            }
-            KeyCode::Down | KeyCode::PageDown => {
+            KeyCode::Up => self.on_updown(session, -1),
+            KeyCode::Down => self.on_updown(session, 1),
+            KeyCode::PageDown => {
                 if session.raw.is_empty() {
                     KeyOutcome::passthrough()
                 } else {
@@ -1002,10 +997,13 @@ impl Engine {
         }
     }
 
-    /// 空格首选 / 空码处理。
+    /// 空格首选 / 空码处理（↑↓ 移动过则上屏高亮项）。
     fn select_first(&mut self, session: &mut Session) -> KeyOutcome {
         if !session.candidates.is_empty() {
-            return self.select_candidate(session, 0);
+            let idx = session
+                .selected
+                .min(session.candidates.len().saturating_sub(1));
+            return self.select_candidate_abs(session, idx);
         }
         // 空码：大写混合输入直接上屏原串，否则清屏
         if session.raw.chars().any(|c| c.is_ascii_uppercase()) {
@@ -1021,7 +1019,12 @@ impl Engine {
     fn select_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
-        let pick = session.candidates.get(start + idx).cloned();
+        self.select_candidate_abs(session, start + idx)
+    }
+
+    /// 选绝对下标候选。
+    fn select_candidate_abs(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+        let pick = session.candidates.get(idx).cloned();
         if let Some(cand) = pick {
             self.sound_hint = Some("select");
             self.learn(&cand);
@@ -1029,6 +1032,36 @@ impl Engine {
             session.clear();
             return KeyOutcome::commit(text, self.state(session));
         }
+        KeyOutcome::consumed(self.state(session))
+    }
+
+    /// ↑↓ 高亮移动（Rime 悬浮窗选重）：逐候选移动、跨页跟随；浏览即暂停提前上屏。
+    fn on_updown(&mut self, session: &mut Session, dir: i32) -> KeyOutcome {
+        if session.raw.is_empty() {
+            return KeyOutcome::passthrough();
+        }
+        // 组句中即使无候选也吞键，避免方向键落入应用移动光标
+        if session.candidates.is_empty() {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        // 方向键浏览 = 暂停提前上屏直至整句结束（Rime 语义）
+        session.early_suspended = true;
+        session.early_history.clear();
+        let len = session.candidates.len();
+        let cur = session.selected.min(len - 1);
+        let next = if dir < 0 {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(len - 1)
+        };
+        if next == cur {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        session.selected = next;
+        // 跨页跟随高亮
+        let page_size = self.config.candidates.page_size.max(1);
+        session.page = next / page_size;
+        self.sound_hint = Some("page");
         KeyOutcome::consumed(self.state(session))
     }
 
@@ -1268,6 +1301,7 @@ impl Engine {
     fn refresh_candidates(&mut self, session: &mut Session) {
         session.candidates.clear();
         session.page = 0;
+        session.selected = 0;
         if session.raw.is_empty() {
             return;
         }
@@ -1550,6 +1584,12 @@ impl Engine {
             candidates: session.candidates[start..end].to_vec(),
             page: session.page,
             page_count: pages,
+            // 高亮（页内下标）：↑↓ 已同步页码，越界兜底 0
+            selected: if session.selected >= start && session.selected < end {
+                session.selected - start
+            } else {
+                0
+            },
             aux: match session.mode {
                 InputMode::Reverse => "〔反查〕".into(),
                 InputMode::Command => "〔命令〕".into(),

@@ -70,8 +70,8 @@ impl CandidateWindow {
         }
     }
 
-    /// 渲染并显示。anchor=插入点屏幕矩形（无则居中下 1/3）。
-    pub fn show(&self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>) {
+    /// 渲染并显示。anchor=插入点屏幕矩形（无则居中下 1/3）。selected=高亮行（页内 0 起）。
+    pub fn show(&self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>, selected: usize) {
         unsafe {
             let back = color_of(skin, "back_color", [32, 32, 34, 0xE6]);
             let border = color_of(skin, "border_color", [255, 255, 255, 0x26]);
@@ -165,9 +165,10 @@ impl CandidateWindow {
             out(memdc, raw, 12, 6);
 
             // 候选行
+            let sel = selected.min(cands.len().saturating_sub(1));
             for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
                 let y = 6 + line_h * (i as i32 + 1);
-                if i == 0 {
+                if i == sel {
                     let hbr = CreateSolidBrush(argb(hi_back));
                     FillRect(
                         memdc,

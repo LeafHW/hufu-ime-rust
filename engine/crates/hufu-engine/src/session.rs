@@ -23,6 +23,8 @@ pub struct Session {
     pub raw: String,
     /// 当前候选页
     pub page: usize,
+    /// ↑↓ 高亮候选（绝对下标；每次重刷归 0）
+    pub selected: usize,
     /// 输入模式
     pub mode: InputMode,
     /// 当前完整候选列表
@@ -47,6 +49,7 @@ impl Session {
             chinese,
             raw: String::new(),
             page: 0,
+            selected: 0,
             mode: InputMode::Normal,
             candidates: Vec::new(),
             pair: PairState::default(),
@@ -62,6 +65,7 @@ impl Session {
         self.raw.clear();
         self.candidates.clear();
         self.page = 0;
+        self.selected = 0;
         self.mode = InputMode::Normal;
         self.committed_raw.clear();
         self.committed_text.clear();
