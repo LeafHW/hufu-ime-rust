@@ -414,6 +414,8 @@ pub struct UserSection {
     pub auto_frequency: bool,
     /// 自动记录用户调整日志
     pub log_adjust: bool,
+    /// 允许 Ctrl+Delete 软删候选
+    pub allow_delete_word: bool,
 }
 
 impl Default for UserSection {
@@ -421,6 +423,7 @@ impl Default for UserSection {
         UserSection {
             auto_frequency: true,
             log_adjust: true,
+            allow_delete_word: true,
         }
     }
 }
