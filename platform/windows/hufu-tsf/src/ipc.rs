@@ -16,6 +16,19 @@ unsafe extern "system" {
         template: isize,
     ) -> isize;
     fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+    fn CreateProcessW(
+        app: *const u16,
+        cmd: *mut u16,
+        sa: *const core::ffi::c_void,
+        thread_sa: *const core::ffi::c_void,
+        inherit: i32,
+        flags: u32,
+        env: *const core::ffi::c_void,
+        cwd: *const u16,
+        si: *mut core::ffi::c_void,
+        pi: *mut core::ffi::c_void,
+    ) -> i32;
+    fn CloseHandle(h: isize) -> i32;
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -23,6 +36,72 @@ const GENERIC_WRITE: u32 = 0x4000_0000;
 const OPEN_EXISTING: u32 = 3;
 const INVALID: isize = -1;
 const PIPE: &str = r"\\.\pipe\hufu-ime";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// STARTUPINFOW + PROCESS_INFORMATION 原始布局（CreateProcessW 用）。
+#[repr(C)]
+#[allow(dead_code)]
+struct SpawnBlock {
+    si_cb: u32,
+    si_rest: [u64; 10], // reserved..std_error 全零即可
+    pi: [isize; 4],     // hProcess/hThread/pid/tid
+}
+
+/// 自愈：server 不在（管道打不开且无实例等待）时拉起 hufu-server.exe。
+/// 每进程只试一次，防拉起风暴。
+fn ensure_server() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // 候选：宿主 exe 同目录（安装态）→ 工程绝对路径（开发态）
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let candidates = [
+        format!("{exe_dir}\\hufu-server.exe"),
+        r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string(),
+    ];
+    for exe in candidates {
+        if !std::path::Path::new(&exe).exists() {
+            continue;
+        }
+        let wexe: Vec<u16> = exe.encode_utf16().chain([0]).collect();
+        let mut cmd: Vec<u16> = format!("\"{exe}\" --data E:\\DSH-KF\\hufu\\hufu-data")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut blk = SpawnBlock {
+            si_cb: 104, // sizeof(STARTUPINFOW)
+            si_rest: [0; 10],
+            pi: [0; 4],
+        };
+        let ok = unsafe {
+            CreateProcessW(
+                wexe.as_ptr(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_NO_WINDOW,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut blk as *mut _ as *mut core::ffi::c_void,
+                &mut blk.pi as *mut _ as *mut core::ffi::c_void,
+            )
+        };
+        if ok != 0 {
+            unsafe {
+                CloseHandle(blk.pi[0]);
+                CloseHandle(blk.pi[1]);
+            }
+            crate::tsf::trace("ipc: 已自愈拉起 hufu-server");
+            return;
+        }
+    }
+}
 
 /// 单次请求（每次新建连接；本地管道往返 <100µs）。
 pub fn call(req: &Value) -> Option<Value> {
@@ -30,6 +109,7 @@ pub fn call(req: &Value) -> Option<Value> {
         let name: Vec<u16> = PIPE.encode_utf16().chain([0]).collect();
         let mut h;
         let mut tries = 0;
+        let mut spawned = false;
         loop {
             h = CreateFileW(
                 name.as_ptr(),
@@ -43,8 +123,12 @@ pub fn call(req: &Value) -> Option<Value> {
             if h != INVALID {
                 break;
             }
-            // 管道忙碌：等待后重试
-            if WaitNamedPipeW(name.as_ptr(), 500) == 0 || tries >= 3 {
+            // 打不开：server 不在则拉起，再等管道就绪
+            if !spawned {
+                spawned = true;
+                ensure_server();
+            }
+            if WaitNamedPipeW(name.as_ptr(), 1500) == 0 || tries >= 5 {
                 return None;
             }
             tries += 1;
