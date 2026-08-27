@@ -238,6 +238,28 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
             Response::json(&serde_json::json!({"ok": true}))
         }
+        ("POST", "/api/candidate/pin") => {
+            let v = req.json();
+            let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if code.is_empty() || text.is_empty() {
+                return Response::err(400, "编码与词不能为空");
+            }
+            host.engine.adjust_pin(&code, &text);
+            host.session.clear();
+            Response::json(&serde_json::json!({"ok": true}))
+        }
+        ("POST", "/api/candidate/hide") => {
+            let v = req.json();
+            let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if code.is_empty() || text.is_empty() {
+                return Response::err(400, "编码与词不能为空");
+            }
+            host.engine.adjust_hide(&code, &text);
+            host.session.clear();
+            Response::json(&serde_json::json!({"ok": true}))
+        }
         ("POST", "/api/schema") => {
             let name = req
                 .json()

@@ -317,8 +317,17 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="u-af"><label for="u-af">选词自动调频</label></div>
       <div class="checkline"><input type="checkbox" id="u-la"><label for="u-la">记录调整日志</label></div>
     </div>
-    <table><thead><tr><th style="width:160px">编码</th><th>词</th><th style="width:90px"></th></tr></thead>
+    <table><thead><tr><th style="width:160px">编码</th><th>词</th><th style="width:210px">操作</th></tr></thead>
     <tbody id="uw-list"></tbody></table>
+    <div class="row" style="margin-top:14px">
+      <div class="sub" style="margin:0">任意候选调整（不必是用户词）：输入码与词，置顶=候选首位、隐藏=软删（Ctrl+Delete / Ctrl+Shift+数字 也可在打字时操作）。</div>
+    </div>
+    <div class="row">
+      <div class="field"><label>编码</label><input type="text" id="adj-code" style="width:130px"></div>
+      <div class="field"><label>词</label><input type="text" id="adj-text" style="width:130px"></div>
+      <button id="adj-pin" class="primary">置顶</button>
+      <button id="adj-hide">隐藏</button>
+    </div>
   </section>
 
   <!-- ════ 导入导出 ════ -->
@@ -560,15 +569,33 @@ async function loadSkin(id) {
 
 /* ── 用户词 ── */
 $("#uw-list").addEventListener("click", async ev => {
-  const b = ev.target.closest("button[data-code]"); if (!b) return;
-  try { await api("POST", "/api/user_word/remove", { code: b.dataset.code, text: b.dataset.text }); await loadUserWords(); msg("已删除", "ok"); }
-  catch (e) { msg(e.message, "err"); }
+  const b = ev.target.closest("button[data-act]"); if (!b) return;
+  const { act, code, text } = b.dataset;
+  try {
+    if (act === "del") await api("POST", "/api/user_word/remove", { code, text });
+    else await api("POST", `/api/candidate/${act}`, { code, text });
+    await loadUserWords(); msg(act === "del" ? "已删除" : act === "pin" ? "已置顶" : "已隐藏", "ok");
+  } catch (e) { msg(e.message, "err"); }
 });
 
 async function loadUserWords() {
   const r = await api("GET", "/api/user_words");
-  $("#uw-list").innerHTML = (r.words || []).map(w => `<tr><td>${esc(w.code)}</td><td>${esc(w.text)}</td><td><button class="danger" data-code="${esc(w.code)}" data-text="${esc(w.text)}">删除</button></td></tr>`).join("") || '<tr><td colspan="3" class="hint">暂无用户词</td></tr>';
+  $("#uw-list").innerHTML = (r.words || []).map(w => `<tr><td>${esc(w.code)}</td><td>${esc(w.text)}</td><td>
+    <button data-act="pin" data-code="${esc(w.code)}" data-text="${esc(w.text)}">置顶</button>
+    <button data-act="hide" data-code="${esc(w.code)}" data-text="${esc(w.text)}">隐藏</button>
+    <button class="danger" data-act="del" data-code="${esc(w.code)}" data-text="${esc(w.text)}">删除</button>
+  </td></tr>`).join("") || '<tr><td colspan="3" class="hint">暂无用户词</td></tr>';
 }
+
+/* 任意候选调整 */
+async function adjCall(op) {
+  const code = $("#adj-code").value.trim(), text = $("#adj-text").value.trim();
+  if (!code || !text) { msg("编码与词不能为空", "err"); return; }
+  try { await api("POST", `/api/candidate/${op}`, { code, text }); msg(op === "pin" ? "已置顶" : "已隐藏", "ok"); }
+  catch (e) { msg(e.message, "err"); }
+}
+$("#adj-pin").onclick = () => adjCall("pin");
+$("#adj-hide").onclick = () => adjCall("hide");
 
 /* ── 初始化 ── */
 document.querySelectorAll("nav a").forEach(a => a.onclick = () => {

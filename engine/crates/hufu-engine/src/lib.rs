@@ -3,6 +3,7 @@
 //! 状态机：按键 →（切换键 / 标点 / 反查 / 命令 / 编码追加与顶功 /
 //! 候选生成 / 选重翻页）→ KeyOutcome。
 
+pub mod dynamic;
 pub mod punct;
 pub mod session;
 
@@ -141,6 +142,17 @@ impl Engine {
                         }
                     }
                 }
+                // Ctrl+Shift+数字：置顶当前页第 N 候选
+                if m.shift {
+                    if let Some(n) = c.to_digit(10) {
+                        let idx = if n == 0 { 9 } else { (n - 1) as usize };
+                        return self.op_pin_candidate(session, idx);
+                    }
+                }
+            }
+            // Ctrl+Delete：软删当前页首选
+            if key.key == KeyCode::Delete && self.config.user.allow_delete_word {
+                return self.op_hide_candidate(session, 0);
             }
             return KeyOutcome::passthrough();
         }
@@ -641,18 +653,72 @@ impl Engine {
         }
     }
 
-    /// `\` 命令模式：动态变量与工具命令。
+    /// `\` 命令模式：动态变量（含 \n数字 → 中文）与工具命令。
     fn on_command_char(&mut self, session: &mut Session, c: char) -> KeyOutcome {
         if c == ' ' || c == '\\' {
             return self.select_first(session);
         }
-        if c.is_ascii_lowercase() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'N';
+        if ok && session.raw.chars().count() < 18 {
             session.raw.push(c);
             self.refresh_candidates(session);
             return KeyOutcome::consumed(self.state(session));
         }
         session.clear();
         KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 置顶当前页第 idx 候选（Ctrl+Shift+N / 设置界面）。持久化到用户调整日志。
+    pub fn op_pin_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+        let page_size = self.config.candidates.page_size.max(1);
+        let start = session.page * page_size;
+        let pick = session.candidates.get(start + idx).cloned();
+        let Some(cand) = pick else {
+            return KeyOutcome::consumed(self.state(session));
+        };
+        self.adjust_pin(&cand.code, &cand.text);
+        let keep_raw = session.raw.clone();
+        session.clear();
+        session.raw = keep_raw;
+        self.refresh_candidates(session);
+        KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 软删当前页第 idx 候选（Ctrl+Delete / 设置界面）。
+    pub fn op_hide_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+        let page_size = self.config.candidates.page_size.max(1);
+        let start = session.page * page_size;
+        let pick = session.candidates.get(start + idx).cloned();
+        let Some(cand) = pick else {
+            return KeyOutcome::consumed(self.state(session));
+        };
+        self.adjust_hide(&cand.code, &cand.text);
+        let keep_raw = session.raw.clone();
+        session.clear();
+        session.raw = keep_raw;
+        self.refresh_candidates(session);
+        KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 按 code+word 置顶（内存 + 追加日志）。
+    pub fn adjust_pin(&mut self, code: &str, word: &str) {
+        self.schema.adjust.pin(code, word);
+        self.append_adjust_log("{置顶}", code, word);
+    }
+
+    /// 按 code+word 软删（内存 + 追加日志）。
+    pub fn adjust_hide(&mut self, code: &str, word: &str) {
+        self.schema.adjust.remove(code, word);
+        self.append_adjust_log("{删除}", code, word);
+    }
+
+    /// 追加一行到 用户调整.txt。
+    fn append_adjust_log(&self, op: &str, code: &str, word: &str) {
+        use std::io::Write;
+        let path = self.schema.dir.join("用户调整.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{op}{code}\t{word}");
+        }
     }
 
     /// 用户学习：自动调频。
@@ -726,23 +792,46 @@ impl Engine {
         }
     }
 
-    /// 命令命名空间候选（\date \time \week \calc …）。
+    /// 命令命名空间候选：动态变量（真实值）与工具命令。
     fn command_candidates(&self, raw: &str) -> Vec<Candidate> {
-        let commands: &[(&str, &str)] = &[
-            ("date", "{日期}"),
-            ("time", "{时分}"),
-            ("week", "{星期}"),
-            ("calc", "{计算器}"),
-            ("n", "{数字转中文}"),
-            ("addword", "{加词}"),
-            ("export", "{导出码表}"),
-        ];
         let name = raw.trim_start_matches('\\');
-        commands
-            .iter()
-            .filter(|(k, _)| k.starts_with(name))
-            .map(|(k, v)| Candidate::new(*v, format!("\\{k}"), CandidateKind::Command))
-            .collect()
+        let mut out = Vec::new();
+
+        // \n<数字> → 中文数字（小写）；\N<数字> → 大写
+        if let Some(num) = name.strip_prefix('n').or_else(|| name.strip_prefix('N')) {
+            if let Some(cn) = dynamic::number_to_chinese(num, name.starts_with('N')) {
+                out.push(Candidate::new(
+                    cn,
+                    format!("\\{name}"),
+                    CandidateKind::Command,
+                ));
+            }
+        }
+
+        let commands: Vec<(&str, String)> = vec![
+            ("date", dynamic::date_string()),
+            ("date2", dynamic::date_string_iso()),
+            ("time", dynamic::time_string()),
+            ("time2", dynamic::time_short()),
+            ("week", dynamic::week_string()),
+        ];
+        for (k, v) in &commands {
+            if k.starts_with(name) {
+                out.push(Candidate::new(v.clone(), format!("\\{k}"), CandidateKind::Command));
+            }
+        }
+        // 前端工具命令（占位，由宿主展开）
+        let tools = ["calc", "addword", "export"];
+        for k in tools {
+            if k.starts_with(name) {
+                out.push(Candidate::new(
+                    format!("{{{k}}}"),
+                    format!("\\{k}"),
+                    CandidateKind::Command,
+                ));
+            }
+        }
+        out
     }
 
     /// 反查候选（反查表 + 主码注释）。
@@ -828,5 +917,133 @@ impl Engine {
             ascii_punct: self.config.input.ascii_punct,
             reverse_mode: session.mode == InputMode::Reverse,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hufu_types::Modifiers;
+
+    fn key(c: char) -> KeyInput {
+        KeyInput {
+            key: KeyCode::Char(c),
+            modifiers: Modifiers::default(),
+            is_press: true,
+        }
+    }
+
+    fn ctrl_shift(c: char) -> KeyInput {
+        KeyInput {
+            key: KeyCode::Char(c),
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+            is_press: true,
+        }
+    }
+
+    fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-dyn-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\naa\t阿\njd\t就\njd\t到的\njd\t加\n",
+        )
+        .unwrap();
+        let cfg = hufu_config::Config::default();
+        let eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        (eng, dir)
+    }
+
+    #[test]
+    fn dynamic_date_week() {
+        let (mut eng, _dir) = test_engine("date");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('\\'));
+        eng.process_key(&mut s, key('d'));
+        let _ = eng.process_key(&mut s, key('a'));
+        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t.contains('年') && t.contains('月')), "{texts:?}");
+        // 星期
+        let (mut eng2, _d2) = test_engine("week");
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('\\'));
+        eng2.process_key(&mut s2, key('w'));
+        let _ = eng2.process_key(&mut s2, key('e'));
+        let snap = eng2.state(&s2);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t.starts_with("星期")), "{texts:?}");
+    }
+
+    #[test]
+    fn dynamic_number() {
+        let (mut eng, _dir) = test_engine("num");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('\\'));
+        for c in "n12345".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == &"一万二千三百四十五".to_string()), "{texts:?}");
+        // 上屏
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.unwrap(), "一万二千三百四十五");
+
+        // 大写
+        let (mut eng2, _d2) = test_engine("num2");
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('\\'));
+        for c in "N1234".chars() {
+            eng2.process_key(&mut s2, key(c));
+        }
+        let snap = eng2.state(&s2); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == &"壹仟贰佰叁拾肆".to_string()), "{texts:?}");
+    }
+
+    #[test]
+    fn pin_and_hide_via_keys() {
+        let (mut eng, _dir) = test_engine("pin");
+        let mut s = Session::new(true);
+        // jd → 就/到的/加；Ctrl+Shift+2 置顶第 2 个（到的）
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let st = eng.state(&s);
+        assert_eq!(st.candidates[0].text, "就");
+
+        let _ = eng.process_key(&mut s, ctrl_shift('2'));
+        let st = eng.state(&s);
+        assert_eq!(st.candidates[0].text, "到的", "置顶后『到的』应在首位");
+
+        // 日志落盘 + 回放等价
+        let dir = eng.schema.dir.clone();
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        assert!(log.contains("{置顶}jd\t到的"), "{log}");
+        let adj = hufu_dict::user::UserAdjust::parse(
+            &log.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        let base = eng.schema.dict.lookup("jd").into_iter().cloned().collect::<Vec<_>>();
+        let out = adj.apply("jd", &base);
+        assert_eq!(out[0].text, "到的");
+
+        // Ctrl+Delete 软删首选（到的）→ 首选回到 就
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let del = KeyInput {
+            key: KeyCode::Delete,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            is_press: true,
+        };
+        let _ = eng.process_key(&mut s3, del);
+        let st = eng.state(&s3);
+        assert_eq!(st.candidates[0].text, "就", "软删后『就』应回到首位");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
