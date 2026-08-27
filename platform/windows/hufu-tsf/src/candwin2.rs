@@ -509,18 +509,18 @@ impl CandidateWindowV2 {
             _ => apply_accent(self.hwnd, ACCENT_DISABLED, tint),
         }
 
-        // 定位：优先插入点上方（输入法惯例），出屏翻到下方；无 anchor 屏幕下 1/3 居中
+        // 定位：优先插入点下方，出屏翻到上方；无 anchor 屏幕下 1/3 居中
         unsafe {
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let sh = GetSystemMetrics(SM_CYSCREEN);
             let (x, y) = match anchor {
                 Some(r) => {
                     let x = (r.left).clamp(0, (sw - width as i32).max(0));
-                    let above = r.top - height as i32 - 4;
-                    if above >= 0 {
-                        (x, above)
+                    let below = r.bottom + 4;
+                    if below + height as i32 <= sh {
+                        (x, below)
                     } else {
-                        (x, (r.bottom + 4).min((sh - height as i32).max(0)))
+                        (x, (r.top - height as i32 - 4).max(0))
                     }
                 }
                 None => ((sw - width as i32) / 2, sh * 2 / 3),
