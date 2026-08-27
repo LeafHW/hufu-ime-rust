@@ -127,8 +127,9 @@ fn main() {
             let cat: windows::core::Result<ITfCategoryMgr> =
                 CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER);
             if let Ok(cat) = &cat {
+                // 真正的 TFCAT_TIP_KEYBOARD 是 34745C63（此前误用 533C5E0E）
                 const TFCAT_TIP_KEYBOARD: GUID =
-                    GUID::from_u128(0x533c5e0e_5ac0_4abd_b6f1_251b82b7be7d);
+                    GUID::from_u128(0x34745c63_b2f0_4784_8b67_5e12c8701a31);
                 let r = unsafe { cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU) };
                 println!("    ITfCategoryMgr::RegisterCategory → {r:?}");
             }
