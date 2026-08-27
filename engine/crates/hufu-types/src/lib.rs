@@ -198,6 +198,9 @@ pub struct SessionState {
     /// 是否处于反查模式
     #[serde(default)]
     pub reverse_mode: bool,
+    /// 候选窗是否显示编码行（TigerClaw「候选窗显示编码」）
+    #[serde(default = "default_true")]
+    pub show_code: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

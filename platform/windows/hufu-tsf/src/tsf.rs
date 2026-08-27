@@ -564,7 +564,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 
     // 候选窗（v2 优先，初始化失败回退 v1）
     let mut g = shared.lock().unwrap();
-    let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let show_code = state.get("show_code").and_then(|v| v.as_bool()).unwrap_or(true);
+    let raw_state = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // 编码行内容：显示编码→raw；关闭时仅在反查/命令等辅助提示下保留一行
+    let raw = if show_code { raw_state.clone() } else { aux.clone() };
     let cands: Vec<(String, String)> = state
         .get("candidates")
         .and_then(|v| v.as_array())
