@@ -1,0 +1,11 @@
+[package]
+name = "hufu-dict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hufu-types = { path = "../hufu-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+encoding_rs = { workspace = true }

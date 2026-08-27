@@ -1,0 +1,12 @@
+[package]
+name = "hufu-sentence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hufu-types = { path = "../hufu-types" }
+hufu-dict = { path = "../hufu-dict" }
+hufu-config = { path = "../hufu-config" }
+hufu-engine = { path = "../hufu-engine" }
+serde = { workspace = true }

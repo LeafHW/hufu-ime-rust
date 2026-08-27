@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hufu-types",
+    "crates/hufu-dict",
+    "crates/hufu-engine",
+    "crates/hufu-sentence",
+    "crates/hufu-config",
+    "crates/hufu-skin",
+    "crates/hufu-server",
+    "crates/hufu-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
