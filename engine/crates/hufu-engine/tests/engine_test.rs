@@ -120,11 +120,11 @@ fn full_code_push_on_fifth() {
 #[test]
 fn quick_symbol_auto_commit() {
     let (mut engine, mut session, _dir) = setup();
+    // 快符与 ; 引导共存：;a 仍是快符 ！（有符号延续），
+    // 无延续的字符（如 ;j 若无映射）才打断回正常编码
     engine.process_key(&mut session, key(';'));
-    // 其他字符打断「;」引导：回到正常编码路径
     let out = engine.process_key(&mut session, key('a'));
-    assert!(out.commit.is_none());
-    assert_eq!(out.state.unwrap().raw, "a");
+    assert_eq!(out.commit.as_deref(), Some("！"));
 }
 
 #[test]

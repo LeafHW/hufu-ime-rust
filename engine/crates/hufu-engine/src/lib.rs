@@ -577,10 +577,12 @@ impl Engine {
             session.clear();
             return KeyOutcome::commit("；".to_string(), self.state(session));
         }
-        // 其他字符打断「;」引导：清缓冲重入（空格留给首选上屏）
+        // 其他字符：有快符/符号延续（;x…）则继续组快符，
+        // 无延续才打断「;」引导清缓冲重入（空格留给首选上屏）
         if session.raw == ";"
             && self.config.input.semicolon_guide
             && c != ' '
+            && !self.has_continuation_prefix(&format!(";{c}"))
         {
             session.clear();
             return self.on_char(session, c, shift);
