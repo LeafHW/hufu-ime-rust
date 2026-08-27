@@ -468,32 +468,36 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
 }
 
 /// 组段内文本的屏幕矩形（插入点跟随）。
-fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {    g.caret = None;
-    let Some(comp) = g.composition.clone() else { return };
-    let Ok(range) = (unsafe { comp.GetRange() }) else { return };
-    let Ok(view) = (unsafe { ctx.GetActiveView() }) else { return };
+fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    g.caret = None;
+    let Some(comp) = g.composition.clone() else {
+        trace("qc: 无组段");
+        return;
+    };
+    let Ok(range) = (unsafe { comp.GetRange() }) else {
+        trace("qc: GetRange 失败");
+        return;
+    };
+    let Ok(view) = (unsafe { ctx.GetActiveView() }) else {
+        trace("qc: GetActiveView 失败");
+        return;
+    };
     let mut rect = RECT::default();
     let mut clipped = BOOL(0);
-    if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_err() {
-        return;
+    match unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) } {
+        Ok(()) => {}
+        Err(e) => {
+            trace(&format!("qc: GetTextExt err 0x{:08X}", e.code().0 as u32));
+            return;
+        }
     }
-    // 客户区 → 屏幕坐标
-    let Ok(hwnd) = (unsafe { view.GetWnd() }) else { return };
-    if hwnd.0.is_null() {
-        return;
-    }
-    let mut pts = [
-        POINT { x: rect.left, y: rect.top },
-        POINT { x: rect.right, y: rect.bottom },
-    ];
-    unsafe {
-        MapWindowPoints(hwnd, HWND(std::ptr::null_mut()), &mut pts);
-    }
+    // GetTextExt 返回屏幕坐标（MSDN）——不再做客户区→屏幕转换
+    trace(&format!("qc: raw=({},{},{},{})", rect.left, rect.top, rect.right, rect.bottom));
     g.caret = Some(RECT {
-        left: pts[0].x,
-        top: pts[0].y,
-        right: pts[1].x,
-        bottom: pts[1].y,
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
     });
 }
 
