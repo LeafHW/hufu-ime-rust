@@ -1,0 +1,12 @@
+[package]
+name = "hufu-rerank"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gemm = "0.19"
+rayon = "1"
+
+[[bin]]
+name = "rerank-bench"
+path = "src/bin/bench.rs"
