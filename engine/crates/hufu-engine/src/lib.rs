@@ -38,6 +38,10 @@ pub struct Engine {
     sentence: Option<Arc<dyn SentenceDecoder>>,
     /// 单次按键内的提示音标签提示（select/page 覆盖默认 key/commit）
     sound_hint: Option<&'static str>,
+    /// OpenCC 转换表（opencc.enabled 时懒加载）
+    opencc: Option<hufu_dict::OpenCc>,
+    opencc_emoji: Option<hufu_dict::OpenCc>,
+    opencc_loaded: bool,
 }
 
 impl Engine {
@@ -62,6 +66,9 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             sentence: None,
             sound_hint: None,
+            opencc: None,
+            opencc_emoji: None,
+            opencc_loaded: false,
         })
     }
 
@@ -78,6 +85,9 @@ impl Engine {
             schema,
             sentence: None,
             sound_hint: None,
+            opencc: None,
+            opencc_emoji: None,
+            opencc_loaded: false,
         })
     }
 
@@ -743,6 +753,55 @@ impl Engine {
         }
     }
 
+    /// OpenCC 滤镜：为前若干候选追加繁体/emoji 变体（Rime simplifier 语义）。
+    fn apply_opencc(&mut self, session: &mut Session) {
+        let cfg = self.config.opencc.clone();
+        if !cfg.enabled {
+            return;
+        }
+        if !self.opencc_loaded {
+            let dir = self.data_dir.join("opencc");
+            // 本数据集只有台版单字表 STCharacters_Tu（无标准 STCharacters，缺文件自动跳过）
+            let t = if cfg.to_traditional {
+                hufu_dict::OpenCc::load_dir(
+                    &dir,
+                    &["STPhrases", "STCharacters", "STCharacters_Tu"],
+                )
+            } else {
+                hufu_dict::OpenCc::load_dir(&dir, &["TSPhrases", "TSCharacters"])
+            };
+            self.opencc = if t.is_empty() { None } else { Some(t) };
+            let em = hufu_dict::OpenCc::load_dir_full(&dir, &["emoji"]);
+            self.opencc_emoji = if em.is_empty() { None } else { Some(em) };
+            self.opencc_loaded = true;
+        }
+        let base: Vec<Candidate> = session.candidates.iter().take(3).cloned().collect();
+        for cand in &base {
+            if cfg.to_traditional {
+                if let Some(t) = &self.opencc {
+                    let conv = t.convert(&cand.text);
+                    if conv != cand.text {
+                        let mut c = cand.clone();
+                        c.text = conv;
+                        c.comment = "⚑繁".into();
+                        session.candidates.push(c);
+                    }
+                }
+            }
+            if cfg.emoji {
+                if let Some(em) = &self.opencc_emoji {
+                    let v = em.convert(&cand.text);
+                    if v != cand.text && v.chars().count() > cand.text.chars().count() {
+                        let mut c = cand.clone();
+                        c.text = v;
+                        c.comment = "😊".into();
+                        session.candidates.push(c);
+                    }
+                }
+            }
+        }
+    }
+
     /// 用户学习：自动调频。
     fn learn(&mut self, cand: &Candidate) {
         if self.config.user.auto_frequency {
@@ -783,6 +842,7 @@ impl Engine {
         let entries = self.schema.candidates(&session.raw);
         if !entries.is_empty() {
             session.candidates = entries.iter().map(|e| self.entry_to_candidate(e)).collect();
+            self.apply_opencc(session);
             return;
         }
         // 符号表回退
@@ -1209,6 +1269,50 @@ mod tests {
         // 选中 → 上屏词、编码=构码（learn 入库）
         let o = eng.process_key(&mut s, key(' '));
         assert_eq!(o.commit.unwrap(), "就就");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opencc_variants() {
+        // fixture：ST 词组/单字 + emoji 表
+        let dir = std::env::temp_dir().join(format!("hufu-eng-oc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("opencc")).unwrap();
+        std::fs::write(schema.join("main.txt"), "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n").unwrap();
+        std::fs::write(dir.join("opencc").join("STPhrases.txt"), "后来\t後來\n").unwrap();
+        std::fs::write(dir.join("opencc").join("STCharacters.txt"), "后\t後\n来\t來\n").unwrap();
+        std::fs::write(dir.join("opencc").join("emoji.txt"), "后\t后 👑\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 单字：后 → 後 变体
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('h'));
+        let snap = eng.state(&s);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.contains(&"後".to_string()), "繁体变体: {texts:?}");
+
+        // 词组：后来 → 後來
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('h'));
+        eng.process_key(&mut s2, key('q'));
+        let snap = eng.state(&s2);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.contains(&"後來".to_string()), "词组繁体: {texts:?}");
+
+        // emoji 变体
+        eng.config.opencc.emoji = true;
+        eng.opencc_loaded = false; // 重载表
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('h'));
+        let snap = eng.state(&s3);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t.contains('👑')), "emoji 变体: {texts:?}");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

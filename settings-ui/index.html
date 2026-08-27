@@ -228,6 +228,18 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="snd-test">▶ 试听</button>
     </div>
     <div class="sub">编码 / 选词 / 上屏 / 翻页 四类提示音（数据目录 sounds/ 下可替换 wav：key.wav、select.wav、commit.wav、page.wav）。</div>
+
+    <h3>繁简与 Emoji</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="oc-en"><label for="oc-en">启用 OpenCC 转换</label></div>
+      <div class="field"><label>方向</label>
+        <select id="oc-dir" style="width:130px">
+          <option value="s2t">简 → 繁</option>
+          <option value="t2s">繁 → 简</option>
+        </select></div>
+      <div class="checkline"><input type="checkbox" id="oc-emoji"><label for="oc-emoji">Emoji 注解候选</label></div>
+    </div>
+    <div class="sub">候选前 3 名自动追加繁体变体（⚑繁 标记）与 emoji 变体（😊 标记）。数据目录 opencc/ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
   </section>
 
   <!-- ════ 整句 ════ -->
@@ -408,6 +420,10 @@ function bindInputs() {
   $("#snd-vol-v").textContent = (CFG.sound?.volume ?? 50) + "%";
   $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; };
   $("#snd-test").onclick = () => new Audio("/api/sound?tag=key").play().catch(() => msg("试听失败", "err"));
+  // OpenCC 繁简 / emoji
+  B("#oc-en", "opencc.enabled"); B("#oc-emoji", "opencc.emoji");
+  $("#oc-dir").value = CFG.opencc?.to_traditional === false ? "t2s" : "s2t";
+  $("#oc-dir").onchange = e => { CFG.opencc = CFG.opencc || { enabled: false, to_traditional: true, emoji: false }; CFG.opencc.to_traditional = e.target.value === "s2t"; };
   $("#exp-all").onclick = async () => {
     try {
       const r = await api("GET", "/api/export");

@@ -20,6 +20,7 @@ pub struct Config {
     pub clipboard: ClipboardSection,
     pub appearance: AppearanceSection,
     pub sound: SoundSection,
+    pub opencc: OpenCcSection,
     pub user: UserSection,
 }
 
@@ -36,6 +37,7 @@ impl Default for Config {
             clipboard: ClipboardSection::default(),
             appearance: AppearanceSection::default(),
             sound: SoundSection::default(),
+            opencc: OpenCcSection::default(),
             user: UserSection::default(),
         }
     }
@@ -403,6 +405,27 @@ impl Default for SoundSection {
         SoundSection {
             enabled: false,
             volume: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenCcSection {
+    /// 启用转换（繁体候选追加）
+    pub enabled: bool,
+    /// 简→繁（STCharacters/STPhrases）；false 则繁→简（TS 表）
+    pub to_traditional: bool,
+    /// emoji 注解候选（emoji.txt）
+    pub emoji: bool,
+}
+
+impl Default for OpenCcSection {
+    fn default() -> Self {
+        OpenCcSection {
+            enabled: false,
+            to_traditional: true,
+            emoji: false,
         }
     }
 }

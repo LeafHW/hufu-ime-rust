@@ -12,6 +12,7 @@
 pub mod annotation;
 pub mod dict;
 pub mod entry;
+pub mod opencc;
 pub mod parse;
 pub mod schema;
 pub mod supplement;
@@ -20,4 +21,5 @@ pub mod user;
 
 pub use dict::Dict;
 pub use entry::DictEntry;
+pub use opencc::OpenCc;
 pub use schema::Schema;
