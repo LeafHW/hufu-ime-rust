@@ -1,0 +1,268 @@
+//! 用户数据：用户调整（追加式日志）与用户词库。
+//!
+//! `用户调整.txt`：`{置顶}码\t词`、`{添加}码\t词`、`{删除}码\t词`，
+//! 追加式操作日志，回放得到当前调整态（与虎爪一致）。
+//!
+//! 用户词库（自造词 / Ctrl+= 加词）持久化为 HuFu 原生 TSV，
+//! 同时维护四态（added/hidden/weight/ordered），v1 以「置顶/添加/删除」三操作覆盖。
+
+use crate::dict::Dict;
+use crate::entry::DictEntry;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// 调整操作类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustOp {
+    /// 置顶：把 `码→词` 移到候选首位（重复置顶按时间累积，最新在前）
+    Pin,
+    /// 添加：把词条加入该码候选（不存在则新增）
+    Add,
+    /// 删除：把词条从该码候选中隐藏
+    Remove,
+}
+
+/// 回放后的调整状态。
+#[derive(Debug, Default, Clone)]
+pub struct UserAdjust {
+    /// 置顶日志（时间序）
+    pins: Vec<(String, String)>,
+    adds: Vec<(String, String)>,
+    removes: HashSet<(String, String)>,
+}
+
+impl UserAdjust {
+    pub fn parse(lines: &[String]) -> Self {
+        let mut adj = UserAdjust::default();
+        for line in lines {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            // 兼容 `{置顶}码\t词` 与裸日志格式
+            let (op, rest) = if let Some(r) = t.strip_prefix("{置顶}") {
+                (AdjustOp::Pin, r)
+            } else if let Some(r) = t.strip_prefix("{添加}") {
+                (AdjustOp::Add, r)
+            } else if let Some(r) = t.strip_prefix("{删除}") {
+                (AdjustOp::Remove, r)
+            } else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let code = parts[0].trim().to_string();
+            let word = parts[1].trim().to_string();
+            if code.is_empty() || word.is_empty() {
+                continue;
+            }
+            match op {
+                AdjustOp::Pin => {
+                    adj.pins.push((code, word));
+                }
+                AdjustOp::Add => {
+                    adj.adds.push((code, word));
+                }
+                AdjustOp::Remove => {
+                    adj.removes.insert((code, word));
+                }
+            }
+        }
+        adj
+    }
+
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::parse(&crate::parse::read_lines(path)?))
+    }
+
+    /// 序列化为追加日志文本（可回放）。
+    pub fn to_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (code, word) in &self.pins {
+            out.push(format!("{{置顶}}{code}\t{word}"));
+        }
+        for (code, word) in &self.adds {
+            out.push(format!("{{添加}}{code}\t{word}"));
+        }
+        for (code, word) in &self.removes {
+            out.push(format!("{{删除}}{code}\t{word}"));
+        }
+        out
+    }
+
+    pub fn pin(&mut self, code: &str, word: &str) {
+        self.pins.retain(|(c, w)| !(c == code && w == word));
+        self.pins.push((code.to_string(), word.to_string()));
+        // 置顶隐含取消删除
+        self.removes.remove(&(code.to_string(), word.to_string()));
+    }
+
+    pub fn add(&mut self, code: &str, word: &str) {
+        self.adds.retain(|(c, w)| !(c == code && w == word));
+        self.adds.push((code.to_string(), word.to_string()));
+        self.removes.remove(&(code.to_string(), word.to_string()));
+    }
+
+    pub fn remove(&mut self, code: &str, word: &str) {
+        self.pins.retain(|(c, w)| !(c == code && w == word));
+        self.adds.retain(|(c, w)| !(c == code && w == word));
+        self.removes.insert((code.to_string(), word.to_string()));
+    }
+
+    /// 应用到字典候选列表：返回调整后的条目序列。
+    pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
+        let mut out: Vec<DictEntry> = Vec::new();
+        // 1) 置顶（最新在前）
+        let pinned: Vec<&(String, String)> = self
+            .pins
+            .iter()
+            .filter(|(c, _)| c == code)
+            .collect();
+        for (c, w) in pinned.iter().rev() {
+            if let Some(e) = base.iter().find(|e| e.code == *c && e.text == *w) {
+                out.push(e.clone());
+            } else {
+                let mut e = DictEntry::new(c.clone(), w.clone(), u32::MAX);
+                e.pinned = true;
+                out.push(e);
+            }
+        }
+        // 2) 原始候选（跳过已置顶与已删除）
+        for e in base {
+            if self.removes.contains(&(e.code.clone(), e.text.clone())) {
+                continue;
+            }
+            if pinned.iter().any(|(c, w)| *c == e.code && *w == e.text) {
+                continue;
+            }
+            out.push(e.clone());
+        }
+        // 3) 添加（不存在时追加到尾部）
+        for (c, w) in &self.adds {
+            if c != code || self.removes.contains(&(c.clone(), w.clone())) {
+                continue;
+            }
+            if !out.iter().any(|e| e.code == *c && e.text == *w) {
+                out.push(DictEntry::new(c.clone(), w.clone(), u32::MAX - 1));
+            }
+        }
+        out
+    }
+}
+
+/// 用户词库（自造词），HuFu 原生格式持久化。
+#[derive(Debug, Default, Clone)]
+pub struct UserDict {
+    pub entries: Vec<DictEntry>,
+    /// 隐藏的词
+    pub hidden: HashSet<(String, String)>,
+    /// 自定义权重（词 → 权重）
+    pub weights: HashMap<(String, String), f64>,
+}
+
+impl UserDict {
+    pub fn parse(lines: &[String]) -> Self {
+        let t = crate::parse::native::parse(lines);
+        UserDict {
+            entries: t.rows,
+            hidden: HashSet::new(),
+            weights: HashMap::new(),
+        }
+    }
+
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::parse(&crate::parse::read_lines(path)?))
+    }
+
+    pub fn to_lines(&self) -> Vec<String> {
+        let mut out = vec!["#hufu-dict v1 name=user_words".to_string()];
+        for e in &self.entries {
+            let hidden = if self.hidden.contains(&(e.code.clone(), e.text.clone())) {
+                "\t#hidden"
+            } else {
+                ""
+            };
+            out.push(format!("{}\t{}\t{}{}", e.code, e.text, e.weight as i64, hidden));
+        }
+        out
+    }
+
+    pub fn add_word(&mut self, code: &str, word: &str) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.code == code && e.text == word)
+        {
+            e.weight += 1.0;
+            self.hidden.remove(&(code.to_string(), word.to_string()));
+        } else {
+            let mut e = DictEntry::new(code, word, self.entries.len() as u32);
+            e.weight = 1.0;
+            self.entries.push(e);
+        }
+    }
+
+    /// 合入字典检索结果：用户词优先于同码低权重系统词。
+    pub fn merge_into(&self, code: &str, base: &Dict, out: &mut Vec<DictEntry>) {
+        for e in &self.entries {
+            if e.code == code && !self.hidden.contains(&(e.code.clone(), e.text.clone())) {
+                let mut e = e.clone();
+                if let Some(w) = self.weights.get(&(e.code.clone(), e.text.clone())) {
+                    e.weight = *w;
+                }
+                out.push(e);
+            }
+        }
+        let _ = base;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Vec<DictEntry> {
+        vec![
+            DictEntry::new("a", "来", 0),
+            DictEntry::new("a", "叉", 1),
+            DictEntry::new("a", "氨", 2),
+        ]
+    }
+
+    #[test]
+    fn adjust_replay() {
+        let lines: Vec<String> = vec![
+            "{置顶}a\t叉".into(),
+            "{删除}a\t氨".into(),
+        ];
+        let adj = UserAdjust::parse(&lines);
+        let out = adj.apply("a", &base());
+        let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["叉", "来"]);
+
+        // 序列化回放等价
+        let adj2 = UserAdjust::parse(&adj.to_lines());
+        assert_eq!(adj2.apply("a", &base()), out);
+    }
+
+    #[test]
+    fn add_and_pin() {
+        let mut adj = UserAdjust::default();
+        adj.add("a", "哎呦");
+        adj.pin("a", "叉");
+        let out = adj.apply("a", &base());
+        let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["叉", "来", "氨", "哎呦"]);
+    }
+
+    #[test]
+    fn user_dict_weighting() {
+        let mut ud = UserDict::default();
+        ud.add_word("jj", "自己");
+        ud.add_word("jj", "自己");
+        assert_eq!(ud.entries.len(), 1);
+        assert_eq!(ud.entries[0].weight, 2.0);
+    }
+}
