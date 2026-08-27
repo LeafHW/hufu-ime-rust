@@ -1,4 +1,133 @@
-//! 动态变量：日期 / 时间 / 星期 / 数字转中文（无外部依赖）。
+//! 动态变量：日期 / 时间 / 星期 / 数字转中文 / 计算器（无外部依赖）。
+
+/// 四则运算表达式求值（+ - * / % ^ 与括号，支持一元负号）。
+/// 成功返回 Some(f64)；除零/语法错误返回 None。
+pub fn calc(expr: &str) -> Option<f64> {
+    let tokens: Vec<char> = expr
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '，' && *c != '　')
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let v = parse_expr(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        return None; // 尾部垃圾
+    }
+    Some(v)
+}
+
+fn peek(tokens: &[char], pos: usize) -> Option<char> {
+    tokens.get(pos).copied()
+}
+
+fn parse_expr(t: &[char], pos: &mut usize) -> Option<f64> {
+    let mut v = parse_term(t, pos)?;
+    while let Some(op) = peek(t, *pos) {
+        if op == '+' || op == '-' || op == '＋' || op == '－' {
+            *pos += 1;
+            let rhs = parse_term(t, pos)?;
+            v = if op == '+' || op == '＋' { v + rhs } else { v - rhs };
+        } else {
+            break;
+        }
+    }
+    Some(v)
+}
+
+fn parse_term(t: &[char], pos: &mut usize) -> Option<f64> {
+    let mut v = parse_factor(t, pos)?;
+    while let Some(op) = peek(t, *pos) {
+        let normalized = match op {
+            '*' | '×' | '✕' => '*',
+            '/' | '÷' => '/',
+            '%' | '％' => '%',
+            _ => break,
+        };
+        *pos += 1;
+        let rhs = parse_factor(t, pos)?;
+        v = match normalized {
+            '*' => v * rhs,
+            '/' => {
+                if rhs == 0.0 {
+                    return None;
+                }
+                v / rhs
+            }
+            _ => {
+                let (a, b) = (v as i64, rhs as i64);
+                if b == 0 {
+                    return None;
+                }
+                (a % b) as f64
+            }
+        };
+    }
+    Some(v)
+}
+
+fn parse_factor(t: &[char], pos: &mut usize) -> Option<f64> {
+    let base = parse_unary(t, pos)?;
+    if peek(t, *pos) == Some('^') {
+        *pos += 1;
+        let exp = parse_factor(t, pos)?; // 右结合
+        return base.powf(exp).is_finite().then_some(base.powf(exp));
+    }
+    Some(base)
+}
+
+fn parse_unary(t: &[char], pos: &mut usize) -> Option<f64> {
+    if peek(t, *pos) == Some('-') || peek(t, *pos) == Some('－') {
+        *pos += 1;
+        return Some(-parse_unary(t, pos)?);
+    }
+    parse_primary(t, pos)
+}
+
+fn parse_primary(t: &[char], pos: &mut usize) -> Option<f64> {
+    match peek(t, *pos)? {
+        '(' | '（' => {
+            *pos += 1;
+            let v = parse_expr(t, pos)?;
+            let close = peek(t, *pos)?;
+            if close == ')' || close == '）' {
+                *pos += 1;
+                Some(v)
+            } else {
+                None
+            }
+        }
+        c if c.is_ascii_digit() || c == '.' => {
+            let start = *pos;
+            let mut seen_dot = false;
+            while let Some(c) = peek(t, *pos) {
+                if c.is_ascii_digit() {
+                    *pos += 1;
+                } else if (c == '.' || c == '．') && !seen_dot {
+                    seen_dot = true;
+                    *pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let s: String = t[start..*pos].iter().map(|c| if *c == '．' { '.' } else { *c }).collect();
+            s.parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// 数值格式化：整数不带小数点，最多 10 位小数去尾零。
+pub fn fmt_num(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.10}");
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        s.to_string()
+    }
+}
 
 /// Unix 秒 → 本地（UTC+8）民用时间。
 fn now_civil() -> (i64, u32, u32, u32, u32, u32, u32) {
@@ -216,5 +345,31 @@ mod tests {
         assert!(d.contains('年') && d.contains('月') && d.contains('日'));
         assert!(week_string().starts_with("星期"));
         assert!(time_string().len() == 8 && time_string().contains(':'));
+    }
+
+    #[test]
+    fn calc_basics() {
+        assert_eq!(calc("1+2*3").map(|v| v as i64), Some(7));
+        assert_eq!(calc("(1+2)*3").map(|v| v as i64), Some(9));
+        assert_eq!(calc("2^10").map(|v| v as i64), Some(1024));
+        assert_eq!(calc("10/4"), Some(2.5));
+        assert_eq!(calc("10%3").map(|v| v as i64), Some(1));
+        assert_eq!(calc("-5+3").map(|v| v as i64), Some(-2));
+        assert_eq!(calc("2^-2"), Some(0.25));
+        assert_eq!(calc("1+2*3"), calc("1 + 2 * 3"), "空白忽略");
+        assert_eq!(calc("（1+2）×3"), calc("(1+2)*3"), "全角符号");
+        assert_eq!(calc("1/0"), None, "除零");
+        assert_eq!(calc("1+"), None, "语法错");
+        assert_eq!(calc("(1+2"), None, "括号不闭合");
+        assert_eq!(calc("1+2)"), None, "尾部垃圾");
+        assert_eq!(calc(""), None);
+    }
+
+    #[test]
+    fn fmt_num_trims() {
+        assert_eq!(fmt_num(7.0), "7");
+        assert_eq!(fmt_num(2.5), "2.5");
+        assert_eq!(fmt_num(1.0 / 3.0), "0.3333333333");
+        assert_eq!(fmt_num(-0.125), "-0.125");
     }
 }

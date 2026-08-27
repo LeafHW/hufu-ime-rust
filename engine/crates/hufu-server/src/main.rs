@@ -260,6 +260,47 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             host.session.clear();
             Response::json(&serde_json::json!({"ok": true}))
         }
+        ("GET", "/api/sound") => {
+            // 音效预览：?tag=key|select|commit|page → audio/wav
+            let tag = req.query.get("tag").cloned().unwrap_or_default();
+            let safe = ["key", "select", "commit", "page"];
+            if !safe.contains(&tag.as_str()) {
+                return Response::err(400, "未知音效");
+            }
+            let p = host.data_dir.join("sounds").join(format!("{tag}.wav"));
+            match std::fs::read(&p) {
+                Ok(bytes) => Response {
+                    status: 200,
+                    content_type: "audio/wav",
+                    body: bytes,
+                },
+                Err(_) => Response::err(404, "音效文件不存在"),
+            }
+        }
+        ("GET", "/api/export") => {
+            // 全量用户数据快照：配置 + 当前方案用户词 + 调整日志
+            let schema_dir = host.engine.schema.dir.clone();
+            let read = |name: &str| -> String {
+                std::fs::read_to_string(schema_dir.join(name)).unwrap_or_default()
+            };
+            let stamp = {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("{}-{secs}", hufu_engine::dynamic::date_string_iso())
+            };
+            Response::json(&serde_json::json!({
+                "schema": host.engine.schema.name,
+                "exported_at_unix": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0),
+                "config": host.engine.config,
+                "user_words_txt": read("用户词.txt"),
+                "adjust_txt": read("用户调整.txt"),
+                "stamp": stamp,
+            }))
+        }
         ("POST", "/api/schema") => {
             let name = req
                 .json()
