@@ -21,6 +21,8 @@ pub struct Shared {
     pub cand2_dead: bool,
     pub cand: Option<CandidateWindow>,
     pub skin: serde_json::Value,
+    /// 会话结束后重新拉皮肤
+    pub skin_stale: bool,
 }
 
 impl Shared {
@@ -33,13 +35,17 @@ impl Shared {
             cand2_dead: false,
             cand: None,
             skin: serde_json::Value::Null,
+            skin_stale: true,
         }
     }
 
     fn load_skin(&mut self) {
-        if self.skin.is_null() {
+        // 编码会话开始（raw 空）时重新拉取皮肤 —— 设置界面改皮肤后，
+        // 下一次打字即生效（近热更新）
+        if self.skin.is_null() || self.skin_stale {
             if let Some(v) = ipc::call(&serde_json::json!({"op": "skin"})) {
                 self.skin = v;
+                self.skin_stale = false;
             }
         }
     }
@@ -310,6 +316,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // 编码会话结束 → 皮肤缓存过期（下次会话重新拉取）
+    if raw.is_empty() {
+        g.skin_stale = true;
+    }
     let cands: Vec<(String, String)> = state
         .get("candidates")
         .and_then(|v| v.as_array())
