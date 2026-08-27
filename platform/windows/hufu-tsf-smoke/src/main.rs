@@ -246,6 +246,14 @@ fn main() {
         let sp = tk(0x20);
         println!("[11] hufu_test_key(space) = {sp}");
 
+        // ── 标点链：空组段直提（Op::Commit 无组段回退）──
+        // OEM 逗号 0xBC / 句号 0xBE：TestKeyDown 应预判消费、KeyDown 后引擎提交 ，。
+        let c1 = tk(0xBC);
+        let p1 = tk(0xBC);
+        println!("[11.p1] 标点逗号 test={c1} down={p1}（应 1/1）");
+        let p2 = tk(0xBE);
+        println!("[11.p2] 标点句号 down={p2}（应 1）");
+
         // ── 候选窗 v2：D3D11+DComp+D2D+Acrylic accent 四材质各渲染一帧 ──
         type TestCandFn = unsafe extern "system" fn(u32) -> i32;
         let tc: TestCandFn = std::mem::transmute(
