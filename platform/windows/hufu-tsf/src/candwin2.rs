@@ -376,16 +376,16 @@ impl CandidateWindowV2 {
                     max_cmt = max_cmt.max(measure(&tf_small, c));
                 }
             }
-            let raw_w = if raw.is_empty() { 0.0 } else { measure(&tf, raw) };
-            // 标签列 + 最宽内容 +（备注列）+ 高亮胶囊余量
-            let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 8.0;
+            // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）
+            // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
+            let mut need = margin_x + label_w + max_text + margin_x + 6.0;
             if max_cmt > 0.0 {
-                need += 8.0 + max_cmt;
+                need += 6.0 + max_cmt;
             }
             let width = if width_cfg > 0.0 {
                 width_cfg
             } else {
-                need.clamp(min_width, 340.0)
+                need.clamp(min_width, 300.0)
             };
             let text_x = margin_x + label_w;
             let (cmt_x, cmt_w) = if max_cmt > 0.0 {
