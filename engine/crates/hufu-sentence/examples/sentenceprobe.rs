@@ -25,7 +25,8 @@ fn main() {
     println!("模型加载: {:?}（unigram {} 条）", t1.elapsed(), engine.model.uni_count());
     for raw in &raws {
         let t = Instant::now();
-        let out = engine.decode_to_strings(raw);
+        let dec = hufu_engine::SentenceDecoder::decode_rich(&engine, raw);
+        let out: Vec<&str> = dec.hits.iter().map(|h| h.text.as_str()).collect();
         println!(
             "\nraw='{}' → {:?}  （{:?}，候选 {}）",
             raw,
@@ -33,8 +34,16 @@ fn main() {
             t.elapsed(),
             out.len()
         );
-        if let Some((text, consumed)) = hufu_engine::SentenceDecoder::early_commit_proposal(&engine, raw) {
-            println!("  提前上屏提案: '{text}'（消耗 {consumed} 码）");
+        let top: Vec<&hufu_engine::SentenceHit> = dec.hits.iter().take(8).collect();
+        let (proposal, _share) = hufu_engine::confidence_proposal(&top, 0.995);
+        if !proposal.is_empty() {
+            println!("  置信前缀提案: '{proposal}'（完整候选源）");
+        }
+        if !dec.early_hits.is_empty() {
+            let etop: Vec<&hufu_engine::SentenceHit> = dec.early_hits.iter().take(8).collect();
+            let (eproposal, _eshare) = hufu_engine::confidence_proposal(&etop, 0.995);
+            let early: Vec<&str> = dec.early_hits.iter().map(|h| h.text.as_str()).take(4).collect();
+            println!("  不完全尾候选: {:?} 提案: '{eproposal}'", early);
         }
     }
 }

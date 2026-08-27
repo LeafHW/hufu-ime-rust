@@ -76,14 +76,19 @@ TypeCh @(' ')
 $total = $mid + $script:last.outcome.commit
 Check "syftuuu;w;jgfd 总输出=让我看看怎么个事" ($total -eq '让我看看怎么个事') "总=$total（中途[$mid]+终[$($script:last.outcome.commit)]）"
 
-# ── 5) 整句流不断：tujatuja 提前上屏
+# ── 5) 整句流不断：tujatuja 提前上屏（中途+空格累计 ≥3 字，Rime 同拍滚动）
 [void](PipeCall '{"op":"reset"}')
-TypeCh @('t','u','j','a','t','u','j','a')
+$mids = @()
+foreach ($ch in @('t','u','j','a','t','u','j','a')) {
+  $script:last = PipeCall ('{"op":"key","key":"' + $ch + '"}')
+  if ($script:last.outcome.commit) { $mids += $script:last.outcome.commit }
+}
 $r = $script:last
 Check 'tujatuja 组句在' ($r.state.candidates.Count -gt 0) "候选数=$($r.state.candidates.Count)"
 TypeCh @(' ')
 $r = $script:last
-Check 'tujatuja+空格上屏' ($null -ne $r.outcome.commit -and $r.outcome.commit.Length -ge 3) "commit=$($r.outcome.commit)"
+$total = ($mids -join '') + $r.outcome.commit
+Check 'tujatuja 总上屏≥3字' ($null -ne $r.outcome.commit -and $total.Length -ge 3) "中途[$($mids -join '')]+空格[$($r.outcome.commit)]=[$total]"
 
 # ── 5) 非整句回归：HTTP 切 虎码单字 → 数字选重立即上屏 → 切回
 [void](PipeCall '{"op":"reset"}')
