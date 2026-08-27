@@ -72,8 +72,9 @@ hufu/
 | `hufu-sentence` | ✅ | 真实 TCSKNM02 224MB 模型加载 87ms；`tujatuja`→「我们我们」、`mfyto`→「大一点我是」；单次组句 0.4–2.8ms；提前上屏提案 |
 | `hufu-skin` | ✅ | 19 颜色角色 + 材质模型；weasel 配色互导（含 0xAABBGGRR ↔ #RRGGBBAA） |
 | `hufu-cli` | ✅ | check / convert / repl |
-| `hufu-server` + 设置 GUI | ⏳ | — |
-| Windows TSF / macOS IMK | ⏳ | — |
+| `hufu-server` + 设置 GUI | ✅ | 13 REST 路由 + `\\.\pipe\hufu-ime` 命名管道；pipeclient 全操作通过（u→raw、space→上屏「的」、skin）；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词/导入导出） |
+| Windows TSF | 🔨 v1 | `hufu_tsf.dll` 编译通过（纯 Rust + windows-rs 0.58，4 COM 导出）；冒烟：LoadLibrary→DllRegisterServer(HKCU CLSID+CTF\TIP)→DllGetClassObject→CreateInstance→msctf ThreadMgr；`hufu_test_key` 直驱 u/j/k/l/m 全 consumed；**待**：CTF 语言档案注册→msctf 真实激活、D2D 候选窗 |
+| macOS IMK | ⏳ | — |
 
 ## 构建
 
@@ -86,9 +87,10 @@ cargo test
 # REPL 体验引擎
 cargo run -p hufu-cli -- repl --dict ../dictionaries/虎码单字
 
-# Windows TSF 前端（需要 Windows）
-cd engine
-cargo build -p hufu-tsf --release
+# Windows TSF 前端（需要 Windows；x86_64-pc-windows-gnu 工具链）
+cd platform/windows
+cargo build --release          # hufu_tsf.dll + hufu-tsf-smoke.exe
+./target/release/hufu-tsf-smoke.exe   # 冒烟：COM 层 + 管道引擎链
 # 注册见 platform/windows/install/README.md
 ```
 

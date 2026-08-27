@@ -1,0 +1,23 @@
+[package]
+name = "hufu-tsf-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hufu-tsf DLL 无注册冒烟测试"
+
+[[bin]]
+name = "hufu-tsf-smoke"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_TextServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+windows-core = "0.58"
