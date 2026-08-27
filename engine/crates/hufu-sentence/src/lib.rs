@@ -2,14 +2,15 @@
 //!
 //! 模型：TigerClaw 生态 `sentence-ngram-*.bin`（明文 TCSKNM02，Kneser-Ney trigram）。
 //! 解码：字级 beam search（按 raw 位置分桶）+ 名次惩罚 + 出字奖励 + 孤立生僻惩罚
-//! + 补充语料奖励；候选尾缀 `;`/`'`/数字作选重；置信前缀提前上屏提案。
+//! + 补充语料奖励；选重后缀 `;`/`'`/数字按「写入编码选重」锁定所在段的名次；
+//! 置信前缀提前上屏提案。
 
 pub mod model;
 
 use hufu_config::SentenceWeights;
 use hufu_dict::dict::Dict;
 use hufu_dict::supplement::Supplement;
-use hufu_engine::SentenceDecoder;
+use hufu_engine::{parse_rank_locks, SentenceDecoder};
 use hufu_types::{Candidate, CandidateKind};
 use model::{BOS, EOS, NgramModel};
 use std::collections::HashMap;
@@ -31,31 +32,8 @@ pub struct SentenceEngine {
 struct BeamOutput {
     text: String,
     score: f64,
-    /// 每个字符发射前的 raw 位置（consumed 映射）
+    /// 每个字符发射前的 base 位置（consumed 映射，base=去锁后缀的纯编码）
     boundaries: Vec<usize>,
-}
-
-/// 选重后缀解析：尾部 `;`(第2) `'`(第3) 数字(第N)。
-fn parse_selector(raw: &str) -> (String, Option<usize>) {
-    let mut chars: Vec<char> = raw.chars().collect();
-    let mut sel = None;
-    while let Some(&last) = chars.last() {
-        let s = match last {
-            ';' => Some(1), // 0 基次选
-            '\'' => Some(2),
-            '0'..='9' => Some(last.to_digit(10).unwrap() as usize % 10), // 0→第10
-            _ => None,
-        };
-        match s {
-            Some(v) => {
-                sel = Some(v);
-                chars.pop();
-                break; // 只取最后一个
-            }
-            None => break,
-        }
-    }
-    (chars.into_iter().collect(), sel)
 }
 
 #[derive(Clone)]
@@ -113,12 +91,12 @@ impl SentenceEngine {
 
     /// 核心解码：返回带边界信息的候选（已按分数降序）。
     fn decode_internal(&self, raw: &str) -> Vec<BeamOutput> {
-        let (base, selector) = parse_selector(raw);
-        let raw_chars: Vec<char> = base.chars().collect();
+        let parsed = parse_rank_locks(raw);
+        let raw_chars: Vec<char> = parsed.base.chars().collect();
         let n = raw_chars.len();
         let w = &self.weights;
-        if n == 0 || n > w.max_raw_length || n <= 4 {
-            // 整句只处理 >4 码
+        if n == 0 || n > w.max_raw_length || (n <= 4 && !parsed.has_locks()) {
+            // 整句只处理 >4 码（带选重锁时 ≤4 也组句）
             return Vec::new();
         }
 
@@ -165,12 +143,38 @@ impl SentenceEngine {
                     continue;
                 }
                 let prev_before_word = state.prev1;
+                // 锁段约束：该位置是某锁的块起点 → 只允许锁定跨度（强制分词穿过锁）
+                let lock_here = parsed.locks.iter().find(|(_, s, _)| *s == pos);
                 for (code_len, entries) in &segs[pos] {
                     let end = pos + code_len;
-                    for (text, rank) in entries {
-                        // >4 码段只允许 rank=1（显式选重除外）
-                        if pos >= 4 && *rank > 0 {
+                    if let Some((le, _, _)) = lock_here {
+                        if end != *le {
                             continue;
+                        }
+                    }
+                    // 段不得跨越任何锁起点（否则绕开锁吞段）
+                    if parsed.locks.iter().any(|(_, s, _)| *s > pos && *s < end) {
+                        continue;
+                    }
+                    // 该段终点是否有用户名次锁（且块起点匹配）
+                    let lock = parsed
+                        .locks
+                        .iter()
+                        .find(|(e, s, _)| *e == end && *s == pos);
+                    for (text, rank) in entries {
+                        match lock {
+                            Some((_, _, r)) => {
+                                // 写入编码选重：该段只允许锁定的名次（无惩罚）
+                                if rank + 1 != *r {
+                                    continue;
+                                }
+                            }
+                            None => {
+                                // >4 码段只允许第 1 候选（无显式锁时）
+                                if pos >= 4 && *rank > 0 {
+                                    continue;
+                                }
+                            }
                         }
                         let mut ns = state.clone();
                         ns.word_start = pos;
@@ -193,7 +197,7 @@ impl SentenceEngine {
                             ns.prev1 = cp;
                             prev_char = cp;
                         }
-                        if *rank > 0 {
+                        if *rank > 0 && lock.is_none() {
                             ns.score -= w.rank_penalty * (*rank as f64 + 1.0).ln();
                         }
                         ns.score += self.supplement_reward(text);
@@ -230,14 +234,6 @@ impl SentenceEngine {
         }
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         out.truncate(w.candidate_limit);
-
-        // 选重后缀：把指定名次候选提到首位
-        if let Some(k) = selector {
-            if k < out.len() {
-                let pick = out.remove(k);
-                out.insert(0, pick);
-            }
-        }
         out
     }
 
@@ -290,10 +286,18 @@ impl SentenceDecoder for SentenceEngine {
                 .map(|o| o.score.exp())
                 .sum();
             if mass / total >= self.weights.confidence {
-                // consumed = 拼出该前缀消耗的 raw 长度（用 top 的边界）
+                // consumed = 拼出该前缀消耗的 base 长度（用 top 的边界）
                 let consumed = top.boundaries.get(l).copied().unwrap_or(0);
                 if consumed > 0 {
-                    best = Some((prefix, consumed));
+                    // base 位置 → 原始 raw 位置（含选重后缀字符）
+                    let parsed = parse_rank_locks(raw);
+                    let base_len = parsed.base.chars().count();
+                    let consumed_orig = if consumed >= base_len {
+                        raw.chars().count()
+                    } else {
+                        parsed.orig_of_base[consumed]
+                    };
+                    best = Some((prefix, consumed_orig));
                 }
                 break;
             }

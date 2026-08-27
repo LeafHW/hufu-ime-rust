@@ -63,9 +63,11 @@ Check 'csps 缓冲保留' ($s1.raw -eq 'csps') "'$($s1.raw)'"
 $n5 = SK 'a'
 Check '第5键进解码器' ($n5.cand.Length -gt 0) "'$($n5.cand)'"
 
-Write-Host '══ 6 选重键与翻页'
-Reset; [void](SK 'jd'); $sel2 = SK '2'; Check '数字2选' ($sel2.commit.Length -gt 0) "'$($sel2.commit)'"
-Reset; [void](SK 'jd'); $semi = SK ';'; Check '分号次选' ($semi.commit.Length -gt 0) "'$($semi.commit)'"
+Write-Host '══ 6 选重键与翻页（整句=写锁不上屏，空格上屏）'
+Reset; foreach ($k in 'j','d') { [void](SK $k) }; $sel2 = SK '2'; Check '数字2选锁不上屏' ($null -eq $sel2.commit -and $sel2.raw -eq 'jd2' -and $sel2.cand.Length -gt 0) "commit=$($sel2.commit) raw=$($sel2.raw) cand=$($sel2.cand)"
+$first2 = ($sel2.cand -split ' ')[0]
+$cfm = SK ' '; Check '锁后空格上屏' ($cfm.commit -eq $first2) "'$($cfm.commit)' vs '$first2'"
+Reset; foreach ($k in 'j','d') { [void](SK $k) }; $semi = SK ';'; Check '分号次选锁' ($null -eq $semi.commit -and $semi.raw -match "^jd." -and $semi.cand.Length -gt 0) "commit=$($semi.commit) raw=$($semi.raw) cand=$($semi.cand)"
 Reset; foreach ($k in 't','u','j','a','t','u') { $last = SK $k }
 $pg = SK '='; Check '解码器态翻页' ($pg.pc -ge 2 -and $pg.page -eq 1) "page=$($pg.page)/$($pg.pc)"
 $bk = SK '-'; Check '减号回页' ($bk.page -eq 0) "page=$($bk.page)"
