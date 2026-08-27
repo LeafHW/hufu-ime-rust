@@ -400,6 +400,15 @@ impl EditSession_Impl {
                     }
                     // 提交后选区放到已提交文本之后
                     let _ = set_selection_at_end(&ctx, ec, &range);
+                } else if !text.is_empty() {
+                    // 无活动组段的直接提交（如开头标点「，」）：
+                    // 在当前选区（插入点）处插入文本，等价于 StartPreedit 的定位流程但不开组段
+                    let range = selection_range(&ctx, ec)?;
+                    let wstr: Vec<u16> = text.encode_utf16().collect();
+                    unsafe {
+                        range.SetText(ec, 0, &wstr)?;
+                    }
+                    let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 g.composition = None;
                 Ok(())

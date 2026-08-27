@@ -469,13 +469,15 @@ impl Engine {
             return;
         }
 
-        // 整句方案：超过最大码长后由整句解码器接管（不顶功、不清屏）
-        let sentence_takeover = self.sentence_active() && len > max_len;
+        // 整句方案：超过最大码长后由整句解码器接管（不顶功、不清屏）；
+        // 整句模式下死路同样不顶屏——编码留在缓冲区交给解码器组句
+        let sentence_mode = self.sentence_active();
+        let sentence_takeover = sentence_mode && len > max_len;
 
         // 顶功：超长（第 max+1 码）或死路（新码无任何延续）
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
         let over_length = len > max_len;
-        if (over_length || dead_end) && !sentence_takeover && self.config.input.auto_push && !has_upper
+        if (over_length || dead_end) && !sentence_mode && self.config.input.auto_push && !has_upper
         {
             if let Some(first) = prev_cands.first().cloned() {
                 // 提交追加前 raw 的首选，新 raw 从刚输入的字符重新开始
@@ -493,8 +495,8 @@ impl Engine {
             return;
         }
 
-        // 空码自动清屏（既无精确也无前缀，且未开启顶功短路）
-        if dead_end && !sentence_takeover && self.config.input.auto_clear_empty && !has_upper {
+        // 空码自动清屏（既无精确也无前缀，且未开启顶功短路；整句模式保留缓冲）
+        if dead_end && !sentence_mode && self.config.input.auto_clear_empty && !has_upper {
             session.clear();
         }
     }
@@ -676,6 +678,30 @@ impl Engine {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 KeyOutcome::consumed(self.state(session))
+            }
+            // 数字选重 / 翻页（与普通模式一致；反查候选多时翻页查看）
+            _ if c.is_ascii_digit() && c != '0' => {
+                let page_size = self.config.candidates.page_size.max(1);
+                let start = session.page * page_size;
+                let pick = session.candidates.get(start + (c as usize - '1' as usize)).cloned();
+                match pick {
+                    Some(cand) => {
+                        let text = cand.commit_text().to_string();
+                        session.clear();
+                        KeyOutcome::commit(text, self.state(session))
+                    }
+                    None => KeyOutcome::consumed(self.state(session)),
+                }
+            }
+            _ if self.config.candidates.paging_keys.contains(c) => {
+                let dir = if self.config.candidates.paging_keys.find(c)
+                    >= Some(self.config.candidates.paging_keys.len() / 2)
+                {
+                    1
+                } else {
+                    -1
+                };
+                self.on_page(session, dir)
             }
             _ => {
                 session.clear();
