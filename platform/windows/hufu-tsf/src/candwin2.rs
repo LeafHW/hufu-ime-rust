@@ -314,7 +314,7 @@ impl CandidateWindowV2 {
         let em = font_pt * 96.0 / 72.0;
 
         // 字体与内容测宽先行（宽度取决于最长候选）
-        let (tf, tf_small, width, text_x, cmt_x, cmt_w) = unsafe {
+        let (tf, tf_label, tf_small, width, text_x, cmt_x, cmt_w) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
                 None => return,
@@ -351,6 +351,15 @@ impl CandidateWindowV2 {
             let tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
             let tf_small =
                 mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+            // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
+            let label_pt = layout_f(skin, "label_font_point", 0.0);
+            let tf_label = if label_pt > 0.0 {
+                mk_tf(&font_face, label_pt * 96.0 / 72.0)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", label_pt * 96.0 / 72.0))
+                    .or(tf_small.clone())
+            } else {
+                tf_small.clone()
+            };
 
             let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
                 if s.is_empty() {
@@ -376,9 +385,15 @@ impl CandidateWindowV2 {
                     max_cmt = max_cmt.max(measure(&tf_small, c));
                 }
             }
-            // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）
+            // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
+            // 例外：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽
+            let raw_w = if cands.is_empty() && !raw.is_empty() {
+                measure(&tf, raw)
+            } else {
+                0.0
+            };
             // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
-            let mut need = margin_x + label_w + max_text + margin_x + 6.0;
+            let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 6.0;
             if max_cmt > 0.0 {
                 need += 6.0 + max_cmt;
             }
@@ -393,7 +408,7 @@ impl CandidateWindowV2 {
             } else {
                 (width, 0.0)
             };
-            (tf, tf_small, width, text_x, cmt_x, cmt_w)
+            (tf, tf_label, tf_small, width, text_x, cmt_x, cmt_w)
         };
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
         let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
@@ -520,7 +535,7 @@ impl CandidateWindowV2 {
                 } else {
                     (&b_text, &b_label)
                 };
-                draw(&ctx, &tf, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
+                draw(&ctx, &tf_label, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
                 draw(&ctx, &tf, text, text_x, y, cmt_x - text_x - 4.0, line_h, bt);
                 if !cmt.is_empty() {
                     draw(&ctx, &tf_small, cmt, cmt_x, y + 2.0, width - cmt_x - margin_x + 4.0, line_h, &b_cmt);

@@ -294,6 +294,7 @@ fn vk_to_name(vk: usize) -> Option<(String, bool, bool, bool)> {
             0x08 => "backspace".to_string(),
             0x09 => "tab".to_string(),
             0x1B => "escape".to_string(),
+            0x14 => "capslock".to_string(),
             0x10 => "shift".to_string(),
             0x11 => "ctrl".to_string(),
             0x12 => "alt".to_string(),
@@ -621,10 +622,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         })
         .unwrap_or_default();
     let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // 反查/命令模式刚进入（编码空、候选空）时，aux 作首行提示立即显示
+    let raw = if raw.is_empty() && cands.is_empty() && !aux.is_empty() {
+        aux.clone()
+    } else {
+        raw
+    };
     trace(&format!("cands={} raw='{}' cand2={} dead={}", cands.len(), raw, g.cand2.is_some(), g.cand2_dead));
 
     g.load_skin();
-    if cands.is_empty() {
+    if cands.is_empty() && raw.is_empty() {
         if let Some(c) = g.cand2.as_ref() {
             c.hide();
         }

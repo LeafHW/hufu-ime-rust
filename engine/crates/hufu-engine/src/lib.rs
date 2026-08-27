@@ -1591,7 +1591,7 @@ impl Engine {
                 0
             },
             aux: match session.mode {
-                InputMode::Reverse => "〔反查〕".into(),
+                InputMode::Reverse => "〔反查〕小鹤双拼".into(),
                 InputMode::Command => "〔命令〕".into(),
                 _ => String::new(),
             },
