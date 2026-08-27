@@ -121,8 +121,10 @@ fn full_code_push_on_fifth() {
 fn quick_symbol_auto_commit() {
     let (mut engine, mut session, _dir) = setup();
     engine.process_key(&mut session, key(';'));
+    // 其他字符打断「;」引导：回到正常编码路径
     let out = engine.process_key(&mut session, key('a'));
-    assert_eq!(out.commit.as_deref(), Some("！"));
+    assert!(out.commit.is_none());
+    assert_eq!(out.state.unwrap().raw, "a");
 }
 
 #[test]
@@ -151,10 +153,16 @@ fn punct_fullwidth_and_pair() {
     assert_eq!(out.state.unwrap().candidates[0].text, "‘");
     let out = engine.process_key(&mut session, key(' '));
     assert_eq!(out.commit.as_deref(), Some("‘"));
-    // ; 空态首选全角分号
+    // ; 引导标点：候选 [：,；]；;+空格=：，;;=；直上
     engine.process_key(&mut session, key(';'));
     let st = engine.state(&session);
-    assert_eq!(st.candidates[0].text, "；");
+    assert_eq!(st.candidates[0].text, "：");
+    assert_eq!(st.candidates[1].text, "；");
+    let out = engine.process_key(&mut session, key(' '));
+    assert_eq!(out.commit.as_deref(), Some("："));
+    engine.process_key(&mut session, key(';'));
+    let out = engine.process_key(&mut session, key(';'));
+    assert_eq!(out.commit.as_deref(), Some("；"));
 }
 
 #[test]
@@ -182,14 +190,14 @@ fn sentence_mode_after_max_length() {
     engine.config.sentence.auto_enable = false;
     assert!(engine.sentence_active());
 
-    // ≤4 码：走码表
+    // ≤4 码：码表候选合并进列表（整句短语可置前，Rime 菜单合并语义）
     engine.process_key(&mut session, key('t'));
-    assert_eq!(engine.state(&session).candidates[0].text, "我");
-    // 4 码满码仍是码表
+    assert!(engine.state(&session).candidates.iter().any(|c| c.text == "我"));
+    // 4 码满码同上
     for c in ['u', 'j', 'a'] {
         engine.process_key(&mut session, key(c)); // tuja = 我们
     }
-    assert_eq!(engine.state(&session).candidates[0].text, "我们");
+    assert!(engine.state(&session).candidates.iter().any(|c| c.text == "我们"));
     // 第 5 码：整句接管，不顶功
     engine.process_key(&mut session, key('x'));
     let st = engine.state(&session);

@@ -572,6 +572,19 @@ impl Engine {
         }
 
         // —— 有编码态 ——
+        // 「;;」→；直接上屏（; 引导标点）
+        if c == ';' && session.raw == ";" && self.config.input.semicolon_guide {
+            session.clear();
+            return KeyOutcome::commit("；".to_string(), self.state(session));
+        }
+        // 其他字符打断「;」引导：清缓冲重入（空格留给首选上屏）
+        if session.raw == ";"
+            && self.config.input.semicolon_guide
+            && c != ' '
+        {
+            session.clear();
+            return self.on_char(session, c, shift);
+        }
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
         // 选重键（不构成编码延续时才作为选重）
         if !extends {
@@ -1316,6 +1329,18 @@ impl Engine {
             return;
         }
 
+        // 「;」引导标点候选：;+空格=：、;;=；直上
+        if self.config.input.semicolon_guide
+            && session.mode == InputMode::Normal
+            && session.raw == ";"
+        {
+            session.candidates = vec![
+                Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol),
+                Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol),
+            ];
+            return;
+        }
+
         let parsed = parse_rank_locks(&session.raw);
         let raw_len = session.raw.chars().count();
         // 整句接管：超长、带选重锁（≤4 码 + 锁时也组句），或已有提前上屏前缀
@@ -1334,11 +1359,56 @@ impl Engine {
             }
         }
 
-        // 常规：精确码候选
+        // 常规：精确码候选 + 整句短语合并
+        // （Rime 菜单合并语义：ngram 多字首选短语压生僻表项置前，
+        //   mlwe → 两次 先于 𠓅/𰧓，与 Rime 实测同拍；其余句子候选去重补后）
         let entries = self.schema.candidates(&session.raw);
         if !entries.is_empty() {
             session.candidates = entries.iter().map(|e| self.entry_to_candidate(e)).collect();
             self.apply_opencc(session);
+            if !sentence_mode && self.sentence_active() {
+                if let Some(dec) = &self.sentence {
+                    let full = format!("{}{}", session.committed_raw, session.raw);
+                    let d = dec.decode_rich(&full);
+                    let cmt = session.committed_text.clone();
+                    let skip = cmt.chars().count();
+                    let mut phrase: Vec<Candidate> = Vec::new();
+                    let mut rest: Vec<Candidate> = Vec::new();
+                    for h in d.hits.iter() {
+                        if !cmt.is_empty() && !h.text.starts_with(&cmt) {
+                            continue;
+                        }
+                        let text: String = h.text.chars().skip(skip).collect();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let multi = text.chars().count() >= 2;
+                        let mut cand =
+                            Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+                        cand.weight = h.score;
+                        if h.max_rank == 1 && multi {
+                            phrase.push(cand);
+                        } else {
+                            rest.push(cand);
+                        }
+                    }
+                    if !phrase.is_empty() || !rest.is_empty() {
+                        let mut merged = phrase;
+                        for existing in session.candidates.drain(..) {
+                            if !merged.iter().any(|m| m.text == existing.text) {
+                                merged.push(existing);
+                            }
+                        }
+                        for r in rest {
+                            if !merged.iter().any(|m| m.text == r.text) {
+                                merged.push(r);
+                            }
+                        }
+                        merged.truncate(20);
+                        session.candidates = merged;
+                    }
+                }
+            }
             return;
         }
         // 词表无此码（如 nqbh 真好）：整句解码器现切（Rime lua_translator 同源行为，
