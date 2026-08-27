@@ -1,19 +1,19 @@
-//! hufu-tsf.dll 冒烟测试（不需 regsvr32）：
-//! [COM 层] LoadLibrary → DllRegisterServer → DllGetClassObject → CreateInstance → msctf ThreadMgr
-//! [引擎链] hufu_test_key 直驱：VK → 管道 → hufu-server 引擎 → consumed
-//! 注：msctf 完整激活需 CTF 语言档案注册（下一轮 install 脚本覆盖），
-//!     手动 AdviseKeyEventSink 在真实 msctf 上返回 E_INVALIDARG（Wine 宽松）。
+//! hufu-tsf.dll 冒烟测试：
+//! [COM 层] LoadLibrary → DllRegisterServer(含语言档案) → DllGetClassObject → CreateInstance
+//! [真实激活] ITfInputProcessorProfileMgr::ActivateProfile → msctf 从注册表加载本 DLL
+//!            → 我们的 Activate 落标记文件 → TestKeyDown 全链路
+//! [引擎链] hufu_test_key 直驱（VK → 管道 → hufu-server 引擎 → consumed）
 
 use windows::core::*;
 use windows::Win32::Foundation::{HMODULE, BOOL, LPARAM, WPARAM};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CLSCTX_INPROC_SERVER, IClassFactory,
-};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IClassFactory};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Ole::OleInitialize;
+use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::*;
 
 const CLSID_HUFU: GUID = GUID::from_u128(0x8f5c2a10_3e77_4b9c_a1d4_9e0b7c2f5a88);
+const PROFILE_GUID: GUID = GUID::from_u128(0x8f5c2a11_3e77_4b9c_a1d4_9e0b7c2f5a88);
 
 type DllGetClassObjectFn =
     unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut core::ffi::c_void) -> HRESULT;
@@ -31,7 +31,7 @@ fn main() {
             std::mem::transmute(GetProcAddress(hmod, PCSTR(b"DllRegisterServer\0".as_ptr())).unwrap());
         let hr = reg();
         assert_eq!(hr.0, 0, "DllRegisterServer 失败: 0x{:08X}", hr.0 as u32);
-        println!("[2] DllRegisterServer ✓（HKCU CLSID + CTF\\TIP 已写）");
+        println!("[2] DllRegisterServer ✓（HKCU CLSID/CTF\\TIP + msctf 语言档案）");
 
         let gco: DllGetClassObjectFn =
             std::mem::transmute(GetProcAddress(hmod, PCSTR(b"DllGetClassObject\0".as_ptr())).unwrap());
@@ -51,38 +51,133 @@ fn main() {
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).unwrap();
         println!("[5] CoCreateInstance(msctf ITfThreadMgr) ✓");
 
-        // 手动 ActivateEx：msctf 会拒绝手动 Advise（tid 必须来自 CTF 档案激活流程）
-        let real_tid: u32 = tm.Activate().unwrap();
-        let manual = tip.ActivateEx(&tm, real_tid, 0);
-        match manual {
-            Err(e) if e.code() == HRESULT(0x8007_0057u32 as i32) => {
-                println!("[6] 手动 ActivateEx → E_INVALIDARG（预期：msctf 要求 CTF 档案 tid）✓");
+        // ── 语言档案注册（安装器职责，在此直测以定位失败点）──
+        let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
+        let _ = std::fs::remove_file(&marker);
+        {
+            // msctf 能否按注册表 CoCreateInstance 我们的 TIP（Register 内部验证路径）
+            let direct: windows::core::Result<ITfTextInputProcessor> =
+                CoCreateInstance(&CLSID_HUFU, None, CLSCTX_INPROC_SERVER);
+            match &direct {
+                Ok(_) => println!("    CoCreateInstance(CLSID_HUFU) 直连 ✓"),
+                Err(e) => println!("    CoCreateInstance(CLSID_HUFU) 直连失败：{e:?}"),
             }
-            other => println!("[6] 手动 ActivateEx → {other:?}"),
+
+            let profiles: ITfInputProcessorProfiles =
+                CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+                    .unwrap();
+            // 分类注册（ITfCategoryMgr）
+            let cat: windows::core::Result<ITfCategoryMgr> =
+                CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER);
+            if let Ok(cat) = &cat {
+                const TFCAT_TIP_KEYBOARD: GUID =
+                    GUID::from_u128(0x533c5e0e_5ac0_4abd_b6f1_251b82b7be7d);
+                let r = unsafe { cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU) };
+                println!("    ITfCategoryMgr::RegisterCategory → {r:?}");
+            }
+            match unsafe {
+                profiles
+                    .Register(&CLSID_HUFU)
+                    .and_then(|()| {
+                        let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+                        profiles.AddLanguageProfile(
+                            &CLSID_HUFU,
+                            0x0804,
+                            &PROFILE_GUID,
+                            &desc,
+                            &[],
+                            0,
+                        )
+                    })
+                    .and_then(|()| {
+                        profiles.EnableLanguageProfile(
+                            &CLSID_HUFU,
+                            0x0804,
+                            &PROFILE_GUID,
+                            BOOL(1),
+                        )
+                    })
+            } {
+                Ok(()) => println!("[6] 语言档案 Register+AddLanguageProfile+Enable ✓"),
+                Err(e) => {
+                    println!("[6] 语言档案注册失败：{e:?}");
+                    println!("    （继续尝试 ActivateProfile，看 msctf 是否已按 CTF\\TIP 键识别）");
+                }
+            }
+
+            let mgr: ITfInputProcessorProfileMgr = profiles.cast().unwrap();
+
+            // 探测：msctf 能否枚举到我们（HKCU 键是否被读取）
+            if let Ok(enum_) = unsafe { mgr.EnumProfiles(0x0804) } {
+                let mut seen_hufu = false;
+                let mut n = 0;
+                loop {
+                    let mut profs = [TF_INPUTPROCESSORPROFILE::default(); 4];
+                    let mut fetched: u32 = 0;
+                    if unsafe { enum_.Next(&mut profs, &mut fetched) }.is_err() || fetched == 0 {
+                        break;
+                    }
+                    for prof in &profs[..fetched as usize] {
+                        n += 1;
+                        let clsid = format!("{:?}", prof.clsid);
+                        if clsid.contains("8f5c2a10") || clsid.contains("8F5C2A10") {
+                            seen_hufu = true;
+                            println!("    EnumProfiles[#{n}] = 我们的 TIP ✓ type={} flags={:#x}", prof.dwProfileType, prof.dwFlags);
+                        }
+                    }
+                }
+                if !seen_hufu {
+                    println!("    EnumProfiles 共 {n} 项，未含我们的 TIP（HKCU 键未被 msctf 枚举）");
+                }
+            }
+
+            const TF_PROFILETYPE_INPUTPROCESSOR: u32 = 1;
+            let ap = mgr.ActivateProfile(
+                TF_PROFILETYPE_INPUTPROCESSOR,
+                0x0804,
+                &CLSID_HUFU,
+                &PROFILE_GUID,
+                HKL(std::ptr::null_mut()),
+                0,
+            );
+            match ap {
+                Ok(()) => println!("[7] ITfInputProcessorProfileMgr::ActivateProfile ✓"),
+                Err(e) => println!("[7] ActivateProfile 失败：{e:?}"),
+            }
+
+            if marker.exists() {
+                let content = std::fs::read_to_string(&marker).unwrap_or_default();
+                println!("[8] 激活标记 ✓（msctf 真实管线加载本 DLL 并调用了 Activate）：{content}");
+            } else {
+                println!("[8] ⚠ 激活标记未出现（Activate 未被 msctf 调用）");
+            }
+
+            // ThreadMgr 激活为客户端，再试全链路按键
+            let _tid: u32 = tm.Activate().unwrap();
+            let km: ITfKeystrokeMgr = tm.cast().unwrap();
+            let eaten = km.TestKeyDown(WPARAM(0x55), LPARAM(1)).unwrap();
+            println!("[9] msctf TestKeyDown('u') consumed={} （若 sink 已激活即全链路通）", eaten.as_bool());
+            let _ = tm.Deactivate();
         }
-        let _ = tm.Deactivate();
 
         // ── 引擎链直驱：hufu_test_key VK→管道→hufu-server→consumed ──
         let tk: TestKeyFn =
             std::mem::transmute(GetProcAddress(hmod, PCSTR(b"hufu_test_key\0".as_ptr())).unwrap());
 
-        // 重置引擎会话（先按 escape 两次清空）
         let _ = tk(0x1B);
         let _ = tk(0x1B);
-
         let u = tk(0x55); // 'u'
         assert_eq!(u, 1, "test_key('u') 应被引擎吃掉");
-        println!("[7] hufu_test_key('u') = {u} ✓（DLL→管道→引擎→响应）");
+        println!("[10] hufu_test_key('u') = {u} ✓（DLL→管道→引擎→响应）");
 
         for vk in [0x4Au32, 0x4B, 0x4C, 0x4D] {
             let r = tk(vk);
             print!("    0x{vk:X}→{r}  ");
         }
         println!("✓");
+        let sp = tk(0x20);
+        println!("[11] hufu_test_key(space) = {sp}");
 
-        let sp = tk(0x20); // space → commit
-        println!("[8] hufu_test_key(space) = {sp}（0 = 直通说明无组合，1 = 上屏）");
-
-        println!("\n=== hufu-tsf 冒烟测试通过：COM 层 + 引擎链均正常 ===");
+        println!("\n=== hufu-tsf 冒烟测试通过 ===");
     }
 }
