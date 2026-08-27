@@ -143,28 +143,18 @@ impl SentenceEngine {
                     continue;
                 }
                 let prev_before_word = state.prev1;
-                // 锁段约束：该位置是某锁的块起点 → 只允许锁定跨度（强制分词穿过锁）
-                let lock_here = parsed.locks.iter().find(|(_, s, _)| *s == pos);
                 for (code_len, entries) in &segs[pos] {
                     let end = pos + code_len;
-                    if let Some((le, _, _)) = lock_here {
-                        if end != *le {
-                            continue;
-                        }
-                    }
-                    // 段不得跨越任何锁起点（否则绕开锁吞段）
-                    if parsed.locks.iter().any(|(_, s, _)| *s > pos && *s < end) {
+                    // 锁位置必须是段边界：段不得跨越锁终点（否则绕开锁）
+                    if parsed.locks.iter().any(|(l, _)| *l > pos && *l < end) {
                         continue;
                     }
-                    // 该段终点是否有用户名次锁（且块起点匹配）
-                    let lock = parsed
-                        .locks
-                        .iter()
-                        .find(|(e, s, _)| *e == end && *s == pos);
+                    // 该段终点是否有用户名次锁
+                    let lock = parsed.locks.iter().find(|(l, _)| *l == end);
                     for (text, rank) in entries {
                         match lock {
-                            Some((_, _, r)) => {
-                                // 写入编码选重：该段只允许锁定的名次（无惩罚）
+                            Some((_, r)) => {
+                                // 写入编码选重：段终点被锁 → 只允许锁定名次（无惩罚）
                                 if rank + 1 != *r {
                                     continue;
                                 }
