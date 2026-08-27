@@ -114,15 +114,16 @@ impl UserAdjust {
     /// 应用到字典候选列表：返回调整后的条目序列。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
         let mut out: Vec<DictEntry> = Vec::new();
-        // 1) 置顶（最新在前）
+        // 1) 置顶（最新在前；命中码表的条目也标记 pinned）
         let pinned: Vec<&(String, String)> = self
             .pins
             .iter()
             .filter(|(c, _)| c == code)
             .collect();
         for (c, w) in pinned.iter().rev() {
-            if let Some(e) = base.iter().find(|e| e.code == *c && e.text == *w) {
-                out.push(e.clone());
+            if let Some(mut e) = base.iter().find(|e| e.code == *c && e.text == *w).cloned() {
+                e.pinned = true;
+                out.push(e);
             } else {
                 let mut e = DictEntry::new(c.clone(), w.clone(), u32::MAX);
                 e.pinned = true;
