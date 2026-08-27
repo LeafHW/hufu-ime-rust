@@ -931,7 +931,7 @@ impl Engine {
             proposal: proposal.clone(),
             full_raw: full.clone(),
             raw_lengths,
-            strong: proposal_share >= 0.9999,
+            strong: proposal_share >= 0.99999, // Rime STRONG_SHARE（2025-01 调参 0.9999→0.99999：提交+14%）
         });
         while session.early_history.len() > 3 {
             session.early_history.remove(0);
@@ -1236,6 +1236,35 @@ impl Engine {
     }
 
     /// 重建候选列表（含整句模式切换）。
+    /// 整句候选显示：全上下文解码（committed ++ live），只显示已提交文本之后的剩余。
+    fn sentence_candidates(
+        &self,
+        session: &Session,
+        dec: &dyn SentenceDecoder,
+    ) -> Vec<Candidate> {
+        let full = format!("{}{}", session.committed_raw, session.raw);
+        let dec = dec.decode_rich(&full);
+        let committed_text = session.committed_text.clone();
+        let mut cands: Vec<Candidate> = Vec::new();
+        for h in dec.hits.iter() {
+            if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
+                continue;
+            }
+            let text: String = h
+                .text
+                .chars()
+                .skip(committed_text.chars().count())
+                .collect();
+            if text.is_empty() {
+                continue;
+            }
+            let mut c = Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+            c.weight = h.score;
+            cands.push(c);
+        }
+        cands
+    }
+
     fn refresh_candidates(&mut self, session: &mut Session) {
         session.candidates.clear();
         session.page = 0;
@@ -1262,31 +1291,7 @@ impl Engine {
                 || !session.committed_raw.is_empty());
         if sentence_mode {
             if let Some(dec) = &self.sentence {
-                // 全上下文解码（committed ++ live），显示已提交文本之后的剩余
-                let full = format!("{}{}", session.committed_raw, session.raw);
-                let dec = dec.decode_rich(&full);
-                let committed_text = session.committed_text.clone();
-                let mut cands: Vec<Candidate> = Vec::new();
-                for h in dec.hits.iter() {
-                    if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
-                        continue;
-                    }
-                    let text: String = h
-                        .text
-                        .chars()
-                        .skip(committed_text.chars().count())
-                        .collect();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let mut c = Candidate::new(
-                        text,
-                        session.raw.clone(),
-                        CandidateKind::Sentence,
-                    );
-                    c.weight = h.score;
-                    cands.push(c);
-                }
+                let cands = self.sentence_candidates(session, dec.as_ref());
                 if !cands.is_empty() {
                     session.candidates = cands;
                     return;
@@ -1301,6 +1306,17 @@ impl Engine {
             session.candidates = entries.iter().map(|e| self.entry_to_candidate(e)).collect();
             self.apply_opencc(session);
             return;
+        }
+        // 词表无此码（如 nqbh 真好）：整句解码器现切（Rime lua_translator 同源行为，
+        // n≤4 全名次参与，nq|bh 两段即出「真好」）
+        if self.sentence_active() {
+            if let Some(dec) = &self.sentence {
+                let cands = self.sentence_candidates(session, dec.as_ref());
+                if !cands.is_empty() {
+                    session.candidates = cands;
+                    return;
+                }
+            }
         }
         // 符号表回退
         let map = self.schema.symbols.merge_code_map();
