@@ -136,6 +136,8 @@ pub struct InputSection {
     pub ascii_punct: bool,
     /// 无编码时 `/` 输出顿号
     pub slash_dunhao: bool,
+    /// 无编码时「;」引导标点：;+空格=：、;;=；直上
+    pub semicolon_guide: bool,
     /// 数字键参与整句选重
     pub digits_in_sentence: bool,
 }
@@ -157,6 +159,7 @@ impl Default for InputSection {
             default_chinese: true,
             ascii_punct: false,
             slash_dunhao: true,
+            semicolon_guide: true,
             digits_in_sentence: true,
         }
     }
