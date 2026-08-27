@@ -3,6 +3,8 @@
 # 用法：右键「使用 PowerShell 运行」，或:  powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 $ErrorActionPreference = 'Stop'
+$log = Join-Path $PSScriptRoot 'install.log'
+Start-Transcript -Path $log -Force | Out-Null
 
 $CLSID        = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}'
 $PROFILE      = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}'
@@ -62,3 +64,4 @@ Write-Host '  2) 注销重登（或任务管理器结束 ctfmon.exe 后重开资
 Write-Host '  3) Win+空格 切到「HuFu 虎符输入法」即可使用'
 Write-Host ''
 Write-Host '卸载: .\uninstall.ps1'
+Stop-Transcript | Out-Null

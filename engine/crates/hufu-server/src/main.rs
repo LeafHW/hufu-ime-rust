@@ -6,6 +6,8 @@
 mod host;
 mod http;
 mod pipe;
+#[cfg(windows)]
+mod tray;
 
 use host::{parse_key, Host};
 use http::{Request, Response};
@@ -56,6 +58,29 @@ fn main() {
         std::thread::spawn(move || {
             if let Err(e) = pipe::run_pipe(p) {
                 eprintln!("命名管道服务退出: {e}");
+            }
+        });
+    }
+
+    // Windows 托盘（双击开设置页 / 右键退出）
+    #[cfg(windows)]
+    {
+        use std::sync::mpsc;
+        let (quit_tx, quit_rx) = mpsc::channel::<()>();
+        let (open_tx, open_rx) = mpsc::channel::<()>();
+        tray::spawn(quit_tx, open_tx);
+        let url = format!("http://{addr}/");
+        std::thread::spawn(move || {
+            if open_rx.try_recv().is_ok() || open_rx.recv().is_ok() {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &url])
+                    .spawn();
+            }
+        });
+        std::thread::spawn(move || {
+            if quit_rx.recv().is_ok() {
+                let _ = std::fs::remove_file(std::env::current_dir().unwrap_or_default().join("server.pid"));
+                std::process::exit(0);
             }
         });
     }
