@@ -293,8 +293,8 @@ impl CandidateWindowV2 {
             })
             .ok()
     }
-    /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。
-    pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>) {
+    /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。selected=高亮行（页内 0 起）。
+    pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>, selected: usize) {
         let kind = material_kind(skin);
         let tint_hex = skin
             .pointer("/skin/material/tint")
@@ -452,10 +452,11 @@ impl CandidateWindowV2 {
             let y0 = margin_y + line_h * code_row;
 
             // 候选行
+            let sel = selected.min(cands.len().saturating_sub(1));
             for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
                 let y = y0 + line_h * i as f32;
-                if i == 0 {
-                    // 首选高亮（圆角胶囊）
+                if i == sel {
+                    // 高亮行（圆角胶囊；↑↓ 移动）
                     if let Some(b) = &b_hi {
                         let rr = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
@@ -470,7 +471,7 @@ impl CandidateWindowV2 {
                         ctx.FillRoundedRectangle(&rr, b);
                     }
                 }
-                let (bt, bl) = if i == 0 {
+                let (bt, bl) = if i == sel {
                     (&b_hi_txt, &b_hi_lbl)
                 } else {
                     (&b_text, &b_label)
