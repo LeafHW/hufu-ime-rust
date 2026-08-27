@@ -93,6 +93,19 @@ impl Engine {
         Ok(())
     }
 
+    /// 重新加载用户数据（用户词/用户调整），码表主体不重载。
+    pub fn reload_user_data(&mut self) {
+        let dir = self.schema.dir.clone();
+        let uw = dir.join("用户词.txt");
+        if let Ok(ud) = hufu_dict::user::UserDict::load(&uw) {
+            self.schema.user_dict = ud;
+        }
+        let adj = dir.join("用户调整.txt");
+        if let Ok(a) = hufu_dict::user::UserAdjust::load(&adj) {
+            self.schema.adjust = a;
+        }
+    }
+
     /// 方案是否启用整句。
     pub fn sentence_active(&self) -> bool {
         if !self.config.sentence.enabled || self.sentence.is_none() {
@@ -222,6 +235,7 @@ impl Engine {
                 }
             }
             KeyCode::Char(c) => self.on_char(session, c, m.shift),
+            KeyCode::Space => self.on_char(session, ' ', false),
             KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete => {
                 if !session.raw.is_empty() {
                     KeyOutcome::consumed(self.state(session))
