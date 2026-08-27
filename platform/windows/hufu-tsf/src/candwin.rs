@@ -127,8 +127,19 @@ impl CandidateWindow {
                 *bits.add(i) = bg_px;
             }
 
-            // GDI 文本
+            // GDI 文本（字体族尊重皮肤 font_face）
             let _ = SetBkMode(memdc, TRANSPARENT);
+            let face: Vec<u16> = {
+                let f = skin
+                    .pointer("/skin/layout/font_face")
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("font_face")))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let mut v: Vec<u16> = f.encode_utf16().collect();
+                v.push(0);
+                v
+            };
+            let face_ptr = if face.len() > 1 { PCWSTR(face.as_ptr()) } else { PCWSTR::null() };
             let make_font = |h: i32| {
                 CreateFontW(
                     -h,
@@ -144,7 +155,7 @@ impl CandidateWindow {
                     0,
                     CLEARTYPE_QUALITY.0 as u32,
                     DEFAULT_PITCH.0 as u32,
-                    PCWSTR::null(),
+                    face_ptr,
                 )
             };
             let hfont = make_font(font_h - 8);
