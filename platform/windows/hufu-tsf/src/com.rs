@@ -157,7 +157,7 @@ pub fn register_profile() {
             profiles.Register(&crate::CLSID_HUFU_TSF)?;
             let clsid = crate::CLSID_HUFU_TSF;
             let langid = 0x0804u16; // zh-CN
-            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().chain([0]).collect();
             profiles.AddLanguageProfile(
                 &clsid,
                 langid,

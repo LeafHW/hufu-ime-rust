@@ -129,6 +129,7 @@ pub struct CandidateWindowV2 {
     target: Option<IDCompositionTarget>,
     visual: Option<IDCompositionVisual>,
     dwrite: Option<IDWriteFactory>,
+    dxgi: Option<IDXGIDevice>,
     size: (i32, i32),
 }
 
@@ -217,6 +218,7 @@ impl CandidateWindowV2 {
                 target: Some(target),
                 visual: Some(visual),
                 dwrite: Some(dwrite),
+                dxgi: Some(dxgi_dev.clone()),
                 size: (0, 0),
             })
         }
@@ -241,9 +243,9 @@ impl CandidateWindowV2 {
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: 2,
-                Scaling: DXGI_SCALING_NONE,
+                Scaling: DXGI_SCALING_STRETCH,
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 Flags: 0,
             };
             // 重建 swapchain（尺寸变更；候选窗小、代价可忽略）
@@ -256,6 +258,7 @@ impl CandidateWindowV2 {
                 (&self.visual, &self.target, &self.dcomp)
             {
                 if visual.SetContent(&chain).is_err() || target.SetRoot(visual).is_err() || dc.Commit().is_err() {
+                    crate::tsf::trace("cw2: dcomp attach FAIL");
                     return false;
                 }
             }
@@ -266,19 +269,30 @@ impl CandidateWindowV2 {
     }
 
     unsafe fn create_chain_from_ctx(&mut self, desc: &DXGI_SWAP_CHAIN_DESC1) -> Option<IDXGISwapChain1> {
-        // D2D 设备内部持 DXGI 设备：通过 QI 上下文 → 设备
-        let d2d_dev: ID2D1Device = self.ctx.as_ref()?.GetDevice().ok()?;
-        let dxgi_dev: IDXGIDevice = d2d_dev.cast().ok()?;
-        let factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
-        factory
-            .CreateSwapChainForComposition(
-                &dxgi_dev,
-                desc,
-                None,
-            )
+        // 用 new() 时存下的 DXGI 设备（ID2D1Device QI 不出 IDXGIDevice）；
+        // factory 必须与设备同源（device→adapter→GetParent），否则 INVALID_CALL
+        let dxgi_dev: IDXGIDevice = self.dxgi.clone()?;
+        let adapter: IDXGIAdapter = match dxgi_dev.GetAdapter() {
+            Ok(a) => a,
+            Err(e) => {
+                crate::tsf::trace(&format!("cw2: GetAdapter err 0x{:08X}", e.code().0 as u32));
+                return None;
+            }
+        };
+        let factory: IDXGIFactory2 = match adapter.GetParent() {
+            Ok(f) => f,
+            Err(e) => {
+                crate::tsf::trace(&format!("cw2: factory err 0x{:08X}", e.code().0 as u32));
+                return None;
+            }
+        };
+        factory.CreateSwapChainForComposition(&dxgi_dev, desc, None)
+            .map_err(|e| {
+                crate::tsf::trace(&format!("cw2: CreateSwapChain err 0x{:08X}", e.code().0 as u32));
+                e
+            })
             .ok()
     }
-
     /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。
     pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>) {
         let kind = material_kind(skin);
@@ -300,6 +314,7 @@ impl CandidateWindowV2 {
         let w = width as u32;
         let h = height as u32;
         if !self.ensure_swapchain(w.max(1), h.max(1)) {
+            crate::tsf::trace("cw2: ensure_swapchain FAIL");
             return;
         }
 
@@ -519,6 +534,11 @@ impl CandidateWindowV2 {
                 height as i32,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
+            crate::tsf::trace(&format!(
+                "cw2: SetWindowPos({x},{y}) err={} visible={}",
+                GetLastError().0,
+                IsWindowVisible(self.hwnd).0
+            ));
         }
     }
 
