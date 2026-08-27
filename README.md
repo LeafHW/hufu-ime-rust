@@ -15,13 +15,14 @@
 | 整句输入 | 兼容 TigerClaw TCSKNM02 明文 ngram 模型（Kneser-Ney trigram），beam search 组句，置信前缀提前上屏，补充语料 Aho–Corasick 奖励；预留 LLM 重排接口（Qwen3 GGUF）；**全部权重可调** |
 | 候选交互 | 数字/分号/引号/自定义选重键、翻页、竖排/横排、调序、置顶、软删、延时显示 |
 | 反查 | `` ` `` 引导小鹤双拼反查；注释显示拼音/Unicode 分区/拆分 |
-| 符号系统 | 快符 `;a`–`;z`、一简符号、`/xx` 分类符号、动态变量（日期/时间/星期）、`\` 命令空间 |
-| 繁简与注解 | OpenCC txt 对照（简↔繁、异体、拼音注、emoji 注、拆分注），候选滤镜链 |
+| 符号系统 | 快符 `;a`–`;z`、一简符号、`/xx` 分类符号、动态变量（日期/时间/星期）、`\` 命令空间、**`\calc` 真计算器**（+ - * / % ^ 括号，全角符号兼容，上屏纯数值）、**`\w` 造词**（Rime encoder 规则构码，选词自动入用户词库） |
+| 繁简与注解 | OpenCC txt 对照（简↔繁、emoji 注），候选滤镜链：前 3 候选自动追加繁体（⚑繁）与 emoji（😊）变体，设置界面开关+方向可选 |
 | 用户数据 | 用户词四态（加/隐/权/序）、追加式调整日志、按时间戳导出 |
 | 皮肤 | JSON 皮肤：19 个颜色角色 + 布局参数 + **材质**（纯色/半透明/毛玻璃磨砂/玻璃边框），Windows 用 DWM Acrylic/Mica + Direct2D，macOS 用 NSVisualEffectView；兼容导入 weasel/squirrel 配色 |
 | 设置界面 | 本地 Web UI（daemon 托管），全图形化：方案/候选/键位/整句权重/皮肤编辑器/用户词管理/导入导出。**不碰 yaml/lua** |
 | 中英切换 | Shift / Ctrl+Space / Caps / 跟随系统；中文态英文标点；大小写保留混输 |
-| 音效 | 4 类按键音 + 音量（可选） |
+| 音效 | 4 类按键音 + 音量（可选）：引擎按键即出标签（key/select/commit/page），DLL waveOut 播放（管道取 base64 音频，音量 0–100），设置界面开关+试听 |
+| 数据安全 | 全量用户数据快照导出（配置+用户词+调整日志，ISO 日期时间戳）；HTTP BOM 容错 |
 
 ## 架构
 
@@ -68,11 +69,11 @@ hufu/
 | `hufu-types` | ✅ | — |
 | `hufu-dict` | ✅ | 虎码单字 113k 条/272ms、虎码字词（import 闭包）246k 条/1.2s、QQ五笔 96k/114ms、多多 B 定制 33k/81ms；置顶/软删回放（最新在前、无重复、pinned 标记） |
 | `hufu-config` | ✅ | — |
-| `hufu-engine` | ✅ | 真实码表 REPL：顶功（`tuj`+死端字母推屏 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显；动态变量 `\da`→真实日期、`\n12345`→一万二千三百四十五、`\N1234`→壹萬贰仟大写金额（HTTP 在线上屏实测）；Ctrl+Shift+数字 置顶 / Ctrl+Delete 软删（日志落盘+回放） |
+| `hufu-engine` | ✅ | 真实码表 REPL：顶功（`tuj`+死端字母推屏 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显；动态变量 `\da`→真实日期、`\n12345`→一万二千三百四十五、`\N1234`→壹萬贰仟大写金额、**`\calc(1+2)*3`→上屏 9**（HTTP 在线实测）、**`\w就就`→构码 jj 入库**（Rime encoder fixture）；Ctrl+Shift+数字 置顶 / Ctrl+Delete 软删（日志落盘+回放）；音效标签 key/select/commit/page；OpenCC 繁体变体（真实 ST 表：来→來、那个→那個 ⚑繁 + emoji） |
 | `hufu-sentence` | ✅ | 真实 TCSKNM02 224MB 模型加载 87ms；`tujatuja`→「我们我们」、`mfyto`→「大一点我是」；单次组句 0.4–2.8ms；提前上屏提案 |
 | `hufu-skin` | ✅ | 19 颜色角色 + 材质模型；weasel 配色互导（含 0xAABBGGRR ↔ #RRGGBBAA） |
 | `hufu-cli` | ✅ | check / convert / repl |
-| `hufu-server` + 设置 GUI | ✅ | 18 REST 路由（+候选置顶/隐藏）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/导入导出） |
+| `hufu-server` + 设置 GUI | ✅ | 20 REST 路由（+候选置顶/隐藏/音效试听/全量快照导出）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/音效开关+试听/繁简开关/快照导出/导入导出） |
 | Windows TSF | 🔨 v1→v2 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；冒烟 12 步全绿：COM 注册、msctf 激活链（AdviseKeyEventSink 前景接收器 ✓）、管道引擎链；**候选窗 v2 已实测**：D3D11+DComp+D2D+DWM accent 四材质（solid/translucent/frosted 磨砂/glass 玻璃）各真实渲染一帧 ✓，皮肤近热更新（会话间重拉）；**待**：管理员 HKLM 注册后真实系统激活（UAC 一次）、插入点跟随 |
 | macOS IMK | 🔨 骨架 | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
 
