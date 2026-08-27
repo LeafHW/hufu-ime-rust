@@ -1,6 +1,7 @@
 //! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin::CandidateWindow;
+use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
@@ -15,6 +16,9 @@ pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub client_id: u32,
     pub composition: Option<ITfComposition>,
+    /// v2（DComp+Acrylic）初始化失败 → 回退 v1
+    pub cand2: Option<CandidateWindowV2>,
+    pub cand2_dead: bool,
     pub cand: Option<CandidateWindow>,
     pub skin: serde_json::Value,
 }
@@ -25,6 +29,8 @@ impl Shared {
             thread_mgr: None,
             client_id: 0,
             composition: None,
+            cand2: None,
+            cand2_dead: false,
             cand: None,
             skin: serde_json::Value::Null,
         }
@@ -91,6 +97,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             }
         }
         g.composition = None;
+        if let Some(c) = g.cand2.take() {
+            c.hide();
+        }
         g.cand = None;
         g.thread_mgr = None;
         g.client_id = 0;
@@ -331,11 +340,34 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         run_session(&shared, Op::SetPreedit(preedit.clone()))?;
     }
 
-    // 2) 候选窗
+    // 2) 候选窗（v2 优先，初始化失败回退 v1）
     g.load_skin();
     if cands.is_empty() {
+        if let Some(c) = g.cand2.as_ref() {
+            c.hide();
+        }
         if let Some(c) = g.cand.take() {
             c.hide();
+        }
+    } else if !g.cand2_dead {
+        if g.cand2.is_none() {
+            match CandidateWindowV2::new() {
+                Some(v2) => g.cand2 = Some(v2),
+                None => g.cand2_dead = true,
+            }
+        }
+        let skin = g.skin.clone();
+        match g.cand2.as_mut() {
+            Some(c) => c.show(&cands, &raw, &skin),
+            None => {}
+        }
+        if g.cand2_dead {
+            if g.cand.is_none() {
+                g.cand = Some(CandidateWindow::new());
+            }
+            if let Some(c) = g.cand.as_ref() {
+                c.show(&cands, &raw, &g.skin);
+            }
         }
     } else {
         if g.cand.is_none() {

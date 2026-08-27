@@ -26,6 +26,12 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectComposition",
+    "Foundation_Numerics",
 ] }
 windows-core = "0.58"
 serde = { version = "1", features = ["derive"] }
