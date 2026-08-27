@@ -219,6 +219,14 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>引导前缀</label><input type="text" maxlength="1" id="r-prefix" style="width:60px"></div>
       <div class="field"><label>反查表文件</label><input type="text" data-path="reverse.table" style="width:230px"></div>
     </div>
+
+    <h3>音效</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="snd-en"><label for="snd-en">启用按键音</label></div>
+      <div class="field"><label>音量 <span id="snd-vol-v"></span></label>
+        <input type="range" id="snd-vol" min="0" max="100" style="width:180px"></div>
+    </div>
+    <div class="sub">编码 / 选词 / 上屏 / 翻页 四类提示音（数据目录 sounds/ 下可替换 wav：key.wav、select.wav、commit.wav、page.wav）。</div>
   </section>
 
   <!-- ════ 整句 ════ -->
@@ -392,6 +400,10 @@ function bindInputs() {
   B("#r-en", "reverse.enabled");
   B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
   B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
+  B("#snd-en", "sound.enabled");
+  $("#snd-vol").value = CFG.sound?.volume ?? 50;
+  $("#snd-vol-v").textContent = (CFG.sound?.volume ?? 50) + "%";
+  $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; };
   $("#c-2nd").value = CFG.candidates.second_select || "";
   $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; };
   $("#c-3rd").value = CFG.candidates.third_select || "";

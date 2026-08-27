@@ -139,6 +139,9 @@ pub struct KeyOutcome {
     pub commit: Option<String>,
     /// 最新的会话状态（组合串 / 候选 / 辅助提示）
     pub state: Option<SessionState>,
+    /// 提示音标签（sound.enabled 时由引擎填充：key/select/commit/page）
+    #[serde(default)]
+    pub sound: Option<String>,
 }
 
 impl KeyOutcome {
@@ -147,6 +150,7 @@ impl KeyOutcome {
             consumed: false,
             commit: None,
             state: None,
+            sound: None,
         }
     }
     pub fn consumed(state: SessionState) -> Self {
@@ -154,6 +158,7 @@ impl KeyOutcome {
             consumed: true,
             commit: None,
             state: Some(state),
+            sound: None,
         }
     }
     pub fn commit(text: impl Into<String>, state: SessionState) -> Self {
@@ -161,6 +166,7 @@ impl KeyOutcome {
             consumed: true,
             commit: Some(text.into()),
             state: Some(state),
+            sound: None,
         }
     }
 }

@@ -70,8 +70,8 @@ impl CandidateWindow {
         }
     }
 
-    /// 渲染并显示。
-    pub fn show(&self, cands: &[(String, String)], raw: &str, skin: &Value) {
+    /// 渲染并显示。anchor=插入点屏幕矩形（无则居中下 1/3）。
+    pub fn show(&self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>) {
         unsafe {
             let back = color_of(skin, "back_color", [32, 32, 34, 0xE6]);
             let border = color_of(skin, "border_color", [255, 255, 255, 0x26]);
@@ -207,12 +207,26 @@ impl CandidateWindow {
                 *bits.add(y as usize * width as usize + (width - 1) as usize) = border_px;
             }
 
-            // 定位：v1 屏幕下 1/3 居中
+            // 定位：优先插入点上方，出屏翻下方
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let sh = GetSystemMetrics(SM_CYSCREEN);
-            let pt = POINT {
-                x: (sw - width) / 2,
-                y: sh * 2 / 3,
+            let pt = match anchor {
+                Some(r) => {
+                    let x = (r.left).clamp(0, (sw - width).max(0));
+                    let above = r.top - height - 4;
+                    if above >= 0 {
+                        POINT { x, y: above }
+                    } else {
+                        POINT {
+                            x,
+                            y: (r.bottom + 4).min((sh - height).max(0)),
+                        }
+                    }
+                }
+                None => POINT {
+                    x: (sw - width) / 2,
+                    y: sh * 2 / 3,
+                },
             };
             let size = SIZE { cx: width, cy: height };
             let ok = UpdateLayeredWindow(

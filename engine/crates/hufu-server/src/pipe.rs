@@ -47,8 +47,52 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 Err(_) => serde_json::json!({"skin": hufu_skin::Skin::default()}),
             }
         }
+        "sound" => {
+            // tag → {data: base64 wav, volume}（文件缺失返回 404 语义 null）
+            let tag = req.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+            let safe = ["key", "select", "commit", "page"];
+            if !safe.contains(&tag) {
+                return serde_json::json!({"error": "未知音效"});
+            }
+            let vol = host.engine.config.sound.volume;
+            let p = host.data_dir.join("sounds").join(format!("{tag}.wav"));
+            match std::fs::read(&p) {
+                Ok(bytes) => serde_json::json!({
+                    "data": base64_encode(&bytes),
+                    "volume": vol,
+                }),
+                Err(_) => serde_json::json!({"data": null, "volume": vol}),
+            }
+        }
         op => serde_json::json!({"error": format!("未知操作: {op}")}),
     }
+}
+
+/// 标准 base64 编码（服务端自足实现，免新增依赖）。
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(windows)]

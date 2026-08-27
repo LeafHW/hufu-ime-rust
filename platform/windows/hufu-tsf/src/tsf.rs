@@ -5,6 +5,7 @@ use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::MapWindowPoints;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 use windows_core::*;
@@ -23,6 +24,8 @@ pub struct Shared {
     pub skin: serde_json::Value,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
+    /// 插入点（屏幕坐标，GetTextExt 实测）
+    pub caret: Option<RECT>,
 }
 
 impl Shared {
@@ -36,6 +39,7 @@ impl Shared {
             cand: None,
             skin: serde_json::Value::Null,
             skin_stale: true,
+            caret: None,
         }
     }
 
@@ -155,7 +159,8 @@ impl HuFuTs_Impl {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
         };
-        let Some((consumed, commit, state)) = ipc::key_request(&name, m_shift, m_ctrl, m_alt)
+        let Some((consumed, commit, state, sound)) =
+            ipc::key_request(&name, m_shift, m_ctrl, m_alt)
         else {
             return BOOL(0);
         };
@@ -163,6 +168,9 @@ impl HuFuTs_Impl {
             return BOOL(0);
         }
         if !test_only {
+            if let Some(tag) = sound {
+                crate::sound::play(&tag);
+            }
             let _ = update_ui(self.shared.clone(), commit, state);
         }
         BOOL(1)
@@ -178,7 +186,7 @@ pub fn test_key(vk: u32) -> i32 {
     let _ = (shift, ctrl, alt);
     let r = ipc::key_request(&name, false, false, false);
     match r {
-        Some((consumed, _commit, _state)) => {
+        Some((consumed, _commit, _state, _sound)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
             if consumed { 1 } else { 0 }
         }
@@ -257,6 +265,7 @@ impl ITfEditSession_Impl for EditSession_Impl {
                 let sink: ITfCompositionSink = CompSinkObj.into();
                 let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
                 g.composition = Some(comp);
+                query_caret(&mut g, &ctx, ec);
                 Ok(())
             }
             Op::SetPreedit(text) => {
@@ -267,6 +276,7 @@ impl ITfEditSession_Impl for EditSession_Impl {
                 let range: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &wstr)? };
+                query_caret(&mut g, &ctx, ec);
                 Ok(())
             }
             Op::Commit(text) => {
@@ -295,6 +305,37 @@ impl ITfEditSession_Impl for EditSession_Impl {
             }
         }
     }
+}
+
+/// 组段内文本的屏幕矩形（插入点跟随）。
+fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    g.caret = None;
+    let Some(comp) = g.composition.clone() else { return };
+    let Ok(range) = (unsafe { comp.GetRange() }) else { return };
+    let Ok(view) = (unsafe { ctx.GetActiveView() }) else { return };
+    let mut rect = RECT::default();
+    let mut clipped = BOOL(0);
+    if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_err() {
+        return;
+    }
+    // 客户区 → 屏幕坐标
+    let Ok(hwnd) = (unsafe { view.GetWnd() }) else { return };
+    if hwnd.0.is_null() {
+        return;
+    }
+    let mut pts = [
+        POINT { x: rect.left, y: rect.top },
+        POINT { x: rect.right, y: rect.bottom },
+    ];
+    unsafe {
+        MapWindowPoints(hwnd, HWND(std::ptr::null_mut()), &mut pts);
+    }
+    g.caret = Some(RECT {
+        left: pts[0].x,
+        top: pts[0].y,
+        right: pts[1].x,
+        bottom: pts[1].y,
+    });
 }
 
 /// 空组段接收器。
@@ -367,8 +408,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             }
         }
         let skin = g.skin.clone();
+        let caret = g.caret;
         match g.cand2.as_mut() {
-            Some(c) => c.show(&cands, &raw, &skin),
+            Some(c) => c.show(&cands, &raw, &skin, caret.as_ref()),
             None => {}
         }
         if g.cand2_dead {
@@ -376,15 +418,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 g.cand = Some(CandidateWindow::new());
             }
             if let Some(c) = g.cand.as_ref() {
-                c.show(&cands, &raw, &g.skin);
+                c.show(&cands, &raw, &g.skin, caret.as_ref());
             }
         }
     } else {
         if g.cand.is_none() {
             g.cand = Some(CandidateWindow::new());
         }
+        let caret = g.caret;
         if let Some(c) = g.cand.as_ref() {
-            c.show(&cands, &raw, &g.skin);
+            c.show(&cands, &raw, &g.skin, caret.as_ref());
         }
     }
     Ok(())

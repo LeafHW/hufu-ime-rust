@@ -36,6 +36,8 @@ pub struct Engine {
     /// 用户数据目录
     pub data_dir: PathBuf,
     sentence: Option<Arc<dyn SentenceDecoder>>,
+    /// 单次按键内的提示音标签提示（select/page 覆盖默认 key/commit）
+    sound_hint: Option<&'static str>,
 }
 
 impl Engine {
@@ -59,6 +61,7 @@ impl Engine {
             schemas,
             data_dir: data_dir.to_path_buf(),
             sentence: None,
+            sound_hint: None,
         })
     }
 
@@ -74,6 +77,7 @@ impl Engine {
                 .to_path_buf(),
             schema,
             sentence: None,
+            sound_hint: None,
         })
     }
 
@@ -124,6 +128,21 @@ impl Engine {
         if !key.is_press {
             return KeyOutcome::passthrough();
         }
+        self.sound_hint = None;
+        let mut out = self.process_key_inner(session, key);
+        // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
+        if self.config.sound.enabled && out.consumed {
+            let tag = self.sound_hint.unwrap_or(if out.commit.is_some() {
+                "commit"
+            } else {
+                "key"
+            });
+            out.sound = Some(tag.to_string());
+        }
+        out
+    }
+
+    fn process_key_inner(&mut self, session: &mut Session, key: KeyInput) -> KeyOutcome {
         let m = key.modifiers;
         if m.ctrl && !m.alt {
             if let Some(c) = key.key.as_char() {
@@ -597,6 +616,7 @@ impl Engine {
         let start = session.page * page_size;
         let pick = session.candidates.get(start + idx).cloned();
         if let Some(cand) = pick {
+            self.sound_hint = Some("select");
             self.learn(&cand);
             let text = cand.commit_text().to_string();
             session.clear();
@@ -611,6 +631,7 @@ impl Engine {
         if pages <= 1 {
             return KeyOutcome::consumed(self.state(session));
         }
+        self.sound_hint = Some("page");
         let cur = session.page as i32;
         let next = if dir < 0 {
             if cur == 0 {
@@ -1044,6 +1065,28 @@ mod tests {
         let _ = eng.process_key(&mut s3, del);
         let st = eng.state(&s3);
         assert_eq!(st.candidates[0].text, "就", "软删后『就』应回到首位");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sound_tags() {
+        // 开启音效后：编码= key、空格上屏/数字选词= select；关闭则无标签
+        let (mut eng, dir) = test_engine("snd");
+        eng.config.sound.enabled = true;
+        let mut s = Session::new(true);
+        let o = eng.process_key(&mut s, key('a'));
+        assert_eq!(o.sound.as_deref(), Some("key"));
+        let o = eng.process_key(&mut s, key(' '));
+        assert_eq!(o.sound.as_deref(), Some("select"), "空格首选上屏");
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('a'));
+        let o = eng.process_key(&mut s2, key('1'));
+        assert_eq!(o.sound.as_deref(), Some("select"), "数字选词");
+        // 关闭 → 无标签
+        eng.config.sound.enabled = false;
+        let mut s4 = Session::new(true);
+        let o = eng.process_key(&mut s4, key('a'));
+        assert_eq!(o.sound, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

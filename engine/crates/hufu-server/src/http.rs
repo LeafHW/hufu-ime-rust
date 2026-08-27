@@ -14,7 +14,13 @@ pub struct Request {
 
 impl Request {
     pub fn json(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+        // 容错：剥 UTF-8 BOM（Windows 工具链常见）
+        let body = if self.body.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            &self.body[3..]
+        } else {
+            &self.body
+        };
+        serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
     }
 }
 
