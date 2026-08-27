@@ -7,6 +7,7 @@ mod candwin;
 mod candwin2;
 mod com;
 mod ipc;
+mod sound;
 mod tsf;
 
 use windows_core::*;
@@ -105,7 +106,7 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
         ("您好".to_string(), "".to_string()),
         ("拟好".to_string(), "少用".to_string()),
     ];
-    w.show(&cands, "nih", &skin);
+    w.show(&cands, "nih", &skin, None);
     std::thread::sleep(std::time::Duration::from_millis(400));
     w.hide();
     eprintln!("candwin2: {kind} 材质渲染+隐藏完成");
