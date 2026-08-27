@@ -27,6 +27,72 @@ pub trait SentenceDecoder: Send + Sync {
     fn early_commit_proposal(&self, raw: &str) -> Option<(String, usize)>;
 }
 
+/// 「写入编码选重」解析结果（整句模式选重后缀）。
+#[derive(Debug, Clone)]
+pub struct RankLocks {
+    /// 去掉选重后缀后的纯编码
+    pub base: String,
+    /// (块结束位置, 块起始位置, 1 起名次)，位置均以 base 字符下标计
+    pub locks: Vec<(usize, usize, usize)>,
+    /// base 第 i 个字符在原始 raw 中的字符下标（提前上屏 consumed 映射用）
+    pub orig_of_base: Vec<usize>,
+}
+
+impl RankLocks {
+    pub fn has_locks(&self) -> bool {
+        !self.locks.is_empty()
+    }
+}
+
+/// 解析选重后缀：raw 中紧跟在编码块（[a-z]+）之后的
+/// `;`(第2) `'`(第3) `2-9`(第N) `0`(第10) 锁定该段的名次。
+/// 其余字符原样保留在 base 中（lenient）。连续后缀只取第一个。
+pub fn parse_rank_locks(raw: &str) -> RankLocks {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut base = String::new();
+    let mut locks = Vec::new();
+    let mut orig_of_base = Vec::new();
+    let mut run_start: Option<usize> = None; // 当前字母块在 base 中的起始下标
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let rank = match c {
+            ';' => Some(2),
+            '\'' => Some(3),
+            '1'..='9' => Some(c.to_digit(10).unwrap() as usize),
+            '0' => Some(10),
+            _ => None,
+        };
+        if let Some(r) = rank {
+            if let Some(start) = run_start.take() {
+                // 锁定 base 中 [start, base.len()) 块的名次 r
+                locks.push((base.chars().count(), start, r));
+                // 连续后缀：跳过（只取第一个）
+                while i + 1 < chars.len() && matches!(chars[i + 1], ';' | '\'' | '0'..='9') {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        if c.is_ascii_lowercase() {
+            if run_start.is_none() {
+                run_start = Some(base.chars().count());
+            }
+        } else {
+            run_start = None;
+        }
+        base.push(c);
+        orig_of_base.push(i);
+        i += 1;
+    }
+    RankLocks {
+        base,
+        locks,
+        orig_of_base,
+    }
+}
+
 /// 引擎：配置 + 当前方案 + 可选整句解码器。
 pub struct Engine {
     pub config: Config,
@@ -360,11 +426,10 @@ impl Engine {
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
         // 选重键（不构成编码延续时才作为选重）
         if !extends {
-            if c == self.config.candidates.second_select {
-                return self.select_candidate(session, 1);
-            }
-            if c == self.config.candidates.third_select {
-                return self.select_candidate(session, 2);
+            if c == self.config.candidates.second_select
+                || c == self.config.candidates.third_select
+            {
+                return self.on_rank_key(session, c);
             }
         }
         // 编码字符（含死路：交给 after_append 处理顶功/清屏）
@@ -380,11 +445,9 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         // 选重键
-        if c == self.config.candidates.second_select {
-            return self.select_candidate(session, 1);
-        }
-        if c == self.config.candidates.third_select {
-            return self.select_candidate(session, 2);
+        if c == self.config.candidates.second_select || c == self.config.candidates.third_select
+        {
+            return self.on_rank_key(session, c);
         }
         // 翻页键
         if self.config.candidates.paging_keys.contains(c) {
@@ -400,8 +463,8 @@ impl Engine {
         }
         // 数字选重
         if let Some(n) = c.to_digit(10) {
-            let idx = if n == 0 { 9 } else { (n - 1) as usize };
-            return self.select_candidate(session, idx);
+            let _ = n;
+            return self.on_rank_key(session, c);
         }
         // 空格首选
         if c == ' ' {
@@ -499,6 +562,90 @@ impl Engine {
         if dead_end && !sentence_mode && self.config.input.auto_clear_empty && !has_upper {
             session.clear();
         }
+    }
+
+    /// 选重键分流（;/'/数字）。
+    /// 整句模式：写入编码选重——后缀进 raw 锁定该段解释，继续组句不上屏
+    /// （TigerClaw/Rime 语义，提前上屏规则另行接管）。
+    /// 非整句：立即选重上屏。
+    fn on_rank_key(&mut self, session: &mut Session, c: char) -> KeyOutcome {
+        if self.sentence_active()
+            && session.mode == InputMode::Normal
+            && !session.raw.is_empty()
+            && !session.raw.starts_with([';', '/', '\\'])
+            && session.raw.chars().all(|x| {
+                x.is_ascii_lowercase() || matches!(x, ';' | '\'' | '0'..='9')
+            })
+        {
+            self.sound_hint = Some("select");
+            // 名次基准 = 候选框显示序（置顶/用户词参与排序）。
+            // 解码器名次 = 码表原序 → 换算后写入，保证锁到用户看到的那个词。
+            let disp_rank: usize = match c {
+                x if x == self.config.candidates.second_select => 2,
+                x if x == self.config.candidates.third_select => 3,
+                x => {
+                    let n = x.to_digit(10).unwrap_or(1);
+                    if n == 0 {
+                        10
+                    } else {
+                        n as usize
+                    }
+                }
+            };
+            let chunk: String = session
+                .raw
+                .chars()
+                .rev()
+                .take_while(|k| k.is_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let suffix = if !chunk.is_empty() {
+                self.schema
+                    .candidates(&chunk)
+                    .get(disp_rank - 1)
+                    .and_then(|pick| {
+                        self.schema
+                            .dict
+                            .lookup(&chunk)
+                            .into_iter()
+                            .position(|e| e.text == pick.text)
+                            .map(|i| i + 1)
+                    })
+                    .and_then(|file_rank| {
+                        if (2..=10).contains(&file_rank) {
+                            Some(if file_rank == 10 {
+                                '0'
+                            } else {
+                                char::from_digit(file_rank as u32, 10).unwrap()
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(c)
+            } else {
+                c
+            };
+            session.raw.push(suffix);
+            self.refresh_candidates(session);
+            return self.take_or_state(session);
+        }
+        // 非整句：按名次立即选重上屏
+        let idx = match c {
+            x if x == self.config.candidates.second_select => 1,
+            x if x == self.config.candidates.third_select => 2,
+            x => {
+                let n = x.to_digit(10).unwrap_or(1);
+                if n == 0 {
+                    9
+                } else {
+                    (n - 1) as usize
+                }
+            }
+        };
+        self.select_candidate(session, idx)
     }
 
     /// raw 是否还有编码延续（前缀树或符号表）。
@@ -853,14 +1000,20 @@ impl Engine {
             return;
         }
 
+        let parsed = parse_rank_locks(&session.raw);
         let raw_len = session.raw.chars().count();
-        let sentence_mode =
-            self.sentence_active() && raw_len > self.config.input.max_code_length;
+        // 整句接管：超长，或带选重锁（≤4 码 + 锁时也走解码器组句）
+        let sentence_mode = self.sentence_active()
+            && (raw_len > self.config.input.max_code_length || parsed.has_locks());
         if sentence_mode {
             if let Some(dec) = &self.sentence {
-                session.candidates = dec.decode(&session.raw);
-                self.track_early_commit(session);
-                return;
+                let cands = dec.decode(&session.raw);
+                if !cands.is_empty() {
+                    session.candidates = cands;
+                    self.track_early_commit(session);
+                    return;
+                }
+                // 解码器无产物（如锁无法匹配任何段）：回退常规路径
             }
         }
 
@@ -1141,6 +1294,122 @@ mod tests {
             },
             is_press: true,
         }
+    }
+
+    #[test]
+    fn rank_locks_parse() {
+        // 无锁：base 原样
+        let p = parse_rank_locks("jdtuja");
+        assert_eq!(p.base, "jdtuja");
+        assert!(p.locks.is_empty());
+        assert_eq!(p.orig_of_base.len(), 6);
+
+        // 尾锁：jd + 2
+        let p = parse_rank_locks("jd2");
+        assert_eq!(p.base, "jd");
+        assert_eq!(p.locks, vec![(2, 0, 2)], "jd 后的 2 = 锁 [0,2) 名次 2");
+        assert_eq!(p.orig_of_base, vec![0, 1]);
+
+        // 中置锁 + 续打
+        let p = parse_rank_locks("jd2tuja");
+        assert_eq!(p.base, "jdtuja");
+        assert_eq!(p.locks, vec![(2, 0, 2)]);
+        assert_eq!(p.orig_of_base, vec![0, 1, 3, 4, 5, 6], "t 在原 raw 下标 3");
+
+        // 分号/引号/0
+        let p = parse_rank_locks("jd;");
+        assert_eq!(p.locks[0].2, 2);
+        let p = parse_rank_locks("jd'");
+        assert_eq!(p.locks[0].2, 3);
+        let p = parse_rank_locks("jd0");
+        assert_eq!(p.locks[0].2, 10);
+        // 连续后缀只取第一个
+        let p = parse_rank_locks("jd2;");
+        assert_eq!(p.locks.len(), 1);
+        assert_eq!(p.base, "jd");
+        // 两段各自锁
+        let p = parse_rank_locks("jd2tu'");
+        assert_eq!(p.base, "jdtu");
+        assert_eq!(p.locks, vec![(2, 0, 2), (4, 2, 3)]);
+        // 前导符号不锁
+        let p = parse_rank_locks(";");
+        assert_eq!(p.base, ";");
+        assert!(p.locks.is_empty());
+    }
+
+    /// mock 整句解码器：识别 raw 中的锁，返回「锁文+余量」形态候选。
+    struct MockDec;
+    impl SentenceDecoder for MockDec {
+        fn decode(&self, raw: &str) -> Vec<Candidate> {
+            let p = parse_rank_locks(raw);
+            if p.base.is_empty() {
+                return Vec::new();
+            }
+            let rank = p.locks.first().map(|l| l.2).unwrap_or(1);
+            let text = format!("锁{}+{}", rank, p.base);
+            vec![Candidate::new(text, raw.to_string(), CandidateKind::Sentence)]
+        }
+        fn early_commit_proposal(&self, _raw: &str) -> Option<(String, usize)> {
+            None
+        }
+    }
+
+    #[test]
+    fn sentence_rank_key_locks_not_commits() {
+        // 整句方案名带「整句」+ auto_enable → mock 解码器生效
+        let dir = std::env::temp_dir().join(format!("hufu-eng-整句lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句测试\njd\t人\njd\t什么\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 整句模式下按 2：写入编码选重，不上屏，候选首为锁定结果
+        let out = eng.process_key(&mut s, key('2'));
+        assert!(out.commit.is_none(), "整句选重不应立即上屏（实际 {:?}）", out.commit);
+        assert!(out.consumed);
+        let st = eng.state(&s);
+        assert_eq!(st.candidates[0].text, "锁2+jd", "候选首 = 锁定名次2");
+        assert_eq!(st.raw, "jd2");
+        // 继续打字：锁保留、组句继续
+        let _ = eng.process_key(&mut s, key('t'));
+        let st = eng.state(&s);
+        assert_eq!(st.raw, "jd2t");
+        assert_eq!(st.candidates[0].text, "锁2+jdt");
+        // 空格才上屏
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.unwrap(), "锁2+jdt");
+
+        // 分号锁第 2：名次换算后写入（此处字典序第2=什么 → 后缀 '2'）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out = eng.process_key(&mut s2, key(';'));
+        assert!(out.commit.is_none());
+        let st = eng.state(&s2);
+        assert_eq!(st.candidates[0].text, "锁2+jd");
+        assert_eq!(st.raw, "jd2", "分号归一为码表名次后缀");
+    }
+
+    #[test]
+    fn nonsentence_rank_key_still_commits() {
+        // 非整句（方案名不含「整句」）：数字选重立即上屏（原行为）
+        let (mut eng, _dir) = test_engine("nsl");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('2'));
+        assert_eq!(out.commit.unwrap(), "到的", "非整句数字选重立即上屏第 2");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
