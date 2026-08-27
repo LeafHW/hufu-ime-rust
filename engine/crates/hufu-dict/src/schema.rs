@@ -333,4 +333,27 @@ mod tests {
         assert_eq!(s.dict.lookup("t")[0].text, "我");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn pin_ordering_no_dup() {
+        // 同码多次置顶：最新在前、无重复；且置顶词应带 pinned 标记
+        // （混排 自造词 + 码表内词 时顺序仍一致）
+        let tmp = std::env::temp_dir().join(format!("hufu-test-pinord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(&tmp, "main.txt", "#hufu-dict v1 name=t\na\t来\na\t那个\n");
+        let mut s = Schema::load(&tmp).unwrap();
+        // pin 码表内词 + 自造词混合
+        s.adjust.pin("a", "那个"); // 码表内
+        s.adjust.pin("a", "abc"); // 自造
+        let cands = s.candidates("a");
+        let texts: Vec<String> = cands.iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, ["abc", "那个", "来"], "最新 pin(abc) 在最前: {texts:?}");
+        assert!(cands.iter().all(|e| (e.text == "来") ^ e.pinned), "两个 pin 词都应带 pinned");
+        // 再 pin 已 pin 的 → 移到最前，无重复
+        s.adjust.pin("a", "那个");
+        let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, ["那个", "abc", "来"], "重 pin: {texts:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
