@@ -7,6 +7,8 @@ mod host;
 mod http;
 mod pipe;
 #[cfg(windows)]
+mod clipboard;
+#[cfg(windows)]
 mod tray;
 
 use host::{parse_key, Host};

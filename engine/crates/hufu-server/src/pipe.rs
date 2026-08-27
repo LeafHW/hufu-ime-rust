@@ -64,6 +64,23 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 Err(_) => serde_json::json!({"data": null, "volume": vol}),
             }
         }
+        "clipboard" => {
+            // {exe} → {text}：白名单校验 + 读剪贴板（Ctrl+Shift+V 剪贴板上屏）
+            let cfg = host.engine.config.clipboard.clone();
+            if !cfg.enabled {
+                return serde_json::json!({"text": null, "reason": "disabled"});
+            }
+            let exe = req.get("exe").and_then(|t| t.as_str()).unwrap_or("");
+            let exe = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+            if !cfg.allows(exe) {
+                return serde_json::json!({"text": null, "reason": "whitelist"});
+            }
+            #[cfg(windows)]
+            let text = crate::clipboard::read_text();
+            #[cfg(not(windows))]
+            let text = String::new();
+            serde_json::json!({"text": text})
+        }
         op => serde_json::json!({"error": format!("未知操作: {op}")}),
     }
 }

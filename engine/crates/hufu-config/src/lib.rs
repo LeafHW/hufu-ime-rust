@@ -368,6 +368,18 @@ impl Default for ClipboardSection {
     }
 }
 
+impl ClipboardSection {
+    /// 白名单判定：空名单=全部进程允许；否则按 exe 名（大小写不敏感）匹配。
+    pub fn allows(&self, exe: &str) -> bool {
+        if self.whitelist.is_empty() {
+            return true;
+        }
+        self.whitelist
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(exe))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSection {

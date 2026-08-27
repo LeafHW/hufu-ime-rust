@@ -152,6 +152,17 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     fn dispatch(&self, wparam: usize, test_only: bool) -> BOOL {
+        // Ctrl+Shift+V：剪贴板上屏（配置+白名单由 server 判定）
+        if wparam == 0x56 {
+            unsafe {
+                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+                if ctrl && shift && !alt {
+                    return self.paste_clipboard(test_only);
+                }
+            }
+        }
         let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
             return BOOL(0);
         };
@@ -172,6 +183,25 @@ impl HuFuTs_Impl {
                 crate::sound::play(&tag);
             }
             let _ = update_ui(self.shared.clone(), commit, state);
+        }
+        BOOL(1)
+    }
+
+    /// Ctrl+Shift+V 剪贴板上屏：管道取文本（server 校验配置/白名单），
+    /// 有文本则插入光标处并吞键。
+    fn paste_clipboard(&self, test_only: bool) -> BOOL {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        let Some(text) = ipc::clipboard_request(&exe) else {
+            return BOOL(0);
+        };
+        if text.is_empty() {
+            return BOOL(0); // 未启用/白名单拒绝/剪贴板空 → 交给系统 Ctrl+Shift+V
+        }
+        if !test_only {
+            let _ = run_session(&self.shared, Op::Insert(text));
         }
         BOOL(1)
     }
@@ -240,6 +270,8 @@ enum Op {
     StartPreedit(String),
     SetPreedit(String),
     Commit(String),
+    /// 无组段直接插入文本（剪贴板上屏）
+    Insert(String),
     End,
 }
 
@@ -289,6 +321,24 @@ impl ITfEditSession_Impl for EditSession_Impl {
                     }
                 }
                 g.composition = None;
+                Ok(())
+            }
+            Op::Insert(text) => {
+                // 无组段：光标处直接插入（剪贴板上屏）
+                if g.composition.is_some() {
+                    // 有活动组段先结束
+                    if let Some(comp) = g.composition.clone() {
+                        unsafe {
+                            let _ = comp.EndComposition(ec);
+                        }
+                    }
+                    g.composition = None;
+                }
+                let ins: ITfInsertAtSelection = ctx.cast()?;
+                let wstr: Vec<u16> = text.encode_utf16().collect();
+                unsafe {
+                    ins.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &wstr)?;
+                }
                 Ok(())
             }
             Op::End => {
