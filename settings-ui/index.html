@@ -240,6 +240,14 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="oc-emoji"><label for="oc-emoji">Emoji 注解候选</label></div>
     </div>
     <div class="sub">候选前 3 名自动追加繁体变体（⚑繁 标记）与 emoji 变体（😊 标记）。数据目录 opencc/ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
+
+    <h3>剪贴板上屏</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="cb-en"><label for="cb-en">启用 Ctrl+Shift+V 剪贴板上屏</label></div>
+    </div>
+    <div class="field"><label>进程白名单（exe 名，逗号分隔；留空 = 所有进程）</label>
+      <input class="wide" id="cb-wl" placeholder="例如: notepad.exe, WINWORD.EXE"></div>
+    <div class="sub">在白名单进程里按 Ctrl+Shift+V 直接把剪贴板文本插入光标处（走输入法通道，不经系统粘贴，密码框类应用可定向关闭）。</div>
   </section>
 
   <!-- ════ 整句 ════ -->
@@ -424,6 +432,13 @@ function bindInputs() {
   B("#oc-en", "opencc.enabled"); B("#oc-emoji", "opencc.emoji");
   $("#oc-dir").value = CFG.opencc?.to_traditional === false ? "t2s" : "s2t";
   $("#oc-dir").onchange = e => { CFG.opencc = CFG.opencc || { enabled: false, to_traditional: true, emoji: false }; CFG.opencc.to_traditional = e.target.value === "s2t"; };
+  // 剪贴板上屏
+  B("#cb-en", "clipboard.enabled");
+  $("#cb-wl").value = (CFG.clipboard?.whitelist || []).join(", ");
+  $("#cb-wl").onchange = e => {
+    CFG.clipboard = CFG.clipboard || { enabled: false, whitelist: [] };
+    CFG.clipboard.whitelist = e.target.value.split(/[,，;；\n]/).map(s => s.trim()).filter(Boolean);
+  };
   $("#exp-all").onclick = async () => {
     try {
       const r = await api("GET", "/api/export");

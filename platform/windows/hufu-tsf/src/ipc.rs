@@ -101,3 +101,12 @@ pub fn ping() -> bool {
         .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
         .unwrap_or(false)
 }
+
+/// 剪贴板上屏：{exe} → 文本（未启用/白名单拒/空剪贴板 → None 或空串）。
+pub fn clipboard_request(exe: &str) -> Option<String> {
+    let resp = call(&serde_json::json!({"op": "clipboard", "exe": exe}))?;
+    match resp.get("text") {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
