@@ -21,6 +21,46 @@ type DllRegisterServerFn = unsafe extern "system" fn() -> HRESULT;
 type TestKeyFn = unsafe extern "system" fn(u32) -> i32;
 
 fn main() {
+    // 提权注册模式：hufu-tsf-smoke.exe reg —— 只做 msctf 语言档案注册
+    // （ITfInputProcessorProfiles::Register/AddLanguageProfile 写 HKLM，须管理员）
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("reg") {
+        unsafe {
+            let _ = OleInitialize(None);
+            let profiles: ITfInputProcessorProfiles =
+                CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+                    .expect("msctf profiles 不可用");
+            let code = |r: windows::core::Result<()>| -> u32 {
+                match r {
+                    Ok(()) => 0,
+                    Err(e) => e.code().0 as u32,
+                }
+            };
+            let hr = code(profiles.Register(&CLSID_HUFU));
+            println!("Register → 0x{hr:08X}");
+            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+            let hr2 = code(profiles.AddLanguageProfile(
+                &CLSID_HUFU,
+                0x0804,
+                &PROFILE_GUID,
+                &desc,
+                &[],
+                0,
+            ));
+            println!("AddLanguageProfile → 0x{hr2:08X}");
+            let hr3 = code(profiles.EnableLanguageProfile(
+                &CLSID_HUFU,
+                0x0804,
+                &PROFILE_GUID,
+                BOOL(1),
+            ));
+            println!("EnableLanguageProfile → 0x{hr3:08X}");
+            if hr == 0 && hr2 == 0 && hr3 == 0 {
+                println!("✓ msctf 档案注册完成");
+            }
+        }
+        return;
+    }
     let dll = r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll";
     let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
     unsafe {

@@ -338,19 +338,42 @@ struct EditSession {
 
 impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        trace("DoEditSession enter");
+        let r = self.do_edit_session(ec);
+        trace(&format!("DoEditSession exit ok={}", r.is_ok()));
+        r
+    }
+}
+
+impl EditSession_Impl {
+    fn do_edit_session(&self, ec: u32) -> Result<()> {
         let mut g = self.shared.lock().unwrap();
         let ctx = g
             .focus_context()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
         match &self.op {
             Op::StartPreedit(text) => {
-                let ins: ITfInsertAtSelection = ctx.cast()?;
-                let wstr: Vec<u16> = text.encode_utf16().collect();
-                let range: ITfRange =
-                    unsafe { ins.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &wstr)? };
+                // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
+                // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
                 let cc: ITfContextComposition = ctx.cast()?;
+                trace("SP: cast ok");
+                let range: ITfRange = selection_range(&ctx, ec)?;
+                trace("SP: GetSelection ok");
                 let sink: ITfCompositionSink = CompSinkObj.into();
-                let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
+                let comp: ITfComposition = match unsafe { cc.StartComposition(ec, &range, &sink) } {
+                    Ok(c) => c,
+                    Err(e) => {
+                        trace(&format!("SP: StartComposition err 0x{:08X}", e.code().0 as u32));
+                        return Err(e);
+                    }
+                };
+                trace("SP: StartComposition ok");
+                let crange: ITfRange = unsafe { comp.GetRange()? };
+                let wstr: Vec<u16> = text.encode_utf16().collect();
+                unsafe { crange.SetText(ec, 0, &wstr)? };
+                trace("SP: SetText ok");
+                // 选区跟随到组段末尾（否则下次插入点停在开头）
+                let _ = set_selection_at_end(&ctx, ec, &crange);
                 g.composition = Some(comp);
                 query_caret(&mut g, &ctx, ec);
                 Ok(())
@@ -363,6 +386,7 @@ impl ITfEditSession_Impl for EditSession_Impl {
                 let range: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &wstr)? };
+                let _ = set_selection_at_end(&ctx, ec, &range);
                 query_caret(&mut g, &ctx, ec);
                 Ok(())
             }
@@ -374,6 +398,8 @@ impl ITfEditSession_Impl for EditSession_Impl {
                         range.SetText(ec, 0, &wstr)?;
                         comp.EndComposition(ec)?;
                     }
+                    // 提交后选区放到已提交文本之后
+                    let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 g.composition = None;
                 Ok(())
@@ -412,9 +438,37 @@ impl ITfEditSession_Impl for EditSession_Impl {
     }
 }
 
+/// 把选区放到指定范围末尾（折叠），保证后续插入点跟随。
+fn set_selection_at_end(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Result<()> {
+    let r: ITfRange = unsafe { range.Clone()? };
+    unsafe { r.Collapse(ec, TF_ANCHOR_END)? };
+    let sel = [TF_SELECTION {
+        range: core::mem::ManuallyDrop::new(Some(r)),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: BOOL(0),
+        },
+    }];
+    unsafe { ctx.SetSelection(ec, &sel)? };
+    Ok(())
+}
+
+/// 当前选区（= 光标插入点）克隆出的范围，作为组段起点。
+fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
+    let mut sel = [TF_SELECTION::default()];
+    let mut fetched: u32 = 0;
+    unsafe {
+        ctx.GetSelection(ec, u32::MAX, &mut sel, &mut fetched)?;
+    }
+    if fetched == 0 {
+        return Err(Error::from(HRESULT(-2147467259)));
+    }
+    let r = unsafe { core::mem::ManuallyDrop::take(&mut sel[0].range) };
+    Ok(r.expect("GetSelection 未返回 range"))
+}
+
 /// 组段内文本的屏幕矩形（插入点跟随）。
-fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
-    g.caret = None;
+fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {    g.caret = None;
     let Some(comp) = g.composition.clone() else { return };
     let Ok(range) = (unsafe { comp.GetRange() }) else { return };
     let Ok(view) = (unsafe { ctx.GetActiveView() }) else { return };
@@ -512,6 +566,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 .collect()
         })
         .unwrap_or_default();
+    trace(&format!("cands={} raw='{}' cand2={} dead={}", cands.len(), raw, g.cand2.is_some(), g.cand2_dead));
 
     g.load_skin();
     if cands.is_empty() {
@@ -527,6 +582,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 Some(v2) => g.cand2 = Some(v2),
                 None => g.cand2_dead = true,
             }
+            trace(&format!("cand2 init dead={}", g.cand2_dead));
         }
         let skin = g.skin.clone();
         let caret = g.caret;
@@ -569,8 +625,11 @@ fn run_session(shared: &SharedRef, op: Op) -> Result<()> {
     }
     .into();
     unsafe {
-        // TF_ES_READWRITE | TF_ES_SYNC = 3
-        let _grant = ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(3))?;
+        // TF_ES_READWRITE | TF_ES_ASYNCDONTCARE = 6
+        // （StartComposition 禁止在 TF_ES_SYNC 会话中调用 → 0x80040201；
+        //  键事件回调内 ASYNCDONTCARE 实际由 msctf 同步授予）
+        let grant = ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(6))?;
+        trace(&format!("session grant = 0x{:08X}", grant.0 as u32));
     }
     Ok(())
 }
