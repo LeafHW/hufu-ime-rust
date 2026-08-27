@@ -225,6 +225,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="snd-en"><label for="snd-en">启用按键音</label></div>
       <div class="field"><label>音量 <span id="snd-vol-v"></span></label>
         <input type="range" id="snd-vol" min="0" max="100" style="width:180px"></div>
+      <button id="snd-test">▶ 试听</button>
     </div>
     <div class="sub">编码 / 选词 / 上屏 / 翻页 四类提示音（数据目录 sounds/ 下可替换 wav：key.wav、select.wav、commit.wav、page.wav）。</div>
   </section>
@@ -344,11 +345,13 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="sub">全部设置即一个 JSON；码表转换用命令行 hufu-cli convert。</div>
     <div class="row">
       <button id="exp-dl" class="primary">导出 config.json</button>
+      <button id="exp-all">导出用户数据快照</button>
       <label class="checkline" style="gap:12px">导入：
         <input type="file" id="imp-file" accept=".json" style="display:none">
         <button id="imp-btn">选择文件…</button>
       </label>
     </div>
+    <div class="sub">用户数据快照 = 配置 + 当前方案的用户词.txt + 用户调整.txt（文件名带日期-时间戳）。</div>
     <h3>原始配置</h3>
     <textarea class="wide" id="cfg-raw" style="min-height:300px"></textarea>
     <div class="row" style="margin-top:10px"><button id="cfg-apply">应用上方 JSON</button></div>
@@ -404,6 +407,18 @@ function bindInputs() {
   $("#snd-vol").value = CFG.sound?.volume ?? 50;
   $("#snd-vol-v").textContent = (CFG.sound?.volume ?? 50) + "%";
   $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; };
+  $("#snd-test").onclick = () => new Audio("/api/sound?tag=key").play().catch(() => msg("试听失败", "err"));
+  $("#exp-all").onclick = async () => {
+    try {
+      const r = await api("GET", "/api/export");
+      const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `hufu-data-${r.stamp || Date.now()}.json`;
+      a.click();
+      msg("快照已导出", "ok");
+    } catch (e) { msg(e.message, "err"); }
+  };
   $("#c-2nd").value = CFG.candidates.second_select || "";
   $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; };
   $("#c-3rd").value = CFG.candidates.third_select || "";

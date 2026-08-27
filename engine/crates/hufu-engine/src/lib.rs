@@ -679,8 +679,9 @@ impl Engine {
         if c == ' ' || c == '\\' {
             return self.select_first(session);
         }
-        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'N';
-        if ok && session.raw.chars().count() < 18 {
+        // 命令空间收任意非空白字符（calc 表达式符号 / \w 造词中文）；
+        // 上限 18 字符
+        if !c.is_whitespace() && session.raw.chars().count() < 18 {
             session.raw.push(c);
             self.refresh_candidates(session);
             return KeyOutcome::consumed(self.state(session));
@@ -841,18 +842,107 @@ impl Engine {
                 out.push(Candidate::new(v.clone(), format!("\\{k}"), CandidateKind::Command));
             }
         }
-        // 前端工具命令（占位，由宿主展开）
-        let tools = ["calc", "addword", "export"];
-        for k in tools {
-            if k.starts_with(name) {
+
+        // \calc<表达式> → 实时求值
+        if let Some(expr) = name.strip_prefix("calc") {
+            if expr.is_empty() {
                 out.push(Candidate::new(
-                    format!("{{{k}}}"),
-                    format!("\\{k}"),
+                    "＝计算器：\\calc(1+2)*3".to_string(),
+                    "\\calc".to_string(),
+                    CandidateKind::Command,
+                ));
+            } else if let Some(v) = dynamic::calc(expr) {
+                let shown = format!("＝{}", dynamic::fmt_num(v));
+                let mut c = Candidate::new(shown, format!("\\calc{expr}"), CandidateKind::Command);
+                c.commit_override = Some(dynamic::fmt_num(v));
+                out.push(c);
+            } else {
+                out.push(Candidate::new(
+                    "＝表达式无效".to_string(),
+                    format!("\\calc{expr}"),
                     CandidateKind::Command,
                 ));
             }
+        } else if name == "c" {
+            // calc 前缀提示
+            out.push(Candidate::new(
+                "＝计算器：\\calc(1+2)*3".to_string(),
+                "\\calc".to_string(),
+                CandidateKind::Command,
+            ));
+        }
+
+        // \w<词> → Rime encoder 规则造词（构码 + 注释显示编码）
+        if let Some(word) = name.strip_prefix('w') {
+            if !word.is_empty() {
+                if let Some(code) = self.encode_word(word) {
+                    let mut c =
+                        Candidate::new(word.to_string(), format!("\\w{word}"), CandidateKind::Command);
+                    c.comment = code.clone();
+                    c.commit_override = Some(word.to_string());
+                    // 直接给候选码，选词时 learn() 自动入用户词库
+                    c.code = code;
+                    out.push(c);
+                } else {
+                    out.push(Candidate::new(
+                        "造词失败：字无编码或无匹配规则".to_string(),
+                        format!("\\w{word}"),
+                        CandidateKind::Command,
+                    ));
+                }
+            }
         }
         out
+    }
+
+    /// Rime encoder 造词：formula 形如 `AaAbBaBb`（大写=第几个字，Z=末字；
+    /// 小写=该字第几码）。返回第一个完全可构的规则结果。
+    fn encode_word(&self, word: &str) -> Option<String> {
+        let chars: Vec<char> = word.chars().collect();
+        if self.schema.encoder_rules.is_empty() || chars.is_empty() {
+            return None;
+        }
+        // 每字首选码
+        let codes: Vec<Option<String>> = chars
+            .iter()
+            .map(|c| self.schema.best_code_of(&c.to_string()))
+            .collect();
+        for rule in &self.schema.encoder_rules {
+            if chars.len() < rule.min_len || chars.len() > rule.max_len {
+                continue;
+            }
+            let mut code = String::new();
+            let mut ok = true;
+            let f: Vec<char> = rule.formula.chars().collect();
+            let mut i = 0;
+            while i + 1 < f.len() {
+                let (up, low) = (f[i], f[i + 1]);
+                let idx = if up == 'Z' || up == 'z' {
+                    chars.len() - 1
+                } else {
+                    (up as u8 - b'A') as usize
+                };
+                let code_pos = (low as u8 - b'a') as usize;
+                match codes.get(idx).and_then(|c| c.as_ref()) {
+                    Some(cc) => match cc.chars().nth(code_pos) {
+                        Some(ch) => code.push(ch),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+                i += 2;
+            }
+            if ok && !code.is_empty() {
+                return Some(code);
+            }
+        }
+        None
     }
 
     /// 反查候选（反查表 + 主码注释）。
@@ -1069,8 +1159,61 @@ mod tests {
     }
 
     #[test]
+    fn calc_command() {
+        let (mut eng, dir) = test_engine("calc");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('\\'));
+        for c in "calc(1+2)*3".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        assert!(snap.candidates.iter().any(|c| c.text.contains('9')), "{:?}",
+            snap.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
+        // 上屏是纯数值
+        let o = eng.process_key(&mut s, key(' '));
+        assert_eq!(o.commit.unwrap(), "9");
+        // 无效表达式
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('\\'));
+        for c in "calc1+".chars() {
+            eng.process_key(&mut s2, key(c));
+        }
+        let snap = eng.state(&s2);
+        assert!(snap.candidates.iter().any(|c| c.text.contains("无效")), "提示无效");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn word_making_encoder() {
+        // Rime encoder：length_equal 2 → formula AaBa（两字词=各取首码）
+        let dir = std::env::temp_dir().join(format!("hufu-eng-wm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tiger.dict.yaml"),
+            "---\nname: t\nsort: by_weight\nencoder:\n  rules:\n    - length_equal: 2\n      formula: AaBa\n...\n就\tjd\n不\tbh\n",
+        )
+        .unwrap();
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('\\'));
+        for c in "w就就".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        let cand = snap.candidates.iter().find(|c| c.commit_override.is_some());
+        assert!(cand.is_some(), "应有造词候选");
+        let c = cand.unwrap();
+        assert_eq!(c.comment, "jj", "两字各取首码: {}", c.comment);
+        // 选中 → 上屏词、编码=构码（learn 入库）
+        let o = eng.process_key(&mut s, key(' '));
+        assert_eq!(o.commit.unwrap(), "就就");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sound_tags() {
-        // 开启音效后：编码= key、空格上屏/数字选词= select；关闭则无标签
         let (mut eng, dir) = test_engine("snd");
         eng.config.sound.enabled = true;
         let mut s = Session::new(true);
