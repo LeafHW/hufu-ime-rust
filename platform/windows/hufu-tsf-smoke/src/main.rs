@@ -38,7 +38,24 @@ fn main() {
             };
             let hr = code(profiles.Register(&CLSID_HUFU));
             println!("Register → 0x{hr:08X}");
-            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+            // 全局分类注册（caps 来源；切换器/系统枚举依赖）：
+            // TFCAT_TIP_KEYBOARD + 键盘汇编分类 {34745C63}
+            let cat: windows::core::Result<ITfCategoryMgr> =
+                CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER);
+            match cat {
+                Ok(cat) => {
+                    const TFCAT_TIP_KEYBOARD: GUID =
+                        GUID::from_u128(0x533c5e0e_5ac0_4abd_b6f1_251b82b7be7d);
+                    const TFCAT_ASM_KBD: GUID =
+                        GUID::from_u128(0x34745c63_b2f0_4784_8b67_5e12c8701a31);
+                    let c1 = code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU));
+                    let c2 = code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_ASM_KBD, &CLSID_HUFU));
+                    println!("RegisterCategory(kbd) → 0x{c1:08X} (asm) → 0x{c2:08X}");
+                }
+                Err(e) => println!("CategoryMgr 不可用：{e:?}"),
+            }
+            // 描述必须 NUL 终止（LPCWSTR），否则 msctf 越界读（注册表出现乱码尾巴）
+            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().chain([0]).collect();
             let hr2 = code(profiles.AddLanguageProfile(
                 &CLSID_HUFU,
                 0x0804,
@@ -160,10 +177,21 @@ fn main() {
                     for prof in &profs[..fetched as usize] {
                         n += 1;
                         let clsid = format!("{:?}", prof.clsid);
-                        if clsid.contains("8f5c2a10") || clsid.contains("8F5C2A10") {
+                        let tag = if clsid.to_lowercase().contains("8f5c2a10") {
                             seen_hufu = true;
-                            println!("    EnumProfiles[#{n}] = 我们的 TIP ✓ type={} flags={:#x}", prof.dwProfileType, prof.dwFlags);
-                        }
+                            " <-- ours"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "    [#{n}] {}{} type={} flags={:#x} caps={:#x} langid={:#x}",
+                            &clsid[..clsid.len().min(8)],
+                            tag,
+                            prof.dwProfileType,
+                            prof.dwFlags,
+                            prof.dwCaps,
+                            prof.langid
+                        );
                     }
                 }
                 if !seen_hufu {
