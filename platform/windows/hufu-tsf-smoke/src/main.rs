@@ -178,6 +178,18 @@ fn main() {
         let sp = tk(0x20);
         println!("[11] hufu_test_key(space) = {sp}");
 
+        // ── 候选窗 v2：D3D11+DComp+D2D+Acrylic accent 四材质各渲染一帧 ──
+        type TestCandFn = unsafe extern "system" fn(u32) -> i32;
+        let tc: TestCandFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"hufu_test_candwin2\0".as_ptr())).unwrap(),
+        );
+        for mode in 0..4u32 {
+            let r = unsafe { tc(mode) };
+            let name = ["solid", "translucent", "frosted", "glass"][(mode % 4) as usize];
+            assert_eq!(r, 1, "candwin2({name}) 渲染应成功");
+            println!("[12.{mode}] candwin2 {name} ✓");
+        }
+
         println!("\n=== hufu-tsf 冒烟测试通过 ===");
     }
 }
