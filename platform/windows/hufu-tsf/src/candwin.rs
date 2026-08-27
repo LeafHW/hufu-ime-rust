@@ -81,9 +81,9 @@ impl CandidateWindow {
             let hi_back = color_of(skin, "hilited_candidate_back_color", [64, 64, 70, 0xFF]);
             let hi_lbl = color_of(skin, "hilited_candidate_label_color", [0xFF, 0xD7, 0x5E, 0xFF]);
 
-            let font_h = 26i32;
-            let line_h = font_h + 8;
-            let width = 300i32;
+            let font_h = 20i32;
+            let line_h = font_h + 6;
+            let width = 250i32;
             let height = line_h * (cands.len() as i32 + 1) + 16;
 
             // 32bpp DIB（top-down，预乘 alpha 由底色提供）
