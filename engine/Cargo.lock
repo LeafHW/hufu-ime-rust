@@ -70,6 +70,16 @@ dependencies = [
 [[package]]
 name = "hufu-server"
 version = "0.1.0"
+dependencies = [
+ "hufu-config",
+ "hufu-dict",
+ "hufu-engine",
+ "hufu-sentence",
+ "hufu-skin",
+ "hufu-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hufu-skin"

@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>虎符 HuFu · 设置</title>
+<style>
+:root {
+  --bg: #17181c; --bg2: #1e2026; --bg3: #262931; --line: #32353e;
+  --fg: #e8e8ea; --fg2: #9a9aa2; --acc: #ffd75e; --acc2: #4f8cff;
+  --ok: #5ecb7d; --err: #ff6b6b; --radius: 12px;
+  font-size: 15px;
+}
+* { box-sizing: border-box; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  display: flex; height: 100vh; overflow: hidden;
+}
+/* ── 侧栏 ── */
+nav {
+  width: 208px; flex: none; background: var(--bg2); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; padding: 18px 10px; gap: 4px;
+}
+nav .logo { font-size: 22px; font-weight: 700; padding: 4px 12px 16px; letter-spacing: 2px; }
+nav .logo span { color: var(--acc); }
+nav a {
+  color: var(--fg2); text-decoration: none; padding: 9px 14px; border-radius: 8px;
+  font-size: 14.5px; cursor: pointer; transition: .15s;
+}
+nav a:hover { color: var(--fg); background: var(--bg3); }
+nav a.on { color: var(--fg); background: var(--bg3); box-shadow: inset 3px 0 0 var(--acc); }
+nav .spacer { flex: 1; }
+/* ── 主区 ── */
+main { flex: 1; overflow-y: auto; padding: 26px 34px 90px; }
+section { display: none; max-width: 880px; }
+section.on { display: block; }
+h2 { font-size: 19px; margin-bottom: 4px; }
+h2 .en { color: var(--fg2); font-size: 12.5px; font-weight: 400; margin-left: 8px; }
+.sub { color: var(--fg2); font-size: 13px; margin-bottom: 20px; }
+h3 { font-size: 15px; margin: 22px 0 10px; color: var(--acc); font-weight: 600; }
+h3:first-of-type { margin-top: 6px; }
+/* ── 表单 ── */
+.row { display: flex; gap: 18px 26px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 14px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > label { font-size: 12.5px; color: var(--fg2); }
+input[type=text], input[type=number], select, textarea {
+  background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 10px; font-size: 14px; outline: none; min-width: 130px;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--acc2); }
+input[type=range] { accent-color: var(--acc2); width: 190px; }
+input[type=checkbox] { accent-color: var(--acc2); width: 16px; height: 16px; }
+input[type=color] { width: 42px; height: 30px; border: 1px solid var(--line); border-radius: 7px; background: none; padding: 2px; cursor: pointer; }
+.checkline { display: flex; align-items: center; gap: 8px; padding: 6px 0; min-width: 210px; cursor: pointer; }
+.checkline label { font-size: 14px; cursor: pointer; }
+.hint { font-size: 12px; color: var(--fg2); }
+.val { display: inline-block; min-width: 52px; text-align: right; color: var(--acc); font-variant-numeric: tabular-nums; }
+/* ── 按钮 ── */
+button {
+  background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+  padding: 8px 18px; border-radius: 8px; font-size: 14px; cursor: pointer; transition: .15s;
+}
+button:hover { border-color: var(--acc2); }
+button.primary { background: var(--acc); color: #221c05; border-color: var(--acc); font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button.danger { color: var(--err); }
+/* ── 底栏 ── */
+footer {
+  position: fixed; bottom: 0; left: 208px; right: 0; height: 62px;
+  background: rgba(23,24,28,.92); backdrop-filter: blur(12px);
+  border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; padding: 0 34px;
+}
+footer .msg { flex: 1; font-size: 13px; color: var(--fg2); }
+footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
+/* ── 试用台 ── */
+.trial {
+  background: linear-gradient(120deg, #2b3a55 0%, #4a3350 30%, #6b4226 55%, #2d5545 80%, #3a2d55 100%);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 26px; margin-bottom: 22px;
+}
+.trial .caption { font-size: 12px; color: rgba(255,255,255,.75); margin-bottom: 12px; }
+.trial .capture {
+  background: rgba(0,0,0,.35); border: 1px dashed rgba(255,255,255,.4); border-radius: 8px;
+  min-height: 56px; padding: 14px 16px; font-size: 17px; outline: none; cursor: text;
+  word-break: break-all; line-height: 1.7; color: #fff;
+}
+.trial .capture .ghost { color: rgba(255,255,255,.35); }
+.trial .log { margin-top: 10px; font-size: 12.5px; color: rgba(255,255,255,.8); min-height: 18px; }
+/* ── 候选窗预览 ── */
+.candwin {
+  display: inline-flex; flex-direction: column; gap: 2px; padding: 10px 12px;
+  border-radius: 10px; border: 1px solid; min-width: 120px;
+}
+.candwin.horizontal { flex-direction: row; align-items: center; gap: 10px; }
+.cand-line { display: flex; align-items: center; gap: 8px; font-size: 16px; padding: 2px 6px; border-radius: 6px; }
+.cand-line .idx { font-size: 12px; opacity: .85; }
+.cand-line .cmt { font-size: 11.5px; opacity: .75; }
+.preedit-line { font-size: 15px; padding: 2px 6px 6px; }
+/* ── 方案列表 ── */
+.schema-list { display: flex; flex-direction: column; gap: 6px; }
+.schema-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+}
+.schema-item.on { border-color: var(--acc); }
+.schema-item .tag { font-size: 11px; background: var(--bg3); color: var(--acc); border-radius: 5px; padding: 2px 8px; }
+/* ── 用户词 ── */
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
+/* ── 皮肤编辑 ── */
+.skin-grid { display: flex; gap: 30px; align-items: flex-start; flex-wrap: wrap; }
+.color-grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 8px 26px; }
+.color-item { display: flex; align-items: center; gap: 10px; font-size: 13.5px; }
+.color-item label { flex: 1; color: var(--fg2); }
+.color-item input[type=number] { width: 64px; min-width: 64px; padding: 4px 6px; }
+.skin-preview-wrap {
+  flex: none; padding: 30px; border-radius: var(--radius);
+  background:
+    radial-gradient(circle at 20% 30%, #ff9a3d55 0%, transparent 40%),
+    radial-gradient(circle at 80% 20%, #4f8cff55 0%, transparent 45%),
+    radial-gradient(circle at 60% 80%, #7dffa855 0%, transparent 40%),
+    repeating-linear-gradient(45deg, #2a2c33 0 14px, #24262c 14px 28px);
+}
+.material-note { font-size: 12px; color: var(--fg2); margin-top: 6px; }
+.pill { font-size: 11px; border-radius: 99px; padding: 2px 10px; background: var(--bg3); color: var(--fg2); }
+textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace; font-size: 12.5px; }
+.candtest-out { font-size: 15px; line-height: 2; }
+.candtest-out b { color: var(--acc); font-weight: 600; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">虎<span>符</span> HuFu</div>
+  <a data-tab="trial" class="on">⟳ 试用与状态</a>
+  <a data-tab="schema">方案</a>
+  <a data-tab="input">输入与候选</a>
+  <a data-tab="sentence">整句模型</a>
+  <a data-tab="skin">皮肤</a>
+  <a data-tab="user">用户词</a>
+  <a data-tab="data">导入导出</a>
+  <div class="spacer"></div>
+  <div class="hint" style="padding:0 12px 6px" id="engine-info"></div>
+</nav>
+
+<main>
+  <!-- ════ 试用 ════ -->
+  <section id="tab-trial" class="on">
+    <h2>试用与状态<span class="en">Live</span></h2>
+    <div class="sub">点击下方输入框直接打字，体验当前方案：顶功、选重、翻页、符号、整句接管都会实时生效。</div>
+    <div class="trial">
+      <div class="caption">▸ 输入区（键盘事件被拦截，不会修改页面）</div>
+      <div class="capture" id="capture" tabindex="0">点击此处开始输入…</div>
+      <div class="log" id="trial-log">已上屏：</div>
+    </div>
+    <div id="trial-state"></div>
+  </section>
+
+  <!-- ════ 方案 ════ -->
+  <section id="tab-schema">
+    <h2>方案<span class="en">Schema</span></h2>
+    <div class="sub">方案 = 码表目录。切换后立即生效，最近方案对可用 Ctrl+M 来回切。</div>
+    <div class="schema-list" id="schema-list"></div>
+    <h3>方案根目录</h3>
+    <div class="row">
+      <div class="field"><label>目录名（数据目录内）</label><input type="text" data-path="schema.dir" style="width:260px"></div>
+      <button id="btn-schema-refresh">刷新列表</button>
+    </div>
+  </section>
+
+  <!-- ════ 输入与候选 ════ -->
+  <section id="tab-input">
+    <h2>输入与候选<span class="en">Input & Candidates</span></h2>
+    <div class="sub">全部图形化配置，实时热更新——不需要碰任何 YAML 或 Lua 文件。</div>
+    <h3>通用</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="g-shift"><label for="g-shift">Shift 切换中英</label></div>
+      <div class="checkline"><input type="checkbox" id="g-ctrl"><label for="g-ctrl">Ctrl+空格 切换中英</label></div>
+      <div class="field"><label>Caps 行为</label>
+        <select id="g-caps"><option value="clear">清屏</option><option value="switch">切英文</option><option value="none">无操作</option></select></div>
+      <div class="checkline"><input type="checkbox" id="g-recent"><label for="g-recent">Ctrl+M 切换最近方案</label></div>
+    </div>
+    <h3>输入</h3>
+    <div class="row">
+      <div class="field"><label>编码字母表</label><input type="text" data-path="input.alphabet" style="width:230px"><span class="hint">默认 27 码元</span></div>
+      <div class="field"><label>最大码长</label><input type="number" data-path="input.max_code_length" min="1" max="10"></div>
+      <div class="checkline"><input type="checkbox" id="i-push"><label for="i-push">顶功（超长自动顶屏）</label></div>
+      <div class="checkline"><input type="checkbox" id="i-uniq"><label for="i-uniq">满四码唯一自动上屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear">空码自动清屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-enter"><label for="i-enter">回车清屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-tab"><label for="i-tab">Tab 清屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-mixed"><label for="i-mixed">中英混输（保留大小写）</label></div>
+      <div class="checkline"><input type="checkbox" id="i-ascii-p"><label for="i-ascii-p">中文态英文标点</label></div>
+      <div class="checkline"><input type="checkbox" id="i-dunhao"><label for="i-dunhao">无编码时 / 出顿号</label></div>
+      <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
+    </div>
+    <h3>候选</h3>
+    <div class="row">
+      <div class="field"><label>每页候选数</label><input type="number" data-path="candidates.page_size" min="1" max="10"></div>
+      <div class="field"><label>翻页键</label><input type="text" data-path="candidates.paging_keys" style="width:90px"></div>
+      <div class="field"><label>次选键</label><input type="text" maxlength="1" id="c-2nd" style="width:60px"></div>
+      <div class="field"><label>三选键</label><input type="text" maxlength="1" id="c-3rd" style="width:60px"></div>
+      <div class="checkline"><input type="checkbox" id="c-v"><label for="c-v">竖排候选</label></div>
+      <div class="checkline"><input type="checkbox" id="c-idx"><label for="c-idx">显示序号</label></div>
+      <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示注释（拼音等）</label></div>
+      <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分</label></div>
+      <div class="field"><label>候选延时（毫秒）</label><input type="number" data-path="candidates.delay_show_ms" min="0" max="2000"></div>
+    </div>
+    <h3>标点与外观</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="p-full"><label for="p-full">全角标点</label></div>
+      <div class="checkline"><input type="checkbox" id="p-pair"><label for="p-pair">成对引号自动配对</label></div>
+      <div class="field"><label>候选字体</label><input type="text" data-path="appearance.font_family" style="width:180px" placeholder="留空=系统默认"></div>
+      <div class="field"><label>字号</label><input type="number" data-path="appearance.font_size" min="10" max="40" step="0.5"></div>
+    </div>
+    <h3>反查</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="r-en"><label for="r-en">启用反查</label></div>
+      <div class="field"><label>引导前缀</label><input type="text" maxlength="1" id="r-prefix" style="width:60px"></div>
+      <div class="field"><label>反查表文件</label><input type="text" data-path="reverse.table" style="width:230px"></div>
+    </div>
+  </section>
+
+  <!-- ════ 整句 ════ -->
+  <section id="tab-sentence">
+    <h2>整句模型<span class="en">Sentence</span></h2>
+    <div class="sub">TCSKNM02 ngram（Kneser-Ney trigram）字级 beam 组句。拖动滑杆实时调整组句倾向，右侧试验框立即验证。</div>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="s-en"><label for="s-en">启用整句</label></div>
+      <div class="checkline"><input type="checkbox" id="s-auto"><label for="s-auto">「整句」方案自动启用</label></div>
+      <div class="checkline"><input type="checkbox" id="s-early"><label for="s-early">提前上屏（稳 3 键）</label></div>
+      <span class="pill" id="s-model-state">模型：检测中…</span>
+    </div>
+    <div class="row">
+      <div class="field"><label>ngram 模型文件（数据目录相对路径）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
+    </div>
+    <h3>组句权重</h3>
+    <div class="row" id="w-sliders"></div>
+    <h3>试验</h3>
+    <div class="field" style="max-width:560px">
+      <label>输入编码（可带尾缀 ; ' 数字 选重）</label>
+      <div style="display:flex;gap:10px">
+        <input type="text" id="s-test-in" placeholder="例如 tujatuja" style="flex:1">
+        <button id="s-test-go" class="primary">组句</button>
+      </div>
+      <div class="candtest-out" id="s-test-out" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- ════ 皮肤 ════ -->
+  <section id="tab-skin">
+    <h2>皮肤<span class="en">Skin</span></h2>
+    <div class="sub">19 个颜色角色 + 布局 + 材质（毛玻璃 / 玻璃 / 半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。</div>
+    <div class="row" style="margin-bottom:18px">
+      <div class="field"><label>皮肤</label><select id="skin-select" style="min-width:200px"></select></div>
+      <div class="field"><label>名称</label><input type="text" data-skin="name" style="width:160px"></div>
+      <div class="field"><label>另存为 ID</label><input type="text" data-skin="id" style="width:180px"></div>
+      <button id="skin-save" class="primary">保存皮肤</button>
+      <button id="skin-new">新建</button>
+    </div>
+    <div class="skin-grid">
+      <div class="skin-preview-wrap">
+        <div id="candwin-preview"></div>
+        <div class="material-note" id="material-note"></div>
+      </div>
+      <div style="flex:1;min-width:330px">
+        <h3>材质</h3>
+        <div class="row">
+          <div class="field"><label>效果</label>
+            <select id="mat-kind">
+              <option value="frosted">毛玻璃磨砂（Acrylic / vibrancy）</option>
+              <option value="glass">玻璃（Mica / underWindow）</option>
+              <option value="translucent">半透明</option>
+              <option value="solid">纯色不透明</option>
+            </select></div>
+          <div class="field"><label>窗口色调</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-tint"><input type="number" id="mat-tint-a" min="0" max="255" title="不透明度"></span></div>
+          <div class="field"><label>暗化 <span class="val" id="mat-darken-v"></span></label><input type="range" id="mat-darken" min="0" max="100"></div>
+          <div class="field"><label>噪点 <span class="val" id="mat-noise-v"></span></label><input type="range" id="mat-noise" min="0" max="100"></div>
+          <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
+          <div class="field"><label>边框色</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-bc"><input type="number" id="mat-bc-a" min="0" max="255"></span></div>
+        </div>
+        <h3>布局</h3>
+        <div class="row">
+          <div class="checkline"><input type="checkbox" id="l-horiz"><label for="l-horiz">横排候选</label></div>
+          <div class="checkline"><input type="checkbox" id="l-inline"><label for="l-inline">编码内联到应用</label></div>
+          <div class="field"><label>圆角 <span class="val" id="l-radius-v"></span></label><input type="range" id="l-radius" min="0" max="20"></div>
+          <div class="field"><label>高亮圆角 <span class="val" id="l-hr-v"></span></label><input type="range" id="l-hr" min="0" max="20"></div>
+          <div class="field"><label>水平留白 <span class="val" id="l-mx-v"></span></label><input type="range" id="l-mx" min="0" max="30"></div>
+          <div class="field"><label>垂直留白 <span class="val" id="l-my-v"></span></label><input type="range" id="l-my" min="0" max="30"></div>
+          <div class="field"><label>高亮内距 <span class="val" id="l-hp-v"></span></label><input type="range" id="l-hp" min="0" max="20"></div>
+        </div>
+        <h3>颜色角色</h3>
+        <div class="color-grid" id="color-grid"></div>
+      </div>
+    </div>
+    <h3>weasel / squirrel 配色互导</h3>
+    <div class="row" style="align-items:flex-start">
+      <div class="field" style="flex:1">
+        <label>粘贴 weasel preset_color_schemes 的一项（JSON），导入为皮肤</label>
+        <textarea class="wide" id="weasel-in" placeholder='{"name":"win11dark","back_color":0x303030,"candidate_text_color":0xFFFFFF,"label_color":0xC9C9C9,"hilited_candidate_back_color":0x202020}'></textarea>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="weasel-import">导入为皮肤</button>
+        <button id="weasel-export">导出当前配色</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════ 用户词 ════ -->
+  <section id="tab-user">
+    <h2>用户词<span class="en">User words</span></h2>
+    <div class="sub">当前方案的用户词库；调整日志（置顶/调频/删词）在方案目录内追加保存。</div>
+    <div class="row">
+      <div class="field"><label>编码</label><input type="text" id="uw-code" style="width:130px"></div>
+      <div class="field"><label>词</label><input type="text" id="uw-text" style="width:130px"></div>
+      <button id="uw-add" class="primary">添加</button>
+      <div class="checkline"><input type="checkbox" id="u-af"><label for="u-af">选词自动调频</label></div>
+      <div class="checkline"><input type="checkbox" id="u-la"><label for="u-la">记录调整日志</label></div>
+    </div>
+    <table><thead><tr><th style="width:160px">编码</th><th>词</th><th style="width:90px"></th></tr></thead>
+    <tbody id="uw-list"></tbody></table>
+  </section>
+
+  <!-- ════ 导入导出 ════ -->
+  <section id="tab-data">
+    <h2>导入导出<span class="en">Data</span></h2>
+    <div class="sub">全部设置即一个 JSON；码表转换用命令行 hufu-cli convert。</div>
+    <div class="row">
+      <button id="exp-dl" class="primary">导出 config.json</button>
+      <label class="checkline" style="gap:12px">导入：
+        <input type="file" id="imp-file" accept=".json" style="display:none">
+        <button id="imp-btn">选择文件…</button>
+      </label>
+    </div>
+    <h3>原始配置</h3>
+    <textarea class="wide" id="cfg-raw" style="min-height:300px"></textarea>
+    <div class="row" style="margin-top:10px"><button id="cfg-apply">应用上方 JSON</button></div>
+  </section>
+</main>
+
+<footer>
+  <span class="msg" id="foot-msg"></span>
+  <span class="hint" id="foot-schema"></span>
+  <button id="btn-reload">放弃更改</button>
+  <button id="btn-save" class="primary">保存并应用</button>
+</footer>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const api = async (m, p, b) => {
+  const r = await fetch(p, { method: m, headers: { "Content-Type": "application/json" }, body: b ? JSON.stringify(b) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+};
+let CFG = null, SKIN = null;
+const msg = (t, cls) => { const e = $("#foot-msg"); e.textContent = t || ""; e.className = "msg " + (cls || ""); };
+
+/* ── 路径工具 ── */
+const getP = (o, p) => p.split(".").reduce((x, k) => (x == null ? x : x[k]), o);
+const setP = (o, p, v) => { const ks = p.split("."); let t = o; for (let i = 0; i < ks.length - 1; i++) t = t[ks[i]]; t[ks[ks.length - 1]] = v; };
+
+/* ── data-path 绑定 ── */
+function bindInputs() {
+  $$("[data-path]").forEach(el => {
+    const v = getP(CFG, el.dataset.path);
+    if (el.type === "number") el.value = v;
+    else el.value = v ?? "";
+  });
+  const B = (id, path, conv) => { const el = $(id); el.checked = !!getP(CFG, path); el.onchange = () => setP(CFG, path, conv ? conv(el) : el.checked); };
+  B("#g-shift", "general.shift_switch"); B("#g-ctrl", "general.ctrl_space_switch");
+  B("#g-recent", "general.switch_recent_schema");
+  $("#g-caps").value = { Clear: "clear", Switch: "switch", None: "none" }[CFG.general.caps_action] || "clear";
+  $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; };
+  B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
+  B("#i-enter", "input.enter_clear"); B("#i-tab", "input.tab_clear"); B("#i-mixed", "input.mixed_input");
+  B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao");
+  B("#c-v", "candidates.vertical"); B("#c-idx", "candidates.show_index");
+  B("#c-cmt", "candidates.show_comment"); B("#c-split", "candidates.show_split");
+  B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
+  B("#r-en", "reverse.enabled");
+  B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
+  B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
+  $("#c-2nd").value = CFG.candidates.second_select || "";
+  $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; };
+  $("#c-3rd").value = CFG.candidates.third_select || "";
+  $("#c-3rd").oninput = e => { if (e.target.value) CFG.candidates.third_select = e.target.value[0]; };
+  $("#r-prefix").value = CFG.reverse.prefix || "`";
+  $("#r-prefix").oninput = e => { if (e.target.value) CFG.reverse.prefix = e.target.value[0]; };
+  $$("[data-path]").forEach(el => {
+    if (el.type === "number") el.oninput = () => { const v = parseFloat(el.value); if (!isNaN(v)) setP(CFG, el.dataset.path, v); };
+    else el.oninput = () => setP(CFG, el.dataset.path, el.value);
+  });
+}
+
+/* ── 整句权重滑杆 ── */
+const WDEFS = [
+  ["beam_width", "Beam 宽度", 10, 600, 1],
+  ["rank_penalty", "名次惩罚", 0, 1, 0.005],
+  ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
+  ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
+  ["isolation_threshold", "生僻字频阈值", 100, 21000, 100],
+  ["confidence", "提前上屏置信", 0.5, 1, 0.001],
+  ["dict_bias", "码表候选加成", 0, 5, 0.05],
+  ["supplement_baseline", "语料奖励基准", 0, 20, 0.1],
+  ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
+  ["supplement_maximum", "语料奖励上限", 1, 30, 0.5],
+];
+function buildSliders() {
+  const box = $("#w-sliders"); box.innerHTML = "";
+  WDEFS.forEach(([k, name, min, max, step]) => {
+    const f = document.createElement("div"); f.className = "field";
+    f.innerHTML = `<label>${name} <span class="val" id="wv-${k}"></span></label>
+      <input type="range" id="ws-${k}" min="${min}" max="${max}" step="${step}">`;
+    box.appendChild(f);
+    const s = f.querySelector("input"), v = f.querySelector(".val");
+    const sync = () => { v.textContent = CFG.sentence.weights[k]; s.value = CFG.sentence.weights[k]; };
+    s.oninput = () => { CFG.sentence.weights[k] = parseFloat(s.value); v.textContent = s.value; };
+    sync();
+  });
+}
+
+/* ── 试用台 ── */
+let committedLog = "";
+async function trialKey(ev) {
+  const map = { " ": "space", Enter: "enter", Backspace: "backspace", Tab: "tab", Escape: "escape" };
+  let key = null;
+  if (ev.key.length === 1) key = ev.key;
+  else if (map[ev.key]) key = map[ev.key];
+  if (!key || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+  ev.preventDefault();
+  const payload = { key, modifiers: { shift: ev.key.length === 1 && ev.key.match(/[A-Z]/) || ev.shiftKey, ctrl: false, alt: false } };
+  const r = await api("POST", "/api/key", payload).catch(e => ({ error: e.message }));
+  if (r.error) return msg(r.error, "err");
+  if (r.outcome && r.outcome.commit) { committedLog += r.outcome.commit; $("#trial-log").textContent = "已上屏：" + committedLog.slice(-40); }
+  renderState(r.state);
+}
+function renderState(st) {
+  $("#capture").innerHTML = (st.preedit ? `<b>${esc(st.preedit)}</b>` : '<span class="ghost">点击此处开始输入…</span>');
+  const cands = (st.candidates || []).map((c, i) =>
+    `<div class="cand-line"><span class="idx">${i + 1}.</span>${esc(c.text)}${c.comment ? ` <span class="cmt">${esc(c.comment)}</span>` : ""}</div>`).join("");
+  $("#trial-state").innerHTML = `
+    <div class="row" style="gap:10px;align-items:center;margin-top:4px">
+      <span class="pill">${st.chinese ? "中" : "EN"}</span>
+      <span class="pill">${esc(st.aux || "常规")}</span>
+      <span class="pill">页 ${st.page + 1}/${Math.max(1, st.page_count)}</span>
+      <span class="pill">raw: ${esc(st.raw)}</span>
+    </div>
+    ${cands ? `<div class="candwin" style="margin-top:12px;background:#1e2026;border-color:#32353e;color:#e8e8ea">${cands}</div>` : ""}`;
+}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ── 方案 ── */
+async function loadSchemas() {
+  const r = await api("GET", "/api/state");
+  const box = $("#schema-list"); box.innerHTML = "";
+  (r.schemas || []).sort((a, b) => a.localeCompare(b, "zh")).forEach(n => {
+    const d = document.createElement("div");
+    d.className = "schema-item" + (n === r.current_schema ? " on" : "");
+    d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}${n === r.current_schema ? '<span class="tag" style="margin-left:auto">当前</span>' : ""}`;
+    d.onclick = async () => {
+      try { await api("POST", "/api/schema", { name: n }); msg(`已切换到 ${n}`, "ok"); await loadSchemas(); await refreshInfo(); }
+      catch (e) { msg(e.message, "err"); }
+    };
+    box.appendChild(d);
+  });
+  $("#foot-schema").textContent = "当前方案：" + r.current_schema + (r.sentence_active ? "（整句激活）" : "");
+  return r;
+}
+
+/* ── 整句模型状态 ── */
+async function refreshInfo() {
+  const r = await api("GET", "/api/state");
+  $("#engine-info").textContent = r.current_schema;
+  const pill = $("#s-model-state");
+  pill.textContent = r.sentence_active ? "模型：已加载 ✓" : "模型：未加载";
+  return r;
+}
+
+/* ── 皮肤 ── */
+const COLOR_ROLES = [
+  ["back_color", "窗口背景"], ["border_color", "窗口边框"], ["text_color", "编码文字"],
+  ["candidate_text_color", "候选文字"], ["comment_text_color", "注释文字"], ["label_color", "序号"],
+  ["hilited_text_color", "编码文字（高亮）"], ["hilited_candidate_text_color", "候选文字（高亮）"],
+  ["hilited_candidate_back_color", "候选背景（高亮）"], ["hilited_candidate_label_color", "序号（高亮）"],
+  ["hilited_comment_text_color", "注释（高亮）"], ["hilited_mark_color", "标记点"],
+  ["shadow_color", "窗口阴影"], ["preedit_back_color", "编码区背景"],
+];
+function hexOf(c) { return "#" + c.slice(1, 7); }
+function alphaOf(c) { return parseInt(c.slice(7, 9) || "FF", 16); }
+function withA(hex, a) { return hex + Math.round(a).toString(16).padStart(2, "0").toUpperCase(); }
+function buildColorGrid() {
+  const g = $("#color-grid"); g.innerHTML = "";
+  COLOR_ROLES.forEach(([k, name]) => {
+    const d = document.createElement("div"); d.className = "color-item";
+    d.innerHTML = `<label>${name}</label><input type="color" id="ck-${k}"><input type="number" id="ca-${k}" min="0" max="255" title="不透明度">`;
+    g.appendChild(d);
+    $("#ck-" + k, d) && null;
+  });
+  COLOR_ROLES.forEach(([k]) => {
+    const ci = g.querySelector(`#ck-${k}`), ai = g.querySelector(`#ca-${k}`);
+    const sync = () => { ci.value = hexOf(SKIN.colors[k] || "#000000"); ai.value = alphaOf(SKIN.colors[k] || "#FF"); };
+    ci.oninput = () => { SKIN.colors[k] = withA(ci.value, parseFloat(ai.value)); preview(); };
+    ai.oninput = () => { SKIN.colors[k] = withA(ci.value, parseFloat(ai.value)); preview(); };
+    sync();
+  });
+}
+function bindSkin() {
+  $$("[data-skin]").forEach(el => { el.value = SKIN[el.dataset.skin] ?? ""; el.oninput = () => SKIN[el.dataset.skin] = el.value; });
+  $("#mat-kind").value = SKIN.material.kind;
+  $("#mat-kind").onchange = e => { SKIN.material.kind = e.target.value; preview(); };
+  const pair = (id, key, alphaId) => {
+    const ci = $(id), ai = $(alphaId);
+    ci.value = hexOf(SKIN.material[key]); ai.value = alphaOf(SKIN.material[key]);
+    ci.oninput = () => { SKIN.material[key] = withA(ci.value, parseFloat(ai.value)); preview(); };
+    ai.oninput = () => { SKIN.material[key] = withA(ci.value, parseFloat(ai.value)); preview(); };
+  };
+  pair("#mat-tint", "tint", "#mat-tint-a"); pair("#mat-bc", "border_color", "#mat-bc-a");
+  const rng = (id, key, fmt) => { const el = $(id); el.value = SKIN.material[key]; $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(SKIN.material[key]) : SKIN.material[key]); el.oninput = () => { SKIN.material[key] = parseFloat(el.value); $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(el.value) : el.value); preview(); }; };
+  rng("#mat-darken", "darken", v => (v / 100).toFixed(2)); $("#mat-darken").max = 100;
+  rng("#mat-noise", "noise", v => (v / 100).toFixed(2)); $("#mat-noise").max = 100;
+  rng("#mat-bw", "border_width");
+  $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); };
+  $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => SKIN.layout.inline_preedit = e.target.checked;
+  const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); }; };
+  lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
+  lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
+}
+function preview() {
+  const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
+  const w = $("#candwin-preview");
+  w.className = "candwin" + (L.horizontal ? " horizontal" : "");
+  const bg = c.back_color, border = M.border_width > 0 ? `${M.border_width}px solid ${M.border_color}` : `${L.border_width || 1}px solid ${c.border_color}`;
+  let backdrop = "", bgc = bg;
+  if (M.kind === "frosted") backdrop = "blur(14px) saturate(1.5)";
+  else if (M.kind === "glass") backdrop = "blur(22px) saturate(1.8) brightness(1.06)";
+  else if (M.kind === "translucent") backdrop = "none";
+  const darken = M.darken > 0 ? `linear-gradient(rgba(0,0,0,${M.darken / 100 * 0.35}),rgba(0,0,0,${M.darken / 100 * 0.35})),` : "";
+  w.style.cssText = `background:${darken}${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${c.shadow_color};padding:${L.margin_y}px ${L.margin_x}px;backdrop-filter:${backdrop};-webkit-backdrop-filter:${backdrop};gap:${L.candidate_spacing}px`;
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${c.hilited_candidate_back_color};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding / 2}px ${L.hilite_padding}px;` : `padding:${L.hilite_padding / 2}px 1px;`}color:${hi ? c.hilited_candidate_text_color : c.candidate_text_color}"><span class="idx" style="color:${hi ? c.hilited_candidate_label_color : c.label_color}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${hi ? c.hilited_comment_text_color : c.comment_text_color}">${cmt}</span>` : ""}</div>`;
+  w.innerHTML =
+    `<div class="preedit-line" style="color:${c.text_color};background:${c.preedit_back_color};border-radius:4px"><span style="opacity:.6">tuj</span>a</div>` +
+    cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
+  const names = { frosted: "毛玻璃 Acrylic（Win）/ vibrancy（mac）", glass: "玻璃 Mica / underWindowBackground", translucent: "半透明（不模糊）", solid: "纯色不透明" };
+  $("#material-note").textContent = names[M.kind] + (M.noise > 0 ? ` · 噪点 ${(M.noise / 100).toFixed(2)}` : "");
+}
+async function loadSkinList(sel) {
+  const r = await api("GET", "/api/skins");
+  const s = $("#skin-select"); s.innerHTML = "";
+  r.skins.forEach(x => { const o = document.createElement("option"); o.value = x.id; o.textContent = x.name; s.appendChild(o); });
+  if (sel || r.current) s.value = sel || r.current;
+  s.onchange = () => loadSkin(s.value);
+}
+async function loadSkin(id) {
+  SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
+  bindSkin(); buildColorGrid(); preview();
+}
+
+/* ── 用户词 ── */
+$("#uw-list").addEventListener("click", async ev => {
+  const b = ev.target.closest("button[data-code]"); if (!b) return;
+  try { await api("POST", "/api/user_word/remove", { code: b.dataset.code, text: b.dataset.text }); await loadUserWords(); msg("已删除", "ok"); }
+  catch (e) { msg(e.message, "err"); }
+});
+
+async function loadUserWords() {
+  const r = await api("GET", "/api/user_words");
+  $("#uw-list").innerHTML = (r.words || []).map(w => `<tr><td>${esc(w.code)}</td><td>${esc(w.text)}</td><td><button class="danger" data-code="${esc(w.code)}" data-text="${esc(w.text)}">删除</button></td></tr>`).join("") || '<tr><td colspan="3" class="hint">暂无用户词</td></tr>';
+}
+
+/* ── 初始化 ── */
+document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
+  $$("nav a").forEach(x => x.classList.remove("on")); a.classList.add("on");
+  $$("main section").forEach(s => s.classList.remove("on"));
+  $("#tab-" + a.dataset.tab).classList.add("on");
+});
+$("#capture").addEventListener("keydown", trialKey);
+$("#capture").addEventListener("click", () => $("#capture").focus());
+$("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
+
+$("#btn-save").onclick = async () => {
+  try {
+    await api("POST", "/api/config", CFG);
+    msg("已保存并应用 ✓", "ok"); await refreshInfo();
+  } catch (e) { msg(e.message, "err"); }
+};
+$("#btn-reload").onclick = async () => { await init(); msg("已还原"); };
+
+$("#s-test-go").onclick = async () => {
+  const raw = $("#s-test-in").value.trim(); if (!raw) return;
+  try {
+    // 先应用当前权重
+    await api("POST", "/api/config", CFG);
+    const r = await api("POST", "/api/sentence_test", { raw });
+    $("#s-test-out").innerHTML = r.candidates.length
+      ? r.candidates.slice(0, 8).map((t, i) => (i === 0 ? "<b>" : "") + esc(t) + (i === 0 ? "</b>" : "")).join("　·　")
+      : '<span class="hint">无候选（检查模型加载与编码长度 >4）</span>';
+    msg("整句试验完成", "ok");
+  } catch (e) { $("#s-test-out").textContent = ""; msg(e.message, "err"); }
+};
+
+$("#skin-save").onclick = async () => {
+  try { const r = await api("POST", "/api/skin", SKIN); msg("皮肤已保存 ✓", "ok"); await loadSkinList(SKIN.id); }
+  catch (e) { msg(e.message, "err"); }
+};
+$("#skin-new").onclick = () => {
+  SKIN = JSON.parse(JSON.stringify(SKIN));
+  SKIN.id = "skin-" + Date.now().toString(36); SKIN.name = "新皮肤";
+  bindSkin(); preview(); msg("已复制为新皮肤，保存后生效");
+};
+$("#weasel-import").onclick = async () => {
+  try {
+    const colors = JSON.parse($("#weasel-in").value);
+    const id = "weasel-" + Date.now().toString(36);
+    SKIN = await api("POST", "/api/weasel_import", { id, colors });
+    bindSkin(); buildColorGrid(); preview(); msg("weasel 配色已导入，保存后生效", "ok");
+  } catch (e) { msg("导入失败：" + e.message, "err"); }
+};
+$("#weasel-export").onclick = () => {
+  const patch = {};
+  COLOR_ROLES.forEach(([k]) => {
+    const c = SKIN.colors[k]; if (!c) return;
+    const r = parseInt(c.slice(1, 3), 16), g = parseInt(c.slice(3, 5), 16), b = parseInt(c.slice(5, 7), 16), a = parseInt(c.slice(7, 9) || "FF", 16);
+    patch[k] = a === 255 ? (b << 16) | (g << 8) | r : (a << 24) | (b << 16) | (g << 8) | r;
+  });
+  patch.name = SKIN.name; patch.author = SKIN.author || "HuFu";
+  $("#weasel-in").value = JSON.stringify(patch, null, 2);
+  msg("已生成 weasel patch（复制到 weasel.custom.yaml 使用）", "ok");
+};
+
+$("#uw-add").onclick = async () => {
+  const code = $("#uw-code").value.trim(), text = $("#uw-text").value.trim();
+  if (!code || !text) return msg("编码与词均不能为空", "err");
+  try { await api("POST", "/api/user_word/add", { code, text }); $("#uw-code").value = ""; $("#uw-text").value = ""; await loadUserWords(); msg("用户词已添加 ✓", "ok"); }
+  catch (e) { msg(e.message, "err"); }
+};
+
+$("#exp-dl").onclick = () => {
+  const blob = new Blob([JSON.stringify(CFG, null, 2)], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "hufu-config.json"; a.click();
+};
+$("#imp-btn").onclick = () => $("#imp-file").click();
+$("#imp-file").onchange = async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  try { CFG = JSON.parse(await f.text()); await $("#btn-save").click(); }
+  catch (e) { msg("导入失败：" + e.message, "err"); }
+};
+$("#cfg-apply").onclick = async () => {
+  try { CFG = JSON.parse($("#cfg-raw").value); await $("#btn-save").click(); }
+  catch (e) { msg("JSON 无效：" + e.message, "err"); }
+};
+
+async function init() {
+  try {
+    CFG = await api("GET", "/api/config");
+    $("#cfg-raw").value = JSON.stringify(CFG, null, 2);
+    bindInputs(); buildSliders();
+    await loadSchemas(); await refreshInfo();
+    await loadSkinList(); await loadSkin($("#skin-select").value);
+    await loadUserWords();
+    renderState({ preedit: "", raw: "", candidates: [], page: 0, page_count: 1, chinese: true, aux: "" });
+    msg("就绪");
+  } catch (e) { msg("初始化失败：" + e.message, "err"); }
+}
+init();
+</script>
+</body>
+</html>
