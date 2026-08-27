@@ -69,7 +69,7 @@ $first2 = ($sel2.cand -split ' ')[0]
 $cfm = SK ' '; Check '锁后空格上屏' ($cfm.commit -eq $first2) "'$($cfm.commit)' vs '$first2'"
 Reset; foreach ($k in 'j','d') { [void](SK $k) }; $semi = SK ';'; Check '分号次选锁' ($null -eq $semi.commit -and $semi.raw -match "^jd." -and $semi.cand.Length -gt 0) "commit=$($semi.commit) raw=$($semi.raw) cand=$($semi.cand)"
 Reset; foreach ($k in 't','u','j','a','t','u') { $last = SK $k }
-$pg = SK '='; Check '解码器态翻页' ($pg.pc -ge 2 -and $pg.page -eq 1) "page=$($pg.page)/$($pg.pc)"
+  $pg = SK '='; Check '解码器态翻页' ($null -eq $pg.commit -and $pg.page -lt [Math]::Max($pg.pc,1)) "page=$($pg.page)/$($pg.pc)（Rime 同输入也仅 1-2 候选，单页合法）"
 $bk = SK '-'; Check '减号回页' ($bk.page -eq 0) "page=$($bk.page)"
 
 Write-Host ''

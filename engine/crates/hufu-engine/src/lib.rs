@@ -8,7 +8,7 @@ pub mod punct;
 pub mod session;
 
 pub use punct::PairState;
-pub use session::Session;
+pub use session::{EarlyHistory, Session};
 
 use hufu_config::Config;
 use hufu_dict::entry::DictEntry;
@@ -19,12 +19,168 @@ use hufu_types::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 单条整句解码命中（对齐 Rime emit 结果）。
+#[derive(Debug, Clone)]
+pub struct SentenceHit {
+    pub text: String,
+    /// 排序分（含名次惩罚 / EOS / 孤立惩罚）
+    pub score: f64,
+    /// 置信分（同文本聚合质量 + EOS - 孤立惩罚）
+    pub confidence: f64,
+    /// 全路径最大码表名次（排序首位键）
+    pub max_rank: usize,
+    /// 词边界：(累计字数, base 消耗位置)
+    pub word_ends: Vec<(usize, usize)>,
+    /// 分段显示（空格分隔编码段）
+    pub segmented: String,
+}
+
+/// 整句解码结果（含提前上屏置信源）。
+pub struct SentenceDecode {
+    /// 完整解码命中（max_rank, score 排序）
+    pub hits: Vec<SentenceHit>,
+    /// 完整解码是否被 beam 截断（置信不可信）
+    pub truncated: bool,
+    /// 不完全尾候选（尾部未成码时把前缀视为完整句；confidence 排序）
+    pub early_hits: Vec<SentenceHit>,
+    /// 不完全尾是否截断
+    pub early_truncated: bool,
+}
+
 /// 整句解码器接口（由 hufu-sentence 实现，可注入替换）。
 pub trait SentenceDecoder: Send + Sync {
-    /// 组句：raw（含选重后缀）→ 已排序候选。
-    fn decode(&self, raw: &str) -> Vec<Candidate>;
-    /// 提前上屏提案：返回（建议上屏文本, 消耗的 raw 长度）。无提案返回 None。
-    fn early_commit_proposal(&self, raw: &str) -> Option<(String, usize)>;
+    /// 富解码：raw（含选重后缀）→ 命中 + 提前上屏置信源。
+    fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode>;
+    /// 组句：raw（含选重后缀）→ 已排序候选（默认由富解码派生）。
+    fn decode(&self, raw: &str) -> Vec<Candidate> {
+        self.decode_rich(raw)
+            .hits
+            .iter()
+            .map(|h| {
+                let mut c = Candidate::new(h.text.clone(), raw.to_string(), CandidateKind::Sentence);
+                c.weight = h.score;
+                c
+            })
+            .collect()
+    }
+}
+
+/// 置信前缀提案（Rime confidence_proposal）：软最大前缀质量占比 ≥ 阈值的最长真前缀。
+/// 返回 (提案, 份额)。
+pub fn confidence_proposal(cands: &[&SentenceHit], threshold: f64) -> (String, f64) {
+    if cands.is_empty() {
+        return (String::new(), 0.0);
+    }
+    let max_score = cands
+        .iter()
+        .map(|c| c.confidence)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = cands.iter().map(|c| (c.confidence - max_score).exp()).sum();
+    let mut prefix_mass: Vec<(Vec<char>, f64)> = Vec::new();
+    for c in cands {
+        let weight = (c.confidence - max_score).exp();
+        let chars: Vec<char> = c.text.chars().collect();
+        if chars.len() < 2 {
+            continue;
+        }
+        let mut prefix: Vec<char> = Vec::new();
+        for _l in 1..chars.len() {
+            // 真前缀（不含全长）
+            prefix.push(chars[_l - 1]);
+            if let Some((_, m)) = prefix_mass.iter_mut().find(|(p, _)| *p == prefix) {
+                *m += weight;
+            } else {
+                prefix_mass.push((prefix.clone(), weight));
+            }
+        }
+    }
+    let mut proposal: Vec<char> = Vec::new();
+    let mut share = 0.0;
+    for (p, m) in &prefix_mass {
+        let s = m / total;
+        if s >= threshold && p.len() > proposal.len() {
+            proposal = p.clone();
+            share = s;
+        }
+    }
+    (proposal.into_iter().collect(), share)
+}
+
+/// 证据史公共前缀（Rime common_history_prefix）。
+fn common_history_prefix(history: &[crate::session::EarlyHistory]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let mut common: Vec<char> = history[0].proposal.chars().collect();
+    for e in history.iter().skip(1) {
+        let chars: Vec<char> = e.proposal.chars().collect();
+        let mut matched = 0usize;
+        while matched < common.len()
+            && matched < chars.len()
+            && common[matched] == chars[matched]
+        {
+            matched += 1;
+        }
+        common.truncate(matched);
+        if common.is_empty() {
+            return String::new();
+        }
+    }
+    common.into_iter().collect()
+}
+
+/// 前缀在证据史中的一致消耗长度（最少 2 键、全部同值；Rime stable_history_raw_length）。
+fn stable_history_raw_length(history: &[crate::session::EarlyHistory], text: &str) -> usize {
+    if text.is_empty() || history.len() < 2 {
+        return 0;
+    }
+    let mut stable = 0usize;
+    for e in history {
+        let raw_length = e
+            .raw_lengths
+            .iter()
+            .find(|(p, _)| p == text)
+            .map(|(_, l)| *l)
+            .unwrap_or(0);
+        if raw_length == 0 {
+            return 0;
+        }
+        if stable == 0 {
+            stable = raw_length;
+        } else if stable != raw_length {
+            return 0;
+        }
+    }
+    stable
+}
+
+/// 为提案构建 前缀→orig消耗 映射（Rime raw_lengths_for_proposal）。
+fn build_raw_lengths(cands: &[&SentenceHit], full_raw: &str) -> Vec<(String, usize)> {
+    let parsed = parse_rank_locks(full_raw);
+    let base_len = parsed.base.chars().count();
+    let full_len = full_raw.chars().count();
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for h in cands {
+        let mut cum = 0usize;
+        let text_all: Vec<char> = h.text.chars().collect();
+        for (chars_cum, base_end) in &h.word_ends {
+            cum = *chars_cum;
+            if cum == 0 || cum > text_all.len() {
+                continue;
+            }
+            let prefix: String = text_all[..cum].iter().collect();
+            if out.iter().any(|(p, _)| *p == prefix) {
+                continue;
+            }
+            let orig = if *base_end >= base_len {
+                full_len
+            } else {
+                parsed.orig_of_base[*base_end]
+            };
+            out.push((prefix, orig));
+        }
+    }
+    out
 }
 
 /// 「写入编码选重」解析结果（整句模式选重后缀）。
@@ -355,6 +511,8 @@ impl Engine {
             return KeyOutcome::passthrough();
         }
         session.raw.pop();
+        // 退格打断提前上屏证据（Rime），但保留已提交前缀
+        session.early_history.clear();
         if session.raw.is_empty() {
             session.clear();
         } else {
@@ -558,6 +716,20 @@ impl Engine {
         if dead_end && !sentence_mode && self.config.input.auto_clear_empty && !has_upper {
             session.clear();
         }
+
+        // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
+        if sentence_takeover || self.parsed_has_locks(session) || !session.committed_raw.is_empty() {
+            self.try_early_commit(session);
+            if session.pending_commit.is_some() {
+                // 前缀已上屏、raw 缩为剩余 → 重刷候选
+                self.refresh_candidates(session);
+            }
+        }
+    }
+
+    /// raw 是否带选重锁。
+    fn parsed_has_locks(&self, session: &Session) -> bool {
+        parse_rank_locks(&session.raw).has_locks()
     }
 
     /// 选重键分流（;/'/数字）。
@@ -635,6 +807,13 @@ impl Engine {
                 .unwrap_or(c);
             session.raw.push(suffix);
             self.refresh_candidates(session);
+            // 选重后缀也是一「键」：评估提前上屏（Rime 在 push_input 后统一评估）
+            if self.parsed_has_locks(session) || !session.committed_raw.is_empty() {
+                self.try_early_commit(session);
+                if session.pending_commit.is_some() {
+                    self.refresh_candidates(session);
+                }
+            }
             return self.take_or_state(session);
         }
         // 非整句：按名次立即选重上屏
@@ -689,45 +868,109 @@ impl Engine {
         session.pending_commit = Some(text);
     }
 
-    /// 消费内联上屏，组装 KeyOutcome。
-    /// 整句模式：提前上屏提案跟踪。同一提案连续 3 键稳定则自动上屏前缀，
-    /// 剩余 raw 从消耗位置重新开始（TigerClaw「稳3键」语义）。
-    fn track_early_commit(&mut self, session: &mut Session) {
-        if !self.config.sentence.early_commit {
-            session.early_streak = None;
+    /// 提前上屏（Rime try_early_commit 逐行移植）：
+    /// 置信前缀提案 + 3 键证据史公共前缀 → 增量上屏，编码留在上下文继续组句。
+    fn try_early_commit(&mut self, session: &mut Session) {
+        if !self.config.sentence.early_commit || session.early_suspended {
+            session.early_history.clear();
+            return;
+        }
+        let live = session.raw.clone();
+        if live.chars().count() + session.committed_raw.chars().count() <= 4 {
+            session.early_history.clear();
             return;
         }
         let dec = match &self.sentence {
             Some(d) => d.clone(),
             None => return,
         };
-        let proposal = dec.early_commit_proposal(&session.raw);
-        match proposal {
-            Some((text, consumed)) if consumed > 0 && consumed < session.raw.chars().count() => {
-                let key = (text, consumed);
-                let streak = match session.early_streak.take() {
-                    Some((k, n)) if k == key => n + 1,
-                    _ => 1,
-                };
-                if streak >= 3 {
-                    let (text, consumed) = key;
-                    let rest: String = session.raw.chars().skip(consumed).collect();
-                    session.raw = rest;
-                    session.early_streak = None;
-                    if session.raw.is_empty() {
-                        session.candidates.clear();
-                        session.pending_commit = Some(text);
-                    } else {
-                        // 剩余编码重新走常规候选
-                        self.refresh_candidates_inner(session);
-                        session.pending_commit = Some(text);
-                    }
-                } else {
-                    session.early_streak = Some((key, streak));
-                }
-            }
-            _ => session.early_streak = None,
+        let full = format!("{}{}", session.committed_raw, live);
+        let dec = dec.decode_rich(&full);
+        // 不完全尾优先作置信源（Rime early_commit_uses_incomplete_tail）
+        let (src, truncated) = if !dec.early_hits.is_empty() {
+            (&dec.early_hits[..], dec.early_truncated)
+        } else {
+            (&dec.hits[..], dec.truncated)
+        };
+        if truncated {
+            session.early_history.clear();
+            return;
         }
+        let committed_text = session.committed_text.clone();
+        let cands: Vec<&SentenceHit> = src
+            .iter()
+            .filter(|h| committed_text.is_empty() || h.text.starts_with(&committed_text))
+            .collect();
+        if cands.is_empty() {
+            session.early_history.clear();
+            return;
+        }
+
+        let (proposal, proposal_share) =
+            confidence_proposal(&cands, self.config.sentence.weights.confidence);
+        if proposal.is_empty()
+            || proposal.chars().count() <= committed_text.chars().count()
+        {
+            session.early_history.clear();
+            return;
+        }
+
+        // 证据史：须逐键延伸（full = 上一证据 + 1 字符）
+        let extends = match session.early_history.last() {
+            Some(e) => {
+                full.chars().count() == e.full_raw.chars().count() + 1
+                    && full.starts_with(&e.full_raw)
+            }
+            None => false,
+        };
+        if !extends {
+            session.early_history.clear();
+        }
+        let raw_lengths = build_raw_lengths(&cands, &full);
+        session.early_history.push(EarlyHistory {
+            proposal: proposal.clone(),
+            full_raw: full.clone(),
+            raw_lengths,
+            strong: proposal_share >= 0.9999,
+        });
+        while session.early_history.len() > 3 {
+            session.early_history.remove(0);
+        }
+
+        // 观察窗口按证据强度自适应：全部强证据 2 键确认，否则 3 键双保险
+        let all_strong = session.early_history.len() >= 2
+            && session.early_history.iter().all(|e| e.strong);
+        let need = if all_strong { 2 } else { 3 };
+        if session.early_history.len() < need {
+            return;
+        }
+
+        // 3 键公共前缀 + 一致的消耗长度
+        let mut stable = common_history_prefix(&session.early_history);
+        let mut consumed = stable_history_raw_length(&session.early_history, &stable);
+        while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
+            stable = stable.chars().take(stable.chars().count() - 1).collect();
+            consumed = stable_history_raw_length(&session.early_history, &stable);
+        }
+        if consumed == 0 {
+            return;
+        }
+        let committed_raw_len = session.committed_raw.chars().count();
+        if consumed <= committed_raw_len || consumed > full.chars().count() {
+            return;
+        }
+        let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
+        if delta.chars().count() < 1 || live.chars().count() < 3 {
+            return;
+        }
+
+        // 提交：committed 前缀增长，live raw 缩为剩余
+        session.committed_text = stable;
+        let full_chars: Vec<char> = full.chars().collect();
+        session.committed_raw = full_chars[..consumed].iter().collect();
+        session.raw = full_chars[consumed..].iter().collect();
+        session.early_history.clear();
+        session.pending_commit = Some(delta);
     }
 
     /// refresh_candidates 的无早屏递归体。
@@ -790,6 +1033,11 @@ impl Engine {
     }
 
     fn on_page(&mut self, session: &mut Session, dir: i32) -> KeyOutcome {
+        // 用户翻页浏览 = 暂停提前上屏直至整句结束（Rime 语义）
+        if dir != 0 {
+            session.early_suspended = true;
+            session.early_history.clear();
+        }
         let page_size = self.config.candidates.page_size.max(1);
         let pages = (session.candidates.len() + page_size - 1) / page_size;
         if pages <= 1 {
@@ -1007,15 +1255,40 @@ impl Engine {
 
         let parsed = parse_rank_locks(&session.raw);
         let raw_len = session.raw.chars().count();
-        // 整句接管：超长，或带选重锁（≤4 码 + 锁时也走解码器组句）
+        // 整句接管：超长、带选重锁（≤4 码 + 锁时也组句），或已有提前上屏前缀
         let sentence_mode = self.sentence_active()
-            && (raw_len > self.config.input.max_code_length || parsed.has_locks());
+            && (raw_len > self.config.input.max_code_length
+                || parsed.has_locks()
+                || !session.committed_raw.is_empty());
         if sentence_mode {
             if let Some(dec) = &self.sentence {
-                let cands = dec.decode(&session.raw);
+                // 全上下文解码（committed ++ live），显示已提交文本之后的剩余
+                let full = format!("{}{}", session.committed_raw, session.raw);
+                let dec = dec.decode_rich(&full);
+                let committed_text = session.committed_text.clone();
+                let mut cands: Vec<Candidate> = Vec::new();
+                for h in dec.hits.iter() {
+                    if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
+                        continue;
+                    }
+                    let text: String = h
+                        .text
+                        .chars()
+                        .skip(committed_text.chars().count())
+                        .collect();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut c = Candidate::new(
+                        text,
+                        session.raw.clone(),
+                        CandidateKind::Sentence,
+                    );
+                    c.weight = h.score;
+                    cands.push(c);
+                }
                 if !cands.is_empty() {
                     session.candidates = cands;
-                    self.track_early_commit(session);
                     return;
                 }
                 // 解码器无产物（如锁无法匹配任何段）：回退常规路径
@@ -1350,17 +1623,28 @@ mod tests {
     /// mock 整句解码器：识别 raw 中的锁，返回「锁文+余量」形态候选。
     struct MockDec;
     impl SentenceDecoder for MockDec {
-        fn decode(&self, raw: &str) -> Vec<Candidate> {
+        fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
             let p = parse_rank_locks(raw);
-            if p.base.is_empty() {
-                return Vec::new();
-            }
-            let rank = p.locks.first().map(|l| l.1).unwrap_or(1);
-            let text = format!("锁{}+{}", rank, p.base);
-            vec![Candidate::new(text, raw.to_string(), CandidateKind::Sentence)]
-        }
-        fn early_commit_proposal(&self, _raw: &str) -> Option<(String, usize)> {
-            None
+            let hits = if p.base.is_empty() {
+                Vec::new()
+            } else {
+                let rank = p.locks.first().map(|l| l.1).unwrap_or(1);
+                let text = format!("锁{}+{}", rank, p.base);
+                vec![SentenceHit {
+                    text,
+                    score: -1.0,
+                    confidence: -1.0,
+                    max_rank: 1,
+                    word_ends: Vec::new(),
+                    segmented: p.base.clone(),
+                }]
+            };
+            std::sync::Arc::new(SentenceDecode {
+                hits,
+                truncated: false,
+                early_hits: Vec::new(),
+                early_truncated: false,
+            })
         }
     }
 

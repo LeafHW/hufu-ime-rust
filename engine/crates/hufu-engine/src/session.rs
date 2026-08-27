@@ -3,12 +3,23 @@
 use crate::punct::PairState;
 use hufu_types::{Candidate, InputMode};
 
+/// 提前上屏证据键（Rime history 条目）：提案 + 完整 raw + 前缀→消耗映射。
+#[derive(Debug, Clone)]
+pub struct EarlyHistory {
+    pub proposal: String,
+    pub full_raw: String,
+    /// (前缀文本, 消耗的 orig 字符数)
+    pub raw_lengths: Vec<(String, usize)>,
+    /// 强证据：提案份额 ≥ 0.9999（异议路径合计质量 < 0.01%）
+    pub strong: bool,
+}
+
 /// 每个输入上下文（应用 / 焦点）一个会话。
 #[derive(Debug, Clone)]
 pub struct Session {
     /// 中/英状态
     pub chinese: bool,
-    /// 原始编码缓冲
+    /// 原始编码缓冲（活的未提交部分；提前上屏后仅剩剩余码）
     pub raw: String,
     /// 当前候选页
     pub page: usize,
@@ -18,9 +29,15 @@ pub struct Session {
     pub candidates: Vec<Candidate>,
     /// 成对引号状态
     pub pair: PairState,
-    /// 提前上屏提案连击：((文本, raw 消耗长度), 连击数)
-    pub early_streak: Option<((String, usize), u32)>,
-    /// 本次按键内联产生的上屏文本（顶功/唯一上屏），由 take_or_state 消费
+    /// 提前上屏：已上屏编码前缀（含选重后缀字符；Rime committed_raw）
+    pub committed_raw: String,
+    /// 提前上屏：已上屏文本（Rime committed_text）
+    pub committed_text: String,
+    /// 提前上屏证据史（最近 3 键）
+    pub early_history: Vec<EarlyHistory>,
+    /// 用户翻页/选字后暂停提前上屏，直至整句提交
+    pub early_suspended: bool,
+    /// 本次按键内联产生的上屏文本（顶功/唯一上屏/提前上屏增量），由 take_or_state 消费
     pub pending_commit: Option<String>,
 }
 
@@ -33,7 +50,10 @@ impl Session {
             mode: InputMode::Normal,
             candidates: Vec::new(),
             pair: PairState::default(),
-            early_streak: None,
+            committed_raw: String::new(),
+            committed_text: String::new(),
+            early_history: Vec::new(),
+            early_suspended: false,
             pending_commit: None,
         }
     }
@@ -43,8 +63,16 @@ impl Session {
         self.candidates.clear();
         self.page = 0;
         self.mode = InputMode::Normal;
-        self.early_streak = None;
+        self.committed_raw.clear();
+        self.committed_text.clear();
+        self.early_history.clear();
+        self.early_suspended = false;
         self.pending_commit = None;
+    }
+
+    /// 清提前上屏瞬态（保留已提交前缀）。
+    pub fn early_reset(&mut self) {
+        self.early_history.clear();
     }
 
     pub fn is_idle(&self) -> bool {

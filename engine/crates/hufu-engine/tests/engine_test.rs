@@ -1,7 +1,7 @@
 //! 引擎状态机集成测试。
 
 use hufu_config::Config;
-use hufu_engine::{Engine, SentenceDecoder, Session};
+use hufu_engine::{Engine, SentenceDecoder, SentenceHit, Session};
 use hufu_types::{Candidate, KeyInput};
 use std::sync::Arc;
 
@@ -38,12 +38,21 @@ fn setup() -> (Engine, Session, std::path::PathBuf) {
 /// 模拟整句解码器。
 struct MockDecoder;
 impl SentenceDecoder for MockDecoder {
-    fn decode(&self, raw: &str) -> Vec<Candidate> {
-        let mut c = Candidate::new(format!("整句[{raw}]"), raw.to_string(), hufu_types::CandidateKind::Sentence);
-        vec![c]
-    }
-    fn early_commit_proposal(&self, _raw: &str) -> Option<(String, usize)> {
-        None
+    fn decode_rich(&self, raw: &str) -> std::sync::Arc<hufu_engine::SentenceDecode> {
+        let hits = vec![SentenceHit {
+            text: format!("整句[{raw}]"),
+            score: -1.0,
+            confidence: -1.0,
+            max_rank: 1,
+            word_ends: Vec::new(),
+            segmented: raw.to_string(),
+        }];
+        std::sync::Arc::new(hufu_engine::SentenceDecode {
+            hits,
+            truncated: false,
+            early_hits: Vec::new(),
+            early_truncated: false,
+        })
     }
 }
 
