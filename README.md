@@ -66,15 +66,20 @@ hufu/
 | 模块 | 状态 | 实测 |
 |---|---|---|
 | `hufu-types` | ✅ | — |
-| `hufu-dict` | ✅ | 虎码单字 113k 条/272ms、虎码字词（import 闭包）246k 条/1.2s、QQ五笔 96k/114ms、多多 B 定制 33k/81ms |
+| `hufu-dict` | ✅ | 虎码单字 113k 条/272ms、虎码字词（import 闭包）246k 条/1.2s、QQ五笔 96k/114ms、多多 B 定制 33k/81ms；置顶/软删回放（最新在前、无重复、pinned 标记） |
 | `hufu-config` | ✅ | — |
-| `hufu-engine` | ✅ | 真实码表 REPL：顶功（`tuj`+死端字母推屏 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显 |
+| `hufu-engine` | ✅ | 真实码表 REPL：顶功（`tuj`+死端字母推屏 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显；动态变量 `\da`→真实日期、`\n12345`→一万二千三百四十五、`\N1234`→壹萬贰仟大写金额（HTTP 在线上屏实测）；Ctrl+Shift+数字 置顶 / Ctrl+Delete 软删（日志落盘+回放） |
 | `hufu-sentence` | ✅ | 真实 TCSKNM02 224MB 模型加载 87ms；`tujatuja`→「我们我们」、`mfyto`→「大一点我是」；单次组句 0.4–2.8ms；提前上屏提案 |
 | `hufu-skin` | ✅ | 19 颜色角色 + 材质模型；weasel 配色互导（含 0xAABBGGRR ↔ #RRGGBBAA） |
 | `hufu-cli` | ✅ | check / convert / repl |
-| `hufu-server` + 设置 GUI | ✅ | 13 REST 路由 + `\\.\pipe\hufu-ime` 命名管道；pipeclient 全操作通过（u→raw、space→上屏「的」、skin）；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词/导入导出） |
-| Windows TSF | 🔨 v1 | `hufu_tsf.dll` 编译通过（纯 Rust + windows-rs 0.58，4 COM 导出）；冒烟：LoadLibrary→DllRegisterServer(HKCU CLSID+CTF\TIP)→DllGetClassObject→CreateInstance→msctf ThreadMgr；`hufu_test_key` 直驱 u/j/k/l/m 全 consumed；**待**：CTF 语言档案注册→msctf 真实激活、D2D 候选窗 |
-| macOS IMK | ⏳ | — |
+| `hufu-server` + 设置 GUI | ✅ | 18 REST 路由（+候选置顶/隐藏）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/导入导出） |
+| Windows TSF | 🔨 v1→v2 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；冒烟 12 步全绿：COM 注册、msctf 激活链（AdviseKeyEventSink 前景接收器 ✓）、管道引擎链；**候选窗 v2 已实测**：D3D11+DComp+D2D+DWM accent 四材质（solid/translucent/frosted 磨砂/glass 玻璃）各真实渲染一帧 ✓，皮肤近热更新（会话间重拉）；**待**：管理员 HKLM 注册后真实系统激活（UAC 一次）、插入点跟随 |
+| macOS IMK | 🔨 骨架 | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
+
+### 测试
+
+- 引擎 workspace：**44 测试 0 失败**（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/皮肤/配置）
+- Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质）
 
 ## 构建
 
