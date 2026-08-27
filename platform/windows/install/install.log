@@ -1,0 +1,33 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260828005117
+用户名: LEAFYINHW\Leafy
+RunAs 用户: LEAFYINHW\Leafy
+配置名称: 
+计算机: LEAFYINHW (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File E:\DSH-KF\hufu\platform\windows\install\install.ps1
+进程 ID: 2800
+PSVersion: 5.1.26100.9168
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9168
+BuildVersion: 10.0.26100.9168
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+DLL: E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll
+✓ HKLM COM + CTF TIP 已注册
+✓ HKCU 用户侧已启用
+
+安装完成。接下来：
+  1) 确保输入引擎在跑:  E:\DSH-KF\hufu\engine\target\release\hufu-server.exe
+     （它提供 \\.\pipe\hufu-ime 管道与 localhost 设置页）
+  2) 重启 ctfmon 或注销重登
+  3) Win+空格 切到「HuFu 虎符输入法」即可使用
+
+卸载: .\uninstall.ps1
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260828005117
+**********************

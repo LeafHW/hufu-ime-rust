@@ -26,6 +26,9 @@ pub struct Shared {
     pub skin_stale: bool,
     /// 插入点（屏幕坐标，GetTextExt 实测）
     pub caret: Option<RECT>,
+    /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
+    pub chinese: bool,
+    pub composing: bool,
 }
 
 impl Shared {
@@ -40,6 +43,8 @@ impl Shared {
             skin: serde_json::Value::Null,
             skin_stale: true,
             caret: None,
+            chinese: true,
+            composing: false,
         }
     }
 
@@ -149,9 +154,56 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     }
 }
 
+/// 轨迹日志（诊断 UI 线程卡死）：追加到 %TEMP%\hufu-tsf-trace.log。
+/// 环境变量 HUFU_TRACE=0 可关。多进程各写各行（带进程名）。
+pub fn trace(msg: &str) {
+    use std::io::Write;
+    if std::env::var("HUFU_TRACE").as_deref() == Ok("0") {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join("hufu-tsf-trace.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{t}] {exe}: {msg}");
+    }
+}
+
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     fn dispatch(&self, wparam: usize, test_only: bool) -> BOOL {
+        // TestKeyDown：本地预判（缓存引擎态），不碰管道——
+        // 否则同一键会被引擎处理两次（Test + Down 各一次）
+        if test_only {
+            let (chinese, composing) = {
+                let g = self.shared.lock().unwrap();
+                (g.chinese, g.composing)
+            };
+            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
+                return BOOL(0);
+            };
+            let _ = (shift, alt);
+            if ctrl {
+                return BOOL(0); // 组合键直通（Ctrl+Shift+V 剪贴板在 KeyDown 处理）
+            }
+            let will = chinese
+                && match name.as_str() {
+                    // 编码中：可打印键与控制键都可能被吞
+                    _ if composing => true,
+                    // 空闲：编码字母/分号/引号会起段
+                    "space" | "enter" | "escape" | "backspace" | "tab" => false,
+                    n if n.len() == 1 => true, // 单字符（字母/数字/标点）
+                    _ => false,
+                };
+            return BOOL(will as i32);
+        }
+        trace(&format!("dispatch vk=0x{wparam:X}"));
         // Ctrl+Shift+V：剪贴板上屏（配置+白名单由 server 判定）
         if wparam == 0x56 {
             unsafe {
@@ -175,6 +227,7 @@ impl HuFuTs_Impl {
         else {
             return BOOL(0);
         };
+        trace(&format!("pipe back consumed={consumed}"));
         if !consumed {
             return BOOL(0);
         }
@@ -182,7 +235,9 @@ impl HuFuTs_Impl {
             if let Some(tag) = sound {
                 crate::sound::play(&tag);
             }
+            trace("before update_ui");
             let _ = update_ui(self.shared.clone(), commit, state);
+            trace("after update_ui");
         }
         BOOL(1)
     }
@@ -400,17 +455,49 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 
 /// 引擎结果 → 组段与候选窗更新。
 fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
+    let (op, has_ctx) = {
+        let mut g = shared.lock().unwrap();
+        let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+        let preedit = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
+        if raw.is_empty() {
+            g.skin_stale = true;
+        }
+        if g.focus_context().is_none() {
+            return Ok(());
+        }
+        let op = if raw.is_empty() && preedit.is_empty() {
+            if !commit.is_empty() || g.composition.is_some() {
+                Some(Op::Commit(commit.clone()))
+            } else {
+                None
+            }
+        } else if g.composition.is_none() {
+            Some(Op::StartPreedit(preedit.to_string()))
+        } else {
+            Some(Op::SetPreedit(preedit.to_string()))
+        };
+        (op, true)
+    };
+    let _ = has_ctx;
+    // 组段（锁已释放；DoEditSession 内部自行加锁）
+    if let Some(op) = op {
+        trace("run_session begin");
+        let r = run_session(&shared, op);
+        trace("run_session end");
+        r?;
+    }
+
+    // 缓存引擎态（TestKeyDown 预判）
+    {
+        let mut g2 = shared.lock().unwrap();
+        g2.chinese = state.get("chinese").and_then(|v| v.as_bool()).unwrap_or(true);
+        g2.composing = !state.get("raw").and_then(|v| v.as_str()).unwrap_or("").is_empty();
+    }
+
+    // 候选窗（v2 优先，初始化失败回退 v1）
     let mut g = shared.lock().unwrap();
     let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let preedit = state
-        .get("preedit")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    // 编码会话结束 → 皮肤缓存过期（下次会话重新拉取）
-    if raw.is_empty() {
-        g.skin_stale = true;
-    }
     let cands: Vec<(String, String)> = state
         .get("candidates")
         .and_then(|v| v.as_array())
@@ -426,22 +513,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         })
         .unwrap_or_default();
 
-    if g.focus_context().is_none() {
-        return Ok(());
-    }
-
-    // 1) 组段
-    if raw.is_empty() && preedit.is_empty() {
-        if !commit.is_empty() || g.composition.is_some() {
-            run_session(&shared, Op::Commit(commit.clone()))?;
-        }
-    } else if g.composition.is_none() {
-        run_session(&shared, Op::StartPreedit(preedit.clone()))?;
-    } else {
-        run_session(&shared, Op::SetPreedit(preedit.clone()))?;
-    }
-
-    // 2) 候选窗（v2 优先，初始化失败回退 v1）
     g.load_skin();
     if cands.is_empty() {
         if let Some(c) = g.cand2.as_ref() {

@@ -1,4 +1,4 @@
-# HuFu 安装后全链验证（安装完成后自动由 agent 触发）
+﻿# HuFu 安装后全链验证（安装完成后自动由 agent 触发）
 $ErrorActionPreference = 'Continue'
 $CLSID = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}'
 $PROFILE_G = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}'

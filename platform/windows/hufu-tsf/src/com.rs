@@ -125,17 +125,17 @@ pub fn register_server() -> HRESULT {
     let tip_root = format!(r"{tip}\{CLSID_STR}");
     let _ = reg_set(&tip_root, None, "HuFu 输入法");
     let _ = reg_set(&format!(r"{tip_root}\Description"), None, "HuFu 虎符输入法（虎码）");
-    // MS Sample IME 布局：Category\Category 与 Category\Item 为 REG_SZ 值
+    // 微拼/MS Sample 实测布局：Category 两层子键（纯存在性，值留空）
     const TFCAT_TIP_KEYBOARD: &str = "{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}";
     let _ = reg_set(
-        &format!(r"{tip_root}\Category\Category\{TFCAT_TIP_KEYBOARD}"),
+        &format!(r"{tip_root}\Category\Category\{TFCAT_TIP_KEYBOARD}\{CLSID_STR}"),
         None,
-        CLSID_STR,
+        "",
     );
     let _ = reg_set(
-        &format!(r"{tip_root}\Category\Item\{TFCAT_TIP_KEYBOARD}"),
+        &format!(r"{tip_root}\Category\Item\{CLSID_STR}\{TFCAT_TIP_KEYBOARD}"),
         None,
-        CLSID_STR,
+        "",
     );
     // 语言档案（msctf AddLanguageProfile 最终也写这里；预写便于 per-user 识别）
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
