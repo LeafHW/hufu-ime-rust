@@ -32,8 +32,9 @@ pub trait SentenceDecoder: Send + Sync {
 pub struct RankLocks {
     /// 去掉选重后缀后的纯编码
     pub base: String,
-    /// (块结束位置, 块起始位置, 1 起名次)，位置均以 base 字符下标计
-    pub locks: Vec<(usize, usize, usize)>,
+    /// (段结束位置, 1 起名次)：该位置必须有段恰好结束于此并取该名次。
+    /// 段起点由解码器决定（;只锁它前面的那个词段，不锁整个字母流）。
+    pub locks: Vec<(usize, usize)>,
     /// base 第 i 个字符在原始 raw 中的字符下标（提前上屏 consumed 映射用）
     pub orig_of_base: Vec<usize>,
 }
@@ -45,14 +46,14 @@ impl RankLocks {
 }
 
 /// 解析选重后缀：raw 中紧跟在编码块（[a-z]+）之后的
-/// `;`(第2) `'`(第3) `2-9`(第N) `0`(第10) 锁定该段的名次。
+/// `;`(第2) `'`(第3) `2-9`(第N) `0`(第10) 在该处设段名次锁。
 /// 其余字符原样保留在 base 中（lenient）。连续后缀只取第一个。
 pub fn parse_rank_locks(raw: &str) -> RankLocks {
     let chars: Vec<char> = raw.chars().collect();
     let mut base = String::new();
     let mut locks = Vec::new();
     let mut orig_of_base = Vec::new();
-    let mut run_start: Option<usize> = None; // 当前字母块在 base 中的起始下标
+    let mut in_run = false; // 是否处于字母块中（后缀仅跟在字母后有效）
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -64,24 +65,19 @@ pub fn parse_rank_locks(raw: &str) -> RankLocks {
             _ => None,
         };
         if let Some(r) = rank {
-            if let Some(start) = run_start.take() {
-                // 锁定 base 中 [start, base.len()) 块的名次 r
-                locks.push((base.chars().count(), start, r));
+            if in_run {
+                // 在当前 base 末尾设段名次锁
+                locks.push((base.chars().count(), r));
                 // 连续后缀：跳过（只取第一个）
                 while i + 1 < chars.len() && matches!(chars[i + 1], ';' | '\'' | '0'..='9') {
                     i += 1;
                 }
+                in_run = false;
                 i += 1;
                 continue;
             }
         }
-        if c.is_ascii_lowercase() {
-            if run_start.is_none() {
-                run_start = Some(base.chars().count());
-            }
-        } else {
-            run_start = None;
-        }
+        in_run = c.is_ascii_lowercase();
         base.push(c);
         orig_of_base.push(i);
         i += 1;
@@ -579,6 +575,8 @@ impl Engine {
         {
             self.sound_hint = Some("select");
             // 名次基准 = 候选框显示序（置顶/用户词参与排序）。
+            // 目标块 = 当前编码的尾部最长有效码（;只锁它前面的那个词段，
+            // 如 syftuuu; 的块是 uu 而非整个字母流）。
             // 解码器名次 = 码表原序 → 换算后写入，保证锁到用户看到的那个词。
             let disp_rank: usize = match c {
                 x if x == self.config.candidates.second_select => 2,
@@ -592,42 +590,49 @@ impl Engine {
                     }
                 }
             };
-            let chunk: String = session
-                .raw
-                .chars()
-                .rev()
-                .take_while(|k| k.is_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let suffix = if !chunk.is_empty() {
-                self.schema
-                    .candidates(&chunk)
-                    .get(disp_rank - 1)
-                    .and_then(|pick| {
-                        self.schema
-                            .dict
-                            .lookup(&chunk)
-                            .into_iter()
-                            .position(|e| e.text == pick.text)
-                            .map(|i| i + 1)
-                    })
-                    .and_then(|file_rank| {
-                        if (2..=10).contains(&file_rank) {
-                            Some(if file_rank == 10 {
-                                '0'
+            let base_now = parse_rank_locks(&session.raw).base;
+            let chunk: Option<String> = (1..=4usize).rev().find_map(|len| {
+                if base_now.chars().count() < len {
+                    return None;
+                }
+                let cand: String = base_now
+                    .chars()
+                    .skip(base_now.chars().count() - len)
+                    .collect();
+                if cand.chars().all(|k| k.is_ascii_lowercase())
+                    && self.schema.candidates(&cand).len() >= disp_rank
+                {
+                    Some(cand)
+                } else {
+                    None
+                }
+            });
+            let suffix = chunk
+                .and_then(|ch| {
+                    self.schema
+                        .candidates(&ch)
+                        .get(disp_rank - 1)
+                        .and_then(|pick| {
+                            self.schema
+                                .dict
+                                .lookup(&ch)
+                                .into_iter()
+                                .position(|e| e.text == pick.text)
+                                .map(|i| i + 1)
+                        })
+                        .and_then(|file_rank| {
+                            if (2..=10).contains(&file_rank) {
+                                Some(if file_rank == 10 {
+                                    '0'
+                                } else {
+                                    char::from_digit(file_rank as u32, 10).unwrap()
+                                })
                             } else {
-                                char::from_digit(file_rank as u32, 10).unwrap()
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(c)
-            } else {
-                c
-            };
+                                None
+                            }
+                        })
+                })
+                .unwrap_or(c);
             session.raw.push(suffix);
             self.refresh_candidates(session);
             return self.take_or_state(session);
@@ -1304,25 +1309,30 @@ mod tests {
         assert!(p.locks.is_empty());
         assert_eq!(p.orig_of_base.len(), 6);
 
-        // 尾锁：jd + 2
+        // 尾锁：jd + 2（锁在 base 终点 2，段起点由解码器决定）
         let p = parse_rank_locks("jd2");
         assert_eq!(p.base, "jd");
-        assert_eq!(p.locks, vec![(2, 0, 2)], "jd 后的 2 = 锁 [0,2) 名次 2");
+        assert_eq!(p.locks, vec![(2, 2)]);
         assert_eq!(p.orig_of_base, vec![0, 1]);
 
         // 中置锁 + 续打
         let p = parse_rank_locks("jd2tuja");
         assert_eq!(p.base, "jdtuja");
-        assert_eq!(p.locks, vec![(2, 0, 2)]);
+        assert_eq!(p.locks, vec![(2, 2)]);
         assert_eq!(p.orig_of_base, vec![0, 1, 3, 4, 5, 6], "t 在原 raw 下标 3");
+
+        // 用户实例：syftuuu;w;jgfd → 让我看看怎么个事
+        let p = parse_rank_locks("syftuuu;w;jgfd");
+        assert_eq!(p.base, "syftuuuwjgfd");
+        assert_eq!(p.locks, vec![(7, 2), (8, 2)], "; 只锁其前词段终点");
 
         // 分号/引号/0
         let p = parse_rank_locks("jd;");
-        assert_eq!(p.locks[0].2, 2);
+        assert_eq!(p.locks[0].1, 2);
         let p = parse_rank_locks("jd'");
-        assert_eq!(p.locks[0].2, 3);
+        assert_eq!(p.locks[0].1, 3);
         let p = parse_rank_locks("jd0");
-        assert_eq!(p.locks[0].2, 10);
+        assert_eq!(p.locks[0].1, 10);
         // 连续后缀只取第一个
         let p = parse_rank_locks("jd2;");
         assert_eq!(p.locks.len(), 1);
@@ -1330,7 +1340,7 @@ mod tests {
         // 两段各自锁
         let p = parse_rank_locks("jd2tu'");
         assert_eq!(p.base, "jdtu");
-        assert_eq!(p.locks, vec![(2, 0, 2), (4, 2, 3)]);
+        assert_eq!(p.locks, vec![(2, 2), (4, 3)]);
         // 前导符号不锁
         let p = parse_rank_locks(";");
         assert_eq!(p.base, ";");
@@ -1345,7 +1355,7 @@ mod tests {
             if p.base.is_empty() {
                 return Vec::new();
             }
-            let rank = p.locks.first().map(|l| l.2).unwrap_or(1);
+            let rank = p.locks.first().map(|l| l.1).unwrap_or(1);
             let text = format!("锁{}+{}", rank, p.base);
             vec![Candidate::new(text, raw.to_string(), CandidateKind::Sentence)]
         }

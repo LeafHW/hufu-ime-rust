@@ -62,7 +62,21 @@ TypeCh @("'")
 $r = $script:last
 Check "jd' 锁3=候选框第3($want3)" ($null -eq $r.outcome.commit -and $r.state.candidates[0].text -eq $want3) "首选=$($r.state.candidates[0].text)"
 
-# ── 4) 整句流不断：tujatuja 提前上屏
+# ── 4) 用户实例：syftuuu;w;jgfd → 让我看看怎么个事
+#     syf=让 tu=我 uu;=看看(uu:推/看看) w;=怎么(w:得/怎么) jg=个 fd=事
+#     注：提前上屏会在中途先落地前缀（如 让我），累计中途 commit + 最终上屏
+[void](PipeCall '{"op":"reset"}')
+$midcommits = @()
+foreach ($ch in @('s','y','f','t','u','u','u',';','w',';','j','g','f','d')) {
+  $script:last = PipeCall ('{"op":"key","key":"' + $ch + '"}')
+  if ($script:last.outcome.commit) { $midcommits += $script:last.outcome.commit }
+}
+$mid = $midcommits -join ''
+TypeCh @(' ')
+$total = $mid + $script:last.outcome.commit
+Check "syftuuu;w;jgfd 总输出=让我看看怎么个事" ($total -eq '让我看看怎么个事') "总=$total（中途[$mid]+终[$($script:last.outcome.commit)]）"
+
+# ── 5) 整句流不断：tujatuja 提前上屏
 [void](PipeCall '{"op":"reset"}')
 TypeCh @('t','u','j','a','t','u','j','a')
 $r = $script:last
