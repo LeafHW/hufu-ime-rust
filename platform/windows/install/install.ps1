@@ -74,13 +74,48 @@ Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
 Set-RegDWord "HKCU:\Software\Microsoft\CTF\TIP\$CLSID\LanguageProfile\0x00000804\$PROFILE" 'Enable' 1
 Write-Host '✓ HKCU 用户侧已启用'
 
+# ── msctf 原生档案登记（提权环境直调，官方 IME 安装器同款）────
+# ITfInputProcessorProfiles::Register + AddLanguageProfile + Enable。
+# 非提权必 E_FAIL；缺这步 Win+空格 切换器不显示、官方 API 拒收。
+$smoke = Join-Path $PSScriptRoot '..\target\release\hufu-tsf-smoke.exe'
+$smoke = [System.IO.Path]::GetFullPath($smoke)
+if (Test-Path $smoke) {
+    & $smoke reg
+    Write-Host '✓ msctf 原生档案已登记'
+} else {
+    Write-Host '⚠ 未找到 hufu-tsf-smoke.exe，跳过 msctf 登记' -ForegroundColor Yellow
+}
+
+# ── 语言列表 + 输入切换器装配 ────────────────────────────────
+# Set-WinUserLanguageList 会静默丢弃未登记 TIP；msctf 登记后正常走官方 API。
+$tipStr = "0804:$CLSID$PROFILE"
+$list = Get-WinUserLanguageList
+$zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+if (-not $zh) { $zh = $list[0] }
+if ($zh.InputMethodTips -notcontains $tipStr) {
+    $zh.InputMethodTips.Add($tipStr)
+    Set-WinUserLanguageList $list -Force
+}
+# 切换器装配表（被系统清理时 Win+空格 不显示，兜底直写）
+$asm = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}\00000003"
+New-Item -Path $asm -Force | Out-Null
+Set-ItemProperty -Path $asm -Name 'CLSID' -Value $CLSID -Type String
+Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
+Set-ItemProperty -Path $asm -Name 'Profile' -Value $PROFILE -Type String
+Write-Host '✓ 语言列表 + 切换器装配已写入'
+
+# ── ctfmon 重读 ─────────────────────────────────────────────
+Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Start-Process ctfmon -ErrorAction SilentlyContinue
+Write-Host '✓ ctfmon 已重启'
+
 # ── 提醒 ───────────────────────────────────────────────────
 Write-Host ''
 Write-Host '安装完成。接下来：' -ForegroundColor Green
 Write-Host '  1) 确保输入引擎在跑:  E:\DSH-KF\hufu\engine\target\release\hufu-server.exe'
 Write-Host '     （它提供 \\.\pipe\hufu-ime 管道与 localhost 设置页）'
-Write-Host '  2) 重启 ctfmon 或注销重登'
-Write-Host '  3) Win+空格 切到「HuFu 虎符输入法」即可使用'
+Write-Host '  2) Win+空格 切到「HuFu 虎符输入法」即可使用'
 Write-Host ''
 Write-Host '卸载: .\uninstall.ps1'
 Stop-Transcript | Out-Null
