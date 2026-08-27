@@ -308,7 +308,9 @@ impl CandidateWindowV2 {
         let margin_y = layout_f(skin, "margin_y", 8.0);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 6.0) + 6.0;
         let width = 320.0f32;
-        let rows = cands.len().min(9) as f32 + 1.0;
+        // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
+        let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
+        let rows = cands.len().min(9) as f32 + code_row;
         let height = margin_y * 2.0 + line_h * rows + 4.0;
 
         let w = width as u32;
@@ -443,12 +445,15 @@ impl CandidateWindowV2 {
                 }
             };
 
-            // 编码行
-            draw(&ctx, &tf, raw, margin_x, margin_y, width - margin_x * 2.0, line_h, &b_raw);
+            // 编码行（有内容才画；候选行相应上移）
+            if !raw.is_empty() {
+                draw(&ctx, &tf, raw, margin_x, margin_y, width - margin_x * 2.0, line_h, &b_raw);
+            }
+            let y0 = margin_y + line_h * code_row;
 
             // 候选行
             for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
-                let y = margin_y + line_h * (i as f32 + 1.0);
+                let y = y0 + line_h * i as f32;
                 if i == 0 {
                     // 首选高亮（圆角胶囊）
                     if let Some(b) = &b_hi {

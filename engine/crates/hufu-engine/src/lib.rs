@@ -1113,6 +1113,7 @@ impl Engine {
             full_shape: self.config.punct.full_shape,
             ascii_punct: self.config.input.ascii_punct,
             reverse_mode: session.mode == InputMode::Reverse,
+            show_code: self.config.input.show_code,
         }
     }
 }
