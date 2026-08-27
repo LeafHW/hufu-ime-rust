@@ -302,16 +302,99 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_str())
             .and_then(parse_hex);
 
-        let font_pt = layout_f(skin, "font_point", 14.5);
+        let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 5.0);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
-        let width = layout_f(skin, "width", 250.0);
-        // 内部列随宽度自适应：标签 | 候选文本 | 备注（窄窗备注右置小字）
+        // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
+        let width_cfg = layout_f(skin, "width", 0.0);
+        let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
         let label_w = 26.0f32;
-        let text_x = margin_x + label_w;
-        let cmt_x = (width - 86.0).max(text_x + 60.0);
+        let em = font_pt * 96.0 / 72.0;
+
+        // 字体与内容测宽先行（宽度取决于最长候选）
+        let (tf, tf_small, width, text_x, cmt_x, cmt_w) = unsafe {
+            let dwrite = match &self.dwrite {
+                Some(d) => d.clone(),
+                None => return,
+            };
+            let font_face: String = {
+                let f = skin
+                    .pointer("/skin/layout/font_face")
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("font_face")))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                if f.is_empty() {
+                    "Microsoft YaHei UI".into()
+                } else {
+                    f.to_string()
+                }
+            };
+            let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
+            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）
+            let mk_tf = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
+                let mut b: Vec<u16> = fam.encode_utf16().collect();
+                b.push(0);
+                dwrite
+                    .CreateTextFormat(
+                        PCWSTR(b.as_ptr()),
+                        None,
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        em,
+                        PCWSTR(locale.as_ptr()),
+                    )
+                    .ok()
+            };
+            let tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
+            let tf_small =
+                mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+
+            let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                if let Some(tf) = tf {
+                    let w: Vec<u16> = s.encode_utf16().collect();
+                    if let Ok(l) = dwrite.CreateTextLayout(&w, tf, 4096.0, line_h.max(8.0)) {
+                        let mut m = DWRITE_TEXT_METRICS::default();
+                        if l.GetMetrics(&mut m).is_ok() {
+                            return m.width.ceil();
+                        }
+                    }
+                }
+                // 兜底：按字数估宽
+                s.chars().count() as f32 * em
+            };
+            let mut max_text = 0.0f32;
+            let mut max_cmt = 0.0f32;
+            for (t, c) in cands {
+                max_text = max_text.max(measure(&tf, t));
+                if !c.is_empty() {
+                    max_cmt = max_cmt.max(measure(&tf_small, c));
+                }
+            }
+            let raw_w = if raw.is_empty() { 0.0 } else { measure(&tf, raw) };
+            // 标签列 + 最宽内容 +（备注列）+ 高亮胶囊余量
+            let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 8.0;
+            if max_cmt > 0.0 {
+                need += 8.0 + max_cmt;
+            }
+            let width = if width_cfg > 0.0 {
+                width_cfg
+            } else {
+                need.clamp(min_width, 340.0)
+            };
+            let text_x = margin_x + label_w;
+            let (cmt_x, cmt_w) = if max_cmt > 0.0 {
+                (width - margin_x - max_cmt - 2.0, max_cmt + 2.0)
+            } else {
+                (width, 0.0)
+            };
+            (tf, tf_small, width, text_x, cmt_x, cmt_w)
+        };
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
         let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
         let rows = cands.len().min(9) as f32 + code_row;
@@ -380,55 +463,6 @@ impl CandidateWindowV2 {
             let b_hi_txt = mkbrush(&ctx, color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF"));
             let b_hi_lbl = mkbrush(&ctx, color_f(skin, "hilited_candidate_label_color", "#FFD75EFF"));
             let b_border = mkbrush(&ctx, color_f(skin, "border_color", "#FFFFFF26"));
-
-            let dwrite = match &self.dwrite {
-                Some(d) => d.clone(),
-                None => return,
-            };
-            let font_face: String = {
-                let f = skin
-                    .pointer("/skin/layout/font_face")
-                    .or_else(|| skin.get("layout").and_then(|l| l.get("font_face")))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                if f.is_empty() {
-                    "Microsoft YaHei UI".into()
-                } else {
-                    f.to_string()
-                }
-            };
-            let mut fam_buf: Vec<u16> = font_face.encode_utf16().collect();
-            fam_buf.push(0);
-            let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
-            let em = font_pt * 96.0 / 72.0;
-            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）
-            let mk_tf = |fam: &str| -> Option<IDWriteTextFormat> {
-                let mut b: Vec<u16> = fam.encode_utf16().collect();
-                b.push(0);
-                dwrite
-                    .CreateTextFormat(
-                        PCWSTR(b.as_ptr()),
-                        None,
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        em,
-                        PCWSTR(locale.as_ptr()),
-                    )
-                    .ok()
-            };
-            let tf = mk_tf(&font_face).or_else(|| mk_tf("Microsoft YaHei UI"));
-            let tf_small = dwrite
-                .CreateTextFormat(
-                    PCWSTR(fam_buf.as_ptr()),
-                    None,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    em * 0.78,
-                    PCWSTR(locale.as_ptr()),
-                )
-                .ok();
 
             let draw = |ctx: &ID2D1DeviceContext,
                         tf: &Option<IDWriteTextFormat>,
