@@ -5,11 +5,12 @@
 
 mod host;
 mod http;
+mod pipe;
 
 use host::{parse_key, Host};
 use http::{Request, Response};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 
@@ -45,11 +46,25 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let host = Mutex::new(host);
+    let shared = Arc::new(Mutex::new(host));
     let addr = format!("127.0.0.1:{port}");
 
-    let handler = move |req: &Request| -> Response { route(&host, req) };
-    if let Err(e) = http::serve(&addr, std::sync::Arc::new(handler)) {
+    // 命名管道（Windows 前端 IPC）独立线程
+    #[cfg(windows)]
+    {
+        let p = shared.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = pipe::run_pipe(p) {
+                eprintln!("命名管道服务退出: {e}");
+            }
+        });
+    }
+
+    let handler = {
+        let shared = shared.clone();
+        move |req: &Request| -> Response { route(&shared, req) }
+    };
+    if let Err(e) = http::serve(&addr, Arc::new(handler)) {
         eprintln!("HTTP 服务失败: {e}");
         std::process::exit(1);
     }
