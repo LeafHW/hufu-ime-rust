@@ -74,7 +74,7 @@ hufu/
 | `hufu-skin` | ✅ | 19 颜色角色 + 材质模型；weasel 配色互导（含 0xAABBGGRR ↔ #RRGGBBAA） |
 | `hufu-cli` | ✅ | check / convert / repl |
 | `hufu-server` + 设置 GUI | ✅ | 20 REST 路由（+候选置顶/隐藏/音效试听/全量快照导出）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/音效开关+试听/繁简开关/快照导出/导入导出） |
-| Windows TSF | 🔨 v1→v2 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；冒烟 12 步全绿：COM 注册、msctf 激活链（AdviseKeyEventSink 前景接收器 ✓）、管道引擎链；**候选窗 v2 已实测**：D3D11+DComp+D2D+DWM accent 四材质（solid/translucent/frosted 磨砂/glass 玻璃）各真实渲染一帧 ✓，皮肤近热更新（会话间重拉）；**待**：管理员 HKLM 注册后真实系统激活（UAC 一次）、插入点跟随 |
+| Windows TSF | ✅ 真机全通 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；**系统级激活实测**：Win+空格 第 4 项（虎图标）、汉字上屏、候选窗贴光标跟随、选区顺序正确；**应用矩阵**：记事本/浏览器/VSCode/QQ/DSH/Listary 全通过。注册九步一键化（install.ps1 + reg-fix.ps1）；DLL 轨迹日志 `%TEMP%\hufu-tsf-trace.log`。运行时铁律：EditSession 用 ASYNCDONTCARE、组段走 GetSelection→StartComposition、GetTextExt 即屏幕坐标 |
 | macOS IMK | 🔨 骨架 | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
 
 ### 测试
@@ -99,6 +99,21 @@ cargo build --release          # hufu_tsf.dll + hufu-tsf-smoke.exe
 ./target/release/hufu-tsf-smoke.exe   # 冒烟：COM 层 + 管道引擎链
 # 注册见 platform/windows/install/README.md
 ```
+
+### 系统激活（真机安装）
+
+```powershell
+# 管理员终端，一条完成全部注册（COM + msctf 档案 + 分类 + 语言列表 + 切换器）
+powershell -ExecutionPolicy Bypass -File "platform\windows\install\install.ps1"
+# 若切换器不显示第 4 项（全局分类被清）：
+powershell -ExecutionPolicy Bypass -File "platform\windows\install\reg-fix.ps1"
+```
+
+注意：
+- `hufu-server.exe` 需先运行（管道与设置页）
+- **启动早于注册的应用要重启才能用 HuFu**（QQ/DSH 实测；TSF 应用启动时缓存输入法列表）
+- ctfmon 重启/注销后当前输入法会重置回默认，需 Win+空格 重选（系统行为）
+- 搜索启动器（Listary 等）打中文时字母进候选——按 `Shift` 切英文直通
 
 ## 文档
 
