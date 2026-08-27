@@ -302,12 +302,16 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_str())
             .and_then(parse_hex);
 
-        let font_pt = layout_f(skin, "font_point", 17.6);
+        let font_pt = layout_f(skin, "font_point", 14.5);
         let radius = layout_f(skin, "corner_radius", 8.0);
-        let margin_x = layout_f(skin, "margin_x", 10.0);
-        let margin_y = layout_f(skin, "margin_y", 8.0);
-        let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 6.0) + 6.0;
-        let width = 320.0f32;
+        let margin_x = layout_f(skin, "margin_x", 8.0);
+        let margin_y = layout_f(skin, "margin_y", 5.0);
+        let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
+        let width = layout_f(skin, "width", 250.0);
+        // 内部列随宽度自适应：标签 | 候选文本 | 备注（窄窗备注右置小字）
+        let label_w = 26.0f32;
+        let text_x = margin_x + label_w;
+        let cmt_x = (width - 86.0).max(text_x + 60.0);
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
         let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
         let rows = cands.len().min(9) as f32 + code_row;
@@ -397,17 +401,23 @@ impl CandidateWindowV2 {
             fam_buf.push(0);
             let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
             let em = font_pt * 96.0 / 72.0;
-            let tf = dwrite
-                .CreateTextFormat(
-                    PCWSTR(fam_buf.as_ptr()),
-                    None,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    em,
-                    PCWSTR(locale.as_ptr()),
-                )
-                .ok();
+            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）
+            let mk_tf = |fam: &str| -> Option<IDWriteTextFormat> {
+                let mut b: Vec<u16> = fam.encode_utf16().collect();
+                b.push(0);
+                dwrite
+                    .CreateTextFormat(
+                        PCWSTR(b.as_ptr()),
+                        None,
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        em,
+                        PCWSTR(locale.as_ptr()),
+                    )
+                    .ok()
+            };
+            let tf = mk_tf(&font_face).or_else(|| mk_tf("Microsoft YaHei UI"));
             let tf_small = dwrite
                 .CreateTextFormat(
                     PCWSTR(fam_buf.as_ptr()),
@@ -476,10 +486,10 @@ impl CandidateWindowV2 {
                 } else {
                     (&b_text, &b_label)
                 };
-                draw(&ctx, &tf, &format!("{}.", i + 1), margin_x, y, 30.0, line_h, bl);
-                draw(&ctx, &tf, text, margin_x + 34.0, y, 170.0, line_h, bt);
+                draw(&ctx, &tf, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
+                draw(&ctx, &tf, text, text_x, y, cmt_x - text_x - 4.0, line_h, bt);
                 if !cmt.is_empty() {
-                    draw(&ctx, &tf_small, cmt, margin_x + 200.0, y + 2.0, width - margin_x - 204.0, line_h, &b_cmt);
+                    draw(&ctx, &tf_small, cmt, cmt_x, y + 2.0, width - cmt_x - margin_x + 4.0, line_h, &b_cmt);
                 }
             }
 
