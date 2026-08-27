@@ -75,6 +75,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let mut g = self.shared.lock().unwrap();
         g.thread_mgr = Some(tm);
         g.client_id = tid;
+        // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
+        let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
+        let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
         Ok(())
     }
 
