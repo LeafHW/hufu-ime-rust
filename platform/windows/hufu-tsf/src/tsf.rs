@@ -325,6 +325,8 @@ enum Op {
     StartPreedit(String),
     SetPreedit(String),
     Commit(String),
+    /// 提前上屏：先提交前缀（结束当前组段），再开新组段继续显示剩余
+    CommitAndRepreedit(String, String),
     /// 无组段直接插入文本（剪贴板上屏）
     Insert(String),
     End,
@@ -411,6 +413,38 @@ impl EditSession_Impl {
                     let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 g.composition = None;
+                Ok(())
+            }
+            Op::CommitAndRepreedit(commit_text, preedit) => {
+                // 1) 提交前缀：组段文本置为 commit → EndComposition 落地
+                if let Some(comp) = g.composition.clone() {
+                    let range: ITfRange = unsafe { comp.GetRange()? };
+                    let wstr: Vec<u16> = commit_text.encode_utf16().collect();
+                    unsafe {
+                        range.SetText(ec, 0, &wstr)?;
+                        comp.EndComposition(ec)?;
+                    }
+                    let _ = set_selection_at_end(&ctx, ec, &range);
+                } else if !commit_text.is_empty() {
+                    let range = selection_range(&ctx, ec)?;
+                    let wstr: Vec<u16> = commit_text.encode_utf16().collect();
+                    unsafe {
+                        range.SetText(ec, 0, &wstr)?;
+                    }
+                    let _ = set_selection_at_end(&ctx, ec, &range);
+                }
+                g.composition = None;
+                // 2) 重开组段显示剩余预编辑
+                let cc: ITfContextComposition = ctx.cast()?;
+                let range: ITfRange = selection_range(&ctx, ec)?;
+                let sink: ITfCompositionSink = CompSinkObj.into();
+                let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
+                let crange: ITfRange = unsafe { comp.GetRange()? };
+                let wstr2: Vec<u16> = preedit.encode_utf16().collect();
+                unsafe { crange.SetText(ec, 0, &wstr2)? };
+                let _ = set_selection_at_end(&ctx, ec, &crange);
+                g.composition = Some(comp);
+                query_caret(&mut g, &ctx, ec);
                 Ok(())
             }
             Op::Insert(text) => {
@@ -539,6 +573,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else {
                 None
             }
+        } else if !commit.is_empty() {
+            // 提前上屏：提交前缀 + 继续组句（此前该分支丢失中途上屏文本）
+            Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
             Some(Op::StartPreedit(preedit.to_string()))
         } else {
