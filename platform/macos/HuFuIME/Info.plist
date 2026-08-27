@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>HuFuIME</string>
+    <key>CFBundleIdentifier</key>
+    <string>im.hufu.HuFuIME</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>HuFu 虎符输入法</string>
+    <key>CFBundlePackageType</key>
+    <string>IMK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- IMK 输入法注册 -->
+    <key>InputMethodConnectionName</key>
+    <string>HuFuIME_Connection</string>
+    <key>InputMethodServerControllerClass</key>
+    <string>HuFuInputController</string>
+    <key>tsInputMethodCharacterRepKey</key>
+    <string>Hans</string>
+    <key>tsInputMethodIconFileLabelKey</key>
+    <string>HuFu</string>
+    <key>tsInputSourceIDKey</key>
+    <string>im.hufu.inputmethod.HuFu</string>
+    <key>tsInputSourceIsASCIICapableKey</key>
+    <false/>
+    <key>tsInputSourceIsEnabledKey</key>
+    <true/>
+    <key>tsInputSourceIsInputModeEnabledKey</key>
+    <true/>
+    <key>tsInputSourceLocalesKey</key>
+    <array>
+        <string>zh_Hans</string>
+    </array>
+
+    <key>LSBackgroundOnly</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

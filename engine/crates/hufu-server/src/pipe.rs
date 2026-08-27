@@ -203,6 +203,63 @@ mod imp {
 pub use imp::run as run_pipe;
 
 #[cfg(not(windows))]
-pub fn run_pipe(_host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
-    Err(std::io::Error::new(ErrorKind::Unsupported, "仅 Windows"))
+mod unix_imp {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn sock_path() -> std::path::PathBuf {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join("hufu-ime.sock")
+    }
+
+    fn serve_conn(mut stream: std::os::unix::net::UnixStream, host: &Mutex<Host>) {
+        loop {
+            let mut head = [0u8; 4];
+            if stream.read_exact(&mut head).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(head) as usize;
+            if len == 0 || len > BUF {
+                break;
+            }
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).is_err() {
+                break;
+            }
+            let req: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            };
+            let resp = dispatch(host, &req);
+            let out = serde_json::to_vec(&resp).unwrap_or_default();
+            let mut frame = (out.len() as u32).to_le_bytes().to_vec();
+            frame.extend_from_slice(&out);
+            if stream.write_all(&frame).is_err() {
+                break;
+            }
+        }
+    }
+
+    pub fn run(host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
+        let path = sock_path();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        eprintln!("HuFu unix socket: {}", path.display());
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    let host = host.clone();
+                    std::thread::spawn(move || serve_conn(s, &host));
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(())
+    }
 }
+
+#[cfg(not(windows))]
+pub use unix_imp::run as run_pipe;
