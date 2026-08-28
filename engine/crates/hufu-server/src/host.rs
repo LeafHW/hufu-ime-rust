@@ -40,9 +40,32 @@ impl Host {
             config_path,
             rerank_tx: None,
         };
+        host.install_official_skins();
         host.setup_sentence();
         host.setup_rerank();
         Ok(host)
+    }
+
+    /// 官方皮肤自愈落盘：内嵌皮肤（official-skins/，随 git 与二进制分发）
+    /// 缺失时写入数据目录 skins/。已存在的不覆盖——用户在设置页的定制优先。
+    fn install_official_skins(&mut self) {
+        /// 嵌入的官方皮肤（编译期打包，数据目录损坏/清空也能恢复全套）
+        const OFFICIAL: &[(&str, &str)] = &[
+            ("hufu-frost-h.json", include_str!("../official-skins/hufu-frost-h.json")),
+            ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
+            ("hufu-qingkong.json", include_str!("../official-skins/hufu-qingkong.json")),
+            ("hufu-yingxiong.json", include_str!("../official-skins/hufu-yingxiong.json")),
+        ];
+        let dir = self.skins_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (file, body) in OFFICIAL {
+            let p = dir.join(file);
+            if !p.exists() {
+                if let Err(e) = std::fs::write(&p, body) {
+                    eprintln!("官方皮肤 {file} 落盘失败: {e}");
+                }
+            }
+        }
     }
 
     /// 依据配置与磁盘可用性装配整句解码器。
