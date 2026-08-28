@@ -531,7 +531,14 @@ async function loadSchemas() {
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
     d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}${n === r.current_schema ? '<span class="tag" style="margin-left:auto">当前</span>' : ""}`;
     d.onclick = async () => {
-      try { await api("POST", "/api/schema", { name: n }); msg(`已切换到 ${n}`, "ok"); await loadSchemas(); await refreshInfo(); }
+      try {
+        await api("POST", "/api/schema", { name: n });
+        /* 关键：重取服务端配置快照。否则内存 CFG.schema.current 仍是旧方案，
+           之后任何 POST /api/config（保存/整句试验都会发）会把旧方案名回写、
+           服务端视为 schema 变更→切回旧方案→整句「没启动」。 */
+        try { CFG = await api("GET", "/api/config"); } catch (_) {}
+        msg(`已切换到 ${n}`, "ok"); await loadSchemas(); await refreshInfo();
+      }
       catch (e) { msg(e.message, "err"); }
     };
     box.appendChild(d);
@@ -715,6 +722,10 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
 $("#capture").addEventListener("keydown", trialKey);
 $("#capture").addEventListener("click", () => $("#capture").focus());
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
+/* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) api("GET", "/api/config").then(c => { CFG = c; }).catch(() => {});
+});
 
 $("#btn-save").onclick = async () => {
   try {
