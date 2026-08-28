@@ -244,6 +244,7 @@ const NIM_ADD: u32 = 0x0;
 const NIM_MODIFY: u32 = 0x1;
 const NIM_DELETE: u32 = 0x2;
 const NIF_MESSAGE: u32 = 0x1;
+const NIF_ICON: u32 = 0x2;
 const NIF_TIP: u32 = 0x4;
 const WM_APP: u32 = 0x8000;
 const WM_DESTROY: u32 = 0x0002;
@@ -331,7 +332,8 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_MESSAGE | NIF_TIP,
+        // NIF_ICON 必须置位：漏了它 Shell_NotifyIcon 无视 hIcon（此前图标永远是系统默认的真因）
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_APP,
         hIcon: hicon,
         szTip: tip,
