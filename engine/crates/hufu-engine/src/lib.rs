@@ -1297,7 +1297,7 @@ impl Engine {
             return;
         }
         if !self.opencc_loaded {
-            let dir = self.data_dir.join("opencc");
+            let dir = self.data_dir.join("转换词典");
             // 本数据集只有台版单字表 STCharacters_Tu（无标准 STCharacters，缺文件自动跳过）
             let t = if cfg.to_traditional {
                 hufu_dict::OpenCc::load_dir(
@@ -2154,11 +2154,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let schema = dir.join("schema");
         std::fs::create_dir_all(&schema).unwrap();
-        std::fs::create_dir_all(dir.join("opencc")).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
         std::fs::write(schema.join("main.txt"), "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n").unwrap();
-        std::fs::write(dir.join("opencc").join("STPhrases.txt"), "后来\t後來\n").unwrap();
-        std::fs::write(dir.join("opencc").join("STCharacters.txt"), "后\t後\n来\t來\n").unwrap();
-        std::fs::write(dir.join("opencc").join("emoji.txt"), "后\t后 👑\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "后来\t後來\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n来\t來\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("emoji.txt"), "后\t后 👑\n").unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.opencc.enabled = true;
         cfg.opencc.to_traditional = true;

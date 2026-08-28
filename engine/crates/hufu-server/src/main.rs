@@ -74,9 +74,29 @@ fn main() {
         let url = format!("http://{addr}/");
         std::thread::spawn(move || {
             if open_rx.try_recv().is_ok() || open_rx.recv().is_ok() {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", "", &url])
-                    .spawn();
+                // 独立应用窗口（Edge --app 模式）：有自己的任务栏图标、无地址栏，
+                // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
+                // Edge 不在时回退默认浏览器。
+                let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
+                let pf = std::env::var("ProgramFiles").unwrap_or_default();
+                let edge = [
+                    format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
+                    format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
+                ]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists());
+                let app_arg = format!("--app={url}");
+                let opened = match &edge {
+                    Some(exe) => {
+                        std::process::Command::new(exe).arg(&app_arg).spawn().is_ok()
+                    }
+                    None => false,
+                };
+                if !opened {
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/C", "start", "", &url])
+                        .spawn();
+                }
             }
         });
         std::thread::spawn(move || {
@@ -316,7 +336,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !safe.contains(&tag.as_str()) {
                 return Response::err(400, "未知音效");
             }
-            let p = host.data_dir.join("sounds").join(format!("{tag}.wav"));
+            let p = host.data_dir.join("音效").join(format!("{tag}.wav"));
             match std::fs::read(&p) {
                 Ok(bytes) => Response {
                     status: 200,

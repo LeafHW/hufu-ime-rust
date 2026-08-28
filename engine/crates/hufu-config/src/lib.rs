@@ -98,7 +98,7 @@ pub struct SchemaSection {
 impl Default for SchemaSection {
     fn default() -> Self {
         SchemaSection {
-            dir: "dictionaries".into(),
+            dir: "码表".into(),
             current: "虎码单字".into(),
             recent_pair: None,
         }
