@@ -189,6 +189,7 @@ fn main() {
     let mut wa: usize = 8;
     let mut _wb: usize = 2; // 已由全局池替代（保留参数兼容）
     let mut out_path = PathBuf::from(r"E:\DSH-KF\hufu\docs\benchmark-qwen-vs-ngram.md");
+    let mut codes_only: Option<PathBuf> = None;
     let mut i = 2;
     while i + 1 < args.len() + 1 && i < args.len() {
         match args[i].as_str() {
@@ -197,6 +198,7 @@ fn main() {
             "--wa" if i + 1 < args.len() => wa = args[i + 1].parse().unwrap_or(8),
             "--wb" if i + 1 < args.len() => _wb = args[i + 1].parse().unwrap_or(2),
             "--out" if i + 1 < args.len() => out_path = PathBuf::from(args[i + 1].clone()),
+            "--codes-only" if i + 1 < args.len() => codes_only = Some(PathBuf::from(args[i + 1].clone())),
             _ => {}
         }
         i += 2;
@@ -257,6 +259,17 @@ fn main() {
     let corpus_codes: Vec<(String, String)> = CORPUS.with(|c| c.borrow().clone());
     let typed_able = corpus_codes.len();
     let untypeable = sentences.len() - typed_able;
+
+    // --codes-only OUT：只导出每句录入码（idx\tcodes），供管道级延迟测试等外部工具使用
+    if let Some(out) = codes_only {
+        let mut s = String::new();
+        for (i, (_t, c)) in corpus_codes.iter().enumerate() {
+            s.push_str(&format!("{i}\t{c}\n"));
+        }
+        std::fs::write(&out, s).expect("码表导出");
+        eprintln!("码表已导出：{} 句 → {}", typed_able, out.display());
+        return;
+    }
 
     // B 臂抽样（固定种子 LCG 洗牌取前 N，保持原序）
     let sample_idx: Vec<usize> = if sample_b >= typed_able {
