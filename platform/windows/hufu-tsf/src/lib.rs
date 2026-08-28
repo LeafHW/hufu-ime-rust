@@ -154,6 +154,13 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         }
     }
     let set_colors = |sk: &mut serde_json::Value, back: &str, hilight: &str, hitext: &str| {
+        // 显式锁定竖排，隔离当前皮肤（可能是横排预设）对测试基线的污染
+        if let Some(l) = sk
+            .pointer_mut("/skin/layout")
+            .and_then(|l| l.as_object_mut())
+        {
+            l.insert("horizontal".into(), serde_json::json!(false));
+        }
         if let Some(s) = sk.get_mut("skin").and_then(|s| s.as_object_mut()) {
             if let Some(c) = s.get_mut("colors").and_then(|c| c.as_object_mut()) {
                 c.insert("back_color".into(), serde_json::json!(back));
@@ -170,6 +177,9 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     let cands = vec![
         ("你好".to_string(), "ni hao".to_string()),
         ("您好".to_string(), "".to_string()),
+        ("拟好".to_string(), "".to_string()),
+        ("腻好".to_string(), "".to_string()),
+        ("逆耗".to_string(), "".to_string()),
     ];
     let capture = |w: &CandidateWindowV2| -> Option<Vec<u8>> {
         unsafe {
@@ -276,20 +286,24 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         }
     }
     w.show(&cands, "nih", &skin_f, None, 0);
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut rc_f = windows::Win32::Foundation::RECT::default();
+    let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_f) };
     let cap_f = capture(&w);
     w.hide();
     let Some(f) = cap_f else {
         eprintln!("skin-hot: frosted 捕获失败");
         return 0;
     };
+    let (fw, fh) = (rc_f.right - rc_f.left, rc_f.bottom - rc_f.top);
+    eprintln!("skin-hot: 竖排 frosted 窗口 {fw}x{fh}");
     let fr = diff_ratio(&a, &f);
     eprintln!("skin-hot: solid vs frosted 差异 {:.1}%（磨砂层可见性）", fr * 100.0);
     if fr <= 0.03 {
         return 0;
     }
 
-    // ── 横排：窗口宽高比必须翻转（w > h）──
+    // ── 横排：同一候选集下窗口必须变宽变矮（5 候选几何上必然分离）──
     let mut skin_h = skin_f.clone();
     if let Some(s) = skin_h.get_mut("skin").and_then(|s| s.as_object_mut()) {
         if let Some(l) = s.get_mut("layout").and_then(|l| l.as_object_mut()) {
@@ -297,15 +311,25 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         }
     }
     w.show(&cands, "nih", &skin_h, None, 0);
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    // 轮询等待尺寸真正变化上屏（SetWindowPos 异步，固定 sleep 有竞态）
     let mut rc_h = windows::Win32::Foundation::RECT::default();
-    let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_h) };
-    let cap_h = capture(&w);
+    let mut settled = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_h) };
+        let (cw, chh) = (rc_h.right - rc_h.left, rc_h.bottom - rc_h.top);
+        if cw > fw + 15 && chh < fh - 8 {
+            settled = true;
+            break;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150)); // 留一帧给 DWM 合成
+    let cap_h = if settled { capture(&w) } else { None };
     w.hide();
     let hw = (rc_h.right - rc_h.left).max(1);
     let hh = (rc_h.bottom - rc_h.top).max(1);
-    eprintln!("skin-hot: 横排窗口 {hw}x{hh}");
-    if hw <= hh {
+    eprintln!("skin-hot: 横排窗口 {hw}x{hh}（竖排 {fw}x{fh}）");
+    if !settled {
         return 0; // 横排未生效
     }
     if let Some(h) = cap_h {

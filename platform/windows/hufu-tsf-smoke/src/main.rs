@@ -288,6 +288,61 @@ fn main() {
         assert_eq!(r, 1, "皮肤 A/B 两帧像素应显著不同（热更新失效）");
         println!("[13] 皮肤热更新像素 E2E ✓");
 
+        // ── [15] 横排真路径 E2E：设置皮肤(毛玻璃横排)→真实按键→窗口必须变宽扁 ──
+        {
+            use std::io::{Read, Write};
+            use std::net::TcpStream;
+            let http = |method: &str, path: &str, body: &str| -> String {
+                let mut s = TcpStream::connect("127.0.0.1:4390").unwrap();
+                let req = format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(req.as_bytes()).unwrap();
+                let mut buf = String::new();
+                s.read_to_string(&mut buf).unwrap();
+                buf
+            };
+            let body_of = |resp: &str| -> String {
+                resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+            };
+            // 保存当前皮肤 JSON（稍后还原）
+            let cur = body_of(&http("GET", "/api/skins", ""));
+            let cur_id = cur
+                .split("\"current\":\"")
+                .nth(1)
+                .and_then(|t| t.split('"').next())
+                .unwrap_or("hufu-default")
+                .to_string();
+            let backup = body_of(&http("GET", &format!("/api/skin?id={cur_id}"), ""));
+            // 切到「毛玻璃横排」预设（用户操作路径：选皮肤→保存）
+            let frost = body_of(&http("GET", "/api/skin?id=hufu-frost-h", ""));
+            let sv = http("POST", "/api/skin", &frost);
+            assert!(sv.contains("\"ok\":true"), "皮肤切换保存失败: {sv}");
+            // 真实按键驱动：TSF KeyDown → update_ui → 候选窗口
+            let _ = tk(0x55); // u
+            let _ = tk(0x4A); // j
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let cls: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
+            let hwnd = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+                    windows::core::PCWSTR(cls.as_ptr()),
+                    None,
+                )
+            }
+            .unwrap_or_default();
+            assert!(!hwnd.0.is_null(), "横排候选窗未出现");
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) };
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            // 先还原原皮肤再断言：断言失败也不能把当前皮肤留在横排预设上
+            let _ = http("POST", "/api/skin", &backup);
+            println!("[15] 横排真路径：切换皮肤→按键 → 窗口 {w}x{h}");
+            assert!(w > h, "横排应宽扁（{w}x{h}）——皮肤未生效");
+            let _ = tk(0x1B); // ESC 关窗
+            println!("[15] 横排真路径 E2E ✓（已还原 {cur_id}）");
+        }
+
         println!("\n=== hufu-tsf 冒烟测试通过 ===");
     }
 }

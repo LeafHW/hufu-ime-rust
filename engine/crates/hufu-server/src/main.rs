@@ -161,7 +161,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => Response::json(&serde_json::to_value(&s).unwrap()),
-                Err(_) => {
+                Err(e) => {
+                    // 皮肤 JSON 有错时明确指认（此前静默回默认皮，用户只见「不生效」）
+                    eprintln!("皮肤 {id} 加载失败（回退默认）: {e}");
                     let s = hufu_skin::Skin::default();
                     Response::json(&serde_json::to_value(&s).unwrap())
                 }

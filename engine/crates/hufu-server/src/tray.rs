@@ -14,6 +14,159 @@ use std::sync::mpsc::Sender;
 extern "system" {
     fn Shell_NotifyIconW(dwMessage: u32, lpData: *const NOTIFYICONDATAW) -> i32;
 }
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateDIBSection(
+        hdc: isize, pbmi: *const BITMAPINFO, usage: u32,
+        ppvbits: *mut *mut std::ffi::c_void, hsection: isize, offset: u32,
+    ) -> isize;
+    fn CreateCompatibleDC(hdc: isize) -> isize;
+    fn DeleteDC(hdc: isize) -> i32;
+    fn DeleteObject(h: isize) -> i32;
+}
+#[link(name = "user32")]
+extern "system" {
+    fn CreateIconIndirect(piconinfo: *const ICONINFO) -> isize;
+}
+
+#[repr(C)]
+struct ICONINFO {
+    fIcon: i32,
+    xHotspot: u32,
+    yHotspot: u32,
+    hbmMask: isize,
+    hbmColor: isize,
+}
+
+#[repr(C)]
+struct BITMAPINFOHEADER {
+    biSize: u32,
+    biWidth: i32,
+    biHeight: i32,
+    biPlanes: u16,
+    biBitCount: u16,
+    biCompression: u32,
+    biSizeImage: u32,
+    biXPelsPerMeter: i32,
+    biYPelsPerMeter: i32,
+    biClrUsed: u32,
+    biClrImportant: u32,
+}
+
+#[repr(C)]
+struct BITMAPINFO {
+    bmiHeader: BITMAPINFOHEADER,
+    bmiColors: [u32; 1],
+}
+
+/// 简约「虎爪三痕」托盘图标：深色圆角方 + 三道白色斜爪痕（4× 超采样抗锯齿）。
+fn make_hu_icon() -> isize {
+    const S: usize = 32; // 图标边长
+    const SS: usize = 4; // 超采样倍数
+    // 爪痕线段（单位像素，32 空间）：右上→左下三道，长度渐短
+    let claws: [((f32, f32), (f32, f32)); 3] = [
+        ((9.0, 6.5), (17.5, 25.0)),
+        ((15.5, 6.0), (22.0, 20.5)),
+        ((21.5, 7.5), (26.5, 17.5)),
+    ];
+    let claw_w = 1.9f32; // 半宽
+    let r = 7.5f32; // 圆角半径
+    let bg = [0.105, 0.105, 0.118f32]; // #1B1B1E
+    let fg = [0.96, 0.96, 0.97f32]; // #F5F5F7
+    let mut buf = vec![0u8; S * S * 4]; // 预乘 BGRA
+    let mut mask = vec![0u8; S * S * 4]; // AND 位图（32bpp 对齐，全 0=不遮）
+    for y in 0..S {
+        for x in 0..S {
+            // 4×4 超采样
+            let mut cov_bg = 0u32;
+            let mut cov_fg = 0u32;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
+                    // 圆角方形覆盖
+                    let dx = (px - 16.0).abs().max(0.0) - (16.0 - r);
+                    let dy = (py - 16.0).abs().max(0.0) - (16.0 - r);
+                    if dx.max(dy) <= 0.0 {
+                        cov_bg += 1;
+                        // 爪痕：任一线段距离 ≤ 半宽
+                        for ((x0, y0), (x1, y1)) in claws {
+                            let vx = x1 - x0;
+                            let vy = y1 - y0;
+                            let t = (((px - x0) * vx + (py - y0) * vy) / (vx * vx + vy * vy))
+                                .clamp(0.0, 1.0);
+                            let cx = x0 + t * vx;
+                            let cy = y0 + t * vy;
+                            let d2 = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+                            if d2 <= claw_w * claw_w {
+                                cov_fg += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let a_bg = cov_bg as f32 / (SS * SS) as f32;
+            let a_fg = cov_fg as f32 / (SS * SS) as f32;
+            let a = a_bg;
+            if a > 0.0 {
+                // 前景按覆盖混合到背景色上，再乘总 alpha（预乘 BGRA）
+                let blend = |i: usize| -> u8 {
+                    let v = fg[i] * a_fg + bg[i] * (a_bg - a_fg) / a_bg.max(1e-6);
+                    (v * a * 255.0) as u8
+                };
+                let i = (y * S + x) * 4;
+                buf[i] = blend(2); // B
+                buf[i + 1] = blend(1); // G
+                buf[i + 2] = blend(0); // R
+                buf[i + 3] = (a * 255.0) as u8; // A
+            }
+        }
+    }
+    unsafe {
+        let hdc = CreateCompatibleDC(0);
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: S as i32,
+                biHeight: -(S as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [0],
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hcolor = CreateDIBSection(hdc, &bi, 0, &mut bits, 0, 0);
+        let mut mbits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hmask = CreateDIBSection(hdc, &bi, 0, &mut mbits, 0, 0);
+        if hcolor == 0 || hmask == 0 || bits.is_null() || mbits.is_null() {
+            if hcolor != 0 { let _ = DeleteObject(hcolor); }
+            if hmask != 0 { let _ = DeleteObject(hmask); }
+            let _ = DeleteDC(hdc);
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), bits as *mut u8, buf.len());
+        std::ptr::copy_nonoverlapping(mask.as_ptr(), mbits as *mut u8, mask.len());
+        let ii = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hmask,
+            hbmColor: hcolor,
+        };
+        let hicon = CreateIconIndirect(&ii);
+        // ICONINFO 文档：位图所有权归系统，不删；DC 可删
+        let _ = DeleteDC(hdc);
+        hicon
+    }
+}
 #[link(name = "user32")]
 extern "system" {
     fn CreateWindowExW(
@@ -155,10 +308,7 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
     let mut tip = [0u16; 128];
     let t: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
     tip[..t.len()].copy_from_slice(&t);
-    // IDI_APPLICATION(32512) 共享加载，保证可见
-    let hicon = unsafe {
-        LoadImageW(0, 32512 as *const u16, 1 /*IMAGE_ICON*/, 0, 0, 0x8000 /*LR_SHARED*/)
-    };
+    let hicon = make_hu_icon();
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
