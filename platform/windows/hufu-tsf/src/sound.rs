@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use windows::Win32::Media::Audio::*;
 
-/// wav 文件（16bit PCM）+ 音量 0–100。
+/// wav PCM 片段 + 音量 0–100。
 struct Clip {
     samples: Vec<u8>,
     samples_per_sec: u32,
+    channels: u16,
+    bits: u16,
     volume: u8,
 }
 
@@ -21,14 +23,18 @@ static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
 pub fn play(tag: &str) {
     let clip = with_clip(tag);
     let Some(c) = clip else { return };
+    let block_align = c.channels * c.bits / 8;
+    if block_align == 0 {
+        return;
+    }
     unsafe {
         let wfx = WAVEFORMATEX {
             wFormatTag: 1, // PCM
-            nChannels: 1,
+            nChannels: c.channels,
             nSamplesPerSec: c.samples_per_sec,
-            wBitsPerSample: 16,
-            nBlockAlign: 2,
-            nAvgBytesPerSec: c.samples_per_sec * 2,
+            wBitsPerSample: c.bits,
+            nBlockAlign: block_align,
+            nAvgBytesPerSec: c.samples_per_sec * block_align as u32,
             cbSize: 0,
         };
         let mut h: HWAVEOUT = HWAVEOUT(std::ptr::null_mut());
@@ -84,6 +90,8 @@ fn with_clip(tag: &str) -> Option<Clip> {
         return Some(Clip {
             samples: c.samples.clone(),
             samples_per_sec: c.samples_per_sec,
+            channels: c.channels,
+            bits: c.bits,
             volume: c.volume,
         });
     }
@@ -92,17 +100,24 @@ fn with_clip(tag: &str) -> Option<Clip> {
     let data_b64 = resp.get("data").and_then(|v| v.as_str())?;
     let volume = resp.get("volume").and_then(|v| v.as_u64()).unwrap_or(50) as u8;
     let raw = base64_decode(data_b64)?;
-    let (samples, rate) = parse_wav(&raw)?;
+    let (samples, rate, channels, bits) = parse_wav(&raw)?;
     let clip = Clip {
         samples,
         samples_per_sec: rate,
+        channels,
+        bits,
         volume,
     };
-    map.insert(tag.to_string(), Clip {
-        samples: clip.samples.clone(),
-        samples_per_sec: clip.samples_per_sec,
-        volume: clip.volume,
-    });
+    map.insert(
+        tag.to_string(),
+        Clip {
+            samples: clip.samples.clone(),
+            samples_per_sec: clip.samples_per_sec,
+            channels: clip.channels,
+            bits: clip.bits,
+            volume: clip.volume,
+        },
+    );
     Some(clip)
 }
 
@@ -112,12 +127,14 @@ pub fn invalidate() {
     *guard = None;
 }
 
-/// 极简 wav 解析：RIFF→fmt→data，取 16bit PCM 单声道数据。
-fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32)> {
+/// 极简 wav 解析：RIFF→fmt→data（PCM，任意声道/位深，waveOut 按实际格式开）。
+fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
     if raw.len() < 44 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
         return None;
     }
     let mut rate = 44_100u32;
+    let mut channels = 1u16;
+    let mut bits = 16u16;
     let mut data: Option<Vec<u8>> = None;
     let mut pos = 12usize;
     while pos + 8 <= raw.len() {
@@ -130,19 +147,24 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32)> {
         ]) as usize;
         let body = pos + 8;
         if id == b"fmt " && size >= 16 {
+            channels = u16::from_le_bytes([raw[body + 2], raw[body + 3]]);
             rate = u32::from_le_bytes([
                 raw[body + 4],
                 raw[body + 5],
                 raw[body + 6],
                 raw[body + 7],
             ]);
+            bits = u16::from_le_bytes([raw[body + 14], raw[body + 15]]);
         } else if id == b"data" {
             let end = (body + size).min(raw.len());
             data = Some(raw[body..end].to_vec());
         }
         pos = body + size + (size & 1);
     }
-    Some((data?, rate))
+    if bits != 8 && bits != 16 {
+        return None; // 仅 PCM 8/16bit
+    }
+    Some((data?, rate, channels.max(1), bits))
 }
 
 /// 标准 base64 解码（无填充容错）。
@@ -173,4 +195,52 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_stereo_wav() {
+        // 最小 RIFF：fmt(16, stereo 44100 16bit) + data(4 字节)
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&36u32.to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&44100u32.to_le_bytes());
+        w.extend_from_slice(&176400u32.to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes()); // align
+        w.extend_from_slice(&16u16.to_le_bytes()); // bits
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&4u32.to_le_bytes());
+        w.extend_from_slice(&[1, 2, 3, 4]);
+        let (d, rate, ch, bits) = parse_wav(&w).unwrap();
+        assert_eq!(d, vec![1, 2, 3, 4]);
+        assert_eq!((rate, ch, bits), (44100, 2, 16));
+    }
+
+    #[test]
+    fn parse_rejects_non_pcm_bit_depth() {
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&36u32.to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&44100u32.to_le_bytes());
+        w.extend_from_slice(&88200u32.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&24u16.to_le_bytes()); // 24bit 不支持
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&4u32.to_le_bytes());
+        w.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(parse_wav(&w).is_none());
+    }
 }

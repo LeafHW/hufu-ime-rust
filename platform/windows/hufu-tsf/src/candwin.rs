@@ -83,8 +83,27 @@ impl CandidateWindow {
 
             let font_h = 22i32;
             let line_h = font_h + 6;
-            let width = 240i32;
-            let height = line_h * (cands.len() as i32 + 1) + 16;
+            let horizontal = skin
+                .pointer("/skin/layout/horizontal")
+                .or_else(|| skin.get("layout").and_then(|l| l.get("horizontal")))
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let show_index = skin
+                .get("show_index")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            // GDI 无精密测宽：横排按字宽估算
+            let (width, height) = if horizontal {
+                let cw = |s: &str| (s.chars().count() as i32 * (font_h - 4)).max(0);
+                let mut w = 24;
+                for (i, (t, c)) in cands.iter().enumerate() {
+                    if i > 0 { w += 8; }
+                    w += if show_index { 20 } else { 0 } + cw(t) + if !c.is_empty() { cw(c) * 3 / 4 + 6 } else { 0 };
+                }
+                (w.max(200), line_h * 2 + 16)
+            } else {
+                (240, line_h * (cands.len() as i32 + 1) + 16)
+            };
 
             // 32bpp DIB（top-down，预乘 alpha 由底色提供）
             let bmi = BITMAPINFO {
@@ -177,29 +196,60 @@ impl CandidateWindow {
 
             // 候选行
             let sel = selected.min(cands.len().saturating_sub(1));
-            for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
-                let y = 6 + line_h * (i as i32 + 1);
-                if i == sel {
-                    let hbr = CreateSolidBrush(argb(hi_back));
-                    FillRect(
-                        memdc,
-                        &RECT { left: 6, top: y - 2, right: width - 6, bottom: y + line_h - 4 },
-                        hbr,
-                    );
-                    let _ = DeleteObject(HGDIOBJ(hbr.0));
-                    let _ = SetTextColor(memdc, argb(hi_lbl));
-                } else {
-                    let _ = SetTextColor(memdc, argb(cand_txt));
+            if horizontal {
+                let mut x = 12;
+                let y = 6 + line_h;
+                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                    if i > 0 { x += 8; }
+                    if i == sel {
+                        let hbr = CreateSolidBrush(argb(hi_back));
+                        FillRect(memdc, &RECT { left: x - 4, top: y - 2, right: x + 150, bottom: y + line_h - 4 }, hbr);
+                        let _ = DeleteObject(HGDIOBJ(hbr.0));
+                    }
+                    let _ = SetTextColor(memdc, if i == sel { argb(hi_lbl) } else { argb(cand_txt) });
+                    if show_index {
+                        out(memdc, &format!("{}. ", i + 1), x, y);
+                        x += 20;
+                    }
+                    out(memdc, text, x, y);
+                    x += (text.chars().count() as i32 * (font_h - 4)).max(12);
+                    if !cmt.is_empty() {
+                        let _ = SetTextColor(memdc, argb(cmt_txt));
+                        let hfont2 = make_font(font_h - 12);
+                        let oldf2 = SelectObject(memdc, HGDIOBJ(hfont2.0));
+                        out(memdc, cmt, x + 2, y + 3);
+                        SelectObject(memdc, oldf2);
+                        let _ = DeleteObject(HGDIOBJ(hfont2.0));
+                        x += cmt.chars().count() as i32 * (font_h - 8) + 6;
+                    }
                 }
-                out(memdc, &format!("{}. ", i + 1), 12, y);
-                out(memdc, text, 40, y);
-                if !cmt.is_empty() {
-                    let _ = SetTextColor(memdc, argb(cmt_txt));
-                    let hfont2 = make_font(font_h - 12);
-                    let oldf2 = SelectObject(memdc, HGDIOBJ(hfont2.0));
-                    out(memdc, cmt, 130, y + 3);
-                    SelectObject(memdc, oldf2);
-                    let _ = DeleteObject(HGDIOBJ(hfont2.0));
+            } else {
+                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                    let y = 6 + line_h * (i as i32 + 1);
+                    if i == sel {
+                        let hbr = CreateSolidBrush(argb(hi_back));
+                        FillRect(
+                            memdc,
+                            &RECT { left: 6, top: y - 2, right: width - 6, bottom: y + line_h - 4 },
+                            hbr,
+                        );
+                        let _ = DeleteObject(HGDIOBJ(hbr.0));
+                        let _ = SetTextColor(memdc, argb(hi_lbl));
+                    } else {
+                        let _ = SetTextColor(memdc, argb(cand_txt));
+                    }
+                    if show_index {
+                        out(memdc, &format!("{}. ", i + 1), 12, y);
+                    }
+                    out(memdc, text, 40, y);
+                    if !cmt.is_empty() {
+                        let _ = SetTextColor(memdc, argb(cmt_txt));
+                        let hfont2 = make_font(font_h - 12);
+                        let oldf2 = SelectObject(memdc, HGDIOBJ(hfont2.0));
+                        out(memdc, cmt, 130, y + 3);
+                        SelectObject(memdc, oldf2);
+                        let _ = DeleteObject(HGDIOBJ(hfont2.0));
+                    }
                 }
             }
             SelectObject(memdc, oldfont);

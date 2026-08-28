@@ -204,6 +204,9 @@ pub struct SessionState {
     /// 候选窗是否显示编码行（TigerClaw「候选窗显示编码」）
     #[serde(default = "default_true")]
     pub show_code: bool,
+    /// 候选窗是否显示序号（candidates.show_index）
+    #[serde(default = "default_true")]
+    pub show_index: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
