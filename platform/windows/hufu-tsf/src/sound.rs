@@ -19,9 +19,9 @@ struct Clip {
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
-/// 预开 waveOut 句柄池（按格式一组 4 个，轮转使用）：
+/// 预开 waveOut 句柄池（按格式一组 8 个，轮转使用）：
 /// 省掉每次播放的 waveOutOpen/Close（实测各 ~5-15ms，是音效迟滞主因），
-/// 4 句柄天然支持 4 路交叠（系统混音），连打音效即刻出声。
+/// 8 句柄支持 8 路并行交叠（系统混音），连打音效即刻出声。
 struct Pool {
     key: (u32, u16, u16),
     handles: Vec<HWAVEOUT>,
@@ -30,6 +30,26 @@ struct Pool {
 // HWAVEOUT 是裸句柄（内部 *mut c_void），跨线程移动安全（waveOut API 线程无关）
 unsafe impl Send for Pool {}
 static POOLS: Mutex<Vec<Pool>> = Mutex::new(Vec::new());
+
+/// 正在出声的（句柄, 是否键音）注册表：key_up() 只截断键音，
+/// 选字/上屏等事件音不受松键影响（否则 space 一松 commit 音就被切没）。
+struct ActiveHandle(HWAVEOUT, bool);
+// HWAVEOUT 裸句柄跨线程使用安全（waveOut API 线程无关，同 Pool）
+unsafe impl Send for ActiveHandle {}
+static ACTIVE: Mutex<Vec<ActiveHandle>> = Mutex::new(Vec::new());
+
+/// 键松开：截断所有正在响的键音（按下出声、松开即停的打字机手感）。
+/// waveOutReset 使头标立即 DONE → 播放线程忙等退出、归还句柄。
+pub fn key_up() {
+    let act = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
+    for ah in act.iter() {
+        if ah.1 {
+            unsafe {
+                let _ = waveOutReset(ah.0);
+            }
+        }
+    }
+}
 
 fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
     let mut pools = POOLS.lock().unwrap_or_else(|p| p.into_inner());
@@ -48,7 +68,7 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
                 cbSize: 0,
             };
             let mut handles = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let mut h = HWAVEOUT(std::ptr::null_mut());
                 let ok = unsafe {
                     waveOutOpen(Some(&mut h), 0xFFFFFFFF, &wfx, 0, 0, CALLBACK_NULL)
@@ -78,32 +98,93 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
 /// 线程堆积会卡；单线程顺序播放版不卡但 ~6 声/秒连打漏音。本版
 /// 4 工人并发（与最初版交叠密度一致）+ 线程恒定（连发不卡），
 /// 全忙且队列满才丢音。
+/// 播放任务：clip + 是否键音（键音可被 key_up() 截断）。
+struct Job {
+    clip: Clip,
+    is_key: bool,
+}
+
+/// 伪随机（splitmix64 步进）：键音随机挑 clip、随机音量抖动用。
+fn rnd() -> u64 {
+    static S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B9)
+        | 1;
+    let _ = S.compare_exchange(
+        0,
+        t,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut z = S.fetch_add(0x9E3779B97F4A7C15, std::sync::atomic::Ordering::Relaxed);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// 键音候选池：音效目录全部事件音（key/select/commit/page 皆为短促
+/// 击键声）——每次按键随机挑一个 + 音量 ±15% 抖动，杜绝「固定音」。
+fn key_pool_tags() -> Vec<String> {
+    static TAGS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let mut g = TAGS.lock().unwrap_or_else(|p| p.into_inner());
+    if g.is_none() {
+        let mut v: Vec<String> = ["key", "select", "commit", "page"]
+            .iter()
+            .filter(|t| with_clip(t).is_some())
+            .map(|t| t.to_string())
+            .collect();
+        if v.is_empty() {
+            v.push("key".to_string());
+        }
+        *g = Some(v);
+    }
+    g.clone().unwrap()
+}
+
+/// 播放 tag 音效（失败静默）。**调度线程 + 8 固定播放工人**：
+/// tag=="key" 走键音新模型：随机 clip + 音量抖动、可被 key_up() 截断
+/// （按下出声松开即停）；其余（select/commit/page）为事件音不受松键影响。
 pub fn play(tag: &str) {
-    let clip = match with_clip(tag) {
-        Some(c) => c,
-        None => return,
+    let is_key = tag == "key";
+    let clip = if is_key {
+        let tags = key_pool_tags();
+        let pick = &tags[(rnd() % tags.len() as u64) as usize];
+        let mut c = match with_clip(pick) {
+            Some(c) => c,
+            None => return,
+        };
+        // 音量抖动 ±15%：同一 wav 也不重样
+        let jitter = 85 + (rnd() % 31) as u32; // 85–115
+        c.volume = ((c.volume as u32 * jitter) / 100).min(100) as u8;
+        c
+    } else {
+        match with_clip(tag) {
+            Some(c) => c,
+            None => return,
+        }
     };
-    static TX: Mutex<Option<std::sync::mpsc::SyncSender<Clip>>> = Mutex::new(None);
+    static TX: Mutex<Option<std::sync::mpsc::SyncSender<Job>>> = Mutex::new(None);
     let mut g = TX.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
         // 缓冲 10 只为吸收突发；播放侧「排空取最新」：起播前把队列里
         // 攒的全部倒掉只播最新一条——连打期间声音连续不中断（队列非空），
         // 停键后至多再播一条（尾巴 ≤1 个音，不再拖一串余音）。
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Clip>(32);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(32);
         let ok = std::thread::Builder::new()
             .name("hufu-snd-disp".into())
             .spawn(move || {
-                // 4 条固定播放工人，轮转分发；单工人队列满(8)跳下一条，
-                // 全满才丢——交叠密度与最初版（每键一线程）完全一致，
-                // 但线程数恒定：按住连发不再线程堆积。
-                let mut wtx = Vec::with_capacity(4);
-                for i in 0..4 {
-                    let (wtx_i, wrx) = std::sync::mpsc::sync_channel::<Clip>(8);
+                // 8 条固定播放工人，轮转分发；单工人队列满(4)跳下一条，
+                // 全满才丢——8 路并行交叠、线程恒定不堆积。
+                let mut wtx = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let (wtx_i, wrx) = std::sync::mpsc::sync_channel::<Job>(4);
                     if std::thread::Builder::new()
                         .name(format!("hufu-snd-{i}"))
                         .spawn(move || {
-                            while let Ok(c) = wrx.recv() {
-                                play_sync(c);
+                            while let Ok(j) = wrx.recv() {
+                                play_sync(j.clip, j.is_key);
                             }
                         })
                         .is_ok()
@@ -116,10 +197,16 @@ pub fn play(tag: &str) {
                 }
                 let n = wtx.len();
                 let mut next = 0usize;
-                while let Ok(c) = rx.recv() {
+                while let Ok(j) = rx.recv() {
                     for k in 0..n {
                         let idx = (next + k) % n;
-                        if wtx[idx].try_send(c.clone()).is_ok() {
+                        if wtx[idx]
+                            .try_send(Job {
+                                clip: j.clip.clone(),
+                                is_key: j.is_key,
+                            })
+                            .is_ok()
+                        {
                             next = (idx + 1) % n;
                             break;
                         }
@@ -132,11 +219,12 @@ pub fn play(tag: &str) {
         }
         *g = Some(tx);
     }
-    let _ = g.as_ref().unwrap().try_send(clip);
+    let _ = g.as_ref().unwrap().try_send(Job { clip, is_key });
 }
 
-/// 同步播放（独立线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。
-fn play_sync(c: Clip) {
+/// 同步播放（工人线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。
+/// 句柄在写入前登记 ACTIVE（key_up 据此截断键音），归还前注销。
+fn play_sync(c: Clip, is_key: bool) {
     let block_align = c.channels * c.bits / 8;
     if block_align == 0 {
         return;
@@ -144,6 +232,10 @@ fn play_sync(c: Clip) {
     let Some(h) = take_handle(c.samples_per_sec, c.channels, c.bits) else {
         return;
     };
+    {
+        let mut act = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
+        act.push(ActiveHandle(h, is_key));
+    }
     unsafe {
         // 音量：0–100 → 0x0000–0xFFFF（左右声道同值；句柄复用需每次设置）
         let v = (c.volume as u32).min(100) * 0xFFFF / 100;
@@ -159,12 +251,13 @@ fn play_sync(c: Clip) {
             reserved: 0,
         };
         if waveOutPrepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32) != 0 {
+            unregister_active(h);
             return;
         }
         let _ = waveOutWrite(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
-        // 等 WHDR_DONE：音效 160-175ms，但同句柄并发播放会排队（4 句柄池），
-        // 上限必须容纳排队（8 连击 → 至多 2 深队列 ≈ 360ms）。超时则 Reset
-        // 清队列（头标 DONE）再 Unprepare——否则栈上 WAVEHDR 被驱动继续写 → UAF 崩溃。
+        // 等 WHDR_DONE：键音 160-175ms；key_up() 的 waveOutReset 会把头标
+        // 置 DONE 提前出循环（松开即停）。超时兜底 Reset 防 UAF：栈上
+        // WAVEHDR 若仍被驱动写，函数返回后就是悬垂指针。
         let mut spins = 0u32;
         while (hdr.dwFlags & 0x1) == 0 && spins < 1000 {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -175,6 +268,15 @@ fn play_sync(c: Clip) {
         }
         let _ = waveOutUnprepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
         // 句柄保留复用，不 Close
+    }
+    unregister_active(h);
+}
+
+/// 从 ACTIVE 注销句柄（播放完成/Prepare 失败时）。
+fn unregister_active(h: HWAVEOUT) {
+    let mut act = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(pos) = act.iter().position(|ah| ah.0 == h) {
+        act.swap_remove(pos);
     }
 }
 

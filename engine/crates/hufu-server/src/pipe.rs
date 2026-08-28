@@ -68,6 +68,12 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 }
             }
         }
+        // 输入法激活态上报（DLL Activate/Deactivate）：驱动托盘图标显隐
+        "ime" => {
+            let active = req.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            crate::tray::on_ime_state(active);
+            serde_json::json!({"ok": true})
+        }
         "sound" => {
             // tag → {data: base64 wav, volume}（文件缺失返回 404 语义 null）
             let tag = req.get("tag").and_then(|t| t.as_str()).unwrap_or("");

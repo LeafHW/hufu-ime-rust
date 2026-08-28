@@ -196,6 +196,9 @@ extern "system" {
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn DestroyMenu(hmenu: isize) -> i32;
     fn PostQuitMessage(exitcode: i32);
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn SetTimer(hwnd: isize, idevent: usize, elapse: u32, timerproc: isize) -> usize;
+    fn KillTimer(hwnd: isize, idevent: usize) -> i32;
     fn LoadImageW(hinst: isize, name: *const u16, typ: u32, cx: i32, cy: i32, load: u32) -> isize;
 }
 #[link(name = "kernel32")]
@@ -247,6 +250,32 @@ const NIF_MESSAGE: u32 = 0x1;
 const NIF_ICON: u32 = 0x2;
 const NIF_TIP: u32 = 0x4;
 const WM_APP: u32 = 0x8000;
+const WM_TIMER: u32 = 0x0113;
+/// 「输入法激活态变化」投递消息（wparam=1 激活 / 0 未激活）
+const WM_APP_IME: u32 = 0x8001;
+/// 激活消失防抖定时器 id（进程切换焦点时旧进程 Deactivate 与新进程
+/// Activate 交错，先 false 后 true——延时确认再隐藏，避免图标闪烁）
+const TIMER_IME_HIDE: usize = 1;
+
+static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static ASK_QUIT: AtomicBool = AtomicBool::new(false);
+/// 虎符输入法当前是否激活（任一进程的 DLL Activate 上报）
+static IME_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 托盘图标当前是否已添加（显隐由输入法激活态驱动）
+static ICON_ADDED: AtomicBool = AtomicBool::new(false);
+
+/// DLL 侧 Activate/Deactivate 经管道上报（pipe.rs op "ime" 转发至此）。
+/// 线程安全：Post 到托盘窗口线程处理（Shell_NotifyIcon 必须在创建
+/// 图标的线程上调用）。
+pub fn on_ime_state(active: bool) {
+    IME_ACTIVE.store(active, Ordering::SeqCst);
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_IME, usize::from(active), 0);
+        }
+    }
+}
 const WM_DESTROY: u32 = 0x0002;
 const WM_COMMAND: u32 = 0x0111;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
@@ -265,8 +294,6 @@ const IDM_QUIT: usize = 3;
 const IDM_SCHEMA_BASE: i32 = 100;
 const SCHEMA_MAX: usize = 40;
 
-static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-static ASK_QUIT: AtomicBool = AtomicBool::new(false);
 /// 打开设置页的信号（主线程 select 循环外执行）
 static mut OPEN_SETTINGS: Option<Sender<()>> = None;
 /// 引擎宿主（托盘右键「切换方案」直调，与 HTTP 路由同源逻辑）
@@ -377,6 +404,35 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                 }
                 0
             }
+            WM_APP_IME => {
+                // 输入法激活态变化（托盘线程上执行，Shell_NotifyIcon 安全）
+                if wparam == 1 {
+                    let _ = KillTimer(hwnd, TIMER_IME_HIDE);
+                    if !ICON_ADDED.load(Ordering::SeqCst) {
+                        let nid = nid_of(hwnd);
+                        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+                            // 残留同名图标 → 先删再加
+                            Shell_NotifyIconW(NIM_DELETE, &nid);
+                            Shell_NotifyIconW(NIM_ADD, &nid);
+                        }
+                        ICON_ADDED.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    // 防抖：700ms 内无再次激活才隐藏（进程焦点切换交错防闪烁）
+                    let _ = SetTimer(hwnd, TIMER_IME_HIDE, 700, 0);
+                }
+                0
+            }
+            WM_TIMER => {
+                if wparam == TIMER_IME_HIDE {
+                    let _ = KillTimer(hwnd, TIMER_IME_HIDE);
+                    if !IME_ACTIVE.load(Ordering::SeqCst) {
+                        let _ = Shell_NotifyIconW(NIM_DELETE, &nid_of(hwnd));
+                        ICON_ADDED.store(false, Ordering::SeqCst);
+                    }
+                }
+                0
+            }
             WM_COMMAND => 0,
             WM_DESTROY => {
                 let nid = nid_of(hwnd);
@@ -460,12 +516,8 @@ pub fn spawn(
             return;
         }
         TRAY_HWND.store(hwnd, Ordering::SeqCst);
-        let nid = nid_of(hwnd);
-        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-            // 已有同名图标（残留）→ 先删再加
-            Shell_NotifyIconW(NIM_DELETE, &nid);
-            Shell_NotifyIconW(NIM_ADD, &nid);
-        }
+        // 图标初始**不显示**：只在虎符输入法激活时出现（DLL 的
+        // Activate/Deactivate 经管道上报，on_ime_state 驱动显隐）。
         let _ = GetCurrentThreadId();
         let mut m = MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, pt: POINT { x: 0, y: 0 } };
         loop {
