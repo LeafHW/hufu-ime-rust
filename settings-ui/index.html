@@ -593,8 +593,9 @@ function bindSkin() {
   rng("#mat-darken", "darken", v => (v / 100).toFixed(2)); $("#mat-darken").max = 100;
   rng("#mat-noise", "noise", v => (v / 100).toFixed(2)); $("#mat-noise").max = 100;
   rng("#mat-bw", "border_width");
-  $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); };
-  $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => SKIN.layout.inline_preedit = e.target.checked;
+  const saveSkinQuiet = async () => { try { await api("POST", "/api/skin", SKIN); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
+  $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
+  $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");

@@ -52,11 +52,14 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 Ok(s) => {
                     serde_json::json!({"skin": s, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
-                Err(_) => serde_json::json!({
-                    "skin": hufu_skin::Skin::default(),
-                    "show_index": show_index,
-                    "delay_show_ms": delay_show_ms
-                }),
+                Err(e) => {
+                    eprintln!("皮肤 {id} 加载失败，候选窗回默认: {e}");
+                    serde_json::json!({
+                        "skin": hufu_skin::Skin::default(),
+                        "show_index": show_index,
+                        "delay_show_ms": delay_show_ms
+                    })
+                }
             }
         }
         "sound" => {
