@@ -37,10 +37,11 @@ fn space() -> KeyInput {
 }
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// 全线程共享一份 ngram 解码器（省 16×214MB 副本）
+static SDEC: OnceLock<Option<std::sync::Arc<dyn hufu_engine::SentenceDecoder>>> = OnceLock::new();
 
 thread_local! {
     static ENGINE: RefCell<hufu_engine::Engine> = RefCell::new(build_engine());
-    static RERANKER: RefCell<Option<hufu_rerank::Reranker>> = const { RefCell::new(None) };
 }
 
 fn build_engine() -> hufu_engine::Engine {
@@ -50,15 +51,19 @@ fn build_engine() -> hufu_engine::Engine {
     config.user.auto_frequency = false;
     config.user.log_adjust = false;
     let mut engine = hufu_engine::Engine::new(&data_dir, config).expect("引擎构建");
-    let ngram = data_dir.join(&engine.config.sentence.ngram_path);
-    let dec = hufu_sentence::SentenceEngine::load(
-        &ngram,
-        engine.schema.dict.clone(),
-        &engine.schema.supplement,
-        engine.config.sentence.weights.clone(),
-    )
-    .expect("ngram 加载");
-    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    if let Some(dec) = SDEC.get().and_then(|d| d.clone()) {
+        engine.set_sentence_decoder(Some(dec));
+    } else {
+        let ngram = data_dir.join(&engine.config.sentence.ngram_path);
+        let dec = hufu_sentence::SentenceEngine::load(
+            &ngram,
+            engine.schema.dict.clone(),
+            &engine.schema.supplement,
+            engine.config.sentence.weights.clone(),
+        )
+        .expect("ngram 加载");
+        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    }
     engine
 }
 
@@ -182,7 +187,7 @@ fn main() {
     let mut arm = String::from("AB");
     let mut sample_b: usize = 2000;
     let mut wa: usize = 8;
-    let mut wb: usize = 2;
+    let mut _wb: usize = 2; // 已由全局池替代（保留参数兼容）
     let mut out_path = PathBuf::from(r"E:\DSH-KF\hufu\docs\benchmark-qwen-vs-ngram.md");
     let mut i = 2;
     while i + 1 < args.len() + 1 && i < args.len() {
@@ -190,7 +195,7 @@ fn main() {
             "--arm" if i + 1 < args.len() => arm = args[i + 1].clone(),
             "--sample" if i + 1 < args.len() => sample_b = args[i + 1].parse().unwrap_or(2000),
             "--wa" if i + 1 < args.len() => wa = args[i + 1].parse().unwrap_or(8),
-            "--wb" if i + 1 < args.len() => wb = args[i + 1].parse().unwrap_or(2),
+            "--wb" if i + 1 < args.len() => _wb = args[i + 1].parse().unwrap_or(2),
             "--out" if i + 1 < args.len() => out_path = PathBuf::from(args[i + 1].clone()),
             _ => {}
         }
@@ -199,6 +204,21 @@ fn main() {
 
     DATA_DIR.set(PathBuf::from(r"E:\DSH-KF\hufu\hufu-data")).unwrap();
     let data_dir = DATA_DIR.get().unwrap().clone();
+    // 先建共享 ngram 解码器（全线程复用一份，省 16×214MB）
+    {
+        let cfg = hufu_config::Config::load(&data_dir.join("config.json")).unwrap_or_default();
+        let ngram = data_dir.join(&cfg.sentence.ngram_path);
+        let probe = hufu_engine::Engine::new(&data_dir, cfg).expect("引擎构建");
+        let dec = hufu_sentence::SentenceEngine::load(
+            &ngram,
+            probe.schema.dict.clone(),
+            &probe.schema.supplement,
+            probe.config.sentence.weights.clone(),
+        )
+        .expect("ngram 加载");
+        let _ = SDEC.set(Some(std::sync::Arc::new(dec)));
+        drop(probe);
+    }
     // 主线程引擎：转码与元信息
     let (schema_name, ngram_disp, model_rel) = {
         let e = build_engine();
@@ -264,7 +284,40 @@ fn main() {
     let mut sa_paired = Stats::default();
     let mut a_ms = 0f64;
     let mut results_a: Vec<(usize, String)> = Vec::new();
+    // A 结果磁盘缓存（同语料可复用，重跑 B 不必重打 5 万句）
+    let cache_path = std::env::temp_dir().join(format!(
+        "hufu-bench-a-{}.jsonl",
+        corpus
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(24)
+            .collect::<String>()
+    ));
+    let mut a_cached = false;
     if do_a {
+        if cache_path.exists() {
+            let mut loaded = Vec::new();
+            if let Ok(f) = std::fs::File::open(&cache_path) {
+                for line in BufReader::new(f).lines().map_while(Result::ok) {
+                    if let Some((i, t)) = line.split_once('\t') {
+                        if let Ok(i) = i.parse::<usize>() {
+                            loaded.push((i, t.to_string()));
+                        }
+                    }
+                }
+            }
+            if loaded.len() == typed_able {
+                eprintln!("A 臂命中缓存 {} 句：{}", loaded.len(), cache_path.display());
+                results_a = loaded;
+                a_cached = true;
+            } else {
+                eprintln!("A 缓存数量不符（{}≠{}），重跑", loaded.len(), typed_able);
+            }
+        }
+        if !a_cached {
         eprintln!("A 臂启动：{} 句 × {} 线程", typed_able, wa);
         let done = AtomicUsize::new(0);
         let t0 = Instant::now();
@@ -285,6 +338,15 @@ fn main() {
         });
         drop(pool); // 释放各线程引擎副本内存
         a_ms = t0.elapsed().as_secs_f64() * 1000.0 / typed_able as f64;
+        // 写缓存
+        if let Ok(mut f) = std::fs::File::create(&cache_path) {
+            use std::io::Write as _;
+            for (i, t) in &results_a {
+                let _ = writeln!(f, "{i}\t{t}");
+            }
+            eprintln!("A 结果已缓存：{}", cache_path.display());
+        }
+        }
         for (i, typed) in &results_a {
             let (target, codes) = &corpus_codes[*i];
             let keys = codes.chars().count();
@@ -296,7 +358,9 @@ fn main() {
         eprintln!("A 臂完成：exact={:.2}% 字准={:.3}%", sa.exact_rate() * 100.0, sa.char_acc() * 100.0);
     }
 
-    // ── B 臂：ngram + Qwen 重排（抽样，wb 线程；每线程一份 Qwen 副本） ──
+    // ── B 臂：ngram + Qwen 重排（抽样；句串行 + 候选 5 路并行走全局池） ──
+    // 注意：不能用 scoped 小池或 16 句嵌套并行 —— 前者把 gemm 困在小池单核，
+    // 后者因堆/缓存争用实测掉到 ~2.4 核。句串行 + 候选并行（主线程发起）最稳。
     let mut sb = Stats::default();
     let mut b_ms = 0f64;
     let mut rerank_applicable = 0usize;
@@ -309,62 +373,55 @@ fn main() {
             data_dir.join(&model_rel)
         };
         model_disp = mp.display().to_string();
-        eprintln!("B 臂启动：{} 句 × {} 线程；模型 {}", sample_idx.len(), wb, model_disp);
-        let done = AtomicUsize::new(0);
-        let applicable = AtomicUsize::new(0);
+        eprintln!("B 臂启动：{} 句（句串行 + 候选并行，全局池 {} 核）；模型 {}", sample_idx.len(), rayon::current_num_threads(), model_disp);
         let t0 = Instant::now();
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(wb).build().unwrap();
-        results_b = pool.install(|| {
-            sample_idx
-                .par_iter()
-                .map(|&i| {
-                    let (target, codes) = &corpus_codes[i];
-                    let typed = ENGINE.with(|e| {
-                        // 惰性加载本线程 Qwen 副本
-                        RERANKER.with(|r| {
-                            let mut rr = r.borrow_mut();
-                            if rr.is_none() {
-                                *rr = Some(hufu_rerank::Reranker::load(&model_disp).expect("模型加载"));
-                            }
-                            let rr = rr.as_ref().unwrap();
-                            let n = &applicable;
-                            let e2 = &mut *e.borrow_mut();
-                            e2.rerank_cache.lock().unwrap().clear();
-                            let mut session = hufu_engine::Session::new(true);
-                            let mut committed = String::new();
-                            for c in codes.chars() {
-                                let out = e2.process_key(&mut session, key(c));
-                                if let Some(t) = &out.commit {
-                                    committed.push_str(t);
-                                }
-                            }
-                            if let Some((k, ctx, cands)) = e2.rerank_request(&session) {
-                                let scores = rr.score(&ctx, &cands);
-                                let mut order: Vec<(f64, String)> =
-                                    scores.into_iter().zip(cands.iter().cloned()).collect();
-                                order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-                                e2.rerank_cache
-                                    .lock()
-                                    .unwrap()
-                                    .insert(k, order.into_iter().map(|(_, t)| t).collect());
-                                n.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let out = e2.process_key(&mut session, space());
-                            if let Some(t) = &out.commit {
-                                committed.push_str(t);
-                            }
-                            committed
-                        })
-                    });
-                    let d = done.fetch_add(1, Ordering::Relaxed);
-                    if d % 100 == 99 {
-                        eprintln!("B {}/{} ({:.0}ms/句 均摊)", d + 1, sample_idx.len(), t0.elapsed().as_secs_f64() * 1000.0 / (d + 1) as f64);
+        let rr = std::sync::Arc::new(hufu_rerank::Reranker::load(&model_disp).expect("模型加载"));
+        eprintln!("模型加载完成 {:.1}s", t0.elapsed().as_secs_f64());
+        let applicable = AtomicUsize::new(0);
+        let applicable = AtomicUsize::new(0);
+        let n_total = sample_idx.len();
+        let mut done: usize = 0;
+        for &i in &sample_idx {
+            let (_target, codes) = &corpus_codes[i];
+            let typed = ENGINE.with(|e| {
+                let e2 = &mut *e.borrow_mut();
+                e2.rerank_cache.lock().unwrap().clear();
+                let mut session = hufu_engine::Session::new(true);
+                let mut committed = String::new();
+                for c in codes.chars() {
+                    let out = e2.process_key(&mut session, key(c));
+                    if let Some(t) = &out.commit {
+                        committed.push_str(t);
                     }
-                    (i, typed)
-                })
-                .collect()
-        });
-        drop(pool);
+                }
+                if let Some((k, ctx, cands)) = e2.rerank_request(&session) {
+                    // 句串行 + 候选 5 路并行（主线程发起 → 全局池），gemm 块可被空闲核偷取。
+                    // 实测 16 句嵌套并行反而因堆/缓存争用掉到 ~2.4 核，此结构最稳。
+                    let scores: Vec<f64> = cands
+                        .par_iter()
+                        .map(|c| rr.score(&ctx, std::slice::from_ref(c))[0])
+                        .collect();
+                    let mut order: Vec<(f64, String)> =
+                        scores.into_iter().zip(cands.iter().cloned()).collect();
+                    order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+                    e2.rerank_cache
+                        .lock()
+                        .unwrap()
+                        .insert(k, order.into_iter().map(|(_, t)| t).collect());
+                    applicable.fetch_add(1, Ordering::Relaxed);
+                }
+                let out = e2.process_key(&mut session, space());
+                if let Some(t) = &out.commit {
+                    committed.push_str(t);
+                }
+                committed
+            });
+            results_b.push((i, typed));
+            done += 1;
+            if done % 100 == 0 {
+                eprintln!("B {}/{} ({:.0}ms/句 均摊)", done, n_total, t0.elapsed().as_secs_f64() * 1000.0 / done as f64);
+            }
+        }
         b_ms = t0.elapsed().as_secs_f64() * 1000.0 / sample_idx.len() as f64;
         rerank_applicable = applicable.load(Ordering::Relaxed);
         for (i, typed) in &results_b {
@@ -400,14 +457,15 @@ fn main() {
     r.push_str("| 臂 | 句数 | 首选全对率 | 95% CI | 字准确率 | 均耗时/句 |\n|---|---|---|---|---|---|\n");
     if do_a {
         let (lo, hi) = sa.wilson();
+        let a_ms_disp = if a_cached { "缓存".to_string() } else { format!("{:.1}ms", a_ms) };
         r.push_str(&format!(
-            "| A ngram 基线（全量） | {} | {:.2}% | [{:.2}%, {:.2}%] | {:.3}% | {:.1}ms |\n",
+            "| A ngram 基线（全量） | {} | {:.2}% | [{:.2}%, {:.2}%] | {:.3}% | {} |\n",
             sa.n,
             sa.exact_rate() * 100.0,
             lo * 100.0,
             hi * 100.0,
             sa.char_acc() * 100.0,
-            a_ms
+            a_ms_disp
         ));
     }
     if do_b {
@@ -486,15 +544,14 @@ fn main() {
     }
     if do_b {
         r.push_str(&format!(
-            "- B 臂均 {:.0}ms/句（Qwen3-0.6B Q8 每句 5 候选各全前向，{} 并行线程均摊后，核数 {}）\n",
+            "- B 臂均 {:.0}ms/句（Qwen3-0.6B Q8 每句 5 候选各全前向；全局池 {} 核句级+候选级并行均摊后）\n",
             b_ms,
-            wb,
             std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_else(|_| "?".into())
         ));
         r.push_str(&format!(
             "- B 抽样 {} 句（固定种子洗牌，配对比较）；折算全量 5 万句纯 CPU 估约 {:.0} 小时，不在本轮执行\n",
             sample_b,
-            b_ms * wb as f64 * 50000.0 / 1000.0 / 3600.0
+            b_ms * 50000.0 / 1000.0 / 3600.0
         ));
     }
 

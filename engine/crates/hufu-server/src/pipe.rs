@@ -259,11 +259,23 @@ mod imp {
             }
             if unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) } == 0 {
                 let err = std::io::Error::last_os_error();
-                unsafe { CloseHandle(h) };
                 // ERROR_NO_DATA=232：客户端已断开，继续接受下一连接
-                if err.raw_os_error() != Some(232) {
-                    return Err(err);
+                if err.raw_os_error() == Some(232) {
+                    unsafe { CloseHandle(h) };
+                    continue;
                 }
+                // ERROR_PIPE_CONNECTED=535：客户端在 Create 与 Connect 之间已连上（竞态），
+                // 视为已连接，正常服务 —— 之前当致命错误退出，会把监听线程带崩。
+                if err.raw_os_error() == Some(535) {
+                    let host = host.clone();
+                    std::thread::spawn(move || serve_conn(h, &host));
+                    continue;
+                }
+                // 其他错误：日志 + 短歇再战，绝不退出（管道是输入法生命线，
+                // 任何单次异常都不能杀掉监听）
+                eprintln!("管道连接异常: {err}，50ms 后继续");
+                unsafe { CloseHandle(h) };
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
             let host = host.clone();

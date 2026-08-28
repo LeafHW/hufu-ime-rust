@@ -5,7 +5,6 @@
 //! waveOutOpen(WAVE_MAPPER) + SetVolume + Write（异步放完自动静默）。
 
 use std::collections::HashMap;
-use std::sync::mpsc::{self, SyncSender};
 use std::sync::Mutex;
 use windows::Win32::Media::Audio::*;
 
@@ -19,35 +18,21 @@ struct Clip {
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
-/// 播放队列（容量 1）：按键线程只 try_send（**非阻塞**），
-/// 专职线程串行播放；忙时丢弃新音（快速连打不堆积、不卡键）。
-static QUEUE: Mutex<Option<SyncSender<Clip>>> = Mutex::new(None);
 
-/// 播放 tag 音效（失败静默）。派发给专职线程，正在播放或已有排队时直接丢弃。
+/// 播放 tag 音效（失败静默）。**非阻塞且可重叠**：每次播放独立线程 +
+/// 独立 waveOut 句柄（系统自动混音）——连续击键音效交叠播放，绝不排队串行。
 pub fn play(tag: &str) {
     let clip = match with_clip(tag) {
         Some(c) => c,
         None => return,
     };
-    let mut guard = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.is_none() {
-        let (tx, rx) = mpsc::sync_channel::<Clip>(1);
-        std::thread::Builder::new()
-            .name("hufu-sound".into())
-            .spawn(move || {
-                while let Ok(c) = rx.recv() {
-                    play_sync(c);
-                }
-            })
-            .ok();
-        *guard = Some(tx);
-    }
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.try_send(clip);
-    }
+    std::thread::Builder::new()
+        .name("hufu-snd".into())
+        .spawn(move || play_sync(clip))
+        .ok();
 }
 
-/// 同步播放（仅专职线程调用；忙等在此无害，不再阻塞按键线程）。
+/// 同步播放（独立线程内调用；忙等在此无害，不阻塞按键线程）。
 fn play_sync(c: Clip) {
     let block_align = c.channels * c.bits / 8;
     if block_align == 0 {
