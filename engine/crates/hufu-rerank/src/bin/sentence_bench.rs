@@ -50,20 +50,20 @@ fn build_engine() -> hufu_engine::Engine {
     // 压测客观性：关用户学习（避免跨句污染）
     config.user.auto_frequency = false;
     config.user.log_adjust = false;
+    // B 臂语义强制开启重排（生产 config 可能默认关，压测不受其影响）
+    config.sentence.rerank.enabled = true;
     let mut engine = hufu_engine::Engine::new(&data_dir, config).expect("引擎构建");
-    if let Some(dec) = SDEC.get().and_then(|d| d.clone()) {
-        engine.set_sentence_decoder(Some(dec));
-    } else {
-        let ngram = data_dir.join(&engine.config.sentence.ngram_path);
-        let dec = hufu_sentence::SentenceEngine::load(
-            &ngram,
-            engine.schema.dict.clone(),
-            &engine.schema.supplement,
-            engine.config.sentence.weights.clone(),
-        )
-        .expect("ngram 加载");
-        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
-    }
+    // 每线程独立 ngram 副本：SentenceEngine 内部有 decode 记忆锁（持锁计算），
+    // 共享一份会把并行线程全部串行化（实测 8 线程掉到 1 核）。
+    let ngram = data_dir.join(&engine.config.sentence.ngram_path);
+    let dec = hufu_sentence::SentenceEngine::load(
+        &ngram,
+        engine.schema.dict.clone(),
+        &engine.schema.supplement,
+        engine.config.sentence.weights.clone(),
+    )
+    .expect("ngram 加载");
+    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
     engine
 }
 
@@ -373,53 +373,60 @@ fn main() {
             data_dir.join(&model_rel)
         };
         model_disp = mp.display().to_string();
-        eprintln!("B 臂启动：{} 句（句串行 + 候选并行，全局池 {} 核）；模型 {}", sample_idx.len(), rayon::current_num_threads(), model_disp);
+        eprintln!("B 臂启动：{} 句（候选 5 路并行 + 句间批并行 HUFU_SB，全局池 {} 核）；模型 {}", sample_idx.len(), rayon::current_num_threads(), model_disp);
         let t0 = Instant::now();
         let rr = std::sync::Arc::new(hufu_rerank::Reranker::load(&model_disp).expect("模型加载"));
         eprintln!("模型加载完成 {:.1}s", t0.elapsed().as_secs_f64());
         let applicable = AtomicUsize::new(0);
-        let applicable = AtomicUsize::new(0);
         let n_total = sample_idx.len();
         let mut done: usize = 0;
-        for &i in &sample_idx {
-            let (_target, codes) = &corpus_codes[i];
-            let typed = ENGINE.with(|e| {
-                let e2 = &mut *e.borrow_mut();
-                e2.rerank_cache.lock().unwrap().clear();
-                let mut session = hufu_engine::Session::new(true);
-                let mut committed = String::new();
-                for c in codes.chars() {
-                    let out = e2.process_key(&mut session, key(c));
-                    if let Some(t) = &out.commit {
-                        committed.push_str(t);
-                    }
-                }
-                if let Some((k, ctx, cands)) = e2.rerank_request(&session) {
-                    // 句串行 + 候选 5 路并行（主线程发起 → 全局池），gemm 块可被空闲核偷取。
-                    // 实测 16 句嵌套并行反而因堆/缓存争用掉到 ~2.4 核，此结构最稳。
-                    let scores: Vec<f64> = cands
-                        .par_iter()
-                        .map(|c| rr.score(&ctx, std::slice::from_ref(c))[0])
-                        .collect();
-                    let mut order: Vec<(f64, String)> =
-                        scores.into_iter().zip(cands.iter().cloned()).collect();
-                    order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-                    e2.rerank_cache
-                        .lock()
-                        .unwrap()
-                        .insert(k, order.into_iter().map(|(_, t)| t).collect());
-                    applicable.fetch_add(1, Ordering::Relaxed);
-                }
-                let out = e2.process_key(&mut session, space());
-                if let Some(t) = &out.commit {
-                    committed.push_str(t);
-                }
-                committed
-            });
-            results_b.push((i, typed));
-            done += 1;
-            if done % 100 == 0 {
-                eprintln!("B {}/{} ({:.0}ms/句 均摊)", done, n_total, t0.elapsed().as_secs_f64() * 1000.0 / done as f64);
+        // 句间并行批大小：1=纯串行（最稳）；>1 时每批 sb 句并行（每句内部候选再 5 路并行，
+        // 全局池上并发前向 = sb×5，16 核内可控；16 句全并行实测因争用反降到 ~2.4 核）
+        let sb_n: usize = std::env::var("HUFU_SB").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        for chunk in sample_idx.chunks(sb_n.max(1)) {
+            let part: Vec<(usize, String)> = chunk
+                .par_iter()
+                .map(|&i| {
+                    let (_t, codes) = &corpus_codes[i];
+                    let typed = ENGINE.with(|e| {
+                        let e2 = &mut *e.borrow_mut();
+                        e2.rerank_cache.lock().unwrap().clear();
+                        let mut session = hufu_engine::Session::new(true);
+                        let mut committed = String::new();
+                        for c in codes.chars() {
+                            let out = e2.process_key(&mut session, key(c));
+                            if let Some(t) = &out.commit {
+                                committed.push_str(t);
+                            }
+                        }
+                        if let Some((k, ctx, cands)) = e2.rerank_request(&session) {
+                            // 候选 5 路并行（gemm 块可被空闲核偷取）
+                            let scores: Vec<f64> = cands
+                                .par_iter()
+                                .map(|c| rr.score(&ctx, std::slice::from_ref(c))[0])
+                                .collect();
+                            let mut order: Vec<(f64, String)> =
+                                scores.into_iter().zip(cands.iter().cloned()).collect();
+                            order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+                            e2.rerank_cache
+                                .lock()
+                                .unwrap()
+                                .insert(k, order.into_iter().map(|(_, t)| t).collect());
+                            applicable.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let out = e2.process_key(&mut session, space());
+                        if let Some(t) = &out.commit {
+                            committed.push_str(t);
+                        }
+                        committed
+                    });
+                    (i, typed)
+                })
+                .collect();
+            results_b.extend(part);
+            done += chunk.len();
+            if done / 100 != (done - chunk.len()) / 100 || done == n_total {
+                eprintln!("B {}/{} ({:.0}ms/句 均摊, sb={sb_n})", done, n_total, t0.elapsed().as_secs_f64() * 1000.0 / done as f64);
             }
         }
         b_ms = t0.elapsed().as_secs_f64() * 1000.0 / sample_idx.len() as f64;
@@ -470,8 +477,10 @@ fn main() {
     }
     if do_b {
         let (lo, hi) = sb.wilson();
+        let full = sample_idx.len() == typed_able;
         r.push_str(&format!(
-            "| B ngram+Qwen 重排（抽样） | {} | {:.2}% | [{:.2}%, {:.2}%] | {:.3}% | {:.0}ms |\n",
+            "| B ngram+Qwen 重排（{}） | {} | {:.2}% | [{:.2}%, {:.2}%] | {:.3}% | {:.0}ms |\n",
+            if full { "同语料全量" } else { "抽样" },
             sb.n,
             sb.exact_rate() * 100.0,
             lo * 100.0,
@@ -525,7 +534,11 @@ fn main() {
         ));
     }
 
-    r.push_str("\n## 按句长分桶（首选全对率）\n\n| 句长 | A 全量 | B 抽样 |\n|---|---|---|\n");
+    let b_full = do_b && sample_idx.len() == typed_able;
+    r.push_str(&format!(
+        "\n## 按句长分桶（首选全对率）\n\n| 句长 | A 全量 | B {} |\n|---|---|---|\n",
+        if b_full { "全量" } else { "抽样" }
+    ));
     let names = ["4-9 字", "10-15 字", "16-21 字", "22-30 字"];
     for (b, name) in names.iter().enumerate() {
         let a = sa.buckets.get(b).copied().unwrap_or((0, 0));
@@ -536,11 +549,14 @@ fn main() {
     }
 
     if do_a {
-        r.push_str(&format!(
-            "\n## 效率\n\n- A 臂均 {:.1}ms/句（含逐键 ngram 解码 + 空格上屏，{} 并行线程均摊后）\n",
-            a_ms,
-            wa
-        ));
+        if a_cached {
+            r.push_str("\n## 效率\n\n- A 臂命中磁盘缓存（历史耗时见缓存运行日志；同语料 A 结果可复用）\n");
+        } else {
+            r.push_str(&format!(
+                "\n## 效率\n\n- A 臂均 {:.1}ms/句（含逐键 ngram 解码 + 空格上屏，{} 并行线程均摊后）\n",
+                a_ms, wa
+            ));
+        }
     }
     if do_b {
         r.push_str(&format!(
@@ -548,11 +564,19 @@ fn main() {
             b_ms,
             std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_else(|_| "?".into())
         ));
-        r.push_str(&format!(
-            "- B 抽样 {} 句（固定种子洗牌，配对比较）；折算全量 5 万句纯 CPU 估约 {:.0} 小时，不在本轮执行\n",
-            sample_b,
-            b_ms * 50000.0 / 1000.0 / 3600.0
-        ));
+        if b_full {
+            r.push_str(&format!(
+                "- B 为同语料全量 {} 句（与 A 逐句配对）；折算 5 万句同法估约 {:.1} 小时\n",
+                sample_idx.len(),
+                b_ms * 50000.0 / 1000.0 / 3600.0
+            ));
+        } else {
+            r.push_str(&format!(
+                "- B 抽样 {} 句（固定种子洗牌，配对比较）；折算全量 5 万句纯 CPU 估约 {:.0} 小时，不在本轮执行\n",
+                sample_b,
+                b_ms * 50000.0 / 1000.0 / 3600.0
+            ));
+        }
     }
 
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(std::path::Path::new(".")));
