@@ -186,6 +186,12 @@ pub fn ping() -> bool {
         .unwrap_or(false)
 }
 
+/// 测试钩子：重置引擎会话（回默认中文态；真实应用里的 Shift 切换会污染
+/// 全局会话态，冒烟前需归零）。
+pub fn reset_session() -> bool {
+    call(&serde_json::json!({"op": "reset"})).is_some()
+}
+
 /// 剪贴板上屏：{exe} → 文本（未启用/白名单拒/空剪贴板 → None 或空串）。
 pub fn clipboard_request(exe: &str) -> Option<String> {
     let resp = call(&serde_json::json!({"op": "clipboard", "exe": exe}))?;

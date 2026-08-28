@@ -58,6 +58,79 @@ extern "system" fn hufu_test_key(vk: u32) -> i32 {
     tsf::test_key(vk)
 }
 
+/// 测试钩子：重置引擎会话（冒烟前置；真实应用里的 Shift 会把全局会话
+/// 切成英文态污染断言）。
+#[no_mangle]
+extern "system" fn hufu_test_reset() -> i32 {
+    i32::from(crate::ipc::reset_session())
+}
+
+/// 测试钩子：按服务器当前皮肤渲染典型候选内容，回读像素落盘 BMP
+/// （%TEMP%\hufu-pad.bmp）供视觉/数值检查内边距。返回 1=成功。
+#[no_mangle]
+extern "system" fn hufu_test_pad_dump() -> i32 {
+    let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+        eprintln!("pad-dump: skin op 失败");
+        return 0;
+    };
+    let skin = resp.get("skin").cloned().unwrap_or(serde_json::Value::Null);
+    let Some(mut w) = crate::candwin2::CandidateWindowV2::new() else {
+        eprintln!("pad-dump: 候选窗初始化失败");
+        return 0;
+    };
+    let cands = vec![
+        ("你好".to_string(), String::new()),
+        ("世界".to_string(), String::new()),
+        ("吗".to_string(), String::new()),
+        ("呢".to_string(), String::new()),
+        ("吧".to_string(), String::new()),
+    ];
+    w.readback = true;
+    w.show(&cands, "uu", &skin, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let px = w.last_pixels.take();
+    let (wq, hq) = w.last_size;
+    w.readback = false;
+    w.hide();
+    let Some(px) = px else {
+        eprintln!("pad-dump: 回读失败");
+        return 0;
+    };
+    // BMP（32bpp 自底向上）
+    let mut bmp: Vec<u8> = Vec::with_capacity(54 + px.len());
+    let sz = 54 + px.len() as u32;
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&sz.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(wq as i32).to_le_bytes());
+    bmp.extend_from_slice(&(hq as i32).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&(px.len() as u32).to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    let stride = (wq as usize) * 4;
+    for y in (0..hq as usize).rev() {
+        bmp.extend_from_slice(&px[y * stride..(y + 1) * stride]);
+    }
+    let path = std::env::temp_dir().join("hufu-pad.bmp");
+    match std::fs::write(&path, &bmp) {
+        Ok(()) => {
+            eprintln!("pad-dump: {} {wq}x{hq} → {}", path.display(), path.display());
+            1
+        }
+        Err(e) => {
+            eprintln!("pad-dump: 写盘失败 {e}");
+            0
+        }
+    }
+}
+
 /// 测试钩子：驱动候选窗 v2（D3D11+DComp+D2D+Acrylic accent）完整渲染一帧。
 /// 返回 1 = 管线全通（设备/链/渲染/Present），0 = 初始化或渲染失败。
 #[no_mangle]
@@ -380,6 +453,40 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             break;
         }
     }
+    // 横排留白回读（用户皮肤即横排；窗口可能比内容先到，再等一帧）
+    w.readback = true;
+    w.show(&cands, "nih", &skin_h, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let (wq, hq) = (
+        ((rc_h.right - rc_h.left).max(1)) as usize,
+        ((rc_h.bottom - rc_h.top).max(1)) as usize,
+    );
+    if let Some(h_px) = w.last_pixels.take() {
+        let mut top_b = usize::MAX;
+        let mut bot_b = 0usize;
+        for y in 0..hq {
+            for x in 0..wq {
+                let i = (y * wq + x) * 4;
+                if h_px[i + 2] > 180 {
+                    if y < top_b {
+                        top_b = y;
+                    }
+                    if y > bot_b {
+                        bot_b = y;
+                    }
+                }
+            }
+        }
+        if top_b != usize::MAX {
+            eprintln!(
+                "skin-hot: 横排留白 上{} / 下{}（差 {}）",
+                top_b,
+                (hq - 1) - bot_b,
+                ((hq - 1) - bot_b) as i32 - top_b as i32
+            );
+        }
+    }
+    w.readback = false;
     w.hide();
     let hw = (rc_h.right - rc_h.left).max(1);
     let hh = (rc_h.bottom - rc_h.top).max(1);
