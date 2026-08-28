@@ -138,10 +138,14 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
+        // 上报激活：托盘图标「仅虎符激活时显示」
+        let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": true}));
         Ok(())
     }
 
     fn Deactivate(&self) -> Result<()> {
+        // 上报失活（托盘侧 700ms 防抖后隐藏图标）
+        let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap();
         if let Some(tm) = g.thread_mgr.clone() {
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
@@ -194,6 +198,8 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     }
 
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        // 键音「松开即停」：截断当前正在响的键音（打字机手感）
+        crate::sound::key_up();
         Ok(BOOL(0))
     }
 
