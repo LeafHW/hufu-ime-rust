@@ -12,7 +12,7 @@
 | 虎码顶功 | 27 码元（a–z + `;` `'`）、最大码长 4、第 5 码顶屏首选、四码唯一上屏、空码清屏 |
 | 多码表格式 | HuFu 原生、Rime dict.yaml（columns/import_tables/encoder）、多多（---config@ 头、`#固`、`=>`）、QQ五笔、虎整句 `码 词 词`、符号/注释/拆分/反查/补充语料 |
 | 方案管理 | 方案=目录；一键切换最近方案对；每方案独立用户词 |
-| 整句输入 | 兼容 TigerClaw TCSKNM02 明文 ngram 模型（Kneser-Ney trigram），beam search 组句，置信前缀提前上屏，补充语料 Aho–Corasick 奖励；预留 LLM 重排接口（Qwen3 GGUF）；**全部权重可调** |
+| 整句输入 | 兼容 TigerClaw TCSKNM02 明文 ngram 模型（Kneser-Ney trigram），beam search 组句，置信前缀提前上屏，补充语料 Aho–Corasick 奖励；**Qwen3-0.6B GGUF 神经重排已接入**（纯 Rust GGUF/q8_0 解码 + GEMM，停顿后异步重排 top-5，下一次按键生效）；**全部权重可调** |
 | 候选交互 | 数字/分号/引号/自定义选重键、翻页、竖排/横排、调序、置顶、软删、延时显示 |
 | 反查 | `` ` `` 引导小鹤双拼反查；注释显示拼音/Unicode 分区/拆分 |
 | 符号系统 | 快符 `;a`–`;z`、一简符号、`/xx` 分类符号、动态变量（日期/时间/星期）、`\` 命令空间、**`\calc` 真计算器**（+ - * / % ^ 括号，全角符号兼容，上屏纯数值）、**`\w` 造词**（Rime encoder 规则构码，选词自动入用户词库） |
@@ -21,7 +21,7 @@
 | 皮肤 | JSON 皮肤：19 个颜色角色 + 布局参数 + **材质**（纯色/半透明/毛玻璃磨砂/玻璃边框），Windows 用 DWM Acrylic/Mica + Direct2D，macOS 用 NSVisualEffectView；兼容导入 weasel/squirrel 配色 |
 | 设置界面 | 本地 Web UI（daemon 托管），全图形化：方案/候选/键位/整句权重/皮肤编辑器/用户词管理/导入导出。**不碰 yaml/lua** |
 | 中英切换 | Shift / Ctrl+Space / Caps / 跟随系统；中文态英文标点；大小写保留混输 |
-| 音效 | 4 类按键音 + 音量（可选）：引擎按键即出标签（key/select/commit/page），DLL waveOut 播放（管道取 base64 音频，音量 0–100），设置界面开关+试听 |
+| 音效 | 4 类按键音 + 音量（可选）：引擎按键即出标签（key/select/commit/page），DLL waveOut 播放（管道取 base64 音频，音量 0–100，**任意声道/位深 PCM**），设置界面开关+试听；默认音源 TigerClaw sounds（KeyNormal/KeySpace/KeyPop/KeyFunc） |
 | 数据安全 | 全量用户数据快照导出（配置+用户词+调整日志，ISO 日期时间戳）；HTTP BOM 容错 |
 
 ## 架构
@@ -33,6 +33,7 @@
 │  hufu-dict     多格式码表解析 + Trie + 用户词 + 注释表          │
 │  hufu-engine   会话状态机：顶功/选重/反查/符号/滤镜链            │
 │  hufu-sentence TCSKNM02 ngram 加载 + beam 组句 + 提前上屏      │
+│  hufu-rerank   纯 Rust GGUF/Qwen3 推理（q8_0 解码 + GEMM）     │
 │  hufu-config   设置模型(JSON) + 热更新                          │
 │  hufu-skin     皮肤模型(JSON) + weasel/squirrel 互导           │
 │  hufu-server   常驻 daemon：引擎实例 + IPC + 设置 Web UI 托管   │
@@ -79,8 +80,10 @@ hufu/
 
 ### 测试
 
-- 引擎 workspace：**44 测试 0 失败**（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/皮肤/配置）
-- Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质）
+- 引擎 workspace：**58 测试 0 失败**（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/皮肤/配置/GGUF f16/GEMM/q8 对 llama.cpp F32 基准/wav 解析）
+- 管道回归电池：lock 12/12、battery2 16/16、edge 17/17、flow 全过、设置生效性 7/7（皮肤热反映/横排/序号/延时/音效/调整日志）
+- Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
+- 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效
 
 ## 构建
 
