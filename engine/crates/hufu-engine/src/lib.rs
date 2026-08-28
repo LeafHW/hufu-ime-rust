@@ -364,13 +364,17 @@ impl Engine {
         }
     }
 
-    /// 切换方案。
+    /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
+        let old = self.config.schema.current.clone();
         let dir = self.data_dir.join(&self.config.schema.dir).join(name);
         let mut schema = Schema::load(&dir)?;
         self.apply_reverse_override(&mut schema);
         self.schema = schema;
         self.config.schema.current = name.to_string();
+        if old != name {
+            self.config.schema.recent_pair = Some((old, name.to_string()));
+        }
         Ok(())
     }
 
@@ -431,10 +435,18 @@ impl Engine {
                     return KeyOutcome::consumed(self.state(session));
                 }
                 if c == 'm' && !m.shift && self.config.general.switch_recent_schema {
-                    if let Some((a, b)) = self.config.schema.recent_pair.clone() {
-                        let target = if self.config.schema.current == a { b } else { a };
-                        if target != self.config.schema.current {
-                            let _ = self.switch_schema(&target);
+                    // 目标：最近方案对的另一端；从未成对时（recent_pair=None）
+                    // 取方案列表中首个非当前方案 —— 保证 Ctrl+M 首次即可用。
+                    let target = match self.config.schema.recent_pair.clone() {
+                        Some((a, b)) => Some(if self.config.schema.current == a { b } else { a }),
+                        None => self
+                            .schemas
+                            .iter()
+                            .find(|s| **s != self.config.schema.current)
+                            .cloned(),
+                    };
+                    if let Some(t) = target {
+                        if t != self.config.schema.current && self.switch_schema(&t).is_ok() {
                             session.clear();
                             return KeyOutcome::consumed(self.state(session));
                         }

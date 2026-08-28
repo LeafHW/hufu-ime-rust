@@ -325,15 +325,28 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
                 pill_hit += 1;
             }
         }
-        // ③ 文本像素存在（R 通道亮像素）
+        // ③ 文本像素存在（R 通道亮像素）+ 上下留白对称性（光学居中诊断）
         let mut text_px = 0usize;
-        for i in 0..(wq * hq) {
-            if f_px[i * 4 + 2] > 180 {
-                text_px += 1;
+        let mut top_bright = usize::MAX;
+        let mut bot_bright = 0usize;
+        for y in 0..hq {
+            for x in 0..wq {
+                if px(x, y)[2] > 180 {
+                    text_px += 1;
+                    if y < top_bright {
+                        top_bright = y;
+                    }
+                    if y > bot_bright {
+                        bot_bright = y;
+                    }
+                }
             }
         }
+        let gap_top = top_bright as i32;
+        let gap_bot = (hq as i32 - 1) - bot_bright as i32;
+        let dy_dbg = w.last_dy.take().unwrap_or(f32::NAN);
         eprintln!(
-            "skin-hot: 回读 {wq}x{hq} 四角透明✓ 胶囊命中 {pill_hit} 亮像素 {text_px}"
+            "skin-hot: 回读 {wq}x{hq} 四角透明✓ 胶囊命中 {pill_hit} 亮像素 {text_px} 留白上{gap_top}/下{gap_bot} dy={dy_dbg:.1}"
         );
         if pill_hit < 3 {
             eprintln!("skin-hot: 高亮胶囊颜色不符（内边距/颜色回归）");

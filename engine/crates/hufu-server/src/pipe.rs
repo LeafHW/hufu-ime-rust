@@ -18,7 +18,13 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
         "key" => match parse_key(req) {
             Some(k) => {
+                let schema_before = host.engine.config.schema.current.clone();
                 let r = host.process_key(k);
+                // Ctrl+M 切方案：落盘 + 重装整句（与 HTTP /api/schema 行为一致）
+                if host.engine.config.schema.current != schema_before {
+                    let _ = host.engine.config.save(&host.config_path);
+                    host.setup_sentence();
+                }
                 host.after_ime_op(); // 神经重排派发（异步）
                 r
             }
