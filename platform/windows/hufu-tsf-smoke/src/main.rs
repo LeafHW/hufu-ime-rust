@@ -140,12 +140,22 @@ fn main() {
                     .Register(&CLSID_HUFU)
                     .and_then(|()| {
                         let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+            // 图标随档案登记进 msctf 原生库（浮层只读这里，
+            // 注册表 IconFile/IconIndex 对浮层无效——25H2 实测）。
+            // 可用环境变量 HUFU_ICON_FILE 换图标文件做鉴别实验。
+                        let icon_path = std::env::var("HUFU_ICON_FILE").unwrap_or_else(|_| {
+                            "E:\\DSH-KF\\hufu\\platform\\windows\\target\\release\\hufu_tsf.dll".into()
+                        });
+                        let icon: Vec<u16> = icon_path
+                            .encode_utf16()
+                            .chain([0])
+                            .collect();
                         profiles.AddLanguageProfile(
                             &CLSID_HUFU,
                             0x0804,
                             &PROFILE_GUID,
                             &desc,
-                            &[],
+                            &icon,
                             0,
                         )
                     })
@@ -168,6 +178,7 @@ fn main() {
             let mgr: ITfInputProcessorProfileMgr = profiles.cast().unwrap();
 
             // 探测：msctf 能否枚举到我们（HKCU 键是否被读取）
+            let mut ours_prof: Option<TF_INPUTPROCESSORPROFILE> = None;
             if let Ok(enum_) = unsafe { mgr.EnumProfiles(0x0804) } {
                 let mut seen_hufu = false;
                 let mut n = 0;
@@ -195,10 +206,42 @@ fn main() {
                             prof.dwCaps,
                             prof.langid
                         );
+                        if !tag.is_empty() {
+                            ours_prof = Some(*prof);
+                        }
                     }
                 }
                 if !seen_hufu {
                     println!("    EnumProfiles 共 {n} 项，未含我们的 TIP（HKCU 键未被 msctf 枚举）");
+                }
+            }
+
+            // 重登记：档案已存在时 AddLanguageProfile 的图标参数会被静默忽略，
+            // 浮层只读 msctf 原生库 → 先卸载 → 带图标重注册（AddLanguageProfile
+            // 的 pchIconFile/uIconIndex 参数即 msctf 原生库的图标来源）。
+            if ours_prof.is_some() {
+                let icon_path = std::env::var("HUFU_ICON_FILE").unwrap_or_else(|_| {
+                    "E:\\DSH-KF\\hufu\\platform\\windows\\target\\release\\hufu_tsf.dll".into()
+                });
+                let icon: Vec<u16> = icon_path.encode_utf16().chain([0]).collect();
+                let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
+                let _ = unsafe { mgr.UnregisterProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, 0) };
+                match unsafe {
+                    mgr.RegisterProfile(
+                        &CLSID_HUFU,
+                        0x0804,
+                        &PROFILE_GUID,
+                        &desc,
+                        &icon,
+                        0,
+                        HKL(std::ptr::null_mut()),
+                        0,
+                        BOOL(1),
+                        0,
+                    )
+                } {
+                    Ok(()) => println!("    卸载→RegisterProfile(带图标 {icon_path}) ✓"),
+                    Err(e) => println!("    卸载→RegisterProfile 失败：{e:?}"),
                 }
             }
 
