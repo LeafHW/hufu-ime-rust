@@ -164,7 +164,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             }
         }
         g.composition = None;
-        if let Some(c) = g.cand2.take() {
+        if let Some(mut c) = g.cand2.take() {
             c.hide();
         }
         g.cand = None;
@@ -258,7 +258,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             g.raw_last.clear();
             g.preedit_last.clear();
             g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
-            if let Some(c) = g.cand2.as_ref() {
+            if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
             if let Some(c) = g.cand.take() {
@@ -833,7 +833,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 
     g.load_skin();
     if cands.is_empty() && raw.is_empty() {
-        if let Some(c) = g.cand2.as_ref() {
+        if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
         if let Some(c) = g.cand.take() {
@@ -841,7 +841,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
     } else if suppress_win {
         // 候选延时窗口内：快速输入防闪烁，先不显示
-        if let Some(c) = g.cand2.as_ref() {
+        if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
         if let Some(c) = g.cand.take() {
