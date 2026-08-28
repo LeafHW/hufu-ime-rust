@@ -76,7 +76,7 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 return serde_json::json!({"error": "未知音效"});
             }
             let vol = host.engine.config.sound.volume;
-            let p = host.data_dir.join("sounds").join(format!("{tag}.wav"));
+            let p = host.data_dir.join("音效").join(format!("{tag}.wav"));
             match std::fs::read(&p) {
                 Ok(bytes) => serde_json::json!({
                     "data": base64_encode(&bytes),

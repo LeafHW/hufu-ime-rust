@@ -55,11 +55,18 @@ fn ensure_server() {
     if TRIED.swap(true, Ordering::SeqCst) {
         return;
     }
-    // 候选：宿主 exe 同目录（安装态）→ 工程绝对路径（开发态）
+    // 候选：宿主 exe 同目录（安装态）→ 工程绝对路径（开发态）。
+    // 数据目录同理：安装态在 exe 旁「数据」目录，开发态回退工程 hufu-data。
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
         .unwrap_or_default();
+    let dev_data = r"E:\DSH-KF\hufu\hufu-data";
+    let data_dir = if std::path::Path::new(&format!("{exe_dir}\\数据")).exists() {
+        format!("{exe_dir}\\数据")
+    } else {
+        dev_data.to_string()
+    };
     let candidates = [
         format!("{exe_dir}\\hufu-server.exe"),
         r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string(),
@@ -69,7 +76,7 @@ fn ensure_server() {
             continue;
         }
         let wexe: Vec<u16> = exe.encode_utf16().chain([0]).collect();
-        let mut cmd: Vec<u16> = format!("\"{exe}\" --data E:\\DSH-KF\\hufu\\hufu-data")
+        let mut cmd: Vec<u16> = format!("\"{exe}\" --data \"{data_dir}\"")
             .encode_utf16()
             .chain([0])
             .collect();

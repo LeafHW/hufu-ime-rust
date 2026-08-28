@@ -179,15 +179,10 @@ pub fn register_server() -> HRESULT {
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
     let _ = reg_set(&lp, Some("Enable"), "1");
     // 档案图标（微软拼音同构写法：IconFile+IconIndex，无 Icon 字符串）。
-    // 三处消费方同步：msctf 原生库（AddLanguageProfile 的 pchIconFile 参数，
-    // 浮层只读这里，须提权登记）；HKCU/HKLM LanguageProfile（设置页读）。
-    // 图标须为传统 DIB 条目——老 Win32 加载器（含 GDI+）不认 PNG 条目 ico。
+    // IconFile 指向 DLL 自身（内嵌虎符图标资源，IconIndex=0）——路径无关，
+    // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
-    let _ = reg_set(
-        &lp,
-        Some("IconFile"),
-        &format!(r"E:\DSH-KF\hufu\platform\windows\install\hufu.ico"),
-    );
+    let _ = reg_set(&lp, Some("IconFile"), &self_path());
     HRESULT(0)
 }
 

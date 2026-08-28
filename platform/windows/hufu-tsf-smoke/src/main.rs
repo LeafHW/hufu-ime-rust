@@ -21,13 +21,36 @@ type DllRegisterServerFn = unsafe extern "system" fn() -> HRESULT;
 type TestKeyFn = unsafe extern "system" fn(u32) -> i32;
 
 fn main() {
-    // 提权注册模式：hufu-tsf-smoke.exe reg —— 只做 msctf 语言档案注册
-    // （ITfInputProcessorProfiles::Register/AddLanguageProfile 写 HKLM，须管理员）
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("reg") {
+    // 提权注销模式：hufu-tsf-smoke.exe unreg —— 卸载器专用，
+    // 从 msctf 原生库移除语言档案（注册表项由卸载脚本删）。
+    if args.get(1).map(|s| s.as_str()) == Some("unreg") {
         unsafe {
             let _ = OleInitialize(None);
-            let profiles: ITfInputProcessorProfiles =
+            let mgr: ITfInputProcessorProfileMgr =
+                CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+                    .expect("msctf profiles 不可用");
+            match unsafe { mgr.UnregisterProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, 0) } {
+                Ok(()) => println!("✓ msctf 档案已注销"),
+                Err(e) => println!("注销返回：{e:?}（未登记也算成功）"),
+            }
+        }
+        return;
+    }
+    // 提权注册模式：hufu-tsf-smoke.exe reg [图标路径] —— 安装器专用，
+    // 只做 msctf 注册（RegisterProfile 带图标 + 分类 + 激活）。须管理员；
+    // 图标路径默认 DLL 自身（内嵌虎符资源）。
+    if args.get(1).map(|s| s.as_str()) == Some("reg") {
+        let icon_path = args
+            .get(2)
+            .cloned()
+            .or_else(|| std::env::var("HUFU_ICON_FILE").ok())
+            .unwrap_or_else(|| {
+                "E:\\DSH-KF\\hufu\\platform\\windows\\target\\release\\hufu_tsf.dll".into()
+            });
+        unsafe {
+            let _ = OleInitialize(None);
+            let mgr: ITfInputProcessorProfileMgr =
                 CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
                     .expect("msctf profiles 不可用");
             let code = |r: windows::core::Result<()>| -> u32 {
@@ -36,8 +59,19 @@ fn main() {
                     Err(e) => e.code().0 as u32,
                 }
             };
-            let hr = code(profiles.Register(&CLSID_HUFU));
-            println!("Register → 0x{hr:08X}");
+            let hr = code(mgr.RegisterProfile(
+                &CLSID_HUFU,
+                0x0804,
+                &PROFILE_GUID,
+                &"HuFu 虎符输入法".encode_utf16().collect::<Vec<_>>(),
+                &icon_path.encode_utf16().collect::<Vec<_>>(),
+                0,
+                HKL(std::ptr::null_mut()),
+                0,
+                BOOL(1),
+                0,
+            ));
+            println!("RegisterProfile(带图标 {icon_path}) → 0x{hr:08X}");
             // 全局分类注册（caps 来源；切换器/系统枚举依赖）：
             // TFCAT_TIP_KEYBOARD + 键盘汇编分类 {34745C63}
             let cat: windows::core::Result<ITfCategoryMgr> =
@@ -54,26 +88,20 @@ fn main() {
                 }
                 Err(e) => println!("CategoryMgr 不可用：{e:?}"),
             }
-            // 描述必须 NUL 终止（LPCWSTR），否则 msctf 越界读（注册表出现乱码尾巴）
-            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().chain([0]).collect();
-            let hr2 = code(profiles.AddLanguageProfile(
-                &CLSID_HUFU,
+            const TF_PROFILETYPE_INPUTPROCESSOR: u32 = 1;
+            match mgr.ActivateProfile(
+                TF_PROFILETYPE_INPUTPROCESSOR,
                 0x0804,
+                &CLSID_HUFU,
                 &PROFILE_GUID,
-                &desc,
-                &[],
+                HKL(std::ptr::null_mut()),
                 0,
-            ));
-            println!("AddLanguageProfile → 0x{hr2:08X}");
-            let hr3 = code(profiles.EnableLanguageProfile(
-                &CLSID_HUFU,
-                0x0804,
-                &PROFILE_GUID,
-                BOOL(1),
-            ));
-            println!("EnableLanguageProfile → 0x{hr3:08X}");
-            if hr == 0 && hr2 == 0 && hr3 == 0 {
-                println!("✓ msctf 档案注册完成");
+            ) {
+                Ok(()) => println!("✓ 激活成功，安装注册完成"),
+                Err(e) => {
+                    println!("✗ ActivateProfile 失败：{e:?}");
+                    std::process::exit(1);
+                }
             }
         }
         return;

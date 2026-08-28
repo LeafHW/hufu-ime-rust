@@ -102,8 +102,8 @@ impl Host {
         } else if !cfg.model_path.is_empty() {
             candidates.push(self.data_dir.join(&cfg.model_path));
         }
-        // 自动探测：数据目录 models 下任意 .gguf（排除 ngram bin）
-        if let Ok(rd) = std::fs::read_dir(self.data_dir.join("models")) {
+        // 自动探测：数据目录「模型」下任意 .gguf（排除 ngram bin）
+        if let Ok(rd) = std::fs::read_dir(self.data_dir.join("模型")) {
             let mut ggufs: Vec<PathBuf> = rd
                 .flatten()
                 .map(|e| e.path())
@@ -226,7 +226,7 @@ impl Host {
 
     /// 皮肤目录。
     pub fn skins_dir(&self) -> PathBuf {
-        self.data_dir.join("skins")
+        self.data_dir.join("皮肤")
     }
 
     pub fn list_skins(&self) -> Vec<(String, String)> {
