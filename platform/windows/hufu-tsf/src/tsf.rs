@@ -852,9 +852,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 }
 
 /// 申请编辑会话。ctx=Some 显式目标（失焦冲销=旧文档）；None=当前焦点。
-/// 授权旗标：首选 TF_ES_READWRITE|TF_ES_ASYNCDONTCARE(0xA)——按键汇内自动同步授予，
-/// 拿不到则排队异步，不拒（此前用 0x6 在 Chromium 系应用普通按键上被拒
-/// TF_E_SYNCHRONOUS 0x80040209，组段编辑静默丢失）；被拒时再退一档纯异步(0x6)。
+/// 授权旗标：首选 TF_ES_SYNC|TF_ES_READWRITE(0x6)——按键汇内 msctf 同步受理并
+/// 授带写锁的 cookie（IME 规范路径）。此前首选 0xA(ASYNCDONTCARE)：重启后实测
+/// 被按异步排队，Chromium 异步会话只授只读锁 → StartComposition 0x80040201
+/// （TS_E_SYNCHRONOUS）打字不上屏、无组段无锚点。0x6 在非按键场景被拒
+/// （0x80040209）时再退 0xA 纯异步（读态操作/冲销尽力而为）。
 fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()> {
     let (target, client_id) = {
         let g = shared.lock().unwrap();
@@ -874,7 +876,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
     .into();
     unsafe {
         let mut granted = None;
-        for flags in [0xAu32, 0x6] {
+        for flags in [0x6u32, 0xA] {
             match target.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(flags)) {
                 Ok(h) => {
                     trace(&format!("session grant = 0x{:08X} (flags={flags})", h.0 as u32));
