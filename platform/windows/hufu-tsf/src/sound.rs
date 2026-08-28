@@ -5,6 +5,7 @@
 //! waveOutOpen(WAVE_MAPPER) + SetVolume + Write（异步放完自动静默）。
 
 use std::collections::HashMap;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Mutex;
 use windows::Win32::Media::Audio::*;
 
@@ -18,11 +19,36 @@ struct Clip {
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
+/// 播放队列（容量 1）：按键线程只 try_send（**非阻塞**），
+/// 专职线程串行播放；忙时丢弃新音（快速连打不堆积、不卡键）。
+static QUEUE: Mutex<Option<SyncSender<Clip>>> = Mutex::new(None);
 
-/// 播放 tag 音效（失败静默）。
+/// 播放 tag 音效（失败静默）。派发给专职线程，正在播放或已有排队时直接丢弃。
 pub fn play(tag: &str) {
-    let clip = with_clip(tag);
-    let Some(c) = clip else { return };
+    let clip = match with_clip(tag) {
+        Some(c) => c,
+        None => return,
+    };
+    let mut guard = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_none() {
+        let (tx, rx) = mpsc::sync_channel::<Clip>(1);
+        std::thread::Builder::new()
+            .name("hufu-sound".into())
+            .spawn(move || {
+                while let Ok(c) = rx.recv() {
+                    play_sync(c);
+                }
+            })
+            .ok();
+        *guard = Some(tx);
+    }
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.try_send(clip);
+    }
+}
+
+/// 同步播放（仅专职线程调用；忙等在此无害，不再阻塞按键线程）。
+fn play_sync(c: Clip) {
     let block_align = c.channels * c.bits / 8;
     if block_align == 0 {
         return;
@@ -51,11 +77,6 @@ pub fn play(tag: &str) {
         // 音量：0–100 → 0x0000–0xFFFF（左右声道同值）
         let v = (c.volume as u32).min(100) * 0xFFFF / 100;
         let _ = waveOutSetVolume(h, v | (v << 16));
-        // 缓冲区需在播放期间存活：泄漏到 Box 并用 waveOutProc 回收过于复杂，
-        // 这里用「分配不释放 + 短生命周期覆盖」不可取 —— 采用静态池。
-        // 简化安全做法：播放前把数据拷入泄漏 Box（每个音 <10KB，且实际
-        // 只在按键时触发；waveOutWrite 返回后 waveOutReset+Close 立即等待）。
-        // 为避免泄漏：同步等待播放完成（音效 ≤80ms，可接受）。
         let mut hdr = WAVEHDR {
             lpData: windows_core::PSTR(c.samples.as_ptr() as *mut u8),
             dwBufferLength: c.samples.len() as u32,
@@ -71,7 +92,7 @@ pub fn play(tag: &str) {
             return;
         }
         let _ = waveOutWrite(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
-        // 忙等 WHDR_DONE（音效极短）
+        // 忙等 WHDR_DONE（音效极短；专职线程，按键零阻塞）
         let mut spins = 0u32;
         while (hdr.dwFlags & 0x1) == 0 && spins < 200 {
             std::thread::sleep(std::time::Duration::from_millis(2));

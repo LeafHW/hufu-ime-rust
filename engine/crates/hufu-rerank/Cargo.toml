@@ -6,7 +6,16 @@ edition = "2021"
 [dependencies]
 gemm = "0.19"
 rayon = "1"
+hufu-types = { path = "../hufu-types" }
+hufu-dict = { path = "../hufu-dict" }
+hufu-config = { path = "../hufu-config" }
+hufu-engine = { path = "../hufu-engine" }
+hufu-sentence = { path = "../hufu-sentence" }
 
 [[bin]]
 name = "rerank-bench"
 path = "src/bin/bench.rs"
+
+[[bin]]
+name = "sentence-bench"
+path = "src/bin/sentence_bench.rs"
