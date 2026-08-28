@@ -306,8 +306,13 @@ impl HuFuTs_Impl {
                 return BOOL(0);
             };
             let _ = (shift, alt);
+            // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
+            // 由引擎定夺（未启用时引擎不吞，KeyDown 返回直通）。
+            if ctrl && !shift && !alt && (name == "m" || name == "space") {
+                return BOOL(1);
+            }
             if ctrl {
-                return BOOL(0); // 组合键直通（Ctrl+Shift+V 剪贴板在 KeyDown 处理）
+                return BOOL(0); // 其余组合键直通（Ctrl+Shift+V 剪贴板在 KeyDown 处理）
             }
             let will = chinese
                 && match name.as_str() {

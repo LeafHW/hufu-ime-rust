@@ -134,6 +134,8 @@ pub struct CandidateWindowV2 {
     /// 测试回读：show() 后从 D2D 目标位图取整帧 BGRA（渲染层真值，不经 DWM）
     pub(crate) readback: bool,
     pub(crate) last_pixels: Option<Vec<u8>>,
+    /// 诊断：最近一次渲染的光学垂直位移（readback 模式填充）
+    pub(crate) last_dy: Option<f32>,
 }
 
 impl CandidateWindowV2 {
@@ -224,6 +226,7 @@ impl CandidateWindowV2 {
                 dxgi: Some(dxgi_dev.clone()),
                 readback: false,
                 last_pixels: None,
+                last_dy: None,
                 size: (0, 0),
             })
         }
@@ -416,6 +419,34 @@ impl CandidateWindowV2 {
                 }
                 cand_ws.push((tw, cw));
             }
+            // 光学垂直居中：CJK 墨盒在行盒内整体偏上（行盒含下降部空白，
+            // 段落居中只对齐行盒）→ 视觉上下内边距不等（下面多）。
+            // GetOverhangMetrics 给墨迹相对布局盒的突出量（负=内缩），
+            // 位移 = 行中心 − 墨盒中心。
+            let probe_slack = |txt: &str, t: &Option<IDWriteTextFormat>| -> Option<(f32, f32)> {
+                if let Some(t) = t {
+                    let ws: Vec<u16> = txt.encode_utf16().collect();
+                    if let Ok(l) = dwrite.CreateTextLayout(&ws, t, 4096.0, line_h.max(8.0)) {
+                        if let Ok(o) = l.GetOverhangMetrics() {
+                            return Some((-o.top, -o.bottom)); // (顶 slack, 底 slack)
+                        }
+                    }
+                }
+                None
+            };
+            let (dy,) = {
+                let mut dy = 0.0f32;
+                if let Some((top_slack, bot_slack)) = probe_slack("永", &tf) {
+                    // 墨盒在行盒内的居中补偿：底 slack − 顶 slack 的一半（正=下移）
+                    dy = (bot_slack - top_slack) * 0.5;
+                    dy = dy.clamp(-6.0, 6.0);
+                }
+                if self.readback {
+                    let cjk = probe_slack("永", &tf);
+                    eprintln!("cw2-probe: cjk(top,bot)={cjk:?} line_h={line_h} dy_row={dy}");
+                }
+                (dy,)
+            };
             // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
             // 例外：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽
             let raw_w = if cands.is_empty() && !raw.is_empty() {
@@ -453,18 +484,20 @@ impl CandidateWindowV2 {
                 };
                 (width, text_x, cmt_x, cmt_w)
             };
-            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w))
+            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w, dy))
         };
-        let (v_width, text_x, cmt_x, cmt_w) = geo;
+        let (v_width, text_x, cmt_x, cmt_w, dy) = geo;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
         let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
         // 横排：内容即宽（纯自适应）；竖排：固定宽/自适应原逻辑
         let width = v_width;
         let height = if horizontal {
-            margin_y * 2.0 + line_h * (1.0 + code_row) + 4.0
+            // 高度贴合内容：margin×2 + 行高×行数 + 编码行后行距（与渲染 y0 一致）
+            margin_y * 2.0 + line_h * (1.0 + code_row) + cand_spacing * code_row
         } else {
+            // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
             let rows = cands.len().min(9) as f32 + code_row;
-            margin_y * 2.0 + (line_h + cand_spacing) * rows + 4.0
+            margin_y * 2.0 + line_h * rows + cand_spacing * (rows - 1.0).max(0.0)
         };
 
         let w = width as u32;
@@ -608,11 +641,11 @@ impl CandidateWindowV2 {
                 }
             };
 
-            // 编码行（有内容才画；候选行相应上移）
+            // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
             if !raw.is_empty() {
-                draw(&ctx, &tf, raw, margin_x, margin_y, width - margin_x * 2.0, line_h, &b_raw);
+                draw(&ctx, &tf, raw, margin_x, margin_y + dy, width - margin_x * 2.0, line_h, &b_raw);
             }
-            let y0 = margin_y + line_h * code_row;
+            let y0 = margin_y + (line_h + cand_spacing) * code_row + dy;
 
             // 高亮胶囊统一内边距：四边都 = hilite_pad。
             // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
@@ -780,6 +813,7 @@ impl CandidateWindowV2 {
                                         }
                                         let _ = cpu.Unmap();
                                         self.last_pixels = Some(data);
+                                        self.last_dy = Some(dy);
                                     }
                                 }
                             }
