@@ -37,9 +37,6 @@ pub struct Shared {
     pub composing: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
-    /// 失焦冲销的目标上下文覆盖（切窗时 RequestEditSession 必须落在「旧」文档上，
-    /// 否则冲销文本会写进新焦点应用）
-    pub commit_ctx: Option<ITfContext>,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
 }
@@ -62,7 +59,6 @@ impl Shared {
             chinese: true,
             composing: false,
             preedit_last: String::new(),
-            commit_ctx: None,
             tm_sink_cookie: 0,
         }
     }
@@ -82,11 +78,8 @@ impl Shared {
         }
     }
 
-    /// 焦点上下文（当前文档顶层）。冲销覆盖优先：失焦提交必须落在旧文档上。
+    /// 焦点上下文（当前文档顶层）。
     fn focus_context(&self) -> Option<ITfContext> {
-        if let Some(c) = self.commit_ctx.as_ref() {
-            return Some(c.clone());
-        }
         let tm = self.thread_mgr.as_ref()?;
         let doc: ITfDocumentMgr = unsafe { tm.GetFocus().ok()? };
         unsafe { doc.GetTop().ok() }
@@ -220,7 +213,10 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
 
     /// 文档焦点变化（切应用 / 切输入框 / 失焦为 None）。
     /// 统一策略：
-    /// 1. 有未上屏内容 → 在「旧」文档上下文里提交（覆盖 commit_ctx，防写错应用）
+    /// 1. 有未上屏内容 → 在「旧」文档上下文里提交（显式 ctx，防写错应用）。
+    ///    焦点切换期应用持有文档锁，同步授权会被拒（trace 实证 TF_E_SYNCHRONOUS
+    ///    0x80040209，全为 Chromium 系应用）→ run_session 内置多档回退，
+    ///    并把提交挪到工作线程异步落账，绝不阻塞焦点回调。
     /// 2. 引擎会话清零 + 本地组段句柄必须丢弃 ——
     ///    切窗时系统已终止组段，留着死句柄会让后续 SetText 全失败，
     ///    表现为「回来后有候选但中文永远上不了屏、只有字母能直通」
@@ -234,17 +230,17 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             let g = self.shared.lock().unwrap();
             (g.composing, g.preedit_last.clone())
         };
-        // 1) 旧文档上冲销提交
+        trace(&format!(
+            "OnSetFocus: composing={composing} preedit='{}' prev={:?}",
+            preedit,
+            pdimprevfocus.is_some()
+        ));
+        // 1) 旧文档上冲销提交：显式 prev ctx；ASYNCDONTCARE 授权拿不到同步就排队，
+        //    焦点回调里绝不因 TF_E_SYNCHRONOUS 丢文本（此前 Chromium 系应用实证）
         if composing && !preedit.is_empty() {
             let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
             if let Some(ctx) = prev_ctx {
-                {
-                    let mut g = self.shared.lock().unwrap();
-                    g.commit_ctx = Some(ctx);
-                }
-                let _ = run_session(&self.shared, Op::Commit(preedit.clone()));
-                let mut g = self.shared.lock().unwrap();
-                g.commit_ctx = None;
+                let _ = run_session(&self.shared, Op::Commit(preedit.clone()), Some(ctx));
             }
         }
         // 2) 引擎会话清零（服务端 focus op 清空缓冲；本地缓存全部复位）
@@ -377,7 +373,7 @@ impl HuFuTs_Impl {
             return BOOL(0); // 未启用/白名单拒绝/剪贴板空 → 交给系统 Ctrl+Shift+V
         }
         if !test_only {
-            let _ = run_session(&self.shared, Op::Insert(text));
+            let _ = run_session(&self.shared, Op::Insert(text), None);
         }
         BOOL(1)
     }
@@ -458,6 +454,8 @@ enum Op {
 struct EditSession {
     shared: SharedRef,
     op: Op,
+    /// 显式目标上下文（失焦冲销 = 旧文档；None = 当前焦点）。
+    ctx_override: Option<ITfContext>,
 }
 
 impl ITfEditSession_Impl for EditSession_Impl {
@@ -472,9 +470,12 @@ impl ITfEditSession_Impl for EditSession_Impl {
 impl EditSession_Impl {
     fn do_edit_session(&self, ec: u32) -> Result<()> {
         let mut g = self.shared.lock().unwrap();
-        let ctx = g
-            .focus_context()
-            .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
+        let ctx = match self.ctx_override.clone() {
+            Some(c) => c,
+            None => g
+                .focus_context()
+                .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
+        };
         match &self.op {
             Op::StartPreedit(text) => {
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
@@ -744,9 +745,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 组段（锁已释放；DoEditSession 内部自行加锁）
     if let Some(op) = op {
         trace("run_session begin");
-        let r = run_session(&shared, op);
+        // 授权被拒不中断：引擎态照常缓存 + 候选窗照常更新（应用持锁的瞬态窗口期，
+        // 下一键会重试补齐组段），否则整条 UI 链被跳过加剧失步
+        let r = run_session(&shared, op, None);
         trace("run_session end");
-        r?;
+        if r.is_err() {
+            trace("run_session err（组段编辑未落地，继续 UI 更新）");
+        }
     }
 
     // 缓存引擎态（TestKeyDown 预判 + 失焦冲销）
@@ -841,26 +846,44 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     Ok(())
 }
 
-fn run_session(shared: &SharedRef, op: Op) -> Result<()> {
-    let (ctx, client_id) = {
+/// 申请编辑会话。ctx=Some 显式目标（失焦冲销=旧文档）；None=当前焦点。
+/// 授权旗标：首选 TF_ES_READWRITE|TF_ES_ASYNCDONTCARE(0xA)——按键汇内自动同步授予，
+/// 拿不到则排队异步，不拒（此前用 0x6 在 Chromium 系应用普通按键上被拒
+/// TF_E_SYNCHRONOUS 0x80040209，组段编辑静默丢失）；被拒时再退一档纯异步(0x6)。
+fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()> {
+    let (target, client_id) = {
         let g = shared.lock().unwrap();
-        (
-            g.focus_context()
+        let target = match ctx {
+            Some(c) => c,
+            None => g
+                .focus_context()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
-            g.client_id,
-        )
+        };
+        (target, g.client_id)
     };
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
         op,
+        ctx_override: Some(target.clone()),
     }
     .into();
     unsafe {
-        // TF_ES_READWRITE | TF_ES_ASYNCDONTCARE = 6
-        // （StartComposition 禁止在 TF_ES_SYNC 会话中调用 → 0x80040201；
-        //  键事件回调内 ASYNCDONTCARE 实际由 msctf 同步授予）
-        let grant = ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(6))?;
-        trace(&format!("session grant = 0x{:08X}", grant.0 as u32));
+        let mut granted = None;
+        for flags in [0xAu32, 0x6] {
+            match target.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(flags)) {
+                Ok(h) => {
+                    trace(&format!("session grant = 0x{:08X} (flags={flags})", h.0 as u32));
+                    granted = Some(h);
+                    break;
+                }
+                Err(e) => {
+                    trace(&format!("session denied flags={flags} err=0x{:08X}", e.code().0 as u32));
+                }
+            }
+        }
+        if granted.is_none() {
+            return Err(Error::from(HRESULT(-2147467259)));
+        }
     }
     Ok(())
 }

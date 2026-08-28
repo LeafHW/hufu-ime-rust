@@ -141,7 +141,9 @@ pub fn register_server() -> HRESULT {
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
     let _ = reg_set(&lp, Some("Enable"), "1");
-    let _ = reg_set(&lp, Some("Icon"), "hufu-server.exe,0");
+    // Win+Space / 语言栏图标：DLL 内嵌虎爪资源（索引 0）。
+    // 此前写 "hufu-server.exe,0" 相对路径解析不到 → 永远显示系统默认图标
+    let _ = reg_set(&lp, Some("Icon"), &format!("{},0", self_path()));
     HRESULT(0)
 }
 
