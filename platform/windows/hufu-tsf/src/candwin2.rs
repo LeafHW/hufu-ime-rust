@@ -904,18 +904,22 @@ impl CandidateWindowV2 {
         //（>26px 才认）——上下逐键摆动在构造上不可能发生。退格/新
         // 组段（编码变短）放行全部变化。
         unsafe {
-            let sw = GetSystemMetrics(SM_CXSCREEN);
-            let sh = GetSystemMetrics(SM_CYSCREEN);
+            // 虚拟屏幕坐标系（多显示器安全）：主屏 SM_CXSCREEN 会把
+            // 副屏负坐标错误钳回主屏
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let grew = raw.len() >= self.last_raw_len;
             self.last_raw_len = raw.len();
             let (x, y) = match anchor {
                 Some(r) => {
-                    let x = (r.left).clamp(0, (sw - width as i32).max(0));
+                    let x = (r.left).clamp(vx, (vx + vw - width as i32).max(vx));
                     let below = r.bottom + 4;
-                    let y = if below + height as i32 <= sh {
+                    let y = if below + height as i32 <= vy + vh {
                         below
                     } else {
-                        (r.top - height as i32 - 4).max(0)
+                        (r.top - height as i32 - 4).max(vy)
                     };
                     match self.sticky_pos {
                         Some((ox, oy)) => {
@@ -935,7 +939,7 @@ impl CandidateWindowV2 {
                 }
                 None => match self.sticky_pos {
                     Some(p) => p,
-                    None => ((sw - width as i32) / 2, sh * 2 / 3),
+                    None => (vx + (vw - width as i32) / 2, vy + vh * 2 / 3),
                 },
             };
             self.sticky_pos = Some((x, y));
@@ -957,7 +961,12 @@ impl CandidateWindowV2 {
         }
     }
 
-    pub fn hide(&self) {
+    pub fn hide(&mut self) {
+        // 隐藏即清定位锁：窗口下次出现是**新组段**——粘性位置与
+        // 「正向打字」锁全部作废。否则单键组段接单键组段（raw 长度
+        // 1≥1 被误判为同一组段打字）会把新组段锁死在旧位置。
+        self.sticky_pos = None;
+        self.last_raw_len = 0;
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
