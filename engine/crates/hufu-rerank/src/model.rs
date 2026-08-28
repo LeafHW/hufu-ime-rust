@@ -2,6 +2,60 @@
 
 use crate::gguf::{GgmlDType, GgufFile};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 前台活动时间戳（ms，粗粒度即可）：宿主每收到一次按键调用 note_foreground()。
+/// gemm 分块循环发现 50ms 内有按键 → 主动小睡让核（覆盖 80ms/键的连打节奏），
+/// 前台解码优先；代价是打分变慢（异步无感）。
+static FOREGROUND_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_foreground() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    FOREGROUND_MS.store(now, Ordering::Relaxed);
+}
+
+fn foreground_recent() -> bool {
+    let last = FOREGROUND_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last) < 50
+}
+
+/// 重排专用线程池：≤6 线程 + Windows BelowNormal 优先级。
+/// 不抢全局池：打分永远让位于前台（管道解码在 normal 优先级），CPU 封顶 ~37%。
+fn rerank_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4)
+            .min(6)
+            .max(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("hufu-rerank-{i}"))
+            .start_handler(|_i| {
+                #[cfg(windows)]
+                unsafe {
+                    // THREAD_PRIORITY_BELOW_NORMAL = -1
+                    windows_sys::Win32::System::Threading::SetThreadPriority(
+                        windows_sys::Win32::System::Threading::GetCurrentThread(),
+                        -1,
+                    );
+                }
+            })
+            .build()
+            .expect("rerank pool")
+    })
+}
 
 pub struct Cfg {
     pub hidden: usize,
@@ -87,24 +141,31 @@ impl Qwen3 {
         let tile = 256usize;
         let out_ptr = SendPtr(out.as_mut_ptr());
         let out_ref = &out_ptr;
-        (0..n)
-            .into_par_iter()
-            .step_by(tile)
-            .for_each(|p0| {
-                let pn = tile.min(n - p0);
-                let w = self.dequant_rows(info, p0, pn);
-                // C(m,pn) = X(m,k)·Wᵀ(k,pn)；B(j,p)=w[p*k+j] → rhs rs=1 cs=k
-                unsafe {
-                    gemm::gemm(
-                        m, pn, k,
-                        out_ref.0.add(p0), 1, n as isize, false,
-                        x.as_ptr(), 1, k as isize,
-                        w.as_ptr(), k as isize, 1,
-                        0.0, 1.0, false, false, false,
-                        gemm::Parallelism::None,
-                    );
-                }
-            });
+        // 专用池内并行（BelowNormal 优先级 + 打字让键），不与前台争核
+        rerank_pool().install(|| {
+            (0..n)
+                .into_par_iter()
+                .step_by(tile)
+                .for_each(|p0| {
+                    // 前台 50ms 内有按键 → 让出 CPU 小睡，避免连打时键延迟被放大
+                    if foreground_recent() {
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                    let pn = tile.min(n - p0);
+                    let w = self.dequant_rows(info, p0, pn);
+                    // C(m,pn) = X(m,k)·Wᵀ(k,pn)；B(j,p)=w[p*k+j] → rhs rs=1 cs=k
+                    unsafe {
+                        gemm::gemm(
+                            m, pn, k,
+                            out_ref.0.add(p0), 1, n as isize, false,
+                            x.as_ptr(), 1, k as isize,
+                            w.as_ptr(), k as isize, 1,
+                            0.0, 1.0, false, false, false,
+                            gemm::Parallelism::None,
+                        );
+                    }
+                })
+        });
     }
 
     /// 一维小张量（norm 权重等）整体读

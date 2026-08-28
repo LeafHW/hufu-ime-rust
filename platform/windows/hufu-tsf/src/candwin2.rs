@@ -507,11 +507,102 @@ impl CandidateWindowV2 {
                 M32: 0.0,
             });
 
-            // 背景：非 solid 材质清透明（模糊由 accent 提供）；solid 用皮肤底色
+            // 背景：solid 用皮肤底色；其余材质清透明后自绘磨砂层
+            // （DWM accent 在 DComp/NOREDIRECTIONBITMAP 窗口上常见失效，
+            //  自绘保证 frosted/glass/translucent 有确定的视觉变化）
             if kind == "solid" {
                 let _ = ctx.Clear(Some(&color_f(skin, "back_color", "#202022E6")));
             } else {
                 let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                let (w_px, h_px) = (width as u32, height as u32);
+                if w_px > 0 && h_px > 0 {
+                    // ① 色调层：tint 半透明铺底（frosted 85% / glass 40% / translucent 60%）
+                    let t = tint_hex.unwrap_or([28, 28, 30, 204]);
+                    let alpha = match kind.as_str() {
+                        "frosted" => 0.85f32,
+                        "glass" => 0.40f32,
+                        _ => 0.60f32,
+                    };
+                    let tint_c = D2D1_COLOR_F {
+                        r: t[0] as f32 / 255.0,
+                        g: t[1] as f32 / 255.0,
+                        b: t[2] as f32 / 255.0,
+                        a: (t[3] as f32 / 255.0) * alpha,
+                    };
+                    if let Ok(b) = ctx.CreateSolidColorBrush(&tint_c, None) {
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        ctx.FillRoundedRectangle(&rr, &b);
+                    }
+                    // ② 噪点层（仅 frosted）：64×64 确定性噪点瓦片，低透明度平铺 = 磨砂颗粒
+                    if kind == "frosted" {
+                        let noise_amt = skin
+                            .pointer("/skin/material/noise")
+                            .or_else(|| skin.get("material").and_then(|m| m.get("noise")))
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(27.0) as f32
+                            / 100.0;
+                        if noise_amt > 0.01 {
+                            let side = 64u32;
+                            let mut px = vec![0u8; (side * side * 4) as usize];
+                            let mut st = 0x1234_5678u64;
+                            for p in px.chunks_exact_mut(4) {
+                                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                let v = ((st >> 33) & 0xFF) as u32;
+                                let a = (v % 2) * ((noise_amt * 90.0) as u32).max(1);
+                                // 预乘 alpha：RGB 需按 alpha 缩放
+                                p[0] = (v * a / 255) as u8;
+                                p[1] = (v * a / 255) as u8;
+                                p[2] = (v * a / 255) as u8;
+                                p[3] = a as u8;
+                            }
+                            let size = windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: side, height: side };
+                            if let Ok(bmp) = ctx.CreateBitmap(size, Some(px.as_ptr() as *const std::ffi::c_void), side * 4, &windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.0, dpiY: 96.0,
+                                ..Default::default()
+                            }) {
+                                use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR};
+                                let bp = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                                    interpolationMode: D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                                };
+                                if let Ok(br) = ctx.CreateBitmapBrush(&bmp, Some(&bp), None) {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
+                                        radiusX: radius,
+                                        radiusY: radius,
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, &br);
+                                }
+                            }
+                        }
+                    }
+                    // ③ 暗化层（material.darken 0-1）
+                    let darken = skin
+                        .pointer("/skin/material/darken")
+                        .or_else(|| skin.get("material").and_then(|m| m.get("darken")))
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    if darken > 0.005 {
+                        let dc = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: darken.min(0.9) };
+                        if let Some(b) = ctx.CreateSolidColorBrush(&dc, None).ok() {
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
+                                radiusX: radius,
+                                radiusY: radius,
+                            };
+                            ctx.FillRoundedRectangle(&rr, &b);
+                        }
+                    }
+                }
             }
 
             let mkbrush = |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {

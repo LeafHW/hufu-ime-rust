@@ -4,6 +4,9 @@ pub mod bpe;
 pub mod gguf;
 pub mod model;
 
+/// 前台按键通知：gemm 分块循环据此让键（详见 model.rs）。
+pub use model::note_foreground;
+
 use model::Qwen3;
 
 pub struct Reranker {

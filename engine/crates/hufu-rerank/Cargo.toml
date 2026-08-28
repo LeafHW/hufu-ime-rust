@@ -12,6 +12,9 @@ hufu-config = { path = "../hufu-config" }
 hufu-engine = { path = "../hufu-engine" }
 hufu-sentence = { path = "../hufu-sentence" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
 [[bin]]
 name = "rerank-bench"
 path = "src/bin/bench.rs"
