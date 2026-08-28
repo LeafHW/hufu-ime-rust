@@ -405,28 +405,32 @@ fn main() {
             let frost = body_of(&http("GET", "/api/skin?id=hufu-frost-h", ""));
             let sv = http("POST", "/api/skin", &frost);
             assert!(sv.contains("\"ok\":true"), "皮肤切换保存失败: {sv}");
-            // 真实按键驱动：TSF KeyDown → update_ui → 候选窗口
-            let _ = tk(0x55); // u
-            let _ = tk(0x4A); // j
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            let cls: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
-            let hwnd = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-                    windows::core::PCWSTR(cls.as_ptr()),
-                    None,
+            // 真实渲染验证：pad_dump 按服务器**当前皮肤**真实渲染并落盘 BMP，
+            // 量 BMP 头的宽高——这才是「切换后渲染尺寸」的真值。
+            //（旧版用 test_key+FindWindow 量窗口，但 test_key 只走引擎管道
+            // 从不渲染，量到的实为上一测试残留窗口——current 恰为横排时
+            // 假通过，默认皮肤改竖排后现出原形。）
+            let pd = {
+                type P = unsafe extern "system" fn() -> i32;
+                let p = GetProcAddress(hmod, PCSTR(b"hufu_test_pad_dump\0".as_ptr())).unwrap();
+                unsafe { std::mem::transmute::<_, P>(p) }
+            };
+            let bmp_dims = || -> (i32, i32) {
+                let mut b = std::fs::read(
+                    std::env::temp_dir().join("hufu-pad.bmp"),
                 )
-            }
-            .unwrap_or_default();
-            assert!(!hwnd.0.is_null(), "横排候选窗未出现");
-            let mut rc = windows::Win32::Foundation::RECT::default();
-            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) };
-            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+                .expect("pad bmp 应已生成");
+                let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]);
+                let h = i32::from_le_bytes([b[22], b[23], b[24], b[25]]);
+                b.clear();
+                (w, h.abs())
+            };
+            assert_eq!(unsafe { pd() }, 1, "横排 pad_dump 渲染失败");
+            let (w, h) = bmp_dims();
             // 先还原原皮肤再断言：断言失败也不能把当前皮肤留在横排预设上
             let _ = http("POST", "/api/skin", &backup);
-            println!("[15] 横排真路径：切换皮肤→按键 → 窗口 {w}x{h}");
             assert!(w > h, "横排应宽扁（{w}x{h}）——皮肤未生效");
-            let _ = tk(0x1B); // ESC 关窗
-            println!("[15] 横排真路径 E2E ✓（已还原 {cur_id}）");
+            println!("[15] 横排真路径：切换皮肤→真实渲染 → {w}x{h} ✓（已还原 {cur_id}）");
         }
 
         println!("\n=== hufu-tsf 冒烟测试通过 ===");

@@ -852,6 +852,15 @@ impl CandidateWindowV2 {
                     } else {
                         (r.top - height as i32 - 4).max(0)
                     };
+                    // 2px 迟滞：亚像素取整误差/回流微动不搬窗（≥3px 真实移动才跟）
+                    let (x, y) = match self.sticky_pos {
+                        Some((ox, oy))
+                            if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 =>
+                        {
+                            (ox, oy)
+                        }
+                        _ => (x, y),
+                    };
                     self.sticky_pos = Some((x, y));
                     (x, y)
                 }

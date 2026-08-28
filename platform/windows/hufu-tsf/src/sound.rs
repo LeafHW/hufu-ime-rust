@@ -72,11 +72,11 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
     Some(h)
 }
 
-/// 播放 tag 音效（失败静默）。**单常驻线程 + 深度 10 合并队列**：
+/// 播放 tag 音效（失败静默）。**单常驻线程 + 排空取最新**：
 /// 每次播放 spawn 线程的老方案在按住键连发（~30 键/秒）时线程堆积，
 /// 几秒后调度拖垮——正是「按住 D 三五秒后卡」的病根。
-/// 现在整进程只有一条 hufu-snd 线程顺序播放（4 句柄池内交叠出声）；
-/// 队列满（≥10 未播）直接丢弃本次——连击音效宁可丢新不积压。
+/// 现在整进程只有一条 hufu-snd 线程：起播前排空队列只播最新——
+/// 连打期间声音连续不中断，停键后尾巴至多一条音。
 pub fn play(tag: &str) {
     let clip = match with_clip(tag) {
         Some(c) => c,
@@ -85,11 +85,20 @@ pub fn play(tag: &str) {
     static TX: Mutex<Option<std::sync::mpsc::SyncSender<Clip>>> = Mutex::new(None);
     let mut g = TX.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
-        // 深度 10：连击不丢音（4 句柄池交叠消化，长队列顺序播完）
+        // 缓冲 10 只为吸收突发；播放侧「排空取最新」：起播前把队列里
+        // 攒的全部倒掉只播最新一条——连打期间声音连续不中断（队列非空），
+        // 停键后至多再播一条（尾巴 ≤1 个音，不再拖一串余音）。
         let (tx, rx) = std::sync::mpsc::sync_channel::<Clip>(10);
         let ok = std::thread::Builder::new()
             .name("hufu-snd".into())
-            .spawn(move || while let Ok(c) = rx.recv() { play_sync(c) })
+            .spawn(move || {
+                while let Ok(mut c) = rx.recv() {
+                    while let Ok(j) = rx.try_recv() {
+                        c = j;
+                    }
+                    play_sync(c);
+                }
+            })
             .is_ok();
         if !ok {
             return;
