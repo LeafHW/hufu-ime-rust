@@ -664,6 +664,9 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
 }
 
 /// 组段内文本的屏幕矩形（插入点跟随）。
+/// 量的是**组段末尾折叠后的零宽范围**=光标点本身，不是整段矩形——
+/// 整段矩形的左缘是组段起点、宽度随打字膨胀、换行时上下跳行，
+/// 拿它当锚点正是候选框水平/垂直抖动的病根。
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret = None;
     let Some(comp) = g.composition.clone() else {
@@ -674,13 +677,21 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: GetRange 失败");
         return;
     };
+    let Ok(caret) = (unsafe { range.Clone() }) else {
+        trace("qc: Clone 失败");
+        return;
+    };
+    if unsafe { caret.Collapse(ec, TF_ANCHOR_END) }.is_err() {
+        trace("qc: Collapse 失败");
+        return;
+    };
     let Ok(view) = (unsafe { ctx.GetActiveView() }) else {
         trace("qc: GetActiveView 失败");
         return;
     };
     let mut rect = RECT::default();
     let mut clipped = BOOL(0);
-    match unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) } {
+    match unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) } {
         Ok(()) => {}
         Err(e) => {
             trace(&format!("qc: GetTextExt err 0x{:08X}", e.code().0 as u32));
