@@ -123,6 +123,9 @@ impl Host {
                         continue;
                     }
                     if model.is_none() {
+                        // 懒加载权重：文件页由 OS 页缓存承载（可共享/可回收），
+                        // 进程私有内存不 +610MB；首次打分有额外读盘，之后页缓存命中。
+                        std::env::set_var("GGUF_LAZY", "1");
                         match hufu_rerank::Reranker::load(&model_path) {
                             Ok(r) => {
                                 eprintln!("神经重排模型已加载: {model_path}");
@@ -167,6 +170,8 @@ impl Host {
 
     /// 按键 → (结果, 状态快照)。
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
+        // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
+        hufu_rerank::note_foreground();
         let outcome = self.engine.process_key(&mut self.session, key);
         let state = self.engine.state(&self.session);
         serde_json::json!({ "outcome": outcome, "state": state })

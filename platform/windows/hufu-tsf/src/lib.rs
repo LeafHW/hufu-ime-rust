@@ -246,19 +246,74 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         return 0;
     };
     let px = a.len() / 4;
-    let mut diff = 0usize;
-    for i in 0..px {
-        let d = (a[i * 4] as i32 - b[i * 4] as i32).abs()
-            + (a[i * 4 + 1] as i32 - b[i * 4 + 1] as i32).abs()
-            + (a[i * 4 + 2] as i32 - b[i * 4 + 2] as i32).abs();
-        if d > 48 {
-            diff += 1;
+    let diff_ratio = |x: &[u8], y: &[u8]| -> f64 {
+        let n = x.len().min(y.len()) / 4;
+        let mut d = 0usize;
+        for i in 0..n {
+            let dv = (x[i * 4] as i32 - y[i * 4] as i32).abs()
+                + (x[i * 4 + 1] as i32 - y[i * 4 + 1] as i32).abs()
+                + (x[i * 4 + 2] as i32 - y[i * 4 + 2] as i32).abs();
+            if dv > 48 {
+                d += 1;
+            }
+        }
+        d as f64 / n.max(1) as f64
+    };
+    let ratio = diff_ratio(&a, &b);
+    eprintln!("skin-hot: 颜色 A/B {px}px 差异 {:.1}%", ratio * 100.0);
+    if ratio <= 0.05 {
+        return 0;
+    }
+
+    // ── 材质可见性：竖排 solid vs 竖排 frosted（自绘磨砂层必须改变外观）──
+    let mut skin_f = base.clone();
+    set_colors(&mut skin_f, "#101014FF", "#3050A0FF", "#FFFFFFFF");
+    if let Some(s) = skin_f.get_mut("skin").and_then(|s| s.as_object_mut()) {
+        if let Some(m) = s.get_mut("material").and_then(|m| m.as_object_mut()) {
+            m.insert("kind".into(), serde_json::json!("frosted"));
+            m.insert("tint".into(), serde_json::json!("#2C3E50D8"));
+            m.insert("noise".into(), serde_json::json!(45.0));
         }
     }
-    let ratio = diff as f64 / px as f64;
-    eprintln!(
-        "skin-hot: 像素 {px}，显著差异 {diff}（{:.1}%）",
-        ratio * 100.0
-    );
-    if ratio > 0.05 { 1 } else { 0 }
+    w.show(&cands, "nih", &skin_f, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let cap_f = capture(&w);
+    w.hide();
+    let Some(f) = cap_f else {
+        eprintln!("skin-hot: frosted 捕获失败");
+        return 0;
+    };
+    let fr = diff_ratio(&a, &f);
+    eprintln!("skin-hot: solid vs frosted 差异 {:.1}%（磨砂层可见性）", fr * 100.0);
+    if fr <= 0.03 {
+        return 0;
+    }
+
+    // ── 横排：窗口宽高比必须翻转（w > h）──
+    let mut skin_h = skin_f.clone();
+    if let Some(s) = skin_h.get_mut("skin").and_then(|s| s.as_object_mut()) {
+        if let Some(l) = s.get_mut("layout").and_then(|l| l.as_object_mut()) {
+            l.insert("horizontal".into(), serde_json::json!(true));
+        }
+    }
+    w.show(&cands, "nih", &skin_h, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let mut rc_h = windows::Win32::Foundation::RECT::default();
+    let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_h) };
+    let cap_h = capture(&w);
+    w.hide();
+    let hw = (rc_h.right - rc_h.left).max(1);
+    let hh = (rc_h.bottom - rc_h.top).max(1);
+    eprintln!("skin-hot: 横排窗口 {hw}x{hh}");
+    if hw <= hh {
+        return 0; // 横排未生效
+    }
+    if let Some(h) = cap_h {
+        let hr = diff_ratio(&f, &h);
+        eprintln!("skin-hot: 竖排 vs 横排 frosted 差异 {:.1}%", hr * 100.0);
+        if hr <= 0.05 {
+            return 0;
+        }
+    }
+    1
 }
