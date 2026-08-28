@@ -558,6 +558,16 @@ impl CandidateWindowV2 {
             }
             let y0 = margin_y + line_h * code_row;
 
+            // 高亮胶囊统一内边距：四边都 = hilite_pad。
+            // 文本垂直居中于行高（em 字面），胶囊 = 文本外扩 hilite_pad（上下左右一致），
+            // 超出行界时收敛到 [y, y+line_h]。
+            let pill_v = |y: f32| -> (f32, f32) {
+                let half = (line_h - em) / 2.0;
+                let top = (y + half - hilite_pad).max(y);
+                let bottom = (y + half + em + hilite_pad).min(y + line_h);
+                (top, bottom)
+            };
+
             // 候选行
             let sel = selected.min(cands.len().saturating_sub(1));
             if horizontal {
@@ -571,14 +581,14 @@ impl CandidateWindowV2 {
                         x += cand_spacing;
                     }
                     if i == sel {
-                        // 胶囊四周留白对称：左右 = hilite_pad，上下 = 1px 内缩（文本已垂直居中）
                         if let Some(b) = &b_hi {
+                            let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
                                     left: x - hilite_pad,
-                                    top: y + 1.0,
+                                    top: pt,
                                     right: x + cell_w + hilite_pad,
-                                    bottom: y + line_h - 1.0,
+                                    bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
                                 radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
@@ -604,18 +614,19 @@ impl CandidateWindowV2 {
                     x += cell_w;
                 }
             } else {
-                // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 外扩）──
+                // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
                 for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
                     let y = y0 + (line_h + cand_spacing) * i as f32;
                     if i == sel {
-                        // 高亮行（圆角胶囊；↑↓ 移动；文本垂直居中后上下留白对称）
+                        // 高亮行（圆角胶囊；↑↓ 移动；四边内边距统一 = hilite_pad）
                         if let Some(b) = &b_hi {
+                            let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
                                     left: margin_x - 4.0 - hilite_pad,
-                                    top: y + 1.0,
+                                    top: pt,
                                     right: width - margin_x + 4.0 + hilite_pad,
-                                    bottom: y + line_h - 1.0,
+                                    bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
                                 radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
