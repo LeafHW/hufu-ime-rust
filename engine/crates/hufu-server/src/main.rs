@@ -73,10 +73,11 @@ fn main() {
         tray::spawn(quit_tx, open_tx);
         let url = format!("http://{addr}/");
         std::thread::spawn(move || {
-            if open_rx.try_recv().is_ok() || open_rx.recv().is_ok() {
+            // 常驻循环：每次托盘信号都开窗口（旧版一次性线程导致第二次进不去）
+            while open_rx.recv().is_ok() {
                 // 独立应用窗口（Edge --app 模式）：有自己的任务栏图标、无地址栏，
                 // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
-                // Edge 不在时回退默认浏览器。
+                // Edge 不在时回退默认浏览器。窗口已开时再启动会聚焦/新开一窗。
                 let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
                 let pf = std::env::var("ProgramFiles").unwrap_or_default();
                 let edge = [
@@ -150,6 +151,22 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({ "state": state }))
         }
         ("GET", "/api/config") => Response::json(&serde_json::to_value(&host.engine.config).unwrap()),
+        ("GET", "/api/schemas") => {
+            // 方案列表 = 码表目录的子目录名（含可读名字则更佳，先给目录名）
+            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        // 注意：码表子目录多为 junction，DirEntry::file_type() 对
+                        // 链接点返回 reparse（非目录）——用 path().is_dir() 跟随判定
+                        .filter(|e| e.path().is_dir())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            Response::json(&serde_json::json!({ "schemas": names }))
+        }
         ("POST", "/api/config") => {
             let v = req.json();
             let cfg: hufu_config::Config = match serde_json::from_value(v) {
