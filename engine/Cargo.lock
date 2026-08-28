@@ -302,6 +302,11 @@ name = "hufu-rerank"
 version = "0.1.0"
 dependencies = [
  "gemm",
+ "hufu-config",
+ "hufu-dict",
+ "hufu-engine",
+ "hufu-sentence",
+ "hufu-types",
  "rayon",
 ]
 
