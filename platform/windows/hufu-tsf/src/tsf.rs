@@ -35,6 +35,10 @@ pub struct Shared {
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
     pub chinese: bool,
     pub composing: bool,
+    /// 最近一次 preedit（失焦冲销用）
+    pub preedit_last: String,
+    /// 线程焦点事件 sink cookie（Deactivate 反注册用）
+    pub tm_sink_cookie: u32,
 }
 
 impl Shared {
@@ -54,6 +58,8 @@ impl Shared {
             caret: None,
             chinese: true,
             composing: false,
+            preedit_last: String::new(),
+            tm_sink_cookie: 0,
         }
     }
 
@@ -82,7 +88,7 @@ impl Shared {
 
 /// ── 文本服务（同时实现按键接收器：msctf 要求 fforeground sink 支持
 ///    ITfTextInputProcessor，因此 TIP 对象自身实现 ITfKeyEventSink）──
-#[implement(ITfTextInputProcessor, ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[implement(ITfTextInputProcessor, ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
 pub struct HuFuTs {
     shared: SharedRef,
 }
@@ -105,6 +111,26 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let sink: ITfKeyEventSink = unsafe { self.cast()? };
         unsafe {
             km.AdviseKeyEventSink(tid, &sink, BOOL(1))?;
+            // 文档焦点事件：失焦冲销会话+关候选窗（修「切窗后候选不关/回不来」）
+            {
+                let tm_sink: ITfThreadMgrEventSink = unsafe { self.cast()? };
+                if let Ok(src) = tm.cast::<ITfSource>() {
+                    let unk: IUnknown = tm_sink.cast()?;
+                    if let Ok(cookie) =
+                        unsafe { src.AdviseSink(&ITfThreadMgrEventSink::IID, Some(&unk)) }
+                    {
+                        self.shared.lock().unwrap().tm_sink_cookie = cookie;
+                    }
+                }
+            }
+            // 输入法默认「开+中文」：部分应用读 OPENCLOSE 档位决定是否走 IME，
+            // 不设会表现为「先按一下 Shift 才能打中文」
+            if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
+                if let Ok(comp) = unsafe { cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) } {
+                    let v = VARIANT::from(1i32);
+                    let _ = unsafe { comp.SetValue(tid, &v) };
+                }
+            }
         }
         let mut g = self.shared.lock().unwrap();
         g.thread_mgr = Some(tm);
@@ -121,6 +147,15 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {
                     let _ = km.UnadviseKeyEventSink(g.client_id);
+                }
+            }
+            if let Ok(src) = tm.cast::<ITfSource>() {
+                let cookie = g.tm_sink_cookie;
+                if cookie != 0 {
+                    unsafe {
+                        let _ = src.UnadviseSink(cookie);
+                    }
+                    g.tm_sink_cookie = 0;
                 }
             }
         }
@@ -164,6 +199,54 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
 
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
         Ok(BOOL(0))
+    }
+}
+
+impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
+    fn OnInitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnUninitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+        Ok(())
+    }
+
+    /// 文档焦点变化（切应用 / 切输入框 / 失焦为 None）。
+    /// 统一策略：有未上屏内容先冲销上屏，再清引擎会话、关候选窗 ——
+    /// 修复「切走候选窗不关、切回后候选在但无法上屏」。
+    fn OnSetFocus(
+        &self,
+        _pdimfocus: Option<&ITfDocumentMgr>,
+        _pdimprevfocus: Option<&ITfDocumentMgr>,
+    ) -> Result<()> {
+        let (composing, preedit) = {
+            let g = self.shared.lock().unwrap();
+            (g.composing, g.preedit_last.clone())
+        };
+        if composing && !preedit.is_empty() {
+            let _ = run_session(&self.shared, Op::Commit(preedit));
+        }
+        // 引擎会话清零（服务端 focus op 清空缓冲；本地缓存复位）
+        let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
+        {
+            let mut g = self.shared.lock().unwrap();
+            g.composing = false;
+            g.raw_last.clear();
+            g.preedit_last.clear();
+            g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
+            if let Some(c) = g.cand2.as_ref() {
+                c.hide();
+            }
+        }
+        Ok(())
+    }
+
+    fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -616,11 +699,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         r?;
     }
 
-    // 缓存引擎态（TestKeyDown 预判）
+    // 缓存引擎态（TestKeyDown 预判 + 失焦冲销）
     {
         let mut g2 = shared.lock().unwrap();
         g2.chinese = state.get("chinese").and_then(|v| v.as_bool()).unwrap_or(true);
         g2.composing = !state.get("raw").and_then(|v| v.as_str()).unwrap_or("").is_empty();
+        g2.preedit_last = state
+            .get("preedit")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
     }
 
     // 候选窗（v2 优先，初始化失败回退 v1）

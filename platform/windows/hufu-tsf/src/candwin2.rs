@@ -131,6 +131,9 @@ pub struct CandidateWindowV2 {
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
     size: (i32, i32),
+    /// 测试回读：show() 后从 D2D 目标位图取整帧 BGRA（渲染层真值，不经 DWM）
+    pub(crate) readback: bool,
+    pub(crate) last_pixels: Option<Vec<u8>>,
 }
 
 impl CandidateWindowV2 {
@@ -219,6 +222,8 @@ impl CandidateWindowV2 {
                 visual: Some(visual),
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
+                readback: false,
+                last_pixels: None,
                 size: (0, 0),
             })
         }
@@ -507,29 +512,38 @@ impl CandidateWindowV2 {
                 M32: 0.0,
             });
 
-            // 背景：solid 用皮肤底色；其余材质清透明后自绘磨砂层
-            // （DWM accent 在 DComp/NOREDIRECTIONBITMAP 窗口上常见失效，
-            //  自绘保证 frosted/glass/translucent 有确定的视觉变化）
-            if kind == "solid" {
-                let _ = ctx.Clear(Some(&color_f(skin, "back_color", "#202022E6")));
-            } else {
-                let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-                let (w_px, h_px) = (width as u32, height as u32);
-                if w_px > 0 && h_px > 0 {
-                    // ① 色调层：tint 半透明铺底（frosted 85% / glass 40% / translucent 60%）
+            // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
+            // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
+            // 材质简化：solid=底色 / translucent|glass|frosted(旧皮肤兼容)=tint 半透明；
+            // 毛玻璃(噪点/DWM accent) 已移除；material.opacity(0-1) 统一控透明度。
+            let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            {
+                let mat = skin.pointer("/skin/material").or_else(|| skin.get("material"));
+                let opacity = mat
+                    .and_then(|m| m.get("opacity"))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let base_alpha = if kind == "solid" {
+                    color_f(skin, "back_color", "#202022E6").a
+                } else {
                     let t = tint_hex.unwrap_or([28, 28, 30, 204]);
-                    let alpha = match kind.as_str() {
-                        "frosted" => 0.85f32,
-                        "glass" => 0.40f32,
-                        _ => 0.60f32,
-                    };
-                    let tint_c = D2D1_COLOR_F {
-                        r: t[0] as f32 / 255.0,
-                        g: t[1] as f32 / 255.0,
-                        b: t[2] as f32 / 255.0,
-                        a: (t[3] as f32 / 255.0) * alpha,
-                    };
-                    if let Ok(b) = ctx.CreateSolidColorBrush(&tint_c, None) {
+                    let t_a = t[3] as f32 / 255.0;
+                    match kind.as_str() {
+                        "glass" => t_a * 0.55,
+                        _ => t_a * 0.85, // translucent / frosted(兼容旧皮肤)
+                    }
+                };
+                let (br, bg_, bb) = if kind == "solid" {
+                    let c = color_f(skin, "back_color", "#202022E6");
+                    (c.r, c.g, c.b)
+                } else {
+                    let t = tint_hex.unwrap_or([28, 28, 30, 204]);
+                    (t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0)
+                };
+                let bg_c = D2D1_COLOR_F { r: br, g: bg_, b: bb, a: base_alpha * opacity };
+                if bg_c.a > 0.004 {
+                    if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                         let rr = D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
                             radiusX: radius,
@@ -537,70 +551,21 @@ impl CandidateWindowV2 {
                         };
                         ctx.FillRoundedRectangle(&rr, &b);
                     }
-                    // ② 噪点层（仅 frosted）：64×64 确定性噪点瓦片，低透明度平铺 = 磨砂颗粒
-                    if kind == "frosted" {
-                        let noise_amt = skin
-                            .pointer("/skin/material/noise")
-                            .or_else(|| skin.get("material").and_then(|m| m.get("noise")))
-                            .and_then(|x| x.as_f64())
-                            .unwrap_or(27.0) as f32
-                            / 100.0;
-                        if noise_amt > 0.01 {
-                            let side = 64u32;
-                            let mut px = vec![0u8; (side * side * 4) as usize];
-                            let mut st = 0x1234_5678u64;
-                            for p in px.chunks_exact_mut(4) {
-                                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                                let v = ((st >> 33) & 0xFF) as u32;
-                                let a = (v % 2) * ((noise_amt * 90.0) as u32).max(1);
-                                // 预乘 alpha：RGB 需按 alpha 缩放
-                                p[0] = (v * a / 255) as u8;
-                                p[1] = (v * a / 255) as u8;
-                                p[2] = (v * a / 255) as u8;
-                                p[3] = a as u8;
-                            }
-                            let size = windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: side, height: side };
-                            if let Ok(bmp) = ctx.CreateBitmap(size, Some(px.as_ptr() as *const std::ffi::c_void), side * 4, &windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
-                                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
-                                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
-                                },
-                                dpiX: 96.0, dpiY: 96.0,
-                                ..Default::default()
-                            }) {
-                                use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR};
-                                let bp = D2D1_BITMAP_BRUSH_PROPERTIES1 {
-                                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
-                                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
-                                    interpolationMode: D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                                };
-                                if let Ok(br) = ctx.CreateBitmapBrush(&bmp, Some(&bp), None) {
-                                    let rr = D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
-                                        radiusX: radius,
-                                        radiusY: radius,
-                                    };
-                                    ctx.FillRoundedRectangle(&rr, &br);
-                                }
-                            }
-                        }
-                    }
-                    // ③ 暗化层（material.darken 0-1）
-                    let darken = skin
-                        .pointer("/skin/material/darken")
-                        .or_else(|| skin.get("material").and_then(|m| m.get("darken")))
-                        .and_then(|x| x.as_f64())
-                        .unwrap_or(0.0) as f32;
-                    if darken > 0.005 {
-                        let dc = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: darken.min(0.9) };
-                        if let Some(b) = ctx.CreateSolidColorBrush(&dc, None).ok() {
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
-                                radiusX: radius,
-                                radiusY: radius,
-                            };
-                            ctx.FillRoundedRectangle(&rr, &b);
-                        }
+                }
+                // 暗化层（material.darken 0-1，圆角）
+                let darken = mat
+                    .and_then(|m| m.get("darken"))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0) as f32;
+                if darken > 0.005 {
+                    let dc = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: darken.min(0.9) };
+                    if let Ok(b) = ctx.CreateSolidColorBrush(&dc, None) {
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        ctx.FillRoundedRectangle(&rr, &b);
                     }
                 }
             }
@@ -650,13 +615,17 @@ impl CandidateWindowV2 {
             let y0 = margin_y + line_h * code_row;
 
             // 高亮胶囊统一内边距：四边都 = hilite_pad。
-            // 文本垂直居中于行高（em 字面），胶囊 = 文本外扩 hilite_pad（上下左右一致），
-            // 超出行界时收敛到 [y, y+line_h]。
+            // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
+            // 保证上下左右内边距始终一致（旧版 top 被夹底没夹，左右还各有隐藏 ±4）。
             let pill_v = |y: f32| -> (f32, f32) {
                 let half = (line_h - em) / 2.0;
-                let top = (y + half - hilite_pad).max(y);
-                let bottom = (y + half + em + hilite_pad).min(y + line_h);
-                (top, bottom)
+                let ih = em + hilite_pad * 2.0;
+                if ih <= line_h {
+                    (y + half - hilite_pad, y + half + em + hilite_pad)
+                } else {
+                    let off = (line_h - ih) / 2.0;
+                    (y + off, y + off + ih)
+                }
             };
 
             // 候选行
@@ -709,14 +678,14 @@ impl CandidateWindowV2 {
                 for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
                     let y = y0 + (line_h + cand_spacing) * i as f32;
                     if i == sel {
-                        // 高亮行（圆角胶囊；↑↓ 移动；四边内边距统一 = hilite_pad）
+                        // 高亮行（圆角胶囊；↑↓ 移动；左右对称 = margin_x 外扩 hilite_pad）
                         if let Some(b) = &b_hi {
                             let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: margin_x - 4.0 - hilite_pad,
+                                    left: margin_x - hilite_pad,
                                     top: pt,
-                                    right: width - margin_x + 4.0 + hilite_pad,
+                                    right: width - margin_x + hilite_pad,
                                     bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
@@ -758,19 +727,73 @@ impl CandidateWindowV2 {
 
             let _ = ctx.EndDraw(None, None);
             ctx.SetTarget(None);
+
+            // 测试回读：EndDraw 后目标位图已非活动，拷到 CPU 位图取整帧 BGRA
+            if self.readback {
+                use windows::Win32::Graphics::Direct2D::{
+                    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CPU_READ,
+                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                };
+                let (w_px, h_px) = (width as u32, height as u32);
+                if w_px > 0 && h_px > 0 {
+                    let props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                            format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0),
+                        ..Default::default()
+                    };
+                    let _ = D2D1_BITMAP_OPTIONS::default();
+                    if let Ok(cpu) = ctx.CreateBitmap(
+                        windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: w_px, height: h_px },
+                        None,
+                        0,
+                        &props,
+                    ) {
+                        unsafe {
+                            if let Ok(bmp0) = bitmap.cast::<ID2D1Bitmap>() {
+                                if cpu
+                                    .CopyFromBitmap(
+                                        None,
+                                        Some(&bmp0),
+                                        Some(&windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U {
+                                            left: 0,
+                                            top: 0,
+                                            right: w_px,
+                                            bottom: h_px,
+                                        }),
+                                    )
+                                    .is_ok()
+                                {
+                                    if let Ok(mapped) = cpu.Map(
+                                        windows::Win32::Graphics::Direct2D::D2D1_MAP_OPTIONS_READ,
+                                    ) {
+                                        let mut data = vec![0u8; (w_px * h_px * 4) as usize];
+                                        let pitch = mapped.pitch as usize;
+                                        for row in 0..h_px as usize {
+                                            let src = mapped.bits.add(row * pitch) as *const u8;
+                                            data[row * (w_px as usize) * 4..(row + 1) * (w_px as usize) * 4]
+                                                .copy_from_slice(std::slice::from_raw_parts(src, (w_px * 4) as usize));
+                                        }
+                                        let _ = cpu.Unmap();
+                                        self.last_pixels = Some(data);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let _ = chain.Present(1, DXGI_PRESENT(0));
         }
 
-        // accent 材质
-        let tint = tint_hex.unwrap_or([28, 28, 30, 204]);
-        match kind.as_str() {
-            "frosted" => apply_accent(self.hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, tint),
-            "glass" => apply_accent(self.hwnd, ACCENT_ENABLE_HOSTBACKDROP, tint),
-            "translucent" => {
-                apply_accent(self.hwnd, ACCENT_ENABLE_TRANSPARENTGRADIENT, tint)
-            }
-            _ => apply_accent(self.hwnd, ACCENT_DISABLED, tint),
-        }
+        // DWM accent 已弃用：NOREDIRECTIONBITMAP+DComp 窗口上不生效，
+        // 透明/半透明完全由自绘层 alpha（material.opacity + kind）承担。
+        let _ = tint_hex;
 
         // 定位：优先插入点下方，出屏翻到上方；无 anchor 屏幕下 1/3 居中
         unsafe {

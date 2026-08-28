@@ -173,6 +173,14 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     set_colors(&mut skin_a, "#101014FF", "#3050A0FF", "#FFFFFFFF"); // 深底·蓝高亮
     let mut skin_b = base.clone();
     set_colors(&mut skin_b, "#F5F0E6FF", "#C03030FF", "#101010FF"); // 浅底·红高亮
+    // 首候选行 y：margin_y(≈9)+编码行(line_h≈26)+胶囊半高≈5 → 约 h*0.2，限界内扫描
+    let first_row_y = |h: i32| -> usize { (h as usize * 20 / 100).max(12) };
+    // 行内水平扫描范围：避开序号列，覆盖胶囊主体
+    let margin_probe = |w: usize| -> std::ops::Range<usize> {
+        let s = (w * 15 / 100).max(20);
+        let e = (w * 70 / 100).min(w.saturating_sub(4));
+        s..e.max(s + 1)
+    };
 
     let cands = vec![
         ("你好".to_string(), "ni hao".to_string()),
@@ -275,33 +283,69 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         return 0;
     }
 
-    // ── 材质可见性：竖排 solid vs 竖排 frosted（自绘磨砂层必须改变外观）──
+    // ── 材质回读断言（D2D 位图；屏幕 BitBlt 对 DComp 窗口不可靠）──
+    // 稳定可断言：① 圆角四角真透明 ② 高亮胶囊颜色精确 ③ 文本像素存在
     let mut skin_f = base.clone();
     set_colors(&mut skin_f, "#101014FF", "#3050A0FF", "#FFFFFFFF");
     if let Some(s) = skin_f.get_mut("skin").and_then(|s| s.as_object_mut()) {
         if let Some(m) = s.get_mut("material").and_then(|m| m.as_object_mut()) {
             m.insert("kind".into(), serde_json::json!("frosted"));
             m.insert("tint".into(), serde_json::json!("#2C3E50D8"));
-            m.insert("noise".into(), serde_json::json!(45.0));
+            m.insert("opacity".into(), serde_json::json!(1.0));
         }
     }
+    w.readback = true;
     w.show(&cands, "nih", &skin_f, None, 0);
-    std::thread::sleep(std::time::Duration::from_millis(300));
     let mut rc_f = windows::Win32::Foundation::RECT::default();
     let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_f) };
-    let cap_f = capture(&w);
-    w.hide();
-    let Some(f) = cap_f else {
-        eprintln!("skin-hot: frosted 捕获失败");
+    let (fw, fh) = (rc_f.right - rc_f.left, rc_f.bottom - rc_f.top);
+    let Some(f_px) = w.last_pixels.take() else {
+        eprintln!("skin-hot: frosted 回读失败");
         return 0;
     };
-    let (fw, fh) = (rc_f.right - rc_f.left, rc_f.bottom - rc_f.top);
-    eprintln!("skin-hot: 竖排 frosted 窗口 {fw}x{fh}");
-    let fr = diff_ratio(&a, &f);
-    eprintln!("skin-hot: solid vs frosted 差异 {:.1}%（磨砂层可见性）", fr * 100.0);
-    if fr <= 0.03 {
-        return 0;
+    {
+        let (wq, hq) = (fw as usize, fh as usize);
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * wq + x) * 4;
+            [f_px[i], f_px[i + 1], f_px[i + 2], f_px[i + 3]]
+        };
+        // ① 圆角：四角 alpha≈0（窗口真透明圆角，非「补直角」）
+        for (x, y) in [(1usize, 1usize), (wq - 2, 1), (1, hq - 2), (wq - 2, hq - 2)] {
+            let c = px(x, y);
+            if c[3] > 30 {
+                eprintln!("skin-hot: 圆角失效（{x},{y} a={}）", c[3]);
+                return 0;
+            }
+        }
+        // ② 高亮胶囊色精确（首行高亮 #3050A0）：取首候选行中部扫描命中胶囊像素
+        let mut pill_hit = 0usize;
+        for gx in (margin_probe(wq)) {
+            let c = px(gx, first_row_y(fh));
+            if c[2] >= 40 && c[2] <= 60 && c[0] >= 145 && c[0] <= 175 && c[3] > 200 {
+                pill_hit += 1;
+            }
+        }
+        // ③ 文本像素存在（R 通道亮像素）
+        let mut text_px = 0usize;
+        for i in 0..(wq * hq) {
+            if f_px[i * 4 + 2] > 180 {
+                text_px += 1;
+            }
+        }
+        eprintln!(
+            "skin-hot: 回读 {wq}x{hq} 四角透明✓ 胶囊命中 {pill_hit} 亮像素 {text_px}"
+        );
+        if pill_hit < 3 {
+            eprintln!("skin-hot: 高亮胶囊颜色不符（内边距/颜色回归）");
+            return 0;
+        }
+        if text_px < 50 {
+            eprintln!("skin-hot: 候选文本缺失");
+            return 0;
+        }
     }
+    w.readback = false;
+    eprintln!("skin-hot: 材质回读断言 ✓（圆角透明/胶囊色/文本）");
 
     // ── 横排：同一候选集下窗口必须变宽变矮（5 候选几何上必然分离）──
     let mut skin_h = skin_f.clone();
@@ -323,21 +367,12 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             break;
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(150)); // 留一帧给 DWM 合成
-    let cap_h = if settled { capture(&w) } else { None };
     w.hide();
     let hw = (rc_h.right - rc_h.left).max(1);
     let hh = (rc_h.bottom - rc_h.top).max(1);
     eprintln!("skin-hot: 横排窗口 {hw}x{hh}（竖排 {fw}x{fh}）");
     if !settled {
         return 0; // 横排未生效
-    }
-    if let Some(h) = cap_h {
-        let hr = diff_ratio(&f, &h);
-        eprintln!("skin-hot: 竖排 vs 横排 frosted 差异 {:.1}%", hr * 100.0);
-        if hr <= 0.05 {
-            return 0;
-        }
     }
     1
 }
