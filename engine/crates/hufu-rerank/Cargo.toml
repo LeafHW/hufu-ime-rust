@@ -19,3 +19,7 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "sentence-bench"
 path = "src/bin/sentence_bench.rs"
+
+[[bin]]
+name = "score-probe"
+path = "src/bin/score_probe.rs"
