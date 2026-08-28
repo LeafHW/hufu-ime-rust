@@ -691,13 +691,26 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     };
     let mut rect = RECT::default();
     let mut clipped = BOOL(0);
-    match unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) } {
-        Ok(()) => {}
-        Err(e) => {
-            trace(&format!("qc: GetTextExt err 0x{:08X}", e.code().0 as u32));
-            return;
+    // 双查取末次：部分应用（如跟打器）文本布局异步——按键后第一次
+    // 查询常返回旧布局（前一位置），第二次才反映新光标。锚点在旧/新
+    // 之间交替正是候选窗「中间→下面→中间」跳动的病根。连查两次取
+    // 末次非退化结果，迫使懒布局在本次渲染前完成。
+    let mut last_ok: Option<RECT> = None;
+    for _ in 0..2 {
+        rect = RECT::default();
+        if unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) }.is_ok() {
+            let degenerate = rect.bottom <= rect.top
+                || rect.right < rect.left
+                || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0);
+            if !degenerate {
+                last_ok = Some(rect);
+            }
         }
     }
+    let Some(rect) = last_ok else {
+        trace("qc: GetTextExt 两次均失败/退化");
+        return;
+    };
     // GetTextExt 返回屏幕坐标（MSDN）——不再做客户区→屏幕转换
     trace(&format!("qc: raw=({},{},{},{})", rect.left, rect.top, rect.right, rect.bottom));
     g.caret = Some(RECT {

@@ -69,7 +69,15 @@ impl Host {
     }
 
     /// 依据配置与磁盘可用性装配整句解码器。
+    /// **整句只属于「整句系」方案**（方案名含「整句」，与设置页的
+    /// 整句标签同约定）：其余方案一律不启用整句引擎——码表类方案
+    /// 与整句模型词典不匹配，混装只会空转耗内存。
     pub fn setup_sentence(&mut self) {
+        let cur = self.engine.config.schema.current.clone();
+        if !cur.contains("整句") {
+            self.engine.set_sentence_decoder(None);
+            return;
+        }
         let path = self.data_dir.join(&self.engine.config.sentence.ngram_path);
         if self.engine.config.sentence.enabled && path.exists() {
             match SentenceEngine::load(
