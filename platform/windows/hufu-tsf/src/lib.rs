@@ -86,7 +86,7 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
         ("吧".to_string(), String::new()),
     ];
     w.readback = true;
-    w.show(&cands, "uu", &skin, None, 0);
+    w.show(&cands, "uu", &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(80));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
@@ -179,7 +179,7 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
         ("您好".to_string(), "".to_string()),
         ("拟好".to_string(), "少用".to_string()),
     ];
-    w.show(&cands, "nih", &skin, None, 0);
+    w.show(&cands, "nih", &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(400));
     w.hide();
     eprintln!("candwin2: {kind} 材质渲染+隐藏完成");
@@ -324,10 +324,10 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     };
 
     // 帧 A → 捕获；帧 B（同一窗口实例，模拟词边界热换肤）→ 捕获
-    w.show(&cands, "nih", &skin_a, None, 0);
+    w.show(&cands, "nih", &skin_a, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(250));
     let cap_a = capture(&w);
-    w.show(&cands, "nih", &skin_b, None, 0);
+    w.show(&cands, "nih", &skin_b, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(250));
     let cap_b = capture(&w);
     w.hide();
@@ -367,7 +367,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         }
     }
     w.readback = true;
-    w.show(&cands, "nih", &skin_f, None, 0);
+    w.show(&cands, "nih", &skin_f, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     let mut rc_f = windows::Win32::Foundation::RECT::default();
     let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_f) };
     let (fw, fh) = (rc_f.right - rc_f.left, rc_f.bottom - rc_f.top);
@@ -459,7 +459,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             l.insert("horizontal".into(), serde_json::json!(true));
         }
     }
-    w.show(&cands, "nih", &skin_h, None, 0);
+    w.show(&cands, "nih", &skin_h, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     // 轮询等待尺寸真正变化上屏（SetWindowPos 异步，固定 sleep 有竞态）
     let mut rc_h = windows::Win32::Foundation::RECT::default();
     let mut settled = false;
@@ -474,7 +474,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     }
     // 横排留白回读（用户皮肤即横排；窗口可能比内容先到，再等一帧）
     w.readback = true;
-    w.show(&cands, "nih", &skin_h, None, 0);
+    w.show(&cands, "nih", &skin_h, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(60));
     let (wq, hq) = (
         ((rc_h.right - rc_h.left).max(1)) as usize,

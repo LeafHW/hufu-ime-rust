@@ -939,7 +939,12 @@ impl CandidateWindowV2 {
                 }
                 None => match self.sticky_pos {
                     Some(p) => p,
-                    None => (vx + (vw - width as i32) / 2, vy + vh * 2 / 3),
+                    // 从未有过真实锚点且本帧也取不到：宁可这帧不显示，
+                    // 也绝不瞬移屏幕中下方（下一帧锚点就绪即正确出现）
+                    None => {
+                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        return;
+                    }
                 },
             };
             self.sticky_pos = Some((x, y));
@@ -962,11 +967,12 @@ impl CandidateWindowV2 {
     }
 
     pub fn hide(&mut self) {
-        // 隐藏即清定位锁：窗口下次出现是**新组段**——粘性位置与
-        // 「正向打字」锁全部作废。否则单键组段接单键组段（raw 长度
-        // 1≥1 被误判为同一组段打字）会把新组段锁死在旧位置。
-        self.sticky_pos = None;
-        self.last_raw_len = 0;
+        // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
+        // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
+        // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
+        // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
+        // 中下方」的病根）。
+        self.last_raw_len = usize::MAX;
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
