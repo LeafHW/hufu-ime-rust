@@ -178,11 +178,12 @@ pub fn register_server() -> HRESULT {
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
     let _ = reg_set(&lp, Some("Enable"), "1");
-    // Win+Space 切换器图标：IconIndex(DWORD) 索引本 DLL 内嵌虎爪资源（索引 0）。
-    // 实测系统输入法（微拼等）LanguageProfile 全部只写 IconIndex、Icon 留空——
-    // 切换器不读 Icon 字符串（旧写法 "exe,0" 因此从未生效）。
+    // Win+Space 切换器图标：双写覆盖两种读取实现——
+    // ① IconIndex(DWORD)（系统输入法全部此写法，设置页已实证生效）；
+    // ② Icon="DLL全路径,0"（部分组件解析字符串格式）。
+    // 切换器浮层有自己的登录会话级图标缓存，改动后需注销/重启才刷新。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
-    let _ = reg_set(&lp, Some("Icon"), "");
+    let _ = reg_set(&lp, Some("Icon"), &format!("{},0", self_path()));
     HRESULT(0)
 }
 
