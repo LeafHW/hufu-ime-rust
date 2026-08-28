@@ -10,8 +10,8 @@ pub use model::note_foreground;
 use model::Qwen3;
 
 pub struct Reranker {
-    m: Qwen3,
-    tok: bpe::Bpe,
+    pub m: Qwen3,
+    pub tok: bpe::Bpe,
 }
 
 impl Reranker {
