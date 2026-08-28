@@ -246,8 +246,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     set_colors(&mut skin_a, "#101014FF", "#3050A0FF", "#FFFFFFFF"); // 深底·蓝高亮
     let mut skin_b = base.clone();
     set_colors(&mut skin_b, "#F5F0E6FF", "#C03030FF", "#101010FF"); // 浅底·红高亮
-    // 首候选行 y：margin_y(≈9)+编码行(line_h≈26)+胶囊半高≈5 → 约 h*0.2，限界内扫描
-    let first_row_y = |h: i32| -> usize { (h as usize * 20 / 100).max(12) };
+    // 首候选行 y：阴影边距下有平移——胶囊检查用竖带扫描（见②）
     // 行内水平扫描范围：避开序号列，覆盖胶囊主体
     let margin_probe = |w: usize| -> std::ops::Range<usize> {
         let s = (w * 15 / 100).max(20);
@@ -390,12 +389,17 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
                 return 0;
             }
         }
-        // ② 高亮胶囊色精确（首行高亮 #3050A0）：取首候选行中部扫描命中胶囊像素
+        // ② 高亮胶囊色精确（首行高亮 #3050A0）：竖带扫描——阴影边距使
+        // 首行 y 整体平移，带状扫描对边距鲁棒
         let mut pill_hit = 0usize;
-        for gx in (margin_probe(wq)) {
-            let c = px(gx, first_row_y(fh));
-            if c[2] >= 40 && c[2] <= 60 && c[0] >= 145 && c[0] <= 175 && c[3] > 200 {
-                pill_hit += 1;
+        let y_lo = (fh as usize * 12 / 100).max(8);
+        let y_hi = (fh as usize * 32 / 100).min(hq.saturating_sub(2));
+        for y in y_lo..y_hi.max(y_lo + 1) {
+            for gx in (margin_probe(wq)) {
+                let c = px(gx, y);
+                if c[2] >= 40 && c[2] <= 60 && c[0] >= 145 && c[0] <= 175 && c[3] > 200 {
+                    pill_hit += 1;
+                }
             }
         }
         // ③ 文本像素存在（R 通道亮像素）+ 上下留白对称性（光学居中诊断）
@@ -418,10 +422,25 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         let gap_top = top_bright as i32;
         let gap_bot = (hq as i32 - 1) - bot_bright as i32;
         let dy_dbg = w.last_dy.take().unwrap_or(f32::NAN);
+        // ④ 投影存在：外边距环内半透明像素（阴影渲染真值——阴影曾经
+        //    整个没画过，此断言防再死回归）
+        let mut sh_px = 0usize;
+        for y in 0..hq {
+            for x in 0..wq {
+                let a = px(x, y)[3];
+                if a > 8 && a < 200 {
+                    sh_px += 1;
+                }
+            }
+        }
         eprintln!(
-            "skin-hot: 回读 {wq}x{hq} 四角透明✓ 胶囊命中 {pill_hit} 亮像素 {text_px} 留白上{gap_top}/下{gap_bot} dy={dy_dbg:.1}"
+            "skin-hot: 回读 {wq}x{hq} 四角透明✓ 胶囊命中 {pill_hit} 亮像素 {text_px} 阴影像素 {sh_px} 留白上{gap_top}/下{gap_bot} dy={dy_dbg:.1}"
         );
-        if pill_hit < 3 {
+        if sh_px < 400 {
+            eprintln!("skin-hot: 投影未渲染（阴影像素 {sh_px}）");
+            return 0;
+        }
+        if pill_hit < 6 {
             eprintln!("skin-hot: 高亮胶囊颜色不符（内边距/颜色回归）");
             return 0;
         }

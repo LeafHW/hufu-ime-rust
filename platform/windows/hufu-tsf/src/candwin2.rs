@@ -135,6 +135,9 @@ pub struct CandidateWindowV2 {
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
     /// 那正是候选框「在光标周围乱跳」的病根。
     sticky_pos: Option<(i32, i32)>,
+    /// 上次 show 的编码长度：判断「正向打字」还是「退格/新组段」。
+    /// 正向打字时光标只应右移/不动——据此过滤应用返回的旧布局回退值。
+    last_raw_len: usize,
     /// 测试回读：show() 后从 D2D 目标位图取整帧 BGRA（渲染层真值，不经 DWM）
     pub(crate) readback: bool,
     pub(crate) last_pixels: Option<Vec<u8>>,
@@ -232,6 +235,7 @@ impl CandidateWindowV2 {
                 dxgi: Some(dxgi_dev.clone()),
                 readback: false,
                 sticky_pos: None,
+                last_raw_len: 0,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -510,7 +514,19 @@ impl CandidateWindowV2 {
 
         let w = width as u32;
         let h = height as u32;
-        if !self.ensure_swapchain(w.max(1), h.max(1)) {
+        // 投影：shadow_radius>0 时窗口四周外扩边距，阴影画在边距里
+        //（内容绘制整体平移进边距内，见渲染段 SetTransform）
+        let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
+        let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
+        let has_shadow = shadow_radius >= 1.0;
+        let shadow_m = if has_shadow {
+            (shadow_radius * 1.6 + 5.0 + shadow_off_y.abs()).ceil()
+        } else {
+            0.0
+        };
+        let w_out = w + 2 * shadow_m as u32;
+        let h_out = h + 2 * shadow_m as u32;
+        if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
             crate::tsf::trace("cw2: ensure_swapchain FAIL");
             return;
         }
@@ -558,6 +574,48 @@ impl CandidateWindowV2 {
             // 材质简化：solid=底色 / translucent|glass|frosted(旧皮肤兼容)=tint 半透明；
             // 毛玻璃(噪点/DWM accent) 已移除；material.opacity(0-1) 统一控透明度。
             let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
+            // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
+            if has_shadow {
+                let sc = color_f(skin, "shadow_color", "#000000FF");
+                if sc.a > 0.004 {
+                    if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
+                        const PASSES: usize = 10;
+                        for i in (1..=PASSES).rev() {
+                            let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈 t=0.1
+                            let grow = shadow_radius * t;
+                            let a = sc.a * (1.0 - t) * (1.0 - t); // 内浓外淡
+                            b.SetColor(&D2D1_COLOR_F {
+                                r: sc.r,
+                                g: sc.g,
+                                b: sc.b,
+                                a,
+                            });
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: shadow_m - grow,
+                                    top: shadow_m - grow + shadow_off_y * t,
+                                    right: shadow_m + width + grow,
+                                    bottom: shadow_m + height + grow
+                                        + shadow_off_y * t,
+                                },
+                                radiusX: radius + grow,
+                                radiusY: radius + grow,
+                            };
+                            ctx.FillRoundedRectangle(&rr, &b);
+                        }
+                    }
+                }
+            }
+            // 内容整体平移进阴影边距内（此后所有内容坐标不变）
+            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                M11: 1.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: 1.0,
+                M31: shadow_m,
+                M32: shadow_m,
+            });
             {
                 let mat = skin.pointer("/skin/material").or_else(|| skin.get("material"));
                 let opacity = mat
@@ -775,7 +833,8 @@ impl CandidateWindowV2 {
                     D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CPU_READ,
                     D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 };
-                let (w_px, h_px) = (width as u32, height as u32);
+                // 回读整窗（含阴影边距），与 SetWindowPos 尺寸一致
+                let (w_px, h_px) = (w_out, h_out);
                 if w_px > 0 && h_px > 0 {
                     let props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                         pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
@@ -838,11 +897,17 @@ impl CandidateWindowV2 {
         // 透明/半透明完全由自绘层 alpha（material.opacity + kind）承担。
         let _ = tint_hex;
 
-        // 定位：优先插入点下方，出屏翻到上方；锚点丢失时**沿用上次位置**
-        //（粘性锚点——瞬移屏幕中央的老行为就是候选框乱跳的来源）。
+        // 定位：优先插入点下方，出屏翻到上方；锚点丢失沿用上次位置。
+        // **组段内单调过滤**（跟打器类异步布局应用的跳动终结者）：
+        // 正向打字（编码不减）时光标只应右移/不动——x 拒绝回退值
+        //（旧布局查询结果比当前光标靠左）、y 锁定到「换行级」变化
+        //（>26px 才认）——上下逐键摆动在构造上不可能发生。退格/新
+        // 组段（编码变短）放行全部变化。
         unsafe {
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let sh = GetSystemMetrics(SM_CYSCREEN);
+            let grew = raw.len() >= self.last_raw_len;
+            self.last_raw_len = raw.len();
             let (x, y) = match anchor {
                 Some(r) => {
                     let x = (r.left).clamp(0, (sw - width as i32).max(0));
@@ -852,30 +917,36 @@ impl CandidateWindowV2 {
                     } else {
                         (r.top - height as i32 - 4).max(0)
                     };
-                    // 2px 迟滞：亚像素取整误差/回流微动不搬窗（≥3px 真实移动才跟）
-                    let (x, y) = match self.sticky_pos {
-                        Some((ox, oy))
-                            if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 =>
-                        {
-                            (ox, oy)
+                    match self.sticky_pos {
+                        Some((ox, oy)) => {
+                            // x：正向打字拒绝回退（旧布局值）
+                            let x = if grew && x < ox - 2 { ox } else { x };
+                            // y：正向打字只认换行级变化（行高 ~29px，阈值 26）
+                            let y = if grew && (y - oy).abs() <= 26 { oy } else { y };
+                            // 2px 迟滞：亚像素取整误差/回流微动不搬窗
+                            if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 {
+                                (ox, oy)
+                            } else {
+                                (x, y)
+                            }
                         }
-                        _ => (x, y),
-                    };
-                    self.sticky_pos = Some((x, y));
-                    (x, y)
+                        None => (x, y),
+                    }
                 }
                 None => match self.sticky_pos {
                     Some(p) => p,
                     None => ((sw - width as i32) / 2, sh * 2 / 3),
                 },
             };
+            self.sticky_pos = Some((x, y));
+            // 内容坐标 → 窗口坐标（内容在阴影边距内侧）
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                x,
-                y,
-                width as i32,
-                height as i32,
+                x - shadow_m as i32,
+                y - shadow_m as i32,
+                w_out as i32,
+                h_out as i32,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             crate::tsf::trace(&format!(
