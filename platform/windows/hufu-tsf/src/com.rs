@@ -104,6 +104,43 @@ fn reg_set(subkey: &str, name: Option<&str>, value: &str) -> WIN32_ERROR {
     }
 }
 
+/// 写 REG_DWORD（Win+Space 切换器的 IconIndex 即此类型：索引 TIP 服务器 DLL
+/// 内嵌图标资源；实测系统输入法全部用 IconIndex 而非 Icon 字符串）。
+fn reg_set_dword(subkey: &str, name: &str, value: u32) -> WIN32_ERROR {
+    unsafe {
+        let mut hkey = HKEY::default();
+        let sk: Vec<u16> = subkey.encode_utf16().chain([0]).collect();
+        let r = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sk.as_ptr()),
+            0,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if r != WIN32_ERROR(0) {
+            return r;
+        }
+        let (vn, ptr) = {
+            let v: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let p = v.as_ptr();
+            (v, p)
+        };
+        let r = RegSetValueExW(
+            hkey,
+            PCWSTR(ptr),
+            0,
+            REG_DWORD,
+            Some(&value.to_le_bytes()),
+        );
+        let _ = RegCloseKey(hkey);
+        r
+    }
+}
+
 fn reg_del_tree(subkey: &str) -> WIN32_ERROR {
     unsafe {
         let sk: Vec<u16> = subkey.encode_utf16().chain([0]).collect();
@@ -141,9 +178,11 @@ pub fn register_server() -> HRESULT {
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
     let _ = reg_set(&lp, Some("Enable"), "1");
-    // Win+Space / 语言栏图标：DLL 内嵌虎爪资源（索引 0）。
-    // 此前写 "hufu-server.exe,0" 相对路径解析不到 → 永远显示系统默认图标
-    let _ = reg_set(&lp, Some("Icon"), &format!("{},0", self_path()));
+    // Win+Space 切换器图标：IconIndex(DWORD) 索引本 DLL 内嵌虎爪资源（索引 0）。
+    // 实测系统输入法（微拼等）LanguageProfile 全部只写 IconIndex、Icon 留空——
+    // 切换器不读 Icon 字符串（旧写法 "exe,0" 因此从未生效）。
+    let _ = reg_set_dword(&lp, "IconIndex", 0);
+    let _ = reg_set(&lp, Some("Icon"), "");
     HRESULT(0)
 }
 

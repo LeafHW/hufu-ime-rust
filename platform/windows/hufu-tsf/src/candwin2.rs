@@ -136,6 +136,8 @@ pub struct CandidateWindowV2 {
     pub(crate) last_pixels: Option<Vec<u8>>,
     /// 诊断：最近一次渲染的光学垂直位移（readback 模式填充）
     pub(crate) last_dy: Option<f32>,
+    /// 诊断：readback 像素尺寸
+    pub(crate) last_size: (u32, u32),
 }
 
 impl CandidateWindowV2 {
@@ -227,6 +229,7 @@ impl CandidateWindowV2 {
                 readback: false,
                 last_pixels: None,
                 last_dy: None,
+                last_size: (0, 0),
                 size: (0, 0),
             })
         }
@@ -814,6 +817,7 @@ impl CandidateWindowV2 {
                                         let _ = cpu.Unmap();
                                         self.last_pixels = Some(data);
                                         self.last_dy = Some(dy);
+                                        self.last_size = (w_px, h_px);
                                     }
                                 }
                             }

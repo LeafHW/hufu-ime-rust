@@ -234,6 +234,13 @@ fn main() {
         // ── 引擎链直驱：hufu_test_key VK→管道→hufu-server→consumed ──
         let tk: TestKeyFn =
             std::mem::transmute(GetProcAddress(hmod, PCSTR(b"hufu_test_key\0".as_ptr())).unwrap());
+        // 前置重置：真实应用的 Shift 会把全局会话切成英文态污染断言
+        type ResetFn = unsafe extern "system" fn() -> i32;
+        if let Some(p) = GetProcAddress(hmod, PCSTR(b"hufu_test_reset\0".as_ptr())) {
+            let rst: ResetFn = std::mem::transmute(p);
+            let r = unsafe { rst() };
+            println!("[pre] hufu_test_reset = {r}（会话归零回中文态）");
+        }
 
         let _ = tk(0x1B);
         let _ = tk(0x1B);
@@ -287,6 +294,14 @@ fn main() {
         let r = unsafe { sh() };
         assert_eq!(r, 1, "皮肤 A/B 两帧像素应显著不同（热更新失效）");
         println!("[13] 皮肤热更新像素 E2E ✓");
+
+        // ── [16] 当前皮肤（crystal 横排）内边距视觉落盘 ──
+        type PadDumpFn = unsafe extern "system" fn() -> i32;
+        if let Some(p) = GetProcAddress(hmod, PCSTR(b"hufu_test_pad_dump\0".as_ptr())) {
+            let pd: PadDumpFn = std::mem::transmute(p);
+            let r = unsafe { pd() };
+            println!("[16] 当前皮肤内边距落盘 = {r}（%TEMP%\\hufu-pad.bmp）");
+        }
 
         // ── [15] 横排真路径 E2E：设置皮肤(毛玻璃横排)→真实按键→窗口必须变宽扁 ──
         {
