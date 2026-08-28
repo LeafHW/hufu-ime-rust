@@ -78,7 +78,9 @@ fn main() {
         }
         return;
     }
-    let dll = r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll";
+    let dll = std::env::var("HUFU_TSF_DLL").unwrap_or_else(|_| {
+        r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll".into()
+    });
     let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
     unsafe {
         let hmod: HMODULE = LoadLibraryW(PCWSTR(wide.as_ptr())).unwrap();

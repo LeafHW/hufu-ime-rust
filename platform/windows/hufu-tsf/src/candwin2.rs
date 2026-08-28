@@ -295,6 +295,11 @@ impl CandidateWindowV2 {
     }
     /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。selected=高亮行（页内 0 起）。
     pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>, selected: usize) {
+        // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
+        let show_index = skin
+            .get("show_index")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
         let kind = material_kind(skin);
         let tint_hex = skin
             .pointer("/skin/material/tint")
@@ -310,11 +315,19 @@ impl CandidateWindowV2 {
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
         let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
-        let label_w = 26.0f32;
+        let label_w = if show_index { 26.0f32 } else { 0.0 };
         let em = font_pt * 96.0 / 72.0;
+        // 横排（skin.layout.horizontal）：候选单行横铺，weasel 式
+        let horizontal = skin
+            .pointer("/skin/layout/horizontal")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("horizontal")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let cand_spacing = layout_f(skin, "candidate_spacing", 6.0);
+        let hilite_pad = layout_f(skin, "hilite_padding", 4.0);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
-        let (tf, tf_label, tf_small, width, text_x, cmt_x, cmt_w) = unsafe {
+        let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
                 None => return,
@@ -379,11 +392,15 @@ impl CandidateWindowV2 {
             };
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
+            let mut cand_ws: Vec<(f32, f32)> = Vec::new();
             for (t, c) in cands {
-                max_text = max_text.max(measure(&tf, t));
+                let tw = measure(&tf, t);
+                let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c) };
+                max_text = max_text.max(tw);
                 if !c.is_empty() {
-                    max_cmt = max_cmt.max(measure(&tf_small, c));
+                    max_cmt = max_cmt.max(cw);
                 }
+                cand_ws.push((tw, cw));
             }
             // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
             // 例外：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽
@@ -392,28 +409,57 @@ impl CandidateWindowV2 {
             } else {
                 0.0
             };
-            // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
-            let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 6.0;
-            if max_cmt > 0.0 {
-                need += 6.0 + max_cmt;
-            }
-            let width = if width_cfg > 0.0 {
-                width_cfg
+            let (width, text_x, cmt_x, cmt_w) = if horizontal {
+                // 横排：Σ(标签+文本+注释+间隔)，几何在绘制期逐格推进
+                let mut w = margin_x * 2.0;
+                for (i, (tw, cw)) in cand_ws.iter().enumerate() {
+                    if i > 0 {
+                        w += cand_spacing;
+                    }
+                    w += label_w * 0.72 + tw + if *cw > 0.0 { 5.0 + cw } else { 0.0 };
+                }
+                let w = w.max(raw_w + margin_x * 2.0);
+                (w, 0.0, 0.0, 0.0)
             } else {
-                need.clamp(min_width, 300.0)
+                // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
+                let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 6.0;
+                if max_cmt > 0.0 {
+                    need += 6.0 + max_cmt;
+                }
+                let width = if width_cfg > 0.0 {
+                    width_cfg
+                } else {
+                    need.clamp(min_width, 300.0)
+                };
+                let text_x = margin_x + label_w;
+                let (cmt_x, cmt_w) = if max_cmt > 0.0 {
+                    (width - margin_x - max_cmt - 2.0, max_cmt + 2.0)
+                } else {
+                    (width, 0.0)
+                };
+                (width, text_x, cmt_x, cmt_w)
             };
-            let text_x = margin_x + label_w;
-            let (cmt_x, cmt_w) = if max_cmt > 0.0 {
-                (width - margin_x - max_cmt - 2.0, max_cmt + 2.0)
-            } else {
-                (width, 0.0)
-            };
-            (tf, tf_label, tf_small, width, text_x, cmt_x, cmt_w)
+            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w))
         };
+        let (v_width, text_x, cmt_x, cmt_w) = geo;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
         let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
-        let rows = cands.len().min(9) as f32 + code_row;
-        let height = margin_y * 2.0 + line_h * rows + 4.0;
+        let width = if horizontal {
+            // 横排固定宽配置同样生效；自适应保底 min_width
+            if width_cfg > 0.0 {
+                width_cfg.max(v_width)
+            } else {
+                v_width.max(min_width)
+            }
+        } else {
+            v_width
+        };
+        let height = if horizontal {
+            margin_y * 2.0 + line_h * (1.0 + code_row) + 4.0
+        } else {
+            let rows = cands.len().min(9) as f32 + code_row;
+            margin_y * 2.0 + (line_h + cand_spacing) * rows + 4.0
+        };
 
         let w = width as u32;
         let h = height as u32;
@@ -477,6 +523,7 @@ impl CandidateWindowV2 {
             let b_hi = mkbrush(&ctx, color_f(skin, "hilited_candidate_back_color", "#404046FF"));
             let b_hi_txt = mkbrush(&ctx, color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF"));
             let b_hi_lbl = mkbrush(&ctx, color_f(skin, "hilited_candidate_label_color", "#FFD75EFF"));
+            let b_hi_cmt = mkbrush(&ctx, color_f(skin, "hilited_comment_text_color", "#C9C9C9FF"));
             let b_border = mkbrush(&ctx, color_f(skin, "border_color", "#FFFFFF26"));
 
             let draw = |ctx: &ID2D1DeviceContext,
@@ -512,33 +559,80 @@ impl CandidateWindowV2 {
 
             // 候选行
             let sel = selected.min(cands.len().saturating_sub(1));
-            for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
-                let y = y0 + line_h * i as f32;
-                if i == sel {
-                    // 高亮行（圆角胶囊；↑↓ 移动）
-                    if let Some(b) = &b_hi {
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: margin_x - 4.0,
-                                top: y,
-                                right: width - margin_x + 4.0,
-                                bottom: y + line_h - 2.0,
-                            },
-                            radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
-                            radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
-                        };
-                        ctx.FillRoundedRectangle(&rr, b);
+            if horizontal {
+                // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
+                let mut x = margin_x;
+                let y = y0;
+                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                    let (tw, cw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0));
+                    let cell_w = label_w * 0.72 + tw + if cw > 0.0 { 5.0 + cw } else { 0.0 };
+                    if i > 0 {
+                        x += cand_spacing;
                     }
+                    if i == sel {
+                        if let Some(b) = &b_hi {
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: x - hilite_pad,
+                                    top: y,
+                                    right: x + cell_w + hilite_pad,
+                                    bottom: y + line_h - 2.0,
+                                },
+                                radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
+                                radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
+                            };
+                            ctx.FillRoundedRectangle(&rr, b);
+                        }
+                    }
+                    let (bt, bl, bc) = if i == sel {
+                        (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                    } else {
+                        (&b_text, &b_label, &b_cmt)
+                    };
+                    let mut cx = x;
+                    if show_index {
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y, label_w * 0.72, line_h, bl);
+                        cx += label_w * 0.72;
+                    }
+                    draw(&ctx, &tf, text, cx, y, tw + 2.0, line_h, bt);
+                    cx += tw + 2.0;
+                    if !cmt.is_empty() && cw > 0.0 {
+                        draw(&ctx, &tf_small, cmt, cx + 3.0, y + 2.0, cw + 2.0, line_h, bc);
+                    }
+                    x += cell_w;
                 }
-                let (bt, bl) = if i == sel {
-                    (&b_hi_txt, &b_hi_lbl)
-                } else {
-                    (&b_text, &b_label)
-                };
-                draw(&ctx, &tf_label, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
-                draw(&ctx, &tf, text, text_x, y, cmt_x - text_x - 4.0, line_h, bt);
-                if !cmt.is_empty() {
-                    draw(&ctx, &tf_small, cmt, cmt_x, y + 2.0, width - cmt_x - margin_x + 4.0, line_h, &b_cmt);
+            } else {
+                // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 外扩）──
+                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                    let y = y0 + (line_h + cand_spacing) * i as f32;
+                    if i == sel {
+                        // 高亮行（圆角胶囊；↑↓ 移动）
+                        if let Some(b) = &b_hi {
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: margin_x - 4.0 - hilite_pad,
+                                    top: y,
+                                    right: width - margin_x + 4.0 + hilite_pad,
+                                    bottom: y + line_h - 2.0,
+                                },
+                                radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
+                                radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
+                            };
+                            ctx.FillRoundedRectangle(&rr, b);
+                        }
+                    }
+                    let (bt, bl, bc) = if i == sel {
+                        (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                    } else {
+                        (&b_text, &b_label, &b_cmt)
+                    };
+                    if show_index {
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
+                    }
+                    draw(&ctx, &tf, text, text_x, y, cmt_x - text_x - 4.0, line_h, bt);
+                    if !cmt.is_empty() {
+                        draw(&ctx, &tf_small, cmt, cmt_x, y + 2.0, width - cmt_x - margin_x + 4.0, line_h, bc);
+                    }
                 }
             }
 

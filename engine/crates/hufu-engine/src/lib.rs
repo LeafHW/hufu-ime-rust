@@ -11,6 +11,7 @@ pub use punct::PairState;
 pub use session::{EarlyHistory, Session};
 
 use hufu_config::Config;
+use hufu_dict::annotation::ReverseTable;
 use hufu_dict::entry::DictEntry;
 use hufu_dict::schema::Schema;
 use hufu_types::{
@@ -269,7 +270,9 @@ impl Engine {
     pub fn new(data_dir: &Path, config: Config) -> std::io::Result<Engine> {
         let dict_root = data_dir.join(&config.schema.dir);
         let current = dict_root.join(&config.schema.current);
-        let schema = Schema::load(&current)?;
+        let mut schema = Schema::load(&current)?;
+        let rev_name = config.reverse.table.trim().to_string();
+        let rev_dir = schema.dir.clone();
         let mut schemas = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dict_root) {
             for e in rd.flatten() {
@@ -280,7 +283,7 @@ impl Engine {
                 }
             }
         }
-        Ok(Engine {
+        let mut engine = Engine {
             config,
             schema,
             schemas,
@@ -291,15 +294,28 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
-        })
+        };
+        // 反查表覆盖（config.reverse.table）
+        if !rev_name.is_empty() {
+            let p = rev_dir.join(&rev_name);
+            if p.exists() {
+                if let Ok(rt) = ReverseTable::load(&p) {
+                    engine.schema.reverse = Some(rt);
+                }
+            }
+        }
+        Ok(engine)
     }
 
     /// 直接从方案目录构建引擎（CLI / 测试用，无 dictionaries/ 包装）。
     pub fn with_schema_dir(schema_dir: &Path, config: Config) -> std::io::Result<Engine> {
-        let schema = Schema::load(schema_dir)?;
-        Ok(Engine {
+        let mut schema = Schema::load(schema_dir)?;
+        let rev_dir = schema.dir.clone();
+        let rev_name = config.reverse.table.trim().to_string();
+        let name = schema.name.clone();
+        let mut engine = Engine {
             config,
-            schemas: vec![schema.name.clone()],
+            schemas: vec![name],
             data_dir: schema_dir
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -311,7 +327,16 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
-        })
+        };
+        if !rev_name.is_empty() {
+            let p = rev_dir.join(&rev_name);
+            if p.exists() {
+                if let Ok(rt) = ReverseTable::load(&p) {
+                    engine.schema.reverse = Some(rt);
+                }
+            }
+        }
+        Ok(engine)
     }
 
     /// 注入整句解码器。
@@ -323,10 +348,28 @@ impl Engine {
         self.sentence.as_ref()
     }
 
+    /// 反查表覆盖：config.reverse.table 指定方案目录内文件名时优先加载
+    /// （未指定或加载失败 → 保持按文件名含「反查」的自动探测结果）。
+    fn apply_reverse_override(&self, schema: &mut Schema) {
+        let name = self.config.reverse.table.trim();
+        if name.is_empty() {
+            return;
+        }
+        let p = schema.dir.join(name);
+        if p.exists() {
+            match ReverseTable::load(&p) {
+                Ok(rt) => schema.reverse = Some(rt),
+                Err(e) => eprintln!("反查表 {name} 加载失败（沿用自动探测）: {e}"),
+            }
+        }
+    }
+
     /// 切换方案。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
         let dir = self.data_dir.join(&self.config.schema.dir).join(name);
-        self.schema = Schema::load(&dir)?;
+        let mut schema = Schema::load(&dir)?;
+        self.apply_reverse_override(&mut schema);
+        self.schema = schema;
         self.config.schema.current = name.to_string();
         Ok(())
     }
@@ -1284,10 +1327,28 @@ impl Engine {
         }
     }
 
-    /// 用户学习：自动调频。
+    /// 用户学习：自动调频 + 可选调整日志（user-adjust.log，log_adjust=true 时记录）。
     fn learn(&mut self, cand: &Candidate) {
         if self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
+        }
+        if self.config.user.log_adjust {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let line = format!(
+                "{secs}\t{}\t{}\t{:?}\n",
+                cand.code, cand.text, cand.source
+            );
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.data_dir.join("user-adjust.log"))
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(line.as_bytes())
+                });
         }
     }
 
@@ -1756,6 +1817,7 @@ impl Engine {
             ascii_punct: self.config.input.ascii_punct,
             reverse_mode: session.mode == InputMode::Reverse,
             show_code: self.config.input.show_code,
+            show_index: self.config.candidates.show_index,
         }
     }
 }

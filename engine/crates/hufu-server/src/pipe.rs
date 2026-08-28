@@ -46,9 +46,17 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
             let p = host.skins_dir().join(format!("{id}.json"));
+            let show_index = host.engine.config.candidates.show_index;
+            let delay_show_ms = host.engine.config.candidates.delay_show_ms;
             match hufu_skin::Skin::load(&p) {
-                Ok(s) => serde_json::json!({"skin": s}),
-                Err(_) => serde_json::json!({"skin": hufu_skin::Skin::default()}),
+                Ok(s) => {
+                    serde_json::json!({"skin": s, "show_index": show_index, "delay_show_ms": delay_show_ms})
+                }
+                Err(_) => serde_json::json!({
+                    "skin": hufu_skin::Skin::default(),
+                    "show_index": show_index,
+                    "delay_show_ms": delay_show_ms
+                }),
             }
         }
         "sound" => {

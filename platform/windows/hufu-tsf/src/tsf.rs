@@ -24,6 +24,12 @@ pub struct Shared {
     pub skin: serde_json::Value,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
+    /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
+    pub delay_show_ms: u32,
+    /// 上次 raw（变化检测）
+    pub raw_last: String,
+    /// raw 最近一次变化时刻
+    pub raw_changed_at: Option<std::time::Instant>,
     /// 插入点（屏幕坐标，GetTextExt 实测）
     pub caret: Option<RECT>,
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
@@ -42,6 +48,9 @@ impl Shared {
             cand: None,
             skin: serde_json::Value::Null,
             skin_stale: true,
+            delay_show_ms: 0,
+            raw_last: String::new(),
+            raw_changed_at: None,
             caret: None,
             chinese: true,
             composing: false,
@@ -53,6 +62,10 @@ impl Shared {
         // 下一次打字即生效（近热更新）
         if self.skin.is_null() || self.skin_stale {
             if let Some(v) = ipc::call(&serde_json::json!({"op": "skin"})) {
+                self.delay_show_ms = v
+                    .get("delay_show_ms")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
                 self.skin = v;
                 self.skin_stale = false;
             }
@@ -558,13 +571,23 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 /// 引擎结果 → 组段与候选窗更新。
 fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
     // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
-    let (op, has_ctx) = {
+    let (op, has_ctx, suppress_win) = {
         let mut g = shared.lock().unwrap();
         let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
         let preedit = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
         if raw.is_empty() {
             g.skin_stale = true;
         }
+        // raw 变化 → 记时刻（候选延时显示用）
+        if raw != g.raw_last {
+            g.raw_last = raw.to_string();
+            g.raw_changed_at = Some(std::time::Instant::now());
+        }
+        let suppress = g.delay_show_ms > 0
+            && !raw.is_empty()
+            && g
+                .raw_changed_at
+                .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms);
         if g.focus_context().is_none() {
             return Ok(());
         }
@@ -582,7 +605,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         } else {
             Some(Op::SetPreedit(preedit.to_string()))
         };
-        (op, true)
+        (op, true, suppress)
     };
     let _ = has_ctx;
     // 组段（锁已释放；DoEditSession 内部自行加锁）
@@ -632,6 +655,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 
     g.load_skin();
     if cands.is_empty() && raw.is_empty() {
+        if let Some(c) = g.cand2.as_ref() {
+            c.hide();
+        }
+        if let Some(c) = g.cand.take() {
+            c.hide();
+        }
+    } else if suppress_win {
+        // 候选延时窗口内：快速输入防闪烁，先不显示
         if let Some(c) = g.cand2.as_ref() {
             c.hide();
         }
