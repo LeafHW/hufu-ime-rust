@@ -297,14 +297,13 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="row">
           <div class="field"><label>效果</label>
             <select id="mat-kind">
-              <option value="frosted">毛玻璃磨砂（Acrylic / vibrancy）</option>
-              <option value="glass">玻璃（Mica / underWindow）</option>
-              <option value="translucent">半透明</option>
-              <option value="solid">纯色不透明</option>
+              <option value="translucent">半透明（推荐）</option>
+              <option value="glass">玻璃（更透）</option>
+              <option value="solid">纯色</option>
             </select></div>
           <div class="field"><label>窗口色调</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-tint"><input type="number" id="mat-tint-a" min="0" max="255" title="不透明度"></span></div>
+          <div class="field"><label>透明度 <span class="val" id="mat-op-v"></span></label><input type="range" id="mat-op" min="0" max="100"></div>
           <div class="field"><label>暗化 <span class="val" id="mat-darken-v"></span></label><input type="range" id="mat-darken" min="0" max="100"></div>
-          <div class="field"><label>噪点 <span class="val" id="mat-noise-v"></span></label><input type="range" id="mat-noise" min="0" max="100"></div>
           <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
           <div class="field"><label>边框色</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-bc"><input type="number" id="mat-bc-a" min="0" max="255"></span></div>
         </div>
@@ -591,9 +590,21 @@ function bindSkin() {
   pair("#mat-tint", "tint", "#mat-tint-a"); pair("#mat-bc", "border_color", "#mat-bc-a");
   const rng = (id, key, fmt) => { const el = $(id); el.value = SKIN.material[key]; $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(SKIN.material[key]) : SKIN.material[key]); el.oninput = () => { SKIN.material[key] = parseFloat(el.value); $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(el.value) : el.value); preview(); }; };
   rng("#mat-darken", "darken", v => (v / 100).toFixed(2)); $("#mat-darken").max = 100;
-  rng("#mat-noise", "noise", v => (v / 100).toFixed(2)); $("#mat-noise").max = 100;
-  rng("#mat-bw", "border_width");
   const saveSkinQuiet = async () => { try { await api("POST", "/api/skin", SKIN); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
+  // 透明度：滑条 0-100 ↔ 存储 0-1（0=全透明 1=不透明），改动即存
+  if (SKIN.material.opacity == null) SKIN.material.opacity = 1;
+  {
+    const op = $("#mat-op");
+    op.value = Math.round(SKIN.material.opacity * 100);
+    $("#mat-op-v").textContent = op.value + "%";
+    op.oninput = () => {
+      SKIN.material.opacity = op.value / 100;
+      $("#mat-op-v").textContent = op.value + "%";
+      preview();
+    };
+    op.onchange = saveSkinQuiet;
+  }
+  rng("#mat-bw", "border_width");
   $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
   $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); }; };
@@ -622,20 +633,34 @@ function bindSkin() {
 function preview() {
   const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
   const w = $("#candwin-preview");
-  w.className = "candwin" + (L.horizontal ? " horizontal" : "");
-  const bg = c.back_color, border = M.border_width > 0 ? `${M.border_width}px solid ${M.border_color}` : `${L.border_width || 1}px solid ${c.border_color}`;
-  let backdrop = "", bgc = bg;
-  if (M.kind === "frosted") backdrop = "blur(14px) saturate(1.5)";
-  else if (M.kind === "glass") backdrop = "blur(22px) saturate(1.8) brightness(1.06)";
-  else if (M.kind === "translucent") backdrop = "none";
+  w.className = "preview-wrap";
+  const border = M.border_width > 0 ? `${M.border_width}px solid ${M.border_color}` : `${L.border_width || 1}px solid ${c.border_color}`;
+  // 透明感知预览：alpha 语义与真实候选窗一致（material.opacity × 底色 alpha）
+  //   solid → back_color；其余 → material.tint（乘 kind 系数）
+  const hexA = (hex, mul) => {
+    const m = /^#?([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?$/.exec(hex || "");
+    if (!m) return hex;
+    const a = Math.round((parseInt(m[2] || "ff", 16) / 255) * mul);
+    return `#${m[1]}${a.toString(16).padStart(2, "0")}`;
+  };
+  const op = Math.max(0, Math.min(1, M.opacity ?? 1));
+  const kindK = M.kind === "glass" ? 0.55 : (M.kind === "solid" ? 1 : 0.85);
+  const bgc = M.kind === "solid" ? hexA(c.back_color, op) : hexA(M.tint, op * kindK);
   const darken = M.darken > 0 ? `linear-gradient(rgba(0,0,0,${M.darken / 100 * 0.35}),rgba(0,0,0,${M.darken / 100 * 0.35})),` : "";
-  w.style.cssText = `background:${darken}${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${c.shadow_color};padding:${L.margin_y}px ${L.margin_x}px;backdrop-filter:${backdrop};-webkit-backdrop-filter:${backdrop};gap:${L.candidate_spacing}px`;
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${c.hilited_candidate_back_color};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding / 2}px ${L.hilite_padding}px;` : `padding:${L.hilite_padding / 2}px 1px;`}color:${hi ? c.hilited_candidate_text_color : c.candidate_text_color}"><span class="idx" style="color:${hi ? c.hilited_candidate_label_color : c.label_color}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${hi ? c.hilited_comment_text_color : c.comment_text_color}">${cmt}</span>` : ""}</div>`;
-  w.innerHTML =
+  // 棋盘格底透出透明度；四角真实透明（pre 视觉≈真窗圆角）
+  const checker = "repeating-conic-gradient(#3a3a40 0% 25%, #2b2b30 0% 50%) 0 0/14px 14px";
+  w.style.cssText = `background:${checker};border:none;padding:0`;
+  const inner = document.createElement("div");
+  w.innerHTML = "";
+  inner.className = "candwin" + (L.horizontal ? " horizontal" : "");
+  inner.style.cssText = `background:${darken}${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${c.shadow_color};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${c.hilited_candidate_back_color};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${hi ? c.hilited_candidate_text_color : c.candidate_text_color}"><span class="idx" style="color:${hi ? c.hilited_candidate_label_color : c.label_color}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${hi ? c.hilited_comment_text_color : c.comment_text_color}">${cmt}</span>` : ""}</div>`;
+  inner.innerHTML =
     `<div class="preedit-line" style="color:${c.text_color};background:${c.preedit_back_color};border-radius:4px"><span style="opacity:.6">tuj</span>a</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
-  const names = { frosted: "毛玻璃 Acrylic（Win）/ vibrancy（mac）", glass: "玻璃 Mica / underWindowBackground", translucent: "半透明（不模糊）", solid: "纯色不透明" };
-  $("#material-note").textContent = names[M.kind] + (M.noise > 0 ? ` · 噪点 ${(M.noise / 100).toFixed(2)}` : "");
+  w.appendChild(inner);
+  const names = { frosted: "半透明（旧名毛玻璃，无模糊）", glass: "玻璃（轻透明）", translucent: "半透明（不模糊）", solid: "纯色" };
+  $("#material-note").textContent = `${names[M.kind] || M.kind} · 透明度 ${(Math.round((1 - op) * 100))}%`;
 }
 async function loadSkinList(sel) {
   const r = await api("GET", "/api/skins");
@@ -647,6 +672,8 @@ async function loadSkinList(sel) {
 async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
   bindSkin(); buildColorGrid(); preview();
+  // 选中即切换为当前皮肤（select 端点不写皮肤文件，避免覆盖）
+  try { await api("POST", "/api/skin/select", { id }); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
 }
 
 /* ── 用户词 ── */

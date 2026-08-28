@@ -81,9 +81,11 @@ pub struct MaterialConfig {
     pub kind: Material,
     /// 背景色与不透明度（translucent/frosted 时作 tint）
     pub tint: Color,
+    /// 整体透明度（0=全透明 1=不透明，作用于候选窗底色）
+    pub opacity: f32,
     /// 磨砂暗化修正
     pub darken: f32,
-    /// 噪点强度（0–1，磨砂质感）
+    /// 噪点强度（0–1，磨砂质感；已弃用，保留兼容旧皮肤）
     pub noise: f32,
     /// 玻璃边框宽度（px）
     pub border_width: f32,
@@ -96,8 +98,9 @@ impl Default for MaterialConfig {
         MaterialConfig {
             kind: Material::Frosted,
             tint: Color([28, 28, 30, 0xCC]),
+            opacity: 1.0,
             darken: 0.0,
-            noise: 0.03,
+            noise: 0.0,
             border_width: 1.0,
             border_color: Color([255, 255, 255, 0x33]),
         }

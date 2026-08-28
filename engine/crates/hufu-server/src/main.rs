@@ -169,6 +169,26 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 }
             }
         }
+        ("POST", "/api/skin/select") => {
+            // 仅切换当前皮肤：不写皮肤文件（POST /api/skin 是「保存」语义，
+            // 误发 {id:...} 会把目标皮肤覆盖成全默认——曾经的静默毁档事故）
+            let id = req
+                .json()
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let p = host.skins_dir().join(format!("{id}.json"));
+            if !p.exists() {
+                return Response::err(404, &format!("皮肤 {id} 不存在"));
+            }
+            host.engine.config.appearance.skin = id.clone();
+            let _ = host.engine.config.save(&host.config_path);
+            Response::json(&serde_json::json!({"ok": true, "id": id}))
+        }
         ("POST", "/api/skin") => {
             let v = req.json();
             let skin: hufu_skin::Skin = match serde_json::from_value(v) {

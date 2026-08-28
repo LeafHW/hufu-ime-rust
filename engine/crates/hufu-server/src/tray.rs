@@ -72,10 +72,10 @@ fn make_hu_icon() -> isize {
     ];
     let claw_w = 1.9f32; // 半宽
     let r = 7.5f32; // 圆角半径
+    let half = 14.0f32; // 半边长（28×28 占 32 画布，留 2px 边距）
     let bg = [0.105, 0.105, 0.118f32]; // #1B1B1E
     let fg = [0.96, 0.96, 0.97f32]; // #F5F5F7
     let mut buf = vec![0u8; S * S * 4]; // 预乘 BGRA
-    let mut mask = vec![0u8; S * S * 4]; // AND 位图（32bpp 对齐，全 0=不遮）
     for y in 0..S {
         for x in 0..S {
             // 4×4 超采样
@@ -85,10 +85,11 @@ fn make_hu_icon() -> isize {
                 for sx in 0..SS {
                     let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
                     let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    // 圆角方形覆盖
-                    let dx = (px - 16.0).abs().max(0.0) - (16.0 - r);
-                    let dy = (py - 16.0).abs().max(0.0) - (16.0 - r);
-                    if dx.max(dy) <= 0.0 {
+                    // 圆角方形 SDF：q = |p-c|-(half-r)，d = hypot(max(q,0)) ≤ r 为内部
+                    let qx = (px - 16.0).abs() - (half - r);
+                    let qy = (py - 16.0).abs() - (half - r);
+                    let d = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
+                    if d <= r {
                         cov_bg += 1;
                         // 爪痕：任一线段距离 ≤ 半宽
                         for ((x0, y0), (x1, y1)) in claws {
@@ -144,16 +145,22 @@ fn make_hu_icon() -> isize {
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
         let hcolor = CreateDIBSection(hdc, &bi, 0, &mut bits, 0, 0);
+        // 掩码必须是 1bpp 单色位图（传 32bpp 会让 CreateIconIndirect 失败 → 图标退回默认）
+        let mut mbi = bi;
+        mbi.bmiHeader.biBitCount = 1;
         let mut mbits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hmask = CreateDIBSection(hdc, &bi, 0, &mut mbits, 0, 0);
+        let hmask = CreateDIBSection(hdc, &mbi, 0, &mut mbits, 0, 0);
         if hcolor == 0 || hmask == 0 || bits.is_null() || mbits.is_null() {
             if hcolor != 0 { let _ = DeleteObject(hcolor); }
             if hmask != 0 { let _ = DeleteObject(hmask); }
             let _ = DeleteDC(hdc);
+            eprintln!("托盘图标位图创建失败");
             return 0;
         }
         std::ptr::copy_nonoverlapping(buf.as_ptr(), bits as *mut u8, buf.len());
-        std::ptr::copy_nonoverlapping(mask.as_ptr(), mbits as *mut u8, mask.len());
+        // 1bpp 行按 32 位对齐（32px → 4 字节/行），全 0 = 不遮任何像素（alpha 全权）
+        let stride_bytes = ((S + 31) / 32) * 4;
+        std::ptr::write_bytes(mbits as *mut u8, 0, stride_bytes * S);
         let ii = ICONINFO {
             fIcon: 1,
             xHotspot: 0,
@@ -162,6 +169,9 @@ fn make_hu_icon() -> isize {
             hbmColor: hcolor,
         };
         let hicon = CreateIconIndirect(&ii);
+        if hicon == 0 {
+            eprintln!("CreateIconIndirect 失败");
+        }
         // ICONINFO 文档：位图所有权归系统，不删；DC 可删
         let _ = DeleteDC(hdc);
         hicon
@@ -309,6 +319,14 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
     let t: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
     tip[..t.len()].copy_from_slice(&t);
     let hicon = make_hu_icon();
+    let hicon = if hicon != 0 {
+        hicon
+    } else {
+        // 兜底：系统默认图标，至少可见
+        unsafe {
+            LoadImageW(0, 32512 as *const u16, 1, 0, 0, 0x8000)
+        }
+    };
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
