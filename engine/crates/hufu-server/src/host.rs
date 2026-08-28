@@ -5,12 +5,23 @@ use hufu_engine::{Engine, Session};
 use hufu_sentence::SentenceEngine;
 use hufu_types::{KeyCode, KeyInput, Modifiers};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+/// 重排任务：key=committed_raw+raw（结果只对同 key 生效）
+struct RerankJob {
+    key: String,
+    ctx: String,
+    cands: Vec<String>,
+}
 
 pub struct Host {
     pub engine: Engine,
     pub session: Session,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
+    /// 神经重排：任务发送端（None=未启用/模型缺失）
+    rerank_tx: Option<mpsc::Sender<RerankJob>>,
 }
 
 impl Host {
@@ -27,8 +38,10 @@ impl Host {
             session: Session::new(true),
             data_dir: data_dir.to_path_buf(),
             config_path,
+            rerank_tx: None,
         };
         host.setup_sentence();
+        host.setup_rerank();
         Ok(host)
     }
 
@@ -53,6 +66,105 @@ impl Host {
         self.engine.set_sentence_decoder(None);
     }
 
+    /// 模型路径解析：配置值（相对→数据目录）→ 数据目录 models/ 自动探测。
+    fn resolve_rerank_model(&self) -> Option<PathBuf> {
+        let cfg = &self.engine.config.sentence.rerank;
+        if !cfg.enabled {
+            return None;
+        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let p = PathBuf::from(&cfg.model_path);
+        if p.is_absolute() {
+            candidates.push(p);
+        } else if !cfg.model_path.is_empty() {
+            candidates.push(self.data_dir.join(&cfg.model_path));
+        }
+        // 自动探测：数据目录 models 下任意 .gguf（排除 ngram bin）
+        if let Ok(rd) = std::fs::read_dir(self.data_dir.join("models")) {
+            let mut ggufs: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false))
+                .collect();
+            ggufs.sort();
+            candidates.extend(ggufs);
+        }
+        candidates.into_iter().find(|p| p.exists())
+    }
+
+    /// 装配神经重排工作线程（旧线程随发送端 Drop 退出）。
+    pub fn setup_rerank(&mut self) {
+        // 关旧：Drop Sender 使 recv 返回 Err → 线程自然退出
+        self.rerank_tx = None;
+        let Some(model) = self.resolve_rerank_model() else {
+            eprintln!("神经重排：未启用或模型缺失");
+            return;
+        };
+        let debounce = self.engine.config.sentence.rerank.debounce_ms;
+        let cache = self.engine.rerank_cache.clone();
+        let model_path = model.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel::<RerankJob>();
+        std::thread::Builder::new()
+            .name("hufu-rerank".into())
+            .spawn(move || {
+                let mut model: Option<hufu_rerank::Reranker> = None;
+                let mut model_failed = false;
+                while let Ok(job) = rx.recv() {
+                    if model_failed {
+                        continue;
+                    }
+                    // 去抖：停顿期间新任务覆盖旧任务
+                    std::thread::sleep(std::time::Duration::from_millis(debounce));
+                    let mut cur = job;
+                    while let Ok(j) = rx.try_recv() {
+                        cur = j;
+                    }
+                    if cur.cands.len() < 2 {
+                        continue;
+                    }
+                    if model.is_none() {
+                        match hufu_rerank::Reranker::load(&model_path) {
+                            Ok(r) => {
+                                eprintln!("神经重排模型已加载: {model_path}");
+                                model = Some(r);
+                            }
+                            Err(e) => {
+                                eprintln!("神经重排模型加载失败（本进程内禁用）: {e}");
+                                model_failed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(r) = &model else { continue };
+                    let scores = r.score(&cur.ctx, &cur.cands);
+                    let mut order: Vec<(f64, String)> = scores
+                        .into_iter()
+                        .zip(cur.cands.iter().cloned())
+                        .collect();
+                    order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
+                    eprintln!("神经重排完成 key={} → [{}]", cur.key, texts.join(" "));
+                    if let Ok(mut c) = cache.lock() {
+                        if c.len() > 64 {
+                            c.clear();
+                        }
+                        c.insert(cur.key, texts);
+                    }
+                }
+            })
+            .ok();
+        eprintln!("神经重排线程就绪（模型 {}，去抖 {debounce}ms）", model.display());
+        self.rerank_tx = Some(tx);
+    }
+
+    /// 输入法操作后钩子：有整句候选时派发重排任务（非阻塞）。
+    pub fn after_ime_op(&mut self) {
+        let Some(tx) = &self.rerank_tx else { return };
+        if let Some((key, ctx, cands)) = self.engine.rerank_request(&self.session) {
+            let _ = tx.send(RerankJob { key, ctx, cands });
+        }
+    }
+
     /// 按键 → (结果, 状态快照)。
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
         let outcome = self.engine.process_key(&mut self.session, key);
@@ -60,9 +172,10 @@ impl Host {
         serde_json::json!({ "outcome": outcome, "state": state })
     }
 
-    /// 应用新配置：落盘 + 热更新 + 必要时重装整句。
+    /// 应用新配置：落盘 + 热更新 + 必要时重装整句/重排。
     pub fn apply_config(&mut self, cfg: Config) -> std::io::Result<()> {
         let sentence_changed = cfg.sentence != self.engine.config.sentence;
+        let rerank_changed = sentence_changed;
         let schema_changed = cfg.schema.current != self.engine.config.schema.current
             || cfg.schema.dir != self.engine.config.schema.dir;
         cfg.save(&self.config_path)?;
@@ -76,6 +189,9 @@ impl Host {
         }
         if sentence_changed || schema_changed {
             self.setup_sentence();
+        }
+        if rerank_changed {
+            self.setup_rerank();
         }
         Ok(())
     }
@@ -151,3 +267,6 @@ pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
         is_press: true,
     })
 }
+
+/// 供管道线程共享的宿主句柄。
+pub type SharedHost = Arc<Mutex<Host>>;

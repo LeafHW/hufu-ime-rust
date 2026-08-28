@@ -9,7 +9,10 @@ members = [
     "crates/hufu-skin",
     "crates/hufu-server",
     "crates/hufu-cli",
+    "crates/hufu-rerank",
 ]
+# rerank-sidecar 是独立 MSVC 工程（candle 依赖需 dlltool/msvc），不入 GNU 工作区
+exclude = ["rerank-sidecar"]
 
 [workspace.package]
 version = "0.1.0"

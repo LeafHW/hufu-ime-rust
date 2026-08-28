@@ -269,21 +269,25 @@ impl Default for SentenceSection {
 #[serde(default)]
 pub struct RerankSection {
     pub enabled: bool,
-    /// llama.cpp 服务地址（本地子进程或 url）
-    pub endpoint: String,
+    /// 神经重排模型（用户数据目录相对路径或绝对路径；留空自动探测）
     pub model_path: String,
     /// 重排候选数
     pub top_k: usize,
+    /// 去抖毫秒（停顿后才开始打分）
+    pub debounce_ms: u64,
+    /// 兼容保留（llama.cpp 子进程时代字段，现无用）
+    pub endpoint: String,
     pub timeout_ms: u64,
 }
 
 impl Default for RerankSection {
     fn default() -> Self {
         RerankSection {
-            enabled: false,
-            endpoint: "127.0.0.1:0".into(),
+            enabled: true,
             model_path: "models/sentence-qwen-q8.gguf".into(),
             top_k: 5,
+            debounce_ms: 350,
+            endpoint: "127.0.0.1:0".into(),
             timeout_ms: 500,
         }
     }

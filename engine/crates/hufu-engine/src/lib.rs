@@ -254,6 +254,9 @@ pub struct Engine {
     /// 用户数据目录
     pub data_dir: PathBuf,
     sentence: Option<Arc<dyn SentenceDecoder>>,
+    /// 神经重排结果缓存：key=committed_raw+raw → 有序候选文本
+    /// Arc 共享给 server 重排线程写入
+    pub rerank_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
     /// 单次按键内的提示音标签提示（select/page 覆盖默认 key/commit）
     sound_hint: Option<&'static str>,
     /// OpenCC 转换表（opencc.enabled 时懒加载）
@@ -283,6 +286,7 @@ impl Engine {
             schemas,
             data_dir: data_dir.to_path_buf(),
             sentence: None,
+            rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sound_hint: None,
             opencc: None,
             opencc_emoji: None,
@@ -302,6 +306,7 @@ impl Engine {
                 .to_path_buf(),
             schema,
             sentence: None,
+            rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sound_hint: None,
             opencc: None,
             opencc_emoji: None,
@@ -357,6 +362,9 @@ impl Engine {
             return KeyOutcome::passthrough();
         }
         self.sound_hint = None;
+        // 神经重排结果已到（停顿期间异步算完）→ 先应用再处理本键，
+        // 空格/选重等不改变 raw 的操作即拿到新顺序
+        self.apply_rerank(session);
         let mut out = self.process_key_inner(session, key);
         // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
         if self.config.sound.enabled && out.consumed {
@@ -1285,6 +1293,78 @@ impl Engine {
 
     /// 重建候选列表（含整句模式切换）。
     /// 整句候选显示：全上下文解码（committed ++ live），只显示已提交文本之后的剩余。
+    /// 组一个重排请求：(key, 前文, 前 top_k 个整句候选文本)。
+    /// 无整句候选或候选不足 2 时返回 None。
+    pub fn rerank_request(
+        &self,
+        session: &Session,
+    ) -> Option<(String, String, Vec<String>)> {
+        if !self.config.sentence.rerank.enabled {
+            return None;
+        }
+        if session.raw.is_empty() {
+            return None;
+        }
+        let key = format!("{}{}", session.committed_raw, session.raw);
+        let top = self.config.sentence.rerank.top_k.max(2);
+        let texts: Vec<String> = session
+            .candidates
+            .iter()
+            .filter(|c| c.source == CandidateKind::Sentence)
+            .take(top)
+            .map(|c| c.text.clone())
+            .collect();
+        if texts.len() < 2 {
+            return None;
+        }
+        Some((key, session.committed_text.clone(), texts))
+    }
+
+    /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
+    fn apply_rerank(&self, session: &mut Session) {
+        if session.candidates.is_empty() {
+            return;
+        }
+        let cache = match self.rerank_cache.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if cache.is_empty() {
+            return;
+        }
+        let key = format!("{}{}", session.committed_raw, session.raw);
+        let Some(order) = cache.get(&key) else {
+            return;
+        };
+        let rank: std::collections::HashMap<&String, usize> =
+            order.iter().enumerate().map(|(i, t)| (t, i)).collect();
+        // 只重排 Sentence 类子序列，其他类候选位置不动
+        let mut idxs: Vec<usize> = Vec::new();
+        for (i, c) in session.candidates.iter().enumerate() {
+            if c.source == CandidateKind::Sentence {
+                idxs.push(i);
+            }
+        }
+        if idxs.len() < 2 {
+            return;
+        }
+        let mut sorted: Vec<usize> = idxs.clone();
+        sorted.sort_by_key(|&i| {
+            let t = &session.candidates[i].text;
+            rank.get(t).copied().unwrap_or(usize::MAX)
+        });
+        if sorted == idxs {
+            return;
+        }
+        let subs: Vec<Candidate> = sorted
+            .iter()
+            .map(|&i| session.candidates[i].clone())
+            .collect();
+        for (slot, cand) in idxs.into_iter().zip(subs) {
+            session.candidates[slot] = cand;
+        }
+    }
+
     fn sentence_candidates(
         &self,
         session: &Session,
@@ -1355,6 +1435,7 @@ impl Engine {
                 let cands = self.sentence_candidates(session, dec.as_ref());
                 if !cands.is_empty() {
                     session.candidates = cands;
+                    self.apply_rerank(session);
                     return;
                 }
                 // 解码器无产物（如锁无法匹配任何段）：回退常规路径
@@ -1408,6 +1489,7 @@ impl Engine {
                         }
                         merged.truncate(20);
                         session.candidates = merged;
+                        self.apply_rerank(session);
                     }
                 }
             }
@@ -1420,6 +1502,7 @@ impl Engine {
                 let cands = self.sentence_candidates(session, dec.as_ref());
                 if !cands.is_empty() {
                     session.candidates = cands;
+                    self.apply_rerank(session);
                     return;
                 }
             }

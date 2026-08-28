@@ -15,5 +15,6 @@ hufu-config = { path = "../hufu-config" }
 hufu-engine = { path = "../hufu-engine" }
 hufu-sentence = { path = "../hufu-sentence" }
 hufu-skin = { path = "../hufu-skin" }
+hufu-rerank = { path = "../hufu-rerank" }
 serde = { workspace = true }
 serde_json = { workspace = true }

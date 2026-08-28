@@ -17,7 +17,11 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
     match req.get("op").and_then(|o| o.as_str()).unwrap_or("") {
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
         "key" => match parse_key(req) {
-            Some(k) => host.process_key(k),
+            Some(k) => {
+                let r = host.process_key(k);
+                host.after_ime_op(); // 神经重排派发（异步）
+                r
+            }
             None => serde_json::json!({"error": "按键描述无效"}),
         },
         "state" => {
