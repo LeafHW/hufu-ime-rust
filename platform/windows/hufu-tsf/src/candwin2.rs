@@ -122,7 +122,7 @@ fn material_kind(v: &Value) -> String {
 // ── 窗口本体 ──
 
 pub struct CandidateWindowV2 {
-    hwnd: HWND,
+    pub(crate) hwnd: HWND,
     ctx: Option<ID2D1DeviceContext>,
     swapchain: Option<IDXGISwapChain1>,
     dcomp: Option<IDCompositionDevice>,

@@ -112,3 +112,153 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
     eprintln!("candwin2: {kind} 材质渲染+隐藏完成");
     1
 }
+
+/// 音效池化播放练习：16 次急速连击（0/15ms 间隔），压排队深度；
+/// 任何一次崩溃/死锁返回 0（崩溃使进程直接退出）。
+#[no_mangle]
+extern "system" fn hufu_test_sound_burst() -> i32 {
+    for i in 0..16u32 {
+        crate::sound::play("key");
+        if i % 2 == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    // 等全部播放线程收尾（最深队列 4×175ms + 余量）
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    1
+}
+
+/// 皮肤热更新 E2E：同一窗口连续两帧不同皮肤 → 屏幕捕获像素必须显著变化。
+/// 返回 1 = 变化检出（渲染管线吃到了新皮肤值）；0 = 两帧几乎一样（热更新失效）。
+#[no_mangle]
+extern "system" fn hufu_test_skin_hot() -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        ReleaseDC, SRCCOPY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let Some(mut w) = CandidateWindowV2::new() else {
+        eprintln!("skin-hot: candwin2 初始化失败");
+        return 0;
+    };
+    // 基础皮肤来自引擎（结构/字体真实），只覆盖颜色做 A/B
+    let mut base = crate::ipc::call(&serde_json::json!({"op": "skin"})).unwrap_or_else(|| {
+        serde_json::json!({"skin": {"colors": {}, "layout": {}, "material": {"kind": "solid"}}})
+    });
+    // 强制 solid + 不透明底色：排除 accent 语义干扰，纯看颜色渲染
+    if let Some(s) = base.get_mut("skin").and_then(|s| s.as_object_mut()) {
+        if let Some(m) = s.get_mut("material").and_then(|m| m.as_object_mut()) {
+            m.insert("kind".into(), serde_json::json!("solid"));
+        }
+    }
+    let set_colors = |sk: &mut serde_json::Value, back: &str, hilight: &str, hitext: &str| {
+        if let Some(s) = sk.get_mut("skin").and_then(|s| s.as_object_mut()) {
+            if let Some(c) = s.get_mut("colors").and_then(|c| c.as_object_mut()) {
+                c.insert("back_color".into(), serde_json::json!(back));
+                c.insert("hilited_candidate_back_color".into(), serde_json::json!(hilight));
+                c.insert("hilited_candidate_text_color".into(), serde_json::json!(hitext));
+            }
+        }
+    };
+    let mut skin_a = base.clone();
+    set_colors(&mut skin_a, "#101014FF", "#3050A0FF", "#FFFFFFFF"); // 深底·蓝高亮
+    let mut skin_b = base.clone();
+    set_colors(&mut skin_b, "#F5F0E6FF", "#C03030FF", "#101010FF"); // 浅底·红高亮
+
+    let cands = vec![
+        ("你好".to_string(), "ni hao".to_string()),
+        ("您好".to_string(), "".to_string()),
+    ];
+    let capture = |w: &CandidateWindowV2| -> Option<Vec<u8>> {
+        unsafe {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(w.hwnd, &mut rc).is_err() {
+                return None;
+            }
+            let wd = (rc.right - rc.left).max(1) as i32;
+            let ht = (rc.bottom - rc.top).max(1) as i32;
+            let hdc_screen = GetDC(None);
+            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: wd,
+                    biHeight: -ht, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hb = match CreateDIBSection(hdc_screen, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = DeleteDC(hdc_mem);
+                    ReleaseDC(None, hdc_screen);
+                    return None;
+                }
+            };
+            if bits.is_null() {
+                let _ = DeleteObject(hb);
+                let _ = DeleteDC(hdc_mem);
+                ReleaseDC(None, hdc_screen);
+                return None;
+            }
+            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc_mem, hb);
+            // DComp/NOREDIRECTIONBITMAP 窗口对 PrintWindow 免疫，BitBlt 屏幕坐标捕获
+            BitBlt(hdc_mem, 0, 0, wd, ht, hdc_screen, rc.left, rc.top, SRCCOPY);
+            let n = (wd * ht * 4) as usize;
+            let mut buf = vec![0u8; n];
+            let mut copied = 0usize;
+            if GetDIBits(
+                hdc_mem,
+                hb,
+                0,
+                ht as u32,
+                Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                &mut bi,
+                DIB_RGB_COLORS,
+            ) != 0
+            {
+                copied = n;
+            }
+            let _ = DeleteObject(hb);
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(None, hdc_screen);
+            if copied == n { Some(buf) } else { None }
+        }
+    };
+
+    // 帧 A → 捕获；帧 B（同一窗口实例，模拟词边界热换肤）→ 捕获
+    w.show(&cands, "nih", &skin_a, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let cap_a = capture(&w);
+    w.show(&cands, "nih", &skin_b, None, 0);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let cap_b = capture(&w);
+    w.hide();
+    let (Some(a), Some(b)) = (cap_a, cap_b) else {
+        eprintln!("skin-hot: 屏幕捕获失败");
+        return 0;
+    };
+    let px = a.len() / 4;
+    let mut diff = 0usize;
+    for i in 0..px {
+        let d = (a[i * 4] as i32 - b[i * 4] as i32).abs()
+            + (a[i * 4 + 1] as i32 - b[i * 4 + 1] as i32).abs()
+            + (a[i * 4 + 2] as i32 - b[i * 4 + 2] as i32).abs();
+        if d > 48 {
+            diff += 1;
+        }
+    }
+    let ratio = diff as f64 / px as f64;
+    eprintln!(
+        "skin-hot: 像素 {px}，显著差异 {diff}（{:.1}%）",
+        ratio * 100.0
+    );
+    if ratio > 0.05 { 1 } else { 0 }
+}

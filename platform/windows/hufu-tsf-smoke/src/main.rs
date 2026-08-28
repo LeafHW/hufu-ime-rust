@@ -269,6 +269,25 @@ fn main() {
             println!("[12.{mode}] candwin2 {name} ✓");
         }
 
+        // ── 音效池化连打：16 连击（4 句柄排队深度压力）不得崩/死锁 ──
+        type SndBurstFn = unsafe extern "system" fn() -> i32;
+        let sb: SndBurstFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"hufu_test_sound_burst\0".as_ptr())).unwrap(),
+        );
+        let r = unsafe { sb() };
+        assert_eq!(r, 1, "音效连打应全部顺利完成");
+        println!("[14] 音效池化连打（含排队压力）✓");
+
+        // ── 皮肤热更新 E2E：同窗两帧不同皮肤，屏幕像素必须显著变化 ──
+        // （刻意排在音效之后：曾因 UAF 在音频线程收尾时崩 D3D 初始化，作回归哨兵）
+        type SkinHotFn = unsafe extern "system" fn() -> i32;
+        let sh: SkinHotFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"hufu_test_skin_hot\0".as_ptr())).unwrap(),
+        );
+        let r = unsafe { sh() };
+        assert_eq!(r, 1, "皮肤 A/B 两帧像素应显著不同（热更新失效）");
+        println!("[13] 皮肤热更新像素 E2E ✓");
+
         println!("\n=== hufu-tsf 冒烟测试通过 ===");
     }
 }

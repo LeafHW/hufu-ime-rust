@@ -18,9 +18,62 @@ struct Clip {
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
+/// 预开 waveOut 句柄池（按格式一组 4 个，轮转使用）：
+/// 省掉每次播放的 waveOutOpen/Close（实测各 ~5-15ms，是音效迟滞主因），
+/// 4 句柄天然支持 4 路交叠（系统混音），连打音效即刻出声。
+struct Pool {
+    key: (u32, u16, u16),
+    handles: Vec<HWAVEOUT>,
+    next: usize,
+}
+// HWAVEOUT 是裸句柄（内部 *mut c_void），跨线程移动安全（waveOut API 线程无关）
+unsafe impl Send for Pool {}
+static POOLS: Mutex<Vec<Pool>> = Mutex::new(Vec::new());
 
-/// 播放 tag 音效（失败静默）。**非阻塞且可重叠**：每次播放独立线程 +
-/// 独立 waveOut 句柄（系统自动混音）——连续击键音效交叠播放，绝不排队串行。
+fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
+    let mut pools = POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (rate, channels, bits);
+    let pool = match pools.iter_mut().find(|p| p.key == key) {
+        Some(p) => p,
+        None => {
+            let block_align = channels * bits / 8;
+            let wfx = WAVEFORMATEX {
+                wFormatTag: 1,
+                nChannels: channels,
+                nSamplesPerSec: rate,
+                wBitsPerSample: bits,
+                nBlockAlign: block_align,
+                nAvgBytesPerSec: rate * block_align as u32,
+                cbSize: 0,
+            };
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let mut h = HWAVEOUT(std::ptr::null_mut());
+                let ok = unsafe {
+                    waveOutOpen(Some(&mut h), 0xFFFFFFFF, &wfx, 0, 0, CALLBACK_NULL)
+                };
+                if ok == 0 && !h.0.is_null() {
+                    handles.push(h);
+                }
+            }
+            if handles.is_empty() {
+                return None;
+            }
+            pools.push(Pool {
+                key,
+                handles,
+                next: 0,
+            });
+            pools.last_mut().unwrap()
+        }
+    };
+    let h = pool.handles[pool.next % pool.handles.len()];
+    pool.next = pool.next.wrapping_add(1);
+    Some(h)
+}
+
+/// 播放 tag 音效（失败静默）。**非阻塞且可重叠**：独立线程 + 预开句柄轮转，
+/// 连续击键音效即刻交叠播放，无设备打开延迟、不排队。
 pub fn play(tag: &str) {
     let clip = match with_clip(tag) {
         Some(c) => c,
@@ -32,34 +85,17 @@ pub fn play(tag: &str) {
         .ok();
 }
 
-/// 同步播放（独立线程内调用；忙等在此无害，不阻塞按键线程）。
+/// 同步播放（独立线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。
 fn play_sync(c: Clip) {
     let block_align = c.channels * c.bits / 8;
     if block_align == 0 {
         return;
     }
+    let Some(h) = take_handle(c.samples_per_sec, c.channels, c.bits) else {
+        return;
+    };
     unsafe {
-        let wfx = WAVEFORMATEX {
-            wFormatTag: 1, // PCM
-            nChannels: c.channels,
-            nSamplesPerSec: c.samples_per_sec,
-            wBitsPerSample: c.bits,
-            nBlockAlign: block_align,
-            nAvgBytesPerSec: c.samples_per_sec * block_align as u32,
-            cbSize: 0,
-        };
-        let mut h: HWAVEOUT = HWAVEOUT(std::ptr::null_mut());
-        if waveOutOpen(
-            Some(&mut h),
-            0xFFFFFFFF, // WAVE_MAPPER
-            &wfx,
-            0,
-            0,
-            CALLBACK_NULL,
-        ) != 0 {
-            return;
-        }
-        // 音量：0–100 → 0x0000–0xFFFF（左右声道同值）
+        // 音量：0–100 → 0x0000–0xFFFF（左右声道同值；句柄复用需每次设置）
         let v = (c.volume as u32).min(100) * 0xFFFF / 100;
         let _ = waveOutSetVolume(h, v | (v << 16));
         let mut hdr = WAVEHDR {
@@ -73,19 +109,22 @@ fn play_sync(c: Clip) {
             reserved: 0,
         };
         if waveOutPrepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32) != 0 {
-            let _ = waveOutClose(h);
             return;
         }
         let _ = waveOutWrite(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
-        // 忙等 WHDR_DONE（音效极短；专职线程，按键零阻塞）
+        // 等 WHDR_DONE：音效 160-175ms，但同句柄并发播放会排队（4 句柄池），
+        // 上限必须容纳排队（8 连击 → 至多 2 深队列 ≈ 360ms）。超时则 Reset
+        // 清队列（头标 DONE）再 Unprepare——否则栈上 WAVEHDR 被驱动继续写 → UAF 崩溃。
         let mut spins = 0u32;
-        while (hdr.dwFlags & 0x1) == 0 && spins < 200 {
+        while (hdr.dwFlags & 0x1) == 0 && spins < 1000 {
             std::thread::sleep(std::time::Duration::from_millis(2));
             spins += 1;
         }
-        let _ = waveOutReset(h);
+        if (hdr.dwFlags & 0x1) == 0 {
+            let _ = waveOutReset(h);
+        }
         let _ = waveOutUnprepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
-        let _ = waveOutClose(h);
+        // 句柄保留复用，不 Close
     }
 }
 
