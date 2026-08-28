@@ -254,7 +254,9 @@ impl Default for Skin {
 impl Skin {
     pub fn load(path: &Path) -> std::io::Result<Skin> {
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text)
+        // 容忍 UTF-8 BOM（PowerShell/记事本保存会带；带 BOM 曾让皮肤静默失效）
+        let text = text.trim_start_matches('\u{feff}');
+        serde_json::from_str(text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 

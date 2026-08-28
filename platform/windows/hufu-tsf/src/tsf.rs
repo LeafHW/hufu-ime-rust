@@ -37,6 +37,9 @@ pub struct Shared {
     pub composing: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
+    /// 失焦冲销的目标上下文覆盖（切窗时 RequestEditSession 必须落在「旧」文档上，
+    /// 否则冲销文本会写进新焦点应用）
+    pub commit_ctx: Option<ITfContext>,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
 }
@@ -59,6 +62,7 @@ impl Shared {
             chinese: true,
             composing: false,
             preedit_last: String::new(),
+            commit_ctx: None,
             tm_sink_cookie: 0,
         }
     }
@@ -78,8 +82,11 @@ impl Shared {
         }
     }
 
-    /// 焦点上下文（当前文档顶层）。
+    /// 焦点上下文（当前文档顶层）。冲销覆盖优先：失焦提交必须落在旧文档上。
     fn focus_context(&self) -> Option<ITfContext> {
+        if let Some(c) = self.commit_ctx.as_ref() {
+            return Some(c.clone());
+        }
         let tm = self.thread_mgr.as_ref()?;
         let doc: ITfDocumentMgr = unsafe { tm.GetFocus().ok()? };
         unsafe { doc.GetTop().ok() }
@@ -212,29 +219,47 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
     }
 
     /// 文档焦点变化（切应用 / 切输入框 / 失焦为 None）。
-    /// 统一策略：有未上屏内容先冲销上屏，再清引擎会话、关候选窗 ——
-    /// 修复「切走候选窗不关、切回后候选在但无法上屏」。
+    /// 统一策略：
+    /// 1. 有未上屏内容 → 在「旧」文档上下文里提交（覆盖 commit_ctx，防写错应用）
+    /// 2. 引擎会话清零 + 本地组段句柄必须丢弃 ——
+    ///    切窗时系统已终止组段，留着死句柄会让后续 SetText 全失败，
+    ///    表现为「回来后有候选但中文永远上不了屏、只有字母能直通」
     fn OnSetFocus(
         &self,
-        _pdimfocus: Option<&ITfDocumentMgr>,
-        _pdimprevfocus: Option<&ITfDocumentMgr>,
+        pdimfocus: Option<&ITfDocumentMgr>,
+        pdimprevfocus: Option<&ITfDocumentMgr>,
     ) -> Result<()> {
+        let _ = pdimfocus;
         let (composing, preedit) = {
             let g = self.shared.lock().unwrap();
             (g.composing, g.preedit_last.clone())
         };
+        // 1) 旧文档上冲销提交
         if composing && !preedit.is_empty() {
-            let _ = run_session(&self.shared, Op::Commit(preedit));
+            let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
+            if let Some(ctx) = prev_ctx {
+                {
+                    let mut g = self.shared.lock().unwrap();
+                    g.commit_ctx = Some(ctx);
+                }
+                let _ = run_session(&self.shared, Op::Commit(preedit.clone()));
+                let mut g = self.shared.lock().unwrap();
+                g.commit_ctx = None;
+            }
         }
-        // 引擎会话清零（服务端 focus op 清空缓冲；本地缓存复位）
+        // 2) 引擎会话清零（服务端 focus op 清空缓冲；本地缓存全部复位）
         let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
         {
             let mut g = self.shared.lock().unwrap();
+            g.composition = None; // 死组段句柄必须丢，后续走全新 StartPreedit
             g.composing = false;
             g.raw_last.clear();
             g.preedit_last.clear();
             g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
             if let Some(c) = g.cand2.as_ref() {
+                c.hide();
+            }
+            if let Some(c) = g.cand.take() {
                 c.hide();
             }
         }
@@ -484,7 +509,16 @@ impl EditSession_Impl {
                     .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
                 let range: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
-                unsafe { range.SetText(ec, 0, &wstr)? };
+                if unsafe { range.SetText(ec, 0, &wstr) }.is_err() {
+                    // 自愈：组段已被应用/焦点切换单方面终止（SetText 失败）——
+                    // 弃死句柄，在当前上下文全新 StartComposition
+                    // （此前表现为「有候选但中文永远上不了屏」）
+                    trace("SetPreedit: 死组段，自愈重开");
+                    let _ = unsafe { comp.EndComposition(ec) };
+                    g.composition = None;
+                    drop(g);
+                    return start_preedit_on(&ctx, &self.shared, ec, text);
+                }
                 let _ = set_selection_at_end(&ctx, ec, &range);
                 query_caret(&mut g, &ctx, ec);
                 Ok(())
@@ -576,6 +610,22 @@ impl EditSession_Impl {
             }
         }
     }
+}
+
+/// 在指定上下文当前选区新开组段并写入预编辑（StartPreedit 主体 + 死组段自愈复用）。
+fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -> Result<()> {
+    let cc: ITfContextComposition = ctx.cast()?;
+    let range: ITfRange = selection_range(ctx, ec)?;
+    let sink: ITfCompositionSink = CompSinkObj.into();
+    let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
+    let crange: ITfRange = unsafe { comp.GetRange()? };
+    let wstr: Vec<u16> = text.encode_utf16().collect();
+    unsafe { crange.SetText(ec, 0, &wstr)? };
+    let _ = set_selection_at_end(ctx, ec, &crange);
+    let mut g = shared.lock().unwrap();
+    g.composition = Some(comp);
+    query_caret(&mut g, ctx, ec);
+    Ok(())
 }
 
 /// 把选区放到指定范围末尾（折叠），保证后续插入点跟随。
