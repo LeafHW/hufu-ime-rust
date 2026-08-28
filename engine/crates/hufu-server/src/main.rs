@@ -70,24 +70,29 @@ fn main() {
         use std::sync::mpsc;
         let (quit_tx, quit_rx) = mpsc::channel::<()>();
         let (open_tx, open_rx) = mpsc::channel::<()>();
-        tray::spawn(quit_tx, open_tx);
+        tray::spawn(quit_tx, open_tx, Some(shared.clone()));
         let url = format!("http://{addr}/");
         std::thread::spawn(move || {
             // 常驻循环：每次托盘信号都开窗口（旧版一次性线程导致第二次进不去）
             while open_rx.recv().is_ok() {
-                // 独立应用窗口（Edge --app 模式）：有自己的任务栏图标、无地址栏，
+                // 独立应用窗口（Chromium --app 模式）：有自己的任务栏图标、无地址栏，
                 // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
-                // Edge 不在时回退默认浏览器。窗口已开时再启动会聚焦/新开一窗。
+                // Edge → Chrome → 默认浏览器三级回退（没装 Edge 的机器用 Chrome
+                // 同样得到独立窗口）。窗口已开时再启动会聚焦/新开一窗。
                 let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
                 let pf = std::env::var("ProgramFiles").unwrap_or_default();
-                let edge = [
+                let pflocal = std::env::var("LOCALAPPDATA").unwrap_or_default();
+                let app_arg = format!("--app={url}");
+                let browser = [
                     format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
                     format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
+                    format!("{pflocal}\\Google\\Chrome\\Application\\chrome.exe"),
+                    format!("{pf}\\Google\\Chrome\\Application\\chrome.exe"),
+                    format!("{pf86}\\Google\\Chrome\\Application\\chrome.exe"),
                 ]
                 .into_iter()
                 .find(|p| std::path::Path::new(p).exists());
-                let app_arg = format!("--app={url}");
-                let opened = match &edge {
+                let opened = match &browser {
                     Some(exe) => {
                         std::process::Command::new(exe).arg(&app_arg).spawn().is_ok()
                     }

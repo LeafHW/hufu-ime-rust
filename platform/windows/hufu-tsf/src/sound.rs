@@ -72,17 +72,30 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
     Some(h)
 }
 
-/// 播放 tag 音效（失败静默）。**非阻塞且可重叠**：独立线程 + 预开句柄轮转，
-/// 连续击键音效即刻交叠播放，无设备打开延迟、不排队。
+/// 播放 tag 音效（失败静默）。**单常驻线程 + 深度 2 合并队列**：
+/// 每次播放 spawn 线程的老方案在按住键连发（~30 键/秒）时线程堆积，
+/// 几秒后调度拖垮——正是「按住 D 三五秒后卡」的病根。
+/// 现在整进程只有一条 hufu-snd 线程顺序播放；队列满（≥2 未播）直接
+/// 丢弃本次——连击音效本就交叠无意义，宁可丢新不积压。
 pub fn play(tag: &str) {
     let clip = match with_clip(tag) {
         Some(c) => c,
         None => return,
     };
-    std::thread::Builder::new()
-        .name("hufu-snd".into())
-        .spawn(move || play_sync(clip))
-        .ok();
+    static TX: Mutex<Option<std::sync::mpsc::SyncSender<Clip>>> = Mutex::new(None);
+    let mut g = TX.lock().unwrap_or_else(|p| p.into_inner());
+    if g.is_none() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Clip>(2);
+        let ok = std::thread::Builder::new()
+            .name("hufu-snd".into())
+            .spawn(move || while let Ok(c) = rx.recv() { play_sync(c) })
+            .is_ok();
+        if !ok {
+            return;
+        }
+        *g = Some(tx);
+    }
+    let _ = g.as_ref().unwrap().try_send(clip);
 }
 
 /// 同步播放（独立线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。

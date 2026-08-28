@@ -131,6 +131,10 @@ pub struct CandidateWindowV2 {
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
     size: (i32, i32),
+    /// 粘性定位：最近一次有效锚点坐标。锚点偶发丢失（GetTextExt 在
+    /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
+    /// 那正是候选框「在光标周围乱跳」的病根。
+    sticky_pos: Option<(i32, i32)>,
     /// 测试回读：show() 后从 D2D 目标位图取整帧 BGRA（渲染层真值，不经 DWM）
     pub(crate) readback: bool,
     pub(crate) last_pixels: Option<Vec<u8>>,
@@ -227,6 +231,7 @@ impl CandidateWindowV2 {
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
                 readback: false,
+                sticky_pos: None,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -833,7 +838,8 @@ impl CandidateWindowV2 {
         // 透明/半透明完全由自绘层 alpha（material.opacity + kind）承担。
         let _ = tint_hex;
 
-        // 定位：优先插入点下方，出屏翻到上方；无 anchor 屏幕下 1/3 居中
+        // 定位：优先插入点下方，出屏翻到上方；锚点丢失时**沿用上次位置**
+        //（粘性锚点——瞬移屏幕中央的老行为就是候选框乱跳的来源）。
         unsafe {
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let sh = GetSystemMetrics(SM_CYSCREEN);
@@ -841,13 +847,18 @@ impl CandidateWindowV2 {
                 Some(r) => {
                     let x = (r.left).clamp(0, (sw - width as i32).max(0));
                     let below = r.bottom + 4;
-                    if below + height as i32 <= sh {
-                        (x, below)
+                    let y = if below + height as i32 <= sh {
+                        below
                     } else {
-                        (x, (r.top - height as i32 - 4).max(0))
-                    }
+                        (r.top - height as i32 - 4).max(0)
+                    };
+                    self.sticky_pos = Some((x, y));
+                    (x, y)
                 }
-                None => ((sw - width as i32) / 2, sh * 2 / 3),
+                None => match self.sticky_pos {
+                    Some(p) => p,
+                    None => ((sw - width as i32) / 2, sh * 2 / 3),
+                },
             };
             let _ = SetWindowPos(
                 self.hwnd,

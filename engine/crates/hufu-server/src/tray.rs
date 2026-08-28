@@ -256,14 +256,59 @@ const TPM_RIGHTBUTTON: u32 = 0x0002;
 const TPM_RETURNCMD: u32 = 0x0100;
 const MF_STRING: u32 = 0x0;
 const MF_SEPARATOR: u32 = 0x800;
+const MF_POPUP: u32 = 0x10;
+const MF_CHECKED: u32 = 0x8;
 
 const IDM_SETTINGS: usize = 1;
 const IDM_QUIT: usize = 3;
+/// 方案子菜单命令 id 基址：100+序号（上限 40 个方案）
+const IDM_SCHEMA_BASE: i32 = 100;
+const SCHEMA_MAX: usize = 40;
 
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static ASK_QUIT: AtomicBool = AtomicBool::new(false);
 /// 打开设置页的信号（主线程 select 循环外执行）
 static mut OPEN_SETTINGS: Option<Sender<()>> = None;
+/// 引擎宿主（托盘右键「切换方案」直调，与 HTTP 路由同源逻辑）
+static mut SHARED: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>> = None;
+
+/// 码表目录方案列表 + 当前方案名（快照；锁内只做目录读与字段拷贝）。
+fn schema_snapshot() -> (Vec<String>, String) {
+    let shared = unsafe {
+        #[allow(static_mut_refs)]
+        SHARED.as_ref()
+    };
+    let Some(shared) = shared else { return (Vec::new(), String::new()) };
+    let Ok(host) = shared.lock() else { return (Vec::new(), String::new()) };
+    let dir = host.data_dir.join(&host.engine.config.schema.dir);
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                // 码表子目录多为 junction：file_type() 判非目录，须 path().is_dir()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.truncate(SCHEMA_MAX);
+    (names, host.engine.config.schema.current.clone())
+}
+
+/// 切换方案（与 POST /api/schema 同逻辑：换方案 + 清会话 + 重建整句 + 落盘）。
+fn switch_schema(name: &str) {
+    let shared = unsafe {
+        #[allow(static_mut_refs)]
+        SHARED.as_ref()
+    };
+    let Some(shared) = shared else { return };
+    let Ok(mut host) = shared.lock() else { return };
+    if host.engine.switch_schema(name).is_ok() {
+        host.session.clear();
+        host.setup_sentence();
+        let _ = host.engine.config.save(&host.config_path);
+    }
+}
 
 extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe {
@@ -277,6 +322,31 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                     }
                     WM_RBUTTONUP => {
                         let hmenu = CreatePopupMenu();
+                        // 方案子菜单（当前方案打勾，点击即切）
+                        let (schemas, current) = schema_snapshot();
+                        let mut submenu_names: Vec<String> = Vec::new();
+                        if !schemas.is_empty() {
+                            let sub = CreatePopupMenu();
+                            for (i, name) in schemas.iter().enumerate() {
+                                let label: Vec<u16> =
+                                    format!("{name}\0").encode_utf16().collect();
+                                let flags = if *name == current {
+                                    MF_STRING | MF_CHECKED
+                                } else {
+                                    MF_STRING
+                                };
+                                AppendMenuW(
+                                    sub,
+                                    flags,
+                                    (IDM_SCHEMA_BASE + i as i32) as usize,
+                                    label.as_ptr(),
+                                );
+                                submenu_names.push(name.clone());
+                            }
+                            let title: Vec<u16> = "切换方案\0".encode_utf16().collect();
+                            AppendMenuW(hmenu, MF_POPUP, sub as usize, title.as_ptr());
+                            AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
+                        }
                         let s1: Vec<u16> = "打开设置页\u{0}".encode_utf16().collect();
                         let s2: Vec<u16> = "退出 HuFu\u{0}".encode_utf16().collect();
                         AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, s1.as_ptr());
@@ -290,7 +360,11 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                             pt.x, pt.y, 0, hwnd, 0,
                         );
                         DestroyMenu(hmenu);
-                        if cmd == IDM_SETTINGS as i32 {
+                        if cmd >= IDM_SCHEMA_BASE
+                            && ((cmd - IDM_SCHEMA_BASE) as usize) < submenu_names.len()
+                        {
+                            switch_schema(&submenu_names[(cmd - IDM_SCHEMA_BASE) as usize]);
+                        } else if cmd == IDM_SETTINGS as i32 {
                             if let Some(tx) = OPEN_SETTINGS.as_ref() {
                                 let _ = tx.send(());
                             }
@@ -350,10 +424,15 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
 
 /// 在独立线程跑托盘消息循环。返回 (ask_quit 标志引用, 设置页请求接收端)。
 /// 传入 `quit_tx`：托盘退出时发 () 通知主循环退出。
-pub fn spawn(quit_tx: Sender<()>, open_tx: Sender<()>) {
+pub fn spawn(
+    quit_tx: Sender<()>,
+    open_tx: Sender<()>,
+    shared: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>>,
+) {
     std::thread::spawn(move || unsafe {
         unsafe {
             OPEN_SETTINGS = Some(open_tx);
+            SHARED = shared;
         }
         let hinst = GetModuleHandleW(std::ptr::null());
         let cls: Vec<u16> = "HuFuTrayWnd\0".encode_utf16().collect();
