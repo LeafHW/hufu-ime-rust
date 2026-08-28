@@ -85,6 +85,18 @@ hufu/
 - Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
 - 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效
 
+### 整句 A/B 压测（5 万句语料）
+
+```powershell
+# 语料：语料目录 prepare_corpus_50k.py 生成（LCSTS/THUCNews/评论 混配，4~30 字纯汉字句）
+cd engine
+cargo run --release -p hufu-rerank --bin sentence-bench -- `
+  E:\DSH-KF\语料\test_sentences_50k.txt --arm AB --sample 2000 --wa 8 --wb 2 `
+  --out ..\docs\benchmark-qwen-vs-ngram.md
+```
+
+录入规则完全按整句虎：逐字全码连打（一简字取 2 码全码）、一句打完才空格；提前上屏前缀由引擎提交累计。A 臂 ngram 全量；B 臂 +Qwen 重排在停顿后空格前一次性介入（同生产路径）。输出 Wilson 95% CI、按句长分桶、打捞/拖累翻转统计。报告见 `docs/benchmark-qwen-vs-ngram.md`。
+
 ## 构建
 
 ```powershell
