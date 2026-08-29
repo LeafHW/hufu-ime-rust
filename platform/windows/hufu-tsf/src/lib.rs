@@ -7,6 +7,9 @@ mod candwin;
 mod candwin2;
 mod com;
 mod ipc;
+// 语言栏按钮已下线（Win11 桌面语言栏为可拖浮动条，用户实测否决）；
+// langbar.rs 源码保留，备将来做中/英态切换时复用。
+#[allow(unused)]
 mod langbar;
 mod sound;
 mod tsf;

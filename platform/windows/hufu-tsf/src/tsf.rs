@@ -135,18 +135,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let mut g = self.shared.lock().unwrap();
         g.thread_mgr = Some(tm);
         g.client_id = tid;
-        // 语言栏「中」按钮：任务栏输入指示区常驻（切到虎符即现，Rime 风格）
-        match g.thread_mgr.as_ref().unwrap().cast::<ITfLangBarItemMgr>() {
-            Ok(lbm) => {
-                let _ = crate::langbar::install(&lbm);
-            }
-            Err(e) => {
-                let _ = std::fs::write(
-                    std::env::temp_dir().join("hufu-langbar.txt"),
-                    format!("cast-fail {:#010x} pid={}\n", e.code().0, std::process::id()),
-                );
-            }
-        }
+        // （语言栏按钮已下线：Win11 桌面语言栏是可拖动浮动条而非任务栏
+        // 常驻，且小尺寸渲染差——用户实测否决。输入指示「中」改由
+        // DLL 内嵌图标资源承担（build.rs + assets/hufu_rsrc.o）。
+        // langbar.rs 源码保留，备将来做中/英态切换。）
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
@@ -159,12 +151,6 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap();
-        // 摘除语言栏「中」按钮（切走输入法即从任务栏消失）
-        if let Some(tm) = g.thread_mgr.clone() {
-            if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
-                crate::langbar::uninstall(&lbm);
-            }
-        }
         if let Some(tm) = g.thread_mgr.clone() {
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {
