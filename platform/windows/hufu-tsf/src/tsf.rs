@@ -21,6 +21,16 @@ pub struct Shared {
     pub cand2: Option<CandidateWindowV2>,
     pub cand2_dead: bool,
     pub cand: Option<CandidateWindow>,
+    /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
+    /// A. TSF UIElement——BeginUIElement pbShow=TRUE 即宿主愿意代画
+    ///    （微软拼音同款，宿主=SearchHost 的搜索框场景）；
+    /// B. server 代画——宿主拒绝时由 hufu-server 进程开窗（普通桌面
+    ///    进程不受容器隐身限制；沉浸层之下仍可能被压，保底通道）。
+    pub cand_ui: Option<windows::Win32::UI::TextServices::ITfCandidateListUIElement>,
+    pub cand_ui_id: u32,
+    pub cand_ui_active: bool,
+    /// true=宿主经 UIElement 画；false=server 代画
+    pub cand_ui_host_draws: bool,
     pub skin: serde_json::Value,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
@@ -50,6 +60,10 @@ impl Shared {
             cand2: None,
             cand2_dead: false,
             cand: None,
+            cand_ui: None,
+            cand_ui_id: 0,
+            cand_ui_active: false,
+            cand_ui_host_draws: false,
             skin: serde_json::Value::Null,
             skin_stale: true,
             delay_show_ms: 0,
@@ -142,6 +156,24 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
+        // 诊断：宿主画像 + 管道探活（排查开始菜单搜索等特殊宿主：
+        // AppContainer 的 DLL 加载与管道连通分层定位）——ProgramData\HuFu\diag
+        {
+            let pipe_ok = crate::ipc::call(&serde_json::json!({"op": "status"})).is_some();
+            let perr = crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst);
+            let line = format!(
+                "pid={} pipe={} perr={} t={:?}\n",
+                std::process::id(),
+                if pipe_ok { "ok" } else { "fail" },
+                perr,
+                std::time::SystemTime::now()
+            );
+            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            let _ = std::fs::write(
+                format!(r"C:\ProgramData\HuFu\diag\act-{}.txt", std::process::id()),
+                line,
+            );
+        }
         // 上报激活：托盘图标「仅虎符激活时显示」
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": true}));
         Ok(())
@@ -172,6 +204,33 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             c.hide();
         }
         g.cand = None;
+        // 【回归病根】ctfmon 重启等场景进程内本实例会被再次 Activate：
+        // cand2_dead 若不清，重激活后所有显示分支被跳过、落入 v1 隐身窗
+        // → 搜索框候选彻底消失（实测 notes 只有老会话记录）
+        g.cand2_dead = false;
+        // 沉浸式宿主：两通道各自收尾
+        if g.cand_ui_active {
+            if g.cand_ui_host_draws {
+                let mgr = g
+                    .thread_mgr
+                    .as_ref()
+                    .and_then(|tm| {
+                        tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>()
+                            .ok()
+                    });
+                let id = g.cand_ui_id;
+                if let Some(mgr) = &mgr {
+                    let _ = unsafe { mgr.EndUIElement(id) };
+                    diag_note("uiel: end (deactivate)");
+                }
+            } else {
+                let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
+                diag_note("srv cand hide (deactivate)");
+            }
+        }
+        g.cand_ui = None;
+        g.cand_ui_active = false;
+        g.cand_ui_host_draws = false;
         g.thread_mgr = None;
         g.client_id = 0;
         Ok(())
@@ -190,6 +249,15 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        // 诊断：按键是否进入键盘钩（搜索框等特殊宿主排查）
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
+        {
+            let _ = writeln!(f, "test vk={:#x} t={:?}", wparam.0, std::time::SystemTime::now());
+        }
         Ok(self.dispatch(wparam.0, true))
     }
 
@@ -198,7 +266,24 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     }
 
     fn OnKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        Ok(self.dispatch(wparam.0, false))
+        // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
+        let r = self.dispatch(wparam.0, false);
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
+        {
+            let _ = writeln!(
+                f,
+                "key vk={:#x} eat={} perr={} t={:?}",
+                wparam.0,
+                r.0,
+                crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst),
+                std::time::SystemTime::now()
+            );
+        }
+        Ok(r)
     }
 
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
@@ -299,6 +384,18 @@ pub fn trace(msg: &str) {
     let path = std::env::temp_dir().join("hufu-tsf-trace.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{t}] {exe}: {msg}");
+    }
+}
+
+/// 跨容器诊断日志（AppContainer 宿主如 SearchHost 写不了 %TEMP%，
+/// 统一落 C:\ProgramData\HuFu\diag\notes-<pid>.txt——该目录已授
+/// Everyone + 全应用包写权限）。
+pub fn diag_note(msg: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+    let path = format!(r"C:\ProgramData\HuFu\diag\notes-{}.txt", std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -447,6 +544,11 @@ fn vk_to_name(vk: usize) -> Option<(String, bool, bool, bool)> {
             0xBF => "/".to_string(),
             0xC0 => "`".to_string(),
             0xDE => "'".to_string(),
+            // 【标点回归】0xDB/0xDC/0xDD 此前缺失 → vk_to_name 返回
+            // None → 直通，中文态 [ ] 出不来【】（引擎映射表本就有）
+            0xDB => "[".to_string(),
+            0xDC => "\\".to_string(),
+            0xDD => "]".to_string(),
             _ => return None,
         };
         Some((name, shift, ctrl, alt))
@@ -843,6 +945,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand.take() {
             c.hide();
         }
+        if g.cand_ui_active {
+            drop(g);
+            ui_element_hide(&shared);
+            return Ok(());
+        }
     } else if suppress_win {
         // 候选延时窗口内：快速输入防闪烁，先不显示
         if let Some(c) = g.cand2.as_mut() {
@@ -851,36 +958,65 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand.take() {
             c.hide();
         }
+    } else if g.cand_ui_active {
+        // 沉浸式宿主：UIElement（宿主画）或 server 代画双通道
+        let (x, y) = g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
+        let raw_c = raw.clone();
+        drop(g);
+        ui_element_show(&shared, &cands, &raw_c, sel, x, y);
     } else if !g.cand2_dead {
         if g.cand2.is_none() {
             match CandidateWindowV2::new() {
                 Some(v2) => g.cand2 = Some(v2),
                 None => g.cand2_dead = true,
             }
-            trace(&format!("cand2 init dead={}", g.cand2_dead));
+            diag_note(&format!(
+                "cand2 init ok={} dead={}",
+                g.cand2.is_some(),
+                g.cand2_dead
+            ));
         }
         let skin = g.skin.clone();
         let caret = g.caret;
+        // DComp 直通窗在打包宿主（SearchHost 等）里会被 DWM 整体
+        // cloaked（显示中但不可见，实测 cloak=2）；v1 混合窗同被隐身，
+        // 自绘路线在此类宿主是死路。首帧 cloaked 即切双通道
+        // （UIElement→宿主画，拒绝则 server 代画）——用户短编码只有
+        // 2 帧按键，阈值 2 会错过切换时机。
+        let cloaked_dead = g
+            .cand2
+            .as_ref()
+            .map(|c| c.cloaked_streak >= 1)
+            .unwrap_or(false);
+        if cloaked_dead {
+            if let Some(mut c) = g.cand2.take() {
+                c.hide();
+            }
+            // 不预置 cand_ui_active——由 ui_element_show 先问宿主
+            // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
+            g.cand2_dead = true;
+            let (x, y) = caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
+            let raw_c = raw.clone();
+            drop(g);
+            diag_note("cw2 连续 cloaked → 切换双通道候选");
+            ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+            return Ok(());
+        }
         match g.cand2.as_mut() {
             Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
             None => {}
         }
-        if g.cand2_dead {
-            if g.cand.is_none() {
-                g.cand = Some(CandidateWindow::new());
-            }
-            if let Some(c) = g.cand.as_ref() {
-                c.show(&cands, &raw, &g.skin, caret.as_ref(), sel);
-            }
-        }
     } else {
-        if g.cand.is_none() {
-            g.cand = Some(CandidateWindow::new());
-        }
-        let caret = g.caret;
-        if let Some(c) = g.cand.as_ref() {
-            c.show(&cands, &raw, &g.skin, caret.as_ref(), sel);
-        }
+        // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
+        // （Deactivate→再 Activate 的状态漂移）：直接 server 代画自愈。
+        // 不再建 v1 窗——v1 在沉浸宿主同样被 cloak 隐身（死路，实测
+        // 搜索框候选「出现一次后永不再现」即此）
+        let (x, y) = g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
+        let raw_c = raw.clone();
+        drop(g);
+        diag_note("cand2_dead 漂移自愈 → server 代画");
+        ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+        return Ok(());
     }
     Ok(())
 }
@@ -927,4 +1063,87 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// 沉浸式宿主候选显示（双通道）：
+/// 首帧 BeginUIElement——pbShow=TRUE 即宿主愿意代画（走 UIElement），
+/// FALSE 则降级 server 代画（pipe 推送候选+坐标，server 开窗绘制，
+/// 其普通桌面进程窗口不受容器隐身限制）。后续帧按通道更新。
+fn ui_element_show(
+    shared: &SharedRef,
+    cands: &[(String, String)],
+    raw: &str,
+    sel: usize,
+    _x: i32,
+    _y: i32,
+) {
+    // 【用户定稿】沉浸式宿主（开始菜单等）：候选固定屏幕左上角，由
+    // server 代画【用户自己的皮肤】（与普通应用同皮肤同竖排观感，
+    // 仅位置不同）。系统自带候选条仅微软自家 IME 可用；自绘窗被
+    // DWM_CLOAKED_SHELL 隐身；server topmost 窗需 AttachThreadInput
+    // 强制置顶，已验证像素级可见。
+    let mut g = shared.lock().unwrap();
+    g.cand_ui_active = true;
+    g.cand_ui_host_draws = false;
+    let skin = g.skin.clone();
+    drop(g);
+    pipe_cand_push(cands, raw, sel, 12, 12, &skin);
+}
+
+/// server 代画：pipe 推送候选帧（含皮肤，server 按皮肤渲染）
+fn pipe_cand_push(
+    cands: &[(String, String)],
+    raw: &str,
+    sel: usize,
+    x: i32,
+    y: i32,
+    skin: &serde_json::Value,
+) {
+    let items: Vec<serde_json::Value> = cands
+        .iter()
+        .map(|(t, c)| serde_json::json!({"text": t, "comment": c}))
+        .collect();
+    let _ = crate::ipc::call(&serde_json::json!({
+        "op": "cand",
+        "items": items,
+        "raw": raw,
+        "selected": sel,
+        "x": x,
+        "y": y,
+        "skin": skin,
+    }));
+    diag_note(&format!(
+        "srv push n={} perr={}",
+        cands.len(),
+        crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst)
+    ));
+}
+
+/// 结束沉浸式候选（编码结束/失焦）：两通道各自收尾
+fn ui_element_hide(shared: &SharedRef) {
+    use windows::Win32::UI::TextServices::ITfUIElementMgr;
+    let mut g = shared.lock().unwrap();
+    if !g.cand_ui_active {
+        return;
+    }
+    if g.cand_ui_host_draws {
+        let mgr = g
+            .thread_mgr
+            .as_ref()
+            .and_then(|tm| tm.cast::<ITfUIElementMgr>().ok());
+        let id = g.cand_ui_id;
+        g.cand_ui = None;
+        g.cand_ui_active = false;
+        g.cand_ui_host_draws = false;
+        drop(g);
+        if let Some(mgr) = mgr {
+            let _ = unsafe { mgr.EndUIElement(id) };
+            diag_note("uiel: end");
+        }
+        return;
+    }
+    g.cand_ui_active = false;
+    g.cand_ui_host_draws = false;
+    drop(g);
+    let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
 }

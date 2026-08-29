@@ -145,6 +145,9 @@ pub struct CandidateWindowV2 {
     pub(crate) last_dy: Option<f32>,
     /// 诊断：readback 像素尺寸
     pub(crate) last_size: (u32, u32),
+    /// 连续被 DWM cloaked（显示中但不可见）的帧数；打包宿主里
+    /// DComp 直通窗可能被整体隐身 → 达阈值切换 v1 传统混合窗
+    pub(crate) cloaked_streak: u32,
 }
 
 impl CandidateWindowV2 {
@@ -240,6 +243,7 @@ impl CandidateWindowV2 {
                 last_dy: None,
                 last_size: (0, 0),
                 size: (0, 0),
+                cloaked_streak: 0,
             })
         }
     }
@@ -939,15 +943,73 @@ impl CandidateWindowV2 {
                 }
                 None => match self.sticky_pos {
                     Some(p) => p,
-                    // 从未有过真实锚点且本帧也取不到：宁可这帧不显示，
-                    // 也绝不瞬移屏幕中下方（下一帧锚点就绪即正确出现）
+                    // 从未有过真实锚点且本帧也取不到：先记诊断；若无
+                    // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
+                    //（SearchHost 等宿主 GetTextExt 常失败——搜索框候选
+                    // 框不显示的病根）。下一帧锚点就绪即回到正常定位。
                     None => {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
-                        return;
+                        crate::tsf::diag_note("cw2 anchor+sticky 双缺，退到焦点窗口定位");
+                        let fg = GetForegroundWindow();
+                        if fg.0.is_null() {
+                            let _ = ShowWindow(self.hwnd, SW_HIDE);
+                            return;
+                        }
+                        let mut fr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                        let _ = GetWindowRect(fg, &mut fr);
+                        let x = fr.left + 16;
+                        let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
+                        (x, below.max(fr.top))
                     }
                 },
             };
             self.sticky_pos = Some((x, y));
+            // 诊断：搜索框等宿主锚点缺失排查（visible=0 说明本帧被隐藏）
+            // + DWM cloaked 检测（显示中但被 DWM 隐身 → 连续 2 帧后
+            //   由调用方切换 v1 传统混合窗——SearchHost 里 DComp 直通
+            //   窗被整体 cloaked 的自愈路径）。dwmapi 经 GetProcAddress
+            //   动态获取（mingw 工具链无 dwmapi 导入库）。
+            let mut cloaked: u32 = 0;
+            let mut hr: i32 = -1;
+            unsafe {
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn GetModuleHandleW(name: *const u16) -> isize;
+                    fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
+                }
+                type Dwma = unsafe fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
+                let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
+                let m = GetModuleHandleW(mn.as_ptr());
+                if m != 0 {
+                    let p = GetProcAddress(m, c"DwmGetWindowAttribute".as_ptr() as *const u8);
+                    if !p.is_null() {
+                        let f: Dwma = std::mem::transmute(p);
+                        hr = f(
+                            self.hwnd,
+                            14, // DWMWA_CLOAKED
+                            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                            4,
+                        );
+                    }
+                }
+            }
+            if cloaked != 0 {
+                self.cloaked_streak += 1;
+            } else {
+                self.cloaked_streak = 0;
+            }
+            crate::tsf::diag_note(&format!(
+                "cw2 show anchor={} x={} y={} w={} h={} vis={} cloak={}({:#x}) hr={:#x} streak={}",
+                anchor.is_some(),
+                x,
+                y,
+                w_out,
+                h_out,
+                IsWindowVisible(self.hwnd).0,
+                cloaked,
+                cloaked,
+                hr,
+                self.cloaked_streak
+            ));
             // 内容坐标 → 窗口坐标（内容在阴影边距内侧）
             let _ = SetWindowPos(
                 self.hwnd,

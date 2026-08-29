@@ -384,6 +384,11 @@ static IME_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 托盘图标当前是否已添加（显隐由输入法激活态驱动）
 static ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
+/// tray 隐藏窗口句柄（candwin 死窗重建请求用）
+pub fn tray_hwnd() -> isize {
+    TRAY_HWND.load(Ordering::SeqCst)
+}
+
 /// DLL 侧 Activate/Deactivate 经管道上报（pipe.rs op "ime" 转发至此）。
 /// 线程安全：Post 到托盘窗口线程处理（Shell_NotifyIcon 必须在创建
 /// 图标的线程上调用）。
@@ -469,6 +474,11 @@ fn switch_schema(name: &str) {
 extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe {
         match msg {
+            // 候选窗重建（宿主退出销毁了子窗口时由 pipe 线程请求）
+            0x8003 => {
+                crate::candwin::reinit_if_dead();
+                0
+            }
             WM_HOTKEY => {
                 // Ctrl+Alt+H → 设置页（与托盘双击同通道）
                 if wparam == 0x4846 {
@@ -658,6 +668,9 @@ pub fn spawn(
         // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
         // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
         let _ = GetCurrentThreadId();
+        // 越进程候选窗：在 tray 线程创建（消息循环共用）——沉浸式
+        // 宿主（开始菜单搜索）里 DLL 自绘窗被 DWM cloaked，server 代画
+        crate::candwin::init_on_tray_thread();
         let mut m = MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, pt: POINT { x: 0, y: 0 } };
         loop {
             let r = GetMessageW(&mut m, 0, 0, 0);

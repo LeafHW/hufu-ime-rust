@@ -3,6 +3,7 @@
 //! 用法：hufu-server [--data <目录>] [--port <端口>]
 //! 默认数据目录：./hufu-data（或环境变量 HUFU_DATA）；默认端口 4390。
 
+mod candwin;
 mod host;
 mod http;
 mod pipe;

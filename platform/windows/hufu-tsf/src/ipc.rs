@@ -29,7 +29,11 @@ unsafe extern "system" {
         pi: *mut core::ffi::c_void,
     ) -> i32;
     fn CloseHandle(h: isize) -> i32;
+    fn GetLastError() -> u32;
 }
+
+/// 最近一次管道连接失败的 Win32 错误码（诊断用；0=无失败记录）
+pub static LAST_PIPE_ERR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -130,6 +134,7 @@ pub fn call(req: &Value) -> Option<Value> {
             if h != INVALID {
                 break;
             }
+            LAST_PIPE_ERR.store(unsafe { GetLastError() }, std::sync::atomic::Ordering::SeqCst);
             // 打不开：server 不在则拉起，再等管道就绪
             if !spawned {
                 spawned = true;
