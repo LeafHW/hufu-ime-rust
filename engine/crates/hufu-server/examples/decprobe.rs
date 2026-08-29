@@ -1,7 +1,8 @@
 //! 复刻 server 装配：Schema::load + SentenceEngine::load，验证 eyiahx/窒闷
 //! 是否进入解码格子。用法: decprobe <数据目录> <ngram路径>
 
-use std::sync::Arc;
+use hufu_engine::SentenceDecoder;
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -9,7 +10,7 @@ fn main() {
     let ngram = std::path::PathBuf::from(&args[2]);
     let schema_dir = data_dir.join("码表").join("虎整句");
 
-    let schema = hufu_engine::Schema::load(&schema_dir).expect("方案加载失败");
+    let schema = hufu_dict::schema::Schema::load(&schema_dir).expect("方案加载失败");
     println!("码表条目数: {}", schema.dict.entries.len());
     let hits: Vec<String> = schema
         .dict
@@ -54,16 +55,11 @@ fn main() {
     let dict = schema.dict.clone();
     let eng = hufu_sentence::SentenceEngine::load(&ngram, dict, &schema.supplement, weights)
         .expect("引擎装配失败");
-    let dec = eng.decode("ueyiahx");
-    println!("══ decode(ueyiahx) ══");
-    for (i, h) in dec.hits.iter().take(6).enumerate() {
-        println!(
-            "{}. {}  score={:.3} segmented=[{}] max_rank={}",
-            i + 1,
-            h.text,
-            h.score,
-            h.segmented,
-            h.max_rank
-        );
+    for raw in ["ueeyiahx", "ueyiahx"] {
+        let dec = eng.decode(raw);
+        println!("══ decode({raw}) ══");
+        for (i, h) in dec.iter().take(6).enumerate() {
+            println!("{}. {}  weight={:.3} code=[{}]", i + 1, h.text, h.weight, h.code);
+        }
     }
 }
