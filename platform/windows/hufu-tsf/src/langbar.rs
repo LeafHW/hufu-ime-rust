@@ -52,7 +52,13 @@ fn is_chinese() -> bool {
     CHINESE.load(Ordering::Relaxed)
 }
 
-/// 更新模式并广播所有 sink（msctf 重拉图标/文字）。返回是否有变化。
+/// 更新模式并请求广播（sink 通知 + compartment 推送）。
+/// 返回是否有变化。
+/// 【异步化——图标只动一次的真因】曾在 OnClick 线程内同步调
+/// sink.OnUpdate：explorer 收到后回调 GetIcon 需重入正被点击回调
+/// 占用的 UI 线程，COM 拒绝重入 → explorer 放弃重绘（首次之后图标
+/// 再不动）。现改为把广播请求发给常驻 MTA 工作线程，OnClick 立即
+/// 返回，线程空闲后 explorer 的回查畅通。
 pub fn set_mode(zh: bool) -> bool {
     let old = CHINESE.swap(zh, Ordering::Relaxed);
     if old == zh {
@@ -62,9 +68,51 @@ pub fn set_mode(zh: bool) -> bool {
         let n = SINKS.lock().map(|v| v.len()).unwrap_or(0);
         n
     }));
-    notify_sinks();
-    push_compartments();
+    // compartment 双写：线程侧（UI 线程，系统牌在焦点/输入法切换时
+    // 读取它）+ 全局侧（工作线程，跨进程对账总线）
+    push_thread_compartment();
+    request_broadcast();
     true
+}
+
+// ── 常驻广播工作线程（CoInitialize MTA；COM 调用合法宿主）──
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(pv: *mut core::ffi::c_void, dw: u32) -> i32;
+}
+const COINIT_MULTITHREADED: u32 = 0x0;
+static NOTIFY_TX: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+fn request_broadcast() {
+    let tx = {
+        let mut guard = match NOTIFY_TX.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("hufu-lb-bcast".into())
+                .spawn(move || {
+                    unsafe {
+                        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
+                    }
+                    // 批处理：连续切换合并为一次广播（线程侧已由 UI
+                    // 线程同步推过；这里只负责全局总线 + sink 通知）
+                    while rx.recv().is_ok() {
+                        while rx.try_recv().is_ok() {}
+                        notify_sinks();
+                        push_global_compartment();
+                    }
+                })
+                .ok();
+            *guard = Some(tx);
+        }
+        guard.clone()
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
 }
 
 /// 追加式诊断日志（%TEMP%\hufu-langbar.log；一行一条，带时间戳）。
@@ -96,29 +144,33 @@ thread_local! {
     /// 本线程 compartment 源（Activate 时装；thread mgr 本身实现该接口）
     static COMP_THREAD: std::cell::RefCell<Option<ITfCompartmentMgr>> =
         const { std::cell::RefCell::new(None) };
-    /// 全局 compartment 源（进程只装一次）
-    static COMP_GLOBAL: std::cell::RefCell<Option<ITfCompartmentMgr>> =
-        const { std::cell::RefCell::new(None) };
     static COMP_COOKIE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static COMP_CLIENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+/// 全局 compartment 源：进程级（工作线程也要推；COM 代理跨线程搬运）
+struct SendComp(ITfCompartmentMgr);
+unsafe impl Send for SendComp {}
+static COMP_GLOBAL: Mutex<Option<SendComp>> = Mutex::new(None);
+/// TSF client id（SetValue 需要；进程级，工作线程可读）
+static TID: AtomicU32 = AtomicU32::new(0);
 static GLOBAL_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Activate 时调用：装 compartment 引用 + 挂监听 + 推初值。
 /// tid = TSF client id（SetValue 需要）。
 pub fn install_compartments(tm: &ITfThreadMgr, tid: u32) {
-    COMP_CLIENT.with(|c| c.set(tid));
+    TID.store(tid, Ordering::Relaxed);
     if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
         COMP_THREAD.with(|c| *c.borrow_mut() = Some(cm));
     }
     if !GLOBAL_DONE.swap(true, Ordering::Relaxed) {
         if let Ok(g) = unsafe { tm.GetGlobalCompartment() } {
-            COMP_GLOBAL.with(|c| *c.borrow_mut() = Some(g));
+            if let Ok(mut slot) = COMP_GLOBAL.lock() {
+                *slot = Some(SendComp(g.clone()));
+            }
+            // 全局监听只挂一次（进程存续期内常驻）
+            advise_conversion(Some(g), tid, true);
         }
-        // 全局监听只挂一次（进程存续期内常驻）
-        advise_conversion(COMP_GLOBAL.with(|c| c.borrow().clone()), tid);
     }
-    advise_conversion(COMP_THREAD.with(|c| c.borrow().clone()), tid);
+    advise_conversion(COMP_THREAD.with(|c| c.borrow().clone()), tid, false);
     push_compartments();
 }
 
@@ -139,34 +191,57 @@ pub fn uninstall_compartments() {
     COMP_THREAD.with(|c| *c.borrow_mut() = None);
 }
 
-/// 把当前模式推进 OPENCLOSE + CONVERSION（线程 + 全局）
+/// 把当前模式推进 OPENCLOSE + CONVERSION。
+/// 线程侧（UI 线程同步）：任务栏牌渲染的就是它；
+/// 全局侧（工作线程）：跨进程对账总线。
 pub fn push_compartments() {
+    push_thread_compartment();
+    push_global_compartment();
+}
+
+/// 线程 compartment（本线程上下文；set_mode/Activate 在 UI 线程调）
+fn push_thread_compartment() {
     let conv: i32 = if is_chinese() {
         TF_CONVERSIONMODE_NATIVE as i32
     } else {
         TF_CONVERSIONMODE_ALPHANUMERIC as i32
     };
-    let tid = COMP_CLIENT.with(|c| c.get());
-    for src in [
-        COMP_THREAD.with(|c| c.borrow().clone()),
-        COMP_GLOBAL.with(|c| c.borrow().clone()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        unsafe {
-            if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
-                let v = VARIANT::from(1i32);
-                if let Err(e) = comp.SetValue(tid, &v) {
-                    log_diag(&format!("push OPENCLOSE hr={:08X}", e.code().0 as u32));
-                }
-            }
-            if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
-                let v = VARIANT::from(conv);
-                if let Err(e) = comp.SetValue(tid, &v) {
-                    log_diag(&format!("push CONV={conv} hr={:08X}", e.code().0 as u32));
-                }
-            }
+    let tid = TID.load(Ordering::Relaxed);
+    let Some(src) = COMP_THREAD.with(|c| c.borrow().clone()) else {
+        return;
+    };
+    unsafe {
+        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
+            let v = VARIANT::from(1i32);
+            let _ = comp.SetValue(tid, &v);
+        }
+        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
+            let v = VARIANT::from(conv);
+            let _ = comp.SetValue(tid, &v);
+        }
+    }
+}
+
+/// 全局 compartment（任意线程可调；COM 代理）
+fn push_global_compartment() {
+    let conv: i32 = if is_chinese() {
+        TF_CONVERSIONMODE_NATIVE as i32
+    } else {
+        TF_CONVERSIONMODE_ALPHANUMERIC as i32
+    };
+    let tid = TID.load(Ordering::Relaxed);
+    let Some(src) = COMP_GLOBAL.lock().ok().and_then(|s| s.as_ref().map(|g| g.0.clone()))
+    else {
+        return;
+    };
+    unsafe {
+        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
+            let v = VARIANT::from(1i32);
+            let _ = comp.SetValue(tid, &v);
+        }
+        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
+            let v = VARIANT::from(conv);
+            let _ = comp.SetValue(tid, &v);
         }
     }
 }
@@ -188,7 +263,7 @@ unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
     }
 }
 
-fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32) {
+fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32, read_global: bool) {
     let Some(cm) = cm else { return };
     unsafe {
         let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) else {
@@ -197,16 +272,23 @@ fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32) {
         let Ok(src) = comp.cast::<ITfSource>() else {
             return;
         };
-        let sink: ITfCompartmentEventSink = ModeSink.into();
+        let sink: ITfCompartmentEventSink = ModeSink { read_global }.into();
         let _ = src.AdviseSink(&ITfCompartmentEventSink::IID, &sink);
         // cookie 不存（进程存续期常驻；Deactivate 只摘线程那份）
     }
 }
 
-/// 外部改了转换模式（用户点系统牌）：值 ≠ 预期 → 引擎跟上切换；
-/// 相等（自己的写入回声）→ 忽略。反馈环就此掐断。
+/// 外部改了转换模式（用户点系统牌 / 其他进程广播）：值 ≠ 预期 →
+/// 引擎【设值】跟上；相等（自己的写入回声）→ 忽略。
+/// 【权威域拆分】sink 只读自己监听的那一侧：
+/// - 线程 sink 读线程 compartment（本应用内 explorer 点牌 → 本线程值）
+/// - 全局 sink 读全局 compartment（跨进程总线，全员向它收敛）
+/// 曾因"线程优先、全局兜底"串读：后台进程拿【陈旧线程值】对账，
+/// 把引擎设回旧状态、恰好撤销用户刚点的切换（一轮失效的真因）。
 #[implement(ITfCompartmentEventSink)]
-struct ModeSink;
+struct ModeSink {
+    read_global: bool,
+}
 
 impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
     fn OnChange(&self, rguid: *const GUID) -> Result<()> {
@@ -220,23 +302,19 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         } else {
             TF_CONVERSIONMODE_ALPHANUMERIC as i32
         };
-        // 读触发侧的当前值（线程优先，全局兜底）
+        // 只读本 sink 的权威域（谁触发读谁，不串读）
+        let src = if self.read_global {
+            COMP_GLOBAL.lock().ok().and_then(|s| s.as_ref().map(|g| g.0.clone()))
+        } else {
+            COMP_THREAD.with(|c| c.borrow().clone())
+        };
         let mut actual: Option<i32> = None;
-        for src in [
-            COMP_THREAD.with(|c| c.borrow().clone()),
-            COMP_GLOBAL.with(|c| c.borrow().clone()),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(cm) = src {
             if let Ok(comp) =
-                unsafe { cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) }
+                unsafe { cm_compartment(&cm, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) }
             {
                 if let Ok(v) = unsafe { comp.GetValue() } {
-                    if let Some(n) = unsafe { var_i32(&v) } {
-                        actual = Some(n);
-                        break;
-                    }
+                    actual = unsafe { var_i32(&v) };
                 }
             }
         }
@@ -247,7 +325,10 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
                 // OnChange，各自 toggle 会把共享引擎连番翻转（实测奇偶
                 // 错乱）；幂等 set_lang 让全部进程收敛到同一状态。
                 let want_zh = (n & TF_CONVERSIONMODE_NATIVE as i32) != 0;
-                log_diag(&format!("OnChange actual={n} expected={expected} → set_lang zh={want_zh}"));
+                let tag = if self.read_global { "G" } else { "T" };
+                log_diag(&format!(
+                    "OnChange[{tag}] actual={n} expected={expected} → set_lang zh={want_zh}"
+                ));
                 if let Some(resp) = crate::ipc::call(&serde_json::json!({
                     "op": "set_lang", "chinese": want_zh
                 })) {
@@ -332,17 +413,6 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
 pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     let item: ITfLangBarItem = unsafe { HuFuLangBar::new().into() };
     let r = unsafe { mgr.AddItem(&item) };
-    // 诊断标记：Activate 后 %TEMP%\hufu-langbar.txt 可查挂载结果
-    let msg = match &r {
-        Ok(()) => format!(
-            "ok pid={} zh={} t={:?}\n",
-            std::process::id(),
-            is_chinese(),
-            std::time::SystemTime::now()
-        ),
-        Err(e) => format!("FAIL {:#010x} pid={}\n", e.code().0, std::process::id()),
-    };
-    let _ = std::fs::write(std::env::temp_dir().join("hufu-langbar.txt"), msg);
     r?;
     LANGBAR_ITEM.with(|c| *c.borrow_mut() = Some(item));
     Ok(())
