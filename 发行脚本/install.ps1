@@ -133,6 +133,7 @@ Write-Host '  · Win+空格 切到「HuFu 虎符输入法」'
 Write-Host '  · 双击「设置.bat」打开设置窗口'
 Write-Host '  · 托盘（输入法区）双击同样打开设置'
 if (-not $hklm) { Write-Host '  · 本次为每用户安装（无管理员权限）' }
+Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载新输入法'
 Write-Host '==========================================' -ForegroundColor Green
 Write-Host '  · 托盘小虎图标只在「切到虎符输入法」时出现；'
 Write-Host '    想让它常驻任务栏（不进隐藏折叠区）：'

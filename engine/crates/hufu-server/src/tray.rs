@@ -458,12 +458,22 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
             LoadImageW(0, 32512 as *const u16, 1, 0, 0, 0x8000)
         }
     };
+    // 固定 GUID 身份（NIF_GUID）：无 GUID 时 Windows 按「窗口+图标」
+    // 指纹识别托盘项——进程重启/重装后指纹变化，用户设过的「常驻
+    // 任务栏（不进折叠区）」就被当成新图标遗忘，图标重新躲进隐藏区。
+    // 固定 GUID 后身份跨重启/重装稳定，常驻设置一次永久记住。
+    const NIF_GUID: u32 = 0x10;
+    // {7C9A2B44-3E11-4F5A-9D6C-8B1E0A55F3A2}（GUID 内存序）
+    const TRAY_GUID: [u8; 16] = [
+        0x44, 0x2B, 0x9A, 0x7C, 0x11, 0x3E, 0x5A, 0x4F, 0x9D, 0x6C, 0x8B, 0x1E, 0x0A, 0x55,
+        0xF3, 0xA2,
+    ];
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
         // NIF_ICON 必须置位：漏了它 Shell_NotifyIcon 无视 hIcon（此前图标永远是系统默认的真因）
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID,
         uCallbackMessage: WM_APP,
         hIcon: hicon,
         szTip: tip,
@@ -473,7 +483,7 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
         uVersion: 0,
         szInfoTitle: [0; 64],
         dwInfoFlags: 0,
-        guidItem: [0; 16],
+        guidItem: TRAY_GUID,
         hBalloonIcon: 0,
     }
 }
