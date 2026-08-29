@@ -959,8 +959,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             c.hide();
         }
     } else if g.cand_ui_active {
-        // 沉浸式宿主：UIElement（宿主画）或 server 代画双通道
-        let (x, y) = g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
+        // 沉浸式宿主：UIElement（宿主画）或 server 代画双通道。
+        // 开始菜单=左上角定稿；其他宿主（真·持续 cloak 的 UWP 等）
+        // =跟光标。
+        let (x, y) = if host_is_searchhost() {
+            (12, 12)
+        } else {
+            g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
+        };
         let raw_c = raw.clone();
         drop(g);
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
@@ -978,15 +984,18 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         let skin = g.skin.clone();
         let caret = g.caret;
-        // DComp 直通窗在打包宿主（SearchHost 等）里会被 DWM 整体
-        // cloaked（显示中但不可见，实测 cloak=2）；v1 混合窗同被隐身，
-        // 自绘路线在此类宿主是死路。首帧 cloaked 即切双通道
-        // （UIElement→宿主画，拒绝则 server 代画）——用户短编码只有
-        // 2 帧按键，阈值 2 会错过切换时机。
+        // DComp 直通窗在 SearchHost（开始菜单搜索）里被 DWM 整体
+        // cloaked（显示中但不可见，实测 cloak=2 逐帧持续）；v1 混合窗
+        // 同被隐身，自绘路线在该宿主是死路 → 切 server 代画（左上角）。
+        // 【其他宿主（含 UWP 如 Store）】建窗首帧 cloak=2 是瞬态
+        // （vis=0 未 Show，实测 Store 首帧即切 → 候选跑左上角被用户
+        // 否决）：streak>=3 才认「真·持续隐身」，且降级为 server 代画
+        // 【跟光标】（观感=正常候选窗），位置不跑左上角。
+        let sh = host_is_searchhost();
         let cloaked_dead = g
             .cand2
             .as_ref()
-            .map(|c| c.cloaked_streak >= 1)
+            .map(|c| c.cloaked_streak >= if sh { 1 } else { 3 })
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
@@ -995,10 +1004,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             // 不预置 cand_ui_active——由 ui_element_show 先问宿主
             // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
             g.cand2_dead = true;
-            let (x, y) = caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
+            let (x, y) = if sh {
+                // 【用户定稿】开始菜单：候选固定屏幕左上角
+                (12, 12)
+            } else {
+                caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
+            };
             let raw_c = raw.clone();
             drop(g);
-            diag_note("cw2 连续 cloaked → 切换双通道候选");
+            diag_note(if sh {
+                "cw2 连续 cloaked → 切换双通道候选（左上角）"
+            } else {
+                "cw2 持续 cloaked（非开始菜单）→ server 跟光标代画"
+            });
             ui_element_show(&shared, &cands, &raw_c, sel, x, y);
             return Ok(());
         }
@@ -1008,14 +1026,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
     } else {
         // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
-        // （Deactivate→再 Activate 的状态漂移）：直接 server 代画自愈。
-        // 不再建 v1 窗——v1 在沉浸宿主同样被 cloak 隐身（死路，实测
-        // 搜索框候选「出现一次后永不再现」即此）
-        let (x, y) = g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100));
-        let raw_c = raw.clone();
-        drop(g);
-        diag_note("cand2_dead 漂移自愈 → server 代画");
-        ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+        // （Deactivate→再 Activate 的状态漂移）：SearchHost 直接
+        // server 代画自愈（左上角）；其他宿主复位 dead 下一帧重建自绘
+        if host_is_searchhost() {
+            let raw_c = raw.clone();
+            drop(g);
+            diag_note("cand2_dead 漂移自愈 → server 代画（左上角）");
+            ui_element_show(&shared, &cands, &raw_c, sel, 12, 12);
+        } else {
+            g.cand2_dead = false;
+        }
         return Ok(());
     }
     Ok(())
@@ -1069,25 +1089,43 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 /// 首帧 BeginUIElement——pbShow=TRUE 即宿主愿意代画（走 UIElement），
 /// FALSE 则降级 server 代画（pipe 推送候选+坐标，server 开窗绘制，
 /// 其普通桌面进程窗口不受容器隐身限制）。后续帧按通道更新。
+/// 宿主是否开始菜单搜索（SearchHost.exe）。DLL 跑在宿主进程里，
+/// current_exe 即宿主路径。开始菜单的 DWM_CLOAKED_SHELL 是逐帧
+/// 持续的真隐身（首帧即切、位置=左上角）；其他宿主（含 UWP/Store）
+/// 首帧 cloak=2 是建窗瞬态，streak>=3 才算真隐身且位置跟光标。
+fn host_is_searchhost() -> bool {
+    static SH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SH.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                p.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        exe.eq_ignore_ascii_case("SearchHost.exe")
+    })
+}
+
 fn ui_element_show(
     shared: &SharedRef,
     cands: &[(String, String)],
     raw: &str,
     sel: usize,
-    _x: i32,
-    _y: i32,
+    x: i32,
+    y: i32,
 ) {
-    // 【用户定稿】沉浸式宿主（开始菜单等）：候选固定屏幕左上角，由
-    // server 代画【用户自己的皮肤】（与普通应用同皮肤同竖排观感，
-    // 仅位置不同）。系统自带候选条仅微软自家 IME 可用；自绘窗被
-    // DWM_CLOAKED_SHELL 隐身；server topmost 窗需 AttachThreadInput
-    // 强制置顶，已验证像素级可见。
+    // 【用户定稿】沉浸式宿主候选由 server 代画【用户自己的皮肤】
+    // （与普通应用同皮肤同竖排观感）：开始菜单=屏幕左上角（调用方
+    // 传 12,12），真·持续 cloak 的其他宿主=跟光标（调用方传光标坐
+    // 标）。系统自带候选条仅微软自家 IME 可用；自绘窗被
+    // DWM_CLOAKED_SHELL 隐身；server topmost 窗已验证像素级可见。
     let mut g = shared.lock().unwrap();
     g.cand_ui_active = true;
     g.cand_ui_host_draws = false;
     let skin = g.skin.clone();
     drop(g);
-    pipe_cand_push(cands, raw, sel, 12, 12, &skin);
+    pipe_cand_push(cands, raw, sel, x, y, &skin);
 }
 
 /// server 代画：pipe 推送候选帧（含皮肤，server 按皮肤渲染）
