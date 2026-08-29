@@ -64,6 +64,44 @@ fn main() {
         });
     }
 
+    // 整句模型后台装载：Host::new 只载词典（秒级），此处线程不持锁
+    // 载 ngram（~10s），载完短锁热挂。期间管道/设置页/打字照常
+    // （词典模式），整句能力稍后自动就位——修「装完要等好久才能
+    // 正常打字」：管道不再被模型加载阻塞。
+    {
+        let shared_bg = shared.clone();
+        std::thread::Builder::new()
+            .name("hufu-ngram-load".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                let plan = {
+                    let h = shared_bg.lock().unwrap();
+                    h.sentence_load_plan()
+                };
+                let Some((path, dict, supplement, weights)) = plan else {
+                    return;
+                };
+                match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
+                    Ok(dec) => {
+                        let mut h = shared_bg.lock().unwrap();
+                        // 装载期间用户可能切方案/关整句：只在仍满足
+                        // 门控时挂载，否则弃用本次结果
+                        if h.engine.config.schema.current.contains("整句")
+                            && h.engine.config.sentence.enabled
+                        {
+                            h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+                            eprintln!(
+                                "整句引擎已加载（后台 {:.1}s）: {}",
+                                t0.elapsed().as_secs_f32(),
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("整句模型后台加载失败: {e}"),
+                }
+            });
+    }
+
     // Windows 托盘（双击开设置页 / 右键退出）
     #[cfg(windows)]
     {

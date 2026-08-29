@@ -41,8 +41,10 @@ impl Host {
             rerank_tx: None,
         };
         host.install_official_skins();
-        host.setup_sentence();
         host.setup_rerank();
+        // 注意：整句模型不在此时同步加载——由 main.rs 的后台线程
+        // 装载后热挂（见 sentence_load_plan）。启动只载词典（秒级），
+        // 管道/设置页即刻可用；装完立即可打字，整句能力稍后自动就位。
         Ok(host)
     }
 
@@ -66,6 +68,32 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// 后台加载整句模型的「装载计划」：快照判定条件与所需所有权
+    /// （词典 Arc/补充语料/权重），真正的重活（ngram 载入）交给调用
+    /// 线程**不持锁**执行——期间按键请求照常被词典模式服务。
+    pub fn sentence_load_plan(
+        &self,
+    ) -> Option<(
+        PathBuf,
+        std::sync::Arc<hufu_dict::dict::Dict>,
+        hufu_dict::supplement::Supplement,
+        hufu_config::SentenceWeights,
+    )> {
+        if !self.engine.config.schema.current.contains("整句") {
+            return None;
+        }
+        let path = self.data_dir.join(&self.engine.config.sentence.ngram_path);
+        if !(self.engine.config.sentence.enabled && path.exists()) {
+            return None;
+        }
+        Some((
+            path,
+            self.engine.schema.dict.clone(),
+            self.engine.schema.supplement.clone(),
+            self.engine.config.sentence.weights.clone(),
+        ))
     }
 
     /// 依据配置与磁盘可用性装配整句解码器。
