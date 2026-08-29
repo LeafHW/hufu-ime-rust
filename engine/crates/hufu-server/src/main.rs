@@ -22,7 +22,16 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut data_dir = std::env::var("HUFU_DATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("hufu-data"));
+        .unwrap_or_else(|_| {
+            // 默认：exe 同目录下的「数据」（安装布局 %LOCALAPPDATA%\HuFu\数据）。
+            // 不再用相对路径 hufu-data——CWD 不可控（开机自启/explorer 中转启动时
+            // CWD 是 system32 等），相对默认会凭空建出错误目录。
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .map(|d| d.join("数据"))
+                .unwrap_or_else(|| PathBuf::from("hufu-data"))
+        });
     let mut port: u16 = 4390;
     while let Some(a) = args.next() {
         match a.as_str() {

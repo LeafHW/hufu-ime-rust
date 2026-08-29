@@ -1,16 +1,68 @@
-﻿# HuFu 虎符输入法 — 安装脚本（管理员可选）
-# 布局：复制到 %LOCALAPPDATA%\HuFu（用户可写），COM/TIP/档案全部
-#       走 HKCU 每用户注册（免管理员）；若当前用户在管理员组则提权
-#       一次补写 HKLM 机器级键（多一层保险，非必需）。
-param([switch]$NoHKLM)   # 测试用：强制每用户模式（跳过 HKLM 与提权）
+﻿# HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
+# - 文件/HKCU/语言列表/自启/server 永远普通权限执行（server 提权启动会锁管道 ACL，
+#   导致所有普通应用连不上→只能打字母，2026-08-29 实测教训）。
+# - HKLM 机器级键 + msctf 原生登记（本机实测需提权才 0x00000000）交给一次 UAC 的
+#   提权子进程（-PhaseElevated），日志回流本窗口可见。
+# - -NoHKLM：完全跳过提权（无管理员机器的每用户安装；msctf 登记尽力而为）。
+param([switch]$NoHKLM, [switch]$PhaseElevated)
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 
 $CLSID   = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}'
 $PROFILE = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}'
 $TFCAT_KBD = '{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}'
 
-# ── 权限判定：已提权 / 管理员组成员（可 UAC）/ 普通用户（免提权）──
+$src  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$inst = Join-Path $env:LOCALAPPDATA 'HuFu'
+$data = Join-Path $inst '数据'
+$dll  = Join-Path $inst 'hufu_tsf.dll'
+$exe  = Join-Path $inst 'hufu-server.exe'
+$icon = Join-Path $inst '图标.ico'
+
+function Set-Reg([string]$path, [string]$name, [string]$val) {
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    if ($name -eq '(default)') {
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($path -replace '^[^:\\]+:\\', ''), $true)
+        if ($k) { $k.SetValue('', $val); $k.Close() }
+        else { $ki = Get-Item $path; $ki.SetValue('', $val) }
+    } else { Set-ItemProperty -Path $path -Name $name -Value $val -Type String }
+}
+function Set-RegDWord([string]$path, [string]$name, [int]$val) {
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    Set-ItemProperty -Path $path -Name $name -Value $val -Type DWord
+}
+function Set-RegHKLM([string]$path, [string]$name, [string]$val) {
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    if ($name -eq '(default)') {
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(($path -replace '^HKLM:\\', ''), $true)
+        if ($k) { $k.SetValue('', $val); $k.Close() }
+    } else { Set-ItemProperty -Path $path -Name $name -Value $val -Type String }
+}
+
+# ═══ 提权子阶段：只做 HKLM 注册 + msctf 登记，绝不启动 server ═══
+if ($PhaseElevated) {
+    Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
+    $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
+    Set-RegHKLM "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
+    Set-RegHKLM $ips '(default)' $dll
+    Set-RegHKLM $ips 'ThreadingModel' 'Apartment'
+    $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID"
+    Set-RegHKLM "$tip\Description" '(default)' 'HuFu 虎符输入法（虎码）'
+    New-Item -Path "$tip\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
+    New-Item -Path "$tip\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
+    $lp = "$tip\LanguageProfile\0x00000804\$PROFILE"
+    Set-RegHKLM $lp 'Description' 'HuFu 虎符输入法'
+    Set-RegHKLM $lp 'Display Description' 'HuFu 虎符输入法'
+    Set-ItemProperty -Path $lp -Name 'Enable' -Value 1 -Type DWord
+    Set-RegHKLM $lp 'IconFile' $dll
+    Set-ItemProperty -Path $lp -Name 'IconIndex' -Value 0 -Type DWord
+    Write-Host 'OK HKLM 机器级已注册'
+    Write-Host '—— 提权阶段：msctf 原生登记 ——'
+    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+    Write-Host '提权阶段完成。'
+    exit
+}
+
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $inAdminGroup = $false
@@ -18,60 +70,19 @@ try {
     $inAdminGroup = (whoami /groups /fo csv | Select-String 'S-1-5-32-544').Count -gt 0
 } catch {}
 
-$hklm = $isAdmin
-if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
-    # 管理员组的未提权会话：提权一次做机器级安装（UAC 一下确认）
-    $ps = Join-Path $PSHOME 'powershell.exe'
-    Start-Process $ps -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Wait
-    exit
-}
-if (-not $hklm) {
-    Write-Host '→ 每用户安装（无需管理员权限，功能完全一致）' -ForegroundColor Yellow
-}
-
-$src = $PSScriptRoot
-$inst = Join-Path $env:LOCALAPPDATA 'HuFu'
-$dll  = Join-Path $inst 'hufu_tsf.dll'
-$exe  = Join-Path $inst 'hufu-server.exe'
-$icon = Join-Path $inst '图标.ico'
-$data = Join-Path $inst '数据'
-
+Write-Host ''
+Write-Host 'HuFu 虎符输入法 安装' -ForegroundColor Cyan
 Write-Host "安装到: $inst"
 
-# ── 1) 复制文件（升级时保留用户 config.json 与词库日志）──
-New-Item -ItemType Directory -Force -Path $inst | Out-Null
-robocopy $src $inst /E /XF config.json /R:1 /W:1 /NFL /NDL /NP | Out-Null
-$userCfg = Join-Path $data 'config.json'
-if (-not (Test-Path $userCfg)) {
-    New-Item -ItemType Directory -Force -Path $data | Out-Null
-    Copy-Item (Join-Path $src '数据\config.json') $userCfg -Force
-}
+# ── 1) 文件就位（保留用户 config.json）──
+robocopy $src $inst /E /XF config.json install.ps1 uninstall.ps1 *.bat > $null
 Write-Host 'OK 文件就位'
 
-function Set-Reg([string]$Path, [string]$Name, [string]$Value) {
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    if ($Name -eq '(default)') {
-        $hive = if ($Path.StartsWith('HKLM:')) { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
-        $sub = $Path -replace '^[A-Z]+:\\', ''
-        $key = $hive.OpenSubKey($sub, $true)
-        if ($key) { $key.SetValue('', $Value); $key.Close() }
-    } else {
-        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type String
-    }
-}
-function Set-RegDWord([string]$Path, [string]$Name, [int]$Value) {
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord
-}
-
-# ── 2) HKCU COM 服务器（每用户；COM 解析 HKCU\Software\Classes 优先）──
+# ── 2) HKCU COM + CTF TIP 键树（每用户；msctf/COM 解析 HKCU 优先）──
 $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
 Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
 Set-Reg $ipsUser '(default)' $dll
 Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
-# regsvr32 触发 DLL 内 DllRegisterServer（HKCU TIP 键树）——但 /s 吞错
-# 且偶发静默失败（提权环境实测）。TIP 键树是 msctf 激活的硬前置，
-# 改由脚本直接等价直写（与 DllRegisterServer 同键集），双保险。
 regsvr32 /s $dll
 $tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
 Set-Reg $tipU '(default)' 'HuFu 输入法'
@@ -85,31 +96,27 @@ Set-RegDWord $lpU 'IconIndex' 0
 Set-Reg $lpU 'IconFile' $dll
 Write-Host 'OK HKCU COM + TIP 键树已注册'
 
-# ── 3) HKLM 机器级 COM + CTF 清单（可选：仅提权时；非必需保险层）──
-if ($hklm) {
-    $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
-    Set-Reg "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
-    Set-Reg $ips '(default)' $dll
-    Set-Reg $ips 'ThreadingModel' 'Apartment'
-    $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID"
-    Set-Reg "$tip\Description" '(default)' 'HuFu 虎符输入法（虎码）'
-    New-Item -Path "$tip\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
-    New-Item -Path "$tip\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
-    $lp = "$tip\LanguageProfile\0x00000804\$PROFILE"
-    Set-Reg $lp 'Description' 'HuFu 虎符输入法'
-    Set-Reg $lp 'Display Description' 'HuFu 虎符输入法'
-    Set-RegDWord $lp 'Enable' 1
-    Set-Reg $lp 'IconFile' $dll
-    Set-RegDWord $lp 'IconIndex' 0
-    regsvr32 /s $dll
-    Write-Host 'OK HKLM 机器级已注册（提权）'
+# ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
+if (-not $NoHKLM) {
+    if ($isAdmin) {
+        & $PSCommandPath -PhaseElevated
+    } elseif ($inAdminGroup) {
+        Write-Host '（弹出 UAC：机器级注册 + msctf 登记，请点「是」）'
+        $elog = Join-Path $env:TEMP 'hufu-install-elevated.log'
+        $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -PhaseElevated *> '$elog'`""
+        Start-Process $ps -Verb RunAs -ArgumentList $arg -Wait
+        if (Test-Path $elog) { Get-Content $elog | ForEach-Object { Write-Host "  $_" } }
+    } else {
+        Write-Host '· 无管理员权限：跳过 HKLM/msctf 提权登记，尝试每用户登记'
+        & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+    }
+} else {
+    Write-Host '· -NoHKLM：跳过提权，尝试每用户 msctf 登记'
+    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
 }
 
-# ── 4) msctf 原生档案登记（每用户；Win+空格 浮层唯一数据源）──
-& (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
-Write-Host 'OK msctf 原生档案已登记'
-
-# ── 5) 语言列表 + 切换器装配（每用户）──
+# ── 4) 语言列表 + 切换器装配（每用户）──
 $tipStr = "0804:$CLSID$PROFILE"
 $list = Get-WinUserLanguageList
 $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
@@ -125,28 +132,33 @@ Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
 Set-ItemProperty -Path $asm -Name 'Profile' -Value $PROFILE -Type String
 Write-Host 'OK 语言列表 + 切换器装配已写入'
 
-# ── 6) 开机自启（server 常驻 = 托盘 + 设置页 + 管道）──
+# ── 5) 开机自启（server 常驻 = 托盘 + 设置页 + 管道）──
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-Set-Reg $run 'HuFu' ('"{0}" --data "{1}"' -f $exe, $data)
-Write-Host 'OK 开机自启已设置'
+Set-Reg $run 'HuFu' ('"{0}"' -f $exe)
+Write-Host 'OK 开机自启已设置（数据目录默认 exe 同目录）'
 
-# ── 7) 启动 server + 刷新输入浮层宿主 ──
+# ── 6) 启动 server ——【铁律】必须普通权限：提权启动的管道会拒绝普通应用】──
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Process $exe -ArgumentList '--data', $data -WindowStyle Hidden
+Start-Sleep -Milliseconds 500
+if ($isAdmin) {
+    # 本脚本自身被提权运行（如右键管理员）：经 explorer 中转降权启动
+    explorer.exe $exe
+} else {
+    Start-Process $exe -WindowStyle Hidden
+}
+Start-Sleep -Seconds 2
 Stop-Process -Name TextInputHost, ShellExperienceHost -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
 Write-Host ''
-Write-Host '==========================================' -ForegroundColor Green
-Write-Host ' 安装完成！' -ForegroundColor Green
+Write-Host '=========================================='
+Write-Host ' 安装完成！'
 Write-Host '  · Win+空格 切到「HuFu 虎符输入法」'
 Write-Host '  · 双击「设置.bat」打开设置窗口'
 Write-Host '  · 托盘（输入法区）双击同样打开设置'
-if (-not $hklm) { Write-Host '  · 本次为每用户安装（无管理员权限）' }
+Write-Host '=========================================='
 Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载新输入法'
-Write-Host '==========================================' -ForegroundColor Green
-Write-Host '  · 托盘小虎图标只在「切到虎符输入法」时出现；'
-Write-Host '    想让它常驻任务栏（不进隐藏折叠区）：'
-Write-Host '    右键任务栏 - 任务栏设置 - 其他系统托盘图标 - 把「hufu-server」打开（只需设一次）。'
-Write-Host '  · 音效默认关闭，想开请到 设置 - 音效 打开。'
+if ($NoHKLM) { Write-Host '  · 本次为每用户安装（-NoHKLM，未写 HKLM）' }
+Write-Host '  · 托盘小虎图标只在「切到虎符输入法」时出现；想常驻任务栏：'
+Write-Host '    右键任务栏 - 任务栏设置 - 其他系统托盘图标 - 打开「hufu-server」。'
