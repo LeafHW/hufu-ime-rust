@@ -1,4 +1,5 @@
 @echo off
-rem Pure-ASCII skeleton: all CJK text lives in uninstall.ps1 (UTF-8 BOM).
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall.ps1"
+rem Per-user uninstall (no UAC). HKLM leftovers (if any elevated install was used) are harmless.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall.ps1" -NoHKLM
+cd /d "%USERPROFILE%"
 pause
