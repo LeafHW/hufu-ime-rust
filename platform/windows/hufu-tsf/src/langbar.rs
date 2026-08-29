@@ -15,7 +15,10 @@ use windows::Win32::UI::TextServices::{
     ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW,
+    SetForegroundWindow, HICON, HWND_MESSAGE, ICONINFO, WNDCLASSEXW,
+};
 
 /// COM 指针跨线程搬运套（sink 由 msctf 线程 Advise、模式切换线程通知：
 /// 实际调用仍是 COM 默认自由线程封送语义，这里只解除 Rust 的静态限制）
@@ -51,12 +54,34 @@ fn is_chinese() -> bool {
 
 /// 更新模式并广播所有 sink（msctf 重拉图标/文字）。返回是否有变化。
 pub fn set_mode(zh: bool) -> bool {
-    if CHINESE.swap(zh, Ordering::Relaxed) == zh {
+    let old = CHINESE.swap(zh, Ordering::Relaxed);
+    if old == zh {
         return false;
     }
+    log_diag(&format!("set_mode {old}->{zh} sinks={}", {
+        let n = SINKS.lock().map(|v| v.len()).unwrap_or(0);
+        n
+    }));
     notify_sinks();
     push_compartments();
     true
+}
+
+/// 追加式诊断日志（%TEMP%\hufu-langbar.log；一行一条，带时间戳）。
+/// 【教训】覆盖式日志只留最后一笔，排查点击序列时信息全丢。
+fn log_diag(s: &str) {
+    use std::io::Write;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() % 86_400_000)
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("hufu-langbar.log"))
+    {
+        let _ = writeln!(f, "[{:02}:{:02}:{:02}] {s}", t / 3_600_000, t / 60_000 % 60, t / 1000 % 60);
+    }
 }
 
 // ═══════════════ compartment 同步：系统输入指示「中/A」的真身 ═══════════════
@@ -132,11 +157,15 @@ pub fn push_compartments() {
         unsafe {
             if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
                 let v = VARIANT::from(1i32);
-                let _ = comp.SetValue(tid, &v);
+                if let Err(e) = comp.SetValue(tid, &v) {
+                    log_diag(&format!("push OPENCLOSE hr={:08X}", e.code().0 as u32));
+                }
             }
             if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
                 let v = VARIANT::from(conv);
-                let _ = comp.SetValue(tid, &v);
+                if let Err(e) = comp.SetValue(tid, &v) {
+                    log_diag(&format!("push CONV={conv} hr={:08X}", e.code().0 as u32));
+                }
             }
         }
     }
@@ -213,13 +242,22 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         }
         if let Some(n) = actual {
             if n != expected {
-                if let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
+                // 【多进程对账】按 compartment 指示值【设值】而非 toggle：
+                // 全局 compartment 变化时所有加载虎符的进程都会收到
+                // OnChange，各自 toggle 会把共享引擎连番翻转（实测奇偶
+                // 错乱）；幂等 set_lang 让全部进程收敛到同一状态。
+                let want_zh = (n & TF_CONVERSIONMODE_NATIVE as i32) != 0;
+                log_diag(&format!("OnChange actual={n} expected={expected} → set_lang zh={want_zh}"));
+                if let Some(resp) = crate::ipc::call(&serde_json::json!({
+                    "op": "set_lang", "chinese": want_zh
+                })) {
                     let zh = resp
                         .pointer("/state/chinese")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or_else(is_chinese);
-                    set_mode(zh); // 内部会推 compartment（此时值已一致，回声无害）
+                        .unwrap_or(want_zh);
+                    set_mode(zh); // 各进程收敛同值；重推同值回声无害
                 } else {
+                    log_diag("OnChange 引擎不可达 → 推回真实态");
                     push_compartments(); // 引擎不可达：把牌推回真实态
                 }
             }
@@ -377,7 +415,6 @@ unsafe extern "system" {
         rect: *const RECT,
     ) -> i32;
     fn DestroyMenu(m: isize) -> i32;
-    fn GetForegroundWindow() -> isize;
 }
 const MF_STRING: u32 = 0x0;
 const MF_SEPARATOR: u32 = 0x800;
@@ -387,7 +424,10 @@ const TPM_RIGHTALIGN: u32 = 0x8;
 const TPM_BOTTOMALIGN: u32 = 0x20;
 
 /// 右键小菜单：码表清单（当前 ✓）+ 分隔线 + 设置…
-/// 返回 true 表示已处理（弹了菜单）；菜单动作就地执行。
+/// 【owner 教训】TrackPopupMenu 的 owner 窗口必须属于调用线程——借
+/// GetForegroundWindow（他进程的窗口）会被静默拒绝（菜单不弹）。
+/// 这里现建一个 message-only 窗口（HWND_MESSAGE 父）作 owner，
+/// SetForegroundWindow 保焦点使外部点击可撤销，用完即毁。
 unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
     unsafe {
         // 取码表清单（server 不可达时只给设置项）
@@ -428,18 +468,59 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         }
         let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
-        // 前台窗口作 owner（经典托盘菜单套路：保焦点使外部点击可撤销）
-        let fg = GetForegroundWindow();
+        // 自建真弹出窗作 owner（调用线程持有 → 合法 owner）。
+        // 【教训】message-only 窗口不能 SetForegroundWindow（不可见），
+        // 焦点保不住 → 菜单有时秒关（sel=0）。真 WS_POPUP 0×0 窗可以。
+        unsafe extern "system" fn menu_wnd_proc(
+            h: windows::Win32::Foundation::HWND,
+            m: u32,
+            w: windows::Win32::Foundation::WPARAM,
+            l: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        let cls: Vec<u16> = "HUFU_LB_MENU\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(menu_wnd_proc),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
+        let owner = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+            PCWSTR(cls.as_ptr()),
+            PCWSTR(nm.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+            pt.x,
+            pt.y,
+            0,
+            0,
+            HWND_MESSAGE, // message-only 父：不进任务栏/切档
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        if owner.is_invalid() {
+            log_diag("popup: 建窗失败");
+            DestroyMenu(m);
+            return;
+        }
+        let _ = SetForegroundWindow(owner);
         let sel = TrackPopupMenu(
             m,
             TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
             pt.x,
             pt.y,
             0,
-            fg,
+            owner.0 as isize,
             std::ptr::null(),
         );
+        let _ = DestroyWindow(owner);
         DestroyMenu(m);
+        log_diag(&format!("popup sel={sel} schemas={}", schemas.len()));
         if sel == 1 {
             let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
         } else if sel >= 100 {
@@ -460,22 +541,24 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
         pt: &windows::Win32::Foundation::POINT,
         _prcarea: *const RECT,
     ) -> Result<()> {
-        // 诊断：点击路由确认（左右键实测排查用）
-        let _ = std::fs::write(
-            std::env::temp_dir().join("hufu-langbar-click.txt"),
-            format!("click={} t={:?}\n", click.0, std::time::SystemTime::now()),
-        );
+        // 诊断：追加式（点击种类 + 切换前态），序列可追溯
+        let pre = is_chinese();
+        log_diag(&format!("OnClick click={} pre_zh={pre}", click.0));
         if click.0 == 1 {
             // 右键：小菜单（码表切换 + 设置…）
             unsafe { popup_menu(pt) };
         } else {
             // 左键：切换中英（引擎无条件清编码后切换，回填图标/文字）
-            if let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
-                let zh = resp
-                    .pointer("/state/chinese")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or_else(is_chinese);
-                set_mode(zh);
+            match crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
+                Some(resp) => {
+                    let zh = resp
+                        .pointer("/state/chinese")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(pre);
+                    log_diag(&format!("toggle → engine_zh={zh}"));
+                    set_mode(zh);
+                }
+                None => log_diag("toggle 管道失败"),
             }
         }
         Ok(())

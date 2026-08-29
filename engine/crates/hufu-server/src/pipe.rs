@@ -88,6 +88,21 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
+        // compartment 对账用【设值】而非切换：全局 compartment 变化
+        // 时多个后台进程会各自收到 OnChange——若各自 toggle 会把共享
+        // 引擎连番翻转（实测：牌显英/打中文的奇偶错乱）。幂等设值让
+        // 所有进程收敛到 compartment 指示的同一状态。
+        "set_lang" => {
+            let zh = req
+                .get("chinese")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(host.session.chinese);
+            host.session.clear();
+            host.session.chinese = zh;
+            host.session.pair.reset();
+            let state = host.engine.state(&host.session);
+            serde_json::json!({"state": state})
+        }
         // 语言栏「中/英」右键菜单数据：码表清单 + 当前方案。
         // 【死锁教训】dispatch 已持 host 锁——绝不能经 tray::
         // schema_snapshot 二次锁同一把 Mutex（曾死锁管道线程拖死全机
