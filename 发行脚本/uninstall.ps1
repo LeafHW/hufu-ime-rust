@@ -67,3 +67,4 @@ Write-Host 'OK 卸载完成（注册表已清）' -ForegroundColor Green
 Write-Host "  程序与数据目录保留在：$inst"
 Write-Host "  确认不再使用可手动删除整个文件夹。"
 if (-not $hklm) { Write-Host '  （每用户卸载；HKLM 无写入，无残留）' }
+Write-Host '  · 无需重启/注销；已开应用里的输入法随应用关闭即消失'
