@@ -136,8 +136,16 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         g.thread_mgr = Some(tm);
         g.client_id = tid;
         // 语言栏「中」按钮：任务栏输入指示区常驻（切到虎符即现，Rime 风格）
-        if let Ok(lbm) = g.thread_mgr.as_ref().unwrap().cast::<ITfLangBarItemMgr>() {
-            let _ = crate::langbar::install(&lbm);
+        match g.thread_mgr.as_ref().unwrap().cast::<ITfLangBarItemMgr>() {
+            Ok(lbm) => {
+                let _ = crate::langbar::install(&lbm);
+            }
+            Err(e) => {
+                let _ = std::fs::write(
+                    std::env::temp_dir().join("hufu-langbar.txt"),
+                    format!("cast-fail {:#010x} pid={}\n", e.code().0, std::process::id()),
+                );
+            }
         }
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
