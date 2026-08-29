@@ -543,19 +543,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                 0
             }
             WM_APP_IME => {
-                // 输入法激活态变化。小虎爪印已改【常驻】：开机自启即上托盘，
-                // 不再随激活态显隐（用户定稿：指示 pill=「中」（DLL 资源），
-                // 爪印常驻托盘作设置入口）。此处仅作意外丢失后的补挂。
-                if wparam == 1 && !ICON_ADDED.load(Ordering::SeqCst) {
-                    let _ = KillTimer(hwnd, TIMER_IME_HIDE);
-                    let nid = nid_of(hwnd);
-                    if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-                        // 残留同名图标 → 先删再加
-                        Shell_NotifyIconW(NIM_DELETE, &nid);
-                        Shell_NotifyIconW(NIM_ADD, &nid);
-                    }
-                    ICON_ADDED.store(true, Ordering::SeqCst);
-                }
+                // 输入法激活态变化。【无托盘模式】不再上图标，此消息仅存档。
                 0
             }
             WM_TIMER => {
@@ -666,18 +654,9 @@ pub fn spawn(
         const HOTKEY_ID_SETTINGS: i32 = 0x4846; // "HF"
         let hk = RegisterHotKey(hwnd, HOTKEY_ID_SETTINGS, MOD_CONTROL | MOD_ALT, 0x48 /*'H'*/);
         let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
-        // 爪印【常驻】：server 启动即上托盘（不再等输入法激活）。
-        // 用户定稿分工——任务栏指示 pill=「中」（DLL 内嵌资源，切到虎符
-        // 即变）；小虎爪印常驻托盘=设置入口（双击开设置）+ 状态标识。
-        {
-            let nid = nid_of(hwnd);
-            if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-                // 残留同名图标（异常退出）→ 先删再加
-                Shell_NotifyIconW(NIM_DELETE, &nid);
-                Shell_NotifyIconW(NIM_ADD, &nid);
-            }
-            ICON_ADDED.store(true, Ordering::SeqCst);
-        }
+        // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
+        // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
+        // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
         let _ = GetCurrentThreadId();
         let mut m = MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, pt: POINT { x: 0, y: 0 } };
         loop {
