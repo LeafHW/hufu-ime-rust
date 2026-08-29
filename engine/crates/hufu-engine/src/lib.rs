@@ -1396,7 +1396,15 @@ impl Engine {
         if texts.len() < 2 {
             return None;
         }
-        Some((key, session.committed_text.clone(), texts))
+        // 语境 = 文章尾巴 + 句内已上屏前缀。句首无任何语境时不触发重排：
+        // 空上下文下 Qwen 会把 ngram 的正确序翻掉（实测 ueeyiahx 空 ctx
+        // 拖乿心 -33.31 > 的窒闷 -34.19；有前文时 的窒闷 遥遥领先）。
+        let mut ctx = session.tail_context.clone();
+        ctx.push_str(&session.committed_text);
+        if ctx.trim().is_empty() {
+            return None;
+        }
+        Some((key, ctx, texts))
     }
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。

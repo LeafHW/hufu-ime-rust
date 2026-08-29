@@ -55,11 +55,15 @@ fn main() {
     let dict = schema.dict.clone();
     let eng = hufu_sentence::SentenceEngine::load(&ngram, dict, &schema.supplement, weights)
         .expect("引擎装配失败");
-    for raw in ["ueeyiahx", "ueyiahx"] {
-        let dec = eng.decode(raw);
-        println!("══ decode({raw}) ══");
-        for (i, h) in dec.iter().take(6).enumerate() {
-            println!("{}. {}  weight={:.3} code=[{}]", i + 1, h.text, h.weight, h.code);
+    for raw in ["ueeyiahx"] {
+        let dec = eng.decode_rich(raw);
+        println!("== decode_rich({raw}) hits ==");
+        for (i, h) in dec.hits.iter().take(6).enumerate() {
+            println!("{}. {}  score={:.3} conf={:.3} max_rank={} seg=[{}]", i + 1, h.text, h.score, h.confidence, h.max_rank, h.segmented);
+        }
+        println!("-- early_hits --");
+        for (i, h) in dec.early_hits.iter().take(4).enumerate() {
+            println!("{}. {}  conf={:.3} score={:.3} max_rank={}", i + 1, h.text, h.confidence, h.score, h.max_rank);
         }
     }
 }

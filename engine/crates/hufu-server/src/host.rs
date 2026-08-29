@@ -232,6 +232,23 @@ impl Host {
         // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
         hufu_rerank::note_foreground();
         let outcome = self.engine.process_key(&mut self.session, key);
+        // 跨句文章尾巴：上屏文本滚动进 tail_context（截尾 32 字），
+        // 供下一句句首的神经重排作真实语境（空 ctx 时 Qwen 会乱序）。
+        if let Some(c) = outcome.commit.as_deref() {
+            if !c.is_empty() {
+                self.session.tail_context.push_str(c);
+                let n = self.session.tail_context.chars().count();
+                if n > 32 {
+                    let skip = n - 32;
+                    self.session.tail_context = self
+                        .session
+                        .tail_context
+                        .chars()
+                        .skip(skip)
+                        .collect();
+                }
+            }
+        }
         let state = self.engine.state(&self.session);
         serde_json::json!({ "outcome": outcome, "state": state })
     }

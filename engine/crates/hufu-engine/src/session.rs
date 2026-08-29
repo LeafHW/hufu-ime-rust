@@ -41,6 +41,10 @@ pub struct Session {
     pub early_suspended: bool,
     /// 本次按键内联产生的上屏文本（顶功/唯一上屏/提前上屏增量），由 take_or_state 消费
     pub pending_commit: Option<String>,
+    /// 跨句文章尾巴（最近上屏文本的尾部，整句提交后保留，焦点切换时清空）。
+    /// 神经重排在句首（committed_text 为空）时以它作语境，
+    /// 避免空上下文下 Qwen 乱序（实测空 ctx 时 拖乿心 反超 的窒闷）。
+    pub tail_context: String,
 }
 
 impl Session {
@@ -58,6 +62,7 @@ impl Session {
             early_history: Vec::new(),
             early_suspended: false,
             pending_commit: None,
+            tail_context: String::new(),
         }
     }
 
