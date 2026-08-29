@@ -3,6 +3,12 @@
 //! 状态机：按键 →（切换键 / 标点 / 反查 / 命令 / 编码追加与顶功 /
 //! 候选生成 / 选重翻页）→ KeyOutcome。
 
+// 整句短语压前的「真词地板」（对数得分，f64）：
+// 实测校准——真词短语 两次(mlwe)≈-7.72 / 真好(nqbh)≈-8.09；
+// 垃圾切分 午王(ennw)≈-21.5。取 -12 分层：强短语压生僻表项置前
+// （Rime 同拍），弱切分不压词典精确匹配（框@ennw 居首，虎爪/Rime 同）。
+const SENT_PHRASE_FRONT_FLOOR: f64 = -12.0;
+
 pub mod dynamic;
 pub mod punct;
 pub mod session;
@@ -1542,7 +1548,12 @@ impl Engine {
                         let mut cand =
                             Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
                         cand.weight = h.score;
-                        if h.max_rank == 1 && multi {
+                        // 短语压前须过「真词地板」：强短语（真词，如 两次
+                        // mlwe≈-7.7 / 真好 nqbh≈-8.1）仍压生僻表项置前
+                        //（与 Rime 同拍）；弱切分产物（如 ennw 解出「午王」
+                        // ≈-21.5，非词）不再压词典精确匹配——「框」应居首
+                        //（虎爪/Rime 实测均首选）。弱项回落到词典之后补位。
+                        if h.max_rank == 1 && multi && h.score > SENT_PHRASE_FRONT_FLOOR {
                             phrase.push(cand);
                         } else {
                             rest.push(cand);
