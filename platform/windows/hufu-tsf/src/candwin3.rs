@@ -234,7 +234,10 @@ fn composite_text(
             if cx < 0 || cx >= c.w {
                 continue;
             }
-            let cov = cov_bits[(row as usize) * pitch + colx as usize * 4] as f32 / 255.0;
+            // 【坐标病根】coverage 在 DIB 里是绝对位置 (bx+colx, by+row)
+            let cov = cov_bits[((by + row) as usize) * pitch + ((bx + colx) as usize) * 4]
+                as f32
+                / 255.0;
             if cov <= 0.0 {
                 continue;
             }
