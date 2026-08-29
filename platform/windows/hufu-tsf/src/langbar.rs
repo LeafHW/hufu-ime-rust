@@ -485,11 +485,20 @@ unsafe extern "system" {
         rect: *const RECT,
     ) -> i32;
     fn DestroyMenu(m: isize) -> i32;
+    fn GetForegroundWindow() -> isize;
+    fn GetWindowThreadProcessId(hwnd: isize, pdwprocessid: *mut u32) -> u32;
+    fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
 }
 const MF_STRING: u32 = 0x0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_CHECKED: u32 = 0x8;
 const TPM_RETURNCMD: u32 = 0x100;
+const TPM_RIGHTBUTTON: u32 = 0x2;
 const TPM_RIGHTALIGN: u32 = 0x8;
 const TPM_BOTTOMALIGN: u32 = 0x20;
 
@@ -578,19 +587,41 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
             DestroyMenu(m);
             return;
         }
+        // 【KB135788 加固】右键点击任务栏指示牌时本进程多半不是前台
+        // （前台是任务栏/上一个应用）——非前台进程的 SetForegroundWindow
+        // 被系统限制，菜单会秒关或不出现（"多试几次不生效"的真因）。
+        // 标准解法：AttachThreadInput 挂到前台线程再抢前台；菜单关闭
+        // 后 PostMessage(WM_NULL) 复位，否则下一次弹出失灵。
+        let cur_tid = GetCurrentThreadId();
+        let fg_hwnd = GetForegroundWindow();
+        let fg_tid = if fg_hwnd != 0 {
+            GetWindowThreadProcessId(fg_hwnd, std::ptr::null_mut())
+        } else {
+            0
+        };
+        let attached =
+            fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
         let _ = SetForegroundWindow(owner);
         let sel = TrackPopupMenu(
             m,
-            TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
             pt.x,
             pt.y,
             0,
             owner.0 as isize,
             std::ptr::null(),
         );
+        // WM_NULL 复位（KB135788：菜单系统状态机要求，缺它二次失灵）
+        PostMessageW(owner.0 as isize, 0x0000, 0, 0);
+        if attached {
+            AttachThreadInput(cur_tid, fg_tid, 0);
+        }
         let _ = DestroyWindow(owner);
         DestroyMenu(m);
-        log_diag(&format!("popup sel={sel} schemas={}", schemas.len()));
+        log_diag(&format!(
+            "popup sel={sel} schemas={} fg_attached={attached}",
+            schemas.len()
+        ));
         if sel == 1 {
             let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
         } else if sel >= 100 {
