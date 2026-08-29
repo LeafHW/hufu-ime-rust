@@ -185,6 +185,7 @@ extern "system" {
         hWndParent: isize, hMenu: isize, hInstance: isize, lpParam: isize,
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn RegisterHotKey(hwnd: isize, id: i32, modifiers: u32, vk: u32) -> i32;
     fn RegisterClassW(lpwcx: *const WNDCLASSW) -> u16;
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(hmenu: isize, uflags: u32, idm: usize, text: *const u16) -> i32;
@@ -250,6 +251,7 @@ const NIF_MESSAGE: u32 = 0x1;
 const NIF_ICON: u32 = 0x2;
 const NIF_TIP: u32 = 0x4;
 const WM_APP: u32 = 0x8000;
+const WM_HOTKEY: u32 = 0x0312;
 const WM_TIMER: u32 = 0x0113;
 /// 「输入法激活态变化」投递消息（wparam=1 激活 / 0 未激活）
 const WM_APP_IME: u32 = 0x8001;
@@ -340,6 +342,15 @@ fn switch_schema(name: &str) {
 extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe {
         match msg {
+            WM_HOTKEY => {
+                // Ctrl+Alt+H → 设置页（与托盘双击同通道）
+                if wparam == 0x4846 {
+                    if let Some(tx) = OPEN_SETTINGS.as_ref() {
+                        let _ = tx.send(());
+                    }
+                }
+                0
+            }
             WM_APP => {
                 match (lparam & 0xFFFF) as u32 {
                     WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
@@ -526,6 +537,14 @@ pub fn spawn(
             return;
         }
         TRAY_HWND.store(hwnd, Ordering::SeqCst);
+        // 全局热键 Ctrl+Alt+H：随时呼出设置页，不依赖托盘图标是否
+        // 被折叠进隐藏区（「常驻任务栏」是 Windows 用户设置，应用无权
+        // 自我提升；热键让设置入口与托盘可见性彻底解耦）。
+        const MOD_ALT: u32 = 0x1;
+        const MOD_CONTROL: u32 = 0x2;
+        const HOTKEY_ID_SETTINGS: i32 = 0x4846; // "HF"
+        let hk = RegisterHotKey(hwnd, HOTKEY_ID_SETTINGS, MOD_CONTROL | MOD_ALT, 0x48 /*'H'*/);
+        let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
         // 图标初始**不显示**：只在虎符输入法激活时出现（DLL 的
         // Activate/Deactivate 经管道上报，on_ime_state 驱动显隐）。
         let _ = GetCurrentThreadId();
