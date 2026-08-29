@@ -79,6 +79,15 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             crate::tray::open_settings();
             serde_json::json!({"ok": true})
         }
+        // 语言栏「中/A」左键切换中英（与 Shift 单击同语义：有编码不动）
+        "toggle_lang" => {
+            if host.session.raw.is_empty() {
+                host.session.chinese = !host.session.chinese;
+                host.session.pair.reset();
+            }
+            let state = host.engine.state(&host.session);
+            serde_json::json!({"state": state})
+        }
         // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
         // cloaked、UIElement 被宿主拒绝 → server 代画【用户皮肤】）
         "cand" => {

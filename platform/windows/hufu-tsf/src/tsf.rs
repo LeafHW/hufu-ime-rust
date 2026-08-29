@@ -155,10 +155,17 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let mut g = self.shared.lock().unwrap();
         g.thread_mgr = Some(tm);
         g.client_id = tid;
-        // （语言栏按钮已下线：Win11 桌面语言栏是可拖动浮动条而非任务栏
-        // 常驻，且小尺寸渲染差——用户实测否决。输入指示「中」改由
-        // DLL 内嵌图标资源承担（build.rs + assets/hufu_rsrc.o）。
-        // langbar.rs 源码保留，备将来做中/英态切换。）
+        // 语言栏「中/A」状态牌（用户需求：任务栏语言区显示中英态，
+        // 左键切换、右键设置）。每线程挂自己的项（weasel 模式）；
+        // 项数据（图标/文字）读进程全局 CHINESE，模式由 update_ui
+        // 每帧从引擎 state 同步。
+        if let Some(tm) = g.thread_mgr.clone() {
+            if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
+                if crate::langbar::install(&lbm).is_err() {
+                    // 多线程重复挂同 GUID 会失败（正常）；留诊断即可
+                }
+            }
+        }
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
@@ -190,6 +197,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap();
         if let Some(tm) = g.thread_mgr.clone() {
+            // 语言栏项摘除（与本线程 Activate 对称）
+            if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
+                crate::langbar::uninstall(&lbm);
+            }
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {
                     let _ = km.UnadviseKeyEventSink(g.client_id);
@@ -905,10 +916,15 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
     }
 
-    // 缓存引擎态（TestKeyDown 预判 + 失焦冲销）
+    // 缓存引擎态（TestKeyDown 预判 + 失焦冲销）+ 语言栏中英态同步
     {
         let mut g2 = shared.lock().unwrap();
-        g2.chinese = state.get("chinese").and_then(|v| v.as_bool()).unwrap_or(true);
+        let zh = state.get("chinese").and_then(|v| v.as_bool()).unwrap_or(true);
+        if g2.chinese != zh {
+            g2.chinese = zh;
+            // 语言栏「中/A」：Shift 切换也走这里回填图标/文字
+            crate::langbar::set_mode(zh);
+        }
         g2.composing = !state.get("raw").and_then(|v| v.as_str()).unwrap_or("").is_empty();
         g2.preedit_last = state
             .get("preedit")
