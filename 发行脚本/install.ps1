@@ -1,4 +1,4 @@
-﻿# HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
+# HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
 # - 文件/HKCU/语言列表/自启/server 永远普通权限执行（server 提权启动会锁管道 ACL，
 #   导致所有普通应用连不上→只能打字母，2026-08-29 实测教训）。
 # - HKLM 机器级键 + msctf 原生登记（本机实测需提权才 0x00000000）交给一次 UAC 的
@@ -18,6 +18,12 @@ $data = Join-Path $inst '数据'
 $dll  = Join-Path $inst 'hufu_tsf.dll'
 $exe  = Join-Path $inst 'hufu-server.exe'
 $icon = Join-Path $inst '图标.ico'
+# SystemIME 副本：开始菜单搜索/任务栏等 SystemApps 打包进程读不了用户目录
+# （%LOCALAPPDATA% 无 ALL APPLICATION PACKAGES 权限），DLL 必须住在
+# C:\Windows\SystemIME（系统输入法同款目录，打包进程可读）——2026-08-29
+# 实测：SearchHost 不加载用户目录 DLL → 搜索框字母直通。
+$sysdir = 'C:\Windows\SystemIME\HuFu'
+$sysdll = Join-Path $sysdir 'hufu_tsf.dll'
 
 function Set-Reg([string]$path, [string]$name, [string]$val) {
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
@@ -41,10 +47,16 @@ function Set-RegHKLM([string]$path, [string]$name, [string]$val) {
 
 # ═══ 提权子阶段：只做 HKLM 注册 + msctf 登记，绝不启动 server ═══
 if ($PhaseElevated) {
+    Write-Host '—— 提权阶段：SystemIME 副本（打包进程可读）——'
+    New-Item -ItemType Directory -Path $sysdir -Force | Out-Null
+    Copy-Item $dll $sysdll -Force
+    icacls $sysdir /grant 'ALL APPLICATION PACKAGES:(OI)(CI)RX' | Out-Null
+    icacls $sysdll /grant 'ALL APPLICATION PACKAGES:RX' | Out-Null
+    Write-Host 'OK DLL → SystemIME'
     Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
     $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
     Set-RegHKLM "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
-    Set-RegHKLM $ips '(default)' $dll
+    Set-RegHKLM $ips '(default)' $sysdll
     Set-RegHKLM $ips 'ThreadingModel' 'Apartment'
     $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID"
     Set-RegHKLM "$tip\Description" '(default)' 'HuFu 虎符输入法（虎码）'
@@ -54,11 +66,11 @@ if ($PhaseElevated) {
     Set-RegHKLM $lp 'Description' 'HuFu 虎符输入法'
     Set-RegHKLM $lp 'Display Description' 'HuFu 虎符输入法'
     Set-ItemProperty -Path $lp -Name 'Enable' -Value 1 -Type DWord
-    Set-RegHKLM $lp 'IconFile' $dll
+    Set-RegHKLM $lp 'IconFile' $sysdll
     Set-ItemProperty -Path $lp -Name 'IconIndex' -Value 0 -Type DWord
-    Write-Host 'OK HKLM 机器级已注册'
+    Write-Host 'OK HKLM 机器级已注册（指向 SystemIME）'
     Write-Host '—— 提权阶段：msctf 原生登记 ——'
-    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $sysdll
     Write-Host '提权阶段完成。'
     exit
 }
@@ -79,9 +91,13 @@ robocopy $src $inst /E /XF config.json install.ps1 uninstall.ps1 *.bat > $null
 Write-Host 'OK 文件就位'
 
 # ── 2) HKCU COM + CTF TIP 键树（每用户；msctf/COM 解析 HKCU 优先）──
+# DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索可用）；
+# 未提权安装（无 SystemIME 副本）时退回用户目录——此时开始菜单搜索
+# 框不可用（SystemApps 进程读不了用户目录），记事本等普通应用不受影响。
+$dllReg = if (Test-Path $sysdll) { $sysdll } else { $dll }
 $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
 Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
-Set-Reg $ipsUser '(default)' $dll
+Set-Reg $ipsUser '(default)' $dllReg
 Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
 regsvr32 /s $dll
 $tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
@@ -93,8 +109,8 @@ $lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
 Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
 Set-Reg $lpU 'Enable' '1'
 Set-RegDWord $lpU 'IconIndex' 0
-Set-Reg $lpU 'IconFile' $dll
-Write-Host 'OK HKCU COM + TIP 键树已注册'
+Set-Reg $lpU 'IconFile' $dllReg
+Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
 
 # ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
 if (-not $NoHKLM) {
@@ -165,10 +181,8 @@ Write-Host ''
 Write-Host '=========================================='
 Write-Host ' 安装完成！'
 Write-Host '  · Win+空格 切到「HuFu 虎符输入法」'
-Write-Host '  · 双击「设置.bat」打开设置窗口'
-Write-Host '  · 托盘（输入法区）双击同样打开设置'
+Write-Host '  · 设置：Ctrl+Alt+H（全局热键）/ 开始菜单'
+Write-Host '     搜「HuFu」或双击「设置.bat」'
 Write-Host '=========================================='
 Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载新输入法'
-if ($NoHKLM) { Write-Host '  · 本次为每用户安装（-NoHKLM，未写 HKLM）' }
-Write-Host '  · 托盘小虎图标只在「切到虎符输入法」时出现；想常驻任务栏：'
-Write-Host '    右键任务栏 - 任务栏设置 - 其他系统托盘图标 - 打开「hufu-server」。'
+if ($NoHKLM -or -not (Test-Path $sysdll)) { Write-Host '  · 每用户安装：开始菜单搜索框不可用虎符（系统限制）' }

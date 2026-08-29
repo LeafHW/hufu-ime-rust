@@ -1,4 +1,4 @@
-﻿# HuFu 虎符输入法 — 卸载脚本（管理员可选；卸载.bat 直接调用）
+# HuFu 虎符输入法 — 卸载脚本（管理员可选；卸载.bat 直接调用）
 # 每用户部分（HKCU/语言列表/自启/server）无管理员亦可完整卸载；
 # HKLM 机器级键：管理员组则提权清一次，普通用户跳过（无害残留）。
 param([switch]$NoHKLM)   # 测试用：强制每用户模式（跳过 HKLM 与提权）
@@ -55,6 +55,8 @@ if ($hklm) {
     Remove-Item "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "HKLM:\SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+    # SystemIME 副本（打包进程可读版 DLL）一并清除
+    Remove-Item 'C:\Windows\SystemIME\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # 6) 刷新宿主
