@@ -135,6 +135,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let mut g = self.shared.lock().unwrap();
         g.thread_mgr = Some(tm);
         g.client_id = tid;
+        // 语言栏「中」按钮：任务栏输入指示区常驻（切到虎符即现，Rime 风格）
+        if let Ok(lbm) = g.thread_mgr.as_ref().unwrap().cast::<ITfLangBarItemMgr>() {
+            let _ = crate::langbar::install(&lbm);
+        }
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
@@ -147,6 +151,12 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap();
+        // 摘除语言栏「中」按钮（切走输入法即从任务栏消失）
+        if let Some(tm) = g.thread_mgr.clone() {
+            if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
+                crate::langbar::uninstall(&lbm);
+            }
+        }
         if let Some(tm) = g.thread_mgr.clone() {
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {

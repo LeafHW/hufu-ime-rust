@@ -74,6 +74,11 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             crate::tray::on_ime_state(active);
             serde_json::json!({"ok": true})
         }
+        // 语言栏「中」按钮点击：开设置页（与托盘双击/Ctrl+Alt+H 同通道）
+        "settings" => {
+            crate::tray::open_settings();
+            serde_json::json!({"ok": true})
+        }
         "sound" => {
             // tag → {data: base64 wav, volume}（文件缺失返回 404 语义 null）
             let tag = req.get("tag").and_then(|t| t.as_str()).unwrap_or("");

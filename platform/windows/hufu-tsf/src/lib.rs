@@ -7,6 +7,7 @@ mod candwin;
 mod candwin2;
 mod com;
 mod ipc;
+mod langbar;
 mod sound;
 mod tsf;
 
