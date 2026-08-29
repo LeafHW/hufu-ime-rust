@@ -979,34 +979,28 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // DComp 直通窗（candwin2）与普通分层窗（candwin3，v1 考古
         // 路线，ulw=1 上屏成功）均被 DWM 以 DWM_CLOAKED_SHELL 持续
         // 隐身——cloak 与窗口技术无关，是宿主级的。唯一出路=server
-        // 进程代画，且锚点在打包宿主完全可用（实测 x=920 y=800 即
-        // 开始菜单搜索框光标）→ 从第一帧就跟光标（不再左上角/不再
-        // 两帧试探）。锚点缺失兜底：开始菜单=左上角，其他=(100,100)。
-        let (x, y) = match g.caret {
-            Some(r) => (r.left, r.bottom + 4),
-            None => {
-                if host_is_searchhost() {
-                    (12, 12)
-                } else {
-                    (100, 100)
-                }
-            }
+        // 进程代画。位置定版（用户拍板）：开始菜单=桌面左上角 (12,12)
+        // 固定；其他打包宿主（Store/UWP）=跟光标（实测锚点精确，
+        // 从第一帧就跟）。
+        let (x, y) = if host_is_searchhost() {
+            (12, 12)
+        } else {
+            g.caret
+                .map(|r| (r.left, r.bottom + 4))
+                .unwrap_or((100, 100))
         };
         let raw_c = raw.clone();
         drop(g);
-        diag_note("打包宿主 → server 跟光标代画");
+        diag_note("打包宿主 → server 代画（开始菜单=左上角，其他=跟光标）");
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
     } else if g.cand_ui_active {
-        // server 代画续帧（打包宿主每帧跟光标；锚点缺失沿用首帧兜底）
-        let (x, y) = match g.caret {
-            Some(r) => (r.left, r.bottom + 4),
-            None => {
-                if host_is_searchhost() {
-                    (12, 12)
-                } else {
-                    (100, 100)
-                }
-            }
+        // server 代画续帧（开始菜单=左上角固定；其他打包宿主每帧跟光标）
+        let (x, y) = if host_is_searchhost() {
+            (12, 12)
+        } else {
+            g.caret
+                .map(|r| (r.left, r.bottom + 4))
+                .unwrap_or((100, 100))
         };
         let raw_c = raw.clone();
         drop(g);
