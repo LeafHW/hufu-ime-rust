@@ -298,6 +298,15 @@ const SCHEMA_MAX: usize = 40;
 
 /// 打开设置页的信号（主线程 select 循环外执行）
 static mut OPEN_SETTINGS: Option<Sender<()>> = None;
+
+/// 外部（管道 op "settings"：语言栏「中」按钮点击）请求打开设置页
+pub fn open_settings() {
+    unsafe {
+        if let Some(tx) = OPEN_SETTINGS.as_ref() {
+            let _ = tx.send(());
+        }
+    }
+}
 /// 引擎宿主（托盘右键「切换方案」直调，与 HTTP 路由同源逻辑）
 static mut SHARED: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>> = None;
 
