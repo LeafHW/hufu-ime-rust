@@ -20,6 +20,10 @@ pub struct Shared {
     /// v2（DComp+Acrylic）初始化失败 → 回退 v1
     pub cand2: Option<CandidateWindowV2>,
     pub cand2_dead: bool,
+    /// v3（普通分层窗，打包宿主 SearchHost/UWP 专用——DComp 直通窗
+    /// 被 DWM cloak，普通分层窗考古验证在 UWP 可见可跟光标）
+    pub cand3: Option<crate::candwin3::CandWin3>,
+    pub cand3_dead: bool,
     pub cand: Option<CandidateWindow>,
     /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
     /// A. TSF UIElement——BeginUIElement pbShow=TRUE 即宿主愿意代画
@@ -59,6 +63,8 @@ impl Shared {
             composition: None,
             cand2: None,
             cand2_dead: false,
+            cand3: None,
+            cand3_dead: false,
             cand: None,
             cand_ui: None,
             cand_ui_id: 0,
@@ -203,11 +209,15 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         if let Some(mut c) = g.cand2.take() {
             c.hide();
         }
+        if let Some(mut c) = g.cand3.take() {
+            c.hide();
+        }
         g.cand = None;
         // 【回归病根】ctfmon 重启等场景进程内本实例会被再次 Activate：
         // cand2_dead 若不清，重激活后所有显示分支被跳过、落入 v1 隐身窗
         // → 搜索框候选彻底消失（实测 notes 只有老会话记录）
         g.cand2_dead = false;
+        g.cand3_dead = false;
         // 沉浸式宿主：两通道各自收尾
         if g.cand_ui_active {
             if g.cand_ui_host_draws {
@@ -942,6 +952,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
+        if let Some(c) = g.cand3.as_mut() {
+            c.hide();
+        }
         if let Some(c) = g.cand.take() {
             c.hide();
         }
@@ -955,17 +968,45 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
+        if let Some(c) = g.cand3.as_mut() {
+            c.hide();
+        }
         if let Some(c) = g.cand.take() {
             c.hide();
         }
+    } else if host_is_packaged() {
+        // 【打包宿主（SearchHost/UWP/Store）】进程内候选窗死路实锤：
+        // DComp 直通窗（candwin2）与普通分层窗（candwin3，v1 考古
+        // 路线，ulw=1 上屏成功）均被 DWM 以 DWM_CLOAKED_SHELL 持续
+        // 隐身——cloak 与窗口技术无关，是宿主级的。唯一出路=server
+        // 进程代画，且锚点在打包宿主完全可用（实测 x=920 y=800 即
+        // 开始菜单搜索框光标）→ 从第一帧就跟光标（不再左上角/不再
+        // 两帧试探）。锚点缺失兜底：开始菜单=左上角，其他=(100,100)。
+        let (x, y) = match g.caret {
+            Some(r) => (r.left, r.bottom + 4),
+            None => {
+                if host_is_searchhost() {
+                    (12, 12)
+                } else {
+                    (100, 100)
+                }
+            }
+        };
+        let raw_c = raw.clone();
+        drop(g);
+        diag_note("打包宿主 → server 跟光标代画");
+        ui_element_show(&shared, &cands, &raw_c, sel, x, y);
     } else if g.cand_ui_active {
-        // 沉浸式宿主：UIElement（宿主画）或 server 代画双通道。
-        // 开始菜单=左上角定稿；其他宿主（真·持续 cloak 的 UWP 等）
-        // =跟光标。
-        let (x, y) = if host_is_searchhost() {
-            (12, 12)
-        } else {
-            g.caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
+        // server 代画续帧（打包宿主每帧跟光标；锚点缺失沿用首帧兜底）
+        let (x, y) = match g.caret {
+            Some(r) => (r.left, r.bottom + 4),
+            None => {
+                if host_is_searchhost() {
+                    (12, 12)
+                } else {
+                    (100, 100)
+                }
+            }
         };
         let raw_c = raw.clone();
         drop(g);
@@ -1089,6 +1130,21 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 /// 首帧 BeginUIElement——pbShow=TRUE 即宿主愿意代画（走 UIElement），
 /// FALSE 则降级 server 代画（pipe 推送候选+坐标，server 开窗绘制，
 /// 其普通桌面进程窗口不受容器隐身限制）。后续帧按通道更新。
+/// 宿主是否打包应用（UWP/XAML Island）：exe 位于 WindowsApps 或
+/// SystemApps（SearchHost/Store/设置 等）。此类宿主里 DComp 直通窗
+/// 被 DWM cloak → 走 candwin3 普通分层窗（考古复活的 v1 路线）。
+fn host_is_packaged() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let l = exe.to_lowercase();
+        l.contains("\\windowsapps\\") || l.contains("\\systemapps\\")
+    })
+}
+
 /// 宿主是否开始菜单搜索（SearchHost.exe）。DLL 跑在宿主进程里，
 /// current_exe 即宿主路径。开始菜单的 DWM_CLOAKED_SHELL 是逐帧
 /// 持续的真隐身（首帧即切、位置=左上角）；其他宿主（含 UWP/Store）

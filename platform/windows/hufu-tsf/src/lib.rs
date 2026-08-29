@@ -5,6 +5,7 @@
 
 mod candwin;
 mod candwin2;
+mod candwin3;
 mod canduielement;
 mod com;
 mod ipc;
