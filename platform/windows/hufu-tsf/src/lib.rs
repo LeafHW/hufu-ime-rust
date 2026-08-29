@@ -5,6 +5,7 @@
 
 mod candwin;
 mod candwin2;
+mod canduielement;
 mod com;
 mod ipc;
 // 语言栏按钮已下线（Win11 桌面语言栏为可拖浮动条，用户实测否决）；

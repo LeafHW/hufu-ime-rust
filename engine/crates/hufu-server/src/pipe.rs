@@ -79,6 +79,39 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             crate::tray::open_settings();
             serde_json::json!({"ok": true})
         }
+        // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
+        // cloaked、UIElement 被宿主拒绝 → server 代画【用户皮肤】）
+        "cand" => {
+            let items: Vec<(String, String)> = req
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|c| {
+                            (
+                                c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                c.get("comment").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let raw = req.get("raw").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let sel = req.get("selected").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let x = req.get("x").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
+            let y = req.get("y").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
+            let skin = req.get("skin").cloned().unwrap_or(serde_json::Value::Null);
+            crate::candwin::show(
+                crate::candwin::CandFrame { items, raw, selected: sel, skin },
+                x,
+                y,
+            );
+            serde_json::json!({"ok": true})
+        }
+        "cand_hide" => {
+            crate::candwin::hide();
+            serde_json::json!({"ok": true})
+        }
         "sound" => {
             // tag → {data: base64 wav, volume}（文件缺失返回 404 语义 null）
             let tag = req.get("tag").and_then(|t| t.as_str()).unwrap_or("");
@@ -161,6 +194,13 @@ mod imp {
             timeout: u32,
             sa: *const core::ffi::c_void,
         ) -> isize;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            sd: *mut *mut core::ffi::c_void,
+            returned: *mut u32,
+        ) -> i32;
+        fn LocalFree(h: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
         fn ConnectNamedPipe(pipe: isize, overlapped: *mut core::ffi::c_void) -> i32;
         fn DisconnectNamedPipe(pipe: isize) -> i32;
         fn ReadFile(
@@ -261,6 +301,44 @@ mod imp {
     /// 阻塞运行管道服务（每实例一线程）。
     pub fn run(host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
         let name = wide(PIPE_NAME);
+        // 管道 DACL（SDDL）：显式授 Everyone + ALL APPLICATION PACKAGES
+        // 读写——默认 DACL（仅创建者/管理员）会拒绝 AppContainer 宿主
+        //（开始菜单搜索 SearchHost 等 SystemApps）→ 搜索框里虎符取词
+        // 失败、字母直通（2026-08-29 实测病灶之一）。
+        #[repr(C)]
+        struct SecurityAttributes {
+            nLength: u32,
+            lp_security_descriptor: *mut core::ffi::c_void,
+            inherit_handle: i32,
+        }
+        let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GWGR;;;WD)(A;;GWGR;;;S-1-15-2-1)(A;;GWGR;;;S-1-15-2-2)\0"
+            .encode_utf16()
+            .collect();
+        let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+        let sd_ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1, // SDDL_REVISION_1
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        // 诊断落盘：SDDL 是否成功转换（AppContainer 管道连通排查）
+        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+        let _ = std::fs::write(
+            r"C:\ProgramData\HuFu\diag\pipe-sddl.txt",
+            format!("sd_ok={sd_ok} err={:?}\n", std::io::Error::last_os_error()),
+        );
+        let sa = SecurityAttributes {
+            nLength: std::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd,
+            inherit_handle: 0,
+        };
+        let sa_ptr: *const core::ffi::c_void = if sd_ok {
+            &sa as *const SecurityAttributes as *const core::ffi::c_void
+        } else {
+            std::ptr::null()
+        };
         loop {
             let h = unsafe {
                 CreateNamedPipeW(
@@ -271,7 +349,7 @@ mod imp {
                     64 * 1024,
                     64 * 1024,
                     0,
-                    std::ptr::null(),
+                    sa_ptr,
                 )
             };
             if h == INVALID_HANDLE_VALUE {
