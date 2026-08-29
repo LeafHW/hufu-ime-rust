@@ -554,6 +554,55 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
             let _ = SetTextColor(hdc, 0x00FF_FF_FF);
             let pitch = (w_out as usize) * 4;
 
+            // ── 光学垂直居中自标定（对齐 candwin2 的墨盒补偿）──
+            // 文楷类字体升降部大：GDI 字格（tmHeight）比请求的 em 高
+            // 一截，而 draw_text 按 em 居中字格 → 墨迹整体偏下（实测
+            // 低 3.5px）。这里直接画"永"探针扫描真实墨盒 [top,bot]，
+            // dy = em/2 − 墨盒中心（负=上移），全行共用保行栅格一致。
+            // 字体度量推导会因字格缩放失真，实测扫描才是真值。
+            let mut dy = 0.0f32;
+            {
+                let s = "永";
+                let pw = measure(h_main, s).ceil() as i32;
+                if pw > 0 && pw < w_out {
+                    let ph = (line_h.ceil() as i32 + 8).min(h_out);
+                    // 清探针区（DIB 新建本为 0，稳妥再清一次）
+                    for row in 0..ph {
+                        let off = row as usize * pitch;
+                        std::ptr::write_bytes((bits as *mut u8).add(off), 0, pw as usize * 4 + 4);
+                    }
+                    let ws: Vec<u16> = s.encode_utf16().collect();
+                    let old_f = SelectObject(hdc, h_main);
+                    let _ = TextOutW(hdc, 0, 0, ws.as_ptr(), ws.len() as i32);
+                    let _ = SelectObject(hdc, old_f);
+                    let _ = GdiFlush();
+                    let mut top = -1i32;
+                    let mut bot = -1i32;
+                    for row in 0..ph {
+                        for col in 0..=pw {
+                            if (bits as *const u8).add(row as usize * pitch + col as usize * 4)
+                                .read_volatile()
+                                > 0
+                            {
+                                if top < 0 {
+                                    top = row;
+                                }
+                                bot = row;
+                            }
+                        }
+                    }
+                    if top >= 0 && bot > top {
+                        dy = (em - (top + bot) as f32) * 0.5;
+                        dy = dy.clamp(-6.0, 6.0);
+                    }
+                    // 探针墨迹清掉，不进合成
+                    for row in 0..ph {
+                        let off = row as usize * pitch;
+                        std::ptr::write_bytes((bits as *mut u8).add(off), 0, pw as usize * 4 + 4);
+                    }
+                }
+            }
+
             // 一段文字：清 bbox → 画 → coverage 合成
             let mut draw_text = |canvas: &mut Canvas, hf: isize, s: &str, x: f32, y_row: f32, fh: f32, col: (u8, u8, u8, u8)| {
                 if s.is_empty() || hf == 0 {
@@ -564,7 +613,7 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
                     return;
                 }
                 let bx = x as i32;
-                let by = (y_row + (line_h - fh) / 2.0) as i32;
+                let by = (y_row + (line_h - fh) / 2.0 + dy) as i32;
                 let bw = (wtxt.ceil() as i32) + 2;
                 let bh = (line_h.ceil() as i32) + 2;
                 // 清 bbox（coverage DIB 复用）
