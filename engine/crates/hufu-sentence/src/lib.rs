@@ -284,7 +284,12 @@ impl SentenceEngine {
                         continue;
                     }
                     let lock = parsed.locks.iter().find(|(l, _)| *l == end);
-                    // 多码整句时段跨须 ≥2（含选重后缀字符；Rime 段跨规则）
+                    // 多码整句时段跨须 ≥2（含选重后缀字符；Rime 段跨规则，
+                    // tiger_sentence.lua L562 同款）。【实测 2026-08-31】放开
+                    // 此规则（允许一简段入整句）100 句基准 exact 92.93%→
+                    // 78.79%、字准 99.39%→98.12%——单码段制造大量噪声路径，
+                    // 禁令是质量担当，不可动。「的(u) 窒(eyi)」类编码冲突靠
+                    // 提前上屏的边界位置解决（见 tiger_sentence.lua live 版）。
                     let span = end - pos + if lock.is_some() { 1 } else { 0 };
                     if n > 1 && span < 2 {
                         continue;

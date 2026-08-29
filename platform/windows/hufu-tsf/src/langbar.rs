@@ -52,66 +52,96 @@ fn is_chinese() -> bool {
     CHINESE.load(Ordering::Relaxed)
 }
 
-/// 更新模式并请求广播（sink 通知 + compartment 推送）。
-/// 返回是否有变化。
-/// 【异步化——图标只动一次的真因】曾在 OnClick 线程内同步调
-/// sink.OnUpdate：explorer 收到后回调 GetIcon 需重入正被点击回调
-/// 占用的 UI 线程，COM 拒绝重入 → explorer 放弃重绘（首次之后图标
-/// 再不动）。现改为把广播请求发给常驻 MTA 工作线程，OnClick 立即
-/// 返回，线程空闲后 explorer 的回查畅通。
+/// 更新模式（sink 通知 + 线程 compartment 推送）。返回是否有变化。
+/// 【v5：纯 STA】历史教训链——
+/// (1) OnClick 线程内同步 notify 会挡 explorer 重入回查 → 曾异步化；
+/// (2) 异步 MTA 工作线程跨套间裸调 STA 代理（sink、全局 compartment）
+///     = UB → 一次切换后语言栏项死亡（OnClick 从此不触发，左右键全
+///     死）——18:44 纯同步时代反复点击存活、异步化后每版必死的时
+///     间线实证；
+/// (3) 全局 compartment 的唯一用途（跨进程对账）已随 v4 引擎权威制
+///     废除——系统焦点切换会把"每应用记忆模式"写进去（陈旧值），
+///     对账等于跟系统记忆打架。
+/// 故整条工作线程 + 全局侧拆除：只在本线程（STA）做线程 compartment
+/// 推送与 sink 通知，进程内零跨套间调用。
 pub fn set_mode(zh: bool) -> bool {
     let old = CHINESE.swap(zh, Ordering::Relaxed);
     if old == zh {
         return false;
     }
-    log_diag(&format!("set_mode {old}->{zh} sinks={}", {
-        let n = SINKS.lock().map(|v| v.len()).unwrap_or(0);
-        n
-    }));
-    // compartment 双写：线程侧（UI 线程，系统牌在焦点/输入法切换时
-    // 读取它）+ 全局侧（工作线程，跨进程对账总线）
-    push_thread_compartment();
-    request_broadcast();
+    // 【v6：延迟到消息泵空闲】铁证（v5 日志）：左键路径（OnClick 内）
+    // set_mode 后右键存活，Shift 路径（ProcessKey 进行中）set_mode 后
+    // 右键死——按键处理上下文里写 compartment / 发 sink 通知会打断
+    // msctf 状态机、弄坏语言栏项连接。CHINESE 原子交换立即生效（读
+    // 取方即刻拿到），msctf 副作用 PostMessage 到本线程常驻窗，按键
+    // 处理完毕、线程回到消息循环后才执行。
+    PENDING_ZH.store(zh, Ordering::Relaxed);
+    let hwnd = DEFER_HWND.load(Ordering::Relaxed);
+    log_diag(&format!("set_mode {old}->{zh}（排队）"));
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd, WM_APP_DEFER, 0, 0);
+        }
+    } else {
+        // 窗还没建（理论不会）：直接执行兜底
+        push_thread_compartment();
+        notify_sinks();
+    }
     true
 }
 
-// ── 常驻广播工作线程（CoInitialize MTA；COM 调用合法宿主）──
-#[link(name = "ole32")]
-unsafe extern "system" {
-    fn CoInitializeEx(pv: *mut core::ffi::c_void, dw: u32) -> i32;
-}
-const COINIT_MULTITHREADED: u32 = 0x0;
-static NOTIFY_TX: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+// ── 延迟执行窗（本线程 message-only；PostMessage 后消息泵空闲时执行）──
+static DEFER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static PENDING_ZH: AtomicBool = AtomicBool::new(true);
+const WM_APP_DEFER: u32 = 0x8002;
 
-fn request_broadcast() {
-    let tx = {
-        let mut guard = match NOTIFY_TX.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            std::thread::Builder::new()
-                .name("hufu-lb-bcast".into())
-                .spawn(move || {
-                    unsafe {
-                        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
-                    }
-                    // 批处理：连续切换合并为一次广播（线程侧已由 UI
-                    // 线程同步推过；这里只负责全局总线 + sink 通知）
-                    while rx.recv().is_ok() {
-                        while rx.try_recv().is_ok() {}
-                        notify_sinks();
-                        push_global_compartment();
-                    }
-                })
-                .ok();
-            *guard = Some(tx);
+unsafe extern "system" fn defer_wnd_proc(
+    h: windows::Win32::Foundation::HWND,
+    m: u32,
+    _w: windows::Win32::Foundation::WPARAM,
+    _l: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    if m == WM_APP_DEFER {
+        let zh = PENDING_ZH.load(Ordering::Relaxed);
+        log_diag(&format!("defer 推 zh={zh}"));
+        push_thread_compartment();
+        notify_sinks();
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+    unsafe { DefWindowProcW(h, m, _w, _l) }
+}
+
+/// 建（一次）延迟执行窗。必须在 UI 线程调（install 时）。
+unsafe fn ensure_defer_window() {
+    unsafe {
+        if DEFER_HWND.load(Ordering::Relaxed) != 0 {
+            return;
         }
-        guard.clone()
-    };
-    if let Some(tx) = tx {
-        let _ = tx.send(());
+        let cls: Vec<u16> = "HUFU_LB_DEFER\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(defer_wnd_proc),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        let nm: Vec<u16> = "HuFu defer\0".encode_utf16().collect();
+        if let Ok(w) = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+            PCWSTR(cls.as_ptr()),
+            PCWSTR(nm.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            None,
+            None,
+        ) {
+            DEFER_HWND.store(w.0 as isize, Ordering::Relaxed);
+        }
     }
 }
 
@@ -132,13 +162,12 @@ fn log_diag(s: &str) {
     }
 }
 
-// ═══════════════ compartment 同步：系统输入指示「中/A」的真身 ═══════════════
-// 任务栏输入指示区的中/英牌是 EXPLORER 画的，读的是 TSF 转换模式
-// compartment（微软拼音/Rime 同款路线）：
-// - GUID_COMPARTMENT_KEYBOARD_OPENCLOSE=1（输入法开着）
-// - GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION = NATIVE(中)/ALPHA(英)
-// 写线程 compartment + 全局 compartment；并监听外部变化（用户点
-// 系统牌 → 引擎跟上）。反馈环由「值与预期一致则忽略」掐断。
+// ═══════════════ compartment 同步（v5：只写线程侧，纯 STA）═══════════════
+// 写线程 compartment（OPENCLOSE=1 + CONV=中/英），供系统输入状态
+// 界面在焦点/输入法切换时读取。【全局侧已废】全局 compartment 的
+// 唯一用途是跨进程对账，而对账已被引擎权威制取代（系统会把"每应用
+// 记忆模式"写回全局侧——陈旧值，追它等于跟系统记忆打架）；且从
+// MTA 工作线程推全局 = 跨套间裸调 UB（语言栏项死亡真因之一）。
 
 thread_local! {
     /// 本线程 compartment 源（Activate 时装；thread mgr 本身实现该接口）
@@ -146,13 +175,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static COMP_COOKIE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
-/// 全局 compartment 源：进程级（工作线程也要推；COM 代理跨线程搬运）
-struct SendComp(ITfCompartmentMgr);
-unsafe impl Send for SendComp {}
-static COMP_GLOBAL: Mutex<Option<SendComp>> = Mutex::new(None);
-/// TSF client id（SetValue 需要；进程级，工作线程可读）
+/// TSF client id（SetValue 需要）
 static TID: AtomicU32 = AtomicU32::new(0);
-static GLOBAL_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Activate 时调用：装 compartment 引用 + 挂监听 + 推初值。
 /// tid = TSF client id（SetValue 需要）。
@@ -161,17 +185,8 @@ pub fn install_compartments(tm: &ITfThreadMgr, tid: u32) {
     if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
         COMP_THREAD.with(|c| *c.borrow_mut() = Some(cm));
     }
-    if !GLOBAL_DONE.swap(true, Ordering::Relaxed) {
-        if let Ok(g) = unsafe { tm.GetGlobalCompartment() } {
-            if let Ok(mut slot) = COMP_GLOBAL.lock() {
-                *slot = Some(SendComp(g.clone()));
-            }
-            // 全局监听只挂一次（进程存续期内常驻）
-            advise_conversion(Some(g), tid, true);
-        }
-    }
-    advise_conversion(COMP_THREAD.with(|c| c.borrow().clone()), tid, false);
-    push_compartments();
+    advise_conversion(COMP_THREAD.with(|c| c.borrow().clone()), tid);
+    push_thread_compartment();
 }
 
 /// Deactivate：摘本线程监听、清引用（全局的留着）
@@ -191,12 +206,9 @@ pub fn uninstall_compartments() {
     COMP_THREAD.with(|c| *c.borrow_mut() = None);
 }
 
-/// 把当前模式推进 OPENCLOSE + CONVERSION。
-/// 线程侧（UI 线程同步）：任务栏牌渲染的就是它；
-/// 全局侧（工作线程）：跨进程对账总线。
+/// 把当前模式推进本线程 compartment（OPENCLOSE + CONV）。
 pub fn push_compartments() {
     push_thread_compartment();
-    push_global_compartment();
 }
 
 /// 线程 compartment（本线程上下文；set_mode/Activate 在 UI 线程调）
@@ -208,30 +220,6 @@ fn push_thread_compartment() {
     };
     let tid = TID.load(Ordering::Relaxed);
     let Some(src) = COMP_THREAD.with(|c| c.borrow().clone()) else {
-        return;
-    };
-    unsafe {
-        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
-            let v = VARIANT::from(1i32);
-            let _ = comp.SetValue(tid, &v);
-        }
-        if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
-            let v = VARIANT::from(conv);
-            let _ = comp.SetValue(tid, &v);
-        }
-    }
-}
-
-/// 全局 compartment（任意线程可调；COM 代理）
-fn push_global_compartment() {
-    let conv: i32 = if is_chinese() {
-        TF_CONVERSIONMODE_NATIVE as i32
-    } else {
-        TF_CONVERSIONMODE_ALPHANUMERIC as i32
-    };
-    let tid = TID.load(Ordering::Relaxed);
-    let Some(src) = COMP_GLOBAL.lock().ok().and_then(|s| s.as_ref().map(|g| g.0.clone()))
-    else {
         return;
     };
     unsafe {
@@ -263,7 +251,7 @@ unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
     }
 }
 
-fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32, read_global: bool) {
+fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32) {
     let Some(cm) = cm else { return };
     unsafe {
         let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) else {
@@ -272,7 +260,7 @@ fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32, read_global: bool
         let Ok(src) = comp.cast::<ITfSource>() else {
             return;
         };
-        let sink: ITfCompartmentEventSink = ModeSink { read_global }.into();
+        let sink: ITfCompartmentEventSink = ModeSink {}.into();
         let _ = src.AdviseSink(&ITfCompartmentEventSink::IID, &sink);
         // cookie 不存（进程存续期常驻；Deactivate 只摘线程那份）
     }
@@ -281,14 +269,8 @@ fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32, read_global: bool
 /// 外部改了转换模式（用户点系统牌 / 其他进程广播）：值 ≠ 预期 →
 /// 引擎【设值】跟上；相等（自己的写入回声）→ 忽略。
 /// 【权威域拆分】sink 只读自己监听的那一侧：
-/// - 线程 sink 读线程 compartment（本应用内 explorer 点牌 → 本线程值）
-/// - 全局 sink 读全局 compartment（跨进程总线，全员向它收敛）
-/// 曾因"线程优先、全局兜底"串读：后台进程拿【陈旧线程值】对账，
-/// 把引擎设回旧状态、恰好撤销用户刚点的切换（一轮失效的真因）。
 #[implement(ITfCompartmentEventSink)]
-struct ModeSink {
-    read_global: bool,
-}
+struct ModeSink {}
 
 impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
     fn OnChange(&self, rguid: *const GUID) -> Result<()> {
@@ -302,12 +284,12 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         } else {
             TF_CONVERSIONMODE_ALPHANUMERIC as i32
         };
-        // 只读本 sink 的权威域（谁触发读谁，不串读）
-        let src = if self.read_global {
-            COMP_GLOBAL.lock().ok().and_then(|s| s.as_ref().map(|g| g.0.clone()))
-        } else {
-            COMP_THREAD.with(|c| c.borrow().clone())
-        };
+        // 【v4/v5：纯观察者】compartment 不是权威——引擎才是。
+        // 系统焦点切换会把「每应用记忆的输入模式」写进 compartment
+        // （陈旧值），追它等于跟系统记忆打架；且 msctf 回调里做任何
+        // 阻塞调用（管道）都会弄坏 msctf 连接（语言栏项死亡真因）。
+        // 这里只读线程侧记一笔诊断日志，引擎状态由按键响应同步。
+        let src = COMP_THREAD.with(|c| c.borrow().clone());
         let mut actual: Option<i32> = None;
         if let Some(cm) = src {
             if let Ok(comp) =
@@ -320,27 +302,9 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         }
         if let Some(n) = actual {
             if n != expected {
-                // 【多进程对账】按 compartment 指示值【设值】而非 toggle：
-                // 全局 compartment 变化时所有加载虎符的进程都会收到
-                // OnChange，各自 toggle 会把共享引擎连番翻转（实测奇偶
-                // 错乱）；幂等 set_lang 让全部进程收敛到同一状态。
-                let want_zh = (n & TF_CONVERSIONMODE_NATIVE as i32) != 0;
-                let tag = if self.read_global { "G" } else { "T" };
                 log_diag(&format!(
-                    "OnChange[{tag}] actual={n} expected={expected} → set_lang zh={want_zh}"
+                    "OnChange[T] actual={n} expected={expected}（仅记录，引擎不追系统记忆）"
                 ));
-                if let Some(resp) = crate::ipc::call(&serde_json::json!({
-                    "op": "set_lang", "chinese": want_zh
-                })) {
-                    let zh = resp
-                        .pointer("/state/chinese")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(want_zh);
-                    set_mode(zh); // 各进程收敛同值；重推同值回声无害
-                } else {
-                    log_diag("OnChange 引擎不可达 → 推回真实态");
-                    push_compartments(); // 引擎不可达：把牌推回真实态
-                }
             }
         }
         Ok(())
@@ -367,9 +331,13 @@ pub struct HuFuLangBar {
 
 impl HuFuLangBar {
     pub fn new() -> HuFuLangBar {
+        // 【品牌按钮】牌图标固定「虎」，不随模式变——系统牌只在
+        // 输入法/焦点切换时重读图标（平台缓存），若显示中/英状态则
+        // 会冻结在旧状态：用户看着错的字、系统点牌时还按错的字
+        // 执行。品牌字永不撒谎；模式看打字即知。
         HuFuLangBar {
-            icon_zh: make_glyph_icon("中"),
-            icon_en: make_glyph_icon("英"),
+            icon_zh: make_glyph_icon("虎"),
+            icon_en: make_glyph_icon("虎"),
         }
     }
 }
@@ -411,6 +379,7 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
 /// 挂载到线程的语言栏（Activate 时调用）。项实例存 thread_local：
 /// msctf 的 AddItem/RemoveItem 按对象引用操作（同一 GUID 认领）。
 pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
+    unsafe { ensure_defer_window() };
     let item: ITfLangBarItem = unsafe { HuFuLangBar::new().into() };
     let r = unsafe { mgr.AddItem(&item) };
     r?;
@@ -461,11 +430,10 @@ impl ITfLangBarItem_Impl for HuFuLangBar_Impl {
     }
 
     fn GetTooltipString(&self) -> Result<windows::core::BSTR> {
-        Ok(windows::core::BSTR::from(if is_chinese() {
-            "虎符输入法 · 中文模式（左键切英文，右键打开设置）"
-        } else {
-            "虎符输入法 · 英文模式（左键切中文，右键打开设置）"
-        }))
+        // 悬停提示固定文案（不随模式变，避免冻结误导）
+        Ok(windows::core::BSTR::from(
+            "虎符输入法（左键切中英，右键选码表/设置）",
+        ))
     }
 }
 
@@ -485,14 +453,7 @@ unsafe extern "system" {
         rect: *const RECT,
     ) -> i32;
     fn DestroyMenu(m: isize) -> i32;
-    fn GetForegroundWindow() -> isize;
-    fn GetWindowThreadProcessId(hwnd: isize, pdwprocessid: *mut u32) -> u32;
-    fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
-}
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetCurrentThreadId() -> u32;
 }
 const MF_STRING: u32 = 0x0;
 const MF_SEPARATOR: u32 = 0x800;
@@ -587,20 +548,11 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
             DestroyMenu(m);
             return;
         }
-        // 【KB135788 加固】右键点击任务栏指示牌时本进程多半不是前台
-        // （前台是任务栏/上一个应用）——非前台进程的 SetForegroundWindow
-        // 被系统限制，菜单会秒关或不出现（"多试几次不生效"的真因）。
-        // 标准解法：AttachThreadInput 挂到前台线程再抢前台；菜单关闭
-        // 后 PostMessage(WM_NULL) 复位，否则下一次弹出失灵。
-        let cur_tid = GetCurrentThreadId();
-        let fg_hwnd = GetForegroundWindow();
-        let fg_tid = if fg_hwnd != 0 {
-            GetWindowThreadProcessId(fg_hwnd, std::ptr::null_mut())
-        } else {
-            0
-        };
-        let attached =
-            fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
+        // 【实测教训】不要 AttachThreadInput 到前台线程：右键时
+        // explorer 正阻塞在本 OnClick 的 COM 调用里，挂上它的输入队列
+        // 后菜单模态循环拿不到输入 → TrackPopupMenu 秒回 0（菜单从未
+        // 显示，日志 sel=0 铁证）。直接 SetForegroundWindow 即可——
+        // 任务栏指示牌右键时系统本来就给了显示许可。
         let _ = SetForegroundWindow(owner);
         let sel = TrackPopupMenu(
             m,
@@ -613,15 +565,9 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         );
         // WM_NULL 复位（KB135788：菜单系统状态机要求，缺它二次失灵）
         PostMessageW(owner.0 as isize, 0x0000, 0, 0);
-        if attached {
-            AttachThreadInput(cur_tid, fg_tid, 0);
-        }
         let _ = DestroyWindow(owner);
         DestroyMenu(m);
-        log_diag(&format!(
-            "popup sel={sel} schemas={} fg_attached={attached}",
-            schemas.len()
-        ));
+        log_diag(&format!("popup sel={sel} schemas={}", schemas.len()));
         if sel == 1 {
             let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
         } else if sel >= 100 {
@@ -649,7 +595,9 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
             // 右键：小菜单（码表切换 + 设置…）
             unsafe { popup_menu(pt) };
         } else {
-            // 左键：切换中英（引擎无条件清编码后切换，回填图标/文字）
+            // 左键：切中英。【v3 曾误删】OnClick(click=2) 实际一直有
+            // 送达（21:14 日志六笔铁证）；系统对自定义项【不会】自翻
+            // compartment——驱动权全在我们。toggle 后按引擎回执刷新。
             match crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
                 Some(resp) => {
                     let zh = resp
@@ -696,7 +644,8 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     }
 
     fn GetText(&self) -> Result<windows::core::BSTR> {
-        Ok(windows::core::BSTR::from(if is_chinese() { "中" } else { "英" }))
+        // 固定「虎符」：不显示会冻结的中/英状态（见 new() 注释）
+        Ok(windows::core::BSTR::from("虎符"))
     }
 }
 
