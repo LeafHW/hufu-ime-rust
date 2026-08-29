@@ -79,14 +79,54 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             crate::tray::open_settings();
             serde_json::json!({"ok": true})
         }
-        // 语言栏「中/A」左键切换中英（与 Shift 单击同语义：有编码不动）
+        // 语言栏「中/英」左键切换中英（语言指示牌语义：切换即放弃
+        // 当前编码残留——无条件清空再切，防全局会话 raw 残留卡死切换）
         "toggle_lang" => {
-            if host.session.raw.is_empty() {
-                host.session.chinese = !host.session.chinese;
-                host.session.pair.reset();
-            }
+            host.session.clear();
+            host.session.chinese = !host.session.chinese;
+            host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
+        }
+        // 语言栏「中/英」右键菜单数据：码表清单 + 当前方案。
+        // 【死锁教训】dispatch 已持 host 锁——绝不能经 tray::
+        // schema_snapshot 二次锁同一把 Mutex（曾死锁管道线程拖死全机
+        // 打字）；这里按 HTTP GET /api/schemas 同源逻辑直算。
+        "schemas" => {
+            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().is_dir())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            let current = host.engine.config.schema.current.clone();
+            serde_json::json!({"schemas": names, "current": current})
+        }
+        // 语言栏菜单选码表（与 POST /api/schema 同逻辑：换方案 + 清
+        // 会话 + 重建整句 + 落盘——同样在已持锁内直做）
+        "set_schema" => {
+            let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.is_empty() && host.engine.switch_schema(name).is_ok() {
+                host.session.clear();
+                host.setup_sentence();
+                let _ = host.engine.config.save(&host.config_path);
+            }
+            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().is_dir())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            let current = host.engine.config.schema.current.clone();
+            serde_json::json!({"schemas": names, "current": current})
         }
         // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
         // cloaked、UIElement 被宿主拒绝 → server 代画【用户皮肤】）

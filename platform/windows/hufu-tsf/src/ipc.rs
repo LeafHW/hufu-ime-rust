@@ -52,12 +52,12 @@ struct SpawnBlock {
 }
 
 /// 自愈：server 不在（管道打不开且无实例等待）时拉起 hufu-server.exe。
-/// 每进程只试一次，防拉起风暴。
-fn ensure_server() {
+/// 每进程只试一次，防拉起风暴。返回 true=本次调用确实拉起了。
+fn ensure_server() -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
     static TRIED: AtomicBool = AtomicBool::new(false);
     if TRIED.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     // 候选：宿主 exe 同目录（安装态）→ 工程绝对路径（开发态）。
     // 数据目录同理：安装态在 exe 旁「数据」目录，开发态回退工程 hufu-data。
@@ -109,17 +109,25 @@ fn ensure_server() {
                 CloseHandle(blk.pi[1]);
             }
             crate::tsf::trace("ipc: 已自愈拉起 hufu-server");
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// 单次请求（每次新建连接；本地管道往返 <100µs）。
+/// 【等待策略】server 缺席时的阻塞上限（02:04 全机卡死事故根因）：
+/// - 本进程首次发现缺席：拉起 server 并给足启动等待（3×1000ms，
+///   仅每进程一次）
+/// - 之后仍缺席：快败（2×150ms）——server 已死时绝不能把宿主
+///   每一次按键拖进秒级等待，宁可这一帧走降级路径
 pub fn call(req: &Value) -> Option<Value> {
     unsafe {
         let name: Vec<u16> = PIPE.encode_utf16().chain([0]).collect();
         let mut h;
-        let mut tries = 0;
+        let mut tries = 0u32;
+        let mut wait_ms: u32 = 150;
+        let mut max_tries: u32 = 2;
         let mut spawned = false;
         loop {
             h = CreateFileW(
@@ -135,12 +143,15 @@ pub fn call(req: &Value) -> Option<Value> {
                 break;
             }
             LAST_PIPE_ERR.store(unsafe { GetLastError() }, std::sync::atomic::Ordering::SeqCst);
-            // 打不开：server 不在则拉起，再等管道就绪
+            // 打不开：server 不在则拉起（首遇给足启动时间）
             if !spawned {
                 spawned = true;
-                ensure_server();
+                if ensure_server() {
+                    wait_ms = 1000;
+                    max_tries = 3;
+                }
             }
-            if WaitNamedPipeW(name.as_ptr(), 1500) == 0 || tries >= 5 {
+            if WaitNamedPipeW(name.as_ptr(), wait_ms) == 0 || tries >= max_tries {
                 return None;
             }
             tries += 1;

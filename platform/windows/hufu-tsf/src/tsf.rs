@@ -166,6 +166,11 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                 }
             }
         }
+        // 系统输入指示「中/A」：compartment 同步（本线程 + 全局），
+        // 推 OPENCLOSE=1 + 转换模式初值（微软拼音/Rime 同路线）
+        if let Some(tm) = g.thread_mgr.clone() {
+            crate::langbar::install_compartments(&tm, tid);
+        }
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
         let _ = std::fs::write(&marker, format!("tid={tid} t={:?}\n", std::time::SystemTime::now()));
@@ -196,6 +201,8 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap();
+        // compartment 监听摘除（语言栏项同理，各自对称）
+        crate::langbar::uninstall_compartments();
         if let Some(tm) = g.thread_mgr.clone() {
             // 语言栏项摘除（与本线程 Activate 对称）
             if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
