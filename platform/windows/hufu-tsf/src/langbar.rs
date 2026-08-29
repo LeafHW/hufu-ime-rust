@@ -30,6 +30,7 @@ const CLSID_HUFU: GUID = GUID::from_values(
     [0xA1, 0xD4, 0x9E, 0x0B, 0x7C, 0x2F, 0x5A, 0x88],
 );
 
+const TF_LBI_STYLE_SHOWNINTRAY: u32 = 0x2; // 在任务栏角落（输入指示区）显示
 const TF_LBI_STYLE_BTN_BUTTON: u32 = 0x10000;
 
 #[implement(ITfLangBarItem, ITfLangBarItemButton, ITfSource)]
@@ -125,7 +126,7 @@ impl ITfLangBarItem_Impl for HuFuLangBar_Impl {
         unsafe {
             (*pclbid).clsidService = CLSID_HUFU;
             (*pclbid).guidItem = LANGBAR_ITEM_GUID;
-            (*pclbid).dwStyle = TF_LBI_STYLE_BTN_BUTTON;
+            (*pclbid).dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
             (*pclbid).ulSort = 0;
             (*pclbid).szDescription = text;
         }
