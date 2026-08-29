@@ -132,10 +132,20 @@ Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
 Set-ItemProperty -Path $asm -Name 'Profile' -Value $PROFILE -Type String
 Write-Host 'OK 语言列表 + 切换器装配已写入'
 
-# ── 5) 开机自启（server 常驻 = 托盘 + 设置页 + 管道）──
+# ── 5) 开机自启（server 常驻 = 托盘 + 设置页 + 管道）+ 开始菜单快捷方式 ──
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Set-Reg $run 'HuFu' ('"{0}"' -f $exe)
-Write-Host 'OK 开机自启已设置（数据目录默认 exe 同目录）'
+try {
+    $sm = [Environment]::GetFolderPath('Programs')
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut((Join-Path $sm 'HuFu 虎符输入法设置.lnk'))
+    $lnk.TargetPath = 'http://127.0.0.1:4390/'
+    $lnk.IconLocation = $icon
+    $lnk.Save()
+    Write-Host 'OK 开机自启 + 开始菜单快捷方式「HuFu 虎符输入法设置」'
+} catch {
+    Write-Host 'OK 开机自启已设置（开始菜单快捷方式失败，可忽略）'
+}
 
 # ── 6) 启动 server ——【铁律】必须普通权限：提权启动的管道会拒绝普通应用】──
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
