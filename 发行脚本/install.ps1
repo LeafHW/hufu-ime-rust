@@ -69,9 +69,20 @@ $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
 Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
 Set-Reg $ipsUser '(default)' $dll
 Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
-# regsvr32 触发 DLL 内 DllRegisterServer：HKCU 直写全套 CTF TIP 键树
-#（LanguageProfile 等）——msctf 原生登记的前置条件；每用户即可，无需提权。
+# regsvr32 触发 DLL 内 DllRegisterServer（HKCU TIP 键树）——但 /s 吞错
+# 且偶发静默失败（提权环境实测）。TIP 键树是 msctf 激活的硬前置，
+# 改由脚本直接等价直写（与 DllRegisterServer 同键集），双保险。
 regsvr32 /s $dll
+$tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
+Set-Reg $tipU '(default)' 'HuFu 输入法'
+Set-Reg "$tipU\Description" '(default)' 'HuFu 虎符输入法（虎码）'
+New-Item -Path "$tipU\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
+New-Item -Path "$tipU\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
+$lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
+Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
+Set-Reg $lpU 'Enable' '1'
+Set-RegDWord $lpU 'IconIndex' 0
+Set-Reg $lpU 'IconFile' $dll
 Write-Host 'OK HKCU COM + TIP 键树已注册'
 
 # ── 3) HKLM 机器级 COM + CTF 清单（可选：仅提权时；非必需保险层）──
