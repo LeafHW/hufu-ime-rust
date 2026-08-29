@@ -6,11 +6,14 @@
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use windows::core::{implement, Interface, Result, GUID};
-use windows::Win32::Foundation::{BOOL, E_INVALIDARG, RECT};
+use windows::core::{implement, Interface, PCWSTR, Result, GUID, VARIANT};
+use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::TextServices::{
-    ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItem_Impl,
-    ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl, TF_LANGBARITEMINFO,
+    GUID_LBI_INPUTMODE, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
+    ITfCompartmentMgr, ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
+    ITfLangBarItem_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl,
+    ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
@@ -19,13 +22,10 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINF
 struct SendSink(ITfLangBarItemSink);
 unsafe impl Send for SendSink {}
 
-/// 语言栏项固定 GUID（身份稳定，msctf 按此识别）
-pub const LANGBAR_ITEM_GUID: GUID = GUID::from_values(
-    0x9C3B7D82,
-    0x1A44,
-    0x4E6F,
-    [0xB5, 0xC8, 0x2D, 0x7E, 0x8F, 0x1A, 0x0B, 0x93],
-);
+/// 语言栏项 GUID：用系统保留的「输入模式」GUID——explorer 只把该
+/// GUID 的按钮渲染进任务栏输入指示区（微软拼音/Rime 同款；自定义
+/// GUID 会被归入浮动语言栏，实测任务栏不显示）
+const LANGBAR_ITEM_GUID: GUID = GUID_LBI_INPUTMODE;
 
 /// 服务 CLSID（与 com.rs 一致；GetInfo 需要）
 const CLSID_HUFU: GUID = GUID::from_values(
@@ -55,7 +55,177 @@ pub fn set_mode(zh: bool) -> bool {
         return false;
     }
     notify_sinks();
+    push_compartments();
     true
+}
+
+// ═══════════════ compartment 同步：系统输入指示「中/A」的真身 ═══════════════
+// 任务栏输入指示区的中/英牌是 EXPLORER 画的，读的是 TSF 转换模式
+// compartment（微软拼音/Rime 同款路线）：
+// - GUID_COMPARTMENT_KEYBOARD_OPENCLOSE=1（输入法开着）
+// - GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION = NATIVE(中)/ALPHA(英)
+// 写线程 compartment + 全局 compartment；并监听外部变化（用户点
+// 系统牌 → 引擎跟上）。反馈环由「值与预期一致则忽略」掐断。
+
+thread_local! {
+    /// 本线程 compartment 源（Activate 时装；thread mgr 本身实现该接口）
+    static COMP_THREAD: std::cell::RefCell<Option<ITfCompartmentMgr>> =
+        const { std::cell::RefCell::new(None) };
+    /// 全局 compartment 源（进程只装一次）
+    static COMP_GLOBAL: std::cell::RefCell<Option<ITfCompartmentMgr>> =
+        const { std::cell::RefCell::new(None) };
+    static COMP_COOKIE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static COMP_CLIENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+static GLOBAL_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Activate 时调用：装 compartment 引用 + 挂监听 + 推初值。
+/// tid = TSF client id（SetValue 需要）。
+pub fn install_compartments(tm: &ITfThreadMgr, tid: u32) {
+    COMP_CLIENT.with(|c| c.set(tid));
+    if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
+        COMP_THREAD.with(|c| *c.borrow_mut() = Some(cm));
+    }
+    if !GLOBAL_DONE.swap(true, Ordering::Relaxed) {
+        if let Ok(g) = unsafe { tm.GetGlobalCompartment() } {
+            COMP_GLOBAL.with(|c| *c.borrow_mut() = Some(g));
+        }
+        // 全局监听只挂一次（进程存续期内常驻）
+        advise_conversion(COMP_GLOBAL.with(|c| c.borrow().clone()), tid);
+    }
+    advise_conversion(COMP_THREAD.with(|c| c.borrow().clone()), tid);
+    push_compartments();
+}
+
+/// Deactivate：摘本线程监听、清引用（全局的留着）
+pub fn uninstall_compartments() {
+    let cookie = COMP_COOKIE.with(|c| c.replace(0));
+    if cookie != 0 {
+        if let Some(cm) = COMP_THREAD.with(|c| c.borrow().clone()) {
+            if let Ok(comp) = unsafe { cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) } {
+                if let Ok(src) = comp.cast::<ITfSource>() {
+                    unsafe {
+                        let _ = src.UnadviseSink(cookie);
+                    }
+                }
+            }
+        }
+    }
+    COMP_THREAD.with(|c| *c.borrow_mut() = None);
+}
+
+/// 把当前模式推进 OPENCLOSE + CONVERSION（线程 + 全局）
+pub fn push_compartments() {
+    let conv: i32 = if is_chinese() {
+        TF_CONVERSIONMODE_NATIVE as i32
+    } else {
+        TF_CONVERSIONMODE_ALPHANUMERIC as i32
+    };
+    let tid = COMP_CLIENT.with(|c| c.get());
+    for src in [
+        COMP_THREAD.with(|c| c.borrow().clone()),
+        COMP_GLOBAL.with(|c| c.borrow().clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        unsafe {
+            if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
+                let v = VARIANT::from(1i32);
+                let _ = comp.SetValue(tid, &v);
+            }
+            if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
+                let v = VARIANT::from(conv);
+                let _ = comp.SetValue(tid, &v);
+            }
+        }
+    }
+}
+
+/// compartment mgr → 指定 guid 的 compartment（GetCompartment 会自动建键）
+unsafe fn cm_compartment(cm: &ITfCompartmentMgr, guid: *const GUID) -> Result<ITfCompartment> {
+    unsafe { cm.GetCompartment(guid) }
+}
+
+/// 读 VARIANT 当 i32（VT_I4 = 3；偏移 8 = vt+3 保留字后）
+unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
+    unsafe {
+        let p = v as *const VARIANT as *const u16;
+        if *p != 3 {
+            return None;
+        }
+        let b = v as *const VARIANT as *const u8;
+        Some(i32::from_le_bytes([*b.add(8), *b.add(9), *b.add(10), *b.add(11)]))
+    }
+}
+
+fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32) {
+    let Some(cm) = cm else { return };
+    unsafe {
+        let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) else {
+            return;
+        };
+        let Ok(src) = comp.cast::<ITfSource>() else {
+            return;
+        };
+        let sink: ITfCompartmentEventSink = ModeSink.into();
+        let _ = src.AdviseSink(&ITfCompartmentEventSink::IID, &sink);
+        // cookie 不存（进程存续期常驻；Deactivate 只摘线程那份）
+    }
+}
+
+/// 外部改了转换模式（用户点系统牌）：值 ≠ 预期 → 引擎跟上切换；
+/// 相等（自己的写入回声）→ 忽略。反馈环就此掐断。
+#[implement(ITfCompartmentEventSink)]
+struct ModeSink;
+
+impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
+    fn OnChange(&self, rguid: *const GUID) -> Result<()> {
+        unsafe {
+            if rguid.as_ref() != Some(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
+                return Ok(());
+            }
+        }
+        let expected: i32 = if is_chinese() {
+            TF_CONVERSIONMODE_NATIVE as i32
+        } else {
+            TF_CONVERSIONMODE_ALPHANUMERIC as i32
+        };
+        // 读触发侧的当前值（线程优先，全局兜底）
+        let mut actual: Option<i32> = None;
+        for src in [
+            COMP_THREAD.with(|c| c.borrow().clone()),
+            COMP_GLOBAL.with(|c| c.borrow().clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(comp) =
+                unsafe { cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) }
+            {
+                if let Ok(v) = unsafe { comp.GetValue() } {
+                    if let Some(n) = unsafe { var_i32(&v) } {
+                        actual = Some(n);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(n) = actual {
+            if n != expected {
+                if let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
+                    let zh = resp
+                        .pointer("/state/chinese")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or_else(is_chinese);
+                    set_mode(zh); // 内部会推 compartment（此时值已一致，回声无害）
+                } else {
+                    push_compartments(); // 引擎不可达：把牌推回真实态
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn notify_sinks() {
@@ -72,15 +242,15 @@ fn notify_sinks() {
 
 #[implement(ITfLangBarItem, ITfLangBarItemButton, ITfSource)]
 pub struct HuFuLangBar {
-    icon_zh: isize, // HICON
-    icon_en: isize,
+    icon_zh: isize, // HICON（纯字符「中」，无底牌）
+    icon_en: isize, // 「英」
 }
 
 impl HuFuLangBar {
     pub fn new() -> HuFuLangBar {
         HuFuLangBar {
-            icon_zh: make_zh_icon(),
-            icon_en: make_a_icon(),
+            icon_zh: make_glyph_icon("中"),
+            icon_en: make_glyph_icon("英"),
         }
     }
 }
@@ -191,17 +361,115 @@ impl ITfLangBarItem_Impl for HuFuLangBar_Impl {
     }
 }
 
+// ── 右键菜单裸 FFI（TrackPopupMenu + TPM_RETURNCMD 取回选项 id；
+// windows crate 的签名拿不到返回值，这里按 Win32 原型直连）──
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn CreatePopupMenu() -> isize;
+    fn AppendMenuW(m: isize, flags: u32, id: usize, text: *const u16) -> i32;
+    fn TrackPopupMenu(
+        m: isize,
+        flags: u32,
+        x: i32,
+        y: i32,
+        reserved: u32,
+        hwnd: isize,
+        rect: *const RECT,
+    ) -> i32;
+    fn DestroyMenu(m: isize) -> i32;
+    fn GetForegroundWindow() -> isize;
+}
+const MF_STRING: u32 = 0x0;
+const MF_SEPARATOR: u32 = 0x800;
+const MF_CHECKED: u32 = 0x8;
+const TPM_RETURNCMD: u32 = 0x100;
+const TPM_RIGHTALIGN: u32 = 0x8;
+const TPM_BOTTOMALIGN: u32 = 0x20;
+
+/// 右键小菜单：码表清单（当前 ✓）+ 分隔线 + 设置…
+/// 返回 true 表示已处理（弹了菜单）；菜单动作就地执行。
+unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
+    unsafe {
+        // 取码表清单（server 不可达时只给设置项）
+        let (schemas, current): (Vec<String>, String) =
+            match crate::ipc::call(&serde_json::json!({"op": "schemas"})) {
+                Some(r) => (
+                    r.get("schemas")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    r.get("current")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                None => (Vec::new(), String::new()),
+            };
+        let m = CreatePopupMenu();
+        if m == 0 {
+            return;
+        }
+        for (i, name) in schemas.iter().enumerate() {
+            let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let flags = MF_STRING
+                + if name == &current {
+                    MF_CHECKED
+                } else {
+                    0
+                };
+            AppendMenuW(m, flags, 100 + i, w.as_ptr());
+        }
+        if !schemas.is_empty() {
+            AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+        }
+        let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
+        AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
+        // 前台窗口作 owner（经典托盘菜单套路：保焦点使外部点击可撤销）
+        let fg = GetForegroundWindow();
+        let sel = TrackPopupMenu(
+            m,
+            TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
+            pt.x,
+            pt.y,
+            0,
+            fg,
+            std::ptr::null(),
+        );
+        DestroyMenu(m);
+        if sel == 1 {
+            let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+        } else if sel >= 100 {
+            let idx = (sel - 100) as usize;
+            if let Some(name) = schemas.get(idx) {
+                let _ = crate::ipc::call(&serde_json::json!({
+                    "op": "set_schema", "name": name
+                }));
+            }
+        }
+    }
+}
+
 impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     fn OnClick(
         &self,
         click: windows::Win32::UI::TextServices::TfLBIClick,
-        _pt: &windows::Win32::Foundation::POINT,
+        pt: &windows::Win32::Foundation::POINT,
         _prcarea: *const RECT,
     ) -> Result<()> {
-        // 右键 → 设置页；左键 → 切换中英（引擎返回最新态，回填图标）
-        if click == windows::Win32::UI::TextServices::TfLBIClick(1) {
-            let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+        // 诊断：点击路由确认（左右键实测排查用）
+        let _ = std::fs::write(
+            std::env::temp_dir().join("hufu-langbar-click.txt"),
+            format!("click={} t={:?}\n", click.0, std::time::SystemTime::now()),
+        );
+        if click.0 == 1 {
+            // 右键：小菜单（码表切换 + 设置…）
+            unsafe { popup_menu(pt) };
         } else {
+            // 左键：切换中英（引擎无条件清编码后切换，回填图标/文字）
             if let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "toggle_lang"})) {
                 let zh = resp
                     .pointer("/state/chinese")
@@ -213,11 +481,29 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
         Ok(())
     }
 
-    fn InitMenu(&self, _pmenu: Option<&windows::Win32::UI::TextServices::ITfMenu>) -> Result<()> {
+    fn InitMenu(&self, pmenu: Option<&windows::Win32::UI::TextServices::ITfMenu>) -> Result<()> {
+        // 兼容走菜单协议的宿主：给一个设置项（右键主路在 OnClick 弹
+        // Win32 菜单，码表清单在那里动态取）
+        if let Some(m) = pmenu {
+            let t: Vec<u16> = "设置…".encode_utf16().collect();
+            unsafe {
+                let _ = m.AddMenuItem(
+                    1,
+                    0, // TF_LBMENUF_NONE
+                    windows::Win32::Graphics::Gdi::HBITMAP(std::ptr::null_mut()),
+                    windows::Win32::Graphics::Gdi::HBITMAP(std::ptr::null_mut()),
+                    &t,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
         Ok(())
     }
 
-    fn OnMenuSelect(&self, _id: u32) -> Result<()> {
+    fn OnMenuSelect(&self, id: u32) -> Result<()> {
+        if id == 1 {
+            let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+        }
         Ok(())
     }
 
@@ -226,102 +512,126 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     }
 
     fn GetText(&self) -> Result<windows::core::BSTR> {
-        Ok(windows::core::BSTR::from(if is_chinese() { "中" } else { "A" }))
+        Ok(windows::core::BSTR::from(if is_chinese() { "中" } else { "英" }))
     }
 }
 
-// ───────────────────────── 「中」「A」图标软件光栅化 ─────────────────────────
-// 32×32 BGRA 超采样 4×；圆角方块底 + 字形几何。「中」（口环+竖贯通）
-// 与 server 托盘爪印图标同一套画法；「A」两斜腿 + 横杠。
-
-/// 通用：圆角方块底 + 前景覆盖判定函数 → HICON
-fn make_plate_icon(fg_hit: impl Fn(f32, f32) -> bool) -> isize {
-    const S: usize = 32;
-    const SS: usize = 4;
-    let r = 7.5f32;
-    let half = 14.0f32;
-    let bg = [0.105, 0.105, 0.118f32]; // #1B1B1E
-    let fg = [0.96, 0.96, 0.97f32]; // #F5F5F7
-    let mut buf = vec![0u8; S * S * 4];
-    for y in 0..S {
-        for x in 0..S {
-            let mut cov_bg = 0u32;
-            let mut cov_fg = 0u32;
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
-                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    let qx = (px - 16.0).abs() - (half - r);
-                    let qy = (py - 16.0).abs() - (half - r);
-                    let d = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
-                    if d <= r {
-                        cov_bg += 1;
-                        if fg_hit(px, py) {
-                            cov_fg += 1;
-                        }
-                    }
+// ───────────────────────── 「中」「英」纯字符图标 ─────────────────────────
+// 32×32 ARGB：GDI 画字符（雅黑粗体、灰度 AA）→ coverage，
+// 【墨迹居中】——CJK 字符格含内隙，字格居中会整体偏上/偏下，与
+// 相邻系统图标错位；这里按 coverage 的实际墨迹行盒重新居中。
+// 白字核心 + 4 邻扩张黑晕（深/浅任务栏都可读），无底牌。
+fn make_glyph_icon(ch: &str) -> isize {
+    use windows::Win32::Graphics::Gdi::*;
+    const S: i32 = 32;
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+        let hf = CreateFontW(
+            -31, // 撑满 32 画布（用户反馈要更大）
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            0x86, // DEFAULT_CHARSET
+            0,
+            0,
+            4, // ANTIALIASED_QUALITY（灰度 coverage）
+            0,
+            PCWSTR(face.as_ptr()),
+        );
+        let mut hdr = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: S,
+                biHeight: -S,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(hdc, &hdr, DIB_RGB_COLORS, &mut bits, None, 0)
+            .unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() || hf.is_invalid() {
+            if !hf.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(hf.0));
+            }
+            let _ = DeleteDC(hdc);
+            return 0;
+        }
+        let _ = SelectObject(hdc, HGDIOBJ(dib.0));
+        let _ = SelectObject(hdc, HGDIOBJ(hf.0));
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(0x00FF_FF_FF));
+        let ws: Vec<u16> = ch.encode_utf16().collect();
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        let _ = GetTextExtentPoint32W(hdc, &ws, &mut sz);
+        let _ = TextOutW(hdc, (S - sz.cx) / 2, (S - sz.cy) / 2, &ws);
+        let _ = GdiFlush();
+        // coverage = 蓝通道（白字 RGB 同值）
+        let mut cov = vec![0f32; (S * S) as usize];
+        for i in 0..(S * S) as usize {
+            cov[i] = (bits as *const u8).add(i * 4).read_volatile() as f32 / 255.0;
+        }
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteObject(HGDIOBJ(hf.0));
+        let _ = DeleteDC(hdc);
+        // 墨迹行盒 → 重定中心（整行平移 dy，消除字格内隙造成的错位）
+        let mut ink_top = -1i32;
+        let mut ink_bot = -1i32;
+        for y in 0..S {
+            let row_has = (0..S).any(|x| cov[(y * S + x) as usize] > 0.02);
+            if row_has {
+                if ink_top < 0 {
+                    ink_top = y;
                 }
-            }
-            let a_bg = cov_bg as f32 / (SS * SS) as f32;
-            let a_fg = cov_fg as f32 / (SS * SS) as f32;
-            if a_bg > 0.0 {
-                let blend = |i: usize| -> u8 {
-                    let v = fg[i] * a_fg + bg[i] * (a_bg - a_fg) / a_bg.max(1e-6);
-                    (v * a_bg * 255.0) as u8
-                };
-                let i = (y * S + x) * 4;
-                buf[i] = blend(2);
-                buf[i + 1] = blend(1);
-                buf[i + 2] = blend(0);
-                buf[i + 3] = (a_bg * 255.0) as u8;
+                ink_bot = y;
             }
         }
+        let dy = if ink_top >= 0 {
+            // 目标墨心 = 画布中线；CJK 墨迹偏字格下方 → 通常上移
+            ((S as f32 - 1.0) / 2.0 - (ink_top + ink_bot) as f32 / 2.0).round() as i32
+        } else {
+            0
+        };
+        let g = |x: i32, y: i32| -> f32 {
+            // 平移后的采样（越界=空）
+            let sy = y - dy;
+            if x < 0 || sy < 0 || x >= S || sy >= S {
+                0.0
+            } else {
+                cov[(sy * S + x) as usize]
+            }
+        };
+        let mut out = vec![0u8; (S * S * 4) as usize];
+        for y in 0..S {
+            for x in 0..S {
+                let c = g(x, y);
+                let o = g(x - 1, y)
+                    .max(g(x + 1, y))
+                    .max(g(x, y - 1))
+                    .max(g(x, y + 1));
+                if c <= 0.0 && o <= 0.0 {
+                    continue;
+                }
+                let a = c.max(o * 0.85);
+                let w = c / a.max(1e-6); // 白占比（核心 1、晕 0）
+                let v = (w * 245.0) as u8;
+                let i = ((y * S + x) * 4) as usize;
+                out[i] = v;
+                out[i + 1] = v;
+                out[i + 2] = v;
+                out[i + 3] = (a * 255.0) as u8;
+            }
+        }
+        bgra_to_hicon(&out, S, S)
     }
-    unsafe { bgra_to_hicon(&buf, S as i32, S as i32) }
-}
-
-fn make_zh_icon() -> isize {
-    // 「中」：口 字环 + 竖贯通（与初版逐像素同参）
-    let (bx0, by0, bx1, by1) = (8.8f32, 10.6f32, 23.2f32, 25.4f32);
-    let stroke = 2.5f32;
-    let (vx, vy0, vy1) = (16.0f32, 5.4f32, 27.6f32);
-    make_plate_icon(move |px, py| {
-        let in_outer = px >= bx0 && px <= bx1 && py >= by0 && py <= by1;
-        let in_inner = px >= bx0 + stroke
-            && px <= bx1 - stroke
-            && py >= by0 + stroke
-            && py <= by1 - stroke;
-        let in_bar = (px - vx).abs() <= stroke / 2.0 && py >= vy0 && py <= vy1;
-        (in_outer && !in_inner) || in_bar
-    })
-}
-
-fn make_a_icon() -> isize {
-    // 「A」：顶点 (16, 5.8)，底脚 (9.6, 26.4)/(22.4, 26.4)，两斜腿
-    // 各宽 2.7；横杠 y∈[19.6, 22.2] 夹在两腿内侧。
-    let apex = (16.0f32, 5.8f32);
-    let lfoot = (9.6f32, 26.4f32);
-    let rfoot = (22.4f32, 26.4f32);
-    let stroke = 2.7f32;
-    // 点到直线距离（有向）：腿 = |d| ≤ stroke/2
-    let dist = |p: (f32, f32), a: (f32, f32), b: (f32, f32)| -> f32 {
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        ((dy * p.0 - dx * p.1 + b.0 * a.1 - b.1 * a.0) / (dx * dx + dy * dy).sqrt()).abs()
-    };
-    let leg_l = |px: f32, py: f32| dist((px, py), apex, lfoot) <= stroke / 2.0;
-    let leg_r = |px: f32, py: f32| dist((px, py), apex, rfoot) <= stroke / 2.0;
-    make_plate_icon(move |px, py| {
-        if py >= 19.6 && py <= 22.2 {
-            // 横杠：x 夹在该高度两腿中心线之间（略收 0.4 防外凸）
-            let t = (py - apex.1) / (lfoot.1 - apex.1);
-            let xl = apex.0 + (lfoot.0 - apex.0) * t + 0.4;
-            let xr = apex.0 + (rfoot.0 - apex.0) * t - 0.4;
-            if px >= xl && px <= xr {
-                return true;
-            }
-        }
-        leg_l(px, py) || leg_r(px, py)
-    })
 }
 
 /// BGRA 缓冲 → HICON（CreateBitmap 直接带位 + CreateIconIndirect；

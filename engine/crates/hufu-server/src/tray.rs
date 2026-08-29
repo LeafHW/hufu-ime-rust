@@ -434,6 +434,8 @@ pub fn open_settings() {
 static mut SHARED: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>> = None;
 
 /// 码表目录方案列表 + 当前方案名（快照；锁内只做目录读与字段拷贝）。
+/// 【死锁教训】pipe 线程已在 dispatch 持锁，不可经此函数二次锁——
+/// 只供托盘自己的菜单线程使用。
 fn schema_snapshot() -> (Vec<String>, String) {
     let shared = unsafe {
         #[allow(static_mut_refs)]
@@ -457,6 +459,7 @@ fn schema_snapshot() -> (Vec<String>, String) {
 }
 
 /// 切换方案（与 POST /api/schema 同逻辑：换方案 + 清会话 + 重建整句 + 落盘）。
+/// pipe "set_schema" 在 dispatch 持锁内直做同逻辑（见 pipe.rs），不绕这里。
 fn switch_schema(name: &str) {
     let shared = unsafe {
         #[allow(static_mut_refs)]
