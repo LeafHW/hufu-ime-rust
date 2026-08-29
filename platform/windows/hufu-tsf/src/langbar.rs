@@ -6,15 +6,11 @@
 //! Deactivate 移除——切到虎符才出现，与用户需求一致。
 //!
 //! 点击 → 管道 op "settings" 打开设置页（与托盘双击/Ctrl+Alt+H 同通道）。
-use windows::core::{implement, Result, GUID, IUnknown};
-use windows::Win32::Foundation::{BOOL, HANDLE, RECT};
-use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DeleteDC, SetDIBits,
-};
-use windows::Win32::System::Com::CoTaskMemAlloc;
+use windows::core::{implement, Interface, Result, GUID};
+use windows::Win32::Foundation::{BOOL, E_INVALIDARG, HANDLE, RECT};
 use windows::Win32::UI::TextServices::{
     ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItem_Impl,
-    ITfLangBarItemMgr, TF_LANGBARITEMINFO,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl, TF_LANGBARITEMINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
@@ -36,16 +32,53 @@ const CLSID_HUFU: GUID = GUID::from_values(
 
 const TF_LBI_STYLE_BTN_BUTTON: u32 = 0x10000;
 
-#[implement(ITfLangBarItem, ITfLangBarItemButton)]
+#[implement(ITfLangBarItem, ITfLangBarItemButton, ITfSource)]
 pub struct HuFuLangBar {
-    icon: isize, // HICON（ isize 便于 ICONINFO 交互）
+    icon: isize, // HICON（isize 便于 ICONINFO 交互）
+    /// msctf 挂的更新 sink（静态图标不主动通知，但 Advise 必须接受）
+    sinks: std::cell::RefCell<Vec<(u32, ITfLangBarItemSink)>>,
+    next_cookie: std::cell::Cell<u32>,
 }
 
 impl HuFuLangBar {
     pub fn new() -> HuFuLangBar {
         HuFuLangBar {
             icon: make_zh_icon(),
+            sinks: std::cell::RefCell::new(Vec::new()),
+            next_cookie: std::cell::Cell::new(0x4846_0001),
         }
+    }
+}
+
+/// ITfSource：msctf（语言栏宿主）会对项 AdviseSink(ITfLangBarItemSink)。
+/// 不实现该接口时 AddItem 在真实宿主里可能 E_FAIL；静态图标无需主动
+/// OnUpdate，但挂/摘必须登记成功。
+impl ITfSource_Impl for HuFuLangBar_Impl {
+    fn AdviseSink(
+        &self,
+        riid: *const GUID,
+        punk: Option<&windows::core::IUnknown>,
+    ) -> Result<u32> {
+        if unsafe { riid.as_ref() } != Some(&ITfLangBarItemSink::IID) {
+            return Err(windows::core::Error::from(E_INVALIDARG));
+        }
+        let sink: ITfLangBarItemSink = punk
+            .and_then(|u| u.cast().ok())
+            .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+        let cookie = self.next_cookie.get();
+        self.next_cookie.set(cookie + 1);
+        self.sinks.borrow_mut().push((cookie, sink));
+        Ok(cookie)
+    }
+
+    fn UnadviseSink(&self, dwcookie: u32) -> Result<()> {
+        let mut v = self.sinks.borrow_mut();
+        let before = v.len();
+        v.retain(|(c, _)| *c != dwcookie);
+        if v.len() == before {
+            return Err(windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG));
+        }
+        Ok(())
     }
 }
 
@@ -53,7 +86,14 @@ impl HuFuLangBar {
 /// msctf 的 AddItem/RemoveItem 按对象引用操作（同一 GUID 认领）。
 pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     let item: ITfLangBarItem = unsafe { HuFuLangBar::new().into() };
-    unsafe { mgr.AddItem(&item)? };
+    let r = unsafe { mgr.AddItem(&item) };
+    // 诊断标记：Activate 后 %TEMP%\hufu-langbar.txt 可查挂载结果
+    let msg = match &r {
+        Ok(()) => format!("ok pid={} t={:?}\n", std::process::id(), std::time::SystemTime::now()),
+        Err(e) => format!("FAIL {:#010x} pid={}\n", e.code().0, std::process::id()),
+    };
+    let _ = std::fs::write(std::env::temp_dir().join("hufu-langbar.txt"), msg);
+    r?;
     LANGBAR_ITEM.with(|c| *c.borrow_mut() = Some(item));
     Ok(())
 }
