@@ -425,31 +425,25 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                 0
             }
             WM_APP_IME => {
-                // 输入法激活态变化（托盘线程上执行，Shell_NotifyIcon 安全）
-                if wparam == 1 {
+                // 输入法激活态变化。小虎爪印已改【常驻】：开机自启即上托盘，
+                // 不再随激活态显隐（用户定稿：指示 pill=「中」（DLL 资源），
+                // 爪印常驻托盘作设置入口）。此处仅作意外丢失后的补挂。
+                if wparam == 1 && !ICON_ADDED.load(Ordering::SeqCst) {
                     let _ = KillTimer(hwnd, TIMER_IME_HIDE);
-                    if !ICON_ADDED.load(Ordering::SeqCst) {
-                        let nid = nid_of(hwnd);
-                        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-                            // 残留同名图标 → 先删再加
-                            Shell_NotifyIconW(NIM_DELETE, &nid);
-                            Shell_NotifyIconW(NIM_ADD, &nid);
-                        }
-                        ICON_ADDED.store(true, Ordering::SeqCst);
+                    let nid = nid_of(hwnd);
+                    if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+                        // 残留同名图标 → 先删再加
+                        Shell_NotifyIconW(NIM_DELETE, &nid);
+                        Shell_NotifyIconW(NIM_ADD, &nid);
                     }
-                } else {
-                    // 防抖：700ms 内无再次激活才隐藏（进程焦点切换交错防闪烁）
-                    let _ = SetTimer(hwnd, TIMER_IME_HIDE, 700, 0);
+                    ICON_ADDED.store(true, Ordering::SeqCst);
                 }
                 0
             }
             WM_TIMER => {
                 if wparam == TIMER_IME_HIDE {
                     let _ = KillTimer(hwnd, TIMER_IME_HIDE);
-                    if !IME_ACTIVE.load(Ordering::SeqCst) {
-                        let _ = Shell_NotifyIconW(NIM_DELETE, &nid_of(hwnd));
-                        ICON_ADDED.store(false, Ordering::SeqCst);
-                    }
+                    // 常驻化：不再因失活隐藏
                 }
                 0
             }
@@ -554,8 +548,18 @@ pub fn spawn(
         const HOTKEY_ID_SETTINGS: i32 = 0x4846; // "HF"
         let hk = RegisterHotKey(hwnd, HOTKEY_ID_SETTINGS, MOD_CONTROL | MOD_ALT, 0x48 /*'H'*/);
         let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
-        // 图标初始**不显示**：只在虎符输入法激活时出现（DLL 的
-        // Activate/Deactivate 经管道上报，on_ime_state 驱动显隐）。
+        // 爪印【常驻】：server 启动即上托盘（不再等输入法激活）。
+        // 用户定稿分工——任务栏指示 pill=「中」（DLL 内嵌资源，切到虎符
+        // 即变）；小虎爪印常驻托盘=设置入口（双击开设置）+ 状态标识。
+        {
+            let nid = nid_of(hwnd);
+            if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+                // 残留同名图标（异常退出）→ 先删再加
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                Shell_NotifyIconW(NIM_ADD, &nid);
+            }
+            ICON_ADDED.store(true, Ordering::SeqCst);
+        }
         let _ = GetCurrentThreadId();
         let mut m = MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, pt: POINT { x: 0, y: 0 } };
         loop {
