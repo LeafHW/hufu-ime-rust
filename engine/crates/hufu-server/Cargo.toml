@@ -8,6 +8,12 @@ license.workspace = true
 name = "hufu-server"
 path = "src/main.rs"
 
+[features]
+# console = 保留控制台子系统构建（调试/特殊部署）；默认 GUI 子系统，
+# 任何方式拉起（HKCU Run / DLL / explorer）都不再弹终端窗。
+default = []
+console = []
+
 [dependencies]
 hufu-types = { path = "../hufu-types" }
 hufu-dict = { path = "../hufu-dict" }

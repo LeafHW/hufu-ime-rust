@@ -1,7 +1,14 @@
 //! hufu-server —— 守护进程：引擎宿主 + HTTP 设置界面 + 前端 IPC。
 //!
-//! 用法：hufu-server [--data <目录>] [--port <端口>]
+//! 用法：hufu-server [--data <目录>] [--port <端口>] [--console]
 //! 默认数据目录：./hufu-data（或环境变量 HUFU_DATA）；默认端口 4390。
+//!
+//! 【GUI 子系统】修复「开机自启弹出终端（重排装载日志）」：HKCU Run 裸路径
+//! 启动控制台程序会弹黑窗。改为 windows 子系统后任何拉起方（Run/DLL/
+//! explorer 中转）都无窗；开发态从终端启动时 AttachConsole(父进程)
+//! 接回 stdout/stderr（首次输出前调用，std 句柄懒初始化可拿到控制台）；
+//! --console 强制 AllocConsole（双击 exe 调试用）。
+#![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
 mod candwin;
 mod host;
@@ -19,7 +26,37 @@ use std::sync::{Arc, Mutex};
 
 const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 
+/// 开发态接回终端（见文件头注释）。必须在任何 stdout/stderr 输出前调用。
+/// 零依赖直声明（与 pipe/tray 同风格）；std 句柄懒初始化，Attach 成功后
+/// 首次 println 即可写入父控制台。
+#[cfg(windows)]
+fn attach_console_for_dev(force: bool) {
+    const ATTACH_PARENT_PROCESS: usize = usize::MAX;
+    // windows-sys 原型（保持零特性门）
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dwProcessId: usize) -> i32;
+        fn AllocConsole() -> i32;
+        fn GetConsoleWindow() -> isize;
+    }
+    unsafe {
+        if GetConsoleWindow() != 0 {
+            return; // 已有控制台（终端里 cargo run / --console 二次调用）
+        }
+        if force {
+            let _ = AllocConsole();
+        } else {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(all(windows, not(feature = "console")))]
+    {
+        let want_console = std::env::args().any(|a| a == "--console");
+        attach_console_for_dev(want_console);
+    }
     let mut args = std::env::args().skip(1);
     let mut data_dir = std::env::var("HUFU_DATA")
         .map(PathBuf::from)
