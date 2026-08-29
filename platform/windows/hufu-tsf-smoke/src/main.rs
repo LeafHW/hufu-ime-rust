@@ -107,7 +107,18 @@ fn main() {
         return;
     }
     let dll = std::env::var("HUFU_TSF_DLL").unwrap_or_else(|_| {
-        r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll".into()
+        // 优先 smoke exe 同目录的 DLL（安装态），否则开发构建兜底。
+        // （旧版直接取工程绝对路径，安装机上会误注册/误测开发 DLL。）
+        let beside = std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                let d = p.parent()?.join("hufu_tsf.dll");
+                d.exists().then_some(d)
+            })
+            .map(|p| p.to_string_lossy().into_owned());
+        beside.unwrap_or_else(|| {
+            r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll".into()
+        })
     });
     let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
     unsafe {

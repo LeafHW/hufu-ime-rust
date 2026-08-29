@@ -59,31 +59,43 @@ fn ensure_server() -> bool {
     if TRIED.swap(true, Ordering::SeqCst) {
         return false;
     }
-    // 候选：宿主 exe 同目录（安装态）→ 工程绝对路径（开发态）。
+    // 候选：宿主 exe 同目录（开发态）→ %LOCALAPPDATA%\HuFu（安装态：
+    // DLL 在 SystemIME 而程序在用户目录，server 崩溃后仍可自愈）→ 工程绝对路径（开发态兜底）。
     // 数据目录同理：安装态在 exe 旁「数据」目录，开发态回退工程 hufu-data。
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
         .unwrap_or_default();
     let dev_data = r"E:\DSH-KF\hufu\hufu-data";
-    let data_dir = if std::path::Path::new(&format!("{exe_dir}\\数据")).exists() {
-        format!("{exe_dir}\\数据")
-    } else {
-        dev_data.to_string()
-    };
+    let local_app = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let candidates = [
         format!("{exe_dir}\\hufu-server.exe"),
+        format!("{local_app}\\HuFu\\hufu-server.exe"),
         r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string(),
     ];
     for exe in candidates {
         if !std::path::Path::new(&exe).exists() {
             continue;
         }
+        // 数据目录跟随 server 自身：候选 1/2 用 exe 旁「数据」（server
+        // 不带 --data 时即此默认）；dev 兜底候选显式指工程数据。
+        let data_of = {
+            let beside = format!("{exe}\\..\\数据");
+            let beside = std::path::Path::new(&beside)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&beside));
+            if beside.exists() {
+                None // 就用 server 默认（exe 同目录\数据）
+            } else {
+                Some(dev_data.to_string())
+            }
+        };
         let wexe: Vec<u16> = exe.encode_utf16().chain([0]).collect();
-        let mut cmd: Vec<u16> = format!("\"{exe}\" --data \"{data_dir}\"")
-            .encode_utf16()
-            .chain([0])
-            .collect();
+        let cmdline = match &data_of {
+            Some(d) => format!("\"{exe}\" --data \"{d}\""),
+            None => format!("\"{exe}\""),
+        };
+        let mut cmd: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
         let mut blk = SpawnBlock {
             si_cb: 104, // sizeof(STARTUPINFOW)
             si_rest: [0; 10],

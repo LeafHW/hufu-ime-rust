@@ -44,8 +44,9 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             serde_json::json!({"state": state})
         }
         "focus" => {
-            // 焦点切换：v1 单会话，仅清空
+            // 焦点切换：v1 单会话，仅清空；换输入框 → 文章尾巴一并作废
             host.session.clear();
+            host.session.tail_context.clear();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
