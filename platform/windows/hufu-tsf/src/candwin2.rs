@@ -56,6 +56,12 @@ extern "system" fn cand2_wndproc(
     // 不进 DefWindowProc——物理隔离点击路径。悬停/移动仍走默认。
     match msg {
         0x201 | 0x202 | 0x204 | 0x205 | 0x207 | 0x208 => return LRESULT(0),
+        // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
+        // 会与 MSCTF/Chromium 焦点临界区死锁）
+        crate::candwin2::WM_APP_HIDE_CAND => {
+            unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
+            return LRESULT(0);
+        }
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1096,11 +1102,23 @@ impl CandidateWindowV2 {
         // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
         // 中下方」的病根）。
         self.last_raw_len = usize::MAX;
+        // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
+        // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
+        // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
+        // 排队，焦点回调返回后由消息循环执行隐藏。
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let _ = PostMessageW(
+                self.hwnd,
+                WM_APP_HIDE_CAND,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
+
+/// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
+pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 
 unsafe extern "system" fn defwindowproc_w(
     hwnd: HWND,
