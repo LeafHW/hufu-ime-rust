@@ -216,11 +216,18 @@ impl CandidateWindowV2 {
                 ..Default::default()
             };
             let _atom = RegisterClassW(&wc);
+            // WS_EX_TRANSPARENT：完全鼠标穿透——鼠标事件（含 hit-test）
+            // 根本不进本窗口，直接落到下层应用。【实测】点击候选框的
+            // WM_LBUTTONDOWN 从未到达 wndproc 应用即冻结（notes-8228
+            // 案发现场：最后记录为 move，ldown 缺失），冻结发生在系统
+            // 与窗口的命中测试交互层。穿透=不参与命中测试，彻底隔离。
+            // 候选窗本无点击/hover 功能，无副作用。
             let ex = WINDOW_EX_STYLE(
                 WS_EX_TOOLWINDOW.0
                     | WS_EX_TOPMOST.0
                     | WS_EX_NOACTIVATE.0
-                    | WS_EX_NOREDIRECTIONBITMAP.0,
+                    | WS_EX_NOREDIRECTIONBITMAP.0
+                    | WS_EX_TRANSPARENT.0,
             );
             let hwnd = CreateWindowExW(
                 ex,
