@@ -1004,11 +1004,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         return;
     };
     // 候选窗锚点按宿主分化：
-    // - 跟随宿主（晴跟打器类，整句长编码场景）：锚 END（光标处）。
-    //   长编码段光标持续前进，窗钉在段首会越离越远（实测 w 涨到
-    //   800px 仍 x 恒定）。此类宿主布局同步（候选不跳），跟随不晃。
-    // - 其余宿主（含虎魄跟打器）：锚 START（组段起始）——编码期间
-    //   位置恒定，逐键右移的「跳」由此消除；首帧错位另由稳定期抑制。
+    // - 跟随宿主（晴跟打Pro/虎魄跟打器，整句长编码场景）：锚 END
+    //   （光标处）。长编码段光标持续前进，窗钉在段首会越离越远
+    //   （实测 w 涨到 800px 仍 x 恒定）；虎魄后报同款病，并入。
+    // - 其余宿主：锚 START（组段起始）——编码期间位置恒定，逐键
+    //   右移的「跳」由此消除；首帧错位另由稳定期抑制。
     let anchor = if host_follow_caret() {
         TF_ANCHOR_END
     } else {
@@ -1090,13 +1090,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 键跳正——cw2 show y 序列实测 1092→1175 / 1166→1286）。首帧
         // 110ms 内不显示，等第二键或轮询在布局稳定后以正确位置补显，
         // 全程零跳变。同步布局宿主（记事本等）不受影响。
-        // （220→110→60ms：用户连续两轮实测「首键候选慢半拍」；异步
-        // 布局 1-2 帧 ~33-66ms，60ms 是防跳变下限，配 140ms 轮询）
+        // （220→110→60→35ms：跟打器首键「比别的软件慢很多」的体感
+        // 主源是本抑制+轮询补显的叠加；35ms≈1 帧防跳下限+110ms 轮询）
         let first_frame_unstable = host_async_layout()
             && !raw.is_empty()
             && raw.len() <= 1
             && g.raw_changed_at
-                .is_some_and(|t| t.elapsed().as_millis() < 60);
+                .is_some_and(|t| t.elapsed().as_millis() < 35);
         let suppress = first_frame_unstable
             || (g.delay_show_ms > 0
                 && !raw.is_empty()
@@ -1526,7 +1526,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
-const POLL_MS: u32 = 140;
+const POLL_MS: u32 = 110;
 
 static POLL_HWND: AtomicIsize = AtomicIsize::new(0);
 // Shared 含 COM 接口指针（NonNull）非 Send/Sync——但 poll 窗口的
@@ -1688,7 +1688,7 @@ fn host_follow_caret() -> bool {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.contains("晴"))
+            .map(|n| n.contains("晴") || n.contains("虎魄"))
             .unwrap_or(false)
     })
 }

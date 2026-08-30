@@ -1287,7 +1287,7 @@ fn lockwin_create() -> isize {
             PCWSTR(class.as_ptr()),
             PCWSTR::null(),
             WINDOW_STYLE(WS_POPUP.0),
-            0, 0, 14, 17,
+            0, 0, 10, 12,
             HWND(std::ptr::null_mut()),
             HMENU(std::ptr::null_mut()),
             HINSTANCE(std::ptr::null_mut()),
@@ -1299,8 +1299,8 @@ fn lockwin_create() -> isize {
                 return 0;
             }
         };
-        // 画锁位图（预乘 alpha）：锁环白描边 + 锁体白填充
-        let (w, h) = (14i32, 17i32);
+        // 画锁位图（预乘 alpha）：锁环白描边 + 锁体白填充（10x12 小锁）
+        let (w, h) = (10i32, 12i32);
         let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
         let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
             bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
@@ -1330,13 +1330,13 @@ fn lockwin_create() -> isize {
         let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
         // 黑底（透明）上画白锁
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
-        let pen = CreatePen(PS_SOLID, 2, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
+        let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
         let oldb = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
         let oldp = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
         // 锁体（圆角矩形填充）
-        let _ = RoundRect(hdc, 1, 8, 13, 16, 3, 3);
+        let _ = RoundRect(hdc, 1, 6, 9, 11, 2, 2);
         // 锁环（上半弧描边）
-        let _ = Arc(hdc, 3, 1, 11, 11, 11, 6, 3, 6);
+        let _ = Arc(hdc, 2, 0, 8, 8, 8, 4, 2, 4);
         let _ = SelectObject(hdc, oldb);
         let _ = SelectObject(hdc, oldp);
         let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
