@@ -483,7 +483,7 @@ impl HuFuTs_Impl {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
         };
-        let Some((consumed, commit, state, sound)) =
+        let Some((consumed, commit, back, state, sound)) =
             ipc::key_request(&name, m_shift, m_ctrl, m_alt)
         else {
             return BOOL(0);
@@ -495,6 +495,10 @@ impl HuFuTs_Impl {
         if !test_only {
             if let Some(tag) = sound {
                 crate::sound::play(&tag);
+            }
+            // 回删替换（数字后 1. 再按 . → 。）：先删旧字符再走正常提交
+            if back > 0 {
+                let _ = run_session(&self.shared, Op::DeleteBack(back as u32), None);
             }
             trace("before update_ui");
             let _ = update_ui(self.shared.clone(), commit, state);
@@ -532,7 +536,7 @@ pub fn test_key(vk: u32) -> i32 {
     let _ = (shift, ctrl, alt);
     let r = ipc::key_request(&name, false, false, false);
     match r {
-        Some((consumed, _commit, _state, _sound)) => {
+        Some((consumed, _commit, _back, _state, _sound)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
             if consumed { 1 } else { 0 }
         }
@@ -596,6 +600,8 @@ enum Op {
     CommitAndRepreedit(String, String),
     /// 无组段直接插入文本（剪贴板上屏）
     Insert(String),
+    /// 回删已上屏字符（数字后「1.」再按 . 换「。」：先删旧点再提交句号）
+    DeleteBack(u32),
     End,
 }
 
@@ -744,6 +750,32 @@ impl EditSession_Impl {
                 unsafe {
                     ins.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &wstr)?;
                 }
+                Ok(())
+            }
+            Op::DeleteBack(n) => {
+                // 回删已上屏字符（composition 之外）：选区起点向前扩 n
+                // 字符后清空该范围。「1.」再按 . → 删半角点 → 提交「。」
+                if g.composition.is_some() {
+                    // 有活动组段先结束（正常不该发生，防御）
+                    if let Some(comp) = g.composition.clone() {
+                        unsafe {
+                            let _ = comp.EndComposition(ec);
+                        }
+                    }
+                    g.composition = None;
+                }
+                let range: ITfRange = selection_range(&ctx, ec)?;
+                for _ in 0..*n {
+                    let mut moved: i32 = 0;
+                    let hr = unsafe {
+                        range.ShiftStart(ec, -1, &mut moved, std::ptr::null_mut())
+                    };
+                    if hr.is_err() || moved == 0 {
+                        break;
+                    }
+                }
+                let empty: Vec<u16> = Vec::new();
+                unsafe { range.SetText(ec, 0, &empty)? };
                 Ok(())
             }
             Op::End => {

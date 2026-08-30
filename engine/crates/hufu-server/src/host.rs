@@ -310,6 +310,12 @@ impl Host {
         let outcome = self.engine.process_key(&mut self.session, key);
         // 跨句文章尾巴：上屏文本滚动进 tail_context（截尾 32 字），
         // 供下一句句首的神经重排作真实语境（空 ctx 时 Qwen 会乱序）。
+        if outcome.back > 0 {
+            // 回删替换（数字后 1. 再按 . → 。）：tail 同步回退再滚动新文
+            for _ in 0..outcome.back {
+                self.session.tail_context.pop();
+            }
+        }
         if let Some(c) = outcome.commit.as_deref() {
             if !c.is_empty() {
                 self.session.tail_context.push_str(c);
