@@ -120,13 +120,10 @@ Write-Host 'OK 文件就位（原地运行，不占用 C 盘额外空间）'
 # ── 1.5) 记录安装目录（DLL 自愈链 / 卸载器读取）──
 Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $inst
 
-# ── 2) HKCU COM 注册（每用户；COM 解析 HKCU 优先）──
+# ── 2) HKCU COM + TIP 键树注册（每用户；COM 解析 HKCU 优先）──
 # DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索/UWP 可用）；
 # 未提权安装（无 SystemIME 副本）时退回用户目录——此时开始菜单搜索
 # 框不可用（SystemApps 进程读不了用户目录），记事本等普通应用不受影响。
-# 【不再手写 HKCU CTF\TIP 键树】对照微软拼音：正常机器 per-user 无此键，
-# msctf 只认机器级（HKLM）注册；手写的每用户副本会被 msctf 周期清理
-# （净室实测：写后数分钟内消失），识别不受影响，徒留「键被吞」假象。
 $dllReg = if (Test-Path $sysdll) { $sysdll } else { $dll }
 $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
 # 【顺序铁律】regsvr32 必须先跑：DllRegisterServer 会把 HKCU CLSID
@@ -139,7 +136,29 @@ Set-Reg $ipsUser '(default)' $dllReg
 Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
 $finalDll = [string](Get-Item "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32").GetValue('')
 if ($finalDll -ne $dllReg) { Set-Reg $ipsUser '(default)' $dllReg }  # 双保险
-Write-Host "OK HKCU COM 已注册（DLL → $dllReg）"
+
+# 【HKCU TIP 键树——切换器/搜索框的生命线，不可省】（dae3baf/23978b3
+# 历史定案，afc2dfc 曾误删致 Win+空格 切不到虎符，实测回归后恢复）：
+# Win+空格切换器只列「带键盘分类」的 TIP（Category 两层键）；语言档案
+# 启用状态（LanguageProfile Enable）与切换器图标（IconFile）也在此树。
+# regsvr32 写的副本 IconFile 指向安装目录 DLL（打包进程读不了），故
+# 安装器直写一遍并统一指向 $dllReg——与 regsvr32 双保险，缺一不可。
+$tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
+Set-Reg $tipU '(default)' 'HuFu 输入法'
+Set-Reg "$tipU\Description" '(default)' 'HuFu 虎符输入法（虎码）'
+New-Item -Path "$tipU\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
+New-Item -Path "$tipU\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
+# 【键盘分类（34745C63）只写 HKLM 全局库】（dae3baf 定案：切换器按
+# HKLM CTF\Category 识别键盘 TIP；提权段 RegisterCategory / oneshot
+# 补全）——HKCU TIP 树里写键盘分类键会被 msctf 判非法周期删除
+# （净室实测稳定复现：MASTER 键存活、34745C63 键必消失），勿双写。
+$lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
+Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
+Set-RegDWord $lpU 'Enable' 1          # DWORD（msctf 标准）
+Set-RegDWord $lpU 'IconIndex' 0
+Set-Reg $lpU 'IconFile' $dllReg       # SystemIME 副本（打包进程可读）
+Set-Reg $lpU 'Icon' "$dllReg,0"       # 图标双写（3544b61：Index+字符串两制式）
+Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
 
 # ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
 if (-not $NoHKLM) {

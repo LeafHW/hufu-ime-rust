@@ -83,6 +83,7 @@ $runV = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 
 Check '[装] Run 自启→当轮' ($runV -like "*$dir*")
 Check '[装] 语言列表加入' (((Get-WinUserLanguageList | ForEach-Object { $_.InputMethodTips }) -contains $tipStr))
 Check '[装] HKCU CLSID 注册' (Test-Path "HKCU:\Software\Classes\CLSID\$CLSID")
+
 # 让当轮构建真实上机：HKCU CLSID 指向当轮 DLL（SystemIME 副本可能是
 # 旧构建；TextInputHost/记事本等普通宿主可读 Downloads 目录）
 reg add "HKCU\Software\Classes\CLSID\$CLSID\InprocServer32" /ve /t REG_SZ /d "$dir\hufu_tsf.dll" /f | Out-Null
@@ -166,6 +167,18 @@ try {
     Check '[愈] 引擎存活' (@($rt.candidates)[0] -eq '的窒闷')
 } catch { Check '[愈] 引擎存活' $false }
 
+# TIP 键树（MASTER+Enable）：msctf 对 HKCU TIP 键有「删→回填」重整
+# （触发点=语言列表变化），窗口可达 20s——断言挪至轮末+重试 5×3s。
+$tipTree = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
+$tipOk = $false
+foreach ($try in 1..5) {
+    $t2 = Test-Path "$tipTree\Category\Category\{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}\$CLSID"
+    $t3 = ((Get-ItemProperty "$tipTree\LanguageProfile\0x00000804\$PROFILE" -ErrorAction SilentlyContinue).Enable -eq 1)
+    if ($t2 -and $t3) { $tipOk = $true; break }
+    Start-Sleep -Seconds 3
+}
+Check '[装] HKCU TIP 树(MASTER+Enable 最终态)' $tipOk
+Check '[底] HKLM 键盘分类在位' (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\Category\Category\{34745C63-B2F0-4784-8B67-5E12C8701A31}\$CLSID")
 # ── H) 中英状态牌（宿主挂载）+ DLL 加载画像 ──
 Remove-Item "$env:TEMP\hufu-langbar.log" -Force -ErrorAction SilentlyContinue
 & "$dir\hufu-tsf-smoke.exe" *> $null
