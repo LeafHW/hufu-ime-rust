@@ -72,6 +72,10 @@ foreach ($try in 1..3) {
     }
 }
 Expand-Archive -Path $Zip -DestinationPath $dir -Force
+# zip 自带顶层文件夹（防止解压散落）：定位实际包目录
+if (-not (Test-Path "$dir\hufu-server.exe") -and (Test-Path "$dir\HuFu虎符输入法-安装包\hufu-server.exe")) {
+    $dir = "$dir\HuFu虎符输入法-安装包"
+}
 Check '[解] 目录就位' (Test-Path "$dir\hufu-server.exe")
 
 # ── C) 绿色安装（每用户，机器级已由底座承担）──
