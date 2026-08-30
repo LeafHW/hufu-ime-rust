@@ -8,6 +8,7 @@
 //! 全流程对齐 Rime 虎整句 tiger_sentence.lua。
 
 pub mod model;
+pub mod supplement_automaton;
 
 use hufu_config::SentenceWeights;
 use hufu_dict::dict::Dict;
@@ -19,11 +20,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use supplement_automaton::SupplementAutomaton;
+
 /// 整句引擎。
 pub struct SentenceEngine {
     pub model: NgramModel,
     pub dict: Arc<Dict>,
-    supplement: HashMap<String, f64>,
+    supplement: SupplementAutomaton,
     pub weights: SentenceWeights,
     /// 上次解码缓存（raw → 解码结果）
     cache: Mutex<Option<(String, Arc<SentenceDecode>)>>,
@@ -35,7 +38,7 @@ struct St {
     prev2: u32,
     prev1: u32,
     text: String,
-    /// 排序分（含名次惩罚）
+    /// 排序分（含名次惩罚与补充词奖励）
     score: f64,
     /// 同文本聚合质量（logsumexp；不含补充奖励）
     mass: f64,
@@ -43,6 +46,8 @@ struct St {
     /// 词边界：(累计字数, base 消耗位置)
     word_ends: Vec<(usize, usize)>,
     segmented: String,
+    /// 补充语料 AC 自动机状态（沿全文逐字推进）
+    supp_state: usize,
 }
 
 fn logsumexp(a: f64, b: f64) -> f64 {
@@ -146,27 +151,23 @@ impl SentenceEngine {
         supplement: &Supplement,
         weights: SentenceWeights,
     ) -> SentenceEngine {
-        let supplement = supplement
+        let entries: Vec<(String, f64)> = supplement
             .entries
             .iter()
             .map(|e| (e.word.clone(), e.weight))
             .collect();
+        let automaton = SupplementAutomaton::build(
+            &entries,
+            weights.supplement_baseline,
+            weights.supplement_scale,
+            weights.supplement_maximum,
+        );
         SentenceEngine {
             model,
             dict,
-            supplement,
+            supplement: automaton,
             weights,
             cache: Mutex::new(None),
-        }
-    }
-
-    /// 补充词奖励（对数域；不进质量）。
-    fn supplement_reward(&self, word: &str) -> f64 {
-        match self.supplement.get(word) {
-            Some(w) => (self.weights.supplement_baseline
-                + self.weights.supplement_scale * ((w / 1000.0).ln().max(0.0)))
-            .min(self.weights.supplement_maximum),
-            None => 0.0,
         }
     }
 
@@ -287,6 +288,7 @@ impl SentenceEngine {
             max_rank: 1,
             word_ends: Vec::new(),
             segmented: String::new(),
+            supp_state: 0,
         });
 
         let allow_all_ranks = n <= 4;
@@ -336,6 +338,11 @@ impl SentenceEngine {
                             ns.mass += (p3.max(1e-12).ln()) as f64 + w.emitted_character_reward;
                             ns.prev2 = ns.prev1;
                             ns.prev1 = cp;
+                            // 补充词：AC 自动机沿全文推进（任意位置命中都加分）
+                            let (st2, r) = self.supplement.advance(ns.supp_state, c);
+                            ns.supp_state = st2;
+                            ns.score += r;
+                            supp_added += r;
                             let _ = prev_before_word;
                         }
                         if rank1b > 1 {
@@ -343,9 +350,6 @@ impl SentenceEngine {
                             ns.score -= pen;
                             ns.mass -= pen;
                         }
-                        let supp = self.supplement_reward(text);
-                        ns.score += supp;
-                        supp_added += supp;
                         let _ = supp_added;
                         let piece: String = base[pos..end].iter().collect();
                         if ns.segmented.is_empty() {
