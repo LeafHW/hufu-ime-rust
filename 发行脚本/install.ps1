@@ -49,7 +49,18 @@ function Set-RegHKLM([string]$path, [string]$name, [string]$val) {
 if ($PhaseElevated) {
     Write-Host '—— 提权阶段：SystemIME 副本（打包进程可读）——'
     New-Item -ItemType Directory -Path $sysdir -Force | Out-Null
-    Copy-Item $dll $sysdll -Force
+    # DLL 可能被宿主进程加载（SearchHost 等长期占用）：改名腾位后拷贝。
+    # （Windows 允许改名已加载的 DLL；旧副本留 .oldN，随系统清理。）
+    try {
+        Copy-Item $dll $sysdll -Force
+    } catch {
+        $n = 1
+        while (Test-Path "$sysdll.old$n") { $n++ }
+        Rename-Item $sysdll "hufu_tsf.dll.old$n" -Force
+        Copy-Item $dll $sysdll -Force
+        Write-Host "（旧 DLL 被占用，已腾位为 .old$n）"
+    }
+    if (-not (Test-Path $sysdll)) { throw "SystemIME DLL 拷贝失败：$sysdll" }
     icacls $sysdir /grant 'ALL APPLICATION PACKAGES:(OI)(CI)RX' | Out-Null
     icacls $sysdll /grant 'ALL APPLICATION PACKAGES:RX' | Out-Null
     Write-Host 'OK DLL → SystemIME'
