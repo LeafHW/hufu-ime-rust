@@ -13,7 +13,9 @@ $PROFILE = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}'
 $TFCAT_KBD = '{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}'
 
 $src  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$inst = Join-Path $env:LOCALAPPDATA 'HuFu'
+# 【原地安装（绿色模式）】程序直接在安装目录运行，不拷贝到 %LOCALAPPDATA%：
+# C 盘零数据占用；卸载 = 跑 卸载.bat 后整个删除本文件夹。
+$inst = $src
 $data = Join-Path $inst '数据'
 $dll  = Join-Path $inst 'hufu_tsf.dll'
 $exe  = Join-Path $inst 'hufu-server.exe'
@@ -95,17 +97,28 @@ try {
 
 Write-Host ''
 Write-Host 'HuFu 虎符输入法 安装' -ForegroundColor Cyan
-Write-Host "安装到: $inst"
+Write-Host "安装目录（原地运行）: $inst"
 
-# ── 1) 文件就位（保留用户 config.json；排除安装器与运行产物）──
-robocopy $src $inst /E /XF config.json install.ps1 uninstall.ps1 *.bat server.pid user-adjust.log adjust-before.json > $null
-# 新装机落出厂配置（老用户的 config.json 已被上面 /XF 保护，不会覆盖）
-$factoryCfg = Join-Path $src '数据\config.json'
-if ((Test-Path $factoryCfg) -and -not (Test-Path (Join-Path $inst '数据\config.json'))) {
-    Copy-Item $factoryCfg (Join-Path $inst '数据\config.json') -Force
-    Write-Host 'OK 出厂配置已落（新装机）'
+# ── 0) 安装位置安全性检查 + 旧布局检测 ──
+if ($inst -like "$env:TEMP*") {
+    Write-Host '⚠ 当前位于临时目录（会被系统清理，输入法将失效）！'
+    Write-Host '  请把整个文件夹移到稳定位置（如 D:\HuFu）后重新运行本安装。'
+    exit 1
 }
-Write-Host 'OK 文件就位'
+$legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
+if (Test-Path (Join-Path $legacy 'hufu-server.exe')) {
+    $mb = [math]::Round((Get-ChildItem $legacy -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
+    Write-Host "· 检测到旧版安装目录：$legacy（约 ${mb}MB）"
+    Write-Host '  本次安装完成后确认输入法正常，即可删除该目录释放空间。'
+}
+
+# ── 1) 文件检查（原地运行：不拷贝；数据/模型直接在本目录使用）──
+if (-not (Test-Path $dll)) { Write-Host "✗ 缺少 $dll，请完整解压安装包后重试"; exit 1 }
+if (-not (Test-Path $exe)) { Write-Host "✗ 缺少 $exe，请完整解压安装包后重试"; exit 1 }
+Write-Host 'OK 文件就位（原地运行，不占用 C 盘额外空间）'
+
+# ── 1.5) 记录安装目录（DLL 自愈链 / 卸载器读取）──
+Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $inst
 
 # ── 2) HKCU COM + CTF TIP 键树（每用户；msctf/COM 解析 HKCU 优先）──
 # DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索可用）；
@@ -204,6 +217,12 @@ Write-Host ' 安装完成！'
 Write-Host '  · Win+空格 切到「HuFu 虎符输入法」'
 Write-Host '  · 设置：Ctrl+Alt+H（全局热键）/ 开始菜单'
 Write-Host '     搜「HuFu」或双击「设置.bat」'
+Write-Host '  · 绿色模式：程序在本目录原地运行，不占 C 盘；'
+Write-Host '    不要移动/删除本文件夹（输入法依赖它）'
+Write-Host '  · 卸载：运行「卸载.bat」后把本文件夹整个删除即可'
 Write-Host '=========================================='
 Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载新输入法'
+if ($legacy -and (Test-Path (Join-Path $legacy 'hufu-server.exe'))) {
+    Write-Host "  · 记得删除旧版目录释放 ${mb}MB：$legacy"
+}
 if ($NoHKLM -or -not (Test-Path $sysdll)) { Write-Host '  · 每用户安装：开始菜单搜索框不可用虎符（系统限制）' }

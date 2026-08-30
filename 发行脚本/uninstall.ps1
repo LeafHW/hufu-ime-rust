@@ -21,7 +21,7 @@ if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
     exit
 }
 
-$inst = Join-Path $env:LOCALAPPDATA 'HuFu'
+$inst = Split-Path -Parent $MyInvocation.MyCommand.Path   # 安装目录（脚本所在处）
 
 # 1) 语言列表移除
 $tipStr = "0804:$CLSID$PROFILE"
@@ -45,6 +45,7 @@ Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 'HuFu'
 # 4) HKCU 注册表清理
 Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "HKCU:\Software\Classes\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item 'HKCU:\Software\HuFu' -Recurse -Force -ErrorAction SilentlyContinue   # InstallDir 记录（原地安装模式）
 $asm = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}'
 Get-ChildItem $asm -ErrorAction SilentlyContinue | Where-Object {
     (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID
@@ -68,7 +69,12 @@ Start-Process ctfmon -ErrorAction SilentlyContinue
 
 Write-Host ''
 Write-Host 'OK 卸载完成（注册表已清）' -ForegroundColor Green
-Write-Host "  程序与数据目录保留在：$inst"
-Write-Host "  确认不再使用可手动删除整个文件夹。"
+Write-Host "  现在把整个文件夹删除即完成卸载：$inst"
+Write-Host "  （绿色模式：程序原地在安装目录运行，删目录即彻底卸载，"
+Write-Host "    C 盘无数据残留）"
+$legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
+if (Test-Path $legacy) {
+    Write-Host "  · 旧版目录仍在：$legacy（可一并删除）"
+}
 if (-not $hklm) { Write-Host '  （每用户卸载；HKLM 无写入，无残留）' }
 Write-Host '  · 无需重启/注销；已开应用里的输入法随应用关闭即消失'

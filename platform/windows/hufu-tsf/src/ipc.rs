@@ -53,14 +53,56 @@ struct SpawnBlock {
 
 /// 自愈：server 不在（管道打不开且无实例等待）时拉起 hufu-server.exe。
 /// 每进程只试一次，防拉起风暴。返回 true=本次调用确实拉起了。
+/// 读 HKCU\Software\HuFu 的 InstallDir（安装器写入的绿色模式安装目录）。
+fn read_installdir() -> Option<String> {
+    use std::ffi::c_void;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(hkey: *mut c_void, name: *const u16, opt: u32, access: u32, out: *mut *mut c_void) -> i32;
+        fn RegQueryValueExW(hkey: *mut c_void, name: *const u16, res: *mut u32, typ: *mut u32, data: *mut u8, size: *mut u32) -> i32;
+        fn RegCloseKey(hkey: *mut c_void) -> i32;
+    }
+    const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001usize as *mut c_void;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const KEY_WOW64_64KEY: u32 = 0x0100;
+    const REG_SZ: u32 = 1;
+    unsafe {
+        let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
+        let val: Vec<u16> = "InstallDir".encode_utf16().chain([0]).collect();
+        let mut hk = std::ptr::null_mut::<c_void>();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &mut hk) != 0 {
+            return None;
+        }
+        let mut typ = 0u32;
+        let mut size = 0u32;
+        if RegQueryValueExW(hk, val.as_ptr(), std::ptr::null_mut(), &mut typ, std::ptr::null_mut(), &mut size) != 0
+            || typ != REG_SZ || size == 0 {
+            RegCloseKey(hk);
+            return None;
+        }
+        let mut size = size.min(32768);
+        let mut buf = vec![0u8; size as usize];
+        let ok = RegQueryValueExW(hk, val.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), buf.as_mut_ptr(), &mut size) == 0;
+        RegCloseKey(hk);
+        if !ok { return None; }
+        let units: Vec<u16> = buf[..size as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    }
+}
+
 fn ensure_server() -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
     static TRIED: AtomicBool = AtomicBool::new(false);
     if TRIED.swap(true, Ordering::SeqCst) {
         return false;
     }
-    // 候选：宿主 exe 同目录（开发态）→ %LOCALAPPDATA%\HuFu（安装态：
-    // DLL 在 SystemIME 而程序在用户目录，server 崩溃后仍可自愈）→ 工程绝对路径（开发态兜底）。
+    // 候选：宿主 exe 同目录（开发态）→ 注册表 InstallDir（绿色原地安装：
+    // DLL 在 SystemIME 而程序在安装目录，安装器写入 HKCU\Software\HuFu）
+    // → %LOCALAPPDATA%\HuFu（旧版布局兼容）→ 工程绝对路径（开发态兜底）。
     // 数据目录同理：安装态在 exe 旁「数据」目录，开发态回退工程 hufu-data。
     let exe_dir = std::env::current_exe()
         .ok()
@@ -68,11 +110,14 @@ fn ensure_server() -> bool {
         .unwrap_or_default();
     let dev_data = r"E:\DSH-KF\hufu\hufu-data";
     let local_app = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let candidates = [
+    let mut candidates = vec![
         format!("{exe_dir}\\hufu-server.exe"),
-        format!("{local_app}\\HuFu\\hufu-server.exe"),
-        r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string(),
     ];
+    if let Some(dir) = read_installdir() {
+        candidates.push(format!("{}\\hufu-server.exe", dir.trim_end_matches('\\')));
+    }
+    candidates.push(format!("{local_app}\\HuFu\\hufu-server.exe"));
+    candidates.push(r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string());
     for exe in candidates {
         if !std::path::Path::new(&exe).exists() {
             continue;
