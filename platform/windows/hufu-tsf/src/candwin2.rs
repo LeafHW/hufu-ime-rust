@@ -50,6 +50,14 @@ extern "system" fn cand2_wndproc(
             crate::tsf::diag_note(&format!("cw2 mouse {tag} t={:?}", std::time::SystemTime::now()));
         }
     }
+    // 【点击全吞】候选窗没有点击功能，但 DefWindowProc 的点击默认
+    // 路径在普通应用里实测导致宿主 UI 线程完全冻结（「未响应」需
+    // 重启应用）。鼠标按钮消息一律直吞（return 0），不激活、不转发、
+    // 不进 DefWindowProc——物理隔离点击路径。悬停/移动仍走默认。
+    match msg {
+        0x201 | 0x202 | 0x204 | 0x205 | 0x207 | 0x208 => return LRESULT(0),
+        _ => {}
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
