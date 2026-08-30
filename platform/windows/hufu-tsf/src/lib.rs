@@ -28,6 +28,17 @@ extern "system" fn DllGetClassObject(
     ppv: *mut *mut core::ffi::c_void,
 ) -> HRESULT {
     use windows::Win32::System::Com::IClassFactory;
+    // 加载画像（每进程一笔，ProgramData\HuFu\diag\load-<pid>.txt）：
+    // 区分「宿主没加载 DLL」vs「加载了但未激活」（UWP/搜索框问题分层定位）
+    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+    let _ = std::fs::write(
+        format!(r"C:\ProgramData\HuFu\diag\load-{}.txt", std::process::id()),
+        format!(
+            "load dll={} t={:?}\n",
+            com::self_path_for_diag(),
+            std::time::SystemTime::now()
+        ),
+    );
     if ppv.is_null() {
         return HRESULT(-2147467261); // E_POINTER
     }

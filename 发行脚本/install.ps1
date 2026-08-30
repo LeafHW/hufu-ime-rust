@@ -120,27 +120,26 @@ Write-Host 'OK 文件就位（原地运行，不占用 C 盘额外空间）'
 # ── 1.5) 记录安装目录（DLL 自愈链 / 卸载器读取）──
 Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $inst
 
-# ── 2) HKCU COM + CTF TIP 键树（每用户；msctf/COM 解析 HKCU 优先）──
-# DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索可用）；
+# ── 2) HKCU COM 注册（每用户；COM 解析 HKCU 优先）──
+# DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索/UWP 可用）；
 # 未提权安装（无 SystemIME 副本）时退回用户目录——此时开始菜单搜索
 # 框不可用（SystemApps 进程读不了用户目录），记事本等普通应用不受影响。
+# 【不再手写 HKCU CTF\TIP 键树】对照微软拼音：正常机器 per-user 无此键，
+# msctf 只认机器级（HKLM）注册；手写的每用户副本会被 msctf 周期清理
+# （净室实测：写后数分钟内消失），识别不受影响，徒留「键被吞」假象。
 $dllReg = if (Test-Path $sysdll) { $sysdll } else { $dll }
 $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
+# 【顺序铁律】regsvr32 必须先跑：DllRegisterServer 会把 HKCU CLSID
+# 默认值覆盖为 DLL 自身路径（安装目录，AppContainer 宿主读不了——
+# 开始菜单/UWP 因此打不了字）。之后我们重写为 $dllReg（SystemIME
+# 副本，打包进程可读），最终值必须落 SystemIME。
+regsvr32 /s $dll
 Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
 Set-Reg $ipsUser '(default)' $dllReg
 Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
-regsvr32 /s $dll
-$tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
-Set-Reg $tipU '(default)' 'HuFu 输入法'
-Set-Reg "$tipU\Description" '(default)' 'HuFu 虎符输入法（虎码）'
-New-Item -Path "$tipU\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
-New-Item -Path "$tipU\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
-$lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
-Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
-Set-Reg $lpU 'Enable' '1'
-Set-RegDWord $lpU 'IconIndex' 0
-Set-Reg $lpU 'IconFile' $dllReg
-Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
+$finalDll = [string](Get-Item "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32").GetValue('')
+if ($finalDll -ne $dllReg) { Set-Reg $ipsUser '(default)' $dllReg }  # 双保险
+Write-Host "OK HKCU COM 已注册（DLL → $dllReg）"
 
 # ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
 if (-not $NoHKLM) {
@@ -166,13 +165,22 @@ if (-not $NoHKLM) {
         & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
 }
 
-# ── 4) 语言列表 + 切换器装配（每用户）──
+# ── 4) 语言列表（虎符插第 0 位=默认输入法）+ 切换器装配 ──
+# 输入法按应用各自记忆选择：新开宿主（开始菜单搜索框、UWP 应用、
+# 新窗口）默认用列表第一项。追加到尾部会让这些宿主落回微软拼音，
+# 用户体验即「开始菜单/UWP 打不了中文」。插入第 0 位后新宿主默认
+# 虎符；已开应用/用户手动切过的选择不受影响（Win+空格随时可切回）。
 $tipStr = "0804:$CLSID$PROFILE"
 $list = Get-WinUserLanguageList
 $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 if (-not $zh) { $zh = $list[0] }
 if ($zh.InputMethodTips -notcontains $tipStr) {
-    $zh.InputMethodTips.Add($tipStr)
+    $zh.InputMethodTips.Insert(0, $tipStr)
+    Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
+} elseif ($zh.InputMethodTips[0] -ne $tipStr) {
+    # 已安装但不在首位（升级/用户调整过）：调到首位，保证新宿主默认虎符
+    $zh.InputMethodTips.Remove($tipStr) | Out-Null
+    $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
 }
 $asm = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}\00000003"
