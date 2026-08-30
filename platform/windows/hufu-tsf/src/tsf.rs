@@ -438,6 +438,13 @@ pub fn diag_note(msg: &str) {
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
+        // keyup 只服务 Shift 单击判定（0x10）；其余键的 keyup 一律直通。
+        // 【实测回归】若放任字母 keyup 走预判：中文模式下 will=true →
+        // Test 吞 keyup → OnKeyUp 把同一字母再发一次 server——每键双发
+        // （「按一下等于按两下」）。
+        if up && wparam != 0x10 {
+            return BOOL(0);
+        }
         // TestKeyDown：本地预判（缓存引擎态），不碰管道——
         // 否则同一键会被引擎处理两次（Test + Down 各一次）
         if test_only {
