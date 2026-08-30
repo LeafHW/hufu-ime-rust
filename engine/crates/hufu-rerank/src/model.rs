@@ -37,7 +37,9 @@ fn rerank_pool() -> &'static rayon::ThreadPool {
         let n = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(4)
-            .min(6)
+            .min(14) // 停顿期重排全速：16 核机用 14（留 2 核给系统/宿主）。
+            // 早期 min(6) 是打字期保守值——重排发生在停顿期（无前台按键），
+            // BELOW_NORMAL 优先级已足够防卡顿，核数不必再省。
             .max(2);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -141,6 +143,9 @@ impl Qwen3 {
         let tile = 256usize;
         let out_ptr = SendPtr(out.as_mut_ptr());
         let out_ref = &out_ptr;
+        let prof2 = std::env::var("GGUF_PROF").is_ok();
+        let t_deq = std::time::Instant::now();
+        let deq_us = std::sync::atomic::AtomicU64::new(0);
         // 专用池内并行（BelowNormal 优先级 + 打字让键），不与前台争核
         rerank_pool().install(|| {
             (0..n)
@@ -152,7 +157,25 @@ impl Qwen3 {
                         std::thread::sleep(std::time::Duration::from_millis(3));
                     }
                     let pn = tile.min(n - p0);
+                    let tdq = std::time::Instant::now();
                     let w = self.dequant_rows(info, p0, pn);
+                    if prof2 { deq_us.fetch_add(tdq.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
+                    // 瘦 M（≤16，整句打分 l≤16）：gemm crate 每调用 pack 整块
+                    // rhs（~1MB×196 次/前向）占绝对大头（实测 0.6 GFLOPS）。
+                    // 手写 AVX2 点积：out(i,p)=dot(x_i, w_p)，K 连续 stride=1，
+                    // 无 pack，直接 10~30×。
+                    if m <= 16 && k % 8 == 0 && dot_avx2_ok() {
+                        unsafe {
+                            for p in 0..pn {
+                                let wrow = &w[p * k..(p + 1) * k];
+                                for i in 0..m {
+                                    let xr = &x[i * k..(i + 1) * k];
+                                    *out_ref.0.add(i * n + p0 + p) = dot_avx2(xr, wrow);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     // C(m,pn) = X(m,k)·Wᵀ(k,pn)；B(j,p)=w[p*k+j] → rhs rs=1 cs=k
                     unsafe {
                         gemm::gemm(
@@ -166,6 +189,10 @@ impl Qwen3 {
                     }
                 })
         });
+        if prof2 {
+            let d = deq_us.load(std::sync::atomic::Ordering::Relaxed) as u128 / 1000;
+            eprintln!("PROF mm_call dequant={}ms tile_calc={}ms", d, t_deq.elapsed().as_millis() as u128 - d);
+        }
     }
 
     /// 一维小张量（norm 权重等）整体读
@@ -238,9 +265,14 @@ impl Qwen3 {
         }
 
         let scale = 1.0 / (hd as f32).sqrt();
+        let prof = std::env::var("GGUF_PROF").is_ok();
+        let (mut t_mm, mut t_attn, mut t_small) = (0u128, 0u128, 0u128);
+        let mut mm_t = std::time::Instant::now();
         for li in 0..c.layers {
             let pfx = format!("blk.{li}.");
+            if prof { t_small += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
             let an = self.small(&(pfx.clone() + "attn_norm.weight"));
+            if prof { t_mm += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
             let h = Self::norm_rows(&an, &x, hidden, c.eps);
 
             let mut q = vec![0f32; l * c.heads * hd];
@@ -249,6 +281,7 @@ impl Qwen3 {
             self.matmul_w(&(pfx.clone() + "attn_k.weight"), &h, l, &mut k);
             let mut v = vec![0f32; l * c.kv_heads * hd];
             self.matmul_w(&(pfx.clone() + "attn_v.weight"), &h, l, &mut v);
+            if prof { t_mm += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
 
             // Qwen3 q/k_norm（head_dim 维 RMSNorm×w）
             let qn = self.small(&(pfx.clone() + "attn_q_norm.weight"));
@@ -294,6 +327,7 @@ impl Qwen3 {
             }
             let mut o = vec![0f32; l * hidden];
             self.matmul_w(&(pfx.clone() + "attn_output.weight"), &attn_out, l, &mut o);
+            if prof { t_mm += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
             for (dst, s) in x.iter_mut().zip(&o) {
                 *dst += s;
             }
@@ -304,6 +338,7 @@ impl Qwen3 {
             self.matmul_w(&(pfx.clone() + "ffn_gate.weight"), &h2, l, &mut gate);
             let mut up = vec![0f32; l * c.inter];
             self.matmul_w(&(pfx.clone() + "ffn_up.weight"), &h2, l, &mut up);
+            if prof { t_mm += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
             for (g, u) in gate.iter_mut().zip(&up) {
                 let sig = 1.0 / (1.0 + (-*g).exp());
                 *g = *g * sig * u;
@@ -313,6 +348,10 @@ impl Qwen3 {
             for (dst, s) in x.iter_mut().zip(&down) {
                 *dst += s;
             }
+            if prof { t_attn += mm_t.elapsed().as_micros(); mm_t = std::time::Instant::now(); }
+        }
+        if prof {
+            eprintln!("PROF mm={}ms attn+small={}ms small={}ms", t_mm / 1000, t_attn / 1000, t_small / 1000);
         }
 
         let fnorm = self.small("output_norm.weight");
@@ -335,4 +374,51 @@ impl Qwen3 {
         self.matmul_w("token_embd.weight", &h_sel, t, &mut logits);
         logits.chunks_exact(vocab).map(|r| r.to_vec()).collect()
     }
+}
+
+// ── 瘦 M 点积 kernel（AVX2+FMA）──────────────────────────────────────
+// 整句打分 l≤16：每输出元素就是一次 K 长点积，无需通用 gemm 的
+// 打包/微核选择——直接向量化点积即贴近峰值。
+
+#[cfg(target_arch = "x86_64")]
+pub fn dot_avx2_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 32 <= a.len() {
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(i));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(a0, b0, acc);
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+        acc = _mm256_fmadd_ps(a1, b1, acc);
+        let a2 = _mm256_loadu_ps(a.as_ptr().add(i + 16));
+        let b2 = _mm256_loadu_ps(b.as_ptr().add(i + 16));
+        acc = _mm256_fmadd_ps(a2, b2, acc);
+        let a3 = _mm256_loadu_ps(a.as_ptr().add(i + 24));
+        let b3 = _mm256_loadu_ps(b.as_ptr().add(i + 24));
+        acc = _mm256_fmadd_ps(a3, b3, acc);
+        i += 32;
+    }
+    while i + 8 <= a.len() {
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+            acc,
+        );
+        i += 8;
+    }
+    let r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    let r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    let r = _mm_add_ss(r, _mm_shuffle_ps(r, r, 1));
+    _mm_cvtss_f32(r)
 }

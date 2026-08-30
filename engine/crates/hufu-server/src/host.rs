@@ -214,14 +214,56 @@ impl Host {
                         }
                     }
                     let Some(r) = &model else { continue };
-                    let scores = r.score(&cur.ctx, &cur.cands);
+                    // 候选并行打分：各候选前向互相独立，多核同时算
+                    // （0.6B q8 每候选 ~1s 串行；3 候选并行墙钟≈单候选）。
+                    // Reranker 权重只读，score(&self) 线程安全。
+                    let t_score = std::time::Instant::now();
+                    let scores: Vec<f64> = std::thread::scope(|s| {
+                        let handles: Vec<_> = cur
+                            .cands
+                            .iter()
+                            .map(|c| {
+                                let ctx = &cur.ctx;
+                                s.spawn(move || {
+                                    r.score(ctx, std::slice::from_ref(c))[0]
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or(f64::NEG_INFINITY))
+                            .collect()
+                    });
+                    let elapsed = t_score.elapsed().as_millis();
                     let mut order: Vec<(f64, String)> = scores
                         .into_iter()
                         .zip(cur.cands.iter().cloned())
                         .collect();
                     order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
-                    eprintln!("神经重排完成 key={} → [{}]", cur.key, texts.join(" "));
+                    // GUI 子系统 eprintln 无人见——重排计时落文件（性能排查生命线）
+                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(r"C:\ProgramData\HuFu\diag\rerank.log")
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            f.write_all(
+                                format!(
+                                    "[{}] key={} score={}ms/{}cand → {}\n",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0),
+                                    cur.key,
+                                    elapsed,
+                                    cur.cands.len(),
+                                    texts.join(" ")
+                                )
+                                .as_bytes(),
+                            )
+                        });
                     if let Ok(mut c) = cache.lock() {
                         if c.len() > 64 {
                             c.clear();
