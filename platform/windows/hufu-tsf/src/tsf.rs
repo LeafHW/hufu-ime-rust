@@ -457,46 +457,68 @@ pub fn diag_note(msg: &str) {
 
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
+    ///
+    /// 【宿主形态实测 keys-17436】虎魄跟打器只投 OnTestKeyDown/OnTestKeyUp
+    /// （test/testup 成对、key/keyup 全无，space 连 TestKeyDown 都不来只
+    /// 来 TestKeyUp）——KeyDown/KeyUp 通道在该宿主完全不可依赖。因此：
+    /// - Shift 单击判定闭环在 Test 层：TestDown 置 pending、其他键
+    ///   TestDown 清除（组合保护）、TestUp 仍存活才发 server 切换。
+    /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
+    ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
-        // keyup：仅 Shift（0x10）走单击判定链（普通宿主实测有效）；
-        // 其余键 keyup 一律直通——放行字母 keyup 会造成每键双发。
-        if up && wparam != 0x10 {
-            return BOOL(0);
-        }
-        // 模式键（无组合歧义）：CapsLock / Ctrl+Space。
-        // 【跟打器实证 keys-17980】该类宿主 TestKeyDown 与 KeyDown 解耦
-        // ——Test 放行后并不调 KeyDown（test vk=0x10 有、key 无），遵守
-        // 「Test 无副作用」规范等于永远收不到切换。故这两键在 Test 阶段
-        // 直接发 server（配置关闭时 server 不吞，无副作用）；规范宿主
-        // 随后的 KeyDown 由 80ms 去重挡住双发。
-        // Shift 不在此列（有大写组合歧义），走下方 keyup 单击判定。
-        let mode_key = {
-            match vk_to_name(wparam) {
-                Some((n, sh, ct, al)) => {
-                    n == "capslock" || (ct && !sh && !al && n == "space")
-                }
-                None => false,
-            }
+        // 模式键（无组合歧义）：CapsLock / Ctrl+Space（按着 Ctrl 的 space，
+        /// 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
+        let mode_key = match vk_to_name(wparam) {
+            Some((n, sh, ct, al)) => n == "capslock" || (ct && !sh && !al && n == "space"),
+            None => false,
         };
-        if mode_key {
-            if test_only {
-                self.shared.lock().unwrap().modekey_last =
-                    Some((wparam, std::time::Instant::now()));
-                // fallthrough：走通用路径发 server + 完整响应处理
-            } else {
-                let dup = {
-                    let g = self.shared.lock().unwrap();
-                    matches!(&g.modekey_last, Some((vk, t))
-                        if *vk == wparam && t.elapsed().as_millis() < 80)
-                };
-                if dup {
-                    return BOOL(0);
-                }
+        // ── Shift 单击判定（Test 层闭环）──
+        if wparam == 0x10 {
+            if !up {
+                // TestDown/KeyDown：只记 pending，不吞（物理 Shift 由应用照常处理）
+                self.shared.lock().unwrap().shift_pending = true;
+                return BOOL(0);
             }
+            // TestUp/KeyUp：pending 存活 = 单击切换 → fallthrough 发 server。
+            // pending 取走即天然去重：规范宿主 TestUp 直发后再来的 OnKeyUp
+            // 会因 pending=false 而直通，不会双发。
+            let fire = {
+                let mut g = self.shared.lock().unwrap();
+                let f = g.shift_pending;
+                g.shift_pending = false;
+                f
+            };
+            if !fire {
+                return BOOL(0);
+            }
+        } else {
+            if !up {
+                // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
+                self.shared.lock().unwrap().shift_pending = false;
+            } else if !mode_key {
+                // 其余键的 keyup/testup 一律直通——放行字母 keyup 会造成
+                // 每键双发（「按一下等于按两下」回归）。
+                return BOOL(0);
+            }
+        }
+        // ── 模式键直发 + 去重 ──
+        if mode_key {
+            let dup = {
+                let g = self.shared.lock().unwrap();
+                matches!(&g.modekey_last, Some((vk, t))
+                    if *vk == wparam && t.elapsed().as_millis() < 80)
+            };
+            if dup {
+                return BOOL(0);
+            }
+            self.shared.lock().unwrap().modekey_last =
+                Some((wparam, std::time::Instant::now()));
+            // fallthrough：走通用路径发 server + 完整响应处理
         }
         // TestKeyDown：本地预判（缓存引擎态），不碰管道——
-        // 否则同一键会被引擎处理两次（Test + Down 各一次）
-        if test_only && !mode_key {
+        // 否则同一键会被引擎处理两次（Test + Down 各一次）。
+        // （Shift 的 TestUp 触发与模式键直发已豁免：fallthrough 发 server。）
+        if test_only && !mode_key && wparam != 0x10 {
             let (chinese, composing) = {
                 let g = self.shared.lock().unwrap();
                 (g.chinese, g.composing)
@@ -539,37 +561,6 @@ impl HuFuTs_Impl {
         let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
             return BOOL(0);
         };
-        // ── Shift 单击切换中英（keyup 触发，组合不误切）──
-        // 实测（跟打器 keys 日志）：TestKeyDown 预判曾把 "shift" 判为
-        // 不处理（非单字符），KeyDown 永远不被调，server 收不到切换，
-        // 英文模式下 will=chinese&&.. 又拦掉所有键 → 切得出切不回。
-        // 现两层修复：Test 无条件放行 Shift（中英皆放，server 决断）；
-        // 切换在 keyup 触发——keydown 只记 pending，期间任何其他键
-        // keydown（大写字母/组合键）清除 pending，keyup 仍存活才是
-        // 单击切换。raw 非空时 server 自己不吞（现有逻辑）。
-        if name == "shift" {
-            if test_only {
-                return BOOL(1);
-            }
-            if !up {
-                self.shared.lock().unwrap().shift_pending = true;
-                // 不吞：应用照常处理 Shift（物理状态/快捷键不受影响）
-                return BOOL(0);
-            }
-            // keyup：pending 存活 → 单击，落入下方通用路径发 server
-            let fire = {
-                let mut g = self.shared.lock().unwrap();
-                let f = g.shift_pending;
-                g.shift_pending = false;
-                f
-            };
-            if !fire {
-                return BOOL(0);
-            }
-        } else if !test_only && !up {
-            // 其他键 keydown：Shift 组合（大写/快捷键），取消单击判定
-            self.shared.lock().unwrap().shift_pending = false;
-        }
         let (name, m_shift, m_ctrl, m_alt) = match name.as_str() {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
