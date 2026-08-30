@@ -49,6 +49,8 @@ $asm = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63
 Get-ChildItem $asm -ErrorAction SilentlyContinue | Where-Object {
     (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID
 } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+# 开始菜单快捷方式（install.ps1 创建的「HuFu 虎符输入法设置.lnk」）
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\HuFu 虎符输入法设置.lnk" -Force -ErrorAction SilentlyContinue
 
 # 5) HKLM 清理（提权时；普通用户跳过——无害残留）
 if ($hklm) {
