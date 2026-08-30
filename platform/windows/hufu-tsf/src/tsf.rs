@@ -52,6 +52,9 @@ pub struct Shared {
     /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
     /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
     pub shift_pending: bool,
+    /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
+    /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
+    pub modekey_last: Option<(usize, std::time::Instant)>,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
@@ -85,6 +88,7 @@ impl Shared {
             chinese: true,
             composing: false,
             shift_pending: false,
+            modekey_last: None,
             preedit_last: String::new(),
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
@@ -298,6 +302,14 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     }
 
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
+        {
+            let _ = writeln!(f, "testup vk={:#x}", wparam.0);
+        }
         Ok(self.dispatch(wparam.0, true, true))
     }
 
@@ -325,6 +337,14 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
+        {
+            let _ = writeln!(f, "keyup vk={:#x}", wparam.0);
+        }
         Ok(self.dispatch(wparam.0, false, true))
     }
 
@@ -438,16 +458,45 @@ pub fn diag_note(msg: &str) {
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
-        // keyup 只服务 Shift 单击判定（0x10）；其余键的 keyup 一律直通。
-        // 【实测回归】若放任字母 keyup 走预判：中文模式下 will=true →
-        // Test 吞 keyup → OnKeyUp 把同一字母再发一次 server——每键双发
-        // （「按一下等于按两下」）。
+        // keyup：仅 Shift（0x10）走单击判定链（普通宿主实测有效）；
+        // 其余键 keyup 一律直通——放行字母 keyup 会造成每键双发。
         if up && wparam != 0x10 {
             return BOOL(0);
         }
+        // 模式键（无组合歧义）：CapsLock / Ctrl+Space。
+        // 【跟打器实证 keys-17980】该类宿主 TestKeyDown 与 KeyDown 解耦
+        // ——Test 放行后并不调 KeyDown（test vk=0x10 有、key 无），遵守
+        // 「Test 无副作用」规范等于永远收不到切换。故这两键在 Test 阶段
+        // 直接发 server（配置关闭时 server 不吞，无副作用）；规范宿主
+        // 随后的 KeyDown 由 80ms 去重挡住双发。
+        // Shift 不在此列（有大写组合歧义），走下方 keyup 单击判定。
+        let mode_key = {
+            match vk_to_name(wparam) {
+                Some((n, sh, ct, al)) => {
+                    n == "capslock" || (ct && !sh && !al && n == "space")
+                }
+                None => false,
+            }
+        };
+        if mode_key {
+            if test_only {
+                self.shared.lock().unwrap().modekey_last =
+                    Some((wparam, std::time::Instant::now()));
+                // fallthrough：走通用路径发 server + 完整响应处理
+            } else {
+                let dup = {
+                    let g = self.shared.lock().unwrap();
+                    matches!(&g.modekey_last, Some((vk, t))
+                        if *vk == wparam && t.elapsed().as_millis() < 80)
+                };
+                if dup {
+                    return BOOL(0);
+                }
+            }
+        }
         // TestKeyDown：本地预判（缓存引擎态），不碰管道——
         // 否则同一键会被引擎处理两次（Test + Down 各一次）
-        if test_only {
+        if test_only && !mode_key {
             let (chinese, composing) = {
                 let g = self.shared.lock().unwrap();
                 (g.chinese, g.composing)
