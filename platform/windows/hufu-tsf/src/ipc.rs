@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -16,6 +16,14 @@ unsafe extern "system" {
         template: isize,
     ) -> isize;
     fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+    fn PeekNamedPipe(
+        h: isize,
+        buf: *mut core::ffi::c_void,
+        size: u32,
+        read: *mut u32,
+        avail: *mut u32,
+        left: *mut u32,
+    ) -> i32;
     fn CreateProcessW(
         app: *const u16,
         cmd: *mut u16,
@@ -230,12 +238,37 @@ pub fn call(req: &Value) -> Option<Value> {
         if f.write_all(&frame).is_err() {
             return None;
         }
+        // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
+        // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
+        // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
+        // 响应」事故）。PeekNamedPipe 轮询，硬上限 2 秒，超时走降级。
+        let raw_pipe = f.as_raw_handle() as isize;
+        let wait_response = |total_ms: u64| -> Option<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+            loop {
+                let mut avail: u32 = 0;
+                if PeekNamedPipe(raw_pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0 {
+                    if avail > 0 {
+                        return Some(());
+                    }
+                } else {
+                    return None; // 管道断（server 退出）
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait_response(2000)?;
         let mut head = [0u8; 4];
         f.read_exact(&mut head).ok()?;
         let len = u32::from_le_bytes(head) as usize;
         if len == 0 || len > (1 << 20) {
             return None;
         }
+        // body 可能分片到达：头 4 字节已到不代表全帧已到
+        wait_response(1000)?;
         let mut buf = vec![0u8; len];
         f.read_exact(&mut buf).ok()?;
         serde_json::from_slice(&buf).ok()
