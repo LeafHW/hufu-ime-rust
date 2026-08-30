@@ -54,6 +54,19 @@ impl Trie {
         &self.nodes[cur].entries
     }
 
+    /// 是否存在以 `prefix` 开头的编码（含 prefix 本身为完整码）。
+    /// 空串视为真。整句空码自动顶屏用它判断「余码是否还是正常码」。
+    pub fn has_prefix(&self, prefix: &str) -> bool {
+        let mut cur = 0usize;
+        for ch in prefix.chars() {
+            match self.nodes[cur].children.get(&ch).copied() {
+                Some(n) => cur = n as usize,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// 收集以 `prefix` 为前缀的所有编码（`(编码, 条目下标)`，编码短者优先）。
     /// `limit` 限制返回条数，防止 `a` 这类短前缀爆炸。
     pub fn completions(&self, prefix: &str, limit: usize) -> Vec<(String, u32)> {
@@ -178,6 +191,12 @@ impl Dict {
     }
 
     /// 精确查询某编码的候选（已排序）。
+    /// 是否存在以 `code` 开头的编码（含 code 为完整码；空串恒真）。
+    /// 整句空码自动顶屏用它判断「余码是否仍是正常码」。
+    pub fn trie_has_prefix(&self, code: &str) -> bool {
+        self.trie.has_prefix(code)
+    }
+
     pub fn lookup(&self, code: &str) -> Vec<&DictEntry> {
         self.by_code
             .get(code)
@@ -274,5 +293,25 @@ mod tests {
         // 长码优先：tuja 在 tu 之前
         let lens: Vec<usize> = pm.iter().map(|(l, _)| *l).collect();
         assert_eq!(lens, vec![4, 2, 1]);
+    }
+
+    #[test]
+    fn trie_has_prefix() {
+        let entries = vec![
+            mk("t", "我", 5.0, 0),
+            mk("tu", "们", 5.0, 1),
+            mk("tuja", "我们", 5.0, 2),
+        ];
+        let d = Dict::from_entries("t", entries);
+        // 真前缀（后续还有更长码）
+        assert!(d.trie_has_prefix("t"));
+        assert!(d.trie_has_prefix("tuj"));
+        // 完整码本身也算
+        assert!(d.trie_has_prefix("tuja"));
+        // 无延续
+        assert!(!d.trie_has_prefix("tujb"));
+        assert!(!d.trie_has_prefix("x"));
+        // 空串恒真
+        assert!(d.trie_has_prefix(""));
     }
 }

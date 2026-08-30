@@ -246,6 +246,10 @@ pub struct SentenceSection {
     pub auto_enable: bool,
     /// 提前上屏
     pub early_commit: bool,
+    /// 整句空码自动顶屏：空码瞬间，若追加前唯一候选以已提交
+    /// 文本开头且余码仍是正常码前缀，把已确定部分顶上屏，
+    /// 余码重新起句（虎爪 2026-08-30 热修 SentenceEmptyCodeAutoCommit）
+    pub empty_code_auto_commit: bool,
     /// 神经重排（llama.cpp 子进程）
     pub rerank: RerankSection,
     /// ngram 模型文件（用户数据目录相对路径）
@@ -260,6 +264,7 @@ impl Default for SentenceSection {
             enabled: true,
             auto_enable: true,
             early_commit: true,
+            empty_code_auto_commit: true,
             rerank: RerankSection::default(),
             ngram_path: "models/sentence-ngram.bin".into(),
             weights: SentenceWeights::default(),

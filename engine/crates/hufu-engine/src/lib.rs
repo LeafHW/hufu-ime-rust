@@ -802,6 +802,39 @@ impl Engine {
         // 顶功：超长（第 max+1 码）或死路（新码无任何延续）
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
         let over_length = len > max_len;
+
+        // 整句空码自动顶屏（虎爪 2026-08-30 热修 SentenceEmptyCodeAutoCommit
+        // 同款）：空码瞬间，若追加前唯一候选以已提交文本开头、余码（去掉
+        // 已提交 raw 后的部分，含刚按下的键）仍是正常码前缀——则把该候选
+        // 去掉已提交前缀的尾部顶上屏，余码重新起句。避免整句打字打到
+        // 空码时整个候选窗空掉、用户被卡住。
+        if sentence_mode
+            && self.config.sentence.empty_code_auto_commit
+            && session.candidates.is_empty()
+            && prev_cands.len() == 1
+        {
+            let cand = &prev_cands[0];
+            let committed_chars = session.committed_text.chars().count();
+            if !cand.text.is_empty()
+                && cand.text.starts_with(&session.committed_text)
+                && cand.text.chars().count() > committed_chars
+            {
+                let rest: String = cand.text.chars().skip(committed_chars).collect();
+                let base_len = session.committed_raw.chars().count();
+                let tail_raw: String = raw.chars().skip(base_len).collect();
+                if !rest.is_empty() && !tail_raw.is_empty() && self.has_continuation(&tail_raw) {
+                    session.pending_commit = Some(rest);
+                    session.raw = tail_raw;
+                    session.committed_raw.clear();
+                    session.committed_text.clear();
+                    session.early_history.clear();
+                    session.early_suspended = false;
+                    self.refresh_candidates(session);
+                    return;
+                }
+            }
+        }
+
         if (over_length || dead_end) && !sentence_mode && self.config.input.auto_push && !has_upper
         {
             if let Some(first) = prev_cands.first().cloned() {
