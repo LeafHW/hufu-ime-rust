@@ -1259,12 +1259,15 @@ fn lockwin_create() -> isize {
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             ..Default::default()
         };
-        let _atom = RegisterClassW(&wc);
+        let atom = RegisterClassW(&wc);
+        if atom == 0 {
+            crate::tsf::trace(&format!("lockwin: RegisterClass 失败 err={}", GetLastError().0));
+        }
         let ex = WINDOW_EX_STYLE(
             WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0
                 | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0,
         );
-        let hwnd = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             ex,
             PCWSTR(class.as_ptr()),
             PCWSTR::null(),
@@ -1274,11 +1277,13 @@ fn lockwin_create() -> isize {
             HMENU(std::ptr::null_mut()),
             HINSTANCE(std::ptr::null_mut()),
             None,
-        )
-        .unwrap_or_default();
-        if hwnd.0.is_null() {
-            return 0;
-        }
+        ) {
+            Ok(h) if !h.0.is_null() => h,
+            _ => {
+                crate::tsf::trace(&format!("lockwin: CreateWindow 失败 err={}", GetLastError().0));
+                return 0;
+            }
+        };
         // 画锁位图（预乘 alpha）：锁环白描边 + 锁体白填充
         let (w, h) = (14i32, 17i32);
         let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
@@ -1302,6 +1307,7 @@ fn lockwin_create() -> isize {
         let dib = match CreateDIBSection(hdc, &bmi as *const _, windows::Win32::Graphics::Gdi::DIB_USAGE(0), &mut bits, None, 0) {
             Ok(d) if !bits.is_null() => d,
             _ => {
+                crate::tsf::trace(&format!("lockwin: DIB 失败 err={}", GetLastError().0));
                 let _ = DeleteDC(hdc);
                 return 0;
             }
@@ -1368,8 +1374,9 @@ fn lockwin_show_at(cand: HWND) {
     unsafe {
         let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         let _ = GetWindowRect(cand, &mut wr);
-        let x = wr.right - 18;
-        let y = wr.top + 5;
+        // 左下角（候选窗窗口矩形左下角内侧）
+        let x = wr.left + 5;
+        let y = wr.bottom - 22;
         let _ = SetWindowPos(
             HWND(h as *mut _),
             HWND(std::ptr::null_mut()),
@@ -1380,7 +1387,7 @@ fn lockwin_show_at(cand: HWND) {
             SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
         );
         let _ = ShowWindow(HWND(h as *mut _), SW_SHOWNOACTIVATE);
-        crate::tsf::trace(&format!("lockwin: show at ({x},{y}) err={}", GetLastError().0));
+        crate::tsf::trace(&format!("lockwin: show L-bottom ({x},{y}) vis={} err={}", IsWindowVisible(HWND(h as *mut _)).0, GetLastError().0));
     }
 }
 
@@ -1406,8 +1413,8 @@ fn lockwin_follow(cand: HWND) {
                 let _ = SetWindowPos(
                     HWND(h as *mut _),
                     HWND(std::ptr::null_mut()),
-                    wr.right - 18,
-                    wr.top + 5,
+                    wr.left + 5,
+                    wr.bottom - 22,
                     0, 0,
                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
                 );
