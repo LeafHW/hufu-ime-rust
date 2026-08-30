@@ -1410,9 +1410,14 @@ impl Engine {
         Some((key, ctx, texts))
     }
 
+    /// 轮询读入口：先应用已到达的重排缓存（无按键副作用）再取 state——
+    /// 候选窗停顿期轮询由此立即看到换序后的新首选。
+    pub fn refresh_rerank(&self, session: &mut Session) {
+        self.apply_rerank(session);
+    }
+
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
-    fn apply_rerank(&self, session: &mut Session) {
-        if session.candidates.is_empty() {
+    fn apply_rerank(&self, session: &mut Session) {        if session.candidates.is_empty() {
             return;
         }
         let cache = match self.rerank_cache.lock() {

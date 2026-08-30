@@ -31,6 +31,12 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             None => serde_json::json!({"error": "按键描述无效"}),
         },
         "state" => {
+            // 先应用已到达的重排缓存：停顿期轮询（DLL poll_tick）拉 state
+            // 时立即拿到换序后的新首选，用户无需按键即可看到候选窗刷新。
+            {
+                let h: &mut Host = &mut host;
+                h.engine.refresh_rerank(&mut h.session);
+            }
             let state = host.engine.state(&host.session);
             serde_json::json!({
                 "state": state,

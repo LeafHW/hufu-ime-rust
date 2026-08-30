@@ -168,6 +168,23 @@ impl Host {
             .spawn(move || {
                 let mut model: Option<hufu_rerank::Reranker> = None;
                 let mut model_failed = false;
+                // 预热：server 启动即后台加载模型并空跑一次前向（触页），
+                // 避免用户首次停顿重排等冷读盘 ~10s（体验即「重排没生效」）。
+                // GGUF_LAZY 页缓存机制不变——私有内存仍由页缓存承载。
+                {
+                    std::env::set_var("GGUF_LAZY", "1");
+                    match hufu_rerank::Reranker::load(&model_path) {
+                        Ok(r) => {
+                            let _ = r.score("。", &["预热".to_string()]);
+                            eprintln!("神经重排模型已预载: {model_path}");
+                            model = Some(r);
+                        }
+                        Err(e) => {
+                            eprintln!("神经重排模型预载失败（本进程内禁用）: {e}");
+                            model_failed = true;
+                        }
+                    }
+                }
                 while let Ok(job) = rx.recv() {
                     if model_failed {
                         continue;
@@ -181,9 +198,8 @@ impl Host {
                     if cur.cands.len() < 2 {
                         continue;
                     }
-                    if model.is_none() {
-                        // 懒加载权重：文件页由 OS 页缓存承载（可共享/可回收），
-                        // 进程私有内存不 +610MB；首次打分有额外读盘，之后页缓存命中。
+                    if model.is_none() && !model_failed {
+                        // 兜底：预热失败后仍尝试懒加载（页缓存可能已就绪）
                         std::env::set_var("GGUF_LAZY", "1");
                         match hufu_rerank::Reranker::load(&model_path) {
                             Ok(r) => {

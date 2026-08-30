@@ -63,16 +63,28 @@ fn main() {
     }
     let s1 = call(&serde_json::json!({"op":"state"}));
     println!("即时(ngram序) 前3: {}", top3(&s1["state"]));
-    // 时序：键入中每键触发 maybe_send（debounce 350ms）；停顿后第一键
-    // 把 job 发出，推理约 0.5~1s，之后下一键应用缓存。故：等 → 键 →
-    // 等（推理）→ 再键（应用）→ 查。
-    println!("停 1.0s → 发键（触发 job）→ 停 1.5s（推理）→ 再键（应用）…");
+    // 时序：键入中每键触发 maybe_send（debounce 350ms）。首次 job 懒加载
+    // 模型（610MB 读盘）+ 推理可能 5s+——轮询 state（server 侧已加
+    // refresh_rerank，state 即含应用结果）直到换序或超时 12s。
+    println!("停 1s → 发键触发 job → 轮询 state（最多 12s，模型首载可能慢）…");
     std::thread::sleep(std::time::Duration::from_millis(1000));
     call(&serde_json::json!({"op":"key","key":"up"}));
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    call(&serde_json::json!({"op":"key","key":"up"}));
-    let s2 = call(&serde_json::json!({"op":"state"}));
-    println!("刷新(重排后) 前3: {}", top3(&s2["state"]));
+    let mut s2 = call(&serde_json::json!({"op":"state"}));
+    let mut hit_at = 0usize;
+    for i in 0..24 {
+        let top = top3(&s2["state"]);
+        if top.starts_with("阖口而不言") {
+            hit_at = i + 1;
+            println!("第 {hit_at} 次轮询({}ms) 换序到达: {}", hit_at * 500, top);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        s2 = call(&serde_json::json!({"op":"state"}));
+    }
+    if hit_at == 0 {
+        println!("12s 未换序（模型未加载/重排线程死/推理异常）");
+    }
+    println!("最终 前3: {}", top3(&s2["state"]));
     let first = s2["state"]["candidates"].as_array()
         .and_then(|a| a.first())
         .and_then(|c| c["text"].as_str().unwrap_or("?").parse::<String>().ok())
