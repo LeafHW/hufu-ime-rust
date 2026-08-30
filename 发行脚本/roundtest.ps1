@@ -178,7 +178,10 @@ foreach ($try in 1..5) {
     Start-Sleep -Seconds 3
 }
 Check '[装] HKCU TIP 树(MASTER+Enable 最终态)' $tipOk
-Check '[底] HKLM 键盘分类在位' (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\Category\Category\{34745C63-B2F0-4784-8B67-5E12C8701A31}\$CLSID")
+# HKLM 分类全套（8 项，虎爪/主流 IME 同款）——切换器可用性依据
+$catNeed = @('{046B8C80-1647-40F7-9B21-B93B81AABC1B}', '{13A016DF-560B-46CD-947A-4C3AF1E0E35D}', '{25504FB4-7BAB-4BC1-9C69-CF81890F0EF5}', '{34745C63-B2F0-4784-8B67-5E12C8701A31}', '{364215D9-75BC-11D7-A6EF-00065B84435C}', '{49D2F9CE-1F5E-11D7-A6D3-00065B84435C}', '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}', '{CCF05DD7-4A87-11D7-A6E2-00065B84435C}')
+$catHit = @($catNeed | Where-Object { Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\Category\Category\$_\$CLSID" }).Count
+Check '[底] HKLM TIP 分类齐全(8)' ($catHit -eq 8)
 # ── H) 中英状态牌（宿主挂载）+ DLL 加载画像 ──
 Remove-Item "$env:TEMP\hufu-langbar.log" -Force -ErrorAction SilentlyContinue
 & "$dir\hufu-tsf-smoke.exe" *> $null

@@ -73,8 +73,28 @@ if ($PhaseElevated) {
     Set-RegHKLM $ips 'ThreadingModel' 'Apartment'
     $tip = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID"
     Set-RegHKLM "$tip\Description" '(default)' 'HuFu 虎符输入法（虎码）'
-    New-Item -Path "$tip\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
-    New-Item -Path "$tip\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
+    # 【TIP 全套分类（8 个，虎爪/主流 IME 同款）】切换器（尤其搜索框等
+    # 打包宿主会话）按分类集合判定 TIP 可用性——只注册键盘一两个分类
+    # 时 Win+空格 会跳过本输入法（用户实测「只能前 3 个来回切」）。
+    # 双层写入：全局分类库 + TIP 树，两层均需齐全。
+    $cats = @(
+        '{046B8C80-1647-40F7-9B21-B93B81AABC1B}',
+        '{13A016DF-560B-46CD-947A-4C3AF1E0E35D}',
+        '{25504FB4-7BAB-4BC1-9C69-CF81890F0EF5}',
+        '{34745C63-B2F0-4784-8B67-5E12C8701A31}',
+        '{364215D9-75BC-11D7-A6EF-00065B84435C}',
+        '{49D2F9CE-1F5E-11D7-A6D3-00065B84435C}',
+        '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}',
+        '{CCF05DD7-4A87-11D7-A6E2-00065B84435C}'
+    )
+    $lmCat = 'HKLM:\SOFTWARE\Microsoft\CTF\Category'
+    foreach ($c in $cats) {
+        New-Item -Path "$tip\Category\Category\$c\$CLSID" -Force | Out-Null
+        New-Item -Path "$tip\Category\Item\$CLSID\$c" -Force | Out-Null
+        New-Item -Path "$lmCat\Category\$c\$CLSID" -Force | Out-Null
+        New-Item -Path "$lmCat\Item\$CLSID\$c" -Force | Out-Null
+    }
+    Write-Host 'OK TIP 分类 8 项已齐全（全局库 + TIP 树双层）'
     $lp = "$tip\LanguageProfile\0x00000804\$PROFILE"
     Set-RegHKLM $lp 'Description' 'HuFu 虎符输入法'
     Set-RegHKLM $lp 'Display Description' 'HuFu 虎符输入法'
