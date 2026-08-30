@@ -28,9 +28,28 @@ pub struct SentenceEngine {
     pub dict: Arc<Dict>,
     supplement: SupplementAutomaton,
     pub weights: SentenceWeights,
-    /// 上次解码缓存（raw → 解码结果）
-    cache: Mutex<Option<(String, Arc<SentenceDecode>)>>,
+    /// 解码缓存：last=同 raw 结果缓存；prefix=上次解码的过程桶
+    /// （增量解码：新 raw 为旧 raw 追加且 base 前缀一致时，复用
+    /// 前部桶只重算尾部窗口）。
+    cache: Mutex<EngineCache>,
 }
+
+#[derive(Default)]
+struct EngineCache {
+    last: Option<(String, Arc<SentenceDecode>)>,
+    prefix: Option<(String, Vec<Bucket>)>,
+}
+
+/// 增量解码参数：前缀最短长度 / 尾部重算窗口 / 单次最大追加键数。
+/// 尾窗须覆盖旧尾段豁免（is_tail 依赖 n）与锁变化的回溯范围
+/// （max_code_length=4 + 缓冲，12 保守）。前缀长度 ≤ 尾窗时 split=0
+/// 退化为全量（主循环从 BOS 种子起算），不产生增量收益也绝不出错。
+const INC_MIN_PREFIX: usize = 20;
+const INC_REDO_TAIL: usize = 8;
+const INC_MAX_DELTA: usize = 3;
+/// 每段参与组句的码表词条上限（rank 截断）：虎码同码词呈长尾分布，
+/// rank>8 的系统词极生僻，beam 展开却为每词条付一次 String clone。
+const SEG_RANK_LIMIT: usize = 8;
 
 /// beam 内部状态。
 #[derive(Clone)]
@@ -167,7 +186,7 @@ impl SentenceEngine {
             dict,
             supplement: automaton,
             weights,
-            cache: Mutex::new(None),
+            cache: Mutex::new(EngineCache::default()),
         }
     }
 
@@ -219,23 +238,35 @@ impl SentenceEngine {
     }
 
     /// 核心解码（对齐 Rime decode_full + emit + build_early_commit_candidates）。
-    fn decode_internal(&self, raw: &str) -> SentenceDecode {
+    /// resume=Some((buckets, start_pos)) 时增量：复用前部桶、从 start_pos
+    /// 续算（segs 与主循环都只跑尾部）。返回 (结果, 过程桶)——桶供下次
+    /// 增量复用；n==0 或超 max_raw_length 时返回 None（不可复用）。
+    fn decode_internal(
+        &self,
+        raw: &str,
+        resume: Option<(Vec<Bucket>, usize)>,
+    ) -> (SentenceDecode, Option<Vec<Bucket>>) {
         let parsed = parse_rank_locks(raw);
         let base: Vec<char> = parsed.base.chars().collect();
         let n = base.len();
         let w = &self.weights;
         if n == 0 || n > w.max_raw_length {
-            return SentenceDecode {
-                hits: Vec::new(),
-                truncated: false,
-                early_hits: Vec::new(),
-                early_truncated: false,
-            };
+            return (
+                SentenceDecode {
+                    hits: Vec::new(),
+                    truncated: false,
+                    early_hits: Vec::new(),
+                    early_truncated: false,
+                },
+                None,
+            );
         }
+        let start_pos = resume.as_ref().map(|(_, s)| *s).unwrap_or(0);
 
         // 每个位置的编码切分预计算：segs[pos] = Vec<(code_len, entries)>
+        // 增量时只需尾部窗内的（前部段不受新键影响）。
         let mut segs: Vec<Vec<(usize, Vec<(String, usize)>)>> = vec![Vec::new(); n];
-        for pos in 0..n {
+        for pos in start_pos..n {
             let tail: String = base[pos..].iter().collect();
             for (code_len, idxs) in self.dict.prefix_matches(&tail) {
                 if code_len == 0 || pos + code_len > n {
@@ -260,6 +291,7 @@ impl SentenceEngine {
                 let entries: Vec<(String, usize)> = idxs
                     .iter()
                     .enumerate()
+                    .take(SEG_RANK_LIMIT)
                     .filter_map(|(rank, &idx)| {
                         self.dict.entries.get(idx as usize).map(|e| (e.text.clone(), rank))
                     })
@@ -277,19 +309,25 @@ impl SentenceEngine {
             .max()
             .unwrap_or(1);
 
-        // beam 分桶
-        let mut buckets: Vec<Bucket> = (0..=n).map(|_| Bucket::new()).collect();
-        buckets[0].add(St {
-            prev2: BOS,
-            prev1: BOS,
-            text: String::new(),
-            score: 0.0,
-            mass: 0.0,
-            max_rank: 1,
-            word_ends: Vec::new(),
-            segmented: String::new(),
-            supp_state: 0,
-        });
+        // beam 分桶：增量时复用前部桶（其内容只依赖 base[..pos]，
+        // 不受尾部新键影响），全量时新建并种入 BOS。
+        let mut buckets: Vec<Bucket> = match resume {
+            Some((b, _)) => b,
+            None => (0..=n).map(|_| Bucket::new()).collect(),
+        };
+        if start_pos == 0 {
+            buckets[0].add(St {
+                prev2: BOS,
+                prev1: BOS,
+                text: String::new(),
+                score: 0.0,
+                mass: 0.0,
+                max_rank: 1,
+                word_ends: Vec::new(),
+                segmented: String::new(),
+                supp_state: 0,
+            });
+        }
 
         let allow_all_ranks = n <= 4;
         // 长句 beam 分档（性能）：解码耗时随长度超线性增长（22键≈15ms、
@@ -302,12 +340,19 @@ impl SentenceEngine {
         } else if n <= 24 {
             (w.beam_width * 3 / 5).max(400)
         } else if n <= 32 {
-            (w.beam_width * 2 / 5).max(300)
+            (w.beam_width / 5).max(300)
         } else {
-            (w.beam_width / 5).max(240)
+            (w.beam_width / 8).max(200)
         };
-        for pos in 0..n {
+        for pos in start_pos..n {
             buckets[pos].limit(beam);
+            if std::env::var("HUFU_INC_DEBUG").is_ok() {
+                eprintln!(
+                    "[inc] raw_len={n} start={start_pos} pos={pos} bucket_size={} segs={}",
+                    buckets[pos].best.len(),
+                    segs[pos].len()
+                );
+            }
             for state in buckets[pos].snapshot() {
                 for (code_len, entries) in &segs[pos] {
                     let end = pos + code_len;
@@ -508,23 +553,70 @@ impl SentenceEngine {
         });
         early_hits.truncate(w.candidate_limit);
 
-        SentenceDecode {
-            hits,
-            truncated: fin_trunc,
-            early_hits,
-            early_truncated: early_trunc,
-        }
+        (
+            SentenceDecode {
+                hits,
+                truncated: fin_trunc,
+                early_hits,
+                early_truncated: early_trunc,
+            },
+            Some(buckets),
+        )
     }
 
     fn decode_cached(&self, raw: &str) -> Arc<SentenceDecode> {
         let mut cache = self.cache.lock().unwrap();
-        if let Some((prev_raw, prev_out)) = cache.as_ref() {
+        if let Some((prev_raw, prev_out)) = cache.last.as_ref() {
             if prev_raw == raw {
                 return prev_out.clone();
             }
         }
-        let out = Arc::new(self.decode_internal(raw));
-        *cache = Some((raw.to_string(), out.clone()));
+        // 增量解码：新 raw 为缓存前缀的追加（1-3 键），且 base 长度
+        // 恰好增长（锁/选重后缀不增 base，走全量保证正确性）。
+        // 复用前部 buckets，从 split=旧base长-尾窗 处重算。
+        let parsed_new = parse_rank_locks(raw);
+        let new_base_len = parsed_new.base.chars().count();
+        let can = cache
+            .prefix
+            .as_ref()
+            .map(|(p_raw, buckets)| {
+                let old_base_len = buckets.len().saturating_sub(1);
+                let delta = new_base_len as isize - old_base_len as isize;
+                raw.starts_with(p_raw.as_str())
+                    && (1..=INC_MAX_DELTA as isize).contains(&delta)
+                    && old_base_len >= INC_MIN_PREFIX
+            })
+            .unwrap_or(false);
+        let resume = if can {
+            cache.prefix.take().map(|(p_raw, mut buckets)| {
+                let old_base_len = buckets.len() - 1;
+                // split=0 时退化为全量（主循环从 BOS 起算），此处不设下限：
+                // 强制 split≥1 会丢弃 pos=0 的段展开，令全部后继桶断源
+                // （13 键候选空 bug 的根因）。
+                let split = old_base_len.saturating_sub(INC_REDO_TAIL);
+                // 再回退一个最大段长（虎码 max_code_length=4）：保留区末尾
+                // pos 的段可能跨界伸入重算区，这些展开必须重跑（Bucket::add
+                // 聚合幂等，重复展开无副作用），否则跨界路径全丢。
+                let start = split.saturating_sub(4);                buckets.truncate(split + 1);
+                buckets.resize_with(new_base_len + 1, Bucket::new);
+                (buckets, start, p_raw)
+            })
+        } else {
+            None
+        };
+        let dbg = std::env::var("HUFU_INC_DEBUG").is_ok();
+        if dbg {
+            let sp = resume.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
+            eprintln!("[cache] raw={raw} start={sp}");
+        }
+        let (out, buckets) = self.decode_internal(raw, resume.map(|(b, s, _)| (b, s)));
+        let out = Arc::new(out);
+        cache.last = Some((raw.to_string(), out.clone()));
+        if let Some(b) = buckets {
+            cache.prefix = Some((raw.to_string(), b));
+        } else {
+            cache.prefix = None;
+        }
         out
     }
 

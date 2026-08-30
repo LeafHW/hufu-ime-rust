@@ -117,10 +117,11 @@ impl Host {
                 Ok(dec) => {
                     let dec = std::sync::Arc::new(dec);
                     // 预热：ngram bin 走 mmap，首次解码会整段触页（实测
-                    // 冷启动首键 ~487ms、热后同码 3ms）。加载后立刻空跑一
-                    // 次长 raw 解码把页拉进缓存，避免用户打第一个长句时
-                    // 感到明显卡顿。
+                    // 冷启动首键 ~490ms、热后同码 4ms）。加载后立刻空跑
+                    // 两次长 raw 解码把页拉进缓存：假码只触 trie 结构页，
+                    // 真实码组合才触 ngram 概率数据页（两者冷启都要付）。
                     let _ = dec.decode_to_strings("buhuibuhuibuhuibuhuibuhuibuhui");
+                    let _ = dec.decode_to_strings("geaenwlcghxirlwddsyftuuuwwjjgffdd");
                     self.engine.set_sentence_decoder(Some(dec));
                     eprintln!("整句引擎已加载: {}", path.display());
                     return;
