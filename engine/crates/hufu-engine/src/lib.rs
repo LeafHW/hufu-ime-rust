@@ -804,22 +804,23 @@ impl Engine {
         let over_length = len > max_len;
 
         // 整句空码自动顶屏（虎爪 2026-08-30 热修 SentenceEmptyCodeAutoCommit
-        // 同款）：空码瞬间，若追加前唯一候选以已提交文本开头、余码（去掉
-        // 已提交 raw 后的部分，含刚按下的键）仍是正常码前缀——则把该候选
-        // 去掉已提交前缀的尾部顶上屏，余码重新起句。避免整句打字打到
-        // 空码时整个候选窗空掉、用户被卡住。
+        // 同款，用户实测反馈「自动上屏积极度提高」的核心）：追加后组句无
+        // 候选（虎爪判定=无以已提交文本开头的完整候选路径），若追加前唯一
+        // 候选仍待顶、余码（去掉已提交 raw 后的部分，含刚按下的键）仍是
+        // 正常码前缀——则把待顶部分上屏，余码重新起句。句中（已有早提交
+        // 部分）同样触发，避免整句打字被卡住。
+        //
+        // 候选形态注意：我们的整句候选是「剩余文本」（早提交后不含已提交
+        // 前缀），虎爪是全文形态（StartsWith(committed) 检查）——在我们
+        // 的形态下该检查天然成立，待顶文本就是候选本身。
         if sentence_mode
             && self.config.sentence.empty_code_auto_commit
             && session.candidates.is_empty()
             && prev_cands.len() == 1
         {
             let cand = &prev_cands[0];
-            let committed_chars = session.committed_text.chars().count();
-            if !cand.text.is_empty()
-                && cand.text.starts_with(&session.committed_text)
-                && cand.text.chars().count() > committed_chars
-            {
-                let rest: String = cand.text.chars().skip(committed_chars).collect();
+            if !cand.text.is_empty() {
+                let rest = cand.text.clone();
                 let base_len = session.committed_raw.chars().count();
                 let tail_raw: String = raw.chars().skip(base_len).collect();
                 if !rest.is_empty() && !tail_raw.is_empty() && self.has_continuation(&tail_raw) {
