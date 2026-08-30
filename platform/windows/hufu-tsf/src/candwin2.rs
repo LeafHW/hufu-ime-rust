@@ -25,6 +25,48 @@ use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
+/// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
+/// 【排查中】用户实测「正常应用里点击候选框导致应用卡死」——本过程
+/// 记录点击/移动消息到达与时刻，卡死复现后由日志定位卡点。
+extern "system" fn cand2_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    const DIAG: once_bool::Diag = once_bool::Diag::new();
+    if DIAG.enabled() {
+        let tag = match msg {
+            0x200 => "move",
+            0x201 => "ldown",
+            0x202 => "lup",
+            0x204 => "rdown",
+            0x205 => "rup",
+            0x20 => "setcursor",
+            0xA0 => "activate",
+            _ => "",
+        };
+        if !tag.is_empty() {
+            crate::tsf::diag_note(&format!("cw2 mouse {tag} t={:?}", std::time::SystemTime::now()));
+        }
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+mod once_bool {
+    /// 进程内一次性诊断开关：写标志文件才启用（默认零开销）。
+    pub struct Diag;
+    impl Diag {
+        pub const fn new() -> Diag {
+            Diag
+        }
+        pub fn enabled(&self) -> bool {
+            static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *V.get_or_init(|| std::path::Path::new(r"C:\ProgramData\HuFu\diag\cand2-mouse").exists())
+        }
+    }
+}
+
 const ACCENT_DISABLED: u32 = 0;
 const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
@@ -156,7 +198,11 @@ impl CandidateWindowV2 {
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
-                lpfnWndProc: Some(defwindowproc_w),
+                lpfnWndProc: Some(cand2_wndproc),
+                // 类光标：NULL 会让鼠标移入时系统 fallback 到忙碌光标
+                //（开始菜单/UWP 里实测「沙漏/转圈」）——显式箭头。
+                hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
+                    .unwrap_or(HCURSOR(std::ptr::null_mut())),
                 lpszClassName: PCWSTR(class.as_ptr()),
                 hbrBackground: HBRUSH(std::ptr::null_mut()),
                 ..Default::default()
