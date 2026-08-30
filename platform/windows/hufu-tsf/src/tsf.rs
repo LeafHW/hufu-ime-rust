@@ -1085,18 +1085,22 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.raw_last = raw.to_string();
             g.raw_changed_at = Some(std::time::Instant::now());
         }
-        // 【首帧稳定期抑制——已撤除】跟打器首键候选「慢半拍」的实锤
-        // 时间线（晴跟首键 trace）：按下→数据就绪 16ms，数据就绪→
-        // 显示 122ms——全耗在「抑制后被动等轮询补显」。而当年抑制
-        // 防的「首键 GetTextExt 旧行框」已被 qc 双查取末次根治（首键
-        // 一次即返回正确位置，补显前后坐标一致）——抑制成了纯延迟。
-        // 首帧立即显示；若「首键偏高一行第二键跳正」回归再换精确
-        // 一次性定时器方案（35ms 后主动补显，不等轮询周期）。
-        let suppress = g.delay_show_ms > 0
+        // 【首帧稳定期（仅异步布局宿主，35ms 精确补显版）】立即显示
+        // 会首帧旧行框跳变（撤抑制实测回归）；被动等轮询补显则慢
+        // 122ms（138ms 首键延迟的实锤主耗）。折中：抑制 35ms（≈1
+        // 帧布局稳定下限）+ 一次性定时器到点主动补显——总延迟
+        // ~55ms 且不跳。
+        let first_frame_unstable = host_async_layout()
             && !raw.is_empty()
-            && g
-                .raw_changed_at
-                .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms);
+            && raw.len() <= 1
+            && g.raw_changed_at
+                .is_some_and(|t| t.elapsed().as_millis() < 35);
+        let suppress = first_frame_unstable
+            || (g.delay_show_ms > 0
+                && !raw.is_empty()
+                && g
+                    .raw_changed_at
+                    .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms));
         if g.focus_context().is_none() {
             return Ok(());
         }
@@ -1194,9 +1198,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
     } else if suppress_win {
         // 候选延时窗口内：快速输入防闪烁，先不显示。
-        // 首帧稳定期抑制时置补显标记——260ms 轮询见此标记且 raw
-        // 非空则无条件刷新（此时布局已稳、rect 正确）。
+        // 置补显标记 + 【精确一次性定时器】35ms 后主动补显（不等
+        // 110ms 轮询周期——「首键候选慢半拍」的 122ms 主耗曾在此；
+        // 立即显示又会首帧旧行框跳变，35ms≈1 帧布局稳定下限）。
         g.suppress_pending = true;
+        arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
@@ -1515,12 +1521,31 @@ fn ui_element_hide(shared: &SharedRef) {
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassW, SetTimer, HWND_MESSAGE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, KillTimer, RegisterClassW, SetTimer, HWND_MESSAGE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 
 const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
 const POLL_MS: u32 = 110;
+/// 首帧稳定期一次性补显定时器（35ms 精确到点，不等轮询周期）
+const FIRST_TIMER_ID: usize = 0x4846_5547; // 'HuFV'
+const FIRST_FRAME_MS: u32 = 35;
+
+/// 武装首帧补显定时器（update_ui 的 suppress 分支调用；与 poll 窗口
+/// 同线程——TSF 回调线程，SetTimer 亲和无虞。重复调用同 id=重置）。
+fn arm_first_frame_timer() {
+    let h = POLL_HWND.load(AtomicOrdering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = SetTimer(
+                HWND(h as *mut _),
+                FIRST_TIMER_ID,
+                FIRST_FRAME_MS,
+                None,
+            );
+        }
+    }
+}
 
 static POLL_HWND: AtomicIsize = AtomicIsize::new(0);
 // Shared 含 COM 接口指针（NonNull）非 Send/Sync——但 poll 窗口的
@@ -1562,6 +1587,14 @@ extern "system" fn poll_wndproc(
     if msg == 0x0113 {
         let id = wparam.0 as usize;
         if id == POLL_TIMER_ID {
+            poll_tick();
+            return LRESULT(0);
+        }
+        if id == FIRST_TIMER_ID {
+            // 首帧补显到点：一次性触发即撤（防空转）
+            unsafe {
+                let _ = KillTimer(hwnd, FIRST_TIMER_ID);
+            }
             poll_tick();
             return LRESULT(0);
         }
