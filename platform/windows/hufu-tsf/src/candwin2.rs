@@ -947,6 +947,42 @@ impl CandidateWindowV2 {
                 }
             }
 
+            // 固定状态小锁标志（内容区右上角）：锁环描边 + 锁体填充
+            if CAND_PINNED.lock().unwrap().is_some() {
+                let pad = 3.0f32;
+                let lw = 9.0f32; // 锁体宽
+                let lh = 8.0f32; // 锁体高
+                let lx = shadow_m as f32 + width - lw - pad;
+                let ly = shadow_m as f32 + pad;
+                let lock_c = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.92 };
+                if let Ok(b) = ctx.CreateSolidColorBrush(&lock_c, None) {
+                    // 锁环：描边圆角矩形（上探出锁体，下半被锁体覆盖）
+                    let shackle = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: lx + 1.5,
+                            top: ly - 3.2,
+                            right: lx + lw - 1.5,
+                            bottom: ly + lh - 2.0,
+                        },
+                        radiusX: 2.2,
+                        radiusY: 2.2,
+                    };
+                    let _ = ctx.DrawRoundedRectangle(&shackle, &b, 1.4, None);
+                    // 锁体：实心圆角矩形
+                    let body = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: lx,
+                            top: ly,
+                            right: lx + lw,
+                            bottom: ly + lh,
+                        },
+                        radiusX: 1.6,
+                        radiusY: 1.6,
+                    };
+                    ctx.FillRoundedRectangle(&body, &b);
+                }
+            }
+
             // 边框
             if let Some(b) = &b_border {
                 let bw = layout_f(skin, "border_width", 1.0);
