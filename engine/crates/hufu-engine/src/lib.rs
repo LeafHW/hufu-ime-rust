@@ -860,14 +860,36 @@ impl Engine {
                                     let tail_code: String =
                                         full_new.iter().skip(last_seg_start).collect();
                                     if !self.has_continuation(&tail_code) {
-                                        session.pending_commit = Some(cand.text.clone());
-                                        session.raw = c.to_string();
-                                        session.committed_raw.clear();
-                                        session.committed_text.clear();
-                                        session.early_history.clear();
-                                        session.early_suspended = false;
-                                        self.refresh_candidates(session);
-                                        return;
+                                        // 「在途词保护」：新 raw 仍有完整组句路径
+                                        // 且新 top1 与 prev top1 共享首字（如
+                                        // cukrpn 的「还没越」vs「还波」——pn 只
+                                        // 是 pnv(跑) 的在途前缀，pnv 完成后切分
+                                        // 会变），说明 prev top1 是中途临时切分，
+                                        // 顶出会固化错误（用户实测「现在还没跑
+                                        // 完」变「现在还波有完」）。三种情况仍顶：
+                                        // 新候选空（组句彻底死，如 cukrpnvw）、
+                                        // prev 带锁（用户显式确认，如 uu2 看看）、
+                                        // 新旧 top1 完全分叉（如 syftuu 的「言祈
+                                        // 推」vs「让我」——让我路径已死）。
+                                        let locked = parse_rank_locks(&prev_raw).has_locks();
+                                        let diverged = session
+                                            .candidates
+                                            .first()
+                                            .map(|nc| {
+                                                nc.text.chars().next()
+                                                    != cand.text.chars().next()
+                                            })
+                                            .unwrap_or(true);
+                                        if session.candidates.is_empty() || locked || diverged {
+                                            session.pending_commit = Some(cand.text.clone());
+                                            session.raw = c.to_string();
+                                            session.committed_raw.clear();
+                                            session.committed_text.clear();
+                                            session.early_history.clear();
+                                            session.early_suspended = false;
+                                            self.refresh_candidates(session);
+                                            return;
+                                        }
                                     }
                                 }
                             }
