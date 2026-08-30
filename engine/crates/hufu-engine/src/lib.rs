@@ -372,13 +372,24 @@ impl Engine {
 
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
+        // 空名防御：dir.join("") = 码表根目录本身，Schema::load 会把
+        // 所有方案子目录当一个方案读（实测挂死 30s+，Ctrl+M 卡死根源；
+        // recent_pair 污染出空端时 target 即空名）。
+        if name.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty schema name",
+            ));
+        }
         let old = self.config.schema.current.clone();
         let dir = self.data_dir.join(&self.config.schema.dir).join(name);
         let mut schema = Schema::load(&dir)?;
         self.apply_reverse_override(&mut schema);
         self.schema = schema;
         self.config.schema.current = name.to_string();
-        if old != name {
+        // 只记录两端皆非空的方案对（启动期 old 为空时不污染——
+        // 否则 Ctrl+M 的 target 会解析出空名）
+        if old != name && !old.is_empty() {
             self.config.schema.recent_pair = Some((old, name.to_string()));
         }
         Ok(())
@@ -451,7 +462,9 @@ impl Engine {
                             .find(|s| **s != self.config.schema.current)
                             .cloned(),
                     };
-                    if let Some(t) = target {
+                    // 空名防御：recent_pair 可能被历史 bug 污染出空端
+                    // （启动期 current="" 时的切换），空目标直接放弃。
+                    if let Some(t) = target.filter(|t| !t.is_empty()) {
                         if t != self.config.schema.current && self.switch_schema(&t).is_ok() {
                             session.clear();
                             return KeyOutcome::consumed(self.state(session));
