@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetCapture, ReleaseCapture};
 use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
@@ -50,12 +51,83 @@ extern "system" fn cand2_wndproc(
             crate::tsf::diag_note(&format!("cw2 mouse {tag} t={:?}", std::time::SystemTime::now()));
         }
     }
-    // 【点击全吞】候选窗没有点击功能，但 DefWindowProc 的点击默认
-    // 路径在普通应用里实测导致宿主 UI 线程完全冻结（「未响应」需
-    // 重启应用）。鼠标按钮消息一律直吞（return 0），不激活、不转发、
-    // 不进 DefWindowProc——物理隔离点击路径。悬停/移动仍走默认。
+    // 【鼠标交互】左键按住拖拽移动候选窗；右键固定/解除固定位置。
+    // 冻结事故教训（已修）：本窗口过程的按钮消息自持自理、绝不经
+    // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
+    // 消息路径（非 TSF 焦点回调），无死锁面。
     match msg {
-        0x201 | 0x202 | 0x204 | 0x205 | 0x207 | 0x208 => return LRESULT(0),
+        0x201 => {
+            // WM_LBUTTONDOWN：记录拖拽偏移并捕获鼠标
+            unsafe {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let _ = GetWindowRect(hwnd, &mut wr);
+                *CAND_DRAG.lock().unwrap() = Some((pt.x - wr.left, pt.y - wr.top));
+                let _ = SetCapture(hwnd);
+            }
+            return LRESULT(0);
+        }
+        0x200 => {
+            // WM_MOUSEMOVE：拖拽中随鼠标移动窗口（clamp 虚拟屏幕内）
+            let drag = *CAND_DRAG.lock().unwrap();
+            if let Some((dx, dy)) = drag {
+                unsafe {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    let w = (wr.right - wr.left).max(1);
+                    let h = (wr.bottom - wr.top).max(1);
+                    let x = (pt.x - dx).clamp(vx, (vx + vw - w).max(vx));
+                    let y = (pt.y - dy).clamp(vy, (vy + vh - h).max(vy));
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND(std::ptr::null_mut()),
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            return LRESULT(0);
+        }
+        0x202 => {
+            // WM_LBUTTONUP：结束拖拽，松手位置交给 show() 作 sticky
+            //（本组段内留在松手处；新组段锚点就绪即恢复跟随——想
+            // 永久固定请右键）
+            unsafe {
+                let _ = ReleaseCapture();
+                if CAND_DRAG.lock().unwrap().is_some() {
+                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    *CAND_DROP_AT.lock().unwrap() = Some((wr.left, wr.top));
+                }
+            }
+            *CAND_DRAG.lock().unwrap() = None;
+            return LRESULT(0);
+        }
+        0x204 => {
+            // WM_RBUTTONDOWN：固定/解除固定
+            let mut pinned = CAND_PINNED.lock().unwrap();
+            if pinned.is_some() {
+                *pinned = None;
+            } else {
+                unsafe {
+                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    *pinned = Some((wr.left, wr.top));
+                }
+            }
+            return LRESULT(0);
+        }
+        0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
@@ -222,18 +294,14 @@ impl CandidateWindowV2 {
                 ..Default::default()
             };
             let _atom = RegisterClassW(&wc);
-            // WS_EX_TRANSPARENT：完全鼠标穿透——鼠标事件（含 hit-test）
-            // 根本不进本窗口，直接落到下层应用。【实测】点击候选框的
-            // WM_LBUTTONDOWN 从未到达 wndproc 应用即冻结（notes-8228
-            // 案发现场：最后记录为 move，ldown 缺失），冻结发生在系统
-            // 与窗口的命中测试交互层。穿透=不参与命中测试，彻底隔离。
-            // 候选窗本无点击/hover 功能，无副作用。
+            // 注：曾因「点击候选框冻结」加过 WS_EX_TRANSPARENT 鼠标穿透
+            // ——后经反汇编定位真凶为焦点回调内同步 ShowWindow 死锁
+            // （已修），穿透撤销以支持拖拽/右键固定交互。
             let ex = WINDOW_EX_STYLE(
                 WS_EX_TOOLWINDOW.0
                     | WS_EX_TOPMOST.0
                     | WS_EX_NOACTIVATE.0
-                    | WS_EX_NOREDIRECTIONBITMAP.0
-                    | WS_EX_TRANSPARENT.0,
+                    | WS_EX_NOREDIRECTIONBITMAP.0,
             );
             let hwnd = CreateWindowExW(
                 ex,
@@ -983,7 +1051,18 @@ impl CandidateWindowV2 {
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let grew = raw.len() >= self.last_raw_len;
             self.last_raw_len = raw.len();
-            let (x, y) = match anchor {
+            // 拖拽松手交接：一次性消费（设 sticky，本组段留在松手处）
+            if let Some(p) = CAND_DROP_AT.lock().unwrap().take() {
+                self.sticky_pos = Some(p);
+            }
+            let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap() {
+                // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
+                //（跨组段/上屏/新一轮候选全部保持；右键再解除）
+                let x = px.clamp(vx, (vx + vw - width as i32).max(vx));
+                let y = py.clamp(vy, (vy + vh - height as i32).max(vy));
+                (x, y)
+            } else {
+            match anchor {
                 Some(r) => {
                     let x = (r.left).clamp(vx, (vx + vw - width as i32).max(vx));
                     let below = r.bottom + 4;
@@ -1028,6 +1107,7 @@ impl CandidateWindowV2 {
                         (x, below.max(fr.top))
                     }
                 },
+            }
             };
             self.sticky_pos = Some((x, y));
             // 诊断：搜索框等宿主锚点缺失排查（visible=0 说明本帧被隐藏）
@@ -1119,6 +1199,18 @@ impl CandidateWindowV2 {
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
+
+/// 拖拽状态：(鼠标屏幕位 − 窗口原点) 偏移；None=非拖拽中。
+static CAND_DRAG: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// 候选窗固定位置（窗口原点，屏幕坐标）；None=未固定。
+/// 右键切换：固定后 show() 忽略光标锚点钉在此处，跨组段/上屏保持；
+/// 再次右键解除恢复跟随光标。进程级（每个应用独立记忆）。
+pub static CAND_PINNED: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// 拖拽松手位置（wndproc → show() 一次性消费：设为 sticky_pos，
+/// 本组段内留在松手处；新组段锚点就绪即恢复跟随光标）。
+static CAND_DROP_AT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
 unsafe extern "system" fn defwindowproc_w(
     hwnd: HWND,
