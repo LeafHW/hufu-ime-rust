@@ -381,6 +381,18 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         pdimprevfocus: Option<&ITfDocumentMgr>,
     ) -> Result<()> {
         let _ = pdimfocus;
+        // 【交互守卫】鼠标悬停在候选窗上 = 用户正在拖拽/右键固定。
+        // 点击候选窗会让宿主连发 docmgr 焦点事件（实测点击即触发
+        // OnSetFocus）——此刻绝不能清组段/隐藏候选窗（表现为「点击
+        // 后候选框消失、拖拽刚按住就断」）。真失焦时鼠标不在候选窗
+        // 上，正常走清理路径。
+        {
+            let g = self.shared.lock().unwrap();
+            if g.cand2.as_ref().map(|c| c.is_mouse_over()).unwrap_or(false) {
+                trace("OnSetFocus: 鼠标在候选窗上——交互中，跳过清理");
+                return Ok(());
+            }
+        }
         let (composing, preedit) = {
             let g = self.shared.lock().unwrap();
             (g.composing, g.preedit_last.clone())
