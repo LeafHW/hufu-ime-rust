@@ -78,12 +78,13 @@ $legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
 if (Test-Path $legacy) {
     Write-Host "  · 旧版目录仍在：$legacy（可一并删除）"
 }
-# 机器级残留说明（普通权限卸载清不掉 HKLM/SystemIME——仅约 1MB DLL）
+# 机器级残留说明（普通权限卸载清不掉 HKLM/SystemIME——机器级注册
+# 会让系统重新激活虎符：切换器可见、可打字。彻底卸载必须提权一次）
 $lmLeft = (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID") -or (Test-Path 'C:\Windows\SystemIME\HuFu')
 if ($lmLeft) {
-    Write-Host '  · 本机 C 盘仍留有约 1MB 系统级副本（SystemIME DLL + 机器注册，'
-    Write-Host '    对系统无害且不影响其他软件）。如需一并清除，请以管理员身份'
-    Write-Host '    再运行一次本卸载器即可。'
+    Write-Host '  ⚠ 本机仍有机器级注册（HKLM 档案 + SystemIME DLL）——虎符会继续'
+    Write-Host '    可用（切换器可见、可打字）！彻底卸载请右键「卸载.bat」选'
+    Write-Host '    「以管理员身份运行」再跑一次（清机器级注册）。'
 }
 # 文件夹删除受阻提示（宿主占用 → 注销/重启后删除）
 Write-Host '  · 若删除文件夹时提示「文件被占用」：注销或重启电脑后再删一次'
