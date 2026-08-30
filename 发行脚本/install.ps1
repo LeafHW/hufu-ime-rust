@@ -104,6 +104,17 @@ if ($PhaseElevated) {
     Write-Host 'OK HKLM 机器级已注册（指向 SystemIME）'
     Write-Host '—— 提权阶段：msctf 原生登记 ——'
     & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $sysdll
+    # 【顺序铁律·回写半边】完整安装下每用户段先写了 HKCU→安装目录 DLL
+    # （当时 SystemIME 尚未建立）。此刻 SystemIME 已就位：HKCU COM 必须
+    # 回写为 SystemIME 路径——否则打包进程（开始菜单/UWP）按 HKCU 优先
+    # 解析到用户目录 DLL（无 ALL APPLICATION PACKAGES 读权限）→ 加载
+    # 失败，开始菜单/UWP 打不了字（实测回归位）。
+    $ipsCU = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
+    Set-ItemProperty -Path $ipsCU -Name '(default)' -Value $sysdll -EA SilentlyContinue
+    (Get-Item $ipsCU).OpenSubKey('', $true).SetValue('', $sysdll)
+    $chkCU = (Get-Item $ipsCU).GetValue('')
+    if ($chkCU -ne $sysdll) { Write-Host "⚠ HKCU 回写校验失败：$chkCU" }
+    else { Write-Host 'OK HKCU COM 已回写 → SystemIME（打包进程可读）' }
     Write-Host '提权阶段完成。'
     exit
 }
@@ -188,9 +199,19 @@ if (-not $NoHKLM) {
         Write-Host '（弹出 UAC：机器级注册 + msctf 登记，请点「是」）'
         $elog = Join-Path $env:TEMP 'hufu-install-elevated.log'
         $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"& '$PSCommandPath' -PhaseElevated *> '$elog'`""
+        $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"[Console]::OutputEncoding=[Text.Encoding]::UTF8; & '$PSCommandPath' -PhaseElevated *> '$elog'`""
         Start-Process $ps -Verb RunAs -ArgumentList $arg -Wait
-        if (Test-Path $elog) { Get-Content $elog | ForEach-Object { Write-Host "  $_" } }
+        if (Test-Path $elog) {
+            # smoke 输出为 UTF-8 字节：按 UTF-8 读回（默认 ANSI 会乱码）
+            Get-Content $elog -Encoding UTF8 | ForEach-Object { Write-Host "  $_" }
+        }
+        # 【顺序铁律·校验半边】提权段已回写 HKCU→SystemIME；此处回读双保险
+        $ipsCU = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
+        $sysdllChk = 'C:\Windows\SystemIME\HuFu\hufu_tsf.dll'
+        if ((Test-Path $ipsCU) -and ((Get-Item $ipsCU).GetValue('') -ne $sysdllChk)) {
+            (Get-Item $ipsCU).OpenSubKey('', $true).SetValue('', $sysdllChk)
+            Write-Host "  · HKCU COM 校正 → SystemIME（原值 $((Get-Item $ipsCU).GetValue(''))）"
+        }
     } else {
         Write-Host '⚠ 无管理员权限：msctf 输入法注册需机器级写入（TSF 平台限制，'
         Write-Host '  同类输入法如虎爪同样要求管理员）。文件与语言列表已铺好，'
