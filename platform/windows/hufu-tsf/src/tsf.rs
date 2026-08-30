@@ -53,6 +53,9 @@ pub struct Shared {
     pub preedit_last: String,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
+    /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
+    /// 异步重排换序后主动刷新候选窗）
+    pub cand_sig_last: String,
 }
 
 impl Shared {
@@ -80,6 +83,7 @@ impl Shared {
             composing: false,
             preedit_last: String::new(),
             tm_sink_cookie: 0,
+            cand_sig_last: String::new(),
         }
     }
 
@@ -873,6 +877,12 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 
 /// 引擎结果 → 组段与候选窗更新。
 fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    // 停顿期轮询武装（幂等；进程内一次）+ 记录本次展示签名
+    poll_arm(&shared);
+    {
+        let mut g0 = shared.lock().unwrap();
+        g0.cand_sig_last = state_sig(&state);
+    }
     // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
     let (op, has_ctx, suppress_win) = {
         let mut g = shared.lock().unwrap();
@@ -1257,4 +1267,158 @@ fn ui_element_hide(shared: &SharedRef) {
     g.cand_ui_host_draws = false;
     drop(g);
     let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 停顿期候选轮询：异步重排换序后，用户不按键也能看到新首选。
+//
+// 背景：重排在 server 侧 debounce+推理（~0.5-1s）后写入缓存，但 DLL
+// 侧候选窗只在 OnKeyDown 时拉取——停顿中模型算完了，眼前的窗还是
+// 旧序，按 2 想选旧序第 2 项会上屏新序第 2 项（选错词投诉位）。
+//
+// 机制：message-only 窗口 + SetTimer(260ms)。WM_TIMER 与按键回调
+// 同线程派发（宿主 UI 线程），窗口操作无跨线程亲和问题；tick 拉一次
+// state（本地管道 ~1ms），候选签名（text 序+selected）变化才走
+// update_ui 全量刷新。timer 于首次 update_ui 时武装，进程生命周期
+// 内常开（空编码 tick 直接短路，开销可忽略）。
+// ═══════════════════════════════════════════════════════════════════
+
+use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, RegisterClassW, SetTimer, HWND_MESSAGE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WNDCLASSW,
+};
+
+const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
+const POLL_MS: u32 = 260;
+
+static POLL_HWND: AtomicIsize = AtomicIsize::new(0);
+// Shared 含 COM 接口指针（NonNull）非 Send/Sync——但 poll 窗口的
+// WM_TIMER 只在其创建线程（=TSF 回调线程）派发，poll_tick 与所有
+// COM 访问严格同线程；此 wrapper 仅满足 static 的类型约束。
+struct PollShared(SharedRef);
+unsafe impl Send for PollShared {}
+unsafe impl Sync for PollShared {}
+static POLL_SHARED: Mutex<Option<PollShared>> = Mutex::new(None);
+static POLL_IN_TICK: AtomicIsize = AtomicIsize::new(0);
+
+fn state_sig(state: &serde_json::Value) -> String {
+    let texts: Vec<String> = state
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|c| {
+                    c.get("text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0);
+    format!("{}|{}", texts.join("\u{1}"), sel)
+}
+
+extern "system" fn poll_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == 273 {
+        // WM_TIMER
+        let id = wparam.0 as usize;
+        if id == POLL_TIMER_ID {
+            poll_tick();
+            return LRESULT(0);
+        }
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn poll_arm(shared: &SharedRef) {
+    if POLL_HWND.load(AtomicOrdering::Relaxed) != 0 {
+        return;
+    }
+    *POLL_SHARED.lock().unwrap() = Some(PollShared(shared.clone()));
+    let cls: Vec<u16> = "HuFuPollWnd".encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = "hufu-poll".encode_utf16().chain([0]).collect();
+    unsafe {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(poll_wndproc),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            hInstance: HINSTANCE(std::ptr::null_mut()),
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 {
+            // 已注册（重复激活）忽略
+        }
+        let h = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(cls.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE, // message-only：不可见、不收桌面消息
+            None,
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        );
+        if let Ok(h) = h {
+            if !h.0.is_null() {
+                let _ = SetTimer(h, POLL_TIMER_ID, POLL_MS, None);
+                POLL_HWND.store(h.0 as isize, AtomicOrdering::Relaxed);
+                diag_note("poll: 轮询窗已武装（260ms）");
+            }
+        }
+    }
+}
+
+fn poll_tick() {
+    // 重入保护（update_ui 过程中不会再泵本消息，双保险）
+    if POLL_IN_TICK.swap(1, AtomicOrdering::Relaxed) != 0 {
+        return;
+    }
+    let _guard = scopeguard_release();
+    let shared = POLL_SHARED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.0.clone());
+    let Some(shared) = shared else { return };
+    let Some(state) = ipc::state_request() else { return };
+    let raw_empty = state
+        .get("raw")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty();
+    let sig = state_sig(&state);
+    {
+        let mut g = shared.lock().unwrap();
+        if raw_empty {
+            g.cand_sig_last = String::new();
+            return;
+        }
+        if sig == g.cand_sig_last {
+            return;
+        }
+    }
+    trace("poll: 候选签名变化 → 刷新");
+    let _ = update_ui(shared, String::new(), state);
+}
+
+fn scopeguard_release() -> PollGuard {
+    PollGuard
+}
+struct PollGuard;
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        POLL_IN_TICK.store(0, AtomicOrdering::Relaxed);
+    }
 }
