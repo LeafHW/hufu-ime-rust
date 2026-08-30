@@ -1332,7 +1332,9 @@ fn lockwin_create() -> isize {
                 }
             }
         }
-        // ULW 上屏（窗口保持隐藏，显示由 ShowWindow 控制）
+        // ULW 上屏（窗口保持隐藏，显示由 ShowWindow 控制）。
+        // pptDst=None：不动位置（Some(0,0) 会把窗拽到屏幕左上角——
+        // 位置由 show_at 的 SetWindowPos 负责）。
         let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
             BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 235, AlphaFormat: 1,
         };
@@ -1341,7 +1343,7 @@ fn lockwin_create() -> isize {
         let _ = UpdateLayeredWindow(
             hwnd,
             None,
-            Some(&windows::Win32::Foundation::POINT { x: 0, y: 0 } as *const windows::Win32::Foundation::POINT),
+            None,
             Some(&sz as *const windows::Win32::Foundation::SIZE),
             hdc,
             Some(&pt as *const windows::Win32::Foundation::POINT),
@@ -1352,6 +1354,7 @@ fn lockwin_create() -> isize {
         let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
         let _ = DeleteDC(hdc);
         *LOCK_HWND.lock().unwrap() = Some(hwnd.0 as isize);
+        crate::tsf::trace(&format!("lockwin: created hwnd={:p}", hwnd.0));
         hwnd.0 as isize
     }
 }
@@ -1367,8 +1370,17 @@ fn lockwin_show_at(cand: HWND) {
         let _ = GetWindowRect(cand, &mut wr);
         let x = wr.right - 18;
         let y = wr.top + 5;
-        let _ = SetWindowPos(HWND(h as _), HWND(std::ptr::null_mut()), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-        let _ = ShowWindow(HWND(h as _), SW_SHOWNOACTIVATE);
+        let _ = SetWindowPos(
+            HWND(h as *mut _),
+            HWND(std::ptr::null_mut()),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+        let _ = ShowWindow(HWND(h as *mut _), SW_SHOWNOACTIVATE);
+        crate::tsf::trace(&format!("lockwin: show at ({x},{y}) err={}", GetLastError().0));
     }
 }
 
@@ -1392,12 +1404,12 @@ fn lockwin_follow(cand: HWND) {
                 let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                 let _ = GetWindowRect(cand, &mut wr);
                 let _ = SetWindowPos(
-                    HWND(h as _),
+                    HWND(h as *mut _),
                     HWND(std::ptr::null_mut()),
                     wr.right - 18,
                     wr.top + 5,
                     0, 0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
                 );
             }
         }
