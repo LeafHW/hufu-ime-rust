@@ -1088,13 +1088,15 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 【组段首帧稳定期（仅异步布局宿主）】跟打器类宿主文本布局
         // 懒执行：首键 GetTextExt 常返回旧行框（候选窗偏高一行、第二
         // 键跳正——cw2 show y 序列实测 1092→1175 / 1166→1286）。首帧
-        // 220ms 内不显示，等第二键或 260ms 轮询在布局稳定后以正确位
-        // 置补显，全程零跳变。同步布局宿主（记事本等）不受影响。
+        // 110ms 内不显示，等第二键或轮询在布局稳定后以正确位置补显，
+        // 全程零跳变。同步布局宿主（记事本等）不受影响。
+        // （220ms→110ms：用户实测「首键候选慢半拍」；异步布局通常
+        // 1-2 帧 ~60ms 完成，110ms 足覆盖，配合轮询提速最坏 ~250ms）
         let first_frame_unstable = host_async_layout()
             && !raw.is_empty()
             && raw.len() <= 1
             && g.raw_changed_at
-                .is_some_and(|t| t.elapsed().as_millis() < 220);
+                .is_some_and(|t| t.elapsed().as_millis() < 110);
         let suppress = first_frame_unstable
             || (g.delay_show_ms > 0
                 && !raw.is_empty()
@@ -1509,7 +1511,7 @@ fn ui_element_hide(shared: &SharedRef) {
 // 侧候选窗只在 OnKeyDown 时拉取——停顿中模型算完了，眼前的窗还是
 // 旧序，按 2 想选旧序第 2 项会上屏新序第 2 项（选错词投诉位）。
 //
-// 机制：message-only 窗口 + SetTimer(260ms)。WM_TIMER 与按键回调
+// 机制：message-only 窗口 + SetTimer(140ms)。WM_TIMER 与按键回调
 // 同线程派发（宿主 UI 线程），窗口操作无跨线程亲和问题；tick 拉一次
 // state（本地管道 ~1ms），候选签名（text 序+selected）变化才走
 // update_ui 全量刷新。timer 于首次 update_ui 时武装，进程生命周期
@@ -1524,7 +1526,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
-const POLL_MS: u32 = 260;
+const POLL_MS: u32 = 140;
 
 static POLL_HWND: AtomicIsize = AtomicIsize::new(0);
 // Shared 含 COM 接口指针（NonNull）非 Send/Sync——但 poll 窗口的
@@ -1608,7 +1610,7 @@ fn poll_arm(shared: &SharedRef) {
             if !h.0.is_null() {
                 let _ = SetTimer(h, POLL_TIMER_ID, POLL_MS, None);
                 POLL_HWND.store(h.0 as isize, AtomicOrdering::Relaxed);
-                diag_note("poll: 轮询窗已武装（260ms）");
+                diag_note("poll: 轮询窗已武装（140ms）");
             }
         }
     }
