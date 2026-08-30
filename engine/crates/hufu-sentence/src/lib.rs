@@ -303,19 +303,25 @@ impl SentenceEngine {
                     }
                     let lock = parsed.locks.iter().find(|(l, _)| *l == end);
                     // 多码整句时段跨须 ≥2（含选重后缀字符；Rime 段跨规则，
-                    // tiger_sentence.lua L562 同款）。【实测 2026-08-31】放开
-                    // 此规则（允许一简段入整句）100 句基准 exact 92.93%→
-                    // 78.79%、字准 99.39%→98.12%——单码段制造大量噪声路径，
-                    // 禁令是质量担当，不可动。「的(u) 窒(eyi)」类编码冲突靠
-                    // 提前上屏的边界位置解决（见 tiger_sentence.lua live 版）。
+                    // tiger_sentence.lua L562 同款；虎爪 ExpandRange L385
+                    // num3-i<2 同款）。【实测 2026-08-31】放开此规则（允许
+                    // 一简段入整句）100 句基准 exact 92.93%→78.79%——单码
+                    // 段制造大量噪声路径，禁令是质量担当，不可动。
                     // 【尾段豁免 2026-09-04】end==n（消耗到 raw 末尾）=
-                    // 用户正在打的下一词，放行单码段——否则「cn;j;c」「cbfe;u」
-                    // 类锁+一简首键时刻 0 候选（虎爪此刻显示已锁部分+新尾，
-                    // 我们整个窗空掉，用户体感「打不出来」）。中间段仍禁，
-                    // 质量禁令本体不动。
+                    // 用户正在打的下一词，仅两类场景放行单码段：
+                    //   a) n>4（真整句，如 cbfe;u 的 u）；
+                    //   b) 有选重锁（顶功确认流，如 cn;j;c 的 c）。
+                    // 短码且无锁（zhh/egy 类）不豁免——否则 zh(其)+h(道)
+                    // 两字路径压过码表精确词「虎」，单字首选错位（用户
+                    // 实测 zhh 首选变「其道」；虎爪/Rime 该码只有「虎」）。
                     let span = end - pos + if lock.is_some() { 1 } else { 0 };
-                    if n > 1 && span < 2 && end < n {
-                        continue;
+                    if n > 1 && span < 2 {
+                        // 尾段豁免仅限：真整句（n>4）或顶功确认流（有锁）
+                        let is_tail = end == n;
+                        let exempt = is_tail && (n > 4 || !parsed.locks.is_empty());
+                        if !exempt {
+                            continue;
+                        }
                     }
                     for (text, rank) in entries {
                         let rank1b = rank + 1; // 码表名次（1 起）
