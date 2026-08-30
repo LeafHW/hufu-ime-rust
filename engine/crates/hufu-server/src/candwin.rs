@@ -101,6 +101,9 @@ struct BITMAPINFO {
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassW(lpwcx: *const WNDCLASSW) -> u16;
+    /// IDC_ARROW=32512：类光标 NULL 会让鼠标移入时系统 fallback 到
+    /// 忙碌光标（开始菜单/UWP 里实测「沙漏/转圈」）——显式加载箭头。
+    fn LoadCursorW(inst: isize, name: *const u16) -> isize;
     fn CreateWindowExW(
         ex: u32, cls: *const u16, name: *const u16, style: u32,
         x: i32, y: i32, w: i32, h: i32, parent: isize, menu: isize,
@@ -876,6 +879,7 @@ pub fn hide() {
 /// 在 tray 线程创建（消息循环已有）：注册类 + 分层隐藏窗口
 pub fn init_on_tray_thread() {
     let class: Vec<u16> = "HuFuSrvCand\0".encode_utf16().collect();
+    let arrow: Vec<u16> = [32512u16].to_vec(); // IDC_ARROW
     let wc = WNDCLASSW {
         style: 0,
         lpfnWndProc: wnd_proc,
@@ -883,7 +887,8 @@ pub fn init_on_tray_thread() {
         cbWndExtra: 0,
         hInstance: 0,
         hIcon: 0,
-        hCursor: 0,
+        // NULL 类光标 = 鼠标移入显示忙碌光标（沙漏/转圈）——设箭头
+        hCursor: unsafe { LoadCursorW(0, arrow.as_ptr()) },
         hbrBackground: 0,
         lpszMenuName: std::ptr::null(),
         lpszClassName: class.as_ptr(),
