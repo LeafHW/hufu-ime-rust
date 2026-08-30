@@ -34,9 +34,11 @@ foreach ($l in $list) {
     }
 }
 
-# 2) msctf 原生档案注销
+# 2) msctf 原生档案注销（机器级；仅在完整卸载（管理员）时做——
+#    每用户卸载（-NoHKLM 或普通权限）不动 msctf 档案：它注册时
+#    需要管理员重建，清了会导致无提权重装后输入法失忆）
 $smoke = Join-Path $inst 'hufu-tsf-smoke.exe'
-if (Test-Path $smoke) { & $smoke unreg }
+if ($hklm -and (Test-Path $smoke)) { & $smoke unreg }
 
 # 3) 停 server、删自启
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -76,5 +78,14 @@ $legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
 if (Test-Path $legacy) {
     Write-Host "  · 旧版目录仍在：$legacy（可一并删除）"
 }
-if (-not $hklm) { Write-Host '  （每用户卸载；HKLM 无写入，无残留）' }
+# 机器级残留说明（普通权限卸载清不掉 HKLM/SystemIME——仅约 1MB DLL）
+$lmLeft = (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID") -or (Test-Path 'C:\Windows\SystemIME\HuFu')
+if ($lmLeft) {
+    Write-Host '  · 本机 C 盘仍留有约 1MB 系统级副本（SystemIME DLL + 机器注册，'
+    Write-Host '    对系统无害且不影响其他软件）。如需一并清除，请以管理员身份'
+    Write-Host '    再运行一次本卸载器即可。'
+}
+# 文件夹删除受阻提示（宿主占用 → 注销/重启后删除）
+Write-Host '  · 若删除文件夹时提示「文件被占用」：注销或重启电脑后再删一次'
+Write-Host '    即可完全删净（个别 DLL 会被系统输入宿主短暂占用）。'
 Write-Host '  · 无需重启/注销；已开应用里的输入法随应用关闭即消失'
