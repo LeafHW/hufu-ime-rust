@@ -49,6 +49,9 @@ pub struct Shared {
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
     pub chinese: bool,
     pub composing: bool,
+    /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
+    /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
+    pub shift_pending: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
@@ -81,6 +84,7 @@ impl Shared {
             caret: None,
             chinese: true,
             composing: false,
+            shift_pending: false,
             preedit_last: String::new(),
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
@@ -290,16 +294,16 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         {
             let _ = writeln!(f, "test vk={:#x} t={:?}", wparam.0, std::time::SystemTime::now());
         }
-        Ok(self.dispatch(wparam.0, true))
+        Ok(self.dispatch(wparam.0, true, false))
     }
 
-    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        Ok(BOOL(0))
+    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        Ok(self.dispatch(wparam.0, true, true))
     }
 
     fn OnKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
-        let r = self.dispatch(wparam.0, false);
+        let r = self.dispatch(wparam.0, false, false);
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -318,10 +322,10 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         Ok(r)
     }
 
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
-        Ok(BOOL(0))
+        Ok(self.dispatch(wparam.0, false, true))
     }
 
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
@@ -433,7 +437,7 @@ pub fn diag_note(msg: &str) {
 
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
-    fn dispatch(&self, wparam: usize, test_only: bool) -> BOOL {
+    fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
         // TestKeyDown：本地预判（缓存引擎态），不碰管道——
         // 否则同一键会被引擎处理两次（Test + Down 各一次）
         if test_only {
@@ -479,6 +483,37 @@ impl HuFuTs_Impl {
         let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
             return BOOL(0);
         };
+        // ── Shift 单击切换中英（keyup 触发，组合不误切）──
+        // 实测（跟打器 keys 日志）：TestKeyDown 预判曾把 "shift" 判为
+        // 不处理（非单字符），KeyDown 永远不被调，server 收不到切换，
+        // 英文模式下 will=chinese&&.. 又拦掉所有键 → 切得出切不回。
+        // 现两层修复：Test 无条件放行 Shift（中英皆放，server 决断）；
+        // 切换在 keyup 触发——keydown 只记 pending，期间任何其他键
+        // keydown（大写字母/组合键）清除 pending，keyup 仍存活才是
+        // 单击切换。raw 非空时 server 自己不吞（现有逻辑）。
+        if name == "shift" {
+            if test_only {
+                return BOOL(1);
+            }
+            if !up {
+                self.shared.lock().unwrap().shift_pending = true;
+                // 不吞：应用照常处理 Shift（物理状态/快捷键不受影响）
+                return BOOL(0);
+            }
+            // keyup：pending 存活 → 单击，落入下方通用路径发 server
+            let fire = {
+                let mut g = self.shared.lock().unwrap();
+                let f = g.shift_pending;
+                g.shift_pending = false;
+                f
+            };
+            if !fire {
+                return BOOL(0);
+            }
+        } else if !test_only && !up {
+            // 其他键 keydown：Shift 组合（大写/快捷键），取消单击判定
+            self.shared.lock().unwrap().shift_pending = false;
+        }
         let (name, m_shift, m_ctrl, m_alt) = match name.as_str() {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
