@@ -1302,6 +1302,7 @@ unsafe impl Send for PollShared {}
 unsafe impl Sync for PollShared {}
 static POLL_SHARED: Mutex<Option<PollShared>> = Mutex::new(None);
 static POLL_IN_TICK: AtomicIsize = AtomicIsize::new(0);
+static POLL_TICKS: AtomicIsize = AtomicIsize::new(0);
 
 fn state_sig(state: &serde_json::Value) -> String {
     let texts: Vec<String> = state
@@ -1328,8 +1329,8 @@ extern "system" fn poll_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == 273 {
-        // WM_TIMER
+    // WM_TIMER=0x0113（此前笔误 273=WM_COMMAND，tick 永不触发）
+    if msg == 0x0113 {
         let id = wparam.0 as usize;
         if id == POLL_TIMER_ID {
             poll_tick();
@@ -1386,6 +1387,10 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    let n = POLL_TICKS.fetch_add(1, AtomicOrdering::Relaxed);
+    if n < 3 {
+        diag_note(&format!("poll: tick #{} 开始", n + 1));
+    }
     let shared = POLL_SHARED
         .lock()
         .unwrap()
