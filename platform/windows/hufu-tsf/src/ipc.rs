@@ -276,6 +276,13 @@ pub fn ping() -> bool {
         .unwrap_or(false)
 }
 
+/// 轮询用：拉当前会话态（不产生按键副作用）。供候选窗停顿期刷新
+/// （异步重排到达后主动换序，用户不必按键即可看到新首选）。
+pub fn state_request() -> Option<Value> {
+    let resp = call(&serde_json::json!({"op": "state"}))?;
+    resp.get("state").cloned()
+}
+
 /// 测试钩子：重置引擎会话（回默认中文态；真实应用里的 Shift 切换会污染
 /// 全局会话态，冒烟前需归零）。
 pub fn reset_session() -> bool {
