@@ -94,6 +94,7 @@ extern "system" fn cand2_wndproc(
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+                    lockwin_follow(hwnd);
                 }
             }
             return LRESULT(0);
@@ -114,16 +115,19 @@ extern "system" fn cand2_wndproc(
             return LRESULT(0);
         }
         0x204 => {
-            // WM_RBUTTONDOWN：固定/解除固定
+            // WM_RBUTTONDOWN：固定/解除固定（锁标志即时反馈）
             let mut pinned = CAND_PINNED.lock().unwrap();
             if pinned.is_some() {
                 *pinned = None;
+                lockwin_hide();
             } else {
                 unsafe {
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *pinned = Some((wr.left, wr.top));
                 }
+                drop(pinned);
+                lockwin_show_at(hwnd);
             }
             return LRESULT(0);
         }
@@ -947,42 +951,6 @@ impl CandidateWindowV2 {
                 }
             }
 
-            // 固定状态小锁标志（内容区右上角）：锁环描边 + 锁体填充
-            if CAND_PINNED.lock().unwrap().is_some() {
-                let pad = 3.0f32;
-                let lw = 9.0f32; // 锁体宽
-                let lh = 8.0f32; // 锁体高
-                let lx = shadow_m as f32 + width - lw - pad;
-                let ly = shadow_m as f32 + pad;
-                let lock_c = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.92 };
-                if let Ok(b) = ctx.CreateSolidColorBrush(&lock_c, None) {
-                    // 锁环：描边圆角矩形（上探出锁体，下半被锁体覆盖）
-                    let shackle = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: lx + 1.5,
-                            top: ly - 3.2,
-                            right: lx + lw - 1.5,
-                            bottom: ly + lh - 2.0,
-                        },
-                        radiusX: 2.2,
-                        radiusY: 2.2,
-                    };
-                    let _ = ctx.DrawRoundedRectangle(&shackle, &b, 1.4, None);
-                    // 锁体：实心圆角矩形
-                    let body = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: lx,
-                            top: ly,
-                            right: lx + lw,
-                            bottom: ly + lh,
-                        },
-                        radiusX: 1.6,
-                        radiusY: 1.6,
-                    };
-                    ctx.FillRoundedRectangle(&body, &b);
-                }
-            }
-
             // 边框
             if let Some(b) = &b_border {
                 let bw = layout_f(skin, "border_width", 1.0);
@@ -1208,6 +1176,11 @@ impl CandidateWindowV2 {
                 GetLastError().0,
                 IsWindowVisible(self.hwnd).0
             ));
+            // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
+            // 锁与候选窗同进退；show_at 幂等：定位+显示）
+            if CAND_PINNED.lock().unwrap().is_some() {
+                lockwin_show_at(self.hwnd);
+            }
         }
     }
 
@@ -1228,6 +1201,8 @@ impl CandidateWindowV2 {
         // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
         // 中下方」的病根）。
         self.last_raw_len = usize::MAX;
+        // 候选窗隐藏时锁指示窗同退（组段间不孤零零挂一个锁）
+        lockwin_hide();
         // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
         // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
@@ -1257,6 +1232,177 @@ pub static CAND_PINNED: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex:
 /// 拖拽松手位置（wndproc → show() 一次性消费：设为 sticky_pos，
 /// 本组段内留在松手处；新组段锚点就绪即恢复跟随光标）。
 static CAND_DROP_AT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+// ── 固定锁指示小窗（独立 GDI 分层窗）──
+// 右键固定/解除【即时】反馈：锁不画在候选窗渲染帧里（那要等下一次
+// 键入触发渲染），而是独立小窗——右键当场显示/隐藏，并跟随候选窗
+// 移动（拖拽/show() 定位联动）。鼠标穿透，纯视觉指示。
+
+static LOCK_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+/// 创建锁指示窗（幂等）：注册类 → 分层小窗 → GDI 画锁 → ULW 上屏（隐藏态）
+fn lockwin_create() -> isize {
+    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+        unsafe {
+            if IsWindow(HWND(h as *mut _)).as_bool() {
+                return h;
+            }
+        }
+    }
+    unsafe {
+        let class: Vec<u16> = "HuFuCandLock\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(defwindowproc_w),
+            hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
+                .unwrap_or(HCURSOR(std::ptr::null_mut())),
+            lpszClassName: PCWSTR(class.as_ptr()),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            ..Default::default()
+        };
+        let _atom = RegisterClassW(&wc);
+        let ex = WINDOW_EX_STYLE(
+            WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0
+                | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0,
+        );
+        let hwnd = CreateWindowExW(
+            ex,
+            PCWSTR(class.as_ptr()),
+            PCWSTR::null(),
+            WINDOW_STYLE(WS_POPUP.0),
+            0, 0, 14, 17,
+            HWND(std::ptr::null_mut()),
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        )
+        .unwrap_or_default();
+        if hwnd.0.is_null() {
+            return 0;
+        }
+        // 画锁位图（预乘 alpha）：锁环白描边 + 锁体白填充
+        let (w, h) = (14i32, 17i32);
+        let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
+        let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
+            bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = match CreateDIBSection(hdc, &bmi as *const _, windows::Win32::Graphics::Gdi::DIB_USAGE(0), &mut bits, None, 0) {
+            Ok(d) if !bits.is_null() => d,
+            _ => {
+                let _ = DeleteDC(hdc);
+                return 0;
+            }
+        };
+        let old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+        // 黑底（透明）上画白锁
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
+        let pen = CreatePen(PS_SOLID, 2, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
+        let oldb = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+        let oldp = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
+        // 锁体（圆角矩形填充）
+        let _ = RoundRect(hdc, 1, 8, 13, 16, 3, 3);
+        // 锁环（上半弧描边）
+        let _ = Arc(hdc, 3, 1, 11, 11, 11, 6, 3, 6);
+        let _ = SelectObject(hdc, oldb);
+        let _ = SelectObject(hdc, oldp);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
+        // GDI 不写 alpha：非黑像素 alpha 置 255（预乘已满足，白=255×1.0）
+        {
+            let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+            for i in (0..px.len()).step_by(4) {
+                if px[i] != 0 || px[i + 1] != 0 || px[i + 2] != 0 {
+                    px[i + 3] = 255;
+                } else {
+                    px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 0;
+                }
+            }
+        }
+        // ULW 上屏（窗口保持隐藏，显示由 ShowWindow 控制）
+        let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+            BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 235, AlphaFormat: 1,
+        };
+        let pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        let sz = windows::Win32::Foundation::SIZE { cx: w, cy: h };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&windows::Win32::Foundation::POINT { x: 0, y: 0 } as *const windows::Win32::Foundation::POINT),
+            Some(&sz as *const windows::Win32::Foundation::SIZE),
+            hdc,
+            Some(&pt as *const windows::Win32::Foundation::POINT),
+            windows::Win32::Foundation::COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+        let _ = DeleteDC(hdc);
+        *LOCK_HWND.lock().unwrap() = Some(hwnd.0 as isize);
+        hwnd.0 as isize
+    }
+}
+
+/// 右键固定：立即显示锁（定位于候选窗内容区右上角附近）
+fn lockwin_show_at(cand: HWND) {
+    let h = lockwin_create();
+    if h == 0 {
+        return;
+    }
+    unsafe {
+        let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let _ = GetWindowRect(cand, &mut wr);
+        let x = wr.right - 18;
+        let y = wr.top + 5;
+        let _ = SetWindowPos(HWND(h as _), HWND(std::ptr::null_mut()), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        let _ = ShowWindow(HWND(h as _), SW_SHOWNOACTIVATE);
+    }
+}
+
+/// 解除固定/失焦隐藏锁
+fn lockwin_hide() {
+    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+        unsafe {
+            let _ = ShowWindow(HWND(h as _), SW_HIDE);
+        }
+    }
+}
+
+/// 候选窗移动时联动锁窗（仅当固定中）
+fn lockwin_follow(cand: HWND) {
+    if CAND_PINNED.lock().unwrap().is_none() {
+        return;
+    }
+    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+        unsafe {
+            if IsWindow(HWND(h as _)).as_bool() {
+                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let _ = GetWindowRect(cand, &mut wr);
+                let _ = SetWindowPos(
+                    HWND(h as _),
+                    HWND(std::ptr::null_mut()),
+                    wr.right - 18,
+                    wr.top + 5,
+                    0, 0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
 
 unsafe extern "system" fn defwindowproc_w(
     hwnd: HWND,
