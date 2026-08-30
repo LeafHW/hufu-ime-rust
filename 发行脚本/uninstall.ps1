@@ -60,9 +60,33 @@ if ($hklm) {
     Remove-Item "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "HKLM:\SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
-    # SystemIME 副本（打包进程可读版 DLL）一并清除
-    Remove-Item 'C:\Windows\SystemIME\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
+    # 全局分类库条目（8 项 TIP 分类 + MASTER，安装器双写对应清理）
+    $lmCat = 'HKLM:\SOFTWARE\Microsoft\CTF\Category'
+    $catAll = @(
+        '{046B8C80-1647-40F7-9B21-B93B81AABC1B}', '{13A016DF-560B-46CD-947A-4C3AF1E0E35D}',
+        '{25504FB4-7BAB-4BC1-9C69-CF81890F0EF5}', '{34745C63-B2F0-4784-8B67-5E12C8701A31}',
+        '{364215D9-75BC-11D7-A6EF-00065B84435C}', '{49D2F9CE-1F5E-11D7-A6D3-00065B84435C}',
+        '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}', '{CCF05DD7-4A87-11D7-A6E2-00065B84435C}',
+        '{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}'
+    )
+    foreach ($c in $catAll) {
+        Remove-Item "$lmCat\Category\$c\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item "$lmCat\Item\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+    # SystemIME 副本；被运行中宿主占用时腾位改名（下次系统清理/重启后消失）
+    $sysdir = 'C:\Windows\SystemIME\HuFu'
+    if (Test-Path $sysdir) {
+        Remove-Item $sysdir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $sysdir) {
+            $n = 1; while (Test-Path "$sysdir.old$n") { $n++ }
+            Rename-Item $sysdir "HuFu.old$n" -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # 诊断画像（load-*/act-*.txt，几十 KB）
+    Remove-Item 'C:\ProgramData\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
 }
+# 临时安装/提权日志（%TEMP%\hufu-*.log）
+Get-ChildItem "$env:TEMP\hufu-*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # 6) 刷新宿主
 Stop-Process -Name TextInputHost, ShellExperienceHost, ctfmon -Force -ErrorAction SilentlyContinue
