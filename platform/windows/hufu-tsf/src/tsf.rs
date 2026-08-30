@@ -972,11 +972,18 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: Clone 失败");
         return;
     };
-    // 候选窗锚定组段【起始】位置（非光标/末尾）：编码每加一键组段
-    // 变长，锚 END 会带着候选窗逐字符右移——打字快时窗口不停挪动
-    // （跟打器实测「在光标附近跳」）。锚 START 则整段编码期间位置
-    // 恒定，新组段才换地方（微软拼音/搜狗同款行为）。
-    if unsafe { caret.Collapse(ec, TF_ANCHOR_START) }.is_err() {
+    // 候选窗锚点按宿主分化：
+    // - 跟随宿主（晴跟打器类，整句长编码场景）：锚 END（光标处）。
+    //   长编码段光标持续前进，窗钉在段首会越离越远（实测 w 涨到
+    //   800px 仍 x 恒定）。此类宿主布局同步（候选不跳），跟随不晃。
+    // - 其余宿主（含虎魄跟打器）：锚 START（组段起始）——编码期间
+    //   位置恒定，逐键右移的「跳」由此消除；首帧错位另由稳定期抑制。
+    let anchor = if host_follow_caret() {
+        TF_ANCHOR_END
+    } else {
+        TF_ANCHOR_START
+    };
+    if unsafe { caret.Collapse(ec, anchor) }.is_err() {
         trace("qc: Collapse 失败");
         return;
     };
@@ -1610,6 +1617,20 @@ fn host_async_layout() -> bool {
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
             .map(|n| n.contains("跟打"))
+            .unwrap_or(false)
+    })
+}
+
+/// 跟随光标宿主（晴跟打器类）：整句长编码场景，候选窗需随光标前进
+/// （锚 END）。此类宿主布局同步、GetTextExt 稳定，跟随不会产生跳动。
+/// 其余宿主（含虎魄跟打器）锚组段起点——段内位置恒定。
+fn host_follow_caret() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(|n| n.contains("晴"))
             .unwrap_or(false)
     })
 }
