@@ -879,7 +879,6 @@ pub fn hide() {
 /// 在 tray 线程创建（消息循环已有）：注册类 + 分层隐藏窗口
 pub fn init_on_tray_thread() {
     let class: Vec<u16> = "HuFuSrvCand\0".encode_utf16().collect();
-    let arrow: Vec<u16> = [32512u16].to_vec(); // IDC_ARROW
     let wc = WNDCLASSW {
         style: 0,
         lpfnWndProc: wnd_proc,
@@ -887,8 +886,11 @@ pub fn init_on_tray_thread() {
         cbWndExtra: 0,
         hInstance: 0,
         hIcon: 0,
-        // NULL 类光标 = 鼠标移入显示忙碌光标（沙漏/转圈）——设箭头
-        hCursor: unsafe { LoadCursorW(0, arrow.as_ptr()) },
+        // NULL 类光标 = 鼠标移入显示忙碌光标（沙漏/转圈）——设箭头。
+        // 【坑】IDC_ARROW 是 MAKEINTRESOURCE(32512)：指针**数值本身**
+        // 是 32512（序数资源 ID），不是指向 32512 的缓冲区——此前
+        // 传 Vec 堆地址令 LoadCursorW 静默失败回 NULL，转圈依旧。
+        hCursor: unsafe { LoadCursorW(0, 32512 as *const u16) },
         hbrBackground: 0,
         lpszMenuName: std::ptr::null(),
         lpszClassName: class.as_ptr(),
