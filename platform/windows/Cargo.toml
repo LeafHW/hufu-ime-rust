@@ -9,3 +9,6 @@ license = "MIT"
 
 [profile.release]
 lto = "thin"
+# 调试：保留符号（PDB）——冻结事故栈偏移→函数名解析（2026-08-31
+# VSCode 点击冻结取证依赖）。产物稍大，不影响运行性能。
+debug = true
