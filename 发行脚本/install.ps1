@@ -198,9 +198,15 @@ if (-not $NoHKLM) {
         & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
     }
 } else {
-        Write-Host '· -NoHKLM：跳过提权（开发/调试用）。注意：msctf 输入法注册'
-        Write-Host '  需机器级写入（TSF 平台限制）；本模式装出的输入法不可打字，'
-        Write-Host '  除非本机已有历史机器级注册。'
+        # 本机已有机器级底座（SystemIME/HKLM 档案/8 分类）时，每用户装
+        # 即全功能（含开始菜单/UWP）；全新机器首次安装仍需提权一次。
+        $hasBase = (Test-Path $sysdll) -and (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID")
+        if ($hasBase) {
+            Write-Host '· 每用户安装（本机已有机器级底座）：功能完整可用。'
+        } else {
+            Write-Host '· -NoHKLM 且本机无机器级底座：输入法将不可用。全新机器'
+            Write-Host '  首次安装请不带 -NoHKLM 运行（一次 UAC 完成机器级注册）。'
+        }
         & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
 }
 
@@ -272,4 +278,5 @@ Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载�
 if ($legacy -and (Test-Path (Join-Path $legacy 'hufu-server.exe'))) {
     Write-Host "  · 记得删除旧版目录释放 ${mb}MB：$legacy"
 }
-if ($NoHKLM -or -not (Test-Path $sysdll)) { Write-Host '  · 每用户安装：开始菜单搜索框不可用虎符（系统限制）' }
+$perUserFull = $NoHKLM -and (Test-Path $sysdll) -and (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID")
+if (-not (Test-Path $sysdll)) { Write-Host '  · 本机未做机器级注册：开始菜单/UWP 暂不可用（下次以管理员运行安装器一次即可）' }
