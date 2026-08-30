@@ -292,8 +292,22 @@ impl SentenceEngine {
         });
 
         let allow_all_ranks = n <= 4;
+        // 长句 beam 分档（性能）：解码耗时随长度超线性增长（22键≈15ms、
+        // 48键≈340ms），打长句时每键 300ms+ 而打字约 150ms/键，滞后累积
+        // 出现「编码打完了候选还在逐字录入」。长句时优质路径早已大幅领
+        // 先，尾部宽度的边际收益极小——按长度降档用极小的质量代价换回
+        // 响应速度。分档界与比例经 100 句基准回归校准。
+        let beam = if n <= 16 {
+            w.beam_width
+        } else if n <= 24 {
+            (w.beam_width * 3 / 5).max(400)
+        } else if n <= 32 {
+            (w.beam_width * 2 / 5).max(300)
+        } else {
+            (w.beam_width / 5).max(240)
+        };
         for pos in 0..n {
-            buckets[pos].limit(w.beam_width);
+            buckets[pos].limit(beam);
             for state in buckets[pos].snapshot() {
                 for (code_len, entries) in &segs[pos] {
                     let end = pos + code_len;
@@ -440,7 +454,7 @@ impl SentenceEngine {
             if !self.incomplete_tail(tail) {
                 continue;
             }
-            buckets[consumed].limit(w.beam_width);
+            buckets[consumed].limit(beam);
             let partial = buckets[consumed].snapshot();
             if !partial.is_empty() {
                 uses_incomplete = true;
