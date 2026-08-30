@@ -29,7 +29,7 @@ $list = Get-WinUserLanguageList
 foreach ($l in $list) {
     if ($l.InputMethodTips -contains $tipStr) {
         $l.InputMethodTips.Remove($tipStr) | Out-Null
-        Set-WinUserLanguageList $list -Force
+        Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
         break
     }
 }
