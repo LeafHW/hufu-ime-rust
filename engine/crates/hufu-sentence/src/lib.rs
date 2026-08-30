@@ -240,6 +240,14 @@ impl SentenceEngine {
                 if code_len == 0 || pos + code_len > n {
                     continue;
                 }
+                // 一简禁令（对齐虎爪规范）：句中（n>4）不允许 1 码段——
+                // 26 一简字在整句里必须打 2 码全码，其 1 码形式不参与
+                // 组句。n≤4 是短码查词场景（对齐虎爪「总长≤4 检索全部
+                // 字词」）保持宽容。虎码 1 码字即一简专属，此过滤等价
+                // 于「一简单码禁入句」。
+                if code_len == 1 && n > 4 {
+                    continue;
+                }
                 let entries: Vec<(String, usize)> = idxs
                     .iter()
                     .enumerate()
