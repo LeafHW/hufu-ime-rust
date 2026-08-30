@@ -106,6 +106,10 @@ pub struct GgufFile {
     pub data_start: u64,
     pub data: Vec<u8>,
     path: Option<String>,
+    /// 懒模式 mmap：整个数据段只读映射一次（页缓存按需填充）。
+    /// 此前每 tile 一次 File::open+seek_read（~1064 次/前向，~140ms
+    /// 纯句柄开销）；mmap 后读权重=零系统调用。
+    map: Option<memmap2::Mmap>,
 }
 
 struct Rd<R: Read> {
@@ -278,13 +282,22 @@ impl GgufFile {
         let mut data = Vec::with_capacity(data_len);
         f.seek(SeekFrom::Start(data_start))?;
         f.take(data_len as u64).read_to_end(&mut data)?;
-        Ok(Self { meta, tensors, data_start, data, path: None })
+        Ok(Self { meta, tensors, data_start, data, path: None, map: None })
     }
 
     /// 只解析头部，数据按需从磁盘流式读（f32 大文件用，低内存）
     pub fn open_lazy(path: &str) -> std::io::Result<Self> {
         let mut probe = Self::open_header(path)?;
         probe.path = Some(path.to_string());
+        // 数据段整体 mmap（只读共享映射，页缓存按需）——raw_rows 零系统调用
+        let flen = std::fs::metadata(path)?.len();
+        if flen > probe.data_start {
+            if let Ok(f) = std::fs::File::open(path) {
+                if let Ok(m) = unsafe { memmap2::MmapOptions::new().len(flen as usize).map(&f) } {
+                    probe.map = Some(m);
+                }
+            }
+        }
         Ok(probe)
     }
 
@@ -326,7 +339,7 @@ impl GgufFile {
         }
         let pos = f.stream_position()?;
         let data_start = pos.div_ceil(32) * 32;
-        Ok(Self { meta, tensors, data_start, data: Vec::new(), path: None })
+        Ok(Self { meta, tensors, data_start, data: Vec::new(), path: None, map: None })
     }
 
     pub fn is_lazy(&self) -> bool {
@@ -343,6 +356,16 @@ impl GgufFile {
             let start = info.offset as usize + p0 * row_bytes;
             buf.copy_from_slice(&self.data[start..start + len]);
             Ok(buf)
+        } else if let Some(m) = &self.map {
+            // mmap 热路径：零 open/零 read 系统调用（map 覆盖整个文件，
+            // 张量偏移需加 data_start）
+            let off = self.data_start as usize + info.offset as usize + p0 * row_bytes;
+            if off + len <= m.len() {
+                buf.copy_from_slice(&m[off..off + len]);
+                Ok(buf)
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mmap 越界"))
+            }
         } else {
             use std::os::windows::fs::FileExt;
             let start = self.data_start + info.offset + (p0 * row_bytes) as u64;
@@ -369,6 +392,32 @@ impl GgufFile {
         }
     }
 
+    /// Q8_0 单行 AVX2 反量化（k 为 32 的倍数；32×i8 = 2×128bit = 4 组 8 lane）。
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn dequant_q8_0_row_avx2(raw: &[u8], blocks: usize, out: &mut Vec<f32>) {
+        use std::arch::x86_64::*;
+        let pre = out.len();
+        out.resize(pre + blocks * 32, 0.0);
+        let dst = &mut out[pre..];
+        for b in 0..blocks {
+            let off = b * 34;
+            let scale = f16_to_f32(raw[off], raw[off + 1]);
+            let s = _mm256_set1_ps(scale);
+            // 32 个 int8：两条 128bit 载入，各拆 low/high 64bit → 4 组 8×i32→f32
+            let a0 = _mm_loadu_si128(raw.as_ptr().add(off + 2) as *const __m128i);
+            let a1 = _mm_loadu_si128(raw.as_ptr().add(off + 2 + 16) as *const __m128i);
+            let base = dst.as_mut_ptr().add(b * 32);
+            let w0 = _mm256_cvtepi8_epi32(a0);
+            let w1 = _mm256_cvtepi8_epi32(_mm_unpackhi_epi64(a0, a0));
+            let w2 = _mm256_cvtepi8_epi32(a1);
+            let w3 = _mm256_cvtepi8_epi32(_mm_unpackhi_epi64(a1, a1));
+            _mm256_storeu_ps(base, _mm256_mul_ps(_mm256_cvtepi32_ps(w0), s));
+            _mm256_storeu_ps(base.add(8), _mm256_mul_ps(_mm256_cvtepi32_ps(w1), s));
+            _mm256_storeu_ps(base.add(16), _mm256_mul_ps(_mm256_cvtepi32_ps(w2), s));
+            _mm256_storeu_ps(base.add(24), _mm256_mul_ps(_mm256_cvtepi32_ps(w3), s));
+        }
+    }
+
     /// 原始字节 → f32 行主 [pn, k]
     pub fn dequant_rows_bytes(info: &TensorInfo, raw: &[u8], pn: usize) -> Vec<f32> {
         let k = info.shape[0];
@@ -376,9 +425,18 @@ impl GgufFile {
         let mut out = Vec::with_capacity(pn * k);
         match info.dtype {
             GgmlDType::Q8_0 => {
+                // AVX2 向量反量化：一块 32×i8 恰为 4 组 8 lane，标量循环的
+                // ~6-8 倍（实测单候选前向 790ms 中 dequant 是大头）。
+                static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let avx2 = *AVX2
+                    .get_or_init(|| std::arch::is_x86_feature_detected!("avx2"));
                 let blocks = k.div_ceil(32);
                 for r in 0..pn {
                     let ro = r * rb;
+                    if avx2 && k % 32 == 0 {
+                        unsafe { Self::dequant_q8_0_row_avx2(&raw[ro..ro + blocks * 34], blocks, &mut out) };
+                        continue;
+                    }
                     for b in 0..blocks {
                         let off = ro + b * 34;
                         let scale = f16_to_f32(raw[off], raw[off + 1]);
