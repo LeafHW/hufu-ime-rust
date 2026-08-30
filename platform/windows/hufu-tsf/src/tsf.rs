@@ -399,10 +399,12 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         //    放弃提交——切焦点丢半个未成词，不可拿宿主冻结换。
         if composing && !preedit.is_empty() {
             let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
+            trace("foc: A 取ctx");
             if let Some(ctx) = prev_ctx {
                 let _ = run_session_sync_only(&self.shared, Op::Commit(preedit.clone()), ctx);
             }
         }
+        trace("foc: B commit完");
         // 2) 引擎会话清零：focus 上报挪到工作线程（fire-and-forget）。
         //    【VSCode 冻结事故】此前在焦点回调里同步 ipc::call——server
         //    端 dispatch 持全局 Host 锁，任何长操作（如切方案重装整句）
@@ -413,8 +415,10 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         std::thread::spawn(|| {
             let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
         });
+        trace("foc: C spawn完");
         {
             let mut g = self.shared.lock().unwrap();
+            trace("foc: D 拿锁");
             g.composition = None; // 死组段句柄必须丢，后续走全新 StartPreedit
             g.composing = false;
             g.raw_last.clear();
@@ -423,10 +427,12 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
+            trace("foc: E hide完");
             if let Some(c) = g.cand.take() {
                 c.hide();
             }
         }
+        trace("foc: F 返回前");
         Ok(())
     }
 
