@@ -166,22 +166,42 @@ impl Host {
         std::thread::Builder::new()
             .name("hufu-rerank".into())
             .spawn(move || {
+                // ── 双引擎：优先虎爪 llama.cpp 原生（81ms/2cand），失败回落纯 Rust ──
+                // 两引擎同 GGUF 文件、同判序语义（native 侧 ctx 拼串整句概率，
+                // 句首/句中/成语三案实测全判对）。
+                let mut native: Option<hufu_rerank::native::NativeScorer> = None;
+                let mp = std::path::PathBuf::from(&model_path);
+                if let Some(ns) = hufu_rerank::native::NativeScorer::try_new(&[], &mp) {
+                    let _ = ns.score("。", &["预热".to_string()]);
+                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                    let _ = std::fs::write(
+                        r"C:\ProgramData\HuFu\diag\rerank-engine.txt",
+                        "native(llama.cpp)",
+                    );
+                    native = Some(ns);
+                } else {
+                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                    let _ = std::fs::write(
+                        r"C:\ProgramData\HuFu\diag\rerank-engine.txt",
+                        "rust(fallback)",
+                    );
+                }
                 let mut model: Option<hufu_rerank::Reranker> = None;
                 let mut model_failed = false;
-                // 预热：server 启动即后台加载模型并空跑一次前向（触页），
-                // 避免用户首次停顿重排等冷读盘 ~10s（体验即「重排没生效」）。
-                // GGUF_LAZY 页缓存机制不变——私有内存仍由页缓存承载。
-                {
-                    std::env::set_var("GGUF_LAZY", "1");
-                    match hufu_rerank::Reranker::load(&model_path) {
-                        Ok(r) => {
-                            let _ = r.score("。", &["预热".to_string()]);
-                            eprintln!("神经重排模型已预载: {model_path}");
-                            model = Some(r);
-                        }
-                        Err(e) => {
-                            eprintln!("神经重排模型预载失败（本进程内禁用）: {e}");
-                            model_failed = true;
+                if native.is_none() {
+                    // 预热：server 启动即后台加载模型并空跑一次前向（触页），
+                    // 避免用户首次停顿重排等冷读盘 ~10s（体验即「重排没生效」）。
+                    // GGUF_LAZY 页缓存机制不变——私有内存仍由页缓存承载。
+                    {
+                        std::env::set_var("GGUF_LAZY", "1");
+                        match hufu_rerank::Reranker::load(&model_path) {
+                            Ok(r) => {
+                                let _ = r.score("。", &["预热".to_string()]);
+                                model = Some(r);
+                            }
+                            Err(_e) => {
+                                model_failed = true;
+                            }
                         }
                     }
                 }
@@ -198,42 +218,40 @@ impl Host {
                     if cur.cands.len() < 2 {
                         continue;
                     }
-                    if model.is_none() && !model_failed {
-                        // 兜底：预热失败后仍尝试懒加载（页缓存可能已就绪）
-                        std::env::set_var("GGUF_LAZY", "1");
-                        match hufu_rerank::Reranker::load(&model_path) {
-                            Ok(r) => {
-                                eprintln!("神经重排模型已加载: {model_path}");
-                                model = Some(r);
-                            }
-                            Err(e) => {
-                                eprintln!("神经重排模型加载失败（本进程内禁用）: {e}");
-                                model_failed = true;
-                                continue;
+                    // 打分（native 优先；native 缺席时纯 Rust 懒加载兜底）
+                    let t_score = std::time::Instant::now();
+                    let scores: Option<Vec<f64>> = if let Some(ns) = &native {
+                        Some(ns.score(&cur.ctx, &cur.cands))
+                    } else {
+                        if model.is_none() && !model_failed {
+                            std::env::set_var("GGUF_LAZY", "1");
+                            match hufu_rerank::Reranker::load(&model_path) {
+                                Ok(r) => model = Some(r),
+                                Err(_e) => {
+                                    model_failed = true;
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    let Some(r) = &model else { continue };
-                    // 候选并行打分：各候选前向互相独立，多核同时算
-                    // （0.6B q8 每候选 ~1s 串行；3 候选并行墙钟≈单候选）。
-                    // Reranker 权重只读，score(&self) 线程安全。
-                    let t_score = std::time::Instant::now();
-                    let scores: Vec<f64> = std::thread::scope(|s| {
-                        let handles: Vec<_> = cur
-                            .cands
-                            .iter()
-                            .map(|c| {
-                                let ctx = &cur.ctx;
-                                s.spawn(move || {
-                                    r.score(ctx, std::slice::from_ref(c))[0]
+                        let Some(r) = &model else { continue };
+                        Some(std::thread::scope(|s| {
+                            let handles: Vec<_> = cur
+                                .cands
+                                .iter()
+                                .map(|c| {
+                                    let ctx = &cur.ctx;
+                                    s.spawn(move || {
+                                        r.score(ctx, std::slice::from_ref(c))[0]
+                                    })
                                 })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap_or(f64::NEG_INFINITY))
-                            .collect()
-                    });
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().unwrap_or(f64::NEG_INFINITY))
+                                .collect()
+                        }))
+                    };
+                    let Some(scores) = scores else { continue };
                     let elapsed = t_score.elapsed().as_millis();
                     let mut order: Vec<(f64, String)> = scores
                         .into_iter()
