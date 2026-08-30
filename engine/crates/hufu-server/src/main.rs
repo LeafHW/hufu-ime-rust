@@ -30,7 +30,7 @@ const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 /// 零依赖直声明（与 pipe/tray 同风格）；std 句柄懒初始化，Attach 成功后
 /// 首次 println 即可写入父控制台。
 #[cfg(windows)]
-fn attach_console_for_dev(force: bool) {
+fn attach_console_for_dev(force: bool, dev_attach: bool) {
     const ATTACH_PARENT_PROCESS: usize = usize::MAX;
     // windows-sys 原型（保持零特性门）
     #[link(name = "kernel32")]
@@ -45,7 +45,10 @@ fn attach_console_for_dev(force: bool) {
         }
         if force {
             let _ = AllocConsole();
-        } else {
+        } else if dev_attach {
+            // 仅开发显式开关（HUFU_DEV_CONSOLE=1）时接回父控制台；默认零
+            // 输出——安装器/Run/DLL 自愈等任何拉起方都静默（用户实测反馈：
+            // 安装窗口出现装载日志会吓到人）。
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
@@ -54,8 +57,9 @@ fn attach_console_for_dev(force: bool) {
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
-        let want_console = std::env::args().any(|a| a == "--console");
-        attach_console_for_dev(want_console);
+        let force = std::env::args().any(|a| a == "--console");
+        let dev = std::env::var("HUFU_DEV_CONSOLE").map(|v| v == "1").unwrap_or(false);
+        attach_console_for_dev(force, dev);
     }
     let mut args = std::env::args().skip(1);
     let mut data_dir = std::env::var("HUFU_DATA")
