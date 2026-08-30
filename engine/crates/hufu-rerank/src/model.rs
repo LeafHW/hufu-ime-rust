@@ -37,9 +37,11 @@ fn rerank_pool() -> &'static rayon::ThreadPool {
         let n = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(4)
-            .min(14) // 停顿期重排全速：16 核机用 14（留 2 核给系统/宿主）。
-            // 早期 min(6) 是打字期保守值——重排发生在停顿期（无前台按键），
-            // BELOW_NORMAL 优先级已足够防卡顿，核数不必再省。
+            // 6 线程封顶：实测 16 核机 14 线程推理会抢内存带宽，慢速打字
+            // （>350ms/键触发重排）时下一键解码从 ~30ms 拖到 150-170ms——
+            // CPU 优先级（BelowNormal）让核但不让内存带宽/L3。6 线程推理
+            // 稍慢（停顿期 ~500ms 内仍可完成）而打字跟手。
+            .min(6)
             .max(2);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
