@@ -802,40 +802,6 @@ impl Engine {
         // 顶功：超长（第 max+1 码）或死路（新码无任何延续）
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
         let over_length = len > max_len;
-
-        // 整句空码自动顶屏（虎爪 2026-08-30 热修 SentenceEmptyCodeAutoCommit
-        // 同款，用户实测反馈「自动上屏积极度提高」的核心）：追加后组句无
-        // 候选（虎爪判定=无以已提交文本开头的完整候选路径），若追加前唯一
-        // 候选仍待顶、余码（去掉已提交 raw 后的部分，含刚按下的键）仍是
-        // 正常码前缀——则把待顶部分上屏，余码重新起句。句中（已有早提交
-        // 部分）同样触发，避免整句打字被卡住。
-        //
-        // 候选形态注意：我们的整句候选是「剩余文本」（早提交后不含已提交
-        // 前缀），虎爪是全文形态（StartsWith(committed) 检查）——在我们
-        // 的形态下该检查天然成立，待顶文本就是候选本身。
-        if sentence_mode
-            && self.config.sentence.empty_code_auto_commit
-            && session.candidates.is_empty()
-            && prev_cands.len() == 1
-        {
-            let cand = &prev_cands[0];
-            if !cand.text.is_empty() {
-                let rest = cand.text.clone();
-                let base_len = session.committed_raw.chars().count();
-                let tail_raw: String = raw.chars().skip(base_len).collect();
-                if !rest.is_empty() && !tail_raw.is_empty() && self.has_continuation(&tail_raw) {
-                    session.pending_commit = Some(rest);
-                    session.raw = tail_raw;
-                    session.committed_raw.clear();
-                    session.committed_text.clear();
-                    session.early_history.clear();
-                    session.early_suspended = false;
-                    self.refresh_candidates(session);
-                    return;
-                }
-            }
-        }
-
         if (over_length || dead_end) && !sentence_mode && self.config.input.auto_push && !has_upper
         {
             if let Some(first) = prev_cands.first().cloned() {
