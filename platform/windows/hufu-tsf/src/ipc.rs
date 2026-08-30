@@ -242,13 +242,13 @@ pub fn call(req: &Value) -> Option<Value> {
     }
 }
 
-/// 按键请求 → (consumed, commit, state, sound)
+/// 按键请求 → (consumed, commit, back, state, sound)
 pub fn key_request(
     key: &str,
     shift: bool,
     ctrl: bool,
     alt: bool,
-) -> Option<(bool, String, Value, Option<String>)> {
+) -> Option<(bool, String, u8, Value, Option<String>)> {
     let resp = call(&serde_json::json!({
         "op": "key",
         "key": key,
@@ -261,12 +261,13 @@ pub fn key_request(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let back = outcome.get("back").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let state = resp.get("state").cloned().unwrap_or(Value::Null);
     let sound = outcome
         .get("sound")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    Some((consumed, commit, state, sound))
+    Some((consumed, commit, back, state, sound))
 }
 
 /// 唤醒：探测服务器是否在。

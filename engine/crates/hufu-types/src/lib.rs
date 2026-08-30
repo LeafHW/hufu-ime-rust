@@ -137,6 +137,9 @@ pub struct KeyOutcome {
     /// 需要立即上屏的文本（可与会话状态同时存在：顶功上屏后继续组合）
     #[serde(default)]
     pub commit: Option<String>,
+    /// 提交前需回删的已上屏字符数（数字后「1.」再按 . → 回删半角点换「。」）
+    #[serde(default)]
+    pub back: u8,
     /// 最新的会话状态（组合串 / 候选 / 辅助提示）
     pub state: Option<SessionState>,
     /// 提示音标签（sound.enabled 时由引擎填充：key/select/commit/page）
@@ -149,6 +152,7 @@ impl KeyOutcome {
         KeyOutcome {
             consumed: false,
             commit: None,
+            back: 0,
             state: None,
             sound: None,
         }
@@ -157,6 +161,7 @@ impl KeyOutcome {
         KeyOutcome {
             consumed: true,
             commit: None,
+            back: 0,
             state: Some(state),
             sound: None,
         }
@@ -165,6 +170,7 @@ impl KeyOutcome {
         KeyOutcome {
             consumed: true,
             commit: Some(text.into()),
+            back: 0,
             state: Some(state),
             sound: None,
         }

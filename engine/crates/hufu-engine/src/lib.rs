@@ -633,9 +633,18 @@ impl Engine {
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
             }
+            // 空态数字：直通（系统原生半角上屏），但记入跨句尾巴——
+            // 数字后的标点半角化（1.5 / 3.14 / 2,500）依赖 tail 判
+            // 「上一个已上屏字符是 ASCII 数字」；不记则判不出。
+            if c.is_ascii_digit() {
+                session.tail_context.push(c);
+                return KeyOutcome::passthrough();
+            }
             // 标点
-            if let Some(text) = self.punct_output(session, c) {
-                return KeyOutcome::commit(text, self.state(session));
+            if let Some((text, back)) = self.punct_output(session, c) {
+                let mut o = KeyOutcome::commit(text, self.state(session));
+                o.back = back;
+                return o;
             }
             return KeyOutcome::passthrough();
         }
@@ -704,14 +713,18 @@ impl Engine {
             return self.select_first(session);
         }
         // 编码态标点：顶字（提交首选后输出标点）
-        if let Some(punct) = self.punct_output(session, c) {
+        if let Some((punct, back)) = self.punct_output(session, c) {
             if !session.candidates.is_empty() {
                 let first = session.candidates[0].commit_text().to_string();
                 session.clear();
-                return KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
+                let mut o = KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
+                o.back = back;
+                return o;
             }
             session.clear();
-            return KeyOutcome::commit(punct, self.state(session));
+            let mut o = KeyOutcome::commit(punct, self.state(session));
+            o.back = back;
+            return o;
         }
         if c.is_ascii_alphanumeric() {
             return KeyOutcome::consumed(self.state(session));
@@ -719,22 +732,38 @@ impl Engine {
         KeyOutcome::passthrough()
     }
 
-    /// 标点输出（全角/半角/引号配对）。
-    fn punct_output(&mut self, session: &mut Session, c: char) -> Option<String> {
+    /// 标点输出（全角/半角/引号配对/数字后点半角化）。
+    /// 返回 (文本, 提交前回删数)——back>0 用于「1.」再按 . 替换为「。」。
+    fn punct_output(&mut self, session: &mut Session, c: char) -> Option<(String, u8)> {
         if !c.is_ascii_punctuation() {
             return None;
         }
         if self.config.input.ascii_punct {
-            return Some(c.to_string());
+            return Some((c.to_string(), 0));
+        }
+        // 数字后的标点半角化（对齐 Rime/虎爪）：已上屏尾是 ASCII 数字时，
+        // . 与 , 直通半角（1.5 / 3.14 / 2,500）；尾恰是刚直通的半角 . 时
+        // 再按 . → 回删替换为全角句号（「1.」后想打中文句号的通道）。
+        let tail_last = session.tail_context.chars().last();
+        if c == '.' || c == ',' {
+            if tail_last == Some('.') && c == '.' {
+                // 上一键刚直通半角点：本键语义为中文句号，回删替换
+                return Some(("。".into(), 1));
+            }
+            if let Some(t) = tail_last {
+                if t.is_ascii_digit() {
+                    return Some((c.to_string(), 0));
+                }
+            }
         }
         if self.config.punct.pair_brackets {
             if let Some(q) = session.pair.quote(c) {
-                return Some(q.to_string());
+                return Some((q.to_string(), 0));
             }
         } else if c == '\'' || c == '"' {
-            return Some(c.to_string());
+            return Some((c.to_string(), 0));
         }
-        punct::to_full_width_punct(c)
+        punct::to_full_width_punct(c).map(|s| (s, 0))
     }
 
     /// 编码追加后的顶功 / 自动上屏 / 快符唯一上屏判定。
