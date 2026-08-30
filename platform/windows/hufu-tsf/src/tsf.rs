@@ -968,7 +968,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: Clone 失败");
         return;
     };
-    if unsafe { caret.Collapse(ec, TF_ANCHOR_END) }.is_err() {
+    // 候选窗锚定组段【起始】位置（非光标/末尾）：编码每加一键组段
+    // 变长，锚 END 会带着候选窗逐字符右移——打字快时窗口不停挪动
+    // （跟打器实测「在光标附近跳」）。锚 START 则整段编码期间位置
+    // 恒定，新组段才换地方（微软拼音/搜狗同款行为）。
+    if unsafe { caret.Collapse(ec, TF_ANCHOR_START) }.is_err() {
         trace("qc: Collapse 失败");
         return;
     };
