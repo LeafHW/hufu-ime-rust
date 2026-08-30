@@ -1327,7 +1327,7 @@ fn lockwin_create() -> isize {
                 return 0;
             }
         };
-        let old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+        let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
         // 黑底（透明）上画白锁
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
         let pen = CreatePen(PS_SOLID, 2, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
@@ -1339,9 +1339,13 @@ fn lockwin_create() -> isize {
         let _ = Arc(hdc, 3, 1, 11, 11, 11, 6, 3, 6);
         let _ = SelectObject(hdc, oldb);
         let _ = SelectObject(hdc, oldp);
-        let _ = SelectObject(hdc, old);
         let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
         let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
+        // 【关键】此处【不可】把 DIB 选出 DC——ULW 用 hdcSrc 当前选入
+        // 的位图上屏，提前恢复 old（空 1x1 单色位图）会让锁窗内容
+        // 全空（vis=1 但屏幕上无锁——Chrome/QQ/跟打器全看不见的
+        // 病根；PS 验证版没做恢复所以显示成功）。位图随 DC 一起销毁
+        // 即可，old 无须恢复。
         // GDI 不写 alpha：非黑像素 alpha 置 255（预乘已满足，白=255×1.0）
         {
             let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);

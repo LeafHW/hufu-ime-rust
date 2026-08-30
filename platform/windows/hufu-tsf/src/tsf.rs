@@ -1090,13 +1090,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 键跳正——cw2 show y 序列实测 1092→1175 / 1166→1286）。首帧
         // 110ms 内不显示，等第二键或轮询在布局稳定后以正确位置补显，
         // 全程零跳变。同步布局宿主（记事本等）不受影响。
-        // （220ms→110ms：用户实测「首键候选慢半拍」；异步布局通常
-        // 1-2 帧 ~60ms 完成，110ms 足覆盖，配合轮询提速最坏 ~250ms）
+        // （220→110→60ms：用户连续两轮实测「首键候选慢半拍」；异步
+        // 布局 1-2 帧 ~33-66ms，60ms 是防跳变下限，配 140ms 轮询）
         let first_frame_unstable = host_async_layout()
             && !raw.is_empty()
             && raw.len() <= 1
             && g.raw_changed_at
-                .is_some_and(|t| t.elapsed().as_millis() < 110);
+                .is_some_and(|t| t.elapsed().as_millis() < 60);
         let suppress = first_frame_unstable
             || (g.delay_show_ms > 0
                 && !raw.is_empty()
