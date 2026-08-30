@@ -166,12 +166,19 @@ try {
     Check '[愈] 引擎存活' (@($rt.candidates)[0] -eq '的窒闷')
 } catch { Check '[愈] 引擎存活' $false }
 
-# ── H) 中英状态牌（宿主挂载）──
+# ── H) 中英状态牌（宿主挂载）+ DLL 加载画像 ──
 Remove-Item "$env:TEMP\hufu-langbar.log" -Force -ErrorAction SilentlyContinue
 & "$dir\hufu-tsf-smoke.exe" *> $null
 Start-Sleep -Seconds 1
 $lb = Get-Content "$env:TEMP\hufu-langbar.log" -Encoding UTF8 -ErrorAction SilentlyContinue | Out-String
 Check '[牌] langbar install ok' ($lb -match 'install ok')
+$loads = @(Get-ChildItem 'C:\ProgramData\HuFu\diag' -Filter 'load-*.txt' -ErrorAction SilentlyContinue)
+Check '[载] DLL 加载画像留痕' ($loads.Count -gt 0)
+
+# ── I) 新宿主默认输入法（记录；msctf 会在 ctfmon 重启时按 SortOrder
+#     重排 tips——平台行为，Insert(0) 尽力写默认位，不作硬性断言）──
+$tips0 = ((Get-WinUserLanguageList | Where-Object { $_.LanguageTag -like 'zh*' }).InputMethodTips)[0]
+Write-Host "    · 语言列表[0]=$(if ($tips0 -like "*$CLSID*") {'虎符（默认位达成）'} else {'系统重排后非虎符（平台行为，Win+空格 可切）'})"
 
 Write-Host "  ---- 第 $Round 轮: $pass OK / $fail FAIL ----" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })
 if ($failList) { $failList | ForEach-Object { Write-Host "    FAIL> $_" -ForegroundColor Red } }

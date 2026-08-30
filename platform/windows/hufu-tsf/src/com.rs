@@ -44,7 +44,11 @@ const CLSID_STR: &str = "{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}";
 pub const PROFILE_GUID: GUID = GUID::from_u128(0x8f5c2a11_3e77_4b9c_a1d4_9e0b7c2f5a88);
 const PROFILE_GUID_STR: &str = "{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}";
 
-/// 本 DLL 绝对路径（按地址反查模块）。
+/// 本 DLL 绝对路径（按地址反查模块）。pub 供加载画像（lib.rs）复用。
+pub fn self_path_for_diag() -> String {
+    self_path()
+}
+
 fn self_path() -> String {
     unsafe {
         let mut hmod = HMODULE::default();
@@ -177,7 +181,7 @@ pub fn register_server() -> HRESULT {
     // 语言档案（msctf AddLanguageProfile 最终也写这里；预写便于 per-user 识别）
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
-    let _ = reg_set(&lp, Some("Enable"), "1");
+    let _ = reg_set_dword(&lp, "Enable", 1); // DWORD（msctf 标准；REG_SZ 会被部分宿主忽略）
     // 档案图标（微软拼音同构写法：IconFile+IconIndex，无 Icon 字符串）。
     // IconFile 指向 DLL 自身（内嵌虎符图标资源，IconIndex=0）——路径无关，
     // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
