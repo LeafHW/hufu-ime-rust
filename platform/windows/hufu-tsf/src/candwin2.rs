@@ -43,6 +43,10 @@ extern "system" fn cand2_wndproc(
             0x202 => "lup",
             0x204 => "rdown",
             0x205 => "rup",
+            0x84 => "nchittest",
+            0x21 => "mactivate",
+            0xA1 => "ncldown",
+            0xA4 => "ncrdown",
             0x20 => "setcursor",
             0xA0 => "activate",
             _ => "",
@@ -51,6 +55,15 @@ extern "system" fn cand2_wndproc(
             crate::tsf::diag_note(&format!("cw2 mouse {tag} t={:?}", std::time::SystemTime::now()));
         }
     }
+    // 【NOREDIRECTIONBITMAP+DComp 窗的 hit-test 修正】DWM 按 visual
+    // 内容 alpha 判定命中：悬停时代码在候选字上命中，但阴影/圆角/
+    // 透明边缘按下会被判穿透——按钮消息根本不进 wndproc（QQ 实测
+    // setcursor/move 到达、ldown/rdown 从未出现）。显式返回
+    // HTCLIENT 强制整窗客户区命中。
+    if msg == 0x84 {
+        // WM_NCHITTEST → HTCLIENT
+        return LRESULT(1);
+    }
     // 【鼠标交互】左键按住拖拽移动候选窗；右键固定/解除固定位置。
     // 冻结事故教训（已修）：本窗口过程的按钮消息自持自理、绝不经
     // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
@@ -58,6 +71,7 @@ extern "system" fn cand2_wndproc(
     match msg {
         0x201 => {
             // WM_LBUTTONDOWN：记录拖拽偏移并捕获鼠标
+            crate::tsf::trace("cw2: ldown 到达");
             unsafe {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -116,6 +130,7 @@ extern "system" fn cand2_wndproc(
         }
         0x204 => {
             // WM_RBUTTONDOWN：固定/解除固定（锁标志即时反馈）
+            crate::tsf::trace("cw2: rdown 到达");
             let mut pinned = CAND_PINNED.lock().unwrap();
             if pinned.is_some() {
                 *pinned = None;
