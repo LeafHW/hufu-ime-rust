@@ -316,9 +316,14 @@ impl SentenceEngine {
                     // 实测 zhh 首选变「其道」；虎爪/Rime 该码只有「虎」）。
                     let span = end - pos + if lock.is_some() { 1 } else { 0 };
                     if n > 1 && span < 2 {
-                        // 尾段豁免仅限：真整句（n>4）或顶功确认流（有锁）
+                        // 尾段豁免仅限顶功确认流（有选重锁，如 cn;j;c 的 c）。
+                        // 不做 n>4 豁免（虎爪 ExpandRange L385 无此豁免）：
+                        // 一简尾段禁掉后「syftuu」类组不出完整终态 → 候选
+                        // 空 → 空码自动顶屏把上一词（「让我」）顶上屏，
+                        // 这是虎爪「词边界顶屏节奏」的来源（用户实测：打
+                        // 下一词首键时上一词立刻上屏）。
                         let is_tail = end == n;
-                        let exempt = is_tail && (n > 4 || !parsed.locks.is_empty());
+                        let exempt = is_tail && !parsed.locks.is_empty();
                         if !exempt {
                             continue;
                         }
