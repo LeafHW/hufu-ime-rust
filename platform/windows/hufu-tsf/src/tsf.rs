@@ -479,29 +479,54 @@ impl HuFuTs_Impl {
                 self.shared.lock().unwrap().shift_pending = true;
                 return BOOL(0);
             }
-            // TestUp/KeyUp：pending 存活 = 单击切换 → fallthrough 发 server。
-            // pending 取走即天然去重：规范宿主 TestUp 直发后再来的 OnKeyUp
-            // 会因 pending=false 而直通，不会双发。
+            // TestUp/KeyUp：pending 存活 = 单击切换。直接发 server 并回填
+            // 缓存态（不走通用路径——update_ui 的回填被 !test_only 挡住，
+            // Test 阶段直发若不回填，g.chinese 停留旧值：英文态下字母
+            // TestDown 预判错报 TRUE → 宿主不产字、IME 也不产 → 字符
+            // 消失（跟打器「英文打不进」实测）。返回 BOOL(0) 不吞 keyup。
             let fire = {
                 let mut g = self.shared.lock().unwrap();
                 let f = g.shift_pending;
                 g.shift_pending = false;
                 f
             };
-            if !fire {
-                return BOOL(0);
+            if fire {
+                if let Some((consumed, _commit, _back, state, _sound)) =
+                    ipc::key_request("shift", false, false, false)
+                {
+                    if consumed {
+                        let zh = state
+                            .get("chinese")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let mut g = self.shared.lock().unwrap();
+                        if g.chinese != zh {
+                            g.chinese = zh;
+                            crate::langbar::set_mode(zh);
+                        }
+                        g.composing = !state
+                            .get("raw")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .is_empty();
+                    }
+                }
             }
+            return BOOL(0);
         } else {
             if !up {
                 // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
                 self.shared.lock().unwrap().shift_pending = false;
-            } else if !mode_key {
+            } else {
                 // 其余键的 keyup/testup 一律直通——放行字母 keyup 会造成
                 // 每键双发（「按一下等于按两下」回归）。
                 return BOOL(0);
             }
         }
         // ── 模式键直发 + 去重 ──
+        // 只在按下事件直发（TestDown 或 KeyDown）。松开（testup/keyup）
+        // 一律直通：实测按住 CapsLock 常 >80ms 去重窗，keyup 再直发会
+        // 把切换翻回去——净效果为零（「caps 无效」实测）。
         if mode_key {
             let dup = {
                 let g = self.shared.lock().unwrap();
@@ -574,7 +599,11 @@ impl HuFuTs_Impl {
         if !consumed {
             return BOOL(0);
         }
-        if !test_only {
+        if !test_only || mode_key {
+            // 模式键豁免 test 挡板：TestDown 直发切换后必须回填
+            // g.chinese/语言栏，否则预判用旧值、英文态错报 TRUE，
+            // 宿主不产字（「caps 切换后英文打不进」）。切换响应
+            // commit 为空、无组段副作用，update_ui 此时只做状态同步。
             if let Some(tag) = sound {
                 crate::sound::play(&tag);
             }
