@@ -398,8 +398,16 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
                 let _ = run_session(&self.shared, Op::Commit(preedit.clone()), Some(ctx));
             }
         }
-        // 2) 引擎会话清零（服务端 focus op 清空缓冲；本地缓存全部复位）
-        let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
+        // 2) 引擎会话清零：focus 上报挪到工作线程（fire-and-forget）。
+        //    【VSCode 冻结事故】此前在焦点回调里同步 ipc::call——server
+        //    端 dispatch 持全局 Host 锁，任何长操作（如切方案重装整句）
+        //    排队期间该请求悬死；客户端 read_exact 无超时 → UI 线程永久
+        //    冻结（实测「点击候选框应用未响应」）。focus 响应本就无需
+        //    读取，丢弃安全。焦点切换到下次按键至少隔数百 ms，管道
+        //    ms 级延迟不构成竞态。
+        std::thread::spawn(|| {
+            let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
+        });
         {
             let mut g = self.shared.lock().unwrap();
             g.composition = None; // 死组段句柄必须丢，后续走全新 StartPreedit
