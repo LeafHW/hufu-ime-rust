@@ -64,8 +64,7 @@ pub trait SentenceDecoder: Send + Sync {
             .hits
             .iter()
             .map(|h| {
-                let mut c =
-                    Candidate::new(h.text.clone(), raw.to_string(), CandidateKind::Sentence);
+                let mut c = Candidate::new(h.text.clone(), raw.to_string(), CandidateKind::Sentence);
                 c.weight = h.score;
                 c
             })
@@ -92,17 +91,8 @@ pub fn confidence_proposal(cands: &[&SentenceHit], threshold: f64) -> (String, f
             continue;
         }
         let mut prefix: Vec<char> = Vec::new();
-        // 前缀枚举到「候选全长 - 1」；多段候选（词组，如 syftu 的
-        // 「让我」）额外允许全长本身——词边界顶屏节奏（虎爪实测：打
-        // 下一词首键时上一词整词上屏）需要完整词作提案。单段候选不
-        // 允许（那是满码顶功的事）。
-        let segs = c.word_ends.len();
-        let last = if segs >= 2 {
-            chars.len()
-        } else {
-            chars.len() - 1
-        };
-        for _l in 1..=last {
+        for _l in 1..chars.len() {
+            // 真前缀（不含全长）
             prefix.push(chars[_l - 1]);
             if let Some((_, m)) = prefix_mass.iter_mut().find(|(p, _)| *p == prefix) {
                 *m += weight;
@@ -132,7 +122,10 @@ fn common_history_prefix(history: &[crate::session::EarlyHistory]) -> String {
     for e in history.iter().skip(1) {
         let chars: Vec<char> = e.proposal.chars().collect();
         let mut matched = 0usize;
-        while matched < common.len() && matched < chars.len() && common[matched] == chars[matched] {
+        while matched < common.len()
+            && matched < chars.len()
+            && common[matched] == chars[matched]
+        {
             matched += 1;
         }
         common.truncate(matched);
@@ -451,11 +444,7 @@ impl Engine {
                     // 目标：最近方案对的另一端；从未成对时（recent_pair=None）
                     // 取方案列表中首个非当前方案 —— 保证 Ctrl+M 首次即可用。
                     let target = match self.config.schema.recent_pair.clone() {
-                        Some((a, b)) => Some(if self.config.schema.current == a {
-                            b
-                        } else {
-                            a
-                        }),
+                        Some((a, b)) => Some(if self.config.schema.current == a { b } else { a }),
                         None => self
                             .schemas
                             .iter()
@@ -625,7 +614,9 @@ impl Engine {
                 return KeyOutcome::consumed(self.state(session));
             }
             // '/' 符号命名空间（首选顿号，继续输入进入 /xx 符号）
-            if c == '/' && (self.config.input.slash_dunhao || self.has_continuation_prefix("/")) {
+            if c == '/'
+                && (self.config.input.slash_dunhao || self.has_continuation_prefix("/"))
+            {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
@@ -677,7 +668,8 @@ impl Engine {
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
         // 选重键（不构成编码延续时才作为选重）
         if !extends {
-            if c == self.config.candidates.second_select || c == self.config.candidates.third_select
+            if c == self.config.candidates.second_select
+                || c == self.config.candidates.third_select
             {
                 return self.on_rank_key(session, c);
             }
@@ -695,7 +687,8 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         // 选重键
-        if c == self.config.candidates.second_select || c == self.config.candidates.third_select {
+        if c == self.config.candidates.second_select || c == self.config.candidates.third_select
+        {
             return self.on_rank_key(session, c);
         }
         // 翻页键
@@ -793,7 +786,10 @@ impl Engine {
         }
 
         // 满码唯一上屏
-        if len == max_len && self.config.input.auto_select_unique && session.candidates.len() == 1 {
+        if len == max_len
+            && self.config.input.auto_select_unique
+            && session.candidates.len() == 1
+        {
             self.commit_first_inline(session);
             return;
         }
@@ -807,99 +803,35 @@ impl Engine {
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
         let over_length = len > max_len;
 
-        // 整句词边界自动顶屏（虎爪节奏对齐）：追加新键后，若追加前
-        // top1 候选已完整消耗（word_ends 末段抵达 base 末端=上一词成
-        // 词完毕），且「该候选最后一段码 + 新键」已是死码（不是任何
-        // 码的前缀，组不出更长词）——立刻把 top1 待顶文本上屏，raw
-        // 重起为新键。虎爪用户实测节奏：syftu 后打 u → 顶「让我」；
-        // uu; 后打 w → 顶「看看」；w; 后打 j → 顶「怎么」。
-        // 死码判定先行，不依赖候选窗空（新键可能与其他切分组出
-        // 候选，但上一词的延续已死即顶）。
-        if sentence_mode && self.config.sentence.empty_code_auto_commit && !prev_cands.is_empty() {
+        // 整句空码自动顶屏（虎爪 2026-08-30 热修 SentenceEmptyCodeAutoCommit
+        // 同款，用户实测反馈「自动上屏积极度提高」的核心）：追加后组句无
+        // 候选（虎爪判定=无以已提交文本开头的完整候选路径），若追加前唯一
+        // 候选仍待顶、余码（去掉已提交 raw 后的部分，含刚按下的键）仍是
+        // 正常码前缀——则把待顶部分上屏，余码重新起句。句中（已有早提交
+        // 部分）同样触发，避免整句打字被卡住。
+        //
+        // 候选形态注意：我们的整句候选是「剩余文本」（早提交后不含已提交
+        // 前缀），虎爪是全文形态（StartsWith(committed) 检查）——在我们
+        // 的形态下该检查天然成立，待顶文本就是候选本身。
+        if sentence_mode
+            && self.config.sentence.empty_code_auto_commit
+            && session.candidates.is_empty()
+            && prev_cands.len() == 1
+        {
             let cand = &prev_cands[0];
             if !cand.text.is_empty() {
-                let raw_chars: Vec<char> = raw.chars().collect();
-                if raw_chars.len() >= 1 {
-                    let prev_raw: String = raw_chars[..raw_chars.len() - 1].iter().collect();
-                    // captured 必须来自整句接管态（超长/带锁/已有前缀），
-                    // 否则短码常规候选（如 syft 的「𫍽」、jgf 的「𭁕」）
-                    // 会被误当词边界顶出。
-                    let prev_takeover = prev_raw.chars().count()
-                        > self.config.input.max_code_length
-                        || parse_rank_locks(&prev_raw).has_locks()
-                        || !session.committed_raw.is_empty();
-                    if prev_takeover {
-                        let full_prev = format!("{}{}", session.committed_raw, prev_raw);
-                        if let Some(dc) = self.sentence.clone() {
-                            let dr = dc.decode_rich(&full_prev);
-                            let want = format!("{}{}", session.committed_text, cand.text);
-                            // captured 必须是 ngram 解码首选（虎爪唯一候选
-                            // 语义的稳妥近似）：神经重排会把生僻切分（如
-                            // eofeofx 的「楊鳳」=eofe+ofx）提到候选窗 top1，
-                            // 但那是 rerank 的语言流畅度判断，不是解码器
-                            // 的结构判断——顶屏若采信会把生僻组合固化上屏
-                            // （用户实测「查查原因」变「楊鳳因为」）。此处
-                            // 用未重排的 hits 首选校验，rerank 只影响显示
-                            // 顺序不影响顶屏决策。
-                            let ngram_top = dr.hits.first().map(|h| h.text.clone());
-                            if let Some(hit) = dr.hits.first() {
-                                if ngram_top.as_deref() == Some(want.as_str()) {
-                                    let complete = hit
-                                        .word_ends
-                                        .last()
-                                        .map(|&(_, base_end)| {
-                                            base_end == Self::base_len_hint(&full_prev)
-                                        })
-                                        .unwrap_or(false);
-                                    if complete && !hit.word_ends.is_empty() {
-                                        let last_seg_start = if hit.word_ends.len() >= 2 {
-                                            hit.word_ends[hit.word_ends.len() - 2].1
-                                        } else {
-                                            0
-                                        };
-                                        let full_new: Vec<char> =
-                                            format!("{}{}", session.committed_raw, raw)
-                                                .chars()
-                                                .collect();
-                                        let tail_code: String =
-                                            full_new.iter().skip(last_seg_start).collect();
-                                        if !self.has_continuation(&tail_code) {
-                                            // 「在途词保护」：新 raw 仍有完整组句路径
-                                            // 且新 top1 与 prev top1 共享首字（如
-                                            // cukrpn 的「还没越」vs「还波」——pn 只
-                                            // 是 pnv(跑) 的在途前缀，pnv 完成后切分
-                                            // 会变），说明 prev top1 是中途临时切分，
-                                            // 顶出会固化错误（用户实测「现在还没跑
-                                            // 完」变「现在还波有完」）。三种情况仍顶：
-                                            // 新候选空（组句彻底死，如 cukrpnvw）、
-                                            // prev 带锁（用户显式确认，如 uu2 看看）、
-                                            // 新旧 top1 完全分叉（如 syftuu 的「言祈
-                                            // 推」vs「让我」——让我路径已死）。
-                                            let locked = parse_rank_locks(&prev_raw).has_locks();
-                                            let diverged = session
-                                                .candidates
-                                                .first()
-                                                .map(|nc| {
-                                                    nc.text.chars().next()
-                                                        != cand.text.chars().next()
-                                                })
-                                                .unwrap_or(true);
-                                            if session.candidates.is_empty() || locked || diverged {
-                                                session.pending_commit = Some(cand.text.clone());
-                                                session.raw = c.to_string();
-                                                session.committed_raw.clear();
-                                                session.committed_text.clear();
-                                                session.early_history.clear();
-                                                session.early_suspended = false;
-                                                self.refresh_candidates(session);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let rest = cand.text.clone();
+                let base_len = session.committed_raw.chars().count();
+                let tail_raw: String = raw.chars().skip(base_len).collect();
+                if !rest.is_empty() && !tail_raw.is_empty() && self.has_continuation(&tail_raw) {
+                    session.pending_commit = Some(rest);
+                    session.raw = tail_raw;
+                    session.committed_raw.clear();
+                    session.committed_text.clear();
+                    session.early_history.clear();
+                    session.early_suspended = false;
+                    self.refresh_candidates(session);
+                    return;
                 }
             }
         }
@@ -928,8 +860,7 @@ impl Engine {
         }
 
         // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
-        if sentence_takeover || self.parsed_has_locks(session) || !session.committed_raw.is_empty()
-        {
+        if sentence_takeover || self.parsed_has_locks(session) || !session.committed_raw.is_empty() {
             self.try_early_commit(session);
             if session.pending_commit.is_some() {
                 // 前缀已上屏、raw 缩为剩余 → 重刷候选
@@ -952,10 +883,9 @@ impl Engine {
             && session.mode == InputMode::Normal
             && !session.raw.is_empty()
             && !session.raw.starts_with([';', '/', '\\'])
-            && session
-                .raw
-                .chars()
-                .all(|x| x.is_ascii_lowercase() || matches!(x, ';' | '\'' | '0'..='9'))
+            && session.raw.chars().all(|x| {
+                x.is_ascii_lowercase() || matches!(x, ';' | '\'' | '0'..='9')
+            })
         {
             self.sound_hint = Some("select");
             // 名次基准 = 候选框显示序（置顶/用户词参与排序）。
@@ -1068,11 +998,6 @@ impl Engine {
         false
     }
 
-    /// raw（含锁形态）对应的 base 长度（去掉选重后缀字符）。
-    fn base_len_hint(raw: &str) -> usize {
-        parse_rank_locks(raw).base.chars().count()
-    }
-
     /// 内联提交首选（顶功 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
     fn commit_first_inline(&mut self, session: &mut Session) {
         if session.candidates.is_empty() {
@@ -1125,26 +1050,9 @@ impl Engine {
 
         let (proposal, proposal_share) =
             confidence_proposal(&cands, self.config.sentence.weights.confidence);
-        if std::env::var("HUFU_EARLY_DEBUG").is_ok() {
-            eprintln!(
-                "[early] full={} src={} cands={} proposal={} share={:.4} hist={}",
-                full,
-                if dec.early_hits.is_empty() {
-                    "hits"
-                } else {
-                    "early"
-                },
-                cands
-                    .iter()
-                    .map(|h| h.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                proposal,
-                proposal_share,
-                session.early_history.len()
-            );
-        }
-        if proposal.is_empty() || proposal.chars().count() <= committed_text.chars().count() {
+        if proposal.is_empty()
+            || proposal.chars().count() <= committed_text.chars().count()
+        {
             session.early_history.clear();
             return;
         }
@@ -1172,8 +1080,8 @@ impl Engine {
         }
 
         // 观察窗口按证据强度自适应：全部强证据 2 键确认，否则 3 键双保险
-        let all_strong =
-            session.early_history.len() >= 2 && session.early_history.iter().all(|e| e.strong);
+        let all_strong = session.early_history.len() >= 2
+            && session.early_history.iter().all(|e| e.strong);
         let need = if all_strong { 2 } else { 3 };
         if session.early_history.len() < need {
             return;
@@ -1193,10 +1101,7 @@ impl Engine {
         if consumed <= committed_raw_len || consumed > full.chars().count() {
             return;
         }
-        let delta: String = stable
-            .chars()
-            .skip(committed_text.chars().count())
-            .collect();
+        let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
         if delta.chars().count() < 1 || live.chars().count() < 3 {
             return;
         }
@@ -1358,10 +1263,7 @@ impl Engine {
             _ if c.is_ascii_digit() && c != '0' => {
                 let page_size = self.config.candidates.page_size.max(1);
                 let start = session.page * page_size;
-                let pick = session
-                    .candidates
-                    .get(start + (c as usize - '1' as usize))
-                    .cloned();
+                let pick = session.candidates.get(start + (c as usize - '1' as usize)).cloned();
                 match pick {
                     Some(cand) => {
                         let text = cand.commit_text().to_string();
@@ -1452,11 +1354,7 @@ impl Engine {
     fn append_adjust_log(&self, op: &str, code: &str, word: &str) {
         use std::io::Write;
         let path = self.schema.dir.join("用户调整.txt");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{op}{code}\t{word}");
         }
     }
@@ -1471,7 +1369,10 @@ impl Engine {
             let dir = self.data_dir.join("转换词典");
             // 本数据集只有台版单字表 STCharacters_Tu（无标准 STCharacters，缺文件自动跳过）
             let t = if cfg.to_traditional {
-                hufu_dict::OpenCc::load_dir(&dir, &["STPhrases", "STCharacters", "STCharacters_Tu"])
+                hufu_dict::OpenCc::load_dir(
+                    &dir,
+                    &["STPhrases", "STCharacters", "STCharacters_Tu"],
+                )
             } else {
                 hufu_dict::OpenCc::load_dir(&dir, &["TSPhrases", "TSCharacters"])
             };
@@ -1517,7 +1418,10 @@ impl Engine {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let line = format!("{secs}\t{}\t{}\t{:?}\n", cand.code, cand.text, cand.source);
+            let line = format!(
+                "{secs}\t{}\t{}\t{:?}\n",
+                cand.code, cand.text, cand.source
+            );
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1533,7 +1437,10 @@ impl Engine {
     /// 整句候选显示：全上下文解码（committed ++ live），只显示已提交文本之后的剩余。
     /// 组一个重排请求：(key, 前文, 前 top_k 个整句候选文本)。
     /// 无整句候选或候选不足 2 时返回 None。
-    pub fn rerank_request(&self, session: &Session) -> Option<(String, String, Vec<String>)> {
+    pub fn rerank_request(
+        &self,
+        session: &Session,
+    ) -> Option<(String, String, Vec<String>)> {
         if !self.config.sentence.rerank.enabled {
             return None;
         }
@@ -1573,8 +1480,7 @@ impl Engine {
     }
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
-    fn apply_rerank(&self, session: &mut Session) {
-        if session.candidates.is_empty() {
+    fn apply_rerank(&self, session: &mut Session) {        if session.candidates.is_empty() {
             return;
         }
         let cache = match self.rerank_cache.lock() {
@@ -1617,7 +1523,11 @@ impl Engine {
         }
     }
 
-    fn sentence_candidates(&self, session: &Session, dec: &dyn SentenceDecoder) -> Vec<Candidate> {
+    fn sentence_candidates(
+        &self,
+        session: &Session,
+        dec: &dyn SentenceDecoder,
+    ) -> Vec<Candidate> {
         let full = format!("{}{}", session.committed_raw, session.raw);
         let dec = dec.decode_rich(&full);
         let committed_text = session.committed_text.clone();
@@ -1782,11 +1692,9 @@ impl Engine {
                 _ => None,
             };
             if let Some(t) = fallback {
-                session.candidates.push(Candidate::new(
-                    t,
-                    session.raw.clone(),
-                    CandidateKind::Symbol,
-                ));
+                session
+                    .candidates
+                    .push(Candidate::new(t, session.raw.clone(), CandidateKind::Symbol));
             }
         }
     }
@@ -1816,11 +1724,7 @@ impl Engine {
         ];
         for (k, v) in &commands {
             if k.starts_with(name) {
-                out.push(Candidate::new(
-                    v.clone(),
-                    format!("\\{k}"),
-                    CandidateKind::Command,
-                ));
+                out.push(Candidate::new(v.clone(), format!("\\{k}"), CandidateKind::Command));
             }
         }
 
@@ -1857,11 +1761,8 @@ impl Engine {
         if let Some(word) = name.strip_prefix('w') {
             if !word.is_empty() {
                 if let Some(code) = self.encode_word(word) {
-                    let mut c = Candidate::new(
-                        word.to_string(),
-                        format!("\\w{word}"),
-                        CandidateKind::Command,
-                    );
+                    let mut c =
+                        Candidate::new(word.to_string(), format!("\\w{word}"), CandidateKind::Command);
                     c.comment = code.clone();
                     c.commit_override = Some(word.to_string());
                     // 直接给候选码，选词时 learn() 自动入用户词库
@@ -2144,11 +2045,7 @@ mod tests {
         eng.process_key(&mut s, key('d'));
         // 整句模式下按 2：写入编码选重，不上屏，候选首为锁定结果
         let out = eng.process_key(&mut s, key('2'));
-        assert!(
-            out.commit.is_none(),
-            "整句选重不应立即上屏（实际 {:?}）",
-            out.commit
-        );
+        assert!(out.commit.is_none(), "整句选重不应立即上屏（实际 {:?}）", out.commit);
         assert!(out.consumed);
         let st = eng.state(&s);
         assert_eq!(st.candidates[0].text, "锁2+jd", "候选首 = 锁定名次2");
@@ -2205,12 +2102,8 @@ mod tests {
         eng.process_key(&mut s, key('\\'));
         eng.process_key(&mut s, key('d'));
         let _ = eng.process_key(&mut s, key('a'));
-        let snap = eng.state(&s);
-        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(
-            texts.iter().any(|t| t.contains('年') && t.contains('月')),
-            "{texts:?}"
-        );
+        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t.contains('年') && t.contains('月')), "{texts:?}");
         // 星期
         let (mut eng2, _d2) = test_engine("week");
         let mut s2 = Session::new(true);
@@ -2230,12 +2123,8 @@ mod tests {
         for c in "n12345".chars() {
             eng.process_key(&mut s, key(c));
         }
-        let snap = eng.state(&s);
-        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(
-            texts.iter().any(|t| t == &"一万二千三百四十五".to_string()),
-            "{texts:?}"
-        );
+        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == &"一万二千三百四十五".to_string()), "{texts:?}");
         // 上屏
         let out = eng.process_key(&mut s, key(' '));
         assert_eq!(out.commit.unwrap(), "一万二千三百四十五");
@@ -2247,12 +2136,8 @@ mod tests {
         for c in "N1234".chars() {
             eng2.process_key(&mut s2, key(c));
         }
-        let snap = eng2.state(&s2);
-        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(
-            texts.iter().any(|t| t == &"壹仟贰佰叁拾肆".to_string()),
-            "{texts:?}"
-        );
+        let snap = eng2.state(&s2); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == &"壹仟贰佰叁拾肆".to_string()), "{texts:?}");
     }
 
     #[test]
@@ -2276,13 +2161,7 @@ mod tests {
         let adj = hufu_dict::user::UserAdjust::parse(
             &log.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
-        let base = eng
-            .schema
-            .dict
-            .lookup("jd")
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let base = eng.schema.dict.lookup("jd").into_iter().cloned().collect::<Vec<_>>();
         let out = adj.apply("jd", &base);
         assert_eq!(out[0].text, "到的");
 
@@ -2313,14 +2192,8 @@ mod tests {
             eng.process_key(&mut s, key(c));
         }
         let snap = eng.state(&s);
-        assert!(
-            snap.candidates.iter().any(|c| c.text.contains('9')),
-            "{:?}",
-            snap.candidates
-                .iter()
-                .map(|c| c.text.clone())
-                .collect::<Vec<_>>()
-        );
+        assert!(snap.candidates.iter().any(|c| c.text.contains('9')), "{:?}",
+            snap.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
         // 上屏是纯数值
         let o = eng.process_key(&mut s, key(' '));
         assert_eq!(o.commit.unwrap(), "9");
@@ -2331,10 +2204,7 @@ mod tests {
             eng.process_key(&mut s2, key(c));
         }
         let snap = eng.state(&s2);
-        assert!(
-            snap.candidates.iter().any(|c| c.text.contains("无效")),
-            "提示无效"
-        );
+        assert!(snap.candidates.iter().any(|c| c.text.contains("无效")), "提示无效");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2375,17 +2245,9 @@ mod tests {
         let schema = dir.join("schema");
         std::fs::create_dir_all(&schema).unwrap();
         std::fs::create_dir_all(dir.join("转换词典")).unwrap();
-        std::fs::write(
-            schema.join("main.txt"),
-            "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n",
-        )
-        .unwrap();
+        std::fs::write(schema.join("main.txt"), "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n").unwrap();
         std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "后来\t後來\n").unwrap();
-        std::fs::write(
-            dir.join("转换词典").join("STCharacters.txt"),
-            "后\t後\n来\t來\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n来\t來\n").unwrap();
         std::fs::write(dir.join("转换词典").join("emoji.txt"), "后\t后 👑\n").unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.opencc.enabled = true;
@@ -2414,10 +2276,7 @@ mod tests {
         eng.process_key(&mut s3, key('h'));
         let snap = eng.state(&s3);
         let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(
-            texts.iter().any(|t| t.contains('👑')),
-            "emoji 变体: {texts:?}"
-        );
+        assert!(texts.iter().any(|t| t.contains('👑')), "emoji 变体: {texts:?}");
 
         let _ = std::fs::remove_dir_all(dir);
     }
