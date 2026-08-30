@@ -1396,13 +1396,16 @@ impl Engine {
         if texts.len() < 2 {
             return None;
         }
-        // 语境 = 文章尾巴 + 句内已上屏前缀。句首无任何语境时不触发重排：
-        // 空上下文下 Qwen 会把 ngram 的正确序翻掉（实测 ueeyiahx 空 ctx
-        // 拖乿心 -33.31 > 的窒闷 -34.19；有前文时 的窒闷 遥遥领先）。
+        // 语境 = 文章尾巴 + 句内已上屏前缀。句首无语境时填「。」伪句首
+        // 语境继续重排（而非跳过）：空上下文裸跑 Qwen 会把 ngram 正确序
+        // 翻掉（实测 ueeyiahx 空 ctx 拖乿心 -33.31 > 的窒闷 -34.19），
+        // 但 ctx="。" 时模型获得「新句开始」信号，判序大幅正确——
+        // 实测 agkadklecbsy：阖口而不言 -28.26 vs 痔问而不言 -40.26
+        // （ngram 字模型把高频字病句排成语前面，句首用户实测投诉位）。
         let mut ctx = session.tail_context.clone();
         ctx.push_str(&session.committed_text);
         if ctx.trim().is_empty() {
-            return None;
+            ctx = "。".to_string();
         }
         Some((key, ctx, texts))
     }
