@@ -160,7 +160,7 @@ $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First
 if (-not $zh) { $zh = $list[0] }
 if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Add($tipStr)
-    Set-WinUserLanguageList $list -Force
+    Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
 }
 $asm = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}\00000003"
 New-Item -Path $asm -Force | Out-Null
