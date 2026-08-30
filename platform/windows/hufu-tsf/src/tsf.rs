@@ -390,12 +390,17 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             preedit,
             pdimprevfocus.is_some()
         ));
-        // 1) 旧文档上冲销提交：显式 prev ctx；ASYNCDONTCARE 授权拿不到同步就排队，
-        //    焦点回调里绝不因 TF_E_SYNCHRONOUS 丢文本（此前 Chromium 系应用实证）
+        // 1) 旧文档上冲销提交：显式 prev ctx；【焦点回调绝不排队异步
+        //    session】Chromium 系应用在点击/焦点切换期持内部锁，异步
+        //    edit session 的排队回调需要宿主 UI 线程泵消息执行——VSCode
+        //    实测死锁冻结（主进程「未响应」，冻结取证：所有线程栈无
+        //    hufu 帧、trace 止于 grant(异步档)，DLL 无阻塞调用但宿主
+        //    已锁死）。同步档被拒（E_UNEXPECTED/TF_E_SYNCHRONOUS）即
+        //    放弃提交——切焦点丢半个未成词，不可拿宿主冻结换。
         if composing && !preedit.is_empty() {
             let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
             if let Some(ctx) = prev_ctx {
-                let _ = run_session(&self.shared, Op::Commit(preedit.clone()), Some(ctx));
+                let _ = run_session_sync_only(&self.shared, Op::Commit(preedit.clone()), ctx);
             }
         }
         // 2) 引擎会话清零：focus 上报挪到工作线程（fire-and-forget）。
@@ -1336,6 +1341,31 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// 焦点回调专用：只请求同步档 edit session，被拒即失败（不排队异步）。
+/// 异步 session 的回调需要宿主 UI 线程泵消息，Chromium 系应用在焦点
+/// 切换期持内部锁 → 排队即死锁（VSCode 点击候选框冻结事故）。
+fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {
+    let client_id = shared.lock().unwrap().client_id;
+    let session: ITfEditSession = EditSession {
+        shared: shared.clone(),
+        op,
+        ctx_override: Some(ctx.clone()),
+    }
+    .into();
+    unsafe {
+        match ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(0x6)) {
+            Ok(_) => {
+                trace("focus-commit: 同步档受理");
+                Ok(())
+            }
+            Err(e) => {
+                trace(&format!("focus-commit: 同步被拒 0x{:08X}，放弃提交", e.code().0 as u32));
+                Err(e)
+            }
+        }
+    }
 }
 
 /// 沉浸式宿主候选显示（双通道）：
