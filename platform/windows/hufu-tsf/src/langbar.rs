@@ -382,6 +382,10 @@ pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     unsafe { ensure_defer_window() };
     let item: ITfLangBarItem = unsafe { HuFuLangBar::new().into() };
     let r = unsafe { mgr.AddItem(&item) };
+    match &r {
+        Ok(()) => log_diag(&format!("install ok pid={}", std::process::id())),
+        Err(e) => log_diag(&format!("install FAIL pid={} err={:?}", std::process::id(), e.code())),
+    }
     r?;
     LANGBAR_ITEM.with(|c| *c.borrow_mut() = Some(item));
     Ok(())

@@ -108,7 +108,7 @@ fn ensure_server() -> bool {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    let dev_data = r"E:\DSH-KF\hufu\hufu-data";
+    let dev_data = std::env::var("HUFU_DEV_DATA").unwrap_or_default(); // 配套 HUFU_DEV_SERVER
     let local_app = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let mut candidates = vec![
         format!("{exe_dir}\\hufu-server.exe"),
@@ -117,13 +117,21 @@ fn ensure_server() -> bool {
         candidates.push(format!("{}\\hufu-server.exe", dir.trim_end_matches('\\')));
     }
     candidates.push(format!("{local_app}\\HuFu\\hufu-server.exe"));
-    candidates.push(r"E:\DSH-KF\hufu\engine\target\release\hufu-server.exe".to_string());
+    // dev 兜底必须显式提供（HUFU_DEV_SERVER=开发机绝对路径）：
+    // 发行 DLL 内置开发路径会在卸载窗口期拉起 dev 版 server（旧数据
+    // 串场、提权宿主还会锁管道 ACL）——10 轮净室实测教训。
+    if let Ok(dev_exe) = std::env::var("HUFU_DEV_SERVER") {
+        if !dev_exe.is_empty() {
+            candidates.push(dev_exe);
+        }
+    }
     for exe in candidates {
         if !std::path::Path::new(&exe).exists() {
             continue;
         }
-        // 数据目录跟随 server 自身：候选 1/2 用 exe 旁「数据」（server
-        // 不带 --data 时即此默认）；dev 兜底候选显式指工程数据。
+        // 数据目录跟随 server 自身：安装态候选用 exe 旁「数据」（server
+        // 不带 --data 时即此默认）；无旁挂数据时若提供了 HUFU_DEV_DATA
+        // 则显式指过去，否则裸启动（server 自有 fallback）。
         let data_of = {
             let beside = format!("{exe}\\..\\数据");
             let beside = std::path::Path::new(&beside)
@@ -131,8 +139,10 @@ fn ensure_server() -> bool {
                 .unwrap_or_else(|_| std::path::PathBuf::from(&beside));
             if beside.exists() {
                 None // 就用 server 默认（exe 同目录\数据）
+            } else if dev_data.is_empty() {
+                None
             } else {
-                Some(dev_data.to_string())
+                Some(dev_data.clone())
             }
         };
         let wexe: Vec<u16> = exe.encode_utf16().chain([0]).collect();
