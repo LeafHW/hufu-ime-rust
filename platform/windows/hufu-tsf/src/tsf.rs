@@ -52,6 +52,9 @@ pub struct Shared {
     /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
     /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
     pub shift_pending: bool,
+    /// 候选窗首帧抑制后的补显标记：poll 轮询看到本位且 raw 非空时
+    /// 无条件刷新（布局稳定后以正确位置显示，消除首帧错位跳变）。
+    pub suppress_pending: bool,
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
@@ -88,6 +91,7 @@ impl Shared {
             chinese: true,
             composing: false,
             shift_pending: false,
+            suppress_pending: false,
             modekey_last: None,
             preedit_last: String::new(),
             tm_sink_cookie: 0,
@@ -1043,11 +1047,22 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.raw_last = raw.to_string();
             g.raw_changed_at = Some(std::time::Instant::now());
         }
-        let suppress = g.delay_show_ms > 0
+        // 【组段首帧稳定期（仅异步布局宿主）】跟打器类宿主文本布局
+        // 懒执行：首键 GetTextExt 常返回旧行框（候选窗偏高一行、第二
+        // 键跳正——cw2 show y 序列实测 1092→1175 / 1166→1286）。首帧
+        // 220ms 内不显示，等第二键或 260ms 轮询在布局稳定后以正确位
+        // 置补显，全程零跳变。同步布局宿主（记事本等）不受影响。
+        let first_frame_unstable = host_async_layout()
             && !raw.is_empty()
-            && g
-                .raw_changed_at
-                .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms);
+            && raw.len() <= 1
+            && g.raw_changed_at
+                .is_some_and(|t| t.elapsed().as_millis() < 220);
+        let suppress = first_frame_unstable
+            || (g.delay_show_ms > 0
+                && !raw.is_empty()
+                && g
+                    .raw_changed_at
+                    .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms));
         if g.focus_context().is_none() {
             return Ok(());
         }
@@ -1144,7 +1159,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             return Ok(());
         }
     } else if suppress_win {
-        // 候选延时窗口内：快速输入防闪烁，先不显示
+        // 候选延时窗口内：快速输入防闪烁，先不显示。
+        // 首帧稳定期抑制时置补显标记——260ms 轮询见此标记且 raw
+        // 非空则无条件刷新（此时布局已稳、rect 正确）。
+        g.suppress_pending = true;
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
@@ -1173,6 +1191,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         drop(g);
         diag_note("打包宿主 → server 代画（开始菜单=左上角，其他=跟光标）");
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+        shared.lock().unwrap().suppress_pending = false;
     } else if g.cand_ui_active {
         // server 代画续帧（开始菜单=左上角固定；其他打包宿主每帧跟光标）
         let (x, y) = if host_is_searchhost() {
@@ -1185,6 +1204,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let raw_c = raw.clone();
         drop(g);
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+        shared.lock().unwrap().suppress_pending = false;
     } else if !g.cand2_dead {
         if g.cand2.is_none() {
             match CandidateWindowV2::new() {
@@ -1233,12 +1253,15 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 "cw2 持续 cloaked（非开始菜单）→ server 跟光标代画"
             });
             ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+            shared.lock().unwrap().suppress_pending = false;
             return Ok(());
         }
         match g.cand2.as_mut() {
             Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
             None => {}
         }
+        // 显示完成：清除首帧抑制补显标记
+        g.suppress_pending = false;
     } else {
         // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
         // （Deactivate→再 Activate 的状态漂移）：SearchHost 直接
@@ -1551,18 +1574,44 @@ fn poll_tick() {
         .unwrap_or("")
         .is_empty();
     let sig = state_sig(&state);
+    let mut need_show = false;
     {
         let mut g = shared.lock().unwrap();
         if raw_empty {
             g.cand_sig_last = String::new();
+            g.suppress_pending = false;
             return;
         }
-        if sig == g.cand_sig_last {
+        // 补显：首帧稳定期抑制过的窗（suppress_pending），轮询时
+        // 无条件刷新——此时 220ms 稳定期已过、布局已稳，update_ui
+        // 以正确 rect 显示（op 重跑 edit session 顺带重查 caret）。
+        need_show = g.suppress_pending;
+        if sig == g.cand_sig_last && !need_show {
             return;
         }
+        g.suppress_pending = false;
     }
-    trace("poll: 候选签名变化 → 刷新");
+    trace(if need_show {
+        "poll: 首帧抑制 → 补显"
+    } else {
+        "poll: 候选签名变化 → 刷新"
+    });
     let _ = update_ui(shared, String::new(), state);
+}
+
+/// 跟打器类宿主：文本布局懒/异步——组段首帧 GetTextExt 常返回旧行框
+/// （首键候选窗偏高一行、第二键跳正，实测 y 序列 1092→1175 / 1166→1286）。
+/// 此类宿主启用「首帧 220ms 稳定期抑制 + 260ms 轮询补显」；同步布局
+/// 宿主（记事本等）首帧 rect 本就正确，不受影响。
+fn host_async_layout() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(|n| n.contains("跟打"))
+            .unwrap_or(false)
+    })
 }
 
 fn scopeguard_release() -> PollGuard {
