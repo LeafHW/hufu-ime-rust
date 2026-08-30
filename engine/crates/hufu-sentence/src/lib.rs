@@ -243,10 +243,18 @@ impl SentenceEngine {
                 // 一简禁令（对齐虎爪规范）：句中（n>4）不允许 1 码段——
                 // 26 一简字在整句里必须打 2 码全码，其 1 码形式不参与
                 // 组句。n≤4 是短码查词场景（对齐虎爪「总长≤4 检索全部
-                // 字词」）保持宽容。虎码 1 码字即一简专属，此过滤等价
-                // 于「一简单码禁入句」。
-                if code_len == 1 && n > 4 {
-                    continue;
+                // 字词」）保持宽容。
+                // 两类豁免：
+                // 1. 尾段（pos+code_len==n）= 用户正在打的下一词，放行
+                //    （否则「cbfe;u」锁+一简尾切分路径全死）；
+                // 2. 段终点被选重锁（;/'/数字）钉住的段 = 用户显式选定
+                //    的名次（如「cn;j;」j 段由 ; 锁 rank），放行——
+                //    虎爪顶功次选流（码+; 逐段确认）依赖此路径。
+                if code_len == 1 && n > 4 && pos + 1 < n {
+                    let seg_end = pos + 1;
+                    if !parsed.locks.iter().any(|(l, _)| *l as usize == seg_end) {
+                        continue;
+                    }
                 }
                 let entries: Vec<(String, usize)> = idxs
                     .iter()
@@ -298,8 +306,13 @@ impl SentenceEngine {
                     // 78.79%、字准 99.39%→98.12%——单码段制造大量噪声路径，
                     // 禁令是质量担当，不可动。「的(u) 窒(eyi)」类编码冲突靠
                     // 提前上屏的边界位置解决（见 tiger_sentence.lua live 版）。
+                    // 【尾段豁免 2026-09-04】end==n（消耗到 raw 末尾）=
+                    // 用户正在打的下一词，放行单码段——否则「cn;j;c」「cbfe;u」
+                    // 类锁+一简首键时刻 0 候选（虎爪此刻显示已锁部分+新尾，
+                    // 我们整个窗空掉，用户体感「打不出来」）。中间段仍禁，
+                    // 质量禁令本体不动。
                     let span = end - pos + if lock.is_some() { 1 } else { 0 };
-                    if n > 1 && span < 2 {
+                    if n > 1 && span < 2 && end < n {
                         continue;
                     }
                     for (text, rank) in entries {
