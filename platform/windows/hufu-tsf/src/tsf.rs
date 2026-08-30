@@ -1085,24 +1085,18 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.raw_last = raw.to_string();
             g.raw_changed_at = Some(std::time::Instant::now());
         }
-        // 【组段首帧稳定期（仅异步布局宿主）】跟打器类宿主文本布局
-        // 懒执行：首键 GetTextExt 常返回旧行框（候选窗偏高一行、第二
-        // 键跳正——cw2 show y 序列实测 1092→1175 / 1166→1286）。首帧
-        // 110ms 内不显示，等第二键或轮询在布局稳定后以正确位置补显，
-        // 全程零跳变。同步布局宿主（记事本等）不受影响。
-        // （220→110→60→35ms：跟打器首键「比别的软件慢很多」的体感
-        // 主源是本抑制+轮询补显的叠加；35ms≈1 帧防跳下限+110ms 轮询）
-        let first_frame_unstable = host_async_layout()
+        // 【首帧稳定期抑制——已撤除】跟打器首键候选「慢半拍」的实锤
+        // 时间线（晴跟首键 trace）：按下→数据就绪 16ms，数据就绪→
+        // 显示 122ms——全耗在「抑制后被动等轮询补显」。而当年抑制
+        // 防的「首键 GetTextExt 旧行框」已被 qc 双查取末次根治（首键
+        // 一次即返回正确位置，补显前后坐标一致）——抑制成了纯延迟。
+        // 首帧立即显示；若「首键偏高一行第二键跳正」回归再换精确
+        // 一次性定时器方案（35ms 后主动补显，不等轮询周期）。
+        let suppress = g.delay_show_ms > 0
             && !raw.is_empty()
-            && raw.len() <= 1
-            && g.raw_changed_at
-                .is_some_and(|t| t.elapsed().as_millis() < 35);
-        let suppress = first_frame_unstable
-            || (g.delay_show_ms > 0
-                && !raw.is_empty()
-                && g
-                    .raw_changed_at
-                    .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms));
+            && g
+                .raw_changed_at
+                .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms);
         if g.focus_context().is_none() {
             return Ok(());
         }
