@@ -86,8 +86,14 @@ Write-Host ''
 Write-Host 'HuFu 虎符输入法 安装' -ForegroundColor Cyan
 Write-Host "安装到: $inst"
 
-# ── 1) 文件就位（保留用户 config.json）──
-robocopy $src $inst /E /XF config.json install.ps1 uninstall.ps1 *.bat > $null
+# ── 1) 文件就位（保留用户 config.json；排除安装器与运行产物）──
+robocopy $src $inst /E /XF config.json install.ps1 uninstall.ps1 *.bat server.pid user-adjust.log adjust-before.json > $null
+# 新装机落出厂配置（老用户的 config.json 已被上面 /XF 保护，不会覆盖）
+$factoryCfg = Join-Path $src '数据\config.json'
+if ((Test-Path $factoryCfg) -and -not (Test-Path (Join-Path $inst '数据\config.json'))) {
+    Copy-Item $factoryCfg (Join-Path $inst '数据\config.json') -Force
+    Write-Host 'OK 出厂配置已落（新装机）'
+}
 Write-Host 'OK 文件就位'
 
 # ── 2) HKCU COM + CTF TIP 键树（每用户；msctf/COM 解析 HKCU 优先）──
@@ -124,12 +130,16 @@ if (-not $NoHKLM) {
         Start-Process $ps -Verb RunAs -ArgumentList $arg -Wait
         if (Test-Path $elog) { Get-Content $elog | ForEach-Object { Write-Host "  $_" } }
     } else {
-        Write-Host '· 无管理员权限：跳过 HKLM/msctf 提权登记，尝试每用户登记'
+        Write-Host '⚠ 无管理员权限：msctf 输入法注册需机器级写入（TSF 平台限制，'
+        Write-Host '  同类输入法如虎爪同样要求管理员）。文件与语言列表已铺好，'
+        Write-Host '  但输入法要能用，需以管理员身份重跑本安装器完成登记。'
         & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
     }
 } else {
-    Write-Host '· -NoHKLM：跳过提权，尝试每用户 msctf 登记'
-    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+        Write-Host '· -NoHKLM：跳过提权（开发/调试用）。注意：msctf 输入法注册'
+        Write-Host '  需机器级写入（TSF 平台限制）；本模式装出的输入法不可打字，'
+        Write-Host '  除非本机已有历史机器级注册。'
+        & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
 }
 
 # ── 4) 语言列表 + 切换器装配（每用户）──

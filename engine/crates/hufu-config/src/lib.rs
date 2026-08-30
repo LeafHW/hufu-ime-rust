@@ -99,7 +99,9 @@ impl Default for SchemaSection {
     fn default() -> Self {
         SchemaSection {
             dir: "码表".into(),
-            current: "虎码单字".into(),
+            // 新装机默认整句方案（产品主打；虎码单字为单字精简模式，
+            // 老用户 config.json 里显式保存不受影响）
+            current: "虎整句".into(),
             recent_pair: None,
         }
     }

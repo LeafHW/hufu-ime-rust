@@ -1,4 +1,4 @@
-# HuFu pipe protocol test (ASCII only; PS5.1-safe)
+﻿# HuFu pipe protocol test (ASCII only; PS5.1-safe)
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
