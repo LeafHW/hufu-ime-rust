@@ -1175,6 +1175,16 @@ impl CandidateWindowV2 {
         }
     }
 
+    /// 鼠标当前是否悬停在本候选窗上（OnSetFocus 守卫用：交互中的
+    /// 点击连带焦点事件不清组段、不隐藏窗口）。
+    pub fn is_mouse_over(&self) -> bool {
+        unsafe {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            WindowFromPoint(pt).0 == self.hwnd.0
+        }
+    }
+
     pub fn hide(&mut self) {
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
