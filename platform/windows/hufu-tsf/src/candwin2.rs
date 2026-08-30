@@ -1389,20 +1389,23 @@ fn lockwin_show_at(cand: HWND) {
     unsafe {
         let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         let _ = GetWindowRect(cand, &mut wr);
-        // 左下角（候选窗窗口矩形左下角内侧）
+        // 左上角（候选窗窗口矩形左上角内侧）
         let x = wr.left + 5;
-        let y = wr.bottom - 22;
+        let y = wr.top + 5;
+        // 候选窗每帧 SetWindowPos(HWND_TOPMOST) 会把自己顶到 TOPMOST
+        // 层最上——锁窗若不跟着置顶会被候选窗盖住（vis=1 但看不见
+        // 的病根）。置顶而非 NOZORDER。
         let _ = SetWindowPos(
             HWND(h as *mut _),
-            HWND(std::ptr::null_mut()),
+            HWND_TOPMOST,
             x,
             y,
             0,
             0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            SWP_NOSIZE | SWP_NOACTIVATE,
         );
         let _ = ShowWindow(HWND(h as *mut _), SW_SHOWNOACTIVATE);
-        crate::tsf::trace(&format!("lockwin: show L-bottom ({x},{y}) vis={} err={}", IsWindowVisible(HWND(h as *mut _)).0, GetLastError().0));
+        crate::tsf::trace(&format!("lockwin: show L-top ({x},{y}) vis={} err={}", IsWindowVisible(HWND(h as *mut _)).0, GetLastError().0));
     }
 }
 
@@ -1427,11 +1430,11 @@ fn lockwin_follow(cand: HWND) {
                 let _ = GetWindowRect(cand, &mut wr);
                 let _ = SetWindowPos(
                     HWND(h as *mut _),
-                    HWND(std::ptr::null_mut()),
+                    HWND_TOPMOST,
                     wr.left + 5,
-                    wr.bottom - 22,
+                    wr.top + 5,
                     0, 0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
                 );
             }
         }
