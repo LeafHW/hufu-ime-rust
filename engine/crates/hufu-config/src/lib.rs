@@ -474,9 +474,12 @@ impl Default for UserSection {
 
 impl Config {
     /// 从 JSON 文件加载（缺省字段取默认值）。
+    /// 容错：跳过 UTF-8 BOM（PowerShell 系工具写的文件常带——serde_json
+    /// 遇 BOM 报 "expected value at line 1 column 1"，曾致 server 起不来）。
     pub fn load(path: &Path) -> std::io::Result<Config> {
         let text = std::fs::read_to_string(path)?;
-        let cfg: Config = serde_json::from_str(&text)
+        let text = text.trim_start_matches('\u{feff}');
+        let cfg: Config = serde_json::from_str(text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(cfg)
     }
