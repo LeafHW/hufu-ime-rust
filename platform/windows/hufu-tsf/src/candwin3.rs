@@ -743,7 +743,8 @@ impl CandWin3 {
                     fn GetModuleHandleW(name: *const u16) -> isize;
                     fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
                 }
-                type Dwma = unsafe fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
+                // 【i386 ABI】extern "system" 必须——同 candwin2（Pain 闪退根因）
+                type Dwma = unsafe extern "system" fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
                 let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
                 let md = GetModuleHandleW(mn.as_ptr());
                 if md != 0 {

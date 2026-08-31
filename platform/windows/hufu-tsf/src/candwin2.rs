@@ -1142,7 +1142,10 @@ impl CandidateWindowV2 {
                     fn GetModuleHandleW(name: *const u16) -> isize;
                     fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
                 }
-                type Dwma = unsafe fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
+                // 【i386 ABI】必须 extern "system"（stdcall）：x64 上 Rust
+                // 默认约定与 Win64 恰好兼容掩盖了此错，32 位下 cdecl 调用
+                // stdcall 函数 → 栈清理错位 → 崩（Pain 打器按键闪退根因）。
+                type Dwma = unsafe extern "system" fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
                 let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
                 let m = GetModuleHandleW(mn.as_ptr());
                 if m != 0 {
@@ -1163,6 +1166,16 @@ impl CandidateWindowV2 {
             } else {
                 self.cloaked_streak = 0;
             }
+            crate::tsf::diag_note(&format!(
+                "cw2 layout dbg: font_pt={font_pt} em={em} line_h={line_h} horiz={horizontal} \
+                 cands={} rawlen={} max_text={} width={width} height={height} w_out={w_out} h_out={h_out}",
+                cands.len(),
+                raw.chars().count(),
+                cand_ws
+                    .iter()
+                    .map(|(tw, _)| *tw)
+                    .fold(0.0f32, f32::max)
+            ));
             crate::tsf::diag_note(&format!(
                 "cw2 show anchor={} x={} y={} w={} h={} vis={} cloak={}({:#x}) hr={:#x} streak={}",
                 anchor.is_some(),

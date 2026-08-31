@@ -1,4 +1,4 @@
-﻿# HuFu 卸载（需要管理员）：删除全部注册链。
+# HuFu 卸载（需要管理员）：删除全部注册链。
 $ErrorActionPreference = 'Continue'
 
 $CLSID   = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}'
@@ -29,9 +29,14 @@ Remove-ItemProperty -Path 'HKCU:\Control Panel\International\User Profile\zh-Han
 
 # 4) COM + CTF 注册树
 Remove-Item "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "HKLM:\SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "HKCU:\Software\Classes\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "HKCU:\Software\Classes\Wow6432Node\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+# 32 位 DLL（SysWOW64\SystemIME\HuFu）
+Remove-Item "$env:SystemRoot\SysWOW64\SystemIME\HuFu" -Recurse -Force -ErrorAction SilentlyContinue
 
 # 5) ctfmon 重读
 Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
