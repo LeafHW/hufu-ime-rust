@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    IsWindowVisible, RegisterClassW, ShowWindow, CW_USEDEFAULT, SM_CXVIRTUALSCREEN,
+    IsWindowVisible, PostMessageW, RegisterClassW, ShowWindow, CW_USEDEFAULT, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE,
     WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
@@ -781,14 +781,24 @@ impl CandWin3 {
         }
     }
 
+    /// 窗口当前是否可见（poll 前台兜底用）
+    pub fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
+    }
+
     pub fn hide(&mut self) {
         // 组段结束：作废「正向打字」单调锁；粘性位置保留（同 candwin2）
         self.last_raw_len = usize::MAX;
+        // 【焦点回调安全】绝不同步 ShowWindow（VSCode 点击冻结事故同源）：
+        // PostMessage 排队，由窗口线程消息循环执行隐藏。
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND3, WPARAM(0), LPARAM(0));
         }
     }
 }
+
+/// 隐藏候选窗的队列消息（hide() 经 PostMessage 投递，窗口线程执行）
+const WM_APP_HIDE_CAND3: u32 = 0x8000 + 0x43; // WM_APP + 'C'
 
 unsafe extern "system" fn defwindowproc_w(
     hwnd: HWND,
@@ -796,5 +806,9 @@ unsafe extern "system" fn defwindowproc_w(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_APP_HIDE_CAND3 {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        return LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }

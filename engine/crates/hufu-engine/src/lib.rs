@@ -274,9 +274,23 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(data_dir: &Path, config: Config) -> std::io::Result<Engine> {
+        // 【性能插桩】词典装载分解（与 server 侧 startup-trace 配套）
+        let t0 = std::time::Instant::now();
+        let mark = |label: &str| {
+            use std::io::Write;
+            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+            {
+                let _ = writeln!(f, "  engine/{label}: {}ms", t0.elapsed().as_millis());
+            }
+        };
         let dict_root = data_dir.join(&config.schema.dir);
         let current = dict_root.join(&config.schema.current);
         let mut schema = Schema::load(&current)?;
+        mark("schema_load");
         let rev_name = config.reverse.table.trim().to_string();
         let rev_dir = schema.dir.clone();
         let mut schemas = Vec::new();
@@ -301,15 +315,17 @@ impl Engine {
             opencc_emoji: None,
             opencc_loaded: false,
         };
-        // 反查表覆盖（config.reverse.table）
+        // 反查表覆盖（config.reverse.table）——【性能】懒加载：只设
+        // 路径不读文件（见 Schema::reverse 注释）；与方案内自动探测
+        // 同名时天然去重（一个路径只装一次）。
         if !rev_name.is_empty() {
             let p = rev_dir.join(&rev_name);
             if p.exists() {
-                if let Ok(rt) = ReverseTable::load(&p) {
-                    engine.schema.reverse = Some(rt);
-                }
+                engine.schema.reverse = None;
+                engine.schema.reverse_path = Some(p);
             }
         }
+        mark("reverse+done");
         Ok(engine)
     }
 
@@ -337,9 +353,9 @@ impl Engine {
         if !rev_name.is_empty() {
             let p = rev_dir.join(&rev_name);
             if p.exists() {
-                if let Ok(rt) = ReverseTable::load(&p) {
-                    engine.schema.reverse = Some(rt);
-                }
+                // 【性能】懒加载（同 Engine::new）
+                engine.schema.reverse = None;
+                engine.schema.reverse_path = Some(p);
             }
         }
         Ok(engine)
@@ -356,6 +372,7 @@ impl Engine {
 
     /// 反查表覆盖：config.reverse.table 指定方案目录内文件名时优先加载
     /// （未指定或加载失败 → 保持按文件名含「反查」的自动探测结果）。
+    /// 【性能】懒加载：只换路径，真正装载见 ensure_reverse。
     fn apply_reverse_override(&self, schema: &mut Schema) {
         let name = self.config.reverse.table.trim();
         if name.is_empty() {
@@ -363,10 +380,33 @@ impl Engine {
         }
         let p = schema.dir.join(name);
         if p.exists() {
-            match ReverseTable::load(&p) {
-                Ok(rt) => schema.reverse = Some(rt),
-                Err(e) => eprintln!("反查表 {name} 加载失败（沿用自动探测）: {e}"),
+            schema.reverse = None;
+            schema.reverse_path = Some(p);
+        }
+    }
+
+    /// 【性能】反查表按需装载：Schema::load 只记路径（冷启动省 ~700ms
+    /// 文本解析），首次进入反查模式或 server 后台预热线程调用本方法
+    /// 真正装载。装完置 None 路径防重复。
+    pub fn ensure_reverse(&mut self) {
+        if self.schema.reverse.is_some() {
+            return;
+        }
+        let Some(p) = self.schema.reverse_path.clone() else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        match ReverseTable::load(&p) {
+            Ok(rt) => {
+                eprintln!(
+                    "反查表已装载（懒加载 {:.0}ms）: {}",
+                    t0.elapsed().as_millis(),
+                    p.display()
+                );
+                self.schema.reverse = Some(rt);
+                self.schema.reverse_path = None;
             }
+            Err(e) => eprintln!("反查表 {} 装载失败: {e}", p.display()),
         }
     }
 
@@ -1547,8 +1587,9 @@ impl Engine {
             session.candidates = self.command_candidates(&session.raw);
             return;
         }
-        // 反查模式
+        // 反查模式（懒装载：首次使用或后台预热时装表）
         if session.mode == InputMode::Reverse {
+            self.ensure_reverse();
             session.candidates = self.reverse_candidates(&session.raw);
             return;
         }

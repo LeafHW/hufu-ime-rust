@@ -341,8 +341,13 @@ impl SentenceEngine {
             (w.beam_width * 3 / 5).max(400)
         } else if n <= 32 {
             (w.beam_width / 5).max(300)
-        } else {
+        } else if n <= 48 {
             (w.beam_width / 8).max(200)
+        } else {
+            // 【性能】超长句（>48 码）：尾键延迟实测 40-50ms——再降档
+            // 换响应（bench 实测：/24 无额外收益，/16 max100 最优——
+            // avg 49→24ms、p95 102→38ms、exact 90% 持平）
+            (w.beam_width / 16).max(100)
         };
         for pos in start_pos..n {
             buckets[pos].limit(beam);

@@ -26,13 +26,29 @@ pub struct Host {
 
 impl Host {
     pub fn new(data_dir: &Path) -> std::io::Result<Host> {
+        // 【性能插桩】启动阶段毫秒戳（diag/startup-trace.txt；常开开销≈0）
+        let t0 = std::time::Instant::now();
+        let mut mark = |label: &str, t: &std::time::Instant| {
+            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+            {
+                let _ = writeln!(f, "{label}: {}ms", t.elapsed().as_millis());
+            }
+        };
         let config_path = data_dir.join("config.json");
         let config = if config_path.exists() {
-            Config::load(&config_path)?
+            let c = Config::load(&config_path)?;
+            mark("config", &t0);
+            c
         } else {
             Config::default()
         };
         let engine = Engine::new(data_dir, config)?;
+        mark("engine(含词典)", &t0);
         let mut host = Host {
             engine,
             session: Session::new(true),
@@ -41,7 +57,9 @@ impl Host {
             rerank_tx: None,
         };
         host.install_official_skins();
+        mark("skins", &t0);
         host.setup_rerank();
+        mark("rerank", &t0);
         // 注意：整句模型不在此时同步加载——由 main.rs 的后台线程
         // 装载后热挂（见 sentence_load_plan）。启动只载词典（秒级），
         // 管道/设置页即刻可用；装完立即可打字，整句能力稍后自动就位。
@@ -52,11 +70,17 @@ impl Host {
     /// 缺失时写入数据目录 skins/。已存在的不覆盖——用户在设置页的定制优先。
     fn install_official_skins(&mut self) {
         /// 嵌入的官方皮肤（编译期打包，数据目录损坏/清空也能恢复全套）
+        /// 【用户定稿】保留 4 款定稿 + 5 款新配色（青瓷/暮山紫/沧海/柿柚/松烟）
         const OFFICIAL: &[(&str, &str)] = &[
-            ("hufu-frost-h.json", include_str!("../official-skins/hufu-frost-h.json")),
-            ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
-            ("hufu-qingkong.json", include_str!("../official-skins/hufu-qingkong.json")),
+            ("hufu-default.json", include_str!("../official-skins/hufu-default.json")),
             ("hufu-yingxiong.json", include_str!("../official-skins/hufu-yingxiong.json")),
+            ("hufu-rongyan.json", include_str!("../official-skins/hufu-rongyan.json")),
+            ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
+            ("hufu-qingci.json", include_str!("../official-skins/hufu-qingci.json")),
+            ("hufu-mushan.json", include_str!("../official-skins/hufu-mushan.json")),
+            ("hufu-canghai.json", include_str!("../official-skins/hufu-canghai.json")),
+            ("hufu-shiyou.json", include_str!("../official-skins/hufu-shiyou.json")),
+            ("hufu-songyan.json", include_str!("../official-skins/hufu-songyan.json")),
         ];
         let dir = self.skins_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -65,6 +89,18 @@ impl Host {
             if !p.exists() {
                 if let Err(e) = std::fs::write(&p, body) {
                     eprintln!("官方皮肤 {file} 落盘失败: {e}");
+                }
+                continue;
+            }
+            // 【id 不变量自愈】官方皮肤文件已存在时只校正 id 字段=
+            // 文件名 stem（其余用户定制不动）。曾因生成期 id 批量写错，
+            // POST /api/skin 按 body.id 落盘导致跨文件覆盖（墨岩被顶）。
+            let stem = file.trim_end_matches(".json");
+            if let Ok(mut s) = hufu_skin::Skin::load(&p) {
+                if s.id != stem {
+                    eprintln!("官方皮肤 {file}: id '{}' 异常，自愈为 '{stem}'", s.id);
+                    s.id = stem.to_string();
+                    let _ = s.save(&p);
                 }
             }
         }
@@ -212,9 +248,75 @@ impl Host {
                         }
                     }
                 }
-                while let Ok(job) = rx.recv() {
+                // 【性能】空闲卸载：连续 IDLE_UNLOAD_MIN 分钟无重排任务
+                // → 释放 llama ctx / Rust 推理器（省数百 MB 私有内存；
+                // qwen ctx+kv 是常驻大头）。下次任务到达时重载（首句
+                // 重排迟到 1-3s，缓存刷新机制照常补偿）。
+                // 【第二轮】10→4 分钟（打字间隙多在 2-5 分钟量级，10 分钟
+                // ≈ 永不卸）；卸载同时 SetProcessWorkingSetSize(-1,-1)
+                // 主动收缩工作集——llama/ngram 的文件映射页一并换出
+                //（落 standby 链表，再访问零读盘），任务管理器 WS 立落。
+                const IDLE_UNLOAD_MIN: u64 = 4;
+                let trim_working_set = || {
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GetCurrentProcess() -> isize;
+                        fn SetProcessWorkingSetSize(h: isize, min: isize, max: isize) -> i32;
+                    }
+                    unsafe {
+                        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), -1isize, -1isize);
+                    }
+                };
+                let mut idle_secs: u64 = 0;
+                let mut loaded = native.is_some() || model.is_some();
+                let mut ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
+                                          model: &mut Option<hufu_rerank::Reranker>| {
+                    if native.is_none() && model.is_none() {
+                        let mp = std::path::PathBuf::from(&model_path);
+                        if let Some(ns) = hufu_rerank::native::NativeScorer::try_new(&[], &mp) {
+                            let _ = ns.score("。", &["预热".to_string()]);
+                            *native = Some(ns);
+                        } else {
+                            std::env::set_var("GGUF_LAZY", "1");
+                            if let Ok(r) = hufu_rerank::Reranker::load(&model_path) {
+                                let _ = r.score("。", &["预热".to_string()]);
+                                *model = Some(r);
+                            }
+                        }
+                    }
+                };
+                loop {
+                    let job = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                        Ok(j) => j,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            idle_secs += 60;
+                            // 空闲到点：卸 rerank（若在）+ 必收缩工作集
+                            //（ngram mmap 全表热页——bench/长句后 214MB
+                            // 驻留 WS——换出到 standby，任务管理器立落）
+                            if idle_secs >= IDLE_UNLOAD_MIN * 60 {
+                                if loaded {
+                                    native = None; // drop llama ctx → 归还数百 MB
+                                    model = None;
+                                    loaded = false;
+                                    eprintln!("神经重排：空闲 {IDLE_UNLOAD_MIN} 分钟，模型已卸载");
+                                }
+                                if idle_secs == IDLE_UNLOAD_MIN * 60 {
+                                    trim_working_set();
+                                    eprintln!("工作集已收缩（空闲 {IDLE_UNLOAD_MIN} 分钟）");
+                                }
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    idle_secs = 0;
                     if model_failed {
                         continue;
+                    }
+                    if !loaded {
+                        // 卸载后首任务：重载（1-3s，本句重排迟到）
+                        ensure_engines(&mut native, &mut model);
+                        loaded = native.is_some() || model.is_some();
                     }
                     // 去抖：停顿期间新任务覆盖旧任务
                     std::thread::sleep(std::time::Duration::from_millis(debounce));

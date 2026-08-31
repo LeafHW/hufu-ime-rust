@@ -123,6 +123,17 @@ extern "system" fn cand2_wndproc(
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *CAND_DROP_AT.lock().unwrap() = Some((wr.left, wr.top));
+                    // 【固定态拖动】锁定期拖到哪锁到哪：松手位置同步写回
+                    // 固定坐标（旧行为：永远弹回第一次右键锁定处）。
+                    let mut pinned = CAND_PINNED.lock().unwrap();
+                    if pinned.is_some() {
+                        *pinned = Some((wr.left, wr.top));
+                        drop(pinned);
+                        crate::tsf::diag_note(&format!(
+                            "cw2 pin 拖动松手回写 ({},{})",
+                            wr.left, wr.top
+                        ));
+                    }
                 }
             }
             *CAND_DRAG.lock().unwrap() = None;
@@ -295,6 +306,93 @@ pub struct CandidateWindowV2 {
     /// 连续被 DWM cloaked（显示中但不可见）的帧数；打包宿主里
     /// DComp 直通窗可能被整体隐身 → 达阈值切换 v1 传统混合窗
     pub(crate) cloaked_streak: u32,
+    /// 【每帧开销缓存】字体格式三件套按 (face,pt,label_pt) 复用——
+    /// CreateTextFormat 含系统字体匹配（百 µs 级），打字每键一帧
+    /// ×3 个格式是渲染路径大头；皮肤/字号不变时零创建。
+    pub(crate) tf_cache: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))>,
+    /// 【每帧开销缓存】光学垂直补偿 dy 按 (face,pt) 复用——probe
+    /// 每帧两次 CreateTextLayout+GetOverhangMetrics 可省。
+    pub(crate) dy_cache: Option<((String, f32), f32)>,
+    /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
+    /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
+    pub(crate) shadow_cache: Option<((u32, u32, u32, i32, u32), (ID2D1CommandList, ID2D1Effect))>,
+}
+
+/// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
+/// 高斯弥散只出现在窗口轮廓之外。返回 true=已 Push（调用方 DrawImage
+/// 后须 PopLayer）；false=几何创建失败（免 Pop）。
+unsafe fn push_shadow_mask(
+    ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+    width: f32,
+    height: f32,
+    w_out: u32,
+    h_out: u32,
+    shadow_m: f32,
+    radius: f32,
+) -> bool {
+    let f = match ctx.GetFactory() {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let big = match f.CreateRectangleGeometry(&D2D_RECT_F {
+        left: -1.0e6,
+        top: -1.0e6,
+        right: w_out as f32 + 1.0e6,
+        bottom: h_out as f32 + 1.0e6,
+    }) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let win = match f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: shadow_m,
+            top: shadow_m,
+            right: shadow_m + width,
+            bottom: shadow_m + height,
+        },
+        radiusX: radius,
+        radiusY: radius,
+    }) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let big: windows::Win32::Graphics::Direct2D::ID2D1Geometry = match big.cast() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let win: windows::Win32::Graphics::Direct2D::ID2D1Geometry = match win.cast() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let grp: windows::Win32::Graphics::Direct2D::ID2D1Geometry = match f
+        .CreateGeometryGroup(D2D1_FILL_MODE_ALTERNATE, &[Some(big), Some(win)])
+    {
+        Ok(g) => match g.cast() {
+            Ok(g) => g,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let mut lp = D2D1_LAYER_PARAMETERS1::default();
+    lp.contentBounds = D2D_RECT_F {
+        left: -1.0e6,
+        top: -1.0e6,
+        right: 1.0e6,
+        bottom: 1.0e6,
+    };
+    lp.geometricMask = std::mem::ManuallyDrop::new(Some(grp));
+    lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+    lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
+        M11: 1.0,
+        M12: 0.0,
+        M21: 0.0,
+        M22: 1.0,
+        M31: 0.0,
+        M32: 0.0,
+    };
+    lp.opacity = 1.0;
+    let _ = ctx.PushLayer(&lp, None);
+    true
 }
 
 impl CandidateWindowV2 {
@@ -398,6 +496,9 @@ impl CandidateWindowV2 {
                 last_size: (0, 0),
                 size: (0, 0),
                 cloaked_streak: 0,
+                tf_cache: None,
+                dy_cache: None,
+                shadow_cache: None,
             })
         }
     }
@@ -501,10 +602,58 @@ impl CandidateWindowV2 {
             .or_else(|| skin.get("layout").and_then(|l| l.get("horizontal")))
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        // 【超屏修复】超长句候选框超出屏幕（用户实测）：横排宽度纯
+        // 内容自适应且编码行整段参与定宽，无上限。三管齐下：
+        // ① 显示层预截断——超长 raw/候选只保尾部（正在打的部分），
+        //    前缀「…」；同名遮蔽参数，后续测量/定宽/渲染全部同源。
+        //    截宽按估算（CJK≈em、ASCII≈0.55em），宁可少截不可截不满。
+        // ② 横排宽度封顶工作区宽（见 width 计算处 w.min(w_cap)）。
+        // ③ 位置 clamp 原已有——宽度封顶后 clamp 区间不再倒置。
+        let screen_w = unsafe { GetSystemMetrics(SM_CXFULLSCREEN) }.max(200) as f32;
+        let w_cap = (screen_w - 24.0).max(320.0);
+        let trunc_tail = |s: &str, cap: f32| -> String {
+            let est = |s: &str| {
+                s.chars()
+                    .map(|c| if c.is_ascii() { em * 0.55 } else { em })
+                    .sum::<f32>() + em // 「…」前缀余量
+            };
+            if est(s) <= cap {
+                return s.to_string();
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let mut k = chars.len();
+            while k > 6 {
+                if est(&chars[chars.len() - k..].iter().collect::<String>()) <= cap {
+                    return std::iter::once('…')
+                        .chain(chars[chars.len() - k..].iter().copied())
+                        .collect();
+                }
+                k -= 2;
+            }
+            std::iter::once('…')
+                .chain(chars[chars.len() - 6..].iter().copied())
+                .collect()
+        };
+        let raw_disp_cap = if horizontal { w_cap * 0.7 } else { 260.0 };
+        let cand_disp_cap = if horizontal { w_cap * 0.35 } else { 240.0 };
+        let raw = trunc_tail(raw, raw_disp_cap.max(100.0));
+        let cands: Vec<(String, String)> = cands
+            .iter()
+            .map(|(t, c)| (trunc_tail(t, cand_disp_cap.max(80.0)), c.clone()))
+            .collect();
+        // 【每帧开销缓存】块前取块后存（测量/渲染 unsafe 块内 self 有
+        // 借用，不能就地读写缓存字段）——字体三件套 / 光学 dy / 阴影
+        // cl+effect，键不变则零创建。
+        let tf_cache_in = self.tf_cache.clone();
+        let dy_cache_in = self.dy_cache.clone();
+        let shadow_cache_in = self.shadow_cache.clone();
         let cand_spacing = layout_f(skin, "candidate_spacing", 6.0);
         let hilite_pad = layout_f(skin, "hilite_padding", 4.0);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
+        let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
+        let mut dy_cache_out: Option<((String, f32), f32)> = None;
+        let mut shadow_cache_out: Option<((u32, u32, u32, i32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
         let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
@@ -539,26 +688,45 @@ impl CandidateWindowV2 {
                     )
                     .ok()
             };
-            let tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
-            let tf_small =
-                mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
-            // 文本垂直居中（高亮胶囊上下留白对称的关键）
-            for t in [&tf, &tf_small] {
-                if let Some(t) = t {
-                    let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                }
-            }
+            let tf;
+            let tf_small;
+            let tf_label;
             // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
             let label_pt = layout_f(skin, "label_font_point", 0.0);
-            let tf_label = if label_pt > 0.0 {
-                mk_tf(&font_face, label_pt * 96.0 / 72.0)
-                    .or_else(|| mk_tf("Microsoft YaHei UI", label_pt * 96.0 / 72.0))
-                    .or(tf_small.clone())
+            let tf_key = (font_face.clone(), font_pt, label_pt);
+            let tf_hit = tf_cache_in
+                .as_ref()
+                .map(|(k, _)| *k == tf_key)
+                .unwrap_or(false);
+            if tf_hit {
+                let (_, v) = tf_cache_in.as_ref().unwrap();
+                tf = v.0.clone();
+                tf_small = v.1.clone();
+                tf_label = v.2.clone();
             } else {
-                tf_small.clone()
-            };
-            if let Some(t) = &tf_label {
-                let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
+                tf_small =
+                    mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+                // 文本垂直居中（高亮胶囊上下留白对称的关键）
+                for t in [&tf, &tf_small] {
+                    if let Some(t) = t {
+                        let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    }
+                }
+                tf_label = if label_pt > 0.0 {
+                    mk_tf(&font_face, label_pt * 96.0 / 72.0)
+                        .or_else(|| mk_tf("Microsoft YaHei UI", label_pt * 96.0 / 72.0))
+                        .or(tf_small.clone())
+                } else {
+                    tf_small.clone()
+                };
+                if let Some(t) = &tf_label {
+                    let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                }
+                tf_cache_out = Some((
+                    tf_key,
+                    (tf.clone(), tf_small.clone(), tf_label.clone()),
+                ));
             }
 
             let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
@@ -580,9 +748,9 @@ impl CandidateWindowV2 {
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
             let mut cand_ws: Vec<(f32, f32)> = Vec::new();
-            for (t, c) in cands {
-                let tw = measure(&tf, t);
-                let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c) };
+            for (t, c) in &cands {
+                let tw = measure(&tf, t.as_str());
+                let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c.as_str()) };
                 max_text = max_text.max(tw);
                 if !c.is_empty() {
                     max_cmt = max_cmt.max(cw);
@@ -604,23 +772,34 @@ impl CandidateWindowV2 {
                 }
                 None
             };
-            let (dy,) = {
-                let mut dy = 0.0f32;
-                if let Some((top_slack, bot_slack)) = probe_slack("永", &tf) {
-                    // 墨盒在行盒内的居中补偿：底 slack − 顶 slack 的一半（正=下移）
-                    dy = (bot_slack - top_slack) * 0.5;
-                    dy = dy.clamp(-6.0, 6.0);
+            // 光学补偿计算（缓存 miss 时用）：墨盒在行盒内偏上，
+            // 位移 = 行中心 − 墨盒中心（底 slack − 顶 slack 的一半）
+            let probe_dy = |probe: &dyn Fn(&str, &Option<IDWriteTextFormat>) -> Option<(f32, f32)>,
+                            t: &Option<IDWriteTextFormat>|
+             -> f32 {
+                if let Some((top_slack, bot_slack)) = probe("永", t) {
+                    ((bot_slack - top_slack) * 0.5).clamp(-6.0, 6.0)
+                } else {
+                    0.0
                 }
-                if self.readback {
-                    let cjk = probe_slack("永", &tf);
-                    eprintln!("cw2-probe: cjk(top,bot)={cjk:?} line_h={line_h} dy_row={dy}");
-                }
-                (dy,)
             };
+            let dy;
+            let dy_key = (font_face.clone(), font_pt);
+            if let Some((k, v)) = &dy_cache_in {
+                if *k == dy_key {
+                    dy = *v;
+                } else {
+                    dy = probe_dy(&probe_slack, &tf);
+                    dy_cache_out = Some((dy_key, dy));
+                }
+            } else {
+                dy = probe_dy(&probe_slack, &tf);
+                dy_cache_out = Some((dy_key, dy));
+            }
             // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
             // 例外：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽
             let raw_w = if cands.is_empty() && !raw.is_empty() {
-                measure(&tf, raw)
+                measure(&tf, raw.as_str())
             } else {
                 0.0
             };
@@ -634,6 +813,9 @@ impl CandidateWindowV2 {
                     w += label_w * 0.72 + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
                 }
                 let w = w.max(raw_w + margin_x * 2.0);
+                // 【超屏修复】横排宽度封顶：工作区宽 − 余量（截断后
+                // 内容已不超 cap，此处兜底防极端布局叠加溢出）
+                let w = w.min(w_cap);
                 (w, 0.0, 0.0, 0.0)
             } else {
                 // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
@@ -677,8 +859,12 @@ impl CandidateWindowV2 {
         let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
         let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
         let has_shadow = shadow_radius >= 1.0;
+        // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
+        // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
+        // 实测「超出 R 角的直角色块」= 弥散阴影遭位图边缘切割）。
         let shadow_m = if has_shadow {
-            (shadow_radius * 1.6 + 5.0 + shadow_off_y.abs()).ceil()
+            let sigma = shadow_radius * 0.5 + 1.0;
+            (sigma * 3.0 + 6.0 + shadow_off_y.abs()).ceil()
         } else {
             0.0
         };
@@ -735,14 +921,167 @@ impl CandidateWindowV2 {
             // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
             // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
             if has_shadow {
-                let sc = color_f(skin, "shadow_color", "#000000FF");
+                // 【阴影透明度】material.shadow_alpha 独立滑条（颜色自带
+                // alpha 忽略——与纯色模型一致的语义）
+                let shadow_alpha = skin
+                    .pointer("/skin/material/shadow_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let mut sc = color_f(skin, "shadow_color", "#000000FF");
+                sc.a = shadow_alpha;
                 if sc.a > 0.004 {
+                    // 【每帧缓存键】(w,h,radius,oy,argb)——宽度不变的连续
+                    // 帧（同长度候选/翻页）零重建 command list+effect。
+                    let sc_packed = ((sc.r * 255.0) as u32)
+                        | (((sc.g * 255.0) as u32) << 8)
+                        | (((sc.b * 255.0) as u32) << 16)
+                        | (((sc.a * 255.0) as u32) << 24);
+                    let sh_key = (
+                        width as u32,
+                        height as u32,
+                        (radius * 4.0) as u32,
+                        (shadow_off_y * 4.0) as i32,
+                        sc_packed,
+                    );
+                    // 【真 D2D 高斯阴影】用户两轮判多层近似「太锐利」——
+                    // 换 D2D1Shadow 效果（系统级高斯模糊）：窗口形状画进
+                    // command list → Shadow 效果 → DrawImage 回主画布。
+                    let fx = (|| -> Option<()> {
+                        unsafe {
+                            if let Some((k, v)) = &shadow_cache_in {
+                                if *k == sh_key {
+                                    // 命中：直接绘制缓存的 effect 输出
+                                    let eff_img: ID2D1Image = v.1.cast().ok()?;
+                                    let mask_ok = push_shadow_mask(
+                                        &ctx,
+                                        width,
+                                        height,
+                                        w_out,
+                                        h_out,
+                                        shadow_m,
+                                        radius,
+                                    );
+                                    let off = D2D_POINT_2F { x: 0.0, y: shadow_off_y };
+                                    ctx.DrawImage(
+                                        &eff_img,
+                                        Some(&off as *const _),
+                                        None,
+                                        D2D1_INTERPOLATION_MODE_LINEAR,
+                                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                                    );
+                                    if mask_ok {
+                                        ctx.PopLayer();
+                                    }
+                                    return Some(());
+                                }
+                            }
+                            let cl = ctx.CreateCommandList().ok()?;
+                            let saved = ctx.GetTarget().ok();
+                            let cl_img: ID2D1Image = cl.cast().ok()?;
+                            ctx.SetTarget(Some(&cl_img));
+                            let wb = ctx
+                                .CreateSolidColorBrush(
+                                    &D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                                    None,
+                                )
+                                .ok()?;
+                            let rr_win = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: shadow_m,
+                                    top: shadow_m,
+                                    right: shadow_m + width,
+                                    bottom: shadow_m + height,
+                                },
+                                radiusX: radius,
+                                radiusY: radius,
+                            };
+                            ctx.FillRoundedRectangle(&rr_win, &wb);
+                            cl.Close().ok()?;
+                            ctx.SetTarget(saved.as_ref());
+                            let effect = ctx.CreateEffect(&CLSID_D2D1Shadow).ok()?;
+                            let blur = shadow_radius * 0.5 + 1.0;
+                            let _ = effect.SetValue(
+                                0,
+                                D2D1_PROPERTY_TYPE_FLOAT,
+                                &blur.to_ne_bytes(),
+                            );
+                            let col = D2D_VECTOR_4F { x: sc.r, y: sc.g, z: sc.b, w: sc.a };
+                            let _ = effect.SetValue(
+                                1,
+                                D2D1_PROPERTY_TYPE_VECTOR4,
+                                &[
+                                    col.x.to_ne_bytes(),
+                                    col.y.to_ne_bytes(),
+                                    col.z.to_ne_bytes(),
+                                    col.w.to_ne_bytes(),
+                                ]
+                                .concat(),
+                            );
+                            let eff_img: ID2D1Image = effect.cast().ok()?;
+                            effect.SetInput(0, &cl_img, true);
+                            // 【圆角外遮罩】高斯向内弥散会进窗口内部；用
+                            // 直角矩形清除会在圆角外留直角切割痕（用户实测
+                            // 「直角色块」）。改 Layer 几何遮罩：整画布 −
+                            // 窗口圆角（even-odd）——阴影只在窗外绘制。
+                            let mask_ok = push_shadow_mask(
+                                &ctx,
+                                width,
+                                height,
+                                w_out,
+                                h_out,
+                                shadow_m,
+                                radius,
+                            );
+                            let off = D2D_POINT_2F { x: 0.0, y: shadow_off_y };
+                            ctx.DrawImage(
+                                &eff_img,
+                                Some(&off as *const _),
+                                None,
+                                D2D1_INTERPOLATION_MODE_LINEAR,
+                                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                            );
+                            if mask_ok {
+                                ctx.PopLayer();
+                            }
+                            // 【每帧缓存】存 command list+effect（键内含
+                            // w/h/圆角/偏移/颜色，任一变即重建）
+                            shadow_cache_out = Some((sh_key, (cl, effect)));
+                            Some(())
+                        }
+                    })();
+                    // 兜底：效果路径失败（老驱动）→ 下方环带多层近似
+                    if fx.is_none() {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
-                        const PASSES: usize = 10;
+                        // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
+                        // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满
+                        // 整窗（用户实测 bug）。改 even-odd 几何环带：每层
+                        // 只画「外圈 − 窗口」的环，窗口内部永远无阴影。
+                        let factory = ctx.GetFactory().ok();
+                        // 模糊感：层数多 + 高斯衰减（exp(-kt²)）——层间
+                        // 台阶不可见，观感≈CSS box-shadow 的高斯模糊。
+                        const PASSES: usize = 28;
+                        // 窗口自身圆角矩形（环带的内边界）
+                        let win_geom = factory.as_ref().and_then(|f| {
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: shadow_m,
+                                    top: shadow_m,
+                                    right: shadow_m + width,
+                                    bottom: shadow_m + height,
+                                },
+                                radiusX: radius,
+                                radiusY: radius,
+                            };
+                            f.CreateRoundedRectangleGeometry(&rr).ok()
+                        });
                         for i in (1..=PASSES).rev() {
-                            let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈 t=0.1
+                            let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈趋 0
                             let grow = shadow_radius * t;
-                            let a = sc.a * (1.0 - t) * (1.0 - t); // 内浓外淡
+                            // 高斯衰减：贴边最浓向外平滑消散（旧 (1-t)²
+                            // 台阶感强——「阴影太锐利」的根因）
+                            let a = sc.a * (-4.5 * t * t).exp();
                             b.SetColor(&D2D1_COLOR_F {
                                 r: sc.r,
                                 g: sc.g,
@@ -760,9 +1099,34 @@ impl CandidateWindowV2 {
                                 radiusX: radius + grow,
                                 radiusY: radius + grow,
                             };
-                            ctx.FillRoundedRectangle(&rr, &b);
+                            // 每层 = 外圈几何 − 窗口几何 的 even-odd 环带
+                            //（窗口内部永远无阴影；全透明窗只剩轮廓外投影）
+                            let ring = (|| -> Option<()> {
+                                let f = factory.as_ref()?;
+                                let wg = win_geom.as_ref()?;
+                                let outer: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> = f
+                                    .CreateRoundedRectangleGeometry(&rr)
+                                    .ok()
+                                    .and_then(|g| g.cast().ok());
+                                let outer = outer?;
+                                let inner: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
+                                    wg.clone().cast().ok()?;
+                                let grp = f
+                                    .CreateGeometryGroup(
+                                        D2D1_FILL_MODE_ALTERNATE,
+                                        &[Some(outer), Some(inner)],
+                                    )
+                                    .ok()?;
+                                ctx.FillGeometry(&grp, &b, None);
+                                Some(())
+                            })();
+                            if ring.is_none() {
+                                // 几何路径失败兜底：退回实心（旧行为）
+                                ctx.FillRoundedRectangle(&rr, &b);
+                            }
                         }
                     }
+                    } // fx.is_none() 环带兜底结束
                 }
             }
             // 内容整体平移进阴影边距内（此后所有内容坐标不变）
@@ -774,31 +1138,25 @@ impl CandidateWindowV2 {
                 M31: shadow_m,
                 M32: shadow_m,
             });
+            // 【整体透明度】非文字元素的总乘法系数（块外供共用）
+            let master = skin
+                .pointer("/skin/material/master_alpha")
+                .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0) as f32;
+            // 【高亮透明度】高亮候选底独立系数
+            let hilite_a = skin
+                .pointer("/skin/material/hilite_alpha")
+                .or_else(|| skin.get("material").and_then(|m| m.get("hilite_alpha")))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0) as f32;
             {
-                let mat = skin.pointer("/skin/material").or_else(|| skin.get("material"));
-                let opacity = mat
-                    .and_then(|m| m.get("opacity"))
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0) as f32;
-                let base_alpha = if kind == "solid" {
-                    color_f(skin, "back_color", "#202022E6").a
-                } else {
-                    let t = tint_hex.unwrap_or([28, 28, 30, 204]);
-                    let t_a = t[3] as f32 / 255.0;
-                    match kind.as_str() {
-                        "glass" => t_a * 0.55,
-                        _ => t_a * 0.85, // translucent / frosted(兼容旧皮肤)
-                    }
-                };
-                let (br, bg_, bb) = if kind == "solid" {
-                    let c = color_f(skin, "back_color", "#202022E6");
-                    (c.r, c.g, c.b)
-                } else {
-                    let t = tint_hex.unwrap_or([28, 28, 30, 204]);
-                    (t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0)
-                };
-                let bg_c = D2D1_COLOR_F { r: br, g: bg_, b: bb, a: base_alpha * opacity };
+                // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
+                // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 1。
+                let back = color_f(skin, "back_color", "#202022E6");
+                let bg_c = D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: master };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                         let rr = D2D1_ROUNDED_RECT {
@@ -809,36 +1167,51 @@ impl CandidateWindowV2 {
                         ctx.FillRoundedRectangle(&rr, &b);
                     }
                 }
-                // 暗化层（material.darken 0-1，圆角）
-                let darken = mat
-                    .and_then(|m| m.get("darken"))
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(0.0) as f32;
-                if darken > 0.005 {
-                    let dc = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: darken.min(0.9) };
-                    if let Ok(b) = ctx.CreateSolidColorBrush(&dc, None) {
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        ctx.FillRoundedRectangle(&rr, &b);
-                    }
-                }
+                // 【纯色模型】暗化层已废弃（材质系统移除）——不画
             }
 
+            // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
+            // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
+            let elem_alpha = |mut c: D2D1_COLOR_F| {
+                c.a = master;
+                c
+            };
+            let text_alpha = |mut c: D2D1_COLOR_F| {
+                c.a = 1.0;
+                c
+            };
             let mkbrush = |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
                 ctx.CreateSolidColorBrush(&c, None).ok()
             };
-            let b_text = mkbrush(&ctx, color_f(skin, "candidate_text_color", "#E8E8EAFF"));
-            let b_label = mkbrush(&ctx, color_f(skin, "label_color", "#C9C9C9FF"));
-            let b_raw = mkbrush(&ctx, color_f(skin, "text_color", "#E8E8EAFF"));
-            let b_cmt = mkbrush(&ctx, color_f(skin, "comment_text_color", "#9A9AA0FF"));
-            let b_hi = mkbrush(&ctx, color_f(skin, "hilited_candidate_back_color", "#404046FF"));
-            let b_hi_txt = mkbrush(&ctx, color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF"));
-            let b_hi_lbl = mkbrush(&ctx, color_f(skin, "hilited_candidate_label_color", "#FFD75EFF"));
-            let b_hi_cmt = mkbrush(&ctx, color_f(skin, "hilited_comment_text_color", "#C9C9C9FF"));
-            let b_border = mkbrush(&ctx, color_f(skin, "border_color", "#FFFFFF26"));
+            let b_text = mkbrush(&ctx, text_alpha(color_f(skin, "candidate_text_color", "#E8E8EAFF")));
+            let b_label = mkbrush(&ctx, text_alpha(color_f(skin, "label_color", "#C9C9C9FF")));
+            let b_raw = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")));
+            // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
+            let b_preedit_bg = {
+                let c = elem_alpha(color_f(skin, "preedit_back_color", "#00000000"));
+                (c.a > 0.01).then(|| mkbrush(&ctx, c)).flatten()
+            };
+            let b_cmt = mkbrush(&ctx, text_alpha(color_f(skin, "comment_text_color", "#9A9AA0FF")));
+            let b_hi = mkbrush(&ctx, {
+                let mut c = color_f(skin, "hilited_candidate_back_color", "#404046FF");
+                c.a = hilite_a;
+                c
+            });
+            let b_hi_txt = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF")));
+            let b_hi_lbl = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_candidate_label_color", "#FFD75EFF")));
+            let b_hi_cmt = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")));
+            let b_border = mkbrush(&ctx, {
+                // 【边框透明度】material.border_alpha 独立滑条（颜色自带 a 忽略）
+                let border_alpha = skin
+                    .pointer("/skin/material/border_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("border_alpha")))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let mut c = color_f(skin, "border_color", "#FFFFFF26");
+                c.a = border_alpha;
+                c
+            });
 
             let draw = |ctx: &ID2D1DeviceContext,
                         tf: &Option<IDWriteTextFormat>,
@@ -867,21 +1240,44 @@ impl CandidateWindowV2 {
 
             // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
             if !raw.is_empty() {
-                draw(&ctx, &tf, raw, margin_x, margin_y + dy, width - margin_x * 2.0, line_h, &b_raw);
+                // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
+                if let Some(bg) = &b_preedit_bg {
+                    let rr = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: margin_x,
+                            top: margin_y + dy,
+                            right: width - margin_x,
+                            bottom: margin_y + dy + line_h,
+                        },
+                        radiusX: 4.0,
+                        radiusY: 4.0,
+                    };
+                    unsafe {
+                        ctx.FillRoundedRectangle(&rr, bg);
+                    }
+                }
+                draw(&ctx, &tf, raw.as_str(), margin_x, margin_y + dy, width - margin_x * 2.0, line_h, &b_raw);
             }
             let y0 = margin_y + (line_h + cand_spacing) * code_row + dy;
 
             // 高亮胶囊统一内边距：四边都 = hilite_pad。
             // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
             // 保证上下左右内边距始终一致（旧版 top 被夹底没夹，左右还各有隐藏 ±4）。
+            // 【光学修正】汉字字面中心略低于几何中心（字体上下伸部不
+            // 对称——DrawText 居中时视觉偏下=胶囊显得偏上）：胶囊整体
+            // 下移 6% em 对齐视觉中心（用户实测「高亮偏上」的修正）。
             let pill_v = |y: f32| -> (f32, f32) {
                 let half = (line_h - em) / 2.0;
+                let optical = em * 0.06;
                 let ih = em + hilite_pad * 2.0;
                 if ih <= line_h {
-                    (y + half - hilite_pad, y + half + em + hilite_pad)
+                    (
+                        y + half - hilite_pad + optical,
+                        y + half + em + hilite_pad + optical,
+                    )
                 } else {
                     let off = (line_h - ih) / 2.0;
-                    (y + off, y + off + ih)
+                    (y + off + optical, y + off + ih + optical)
                 }
             };
 
@@ -1076,7 +1472,10 @@ impl CandidateWindowV2 {
             }
             let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap() {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
-                //（跨组段/上屏/新一轮候选全部保持；右键再解除）
+                //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
+                // 拖动松手会回写 pin（见 WM_LBUTTONUP）——打字必然用
+                // 最新固定位。
+                crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
                 let x = px.clamp(vx, (vx + vw - width as i32).max(vx));
                 let y = py.clamp(vy, (vy + vh - height as i32).max(vy));
                 (x, y)
@@ -1128,6 +1527,12 @@ impl CandidateWindowV2 {
                 },
             }
             };
+            // 【右缘兜底】正向打字的 x 单调锁（宽度增长时拒回退）会把
+            // 已 clamp 的新 x 顶回旧位置——窗口变宽后旧 x+新宽超右缘
+            //（用户实测：跟打器超长句候选框超出屏幕；宽度封顶后根因
+            // 转到这里）。每帧输出前统一夹回，屏幕边界优先于位置记忆。
+            let x = x.clamp(vx, (vx + vw - width as i32 - shadow_m as i32).max(vx));
+            let y = y.clamp(vy, (vy + vh - height as i32).max(vy));
             self.sticky_pos = Some((x, y));
             // 诊断：搜索框等宿主锚点缺失排查（visible=0 说明本帧被隐藏）
             // + DWM cloaked 检测（显示中但被 DWM 隐身 → 连续 2 帧后
@@ -1189,6 +1594,16 @@ impl CandidateWindowV2 {
                 hr,
                 self.cloaked_streak
             ));
+            // 【每帧缓存】块后存回（测量/渲染块内 self 有借用）
+            if let Some(v) = tf_cache_out {
+                self.tf_cache = Some(v);
+            }
+            if let Some(v) = dy_cache_out {
+                self.dy_cache = Some(v);
+            }
+            if let Some(v) = shadow_cache_out {
+                self.shadow_cache = Some(v);
+            }
             // 内容坐标 → 窗口坐标（内容在阴影边距内侧）
             let _ = SetWindowPos(
                 self.hwnd,
@@ -1220,6 +1635,11 @@ impl CandidateWindowV2 {
             let _ = GetCursorPos(&mut pt);
             WindowFromPoint(pt).0 == self.hwnd.0
         }
+    }
+
+    /// 窗口当前是否可见（poll 前台兜底用：只在可见时记日志/收尾）
+    pub fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
     pub fn hide(&mut self) {

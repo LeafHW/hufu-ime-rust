@@ -22,8 +22,12 @@ pub struct Schema {
     pub unicode_block: Option<AnnotationTable>,
     /// 拆分提示
     pub split: Option<AnnotationTable>,
-    /// 反查表（码 → 词）
+    /// 反查表（码 → 词）——【性能】懒加载：启动只记 reverse_path
+    /// （7.7MB 文本解析 ~700ms 是冷启动大头之一），首次反查或后台
+    /// 预热线程调用 Engine::ensure_reverse 时才真正装载。
     pub reverse: Option<ReverseTable>,
+    /// 反查表源文件（未装载时记录，装载后置 None）
+    pub reverse_path: Option<PathBuf>,
     /// 用户调整（置顶/添加/删除日志）
     pub adjust: UserAdjust,
     /// 用户词库
@@ -55,6 +59,7 @@ impl Schema {
             unicode_block: None,
             split: None,
             reverse: None,
+            reverse_path: None,
             adjust: UserAdjust::default(),
             user_dict: UserDict::default(),
             encoder_rules: Vec::new(),
@@ -106,7 +111,8 @@ impl Schema {
                 if stem.contains("用户码表") {
                     duoduo_user = Some(path.clone());
                 } else if stem.contains("反查") {
-                    schema.reverse = Some(ReverseTable::load(&path)?);
+                    // 【性能】懒加载：只记路径（见 reverse 字段注释）
+                    schema.reverse_path = Some(path.clone());
                 } else {
                     // 其余 txt：可能是主码表（多多/QQ五笔/虎整句/多多用户词）
                     if stem.contains("用户词") {
