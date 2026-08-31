@@ -86,6 +86,33 @@ extern "system" fn hufu_test_reset() -> i32 {
     i32::from(crate::ipc::reset_session())
 }
 
+/// 测试钩子：DLL→server 管道键往返微基准。n 次真实 key 请求（reset→
+/// 编码增长→reset），返回平均每键耗时（µs）。回归资产：轮询分级/
+/// 连接复用等 ipc 改动的量化依据。
+#[no_mangle]
+extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
+    let n = n.clamp(1, 512) as usize;
+    let _ = crate::ipc::reset_session();
+    let keys = ["u", "e", "y", "i", "h", "x", "m", "f", "t", "d"];
+    // 预热一轮（首键建连/服务器锁热身）
+    let _ = crate::ipc::key_request("u", false, false, false);
+    let _ = crate::ipc::reset_session();
+    let t0 = std::time::Instant::now();
+    for i in 0..n {
+        // 每 8 键 reset：避免编码无限增长把基准变成「长句解码测试」
+        //（10 键循环拼出的串在整句方案下解码代价逐键暴涨，测不出 ipc）
+        if i > 0 && i % 8 == 0 {
+            let _ = crate::ipc::reset_session();
+        }
+        let k = keys[i % keys.len()];
+        let _ = crate::ipc::key_request(k, false, false, false);
+    }
+    let us = t0.elapsed().as_micros() as f64 / n as f64;
+    eprintln!("key-burst: {n} 键 avg {us:.0}µs/键");
+    // 返回毫秒×10（i32 精度够；0 表示 <100µs）
+    (us / 100.0) as i32
+}
+
 /// 测试钩子：按服务器当前皮肤渲染典型候选内容，回读像素落盘 BMP
 /// （%TEMP%\hufu-pad.bmp）供视觉/数值检查内边距。返回 1=成功。
 #[no_mangle]
@@ -241,10 +268,17 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     let mut base = crate::ipc::call(&serde_json::json!({"op": "skin"})).unwrap_or_else(|| {
         serde_json::json!({"skin": {"colors": {}, "layout": {}, "material": {"kind": "solid"}}})
     });
-    // 强制 solid + 不透明底色：排除 accent 语义干扰，纯看颜色渲染
+    // 强制 solid + 不透明底色：排除 accent 语义干扰，纯看颜色渲染。
+    // 【基线钉死】master/hilite/shadow/border 四个透明度也一并锁 1.0
+    // ——皮肤热数据（用户滑条设置）会随「服务器当前皮肤」混进基线，
+    // 曾因墨岩 hilite_alpha=0.7 把胶囊压暗致断言假红。
     if let Some(s) = base.get_mut("skin").and_then(|s| s.as_object_mut()) {
         if let Some(m) = s.get_mut("material").and_then(|m| m.as_object_mut()) {
             m.insert("kind".into(), serde_json::json!("solid"));
+            m.insert("master_alpha".into(), serde_json::json!(1.0));
+            m.insert("hilite_alpha".into(), serde_json::json!(1.0));
+            m.insert("shadow_alpha".into(), serde_json::json!(1.0));
+            m.insert("border_alpha".into(), serde_json::json!(1.0));
         }
     }
     let set_colors = |sk: &mut serde_json::Value, back: &str, hilight: &str, hitext: &str| {

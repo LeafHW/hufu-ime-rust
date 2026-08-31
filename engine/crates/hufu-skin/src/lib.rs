@@ -91,6 +91,14 @@ pub struct MaterialConfig {
     pub border_width: f32,
     /// 玻璃边框色
     pub border_color: Color,
+    /// 【纯色模型】整体透明度（0=全透明 1=不透明；窗底/边框/编码底/阴影）
+    pub master_alpha: f32,
+    /// 【纯色模型】高亮候选底独立透明度
+    pub hilite_alpha: f32,
+    /// 【纯色模型】阴影独立透明度
+    pub shadow_alpha: f32,
+    /// 【纯色模型】边框独立透明度
+    pub border_alpha: f32,
 }
 
 impl Default for MaterialConfig {
@@ -103,6 +111,10 @@ impl Default for MaterialConfig {
             noise: 0.0,
             border_width: 1.0,
             border_color: Color([255, 255, 255, 0x33]),
+            master_alpha: 1.0,
+            hilite_alpha: 1.0,
+            shadow_alpha: 1.0,
+            border_alpha: 1.0,
         }
     }
 }

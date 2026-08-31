@@ -101,6 +101,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+    {
+        // 【性能插桩】main 侧总戳（与 host.rs 的 Host::new 打点配套）
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+        {
+            let _ = writeln!(f, "--- Host::new 完成（含 spawn 前全部同步工作）---");
+        }
+    }
     let shared = Arc::new(Mutex::new(host));
     let addr = format!("127.0.0.1:{port}");
 
@@ -153,6 +165,20 @@ fn main() {
             });
     }
 
+    // 【性能】反查表后台预热：启动路径已不载（懒加载省冷启动 ~700ms），
+    // 此处稍等片刻（让位 ngram/打字 IO）后装表，用户首按反查前缀
+    // （默认 `）前即已就绪。
+    {
+        let shared_bg = shared.clone();
+        std::thread::Builder::new()
+            .name("hufu-reverse-warm".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let mut h = shared_bg.lock().unwrap();
+                h.engine.ensure_reverse();
+            });
+    }
+
     // Windows 托盘（双击开设置页 / 右键退出）
     #[cfg(windows)]
     {
@@ -172,6 +198,19 @@ fn main() {
                 let pf = std::env::var("ProgramFiles").unwrap_or_default();
                 let pflocal = std::env::var("LOCALAPPDATA").unwrap_or_default();
                 let app_arg = format!("--app={url}");
+                // 【用户定稿】900×800 紧凑窗口。Edge/Chrome 单实例驻留时
+                // --window-size 会被忽略（参数转发给已有实例）——独立
+                // user-data-dir 让设置窗口自成实例，尺寸参数永远生效，
+                // 也避免与用户日常浏览器窗口互相干扰。
+                let profile = std::env::var("LOCALAPPDATA")
+                    .map(|p| format!("{p}\\HuFuSettingsProfile"))
+                    .unwrap_or_else(|_| "HuFuSettingsProfile".to_string());
+                let size_arg = "--window-size=900,800";
+                let extra_args = [
+                    format!("--user-data-dir={profile}"),
+                    "--no-first-run".to_string(),
+                    "--no-default-browser-check".to_string(),
+                ];
                 let browser = [
                     format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
                     format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
@@ -183,7 +222,12 @@ fn main() {
                 .find(|p| std::path::Path::new(p).exists());
                 let opened = match &browser {
                     Some(exe) => {
-                        std::process::Command::new(exe).arg(&app_arg).spawn().is_ok()
+                        let mut c = std::process::Command::new(exe);
+                        c.arg(&app_arg).arg(size_arg);
+                        for a in &extra_args {
+                            c.arg(a);
+                        }
+                        c.spawn().is_ok()
                     }
                     None => false,
                 };
@@ -291,7 +335,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .unwrap_or_else(|| host.engine.config.appearance.skin.clone());
             let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
-                Ok(s) => Response::json(&serde_json::to_value(&s).unwrap()),
+                Ok(mut s) => {
+                    // 【id 不变量】返回体 id 强制=请求 id（文件名）。皮肤
+                    // json 内 id 曾批量写错（gen5 模板 id 未换）——设置页
+                    // 按 GET 的 id 回存 POST，若放行错 id 会把 A 皮肤写进
+                    // B 文件（墨岩被暮山紫顶掉的事故链）。
+                    s.id = id.clone();
+                    Response::json(&serde_json::to_value(&s).unwrap())
+                }
                 Err(e) => {
                     // 皮肤 JSON 有错时明确指认（此前静默回默认皮，用户只见「不生效」）
                     eprintln!("皮肤 {id} 加载失败（回退默认）: {e}");

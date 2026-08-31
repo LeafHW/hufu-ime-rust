@@ -18,13 +18,94 @@ fn main() {
             args.get(3).expect("用法: convert <输入文件> <输出文件>"),
         ),
         "repl" => cmd_repl(args.get(2).expect("用法: repl <方案目录>")),
+        "bench" => cmd_bench(
+            args.get(2).expect("用法: bench <方案目录> <语料> [ngram路径]"),
+            args.get(3).expect("用法: bench <方案目录> <语料> [ngram路径]"),
+            args.get(4).map(|s| s.to_string()),
+        ),
         _ => {
             println!("hufu-cli 命令：");
             println!("  check   <方案目录>   加载方案并输出统计与样例候选");
             println!("  convert <输入> <输出> 任意支持格式 → HuFu 原生 TSV");
             println!("  repl    <方案目录>   逐字符模拟输入（q 退出，BS 退格，SP 空格）");
+            println!("  bench   <方案目录> <语料> [ngram] 整句质量基准（exact 率 + 逐句解码耗时）");
         }
     }
+}
+
+/// 整句质量基准：语料每句 → 逐字 best_code_of 拼编码 → SentenceEngine
+/// 解码 → top1 与原句比对 exact。_beam 调档前后的回归护栏
+/// （历史基准：100 句 exact 92.93%）。
+fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
+    let t0 = Instant::now();
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = Config::default();
+    let ngram_path = ngram
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("模型/sentence-ngram.bin"));
+    println!(
+        "方案 {} 条目 {}（{:.0}ms）ngram={}",
+        schema.name,
+        schema.dict.len(),
+        t0.elapsed().as_millis(),
+        ngram_path.display()
+    );
+    let dec = match hufu_sentence::SentenceEngine::load(
+        &ngram_path,
+        schema.dict.clone(),
+        &schema.supplement,
+        cfg.sentence.weights.clone(),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ngram 装载失败: {e}");
+            return;
+        }
+    };
+    let sents: Vec<String> = std::io::BufReader::new(
+        std::fs::File::open(corpus).expect("语料打开失败"),
+    )
+    .lines()
+    .map(|l| l.unwrap().trim().to_string())
+    .filter(|l| !l.is_empty())
+    .collect();
+    let mut exact = 0usize;
+    let mut total = 0usize;
+    let mut decode_ms: Vec<u128> = Vec::new();
+    for s in &sents {
+        // 逐字取码（best_code_of：最短/最优码）拼整句编码
+        let mut raw = String::new();
+        for ch in s.chars() {
+            let code = schema.best_code_of(&ch.to_string()).unwrap_or_default();
+            raw.push_str(&code);
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        total += 1;
+        let t1 = Instant::now();
+        let hits = hufu_engine::SentenceDecoder::decode(&dec, &raw);
+        decode_ms.push(t1.elapsed().as_millis());
+        if let Some(top) = hits.first() {
+            if top.text == *s {
+                exact += 1;
+            }
+        }
+    }
+    let avg = decode_ms.iter().sum::<u128>() as f64 / decode_ms.len().max(1) as f64;
+    let p95_idx = (decode_ms.len() * 95 / 100).min(decode_ms.len().saturating_sub(1));
+    let mut sorted = decode_ms.clone();
+    sorted.sort();
+    let p95 = sorted.get(p95_idx).copied().unwrap_or(0);
+    println!(
+        "句数 {total}  exact {}/{} = {:.2}%  解码 avg {:.1}ms  p95 {}ms  max {}ms",
+        exact,
+        total,
+        exact as f64 / total as f64 * 100.0,
+        avg,
+        p95,
+        sorted.last().copied().unwrap_or(0)
+    );
 }
 
 fn cmd_check(dir: &str) {

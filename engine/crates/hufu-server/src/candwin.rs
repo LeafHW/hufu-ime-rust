@@ -387,18 +387,30 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
         .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
         .and_then(|x| x.as_str())
         .and_then(parse_hex4);
-    let bg_col = if kind == "solid" {
-        let c = skin_color4(skin, "back_color", "#202022E6");
-        (c.0, c.1, c.2, (c.3 as f32 * opacity) as u8)
-    } else {
-        let t = tint_hex.unwrap_or((28, 28, 30, 204));
-        let a = match kind.as_str() {
-            "glass" => t.3 as f32 / 255.0 * 0.55,
-            _ => t.3 as f32 / 255.0 * 0.85, // translucent / frosted
-        };
-        (t.0, t.1, t.2, (a * opacity * 255.0) as u8)
-    };
-    let border_col = skin_color4(skin, "border_color", "#FFFFFF26");
+    // 【纯色模型 v2·与 candwin2/预览同步】颜色只管色相（自带 alpha 忽略）：
+    // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 255。
+    let master = skin
+        .pointer("/skin/material/master_alpha")
+        .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0) as f32;
+    let hilite_a = skin
+        .pointer("/skin/material/hilite_alpha")
+        .or_else(|| skin.get("material").and_then(|m| m.get("hilite_alpha")))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0) as f32;
+    let bgc4 = skin_color4(skin, "back_color", "#202022E6");
+    let bg_col = (bgc4.0, bgc4.1, bgc4.2, (master * 255.0) as u8);
+    let bc = skin_color4(skin, "border_color", "#FFFFFF26");
+    let border_alpha = skin
+        .pointer("/skin/material/border_alpha")
+        .or_else(|| skin.get("material").and_then(|m| m.get("border_alpha")))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0) as f32;
+    let border_col = (bc.0, bc.1, bc.2, (border_alpha * 255.0) as u8); // 边框独立透明度
     let border_w = skin_layout(skin, "border_width", 1.0).max(0.0);
 
     // ── GDI：字体 + 测宽 + 文字 coverage ──
@@ -527,7 +539,10 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
                 m + width - margin_x + hilite_pad,
                 m + pb,
                 hi_radius,
-                skin_color4(skin, "hilited_candidate_back_color", "#404046FF"),
+                {
+                    let h = skin_color4(skin, "hilited_candidate_back_color", "#404046FF");
+                    (h.0, h.1, h.2, (hilite_a * 255.0) as u8) // 高亮独立透明度
+                },
             );
         }
 
@@ -637,11 +652,11 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
                 composite_text(canvas, std::slice::from_raw_parts(bits as *const u8, pitch * h_out as usize), pitch, bx, by, bw, bh, col);
             };
 
-            // 编码行
+            // 编码行（【文字恒满】alpha 强制 255——任何透明设置不影响文字）
             if !f.raw.is_empty() {
                 draw_text(
                     &mut canvas, h_main, &f.raw, m + margin_x, m + margin_y, em,
-                    skin_color4(skin, "text_color", "#E8E8EAFF"),
+                    { let mut c = skin_color4(skin, "text_color", "#E8E8EAFF"); c.3 = 255; c },
                 );
             }
             // 候选行
@@ -655,19 +670,19 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
                 let y = y0 + (line_h + cand_spacing) * i as f32;
                 let is_sel = i == sel;
                 let c_label = if is_sel {
-                    skin_color4(skin, "hilited_candidate_label_color", "#FFD75EFF")
+                    let mut c = skin_color4(skin, "hilited_candidate_label_color", "#FFD75EFF"); c.3 = 255; c
                 } else {
-                    skin_color4(skin, "label_color", "#C9C9C9FF")
+                    let mut c = skin_color4(skin, "label_color", "#C9C9C9FF"); c.3 = 255; c
                 };
                 let c_text = if is_sel {
-                    skin_color4(skin, "hilited_candidate_text_color", "#FFFFFFFF")
+                    let mut c = skin_color4(skin, "hilited_candidate_text_color", "#FFFFFFFF"); c.3 = 255; c
                 } else {
-                    skin_color4(skin, "candidate_text_color", "#E8E8EAFF")
+                    let mut c = skin_color4(skin, "candidate_text_color", "#E8E8EAFF"); c.3 = 255; c
                 };
                 let c_cmt = if is_sel {
-                    skin_color4(skin, "hilited_comment_text_color", "#C9C9C9FF")
+                    let mut c = skin_color4(skin, "hilited_comment_text_color", "#C9C9C9FF"); c.3 = 255; c
                 } else {
-                    skin_color4(skin, "comment_text_color", "#9A9AA0FF")
+                    let mut c = skin_color4(skin, "comment_text_color", "#9A9AA0FF"); c.3 = 255; c
                 };
                 if show_index {
                     draw_text(&mut canvas, h_label, &format!("{}.", i + 1), m + margin_x, m + y, if label_pt > 0.0 { label_pt * 96.0 / 72.0 } else { em * 0.78 }, c_label);

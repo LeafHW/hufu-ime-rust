@@ -367,6 +367,13 @@ fn main() {
         assert_eq!(r, 1, "音效连打应全部顺利完成");
         println!("[14] 音效池化连打（含排队压力）✓");
 
+        // ── 管道键往返微基准（ipc 改动的量化回归点）──
+        type KeyBurstFn = unsafe extern "system" fn(u32) -> i32;
+        if let Some(p) = GetProcAddress(hmod, PCSTR(b"hufu_test_key_burst\0".as_ptr())) {
+            let kb: KeyBurstFn = std::mem::transmute(p);
+            let _ = unsafe { kb(200) };
+        }
+
         // ── 皮肤热更新 E2E：同窗两帧不同皮肤，屏幕像素必须显著变化 ──
         // （刻意排在音效之后：曾因 UAF 在音频线程收尾时崩 D3D 初始化，作回归哨兵）
         type SkinHotFn = unsafe extern "system" fn() -> i32;

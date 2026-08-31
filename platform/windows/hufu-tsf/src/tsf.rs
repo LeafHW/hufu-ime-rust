@@ -38,6 +38,8 @@ pub struct Shared {
     pub skin: serde_json::Value,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
+    /// 皮肤上次拉取时刻（2.5s 自动过期：打字中改皮肤也能热生效）
+    pub skin_loaded_at: std::time::Instant,
     /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
     pub delay_show_ms: u32,
     /// 上次 raw（变化检测）
@@ -84,6 +86,7 @@ impl Shared {
             cand_ui_host_draws: false,
             skin: serde_json::Value::Null,
             skin_stale: true,
+            skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
@@ -100,8 +103,14 @@ impl Shared {
     }
 
     fn load_skin(&mut self) {
-        // 编码会话开始（raw 空）时重新拉取皮肤 —— 设置界面改皮肤后，
-        // 下一次打字即生效（近热更新）
+        // 皮肤过期三通道：①首次 ②raw 空（断段）③拉取后超 2.5s——
+        // 【打字中热更新】③是关键：旧逻辑只在 raw 空时置 stale，打字
+        // 期间（raw 非空）改皮肤（透明度/颜色）永远用缓存——「设置页
+        // 预览变了、实际候选窗不变」的病根。2.5s 自动过期让改皮肤最
+        // 多 2.5 秒后下一帧生效，代价是每 2.5s 一次 ~100µs 管道往返。
+        if self.skin_loaded_at.elapsed() > std::time::Duration::from_millis(2500) {
+            self.skin_stale = true;
+        }
         if self.skin.is_null() || self.skin_stale {
             if let Some(v) = ipc::call(&serde_json::json!({"op": "skin"})) {
                 self.delay_show_ms = v
@@ -110,6 +119,7 @@ impl Shared {
                     .unwrap_or(0) as u32;
                 self.skin = v;
                 self.skin_stale = false;
+                self.skin_loaded_at = std::time::Instant::now();
             }
         }
     }
@@ -288,7 +298,21 @@ impl ITfTextInputProcessorEx_Impl for HuFuTs_Impl {
 }
 
 impl ITfKeyEventSink_Impl for HuFuTs_Impl {
-    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        // 【焦点残留】本进程键盘 sink 失去前台（切到别的应用打字、
+        // 开始菜单/UWP 宿主关闭）：立刻收起本进程候选窗，否则独立
+        // TOPMOST 窗会在新前台里残留成「第二个候选框」。server 会话
+        // 不动——切回原宿主时组段还在，可继续。poll_tick 另有前台
+        // 判据兜底（防个别宿主不走此回调）。
+        if !fforeground.as_bool() {
+            let mut g = self.shared.lock().unwrap();
+            if let Some(c) = g.cand2.as_mut() {
+                c.hide();
+            }
+            if let Some(c) = g.cand3.as_mut() {
+                c.hide();
+            }
+        }
         Ok(())
     }
 
@@ -439,9 +463,36 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
+            if let Some(c) = g.cand3.as_mut() {
+                c.hide();
+            }
             trace("foc: E hide完");
             if let Some(c) = g.cand.take() {
                 c.hide();
+            }
+            // 【UWP 失焦收候选】沉浸式宿主（Store/UWP/搜索框）的候选由
+            // server 代画或宿主 UIElement 画——本地 cand2/cand3 关不到
+            // 它。失焦即收尾代画通道（用户定稿：UWP 失焦/失光标就关
+            // 候选）。fire-and-forget：焦点回调绝不等待管道。
+            if g.cand_ui_active {
+                let host_draws = g.cand_ui_host_draws;
+                let ui_id = g.cand_ui_id;
+                g.cand_ui_active = false;
+                g.cand_ui_host_draws = false;
+                g.cand_ui = None;
+                drop(g);
+                if host_draws {
+                    let mgr = self.shared.lock().unwrap().thread_mgr.as_ref().and_then(|tm| {
+                        tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>().ok()
+                    });
+                    if let Some(m) = &mgr {
+                        let _ = unsafe { m.EndUIElement(ui_id) };
+                    }
+                } else {
+                    std::thread::spawn(|| {
+                        let _ = ipc::call(&serde_json::json!({ "op": "cand_hide" }));
+                    });
+                }
             }
         }
         trace("foc: F 返回前");
@@ -1180,7 +1231,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     };
     trace(&format!("cands={} raw='{}' cand2={} dead={}", cands.len(), raw, g.cand2.is_some(), g.cand2_dead));
 
-    g.load_skin();
+    // 【性能】皮肤拉取只在「无皮肤（首键）」时走按键路径——首次必须
+    // 拉否则无皮肤可渲染。此后 2.5s 过期拉取全部挪到 poll_tick 的
+    // 断段分支（raw 空）：改皮肤在下一组段生效，键路径零管道往返
+    //（「响应速度变慢」的修复——过期拉取曾在每键路径上同步等管道）。
+    if g.skin.is_null() {
+        g.load_skin();
+    }
     if cands.is_empty() && raw.is_empty() {
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
@@ -1443,7 +1500,11 @@ fn ui_element_show(
     g.cand_ui_host_draws = false;
     let skin = g.skin.clone();
     drop(g);
-    pipe_cand_push(cands, raw, sel, x, y, &skin);
+    // 宿主顶层窗（前台窗——代画显示时宿主必为前台）：交给 server 自守
+    //（宿主窗不可见时 server 自收代画窗——开始菜单残留的根治）
+    let host_hwnd = unsafe { GetForegroundWindow() };
+    let host_hwnd = if host_hwnd.0.is_null() { 0 } else { host_hwnd.0 as isize };
+    pipe_cand_push(cands, raw, sel, x, y, &skin, host_hwnd);
 }
 
 /// server 代画：pipe 推送候选帧（含皮肤，server 按皮肤渲染）
@@ -1454,6 +1515,7 @@ fn pipe_cand_push(
     x: i32,
     y: i32,
     skin: &serde_json::Value,
+    host_hwnd: isize,
 ) {
     let items: Vec<serde_json::Value> = cands
         .iter()
@@ -1467,6 +1529,7 @@ fn pipe_cand_push(
         "x": x,
         "y": y,
         "skin": skin,
+        "host_hwnd": host_hwnd,
     }));
     diag_note(&format!(
         "srv push n={} perr={}",
@@ -1521,8 +1584,8 @@ fn ui_element_hide(shared: &SharedRef) {
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, KillTimer, RegisterClassW, SetTimer, HWND_MESSAGE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetWindowThreadProcessId, KillTimer,
+    RegisterClassW, SetTimer, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 
 const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
@@ -1659,6 +1722,62 @@ fn poll_tick() {
         .as_ref()
         .map(|p| p.0.clone());
     let Some(shared) = shared else { return };
+    // 【残留兜底】前台窗口属于别的进程（宿主失焦：切到别的应用打字、
+    // 开始菜单/UWP 宿主关闭）→ 收起本进程候选窗并跳过本帧刷新。
+    // 组段会话不动（切回原宿主 poll 恢复显示）；正常显示期前台必然
+    // 是本进程宿主（候选窗自身不抢焦点）。OnSetFocus(false) 是同步
+    // 路径，这里是 140ms 兜底——个别宿主关闭时键盘 sink 回调不触发。
+    unsafe {
+        let fg = GetForegroundWindow();
+        if !fg.0.is_null() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            // 【UWP 豁免】Store 等 UWP 的可见窗口属于框架进程
+            // ApplicationFrameHost（pid≠内容进程）——前台判据会把
+            // 正在打字的 UWP 误判成「他进程」→ 候选闪现即被收
+            //（用户实测 Store 候选只闪一下）。SearchHost 例外：它
+            // 的前台窗属于自己（打字时 pid==我，不触发）；开始菜单
+            // 关闭后前台离开才需要兜底收残留——不能豁免。
+            if pid != std::process::id()
+                && !(host_is_packaged() && !host_is_searchhost())
+            {
+                let mut g = shared.lock().unwrap();
+                let mut any_visible = false;
+                if let Some(c) = g.cand2.as_mut() {
+                    any_visible |= c.is_visible();
+                    c.hide();
+                }
+                if let Some(c) = g.cand3.as_mut() {
+                    any_visible |= c.is_visible();
+                    c.hide();
+                }
+                // 沉浸式宿主两通道也收尾（UWP/搜索框走 UIElement 或
+                // server 代画——只藏 cand2 不够，残留正是缺这段）：
+                if g.cand_ui_active {
+                    if g.cand_ui_host_draws {
+                        let mgr = g.thread_mgr.as_ref().and_then(|tm| {
+                            tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>().ok()
+                        });
+                        let id = g.cand_ui_id;
+                        if let Some(mgr) = &mgr {
+                            let _ = unsafe { mgr.EndUIElement(id) };
+                            diag_note("poll: 前台他进程 → EndUIElement（残留兜底）");
+                        }
+                    } else {
+                        let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
+                        diag_note("poll: 前台他进程 → srv cand_hide（残留兜底）");
+                    }
+                    g.cand_ui_active = false;
+                }
+                if any_visible {
+                    diag_note(&format!(
+                        "poll: 前台他进程(pid={pid}) → 收起候选窗（残留兜底）"
+                    ));
+                }
+                return;
+            }
+        }
+    }
     let Some(state) = ipc::state_request() else { return };
     let raw_empty = state
         .get("raw")
@@ -1672,6 +1791,11 @@ fn poll_tick() {
         if raw_empty {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
+            // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
+            // 内）：键路径不再做管道往返（性能），改皮肤下一组段生效。
+            if !g.skin.is_null() {
+                g.load_skin();
+            }
             return;
         }
         // 补显：首帧稳定期抑制过的窗（suppress_pending），轮询时

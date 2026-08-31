@@ -25,9 +25,29 @@ const MAGIC: &[u8; 8] = b"TCSKNM02";
 pub const BOS: u32 = 0x02;
 pub const EOS: u32 = 0x03;
 
-/// 已加载的 ngram 模型（全量驻留内存）。
+/// 模型数据源：mmap 只读映射（生产）或堆 Vec（测试）。
+/// 【性能】214MB 模型改 mmap：私有内存 -214MB（页缓存承载可被
+/// 系统换出），启动免同步全量读盘（冷启动提速）；查询路径
+/// （rd_* 按字节读）完全不变。
+enum ModelData {
+    Map(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for ModelData {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            ModelData::Map(m) => m.as_ref(),
+            ModelData::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+/// 已加载的 ngram 模型（数据段 mmap 驻留，索引二分查询）。
 pub struct NgramModel {
-    data: Vec<u8>,
+    data: ModelData,
     pub index_stride: usize,
     uni_count: usize,
     uni_off: usize,
@@ -64,33 +84,41 @@ fn pack_key(first: u32, second: u32) -> i64 {
 
 impl NgramModel {
     pub fn load(path: &Path) -> std::io::Result<NgramModel> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes(data)
+        // mmap 只读映射（惰性换入：首查触发缺页，冷启动不再同步
+        // 读整文件 214MB）。独占写场景不存在——模型文件只读。
+        let file = std::fs::File::open(path)?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Self::build(ModelData::Map(map))
     }
 
     pub fn from_bytes(data: Vec<u8>) -> std::io::Result<NgramModel> {
-        if data.len() < 104 || &data[0..8] != MAGIC {
+        Self::build(ModelData::Owned(data))
+    }
+
+    fn build(data: ModelData) -> std::io::Result<NgramModel> {
+        let data_ref: &[u8] = &data;
+        if data_ref.len() < 104 || &data_ref[0..8] != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "非 TCSKNM02 模型文件（魔数不符）",
             ));
         }
-        let index_stride = rd_i64(&data, 24) as usize;
-        let uni_count = rd_i64(&data, 32) as usize;
-        let uni_off = rd_i64(&data, 40) as usize;
-        let bi_index_count = rd_i32(&data, 52) as usize;
-        let bi_blocks_off = rd_i64(&data, 56) as usize;
-        let bi_index_off = rd_i64(&data, 64) as usize;
-        let tri_index_count = rd_i32(&data, 80) as usize;
-        let tri_blocks_off = rd_i64(&data, 88) as usize;
-        let tri_index_off = rd_i64(&data, 96) as usize;
+        let index_stride = rd_i64(data_ref, 24) as usize;
+        let uni_count = rd_i64(data_ref, 32) as usize;
+        let uni_off = rd_i64(data_ref, 40) as usize;
+        let bi_index_count = rd_i32(data_ref, 52) as usize;
+        let bi_blocks_off = rd_i64(data_ref, 56) as usize;
+        let bi_index_off = rd_i64(data_ref, 64) as usize;
+        let tri_index_count = rd_i32(data_ref, 80) as usize;
+        let tri_blocks_off = rd_i64(data_ref, 88) as usize;
+        let tri_index_off = rd_i64(data_ref, 96) as usize;
 
         let mut uni_pos = HashMap::with_capacity(uni_count);
         let mut unigrams: Vec<(u32, f32)> = Vec::with_capacity(uni_count);
         for i in 0..uni_count {
             let off = uni_off + i * 8;
-            let cp = rd_i32(&data, off) as u32;
-            let p = rd_f32(&data, off + 4);
+            let cp = rd_i32(data_ref, off) as u32;
+            let p = rd_f32(data_ref, off + 4);
             uni_pos.insert(cp, i);
             unigrams.push((cp, p));
         }
@@ -129,7 +157,8 @@ impl NgramModel {
             Some(i) => *i,
             None => 0,
         };
-        rd_f32(&self.data, self.uni_off + idx * 8 + 4)
+        let d: &[u8] = &self.data;
+        rd_f32(d, self.uni_off + idx * 8 + 4)
     }
 
     /// 字频名次（1 起；未收录返回 usize::MAX）。

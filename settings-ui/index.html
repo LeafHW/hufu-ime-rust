@@ -116,6 +116,7 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 .color-item input[type=number] { width: 64px; min-width: 64px; padding: 4px 6px; }
 .skin-preview-wrap {
   flex: none; padding: 30px; border-radius: var(--radius);
+  position: relative; overflow: hidden;
   /* 实时透明：背景只留彩色光斑（衬托半透明/玻璃材质的实际通透感），
      不再用斜纹格子——预览即真实叠加效果 */
   background:
@@ -123,6 +124,19 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
     radial-gradient(circle at 80% 20%, #4f8cff55 0%, transparent 45%),
     radial-gradient(circle at 60% 80%, #7dffa855 0%, transparent 40%);
 }
+#livebg {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; z-index: 0; pointer-events: none;
+}
+.preview-tools {
+  position: relative; z-index: 2; margin-bottom: 10px; text-align: right;
+}
+.preview-tools button {
+  font-size: 12px; padding: 4px 12px; border-radius: 99px;
+  border: 1px solid var(--bd); background: var(--bg3); color: var(--fg2); cursor: pointer;
+}
+.preview-tools button:hover { border-color: var(--acc); color: var(--fg1); }
+#candwin-preview { position: relative; z-index: 1; }
 .material-note { font-size: 12px; color: var(--fg2); margin-top: 6px; }
 .pill { font-size: 11px; border-radius: 99px; padding: 2px 10px; background: var(--bg3); color: var(--fg2); }
 textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace; font-size: 12.5px; }
@@ -290,23 +304,24 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
+        <div class="preview-tools">
+          <button id="livebg-btn" title="把真实屏幕作为预览背景，实时透视透明效果">真实屏幕背景</button>
+        </div>
+        <video id="livebg" autoplay muted playsinline style="display:none"></video>
         <div id="candwin-preview"></div>
         <div class="material-note" id="material-note"></div>
       </div>
       <div style="flex:1;min-width:330px">
         <h3>材质</h3>
         <div class="row">
-          <div class="field"><label>效果</label>
-            <select id="mat-kind">
-              <option value="translucent">半透明（推荐）</option>
-              <option value="glass">玻璃（更透）</option>
-              <option value="solid">纯色</option>
-            </select></div>
-          <div class="field"><label>窗口色调</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-tint"><input type="number" id="mat-tint-a" min="0" max="255" title="不透明度"></span></div>
-          <div class="field"><label>透明度 <span class="val" id="mat-op-v"></span></label><input type="range" id="mat-op" min="0" max="100"></div>
-          <div class="field"><label>暗化 <span class="val" id="mat-darken-v"></span></label><input type="range" id="mat-darken" min="0" max="100"></div>
+          <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc"></div>
+          <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="除文字与高亮外所有元素（窗底/边框/编码底/阴影）的透明度，0%=全透明 100%=不透明"></div>
+          <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
+          <div class="field"><label>高亮色</label><input type="color" id="mat-hi" title="高亮候选的底色（配合高亮透明度）"></div>
+          <div class="field"><label>阴影透明度 <span class="val" id="mat-sa-v"></span></label><input type="range" id="mat-sa" min="0" max="100" title="候选窗投影的透明度（独立控制）"></div>
+          <div class="field"><label>边框透明度 <span class="val" id="mat-ba-v"></span></label><input type="range" id="mat-ba" min="0" max="100" title="边框色的透明度（独立控制）"></div>
           <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
-          <div class="field"><label>边框色</label><span style="display:flex;gap:6px;align-items:center"><input type="color" id="mat-bc"><input type="number" id="mat-bc-a" min="0" max="255"></span></div>
+          <div class="field"><label>边框色</label><input type="color" id="mat-bc"></div>
         </div>
         <h3>布局</h3>
         <div class="row">
@@ -321,6 +336,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="20" step="0.5"></div>
           <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="20" step="0.5"></div>
           <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="480" step="10"></div>
+          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="24" step="0.5"></div>
+          <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-10" max="10" step="1"></div>
         </div>
         <h3>颜色角色</h3>
         <div class="color-grid" id="color-grid"></div>
@@ -562,57 +579,124 @@ const COLOR_ROLES = [
   ["back_color", "窗口背景"], ["border_color", "窗口边框"], ["text_color", "编码文字"],
   ["candidate_text_color", "候选文字"], ["comment_text_color", "注释文字"], ["label_color", "序号"],
   ["hilited_text_color", "编码文字（高亮）"], ["hilited_candidate_text_color", "候选文字（高亮）"],
-  ["hilited_candidate_back_color", "候选背景（高亮）"], ["hilited_candidate_label_color", "序号（高亮）"],
+  ["hilited_candidate_label_color", "序号（高亮）"],
   ["hilited_comment_text_color", "注释（高亮）"], ["hilited_mark_color", "标记点"],
   ["shadow_color", "窗口阴影"], ["preedit_back_color", "编码区背景"],
+  ["hilited_back_color", "编码背景（高亮）"], ["hilited_label_color", "序号（编码高亮）"],
+  ["candidate_back_color", "候选背景"], ["candidate_shadow_color", "候选阴影"],
+  ["hilited_shadow_color", "阴影（编码高亮）"], ["hilited_candidate_shadow_color", "阴影（候选高亮）"],
+  ["capsule_text_color", "胶囊文字"], ["capsule_back_color", "胶囊背景"],
 ];
 function hexOf(c) { return "#" + c.slice(1, 7); }
 function alphaOf(c) { return parseInt(c.slice(7, 9) || "FF", 16); }
 function withA(hex, a) { return hex + Math.round(a).toString(16).padStart(2, "0").toUpperCase(); }
 function buildColorGrid() {
   const g = $("#color-grid"); g.innerHTML = "";
+  // 【用户定稿】颜色只管色相：无每色 alpha 数字框——透明度只由
+  // 「整体透明度」与「高亮透明度」两个滑条决定（渲染端忽略 alpha 分量）。
   COLOR_ROLES.forEach(([k, name]) => {
     const d = document.createElement("div"); d.className = "color-item";
-    d.innerHTML = `<label>${name}</label><input type="color" id="ck-${k}"><input type="number" id="ca-${k}" min="0" max="255" title="不透明度">`;
+    d.innerHTML = `<label>${name}</label><input type="color" id="ck-${k}">`;
     g.appendChild(d);
-    $("#ck-" + k, d) && null;
   });
   COLOR_ROLES.forEach(([k]) => {
-    const ci = g.querySelector(`#ck-${k}`), ai = g.querySelector(`#ca-${k}`);
-    const sync = () => { ci.value = hexOf(SKIN.colors[k] || "#000000"); ai.value = alphaOf(SKIN.colors[k] || "#FF"); };
-    ci.oninput = () => { SKIN.colors[k] = withA(ci.value, parseFloat(ai.value)); preview(); };
-    ai.oninput = () => { SKIN.colors[k] = withA(ci.value, parseFloat(ai.value)); preview(); };
+    const ci = g.querySelector(`#ck-${k}`);
+    const sync = () => { ci.value = hexOf(SKIN.colors[k] || "#000000"); };
+    ci.oninput = () => { SKIN.colors[k] = ci.value + "FF"; preview(); };
+    ci.onchange = () => api("POST", "/api/skin", SKIN).catch(() => {});
     sync();
   });
 }
 function bindSkin() {
   $$("[data-skin]").forEach(el => { el.value = SKIN[el.dataset.skin] ?? ""; el.oninput = () => SKIN[el.dataset.skin] = el.value; });
-  $("#mat-kind").value = SKIN.material.kind;
-  $("#mat-kind").onchange = e => { SKIN.material.kind = e.target.value; preview(); };
-  const pair = (id, key, alphaId) => {
-    const ci = $(id), ai = $(alphaId);
-    ci.value = hexOf(SKIN.material[key]); ai.value = alphaOf(SKIN.material[key]);
-    ci.oninput = () => { SKIN.material[key] = withA(ci.value, parseFloat(ai.value)); preview(); };
-    ai.oninput = () => { SKIN.material[key] = withA(ci.value, parseFloat(ai.value)); preview(); };
-  };
-  pair("#mat-tint", "tint", "#mat-tint-a"); pair("#mat-bc", "border_color", "#mat-bc-a");
-  const rng = (id, key, fmt) => { const el = $(id); el.value = SKIN.material[key]; $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(SKIN.material[key]) : SKIN.material[key]); el.oninput = () => { SKIN.material[key] = parseFloat(el.value); $(id + "-v") && ($(id + "-v").textContent = fmt ? fmt(el.value) : el.value); preview(); }; };
-  rng("#mat-darken", "darken", v => (v / 100).toFixed(2)); $("#mat-darken").max = 100;
   const saveSkinQuiet = async () => { try { await api("POST", "/api/skin", SKIN); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
-  // 透明度：滑条 0-100 ↔ 存储 0-1（0=全透明 1=不透明），改动即存
-  if (SKIN.material.opacity == null) SKIN.material.opacity = 1;
+  // 【纯色模型·用户定稿】不再有材质（kind/tint/暗化/旧透明度全撤）：
+  // 窗底=colors.back_color（alpha×整体透明度）、高亮底=自带alpha×高亮
+  // 透明度、其余非文字元素=自带alpha×整体透明度；文字 alpha 恒满。
+  // 窗口底色（写 colors.back_color；alpha 由整体透明度滑条决定）
   {
-    const op = $("#mat-op");
-    op.value = Math.round(SKIN.material.opacity * 100);
-    $("#mat-op-v").textContent = op.value + "%";
-    op.oninput = () => {
-      SKIN.material.opacity = op.value / 100;
-      $("#mat-op-v").textContent = op.value + "%";
+    const ci = $("#mat-bgc");
+    const syncBg = () => { ci.value = hexOf(SKIN.colors.back_color || "#202022"); };
+    ci.oninput = () => { SKIN.colors.back_color = ci.value + "FF"; preview(); };
+    ci.onchange = saveSkinQuiet;
+    syncBg();
+  }
+  // 边框宽度/颜色：真候选窗消费 layout.border_width + colors.border_color
+  {
+    const bw = $("#mat-bw"), bcv = $("#mat-bc");
+    const syncB = () => {
+      bw.value = SKIN.layout.border_width ?? 1;
+      $("#mat-bw-v").textContent = SKIN.layout.border_width ?? 1;
+      bcv.value = hexOf(SKIN.colors.border_color || "#FFFFFF");
+    };
+    bw.oninput = () => { SKIN.layout.border_width = parseFloat(bw.value); $("#mat-bw-v").textContent = bw.value; preview(); };
+    bw.onchange = saveSkinQuiet;
+    bcv.oninput = () => { SKIN.colors.border_color = bcv.value + "FF"; preview(); };
+    bcv.onchange = saveSkinQuiet;
+    syncB();
+  }
+  // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
+  if (SKIN.material.master_alpha == null) SKIN.material.master_alpha = 1;
+  {
+    const ma = $("#mat-ma");
+    ma.value = Math.round(SKIN.material.master_alpha * 100);
+    $("#mat-ma-v").textContent = ma.value + "%";
+    ma.oninput = () => {
+      SKIN.material.master_alpha = ma.value / 100;
+      $("#mat-ma-v").textContent = ma.value + "%";
       preview();
     };
-    op.onchange = saveSkinQuiet;
+    ma.onchange = saveSkinQuiet;
   }
-  rng("#mat-bw", "border_width");
+  // 边框透明度（border_alpha 0-1）：边框色独立控制
+  if (SKIN.material.border_alpha == null) SKIN.material.border_alpha = 1;
+  {
+    const ba = $("#mat-ba");
+    ba.value = Math.round(SKIN.material.border_alpha * 100);
+    $("#mat-ba-v").textContent = ba.value + "%";
+    ba.oninput = () => {
+      SKIN.material.border_alpha = ba.value / 100;
+      $("#mat-ba-v").textContent = ba.value + "%";
+      preview();
+    };
+    ba.onchange = saveSkinQuiet;
+  }
+  // 阴影透明度（shadow_alpha 0-1）：候选窗投影独立控制
+  if (SKIN.material.shadow_alpha == null) SKIN.material.shadow_alpha = 1;
+  {
+    const sa = $("#mat-sa");
+    sa.value = Math.round(SKIN.material.shadow_alpha * 100);
+    $("#mat-sa-v").textContent = sa.value + "%";
+    sa.oninput = () => {
+      SKIN.material.shadow_alpha = sa.value / 100;
+      $("#mat-sa-v").textContent = sa.value + "%";
+      preview();
+    };
+    sa.onchange = saveSkinQuiet;
+  }
+  // 高亮色（写 colors.hilited_candidate_back_color——已从颜色区移到这里，
+  // 与高亮透明度并排）
+  {
+    const ci = $("#mat-hi");
+    const syncHi = () => { ci.value = hexOf(SKIN.colors.hilited_candidate_back_color || "#404046"); };
+    ci.oninput = () => { SKIN.colors.hilited_candidate_back_color = ci.value + "FF"; preview(); };
+    ci.onchange = saveSkinQuiet;
+    syncHi();
+  }
+  // 高亮透明度（hilite_alpha 0-1）：高亮候选底独立控制
+  if (SKIN.material.hilite_alpha == null) SKIN.material.hilite_alpha = 1;
+  {
+    const ha = $("#mat-ha");
+    ha.value = Math.round(SKIN.material.hilite_alpha * 100);
+    $("#mat-ha-v").textContent = ha.value + "%";
+    ha.oninput = () => {
+      SKIN.material.hilite_alpha = ha.value / 100;
+      $("#mat-ha-v").textContent = ha.value + "%";
+      preview();
+    };
+    ha.onchange = saveSkinQuiet;
+  }
+  // rng("#mat-bw", ...) 已并入上方边框对齐块（真窗键 layout.border_width）
   $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
   $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); }; };
@@ -620,6 +704,7 @@ function bindSkin() {
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
   lrng("#l-cs", "candidate_spacing"); lrng("#l-ls", "line_spacing");
   lrng("#l-lfp", "label_font_point"); lrng("#l-w", "width");
+  lrng("#l-sr", "shadow_radius"); lrng("#l-soy", "shadow_offset_y");
   // 通用页「竖排候选」复用为同一开关（皮肤 layout.horizontal 取反），改动即存皮肤
   const cv = $("#c-v");
   cv.checked = !SKIN.layout.horizontal;
@@ -642,33 +727,62 @@ function preview() {
   const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
   const w = $("#candwin-preview");
   w.className = "preview-wrap";
-  const border = M.border_width > 0 ? `${M.border_width}px solid ${M.border_color}` : `${L.border_width || 1}px solid ${c.border_color}`;
-  // 透明感知预览：alpha 语义与真实候选窗一致（material.opacity × 底色 alpha）
-  //   solid → back_color；其余 → material.tint（乘 kind 系数）
-  const hexA = (hex, mul) => {
-    const m = /^#?([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?$/.exec(hex || "");
-    if (!m) return hex;
-    const a = Math.round((parseInt(m[2] || "ff", 16) / 255) * mul);
-    return `#${m[1]}${a.toString(16).padStart(2, "0")}`;
-  };
-  const op = Math.max(0, Math.min(1, M.opacity ?? 1));
-  const kindK = M.kind === "glass" ? 0.55 : (M.kind === "solid" ? 1 : 0.85);
-  const bgc = M.kind === "solid" ? hexA(c.back_color, op) : hexA(M.tint, op * kindK);
-  const darken = M.darken > 0 ? `linear-gradient(rgba(0,0,0,${M.darken / 100 * 0.35}),rgba(0,0,0,${M.darken / 100 * 0.35})),` : "";
+  // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
+  // · 窗底/边框/编码底/阴影 alpha = 整体透明度滑条
+  // · 高亮底 alpha = 高亮透明度滑条（独立）
+  // · 文字（编码/序号/候选/注释）一律 100% 不透明
+  const ma = Math.max(0, Math.min(1, M.master_alpha ?? 1));
+  const ha = Math.max(0, Math.min(1, M.hilite_alpha ?? 1));
+  const sAlpha = Math.max(0, Math.min(1, M.shadow_alpha ?? 1));
+  const bAlpha = Math.max(0, Math.min(1, M.border_alpha ?? 1));
+  const elemA = hex => withA(hex.slice(0, 7), Math.round(ma * 255));
+  const hiA = hex => withA(hex.slice(0, 7), Math.round(ha * 255));
+  const shA = hex => withA(hex.slice(0, 7), Math.round(sAlpha * 255)); // 阴影独立
+  const bdA = hex => withA(hex.slice(0, 7), Math.round(bAlpha * 255)); // 边框独立
+  const solid = hex => hex.slice(0, 7); // 文字恒不透明
+  // 边框预览 = 真窗消费键（elemA 只处理 hex 色值——先定义后使用，防 TDZ）
+  const border = L.border_width > 0 ? `${L.border_width}px solid ${bdA(c.border_color)}` : "none";
+  const bgc = elemA(c.back_color);
   // 棋盘格底透出透明度；四角真实透明（pre 视觉≈真窗圆角）
-  const checker = "repeating-conic-gradient(#3a3a40 0% 25%, #2b2b30 0% 50%) 0 0/14px 14px";
-  w.style.cssText = `background:${checker};border:none;padding:0`;
+  // 默认底：外层光斑（衬托透明感）；开启真实屏幕背景后 video 铺底，
+  // 预览窗透出的是真实屏幕内容——所见即所得
+  const liveOn = !$("#livebg").style.display.includes("none");
+  w.style.cssText = "position:relative;z-index:1;border:none;padding:0;background:transparent";
   const inner = document.createElement("div");
   w.innerHTML = "";
   inner.className = "candwin" + (L.horizontal ? " horizontal" : "");
-  inner.style.cssText = `background:${darken}${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${c.shadow_color};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${c.hilited_candidate_back_color};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${hi ? c.hilited_candidate_text_color : c.candidate_text_color}"><span class="idx" style="color:${hi ? c.hilited_candidate_label_color : c.label_color}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${hi ? c.hilited_comment_text_color : c.comment_text_color}">${cmt}</span>` : ""}</div>`;
+  inner.style.cssText = `background:${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}"><span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
   inner.innerHTML =
-    `<div class="preedit-line" style="color:${c.text_color};background:${c.preedit_back_color};border-radius:4px"><span style="opacity:.6">tuj</span>a</div>` +
+    `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
   w.appendChild(inner);
-  const names = { frosted: "半透明（旧名毛玻璃，无模糊）", glass: "玻璃（轻透明）", translucent: "半透明（不模糊）", solid: "纯色" };
-  $("#material-note").textContent = `${names[M.kind] || M.kind} · 透明度 ${(Math.round((1 - op) * 100))}%`;
+  $("#material-note").textContent = `纯色 · 整体透明度 ${Math.round(ma * 100)}% · 高亮透明度 ${Math.round(ha * 100)}% · 文字恒不透明`;
+}
+/* ── 真实屏幕背景：把实际屏幕作为预览底，透明度所见即所得 ── */
+{
+  const btn = () => $("#livebg-btn");
+  let stream = null;
+  document.addEventListener("DOMContentLoaded", () => {
+    btn().onclick = async () => {
+      const v = $("#livebg");
+      if (stream) { // 再点一次关闭
+        stream.getTracks().forEach(t => t.stop()); stream = null;
+        v.style.display = "none"; v.srcObject = null;
+        btn().textContent = "真实屏幕背景"; preview(); return;
+      }
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        v.srcObject = stream; v.style.display = "block";
+        btn().textContent = "关闭真实背景";
+        stream.getVideoTracks()[0].addEventListener("ended", () => {
+          stream = null; v.style.display = "none"; v.srcObject = null;
+          btn().textContent = "真实屏幕背景"; preview();
+        });
+        preview();
+      } catch (e) { msg("未授权屏幕捕获，保持渐变底：" + e.message, "err"); }
+    };
+  });
 }
 async function loadSkinList(sel) {
   const r = await api("GET", "/api/skins");
@@ -679,9 +793,13 @@ async function loadSkinList(sel) {
 }
 async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
-  bindSkin(); buildColorGrid(); preview();
+  bindSkin(); buildColorGrid();
   // 选中即切换为当前皮肤（select 端点不写皮肤文件，避免覆盖）
   try { await api("POST", "/api/skin/select", { id }); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
+  // 双保险重绘：同步一次 + 下一帧再一次（个别浏览器 select 切换后
+  // 首次重绘被合并掉——用户报「换皮肤预览不更新、动一下才变」）
+  preview();
+  requestAnimationFrame(() => preview());
 }
 
 /* ── 用户词 ── */

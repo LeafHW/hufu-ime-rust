@@ -265,6 +265,7 @@ dependencies = [
  "hufu-config",
  "hufu-dict",
  "hufu-engine",
+ "hufu-sentence",
  "hufu-types",
  "serde_json",
 ]
@@ -320,6 +321,7 @@ dependencies = [
  "hufu-dict",
  "hufu-engine",
  "hufu-types",
+ "memmap2",
  "serde",
 ]
 

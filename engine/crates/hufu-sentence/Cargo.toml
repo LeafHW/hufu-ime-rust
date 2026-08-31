@@ -10,3 +10,4 @@ hufu-dict = { path = "../hufu-dict" }
 hufu-config = { path = "../hufu-config" }
 hufu-engine = { path = "../hufu-engine" }
 serde = { workspace = true }
+memmap2 = "0.9"

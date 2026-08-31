@@ -252,6 +252,10 @@ pub fn call(req: &Value) -> Option<Value> {
         let raw_pipe = f.as_raw_handle() as isize;
         let wait_response = |total_ms: u64| -> Option<()> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+            // 【响应等待分级】server 处理一次 key 通常 <3ms：先自旋让快
+            // 响应零等待，再让步、再 1ms/10ms 粒度递进。旧版上来就
+            // sleep(10ms)——每键白交 10ms 量子税，真实打字延迟的大头。
+            let start = std::time::Instant::now();
             loop {
                 let mut avail: u32 = 0;
                 if PeekNamedPipe(raw_pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0 {
@@ -264,7 +268,18 @@ pub fn call(req: &Value) -> Option<Value> {
                 if std::time::Instant::now() >= deadline {
                     return None;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                let el = start.elapsed();
+                if el.as_micros() < 600 {
+                    for _ in 0..32 {
+                        std::hint::spin_loop();
+                    }
+                } else if el.as_millis() < 4 {
+                    std::thread::yield_now();
+                } else if el.as_millis() < 20 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         };
         wait_response(2000)?;

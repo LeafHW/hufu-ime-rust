@@ -405,7 +405,7 @@ pub struct AppearanceSection {
 impl Default for AppearanceSection {
     fn default() -> Self {
         AppearanceSection {
-            skin: "hufu-default".into(),
+            skin: "hufu-moyan".into(), // 【用户定稿】墨岩为默认皮肤
             font_family: String::new(),
             font_size: 17.6,
             status_capsule: true,
