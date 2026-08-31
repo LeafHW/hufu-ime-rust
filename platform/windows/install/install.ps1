@@ -22,11 +22,26 @@ if (-not $isAdmin) {
 }
 
 # ── 定位 DLL ────────────────────────────────────────────────
-$dll = Join-Path $PSScriptRoot '..\target\release\hufu_tsf.dll'
+# 查找顺序：① 发行包自身目录（绿色分发：install.ps1 与 DLL 同级）
+#          ② 仓库构建输出（开发机直装）
+#          ③ 开发机绝对路径（历史兜底）
+$dll = Join-Path $PSScriptRoot 'hufu_tsf.dll'
+if (-not (Test-Path $dll)) { $dll = Join-Path $PSScriptRoot '..\target\release\hufu_tsf.dll' }
 if (-not (Test-Path $dll)) { $dll = 'E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll' }
 $dll = [System.IO.Path]::GetFullPath($dll)
-if (-not (Test-Path $dll)) { throw "找不到 hufu_tsf.dll：$dll（先 cd platform/windows; cargo build --release）" }
+if (-not (Test-Path $dll)) { throw "找不到 hufu_tsf.dll：$dll（发行包内应与本脚本同级；开发机构建：cd platform/windows; cargo build --release）" }
 Write-Host "DLL: $dll"
+
+# ── 发行包位置登记（server 自愈拉起的跨架构锚点）──────────────
+# DLL 在 32 位宿主里注册于 SysWOW64（exe 旁无 server），靠
+# HKCU\Software\HuFu\InstallDir 找回包内 hufu-server.exe（ipc.rs
+# ensure_server 的候选 2，读 64 位视图，x86/x64 进程一致）。
+# 仅当本脚本运行于发行包内（旁边就是 server）时写入。
+$pkgServer = Join-Path $PSScriptRoot 'hufu-server.exe'
+if (Test-Path $pkgServer) {
+    Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $PSScriptRoot
+    Write-Host "✓ InstallDir 已登记: $PSScriptRoot"
+}
 
 function Set-Reg([string]$Path, [string]$Name, [string]$Value) {
     if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
@@ -99,7 +114,9 @@ Write-Host '✓ HKCU 用户侧已启用'
 # ── msctf 原生档案登记（提权环境直调，官方 IME 安装器同款）────
 # ITfInputProcessorProfiles::Register + AddLanguageProfile + Enable。
 # 非提权必 E_FAIL；缺这步 Win+空格 切换器不显示、官方 API 拒收。
-$smoke = Join-Path $PSScriptRoot '..\target\release\hufu-tsf-smoke.exe'
+# 定位同 DLL：发行包目录优先（smoke exe 与脚本同级），其次构建输出。
+$smoke = Join-Path $PSScriptRoot 'hufu-tsf-smoke.exe'
+if (-not (Test-Path $smoke)) { $smoke = Join-Path $PSScriptRoot '..\target\release\hufu-tsf-smoke.exe' }
 $smoke = [System.IO.Path]::GetFullPath($smoke)
 if (Test-Path $smoke) {
     & $smoke reg
@@ -134,10 +151,10 @@ Write-Host '✓ ctfmon 已重启'
 
 # ── 提醒 ───────────────────────────────────────────────────
 Write-Host ''
-Write-Host '安装完成。接下来：' -ForegroundColor Green
-Write-Host '  1) 确保输入引擎在跑:  E:\DSH-KF\hufu\engine\target\release\hufu-server.exe'
-Write-Host '     （它提供 \\.\pipe\hufu-ime 管道与 localhost 设置页）'
-Write-Host '  2) Win+空格 切到「HuFu 虎符输入法」即可使用'
+Write-Host '安装完成。' -ForegroundColor Green
+Write-Host '  · 输入引擎（hufu-server）会在首次切换到虎符时自动拉起，无需手动启动'
+Write-Host '  · Win+空格 切到「HuFu 虎符输入法」即可使用'
+Write-Host '  · 设置页: 双击 安装目录里的 设置.bat（或托盘图标右键）'
 Write-Host ''
 Write-Host '卸载: .\uninstall.ps1'
 Stop-Transcript | Out-Null

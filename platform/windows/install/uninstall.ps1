@@ -37,6 +37,9 @@ Remove-Item "HKCU:\Software\Classes\Wow6432Node\CLSID\$CLSID" -Recurse -Force -E
 Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 # 32 位 DLL（SysWOW64\SystemIME\HuFu）
 Remove-Item "$env:SystemRoot\SysWOW64\SystemIME\HuFu" -Recurse -Force -ErrorAction SilentlyContinue
+# 发行包位置登记（server 自愈拉起锚点）+ 托盘自启项
+Remove-Item 'HKCU:\Software\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'HuFuServer' -ErrorAction SilentlyContinue
 
 # 5) ctfmon 重读
 Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
