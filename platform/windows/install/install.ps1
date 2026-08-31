@@ -32,17 +32,6 @@ $dll = [System.IO.Path]::GetFullPath($dll)
 if (-not (Test-Path $dll)) { throw "找不到 hufu_tsf.dll：$dll（发行包内应与本脚本同级；开发机构建：cd platform/windows; cargo build --release）" }
 Write-Host "DLL: $dll"
 
-# ── 发行包位置登记（server 自愈拉起的跨架构锚点）──────────────
-# DLL 在 32 位宿主里注册于 SysWOW64（exe 旁无 server），靠
-# HKCU\Software\HuFu\InstallDir 找回包内 hufu-server.exe（ipc.rs
-# ensure_server 的候选 2，读 64 位视图，x86/x64 进程一致）。
-# 仅当本脚本运行于发行包内（旁边就是 server）时写入。
-$pkgServer = Join-Path $PSScriptRoot 'hufu-server.exe'
-if (Test-Path $pkgServer) {
-    Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $PSScriptRoot
-    Write-Host "✓ InstallDir 已登记: $PSScriptRoot"
-}
-
 function Set-Reg([string]$Path, [string]$Name, [string]$Value) {
     if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
     if ($Name -eq '(default)') {
@@ -59,6 +48,19 @@ function Set-Reg([string]$Path, [string]$Name, [string]$Value) {
 function Set-RegDWord([string]$Path, [string]$Name, [int]$Value) {
     if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
     Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord
+}
+
+# ── 发行包位置登记（server 自愈拉起的跨架构锚点）──────────────
+# DLL 在 32 位宿主里注册于 SysWOW64（exe 旁无 server），靠
+# HKCU\Software\HuFu\InstallDir 找回包内 hufu-server.exe（ipc.rs
+# ensure_server 的候选 2，读 64 位视图，x86/x64 进程一致）。
+# 仅当本脚本运行于发行包内（旁边就是 server）时写入。
+# 【位置注意】必须在 Set-Reg 函数定义之后（曾在函数定义前调用，
+# $ErrorActionPreference=Stop 下脚本静默早退——安装只跑了一行的教训）。
+$pkgServer = Join-Path $PSScriptRoot 'hufu-server.exe'
+if (Test-Path $pkgServer) {
+    Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $PSScriptRoot
+    Write-Host "✓ InstallDir 已登记: $PSScriptRoot"
 }
 
 # ── HKLM：COM 服务器 + CTF TIP 清单 ────────────────────────
