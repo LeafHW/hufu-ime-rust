@@ -8,7 +8,9 @@ use std::sync::Arc;
 fn setup() -> (Engine, Session, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("hufu-engine-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let dict_dir = dir.join("dictionaries").join("虎码单字");
+    // 与 Config::default 的 schema.dir（"码表"）保持一致——1c94901
+    // 改 default 目录名后 fixture 未同步，Engine::new 找不到方案目录
+    let dict_dir = dir.join("码表").join("虎码单字");
     std::fs::create_dir_all(&dict_dir).unwrap();
     std::fs::write(
         dict_dir.join("tiger.dict.yaml"),
@@ -85,22 +87,32 @@ fn second_and_third_select() {
     let st = out.state.unwrap();
     assert_eq!(st.candidates[0].text, "底");
 
-    // a 的次选走 `;`：`a;` 是「那个」的编码，仍延续
+    // a 的次选走 `;`：`a;` 是「那个」的编码，仍延续。新组段显式清缓冲
+    // （旧死路顶功语义里 u;+a 靠死路推屏自然分字；新语义死路=清屏，
+    // 残留 raw 会吞掉新首键）
+    session.clear();
     engine.process_key(&mut session, key('a'));
     let out = engine.process_key(&mut session, key(';'));
     assert_eq!(out.commit, None);
-    assert_eq!(out.state.unwrap().candidates[0].text, "那个");
+    let cands = out.state.unwrap().candidates;
+    let dbg: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+    assert!(
+        cands.iter().any(|c| c.text == "那个"),
+        "a; 应组出「那个」，实际候选: {dbg:?}"
+    );
 }
 
 #[test]
 fn dinggong_push() {
-    // 顶功：一简 a(来) 后跟死路字符 → 自动上屏「来」，新码从新字符开始
+    // 顶功（语义定版 2026-08-31）：死路键【不】顶屏——只有超过最大
+    // 码长（第 max+1 键）才顶首选。一简 a(来) 后跟死路 z：不上屏，
+    // 空码按 auto_clear_empty 清缓冲。
     let (mut engine, mut session, _dir) = setup();
     engine.process_key(&mut session, key('a')); // 来
-    let out = engine.process_key(&mut session, key('z')); // az 无任何延续 → 顶功
-    assert_eq!(out.commit.as_deref(), Some("来"));
+    let out = engine.process_key(&mut session, key('z')); // az 死路
+    assert_eq!(out.commit, None, "死路键不得自动上屏");
     let st = out.state.unwrap();
-    assert_eq!(st.raw, "z");
+    assert_eq!(st.raw, "", "空码自动清屏（auto_clear_empty 默认开）");
 }
 
 #[test]
@@ -168,7 +180,7 @@ fn punct_fullwidth_and_pair() {
 #[test]
 fn reverse_lookup_mode() {
     let (mut engine, mut session, _dir) = setup();
-    let dir = engine.data_dir.join("dictionaries").join("虎码单字");
+    let dir = engine.data_dir.join("码表").join("虎码单字");
     std::fs::write(dir.join("Bime_小鹤双拼反查.txt"), "我\two\n的\tde\n").unwrap();
     engine.schema = hufu_dict::Schema::load(&dir).unwrap();
     engine.process_key(&mut session, key('`'));

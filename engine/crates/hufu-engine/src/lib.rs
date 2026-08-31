@@ -812,10 +812,15 @@ impl Engine {
         let sentence_mode = self.sentence_active();
         let sentence_takeover = sentence_mode && len > max_len;
 
-        // 顶功：超长（第 max+1 码）或死路（新码无任何延续）
+        // 顶功：仅超长顶屏（第 max+1 键，即最大码长 4 时的第 5 键）。
+        // 【语义定版】死路（新码无延续）不顶——此前实现 3 码全码字后
+        // 接死路键也自动上屏（如 kog+x 直接顶「涅」），与「打第五码才
+        // 上屏」的顶功定义不符（用户实测拍板）。死路走下方空码清屏
+        // 分支（auto_clear_empty 开则清缓冲重打，关则留空码由退格/空格
+        // 处理）。
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
         let over_length = len > max_len;
-        if (over_length || dead_end) && !sentence_mode && self.config.input.auto_push && !has_upper
+        if over_length && !sentence_mode && self.config.input.auto_push && !has_upper
         {
             if let Some(first) = prev_cands.first().cloned() {
                 // 提交追加前 raw 的首选，新 raw 从刚输入的字符重新开始
