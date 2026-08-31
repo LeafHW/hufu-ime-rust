@@ -8,6 +8,10 @@ mod candwin2;
 mod candwin3;
 mod canduielement;
 mod com;
+// i686 windows-gnu 交叉链接补丁：llvm libmingw32 无 _DllEntryPoint@12，
+// 由本模块 stub 提供（转发 DllMainCRTStartup）。x86_64 不编入。
+#[cfg(all(target_arch = "x86", target_env = "gnu"))]
+mod dll_entry_x86;
 mod ipc;
 // 语言栏按钮已下线（Win11 桌面语言栏为可拖浮动条，用户实测否决）；
 // langbar.rs 源码保留，备将来做中/英态切换时复用。

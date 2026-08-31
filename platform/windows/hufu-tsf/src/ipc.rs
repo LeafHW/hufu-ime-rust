@@ -51,12 +51,23 @@ const PIPE: &str = r"\\.\pipe\hufu-ime";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// STARTUPINFOW + PROCESS_INFORMATION 原始布局（CreateProcessW 用）。
+/// cb 必须按架构给（x64 sizeof=104 / i386=68）；rest 冗余放大到 96B
+/// 保证两种架构下系统按 cb 读取时都在本结构内存内。
 #[repr(C)]
 #[allow(dead_code)]
 struct SpawnBlock {
     si_cb: u32,
-    si_rest: [u64; 10], // reserved..std_error 全零即可
+    si_rest: [u64; 12], // reserved..std_error 全零即可
     pi: [isize; 4],     // hProcess/hThread/pid/tid
+}
+impl SpawnBlock {
+    fn zeroed() -> Self {
+        SpawnBlock {
+            si_cb: if cfg!(target_arch = "x86") { 68 } else { 104 },
+            si_rest: [0; 12],
+            pi: [0; 4],
+        }
+    }
 }
 
 /// 自愈：server 不在（管道打不开且无实例等待）时拉起 hufu-server.exe。
@@ -159,11 +170,7 @@ fn ensure_server() -> bool {
             None => format!("\"{exe}\""),
         };
         let mut cmd: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
-        let mut blk = SpawnBlock {
-            si_cb: 104, // sizeof(STARTUPINFOW)
-            si_rest: [0; 10],
-            pi: [0; 4],
-        };
+        let mut blk = SpawnBlock::zeroed();
         let ok = unsafe {
             CreateProcessW(
                 wexe.as_ptr(),

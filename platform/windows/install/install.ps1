@@ -1,4 +1,4 @@
-﻿# HuFu 虎符输入法 — Windows 安装脚本（需要管理员一次）
+# HuFu 虎符输入法 — Windows 安装脚本（需要管理员一次）
 # 作用：把 hufu-tsf.dll 注册为系统 TSF 输入法（HKLM）+ 当前用户启用（HKCU）。
 # 注册表布局对齐微软拼音实测：LanguageProfile 名值（Description=SZ /
 # Enable=DWORD / IconFile+IconIndex），Category 两层子键纯存在性。
@@ -65,6 +65,28 @@ Set-RegDWord $lp 'Enable' 1
 Set-Reg $lp 'IconFile' "$env:SystemRoot\System32\shell32.dll"
 Set-RegDWord $lp 'IconIndex' 70
 Write-Host '✓ HKLM COM + CTF TIP 已注册'
+
+# ── 32 位宿主支持（WoW64：Pain 打器等 32 位进程）─────────────
+# 32 位进程无法加载 x64 COM DLL；照虎爪/小狼毫双视图模式在
+# WOW6432Node 再挂一份 InprocServer32 指向 32 位 DLL。
+# 32 位 DLL 定位：优先发行包同目录，其次 i686 构建输出。
+$dll32src = Join-Path $PSScriptRoot 'hufu_tsf32.dll'
+if (-not (Test-Path $dll32src)) { $dll32src = Join-Path $PSScriptRoot '..\target\i686-pc-windows-gnu\release\hufu_tsf.dll' }
+$dll32src = [System.IO.Path]::GetFullPath($dll32src)
+if (Test-Path $dll32src) {
+    # 32 位进程的 System32 重定向视图：SysWOW64\SystemIME\HuFu\
+    $dir32 = "$env:SystemRoot\SysWOW64\SystemIME\HuFu"
+    New-Item -ItemType Directory -Force $dir32 | Out-Null
+    $dll32 = Join-Path $dir32 'hufu_tsf32.dll'
+    Copy-Item $dll32src $dll32 -Force
+    $wow = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$CLSID"
+    Set-Reg $wow '(default)' 'HuFu TSF Service'
+    Set-Reg "$wow\InProcServer32" '(default)' $dll32
+    Set-Reg "$wow\InProcServer32" 'ThreadingModel' 'Apartment'
+    Write-Host "✓ 32 位宿主支持已注册: $dll32"
+} else {
+    Write-Host '⚠ 未找到 32 位 DLL（hufu_tsf32.dll / i686 构建），跳过 WoW64 注册' -ForegroundColor Yellow
+}
 
 # ── HKCU：当前用户可见（per-user 类注册兜底）────────────────
 $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"

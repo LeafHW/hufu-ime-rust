@@ -1,0 +1,19 @@
+# i686（32 位宿主支持，Pain 打器等）交叉链接配置。
+# rustup windows-gnu 的 i686 std 组件只带 crt2.o/dllcrt2.o（binutils
+# 世界），若与 llvm-mingw 的 runtime 混链，dllcrt2 调 到的
+# __pei386_runtime_relocator 与 pseudo-reloc 列表符号不同源，列表
+# 边界错乱 → DLL_PROCESS_ATTACH 必崩（实测 Pain 切 hufu 闪退，
+# 异常 c0000005/c00000fd @ ___DllMainCRTStartup+0x80）。
+# 因此 i686 走「全 llvm 世界」：link-self-contained=no（不传 rustup
+# 的 crt），crt2/dllcrt2/relocator 由 llvm libmingw32.a 同源提供；
+# libgcc/libgcc_eh 仍需 gcc 世界真货（msys2，非 LTO、含
+# __register_frame_info；llvm libunwind 无此符号）。
+# llvm libmingw32 无 _DllEntryPoint@12 → tsf 源码内 stub。
+[target.i686-pc-windows-gnu]
+linker = "C:\\Users\\Leafy\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\bin\\rust-lld.exe"
+rustflags = [
+  "-C", "link-self-contained=no",
+  "-C", "link-arg=E:\\DSH-KF\\tools\\llvm-mingw-20260826-msvcrt-i686\\i686-w64-mingw32\\lib\\dllcrt2.o",
+  "-L", "native=E:\\DSH-KF\\tools\\llvm-mingw-20260826-msvcrt-i686\\i686-w64-mingw32\\lib",
+  "-L", "native=E:\\DSH-KF\\tools\\msys2-i686\\mingw32\\lib\\gcc\\i686-w64-mingw32\\16.2.0",
+]
