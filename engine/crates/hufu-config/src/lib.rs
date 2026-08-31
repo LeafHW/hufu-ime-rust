@@ -114,7 +114,7 @@ pub struct InputSection {
     pub alphabet: String,
     /// 最大码长
     pub max_code_length: usize,
-    /// 顶功：编码长度超过 max_code_length 时自动顶屏首选
+    /// 超最大码长自动上屏：编码长度超过 max_code_length 时自动顶屏首选（设置界面显示名；旧称「顶功」）
     pub auto_push: bool,
     /// 满码且唯一候选时自动上屏
     pub auto_select_unique: bool,
