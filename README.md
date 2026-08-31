@@ -88,14 +88,18 @@ hufu/
 ### 整句 A/B 压测（5 万句语料）
 
 ```powershell
-# 语料：语料目录 prepare_corpus_50k.py 生成（LCSTS/THUCNews/评论 混配，4~30 字纯汉字句）
+# 语料：prepare_corpus_50k.py 生成（LCCTS/THUCNews/评论 混配，4~30 字纯汉字句）
 cd engine
 cargo run --release -p hufu-rerank --bin sentence-bench -- `
-  E:\DSH-KF\语料\test_sentences_50k.txt --arm AB --sample 2000 --wa 8 --wb 2 `
+  <语料目录>\test_sentences_50k.txt --arm AB --sample 2000 --wa 8 --wb 2 `
   --out ..\docs\benchmark-qwen-vs-ngram.md
 ```
 
 录入规则完全按整句虎：逐字全码连打（一简字取 2 码全码）、一句打完才空格；提前上屏前缀由引擎提交累计。A 臂 ngram 全量；B 臂 +Qwen 重排在停顿后空格前一次性介入（同生产路径）。输出 Wilson 95% CI、按句长分桶、打捞/拖累翻转统计。报告见 `docs/benchmark-qwen-vs-ngram.md`。
+
+## 安装（终端用户，免构建）
+
+从 [Releases](../../releases) 下载 `HuFu虎符输入法-安装包.zip`（约 700MB，含码表、ngram 整句模型、Qwen3 重排模型与全部数据），解压到任意稳定位置（勿放临时目录），双击 **`安装.bat`**。绿色安装：程序与数据原地在安装文件夹内运行，C 盘零残留；卸载跑 `卸载.bat` 后删除目录即可。Windows 10/11 x64。
 
 ## 构建
 
@@ -135,3 +139,8 @@ powershell -ExecutionPolicy Bypass -File "platform\windows\install\reg-fix.ps1"
 - [docs/architecture.md](docs/architecture.md) — 架构设计与数据流
 - [docs/research/ime-frontends.md](docs/research/ime-frontends.md) — TSF / IMK 前端研究纪要与 TigerClaw 行为语义
 - [docs/dictionary-formats.md](docs/dictionary-formats.md) — 支持的码表格式规范（含 TCSKNM02 模型布局实测）
+
+## 许可证
+
+- 本项目代码以 [GPL-3.0](LICENSE) 发布
+- 随发行包分发的第三方组件保留其原始许可证：Qwen3 模型（Apache-2.0）、llama.cpp（MIT）、OpenCC 词典数据（Apache-2.0）
