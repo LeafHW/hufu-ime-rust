@@ -1825,50 +1825,24 @@ impl Engine {
                         entries.iter().any(|e| e.text.chars().any(|ch| dec.rare_hint(ch)))
                     })
                     .unwrap_or(false);
-            let mut early_front: Vec<Candidate> = Vec::new();
             if rare_rescue {
                 let dec = self.sentence.as_ref().unwrap();
-                let full = format!("{}{}", session.committed_raw, session.raw);
-                let d = dec.decode_rich(&full);
-                let cmt = session.committed_text.clone();
-                let skip = cmt.chars().count();
-                let mut parts: Vec<(usize, f64, Candidate)> = Vec::new();
-                for h in d.early_hits.iter().filter(|h| h.partial) {
-                    if !cmt.is_empty() && !h.text.starts_with(&cmt) {
-                        continue;
-                    }
-                    let text: String = h.text.chars().skip(skip).collect();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let mut c =
-                        Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
-                    c.weight = h.confidence;
-                    c.partial = true; // 过程态（未消耗全部 raw）
-                    parts.push((h.max_rank, h.confidence, c));
-                }
-                // 码表名次优先（它 rank1 先于 次要 rank2），同次按置信
-                parts.sort_by(|a, b| {
-                    a.0.cmp(&b.0)
-                        .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-                });
-                early_front = parts.into_iter().map(|(_, _, c)| c).take(6).collect();
-                // 码表精确候选：生僻下沉。early 前缀态**不占第一**——
-                // 顶功推字/唯一上屏等自动行为取 candidates[0]，必须钉在
-                // 码表首选上（5000 句实测 early 顶第一会扰动顶功推字，
-                // 99.48→99.34%）；「它」在第 2 位起可见即满足翻选需求。
-                // 码表全生僻（wvn 场景）时 normal 空、early 自然居前——
-                // 生僻字当首选本就是坏首选，且此时推字推 early 首字
-                // 反而更符合用户预期（正在打的词）。
+                // 【前缀态不进候选】（虎爪/Rime 对齐，2026-09-04 拍板）：
+                // 打出延伸键（pvl 的 l、dzht 的 t）即表达「要延伸」，前码
+                // 字（「起」pv、「唬」dzh）不再出现在候选里——虎爪/Rime
+                // 同款语义。前码字要上屏该在打它自己的码时空格（pv+空格
+                // =起），打了延伸键再要前码字=退格。前缀态候选是历代霸首
+                // bug 的种子（partial 提权/沉底防御复杂度全由此生），根除。
+                // 连带效果：满码唯一字（dzht=嘶）候选唯一化，触发「满码
+                // 无重自动上屏」（对齐虎爪「最大码长无重自动上屏」）。
                 let mut normal = Vec::new();
                 let mut rare = Vec::new();
                 // 【精确码不下沉】码表精确候选若正是当前 raw 的精确
                 // 条目（打出的码有精确匹配=用户明确意图，如 dzht=嘶、
                 // pvl=踹——即使存在更长码 pvlc/pvle，打在这个码上就是
-                // 要这个字，继续打才延伸），不判生僻下沉——否则 2/3 键
-                // 前缀态（「唬」dzh、「起」pv）经 early 压前霸占首位，
-                // 空格上屏上错字（2026-09-04 用户实测「嘶」→「唬」、
-                // 「踹」→「起」）。未打到的更长码的生僻候选维持下沉。
+                // 要这个字，继续打才延伸），不判生僻下沉。未打到的更长
+                // 码的生僻候选维持下沉（码表全生僻时 wvn=[徴,𡦺] 照常
+                // 全上——生僻单字间不再有前缀态垫背）。
                 let raw_exact = !self.schema.dict.lookup(&session.raw).is_empty();
                 for e in &entries {
                     let c = self.entry_to_candidate(e);
@@ -1878,7 +1852,6 @@ impl Engine {
                         normal.push(c);
                     }
                 }
-                normal.extend(early_front);
                 session.candidates = normal;
                 session.candidates.extend(rare);
             } else {
