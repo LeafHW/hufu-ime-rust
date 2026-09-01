@@ -14,6 +14,18 @@ pub struct EarlyHistory {
     pub strong: bool,
 }
 
+/// 空码顶屏挂起态（虎爪 SentenceEmptyCodePending）：断供时捕获的
+/// 强首选先挂起，等保留量攒够（min_retained_raw）或豁免解除再顶。
+#[derive(Debug, Clone)]
+pub struct EmptyCodePending {
+    /// 追加前捕获的首选全文（含此前已提交部分）
+    pub text: String,
+    /// 捕获时的 committed_text（校验用，变了就作废）
+    pub cmt: String,
+    /// 顶屏消耗的 full 键数（base 长度；其后留缓冲）
+    pub base: usize,
+}
+
 /// 每个输入上下文（应用 / 焦点）一个会话。
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -37,6 +49,8 @@ pub struct Session {
     pub committed_text: String,
     /// 提前上屏证据史（最近 3 键）
     pub early_history: Vec<EarlyHistory>,
+    /// 空码顶屏挂起态（断供持续时跨键保留，见 after_append）
+    pub empty_pending: Option<EmptyCodePending>,
     /// 用户翻页/选字后暂停提前上屏，直至整句提交
     pub early_suspended: bool,
     /// 本次按键内联产生的上屏文本（顶功/唯一上屏/提前上屏增量），由 take_or_state 消费
@@ -65,6 +79,7 @@ impl Session {
             committed_raw: String::new(),
             committed_text: String::new(),
             early_history: Vec::new(),
+            empty_pending: None,
             early_suspended: false,
             pending_commit: None,
             tail_context: String::new(),
@@ -81,6 +96,7 @@ impl Session {
         self.committed_raw.clear();
         self.committed_text.clear();
         self.early_history.clear();
+        self.empty_pending = None;
         self.early_suspended = false;
         self.pending_commit = None;
     }

@@ -246,6 +246,16 @@ pub struct SentenceSection {
     pub auto_enable: bool,
     /// 提前上屏
     pub early_commit: bool,
+    /// 整句空码自动顶屏（虎爪 2026-09 同步）：新键使「已提交前缀」
+    /// 断供（无完整候选）时，自动顶出追加前的强首选，新键留在缓冲
+    /// 继续组新字——而非干挂缓冲死等。
+    #[serde(default = "default_true")]
+    pub empty_code_auto_commit: bool,
+    /// 空码顶屏后缓冲至少保留的编码键数（虎爪「保留最少编码数量」，
+    /// 默认 0=不限）：断供时若顶出后缓冲剩余键数不足该值，先挂起
+    /// 等继续打键攒够再顶——防止把码流上下文一次掏空。
+    #[serde(default)]
+    pub min_retained_raw: usize,
     /// 神经重排（llama.cpp 子进程）
     pub rerank: RerankSection,
     /// ngram 模型文件（用户数据目录相对路径）
@@ -254,12 +264,18 @@ pub struct SentenceSection {
     pub weights: SentenceWeights,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for SentenceSection {
     fn default() -> Self {
         SentenceSection {
             enabled: true,
             auto_enable: true,
             early_commit: true,
+            empty_code_auto_commit: true,
+            min_retained_raw: 0,
             rerank: RerankSection::default(),
             ngram_path: "models/sentence-ngram.bin".into(),
             weights: SentenceWeights::default(),
