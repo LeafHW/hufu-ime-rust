@@ -1862,15 +1862,17 @@ impl Engine {
                 // 反而更符合用户预期（正在打的词）。
                 let mut normal = Vec::new();
                 let mut rare = Vec::new();
-                // 【满码精确不下沉】码表精确候选若已无更长编码（打满该码
-                // = 用户明确意图，如 dzht=嘶），不判生僻下沉——否则 dzh
-                // 前缀态「唬」经 early 压前霸占首位，空格上屏上错字
-                //（2026-09-04 用户实测「嘶」打成「唬」）。低频但满码的
-                // 字必须居首；未满码的前缀态生僻（如 wvn 场景）维持下沉。
-                let raw_sealed = !self.has_longer_code(&session.raw);
+                // 【精确码不下沉】码表精确候选若正是当前 raw 的精确
+                // 条目（打出的码有精确匹配=用户明确意图，如 dzht=嘶、
+                // pvl=踹——即使存在更长码 pvlc/pvle，打在这个码上就是
+                // 要这个字，继续打才延伸），不判生僻下沉——否则 2/3 键
+                // 前缀态（「唬」dzh、「起」pv）经 early 压前霸占首位，
+                // 空格上屏上错字（2026-09-04 用户实测「嘶」→「唬」、
+                // 「踹」→「起」）。未打到的更长码的生僻候选维持下沉。
+                let raw_exact = !self.schema.dict.lookup(&session.raw).is_empty();
                 for e in &entries {
                     let c = self.entry_to_candidate(e);
-                    if !raw_sealed && e.text.chars().any(|ch| dec.rare_hint(ch)) {
+                    if !raw_exact && e.text.chars().any(|ch| dec.rare_hint(ch)) {
                         rare.push(c);
                     } else {
                         normal.push(c);
