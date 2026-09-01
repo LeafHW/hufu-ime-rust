@@ -1042,7 +1042,7 @@ impl Engine {
             return;
         }
         let live = session.raw.clone();
-        if live.chars().count() + session.committed_raw.chars().count() <= 4 {
+        if live.chars().count() + session.committed_raw.chars().count() <= 3 {
             session.early_history.clear();
             return;
         }
@@ -1097,16 +1097,16 @@ impl Engine {
             proposal: proposal.clone(),
             full_raw: full.clone(),
             raw_lengths,
-            strong: proposal_share >= 0.99999, // Rime STRONG_SHARE（2025-01 调参 0.9999→0.99999：提交+14%）
+            strong: proposal_share >= 0.999, // Rime STRONG_SHARE（0.9999→0.99999 曾反向调严；
+            // 实测 v5 下提前上屏偏保守，回 0.999 提高积极性）
         });
         while session.early_history.len() > 3 {
             session.early_history.remove(0);
         }
 
-        // 观察窗口按证据强度自适应：全部强证据 2 键确认，否则 3 键双保险
-        let all_strong = session.early_history.len() >= 2
-            && session.early_history.iter().all(|e| e.strong);
-        let need = if all_strong { 2 } else { 3 };
+        // 观察窗口按证据强度自适应：强证据 2 键确认；普通证据 2 键
+        // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）
+        let need = 2;
         if session.early_history.len() < need {
             return;
         }
@@ -1126,7 +1126,7 @@ impl Engine {
             return;
         }
         let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
-        if delta.chars().count() < 1 || live.chars().count() < 3 {
+        if delta.chars().count() < 1 || live.chars().count() < 2 {
             return;
         }
 

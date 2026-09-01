@@ -201,9 +201,17 @@ impl Dict {
 
     /// 词 → 码（取最优码，即权重最高）。
     pub fn best_code_of(&self, text: &str) -> Option<&str> {
+        self.best_code_with_min_len(text, 1)
+    }
+
+    /// 词 → 码（整句打法：一简字不用 1 码——整句录入时 26 一简
+    /// 一律打 2 码全码，1 码会以简码候选形式干扰切分/上屏）。
+    /// min_len=2 过滤掉一简键位码，其余选择规则与 best_code_of 相同。
+    pub fn best_code_with_min_len(&self, text: &str, min_len: usize) -> Option<&str> {
         self.text_to_codes.get(text).and_then(|codes| {
             codes
                 .iter()
+                .filter(|c| c.len() >= min_len)
                 .filter_map(|c| self.by_code.get(c).map(|v| (c, v)))
                 .max_by(|(c1, v1), (c2, v2)| {
                     let e1 = &self.entries[*v1.first().unwrap_or(&0) as usize];
@@ -211,6 +219,29 @@ impl Dict {
                     rank_cmp(e1, e2).then_with(|| c1.len().cmp(&c2.len()))
                 })
                 .map(|(c, _)| c.as_str())
+        })
+    }
+
+    /// 词 → 码 + 位次（整句真实打法基准用）：取最优码（min_len 过滤
+    /// 一简 1 码），并返回 text 在该码候选列表中的位次（1 起，已按
+    /// rank 排序）。位次 >1 的字实际整句打法需追加名次锁键
+    /// （';'=2、'\''=3、'4'..'9'=序位、'0'=10），见 engine RankLocks。
+    pub fn best_code_and_rank(&self, text: &str, min_len: usize) -> Option<(String, usize)> {
+        self.text_to_codes.get(text).and_then(|codes| {
+            codes
+                .iter()
+                .filter(|c| c.len() >= min_len)
+                .filter_map(|c| self.by_code.get(c).map(|v| (c, v)))
+                .max_by(|(c1, v1), (c2, v2)| {
+                    let e1 = &self.entries[*v1.first().unwrap_or(&0) as usize];
+                    let e2 = &self.entries[*v2.first().unwrap_or(&0) as usize];
+                    rank_cmp(e1, e2).then_with(|| c1.len().cmp(&c2.len()))
+                })
+                .and_then(|(c, v)| {
+                    v.iter()
+                        .position(|&idx| self.entries[idx as usize].text == text)
+                        .map(|p| (c.clone(), p + 1))
+                })
         })
     }
 

@@ -650,9 +650,13 @@ impl HuFuTs_Impl {
                 && match name.as_str() {
                     // 编码中：可打印键与控制键都可能被吞
                     _ if composing => true,
+                    // 空闲态数字放行：跟打器类宿主信任 TestDown 的吞键结果
+                    // （TestDown TRUE + KeyDown eat=0 的组合数字蒸发，keys-5008
+                    // 实证：test/key vk=0x33 eat=0 三连但窗口无字）；组段中
+                    // 数字保持吞（选重/锁键由引擎处理不受影响）。
+                    n if n.len() == 1 => !n.chars().all(|c| c.is_ascii_digit()),
                     // 空闲：编码字母/分号/引号会起段
                     "space" | "enter" | "escape" | "backspace" | "tab" => false,
-                    n if n.len() == 1 => true, // 单字符（字母/数字/标点）
                     _ => false,
                 };
             return BOOL(will as i32);
