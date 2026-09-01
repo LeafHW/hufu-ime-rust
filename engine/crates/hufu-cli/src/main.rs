@@ -340,7 +340,17 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     // 纯码表基准同时关学习（auto_frequency/log_adjust）：逐句调频会
     // 改变后续句的候选序（实测「装」上屏后 ag 首选被顶、「鬼」句打错），
     // 基准必须测裸码表能力。
+    let no_lock_scan = std::env::var("HUFU_BENCH_NOLOCK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let bench_cfg = if ngram == "-" {
+        let mut c = Config::default();
+        c.user.auto_frequency = false;
+        c.user.log_adjust = false;
+        c
+    } else if no_lock_scan {
+        // 无锁整句扫描同样关学习：扫描的逐字上屏若写调频，会改变后续
+        // 字的候选序，污染判据（回放亦然——跑前须删 user-adjust.log）。
         let mut c = Config::default();
         c.user.auto_frequency = false;
         c.user.log_adjust = false;
@@ -379,11 +389,8 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let no_lock_scan = std::env::var("HUFU_BENCH_NOLOCK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
     if no_lock_scan {
-        println!("[NOLOCK 无锁扫描] 只测引擎真实候选序（schema.candidates）第一名==本字的码");
+        println!("[NOLOCK 无锁扫描] 只测引擎真实候选序（schema.candidates）第一名==本字的码（整句模式覆盖生僻下沉路径）");
     }
     for s in &sents {
         let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
@@ -394,11 +401,15 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         let mut sess = Session::new(true);
         let mut committed = String::new();
         let t1 = Instant::now();
-        if ngram == "-" {
-            // 纯码表单字打法：逐字打码（最优码+选重锁），顶功自动推字；
+        if ngram == "-" || no_lock_scan {
+            // 纯码表单字打法 / 无锁整句扫描：逐字打码，顶功自动推字；
             // 未被顶出的字补一次空格强上（真实单字打法用户的行为）。
-            // 连续喂整句码流在此模式不可用——无整句解码，码流会粘连成
-            // 多字词/长码生僻字（实测 出: 𤁨咆绶 vs 10 字原句）。
+            // 连续喂整句码流在纯码表模式不可用——无整句解码，码流会
+            // 粘连成多字词/长码生僻字（实测 出: 𤁨咆绶 vs 10 字原句）。
+            // 无锁扫描必须逐字（单字独立成段才能验证「打自己的码+空格
+            // =上自己」），且在整句模式（带模型）下运行——覆盖 rare_rescue
+            // 生僻下沉路径：纯码表无模型 rare_hint 恒假，测不出「踹/起」
+            // 「唬/嘶」类整句霸首 bug（2026-09-04「踹→起」的教训）。
             let per_char: Vec<String> = s
                 .chars()
                 .filter_map(|c| {
