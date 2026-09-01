@@ -222,6 +222,14 @@ impl Dict {
         })
     }
 
+    /// 词 → 全部编码（无锁排序扫描用：逐码验证引擎真实序第一名）。
+    pub fn codes_of(&self, text: &str) -> Vec<String> {
+        self.text_to_codes
+            .get(text)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// 词 → 码 + 位次（整句真实打法基准用）：取最优码（min_len 过滤
     /// 一简 1 码），并返回 text 在该码候选列表中的位次（1 起，已按
     /// rank 排序）。位次 >1 的字实际整句打法需追加名次锁键
