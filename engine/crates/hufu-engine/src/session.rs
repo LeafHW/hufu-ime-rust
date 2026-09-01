@@ -45,6 +45,11 @@ pub struct Session {
     /// 神经重排在句首（committed_text 为空）时以它作语境，
     /// 避免空上下文下 Qwen 乱序（实测空 ctx 时 拖乿心 反超 的窒闷）。
     pub tail_context: String,
+    /// 【行尾瞬态】前端检测到组段逼近窗口右缘（软换行边界）：本次按键
+    /// 的提前上屏确认从 2 键放宽到 1 键——组段早一步缩短，减少 composition
+    /// 跨软换行期应用 caret 视觉滞留（「光标停在上一行结尾」）。瞬态单键
+    /// 有效：try_early_commit 开头消费。
+    pub line_end_hint: bool,
 }
 
 impl Session {
@@ -63,6 +68,7 @@ impl Session {
             early_suspended: false,
             pending_commit: None,
             tail_context: String::new(),
+            line_end_hint: false,
         }
     }
 

@@ -19,6 +19,8 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         "key" => match parse_key(req) {
             Some(k) => {
                 let schema_before = host.engine.config.schema.current.clone();
+                host.session.line_end_hint =
+                    req.get("line_end").and_then(|v| v.as_bool()).unwrap_or(false);
                 let r = host.process_key(k);
                 // Ctrl+M 切方案：落盘 + 重装整句（与 HTTP /api/schema 行为一致）
                 if host.engine.config.schema.current != schema_before {

@@ -307,6 +307,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Some(k) => k,
                 None => return Response::err(400, "按键描述无效"),
             };
+            host.session.line_end_hint = req
+                .json()
+                .get("line_end")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             Response::json(&host.process_key(key))
         }
         ("POST", "/api/reset") => {
