@@ -27,6 +27,25 @@ fn main() {
             args.get(2).expect("用法: code <方案目录> <句子>"),
             args.get(3).expect("用法: code <方案目录> <句子>"),
         ),
+        "query" => {
+            let mut rest: Vec<String> = args[2..].to_vec();
+            let mut show_early = false;
+            if rest.first().map(|s| s.as_str()) == Some("-e") {
+                show_early = true;
+                rest.remove(0);
+            }
+            cmd_query(
+                rest.get(0).expect("用法: query [-e] <方案目录> <ngram> <raw...>"),
+                rest.get(1).expect("用法: query [-e] <方案目录> <ngram> <raw...>"),
+                &rest[2..],
+                show_early,
+            );
+        }
+        "cands" => cmd_cands(
+            args.get(2).expect("用法: cands <方案目录> <ngram> <raw...>"),
+            args.get(3).expect("用法: cands <方案目录> <ngram> <raw...>"),
+            &args[4..],
+        ),
         "tbench" => cmd_tbench(
             args.get(2).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
             args.get(3).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
@@ -40,6 +59,8 @@ fn main() {
             println!("  repl    <方案目录>   逐字符模拟输入（q 退出，BS 退格，SP 空格）");
             println!("  bench   <方案目录> <语料> [ngram] 整句质量基准（exact 率 + 逐句解码耗时）");
             println!("  code    <方案目录> <句子>   逐字 best_code_of 展示（bench 同款打法）");
+            println!("  query   [-e] <方案目录> <ngram> <raw...>  解码候选（分数/名次/切分）");
+            println!("  cands   <方案目录> <ngram> <raw...>  逐键 session 候选框（真实 UI 所见）");
         }
     }
 }
@@ -171,6 +192,73 @@ fn cmd_code(dir: &str, sentence: &str) {
         raw.push_str(&code);
     }
     println!("整句编码: {raw}");
+}
+
+/// 解码候选透视：完整候选（score/confidence/max_rank/segmented），
+/// -e 附带提前上屏不完全尾候选。码表直查对照一并输出。
+fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = Config::default();
+    let dec = hufu_sentence::SentenceEngine::load(
+        Path::new(ngram),
+        schema.dict.clone(),
+        &schema.supplement,
+        cfg.sentence.weights.clone(),
+    )
+    .expect("ngram 装载失败");
+    for raw in raws {
+        println!("━━ raw = {raw}");
+        let rich = hufu_engine::SentenceDecoder::decode_rich(&dec, raw);
+        for (i, h) in rich.hits.iter().take(10).enumerate() {
+            println!(
+                "  {:>2}. {}  score={:>8.3} conf={:>8.3} rank={}  {}",
+                i + 1,
+                h.text,
+                h.score,
+                h.confidence,
+                h.max_rank,
+                h.segmented
+            );
+        }
+        if show_early {
+            println!("  ── early（不完全尾）:");
+            for h in rich.early_hits.iter().take(5) {
+                println!(
+                "     {}  conf={:>8.3} rank={}  {}",
+                h.text, h.confidence, h.max_rank, h.segmented
+            );
+            }
+        }
+    }
+}
+
+/// session 级候选框透视：逐键喂入，每键后打印候选框（真实 UI 同源）。
+fn cmd_cands(dir: &str, ngram: &str, raws: &[String]) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = Config::default();
+    let dec = hufu_sentence::SentenceEngine::load(
+        Path::new(ngram),
+        schema.dict.clone(),
+        &schema.supplement,
+        cfg.sentence.weights.clone(),
+    )
+    .expect("ngram 装载失败");
+    let mut engine = Engine::with_schema_dir(Path::new(dir), Config::default())
+        .expect("引擎初始化失败");
+    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    for raw in raws {
+        println!("━━ raw = {raw}");
+        let mut sess = Session::new(true);
+        for ch in raw.chars() {
+            let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
+            if let Some(c) = out.commit {
+                println!("   [commit] {c}");
+            }
+            let show: Vec<String> =
+                sess.candidates.iter().take(6).map(|c| c.text.clone()).collect();
+            println!("   {ch} → [{}]", show.join(" "));
+        }
+    }
 }
 
 fn cmd_check(dir: &str) {

@@ -40,6 +40,9 @@ pub struct SentenceHit {
     pub word_ends: Vec<(usize, usize)>,
     /// 分段显示（空格分隔编码段）
     pub segmented: String,
+    /// 不完全尾候选（尾部编码未完成，text 为 raw 的真前缀产物）：
+    /// 录入中间态候选框用（正在打的词），完整态恒 false。
+    pub partial: bool,
 }
 
 /// 整句解码结果（含提前上屏置信源）。
@@ -58,6 +61,11 @@ pub struct SentenceDecode {
 pub trait SentenceDecoder: Send + Sync {
     /// 富解码：raw（含选重后缀）→ 命中 + 提前上屏置信源。
     fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode>;
+    /// 字是否生僻（模型字频名次超阈值）——候选框生僻下沉判据。
+    /// 默认 false（无模型实现时不下沉）。
+    fn rare_hint(&self, _ch: char) -> bool {
+        false
+    }
     /// 组句：raw（含选重后缀）→ 已排序候选（默认由富解码派生）。
     fn decode(&self, raw: &str) -> Vec<Candidate> {
         self.decode_rich(raw)
@@ -1553,10 +1561,43 @@ impl Engine {
         dec: &dyn SentenceDecoder,
     ) -> Vec<Candidate> {
         let full = format!("{}{}", session.committed_raw, session.raw);
-        let dec = dec.decode_rich(&full);
+        let rich = dec.decode_rich(&full);
         let committed_text = session.committed_text.clone();
+        let skip = committed_text.chars().count();
+        // 【中间态候选 2026-09-03】录入过程中（无锁）把不完全尾前缀态
+        // （正在打的词，early_hits 已按置信排序）并入候选框，生僻整码
+        // 候选（rare_hint）下沉——修复「打「它存」到 wvn 时候选全是 徴/
+        // 𡦺 生僻字、『它』不在框内」：前缀态「它」conf≈-11.5 远优于
+        // 生僻整码「徴」≈-23.8。带选重锁时（顶功确认流，;/'/数字=码表
+        // 名次）不并入——锁选第 N 个的语义必须钉在完整态列表上。
+        let has_locks = parse_rank_locks(&session.raw).has_locks();
+        let mut part_stash: Vec<(usize, f64, Candidate)> = Vec::new();
+        if !has_locks {
+            for h in rich.early_hits.iter().filter(|h| h.partial) {
+                if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
+                    continue;
+                }
+                let text: String = h.text.chars().skip(skip).collect();
+                if text.is_empty() {
+                    continue;
+                }
+                let mut c = Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+                c.weight = h.confidence;
+                part_stash.push((h.max_rank, h.confidence, c));
+            }
+        }
+        // 码表名次优先、同次按置信（它 rank1 先于 次要 rank2），取前 6。
+        // 【首选语义】完整态最优恒居第一（空格上屏/自动首选走列表头，
+        // 不能被前缀态顶替——tbench 曾因 partial 压首致准率崩到 4%）；
+        // partial 是「正在打的词」备选，追加在完整态之后供翻选。
+        part_stash.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let part_cands: Vec<Candidate> =
+            part_stash.into_iter().map(|(_, _, c)| c).take(6).collect();
         let mut cands: Vec<Candidate> = Vec::new();
-        for h in dec.hits.iter() {
+        for h in rich.hits.iter() {
             if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
                 continue;
             }
@@ -1572,6 +1613,10 @@ impl Engine {
             c.weight = h.score;
             cands.push(c);
         }
+        // 完整态在前（首选=完整态最优，不做任何下沉——完整句含一个低频
+        // 字就整条沉底会错杀正确句，500 句实测 99.80→96.60% 的根因），
+        // 前缀态（正在打的词）追加供翻选
+        cands.extend(part_cands);
         cands
     }
 
@@ -1630,7 +1675,71 @@ impl Engine {
         //   mlwe → 两次 先于 𠓅/𰧓，与 Rime 实测同拍；其余句子候选去重补后）
         let entries = self.schema.candidates(&session.raw);
         if !entries.is_empty() {
-            session.candidates = entries.iter().map(|e| self.entry_to_candidate(e)).collect();
+            // 【中间态候选 2026-09-03】录入中途且码表精确候选被生僻字
+            // 霸屏时（打「它存」到 wvn：码表只有 徴/𡦺）：early 前缀态
+            //（正在打的词，如「它」）压最前、生僻码表候选下沉。
+            // 码表首选非生僻时（srsr→常常）**不动序**——码表精确首选
+            // 语义保持（虎爪回归案例 zhh→虎），early 也不压前。
+            let rare_rescue = !parsed.has_locks()
+                && self.has_continuation(&session.raw)
+                && self
+                    .sentence
+                    .as_ref()
+                    .map(|dec| {
+                        entries.iter().any(|e| e.text.chars().any(|ch| dec.rare_hint(ch)))
+                    })
+                    .unwrap_or(false);
+            let mut early_front: Vec<Candidate> = Vec::new();
+            if rare_rescue {
+                let dec = self.sentence.as_ref().unwrap();
+                let full = format!("{}{}", session.committed_raw, session.raw);
+                let d = dec.decode_rich(&full);
+                let cmt = session.committed_text.clone();
+                let skip = cmt.chars().count();
+                let mut parts: Vec<(usize, f64, Candidate)> = Vec::new();
+                for h in d.early_hits.iter().filter(|h| h.partial) {
+                    if !cmt.is_empty() && !h.text.starts_with(&cmt) {
+                        continue;
+                    }
+                    let text: String = h.text.chars().skip(skip).collect();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut c =
+                        Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+                    c.weight = h.confidence;
+                    parts.push((h.max_rank, h.confidence, c));
+                }
+                // 码表名次优先（它 rank1 先于 次要 rank2），同次按置信
+                parts.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                });
+                early_front = parts.into_iter().map(|(_, _, c)| c).take(6).collect();
+                // 码表精确候选：生僻下沉。early 前缀态**不占第一**——
+                // 顶功推字/唯一上屏等自动行为取 candidates[0]，必须钉在
+                // 码表首选上（5000 句实测 early 顶第一会扰动顶功推字，
+                // 99.48→99.34%）；「它」在第 2 位起可见即满足翻选需求。
+                // 码表全生僻（wvn 场景）时 normal 空、early 自然居前——
+                // 生僻字当首选本就是坏首选，且此时推字推 early 首字
+                // 反而更符合用户预期（正在打的词）。
+                let mut normal = Vec::new();
+                let mut rare = Vec::new();
+                for e in &entries {
+                    let c = self.entry_to_candidate(e);
+                    if e.text.chars().any(|ch| dec.rare_hint(ch)) {
+                        rare.push(c);
+                    } else {
+                        normal.push(c);
+                    }
+                }
+                normal.extend(early_front);
+                session.candidates = normal;
+                session.candidates.extend(rare);
+            } else {
+                session.candidates =
+                    entries.iter().map(|e| self.entry_to_candidate(e)).collect();
+            }
             self.apply_opencc(session);
             if !sentence_mode && self.sentence_active() {
                 if let Some(dec) = &self.sentence {
@@ -1664,6 +1773,8 @@ impl Engine {
                         }
                     }
                     if !phrase.is_empty() || !rest.is_empty() {
+                        // session.candidates 已含（码表 normal + early 前缀
+                        // 态 + 生僻沉底）——phrase 真词压最前，其余原序补后
                         let mut merged = phrase;
                         for existing in session.candidates.drain(..) {
                             if !merged.iter().any(|m| m.text == existing.text) {
@@ -2037,6 +2148,7 @@ mod tests {
                     max_rank: 1,
                     word_ends: Vec::new(),
                     segmented: p.base.clone(),
+                    partial: false,
                 }]
             };
             std::sync::Arc::new(SentenceDecode {
