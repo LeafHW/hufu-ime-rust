@@ -236,16 +236,18 @@ fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
 fn cmd_cands(dir: &str, ngram: &str, raws: &[String]) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
     let cfg = Config::default();
-    let dec = hufu_sentence::SentenceEngine::load(
-        Path::new(ngram),
-        schema.dict.clone(),
-        &schema.supplement,
-        cfg.sentence.weights.clone(),
-    )
-    .expect("ngram 装载失败");
     let mut engine = Engine::with_schema_dir(Path::new(dir), Config::default())
         .expect("引擎初始化失败");
-    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    if ngram != "-" {
+        let dec = hufu_sentence::SentenceEngine::load(
+            Path::new(ngram),
+            schema.dict.clone(),
+            &schema.supplement,
+            cfg.sentence.weights.clone(),
+        )
+        .expect("ngram 装载失败");
+        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    }
     for raw in raws {
         println!("━━ raw = {raw}");
         let mut sess = Session::new(true);
@@ -322,16 +324,30 @@ fn cmd_convert(input: &str, output: &str) {
 fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
     let cfg = Config::default();
-    let dec = hufu_sentence::SentenceEngine::load(
-        Path::new(ngram),
-        schema.dict.clone(),
-        &schema.supplement,
-        cfg.sentence.weights.clone(),
-    )
-    .expect("ngram 装载失败");
-    let mut engine = Engine::with_schema_dir(Path::new(dir), Config::default())
-        .expect("引擎初始化失败");
-    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    // ngram == "-"：纯码表模式（不装整句解码器、不调模型不重排）——
+    // 顶功码表 + 选重锁单字打法，测纯查表路径触达。
+    // 纯码表基准同时关学习（auto_frequency/log_adjust）：逐句调频会
+    // 改变后续句的候选序（实测「装」上屏后 ag 首选被顶、「鬼」句打错），
+    // 基准必须测裸码表能力。
+    let bench_cfg = if ngram == "-" {
+        let mut c = Config::default();
+        c.user.auto_frequency = false;
+        c.user.log_adjust = false;
+        c
+    } else {
+        Config::default()
+    };
+    let mut engine = Engine::with_schema_dir(Path::new(dir), bench_cfg).expect("引擎初始化失败");
+    if ngram != "-" {
+        let dec = hufu_sentence::SentenceEngine::load(
+            Path::new(ngram),
+            schema.dict.clone(),
+            &schema.supplement,
+            cfg.sentence.weights.clone(),
+        )
+        .expect("ngram 装载失败");
+        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    }
     let sents: Vec<String> = std::io::BufReader::new(std::fs::File::open(corpus).expect("语料打开失败"))
         .lines()
         .map(|l| l.unwrap().trim().to_string())
@@ -344,6 +360,14 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dumped = 0usize;
+    // 【行尾模拟 A/B】HUFU_BENCH_LINE_END=W（W>0 启用）：模拟 TSF 侧行尾
+    // 检测——组段尾（已上屏编码+剩余编码的列位置，按每行 W 个编码字符
+    // 折行）进入行尾 3 字区即置 line_end_hint。与真机行为同构：真实检测
+    // 为 caret 距窗口右缘 <56px（≈2-3 字）。对照组不设该变量（恒 false）。
+    let line_end_w: usize = std::env::var("HUFU_BENCH_LINE_END")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     for s in &sents {
         let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
         if raw.is_empty() {
@@ -353,7 +377,41 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         let mut sess = Session::new(true);
         let mut committed = String::new();
         let t1 = Instant::now();
+        if ngram == "-" {
+            // 纯码表单字打法：逐字打码（最优码+选重锁），顶功自动推字；
+            // 未被顶出的字补一次空格强上（真实单字打法用户的行为）。
+            // 连续喂整句码流在此模式不可用——无整句解码，码流会粘连成
+            // 多字词/长码生僻字（实测 出: 𤁨咆绶 vs 10 字原句）。
+            let per_char: Vec<String> =
+                s.chars().map(|c| real_code_of(&schema, c)).collect();
+            for code in per_char {
+                if code.is_empty() {
+                    continue;
+                }
+                for ch in code.chars() {
+                    let tk = Instant::now();
+                    let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
+                    key_us.push(tk.elapsed().as_micros() as u64);
+                    if let Some(c) = out.commit {
+                        committed.push_str(&c);
+                        early_commits += 1;
+                    }
+                }
+                if !sess.raw.is_empty() {
+                    let tk = Instant::now();
+                    let out = engine.process_key(&mut sess, KeyInput::char_key(' '));
+                    key_us.push(tk.elapsed().as_micros() as u64);
+                    if let Some(c) = out.commit {
+                        committed.push_str(&c);
+                    }
+                }
+            }
+        } else {
         for ch in raw.chars() {
+            if line_end_w > 0 {
+                let col = sess.committed_raw.chars().count() + sess.raw.chars().count();
+                sess.line_end_hint = col % line_end_w >= line_end_w.saturating_sub(3);
+            }
             let tk = Instant::now();
             let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
             key_us.push(tk.elapsed().as_micros() as u64);
@@ -368,6 +426,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         key_us.push(tk.elapsed().as_micros() as u64);
         if let Some(c) = out.commit {
             committed.push_str(&c);
+        }
         }
         total_ms.push(t1.elapsed().as_millis());
         if committed == *s {
