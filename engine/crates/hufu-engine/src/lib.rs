@@ -1556,9 +1556,16 @@ impl Engine {
             return;
         }
         let mut sorted: Vec<usize> = idxs.clone();
+        // 【过程态硬防御】partial（未消耗全部 raw 的前缀形态）恒沉底：
+        // 即使旧缓存（过滤前产生的 Qwen 顺序）含过程态文本也不得提前
+        // ——缺席的完整态次沉，完整态间按 Qwen 顺序自由重排。
         sorted.sort_by_key(|&i| {
-            let t = &session.candidates[i].text;
-            rank.get(t).copied().unwrap_or(usize::MAX)
+            let c = &session.candidates[i];
+            if c.partial {
+                usize::MAX
+            } else {
+                rank.get(&c.text).copied().unwrap_or(usize::MAX - 1)
+            }
         });
         if sorted == idxs {
             return;
@@ -2256,6 +2263,46 @@ mod tests {
         let cfg = hufu_config::Config::default();
         let eng = Engine::with_schema_dir(&dir, cfg).unwrap();
         (eng, dir)
+    }
+
+    /// 【过程态防御】神经重排不得把 partial（未消耗全部 raw 的前缀态）
+    /// 候选提到完整态之前——真实场景：qlagy 时 Qwen 把 4 键「老鬼」
+    /// 提到 5 键「老痒」前霸首（2026-09-04 用户实测）。rerank_request
+    /// 必须过滤 partial；缺席于重排序的 partial 在 apply 时自然靠后。
+    #[test]
+    fn rerank_never_lifts_partial() {
+        let dir = std::env::temp_dir().join("hufu-eng-partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        // 造候选列表：完整态在前、过程态在后（qlagy 语义）
+        let mut s = Session::new(true);
+        s.raw = "y".into();
+        s.committed_raw = "qlag".into();
+        let mut full = Candidate::new("老痒", "y", CandidateKind::Sentence);
+        full.partial = false;
+        let full2 = Candidate::new("老痒痒", "y", CandidateKind::Sentence);
+        let mut part = Candidate::new("老鬼", "y", CandidateKind::Sentence);
+        part.partial = true;
+        s.candidates = vec![full, full2, part];
+        // 1) rerank_request 必须排除 partial：texts 只含完整态
+        eng.config.sentence.rerank.enabled = true;
+        let req = eng.rerank_request(&s);
+        assert!(req.is_some(), "完整态≥2 应派发");
+        if let Some((_, _, texts)) = req {
+            assert!(!texts.contains(&"老鬼".to_string()), "partial 不得进重排: {texts:?}");
+        }
+        // 2) 缓存塞入「老鬼在前」的被污染顺序（模拟修复前的旧缓存
+        //    残留）——apply 后老鬼仍沉底（partial 恒 MAX），完整态间
+        //    按 Qwen 顺序自由重排（老痒痒可居首）。
+        {
+            let mut cache = eng.rerank_cache.lock().unwrap();
+            cache.insert("qlagy".into(), vec!["老鬼".into(), "老痒痒".into()]);
+        }
+        eng.refresh_rerank(&mut s);
+        let pos_lg = s.candidates.iter().position(|c| c.text == "老鬼").unwrap();
+        assert_eq!(pos_lg, s.candidates.len() - 1, "过程态恒沉底: {:?}", s.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
+        assert!(s.candidates[0].text != "老鬼", "过程态不可居首");
     }
 
     #[test]

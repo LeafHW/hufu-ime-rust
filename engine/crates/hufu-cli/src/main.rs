@@ -71,8 +71,19 @@ fn main() {
 /// 整句真实打法：最优码（≥2 码）+ 名次锁键（engine RankLocks 同款：
 /// 位次 1 无锁、2=';'、3='\''、4..9=数字、10='0'）。
 fn real_code_of(schema: &Schema, ch: char) -> String {
+    // 【无锁打法】HUFU_BENCH_NOLOCK=1：只打最优码不取名次锁——模拟
+    // 真实单字用户「打码+空格取首选」行为。用于全码表排序扫描：
+    // 码表序第一名的字打自己的码+空格，首选必须是自己（否则即
+    // 「唬/嘶」类前缀态霸首 bug 残留）。
+    static NO_LOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_lock = *NO_LOCK.get_or_init(|| {
+        std::env::var("HUFU_BENCH_NOLOCK").map(|v| v == "1").unwrap_or(false)
+    });
     match schema.dict.best_code_and_rank(&ch.to_string(), 2) {
         Some((code, rank)) => {
+            if no_lock {
+                return code;
+            }
             let lock = match rank {
                 1 => String::new(),
                 2 => ";".into(),
@@ -368,6 +379,12 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let no_lock_scan = std::env::var("HUFU_BENCH_NOLOCK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if no_lock_scan {
+        println!("[NOLOCK 无锁扫描] 只测引擎真实候选序（schema.candidates）第一名==本字的码");
+    }
     for s in &sents {
         let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
         if raw.is_empty() {
@@ -382,8 +399,26 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             // 未被顶出的字补一次空格强上（真实单字打法用户的行为）。
             // 连续喂整句码流在此模式不可用——无整句解码，码流会粘连成
             // 多字词/长码生僻字（实测 出: 𤁨咆绶 vs 10 字原句）。
-            let per_char: Vec<String> =
-                s.chars().map(|c| real_code_of(&schema, c)).collect();
+            let per_char: Vec<String> = s
+                .chars()
+                .filter_map(|c| {
+                    // 无锁扫描判据＝引擎真实序：schema.candidates(c)[0]==字
+                    //（best_code_and_rank 的 rank 按 weight 序，与显示序
+                    // 不一致，不能用作「第一名」判据）。
+                    if no_lock_scan {
+                        let ch = c.to_string();
+                        let codes = schema.dict.codes_of(&ch);
+                        return codes.into_iter().find(|code| {
+                            schema
+                                .candidates(code)
+                                .first()
+                                .map(|e| e.text == ch)
+                                .unwrap_or(false)
+                        });
+                    }
+                    Some(real_code_of(&schema, c))
+                })
+                .collect();
             for code in per_char {
                 if code.is_empty() {
                     continue;
