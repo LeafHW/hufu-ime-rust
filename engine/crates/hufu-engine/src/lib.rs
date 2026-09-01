@@ -1733,24 +1733,27 @@ impl Engine {
 
     /// 轮询读入口：先应用已到达的重排缓存（无按键副作用）再取 state——
     /// 候选窗停顿期轮询由此立即看到换序后的新首选。
-    pub fn refresh_rerank(&self, session: &mut Session) {
+    pub fn refresh_rerank(&mut self, session: &mut Session) {
         self.apply_rerank(session);
     }
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
-    fn apply_rerank(&self, session: &mut Session) {        if session.candidates.is_empty() {
-            return;
-        }
-        let cache = match self.rerank_cache.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        if cache.is_empty() {
+    fn apply_rerank(&mut self, session: &mut Session) {        if session.candidates.is_empty() {
             return;
         }
         let key = format!("{}{}", session.committed_raw, session.raw);
-        let Some(order) = cache.get(&key) else {
-            return;
+        let order: Vec<String> = {
+            let cache = match self.rerank_cache.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if cache.is_empty() {
+                return;
+            }
+            match cache.get(&key) {
+                Some(o) => o.clone(),
+                None => return,
+            }
         };
         let rank: std::collections::HashMap<&String, usize> =
             order.iter().enumerate().map(|(i, t)| (t, i)).collect();
@@ -1762,6 +1765,7 @@ impl Engine {
             }
         }
         if idxs.len() < 2 {
+            self.anchor_rerank_early(session, &key);
             return;
         }
         let mut sorted: Vec<usize> = idxs.clone();
@@ -1777,6 +1781,7 @@ impl Engine {
             }
         });
         if sorted == idxs {
+            self.anchor_rerank_early(session, &key);
             return;
         }
         let subs: Vec<Candidate> = sorted
@@ -1786,6 +1791,57 @@ impl Engine {
         for (slot, cand) in idxs.into_iter().zip(subs) {
             session.candidates[slot] = cand;
         }
+        self.anchor_rerank_early(session, &key);
+    }
+
+    /// 【rerank 锚定】（虎爪 text3：neural top 锚定提案）：Qwen 接受的
+    /// 首选若为当前候选里的完整态，直接把它作为强证据帧注入提前上屏
+    /// 证据史并立即重评——ngram 慢慢攒份额的过程被 Qwen 的整句判断
+    /// 跳过，这是虎爪上屏「快」的主要来源。安全性不豁免：边界封口、
+    /// 身后保留量、反证撤销对锚定帧同样生效；锚定帧一次性（下一键
+    /// 证据史断档/反证即清）。
+    fn anchor_rerank_early(&mut self, session: &mut Session, key: &str) {
+        let top = match session.candidates.first() {
+            Some(c) if !c.partial && c.text.chars().count() > session.committed_text.chars().count() => c.text.clone(),
+            _ => return,
+        };
+        let dec = match &self.sentence {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let rich = dec.decode_rich(key);
+        let cmt = session.committed_text.clone();
+        let cands: Vec<&SentenceHit> = rich
+            .hits
+            .iter()
+            .filter(|h| cmt.is_empty() || h.text.starts_with(&cmt))
+            .collect();
+        if cands.is_empty() {
+            return;
+        }
+        let raw_lengths = build_raw_lengths(&cands, key);
+        if !raw_lengths.iter().any(|(p, _)| *p == top) {
+            return; // Qwen 首选不是当前解码可达的完整切分：不锚
+        }
+        // 已有同提案同长度的帧（本帧自然产生过）就不重复注入
+        let dup = session
+            .early_history
+            .last()
+            .map(|e| e.proposal == top && e.full_raw == key)
+            .unwrap_or(false);
+        if dup {
+            return;
+        }
+        session.early_history.push(EarlyHistory {
+            proposal: top,
+            full_raw: key.to_string(),
+            raw_lengths,
+            strong: true,
+        });
+        while session.early_history.len() > 3 {
+            session.early_history.remove(0);
+        }
+        self.try_early_commit(session);
     }
 
     fn sentence_candidates(
