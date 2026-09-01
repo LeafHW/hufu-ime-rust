@@ -1491,8 +1491,16 @@ impl CandidateWindowV2 {
                     };
                     match self.sticky_pos {
                         Some((ox, oy)) => {
-                            // x：正向打字拒绝回退（旧布局值）
-                            let x = if grew && x < ox - 2 { ox } else { x };
+                            // 软换行判定：x 想回退（<旧行尾）且 y 发生换行级
+                            // 变化（>26px 行高阈值）同时成立 = 新行开始——
+                            // x 回到新行行首是合法回退，禁令解除。否则单调锁
+                            // 会把换行后的 X 钉死在旧行尾（实测虎魄：换行
+                            // x 2361→1625 被拒，候选框只上下动、不横向跟到
+                            // 新行打字点）。仅 y 超阈值不构成豁免——跟打器
+                            // 滚动步进可达 29px，x 正常增长帧不得误放行。
+                            let line_broke = x < ox - 2 && (y - oy).abs() > 26;
+                            // x：正向打字拒绝回退（旧布局值）；软换行除外
+                            let x = if grew && !line_broke && x < ox - 2 { ox } else { x };
                             // y：正向打字只认换行级变化（行高 ~29px，阈值 26）
                             let y = if grew && (y - oy).abs() <= 26 { oy } else { y };
                             // 2px 迟滞：亚像素取整误差/回流微动不搬窗
