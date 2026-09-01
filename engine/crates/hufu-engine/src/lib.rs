@@ -1264,12 +1264,48 @@ impl Engine {
             return;
         }
 
-        // 3 键公共前缀 + 一致的消耗长度
-        let mut stable = common_history_prefix(&session.early_history);
-        let mut consumed = stable_history_raw_length(&session.early_history, &stable);
-        while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
-            stable = stable.chars().take(stable.chars().count() - 1).collect();
+        // 【连续强证据捷径】（虎爪 ConsecutiveStrongCount≥2 提交「最长
+        // 达标 tracker」语义，TryCommitMatureSentencePrefix 的 LengthIn
+        // TextElements descending）：尾部 need 键全为强证据（share≥
+        // 0.999）时，直接提交最新帧的完整提案——不必再等 3 帧公共前
+        // 缀。这是虎爪上屏积极感的主要来源：打常见词组时 ngram 两键
+        // 就笃定（Strong×2），整段提案立即落地。普通流维持 3 帧公共
+        // （保守面：边界封口+反证撤销对两条路径都生效）。
+        let tail_strong = session.early_history.len() >= need.max(2)
+            && session
+                .early_history
+                .iter()
+                .rev()
+                .take(need.max(2))
+                .all(|e| e.strong);
+        let mut stable;
+        let mut consumed;
+        if !line_end && tail_strong {
+            let last = session.early_history.last().unwrap();
+            stable = last.proposal.clone();
+            consumed = last
+                .raw_lengths
+                .iter()
+                .find(|(p, _)| *p == stable)
+                .map(|(_, l)| *l)
+                .unwrap_or(0);
+            while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
+                stable = stable.chars().take(stable.chars().count() - 1).collect();
+                consumed = last
+                    .raw_lengths
+                    .iter()
+                    .find(|(p, _)| *p == stable)
+                    .map(|(_, l)| *l)
+                    .unwrap_or(0);
+            }
+        } else {
+            // 3 键公共前缀 + 一致的消耗长度
+            stable = common_history_prefix(&session.early_history);
             consumed = stable_history_raw_length(&session.early_history, &stable);
+            while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
+                stable = stable.chars().take(stable.chars().count() - 1).collect();
+                consumed = stable_history_raw_length(&session.early_history, &stable);
+            }
         }
         if consumed == 0 {
             return;
