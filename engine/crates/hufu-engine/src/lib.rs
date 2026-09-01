@@ -1047,8 +1047,11 @@ impl Engine {
     fn try_early_commit(&mut self, session: &mut Session) {
         if !self.config.sentence.early_commit || session.early_suspended {
             session.early_history.clear();
+            session.line_end_hint = false;
             return;
         }
+        // 行尾瞬态（单键有效）：确认键数 2→1，组段早一步缩短
+        let line_end = std::mem::take(&mut session.line_end_hint);
         let live = session.raw.clone();
         if live.chars().count() + session.committed_raw.chars().count() <= 3 {
             session.early_history.clear();
@@ -1113,8 +1116,11 @@ impl Engine {
         }
 
         // 观察窗口按证据强度自适应：强证据 2 键确认；普通证据 2 键
-        // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）
-        let need = 2;
+        // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）。
+        // 行尾（组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信
+        // 前缀（confidence 软最大占比 ≥0.99 不变），只是早一键落地，
+        // 让组段尽快缩回一行内。
+        let need = if line_end { 1 } else { 2 };
         if session.early_history.len() < need {
             return;
         }

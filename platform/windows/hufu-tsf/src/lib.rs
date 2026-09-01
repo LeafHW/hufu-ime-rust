@@ -95,7 +95,7 @@ extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
     let _ = crate::ipc::reset_session();
     let keys = ["u", "e", "y", "i", "h", "x", "m", "f", "t", "d"];
     // 预热一轮（首键建连/服务器锁热身）
-    let _ = crate::ipc::key_request("u", false, false, false);
+    let _ = crate::ipc::key_request("u", false, false, false, false);
     let _ = crate::ipc::reset_session();
     let t0 = std::time::Instant::now();
     for i in 0..n {
@@ -105,7 +105,7 @@ extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
             let _ = crate::ipc::reset_session();
         }
         let k = keys[i % keys.len()];
-        let _ = crate::ipc::key_request(k, false, false, false);
+        let _ = crate::ipc::key_request(k, false, false, false, false);
     }
     let us = t0.elapsed().as_micros() as f64 / n as f64;
     eprintln!("key-burst: {n} 键 avg {us:.0}µs/键");

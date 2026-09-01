@@ -298,16 +298,20 @@ pub fn call(req: &Value) -> Option<Value> {
 }
 
 /// 按键请求 → (consumed, commit, back, state, sound)
+/// line_end：前端检测到组段逼近窗口右缘（软换行边界）——引擎提前上屏
+/// 确认键数 2→1，组段早一步缩短（见 engine Session::line_end_hint）。
 pub fn key_request(
     key: &str,
     shift: bool,
     ctrl: bool,
     alt: bool,
+    line_end: bool,
 ) -> Option<(bool, String, u8, Value, Option<String>)> {
     let resp = call(&serde_json::json!({
         "op": "key",
         "key": key,
-        "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt }
+        "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt },
+        "line_end": line_end
     }))?;
     let outcome = resp.get("outcome")?;
     let consumed = outcome.get("consumed").and_then(|v| v.as_bool()).unwrap_or(false);

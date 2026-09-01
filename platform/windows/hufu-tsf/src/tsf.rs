@@ -67,6 +67,16 @@ pub struct Shared {
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
     /// 异步重排换序后主动刷新候选窗）
     pub cand_sig_last: String,
+    /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
+    /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
+    /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
+    /// 重查 caret 并移动候选窗到最新插入点——「每自动上屏一次就跟随，
+    /// 哪怕候选里还有内容」。
+    pub caret_recheck_due: bool,
+    /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
+    /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
+    /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
+    pub line_end: bool,
 }
 
 impl Shared {
@@ -99,6 +109,8 @@ impl Shared {
             preedit_last: String::new(),
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
+            caret_recheck_due: false,
+            line_end: false,
         }
     }
 
@@ -578,7 +590,7 @@ impl HuFuTs_Impl {
             };
             if fire {
                 if let Some((consumed, _commit, _back, state, _sound)) =
-                    ipc::key_request("shift", false, false, false)
+                    ipc::key_request("shift", false, false, false, false)
                 {
                     if consumed {
                         let zh = state
@@ -680,8 +692,11 @@ impl HuFuTs_Impl {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
         };
+        // 行尾瞬态（query_caret 每帧刷新）：组段逼近窗口右缘时本键
+        // 的提前上屏确认放宽（engine need 2→1）
+        let line_end = self.shared.lock().unwrap().line_end;
         let Some((consumed, commit, back, state, sound)) =
-            ipc::key_request(&name, m_shift, m_ctrl, m_alt)
+            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end)
         else {
             return BOOL(0);
         };
@@ -735,7 +750,7 @@ pub fn test_key(vk: u32) -> i32 {
         return 0;
     };
     let _ = (shift, ctrl, alt);
-    let r = ipc::key_request(&name, false, false, false);
+    let r = ipc::key_request(&name, false, false, false, false);
     match r {
         Some((consumed, _commit, _back, _state, _sound)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
@@ -1107,6 +1122,23 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         right: rect.right,
         bottom: rect.bottom,
     });
+    // 【行尾检测】caret 右缘距前台窗口右缘 < 56px（≈2-3 个全角字 +
+    // 滚动条余量，二者同为屏幕物理像素可直接比）→ 软换行边界将至。
+    // 页面视图/分栏等行宽 < 窗口宽的宿主检测不到（不触发，无害）；
+    // 误触发时提前上屏的仍是同一置信前缀，语义安全。
+    g.line_end = unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            false
+        } else {
+            let mut wr = RECT::default();
+            if GetWindowRect(fg, &mut wr).is_ok() {
+                wr.right - rect.right < 56 && rect.right <= wr.right
+            } else {
+                false
+            }
+        }
+    };
 }
 
 /// 空组段接收器。
@@ -1167,6 +1199,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             }
         } else if !commit.is_empty() {
             // 提前上屏：提交前缀 + 继续组句（此前该分支丢失中途上屏文本）
+            // 【上屏跟随】懒布局宿主上屏帧 caret 常是旧行框——布置 60ms
+            // 重查（见 caret_recheck_due 注释）。
+            g.caret_recheck_due = true;
+            arm_caret_recheck_timer();
             Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
             Some(Op::StartPreedit(preedit.to_string()))
@@ -1588,7 +1624,7 @@ fn ui_element_hide(shared: &SharedRef) {
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetWindowThreadProcessId, KillTimer,
+    CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, KillTimer,
     RegisterClassW, SetTimer, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 
@@ -1597,6 +1633,9 @@ const POLL_MS: u32 = 110;
 /// 首帧稳定期一次性补显定时器（35ms 精确到点，不等轮询周期）
 const FIRST_TIMER_ID: usize = 0x4846_5547; // 'HuFV'
 const FIRST_FRAME_MS: u32 = 35;
+/// 上屏跟随重查（一次性）：60ms ≈ 2-3 帧后宿主懒布局已稳定
+const CARET_TIMER_ID: usize = 0x4846_5548; // 'HuFW'
+const CARET_RECHECK_MS: u32 = 60;
 
 /// 武装首帧补显定时器（update_ui 的 suppress 分支调用；与 poll 窗口
 /// 同线程——TSF 回调线程，SetTimer 亲和无虞。重复调用同 id=重置）。
@@ -1608,6 +1647,22 @@ fn arm_first_frame_timer() {
                 HWND(h as *mut _),
                 FIRST_TIMER_ID,
                 FIRST_FRAME_MS,
+                None,
+            );
+        }
+    }
+}
+
+/// 武装上屏跟随重查定时器（update_ui 的 CommitAndRepreedit 分支调用；
+/// 与 poll 窗同线程。重复调用同 id=重置，幂等）。
+fn arm_caret_recheck_timer() {
+    let h = POLL_HWND.load(AtomicOrdering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = SetTimer(
+                HWND(h as *mut _),
+                CARET_TIMER_ID,
+                CARET_RECHECK_MS,
                 None,
             );
         }
@@ -1663,6 +1718,41 @@ extern "system" fn poll_wndproc(
                 let _ = KillTimer(hwnd, FIRST_TIMER_ID);
             }
             poll_tick();
+            return LRESULT(0);
+        }
+        if id == CARET_TIMER_ID {
+            // 上屏跟随重查到点：一次性。拉当前引擎态强制走一遍 update_ui
+            //（同文本 SetPreedit 重跑组段会话 → query_caret 双查此时拿到
+            // 稳定后的新行框 → 候选窗以最新插入点重新定位——懒布局宿主
+            // 上屏帧的旧行框滞留由此消除）。
+            unsafe {
+                let _ = KillTimer(hwnd, CARET_TIMER_ID);
+            }
+            let shared = POLL_SHARED
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.0.clone());
+            if let Some(shared) = shared {
+                {
+                    let mut g = shared.lock().unwrap();
+                    g.caret_recheck_due = false;
+                }
+                if let Some(state) = crate::ipc::state_request() {
+                    let raw_empty = state
+                        .get("raw")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .is_empty();
+                    if !raw_empty {
+                        // 候选签名不参与判断（内容没变也要移动位置）
+                        let mut g = shared.lock().unwrap();
+                        g.cand_sig_last = String::new();
+                        drop(g);
+                        let _ = update_ui(shared, String::new(), state);
+                    }
+                }
+            }
             return LRESULT(0);
         }
     }
