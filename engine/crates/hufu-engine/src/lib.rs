@@ -891,57 +891,6 @@ impl Engine {
             session.clear();
         }
 
-        // 【整句空码自动顶屏】（虎爪 2026-09-02 版同步）：整句模式下，
-        // 新键使「已提交文本开头的完整候选」断供（无路可走）时，立即
-        // 把追加前的强首选顶上屏、新键留在缓冲继续组新字——而非干挂
-        // 缓冲死等。虎爪同款三重门槛：
-        //  1) 追加前首选须强：完整态、committed 开头有增量、软最大
-        //     占比 0.99999 档（唯一或与次名 score 差 ≥ ln(99999)≈11.5）；
-        //  2) 断供：追加后无 committed 开头的完整态候选（partial/前缀
-        //     态不算供给——虎爪 HasCompleteCandidate 只要完整切分）；
-        //  3) 豁免：尾部 2..=4 键拼成合法编码前缀（还能延伸出字）→
-        //     不顶，等（虎爪 IsProperCodePrefix 的保守近似）。
-        if sentence_mode && !prev_cands.is_empty() {
-            let cmt = session.committed_text.clone();
-            let first = prev_cands[0].clone();
-            let strong = !first.partial
-                && first.text.starts_with(&cmt)
-                && first.text.chars().count() > cmt.chars().count()
-                && (prev_cands.len() == 1
-                    || prev_cands[1].weight <= first.weight - 11.5);
-            if strong {
-                let supply = session.candidates.iter().any(|c| {
-                    !c.partial
-                        && c.text.starts_with(&cmt)
-                        && c.text.chars().count() > cmt.chars().count()
-                });
-                if !supply {
-                    let full = format!("{}{}", session.committed_raw, session.raw);
-                    let fc: Vec<char> = full.chars().collect();
-                    let extendable = (2..=4usize).any(|n| {
-                        n <= fc.len() && {
-                            let tail: String = fc[fc.len() - n..].iter().collect();
-                            self.has_continuation_prefix(&tail)
-                        }
-                    });
-                    if !extendable && fc.len() >= 2 {
-                        let k = fc.len() - 1;
-                        let delta: String =
-                            first.text.chars().skip(cmt.chars().count()).collect();
-                        if !delta.is_empty() {
-                            session.committed_text = first.text.clone();
-                            session.committed_raw = fc[..k].iter().collect();
-                            session.raw = fc[k..].iter().collect();
-                            session.early_history.clear();
-                            session.pending_commit = Some(delta);
-                            self.refresh_candidates(session);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
         // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
         if sentence_takeover || self.parsed_has_locks(session) || !session.committed_raw.is_empty() {
             self.try_early_commit(session);
@@ -1146,49 +1095,19 @@ impl Engine {
         }
 
         let (proposal, proposal_share) =
-            confidence_proposal(&cands, self.config.sentence.weights.confidence.max(0.995));
+            confidence_proposal(&cands, self.config.sentence.weights.confidence);
         if proposal.is_empty()
             || proposal.chars().count() <= committed_text.chars().count()
         {
-            // 中性帧（提案空/弱）：不清证据史——虎爪 NeutralGap 断档
-            // 容忍精神，中间一帧不稳不丢已积累的证据；真清场交给反证
-            // 与断档超限。
-            return;
-        }
-
-        // 证据史：须逐键延伸（full = 上一证据 + 1 字符）
-        // 反证撤销（虎爪 SentencePrefixContradicted）：存在「同消耗长度、
-        // 异文」的前缀路径 → 旧证据作废（切分已换轨，不能再信）。
-        let contradiction = match session.early_history.last() {
-            Some(e) => {
-                let k_last = e
-                    .raw_lengths
-                    .iter()
-                    .find(|(p, _)| *p == e.proposal)
-                    .map(|(_, l)| *l)
-                    .unwrap_or(0);
-                k_last > 0
-                    && k_last < full.chars().count()
-                    && {
-                        let tlen = e.proposal.chars().count();
-                        cands
-                            .iter()
-                            .any(|h| h.word_ends.iter().any(|&(cc, be)| cc != tlen && be == k_last))
-                    }
-            }
-            None => false,
-        };
-        if contradiction {
             session.early_history.clear();
             return;
         }
 
-        // 证据史：逐键延伸（虎爪 NeutralGap≤3 精神——断档 1..=3 键内
-        // 的回归仍算延续；超过 4 键差或非前缀即断崖清零）
+        // 证据史：须逐键延伸（full = 上一证据 + 1 字符）
         let extends = match session.early_history.last() {
             Some(e) => {
-                let gap = full.chars().count() as i64 - e.full_raw.chars().count() as i64;
-                gap >= 1 && gap <= 4 && full.starts_with(&e.full_raw)
+                full.chars().count() == e.full_raw.chars().count() + 1
+                    && full.starts_with(&e.full_raw)
             }
             None => false,
         };
@@ -1207,17 +1126,12 @@ impl Engine {
             session.early_history.remove(0);
         }
 
-        // 观察窗口按证据强度自适应（虎爪对齐）：强证据（全史 0.999 档）
-        // 2 键确认；普通证据 3 键（虎爪 RequiredEvidenceCount=3）；行尾
-        // （组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信前缀。
-        let all_strong = session.early_history.iter().all(|e| e.strong);
-        let need = if line_end {
-            1
-        } else if all_strong {
-            2
-        } else {
-            3
-        };
+        // 观察窗口按证据强度自适应：强证据 2 键确认；普通证据 2 键
+        // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）。
+        // 行尾（组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信
+        // 前缀（confidence 软最大占比 ≥0.99 不变），只是早一键落地，
+        // 让组段尽快缩回一行内。
+        let need = if line_end { 1 } else { 2 };
         if session.early_history.len() < need {
             return;
         }
@@ -1239,30 +1153,6 @@ impl Engine {
         let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
         if delta.chars().count() < 1 || live.chars().count() < 2 {
             return;
-        }
-
-        // 【边界封口】（虎爪 BoundaryClosed）：提案的末边界必须是
-        // 「全体候选一致同意」的切分点——恰好在该 (文本长, 编码长)
-        // 边界结束的置信质量占比 ≥0.99999。词中截断的提案不提交
-        // （切分演化中词内截断最容易变，是提前上屏锁错的主源）。
-        // 仅无锁时检验（带锁=用户钉名次，边界由锁决定）。
-        if !parse_rank_locks(&full).has_locks() {
-            let tlen = stable.chars().count();
-            let max_c = cands
-                .iter()
-                .map(|h| h.confidence)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let total_c: f64 = cands.iter().map(|h| (h.confidence - max_c).exp()).sum();
-            if total_c > 0.0 {
-                let boundary_mass: f64 = cands
-                    .iter()
-                    .filter(|h| h.word_ends.iter().any(|&(cc, be)| cc == tlen && be == consumed))
-                    .map(|h| (h.confidence - max_c).exp())
-                    .sum();
-                if boundary_mass / total_c < 0.99999 {
-                    return;
-                }
-            }
         }
 
         // 提交：committed 前缀增长，live raw 缩为剩余
@@ -1827,22 +1717,21 @@ impl Engine {
                     .unwrap_or(false);
             if rare_rescue {
                 let dec = self.sentence.as_ref().unwrap();
-                // 【前缀态不进候选】（虎爪/Rime 对齐，2026-09-04 拍板）：
-                // 打出延伸键（pvl 的 l、dzht 的 t）即表达「要延伸」，前码
-                // 字（「起」pv、「唬」dzh）不再出现在候选里——虎爪/Rime
-                // 同款语义。前码字要上屏该在打它自己的码时空格（pv+空格
-                // =起），打了延伸键再要前码字=退格。前缀态候选是历代霸首
-                // bug 的种子（partial 提权/沉底防御复杂度全由此生），根除。
-                // 连带效果：满码唯一字（dzht=嘶）候选唯一化，触发「满码
-                // 无重自动上屏」（对齐虎爪「最大码长无重自动上屏」）。
+                // 【前缀态不进候选】（踹修复链，虎爪/Rime 对齐）：打出
+                // 延伸键（pvl 的 l、dzht 的 t）即表达「要延伸」，前码字
+                //（「起」pv、「唬」dzh）不再出现在候选里——虎爪/Rime 同
+                // 款语义。前码字要上屏该在打它自己的码时空格（pv+空格
+                // =起），打了延伸键再要前码字=退格。前缀态候选是历代
+                // 霸首 bug 的种子（partial 提权/沉底防御复杂度全由此生）。
                 let mut normal = Vec::new();
                 let mut rare = Vec::new();
-                // 【精确码不下沉】码表精确候选若正是当前 raw 的精确
-                // 条目（打出的码有精确匹配=用户明确意图，如 dzht=嘶、
-                // pvl=踹——即使存在更长码 pvlc/pvle，打在这个码上就是
-                // 要这个字，继续打才延伸），不判生僻下沉。未打到的更长
-                // 码的生僻候选维持下沉（码表全生僻时 wvn=[徴,𡦺] 照常
-                // 全上——生僻单字间不再有前缀态垫背）。
+                // 【精确码不下沉】（踹修复）：码表精确候选若正是当前
+                // raw 的精确条目（打出的码有精确匹配=用户明确意图，如
+                // dzht=嘶、pvl=踹——即使存在更长码 pvlc/pvle，打在这个
+                // 码上就是要这个字，继续打才延伸），不判生僻下沉——否则
+                // 2/3 键前缀态（「唬」dzh、「起」pv）经 early 压前霸占首
+                // 位，空格上屏上错字。未打到的更长码的生僻候选维持下沉
+                //（码表全生僻时 wvn=[徴,𡦺] 照常全上）。
                 let raw_exact = !self.schema.dict.lookup(&session.raw).is_empty();
                 for e in &entries {
                     let c = self.entry_to_candidate(e);
