@@ -377,6 +377,8 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut exact = 0usize;
     let mut total = 0usize;
     let mut early_commits = 0usize; // 提前上屏总次数（句中 commit，不含收尾）
+    let mut early_chars = 0u64; // 提前上屏总字数（手感：每次几个字）
+    let mut total_chars = 0u64; // 全文总字数（覆盖率分母）
     let mut total_ms: Vec<u128> = Vec::new();
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -464,6 +466,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             if let Some(c) = out.commit {
                 committed.push_str(&c);
                 early_commits += 1;
+                early_chars += c.chars().count() as u64;
             }
         }
         // 收尾：空格上屏剩余（延迟也计入）
@@ -475,6 +478,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         }
         }
         total_ms.push(t1.elapsed().as_millis());
+        total_chars += s.chars().count() as u64;
         if committed == *s {
             exact += 1;
         } else if dumped < dump {
@@ -505,6 +509,15 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         p(95),
         key_us.iter().sum::<u64>() as f64 / n as f64,
         sorted.last().copied().unwrap_or(0)
+    );
+    // 手感综合评估：提前上屏的字数视角——每次上屏平均几个字、全文
+    // 有多大比例的字是免空格提前落地的（覆盖率=少按空格的真实比例）。
+    println!(
+        "手感： 每次提前上屏平均 {:.2} 字  提前上屏覆盖 {:.1}%（{} 字 / 全文 {} 字）",
+        early_chars as f64 / early_commits.max(1) as f64,
+        early_chars as f64 / total_chars.max(1) as f64 * 100.0,
+        early_chars,
+        total_chars
     );
 }
 
