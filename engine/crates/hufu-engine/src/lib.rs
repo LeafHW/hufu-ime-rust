@@ -14,7 +14,7 @@ pub mod punct;
 pub mod session;
 
 pub use punct::PairState;
-pub use session::{EarlyHistory, EmptyCodePending, Session};
+pub use session::{EarlyHistory, Session};
 
 use hufu_config::Config;
 use hufu_dict::annotation::ReverseTable;
@@ -891,97 +891,55 @@ impl Engine {
             session.clear();
         }
 
-        // 【整句空码自动顶屏】（虎爪 2026-09-02 版同步，可配置）：整句
-        // 模式下，新键使「已提交文本开头的完整候选」断供（无路可走）时，
-        // 立即把追加前的强首选顶上屏、新键留在缓冲继续组新字——而非干
-        // 挂缓冲死等。虎爪同款门槛：
+        // 【整句空码自动顶屏】（虎爪 2026-09-02 版同步）：整句模式下，
+        // 新键使「已提交文本开头的完整候选」断供（无路可走）时，立即
+        // 把追加前的强首选顶上屏、新键留在缓冲继续组新字——而非干挂
+        // 缓冲死等。虎爪同款三重门槛：
         //  1) 追加前首选须强：完整态、committed 开头有增量、软最大
         //     占比 0.99999 档（唯一或与次名 score 差 ≥ ln(99999)≈11.5）；
-        //  2) 断供：追加后无 committed 开头的完整态候选（partial 不算
-        //     供给——虎爪 HasCompleteCandidate 只要完整切分）；
+        //  2) 断供：追加后无 committed 开头的完整态候选（partial/前缀
+        //     态不算供给——虎爪 HasCompleteCandidate 只要完整切分）；
         //  3) 豁免：尾部 2..=4 键拼成合法编码前缀（还能延伸出字）→
         //     不顶，等（虎爪 IsProperCodePrefix 的保守近似）。
-        // 配置（sentence 段）：empty_code_auto_commit 开关（默认开）；
-        // min_retained_raw 保留量（默认 0 不限）：顶出后缓冲剩余键数
-        // 不足该值时先挂起（empty_pending 跨键保留），继续打键攒够再
-        // 顶——虎爪「保留最少编码数量」同款语义。
-        if sentence_mode && self.config.sentence.empty_code_auto_commit {
+        if sentence_mode && !prev_cands.is_empty() {
             let cmt = session.committed_text.clone();
-            let supply = session
-                .candidates
-                .iter()
-                .any(|c| {
+            let first = prev_cands[0].clone();
+            let strong = !first.partial
+                && first.text.starts_with(&cmt)
+                && first.text.chars().count() > cmt.chars().count()
+                && (prev_cands.len() == 1
+                    || prev_cands[1].weight <= first.weight - 11.5);
+            if strong {
+                let supply = session.candidates.iter().any(|c| {
                     !c.partial
                         && c.text.starts_with(&cmt)
                         && c.text.chars().count() > cmt.chars().count()
                 });
-            if supply {
-                // 有路可走：挂起态作废（虎爪 HasCompleteCandidate 真
-                // 分支 ResetSentenceEmptyCodePending）
-                session.empty_pending = None;
-            } else {
-                // 断供：建立/沿用挂起态（捕获追加前的强首选）
-                if session.empty_pending.is_none() && !prev_cands.is_empty() {
-                    let first = &prev_cands[0];
-                    let strong = !first.partial
-                        && first.text.starts_with(&cmt)
-                        && first.text.chars().count() > cmt.chars().count()
-                        && (prev_cands.len() == 1
-                            || prev_cands[1].weight <= first.weight - 11.5);
-                    if strong {
-                        let full0 = format!("{}{}", session.committed_raw, session.raw);
-                        let base = full0.chars().count().saturating_sub(1);
-                        session.empty_pending = Some(EmptyCodePending {
-                            text: first.text.clone(),
-                            cmt: cmt.clone(),
-                            base,
-                        });
-                    }
-                }
-                let valid = session
-                    .empty_pending
-                    .as_ref()
-                    .map(|p| {
-                        p.cmt == session.committed_text
-                            && p.base > 0
-                            && p.text.starts_with(&p.cmt)
-                            && p.text.chars().count() > p.cmt.chars().count()
-                    })
-                    .unwrap_or(false);
-                if valid {
-                    let p = session.empty_pending.clone().unwrap();
+                if !supply {
                     let full = format!("{}{}", session.committed_raw, session.raw);
                     let fc: Vec<char> = full.chars().collect();
-                    if p.base < fc.len() {
-                        // 豁免：尾部 2..=4 键是合法编码前缀 → 不顶（挂起保留）
-                        let extendable = (2..=4usize).any(|n| {
-                            n <= fc.len() && {
-                                let tail: String = fc[fc.len() - n..].iter().collect();
-                                self.has_continuation_prefix(&tail)
-                            }
-                        });
-                        // 保留量：顶出后缓冲剩余键数须 ≥ min_retained_raw
-                        let min_keep = self.config.sentence.min_retained_raw;
-                        let retained = fc.len() - p.base;
-                        if !extendable && (min_keep == 0 || retained >= min_keep) {
-                            let delta: String =
-                                p.text.chars().skip(p.cmt.chars().count()).collect();
-                            if !delta.is_empty() {
-                                session.committed_text = p.text.clone();
-                                session.committed_raw = fc[..p.base].iter().collect();
-                                session.raw = fc[p.base..].iter().collect();
-                                session.early_history.clear();
-                                session.empty_pending = None;
-                                session.pending_commit = Some(delta);
-                                self.refresh_candidates(session);
-                                return;
-                            }
+                    let extendable = (2..=4usize).any(|n| {
+                        n <= fc.len() && {
+                            let tail: String = fc[fc.len() - n..].iter().collect();
+                            self.has_continuation_prefix(&tail)
+                        }
+                    });
+                    if !extendable && fc.len() >= 2 {
+                        let k = fc.len() - 1;
+                        let delta: String =
+                            first.text.chars().skip(cmt.chars().count()).collect();
+                        if !delta.is_empty() {
+                            session.committed_text = first.text.clone();
+                            session.committed_raw = fc[..k].iter().collect();
+                            session.raw = fc[k..].iter().collect();
+                            session.early_history.clear();
+                            session.pending_commit = Some(delta);
+                            self.refresh_candidates(session);
+                            return;
                         }
                     }
                 }
             }
-        } else {
-            session.empty_pending = None; // 功能关闭：清挂起态
         }
 
         // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
@@ -1242,13 +1200,8 @@ impl Engine {
             proposal: proposal.clone(),
             full_raw: full.clone(),
             raw_lengths,
-            // 虎爪对齐 0.99999（STRONG_SHARE）：Strong 是「连续强证据×2
-            // 即提交整段」的捷径入场券，必须极严——0.999 档在后续键
-            // 歧义期（如下一字首键引入「我推/我的」竞争路径）仍会保持
-            // 达标，导致半途提交短段（「让|我|看看」碎片节奏）；0.99999
-            // 下歧义期跌出 Strong → 继续等，攒到「我看看」笃定后一次提
-            // 长段（虎爪实测节奏）。
-            strong: proposal_share >= 0.99999,
+            strong: proposal_share >= 0.999, // Rime STRONG_SHARE（0.9999→0.99999 曾反向调严；
+            // 实测 v5 下提前上屏偏保守，回 0.999 提高积极性）
         });
         while session.early_history.len() > 3 {
             session.early_history.remove(0);
@@ -1269,48 +1222,12 @@ impl Engine {
             return;
         }
 
-        // 【连续强证据捷径】（虎爪 ConsecutiveStrongCount≥2 提交「最长
-        // 达标 tracker」语义，TryCommitMatureSentencePrefix 的 LengthIn
-        // TextElements descending）：尾部 need 键全为强证据（share≥
-        // 0.999）时，直接提交最新帧的完整提案——不必再等 3 帧公共前
-        // 缀。这是虎爪上屏积极感的主要来源：打常见词组时 ngram 两键
-        // 就笃定（Strong×2），整段提案立即落地。普通流维持 3 帧公共
-        // （保守面：边界封口+反证撤销对两条路径都生效）。
-        let tail_strong = session.early_history.len() >= need.max(2)
-            && session
-                .early_history
-                .iter()
-                .rev()
-                .take(need.max(2))
-                .all(|e| e.strong);
-        let mut stable;
-        let mut consumed;
-        if !line_end && tail_strong {
-            let last = session.early_history.last().unwrap();
-            stable = last.proposal.clone();
-            consumed = last
-                .raw_lengths
-                .iter()
-                .find(|(p, _)| *p == stable)
-                .map(|(_, l)| *l)
-                .unwrap_or(0);
-            while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
-                stable = stable.chars().take(stable.chars().count() - 1).collect();
-                consumed = last
-                    .raw_lengths
-                    .iter()
-                    .find(|(p, _)| *p == stable)
-                    .map(|(_, l)| *l)
-                    .unwrap_or(0);
-            }
-        } else {
-            // 3 键公共前缀 + 一致的消耗长度
-            stable = common_history_prefix(&session.early_history);
+        // 3 键公共前缀 + 一致的消耗长度
+        let mut stable = common_history_prefix(&session.early_history);
+        let mut consumed = stable_history_raw_length(&session.early_history, &stable);
+        while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
+            stable = stable.chars().take(stable.chars().count() - 1).collect();
             consumed = stable_history_raw_length(&session.early_history, &stable);
-            while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
-                stable = stable.chars().take(stable.chars().count() - 1).collect();
-                consumed = stable_history_raw_length(&session.early_history, &stable);
-            }
         }
         if consumed == 0 {
             return;
@@ -1319,25 +1236,9 @@ impl Engine {
         if consumed <= committed_raw_len || consumed > full.chars().count() {
             return;
         }
-        // 【身后保留量】（虎爪 GetSentenceAutoCommitRetainRawLength=max(3,
-        // minRetained) 语义）：提交时 full 减去消耗后至少还要剩 3 键活码
-        // ——身后码不足就继续等（下一键证据会更新提案，往往攒成更长段，
-        // 如「我」→「我看看」）。行尾（组段逼近右缘）例外放宽到 1 键：
-        // 行尾组段必须尽快缩短，不能等。
-        let retain = if line_end {
-            1
-        } else {
-            self.config.sentence.min_retained_raw.max(3)
-        };
         let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
-        if delta.chars().count() < 1 || full.chars().count() - consumed < retain {
+        if delta.chars().count() < 1 || live.chars().count() < 2 {
             return;
-        }
-        if std::env::var("HUFU_EARLY_DEBUG").is_ok() {
-            eprintln!(
-                "[early] full={} consumed={} retain={} behind={} stable={} line_end={}",
-                full, consumed, retain, full.chars().count() - consumed, stable, line_end
-            );
         }
 
         // 【边界封口】（虎爪 BoundaryClosed）：提案的末边界必须是
@@ -1733,27 +1634,24 @@ impl Engine {
 
     /// 轮询读入口：先应用已到达的重排缓存（无按键副作用）再取 state——
     /// 候选窗停顿期轮询由此立即看到换序后的新首选。
-    pub fn refresh_rerank(&mut self, session: &mut Session) {
+    pub fn refresh_rerank(&self, session: &mut Session) {
         self.apply_rerank(session);
     }
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
-    fn apply_rerank(&mut self, session: &mut Session) {        if session.candidates.is_empty() {
+    fn apply_rerank(&self, session: &mut Session) {        if session.candidates.is_empty() {
+            return;
+        }
+        let cache = match self.rerank_cache.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if cache.is_empty() {
             return;
         }
         let key = format!("{}{}", session.committed_raw, session.raw);
-        let order: Vec<String> = {
-            let cache = match self.rerank_cache.lock() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            if cache.is_empty() {
-                return;
-            }
-            match cache.get(&key) {
-                Some(o) => o.clone(),
-                None => return,
-            }
+        let Some(order) = cache.get(&key) else {
+            return;
         };
         let rank: std::collections::HashMap<&String, usize> =
             order.iter().enumerate().map(|(i, t)| (t, i)).collect();
@@ -1765,7 +1663,6 @@ impl Engine {
             }
         }
         if idxs.len() < 2 {
-            self.anchor_rerank_early(session, &key);
             return;
         }
         let mut sorted: Vec<usize> = idxs.clone();
@@ -1781,7 +1678,6 @@ impl Engine {
             }
         });
         if sorted == idxs {
-            self.anchor_rerank_early(session, &key);
             return;
         }
         let subs: Vec<Candidate> = sorted
@@ -1791,57 +1687,6 @@ impl Engine {
         for (slot, cand) in idxs.into_iter().zip(subs) {
             session.candidates[slot] = cand;
         }
-        self.anchor_rerank_early(session, &key);
-    }
-
-    /// 【rerank 锚定】（虎爪 text3：neural top 锚定提案）：Qwen 接受的
-    /// 首选若为当前候选里的完整态，直接把它作为强证据帧注入提前上屏
-    /// 证据史并立即重评——ngram 慢慢攒份额的过程被 Qwen 的整句判断
-    /// 跳过，这是虎爪上屏「快」的主要来源。安全性不豁免：边界封口、
-    /// 身后保留量、反证撤销对锚定帧同样生效；锚定帧一次性（下一键
-    /// 证据史断档/反证即清）。
-    fn anchor_rerank_early(&mut self, session: &mut Session, key: &str) {
-        let top = match session.candidates.first() {
-            Some(c) if !c.partial && c.text.chars().count() > session.committed_text.chars().count() => c.text.clone(),
-            _ => return,
-        };
-        let dec = match &self.sentence {
-            Some(d) => d.clone(),
-            None => return,
-        };
-        let rich = dec.decode_rich(key);
-        let cmt = session.committed_text.clone();
-        let cands: Vec<&SentenceHit> = rich
-            .hits
-            .iter()
-            .filter(|h| cmt.is_empty() || h.text.starts_with(&cmt))
-            .collect();
-        if cands.is_empty() {
-            return;
-        }
-        let raw_lengths = build_raw_lengths(&cands, key);
-        if !raw_lengths.iter().any(|(p, _)| *p == top) {
-            return; // Qwen 首选不是当前解码可达的完整切分：不锚
-        }
-        // 已有同提案同长度的帧（本帧自然产生过）就不重复注入
-        let dup = session
-            .early_history
-            .last()
-            .map(|e| e.proposal == top && e.full_raw == key)
-            .unwrap_or(false);
-        if dup {
-            return;
-        }
-        session.early_history.push(EarlyHistory {
-            proposal: top,
-            full_raw: key.to_string(),
-            raw_lengths,
-            strong: true,
-        });
-        while session.early_history.len() > 3 {
-            session.early_history.remove(0);
-        }
-        self.try_early_commit(session);
     }
 
     fn sentence_candidates(

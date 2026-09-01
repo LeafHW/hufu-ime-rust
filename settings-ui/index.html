@@ -273,12 +273,10 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="s-en"><label for="s-en">启用整句</label></div>
       <div class="checkline"><input type="checkbox" id="s-auto"><label for="s-auto">「整句」方案自动启用</label></div>
       <div class="checkline"><input type="checkbox" id="s-early"><label for="s-early">提前上屏（稳 3 键）</label></div>
-      <div class="checkline"><input type="checkbox" id="s-empty"><label for="s-empty">整句空码自动顶屏</label></div>
       <span class="pill" id="s-model-state">模型：检测中…</span>
     </div>
     <div class="row">
       <div class="field"><label>ngram 模型文件（数据目录相对路径）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
-      <div class="field"><label>保留最少编码数量（空码顶屏后缓冲至少剩几键，0=不限）</label><input type="number" id="s-retain" min="0" max="32" step="1" style="width:110px"></div>
     </div>
     <h3>组句权重</h3>
     <div class="row" id="w-sliders"></div>
@@ -445,10 +443,7 @@ function bindInputs() {
   B("#c-cmt", "candidates.show_comment"); B("#c-split", "candidates.show_split");
   B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
   B("#r-en", "reverse.enabled");
-  B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit"); B("#s-empty", "sentence.empty_code_auto_commit");
-  // min_retained_raw 是 usize：专用绑定取整（通用 data-path number 绑定写 float 会反序列化失败）
-  $("#s-retain").value = CFG.sentence.min_retained_raw ?? 0;
-  $("#s-retain").oninput = e => { const v = Math.round(+e.target.value); if (!isNaN(v) && v >= 0) CFG.sentence.min_retained_raw = v; };
+  B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
   B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
   B("#snd-en", "sound.enabled");
   $("#snd-vol").value = CFG.sound?.volume ?? 50;
