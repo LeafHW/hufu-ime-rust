@@ -14,7 +14,7 @@ pub mod punct;
 pub mod session;
 
 pub use punct::PairState;
-pub use session::{EarlyHistory, Session};
+pub use session::{EarlyHistory, EmptyCodePending, Session};
 
 use hufu_config::Config;
 use hufu_dict::annotation::ReverseTable;
@@ -891,55 +891,97 @@ impl Engine {
             session.clear();
         }
 
-        // 【整句空码自动顶屏】（虎爪 2026-09-02 版同步）：整句模式下，
-        // 新键使「已提交文本开头的完整候选」断供（无路可走）时，立即
-        // 把追加前的强首选顶上屏、新键留在缓冲继续组新字——而非干挂
-        // 缓冲死等。虎爪同款三重门槛：
+        // 【整句空码自动顶屏】（虎爪 2026-09-02 版同步，可配置）：整句
+        // 模式下，新键使「已提交文本开头的完整候选」断供（无路可走）时，
+        // 立即把追加前的强首选顶上屏、新键留在缓冲继续组新字——而非干
+        // 挂缓冲死等。虎爪同款门槛：
         //  1) 追加前首选须强：完整态、committed 开头有增量、软最大
         //     占比 0.99999 档（唯一或与次名 score 差 ≥ ln(99999)≈11.5）；
-        //  2) 断供：追加后无 committed 开头的完整态候选（partial/前缀
-        //     态不算供给——虎爪 HasCompleteCandidate 只要完整切分）；
+        //  2) 断供：追加后无 committed 开头的完整态候选（partial 不算
+        //     供给——虎爪 HasCompleteCandidate 只要完整切分）；
         //  3) 豁免：尾部 2..=4 键拼成合法编码前缀（还能延伸出字）→
         //     不顶，等（虎爪 IsProperCodePrefix 的保守近似）。
-        if sentence_mode && !prev_cands.is_empty() {
+        // 配置（sentence 段）：empty_code_auto_commit 开关（默认开）；
+        // min_retained_raw 保留量（默认 0 不限）：顶出后缓冲剩余键数
+        // 不足该值时先挂起（empty_pending 跨键保留），继续打键攒够再
+        // 顶——虎爪「保留最少编码数量」同款语义。
+        if sentence_mode && self.config.sentence.empty_code_auto_commit {
             let cmt = session.committed_text.clone();
-            let first = prev_cands[0].clone();
-            let strong = !first.partial
-                && first.text.starts_with(&cmt)
-                && first.text.chars().count() > cmt.chars().count()
-                && (prev_cands.len() == 1
-                    || prev_cands[1].weight <= first.weight - 11.5);
-            if strong {
-                let supply = session.candidates.iter().any(|c| {
+            let supply = session
+                .candidates
+                .iter()
+                .any(|c| {
                     !c.partial
                         && c.text.starts_with(&cmt)
                         && c.text.chars().count() > cmt.chars().count()
                 });
-                if !supply {
+            if supply {
+                // 有路可走：挂起态作废（虎爪 HasCompleteCandidate 真
+                // 分支 ResetSentenceEmptyCodePending）
+                session.empty_pending = None;
+            } else {
+                // 断供：建立/沿用挂起态（捕获追加前的强首选）
+                if session.empty_pending.is_none() && !prev_cands.is_empty() {
+                    let first = &prev_cands[0];
+                    let strong = !first.partial
+                        && first.text.starts_with(&cmt)
+                        && first.text.chars().count() > cmt.chars().count()
+                        && (prev_cands.len() == 1
+                            || prev_cands[1].weight <= first.weight - 11.5);
+                    if strong {
+                        let full0 = format!("{}{}", session.committed_raw, session.raw);
+                        let base = full0.chars().count().saturating_sub(1);
+                        session.empty_pending = Some(EmptyCodePending {
+                            text: first.text.clone(),
+                            cmt: cmt.clone(),
+                            base,
+                        });
+                    }
+                }
+                let valid = session
+                    .empty_pending
+                    .as_ref()
+                    .map(|p| {
+                        p.cmt == session.committed_text
+                            && p.base > 0
+                            && p.text.starts_with(&p.cmt)
+                            && p.text.chars().count() > p.cmt.chars().count()
+                    })
+                    .unwrap_or(false);
+                if valid {
+                    let p = session.empty_pending.clone().unwrap();
                     let full = format!("{}{}", session.committed_raw, session.raw);
                     let fc: Vec<char> = full.chars().collect();
-                    let extendable = (2..=4usize).any(|n| {
-                        n <= fc.len() && {
-                            let tail: String = fc[fc.len() - n..].iter().collect();
-                            self.has_continuation_prefix(&tail)
-                        }
-                    });
-                    if !extendable && fc.len() >= 2 {
-                        let k = fc.len() - 1;
-                        let delta: String =
-                            first.text.chars().skip(cmt.chars().count()).collect();
-                        if !delta.is_empty() {
-                            session.committed_text = first.text.clone();
-                            session.committed_raw = fc[..k].iter().collect();
-                            session.raw = fc[k..].iter().collect();
-                            session.early_history.clear();
-                            session.pending_commit = Some(delta);
-                            self.refresh_candidates(session);
-                            return;
+                    if p.base < fc.len() {
+                        // 豁免：尾部 2..=4 键是合法编码前缀 → 不顶（挂起保留）
+                        let extendable = (2..=4usize).any(|n| {
+                            n <= fc.len() && {
+                                let tail: String = fc[fc.len() - n..].iter().collect();
+                                self.has_continuation_prefix(&tail)
+                            }
+                        });
+                        // 保留量：顶出后缓冲剩余键数须 ≥ min_retained_raw
+                        let min_keep = self.config.sentence.min_retained_raw;
+                        let retained = fc.len() - p.base;
+                        if !extendable && (min_keep == 0 || retained >= min_keep) {
+                            let delta: String =
+                                p.text.chars().skip(p.cmt.chars().count()).collect();
+                            if !delta.is_empty() {
+                                session.committed_text = p.text.clone();
+                                session.committed_raw = fc[..p.base].iter().collect();
+                                session.raw = fc[p.base..].iter().collect();
+                                session.early_history.clear();
+                                session.empty_pending = None;
+                                session.pending_commit = Some(delta);
+                                self.refresh_candidates(session);
+                                return;
+                            }
                         }
                     }
                 }
             }
+        } else {
+            session.empty_pending = None; // 功能关闭：清挂起态
         }
 
         // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
