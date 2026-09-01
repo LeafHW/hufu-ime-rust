@@ -108,6 +108,12 @@ pub struct Candidate {
     /// 实际上屏文本与显示不同（多多 `显示=>输出`、剪贴板变量等）
     #[serde(default)]
     pub commit_override: Option<String>,
+    /// 【过程态】整句不完全尾前缀形态（未消耗全部 raw，如 dzht 时的
+    ///「唬」dzh、qlagy 时的「老鬼」qlag）——顶功语义下打满更长编码
+    /// = 用户已越过该前缀态。神经重排不评价过程态（Qwen 无键耗信息，
+    /// 实测把 4 键「老鬼」提到 5 键「老痒」前霸首）。
+    #[serde(default)]
+    pub partial: bool,
 }
 
 impl Candidate {
@@ -120,6 +126,7 @@ impl Candidate {
             source,
             pinned: false,
             commit_override: None,
+            partial: false,
         }
     }
 

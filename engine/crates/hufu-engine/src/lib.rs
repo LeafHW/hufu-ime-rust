@@ -1030,6 +1030,17 @@ impl Engine {
         false
     }
 
+    /// 【满码判定】编码是否存在严格更长的码表条目。注意 completions
+    /// 含自身条目——必须过滤长度；结果以 code 为前缀、长度 ≥ code、
+    /// 排序后自身居首，limit=2 足够抓到「更长」。
+    fn has_longer_code(&self, code: &str) -> bool {
+        self.schema
+            .dict
+            .completions(code, 2)
+            .iter()
+            .any(|e| e.code.chars().count() > code.chars().count())
+    }
+
     /// 内联提交首选（顶功 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
     fn commit_first_inline(&mut self, session: &mut Session) {
         if session.candidates.is_empty() {
@@ -1490,7 +1501,7 @@ impl Engine {
         let texts: Vec<String> = session
             .candidates
             .iter()
-            .filter(|c| c.source == CandidateKind::Sentence)
+            .filter(|c| c.source == CandidateKind::Sentence && !c.partial)
             .take(top)
             .map(|c| c.text.clone())
             .collect();
@@ -1587,8 +1598,10 @@ impl Engine {
                 if text.is_empty() {
                     continue;
                 }
-                let mut c = Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+                let mut c =
+                    Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
                 c.weight = h.confidence;
+                c.partial = true; // 过程态（未消耗全部 raw）
                 part_stash.push((h.max_rank, h.confidence, c));
             }
         }
@@ -1714,6 +1727,7 @@ impl Engine {
                     let mut c =
                         Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
                     c.weight = h.confidence;
+                    c.partial = true; // 过程态（未消耗全部 raw）
                     parts.push((h.max_rank, h.confidence, c));
                 }
                 // 码表名次优先（它 rank1 先于 次要 rank2），同次按置信
@@ -1731,9 +1745,15 @@ impl Engine {
                 // 反而更符合用户预期（正在打的词）。
                 let mut normal = Vec::new();
                 let mut rare = Vec::new();
+                // 【满码精确不下沉】码表精确候选若已无更长编码（打满该码
+                // = 用户明确意图，如 dzht=嘶），不判生僻下沉——否则 dzh
+                // 前缀态「唬」经 early 压前霸占首位，空格上屏上错字
+                //（2026-09-04 用户实测「嘶」打成「唬」）。低频但满码的
+                // 字必须居首；未满码的前缀态生僻（如 wvn 场景）维持下沉。
+                let raw_sealed = !self.has_longer_code(&session.raw);
                 for e in &entries {
                     let c = self.entry_to_candidate(e);
-                    if e.text.chars().any(|ch| dec.rare_hint(ch)) {
+                    if !raw_sealed && e.text.chars().any(|ch| dec.rare_hint(ch)) {
                         rare.push(c);
                     } else {
                         normal.push(c);
