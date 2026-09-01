@@ -378,7 +378,9 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut total = 0usize;
     let mut early_commits = 0usize; // 提前上屏总次数（句中 commit，不含收尾）
     let mut early_chars = 0u64; // 提前上屏总字数（手感：每次几个字）
+    let mut early_max = 0usize; // 单次提前上屏最大字数（最长免空格串）
     let mut total_chars = 0u64; // 全文总字数（覆盖率分母）
+    let mut sent_events: Vec<usize> = Vec::new(); // 每句上屏事件数（提前+收尾，越少越一气呵成）
     let mut total_ms: Vec<u128> = Vec::new();
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -455,6 +457,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
                 }
             }
         } else {
+        let mut sent_events_this = 0usize;
         for ch in raw.chars() {
             if line_end_w > 0 {
                 let col = sess.committed_raw.chars().count() + sess.raw.chars().count();
@@ -467,6 +470,8 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
                 committed.push_str(&c);
                 early_commits += 1;
                 early_chars += c.chars().count() as u64;
+                early_max = early_max.max(c.chars().count());
+                sent_events_this += 1;
             }
         }
         // 收尾：空格上屏剩余（延迟也计入）
@@ -475,7 +480,9 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         key_us.push(tk.elapsed().as_micros() as u64);
         if let Some(c) = out.commit {
             committed.push_str(&c);
+            sent_events_this += 1; // 收尾空格也是一次上屏事件
         }
+        sent_events.push(sent_events_this);
         }
         total_ms.push(t1.elapsed().as_millis());
         total_chars += s.chars().count() as u64;
@@ -513,12 +520,40 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     // 手感综合评估：提前上屏的字数视角——每次上屏平均几个字、全文
     // 有多大比例的字是免空格提前落地的（覆盖率=少按空格的真实比例）。
     println!(
-        "手感： 每次提前上屏平均 {:.2} 字  提前上屏覆盖 {:.1}%（{} 字 / 全文 {} 字）",
+        "手感： 每次提前上屏平均 {:.2} 字（最长 {} 字）  提前上屏覆盖 {:.1}%（{} 字 / 全文 {} 字）",
         early_chars as f64 / early_commits.max(1) as f64,
+        early_max,
         early_chars as f64 / total_chars.max(1) as f64 * 100.0,
         early_chars,
         total_chars
     );
+    // 「几次上屏打完一句」分布（含收尾空格共 1 次，越小越一气呵成）：
+    // 1 次=整句全靠句尾空格一次落地；N 次=中途 N-1 次提前+收尾。
+    {
+        let mut ev = sent_events.clone();
+        ev.sort_unstable();
+        let sn = ev.len().max(1);
+        let q = |x: usize| ev[(sn * x / 100).min(sn - 1)];
+        let zero = ev.iter().filter(|&&e| e <= 1).count();
+        let two = ev.iter().filter(|&&e| e <= 2).count();
+        let three = ev.iter().filter(|&&e| e <= 3).count();
+        let avg_ev = ev.iter().sum::<usize>() as f64 / sn as f64;
+        let avg_sent_chars = total_chars as f64 / sn as f64;
+        println!(
+            "句子节奏： 平均 {:.2} 次上屏/句（句均 {:.1} 字，每 {:.1} 字一次）  分位 p25={} p50={} p75={} p95={} max={}  ≤1次 {:.0}%  ≤2次 {:.0}%  ≤3次 {:.0}%",
+            avg_ev,
+            avg_sent_chars,
+            avg_sent_chars / avg_ev.max(0.01),
+            q(25),
+            q(50),
+            q(75),
+            q(95),
+            ev.last().copied().unwrap_or(0),
+            zero as f64 / sn as f64 * 100.0,
+            two as f64 / sn as f64 * 100.0,
+            three as f64 / sn as f64 * 100.0
+        );
+    }
 }
 
 fn cmd_repl(dir: &str) {
