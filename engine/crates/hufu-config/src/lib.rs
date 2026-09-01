@@ -332,7 +332,7 @@ impl Default for SentenceWeights {
             emitted_character_reward: 2.0,
             isolation_threshold: 3000,
             isolation_lambda: 2.0,
-            confidence: 0.995,
+            confidence: 0.99,
             dict_bias: 1.0,
             supplement_baseline: 9.0,
             supplement_scale: 2.0,

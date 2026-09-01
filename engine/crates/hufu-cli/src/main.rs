@@ -23,12 +23,23 @@ fn main() {
             args.get(3).expect("用法: bench <方案目录> <语料> [ngram路径]"),
             args.get(4).map(|s| s.to_string()),
         ),
+        "code" => cmd_code(
+            args.get(2).expect("用法: code <方案目录> <句子>"),
+            args.get(3).expect("用法: code <方案目录> <句子>"),
+        ),
+        "tbench" => cmd_tbench(
+            args.get(2).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
+            args.get(3).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
+            args.get(4).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
+            args.get(5).cloned(),
+        ),
         _ => {
             println!("hufu-cli 命令：");
             println!("  check   <方案目录>   加载方案并输出统计与样例候选");
             println!("  convert <输入> <输出> 任意支持格式 → HuFu 原生 TSV");
             println!("  repl    <方案目录>   逐字符模拟输入（q 退出，BS 退格，SP 空格）");
             println!("  bench   <方案目录> <语料> [ngram] 整句质量基准（exact 率 + 逐句解码耗时）");
+            println!("  code    <方案目录> <句子>   逐字 best_code_of 展示（bench 同款打法）");
         }
     }
 }
@@ -36,6 +47,25 @@ fn main() {
 /// 整句质量基准：语料每句 → 逐字 best_code_of 拼编码 → SentenceEngine
 /// 解码 → top1 与原句比对 exact。_beam 调档前后的回归护栏
 /// （历史基准：100 句 exact 92.93%）。
+/// 整句真实打法：最优码（≥2 码）+ 名次锁键（engine RankLocks 同款：
+/// 位次 1 无锁、2=';'、3='\''、4..9=数字、10='0'）。
+fn real_code_of(schema: &Schema, ch: char) -> String {
+    match schema.dict.best_code_and_rank(&ch.to_string(), 2) {
+        Some((code, rank)) => {
+            let lock = match rank {
+                1 => String::new(),
+                2 => ";".into(),
+                3 => "'".into(),
+                4..=9 => rank.to_string(),
+                10 => "0".into(),
+                _ => String::new(),
+            };
+            format!("{code}{lock}")
+        }
+        None => String::new(),
+    }
+}
+
 fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
     let t0 = Instant::now();
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
@@ -70,13 +100,20 @@ fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
     .filter(|l| !l.is_empty())
     .collect();
     let mut exact = 0usize;
+    let mut code_exact = 0usize; // 码级：输出句重新编码 == 原编码（同码句算对）
     let mut total = 0usize;
     let mut decode_ms: Vec<u128> = Vec::new();
+    let dump_fail: usize = std::env::var("BENCH_DUMP_FAIL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut dumped = 0usize;
     for s in &sents {
         // 逐字取码（best_code_of：最短/最优码）拼整句编码
         let mut raw = String::new();
         for ch in s.chars() {
-            let code = schema.best_code_of(&ch.to_string()).unwrap_or_default();
+            // 整句真实打法：一简 2 码全码 + 同码字名次锁（ag; → 装）
+            let code = real_code_of(&schema, ch);
             raw.push_str(&code);
         }
         if raw.is_empty() {
@@ -89,6 +126,19 @@ fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
         if let Some(top) = hits.first() {
             if top.text == *s {
                 exact += 1;
+                code_exact += 1;
+            } else {
+                // 码级判定：输出句逐字真实编码与原编码一致 = 同码句
+                let raw2: String = top.text.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
+                if raw2 == raw {
+                    code_exact += 1;
+                }
+                if dumped < dump_fail {
+                    dumped += 1;
+                    println!("[FAIL] 原: {s}");
+                    println!("       码: {raw}");
+                    println!("       出: {}{}", top.text, if raw2 == raw { "（同码句）" } else { "" });
+                }
             }
         }
     }
@@ -98,14 +148,29 @@ fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
     sorted.sort();
     let p95 = sorted.get(p95_idx).copied().unwrap_or(0);
     println!(
-        "句数 {total}  exact {}/{} = {:.2}%  解码 avg {:.1}ms  p95 {}ms  max {}ms",
+        "句数 {total}  exact {}/{} = {:.2}%  码级 {}/{} = {:.2}%  解码 avg {:.1}ms  p95 {}ms  max {}ms",
         exact,
         total,
         exact as f64 / total as f64 * 100.0,
+        code_exact,
+        total,
+        code_exact as f64 / total as f64 * 100.0,
         avg,
         p95,
         sorted.last().copied().unwrap_or(0)
     );
+}
+
+/// 逐字展示：整句真实打法（≥2 码 + 同码字名次锁）。
+fn cmd_code(dir: &str, sentence: &str) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let mut raw = String::new();
+    for ch in sentence.chars() {
+        let code = real_code_of(&schema, ch);
+        println!("{ch} → {code}{}", if code.is_empty() { "（无码）" } else { "" });
+        raw.push_str(&code);
+    }
+    println!("整句编码: {raw}");
 }
 
 fn cmd_check(dir: &str) {
@@ -161,6 +226,93 @@ fn cmd_convert(input: &str, output: &str) {
     }
     std::fs::write(output, out).expect("写出失败");
     println!("已转换 {} 条 → {}", table.rows.len(), output);
+}
+
+/// 逐键打字基准：真实整句打法（一简 2 码 + 同码锁）逐键喂引擎，
+/// 统计 准率 / 提前上屏次数 / 每键触达延迟（击键→解码可用）。
+/// lat_out 可选：每键延迟 µs 逐行写文件（多进程分片汇总用）。
+fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = Config::default();
+    let dec = hufu_sentence::SentenceEngine::load(
+        Path::new(ngram),
+        schema.dict.clone(),
+        &schema.supplement,
+        cfg.sentence.weights.clone(),
+    )
+    .expect("ngram 装载失败");
+    let mut engine = Engine::with_schema_dir(Path::new(dir), Config::default())
+        .expect("引擎初始化失败");
+    engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    let sents: Vec<String> = std::io::BufReader::new(std::fs::File::open(corpus).expect("语料打开失败"))
+        .lines()
+        .map(|l| l.unwrap().trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut exact = 0usize;
+    let mut total = 0usize;
+    let mut early_commits = 0usize; // 提前上屏总次数（句中 commit，不含收尾）
+    let mut total_ms: Vec<u128> = Vec::new();
+    let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
+    let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut dumped = 0usize;
+    for s in &sents {
+        let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
+        if raw.is_empty() {
+            continue;
+        }
+        total += 1;
+        let mut sess = Session::new(true);
+        let mut committed = String::new();
+        let t1 = Instant::now();
+        for ch in raw.chars() {
+            let tk = Instant::now();
+            let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
+            key_us.push(tk.elapsed().as_micros() as u64);
+            if let Some(c) = out.commit {
+                committed.push_str(&c);
+                early_commits += 1;
+            }
+        }
+        // 收尾：空格上屏剩余（延迟也计入）
+        let tk = Instant::now();
+        let out = engine.process_key(&mut sess, KeyInput::char_key(' '));
+        key_us.push(tk.elapsed().as_micros() as u64);
+        if let Some(c) = out.commit {
+            committed.push_str(&c);
+        }
+        total_ms.push(t1.elapsed().as_millis());
+        if committed == *s {
+            exact += 1;
+        } else if dumped < dump {
+            dumped += 1;
+            println!("[FAIL] 原: {s}");
+            println!("       码: {raw}");
+            println!("       出: {committed}");
+        }
+    }
+    if let Some(path) = lat_out {
+        std::fs::write(&path, key_us.iter().map(|u| u.to_string()).collect::<Vec<_>>().join("\n"))
+            .expect("延迟文件写出失败");
+    }
+    let mut sorted = key_us.clone();
+    sorted.sort_unstable();
+    let n = sorted.len().max(1);
+    let p = |q: usize| sorted[(n * q / 100).min(n - 1)];
+    let avg = total_ms.iter().sum::<u128>() as f64 / total_ms.len().max(1) as f64;
+    println!(
+        "句数 {total}  准率 {}/{} = {:.2}%  提前上屏 {} 次（平均 {:.2} 次/句）  键 {}  触达延迟 p50 {}µs p95 {}µs avg {}µs max {}µs",
+        exact,
+        total,
+        exact as f64 / total as f64 * 100.0,
+        early_commits,
+        early_commits as f64 / total.max(1) as f64,
+        key_us.len(),
+        p(50),
+        p(95),
+        key_us.iter().sum::<u64>() as f64 / n as f64,
+        sorted.last().copied().unwrap_or(0)
+    );
 }
 
 fn cmd_repl(dir: &str) {
