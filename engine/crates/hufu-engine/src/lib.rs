@@ -1242,8 +1242,13 @@ impl Engine {
             proposal: proposal.clone(),
             full_raw: full.clone(),
             raw_lengths,
-            strong: proposal_share >= 0.999, // Rime STRONG_SHARE（0.9999→0.99999 曾反向调严；
-            // 实测 v5 下提前上屏偏保守，回 0.999 提高积极性）
+            // 虎爪对齐 0.99999（STRONG_SHARE）：Strong 是「连续强证据×2
+            // 即提交整段」的捷径入场券，必须极严——0.999 档在后续键
+            // 歧义期（如下一字首键引入「我推/我的」竞争路径）仍会保持
+            // 达标，导致半途提交短段（「让|我|看看」碎片节奏）；0.99999
+            // 下歧义期跌出 Strong → 继续等，攒到「我看看」笃定后一次提
+            // 长段（虎爪实测节奏）。
+            strong: proposal_share >= 0.99999,
         });
         while session.early_history.len() > 3 {
             session.early_history.remove(0);
@@ -1314,9 +1319,25 @@ impl Engine {
         if consumed <= committed_raw_len || consumed > full.chars().count() {
             return;
         }
+        // 【身后保留量】（虎爪 GetSentenceAutoCommitRetainRawLength=max(3,
+        // minRetained) 语义）：提交时 full 减去消耗后至少还要剩 3 键活码
+        // ——身后码不足就继续等（下一键证据会更新提案，往往攒成更长段，
+        // 如「我」→「我看看」）。行尾（组段逼近右缘）例外放宽到 1 键：
+        // 行尾组段必须尽快缩短，不能等。
+        let retain = if line_end {
+            1
+        } else {
+            self.config.sentence.min_retained_raw.max(3)
+        };
         let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
-        if delta.chars().count() < 1 || live.chars().count() < 2 {
+        if delta.chars().count() < 1 || full.chars().count() - consumed < retain {
             return;
+        }
+        if std::env::var("HUFU_EARLY_DEBUG").is_ok() {
+            eprintln!(
+                "[early] full={} consumed={} retain={} behind={} stable={} line_end={}",
+                full, consumed, retain, full.chars().count() - consumed, stable, line_end
+            );
         }
 
         // 【边界封口】（虎爪 BoundaryClosed）：提案的末边界必须是
