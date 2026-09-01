@@ -144,6 +144,32 @@ fn main() {
                 let Some((path, dict, supplement, weights)) = plan else {
                     return;
                 };
+                // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
+                // 缺页逐条读盘（首句打字偶发卡顿来源）。加载即并行顺序
+                // 读整文件填 page cache（NVMe ~1-2s / SATA ~3-5s，后台 IO
+                // 不阻塞），mmap 随后全命中内存。
+                {
+                    let p = path.clone();
+                    std::thread::Builder::new()
+                        .name("hufu-ngram-warm".into())
+                        .spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            if let Ok(mut f) = std::fs::File::open(&p) {
+                                use std::io::Read;
+                                let mut buf = vec![0u8; 4 << 20];
+                                while let Ok(n) = f.read(&mut buf) {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "ngram 页缓存预热完成（{:.1}s）",
+                                t0.elapsed().as_secs_f32()
+                            );
+                        })
+                        .ok();
+                }
                 match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
                     Ok(dec) => {
                         let mut h = shared_bg.lock().unwrap();

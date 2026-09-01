@@ -52,6 +52,8 @@ const INC_MAX_DELTA: usize = 3;
 const SEG_RANK_LIMIT: usize = 8;
 
 /// beam 内部状态。
+/// 【性能】segmented 不存（clone 热路径省 1/3 堆拷贝）：emit 期由
+/// word_ends + base 重建（信息无损）。
 #[derive(Clone)]
 struct St {
     prev2: u32,
@@ -64,9 +66,25 @@ struct St {
     max_rank: usize,
     /// 词边界：(累计字数, base 消耗位置)
     word_ends: Vec<(usize, usize)>,
-    segmented: String,
     /// 补充语料 AC 自动机状态（沿全文逐字推进）
     supp_state: usize,
+}
+
+/// emit 期由词边界重建切分串（对齐旧 St.segmented 语义）。
+fn segmented_of(word_ends: &[(usize, usize)], base: &[char]) -> String {
+    let mut out = String::new();
+    let mut prev_end = 0usize;
+    for &(_, end) in word_ends {
+        let piece: String = base[prev_end..end].iter().collect();
+        if out.is_empty() {
+            out = piece;
+        } else {
+            out.push(' ');
+            out.push_str(&piece);
+        }
+        prev_end = end;
+    }
+    out
 }
 
 fn logsumexp(a: f64, b: f64) -> f64 {
@@ -263,15 +281,26 @@ impl SentenceEngine {
         }
         let start_pos = resume.as_ref().map(|(_, s)| *s).unwrap_or(0);
 
-        // 每个位置的编码切分预计算：segs[pos] = Vec<(code_len, entries)>
+        // 每个位置的编码切分预计算：segs[pos] = Vec<Seg>
         // 增量时只需尾部窗内的（前部段不受新键影响）。
-        let mut segs: Vec<Vec<(usize, Vec<(String, usize)>)>> = vec![Vec::new(); n];
+        // 【性能】锁关系（段终点锁名次/是否跨界锁）在此一次算清——
+        // 原实现在 state×seg 内层循环反复 iter().any/find，与 state
+        // 无关纯属重复（20 键句 ≈ 24 万次锁遍历/键）。
+        #[derive(Clone)]
+        struct Seg {
+            end: usize,
+            /// 段终点命中的锁名次（锁位置 == end）
+            lock_rank: Option<usize>,
+            entries: Vec<(String, usize)>,
+        }
+        let mut segs: Vec<Vec<Seg>> = vec![Vec::new(); n];
         for pos in start_pos..n {
             let tail: String = base[pos..].iter().collect();
             for (code_len, idxs) in self.dict.prefix_matches(&tail) {
                 if code_len == 0 || pos + code_len > n {
                     continue;
                 }
+                let end = pos + code_len;
                 // 一简禁令（对齐虎爪规范）：句中（n>4）不允许 1 码段——
                 // 26 一简字在整句里必须打 2 码全码，其 1 码形式不参与
                 // 组句。n≤4 是短码查词场景（对齐虎爪「总长≤4 检索全部
@@ -288,6 +317,15 @@ impl SentenceEngine {
                         continue;
                     }
                 }
+                // 锁位置必须是段边界：段不得跨越锁终点
+                if parsed.locks.iter().any(|(l, _)| *l as usize > pos && (*l as usize) < end) {
+                    continue;
+                }
+                let lock_rank = parsed
+                    .locks
+                    .iter()
+                    .find(|(l, _)| *l as usize == end)
+                    .map(|(_, r)| *r);
                 let entries: Vec<(String, usize)> = idxs
                     .iter()
                     .enumerate()
@@ -297,7 +335,7 @@ impl SentenceEngine {
                     })
                     .collect();
                 if !entries.is_empty() {
-                    segs[pos].push((code_len, entries));
+                    segs[pos].push(Seg { end, lock_rank, entries });
                 }
             }
         }
@@ -305,7 +343,7 @@ impl SentenceEngine {
         let max_code_len = segs
             .iter()
             .flatten()
-            .map(|(l, _)| *l)
+            .map(|s| s.end)
             .max()
             .unwrap_or(1);
 
@@ -324,7 +362,6 @@ impl SentenceEngine {
                 mass: 0.0,
                 max_rank: 1,
                 word_ends: Vec::new(),
-                segmented: String::new(),
                 supp_state: 0,
             });
         }
@@ -359,13 +396,9 @@ impl SentenceEngine {
                 );
             }
             for state in buckets[pos].snapshot() {
-                for (code_len, entries) in &segs[pos] {
-                    let end = pos + code_len;
-                    // 锁位置必须是段边界：段不得跨越锁终点
-                    if parsed.locks.iter().any(|(l, _)| *l > pos && *l < end) {
-                        continue;
-                    }
-                    let lock = parsed.locks.iter().find(|(l, _)| *l == end);
+                for seg in &segs[pos] {
+                    let end = seg.end;
+                    let lock = seg.lock_rank;
                     // 多码整句时段跨须 ≥2（含选重后缀字符；Rime 段跨规则，
                     // tiger_sentence.lua L562 同款；虎爪 ExpandRange L385
                     // num3-i<2 同款）。【实测 2026-08-31】放开此规则（允许
@@ -387,10 +420,10 @@ impl SentenceEngine {
                             continue;
                         }
                     }
-                    for (text, rank) in entries {
+                    for (text, rank) in &seg.entries {
                         let rank1b = rank + 1; // 码表名次（1 起）
-                        if let Some((_, r)) = lock {
-                            if rank1b != *r {
+                        if let Some(r) = lock {
+                            if rank1b != r {
                                 continue;
                             }
                         } else if !allow_all_ranks && rank1b != 1 {
@@ -398,8 +431,6 @@ impl SentenceEngine {
                             continue;
                         }
                         let mut ns = state.clone();
-                        let prev_before_word = state.prev1;
-                        let mut supp_added = 0.0;
                         for c in text.chars() {
                             let cp = c as u32;
                             let p3 = self.model.trigram_prob(ns.prev2, ns.prev1, cp);
@@ -412,21 +443,24 @@ impl SentenceEngine {
                             let (st2, r) = self.supplement.advance(ns.supp_state, c);
                             ns.supp_state = st2;
                             ns.score += r;
-                            supp_added += r;
-                            let _ = prev_before_word;
                         }
                         if rank1b > 1 {
                             let pen = w.rank_penalty * (rank1b as f64).ln();
                             ns.score -= pen;
                             ns.mass -= pen;
                         }
-                        let _ = supp_added;
-                        let piece: String = base[pos..end].iter().collect();
-                        if ns.segmented.is_empty() {
-                            ns.segmented = piece;
-                        } else {
-                            ns.segmented.push(' ');
-                            ns.segmented.push_str(&piece);
+                        // 【dict_bias 接线 2026-09-03】短码窗口（n≤4）多字
+                        // 码表词条温和加成：只进 score 不进 mass（与
+                        // supplement 同语义——非概率项，不污染提前上屏置
+                        // 信估计）。仅 n≤4 生效：整句（n>4）全程模型主导
+                        //（500 句实测 bias 全局生效准率 99.80→96.60%——
+                        // 码表冷词+1 压过正确的拆字/词组路径）；短码场景
+                        // 码表词优先（srsr 常常 vs 发发 贴脸 0.002 分，无
+                        // bias 时排序随扰动翻转）。量级 1.0：压得住拆字噪
+                        // 声路径，压不过 ngram 强信号（领先 2-5 分）——
+                        // 「码表词稳靠前，模型强词仍可反超」。
+                        if n <= 4 && text.chars().count() >= 2 {
+                            ns.score += w.dict_bias;
                         }
                         ns.text.push_str(text);
                         ns.max_rank = ns.max_rank.max(rank1b);
@@ -438,21 +472,35 @@ impl SentenceEngine {
         }
 
         // 终态 emit：EOS + 孤立惩罚（Rime build_early_commit_candidates 先并入完整态）
+        // 【性能】isolation 按 text 缓存（纯 text 函数，hits/early 三轮共用）；
+        // eos 依赖 (prev2,prev1)、segmented 依赖 word_ends——同 text 跨桶
+        // 可不同，不缓存（原实现同 text 三轮全量重算 isolation，每生僻字
+        // 2 次 bigram 查询，beam_width 终态下每键白付两轮）。
         buckets[n].limit(w.beam_width);
         let fin_trunc = buckets[n].truncated;
         let finals = buckets[n].snapshot();
+        let mut iso_cache: HashMap<String, f64> = HashMap::new();
+        let mut iso_of = |text: &str| -> f64 {
+            if let Some(v) = iso_cache.get(text) {
+                return *v;
+            }
+            let v = self.isolation_penalty(text);
+            iso_cache.insert(text.to_string(), v);
+            v
+        };
         let mut hits: Vec<SentenceHit> = finals
             .iter()
             .map(|st| {
                 let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
-                let iso = self.isolation_penalty(&st.text);
+                let iso = iso_of(&st.text);
                 SentenceHit {
                     score: st.score + eos - iso,
                     confidence: st.mass + eos - iso,
                     text: st.text.clone(),
                     max_rank: st.max_rank,
                     word_ends: st.word_ends.clone(),
-                    segmented: st.segmented.clone(),
+                    segmented: segmented_of(&st.word_ends, &base),
+                    partial: false,
                 }
             })
             .collect();
@@ -472,9 +520,8 @@ impl SentenceEngine {
             if st.text.is_empty() {
                 continue;
             }
-            let eos =
-                (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
-            let iso = self.isolation_penalty(&st.text);
+            let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
+            let iso = iso_of(&st.text);
             let conf = st.mass + eos - iso;
             let score = st.score + eos - iso;
             let key = st.text.clone();
@@ -491,7 +538,8 @@ impl SentenceEngine {
                     text: st.text.clone(),
                     max_rank: st.max_rank.max(1),
                     word_ends: st.word_ends.clone(),
-                    segmented: st.segmented.clone(),
+                    segmented: segmented_of(&st.word_ends, &base),
+                    partial: false,
                 },
             );
         }
@@ -513,9 +561,8 @@ impl SentenceEngine {
                     if st.text.is_empty() {
                         continue;
                     }
-                    let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln())
-                        as f64;
-                    let iso = self.isolation_penalty(&st.text);
+                    let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
+                    let iso = iso_of(&st.text);
                     let conf = st.mass + eos - iso;
                     let score = st.score + eos - iso;
                     let key = st.text.clone();
@@ -537,7 +584,8 @@ impl SentenceEngine {
                                 text: st.text.clone(),
                                 max_rank: st.max_rank.max(1),
                                 word_ends: st.word_ends.clone(),
-                                segmented: st.segmented.clone(),
+                                segmented: segmented_of(&st.word_ends, &base),
+                                partial: true,
                             },
                         );
                     }
@@ -672,6 +720,10 @@ impl SentenceEngine {
 impl SentenceDecoder for SentenceEngine {
     fn decode_rich(&self, raw: &str) -> Arc<SentenceDecode> {
         self.decode_cached(raw)
+    }
+
+    fn rare_hint(&self, ch: char) -> bool {
+        self.model.is_rare(ch as u32, self.weights.isolation_threshold)
     }
 
     fn decode(&self, raw: &str) -> Vec<Candidate> {

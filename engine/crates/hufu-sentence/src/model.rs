@@ -212,6 +212,10 @@ impl NgramModel {
     }
 
     /// 上下文查询 → (p_stored, λ)。
+    /// 【性能 2026-09-03】succ 码点经全量校验 100% 有序（bigram 15404/
+    /// trigram 5145476 条记录无一例外）→ 二分查找。真实语料字对的 succ
+    /// 平均 678 条（p99 3532），线性扫描每查平均读 ~5KB；二分后 log2≈10
+    /// 次比较，miss（cp 不在表内，需扫全表确认）收益最大。
     fn ctx_lookup(
         &self,
         blocks_off: usize,
@@ -221,11 +225,26 @@ impl NgramModel {
         cp: u32,
     ) -> Option<(f32, f32)> {
         let (succ_off, lambda, succ) = self.find_ctx(blocks_off, index_off, index_count, key)?;
-        // 后继多时二分（码点有序与否未知，先线性，短表足够快）
-        for i in 0..succ {
-            let off = succ_off + i * 8;
-            if rd_i32(&self.data, off) as u32 == cp {
-                return Some((rd_f32(&self.data, off + 4), lambda));
+        // succ 按码点升序：二分（短表 ≤4 条时线性更省分支）
+        if succ > 4 {
+            let (mut lo, mut hi) = (0usize, succ);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let c = rd_i32(&self.data, succ_off + mid * 8) as u32;
+                if c < cp {
+                    lo = mid + 1;
+                } else if c > cp {
+                    hi = mid;
+                } else {
+                    return Some((rd_f32(&self.data, succ_off + mid * 8 + 4), lambda));
+                }
+            }
+        } else {
+            for i in 0..succ {
+                let off = succ_off + i * 8;
+                if rd_i32(&self.data, off) as u32 == cp {
+                    return Some((rd_f32(&self.data, off + 4), lambda));
+                }
             }
         }
         Some((0.0, lambda))
@@ -269,10 +288,28 @@ impl NgramModel {
             w as i64,
         ) {
             Some((succ_off, _lambda, succ)) => {
-                (0..succ).any(|i| rd_i32(&self.data, succ_off + i * 8) as u32 == c)
+                // succ 有序 → 二分（bigram succ 平均 317 条，p90 超 1172）
+                let (mut lo, mut hi) = (0usize, succ);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cp = rd_i32(&self.data, succ_off + mid * 8) as u32;
+                    if cp < c {
+                        lo = mid + 1;
+                    } else if cp > c {
+                        hi = mid;
+                    } else {
+                        return true;
+                    }
+                }
+                false
             }
             None => false,
         }
+    }
+
+    /// 码点字频名次是否超过阈值（engine 生僻字下沉判据）。
+    pub fn is_rare(&self, cp: u32, threshold: usize) -> bool {
+        self.freq_rank(cp) > threshold
     }
 
     pub fn uni_count(&self) -> usize {
