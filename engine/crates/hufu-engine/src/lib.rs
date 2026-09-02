@@ -1143,7 +1143,17 @@ impl Engine {
         // 行尾（组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信
         // 前缀（confidence 软最大占比 ≥0.99 不变），只是早一键落地，
         // 让组段尽快缩回一行内。
-        let need = if line_end { 1 } else { 2 };
+        // 【证据窗参数】HUFU_EARLY_NEED（默认 2）：确认上屏所需证据键
+        // 数。3 = 更保守（第三键仍同提案才落地）——上屏更晚更少、残
+        // 留码更长（2026-09-05 档位实验）。行尾仍 1 键。
+        static NEED_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let need_k = *NEED_K.get_or_init(|| {
+            std::env::var("HUFU_EARLY_NEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+        });
+        let need = if line_end { 1 } else { need_k };
         if session.early_history.len() < need {
             return;
         }
@@ -1162,9 +1172,41 @@ impl Engine {
         if consumed <= committed_raw_len || consumed > full.chars().count() {
             return;
         }
-        let delta: String = stable.chars().skip(committed_text.chars().count()).collect();
+        let mut delta: String = stable.chars().skip(committed_text.chars().count()).collect();
         if delta.chars().count() < 1 || live.chars().count() < 2 {
             return;
+        }
+        // 【残码门槛实验】HUFU_EARLY_MIN_RESID：上屏后 raw 剩余键数
+        // （live - consumed）低于该值时——不是丢弃上屏机会（那样次数
+        // 腰斩，2026-09-05 用户实测 3.5→4.0 档 6.44→3.52 次/句），而是
+        // 截短上屏前缀（尾字留在缓冲继续攒，剩余≥门槛），上屏照常发
+        // 生、每次少上几字。未设置或 0 = 无门槛（当前行为）。
+        static MIN_RESID: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let min_resid = *MIN_RESID.get_or_init(|| {
+            std::env::var("HUFU_EARLY_MIN_RESID")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        });
+        if min_resid > 0.0 {
+            let live_len = live.chars().count();
+            let floor = min_resid as usize;
+            while (live_len.saturating_sub(consumed)) < floor
+                && stable.chars().count() > committed_text.chars().count() + 1
+            {
+                stable = stable.chars().take(stable.chars().count() - 1).collect();
+                consumed = stable_history_raw_length(&session.early_history, &stable);
+                if consumed == 0 || consumed <= committed_raw_len {
+                    break;
+                }
+            }
+            if consumed == 0 || consumed <= committed_raw_len {
+                return;
+            }
+            delta = stable.chars().skip(committed_text.chars().count()).collect();
+            if delta.chars().count() < 1 {
+                return;
+            }
         }
 
         // 提交：committed 前缀增长，live raw 缩为剩余
