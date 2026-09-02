@@ -427,9 +427,13 @@ impl SentenceEngine {
                     // 实测 zhh 首选变「其道」；虎爪/Rime 该码只有「虎」）。
                     let span = end - pos + if lock.is_some() { 1 } else { 0 };
                     if n > 1 && span < 2 {
-                        // 尾段豁免仅限：真整句（n>4）或顶功确认流（有锁）
+                        // 尾段豁免仅限带锁（顶功确认流，如「cn;j;c」「cbfe;u」
+                        // 的锁+一简尾）。无锁一简尾=进行中（用户还要打）——
+                        // 一简字进组句必须打 2 码全码（2026-09-05 用户实测
+                        // uaegq 出「打干都」：都 的一简 q 段未经锁确认固化
+                        // 进组合，属进行态不该出现）。
                         let is_tail = end == n;
-                        let exempt = is_tail && (n > 4 || !parsed.locks.is_empty());
+                        let exempt = is_tail && !parsed.locks.is_empty();
                         if !exempt {
                             continue;
                         }

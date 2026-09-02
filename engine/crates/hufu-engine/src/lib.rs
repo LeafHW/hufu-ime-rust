@@ -1627,40 +1627,14 @@ impl Engine {
         let rich = dec.decode_rich(&full);
         let committed_text = session.committed_text.clone();
         let skip = committed_text.chars().count();
-        // 【中间态候选 2026-09-03】录入过程中（无锁）把不完全尾前缀态
-        // （正在打的词，early_hits 已按置信排序）并入候选框，生僻整码
-        // 候选（rare_hint）下沉——修复「打「它存」到 wvn 时候选全是 徴/
-        // 𡦺 生僻字、『它』不在框内」：前缀态「它」conf≈-11.5 远优于
-        // 生僻整码「徴」≈-23.8。带选重锁时（顶功确认流，;/'/数字=码表
-        // 名次）不并入——锁选第 N 个的语义必须钉在完整态列表上。
+        // 【进行态（partial）不进候选】（2026-09-05 定版）：partial=前段
+        // 精确+尾键进行中（消耗不满 raw），无论码表域还是整句域都不显
+        // 示——用户规则：候选=与实打编码精确对应的完成态组合。历轮案
+        // 例：倩（码 jav）在 javz 时刻、uaegq 时刻的「打干」「打干都」
+        //（含一简尾段）、pvlc 时刻的「踹」——进行态一律退出候选框；
+        // 要上屏走顶功/继续打完整码。2026-09-03「它存 wvn 提示它」的
+        // 中间态并入已被此规则取代（3943a9b 踹修复同方向收口）。
         let has_locks = parse_rank_locks(&session.raw).has_locks();
-        let mut part_stash: Vec<(usize, f64, Candidate)> = Vec::new();
-        if !has_locks {
-            for h in rich.early_hits.iter().filter(|h| h.partial) {
-                if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
-                    continue;
-                }
-                let text: String = h.text.chars().skip(skip).collect();
-                if text.is_empty() {
-                    continue;
-                }
-                let mut c =
-                    Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
-                c.weight = h.confidence;
-                c.partial = true; // 过程态（未消耗全部 raw）
-                part_stash.push((h.max_rank, h.confidence, c));
-            }
-        }
-        // 码表名次优先、同次按置信（它 rank1 先于 次要 rank2），取前 6。
-        // 【首选语义】完整态最优恒居第一（空格上屏/自动首选走列表头，
-        // 不能被前缀态顶替——tbench 曾因 partial 压首致准率崩到 4%）；
-        // partial 是「正在打的词」备选，追加在完整态之后供翻选。
-        part_stash.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        let part_cands: Vec<Candidate> =
-            part_stash.into_iter().map(|(_, _, c)| c).take(6).collect();
         let mut cands: Vec<Candidate> = Vec::new();
         // 【无锁短码候选=精确对应】（2026-09-05 用户规则）：live raw ≤
         // 最大码长且无锁=码表域——候选只留每段精确对应实打编码的完整
@@ -1701,16 +1675,7 @@ impl Engine {
             cands = exact_cands;
             cands.extend(inexact_cands);
         }
-        // 完整态在前（首选=完整态最优，不做任何下沉——完整句含一个低频
-        // 字就整条沉底会错杀正确句，500 句实测 99.80→96.60% 的根因），
-        // 前缀态（正在打的词）追加供翻选。
-        // 【码表域无 partial】（2026-09-05 倩案例）：partial=前段精确
-        // +尾键进行中（倩 的码 jav，javz 时刻它是 jav+z 的进行态）
-        // ——与踹案例 pvlc 时的「踹」同款，码表域不显示（打满 raw 的
-        // 词组完成态才是候选；要打「倩身」继续 javzs，整句域自会出）。
-        if !dict_domain {
-            cands.extend(part_cands);
-        }
+        // 完整态构成整个候选列表（partial 已全局退出，见上）。
         cands
     }
 
