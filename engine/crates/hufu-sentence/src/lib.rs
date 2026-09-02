@@ -72,6 +72,10 @@ struct St {
     word_ends: Vec<(usize, usize)>,
     /// 补充语料 AC 自动机状态（沿全文逐字推进）
     supp_state: usize,
+    /// 补充语料累计加分（2026-09-05：计入提前上屏置信——用户显式
+    /// 加权的词（补充语料.txt）理应也影响提案，否则「上屏真爽」案
+    /// 显示翻盘而提案仍被「火藏」拆段抢跑。dict_bias 仍不进置信。）
+    supp_bonus: f64,
 }
 
 /// emit 期由词边界重建切分串（对齐旧 St.segmented 语义）。
@@ -377,6 +381,7 @@ impl SentenceEngine {
                 exact: true,
                 word_ends: Vec::new(),
                 supp_state: 0,
+                supp_bonus: 0.0,
             });
         }
 
@@ -461,6 +466,7 @@ impl SentenceEngine {
                             let (st2, r) = self.supplement.advance(ns.supp_state, c);
                             ns.supp_state = st2;
                             ns.score += r;
+                            ns.supp_bonus += r;
                         }
                         if rank1b > 1 {
                             let pen = w.rank_penalty * (rank1b as f64).ln();
@@ -523,7 +529,7 @@ impl SentenceEngine {
                 let iso = iso_of(&st.text);
                 SentenceHit {
                     score: st.score + eos - iso,
-                    confidence: st.mass + eos - iso,
+                    confidence: st.mass + eos - iso + st.supp_bonus,
                     text: st.text.clone(),
                     max_rank: st.max_rank,
                     sum_rank: st.sum_rank,
@@ -552,7 +558,7 @@ impl SentenceEngine {
             }
             let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
             let iso = iso_of(&st.text);
-            let conf = st.mass + eos - iso;
+            let conf = st.mass + eos - iso + st.supp_bonus;
             let score = st.score + eos - iso;
             let key = st.text.clone();
             let newm = match early_mass.get(&key) {
@@ -595,7 +601,7 @@ impl SentenceEngine {
                     }
                     let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
                     let iso = iso_of(&st.text);
-                    let conf = st.mass + eos - iso;
+                    let conf = st.mass + eos - iso + st.supp_bonus;
                     let score = st.score + eos - iso;
                     let key = st.text.clone();
                     let newm = match early_mass.get(&key) {
