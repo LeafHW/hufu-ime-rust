@@ -510,6 +510,9 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         if !schemas.is_empty() {
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
         }
+        // 【2026-09-05】重载码表：改码表/补充语料后免重启即生效。
+        let wrel: Vec<u16> = "重载码表".encode_utf16().chain([0]).collect();
+        AppendMenuW(m, MF_STRING, 2, wrel.as_ptr());
         let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
         // 自建真弹出窗作 owner（调用线程持有 → 合法 owner）。
@@ -574,6 +577,9 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         log_diag(&format!("popup sel={sel} schemas={}", schemas.len()));
         if sel == 1 {
             let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+        } else if sel == 2 {
+            // 重载码表（当前方案原样重载；server 侧清会话+重建整句）
+            let _ = crate::ipc::call(&serde_json::json!({"op": "reload_schema"}));
         } else if sel >= 100 {
             let idx = (sel - 100) as usize;
             if let Some(name) = schemas.get(idx) {

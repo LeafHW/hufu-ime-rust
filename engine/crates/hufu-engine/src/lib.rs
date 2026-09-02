@@ -1485,6 +1485,10 @@ impl Engine {
             self.opencc_loaded = true;
         }
         let base: Vec<Candidate> = session.candidates.iter().take(3).cloned().collect();
+        // 【2026-09-05 改】变体插入最前（用户实测繁体「生效但不在首选」；
+        // 原 push 尾部导致要翻页找）。按源候选顺序整体置顶，保持
+        // 「第 1 候选的繁体在最前」的对应关系。
+        let mut variants: Vec<Candidate> = Vec::new();
         for cand in &base {
             if cfg.to_traditional {
                 if let Some(t) = &self.opencc {
@@ -1493,7 +1497,7 @@ impl Engine {
                         let mut c = cand.clone();
                         c.text = conv;
                         c.comment = "⚑繁".into();
-                        session.candidates.push(c);
+                        variants.push(c);
                     }
                 }
             }
@@ -1504,11 +1508,14 @@ impl Engine {
                         let mut c = cand.clone();
                         c.text = v;
                         c.comment = "😊".into();
-                        session.candidates.push(c);
+                        variants.push(c);
                     }
                 }
             }
         }
+        let n = variants.len();
+        session.candidates.splice(0..0, variants);
+        let _ = n;
     }
 
     /// 用户学习：自动调频 + 可选调整日志（user-adjust.log，log_adjust=true 时记录）。
@@ -2089,6 +2096,9 @@ impl Engine {
     /// 注释：拆分 / 拼音 / Unicode 分区（按配置与可用性）。
     pub fn annotate(&self, word: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
+        // 【2026-09-05 修复】拆分/注释原为 else-if 互斥——开拆分时注释
+        // 被短路（用户实测「显示注释不生效」）。两开关独立生效：
+        // 拆分（部件提示）与拼音注释可同显，均受各自开关控制。
         if self.config.candidates.show_split {
             if let Some(sp) = &self.schema.split {
                 let s = sp.annotate_word(word, 2);
@@ -2096,9 +2106,27 @@ impl Engine {
                     parts.push(s);
                 }
             }
-        } else if self.config.candidates.show_comment {
+        }
+        if self.config.candidates.show_comment {
             if let Some(py) = &self.schema.pinyin {
                 let s = py.annotate_word(word, 2);
+                if !s.is_empty() {
+                    parts.push(s);
+                }
+            } else if let Some(rev) = &self.schema.reverse {
+                // 【2026-09-05】无拼音注释表时回退反查表（词→码）——
+                // Bime 反查表数据已有，「显示注释」开箱即用（整词
+                // 优先，miss 则前 2 字逐字拼）。
+                let s = rev
+                    .code_of(word)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| {
+                        word.chars()
+                            .take(2)
+                            .filter_map(|ch| rev.code_of(&ch.to_string()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
                 if !s.is_empty() {
                     parts.push(s);
                 }
@@ -2139,7 +2167,9 @@ impl Engine {
                 0
             },
             aux: match session.mode {
-                InputMode::Reverse => "〔反查〕小鹤双拼".into(),
+                // 【2026-09-05】反查提示精简为「〔反查〕」——TSF 端把它与
+                // raw 拼接成编码行「〔反查〕 ni」，全程提示反查态。
+                InputMode::Reverse => "〔反查〕".into(),
                 InputMode::Command => "〔命令〕".into(),
                 _ => String::new(),
             },

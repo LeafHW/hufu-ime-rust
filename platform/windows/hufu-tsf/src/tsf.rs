@@ -1162,8 +1162,25 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
     let (op, has_ctx, suppress_win) = {
         let mut g = shared.lock().unwrap();
+        // 【皮肤首键】inline 判定依赖皮肤——首键无皮肤时先拉取（原在
+        // op 决策之后，会让 inline_preedit=false 的皮肤首键先建组段）。
+        if g.skin.is_null() {
+            g.load_skin();
+        }
         let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
-        let preedit = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
+        let mut preedit = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
+        // 【2026-09-05 接线】皮肤 layout.inline_preedit（设置页「编码内联
+        // 到应用」）：false 时编码不进应用文本流（组段不建、preedit 视为
+        // 空），编码只在候选窗编码行显示；true（默认/无皮肤）保持原行为。
+        let inline_on = g
+            .skin
+            .pointer("/skin/layout/inline_preedit")
+            .or_else(|| g.skin.get("layout").and_then(|l| l.get("inline_preedit")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !inline_on {
+            preedit = "";
+        }
         if raw.is_empty() {
             g.skin_stale = true;
         }
@@ -1246,8 +1263,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     let show_code = state.get("show_code").and_then(|v| v.as_bool()).unwrap_or(true);
     let raw_state = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    // 编码行内容：显示编码→raw；关闭时仅在反查/命令等辅助提示下保留一行
-    let raw = if show_code { raw_state.clone() } else { aux.clone() };
+    // 编码行内容：显示编码→raw；关闭时仅在反查/命令等辅助提示下保留一行。
+    // 【2026-09-05 反查提示】aux 非空（反查/命令模式）且 raw 非空时拼成
+    // 「〔反查〕 ni」——全程提示当前在反查态（此前进入后提示即消失，
+    // 编码行只剩拼音，用户看不出自己在反查）。样式=当前皮肤编码行。
+    let raw = if !aux.is_empty() && !raw_state.is_empty() {
+        format!("{aux} {raw_state}")
+    } else if show_code {
+        raw_state.clone()
+    } else {
+        aux.clone()
+    };
     let cands: Vec<(String, String)> = state
         .get("candidates")
         .and_then(|v| v.as_array())
