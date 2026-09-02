@@ -379,6 +379,9 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut early_commits = 0usize; // 提前上屏总次数（句中 commit，不含收尾）
     let mut early_chars = 0u64; // 提前上屏总字数（手感：每次几个字）
     let mut early_max = 0usize; // 单次提前上屏最大字数（最长免空格串）
+    // 【残留码长 2026-09-05】提前上屏事件瞬间 raw 缓冲剩余键数——上屏
+    // 后用户还需继续打/组句的负担，越短越跟手。
+    let mut early_resid = 0usize;
     let mut total_chars = 0u64; // 全文总字数（覆盖率分母）
     let mut sent_events: Vec<usize> = Vec::new(); // 每句上屏事件数（提前+收尾，越少越一气呵成）
     let mut total_ms: Vec<u128> = Vec::new();
@@ -471,6 +474,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
                 early_commits += 1;
                 early_chars += c.chars().count() as u64;
                 early_max = early_max.max(c.chars().count());
+                early_resid += sess.raw.chars().count();
                 sent_events_this += 1;
             }
         }
@@ -519,13 +523,15 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     );
     // 手感综合评估：提前上屏的字数视角——每次上屏平均几个字、全文
     // 有多大比例的字是免空格提前落地的（覆盖率=少按空格的真实比例）。
+    // 残留码长：提前上屏瞬间 raw 缓冲剩余键数（还要继续打/组句的量）。
     println!(
-        "手感： 每次提前上屏平均 {:.2} 字（最长 {} 字）  提前上屏覆盖 {:.1}%（{} 字 / 全文 {} 字）",
+        "手感： 每次提前上屏平均 {:.2} 字（最长 {} 字）  提前上屏覆盖 {:.1}%（{} 字 / 全文 {} 字）  上屏后残留平均 {:.2} 键",
         early_chars as f64 / early_commits.max(1) as f64,
         early_max,
         early_chars as f64 / total_chars.max(1) as f64 * 100.0,
         early_chars,
-        total_chars
+        total_chars,
+        early_resid as f64 / early_commits.max(1) as f64
     );
     // 「几次上屏打完一句」分布（含收尾空格共 1 次，越小越一气呵成）：
     // 1 次=整句全靠句尾空格一次落地；N 次=中途 N-1 次提前+收尾。
