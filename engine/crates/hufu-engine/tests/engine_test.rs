@@ -47,6 +47,7 @@ impl SentenceDecoder for MockDecoder {
             confidence: -1.0,
             max_rank: 1,
             sum_rank: 1,
+            exact: true,
             word_ends: Vec::new(),
             segmented: raw.to_string(),
             partial: false,
