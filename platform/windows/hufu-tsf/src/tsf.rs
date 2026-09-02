@@ -1263,6 +1263,18 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     let show_code = state.get("show_code").and_then(|v| v.as_bool()).unwrap_or(true);
     let raw_state = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // 【2026-09-05 内联去重】inline_preedit 开启且编码已内联在应用组段里
+    // 时，候选框不再重复显示编码行（反查/命令模式例外——aux 提示保留）。
+    let inline_dup = {
+        let on = g
+            .skin
+            .pointer("/skin/layout/inline_preedit")
+            .or_else(|| g.skin.get("layout").and_then(|l| l.get("inline_preedit")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        on && aux.is_empty() && !raw_state.is_empty()
+    };
+    let show_code = show_code && !inline_dup;
     // 编码行内容：显示编码→raw；关闭时仅在反查/命令等辅助提示下保留一行。
     // 【2026-09-05 反查提示】aux 非空（反查/命令模式）且 raw 非空时拼成
     // 「〔反查〕 ni」——全程提示当前在反查态（此前进入后提示即消失，

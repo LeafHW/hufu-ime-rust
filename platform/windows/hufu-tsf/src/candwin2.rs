@@ -797,15 +797,24 @@ impl CandidateWindowV2 {
                 dy_cache_out = Some((dy_key, dy));
             }
             // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
-            // 例外：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽
-            let raw_w = if cands.is_empty() && !raw.is_empty() {
-                measure(&tf, raw.as_str())
+            // 例外一：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽；
+            // 例外二：横排布局编码与候选同行（编码在左，2026-09-05 用户
+            // 反馈「横排编码独占一行在候选上面」），编码宽度参与定宽。
+            let raw_w = if cands.is_empty() || horizontal {
+                if raw.is_empty() {
+                    0.0
+                } else {
+                    measure(&tf, raw.as_str())
+                }
             } else {
                 0.0
             };
             let (width, text_x, cmt_x, cmt_w) = if horizontal {
                 // 横排纯内容自适应：Σ(标签+文本+注释+间隔)，不受固定宽/最小宽约束
                 let mut w = margin_x * 2.0;
+                if raw_w > 0.0 {
+                    w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
+                }
                 for (i, (tw, cw)) in cand_ws.iter().enumerate() {
                     if i > 0 {
                         w += cand_spacing;
@@ -836,11 +845,12 @@ impl CandidateWindowV2 {
                 };
                 (width, text_x, cmt_x, cmt_w)
             };
-            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w, dy))
+            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w, dy, raw_w))
         };
-        let (v_width, text_x, cmt_x, cmt_w, dy) = geo;
-        // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）
-        let code_row = if raw.is_empty() { 0.0 } else { 1.0 };
+        let (v_width, text_x, cmt_x, cmt_w, dy, raw_w) = geo;
+        // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
+        // 横排编码与候选同行（左），不占独立行（2026-09-05）
+        let code_row = if raw.is_empty() || horizontal { 0.0 } else { 1.0 };
         // 横排：内容即宽（纯自适应）；竖排：固定宽/自适应原逻辑
         let width = v_width;
         let height = if horizontal {
@@ -1285,7 +1295,8 @@ impl CandidateWindowV2 {
             let sel = selected.min(cands.len().saturating_sub(1));
             if horizontal {
                 // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
-                let mut x = margin_x;
+                // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
+                let mut x = margin_x + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
                 let y = y0;
                 for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
                     let (tw, cw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0));
