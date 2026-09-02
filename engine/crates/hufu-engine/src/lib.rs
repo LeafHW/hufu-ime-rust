@@ -36,6 +36,11 @@ pub struct SentenceHit {
     pub confidence: f64,
     /// 全路径最大码表名次（排序首位键）
     pub max_rank: usize,
+    /// 全路径各段码表名次总和（选重深度）：无锁候选各段名次之和，
+    /// 「们服」=1+1=2、「舒服」=2+1=3。rerank 换序约束用：无锁时
+    /// 深于原首选的候选不得被重排提前（要打「舒服」规范打法是 ja2vz
+    /// 锁第 2 选——见 2026-09-05 用户实测 舒服/坏人/势力 三案例）。
+    pub sum_rank: usize,
     /// 词边界：(累计字数, base 消耗位置)
     pub word_ends: Vec<(usize, usize)>,
     /// 分段显示（空格分隔编码段）
@@ -585,6 +590,25 @@ impl Engine {
                 if self.config.input.enter_clear {
                     session.clear();
                     KeyOutcome::consumed(self.state(session))
+                } else if self.sentence_active() {
+                    // 【换行切分修复 2026-09-05】整句模式 Enter 原样上屏
+                    // raw 字母——提前上屏已出的「字」与 Enter 吐出的「字
+                    // 母尾巴」拼在一行（用户实测「换行切分」）。改为上屏
+                    // 当前首选候选文本（完整态优先；无候选退回 raw，与
+                    // 码表模式行为一致）；挂起的 pending_commit（提前上
+                    // 屏未出字）先行拼入，一次 Enter 一段完整文本。
+                    let mut text = session.pending_commit.take().unwrap_or_default();
+                    let live = session
+                        .candidates
+                        .iter()
+                        .find(|c| !c.partial)
+                        .map(|c| c.text.clone())
+                        .or_else(|| session.candidates.first().map(|c| c.text.clone()))
+                        .unwrap_or_else(|| session.raw.clone());
+                    text.push_str(&live);
+                    session.raw.clear();
+                    session.candidates.clear();
+                    KeyOutcome::commit(text, self.state(session))
                 } else {
                     let raw = std::mem::take(&mut session.raw);
                     session.candidates.clear();
@@ -1555,16 +1579,43 @@ impl Engine {
         if idxs.len() < 2 {
             return;
         }
+        // 【选重深度约束】（2026-09-05 用户实测 舒服/坏人/势力 三案例）：
+        // 无锁时候选各段码表名次和（sum_rank）是「用户付出的选重代价」
+        // ——纯字母码的经济契约是「每段取码表首选」（ja=们，舒 是 ja2，
+        // 要打「舒服」规范打法 ja2vz）。rerank 换序不得把深度超过原
+        // 首选的候选提到前面——Qwen 觉得「舒服/坏人/势力」是高频词也
+        // 不行：那是在替用户付出他没同意的选重代价。
+        let depth_map: std::collections::HashMap<String, usize> = self
+            .sentence
+            .as_ref()
+            .map(|dec| {
+                dec.decode_rich(&key)
+                    .hits
+                    .iter()
+                    .map(|h| (h.text.clone(), h.sum_rank))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let base_depth = depth_map.get(&session.candidates[idxs[0]].text).copied();
         let mut sorted: Vec<usize> = idxs.clone();
         // 【过程态硬防御】partial（未消耗全部 raw 的前缀形态）恒沉底：
         // 即使旧缓存（过滤前产生的 Qwen 顺序）含过程态文本也不得提前
         // ——缺席的完整态次沉，完整态间按 Qwen 顺序自由重排。
+        // 【深度约束】完整态中 sum_rank 超过原首位深度者沉到缺席者
+        // 之前（仍在候选可见，只是不占前）。无深度数据（decode 未返）
+        // 时不约束。
         sorted.sort_by_key(|&i| {
             let c = &session.candidates[i];
             if c.partial {
                 usize::MAX
+            } else if let (Some(base), Some(&d)) = (base_depth, depth_map.get(&c.text)) {
+                if d > base {
+                    usize::MAX - 1
+                } else {
+                    rank.get(&c.text).copied().unwrap_or(usize::MAX - 2)
+                }
             } else {
-                rank.get(&c.text).copied().unwrap_or(usize::MAX - 1)
+                rank.get(&c.text).copied().unwrap_or(usize::MAX - 2)
             }
         });
         if sorted == idxs {
@@ -2153,6 +2204,7 @@ mod tests {
                     score: -1.0,
                     confidence: -1.0,
                     max_rank: 1,
+                    sum_rank: 1,
                     word_ends: Vec::new(),
                     segmented: p.base.clone(),
                     partial: false,
@@ -2243,6 +2295,50 @@ mod tests {
     /// 候选提到完整态之前——真实场景：qlagy 时 Qwen 把 4 键「老鬼」
     /// 提到 5 键「老痒」前霸首（2026-09-04 用户实测）。rerank_request
     /// 必须过滤 partial；缺席于重排序的 partial 在 apply 时自然靠后。
+    /// 【选重深度约束】无锁时 rerank 不得把 sum_rank 更深的候选提到
+    /// 原首选之前（javz 首选 们服 sum=2，Qwen 偏爱词「舒服」sum=3
+    /// ——要打舒服规范打法 ja2vz）。2026-09-05 用户实测三案例。
+    struct DepthMock;
+    impl SentenceDecoder for DepthMock {
+        fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
+            let hits = if raw == "javz" {
+                vec![
+                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false },
+                ]
+            } else {
+                Vec::new()
+            };
+            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false })
+        }
+    }
+
+    #[test]
+    fn rerank_never_lifts_deeper_rank() {
+        let dir = std::env::temp_dir().join("hufu-eng-depth");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(DepthMock)));
+        let mut s = Session::new(true);
+        s.raw = "javz".into();
+        s.candidates = vec![
+            Candidate::new("们服", "javz", CandidateKind::Sentence),
+            Candidate::new("舒服", "javz", CandidateKind::Sentence),
+            Candidate::new("们改变", "javz", CandidateKind::Sentence),
+        ];
+        // Qwen 把「舒服」排第一（词频偏爱）
+        {
+            let mut cache = eng.rerank_cache.lock().unwrap();
+            cache.insert("javz".into(), vec!["舒服".into(), "们改变".into(), "们服".into()]);
+        }
+        eng.refresh_rerank(&mut s);
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts[0], "们服", "原首选（深度 2）必须保持首位: {texts:?}");
+        assert!(texts.iter().position(|t| *t == "舒服").unwrap() > 0, "深度 3 的舒服不得被 Qwen 提到首位: {texts:?}");
+    }
+
     #[test]
     fn rerank_never_lifts_partial() {
         let dir = std::env::temp_dir().join("hufu-eng-partial");

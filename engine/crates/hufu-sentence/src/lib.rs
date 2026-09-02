@@ -64,6 +64,8 @@ struct St {
     /// 同文本聚合质量（logsumexp；不含补充奖励）
     mass: f64,
     max_rank: usize,
+    /// 各段码表名次总和（选重深度；rerank 无锁约束用）
+    sum_rank: usize,
     /// 词边界：(累计字数, base 消耗位置)
     word_ends: Vec<(usize, usize)>,
     /// 补充语料 AC 自动机状态（沿全文逐字推进）
@@ -361,6 +363,7 @@ impl SentenceEngine {
                 score: 0.0,
                 mass: 0.0,
                 max_rank: 1,
+                sum_rank: 0,
                 word_ends: Vec::new(),
                 supp_state: 0,
             });
@@ -464,6 +467,7 @@ impl SentenceEngine {
                         }
                         ns.text.push_str(text);
                         ns.max_rank = ns.max_rank.max(rank1b);
+                        ns.sum_rank += rank1b;
                         ns.word_ends.push((ns.text.chars().count(), end));
                         buckets[end].add(ns);
                     }
@@ -498,6 +502,7 @@ impl SentenceEngine {
                     confidence: st.mass + eos - iso,
                     text: st.text.clone(),
                     max_rank: st.max_rank,
+                    sum_rank: st.sum_rank,
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
@@ -537,6 +542,7 @@ impl SentenceEngine {
                     confidence: conf,
                     text: st.text.clone(),
                     max_rank: st.max_rank.max(1),
+                    sum_rank: st.sum_rank,
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
@@ -583,6 +589,7 @@ impl SentenceEngine {
                                 confidence: conf,
                                 text: st.text.clone(),
                                 max_rank: st.max_rank.max(1),
+                                sum_rank: st.sum_rank,
                                 word_ends: st.word_ends.clone(),
                                 segmented: segmented_of(&st.word_ends, &base),
                                 partial: true,
