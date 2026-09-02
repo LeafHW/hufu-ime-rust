@@ -1703,8 +1703,14 @@ impl Engine {
         }
         // 完整态在前（首选=完整态最优，不做任何下沉——完整句含一个低频
         // 字就整条沉底会错杀正确句，500 句实测 99.80→96.60% 的根因），
-        // 前缀态（正在打的词）追加供翻选
-        cands.extend(part_cands);
+        // 前缀态（正在打的词）追加供翻选。
+        // 【码表域无 partial】（2026-09-05 倩案例）：partial=前段精确
+        // +尾键进行中（倩 的码 jav，javz 时刻它是 jav+z 的进行态）
+        // ——与踹案例 pvlc 时的「踹」同款，码表域不显示（打满 raw 的
+        // 词组完成态才是候选；要打「倩身」继续 javzs，整句域自会出）。
+        if !dict_domain {
+            cands.extend(part_cands);
+        }
         cands
     }
 
@@ -1824,6 +1830,18 @@ impl Engine {
                         }
                         let text: String = h.text.chars().skip(skip).collect();
                         if text.is_empty() {
+                            continue;
+                        }
+                        // 【码表域 exact 过滤】（2026-09-05 uksl 案例）：此
+                        // 常规路径（码表有精确条目，如 uksl=抛）此前没有
+                        // sentence_candidates 的过滤，势力（uk2+sl）热发
+                        // 生 类从 rest 漏进候选。码表域（无锁且 ≤ 最大码
+                        // 长）短语合并同样只收精确对应项。
+                        let live_n = session.raw.chars().count();
+                        let dom = !parsed.has_locks()
+                            && live_n > 0
+                            && live_n <= self.config.input.max_code_length;
+                        if dom && !h.exact {
                             continue;
                         }
                         let multi = text.chars().count() >= 2;
