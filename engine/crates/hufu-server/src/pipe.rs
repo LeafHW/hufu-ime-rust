@@ -152,6 +152,18 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             let current = host.engine.config.schema.current.clone();
             serde_json::json!({"schemas": names, "current": current})
         }
+        // 【2026-09-05】语言栏右键「重载码表」：当前方案原样重载（改
+        // 码表/补充语料/符号表后免重启 server 生效）。与 set_schema 同
+        // 源逻辑，name=当前方案名。
+        "reload_schema" => {
+            let name = host.engine.config.schema.current.clone();
+            let ok = host.engine.switch_schema(&name).is_ok();
+            if ok {
+                host.session.clear();
+                host.setup_sentence();
+            }
+            serde_json::json!({"ok": ok, "current": name})
+        }
         // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
         // cloaked、UIElement 被宿主拒绝 → server 代画【用户皮肤】）
         "cand" => {
