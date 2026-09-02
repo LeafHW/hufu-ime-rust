@@ -590,25 +590,6 @@ impl Engine {
                 if self.config.input.enter_clear {
                     session.clear();
                     KeyOutcome::consumed(self.state(session))
-                } else if self.sentence_active() {
-                    // 【换行切分修复 2026-09-05】整句模式 Enter 原样上屏
-                    // raw 字母——提前上屏已出的「字」与 Enter 吐出的「字
-                    // 母尾巴」拼在一行（用户实测「换行切分」）。改为上屏
-                    // 当前首选候选文本（完整态优先；无候选退回 raw，与
-                    // 码表模式行为一致）；挂起的 pending_commit（提前上
-                    // 屏未出字）先行拼入，一次 Enter 一段完整文本。
-                    let mut text = session.pending_commit.take().unwrap_or_default();
-                    let live = session
-                        .candidates
-                        .iter()
-                        .find(|c| !c.partial)
-                        .map(|c| c.text.clone())
-                        .or_else(|| session.candidates.first().map(|c| c.text.clone()))
-                        .unwrap_or_else(|| session.raw.clone());
-                    text.push_str(&live);
-                    session.raw.clear();
-                    session.candidates.clear();
-                    KeyOutcome::commit(text, self.state(session))
                 } else {
                     let raw = std::mem::take(&mut session.raw);
                     session.candidates.clear();
