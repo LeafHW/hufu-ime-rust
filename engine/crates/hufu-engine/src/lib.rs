@@ -1485,22 +1485,23 @@ impl Engine {
             self.opencc_loaded = true;
         }
         let base: Vec<Candidate> = session.candidates.iter().take(3).cloned().collect();
-        // 【2026-09-05 改】变体插入最前（用户实测繁体「生效但不在首选」；
-        // 原 push 尾部导致要翻页找）。按源候选顺序整体置顶，保持
-        // 「第 1 候选的繁体在最前」的对应关系。
-        let mut variants: Vec<Candidate> = Vec::new();
-        for cand in &base {
-            if cfg.to_traditional {
-                if let Some(t) = &self.opencc {
+        // 【2026-09-05 定稿】简→繁=替换式（Rime simplifier 语义，用户拍板）：
+        // 直接转换候选文本，显示与上屏都是繁体——「打简出繁」；候选顺序
+        // 不动：无简繁之分的字（中/你）保持原样原位（「中」仍是首选
+        // 「中」，不会冒出「哪個」压顶；此前「置顶追加变体」被用户否决：
+        // d 键首选变「哪個」）。emoji 仍为追加变体（原本语义）。
+        if cfg.to_traditional {
+            if let Some(t) = &self.opencc {
+                for cand in session.candidates.iter_mut() {
                     let conv = t.convert(&cand.text);
                     if conv != cand.text {
-                        let mut c = cand.clone();
-                        c.text = conv;
-                        c.comment = "⚑繁".into();
-                        variants.push(c);
+                        cand.text = conv;
                     }
                 }
             }
+        }
+        let mut variants: Vec<Candidate> = Vec::new();
+        for cand in &base {
             if cfg.emoji {
                 if let Some(em) = &self.opencc_emoji {
                     let v = em.convert(&cand.text);
@@ -1514,7 +1515,7 @@ impl Engine {
             }
         }
         let n = variants.len();
-        session.candidates.splice(0..0, variants);
+        session.candidates.append(&mut variants);
         let _ = n;
     }
 
