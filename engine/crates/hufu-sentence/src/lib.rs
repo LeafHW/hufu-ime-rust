@@ -66,6 +66,8 @@ struct St {
     max_rank: usize,
     /// 各段码表名次总和（选重深度；rerank 无锁约束用）
     sum_rank: usize,
+    /// 全路径每段精确对应实打编码（无前缀扩展、无未打选重）
+    exact: bool,
     /// 词边界：(累计字数, base 消耗位置)
     word_ends: Vec<(usize, usize)>,
     /// 补充语料 AC 自动机状态（沿全文逐字推进）
@@ -293,7 +295,12 @@ impl SentenceEngine {
             end: usize,
             /// 段终点命中的锁名次（锁位置 == end）
             lock_rank: Option<usize>,
-            entries: Vec<(String, usize)>,
+            /// (文本, 码表名次-1, 精确)：精确=该词条码表码长==消耗键数
+            /// （「改变」码 vz; 只消耗 2 键=前缀扩展，不精确；「服」码
+            /// vz 消耗 2 键=精确）。无锁短码候选过滤用（2026-09-05 用
+            /// 户规则：选重的数字、词锁的 ; 都是编码的一部分——没打就
+            /// 不出现在候选里，javz 只该有「们服」与整码字）。
+            entries: Vec<(String, usize, bool)>,
         }
         let mut segs: Vec<Vec<Seg>> = vec![Vec::new(); n];
         for pos in start_pos..n {
@@ -328,12 +335,15 @@ impl SentenceEngine {
                     .iter()
                     .find(|(l, _)| *l as usize == end)
                     .map(|(_, r)| *r);
-                let entries: Vec<(String, usize)> = idxs
+                let entries: Vec<(String, usize, bool)> = idxs
                     .iter()
                     .enumerate()
                     .take(SEG_RANK_LIMIT)
                     .filter_map(|(rank, &idx)| {
-                        self.dict.entries.get(idx as usize).map(|e| (e.text.clone(), rank))
+                        self.dict.entries.get(idx as usize).map(|e| {
+                            let exact = e.code.chars().count() == code_len;
+                            (e.text.clone(), rank, exact)
+                        })
                     })
                     .collect();
                 if !entries.is_empty() {
@@ -364,6 +374,7 @@ impl SentenceEngine {
                 mass: 0.0,
                 max_rank: 1,
                 sum_rank: 0,
+                exact: true,
                 word_ends: Vec::new(),
                 supp_state: 0,
             });
@@ -423,7 +434,7 @@ impl SentenceEngine {
                             continue;
                         }
                     }
-                    for (text, rank) in &seg.entries {
+                    for (text, rank, seg_exact) in &seg.entries {
                         let rank1b = rank + 1; // 码表名次（1 起）
                         if let Some(r) = lock {
                             if rank1b != r {
@@ -468,6 +479,15 @@ impl SentenceEngine {
                         ns.text.push_str(text);
                         ns.max_rank = ns.max_rank.max(rank1b);
                         ns.sum_rank += rank1b;
+                        // 精确累计：段词条码长==消耗键数（无前缀扩展）且
+                        // 无选重（rank1，或被锁钉名次=用户打了选重键）。
+                        // 任何一段不精确则整条路径 exact=false。
+                        if !*seg_exact && lock.is_none() {
+                            ns.exact = false;
+                        }
+                        if rank1b > 1 && lock.is_none() {
+                            ns.exact = false;
+                        }
                         ns.word_ends.push((ns.text.chars().count(), end));
                         buckets[end].add(ns);
                     }
@@ -503,6 +523,7 @@ impl SentenceEngine {
                     text: st.text.clone(),
                     max_rank: st.max_rank,
                     sum_rank: st.sum_rank,
+                    exact: st.exact,
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
@@ -543,6 +564,7 @@ impl SentenceEngine {
                     text: st.text.clone(),
                     max_rank: st.max_rank.max(1),
                     sum_rank: st.sum_rank,
+                    exact: st.exact,
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
@@ -590,6 +612,7 @@ impl SentenceEngine {
                                 text: st.text.clone(),
                                 max_rank: st.max_rank.max(1),
                                 sum_rank: st.sum_rank,
+                    exact: st.exact,
                                 word_ends: st.word_ends.clone(),
                                 segmented: segmented_of(&st.word_ends, &base),
                                 partial: true,

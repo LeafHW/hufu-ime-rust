@@ -41,6 +41,13 @@ pub struct SentenceHit {
     /// 深于原首选的候选不得被重排提前（要打「舒服」规范打法是 ja2vz
     /// 锁第 2 选——见 2026-09-05 用户实测 舒服/坏人/势力 三案例）。
     pub sum_rank: usize,
+    /// 全路径每段精确对应实打编码：段词条码表码长==消耗键数（无前
+    /// 缀扩展）且名次 1（或被锁钉住=用户打了选重键）。无锁短码候选
+    /// 过滤用（2026-09-05 用户规则：「选重的数字、词锁的 ; 都是编码
+    /// 的一部分——没打就不要出现在候选里」：javaz 只该有「们服」与
+    /// 整码字，「舒服」(ja2)「们改变」(javz;) 不出现；打 javz; 或
+    /// ja2vz 时才出现）。
+    pub exact: bool,
     /// 词边界：(累计字数, base 消耗位置)
     pub word_ends: Vec<(usize, usize)>,
     /// 分段显示（空格分隔编码段）
@@ -1655,6 +1662,17 @@ impl Engine {
         let part_cands: Vec<Candidate> =
             part_stash.into_iter().map(|(_, _, c)| c).take(6).collect();
         let mut cands: Vec<Candidate> = Vec::new();
+        // 【无锁短码候选=精确对应】（2026-09-05 用户规则）：live raw ≤
+        // 最大码长且无锁=码表域——候选只留每段精确对应实打编码的完整
+        // 态（段词条码表码长==消耗键数、名次 1）：javz 只出「们服」与
+        // 整码字，「舒服」(ja2 的 2 没打)「们改变」(javz; 的 ; 没打)
+        // 不出——打 javz;（5 键进整句域）或 ja2vz（锁域）时才出现。
+        // exact 集为空时回退全显（不破坏可见性，如全生僻码）。
+        let live_len = session.raw.chars().count();
+        let dict_domain =
+            !has_locks && live_len > 0 && live_len <= self.config.input.max_code_length;
+        let mut exact_cands: Vec<Candidate> = Vec::new();
+        let mut inexact_cands: Vec<Candidate> = Vec::new();
         for h in rich.hits.iter() {
             if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
                 continue;
@@ -1669,7 +1687,19 @@ impl Engine {
             }
             let mut c = Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
             c.weight = h.score;
-            cands.push(c);
+            if h.exact {
+                exact_cands.push(c);
+            } else {
+                inexact_cands.push(c);
+            }
+        }
+        if dict_domain && !exact_cands.is_empty() {
+            // 码表域：只显精确对应项；exact 全空（无精确组合，如全生
+            // 僻码 wvn）回退全显保持可见性
+            cands = exact_cands;
+        } else {
+            cands = exact_cands;
+            cands.extend(inexact_cands);
         }
         // 完整态在前（首选=完整态最优，不做任何下沉——完整句含一个低频
         // 字就整条沉底会错杀正确句，500 句实测 99.80→96.60% 的根因），
@@ -2186,6 +2216,7 @@ mod tests {
                     confidence: -1.0,
                     max_rank: 1,
                     sum_rank: 1,
+                    exact: true,
                     word_ends: Vec::new(),
                     segmented: p.base.clone(),
                     partial: false,
@@ -2284,9 +2315,9 @@ mod tests {
         fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
             let hits = if raw == "javz" {
                 vec![
-                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
-                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
-                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false },
                 ]
             } else {
                 Vec::new()
