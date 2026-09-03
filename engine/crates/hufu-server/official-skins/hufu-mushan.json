@@ -21,7 +21,7 @@
                    "hilited_comment_text_color":  "#B8B0D8FF",
                    "hilited_label_color":  "#C0A8FFFF",
                    "hilited_mark_color":  "#C0A8FFFF",
-                   "shadow_color":  "#00000040",
+                   "shadow_color":  "#000000FF",
                    "hilited_shadow_color":  "#00000000",
                    "hilited_candidate_shadow_color":  "#00000000",
                    "capsule_text_color":  "#E4E0F0FF",

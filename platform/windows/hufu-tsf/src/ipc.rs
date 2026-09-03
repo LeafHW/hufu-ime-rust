@@ -297,7 +297,7 @@ pub fn call(req: &Value) -> Option<Value> {
     }
 }
 
-/// 按键请求 → (consumed, commit, back, state, sound)
+/// 按键请求 → (consumed, commit, back, state, sound, sound_vol)
 /// line_end：前端检测到组段逼近窗口右缘（软换行边界）——引擎提前上屏
 /// 确认键数 2→1，组段早一步缩短（见 engine Session::line_end_hint）。
 pub fn key_request(
@@ -306,7 +306,7 @@ pub fn key_request(
     ctrl: bool,
     alt: bool,
     line_end: bool,
-) -> Option<(bool, String, u8, Value, Option<String>)> {
+) -> Option<(bool, String, u8, Value, Option<String>, u8)> {
     let resp = call(&serde_json::json!({
         "op": "key",
         "key": key,
@@ -326,7 +326,12 @@ pub fn key_request(
         .get("sound")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    Some((consumed, commit, back, state, sound))
+    // 音量每键随行（热生效：设置页改音量 → 下一键即新音量）
+    let sound_vol = outcome
+        .get("sound_vol")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(70) as u8;
+    Some((consumed, commit, back, state, sound, sound_vol))
 }
 
 /// 唤醒：探测服务器是否在。

@@ -605,7 +605,7 @@ impl HuFuTs_Impl {
                 f
             };
             if fire {
-                if let Some((consumed, _commit, _back, state, _sound)) =
+                if let Some((consumed, _commit, _back, state, _sound, _vol)) =
                     ipc::key_request("shift", false, false, false, false)
                 {
                     if consumed {
@@ -711,7 +711,7 @@ impl HuFuTs_Impl {
         // 行尾瞬态（query_caret 每帧刷新）：组段逼近窗口右缘时本键
         // 的提前上屏确认放宽（engine need 2→1）
         let line_end = self.shared.lock().unwrap().line_end;
-        let Some((consumed, commit, back, state, sound)) =
+        let Some((consumed, commit, back, state, sound, sound_vol)) =
             ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end)
         else {
             return BOOL(0);
@@ -726,7 +726,7 @@ impl HuFuTs_Impl {
             // 宿主不产字（「caps 切换后英文打不进」）。切换响应
             // commit 为空、无组段副作用，update_ui 此时只做状态同步。
             if let Some(tag) = sound {
-                crate::sound::play(&tag);
+                crate::sound::play(&tag, sound_vol);
             }
             // 回删替换（数字后 1. 再按 . → 。）：先删旧字符再走正常提交
             if back > 0 {
@@ -768,7 +768,7 @@ pub fn test_key(vk: u32) -> i32 {
     let _ = (shift, ctrl, alt);
     let r = ipc::key_request(&name, false, false, false, false);
     match r {
-        Some((consumed, _commit, _back, _state, _sound)) => {
+        Some((consumed, _commit, _back, _state, _sound, _vol)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
             if consumed { 1 } else { 0 }
         }

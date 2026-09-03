@@ -580,6 +580,25 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => Response::err(500, &format!("切换失败: {e}")),
             }
         }
+        ("POST", "/api/open_schema_dir") => {
+            // body {name?}：缺省=当前方案。打开方案码表目录的资源管理器窗口。
+            let name = req
+                .json()
+                .get("name")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&host.engine.config.schema.current)
+                .to_string();
+            let dir = host
+                .data_dir
+                .join(&host.engine.config.schema.dir)
+                .join(&name);
+            if !dir.is_dir() {
+                return Response::err(404, &format!("方案目录不存在: {name}"));
+            }
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+            Response::json(&serde_json::json!({"ok": true, "path": dir}))
+        }
         ("POST", "/api/shutdown") => {
             std::process::exit(0);
         }

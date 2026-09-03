@@ -104,6 +104,12 @@ footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
 }
 .schema-item.on { border-color: var(--acc); }
 .schema-item .tag { font-size: 11px; background: var(--bg3); color: var(--acc); border-radius: 5px; padding: 2px 8px; }
+.schema-item .opendir {
+  margin-left: auto; font-size: 14px; background: none; border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 10px; cursor: pointer; color: var(--fg2);
+}
+.schema-item .opendir:hover { border-color: var(--acc); color: var(--acc); }
+.schema-item .opendir + .tag { margin-left: 0; }
 /* ── 用户词 ── */
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
@@ -147,8 +153,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
 <body>
 <nav>
   <div class="logo">虎<span>符</span> HuFu</div>
-  <a data-tab="trial" class="on">⟳ 试用与状态</a>
-  <a data-tab="schema">方案</a>
+  <a data-tab="schema" class="on">方案</a>
   <a data-tab="input">输入与候选</a>
   <a data-tab="sentence">整句模型</a>
   <a data-tab="skin">皮肤</a>
@@ -159,20 +164,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
 </nav>
 
 <main>
-  <!-- ════ 试用 ════ -->
-  <section id="tab-trial" class="on">
-    <h2>试用与状态<span class="en">Live</span></h2>
-    <div class="sub">点击下方输入框直接打字，体验当前方案：超最大码长自动上屏、选重、翻页、符号、整句接管都会实时生效。</div>
-    <div class="trial">
-      <div class="caption">▸ 输入区（键盘事件被拦截，不会修改页面）</div>
-      <div class="capture" id="capture" tabindex="0">点击此处开始输入…</div>
-      <div class="log" id="trial-log">已上屏：</div>
-    </div>
-    <div id="trial-state"></div>
-  </section>
-
   <!-- ════ 方案 ════ -->
-  <section id="tab-schema">
+  <section id="tab-schema" class="on">
     <h2>方案<span class="en">Schema</span></h2>
     <div class="sub">方案 = 码表目录。切换后立即生效，最近方案对可用 Ctrl+M 来回切。</div>
     <div class="schema-list" id="schema-list"></div>
@@ -268,6 +261,9 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 整句 ════ -->
   <section id="tab-sentence">
     <h2>整句模型<span class="en">Sentence</span></h2>
+    <div style="color:#ff5f57;font-weight:600;font-size:14px;padding:8px 12px;border:1px solid #ff5f5740;border-radius:8px;background:#ff5f5714;margin-bottom:12px">
+      ⚠ 以下参数已按当前输入法调校到最佳状态，不建议自行调整。误调后可点「恢复初始值」一键还原。
+    </div>
     <div class="sub">TCSKNM02 ngram（Kneser-Ney trigram）字级 beam 组句。拖动滑杆实时调整组句倾向，右侧试验框立即验证。</div>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="s-en"><label for="s-en">启用整句</label></div>
@@ -278,7 +274,10 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="row">
       <div class="field"><label>ngram 模型文件（数据目录相对路径）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
     </div>
-    <h3>组句权重</h3>
+    <div class="row" style="align-items:center;justify-content:space-between">
+      <h3 style="margin:0">组句权重</h3>
+      <button id="w-reset" title="把下方所有权重恢复为出厂调校值（自动保存生效）">恢复初始值</button>
+    </div>
     <div class="row" id="w-sliders"></div>
     <h3>试验</h3>
     <div class="field" style="max-width:560px">
@@ -496,6 +495,12 @@ const WDEFS = [
   ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
   ["supplement_maximum", "语料奖励上限", 1, 30, 0.5],
 ];
+/* 出厂调校值（v1.4.6 万句基准定标）：恢复初始值按钮用 */
+const W_DEFAULTS = {
+  beam_width: 200, rank_penalty: 0.03, emitted_character_reward: 2.0,
+  isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
+  dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
+};
 function buildSliders() {
   const box = $("#w-sliders"); box.innerHTML = "";
   WDEFS.forEach(([k, name, min, max, step]) => {
@@ -509,35 +514,16 @@ function buildSliders() {
     sync();
   });
 }
+/* 恢复初始值：权重一键还原出厂调校值 + 自动保存应用 */
+$("#w-reset").onclick = async () => {
+  try {
+    Object.assign(CFG.sentence.weights, W_DEFAULTS);
+    buildSliders();
+    await api("POST", "/api/config", CFG);
+    msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
+  } catch (e) { msg(e.message, "err"); }
+};
 
-/* ── 试用台 ── */
-let committedLog = "";
-async function trialKey(ev) {
-  const map = { " ": "space", Enter: "enter", Backspace: "backspace", Tab: "tab", Escape: "escape" };
-  let key = null;
-  if (ev.key.length === 1) key = ev.key;
-  else if (map[ev.key]) key = map[ev.key];
-  if (!key || ev.ctrlKey || ev.altKey || ev.metaKey) return;
-  ev.preventDefault();
-  const payload = { key, modifiers: { shift: ev.key.length === 1 && ev.key.match(/[A-Z]/) || ev.shiftKey, ctrl: false, alt: false } };
-  const r = await api("POST", "/api/key", payload).catch(e => ({ error: e.message }));
-  if (r.error) return msg(r.error, "err");
-  if (r.outcome && r.outcome.commit) { committedLog += r.outcome.commit; $("#trial-log").textContent = "已上屏：" + committedLog.slice(-40); }
-  renderState(r.state);
-}
-function renderState(st) {
-  $("#capture").innerHTML = (st.preedit ? `<b>${esc(st.preedit)}</b>` : '<span class="ghost">点击此处开始输入…</span>');
-  const cands = (st.candidates || []).map((c, i) =>
-    `<div class="cand-line"><span class="idx">${i + 1}.</span>${esc(c.text)}${c.comment ? ` <span class="cmt">${esc(c.comment)}</span>` : ""}</div>`).join("");
-  $("#trial-state").innerHTML = `
-    <div class="row" style="gap:10px;align-items:center;margin-top:4px">
-      <span class="pill">${st.chinese ? "中" : "EN"}</span>
-      <span class="pill">${esc(st.aux || "常规")}</span>
-      <span class="pill">页 ${st.page + 1}/${Math.max(1, st.page_count)}</span>
-      <span class="pill">raw: ${esc(st.raw)}</span>
-    </div>
-    ${cands ? `<div class="candwin" style="margin-top:12px;background:#1e2026;border-color:#32353e;color:#e8e8ea">${cands}</div>` : ""}`;
-}
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 /* ── 方案 ── */
@@ -547,7 +533,14 @@ async function loadSchemas() {
   (r.schemas || []).sort((a, b) => a.localeCompare(b, "zh")).forEach(n => {
     const d = document.createElement("div");
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
-    d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}${n === r.current_schema ? '<span class="tag" style="margin-left:auto">当前</span>' : ""}`;
+    d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}` +
+      `<button class="opendir" title="在资源管理器中打开此方案的码表文件夹">📂 打开文件夹</button>` +
+      `${n === r.current_schema ? '<span class="tag">当前</span>' : ""}`;
+    d.querySelector(".opendir").onclick = async ev => {
+      ev.stopPropagation();
+      try { await api("POST", "/api/open_schema_dir", { name: n }); msg(`已打开 ${n} 的文件夹`, "ok"); }
+      catch (e) { msg(e.message, "err"); }
+    };
     d.onclick = async () => {
       try {
         await api("POST", "/api/schema", { name: n });
@@ -838,8 +831,6 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
   $$("main section").forEach(s => s.classList.remove("on"));
   $("#tab-" + a.dataset.tab).classList.add("on");
 });
-$("#capture").addEventListener("keydown", trialKey);
-$("#capture").addEventListener("click", () => $("#capture").focus());
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
 /* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
 document.addEventListener("visibilitychange", () => {
@@ -926,7 +917,6 @@ async function init() {
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
     await loadUserWords();
-    renderState({ preedit: "", raw: "", candidates: [], page: 0, page_count: 1, chinese: true, aux: "" });
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
 }

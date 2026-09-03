@@ -146,7 +146,9 @@ fn key_pool_tags() -> Vec<String> {
 /// 播放 tag 音效（失败静默）。**调度线程 + 8 固定播放工人**：
 /// tag=="key" 走键音新模型：随机 clip + 音量抖动、可被 key_up() 截断
 /// （按下出声松开即停）；其余（select/commit/page）为事件音不受松键影响。
-pub fn play(tag: &str) {
+/// vol = server 每键随行的当前音量（0-100，热生效）——wav 数据可缓存，
+/// 音量永远用最新值，设置页改音量下一键即生效。
+pub fn play(tag: &str, vol: u8) {
     let is_key = tag == "key";
     let clip = if is_key {
         let tags = key_pool_tags();
@@ -155,13 +157,17 @@ pub fn play(tag: &str) {
             Some(c) => c,
             None => return,
         };
+        c.volume = vol;
         // 音量抖动 ±15%：同一 wav 也不重样
         let jitter = 85 + (rnd() % 31) as u32; // 85–115
         c.volume = ((c.volume as u32 * jitter) / 100).min(100) as u8;
         c
     } else {
         match with_clip(tag) {
-            Some(c) => c,
+            Some(mut c) => {
+                c.volume = vol;
+                c
+            }
             None => return,
         }
     };
