@@ -92,6 +92,37 @@ pub trait SentenceDecoder: Send + Sync {
     }
 }
 
+/// 【Shift 标点 2026-09-05】US 键盘 Shift 形态（基础键 → Shift 字符）。
+/// TSF 层传基础键名+shift=true（Shift+, → key=","），引擎侧转成 shift
+/// 形态字符再走标点映射：shift+,→<→《、shift+'→"→“、shift+/→?→？、
+/// shift+1→!→！。
+fn shift_form(c: char) -> Option<char> {
+    Some(match c {
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        ';' => ':',
+        '\'' => '"',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        '`' => '~',
+        '=' => '+',
+        '-' => '_',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        _ => return None,
+    })
+}
+
 /// 置信前缀提案（Rime confidence_proposal）：软最大前缀质量占比 ≥ 阈值的最长真前缀。
 /// 返回 (提案, 份额)。
 pub fn confidence_proposal(cands: &[&SentenceHit], threshold: f64) -> (String, f64) {
@@ -685,6 +716,20 @@ impl Engine {
                 session.raw = "\\".into();
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
+            }
+            // 【Shift 标点 2026-09-05】TSF 传基础键+shift=true（Shift+,→
+            // key=","），空态 Shift+标点/数字转 US 键盘 shift 形态字符走
+            // 标点映射：shift+,→<→《、shift+'→"→“（智能配对）、shift+/
+            // →?→？、shift+1→!→！。放在 '/' 符号命名空间之前（否则
+            // shift+/ 被顿号分支先吃）。有编码态不受影响。
+            if shift && session.raw.is_empty() {
+                if let Some(sf) = shift_form(c) {
+                    if let Some((text, back)) = self.punct_output(session, sf) {
+                        let mut o = KeyOutcome::commit(text, self.state(session));
+                        o.back = back;
+                        return o;
+                    }
+                }
             }
             // '/' 符号命名空间（首选顿号，继续输入进入 /xx 符号）
             if c == '/'
