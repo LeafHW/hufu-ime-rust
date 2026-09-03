@@ -12,6 +12,16 @@ use windows_core::*;
 
 type SharedRef = Arc<Mutex<Shared>>;
 
+/// 【滚轮缩放候选框】进程级 SharedRef 锚点：candwin2 的窗口过程是静态
+/// 函数拿不到 TSF 实例，WM_MOUSEWHEEL 里经此重入（取 cand2 + 上帧渲染
+/// 参数立即重绘，不等皮肤缓存过期）。Activate 时 Set 一次。
+/// Shared 含 HWND 等裸指针（非 Send），静态存储需显式声明跨线程安全
+/// ——访问全程持 Mutex，实际串行。
+pub struct GShared(pub SharedRef);
+unsafe impl Send for GShared {}
+unsafe impl Sync for GShared {}
+pub static G_SHARED: std::sync::OnceLock<GShared> = std::sync::OnceLock::new();
+
 /// 线程共享状态（文本服务 / 按键接收 / 编辑会话共用）。
 pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
@@ -77,6 +87,9 @@ pub struct Shared {
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
     pub line_end: bool,
+    /// 【滚轮缩放候选框】最近一次 show 的渲染参数（候选/编码/选中）：
+    /// WM_MOUSEWHEEL 改字号后用它立即重绘（无键事件触发 update_ui）。
+    pub last_show: Option<(Vec<(String, String)>, String, usize)>,
 }
 
 impl Shared {
@@ -111,6 +124,7 @@ impl Shared {
             cand_sig_last: String::new(),
             caret_recheck_due: false,
             line_end: false,
+            last_show: None,
         }
     }
 
@@ -161,6 +175,8 @@ impl HuFuTs {
 
 impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
     fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        // 【滚轮缩放候选框】进程级锚点：candwin2 窗口过程静态重入用
+        let _ = G_SHARED.set(GShared(self.shared.clone()));
         let tm = ptim
             .cloned()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
@@ -1435,6 +1451,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
             None => {}
         }
+        // 【滚轮缩放候选框】缓存渲染参数：WM_MOUSEWHEEL 改字号后
+        // 免键事件立即重绘
+        g.last_show = Some((cands.clone(), raw.clone(), sel));
         // 显示完成：清除首帧抑制补显标记
         g.suppress_pending = false;
     } else {

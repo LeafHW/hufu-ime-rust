@@ -77,6 +77,31 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 }
             }
         }
+        // 【滚轮缩放候选框】DLL 候选框 WM_MOUSEWHEEL 调用：当前皮肤
+        // layout.font_point ±delta（clamp 10~36），写回皮肤文件持久化；
+        // 返回新字号供 DLL 立即重绘。
+        "skin_font_delta" => {
+            let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
+            let id = host.engine.config.appearance.skin.clone();
+            let p = host.skins_dir().join(format!("{id}.json"));
+            match hufu_skin::Skin::load(&p) {
+                Ok(mut s) => {
+                    let np = (s.layout.font_point as i32 + delta).clamp(10, 36);
+                    s.layout.font_point = np as f32;
+                    match s.save(&p) {
+                        Ok(()) => serde_json::json!({"font_point": np}),
+                        Err(e) => {
+                            eprintln!("皮肤 {id} 字号保存失败: {e}");
+                            serde_json::json!({"err": e.to_string()})
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("皮肤 {id} 加载失败: {e}");
+                    serde_json::json!({"err": e.to_string()})
+                }
+            }
+        }
         // 输入法激活态上报（DLL Activate/Deactivate）：驱动托盘图标显隐
         "ime" => {
             let active = req.get("active").and_then(|v| v.as_bool()).unwrap_or(false);

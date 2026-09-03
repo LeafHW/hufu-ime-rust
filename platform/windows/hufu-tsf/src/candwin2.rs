@@ -157,6 +157,48 @@ extern "system" fn cand2_wndproc(
             }
             return LRESULT(0);
         }
+        0x20A => {
+            // 【滚轮缩放候选框】WM_MOUSEWHEEL（Win10+ 默认「悬停时滚动
+            // 非活动窗口」，光标在框上即到达）：上滚放大、下滚缩小，
+            // 每格 ±1pt（10~36 clamp）。字号经 server 写回当前皮肤
+            // layout.font_point（持久化），随后本地皮肤副本同步新字号
+            // 并用缓存的上帧渲染参数立即重绘——不等 2.5s 皮肤缓存过期、
+            // 不依赖键事件触发 update_ui。
+            let delta: i32 = if ((wparam.0 >> 16) as i16) > 0 { 1 } else { -1 };
+            if let Some(r) = crate::ipc::call(&serde_json::json!({
+                "op": "skin_font_delta", "delta": delta
+            })) {
+                let new_pt = r.get("font_point").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                if new_pt > 0.0 {
+                    if let Some(gsh) = crate::tsf::G_SHARED.get() {
+                        let shared = gsh.0.clone();
+                        let mut g = shared.lock().unwrap();
+                        let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
+                            l["font_point"] = serde_json::json!(new_pt);
+                            true
+                        } else if let Some(l) = g.skin.get_mut("layout") {
+                            l["font_point"] = serde_json::json!(new_pt);
+                            true
+                        } else {
+                            false
+                        };
+                        if patched {
+                            // 副本已同步新字号：刷新缓存时限，暂不重拉
+                            g.skin_stale = false;
+                            g.skin_loaded_at = std::time::Instant::now();
+                        }
+                        let last = g.last_show.take();
+                        let skin = g.skin.clone();
+                        let caret = g.caret;
+                        if let (Some(c), Some((cands, raw, sel))) = (g.cand2.as_mut(), last) {
+                            c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                            g.last_show = Some((cands, raw, sel));
+                        }
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
         0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
