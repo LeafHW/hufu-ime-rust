@@ -235,10 +235,68 @@ impl Dict {
     /// rank 排序）。位次 >1 的字实际整句打法需追加名次锁键
     /// （';'=2、'\''=3、'4'..'9'=序位、'0'=10），见 engine RankLocks。
     pub fn best_code_and_rank(&self, text: &str, min_len: usize) -> Option<(String, usize)> {
+        self.best_code_and_rank_impl(text, |len| len >= min_len)
+    }
+
+    /// 精确码长版：一简字 2 码全码取位用。
+    pub fn best_code_and_rank_exact(&self, text: &str, exact_len: usize) -> Option<(String, usize)> {
+        self.best_code_and_rank_impl(text, |len| len == exact_len)
+    }
+
+    /// 【整句虎规则 v2 2026-09-05】最短首选码：该字全部码按码长升序，
+    /// 取第一个「该字为首选（rank==1）」的码——简码是首选就打简码
+    /// （似=jvj 不打 jvjr；抑=ubz 不打 ubzj；揭=uon 不打 uonf）。
+    /// 一个首选码都没有的字（如 势：uk 第 2 位且无其他码）返回最长码
+    /// +真实 rank（调用方配选重锁）。一简字（有 1 码首选位）由调用方
+    /// 强制走 2 码全码。
+    pub fn shortest_first_choice(&self, text: &str) -> Option<(String, usize)> {
+        let codes = self.text_to_codes.get(text)?;
+        let mut sorted: Vec<&String> = codes.iter().collect();
+        sorted.sort_by_key(|c| c.len());
+        let usable: Vec<&String> = sorted.into_iter().filter(|c| c.len() >= 2).collect();
+        if usable.is_empty() {
+            return None;
+        }
+        for code in usable.iter() {
+            if let Some(rank) = self.rank_of(code, text) {
+                if rank == 1 {
+                    return Some(((*code).clone(), 1));
+                }
+            }
+        }
+        let full = *usable.last()?;
+        self.rank_of(full, text).map(|r| ((*full).clone(), r))
+    }
+
+    /// 该字在指定码位下的位次（1 起）。字不在该码的字列返回 None。
+    fn rank_of(&self, code: &str, text: &str) -> Option<usize> {
+        let v = self.by_code.get(code)?;
+        v.iter()
+            .position(|&idx| self.entries[idx as usize].text == text)
+            .map(|p| p + 1)
+    }
+
+    /// 【整句虎规则】该字是否有 1 码首选位（=26 一简字判定）。
+    pub fn has_one_code_first(&self, text: &str) -> bool {
+        let codes = match self.text_to_codes.get(text) {
+            Some(c) => c,
+            None => return false,
+        };
+        codes
+            .iter()
+            .filter(|c| c.len() == 1)
+            .any(|c| self.rank_of(c, text) == Some(1))
+    }
+
+    fn best_code_and_rank_impl(
+        &self,
+        text: &str,
+        len_pred: impl Fn(usize) -> bool,
+    ) -> Option<(String, usize)> {
         self.text_to_codes.get(text).and_then(|codes| {
             codes
                 .iter()
-                .filter(|c| c.len() >= min_len)
+                .filter(|c| len_pred(c.len()))
                 .filter_map(|c| self.by_code.get(c).map(|v| (c, v)))
                 .max_by(|(c1, v1), (c2, v2)| {
                     let e1 = &self.entries[*v1.first().unwrap_or(&0) as usize];
