@@ -861,8 +861,9 @@ impl Engine {
         }
 
         // —— 有编码态 ——
-        // 「;;」→；直接上屏（; 引导标点）
-        if c == ';' && session.raw == ";" && self.config.input.semicolon_guide {
+        // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
+        // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
+        if c == ';' && !shift && session.raw == ";" && self.config.input.semicolon_guide {
             session.clear();
             return KeyOutcome::commit("；".to_string(), self.state(session));
         }
@@ -875,6 +876,27 @@ impl Engine {
         {
             session.clear();
             return self.on_char(session, c, shift);
+        }
+        // 【Shift 标点 2026-09-06】有编码态同空态（a18f89c 的空态修复漏了
+        // 这条路径）：TSF 传基础键+shift=true，Shift+标点/数字先转 US 键盘
+        // shift 形态再走标点映射——打 d 出候选「中」后 Shift+, 应上屏
+        // 「中《」而非「中，」。置于选重/翻页/数字选重之前：Shift+1 是
+        // 「！」不是数字选重、Shift+; 不是二选键。语义同编码态标点顶字
+        //（提交首选后输出标点）。
+        if shift {
+            if let Some(sf) = shift_form(c) {
+                if let Some((text, back)) = self.punct_output(session, sf) {
+                    let first = session
+                        .candidates
+                        .first()
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default();
+                    session.clear();
+                    let mut o = KeyOutcome::commit(format!("{first}{text}"), self.state(session));
+                    o.back = back;
+                    return o;
+                }
+            }
         }
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
         // 选重键（不构成编码延续时才作为选重）
@@ -2853,6 +2875,53 @@ mod tests {
         let mut s4 = Session::new(true);
         let o = eng.process_key(&mut s4, key('a'));
         assert_eq!(o.sound, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【Shift 标点 2026-09-06】有编码态 Shift+标点/数字转 US 键盘 shift
+    /// 形态顶字：a 出候选「啊」后 Shift+, → 「啊《」（此前误出「啊，」
+    /// ——a18f89c 只修了空态，漏了有编码态标点顶字路径）。Shift+1 →
+    /// 「啊！」不再当数字选重；Shift+. → 「啊」+「」」。; 引导态
+    /// Shift+; → 清缓冲空态输出「：」。
+    #[test]
+    fn shift_punct_with_composition() {
+        let (mut eng, dir) = test_engine("shiftpunct");
+        // 有编码态：a → 候选「啊」，Shift+, 顶字上屏「啊《」
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        assert!(!s.raw.is_empty(), "先组成编码态");
+        let o = eng.on_char(&mut s, ',', true);
+        assert_eq!(o.commit.as_deref(), Some("啊《"), "Shift+, 必须出《: {:?}", o.commit);
+        assert!(s.raw.is_empty(), "顶字后缓冲清空");
+        // Shift+. → 「啊》」
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('a'));
+        let o = eng.on_char(&mut s2, '.', true);
+        assert_eq!(o.commit.as_deref(), Some("啊》"));
+        // Shift+1 → 「啊！」：不再当数字选重（否则会提交第 1 候选而不带标点）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('a'));
+        let o = eng.on_char(&mut s3, '1', true);
+        assert_eq!(o.commit.as_deref(), Some("啊！"), "Shift+1 必须出！: {:?}", o.commit);
+        // Shift+/ → 「啊？」（顿号分支不得先吃 shift 变体）
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('a'));
+        let o = eng.on_char(&mut s4, '/', true);
+        assert_eq!(o.commit.as_deref(), Some("啊？"));
+        // 空态回归（a18f89c 行为不变）：Shift+, → 《
+        let mut s5 = Session::new(true);
+        let o = eng.on_char(&mut s5, ',', true);
+        assert_eq!(o.commit.as_deref(), Some("《"));
+        // ; 引导态：raw=";" 时 Shift+; → 清缓冲空态输出「：」（不走 ;; 分支）
+        let mut s6 = Session::new(true);
+        eng.process_key(&mut s6, key(';'));
+        let o = eng.on_char(&mut s6, ';', true);
+        assert_eq!(o.commit.as_deref(), Some("："), "Shift+; 在 ; 引导态应出：: {:?}", o.commit);
+        // 无 shift 的普通标点行为不变：a + , → 「啊，」
+        let mut s7 = Session::new(true);
+        eng.process_key(&mut s7, key('a'));
+        let o = eng.on_char(&mut s7, ',', false);
+        assert_eq!(o.commit.as_deref(), Some("啊，"), "无 shift 行为不变");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
