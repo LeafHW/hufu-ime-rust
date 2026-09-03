@@ -79,7 +79,31 @@ fn real_code_of(schema: &Schema, ch: char) -> String {
     let no_lock = *NO_LOCK.get_or_init(|| {
         std::env::var("HUFU_BENCH_NOLOCK").map(|v| v == "1").unwrap_or(false)
     });
-    match schema.dict.best_code_and_rank(&ch.to_string(), 2) {
+    // 【整句虎规则 2026-09-05】整句录入下一简字一律打 2 码全码（「中」
+    // 打 dg 不打 d，用户确认的录入规则）。此前实现取 rank 最优的 ≥2
+    // 码——被测试码表的 rank 重排带偏（新表把一简字最优排到 3-4 码，
+    // tbench 跟着打 3-4 码，+39% 键是口径偏移不是录入负担）。现固定
+    // 「存在 2 码则打 2 码，无 2 码才取更长的 rank 最优」。对照旧行为
+    // 设 HUFU_BENCH_RAW_RANK=1。
+    static RAW_RANK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let raw_rank = *RAW_RANK.get_or_init(|| {
+        std::env::var("HUFU_BENCH_RAW_RANK").map(|v| v == "1").unwrap_or(false)
+    });
+    let picked = if raw_rank {
+        // 对照口径：rank 最优的 ≥2 码
+        schema.dict.best_code_and_rank(&ch.to_string(), 2)
+    } else if schema.dict.has_one_code_first(&ch.to_string()) {
+        // 26 一简字：强制 2 码全码（「中」打 dg 不打 d）
+        schema
+            .dict
+            .best_code_and_rank_exact(&ch.to_string(), 2)
+            .or_else(|| schema.dict.shortest_first_choice(&ch.to_string()))
+    } else {
+        // 其余字：最短首选码优先（似=jvj、抑=ubz、揭=uon）；全无首选
+        // 码的字打全码+选重锁（势=uk;）
+        schema.dict.shortest_first_choice(&ch.to_string())
+    };
+    match picked {
         Some((code, rank)) => {
             if no_lock {
                 return code;
