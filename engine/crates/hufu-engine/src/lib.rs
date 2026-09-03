@@ -213,8 +213,17 @@ fn stable_history_raw_length(history: &[crate::session::EarlyHistory], text: &st
 }
 
 /// 为提案构建 前缀→orig消耗 映射（Rime raw_lengths_for_proposal）。
-fn build_raw_lengths(cands: &[&SentenceHit], full_raw: &str) -> Vec<(String, usize)> {
-    let parsed = parse_rank_locks(full_raw);
+fn build_raw_lengths(
+    cands: &[&SentenceHit],
+    full_raw: &str,
+    digit_coded: bool,
+    is_code_prefix: &dyn Fn(&str) -> bool,
+) -> Vec<(String, usize)> {
+    let parsed = if digit_coded {
+        parse_rank_locks_keep_digits(full_raw, is_code_prefix)
+    } else {
+        parse_rank_locks(full_raw)
+    };
     let base_len = parsed.base.chars().count();
     let full_len = full_raw.chars().count();
     let mut out: Vec<(String, usize)> = Vec::new();
@@ -303,6 +312,70 @@ pub fn parse_rank_locks(raw: &str) -> RankLocks {
     }
 }
 
+/// 【数字编码 2026-09-05】数字编码表的锁解析：raw 里的数字按「码表
+/// 延续」逐个判定——到该数字为止的前缀在码表有延续（如 a8、u3 的
+/// 8/3）则保留为编码字符；无延续（如 ve; 锁转成的内部数字 ve2）则
+/// 仍做「选重第 N」锁。分号/单引号词锁恒为锁。is_code_prefix 由
+/// 调用方传入（码表前缀查询）。
+pub fn parse_rank_locks_keep_digits(
+    raw: &str,
+    is_code_prefix: &dyn Fn(&str) -> bool,
+) -> RankLocks {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut base = String::new();
+    let mut locks = Vec::new();
+    let mut orig_of_base = Vec::new();
+    let mut in_run = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let rank = match c {
+            ';' => Some(2),
+            '\'' => Some(3),
+            '0'..='9' => {
+                // 数字：码表延续 → 编码字符（保留）；否则锁。
+                // base+c 是当前累计前缀（含更早保留的数字，如 r8 后再打数字）。
+                let probe = format!("{}{c}", base);
+                if is_code_prefix(&probe) {
+                    None
+                } else {
+                    Some(c.to_digit(10).unwrap() as usize).filter(|&r| r != 1)
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = rank {
+            if in_run {
+                locks.push((base.chars().count(), r));
+                while i + 1 < chars.len() && matches!(chars[i + 1], ';' | '\'' | '0'..='9') {
+                    // 连续后缀跳过前，先看下一个数字是否码表延续（是则停，
+                    // 后续数字可能是编码，如 ve2 锁后跟 8 属新段编码）
+                    let nc = chars[i + 1];
+                    if nc.is_ascii_digit() {
+                        let probe = format!("{}{nc}", base);
+                        if is_code_prefix(&probe) {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                in_run = false;
+                i += 1;
+                continue;
+            }
+        }
+        in_run = c.is_ascii_lowercase() || c.is_ascii_digit();
+        base.push(c);
+        orig_of_base.push(i);
+        i += 1;
+    }
+    RankLocks {
+        base,
+        locks,
+        orig_of_base,
+    }
+}
+
 /// 引擎：配置 + 当前方案 + 可选整句解码器。
 pub struct Engine {
     pub config: Config,
@@ -324,6 +397,26 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 【数字编码】按当前码表选择锁解析：数字编码表按码表延续逐位
+    /// 判定数字是编码还是选重锁；普通表数字一律选重锁。
+    pub fn parse_locks(&self, raw: &str) -> RankLocks {
+        if self.schema.dict.digit_coded {
+            let dict = &self.schema.dict;
+            // 整体或任意后缀是词条/前缀都算编码延续（跨段：vvb8 的
+            // b8=如）。锁数字（ve2：e2/2 均无）不命中。
+            let is_code = |p: &str| {
+                let cs: Vec<char> = p.chars().collect();
+                (1..=cs.len()).any(|j| {
+                    let s: String = cs[cs.len() - j..].iter().collect();
+                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
+                })
+            };
+            parse_rank_locks_keep_digits(raw, &is_code)
+        } else {
+            parse_rank_locks(raw)
+        }
+    }
+
     pub fn new(data_dir: &Path, config: Config) -> std::io::Result<Engine> {
         // 【性能插桩】词典装载分解（与 server 侧 startup-trace 配套）
         let t0 = std::time::Instant::now();
@@ -824,6 +917,28 @@ impl Engine {
         // 数字选重
         if let Some(n) = c.to_digit(10) {
             let _ = n;
+            // 【数字编码 2026-09-05】raw+数字构成码表延续（如 a8=来、
+            // u3=的）时数字是编码字符，不当选重——数字做第二码位的
+            // 码表体系。无延续（虎码类）保持数字选重不变。
+            // 【跨段延续】整句流里数字常与前一段尾字符组成词条
+            //（如 比|vv + 如|b8 连打：按到 8 时 raw=vvb，整体 vvb8
+            // 无词条，但后缀 b8=如 是词条）——数字对 raw 的任意
+            // 后缀构成词条/前缀即当编码字符，交给整句解码切分。
+            let digit_extends = extends || {
+                let raw = &session.raw;
+                (1..=raw.chars().count()).any(|k| {
+                    let start = raw.chars().count() - k;
+                    let suffix: String = raw.chars().skip(start).collect();
+                    let probe = format!("{}{c}", suffix);
+                    !self.schema.dict.lookup(&probe).is_empty()
+                        || !self.schema.dict.completions(&probe, 1).is_empty()
+                })
+            };
+            if digit_extends {
+                session.raw.push(c);
+                self.after_append(session);
+                return self.take_or_state(session);
+            }
             return self.on_rank_key(session, c);
         }
         // 空格首选
@@ -960,7 +1075,7 @@ impl Engine {
 
     /// raw 是否带选重锁。
     fn parsed_has_locks(&self, session: &Session) -> bool {
-        parse_rank_locks(&session.raw).has_locks()
+        self.parse_locks(&session.raw).has_locks()
     }
 
     /// 选重键分流（;/'/数字）。
@@ -993,7 +1108,7 @@ impl Engine {
                     }
                 }
             };
-            let base_now = parse_rank_locks(&session.raw).base;
+            let base_now = self.parse_locks(&session.raw).base;
             let chunk: Option<String> = (1..=4usize).rev().find_map(|len| {
                 if base_now.chars().count() < len {
                     return None;
@@ -1171,7 +1286,17 @@ impl Engine {
         if !extends {
             session.early_history.clear();
         }
-        let raw_lengths = build_raw_lengths(&cands, &full);
+        let raw_lengths = {
+            let dict = &self.schema.dict;
+            let is_code = |p: &str| {
+                let cs: Vec<char> = p.chars().collect();
+                (1..=cs.len()).any(|j| {
+                    let s: String = cs[cs.len() - j..].iter().collect();
+                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
+                })
+            };
+            build_raw_lengths(&cands, &full, dict.digit_coded, &is_code)
+        };
         session.early_history.push(EarlyHistory {
             proposal: proposal.clone(),
             full_raw: full.clone(),
@@ -1729,7 +1854,7 @@ impl Engine {
         //（含一简尾段）、pvlc 时刻的「踹」——进行态一律退出候选框；
         // 要上屏走顶功/继续打完整码。2026-09-03「它存 wvn 提示它」的
         // 中间态并入已被此规则取代（3943a9b 踹修复同方向收口）。
-        let has_locks = parse_rank_locks(&session.raw).has_locks();
+        let has_locks = self.parse_locks(&session.raw).has_locks();
         let mut cands: Vec<Candidate> = Vec::new();
         // 【无锁短码候选=精确对应】（2026-09-05 用户规则）：live raw ≤
         // 最大码长且无锁=码表域——候选只留每段精确对应实打编码的完整
@@ -1805,7 +1930,7 @@ impl Engine {
             return;
         }
 
-        let parsed = parse_rank_locks(&session.raw);
+        let parsed = self.parse_locks(&session.raw);
         let raw_len = session.raw.chars().count();
         // 整句接管：超长、带选重锁（≤4 码 + 锁时也组句），或已有提前上屏前缀
         let sentence_mode = self.sentence_active()
@@ -2255,13 +2380,49 @@ mod tests {
         }
     }
 
+    /// 【数字编码锁消歧 2026-09-05】数字编码码表（a8=来、u3=的、
+    /// b8=如）下 raw 数字的编码/锁二义：与任意后缀组成词条 → 编码
+    /// 字符（跨段：vvb8 的 b8）；无词条 → 选重锁（ve; 转的内部
+    /// 数字 ve2）。固化该行为。
+    #[test]
+    fn digit_code_locks_disambiguation() {
+        let codes = ["b8", "a8", "u3", "r8", "vv", "vvb", "vvbn", "qpu", "ldl"];
+        // 与 Engine::parse_locks 同款后缀枚举闭包
+        let is_code = |p: &str| {
+            let cs: Vec<char> = p.chars().collect();
+            (1..=cs.len()).any(|j| {
+                let s: String = cs[cs.len() - j..].iter().collect();
+                codes.contains(&s.as_str())
+            })
+        };
+        // 跨段：vvb8 的 8 与后缀 b 组成 b8（如）→ 保留编码
+        let r = parse_rank_locks_keep_digits("vvb8", &is_code);
+        assert_eq!(r.base, "vvb8");
+        assert!(r.locks.is_empty(), "vvb8 的 8 是编码（b8=如），不应成锁");
+        // 锁数字：ve2（ve; 的内部表达）——e2/2 均非词条 → rank 2 锁
+        let r2 = parse_rank_locks_keep_digits("ve2", &is_code);
+        assert_eq!(r2.base, "ve");
+        assert_eq!(r2.locks, vec![(2, 2)], "ve2 的 2 应为选重锁");
+        // 整句流：zlr8（错了）的 r8=了 是词条 → 保留
+        let r3 = parse_rank_locks_keep_digits("zlr8", &is_code);
+        assert_eq!(r3.base, "zlr8");
+        assert!(r3.locks.is_empty());
+        // 词锁分号恒锁（数字编码表下不变）
+        let r4 = parse_rank_locks_keep_digits("qpu;", &is_code);
+        assert_eq!(r4.base, "qpu");
+        assert_eq!(r4.locks, vec![(3, 2)]);
+        // 普通表行为不变：jd2 数字一律锁
+        let r5 = parse_rank_locks("jd2");
+        assert_eq!(r5.base, "jd");
+        assert_eq!(r5.locks, vec![(2, 2)]);
+    }
+
     #[test]
     fn rank_locks_parse() {
         // 无锁：base 原样
         let p = parse_rank_locks("jdtuja");
         assert_eq!(p.base, "jdtuja");
-        assert!(p.locks.is_empty());
-        assert_eq!(p.orig_of_base.len(), 6);
+        assert!(p.locks.is_empty());        assert_eq!(p.orig_of_base.len(), 6);
 
         // 尾锁：jd + 2（锁在 base 终点 2，段起点由解码器决定）
         let p = parse_rank_locks("jd2");
