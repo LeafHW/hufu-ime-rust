@@ -51,6 +51,7 @@ fn main() {
         supplement_baseline: 9.0,
         supplement_scale: 2.0,
         supplement_maximum: 16.0,
+        digit_codes: false,
     };
     let dict = schema.dict.clone();
     let eng = hufu_sentence::SentenceEngine::load(&ngram, dict, &schema.supplement, weights)
