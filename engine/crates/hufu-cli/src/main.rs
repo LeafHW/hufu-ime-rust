@@ -52,6 +52,18 @@ fn main() {
             args.get(4).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
             args.get(5).cloned(),
         ),
+        // 【真机重排对比 2026-09-05】逐句输出 v2 口径（整句虎规则）码串：
+        // probe 真机 HTTP 逐键模拟用，保证和 tbench 同打法。
+        "codes" => {
+            let dir = args.get(2).expect("用法: codes <方案目录> <语料>");
+            let corpus = args.get(3).expect("用法: codes <方案目录> <语料>");
+            let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+            let text = std::fs::read_to_string(corpus).expect("语料读取失败");
+            for s in text.lines().filter(|l| !l.trim().is_empty()) {
+                let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
+                println!("{raw}");
+            }
+        }
         _ => {
             println!("hufu-cli 命令：");
             println!("  check   <方案目录>   加载方案并输出统计与样例候选");
@@ -140,7 +152,7 @@ fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
         &ngram_path,
         schema.dict.clone(),
         &schema.supplement,
-        cfg.sentence.weights.clone(),
+        { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -238,7 +250,7 @@ fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
         Path::new(ngram),
         schema.dict.clone(),
         &schema.supplement,
-        cfg.sentence.weights.clone(),
+        { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
     )
     .expect("ngram 装载失败");
     for raw in raws {
@@ -278,7 +290,7 @@ fn cmd_cands(dir: &str, ngram: &str, raws: &[String]) {
             Path::new(ngram),
             schema.dict.clone(),
             &schema.supplement,
-            cfg.sentence.weights.clone(),
+            { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
         )
         .expect("ngram 装载失败");
         engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
@@ -388,7 +400,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             Path::new(ngram),
             schema.dict.clone(),
             &schema.supplement,
-            cfg.sentence.weights.clone(),
+            { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
         )
         .expect("ngram 装载失败");
         engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));

@@ -336,6 +336,11 @@ pub struct SentenceWeights {
     pub supplement_scale: f64,
     /// 补充语料奖励上限
     pub supplement_maximum: f64,
+    /// 【数字编码 2026-09-05】码表用数字做编码字符（a8=来、u3=的
+    /// 这类第二码位为数字的体系）时为 true：raw 里的数字保留为编码、
+    /// 不解析成「选重第 N」。由引擎按码表内容自动填充（有无数字码
+    /// 词条），非用户配置项。
+    pub digit_codes: bool,
 }
 
 impl Default for SentenceWeights {
@@ -353,6 +358,7 @@ impl Default for SentenceWeights {
             supplement_baseline: 9.0,
             supplement_scale: 2.0,
             supplement_maximum: 16.0,
+            digit_codes: false,
         }
     }
 }

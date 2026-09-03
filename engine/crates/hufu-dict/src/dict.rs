@@ -124,6 +124,10 @@ pub struct Dict {
     trie: Trie,
     /// 词 → 编码列表（反查注释 / 造词）
     pub text_to_codes: HashMap<String, Vec<String>>,
+    /// 【数字编码 2026-09-05】码表是否存在数字做编码字符的词条
+    /// （a8=来、u3=的）。true 时引擎把 raw 里的数字当编码而非
+    /// 「选重第 N」。rebuild 时扫描缓存。
+    pub digit_coded: bool,
 }
 
 impl Dict {
@@ -161,6 +165,7 @@ impl Dict {
         self.by_code.clear();
         self.trie = Trie::new();
         self.text_to_codes.clear();
+        self.digit_coded = false;
         let mut order: Vec<u32> = (0..self.entries.len() as u32).collect();
         order.sort_by(|&i, &j| crate::entry::rank_cmp(&self.entries[i as usize], &self.entries[j as usize]));
         for idx in order {
@@ -168,6 +173,11 @@ impl Dict {
                 let e = &self.entries[idx as usize];
                 (e.code.clone(), e.text.clone())
             };
+            // 【数字编码】码 → 编码字符含数字（a8/u3 类）→ 标记。
+            // 数字选重键（1-9/0）做编码位的码表体系。
+            if !self.digit_coded && code.chars().any(|c| c.is_ascii_digit()) {
+                self.digit_coded = true;
+            }
             self.by_code.entry(code.clone()).or_default().push(idx);
             self.trie.insert(&code, idx);
             let codes = self.text_to_codes.entry(text).or_default();

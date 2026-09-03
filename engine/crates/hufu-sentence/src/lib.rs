@@ -13,7 +13,9 @@ pub mod supplement_automaton;
 use hufu_config::SentenceWeights;
 use hufu_dict::dict::Dict;
 use hufu_dict::supplement::Supplement;
-use hufu_engine::{parse_rank_locks, SentenceDecoder, SentenceHit, SentenceDecode};
+use hufu_engine::{
+    parse_rank_locks, parse_rank_locks_keep_digits, SentenceDecoder, SentenceHit, SentenceDecode,
+};
 use hufu_types::{Candidate, CandidateKind};
 use model::{BOS, EOS, NgramModel};
 use std::collections::HashMap;
@@ -272,7 +274,23 @@ impl SentenceEngine {
         raw: &str,
         resume: Option<(Vec<Bucket>, usize)>,
     ) -> (SentenceDecode, Option<Vec<Bucket>>) {
-        let parsed = parse_rank_locks(raw);
+        // 【数字编码 2026-09-05】数字编码表（a8=来、u3=的）：数字按
+        // 码表延续判定——是编码字符则保留（整体或任意后缀是词条，跨
+        // 段如 vvb8 的 b8=如），无延续（选重锁转的内部数字）仍做锁；
+        // 普通表数字一律锁。
+        let parsed = if self.weights.digit_codes {
+            let dict = &self.dict;
+            let is_code = |p: &str| {
+                let cs: Vec<char> = p.chars().collect();
+                (1..=cs.len()).any(|j| {
+                    let s: String = cs[cs.len() - j..].iter().collect();
+                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
+                })
+            };
+            parse_rank_locks_keep_digits(raw, &is_code)
+        } else {
+            parse_rank_locks(raw)
+        };
         let base: Vec<char> = parsed.base.chars().collect();
         let n = base.len();
         let w = &self.weights;
@@ -667,7 +685,19 @@ impl SentenceEngine {
         // 增量解码：新 raw 为缓存前缀的追加（1-3 键），且 base 长度
         // 恰好增长（锁/选重后缀不增 base，走全量保证正确性）。
         // 复用前部 buckets，从 split=旧base长-尾窗 处重算。
-        let parsed_new = parse_rank_locks(raw);
+        let parsed_new = if self.weights.digit_codes {
+            let dict = &self.dict;
+            let is_code = |p: &str| {
+                let cs: Vec<char> = p.chars().collect();
+                (1..=cs.len()).any(|j| {
+                    let s: String = cs[cs.len() - j..].iter().collect();
+                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
+                })
+            };
+            parse_rank_locks_keep_digits(raw, &is_code)
+        } else {
+            parse_rank_locks(raw)
+        };
         let new_base_len = parsed_new.base.chars().count();
         let can = cache
             .prefix

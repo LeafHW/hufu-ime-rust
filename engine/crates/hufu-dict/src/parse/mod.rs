@@ -123,7 +123,16 @@ pub fn sniff_format(lines: &[String]) -> TableFormat {
                     TableFormat::Native
                 };
             } else if t.split_whitespace().count() >= 2 {
-                return TableFormat::SpaceCodeWords;
+                // 【词前格式空格行 2026-09-05】整文件用空格分隔的词前
+                // 格式（如「的 u3」「来 a8」）：首列是汉字 → 词在前码
+                // 在后（多多类变体，无 ---config@ 头）；首列拉丁 → 虎
+                // 整句「码 词1 词2」格式。
+                let first = t.split_whitespace().next().unwrap_or("");
+                return if contains_cjk(first) {
+                    TableFormat::WordFirstTsv
+                } else {
+                    TableFormat::SpaceCodeWords
+                };
             }
             data_checked = true;
         }

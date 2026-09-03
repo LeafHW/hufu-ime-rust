@@ -124,11 +124,15 @@ impl Host {
         if !(self.engine.config.sentence.enabled && path.exists()) {
             return None;
         }
+        let mut weights = self.engine.config.sentence.weights.clone();
+        // 【数字编码 2026-09-05】按码表内容自动标记：数字做编码字符
+        // （a8=来、u3=的）的表，整句解码时数字保留为编码不做选重锁。
+        weights.digit_codes = self.engine.schema.dict.digit_coded;
         Some((
             path,
             self.engine.schema.dict.clone(),
             self.engine.schema.supplement.clone(),
-            self.engine.config.sentence.weights.clone(),
+            weights,
         ))
     }
 
@@ -144,11 +148,14 @@ impl Host {
         }
         let path = self.data_dir.join(&self.engine.config.sentence.ngram_path);
         if self.engine.config.sentence.enabled && path.exists() {
+            let mut weights = self.engine.config.sentence.weights.clone();
+            // 【数字编码 2026-09-05】按码表内容自动标记（同 sentence_plan）
+            weights.digit_codes = self.engine.schema.dict.digit_coded;
             match SentenceEngine::load(
                 &path,
                 self.engine.schema.dict.clone(),
                 &self.engine.schema.supplement,
-                self.engine.config.sentence.weights.clone(),
+                weights,
             ) {
                 Ok(dec) => {
                     let dec = std::sync::Arc::new(dec);
@@ -416,6 +423,11 @@ impl Host {
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
         // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
         hufu_rerank::note_foreground();
+        // 【真机重排模拟 2026-09-05】HTTP /api/key 此前不派发也不应用
+        // 神经重排（pipe 路径两样都做）——probe 走 HTTP 测出的准率不含
+        // 重排，与真实输入链路不一致。补齐：先应用已到达的重排缓存，
+        // 派发在 process_key 之后（与 pipe 同序）。
+        self.engine.refresh_rerank(&mut self.session);
         let outcome = self.engine.process_key(&mut self.session, key);
         // 跨句文章尾巴：上屏文本滚动进 tail_context（截尾 32 字），
         // 供下一句句首的神经重排作真实语境（空 ctx 时 Qwen 会乱序）。
@@ -440,6 +452,8 @@ impl Host {
                 }
             }
         }
+        // 【真机重排模拟】process_key 后派发重排任务（与 pipe 路径同序）
+        self.after_ime_op();
         let state = self.engine.state(&self.session);
         serde_json::json!({ "outcome": outcome, "state": state })
     }
