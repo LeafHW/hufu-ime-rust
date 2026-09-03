@@ -513,6 +513,20 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         // 【2026-09-05】重载码表：改码表/补充语料后免重启即生效。
         let wrel: Vec<u16> = "重载码表".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 2, wrel.as_ptr());
+        // 打开当前方案码表目录（资源管理器）
+        let wdir: Vec<u16> = "打开方案文件夹".encode_utf16().chain([0]).collect();
+        AppendMenuW(m, MF_STRING, 3, wdir.as_ptr());
+        // 按键音效开关（勾选态=当前 enabled；音量滑条在设置窗「输入与候选」页）
+        let snd_on = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
+            .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let wsnd: Vec<u16> = "按键音效".encode_utf16().chain([0]).collect();
+        AppendMenuW(
+            m,
+            MF_STRING + if snd_on { MF_CHECKED } else { 0 },
+            4,
+            wsnd.as_ptr(),
+        );
         let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
         // 自建真弹出窗作 owner（调用线程持有 → 合法 owner）。
@@ -580,6 +594,12 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         } else if sel == 2 {
             // 重载码表（当前方案原样重载；server 侧清会话+重建整句）
             let _ = crate::ipc::call(&serde_json::json!({"op": "reload_schema"}));
+        } else if sel == 3 {
+            // 打开当前方案码表目录（server 侧 explorer）
+            let _ = crate::ipc::call(&serde_json::json!({"op": "open_schema_dir"}));
+        } else if sel == 4 {
+            // 按键音效开关：server 侧取反+落盘（热生效）
+            let _ = crate::ipc::call(&serde_json::json!({"op": "sound_toggle"}));
         } else if sel >= 100 {
             let idx = (sel - 100) as usize;
             if let Some(name) = schemas.get(idx) {

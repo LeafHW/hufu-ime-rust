@@ -21,13 +21,19 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 let schema_before = host.engine.config.schema.current.clone();
                 host.session.line_end_hint =
                     req.get("line_end").and_then(|v| v.as_bool()).unwrap_or(false);
-                let r = host.process_key(k);
+                let mut r = host.process_key(k);
                 // Ctrl+M 切方案：落盘 + 重装整句（与 HTTP /api/schema 行为一致）
                 if host.engine.config.schema.current != schema_before {
                     let _ = host.engine.config.save(&host.config_path);
                     host.setup_sentence();
                 }
                 host.after_ime_op(); // 神经重排派发（异步）
+                // 音效热生效：每键带上当前音量（DLL 端 wav 数据可缓存，
+                // 音量取响应值——设置页改音量无需重启/失效缓存）
+                if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
+                    r["outcome"]["sound_vol"] =
+                        serde_json::json!(host.engine.config.sound.volume);
+                }
                 r
             }
             None => serde_json::json!({"error": "按键描述无效"}),
@@ -188,6 +194,29 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 host.setup_sentence();
             }
             serde_json::json!({"ok": ok, "current": name})
+        }
+        // 语言栏右键「打开方案文件夹」：explorer 打开当前方案码表目录
+        "open_schema_dir" => {
+            let name = host.engine.config.schema.current.clone();
+            let dir = host
+                .data_dir
+                .join(&host.engine.config.schema.dir)
+                .join(&name);
+            if dir.is_dir() {
+                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+            }
+            serde_json::json!({"ok": dir.is_dir(), "path": dir})
+        }
+        // 语言栏菜单音效开关：读态 / 切换（落盘，热生效）
+        "sound_state" => serde_json::json!({
+            "enabled": host.engine.config.sound.enabled,
+            "volume": host.engine.config.sound.volume,
+        }),
+        "sound_toggle" => {
+            host.engine.config.sound.enabled = !host.engine.config.sound.enabled;
+            let enabled = host.engine.config.sound.enabled;
+            let _ = host.engine.config.save(&host.config_path);
+            serde_json::json!({"enabled": enabled})
         }
         // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
         // cloaked、UIElement 被宿主拒绝 → server 代画【用户皮肤】）
