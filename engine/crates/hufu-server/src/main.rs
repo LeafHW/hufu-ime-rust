@@ -285,6 +285,33 @@ fn main() {
     }
 }
 
+/// 【格式统一 2026-09-06】清 用户调整.txt 中同码同词旧行（四种标记
+/// 行+旧 TSV 词行一起清——写入端只留最新操作，文件不膨胀且回放
+/// 语义与追加日志等价）。
+fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                let body = ["{置顶}", "{添加}", "{删除}", "{加权}"]
+                    .iter()
+                    .find_map(|m| t.strip_prefix(m))
+                    .unwrap_or(t);
+                let mut it = body.split('\t');
+                let c = it.next().unwrap_or("").trim();
+                let w = it.next().unwrap_or("").trim();
+                !(c == code && w == text)
+            })
+            .collect();
+        let mut s = kept.join("\n");
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        let _ = std::fs::write(path, s.as_bytes());
+    }
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
@@ -488,28 +515,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !(0..=99).contains(&pos) {
                 return Response::err(400, "选重位须在 1-99");
             }
-            let file = host.engine.schema.dir.join("用户词.txt");
-            // 查重：同码同词旧行先删（覆盖旧 pos 标记）
-            if file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&file) {
-                    let kept: String = content
-                        .lines()
-                        .filter(|l| {
-                            let mut it = l.split('\t');
-                            let c = it.next().unwrap_or("").trim();
-                            let t = it.next().unwrap_or("").trim();
-                            !(t == text && c == code)
-                        })
-                        .map(|l| format!("{l}\n"))
-                        .collect();
-                    let _ = std::fs::write(&file, kept.as_bytes());
-                }
-            }
-            // pos 版行带 stem 标记 pN（Schema::candidates 按位插入）
+            // 【格式统一 2026-09-06】统一 用户调整.txt：{添加}码\t词[\tpN]。
+            // 同码同词旧行全清（含 {删除}——加词=明确想要它，修复加词
+            // 被旧删除行屏蔽的问题）后追加。
+            let file = host.engine.schema.dir.join("用户调整.txt");
+            rewrite_keep_lines(&file, code, text);
             let line = if pos >= 1 {
-                format!("{code}\t{text}\t1\tp{pos}\n")
+                format!("{{添加}}{code}\t{text}\tp{pos}\n")
             } else {
-                format!("{code}\t{text}\n")
+                format!("{{添加}}{code}\t{text}\n")
             };
             use std::io::Write;
             let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
@@ -524,8 +538,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/user_word/weight") => {
             // 【/jq 加权 2026-09-06】词+权重（缺省 1000）→ 反查最优码
-            // → 写 用户词.txt 词行 weight 列（去重同码同词旧行）→ 重载。
-            // 用户词在 candidates 置顶组——加权词提到候选前部。
+            // → 写 用户调整.txt：{加权}码\t词\t权重（同码同词旧行全清，
+            // 含 {删除}——加权=明确想要它）→ 重载。
             let v = req.json();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
             let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
@@ -538,23 +552,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let Some(code) = host.engine.schema.best_code_of(&text) else {
                 return Response::err(404, "码表中找不到该词的编码");
             };
-            let file = host.engine.schema.dir.join("用户词.txt");
-            if file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&file) {
-                    let kept: String = content
-                        .lines()
-                        .filter(|l| {
-                            let mut it = l.split('\t');
-                            let c = it.next().unwrap_or("").trim();
-                            let t = it.next().unwrap_or("").trim();
-                            !(t == text && c == code)
-                        })
-                        .map(|l| format!("{l}\n"))
-                        .collect();
-                    let _ = std::fs::write(&file, kept.as_bytes());
-                }
-            }
-            let line = format!("{code}\t{text}\t{weight}\n");
+            let file = host.engine.schema.dir.join("用户调整.txt");
+            rewrite_keep_lines(&file, &code, &text);
+            let line = format!("{{加权}}{code}\t{text}\t{weight}\n");
             use std::io::Write;
             let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
                 Ok(f) => f,
@@ -571,25 +571,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let file = host.engine.schema.dir.join("用户词.txt");
+            // 硬删用户词条：清同码同词全部行（词行+调整行）
+            let file = host.engine.schema.dir.join("用户调整.txt");
             if file.exists() {
-                let content = match std::fs::read_to_string(&file) {
-                    Ok(c) => c,
-                    Err(e) => return Response::err(500, &format!("读取失败: {e}")),
-                };
-                let kept: String = content
-                    .lines()
-                    .filter(|l| {
-                        let mut it = l.split('\t');
-                        let c = it.next().unwrap_or("").trim();
-                        let t = it.next().unwrap_or("").trim();
-                        !(t == text && c == code)
-                    })
-                    .map(|l| format!("{l}\n"))
-                    .collect();
-                if let Err(e) = std::fs::write(&file, kept.as_bytes()) {
-                    return Response::err(500, &format!("写入失败: {e}"));
-                }
+                rewrite_keep_lines(&file, &code, &text);
                 host.engine.reload_user_data();
             }
             Response::json(&serde_json::json!({"ok": true}))

@@ -592,22 +592,36 @@ impl Engine {
         Ok(())
     }
 
-    /// 重新加载用户数据（用户词+调整，统一在 用户词.txt），码表主体不重载。
-    /// 旧 用户调整.txt 只读兼容（虎爪导出包/历史数据）。
+    /// 重新加载用户数据（【格式统一 2026-09-06】统一在 用户调整.txt：
+    /// {置顶}/{添加}/{删除}/{加权} 标记格式；词行由 {添加} 分拣产生），
+    /// 码表主体不重载。旧 用户词.txt 只读兼容（历史数据）。
     pub fn reload_user_data(&mut self) {
         let dir = self.schema.dir.clone();
-        let uw = dir.join("用户词.txt");
+        let mut dict_all: Vec<String> = Vec::new();
         let mut replay: Vec<String> = Vec::new();
-        if let Ok(l) = hufu_dict::parse::read_lines(&uw) {
-            let (dict_lines, adj_lines) = hufu_dict::user::UserAdjust::split_adjust_lines(&l);
-            self.schema.user_dict = hufu_dict::user::UserDict::parse(&dict_lines);
+        // 旧 用户词.txt（历史）：词行并入，调整行先回放
+        if let Ok(old) = hufu_dict::parse::read_lines(&dir.join("用户词.txt")) {
+            let (dict_lines, adj_lines) =
+                hufu_dict::user::UserAdjust::split_adjust_lines(&old);
+            dict_all.extend(dict_lines);
             replay.extend(adj_lines);
         }
-        if let Ok(old) = hufu_dict::parse::read_lines(&dir.join("用户调整.txt")) {
-            replay.splice(0..0, old);
+        // 新主文件 用户调整.txt：调整行最后回放（最新覆盖）
+        if let Ok(l) = hufu_dict::parse::read_lines(&dir.join("用户调整.txt")) {
+            let (dict_lines, adj_lines) = hufu_dict::user::UserAdjust::split_adjust_lines(&l);
+            dict_all.extend(dict_lines);
+            replay.extend(adj_lines);
         }
+        self.schema.user_dict = hufu_dict::user::UserDict::parse(&dict_all);
         // 无条件覆盖：文件里调整行清空时内存态也要归零
         self.schema.adjust = hufu_dict::user::UserAdjust::parse(&replay);
+        // {加权} 回放出的权重填入 user_dict.weights（merge_into 消费）
+        for ((c, w), v) in self.schema.adjust.weights.iter() {
+            self.schema
+                .user_dict
+                .weights
+                .insert((c.clone(), w.clone()), *v);
+        }
         // 【用户词注入整句 2026-09-06】加词后整句词图同步热更
         self.sync_sentence_user_words();
     }
@@ -1954,11 +1968,34 @@ impl Engine {
         self.append_adjust_log("{删除}", code, word);
     }
 
-    /// 追加调整行到 用户词.txt（【文件整合 2026-09-06】原 用户调整.txt
-    /// 已降为只读兼容；新写入统一进 用户词.txt，与 /jc 词行同文件混载）。
+    /// 落调整行到 用户调整.txt（【格式统一 2026-09-06】主文件统一
+    /// `{标记}码\t词` 格式；同码同词旧行先清——文件始终只留最新操作，
+    /// 回放语义与追加日志等价且格式不膨胀）。
     fn append_adjust_log(&self, op: &str, code: &str, word: &str) {
         use std::io::Write;
-        let path = self.schema.dir.join("用户词.txt");
+        let path = self.schema.dir.join("用户调整.txt");
+        // 清同词旧行（四种标记+旧 TSV 词行格式一起清——最新操作赢）
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let kept: Vec<&str> = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    let body = ["{置顶}", "{添加}", "{删除}", "{加权}"]
+                        .iter()
+                        .find_map(|m| t.strip_prefix(m))
+                        .unwrap_or(t);
+                    let mut it = body.split('\t');
+                    let c = it.next().unwrap_or("").trim();
+                    let w = it.next().unwrap_or("").trim();
+                    !(c == code && w == word)
+                })
+                .collect();
+            let mut s = kept.join("\n");
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            let _ = std::fs::write(&path, s.as_bytes());
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{op}{code}\t{word}");
         }
@@ -3393,21 +3430,22 @@ mod tests {
         );
         let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
         assert_eq!(texts2, vec!["新", "到的", "加"], "Ctrl+Shift+2 删词：码表词就 隐藏");
-        // 持久化验证：【文件整合 2026-09-06】调整行统一落 用户词.txt
-        // （与 /jc 词行同文件混载），旧 用户调整.txt 不再写入
-        let log = std::fs::read_to_string(dir.join("用户词.txt")).unwrap();
-        assert!(log.contains("jd\t新\t1\tp3"), "词行保留: {log}");
+        // 持久化验证：【格式统一 2026-09-06】调整行落 用户调整.txt
+        //（统一 {标记} 格式）；词行（旧 用户词.txt）保留不动
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
         assert!(log.contains("{置顶}jd\t新"), "置顶日志: {log}");
         assert!(log.contains("{删除}jd\t就"), "删除日志: {log}");
+        let old = std::fs::read_to_string(dir.join("用户词.txt")).unwrap();
+        assert!(old.contains("jd\t新\t1\tp3"), "词行保留: {old}");
         // 码表原文不受影响（reload 后仍恢复可见）
         let restored = eng.schema.dict.lookup("jd");
         let rt: Vec<&str> = restored.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(rt, ["就", "到的", "加"], "原始码表不受污染");
     }
 
-    // 【文件整合 2026-09-06】用户词.txt 混载 TSV 词行 + {置顶}/{删除}
-    // 调整行：重启（reload_user_data）后两类行各归其位，旧 用户调整.txt
-    // 存在时兼容读入且新文件操作覆盖旧。
+    // 【格式统一 2026-09-06】用户调整.txt（新主文件）= {标记} 统一格式；
+    // 旧 用户词.txt（TSV 词行+调整行）只读兼容：词行并入、调整行先
+    // 回放（新主文件操作在后覆盖旧）。回放序翻转后 pins 最新在前。
     #[test]
     fn unified_user_file_reload() {
         let (mut eng, dir) = test_engine("unified");
@@ -3426,9 +3464,9 @@ mod tests {
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let texts: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
-        // 就(旧置顶) → 到的(新置顶，覆盖在前？回放序：旧文件→新文件，
-        // 到的 后 pin 更新在前) → 新(p3) → 加 被删
-        assert_eq!(texts, vec!["到的", "就", "新"], "混载回放: {texts:?}");
+        // 新主文件 {置顶}jd 就 = 最新操作 → pins 最前；旧文件 到的 次之；
+        // 新(p3) ；加 被旧文件删除
+        assert_eq!(texts, vec!["就", "到的", "新"], "混载回放: {texts:?}");
         assert_eq!(eng.schema.user_dict.entries.len(), 1, "TSV 词行入用户词库");
     }
 
@@ -3581,6 +3619,53 @@ mod tests {
         eng2.process_key(&mut s2, key('j'));
         let out = eng2.process_key(&mut s2, key('q'));
         assert_eq!(out.commit.unwrap(), "{加权}", "加权指令透传");
+    }
+
+    // 【格式统一 2026-09-06】用户调整.txt 统一 {标记} 格式：
+    // {添加} 取消同词旧 {删除}（加词=明确想要它——用户实测场景：
+    // 指了指 曾被删、再加词必须显示）；{加权} 权重回放进 user_dict。
+    #[test]
+    fn unified_format_add_overrides_remove() {
+        let (mut eng, dir) = test_engine("ufmt");
+        // 先删再加（文件序）：{删除} 在前 {添加} 在后 → 显示
+        std::fs::write(
+            dir.join("用户调整.txt"),
+            "{删除}jd\t就\n{添加}jd\t新\n{加权}jd\t到的\t3000\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.contains(&"新".to_string()),
+            "{{添加}} 覆盖旧 {{删除}}：{texts:?}"
+        );
+        assert!(!texts.contains(&"就".to_string()), "码表词就 被 {{删除}} 隐藏: {texts:?}");
+        assert!(
+            texts.contains(&"到的".to_string()),
+            "{{加权}} 词仍在候选: {texts:?}"
+        );
+        // 权重回放
+        let w = eng
+            .schema
+            .user_dict
+            .weights
+            .get(&("jd".to_string(), "到的".to_string()));
+        assert_eq!(*w.unwrap_or(&0.0), 3000.0, "{{加权}} 权重回放");
+        // 逆向序：{添加} 在前 {删除} 在后 → 删除赢（后操作覆盖）
+        std::fs::write(
+            dir.join("用户调整.txt"),
+            "{添加}jd\t新\n{删除}jd\t就\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let t2: Vec<String> = s2.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(!t2.contains(&"就".to_string()), "{{删除}} 后操作赢: {t2:?}");
     }
 
     // 【延迟重载 2026-09-06】调频后 pending；候选框消失（Escape）才 reload
@@ -3833,9 +3918,9 @@ mod tests {
         let st = eng.state(&s);
         assert_eq!(st.candidates[0].text, "到的", "Ctrl+2 置顶后『到的』应在首位");
 
-        // 日志落盘 + 回放等价（【文件整合 2026-09-06】落 用户词.txt）
+        // 日志落盘 + 回放等价（【格式统一 2026-09-06】落 用户调整.txt）
         let dir = eng.schema.dir.clone();
-        let log = std::fs::read_to_string(dir.join("用户词.txt")).unwrap();
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
         assert!(log.contains("{置顶}jd\t到的"), "{log}");
         let adj = hufu_dict::user::UserAdjust::parse(
             &log.lines().map(|l| l.to_string()).collect::<Vec<_>>(),

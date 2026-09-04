@@ -1,10 +1,10 @@
 //! 用户数据：用户调整（追加式日志）与用户词库。
 //!
-//! `用户调整.txt`：`{置顶}码\t词`、`{添加}码\t词`、`{删除}码\t词`，
-//! 追加式操作日志，回放得到当前调整态（与虎爪一致）。
-//!
-//! 用户词库（自造词 / Ctrl+= 加词）持久化为 HuFu 原生 TSV，
-//! 同时维护四态（added/hidden/weight/ordered），v1 以「置顶/添加/删除」三操作覆盖。
+//! 【格式统一 2026-09-06】主文件 `用户调整.txt`，所有行统一
+//! `{标记}码\t词` 格式：`{置顶}`（调频）、`{添加}`（/jc 加词，可选
+//! 第三列 pN 选重位）、`{加权}`（/jq，第三列权重）、`{删除}`（删词）。
+//! 追加式操作日志，回放得到当前调整态；写入端同词旧行先清后写，
+//! 文件始终最新。旧 `用户词.txt`（TSV 词行+{标记}行混载）只读兼容。
 
 use crate::dict::Dict;
 use crate::entry::DictEntry;
@@ -20,6 +20,8 @@ pub enum AdjustOp {
     Add,
     /// 删除：把词条从该码候选中隐藏
     Remove,
+    /// 加权：把 `码→词` 提到候选前部（用户词 weight 列）
+    Weight,
 }
 
 /// 回放后的调整状态。
@@ -29,6 +31,8 @@ pub struct UserAdjust {
     pins: Vec<(String, String)>,
     adds: Vec<(String, String)>,
     removes: HashSet<(String, String)>,
+    /// 加权：码→词 → 权重（{加权}行第三列；缺省 1000）
+    pub weights: HashMap<(String, String), f64>,
 }
 
 impl UserAdjust {
@@ -46,6 +50,8 @@ impl UserAdjust {
                 (AdjustOp::Add, r)
             } else if let Some(r) = t.strip_prefix("{删除}") {
                 (AdjustOp::Remove, r)
+            } else if let Some(r) = t.strip_prefix("{加权}") {
+                (AdjustOp::Weight, r)
             } else {
                 continue;
             };
@@ -69,10 +75,22 @@ impl UserAdjust {
                     adj.pins.push((code, word));
                 }
                 AdjustOp::Add => {
-                    adj.adds.push((code, word));
+                    adj.adds.push((code.clone(), word.clone()));
+                    // 添加隐含取消删除（明确想要它）
+                    adj.removes.remove(&(code, word));
                 }
                 AdjustOp::Remove => {
                     adj.removes.insert((code, word));
+                }
+                AdjustOp::Weight => {
+                    // 第三列=权重（{加权}code\t词\t3000；缺省 1000）
+                    let w = parts
+                        .get(2)
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .unwrap_or(1000.0);
+                    adj.weights.insert((code.clone(), word.clone()), w);
+                    // 加权隐含取消删除（明确想要它）
+                    adj.removes.remove(&(code, word));
                 }
             }
         }
@@ -123,16 +141,52 @@ impl UserAdjust {
         self.removes.contains(&(code.to_string(), word.to_string()))
     }
 
-    /// 【文件整合 2026-09-06】用户数据统一落 `用户词.txt`：TSV 词行与
-    /// `{置顶}/{添加}/{删除}` 调整行混载。本函数按行前缀分拣——
-    /// 返回 (词行, 调整行)。旧 `用户调整.txt` 降为只读兼容（虎爪导出
-    /// 包/历史数据），引擎不再写入。
+    /// 【格式统一 2026-09-06】用户数据统一落 `用户调整.txt`：
+    /// `{置顶}/{添加}/{删除}/{加权}` 四种标记行（码\t词 主体，可选
+    /// 第三列：{添加}=pN 选重位、{加权}=权重）。本函数按行前缀分拣
+    /// ——返回 (词行, 调整行)：{添加} 行语义=词行（转 TSV 喂
+    /// UserDict），其余进调整流。旧 `用户词.txt`（TSV 词行+{标记}行
+    /// 混载）只读兼容，同样分拣。
     pub fn split_adjust_lines(lines: &[String]) -> (Vec<String>, Vec<String>) {
-        let is_adj = |l: &str| {
-            let t = l.trim_start();
-            t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
-        };
-        lines.iter().cloned().partition(|l| !is_adj(l))
+        let mut word_lines = Vec::new();
+        let mut adj_lines = Vec::new();
+        for l in lines {
+            let t = l.trim_start().to_string();
+            if let Some(rest) = t.strip_prefix("{添加}") {
+                // {添加}code\t词[\tpN] → 词行 code\t词\t1[\tpN]；
+                // 原行同时保留在调整流（UserAdjust 回放：Add 在文件序上
+                // 取消同词 {删除}——加词=明确想要它，时序语义不能丢）
+                let parts: Vec<&str> = rest
+                    .split('\t')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.len() >= 2 {
+                    let stem = parts.get(2).filter(|s| s.starts_with('p')).map(|s| *s);
+                    let mut w = format!("{}\t{}\t1", parts[0], parts[1]);
+                    if let Some(st) = stem {
+                        w.push('\t');
+                        w.push_str(st);
+                    }
+                    word_lines.push(w);
+                    adj_lines.push(l.clone());
+                    continue;
+                }
+                // 格式坏行原样归调整流（不丢数据）
+                adj_lines.push(l.clone());
+            } else if t.starts_with("{置顶}")
+                || t.starts_with("{删除}")
+                || t.starts_with("{加权}")
+            {
+                adj_lines.push(l.clone());
+            } else if t.starts_with('#') || t.is_empty() {
+                // 头注释/空行跳过
+            } else {
+                // 旧 TSV 词行（码\t词\tweight[\tpN]）原样词行
+                word_lines.push(l.clone());
+            }
+        }
+        (word_lines, adj_lines)
     }
 
     /// 应用到字典候选列表：返回调整后的条目序列。
