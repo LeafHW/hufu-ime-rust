@@ -192,6 +192,25 @@ pub fn week_string() -> String {
     format!("星期{}", names[wd as usize])
 }
 
+/// 码表动态变量展开：`{日期}` `{日期.}` `{日期-}` `{日期/}` `{时分}`
+/// `{时分秒}` `{星期}` `{周}`。非时间标记（`{重复上屏}`/`{加词}`/
+/// `{隐藏候选}` 等功能词）返回 None，由提交收口另行处理。
+pub fn expand(tag: &str) -> Option<String> {
+    let (y, m, d, h, mi, s, wd) = now_civil();
+    let names = ["日", "一", "二", "三", "四", "五", "六"];
+    match tag {
+        "日期" => Some(format!("{y}年{m:02}月{d:02}日")),
+        "日期." => Some(format!("{y}.{m:02}.{d:02}")),
+        "日期-" => Some(format!("{y}-{m:02}-{d:02}")),
+        "日期/" => Some(format!("{y}/{m:02}/{d:02}")),
+        "时分" => Some(format!("{h:02}:{mi:02}")),
+        "时分秒" => Some(format!("{h:02}:{mi:02}:{s:02}")),
+        "星期" => Some(format!("星期{}", names[wd as usize])),
+        "周" => Some(format!("周{}", names[wd as usize])),
+        _ => None,
+    }
+}
+
 const DIGITS_LOWER: [char; 10] = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
 const DIGITS_UPPER: [char; 10] = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖'];
 const UNITS_LOWER: [&str; 4] = ["", "万", "亿", "兆"];
@@ -371,5 +390,21 @@ mod tests {
         assert_eq!(fmt_num(2.5), "2.5");
         assert_eq!(fmt_num(1.0 / 3.0), "0.3333333333");
         assert_eq!(fmt_num(-0.125), "-0.125");
+    }
+
+    #[test]
+    fn expand_variants() {
+        assert_eq!(expand("日期").unwrap().chars().count(), 11); // 2026年09月04日
+        assert!(expand("日期-").unwrap().matches('-').count() == 2);
+        assert!(expand("日期.").unwrap().matches('.').count() == 2);
+        assert!(expand("日期/").unwrap().matches('/').count() == 2);
+        assert_eq!(expand("时分").unwrap().len(), 5); // 17:30
+        assert_eq!(expand("时分秒").unwrap().len(), 8); // 17:30:45
+        assert!(expand("星期").unwrap().starts_with("星期"));
+        assert!(expand("周").unwrap().starts_with("周"));
+        // 功能词不展开（上层处理）
+        assert!(expand("重复上屏").is_none());
+        assert!(expand("加词").is_none());
+        assert!(expand("隐藏候选").is_none());
     }
 }

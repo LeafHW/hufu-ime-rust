@@ -912,6 +912,35 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::Commit(text) => {
+                // 【功能词拦截 2026-09-06】{加词}：不上屏，弹加词小窗
+                //（词+码 → server /api/user_word/add）；{隐藏候选}：不上
+                // 屏，只收起候选窗。两者都先把组段清空结束（preedit 里的
+                // /jc 之类不落文档）。
+                if text == "{加词}" || text == "{隐藏候选}" {
+                    if let Some(comp) = g.composition.clone() {
+                        if let Ok(range) = (unsafe { comp.GetRange() }) {
+                            let empty: Vec<u16> = Vec::new();
+                            let _ = unsafe { range.SetText(ec, 0, &empty) };
+                            let _ = unsafe { comp.EndComposition(ec) };
+                        }
+                    }
+                    g.composition = None;
+                    if text == "{加词}" {
+                        drop(g);
+                        crate::addword::open();
+                    } else {
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.hide();
+                        }
+                        if let Some(c) = g.cand3.as_mut() {
+                            c.hide();
+                        }
+                        if let Some(mut c) = g.cand.take() {
+                            c.hide();
+                        }
+                    }
+                    return Ok(());
+                }
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = text.encode_utf16().collect();
@@ -1447,6 +1476,22 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             shared.lock().unwrap().suppress_pending = false;
             return Ok(());
         }
+        // 【首帧锚点缺失抑制 2026-09-06】WPS 类宿主组段首帧 GetTextExt
+        // 未就绪（caret=None，布局异步）——此前 anchor 缺失时 show 退
+        // 「焦点窗口内左下」错位显示（用户实测：首键候选跳位，第二帧
+        // 才跳回光标处）。改为本帧不显示 + 35ms 精确补显 timer 重查
+        // 锚点后就位——首键慢一拍（35ms≈1 帧）但位置直接正确不跳。
+        // SearchHost 豁免：其 GetTextExt 常态失败，焦点窗定位候选是
+        // 刚需；用户固定（pinned）时无视锚点，不抑制。
+        let pinned_now = crate::candwin2::CAND_PINNED.lock().unwrap().is_some();
+        if g.caret.is_none() && !pinned_now && !host_is_searchhost() {
+            if let Some(c) = g.cand2.as_mut() {
+                c.hide();
+            }
+            g.suppress_pending = true;
+            arm_first_frame_timer();
+            return Ok(());
+        }
         match g.cand2.as_mut() {
             Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
             None => {}
@@ -1857,6 +1902,40 @@ fn poll_arm(shared: &SharedRef) {
     }
 }
 
+/// 前台窗口进程是否与本 DLL 宿主同应用族（同一安装目录）。
+/// WPS 多进程架构：编辑在 wpspdf.exe、前台窗属于 wps.exe——两者
+/// exe 同目录。同族不当「他进程」（poll 残留兜底不收窗）。
+fn fg_same_app_dir(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+                .is_ok();
+        let _ = CloseHandle(h);
+        if !ok {
+            return false;
+        }
+        let fg_dir = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))
+            .parent()
+            .map(|p| p.to_path_buf());
+        let my_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        match (fg_dir, my_dir) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 fn poll_tick() {
     // 重入保护（update_ui 过程中不会再泵本消息，双保险）
     if POLL_IN_TICK.swap(1, AtomicOrdering::Relaxed) != 0 {
@@ -1889,8 +1968,15 @@ fn poll_tick() {
             //（用户实测 Store 候选只闪一下）。SearchHost 例外：它
             // 的前台窗属于自己（打字时 pid==我，不触发）；开始菜单
             // 关闭后前台离开才需要兜底收残留——不能豁免。
+            // 【同应用族豁免 2026-09-06】WPS 多进程架构：编辑上下文
+            // 在 wpspdf.exe（本 DLL 宿主），前台窗口属于主进程
+            // wps.exe（pid≠我、非 UWP）——原判据把正在打字的 WPS
+            // 误判成「他进程」，40ms 轮询反复收窗：候选闪现一下就
+            // 消失（空格上字正常）。同应用族=前台进程 exe 与本进程
+            // exe 同目录（WPS 全家同目录），不当他进程收窗。
             if pid != std::process::id()
                 && !(host_is_packaged() && !host_is_searchhost())
+                && !fg_same_app_dir(pid)
             {
                 let mut g = shared.lock().unwrap();
                 let mut any_visible = false;

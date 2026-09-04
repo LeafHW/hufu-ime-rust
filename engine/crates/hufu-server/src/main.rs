@@ -453,15 +453,61 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .collect();
             Response::json(&serde_json::json!({"words": words}))
         }
+        ("GET", "/api/code_preview") => {
+            // /jc 加词窗「编码框」实时预览：该编码当前最终候选序
+            //（码表 + 调整回放 + 用户词含选重位——所见即所得），供
+            // 用户参考着填选重位。?code=xxx，限前 10。
+            let code = req
+                .query
+                .get("code")
+                .cloned()
+                .unwrap_or_default();
+            let texts: Vec<String> = host
+                .engine
+                .schema
+                .candidates(&code)
+                .iter()
+                .take(10)
+                .map(|e| e.text.clone())
+                .collect();
+            Response::json(&serde_json::json!({"texts": texts}))
+        }
         ("POST", "/api/user_word/add") => {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim();
+            // 选重位（/jc 第三框「第 N 选」）：≥1 时词固定第 N 候选
+            //（不足 N 个则排最后）；0/缺省=原置顶行为。
+            let pos = v.get("pos").and_then(|x| x.as_i64()).unwrap_or(0);
             if code.is_empty() || text.is_empty() {
                 return Response::err(400, "编码与词不能为空");
             }
+            if !(0..=99).contains(&pos) {
+                return Response::err(400, "选重位须在 1-99");
+            }
             let file = host.engine.schema.dir.join("用户词.txt");
-            let line = format!("{code}\t{text}\n");
+            // 查重：同码同词旧行先删（覆盖旧 pos 标记）
+            if file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    let kept: String = content
+                        .lines()
+                        .filter(|l| {
+                            let mut it = l.split('\t');
+                            let c = it.next().unwrap_or("").trim();
+                            let t = it.next().unwrap_or("").trim();
+                            !(t == text && c == code)
+                        })
+                        .map(|l| format!("{l}\n"))
+                        .collect();
+                    let _ = std::fs::write(&file, kept.as_bytes());
+                }
+            }
+            // pos 版行带 stem 标记 pN（Schema::candidates 按位插入）
+            let line = if pos >= 1 {
+                format!("{code}\t{text}\t1\tp{pos}\n")
+            } else {
+                format!("{code}\t{text}\n")
+            };
             use std::io::Write;
             let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
                 Ok(f) => f,

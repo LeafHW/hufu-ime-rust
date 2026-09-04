@@ -116,9 +116,14 @@ impl Schema {
                 } else {
                     // 其余 txt：可能是主码表（多多/QQ五笔/虎整句/多多用户词）
                     if stem.contains("用户词") {
+                        // 【2026-09-06】用户词不得进主码表候选：/jc 加词
+                        // 落盘 用户词.txt 后，文件大于真码表时 max_by_key
+                        // 会把它选成主表——整个输入法只剩几个用户词
+                        //（测试 user_word_placement 抓获）。只入用户词库。
                         duoduo_user = Some(path.clone());
+                    } else {
+                        big_tables.push(path.clone());
                     }
-                    big_tables.push(path.clone());
                 }
             }
         }
@@ -183,8 +188,28 @@ impl Schema {
         } else if let Some(main) = big_tables.iter().max_by_key(|p| {
             std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
         }) {
-            let table = parse_file(main)?;
+            // 【虎爪码表内嵌调整 2026-09-06】虎爪导出的码表把学习记录直接
+            // 嵌在码表里：`{置顶}码 词 [日期]`、`{添加}…`、`{删除}…`（第三
+            // 列常为日期，UserAdjust::parse 宽容忽略）。此前这些行被当普通
+            // 词条（码=「{添加}xx」非法编码，静默成死数据）。现在解析前抽
+            // 走：词典不含死行；抽出的行与方案目录 用户调整.txt 拼接回放
+            // ——内嵌在前、用户文件在后，用户自己的操作覆盖码表作者内嵌。
+            let lines = parse::read_lines(main)?;
+            let is_adjust = |l: &String| {
+                let t = l.trim_start();
+                t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
+            };
+            let embedded: Vec<String> = lines.iter().filter(|l| is_adjust(l)).cloned().collect();
+            let dict_lines: Vec<String> = lines.into_iter().filter(|l| !is_adjust(&l)).collect();
+            let table = parse::parse_auto(&dict_lines);
             schema.dict = std::sync::Arc::new(Dict::from_entries(name.clone(), table.rows));
+            if !embedded.is_empty() {
+                let mut replay = embedded;
+                if let Ok(ul) = parse::read_lines(&dir.join("用户调整.txt")) {
+                    replay.extend(ul);
+                }
+                schema.adjust = UserAdjust::parse(&replay);
+            }
         }
 
         // 多多用户码表并入用户词库
@@ -234,13 +259,30 @@ impl Schema {
     pub fn candidates(&self, code: &str) -> Vec<DictEntry> {
         let base: Vec<DictEntry> = self.dict.lookup(code).into_iter().cloned().collect();
         let out = self.adjust.apply(code, &base);
-        // 用户词插到置顶之后、系统词之前
+        // 用户词插到置顶之后、系统词之前；带选重位标记（stem="pN"，
+        // /jc 加词第三框指定「第 N 选」）的用户词按绝对位次插入最终
+        // 列表：N 超出现有候选数 → 排最后；否则插到第 N 位，原第 N
+        // 位及以后统一后移一位（2026-09-06 用户需求）。
         let mut user_entries: Vec<DictEntry> = Vec::new();
         self.user_dict.merge_into(code, &self.dict, &mut user_entries);
+        let mut pinned_users: Vec<DictEntry> = Vec::new();
+        let mut placed: Vec<(usize, DictEntry)> = Vec::new();
+        for ue in user_entries {
+            let pos = ue
+                .stem
+                .as_deref()
+                .and_then(|s| s.strip_prefix('p'))
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1);
+            match pos {
+                Some(n) => placed.push((n, ue)),
+                None => pinned_users.push(ue),
+            }
+        }
         let mut merged: Vec<DictEntry> = Vec::new();
         let pinned: Vec<DictEntry> = out.iter().filter(|e| e.pinned).cloned().collect();
         merged.extend(pinned);
-        for ue in user_entries {
+        for ue in pinned_users {
             if !merged.iter().any(|e| e.text == ue.text) {
                 merged.push(ue);
             }
@@ -252,6 +294,16 @@ impl Schema {
             if !merged.iter().any(|x| x.text == e.text) {
                 merged.push(e);
             }
+        }
+        // 选重位用户词：按位次从大到小插入（先大后小，位次小的
+        // 后插不受先插者下标位移影响）
+        placed.sort_by(|a, b| b.0.cmp(&a.0));
+        for (n, ue) in placed {
+            if merged.iter().any(|x| x.text == ue.text) {
+                continue;
+            }
+            let idx = (n - 1).min(merged.len());
+            merged.insert(idx, ue);
         }
         merged
     }
@@ -360,6 +412,74 @@ mod tests {
         s.adjust.pin("a", "那个");
         let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts, ["那个", "abc", "来"], "重 pin: {texts:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【虎爪码表内嵌调整】主码表里的 {置顶}/{添加}/{删除}（带日期列）
+    // 解析前抽走：不进词典（无死行）、候选生效；用户文件覆盖内嵌。
+    #[test]
+    fn embedded_adjust_in_main_dict() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-embed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 虎整句空格格式主表 + 内嵌三行（日期形态各异）
+        write(
+            &tmp,
+            "码表.txt",
+            "a 来 那个 氨\n{置顶}a 氨 2026-09-04\n{添加}a 哎呦 20260904\n{删除}a 那个 2026/09/05\n",
+        );
+        let s = Schema::load(&tmp).unwrap();
+        // 词典不含内嵌死行（1 行 ×3 真词；{} 码查不到任何东西）
+        assert_eq!(s.dict.len(), 3, "内嵌调整行不得进词典");
+        assert!(s.dict.lookup("{置顶}a").is_empty(), "不得残留花括号死码");
+        // 内嵌回放：氨置顶、那个删除、哎呦添加
+        let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, ["氨".to_string(), "来".to_string(), "哎呦".to_string()]);
+
+        // 用户文件覆盖内嵌：用户删掉内嵌置顶的「氨」
+        write(&tmp, "用户调整.txt", "{删除}a\t氨\n");
+        let s2 = Schema::load(&tmp).unwrap();
+        let texts2: Vec<String> = s2.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts2, ["来".to_string(), "哎呦".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【/jc 选重位】用户词带 stem="pN"（加词窗第三框「第 N 选」）按
+    // 绝对位次插入最终候选：N 超出候选数 → 排最后；否则插第 N 位、
+    // 原第 N 位起后移。
+    #[test]
+    fn user_word_placement() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(
+            &tmp,
+            "码表.txt",
+            "a 甲 乙 丙 丁 戊 己\n",
+        );
+        // 用户词：pos=3（插第 3 位）、pos=9（超出 → 最后）、无 pos（默认置顶）
+        write(
+            &tmp,
+            "用户词.txt",
+            "#hufu-dict v1 name=user_words\na\t酉\t1\tp3\na\t戌\t1\tp9\na\t子\n",
+        );
+        let s = Schema::load(&tmp).unwrap();
+        let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts,
+            [
+                "子".to_string(), // 无 pos：置顶（v1 行为）
+                "甲".to_string(),
+                "酉".to_string(), // 第 3 选
+                "乙".to_string(),
+                "丙".to_string(),
+                "丁".to_string(),
+                "戊".to_string(),
+                "己".to_string(),
+                "戌".to_string(), // pos=9 超出（8 个）→ 最后
+            ],
+            "选重位插入: {texts:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
