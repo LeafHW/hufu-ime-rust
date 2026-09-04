@@ -34,6 +34,24 @@ pub struct SentenceEngine {
     /// （增量解码：新 raw 为旧 raw 追加且 base 前缀一致时，复用
     /// 前部桶只重算尾部窗口）。
     cache: Mutex<EngineCache>,
+    /// 【用户词注入 2026-09-06】/jc 加的词参与整句词图（与码表段并列
+    /// 的独立 Seg，rank=1：长句只放行 rank1 段，用户词须以并列首选
+    /// 身份进入；排序仍由 ngram 主导）。RwLock 热更新：引擎 reload
+    /// 用户数据后 set_user_words 同步，无需重建 ngram。码表原序不动。
+    user_words: std::sync::RwLock<Vec<(String, String)>>,
+}
+
+impl SentenceEngine {
+    /// 热更新用户词表（code, text）。清空传空即可。
+    pub fn set_user_words(&self, words: Vec<(String, String)>) {
+        if let Ok(mut g) = self.user_words.write() {
+            *g = words;
+        }
+        // 解码缓存失效：last/prefix 桶是旧词图的结果，不含新词
+        if let Ok(mut c) = self.cache.lock() {
+            *c = EngineCache::default();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -215,6 +233,7 @@ impl SentenceEngine {
             supplement: automaton,
             weights,
             cache: Mutex::new(EngineCache::default()),
+            user_words: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -370,6 +389,63 @@ impl SentenceEngine {
                     .collect();
                 if !entries.is_empty() {
                     segs[pos].push(Seg { end, lock_rank, entries });
+                }
+            }
+            // 【用户词注入 2026-09-06】/jc 用户词独立 Seg（与码表段并列）：
+            // rank=1（长句 rank1 放行——用户词与码表首选并列首选，ngram
+            // 拍板排序）；exact=true（码=消耗键数）。一简禁令、锁边界与
+            // 码表段同规则。码表已有同码同词时跳过（去重）。
+            if let Ok(uw) = self.user_words.read() {
+                if !uw.is_empty() {
+                    let tail_s: String = base[pos..].iter().collect();
+                    for (code, text) in uw.iter() {
+                        let cl = code.chars().count();
+                        if cl == 0 || pos + cl > n || cl > 4 || cl > tail_s.chars().count() {
+                            continue;
+                        }
+                        if !tail_s.starts_with(code.as_str()) {
+                            continue;
+                        }
+                        let end = pos + cl;
+                        // 同位段去重（码表已含该词）
+                        let dup = segs[pos].iter().any(|s| {
+                            s.end == end && s.entries.iter().any(|(t, _, _)| t == text)
+                        });
+                        if dup {
+                            continue;
+                        }
+                        // 一简禁令：句中 1 码段须被锁钉住（码表段同款豁免）
+                        if cl == 1 && n > 4 && end < n {
+                            if !parsed.locks.iter().any(|(l, _)| *l as usize == end) {
+                                continue;
+                            }
+                        }
+                        // 段不得跨越锁终点
+                        if parsed
+                            .locks
+                            .iter()
+                            .any(|(l, _)| *l as usize > pos && (*l as usize) < end)
+                        {
+                            continue;
+                        }
+                        let lock_rank = parsed
+                            .locks
+                            .iter()
+                            .find(|(l, _)| *l as usize == end)
+                            .map(|(_, r)| *r);
+                        // 锁名次>1 时用户词（rank1）不匹配锁：跳过
+                        //（锁 r=1 放行——用户词即显示序第 1）
+                        if let Some(r) = lock_rank {
+                            if r != 1 {
+                                continue;
+                            }
+                        }
+                        segs[pos].push(Seg {
+                            end,
+                            lock_rank,
+                            entries: vec![(text.clone(), 0, true)],
+                        });
+                    }
                 }
             }
         }
@@ -806,5 +882,10 @@ impl SentenceDecoder for SentenceEngine {
                 c
             })
             .collect()
+    }
+
+    /// 【用户词注入 2026-09-06】/jc 加词参与整句词图（热更新+缓存失效）
+    fn set_user_words(&self, words: &[(String, String)]) {
+        SentenceEngine::set_user_words(self, words.to_vec());
     }
 }

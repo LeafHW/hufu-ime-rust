@@ -253,6 +253,20 @@ fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
         { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
     )
     .expect("ngram 装载失败");
+    // 【用户词注入 2026-09-06】对齐 server：用户词参与整句词图（调试用）
+    {
+        let mut seen = std::collections::HashSet::new();
+        let words: Vec<(String, String)> = schema
+            .user_dict
+            .entries
+            .iter()
+            .filter(|e| !e.code.is_empty() && !e.text.is_empty())
+            .filter(|e| seen.insert((e.code.clone(), e.text.clone())))
+            .map(|e| (e.code.clone(), e.text.clone()))
+            .collect();
+        eprintln!("注入用户词 {} 条", words.len());
+        hufu_engine::SentenceDecoder::set_user_words(&dec, &words);
+    }
     for raw in raws {
         println!("━━ raw = {raw}");
         let rich = hufu_engine::SentenceDecoder::decode_rich(&dec, raw);
