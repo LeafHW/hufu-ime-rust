@@ -667,14 +667,14 @@ impl HuFuTs_Impl {
         // 否则同一键会被引擎处理两次（Test + Down 各一次）。
         // （Shift 的 TestUp 触发与模式键直发已豁免：fallthrough 发 server。）
         if test_only && !mode_key && wparam != 0x10 {
-            let (chinese, composing) = {
+            let (chinese, composing, hint) = {
                 let g = self.shared.lock().unwrap();
-                (g.chinese, g.composing)
+                (g.chinese, g.composing, g.shift_down)
             };
-            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, false) else {
+            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
                 return BOOL(0);
             };
-            let _ = (shift, alt);
+            let _ = alt;
             // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
             // 由引擎定夺（未启用时引擎不吞，KeyDown 返回直通）。
             if ctrl && !shift && !alt && (name == "m" || name == "space") {
@@ -691,7 +691,13 @@ impl HuFuTs_Impl {
                     // （TestDown TRUE + KeyDown eat=0 的组合数字蒸发，keys-5008
                     // 实证：test/key vk=0x33 eat=0 三连但窗口无字）；组段中
                     // 数字保持吞（选重/锁键由引擎处理不受影响）。
-                    n if n.len() == 1 => !n.chars().all(|c| c.is_ascii_digit()),
+                    // 【Shift+数字=符号 2026-09-06】Shift 按着的数字是符号
+                    // （……！＠＃），必须预吞——信任 TestDown 的 32 位宿主
+                    // 否则自己上屏 ^ 之类的 US shift 形态（Shift+6 实测）。
+                    n if n.len() == 1 => {
+                        let plain_digit = n.chars().all(|c| c.is_ascii_digit());
+                        !plain_digit || shift
+                    }
                     // 空闲：编码字母/分号/引号会起段
                     "space" | "enter" | "escape" | "backspace" | "tab" => false,
                     _ => false,
