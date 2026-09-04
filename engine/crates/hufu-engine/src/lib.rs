@@ -1168,22 +1168,45 @@ impl Engine {
                 }
             };
             let base_now = self.parse_locks(&session.raw).base;
-            let chunk: Option<String> = (1..=4usize).rev().find_map(|len| {
-                if base_now.chars().count() < len {
-                    return None;
-                }
-                let cand: String = base_now
-                    .chars()
-                    .skip(base_now.chars().count() - len)
-                    .collect();
-                if cand.chars().all(|k| k.is_ascii_lowercase())
-                    && self.schema.candidates(&cand).len() >= disp_rank
-                {
-                    Some(cand)
-                } else {
-                    None
-                }
+            // 【目标块=解码切分尾段 2026-09-06】虎爪语义：数字/选重键锁
+            // 「正在输入的尾段」——cbae 按 3 给尾段 ae 选（不是 4 码全码
+            // cbae：旧「尾部最长有效码」在 4 码有词条时会选错段，换算与
+            // 解码切分脱节，cbae3 出「不乛」）。优先解码器对字母流的
+            // 切分尾段；解码器不可用/无切分时回退尾部最长有效码。
+            let base_len_now = base_now.chars().count();
+            let dec_chunk: Option<String> = self.sentence.as_ref().and_then(|d| {
+                let dec = d.decode_rich(&base_now);
+                dec.hits.first().and_then(|h| {
+                    h.word_ends
+                        .iter()
+                        .rev()
+                        .find(|(s, e)| *e == base_len_now && *e > *s)
+                        .map(|(s, _)| base_now.chars().skip(*s).collect::<String>())
+                })
             });
+            let chunk: Option<String> = dec_chunk
+                .filter(|c| {
+                    c.chars().all(|k| k.is_ascii_lowercase())
+                        && self.schema.candidates(c).len() >= disp_rank
+                })
+                .or_else(|| {
+                    (1..=4usize).rev().find_map(|len| {
+                        if base_now.chars().count() < len {
+                            return None;
+                        }
+                        let cand: String = base_now
+                            .chars()
+                            .skip(base_now.chars().count() - len)
+                            .collect();
+                        if cand.chars().all(|k| k.is_ascii_lowercase())
+                            && self.schema.candidates(&cand).len() >= disp_rank
+                        {
+                            Some(cand)
+                        } else {
+                            None
+                        }
+                    })
+                });
             // 锁只认码表位次。用户词（/jc 加的）不在码表原序里——换算
             // 不到锁位次时，不能把原键字符塞进 raw（ae+3 会变成死码
             // ae3，被解码器再当「码表第 3 名」锁，2026-09-06 用户实测
@@ -1198,11 +1221,12 @@ impl Engine {
                         .map(|p| p.text.clone())
                 });
             let suffix = chunk
+                .as_ref()
                 .and_then(|ch| {
                     let pk = picked.clone()?;
                     self.schema
                         .dict
-                        .lookup(&ch)
+                        .lookup(ch)
                         .into_iter()
                         .position(|e| e.text == pk)
                         .map(|i| i + 1)
@@ -1229,17 +1253,62 @@ impl Engine {
                 && parsed_now.locks.iter().any(|(l, _)| *l as usize == base_len)
                 && session.raw.chars().count() == base_len + 1;
             if suffix.is_none() {
-                if let Some(pk) = picked {
-                    if session.committed_raw.is_empty() && (!had_locks || tail_locked) {
-                        // 单段纯净态或尾锁改选：选中即上屏（用户词/置顶项
-                        // 无锁位次；2026-09-06 锁态改选用户词也直接上屏，
-                        // 不再把原键字符塞进 raw 成死码。中置锁流不适用
-                        // ——commit 会丢掉已锁的前段）
-                        session.clear();
-                        return KeyOutcome::commit(pk, self.state(session));
+                if let Some(pk) = picked.clone() {
+                    if !had_locks || tail_locked {
+                        // 多段判定：选重目标是尾部真子段（cbae 的 ae）而非
+                        // 整个字母流
+                        let chunk_len = chunk
+                            .as_ref()
+                            .map(|c| c.chars().count())
+                            .unwrap_or(0);
+                        let multi_seg =
+                            chunk_len > 0 && chunk_len < base_len_now;
+                        if session.committed_raw.is_empty() {
+                            if !multi_seg {
+                                // 单段纯净态：选中即上屏
+                                session.clear();
+                                return KeyOutcome::commit(pk, self.state(session));
+                            }
+                            // 【多段流前缀未上屏 2026-09-06】cbae3 = cb|ae，
+                            // 尾段选用户词「行」：前缀 cb 解码文本「不」+
+                            // 「行」组合上屏「不行」（虎爪候选序语义；旧
+                            // 实现塞 '3' 成死码锁出「不乛」）。
+                            if let Some(ck) = chunk.as_ref() {
+                                let prefix_raw: String = base_now
+                                    .chars()
+                                    .take(base_len_now - chunk_len)
+                                    .collect();
+                                let prefix_text: Option<String> = self
+                                    .schema
+                                    .candidates(&prefix_raw)
+                                    .first()
+                                    .map(|c| c.text.clone())
+                                    .or_else(|| {
+                                        self.sentence.as_ref().and_then(|d| {
+                                            let pd = d.decode_rich(&prefix_raw);
+                                            pd.hits.first().map(|h| h.text.clone())
+                                        })
+                                    });
+                                if let Some(pt) = prefix_text {
+                                    session.clear();
+                                    return KeyOutcome::commit(
+                                        format!("{}{}", pt, pk),
+                                        self.state(session),
+                                    );
+                                }
+                            }
+                        } else {
+                            // 前缀已提前上屏（early_commit）：commit 该词
+                            // 接在前缀后
+                            session.clear();
+                            return KeyOutcome::commit(pk, self.state(session));
+                        }
                     }
+                    // 有锁流（中置锁）+用户词：保守不处理（罕见场景）
                 }
             }
+            // 尾锁且选重仍是码表词：改锁重锁（下方 tail_locked 分支）；
+            // 尾锁+用户词已在上面 tail_locked 条件下 commit
             // 【锁态重锁 2026-09-06】尾锁时按数字 = 改锁（换名次不追加），
             // raw 恒 base+单锁——原实现连按 4567890 会堆出 ae3465678 死码
             // 串。中置锁（尾段新编码）走正常追加。suffix 算不出（picked
@@ -2964,6 +3033,81 @@ mod tests {
             s.raw, "do2fj2",
             "两段各自换算锁：前段 do2 保留（中置锁），尾段 fj2 追加"
         );
+    }
+
+    // 【流中选用户词 2026-09-06】cbae3 打「不行」：cb 经 early_commit
+    // 提前上屏「不」（committed_raw="cb"），流中 ae 按数字选用户词
+    // 「行」无码表位次——原 fallback 塞原键字符成死码锁（ae3 被当
+    // 码表第 3 出「乛」）。修复：commit 该词接前缀后，缓冲清空。
+    #[test]
+    fn user_word_select_in_stream() {
+        let (mut eng, dir) = test_engine("整句流中");
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        eng.config.sentence.enabled = true;
+        eng.config.sentence.auto_enable = true;
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        // 模拟 early_commit 后的流中态：前缀 cb 已上屏记录
+        let mut s = Session::new(true);
+        s.committed_raw = "cb".into();
+        s.committed_text = "不".into();
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // jd 显示 [就,到的,新(p3),加]，按 3 = 新（用户词）
+        let out = eng.process_key(&mut s, key('3'));
+        assert_eq!(
+            out.commit.unwrap(),
+            "新",
+            "流中选用户词直接上屏（接在已上屏前缀后），不死码锁"
+        );
+        assert!(s.raw.is_empty() && s.committed_raw.is_empty(), "缓冲清空");
+    }
+
+    // 【多段流尾段选用户词 2026-09-06】cbae3 = cb|ae 打「不行」：ae 尾段
+    // 按数字选用户词「行」（无码表位次）。旧实现 chunk 取「尾部最长有效
+    // 码」在 4 码有词条时锁错段、换算与解码切分脱节出「不乛」。修复：
+    // 目标块=解码器切分尾段；前缀未上屏时前缀解码文本+用户词组合上屏。
+    // 码表：do→员/只是，fj→骱/一个；用户词 fj 行 p2。
+    #[test]
+    fn user_word_select_multi_seg() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-整句多段-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句多段\ndo\t员\ndo\t只是\nfj\t骱\nfj\t一个\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\nfj\t行\t1\tp2\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        let mut s = Session::new(true);
+        for c in ['d', 'o', 'f', 'j'] {
+            eng.process_key(&mut s, key(c));
+        }
+        // dofj 显示 [员,骱]（MockDec 无组合），fj 显示 [骱,行(p2),一个]
+        // 按 2 = 行（用户词，fj 尾段）
+        let out = eng.process_key(&mut s, key('2'));
+        assert_eq!(
+            out.commit.unwrap(),
+            "员行",
+            "多段流：前缀 do 解码码表首选「员」+ 用户词「行」组合上屏"
+        );
+        assert!(s.raw.is_empty(), "缓冲清空");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
