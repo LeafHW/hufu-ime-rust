@@ -211,6 +211,18 @@ pub fn open_weight() {
 fn open_common() {
     std::thread::spawn(|| unsafe {
         crate::tsf::trace("addword open（线程已起）");
+        // 【单例 2026-09-06】窗口已在（本进程）→ 前置复用，不再多开
+        //（用户连按 /jq 会叠开多个同位窗口，只看得见第一个）
+        if let Ok(existing) = FindWindowW(CLASS, None) {
+            let mut pid: u32 = 0;
+            let _ = GetWindowThreadProcessId(existing, Some(&mut pid));
+            if pid == std::process::id() && !existing.0.is_null() {
+                let _ = ShowWindow(existing, SW_SHOWNORMAL);
+                let _ = SetForegroundWindow(existing);
+                crate::tsf::trace("addword 窗口已在，前置复用");
+                return;
+            }
+        }
         load_skin();
         let hmod = GetModuleHandleW(None).unwrap_or_default();
         let hinst = HINSTANCE(hmod.0);
@@ -249,6 +261,7 @@ fn open_common() {
         )
         .unwrap_or_default();
         if hwnd.0.is_null() {
+            crate::tsf::trace("addword CreateWindow 失败（窗口未建）");
             return;
         }
         let _ = ShowWindow(hwnd, SW_SHOW);

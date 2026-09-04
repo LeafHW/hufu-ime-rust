@@ -995,6 +995,50 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::CommitAndRepreedit(commit_text, preedit) => {
+                // 【功能词拦截 2026-09-06b】提前上屏路径（pending 收口+
+                // 新编码并存）也会带出 {加权}/{加词}——不落文档：弹窗，
+                // 剩余 preedit 继续组句（与 Op::Commit 拦截同语义）。
+                if commit_text == "{加词}" || commit_text == "{加权}"
+                    || commit_text == "{隐藏候选}"
+                {
+                    // 先处理剩余 preedit / 候选窗（用 g），最后才 drop 弹窗
+                    if !preedit.is_empty() {
+                        let cc: ITfContextComposition = ctx.cast()?;
+                        let range: ITfRange = selection_range(&ctx, ec)?;
+                        let sink: ITfCompositionSink = CompSinkObj.into();
+                        let comp: ITfComposition =
+                            unsafe { cc.StartComposition(ec, &range, &sink)? };
+                        let crange: ITfRange = unsafe { comp.GetRange()? };
+                        let wstr2: Vec<u16> = preedit.encode_utf16().collect();
+                        unsafe { crange.SetText(ec, 0, &wstr2)? };
+                        let _ = set_selection_at_end(&ctx, ec, &crange);
+                        g.composition = Some(comp);
+                        query_caret(&mut g, &ctx, ec);
+                    } else {
+                        g.composition = None;
+                    }
+                    if commit_text == "{隐藏候选}" {
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.hide();
+                        }
+                        if let Some(c) = g.cand3.as_mut() {
+                            c.hide();
+                        }
+                        if let Some(mut c) = g.cand.take() {
+                            c.hide();
+                        }
+                    } else {
+                        let weighted = commit_text == "{加权}";
+                        drop(g);
+                        crate::tsf::trace("CommitAndRepreedit 拦截功能词（提前上屏路径）");
+                        if weighted {
+                            crate::addword::open_weight();
+                        } else {
+                            crate::addword::open();
+                        }
+                    }
+                    return Ok(());
+                }
                 // 1) 提交前缀：组段文本置为 commit → EndComposition 落地
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
