@@ -583,17 +583,22 @@ impl Engine {
         Ok(())
     }
 
-    /// 重新加载用户数据（用户词/用户调整），码表主体不重载。
+    /// 重新加载用户数据（用户词+调整，统一在 用户词.txt），码表主体不重载。
+    /// 旧 用户调整.txt 只读兼容（虎爪导出包/历史数据）。
     pub fn reload_user_data(&mut self) {
         let dir = self.schema.dir.clone();
         let uw = dir.join("用户词.txt");
-        if let Ok(ud) = hufu_dict::user::UserDict::load(&uw) {
-            self.schema.user_dict = ud;
+        let mut replay: Vec<String> = Vec::new();
+        if let Ok(l) = hufu_dict::parse::read_lines(&uw) {
+            let (dict_lines, adj_lines) = hufu_dict::user::UserAdjust::split_adjust_lines(&l);
+            self.schema.user_dict = hufu_dict::user::UserDict::parse(&dict_lines);
+            replay.extend(adj_lines);
         }
-        let adj = dir.join("用户调整.txt");
-        if let Ok(a) = hufu_dict::user::UserAdjust::load(&adj) {
-            self.schema.adjust = a;
+        if let Ok(old) = hufu_dict::parse::read_lines(&dir.join("用户调整.txt")) {
+            replay.splice(0..0, old);
         }
+        // 无条件覆盖：文件里调整行清空时内存态也要归零
+        self.schema.adjust = hufu_dict::user::UserAdjust::parse(&replay);
     }
 
     /// 方案是否启用整句。
@@ -664,12 +669,17 @@ impl Engine {
                 // 字/词。写 用户调整.txt 追加日志（{置顶}/{删除}），不碰
                 // 原始码表。整句组合候选（Sentence）是临时组句非词条，
                 // 不参与调频/删词。
-                if let Some(n) = c.to_digit(10) {
-                    let idx = if n == 0 { 9 } else { (n - 1) as usize };
-                    if m.shift {
-                        return self.op_hide_candidate(session, idx);
+                // 【自查修复 2026-09-06】仅中文态且有编码时处理——英文态/
+                // 空态 Ctrl+数字是应用快捷键（Ctrl+1 切标签等），原先无条件
+                // 吞键（op_* 对空候选返回 consumed）。
+                if session.chinese && !session.raw.is_empty() {
+                    if let Some(n) = c.to_digit(10) {
+                        let idx = if n == 0 { 9 } else { (n - 1) as usize };
+                        if m.shift {
+                            return self.op_hide_candidate(session, idx);
+                        }
+                        return self.op_pin_candidate(session, idx);
                     }
-                    return self.op_pin_candidate(session, idx);
                 }
             }
             // Ctrl+Delete：软删当前页首选
@@ -1805,8 +1815,11 @@ impl Engine {
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
-        // 整句组合候选是临时组句（code=整段 raw）非词条，不参与调频
-        if cand.source == CandidateKind::Sentence {
+        // 【自查修复 2026-09-06】候选源白名单：只有码表词（Dict）与用户
+        // 词（UserWord）是可管理词条。整句组合（Sentence）是临时组句；
+        // 符号表（Symbol）/计算器/反查等候选的 code 不是编码语义——
+        // 置顶/删除会写出垃圾调整行。
+        if cand.source != CandidateKind::Dict && cand.source != CandidateKind::UserWord {
             return KeyOutcome::consumed(self.state(session));
         }
         self.adjust_pin(&cand.code, &cand.text);
@@ -1825,8 +1838,8 @@ impl Engine {
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
-        // 整句组合候选是临时组句非词条，不参与删词
-        if cand.source == CandidateKind::Sentence {
+        // 【自查修复 2026-09-06】候选源白名单同 op_pin_candidate
+        if cand.source != CandidateKind::Dict && cand.source != CandidateKind::UserWord {
             return KeyOutcome::consumed(self.state(session));
         }
         self.adjust_hide(&cand.code, &cand.text);
@@ -1849,10 +1862,11 @@ impl Engine {
         self.append_adjust_log("{删除}", code, word);
     }
 
-    /// 追加一行到 用户调整.txt。
+    /// 追加调整行到 用户词.txt（【文件整合 2026-09-06】原 用户调整.txt
+    /// 已降为只读兼容；新写入统一进 用户词.txt，与 /jc 词行同文件混载）。
     fn append_adjust_log(&self, op: &str, code: &str, word: &str) {
         use std::io::Write;
-        let path = self.schema.dir.join("用户调整.txt");
+        let path = self.schema.dir.join("用户词.txt");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{op}{code}\t{word}");
         }
@@ -3271,14 +3285,43 @@ mod tests {
         );
         let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
         assert_eq!(texts2, vec!["新", "到的", "加"], "Ctrl+Shift+2 删词：码表词就 隐藏");
-        // 持久化验证：用户调整.txt 含 {置顶}jd 新 与 {删除}jd 就
-        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        // 持久化验证：【文件整合 2026-09-06】调整行统一落 用户词.txt
+        // （与 /jc 词行同文件混载），旧 用户调整.txt 不再写入
+        let log = std::fs::read_to_string(dir.join("用户词.txt")).unwrap();
+        assert!(log.contains("jd\t新\t1\tp3"), "词行保留: {log}");
         assert!(log.contains("{置顶}jd\t新"), "置顶日志: {log}");
         assert!(log.contains("{删除}jd\t就"), "删除日志: {log}");
         // 码表原文不受影响（reload 后仍恢复可见）
         let restored = eng.schema.dict.lookup("jd");
         let rt: Vec<&str> = restored.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(rt, ["就", "到的", "加"], "原始码表不受污染");
+    }
+
+    // 【文件整合 2026-09-06】用户词.txt 混载 TSV 词行 + {置顶}/{删除}
+    // 调整行：重启（reload_user_data）后两类行各归其位，旧 用户调整.txt
+    // 存在时兼容读入且新文件操作覆盖旧。
+    #[test]
+    fn unified_user_file_reload() {
+        let (mut eng, dir) = test_engine("unified");
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n{置顶}jd\t到的\n{删除}jd\t加\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("用户调整.txt"),
+            "{置顶}jd\t就\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        // 就(旧置顶) → 到的(新置顶，覆盖在前？回放序：旧文件→新文件，
+        // 到的 后 pin 更新在前) → 新(p3) → 加 被删
+        assert_eq!(texts, vec!["到的", "就", "新"], "混载回放: {texts:?}");
+        assert_eq!(eng.schema.user_dict.entries.len(), 1, "TSV 词行入用户词库");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
@@ -3490,9 +3533,9 @@ mod tests {
         let st = eng.state(&s);
         assert_eq!(st.candidates[0].text, "到的", "Ctrl+2 置顶后『到的』应在首位");
 
-        // 日志落盘 + 回放等价
+        // 日志落盘 + 回放等价（【文件整合 2026-09-06】落 用户词.txt）
         let dir = eng.schema.dir.clone();
-        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        let log = std::fs::read_to_string(dir.join("用户词.txt")).unwrap();
         assert!(log.contains("{置顶}jd\t到的"), "{log}");
         let adj = hufu_dict::user::UserAdjust::parse(
             &log.lines().map(|l| l.to_string()).collect::<Vec<_>>(),

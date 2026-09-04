@@ -68,6 +68,12 @@ impl Schema {
         let mut rime_dicts: Vec<PathBuf> = Vec::new();
         let mut big_tables: Vec<PathBuf> = Vec::new();
         let mut duoduo_user: Option<PathBuf> = None;
+        // 【文件整合 2026-09-06】调整行不再即读即 set：统一收集到加载
+        // 收尾回放（码表内嵌 ++ 用户调整.txt ++ 用户词.txt 调整行，
+        // 后者最新在后，覆盖语义正确）。
+        let mut adj_file_lines: Vec<String> = Vec::new();
+        let mut word_adj_lines: Vec<String> = Vec::new();
+        let mut embedded_adj: Vec<String> = Vec::new();
 
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -95,8 +101,21 @@ impl Schema {
                         SymbolTables::parse_simple(&parse::read_lines(&path)?);
                 }
                 "补充语料" => schema.supplement = Supplement::load(&path)?,
-                "用户调整" => schema.adjust = UserAdjust::load(&path)?,
-                "用户词" => schema.user_dict = UserDict::load(&path)?,
+                // 旧文件：只读兼容（虎爪导出包/历史数据），引擎不再写入
+                "用户调整" => {
+                    if let Ok(l) = parse::read_lines(&path) {
+                        adj_file_lines = l;
+                    }
+                }
+                // 新主文件：TSV 词行 + {置顶}/{删除} 调整行混载分拣
+                "用户词" => {
+                    if let Ok(l) = parse::read_lines(&path) {
+                        let (dict_lines, adj_lines) =
+                            UserAdjust::split_adjust_lines(&l);
+                        schema.user_dict = UserDict::parse(&dict_lines);
+                        word_adj_lines = adj_lines;
+                    }
+                }
                 _ => {}
             }
             if stem.contains("拼音") && ext == "注释" {
@@ -192,22 +211,27 @@ impl Schema {
             // 嵌在码表里：`{置顶}码 词 [日期]`、`{添加}…`、`{删除}…`（第三
             // 列常为日期，UserAdjust::parse 宽容忽略）。此前这些行被当普通
             // 词条（码=「{添加}xx」非法编码，静默成死数据）。现在解析前抽
-            // 走：词典不含死行；抽出的行与方案目录 用户调整.txt 拼接回放
-            // ——内嵌在前、用户文件在后，用户自己的操作覆盖码表作者内嵌。
+            // 走：词典不含死行；抽出的行进统一回放（见加载收尾）。
             let lines = parse::read_lines(main)?;
             let is_adjust = |l: &String| {
                 let t = l.trim_start();
                 t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
             };
-            let embedded: Vec<String> = lines.iter().filter(|l| is_adjust(l)).cloned().collect();
-            let dict_lines: Vec<String> = lines.into_iter().filter(|l| !is_adjust(&l)).collect();
+            embedded_adj = lines.iter().filter(|l| is_adjust(l)).cloned().collect();
+            let dict_lines: Vec<String> =
+                lines.into_iter().filter(|l| !is_adjust(&l)).collect();
             let table = parse::parse_auto(&dict_lines);
             schema.dict = std::sync::Arc::new(Dict::from_entries(name.clone(), table.rows));
-            if !embedded.is_empty() {
-                let mut replay = embedded;
-                if let Ok(ul) = parse::read_lines(&dir.join("用户调整.txt")) {
-                    replay.extend(ul);
-                }
+        }
+
+        // 【文件整合 2026-09-06】调整统一回放收尾：码表内嵌（作者）→
+        // 用户调整.txt（旧文件，只读兼容）→ 用户词.txt 调整行（新主文
+        // 件，用户最新操作在后覆盖前面的语义）。
+        {
+            let mut replay = embedded_adj;
+            replay.extend(adj_file_lines);
+            replay.extend(word_adj_lines);
+            if !replay.is_empty() {
                 schema.adjust = UserAdjust::parse(&replay);
             }
         }

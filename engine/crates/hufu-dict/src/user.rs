@@ -123,6 +123,18 @@ impl UserAdjust {
         self.removes.contains(&(code.to_string(), word.to_string()))
     }
 
+    /// 【文件整合 2026-09-06】用户数据统一落 `用户词.txt`：TSV 词行与
+    /// `{置顶}/{添加}/{删除}` 调整行混载。本函数按行前缀分拣——
+    /// 返回 (词行, 调整行)。旧 `用户调整.txt` 降为只读兼容（虎爪导出
+    /// 包/历史数据），引擎不再写入。
+    pub fn split_adjust_lines(lines: &[String]) -> (Vec<String>, Vec<String>) {
+        let is_adj = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
+        };
+        lines.iter().cloned().partition(|l| !is_adj(l))
+    }
+
     /// 应用到字典候选列表：返回调整后的条目序列。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
         let mut out: Vec<DictEntry> = Vec::new();
