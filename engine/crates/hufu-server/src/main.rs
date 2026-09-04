@@ -309,22 +309,6 @@ fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
             s.push('\n');
         }
         let _ = std::fs::write(path, s.as_bytes());
-        // 【审计 2026-09-06】真机行丢失事件抓现场（见 engine 同款注释）
-        if let Some(dir) = path.parent() {
-            use std::io::Write;
-            if let Ok(mut a) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("adj-audit.log"))
-            {
-                let _ = writeln!(
-                    a,
-                    "[server rewrite] {code}/{text} 前={} 后={}",
-                    content.lines().count(),
-                    kept.len()
-                );
-            }
-        }
     }
 }
 
