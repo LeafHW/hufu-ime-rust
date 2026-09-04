@@ -390,6 +390,8 @@ pub struct Engine {
     pub rerank_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
     /// 单次按键内的提示音标签提示（select/page 覆盖默认 key/commit）
     sound_hint: Option<&'static str>,
+    /// 上一次提交文本（跨 session，进程级）——{重复上屏} 的回放源
+    pub last_commit: String,
     /// OpenCC 转换表（opencc.enabled 时懒加载）
     opencc: Option<hufu_dict::OpenCc>,
     opencc_emoji: Option<hufu_dict::OpenCc>,
@@ -455,6 +457,7 @@ impl Engine {
             sentence: None,
             rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sound_hint: None,
+            last_commit: String::new(),
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
@@ -490,6 +493,7 @@ impl Engine {
             sentence: None,
             rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sound_hint: None,
+            last_commit: String::new(),
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
@@ -1147,33 +1151,52 @@ impl Engine {
                     None
                 }
             });
-            let suffix = chunk
+            // 锁只认码表位次。用户词（/jc 加的）不在码表原序里——换算
+            // 不到锁位次时，不能把原键字符塞进 raw（ae+3 会变成死码
+            // ae3，被解码器再当「码表第 3 名」锁，2026-09-06 用户实测
+            // 出乛）。单段纯净态（无前段无锁）直接提交该词；流中场景
+            // 维持原 fallback。
+            let picked: Option<String> = chunk
+                .as_ref()
                 .and_then(|ch| {
                     self.schema
-                        .candidates(&ch)
+                        .candidates(ch)
                         .get(disp_rank - 1)
-                        .and_then(|pick| {
-                            self.schema
-                                .dict
-                                .lookup(&ch)
-                                .into_iter()
-                                .position(|e| e.text == pick.text)
-                                .map(|i| i + 1)
-                        })
-                        .and_then(|file_rank| {
-                            if (2..=10).contains(&file_rank) {
-                                Some(if file_rank == 10 {
-                                    '0'
-                                } else {
-                                    char::from_digit(file_rank as u32, 10).unwrap()
-                                })
-                            } else {
-                                None
-                            }
-                        })
+                        .map(|p| p.text.clone())
+                });
+            let suffix = chunk
+                .and_then(|ch| {
+                    let pk = picked.clone()?;
+                    self.schema
+                        .dict
+                        .lookup(&ch)
+                        .into_iter()
+                        .position(|e| e.text == pk)
+                        .map(|i| i + 1)
                 })
-                .unwrap_or(c);
-            session.raw.push(suffix);
+                .and_then(|file_rank| {
+                    if (2..=10).contains(&file_rank) {
+                        Some(if file_rank == 10 {
+                            '0'
+                        } else {
+                            char::from_digit(file_rank as u32, 10).unwrap()
+                        })
+                    } else {
+                        None
+                    }
+                });
+            if suffix.is_none() {
+                if let Some(pk) = picked {
+                    if session.committed_raw.is_empty()
+                        && !self.parsed_has_locks(session)
+                    {
+                        // 单段态：选中即上屏（用户词/置顶项无锁位次）
+                        session.clear();
+                        return KeyOutcome::commit(pk, self.state(session));
+                    }
+                }
+            }
+            session.raw.push(suffix.unwrap_or(c));
             self.refresh_candidates(session);
             // 选重后缀也是一「键」：评估提前上屏（Rime 在 push_input 后统一评估）
             if self.parsed_has_locks(session) || !session.committed_raw.is_empty() {
@@ -1241,8 +1264,13 @@ impl Engine {
             return;
         }
         let first = session.candidates[0].clone();
-        self.learn(&first);
-        let text = first.commit_text().to_string();
+        if !first.text.starts_with('{') {
+            self.learn(&first);
+        }
+        let mut text = first.commit_text().to_string();
+        if text.starts_with('{') {
+            text = self.resolve_dynamic(&text);
+        }
         session.clear();
         session.pending_commit = Some(text);
     }
@@ -1469,8 +1497,14 @@ impl Engine {
         let pick = session.candidates.get(idx).cloned();
         if let Some(cand) = pick {
             self.sound_hint = Some("select");
-            self.learn(&cand);
-            let text = cand.commit_text().to_string();
+            // 动态/功能词（{日期} 等）不进用户词学习——字面标记不是词
+            if !cand.text.starts_with('{') {
+                self.learn(&cand);
+            }
+            let mut text = cand.commit_text().to_string();
+            if text.starts_with('{') {
+                text = self.resolve_dynamic(&text);
+            }
             session.clear();
             return KeyOutcome::commit(text, self.state(session));
         }
@@ -1712,6 +1746,23 @@ impl Engine {
     }
 
     /// 用户学习：自动调频 + 可选调整日志（user-adjust.log，log_adjust=true 时记录）。
+    /// 提交收口的动态/功能词解析：`{日期}`族 → 实时展开；`{重复上屏}`
+    /// → last_commit（进程级，server 侧每键收口更新）；`{加词}`/
+    /// `{隐藏候选}` → 原样透传（DLL 拦截处理）；未知 `{x}` 原样。
+    fn resolve_dynamic(&self, text: &str) -> String {
+        if !text.starts_with('{') || !text.ends_with('}') || text.len() < 3 {
+            return text.to_string();
+        }
+        let tag = &text[1..text.len() - 1];
+        if tag == "重复上屏" {
+            return self.last_commit.clone();
+        }
+        if let Some(v) = dynamic::expand(tag) {
+            return v;
+        }
+        text.to_string()
+    }
+
     fn learn(&mut self, cand: &Candidate) {
         if self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
@@ -2347,10 +2398,37 @@ impl Engine {
         if !self.config.input.code_disguise.is_empty() && !preedit.is_empty() {
             preedit = format!("{}{}", self.config.input.code_disguise, preedit);
         }
+        // 【动态候选实时显示 2026-09-06】{日期}族候选显示实时值（用户
+        // 拍板：不要字面标记要实时）；{重复上屏} 显示上次上屏内容（还
+        // 没上过屏则不显示该候选）；{加词}/{隐藏候选} 显示功能提示。
+        // 只改显示层（session.candidates 原样）——选中提交走
+        // resolve_dynamic，与显示一致。
+        let shown: Vec<Candidate> = session.candidates[start..end]
+            .iter()
+            .filter_map(|c| {
+                let mut c = c.clone();
+                if c.text.starts_with('{') && c.text.ends_with('}') && c.text.len() > 2 {
+                    let tag = &c.text[1..c.text.len() - 1];
+                    if tag == "重复上屏" {
+                        if self.last_commit.is_empty() {
+                            return None;
+                        }
+                        c.text = self.last_commit.clone();
+                    } else if tag == "加词" {
+                        c.text = "＋加词".into();
+                    } else if tag == "隐藏候选" {
+                        c.text = "－隐藏候选".into();
+                    } else if let Some(v) = dynamic::expand(tag) {
+                        c.text = v;
+                    }
+                }
+                Some(c)
+            })
+            .collect();
         SessionState {
             raw: session.raw.clone(),
             preedit,
-            candidates: session.candidates[start..end].to_vec(),
+            candidates: shown,
             page: session.page,
             page_count: pages,
             // 高亮（页内下标）：↑↓ 已同步页码，越界兜底 0
@@ -2573,6 +2651,68 @@ mod tests {
         assert_eq!(out.commit.unwrap(), "到的", "非整句数字选重立即上屏第 2");
     }
 
+    // 【用户词选重 2026-09-06】整句方案锁式选重只认码表位次：/jc 加
+    // 的用户词不在码表原序 → 换算不到锁位次，原实现退化把按键字符塞
+    // 进 raw（ae+3 → 死码 ae3 被解码器再当「码表第 3」锁，用户实测
+    // 出乛）。修复：单段纯净态（无前段无锁）选中即上屏该词。
+    #[test]
+    fn user_word_rank_select_commits() {
+        let (mut eng, dir) = test_engine("uwr");
+        // 整句引擎 + 用户词 jd 第 3 位（码表 [就,到的,加] → [就,到的,新,加]）
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        // 整句引擎：方案名 t 不含「整句」——锁式选重只在整句开。构造
+        // 整句引擎：直接改 sentence 装载条件不现实，改用 schema 目录
+        // 名含「整句」再建一个。
+        let dir2 = std::env::temp_dir().join(format!("hufu-eng-整句uwrs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=整句测试\na\t啊\naa\t阿\njd\t就\njd\t到的\njd\t加\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir2.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n",
+        )
+        .unwrap();
+        let mut cfg2 = hufu_config::Config::default();
+        cfg2.sentence.enabled = true;
+        cfg2.sentence.auto_enable = true;
+        let mut eng2 = Engine::with_schema_dir(&dir2, cfg2).unwrap();
+        eng2.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+        assert!(eng2.sentence_active(), "整句模式生效");
+        let mut s = Session::new(true);
+        eng2.process_key(&mut s, key('j'));
+        eng2.process_key(&mut s, key('d'));
+        // 显示序：MockDec 首选压首 + 码表 [就,到的,新(p3),加]
+        let st = eng2.state(&s);
+        let texts: Vec<String> = st.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.contains(&"新".to_string()),
+            "p3 用户词进候选: {texts:?}"
+        );
+        // 按 3：不再变死码 jd3 出「加」（码表第 3），而是直接上屏「新」
+        let out = eng2.process_key(&mut s, key('3'));
+        assert_eq!(out.commit.unwrap(), "新", "用户词无锁位次 → 单段态直接上屏");
+        assert!(s.raw.is_empty(), "上屏后缓冲清空");
+
+        // 码表词选重不受影响：按 2（到的，码表第 2）→ 锁式：raw=jd2、
+        // 不上屏，候选首=锁定名次（MockDec 的锁产物），空格才上屏
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('j'));
+        eng2.process_key(&mut s2, key('d'));
+        let out2 = eng2.process_key(&mut s2, key('2'));
+        assert!(out2.commit.is_none(), "码表词锁式选重不立即上屏");
+        assert_eq!(s2.raw, "jd2", "码表名次 2 写入锁");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("hufu-eng-dyn-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2714,6 +2854,54 @@ mod tests {
         }
         let snap = eng2.state(&s2); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
         assert!(texts.iter().any(|t| t == &"壹仟贰佰叁拾肆".to_string()), "{texts:?}");
+    }
+
+    // 【码表动态变量 2026-09-06】{日期}族上屏展开（候选显示保留字面标记）、
+    // {重复上屏} 回放 last_commit、{加词} 原样透传（DLL 拦截弹窗）。
+    #[test]
+    fn dict_dynamic_tags() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-dynv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("码表.txt"),
+            "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        let mut s = Session::new(true);
+
+        // /rq：候选显示实时日期值（非字面标记），上屏同值
+        for c in "/rq".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        assert!(
+            snap.candidates
+                .iter()
+                .any(|c| c.text.contains('年') && c.text.contains('月') && c.text.contains('日')),
+            "候选显示实时值: {:?}",
+            snap.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+        );
+        let out = eng.process_key(&mut s, key(' '));
+        let t = out.commit.unwrap();
+        assert!(t.contains('年') && t.contains('月') && t.contains('日'), "上屏展开: {t}");
+
+        // z3：重复上屏回放 last_commit（host 收口更新，测试直设）
+        eng.last_commit = "重复我".into();
+        for c in "z3".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.unwrap(), "重复我", "z3 = 上次上屏内容");
+
+        // /jc：加词指令原样透传给 DLL（唯一候选 → 末键自动顶字，
+        // 无需空格确认）
+        let mut last: Option<String> = None;
+        for c in "/jc".chars() {
+            last = eng.process_key(&mut s, key(c)).commit;
+        }
+        assert_eq!(last.unwrap(), "{加词}", "加词指令透传");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! 架构（同小狼毫）：本 DLL 是薄壳——按键事件通过命名管道发给 hufu-server
 //! 引擎，取回 {consumed, commit, state} 后操作 TSF 组段并绘制候选窗。
 
+mod addword;
 mod candwin;
 mod candwin2;
 mod candwin3;

@@ -439,16 +439,22 @@ impl Host {
         }
         if let Some(c) = outcome.commit.as_deref() {
             if !c.is_empty() {
-                self.session.tail_context.push_str(c);
-                let n = self.session.tail_context.chars().count();
-                if n > 32 {
-                    let skip = n - 32;
-                    self.session.tail_context = self
-                        .session
-                        .tail_context
-                        .chars()
-                        .skip(skip)
-                        .collect();
+                // 【{重复上屏} 数据源】每次真实上屏更新进程级 last_commit
+                //（engine 侧 {重复上屏} 展开时读）。功能词指令（{加词}/
+                // {隐藏候选}——DLL 拦截不上屏）不算上屏内容、不进语境尾巴。
+                if c != "{加词}" && c != "{隐藏候选}" {
+                    self.engine.last_commit = c.to_string();
+                    self.session.tail_context.push_str(c);
+                    let n = self.session.tail_context.chars().count();
+                    if n > 32 {
+                        let skip = n - 32;
+                        self.session.tail_context = self
+                            .session
+                            .tail_context
+                            .chars()
+                            .skip(skip)
+                            .collect();
+                    }
                 }
             }
         }

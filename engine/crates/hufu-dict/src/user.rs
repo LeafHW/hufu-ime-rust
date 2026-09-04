@@ -49,7 +49,13 @@ impl UserAdjust {
             } else {
                 continue;
             };
-            let parts: Vec<&str> = rest.split('\t').collect();
+            // 【虎爪内嵌兼容 2026-09-06】列分隔宽容：TAB 或空白均可；
+            // 超过两列时多余列忽略（虎爪码表第三列常为日期
+            // 2026-09-04 / 20260904 之类——只取 码+词）。
+            let parts: Vec<&str> = rest
+                .split(|c| c == '\t' || c == ' ' || c == '\u{3000}')
+                .filter(|s| !s.is_empty())
+                .collect();
             if parts.len() < 2 {
                 continue;
             }
@@ -114,13 +120,19 @@ impl UserAdjust {
     /// 应用到字典候选列表：返回调整后的条目序列。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
         let mut out: Vec<DictEntry> = Vec::new();
-        // 1) 置顶（最新在前；命中码表的条目也标记 pinned）
+        // 1) 置顶（最新在前；命中码表的条目也标记 pinned）。
+        //    【回放语义 2026-09-06】置顶之后又删除的（日志后操作=删除，
+        //    虎爪码表内嵌置顶 + 用户文件删除的覆盖场景）不显示——
+        //    removes 赢，与实时 pin()/remove() 的联动语义对齐。
         let pinned: Vec<&(String, String)> = self
             .pins
             .iter()
             .filter(|(c, _)| c == code)
             .collect();
         for (c, w) in pinned.iter().rev() {
+            if self.removes.contains(&((*c).clone(), ((*w).clone()))) {
+                continue;
+            }
             if let Some(mut e) = base.iter().find(|e| e.code == *c && e.text == *w).cloned() {
                 e.pinned = true;
                 out.push(e);
@@ -265,5 +277,23 @@ mod tests {
         ud.add_word("jj", "自己");
         assert_eq!(ud.entries.len(), 1);
         assert_eq!(ud.entries[0].weight, 2.0);
+    }
+
+    // 【虎爪内嵌兼容】空格/全角空格分隔 + 第三列日期（任意形态）忽略
+    #[test]
+    fn parse_tigerclaw_embedded_lines() {
+        let lines: Vec<String> = vec![
+            "{置顶}a 叉 2026-09-04".into(),
+            "{添加}a 哎呦 20260904".into(),
+            "{删除}a\u{3000}氨\t2026/09/05".into(),
+            // 裸日志（原生 TAB）不受影响
+            "{置顶}ab\t你好".into(),
+        ];
+        let adj = UserAdjust::parse(&lines);
+        let out = adj.apply("a", &base());
+        let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["叉", "来", "哎呦"]); // 氨被删、哎呦添加
+        let out2 = adj.apply("ab", &[]);
+        assert_eq!(out2[0].text, "你好");
     }
 }
