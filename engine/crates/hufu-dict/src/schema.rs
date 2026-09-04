@@ -69,8 +69,10 @@ impl Schema {
         let mut big_tables: Vec<PathBuf> = Vec::new();
         let mut duoduo_user: Option<PathBuf> = None;
         // 【文件整合 2026-09-06】调整行不再即读即 set：统一收集到加载
-        // 收尾回放（码表内嵌 ++ 用户调整.txt ++ 用户词.txt 调整行，
+        // 收尾回放（码表内嵌 ++ 旧用户调整.txt ++ 旧用户词.txt，
         // 后者最新在后，覆盖语义正确）。
+        // 【格式统一 2026-09-06】新主文件=用户调整.txt（{置顶}/{添加}/
+        // {删除}/{加权} 统一标记格式）；旧 用户词.txt 只读兼容。
         let mut adj_file_lines: Vec<String> = Vec::new();
         let mut word_adj_lines: Vec<String> = Vec::new();
         let mut embedded_adj: Vec<String> = Vec::new();
@@ -101,18 +103,25 @@ impl Schema {
                         SymbolTables::parse_simple(&parse::read_lines(&path)?);
                 }
                 "补充语料" => schema.supplement = Supplement::load(&path)?,
-                // 旧文件：只读兼容（虎爪导出包/历史数据），引擎不再写入
+                // 新主文件：{置顶}/{添加}/{删除}/{加权} 统一标记格式
+                //（split 分拣：{添加}→词行，其余→调整行）。entries 用
+                // extend：read_dir 遍历序不定，两用户文件谁先都能合入
                 "用户调整" => {
                     if let Ok(l) = parse::read_lines(&path) {
-                        adj_file_lines = l;
+                        let (dict_lines, adj_lines) = UserAdjust::split_adjust_lines(&l);
+                        let d = UserDict::parse(&dict_lines);
+                        schema.user_dict.entries.extend(d.entries);
+                        adj_file_lines = adj_lines;
                     }
                 }
-                // 新主文件：TSV 词行 + {置顶}/{删除} 调整行混载分拣
+                // 旧文件：只读兼容（历史数据，引擎不再写入）；词行并入
+                // 用户词库，调整行先回放（新主文件覆盖它）
                 "用户词" => {
                     if let Ok(l) = parse::read_lines(&path) {
                         let (dict_lines, adj_lines) =
                             UserAdjust::split_adjust_lines(&l);
-                        schema.user_dict = UserDict::parse(&dict_lines);
+                        let old_dict = UserDict::parse(&dict_lines);
+                        schema.user_dict.entries.extend(old_dict.entries);
                         word_adj_lines = adj_lines;
                     }
                 }
@@ -225,14 +234,22 @@ impl Schema {
         }
 
         // 【文件整合 2026-09-06】调整统一回放收尾：码表内嵌（作者）→
-        // 用户调整.txt（旧文件，只读兼容）→ 用户词.txt 调整行（新主文
-        // 件，用户最新操作在后覆盖前面的语义）。
+        // 旧用户词.txt 调整行（历史）→ 用户调整.txt（新主文件，用户
+        // 最新操作在后覆盖前面的语义）。
+        // 【权重回放 2026-09-06】{加权} 行回放出的 weights 填入
+        // user_dict.weights（merge_into 用户词分支消费）。
         {
             let mut replay = embedded_adj;
-            replay.extend(adj_file_lines);
             replay.extend(word_adj_lines);
+            replay.extend(adj_file_lines);
             if !replay.is_empty() {
                 schema.adjust = UserAdjust::parse(&replay);
+                for ((c, w), v) in schema.adjust.weights.iter() {
+                    schema
+                        .user_dict
+                        .weights
+                        .insert((c.clone(), w.clone()), *v);
+                }
             }
         }
 
