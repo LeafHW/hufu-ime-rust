@@ -881,6 +881,38 @@ impl Engine {
             session.clear();
             return self.on_char(session, c, shift);
         }
+        // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
+        // 翻不动时直接顶屏（首选+符号形态上屏，编码态标点顶字同款语义）。
+        // Shift 形态（—— / +）与基键同方向。须在 Shift 标点拦截之前。
+        if (c == '-' || c == '=') && !session.candidates.is_empty() {
+            let (dir, sym) = if c == '-' {
+                if shift {
+                    (-1, "——".to_string())
+                } else {
+                    (-1, "-".to_string())
+                }
+            } else if shift {
+                (1, "+".to_string())
+            } else {
+                (1, "=".to_string())
+            };
+            let page_size = self.config.candidates.page_size.max(1);
+            let pages = (session.candidates.len() + page_size - 1) / page_size;
+            let can = if dir < 0 {
+                session.page > 0
+            } else {
+                session.page + 1 < pages
+            };
+            if can {
+                return self.on_page(session, dir);
+            }
+            // 不可翻：顶字（当前页首选——翻页后顶的是所在页首字）
+            let ps = page_size as usize;
+            let idx = (session.page as usize * ps).min(session.candidates.len().saturating_sub(1));
+            let first = session.candidates[idx].commit_text().to_string();
+            session.clear();
+            return KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
+        }
         // 【Shift 标点 2026-09-06】有编码态同空态（a18f89c 的空态修复漏了
         // 这条路径）：TSF 传基础键+shift=true，Shift+标点/数字先转 US 键盘
         // shift 形态再走标点映射——打 d 出候选「中」后 Shift+, 应上屏
@@ -928,8 +960,8 @@ impl Engine {
         {
             return self.on_rank_key(session, c);
         }
-        // 翻页键
-        if self.config.candidates.paging_keys.contains(c) {
+        // 翻页键（其余配置翻页键：保持纯翻页）
+        if self.config.candidates.paging_keys.contains(c) && !(c == '-' || c == '=') {
             let idx = self
                 .config
                 .candidates
@@ -2711,6 +2743,59 @@ mod tests {
         assert!(out2.commit.is_none(), "码表词锁式选重不立即上屏");
         assert_eq!(s2.raw, "jd2", "码表名次 2 写入锁");
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
+    // 翻不动时直接顶屏（首选+符号形态）。一页装满（pages=1）时按 -
+    // 或 = 都不可翻 → 顶字；多页时 = 翻下页、- 翻上页；翻页后顶字。
+    #[test]
+    fn page_or_commit_keys() {
+        let (mut eng, _dir) = test_engine("pok");
+        // jd 3 个候选（page_size 4）→ 一页装满，无翻页空间
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 按 -：无上页 → 顶字「就-」
+        let out = eng.process_key(&mut s, key('-'));
+        assert_eq!(out.commit.unwrap(), "就-", "一页满时 - 顶字");
+        assert!(s.raw.is_empty());
+        // 按 =：无下页 → 顶字「就=」
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out2 = eng.process_key(&mut s2, key('='));
+        assert_eq!(out2.commit.unwrap(), "就=", "一页满时 = 顶字");
+
+        // Shift 形态顶字：—— / +
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let out3 = eng.process_key(&mut s3, {
+            let mut k = key('-');
+            k.modifiers.shift = true;
+            k
+        });
+        assert_eq!(out3.commit.unwrap(), "就——", "Shift+- 顶字 ——");
+
+        // 多页场景：临时把 page_size 调 2（jd 3 候选 → 2 页）
+        let mut s4 = Session::new(true);
+        eng.config.candidates.page_size = 2;
+        eng.process_key(&mut s4, key('j'));
+        eng.process_key(&mut s4, key('d'));
+        let out4 = eng.process_key(&mut s4, key('='));
+        assert!(out4.commit.is_none(), "= 有下页时翻页不上屏");
+        assert_eq!(s4.page, 1, "翻到第 2 页");
+        // 到末页再按 = → 顶字（首选=当前页首「加」）
+        let out5 = eng.process_key(&mut s4, key('='));
+        assert_eq!(out5.commit.unwrap(), "加=", "末页再 = 顶字");
+        // - 回翻：第 2 页按 - 回第 1 页
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('j'));
+        eng.process_key(&mut s5, key('d'));
+        eng.process_key(&mut s5, key('='));
+        let out6 = eng.process_key(&mut s5, key('-'));
+        assert!(out6.commit.is_none(), "- 有上页时翻页不上屏");
+        assert_eq!(s5.page, 0, "翻回第 1 页");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
