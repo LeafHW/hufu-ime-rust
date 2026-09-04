@@ -162,7 +162,10 @@ impl Default for InputSection {
             hide_candidates: false,
             default_chinese: true,
             ascii_punct: false,
-            slash_dunhao: true,
+            // 【2026-09-06 用户拍板】默认命名空间档：/ 前缀功能
+            //（/jc 加词、/jq 加权、/rq 日期等，见各方案 快符.txt）
+            // 开箱即用；要「/ 一键出顿号」的用户手动勾选直出档。
+            slash_dunhao: false,
             semicolon_guide: true,
             digits_in_sentence: true,
         }
