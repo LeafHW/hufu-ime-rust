@@ -1219,25 +1219,34 @@ impl Engine {
                     }
                 });
             let had_locks = self.parsed_has_locks(session);
+            // 【尾锁判定 2026-09-06】锁正好在字母流末尾（刚锁完、还没打
+            // 新编码）才允许重锁/改选。中置锁（do;fj——前段已确认、正给
+            // 尾段选重）绝不能动前段：旧实现无条件按 base 长度截断字节，
+            // 剥掉中置锁且字节错位（do;fj; → do2f2 → 「只是开始」实测）。
+            let parsed_now = self.parse_locks(&session.raw);
+            let base_len = parsed_now.base.chars().count();
+            let tail_locked = had_locks
+                && parsed_now.locks.iter().any(|(l, _)| *l as usize == base_len)
+                && session.raw.chars().count() == base_len + 1;
             if suffix.is_none() {
                 if let Some(pk) = picked {
-                    if session.committed_raw.is_empty() {
-                        // 单段纯净态或已有锁的改选：选中即上屏（用户词/
-                        // 置顶项无锁位次；2026-09-06 锁态改选用户词也直接
-                        // 上屏，不再把原键字符塞进 raw 成死码）
+                    if session.committed_raw.is_empty() && (!had_locks || tail_locked) {
+                        // 单段纯净态或尾锁改选：选中即上屏（用户词/置顶项
+                        // 无锁位次；2026-09-06 锁态改选用户词也直接上屏，
+                        // 不再把原键字符塞进 raw 成死码。中置锁流不适用
+                        // ——commit 会丢掉已锁的前段）
                         session.clear();
                         return KeyOutcome::commit(pk, self.state(session));
                     }
                 }
             }
-            // 【锁态重锁 2026-09-06】raw 已带锁时按数字 = 改锁（去掉旧锁
-            // 换新名次），不追加——原实现连按 4567890 会堆出 ae3465678
-            // 死码串（换算后的码表名次逐个追加，候选恒为首个锁产物）。
-            // suffix 算不出（picked 超候选）时锁态忽略本键。
-            if had_locks {
+            // 【锁态重锁 2026-09-06】尾锁时按数字 = 改锁（换名次不追加），
+            // raw 恒 base+单锁——原实现连按 4567890 会堆出 ae3465678 死码
+            // 串。中置锁（尾段新编码）走正常追加。suffix 算不出（picked
+            // 超候选）时忽略本键。
+            if tail_locked {
                 if let Some(sf) = suffix {
-                    let keep = base_now.chars().count();
-                    session.raw.truncate(keep);
+                    session.raw = parsed_now.base.clone();
                     session.raw.push(sf);
                     self.refresh_candidates(session);
                     self.try_early_commit(session);
@@ -2917,6 +2926,44 @@ mod tests {
         let out5 = eng.process_key(&mut s3, key('4'));
         assert_eq!(s3.raw, "jd3", "连按数字重锁，raw 恒单锁");
         assert_eq!(out5.state.as_ref().unwrap().raw, "jd4", "回显随按键还原");
+    }
+
+    // 【中置锁保护 2026-09-06】do;fj; 多段流：第一段锁（do2）是中置锁，
+    // 给尾段 fj 选重时不得剥离/错位截断前段锁——旧实现无条件按 base
+    // 长度 truncate 字节，do;fj; 出「只是开始」（do 段锁被毁且字节错位
+    // 拼出 do2f2）。中置锁走正常追加。
+    #[test]
+    fn mid_lock_stream_preserved() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-整句midlk-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句中置\ndo\t员\ndo\t只是\nfj\t骱\nfj\t一个\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        // do;fj; → 内部 do2fj2，解码 [只是|一个]
+        let mut s = Session::new(true);
+        for c in ['d', 'o', ';', 'f', 'j', ';'] {
+            eng.process_key(&mut s, key(c));
+        }
+        assert!(
+            s.raw.starts_with("do"),
+            "前段编码不得被截断: raw={}",
+            s.raw
+        );
+        assert_eq!(
+            s.raw, "do2fj2",
+            "两段各自换算锁：前段 do2 保留（中置锁），尾段 fj2 追加"
+        );
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
