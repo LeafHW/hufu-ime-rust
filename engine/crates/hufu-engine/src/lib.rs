@@ -636,6 +636,10 @@ impl Engine {
                 .user_dict
                 .entries
                 .iter()
+                // 【删除态不注入 2026-09-06】{删除} 的用户词不再进整句
+                // 词图——否则 decoder 副本让已删词复活（短码路径由
+                // candidates 的 removed 过滤兜底，长句路径全靠这里）。
+                .filter(|e| !self.schema.adjust.removed(&e.code, &e.text))
                 .filter(|e| !e.code.is_empty() && !e.text.is_empty())
                 .filter(|e| seen.insert((e.code.clone(), e.text.clone())))
                 .map(|e| (e.code.clone(), e.text.clone()))
@@ -1995,6 +1999,21 @@ impl Engine {
                 s.push('\n');
             }
             let _ = std::fs::write(&path, s.as_bytes());
+            // 【审计 2026-09-06】真机曾现「13 行基线只剩 3 行操作行」
+            //（05:54 事件，本地复现 engine/server 两路均正常）——写入
+            // 前后行数落 audit 抓现场。
+            if let Ok(mut a) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.schema.dir.join("adj-audit.log"))
+            {
+                let _ = writeln!(
+                    a,
+                    "[engine {op}] {code}/{word} 前={} 后={}",
+                    content.lines().count(),
+                    kept.len() + 1
+                );
+            }
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{op}{code}\t{word}");
@@ -2416,15 +2435,25 @@ impl Engine {
                             continue;
                         }
                         let multi = text.chars().count() >= 2;
-                        let mut cand =
-                            Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
-                        cand.weight = h.score;
                         // 短语压前须过「真词地板」：强短语（真词，如 两次
                         // mlwe≈-7.7 / 真好 nqbh≈-8.1）仍压生僻表项置前
                         //（与 Rime 同拍）；弱切分产物（如 ennw 解出「午王」
                         // ≈-21.5，非词）不再压词典精确匹配——「框」应居首
                         //（虎爪/Rime 实测均首选）。弱项回落到词典之后补位。
-                        if h.max_rank == 1 && multi && h.score > SENT_PHRASE_FRONT_FLOOR {
+                        // 【码表域已有则不压前 2026-09-06】注入整句的用户词
+                        //（nl 什么东西 p2 案例）会被 ngram 判为强真词压到
+                        // 最前，压过用户置顶（{置顶}nl 弄）与选重位（p2）。
+                        // 码表域候选已含用户词的最终位次（pins/pN 回放），
+                        // decoder 副本不再重复压前——保留码表域位次。decoder
+                        // 独有的短语（码表域没有的，如 两次/真好）照常压前。
+                        let front = h.max_rank == 1
+                            && multi
+                            && h.score > SENT_PHRASE_FRONT_FLOOR
+                            && !session.candidates.iter().any(|c| c.text == text);
+                        let mut cand =
+                            Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
+                        cand.weight = h.score;
+                        if front {
                             phrase.push(cand);
                         } else {
                             rest.push(cand);
@@ -3701,6 +3730,52 @@ mod tests {
         );
         assert!(s.raw.is_empty() && s.candidates.is_empty(), "候选框消失");
         assert!(!eng.pending_user_reload, "消失时已 reload 并清 pending");
+    }
+
+    /// 【码表域已有则不压前 2026-09-06】用户实测 nl 案例：/jc 加
+    /// 「什么东西」p2、Ctrl 置顶「弄」，decoder 注入用户词后 ngram 给
+    /// 什么东西 -3.33 强真词分压到最前，压过 {置顶}nl 弄。修复：码表
+    /// 域候选（已含 pins/pN 最终位次）已有的词，decoder 副本不进
+    /// phrase 组压前。
+    struct NlMock;
+    impl SentenceDecoder for NlMock {
+        fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
+            let hits = if raw == "nl" {
+                vec![
+                    SentenceHit { text: "什么东西".into(), score: -3.33, confidence: -3.33, max_rank: 1, sum_rank: 1, exact: true, word_ends: vec![(1,2)], segmented: "nl".into(), partial: false },
+                    SentenceHit { text: "弄".into(), score: -13.02, confidence: -13.02, max_rank: 1, sum_rank: 1, exact: true, word_ends: vec![(1,2)], segmented: "nl".into(), partial: false },
+                ]
+            } else {
+                Vec::new()
+            };
+            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false })
+        }
+    }
+
+    #[test]
+    fn decoder_phrase_not_lift_existing_user_word() {
+        let dir = std::env::temp_dir().join("hufu-eng-nl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\nnl\t弄\nnl\t呢\n").unwrap();
+        std::fs::write(
+            dir.join("用户调整.txt"),
+            "{添加}nl\t什么东西\tp2\n{置顶}nl\t弄\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        eng.config.sentence.enabled = true;
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(NlMock)));
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('n'));
+        eng.process_key(&mut s, key('l'));
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts[0], "弄", "{{置顶}} 必须首位（decoder 强真词不得压过）: {texts:?}");
+        assert_eq!(
+            texts.iter().position(|t| *t == "什么东西").unwrap(),
+            1,
+            "p2 用户词保持第 2 位: {texts:?}"
+        );
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {

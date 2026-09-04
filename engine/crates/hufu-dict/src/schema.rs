@@ -143,11 +143,16 @@ impl Schema {
                     schema.reverse_path = Some(path.clone());
                 } else {
                     // 其余 txt：可能是主码表（多多/QQ五笔/虎整句/多多用户词）
-                    if stem.contains("用户词") {
-                        // 【2026-09-06】用户词不得进主码表候选：/jc 加词
-                        // 落盘 用户词.txt 后，文件大于真码表时 max_by_key
-                        // 会把它选成主表——整个输入法只剩几个用户词
-                        //（测试 user_word_placement 抓获）。只入用户词库。
+                    if stem.contains("用户词") || stem.contains("用户调整") {
+                        // 【2026-09-06】用户数据文件不进主码表候选也不进
+                        // 多多并入（上方 match 分支已消化：entries 并入
+                        // user_dict、调整行进回放）——落进 big_tables 的话
+                        // 文件大于真码表时 max_by_key 会把它误选成主表，
+                        // 整个输入法只剩几个用户词（测试 user_word_placement
+                        // 抓获旧名；格式统一后新名「用户调整」不含「用户词」
+                        // 字样漏拦，decoder_phrase_not_lift_existing_user_word
+                        // 抓获——小目录里它比码表大即被误选，dict 变空）。
+                    } else if stem.contains("用户码表") {
                         duoduo_user = Some(path.clone());
                     } else {
                         big_tables.push(path.clone());
@@ -306,6 +311,13 @@ impl Schema {
         // 位及以后统一后移一位（2026-09-06 用户需求）。
         let mut user_entries: Vec<DictEntry> = Vec::new();
         self.user_dict.merge_into(code, &self.dict, &mut user_entries);
+        // 用户词行版本的 text 集合：apply 的 {添加} 追加副本（adjust.adds，
+        // 无选重位）与 user_dict 词行（带 pN/权重）双写重复——词行版本
+        // 由下方 pinned_users/placed 段负责（含位次语义），out 里的追加
+        // 副本跳过，防它先占位挡住按位插入（nl 什么东西 p2 案例：
+        // 副本占尾位 → placed 去重 continue → p2 失效）。
+        let user_texts: std::collections::HashSet<String> =
+            user_entries.iter().map(|e| e.text.clone()).collect();
         let mut pinned_users: Vec<DictEntry> = Vec::new();
         let mut placed: Vec<(usize, DictEntry)> = Vec::new();
         for ue in user_entries {
@@ -335,6 +347,9 @@ impl Schema {
         }
         for e in out {
             if e.pinned {
+                continue;
+            }
+            if user_texts.contains(e.text.as_str()) {
                 continue;
             }
             if !merged.iter().any(|x| x.text == e.text) {
