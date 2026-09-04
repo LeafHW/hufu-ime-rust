@@ -1218,16 +1218,35 @@ impl Engine {
                         None
                     }
                 });
+            let had_locks = self.parsed_has_locks(session);
             if suffix.is_none() {
                 if let Some(pk) = picked {
-                    if session.committed_raw.is_empty()
-                        && !self.parsed_has_locks(session)
-                    {
-                        // 单段态：选中即上屏（用户词/置顶项无锁位次）
+                    if session.committed_raw.is_empty() {
+                        // 单段纯净态或已有锁的改选：选中即上屏（用户词/
+                        // 置顶项无锁位次；2026-09-06 锁态改选用户词也直接
+                        // 上屏，不再把原键字符塞进 raw 成死码）
                         session.clear();
                         return KeyOutcome::commit(pk, self.state(session));
                     }
                 }
+            }
+            // 【锁态重锁 2026-09-06】raw 已带锁时按数字 = 改锁（去掉旧锁
+            // 换新名次），不追加——原实现连按 4567890 会堆出 ae3465678
+            // 死码串（换算后的码表名次逐个追加，候选恒为首个锁产物）。
+            // suffix 算不出（picked 超候选）时锁态忽略本键。
+            if had_locks {
+                if let Some(sf) = suffix {
+                    let keep = base_now.chars().count();
+                    session.raw.truncate(keep);
+                    session.raw.push(sf);
+                    self.refresh_candidates(session);
+                    self.try_early_commit(session);
+                    if session.pending_commit.is_some() {
+                        self.refresh_candidates(session);
+                    }
+                    return self.take_or_state(session);
+                }
+                return KeyOutcome::consumed(self.state(session));
             }
             session.raw.push(suffix.unwrap_or(c));
             self.refresh_candidates(session);
@@ -2422,12 +2441,65 @@ impl Engine {
     }
 
     /// 会话状态快照。
+    /// 【锁名次显示还原 2026-09-06】回显层把尾部数字锁（码表名次）还原为
+    /// 「候选框显示名次」：按 4 选「码表第 3」回显 ae4（与按键一致），而非
+    /// 内部锁值 ae3——用户词插入使显示序与码表序错位，用户实测按 4567890
+    /// 回显 ae3465678 观感错乱。仅还原尾部锁；中置锁与 ;/' 锁保持原样
+    /// （;/' 的锁形即按键形态，本就一致）。Session.raw 真值不动（解码、
+    /// 基准、测试断言均用真值）。
+    fn display_raw(&self, session: &Session) -> String {
+        let raw = &session.raw;
+        if raw.is_empty() || !self.sentence_active() {
+            return raw.clone();
+        }
+        let parsed = self.parse_locks(raw);
+        let base = &parsed.base;
+        if base.is_empty() || raw.len() <= base.len() {
+            return raw.clone();
+        }
+        let tail = &raw[base.len()..];
+        let mut chars = tail.chars();
+        let lock_c = match (chars.next(), chars.next()) {
+            (Some(c), None) => c,
+            _ => return raw.clone(),
+        };
+        if !lock_c.is_ascii_digit() {
+            return raw.clone();
+        }
+        let file_rank = if lock_c == '0' {
+            10
+        } else {
+            lock_c.to_digit(10).unwrap_or(0) as usize
+        };
+        if !(2..=10).contains(&file_rank) {
+            return raw.clone();
+        }
+        // 锁到的词（码表原序第 file_rank）→ 在候选显示序里的名次
+        let word = match self.schema.dict.lookup(base).iter().nth(file_rank - 1) {
+            Some(e) => e.text.clone(),
+            None => return raw.clone(),
+        };
+        let disp = match self.schema.candidates(base).iter().position(|c| c.text == word) {
+            Some(i) => i + 1,
+            None => return raw.clone(),
+        };
+        if !(2..=10).contains(&disp) {
+            return raw.clone();
+        }
+        let disp_c = if disp == 10 {
+            '0'
+        } else {
+            char::from_digit(disp as u32, 10).unwrap()
+        };
+        format!("{}{}", base, disp_c)
+    }
+
     pub fn state(&self, session: &Session) -> SessionState {
         let page_size = self.config.candidates.page_size.max(1);
         let pages = (session.candidates.len() + page_size - 1) / page_size;
         let start = (session.page * page_size).min(session.candidates.len());
         let end = (start + page_size).min(session.candidates.len());
-        let mut preedit = session.raw.clone();
+        let mut preedit = self.display_raw(session);
         if !self.config.input.code_disguise.is_empty() && !preedit.is_empty() {
             preedit = format!("{}{}", self.config.input.code_disguise, preedit);
         }
@@ -2459,7 +2531,7 @@ impl Engine {
             })
             .collect();
         SessionState {
-            raw: session.raw.clone(),
+            raw: self.display_raw(session),
             preedit,
             candidates: shown,
             page: session.page,
@@ -2797,6 +2869,54 @@ mod tests {
         let out6 = eng.process_key(&mut s5, key('-'));
         assert!(out6.commit.is_none(), "- 有上页时翻页不上屏");
         assert_eq!(s5.page, 0, "翻回第 1 页");
+    }
+
+    // 【锁态重锁与回显还原 2026-09-06】用户词插入使显示序≠码表序：
+    // jd 显示 [就,到的,新(p3),加]——按 4（加=码表第3）旧实现追加锁字符
+    // 成 jd3，再按数字逐个追加换算名次堆出死码串、候选恒首个锁产物。
+    // 修复：锁态按数字=重锁（换名次不追加）；回显层把尾锁还原为显示
+    // 名次（按 4 回显 jd4）。码表 jd=[就,到的,加]，用户词 新 p3。
+    #[test]
+    fn lock_relock_and_display() {
+        let (mut eng, dir) = test_engine("整句锁显");
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        eng.config.sentence.enabled = true;
+        eng.config.sentence.auto_enable = true;
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        // 按 3（新，用户词）直接上屏
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('3'));
+        assert_eq!(out.commit.unwrap(), "新", "用户词选重直接上屏");
+        // 按 4（加=码表第3）→ 锁式 raw=jd3，回显 jd4（显示名次还原）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out2 = eng.process_key(&mut s2, key('4'));
+        assert!(out2.commit.is_none(), "码表词锁式不上屏");
+        assert_eq!(s2.raw, "jd3", "内部锁值=码表名次 3");
+        assert_eq!(out2.state.as_ref().unwrap().raw, "jd4", "回显还原=显示名次 4");
+        // 锁态再按 3（新，用户词）→ 改选直接上屏（不堆死码）
+        let out3 = eng.process_key(&mut s2, key('3'));
+        assert_eq!(out3.commit.unwrap(), "新", "锁态改选用户词直接上屏");
+        // 锁态再按数字（码表词）→ 重锁（替换名次，不追加）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        eng.process_key(&mut s3, key('4')); // raw=jd3
+        let out4 = eng.process_key(&mut s3, key('2')); // 到的=码表2
+        assert!(out4.commit.is_none());
+        assert_eq!(s3.raw, "jd2", "锁态重锁：raw 仍单锁（码表名次2），非 jd32");
+        // 连按数字不堆死码：再按 4 → 仍 jd3
+        let out5 = eng.process_key(&mut s3, key('4'));
+        assert_eq!(s3.raw, "jd3", "连按数字重锁，raw 恒单锁");
+        assert_eq!(out5.state.as_ref().unwrap().raw, "jd4", "回显随按键还原");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
