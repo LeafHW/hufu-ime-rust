@@ -114,6 +114,9 @@ fn main() {
         }
     }
     let shared = Arc::new(Mutex::new(host));
+    // 【/jq→补充语料 2026-09-06】weight API 运行时触发整句模型重载
+    // 需要 'static 句柄——全局登记。
+    let _ = HOST_HANDLE.set(shared.clone());
     let addr = format!("127.0.0.1:{port}");
 
     // 命名管道（Windows 前端 IPC）独立线程
@@ -129,71 +132,9 @@ fn main() {
 
     // 整句模型后台装载：Host::new 只载词典（秒级），此处线程不持锁
     // 载 ngram（~10s），载完短锁热挂。期间管道/设置页/打字照常
-    // （词典模式），整句能力稍后自动就位——修「装完要等好久才能
+    //（词典模式），整句能力稍后自动就位——修「装完要等好久才能
     // 正常打字」：管道不再被模型加载阻塞。
-    {
-        let shared_bg = shared.clone();
-        std::thread::Builder::new()
-            .name("hufu-ngram-load".into())
-            .spawn(move || {
-                let t0 = std::time::Instant::now();
-                let plan = {
-                    let h = shared_bg.lock().unwrap();
-                    h.sentence_load_plan()
-                };
-                let Some((path, dict, supplement, weights)) = plan else {
-                    return;
-                };
-                // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
-                // 缺页逐条读盘（首句打字偶发卡顿来源）。加载即并行顺序
-                // 读整文件填 page cache（NVMe ~1-2s / SATA ~3-5s，后台 IO
-                // 不阻塞），mmap 随后全命中内存。
-                {
-                    let p = path.clone();
-                    std::thread::Builder::new()
-                        .name("hufu-ngram-warm".into())
-                        .spawn(move || {
-                            let t0 = std::time::Instant::now();
-                            if let Ok(mut f) = std::fs::File::open(&p) {
-                                use std::io::Read;
-                                let mut buf = vec![0u8; 4 << 20];
-                                while let Ok(n) = f.read(&mut buf) {
-                                    if n == 0 {
-                                        break;
-                                    }
-                                }
-                            }
-                            eprintln!(
-                                "ngram 页缓存预热完成（{:.1}s）",
-                                t0.elapsed().as_secs_f32()
-                            );
-                        })
-                        .ok();
-                }
-                match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
-                    Ok(dec) => {
-                        let mut h = shared_bg.lock().unwrap();
-                        // 装载期间用户可能切方案/关整句：只在仍满足
-                        // 门控时挂载，否则弃用本次结果
-                        if h.engine.config.schema.current.contains("整句")
-                            && h.engine.config.sentence.enabled
-                        {
-                            h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
-                            // 【用户词注入 2026-09-06】启动装载后即注入
-                            //（/jc 加词参与整句词图）
-                            h.engine.sync_sentence_user_words();
-                            eprintln!(
-                                "整句引擎已加载（后台 {:.1}s）: {}",
-                                t0.elapsed().as_secs_f32(),
-                                path.display()
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!("整句模型后台加载失败: {e}"),
-                }
-            });
-    }
-
+    spawn_sentence_reload(shared.clone(), false);
     // 【性能】反查表后台预热：启动路径已不载（懒加载省冷启动 ~700ms），
     // 此处稍等片刻（让位 ngram/打字 IO）后装表，用户首按反查前缀
     // （默认 `）前即已就绪。
@@ -282,6 +223,126 @@ fn main() {
     if let Err(e) = http::serve(&addr, Arc::new(handler)) {
         eprintln!("HTTP 服务失败: {e}");
         std::process::exit(1);
+    }
+}
+
+/// 【/jq→补充语料 2026-09-06】weight API 运行时触发整句模型重载需要
+/// 'static 句柄——main 里登记，API 里取用。
+static HOST_HANDLE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Host>>> =
+    std::sync::OnceLock::new();
+
+/// 整句模型后台装载（启动与 /jq 加权后共用）：短锁取装载计划
+///（resupplement=true 时先重读 补充语料.txt 刷新内存快照——补充语料
+/// 只在模型装载时生效，写入后必须重载模型），不持锁载 ngram
+///（page cache 热时 ~2s），载完短锁热挂。期间管道/设置页/打字照常
+///（旧模型继续服务）。
+fn spawn_sentence_reload(
+    shared: std::sync::Arc<std::sync::Mutex<Host>>,
+    resupplement: bool,
+) {
+    std::thread::Builder::new()
+        .name("hufu-ngram-load".into())
+        .spawn(move || {
+            let t0 = std::time::Instant::now();
+            let plan = {
+                let mut h = shared.lock().unwrap();
+                if resupplement {
+                    let p = h.engine.schema.dir.join("补充语料.txt");
+                    match hufu_dict::supplement::Supplement::load(&p) {
+                        Ok(s) => h.engine.schema.supplement = s,
+                        Err(e) => eprintln!("补充语料重读失败: {e}"),
+                    }
+                }
+                h.sentence_load_plan()
+            };
+            let Some((path, dict, supplement, weights)) = plan else {
+                return;
+            };
+            // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
+            // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
+            // 重载时页缓存已热，顺序读很快返回。
+            {
+                let p = path.clone();
+                std::thread::Builder::new()
+                    .name("hufu-ngram-warm".into())
+                    .spawn(move || {
+                        let t0 = std::time::Instant::now();
+                        if let Ok(mut f) = std::fs::File::open(&p) {
+                            use std::io::Read;
+                            let mut buf = vec![0u8; 4 << 20];
+                            while let Ok(n) = f.read(&mut buf) {
+                                if n == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "ngram 页缓存预热完成（{:.1}s）",
+                            t0.elapsed().as_secs_f32()
+                        );
+                    })
+                    .ok();
+            }
+            match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
+                Ok(dec) => {
+                    let mut h = shared.lock().unwrap();
+                    // 装载期间用户可能切方案/关整句：只在仍满足
+                    // 门控时挂载，否则弃用本次结果
+                    if h.engine.config.schema.current.contains("整句")
+                        && h.engine.config.sentence.enabled
+                    {
+                        h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+                        // 【用户词注入 2026-09-06】装载后即注入
+                        //（/jc 加词参与整句词图）
+                        h.engine.sync_sentence_user_words();
+                        eprintln!(
+                            "整句引擎已加载（后台 {:.1}s）: {}",
+                            t0.elapsed().as_secs_f32(),
+                            path.display()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("整句模型后台加载失败: {e}"),
+            }
+        })
+        .ok();
+}
+
+/// 清 补充语料.txt 同词旧行（`词 权重` 格式；# 注释行/空行保留）。
+fn rewrite_supplement_lines(path: &std::path::Path, word: &str) {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    return true;
+                }
+                let first = t.split_whitespace().next().unwrap_or("");
+                first != word
+            })
+            .collect();
+        let mut s = kept.join("\n");
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        let _ = std::fs::write(path, s.as_bytes());
+        // 【审计】行数变化落 adj-audit.log（与 用户调整.txt 同款抓现场）
+        if let Some(dir) = path.parent() {
+            use std::io::Write;
+            if let Ok(mut a) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("adj-audit.log"))
+            {
+                let _ = writeln!(
+                    a,
+                    "[server supplement] {word} 前={} 后={}",
+                    content.lines().count(),
+                    kept.len() + 1
+                );
+            }
+        }
     }
 }
 
@@ -537,9 +598,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/weight") => {
-            // 【/jq 加权 2026-09-06】词+权重（缺省 1000）→ 反查最优码
-            // → 写 用户调整.txt：{加权}码\t词\t权重（同码同词旧行全清，
-            // 含 {删除}——加权=明确想要它）→ 重载。
+            // 【/jq→补充语料 2026-09-06 用户拍板】词+权重 → 写当前方案
+            // 的 补充语料.txt：`词 权重`（同词旧行先清）——/jq 的语义
+            // 是「提升整句里这个词的概率」，这正是补充语料的职责
+            //（ngram 词图注入，奖励 = 9+2·ln(权重/1000)，上限 32）。
+            // 补充语料只在模型装载时生效 → 写完后台重载整句引擎
+            //（~2s，期间旧模型继续服务）。不再写 用户调整.txt 的
+            // {加权} 行（旧行回放兼容保留）。
             let v = req.json();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
             let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
@@ -549,12 +614,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !(1..=1_000_000_000).contains(&weight) {
                 return Response::err(400, "权重须为正整数");
             }
-            let Some(code) = host.engine.schema.best_code_of(&text) else {
-                return Response::err(404, "码表中找不到该词的编码");
-            };
-            let file = host.engine.schema.dir.join("用户调整.txt");
-            rewrite_keep_lines(&file, &code, &text);
-            let line = format!("{{加权}}{code}\t{text}\t{weight}\n");
+            let file = host.engine.schema.dir.join("补充语料.txt");
+            rewrite_supplement_lines(&file, &text);
+            let line = format!("{text} {weight}\n");
             use std::io::Write;
             let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
                 Ok(f) => f,
@@ -563,9 +625,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if let Err(e) = f.write_all(line.as_bytes()) {
                 return Response::err(500, &format!("写入失败: {e}"));
             }
-            // 小窗关闭的同时重载码表（用户规格）+同步整句注入
-            host.engine.reload_user_data();
-            Response::json(&serde_json::json!({"ok": true, "code": code}))
+            // 后台重载整句模型（刷新补充语料快照→重载 ngram→热挂）
+            if let Some(h) = HOST_HANDLE.get() {
+                spawn_sentence_reload(h.clone(), true);
+            }
+            Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/remove") => {
             let v = req.json();
