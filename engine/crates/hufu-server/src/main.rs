@@ -522,6 +522,51 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             host.engine.reload_user_data();
             Response::json(&serde_json::json!({"ok": true}))
         }
+        ("POST", "/api/user_word/weight") => {
+            // 【/jq 加权 2026-09-06】词+权重（缺省 1000）→ 反查最优码
+            // → 写 用户词.txt 词行 weight 列（去重同码同词旧行）→ 重载。
+            // 用户词在 candidates 置顶组——加权词提到候选前部。
+            let v = req.json();
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
+            if text.is_empty() {
+                return Response::err(400, "词不能为空");
+            }
+            if !(1..=1_000_000_000).contains(&weight) {
+                return Response::err(400, "权重须为正整数");
+            }
+            let Some(code) = host.engine.schema.best_code_of(&text) else {
+                return Response::err(404, "码表中找不到该词的编码");
+            };
+            let file = host.engine.schema.dir.join("用户词.txt");
+            if file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    let kept: String = content
+                        .lines()
+                        .filter(|l| {
+                            let mut it = l.split('\t');
+                            let c = it.next().unwrap_or("").trim();
+                            let t = it.next().unwrap_or("").trim();
+                            !(t == text && c == code)
+                        })
+                        .map(|l| format!("{l}\n"))
+                        .collect();
+                    let _ = std::fs::write(&file, kept.as_bytes());
+                }
+            }
+            let line = format!("{code}\t{text}\t{weight}\n");
+            use std::io::Write;
+            let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+                Ok(f) => f,
+                Err(e) => return Response::err(500, &format!("写入失败: {e}")),
+            };
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                return Response::err(500, &format!("写入失败: {e}"));
+            }
+            // 小窗关闭的同时重载码表（用户规格）+同步整句注入
+            host.engine.reload_user_data();
+            Response::json(&serde_json::json!({"ok": true, "code": code}))
+        }
         ("POST", "/api/user_word/remove") => {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();

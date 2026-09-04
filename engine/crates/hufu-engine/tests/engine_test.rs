@@ -145,9 +145,12 @@ fn quick_symbol_auto_commit() {
 #[test]
 fn slash_dunhao_and_symbols() {
     let (mut engine, mut session, _dir) = setup();
-    // / 空格 → 顿号
+    // 【2026-09-06 双档】默认（直出档）：空态 / = 、 直接上屏
     let out = engine.process_key(&mut session, key('/'));
-    assert_eq!(out.state.unwrap().candidates[0].text, "、");
+    assert_eq!(out.commit.as_deref(), Some("、"), "直出档空态 / 直出顿号");
+    // 命名空间档（关直出）：/ 进候选首位=、，空格确认
+    engine.config.input.slash_dunhao = false;
+    engine.process_key(&mut session, key('/'));
     let out = engine.process_key(&mut session, key(' '));
     assert_eq!(out.commit.as_deref(), Some("、"));
     // /tm → ™

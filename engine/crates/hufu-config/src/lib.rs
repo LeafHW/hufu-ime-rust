@@ -136,7 +136,9 @@ pub struct InputSection {
     pub default_chinese: bool,
     /// 中文态使用英文标点
     pub ascii_punct: bool,
-    /// 无编码时 `/` 输出顿号
+    /// `/`=顿时直出，屏蔽码表内/相关内容：开启后空态按 / 直接上屏
+    /// 「、」（不进 / 符号命名空间）、有候选时首选+「、」；关闭时
+    /// / 进符号命名空间（首位顿号需空格确认，继续 / 按数量出 /）
     pub slash_dunhao: bool,
     /// 无编码时「;」引导标点：;+空格=：、;;=；直上
     pub semicolon_guide: bool,
