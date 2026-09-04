@@ -940,10 +940,11 @@ impl EditSession_Impl {
             }
             Op::Commit(text) => {
                 // 【功能词拦截 2026-09-06】{加词}：不上屏，弹加词小窗
-                //（词+码 → server /api/user_word/add）；{隐藏候选}：不上
-                // 屏，只收起候选窗。两者都先把组段清空结束（preedit 里的
-                // /jc 之类不落文档）。
-                if text == "{加词}" || text == "{隐藏候选}" {
+                //（词+码 → server /api/user_word/add）；{加权}：不上屏，
+                // 弹加权小窗（/jq → server 反查最优码提权）；{隐藏候选}：
+                // 不上屏，只收起候选窗。三者都先把组段清空结束（preedit
+                // 里的 /jc 之类不落文档）。
+                if text == "{加词}" || text == "{加权}" || text == "{隐藏候选}" {
                     if let Some(comp) = g.composition.clone() {
                         if let Ok(range) = (unsafe { comp.GetRange() }) {
                             let empty: Vec<u16> = Vec::new();
@@ -955,6 +956,9 @@ impl EditSession_Impl {
                     if text == "{加词}" {
                         drop(g);
                         crate::addword::open();
+                    } else if text == "{加权}" {
+                        drop(g);
+                        crate::addword::open_weight();
                     } else {
                         if let Some(c) = g.cand2.as_mut() {
                             c.hide();

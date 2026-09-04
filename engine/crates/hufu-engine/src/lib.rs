@@ -399,6 +399,10 @@ pub struct Engine {
     opencc: Option<hufu_dict::OpenCc>,
     opencc_emoji: Option<hufu_dict::OpenCc>,
     opencc_loaded: bool,
+    /// 【延迟重载 2026-09-06】候选框内调频/删词后置位；候选框消失
+    ///（raw 清空且无待上屏）时才 reload 用户数据+同步整句注入——
+    /// 用户在候选框连续操作期间不被重载打断。
+    pub pending_user_reload: bool,
 }
 
 impl Engine {
@@ -464,6 +468,7 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
+            pending_user_reload: false,
         };
         // 反查表覆盖（config.reverse.table）——【性能】懒加载：只设
         // 路径不读文件（见 Schema::reverse 注释）；与方案内自动探测
@@ -500,6 +505,7 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
+            pending_user_reload: false,
         };
         if !rev_name.is_empty() {
             let p = rev_dir.join(&rev_name);
@@ -646,6 +652,18 @@ impl Engine {
         // 空格/选重等不改变 raw 的操作即拿到新顺序
         self.apply_rerank(session);
         let mut out = self.process_key_inner(session, key);
+        // 【延迟重载 2026-09-06】候选框内调频/删词后，等候选框消失
+        //（raw 空、无待上屏、无候选）再统一 reload 用户数据+同步整句
+        // 注入——连续操作不被重载打断（用户规格：一定是弄完后候选框
+        // 消失才重载）。
+        if self.pending_user_reload
+            && session.raw.is_empty()
+            && session.pending_commit.is_none()
+            && session.candidates.is_empty()
+        {
+            self.pending_user_reload = false;
+            self.reload_user_data();
+        }
         // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
         if self.config.sound.enabled && out.consumed {
             let tag = self.sound_hint.unwrap_or(if out.commit.is_some() {
@@ -871,10 +889,16 @@ impl Engine {
                     }
                 }
             }
-            // '/' 符号命名空间（首选顿号，继续输入进入 /xx 符号）
-            if c == '/'
-                && (self.config.input.slash_dunhao || self.has_continuation_prefix("/"))
-            {
+            // 【/=顿时直出 2026-09-06】开启（slash_dunhao）后空态按 /
+            // =「、」直接上屏：不进 / 符号命名空间（屏蔽码表内 / 相关
+            // 编码）、无候选无二次确认；有候选时 / = 首选上屏+「、」
+            //（走下方编码态标点顶字，punct 表 /→、）。
+            if c == '/' && self.config.input.slash_dunhao {
+                return KeyOutcome::commit("、", self.state(session));
+            }
+            // '/' 符号命名空间（关闭直出档=现状：首选顿号，继续输入进入
+            // /xx 符号；再按 / 按数量出 /）
+            if c == '/' && self.has_continuation_prefix("/") {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
@@ -908,11 +932,28 @@ impl Engine {
         }
 
         // —— 有编码态 ——
-        // 【` 顶屏 2026-09-06】编码态按 `（反查引导键）= 直接顶当前
-        // 首选上屏（用户规格：有候选时按 · 顶屏；Shift+` 走下方 Shift
-        // 标点拦截出「首选~」）。置于其他引导之前——` 不是编码字符。
+        // 【/ 数量追加 2026-09-06】raw 以 / 开头（命名空间档）时再按 /
+        // = 继续串：//、/// 候选按数量出 /（走标点会顶字打断）。
+        if c == '/' && !shift && session.raw.starts_with('/') {
+            session.raw.push(c);
+            self.refresh_candidates(session);
+            return KeyOutcome::consumed(self.state(session));
+        }
+        // 【` 顶屏 2026-09-06】编码态按 `（反查引导键）= 顶当前首选
+        // 上屏并追加间隔号「·」（用户规格：有候选时按 · 顶屏带 ·；
+        // Shift+` 走下方 Shift 标点拦截出「首选~」）。置于其他引导
+        // 之前——` 不是编码字符。
         if c == self.config.reverse.prefix && !shift {
-            return self.select_first(session);
+            if session.candidates.is_empty() {
+                session.clear();
+                return KeyOutcome::consumed(self.state(session));
+            }
+            let idx = session
+                .selected
+                .min(session.candidates.len().saturating_sub(1));
+            let first = session.candidates[idx].commit_text().to_string();
+            session.clear();
+            return KeyOutcome::commit(format!("{first}·"), self.state(session));
         }
         // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
         // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
@@ -1077,6 +1118,11 @@ impl Engine {
     fn punct_output(&mut self, session: &mut Session, c: char) -> Option<(String, u8)> {
         if !c.is_ascii_punctuation() {
             return None;
+        }
+        // 【/=顿时直出 2026-09-06】直出档编码态 / =「、」（标点顶字：
+        // 首选上屏+、）；命名空间档不受影响（/ 走原全角映射）
+        if c == '/' && self.config.input.slash_dunhao {
+            return Some(("、".into(), 0));
         }
         if self.config.input.ascii_punct {
             return Some((c.to_string(), 0));
@@ -1863,6 +1909,10 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         self.adjust_pin(&cand.code, &cand.text);
+        // 【延迟重载 2026-09-06】不立即 reload——用户可能继续在候选框
+        // 操作（连续调频/删词）；候选框消失时（process_key 出口）统一
+        // reload+同步整句注入。
+        self.pending_user_reload = true;
         let keep_raw = session.raw.clone();
         session.clear();
         session.raw = keep_raw;
@@ -1883,6 +1933,8 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         self.adjust_hide(&cand.code, &cand.text);
+        // 【延迟重载 2026-09-06】同 op_pin_candidate
+        self.pending_user_reload = true;
         let keep_raw = session.raw.clone();
         session.clear();
         session.raw = keep_raw;
@@ -2389,12 +2441,24 @@ impl Engine {
                 .collect();
         }
         // 空态标点首选：/ → 顿号、; → 全角分号、' → 左单引号
+        // 【2026-09-06 双档】/ 候选与 slash_dunhao 解耦：
+        // - 命名空间档（关闭直出）：raw=/ 首位=、（空格确认出、；
+        //   继续 /xx 进符号）；raw 全 /（//、///）时候选=按数量出 /
+        //   （半角斜杠串，用户规格）。
+        // - 直出档空态根本不进 raw（直接 commit 、）。
         if session.candidates.is_empty() {
-            let fallback = match session.raw.as_str() {
-                "/" if self.config.input.slash_dunhao => Some("、"),
-                ";" => Some("；"),
-                "'" => Some("‘"),
-                _ => None,
+            // 全 / 串（//、///）=按数量出 /；单个 / 落下方首位顿号
+            let all_slash = session.raw.len() >= 2
+                && session.raw.chars().all(|c| c == '/');
+            let fallback = if all_slash {
+                Some(session.raw.as_str())
+            } else {
+                match session.raw.as_str() {
+                    "/" => Some("、"),
+                    ";" => Some("；"),
+                    "'" => Some("‘"),
+                    _ => None,
+                }
             };
             if let Some(t) = fallback {
                 session
@@ -2693,6 +2757,8 @@ impl Engine {
                         c.text = self.last_commit.clone();
                     } else if tag == "加词" {
                         c.text = "＋加词".into();
+                    } else if tag == "加权" {
+                        c.text = "＊加权".into();
                     } else if tag == "隐藏候选" {
                         c.text = "－隐藏候选".into();
                     } else if let Some(v) = dynamic::expand(tag) {
@@ -2717,7 +2783,9 @@ impl Engine {
             aux: match session.mode {
                 // 【2026-09-05】反查提示精简为「〔反查〕」——TSF 端把它与
                 // raw 拼接成编码行「〔反查〕 ni」，全程提示反查态。
-                InputMode::Reverse => "〔反查〕".into(),
+                // 【2026-09-06】前置「·」：第一下 ` 的编码行即显示
+                // 「·〔反查〕」——再按一下出「·」的预告（用户规格）。
+                InputMode::Reverse => "·〔反查〕".into(),
                 InputMode::Command => "〔命令〕".into(),
                 _ => String::new(),
             },
@@ -3405,11 +3473,11 @@ mod tests {
         );
         assert_eq!(out.commit.unwrap(), "·", "双击 ` = ·");
         assert_eq!(s.mode, InputMode::Normal, "退出反查");
-        // 编码态按 ` → 顶首选（jd 首选=就）
+        // 编码态按 ` → 顶首选+·（2026-09-06 用户规格：顶屏带间隔号）
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let out = eng.process_key(&mut s, key('`'));
-        assert_eq!(out.commit.unwrap(), "就", "编码态 ` 顶首选");
+        assert_eq!(out.commit.unwrap(), "就·", "编码态 ` 顶首选带 ·");
         assert!(s.raw.is_empty(), "顶屏后清缓冲");
     }
 
@@ -3444,6 +3512,110 @@ mod tests {
         let got = sink.lock().unwrap().clone();
         assert!(got.contains(&("fj".into(), "行".into())), "用户词同步: {got:?}");
         assert!(got.contains(&("xx".into(), "测试词".into())), "全部词条: {got:?}");
+    }
+
+    // 【2026-09-06 批次】/ 双档（直出/命名空间）、` 顶屏带·、/jq 加权
+    // 透传、调频延迟重载。
+    #[test]
+    fn slash_dual_mode_and_quote() {
+        let (_eng, dir) = test_engine("sdq");
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n/jc\t{加词}\n/jq\t{加权}\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, {
+            let mut c = Config::default();
+            c.input.slash_dunhao = true;
+            c
+        })
+        .unwrap();
+        let mut s = Session::new(true);
+        // 直出档：空态 / = 、 直出
+        let out = eng.process_key(&mut s, key('/'));
+        assert_eq!(out.commit.unwrap(), "、", "直出档空态 / 直出顿号");
+        assert!(s.raw.is_empty(), "不进命名空间");
+        // 编码态 / = 首选+、
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('/'));
+        assert_eq!(out.commit.unwrap(), "就、", "直出档编码态 / = 首选+顿号");
+        // 编码态 ` = 首选+·
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(out.commit.unwrap(), "就·", "编码态 ` 顶首选带间隔号");
+        // 直出档下 / 一切前缀编码（含 /jq）均屏蔽——第一键即出顿号：
+        let out = eng.process_key(&mut s, key('/'));
+        assert_eq!(out.commit.unwrap(), "、", "直出档 / 前缀码被屏蔽");
+
+        // 命名空间档（slash_dunhao=false）：/ 进 raw、首选、空格确认；
+        // // 候选=按数量出 /；/jq 功能词透传 {加权}
+        let (_eng2, dir2) = test_engine("sdq2");
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t2\na\t啊\n/jc\t{加词}\n/jq\t{加权}\n",
+        )
+        .unwrap();
+        let mut eng2 = Engine::with_schema_dir(&dir2, {
+            // 命名空间档测试：显式关直出
+            let mut c = Config::default();
+            c.input.slash_dunhao = false;
+            c
+        })
+        .unwrap();
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('/'));
+        assert_eq!(s2.raw, "/", "命名空间档 / 进 raw");
+        let first = s2.candidates.first().unwrap().text.clone();
+        assert_eq!(first, "、", "命名空间档首选=顿号（空格确认）");
+        let out = eng2.process_key(&mut s2, key(' '));
+        assert_eq!(out.commit.unwrap(), "、", "空格确认出顿号");
+        eng2.process_key(&mut s2, key('/'));
+        eng2.process_key(&mut s2, key('/'));
+        let cand = s2.candidates.first().unwrap().text.clone();
+        assert_eq!(cand, "//", "连按 // 候选按数量出 /");
+        let _ = eng2.process_key(&mut s2, key(' '));
+        // /jq 功能词透传 {加权}（命名空间档；快符唯一候选=尾键即上屏）
+        eng2.process_key(&mut s2, key('/'));
+        eng2.process_key(&mut s2, key('j'));
+        let out = eng2.process_key(&mut s2, key('q'));
+        assert_eq!(out.commit.unwrap(), "{加权}", "加权指令透传");
+    }
+
+    // 【延迟重载 2026-09-06】调频后 pending；候选框消失（Escape）才 reload
+    #[test]
+    fn deferred_reload_after_adjust() {
+        let (mut eng, _dir) = test_engine("dfr");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // Ctrl+2 调频：pending 置位、候选仍在（raw 保留）
+        eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('2'),
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                is_press: true,
+            },
+        );
+        assert!(eng.pending_user_reload, "调频后置 pending");
+        assert_eq!(s.raw, "jd", "候选框还在（raw 保留）");
+        assert!(!s.candidates.is_empty(), "候选仍在");
+        // Escape：候选框消失 → 触发 reload（pending 清）
+        eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Escape,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(s.raw.is_empty() && s.candidates.is_empty(), "候选框消失");
+        assert!(!eng.pending_user_reload, "消失时已 reload 并清 pending");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
@@ -3601,7 +3773,13 @@ mod tests {
             "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n",
         )
         .unwrap();
-        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, {
+            // /rq 走 / 命名空间——须关直出档（slash_dunhao=true 时 / 直出顿号）
+            let mut c = Config::default();
+            c.input.slash_dunhao = false;
+            c
+        })
+        .unwrap();
         let mut s = Session::new(true);
 
         // /rq：候选显示实时日期值（非字面标记），上屏同值

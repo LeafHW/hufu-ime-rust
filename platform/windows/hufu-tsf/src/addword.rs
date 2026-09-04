@@ -1,9 +1,10 @@
-//! {加词} 弹窗：`/jc {加词}` 选中后弹小窗。三个输入框（词 / 编码 /
-//! 选重位）+ 候选顺序实时预览。预览做成候选窗样式：每项「序号+词」
-//! 分色（label/text 色）流式排列，新词高亮底块；配色与字体套用当前
-//! 皮肤（colors + layout.font_*）。每次键入（EN_UPDATE=0x400）立即刷
-//! 新；预览变多窗口自适应加高，确定/取消恒在底部。窗口独立线程跑消
-//! 息循环不阻塞 TSF。
+//! {加词}/{加权} 弹窗：`/jc {加词}`、`/jq {加权}` 选中后弹小窗。
+//! 加词=三输入框（词 / 编码 / 选重位）+ 候选顺序实时预览；加权=两框
+//!（词 / 权重，缺省 1000；编码由 server 反查最优码）。预览做成候选窗
+//! 样式：每项「序号+词」分色（label/text 色）流式排列，新词高亮底块；
+//! 配色与字体套用当前皮肤（colors + layout.font_*）。每次键入
+//!（EN_UPDATE=0x400）立即刷新；预览变多窗口自适应加高，确定/取消恒
+//! 在底部。窗口独立线程跑消息循环不阻塞 TSF。
 
 use windows::core::*;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -186,8 +187,28 @@ fn load_skin() {
     *g = Some(s);
 }
 
+/// 窗模式：false=加词（三框+预览），true=加权（词+权重两框）。
+/// 【/jq 加权 2026-09-06】加权=提升该词权重（server 反查最优码，
+/// 写 用户词.txt 词行 weight 列；缺省 1000）。
+static MODE_WEIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_weight_mode() -> bool {
+    MODE_WEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 弹出加词窗（非阻塞：新线程 + 消息循环）。
 pub fn open() {
+    MODE_WEIGHT.store(false, std::sync::atomic::Ordering::Relaxed);
+    open_common();
+}
+
+/// 弹出加权窗（/jq {加权} 触发；词+权重两框）。
+pub fn open_weight() {
+    MODE_WEIGHT.store(true, std::sync::atomic::Ordering::Relaxed);
+    open_common();
+}
+
+fn open_common() {
     std::thread::spawn(|| unsafe {
         crate::tsf::trace("addword open（线程已起）");
         load_skin();
@@ -206,11 +227,16 @@ pub fn open() {
         };
         let _ = RegisterClassW(&wc);
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        let h = outer_h(300);
+        let title: Vec<u16> = if is_weight_mode() {
+            "虎符 · 加权".encode_utf16().collect()
+        } else {
+            "虎符 · 加词".encode_utf16().collect()
+        };
+        let h = outer_h(if is_weight_mode() { 200 } else { 300 });
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
             CLASS,
-            w!("虎符 · 加词"),
+            PCWSTR(title.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             (sw - WIN_W) / 2,
             (sh - h) / 2,
@@ -289,11 +315,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 v
             };
             let mut first_edit = HWND::default();
-            let rows: [(&str, i32, u32); 3] = [
-                ("词（要打出的内容）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
-                ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
-                ("选重位（第几选，留空=首选）", ID_POS, WS_TABSTOP.0 | 0x80u32 | 0x2000u32),
-            ];
+            // 【加权模式 2026-09-06】两框：词 + 权重（编码由 server
+            // 反查；不建选重位）；加词模式=原有三框
+            let rows: Vec<(&str, i32, u32)> = if is_weight_mode() {
+                vec![
+                    ("词（要加权的字或词）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
+                    (
+                        "权重（留空=1000）",
+                        ID_CODE,
+                        WS_TABSTOP.0 | 0x80u32 | 0x2000u32,
+                    ),
+                ]
+            } else {
+                vec![
+                    ("词（要打出的内容）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
+                    ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
+                    ("选重位（第几选，留空=首选）", ID_POS, WS_TABSTOP.0 | 0x80u32 | 0x2000u32),
+                ]
+            };
             for (i, (label, id, extra)) in rows.iter().enumerate() {
                 let y = 14 + i as i32 * 62;
                 let lbl_txt = mk(label);
@@ -327,20 +366,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     first_edit = ed;
                 }
             }
-            let t1 = mk("该编码候选（实时，第 N 选参考）：");
-            let pt = create_child(
-                hwnd,
-                w!("STATIC"),
-                PCWSTR(t1.as_ptr()),
-                WINDOW_EX_STYLE(0),
-                0,
-                PV_X,
-                202,
-                340,
-                22,
-                0,
-            );
-            set_item_font(pt, true);
+            if !is_weight_mode() {
+                let t1 = mk("该编码候选（实时，第 N 选参考）：");
+                let pt = create_child(
+                    hwnd,
+                    w!("STATIC"),
+                    PCWSTR(t1.as_ptr()),
+                    WINDOW_EX_STYLE(0),
+                    0,
+                    PV_X,
+                    202,
+                    340,
+                    22,
+                    0,
+                );
+                set_item_font(pt, true);
+            }
             for (label, id) in [("确定", ID_OK), ("取消", ID_CANCEL)] {
                 let btxt = mk(label);
                 let btn = create_child(
@@ -588,6 +629,42 @@ unsafe fn refresh_preview(hwnd: HWND) {
         let n = GetWindowTextW(h, &mut buf);
         String::from_utf16_lossy(&buf[..n.max(0) as usize])
     };
+    // 【加权模式 2026-09-06】单行提示：确定后 server 反查最优码并
+    // 以用户词 weight 提权（词将排到候选前部）
+    if is_weight_mode() {
+        clear_items();
+        let word = read_box(ID_WORD).trim().to_string();
+        let wv: i64 = read_box(ID_CODE).trim().parse().unwrap_or(1000);
+        let wv = if read_box(ID_CODE).trim().is_empty() { 1000 } else { wv };
+        let msg = if word.is_empty() {
+            "输入词后确定：编码自动反查，该词将提到候选前部。".to_string()
+        } else {
+            format!("『{word}』权重 {wv}：确定后提到候选前部。")
+        };
+        let em = SKIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.font_pt)
+            .unwrap_or(16);
+        let t = utf16z(&msg);
+        let h = create_child(
+            hwnd,
+            w!("STATIC"),
+            PCWSTR(t.as_ptr()),
+            WINDOW_EX_STYLE(0),
+            0,
+            PV_X,
+            156,
+            PV_W,
+            em + 10,
+            0,
+        );
+        set_item_font(h, false);
+        ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(h.0 as isize);
+        let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+        return;
+    }
     let code = read_box(ID_CODE).trim().to_string();
     let word = read_box(ID_WORD).trim().to_string();
     let pos: usize = read_box(ID_POS).trim().parse().unwrap_or(0);
@@ -747,6 +824,24 @@ unsafe fn submit(hwnd: HWND) {
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
+    // 【加权模式 2026-09-06】词+权重（缺省 1000）→ server 反查最优码
+    if is_weight_mode() {
+        let Some(word) = word else { return };
+        let word = word.trim().to_string();
+        if word.is_empty() {
+            return;
+        }
+        let wv: i64 = code
+            .as_deref()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1000);
+        if post_weight(&word, wv) {
+            crate::tsf::trace(&format!("addweight ok: {word} *{wv}"));
+        } else {
+            crate::tsf::trace(&format!("addweight POST 失败: {word} *{wv}"));
+        }
+        return;
+    }
     let (Some(word), Some(code)) = (word, code) else {
         return;
     };
@@ -762,6 +857,13 @@ unsafe fn submit(hwnd: HWND) {
     }
 }
 
+/// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/weight。
+fn post_weight(word: &str, weight: i64) -> bool {
+    let esc = |s: &str| -> String { s.replace('\\', "\\\\").replace('"', "\\\"") };
+    let body = format!("{{\"text\":\"{}\",\"weight\":{}}}", esc(word), weight);
+    http_post_json("/api/user_word/weight", &body)
+}
+
 /// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/add。
 fn post_add(code: &str, word: &str, pos: i64) -> bool {
     use std::io::{Read, Write};
@@ -772,8 +874,14 @@ fn post_add(code: &str, word: &str, pos: i64) -> bool {
         esc(word),
         pos
     );
+    http_post_json("/api/user_word/add", &body)
+}
+
+/// 公共 POST（path + JSON body → 200 即成功）。
+fn http_post_json(path: &str, body: &str) -> bool {
+    use std::io::{Read, Write};
     let req = format!(
-        "POST /api/user_word/add HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
