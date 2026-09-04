@@ -179,6 +179,9 @@ fn main() {
                             && h.engine.config.sentence.enabled
                         {
                             h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+                            // 【用户词注入 2026-09-06】启动装载后即注入
+                            //（/jc 加词参与整句词图）
+                            h.engine.sync_sentence_user_words();
                             eprintln!(
                                 "整句引擎已加载（后台 {:.1}s）: {}",
                                 t0.elapsed().as_secs_f32(),

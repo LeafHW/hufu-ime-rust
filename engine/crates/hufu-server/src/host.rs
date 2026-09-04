@@ -166,6 +166,9 @@ impl Host {
                     let _ = dec.decode_to_strings("buhuibuhuibuhuibuhuibuhuibuhui");
                     let _ = dec.decode_to_strings("geaenwlcghxirlwddsyftuuuwwjjgffdd");
                     self.engine.set_sentence_decoder(Some(dec));
+                    // 【用户词注入 2026-09-06】启动即注入（/jc 加词参与
+                    // 整句词图；后续 reload_user_data 热更）
+                    self.engine.sync_sentence_user_words();
                     eprintln!("整句引擎已加载: {}", path.display());
                     return;
                 }

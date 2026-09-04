@@ -90,6 +90,9 @@ pub trait SentenceDecoder: Send + Sync {
             })
             .collect()
     }
+    /// 【用户词注入 2026-09-06】热更新用户词表（/jc 加词参与整句词图）。
+    /// 默认空实现（MockDec 等测试解码器不需要）。
+    fn set_user_words(&self, _words: &[(String, String)]) {}
 }
 
 /// 【Shift 标点 2026-09-05】US 键盘 Shift 形态（基础键 → Shift 字符）。
@@ -599,6 +602,26 @@ impl Engine {
         }
         // 无条件覆盖：文件里调整行清空时内存态也要归零
         self.schema.adjust = hufu_dict::user::UserAdjust::parse(&replay);
+        // 【用户词注入整句 2026-09-06】加词后整句词图同步热更
+        self.sync_sentence_user_words();
+    }
+
+    /// 把用户词库同步进整句解码器（去重后的 code→text 列表；
+    /// 整句未启用/解码器不支持注入时静默跳过）。
+    pub fn sync_sentence_user_words(&self) {
+        if let Some(dec) = &self.sentence {
+            let mut seen = std::collections::HashSet::new();
+            let words: Vec<(String, String)> = self
+                .schema
+                .user_dict
+                .entries
+                .iter()
+                .filter(|e| !e.code.is_empty() && !e.text.is_empty())
+                .filter(|e| seen.insert((e.code.clone(), e.text.clone())))
+                .map(|e| (e.code.clone(), e.text.clone()))
+                .collect();
+            dec.set_user_words(&words);
+        }
     }
 
     /// 方案是否启用整句。
@@ -817,8 +840,12 @@ impl Engine {
         }
 
         if session.raw.is_empty() {
-            // 反查引导
-            if c == self.config.reverse.prefix && self.config.reverse.enabled {
+            // 反查引导（Shift+` 是 ~ 波浪号，不进反查——2026-09-06
+            // 用户规格：空态 Shift+`=「~」上屏）
+            if c == self.config.reverse.prefix
+                && self.config.reverse.enabled
+                && !shift
+            {
                 session.mode = InputMode::Reverse;
                 return KeyOutcome::consumed(self.state(session));
             }
@@ -881,6 +908,12 @@ impl Engine {
         }
 
         // —— 有编码态 ——
+        // 【` 顶屏 2026-09-06】编码态按 `（反查引导键）= 直接顶当前
+        // 首选上屏（用户规格：有候选时按 · 顶屏；Shift+` 走下方 Shift
+        // 标点拦截出「首选~」）。置于其他引导之前——` 不是编码字符。
+        if c == self.config.reverse.prefix && !shift {
+            return self.select_first(session);
+        }
         // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
         // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
         if c == ';' && !shift && session.raw == ";" && self.config.input.semicolon_guide {
@@ -1747,7 +1780,14 @@ impl Engine {
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
             }
-            if c == ' ' || c == self.config.reverse.prefix {
+            // 【按两下 ` = 间隔号 2026-09-06】反查态再按 `（第二下）
+            // 直接上屏「·」退出反查（虎爪语义；原先空吞）
+            if c == self.config.reverse.prefix {
+                session.mode = InputMode::Normal;
+                session.clear();
+                return KeyOutcome::commit("·", self.state(session));
+            }
+            if c == ' ' {
                 return KeyOutcome::consumed(self.state(session));
             }
             session.mode = InputMode::Normal;
@@ -3322,6 +3362,88 @@ mod tests {
         // 到的 后 pin 更新在前) → 新(p3) → 加 被删
         assert_eq!(texts, vec!["到的", "就", "新"], "混载回放: {texts:?}");
         assert_eq!(eng.schema.user_dict.entries.len(), 1, "TSV 词行入用户词库");
+    }
+
+    // 【` 键四态 2026-09-06】空态单击=反查、反查态再按=「·」上屏、
+    // Shift+`=「~」、编码态=顶当前首选上屏。
+    #[test]
+    fn quote_key_four_states() {
+        let (mut eng, _dir) = test_engine("quote");
+        let mut s = Session::new(true);
+        // 空态 Shift+` → ~（不进反查）
+        let out = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('`'),
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                is_press: true,
+            },
+        );
+        assert_eq!(out.commit.unwrap(), "~", "Shift+` = ~");
+        assert_eq!(s.mode, InputMode::Normal, "Shift+` 不进反查");
+        // 空态单击 ` → 反查
+        eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('`'),
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert_eq!(s.mode, InputMode::Reverse, "单击 ` 进反查");
+        // 反查态再按 `（第二下）→ · 上屏退出
+        let out = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('`'),
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert_eq!(out.commit.unwrap(), "·", "双击 ` = ·");
+        assert_eq!(s.mode, InputMode::Normal, "退出反查");
+        // 编码态按 ` → 顶首选（jd 首选=就）
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(out.commit.unwrap(), "就", "编码态 ` 顶首选");
+        assert!(s.raw.is_empty(), "顶屏后清缓冲");
+    }
+
+    // 【用户词注入管道 2026-09-06】reload_user_data 后用户词同步进
+    // 整句解码器（词图注入效果由真机整句验证）。
+    #[test]
+    fn user_word_sync_to_decoder() {
+        let (mut eng, dir) = test_engine("uwsync");
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\nfj\t行\t1\tp2\nxx\t测试词\t1\n",
+        )
+        .unwrap();
+        // 注入记录型解码器
+        struct Rec(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+        impl SentenceDecoder for Rec {
+            fn decode_rich(&self, _raw: &str) -> std::sync::Arc<SentenceDecode> {
+                std::sync::Arc::new(SentenceDecode {
+                    hits: Vec::new(),
+                    truncated: false,
+                    early_hits: Vec::new(),
+                    early_truncated: false,
+                })
+            }
+            fn set_user_words(&self, words: &[(String, String)]) {
+                *self.0.lock().unwrap() = words.to_vec();
+            }
+        }
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        eng.set_sentence_decoder(Some(Arc::new(Rec(sink.clone()))));
+        eng.reload_user_data();
+        let got = sink.lock().unwrap().clone();
+        assert!(got.contains(&("fj".into(), "行".into())), "用户词同步: {got:?}");
+        assert!(got.contains(&("xx".into(), "测试词".into())), "全部词条: {got:?}");
     }
 
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
