@@ -659,12 +659,17 @@ impl Engine {
                         }
                     }
                 }
-                // Ctrl+Shift+数字：置顶当前页第 N 候选
-                if m.shift {
-                    if let Some(n) = c.to_digit(10) {
-                        let idx = if n == 0 { 9 } else { (n - 1) as usize };
-                        return self.op_pin_candidate(session, idx);
+                // 【候选框调频/删词 2026-09-06】Ctrl+数字=把当前页第 N 候选
+                // 移到首位（其余统一后移）、Ctrl+Shift+数字=删除该位置的
+                // 字/词。写 用户调整.txt 追加日志（{置顶}/{删除}），不碰
+                // 原始码表。整句组合候选（Sentence）是临时组句非词条，
+                // 不参与调频/删词。
+                if let Some(n) = c.to_digit(10) {
+                    let idx = if n == 0 { 9 } else { (n - 1) as usize };
+                    if m.shift {
+                        return self.op_hide_candidate(session, idx);
                     }
+                    return self.op_pin_candidate(session, idx);
                 }
             }
             // Ctrl+Delete：软删当前页首选
@@ -1800,6 +1805,10 @@ impl Engine {
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
+        // 整句组合候选是临时组句（code=整段 raw）非词条，不参与调频
+        if cand.source == CandidateKind::Sentence {
+            return KeyOutcome::consumed(self.state(session));
+        }
         self.adjust_pin(&cand.code, &cand.text);
         let keep_raw = session.raw.clone();
         session.clear();
@@ -1808,7 +1817,7 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
-    /// 软删当前页第 idx 候选（Ctrl+Delete / 设置界面）。
+    /// 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
     pub fn op_hide_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
@@ -1816,6 +1825,10 @@ impl Engine {
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
+        // 整句组合候选是临时组句非词条，不参与删词
+        if cand.source == CandidateKind::Sentence {
+            return KeyOutcome::consumed(self.state(session));
+        }
         self.adjust_hide(&cand.code, &cand.text);
         let keep_raw = session.raw.clone();
         session.clear();
@@ -3206,6 +3219,68 @@ mod tests {
         assert!(s.raw.is_empty() && s.committed_raw.is_empty(), "缓冲清空");
     }
 
+    // 【候选框调频/删词 2026-09-06】Ctrl+数字=移到首位其余后移、
+    // Ctrl+Shift+数字=删除。写 用户调整.txt（{置顶}/{删除}）不碰码表；
+    // 整句组合候选不参与；删词对用户词同样生效。
+    #[test]
+    fn ctrl_pin_and_remove() {
+        let (mut eng, dir) = test_engine("ctrlpr");
+        // jd 码表 [就,到的,加] + 用户词 jd 新 p3
+        std::fs::write(
+            dir.join("用户词.txt"),
+            "#hufu-dict v1 name=user_words\njd\t新\t1\tp3\n",
+        )
+        .unwrap();
+        eng.reload_user_data();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts0: Vec<String> = s
+            .candidates
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
+        assert_eq!(texts0, vec!["就", "到的", "新", "加"], "初始序");
+        // Ctrl+3：把第 3 位「新」（用户词）移到首位
+        let out = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('3'),
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                is_press: true,
+            },
+        );
+        assert!(out.commit.is_none());
+        let texts1: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts1, vec!["新", "就", "到的", "加"], "Ctrl+3 调频：新 到首位其余后移");
+        // Ctrl+Shift+2：删除第 2 位「就」（码表词）
+        eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('2'),
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                is_press: true,
+            },
+        );
+        let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts2, vec!["新", "到的", "加"], "Ctrl+Shift+2 删词：码表词就 隐藏");
+        // 持久化验证：用户调整.txt 含 {置顶}jd 新 与 {删除}jd 就
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        assert!(log.contains("{置顶}jd\t新"), "置顶日志: {log}");
+        assert!(log.contains("{删除}jd\t就"), "删除日志: {log}");
+        // 码表原文不受影响（reload 后仍恢复可见）
+        let restored = eng.schema.dict.lookup("jd");
+        let rt: Vec<&str> = restored.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(rt, ["就", "到的", "加"], "原始码表不受污染");
+    }
+
     fn test_engine(tag: &str) -> (Engine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("hufu-eng-dyn-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3401,15 +3476,19 @@ mod tests {
     fn pin_and_hide_via_keys() {
         let (mut eng, _dir) = test_engine("pin");
         let mut s = Session::new(true);
-        // jd → 就/到的/加；Ctrl+Shift+2 置顶第 2 个（到的）
+        // jd → 就/到的/加；【2026-09-06 新绑定】Ctrl+2 置顶第 2 个（到的）
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let st = eng.state(&s);
         assert_eq!(st.candidates[0].text, "就");
 
-        let _ = eng.process_key(&mut s, ctrl_shift('2'));
+        let _ = eng.process_key(&mut s, {
+            let mut k = ctrl_shift('2');
+            k.modifiers.shift = false;
+            k
+        });
         let st = eng.state(&s);
-        assert_eq!(st.candidates[0].text, "到的", "置顶后『到的』应在首位");
+        assert_eq!(st.candidates[0].text, "到的", "Ctrl+2 置顶后『到的』应在首位");
 
         // 日志落盘 + 回放等价
         let dir = eng.schema.dir.clone();

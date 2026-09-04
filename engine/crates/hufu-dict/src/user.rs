@@ -117,6 +117,12 @@ impl UserAdjust {
         self.removes.insert((code.to_string(), word.to_string()));
     }
 
+    /// 该 码→词 是否处于删除态（用户词分支过滤用：adjust.apply 只
+    /// 过滤码表 base，用户词在 schema.candidates 单独合并）。
+    pub fn removed(&self, code: &str, word: &str) -> bool {
+        self.removes.contains(&(code.to_string(), word.to_string()))
+    }
+
     /// 应用到字典候选列表：返回调整后的条目序列。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
         let mut out: Vec<DictEntry> = Vec::new();

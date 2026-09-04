@@ -283,6 +283,11 @@ impl Schema {
         let pinned: Vec<DictEntry> = out.iter().filter(|e| e.pinned).cloned().collect();
         merged.extend(pinned);
         for ue in pinned_users {
+            // 【删词对用户词生效 2026-09-06】adjust.apply 只过滤码表
+            // base；用户词（/jc 加的）在删除态也须隐藏（Ctrl+Shift+数字）
+            if self.adjust.removed(&ue.code, &ue.text) {
+                continue;
+            }
             if !merged.iter().any(|e| e.text == ue.text) {
                 merged.push(ue);
             }
@@ -300,6 +305,9 @@ impl Schema {
         placed.sort_by(|a, b| b.0.cmp(&a.0));
         for (n, ue) in placed {
             if merged.iter().any(|x| x.text == ue.text) {
+                continue;
+            }
+            if self.adjust.removed(&ue.code, &ue.text) {
                 continue;
             }
             let idx = (n - 1).min(merged.len());
