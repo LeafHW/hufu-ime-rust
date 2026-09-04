@@ -807,8 +807,9 @@ impl Engine {
                 session.mode = InputMode::Reverse;
                 return KeyOutcome::consumed(self.state(session));
             }
-            // 命令命名空间
-            if c == '\\' {
+            // 命令命名空间（Shift+\ = ｜ 符号，不进命令——2026-09-06
+            // 符号自查：空态 Shift+\ 误入命令模式导致 ｜ 打不出）
+            if c == '\\' && !shift {
                 session.mode = InputMode::Command;
                 session.raw = "\\".into();
                 self.refresh_candidates(session);

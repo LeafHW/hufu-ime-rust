@@ -27,6 +27,13 @@ pub fn to_full_width_punct(c: char) -> Option<String> {
         '*' => "＊".into(),
         '^' => "……".into(),
         '-' => "-".into(),
+        // 【符号自查 2026-09-06】Shift 形态全角补全：|（Shift+\ 编码态
+        // 此前映射缺失一路 fallthrough 直通乱象）、＋／＝、_（Shift+-
+        // 空态；编码态已被翻页/顶字复用键拦为 ——）
+        '|' => "｜".into(),
+        '+' => "＋".into(),
+        '=' => "＝".into(),
+        '_' => "——".into(),
         _ => return None,
     };
     Some(s)

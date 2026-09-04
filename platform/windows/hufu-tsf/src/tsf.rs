@@ -64,6 +64,11 @@ pub struct Shared {
     /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
     /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
     pub shift_pending: bool,
+    /// 【Shift 状态跟踪 2026-09-06】TestDown/KeyDown 见 0x10 置 true、
+    /// keyup 置 false。32 位应用 KeyDown 时刻 GetKeyState(VK_SHIFT)
+    /// 偶发读不到按下（Shift+6 出不了 ……——引擎收到 shift=false 数字
+    /// 被当选重），vk_to_name 判 shift 用「GetKeyState<0 || 本位」双保险。
+    pub shift_down: bool,
     /// 候选窗首帧抑制后的补显标记：poll 轮询看到本位且 raw 非空时
     /// 无条件刷新（布局稳定后以正确位置显示，消除首帧错位跳变）。
     pub suppress_pending: bool,
@@ -117,6 +122,7 @@ impl Shared {
             chinese: true,
             composing: false,
             shift_pending: false,
+            shift_down: false,
             suppress_pending: false,
             modekey_last: None,
             preedit_last: String::new(),
@@ -582,7 +588,7 @@ impl HuFuTs_Impl {
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
         // 模式键（无组合歧义）：CapsLock / Ctrl+Space（按着 Ctrl 的 space，
         /// 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
-        let mode_key = match vk_to_name(wparam) {
+        let mode_key = match vk_to_name(wparam, false) {
             Some((n, sh, ct, al)) => n == "capslock" || (ct && !sh && !al && n == "space"),
             None => false,
         };
@@ -590,7 +596,9 @@ impl HuFuTs_Impl {
         if wparam == 0x10 {
             if !up {
                 // TestDown/KeyDown：只记 pending，不吞（物理 Shift 由应用照常处理）
-                self.shared.lock().unwrap().shift_pending = true;
+                let mut g = self.shared.lock().unwrap();
+                g.shift_pending = true;
+                g.shift_down = true;
                 return BOOL(0);
             }
             // TestUp/KeyUp：pending 存活 = 单击切换。直接发 server 并回填
@@ -602,6 +610,7 @@ impl HuFuTs_Impl {
                 let mut g = self.shared.lock().unwrap();
                 let f = g.shift_pending;
                 g.shift_pending = false;
+                g.shift_down = false;
                 f
             };
             if fire {
@@ -662,7 +671,7 @@ impl HuFuTs_Impl {
                 let g = self.shared.lock().unwrap();
                 (g.chinese, g.composing)
             };
-            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
+            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, false) else {
                 return BOOL(0);
             };
             let _ = (shift, alt);
@@ -701,7 +710,8 @@ impl HuFuTs_Impl {
                 }
             }
         }
-        let Some((name, shift, ctrl, alt)) = vk_to_name(wparam) else {
+        let hint = self.shared.lock().unwrap().shift_down;
+        let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
             return BOOL(0);
         };
         let (name, m_shift, m_ctrl, m_alt) = match name.as_str() {
@@ -761,7 +771,7 @@ impl HuFuTs_Impl {
 
 /// 冒烟测试直驱：vk_to_name + 管道引擎往返（不经 msctf/组段/候选窗）。
 pub fn test_key(vk: u32) -> i32 {
-    let Some((name, shift, ctrl, alt)) = vk_to_name(vk as usize) else {
+    let Some((name, shift, ctrl, alt)) = vk_to_name(vk as usize, false) else {
         eprintln!("hufu-tsf: test_key vk={vk} 无映射");
         return 0;
     };
@@ -780,9 +790,12 @@ pub fn test_key(vk: u32) -> i32 {
 }
 
 /// VK → (引擎键名, shift, ctrl, alt)。不可识别返回 None（直通）。
-fn vk_to_name(vk: usize) -> Option<(String, bool, bool, bool)> {
+/// vk → (基础键名, shift, ctrl, alt)。shift = GetKeyState 按下 ||
+/// hint（本 DLL 跟踪的 TestDown/KeyDown 状态——32 位宿主 KeyDown 时刻
+/// GetKeyState 偶发失准，双保险）。
+fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
     unsafe {
-        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0 || hint;
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
         let alt = GetKeyState(VK_MENU.0 as i32) < 0;
         let name = match vk {
