@@ -681,6 +681,14 @@ impl HuFuTs_Impl {
                 return BOOL(1);
             }
             if ctrl {
+                // 【候选调频/删词 2026-09-06】Ctrl+数字（含 Shift 形态）在
+                // 编码态由引擎处理（置顶/删除），预吞；空态放行（应用
+                // 快捷键语义保留）
+                let is_digit = name.len() == 1
+                    && name.chars().all(|c| c.is_ascii_digit());
+                if is_digit && composing {
+                    return BOOL(1);
+                }
                 return BOOL(0); // 其余组合键直通（Ctrl+Shift+V 剪贴板在 KeyDown 处理）
             }
             let will = chinese
