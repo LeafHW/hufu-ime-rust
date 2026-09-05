@@ -169,10 +169,22 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <h2>方案<span class="en">Schema</span></h2>
     <div class="sub">方案 = 码表目录。切换后立即生效，最近方案对可用 Ctrl+M 来回切。</div>
     <div class="schema-list" id="schema-list"></div>
-    <h3>方案根目录</h3>
-    <div class="row">
-      <div class="field"><label>目录名（安装根下，兼容数据目录内）</label><input type="text" data-path="schema.dir" style="width:260px"></div>
+    <div class="row" style="margin-top:8px">
       <button id="btn-schema-refresh">刷新列表</button>
+      <span class="sub" style="align-self:center">码表文件夹里新建方案目录后点「刷新列表」即可出现（与本地目录实时同步）。</span>
+    </div>
+    <h3>拼音反查方案选择</h3>
+    <div class="row">
+      <div class="field"><label>反查方案（数据\拼音反查\ 内的表文件）</label>
+        <select id="rev-scheme" style="width:220px"></select></div>
+      <div class="field"><label>引导前缀</label><input type="text" maxlength="1" id="r-prefix" style="width:60px"></div>
+      <span class="sub" style="align-self:center">任何方案启用反查时都从这里调用；表中放新 .txt 文件后重开设置页即可选择。</span>
+    </div>
+    <h3>拆分显示选择</h3>
+    <div class="row">
+      <div class="field"><label>拆分方案（数据\拆分\ 内的表文件）</label>
+        <select id="split-scheme" style="width:220px"></select></div>
+      <span class="sub" style="align-self:center">配合「输入与候选 → 显示拆分」开关使用；表中放新 .拆分 文件即可扩展。</span>
     </div>
   </section>
 
@@ -210,7 +222,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>三选键</label><input type="text" maxlength="1" id="c-3rd" style="width:60px"></div>
       <div class="checkline"><input type="checkbox" id="c-v"><label for="c-v">竖排候选</label></div>
       <div class="checkline"><input type="checkbox" id="c-idx"><label for="c-idx">显示序号</label></div>
-      <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示注释（拼音等）</label></div>
+      <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示拼音注释</label></div>
+      <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释</label></div>
       <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分</label></div>
       <div class="field"><label>候选延时（毫秒）</label><input type="number" data-path="candidates.delay_show_ms" min="0" max="2000"></div>
     </div>
@@ -221,13 +234,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>候选字体（存入皮肤）</label><input type="text" id="ap-font" style="width:180px" placeholder="留空=系统默认"></div>
       <div class="field"><label>字号（存入皮肤）</label><input type="number" id="ap-size" min="10" max="40" step="0.5"></div>
     </div>
-    <h3>反查</h3>
-    <div class="row">
-      <div class="checkline"><input type="checkbox" id="r-en"><label for="r-en">启用反查</label></div>
-      <div class="field"><label>引导前缀</label><input type="text" maxlength="1" id="r-prefix" style="width:60px"></div>
-      <div class="field"><label>反查表文件</label><input type="text" data-path="reverse.table" style="width:230px"></div>
-    </div>
-
     <h3>音效</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="snd-en"><label for="snd-en">启用按键音</label></div>
@@ -452,9 +458,9 @@ function bindInputs() {
   B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao");
   // #c-v（竖排候选）在 bindSkin 里接皮肤 layout.horizontal，不绑 config
   B("#c-idx", "candidates.show_index");
-  B("#c-cmt", "candidates.show_comment"); B("#c-split", "candidates.show_split");
+  B("#c-cmt", "candidates.show_pinyin_comment"); B("#c-ucmt", "candidates.show_unicode_comment");
+  B("#c-split", "candidates.show_split");
   B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
-  B("#r-en", "reverse.enabled");
   B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
   B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
   B("#snd-en", "sound.enabled");
@@ -490,6 +496,30 @@ function bindInputs() {
   $("#c-3rd").oninput = e => { if (e.target.value) CFG.candidates.third_select = e.target.value[0]; };
   $("#r-prefix").value = CFG.reverse.prefix || "`";
   $("#r-prefix").oninput = e => { if (e.target.value) CFG.reverse.prefix = e.target.value[0]; };
+  // 【2026-09-06 大统一】反查/拆分方案下拉（/api/assets 实时列目录）
+  const fillSel = (selId, cur, list, phOff) => {
+    const el = $(selId); el.innerHTML = "";
+    const mk = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; return o; };
+    el.appendChild(mk("", phOff));
+    (list || []).forEach(n => el.appendChild(mk(n, n)));
+    el.value = cur || "";
+    if (el.selectedIndex < 0) el.selectedIndex = 0;
+  };
+  api("GET", "/api/assets").then(a => {
+    fillSel("#rev-scheme", CFG.reverse.scheme, a.reverse, "（关闭反查）");
+    fillSel("#split-scheme", CFG.candidates.split_scheme, a.split, "（关闭拆分）");
+  }).catch(e => console.warn("assets", e));
+  const pick = (selId, fn) => {
+    $(selId).onchange = async e => {
+      try {
+        fn(e.target.value);
+        await api("POST", "/api/config", CFG);
+        msg("已切换并生效 ✓", "ok");
+      } catch (err) { msg(err.message, "err"); }
+    };
+  };
+  pick("#rev-scheme", v => CFG.reverse.scheme = v);
+  pick("#split-scheme", v => CFG.candidates.split_scheme = v);
   $$("[data-path]").forEach(el => {
     if (el.type === "number") el.oninput = () => { const v = parseFloat(el.value); if (!isNaN(v)) setP(CFG, el.dataset.path, v); };
     else el.oninput = () => setP(CFG, el.dataset.path, el.value);
@@ -541,9 +571,16 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "
 
 /* ── 方案 ── */
 async function loadSchemas() {
-  const r = await api("GET", "/api/state");
+  // 【2026-09-06 实时同步】列表改读 /api/schemas（服务端实时列码表目录），
+  // current/整句态另从 /api/state 取——新建码表文件夹后刷新即出现。
+  const [list, st] = await Promise.all([
+    api("GET", "/api/schemas").catch(() => ({ schemas: [] })),
+    api("GET", "/api/state").catch(() => ({})),
+  ]);
+  const names = list.schemas || [];
+  const r = { schemas: names, current_schema: st.current_schema, sentence_active: st.sentence_active };
   const box = $("#schema-list"); box.innerHTML = "";
-  (r.schemas || []).sort((a, b) => a.localeCompare(b, "zh")).forEach(n => {
+  names.sort((a, b) => a.localeCompare(b, "zh")).forEach(n => {
     const d = document.createElement("div");
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
     d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}` +

@@ -421,8 +421,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("GET", "/api/config") => Response::json(&serde_json::to_value(&host.engine.config).unwrap()),
         ("GET", "/api/schemas") => {
-            // 方案列表 = 码表目录的子目录名（含可读名字则更佳，先给目录名）
-            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            // 方案列表 = 码表目录的子目录名（实时列目录）。
+            // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表
+            // （resolve_data_sub 与引擎同源判定）。
+            let dir =
+                hufu_engine::Engine::resolve_data_sub(&host.data_dir, &host.engine.config.schema.dir);
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -435,6 +438,37 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .unwrap_or_default();
             names.sort();
             Response::json(&serde_json::json!({ "schemas": names }))
+        }
+        // 【2026-09-06 大统一】全局资源清单：拼音反查方案（数据\拼音反查\*.txt）
+        // 与拆分方案（数据\拆分\*.拆分）——设置页下拉实时数据源。
+        ("GET", "/api/assets") => {
+            let list = |dir: &str, ext: &str| -> Vec<String> {
+                let mut v: Vec<String> = std::fs::read_dir(host.data_dir.join(dir))
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().is_file())
+                            .filter(|e| {
+                                e.path()
+                                    .extension()
+                                    .and_then(|x| x.to_str())
+                                    .map(|x| x == ext)
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|e| {
+                                e.path()
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                v.sort();
+                v
+            };
+            let reverse = list("拼音反查", "txt");
+            let split = list("拆分", "拆分");
+            Response::json(&serde_json::json!({ "reverse": reverse, "split": split }))
         }
         ("POST", "/api/config") => {
             let v = req.json();

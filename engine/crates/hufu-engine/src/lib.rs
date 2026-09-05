@@ -457,8 +457,6 @@ impl Engine {
         let current = dict_root.join(&config.schema.current);
         let mut schema = Schema::load(&current)?;
         mark("schema_load");
-        let rev_name = config.reverse.table.trim().to_string();
-        let rev_dir = schema.dir.clone();
         let mut schemas = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dict_root) {
             for e in rd.flatten() {
@@ -483,16 +481,8 @@ impl Engine {
             opencc_loaded: false,
             pending_user_reload: false,
         };
-        // 反查表覆盖（config.reverse.table）——【性能】懒加载：只设
-        // 路径不读文件（见 Schema::reverse 注释）；与方案内自动探测
-        // 同名时天然去重（一个路径只装一次）。
-        if !rev_name.is_empty() {
-            let p = rev_dir.join(&rev_name);
-            if p.exists() {
-                engine.schema.reverse = None;
-                engine.schema.reverse_path = Some(p);
-            }
-        }
+        // 全局资源（反查/注释/拆分）大统一应用——见 apply_global_assets
+        engine.apply_global_assets();
         mark("reverse+done");
         Ok(engine)
     }
@@ -500,8 +490,6 @@ impl Engine {
     /// 直接从方案目录构建引擎（CLI / 测试用，无 dictionaries/ 包装）。
     pub fn with_schema_dir(schema_dir: &Path, config: Config) -> std::io::Result<Engine> {
         let mut schema = Schema::load(schema_dir)?;
-        let rev_dir = schema.dir.clone();
-        let rev_name = config.reverse.table.trim().to_string();
         let name = schema.name.clone();
         let mut engine = Engine {
             config,
@@ -520,14 +508,7 @@ impl Engine {
             opencc_loaded: false,
             pending_user_reload: false,
         };
-        if !rev_name.is_empty() {
-            let p = rev_dir.join(&rev_name);
-            if p.exists() {
-                // 【性能】懒加载（同 Engine::new）
-                engine.schema.reverse = None;
-                engine.schema.reverse_path = Some(p);
-            }
-        }
+        engine.apply_global_assets();
         Ok(engine)
     }
 
@@ -540,18 +521,59 @@ impl Engine {
         self.sentence.as_ref()
     }
 
-    /// 反查表覆盖：config.reverse.table 指定方案目录内文件名时优先加载
-    /// （未指定或加载失败 → 保持按文件名含「反查」的自动探测结果）。
-    /// 【性能】懒加载：只换路径，真正装载见 ensure_reverse。
-    fn apply_reverse_override(&self, schema: &mut Schema) {
-        let name = self.config.reverse.table.trim();
-        if name.is_empty() {
-            return;
+    /// 【2026-09-06 大统一】全局资源应用：反查 / 拼音注释 / unicode
+    /// 注释 / 拆分统一从 数据\拼音反查\、数据\注释\、数据\拆分\ 调用
+    /// （一级布局，所有方案共享，不再各码表目录自带一份）。
+    /// - 反查：reverse.scheme（数据\拼音反查\<名>.txt；空=关）；
+    ///   scheme 对应全局文件不存在时回退方案目录自动探测（旧包兼容）。
+    /// - 注释：拼音.注释 / unicode.注释（全局存在则覆盖方案目录探测）。
+    /// - 拆分：candidates.split_scheme（数据\拆分\<名>.拆分；空=关）。
+    /// 【性能】反查保持懒加载：只设路径，真正装载见 ensure_reverse。
+    pub fn apply_global_assets(&mut self) {
+        // 反查
+        let scheme = self.config.reverse.scheme.trim().to_string();
+        let global_rev = if scheme.is_empty() {
+            None
+        } else {
+            Some(self.data_dir.join("拼音反查").join(format!("{scheme}.txt")))
+        };
+        if let Some(p) = global_rev {
+            if p.exists() {
+                self.schema.reverse = None;
+                self.schema.reverse_path = Some(p);
+            }
+            // 全局文件缺失：保持 Schema::load 的方案目录探测（旧包回退）
+        } else {
+            // scheme 空 = 明确关闭反查
+            self.schema.reverse = None;
+            self.schema.reverse_path = None;
         }
-        let p = schema.dir.join(name);
-        if p.exists() {
-            schema.reverse = None;
-            schema.reverse_path = Some(p);
+        // 拼音注释（全局优先，回退方案目录探测结果）
+        let py = self.data_dir.join("注释").join("拼音.注释");
+        if py.exists() {
+            if let Ok(t) = hufu_dict::AnnotationTable::load(&py) {
+                self.schema.pinyin = Some(t);
+            }
+        }
+        // unicode 注释
+        let uc = self.data_dir.join("注释").join("unicode.注释");
+        if uc.exists() {
+            if let Ok(t) = hufu_dict::AnnotationTable::load(&uc) {
+                self.schema.unicode_block = Some(t);
+            }
+        }
+        // 拆分（split_scheme 空=关）
+        let ss = self.config.candidates.split_scheme.trim().to_string();
+        if ss.is_empty() {
+            self.schema.split = None;
+        } else {
+            let p = self.data_dir.join("拆分").join(format!("{ss}.拆分"));
+            if p.exists() {
+                if let Ok(t) = hufu_dict::AnnotationTable::load(&p) {
+                    self.schema.split = Some(t);
+                }
+            }
+            // 文件缺失：保持方案目录探测（旧包回退）
         }
     }
 
@@ -594,8 +616,8 @@ impl Engine {
         let old = self.config.schema.current.clone();
         let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
         let mut schema = Schema::load(&dir)?;
-        self.apply_reverse_override(&mut schema);
         self.schema = schema;
+        self.apply_global_assets();
         self.config.schema.current = name.to_string();
         // 只记录两端皆非空的方案对（启动期 old 为空时不污染——
         // 否则 Ctrl+M 的 target 会解析出空名）
@@ -2723,7 +2745,7 @@ impl Engine {
                 }
             }
         }
-        if self.config.candidates.show_comment {
+        if self.config.candidates.show_pinyin_comment {
             if let Some(py) = &self.schema.pinyin {
                 let s = py.annotate_word(word, 2);
                 if !s.is_empty() {
@@ -2731,7 +2753,7 @@ impl Engine {
                 }
             } else if let Some(rev) = &self.schema.reverse {
                 // 【2026-09-05】无拼音注释表时回退反查表（词→码）——
-                // Bime 反查表数据已有，「显示注释」开箱即用（整词
+                // Bime 反查表数据已有，「显示拼音注释」开箱即用（整词
                 // 优先，miss 则前 2 字逐字拼）。
                 let s = rev
                     .code_of(word)
@@ -2748,11 +2770,15 @@ impl Engine {
                 }
             }
         }
-        if let Some(uni) = &self.schema.unicode_block {
-            if let Some(fc) = word.chars().next() {
-                if let Some(u) = uni.get(fc) {
-                    if u != "基本" {
-                        parts.push(format!("[{u}]"));
+        // 【2026-09-06】unicode 注释独立开关（数据\注释\unicode.注释；
+        // 非「基本」字显示分区名，如 [平假名]）
+        if self.config.candidates.show_unicode_comment {
+            if let Some(uni) = &self.schema.unicode_block {
+                if let Some(fc) = word.chars().next() {
+                    if let Some(u) = uni.get(fc) {
+                        if u != "基本" {
+                            parts.push(format!("[{u}]"));
+                        }
                     }
                 }
             }

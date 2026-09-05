@@ -194,10 +194,14 @@ pub struct CandidatesSection {
     pub vertical: bool,
     /// 显示候选序号
     pub show_index: bool,
-    /// 显示注释
-    pub show_comment: bool,
+    /// 显示拼音注释（数据\注释\拼音.注释；无表时回退反查表 词→码）
+    pub show_pinyin_comment: bool,
+    /// 显示 unicode 注释（数据\注释\unicode.注释，如 [平假名]）
+    pub show_unicode_comment: bool,
     /// 显示拆分
     pub show_split: bool,
+    /// 拆分方案名（数据\拆分\<名>.拆分；空=关）
+    pub split_scheme: String,
     /// 延时显示候选（毫秒，0=立即）
     pub delay_show_ms: u32,
     /// 延时展开注释与拆分（毫秒）
@@ -214,8 +218,10 @@ impl Default for CandidatesSection {
             custom_select_keys: Vec::new(),
             vertical: false,
             show_index: true,
-            show_comment: true,
+            show_pinyin_comment: true,
+            show_unicode_comment: false,
             show_split: false,
+            split_scheme: "虎码".into(),
             delay_show_ms: 0,
             delay_comment_ms: 0,
         }
@@ -228,8 +234,8 @@ pub struct ReverseSection {
     pub enabled: bool,
     /// 反查引导前缀
     pub prefix: char,
-    /// 反查表文件名（方案目录内）
-    pub table: String,
+    /// 反查方案名（数据\拼音反查\<名>.txt；空=关；文件缺失回退方案目录旧表）
+    pub scheme: String,
 }
 
 impl Default for ReverseSection {
@@ -237,7 +243,7 @@ impl Default for ReverseSection {
         ReverseSection {
             enabled: true,
             prefix: '`',
-            table: "Bime_小鹤双拼反查.txt".into(),
+            scheme: "小鹤双拼".into(),
         }
     }
 }
