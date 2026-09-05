@@ -142,6 +142,13 @@ powershell -ExecutionPolicy Bypass -File "platform\windows\install\reg-fix.ps1"
 - [docs/research/ime-frontends.md](docs/research/ime-frontends.md) — TSF / IMK 前端研究纪要与 TigerClaw 行为语义
 - [docs/dictionary-formats.md](docs/dictionary-formats.md) — 支持的码表格式规范（含 TCSKNM02 模型布局实测）
 
+
+## 发布文案规范（铁律，用户 2026-09-06 定）
+
+- 任何更新说明、功能描述、自述文件、release 正文、设置页文案、更新日志——**不得出现「顶功」「自研」等字眼**（含原创/独家/首创）；用「码表方案」「顶屏」等中性表述
+- GitHub release 正文**最上面**必须是【下载说明】块（只提供无模型轻量包 + 模型在「模型文件」发布页单独下载的指引），之后才是本版更新内容
+- GitHub 只上传无模型小包；大包仅本地留存；模型 default.7z 常驻「模型文件」发布页复用
+- 完整 SOP 见 `E:\DSH-KF\hufu-发行\发布流程.md`（打包/发布脚本模板：`发布-v1.4.7-二轮.ps1`）
 ## 许可证
 
 - 本项目代码以 [GPL-3.0](LICENSE) 发布
