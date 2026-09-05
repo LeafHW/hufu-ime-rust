@@ -123,6 +123,16 @@ if ($PhaseElevated) {
         }
         if ($n -gt 0) { Write-Host "清理诊断日志: $n 个" }
     }
+    # 3) 【早期版本残留 2026-09-07】%LOCALAPPDATA%\HuFu（绿色化前旧版
+    #    数据目录——新版数据全部在安装目录，此目录属残留，安装时清除）
+    $legacyLocal = Join-Path $env:LOCALAPPDATA 'HuFu'
+    if (Test-Path $legacyLocal) {
+        try {
+            Get-ChildItem $legacyLocal -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+            Remove-Item $legacyLocal -Recurse -Force -ErrorAction Stop
+            Write-Host '清理早期版本数据: %LOCALAPPDATA%\HuFu'
+        } catch { Write-Host '· %LOCALAPPDATA%\HuFu 被占用，下次安装再清' }
+    }
     Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
     $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
     Set-RegHKLM "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
