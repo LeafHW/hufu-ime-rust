@@ -120,7 +120,10 @@ impl Host {
         if !self.engine.config.schema.current.contains("整句") {
             return None;
         }
-        let path = self.data_dir.join(&self.engine.config.sentence.ngram_path);
+        let path = hufu_engine::Engine::resolve_data_sub(
+            &self.data_dir,
+            &self.engine.config.sentence.ngram_path,
+        );
         if !(self.engine.config.sentence.enabled && path.exists()) {
             return None;
         }
@@ -146,7 +149,10 @@ impl Host {
             self.engine.set_sentence_decoder(None);
             return;
         }
-        let path = self.data_dir.join(&self.engine.config.sentence.ngram_path);
+        let path = hufu_engine::Engine::resolve_data_sub(
+            &self.data_dir,
+            &self.engine.config.sentence.ngram_path,
+        );
         if self.engine.config.sentence.enabled && path.exists() {
             let mut weights = self.engine.config.sentence.weights.clone();
             // 【数字编码 2026-09-05】按码表内容自动标记（同 sentence_plan）
@@ -191,8 +197,10 @@ impl Host {
         } else if !cfg.model_path.is_empty() {
             candidates.push(self.data_dir.join(&cfg.model_path));
         }
-        // 自动探测：数据目录「模型」下任意 .gguf（排除 ngram bin）
-        if let Ok(rd) = std::fs::read_dir(self.data_dir.join("模型")) {
+        // 自动探测：数据根「模型」下任意 .gguf（排除 ngram bin）——
+        // 一级目录布局优先，回退 数据\ 内旧位置
+        let model_dir = hufu_engine::Engine::resolve_data_sub(&self.data_dir, "模型");
+        if let Ok(rd) = std::fs::read_dir(model_dir) {
             let mut ggufs: Vec<PathBuf> = rd
                 .flatten()
                 .map(|e| e.path())
@@ -422,6 +430,56 @@ impl Host {
         }
     }
 
+    /// 导出码表（虎爪码表导出语义）：name 缺省=当前方案。当前方案用
+    /// 运行态（含本会话调频）；其它方案从磁盘重载（含其用户调整/用户词）。
+    /// 输出 数据\码表导出\<方案名> <yyyyMMdd-HHmm>.txt，返回 (路径, 行数)。
+    pub fn export_schema(&self, name: Option<&str>) -> Result<(String, usize), String> {
+        let current = self.engine.config.schema.current.clone();
+        let target = name.filter(|n| !n.is_empty()).unwrap_or(&current).to_string();
+        if target != current {
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &self.data_dir,
+                &self.engine.config.schema.dir,
+            )
+            .join(&target);
+            if !dir.is_dir() {
+                return Err(format!("方案目录不存在: {target}"));
+            }
+            let schema = hufu_dict::Schema::load(&dir)
+                .map_err(|e| format!("方案加载失败: {e}"))?;
+            let out = self.export_out_path(&target);
+            let n = export_util::export_one(&schema, &out)?;
+            return Ok((out.to_string_lossy().into_owned(), n));
+        }
+        let out = self.export_out_path(&target);
+        let n = export_util::export_one(&self.engine.schema, &out)?;
+        Ok((out.to_string_lossy().into_owned(), n))
+    }
+
+    /// 导出文件路径：<安装根>\码表导出\<方案名>\<方案名> <yyyyMMdd-HHmm>.txt
+    ///（一级目录布局：与 码表/模型 平级；每码表一个子文件夹）。
+    fn export_out_path(&self, name: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 本地时间 yyyyMMdd-HHmm（无 chrono：从 UTC+8 偏移换算）
+        let secs = now + 8 * 3600;
+        let days = secs / 86400;
+        let rem = secs % 86400;
+        let (y, mo, da) = civil_from_days(days as i64);
+        let (h, mi) = (rem / 3600, (rem % 3600) / 60);
+        let root = self
+            .data_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.data_dir.clone());
+        root.join("码表导出").join(name).join(format!(
+            "{name} {:04}{:02}{:02}-{:02}{:02}.txt",
+            y, mo, da, h, mi
+        ))
+    }
+
     /// 按键 → (结果, 状态快照)。
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
         // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
@@ -565,3 +623,75 @@ pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
 
 /// 供管道线程共享的宿主句柄。
 pub type SharedHost = Arc<Mutex<Host>>;
+
+/// 简单公历换算（Unix 天数 → 年月日，Howard Hinnant 算法）——
+/// 导出文件名时间戳用，避免引入 chrono 依赖。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 导出码表辅助（host.export_schema 用）。
+mod export_util {
+    use hufu_dict::Schema;
+
+    /// 单方案导出：全部编码按当前生效序（码表 + 用户调整回放 + 用户词
+    /// + 运行调频）聚合为 `码 词1 词2 …` 行（虎爪码表导出同格式，HuFu
+    /// 的 SpaceCodeWords 解析器可直接再导入）。补充语料不进导出（用户
+    /// 拍板：导出语义只有「用户调整 + 原始码表」合一）。
+    pub fn export_one(schema: &Schema, out_path: &std::path::Path) -> Result<usize, String> {
+        // 1) 编码全集：码表条目 ∪ 用户词条目（/jc 加词的码可能不在码表）
+        let mut codes: Vec<String> = schema
+            .dict
+            .entries
+            .iter()
+            .map(|e| e.code.clone())
+            .collect();
+        codes.extend(schema.user_dict.entries.iter().map(|e| e.code.clone()));
+        codes.sort();
+        codes.dedup();
+
+        // 2) 逐码取当前生效序
+        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        for code in &codes {
+            let texts: Vec<String> =
+                schema.candidates(code).iter().map(|e| e.text.clone()).collect();
+            if !texts.is_empty() {
+                rows.push((code.clone(), texts));
+            }
+        }
+        // 【2026-09-05 用户拍板】补充语料（整句权重词）不进导出——导出
+        // 语义只有「用户调整 + 原始码表」合一；补充语料是整句层概念，
+        // 随方案目录原样保留即可。
+
+        // 3) 行序：/ 符号码组在前（字母序），再普通码（字母序）
+        rows.sort_by(|a, b| {
+            let slash = |c: &str| !c.starts_with('/');
+            match (slash(&a.0), slash(&b.0)) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => a.0.cmp(&b.0),
+            }
+        });
+
+        // 5) 落盘（GB18030，CRLF）
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|(c, texts)| format!("{c} {}", texts.join(" ")))
+            .collect();
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        hufu_dict::parse::write_lines_gb18030(out_path, &lines)
+            .map_err(|e| format!("写文件失败: {e}"))?;
+        Ok(rows.len())
+    }
+}

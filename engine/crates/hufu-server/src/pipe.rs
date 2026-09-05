@@ -148,7 +148,10 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         // schema_snapshot 二次锁同一把 Mutex（曾死锁管道线程拖死全机
         // 打字）；这里按 HTTP GET /api/schemas 同源逻辑直算。
         "schemas" => {
-            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.schema.dir,
+            );
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -170,7 +173,10 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 host.setup_sentence();
                 let _ = host.engine.config.save(&host.config_path);
             }
-            let dir = host.data_dir.join(&host.engine.config.schema.dir);
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.schema.dir,
+            );
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -198,14 +204,34 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         // 语言栏右键「打开方案文件夹」：explorer 打开当前方案码表目录
         "open_schema_dir" => {
             let name = host.engine.config.schema.current.clone();
-            let dir = host
-                .data_dir
-                .join(&host.engine.config.schema.dir)
-                .join(&name);
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.schema.dir,
+            )
+            .join(&name);
             if dir.is_dir() {
                 let _ = std::process::Command::new("explorer").arg(&dir).spawn();
             }
             serde_json::json!({"ok": dir.is_dir(), "path": dir})
+        }
+        // 语言栏右键「导出码表」：导出当前方案（用户调整合并快照）并
+        // explorer 打开导出子文件夹（码表导出\<方案名>\）。
+        "export_schema" => {
+            match host.export_schema(None) {
+                Ok((path, n)) => {
+                    let dir = std::path::Path::new(&path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default();
+                    if dir.is_dir() {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&dir)
+                            .spawn();
+                    }
+                    serde_json::json!({"ok": true, "path": path, "lines": n})
+                }
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            }
         }
         // 语言栏菜单音效开关：读态 / 切换（落盘，热生效）
         "sound_state" => serde_json::json!({

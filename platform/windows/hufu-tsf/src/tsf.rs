@@ -72,6 +72,24 @@ pub struct Shared {
     /// 候选窗首帧抑制后的补显标记：poll 轮询看到本位且 raw 非空时
     /// 无条件刷新（布局稳定后以正确位置显示，消除首帧错位跳变）。
     pub suppress_pending: bool,
+    /// 【WPS caret 收敛 2026-09-07】WPS 族（et 表格实测）组段首显前
+    /// 做插入点收敛检测：每轮记录 GetTextExt rect，连续两轮相同视为
+    /// 布局稳定才首显；上限 300ms 兜底强制显示。此前固定 35ms 补显
+    /// 远不够表格布局刷新（首键抑制了，第二键 raw=2 直接以陈旧
+    /// caret 显示 → 依旧跳）。
+    pub wps_caret_prev: Option<RECT>,
+    pub wps_settle_start: Option<std::time::Instant>,
+    /// 本组段候选窗是否已完成首显（raw 变空时重置）——WPS 收敛检测
+    /// 只管首显，首显后正常跟随。
+    pub cand_shown_this_segment: bool,
+    /// 【失焦残留拦截 2026-09-07】OnSetFocus 后 focus op 异步清 server
+    /// session，窗口期内补显 timer/轮询可能拿着失焦前的 raw（如 'd'）
+    /// 在新焦点重建组段——用户实测 WPS 表格 A1 打 d 点 B2，A1/B2 双双
+    /// 出现字母 d。失焦时记录 raw 快照 + 300ms 有效期：期间 update_ui/
+    /// poll 见到同码 state 直接忽略（server 清后自然消失）；不同码=
+    /// 用户已在新焦点开始新输入，放行。
+    pub stale_raw: String,
+    pub stale_raw_until: Option<std::time::Instant>,
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
@@ -124,6 +142,11 @@ impl Shared {
             shift_pending: false,
             shift_down: false,
             suppress_pending: false,
+            wps_caret_prev: None,
+            wps_settle_start: None,
+            cand_shown_this_segment: false,
+            stale_raw: String::new(),
+            stale_raw_until: None,
             modekey_last: None,
             preedit_last: String::new(),
             tm_sink_cookie: 0,
@@ -468,10 +491,24 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         //    已锁死）。同步档被拒（E_UNEXPECTED/TF_E_SYNCHRONOUS）即
         //    放弃提交——切焦点丢半个未成词，不可拿宿主冻结换。
         if composing && !preedit.is_empty() {
+            let raw_last = {
+                let g = self.shared.lock().unwrap();
+                g.raw_last.clone()
+            };
+            // 【失焦编码冲销 2026-09-07】兜底提交只保「中文形态」preedit
+            //（整句/成词显示文本）；编码字母形态（preedit==raw，顶功
+            // 进行中）原样 commit 会把字母写进旧单元格（WPS 表格实测：
+            // A1 打 d 点 B2，A1 出字母 d）——改为冲销组段（清空不写）。
+            let is_code_form = !raw_last.is_empty() && preedit == raw_last;
             let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
             trace("foc: A 取ctx");
             if let Some(ctx) = prev_ctx {
-                let _ = run_session_sync_only(&self.shared, Op::Commit(preedit.clone()), ctx);
+                let payload = if is_code_form {
+                    String::new()
+                } else {
+                    preedit.clone()
+                };
+                let _ = run_session_sync_only(&self.shared, Op::Commit(payload), ctx);
             }
         }
         trace("foc: B commit完");
@@ -491,6 +528,15 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             trace("foc: D 拿锁");
             g.composition = None; // 死组段句柄必须丢，后续走全新 StartPreedit
             g.composing = false;
+            // 失焦残留拦截：focus op 异步清 server session，窗口期内
+            // 补显 timer/轮询拿旧 raw 在新焦点重建组段——记快照拦同码。
+            if !g.raw_last.is_empty() {
+                g.stale_raw = g.raw_last.clone();
+                g.stale_raw_until = Some(std::time::Instant::now());
+            } else {
+                g.stale_raw.clear();
+                g.stale_raw_until = None;
+            }
             g.raw_last.clear();
             g.preedit_last.clear();
             g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
@@ -1288,6 +1334,18 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.load_skin();
         }
         let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+        // 【失焦残留拦截】focus op 异步清 session 的窗口期内，补显
+        // timer/轮询拿失焦前的同码 raw 在新焦点重建组段（B2 冒出
+        // 残留字母）——300ms 内同码直接忽略；不同码=新输入放行。
+        if !raw.is_empty()
+            && !g.stale_raw.is_empty()
+            && raw == g.stale_raw
+            && g.stale_raw_until.is_some_and(|t| {
+                t.elapsed() < std::time::Duration::from_millis(300)
+            })
+        {
+            return Ok(());
+        }
         let mut preedit = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
         // 【2026-09-05 接线】皮肤 layout.inline_preedit（设置页「编码内联
         // 到应用」）：false 时编码不进应用文本流（组段不建、preedit 视为
@@ -1303,6 +1361,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         if raw.is_empty() {
             g.skin_stale = true;
+            // 断段：下一组段的候选首显重新走 WPS 收敛检测
+            g.cand_shown_this_segment = false;
+            g.wps_caret_prev = None;
+            g.wps_settle_start = None;
         }
         // raw 变化 → 记时刻（候选延时显示用）
         if raw != g.raw_last {
@@ -1559,13 +1621,27 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // SearchHost 豁免：其 GetTextExt 常态失败，焦点窗定位候选是
         // 刚需；用户固定（pinned）时无视锚点，不抑制。
         let pinned_now = crate::candwin2::CAND_PINNED.lock().unwrap().is_some();
-        // 【WPS 表格首键 2026-09-06】WPS 族（et 表格实测）首键 caret 是
-        // 陈旧 Some（旧单元格位）——除 caret=None 外，WPS 族组段首键帧
-        // （raw 单键）也抑制一帧 + 35ms 补显，避免首键显示旧位第二帧跳。
-        let wps_first_key = host_is_wps() && raw.chars().count() == 1;
-        if (g.caret.is_none() || wps_first_key) && !pinned_now && !host_is_searchhost() {
+        // 【WPS caret 收敛 2026-09-07】固定 35ms 补显不够 WPS 表格布局
+        // 稳定：首键帧抑制了，但第二键（raw=2）不再命中 wps_first_key，
+        // 直接以陈旧 caret 显示 → 依旧跳。改为按「组段首显」管理：WPS
+        // 族组段候选窗首次显示前做插入点收敛检测——每 35ms 重查一轮，
+        // 连续两轮 GetTextExt rect 相同（布局已稳）才首显；300ms 上限
+        // 兜底强制显示（防极端慢布局永不显示）。首显后正常跟随。
+        let wps_settle = host_is_wps() && !g.cand_shown_this_segment;
+        let wps_stable = g.wps_caret_prev.is_some_and(|p| g.caret == Some(p));
+        let wps_deadline = g
+            .wps_settle_start
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(300));
+        let suppress = (g.caret.is_none() || (wps_settle && !(wps_stable || wps_deadline)))
+            && !pinned_now
+            && !host_is_searchhost();
+        if suppress {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
+            }
+            g.wps_caret_prev = g.caret;
+            if g.wps_settle_start.is_none() {
+                g.wps_settle_start = Some(std::time::Instant::now());
             }
             g.suppress_pending = true;
             arm_first_frame_timer();
@@ -1579,6 +1655,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 免键事件立即重绘
         g.last_show = Some((cands.clone(), raw.clone(), sel));
         // 显示完成：清除首帧抑制补显标记
+        g.cand_shown_this_segment = true;
+        g.wps_caret_prev = None;
+        g.wps_settle_start = None;
         g.suppress_pending = false;
     } else {
         // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
@@ -2128,6 +2207,9 @@ fn poll_tick() {
         if raw_empty {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
+            g.cand_shown_this_segment = false;
+            g.wps_caret_prev = None;
+            g.wps_settle_start = None;
             // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
             // 内）：键路径不再做管道往返（性能），改皮肤下一组段生效。
             if !g.skin.is_null() {

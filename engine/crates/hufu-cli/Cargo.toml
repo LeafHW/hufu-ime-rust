@@ -10,4 +10,5 @@ hufu-dict = { path = "../hufu-dict" }
 hufu-engine = { path = "../hufu-engine" }
 hufu-config = { path = "../hufu-config" }
 hufu-sentence = { path = "../hufu-sentence" }
+hufu-rerank = { path = "../hufu-rerank" }
 serde_json = { workspace = true }

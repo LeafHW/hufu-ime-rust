@@ -426,6 +426,19 @@ impl Engine {
         }
     }
 
+    /// 【一级目录布局 2026-09-05】数据子目录解析：安装根（data_dir 的
+    /// 父级）下的新位置优先（<根>\码表、<根>\模型），不存在回退旧
+    /// <数据>\内位置——升级安装把 码表/模型 提到一级后老安装照常工作。
+    pub fn resolve_data_sub(data_dir: &Path, rel: &str) -> std::path::PathBuf {
+        if let Some(root) = data_dir.parent() {
+            let new = root.join(rel);
+            if new.exists() {
+                return new;
+            }
+        }
+        data_dir.join(rel)
+    }
+
     pub fn new(data_dir: &Path, config: Config) -> std::io::Result<Engine> {
         // 【性能插桩】词典装载分解（与 server 侧 startup-trace 配套）
         let t0 = std::time::Instant::now();
@@ -440,7 +453,7 @@ impl Engine {
                 let _ = writeln!(f, "  engine/{label}: {}ms", t0.elapsed().as_millis());
             }
         };
-        let dict_root = data_dir.join(&config.schema.dir);
+        let dict_root = Engine::resolve_data_sub(data_dir, &config.schema.dir);
         let current = dict_root.join(&config.schema.current);
         let mut schema = Schema::load(&current)?;
         mark("schema_load");
@@ -579,7 +592,7 @@ impl Engine {
             ));
         }
         let old = self.config.schema.current.clone();
-        let dir = self.data_dir.join(&self.config.schema.dir).join(name);
+        let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
         let mut schema = Schema::load(&dir)?;
         self.apply_reverse_override(&mut schema);
         self.schema = schema;
@@ -2402,6 +2415,15 @@ impl Engine {
                     let skip = cmt.chars().count();
                     let mut phrase: Vec<Candidate> = Vec::new();
                     let mut rest: Vec<Candidate> = Vec::new();
+                    // 【用户点名提顶 2026-09-07】lets 案例：用户给「旋」
+                    // 加 supplement 权重后引擎解码第一名已是旋（-4.16），
+                    // 但码表域「真词短语压前」把两字切分产物（而三 -10.97）
+                    // 结构性压在所有单字码表项之前——权重通道被多字规则
+                    // 屏蔽。修复：引擎第一名（无锁单段 max_rank==1，选重
+                    // 代价与码表首选同级）若被短语组压制且分数领先短语头
+                    // ≥5.0（supplement 点名才会有的量级；常规 ngram 候选
+                    // 差距 <2），合并后置顶——用户权重可感知生效。
+                    let mut first_hit: Option<(String, f64, usize)> = None;
                     for h in d.hits.iter() {
                         if !cmt.is_empty() && !h.text.starts_with(&cmt) {
                             continue;
@@ -2421,6 +2443,10 @@ impl Engine {
                             && live_n <= self.config.input.max_code_length;
                         if dom && !h.exact {
                             continue;
+                        }
+                        if first_hit.is_none() {
+                            first_hit =
+                                Some((text.clone(), h.score, h.max_rank));
                         }
                         let multi = text.chars().count() >= 2;
                         let mut cand =
@@ -2449,6 +2475,20 @@ impl Engine {
                         for r in rest {
                             if !merged.iter().any(|m| m.text == r.text) {
                                 merged.push(r);
+                            }
+                        }
+                        // 【用户点名提顶】引擎第一名被短语组压住且大幅
+                        // 领先（≥5.0 分、无锁单段）时置顶（见上方注释）。
+                        if let Some((t0, s0, r0)) = &first_hit {
+                            if !merged.is_empty() && merged[0].text != *t0 && *r0 == 1 {
+                                if *s0 - merged[0].weight >= 5.0 {
+                                    if let Some(pos) =
+                                        merged.iter().position(|m| m.text == *t0)
+                                    {
+                                        let c = merged.remove(pos);
+                                        merged.insert(0, c);
+                                    }
+                                }
                             }
                         }
                         merged.truncate(20);

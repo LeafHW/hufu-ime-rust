@@ -391,6 +391,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 "schemas": host.engine.schemas,
                 "current_schema": host.engine.config.schema.current,
                 "sentence_active": host.engine.sentence_active(),
+                // 【无模型小包 2026-09-07】设置页「整句模型」页判断用：
+                // ngram 模型文件是否在数据目录（小包默认不带，设置页
+                // 显示下载/放置指引；与 sentence_active 分开——后者还
+                // 受当前方案是否整句方案影响）。
+                "model_present": hufu_engine::Engine::resolve_data_sub(
+                    &host.data_dir,
+                    &host.engine.config.sentence.ngram_path,
+                )
+                .exists(),
             }))
         }
         ("POST", "/api/key") => {
@@ -732,15 +741,42 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&host.engine.config.schema.current)
                 .to_string();
-            let dir = host
-                .data_dir
-                .join(&host.engine.config.schema.dir)
-                .join(&name);
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.schema.dir,
+            )
+            .join(&name);
             if !dir.is_dir() {
                 return Response::err(404, &format!("方案目录不存在: {name}"));
             }
             let _ = std::process::Command::new("explorer").arg(&dir).spawn();
             Response::json(&serde_json::json!({"ok": true, "path": dir}))
+        }
+        ("POST", "/api/export_schema") => {
+            // body {name?}：缺省=当前方案。导出用户调整合并后的完整码表
+            //（虎爪码表导出同格式）到 数据\码表导出\<方案名> <时间戳>.txt。
+            let name = req
+                .json()
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            match host.export_schema(if name.is_empty() { None } else { Some(&name) }) {
+                Ok((path, n)) => {
+                    // 导出即达：explorer 打开导出子文件夹（码表导出\<方案名>\）
+                    if let Some(dir) = std::path::Path::new(&path).parent() {
+                        if dir.is_dir() {
+                            let _ = std::process::Command::new("explorer")
+                                .arg(dir)
+                                .spawn();
+                        }
+                    }
+                    Response::json(&serde_json::json!({
+                        "ok": true, "path": path, "lines": n
+                    }))
+                }
+                Err(e) => Response::err(500, &format!("导出失败: {e}")),
+            }
         }
         ("POST", "/api/shutdown") => {
             std::process::exit(0);

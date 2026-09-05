@@ -516,6 +516,10 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         // 打开当前方案码表目录（资源管理器）
         let wdir: Vec<u16> = "打开方案文件夹".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 3, wdir.as_ptr());
+        // 【2026-09-05】导出码表：用户调整合并快照 → 码表导出\<方案>\
+        //（server 侧导出后自动打开该文件夹）
+        let wexp: Vec<u16> = "导出码表".encode_utf16().chain([0]).collect();
+        AppendMenuW(m, MF_STRING, 5, wexp.as_ptr());
         // 按键音效开关（勾选态=当前 enabled；音量滑条在设置窗「输入与候选」页）
         let snd_on = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
             .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()))
@@ -597,6 +601,9 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         } else if sel == 3 {
             // 打开当前方案码表目录（server 侧 explorer）
             let _ = crate::ipc::call(&serde_json::json!({"op": "open_schema_dir"}));
+        } else if sel == 5 {
+            // 导出码表（server 侧导出+打开导出文件夹）
+            let _ = crate::ipc::call(&serde_json::json!({"op": "export_schema"}));
         } else if sel == 4 {
             // 按键音效开关：server 侧取反+落盘（热生效）
             let _ = crate::ipc::call(&serde_json::json!({"op": "sound_toggle"}));

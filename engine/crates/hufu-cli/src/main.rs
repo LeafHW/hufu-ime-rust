@@ -419,6 +419,25 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         .expect("ngram 装载失败");
         engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
     }
+    // 【rerank AB 2026-09-07】HUFU_RERANK_GGUF=<路径>：B 组——句末收尾
+    // 空格前做一次神经重排（真机「打完停顿确认」场景的忠实子集：
+    // request→score→cache→refresh，engine 侧消费含选重深度约束）。
+    // 引擎 cfg 同步开 rerank（rerank_request 的出活开关）。native
+    // llama.cpp 优先（与真机同引擎），失败退纯 Rust（约慢 40 倍）。
+    let rerank_gguf = std::env::var("HUFU_RERANK_GGUF").ok().filter(|s| !s.is_empty());
+    if rerank_gguf.is_some() {
+        engine.config.sentence.rerank.enabled = true;
+    }
+    let reranker: Option<hufu_rerank::Reranker> = rerank_gguf.as_ref().and_then(|p| {
+        hufu_rerank::Reranker::load(p).ok()
+    });
+    let native_scorer: Option<hufu_rerank::native::NativeScorer> = rerank_gguf.as_ref().and_then(|p| {
+        hufu_rerank::native::NativeScorer::try_new(&[], std::path::Path::new(p))
+    });
+    if rerank_gguf.is_some() {
+        let engine_kind = if native_scorer.is_some() { "native(llama.cpp)" } else { "rust(fallback)" };
+        println!("[RERANK] {engine_kind}");
+    }
     let sents: Vec<String> = std::io::BufReader::new(std::fs::File::open(corpus).expect("语料打开失败"))
         .lines()
         .map(|l| l.unwrap().trim().to_string())
@@ -434,6 +453,8 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut early_resid = 0usize;
     let mut total_chars = 0u64; // 全文总字数（覆盖率分母）
     let mut sent_events: Vec<usize> = Vec::new(); // 每句上屏事件数（提前+收尾，越少越一气呵成）
+    let mut total_rerank_fired = 0usize; // 【rerank B 组】句中停顿重排实际触发次数
+    let mut total_rerank_changed = 0usize; // 【rerank B 组】qwen 首选≠引擎原序首选的次数
     let mut total_ms: Vec<u128> = Vec::new();
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -511,6 +532,12 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             }
         } else {
         let mut sent_events_this = 0usize;
+        // 【rerank B 组 v2】句中停顿点：打满 60% 编码时同步重排一次
+        //（真机收益场景——句中停顿时 raw 尚长、Sentence 候选 ≥2；
+        // 句末收尾时顶功已推空 raw，request 恒 None，测不出重排）。
+        let raw_len = raw.chars().count();
+        let pause_at = raw_len * 6 / 10;
+        let mut keys_done = 0usize;
         for ch in raw.chars() {
             if line_end_w > 0 {
                 let col = sess.committed_raw.chars().count() + sess.raw.chars().count();
@@ -519,6 +546,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             let tk = Instant::now();
             let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
             key_us.push(tk.elapsed().as_micros() as u64);
+            keys_done += 1;
             if let Some(c) = out.commit {
                 committed.push_str(&c);
                 early_commits += 1;
@@ -526,6 +554,61 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
                 early_max = early_max.max(c.chars().count());
                 early_resid += sess.raw.chars().count();
                 sent_events_this += 1;
+            }
+            // 句中停顿重排（同步：等结果落地再继续打）
+            if rerank_gguf.is_some() && keys_done == pause_at {
+                if let Some((key, ctx, texts)) = engine.rerank_request(&sess) {
+                    let first_before = texts.first().cloned();
+                    let scores: Vec<f64> = if let Some(ns) = &native_scorer {
+                        ns.score(&ctx, &texts)
+                    } else if let Some(rr) = &reranker {
+                        rr.score(&ctx, &texts)
+                    } else {
+                        Vec::new()
+                    };
+                    if scores.len() == texts.len() && texts.len() >= 2 {
+                        let mut order: Vec<(f64, String)> =
+                            scores.into_iter().zip(texts.into_iter()).collect();
+                        order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        let new_texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
+                        // 分歧统计：qwen 首选 vs 引擎原序首选
+                        total_rerank_fired += 1;
+                        if new_texts.first() != first_before.as_ref() {
+                            total_rerank_changed += 1;
+                        }
+                        engine
+                            .rerank_cache
+                            .lock()
+                            .unwrap()
+                            .insert(key, new_texts);
+                        engine.refresh_rerank(&mut sess);
+                    }
+                }
+            }
+        }
+        // 【rerank B 组】句末停顿重排：打完整句编码、收尾空格上屏前，
+        // 按真机管线（rerank_request→score→cache→refresh）换序一次。
+        if rerank_gguf.is_some() {
+            if let Some((key, ctx, texts)) = engine.rerank_request(&sess) {
+                let scores: Vec<f64> = if let Some(ns) = &native_scorer {
+                    ns.score(&ctx, &texts)
+                } else if let Some(rr) = &reranker {
+                    rr.score(&ctx, &texts)
+                } else {
+                    Vec::new()
+                };
+                if scores.len() == texts.len() && texts.len() >= 2 {
+                    let mut order: Vec<(f64, String)> =
+                        scores.into_iter().zip(texts.into_iter()).collect();
+                    order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let new_texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
+                    engine
+                        .rerank_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, new_texts);
+                    engine.refresh_rerank(&mut sess);
+                }
             }
         }
         // 收尾：空格上屏剩余（延迟也计入）
@@ -552,6 +635,11 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     if let Some(path) = lat_out {
         std::fs::write(&path, key_us.iter().map(|u| u.to_string()).collect::<Vec<_>>().join("\n"))
             .expect("延迟文件写出失败");
+    }
+    if rerank_gguf.is_some() {
+        println!("[RERANK] 句中停顿重排触发 {total_rerank_fired} 次 · qwen 首选与引擎原序分歧 {total_rerank_changed} 次（{}/{:.0}%）",
+            total_rerank_changed,
+            total_rerank_changed as f64 / total_rerank_fired.max(1) as f64 * 100.0);
     }
     let mut sorted = key_us.clone();
     sorted.sort_unstable();

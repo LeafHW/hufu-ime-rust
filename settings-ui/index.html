@@ -261,6 +261,20 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 整句 ════ -->
   <section id="tab-sentence">
     <h2>整句模型<span class="en">Sentence</span></h2>
+    <div id="s-model-guide" style="display:none;border:1px solid var(--bd);border-radius:8px;background:var(--bg3);padding:14px 16px;margin-bottom:12px;font-size:13.5px;line-height:1.9">
+      <b style="font-size:14.5px">当前安装未携带整句模型（轻量安装）</b><br>
+      现在各方案（含当前默认的顶功方案）可以正常打字；要启用整句组句，请按下面步骤补装模型：<br>
+      1. 到 <a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" style="color:var(--acc)">GitHub 发布页</a> 下载<b>完整版</b>压缩包（约 1 GB）；<br>
+      2. 解压后把 <b>模型\</b> 文件夹里的两个文件复制到本机输入法安装目录的「模型」文件夹（目录结构如下）；<br>
+      3. 注销重登（或在任务管理器结束 <code>hufu-server.exe</code> 后重新打开设置页）让模型加载；<br>
+      4. 在「方案」页切换到 <b>虎整句</b> 方案即可整句输入（Ctrl+M 可在最近两方案间来回切）。
+      <pre style="margin:10px 0 0;padding:12px 14px;border-radius:6px;background:var(--bg2);font-family:Consolas,monospace;font-size:12px;line-height:1.7;overflow-x:auto">HuFu虎符输入法-v1.4.7\            ← 安装目录（本输入法解压处）
+├─ hufu-server.exe …              程序文件
+├─ 码表\ …                        各输入方案
+└─ 模型\                           ← 没有就新建「模型」文件夹
+   ├─ mohu-sentence-ngram-v5.bin   整句组句模型（必需，约 547 MB）
+   └─ sentence-qwen-q8.gguf        神经重排模型（可选，约 610 MB）</pre>
+    </div>
     <div style="color:#ff5f57;font-weight:600;font-size:14px;padding:8px 12px;border:1px solid #ff5f5740;border-radius:8px;background:#ff5f5714;margin-bottom:12px">
       ⚠ 以下参数已按当前输入法调校到最佳状态，不建议自行调整。误调后可点「恢复初始值」一键还原。
     </div>
@@ -535,11 +549,19 @@ async function loadSchemas() {
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
     d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}` +
       `<button class="opendir" title="在资源管理器中打开此方案的码表文件夹">📂 打开文件夹</button>` +
+      `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频/整句权重词）合并进原始码表，导出为一张新码表（数据\\码表导出\\）">📤 导出码表</button>` +
       `${n === r.current_schema ? '<span class="tag">当前</span>' : ""}`;
     d.querySelector(".opendir").onclick = async ev => {
       ev.stopPropagation();
       try { await api("POST", "/api/open_schema_dir", { name: n }); msg(`已打开 ${n} 的文件夹`, "ok"); }
       catch (e) { msg(e.message, "err"); }
+    };
+    d.querySelector(".exp-dict").onclick = async ev => {
+      ev.stopPropagation();
+      try {
+        const r2 = await api("POST", "/api/export_schema", { name: n });
+        msg(`已导出 ${r2.lines} 行 → ${r2.path}`, "ok");
+      } catch (e) { msg(e.message, "err"); }
     };
     d.onclick = async () => {
       try {
@@ -563,7 +585,19 @@ async function refreshInfo() {
   const r = await api("GET", "/api/state");
   $("#engine-info").textContent = r.current_schema;
   const pill = $("#s-model-state");
-  pill.textContent = r.sentence_active ? "模型：已加载 ✓" : "模型：未加载";
+  const guide = $("#s-model-guide");
+  if (r.sentence_active) {
+    pill.textContent = "模型：已加载 ✓";
+    if (guide) guide.style.display = "none";
+  } else if (r.model_present === false) {
+    /* 【无模型小包 2026-09-07】文件都不在：显示下载/放置指引 */
+    pill.textContent = "模型：未安装";
+    if (guide) guide.style.display = "block";
+  } else {
+    /* 文件在但未激活：非整句方案（如顶功方案）的正常状态 */
+    pill.textContent = "模型：未加载";
+    if (guide) guide.style.display = "none";
+  }
   return r;
 }
 
