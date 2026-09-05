@@ -196,8 +196,13 @@ fn main() {
         // de 组垫底）。单字改用 Jun Da 字频 rank（1e9 基准，rank 越小分
         // 越高）；多字词沿用 PY_c weight（词权重可用），整体压在字之下
         // （反查先选字，词为补充）；词权重封顶避免压过字。
+        // 【生僻剔除 2026-09-07】用户拍板「特别生僻的单字去掉」：单字
+        // 不在 Jun Da 9900 字频表（CJK 扩展区等）→ 整条剔除。
         // 【小鹤过滤】非蓝本收录词整条剔除（用户拍板瘦身）。
         let chars: Vec<char> = text.chars().collect();
+        if chars.len() == 1 && !rank.contains_key(&chars[0]) {
+            continue;
+        }
         let score: i64 = if chars.len() == 1 {
             let r = rank.get(&chars[0]).copied().unwrap_or(200_000);
             1_000_000_000 - r * 10_000

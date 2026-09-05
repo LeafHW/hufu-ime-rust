@@ -851,23 +851,69 @@ impl CandidateWindowV2 {
             } else {
                 0.0
             };
+            // 【注释配额 2026-09-07】两处布局封顶（竖排固定宽/300、横排
+            // w_cap）与最长注释冲突时按配额截断注释（尾部 …），不再让
+            // 注释列侵入文本列——旧版 cmt_x 以 max_cmt 定位、横排按原
+            // cw 推进格子，长注释（拆分+拼音+unicode 多段拼接）直接压到
+            // 候选文本上或溢出重叠（用户实测「候选挤在一起」）。
+            let mut cmt_disp: Vec<String> = cands.iter().map(|(_, c)| c.clone()).collect();
+            let trunc_cmt = |s: &str, quota: f32| -> String {
+                if quota <= 0.0 || s.is_empty() {
+                    return String::new();
+                }
+                let mut out: String = s.to_string();
+                loop {
+                    let mut t = out.clone();
+                    t.push('…');
+                    if measure(&tf_small, &t) <= quota {
+                        return t;
+                    }
+                    if out.pop().is_none() {
+                        return String::new();
+                    }
+                }
+            };
             let (width, text_x, cmt_x, cmt_w) = if horizontal {
                 // 横排纯内容自适应：Σ(标签+文本+注释+间隔)，不受固定宽/最小宽约束
                 let mut w = margin_x * 2.0;
                 if raw_w > 0.0 {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
                 }
-                for (i, (tw, cw)) in cand_ws.iter().enumerate() {
-                    if i > 0 {
+                for (_i, (tw, cw)) in cand_ws.iter().enumerate() {
+                    if _i > 0 {
                         w += cand_spacing;
                     }
                     w += label_w * 0.72 + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
                 }
-                let w = w.max(raw_w + margin_x * 2.0);
-                // 【超屏修复】横排宽度封顶：工作区宽 − 余量（截断后
-                // 内容已不超 cap，此处兜底防极端布局叠加溢出）
-                let w = w.min(w_cap);
-                (w, 0.0, 0.0, 0.0)
+                let w_full = w.max(raw_w + margin_x * 2.0);
+                // 【超屏修复】横排宽度封顶：工作区宽 − 余量。超屏时注释
+                // 预算按剩余空间等比压缩（不足 12px 整列不显示），逐条
+                // 截断加 …；格子推进宽同步收缩，尾部候选不再溢出重叠。
+                if w_full > w_cap {
+                    let budget: f32 = cand_ws
+                        .iter()
+                        .filter(|(_, c)| *c > 0.0)
+                        .map(|(_, c)| 3.0 + c)
+                        .sum();
+                    let avail = w_cap - (w_full - budget);
+                    if avail <= 12.0 {
+                        for i in 0..cand_ws.len() {
+                            cand_ws[i].1 = 0.0;
+                            cmt_disp[i].clear();
+                        }
+                    } else if budget > 0.0 {
+                        let scale = avail / budget;
+                        for i in 0..cand_ws.len() {
+                            let cw = cand_ws[i].1;
+                            if cw > 0.0 {
+                                let quota = ((cw + 3.0) * scale - 3.0).max(0.0);
+                                cmt_disp[i] = trunc_cmt(&cmt_disp[i], quota);
+                                cand_ws[i].1 = if cmt_disp[i].is_empty() { 0.0 } else { quota };
+                            }
+                        }
+                    }
+                }
+                (w_full.min(w_cap), 0.0, 0.0, 0.0)
             } else {
                 // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
                 let mut need = margin_x + label_w + max_text.max(raw_w) + margin_x + 6.0;
@@ -880,16 +926,38 @@ impl CandidateWindowV2 {
                     need.clamp(min_width, 300.0)
                 };
                 let text_x = margin_x + label_w;
-                let (cmt_x, cmt_w) = if max_cmt > 0.0 {
-                    (width - margin_x - max_cmt - 2.0, max_cmt + 2.0)
+                // 注释列配额：右端对齐不变，宽压到「文本列右侧余量」；
+                // 超配额逐条截断（…）。固定宽皮肤装不下整条注释时宁可
+                // 截断注释也不压文本列。
+                let quota = if max_cmt > 0.0 {
+                    (width - margin_x - 2.0 - (text_x + max_text.max(raw_w) + 6.0)).max(0.0)
+                } else {
+                    0.0
+                };
+                if quota <= 0.0 {
+                    for i in 0..cand_ws.len() {
+                        cand_ws[i].1 = 0.0;
+                        cmt_disp[i].clear();
+                    }
+                } else if quota < max_cmt {
+                    for (i, (_, c)) in cands.iter().enumerate() {
+                        if cand_ws[i].1 > quota {
+                            cmt_disp[i] = trunc_cmt(c, quota);
+                            cand_ws[i].1 = if cmt_disp[i].is_empty() { 0.0 } else { quota };
+                        }
+                    }
+                }
+                let (cmt_x, cmt_w) = if quota > 0.0 {
+                    (width - margin_x - quota - 2.0, quota + 2.0)
                 } else {
                     (width, 0.0)
                 };
                 (width, text_x, cmt_x, cmt_w)
             };
-            (tf, tf_label, tf_small, cand_ws, (width, text_x, cmt_x, cmt_w, dy, raw_w))
+            (tf, tf_label, tf_small, cand_ws, (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)))
         };
-        let (v_width, text_x, cmt_x, cmt_w, dy, raw_w) = geo;
+        let (v_width, text_x, cmt_x, cmt_w, dy, raw_w) = geo.1;
+        let cmt_disp = geo.0;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
         let code_row = if raw.is_empty() || horizontal { 0.0 } else { 1.0 };
@@ -900,7 +968,7 @@ impl CandidateWindowV2 {
             margin_y * 2.0 + line_h * (1.0 + code_row) + cand_spacing * code_row
         } else {
             // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
-            let rows = cands.len().min(9) as f32 + code_row;
+            let rows = cands.len().min(10) as f32 + code_row;
             margin_y * 2.0 + line_h * rows + cand_spacing * (rows - 1.0).max(0.0)
         };
 
@@ -1340,7 +1408,8 @@ impl CandidateWindowV2 {
                 // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
                 let mut x = margin_x + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
                 let y = y0;
-                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                    let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                     let (tw, cw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0));
                     let cell_w = label_w * 0.72 + tw + if cw > 0.0 { 3.0 + cw } else { 0.0 };
                     if i > 0 {
@@ -1381,7 +1450,8 @@ impl CandidateWindowV2 {
                 }
             } else {
                 // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
-                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                    let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                     let y = y0 + (line_h + cand_spacing) * i as f32;
                     if i == sel {
                         // 高亮行（圆角胶囊；↑↓ 移动；左右对称 = margin_x 外扩 hilite_pad）
