@@ -31,7 +31,7 @@
 │                     engine/ (Rust, 跨平台核心)                │
 │  hufu-types    按键/候选/会话 等共享类型                       │
 │  hufu-dict     多格式码表解析 + Trie + 用户词 + 注释表          │
-│  hufu-engine   会话状态机：顶功/选重/反查/符号/滤镜链            │
+│  hufu-engine   会话状态机：顶屏/选重/反查/符号/滤镜链            │
 │  hufu-sentence TCSKNM02 ngram 加载 + beam 组句 + 提前上屏      │
 │  hufu-rerank   纯 Rust GGUF/Qwen3 推理（q8_0 解码 + GEMM）     │
 │  hufu-config   设置模型(JSON) + 热更新                          │
@@ -70,7 +70,7 @@ hufu/
 | `hufu-types`             | ✅          | —                                                            |
 | `hufu-dict`              | ✅          | 虎码单字 113k 条/272ms、虎码字词（import 闭包）246k 条/1.2s、QQ五笔 96k/114ms、多多 B 定制 33k/81ms；置顶/软删回放（最新在前、无重复、pinned 标记） |
 | `hufu-config`            | ✅          | —                                                            |
-| `hufu-engine`            | ✅          | 真实码表 REPL：顶功（`tuj`+死端字母推屏 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显；动态变量 `\da`→真实日期、`\n12345`→一万二千三百四十五、`\N1234`→壹萬贰仟大写金额、**`\calc(1+2)*3`→上屏 9**（HTTP 在线实测）、**`\w就就`→构码 jj 入库**（Rime encoder fixture）；Ctrl+Shift+数字 置顶 / Ctrl+Delete 软删（日志落盘+回放）；音效标签 key/select/commit/page；OpenCC 繁体变体（真实 ST 表：来→來、那个→那個 ⚑繁 + emoji） |
+| `hufu-engine`            | ✅          | 真实码表 REPL：顶屏（`tuj`+死端字母推字 𪚠）、`jd`+`;` 次选、注释/拼音/分区回显；动态变量 `\da`→真实日期、`\n12345`→一万二千三百四十五、`\N1234`→壹萬贰仟大写金额、**`\calc(1+2)*3`→上屏 9**（HTTP 在线实测）、**`\w就就`→构码 jj 入库**（Rime encoder fixture）；Ctrl+Shift+数字 置顶 / Ctrl+Delete 软删（日志落盘+回放）；音效标签 key/select/commit/page；OpenCC 繁体变体（真实 ST 表：来→來、那个→那個 ⚑繁 + emoji） |
 | `hufu-sentence`          | ✅          | 真实 TCSKNM02 224MB 模型加载 87ms；`tujatuja`→「我们我们」、`mfyto`→「大一点我是」；单次组句 0.4–2.8ms；提前上屏提案 |
 | `hufu-skin`              | ✅          | 19 颜色角色 + 材质模型；weasel 配色互导（含 0xAABBGGRR ↔ #RRGGBBAA） |
 | `hufu-cli`               | ✅          | check / convert / repl                                       |
