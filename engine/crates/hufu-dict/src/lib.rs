@@ -26,6 +26,7 @@ pub mod supplement;
 pub mod symbols;
 pub mod user;
 
+pub use annotation::AnnotationTable;
 pub use dict::Dict;
 pub use entry::DictEntry;
 pub use opencc::OpenCc;

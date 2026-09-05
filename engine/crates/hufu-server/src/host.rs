@@ -556,6 +556,10 @@ impl Host {
         let rerank_changed = sentence_changed;
         let schema_changed = cfg.schema.current != self.engine.config.schema.current
             || cfg.schema.dir != self.engine.config.schema.dir;
+        // 【2026-09-06 大统一】反查/拆分方案选择变化 → 重应用全局资源
+        // （注释表数据不变但 split/reverse 换文件；无需换主码表）
+        let assets_changed = cfg.reverse.scheme != self.engine.config.reverse.scheme
+            || cfg.candidates.split_scheme != self.engine.config.candidates.split_scheme;
         cfg.save(&self.config_path)?;
         self.engine.config = cfg;
         if schema_changed {
@@ -563,6 +567,9 @@ impl Host {
             if let Err(e) = self.engine.switch_schema(&name) {
                 return Err(e);
             }
+            self.session.clear();
+        } else if assets_changed {
+            self.engine.apply_global_assets();
             self.session.clear();
         }
         if sentence_changed || schema_changed {
