@@ -420,7 +420,7 @@ impl CandWin3 {
                 sz.cx as f32
             };
 
-            let n = cands.len().min(9);
+            let n = cands.len().min(10);
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
             for (t, c) in cands.iter().take(n) {
@@ -583,10 +583,34 @@ impl CandWin3 {
                 );
             }
             let text_x = margin_x + label_w;
-            let cmt_x = if max_cmt > 0.0 {
-                width - margin_x - max_cmt - 2.0
+            // 【注释配额 2026-09-07】同 candwin2：固定宽/300 封顶装不下
+            // 整条注释时，注释列宽压到「文本列右侧余量」（超配额逐条截
+            // 断加 …），不再左移侵入文本列（长注释压到候选文本上）。
+            let quota = if max_cmt > 0.0 {
+                (width - margin_x - 2.0 - (text_x + max_text.max(raw_w) + 6.0)).max(0.0)
+            } else {
+                0.0
+            };
+            let cmt_x = if quota > 0.0 {
+                width - margin_x - quota - 2.0
             } else {
                 width
+            };
+            let trunc_cmt = |s: &str, q: f32| -> String {
+                if q <= 0.0 || s.is_empty() {
+                    return String::new();
+                }
+                let mut out: String = s.to_string();
+                loop {
+                    let mut t = out.clone();
+                    t.push('…');
+                    if measure(h_small, &t) <= q {
+                        return t;
+                    }
+                    if out.pop().is_none() {
+                        return String::new();
+                    }
+                }
             };
             for (i, (text, cmt)) in cands.iter().take(n).enumerate() {
                 let y = y0 + (line_h + cand_spacing) * i as f32;
@@ -613,8 +637,15 @@ impl CandWin3 {
                     );
                 }
                 draw_text(&mut canvas, h_main, text, m + text_x, m + y, em, c_text);
-                if !cmt.is_empty() && max_cmt > 0.0 {
-                    draw_text(&mut canvas, h_small, cmt, m + cmt_x, m + y, em * 0.78, c_cmt);
+                let cmt_s = if cmt.is_empty() || quota <= 0.0 {
+                    String::new()
+                } else if max_cmt > quota && measure(h_small, cmt) > quota {
+                    trunc_cmt(cmt, quota)
+                } else {
+                    cmt.to_string()
+                };
+                if !cmt_s.is_empty() {
+                    draw_text(&mut canvas, h_small, &cmt_s, m + cmt_x, m + y, em * 0.78, c_cmt);
                 }
             }
             let _ = SelectObject(hdc, old_bmp);

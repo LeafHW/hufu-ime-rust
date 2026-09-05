@@ -199,7 +199,7 @@ impl CandidateWindow {
             if horizontal {
                 let mut x = 12;
                 let y = 6 + line_h;
-                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                for (i, (text, cmt)) in cands.iter().enumerate().take(10) {
                     if i > 0 { x += 8; }
                     if i == sel {
                         let hbr = CreateSolidBrush(argb(hi_back));
@@ -224,7 +224,7 @@ impl CandidateWindow {
                     }
                 }
             } else {
-                for (i, (text, cmt)) in cands.iter().enumerate().take(9) {
+                for (i, (text, cmt)) in cands.iter().enumerate().take(10) {
                     let y = 6 + line_h * (i as i32 + 1);
                     if i == sel {
                         let hbr = CreateSolidBrush(argb(hi_back));
