@@ -1284,11 +1284,18 @@ impl Engine {
             // 「尾部最长有效码」会选 ruae 之类 4 码段，锁段与解码切分脱
             // 节出「指了指乛」）。解码不可用/无切分才回退长优先。
             let base_len_now = base_now.chars().count();
+            // 【探针含锁 2026-09-06】解码探针必须含刚按的锁键：无锁
+            // 首选切分会把尾段并进长码词（smrlj 首选「出箊」尾段=rlj，
+            // rlj 组单词无第 2 名 → ; 被忽略，用户实测 smrlj;w; 按不动）。
+            // 含锁探针让锁钉住尾段（smrlj; → j 段锁 2 → 「出了什么」），
+            // 尾段=用户正锁的那个词段。锁字符不进 base，word_ends 终点
+            // 仍 == base_len_now，原检查兼容。
+            let probe_raw = format!("{}{}", session.raw, c);
             // word_ends 元素=(累计文本字符数, 段终点)——段起点=上一段
             // 终点（首段 0）。cbae=[(1,2),(2,4)]：尾段 ae 起点=we[0].1=2。
             let dec_tail: Option<(usize, usize)> =
                 self.sentence.as_ref().and_then(|d| {
-                    let dec = d.decode_rich(&session.raw);
+                    let dec = d.decode_rich(&probe_raw);
                     dec.hits.first().and_then(|h| {
                         let we = &h.word_ends;
                         let last = *we.last()?;

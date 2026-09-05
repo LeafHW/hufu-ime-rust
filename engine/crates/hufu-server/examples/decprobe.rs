@@ -56,7 +56,13 @@ fn main() {
     let dict = schema.dict.clone();
     let eng = hufu_sentence::SentenceEngine::load(&ngram, dict, &schema.supplement, weights)
         .expect("引擎装配失败");
-    for raw in ["ueeyiahx"] {
+    // 用法: decprobe <数据目录> <ngram路径> [raw1 raw2 ...]——不给 raw 时跑默认 ueeyiahx
+    let probe_raws: Vec<String> = if args.len() > 3 {
+        args[3..].to_vec()
+    } else {
+        vec!["ueeyiahx".to_string()]
+    };
+    for raw in &probe_raws {
         let dec = eng.decode_rich(raw);
         println!("== decode_rich({raw}) hits ==");
         for (i, h) in dec.hits.iter().take(6).enumerate() {
