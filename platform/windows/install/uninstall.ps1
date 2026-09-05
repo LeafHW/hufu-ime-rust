@@ -1,7 +1,11 @@
-# HuFu 虎符输入法 — 卸载脚本（管理员可选；卸载.bat 直接调用）
-# 每用户部分（HKCU/语言列表/自启/server）无管理员亦可完整卸载；
-# HKLM 机器级键：管理员组则提权清一次，普通用户跳过（无害残留）。
-param([switch]$NoHKLM)   # 测试用：强制每用户模式（跳过 HKLM 与提权）
+﻿# HuFu 虎符输入法 — 卸载脚本（卸载.bat 提权调用）
+# 【2026-09-07 残留清除强化】一次跑完全清：
+#   每用户注册+语言列表+自启+快捷方式 + 机器级注册+分类库
+#   + SystemIME（含 .oldN 腾位链，x64/SysWOW64 双位）
+#   + ProgramData + %LOCALAPPDATA% 早期版本数据 + 安装目录本体。
+# 关键顺序：先杀 ctfmon 再清注册（后杀会在重启时用缓存档案重建
+# HKCU TIP——实测残留根因）；全部清完最后再拉起 ctfmon。
+param([switch]$NoHKLM)   # 测试用：仅每用户清理（不提权、不动 HKLM）
 
 $ErrorActionPreference = 'Continue'
 
@@ -23,6 +27,11 @@ if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
 
 $inst = Split-Path -Parent $MyInvocation.MyCommand.Path   # 安装目录（脚本所在处）
 
+# 0) 【顺序关键】先杀 ctfmon/server 再清注册（防档案重建）
+Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+
 # 1) 语言列表移除
 $tipStr = "0804:$CLSID$PROFILE"
 $list = Get-WinUserLanguageList
@@ -40,8 +49,7 @@ foreach ($l in $list) {
 $smoke = Join-Path $inst 'hufu-tsf-smoke.exe'
 if ($hklm -and (Test-Path $smoke)) { & $smoke unreg }
 
-# 3) 停 server、删自启
-Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# 3) 删自启
 Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 'HuFu' -ErrorAction SilentlyContinue
 
 # 4) HKCU 注册表清理
@@ -52,8 +60,17 @@ $asm = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63
 Get-ChildItem $asm -ErrorAction SilentlyContinue | Where-Object {
     (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID
 } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-# 开始菜单快捷方式（install.ps1 创建的「HuFu 虎符输入法设置.lnk」）
+# 开始菜单快捷方式（通配双保险：精确名+*HuFu* 扫描）
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\HuFu 虎符输入法设置.lnk" -Force -ErrorAction SilentlyContinue
+Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Filter '*HuFu*' -ErrorAction SilentlyContinue |
+    Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+# 【早期版本残留】%LOCALAPPDATA%\HuFu（旧版数据目录——绿色化前版本使用）
+$legacyLocal = Join-Path $env:LOCALAPPDATA 'HuFu'
+if (Test-Path $legacyLocal) {
+    Remove-Item $legacyLocal -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $legacyLocal) { Write-Host '· %LOCALAPPDATA%\HuFu 部分被占用，重启后再跑一次卸载可清' }
+    else { Write-Host '已清早期版本数据: %LOCALAPPDATA%\HuFu' }
+}
 
 # 5) HKLM 清理（提权时；普通用户跳过——无害残留）
 if ($hklm) {
@@ -62,14 +79,6 @@ if ($hklm) {
     Remove-Item "HKLM:\SOFTWARE\WOW6432Node\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     # 32 位 COM 双视图 + SysWOW64 副本（32 位宿主支持）
     Remove-Item "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
-    $sysdir32 = "$env:SystemRoot\SysWOW64\SystemIME\HuFu"
-    if (Test-Path $sysdir32) {
-        Remove-Item $sysdir32 -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path $sysdir32) {
-            $m = 1; while (Test-Path "$sysdir32.old$m") { $m++ }
-            Rename-Item $sysdir32 "HuFu.old$m" -Force -ErrorAction SilentlyContinue
-        }
-    }
     # 全局分类库条目（8 项 TIP 分类 + MASTER，安装器双写对应清理）
     $lmCat = 'HKLM:\SOFTWARE\Microsoft\CTF\Category'
     $catAll = @(
@@ -83,46 +92,60 @@ if ($hklm) {
         Remove-Item "$lmCat\Category\$c\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item "$lmCat\Item\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
-    # SystemIME 副本；被运行中宿主占用时腾位改名（下次系统清理/重启后消失）
-    $sysdir = 'C:\Windows\SystemIME\HuFu'
-    if (Test-Path $sysdir) {
-        Remove-Item $sysdir -Recurse -Force -ErrorAction SilentlyContinue
+    # 【腾位链清除】SystemIME 当前目录 + 历史 .oldN 腾位（升级一次攒
+    # 一份的根源；卸载语义=全清，占用项改名腾位、重启后系统回收）
+    foreach ($base in @("$env:SystemRoot\SystemIME", "$env:SystemRoot\SysWOW64\SystemIME")) {
+        Get-ChildItem $base -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'HuFu*' } |
+            ForEach-Object {
+                Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        $sysdir = Join-Path $base 'HuFu'
         if (Test-Path $sysdir) {
             $n = 1; while (Test-Path "$sysdir.old$n") { $n++ }
             Rename-Item $sysdir "HuFu.old$n" -Force -ErrorAction SilentlyContinue
+            Write-Host "· DLL 被占用，SystemIME 已腾位 HuFu.old$n（重启后自动可删）"
         }
     }
-    # 诊断画像（load-*/act-*.txt，几十 KB）
+    # 诊断画像（load-*/act-*.txt）+ 删后复查（实测偶发删除后又被写回）
     Remove-Item 'C:\ProgramData\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path 'C:\ProgramData\HuFu') {
+        Remove-Item 'C:\ProgramData\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 # 临时安装/提权日志（%TEMP%\hufu-*.log）
 Get-ChildItem "$env:TEMP\hufu-*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 6) 刷新宿主——【2026-09-06 虎爪误伤修复】只杀 ctfmon（同 install.ps1
-#    说明：杀 TextInputHost/ShellExperienceHost 会触发 msctf 一致性
-#    校验，可能把注册非原生的第三方输入法判非法删除）。
-Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
+# 6) 【HKCU 二次复查】ctfmon 已在步骤 0 关闭，此处防外部因素重建
+if (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") {
+    Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# 7) 【自动删除安装目录】绿色模式：目录即程序，删目录=彻底卸载。
+#    脚本自身已被 PowerShell 加载进内存，删除不受影响；宿主短暂占用
+#    DLL 时腾位改名（重启后系统回收，下次安装的升级清理也会清）。
+if ($inst -and (Test-Path $inst)) {
+    Get-ChildItem $inst -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+    Remove-Item $inst -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $inst) {
+        $leaf = Split-Path $inst -Leaf
+        $n = 1; while (Test-Path "$($inst).old$n") { $n++ }
+        Rename-Item $inst "$leaf.old$n" -Force -ErrorAction SilentlyContinue
+        Write-Host "· 安装目录被占用已腾位: $leaf.old$n（重启后可删）"
+    } else {
+        Write-Host '安装目录已删除'
+    }
+}
+
+# 8) 拉起 ctfmon（系统输入法框架恢复）
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
 Write-Host ''
-Write-Host 'OK 卸载完成（注册表已清）' -ForegroundColor Green
-Write-Host "  现在把整个文件夹删除即完成卸载：$inst"
-Write-Host "  （绿色模式：程序原地在安装目录运行，删目录即彻底卸载，"
-Write-Host "    C 盘无数据残留）"
-$legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
-if (Test-Path $legacy) {
-    Write-Host "  · 旧版目录仍在：$legacy（可一并删除）"
+Write-Host 'OK 卸载完成（注册表+SystemIME+ProgramData+早期残留+安装目录 已全清）' -ForegroundColor Green
+if (-not $hklm) {
+    Write-Host '  · 本次为每用户模式（-NoHKLM）：机器级注册未动。' -ForegroundColor Yellow
+    Write-Host '    完整卸载请直接运行 卸载.bat（自动提权）。'
 }
-# 机器级残留说明（普通权限卸载清不掉 HKLM/SystemIME——机器级注册
-# 会让系统重新激活虎符：切换器可见、可打字。彻底卸载必须提权一次）
-$lmLeft = (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID") -or (Test-Path 'C:\Windows\SystemIME\HuFu')
-if ($lmLeft) {
-    Write-Host '  ⚠ 本机仍有机器级注册（HKLM 档案 + SystemIME DLL）——虎符会继续'
-    Write-Host '    可用（切换器可见、可打字）！彻底卸载请右键「卸载.bat」选'
-    Write-Host '    「以管理员身份运行」再跑一次（清机器级注册）。'
-}
-# 文件夹删除受阻提示（宿主占用 → 注销/重启后删除）
-Write-Host '  · 若删除文件夹时提示「文件被占用」：注销或重启电脑后再删一次'
-Write-Host '    即可完全删净（个别 DLL 会被系统输入宿主短暂占用）。'
+Write-Host '  · 腾位项（.oldN）重启后自动可删；下次安装也会自动清理'
 Write-Host '  · 无需重启/注销；已开应用里的输入法随应用关闭即消失'
