@@ -111,13 +111,33 @@ fn conv(syl: &str, ms: bool) -> Option<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 {
-        eprintln!("用法: gen_shuangpin <PY_c.dict.yaml> <输出目录> <字频csv（Jun Da hanziDB）>");
+    if args.len() < 5 {
+        eprintln!(
+            "用法: gen_shuangpin <PY_c.dict.yaml> <输出目录> <字频csv（Jun Da hanziDB）> <小鹤表（过滤蓝本）>"
+        );
         std::process::exit(2);
     }
     let src = &args[1];
     let out_dir = &args[2];
     let freq_csv = &args[3];
+    let xiaohe_tbl = &args[4];
+
+    // 【2026-09-07 用户拍板】反查表以小鹤（Bime 成品 43.9 万词）为蓝本：
+    // 只保留小鹤收录的词（微软双拼方案删除——无人使用；全拼/自然码
+    // 原始生成各 82 万条体积过大）。表格式：词<TAB>码。
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let f = std::fs::File::open(xiaohe_tbl).expect("打开小鹤表失败");
+        let br = std::io::BufReader::new(f);
+        for line in br.lines() {
+            let line = line.unwrap();
+            let word = line.split('\t').next().unwrap_or("").trim();
+            if !word.is_empty() {
+                keep.insert(word.to_string());
+            }
+        }
+        eprintln!("小鹤蓝本: {} 词", keep.len());
+    }
 
     // 字频表（Jun Da 现代汉语字频，frequency_rank 列）：rank 越小越常用。
     // CSV 列：frequency_rank,character,pinyin,definition,...
@@ -176,6 +196,7 @@ fn main() {
         // de 组垫底）。单字改用 Jun Da 字频 rank（1e9 基准，rank 越小分
         // 越高）；多字词沿用 PY_c weight（词权重可用），整体压在字之下
         // （反查先选字，词为补充）；词权重封顶避免压过字。
+        // 【小鹤过滤】非蓝本收录词整条剔除（用户拍板瘦身）。
         let chars: Vec<char> = text.chars().collect();
         let score: i64 = if chars.len() == 1 {
             let r = rank.get(&chars[0]).copied().unwrap_or(200_000);
@@ -183,19 +204,17 @@ fn main() {
         } else {
             weight.min(900_000_000)
         };
+        if !keep.contains(text) {
+            continue;
+        }
         entries.push((text.to_string(), syls, score));
     }
     // 【候选序=行序】PY_c 词典生僻字排在前（权重低），直接输出会让反查
     // 候选生僻字优先。按权重降序稳定排序后再编码：常用字进前列。
     entries.sort_by(|a, b| b.2.cmp(&a.2));
-    eprintln!("词条: {}（已按权重降序）", entries.len());
+    eprintln!("词条: {}（小鹤过滤+权重降序）", entries.len());
 
-    for (name, ms) in [("微软双拼", true), ("自然码", false), ("小鹤双拼备用", true)] {
-        // 小鹤正式表用 Bime 成品（虎爪调优序），此处仅当用户要求重建时用
-        // （--build-xiaohe 参数控制）；默认跳过。
-        if name == "小鹤双拼备用" && !std::env::args().any(|a| a == "--build-xiaohe") {
-            continue;
-        }
+    for (name, ms) in [("自然码", false)] {
         let mut out = BufWriter::new(
             std::fs::File::create(format!("{out_dir}/{name}.txt")).expect("创建输出失败"),
         );
