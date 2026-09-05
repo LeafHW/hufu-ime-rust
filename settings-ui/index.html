@@ -171,7 +171,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="schema-list" id="schema-list"></div>
     <h3>方案根目录</h3>
     <div class="row">
-      <div class="field"><label>目录名（数据目录内）</label><input type="text" data-path="schema.dir" style="width:260px"></div>
+      <div class="field"><label>目录名（安装根下，兼容数据目录内）</label><input type="text" data-path="schema.dir" style="width:260px"></div>
       <button id="btn-schema-refresh">刷新列表</button>
     </div>
   </section>
@@ -235,7 +235,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <input type="range" id="snd-vol" min="0" max="100" style="width:180px"></div>
       <button id="snd-test">▶ 试听</button>
     </div>
-    <div class="sub">编码 / 选词 / 上屏 / 翻页 四类提示音（数据目录 sounds/ 下可替换 wav：key.wav、select.wav、commit.wav、page.wav）。</div>
+    <div class="sub">编码 / 选词 / 上屏 / 翻页 四类提示音（数据\音效\ 下可替换 wav：key.wav、select.wav、commit.wav、page.wav）。</div>
 
     <h3>繁简与 Emoji</h3>
     <div class="row">
@@ -247,7 +247,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         </select></div>
       <div class="checkline"><input type="checkbox" id="oc-emoji"><label for="oc-emoji">Emoji 注解候选</label></div>
     </div>
-    <div class="sub">开启简→繁后打简出繁：候选与上屏文本直接转为繁体，候选顺序不变（无简繁之分的字保持原样原位）。Emoji 注解候选追加在尾部（😊 标记）。数据目录 opencc/ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
+    <div class="sub">开启简→繁后打简出繁：候选与上屏文本直接转为繁体，候选顺序不变（无简繁之分的字保持原样原位）。Emoji 注解候选追加在尾部（😊 标记）。数据\转换词典\ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
 
     <h3>剪贴板上屏</h3>
     <div class="row">
@@ -264,14 +264,14 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div id="s-model-guide" style="display:none;border:1px solid var(--bd);border-radius:8px;background:var(--bg3);padding:14px 16px;margin-bottom:12px;font-size:13.5px;line-height:1.9">
       <b style="font-size:14.5px">当前安装未携带整句模型（轻量安装）</b><br>
       现在各方案（含当前默认的顶功方案）可以正常打字；要启用整句组句，请按下面步骤补装模型：<br>
-      1. 到 <a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" style="color:var(--acc)">GitHub 发布页</a> 下载<b>完整版</b>压缩包（约 1 GB）；<br>
-      2. 解压后把 <b>模型\</b> 文件夹里的两个文件复制到本机输入法安装目录的「模型」文件夹（目录结构如下）；<br>
+      1. 到 <a href="https://github.com/LeafHW/hufu-ime-rust/releases/tag/%E6%A8%A1%E5%9E%8B" target="_blank" style="color:var(--acc)">GitHub 模型发布页</a> 下载 <b>default.7z</b>（约 880 MB）；<br>
+      2. 解压后把「<b>模型</b>」文件夹<b>整个</b>复制到本输入法安装目录（与「安装.bat」同级——注意是整个文件夹，不是单个文件）；<br>
       3. 注销重登（或在任务管理器结束 <code>hufu-server.exe</code> 后重新打开设置页）让模型加载；<br>
       4. 在「方案」页切换到 <b>虎整句</b> 方案即可整句输入（Ctrl+M 可在最近两方案间来回切）。
       <pre style="margin:10px 0 0;padding:12px 14px;border-radius:6px;background:var(--bg2);font-family:Consolas,monospace;font-size:12px;line-height:1.7;overflow-x:auto">HuFu虎符输入法-v1.4.7\            ← 安装目录（本输入法解压处）
 ├─ hufu-server.exe …              程序文件
 ├─ 码表\ …                        各输入方案
-└─ 模型\                           ← 没有就新建「模型」文件夹
+└─ 模型\                           ← 解压出来的「模型」文件夹放这里（与安装.bat 同级）
    ├─ mohu-sentence-ngram-v5.bin   整句组句模型（必需，约 547 MB）
    └─ sentence-qwen-q8.gguf        神经重排模型（可选，约 610 MB）</pre>
     </div>
@@ -286,7 +286,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <span class="pill" id="s-model-state">模型：检测中…</span>
     </div>
     <div class="row">
-      <div class="field"><label>ngram 模型文件（数据目录相对路径）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
+      <div class="field"><label>ngram 模型文件（安装根下相对路径，如 模型\xxx.bin）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
     </div>
     <div class="row" style="align-items:center;justify-content:space-between">
       <h3 style="margin:0">组句权重</h3>
@@ -549,7 +549,7 @@ async function loadSchemas() {
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
     d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}` +
       `<button class="opendir" title="在资源管理器中打开此方案的码表文件夹">📂 打开文件夹</button>` +
-      `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频/整句权重词）合并进原始码表，导出为一张新码表（数据\\码表导出\\）">📤 导出码表</button>` +
+      `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频）合并进原始码表，导出为一张新码表（码表导出\\<方案>\\）">📤 导出码表</button>` +
       `${n === r.current_schema ? '<span class="tag">当前</span>' : ""}`;
     d.querySelector(".opendir").onclick = async ev => {
       ev.stopPropagation();
