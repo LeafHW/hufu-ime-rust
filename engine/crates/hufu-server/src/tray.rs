@@ -443,7 +443,10 @@ fn schema_snapshot() -> (Vec<String>, String) {
     };
     let Some(shared) = shared else { return (Vec::new(), String::new()) };
     let Ok(host) = shared.lock() else { return (Vec::new(), String::new()) };
-    let dir = host.data_dir.join(&host.engine.config.schema.dir);
+    let dir = hufu_engine::Engine::resolve_data_sub(
+        &host.data_dir,
+        &host.engine.config.schema.dir,
+    );
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()

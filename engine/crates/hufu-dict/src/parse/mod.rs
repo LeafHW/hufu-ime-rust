@@ -56,6 +56,18 @@ pub fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(decode_lines(&bytes))
 }
 
+/// 行列表写文件（UTF-8 带 BOM，CRLF）：码表导出用。带 BOM 的 UTF-8
+/// 是记事本/VSCode/Notepad++ 全兼容形态（GB18030 无 BOM 在 VSCode 等
+/// 默认 UTF-8 的编辑器里显示为乱码）；HuFu 自身 read_lines 首查
+/// UTF-8 BOM，导出文件可直接再导入。
+pub fn write_lines_gb18030(path: &Path, lines: &[String]) -> std::io::Result<()> {
+    let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    let mut text = lines.join("\r\n");
+    text.push_str("\r\n");
+    bytes.extend_from_slice(text.as_bytes());
+    std::fs::write(path, bytes)
+}
+
 pub fn decode_lines(bytes: &[u8]) -> Vec<String> {
     let text = decode_text(bytes);
     text.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
