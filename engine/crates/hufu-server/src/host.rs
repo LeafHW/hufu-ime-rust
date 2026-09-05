@@ -147,6 +147,11 @@ impl Host {
         let cur = self.engine.config.schema.current.clone();
         if !cur.contains("整句") {
             self.engine.set_sentence_decoder(None);
+            // 【拖入模型补装 2026-09-06】神经重排线程同理只在启动/配置
+            // 变更时建——小包先装、事后拖入 模型\qwen 的场景下线程从未
+            // 建起。这里补位：线程缺位且模型文件如今在 → 建线程（已有
+            // 线程不动，避免切方案反复重载几百 MB）。
+            self.ensure_rerank_if_late();
             return;
         }
         let path = hufu_engine::Engine::resolve_data_sub(
@@ -176,12 +181,28 @@ impl Host {
                     // 整句词图；后续 reload_user_data 热更）
                     self.engine.sync_sentence_user_words();
                     eprintln!("整句引擎已加载: {}", path.display());
+                    // 拖入模型补装：ngram 已就位，qwen 若也是事后拖入
+                    // 的则一并补建重排线程（见 ensure_rerank_if_late）。
+                    self.ensure_rerank_if_late();
                     return;
                 }
                 Err(e) => eprintln!("整句模型加载失败: {e}"),
             }
         }
         self.engine.set_sentence_decoder(None);
+        // 同上：切到整句方案但 ngram 仍缺（还没拖模型）——重排线程若也
+        // 缺位且 qwen 已在，顺手补建（两模型可以分两次拖入的场景）。
+        self.ensure_rerank_if_late();
+    }
+
+    /// 拖入模型补装（2026-09-06）：rerank 线程从未建起而模型文件如今
+    /// 在场 → 补建。已有线程不碰（防切方案反复重载）。配置关 rerank
+    /// 时 setup_rerank 自己会短路，这里无需再判。
+    fn ensure_rerank_if_late(&mut self) {
+        if self.rerank_tx.is_none() && self.resolve_rerank_model().is_some() {
+            eprintln!("神经重排：检测到事后拖入的模型，补建重排线程");
+            self.setup_rerank();
+        }
     }
 
     /// 模型路径解析：配置值（相对→数据目录）→ 数据目录 models/ 自动探测。
@@ -195,7 +216,11 @@ impl Host {
         if p.is_absolute() {
             candidates.push(p);
         } else if !cfg.model_path.is_empty() {
-            candidates.push(self.data_dir.join(&cfg.model_path));
+            // 一级目录布局兼容：安装根优先，回退 数据\ 旧位置
+            candidates.push(hufu_engine::Engine::resolve_data_sub(
+                &self.data_dir,
+                &cfg.model_path,
+            ));
         }
         // 自动探测：数据根「模型」下任意 .gguf（排除 ngram bin）——
         // 一级目录布局优先，回退 数据\ 内旧位置
