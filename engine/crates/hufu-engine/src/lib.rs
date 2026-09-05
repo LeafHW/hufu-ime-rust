@@ -2309,6 +2309,8 @@ impl Engine {
             }
             let mut c = Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
             c.weight = h.score;
+            // 【2026-09-07 用户拍板】整句候选（现切多字组合）不带注释/
+            // 拆分——多音拼音串冗长无意义；注释功能仅码表域（Dict）生效。
             if h.exact {
                 exact_cands.push(c);
             } else {
@@ -2474,6 +2476,9 @@ impl Engine {
                         let mut cand =
                             Candidate::new(text, session.raw.clone(), CandidateKind::Sentence);
                         cand.weight = h.score;
+                        // 【2026-09-07 用户拍板】整句/短语候选不带注释——
+                        // 注释与拆分仅码表域（Dict）生效（见 annotate 调用
+                        // 处 entry_to_candidate）。
                         // 短语压前须过「真词地板」：强短语（真词，如 两次
                         // mlwe≈-7.7 / 真好 nqbh≈-8.1）仍压生僻表项置前
                         //（与 Rime 同拍）；弱切分产物（如 ennw 解出「午王」
