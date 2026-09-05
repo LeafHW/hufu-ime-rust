@@ -1559,7 +1559,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // SearchHost 豁免：其 GetTextExt 常态失败，焦点窗定位候选是
         // 刚需；用户固定（pinned）时无视锚点，不抑制。
         let pinned_now = crate::candwin2::CAND_PINNED.lock().unwrap().is_some();
-        if g.caret.is_none() && !pinned_now && !host_is_searchhost() {
+        // 【WPS 表格首键 2026-09-06】WPS 族（et 表格实测）首键 caret 是
+        // 陈旧 Some（旧单元格位）——除 caret=None 外，WPS 族组段首键帧
+        // （raw 单键）也抑制一帧 + 35ms 补显，避免首键显示旧位第二帧跳。
+        let wps_first_key = host_is_wps() && raw.chars().count() == 1;
+        if (g.caret.is_none() || wps_first_key) && !pinned_now && !host_is_searchhost() {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
@@ -1696,6 +1700,27 @@ fn host_is_searchhost() -> bool {
             })
             .unwrap_or_default();
         exe.eq_ignore_ascii_case("SearchHost.exe")
+    })
+}
+
+/// 宿主是否 WPS 全家（wps 文字 / et 表格 / wpp 演示 / wpspdf）。
+/// 【表格首键跳位 2026-09-06】et.exe 表格里 GetTextExt 首键返回
+/// 陈旧 caret（上一单元格位置，Some 非 None）——原「首帧锚点缺失
+/// 抑制」只盖 caret=None，表格首键候选先显示旧位、第二帧跳回光标
+/// （用户实测首键跳、第二键才跟随）。WPS 族组段首键帧（raw 单键）
+/// 一律延迟一帧 + 35ms 补显，等表格布局把 caret 刷稳。
+fn host_is_wps() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                p.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let l = exe.to_lowercase();
+        l == "et.exe" || l == "wps.exe" || l == "wpp.exe" || l == "wpspdf.exe"
     })
 }
 
