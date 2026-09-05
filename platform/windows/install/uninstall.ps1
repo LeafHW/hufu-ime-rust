@@ -98,8 +98,10 @@ if ($hklm) {
 # 临时安装/提权日志（%TEMP%\hufu-*.log）
 Get-ChildItem "$env:TEMP\hufu-*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 6) 刷新宿主
-Stop-Process -Name TextInputHost, ShellExperienceHost, ctfmon -Force -ErrorAction SilentlyContinue
+# 6) 刷新宿主——【2026-09-06 虎爪误伤修复】只杀 ctfmon（同 install.ps1
+#    说明：杀 TextInputHost/ShellExperienceHost 会触发 msctf 一致性
+#    校验，可能把注册非原生的第三方输入法判非法删除）。
+Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
