@@ -93,6 +93,36 @@ if ($PhaseElevated) {
     } else {
         Write-Host '（未找到 hufu_tsf32.dll，跳过 32 位支持）' -ForegroundColor Yellow
     }
+    # ── 升级清理（2026-09-06）：腾位残留与诊断日志 ──
+    # 1) 历史腾位目录/文件（HuFu.oldN 目录、hufu_tsf.dll.oldN——此前
+    #    「随系统清理」实际永不清，升级一次攒一份）。本次 DLL 已就位，
+    #    旧的若仍被运行中的应用占用则跳过（下次安装/重启后再清）。
+    foreach ($base in @("$env:SystemRoot\SystemIME", "$env:SystemRoot\SysWOW64\SystemIME")) {
+        Get-ChildItem $base -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'HuFu.old*' } |
+            ForEach-Object {
+                try {
+                    Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+                    Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
+                    Write-Host "清理腾位残留: $($_.FullName)"
+                } catch {}
+            }
+        $hu = Join-Path $base 'HuFu'
+        if (Test-Path $hu) {
+            Get-ChildItem $hu -Filter '*.old*' -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try { Remove-Item $_.FullName -Force -ErrorAction Stop; Write-Host "清理旧副本: $($_.Name)" } catch {}
+            }
+        }
+    }
+    # 2) 诊断日志（ProgramData\HuFu\diag——升级即清，日志无需跨版本保留）
+    $diag = 'C:\ProgramData\HuFu\diag'
+    if (Test-Path $diag) {
+        $n = @(Get-ChildItem $diag -Force -ErrorAction SilentlyContinue).Count
+        Get-ChildItem $diag -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item $_.FullName -Force -Recurse -ErrorAction Stop } catch {}
+        }
+        if ($n -gt 0) { Write-Host "清理诊断日志: $n 个" }
+    }
     Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
     $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
     Set-RegHKLM "HKLM:\SOFTWARE\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
@@ -308,7 +338,13 @@ if ($isAdmin) {
     Start-Process $exe -WindowStyle Hidden
 }
 Start-Sleep -Seconds 2
-Stop-Process -Name TextInputHost, ShellExperienceHost -Force -ErrorAction SilentlyContinue
+# 【2026-09-06 虎爪误伤修复】刷新宿主只杀 ctfmon（输入法框架标准刷新，
+# 主流输入法安装器通用）。此前杀 TextInputHost/ShellExperienceHost：
+# shell 宿主重启会触发 msctf 对 TIP 存储的一致性校验，把注册结构
+# 非原生/不完整的第三方输入法（如虎爪）判非法周期删除——「装完
+# HuFu 虎爪从列表消失」的概率性根因。ctfmon 重载即可让新 TIP 进
+# Win+空格列表，无需动 shell 组件。
+Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
