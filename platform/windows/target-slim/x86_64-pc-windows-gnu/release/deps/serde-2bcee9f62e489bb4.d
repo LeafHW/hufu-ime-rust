@@ -1,0 +1,14 @@
+E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\deps\serde-2bcee9f62e489bb4.d: C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\build\serde-ef229c42f649a035\out/private.rs
+
+E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\deps\libserde-2bcee9f62e489bb4.rlib: C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\build\serde-ef229c42f649a035\out/private.rs
+
+E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\deps\libserde-2bcee9f62e489bb4.rmeta: C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\build\serde-ef229c42f649a035\out/private.rs
+
+C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\Leafy\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\build\serde-ef229c42f649a035\out/private.rs:
+
+# env-dep:OUT_DIR=E:\\DSH-KF\\hufu\\platform\\windows\\target-slim\\x86_64-pc-windows-gnu\\release\\build\\serde-ef229c42f649a035\\out
