@@ -1,0 +1,1 @@
+cargo:rustc-link-search=native=C:\Users\Leafy\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\windows_x86_64_gnu-0.52.6\lib

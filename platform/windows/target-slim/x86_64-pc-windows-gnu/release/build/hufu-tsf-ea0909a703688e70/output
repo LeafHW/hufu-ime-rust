@@ -1,0 +1,3 @@
+cargo:rustc-link-arg=E:\DSH-KF\hufu\platform\windows\hufu-tsf\assets\hufu_rsrc.o
+cargo:rerun-if-changed=assets/hufu_rsrc.o
+cargo:rerun-if-changed=assets/hufu_rsrc32.o
