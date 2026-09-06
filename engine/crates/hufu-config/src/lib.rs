@@ -273,9 +273,10 @@ pub struct SentenceSection {
     pub rerank: RerankSection,
     /// ngram 模型文件（用户数据目录相对路径）
     pub ngram_path: String,
-    /// 【提前上屏证据窗 2026-09-07】确认上屏所需证据键数（2=激进，
-    /// 3=稳健：残留码长 3.5→4.85、每次上屏字数 1.05→1.29、准率+0.3，
-    /// 上屏率需配大束宽补回）。HUFU_EARLY_NEED 环境变量优先（bench 覆盖）。
+    /// 【提前上屏证据窗 2026-09-06 定版】确认上屏所需证据键数。
+    /// 万句终测定版 3：残留码长 4.86、字/次 1.29、准率 99.54%（三者
+    /// 最高），配束宽 6000 上屏率 48.5%。HUFU_EARLY_NEED 环境变量
+    /// 优先（bench 覆盖）。
     #[serde(default = "default_early_need")]
     pub early_need: usize,
     /// 组句权重（全部可调）
@@ -283,7 +284,7 @@ pub struct SentenceSection {
 }
 
 fn default_early_need() -> usize {
-    2
+    3
 }
 
 fn default_true() -> bool {
@@ -300,7 +301,7 @@ impl Default for SentenceSection {
             min_retained_raw: 0,
             rerank: RerankSection::default(),
             ngram_path: "models/sentence-ngram.bin".into(),
-            early_need: 2,
+            early_need: 3,
             weights: SentenceWeights::default(),
         }
     }
@@ -369,7 +370,10 @@ pub struct SentenceWeights {
 impl Default for SentenceWeights {
     fn default() -> Self {
         SentenceWeights {
-            beam_width: 200,
+            // 【束宽 2026-09-06 万句定版】6000：上屏率 48.5%（200→6000
+            // 从 40.1% 起步单调升后收敛），准率不降反升。长尾代价见
+            // p95——顿挫敏感场景退 3000（43.7%，长尾明显短）。
+            beam_width: 6000,
             candidate_limit: 20,
             max_raw_length: 128,
             rank_penalty: 0.03,
@@ -550,7 +554,9 @@ mod tests {
     fn default_roundtrip_and_partial_load() {
         let cfg = Config::default();
         assert_eq!(cfg.input.max_code_length, 4);
-        assert_eq!(cfg.sentence.weights.beam_width, 200);
+        // 2026-09-06 舒适度定版：束宽 6000+证据窗 3（万句 48.5%/99.54%）
+        assert_eq!(cfg.sentence.weights.beam_width, 6000);
+        assert_eq!(cfg.sentence.early_need, 3);
 
         // 部分 JSON：未给字段用默认值
         let partial = r#"{ "input": { "max_code_length": 5 } }"#;
