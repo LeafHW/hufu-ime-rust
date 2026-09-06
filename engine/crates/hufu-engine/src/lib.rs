@@ -1654,11 +1654,22 @@ impl Engine {
             };
             build_raw_lengths(&cands, &full, dict.digit_coded, &is_code)
         };
+        // 【strong 份额线 2026-09-06 自由探索】判定提案为强证据的份额
+        // 线（原硬编码 0.999）。HUFU_EARLY_STRONG_SHARE 可调（bench 探
+        // 索用）：线上调→更多提案落入普通通道、按 early_need 多等——
+        // 上屏更稀但每次攒字更多。
+        static STRONG_SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let strong_line = *STRONG_SHARE.get_or_init(|| {
+            std::env::var("HUFU_EARLY_STRONG_SHARE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.999)
+        });
         session.early_history.push(EarlyHistory {
             proposal: proposal.clone(),
             full_raw: full.clone(),
             raw_lengths,
-            strong: proposal_share >= 0.999, // Rime STRONG_SHARE（0.9999→0.99999 曾反向调严；
+            strong: proposal_share >= strong_line, // Rime STRONG_SHARE（0.9999→0.99999 曾反向调严；
             // 实测 v5 下提前上屏偏保守，回 0.999 提高积极性）
         });
         while session.early_history.len() > 3 {
@@ -1673,6 +1684,9 @@ impl Engine {
         // 【证据窗参数】config sentence.early_need（默认 2）+HUFU_EARLY_NEED
         // 环境变量最高优先（bench 零编译覆盖）。3 = 更稳健：残留码长
         // 3.5→4.85、字/次 1.05→1.29（2026-09-07 舒适度扫描），行尾仍 1 键。
+        // 【混合证据窗 2026-09-06 自由探索】HUFU_EARLY_STRONG_NEED：当前
+        // 提案为强证据（份额≥0.999）时的独立确认键数（缺省=同 early_need）。
+        // 设小于 early_need 即「高置信快出、普通置信稳等」的混合策略。
         static NEED_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let need_k = *NEED_K.get_or_init(|| {
             std::env::var("HUFU_EARLY_NEED")
@@ -1680,7 +1694,21 @@ impl Engine {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(self.config.sentence.early_need)
         });
-        let need = if line_end { 1 } else { need_k };
+        static STRONG_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let strong_k = *STRONG_K.get_or_init(|| {
+            std::env::var("HUFU_EARLY_STRONG_NEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(need_k)
+        });
+        let cur_strong = session.early_history.last().map(|e| e.strong).unwrap_or(false);
+        let need = if line_end {
+            1
+        } else if cur_strong {
+            strong_k.min(need_k.max(1))
+        } else {
+            need_k
+        };
         if session.early_history.len() < need {
             return;
         }
