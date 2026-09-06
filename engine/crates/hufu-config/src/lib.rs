@@ -218,7 +218,9 @@ impl Default for CandidatesSection {
             custom_select_keys: Vec::new(),
             vertical: false,
             show_index: true,
-            show_pinyin_comment: true,
+            // 【2026-09-07 用户拍板】拼音注释默认关（此前默认开，用户
+            // 反馈默认关）；unicode/拆分维持默认关。
+            show_pinyin_comment: false,
             show_unicode_comment: false,
             show_split: false,
             split_scheme: "虎码".into(),
