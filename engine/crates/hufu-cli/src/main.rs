@@ -134,10 +134,33 @@ fn real_code_of(schema: &Schema, ch: char) -> String {
     }
 }
 
+/// 【权重扫描 2026-09-07】bench 系命令的配置：默认值 + HUFU_W_<字段>
+/// 环境变量覆盖（f64/usize 按字段类型解析）。零编译扫描整句权重用。
+/// 例：HUFU_W_CONFIDENCE=0.95 HUFU_W_EMITTED_CHARACTER_REWARD=4 tbench …
+fn bench_config() -> Config {
+    let mut cfg = Config::default();
+    let w = &mut cfg.sentence.weights;
+    macro_rules! w_f64 {
+        ($($f:ident),* $(,)?) => { $( if let Ok(v) = std::env::var(concat!("HUFU_W_", stringify!($f))) {
+            if let Ok(n) = v.parse::<f64>() { w.$f = n; }
+        } )* }
+    }
+    macro_rules! w_usize {
+        ($($f:ident),* $(,)?) => { $( if let Ok(v) = std::env::var(concat!("HUFU_W_", stringify!($f))) {
+            if let Ok(n) = v.parse::<usize>() { w.$f = n; }
+        } )* }
+    }
+    w_f64!(rank_penalty, emitted_character_reward, isolation_lambda,
+           confidence, dict_bias, supplement_baseline, supplement_scale,
+           supplement_maximum);
+    w_usize!(beam_width, candidate_limit, max_raw_length, isolation_threshold);
+    cfg
+}
+
 fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
     let t0 = Instant::now();
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
-    let cfg = Config::default();
+    let cfg = bench_config();
     let ngram_path = ngram
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("模型/sentence-ngram.bin"));
@@ -245,7 +268,7 @@ fn cmd_code(dir: &str, sentence: &str) {
 /// -e 附带提前上屏不完全尾候选。码表直查对照一并输出。
 fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
-    let cfg = Config::default();
+    let cfg = bench_config();
     let dec = hufu_sentence::SentenceEngine::load(
         Path::new(ngram),
         schema.dict.clone(),
@@ -296,8 +319,8 @@ fn cmd_query(dir: &str, ngram: &str, raws: &[String], show_early: bool) {
 /// session 级候选框透视：逐键喂入，每键后打印候选框（真实 UI 同源）。
 fn cmd_cands(dir: &str, ngram: &str, raws: &[String]) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
-    let cfg = Config::default();
-    let mut engine = Engine::with_schema_dir(Path::new(dir), Config::default())
+    let cfg = bench_config();
+    let mut engine = Engine::with_schema_dir(Path::new(dir), bench_config())
         .expect("引擎初始化失败");
     if ngram != "-" {
         let dec = hufu_sentence::SentenceEngine::load(
@@ -384,7 +407,7 @@ fn cmd_convert(input: &str, output: &str) {
 /// lat_out 可选：每键延迟 µs 逐行写文件（多进程分片汇总用）。
 fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
-    let cfg = Config::default();
+    let cfg = bench_config();
     // ngram == "-"：纯码表模式（不装整句解码器、不调模型不重排）——
     // 顶功码表 + 选重锁单字打法，测纯查表路径触达。
     // 纯码表基准同时关学习（auto_frequency/log_adjust）：逐句调频会
