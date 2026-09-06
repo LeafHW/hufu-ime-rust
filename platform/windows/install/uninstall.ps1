@@ -122,30 +122,37 @@ if (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") {
     Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# 7) 【自动删除安装目录】绿色模式：目录即程序，删目录=彻底卸载。
-#    脚本自身已被 PowerShell 加载进内存，删除不受影响；宿主短暂占用
-#    DLL 时腾位改名（重启后系统回收，下次安装的升级清理也会清）。
-if ($inst -and (Test-Path $inst)) {
-    Get-ChildItem $inst -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
-    Remove-Item $inst -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $inst) {
-        $leaf = Split-Path $inst -Leaf
-        $n = 1; while (Test-Path "$($inst).old$n") { $n++ }
-        Rename-Item $inst "$leaf.old$n" -Force -ErrorAction SilentlyContinue
-        Write-Host "· 安装目录被占用已腾位: $leaf.old$n（重启后可删）"
-    } else {
-        Write-Host '安装目录已删除'
-    }
-}
+# 7) 【数据保留 2026-09-07 用户拍板】卸载=解除注册+停进程，安装目录
+#    与其中数据（配置/用户调整/码表导出）一概不删——去留由用户决定。
+#    卸载完成输出里给出数据位置与手动清理指引。
 
 # 8) 拉起 ctfmon（系统输入法框架恢复）
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
 Write-Host ''
-Write-Host 'OK 卸载完成（注册表+SystemIME+ProgramData+早期残留+安装目录 已全清）' -ForegroundColor Green
+Write-Host 'OK 卸载完成（注册表+SystemIME+ProgramData+早期残留已清；输入法已移除）' -ForegroundColor Green
 if (-not $hklm) {
     Write-Host '  · 本次为每用户模式（-NoHKLM）：机器级注册未动。' -ForegroundColor Yellow
     Write-Host '    完整卸载请直接运行 卸载.bat（自动提权）。'
 }
 Write-Host '  · 腾位项（.oldN）重启后自动可删；下次安装也会自动清理'
 Write-Host '  · 无需重启/注销；已开应用里的输入法随应用关闭即消失'
+# 【数据保留指引】安装目录不删——用户数据去留由用户决定
+if ($inst -and (Test-Path $inst)) {
+    Write-Host ''
+    Write-Host "  数据已保留（未删除任何文件），安装目录：$inst"
+    $dataTips = @()
+    if (Test-Path "$inst\数据\config.json") { $dataTips += '数据\config.json（配置：方案/皮肤/习惯设置）' }
+    $adjN = @(Get-ChildItem "$inst\码表" -Recurse -Filter '用户调整.txt' -File -ErrorAction SilentlyContinue).Count
+    if ($adjN -gt 0) { $dataTips += "码表\*\用户调整.txt（词频学习记录，$adjN 个方案）" }
+    if (Test-Path "$inst\码表导出") {
+        $expN = @(Get-ChildItem "$inst\码表导出" -Recurse -File -ErrorAction SilentlyContinue).Count
+        if ($expN -gt 0) { $dataTips += "码表导出\（导出的码表快照，$expN 个文件）" }
+    }
+    if ($dataTips.Count -gt 0) {
+        Write-Host '  可存档的数据：'
+        $dataTips | ForEach-Object { Write-Host "    · $_" }
+        Write-Host '  （重装同版后再放回原位即可恢复）'
+    }
+    Write-Host "  确认不要了，手动删整个文件夹即彻底清理：$inst"
+}
