@@ -273,8 +273,17 @@ pub struct SentenceSection {
     pub rerank: RerankSection,
     /// ngram 模型文件（用户数据目录相对路径）
     pub ngram_path: String,
+    /// 【提前上屏证据窗 2026-09-07】确认上屏所需证据键数（2=激进，
+    /// 3=稳健：残留码长 3.5→4.85、每次上屏字数 1.05→1.29、准率+0.3，
+    /// 上屏率需配大束宽补回）。HUFU_EARLY_NEED 环境变量优先（bench 覆盖）。
+    #[serde(default = "default_early_need")]
+    pub early_need: usize,
     /// 组句权重（全部可调）
     pub weights: SentenceWeights,
+}
+
+fn default_early_need() -> usize {
+    2
 }
 
 fn default_true() -> bool {
@@ -291,6 +300,7 @@ impl Default for SentenceSection {
             min_retained_raw: 0,
             rerank: RerankSection::default(),
             ngram_path: "models/sentence-ngram.bin".into(),
+            early_need: 2,
             weights: SentenceWeights::default(),
         }
     }

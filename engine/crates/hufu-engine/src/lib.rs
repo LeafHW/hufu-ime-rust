@@ -1670,15 +1670,15 @@ impl Engine {
         // 行尾（组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信
         // 前缀（confidence 软最大占比 ≥0.99 不变），只是早一键落地，
         // 让组段尽快缩回一行内。
-        // 【证据窗参数】HUFU_EARLY_NEED（默认 2）：确认上屏所需证据键
-        // 数。3 = 更保守（第三键仍同提案才落地）——上屏更晚更少、残
-        // 留码更长（2026-09-05 档位实验）。行尾仍 1 键。
+        // 【证据窗参数】config sentence.early_need（默认 2）+HUFU_EARLY_NEED
+        // 环境变量最高优先（bench 零编译覆盖）。3 = 更稳健：残留码长
+        // 3.5→4.85、字/次 1.05→1.29（2026-09-07 舒适度扫描），行尾仍 1 键。
         static NEED_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let need_k = *NEED_K.get_or_init(|| {
             std::env::var("HUFU_EARLY_NEED")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2)
+                .unwrap_or(self.config.sentence.early_need)
         });
         let need = if line_end { 1 } else { need_k };
         if session.early_history.len() < need {
