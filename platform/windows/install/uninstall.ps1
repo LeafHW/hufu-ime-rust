@@ -122,11 +122,28 @@ if (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") {
     Remove-Item "HKCU:\Software\Microsoft\CTF\TIP\$CLSID" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# 7) 【数据保留 2026-09-07 用户拍板】卸载=解除注册+停进程，安装目录
-#    与其中数据（配置/用户调整/码表导出）一概不删——去留由用户决定。
-#    卸载完成输出里给出数据位置与手动清理指引。
+# 7) 【数据保留 2026-09-07 用户拍板】卸载=解除注册+停进程+C 盘安装产物
+#    清干净（SystemIME/ProgramData/LOCALAPPDATA 旧版数据/临时日志）；
+#    安装目录与其中数据（配置/用户调整/码表导出）一概不删——去留由
+#    用户决定，卸载完成输出里给出数据位置与手动清理指引。
 
-# 8) 拉起 ctfmon（系统输入法框架恢复）
+# 8) 【腾位残留二扫】步骤 5 清 SystemIME 时被宿主占用的项已改名 .oldN；
+#    此时 ctfmon 已杀，锁大概率已释放——再清一遍，能删则删（仍占用
+#    的留待重启后系统回收/下次安装清理）。
+if ($hklm) {
+    foreach ($base in @("$env:SystemRoot\SystemIME", "$env:SystemRoot\SysWOW64\SystemIME")) {
+        Get-ChildItem $base -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'HuFu.old*' } |
+            ForEach-Object {
+                Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+    }
+    $leftN = @(Get-ChildItem "$env:SystemRoot\SystemIME" -Filter 'HuFu*' -Force -ErrorAction SilentlyContinue).Count
+    if ($leftN -gt 0) { Write-Host "· SystemIME 剩 $leftN 个占用项（重启后可删/下次安装自动清）" }
+}
+
+# 9) 拉起 ctfmon（系统输入法框架恢复）
 Start-Process ctfmon -ErrorAction SilentlyContinue
 
 Write-Host ''
