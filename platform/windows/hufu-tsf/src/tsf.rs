@@ -62,6 +62,10 @@ pub struct Shared {
     /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
     /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
     pub focus_idle_at: Option<std::time::Instant>,
+    /// 【打字期 poll 静默 2026-09-08】最近一次按键时刻——poll_tick 在
+    /// 500ms 活跃窗口内直接跳过（键路径自会刷新 UI；poll 在打字中
+    /// 只有抢管道/抢锁的副作用）。对齐虎爪「打字时零后台」行为。
+    pub last_key_at: Option<std::time::Instant>,
     /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
     pub delay_show_ms: u32,
     /// 上次 raw（变化检测）
@@ -154,6 +158,7 @@ impl Shared {
             skin_ver_last: 0,
             skin_repaint: false,
             focus_idle_at: None,
+            last_key_at: None,
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
@@ -865,6 +870,8 @@ impl HuFuTs_Impl {
         // 行尾瞬态（query_caret 每帧刷新）：组段逼近窗口右缘时本键
         // 的提前上屏确认放宽（engine need 2→1）
         let line_end = self.shared.lock().unwrap().line_end;
+        // 【打字期 poll 静默】记最近按键时刻（poll 500ms 窗口内跳过）
+        self.shared.lock().unwrap().last_key_at = Some(std::time::Instant::now());
         let Some((consumed, commit, back, state, sound, sound_vol)) =
             ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end)
         else {
@@ -2251,6 +2258,26 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【打字期静默】500ms 内有按键 → 键路径在活跃，poll 只会抢管道
+    // /抢锁（键请求被队头阻塞的温床）。跳过本拍（打完最后一键
+    // 500ms 后 poll 恢复：补显/换序/皮肤热更新照常）。
+    {
+        let sp = POLL_SHARED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.0.clone());
+        if let Some(s) = sp {
+            let busy = s
+                .lock()
+                .unwrap()
+                .last_key_at
+                .is_some_and(|t| t.elapsed().as_millis() < 500);
+            if busy {
+                return;
+            }
+        }
+    }
     let n = POLL_TICKS.fetch_add(1, AtomicOrdering::Relaxed);
     if n < 3 {
         diag_note(&format!("poll: tick #{} 开始", n + 1));
