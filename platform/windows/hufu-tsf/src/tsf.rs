@@ -118,6 +118,12 @@ pub struct Shared {
     /// 重查 caret 并移动候选窗到最新插入点——「每自动上屏一次就跟随，
     /// 哪怕候选里还有内容」。
     pub caret_recheck_due: bool,
+    /// 【锚组段起点·补显强制重查 2026-09-08】非跟随宿主段内跳过
+    /// query_caret（布局锁减压）——但组段首帧查到的常是旧行框（懒
+    /// 布局），首帧抑制 35ms 补显时必须强制重查一次拿稳定值，否则
+    /// 候选窗按旧行框显示到下一段（用户实测「候选框乱跳」）。置位
+    /// 于 arm_first_frame_timer 各抑制点，query_caret 消费即清。
+    pub caret_force: bool,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -167,6 +173,7 @@ impl Shared {
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
             caret_recheck_due: false,
+            caret_force: false,
             line_end: false,
             last_show: None,
         }
@@ -1061,8 +1068,9 @@ impl EditSession_Impl {
                 // 【锚组段起点宿主：段内零 GetTextExt】非跟随宿主组段
                 // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
                 // 只会把布局锁压力（每次×2 连查）无谓压给宿主（虎魄
-                // 跟打器卡顿根因）。跟随宿主/锚点缺失才查。
-                if host_follow_caret() || g.caret.is_none() {
+                // 跟打器卡顿根因）。跟随宿主/锚点缺失/首帧补显（懒布局
+                // 首查常为旧行框，补显必须重拿稳定值）才查。
+                if host_follow_caret() || g.caret.is_none() || g.caret_force {
                     query_caret(&mut g, &ctx, ec);
                 }
                 Ok(())
@@ -1310,6 +1318,7 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
 /// 拿它当锚点正是候选框水平/垂直抖动的病根。
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret = None;
+    g.caret_force = false; // 消费即清（补显强制重查一次性）
     let Some(comp) = g.composition.clone() else {
         trace("qc: 无组段");
         return;
@@ -1620,6 +1629,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 110ms 轮询周期——「首键候选慢半拍」的 122ms 主耗曾在此；
         // 立即显示又会首帧旧行框跳变，35ms≈1 帧布局稳定下限）。
         g.suppress_pending = true;
+        g.caret_force = true; // 补显时强制重查锚点（旧行框矫正）
         arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
@@ -1758,6 +1768,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 g.wps_settle_start = Some(std::time::Instant::now());
             }
             g.suppress_pending = true;
+            g.caret_force = true; // 补显时强制重查锚点（旧行框矫正）
             arm_first_frame_timer();
             return Ok(());
         }
@@ -2335,6 +2346,7 @@ fn poll_tick() {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
             g.cand_shown_this_segment = false;
+            g.caret_force = false; // 断段：补显强制重查标志失效
             g.wps_caret_prev = None;
             g.wps_settle_start = None;
             // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
