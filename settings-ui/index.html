@@ -579,7 +579,10 @@ const WDEFS = [
 ];
 /* 出厂调校值（v1.4.6 万句基准定标）：恢复初始值按钮用 */
 const W_DEFAULTS = {
-  beam_width: 200, rank_penalty: 0.03, emitted_character_reward: 2.0,
+  /* 【2026-09-06 开箱定版 W1「更安心的上屏」】与 Rust 端
+     SentenceWeights::default 同步（万句 99.54%/56.1%/1.30） */
+  beam_width: 30000, candidate_limit: 10,
+  rank_penalty: 0.03, emitted_character_reward: 2.0,
   isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
   dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
 };
@@ -621,6 +624,7 @@ function scheduleWeightAutoSave() {
 $("#w-reset").onclick = async () => {
   try {
     Object.assign(CFG.sentence.weights, W_DEFAULTS);
+    CFG.sentence.early_need = 3; /* 恢复为 W1 出厂档 */
     buildSliders();
     await api("POST", "/api/config", CFG);
     msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
