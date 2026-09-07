@@ -357,7 +357,11 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="material-note" id="material-note"></div>
         <div class="field" style="margin-top:14px">
           <label>实机试打（在此打字，真实候选窗会弹出，与上方预览对比）</label>
-          <input type="text" id="skin-try" style="width:100%" placeholder="例如输入 zhrjk（虎符）——真实候选窗即在此处弹出">
+          <div style="display:flex;gap:10px">
+            <input type="text" id="skin-try" style="flex:1" placeholder="例如输入 zhrjk（虎符）——真实候选窗即在此处弹出">
+            <button id="skin-preview-btn" title="立即弹真实候选窗（键入 zhrjk）查看当前皮肤实机效果">📲 实机预览</button>
+          </div>
+          <div class="sub" style="margin-top:4px">拖动上方任意滑杆松手后，也会自动弹出一次实机预览。</div>
         </div>
       </div>
       <div style="flex:1;min-width:330px">
@@ -880,8 +884,21 @@ function bindSkin() {
   let _skinSaveTimer = null;
   const saveSkinDebounced = () => {
     clearTimeout(_skinSaveTimer);
-    _skinSaveTimer = setTimeout(() => saveSkinQuiet(), 600);
+    _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); previewLive(); }, 600);
   };
+  /* 【实机预览 2026-09-06】保存皮肤后自动键入 zhrjk（虎符）：server
+     session 出现候选，DLL poll（40ms 拉状态、签名变化即刷新）会弹出
+     真实候选窗——与左侧预览图实时对比。1.6s 后自动清缓冲收窗。
+     位置跟随上次组段光标（刚在试打框打过字=就在试打框旁）。 */
+  let _pvTimer = null;
+  function previewLive() {
+    clearTimeout(_pvTimer);
+    api("POST", "/api/reset", {}).catch(() => {});
+    ["z", "h", "r", "j", "k"].forEach((k, i) => {
+      setTimeout(() => api("POST", "/api/key", { key: k }).catch(() => {}), 40 * i + 30);
+    });
+    _pvTimer = setTimeout(() => api("POST", "/api/reset", {}).catch(() => {}), 1600);
+  }
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
@@ -929,8 +946,11 @@ function bindSkin() {
         bindSkin(); buildColorGrid(); preview();
         await api("POST", "/api/skin", SKIN);
         msg("当前皮肤已恢复出厂默认值并保存生效 ✓", "ok");
+        previewLive();
       } catch (e) { msg("恢复默认失败：" + e.message, "err"); }
     };
+    // 手动实机预览按钮
+    $("#skin-preview-btn").onclick = () => { previewLive(); msg("实机预览已触发 ✓", "ok"); };
   }
 }
 function preview() {
