@@ -727,9 +727,13 @@ impl CandidateWindowV2 {
             .unwrap_or("%s.")
             .to_string();
         let fmt_label = |n: usize| -> String {
+            // 【10 选序号 2026-09-08】第 10 候选显示 0（1234567890，
+            // 与引擎 0=10 选重键一致）；n_show=10 的列宽测量也因此量
+            // 「0.」宽（与「1.」同宽，比「10.」窄）。
+            let d = if n == 10 { 0 } else { n };
             match label_fmt.find("%s") {
-                Some(p) => format!("{}{}{}", &label_fmt[..p], n, &label_fmt[p + 2..]),
-                None => format!("{n}."),
+                Some(p) => format!("{}{}{}", &label_fmt[..p], d, &label_fmt[p + 2..]),
+                None => format!("{d}."),
             }
         };
         let hsp = layout_f(skin, "hilite_spacing", 2.0);
