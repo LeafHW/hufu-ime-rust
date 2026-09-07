@@ -2270,8 +2270,11 @@ fn poll_tick() {
     }
     let _guard = scopeguard_release();
     // 【打字期静默】500ms 内有按键 → 键路径在活跃，poll 只会抢管道
-    // /抢锁（键请求被队头阻塞的温床）。跳过本拍（打完最后一键
-    // 500ms 后 poll 恢复：补显/换序/皮肤热更新照常）。
+    // /抢锁（键请求被队头阻塞的温床）。跳过本拍。
+    // 【回归修复 2026-09-08】首帧抑制的 35ms 补显走 poll 路径——
+    // 打字期全静默把补显也饿死（用户实测「没有候选框」：连打期间
+    // suppress_pending 永不消费）。豁免：待补显/上屏重查/皮肤重绘
+    // 在身时 poll 必须跑（跑一拍消费掉标志后恢复静默）。
     {
         let sp = POLL_SHARED
             .lock()
@@ -2279,12 +2282,13 @@ fn poll_tick() {
             .as_ref()
             .map(|p| p.0.clone());
         if let Some(s) = sp {
-            let busy = s
-                .lock()
-                .unwrap()
+            let g = s.lock().unwrap();
+            let busy = g
                 .last_key_at
                 .is_some_and(|t| t.elapsed().as_millis() < 500);
-            if busy {
+            let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
+            drop(g);
+            if busy && !owes {
                 return;
             }
         }
