@@ -652,11 +652,11 @@ impl CandidateWindowV2 {
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
         let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
-        // 序号列宽：基准 26px，测量块内按序号字体实测「10.」宽度自适应
-        // 放大（滚轮放大序号后 26px 装不下导致「1」与「.」换行上下摞——
-        // 2026-09-06 用户实测；比例随 label_font_point 自动缩放，用户
-        // 无需任何手动调整）。
-        let mut label_w = if show_index { 26.0f32 } else { 0.0 };
+        // 序号列宽：按本页实际序号宽度自适应（测量块内计算）——基准
+        // 12px 保底。滚轮放大序号后列宽随字号缩放（「1.」「10.」不换
+        // 行摞字），序号与正文间距保持紧凑（2026-09-06 用户实测反馈
+        // 「隔太远」后去掉 26px 固定基准与「10.」保守定宽）。
+        let mut label_w = if show_index { 12.0f32 } else { 0.0 };
         let em = font_pt * 96.0 / 72.0;
         // 横排（skin.layout.horizontal）：候选单行横铺，weasel 式
         let horizontal = skin
@@ -807,24 +807,33 @@ impl CandidateWindowV2 {
                 // 兜底：按字数估宽
                 s.chars().count() as f32 * em
             };
-            // 序号列宽自适应（见 label_w 定义处注释）：以最宽序号「10.」
-            // 实测宽 + 5px 余量，不低于基准 26px——任何字号下「1.」「10.」
-            // 都单行放得下，比例自动保持。
-            if show_index {
-                let w10 = measure(&tf_label, "10.");
-                label_w = label_w.max(w10 * 1.05 + 5.0);
+            // 序号列宽自适应（见 label_w 定义处注释）：竖排列宽按本页
+            // 实际最大序号「N.」实测（只显示 min(len,10) 个——按「10.」
+            // 定宽在页内只有 2~5 个候选时右侧空一大截，序号与正文隔
+            // 太远，2026-09-06 用户实测）。横排不按列宽——逐格序号宽
+            // 存 cand_ws 第三元，正文紧贴各自序号。
+            let n_show = cands.len().min(10);
+            if show_index && n_show > 0 {
+                let wmax = measure(&tf_label, &format!("{n_show}."));
+                label_w = label_w.max(wmax + 4.0);
             }
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
-            let mut cand_ws: Vec<(f32, f32)> = Vec::new();
-            for (t, c) in &cands {
+            let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
+            for (i, (t, c)) in cands.iter().enumerate() {
                 let tw = measure(&tf, t.as_str());
                 let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c.as_str()) };
+                // 本格序号宽（「N.」实测 + 4px 间距）：横排正文紧跟序号
+                let iw = if show_index && i < 10 {
+                    measure(&tf_label, &format!("{}.", i + 1)).max(12.0) + 4.0
+                } else {
+                    0.0
+                };
                 max_text = max_text.max(tw);
                 if !c.is_empty() {
                     max_cmt = max_cmt.max(cw);
                 }
-                cand_ws.push((tw, cw));
+                cand_ws.push((tw, cw, iw));
             }
             // 光学垂直居中：CJK 墨盒在行盒内整体偏上（行盒含下降部空白，
             // 段落居中只对齐行盒）→ 视觉上下内边距不等（下面多）。
@@ -906,11 +915,11 @@ impl CandidateWindowV2 {
                 if raw_w > 0.0 {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
                 }
-                for (_i, (tw, cw)) in cand_ws.iter().enumerate() {
+                for (_i, (tw, cw, iw)) in cand_ws.iter().enumerate() {
                     if _i > 0 {
                         w += cand_spacing;
                     }
-                    w += label_w + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
+                    w += iw + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
                 }
                 let w_full = w.max(raw_w + margin_x * 2.0);
                 // 【超屏修复】横排宽度封顶：工作区宽 − 余量。超屏时注释
@@ -919,8 +928,8 @@ impl CandidateWindowV2 {
                 if w_full > w_cap {
                     let budget: f32 = cand_ws
                         .iter()
-                        .filter(|(_, c)| *c > 0.0)
-                        .map(|(_, c)| 3.0 + c)
+                        .filter(|(_, c, _)| *c > 0.0)
+                        .map(|(_, c, _)| 3.0 + c)
                         .sum();
                     let avail = w_cap - (w_full - budget);
                     if avail <= 12.0 {
@@ -1447,8 +1456,8 @@ impl CandidateWindowV2 {
                 let y = y0;
                 for (i, (text, _)) in cands.iter().enumerate().take(10) {
                     let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                    let (tw, cw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0));
-                    let cell_w = label_w + tw + if cw > 0.0 { 3.0 + cw } else { 0.0 };
+                    let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                    let cell_w = iw + tw + if cw > 0.0 { 3.0 + cw } else { 0.0 };
                     if i > 0 {
                         x += cand_spacing;
                     }
@@ -1475,8 +1484,8 @@ impl CandidateWindowV2 {
                     };
                     let mut cx = x;
                     if show_index {
-                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y + dy, label_w, line_h, bl);
-                        cx += label_w;
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y + dy, iw, line_h, bl);
+                        cx += iw;
                     }
                     draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, line_h, bt);
                     cx += tw;
@@ -1746,7 +1755,7 @@ impl CandidateWindowV2 {
                 raw.chars().count(),
                 cand_ws
                     .iter()
-                    .map(|(tw, _)| *tw)
+                    .map(|(tw, _, _)| *tw)
                     .fold(0.0f32, f32::max)
             ));
             crate::tsf::diag_note(&format!(
