@@ -58,6 +58,10 @@ pub struct Shared {
     /// 皮肤刚重拉、待按新皮肤重绘一次（poll 消费即清——签名未变
     /// 时的预览刷新通道；绝非常驻标志，防每 40ms 白绘）。
     pub skin_repaint: bool,
+    /// 【焦点风暴去抖 2026-09-08】上次「无组段」OnSetFocus 处理时刻——
+    /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
+    /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
+    pub focus_idle_at: Option<std::time::Instant>,
     /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
     pub delay_show_ms: u32,
     /// 上次 raw（变化检测）
@@ -143,6 +147,7 @@ impl Shared {
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             skin_ver_last: 0,
             skin_repaint: false,
+            focus_idle_at: None,
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
@@ -497,6 +502,27 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             let g = self.shared.lock().unwrap();
             (g.composing, g.preedit_last.clone())
         };
+        // 【焦点风暴去抖 2026-09-08】QQ 实测 40ms 内连发 8 次
+        // OnSetFocus（宿主内部焦点抖动）——每次 spawn 线程+focus
+        // 管道+抢锁，与打字键路径竞争 → 打字卡顿（用户实测「打着
+        // 打着会卡」，trace 实锤风暴时段）。无组段（composing=
+        // false 且 preedit 空）时这些全是幂等空操作：200ms 内已
+        // 处理过一次的直接跳过。有组段永不去抖（冲销必须执行）。
+        if !composing && preedit.is_empty() {
+            let mut g = self.shared.lock().unwrap();
+            let now = std::time::Instant::now();
+            let skip = g
+                .focus_idle_at
+                .is_some_and(|t| now.duration_since(t).as_millis() < 200);
+            if !skip {
+                g.focus_idle_at = Some(now);
+            }
+            drop(g);
+            if skip {
+                trace("OnSetFocus: 无组段+200ms 内已处理 → 风暴去抖跳过");
+                return Ok(());
+            }
+        }
         trace(&format!(
             "OnSetFocus: composing={composing} preedit='{}' prev={:?}",
             preedit,
