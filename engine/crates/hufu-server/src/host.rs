@@ -322,20 +322,18 @@ impl Host {
                 // → 释放 llama ctx / Rust 推理器（省数百 MB 私有内存；
                 // qwen ctx+kv 是常驻大头）。下次任务到达时重载（首句
                 // 重排迟到 1-3s，缓存刷新机制照常补偿）。
-                // 【第二轮】10→4 分钟（打字间隙多在 2-5 分钟量级，10 分钟
-                // ≈ 永不卸）；卸载同时 SetProcessWorkingSetSize(-1,-1)
-                // 主动收缩工作集——llama/ngram 的文件映射页一并换出
-                //（落 standby 链表，再访问零读盘），任务管理器 WS 立落。
-                const IDLE_UNLOAD_MIN: u64 = 4;
+                // 【2026-09-08 卡顿复盘】①4→30 分钟：打字中阅读/思考
+                // 停顿 2-5 分钟是常态，4 分钟阈值把「正常停顿后恢复打
+                // 字」变成首键重载+换页高发窗口；②删除卸载时的
+                // SetProcessWorkingSetSize(-1,-1) 全进程收缩——它把
+                // 546MB ngram mmap 页+词典堆页一并逐出工作集，恢复打
+                // 字的第一键在 Host 锁内整句解码靠缺页换回（内存紧张
+                // 时=硬读盘），实测形态恰为「偶发 1-4s 卡、CPU≈4%、按
+                // 键断流」。mmap 页落 standby 本就省内存，收缩只换来
+                // 任务管理器数字好看，代价是打字恢复卡顿——不值得。
+                const IDLE_UNLOAD_MIN: u64 = 30;
                 let trim_working_set = || {
-                    #[link(name = "kernel32")]
-                    unsafe extern "system" {
-                        fn GetCurrentProcess() -> isize;
-                        fn SetProcessWorkingSetSize(h: isize, min: isize, max: isize) -> i32;
-                    }
-                    unsafe {
-                        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), -1isize, -1isize);
-                    }
+                    // 已废弃为空操作：见上注释②（工作集收缩有害无益）
                 };
                 let mut idle_secs: u64 = 0;
                 let mut loaded = native.is_some() || model.is_some();
@@ -359,20 +357,25 @@ impl Host {
                     let job = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
                         Ok(j) => j,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // 【前台感知 2026-09-08】idle 只看「无重排任务」
+                            // 会误判：词典域短码（跟打器主场景）本来就不
+                            // 产生重排任务——用户正在打字也会被判空闲，
+                            // 打字中卸模型（审计 E-1）。note_foreground
+                            // 每 key 都写时间戳：60s 内有过按键就不累计。
+                            if hufu_rerank::foreground_within(60_000) {
+                                idle_secs = 0;
+                                continue;
+                            }
                             idle_secs += 60;
-                            // 空闲到点：卸 rerank（若在）+ 必收缩工作集
-                            //（ngram mmap 全表热页——bench/长句后 214MB
-                            // 驻留 WS——换出到 standby，任务管理器立落）
+                            // 空闲到点：卸 rerank（工作集收缩已废弃——
+                            // 见 IDLE_UNLOAD_MIN 注释，收缩踢热页=恢复
+                            // 打字卡顿根因）
                             if idle_secs >= IDLE_UNLOAD_MIN * 60 {
                                 if loaded {
                                     native = None; // drop llama ctx → 归还数百 MB
                                     model = None;
                                     loaded = false;
-                                    eprintln!("神经重排：空闲 {IDLE_UNLOAD_MIN} 分钟，模型已卸载");
-                                }
-                                if idle_secs == IDLE_UNLOAD_MIN * 60 {
-                                    trim_working_set();
-                                    eprintln!("工作集已收缩（空闲 {IDLE_UNLOAD_MIN} 分钟）");
+                                    eprintln!("神经重排：空闲 {IDLE_UNLOAD_MIN} 分钟（无任务且无按键），模型已卸载");
                                 }
                             }
                             continue;

@@ -50,6 +50,13 @@ pub struct Session {
     /// 跨软换行期应用 caret 视觉滞留（「光标停在上一行结尾」）。瞬态单键
     /// 有效：try_early_commit 开头消费。
     pub line_end_hint: bool,
+    /// 【重排应用记忆 2026-09-08】apply_rerank 最近一次已应用的
+    /// key——DLL poll 每 40ms 拉 state 时 refresh_rerank 会对同一
+    /// key 反复做 decode_rich（取 depth_map 的全量 beam 解码，锁内）
+    ///——停顿期 40ms 一次重算同一结果。同 key 幂等跳过；key 变化
+    ///（下一键）自然重放。缓存新 order 到达的同 key 场景由下一键
+    /// 应用（停顿期用户无输入，视觉无损）。
+    pub rerank_applied_key: String,
 }
 
 impl Session {
@@ -69,6 +76,7 @@ impl Session {
             pending_commit: None,
             tail_context: String::new(),
             line_end_hint: false,
+            rerank_applied_key: String::new(),
         }
     }
 

@@ -18,6 +18,13 @@ pub fn note_foreground() {
 }
 
 fn foreground_recent() -> bool {
+    foreground_within(50)
+}
+
+/// 【空闲判定辅助 2026-09-08】距最近一次按键是否在 within_ms 内——
+/// 重排线程的模型卸载判定用（打字中永不卸，审计 E-1：词典域短码
+/// 不产生重排任务，只看任务会把「正在打字」误判空闲）。
+pub fn foreground_within(within_ms: u64) -> bool {
     let last = FOREGROUND_MS.load(Ordering::Relaxed);
     if last == 0 {
         return false;
@@ -26,7 +33,7 @@ fn foreground_recent() -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    now.saturating_sub(last) < 50
+    now.saturating_sub(last) < within_ms
 }
 
 /// 重排专用线程池：≤6 线程 + Windows BelowNormal 优先级。

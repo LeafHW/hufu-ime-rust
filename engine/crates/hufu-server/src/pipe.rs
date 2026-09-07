@@ -27,7 +27,9 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                     let _ = host.engine.config.save(&host.config_path);
                     host.setup_sentence();
                 }
-                host.after_ime_op(); // 神经重排派发（异步）
+                // 【重排派发去重 2026-09-08】process_key 内部已调
+                // after_ime_op（host.rs）——此处再调=每键双份 RerankJob
+                //（worker 去抖吸收，纯浪费，审计 E-5）。
                 // 音效热生效：每键带上当前音量（DLL 端 wav 数据可缓存，
                 // 音量取响应值——设置页改音量无需重启/失效缓存）
                 if r.get("outcome").and_then(|o| o.get("sound")).is_some() {

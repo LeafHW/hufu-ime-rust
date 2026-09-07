@@ -499,9 +499,14 @@ impl SentenceEngine {
             // avg 49→24ms、p95 102→38ms、exact 90% 持平）
             (w.beam_width / 16).max(100)
         };
+        // 【性能 2026-09-08】env 读取移出循环：Windows 上 env::var 走
+        // 进程环境块+内部锁，原先在 beam 循环体内每位置读一次，48 码
+        // 句每次解码白读 48 次（审计报告 E-3）。OnceLock 一次定型。
+        static INC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let inc_debug = *INC_DEBUG.get_or_init(|| std::env::var("HUFU_INC_DEBUG").is_ok());
         for pos in start_pos..n {
             buckets[pos].limit(beam);
-            if std::env::var("HUFU_INC_DEBUG").is_ok() {
+            if inc_debug {
                 eprintln!(
                     "[inc] raw_len={n} start={start_pos} pos={pos} bucket_size={} segs={}",
                     buckets[pos].best.len(),
