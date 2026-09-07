@@ -1064,7 +1064,12 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
-                let _ = set_selection_at_end(&ctx, ec, &range);
+                // 【段内免 SetSelection 2026-09-08】每键 SetSelection 触发
+                // 宿主选区通知链（跟打器 UI 线程上又一逐键负担——虎爪
+                // 对照流畅，我们卡：段内逐键压宿主的点全部剔除）。组段
+                // range 自锚定，选区只在 StartPreedit 建段时设一次；
+                // Commit/上屏路径不受影响（EndComposition 后宿主按组段
+                // 末尾放置插入点）。
                 // 【锚组段起点宿主：段内零 GetTextExt】非跟随宿主组段
                 // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
                 // 只会把布局锁压力（每次×2 连查）无谓压给宿主（虎魄
