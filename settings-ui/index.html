@@ -358,7 +358,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="field" style="margin-top:14px">
           <label>实机试打（在此打字，真实候选窗会弹出，与上方预览对比）</label>
           <div style="display:flex;gap:10px">
-            <input type="text" id="skin-try" style="flex:1" placeholder="例如输入 zhrjk（虎符）——真实候选窗即在此处弹出">
+            <input type="text" id="skin-try" style="flex:1" placeholder="例如输入 zhhrjk（虎符）——真实候选窗即在此处弹出">
             <button id="skin-preview-btn" title="立即弹真实候选窗（键入 zhrjk）查看当前皮肤实机效果">📲 实机预览</button>
           </div>
           <div class="sub" style="margin-top:4px">拖动上方任意滑杆松手后，也会自动弹出一次实机预览。</div>
@@ -894,7 +894,7 @@ function bindSkin() {
   function previewLive() {
     clearTimeout(_pvTimer);
     api("POST", "/api/reset", {}).catch(() => {});
-    ["z", "h", "r", "j", "k"].forEach((k, i) => {
+    ["z", "h", "h", "r", "j", "k"].forEach((k, i) => {
       setTimeout(() => api("POST", "/api/key", { key: k }).catch(() => {}), 40 * i + 30);
     });
     _pvTimer = setTimeout(() => api("POST", "/api/reset", {}).catch(() => {}), 1600);
