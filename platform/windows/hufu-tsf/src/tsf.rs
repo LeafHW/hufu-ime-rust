@@ -1058,7 +1058,13 @@ impl EditSession_Impl {
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
                 let _ = set_selection_at_end(&ctx, ec, &range);
-                query_caret(&mut g, &ctx, ec);
+                // 【锚组段起点宿主：段内零 GetTextExt】非跟随宿主组段
+                // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
+                // 只会把布局锁压力（每次×2 连查）无谓压给宿主（虎魄
+                // 跟打器卡顿根因）。跟随宿主/锚点缺失才查。
+                if host_follow_caret() || g.caret.is_none() {
+                    query_caret(&mut g, &ctx, ec);
+                }
                 Ok(())
             }
             Op::Commit(text) => {
@@ -1317,11 +1323,15 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         return;
     };
     // 候选窗锚点按宿主分化：
-    // - 跟随宿主（晴跟打Pro/虎魄跟打器，整句长编码场景）：锚 END
-    //   （光标处）。长编码段光标持续前进，窗钉在段首会越离越远
-    //   （实测 w 涨到 800px 仍 x 恒定）；虎魄后报同款病，并入。
-    // - 其余宿主：锚 START（组段起始）——编码期间位置恒定，逐键
-    //   右移的「跳」由此消除；首帧错位另由稳定期抑制。
+    // - 跟随宿主（晴跟打Pro，整句长编码场景）：锚 END（光标处）。
+    //   长编码段光标持续前进，窗钉在段首会越离越远。
+    // - 其余宿主（含虎魄跟打器）：锚 START（组段起始）——编码期间
+    //   位置恒定，逐键右移的「跳」由此消除；首帧错位另由稳定期抑制。
+    //   【2026-09-08 虎魄移出跟随名单】跟随=每键 GetTextExt×2（强迫
+    //   懒布局收敛）——跑在跟打器布局引擎上的同步调用，布局锁被大
+    //   范围重排占住时卡秒级（用户实测 02:23:49 卡 5.1s，卡点在
+    //   SetPreedit 会话内 GetTextExt；换虎爪输入法不卡——虎爪无逐键
+    //   布局查询）。虎魄改锚组段起点：段内零查询，首键查一次定位。
     let anchor = if host_follow_caret() {
         TF_ANCHOR_END
     } else {
@@ -1480,9 +1490,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         } else if !commit.is_empty() {
             // 提前上屏：提交前缀 + 继续组句（此前该分支丢失中途上屏文本）
             // 【上屏跟随】懒布局宿主上屏帧 caret 常是旧行框——布置 60ms
-            // 重查（见 caret_recheck_due 注释）。
-            g.caret_recheck_due = true;
-            arm_caret_recheck_timer();
+            // 重查（见 caret_recheck_due 注释）。锚组段起点宿主不需要：
+            // CommitAndRepreet 新组段 StartPreedit 会话自会查首帧锚点。
+            if host_follow_caret() {
+                g.caret_recheck_due = true;
+                arm_caret_recheck_timer();
+            }
             Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
             Some(Op::StartPreedit(preedit.to_string()))
@@ -2387,14 +2400,16 @@ fn host_async_layout() -> bool {
 
 /// 跟随光标宿主（晴跟打器类）：整句长编码场景，候选窗需随光标前进
 /// （锚 END）。此类宿主布局同步、GetTextExt 稳定，跟随不会产生跳动。
-/// 其余宿主（含虎魄跟打器）锚组段起点——段内位置恒定。
+/// 其余宿主（含虎魄跟打器）锚组段起点——段内位置恒定且零 GetTextExt
+///（虎魄 2026-09-08 移出：逐键布局查询×2 在跟打器上卡秒级，见
+/// query_caret 注释）。
 fn host_follow_caret() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.contains("晴") || n.contains("虎魄"))
+            .map(|n| n.contains("晴"))
             .unwrap_or(false)
     })
 }
