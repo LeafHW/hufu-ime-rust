@@ -635,22 +635,54 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
 
 /// 轨迹日志（诊断 UI 线程卡死）：追加到 %TEMP%\hufu-tsf-trace.log。
 /// 环境变量 HUFU_TRACE=0 可关。多进程各写各行（带进程名）。
+/// 【高速化 2026-09-08】旧版每条 trace 都 env::var + current_exe +
+/// open/close 文件——日志累积 83MB（约百万条，每键 10+ 条）意味着
+/// 键路径上每秒几百次磁盘 I/O（trace 本身成了卡顿放大器）。现：
+/// 开关/exe 名 OnceLock 缓存；句柄进程级常驻（append 打开一次）；
+/// 超 8MB 自动轮转（.old 覆盖）。
 pub fn trace(msg: &str) {
     use std::io::Write;
-    if std::env::var("HUFU_TRACE").as_deref() == Ok("0") {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() != Ok("0")) {
         return;
     }
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let exe = EXE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default()
+    });
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join("hufu-tsf-trace.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "[{t}] {exe}: {msg}");
+    let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
+    let reopen = |g: &mut Option<std::fs::File>| -> Option<std::fs::File> {
+        let path = std::env::temp_dir().join("hufu-tsf-trace.log");
+        // 轮转：超 8MB 归档 .old（旧 .old 覆盖）
+        if let Ok(md) = std::fs::metadata(&path) {
+            if md.len() > 8 * 1024 * 1024 {
+                let _ = std::fs::rename(&path, path.with_extension("log.old"));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    };
+    if g.is_none() {
+        *g = reopen(&mut None);
+    }
+    if let Some(f) = g.as_mut() {
+        if writeln!(f, "[{t}] {exe}: {msg}").is_err() {
+            *g = reopen(&mut None);
+            if let Some(f) = g.as_mut() {
+                let _ = writeln!(f, "[{t}] {exe}: {msg}");
+            }
+        }
     }
 }
 
