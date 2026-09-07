@@ -397,7 +397,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>候选间距 <span class="val" id="l-cs-v"></span></label><input type="range" id="l-cs" min="0" max="48"></div>
           <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="40" step="0.5"></div>
           <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="30" step="0.5"></div>
-          <div class="field"><label>序号格式 <span class="val" style="opacity:.7">%s=数字</span></label><input type="text" id="l-lfmt" placeholder="%s." style="width:72px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px"></div>
+          <div class="field"><label>序号 <input type="checkbox" id="sk-idx" style="accent-color:var(--acc)"></label><input type="text" id="l-lfmt" placeholder="%s." style="width:60px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px"></div>
           <div class="field"><label>序号/注释间距 <span class="val" id="l-hsp-v"></span></label><input type="range" id="l-hsp" min="0" max="16" step="0.5"></div>
           <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="800" step="10"></div>
           <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
@@ -918,6 +918,22 @@ function bindSkin() {
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   // 【皮肤元素自查 2026-09-08】序号格式（label_format，%s→数字）+
   // hilite_spacing（序号↔正文↔注释统一间距，与 DLL 同步激活）
+  // 【序号开关 2026-09-08】皮肤页开关绑全局 config.candidates.show_index
+  //（与「输入与候选」页同一真源；保存走 /api/config，DLL ≤2.5s 经
+  // skin 响应附带生效）
+  {
+    const si = $("#sk-idx");
+    si.checked = CFG.candidates.show_index !== false;
+    si.onchange = async () => {
+      CFG.candidates.show_index = si.checked;
+      try {
+        await api("POST", "/api/config", CFG);
+        const c2 = $("#c-idx"); if (c2) c2.checked = si.checked;
+        preview();
+        msg(si.checked ? "候选序号已开启 ✓" : "候选序号已隐藏 ✓", "ok");
+      } catch (e) { msg("保存失败：" + e.message, "err"); }
+    };
+  }
   {
     const lf = $("#l-lfmt");
     lf.value = SKIN.layout.label_format ?? "%s.";
@@ -1030,9 +1046,13 @@ function preview() {
   inner.style.cssText = `background:${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
   // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
   // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
-  // 与 mark_text（高亮行左缘细竖条，weasel 语义）
-  const fmtLbl = n => { const f = L.label_format || "%s."; return f.includes("%s") ? f.replace("%s", n) : n + "."; };
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${fmtLbl(i)}</span>${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
+  // 与 mark_text（高亮行左缘细竖条，weasel 语义）。
+  // 【10 选序号】第 10 候选显示 0（1234567890，与引擎 0=10 选重一致）。
+  // 【序号开关】皮肤页开关与「输入与候选」页同一真源（config.
+  // candidates.show_index），切换即存全局配置（DLL 经 skin 响应附带
+  // 读取，≤2.5s 生效），预览同步隐藏/显示序号列。
+  const fmtLbl = n => { const f = L.label_format || "%s."; const d = n === 10 ? 0 : n; return f.includes("%s") ? f.replace("%s", d) : d + "."; };
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${fmtLbl(i)}</span>` : ""}${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
   inner.innerHTML =
     `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");

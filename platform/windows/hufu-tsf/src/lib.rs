@@ -127,13 +127,17 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
         eprintln!("pad-dump: 候选窗初始化失败");
         return 0;
     };
-    let cands = vec![
-        ("你好".to_string(), String::new()),
-        ("世界".to_string(), String::new()),
-        ("吗".to_string(), String::new()),
-        ("呢".to_string(), String::new()),
-        ("吧".to_string(), String::new()),
-    ];
+    // 候选数可用 HUFU_PAD_N 控制（默认 5；10=验证第 10 序号显示 0）
+    let n = std::env::var("HUFU_PAD_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5)
+        .clamp(1, 10);
+    let words = ["你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有"];
+    let cands: Vec<(String, String)> = words[..n]
+        .iter()
+        .map(|w| (w.to_string(), String::new()))
+        .collect();
     w.readback = true;
     w.show(&cands, "uu", &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(80));
