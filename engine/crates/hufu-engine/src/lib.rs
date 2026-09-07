@@ -2145,7 +2145,14 @@ impl Engine {
     }
 
     fn learn(&mut self, cand: &Candidate) {
-        if self.config.user.auto_frequency {
+        // 【learn 收口 2026-09-08 审计 E-2】两个防劣化约束：
+        // ①整句候选不入 user_dict——其 code 是整句 raw 剩串（非真实码），
+        //   存进去纯垃圾条目，还驱动 add_word/merge_into 的 O(N) 线性扫
+        //   持续变慢；码表域候选（真实短码）才学。
+        // ②超长 code 不学（>16 键的非整句异常条目防御）。
+        let learnable =
+            cand.source != CandidateKind::Sentence && cand.code.chars().count() <= 16;
+        if learnable && self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
         }
         if self.config.user.log_adjust {
@@ -2226,9 +2233,19 @@ impl Engine {
             return;
         }
         let key = format!("{}{}", session.committed_raw, session.raw);
+        // 【同 key 幂等 2026-09-08】DLL poll 每 40ms 的 state op 都进
+        // 这里——同 key 重复执行会反复做 decode_rich（depth_map 的
+        // 全量 beam 解码，锁内）——停顿期 40ms 一次重算同一结果。
+        // 已应用过即跳过（重排结果是确定性的：同 key 同 order）。
+        if session.rerank_applied_key == key {
+            return;
+        }
         let Some(order) = cache.get(&key) else {
             return;
         };
+        // 缓存命中即标记（同 key 同 order 的重排结果确定——即使本次
+        // 无需换序，后续 poll 也不必重做 decode_rich）
+        session.rerank_applied_key = key.clone();
         let rank: std::collections::HashMap<&String, usize> =
             order.iter().enumerate().map(|(i, t)| (t, i)).collect();
         // 只重排 Sentence 类子序列，其他类候选位置不动

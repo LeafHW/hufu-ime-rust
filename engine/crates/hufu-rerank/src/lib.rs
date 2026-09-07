@@ -7,6 +7,8 @@ pub mod native;
 
 /// 前台按键通知：gemm 分块循环据此让键（详见 model.rs）。
 pub use model::note_foreground;
+/// 距最近按键的时窗判定（空闲卸载防误判用，详见 model.rs）。
+pub use model::foreground_within;
 
 use model::Qwen3;
 

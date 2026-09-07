@@ -1907,8 +1907,11 @@ impl CandidateWindowV2 {
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
             let dragging = CAND_DRAG.lock().unwrap().is_some();
-            if !dragging {
-                let _ = SetWindowPos(
+            // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
+            // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
+            //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
+            let sp_ok = if !dragging {
+                SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     x - (shadow_m * dpi_scale) as i32,
@@ -1916,10 +1919,10 @@ impl CandidateWindowV2 {
                     w_out as i32,
                     h_out as i32,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+                )
             } else {
                 // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
-                let _ = SetWindowPos(
+                SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     0,
@@ -1927,13 +1930,15 @@ impl CandidateWindowV2 {
                     0,
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+                )
+            };
+            if sp_ok.is_err() {
+                crate::tsf::trace(&format!(
+                    "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
+                    sp_ok,
+                    IsWindowVisible(self.hwnd).0
+                ));
             }
-            crate::tsf::trace(&format!(
-                "cw2: SetWindowPos({x},{y}) err={} visible={}",
-                GetLastError().0,
-                IsWindowVisible(self.hwnd).0
-            ));
             // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
             // 锁与候选窗同进退；show_at 幂等：定位+显示）
             if CAND_PINNED.lock().unwrap().is_some() {
