@@ -940,12 +940,30 @@ function bindSkin() {
     };
     $("#skin-reset").onclick = async () => {
       try {
-        SKIN.layout = JSON.parse(JSON.stringify(F.layout));
-        SKIN.colors = JSON.parse(JSON.stringify(F.colors));
-        SKIN.material = JSON.parse(JSON.stringify(F.material));
+        // 【每皮肤恢复默认 2026-09-08】官方皮肤（hufu-*）恢复各自
+        // 出厂配置（server 内嵌 official-skins 整文件写回——各皮肤
+        // 保留自己的配色/布局个性）；用户自建皮肤（非官方 id）回退
+        // 本地统一出厂常量（保留 id/名称）。
+        const isOfficial = /^(hufu-[a-z]+)$/.test(SKIN.id || "");
+        if (isOfficial) {
+          const fac = await api("POST", "/api/skin/reset", { id: SKIN.id });
+          if (fac && fac.id) {
+            SKIN.layout = fac.layout; SKIN.colors = fac.colors; SKIN.material = fac.material;
+          } else {
+            SKIN.layout = JSON.parse(JSON.stringify(F.layout));
+            SKIN.colors = JSON.parse(JSON.stringify(F.colors));
+            SKIN.material = JSON.parse(JSON.stringify(F.material));
+          }
+        } else {
+          SKIN.layout = JSON.parse(JSON.stringify(F.layout));
+          SKIN.colors = JSON.parse(JSON.stringify(F.colors));
+          SKIN.material = JSON.parse(JSON.stringify(F.material));
+        }
         bindSkin(); buildColorGrid(); preview();
         await api("POST", "/api/skin", SKIN);
-        msg("当前皮肤已恢复出厂默认值并保存生效 ✓", "ok");
+        msg(isOfficial
+          ? `已恢复「${SKIN.name || SKIN.id}」的出厂配置并保存生效 ✓`
+          : "自建皮肤：已恢复为统一默认布局/配色（ID/名称保留）✓", "ok");
         previewLive();
       } catch (e) { msg("恢复默认失败：" + e.message, "err"); }
     };

@@ -536,6 +536,27 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let _ = host.engine.config.save(&host.config_path);
             Response::json(&serde_json::json!({"ok": true, "id": id}))
         }
+        ("POST", "/api/skin/reset") => {
+            // 【每皮肤恢复默认 2026-09-08】官方皮肤按 id 恢复各自出厂
+            // （内嵌 official-skins 整文件写回）；非官方 id（用户自建）
+            // 返回 404，UI 回退统一出厂常量。返回恢复后的皮肤全量 JSON。
+            let id = req
+                .json()
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match host.reset_official_skin(&id) {
+                Some(s) => {
+                    let _ = host.engine.config.save(&host.config_path);
+                    Response::json(&serde_json::to_value(&s).unwrap())
+                }
+                None => Response::err(404, &format!("皮肤 {id} 非官方皮肤（无出厂配置）")),
+            }
+        }
         ("POST", "/api/skin") => {
             let v = req.json();
             let skin: hufu_skin::Skin = match serde_json::from_value(v) {
