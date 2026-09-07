@@ -70,11 +70,10 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
                 cbSize: 0,
             };
             let mut handles = Vec::new();
-            // 【音效减负 2026-09-08】8→3 路交叠：8 路全开时高速跟打
-            //（6-8 键/秒持续）所有键音同时在播，混音器负载+听感糊成
-            // 一团（用户实测「音效卡住」）；3 路交叠（键音 170ms×键距
-            // 140ms 稳态 1.2 路，峰值 3）听感不减，压力降 60%。
-            for _ in 0..3 {
+            // 【音效恢复 8 路 2026-09-08】减负期（3 路）曾为排查卡顿所
+            // 设——现已实锤卡顿根因是 32 位老 DLL（与音效无关），按用户
+            // 要求恢复 8 路交叠原版听感/行为。
+            for _ in 0..8 {
                 let mut h = HWAVEOUT(std::ptr::null_mut());
                 let ok = unsafe {
                     waveOutOpen(Some(&mut h), 0xFFFFFFFF, &wfx, 0, 0, CALLBACK_NULL)
@@ -187,11 +186,12 @@ pub fn play(tag: &str, vol: u8) {
         let ok = std::thread::Builder::new()
             .name("hufu-snd-disp".into())
             .spawn(move || {
-                // 3 条固定播放工人（与句柄池 3 对齐），轮转分发；单工人
-                // 队列满(4)跳下一条，全满才丢——3 路并行交叠、线程恒定
-                // 不堆积（8 工人版高速跟打混音糊+调度压力大，已减负）。
-                let mut wtx = Vec::with_capacity(3);
-                for i in 0..3 {
+                // 8 条固定播放工人（与句柄池 8 对齐），轮转分发；单工人
+                // 队列满(4)跳下一条，全满才丢——8 路并行交叠、线程恒定
+                // 不堆积。（3 路减负期已过：卡顿根因实锤为 32 位老
+                // DLL，与音效无关，恢复原版。）
+                let mut wtx = Vec::with_capacity(8);
+                for i in 0..8 {
                     let (wtx_i, wrx) = std::sync::mpsc::sync_channel::<Job>(4);
                     if std::thread::Builder::new()
                         .name(format!("hufu-snd-{i}"))
@@ -271,12 +271,12 @@ fn play_sync(c: Clip, is_key: bool) {
         // 等 WHDR_DONE：键音 160-175ms；key_up() 的 waveOutReset 会把头标
         // 置 DONE 提前出循环（松开即停）。超时兜底 Reset 防 UAF：栈上
         // WAVEHDR 若仍被驱动写，函数返回后就是悬垂指针。
-        // 【音效减负】等待粒度 2ms→10ms：8 工人×2ms 唤醒=每秒 4000 次
-        // 定时器唤醒拖累调度（用户实测音效卡顿）；10ms 粒度对 170ms
-        // 键音无感（key_up 截断延迟最多 +10ms）。
+        // 【音效恢复 2ms 粒度 2026-09-08】10ms 粒度曾为排查卡顿所设；
+        // 根因实锤为 32 位老 DLL（与音效无关），恢复原版 2ms 响应度
+        //（key_up 截断零迟滞）。
         let mut spins = 0u32;
-        while (hdr.dwFlags & 0x1) == 0 && spins < 200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        while (hdr.dwFlags & 0x1) == 0 && spins < 1000 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
             spins += 1;
         }
         if (hdr.dwFlags & 0x1) == 0 {
