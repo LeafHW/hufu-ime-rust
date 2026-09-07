@@ -1429,21 +1429,24 @@ impl CandidateWindowV2 {
             // 高亮胶囊统一内边距：四边都 = hilite_pad。
             // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
             // 保证上下左右内边距始终一致（旧版 top 被夹底没夹，左右还各有隐藏 ±4）。
-            // 【光学修正】汉字字面中心略低于几何中心（字体上下伸部不
-            // 对称——DrawText 居中时视觉偏下=胶囊显得偏上）：胶囊整体
-            // 下移 6% em 对齐视觉中心（用户实测「高亮偏上」的修正）。
+            // 【对齐终修 2026-09-06】旧版胶囊整体下移 6% em（optical，
+            // 「高亮偏上」时代补丁——当时 dy 平移整行、文字相对胶囊
+            // 无独立修正，只能靠胶囊错位补视觉）。现 dy 只作用于文本
+            // draw（墨盒居中已正确处理文字在胶囊内的视觉位置），
+            // optical 残留成胶囊相对窗框上下间隙差 2×6%em（字号越大
+            // 越明显，用户实测「高亮与内框上下没对齐」）——删除：
+            // 胶囊纯几何对称，文字居中全权交 dy。
             let pill_v = |y: f32| -> (f32, f32) {
                 let half = (line_h - em) / 2.0;
-                let optical = em * 0.06;
                 let ih = em + hilite_pad * 2.0;
                 if ih <= line_h {
                     (
-                        y + half - hilite_pad + optical,
-                        y + half + em + hilite_pad + optical,
+                        y + half - hilite_pad,
+                        y + half + em + hilite_pad,
                     )
                 } else {
                     let off = (line_h - ih) / 2.0;
-                    (y + off + optical, y + off + ih + optical)
+                    (y + off, y + off + ih)
                 }
             };
 
