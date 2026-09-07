@@ -598,11 +598,12 @@ const WDEFS = [
   ["supplement_maximum", "常用词加分封顶", 1, 30, 0.5, null,
     "单个词最多能加多少分（语料奖励上限）"],
 ];
-/* 出厂调校值（v1.4.6 万句基准定标）：恢复初始值按钮用 */
+/* 出厂调校值：恢复初始值按钮用
+   【2026-09-08 默认回归 1.4.8 模型值】W1 束宽 30000 实机每键解码
+   数百 ms 致「越打越卡」（1.4.8 基线对照实锤）——出厂回 1.4.8 值；
+   W1/激进档保留在上屏节奏预设，按需一键切换。 */
 const W_DEFAULTS = {
-  /* 【2026-09-06 开箱定版 W1「更安心的上屏」】与 Rust 端
-     SentenceWeights::default 同步（万句 99.54%/56.1%/1.30） */
-  beam_width: 30000, candidate_limit: 10,
+  beam_width: 200, candidate_limit: 20,
   rank_penalty: 0.03, emitted_character_reward: 2.0,
   isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
   dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
@@ -645,7 +646,7 @@ function scheduleWeightAutoSave() {
 $("#w-reset").onclick = async () => {
   try {
     Object.assign(CFG.sentence.weights, W_DEFAULTS);
-    CFG.sentence.early_need = 3; /* 恢复为 W1 出厂档 */
+    CFG.sentence.early_need = 2; /* 恢复为 1.4.8 出厂档 */
     buildSliders();
     await api("POST", "/api/config", CFG);
     msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
