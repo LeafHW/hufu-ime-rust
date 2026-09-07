@@ -488,21 +488,24 @@ impl SentenceEngine {
         // 【短句降档 2026-09-08】实测跟打器 05:50 段连打：16 键内全量
         // 30000 束，引擎往返 42→446ms 随句长递增（增量缓存门槛
         // base≥20，短句每键全量）——打字节奏被拖垮=用户「越打越卡」。
-        // n≤16 从全束降为 2/5 束（12000）：短句首选路径领先幅度通常
-        // 极大，边际束宽对 exact 无感；预计该区间解码时间≈对半。
+        // n≤16 从全束降为 2/5 束（30000→12000）：短句首选路径领先幅度
+        // 通常极大，边际束宽对 exact 无感。
+        // 【min 收口 2026-09-08】各档 max 下限会把小束宽反向抬高
+        //（beam=200 时 max(12000)=12000≠用户设定）——min(原值) 保证
+        // 降档永不升束：200→200、30000→12000。
         let beam = if n <= 16 {
-            (w.beam_width * 2 / 5).max(12000)
+            (w.beam_width * 2 / 5).max(12000).min(w.beam_width)
         } else if n <= 24 {
-            (w.beam_width * 3 / 5).max(400)
+            (w.beam_width * 3 / 5).max(400).min(w.beam_width)
         } else if n <= 32 {
-            (w.beam_width / 5).max(300)
+            (w.beam_width / 5).max(300).min(w.beam_width)
         } else if n <= 48 {
-            (w.beam_width / 8).max(200)
+            (w.beam_width / 8).max(200).min(w.beam_width)
         } else {
             // 【性能】超长句（>48 码）：尾键延迟实测 40-50ms——再降档
             // 换响应（bench 实测：/24 无额外收益，/16 max100 最优——
             // avg 49→24ms、p95 102→38ms、exact 90% 持平）
-            (w.beam_width / 16).max(100)
+            (w.beam_width / 16).max(100).min(w.beam_width)
         };
         // 【性能 2026-09-08】env 读取移出循环：Windows 上 env::var 走
         // 进程环境块+内部锁，原先在 beam 循环体内每位置读一次，48 码
