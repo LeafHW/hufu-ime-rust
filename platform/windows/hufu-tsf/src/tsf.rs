@@ -1378,14 +1378,25 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         if unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) }.is_ok() {
             let degenerate = rect.bottom <= rect.top
                 || rect.right < rect.left
-                || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0);
+                || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0)
+                // 【行框过滤 2026-09-08】部分宿主对折叠 range 返回整段/
+                // 整行矩形（实测 2px 宽 × 134px 高）——若采纳，候选窗被
+                // 定位到段底（用户实测「候选框乱跳」形态之一）。行高物
+                // 理上限 64px（覆盖大字号场景），超高度按退化丢弃。
+                || (rect.bottom - rect.top) > 64;
             if !degenerate {
                 last_ok = Some(rect);
+            } else {
+                trace(&format!(
+                    "qc: 行框丢弃 ({},{},{},{})",
+                    rect.left, rect.top, rect.right, rect.bottom
+                ));
             }
         }
     }
     let Some(rect) = last_ok else {
-        trace("qc: GetTextExt 两次均失败/退化");
+        // 两次均失败/退化：保留旧 caret（比跳行底/丢锚点稳）
+        trace("qc: GetTextExt 两次均失败/退化，沿用旧锚点");
         return;
     };
     // GetTextExt 返回屏幕坐标（MSDN）——不再做客户区→屏幕转换
