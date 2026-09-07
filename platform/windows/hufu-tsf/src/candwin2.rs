@@ -652,11 +652,11 @@ impl CandidateWindowV2 {
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
         let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
-        // 序号列宽：按本页实际序号宽度自适应（测量块内计算）——基准
-        // 12px 保底。滚轮放大序号后列宽随字号缩放（「1.」「10.」不换
-        // 行摞字），序号与正文间距保持紧凑（2026-09-06 用户实测反馈
-        // 「隔太远」后去掉 26px 固定基准与「10.」保守定宽）。
-        let mut label_w = if show_index { 12.0f32 } else { 0.0 };
+        // 序号列宽：按本页实际序号宽度自适应（测量块内计算）。
+        // 滚轮放大序号后列宽随字号缩放（「1.」「10.」不换行摞字），
+        // 序号与正文紧贴（2026-09-06 用户两轮实测反馈后：无固定基准，
+        // 实测宽 + 2px）。
+        let mut label_w = if show_index { 0.0f32 } else { 0.0 };
         let em = font_pt * 96.0 / 72.0;
         // 横排（skin.layout.horizontal）：候选单行横铺，weasel 式
         let horizontal = skin
@@ -808,14 +808,14 @@ impl CandidateWindowV2 {
                 s.chars().count() as f32 * em
             };
             // 序号列宽自适应（见 label_w 定义处注释）：竖排列宽按本页
-            // 实际最大序号「N.」实测（只显示 min(len,10) 个——按「10.」
-            // 定宽在页内只有 2~5 个候选时右侧空一大截，序号与正文隔
-            // 太远，2026-09-06 用户实测）。横排不按列宽——逐格序号宽
-            // 存 cand_ws 第三元，正文紧贴各自序号。
+            // 实际最大序号「N.」实测（只显示 min(len,10) 个）。序号↔
+            // 正文间距 2px（2026-09-06 用户两轮反馈「隔太远」：4px 设计
+            // 值 + 「.」字形尾部侧空 + 汉字墨盒头部侧空，视觉 ≈6-8px
+            // 偏松——收紧为紧贴值）。
             let n_show = cands.len().min(10);
             if show_index && n_show > 0 {
                 let wmax = measure(&tf_label, &format!("{n_show}."));
-                label_w = label_w.max(wmax + 4.0);
+                label_w = label_w.max(wmax + 2.0);
             }
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
@@ -823,9 +823,9 @@ impl CandidateWindowV2 {
             for (i, (t, c)) in cands.iter().enumerate() {
                 let tw = measure(&tf, t.as_str());
                 let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c.as_str()) };
-                // 本格序号宽（「N.」实测 + 4px 间距）：横排正文紧跟序号
+                // 本格序号宽（「N.」实测 + 2px 紧贴间距）：横排正文紧跟序号
                 let iw = if show_index && i < 10 {
-                    measure(&tf_label, &format!("{}.", i + 1)).max(12.0) + 4.0
+                    measure(&tf_label, &format!("{}.", i + 1)).max(10.0) + 2.0
                 } else {
                     0.0
                 };
