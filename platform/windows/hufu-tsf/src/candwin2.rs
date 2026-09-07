@@ -1739,19 +1739,25 @@ impl CandidateWindowV2 {
             let grew = raw.len() >= self.last_raw_len;
             self.last_raw_len = raw.len();
             // 拖拽松手交接：一次性消费（设 sticky 并标记组段级钉住——
-            // 本组段留在松手处，hide 时解除）
+            // 本组段留在松手处，hide 时解除）。
+            // 【坐标系统一 2026-09-08】DROP_AT 来自 wndproc 的
+            // GetWindowRect = 窗口原点（锚点 − shadow_m 外扩）；
+            // sticky_pos 本帧坐标系 = 内容锚点系（SetWindowPos 统一
+            // 减 shadow_m）。不转换则松手/锁定后窗口往左上偏一个
+            // 阴影边距（用户实测「锁定时有点跳动」）。
+            let m_off = (shadow_m * dpi_scale) as i32;
             if let Some(p) = CAND_DROP_AT.lock().unwrap().take() {
-                self.sticky_pos = Some(p);
+                self.sticky_pos = Some((p.0 + m_off, p.1 + m_off));
                 self.sticky_drag = true;
             }
             let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap() {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
                 //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
                 // 拖动松手会回写 pin（见 WM_LBUTTONUP）——打字必然用
-                // 最新固定位。
+                // 最新固定位。pin 同为窗口原点系：+m_off 转回锚点系。
                 crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
-                let x = px.clamp(vx, (vx + vw - width as i32).max(vx));
-                let y = py.clamp(vy, (vy + vh - height as i32).max(vy));
+                let x = (px + m_off).clamp(vx, (vx + vw - width as i32).max(vx));
+                let y = (py + m_off).clamp(vy, (vy + vh - height as i32).max(vy));
                 (x, y)
             } else if self.sticky_drag && self.sticky_pos.is_some() {
                 // 【拖拽钉住】松手设的 sticky 优先于锚点：本组段内
