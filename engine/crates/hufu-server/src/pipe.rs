@@ -45,7 +45,16 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 let h: &mut Host = &mut host;
                 h.engine.refresh_rerank(&mut h.session);
             }
-            let state = host.engine.state(&host.session);
+            let mut state = serde_json::to_value(host.engine.state(&host.session))
+                .unwrap_or_else(|_| serde_json::json!({}));
+            // 【皮肤版本】DLL poll 比对后强制重拉（连续调参即时生效）
+            state["skin_ver"] = serde_json::json!(host.skin_ver);
+            // 【实机预览锚点】有效期内携带：DLL 预览窗弹在设置窗中心
+            if let Some(((x, y), until)) = host.preview_anchor {
+                if until > std::time::Instant::now() {
+                    state["preview_anchor"] = serde_json::json!({"x": x, "y": y});
+                }
+            }
             serde_json::json!({
                 "state": state,
                 "current_schema": host.engine.config.schema.current,
@@ -107,7 +116,10 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                     s.layout.font_point = np as f32;
                     let nl = s.layout.label_font_point;
                     match s.save(&p) {
-                        Ok(()) => serde_json::json!({"font_point": np, "label_font_point": nl}),
+                        Ok(()) => {
+                            host.skin_ver += 1;
+                            serde_json::json!({"font_point": np, "label_font_point": nl})
+                        }
                         Err(e) => {
                             eprintln!("皮肤 {id} 字号保存失败: {e}");
                             serde_json::json!({"err": e.to_string()})

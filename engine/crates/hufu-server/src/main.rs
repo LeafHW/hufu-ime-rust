@@ -536,6 +536,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let _ = host.engine.config.save(&host.config_path);
             Response::json(&serde_json::json!({"ok": true, "id": id}))
         }
+        ("POST", "/api/preview") => {
+            // 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标
+            //（浏览器 window.screenX/outerWidth 可得），2.5s 有效期内
+            // pipe state 携带 → DLL 预览候选窗弹在设置窗中心而非陈旧
+            // 光标处（用户实测「弹在屏幕中间位置不对」的修复）。
+            let v = req.json();
+            let x = v.get("x").and_then(|x| x.as_i64()).unwrap_or(0);
+            let y = v.get("y").and_then(|x| x.as_i64()).unwrap_or(0);
+            host.preview_anchor = Some(((x, y), std::time::Instant::now() + std::time::Duration::from_millis(2500)));
+            Response::json(&serde_json::json!({"ok": true}))
+        }
         ("POST", "/api/skin/reset") => {
             // 【每皮肤恢复默认 2026-09-08】官方皮肤按 id 恢复各自出厂
             // （内嵌 official-skins 整文件写回）；非官方 id（用户自建）
@@ -568,6 +579,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Ok(()) => {
                     host.engine.config.appearance.skin = skin.id.clone();
                     let _ = host.engine.config.save(&host.config_path);
+                    // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
+                    // 2.5s 缓存）——设置页调参实机预览即时生效
+                    host.skin_ver += 1;
                     Response::json(&serde_json::json!({"ok": true, "id": skin.id}))
                 }
                 Err(e) => Response::err(500, &format!("保存失败: {e}")),
