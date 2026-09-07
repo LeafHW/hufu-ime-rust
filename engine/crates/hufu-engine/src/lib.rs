@@ -1658,13 +1658,10 @@ impl Engine {
         // 线（原硬编码 0.999）。HUFU_EARLY_STRONG_SHARE 可调（bench 探
         // 索用）：线上调→更多提案落入普通通道、按 early_need 多等——
         // 上屏更稀但每次攒字更多。
-        static STRONG_SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-        let strong_line = *STRONG_SHARE.get_or_init(|| {
-            std::env::var("HUFU_EARLY_STRONG_SHARE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.999)
-        });
+        let strong_line = std::env::var("HUFU_EARLY_STRONG_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.999);
         session.early_history.push(EarlyHistory {
             proposal: proposal.clone(),
             full_raw: full.clone(),
@@ -1687,20 +1684,17 @@ impl Engine {
         // 【混合证据窗 2026-09-06 自由探索】HUFU_EARLY_STRONG_NEED：当前
         // 提案为强证据（份额≥0.999）时的独立确认键数（缺省=同 early_need）。
         // 设小于 early_need 即「高置信快出、普通置信稳等」的混合策略。
-        static NEED_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let need_k = *NEED_K.get_or_init(|| {
-            std::env::var("HUFU_EARLY_NEED")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(self.config.sentence.early_need)
-        });
-        static STRONG_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let strong_k = *STRONG_K.get_or_init(|| {
-            std::env::var("HUFU_EARLY_STRONG_NEED")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(need_k)
-        });
+        // 【2026-09-06 热更新修复】原 OnceLock 缓存导致设置页切换上屏节奏
+        // 预设后引擎仍用旧值（进程内只读一次 config）。改为逐键直读：
+        // config 每键访问 + env::var 微秒级，early_commit 每键一次可忽略。
+        let need_k = std::env::var("HUFU_EARLY_NEED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(self.config.sentence.early_need);
+        let strong_k = std::env::var("HUFU_EARLY_STRONG_NEED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(need_k);
         let cur_strong = session.early_history.last().map(|e| e.strong).unwrap_or(false);
         let need = if line_end {
             1
