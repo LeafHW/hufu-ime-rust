@@ -553,8 +553,10 @@ function bindInputs() {
 }
 
 /* ── 整句权重滑杆 ── */
+/* 第 6 项 "sentence" = 直接挂 sentence 段（如 early_need），其余挂 weights */
 const WDEFS = [
   ["beam_width", "Beam 宽度", 10, 32000, 100],
+  ["early_need", "上屏确认键数", 1, 4, 1, "sentence"],
   ["rank_penalty", "名次惩罚", 0, 1, 0.005],
   ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
   ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
@@ -572,14 +574,16 @@ const W_DEFAULTS = {
 };
 function buildSliders() {
   const box = $("#w-sliders"); box.innerHTML = "";
-  WDEFS.forEach(([k, name, min, max, step]) => {
+  WDEFS.forEach((def) => {
+    const [k, name, min, max, step] = def;
+    const sec = def[5] === "sentence" ? CFG.sentence : CFG.sentence.weights;
     const f = document.createElement("div"); f.className = "field";
     f.innerHTML = `<label>${name} <span class="val" id="wv-${k}"></span></label>
       <input type="range" id="ws-${k}" min="${min}" max="${max}" step="${step}">`;
     box.appendChild(f);
     const s = f.querySelector("input"), v = f.querySelector(".val");
-    const sync = () => { v.textContent = CFG.sentence.weights[k]; s.value = CFG.sentence.weights[k]; };
-    s.oninput = () => { CFG.sentence.weights[k] = parseFloat(s.value); v.textContent = s.value; };
+    const sync = () => { v.textContent = sec[k]; s.value = sec[k]; };
+    s.oninput = () => { sec[k] = parseFloat(s.value); v.textContent = s.value; };
     sync();
   });
 }
