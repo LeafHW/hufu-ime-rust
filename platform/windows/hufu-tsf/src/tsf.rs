@@ -50,6 +50,11 @@ pub struct Shared {
     pub skin_stale: bool,
     /// 皮肤上次拉取时刻（2.5s 自动过期：打字中改皮肤也能热生效）
     pub skin_loaded_at: std::time::Instant,
+    /// 【皮肤版本 2026-09-08】server 每次保存皮肤 +1；poll 比对不一致
+    /// 即强制重拉（绕 2.5s 缓存）——设置页连续调参时实机预览即时
+    /// 生效（用户实测「反应慢」根因：连续拖动内缓存未过期，弹的
+    /// 还是旧参数窗）。
+    pub skin_ver_last: u64,
     /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
     pub delay_show_ms: u32,
     /// 上次 raw（变化检测）
@@ -133,6 +138,7 @@ impl Shared {
             skin: serde_json::Value::Null,
             skin_stale: true,
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
+            skin_ver_last: 0,
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
@@ -158,7 +164,8 @@ impl Shared {
     }
 
     fn load_skin(&mut self) {
-        // 皮肤过期三通道：①首次 ②raw 空（断段）③拉取后超 2.5s——
+        // 皮肤过期四通道：①首次 ②raw 空（断段）③拉取后超 2.5s
+        // ④server 皮肤版本变化（poll 比对 skin_ver，强制绕过时限——
         // 【打字中热更新】③是关键：旧逻辑只在 raw 空时置 stale，打字
         // 期间（raw 非空）改皮肤（透明度/颜色）永远用缓存——「设置页
         // 预览变了、实际候选窗不变」的病根。2.5s 自动过期让改皮肤最
@@ -177,6 +184,14 @@ impl Shared {
                 self.skin_loaded_at = std::time::Instant::now();
             }
         }
+    }
+
+    /// 【皮肤版本失效 2026-09-08】poll 检测 server 皮肤版本变化：直接
+    /// 强制重拉（不重置 loaded_at 的路径之外另走）——连续调参时
+    /// 2.5s 时限未到也立即拿到新皮肤。
+    fn load_skin_forced(&mut self) {
+        self.skin_stale = true;
+        self.load_skin();
     }
 
     /// 焦点上下文（当前文档顶层）。
@@ -1381,12 +1396,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             && raw.len() <= 1
             && g.raw_changed_at
                 .is_some_and(|t| t.elapsed().as_millis() < 35);
-        let suppress = first_frame_unstable
-            || (g.delay_show_ms > 0
-                && !raw.is_empty()
-                && g
-                    .raw_changed_at
-                    .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms));
+        // 【实机预览豁免】预览态（state 带 preview_anchor）不走首帧/
+        // 延时抑制——锚点即位置无跳变风险，立即显示。
+        let is_preview = state.get("preview_anchor").is_some();
+        let suppress = !is_preview
+            && (first_frame_unstable
+                || (g.delay_show_ms > 0
+                    && !raw.is_empty()
+                    && g
+                        .raw_changed_at
+                        .is_some_and(|t| (t.elapsed().as_millis() as u32) < g.delay_show_ms)));
         if g.focus_context().is_none() {
             return Ok(());
         }
@@ -1582,7 +1601,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             ));
         }
         let skin = g.skin.clone();
-        let caret = g.caret;
+        // 【实机预览锚点 2026-09-08】设置页预览（server state 带
+        // preview_anchor=设置窗中心）时候选窗弹在那里，不用陈旧
+        // 光标——预览不依赖真实 caret（可能 None 或屏幕任意处）。
+        let preview_anchor = state.get("preview_anchor").cloned();
+        let caret = preview_anchor
+            .as_ref()
+            .and_then(|a| {
+                let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                Some(RECT { left: x, top: y, right: x, bottom: y })
+            })
+            .or(g.caret);
+        let is_preview = preview_anchor.is_some();
         // DComp 直通窗在 SearchHost（开始菜单搜索）里被 DWM 整体
         // cloaked（显示中但不可见，实测 cloak=2 逐帧持续）；v1 混合窗
         // 同被隐身，自绘路线在该宿主是死路 → 切 server 代画（左上角）。
@@ -1641,7 +1672,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(300));
         let suppress = (g.caret.is_none() || (wps_settle && !(wps_stable || wps_deadline)))
             && !pinned_now
-            && !host_is_searchhost();
+            && !host_is_searchhost()
+            && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
@@ -2211,6 +2243,17 @@ fn poll_tick() {
     let mut need_show = false;
     {
         let mut g = shared.lock().unwrap();
+        // 【皮肤版本失效 2026-09-08】server 保存过皮肤（版本号变化）
+        // → 强制重拉绕 2.5s 时限：设置页连续调参时实机预览即时生效。
+        // 放 raw_empty 判定前——预览流程 reset（断段）与打 w 之间的
+        // 任意一拍都会走到这里。
+        let sv = state.get("skin_ver").and_then(|v| v.as_u64()).unwrap_or(0);
+        if sv != g.skin_ver_last {
+            g.skin_ver_last = sv;
+            if !g.skin.is_null() {
+                g.load_skin_forced();
+            }
+        }
         if raw_empty {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
@@ -2229,6 +2272,24 @@ fn poll_tick() {
         // 以正确 rect 显示（op 重跑 edit session 顺带重查 caret）。
         need_show = g.suppress_pending;
         if sig == g.cand_sig_last && !need_show {
+            // 【实机预览重绘】签名未变但皮肤刚重拉（调参后连续预览同
+            // 一码 w）：用缓存的上帧渲染参数按新皮肤立即重绘。
+            if g.cand_shown_this_segment {
+                let last = g.last_show.take();
+                let skin = g.skin.clone();
+                let caret = g.caret;
+                let anchor = state.get("preview_anchor").cloned();
+                if let (Some(c), Some((cands, raw2, sel))) = (g.cand2.as_mut(), last) {
+                    let anchor_rect = anchor.and_then(|a| {
+                        let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                        let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                        Some(RECT { left: x, top: y, right: x, bottom: y })
+                    });
+                    let caret2 = anchor_rect.or(caret);
+                    c.show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                    g.last_show = Some((cands, raw2, sel));
+                }
+            }
             return;
         }
         g.suppress_pending = false;

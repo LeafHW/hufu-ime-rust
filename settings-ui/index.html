@@ -154,6 +154,13 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 }
 .preview-tools button:hover { border-color: var(--acc); color: var(--fg1); }
 .preview-tools button.on { border-color: var(--acc); color: var(--acc); }
+/* 【布局稳定 2026-09-08】预览舞台固定高：调参（字号/间距/固定宽）改
+   变预览框尺寸时不再推动整个设置页布局（用户实测「改参数整个界面
+   布局会变」）——预览框在固定高舞台内垂直居中，页面其余部分不动。 */
+.preview-stage {
+  height: 195px; display: flex; align-items: center; justify-content: flex-start;
+  overflow: visible; position: relative; z-index: 1;
+}
 #candwin-preview { position: relative; z-index: 1; }
 .material-note { font-size: 12px; color: var(--fg2); margin-top: 6px; }
 .pill { font-size: 11px; border-radius: 99px; padding: 2px 10px; background: var(--bg3); color: var(--fg2); }
@@ -353,7 +360,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <button id="pv-light" title="预览区用浅色背景">浅色底</button>
         </div>
         <video id="livebg" autoplay muted playsinline style="display:none"></video>
-        <div id="candwin-preview"></div>
+        <div class="preview-stage"><div id="candwin-preview"></div></div>
         <div class="material-note" id="material-note"></div>
         <div class="field" style="margin-top:14px">
           <label>实机试打（在此打字，真实候选窗会弹出，与上方预览对比）</label>
@@ -879,24 +886,30 @@ function bindSkin() {
   $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
   // 【2026-09-06 实时生效】布局滑杆（阴影/圆角/间距/字级/固定宽等）
   // 此前只改内存+预览图、无任何保存路径（用户实测「阴影大小不生效」
-  // 根因）——现拖动防抖 600ms 自动存皮肤，server 落盘后 DLL 2.5s 过期
-  // 拉取、下一组段生效。
+  // 根因）——现拖动防抖 400ms 自动存皮肤；server 保存即 bump 皮肤
+  // 版本号，DLL poll（40ms）发现版本变化强制重拉（绕 2.5s 缓存），
+  // 连续调参即时生效（2026-09-08 用户实测「反应慢」的根修）。
   let _skinSaveTimer = null;
   const saveSkinDebounced = () => {
     clearTimeout(_skinSaveTimer);
-    _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); previewLive(); }, 600);
+    _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); previewLive(); }, 400);
   };
-  /* 【实机预览 2026-09-06】保存皮肤后自动键入 zhrjk（虎符）：server
-     session 出现候选，DLL poll（40ms 拉状态、签名变化即刷新）会弹出
-     真实候选窗——与左侧预览图实时对比。1.6s 后自动清缓冲收窗。
-     位置跟随上次组段光标（刚在试打框打过字=就在试打框旁）。 */
+  /* 【实机预览 2026-09-08 v3】保存皮肤后自动键入 w（虎码单键即出
+     候选，此前 zhrjk 六键 240ms 太慢）。DLL poll 40ms 拉状态发现
+     签名变化弹真实候选窗。位置：先 POST /api/preview 报上设置窗口
+     中心的屏幕坐标（window.screenX/outerWidth），server 在 state 里
+     携带 preview_anchor → DLL 把预览窗弹在设置窗中心（此前跟陈旧
+     光标满屏跑，用户实测「弹在屏幕中间不对」）。1.6s 后自动收窗。 */
   let _pvTimer = null;
   function previewLive() {
     clearTimeout(_pvTimer);
+    // 设置窗中心（近似：screenX+outerWidth/2；y 取 60% 高处避开预览
+    // 图本体遮挡视线）——候选窗将以 (x, y+4) 为左上角弹出
+    const px = Math.round(window.screenX + window.outerWidth / 2 - 70);
+    const py = Math.round(window.screenY + window.outerHeight * 0.6);
+    api("POST", "/api/preview", { x: px, y: py }).catch(() => {});
     api("POST", "/api/reset", {}).catch(() => {});
-    ["z", "h", "h", "r", "j", "k"].forEach((k, i) => {
-      setTimeout(() => api("POST", "/api/key", { key: k }).catch(() => {}), 40 * i + 30);
-    });
+    setTimeout(() => api("POST", "/api/key", { key: "w" }).catch(() => {}), 30);
     _pvTimer = setTimeout(() => api("POST", "/api/reset", {}).catch(() => {}), 1600);
   }
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };

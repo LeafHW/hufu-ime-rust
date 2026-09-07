@@ -38,6 +38,15 @@ pub struct Host {
     pub config_path: PathBuf,
     /// 神经重排：任务发送端（None=未启用/模型缺失）
     rerank_tx: Option<mpsc::Sender<RerankJob>>,
+    /// 【皮肤版本号 2026-09-08】每次皮肤保存 +1。DLL poll 从 state 里
+    /// 读到变化即强制重拉皮肤（绕过 2.5s 缓存）——设置页连续调参
+    /// 实机预览即时生效（此前连续拖动时 DLL 缓存未过期，弹的还是
+    /// 旧参数窗，用户实测「反应慢」的根因）。
+    pub skin_ver: u64,
+    /// 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标，
+    /// 有效期内 state 携带——DLL 预览候选窗弹在设置窗中心而非
+    /// 陈旧光标处（用户实测「弹在屏幕中间位置不对」的修复）。
+    pub preview_anchor: Option<((i64, i64), std::time::Instant)>,
 }
 
 impl Host {
@@ -71,6 +80,8 @@ impl Host {
             data_dir: data_dir.to_path_buf(),
             config_path,
             rerank_tx: None,
+            skin_ver: 0,
+            preview_anchor: None,
         };
         host.install_official_skins();
         mark("skins", &t0);
