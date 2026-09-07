@@ -205,7 +205,14 @@ fn ensure_server() -> bool {
 /// 循环处理」+ PIPE_UNLIMITED_INSTANCES——客户端持久连接零改动即用。
 /// 串行化（跨线程请求在锁上排队）无损：server dispatch 本就持全局
 /// 锁串行。断线/写失败/读超时弃连接重连一次（防响应错位）。
-static PIPE_CONN: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// 【双通道 2026-09-08】键路径专用连接：与后台 op（poll state/focus/
+/// 音效）物理分离——单连接时代一次慢响应（读超时上限 2s）会把
+/// PIPE_CONN 锁占住，后续按键全部排队（用户实测重启后仍卡：打字
+/// 高峰撞上 poll 即卡）。键通道永不与后台争抢。
+static PIPE_KEY: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// 后台通道（poll/focus/音效/探测）：读上限压到 150ms——后台慢就
+/// 弃连接重来，绝不长时间占锁。
+static PIPE_BG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
 /// 建立新连接（含 server 缺席拉起逻辑——与旧版一致）。
 unsafe fn connect_pipe() -> Option<std::fs::File> {
@@ -243,15 +250,25 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
     }
 }
 
-/// 单次请求（持久连接复用）。
-/// 【等待策略】server 缺席时的阻塞上限（02:04 全机卡死事故根因）：
-/// - 本进程首次发现缺席：拉起 server 并给足启动等待（3×1000ms，
-///   仅每进程一次）
-/// - 之后仍缺席：快败（2×150ms）——server 已死时绝不能把宿主
-///   每一次按键拖进秒级等待，宁可这一帧走降级路径
+/// 后台请求（poll/focus/音效/探测）：后台通道 + 150ms 响应上限。
 pub fn call(req: &Value) -> Option<Value> {
+    call_on(&PIPE_BG, req, 150, 150)
+}
+
+/// 键路径请求：键通道（与后台物理分离）+ 完整超时（server 正常
+/// <3ms；上限保留给极端恢复场景）。
+pub fn call_key(req: &Value) -> Option<Value> {
+    call_on(&PIPE_KEY, req, 2000, 1000)
+}
+
+fn call_on(
+    slot: &std::sync::Mutex<Option<std::fs::File>>,
+    req: &Value,
+    resp_timeout: u64,
+    body_timeout: u64,
+) -> Option<Value> {
     unsafe {
-        let mut g = PIPE_CONN.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
         let body = serde_json::to_vec(req).ok()?;
         let mut frame = (body.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(&body);
@@ -266,7 +283,7 @@ pub fn call(req: &Value) -> Option<Value> {
             // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
             // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
             // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
-            // 响应」事故）。PeekNamedPipe 轮询，硬上限 2 秒，超时走降级。
+            // 响应」事故）。PeekNamedPipe 轮询，超时走降级。
             let raw_pipe = f.as_raw_handle() as isize;
             let wait_response = |total_ms: u64| -> Option<()> {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
@@ -305,7 +322,7 @@ pub fn call(req: &Value) -> Option<Value> {
                 *g = None;
                 continue;
             }
-            if wait_response(2000).is_none() {
+            if wait_response(resp_timeout).is_none() {
                 // 超时/断线：弃连接（防响应错位）走降级
                 *g = None;
                 return None;
@@ -322,7 +339,7 @@ pub fn call(req: &Value) -> Option<Value> {
                 return None;
             }
             // body 可能分片到达：头 4 字节已到不代表全帧已到
-            if wait_response(1000).is_none() {
+            if wait_response(body_timeout).is_none() {
                 *g = None;
                 return None;
             }
@@ -347,7 +364,7 @@ pub fn key_request(
     alt: bool,
     line_end: bool,
 ) -> Option<(bool, String, u8, Value, Option<String>, u8)> {
-    let resp = call(&serde_json::json!({
+    let resp = call_key(&serde_json::json!({
         "op": "key",
         "key": key,
         "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt },
