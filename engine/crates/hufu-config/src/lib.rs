@@ -301,7 +301,11 @@ impl Default for SentenceSection {
             min_retained_raw: 0,
             rerank: RerankSection::default(),
             ngram_path: "models/sentence-ngram.bin".into(),
-            early_need: 3,
+            // 【回归 1.4.8 模型默认 2026-09-08】W1 束宽 30000 实测引发
+            // 「越打越卡」（每键全量解码数百 ms，1.4.8 基线对照实锤）
+            //——默认回 1.4.8 值（beam200/cl20/need2/supp32），W1 档位
+            // 保留在设置页预设里按需一键切换。
+            early_need: 2,
             weights: SentenceWeights::default(),
         }
     }
@@ -370,15 +374,12 @@ pub struct SentenceWeights {
 impl Default for SentenceWeights {
     fn default() -> Self {
         SentenceWeights {
-            // 【束宽 2026-09-06 万句定版·W1「更安心的上屏」】30000：
-            // 上屏率 56.1%（6000 时 48.5%，束宽增益当时未探顶）、字/次
-            // 1.30 成段出词、准率 99.54% 最高档、每句 7.41 次在舒适区。
-            // 与设置页「上屏节奏·更安心的上屏」预设一致；激进档
-            // （early_need=2）由预设一键切换。
-            beam_width: 30000,
-            // 【cl10 2026-09-06】10 与 20 指标全同（万句等价验证），
-            // p95 长尾略短——取 10 省 beam 计算量。
-            candidate_limit: 10,
+            // 【回归 1.4.8 模型默认 2026-09-08】束宽 30000 在实机每键
+            // 全量解码数百 ms（短句无增量门槛），跟打场景节奏被拖垮
+            //——默认回 1.4.8 值。束宽增益（上屏率/成段出词）保留在
+            // 设置页「上屏节奏」预设：想用 W1 一键切换。
+            beam_width: 200,
+            candidate_limit: 20,
             max_raw_length: 128,
             rank_penalty: 0.03,
             emitted_character_reward: 2.0,
@@ -388,7 +389,7 @@ impl Default for SentenceWeights {
             dict_bias: 1.0,
             supplement_baseline: 9.0,
             supplement_scale: 2.0,
-            supplement_maximum: 16.0,
+            supplement_maximum: 32.0,
             digit_codes: false,
         }
     }
@@ -558,10 +559,10 @@ mod tests {
     fn default_roundtrip_and_partial_load() {
         let cfg = Config::default();
         assert_eq!(cfg.input.max_code_length, 4);
-        // 2026-09-06 开箱定版 = W1「更安心的上屏」（万句 99.54%/56.1%/1.30）
-        assert_eq!(cfg.sentence.weights.beam_width, 30000);
-        assert_eq!(cfg.sentence.weights.candidate_limit, 10);
-        assert_eq!(cfg.sentence.early_need, 3);
+        // 2026-09-08 默认回归 1.4.8 模型值（W1 30000 实测致越打越卡）
+        assert_eq!(cfg.sentence.weights.beam_width, 200);
+        assert_eq!(cfg.sentence.weights.candidate_limit, 20);
+        assert_eq!(cfg.sentence.early_need, 2);
 
         // 部分 JSON：未给字段用默认值
         let partial = r#"{ "input": { "max_code_length": 5 } }"#;
