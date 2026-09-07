@@ -164,20 +164,28 @@ extern "system" fn cand2_wndproc(
             // layout.font_point（持久化），随后本地皮肤副本同步新字号
             // 并用缓存的上帧渲染参数立即重绘——不等 2.5s 皮肤缓存过期、
             // 不依赖键事件触发 update_ui。
+            // 【2026-09-06 序号跟随修复】此前只 patch font_point——
+            // 序号字级（label_font_point）仍是旧值，且把皮肤重拉时限
+            // 推后，滚轮时序号原地不动、要等下一组段才跳变。现在
+            // server 响应带回新 label_font_point，一并写进本地副本，
+            // 主字与序号同一帧同步缩放。
             let delta: i32 = if ((wparam.0 >> 16) as i16) > 0 { 1 } else { -1 };
             if let Some(r) = crate::ipc::call(&serde_json::json!({
                 "op": "skin_font_delta", "delta": delta
             })) {
                 let new_pt = r.get("font_point").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                let new_lb = r.get("label_font_point").and_then(|x| x.as_f64());
                 if new_pt > 0.0 {
                     if let Some(gsh) = crate::tsf::G_SHARED.get() {
                         let shared = gsh.0.clone();
                         let mut g = shared.lock().unwrap();
                         let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
                             l["font_point"] = serde_json::json!(new_pt);
+                            if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
                             true
                         } else if let Some(l) = g.skin.get_mut("layout") {
                             l["font_point"] = serde_json::json!(new_pt);
+                            if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
                             true
                         } else {
                             false
