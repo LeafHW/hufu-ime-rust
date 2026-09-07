@@ -370,11 +370,15 @@ pub struct SentenceWeights {
 impl Default for SentenceWeights {
     fn default() -> Self {
         SentenceWeights {
-            // 【束宽 2026-09-06 万句定版】6000：上屏率 48.5%（200→6000
-            // 从 40.1% 起步单调升后收敛），准率不降反升。长尾代价见
-            // p95——顿挫敏感场景退 3000（43.7%，长尾明显短）。
-            beam_width: 6000,
-            candidate_limit: 20,
+            // 【束宽 2026-09-06 万句定版·W1「更安心的上屏」】30000：
+            // 上屏率 56.1%（6000 时 48.5%，束宽增益当时未探顶）、字/次
+            // 1.30 成段出词、准率 99.54% 最高档、每句 7.41 次在舒适区。
+            // 与设置页「上屏节奏·更安心的上屏」预设一致；激进档
+            // （early_need=2）由预设一键切换。
+            beam_width: 30000,
+            // 【cl10 2026-09-06】10 与 20 指标全同（万句等价验证），
+            // p95 长尾略短——取 10 省 beam 计算量。
+            candidate_limit: 10,
             max_raw_length: 128,
             rank_penalty: 0.03,
             emitted_character_reward: 2.0,
@@ -554,8 +558,9 @@ mod tests {
     fn default_roundtrip_and_partial_load() {
         let cfg = Config::default();
         assert_eq!(cfg.input.max_code_length, 4);
-        // 2026-09-06 舒适度定版：束宽 6000+证据窗 3（万句 48.5%/99.54%）
-        assert_eq!(cfg.sentence.weights.beam_width, 6000);
+        // 2026-09-06 开箱定版 = W1「更安心的上屏」（万句 99.54%/56.1%/1.30）
+        assert_eq!(cfg.sentence.weights.beam_width, 30000);
+        assert_eq!(cfg.sentence.weights.candidate_limit, 10);
         assert_eq!(cfg.sentence.early_need, 3);
 
         // 部分 JSON：未给字段用默认值
