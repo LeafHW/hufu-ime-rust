@@ -652,7 +652,11 @@ impl CandidateWindowV2 {
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
         let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
-        let label_w = if show_index { 26.0f32 } else { 0.0 };
+        // 序号列宽：基准 26px，测量块内按序号字体实测「10.」宽度自适应
+        // 放大（滚轮放大序号后 26px 装不下导致「1」与「.」换行上下摞——
+        // 2026-09-06 用户实测；比例随 label_font_point 自动缩放，用户
+        // 无需任何手动调整）。
+        let mut label_w = if show_index { 26.0f32 } else { 0.0 };
         let em = font_pt * 96.0 / 72.0;
         // 横排（skin.layout.horizontal）：候选单行横铺，weasel 式
         let horizontal = skin
@@ -803,6 +807,13 @@ impl CandidateWindowV2 {
                 // 兜底：按字数估宽
                 s.chars().count() as f32 * em
             };
+            // 序号列宽自适应（见 label_w 定义处注释）：以最宽序号「10.」
+            // 实测宽 + 5px 余量，不低于基准 26px——任何字号下「1.」「10.」
+            // 都单行放得下，比例自动保持。
+            if show_index {
+                let w10 = measure(&tf_label, "10.");
+                label_w = label_w.max(w10 * 1.05 + 5.0);
+            }
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
             let mut cand_ws: Vec<(f32, f32)> = Vec::new();
@@ -899,7 +910,7 @@ impl CandidateWindowV2 {
                     if _i > 0 {
                         w += cand_spacing;
                     }
-                    w += label_w * 0.72 + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
+                    w += label_w + tw + if *cw > 0.0 { 3.0 + cw } else { 0.0 };
                 }
                 let w_full = w.max(raw_w + margin_x * 2.0);
                 // 【超屏修复】横排宽度封顶：工作区宽 − 余量。超屏时注释
@@ -1437,7 +1448,7 @@ impl CandidateWindowV2 {
                 for (i, (text, _)) in cands.iter().enumerate().take(10) {
                     let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                     let (tw, cw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0));
-                    let cell_w = label_w * 0.72 + tw + if cw > 0.0 { 3.0 + cw } else { 0.0 };
+                    let cell_w = label_w + tw + if cw > 0.0 { 3.0 + cw } else { 0.0 };
                     if i > 0 {
                         x += cand_spacing;
                     }
@@ -1464,8 +1475,8 @@ impl CandidateWindowV2 {
                     };
                     let mut cx = x;
                     if show_index {
-                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y + dy, label_w * 0.72, line_h, bl);
-                        cx += label_w * 0.72;
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y + dy, label_w, line_h, bl);
+                        cx += label_w;
                     }
                     draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, line_h, bt);
                     cx += tw;

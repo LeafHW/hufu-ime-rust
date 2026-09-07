@@ -1918,6 +1918,27 @@ impl Engine {
         }
         match c {
             ' ' => self.select_first(session),
+            // 【2026-09-06 反查 ;' 选重】有候选时 ; 与 ' = 次选/三选
+            // （用户肌肉记忆，与普通模式一致；此前 ' 被 push 成隔音符
+            // 导致候选消失「反查不能用」）。隔音符仅在无候选可用时
+            // 保留（xi'an 这类带隔音的拼音在无候选态下仍可续输）。
+            _ if !session.candidates.is_empty()
+                && (c == self.config.candidates.second_select
+                    || c == self.config.candidates.third_select) =>
+            {
+                let n = if c == self.config.candidates.second_select { 2 } else { 3 };
+                let page_size = self.config.candidates.page_size.max(1);
+                let start = session.page * page_size;
+                let pick = session.candidates.get(start + n - 1).cloned();
+                match pick {
+                    Some(cand) => {
+                        let text = cand.commit_text().to_string();
+                        session.clear();
+                        KeyOutcome::commit(text, self.state(session))
+                    }
+                    None => KeyOutcome::consumed(self.state(session)),
+                }
+            }
             _ if c.is_ascii_lowercase() || c == '\'' => {
                 session.raw.push(c);
                 self.refresh_candidates(session);
@@ -3503,6 +3524,50 @@ mod tests {
         assert_eq!(s.raw, "n", "退格 pop 拼音");
         eng.process_key(&mut s, bs());
         assert_eq!(s.mode, InputMode::Normal, "退空退出反查");
+    }
+
+    // 【反查 ;' 选重 2026-09-06】有候选时 ;=次选 '=三选（此前 ' 被
+    // push 成隔音符候选消失）；无候选时 ' 仍可隔音续输。
+    #[test]
+    fn reverse_quote_semil_select() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-revs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\njd\t就\n").unwrap();
+        // 反查表：文件名含「反查」的 txt 由 Schema::load 直接探测
+        //（data_dir=码表目录父级，apply_global_assets 的 拼音反查/
+        // 子目录路径在临时 fixture 中不可用）。
+        std::fs::write(dir.join("反查.txt"), "西\txi\n希\txi\n息\txi\n").unwrap();
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('`'));
+        for c in "xi".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        assert_eq!(s.candidates.len(), 3, "xi 应有三个反查候选");
+        // ; = 次选「希」
+        let out = eng.process_key(&mut s, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("希"), "; 应选次选");
+        assert!(s.is_idle(), "选重后清缓冲退出反查");
+        // ' = 三选「息」
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('`'));
+        for c in "xi".chars() {
+            eng.process_key(&mut s2, key(c));
+        }
+        let out2 = eng.process_key(&mut s2, key('\''));
+        assert_eq!(out2.commit.as_deref(), Some("息"), "' 应选三选");
+        // 无候选时 ' 仍隔音续输（vvvv 无果）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('`'));
+        for c in "vvvv".chars() {
+            eng.process_key(&mut s3, key(c));
+        }
+        assert!(s3.candidates.is_empty(), "vvvv 无候选");
+        eng.process_key(&mut s3, key('\''));
+        assert!(s3.raw.ends_with('\''), "无候选时 ' 仍为隔音符");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // 【用户词注入管道 2026-09-06】reload_user_data 后用户词同步进
