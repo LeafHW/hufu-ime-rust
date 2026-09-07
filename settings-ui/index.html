@@ -397,6 +397,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>候选间距 <span class="val" id="l-cs-v"></span></label><input type="range" id="l-cs" min="0" max="48"></div>
           <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="40" step="0.5"></div>
           <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="30" step="0.5"></div>
+          <div class="field"><label>序号格式 <span class="val" style="opacity:.7">%s=数字</span></label><input type="text" id="l-lfmt" placeholder="%s." style="width:72px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px"></div>
+          <div class="field"><label>序号/注释间距 <span class="val" id="l-hsp-v"></span></label><input type="range" id="l-hsp" min="0" max="16" step="0.5"></div>
           <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="800" step="10"></div>
           <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
           <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-30" max="30" step="1"></div>
@@ -914,6 +916,19 @@ function bindSkin() {
   }
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
+  // 【皮肤元素自查 2026-09-08】序号格式（label_format，%s→数字）+
+  // hilite_spacing（序号↔正文↔注释统一间距，与 DLL 同步激活）
+  {
+    const lf = $("#l-lfmt");
+    lf.value = SKIN.layout.label_format ?? "%s.";
+    lf.onchange = () => {
+      const v = lf.value.trim();
+      SKIN.layout.label_format = v.includes("%s") ? v : "%s.";
+      lf.value = SKIN.layout.label_format;
+      preview(); saveSkinQuiet();
+    };
+  }
+  lrng("#l-hsp", "hilite_spacing");
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
   lrng("#l-cs", "candidate_spacing"); lrng("#l-ls", "line_spacing");
   lrng("#l-lfp", "label_font_point"); lrng("#l-w", "width");
@@ -947,7 +962,7 @@ function bindSkin() {
   // ② 恢复默认值：颜色/布局/材质回出厂（保留皮肤 ID/名称/作者）
   {
     const F = {
-      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 4, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
+      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
       material: { kind: "Frosted", tint: "#1C1C1ECC", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1 },
     };
@@ -1013,7 +1028,11 @@ function preview() {
   w.innerHTML = "";
   inner.className = "candwin" + (L.horizontal ? " horizontal" : "");
   inner.style.cssText = `background:${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}"><span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${i}.</span>${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
+  // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
+  // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
+  // 与 mark_text（高亮行左缘细竖条，weasel 语义）
+  const fmtLbl = n => { const f = L.label_format || "%s."; return f.includes("%s") ? f.replace("%s", n) : n + "."; };
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${fmtLbl(i)}</span>${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
   inner.innerHTML =
     `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
