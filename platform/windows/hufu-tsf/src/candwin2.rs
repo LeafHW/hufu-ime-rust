@@ -1861,15 +1861,35 @@ impl CandidateWindowV2 {
                 self.shadow_cache = Some(v);
             }
             // 内容坐标 → 窗口坐标（内容在阴影边距内侧；高 DPI 下边距同乘 scale）
-            let _ = SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                x - (shadow_m * dpi_scale) as i32,
-                y - (shadow_m * dpi_scale) as i32,
-                w_out as i32,
-                h_out as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            // 【拖拽防闪 2026-09-08】拖拽中（鼠标按住移动）本线程与 wndproc
+            // 的 WM_MOUSEMOVE 并发 SetWindowPos 同一窗口——两处位置打架
+            // = 窗口来回跳变（用户实测「拖动候选闪烁」）。拖拽期间跳过
+            // show() 的定位（渲染/Present 照常，位置交给拖拽消息控制；
+            // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
+            // 生效回正。
+            let dragging = CAND_DRAG.lock().unwrap().is_some();
+            if !dragging {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    x - (shadow_m * dpi_scale) as i32,
+                    y - (shadow_m * dpi_scale) as i32,
+                    w_out as i32,
+                    h_out as i32,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            } else {
+                // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
             crate::tsf::trace(&format!(
                 "cw2: SetWindowPos({x},{y}) err={} visible={}",
                 GetLastError().0,
