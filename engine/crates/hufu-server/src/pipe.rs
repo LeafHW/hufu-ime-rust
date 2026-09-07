@@ -86,6 +86,9 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         // 【滚轮缩放候选框】DLL 候选框 WM_MOUSEWHEEL 调用：当前皮肤
         // layout.font_point ±delta（clamp 10~36），写回皮肤文件持久化；
         // 返回新字号供 DLL 立即重绘。
+        // 【2026-09-06 序号跟随】label_font_point（候选序号字级）按同比例
+        // 缩放——用户实测滚轮放大时候选序号原大小不动。比例=序号/主字，
+        // 放大缩小都保持视觉层级；clamp 4~40。
         "skin_font_delta" => {
             let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
             let id = host.engine.config.appearance.skin.clone();
@@ -93,6 +96,12 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {
                     let np = (s.layout.font_point as i32 + delta).clamp(10, 36);
+                    let ratio = if s.layout.font_point > 0.0 {
+                        s.layout.label_font_point / s.layout.font_point
+                    } else {
+                        0.75
+                    };
+                    s.layout.label_font_point = (np as f32 * ratio).clamp(4.0, 40.0);
                     s.layout.font_point = np as f32;
                     match s.save(&p) {
                         Ok(()) => serde_json::json!({"font_point": np}),

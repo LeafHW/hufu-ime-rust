@@ -877,7 +877,13 @@ impl Engine {
     }
 
     fn on_backspace(&mut self, session: &mut Session) -> KeyOutcome {
+        // 【2026-09-06 反查退格】反查/命令刚进入（raw 空、模式非普通）时
+        // 退格=退出模式（此前 passthrough 漏给应用，反查态退不掉只能 ESC）。
         if session.raw.is_empty() {
+            if session.mode != InputMode::Normal {
+                session.clear();
+                return KeyOutcome::consumed(self.state(session));
+            }
             return KeyOutcome::passthrough();
         }
         session.raw.pop();
@@ -901,11 +907,6 @@ impl Engine {
             return self.on_reverse_char(session, c);
         }
 
-        // 命令模式
-        if session.mode == InputMode::Command {
-            return self.on_command_char(session, c);
-        }
-
         if session.raw.is_empty() {
             // 反查引导（Shift+` 是 ~ 波浪号，不进反查——2026-09-06
             // 用户规格：空态 Shift+`=「~」上屏）
@@ -918,12 +919,10 @@ impl Engine {
             }
             // 命令命名空间（Shift+\ = ｜ 符号，不进命令——2026-09-06
             // 符号自查：空态 Shift+\ 误入命令模式导致 ｜ 打不出）
-            if c == '\\' && !shift {
-                session.mode = InputMode::Command;
-                session.raw = "\\".into();
-                self.refresh_candidates(session);
-                return KeyOutcome::consumed(self.state(session));
-            }
+            // 【2026-09-06 用户规格】\ 命令模式整体取消（\n数字/\date/
+            // \calc/\w造词等全部下线）——\ 走标点表原样录入自身。
+            // 命令分发/候选/造词代码已删，InputMode::Command 枚举保留
+            // 仅为反序列化兼容（state JSON 里不会再出现）。
             // 【Shift 标点 2026-09-05】TSF 传基础键+shift=true（Shift+,→
             // key=","），空态 Shift+标点/数字转 US 键盘 shift 形态字符走
             // 标点映射：shift+,→<→《、shift+'→"→“（智能配对）、shift+/
@@ -1955,22 +1954,6 @@ impl Engine {
         }
     }
 
-    /// `\` 命令模式：动态变量（含 \n数字 → 中文）与工具命令。
-    fn on_command_char(&mut self, session: &mut Session, c: char) -> KeyOutcome {
-        if c == ' ' || c == '\\' {
-            return self.select_first(session);
-        }
-        // 命令空间收任意非空白字符（calc 表达式符号 / \w 造词中文）；
-        // 上限 18 字符
-        if !c.is_whitespace() && session.raw.chars().count() < 18 {
-            session.raw.push(c);
-            self.refresh_candidates(session);
-            return KeyOutcome::consumed(self.state(session));
-        }
-        session.clear();
-        KeyOutcome::consumed(self.state(session))
-    }
-
     /// 置顶当前页第 idx 候选（Ctrl+Shift+N / 设置界面）。持久化到用户调整日志。
     pub fn op_pin_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
         let page_size = self.config.candidates.page_size.max(1);
@@ -2359,10 +2342,7 @@ impl Engine {
             return;
         }
         // 命令模式：动态变量候选
-        if session.mode == InputMode::Command {
-            session.candidates = self.command_candidates(&session.raw);
-            return;
-        }
+        // 【2026-09-06 用户规格】\ 命令模式取消——分支与 command_candidates 已删。
         // 反查模式（懒装载：首次使用或后台预热时装表）
         if session.mode == InputMode::Reverse {
             self.ensure_reverse();
@@ -2602,135 +2582,9 @@ impl Engine {
     }
 
     /// 命令命名空间候选：动态变量（真实值）与工具命令。
-    fn command_candidates(&self, raw: &str) -> Vec<Candidate> {
-        let name = raw.trim_start_matches('\\');
-        let mut out = Vec::new();
-
-        // \n<数字> → 中文数字（小写）；\N<数字> → 大写
-        if let Some(num) = name.strip_prefix('n').or_else(|| name.strip_prefix('N')) {
-            if let Some(cn) = dynamic::number_to_chinese(num, name.starts_with('N')) {
-                out.push(Candidate::new(
-                    cn,
-                    format!("\\{name}"),
-                    CandidateKind::Command,
-                ));
-            }
-        }
-
-        let commands: Vec<(&str, String)> = vec![
-            ("date", dynamic::date_string()),
-            ("date2", dynamic::date_string_iso()),
-            ("time", dynamic::time_string()),
-            ("time2", dynamic::time_short()),
-            ("week", dynamic::week_string()),
-        ];
-        for (k, v) in &commands {
-            if k.starts_with(name) {
-                out.push(Candidate::new(v.clone(), format!("\\{k}"), CandidateKind::Command));
-            }
-        }
-
-        // \calc<表达式> → 实时求值
-        if let Some(expr) = name.strip_prefix("calc") {
-            if expr.is_empty() {
-                out.push(Candidate::new(
-                    "＝计算器：\\calc(1+2)*3".to_string(),
-                    "\\calc".to_string(),
-                    CandidateKind::Command,
-                ));
-            } else if let Some(v) = dynamic::calc(expr) {
-                let shown = format!("＝{}", dynamic::fmt_num(v));
-                let mut c = Candidate::new(shown, format!("\\calc{expr}"), CandidateKind::Command);
-                c.commit_override = Some(dynamic::fmt_num(v));
-                out.push(c);
-            } else {
-                out.push(Candidate::new(
-                    "＝表达式无效".to_string(),
-                    format!("\\calc{expr}"),
-                    CandidateKind::Command,
-                ));
-            }
-        } else if name == "c" {
-            // calc 前缀提示
-            out.push(Candidate::new(
-                "＝计算器：\\calc(1+2)*3".to_string(),
-                "\\calc".to_string(),
-                CandidateKind::Command,
-            ));
-        }
-
-        // \w<词> → Rime encoder 规则造词（构码 + 注释显示编码）
-        if let Some(word) = name.strip_prefix('w') {
-            if !word.is_empty() {
-                if let Some(code) = self.encode_word(word) {
-                    let mut c =
-                        Candidate::new(word.to_string(), format!("\\w{word}"), CandidateKind::Command);
-                    c.comment = code.clone();
-                    c.commit_override = Some(word.to_string());
-                    // 直接给候选码，选词时 learn() 自动入用户词库
-                    c.code = code;
-                    out.push(c);
-                } else {
-                    out.push(Candidate::new(
-                        "造词失败：字无编码或无匹配规则".to_string(),
-                        format!("\\w{word}"),
-                        CandidateKind::Command,
-                    ));
-                }
-            }
-        }
-        out
-    }
-
-    /// Rime encoder 造词：formula 形如 `AaAbBaBb`（大写=第几个字，Z=末字；
-    /// 小写=该字第几码）。返回第一个完全可构的规则结果。
-    fn encode_word(&self, word: &str) -> Option<String> {
-        let chars: Vec<char> = word.chars().collect();
-        if self.schema.encoder_rules.is_empty() || chars.is_empty() {
-            return None;
-        }
-        // 每字首选码
-        let codes: Vec<Option<String>> = chars
-            .iter()
-            .map(|c| self.schema.best_code_of(&c.to_string()))
-            .collect();
-        for rule in &self.schema.encoder_rules {
-            if chars.len() < rule.min_len || chars.len() > rule.max_len {
-                continue;
-            }
-            let mut code = String::new();
-            let mut ok = true;
-            let f: Vec<char> = rule.formula.chars().collect();
-            let mut i = 0;
-            while i + 1 < f.len() {
-                let (up, low) = (f[i], f[i + 1]);
-                let idx = if up == 'Z' || up == 'z' {
-                    chars.len() - 1
-                } else {
-                    (up as u8 - b'A') as usize
-                };
-                let code_pos = (low as u8 - b'a') as usize;
-                match codes.get(idx).and_then(|c| c.as_ref()) {
-                    Some(cc) => match cc.chars().nth(code_pos) {
-                        Some(ch) => code.push(ch),
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    },
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-                i += 2;
-            }
-            if ok && !code.is_empty() {
-                return Some(code);
-            }
-        }
-        None
-    }
+    /// 【2026-09-06 用户规格】\ 命令模式整体取消——command_candidates 与
+    /// encode_word 已删（\n 中文数字 / \date \time \week / \calc 计算器 /
+    /// \w encoder 造词全部下线）；\ 键原样录入自身。
 
     /// 反查候选（反查表 + 主码注释）。
     fn reverse_candidates(&self, raw: &str) -> Vec<Candidate> {
@@ -2945,6 +2799,14 @@ mod tests {
     fn key(c: char) -> KeyInput {
         KeyInput {
             key: KeyCode::Char(c),
+            modifiers: Modifiers::default(),
+            is_press: true,
+        }
+    }
+
+    fn bs() -> KeyInput {
+        KeyInput {
+            key: KeyCode::Backspace,
             modifiers: Modifiers::default(),
             is_press: true,
         }
@@ -3619,6 +3481,30 @@ mod tests {
         assert!(s.raw.is_empty(), "顶屏后清缓冲");
     }
 
+    // 【反查退格 2026-09-06】进反查后（raw 空）按退格=退出反查而非漏键。
+    #[test]
+    fn reverse_backspace_exits() {
+        let (mut eng, _dir) = test_engine("revbs");
+        let mut s = Session::new(true);
+        // 进反查
+        eng.process_key(&mut s, key('`'));
+        assert_eq!(s.mode, InputMode::Reverse);
+        // 空态退格：退出反查（此前 passthrough 给应用，反查态退不掉）
+        let out = eng.process_key(&mut s, bs());
+        assert!(out.consumed, "空态退格应吃掉并退出反查");
+        assert_eq!(s.mode, InputMode::Normal, "退格退出反查");
+        assert!(s.is_idle());
+        // 带编码退格：pop 拼音；退空后同样退出反查
+        eng.process_key(&mut s, key('`'));
+        eng.process_key(&mut s, key('n'));
+        eng.process_key(&mut s, key('i'));
+        assert_eq!(s.mode, InputMode::Reverse);
+        eng.process_key(&mut s, bs());
+        assert_eq!(s.raw, "n", "退格 pop 拼音");
+        eng.process_key(&mut s, bs());
+        assert_eq!(s.mode, InputMode::Normal, "退空退出反查");
+    }
+
     // 【用户词注入管道 2026-09-06】reload_user_data 后用户词同步进
     // 整句解码器（词图注入效果由真机整句验证）。
     #[test]
@@ -3901,49 +3787,24 @@ mod tests {
         assert!(s.candidates[0].text != "老鬼", "过程态不可居首");
     }
 
+    // 【2026-09-06 用户规格】\ 命令模式取消：原 dynamic_date_week/
+    // dynamic_number/calc_command/word_making_encoder 四测随功能下线。
     #[test]
-    fn dynamic_date_week() {
-        let (mut eng, _dir) = test_engine("date");
+    fn backslash_literal_commit() {
+        // \ 不再进命令模式：空态直出自身（中文态也原样，无顿号映射）
+        let (mut eng, _dir) = test_engine("bs");
         let mut s = Session::new(true);
-        eng.process_key(&mut s, key('\\'));
-        eng.process_key(&mut s, key('d'));
-        let _ = eng.process_key(&mut s, key('a'));
-        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(texts.iter().any(|t| t.contains('年') && t.contains('月')), "{texts:?}");
-        // 星期
-        let (mut eng2, _d2) = test_engine("week");
+        let o = eng.process_key(&mut s, key('\\'));
+        assert_eq!(o.commit.as_deref(), Some("\\"), "空态 \\ 直接上屏自身");
+        assert!(s.is_idle(), "无残留模式");
+        // 有编码态：\ 走标点顶字（顶首选+原样 \，与其他标点语义一致）
         let mut s2 = Session::new(true);
-        eng2.process_key(&mut s2, key('\\'));
-        eng2.process_key(&mut s2, key('w'));
-        let _ = eng2.process_key(&mut s2, key('e'));
-        let snap = eng2.state(&s2);
-        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(texts.iter().any(|t| t.starts_with("星期")), "{texts:?}");
-    }
-
-    #[test]
-    fn dynamic_number() {
-        let (mut eng, _dir) = test_engine("num");
-        let mut s = Session::new(true);
-        eng.process_key(&mut s, key('\\'));
-        for c in "n12345".chars() {
-            eng.process_key(&mut s, key(c));
+        for c in "jd".chars() {
+            eng.process_key(&mut s2, key(c));
         }
-        let snap = eng.state(&s); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(texts.iter().any(|t| t == &"一万二千三百四十五".to_string()), "{texts:?}");
-        // 上屏
-        let out = eng.process_key(&mut s, key(' '));
-        assert_eq!(out.commit.unwrap(), "一万二千三百四十五");
-
-        // 大写
-        let (mut eng2, _d2) = test_engine("num2");
-        let mut s2 = Session::new(true);
-        eng2.process_key(&mut s2, key('\\'));
-        for c in "N1234".chars() {
-            eng2.process_key(&mut s2, key(c));
-        }
-        let snap = eng2.state(&s2); let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
-        assert!(texts.iter().any(|t| t == &"壹仟贰佰叁拾肆".to_string()), "{texts:?}");
+        let o2 = eng.process_key(&mut s2, key('\\'));
+        assert_eq!(o2.commit.as_deref(), Some("就\\"), "编码态 \\ 顶首选+原样");
+        assert_eq!(s2.mode, crate::InputMode::Normal, "不进命令模式");
     }
 
     // 【码表动态变量 2026-09-06】{日期}族上屏展开（候选显示保留字面标记）、
@@ -4047,59 +3908,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn calc_command() {
-        let (mut eng, dir) = test_engine("calc");
-        let mut s = Session::new(true);
-        eng.process_key(&mut s, key('\\'));
-        for c in "calc(1+2)*3".chars() {
-            eng.process_key(&mut s, key(c));
-        }
-        let snap = eng.state(&s);
-        assert!(snap.candidates.iter().any(|c| c.text.contains('9')), "{:?}",
-            snap.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
-        // 上屏是纯数值
-        let o = eng.process_key(&mut s, key(' '));
-        assert_eq!(o.commit.unwrap(), "9");
-        // 无效表达式
-        let mut s2 = Session::new(true);
-        eng.process_key(&mut s2, key('\\'));
-        for c in "calc1+".chars() {
-            eng.process_key(&mut s2, key(c));
-        }
-        let snap = eng.state(&s2);
-        assert!(snap.candidates.iter().any(|c| c.text.contains("无效")), "提示无效");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn word_making_encoder() {
-        // Rime encoder：length_equal 2 → formula AaBa（两字词=各取首码）
-        let dir = std::env::temp_dir().join(format!("hufu-eng-wm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("tiger.dict.yaml"),
-            "---\nname: t\nsort: by_weight\nencoder:\n  rules:\n    - length_equal: 2\n      formula: AaBa\n...\n就\tjd\n不\tbh\n",
-        )
-        .unwrap();
-        let cfg = hufu_config::Config::default();
-        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
-        let mut s = Session::new(true);
-        eng.process_key(&mut s, key('\\'));
-        for c in "w就就".chars() {
-            eng.process_key(&mut s, key(c));
-        }
-        let snap = eng.state(&s);
-        let cand = snap.candidates.iter().find(|c| c.commit_override.is_some());
-        assert!(cand.is_some(), "应有造词候选");
-        let c = cand.unwrap();
-        assert_eq!(c.comment, "jj", "两字各取首码: {}", c.comment);
-        // 选中 → 上屏词、编码=构码（learn 入库）
-        let o = eng.process_key(&mut s, key(' '));
-        assert_eq!(o.commit.unwrap(), "就就");
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    // calc_command/word_making_encoder 随 \ 命令模式下线（2026-09-06）。
 
     #[test]
     fn opencc_variants() {
