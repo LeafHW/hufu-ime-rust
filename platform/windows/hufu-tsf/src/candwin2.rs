@@ -343,6 +343,12 @@ pub struct CandidateWindowV2 {
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
     /// 那正是候选框「在光标周围乱跳」的病根。
     sticky_pos: Option<(i32, i32)>,
+    /// 【拖拽钉住 2026-09-08】拖拽松手设的 sticky 是「组段级钉住」：
+    /// 本组段内窗口留在松手处（忽略 caret 锚），hide（收窗/失焦/
+    /// 上屏断段）时解除——下一组段恢复跟随。旧行为 sticky 只作
+    /// 防抖基准，松手后下一次重绘即弹回 caret（用户实测「拖动后
+    /// 回到原位」）。永久固定仍走右键 pin。
+    sticky_drag: bool,
     /// 上次 show 的编码长度：判断「正向打字」还是「退格/新组段」。
     /// 正向打字时光标只应右移/不动——据此过滤应用返回的旧布局回退值。
     last_raw_len: usize,
@@ -540,6 +546,7 @@ impl CandidateWindowV2 {
                 dxgi: Some(dxgi_dev.clone()),
                 readback: false,
                 sticky_pos: None,
+                sticky_drag: false,
                 last_raw_len: 0,
                 last_pixels: None,
                 last_dy: None,
@@ -1714,9 +1721,11 @@ impl CandidateWindowV2 {
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let grew = raw.len() >= self.last_raw_len;
             self.last_raw_len = raw.len();
-            // 拖拽松手交接：一次性消费（设 sticky，本组段留在松手处）
+            // 拖拽松手交接：一次性消费（设 sticky 并标记组段级钉住——
+            // 本组段留在松手处，hide 时解除）
             if let Some(p) = CAND_DROP_AT.lock().unwrap().take() {
                 self.sticky_pos = Some(p);
+                self.sticky_drag = true;
             }
             let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap() {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
@@ -1726,6 +1735,13 @@ impl CandidateWindowV2 {
                 crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
                 let x = px.clamp(vx, (vx + vw - width as i32).max(vx));
                 let y = py.clamp(vy, (vy + vh - height as i32).max(vy));
+                (x, y)
+            } else if self.sticky_drag && self.sticky_pos.is_some() {
+                // 【拖拽钉住】松手设的 sticky 优先于锚点：本组段内
+                // 窗口钉在松手处不回弹（clamp 防出屏）
+                let (ox, oy) = self.sticky_pos.unwrap();
+                let x = ox.clamp(vx, (vx + vw - width as i32).max(vx));
+                let y = oy.clamp(vy, (vy + vh - height as i32).max(vy));
                 (x, y)
             } else {
             match anchor {
@@ -1925,6 +1941,9 @@ impl CandidateWindowV2 {
         // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
         // 中下方」的病根）。
         self.last_raw_len = usize::MAX;
+        // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
+        // ——下一组段恢复跟随 caret。
+        self.sticky_drag = false;
         // 候选窗隐藏时锁指示窗同退（组段间不孤零零挂一个锁）
         lockwin_hide();
         // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
