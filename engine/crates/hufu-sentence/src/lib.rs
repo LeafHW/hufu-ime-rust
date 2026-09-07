@@ -64,9 +64,20 @@ struct EngineCache {
 /// 尾窗须覆盖旧尾段豁免（is_tail 依赖 n）与锁变化的回溯范围
 /// （max_code_length=4 + 缓冲，12 保守）。前缀长度 ≤ 尾窗时 split=0
 /// 退化为全量（主循环从 BOS 种子起算），不产生增量收益也绝不出错。
-const INC_MIN_PREFIX: usize = 20;
+/// 【增量门槛 2026-09-08】20→4：原 20 只避开「前缀≤尾窗时 split=0
+/// 白做簿记」的场景，非正确性要求（增量算法对任意长度安全，≤12 键
+/// 时 split=0 自然退化为全量）。实测 beam30000 连打爬坡段（4-19 键）
+/// 正是全量在付成本——门槛降到 4 后该区间开始部分增量（重算 12 键
+/// 尾窗 < 句长即有收益）。
+const INC_MIN_PREFIX: usize = 4;
 const INC_REDO_TAIL: usize = 8;
 const INC_MAX_DELTA: usize = 3;
+/// 【增量尾窗束宽 2026-09-08】beam30000「质量+不卡」两全的钥匙：
+/// 增量重算只覆盖尾部 ≤12 键（REDO_TAIL+回退），前部 30000 束的
+/// 路径多样性已锁定在复用桶中——尾段组合空间小，重算用 6000 束
+/// 足够承载（全束只付在首键/缓存失效的全量重建上）。束宽 30000
+/// 下连打稳态 = 首键全量（长）+后续每键 6000×12 键尾窗（快）。
+const INC_TAIL_BEAM: usize = 6000;
 /// 每段参与组句的码表词条上限（rank 截断）：虎码同码词呈长尾分布，
 /// rank>8 的系统词极生僻，beam 展开却为每词条付一次 String clone。
 const SEG_RANK_LIMIT: usize = 8;
@@ -459,6 +470,7 @@ impl SentenceEngine {
 
         // beam 分桶：增量时复用前部桶（其内容只依赖 base[..pos]，
         // 不受尾部新键影响），全量时新建并种入 BOS。
+        let is_resume = resume.is_some();
         let mut buckets: Vec<Bucket> = match resume {
             Some((b, _)) => b,
             None => (0..=n).map(|_| Bucket::new()).collect(),
@@ -507,6 +519,9 @@ impl SentenceEngine {
             // avg 49→24ms、p95 102→38ms、exact 90% 持平）
             (w.beam_width / 16).max(100).min(w.beam_width)
         };
+        // 【增量尾窗束宽】见 INC_TAIL_BEAM 注释：增量重算只算尾部
+        // ≤12 键，6000 束承载尾段组合；全束质量保留在前部复用桶。
+        let beam = if is_resume { beam.min(INC_TAIL_BEAM) } else { beam };
         // 【性能 2026-09-08】env 读取移出循环：Windows 上 env::var 走
         // 进程环境块+内部锁，原先在 beam 循环体内每位置读一次，48 码
         // 句每次解码白读 48 次（审计报告 E-3）。OnceLock 一次定型。
