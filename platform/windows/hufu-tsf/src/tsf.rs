@@ -55,6 +55,9 @@ pub struct Shared {
     /// 生效（用户实测「反应慢」根因：连续拖动内缓存未过期，弹的
     /// 还是旧参数窗）。
     pub skin_ver_last: u64,
+    /// 皮肤刚重拉、待按新皮肤重绘一次（poll 消费即清——签名未变
+    /// 时的预览刷新通道；绝非常驻标志，防每 40ms 白绘）。
+    pub skin_repaint: bool,
     /// 候选延时显示（candidates.delay_show_ms）：raw 变更后该毫秒内抑制候选窗（防闪烁）
     pub delay_show_ms: u32,
     /// 上次 raw（变化检测）
@@ -139,6 +142,7 @@ impl Shared {
             skin_stale: true,
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             skin_ver_last: 0,
+            skin_repaint: false,
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
@@ -2246,12 +2250,14 @@ fn poll_tick() {
         // 【皮肤版本失效 2026-09-08】server 保存过皮肤（版本号变化）
         // → 强制重拉绕 2.5s 时限：设置页连续调参时实机预览即时生效。
         // 放 raw_empty 判定前——预览流程 reset（断段）与打 w 之间的
-        // 任意一拍都会走到这里。
+        // 任意一拍都会走到这里。skin_repaint 置位：签名未变时也按
+        // 新皮肤重绘一次（一次性，下方消费清除）。
         let sv = state.get("skin_ver").and_then(|v| v.as_u64()).unwrap_or(0);
         if sv != g.skin_ver_last {
             g.skin_ver_last = sv;
             if !g.skin.is_null() {
                 g.load_skin_forced();
+                g.skin_repaint = true;
             }
         }
         if raw_empty {
@@ -2272,9 +2278,13 @@ fn poll_tick() {
         // 以正确 rect 显示（op 重跑 edit session 顺带重查 caret）。
         need_show = g.suppress_pending;
         if sig == g.cand_sig_last && !need_show {
-            // 【实机预览重绘】签名未变但皮肤刚重拉（调参后连续预览同
-            // 一码 w）：用缓存的上帧渲染参数按新皮肤立即重绘。
-            if g.cand_shown_this_segment {
+            // 【实机预览重绘·仅限皮肤刚变化 2026-09-08】签名未变且
+            // 皮肤刚重拉（skin_repaint 一次性标志）时按上帧渲染参数
+            // 重绘一次。此前为无条件——候选窗显示期间 poll 每 40ms
+            // 全帧重绘（每秒 25 次白绘），打字卡顿实锤（用户实测
+            // 「打着打着会卡」）。
+            if g.skin_repaint && g.cand_shown_this_segment {
+                g.skin_repaint = false;
                 let last = g.last_show.take();
                 let skin = g.skin.clone();
                 let caret = g.caret;
