@@ -153,6 +153,7 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
   border: 1px solid var(--bd); background: var(--bg3); color: var(--fg2); cursor: pointer;
 }
 .preview-tools button:hover { border-color: var(--acc); color: var(--fg1); }
+.preview-tools button.on { border-color: var(--acc); color: var(--acc); }
 #candwin-preview { position: relative; z-index: 1; }
 .material-note { font-size: 12px; color: var(--fg2); margin-top: 6px; }
 .pill { font-size: 11px; border-radius: 99px; padding: 2px 10px; background: var(--bg3); color: var(--fg2); }
@@ -231,7 +232,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>翻页键</label><input type="text" data-path="candidates.paging_keys" style="width:90px"></div>
       <div class="field"><label>次选键</label><input type="text" maxlength="1" id="c-2nd" style="width:60px"></div>
       <div class="field"><label>三选键</label><input type="text" maxlength="1" id="c-3rd" style="width:60px"></div>
-      <div class="checkline"><input type="checkbox" id="c-v"><label for="c-v">竖排候选</label></div>
       <div class="checkline"><input type="checkbox" id="c-idx"><label for="c-idx">显示序号</label></div>
       <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示拼音注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释<span class="sub">（整句状态不可用）</span></label></div>
@@ -242,8 +242,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="row">
       <div class="checkline"><input type="checkbox" id="p-full"><label for="p-full">全角标点</label></div>
       <div class="checkline"><input type="checkbox" id="p-pair"><label for="p-pair">成对引号自动配对</label></div>
-      <div class="field"><label>候选字体（存入皮肤）</label><input type="text" id="ap-font" style="width:180px" placeholder="留空=系统默认"></div>
-      <div class="field"><label>字号（存入皮肤）</label><input type="number" id="ap-size" min="10" max="40" step="0.5"></div>
     </div>
     <h3>音效</h3>
     <div class="row">
@@ -345,15 +343,22 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>另存为 ID</label><input type="text" data-skin="id" style="width:180px"></div>
       <button id="skin-save" class="primary">保存皮肤</button>
       <button id="skin-new">新建</button>
+      <button id="skin-reset" title="把当前皮肤的颜色、布局、材质全部恢复为出厂默认（保留皮肤 ID/名称）">恢复默认值</button>
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
         <div class="preview-tools">
           <button id="livebg-btn" title="把真实屏幕作为预览背景，实时透视透明效果">真实屏幕背景</button>
+          <button id="pv-dark" class="on" title="预览区用深色背景">深色底</button>
+          <button id="pv-light" title="预览区用浅色背景">浅色底</button>
         </div>
         <video id="livebg" autoplay muted playsinline style="display:none"></video>
         <div id="candwin-preview"></div>
         <div class="material-note" id="material-note"></div>
+        <div class="field" style="margin-top:14px">
+          <label>实机试打（在此打字，真实候选窗会弹出，与上方预览对比）</label>
+          <input type="text" id="skin-try" style="width:100%" placeholder="例如输入 zhrjk（虎符）——真实候选窗即在此处弹出">
+        </div>
       </div>
       <div style="flex:1;min-width:330px">
         <h3>材质</h3>
@@ -371,17 +376,20 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="row">
           <div class="checkline"><input type="checkbox" id="l-horiz"><label for="l-horiz">横排候选</label></div>
           <div class="checkline"><input type="checkbox" id="l-inline"><label for="l-inline">编码内联到应用</label></div>
-          <div class="field"><label>圆角 <span class="val" id="l-radius-v"></span></label><input type="range" id="l-radius" min="0" max="20"></div>
-          <div class="field"><label>高亮圆角 <span class="val" id="l-hr-v"></span></label><input type="range" id="l-hr" min="0" max="20"></div>
-          <div class="field"><label>水平留白 <span class="val" id="l-mx-v"></span></label><input type="range" id="l-mx" min="0" max="30"></div>
-          <div class="field"><label>垂直留白 <span class="val" id="l-my-v"></span></label><input type="range" id="l-my" min="0" max="30"></div>
-          <div class="field"><label>高亮内距 <span class="val" id="l-hp-v"></span></label><input type="range" id="l-hp" min="0" max="20"></div>
-          <div class="field"><label>候选间距 <span class="val" id="l-cs-v"></span></label><input type="range" id="l-cs" min="0" max="24"></div>
-          <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="20" step="0.5"></div>
-          <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="20" step="0.5"></div>
-          <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="480" step="10"></div>
-          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="24" step="0.5"></div>
-          <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-10" max="10" step="1"></div>
+          <div class="field"><label>候选字体</label><input type="text" id="ap-font" style="width:170px" placeholder="留空=系统默认"></div>
+          <div class="field"><label>字号</label><input type="number" id="ap-size" min="10" max="60" step="0.5"></div>
+          <div class="field"><label>圆角 <span class="val" id="l-radius-v"></span></label><input type="range" id="l-radius" min="0" max="40"></div>
+          <div class="field"><label>高亮圆角 <span class="val" id="l-hr-v"></span></label><input type="range" id="l-hr" min="0" max="40"></div>
+          <div class="field"><label>水平留白 <span class="val" id="l-mx-v"></span></label><input type="range" id="l-mx" min="0" max="60"></div>
+          <div class="field"><label>垂直留白 <span class="val" id="l-my-v"></span></label><input type="range" id="l-my" min="0" max="60"></div>
+          <div class="field"><label>高亮内距 <span class="val" id="l-hp-v"></span></label><input type="range" id="l-hp" min="0" max="40"></div>
+          <div class="field"><label>候选间距 <span class="val" id="l-cs-v"></span></label><input type="range" id="l-cs" min="0" max="48"></div>
+          <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="40" step="0.5"></div>
+          <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="30" step="0.5"></div>
+          <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="800" step="10"></div>
+          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
+          <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-30" max="30" step="1"></div>
+          <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-30" max="30" step="1"></div>
         </div>
         <h3>颜色角色</h3>
         <div class="color-grid" id="color-grid"></div>
@@ -865,20 +873,23 @@ function bindSkin() {
   // rng("#mat-bw", ...) 已并入上方边框对齐块（真窗键 layout.border_width）
   $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
   $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
-  const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); }; };
+  // 【2026-09-06 实时生效】布局滑杆（阴影/圆角/间距/字级/固定宽等）
+  // 此前只改内存+预览图、无任何保存路径（用户实测「阴影大小不生效」
+  // 根因）——现拖动防抖 600ms 自动存皮肤，server 落盘后 DLL 2.5s 过期
+  // 拉取、下一组段生效。
+  let _skinSaveTimer = null;
+  const saveSkinDebounced = () => {
+    clearTimeout(_skinSaveTimer);
+    _skinSaveTimer = setTimeout(() => saveSkinQuiet(), 600);
+  };
+  const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
   lrng("#l-cs", "candidate_spacing"); lrng("#l-ls", "line_spacing");
   lrng("#l-lfp", "label_font_point"); lrng("#l-w", "width");
-  lrng("#l-sr", "shadow_radius"); lrng("#l-soy", "shadow_offset_y");
-  // 通用页「竖排候选」复用为同一开关（皮肤 layout.horizontal 取反），改动即存皮肤
-  const cv = $("#c-v");
-  cv.checked = !SKIN.layout.horizontal;
-  cv.onchange = async () => {
-    SKIN.layout.horizontal = !cv.checked; preview();
-    try { await api("POST", "/api/skin", SKIN); msg(cv.checked ? "已切换竖排并保存皮肤 ✓" : "已切换横排并保存皮肤 ✓", "ok"); }
-    catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
-  };
+  lrng("#l-sr", "shadow_radius"); lrng("#l-sox", "shadow_offset_x"); lrng("#l-soy", "shadow_offset_y");
+  // 【2026-09-06 用户规格】「竖排候选」开关从「输入与候选」页移除——
+  // 只保留皮肤页「横排候选」（同一皮肤 layout.horizontal，取反即竖排）。
   // 候选字体/字号 → 皮肤 layout（真实候选窗读皮肤），改动即存
   const af = $("#ap-font"), asz = $("#ap-size");
   af.value = SKIN.layout.font_face || "";
@@ -888,6 +899,39 @@ function bindSkin() {
   };
   af.onchange = () => { SKIN.layout.font_face = af.value.trim(); saveSkinNow(); };
   asz.onchange = () => { const v = parseFloat(asz.value); if (v >= 8 && v <= 60) { SKIN.layout.font_point = v; saveSkinNow(); } };
+
+  /* 【2026-09-06 用户规格】三个皮肤页新能力：
+     ① 预览背景深/浅切换（默认深）② 每皮肤「恢复默认值」③ 实机试打框 */
+  // ① 深/浅底切换（浅色底内联覆盖，默认深=样式表原样）
+  {
+    const wrap = document.querySelector(".skin-preview-wrap");
+    const bd = $("#pv-dark"), bl = $("#pv-light");
+    const apply = light => {
+      wrap.style.background = light ? "#E9E9EE" : "";
+      bd.classList.toggle("on", !light);
+      bl.classList.toggle("on", light);
+    };
+    bd.onclick = () => apply(false);
+    bl.onclick = () => apply(true);
+  }
+  // ② 恢复默认值：颜色/布局/材质回出厂（保留皮肤 ID/名称/作者）
+  {
+    const F = {
+      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 4, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
+      colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
+      material: { kind: "Frosted", tint: "#1C1C1ECC", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1 },
+    };
+    $("#skin-reset").onclick = async () => {
+      try {
+        SKIN.layout = JSON.parse(JSON.stringify(F.layout));
+        SKIN.colors = JSON.parse(JSON.stringify(F.colors));
+        SKIN.material = JSON.parse(JSON.stringify(F.material));
+        bindSkin(); buildColorGrid(); preview();
+        await api("POST", "/api/skin", SKIN);
+        msg("当前皮肤已恢复出厂默认值并保存生效 ✓", "ok");
+      } catch (e) { msg("恢复默认失败：" + e.message, "err"); }
+    };
+  }
 }
 function preview() {
   const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
@@ -1003,6 +1047,9 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
   $$("nav a").forEach(x => x.classList.remove("on")); a.classList.add("on");
   $$("main section").forEach(s => s.classList.remove("on"));
   $("#tab-" + a.dataset.tab).classList.add("on");
+  // 【2026-09-06 用户规格】皮肤页隐藏全局「保存并应用」——皮肤改动全部
+  // 实时生效（滑杆防抖自动存），该按钮在皮肤页只会误导「要手动保存」。
+  $("#btn-save").style.display = a.dataset.tab === "skin" ? "none" : "";
 });
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
 /* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */

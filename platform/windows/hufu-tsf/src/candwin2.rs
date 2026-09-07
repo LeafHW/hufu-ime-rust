@@ -357,7 +357,7 @@ pub struct CandidateWindowV2 {
     pub(crate) dy_cache: Option<((String, f32), f32)>,
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
-    pub(crate) shadow_cache: Option<((u32, u32, u32, i32, u32), (ID2D1CommandList, ID2D1Effect))>,
+    pub(crate) shadow_cache: Option<((u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -616,6 +616,14 @@ impl CandidateWindowV2 {
     }
     /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。selected=高亮行（页内 0 起）。
     pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>, selected: usize) {
+        // 【5K/高 DPI 缩放 2026-09-06】窗口尺寸/渲染此前全部按 96-DPI 逻辑
+        // 像素算——宿主 Per-Monitor V2 时这些被当物理像素用，200%/300%
+        // 缩放屏上候选窗整体偏小。中心化修法：取窗口 DPI 得 scale，位图/
+        // 窗口尺寸×scale，渲染层 SetTransform 缩放（DWrite 文本按目标
+        // 分辨率光栅化，不糊），内容逻辑坐标全部不变。
+        let dpi_scale = unsafe {
+            windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0
+        };
         // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
         let show_index = skin
             .get("show_index")
@@ -695,7 +703,7 @@ impl CandidateWindowV2 {
         // 字体与内容测宽先行（宽度取决于最长候选）
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
         let mut dy_cache_out: Option<((String, f32), f32)> = None;
-        let mut shadow_cache_out: Option<((u32, u32, u32, i32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
+        let mut shadow_cache_out: Option<((u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
         let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
@@ -838,18 +846,18 @@ impl CandidateWindowV2 {
                 dy = probe_dy(&probe_slack, &tf);
                 dy_cache_out = Some((dy_key, dy));
             }
-            // 注意：编码行不参与定宽（长码截断显示，框宽只随候选内容）；
-            // 例外一：仅提示行窗口（反查/命令进入提示，无候选）时由提示行定宽；
-            // 例外二：横排布局编码与候选同行（编码在左，2026-09-05 用户
-            // 反馈「横排编码独占一行在候选上面」），编码宽度参与定宽。
-            let raw_w = if cands.is_empty() || horizontal {
-                if raw.is_empty() {
-                    0.0
-                } else {
-                    measure(&tf, raw.as_str())
-                }
-            } else {
+            // 注意：编码行定宽策略——
+            // 横排：编码与候选同行（左，2026-09-05），宽度参与定宽；
+            // 【2026-09-06 竖排根修】竖排同样参与定宽：此前竖排恒 0 导致
+            // 窗宽只随候选列——反查「·〔反查〕 ni」类长编码行超出窗宽，
+            // DrawText 自动换行下移、被后画的候选行覆盖（用户实测
+            // 「字母超 3 个编码下移被候选挡住」）。竖排也量编码宽，
+            // 窗口加宽容纳编码单行（显示层 trunc_tail 的 260px 截断仍在，
+            // 长码尾部保留，不会无限撑宽）。
+            let raw_w = if raw.is_empty() {
                 0.0
+            } else {
+                measure(&tf, raw.as_str())
             };
             // 【注释配额 2026-09-07】两处布局封顶（竖排固定宽/300、横排
             // w_cap）与最长注释冲突时按配额截断注释（尾部 …），不再让
@@ -976,20 +984,22 @@ impl CandidateWindowV2 {
         let h = height as u32;
         // 投影：shadow_radius>0 时窗口四周外扩边距，阴影画在边距里
         //（内容绘制整体平移进边距内，见渲染段 SetTransform）
-        let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
+        let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 60.0);
         let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
+        // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
+        let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;
         // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
         // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
         // 实测「超出 R 角的直角色块」= 弥散阴影遭位图边缘切割）。
         let shadow_m = if has_shadow {
             let sigma = shadow_radius * 0.5 + 1.0;
-            (sigma * 3.0 + 6.0 + shadow_off_y.abs()).ceil()
+            (sigma * 3.0 + 6.0 + shadow_off_y.abs().max(shadow_off_x.abs())).ceil()
         } else {
             0.0
         };
-        let w_out = w + 2 * shadow_m as u32;
-        let h_out = h + 2 * shadow_m as u32;
+        let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
+        let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
             crate::tsf::trace("cw2: ensure_swapchain FAIL");
             return;
@@ -1025,10 +1035,10 @@ impl CandidateWindowV2 {
             ctx.SetTarget(&bitmap);
             ctx.BeginDraw();
             ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: 1.0,
+                M11: dpi_scale,
                 M12: 0.0,
                 M21: 0.0,
-                M22: 1.0,
+                M22: dpi_scale,
                 M31: 0.0,
                 M32: 0.0,
             });
@@ -1062,8 +1072,9 @@ impl CandidateWindowV2 {
                         width as u32,
                         height as u32,
                         (radius * 4.0) as u32,
-                        (shadow_off_y * 4.0) as i32,
+                        ((shadow_off_y * 4.0) as i32, (shadow_off_x * 4.0) as i32),
                         sc_packed,
+                        (dpi_scale * 100.0) as u32,
                     );
                     // 【真 D2D 高斯阴影】用户两轮判多层近似「太锐利」——
                     // 换 D2D1Shadow 效果（系统级高斯模糊）：窗口形状画进
@@ -1083,7 +1094,7 @@ impl CandidateWindowV2 {
                                         shadow_m,
                                         radius,
                                     );
-                                    let off = D2D_POINT_2F { x: 0.0, y: shadow_off_y };
+                                    let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
                                     ctx.DrawImage(
                                         &eff_img,
                                         Some(&off as *const _),
@@ -1154,7 +1165,7 @@ impl CandidateWindowV2 {
                                 shadow_m,
                                 radius,
                             );
-                            let off = D2D_POINT_2F { x: 0.0, y: shadow_off_y };
+                            let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
                             ctx.DrawImage(
                                 &eff_img,
                                 Some(&off as *const _),
@@ -1210,9 +1221,10 @@ impl CandidateWindowV2 {
                             });
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: shadow_m - grow,
+                                    left: shadow_m - grow + shadow_off_x * t,
                                     top: shadow_m - grow + shadow_off_y * t,
-                                    right: shadow_m + width + grow,
+                                    right: shadow_m + width + grow
+                                        + shadow_off_x * t,
                                     bottom: shadow_m + height + grow
                                         + shadow_off_y * t,
                                 },
@@ -1249,14 +1261,15 @@ impl CandidateWindowV2 {
                     } // fx.is_none() 环带兜底结束
                 }
             }
-            // 内容整体平移进阴影边距内（此后所有内容坐标不变）
+            // 内容整体平移进阴影边距内（此后所有内容坐标不变）；
+            // 矩阵 = 缩放（高 DPI）× 平移（shadow_m 物理 px）
             ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: 1.0,
+                M11: dpi_scale,
                 M12: 0.0,
                 M21: 0.0,
-                M22: 1.0,
-                M31: shadow_m,
-                M32: shadow_m,
+                M22: dpi_scale,
+                M31: shadow_m * dpi_scale,
+                M32: shadow_m * dpi_scale,
             });
             // 【整体透明度】非文字元素的总乘法系数（块外供共用）
             let master = skin
@@ -1365,9 +1378,9 @@ impl CandidateWindowV2 {
                     let rr = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
                             left: margin_x,
-                            top: margin_y + dy,
+                            top: margin_y,
                             right: width - margin_x,
-                            bottom: margin_y + dy + line_h,
+                            bottom: margin_y + line_h,
                         },
                         radiusX: 4.0,
                         radiusY: 4.0,
@@ -1378,7 +1391,12 @@ impl CandidateWindowV2 {
                 }
                 draw(&ctx, &tf, raw.as_str(), margin_x, margin_y + dy, width - margin_x * 2.0, line_h, &b_raw);
             }
-            let y0 = margin_y + (line_h + cand_spacing) * code_row + dy;
+            // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
+            // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
+            // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
+            // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
+            // 布置。
+            let y0 = margin_y + (line_h + cand_spacing) * code_row;
 
             // 高亮胶囊统一内边距：四边都 = hilite_pad。
             // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
@@ -1438,13 +1456,13 @@ impl CandidateWindowV2 {
                     };
                     let mut cx = x;
                     if show_index {
-                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y, label_w * 0.72, line_h, bl);
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), cx, y + dy, label_w * 0.72, line_h, bl);
                         cx += label_w * 0.72;
                     }
-                    draw(&ctx, &tf, text, cx, y, tw + 2.0, line_h, bt);
+                    draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, line_h, bt);
                     cx += tw;
                     if !cmt.is_empty() && cw > 0.0 {
-                        draw(&ctx, &tf_small, cmt, cx + 3.0, y, cw + 2.0, line_h, bc);
+                        draw(&ctx, &tf_small, cmt, cx + 3.0, y + dy, cw + 2.0, line_h, bc);
                     }
                     x += cell_w;
                 }
@@ -1476,11 +1494,11 @@ impl CandidateWindowV2 {
                         (&b_text, &b_label, &b_cmt)
                     };
                     if show_index {
-                        draw(&ctx, &tf_label, &format!("{}.", i + 1), margin_x, y, label_w, line_h, bl);
+                        draw(&ctx, &tf_label, &format!("{}.", i + 1), margin_x, y + dy, label_w, line_h, bl);
                     }
-                    draw(&ctx, &tf, text, text_x, y, cmt_x - text_x - 4.0, line_h, bt);
+                    draw(&ctx, &tf, text, text_x, y + dy, cmt_x - text_x - 4.0, line_h, bt);
                     if !cmt.is_empty() {
-                        draw(&ctx, &tf_small, cmt, cmt_x, y, width - cmt_x - margin_x + 4.0, line_h, bc);
+                        draw(&ctx, &tf_small, cmt, cmt_x, y + dy, width - cmt_x - margin_x + 4.0, line_h, bc);
                     }
                 }
             }
@@ -1735,12 +1753,12 @@ impl CandidateWindowV2 {
             if let Some(v) = shadow_cache_out {
                 self.shadow_cache = Some(v);
             }
-            // 内容坐标 → 窗口坐标（内容在阴影边距内侧）
+            // 内容坐标 → 窗口坐标（内容在阴影边距内侧；高 DPI 下边距同乘 scale）
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                x - shadow_m as i32,
-                y - shadow_m as i32,
+                x - (shadow_m * dpi_scale) as i32,
+                y - (shadow_m * dpi_scale) as i32,
                 w_out as i32,
                 h_out as i32,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,

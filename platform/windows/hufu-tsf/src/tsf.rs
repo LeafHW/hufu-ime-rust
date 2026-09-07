@@ -1446,23 +1446,30 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     let raw_state = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // 【2026-09-05 内联去重】inline_preedit 开启且编码已内联在应用组段里
-    // 时，候选框不再重复显示编码行（反查/命令模式例外——aux 提示保留）。
-    let inline_dup = {
-        let on = g
-            .skin
-            .pointer("/skin/layout/inline_preedit")
-            .or_else(|| g.skin.get("layout").and_then(|l| l.get("inline_preedit")))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        on && aux.is_empty() && !raw_state.is_empty()
-    };
+    // 时，候选框不再重复显示编码行。
+    // 【2026-09-06 反查内联跟随】反查模式 aux 非空不再豁免：内联开着时
+    // 拼音同样内嵌在应用组段（g2.preedit=raw），候选框只留〔反查〕提示
+    // 不重复拼音；内联关着时候选框承担编码显示，仍拼「〔反查〕 ni」。
+    let inline_on = g
+        .skin
+        .pointer("/skin/layout/inline_preedit")
+        .or_else(|| g.skin.get("layout").and_then(|l| l.get("inline_preedit")))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let inline_dup = inline_on && !raw_state.is_empty();
     let show_code = show_code && !inline_dup;
-    // 编码行内容：显示编码→raw；关闭时仅在反查/命令等辅助提示下保留一行。
-    // 【2026-09-05 反查提示】aux 非空（反查/命令模式）且 raw 非空时拼成
+    // 编码行内容：显示编码→raw；关闭时仅在反查等辅助提示下保留一行。
+    // 【2026-09-05 反查提示】aux 非空（反查）且 raw 非空时拼成
     // 「〔反查〕 ni」——全程提示当前在反查态（此前进入后提示即消失，
     // 编码行只剩拼音，用户看不出自己在反查）。样式=当前皮肤编码行。
+    // 【2026-09-06 内联跟随】内联开（拼音已在应用组段）→ 候选框只留
+    // aux 提示不拼 raw；内联关 → 维持拼合显示。
     let raw = if !aux.is_empty() && !raw_state.is_empty() {
-        format!("{aux} {raw_state}")
+        if inline_on {
+            aux.clone()
+        } else {
+            format!("{aux} {raw_state}")
+        }
     } else if show_code {
         raw_state.clone()
     } else {
