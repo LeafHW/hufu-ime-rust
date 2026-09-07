@@ -110,6 +110,17 @@ footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
 }
 .schema-item .opendir:hover { border-color: var(--acc); color: var(--acc); }
 .schema-item .opendir + .tag { margin-left: 0; }
+/* ── 上屏节奏预设 ── */
+.rhythm-cards { display: flex; gap: 12px; flex-wrap: wrap; }
+.rhythm-card {
+  flex: 1; min-width: 220px; max-width: 320px; padding: 14px 16px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
+  cursor: pointer; transition: border-color .15s;
+}
+.rhythm-card:hover { border-color: var(--acc); }
+.rhythm-card.on { border-color: var(--acc); background: var(--bg3); }
+.rhythm-card b { display: block; font-size: 14.5px; margin-bottom: 6px; }
+.rhythm-card .sub { display: block; line-height: 1.7; }
 /* ── 用户词 ── */
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
@@ -290,6 +301,21 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="s-early"><label for="s-early">提前上屏（稳 3 键）</label></div>
       <span class="pill" id="s-model-state">模型：检测中…</span>
     </div>
+    <div class="row" style="align-items:center;justify-content:space-between">
+      <h3 style="margin:0">上屏节奏</h3>
+      <span class="pill" id="s-rhythm-state">自定义</span>
+    </div>
+    <div class="rhythm-cards" id="rhythm-cards">
+      <div class="rhythm-card" id="rc-aggressive" title="万句实测：约 61% 字自动落屏，小步快出">
+        <b>⚡ 更激进的上屏</b>
+        <span class="sub">出字更快更多——约六成字自动落屏，小步快出，接近「它替你打字」。</span>
+      </div>
+      <div class="rhythm-card" id="rc-safe" title="万句实测：约 56% 字自动落屏，成段出词">
+        <b>🛡 更安心的上屏</b>
+        <span class="sub">多等一键证据再出——成段出词更稳，攒字成段，节奏从容。</span>
+      </div>
+    </div>
+    <div class="sub">点击即保存生效（无需重启）。两张卡片来自万句语料实测调校，可随时互切。</div>
     <div class="row">
       <div class="field"><label>ngram 模型文件（安装根下相对路径，如 模型\xxx.bin）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
     </div>
@@ -528,7 +554,7 @@ function bindInputs() {
 
 /* ── 整句权重滑杆 ── */
 const WDEFS = [
-  ["beam_width", "Beam 宽度", 10, 600, 1],
+  ["beam_width", "Beam 宽度", 10, 32000, 100],
   ["rank_penalty", "名次惩罚", 0, 1, 0.005],
   ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
   ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
@@ -564,8 +590,47 @@ $("#w-reset").onclick = async () => {
     buildSliders();
     await api("POST", "/api/config", CFG);
     msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
+    syncRhythmUI();
   } catch (e) { msg(e.message, "err"); }
 };
+
+/* ── 上屏节奏预设（2026-09-06 万句终测定标：W4/W1）── */
+const RHYTHM = {
+  aggressive: {
+    name: "更激进的上屏", early_need: 2,
+    weights: { beam_width: 30000, candidate_limit: 10 },
+  },
+  safe: {
+    name: "更安心的上屏", early_need: 3,
+    weights: { beam_width: 30000, candidate_limit: 10 },
+  },
+};
+function rhythmMatch() {
+  for (const [k, p] of Object.entries(RHYTHM)) {
+    if (CFG.sentence.early_need === p.early_need
+      && CFG.sentence.weights.beam_width === p.weights.beam_width
+      && CFG.sentence.weights.candidate_limit === p.weights.candidate_limit) return k;
+  }
+  return "";
+}
+function syncRhythmUI() {
+  const cur = rhythmMatch();
+  $("#rc-aggressive").classList.toggle("on", cur === "aggressive");
+  $("#rc-safe").classList.toggle("on", cur === "safe");
+  $("#s-rhythm-state").textContent = cur ? RHYTHM[cur].name : "自定义";
+}
+async function applyRhythm(k) {
+  const p = RHYTHM[k];
+  try {
+    CFG.sentence.early_need = p.early_need;
+    Object.assign(CFG.sentence.weights, p.weights);
+    buildSliders(); syncRhythmUI();
+    await api("POST", "/api/config", CFG);
+    msg(`已切换为「${p.name}」并保存生效 ✓`, "ok"); await refreshInfo();
+  } catch (e) { msg(e.message, "err"); }
+}
+$("#rc-aggressive").onclick = () => applyRhythm("aggressive");
+$("#rc-safe").onclick = () => applyRhythm("safe");
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -983,7 +1048,7 @@ async function init() {
   try {
     CFG = await api("GET", "/api/config");
     $("#cfg-raw").value = JSON.stringify(CFG, null, 2);
-    bindInputs(); buildSliders();
+    bindInputs(); buildSliders(); syncRhythmUI();
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
     await loadUserWords();
