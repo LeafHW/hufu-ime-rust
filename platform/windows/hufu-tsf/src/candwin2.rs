@@ -70,25 +70,41 @@ extern "system" fn cand2_wndproc(
     // 消息路径（非 TSF 焦点回调），无死锁面。
     match msg {
         0x201 => {
-            // WM_LBUTTONDOWN：记录拖拽偏移并捕获鼠标
+            // WM_LBUTTONDOWN：记录按下起点（死区内不拖）并捕获鼠标
             crate::tsf::trace("cw2: ldown 到达");
             unsafe {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                let _ = GetWindowRect(hwnd, &mut wr);
-                *CAND_DRAG.lock().unwrap() = Some((pt.x - wr.left, pt.y - wr.top));
+                *CAND_DOWN.lock().unwrap() = Some((pt.x, pt.y));
+                *CAND_DRAG.lock().unwrap() = None;
                 let _ = SetCapture(hwnd);
             }
             return LRESULT(0);
         }
         0x200 => {
-            // WM_MOUSEMOVE：拖拽中随鼠标移动窗口（clamp 虚拟屏幕内）
-            let drag = *CAND_DRAG.lock().unwrap();
-            if let Some((dx, dy)) = drag {
-                unsafe {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
+            // WM_MOUSEMOVE：按下且累计位移超过 4px 死区才激活拖拽；
+            // 拖拽中随鼠标移动窗口（clamp 虚拟屏幕内）
+            unsafe {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                // 死区判定：未激活时距离起点 >4px 才升级为拖拽
+                if CAND_DRAG.lock().unwrap().is_none() {
+                    let down = *CAND_DOWN.lock().unwrap();
+                    match down {
+                        Some((sx, sy)) => {
+                            if (pt.x - sx).abs() <= 4 && (pt.y - sy).abs() <= 4 {
+                                return LRESULT(0);
+                            }
+                        }
+                        None => return LRESULT(0),
+                    }
+                    // 越过死区：此刻激活拖拽（偏移=当前鼠标−窗口原点）
+                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    *CAND_DRAG.lock().unwrap() = Some((pt.x - wr.left, pt.y - wr.top));
+                }
+                let drag = *CAND_DRAG.lock().unwrap();
+                if let Some((dx, dy)) = drag {
                     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
                     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
                     let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -114,12 +130,13 @@ extern "system" fn cand2_wndproc(
             return LRESULT(0);
         }
         0x202 => {
-            // WM_LBUTTONUP：结束拖拽，松手位置交给 show() 作 sticky
-            //（本组段内留在松手处；新组段锚点就绪即恢复跟随——想
-            // 永久固定请右键）
+            // WM_LBUTTONUP：结束拖拽；只有真拖过（越过死区）松手位置才
+            // 交给 show() 作 sticky / 回写 pin——纯单击（抖动在死区内）
+            // 什么都不动（锁定位不被单击固化偏移）。
             unsafe {
                 let _ = ReleaseCapture();
-                if CAND_DRAG.lock().unwrap().is_some() {
+                *CAND_DOWN.lock().unwrap() = None;
+                if CAND_DRAG.lock().unwrap().take().is_some() {
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *CAND_DROP_AT.lock().unwrap() = Some((wr.left, wr.top));
@@ -1966,6 +1983,11 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 
 /// 拖拽状态：(鼠标屏幕位 − 窗口原点) 偏移；None=非拖拽中。
 static CAND_DRAG: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+/// 【点击死区 2026-09-08】左键按下时的鼠标屏幕位（未激活拖拽）。
+/// MOUSEMOVE 累计位移 >4px 才激活 CAND_DRAG——单击的鼠标抖动
+/// （1-2px）不拖窗、松手不回写 pin（用户实测「锁了之后左键点一下
+/// 跳一下/位移一下」：抖动被当拖拽，窗口挪一点还把偏移固化）。
+static CAND_DOWN: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
 /// 候选窗固定位置（窗口原点，屏幕坐标）；None=未固定。
 /// 右键切换：固定后 show() 忽略光标锚点钉在此处，跨组段/上屏保持；
