@@ -120,6 +120,21 @@ fn main() {
             r"E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll".into()
         })
     });
+    // 【--pad 模式 2026-09-08】只按 server 当前皮肤真实渲染一帧并落盘
+    // BMP（%TEMP%\hufu-pad.bmp）——白边/对齐类视觉问题的像素级取证，
+    // 不跑完整冒烟（不注册不切皮肤）。
+    if std::env::args().any(|a| a == "--pad") {
+        let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
+        unsafe {
+            let hmod: HMODULE = LoadLibraryW(PCWSTR(wide.as_ptr())).unwrap();
+            type P = unsafe extern "system" fn() -> i32;
+            let p = GetProcAddress(hmod, PCSTR(b"hufu_test_pad_dump\0".as_ptr())).unwrap();
+            let pd: P = std::mem::transmute(p);
+            let r = pd();
+            println!("pad_dump → {}（%TEMP%\\hufu-pad.bmp）", if r == 1 { "OK" } else { "FAIL" });
+        }
+        return;
+    }
     let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
     unsafe {
         let hmod: HMODULE = LoadLibraryW(PCWSTR(wide.as_ptr())).unwrap();

@@ -140,7 +140,17 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;
-    w.hide();
+    // 【取证模式 2026-09-08】HUFU_PAD_HOLD=<ms>：渲染帧保持显示指定时长
+    // （不立即 hide），供外部截屏做实机白边取证；窗口位置 (100,100)。
+    let hold = std::env::var("HUFU_PAD_HOLD")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if hold > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(hold));
+    } else {
+        w.hide();
+    }
     let Some(px) = px else {
         eprintln!("pad-dump: 回读失败");
         return 0;
