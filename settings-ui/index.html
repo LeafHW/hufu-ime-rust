@@ -553,18 +553,29 @@ function bindInputs() {
 }
 
 /* ── 整句权重滑杆 ── */
-/* 第 6 项 "sentence" = 直接挂 sentence 段（如 early_need），其余挂 weights */
+/* 第 6 项 "sentence" = 直接挂 sentence 段（如 early_need），其余挂 weights；
+   第 7 项 = 悬停说明（数值方向对效果的影响） */
 const WDEFS = [
-  ["beam_width", "Beam 宽度", 10, 32000, 100],
-  ["early_need", "上屏确认键数", 1, 4, 1, "sentence"],
-  ["rank_penalty", "名次惩罚", 0, 1, 0.005],
-  ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
-  ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
-  ["isolation_threshold", "生僻字频阈值", 100, 21000, 100],
-  ["confidence", "提前上屏置信", 0.5, 1, 0.001],
-  ["supplement_baseline", "语料奖励基准", 0, 20, 0.1],
-  ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
-  ["supplement_maximum", "语料奖励上限", 1, 30, 0.5],
+  ["beam_width", "组句思考广度", 10, 32000, 100, null,
+    "数值越大，输入法「想得越多」：自动上屏越多越准，但越吃性能（束宽）"],
+  ["early_need", "上屏确认键数", 1, 4, 1, "sentence",
+    "连续几键想法一致才自动出字：2=更快出、3=更稳更成段"],
+  ["rank_penalty", "偏爱常见词程度", 0, 1, 0.005, null,
+    "越大越倾向选大众常用词，越小越敢选冷门词（名次惩罚）"],
+  ["emitted_character_reward", "鼓励多出字力度", 0, 8, 0.05, null,
+    "越大越倾向一次多出几个字（出字奖励）"],
+  ["isolation_lambda", "少用生僻字力度", 0, 20, 0.1, null,
+    "越大越避免夹进少见字（孤立生僻惩罚）"],
+  ["isolation_threshold", "生僻字认定标准", 100, 21000, 100, null,
+    "字的使用频率低于此值就当作生僻字处理：值越高，越多字被当生僻（字频阈值）"],
+  ["confidence", "自动出字把握要求", 0.5, 1, 0.001, null,
+    "要多有把握才提前上屏：越高越谨慎（提前上屏置信）"],
+  ["supplement_baseline", "常用词加分底数", 0, 20, 0.1, null,
+    "日常高频词的基础加分（语料奖励基准）"],
+  ["supplement_scale", "常用词加分力度", 0, 8, 0.1, null,
+    "高频词按日常使用频率加分的强度（语料奖励缩放）"],
+  ["supplement_maximum", "常用词加分封顶", 1, 30, 0.5, null,
+    "单个词最多能加多少分（语料奖励上限）"],
 ];
 /* 出厂调校值（v1.4.6 万句基准定标）：恢复初始值按钮用 */
 const W_DEFAULTS = {
@@ -577,8 +588,9 @@ function buildSliders() {
   WDEFS.forEach((def) => {
     const [k, name, min, max, step] = def;
     const sec = def[5] === "sentence" ? CFG.sentence : CFG.sentence.weights;
+    const tip = def[6] ? ` title="${def[6]}"` : "";
     const f = document.createElement("div"); f.className = "field";
-    f.innerHTML = `<label>${name} <span class="val" id="wv-${k}"></span></label>
+    f.innerHTML = `<label${tip}>${name} <span class="val" id="wv-${k}"></span></label>
       <input type="range" id="ws-${k}" min="${min}" max="${max}" step="${step}">`;
     box.appendChild(f);
     const s = f.querySelector("input"), v = f.querySelector(".val");
