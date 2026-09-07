@@ -947,8 +947,10 @@ impl CandidateWindowV2 {
                 }
             };
             let (width, text_x, cmt_x, cmt_w) = if horizontal {
-                // 横排内容自适应：Σ(标签+文本+注释+间隔)，下限 min_width
-                //（weasel 语义：横排同样尊重 min_width），上限 w_cap
+                // 横排内容自适应：Σ(标签+文本+注释+间隔)，上限 w_cap。
+                // 【撤销 min_width 下限 2026-09-08】用户实测「最低宽度
+                // 受限」——虎码横排候选少时窄窗更精致，min_width(150)
+                // 让窗窄不下去；weasel 语义此处不适用，恢复纯自适应。
                 let mut w = rm_x * 2.0;
                 if raw_w > 0.0 {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
@@ -959,7 +961,7 @@ impl CandidateWindowV2 {
                     }
                     w += iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 };
                 }
-                let w_full = w.max(min_width).max(raw_w + rm_x * 2.0);
+                let w_full = w.max(raw_w + rm_x * 2.0);
                 // 【超屏修复】横排宽度封顶：工作区宽 − 余量。超屏时注释
                 // 预算按剩余空间等比压缩（不足 12px 整列不显示），逐条
                 // 截断加 …；格子推进宽同步收缩，尾部候选不再溢出重叠。
