@@ -15,6 +15,22 @@ struct RerankJob {
     cands: Vec<String>,
 }
 
+/// 嵌入的官方皮肤（编译期打包，数据目录损坏/清空也能恢复全套）
+/// 【用户定稿】保留 4 款定稿 + 5 款新配色（青瓷/暮山紫/沧海/柿柚/松烟）
+/// 【2026-09-08 模块级】供 install_official_skins（缺失自愈）与
+/// reset_official_skin（按皮肤恢复出厂）共用。
+const OFFICIAL_SKINS: &[(&str, &str)] = &[
+    ("hufu-default.json", include_str!("../official-skins/hufu-default.json")),
+    ("hufu-yingxiong.json", include_str!("../official-skins/hufu-yingxiong.json")),
+    ("hufu-rongyan.json", include_str!("../official-skins/hufu-rongyan.json")),
+    ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
+    ("hufu-qingci.json", include_str!("../official-skins/hufu-qingci.json")),
+    ("hufu-mushan.json", include_str!("../official-skins/hufu-mushan.json")),
+    ("hufu-canghai.json", include_str!("../official-skins/hufu-canghai.json")),
+    ("hufu-shiyou.json", include_str!("../official-skins/hufu-shiyou.json")),
+    ("hufu-songyan.json", include_str!("../official-skins/hufu-songyan.json")),
+];
+
 pub struct Host {
     pub engine: Engine,
     pub session: Session,
@@ -69,22 +85,9 @@ impl Host {
     /// 官方皮肤自愈落盘：内嵌皮肤（official-skins/，随 git 与二进制分发）
     /// 缺失时写入数据目录 skins/。已存在的不覆盖——用户在设置页的定制优先。
     fn install_official_skins(&mut self) {
-        /// 嵌入的官方皮肤（编译期打包，数据目录损坏/清空也能恢复全套）
-        /// 【用户定稿】保留 4 款定稿 + 5 款新配色（青瓷/暮山紫/沧海/柿柚/松烟）
-        const OFFICIAL: &[(&str, &str)] = &[
-            ("hufu-default.json", include_str!("../official-skins/hufu-default.json")),
-            ("hufu-yingxiong.json", include_str!("../official-skins/hufu-yingxiong.json")),
-            ("hufu-rongyan.json", include_str!("../official-skins/hufu-rongyan.json")),
-            ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
-            ("hufu-qingci.json", include_str!("../official-skins/hufu-qingci.json")),
-            ("hufu-mushan.json", include_str!("../official-skins/hufu-mushan.json")),
-            ("hufu-canghai.json", include_str!("../official-skins/hufu-canghai.json")),
-            ("hufu-shiyou.json", include_str!("../official-skins/hufu-shiyou.json")),
-            ("hufu-songyan.json", include_str!("../official-skins/hufu-songyan.json")),
-        ];
         let dir = self.skins_dir();
         let _ = std::fs::create_dir_all(&dir);
-        for (file, body) in OFFICIAL {
+        for (file, body) in OFFICIAL_SKINS {
             let p = dir.join(file);
             if !p.exists() {
                 if let Err(e) = std::fs::write(&p, body) {
@@ -104,6 +107,19 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// 【每皮肤恢复默认 2026-09-08】官方皮肤按 id 恢复出厂：内嵌
+    /// official-skins 版本整文件写回（各皮肤保留各自出厂配色/布局/
+    /// 材质——此前 UI「恢复默认值」用统一出厂常量会把所有皮肤抹成
+    /// 同一套，用户实测反馈后改此语义）。非官方 id（用户自建）返回
+    /// None，由调用方回退统一默认。
+    pub fn reset_official_skin(&self, id: &str) -> Option<hufu_skin::Skin> {
+        let file = format!("{id}.json");
+        let (_, body) = OFFICIAL_SKINS.iter().find(|(f, _)| *f == file)?;
+        let p = self.skins_dir().join(&file);
+        std::fs::write(&p, body).ok()?;
+        hufu_skin::Skin::load(&p).ok()
     }
 
     /// 后台加载整句模型的「装载计划」：快照判定条件与所需所有权
