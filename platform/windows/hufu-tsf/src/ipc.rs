@@ -197,7 +197,53 @@ fn ensure_server() -> bool {
     false
 }
 
-/// 单次请求（每次新建连接；本地管道往返 <100µs）。
+/// 【持久连接 2026-09-08】进程级管道复用：此前每请求新建连接（每键
+/// + 每 40ms poll=每秒 30+ 连接），server 每连接 spawn 线程——线程
+/// 创建风暴（系统采样 ±7 线程/秒）+ 偶发系统抖动下 accept 排队 =
+/// 300ms 尾延迟（02:40:33/45 两卡顿实锤：dispatch→pipe back 330-
+/// 353ms 而 server CPU 仅 4%）。server 端 serve_conn 本就是「单连接
+/// 循环处理」+ PIPE_UNLIMITED_INSTANCES——客户端持久连接零改动即用。
+/// 串行化（跨线程请求在锁上排队）无损：server dispatch 本就持全局
+/// 锁串行。断线/写失败/读超时弃连接重连一次（防响应错位）。
+static PIPE_CONN: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// 建立新连接（含 server 缺席拉起逻辑——与旧版一致）。
+unsafe fn connect_pipe() -> Option<std::fs::File> {
+    let name: Vec<u16> = PIPE.encode_utf16().chain([0]).collect();
+    let mut tries = 0u32;
+    let mut wait_ms: u32 = 150;
+    let mut max_tries: u32 = 2;
+    let mut spawned = false;
+    loop {
+        let h = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if h != INVALID {
+            return Some(std::fs::File::from_raw_handle(h as RawHandle));
+        }
+        LAST_PIPE_ERR.store(unsafe { GetLastError() }, std::sync::atomic::Ordering::SeqCst);
+        // 打不开：server 不在则拉起（首遇给足启动时间）
+        if !spawned {
+            spawned = true;
+            if ensure_server() {
+                wait_ms = 1000;
+                max_tries = 3;
+            }
+        }
+        if WaitNamedPipeW(name.as_ptr(), wait_ms) == 0 || tries >= max_tries {
+            return None;
+        }
+        tries += 1;
+    }
+}
+
+/// 单次请求（持久连接复用）。
 /// 【等待策略】server 缺席时的阻塞上限（02:04 全机卡死事故根因）：
 /// - 本进程首次发现缺席：拉起 server 并给足启动等待（3×1000ms，
 ///   仅每进程一次）
@@ -205,95 +251,89 @@ fn ensure_server() -> bool {
 ///   每一次按键拖进秒级等待，宁可这一帧走降级路径
 pub fn call(req: &Value) -> Option<Value> {
     unsafe {
-        let name: Vec<u16> = PIPE.encode_utf16().chain([0]).collect();
-        let mut h;
-        let mut tries = 0u32;
-        let mut wait_ms: u32 = 150;
-        let mut max_tries: u32 = 2;
-        let mut spawned = false;
-        loop {
-            h = CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                0,
-            );
-            if h != INVALID {
-                break;
-            }
-            LAST_PIPE_ERR.store(unsafe { GetLastError() }, std::sync::atomic::Ordering::SeqCst);
-            // 打不开：server 不在则拉起（首遇给足启动时间）
-            if !spawned {
-                spawned = true;
-                if ensure_server() {
-                    wait_ms = 1000;
-                    max_tries = 3;
-                }
-            }
-            if WaitNamedPipeW(name.as_ptr(), wait_ms) == 0 || tries >= max_tries {
-                return None;
-            }
-            tries += 1;
-        }
-        let mut f = std::fs::File::from_raw_handle(h as RawHandle);
+        let mut g = PIPE_CONN.lock().unwrap_or_else(|p| p.into_inner());
         let body = serde_json::to_vec(req).ok()?;
         let mut frame = (body.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(&body);
-        if f.write_all(&frame).is_err() {
-            return None;
-        }
-        // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
-        // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
-        // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
-        // 响应」事故）。PeekNamedPipe 轮询，硬上限 2 秒，超时走降级。
-        let raw_pipe = f.as_raw_handle() as isize;
-        let wait_response = |total_ms: u64| -> Option<()> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
-            // 【响应等待分级】server 处理一次 key 通常 <3ms：先自旋让快
-            // 响应零等待，再让步、再 1ms/10ms 粒度递进。旧版上来就
-            // sleep(10ms)——每键白交 10ms 量子税，真实打字延迟的大头。
-            let start = std::time::Instant::now();
-            loop {
-                let mut avail: u32 = 0;
-                if PeekNamedPipe(raw_pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0 {
-                    if avail > 0 {
-                        return Some(());
-                    }
-                } else {
-                    return None; // 管道断（server 退出）
-                }
-                if std::time::Instant::now() >= deadline {
+        for _attempt in 0..2 {
+            if g.is_none() {
+                *g = connect_pipe();
+                if g.is_none() {
                     return None;
                 }
-                let el = start.elapsed();
-                if el.as_micros() < 600 {
-                    for _ in 0..32 {
-                        std::hint::spin_loop();
-                    }
-                } else if el.as_millis() < 4 {
-                    std::thread::yield_now();
-                } else if el.as_millis() < 20 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
             }
-        };
-        wait_response(2000)?;
-        let mut head = [0u8; 4];
-        f.read_exact(&mut head).ok()?;
-        let len = u32::from_le_bytes(head) as usize;
-        if len == 0 || len > (1 << 20) {
-            return None;
+            let f = g.as_mut().unwrap();
+            // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
+            // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
+            // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
+            // 响应」事故）。PeekNamedPipe 轮询，硬上限 2 秒，超时走降级。
+            let raw_pipe = f.as_raw_handle() as isize;
+            let wait_response = |total_ms: u64| -> Option<()> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+                // 【响应等待分级】server 处理一次 key 通常 <3ms：先自旋让快
+                // 响应零等待，再让步、再 1ms/10ms 粒度递进。旧版上来就
+                // sleep(10ms)——每键白交 10ms 量子税，真实打字延迟的大头。
+                let start = std::time::Instant::now();
+                loop {
+                    let mut avail: u32 = 0;
+                    if PeekNamedPipe(raw_pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0 {
+                        if avail > 0 {
+                            return Some(());
+                        }
+                    } else {
+                        return None; // 管道断（server 退出）
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    let el = start.elapsed();
+                    if el.as_micros() < 600 {
+                        for _ in 0..32 {
+                            std::hint::spin_loop();
+                        }
+                    } else if el.as_millis() < 4 {
+                        std::thread::yield_now();
+                    } else if el.as_millis() < 20 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            };
+            if f.write_all(&frame).is_err() {
+                // 断线：弃连接重试一次
+                *g = None;
+                continue;
+            }
+            if wait_response(2000).is_none() {
+                // 超时/断线：弃连接（防响应错位）走降级
+                *g = None;
+                return None;
+            }
+            let mut head = [0u8; 4];
+            let read_head = (&*f).read_exact(&mut head);
+            if read_head.is_err() {
+                *g = None;
+                continue;
+            }
+            let len = u32::from_le_bytes(head) as usize;
+            if len == 0 || len > (1 << 20) {
+                *g = None;
+                return None;
+            }
+            // body 可能分片到达：头 4 字节已到不代表全帧已到
+            if wait_response(1000).is_none() {
+                *g = None;
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            if (&*f).read_exact(&mut buf).is_err() {
+                *g = None;
+                continue;
+            }
+            return serde_json::from_slice(&buf).ok();
         }
-        // body 可能分片到达：头 4 字节已到不代表全帧已到
-        wait_response(1000)?;
-        let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf).ok()?;
-        serde_json::from_slice(&buf).ok()
+        None
     }
 }
 
