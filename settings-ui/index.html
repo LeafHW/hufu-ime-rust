@@ -595,9 +595,27 @@ function buildSliders() {
     box.appendChild(f);
     const s = f.querySelector("input"), v = f.querySelector(".val");
     const sync = () => { v.textContent = sec[k]; s.value = sec[k]; };
-    s.oninput = () => { sec[k] = parseFloat(s.value); v.textContent = s.value; };
+    s.oninput = () => {
+      sec[k] = parseFloat(s.value); v.textContent = s.value;
+      scheduleWeightAutoSave();
+    };
     sync();
   });
+}
+/* 【2026-09-06 实时生效】滑杆拖动防抖 600ms 自动保存：server 端
+   apply_config 热重载组句器实测 ~360ms（ngram 页缓存热），拖完停下
+   半秒即生效，无需再点「保存并应用」。连续拖动自动合并为一次。 */
+let _wSaveTimer = null;
+function scheduleWeightAutoSave() {
+  clearTimeout(_wSaveTimer);
+  msg("调整中…松手即自动生效", "");
+  _wSaveTimer = setTimeout(async () => {
+    try {
+      await api("POST", "/api/config", CFG);
+      syncRhythmUI();
+      msg("已实时生效 ✓（自动保存）", "ok");
+    } catch (e) { msg("自动保存失败：" + e.message, "err"); }
+  }, 600);
 }
 /* 恢复初始值：权重一键还原出厂调校值 + 自动保存应用 */
 $("#w-reset").onclick = async () => {
