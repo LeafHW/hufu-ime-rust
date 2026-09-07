@@ -74,10 +74,19 @@ const INC_REDO_TAIL: usize = 8;
 const INC_MAX_DELTA: usize = 3;
 /// 【增量尾窗束宽 2026-09-08】beam30000「质量+不卡」两全的钥匙：
 /// 增量重算只覆盖尾部 ≤12 键（REDO_TAIL+回退），前部 30000 束的
-/// 路径多样性已锁定在复用桶中——尾段组合空间小，重算用 6000 束
-/// 足够承载（全束只付在首键/缓存失效的全量重建上）。束宽 30000
-/// 下连打稳态 = 首键全量（长）+后续每键 6000×12 键尾窗（快）。
-const INC_TAIL_BEAM: usize = 6000;
+/// 路径多样性已锁定在复用桶中——尾段组合空间小，重算用小束
+/// 承载。实测每键成本主要由尾窗束宽决定（尾窗 6000 对 beam≤6000
+/// 无减负，6000 依然卡）——默认 1500，HUFU_INC_TAIL env 可调
+/// （参数扫描用）。
+fn inc_tail_beam() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HUFU_INC_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000)
+    })
+}
 /// 每段参与组句的码表词条上限（rank 截断）：虎码同码词呈长尾分布，
 /// rank>8 的系统词极生僻，beam 展开却为每词条付一次 String clone。
 const SEG_RANK_LIMIT: usize = 8;
@@ -519,9 +528,13 @@ impl SentenceEngine {
             // avg 49→24ms、p95 102→38ms、exact 90% 持平）
             (w.beam_width / 16).max(100).min(w.beam_width)
         };
-        // 【增量尾窗束宽】见 INC_TAIL_BEAM 注释：增量重算只算尾部
-        // ≤12 键，6000 束承载尾段组合；全束质量保留在前部复用桶。
-        let beam = if is_resume { beam.min(INC_TAIL_BEAM) } else { beam };
+        // 【增量尾窗束宽】见 inc_tail_beam() 注释：增量重算只算尾部
+        // ≤12 键，小束承载尾段组合；全束质量保留在前部复用桶。
+        let beam = if is_resume {
+            beam.min(inc_tail_beam())
+        } else {
+            beam
+        };
         // 【性能 2026-09-08】env 读取移出循环：Windows 上 env::var 走
         // 进程环境块+内部锁，原先在 beam 循环体内每位置读一次，48 码
         // 句每次解码白读 48 次（审计报告 E-3）。OnceLock 一次定型。
@@ -809,9 +822,20 @@ impl SentenceEngine {
             .map(|(p_raw, buckets)| {
                 let old_base_len = buckets.len().saturating_sub(1);
                 let delta = new_base_len as isize - old_base_len as isize;
-                raw.starts_with(p_raw.as_str())
-                    && (1..=INC_MAX_DELTA as isize).contains(&delta)
-                    && old_base_len >= INC_MIN_PREFIX
+                if !raw.starts_with(p_raw.as_str()) || old_base_len < INC_MIN_PREFIX {
+                    return false;
+                }
+                // 情形A（常规追加）：base 增长 1-3。
+                if (1..=INC_MAX_DELTA as isize).contains(&delta) {
+                    return true;
+                }
+                // 情形B（选重锁追加 2026-09-08）：raw 追加了 ≤4 字符而
+                // base 没长 = 纯锁后缀（选重 ;' 数字）。锁字符不进 base
+                //（桶结构不变），锁影响的段选择发生在尾部——重算区
+                //（REDO_TAIL+4 回退）覆盖尾部锁位置，增量安全。跟打选重
+                // 密集场景原本每选重一次 30000 全量重建（实测曲线
+                // 52→501ms 爬升=「感觉又卡回去」的主源）。
+                delta == 0 && raw.len() - p_raw.len() <= 4
             })
             .unwrap_or(false);
         let resume = if can {
