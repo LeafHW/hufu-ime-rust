@@ -777,10 +777,9 @@ impl CandidateWindowV2 {
                         .and_then(|x| x.as_str())
                         .and_then(parse_hex);
                     let (tr, tg, tb, ta) = match tint_v {
-                        // tint alpha 是自绘时代语义（bg 上叠毛玻璃层），
-                        // acrylic 直接整层染色——乘 0.55 调到验证过的
-                        // 45% 观感（80% 原值=用户实测「大色块」几乎不透明）
-                        Some([r, g, b, a]) => (r, g, b, ((a as f32 * 0.55) as u8).min(200)),
+                        // tint alpha=染色浓度（设置页「毛玻璃染色」控件，
+                        // UI 值即真值；缺省回退 back_color+45%）
+                        Some([r, g, b, a]) => (r, g, b, a),
                         None => {
                             let back = color_f(skin, "back_color", "#202022E6");
                             (
@@ -2402,27 +2401,36 @@ impl CandidateWindowV2 {
                     IsWindowVisible(self.hwnd).0
                 ));
             }
-            // 【毛玻璃 v3·圆角 RGN】acrylic 盖整窗矩形（方角），圆角
-            // 窗体四角会露方角色块。SetWindowRgn 圆角区域同步窗口尺寸
-            //（DWM 按区域裁剪=accent 同被裁）；非 glass 清除区域恢复矩形。
-            if kind == "glass" {
-                unsafe {
-                    let rr = (radius * dpi_scale).max(1.0) as i32;
-                    let rgn = CreateRoundRectRgn(
-                        0,
-                        0,
-                        (w_out + 1) as i32,
-                        (h_out + 1) as i32,
-                        rr,
-                        rr,
+            // 【毛玻璃 v3.2·DWM 圆角】SetWindowRgn 裁不了 accent（DWM
+            // backdrop 层，用户实测仍直角）。改 DWMWA_WINDOW_CORNER_
+            // PREFERENCE=33（Win11 官方合成级圆角——整个窗口视觉含
+            // accent 一起圆角化）。glass=ROUND(2)；非 glass=DONOTROUND(1)。
+            // 动态加载（同 DwmGetWindowAttribute 模式）。系统半径固定~8px。
+            unsafe {
+                let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                    windows::core::w!("dwmapi.dll"),
+                );
+                if let Ok(m) = m {
+                    let p = windows::Win32::System::LibraryLoader::GetProcAddress(
+                        m,
+                        windows::core::s!("DwmSetWindowAttribute"),
                     );
-                    if !rgn.is_invalid() {
-                        let _ = SetWindowRgn(self.hwnd, rgn, true);
+                    if let Some(p) = p {
+                        type DwmaSet = unsafe extern "system" fn(
+                            HWND,
+                            u32,
+                            *const core::ffi::c_void,
+                            u32,
+                        ) -> windows::core::HRESULT;
+                        let f: DwmaSet = std::mem::transmute(p);
+                        let pref: u32 = if kind == "glass" { 2 } else { 1 };
+                        let _ = f(
+                            self.hwnd,
+                            33, // DWMWA_WINDOW_CORNER_PREFERENCE
+                            &pref as *const u32 as *const core::ffi::c_void,
+                            4,
+                        );
                     }
-                }
-            } else {
-                unsafe {
-                    let _ = SetWindowRgn(self.hwnd, HRGN(std::ptr::null_mut()), true);
                 }
             }
             // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
