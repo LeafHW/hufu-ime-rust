@@ -253,6 +253,9 @@ mod once_bool {
 
 const ACCENT_DISABLED: u32 = 0;
 const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
+/// 【v3.9】轻模糊档：BLURBEHIND=Win10 时代模糊，比 ACRYLIC（重度
+/// 噪声模糊）明显轻——系统模糊强度无法连续调节，滑杆用三档离散。
+const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 const ACCENT_ENABLE_HOSTBACKDROP: u32 = 6;
 const WCA_ACCENT_POLICY: u32 = 19;
@@ -784,8 +787,14 @@ impl CandidateWindowV2 {
             let state: u32 = if !want_acrylic {
                 ACCENT_DISABLED
             } else if blur_v <= 0.0 {
+                // 0=无模糊纯透明
                 ACCENT_ENABLE_TRANSPARENTGRADIENT
+            } else if blur_v <= 50.0 {
+                // 1-50=轻模糊（BLURBEHIND，模糊度较低——用户实测
+                // ACRYLIC「模糊度有点高」）
+                ACCENT_ENABLE_BLURBEHIND
             } else {
+                // 51-100=重模糊（ACRYLIC）
                 ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
             // 染色=tint RGBA（无 tint 时深灰 50% 兜底）
