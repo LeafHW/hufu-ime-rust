@@ -2530,14 +2530,21 @@ impl CandidateWindowV2 {
                                 &nc as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
-                            // 【修「白色边框」】DWM 还会画主题色 1px 窗口
-                            // 边框线（浅色主题=白线，NC 关闭后更明显）——
-                            // DWMWA_BORDER_COLOR=0xFFFFFFFE（NONE）显式去掉。
-                            let none_border: u32 = 0xFFFFFFFE;
+                            // 【修「四角白线」】BORDER_COLOR=NONE 时 DWM
+                            // ROUND 圆角 AA 过渡带=半透明玻璃边与亮桌面
+                            // 混合=角上 2-3px 亮线（实测角(2,2)=#B8 vs 中
+                            // 心#73）。改设不透明深色边线（取 tint 基色，
+                            // COLORREF=0x00BBGGRR 布局）——深色 1px 在深
+                            // 玻璃上不可见，且盖住 AA 白线。
+                            let border_col: u32 = if let Some([br, bg2, bb2, _]) = tint_hex {
+                                ((bb2 as u32) << 16) | ((bg2 as u32) << 8) | (br as u32)
+                            } else {
+                                0x001E1C1C // 深灰兜底（#1C1C1E）
+                            };
                             let _ = f(
                                 self.hwnd,
                                 34, // DWMWA_BORDER_COLOR
-                                &none_border as *const u32 as *const core::ffi::c_void,
+                                &border_col as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
                         }
