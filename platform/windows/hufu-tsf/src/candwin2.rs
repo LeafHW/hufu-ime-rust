@@ -600,8 +600,21 @@ unsafe fn capture_duplication_bgra(x: i32, y: i32, w: u32, h: u32) -> Option<Vec
                 tex
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                // 静止：同位置同尺寸直接复用缓存
-                return s.cache.clone().filter(|((cx, cy, cw, ch), _)| *cx == x && *cy == y && *cw == w && *ch == h).map(|(_, v)| v);
+                // 静止：同位置同尺寸直接复用缓存；无匹配缓存（首次/移动）
+                // 阻塞等一帧（17ms=一个合成周期——首次抓屏的窗口出现前
+                // 桌面静止无新帧，超时后必须等）
+                let hit = s.cache.as_ref().is_some_and(|((cx, cy, cw, ch), _)| *cx == x && *cy == y && *cw == w && *ch == h);
+                if hit {
+                    return s.cache.clone().map(|(_, v)| v);
+                }
+                let mut res2: Option<IDXGIResource> = None;
+                let acq2 = s.dup.AcquireNextFrame(17, &mut info, &mut res2 as *mut Option<IDXGIResource> as *mut _);
+                if acq2.is_err() {
+                    return None;
+                }
+                let res = res2?;
+                let tex: ID3D11Texture2D = res.cast().ok()?;
+                tex
             }
             Err(_) => {
                 *g = None; // 设备丢失/访问丢失：下次重建
@@ -638,6 +651,77 @@ unsafe fn capture_duplication_bgra(x: i32, y: i32, w: u32, h: u32) -> Option<Vec
         }
         s.cache = Some(((x, y, w, h), out.clone()));
         Some(out)
+    }
+}
+
+// 【v4 CPU 盒式模糊】3 轮 box blur≈高斯。可分离：每轮水平+垂直。
+// 中心窗口 [x-r, x+r] clamp 到边界，增量进出（每元素进出各一次，
+// 绝无 u32 下溢——初版 saturating_sub 卡 0 重复减首元素导致全黑）。
+fn box_blur_bgra(px: &mut [u8], w: usize, h: usize, radius: usize) {
+    if radius == 0 || w < 2 || h < 2 || px.len() < w * h * 4 {
+        return;
+    }
+    let r = radius.min((w.max(h) / 2).saturating_sub(1)).max(1);
+    let mut tmp = vec![0u8; px.len()];
+    let mut acc = [0u32; 4];
+    for _round in 0..3 {
+        // 水平：行内窗口
+        for y in 0..h {
+            let row = y * w * 4;
+            for c in 0..4 {
+                acc[c] = 0;
+            }
+            let mut l = 0usize;
+            let mut rr = 0usize;
+            for x in 0..w {
+                let nl = x.saturating_sub(r);
+                let nr = (x + r).min(w - 1);
+                while rr < nr {
+                    rr += 1;
+                    for c in 0..4 {
+                        acc[c] += px[row + rr * 4 + c] as u32;
+                    }
+                }
+                while l < nl {
+                    for c in 0..4 {
+                        acc[c] -= px[row + l * 4 + c] as u32;
+                    }
+                    l += 1;
+                }
+                let cnt = (rr - l + 1) as u32;
+                for c in 0..4 {
+                    tmp[row + x * 4 + c] = (acc[c] / cnt) as u8;
+                }
+            }
+        }
+        // 垂直：列内窗口
+        for x in 0..w {
+            for c in 0..4 {
+                acc[c] = 0;
+            }
+            let mut l = 0usize;
+            let mut rr = 0usize;
+            for y in 0..h {
+                let nl = y.saturating_sub(r);
+                let nr = (y + r).min(h - 1);
+                while rr < nr {
+                    rr += 1;
+                    for c in 0..4 {
+                        acc[c] += tmp[rr * w * 4 + x * 4 + c] as u32;
+                    }
+                }
+                while l < nl {
+                    for c in 0..4 {
+                        acc[c] -= tmp[l * w * 4 + x * 4 + c] as u32;
+                    }
+                    l += 1;
+                }
+                let cnt = (rr - l + 1) as u32;
+                for c in 0..4 {
+                    px[y * w * 4 + x * 4 + c] = (acc[c] / cnt) as u8;
+                }
+            }
+        }
     }
 }
 
@@ -1472,10 +1556,14 @@ impl CandidateWindowV2 {
                     if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
                     let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
                     let g_cached = self.glass_cache.take();
-                    // 原尺寸位图上载（GaussianBlur effect 输入）
+                    // 原尺寸位图上载（模糊在上载前 CPU 完成）
                     let bmp = match &g_cached {
                         Some((k, v)) if *k == g_key => v.clone(),
                         _ => unsafe {
+                            let mut px_own = raw_px.as_ref().clone();
+                            let sigma = (blur_r / 3.0).max(0.2);
+                            let radius = ((sigma * 1.4) as usize).min(64); // σ→box r 经验
+                            box_blur_bgra(&mut px_own, *gw as usize, *gh as usize, radius);
                             let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                                 pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
                                     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -1488,7 +1576,7 @@ impl CandidateWindowV2 {
                             };
                             let r = ctx.CreateBitmap(
                                 D2D_SIZE_U { width: *gw, height: *gh },
-                                Some(raw_px.as_ptr() as *const core::ffi::c_void),
+                                Some(px_own.as_ptr() as *const core::ffi::c_void),
                                 *gw * 4,
                                 &bmp_props,
                             );
@@ -1504,147 +1592,41 @@ impl CandidateWindowV2 {
                         },
                     };
                     glass_cache_out = Some((g_key, bmp.clone()));
-                    if stage == 1 || stage == 2 {
-                        // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
-                        unsafe {
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
-                            });
-                            let full = D2D_RECT_F {
-                                left: 0.0,
-                                top: 0.0,
-                                right: w_out as f32,
-                                bottom: h_out as f32,
-                            };
-                            // 真实抓屏位图全幅直画（最小毛玻璃管线）
-                            let _ = ctx.DrawBitmap(&bmp, Some(&full as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                            crate::tsf::diag_note(&format!(
-                                "v4: stage={stage} DrawBitmap →{w_out}x{h_out}"
-                            ));
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
-                            });
-                        }
-                    } else {
+                    let _ = stage; // stage 分层验证使命完成（Layer 已废）
+                    // 【v4 终版】全窗直画：圆角=窗口 RGN（v3.9 起已设=皮肤
+                    // corner_radius）裁四角，位图铺满全窗（含模糊余量边距
+                    // 区）。【Layer 路径废除】stage 实验证明 Layer 内绘制不
+                    // 显示（stage1 无 Layer 全幅直画能显示）。
                     unsafe {
-                        // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
-                        let mask = ctx
-                            .GetFactory()
-                            .ok()
-                            .and_then(|f| {
-                                f.CreateRoundedRectangleGeometry(
-                                    &D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F {
-                                            left: shadow_m * dpi_scale,
-                                            top: shadow_m * dpi_scale,
-                                            right: (shadow_m + width) * dpi_scale,
-                                            bottom: (shadow_m + height) * dpi_scale,
-                                        },
-                                        radiusX: radius * dpi_scale,
-                                        radiusY: radius * dpi_scale,
-                                    },
-                                )
-                                .ok()
-                            });
-                        if let Some(mask) = mask {
-                            if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
-                                    // 【根因修复 2026-09-08】PushLayer 的 mask
-                                    // 按当时 transform 解释——此前在 Push 后才切
-                                    // identity，mask（物理坐标）被 dpi 主变换二
-                                    // 次缩放跑出窗外→层内所有绘制全被裁掉
-                                    //（红色裁决实测：层没画、窗口半透明穿透）。
-                                    // 正序：先切 identity 再 Push。
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
-                                    lp.contentBounds = D2D_RECT_F {
-                                        left: -1.0e6,
-                                        top: -1.0e6,
-                                        right: 1.0e6,
-                                        bottom: 1.0e6,
-                                    };
-                                    lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
-                                    lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                                    // 【终极根因 2026-09-08】default() 的 maskTransform
-                                    // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
-                                    // 一点，Layer 内一切绘制全被裁掉（对照阴影段
-                                    // push_shadow_mask 显式设 identity 才正常显示）。
-                                    lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    };
-                                    ctx.PushLayer(&lp, None);
-                                    let dst = D2D_RECT_F {
-                                        left: shadow_m * dpi_scale,
-                                        top: shadow_m * dpi_scale,
-                                        right: (shadow_m + width) * dpi_scale,
-                                        bottom: (shadow_m + height) * dpi_scale,
-                                    };
-                                    // 【v4 主路径】GaussianBlur effect（σ=blur/3 连续）
-                                    let sigma = (blur_r / 3.0).max(0.2);
-                                    let eff_ok = (|| -> Option<()> {
-                                        if blur_r <= 0.0 {
-                                            return None; // 0=无模糊直画兜底
-                                        }
-                                        let effect = ctx.CreateEffect(&CLSID_D2D1GaussianBlur).ok()?;
-                                        let _ = effect.SetValue(
-                                            0, // STANDARDDEVIATION
-                                            D2D1_PROPERTY_TYPE_FLOAT,
-                                            &sigma.to_ne_bytes(),
-                                        );
-                                        let bmp_img: ID2D1Image = bmp.cast().ok()?;
-                                        effect.SetInput(0, &bmp_img, true);
-                                        let eff_img: ID2D1Image = effect.cast().ok()?;
-                                        ctx.DrawImage(
-                                            &eff_img,
-                                            Some(&D2D_POINT_2F { x: dst.left, y: dst.top } as *const _),
-                                            None,
-                                            D2D1_INTERPOLATION_MODE_LINEAR,
-                                            D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                                        );
-                                        Some(())
-                                    })();
-                                    if eff_ok.is_none() {
-                                        // 兜底：原尺寸直画（blur=0 或 effect 失败）
-                                        let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                                    }
-                                    // 【v4 tint 染色层】模糊之上叠皮肤染色（极简：
-                                    // 模糊+染色，无面板/边框）
-                                    if let Some([tr2, tg2, tb2, ta2]) = tint_hex {
-                                        let tc = D2D1_COLOR_F {
-                                            r: tr2 as f32 / 255.0,
-                                            g: tg2 as f32 / 255.0,
-                                            b: tb2 as f32 / 255.0,
-                                            a: ta2 as f32 / 255.0,
-                                        };
-                                        if let Ok(tb2b) = ctx.CreateSolidColorBrush(&tc, None) {
-                                            ctx.FillRectangle(&dst, &tb2b);
-                                        }
-                                    }
-                                    // 恢复渲染主变换（dpi 缩放）
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: dpi_scale,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: dpi_scale,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    ctx.PopLayer();
+                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                            M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
+                        });
+                        let dst = D2D_RECT_F {
+                            left: 0.0,
+                            top: 0.0,
+                            right: w_out as f32,
+                            bottom: h_out as f32,
+                        };
+                        // 模糊已在位图上载前 CPU 完成（box_blur_bgra），直画
+                        let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                        // 【v4 tint 染色层】模糊之上叠皮肤染色（极简：
+                        // 模糊+染色，无面板/边框）
+                        if let Some([tr2, tg2, tb2, ta2]) = tint_hex {
+                            let tc = D2D1_COLOR_F {
+                                r: tr2 as f32 / 255.0,
+                                g: tg2 as f32 / 255.0,
+                                b: tb2 as f32 / 255.0,
+                                a: ta2 as f32 / 255.0,
+                            };
+                            if let Ok(tb2b) = ctx.CreateSolidColorBrush(&tc, None) {
+                                ctx.FillRectangle(&dst, &tb2b);
                             }
                         }
+                        // 恢复渲染主变换（dpi 缩放）
+                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                            M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
+                        });
                     }
-                    } // else Layer 路径（stage 0/3+）
                     }
                 }
             }
