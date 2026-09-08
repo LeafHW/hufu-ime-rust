@@ -2398,7 +2398,10 @@ impl CandidateWindowV2 {
                     y - (shadow_m * dpi_scale) as i32,
                     w_out,
                     h_out,
-                    (radius * dpi_scale).max(0.0) as u32,
+                    // SDF 圆角=min(皮肤,8)：必须 ≤DWM 圆角(8)——SDF 无影
+                    // 区才能盖住 DWM 裁角区（角上 8px）；浓度等其他参数
+                    // 已按用户要求恢复原值（v3.5.3）。
+                    (radius.min(8.0) * dpi_scale).max(0.0) as u32,
                     shadow_radius * dpi_scale,
                     (shadow_off_x * dpi_scale) as i32,
                     (shadow_off_y * dpi_scale) as i32,
