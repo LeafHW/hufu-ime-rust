@@ -481,9 +481,8 @@ unsafe fn push_shadow_mask(
 /// 【毛玻璃抓屏 2026-09-08】BitBlt 抓屏幕矩形（物理像素）为 BGRA 字节。
 /// 调用时机=SetWindowPos 之前（窗口未画到新位置，抓到干净底）。
 /// GDI BitBlt 300×150 亚毫秒级，无需权限（区别于 Graphics.Capture）。
-/// DIB 32bpp top-down：GDI 字节序 BGRA，与 D2D CreateBitmap 的
-/// DXGI_FORMAT_B8G8R8A8_UNORM + 预乘 alpha 直接兼容（屏幕像素不透明
-/// alpha=255，预乘=自身，无须转换）。
+/// DIB 32bpp top-down：GDI 字节序 BGRA；alpha 通道 BitBlt 不写（内容
+/// 未定义，实测全 0）——函数内强制置 255（见【终极根因】注释）。
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
@@ -530,7 +529,14 @@ unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>>
     );
     let _ = SelectObject(memdc, old);
     let out = if ok.is_ok() {
-        let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+        let mut px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+        // 【终极根因 2026-09-08】GDI BitBlt 不写 alpha 通道（内容未定义，
+        // 实测全 0）——PREMULTIPLIED 模式下 alpha=0=完全透明，毛玻璃层
+        // 画的是全透明位图（红裁决能显示、模糊层不可见的真凶）。
+        // 屏幕内容恒不透明：置 255。
+        for i in (3..px.len()).step_by(4) {
+            px[i] = 255;
+        }
         Some(px)
     } else {
         None
