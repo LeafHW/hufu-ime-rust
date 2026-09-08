@@ -902,7 +902,7 @@ function bindSkin() {
                        ["spacing",null,24],["candidate_spacing","#l-cs",48],
                        ["hilite_spacing","#l-hsp",16],["hilite_padding","#l-hp",40],
                        ["line_spacing","#l-ls",40],["border_width",null,12],
-                       ["shadow_radius","#l-sr",60],["min_width",null,800]];
+                       ["min_width",null,800]];
           for (const [k, sel, hi] of geo) {
             const nv = Math.round((SKIN.layout[k] || 0) * r * 2) / 2;
             SKIN.layout[k] = Math.min(Math.max(nv, 0), hi);

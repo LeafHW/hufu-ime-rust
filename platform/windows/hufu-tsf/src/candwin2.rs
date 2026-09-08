@@ -1099,7 +1099,14 @@ impl CandidateWindowV2 {
         let h = height as u32;
         // 投影：shadow_radius>0 时窗口四周外扩边距，阴影画在边距里
         //（内容绘制整体平移进边距内，见渲染段 SetTransform）
-        let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 60.0);
+        // 【阴影弱联动 2026-09-08】字号放大时阴影半径按 √比例 放大：
+        // 等比放大（×2.57）会把同样 alpha 的高斯摊到 2.57 倍面积，
+        // 视觉浓度骤降（用户实测「变大后阴影浓度不太够」）。√比例
+        //（×1.6）摊薄减半，浓度观感保留；渲染时计算不落盘，滚轮
+        // 缩放来回不漂移。基准 14.5=hufu-skin 出厂主字号。
+        let _shadow_base = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 60.0);
+        let font_scale = (font_pt / 14.5).clamp(0.5, 3.0);
+        let shadow_radius = (_shadow_base * font_scale.sqrt()).clamp(0.0, 60.0);
         let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
