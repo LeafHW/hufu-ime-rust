@@ -388,7 +388,7 @@ pub struct CandidateWindowV2 {
     pub(crate) dy_cache: Option<((String, f32), f32)>,
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
-    pub(crate) shadow_cache: Option<((u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))>,
+    pub(crate) shadow_cache: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -750,11 +750,34 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_str())
             .unwrap_or("%s.")
             .to_string();
+        // 【序号样式 2026-09-08】label_style：digit（默认）/zh（一二三…）
+        // /roman（Ⅰ Ⅱ Ⅲ…）——%s 的替换字形。第 10 候选在 digit 下仍显
+        // 0（1234567890，与引擎 0=10 选重键一致）；zh/roman 用十/Ⅹ。
+        let label_style: String = skin
+            .pointer("/skin/layout/label_style")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("label_style")))
+            .and_then(|x| x.as_str())
+            .unwrap_or("digit")
+            .to_string();
         let fmt_label = |n: usize| -> String {
-            // 【10 选序号 2026-09-08】第 10 候选显示 0（1234567890，
-            // 与引擎 0=10 选重键一致）；n_show=10 的列宽测量也因此量
-            // 「0.」宽（与「1.」同宽，比「10.」窄）。
-            let d = if n == 10 { 0 } else { n };
+            let d: String = match label_style.as_str() {
+                "zh" => {
+                    const ZH: [&str; 10] = [
+                        "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+                    ];
+                    ZH[(if n == 10 { 10 } else { n }) - 1].to_string()
+                }
+                "roman" => {
+                    const RM: [&str; 10] = [
+                        "Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ",
+                    ];
+                    RM[(if n == 10 { 10 } else { n }) - 1].to_string()
+                }
+                _ => {
+                    // 【10 选序号】第 10 候选显示 0（1234567890）
+                    if n == 10 { "0".to_string() } else { n.to_string() }
+                }
+            };
             match label_fmt.find("%s") {
                 Some(p) => format!("{}{}{}", &label_fmt[..p], d, &label_fmt[p + 2..]),
                 None => format!("{d}."),
@@ -776,7 +799,7 @@ impl CandidateWindowV2 {
         // 字体与内容测宽先行（宽度取决于最长候选）
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
         let mut dy_cache_out: Option<((String, f32), f32)> = None;
-        let mut shadow_cache_out: Option<((u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
+        let mut shadow_cache_out: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
         let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
@@ -1154,8 +1177,14 @@ impl CandidateWindowV2 {
                 let mut sc = color_f(skin, "shadow_color", "#000000FF");
                 sc.a = shadow_alpha;
                 if sc.a > 0.004 {
-                    // 【每帧缓存键】(w,h,radius,oy,argb)——宽度不变的连续
-                    // 帧（同长度候选/翻页）零重建 command list+effect。
+                    // 【每帧缓存键】(w,h,corner_radius,shadow_radius,oy,ox,argb,dpi)
+                    // ——宽度不变的连续帧（同长度候选/翻页）零重建 command
+                    // list+effect。【2026-09-08 分离 BUG 修复】原键漏了
+                    // shadow_radius：拖「阴影大小」滑杆时 shadow_m→窗口
+                    // 尺寸变，但内容 w/h/圆角/偏移/颜色全没变→键命中→
+                    // 重放旧 effect（旧 blur、旧 shadow_m 坐标的圆角矩形）
+                    // 画进新窗口，阴影与窗体错位（用户实测「偶发阴影和
+                    // 候选分离」的根因）。
                     let sc_packed = ((sc.r * 255.0) as u32)
                         | (((sc.g * 255.0) as u32) << 8)
                         | (((sc.b * 255.0) as u32) << 16)
@@ -1164,6 +1193,7 @@ impl CandidateWindowV2 {
                         width as u32,
                         height as u32,
                         (radius * 4.0) as u32,
+                        (shadow_radius * 4.0) as u32,
                         ((shadow_off_y * 4.0) as i32, (shadow_off_x * 4.0) as i32),
                         sc_packed,
                         (dpi_scale * 100.0) as u32,

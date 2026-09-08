@@ -110,17 +110,6 @@ footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
 }
 .schema-item .opendir:hover { border-color: var(--acc); color: var(--acc); }
 .schema-item .opendir + .tag { margin-left: 0; }
-/* ── 上屏节奏预设 ── */
-.rhythm-cards { display: flex; gap: 12px; flex-wrap: wrap; }
-.rhythm-card {
-  flex: 1; min-width: 220px; max-width: 320px; padding: 14px 16px;
-  background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
-  cursor: pointer; transition: border-color .15s;
-}
-.rhythm-card:hover { border-color: var(--acc); }
-.rhythm-card.on { border-color: var(--acc); background: var(--bg3); }
-.rhythm-card b { display: block; font-size: 14.5px; margin-bottom: 6px; }
-.rhythm-card .sub { display: block; line-height: 1.7; }
 /* ── 用户词 ── */
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
@@ -239,7 +228,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>翻页键</label><input type="text" data-path="candidates.paging_keys" style="width:90px"></div>
       <div class="field"><label>次选键</label><input type="text" maxlength="1" id="c-2nd" style="width:60px"></div>
       <div class="field"><label>三选键</label><input type="text" maxlength="1" id="c-3rd" style="width:60px"></div>
-      <div class="checkline"><input type="checkbox" id="c-idx"><label for="c-idx">显示序号</label></div>
       <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示拼音注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分<span class="sub">（整句状态不可用）</span></label></div>
@@ -306,21 +294,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="s-early"><label for="s-early">提前上屏（稳 3 键）</label></div>
       <span class="pill" id="s-model-state">模型：检测中…</span>
     </div>
-    <div class="row" style="align-items:center;justify-content:space-between">
-      <h3 style="margin:0">上屏节奏</h3>
-      <span class="pill" id="s-rhythm-state">自定义</span>
-    </div>
-    <div class="rhythm-cards" id="rhythm-cards">
-      <div class="rhythm-card" id="rc-aggressive" title="万句实测：约 61% 字自动落屏，小步快出">
-        <b>⚡ 更激进的上屏</b>
-        <span class="sub">出字更快更多——约六成字自动落屏，小步快出，接近「它替你打字」。</span>
-      </div>
-      <div class="rhythm-card" id="rc-safe" title="万句实测：约 56% 字自动落屏，成段出词">
-        <b>🛡 更安心的上屏</b>
-        <span class="sub">多等一键证据再出——成段出词更稳，攒字成段，节奏从容。</span>
-      </div>
-    </div>
-    <div class="sub">点击即保存生效（无需重启）。两张卡片来自万句语料实测调校，可随时互切。</div>
     <div class="row">
       <div class="field"><label>ngram 模型文件（安装根下相对路径，如 模型\xxx.bin）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
     </div>
@@ -362,14 +335,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <video id="livebg" autoplay muted playsinline style="display:none"></video>
         <div class="preview-stage"><div id="candwin-preview"></div></div>
         <div class="material-note" id="material-note"></div>
-        <div class="field" style="margin-top:14px">
-          <label>实机试打（在此打字，真实候选窗会弹出，与上方预览对比）</label>
-          <div style="display:flex;gap:10px">
-            <input type="text" id="skin-try" style="flex:1" placeholder="例如输入 zhhrjk（虎符）——真实候选窗即在此处弹出">
-            <button id="skin-preview-btn" title="立即弹真实候选窗（键入 zhrjk）查看当前皮肤实机效果">📲 实机预览</button>
-          </div>
-          <div class="sub" style="margin-top:4px">拖动上方任意滑杆松手后，也会自动弹出一次实机预览。</div>
-        </div>
       </div>
       <div style="flex:1;min-width:330px">
         <h3>材质</h3>
@@ -383,7 +348,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
           <div class="field"><label>边框色</label><input type="color" id="mat-bc"></div>
         </div>
-        <h3>布局</h3>
+        <h3>布局 · 基本</h3>
         <div class="row">
           <div class="checkline"><input type="checkbox" id="l-horiz"><label for="l-horiz">横排候选</label></div>
           <div class="checkline"><input type="checkbox" id="l-inline"><label for="l-inline">编码内联到应用</label></div>
@@ -391,15 +356,30 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>字号</label><input type="number" id="ap-size" min="10" max="60" step="0.5"></div>
           <div class="field"><label>圆角 <span class="val" id="l-radius-v"></span></label><input type="range" id="l-radius" min="0" max="40"></div>
           <div class="field"><label>高亮圆角 <span class="val" id="l-hr-v"></span></label><input type="range" id="l-hr" min="0" max="40"></div>
+          <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="800" step="10" title="候选窗固定宽度（0=按内容自适应）"></div>
+        </div>
+        <h3>布局 · 间距</h3>
+        <div class="row">
           <div class="field"><label>水平留白 <span class="val" id="l-mx-v"></span></label><input type="range" id="l-mx" min="0" max="60"></div>
           <div class="field"><label>垂直留白 <span class="val" id="l-my-v"></span></label><input type="range" id="l-my" min="0" max="60"></div>
-          <div class="field"><label>高亮内距 <span class="val" id="l-hp-v"></span></label><input type="range" id="l-hp" min="0" max="40"></div>
           <div class="field"><label>候选间距 <span class="val" id="l-cs-v"></span></label><input type="range" id="l-cs" min="0" max="48"></div>
           <div class="field"><label>行距 <span class="val" id="l-ls-v"></span></label><input type="range" id="l-ls" min="0" max="40" step="0.5"></div>
+          <div class="field"><label>高亮内距 <span class="val" id="l-hp-v"></span></label><input type="range" id="l-hp" min="0" max="40"></div>
+        </div>
+        <h3>序号</h3>
+        <div class="row">
+          <div class="checkline"><input type="checkbox" id="sk-idx"><label for="sk-idx">显示序号</label></div>
+          <div class="field"><label>序号样式</label><select id="l-lstyle">
+            <option value="digit">数字（1 2 3…）</option>
+            <option value="zh">中文（一 二 三…）</option>
+            <option value="roman">罗马（Ⅰ Ⅱ Ⅲ…）</option>
+          </select></div>
           <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="30" step="0.5"></div>
-          <div class="field"><label>序号 <input type="checkbox" id="sk-idx" style="accent-color:var(--acc)"></label><input type="text" id="l-lfmt" placeholder="%s." style="width:60px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px"></div>
           <div class="field"><label>序号/注释间距 <span class="val" id="l-hsp-v"></span></label><input type="range" id="l-hsp" min="0" max="16" step="0.5"></div>
-          <div class="field"><label>固定宽 <span class="val" id="l-w-v"></span></label><input type="range" id="l-w" min="0" max="800" step="10"></div>
+          <div class="field"><label>格式模板 <input type="text" id="l-lfmt" placeholder="%s." style="width:70px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px" title="高级：%s 代表序号本身，其余字符为装饰（如 %s. 带点、%s、 空格）"></label></div>
+        </div>
+        <h3>阴影</h3>
+        <div class="row">
           <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
           <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-30" max="30" step="1"></div>
           <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-30" max="30" step="1"></div>
@@ -504,7 +484,8 @@ function bindInputs() {
   B("#i-enter", "input.enter_clear"); B("#i-tab", "input.tab_clear"); B("#i-mixed", "input.mixed_input");
   B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao");
   // #c-v（竖排候选）在 bindSkin 里接皮肤 layout.horizontal，不绑 config
-  B("#c-idx", "candidates.show_index");
+  // 【2026-09-08】「显示序号」开关只在皮肤页（#sk-idx 绑 config.candidates.
+  // show_index）——输入页不再重复（单一真源）
   B("#c-cmt", "candidates.show_pinyin_comment"); B("#c-ucmt", "candidates.show_unicode_comment");
   B("#c-split", "candidates.show_split");
   B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
@@ -573,35 +554,21 @@ function bindInputs() {
   });
 }
 
-/* ── 整句权重滑杆 ── */
-/* 第 6 项 "sentence" = 直接挂 sentence 段（如 early_need），其余挂 weights；
-   第 7 项 = 悬停说明（数值方向对效果的影响） */
+/* ── 整句权重滑杆（1.4.8 版式：九项原术语，拖动后点「保存并应用」生效）── */
 const WDEFS = [
-  ["beam_width", "组句思考广度", 10, 32000, 100, null,
-    "数值越大，输入法「想得越多」：自动上屏越多越准，但越吃性能（束宽）"],
-  ["early_need", "上屏确认键数", 1, 4, 1, "sentence",
-    "连续几键想法一致才自动出字：2=更快出、3=更稳更成段"],
-  ["rank_penalty", "偏爱常见词程度", 0, 1, 0.005, null,
-    "越大越倾向选大众常用词，越小越敢选冷门词（名次惩罚）"],
-  ["emitted_character_reward", "鼓励多出字力度", 0, 8, 0.05, null,
-    "越大越倾向一次多出几个字（出字奖励）"],
-  ["isolation_lambda", "少用生僻字力度", 0, 20, 0.1, null,
-    "越大越避免夹进少见字（孤立生僻惩罚）"],
-  ["isolation_threshold", "生僻字认定标准", 100, 21000, 100, null,
-    "字的使用频率低于此值就当作生僻字处理：值越高，越多字被当生僻（字频阈值）"],
-  ["confidence", "自动出字把握要求", 0.5, 1, 0.001, null,
-    "要多有把握才提前上屏：越高越谨慎（提前上屏置信）"],
-  ["supplement_baseline", "常用词加分底数", 0, 20, 0.1, null,
-    "日常高频词的基础加分（语料奖励基准）"],
-  ["supplement_scale", "常用词加分力度", 0, 8, 0.1, null,
-    "高频词按日常使用频率加分的强度（语料奖励缩放）"],
-  ["supplement_maximum", "常用词加分封顶", 1, 30, 0.5, null,
-    "单个词最多能加多少分（语料奖励上限）"],
+  ["beam_width", "Beam 宽度", 10, 32000, 1],
+  ["rank_penalty", "名次惩罚", 0, 1, 0.005],
+  ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
+  ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
+  ["isolation_threshold", "生僻字频阈值", 100, 21000, 100],
+  ["confidence", "提前上屏置信", 0.5, 1, 0.001],
+  ["supplement_baseline", "语料奖励基准", 0, 20, 0.1],
+  ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
+  ["supplement_maximum", "语料奖励上限", 1, 30, 0.5],
 ];
 /* 出厂调校值：恢复初始值按钮用
    【2026-09-08 默认回归 1.4.8 模型值】W1 束宽 30000 实机每键解码
-   数百 ms 致「越打越卡」（1.4.8 基线对照实锤）——出厂回 1.4.8 值；
-   W1/激进档保留在上屏节奏预设，按需一键切换。 */
+   数百 ms 致「越打越卡」（1.4.8 基线对照实锤）——出厂回 1.4.8 值。 */
 const W_DEFAULTS = {
   beam_width: 200, candidate_limit: 20,
   rank_penalty: 0.03, emitted_character_reward: 2.0,
@@ -610,37 +577,16 @@ const W_DEFAULTS = {
 };
 function buildSliders() {
   const box = $("#w-sliders"); box.innerHTML = "";
-  WDEFS.forEach((def) => {
-    const [k, name, min, max, step] = def;
-    const sec = def[5] === "sentence" ? CFG.sentence : CFG.sentence.weights;
-    const tip = def[6] ? ` title="${def[6]}"` : "";
+  WDEFS.forEach(([k, name, min, max, step]) => {
     const f = document.createElement("div"); f.className = "field";
-    f.innerHTML = `<label${tip}>${name} <span class="val" id="wv-${k}"></span></label>
+    f.innerHTML = `<label>${name} <span class="val" id="wv-${k}"></span></label>
       <input type="range" id="ws-${k}" min="${min}" max="${max}" step="${step}">`;
     box.appendChild(f);
     const s = f.querySelector("input"), v = f.querySelector(".val");
-    const sync = () => { v.textContent = sec[k]; s.value = sec[k]; };
-    s.oninput = () => {
-      sec[k] = parseFloat(s.value); v.textContent = s.value;
-      scheduleWeightAutoSave();
-    };
+    const sync = () => { v.textContent = CFG.sentence.weights[k]; s.value = CFG.sentence.weights[k]; };
+    s.oninput = () => { CFG.sentence.weights[k] = parseFloat(s.value); v.textContent = s.value; };
     sync();
   });
-}
-/* 【2026-09-06 实时生效】滑杆拖动防抖 600ms 自动保存：server 端
-   apply_config 热重载组句器实测 ~360ms（ngram 页缓存热），拖完停下
-   半秒即生效，无需再点「保存并应用」。连续拖动自动合并为一次。 */
-let _wSaveTimer = null;
-function scheduleWeightAutoSave() {
-  clearTimeout(_wSaveTimer);
-  msg("调整中…松手即自动生效", "");
-  _wSaveTimer = setTimeout(async () => {
-    try {
-      await api("POST", "/api/config", CFG);
-      syncRhythmUI();
-      msg("已实时生效 ✓（自动保存）", "ok");
-    } catch (e) { msg("自动保存失败：" + e.message, "err"); }
-  }, 600);
 }
 /* 恢复初始值：权重一键还原出厂调校值 + 自动保存应用 */
 $("#w-reset").onclick = async () => {
@@ -650,47 +596,8 @@ $("#w-reset").onclick = async () => {
     buildSliders();
     await api("POST", "/api/config", CFG);
     msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
-    syncRhythmUI();
   } catch (e) { msg(e.message, "err"); }
 };
-
-/* ── 上屏节奏预设（2026-09-06 万句终测定标：W4/W1）── */
-const RHYTHM = {
-  aggressive: {
-    name: "更激进的上屏", early_need: 2,
-    weights: { beam_width: 30000, candidate_limit: 10 },
-  },
-  safe: {
-    name: "更安心的上屏", early_need: 3,
-    weights: { beam_width: 30000, candidate_limit: 10 },
-  },
-};
-function rhythmMatch() {
-  for (const [k, p] of Object.entries(RHYTHM)) {
-    if (CFG.sentence.early_need === p.early_need
-      && CFG.sentence.weights.beam_width === p.weights.beam_width
-      && CFG.sentence.weights.candidate_limit === p.weights.candidate_limit) return k;
-  }
-  return "";
-}
-function syncRhythmUI() {
-  const cur = rhythmMatch();
-  $("#rc-aggressive").classList.toggle("on", cur === "aggressive");
-  $("#rc-safe").classList.toggle("on", cur === "safe");
-  $("#s-rhythm-state").textContent = cur ? RHYTHM[cur].name : "自定义";
-}
-async function applyRhythm(k) {
-  const p = RHYTHM[k];
-  try {
-    CFG.sentence.early_need = p.early_need;
-    Object.assign(CFG.sentence.weights, p.weights);
-    buildSliders(); syncRhythmUI();
-    await api("POST", "/api/config", CFG);
-    msg(`已切换为「${p.name}」并保存生效 ✓`, "ok"); await refreshInfo();
-  } catch (e) { msg(e.message, "err"); }
-}
-$("#rc-aggressive").onclick = () => applyRhythm("aggressive");
-$("#rc-safe").onclick = () => applyRhythm("safe");
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -895,26 +802,8 @@ function bindSkin() {
   let _skinSaveTimer = null;
   const saveSkinDebounced = () => {
     clearTimeout(_skinSaveTimer);
-    _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); previewLive(); }, 400);
+    _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); }, 400);
   };
-  /* 【实机预览 2026-09-08 v3】保存皮肤后自动键入 w（虎码单键即出
-     候选，此前 zhrjk 六键 240ms 太慢）。DLL poll 40ms 拉状态发现
-     签名变化弹真实候选窗。位置：先 POST /api/preview 报上设置窗口
-     中心的屏幕坐标（window.screenX/outerWidth），server 在 state 里
-     携带 preview_anchor → DLL 把预览窗弹在设置窗中心（此前跟陈旧
-     光标满屏跑，用户实测「弹在屏幕中间不对」）。1.6s 后自动收窗。 */
-  let _pvTimer = null;
-  function previewLive() {
-    clearTimeout(_pvTimer);
-    // 设置窗中心（近似：screenX+outerWidth/2；y 取 60% 高处避开预览
-    // 图本体遮挡视线）——候选窗将以 (x, y+4) 为左上角弹出
-    const px = Math.round(window.screenX + window.outerWidth / 2 - 70);
-    const py = Math.round(window.screenY + window.outerHeight * 0.6);
-    api("POST", "/api/preview", { x: px, y: py }).catch(() => {});
-    api("POST", "/api/reset", {}).catch(() => {});
-    setTimeout(() => api("POST", "/api/key", { key: "w" }).catch(() => {}), 30);
-    _pvTimer = setTimeout(() => api("POST", "/api/reset", {}).catch(() => {}), 1600);
-  }
   const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   // 【皮肤元素自查 2026-09-08】序号格式（label_format，%s→数字）+
@@ -929,7 +818,6 @@ function bindSkin() {
       CFG.candidates.show_index = si.checked;
       try {
         await api("POST", "/api/config", CFG);
-        const c2 = $("#c-idx"); if (c2) c2.checked = si.checked;
         preview();
         msg(si.checked ? "候选序号已开启 ✓" : "候选序号已隐藏 ✓", "ok");
       } catch (e) { msg("保存失败：" + e.message, "err"); }
@@ -944,6 +832,14 @@ function bindSkin() {
       lf.value = SKIN.layout.label_format;
       preview(); saveSkinQuiet();
     };
+  }
+  // 【序号样式 2026-09-08】digit/zh/roman——%s 的字形（数字/中文/罗马），
+  // 与格式模板独立（样式管字形，模板管点/间距装饰）。DLL fmt_label
+  // 同步映射（第 10 候选：digit=0 与选重键一致；zh=十；roman=Ⅹ）。
+  {
+    const ls = $("#l-lstyle");
+    ls.value = ["digit", "zh", "roman"].includes(SKIN.layout.label_style) ? SKIN.layout.label_style : "digit";
+    ls.onchange = () => { SKIN.layout.label_style = ls.value; preview(); saveSkinQuiet(); };
   }
   lrng("#l-hsp", "hilite_spacing");
   lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
@@ -979,7 +875,7 @@ function bindSkin() {
   // ② 恢复默认值：颜色/布局/材质回出厂（保留皮肤 ID/名称/作者）
   {
     const F = {
-      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
+      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
       material: { kind: "Frosted", tint: "#1C1C1ECC", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1 },
     };
@@ -1009,11 +905,8 @@ function bindSkin() {
         msg(isOfficial
           ? `已恢复「${SKIN.name || SKIN.id}」的出厂配置并保存生效 ✓`
           : "自建皮肤：已恢复为统一默认布局/配色（ID/名称保留）✓", "ok");
-        previewLive();
       } catch (e) { msg("恢复默认失败：" + e.message, "err"); }
     };
-    // 手动实机预览按钮
-    $("#skin-preview-btn").onclick = () => { previewLive(); msg("实机预览已触发 ✓", "ok"); };
   }
 }
 function preview() {
@@ -1052,7 +945,14 @@ function preview() {
   // 【序号开关】皮肤页开关与「输入与候选」页同一真源（config.
   // candidates.show_index），切换即存全局配置（DLL 经 skin 响应附带
   // 读取，≤2.5s 生效），预览同步隐藏/显示序号列。
-  const fmtLbl = n => { const f = L.label_format || "%s."; const d = n === 10 ? 0 : n; return f.includes("%s") ? f.replace("%s", d) : d + "."; };
+  // 【序号样式】与 DLL fmt_label 同映射：digit（第10=0）/zh（十）/roman（Ⅹ）
+  const lblDigits = n => {
+    const k = n === 10 ? 10 : n;
+    if (L.label_style === "zh") return ["一","二","三","四","五","六","七","八","九","十"][k - 1];
+    if (L.label_style === "roman") return ["Ⅰ","Ⅱ","Ⅲ","Ⅳ","Ⅴ","Ⅵ","Ⅶ","Ⅷ","Ⅸ","Ⅹ"][k - 1];
+    return k === 10 ? 0 : k;
+  };
+  const fmtLbl = n => { const f = L.label_format || "%s."; const d = lblDigits(n); return f.includes("%s") ? f.replace("%s", d) : d + "."; };
   const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${fmtLbl(i)}</span>` : ""}${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
   inner.innerHTML =
     `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
@@ -1224,7 +1124,7 @@ async function init() {
   try {
     CFG = await api("GET", "/api/config");
     $("#cfg-raw").value = JSON.stringify(CFG, null, 2);
-    bindInputs(); buildSliders(); syncRhythmUI();
+    bindInputs(); buildSliders();
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
     await loadUserWords();

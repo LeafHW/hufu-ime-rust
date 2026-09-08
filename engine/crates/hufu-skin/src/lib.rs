@@ -205,6 +205,11 @@ pub struct Layout {
     pub shadow_offset_x: f32,
     pub shadow_offset_y: f32,
     pub mark_text: String,
+    /// 【序号样式 2026-09-08】digit=阿拉伯数字（默认）/ zh=中文数字
+    ///（一二三…十）/ roman=罗马数字（Ⅰ Ⅱ Ⅲ…Ⅹ）。label_format 的
+    /// %s 替换为对应样式文本；两字段独立（样式管字形，格式管点/
+    /// 间距装饰）。
+    pub label_style: String,
 }
 
 impl Default for Layout {
@@ -232,6 +237,7 @@ impl Default for Layout {
             shadow_offset_x: 0.0,
             shadow_offset_y: 2.0,
             mark_text: "·".into(),
+            label_style: "digit".into(),
         }
     }
 }
