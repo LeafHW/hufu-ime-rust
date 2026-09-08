@@ -1268,7 +1268,8 @@ impl CandidateWindowV2 {
         let _shadow_base = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 60.0);
         let font_scale = (font_pt / 14.5).clamp(0.5, 3.0);
         let shadow_radius = (_shadow_base * font_scale.sqrt()).clamp(0.0, 60.0);
-        let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
+        // 【默认阴影偏移 0】用户定稿：所有皮肤默认阴影偏移=0（居中）。
+        let shadow_off_y = layout_f(skin, "shadow_offset_y", 0.0);
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;

@@ -115,7 +115,8 @@ pub struct MaterialConfig {
 impl Default for MaterialConfig {
     fn default() -> Self {
         MaterialConfig {
-            kind: Material::Frosted,
+            // 【毛玻璃默认关】用户定稿：默认纯色（此前 Frosted）。
+            kind: Material::Solid,
             tint: Color([28, 28, 30, 0xCC]),
             opacity: 1.0,
             darken: 0.0,
@@ -282,9 +283,12 @@ impl Default for Layout {
             min_width: 120.0,
             width: 250.0,
             shadow_radius: 12.0,
+            // 【默认偏移 0】用户定稿：所有皮肤默认阴影偏移=0（居中）。
             shadow_offset_x: 0.0,
-            shadow_offset_y: 2.0,
-            blur_radius: 24.0,
+            shadow_offset_y: 0.0,
+            // 【默认低档】模糊=低/中/高三档（accent 时代映射：低=轻
+            // BLURBEHIND、中/高=重 ACRYLIC），默认低=10。
+            blur_radius: 10.0,
             mark_text: "·".into(),
             label_style: "digit".into(),
             label_size_lock: true,
