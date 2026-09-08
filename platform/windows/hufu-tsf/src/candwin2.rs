@@ -2392,12 +2392,24 @@ impl CandidateWindowV2 {
             // 如常）；开毛玻璃=裸玻璃（面板/边框隐藏，只留高亮+文字）+
             // 阴影窗按毛玻璃窗体（=面板大小、8px 系统圆角）重绘投影。
             const GLASS_SHADOW: bool = true;
-            if GLASS_SHADOW && kind == "glass" && _shadow_base >= 1.0 && !dragging {
-                let s_alpha = skin
-                    .pointer("/skin/material/shadow_alpha")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
+            // 【v3.9】玻璃阴影独立参数（与纯色 shadow_* 完全解耦——含
+            // 开关：皮肤 shadow_radius=0 只关纯色自绘阴影，玻璃阴影由
+            // glass_shadow_alpha 自己决定）
+            let gs_alpha = if kind == "glass" {
+                skin
+                    .pointer("/skin/material/glass_shadow_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("glass_shadow_alpha")))
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
+                    .unwrap_or(0.38) as f32
+            } else {
+                0.0
+            };
+            if GLASS_SHADOW && gs_alpha > 0.005 && !dragging {
+                let gs_size = skin
+                    .pointer("/skin/material/glass_shadow_size")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("glass_shadow_size")))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(6.0) as f32;
                 shadowwin_show(
                     self.hwnd,
                     x - (shadow_m * dpi_scale) as i32,
@@ -2405,13 +2417,12 @@ impl CandidateWindowV2 {
                     w_out,
                     h_out,
                     // SDF 圆角=min(皮肤,8)：必须 ≤DWM 圆角(8)——SDF 无影
-                    // 区才能盖住 DWM 裁角区（角上 8px）；浓度等其他参数
-                    // 已按用户要求恢复原值（v3.5.3）。
+                    // 区才能盖住 DWM 裁角区（角上 8px）。
                     (radius.min(8.0) * dpi_scale).max(0.0) as u32,
-                    shadow_radius * dpi_scale,
+                    gs_size * dpi_scale,
                     (shadow_off_x * dpi_scale) as i32,
                     (shadow_off_y * dpi_scale) as i32,
-                    (s_alpha * 255.0) as u32,
+                    gs_alpha,
                 );
             }
             let sp_ok = if !dragging {
@@ -2816,18 +2827,19 @@ fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -
 }
 
 /// 渲染阴影位图并 ULW 上屏（尺寸/参数变化才重渲染）
+/// g_size=σ₁ 基准（glass_shadow_size）、g_alpha=浓度（glass_shadow_alpha）
 unsafe fn shadowwin_render(
     hwnd: HWND,
     w: u32,
     h: u32,
     m: u32,
     radius: u32,
-    shadow_radius: f32,
+    g_size: f32,
     off_x: i32,
     off_y: i32,
-    alpha8: u32,
+    g_alpha: f32,
 ) {
-    let key = format!("{w}:{h}:{m}:{radius}:{shadow_radius:.1}:{off_x}:{off_y}:{alpha8}");
+    let key = format!("{w}:{h}:{m}:{radius}:{g_size:.1}:{off_x}:{off_y}:{g_alpha:.2}");
     if *SHADOW_KEY.lock().unwrap() == key {
         return;
     }
@@ -2861,17 +2873,14 @@ unsafe fn shadowwin_render(
         }
     };
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    // SDF 双高斯衰减【v3.8.2 玻璃阴影独立参数】用户强调：glass 阴影
-    // 与不开毛玻璃的自绘阴影完全独立——不读皮肤 shadow_radius/
-    // shadow_alpha，用固定轻柔参数（用户实测 ×1.15 皮肤浓度「太重」）：
-    // σ₁=6 近场、σ₂=15.6 拖尾、浓度 0.38（系统窗口阴影级别）。
+    // SDF 双高斯衰减【v3.9 玻璃阴影独立可调】σ₁=g_size（拖尾 2.6σ₁）、
+    // 浓度=g_alpha——与纯色阴影（shadow_radius/shadow_alpha）完全独立。
     let (fw, fh) = (w as f32, h as f32);
     let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
-    let _ = (shadow_radius, alpha8); // 皮肤参数不参与（独立体系）
-    let sigma1 = 6.0f32;
-    let sigma2 = 6.0f32 * 2.6;
-    let base_a = 0.38f32;
+    let sigma1 = g_size.max(0.1);
+    let sigma2 = sigma1 * 2.6;
+    let base_a = g_alpha.clamp(0.0, 1.0);
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     let mut o = 0usize;
     for y in 0..h {
@@ -2928,10 +2937,10 @@ pub fn shadowwin_show(
     w_out: u32,
     h_out: u32,
     radius_phys: u32,
-    shadow_radius: f32,
+    g_size: f32,
     off_x: i32,
     off_y: i32,
-    alpha8: u32,
+    g_alpha: f32,
 ) {
     let h = {
         let mut g = SHADOW_HWND.lock().unwrap();
@@ -2989,7 +2998,7 @@ pub fn shadowwin_show(
     }
     unsafe {
         // 边距按独立 σ₂（拖尾 3σ₂≈47px 覆盖）——位图边界截断拖尾会出硬边
-        let m = (6.0f32 * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        let m = (g_size.max(0.1) * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
         *SHADOW_M.lock().unwrap() = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
@@ -3004,7 +3013,7 @@ pub fn shadowwin_show(
             sh2 as i32,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        shadowwin_render(HWND(h as *mut _), sw, sh2, m, radius_phys, shadow_radius, off_x, off_y, alpha8);
+        shadowwin_render(HWND(h as *mut _), sw, sh2, m, radius_phys, g_size, off_x, off_y, g_alpha);
     }
 }
 

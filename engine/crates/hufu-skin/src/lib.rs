@@ -104,6 +104,12 @@ pub struct MaterialConfig {
     /// 泛白，v3.5.1 的 0.25 默认实测被用户判「还是泛白」——归零，
     /// 白雾仅作用户可选项）。
     pub glass_alpha: f32,
+    /// 【毛玻璃 v3.9】玻璃阴影独立浓度（0-1）——与纯色阴影 shadow_alpha
+    /// 完全独立（v3.8.2 解耦）。默认 0.38（系统窗口阴影级别）。
+    pub glass_shadow_alpha: f32,
+    /// 【毛玻璃 v3.9】玻璃阴影独立大小（σ 基准 2-16，拖尾=2.6σ）——
+    /// 与纯色阴影 shadow_radius 完全独立。默认 6。
+    pub glass_shadow_size: f32,
 }
 
 impl Default for MaterialConfig {
@@ -121,6 +127,8 @@ impl Default for MaterialConfig {
             shadow_alpha: 1.0,
             border_alpha: 1.0,
             glass_alpha: 0.0,
+            glass_shadow_alpha: 0.38,
+            glass_shadow_size: 6.0,
         }
     }
 }
