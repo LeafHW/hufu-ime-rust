@@ -2467,6 +2467,16 @@ impl CandidateWindowV2 {
                                 &nc as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
+                            // 【修「白色边框」】DWM 还会画主题色 1px 窗口
+                            // 边框线（浅色主题=白线，NC 关闭后更明显）——
+                            // DWMWA_BORDER_COLOR=0xFFFFFFFE（NONE）显式去掉。
+                            let none_border: u32 = 0xFFFFFFFE;
+                            let _ = f(
+                                self.hwnd,
+                                34, // DWMWA_BORDER_COLOR
+                                &none_border as *const u32 as *const core::ffi::c_void,
+                                4,
+                            );
                         }
                     }
                 }
