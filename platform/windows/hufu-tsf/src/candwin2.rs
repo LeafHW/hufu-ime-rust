@@ -2379,7 +2379,9 @@ impl CandidateWindowV2 {
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
             // 【v3.5 阴影窗先就位】glass 无边距（窗口=面板），阴影由独立
             // 分层窗承担——先置顶就位，候选窗随后 TOPMOST 压其上。
-            if kind == "glass" && _shadow_base >= 1.0 {
+            // 【v3.5.2】拖拽中跳过（show 帧会把阴影拉回渲染旧坐标，与
+            // MOUSEMOVE 的 shadowwin_follow 打架=「拖动后元素对不齐」）。
+            if kind == "glass" && _shadow_base >= 1.0 && !dragging {
                 let s_alpha = skin
                     .pointer("/skin/material/shadow_alpha")
                     .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
@@ -2391,7 +2393,9 @@ impl CandidateWindowV2 {
                     y - (shadow_m * dpi_scale) as i32,
                     w_out,
                     h_out,
-                    (radius * dpi_scale).max(0.0) as u32,
+                    // SDF 圆角=面板圆角+4：确保 SDF 无影区完全覆盖面板
+                    // 圆角外的透明角（露黑根因：SDF 圆角 8 < 面板 10）
+                    ((radius + 4.0) * dpi_scale).max(0.0) as u32,
                     shadow_radius * dpi_scale,
                     (shadow_off_x * dpi_scale) as i32,
                     (shadow_off_y * dpi_scale) as i32,
@@ -2798,14 +2802,14 @@ unsafe fn shadowwin_render(
         }
     };
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    // SDF 高斯衰减：面板矩形（m 边距内缩，圆角 radius），中心偏移
-    //（shadow_offset）。黑影预乘：BGR=0，A=衰减。
-    // 【柔化】内缩 3px：候选窗四角（DWM 圆角外）露出的阴影从满强度
-    // 后退 3px 才起坡（用户实测「黑边重」=内圈 100% alpha 直露）；
+    // SDF 高斯衰减：阴影矩形=候选窗窗口矩形（面板视觉边界），中心
+    // 偏移（shadow_offset）。黑影预乘：BGR=0，A=衰减。
+    // 【v3.5.2】inset=0（内缩会让窗口边缘内 3px 就有阴影，透过面板
+    // 圆角外的透明像素露出=「没挡住」）；radius=面板圆角+4（SDF 圆角
+    // 比面板圆角小时，面板角上透明区超出 SDF 无影区=角上露黑）；
     // 整体 ×0.85。
     let (fw, fh) = (w as f32, h as f32);
-    let inset = 3.0f32;
-    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0 - inset, (fh - 2.0 * m as f32) / 2.0 - inset);
+    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
     let sigma = (shadow_radius * 0.5 + 1.0).max(1.0);
     let base_a = alpha8 as f32 / 255.0 * 0.85;

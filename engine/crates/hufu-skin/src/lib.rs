@@ -100,7 +100,9 @@ pub struct MaterialConfig {
     /// 【纯色模型】边框独立透明度
     pub border_alpha: f32,
     /// 【毛玻璃 v3.5】玻璃本体透明度（0-1）：accent 白雾 alpha——
-    /// 高=白雾浓（更不透），低=纯模糊通透。默认 0.25（0.5 泛白实测过重）。
+    /// 高=白雾浓（更不透），低=纯模糊通透。默认 0（白雾会让整窗
+    /// 泛白，v3.5.1 的 0.25 默认实测被用户判「还是泛白」——归零，
+    /// 白雾仅作用户可选项）。
     pub glass_alpha: f32,
 }
 
@@ -118,7 +120,7 @@ impl Default for MaterialConfig {
             hilite_alpha: 1.0,
             shadow_alpha: 1.0,
             border_alpha: 1.0,
-            glass_alpha: 0.25,
+            glass_alpha: 0.0,
         }
     }
 }
