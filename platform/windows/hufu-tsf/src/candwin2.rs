@@ -671,7 +671,15 @@ impl CandidateWindowV2 {
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
-        let margin_y = layout_f(skin, "margin_y", 5.0);
+        // 【垂直留白弱联动 2026-09-08】DWrite 行盒 ≈1.3-1.45 倍字号，
+        // 文字上下每边白送 ~0.16-0.22×字号的空隙——字号放大后视觉
+        // 上下边距（margin_y+行高余量）反超左右，观感「上下比左右宽」
+        //（用户滚轮最大档实测）。margin_y 落盘值已含等比放大，渲染
+        // 时按 字号比^-0.2 收敛（放大 2.5 倍档垂直 ×2.0 而非 ×2.5，
+        // 行高余量补差）——不落盘、滚轮回缩不漂移；基准字号（≈14.5）
+        // 附近无感。
+        let _my_base = layout_f(skin, "margin_y", 5.0);
+        let margin_y = _my_base * (font_pt / 14.5).clamp(0.5, 3.0).powf(-0.2);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
