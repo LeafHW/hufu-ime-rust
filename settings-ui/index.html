@@ -347,16 +347,17 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>模糊强度 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="0" max="100" step="1" title="三档：0=无模糊，1-50=轻模糊，51-100=重模糊（系统限制无法连续调节）"></div>
           <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
           <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
-          <div class="field"><label>毛玻璃透明度 <span class="val" id="mat-ga-v"></span></label><input type="range" id="mat-ga" min="0" max="100" title="玻璃本体的实度：0%=全透（只借模糊），100%=实玻璃（底下内容更朦胧）"></div>
-          <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc"></div>
-          <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="除文字与高亮外所有元素（窗底/边框/编码底/阴影）的透明度，0%=全透明 100%=不透明"></div>
+          <div class="field"><label>玻璃阴影浓度 <span class="val" id="mat-gsa-v"></span></label><input type="range" id="mat-gsa" min="0" max="100" title="毛玻璃模式专用投影浓度（独立于纯色阴影的透明度）；0%=无玻璃阴影"></div>
+          <div class="field"><label>玻璃阴影大小 <span class="val" id="mat-gss-v"></span></label><input type="range" id="mat-gss" min="2" max="16" step="0.5" title="毛玻璃模式专用投影扩散范围（独立于纯色阴影大小）"></div>
+          <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc" title="纯色模式的窗底色（毛玻璃模式下面板隐藏，改此色无效果）"></div>
+          <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="纯色模式下窗底/边框/编码底的透明度（毛玻璃模式下无效，玻璃浓度用染色浓度调）"></div>
           <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
           <div class="field"><label>高亮色</label><input type="color" id="mat-hi" title="高亮候选的底色（配合高亮透明度）"></div>
-          <div class="field"><label>阴影透明度 <span class="val" id="mat-sa-v"></span></label><input type="range" id="mat-sa" min="0" max="100" title="候选窗投影的透明度（独立控制）"></div>
-          <div class="field"><label>边框透明度 <span class="val" id="mat-ba-v"></span></label><input type="range" id="mat-ba" min="0" max="100" title="边框色的透明度（独立控制）"></div>
-          <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
-          <div class="field"><label>边框色</label><input type="color" id="mat-bc"></div>
-          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
+          <div class="field"><label>阴影透明度 <span class="val" id="mat-sa-v"></span></label><input type="range" id="mat-sa" min="0" max="100" title="纯色模式自绘阴影的透明度（毛玻璃模式的阴影用下方玻璃阴影浓度独立调）"></div>
+          <div class="field"><label>边框透明度 <span class="val" id="mat-ba-v"></span></label><input type="range" id="mat-ba" min="0" max="100" title="边框色的透明度（纯色模式；毛玻璃模式下边框隐藏）"></div>
+          <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5" title="纯色模式边框（毛玻璃模式下边框隐藏）"></div>
+          <div class="field"><label>边框色</label><input type="color" id="mat-bc" title="纯色模式边框色（毛玻璃模式下边框隐藏）"></div>
+          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5" title="纯色模式自绘阴影大小（毛玻璃模式的阴影大小独立调）"></div>
           <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-5" max="5" step="1"></div>
           <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-5" max="5" step="1"></div>
         </div>
@@ -787,16 +788,22 @@ function bindSkin() {
       preview();
     };
     ta.onchange = saveSkinQuiet;
-    // 【毛玻璃透明度】glass_alpha 0-1（玻璃本体实度）
-    const ga = $("#mat-ga");
-    ga.value = Math.round((SKIN.material.glass_alpha ?? 0) * 100);
-    $("#mat-ga-v").textContent = ga.value + "%";
-    ga.oninput = () => {
-      SKIN.material.glass_alpha = ga.value / 100;
-      $("#mat-ga-v").textContent = ga.value + "%";
-      preview();
+    // 【v3.9 玻璃阴影独立参数】gsa=浓度(0-1) gss=σ 基准(2-16)
+    const gsa = $("#mat-gsa"), gss = $("#mat-gss");
+    gsa.value = Math.round((SKIN.material.glass_shadow_alpha ?? 0.38) * 100);
+    $("#mat-gsa-v").textContent = gsa.value + "%";
+    gsa.oninput = () => {
+      SKIN.material.glass_shadow_alpha = gsa.value / 100;
+      $("#mat-gsa-v").textContent = gsa.value + "%";
     };
-    ga.onchange = saveSkinQuiet;
+    gsa.onchange = saveSkinQuiet;
+    gss.value = SKIN.material.glass_shadow_size ?? 6;
+    $("#mat-gss-v").textContent = gss.value;
+    gss.oninput = () => {
+      SKIN.material.glass_shadow_size = parseFloat(gss.value);
+      $("#mat-gss-v").textContent = gss.value;
+    };
+    gss.onchange = saveSkinQuiet;
     syncG();
   }
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
