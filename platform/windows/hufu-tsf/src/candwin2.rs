@@ -510,7 +510,142 @@ fn read_diag_stage() -> u32 {
 /// NOREDIRECTIONBITMAP+DComp 窗口配 ACCENT_ENABLE_ACRYLICBLURBEHIND——
 /// DWM 合成器直接给窗口底下做系统级真毛玻璃。零抓屏（自绘方案抓到
 /// 自己黑块的死结消除）、零模糊算法。染色=GradientColor(0xAABBGGRR)。
+// 【v4.0 DXGI Desktop Duplication 抓屏】GDI BitBlt 在 TSF 宿主进程里
+// 对屏幕区域返回纯黑（v2「自绘死结」真身：PowerShell 进程能抓到，
+// ISE 宿主进程 BitBlt=黑——GDI 屏幕读取的宿主上下文怪癖）。
+// GetDisplaySurfaceData 直接从 DWM 合成器拿当前桌面快照（无需
+// Acquire 帧循环），无 GDI 怪癖。全屏帧缓存+按需裁剪。
+unsafe fn capture_duplication_bgra(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{
+        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11CreateDevice,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    };
+    use windows::Win32::Graphics::Dxgi::{IDXGIDevice1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    struct DupState {
+        ctx: ID3D11DeviceContext,
+        dup: IDXGIOutputDuplication,
+        ox: i32,
+        oy: i32,
+        fw: u32,
+        fh: u32,
+        staging: ID3D11Texture2D,
+        // 静止桌面复用缓存（AcquireNextFrame 超时=无新帧=屏幕没变）
+        cache: Option<((i32, i32, u32, u32), Vec<u8>)>,
+    }
+    static STATE: Mutex<Option<DupState>> = Mutex::new(None);
+    let mut g = STATE.lock().unwrap();
+
+    if g.is_none() {
+        unsafe {
+            let mut dev: Option<ID3D11Device> = None;
+            let mut ctx: Option<ID3D11DeviceContext> = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut dev),
+                None,
+                Some(&mut ctx),
+            )
+            .ok()?;
+            let dev = dev?;
+            let ctx = ctx?;
+            let dxgi_dev: IDXGIDevice1 = dev.cast().ok()?;
+            let adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter1 = dxgi_dev.GetParent().ok()?;
+            let out = adapter.EnumOutputs(0).ok()?;
+            // 输出区域坐标（DXGI_OUTPUT_DESC，非 OUTDUPL_DESC）
+            let od = out.GetDesc().ok()?;
+            let (ox, oy) = (od.DesktopCoordinates.left, od.DesktopCoordinates.top);
+            let out1: IDXGIOutput1 = out.cast().ok()?;
+            let dup = out1.DuplicateOutput(&dev).ok()?;
+            let dd = dup.GetDesc();
+            let (fw, fh) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
+            let mk = |usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE, cpu: u32| D3D11_TEXTURE2D_DESC {
+                Width: fw,
+                Height: fh,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: usage,
+                BindFlags: 0,
+                CPUAccessFlags: cpu,
+                MiscFlags: 0,
+            };
+            let mut st_opt: Option<ID3D11Texture2D> = None;
+            dev.CreateTexture2D(&mk(D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32), None, Some(&mut st_opt)).ok()?;
+            let staging = st_opt?;
+            *g = Some(DupState { ctx, dup, ox, oy, fw, fh, staging, cache: None });
+        }
+    }
+    let s = g.as_mut()?;
+
+    unsafe {
+        // 等一帧（0ms 快路径；静止=超时→缓存复用）
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut res_opt: Option<IDXGIResource> = None;
+        let acq = s.dup.AcquireNextFrame(0, &mut info, &mut res_opt as *mut Option<IDXGIResource> as *mut _);
+        let frame_tex: ID3D11Texture2D = match acq {
+            Ok(()) => {
+                let res = res_opt?;
+                let tex: ID3D11Texture2D = res.cast().ok()?;
+                tex
+            }
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                // 静止：同位置同尺寸直接复用缓存
+                return s.cache.clone().filter(|((cx, cy, cw, ch), _)| *cx == x && *cy == y && *cw == w && *ch == h).map(|(_, v)| v);
+            }
+            Err(_) => {
+                *g = None; // 设备丢失/访问丢失：下次重建
+                return None;
+            }
+        };
+        s.ctx.CopyResource(&s.staging, &frame_tex);
+        let _ = s.dup.ReleaseFrame();
+        let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
+        s.ctx
+            .Map(&s.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped as *mut _))
+            .ok()?;
+        let pitch = mapped.RowPitch as usize;
+        let src = mapped.pData as *const u8;
+        // 只拷目标行区间（省内存带宽）
+        let lx = (x - s.ox) as isize;
+        let ly = (y - s.oy) as isize;
+        if lx < 0 || ly < 0 || lx + w as isize > s.fw as isize || ly + h as isize > s.fh as isize {
+            s.ctx.Unmap(&s.staging, 0);
+            return None;
+        }
+        let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for row in 0..(h as usize) {
+            let so = ((ly as usize + row) * pitch) + (lx as usize) * 4;
+            out.extend_from_slice(std::slice::from_raw_parts(
+                src.add(so),
+                (w as usize) * 4,
+            ));
+        }
+        s.ctx.Unmap(&s.staging, 0);
+        // duplication 帧同样置满 alpha（内容恒不透明）
+        for i in (3..out.len()).step_by(4) {
+            out[i] = 255;
+        }
+        s.cache = Some(((x, y, w, h), out.clone()));
+        Some(out)
+    }
+}
+
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
+    // 主路径：Desktop Duplication；失败退 GDI（黑块风险）
+    if let Some(v) = capture_duplication_bgra(x, y, w, h) {
+        return Some(v);
+    }
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
