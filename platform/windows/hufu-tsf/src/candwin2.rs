@@ -1270,10 +1270,6 @@ impl CandidateWindowV2 {
         let shadow_m = if has_shadow {
             let sigma = shadow_radius * 0.5 + 1.0;
             (sigma * 3.0 + 6.0 + shadow_off_y.abs().max(shadow_off_x.abs())).ceil()
-        } else if kind == "glass" && shadow_radius >= 1.0 {
-            // glass：固定 6px 玻璃边（窗口大于面板；DWM 圆角裁角落在
-            // 玻璃边内，不再透出阴影窗）
-            6.0
         } else {
             0.0
         };
@@ -1784,19 +1780,12 @@ impl CandidateWindowV2 {
                 // 层」——保持 master 不透明会把毛玻璃完全盖死（用户实测
                 // 「画了但看不到」的根因），降为 0.55 让模糊底透出。
                 let back = color_f(skin, "back_color", "#202022E6");
-                // 【v3.3 视觉回归自绘】accent 只做模糊底（染色固定极淡），
-                // 面板大小/R 角/染色浓度/阴影全由自绘决定——glass 时底色
-                // =tint（色+浓度），画皮肤圆角；非 glass=back_color×master。
+                // 【v3.6·裸玻璃实验】用户方向：glass 时隐藏候选框面板元素
+                //（底色/染色层不画），只保留高亮胶囊和文字——毛玻璃底
+                //（accent 模糊）直接裸露，元素浮在玻璃上。视觉不行可回退
+                // 此段（恢复 v3.3 染色面板）。
                 let bg_c = if kind == "glass" {
-                    match tint_hex {
-                        Some([r, g, b, a]) => D2D1_COLOR_F {
-                            r: r as f32 / 255.0,
-                            g: g as f32 / 255.0,
-                            b: b as f32 / 255.0,
-                            a: a as f32 / 255.0,
-                        },
-                        None => D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: 0.45 },
-                    }
+                    D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
                 } else {
                     D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: if stage == 1 { 0.0 } else { master } }
                 };
@@ -2044,9 +2033,10 @@ impl CandidateWindowV2 {
                 }
             }
 
-            // 边框
+            // 边框【v3.6 裸玻璃：glass 时一并隐藏（只留高亮+文字）】
             if let Some(b) = &b_border {
-                let bw = layout_f(skin, "border_width", 1.0);
+                if kind != "glass" {
+                    let bw = layout_f(skin, "border_width", 1.0);
                 let rr = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: bw / 2.0,
@@ -2058,6 +2048,7 @@ impl CandidateWindowV2 {
                     radiusY: radius,
                 };
                 let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+                }
             }
             } // draw_content
 
