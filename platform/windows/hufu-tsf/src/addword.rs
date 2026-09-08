@@ -119,12 +119,12 @@ fn load_skin() {
         // 窗口底色提亮 20%：候选窗小面积用原底色可以，整窗大面积
         // 直接用会死黑（用户反馈），向白混一档。
         bg: lighten(
-            get_color("back_color").unwrap_or(0x22_2E_16),
+            get_color("back_color").unwrap_or(0x22_2E_16_u32),
             0.20,
         ),
         text: get_color("text_color")
             .or_else(|| get_color("candidate_text_color"))
-            .unwrap_or(0xEC_E2_D7),
+            .unwrap_or(0xEC_E2_D7_u32),
         label: get_color("label_color")
             .or_else(|| get_color("comment_text_color"))
             .unwrap_or(0xB5_A6_8A),

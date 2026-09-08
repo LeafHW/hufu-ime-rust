@@ -260,7 +260,10 @@ impl Schema {
                 if !schema.user_dict.entries.iter().any(|x| x.code == e.code && x.text == e.text) {
                     let mut e = e;
                     e.weight = 1.0;
-                    e.pinned = e.pinned;
+                    // 【clippy 修复】原 e.pinned = e.pinned 自赋值（无效果）
+                    //——多多用户码表并入时置顶标记清零（用户词默认不置顶，
+                    //置顶由用户调整.txt 的 {置顶} 行控制）。
+                    e.pinned = false;
                     schema.user_dict.entries.push(e);
                 }
             }
