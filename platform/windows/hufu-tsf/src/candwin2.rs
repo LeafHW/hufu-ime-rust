@@ -796,7 +796,20 @@ impl CandidateWindowV2 {
             .trim()
             .is_empty();
         let rm_x = margin_x.max(hilite_pad);
+        // 【胶囊边距调平 v2 2026-09-08】v1（pill_dx 缩胶囊）破胶囊内
+        // 文字内距对称（左右 hp-dx vs 上下 hp），用户实测「胶囊形状
+        // 和候选不一样」。v2 反向：胶囊几何不动（内距四边恒=hp），
+        // 水平起点右移对齐垂直外边距——rm_x' = 垂直边距+hp，取 max
+        // 保底（垂直小时维持原值）。pill_off=胶囊顶相对行盒顶偏移
+        //（行盒装不下胶囊时为负溢出）。
+        let _pill_ih = em + hilite_pad * 2.0;
+        let _pill_off = if _pill_ih <= line_h {
+            (line_h - em) / 2.0 - hilite_pad
+        } else {
+            (line_h - _pill_ih) / 2.0
+        };
         let rm_y = margin_y.max(hilite_pad);
+        let rm_x = (rm_y + _pill_off + hilite_pad).max(rm_x);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
@@ -1593,21 +1606,6 @@ impl CandidateWindowV2 {
                     (y + off, y + off + ih)
                 }
             };
-            // 【胶囊边距调平 2026-09-08】水平边距=rm_x-hp、垂直边距
-            // =rm_y+pill_off（行盒溢出，大字号档为负）——两方向几何
-            // 不同源，36 号实测左右 4.5 vs 上下 7（用户「左右没上下
-            // 多」）。水平向补差 pill_dx 使胶囊四边视觉边距一致；
-            // 负值时反向（垂直小则水平外扩），自适应全字号档。
-            let pill_ih = em + hilite_pad * 2.0;
-            let pill_off = if pill_ih <= line_h {
-                (line_h - em) / 2.0 - hilite_pad
-            } else {
-                (line_h - pill_ih) / 2.0
-            };
-            let pill_v_margin = rm_y + pill_off;
-            let pill_h_margin = rm_x - hilite_pad;
-            let pill_dx = (pill_v_margin - pill_h_margin)
-                .clamp(-hilite_pad, hilite_pad * 2.0);
 
             // 候选行
             let sel = selected.min(cands.len().saturating_sub(1));
@@ -1628,9 +1626,9 @@ impl CandidateWindowV2 {
                             let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: x - hilite_pad + pill_dx,
+                                    left: x - hilite_pad,
                                     top: pt,
-                                    right: x + cell_w + hilite_pad - pill_dx,
+                                    right: x + cell_w + hilite_pad,
                                     bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
@@ -1644,9 +1642,9 @@ impl CandidateWindowV2 {
                                 let mh = line_h * 0.6;
                                 let mrr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
-                                        left: x - hilite_pad + pill_dx + (hilite_pad - mw) / 2.0,
+                                        left: x - hilite_pad + (hilite_pad - mw) / 2.0,
                                         top: my,
-                                        right: x - hilite_pad + pill_dx + (hilite_pad - mw) / 2.0 + mw,
+                                        right: x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
                                         bottom: my + mh,
                                     },
                                     radiusX: 1.0,
@@ -1685,9 +1683,9 @@ impl CandidateWindowV2 {
                             let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: rm_x - hilite_pad + pill_dx,
+                                    left: rm_x - hilite_pad,
                                     top: pt,
-                                    right: width - rm_x + hilite_pad - pill_dx,
+                                    right: width - rm_x + hilite_pad,
                                     bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
@@ -1701,9 +1699,9 @@ impl CandidateWindowV2 {
                                 let mh = line_h * 0.6;
                                 let mrr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
-                                        left: rm_x - hilite_pad + pill_dx + (hilite_pad - mw) / 2.0,
+                                        left: rm_x - hilite_pad + (hilite_pad - mw) / 2.0,
                                         top: my,
-                                        right: rm_x - hilite_pad + pill_dx + (hilite_pad - mw) / 2.0 + mw,
+                                        right: rm_x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
                                         bottom: my + mh,
                                     },
                                     radiusX: 1.0,
