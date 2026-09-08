@@ -809,7 +809,12 @@ impl CandidateWindowV2 {
             (line_h - _pill_ih) / 2.0
         };
         let rm_y = margin_y.max(hilite_pad);
-        let rm_x = (rm_y + _pill_off + hilite_pad).max(rm_x);
+        // 【用户手感微调 2026-09-08】「上下还是多一点」——汉字墨迹高
+        // ≈0.86em（上下留白比左右多 ~3px 的视觉源）。按用户直觉：水平
+        // 收一点点（每边 1.5px）对冲。内容起点右移（胶囊跟随，内距
+        // 保持四边对称），窗口宽自适应。
+        const PILL_SQUEEZE_X: f32 = 1.5;
+        let rm_x = ((rm_y + _pill_off + hilite_pad).max(rm_x)) + PILL_SQUEEZE_X;
 
         // 字体与内容测宽先行（宽度取决于最长候选）
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
