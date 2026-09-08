@@ -1362,13 +1362,24 @@ impl CandidateWindowV2 {
                                         M31: 0.0,
                                         M32: 0.0,
                                     });
+                                    // 【诊断模式 2026-09-08】裁决毛玻璃层是否
+                                    // 真的画上屏：纯红 80% 填充窗体区。
+                                    // 用户看到红=层在画（问题在数据/拉伸）；
+                                    // 没红=层没画（问题在层序/Layer/坐标）。
+                                    if let Ok(rb) = ctx.CreateSolidColorBrush(
+                                        &D2D1_COLOR_F { r: 1.0, g: 0.0, b: 0.0, a: 0.8 },
+                                        None,
+                                    ) {
+                                        let full = D2D_RECT_F { left: 0.0, top: 0.0, right: w_out as f32, bottom: h_out as f32 };
+                                        ctx.FillRectangle(&full, &rb);
+                                    }
                                     let dst = D2D_RECT_F {
                                         left: shadow_m * dpi_scale,
                                         top: shadow_m * dpi_scale,
                                         right: (shadow_m + width) * dpi_scale,
                                         bottom: (shadow_m + height) * dpi_scale,
                                     };
-                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 0.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
                                     // 恢复渲染主变换（dpi 缩放）
                                     ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
                                         M11: dpi_scale,
