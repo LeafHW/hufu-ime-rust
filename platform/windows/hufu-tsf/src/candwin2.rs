@@ -1086,7 +1086,7 @@ impl CandidateWindowV2 {
                 // 【撤销 min_width 下限 2026-09-08】用户实测「最低宽度
                 // 受限」——虎码横排候选少时窄窗更精致，min_width(150)
                 // 让窗窄不下去；weasel 语义此处不适用，恢复纯自适应。
-                let mut w = rm_x * 2.0;
+                let mut w = rm_x * 2.0 + hilite_pad * 2.0;
                 if raw_w > 0.0 {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
                 }
@@ -1096,7 +1096,7 @@ impl CandidateWindowV2 {
                     }
                     w += iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 };
                 }
-                let w_full = w.max(raw_w + rm_x * 2.0);
+                let w_full = w.max(raw_w + rm_x * 2.0 + hilite_pad * 2.0);
                 // 【超屏修复】横排宽度封顶：工作区宽 − 余量。超屏时注释
                 // 预算按剩余空间等比压缩（不足 12px 整列不显示），逐条
                 // 截断加 …；格子推进宽同步收缩，尾部候选不再溢出重叠。
@@ -1127,7 +1127,9 @@ impl CandidateWindowV2 {
                 (w_full.min(w_cap), 0.0, 0.0, 0.0)
             } else {
                 // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
-                let mut need = rm_x + label_w + max_text.max(raw_w) + rm_x + 6.0;
+                // 【口径统一】胶囊四边=gap：文字列从 gap+hp 起、width 含
+                // 两端 hp；胶囊 [gap, width-gap] 不再 ±hp 外扩。
+                let mut need = rm_x + hilite_pad + label_w + max_text.max(raw_w) + hilite_pad + rm_x + 6.0;
                 if max_cmt > 0.0 {
                     need += 6.0 + max_cmt;
                 }
@@ -1136,7 +1138,7 @@ impl CandidateWindowV2 {
                 } else {
                     need.clamp(min_width, 300.0)
                 };
-                let text_x = rm_x + label_w;
+                let text_x = rm_x + hilite_pad + label_w;
                 // 注释列配额：右端对齐不变，宽压到「文本列右侧余量」；
                 // 超配额逐条截断（…）。固定宽皮肤装不下整条注释时宁可
                 // 截断注释也不压文本列。
@@ -1769,7 +1771,7 @@ impl CandidateWindowV2 {
             if horizontal {
                 // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
                 // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
-                let mut x = rm_x + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
+                let mut x = rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
                 let y = y0;
                 for (i, (text, _)) in cands.iter().enumerate().take(10) {
                     let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -1835,14 +1837,16 @@ impl CandidateWindowV2 {
                     let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                     let y = y0 + (row_h + cand_spacing) * i as f32;
                     if i == sel {
-                        // 高亮行（圆角胶囊；↑↓ 移动；左右对称 = rm_x 外扩 hilite_pad）
+                        // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
+                        // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
+                        // 已在胶囊内 gap+hp 起）
                         if let Some(b) = &b_hi {
                             let (pt, pb) = pill_v(y);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: rm_x - hilite_pad,
+                                    left: rm_x,
                                     top: pt,
-                                    right: width - rm_x + hilite_pad,
+                                    right: width - rm_x,
                                     bottom: pb,
                                 },
                                 radiusX: layout_f(skin, "hilited_corner_radius", radius),
@@ -1856,9 +1860,9 @@ impl CandidateWindowV2 {
                                 let mh = row_h * 0.6;
                                 let mrr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
-                                        left: rm_x - hilite_pad + (hilite_pad - mw) / 2.0,
+                                        left: rm_x + (hilite_pad - mw) / 2.0,
                                         top: my,
-                                        right: rm_x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
+                                        right: rm_x + (hilite_pad - mw) / 2.0 + mw,
                                         bottom: my + mh,
                                     },
                                     radiusX: 1.0,
@@ -1875,7 +1879,7 @@ impl CandidateWindowV2 {
                         (&b_text, &b_label, &b_cmt)
                     };
                     if show_index {
-                        draw(&ctx, &tf_label, &fmt_label(i + 1), rm_x, y + dy, label_w, row_h, bl);
+                        draw(&ctx, &tf_label, &fmt_label(i + 1), rm_x + hilite_pad, y + dy, label_w, row_h, bl);
                     }
                     draw(&ctx, &tf, text, text_x, y + dy, cmt_x - text_x - 4.0, row_h, bt);
                     if !cmt.is_empty() {
@@ -2117,8 +2121,9 @@ impl CandidateWindowV2 {
                 self.cloaked_streak = 0;
             }
             crate::tsf::diag_note(&format!(
-                "cw2 layout dbg: font_pt={font_pt} em={em} line_h={line_h} horiz={horizontal} \
+                "cw2 layout dbg: font_pt={font_pt} em={em} line_h={line_h} horiz={horizontal} blur={} \
                  cands={} rawlen={} max_text={} width={width} height={height} w_out={w_out} h_out={h_out}",
+                if kind == "glass" { layout_f(skin, "blur_radius", 24.0) as i32 } else { -1 },
                 cands.len(),
                 raw.chars().count(),
                 cand_ws
