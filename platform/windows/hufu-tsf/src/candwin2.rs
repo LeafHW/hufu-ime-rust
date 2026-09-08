@@ -483,6 +483,19 @@ unsafe fn push_shadow_mask(
 /// GDI BitBlt 300×150 亚毫秒级，无需权限（区别于 Graphics.Capture）。
 /// DIB 32bpp top-down：GDI 字节序 BGRA；alpha 通道 BitBlt 不写（内容
 /// 未定义，实测全 0）——函数内强制置 255（见【终极根因】注释）。
+/// 【阶段验证 2026-09-08·用户指令】皮肤系统穷举重做：
+/// stage.txt（C:\ProgramData\HuFu\diag\stage.txt）控制渲染分层——
+/// 1=纯毛玻璃（透明+抓屏模糊，无遮罩/染色/阴影/内容）
+/// 2=+染色 3=+圆角遮罩 4=+阴影 5/0=全功能。每加一层自动化验证
+/// （条纹探针+梯度量化），定位第一个打破毛玻璃的层。
+fn read_diag_stage() -> u32 {
+    std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\stage.txt")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(5)
+}
+
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
@@ -1253,6 +1266,8 @@ impl CandidateWindowV2 {
             };
             ctx.SetTarget(&bitmap);
             ctx.BeginDraw();
+            // 【阶段验证】stage 分层渲染开关（见 read_diag_stage 注释）
+            let stage = read_diag_stage();
             ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
                 M11: dpi_scale,
                 M12: 0.0,
@@ -1333,6 +1348,24 @@ impl CandidateWindowV2 {
                         },
                     };
                     glass_cache_out = Some((g_key, bmp.clone()));
+                    if stage == 1 || stage == 2 {
+                        // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
+                        unsafe {
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
+                            });
+                            let full = D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: w_out as f32,
+                                bottom: h_out as f32,
+                            };
+                            let _ = ctx.DrawBitmap(&bmp, Some(&full as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
+                            });
+                        }
+                    } else {
                     unsafe {
                         // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
                         let mask = ctx
@@ -1411,12 +1444,13 @@ impl CandidateWindowV2 {
                             }
                         }
                     }
+                    } // else Layer 路径（stage 0/3+）
                     }
                 }
             }
             // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
             // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
-            if has_shadow {
+            if has_shadow && !(stage >= 1 && stage <= 3) {
                 // 【阴影透明度】material.shadow_alpha 独立滑条（颜色自带
                 // alpha 忽略——与纯色模型一致的语义）
                 let shadow_alpha = skin
@@ -1695,7 +1729,13 @@ impl CandidateWindowV2 {
                     r: back.r,
                     g: back.g,
                     b: back.b,
-                    a: if kind == "glass" { master * 0.45 } else { master },
+                    a: if stage == 1 {
+                        0.0 // 【阶段 1】纯毛玻璃：无染色
+                    } else if kind == "glass" {
+                        master * 0.45
+                    } else {
+                        master
+                    },
                 };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
@@ -1778,6 +1818,9 @@ impl CandidateWindowV2 {
                 }
             };
 
+            // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
+            let draw_content = !(stage >= 1 && stage <= 4);
+            if draw_content {
             // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
             if !raw.is_empty() {
                 // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
@@ -1953,6 +1996,7 @@ impl CandidateWindowV2 {
                 };
                 let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
             }
+            } // draw_content
 
             let _ = ctx.EndDraw(None, None);
             ctx.SetTarget(None);
