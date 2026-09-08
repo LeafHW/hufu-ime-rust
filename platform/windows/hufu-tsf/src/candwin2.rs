@@ -2377,7 +2377,10 @@ impl CandidateWindowV2 {
             // 分层窗承担——先置顶就位，候选窗随后 TOPMOST 压其上。
             // 【v3.5.2】拖拽中跳过（show 帧会把阴影拉回渲染旧坐标，与
             // MOUSEMOVE 的 shadowwin_follow 打架=「拖动后元素对不齐」）。
-            if kind == "glass" && _shadow_base >= 1.0 && !dragging {
+            // 【v3.6·裸玻璃实验】GLASS_SHADOW=false：阴影一并隐藏（用户
+            // 要求）——只留高亮+文字浮在纯玻璃上。改回 true 即恢复。
+            const GLASS_SHADOW: bool = false;
+            if GLASS_SHADOW && kind == "glass" && _shadow_base >= 1.0 && !dragging {
                 let s_alpha = skin
                     .pointer("/skin/material/shadow_alpha")
                     .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
