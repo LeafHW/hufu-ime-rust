@@ -394,6 +394,11 @@ pub struct CandidateWindowV2 {
     /// +圆角裁剪画为窗底。缓存键=(屏幕x,y,w,h)——位置/尺寸不变（打
     /// 字连续帧）零重抓；材质关（非 glass）清空。
     pub(crate) glass_raw: Option<(i32, i32, u32, u32, std::sync::Arc<Vec<u8>>)>,
+    /// 【毛玻璃渲染缓存 2026-09-08·闪退修复】设置页拖「模糊半径」
+    /// 滑杆时每帧 CreateBitmap(~700KB 上传)+CreateEffect——QQ（Chromium
+    /// GPU 合成）实测高频竞态崩（事件日志 QQNT.dll_unloaded c0000005）。
+    /// 缓存键=(w_out,h_out,blur)——不变则复用 bitmap+effect，零重建。
+    pub(crate) glass_cache: Option<((u32, u32, u32), (windows::Win32::Graphics::Direct2D::ID2D1Bitmap1, windows::Win32::Graphics::Direct2D::ID2D1Effect))>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -642,6 +647,7 @@ impl CandidateWindowV2 {
                 dy_cache: None,
                 shadow_cache: None,
                 glass_raw: None,
+                glass_cache: None,
             })
         }
     }
@@ -881,6 +887,7 @@ impl CandidateWindowV2 {
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
         let mut dy_cache_out: Option<((String, f32), f32)> = None;
         let mut shadow_cache_out: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
+        let mut glass_cache_out: Option<((u32, u32, u32), (windows::Win32::Graphics::Direct2D::ID2D1Bitmap1, windows::Win32::Graphics::Direct2D::ID2D1Effect))> = None;
         let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
@@ -1258,49 +1265,68 @@ impl CandidateWindowV2 {
             // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
             // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
             if kind == "glass" {
-                if let Some((_, _, _, _, raw_px)) = &self.glass_raw {
+                if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
                     let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
+                    // 【尺寸防御】抓屏缓存尺寸必须与本帧 w_out/h_out 完全
+                    // 一致（滑杆/字号变化瞬间新旧帧错配→CreateBitmap 越界
+                    // 读→崩）。不一致则本帧跳过毛玻璃（底色兜底），下帧
+                    // show 段重抓后恢复。
+                    let want_len = (w_out as usize) * (h_out as usize) * 4;
+                    if *gw == w_out && *gh == h_out && raw_px.len() == want_len {
+                    let g_key = (w_out, h_out, (blur_r * 4.0) as u32);
+                    let g_cached = self.glass_cache.take();
+                    let (bmp, effect) = match &g_cached {
+                        Some((k, v)) if *k == g_key => (v.0.clone(), v.1.clone()),
+                        _ => unsafe {
+                            let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                                bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_NONE.0),
+                                ..Default::default()
+                            };
+                            match ctx.CreateBitmap(D2D_SIZE_U { width: w_out, height: h_out }, Some(raw_px.as_ptr() as *const core::ffi::c_void), w_out * 4, &bmp_props) {
+                                Ok(bmp) => {
+                                    // 高斯模糊：属性 0 = StandardDeviation
+                                    let sd = blur_r / 3.0;
+                                    if let Ok(effect) = ctx.CreateEffect(&CLSID_D2D1GaussianBlur) {
+                                        let _ = effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &sd.to_ne_bytes());
+                                        effect.SetInput(0, &bmp, true);
+                                        (bmp, effect)
+                                    } else { return; }
+                                }
+                                Err(_) => return,
+                            }
+                        },
+                    };
+                    glass_cache_out = Some((g_key, (bmp.clone(), effect.clone())));
                     unsafe {
-                        let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
-                            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
-                                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
-                            },
-                            dpiX: 96.0,
-                            dpiY: 96.0,
-                            bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_NONE.0),
-                            ..Default::default()
-                        };
-                        if let Ok(bmp) = ctx.CreateBitmap(D2D_SIZE_U { width: w_out, height: h_out }, Some(raw_px.as_ptr() as *const core::ffi::c_void), w_out * 4, &bmp_props) {
-                            // 高斯模糊：属性 0 = StandardDeviation（与阴影
-                            // effect 同款 SetValue 数字属性写法）
-                            if let Ok(effect) = ctx.CreateEffect(&CLSID_D2D1GaussianBlur) {
-                                let sd = blur_r / 3.0;
-                                let _ = effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &sd.to_ne_bytes());
-                                effect.SetInput(0, &bmp, true);
-                                // 圆角裁剪（物理像素系）+ 满幅 DrawImage
-                                let mask = ctx
-                                    .GetFactory()
-                                    .ok()
-                                    .and_then(|f| {
-                                        f.CreateRoundedRectangleGeometry(
-                                            &D2D1_ROUNDED_RECT {
-                                                rect: D2D_RECT_F {
-                                                    left: shadow_m * dpi_scale,
-                                                    top: shadow_m * dpi_scale,
-                                                    right: (shadow_m + width) * dpi_scale,
-                                                    bottom: (shadow_m + height) * dpi_scale,
-                                                },
-                                                radiusX: radius * dpi_scale,
-                                                radiusY: radius * dpi_scale,
-                                            },
-                                        )
-                                        .ok()
-                                    });
-                                if let Some(mask) = mask {
-                                    // effect → ID2D1Image（DrawImage 参数类型）
-                                    if let Ok(eff_img) = effect.cast::<ID2D1Image>() {
-                                    if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                        // 圆角裁剪（物理像素系）+ 满幅 DrawImage
+                        let mask = ctx
+                            .GetFactory()
+                            .ok()
+                            .and_then(|f| {
+                                f.CreateRoundedRectangleGeometry(
+                                    &D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: shadow_m * dpi_scale,
+                                            top: shadow_m * dpi_scale,
+                                            right: (shadow_m + width) * dpi_scale,
+                                            bottom: (shadow_m + height) * dpi_scale,
+                                        },
+                                        radiusX: radius * dpi_scale,
+                                        radiusY: radius * dpi_scale,
+                                    },
+                                )
+                                .ok()
+                            });
+                        if let Some(mask) = mask {
+                            // effect → ID2D1Image（DrawImage 参数类型）
+                            if let Ok(eff_img) = effect.cast::<ID2D1Image>() {
+                            if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
                                     let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
                                     lp.contentBounds = D2D_RECT_F {
                                         left: -1.0e6,
@@ -1343,7 +1369,6 @@ impl CandidateWindowV2 {
                             }
                         }
                     }
-                }
             }
             // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
             // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
@@ -2123,6 +2148,9 @@ impl CandidateWindowV2 {
             }
             if let Some(v) = shadow_cache_out {
                 self.shadow_cache = Some(v);
+            }
+            if let Some(v) = glass_cache_out {
+                self.glass_cache = Some(v);
             }
             // 内容坐标 → 窗口坐标（内容在阴影边距内侧；高 DPI 下边距同乘 scale）
             // 【拖拽防闪 2026-09-08】拖拽中（鼠标按住移动）本线程与 wndproc
