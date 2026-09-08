@@ -765,46 +765,24 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
         let kind = material_kind(skin);
-        // 【毛玻璃 v3·DWM acrylic】kind=glass → 系统级 acrylic（复用文件
-        // 头部现成 apply_accent）。染色=皮肤 tint（#RRGGBBAA，语义即
-        // 毛玻璃染色）；tint 缺省时回退 back_color+45%。幂等：变化才调用。
+        // 【毛玻璃 v3.3·accent=纯模糊底】染色固定极淡（alpha≈3% 不可见，
+        // 只兜底）——视觉染色/大小/R 角/阴影全部回归自绘（tint 面板）。
+        // blur_radius=0 → TRANSPARENTGRADIENT（无模糊纯透明）；>0 →
+        // ACRYLIC（系统模糊强度固定，数值不影响观感，仅 0/非0 切换有无）。
         {
             let want_acrylic = kind == "glass";
-            // 幂等键含 argb：kind 不变但 tint/染色浓度变了也重设 accent
-            //（「染色浓度不生效」根因：glass→glass 时旧逻辑跳过重设）
-            let argb = if want_acrylic {
-                let tint_v = skin
-                    .pointer("/skin/material/tint")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
-                    .and_then(|x| x.as_str())
-                    .and_then(parse_hex);
-                let (tr, tg, tb, ta) = match tint_v {
-                    Some([r, g, b, a]) => (r, g, b, a),
-                    None => {
-                        let back = color_f(skin, "back_color", "#202022E6");
-                        (
-                            (back.r * 255.0) as u8,
-                            (back.g * 255.0) as u8,
-                            (back.b * 255.0) as u8,
-                            (0.45 * 255.0) as u8,
-                        )
-                    }
-                };
-                (u32::from(ta) << 24) | (u32::from(tb) << 16) | (u32::from(tg) << 8) | u32::from(tr)
+            let blur_v = layout_f(skin, "blur_radius", 24.0);
+            let state: u32 = if !want_acrylic {
+                ACCENT_DISABLED
+            } else if blur_v <= 0.0 {
+                ACCENT_ENABLE_TRANSPARENTGRADIENT
             } else {
-                u32::MAX
+                ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
-            if self.acrylic_last.get() != argb {
-                if want_acrylic {
-                    let a = ((argb >> 24) & 0xFF) as u8;
-                    let b = ((argb >> 16) & 0xFF) as u8;
-                    let g = ((argb >> 8) & 0xFF) as u8;
-                    let r = (argb & 0xFF) as u8;
-                    apply_accent(self.hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, [r, g, b, a]);
-                } else {
-                    apply_accent(self.hwnd, ACCENT_DISABLED, [0, 0, 0, 0]);
-                }
-                self.acrylic_last.set(argb);
+            // 幂等键：state 不同即重设（accent 参数恒定无需比较 argb）
+            if self.acrylic_last.get() != state {
+                apply_accent(self.hwnd, state, [0, 0, 0, 8]);
+                self.acrylic_last.set(state);
             }
         }
         let tint_hex = skin
@@ -1272,11 +1250,6 @@ impl CandidateWindowV2 {
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;
-        // 【毛玻璃 v3·窗口收缩】acrylic 模式：accent 盖整窗矩形——自绘
-        // 阴影边距会让方角色块超出圆角窗体（用户实测「大色块超出候选
-        // 框」）。故 glass 无边距（窗口=窗体），圆角由 SetWindowRgn 裁
-        //（同时裁掉 accent 方角），阴影不画。
-        let has_shadow = has_shadow && kind != "glass";
         // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
         // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
         // 实测「超出 R 角的直角色块」= 弥散阴影遭位图边缘切割）。
@@ -1793,12 +1766,21 @@ impl CandidateWindowV2 {
                 // 层」——保持 master 不透明会把毛玻璃完全盖死（用户实测
                 // 「画了但看不到」的根因），降为 0.55 让模糊底透出。
                 let back = color_f(skin, "back_color", "#202022E6");
-                let bg_c = D2D1_COLOR_F {
-                    r: back.r,
-                    g: back.g,
-                    b: back.b,
-                    // 【v3】glass 染色由 DWM acrylic GradientColor 承担
-                    a: if stage == 1 || kind == "glass" { 0.0 } else { master },
+                // 【v3.3 视觉回归自绘】accent 只做模糊底（染色固定极淡），
+                // 面板大小/R 角/染色浓度/阴影全由自绘决定——glass 时底色
+                // =tint（色+浓度），画皮肤圆角；非 glass=back_color×master。
+                let bg_c = if kind == "glass" {
+                    match tint_hex {
+                        Some([r, g, b, a]) => D2D1_COLOR_F {
+                            r: r as f32 / 255.0,
+                            g: g as f32 / 255.0,
+                            b: b as f32 / 255.0,
+                            a: a as f32 / 255.0,
+                        },
+                        None => D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: 0.45 },
+                    }
+                } else {
+                    D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: if stage == 1 { 0.0 } else { master } }
                 };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
@@ -2411,11 +2393,8 @@ impl CandidateWindowV2 {
                     IsWindowVisible(self.hwnd).0
                 ));
             }
-            // 【毛玻璃 v3.2·DWM 圆角】SetWindowRgn 裁不了 accent（DWM
-            // backdrop 层，用户实测仍直角）。改 DWMWA_WINDOW_CORNER_
-            // PREFERENCE=33（Win11 官方合成级圆角——整个窗口视觉含
-            // accent 一起圆角化）。glass=ROUND(2)；非 glass=DONOTROUND(1)。
-            // 动态加载（同 DwmGetWindowAttribute 模式）。系统半径固定~8px。
+            // 【毛玻璃 v3.3】圆角回归自绘（accent 极淡不可见方角无碍；
+            // 系统 ROUND 会裁自绘阴影外角）——统一 DONOTROUND。
             unsafe {
                 let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(
                     windows::core::w!("dwmapi.dll"),
@@ -2433,7 +2412,7 @@ impl CandidateWindowV2 {
                             u32,
                         ) -> windows::core::HRESULT;
                         let f: DwmaSet = std::mem::transmute(p);
-                        let pref: u32 = if kind == "glass" { 2 } else { 1 };
+                        let pref: u32 = 1; // DONOTROUND：圆角由自绘决定
                         let _ = f(
                             self.hwnd,
                             33, // DWMWA_WINDOW_CORNER_PREFERENCE
