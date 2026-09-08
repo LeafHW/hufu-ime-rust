@@ -403,6 +403,8 @@ pub struct CandidateWindowV2 {
     /// 【毛玻璃 v3】上次 accent 状态：argb 值；u32::MAX=OFF（幂等判断
     /// 含 tint——用户拖「染色浓度」滑杆时 kind 不变也须重设 accent）
     pub(crate) acrylic_last: std::cell::Cell<u64>,
+    /// RGN 幂等键（尺寸+半径打包；MAX=未设）
+    pub(crate) rgn_last: std::cell::Cell<u64>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -677,6 +679,7 @@ impl CandidateWindowV2 {
                 glass_raw: None,
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
+                rgn_last: std::cell::Cell::new(u64::MAX),
             })
         }
     }
@@ -2031,7 +2034,9 @@ impl CandidateWindowV2 {
                 }
             }
 
-            // 边框【v3.6 裸玻璃：glass 时一并隐藏（只留高亮+文字）】
+            // 边框【v3.7 glass=tint 色圆角描边】accent 圆角被 DWM 钉死
+            // 8px（RGN 实测无效），皮肤 R 角的唯一视觉载体=自绘描边
+            // （radius=皮肤 corner_radius，色=tint 同色系）。
             if let Some(b) = &b_border {
                 if kind != "glass" {
                     let bw = layout_f(skin, "border_width", 1.0);
@@ -2046,6 +2051,33 @@ impl CandidateWindowV2 {
                     radiusY: radius,
                 };
                 let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+                }
+            }
+            // 【v3.7 glass·皮肤色圆角描边】RGN 实测裁不了 accent（DWM
+            // 圆角钉死 8px），皮肤 R 角由描边承载：tint 同色系、宽度
+            // 1.5px、radius=皮肤 corner_radius。
+            if kind == "glass" {
+                if let Some([r, g, b, a]) = tint_hex {
+                    let bc = D2D1_COLOR_F {
+                        r: r as f32 / 255.0,
+                        g: g as f32 / 255.0,
+                        b: b as f32 / 255.0,
+                        a: (a as f32 / 255.0).clamp(0.35, 0.9),
+                    };
+                    if let Ok(br) = ctx.CreateSolidColorBrush(&bc, None) {
+                        let bw = 1.5;
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: bw / 2.0,
+                                top: bw / 2.0,
+                                right: width - bw / 2.0,
+                                bottom: height - bw / 2.0,
+                            },
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        let _ = ctx.DrawRoundedRectangle(&rr, &br, bw, None);
+                    }
                 }
             }
             } // draw_content
@@ -2428,6 +2460,31 @@ impl CandidateWindowV2 {
                     sp_ok,
                     IsWindowVisible(self.hwnd).0
                 ));
+            }
+            // 【v3.7 RGN 圆角重试】用户要求玻璃 R 角=皮肤 corner_radius。
+            // DWM ROUND 固定 8px 无法自定义；SetWindowRgn 若对 accent
+            // 有效（v3.2 判无效但当时测试条件不纯：染色/边距干扰）则
+            // 任意半径可达。每帧按当前尺寸+皮肤 radius 设 RGN（幂等：
+            // 尺寸/半径变才重设）。无效时 DWM ROUND 8px 兜底仍在。
+            if kind == "glass" {
+                let rgn_r = (radius * dpi_scale).round().max(1.0) as i32;
+                let rgn_key = ((w_out as u64) << 32) | ((h_out as u64) << 16) | rgn_r as u64;
+                if self.rgn_last.get() != rgn_key {
+                    unsafe {
+                        let rgn = CreateRoundRectRgn(
+                            0,
+                            0,
+                            w_out as i32 + 1,
+                            h_out as i32 + 1,
+                            rgn_r,
+                            rgn_r,
+                        );
+                        if !rgn.is_invalid() {
+                            let _ = SetWindowRgn(self.hwnd, rgn, true);
+                            self.rgn_last.set(rgn_key);
+                        }
+                    }
+                }
             }
             // 【毛玻璃 v3.5·DWM ROUND】accent 方角（面板圆角外四角残留）
             // 用系统合成级圆角裁掉（v3.2 实测有效：accent+窗口一起圆角化）。
