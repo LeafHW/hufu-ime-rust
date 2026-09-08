@@ -1267,6 +1267,17 @@ impl CandidateWindowV2 {
             // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
             // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
             if kind == "glass" {
+                // 【毛玻璃诊断】分支进入/缓存状态/防御拦截全链路日志
+                crate::tsf::diag_note(&format!(
+                    "glass draw: raw={} w_out={w_out} h_out={h_out}",
+                    match &self.glass_raw {
+                        Some((cx, cy, cw, ch, v)) => format!(
+                            "some({cw}x{ch} len={})",
+                            v.len()
+                        ),
+                        None => "none".into(),
+                    }
+                ));
                 if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
                     let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
                     // 【尺寸防御】抓屏缓存尺寸必须与本帧 w_out/h_out 完全
@@ -1275,7 +1286,7 @@ impl CandidateWindowV2 {
                     // show 段重抓后恢复。
                     let want_len = (w_out as usize) * (h_out as usize) * 4;
                     if *gw == w_out && *gh == h_out && raw_px.len() == want_len {
-                    let g_key = (w_out, h_out, (blur_r * 4.0) as u32);
+                    crate::tsf::diag_note("glass draw: size-check PASS, drawing");                    let g_key = (w_out, h_out, (blur_r * 4.0) as u32);
                     let g_cached = self.glass_cache.take();
                     let (bmp, effect) = match &g_cached {
                         Some((k, v)) if *k == g_key => (v.0.clone(), v.1.clone()),
@@ -2177,11 +2188,18 @@ impl CandidateWindowV2 {
                     None => true,
                 };
                 if need {
-                    self.glass_raw = capture_screen_rgba(gx, gy, w_out, h_out)
-                        .map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
+                    let cap = capture_screen_rgba(gx, gy, w_out, h_out);
+                    crate::tsf::diag_note(&format!(
+                        "glass capture: at({gx},{gy}) {w_out}x{h_out} -> {}",
+                        match &cap { Some(v) => format!("ok len={}", v.len()), None => "FAIL".into() }
+                    ));
+                    self.glass_raw = cap.map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
                 }
             } else if !glass_on {
                 self.glass_raw = None;
+            }
+            if glass_on && self.glass_raw.is_none() {
+                crate::tsf::diag_note("glass capture: 缓存为空（抓屏从未成功）");
             }
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
