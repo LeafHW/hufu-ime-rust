@@ -215,6 +215,33 @@ pub struct Layout {
     pub label_size_lock: bool,
 }
 
+impl Layout {
+    /// 【比例联动 2026-09-08】字号变化（滚轮缩放/设置页改字号）时，
+    /// 几何参数按同比放大/缩小——只放字不放垫（内边距/间距/圆角/
+    /// 边框/阴影大小）会「字大垫小」放大不好看（用户实测）。
+    /// 各参数独立 clamp（与设置页滑杆上限同源）防连年缩放漂移。
+    /// 不联动：颜色/文本（label_format/mark_text）、阴影偏移（用户
+    /// 手调的方向性参数）、固定宽（0=自适应语义不能乘）。
+    pub fn scale_geometry(&mut self, ratio: f32) {
+        if !(0.05..=20.0).contains(&ratio) || (ratio - 1.0).abs() < 1e-3 {
+            return;
+        }
+        let sc = |v: f32, hi: f32| (v * ratio).clamp(0.0, hi);
+        self.corner_radius = sc(self.corner_radius, 40.0);
+        self.hilited_corner_radius = sc(self.hilited_corner_radius, 40.0);
+        self.margin_x = sc(self.margin_x, 60.0);
+        self.margin_y = sc(self.margin_y, 60.0);
+        self.spacing = sc(self.spacing, 24.0);
+        self.candidate_spacing = sc(self.candidate_spacing, 48.0);
+        self.hilite_spacing = sc(self.hilite_spacing, 16.0);
+        self.hilite_padding = sc(self.hilite_padding, 40.0);
+        self.line_spacing = sc(self.line_spacing, 40.0);
+        self.border_width = sc(self.border_width, 12.0);
+        self.shadow_radius = sc(self.shadow_radius, 60.0);
+        self.min_width = sc(self.min_width, 800.0);
+    }
+}
+
 impl Default for Layout {
     fn default() -> Self {
         Layout {

@@ -103,6 +103,10 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
         // 【语义修正】label_font_point=0 是「0.78 倍正文自动跟随」
         // （candwin2 tf_label 回退 tf_small）——保持 0 不动，主字缩放
         // 时天然跟随（此前 0/主字=0 被 clamp 成 4pt 钉死）。
+        // 【比例联动 2026-09-08】几何参数（内边距/间距/圆角/边框/阴影
+        // 大小/最小宽）同比例放大——只放字不放垫「放大不好看」（用户
+        // 实测）。逻辑在 hufu_skin::Layout::scale_geometry（与设置页
+        // 改字号共用同一语义）。
         "skin_font_delta" => {
             let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
             let id = host.engine.config.appearance.skin.clone();
@@ -111,9 +115,13 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 Ok(mut s) => {
                     let op = s.layout.font_point;
                     let np = (op as i32 + delta).clamp(10, 36);
-                    if s.layout.label_font_point > 0.0 && op > 0.0 {
-                        let ratio = s.layout.label_font_point / op;
-                        s.layout.label_font_point = (np as f32 * ratio).clamp(4.0, 40.0);
+                    if op > 0.0 {
+                        let ratio = np as f32 / op;
+                        if s.layout.label_font_point > 0.0 {
+                            let r2 = s.layout.label_font_point / op;
+                            s.layout.label_font_point = (np as f32 * r2).clamp(4.0, 40.0);
+                        }
+                        s.layout.scale_geometry(ratio);
                     }
                     s.layout.font_point = np as f32;
                     let nl = s.layout.label_font_point;

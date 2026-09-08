@@ -890,6 +890,26 @@ function bindSkin() {
           const ev = $("#l-lfp-v"); if (ev) ev.textContent = nl;
         }
       }
+      // 【比例联动 2026-09-08】几何参数同比例放大（与滚轮缩放同一语义，
+      // 见 hufu_skin::Layout::scale_geometry）——只放字不放垫会「字大
+      // 垫小」放大不好看。联动后刷新对应滑杆显示。
+      if (oldF > 0) {
+        const r = v / oldF;
+        if (r > 0.95 && r < 1.05) { /* 忽略微调 */ }
+        else {
+          const geo = [["corner_radius","#l-radius",40],["hilited_corner_radius","#l-hr",40],
+                       ["margin_x","#l-mx",60],["margin_y","#l-my",60],
+                       ["spacing",null,24],["candidate_spacing","#l-cs",48],
+                       ["hilite_spacing","#l-hsp",16],["hilite_padding","#l-hp",40],
+                       ["line_spacing","#l-ls",40],["border_width",null,12],
+                       ["shadow_radius","#l-sr",60],["min_width",null,800]];
+          for (const [k, sel, hi] of geo) {
+            const nv = Math.round((SKIN.layout[k] || 0) * r * 2) / 2;
+            SKIN.layout[k] = Math.min(Math.max(nv, 0), hi);
+            if (sel) { const e = $(sel); if (e) e.value = SKIN.layout[k]; const t = $(sel + "-v"); if (t) t.textContent = SKIN.layout[k]; }
+          }
+        }
+      }
       SKIN.layout.font_point = v;
       preview(); saveSkinNow();
     }
