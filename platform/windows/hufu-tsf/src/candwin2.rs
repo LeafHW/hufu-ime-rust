@@ -2456,6 +2456,18 @@ impl CandidateWindowV2 {
                             &pref as *const u32 as *const core::ffi::c_void,
                             4,
                         );
+                        // 【v3.6 修「还有点阴影」】DWM 非客户区渲染会给弹窗
+                        // 自动画一圈系统阴影——自绘阴影时代被盖住看不出，
+                        // 裸玻璃全裸露后可见。glass 关 NC 渲染。
+                        if kind == "glass" {
+                            let nc: u32 = 0; // DWMWA_NCRENDERING_ENABLED=FALSE
+                            let _ = f(
+                                self.hwnd,
+                                1,
+                                &nc as *const u32 as *const core::ffi::c_void,
+                                4,
+                            );
+                        }
                     }
                 }
             }
