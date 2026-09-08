@@ -783,18 +783,26 @@ impl CandidateWindowV2 {
         // glass_alpha 弃用（白雾语义错误）；浓度=tint 自带 alpha。
         {
             let want_acrylic = kind == "glass";
-            let blur_v = layout_f(skin, "blur_radius", 24.0);
+            // 【模糊三档 2026-09-09】真档位枚举 blur_level（low/mid/high，
+            // 默认 low）——不再从 blur_radius 1-100 截值。旧皮肤无
+            // blur_level 字段时从 blur_radius 推档兼容（≤50=low，其余
+            // 按值分 mid/high）。
+            let level = skin
+                .pointer("/skin/layout/blur_level")
+                .or_else(|| skin.get("layout").and_then(|l| l.get("blur_level")))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let bv = layout_f(skin, "blur_radius", 24.0);
+                    if bv <= 50.0 { "low".into() } else if bv <= 80.0 { "mid".into() } else { "high".into() }
+                });
             let state: u32 = if !want_acrylic {
                 ACCENT_DISABLED
-            } else if blur_v <= 0.0 {
-                // 0=无模糊纯透明
-                ACCENT_ENABLE_TRANSPARENTGRADIENT
-            } else if blur_v <= 50.0 {
-                // 1-50=轻模糊（BLURBEHIND，模糊度较低——用户实测
-                // ACRYLIC「模糊度有点高」）
+            } else if level == "low" {
+                // 低=轻模糊（BLURBEHIND）
                 ACCENT_ENABLE_BLURBEHIND
             } else {
-                // 51-100=重模糊（ACRYLIC）
+                // 中/高=重模糊（ACRYLIC——Windows 仅两档模糊深度）
                 ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
             // 染色=tint RGBA（无 tint 时深灰 50% 兜底）

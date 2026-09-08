@@ -193,6 +193,18 @@ impl Default for Colors {
     }
 }
 
+/// 毛玻璃模糊档位（真三档枚举，非 1-100 截值）。
+/// low=轻模糊（BLURBEHIND）/ mid=重模糊（ACRYLIC）/ high=重模糊
+///（Windows 仅两档模糊深度，mid/high 同深度、档位语义保留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlurLevel {
+    #[default]
+    Low,
+    Mid,
+    High,
+}
+
 /// 布局参数（与 weasel layout 对齐）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -222,6 +234,9 @@ pub struct Layout {
     /// 【毛玻璃 2026-09-08】material.kind=glass 时的高斯模糊半径
     ///（DLL 渲染：σ=blur/3，抓屏底模糊+圆角裁剪）。默认 24。
     pub blur_radius: f32,
+    /// 【模糊三档 2026-09-09】真档位枚举（low/mid/high，默认 low）——
+    /// 有此字段优先生效；旧皮肤无此字段时从 blur_radius 推档兼容。
+    pub blur_level: BlurLevel,
     pub mark_text: String,
     /// 【序号样式 2026-09-08】digit=阿拉伯数字（默认）/ zh=中文数字
     ///（一二三…十）/ roman=罗马数字（Ⅰ Ⅱ Ⅲ…Ⅹ）。label_format 的
@@ -286,9 +301,9 @@ impl Default for Layout {
             // 【默认偏移 0】用户定稿：所有皮肤默认阴影偏移=0（居中）。
             shadow_offset_x: 0.0,
             shadow_offset_y: 0.0,
-            // 【默认低档】模糊=低/中/高三档（accent 时代映射：低=轻
-            // BLURBEHIND、中/高=重 ACRYLIC），默认低=10。
-            blur_radius: 10.0,
+            // 【默认低档】模糊=低/中/高三档（真档位枚举），默认 low。
+            blur_radius: 24.0,
+            blur_level: BlurLevel::Low,
             mark_text: "·".into(),
             label_style: "digit".into(),
             label_size_lock: true,
