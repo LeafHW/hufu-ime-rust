@@ -344,7 +344,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <h3>材质</h3>
         <div class="row">
           <div class="checkline"><input type="checkbox" id="mat-glass"><label for="mat-glass" title="窗底实时抓取屏幕内容并高斯模糊（真窗口毛玻璃；预览图以半透明近似）">毛玻璃底</label></div>
-          <div class="field"><label>模糊半径 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="4" max="60" step="1"></div>
+          <div class="field"><label>模糊半径 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="0" max="100" step="1" title="0=关闭模糊（纯染色透明）；>0=系统毛玻璃模糊（系统风格固定强度）"></div>
           <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
           <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
           <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc"></div>
