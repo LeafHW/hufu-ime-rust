@@ -2852,25 +2852,30 @@ unsafe fn shadowwin_render(
         }
     };
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    // SDF 高斯衰减：阴影矩形=候选窗窗口矩形（面板视觉边界），中心
-    // 偏移（shadow_offset）。黑影预乘：BGR=0，A=衰减。
-    // 【v3.5.3】浓度/圆角恢复原值（用户：玻璃加大解决遮挡，阴影改回）。
+    // SDF 双高斯衰减【v3.8.1 阴影质量重做】用户：太淡+要贴玻璃区域。
+    // 单高斯 σ 小（半径12→σ7）衰减快、21px 外全无=「质量不行」。改
+    // 双段：近场 σ₁=σ 承浓度，远场 σ₂=σ×2.6 拖尾（Win11/系统窗口
+    // 阴影=近浓+大范围淡晕的观感）。SDF 矩形=候选窗窗口矩形（毛
+    // 玻璃区域），圆角=皮肤(min 8) 完全贴合。
     let (fw, fh) = (w as f32, h as f32);
     let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
-    let sigma = (shadow_radius * 0.5 + 1.0).max(1.0);
-    let base_a = alpha8 as f32 / 255.0;
+    let sigma1 = (shadow_radius * 0.5 + 1.0).max(1.0);
+    let sigma2 = sigma1 * 2.6;
+    // 近场浓（总量的 62%）+远场晕（38%），整体 ×1.15 增强可见度
+    let base_a = (alpha8 as f32 / 255.0 * 1.15).min(1.0);
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     let mut o = 0usize;
     for y in 0..h {
         for x in 0..w {
             let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, scx, scy, phw, phh, radius as f32);
-            // 面板内部无影；外侧高斯衰减
+            // 面板内部无影；外侧双高斯（近浓+远晕）
             let a = if d <= 0.0 {
                 0.0
             } else {
-                let t = d / sigma;
-                base_a * (-t * t * 0.5).exp()
+                let t1 = d / sigma1;
+                let t2 = d / sigma2;
+                base_a * (0.62 * (-t1 * t1 * 0.5).exp() + 0.38 * (-t2 * t2 * 0.5).exp())
             };
             let a8 = (a * 255.0).round() as u8;
             // BGRA 预乘（黑影：BGR=0）
@@ -2975,9 +2980,10 @@ pub fn shadowwin_show(
         return;
     }
     unsafe {
-        // 边距=σ*3+6+|off|（与自绘阴影公式一致）
-        let sigma = shadow_radius * 0.5 + 1.0;
-        let m = (sigma * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        // 边距按远场 σ₂（拖尾 3σ₂ 覆盖）——位图边界截断拖尾会出硬边
+        let sigma1 = shadow_radius * 0.5 + 1.0;
+        let sigma2 = sigma1 * 2.6;
+        let m = (sigma2 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
         *SHADOW_M.lock().unwrap() = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
