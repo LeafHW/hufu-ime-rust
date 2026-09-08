@@ -33,7 +33,7 @@
                    "font_face":  "霞鹜文楷 GB 屏幕阅读版",
                    "font_point":  16.0,
                    "label_font_point":  12.0,
-                   "label_format": "%s.",
+                   "label_format": "%s.", "label_style": "digit",
                    "corner_radius":  6.0,
                    "hilited_corner_radius":  10,
                    "border_width":  0.5,
