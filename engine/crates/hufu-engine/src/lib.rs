@@ -954,21 +954,13 @@ impl Engine {
                 if self.config.input.backslash_dunhao {
                     return KeyOutcome::commit("、", self.state(session));
                 }
+                // 【\ 与 / 完全同构 2026-09-08】命名空间档：无条件进 raw
+                //（快符表一般无 \ 词条，判 has_continuation 会回退到
+                // 顶字上屏——用户实测「连按会上屏」的根因）；候选（首位
+                // 顿号/全 \ 串按数量出 \）由 refresh 的 fallback 统一给，
+                // 与 / 同一条链路。
                 session.raw.push('\\');
                 self.refresh_candidates(session);
-                if session.candidates.is_empty() {
-                    session.candidates.push(hufu_types::Candidate {
-                        text: "、".into(),
-                        code: "\\".into(),
-                        comment: String::new(),
-                        weight: 0.0,
-                        source: hufu_types::CandidateKind::Symbol,
-                        pinned: false,
-                        commit_override: None,
-                        partial: false,
-                    });
-                    let _ = self.state(session);
-                }
                 return KeyOutcome::consumed(self.state(session));
             }
             // '/' 符号命名空间（关闭直出档=现状：首选顿号，继续输入进入
@@ -1010,6 +1002,13 @@ impl Engine {
         // 【/ 数量追加 2026-09-06】raw 以 / 开头（命名空间档）时再按 /
         // = 继续串：//、/// 候选按数量出 /（走标点会顶字打断）。
         if c == '/' && !shift && session.raw.starts_with('/') {
+            session.raw.push(c);
+            self.refresh_candidates(session);
+            return KeyOutcome::consumed(self.state(session));
+        }
+        // 【\ 与 / 同构 2026-09-08】raw 以 \ 开头时再按 \ 继续串：
+        // \\、\\\ 按数量出 \（直出档空态不进 raw，不受此分支影响）。
+        if c == '\\' && !shift && session.raw.starts_with('\\') {
             session.raw.push(c);
             self.refresh_candidates(session);
             return KeyOutcome::consumed(self.state(session));
@@ -1242,7 +1241,7 @@ impl Engine {
         let has_upper = raw.chars().any(|x| x.is_ascii_uppercase());
 
         // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
-        if (raw.starts_with(';') || raw.starts_with('/'))
+        if (raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\'))
             && len >= 2
             && session.candidates.len() == 1
         {
@@ -1574,7 +1573,7 @@ impl Engine {
         if !self.schema.dict.completions(raw, 1).is_empty() {
             return true;
         }
-        if raw.starts_with(';') || raw.starts_with('/') {
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\') {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(raw));
         }
@@ -1586,7 +1585,7 @@ impl Engine {
         if !self.schema.dict.completions(s, 1).is_empty() {
             return true;
         }
-        if s.starts_with(';') || s.starts_with('/') {
+        if s.starts_with(';') || s.starts_with('/') || s.starts_with('\\') {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(s) || k == s);
         }
@@ -2639,13 +2638,15 @@ impl Engine {
         // - 直出档空态根本不进 raw（直接 commit 、）。
         if session.candidates.is_empty() {
             // 全 / 串（//、///）=按数量出 /；单个 / 落下方首位顿号
+            // 【\ 与 / 同构 2026-09-08】全 \ 串按数量出 \、单个 \ 首位顿号
             let all_slash = session.raw.len() >= 2
-                && session.raw.chars().all(|c| c == '/');
+                && (session.raw.chars().all(|c| c == '/')
+                    || session.raw.chars().all(|c| c == '\\'));
             let fallback = if all_slash {
                 Some(session.raw.as_str())
             } else {
                 match session.raw.as_str() {
-                    "/" => Some("、"),
+                    "/" | "\\" => Some("、"),
                     ";" => Some("；"),
                     "'" => Some("‘"),
                     _ => None,
@@ -3921,8 +3922,16 @@ mod tests {
         assert_eq!(o.commit, None, "默认档不直出");
         assert!(!s.candidates.is_empty(), "应弹「、」候选");
         assert_eq!(s.candidates[0].text, "、", "首选=顿号");
-        // 空格确认上屏「、」
-        let o2 = eng.process_key(&mut s, key(' '));
+        // 连按 \：进 raw 续串（\\ 按数量出 \），不顶字上屏（与 / 同构）
+        let oc = eng.process_key(&mut s, key('\\'));
+        assert_eq!(oc.commit, None, "连按 \\ 不得上屏（与 / 同构）");
+        assert_eq!(s.raw, "\\\\", "连按进 raw 续串");
+        assert!(!s.candidates.is_empty(), "全 \\ 串应有候选（按数量出 \\）");
+        assert_eq!(s.candidates[0].text, "\\\\", "候选=按数量出 \\");
+        // 空格确认上屏
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('\\'));
+        let o2 = eng.process_key(&mut s2, key(' '));
         assert_eq!(o2.commit.as_deref(), Some("、"), "空格确认顿号");
         // 勾选直出档：空态 \ 直接上屏「、」
         let mut c2 = hufu_config::Config::default();
