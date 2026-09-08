@@ -399,8 +399,9 @@ pub struct CandidateWindowV2 {
     /// GPU 合成）实测高频竞态崩（事件日志 QQNT.dll_unloaded c0000005）。
     /// 缓存键=(w_out,h_out,blur)——不变则复用 bitmap+effect，零重建。
     pub(crate) glass_cache: Option<((u32, u32, u32), windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)>,
-    /// 【毛玻璃 v3】DWM acrylic 当前是否已应用（幂等开关）
-    pub(crate) acrylic_on: std::cell::Cell<bool>,
+    /// 【毛玻璃 v3】上次 accent 状态：argb 值；u32::MAX=OFF（幂等判断
+    /// 含 tint——用户拖「染色浓度」滑杆时 kind 不变也须重设 accent）
+    pub(crate) acrylic_last: std::cell::Cell<u32>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -674,7 +675,7 @@ impl CandidateWindowV2 {
                 shadow_cache: None,
                 glass_raw: None,
                 glass_cache: None,
-                acrylic_on: std::cell::Cell::new(false),
+                acrylic_last: std::cell::Cell::new(u32::MAX),
             })
         }
     }
@@ -769,32 +770,41 @@ impl CandidateWindowV2 {
         // 毛玻璃染色）；tint 缺省时回退 back_color+45%。幂等：变化才调用。
         {
             let want_acrylic = kind == "glass";
-            if self.acrylic_on.get() != want_acrylic {
+            // 幂等键含 argb：kind 不变但 tint/染色浓度变了也重设 accent
+            //（「染色浓度不生效」根因：glass→glass 时旧逻辑跳过重设）
+            let argb = if want_acrylic {
+                let tint_v = skin
+                    .pointer("/skin/material/tint")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
+                    .and_then(|x| x.as_str())
+                    .and_then(parse_hex);
+                let (tr, tg, tb, ta) = match tint_v {
+                    Some([r, g, b, a]) => (r, g, b, a),
+                    None => {
+                        let back = color_f(skin, "back_color", "#202022E6");
+                        (
+                            (back.r * 255.0) as u8,
+                            (back.g * 255.0) as u8,
+                            (back.b * 255.0) as u8,
+                            (0.45 * 255.0) as u8,
+                        )
+                    }
+                };
+                (u32::from(ta) << 24) | (u32::from(tb) << 16) | (u32::from(tg) << 8) | u32::from(tr)
+            } else {
+                u32::MAX
+            };
+            if self.acrylic_last.get() != argb {
                 if want_acrylic {
-                    let tint_v = skin
-                        .pointer("/skin/material/tint")
-                        .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
-                        .and_then(|x| x.as_str())
-                        .and_then(parse_hex);
-                    let (tr, tg, tb, ta) = match tint_v {
-                        // tint alpha=染色浓度（设置页「毛玻璃染色」控件，
-                        // UI 值即真值；缺省回退 back_color+45%）
-                        Some([r, g, b, a]) => (r, g, b, a),
-                        None => {
-                            let back = color_f(skin, "back_color", "#202022E6");
-                            (
-                                (back.r * 255.0) as u8,
-                                (back.g * 255.0) as u8,
-                                (back.b * 255.0) as u8,
-                                (0.45 * 255.0) as u8,
-                            )
-                        }
-                    };
-                    apply_accent(self.hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, [tr, tg, tb, ta]);
+                    let a = ((argb >> 24) & 0xFF) as u8;
+                    let b = ((argb >> 16) & 0xFF) as u8;
+                    let g = ((argb >> 8) & 0xFF) as u8;
+                    let r = (argb & 0xFF) as u8;
+                    apply_accent(self.hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, [r, g, b, a]);
                 } else {
                     apply_accent(self.hwnd, ACCENT_DISABLED, [0, 0, 0, 0]);
                 }
-                self.acrylic_on.set(want_acrylic);
+                self.acrylic_last.set(argb);
             }
         }
         let tint_hex = skin
