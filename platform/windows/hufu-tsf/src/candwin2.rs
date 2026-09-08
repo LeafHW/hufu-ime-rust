@@ -1243,23 +1243,15 @@ impl CandidateWindowV2 {
                                         shadow_m,
                                         radius,
                                     );
-                                    // 【阴影分离修复 2026-09-08】DrawImage 把
-                                    // image 的 bounds 左上对齐到 offset——而
-                                    // Shadow effect 输出的 bounds 随高斯扩散
-                                    // 向左上外扩（σ*3，r=12 时约 21px），圆角
-                                    // 矩形因此被整体画偏（r=4 时代偏 ~9px 未
-                                    // 察觉，默认阴影加大到 12 后爆显「阴影在
-                                    // 候选范围外/辐射状错位」）。补偿：运行时
-                                    // 查询 bounds，把 offset 平移
-                                    // (bounds.left - shadow_m) 抵消外扩。
-                                    let off = if let Ok(pad) = ctx.GetImageLocalBounds(&eff_img) {
-                                        D2D_POINT_2F {
-                                            x: shadow_off_x + pad.left - shadow_m,
-                                            y: shadow_off_y + pad.top - shadow_m,
-                                        }
-                                    } else {
-                                        D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y }
-                                    };
+                                    // 【阴影分离修复·终版 2026-09-08】曾加
+                                    // GetImageLocalBounds 补偿——实错：DrawImage
+                                    // 的 targetOffset 对齐 image 坐标原点 (0,0)
+                                    //（effect 输出继承 command list 坐标系，
+                                    // 圆角矩形在 shadow_m 处），不是 bounds 左
+                                    // 上——补偿把阴影平移出左上角（白底像素
+                                    // 分析：浓阴影聚窗口左上）。原始分离根因
+                                    // 是缓存键漏 shadow_radius（本版已在键中）。
+                                    let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
                                     ctx.DrawImage(
                                         &eff_img,
                                         Some(&off as *const _),
@@ -1330,16 +1322,9 @@ impl CandidateWindowV2 {
                                 shadow_m,
                                 radius,
                             );
-                            // 【阴影分离修复】同缓存命中分支：bounds 左上
-                            // 补偿（详见上方注释）。
-                            let off = if let Ok(pad) = ctx.GetImageLocalBounds(&eff_img) {
-                                D2D_POINT_2F {
-                                    x: shadow_off_x + pad.left - shadow_m,
-                                    y: shadow_off_y + pad.top - shadow_m,
-                                }
-                            } else {
-                                D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y }
-                            };
+                            // 【阴影分离修复·终版】同缓存命中分支：无补偿
+                            // 原语义（详见上方注释）。
+                            let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
                             ctx.DrawImage(
                                 &eff_img,
                                 Some(&off as *const _),
