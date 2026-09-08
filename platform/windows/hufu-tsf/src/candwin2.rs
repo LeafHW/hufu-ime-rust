@@ -812,9 +812,9 @@ impl CandidateWindowV2 {
 
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
-        // 【glass 元素内缩 2px】用户指令：1px 不够再缩——胶囊/文字
-        // 整体内收 2px，边缘露出更多纯玻璃。
-        let inset = if kind == "glass" { 2.0 } else { 0.0 };
+        // 【glass 元素内缩 4px】1px/2px 视觉太微（用户以为未生效，
+        // 实测窗口 110 vs 无inset 106=链路通）——加大到 4px 明显可感。
+        let inset = if kind == "glass" { 4.0 } else { 0.0 };
         let margin_x = layout_f(skin, "margin_x", 8.0) + inset;
         let margin_y = layout_f(skin, "margin_y", 6.0) + inset;
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
