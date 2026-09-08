@@ -420,7 +420,10 @@ impl SentenceEngine {
                     let tail_s: String = base[pos..].iter().collect();
                     for (code, text) in uw.iter() {
                         let cl = code.chars().count();
-                        if cl == 0 || pos + cl > n || cl > 4 || cl > tail_s.chars().count() {
+                        // 【码长放宽 2026-09-09】原 cl>4 一刀切拒收——虎码
+                        // 词组编码变体（语料注入：蚩奼 sfcbtrq=7 码）与
+                        // /jc 长词用户词全被丢。放宽到 16（4字×4码上限）。
+                        if cl == 0 || pos + cl > n || cl > 16 || cl > tail_s.chars().count() {
                             continue;
                         }
                         if !tail_s.starts_with(code.as_str()) {
