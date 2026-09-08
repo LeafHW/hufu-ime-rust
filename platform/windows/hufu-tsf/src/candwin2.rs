@@ -1303,10 +1303,20 @@ impl CandidateWindowV2 {
                             };
                             match ctx.CreateBitmap(D2D_SIZE_U { width: w_out, height: h_out }, Some(raw_px.as_ptr() as *const core::ffi::c_void), w_out * 4, &bmp_props) {
                                 Ok(bmp) => {
-                                    // 高斯模糊：属性 0 = StandardDeviation
+                                    // 高斯模糊：名字寻址（属性索引在部分
+                                    // 系统语义不稳——用户实测透出但不模糊
+                                    // =SetValue 静默失败嫌疑）
                                     let sd = blur_r / 3.0;
                                     if let Ok(effect) = ctx.CreateEffect(&CLSID_D2D1GaussianBlur) {
-                                        let _ = effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &sd.to_ne_bytes());
+                                        let sv = effect.SetValueByName(
+                                            windows::core::w!("StandardDeviation"),
+                                            D2D1_PROPERTY_TYPE_FLOAT,
+                                            &sd.to_ne_bytes(),
+                                        );
+                                        crate::tsf::diag_note(&format!(
+                                            "glass fx: SetValueByName sd={sd} -> {:?}",
+                                            sv.map_err(|e| e.to_string())
+                                        ));
                                         effect.SetInput(0, &bmp, true);
                                         (bmp, effect)
                                     } else { return; }
