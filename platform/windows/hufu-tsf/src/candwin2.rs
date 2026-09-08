@@ -402,7 +402,7 @@ pub struct CandidateWindowV2 {
     pub(crate) glass_cache: Option<((u32, u32, u32), windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)>,
     /// 【毛玻璃 v3】上次 accent 状态：argb 值；u32::MAX=OFF（幂等判断
     /// 含 tint——用户拖「染色浓度」滑杆时 kind 不变也须重设 accent）
-    pub(crate) acrylic_last: std::cell::Cell<u32>,
+    pub(crate) acrylic_last: std::cell::Cell<u64>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -676,7 +676,7 @@ impl CandidateWindowV2 {
                 shadow_cache: None,
                 glass_raw: None,
                 glass_cache: None,
-                acrylic_last: std::cell::Cell::new(u32::MAX),
+                acrylic_last: std::cell::Cell::new(u64::MAX),
             })
         }
     }
@@ -766,17 +766,18 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
         let kind = material_kind(skin);
-        // 【v3.5 accent=模糊底（透明度可调）】glass_alpha 控制玻璃本体
-        // 实度（0=全透只借模糊，1=实玻璃）。blur=0 → 无模糊纯透明。
-        // 染色/大小/圆角由自绘 tint 面板承担。
+        let tint_hex = skin
+            .pointer("/skin/material/tint")
+            .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
+            .and_then(|x| x.as_str())
+            .and_then(parse_hex);
+        // 【v3.6 暗玻璃】裸玻璃（面板元素全隐）在白底上=白玻璃泛白。
+        // tint 染回 accent 层（系统合成染色，均匀覆盖+跟随模糊层）：
+        // 深色 tint=暗玻璃不泛白，元素仍是极简形态（高亮+文字）。
+        // glass_alpha 弃用（白雾语义错误）；浓度=tint 自带 alpha。
         {
             let want_acrylic = kind == "glass";
             let blur_v = layout_f(skin, "blur_radius", 24.0);
-            let g_alpha = skin
-                .pointer("/skin/material/glass_alpha")
-                .or_else(|| skin.get("material").and_then(|m| m.get("glass_alpha")))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.5) as f32;
             let state: u32 = if !want_acrylic {
                 ACCENT_DISABLED
             } else if blur_v <= 0.0 {
@@ -784,21 +785,18 @@ impl CandidateWindowV2 {
             } else {
                 ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
-            // 幂等键含 alpha（拖「毛玻璃透明度」即时重设）。
-            // 染白雾：glass_alpha 高=白雾浓（更不透，磨砂玻璃感）；
-            // 低=纯模糊通透。黑染会变成暗窗（实测对比度反升），弃。
-            let ga8 = (g_alpha.clamp(0.0, 1.0) * 255.0) as u32;
-            let key = (state << 8) | ga8;
+            // 染色=tint RGBA（无 tint 时深灰 50% 兜底）
+            let (tr, tg, tb, ta) = match tint_hex {
+                Some([r, g, b, a]) => (r as u32, g as u32, b as u32, a as u32),
+                None => (28, 28, 30, 128),
+            };
+            // 幂等键含全 RGBA（拖色板/浓度即时重设）
+            let key = (state << 32) | (tr << 24) | (tg << 16) | (tb << 8) | ta;
             if self.acrylic_last.get() != key {
-                apply_accent(self.hwnd, state, [255, 255, 255, ga8 as u8]);
+                apply_accent(self.hwnd, state, [tr as u8, tg as u8, tb as u8, ta as u8]);
                 self.acrylic_last.set(key);
             }
         }
-        let tint_hex = skin
-            .pointer("/skin/material/tint")
-            .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
-            .and_then(|x| x.as_str())
-            .and_then(parse_hex);
 
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
