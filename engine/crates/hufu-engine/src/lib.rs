@@ -409,7 +409,7 @@ pub struct Engine {
     /// 全码）应等后续键辨析走语料路径，而不是被高置信单字路径
     ///（证sf+不cb）抢跑分段。分道扬镳（后续键与全部变体不一致）后
     /// 自动恢复置信上屏。
-    supp_hold: std::sync::Mutex<Option<(String, Vec<String>)>>,
+    supp_hold: std::sync::Mutex<Option<(String, Vec<String>, Vec<(String, String)>)>>,
 }
 
 impl Engine {
@@ -524,6 +524,10 @@ impl Engine {
     /// 注入整句解码器。
     pub fn set_sentence_decoder(&mut self, dec: Option<Arc<dyn SentenceDecoder>>) {
         self.sentence = dec;
+        // 【语料词注入 2026-09-09】解码器（重）装载后用户词+补充语料
+        // 变体词图重注入——新实例 user_words 为空，/jq 热重载整句后
+        // 不重注会丢词。
+        self.sync_sentence_user_words();
     }
 
     pub fn sentence_decoder(&self) -> Option<&Arc<dyn SentenceDecoder>> {
@@ -672,10 +676,13 @@ impl Engine {
 
     /// 把用户词库同步进整句解码器（去重后的 code→text 列表；
     /// 整句未启用/解码器不支持注入时静默跳过）。
+    /// 【语料词注入 2026-09-09】补充语料编码变体（蚩奼 sfcbtrq 等）
+    /// 一并注入 rank1 段——语料词在打字中途即登顶候选（此前靠 supp_
+    /// bonus 终点翻盘太晚），与挂起护栏互补。
     pub fn sync_sentence_user_words(&self) {
         if let Some(dec) = &self.sentence {
             let mut seen = std::collections::HashSet::new();
-            let words: Vec<(String, String)> = self
+            let mut words: Vec<(String, String)> = self
                 .schema
                 .user_dict
                 .entries
@@ -684,6 +691,13 @@ impl Engine {
                 .filter(|e| seen.insert((e.code.clone(), e.text.clone())))
                 .map(|e| (e.code.clone(), e.text.clone()))
                 .collect();
+            for (code, word) in self.supp_pairs() {
+                // 码表已有同码同词段（beam 内去重）也注入无害，但去重
+                // 省 beam 展开；单字语料不注入（码表本身有，挂起已够）
+                if word.chars().count() >= 2 && seen.insert((code.clone(), word.clone())) {
+                    words.push((code, word));
+                }
+            }
             dec.set_user_words(&words);
         }
     }
@@ -1629,13 +1643,15 @@ impl Engine {
         session.pending_commit = Some(text);
     }
 
-    /// 【语料前缀挂起 2026-09-09】构建补充语料词的编码变体集：
-    /// 每字取码表全部编码（codes_of）做笛卡尔积拼接（每字截前 4、
-    /// 总量截 32 防爆炸）——单字直接全码；2-4 字词覆盖简码（短码
-    /// 组合，如 蚩sfc+奼btrq=sfcbtrq）与全码（sfcc+btrq=sfccbtrq）
-    /// 全部路径。指纹（方案名+语料条数+全词串+码表规模）变化即重建
-    /// ——/jq 热加词后下一键生效。
-    fn supp_hold_variants(&self) -> Vec<String> {
+    /// 【语料前缀挂起 2026-09-09】构建补充语料词的编码变体（code, word）
+    /// 对：每字取码表全部编码（codes_of）做笛卡尔积拼接（每字截前 4、
+    /// 总量截 32 防爆炸）——单字直接全码；2-4 字词覆盖简码（短码组
+    /// 合，如 蚩sfc+奼btrq=sfcbtrq）与全码（sfcc+btrq=sfccbtrq）全部
+    /// 路径。双用途：①挂起判定（codes 排序前缀探测）；②整句词图注
+    /// 入（rank1 段——语料词从打字中途就登顶候选，而非终点才翻盘）。
+    /// 指纹（方案名+语料全词+码表规模）变化即重建——/jq 热加词下一
+    /// 键生效。
+    fn supp_pairs(&self) -> Vec<(String, String)> {
         let mut fp = String::with_capacity(64);
         fp.push_str(&self.config.schema.current);
         fp.push('\u{1}');
@@ -1651,12 +1667,12 @@ impl Engine {
         fp.push('\u{1}');
         fp.push_str(&self.schema.dict.entries.len().to_string());
         let mut guard = self.supp_hold.lock().unwrap();
-        if let Some((old_fp, v)) = guard.as_ref() {
+        if let Some((old_fp, _, pairs)) = guard.as_ref() {
             if *old_fp == fp {
-                return v.clone();
+                return pairs.clone();
             }
         }
-        let mut out: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         for e in supp {
             let chars: Vec<char> = e.word.chars().collect();
             if chars.is_empty() || chars.len() > 4 {
@@ -1682,12 +1698,15 @@ impl Engine {
                     combos.truncate(32);
                 }
             }
-            out.extend(combos);
+            for c in combos {
+                pairs.push((c, e.word.clone()));
+            }
         }
-        out.sort();
-        out.dedup();
-        *guard = Some((fp, out.clone()));
-        out
+        let mut codes: Vec<String> = pairs.iter().map(|(c, _)| c.clone()).collect();
+        codes.sort();
+        codes.dedup();
+        *guard = Some((fp, codes, pairs.clone()));
+        pairs
     }
 
     /// full（已打全编码）是否被语料挂起：是任一变体真前缀（变体更
@@ -1697,10 +1716,13 @@ impl Engine {
         if self.schema.supplement.entries.is_empty() || full.is_empty() {
             return false;
         }
-        let variants = self.supp_hold_variants();
-        // 二分：首个 ≥ full 的变体——starts_with(full) 的最短候选
-        let pos = variants.partition_point(|v| v.as_str() < full);
-        if let Some(v) = variants.get(pos) {
+        let _ = self.supp_pairs(); // 确保缓存已按当前指纹构建
+        let guard = self.supp_hold.lock().unwrap();
+        let Some((_, codes, _)) = guard.as_ref() else {
+            return false;
+        };
+        let pos = codes.partition_point(|v| v.as_str() < full);
+        if let Some(v) = codes.get(pos) {
             if v.len() > full.len() && v.starts_with(full) {
                 let remain = v.chars().count() - full.chars().count();
                 return remain <= 4;
