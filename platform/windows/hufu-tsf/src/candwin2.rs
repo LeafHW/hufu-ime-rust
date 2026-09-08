@@ -2034,9 +2034,8 @@ impl CandidateWindowV2 {
                 }
             }
 
-            // 边框【v3.7 glass=tint 色圆角描边】accent 圆角被 DWM 钉死
-            // 8px（RGN 实测无效），皮肤 R 角的唯一视觉载体=自绘描边
-            // （radius=皮肤 corner_radius，色=tint 同色系）。
+            // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
+            // 描边方案用户否决已撤】
             if let Some(b) = &b_border {
                 if kind != "glass" {
                     let bw = layout_f(skin, "border_width", 1.0);
@@ -2051,33 +2050,6 @@ impl CandidateWindowV2 {
                     radiusY: radius,
                 };
                 let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
-                }
-            }
-            // 【v3.7 glass·皮肤色圆角描边】RGN 实测裁不了 accent（DWM
-            // 圆角钉死 8px），皮肤 R 角由描边承载：tint 同色系、宽度
-            // 1.5px、radius=皮肤 corner_radius。
-            if kind == "glass" {
-                if let Some([r, g, b, a]) = tint_hex {
-                    let bc = D2D1_COLOR_F {
-                        r: r as f32 / 255.0,
-                        g: g as f32 / 255.0,
-                        b: b as f32 / 255.0,
-                        a: (a as f32 / 255.0).clamp(0.35, 0.9),
-                    };
-                    if let Ok(br) = ctx.CreateSolidColorBrush(&bc, None) {
-                        let bw = 1.5;
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: bw / 2.0,
-                                top: bw / 2.0,
-                                right: width - bw / 2.0,
-                                bottom: height - bw / 2.0,
-                            },
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        let _ = ctx.DrawRoundedRectangle(&rr, &br, bw, None);
-                    }
                 }
             }
             } // draw_content
