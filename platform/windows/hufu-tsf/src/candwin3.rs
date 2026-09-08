@@ -339,7 +339,7 @@ impl CandWin3 {
         let border_w = layout_f(skin, "border_width", 1.0).max(0.0);
 
         let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
-        let shadow_off_y = layout_f(skin, "shadow_offset_y", 2.0);
+        let shadow_off_y = layout_f(skin, "shadow_offset_y", 0.0);
         let has_shadow = shadow_radius >= 1.0;
         let shadow_m = if has_shadow {
             (shadow_radius * 1.6 + 5.0 + shadow_off_y.abs()).ceil() as i32
