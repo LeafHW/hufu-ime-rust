@@ -2512,11 +2512,7 @@ impl CandidateWindowV2 {
                             u32,
                         ) -> windows::core::HRESULT;
                         let f: DwmaSet = std::mem::transmute(p);
-                        // 【v4 无白线实验】ROUND 的圆角 AA=四角白线根因
-                        //（半透明玻璃边与亮桌面混合）。撤 ROUND，圆角交给
-                        // RGN（皮肤 radius）——重新实测 RGN 对 accent 的
-                        // 裁剪有效性（v3.9 判无效时条件不纯：染色/边距干扰）。
-                        let pref: u32 = 1; // DONOTROUND
+                        let pref: u32 = if kind == "glass" { 2 } else { 1 }; // ROUND / DONOTROUND
                         let _ = f(
                             self.hwnd,
                             33, // DWMWA_WINDOW_CORNER_PREFERENCE
@@ -2534,8 +2530,9 @@ impl CandidateWindowV2 {
                                 &nc as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
-                        // 【v4 无边框】用户明确不要任何边框线。此前深色
-                        // 边线盖白线的方案废弃——BORDER_COLOR=NONE。
+                        // 【无边框+圆角定稿】BORDER=NONE（无任何边框线），
+                        // 圆角=DWM ROUND（系统 8px）。四角的轻微 AA 亮线
+                        // 是系统圆角自带行为，保留不再处理。
                         let none_border: u32 = 0xFFFFFFFE;
                         let _ = f(
                             self.hwnd,
