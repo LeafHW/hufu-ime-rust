@@ -204,6 +204,9 @@ pub struct Layout {
     pub shadow_radius: f32,
     pub shadow_offset_x: f32,
     pub shadow_offset_y: f32,
+    /// 【毛玻璃 2026-09-08】material.kind=glass 时的高斯模糊半径
+    ///（DLL 渲染：σ=blur/3，抓屏底模糊+圆角裁剪）。默认 24。
+    pub blur_radius: f32,
     pub mark_text: String,
     /// 【序号样式 2026-09-08】digit=阿拉伯数字（默认）/ zh=中文数字
     ///（一二三…十）/ roman=罗马数字（Ⅰ Ⅱ Ⅲ…Ⅹ）。label_format 的
@@ -267,6 +270,7 @@ impl Default for Layout {
             shadow_radius: 12.0,
             shadow_offset_x: 0.0,
             shadow_offset_y: 2.0,
+            blur_radius: 24.0,
             mark_text: "·".into(),
             label_style: "digit".into(),
             label_size_lock: true,

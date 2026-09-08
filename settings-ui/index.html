@@ -343,6 +343,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div style="flex:1;min-width:330px">
         <h3>材质</h3>
         <div class="row">
+          <div class="checkline"><input type="checkbox" id="mat-glass"><label for="mat-glass" title="窗底实时抓取屏幕内容并高斯模糊（真窗口毛玻璃；预览图以半透明近似）">毛玻璃底</label></div>
+          <div class="field"><label>模糊半径 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="4" max="60" step="1"></div>
           <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc"></div>
           <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="除文字与高亮外所有元素（窗底/边框/编码底/阴影）的透明度，0%=全透明 100%=不透明"></div>
           <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
@@ -743,6 +745,23 @@ function bindSkin() {
     bcv.onchange = saveSkinQuiet;
     syncB();
   }
+  // 【毛玻璃 2026-09-08】material.kind=glass：真窗口=抓屏+D2D 高斯模糊
+  //+圆角裁剪（预览以半透明近似）；layout.blur_radius 模糊半径。
+  {
+    const gc = $("#mat-glass"), bl = $("#l-blur");
+    if (!SKIN.material) SKIN.material = {};
+    if (!SKIN.layout) SKIN.layout = {};
+    const syncG = () => {
+      gc.checked = SKIN.material.kind === "glass";
+      bl.value = SKIN.layout.blur_radius ?? 24;
+      $("#l-blur-v").textContent = bl.value;
+    };
+    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; preview(); };
+    gc.onchange = saveSkinQuiet;
+    bl.oninput = () => { SKIN.layout.blur_radius = parseFloat(bl.value); $("#l-blur-v").textContent = bl.value; preview(); };
+    bl.onchange = saveSkinQuiet;
+    syncG();
+  }
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
   if (SKIN.material.master_alpha == null) SKIN.material.master_alpha = 1;
   {
@@ -994,7 +1013,11 @@ function preview() {
   const inner = document.createElement("div");
   w.innerHTML = "";
   inner.className = "candwin" + (L.horizontal ? " horizontal" : "");
-  inner.style.cssText = `background:${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
+  // 【毛玻璃预览近似】真窗口=抓屏+D2D 模糊；预览用 backdrop-filter
+  //（stage 背后的彩色光斑透出模糊感，L126 预留的铺垫）。
+  const glassCss = SKIN.material && SKIN.material.kind === "glass"
+    ? `backdrop-filter:blur(${L.blur_radius ?? 24}px);-webkit-backdrop-filter:blur(${L.blur_radius ?? 24}px);` : "";
+  inner.style.cssText = `${glassCss}background:${bgc};border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
   // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
   // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
   // 与 mark_text（高亮行左缘细竖条，weasel 语义）。
