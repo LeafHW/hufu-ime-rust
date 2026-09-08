@@ -1216,7 +1216,23 @@ impl CandidateWindowV2 {
                                         shadow_m,
                                         radius,
                                     );
-                                    let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
+                                    // 【阴影分离修复 2026-09-08】DrawImage 把
+                                    // image 的 bounds 左上对齐到 offset——而
+                                    // Shadow effect 输出的 bounds 随高斯扩散
+                                    // 向左上外扩（σ*3，r=12 时约 21px），圆角
+                                    // 矩形因此被整体画偏（r=4 时代偏 ~9px 未
+                                    // 察觉，默认阴影加大到 12 后爆显「阴影在
+                                    // 候选范围外/辐射状错位」）。补偿：运行时
+                                    // 查询 bounds，把 offset 平移
+                                    // (bounds.left - shadow_m) 抵消外扩。
+                                    let off = if let Ok(pad) = ctx.GetImageLocalBounds(&eff_img) {
+                                        D2D_POINT_2F {
+                                            x: shadow_off_x + pad.left - shadow_m,
+                                            y: shadow_off_y + pad.top - shadow_m,
+                                        }
+                                    } else {
+                                        D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y }
+                                    };
                                     ctx.DrawImage(
                                         &eff_img,
                                         Some(&off as *const _),
@@ -1287,7 +1303,16 @@ impl CandidateWindowV2 {
                                 shadow_m,
                                 radius,
                             );
-                            let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
+                            // 【阴影分离修复】同缓存命中分支：bounds 左上
+                            // 补偿（详见上方注释）。
+                            let off = if let Ok(pad) = ctx.GetImageLocalBounds(&eff_img) {
+                                D2D_POINT_2F {
+                                    x: shadow_off_x + pad.left - shadow_m,
+                                    y: shadow_off_y + pad.top - shadow_m,
+                                }
+                            } else {
+                                D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y }
+                            };
                             ctx.DrawImage(
                                 &eff_img,
                                 Some(&off as *const _),
@@ -1306,6 +1331,22 @@ impl CandidateWindowV2 {
                     })();
                     // 兜底：效果路径失败（老驱动）→ 下方环带多层近似
                     if fx.is_none() {
+                    // 【阴影诊断 2026-09-08】用户实测「辐射状阴影+与候选分离」
+                    // ——症状指向本兜底分支（环带多层）。记录失败原因到 trace。
+                    unsafe {
+                        let line = format!(
+                            "[shadow] D2D effect 失败→环带兜底 r={} w={} h={} m={:.1}\n",
+                            shadow_radius, w, h, shadow_m
+                        );
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(std::env::temp_dir().join("hufu-tsf-trace.log"))
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
                     if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
                         // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
                         // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满

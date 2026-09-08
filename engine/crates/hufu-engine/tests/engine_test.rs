@@ -16,6 +16,7 @@ fn setup() -> (Engine, Session, std::path::PathBuf) {
         dict_dir.join("tiger.dict.yaml"),
         "---\nname: tiger\nsort: by_weight\n...\n\
          我\tt\t900\n\
+         你\tt\t450\n\
          来\ta\t800\n\
          的\tu\t700\n\
          他\tje\t600\n\
@@ -108,14 +109,39 @@ fn second_and_third_select() {
 #[test]
 fn dinggong_push() {
     // 顶功（语义定版 2026-08-31）：死路键【不】顶屏——只有超过最大
-    // 码长（第 max+1 键）才顶首选。一简 a(来) 后跟死路 z：不上屏，
-    // 空码按 auto_clear_empty 清缓冲。
+    // 码长（第 max+1 键）才顶首选。一简 a(来) 后跟死路 z：不上屏。
+    // 【空码绑码长 2026-09-08】2-3 键的暂时空码不再立即清（第 4 键
+    // 可能仍有解/用户词），不满码保留缓冲由退格/空格处理；满码
+    //（len≥max_code_length）空码才自动清。
     let (mut engine, mut session, _dir) = setup();
     engine.process_key(&mut session, key('a')); // 来
-    let out = engine.process_key(&mut session, key('z')); // az 死路
+    let out = engine.process_key(&mut session, key('z')); // az 死路（2 键）
     assert_eq!(out.commit, None, "死路键不得自动上屏");
     let st = out.state.unwrap();
-    assert_eq!(st.raw, "", "空码自动清屏（auto_clear_empty 默认开）");
+    assert_eq!(st.raw, "az", "不满码空码保留缓冲（等满码再清）");
+    // 满 4 码仍空码 → 自动清（空码清屏绑最大码长）
+    engine.process_key(&mut session, key('z'));
+    let out4 = engine.process_key(&mut session, key('z')); // azzz 满码死路
+    assert_eq!(out4.commit, None);
+    assert_eq!(out4.state.unwrap().raw, "", "满码空码自动清屏");
+}
+
+#[test]
+fn tab_navigate_mode() {
+    // 【Tab 双模式 2026-09-08】tab_clear=false → Tab=选重导航：
+    // 按一下高亮移到下一候选（同方向键↓），空格上屏选中项。
+    let (mut engine, mut session, _dir) = setup();
+    engine.config.input.tab_clear = false;
+    engine.process_key(&mut session, key('t')); // t 前缀态：我(t)、我们(tuja) 多候选
+    let st0 = engine.state(&session);
+    assert!(st0.candidates.len() >= 2, "需多候选场景（t 前缀）");
+    assert_eq!(st0.selected, 0, "初始高亮首选");
+    let out = engine.process_key(&mut session, KeyInput { key: hufu_types::KeyCode::Tab, modifiers: hufu_types::Modifiers::default(), is_press: true });
+    let st1 = out.state.unwrap();
+    assert_eq!(st1.selected, 1, "Tab 高亮下一候选");
+    // 空格上屏当前高亮（不再清屏）
+    let out2 = engine.process_key(&mut session, key(' '));
+    assert!(out2.commit.is_some(), "空格上屏选中候选");
 }
 
 #[test]

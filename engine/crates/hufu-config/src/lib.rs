@@ -140,6 +140,10 @@ pub struct InputSection {
     /// 「、」（不进 / 符号命名空间）、有候选时首选+「、」；关闭时
     /// / 进符号命名空间（首位顿号需空格确认，继续 / 按数量出 /）
     pub slash_dunhao: bool,
+    /// 【\=顿号直出 2026-09-08】true=空态按 \ 直接上屏「、」、有
+    /// 候选时首选+「、」；false（默认）=打 \ 弹「、」候选（空格
+    /// 确认，与 / 命名空间档的首选行为一致）。
+    pub backslash_dunhao: bool,
     /// 无编码时「;」引导标点：;+空格=：、;;=；直上
     pub semicolon_guide: bool,
     /// 数字键参与整句选重
@@ -166,6 +170,7 @@ impl Default for InputSection {
             //（/jc 加词、/jq 加权、/rq 日期等，见各方案 快符.txt）
             // 开箱即用；要「/ 一键出顿号」的用户手动勾选直出档。
             slash_dunhao: false,
+            backslash_dunhao: false,
             semicolon_guide: true,
             digits_in_sentence: true,
         }

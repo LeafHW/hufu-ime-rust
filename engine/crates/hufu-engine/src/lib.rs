@@ -844,7 +844,10 @@ impl Engine {
                     session.clear();
                     KeyOutcome::consumed(self.state(session))
                 } else {
-                    self.on_page(session, 1)
+                    // 【Tab 双模式 2026-09-08】关闭清屏 = 选重导航档：
+                    // 按一下高亮移到下一候选（同方向键↓），空格上屏
+                    //——不是一键选定；不再是翻页（翻页由 -/= 翻页键承担）。
+                    self.on_updown(session, 1)
                 }
             }
             KeyCode::Up => self.on_updown(session, -1),
@@ -943,6 +946,30 @@ impl Engine {
             //（走下方编码态标点顶字，punct 表 /→、）。
             if c == '/' && self.config.input.slash_dunhao {
                 return KeyOutcome::commit("、", self.state(session));
+            }
+            // 【\=顿号直出 2026-09-08】\ 与 / 同构双档：
+            // 勾选（backslash_dunhao）=空态直出「、」；不勾（默认）=
+            // 弹「、」候选（空格确认，与 / 命名空间档首选行为一致）。
+            if c == '\\' {
+                if self.config.input.backslash_dunhao {
+                    return KeyOutcome::commit("、", self.state(session));
+                }
+                session.raw.push('\\');
+                self.refresh_candidates(session);
+                if session.candidates.is_empty() {
+                    session.candidates.push(hufu_types::Candidate {
+                        text: "、".into(),
+                        code: "\\".into(),
+                        comment: String::new(),
+                        weight: 0.0,
+                        source: hufu_types::CandidateKind::Symbol,
+                        pinned: false,
+                        commit_override: None,
+                        partial: false,
+                    });
+                    let _ = self.state(session);
+                }
+                return KeyOutcome::consumed(self.state(session));
             }
             // '/' 符号命名空间（关闭直出档=现状：首选顿号，继续输入进入
             // /xx 符号；再按 / 按数量出 /）
@@ -1172,6 +1199,10 @@ impl Engine {
         if c == '/' && self.config.input.slash_dunhao {
             return Some(("、".into(), 0));
         }
+        // 【\=顿号直出 2026-09-08】编码态对称：勾选时 \ =首选上屏+「、」
+        if c == '\\' && self.config.input.backslash_dunhao {
+            return Some(("、".into(), 0));
+        }
         if self.config.input.ascii_punct {
             return Some((c.to_string(), 0));
         }
@@ -1260,7 +1291,16 @@ impl Engine {
         }
 
         // 空码自动清屏（既无精确也无前缀，且未开启顶功短路；整句模式保留缓冲）
-        if dead_end && !sentence_mode && self.config.input.auto_clear_empty && !has_upper {
+        // 【绑最大码长 2026-09-08】仅满码（len≥max_code_length）才清：
+        // 此前 2-3 键的暂时空码也清——用户词/第 4 键可能仍有解，清了
+        // 就打断输入（用户实测「3 码也清屏」）。不满码的空码留在缓冲，
+        // 由退格/空格/继续输入处理。
+        if dead_end
+            && !sentence_mode
+            && self.config.input.auto_clear_empty
+            && !has_upper
+            && len >= max_len
+        {
             session.clear();
         }
 
@@ -3869,24 +3909,36 @@ mod tests {
         assert!(s.candidates[0].text != "老鬼", "过程态不可居首");
     }
 
-    // 【2026-09-06 用户规格】\ 命令模式取消：原 dynamic_date_week/
-    // dynamic_number/calc_command/word_making_encoder 四测随功能下线。
+    // 【2026-09-06 用户规格→2026-09-08 双档】\ 命令模式取消；
+    // \=顿号双档（backslash_dunhao）：不勾=打 \ 弹「、」候选（空格
+    // 确认，同 / 命名空间档首选）；勾=空态直出「、」、编码态首选+「、」。
     #[test]
     fn backslash_literal_commit() {
-        // \ 不再进命令模式：空态直出自身（中文态也原样，无顿号映射）
+        // 不勾（默认）：空态打 \ → 候选「、」等待确认，不直接上屏
         let (mut eng, _dir) = test_engine("bs");
         let mut s = Session::new(true);
         let o = eng.process_key(&mut s, key('\\'));
-        assert_eq!(o.commit.as_deref(), Some("\\"), "空态 \\ 直接上屏自身");
-        assert!(s.is_idle(), "无残留模式");
-        // 有编码态：\ 走标点顶字（顶首选+原样 \，与其他标点语义一致）
-        let mut s2 = Session::new(true);
+        assert_eq!(o.commit, None, "默认档不直出");
+        assert!(!s.candidates.is_empty(), "应弹「、」候选");
+        assert_eq!(s.candidates[0].text, "、", "首选=顿号");
+        // 空格确认上屏「、」
+        let o2 = eng.process_key(&mut s, key(' '));
+        assert_eq!(o2.commit.as_deref(), Some("、"), "空格确认顿号");
+        // 勾选直出档：空态 \ 直接上屏「、」
+        let mut c2 = hufu_config::Config::default();
+        c2.input.backslash_dunhao = true;
+        eng.config = c2;
+        let mut s3 = Session::new(true);
+        let o3 = eng.process_key(&mut s3, key('\\'));
+        assert_eq!(o3.commit.as_deref(), Some("、"), "直出档空态顿号");
+        assert!(s3.is_idle(), "无残留模式");
+        // 有编码态：\ 走标点顶字（顶首选+「、」，直出档；默认档顶首选+原样 \）
+        let mut s4 = Session::new(true);
         for c in "jd".chars() {
-            eng.process_key(&mut s2, key(c));
+            eng.process_key(&mut s4, key(c));
         }
-        let o2 = eng.process_key(&mut s2, key('\\'));
-        assert_eq!(o2.commit.as_deref(), Some("就\\"), "编码态 \\ 顶首选+原样");
-        assert_eq!(s2.mode, crate::InputMode::Normal, "不进命令模式");
+        let o4 = eng.process_key(&mut s4, key('\\'));
+        assert_eq!(o4.commit.as_deref(), Some("就、"), "编码态直出档顶首选+顿号");
     }
 
     // 【码表动态变量 2026-09-06】{日期}族上屏展开（候选显示保留字面标记）、

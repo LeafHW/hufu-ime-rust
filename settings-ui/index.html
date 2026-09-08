@@ -214,12 +214,16 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>最大码长</label><input type="number" data-path="input.max_code_length" min="1" max="10"></div>
       <div class="checkline"><input type="checkbox" id="i-push"><label for="i-push">超最大码长自动上屏</label></div>
       <div class="checkline"><input type="checkbox" id="i-uniq"><label for="i-uniq">满四码唯一自动上屏</label></div>
-      <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear">空码自动清屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear" title="开启时只在编码长度达到「最大码长」后才清（如最大码长 4：1-3 码的暂时空码保留缓冲，第 4 键仍无解才清）">空码自动清屏<span class="sub">（满码才清）</span></label></div>
       <div class="checkline"><input type="checkbox" id="i-enter"><label for="i-enter">回车清屏</label></div>
-      <div class="checkline"><input type="checkbox" id="i-tab"><label for="i-tab">Tab 清屏</label></div>
+      <div class="field"><label>Tab 键</label><select id="i-tabmode" style="min-width:150px">
+        <option value="clear">清屏（默认）</option>
+        <option value="nav">选重导航<span class="sub">（高亮下一候选，空格上屏）</span></option>
+      </select></div>
       <div class="checkline"><input type="checkbox" id="i-mixed"><label for="i-mixed">中英混输（保留大小写）</label></div>
       <div class="checkline"><input type="checkbox" id="i-ascii-p"><label for="i-ascii-p">中文态英文标点</label></div>
       <div class="checkline"><input type="checkbox" id="i-dunhao"><label for="i-dunhao">/=顿时直出，屏蔽码表内/相关内容</label></div>
+      <div class="checkline"><input type="checkbox" id="i-bdunhao"><label for="i-bdunhao" title="勾选：空态按 \ 直接上屏「、」；不勾（默认）：打 \ 弹「、」候选，空格确认">\=顿号直出</label></div>
       <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
     </div>
     <h3>候选</h3>
@@ -372,6 +376,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <h3>序号</h3>
         <div class="row">
           <div class="checkline"><input type="checkbox" id="sk-idx"><label for="sk-idx">显示序号</label></div>
+          <div class="checkline"><input type="checkbox" id="l-llock"><label for="l-llock" title="开启：改「字号」时序号字级按原比例一起变（与滚轮缩放一致）；关闭：两者各自独立调">序号字级随字号联动</label></div>
           <div class="field"><label>序号样式</label><select id="l-lstyle">
             <option value="digit">数字（1 2 3…）</option>
             <option value="zh">中文（一 二 三…）</option>
@@ -478,8 +483,19 @@ function bindInputs() {
   $("#g-caps").value = { Clear: "clear", Switch: "switch", None: "none" }[CFG.general.caps_action] || "clear";
   $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; };
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
-  B("#i-enter", "input.enter_clear"); B("#i-tab", "input.tab_clear"); B("#i-mixed", "input.mixed_input");
-  B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao");
+  B("#i-enter", "input.enter_clear"); B("#i-mixed", "input.mixed_input");
+  B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao"); B("#i-bdunhao", "input.backslash_dunhao");
+  // 【Tab 双模式 2026-09-08】下拉映射 tab_clear（清屏=true / 导航=false），
+  // 切换即存（输入页其他项走统一「保存并应用」——此下拉独立直存避免
+  // 用户以为切换了没生效；语义即改即存与皮肤页一致）。
+  {
+    const tm = $("#i-tabmode");
+    tm.value = CFG.input.tab_clear === false ? "nav" : "clear";
+    tm.onchange = async () => {
+      CFG.input.tab_clear = tm.value !== "nav";
+      try { await api("POST", "/api/config", CFG); msg(tm.value === "nav" ? "Tab=选重导航 ✓（高亮下一候选，空格上屏）" : "Tab=清屏 ✓", "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
+    };
+  }
   // #c-v（竖排候选）在 bindSkin 里接皮肤 layout.horizontal，不绑 config
   // 【2026-09-08】「显示序号」开关只在皮肤页（#sk-idx 绑 config.candidates.
   // show_index）——输入页不再重复（单一真源）
@@ -853,7 +869,31 @@ function bindSkin() {
     try { await api("POST", "/api/skin", SKIN); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
   };
   af.onchange = () => { SKIN.layout.font_face = af.value.trim(); saveSkinNow(); };
-  asz.onchange = () => { const v = parseFloat(asz.value); if (v >= 8 && v <= 60) { SKIN.layout.font_point = v; saveSkinNow(); } };
+  // 【序号字级联动 2026-09-08】字号变化时若联动开启，序号字级按原比例
+  // 一起变（与滚轮缩放行为一致）；皮肤页只改字号不联动会导致序号
+  // 字号失衡（用户实测「候选不好看」）。
+  {
+    const lk = $("#l-llock");
+    lk.checked = SKIN.layout.label_size_lock !== false;
+    lk.onchange = () => { SKIN.layout.label_size_lock = lk.checked; saveSkinQuiet(); };
+  }
+  asz.onchange = () => {
+    const v = parseFloat(asz.value);
+    if (v >= 8 && v <= 60) {
+      const oldF = SKIN.layout.font_point || 14.5;
+      if (SKIN.layout.label_size_lock !== false && oldF > 0) {
+        const ratio = (SKIN.layout.label_font_point ?? oldF * 0.75) / oldF;
+        const nl = Math.round(v * ratio * 2) / 2;   // 0.5 步进
+        if (nl >= 6 && nl <= 40) {
+          SKIN.layout.label_font_point = nl;
+          const el = $("#l-lfp"); if (el) el.value = nl;
+          const ev = $("#l-lfp-v"); if (ev) ev.textContent = nl;
+        }
+      }
+      SKIN.layout.font_point = v;
+      preview(); saveSkinNow();
+    }
+  };
 
   /* 【2026-09-06 用户规格】三个皮肤页新能力：
      ① 预览背景深/浅切换（默认深）② 每皮肤「恢复默认值」③ 实机试打框 */

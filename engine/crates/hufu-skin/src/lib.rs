@@ -210,6 +210,9 @@ pub struct Layout {
     /// %s 替换为对应样式文本；两字段独立（样式管字形，格式管点/
     /// 间距装饰）。
     pub label_style: String,
+    /// 【序号字级绑定 2026-09-08】true（默认）=皮肤页改「字号」时
+    /// 序号字级按原比例联动（与滚轮缩放行为一致）；false=各自独立。
+    pub label_size_lock: bool,
 }
 
 impl Default for Layout {
@@ -238,6 +241,7 @@ impl Default for Layout {
             shadow_offset_y: 2.0,
             mark_text: "·".into(),
             label_style: "digit".into(),
+            label_size_lock: true,
         }
     }
 }
