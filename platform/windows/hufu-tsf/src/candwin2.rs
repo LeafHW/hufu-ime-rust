@@ -784,6 +784,36 @@ impl CandidateWindowV2 {
                 apply_accent(self.hwnd, state, [0, 0, 0, 8]);
                 self.acrylic_last.set(state);
             }
+            // 【v3.4 DWM frame 阴影】glass 窗口无边距（自绘阴影无区域），
+            // DwmExtendFrameIntoClientArea(全窗 frame) 让 DWM 画系统阴影
+            //（Win11 应用窗同款柔和外圈，跟随窗口移动免费）。
+            if want_acrylic {
+                unsafe {
+                    let m2 = windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                        windows::core::w!("dwmapi.dll"),
+                    );
+                    if let Ok(m2) = m2 {
+                        let p2 = windows::Win32::System::LibraryLoader::GetProcAddress(
+                            m2,
+                            windows::core::s!("DwmExtendFrameIntoClientArea"),
+                        );
+                        if let Some(p2) = p2 {
+                            #[repr(C)]
+                            struct Margins {
+                                l: i32, r: i32, t: i32, b: i32,
+                            }
+                            type ExtFn = unsafe extern "system" fn(
+                                HWND,
+                                *const Margins,
+                            ) -> windows::core::HRESULT;
+                            let f: ExtFn = std::mem::transmute(p2);
+                            // 全 -1 = sheet of glass（整窗 frame）
+                            let mg = Margins { l: -1, r: -1, t: -1, b: -1 };
+                            let _ = f(self.hwnd, &mg);
+                        }
+                    }
+                }
+            }
         }
         let tint_hex = skin
             .pointer("/skin/material/tint")
@@ -1250,6 +1280,10 @@ impl CandidateWindowV2 {
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;
+        // 【毛玻璃 v3.4·再收缩】accent 盖整窗矩形，边距区会渗一圈淡
+        // 模糊（用户实测「溢出」）。glass：无边距（窗口=窗体=accent 区
+        // 域=面板，完全贴合），阴影改 DWM frame 阴影（见 accent 段）。
+        let has_shadow = has_shadow && kind != "glass";
         // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
         // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
         // 实测「超出 R 角的直角色块」= 弥散阴影遭位图边缘切割）。
