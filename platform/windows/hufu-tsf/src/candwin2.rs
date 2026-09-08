@@ -1290,7 +1290,6 @@ impl CandidateWindowV2 {
                     // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
                     //   窗体区（模糊底拉伸无感知）——打字全程连续显示
                     if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
-                    crate::tsf::diag_note("gstep2: size ok");
                     let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
                     let g_cached = self.glass_cache.take();
                     let bmp = match &g_cached {
@@ -1334,7 +1333,6 @@ impl CandidateWindowV2 {
                         },
                     };
                     glass_cache_out = Some((g_key, bmp.clone()));
-                    crate::tsf::diag_note("gstep3: bitmap ok");
                     unsafe {
                         // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
                         let mask = ctx
@@ -1357,7 +1355,6 @@ impl CandidateWindowV2 {
                             });
                         if let Some(mask) = mask {
                             if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
-                                    crate::tsf::diag_note("gstep: mask+cast ok");
                                     // 【根因修复 2026-09-08】PushLayer 的 mask
                                     // 按当时 transform 解释——此前在 Push 后才切
                                     // identity，mask（物理坐标）被 dpi 主变换二
