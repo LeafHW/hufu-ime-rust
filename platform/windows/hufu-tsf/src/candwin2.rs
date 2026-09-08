@@ -765,24 +765,30 @@ impl CandidateWindowV2 {
             .unwrap_or(true);
         let kind = material_kind(skin);
         // 【毛玻璃 v3·DWM acrylic】kind=glass → 系统级 acrylic（复用文件
-        // 头部现成 apply_accent）。染色=back_color RGB + 45% alpha。
-        // 幂等：状态变化才调用。
+        // 头部现成 apply_accent）。染色=皮肤 tint（#RRGGBBAA，语义即
+        // 毛玻璃染色）；tint 缺省时回退 back_color+45%。幂等：变化才调用。
         {
             let want_acrylic = kind == "glass";
             if self.acrylic_on.get() != want_acrylic {
                 if want_acrylic {
-                    let back = color_f(skin, "back_color", "#202022E6");
-                    let a = (0.45 * 255.0) as u8;
-                    apply_accent(
-                        self.hwnd,
-                        ACCENT_ENABLE_ACRYLICBLURBEHIND,
-                        [
-                            (back.r * 255.0) as u8,
-                            (back.g * 255.0) as u8,
-                            (back.b * 255.0) as u8,
-                            a,
-                        ],
-                    );
+                    let tint_v = skin
+                        .pointer("/skin/material/tint")
+                        .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
+                        .and_then(|x| x.as_str())
+                        .and_then(parse_hex);
+                    let (tr, tg, tb, ta) = match tint_v {
+                        Some([r, g, b, a]) => (r, g, b, a),
+                        None => {
+                            let back = color_f(skin, "back_color", "#202022E6");
+                            (
+                                (back.r * 255.0) as u8,
+                                (back.g * 255.0) as u8,
+                                (back.b * 255.0) as u8,
+                                (0.45 * 255.0) as u8,
+                            )
+                        }
+                    };
+                    apply_accent(self.hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, [tr, tg, tb, ta]);
                 } else {
                     apply_accent(self.hwnd, ACCENT_DISABLED, [0, 0, 0, 0]);
                 }
