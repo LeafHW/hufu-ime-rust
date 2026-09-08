@@ -46,9 +46,9 @@
                    "line_spacing":  3.0,
                    "min_width":  150.0,
                    "width":  0.0,
-                   "shadow_radius":  5.0,
-                   "shadow_offset_x":  0.0,
-                   "shadow_offset_y":  2.0,
+                   "shadow_radius": 12.0,
+                   "shadow_offset_x": 0,
+                   "shadow_offset_y": 2,
                    "mark_text":  "❀"
                },
     "material":  {
