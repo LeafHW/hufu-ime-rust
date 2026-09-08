@@ -344,7 +344,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <h3>材质</h3>
         <div class="row">
           <div class="checkline"><input type="checkbox" id="mat-glass"><label for="mat-glass" title="窗底实时抓取屏幕内容并高斯模糊（真窗口毛玻璃；预览图以半透明近似）">毛玻璃底</label></div>
-          <div class="field"><label>模糊强度 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="0" max="100" step="1" title="自绘高斯模糊强度 0-100 连续可调（0=无模糊），每个数值都生效"></div>
+          <div class="field"><label>模糊强度 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="0" max="100" step="1" title="三档（系统限制无法连续调节）：0=无模糊，1-50=轻模糊，51-100=重模糊。同档内数值观感相同属正常"></div>
           <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
           <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
           <div class="field"><label>玻璃阴影浓度 <span class="val" id="mat-gsa-v"></span></label><input type="range" id="mat-gsa" min="0" max="100" title="毛玻璃模式专用投影浓度（独立于纯色阴影的透明度）；0%=无玻璃阴影"></div>
@@ -764,7 +764,7 @@ function bindSkin() {
     const syncG = () => {
       gc.checked = SKIN.material.kind === "glass";
       bl.value = SKIN.layout.blur_radius ?? 24;
-      $("#l-blur-v").textContent = bl.value;
+      $("#l-blur-v").textContent = parseFloat(bl.value) === 0 ? "无" : (bl.value <= 50 ? "轻" : "重");
       const t = parseTint(SKIN.material.tint);
       if (t) {
         tc.value = "#" + t.slice(0, 6);
@@ -777,7 +777,7 @@ function bindSkin() {
     };
     gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; preview(); };
     gc.onchange = saveSkinQuiet;
-    bl.oninput = () => { SKIN.layout.blur_radius = parseFloat(bl.value); $("#l-blur-v").textContent = bl.value; preview(); };
+    bl.oninput = () => { SKIN.layout.blur_radius = parseFloat(bl.value); $("#l-blur-v").textContent = parseFloat(bl.value) === 0 ? "无" : (bl.value <= 50 ? "轻" : "重"); preview(); };
     bl.onchange = saveSkinQuiet;
     const tintOf = () => tc.value + Math.round(ta.value / 100 * 255).toString(16).padStart(2, "0");
     tc.oninput = () => { SKIN.material.tint = tintOf(); preview(); };

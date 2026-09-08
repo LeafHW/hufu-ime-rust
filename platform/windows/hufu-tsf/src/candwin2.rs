@@ -510,226 +510,7 @@ fn read_diag_stage() -> u32 {
 /// NOREDIRECTIONBITMAP+DComp 窗口配 ACCENT_ENABLE_ACRYLICBLURBEHIND——
 /// DWM 合成器直接给窗口底下做系统级真毛玻璃。零抓屏（自绘方案抓到
 /// 自己黑块的死结消除）、零模糊算法。染色=GradientColor(0xAABBGGRR)。
-// 【v4.0 DXGI Desktop Duplication 抓屏】GDI BitBlt 在 TSF 宿主进程里
-// 对屏幕区域返回纯黑（v2「自绘死结」真身：PowerShell 进程能抓到，
-// ISE 宿主进程 BitBlt=黑——GDI 屏幕读取的宿主上下文怪癖）。
-// GetDisplaySurfaceData 直接从 DWM 合成器拿当前桌面快照（无需
-// Acquire 帧循环），无 GDI 怪癖。全屏帧缓存+按需裁剪。
-unsafe fn capture_duplication_bgra(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
-    use std::sync::Mutex;
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-    use windows::Win32::Graphics::Direct3D11::{
-        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11CreateDevice,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-    };
-    use windows::Win32::Graphics::Dxgi::{IDXGIDevice1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO};
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-
-    struct DupState {
-        ctx: ID3D11DeviceContext,
-        dup: IDXGIOutputDuplication,
-        ox: i32,
-        oy: i32,
-        fw: u32,
-        fh: u32,
-        staging: ID3D11Texture2D,
-        // 静止桌面复用缓存（AcquireNextFrame 超时=无新帧=屏幕没变）
-        cache: Option<((i32, i32, u32, u32), Vec<u8>)>,
-    }
-    static STATE: Mutex<Option<DupState>> = Mutex::new(None);
-    let mut g = STATE.lock().unwrap();
-
-    if g.is_none() {
-        unsafe {
-            let mut dev: Option<ID3D11Device> = None;
-            let mut ctx: Option<ID3D11DeviceContext> = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut dev),
-                None,
-                Some(&mut ctx),
-            )
-            .ok()?;
-            let dev = dev?;
-            let ctx = ctx?;
-            let dxgi_dev: IDXGIDevice1 = dev.cast().ok()?;
-            let adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter1 = dxgi_dev.GetParent().ok()?;
-            let out = adapter.EnumOutputs(0).ok()?;
-            // 输出区域坐标（DXGI_OUTPUT_DESC，非 OUTDUPL_DESC）
-            let od = out.GetDesc().ok()?;
-            let (ox, oy) = (od.DesktopCoordinates.left, od.DesktopCoordinates.top);
-            let out1: IDXGIOutput1 = out.cast().ok()?;
-            let dup = out1.DuplicateOutput(&dev).ok()?;
-            let dd = dup.GetDesc();
-            let (fw, fh) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
-            let mk = |usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE, cpu: u32| D3D11_TEXTURE2D_DESC {
-                Width: fw,
-                Height: fh,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: usage,
-                BindFlags: 0,
-                CPUAccessFlags: cpu,
-                MiscFlags: 0,
-            };
-            let mut st_opt: Option<ID3D11Texture2D> = None;
-            dev.CreateTexture2D(&mk(D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32), None, Some(&mut st_opt)).ok()?;
-            let staging = st_opt?;
-            *g = Some(DupState { ctx, dup, ox, oy, fw, fh, staging, cache: None });
-        }
-    }
-    let s = g.as_mut()?;
-
-    unsafe {
-        // 等一帧（0ms 快路径；静止=超时→缓存复用）
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut res_opt: Option<IDXGIResource> = None;
-        let acq = s.dup.AcquireNextFrame(0, &mut info, &mut res_opt as *mut Option<IDXGIResource> as *mut _);
-        let frame_tex: ID3D11Texture2D = match acq {
-            Ok(()) => {
-                let res = res_opt?;
-                let tex: ID3D11Texture2D = res.cast().ok()?;
-                tex
-            }
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                // 静止：同位置同尺寸直接复用缓存；无匹配缓存（首次/移动）
-                // 阻塞等一帧（17ms=一个合成周期——首次抓屏的窗口出现前
-                // 桌面静止无新帧，超时后必须等）
-                let hit = s.cache.as_ref().is_some_and(|((cx, cy, cw, ch), _)| *cx == x && *cy == y && *cw == w && *ch == h);
-                if hit {
-                    return s.cache.clone().map(|(_, v)| v);
-                }
-                let mut res2: Option<IDXGIResource> = None;
-                let acq2 = s.dup.AcquireNextFrame(17, &mut info, &mut res2 as *mut Option<IDXGIResource> as *mut _);
-                if acq2.is_err() {
-                    return None;
-                }
-                let res = res2?;
-                let tex: ID3D11Texture2D = res.cast().ok()?;
-                tex
-            }
-            Err(_) => {
-                *g = None; // 设备丢失/访问丢失：下次重建
-                return None;
-            }
-        };
-        s.ctx.CopyResource(&s.staging, &frame_tex);
-        let _ = s.dup.ReleaseFrame();
-        let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
-        s.ctx
-            .Map(&s.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped as *mut _))
-            .ok()?;
-        let pitch = mapped.RowPitch as usize;
-        let src = mapped.pData as *const u8;
-        // 只拷目标行区间（省内存带宽）
-        let lx = (x - s.ox) as isize;
-        let ly = (y - s.oy) as isize;
-        if lx < 0 || ly < 0 || lx + w as isize > s.fw as isize || ly + h as isize > s.fh as isize {
-            s.ctx.Unmap(&s.staging, 0);
-            return None;
-        }
-        let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for row in 0..(h as usize) {
-            let so = ((ly as usize + row) * pitch) + (lx as usize) * 4;
-            out.extend_from_slice(std::slice::from_raw_parts(
-                src.add(so),
-                (w as usize) * 4,
-            ));
-        }
-        s.ctx.Unmap(&s.staging, 0);
-        // duplication 帧同样置满 alpha（内容恒不透明）
-        for i in (3..out.len()).step_by(4) {
-            out[i] = 255;
-        }
-        s.cache = Some(((x, y, w, h), out.clone()));
-        Some(out)
-    }
-}
-
-// 【v4 CPU 盒式模糊】3 轮 box blur≈高斯。可分离：每轮水平+垂直。
-// 中心窗口 [x-r, x+r] clamp 到边界，增量进出（每元素进出各一次，
-// 绝无 u32 下溢——初版 saturating_sub 卡 0 重复减首元素导致全黑）。
-fn box_blur_bgra(px: &mut [u8], w: usize, h: usize, radius: usize) {
-    if radius == 0 || w < 2 || h < 2 || px.len() < w * h * 4 {
-        return;
-    }
-    let r = radius.min((w.max(h) / 2).saturating_sub(1)).max(1);
-    let mut tmp = vec![0u8; px.len()];
-    let mut acc = [0u32; 4];
-    for _round in 0..3 {
-        // 水平：行内窗口
-        for y in 0..h {
-            let row = y * w * 4;
-            for c in 0..4 {
-                acc[c] = 0;
-            }
-            let mut l = 0usize;
-            let mut rr = 0usize;
-            for x in 0..w {
-                let nl = x.saturating_sub(r);
-                let nr = (x + r).min(w - 1);
-                while rr < nr {
-                    rr += 1;
-                    for c in 0..4 {
-                        acc[c] += px[row + rr * 4 + c] as u32;
-                    }
-                }
-                while l < nl {
-                    for c in 0..4 {
-                        acc[c] -= px[row + l * 4 + c] as u32;
-                    }
-                    l += 1;
-                }
-                let cnt = (rr - l + 1) as u32;
-                for c in 0..4 {
-                    tmp[row + x * 4 + c] = (acc[c] / cnt) as u8;
-                }
-            }
-        }
-        // 垂直：列内窗口
-        for x in 0..w {
-            for c in 0..4 {
-                acc[c] = 0;
-            }
-            let mut l = 0usize;
-            let mut rr = 0usize;
-            for y in 0..h {
-                let nl = y.saturating_sub(r);
-                let nr = (y + r).min(h - 1);
-                while rr < nr {
-                    rr += 1;
-                    for c in 0..4 {
-                        acc[c] += tmp[rr * w * 4 + x * 4 + c] as u32;
-                    }
-                }
-                while l < nl {
-                    for c in 0..4 {
-                        acc[c] -= tmp[l * w * 4 + x * 4 + c] as u32;
-                    }
-                    l += 1;
-                }
-                let cnt = (rr - l + 1) as u32;
-                for c in 0..4 {
-                    px[y * w * 4 + x * 4 + c] = (acc[c] / cnt) as u8;
-                }
-            }
-        }
-    }
-}
-
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
-    // 主路径：Desktop Duplication；失败退 GDI（黑块风险）
-    if let Some(v) = capture_duplication_bgra(x, y, w, h) {
-        return Some(v);
-    }
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -1000,13 +781,28 @@ impl CandidateWindowV2 {
         // tint 染回 accent 层（系统合成染色，均匀覆盖+跟随模糊层）：
         // 深色 tint=暗玻璃不泛白，元素仍是极简形态（高亮+文字）。
         // glass_alpha 弃用（白雾语义错误）；浓度=tint 自带 alpha。
-        // 【v4.0 自绘毛玻璃】用户指令：去掉 DWM 毛玻璃路线，自绘模糊
-        // 候选（强度自由可调）。accent/DWM 全停用——模糊=抓屏缓存+
-        // D2D 高斯（blur_radius 连续映射 σ）。窗口恢复普通透明 DComp 窗
-        //（swapchain 透明区穿透，模糊层+内容不透明）。
         {
-            let state: u32 = ACCENT_DISABLED;
-            let (tr, tg, tb, ta) = (0u32, 0u32, 0u32, 8u32);
+            let want_acrylic = kind == "glass";
+            let blur_v = layout_f(skin, "blur_radius", 24.0);
+            let state: u32 = if !want_acrylic {
+                ACCENT_DISABLED
+            } else if blur_v <= 0.0 {
+                // 0=无模糊纯透明
+                ACCENT_ENABLE_TRANSPARENTGRADIENT
+            } else if blur_v <= 50.0 {
+                // 1-50=轻模糊（BLURBEHIND，模糊度较低——用户实测
+                // ACRYLIC「模糊度有点高」）
+                ACCENT_ENABLE_BLURBEHIND
+            } else {
+                // 51-100=重模糊（ACRYLIC）
+                ACCENT_ENABLE_ACRYLICBLURBEHIND
+            };
+            // 染色=tint RGBA（无 tint 时深灰 50% 兜底）
+            let (tr, tg, tb, ta) = match tint_hex {
+                Some([r, g, b, a]) => (r as u32, g as u32, b as u32, a as u32),
+                None => (28, 28, 30, 128),
+            };
+            // 幂等键含全 RGBA（拖色板/浓度即时重设）
             let key: u64 = ((state as u64) << 32) | ((tr << 24) | (tg << 16) | (tb << 8) | ta) as u64;
             if self.acrylic_last.get() != key {
                 apply_accent(self.hwnd, state, [tr as u8, tg as u8, tb as u8, ta as u8]);
@@ -1484,11 +1280,6 @@ impl CandidateWindowV2 {
         let shadow_m = if has_shadow {
             let sigma = shadow_radius * 0.5 + 1.0;
             (sigma * 3.0 + 6.0 + shadow_off_y.abs().max(shadow_off_x.abs())).ceil()
-        } else if kind == "glass" {
-            // 【v4 模糊采样余量】大 σ 模糊边缘需要窗口外更大的源图——
-            // 窗口=面板+2*blur_m（抓屏含余量，模糊边缘不发虚）。
-            let blr = layout_f(skin, "blur_radius", 24.0).clamp(0.0, 100.0);
-            ((blr / 3.0).max(0.2) * 2.0 + 6.0).ceil()
         } else {
             0.0
         };
@@ -1545,25 +1336,51 @@ impl CandidateWindowV2 {
             // glass=毛玻璃（抓屏+D2D 高斯模糊+圆角裁剪，2026-09-08）；
             // material.opacity(0-1) 统一控透明度。
             let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-            // 【毛玻璃 v4.0 自绘】抓屏缓存（show 定位前抓的干净底）→
-            // D2D GaussianBlur effect（σ=blur_radius/3 连续可调——用户
-            // 要求每个数字都生效）→ Layer 圆角裁剪（=皮肤 corner_radius
-            // 真正生效）→ tint 染色层。effect 失败退原尺寸直画兜底。
-            const GLASS_SELF_DRAW: bool = true;
+            // 【毛玻璃层】glass_raw（show 定位前抓的干净底）→ D2D bitmap
+            // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
+            // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
+            // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
+            // 【毛玻璃 v3】glass 走 DWM acrylic（show 开头）——自绘路径
+            // 整体停用，保留代码作回退（GLASS_SELF_DRAW=true 恢复）。
+            const GLASS_SELF_DRAW: bool = false;
             if GLASS_SELF_DRAW && kind == "glass" {
+                crate::tsf::diag_note(&format!(
+                    "gstep1: enter dpi={dpi_scale} raw={}",
+                    match &self.glass_raw { Some(_) => "some", None => "none" }
+                ));
                 if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
-                    let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(0.0, 100.0);
+                    let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
+                    // 【毛玻璃 v2·降采样模糊 2026-09-08】两轮实测定位：
+                    // ① GaussianBlur effect 输出不模糊（透出但清晰）
+                    // ② 尺寸防御拦截——打字时候选宽度帧帧变（日志
+                    // 242→282→201→181），抓屏缓存永远追不上本帧尺寸
+                    // → 每帧跳过。v2 方案：
+                    // - 模糊=降采样上载（1/k 尺寸 bitmap）+DrawBitmap
+                    //   双线性放大（天然平滑模糊），k=blur/8——绕开
+                    //   effect；模糊半径直接映射采样步长
+                    // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
+                    //   窗体区（模糊底拉伸无感知）——打字全程连续显示
                     if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
                     let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
                     let g_cached = self.glass_cache.take();
-                    // 原尺寸位图上载（模糊在上载前 CPU 完成）
                     let bmp = match &g_cached {
                         Some((k, v)) if *k == g_key => v.clone(),
                         _ => unsafe {
-                            let mut px_own = raw_px.as_ref().clone();
-                            let sigma = (blur_r / 3.0).max(0.2);
-                            let radius = ((sigma * 1.4) as usize).min(64); // σ→box r 经验
-                            box_blur_bgra(&mut px_own, *gw as usize, *gh as usize, radius);
+                            // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
+                            // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
+                            // 实测梯度比 0.78（含文字行干扰）仍偏轻
+                            let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
+                            let sw = (*gw / k).max(1);
+                            let sh = (*gh / k).max(1);
+                            let mut small: Vec<u8> = Vec::with_capacity((sw * sh * 4) as usize);
+                            for y in 0..sh {
+                                let sy = ((y as usize) * (k as usize)).min(*gh as usize - 1);
+                                for x in 0..sw {
+                                    let sx = ((x as usize) * (k as usize)).min(*gw as usize - 1);
+                                    let o = (sy * (*gw as usize) + sx) * 4;
+                                    small.extend_from_slice(&raw_px[o..o + 4]);
+                                }
+                            }
                             let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                                 pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
                                     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -1575,16 +1392,16 @@ impl CandidateWindowV2 {
                                 ..Default::default()
                             };
                             let r = ctx.CreateBitmap(
-                                D2D_SIZE_U { width: *gw, height: *gh },
-                                Some(px_own.as_ptr() as *const core::ffi::c_void),
-                                *gw * 4,
+                                D2D_SIZE_U { width: sw, height: sh },
+                                Some(small.as_ptr() as *const core::ffi::c_void),
+                                sw * 4,
                                 &bmp_props,
                             );
                             match r {
                                 Ok(b) => b,
                                 Err(e) => {
                                     crate::tsf::diag_note(&format!(
-                                        "v4 createbmp FAIL {e:?}"
+                                        "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
                                     ));
                                     return;
                                 }
@@ -1592,41 +1409,107 @@ impl CandidateWindowV2 {
                         },
                     };
                     glass_cache_out = Some((g_key, bmp.clone()));
-                    let _ = stage; // stage 分层验证使命完成（Layer 已废）
-                    // 【v4 终版】全窗直画：圆角=窗口 RGN（v3.9 起已设=皮肤
-                    // corner_radius）裁四角，位图铺满全窗（含模糊余量边距
-                    // 区）。【Layer 路径废除】stage 实验证明 Layer 内绘制不
-                    // 显示（stage1 无 Layer 全幅直画能显示）。
-                    unsafe {
-                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                            M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
-                        });
-                        let dst = D2D_RECT_F {
-                            left: 0.0,
-                            top: 0.0,
-                            right: w_out as f32,
-                            bottom: h_out as f32,
-                        };
-                        // 模糊已在位图上载前 CPU 完成（box_blur_bgra），直画
-                        let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                        // 【v4 tint 染色层】模糊之上叠皮肤染色（极简：
-                        // 模糊+染色，无面板/边框）
-                        if let Some([tr2, tg2, tb2, ta2]) = tint_hex {
-                            let tc = D2D1_COLOR_F {
-                                r: tr2 as f32 / 255.0,
-                                g: tg2 as f32 / 255.0,
-                                b: tb2 as f32 / 255.0,
-                                a: ta2 as f32 / 255.0,
+                    if stage == 1 || stage == 2 {
+                        // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
+                        unsafe {
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
+                            });
+                            let full = D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: w_out as f32,
+                                bottom: h_out as f32,
                             };
-                            if let Ok(tb2b) = ctx.CreateSolidColorBrush(&tc, None) {
-                                ctx.FillRectangle(&dst, &tb2b);
+                            // 真实抓屏位图全幅直画（最小毛玻璃管线）
+                            let _ = ctx.DrawBitmap(&bmp, Some(&full as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                            crate::tsf::diag_note(&format!(
+                                "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
+                            ));
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
+                            });
+                        }
+                    } else {
+                    unsafe {
+                        // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
+                        let mask = ctx
+                            .GetFactory()
+                            .ok()
+                            .and_then(|f| {
+                                f.CreateRoundedRectangleGeometry(
+                                    &D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: shadow_m * dpi_scale,
+                                            top: shadow_m * dpi_scale,
+                                            right: (shadow_m + width) * dpi_scale,
+                                            bottom: (shadow_m + height) * dpi_scale,
+                                        },
+                                        radiusX: radius * dpi_scale,
+                                        radiusY: radius * dpi_scale,
+                                    },
+                                )
+                                .ok()
+                            });
+                        if let Some(mask) = mask {
+                            if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                    // 【根因修复 2026-09-08】PushLayer 的 mask
+                                    // 按当时 transform 解释——此前在 Push 后才切
+                                    // identity，mask（物理坐标）被 dpi 主变换二
+                                    // 次缩放跑出窗外→层内所有绘制全被裁掉
+                                    //（红色裁决实测：层没画、窗口半透明穿透）。
+                                    // 正序：先切 identity 再 Push。
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                    let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
+                                    lp.contentBounds = D2D_RECT_F {
+                                        left: -1.0e6,
+                                        top: -1.0e6,
+                                        right: 1.0e6,
+                                        bottom: 1.0e6,
+                                    };
+                                    lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
+                                    lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                    // 【终极根因 2026-09-08】default() 的 maskTransform
+                                    // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
+                                    // 一点，Layer 内一切绘制全被裁掉（对照阴影段
+                                    // push_shadow_mask 显式设 identity 才正常显示）。
+                                    lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    };
+                                    ctx.PushLayer(&lp, None);
+                                    let dst = D2D_RECT_F {
+                                        left: shadow_m * dpi_scale,
+                                        top: shadow_m * dpi_scale,
+                                        right: (shadow_m + width) * dpi_scale,
+                                        bottom: (shadow_m + height) * dpi_scale,
+                                    };
+                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                                    // 恢复渲染主变换（dpi 缩放）
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: dpi_scale,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: dpi_scale,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                    ctx.PopLayer();
                             }
                         }
-                        // 恢复渲染主变换（dpi 缩放）
-                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                            M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
-                        });
                     }
+                    } // else Layer 路径（stage 0/3+）
                     }
                 }
             }
@@ -2462,13 +2345,8 @@ impl CandidateWindowV2 {
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
             let dragging = CAND_DRAG.lock().unwrap().is_some();
-            // 【v4.0 自绘毛玻璃复活】关键修复 v2 死结：v2 抓屏前把窗口
-            // 移屏外+sleep 8ms——DWM 合成周期 16.7ms，8ms 时旧帧里窗口
-            // 还在原地=抓到自己黑块。v4 不移动不等待：此段在 SetWindowPos
-            // 之前跑，抓的是【目标新位置】——首帧窗口隐藏=干净桌面；跟随
-            // 移动帧窗口在旧位置=新位置干净（重叠小区块用旧缓存近似）。
-            // 同位置内容刷新帧不重抓（need=false，缓存复用）。
-            let glass_on = kind == "glass";
+            // 【毛玻璃 v3】自绘路径停用——不抓屏（v3 由 DWM acrylic 承担）
+            let glass_on = false;
             if glass_on && !dragging {
                 let gx = x - (shadow_m * dpi_scale) as i32;
                 let gy = y - (shadow_m * dpi_scale) as i32;
@@ -2477,19 +2355,35 @@ impl CandidateWindowV2 {
                         *cx != gx || *cy != gy || *cw != w_out || *ch != h_out
                     }
                     None => true,
-                };
+                } || read_diag_stage() >= 1; // 【阶段验证】诊断模式强制每帧重抓（黑缓存陷阱）
                 if need {
+                    // 【终极根因 3·2026-09-08】GDI BitBlt 拷屏对本窗口
+                    //（NOREDIRECTIONBITMAP+DComp）区域=黑块——窗口常驻
+                    // 抓屏区域时抓到自己。修复：移到屏幕外+等 DWM 合成
+                    // 一帧（8ms，BitBlt 读的是 DWM 已合成内容，不等=旧
+                    // 帧里还有自己黑影——实测移走不等仍全黑）。
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND(std::ptr::null_mut()),
+                        -20000,
+                        -20000,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(8));
                     let cap = capture_screen_rgba(gx, gy, w_out, h_out);
                     crate::tsf::diag_note(&format!(
-                        "v4: cap({gx},{gy}) {w_out}x{h_out} 首像素={:?}",
+                        "diag: cap({gx},{gy}) 首像素={:?}",
                         cap.as_ref().map(|v| &v[0..4]).unwrap_or(&[9u8, 9, 9, 9][..])
                     ));
-                    if let Some(v) = cap {
-                        self.glass_raw = Some((gx, gy, w_out, h_out, std::sync::Arc::new(v)));
-                    }
+                    self.glass_raw = cap.map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
                 }
             } else if !glass_on {
                 self.glass_raw = None;
+            }
+            if glass_on && self.glass_raw.is_none() {
+                crate::tsf::diag_note("glass capture: 缓存为空（抓屏从未成功）");
             }
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
@@ -2598,10 +2492,9 @@ impl CandidateWindowV2 {
                 }
                 self.rgn_last.set(0);
             }
-            // 【毛玻璃 v4.0·DWM 路线停用】自绘模式下不再用 DWM 圆角/NC
-            // 关闭/边框色（那些是 accent 路线的配套）。圆角=自绘 Layer
-            // +RGN（皮肤 corner_radius 真正生效）。仅保留 DONOTROUND
-            // 兜底（防系统默认圆角裁自绘内容）。
+            // 【毛玻璃 v3.5·DWM ROUND】accent 方角（面板圆角外四角残留）
+            // 用系统合成级圆角裁掉（v3.2 实测有效：accent+窗口一起圆角化）。
+            // 玻璃圆角=系统固定（~8px），面板主圆角仍由自绘 radius 决定。
             unsafe {
                 let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(
                     windows::core::w!("dwmapi.dll"),
@@ -2619,15 +2512,16 @@ impl CandidateWindowV2 {
                             u32,
                         ) -> windows::core::HRESULT;
                         let f: DwmaSet = std::mem::transmute(p);
-                        let pref: u32 = 1; // DONOTROUND（自绘圆角）
+                        let pref: u32 = if kind == "glass" { 2 } else { 1 }; // ROUND / DONOTROUND
                         let _ = f(
                             self.hwnd,
                             33, // DWMWA_WINDOW_CORNER_PREFERENCE
                             &pref as *const u32 as *const core::ffi::c_void,
                             4,
                         );
-                        // 【v4.0】NC 渲染关闭/边框色去除对 glass 保留
-                        //（自绘模式下 DWM 系统阴影/边框同样多余）
+                        // 【v3.6 修「还有点阴影」】DWM 非客户区渲染会给弹窗
+                        // 自动画一圈系统阴影——自绘阴影时代被盖住看不出，
+                        // 裸玻璃全裸露后可见。glass 关 NC 渲染。
                         if kind == "glass" {
                             let nc: u32 = 0; // DWMWA_NCRENDERING_ENABLED=FALSE
                             let _ = f(
@@ -2636,6 +2530,9 @@ impl CandidateWindowV2 {
                                 &nc as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
+                            // 【修「白色边框」】DWM 还会画主题色 1px 窗口
+                            // 边框线（浅色主题=白线，NC 关闭后更明显）——
+                            // DWMWA_BORDER_COLOR=0xFFFFFFFE（NONE）显式去掉。
                             let none_border: u32 = 0xFFFFFFFE;
                             let _ = f(
                                 self.hwnd,
