@@ -347,6 +347,9 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>边框透明度 <span class="val" id="mat-ba-v"></span></label><input type="range" id="mat-ba" min="0" max="100" title="边框色的透明度（独立控制）"></div>
           <div class="field"><label>边框宽度 <span class="val" id="mat-bw-v"></span></label><input type="range" id="mat-bw" min="0" max="8" step="0.5"></div>
           <div class="field"><label>边框色</label><input type="color" id="mat-bc"></div>
+          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
+          <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-5" max="5" step="1"></div>
+          <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-5" max="5" step="1"></div>
         </div>
         <h3>布局 · 基本</h3>
         <div class="row">
@@ -377,12 +380,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>序号字级 <span class="val" id="l-lfp-v"></span></label><input type="range" id="l-lfp" min="0" max="30" step="0.5"></div>
           <div class="field"><label>序号/注释间距 <span class="val" id="l-hsp-v"></span></label><input type="range" id="l-hsp" min="0" max="16" step="0.5"></div>
           <div class="field"><label>格式模板 <input type="text" id="l-lfmt" placeholder="%s." style="width:70px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px" title="高级：%s 代表序号本身，其余字符为装饰（如 %s. 带点、%s、 空格）"></label></div>
-        </div>
-        <h3>阴影</h3>
-        <div class="row">
-          <div class="field"><label>阴影大小 <span class="val" id="l-sr-v"></span></label><input type="range" id="l-sr" min="0" max="60" step="0.5"></div>
-          <div class="field"><label>阴影水平偏移 <span class="val" id="l-sox-v"></span></label><input type="range" id="l-sox" min="-30" max="30" step="1"></div>
-          <div class="field"><label>阴影垂直偏移 <span class="val" id="l-soy-v"></span></label><input type="range" id="l-soy" min="-30" max="30" step="1"></div>
         </div>
         <h3>颜色角色</h3>
         <div class="color-grid" id="color-grid"></div>
@@ -875,7 +872,7 @@ function bindSkin() {
   // ② 恢复默认值：颜色/布局/材质回出厂（保留皮肤 ID/名称/作者）
   {
     const F = {
-      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 4, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
+      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 12, shadow_offset_x: 0, shadow_offset_y: 2, mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
       material: { kind: "Frosted", tint: "#1C1C1ECC", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1 },
     };

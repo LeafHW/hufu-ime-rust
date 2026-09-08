@@ -233,7 +233,7 @@ impl Default for Layout {
             line_spacing: 3.0,
             min_width: 120.0,
             width: 250.0,
-            shadow_radius: 4.0,
+            shadow_radius: 12.0,
             shadow_offset_x: 0.0,
             shadow_offset_y: 2.0,
             mark_text: "·".into(),
