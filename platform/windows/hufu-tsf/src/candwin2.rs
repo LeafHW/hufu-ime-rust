@@ -2459,6 +2459,9 @@ impl CandidateWindowV2 {
             // 有效（v3.2 判无效但当时测试条件不纯：染色/边距干扰）则
             // 任意半径可达。每帧按当前尺寸+皮肤 radius 设 RGN（幂等：
             // 尺寸/半径变才重设）。无效时 DWM ROUND 8px 兜底仍在。
+            // 【v3.9.1 修「关毛玻璃后显示不全」】切回 solid 时窗口变大
+            //（含阴影边距）但 RGN 残留 glass 时的小尺寸圆角区=大窗被裁
+            // ——非 glass 分支显式清 RGN（SetWindowRgn NULL=恢复全窗）。
             if kind == "glass" {
                 let rgn_r = (radius * dpi_scale).round().max(1.0) as i32;
                 let rgn_key = ((w_out as u64) << 32) | ((h_out as u64) << 16) | rgn_r as u64;
@@ -2478,6 +2481,12 @@ impl CandidateWindowV2 {
                         }
                     }
                 }
+            } else if self.rgn_last.get() != 0 {
+                // 清残留（rgn_last≠0=曾设过）
+                unsafe {
+                    let _ = SetWindowRgn(self.hwnd, HRGN(std::ptr::null_mut()), true);
+                }
+                self.rgn_last.set(0);
             }
             // 【毛玻璃 v3.5·DWM ROUND】accent 方角（面板圆角外四角残留）
             // 用系统合成级圆角裁掉（v3.2 实测有效：accent+窗口一起圆角化）。
