@@ -813,7 +813,7 @@ impl CandidateWindowV2 {
         // ≈0.86em（上下留白比左右多 ~3px 的视觉源）。按用户直觉：水平
         // 收一点点（每边 1.5px）对冲。内容起点右移（胶囊跟随，内距
         // 保持四边对称），窗口宽自适应。
-        const PILL_SQUEEZE_X: f32 = 4.5;
+        const PILL_SQUEEZE_X: f32 = 3.0;
         let rm_x = ((rm_y + _pill_off + hilite_pad).max(rm_x)) + PILL_SQUEEZE_X;
 
         // 字体与内容测宽先行（宽度取决于最长候选）
