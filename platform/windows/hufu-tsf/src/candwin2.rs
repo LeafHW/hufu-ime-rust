@@ -389,6 +389,11 @@ pub struct CandidateWindowV2 {
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
     pub(crate) shadow_cache: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))>,
+    /// 【毛玻璃 2026-09-08】材质 kind="glass"：show 定位前 BitBlt 抓窗
+    /// 底屏幕（此刻窗口未画到新位置=干净底），paint 时 D2D 高斯模糊
+    /// +圆角裁剪画为窗底。缓存键=(屏幕x,y,w,h)——位置/尺寸不变（打
+    /// 字连续帧）零重抓；材质关（非 glass）清空。
+    pub(crate) glass_raw: Option<(i32, i32, u32, u32, std::sync::Arc<Vec<u8>>)>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -466,6 +471,69 @@ unsafe fn push_shadow_mask(
     lp.opacity = 1.0;
     let _ = ctx.PushLayer(&lp, None);
     true
+}
+
+/// 【毛玻璃抓屏 2026-09-08】BitBlt 抓屏幕矩形（物理像素）为 BGRA 字节。
+/// 调用时机=SetWindowPos 之前（窗口未画到新位置，抓到干净底）。
+/// GDI BitBlt 300×150 亚毫秒级，无需权限（区别于 Graphics.Capture）。
+/// DIB 32bpp top-down：GDI 字节序 BGRA，与 D2D CreateBitmap 的
+/// DXGI_FORMAT_B8G8R8A8_UNORM + 预乘 alpha 直接兼容（屏幕像素不透明
+/// alpha=255，预乘=自身，无须转换）。
+unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
+        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        HGDIOBJ, SRCCOPY,
+    };
+    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    let screen = GetDC(HWND(std::ptr::null_mut()));
+    if screen.is_invalid() {
+        return None;
+    }
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32), // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        ReleaseDC(HWND(std::ptr::null_mut()), screen);
+        return None;
+    }
+    let memdc = CreateCompatibleDC(screen);
+    let old = SelectObject(memdc, HGDIOBJ(dib.0));
+    let ok = BitBlt(
+        memdc,
+        0,
+        0,
+        w as i32,
+        h as i32,
+        screen,
+        x,
+        y,
+        SRCCOPY,
+    );
+    let _ = SelectObject(memdc, old);
+    let out = if ok.is_ok() {
+        let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+        Some(px)
+    } else {
+        None
+    };
+    let _ = DeleteObject(HGDIOBJ(dib.0));
+    let _ = DeleteDC(memdc);
+    ReleaseDC(HWND(std::ptr::null_mut()), screen);
+    out
 }
 
 impl CandidateWindowV2 {
@@ -573,6 +641,7 @@ impl CandidateWindowV2 {
                 tf_cache: None,
                 dy_cache: None,
                 shadow_cache: None,
+                glass_raw: None,
             })
         }
     }
@@ -671,9 +740,7 @@ impl CandidateWindowV2 {
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
-        // margin_y 原值直读（此前 -0.2 收敛因 rm_y=max(my,hp) 被 hp 钉死
-        // 无效，2026-09-08 撤除；垂直调平改由胶囊 pill_dx 统一处理）。
-        let margin_y = layout_f(skin, "margin_y", 5.0);
+        let margin_y = layout_f(skin, "margin_y", 6.0);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
@@ -795,30 +862,20 @@ impl CandidateWindowV2 {
             .unwrap_or("")
             .trim()
             .is_empty();
-        let rm_x = margin_x.max(hilite_pad);
-        // 【胶囊边距调平 v2 2026-09-08】v1（pill_dx 缩胶囊）破胶囊内
-        // 文字内距对称（左右 hp-dx vs 上下 hp），用户实测「胶囊形状
-        // 和候选不一样」。v2 反向：胶囊几何不动（内距四边恒=hp），
-        // 水平起点右移对齐垂直外边距——rm_x' = 垂直边距+hp，取 max
-        // 保底（垂直小时维持原值）。pill_off=胶囊顶相对行盒顶偏移
-        //（行盒装不下胶囊时为负溢出）。
-        let _pill_ih = em + hilite_pad * 2.0;
-        let _pill_off = if _pill_ih <= line_h {
-            (line_h - em) / 2.0 - hilite_pad
-        } else {
-            (line_h - _pill_ih) / 2.0
-        };
-        // 【垂直收窄 2026-09-08】用户实测上下仍偏多（汉字墨迹高≈0.86em，
-        // 上下墨白天生比左右多 ~3px）。垂直留白再收 2px（胶囊垂直边距
-        // 7→5），下限 4 防贴边，窗口高自适应缩。
-        const PILL_SQUEEZE_Y: f32 = 4.0;
-        let rm_y = (margin_y.max(hilite_pad) - PILL_SQUEEZE_Y).max(4.0);
-        // 【用户手感微调 2026-09-08】「上下还是多一点」——汉字墨迹高
-        // ≈0.86em（上下留白比左右多 ~3px 的视觉源）。按用户直觉：水平
-        // 收一点点（每边 1.5px）对冲。内容起点右移（胶囊跟随，内距
-        // 保持四边对称），窗口宽自适应。
-        const PILL_SQUEEZE_X: f32 = 3.0;
-        let rm_x = ((rm_y + _pill_off + hilite_pad).max(rm_x)) + PILL_SQUEEZE_X;
+        // 【布局口径重构 2026-09-08·对齐 weasel schema】用户定调：
+        // 高亮只有两个几何属性——①「高亮与边框的距离」gap（四边同
+        // 一值）②「高亮内距」hilite_padding（四边同一值，管胶囊↔
+        // 文字）。废除此前 margin_x/y 分别推导+调平+收窄的补丁堆
+        //（v2 调平/SQUEEZE_X/SQUEEZE_Y 全删——口径不一的根源）。
+        // gap=(margin_x+margin_y)/2：老皮肤自动对称化；设置页已合
+        // 一「边距」滑杆（同写两字段），新口径下恒 mx=my=gap。
+        // 行槽高 row_h=max(line_h, em+2hp)：胶囊需要时撑高，胶囊与
+        // 文字在槽内居中——胶囊四边到窗恒= gap（weasel margin 语义）。
+        let gap = (margin_x + margin_y) / 2.0;
+        let rm_x = gap;
+        let rm_y = gap;
+        let pill_h = em + hilite_pad * 2.0;
+        let row_h = line_h.max(pill_h);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
         let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
@@ -1111,12 +1168,13 @@ impl CandidateWindowV2 {
         // 横排：内容即宽（纯自适应）；竖排：固定宽/自适应原逻辑
         let width = v_width;
         let height = if horizontal {
-            // 高度贴合内容：rm×2 + 行高×行数 + 编码行后行距（与渲染 y0 一致）
-            rm_y * 2.0 + line_h * (1.0 + code_row) + cand_spacing * code_row
+            // 高度贴合内容：gap×2 + 行槽高×行数 + 编码行后行距（与渲染 y0 一致）
+            //【口径重构】line_h→row_h（行槽撑高装胶囊，胶囊四边=gap）
+            rm_y * 2.0 + row_h * (1.0 + code_row) + cand_spacing * code_row
         } else {
             // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
             let rows = cands.len().min(10) as f32 + code_row;
-            rm_y * 2.0 + line_h * rows + cand_spacing * (rows - 1.0).max(0.0)
+            rm_y * 2.0 + row_h * rows + cand_spacing * (rows - 1.0).max(0.0)
         };
 
         let w = width as u32;
@@ -1191,9 +1249,102 @@ impl CandidateWindowV2 {
 
             // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
             // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
-            // 材质简化：solid=底色 / translucent|glass|frosted(旧皮肤兼容)=tint 半透明；
-            // 毛玻璃(噪点/DWM accent) 已移除；material.opacity(0-1) 统一控透明度。
+            // 材质简化：solid=底色 / translucent|frosted(旧皮肤兼容)=tint 半透明 /
+            // glass=毛玻璃（抓屏+D2D 高斯模糊+圆角裁剪，2026-09-08）；
+            // material.opacity(0-1) 统一控透明度。
             let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            // 【毛玻璃层】glass_raw（show 定位前抓的干净底）→ D2D bitmap
+            // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
+            // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
+            // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
+            if kind == "glass" {
+                if let Some((_, _, _, _, raw_px)) = &self.glass_raw {
+                    let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
+                    unsafe {
+                        let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                            },
+                            dpiX: 96.0,
+                            dpiY: 96.0,
+                            bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_NONE.0),
+                            ..Default::default()
+                        };
+                        if let Ok(bmp) = ctx.CreateBitmap(D2D_SIZE_U { width: w_out, height: h_out }, Some(raw_px.as_ptr() as *const core::ffi::c_void), w_out * 4, &bmp_props) {
+                            // 高斯模糊：属性 0 = StandardDeviation（与阴影
+                            // effect 同款 SetValue 数字属性写法）
+                            if let Ok(effect) = ctx.CreateEffect(&CLSID_D2D1GaussianBlur) {
+                                let sd = blur_r / 3.0;
+                                let _ = effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &sd.to_ne_bytes());
+                                effect.SetInput(0, &bmp, true);
+                                // 圆角裁剪（物理像素系）+ 满幅 DrawImage
+                                let mask = ctx
+                                    .GetFactory()
+                                    .ok()
+                                    .and_then(|f| {
+                                        f.CreateRoundedRectangleGeometry(
+                                            &D2D1_ROUNDED_RECT {
+                                                rect: D2D_RECT_F {
+                                                    left: shadow_m * dpi_scale,
+                                                    top: shadow_m * dpi_scale,
+                                                    right: (shadow_m + width) * dpi_scale,
+                                                    bottom: (shadow_m + height) * dpi_scale,
+                                                },
+                                                radiusX: radius * dpi_scale,
+                                                radiusY: radius * dpi_scale,
+                                            },
+                                        )
+                                        .ok()
+                                    });
+                                if let Some(mask) = mask {
+                                    // effect → ID2D1Image（DrawImage 参数类型）
+                                    if let Ok(eff_img) = effect.cast::<ID2D1Image>() {
+                                    if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                    let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
+                                    lp.contentBounds = D2D_RECT_F {
+                                        left: -1.0e6,
+                                        top: -1.0e6,
+                                        right: 1.0e6,
+                                        bottom: 1.0e6,
+                                    };
+                                    lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
+                                    lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                    ctx.PushLayer(&lp, None);
+                                    // 物理像素单位（identity 变换）
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                    ctx.DrawImage(
+                                        &eff_img,
+                                        None,
+                                        None,
+                                        D2D1_INTERPOLATION_MODE_LINEAR,
+                                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                                    );
+                                    // 恢复渲染主变换（dpi 缩放）
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: dpi_scale,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: dpi_scale,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                    ctx.PopLayer();
+                                    }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
             // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
             if has_shadow {
@@ -1568,37 +1719,24 @@ impl CandidateWindowV2 {
                         ctx.FillRoundedRectangle(&rr, bg);
                     }
                 }
-                draw(&ctx, &tf, raw.as_str(), rm_x, rm_y + dy, width - rm_x * 2.0, line_h, &b_raw);
+                draw(&ctx, &tf, raw.as_str(), rm_x, rm_y + dy, width - rm_x * 2.0, row_h, &b_raw);
             }
             // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
             // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
             // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
             // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
             // 布置。
-            let y0 = rm_y + (line_h + cand_spacing) * code_row;
+            let y0 = rm_y + (row_h + cand_spacing) * code_row;
 
-            // 高亮胶囊统一内边距：四边都 = hilite_pad。
-            // 文本盒（em 高、垂直居中于行）向外扩 hilite_pad；放不下时整胶囊在行内居中，
-            // 保证上下左右内边距始终一致（旧版 top 被夹底没夹，左右还各有隐藏 ±4）。
-            // 【对齐终修 2026-09-06】旧版胶囊整体下移 6% em（optical，
-            // 「高亮偏上」时代补丁——当时 dy 平移整行、文字相对胶囊
-            // 无独立修正，只能靠胶囊错位补视觉）。现 dy 只作用于文本
-            // draw（墨盒居中已正确处理文字在胶囊内的视觉位置），
-            // optical 残留成胶囊相对窗框上下间隙差 2×6%em（字号越大
-            // 越明显，用户实测「高亮与内框上下没对齐」）——删除：
-            // 胶囊纯几何对称，文字居中全权交 dy。
+            // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
+            // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
+            // 行槽 row_h 已在测量段撑高到能装下胶囊（max(line_h,
+            // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
+            // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
+            // 补丁链全部废除。
             let pill_v = |y: f32| -> (f32, f32) {
-                let half = (line_h - em) / 2.0;
-                let ih = em + hilite_pad * 2.0;
-                if ih <= line_h {
-                    (
-                        y + half - hilite_pad,
-                        y + half + em + hilite_pad,
-                    )
-                } else {
-                    let off = (line_h - ih) / 2.0;
-                    (y + off, y + off + ih)
-                }
+                let off = (row_h - pill_h) / 2.0;
+                (y + off, y + off + pill_h)
             };
 
             // 候选行
@@ -1625,15 +1763,15 @@ impl CandidateWindowV2 {
                                     right: x + cell_w + hilite_pad,
                                     bottom: pb,
                                 },
-                                radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
-                                radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
+                                radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                radiusY: layout_f(skin, "hilited_corner_radius", radius),
                             };
                             ctx.FillRoundedRectangle(&rr, b);
                             // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
                             if mark_en {
                                 let mw = 2.0f32.min(hilite_pad);
-                                let my = y + line_h * 0.2;
-                                let mh = line_h * 0.6;
+                                let my = y + row_h * 0.2;
+                                let mh = row_h * 0.6;
                                 let mrr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
                                         left: x - hilite_pad + (hilite_pad - mw) / 2.0,
@@ -1656,13 +1794,13 @@ impl CandidateWindowV2 {
                     };
                     let mut cx = x;
                     if show_index {
-                        draw(&ctx, &tf_label, &fmt_label(i + 1), cx, y + dy, iw, line_h, bl);
+                        draw(&ctx, &tf_label, &fmt_label(i + 1), cx, y + dy, iw, row_h, bl);
                         cx += iw;
                     }
-                    draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, line_h, bt);
+                    draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
                     cx += tw;
                     if !cmt.is_empty() && cw > 0.0 {
-                        draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, line_h, bc);
+                        draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
                     }
                     x += cell_w;
                 }
@@ -1670,7 +1808,7 @@ impl CandidateWindowV2 {
                 // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
                 for (i, (text, _)) in cands.iter().enumerate().take(10) {
                     let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                    let y = y0 + (line_h + cand_spacing) * i as f32;
+                    let y = y0 + (row_h + cand_spacing) * i as f32;
                     if i == sel {
                         // 高亮行（圆角胶囊；↑↓ 移动；左右对称 = rm_x 外扩 hilite_pad）
                         if let Some(b) = &b_hi {
@@ -1682,15 +1820,15 @@ impl CandidateWindowV2 {
                                     right: width - rm_x + hilite_pad,
                                     bottom: pb,
                                 },
-                                radiusX: layout_f(skin, "hilited_corner_radius", 6.0),
-                                radiusY: layout_f(skin, "hilited_corner_radius", 6.0),
+                                radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                radiusY: layout_f(skin, "hilited_corner_radius", radius),
                             };
                             ctx.FillRoundedRectangle(&rr, b);
                             // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
                             if mark_en {
                                 let mw = 2.0f32.min(hilite_pad);
-                                let my = y + line_h * 0.2;
-                                let mh = line_h * 0.6;
+                                let my = y + row_h * 0.2;
+                                let mh = row_h * 0.6;
                                 let mrr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
                                         left: rm_x - hilite_pad + (hilite_pad - mw) / 2.0,
@@ -1712,11 +1850,11 @@ impl CandidateWindowV2 {
                         (&b_text, &b_label, &b_cmt)
                     };
                     if show_index {
-                        draw(&ctx, &tf_label, &fmt_label(i + 1), rm_x, y + dy, label_w, line_h, bl);
+                        draw(&ctx, &tf_label, &fmt_label(i + 1), rm_x, y + dy, label_w, row_h, bl);
                     }
-                    draw(&ctx, &tf, text, text_x, y + dy, cmt_x - text_x - 4.0, line_h, bt);
+                    draw(&ctx, &tf, text, text_x, y + dy, cmt_x - text_x - 4.0, row_h, bt);
                     if !cmt.is_empty() {
-                        draw(&ctx, &tf_small, cmt, cmt_x, y + dy, width - cmt_x - rm_x + 4.0, line_h, bc);
+                        draw(&ctx, &tf_small, cmt, cmt_x, y + dy, width - cmt_x - rm_x + 4.0, row_h, bc);
                     }
                 }
             }
@@ -1994,6 +2132,24 @@ impl CandidateWindowV2 {
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
             let dragging = CAND_DRAG.lock().unwrap().is_some();
+            // 【毛玻璃抓屏】须在 SetWindowPos 之前：此刻窗口（旧位图）
+            // 还没画到新位置，BitBlt 到的是干净底。位置/尺寸与缓存一致
+            // （打字连续帧）则跳过；拖拽中不重抓（旧模糊底，松手回正）。
+            let glass_on = kind == "glass";
+            if glass_on && !dragging {
+                let gx = x - (shadow_m * dpi_scale) as i32;
+                let gy = y - (shadow_m * dpi_scale) as i32;
+                let need = match &self.glass_raw {
+                    Some((cx, cy, cw, ch, _)) => *cx != gx || *cy != gy || *cw != w_out || *ch != h_out,
+                    None => true,
+                };
+                if need {
+                    self.glass_raw = capture_screen_rgba(gx, gy, w_out, h_out)
+                        .map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
+                }
+            } else if !glass_on {
+                self.glass_raw = None;
+            }
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
