@@ -1656,8 +1656,16 @@ impl CandidateWindowV2 {
             {
                 // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
                 // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 1。
+                // 【毛玻璃 2026-09-08】kind=glass 时底色是模糊底上的「染色
+                // 层」——保持 master 不透明会把毛玻璃完全盖死（用户实测
+                // 「画了但看不到」的根因），降为 0.55 让模糊底透出。
                 let back = color_f(skin, "back_color", "#202022E6");
-                let bg_c = D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: master };
+                let bg_c = D2D1_COLOR_F {
+                    r: back.r,
+                    g: back.g,
+                    b: back.b,
+                    a: if kind == "glass" { master * 0.55 } else { master },
+                };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                         let rr = D2D1_ROUNDED_RECT {
