@@ -344,7 +344,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <h3>材质</h3>
         <div class="row">
           <div class="checkline"><input type="checkbox" id="mat-glass"><label for="mat-glass" title="窗底实时抓取屏幕内容并高斯模糊（真窗口毛玻璃；预览图以半透明近似）">毛玻璃底</label></div>
-          <div class="field"><label>模糊档位</label><select id="l-blur" title="三档：低=轻模糊（BLURBEHIND）、中=重模糊（ACRYLIC）、高=重模糊·浓度顶格。Windows 系统只有两档模糊深度，中/高同为重模糊"><option value="10">低</option><option value="60">中</option><option value="100">高</option></select></div>
+          <div class="field"><label>模糊档位</label><select id="l-blur" title="三档：低=轻模糊、中/高=重模糊。Windows 系统只有两档模糊深度，中/高同为重模糊"><option value="low">低</option><option value="mid">中</option><option value="high">高</option></select></div>
           <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
           <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
           <div class="field"><label>玻璃阴影浓度 <span class="val" id="mat-gsa-v"></span></label><input type="range" id="mat-gsa" min="0" max="100" title="毛玻璃模式专用投影浓度（独立于纯色阴影的透明度）；0%=无玻璃阴影"></div>
@@ -763,9 +763,13 @@ function bindSkin() {
     };
     const syncG = () => {
       gc.checked = SKIN.material.kind === "glass";
-      // 三档（低/中/高）：值→就近档位（低≤50=10，>50=60/100 顶格归高）
-      const bv = SKIN.layout.blur_radius ?? 10;
-      bl.value = bv <= 50 ? "10" : (bv <= 80 ? "60" : "100");
+      // 真三档枚举 blur_level；旧皮肤无此字段从 blur_radius 推档
+      if (SKIN.layout.blur_level) {
+        bl.value = SKIN.layout.blur_level;
+      } else {
+        const bv = SKIN.layout.blur_radius ?? 24;
+        bl.value = bv <= 50 ? "low" : (bv <= 80 ? "mid" : "high");
+      }
       const t = parseTint(SKIN.material.tint);
       if (t) {
         tc.value = "#" + t.slice(0, 6);
@@ -778,7 +782,7 @@ function bindSkin() {
     };
     gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; preview(); };
     gc.onchange = saveSkinQuiet;
-    bl.oninput = () => { SKIN.layout.blur_radius = parseFloat(bl.value); preview(); };
+    bl.oninput = () => { SKIN.layout.blur_level = bl.value; preview(); };
     bl.onchange = saveSkinQuiet;
     const tintOf = () => tc.value + Math.round(ta.value / 100 * 255).toString(16).padStart(2, "0");
     tc.oninput = () => { SKIN.material.tint = tintOf(); preview(); };
@@ -1067,8 +1071,11 @@ function preview() {
     const b = parseInt(m[1].slice(4, 6), 16), a = parseInt(m[1].slice(6, 8), 16) / 255;
     return `rgba(${r},${g},${b},${a.toFixed(2)})`;
   })();
+  // 模糊三档→预览 px（近似观感：低轻/中高重）
+  const blurPx = { low: 10, mid: 60, high: 100 }[L.blur_level]
+    ?? (L.blur_radius <= 50 ? 10 : (L.blur_radius <= 80 ? 60 : 100));
   const glassCss = SKIN.material && SKIN.material.kind === "glass"
-    ? `backdrop-filter:blur(${L.blur_radius ?? 24}px);-webkit-backdrop-filter:blur(${L.blur_radius ?? 24}px);`
+    ? `backdrop-filter:blur(${blurPx}px);-webkit-backdrop-filter:blur(${blurPx}px);`
       + (tintPx ? `background:${tintPx};` : "")
     : "";
   // glass 时底色交给 tint 层（真窗 bg alpha=0，accent 承担染色）
