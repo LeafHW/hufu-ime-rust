@@ -99,8 +99,8 @@ pub struct MaterialConfig {
     pub shadow_alpha: f32,
     /// 【纯色模型】边框独立透明度
     pub border_alpha: f32,
-    /// 【毛玻璃 v3.5】玻璃本体透明度（0-1）：accent GradientColor 的
-    /// alpha——高=玻璃实（模糊层重）、低=更透。独立于 tint 染色浓度。
+    /// 【毛玻璃 v3.5】玻璃本体透明度（0-1）：accent 白雾 alpha——
+    /// 高=白雾浓（更不透），低=纯模糊通透。默认 0.25（0.5 泛白实测过重）。
     pub glass_alpha: f32,
 }
 
@@ -118,7 +118,7 @@ impl Default for MaterialConfig {
             hilite_alpha: 1.0,
             shadow_alpha: 1.0,
             border_alpha: 1.0,
-            glass_alpha: 0.5,
+            glass_alpha: 0.25,
         }
     }
 }
