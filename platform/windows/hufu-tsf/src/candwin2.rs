@@ -125,6 +125,7 @@ extern "system" fn cand2_wndproc(
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                     lockwin_follow(hwnd);
+                    shadowwin_follow(hwnd);
                 }
             }
             return LRESULT(0);
@@ -2731,6 +2732,7 @@ fn lockwin_follow(cand: HWND) {
 // ULW 上屏，Z 序在候选窗下（先置顶，候选窗随后 TOPMOST 盖上）。
 static SHADOW_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
 static SHADOW_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static SHADOW_M: std::sync::Mutex<u32> = std::sync::Mutex::new(0); // 当前边距（follow 用）
 
 unsafe extern "system" fn shadow_wndproc(
     hwnd: HWND,
@@ -2798,11 +2800,15 @@ unsafe fn shadowwin_render(
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
     // SDF 高斯衰减：面板矩形（m 边距内缩，圆角 radius），中心偏移
     //（shadow_offset）。黑影预乘：BGR=0，A=衰减。
+    // 【柔化】内缩 3px：候选窗四角（DWM 圆角外）露出的阴影从满强度
+    // 后退 3px 才起坡（用户实测「黑边重」=内圈 100% alpha 直露）；
+    // 整体 ×0.85。
     let (fw, fh) = (w as f32, h as f32);
-    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
+    let inset = 3.0f32;
+    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0 - inset, (fh - 2.0 * m as f32) / 2.0 - inset);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
     let sigma = (shadow_radius * 0.5 + 1.0).max(1.0);
-    let base_a = alpha8 as f32 / 255.0;
+    let base_a = alpha8 as f32 / 255.0 * 0.85;
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     let mut o = 0usize;
     for y in 0..h {
@@ -2921,6 +2927,7 @@ pub fn shadowwin_show(
         // 边距=σ*3+6+|off|（与自绘阴影公式一致）
         let sigma = shadow_radius * 0.5 + 1.0;
         let m = (sigma * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        *SHADOW_M.lock().unwrap() = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
         let _ = cand;
@@ -2943,6 +2950,31 @@ pub fn shadowwin_hide() {
     if let Some(h) = *SHADOW_HWND.lock().unwrap() {
         unsafe {
             let _ = ShowWindow(HWND(h as _), SW_HIDE);
+        }
+    }
+}
+
+/// 拖拽移动时阴影窗跟随（候选窗原点-m 边距）
+pub fn shadowwin_follow(cand: HWND) {
+    let m = *SHADOW_M.lock().unwrap();
+    if m == 0 {
+        return;
+    }
+    if let Some(h) = *SHADOW_HWND.lock().unwrap() {
+        unsafe {
+            if IsWindow(HWND(h as _)).as_bool() && IsWindowVisible(HWND(h as _)).as_bool() {
+                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let _ = GetWindowRect(cand, &mut wr);
+                let _ = SetWindowPos(
+                    HWND(h as *mut _),
+                    HWND(std::ptr::null_mut()),
+                    wr.left - m as i32,
+                    wr.top - m as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
         }
     }
 }
