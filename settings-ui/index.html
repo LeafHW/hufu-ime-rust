@@ -789,7 +789,7 @@ function bindSkin() {
     ta.onchange = saveSkinQuiet;
     // 【毛玻璃透明度】glass_alpha 0-1（玻璃本体实度）
     const ga = $("#mat-ga");
-    ga.value = Math.round((SKIN.material.glass_alpha ?? 0.5) * 100);
+    ga.value = Math.round((SKIN.material.glass_alpha ?? 0) * 100);
     $("#mat-ga-v").textContent = ga.value + "%";
     ga.oninput = () => {
       SKIN.material.glass_alpha = ga.value / 100;
