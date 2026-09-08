@@ -1343,6 +1343,20 @@ impl CandidateWindowV2 {
                             });
                         if let Some(mask) = mask {
                             if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                    // 【根因修复 2026-09-08】PushLayer 的 mask
+                                    // 按当时 transform 解释——此前在 Push 后才切
+                                    // identity，mask（物理坐标）被 dpi 主变换二
+                                    // 次缩放跑出窗外→层内所有绘制全被裁掉
+                                    //（红色裁决实测：层没画、窗口半透明穿透）。
+                                    // 正序：先切 identity 再 Push。
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
                                     let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
                                     lp.contentBounds = D2D_RECT_F {
                                         left: -1.0e6,
@@ -1353,33 +1367,13 @@ impl CandidateWindowV2 {
                                     lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
                                     lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
                                     ctx.PushLayer(&lp, None);
-                                    // 物理像素单位（identity 变换）+ dest 拉伸
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    // 【诊断模式 2026-09-08】裁决毛玻璃层是否
-                                    // 真的画上屏：纯红 80% 填充窗体区。
-                                    // 用户看到红=层在画（问题在数据/拉伸）；
-                                    // 没红=层没画（问题在层序/Layer/坐标）。
-                                    if let Ok(rb) = ctx.CreateSolidColorBrush(
-                                        &D2D1_COLOR_F { r: 1.0, g: 0.0, b: 0.0, a: 0.8 },
-                                        None,
-                                    ) {
-                                        let full = D2D_RECT_F { left: 0.0, top: 0.0, right: w_out as f32, bottom: h_out as f32 };
-                                        ctx.FillRectangle(&full, &rb);
-                                    }
                                     let dst = D2D_RECT_F {
                                         left: shadow_m * dpi_scale,
                                         top: shadow_m * dpi_scale,
                                         right: (shadow_m + width) * dpi_scale,
                                         bottom: (shadow_m + height) * dpi_scale,
                                     };
-                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 0.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
                                     // 恢复渲染主变换（dpi 缩放）
                                     ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
                                         M11: dpi_scale,
