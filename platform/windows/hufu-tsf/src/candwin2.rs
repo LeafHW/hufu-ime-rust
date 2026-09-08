@@ -2852,18 +2852,17 @@ unsafe fn shadowwin_render(
         }
     };
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    // SDF 双高斯衰减【v3.8.1 阴影质量重做】用户：太淡+要贴玻璃区域。
-    // 单高斯 σ 小（半径12→σ7）衰减快、21px 外全无=「质量不行」。改
-    // 双段：近场 σ₁=σ 承浓度，远场 σ₂=σ×2.6 拖尾（Win11/系统窗口
-    // 阴影=近浓+大范围淡晕的观感）。SDF 矩形=候选窗窗口矩形（毛
-    // 玻璃区域），圆角=皮肤(min 8) 完全贴合。
+    // SDF 双高斯衰减【v3.8.2 玻璃阴影独立参数】用户强调：glass 阴影
+    // 与不开毛玻璃的自绘阴影完全独立——不读皮肤 shadow_radius/
+    // shadow_alpha，用固定轻柔参数（用户实测 ×1.15 皮肤浓度「太重」）：
+    // σ₁=6 近场、σ₂=15.6 拖尾、浓度 0.38（系统窗口阴影级别）。
     let (fw, fh) = (w as f32, h as f32);
     let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
-    let sigma1 = (shadow_radius * 0.5 + 1.0).max(1.0);
-    let sigma2 = sigma1 * 2.6;
-    // 近场浓（总量的 62%）+远场晕（38%），整体 ×1.15 增强可见度
-    let base_a = (alpha8 as f32 / 255.0 * 1.15).min(1.0);
+    let _ = (shadow_radius, alpha8); // 皮肤参数不参与（独立体系）
+    let sigma1 = 6.0f32;
+    let sigma2 = 6.0f32 * 2.6;
+    let base_a = 0.38f32;
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     let mut o = 0usize;
     for y in 0..h {
@@ -2980,10 +2979,8 @@ pub fn shadowwin_show(
         return;
     }
     unsafe {
-        // 边距按远场 σ₂（拖尾 3σ₂ 覆盖）——位图边界截断拖尾会出硬边
-        let sigma1 = shadow_radius * 0.5 + 1.0;
-        let sigma2 = sigma1 * 2.6;
-        let m = (sigma2 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        // 边距按独立 σ₂（拖尾 3σ₂≈47px 覆盖）——位图边界截断拖尾会出硬边
+        let m = (6.0f32 * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
         *SHADOW_M.lock().unwrap() = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
