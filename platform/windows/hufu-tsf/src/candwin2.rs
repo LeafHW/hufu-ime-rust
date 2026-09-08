@@ -1259,9 +1259,10 @@ impl CandidateWindowV2 {
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;
-        // 【毛玻璃 v3.4·再收缩】accent 盖整窗矩形，边距区会渗一圈淡
-        // 模糊（用户实测「溢出」）。glass：无边距（窗口=窗体=accent 区
-        // 域=面板，完全贴合），阴影改 DWM frame 阴影（见 accent 段）。
+        // 【毛玻璃 v3.5.3·玻璃加大】用户方向：与其改阴影不如把玻璃加大
+        // ——glass 窗口=面板+6px 玻璃边（accent 盖整窗，视觉玻璃大于
+        // 内容面板），阴影窗 SDF 起点退到玻璃边外=阴影被玻璃盖住。
+        // 自绘阴影仍不参与（阴影全由独立阴影窗承担）。
         let has_shadow = has_shadow && kind != "glass";
         // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
         // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
@@ -1269,6 +1270,10 @@ impl CandidateWindowV2 {
         let shadow_m = if has_shadow {
             let sigma = shadow_radius * 0.5 + 1.0;
             (sigma * 3.0 + 6.0 + shadow_off_y.abs().max(shadow_off_x.abs())).ceil()
+        } else if kind == "glass" && shadow_radius >= 1.0 {
+            // glass：固定 6px 玻璃边（窗口大于面板；DWM 圆角裁角落在
+            // 玻璃边内，不再透出阴影窗）
+            6.0
         } else {
             0.0
         };
@@ -2393,9 +2398,7 @@ impl CandidateWindowV2 {
                     y - (shadow_m * dpi_scale) as i32,
                     w_out,
                     h_out,
-                    // SDF 圆角=面板圆角+4：确保 SDF 无影区完全覆盖面板
-                    // 圆角外的透明角（露黑根因：SDF 圆角 8 < 面板 10）
-                    ((radius + 4.0) * dpi_scale).max(0.0) as u32,
+                    (radius * dpi_scale).max(0.0) as u32,
                     shadow_radius * dpi_scale,
                     (shadow_off_x * dpi_scale) as i32,
                     (shadow_off_y * dpi_scale) as i32,
@@ -2804,15 +2807,12 @@ unsafe fn shadowwin_render(
     let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
     // SDF 高斯衰减：阴影矩形=候选窗窗口矩形（面板视觉边界），中心
     // 偏移（shadow_offset）。黑影预乘：BGR=0，A=衰减。
-    // 【v3.5.2】inset=0（内缩会让窗口边缘内 3px 就有阴影，透过面板
-    // 圆角外的透明像素露出=「没挡住」）；radius=面板圆角+4（SDF 圆角
-    // 比面板圆角小时，面板角上透明区超出 SDF 无影区=角上露黑）；
-    // 整体 ×0.85。
+    // 【v3.5.3】浓度/圆角恢复原值（用户：玻璃加大解决遮挡，阴影改回）。
     let (fw, fh) = (w as f32, h as f32);
     let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
     let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
     let sigma = (shadow_radius * 0.5 + 1.0).max(1.0);
-    let base_a = alpha8 as f32 / 255.0 * 0.85;
+    let base_a = alpha8 as f32 / 255.0;
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     let mut o = 0usize;
     for y in 0..h {
