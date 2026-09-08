@@ -1267,6 +1267,10 @@ impl CandidateWindowV2 {
             // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
             // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
             if kind == "glass" {
+                crate::tsf::diag_note(&format!(
+                    "gstep1: enter dpi={dpi_scale} raw={}",
+                    match &self.glass_raw { Some(_) => "some", None => "none" }
+                ));
                 if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
                     let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
                     // 【毛玻璃 v2·降采样模糊 2026-09-08】两轮实测定位：
@@ -1280,6 +1284,7 @@ impl CandidateWindowV2 {
                     // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
                     //   窗体区（模糊底拉伸无感知）——打字全程连续显示
                     if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
+                    crate::tsf::diag_note("gstep2: size ok");
                     let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
                     let g_cached = self.glass_cache.take();
                     let bmp = match &g_cached {
@@ -1321,6 +1326,7 @@ impl CandidateWindowV2 {
                         },
                     };
                     glass_cache_out = Some((g_key, bmp.clone()));
+                    crate::tsf::diag_note("gstep3: bitmap ok");
                     unsafe {
                         // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
                         let mask = ctx
@@ -1343,6 +1349,7 @@ impl CandidateWindowV2 {
                             });
                         if let Some(mask) = mask {
                             if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                    crate::tsf::diag_note("gstep: mask+cast ok");
                                     // 【根因修复 2026-09-08】PushLayer 的 mask
                                     // 按当时 transform 解释——此前在 Push 后才切
                                     // identity，mask（物理坐标）被 dpi 主变换二
@@ -1366,6 +1373,18 @@ impl CandidateWindowV2 {
                                     };
                                     lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
                                     lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                    // 【终极根因 2026-09-08】default() 的 maskTransform
+                                    // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
+                                    // 一点，Layer 内一切绘制全被裁掉（对照阴影段
+                                    // push_shadow_mask 显式设 identity 才正常显示）。
+                                    lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    };
                                     ctx.PushLayer(&lp, None);
                                     let dst = D2D_RECT_F {
                                         left: shadow_m * dpi_scale,
@@ -2026,6 +2045,23 @@ impl CandidateWindowV2 {
             // 减 shadow_m）。不转换则松手/锁定后窗口往左上偏一个
             // 阴影边距（用户实测「锁定时有点跳动」）。
             let m_off = (shadow_m * dpi_scale) as i32;
+            // 【毛玻璃诊断钩子 2026-09-08】pin.txt 存在 → 固定到其中
+            // 坐标（"x,y"，窗口原点系）。自动化验证用（把窗口钉在屏幕
+            // 中央壁纸上肉眼看模糊），删文件即恢复正常。
+            {
+                let mut pinned = CAND_PINNED.lock().unwrap();
+                if pinned.is_none() {
+                    if let Ok(s) = std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\pin.txt") {
+                        let t = s.trim();
+                        if let Some((a, b)) = t.split_once(',') {
+                            if let (Ok(px), Ok(py)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                                *pinned = Some((px, py));
+                                crate::tsf::diag_note(&format!("cw2 pin.txt 钩子 ({px},{py})"));
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(p) = CAND_DROP_AT.lock().unwrap().take() {
                 self.sticky_pos = Some((p.0 + m_off, p.1 + m_off));
                 self.sticky_drag = true;
