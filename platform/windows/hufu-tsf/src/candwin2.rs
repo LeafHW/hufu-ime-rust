@@ -1888,7 +1888,8 @@ impl CandidateWindowV2 {
                 // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
                 // 【v3.9.1 裸玻璃】glass 时编码底块一并隐藏（用户「有些
                 // 元素没挡住」——实色底块浮在玻璃上突兀；编码文字保留）。
-                if let Some(bg) = (&b_preedit_bg).filter(|_| kind != "glass") {
+                if kind != "glass" {
+                if let Some(bg) = &b_preedit_bg {
                     let rr = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
                             left: rm_x,
@@ -1902,6 +1903,7 @@ impl CandidateWindowV2 {
                     unsafe {
                         ctx.FillRoundedRectangle(&rr, bg);
                     }
+                }
                 }
                 draw(&ctx, &tf, raw.as_str(), rm_x, rm_y + dy, width - rm_x * 2.0, row_h, &b_raw);
             }
