@@ -777,7 +777,10 @@ impl CandidateWindowV2 {
                         .and_then(|x| x.as_str())
                         .and_then(parse_hex);
                     let (tr, tg, tb, ta) = match tint_v {
-                        Some([r, g, b, a]) => (r, g, b, a),
+                        // tint alpha 是自绘时代语义（bg 上叠毛玻璃层），
+                        // acrylic 直接整层染色——乘 0.55 调到验证过的
+                        // 45% 观感（80% 原值=用户实测「大色块」几乎不透明）
+                        Some([r, g, b, a]) => (r, g, b, ((a as f32 * 0.55) as u8).min(200)),
                         None => {
                             let back = color_f(skin, "back_color", "#202022E6");
                             (
@@ -1260,6 +1263,11 @@ impl CandidateWindowV2 {
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
         let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
         let has_shadow = shadow_radius >= 1.0;
+        // 【毛玻璃 v3·窗口收缩】acrylic 模式：accent 盖整窗矩形——自绘
+        // 阴影边距会让方角色块超出圆角窗体（用户实测「大色块超出候选
+        // 框」）。故 glass 无边距（窗口=窗体），圆角由 SetWindowRgn 裁
+        //（同时裁掉 accent 方角），阴影不画。
+        let has_shadow = has_shadow && kind != "glass";
         // 【阴影位图边距】按 D2D1Shadow 的模糊扩散精确覆盖：σ=radius*0.5+1，
         // 高斯扩散 3σ 覆盖 99.7%——小于此会在位图边界被直角截断（用户
         // 实测「超出 R 角的直角色块」= 弥散阴影遭位图边缘切割）。
@@ -2393,6 +2401,29 @@ impl CandidateWindowV2 {
                     sp_ok,
                     IsWindowVisible(self.hwnd).0
                 ));
+            }
+            // 【毛玻璃 v3·圆角 RGN】acrylic 盖整窗矩形（方角），圆角
+            // 窗体四角会露方角色块。SetWindowRgn 圆角区域同步窗口尺寸
+            //（DWM 按区域裁剪=accent 同被裁）；非 glass 清除区域恢复矩形。
+            if kind == "glass" {
+                unsafe {
+                    let rr = (radius * dpi_scale).max(1.0) as i32;
+                    let rgn = CreateRoundRectRgn(
+                        0,
+                        0,
+                        (w_out + 1) as i32,
+                        (h_out + 1) as i32,
+                        rr,
+                        rr,
+                    );
+                    if !rgn.is_invalid() {
+                        let _ = SetWindowRgn(self.hwnd, rgn, true);
+                    }
+                }
+            } else {
+                unsafe {
+                    let _ = SetWindowRgn(self.hwnd, HRGN(std::ptr::null_mut()), true);
+                }
             }
             // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
             // 锁与候选窗同进退；show_at 幂等：定位+显示）
