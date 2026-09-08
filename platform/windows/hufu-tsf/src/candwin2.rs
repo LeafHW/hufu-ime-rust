@@ -811,7 +811,7 @@ impl CandidateWindowV2 {
         // 【垂直收窄 2026-09-08】用户实测上下仍偏多（汉字墨迹高≈0.86em，
         // 上下墨白天生比左右多 ~3px）。垂直留白再收 2px（胶囊垂直边距
         // 7→5），下限 4 防贴边，窗口高自适应缩。
-        const PILL_SQUEEZE_Y: f32 = 2.0;
+        const PILL_SQUEEZE_Y: f32 = 4.0;
         let rm_y = (margin_y.max(hilite_pad) - PILL_SQUEEZE_Y).max(4.0);
         // 【用户手感微调 2026-09-08】「上下还是多一点」——汉字墨迹高
         // ≈0.86em（上下留白比左右多 ~3px 的视觉源）。按用户直觉：水平
