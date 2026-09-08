@@ -403,6 +403,13 @@ pub struct Engine {
     ///（raw 清空且无待上屏）时才 reload 用户数据+同步整句注入——
     /// 用户在候选框连续操作期间不被重载打断。
     pub pending_user_reload: bool,
+    /// 【语料前缀挂起 2026-09-09】补充语料词编码变体（排序去重，懒建
+    /// +指纹失效）：full 是任一变体真前缀且剩余码 ≤ 挂起余量时压制
+    /// 提前上屏——用户显式加权的词（如「蚩奼」sfcbtrq 简码 sfccbtrq
+    /// 全码）应等后续键辨析走语料路径，而不是被高置信单字路径
+    ///（证sf+不cb）抢跑分段。分道扬镳（后续键与全部变体不一致）后
+    /// 自动恢复置信上屏。
+    supp_hold: std::sync::Mutex<Option<(String, Vec<String>)>>,
 }
 
 impl Engine {
@@ -480,6 +487,7 @@ impl Engine {
             opencc_emoji: None,
             opencc_loaded: false,
             pending_user_reload: false,
+            supp_hold: std::sync::Mutex::new(None),
         };
         // 全局资源（反查/注释/拆分）大统一应用——见 apply_global_assets
         engine.apply_global_assets();
@@ -507,6 +515,7 @@ impl Engine {
             opencc_emoji: None,
             opencc_loaded: false,
             pending_user_reload: false,
+            supp_hold: std::sync::Mutex::new(None),
         };
         engine.apply_global_assets();
         Ok(engine)
@@ -1620,6 +1629,86 @@ impl Engine {
         session.pending_commit = Some(text);
     }
 
+    /// 【语料前缀挂起 2026-09-09】构建补充语料词的编码变体集：
+    /// 每字取码表全部编码（codes_of）做笛卡尔积拼接（每字截前 4、
+    /// 总量截 32 防爆炸）——单字直接全码；2-4 字词覆盖简码（短码
+    /// 组合，如 蚩sfc+奼btrq=sfcbtrq）与全码（sfcc+btrq=sfccbtrq）
+    /// 全部路径。指纹（方案名+语料条数+全词串+码表规模）变化即重建
+    /// ——/jq 热加词后下一键生效。
+    fn supp_hold_variants(&self) -> Vec<String> {
+        let mut fp = String::with_capacity(64);
+        fp.push_str(&self.config.schema.current);
+        fp.push('\u{1}');
+        let supp = &self.schema.supplement.entries;
+        fp.push_str(&supp.len().to_string());
+        fp.push('\u{1}');
+        for e in supp {
+            fp.push_str(&e.word);
+            fp.push('\u{2}');
+            fp.push_str(&e.weight.to_string());
+            fp.push('\u{3}');
+        }
+        fp.push('\u{1}');
+        fp.push_str(&self.schema.dict.entries.len().to_string());
+        let mut guard = self.supp_hold.lock().unwrap();
+        if let Some((old_fp, v)) = guard.as_ref() {
+            if *old_fp == fp {
+                return v.clone();
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        for e in supp {
+            let chars: Vec<char> = e.word.chars().collect();
+            if chars.is_empty() || chars.len() > 4 {
+                continue;
+            }
+            let mut combos: Vec<String> = vec![String::new()];
+            for ch in chars {
+                let codes = self.schema.dict.codes_of(&ch.to_string());
+                if codes.is_empty() {
+                    combos.clear();
+                    break;
+                }
+                let mut next = Vec::with_capacity(combos.len() * 4);
+                for c in &combos {
+                    for code in codes.iter().take(4) {
+                        let mut s = c.clone();
+                        s.push_str(code);
+                        next.push(s);
+                    }
+                }
+                combos = next;
+                if combos.len() > 32 {
+                    combos.truncate(32);
+                }
+            }
+            out.extend(combos);
+        }
+        out.sort();
+        out.dedup();
+        *guard = Some((fp, out.clone()));
+        out
+    }
+
+    /// full（已打全编码）是否被语料挂起：是任一变体真前缀（变体更
+    /// 长）且剩余码数 ≤ 余量（虎码 max_code_length=4——词尾将近才
+    /// 挂，避免 sf 这类长距离前缀把单字「证」的上屏也拖死）。
+    fn supp_hold_blocks(&self, full: &str) -> bool {
+        if self.schema.supplement.entries.is_empty() || full.is_empty() {
+            return false;
+        }
+        let variants = self.supp_hold_variants();
+        // 二分：首个 ≥ full 的变体——starts_with(full) 的最短候选
+        let pos = variants.partition_point(|v| v.as_str() < full);
+        if let Some(v) = variants.get(pos) {
+            if v.len() > full.len() && v.starts_with(full) {
+                let remain = v.chars().count() - full.chars().count();
+                return remain <= 4;
+            }
+        }
+        false
+    }
+
     /// 提前上屏（Rime try_early_commit 逐行移植）：
     /// 置信前缀提案 + 3 键证据史公共前缀 → 增量上屏，编码留在上下文继续组句。
     fn try_early_commit(&mut self, session: &mut Session) {
@@ -1640,6 +1729,15 @@ impl Engine {
             None => return,
         };
         let full = format!("{}{}", session.committed_raw, live);
+        // 【语料前缀挂起】full 是语料词编码变体的真前缀且词尾将近
+        //（剩余 ≤4 键）→ 本键不提案不上屏，等后续键辨析：后续键沿
+        // 变体走=语料词路径成型（简码/全码组合均覆盖）；分道扬镳=
+        // 不再是任何变体前缀，自然恢复置信提案（证据史被 extends
+        // 判定清零后重新积累）。
+        if self.supp_hold_blocks(&full) {
+            session.early_history.clear();
+            return;
+        }
         let dec = dec.decode_rich(&full);
         // 不完全尾优先作置信源（Rime early_commit_uses_incomplete_tail）
         let (src, truncated) = if !dec.early_hits.is_empty() {
@@ -2907,6 +3005,35 @@ mod tests {
     /// b8=如）下 raw 数字的编码/锁二义：与任意后缀组成词条 → 编码
     /// 字符（跨段：vvb8 的 b8）；无词条 → 选重锁（ve; 转的内部
     /// 数字 ve2）。固化该行为。
+    #[test]
+    fn supp_hold_prefix_veto() {
+        // 【语料前缀挂起】用户场景固化：语料「蚩奼」（蚩∈{sfc,sfcc}
+        // 奂=btrq）→ 变体 {sfcbtrq, sfccbtrq}。
+        //   sf    剩 5 键 > 4 → 不挂（「证 sf」自由上屏）
+        //   sfc   剩 4（btrq）→ 挂（蚩完成段，奼将至）
+        //   sfcb  剩 3（trq） → 挂（用户场景：证/不 不得抢跑）
+        //   sfcbt 剩 2        → 挂
+        //   sfcbtrq           → 非真前缀（=变体全长）→ 不挂（组句正常出蚩奼）
+        //   sfcbx             → 分道扬镳 → 不挂（恢复置信上屏「证不」）
+        let dir = std::env::temp_dir().join(format!("hufu-supp-hold-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("码表.txt"),
+            "sf 证\nsfc 蚩\nsfcc 蚩\ncb 不\nbtrq 奼\ntrq 乇\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("补充语料.txt"), "蚩奼 1000\n").unwrap();
+        let engine = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        assert!(!engine.supp_hold_blocks("sf"), "sf 距语料词还剩 5 键，不挂");
+        assert!(engine.supp_hold_blocks("sfc"), "sfc=蚩段完成+奼 btrq 将至（剩4），挂");
+        assert!(engine.supp_hold_blocks("sfcb"), "sfcb=用户场景（剩 trq 3），挂");
+        assert!(engine.supp_hold_blocks("sfcbt"), "sfcbt 剩 rq 2，挂");
+        assert!(!engine.supp_hold_blocks("sfcbtrq"), "=简码变体全长，正常组句不挂");
+        assert!(engine.supp_hold_blocks("sfcc"), "sfcc 剩 btrq 4，挂");
+        assert!(!engine.supp_hold_blocks("sfcbx"), "分道扬镳（x 与全部变体不一致），恢复上屏");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn digit_code_locks_disambiguation() {
         let codes = ["b8", "a8", "u3", "r8", "vv", "vvb", "vvbn", "qpu", "ldl"];
