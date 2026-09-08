@@ -1297,9 +1297,9 @@ impl CandidateWindowV2 {
                         Some((k, v)) if *k == g_key => v.clone(),
                         _ => unsafe {
                             // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
-                            // 【模糊力度 2026-09-08】k=blur/4（上限 12）——
-                            // 实测 blur/8 时 4 倍放大模糊太轻（用户看不出）
-                            let k = ((blur_r / 4.0).ceil() as u32).clamp(1, 12);
+                            // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
+                            // 实测梯度比 0.78（含文字行干扰）仍偏轻
+                            let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
                             let sw = (*gw / k).max(1);
                             let sh = (*gh / k).max(1);
                             let mut small: Vec<u8> = Vec::with_capacity((sw * sh * 4) as usize);
