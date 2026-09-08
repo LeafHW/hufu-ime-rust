@@ -765,13 +765,17 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
         let kind = material_kind(skin);
-        // 【毛玻璃 v3.3·accent=纯模糊底】染色固定极淡（alpha≈3% 不可见，
-        // 只兜底）——视觉染色/大小/R 角/阴影全部回归自绘（tint 面板）。
-        // blur_radius=0 → TRANSPARENTGRADIENT（无模糊纯透明）；>0 →
-        // ACRYLIC（系统模糊强度固定，数值不影响观感，仅 0/非0 切换有无）。
+        // 【v3.5 accent=模糊底（透明度可调）】glass_alpha 控制玻璃本体
+        // 实度（0=全透只借模糊，1=实玻璃）。blur=0 → 无模糊纯透明。
+        // 染色/大小/圆角由自绘 tint 面板承担。
         {
             let want_acrylic = kind == "glass";
             let blur_v = layout_f(skin, "blur_radius", 24.0);
+            let g_alpha = skin
+                .pointer("/skin/material/glass_alpha")
+                .or_else(|| skin.get("material").and_then(|m| m.get("glass_alpha")))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.5) as f32;
             let state: u32 = if !want_acrylic {
                 ACCENT_DISABLED
             } else if blur_v <= 0.0 {
@@ -779,40 +783,14 @@ impl CandidateWindowV2 {
             } else {
                 ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
-            // 幂等键：state 不同即重设（accent 参数恒定无需比较 argb）
-            if self.acrylic_last.get() != state {
-                apply_accent(self.hwnd, state, [0, 0, 0, 8]);
-                self.acrylic_last.set(state);
-            }
-            // 【v3.4 DWM frame 阴影】glass 窗口无边距（自绘阴影无区域），
-            // DwmExtendFrameIntoClientArea(全窗 frame) 让 DWM 画系统阴影
-            //（Win11 应用窗同款柔和外圈，跟随窗口移动免费）。
-            if want_acrylic {
-                unsafe {
-                    let m2 = windows::Win32::System::LibraryLoader::GetModuleHandleW(
-                        windows::core::w!("dwmapi.dll"),
-                    );
-                    if let Ok(m2) = m2 {
-                        let p2 = windows::Win32::System::LibraryLoader::GetProcAddress(
-                            m2,
-                            windows::core::s!("DwmExtendFrameIntoClientArea"),
-                        );
-                        if let Some(p2) = p2 {
-                            #[repr(C)]
-                            struct Margins {
-                                l: i32, r: i32, t: i32, b: i32,
-                            }
-                            type ExtFn = unsafe extern "system" fn(
-                                HWND,
-                                *const Margins,
-                            ) -> windows::core::HRESULT;
-                            let f: ExtFn = std::mem::transmute(p2);
-                            // 全 -1 = sheet of glass（整窗 frame）
-                            let mg = Margins { l: -1, r: -1, t: -1, b: -1 };
-                            let _ = f(self.hwnd, &mg);
-                        }
-                    }
-                }
+            // 幂等键含 alpha（拖「毛玻璃透明度」即时重设）。
+            // 染白雾：glass_alpha 高=白雾浓（更不透，磨砂玻璃感）；
+            // 低=纯模糊通透。黑染会变成暗窗（实测对比度反升），弃。
+            let ga8 = (g_alpha.clamp(0.0, 1.0) * 255.0) as u32;
+            let key = (state << 8) | ga8;
+            if self.acrylic_last.get() != key {
+                apply_accent(self.hwnd, state, [255, 255, 255, ga8 as u8]);
+                self.acrylic_last.set(key);
             }
         }
         let tint_hex = skin
@@ -2398,6 +2376,27 @@ impl CandidateWindowV2 {
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
+            // 【v3.5 阴影窗先就位】glass 无边距（窗口=面板），阴影由独立
+            // 分层窗承担——先置顶就位，候选窗随后 TOPMOST 压其上。
+            if kind == "glass" && _shadow_base >= 1.0 {
+                let s_alpha = skin
+                    .pointer("/skin/material/shadow_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32;
+                shadowwin_show(
+                    self.hwnd,
+                    x - (shadow_m * dpi_scale) as i32,
+                    y - (shadow_m * dpi_scale) as i32,
+                    w_out,
+                    h_out,
+                    (radius * dpi_scale).max(0.0) as u32,
+                    shadow_radius * dpi_scale,
+                    (shadow_off_x * dpi_scale) as i32,
+                    (shadow_off_y * dpi_scale) as i32,
+                    (s_alpha * 255.0) as u32,
+                );
+            }
             let sp_ok = if !dragging {
                 SetWindowPos(
                     self.hwnd,
@@ -2427,8 +2426,9 @@ impl CandidateWindowV2 {
                     IsWindowVisible(self.hwnd).0
                 ));
             }
-            // 【毛玻璃 v3.3】圆角回归自绘（accent 极淡不可见方角无碍；
-            // 系统 ROUND 会裁自绘阴影外角）——统一 DONOTROUND。
+            // 【毛玻璃 v3.5·DWM ROUND】accent 方角（面板圆角外四角残留）
+            // 用系统合成级圆角裁掉（v3.2 实测有效：accent+窗口一起圆角化）。
+            // 玻璃圆角=系统固定（~8px），面板主圆角仍由自绘 radius 决定。
             unsafe {
                 let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(
                     windows::core::w!("dwmapi.dll"),
@@ -2446,7 +2446,7 @@ impl CandidateWindowV2 {
                             u32,
                         ) -> windows::core::HRESULT;
                         let f: DwmaSet = std::mem::transmute(p);
-                        let pref: u32 = 1; // DONOTROUND：圆角由自绘决定
+                        let pref: u32 = if kind == "glass" { 2 } else { 1 }; // ROUND / DONOTROUND
                         let _ = f(
                             self.hwnd,
                             33, // DWMWA_WINDOW_CORNER_PREFERENCE
@@ -2489,8 +2489,9 @@ impl CandidateWindowV2 {
         // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
         // ——下一组段恢复跟随 caret。
         self.sticky_drag = false;
-        // 候选窗隐藏时锁指示窗同退（组段间不孤零零挂一个锁）
+        // 候选窗隐藏时锁指示窗/阴影窗同退（组段间不孤零零挂着）
         lockwin_hide();
+        shadowwin_hide();
         // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
         // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
@@ -2719,6 +2720,229 @@ fn lockwin_follow(cand: HWND) {
                     SWP_NOSIZE | SWP_NOACTIVATE,
                 );
             }
+        }
+    }
+}
+
+// ── 独立阴影窗（毛玻璃 v3.5）──
+// glass 候选窗无边距（accent 限制窗口=面板）——自绘阴影没有边距区
+// 可画、DwmExtendFrame 对 DComp 直呈窗无效（实测无阴影）。独立分层
+// 窗（lockwin 同模式）：尺寸=面板+2m 边距，SDF 高斯衰减 alpha 阴影，
+// ULW 上屏，Z 序在候选窗下（先置顶，候选窗随后 TOPMOST 盖上）。
+static SHADOW_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+static SHADOW_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+unsafe extern "system" fn shadow_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 圆角矩形 SDF（带符号距离，外正内负）
+fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let qx = (px - cx).abs() - (hw - r);
+    let qy = (py - cy).abs() - (hh - r);
+    let ax = qx.max(0.0);
+    let ay = qy.max(0.0);
+    ((ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - r) as f32
+}
+
+/// 渲染阴影位图并 ULW 上屏（尺寸/参数变化才重渲染）
+unsafe fn shadowwin_render(
+    hwnd: HWND,
+    w: u32,
+    h: u32,
+    m: u32,
+    radius: u32,
+    shadow_radius: f32,
+    off_x: i32,
+    off_y: i32,
+    alpha8: u32,
+) {
+    let key = format!("{w}:{h}:{m}:{radius}:{shadow_radius:.1}:{off_x}:{off_y}:{alpha8}");
+    if *SHADOW_KEY.lock().unwrap() == key {
+        return;
+    }
+    *SHADOW_KEY.lock().unwrap() = key;
+    let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
+    let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
+        bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        },
+        bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = match CreateDIBSection(
+        hdc,
+        &bmi as *const _,
+        windows::Win32::Graphics::Gdi::DIB_USAGE(0),
+        &mut bits,
+        None,
+        0,
+    ) {
+        Ok(d) if !bits.is_null() => d,
+        _ => {
+            let _ = DeleteDC(hdc);
+            return;
+        }
+    };
+    let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+    // SDF 高斯衰减：面板矩形（m 边距内缩，圆角 radius），中心偏移
+    //（shadow_offset）。黑影预乘：BGR=0，A=衰减。
+    let (fw, fh) = (w as f32, h as f32);
+    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
+    let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
+    let sigma = (shadow_radius * 0.5 + 1.0).max(1.0);
+    let base_a = alpha8 as f32 / 255.0;
+    let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    let mut o = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, scx, scy, phw, phh, radius as f32);
+            // 面板内部无影；外侧高斯衰减
+            let a = if d <= 0.0 {
+                0.0
+            } else {
+                let t = d / sigma;
+                base_a * (-t * t * 0.5).exp()
+            };
+            let a8 = (a * 255.0).round() as u8;
+            // BGRA 预乘（黑影：BGR=0）
+            px[o] = 0;
+            px[o + 1] = 0;
+            px[o + 2] = 0;
+            px[o + 3] = a8;
+            o += 4;
+        }
+    }
+    let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA（预乘）
+    };
+    let pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+    let sz = windows::Win32::Foundation::SIZE { cx: w as i32, cy: h as i32 };
+    let _ = UpdateLayeredWindow(
+        hwnd,
+        None,
+        None,
+        Some(&sz as *const windows::Win32::Foundation::SIZE),
+        hdc,
+        Some(&pt as *const windows::Win32::Foundation::POINT),
+        windows::Win32::Foundation::COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+    let _ = DeleteDC(hdc);
+    // bmi 仅用一次（字段都被赋值），消未用警告
+    let _ = &mut bmi;
+}
+
+/// glass 候选窗定位前调用：阴影窗先就位（目标坐标 x,y），随后候选窗
+/// TOPMOST 压在其上（Z 序正确：阴影在候选窗下、桌面上）。
+pub fn shadowwin_show(
+    cand: HWND,
+    x: i32,
+    y: i32,
+    w_out: u32,
+    h_out: u32,
+    radius_phys: u32,
+    shadow_radius: f32,
+    off_x: i32,
+    off_y: i32,
+    alpha8: u32,
+) {
+    let h = {
+        let mut g = SHADOW_HWND.lock().unwrap();
+        if let Some(h) = *g {
+            unsafe {
+                if IsWindow(HWND(h as *mut _)).as_bool() {
+                    h
+                } else {
+                    0
+                }
+            }
+        } else {
+            0
+        }
+    };
+    let h = if h != 0 {
+        h
+    } else {
+        unsafe {
+            let class: Vec<u16> = "HuFuCandShadow\0".encode_utf16().collect();
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(shadow_wndproc),
+                hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
+                    .unwrap_or(HCURSOR(std::ptr::null_mut())),
+                lpszClassName: PCWSTR(class.as_ptr()),
+                hbrBackground: HBRUSH(std::ptr::null_mut()),
+                ..Default::default()
+            };
+            let _atom = RegisterClassW(&wc);
+            let ex = WINDOW_EX_STYLE(
+                WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0
+                    | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0,
+            );
+            match CreateWindowExW(
+                ex,
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0),
+                0, 0, 10, 10,
+                HWND(std::ptr::null_mut()),
+                HMENU(std::ptr::null_mut()),
+                HINSTANCE(std::ptr::null_mut()),
+                None,
+            ) {
+                Ok(hw) if !hw.0.is_null() => {
+                    *SHADOW_HWND.lock().unwrap() = Some(hw.0 as isize);
+                    hw.0 as isize
+                }
+                _ => return,
+            }
+        }
+    };
+    if h == 0 {
+        return;
+    }
+    unsafe {
+        // 边距=σ*3+6+|off|（与自绘阴影公式一致）
+        let sigma = shadow_radius * 0.5 + 1.0;
+        let m = (sigma * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        let sw = w_out + 2 * m;
+        let sh2 = h_out + 2 * m;
+        let _ = cand;
+        // 先渲染内容再定位显示（避免空白帧）
+        SetWindowPos(
+            HWND(h as *mut _),
+            HWND_TOPMOST,
+            x - m as i32,
+            y - m as i32,
+            sw as i32,
+            sh2 as i32,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        shadowwin_render(HWND(h as *mut _), sw, sh2, m, radius_phys, shadow_radius, off_x, off_y, alpha8);
+    }
+}
+
+/// 候选窗隐藏时联动隐藏阴影
+pub fn shadowwin_hide() {
+    if let Some(h) = *SHADOW_HWND.lock().unwrap() {
+        unsafe {
+            let _ = ShowWindow(HWND(h as _), SW_HIDE);
         }
     }
 }

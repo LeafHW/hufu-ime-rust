@@ -347,6 +347,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>模糊半径 <span class="val" id="l-blur-v"></span></label><input type="range" id="l-blur" min="0" max="100" step="1" title="0=关闭模糊（纯染色透明）；>0=系统毛玻璃模糊（系统风格固定强度）"></div>
           <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
           <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
+          <div class="field"><label>毛玻璃透明度 <span class="val" id="mat-ga-v"></span></label><input type="range" id="mat-ga" min="0" max="100" title="玻璃本体的实度：0%=全透（只借模糊），100%=实玻璃（底下内容更朦胧）"></div>
           <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc"></div>
           <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="除文字与高亮外所有元素（窗底/边框/编码底/阴影）的透明度，0%=全透明 100%=不透明"></div>
           <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
@@ -786,6 +787,16 @@ function bindSkin() {
       preview();
     };
     ta.onchange = saveSkinQuiet;
+    // 【毛玻璃透明度】glass_alpha 0-1（玻璃本体实度）
+    const ga = $("#mat-ga");
+    ga.value = Math.round((SKIN.material.glass_alpha ?? 0.5) * 100);
+    $("#mat-ga-v").textContent = ga.value + "%";
+    ga.oninput = () => {
+      SKIN.material.glass_alpha = ga.value / 100;
+      $("#mat-ga-v").textContent = ga.value + "%";
+      preview();
+    };
+    ga.onchange = saveSkinQuiet;
     syncG();
   }
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
