@@ -399,6 +399,8 @@ pub struct CandidateWindowV2 {
     /// GPU 合成）实测高频竞态崩（事件日志 QQNT.dll_unloaded c0000005）。
     /// 缓存键=(w_out,h_out,blur)——不变则复用 bitmap+effect，零重建。
     pub(crate) glass_cache: Option<((u32, u32, u32), windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)>,
+    /// 【毛玻璃 v3】DWM acrylic 当前是否已应用（幂等开关）
+    pub(crate) acrylic_on: std::cell::Cell<bool>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -496,6 +498,11 @@ fn read_diag_stage() -> u32 {
         .min(5)
 }
 
+/// 【毛玻璃 v3·DWM acrylic 2026-09-08】参照 window-vibrancy / TranslucentTB
+///（GitHub 成熟方案，复用文件头部现成的 apply_accent 基础设施）：
+/// NOREDIRECTIONBITMAP+DComp 窗口配 ACCENT_ENABLE_ACRYLICBLURBEHIND——
+/// DWM 合成器直接给窗口底下做系统级真毛玻璃。零抓屏（自绘方案抓到
+/// 自己黑块的死结消除）、零模糊算法。染色=GradientColor(0xAABBGGRR)。
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
@@ -667,6 +674,7 @@ impl CandidateWindowV2 {
                 shadow_cache: None,
                 glass_raw: None,
                 glass_cache: None,
+                acrylic_on: std::cell::Cell::new(false),
             })
         }
     }
@@ -756,6 +764,31 @@ impl CandidateWindowV2 {
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
         let kind = material_kind(skin);
+        // 【毛玻璃 v3·DWM acrylic】kind=glass → 系统级 acrylic（复用文件
+        // 头部现成 apply_accent）。染色=back_color RGB + 45% alpha。
+        // 幂等：状态变化才调用。
+        {
+            let want_acrylic = kind == "glass";
+            if self.acrylic_on.get() != want_acrylic {
+                if want_acrylic {
+                    let back = color_f(skin, "back_color", "#202022E6");
+                    let a = (0.45 * 255.0) as u8;
+                    apply_accent(
+                        self.hwnd,
+                        ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                        [
+                            (back.r * 255.0) as u8,
+                            (back.g * 255.0) as u8,
+                            (back.b * 255.0) as u8,
+                            a,
+                        ],
+                    );
+                } else {
+                    apply_accent(self.hwnd, ACCENT_DISABLED, [0, 0, 0, 0]);
+                }
+                self.acrylic_on.set(want_acrylic);
+            }
+        }
         let tint_hex = skin
             .pointer("/skin/material/tint")
             .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
@@ -1287,7 +1320,10 @@ impl CandidateWindowV2 {
             // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
             // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
             // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
-            if kind == "glass" {
+            // 【毛玻璃 v3】glass 走 DWM acrylic（show 开头）——自绘路径
+            // 整体停用，保留代码作回退（GLASS_SELF_DRAW=true 恢复）。
+            const GLASS_SELF_DRAW: bool = false;
+            if GLASS_SELF_DRAW && kind == "glass" {
                 crate::tsf::diag_note(&format!(
                     "gstep1: enter dpi={dpi_scale} raw={}",
                     match &self.glass_raw { Some(_) => "some", None => "none" }
@@ -1343,7 +1379,12 @@ impl CandidateWindowV2 {
                             );
                             match r {
                                 Ok(b) => b,
-                                Err(_) => return,
+                                Err(e) => {
+                                    crate::tsf::diag_note(&format!(
+                                        "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
+                                    ));
+                                    return;
+                                }
                             }
                         },
                     };
@@ -1360,7 +1401,11 @@ impl CandidateWindowV2 {
                                 right: w_out as f32,
                                 bottom: h_out as f32,
                             };
+                            // 真实抓屏位图全幅直画（最小毛玻璃管线）
                             let _ = ctx.DrawBitmap(&bmp, Some(&full as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                            crate::tsf::diag_note(&format!(
+                                "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
+                            ));
                             ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
                                 M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
                             });
@@ -1729,13 +1774,8 @@ impl CandidateWindowV2 {
                     r: back.r,
                     g: back.g,
                     b: back.b,
-                    a: if stage == 1 {
-                        0.0 // 【阶段 1】纯毛玻璃：无染色
-                    } else if kind == "glass" {
-                        master * 0.45
-                    } else {
-                        master
-                    },
+                    // 【v3】glass 染色由 DWM acrylic GradientColor 承担
+                    a: if stage == 1 || kind == "glass" { 0.0 } else { master },
                 };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
@@ -2276,22 +2316,37 @@ impl CandidateWindowV2 {
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
             let dragging = CAND_DRAG.lock().unwrap().is_some();
-            // 【毛玻璃抓屏】须在 SetWindowPos 之前：此刻窗口（旧位图）
-            // 还没画到新位置，BitBlt 到的是干净底。位置/尺寸与缓存一致
-            // （打字连续帧）则跳过；拖拽中不重抓（旧模糊底，松手回正）。
-            let glass_on = kind == "glass";
+            // 【毛玻璃 v3】自绘路径停用——不抓屏（v3 由 DWM acrylic 承担）
+            let glass_on = false;
             if glass_on && !dragging {
                 let gx = x - (shadow_m * dpi_scale) as i32;
                 let gy = y - (shadow_m * dpi_scale) as i32;
                 let need = match &self.glass_raw {
-                    Some((cx, cy, cw, ch, _)) => *cx != gx || *cy != gy || *cw != w_out || *ch != h_out,
+                    Some((cx, cy, cw, ch, _)) => {
+                        *cx != gx || *cy != gy || *cw != w_out || *ch != h_out
+                    }
                     None => true,
-                };
+                } || read_diag_stage() >= 1; // 【阶段验证】诊断模式强制每帧重抓（黑缓存陷阱）
                 if need {
+                    // 【终极根因 3·2026-09-08】GDI BitBlt 拷屏对本窗口
+                    //（NOREDIRECTIONBITMAP+DComp）区域=黑块——窗口常驻
+                    // 抓屏区域时抓到自己。修复：移到屏幕外+等 DWM 合成
+                    // 一帧（8ms，BitBlt 读的是 DWM 已合成内容，不等=旧
+                    // 帧里还有自己黑影——实测移走不等仍全黑）。
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND(std::ptr::null_mut()),
+                        -20000,
+                        -20000,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(8));
                     let cap = capture_screen_rgba(gx, gy, w_out, h_out);
                     crate::tsf::diag_note(&format!(
-                        "glass capture: at({gx},{gy}) {w_out}x{h_out} -> {}",
-                        match &cap { Some(v) => format!("ok len={}", v.len()), None => "FAIL".into() }
+                        "diag: cap({gx},{gy}) 首像素={:?}",
+                        cap.as_ref().map(|v| &v[0..4]).unwrap_or(&[9u8, 9, 9, 9][..])
                     ));
                     self.glass_raw = cap.map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
                 }
