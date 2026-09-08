@@ -791,7 +791,7 @@ impl CandidateWindowV2 {
                 None => (28, 28, 30, 128),
             };
             // 幂等键含全 RGBA（拖色板/浓度即时重设）
-            let key = (state << 32) | (tr << 24) | (tg << 16) | (tb << 8) | ta;
+            let key: u64 = ((state as u64) << 32) | ((tr << 24) | (tg << 16) | (tb << 8) | ta) as u64;
             if self.acrylic_last.get() != key {
                 apply_accent(self.hwnd, state, [tr as u8, tg as u8, tb as u8, ta as u8]);
                 self.acrylic_last.set(key);
