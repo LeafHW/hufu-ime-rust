@@ -105,6 +105,7 @@ extern "system" fn cand2_wndproc(
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = Some((pt.x - wr.left, pt.y - wr.top));
+                    crate::tsf::trace("cw2: drag 激活（越过死区）");
                 }
                 let drag = *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((dx, dy)) = drag {
@@ -143,6 +144,7 @@ extern "system" fn cand2_wndproc(
                 let _ = ReleaseCapture();
                 *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() {
+                    crate::tsf::trace("cw2: lup 拖动结束");
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
@@ -151,6 +153,16 @@ extern "system" fn cand2_wndproc(
                         "cw2 pin 拖动即固定 ({},{})",
                         wr.left, wr.top
                     ));
+                    // 【交互后焦点自愈 2026-09-10】Chromium 系宿主
+                    //（VSCode/Electron/QQ NT）在鼠标按下候选窗瞬间主动
+                    // 终止组段并 blur 编辑器（实测 trace：ldown 前 2ms
+                    // OnCompositionTerminated）——caret 消失、键盘不再
+                    // 进 TSF，用户须手动点回。交互期间宿主杀过组段时，
+                    // 松手后向 caret 所在窗口补一对合成点击（位置=caret
+                    // 中心，原地置焦不挪光标）恢复编辑焦点。
+                    restore_host_focus_if_killed();
+                } else {
+                    crate::tsf::trace("cw2: lup 未拖动（死区内）");
                 }
             }
             *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -160,6 +172,7 @@ extern "system" fn cand2_wndproc(
             // WM_RBUTTONDOWN：【右键=解锁 2026-09-10 用户拍板】清除固定
             // 位与拖拽钉住残留——候选窗回到光标处恢复跟随。未固定时
             // 右键无操作（不再有「右键固定」路径）。
+            crate::tsf::trace("cw2: rdown（右键解锁）");
             let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
             if pinned.is_some() {
                 *pinned = None;
@@ -167,6 +180,7 @@ extern "system" fn cand2_wndproc(
                 *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 crate::tsf::diag_note("cw2 pin 右键解除（回跟随光标）");
+                unsafe { restore_host_focus_if_killed(); }
             }
             return LRESULT(0);
         }
@@ -2680,6 +2694,41 @@ static CAND_DROP_AT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::ne
 /// 【右键解锁 2026-09-10】wndproc → show() 一次性标记：右键解除固定
 /// 时置位，下一帧 show 清 sticky_pos/sticky_drag（拖拽钉住残留）。
 static CAND_UNSTICK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// 【交互后焦点自愈 2026-09-10】Chromium 系宿主在用户按下候选窗瞬间
+/// 主动杀组段+blur 编辑器（caret 消失）——OnCompositionTerminated 置位，
+/// 拖动松手/右键时消费并补合成点击恢复编辑焦点。
+pub static HOST_KILLED_COMP: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// 宿主杀过组段（交互期间）→ 向 caret 窗口补一对合成点击恢复编辑
+/// 焦点（原地置焦不挪光标）。wndproc 线程=宿主 UI 线程，
+/// GetGUIThreadInfo(0) 即本线程 caret 信息。
+unsafe fn restore_host_focus_if_killed() {
+    let killed = {
+        let mut f = HOST_KILLED_COMP.lock().unwrap_or_else(|e| e.into_inner());
+        let v = *f;
+        *f = false;
+        v
+    };
+    if !killed {
+        return;
+    }
+    unsafe {
+        let mut gti = GUITHREADINFO::default();
+        gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(0, &mut gti).is_ok() && !gti.hwndCaret.0.is_null() {
+            let mut pt = POINT {
+                x: (gti.rcCaret.left + gti.rcCaret.right) / 2,
+                y: (gti.rcCaret.top + gti.rcCaret.bottom) / 2,
+            };
+            // rcCaret 是 caret 窗口客户坐标——直接可用
+            let lp = ((pt.y as usize) << 16) | (pt.x as usize & 0xFFFF);
+            let _ = PostMessageW(gti.hwndCaret, 0x201 /*WM_LBUTTONDOWN*/, WPARAM(1), LPARAM(lp as isize));
+            let _ = PostMessageW(gti.hwndCaret, 0x202 /*WM_LBUTTONUP*/, WPARAM(0), LPARAM(lp as isize));
+            crate::tsf::trace("cw2: 交互后焦点自愈（合成点击 caret 处）");
+        }
+    }
+}
 
 // ── 独立阴影窗（毛玻璃 v3.5）──
 // glass 候选窗无边距（accent 限制窗口=面板）——自绘阴影没有边距区
