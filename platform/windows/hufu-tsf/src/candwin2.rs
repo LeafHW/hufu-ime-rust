@@ -859,7 +859,7 @@ impl CandidateWindowV2 {
                 .unwrap_or(dflt)
         };
         let (margin_x, margin_y) = if kind == "glass" {
-            (mat_f("glass_margin_x", 1.0), mat_f("glass_margin_y", 1.0))
+            (mat_f("glass_margin_x", 4.0), mat_f("glass_margin_y", 4.0))
         } else {
             (layout_f(skin, "margin_x", 8.0), layout_f(skin, "margin_y", 6.0))
         };
