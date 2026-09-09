@@ -398,13 +398,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     *id,
                 );
                 set_item_font(ed, false);
-                // 【EDIT 免 IME 2026-09-11】输入法自己的加词框里再唤起
-                // 输入法=鸡生蛋（编码框打 jav 会先出候选不上字母）。
-                // 断开 EDIT 的输入上下文，恢复纯字母数字输入。
+                // 【EDIT 免 IME·分字段 2026-09-10】只有编码框（打什么出
+                // 它，纯字母）与选重位/权重框（纯数字）断开输入上下文——
+                // 在这些框打 jav/123 若唤起输入法会先出候选不上字母。
+                // 【词框恢复 IME 2026-09-10 用户反馈】词框恰恰要打中文
+                //（HuFu 自己在词框组段正常，也可切其他输入法）——此前
+                // 一刀切全断导致词框打不了中文。
                 // 动态取 ImmAssociateContext：mingw 交叉工具链无 imm32
                 // import lib（链接报 cannot find -limm32），imm32.dll
                 // 运行期必然在（IMM 子系统）——GetProcAddress 最稳。
-                {
+                if *id == ID_CODE || *id == ID_POS {
                     #[link(name = "kernel32")]
                     unsafe extern "system" {
                         fn GetModuleHandleW(name: *const u16) -> isize;
