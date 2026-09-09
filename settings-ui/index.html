@@ -594,6 +594,50 @@ const W_DEFAULTS = {
   isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
   dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
 };
+/* ── 【数值显示与手输 2026-09-10】滑杆数值显示统一（用户规格）：
+   ① 纯数值最多两位小数（去尾零）；② 点击数字行内手动输入（回车/
+   失焦提交按滑杆范围钳制，Esc 取消）。百分比类显示（NN%，材质浓
+   度系列）带单位语义，跳过不改。权重滑杆动态生成，buildSliders
+   尾部与皮肤滑杆绑定后各调用一次。 ── */
+const fmtV = v => { let s = (+v).toFixed(2); if (s.includes(".")) s = s.replace(/0+$/, "").replace(/\.$/, ""); return s; };
+function hookValFields() {
+  $$(".field").forEach(f => {
+    const rg = f.querySelector("input[type=range]");
+    const sp = f.querySelector("span.val");
+    if (!rg || !sp || sp.dataset.ed) return;
+    if ((sp.textContent || "").includes("%")) return; // 百分比类跳过
+    sp.dataset.ed = "1";
+    sp.style.cursor = "text";
+    sp.title = "点击输入数值";
+    sp.textContent = fmtV(rg.value);
+    rg.addEventListener("input", () => { sp.textContent = fmtV(rg.value); });
+    sp.addEventListener("click", () => {
+      if (sp.querySelector("input")) return;
+      const inp = document.createElement("input");
+      inp.type = "number"; inp.step = "any";
+      inp.value = parseFloat(sp.textContent);
+      inp.style.cssText = "width:58px;font-size:12px;padding:0 3px;border:1px solid var(--acc2);border-radius:4px;background:transparent;color:inherit";
+      sp.textContent = ""; sp.appendChild(inp);
+      inp.focus(); inp.select();
+      let done = false;
+      const finish = ok => {
+        if (done) return; done = true;
+        const v = parseFloat(inp.value);
+        if (ok && isFinite(v)) {
+          const cv = Math.min(parseFloat(rg.max), Math.max(parseFloat(rg.min), v));
+          rg.value = cv;
+          if (typeof rg.oninput === "function") rg.oninput();
+        }
+        sp.textContent = fmtV(rg.value);
+      };
+      inp.onblur = () => finish(true);
+      inp.onkeydown = e => {
+        if (e.key === "Enter") inp.blur();
+        else if (e.key === "Escape") { done = true; sp.textContent = fmtV(rg.value); }
+      };
+    });
+  });
+}
 function buildSliders() {
   const box = $("#w-sliders"); box.innerHTML = "";
   WDEFS.forEach(([k, name, min, max, step]) => {
@@ -602,10 +646,11 @@ function buildSliders() {
       <input type="range" id="ws-${k}" min="${min}" max="${max}" step="${step}">`;
     box.appendChild(f);
     const s = f.querySelector("input"), v = f.querySelector(".val");
-    const sync = () => { v.textContent = CFG.sentence.weights[k]; s.value = CFG.sentence.weights[k]; };
-    s.oninput = () => { CFG.sentence.weights[k] = parseFloat(s.value); v.textContent = s.value; };
+    const sync = () => { v.textContent = fmtV(CFG.sentence.weights[k]); s.value = CFG.sentence.weights[k]; };
+    s.oninput = () => { CFG.sentence.weights[k] = parseFloat(s.value); v.textContent = fmtV(s.value); };
     sync();
   });
+  hookValFields();
 }
 /* 恢复初始值：权重一键还原出厂调校值 + 自动保存应用 */
 $("#w-reset").onclick = async () => {
@@ -818,7 +863,7 @@ function bindSkin() {
     const bw = $("#mat-bw"), bcv = $("#mat-bc");
     const syncB = () => {
       bw.value = SKIN.layout.border_width ?? 1;
-      $("#mat-bw-v").textContent = SKIN.layout.border_width ?? 1;
+      $("#mat-bw-v").textContent = fmtV(SKIN.layout.border_width ?? 1);
       bcv.value = hexOf(SKIN.colors.border_color || "#FFFFFF");
     };
     bw.oninput = () => { SKIN.layout.border_width = parseFloat(bw.value); $("#mat-bw-v").textContent = bw.value; preview(); };
@@ -978,7 +1023,7 @@ function bindSkin() {
     clearTimeout(_skinSaveTimer);
     _skinSaveTimer = setTimeout(() => { saveSkinQuiet(); }, 400);
   };
-  const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = SKIN.layout[key]; el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = el.value; preview(); saveSkinDebounced(); }; };
+  const lrng = (id, key) => { const el = $(id); el.value = SKIN.layout[key]; $(id + "-v").textContent = fmtV(SKIN.layout[key]); el.oninput = () => { SKIN.layout[key] = parseFloat(el.value); $(id + "-v").textContent = fmtV(el.value); preview(); saveSkinDebounced(); }; };
   lrng("#l-radius", "corner_radius"); lrng("#l-hr", "hilited_corner_radius");
   // 【皮肤元素自查 2026-09-08】序号格式（label_format，%s→数字）+
   // hilite_spacing（序号↔正文↔注释统一间距，与 DLL 同步激活）
@@ -1031,12 +1076,12 @@ function bindSkin() {
     };
     const syncMarginSliders = () => {
       mx.value = getV("x"); my.value = getV("y");
-      mxv.textContent = mx.value; myv.textContent = my.value;
+      mxv.textContent = fmtV(mx.value); myv.textContent = fmtV(my.value);
       const hint = isGlass() ? "毛玻璃独立留白（与纯色两套）" : "";
       mx.title = my.title = hint;
     };
-    mx.oninput = () => { setV("x", parseFloat(mx.value)); mxv.textContent = mx.value; preview(); saveSkinDebounced(); };
-    my.oninput = () => { setV("y", parseFloat(my.value)); myv.textContent = my.value; preview(); saveSkinDebounced(); };
+    mx.oninput = () => { setV("x", parseFloat(mx.value)); mxv.textContent = fmtV(mx.value); preview(); saveSkinDebounced(); };
+    my.oninput = () => { setV("y", parseFloat(my.value)); myv.textContent = fmtV(my.value); preview(); saveSkinDebounced(); };
     window.__syncGlassMargins = syncMarginSliders;
     syncMarginSliders();
   }
@@ -1044,6 +1089,7 @@ function bindSkin() {
   lrng("#l-cs", "candidate_spacing"); lrng("#l-ls", "line_spacing");
   lrng("#l-lfp", "label_font_point"); lrng("#l-w", "width");
   lrng("#l-sr", "shadow_radius"); lrng("#l-sox", "shadow_offset_x"); lrng("#l-soy", "shadow_offset_y");
+  hookValFields(); // 纯数值滑杆挂「两位小数+点击输入」
   // 【2026-09-06 用户规格】「竖排候选」开关从「输入与候选」页移除——
   // 只保留皮肤页「横排候选」（同一皮肤 layout.horizontal，取反即竖排）。
   // 候选字体/字号 → 皮肤 layout（真实候选窗读皮肤），改动即存
@@ -1072,7 +1118,7 @@ function bindSkin() {
         if (nl >= 6 && nl <= 40) {
           SKIN.layout.label_font_point = nl;
           const el = $("#l-lfp"); if (el) el.value = nl;
-          const ev = $("#l-lfp-v"); if (ev) ev.textContent = nl;
+          const ev = $("#l-lfp-v"); if (ev) ev.textContent = fmtV(nl);
         }
       }
       // 【比例联动 2026-09-08】几何参数同比例放大（与滚轮缩放同一语义，
@@ -1091,8 +1137,15 @@ function bindSkin() {
           for (const [k, sel, hi] of geo) {
             const nv = Math.round((SKIN.layout[k] || 0) * r * 2) / 2;
             SKIN.layout[k] = Math.min(Math.max(nv, 0), hi);
-            if (sel) { const e = $(sel); if (e) e.value = SKIN.layout[k]; const t = $(sel + "-v"); if (t) t.textContent = SKIN.layout[k]; }
+            if (sel) { const e = $(sel); if (e) e.value = SKIN.layout[k]; const t = $(sel + "-v"); if (t) t.textContent = fmtV(SKIN.layout[k]); }
           }
+          // 【玻璃留白字号联动 2026-09-10】glass_margin_* 与 server 滚轮
+          // 缩放（scale_glass_geometry）同语义同比联动——毛玻璃放大时
+          // 留白跟着变（此前缺位）。非玻璃皮肤同样改数据（不读无副作用）。
+          // 双源滑杆显示走 __syncGlassMargins 刷新（玻璃时显示 glass 值）。
+          SKIN.material.glass_margin_x = Math.min(60, Math.max(0, Math.round((SKIN.material.glass_margin_x ?? 4) * r * 2) / 2));
+          SKIN.material.glass_margin_y = Math.min(60, Math.max(0, Math.round((SKIN.material.glass_margin_y ?? 4) * r * 2) / 2));
+          if (window.__syncGlassMargins) window.__syncGlassMargins();
         }
       }
       SKIN.layout.font_point = v;
@@ -1203,7 +1256,9 @@ function preview() {
   // glass 时底色交给 tint 层（真窗 bg alpha=0，accent 承担染色）
   const bgPart = SKIN.material && SKIN.material.kind === "glass" ? "" : `background:${bgc};`;
   /* 【玻璃独立留白 2026-09-10】预览与真窗同语义：玻璃用 material.
-     glass_margin_*（默认 1），非玻璃用 layout.margin_* */
+     glass_margin_*（默认 4），非玻璃用 layout.margin_*；
+     【玻璃留白字号联动 2026-09-10】比例跟随在数据层（scale_glass_
+     geometry，字号滑杆 geo 联动同改数据）——预览直读即可。 */
   const isGlassSkin = SKIN.material && SKIN.material.kind === "glass";
   const padY = isGlassSkin ? (SKIN.material.glass_margin_y ?? 4) : L.margin_y;
   const padX = isGlassSkin ? (SKIN.material.glass_margin_x ?? 4) : L.margin_x;

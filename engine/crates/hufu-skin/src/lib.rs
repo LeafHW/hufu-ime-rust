@@ -154,6 +154,25 @@ impl Default for MaterialConfig {
     }
 }
 
+impl MaterialConfig {
+    /// 【玻璃留白字号联动 2026-09-10】字号变化（滚轮缩放/设置页改
+    /// 字号）时，玻璃独立留白与普通皮肤 Layout::scale_geometry 同比
+    /// 例联动——此前 glass_margin_* 不在联动字段里：毛玻璃放大时候选
+    /// 窗变大而留白不变，比例失衡（用户实测「内边距没有跟着变」）。
+    /// clamp 0-60 与设置页滑杆上限同源；浓度/大小类玻璃参数
+    ///（glass_shadow_*）不联动（阴影在 DLL 渲染层按 √字号比弱联动，
+    /// 等比会摊薄浓度）。非玻璃皮肤数据同样联动（该字段非玻璃不读，
+    /// 无副作用）。
+    pub fn scale_glass_geometry(&mut self, ratio: f32) {
+        if !(0.05..=20.0).contains(&ratio) || (ratio - 1.0).abs() < 1e-3 {
+            return;
+        }
+        let sc = |v: f32| (v * ratio).clamp(0.0, 60.0);
+        self.glass_margin_x = sc(self.glass_margin_x);
+        self.glass_margin_y = sc(self.glass_margin_y);
+    }
+}
+
 /// 颜色角色全集（与 weasel 对齐 + 扩展）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
