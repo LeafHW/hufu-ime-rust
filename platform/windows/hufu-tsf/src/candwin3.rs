@@ -339,7 +339,18 @@ impl CandWin3 {
         let border_w = layout_f(skin, "border_width", 1.0).max(0.0);
 
         let shadow_radius = layout_f(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
-        let shadow_off_y = layout_f(skin, "shadow_offset_y", 0.0);
+        // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（与 candwin2/
+        // server 代画同款钳制）
+        let kind_early = skin
+            .pointer("/skin/material/kind")
+            .or_else(|| skin.get("material").and_then(|m| m.get("kind")))
+            .and_then(|x| x.as_str())
+            .unwrap_or("solid");
+        let shadow_off_y = if kind_early == "glass" {
+            0.0
+        } else {
+            layout_f(skin, "shadow_offset_y", 0.0)
+        };
         let has_shadow = shadow_radius >= 1.0;
         let shadow_m = if has_shadow {
             (shadow_radius * 1.6 + 5.0 + shadow_off_y.abs()).ceil() as i32

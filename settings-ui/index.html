@@ -779,8 +779,22 @@ function bindSkin() {
         ta.value = 45;
       }
       $("#mat-ta-v").textContent = ta.value + "%";
+      syncShadowOff();
     };
-    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; preview(); };
+    // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移：勾选玻璃时
+    // 偏移滑杆禁用并归 0（SKIN 数据同步清零，保存走 server 归一双保险）。
+    const sox = $("#l-sox"), soy = $("#l-soy");
+    const syncShadowOff = () => {
+      const glass = SKIN.material.kind === "glass";
+      if (glass) {
+        SKIN.layout.shadow_offset_x = 0; SKIN.layout.shadow_offset_y = 0;
+        sox.value = 0; soy.value = 0;
+        $("#l-sox-v").textContent = "0"; $("#l-soy-v").textContent = "0";
+      }
+      sox.disabled = glass; soy.disabled = glass;
+      sox.title = soy.title = glass ? "毛玻璃模式不允许阴影偏移（强制 0）" : "";
+    };
+    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; syncShadowOff(); preview(); };
     gc.onchange = saveSkinQuiet;
     bl.oninput = () => { SKIN.layout.blur_level = bl.value; preview(); };
     bl.onchange = saveSkinQuiet;
@@ -1080,7 +1094,7 @@ function preview() {
     : "";
   // glass 时底色交给 tint 层（真窗 bg alpha=0，accent 承担染色）
   const bgPart = SKIN.material && SKIN.material.kind === "glass" ? "" : `background:${bgc};`;
-  inner.style.cssText = `${glassCss}${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 2}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
+  inner.style.cssText = `${glassCss}${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 0}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
   // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
   // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
   // 与 mark_text（高亮行左缘细竖条，weasel 语义）。
