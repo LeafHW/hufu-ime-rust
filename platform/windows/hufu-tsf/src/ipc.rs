@@ -279,7 +279,7 @@ fn call_on(
                     return None;
                 }
             }
-            let f = g.as_mut().unwrap();
+            let mut f = g.as_mut().unwrap();
             // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
             // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
             // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
@@ -317,6 +317,52 @@ fn call_on(
                     }
                 }
             };
+            // 【读满超时 2026-09-09】wait_response 只保证 ≥1 字节可读；
+            // read_exact 等满 4 字节头/整帧 body 时若 server 中途挂死
+            // （大帧分片到达后对端崩溃）仍会无限阻塞冻结宿主 UI 线程
+            // ——改为循环 Peek 直到凑满 n 字节或超时，不满即弃连接。
+            let read_full_timeout = |f: &mut std::fs::File,
+                                     buf: &mut [u8],
+                                     raw_pipe: isize,
+                                     total_ms: u64|
+             -> bool {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+                let mut filled = 0usize;
+                while filled < buf.len() {
+                    let mut avail: u32 = 0;
+                    if PeekNamedPipe(
+                        raw_pipe,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut avail,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        return false; // 管道断
+                    }
+                    if avail as usize >= buf.len() - filled {
+                        if f.read_exact(&mut buf[filled..]).is_err() {
+                            return false;
+                        }
+                        return true;
+                    }
+                    if avail > 0 {
+                        // 先取走已到部分，继续等剩余
+                        let take = (avail as usize).min(buf.len() - filled);
+                        if f.read_exact(&mut buf[filled..filled + take]).is_err() {
+                            return false;
+                        }
+                        filled += take;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                true
+            };
             if f.write_all(&frame).is_err() {
                 // 断线：弃连接重试一次
                 *g = None;
@@ -328,10 +374,9 @@ fn call_on(
                 return None;
             }
             let mut head = [0u8; 4];
-            let read_head = (&*f).read_exact(&mut head);
-            if read_head.is_err() {
+            if !read_full_timeout(&mut f, &mut head, raw_pipe, body_timeout.max(500)) {
                 *g = None;
-                continue;
+                return None;
             }
             let len = u32::from_le_bytes(head) as usize;
             if len == 0 || len > (1 << 20) {
@@ -339,14 +384,10 @@ fn call_on(
                 return None;
             }
             // body 可能分片到达：头 4 字节已到不代表全帧已到
-            if wait_response(body_timeout).is_none() {
+            let mut buf = vec![0u8; len];
+            if !read_full_timeout(&mut f, &mut buf, raw_pipe, body_timeout.max(500)) {
                 *g = None;
                 return None;
-            }
-            let mut buf = vec![0u8; len];
-            if (&*f).read_exact(&mut buf).is_err() {
-                *g = None;
-                continue;
             }
             return serde_json::from_slice(&buf).ok();
         }

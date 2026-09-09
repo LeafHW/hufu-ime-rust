@@ -360,6 +360,12 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
         ]) as usize;
         let body = pos + 8;
         if id == b"fmt " && size >= 16 {
+            // 【越界修复 2026-09-09】截断/损坏 wav（fmt 头声称 16 字节但
+            // 文件不够）原样读 raw[body+14] 越界 panic——本函数在宿主
+            // UI 线程同步调用，panic=宿主进程崩溃。读前验界。
+            if body + 16 > raw.len() {
+                return None;
+            }
             channels = u16::from_le_bytes([raw[body + 2], raw[body + 3]]);
             rate = u32::from_le_bytes([
                 raw[body + 4],
@@ -372,7 +378,11 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
             let end = (body + size).min(raw.len());
             data = Some(raw[body..end].to_vec());
         }
-        pos = body + size + (size & 1);
+        // pos 递增防溢出回绕（size 伪造巨大值→usize 回绕→死循环/越界）
+        match body.checked_add(size).and_then(|v| v.checked_add(size & 1)) {
+            Some(next) if next > pos => pos = next,
+            _ => break,
+        }
     }
     if bits != 8 && bits != 16 {
         return None; // 仅 PCM 8/16bit
