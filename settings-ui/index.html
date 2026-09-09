@@ -643,6 +643,7 @@ const NUM_CLAMPS = {
     opacity: [0, 1], darken: [0, 1], noise: [0, 1],
     master_alpha: [0, 1], hilite_alpha: [0, 1], shadow_alpha: [0, 1], border_alpha: [0, 1],
     glass_alpha: [0, 1], glass_shadow_alpha: [0, 1], glass_shadow_size: [2, 16],
+    glass_margin_x: [0, 60], glass_margin_y: [0, 60],
   },
 };
 function sanitizeConfig(c) {
@@ -872,7 +873,7 @@ function bindSkin() {
       sox.disabled = glass; soy.disabled = glass;
       sox.title = soy.title = glass ? "毛玻璃模式不允许阴影偏移（强制 0）" : "";
     };
-    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; syncShadowOff(); preview(); };
+    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; syncShadowOff(); /* 【玻璃独立留白 2026-09-10】切换材质即切换留白滑杆数据源 */ if (window.__syncGlassMargins) window.__syncGlassMargins(); preview(); };
     gc.onchange = saveSkinQuiet;
     bl.oninput = () => { SKIN.layout.blur_level = bl.value; preview(); };
     bl.onchange = saveSkinQuiet;
@@ -1015,7 +1016,29 @@ function bindSkin() {
     ls.onchange = () => { SKIN.layout.label_style = ls.value; preview(); saveSkinQuiet(); };
   }
   lrng("#l-hsp", "hilite_spacing");
-  lrng("#l-mx", "margin_x"); lrng("#l-my", "margin_y"); lrng("#l-hp", "hilite_padding");
+  // 【玻璃独立留白 2026-09-10】水平/垂直留白双源：毛玻璃材质时滑杆
+  // 编辑 material.glass_margin_x/y（默认 1，与 layout 两套完全独立），
+  // 非玻璃编辑 layout.margin_x/y——不用 lrng 静态绑定，动态切目标。
+  {
+    const mx = $("#l-mx"), my = $("#l-my"), mxv = $("#l-mx-v"), myv = $("#l-my-v");
+    const glassMargins = () => SKIN.material && SKIN.material.kind === "glass";
+    const marginTarget = () => glassMargins() ? SKIN.material : SKIN.layout;
+    if (SKIN.material && SKIN.material.glass_margin_x === undefined) SKIN.material.glass_margin_x = 1;
+    if (SKIN.material && SKIN.material.glass_margin_y === undefined) SKIN.material.glass_margin_y = 1;
+    const syncMarginSliders = () => {
+      const t = marginTarget();
+      mx.value = t.margin_x !== undefined ? t.margin_x : (glassMargins() ? 1 : 8);
+      my.value = t.margin_y !== undefined ? t.margin_y : (glassMargins() ? 1 : 6);
+      mxv.textContent = mx.value; myv.textContent = my.value;
+      const hint = glassMargins() ? "毛玻璃独立留白（与纯色两套）" : "";
+      mx.title = my.title = hint;
+    };
+    mx.oninput = () => { marginTarget().margin_x = parseFloat(mx.value); mxv.textContent = mx.value; preview(); saveSkinDebounced(); };
+    my.oninput = () => { marginTarget().margin_y = parseFloat(my.value); myv.textContent = my.value; preview(); saveSkinDebounced(); };
+    window.__syncGlassMargins = syncMarginSliders;
+    syncMarginSliders();
+  }
+  lrng("#l-hp", "hilite_padding");
   lrng("#l-cs", "candidate_spacing"); lrng("#l-ls", "line_spacing");
   lrng("#l-lfp", "label_font_point"); lrng("#l-w", "width");
   lrng("#l-sr", "shadow_radius"); lrng("#l-sox", "shadow_offset_x"); lrng("#l-soy", "shadow_offset_y");
@@ -1097,7 +1120,7 @@ function bindSkin() {
     const F = {
       layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 6, spacing: 6, candidate_spacing: 4, hilite_spacing: 4, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 12, shadow_offset_x: 0, shadow_offset_y: 0, blur_level: "low", mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
-      material: { kind: "solid", tint: "#1C1C1E00", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_alpha: 0, glass_shadow_alpha: 0.38, glass_shadow_size: 6 },
+      material: { kind: "solid", tint: "#1C1C1E00", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_alpha: 0, glass_shadow_alpha: 0.38, glass_shadow_size: 6, glass_margin_x: 1, glass_margin_y: 1 },
     };
     $("#skin-reset").onclick = async () => {
       try {
@@ -1177,7 +1200,12 @@ function preview() {
     : "";
   // glass 时底色交给 tint 层（真窗 bg alpha=0，accent 承担染色）
   const bgPart = SKIN.material && SKIN.material.kind === "glass" ? "" : `background:${bgc};`;
-  inner.style.cssText = `${glassCss}${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 0}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${L.margin_y}px ${L.margin_x}px;gap:${L.candidate_spacing}px`;
+  /* 【玻璃独立留白 2026-09-10】预览与真窗同语义：玻璃用 material.
+     glass_margin_*（默认 1），非玻璃用 layout.margin_* */
+  const isGlassSkin = SKIN.material && SKIN.material.kind === "glass";
+  const padY = isGlassSkin ? (SKIN.material.glass_margin_y ?? 1) : L.margin_y;
+  const padX = isGlassSkin ? (SKIN.material.glass_margin_x ?? 1) : L.margin_x;
+  inner.style.cssText = `${glassCss}${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 0}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${padY}px ${padX}px;gap:${L.candidate_spacing}px`;
   // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
   // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
   // 与 mark_text（高亮行左缘细竖条，weasel 语义）。

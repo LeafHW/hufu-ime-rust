@@ -846,11 +846,23 @@ impl CandidateWindowV2 {
 
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
-        // 【glass 元素内缩 4px】1px/2px 视觉太微（用户以为未生效，
-        // 实测窗口 110 vs 无inset 106=链路通）——加大到 4px 明显可感。
-        let inset = if kind == "glass" { 4.0 } else { 0.0 };
-        let margin_x = layout_f(skin, "margin_x", 8.0) + inset;
-        let margin_y = layout_f(skin, "margin_y", 6.0) + inset;
+        // 【玻璃独立留白 2026-09-10】毛玻璃与非玻璃两套 margin 彻底
+        // 独立：glass 用 material.glass_margin_x/y（默认 1，裸玻璃贴
+        // 边）；非玻璃沿用 layout.margin_x/y（8/6）。旧方案（共用
+        // layout 值 + 4px inset 内缩补丁）作废——inset 的「视觉可感」
+        // 语义并入独立字段，由设置页分别调。
+        let mat_f = |key: &str, dflt: f32| -> f32 {
+            skin.pointer(("/skin/material/".to_string() + key).as_str())
+                .or_else(|| skin.get("material").and_then(|m| m.get(key)))
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(dflt)
+        };
+        let (margin_x, margin_y) = if kind == "glass" {
+            (mat_f("glass_margin_x", 1.0), mat_f("glass_margin_y", 1.0))
+        } else {
+            (layout_f(skin, "margin_x", 8.0), layout_f(skin, "margin_y", 6.0))
+        };
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
