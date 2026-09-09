@@ -72,6 +72,9 @@ pub struct Shared {
     pub skin: serde_json::Value,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
+    /// 【焦点代际 2026-09-09】每次 OnSetFocus（真实焦点变化）+1——
+    /// 在途编辑会话执行时比对，不符即丢弃（详见 EditSession.epoch）。
+    pub focus_epoch: u64,
     /// 皮肤上次拉取时刻（2.5s 自动过期：打字中改皮肤也能热生效）
     pub skin_loaded_at: std::time::Instant,
     /// 【皮肤版本 2026-09-08】server 每次保存皮肤 +1；poll 比对不一致
@@ -178,6 +181,7 @@ impl Shared {
             cand_ui_host_draws: false,
             skin: serde_json::Value::Null,
             skin_stale: true,
+            focus_epoch: 0,
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             skin_ver_last: 0,
             skin_repaint: false,
@@ -561,7 +565,11 @@ fn handle_set_focus(
         }
     }
     let (composing, preedit) = {
-        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【焦点代际 2026-09-09】真实焦点事件到达即 +1：此前请求的
+        // 在途编辑会话（异步档排队中）执行时代际不符即被丢弃——
+        // 否则会把组段/文字写进旧焦点文档（切窗竞态残余）。
+        g.focus_epoch += 1;
         (g.composing, g.preedit_last.clone())
     };
         // 【焦点风暴去抖 2026-09-08】QQ 实测 40ms 内连发 8 次
@@ -1048,6 +1056,11 @@ struct EditSession {
     op: Op,
     /// 显式目标上下文（失焦冲销 = 旧文档；None = 当前焦点）。
     ctx_override: Option<ITfContext>,
+    /// 【焦点代际 2026-09-09】请求时的 focus_epoch：异步档（0xA）会话
+    /// 排队执行可能晚于焦点切换——ctx_override 是请求时的旧文档，
+    /// 执行时若代际已变，继续写=文字/组段落进旧应用（切窗「打不出
+    /// 字/候选漂移」残余竞态）。执行前比对，不符即丢弃本会话。
+    epoch: u64,
 }
 
 impl ITfEditSession_Impl for EditSession_Impl {
@@ -1071,6 +1084,14 @@ impl ITfEditSession_Impl for EditSession_Impl {
 impl EditSession_Impl {
     fn do_edit_session(&self, ec: u32) -> Result<()> {
         let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【焦点代际守卫 2026-09-09】请求→执行之间焦点已变（异步档排队/
+        // 宿主消息泵延迟）：本会话的目标文档是旧焦点——丢弃，防止组段
+        // 句柄/文字写进旧应用（g.composition 被指向旧文档后，下一键
+        // SetText 打不进新应用=「打不出字」，候选锚新光标=「漂移」）。
+        if g.focus_epoch != self.epoch {
+            trace("edit session: 焦点代际不符——丢弃旧文档会话");
+            return Err(Error::from(HRESULT(-2147467259)));
+        }
         let ctx = match self.ctx_override.clone() {
             Some(c) => c,
             None => g
@@ -1972,7 +1993,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 /// （TS_E_SYNCHRONOUS）打字不上屏、无组段无锚点。0x6 在非按键场景被拒
 /// （0x80040209）时再退 0xA 纯异步（读态操作/冲销尽力而为）。
 fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()> {
-    let (target, client_id) = {
+    let (target, client_id, epoch) = {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         let target = match ctx {
             Some(c) => c,
@@ -1980,12 +2001,13 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
                 .focus_context()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
-        (target, g.client_id)
+        (target, g.client_id, g.focus_epoch)
     };
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
         op,
         ctx_override: Some(target.clone()),
+        epoch,
     }
     .into();
     unsafe {
@@ -2013,11 +2035,15 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 /// 异步 session 的回调需要宿主 UI 线程泵消息，Chromium 系应用在焦点
 /// 切换期持内部锁 → 排队即死锁（VSCode 点击候选框冻结事故）。
 fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {
-    let client_id = shared.lock().unwrap_or_else(|e| e.into_inner()).client_id;
+    let (client_id, epoch) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (g.client_id, g.focus_epoch)
+    };
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
         op,
         ctx_override: Some(ctx.clone()),
+        epoch,
     }
     .into();
     unsafe {
