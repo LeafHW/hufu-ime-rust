@@ -356,7 +356,15 @@ impl Skin {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let text = serde_json::to_string_pretty(self)
+        // 【玻璃零偏移 2026-09-09 用户规格】毛玻璃模式不允许阴影偏移
+        //（玻璃阴影=SDF 居中投影，偏移会破坏对称）；保存前归一为 0。
+        // 渲染侧另有同款钳制（candwin2）双保险。
+        let mut s = self.clone();
+        if s.material.kind == Material::Glass {
+            s.layout.shadow_offset_x = 0.0;
+            s.layout.shadow_offset_y = 0.0;
+        }
+        let text = serde_json::to_string_pretty(&s)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;

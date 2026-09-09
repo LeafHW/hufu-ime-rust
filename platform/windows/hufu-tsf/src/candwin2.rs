@@ -1286,9 +1286,12 @@ impl CandidateWindowV2 {
         let font_scale = (font_pt / 14.5).clamp(0.5, 3.0);
         let shadow_radius = (_shadow_base * font_scale.sqrt()).clamp(0.0, 60.0);
         // 【默认阴影偏移 0】用户定稿：所有皮肤默认阴影偏移=0（居中）。
-        let shadow_off_y = layout_f(skin, "shadow_offset_y", 0.0);
+        // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（SDF 居中
+        // 投影，偏移破坏对称）——即使皮肤数据带偏移也钳为 0（与
+        // hufu-skin save 归一、设置页禁用滑杆三重一致）。
+        let shadow_off_y = if kind == "glass" { 0.0 } else { layout_f(skin, "shadow_offset_y", 0.0) };
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
-        let shadow_off_x = layout_f(skin, "shadow_offset_x", 0.0);
+        let shadow_off_x = if kind == "glass" { 0.0 } else { layout_f(skin, "shadow_offset_x", 0.0) };
         let has_shadow = shadow_radius >= 1.0;
         // 【毛玻璃 v3.5.3·玻璃加大】用户方向：与其改阴影不如把玻璃加大
         // ——glass 窗口=面板+6px 玻璃边（accent 盖整窗，视觉玻璃大于
