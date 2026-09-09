@@ -1,11 +1,9 @@
 //! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
-use crate::candwin::CandidateWindow;
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::MapWindowPoints;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 use windows_core::*;
@@ -56,9 +54,6 @@ pub struct Shared {
     pub cand2_dead: bool,
     /// v3（普通分层窗，打包宿主 SearchHost/UWP 专用——DComp 直通窗
     /// 被 DWM cloak，普通分层窗考古验证在 UWP 可见可跟光标）
-    pub cand3: Option<crate::candwin3::CandWin3>,
-    pub cand3_dead: bool,
-    pub cand: Option<CandidateWindow>,
     /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
     /// A. TSF UIElement——BeginUIElement pbShow=TRUE 即宿主愿意代画
     ///    （微软拼音同款，宿主=SearchHost 的搜索框场景）；
@@ -85,6 +80,11 @@ pub struct Shared {
     /// 皮肤刚重拉、待按新皮肤重绘一次（poll 消费即清——签名未变
     /// 时的预览刷新通道；绝非常驻标志，防每 40ms 白绘）。
     pub skin_repaint: bool,
+    /// 【皮肤去重推送 2026-09-11】server 代画通道已推送过的皮肤版本
+    ///（u64::MAX=从未/失效→下次必带 skin）。旧实现每帧 clone 整份
+    /// 皮肤 JSON 随管道全量推送（沉浸宿主逐键帧，KB 级浪费）；现仅
+    /// 换肤/首推/推送失败重推时携带，server 端缓存上帧皮肤。
+    pub srv_skin_ver_pushed: u64,
     /// 【焦点风暴去抖 2026-09-08】上次「无组段」OnSetFocus 处理时刻——
     /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
     /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
@@ -172,9 +172,6 @@ impl Shared {
             composition: None,
             cand2: None,
             cand2_dead: false,
-            cand3: None,
-            cand3_dead: false,
-            cand: None,
             cand_ui: None,
             cand_ui_id: 0,
             cand_ui_active: false,
@@ -185,6 +182,7 @@ impl Shared {
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             skin_ver_last: 0,
             skin_repaint: false,
+            srv_skin_ver_pushed: u64::MAX,
             focus_idle_at: None,
             last_key_at: None,
             delay_show_ms: 0,
@@ -374,15 +372,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         if let Some(mut c) = g.cand2.take() {
             c.hide();
         }
-        if let Some(mut c) = g.cand3.take() {
-            c.hide();
-        }
-        g.cand = None;
         // 【回归病根】ctfmon 重启等场景进程内本实例会被再次 Activate：
         // cand2_dead 若不清，重激活后所有显示分支被跳过、落入 v1 隐身窗
         // → 搜索框候选彻底消失（实测 notes 只有老会话记录）
         g.cand2_dead = false;
-        g.cand3_dead = false;
         // 沉浸式宿主：两通道各自收尾
         if g.cand_ui_active {
             if g.cand_ui_host_draws {
@@ -430,70 +423,42 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
-            if let Some(c) = g.cand3.as_mut() {
-                c.hide();
-            }
         }
         Ok(())
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 诊断：按键是否进入键盘钩（搜索框等特殊宿主排查）
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
-        {
-            let _ = writeln!(f, "test vk={:#x} t={:?}", wparam.0, std::time::SystemTime::now());
-        }
+        keys_log(&format!(
+            "test vk={:#x} t={:?}",
+            wparam.0,
+            std::time::SystemTime::now()
+        ));
         Ok(self.dispatch(wparam.0, true, false))
     }
 
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
-        {
-            let _ = writeln!(f, "testup vk={:#x}", wparam.0);
-        }
+        keys_log(&format!("testup vk={:#x}", wparam.0));
         Ok(self.dispatch(wparam.0, true, true))
     }
 
     fn OnKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
         let r = self.dispatch(wparam.0, false, false);
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
-        {
-            let _ = writeln!(
-                f,
-                "key vk={:#x} eat={} perr={} t={:?}",
-                wparam.0,
-                r.0,
-                crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst),
-                std::time::SystemTime::now()
-            );
-        }
+        keys_log(&format!(
+            "key vk={:#x} eat={} perr={} t={:?}",
+            wparam.0,
+            r.0,
+            crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst),
+            std::time::SystemTime::now()
+        ));
         Ok(r)
     }
 
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id()))
-        {
-            let _ = writeln!(f, "keyup vk={:#x}", wparam.0);
-        }
+        keys_log(&format!("keyup vk={:#x}", wparam.0));
         Ok(self.dispatch(wparam.0, false, true))
     }
 
@@ -658,15 +623,9 @@ fn handle_set_focus(
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
-            if let Some(c) = g.cand3.as_mut() {
-                c.hide();
-            }
             trace("foc: E hide完");
-            if let Some(c) = g.cand.take() {
-                c.hide();
-            }
             // 【UWP 失焦收候选】沉浸式宿主（Store/UWP/搜索框）的候选由
-            // server 代画或宿主 UIElement 画——本地 cand2/cand3 关不到
+            // server 代画或宿主 UIElement 画——本地 cand2 关不到
             // 它。失焦即收尾代画通道（用户定稿：UWP 失焦/失光标就关
             // 候选）。fire-and-forget：焦点回调绝不等待管道。
             if g.cand_ui_active {
@@ -720,7 +679,7 @@ pub fn trace(msg: &str) {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
-    let reopen = |g: &mut Option<std::fs::File>| -> Option<std::fs::File> {
+    let reopen = |_g: &mut Option<std::fs::File>| -> Option<std::fs::File> {
         let path = std::env::temp_dir().join("hufu-tsf-trace.log");
         // 轮转：超 8MB 归档 .old（旧 .old 覆盖）
         if let Ok(md) = std::fs::metadata(&path) {
@@ -750,12 +709,64 @@ pub fn trace(msg: &str) {
 /// 跨容器诊断日志（AppContainer 宿主如 SearchHost 写不了 %TEMP%，
 /// 统一落 C:\ProgramData\HuFu\diag\notes-<pid>.txt——该目录已授
 /// Everyone + 全应用包写权限）。
+/// 【常驻句柄 + 轮转 2026-09-11】旧实现每条 open/close 且无上限——
+/// 残留兜底路径每次 poll 命中都写，宿主异常日可涨到 MB 级。改常驻
+/// 句柄 + 8MB 轮转（对齐 trace 的教训：日志别成卡顿放大器）。
 pub fn diag_note(msg: &str) {
     use std::io::Write;
-    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
     let path = format!(r"C:\ProgramData\HuFu\diag\notes-{}.txt", std::process::id());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{msg}");
+    if g.is_none() {
+        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+        if let Ok(md) = std::fs::metadata(&path) {
+            if md.len() > 8 * 1024 * 1024 {
+                let _ = std::fs::rename(&path, format!("{path}.old"));
+            }
+        }
+        *g = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+    }
+    if let Some(f) = g.as_mut() {
+        if writeln!(f, "{msg}").is_err() {
+            *g = None; // 下次重开（句柄失效）
+        }
+    }
+}
+
+/// 键事件诊断日志（keys-<pid>.txt：vk/dispatch 结论/管道错误码）。
+/// 【开关化 2026-09-11】旧实现每键 2-3 次无条件 open/append，无开关
+/// 无轮转——keys-*.txt 日增 MB 级（对照 trace 83MB 的教训）。现默认
+/// 关：HUFU_KEYS=1 开启（排障时设）；开启时常驻句柄 + 8MB 轮转。
+pub fn keys_log(line: &str) {
+    use std::io::Write;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("HUFU_KEYS").as_deref() == Ok("1")) {
+        return;
+    }
+    let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
+    let path = format!(r"C:\ProgramData\HuFu\diag\keys-{}.txt", std::process::id());
+    if g.is_none() {
+        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+        if let Ok(md) = std::fs::metadata(&path) {
+            if md.len() > 8 * 1024 * 1024 {
+                let _ = std::fs::rename(&path, format!("{path}.old"));
+            }
+        }
+        *g = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+    }
+    if let Some(f) = g.as_mut() {
+        if writeln!(f, "{line}").is_err() {
+            *g = None;
+        }
     }
 }
 
@@ -771,7 +782,7 @@ impl HuFuTs_Impl {
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
         // 模式键（无组合歧义）：CapsLock / Ctrl+Space（按着 Ctrl 的 space，
-        /// 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
+        // 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
         let mode_key = match vk_to_name(wparam, false) {
             Some((n, sh, ct, al)) => n == "capslock" || (ct && !sh && !al && n == "space"),
             None => false,
@@ -1061,6 +1072,12 @@ struct EditSession {
     /// 执行时若代际已变，继续写=文字/组段落进旧应用（切窗「打不出
     /// 字/候选漂移」残余竞态）。执行前比对，不符即丢弃本会话。
     epoch: u64,
+    /// 【结果回传 2026-09-11】RequestEditSession 的返回值只反映「受理」
+    /// 不反映执行——旧实现 run_session 把受理当成功上抛（状态假阳
+    /// 性：上屏实际失败但调用方当成功清了本地状态）。回调把执行结果
+    /// 写进槽位；同步档（0x6 回调内联）受理后即可读真实结果。
+    /// None = 调用方不关心（焦点冲销等一次性路径）。
+    result_slot: Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
 }
 
 impl ITfEditSession_Impl for EditSession_Impl {
@@ -1075,6 +1092,12 @@ impl ITfEditSession_Impl for EditSession_Impl {
         if let Some((f, p)) = take_deferred_focus() {
             trace("DoEditSession: 回放延迟焦点事件（session 内触发）");
             let _ = handle_set_focus(&self.shared, f.as_ref(), p.as_ref());
+        }
+        // 执行结果落槽（run_session 同步档受理后读取上抛）
+        if let Some(slot) = &self.result_slot {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(r.is_ok());
+            }
         }
         trace(&format!("DoEditSession exit ok={}", r.is_ok()));
         r
@@ -1106,7 +1129,7 @@ impl EditSession_Impl {
                 trace("SP: cast ok");
                 let range: ITfRange = selection_range(&ctx, ec)?;
                 trace("SP: GetSelection ok");
-                let sink: ITfCompositionSink = CompSinkObj.into();
+                let sink: ITfCompositionSink = CompSinkObj { shared: self.shared.clone() }.into();
                 let comp: ITfComposition = match unsafe { cc.StartComposition(ec, &range, &sink) } {
                     Ok(c) => c,
                     Err(e) => {
@@ -1132,7 +1155,7 @@ impl EditSession_Impl {
                 if composition_drifted(&g, &ctx, ec) {
                     trace("SetPreedit: 选区离段——重组段跟随光标");
                     if let Some(comp) = g.composition.clone() {
-                        let _ = unsafe { comp.EndComposition(ec) };
+                        end_comp_clear(ec, &comp);
                     }
                     g.composition = None;
                     drop(g);
@@ -1195,12 +1218,6 @@ impl EditSession_Impl {
                         if let Some(c) = g.cand2.as_mut() {
                             c.hide();
                         }
-                        if let Some(c) = g.cand3.as_mut() {
-                            c.hide();
-                        }
-                        if let Some(mut c) = g.cand.take() {
-                            c.hide();
-                        }
                     }
                     return Ok(());
                 }
@@ -1210,7 +1227,7 @@ impl EditSession_Impl {
                 if composition_drifted(&g, &ctx, ec) {
                     trace("Commit: 选区离段——弃旧段改光标直插");
                     if let Some(comp) = g.composition.clone() {
-                        let _ = unsafe { comp.EndComposition(ec) };
+                        end_comp_clear(ec, &comp);
                     }
                     g.composition = None;
                 }
@@ -1261,7 +1278,7 @@ impl EditSession_Impl {
                     if !preedit.is_empty() {
                         let cc: ITfContextComposition = ctx.cast()?;
                         let range: ITfRange = selection_range(&ctx, ec)?;
-                        let sink: ITfCompositionSink = CompSinkObj.into();
+                        let sink: ITfCompositionSink = CompSinkObj { shared: self.shared.clone() }.into();
                         let comp: ITfComposition =
                             unsafe { cc.StartComposition(ec, &range, &sink)? };
                         let crange: ITfRange = unsafe { comp.GetRange()? };
@@ -1275,12 +1292,6 @@ impl EditSession_Impl {
                     }
                     if commit_text == "{隐藏候选}" {
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
-                        }
-                        if let Some(c) = g.cand3.as_mut() {
-                            c.hide();
-                        }
-                        if let Some(mut c) = g.cand.take() {
                             c.hide();
                         }
                     } else {
@@ -1303,7 +1314,7 @@ impl EditSession_Impl {
                 if composition_drifted(&g, &ctx, ec) {
                     trace("C&R: 选区离段——弃旧段改光标直插");
                     if let Some(comp) = g.composition.clone() {
-                        let _ = unsafe { comp.EndComposition(ec) };
+                        end_comp_clear(ec, &comp);
                     }
                     g.composition = None;
                 }
@@ -1336,7 +1347,7 @@ impl EditSession_Impl {
                 // 2) 重开组段显示剩余预编辑
                 let cc: ITfContextComposition = ctx.cast()?;
                 let range: ITfRange = selection_range(&ctx, ec)?;
-                let sink: ITfCompositionSink = CompSinkObj.into();
+                let sink: ITfCompositionSink = CompSinkObj { shared: self.shared.clone() }.into();
                 let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
                 let crange: ITfRange = unsafe { comp.GetRange()? };
                 let wstr2: Vec<u16> = preedit.encode_utf16().collect();
@@ -1349,11 +1360,11 @@ impl EditSession_Impl {
             Op::Insert(text) => {
                 // 无组段：光标处直接插入（剪贴板上屏）
                 if g.composition.is_some() {
-                    // 有活动组段先结束
+                    // 有活动组段先结束（清空段内文本——裸 EndComposition
+                    // 会把旧 preedit 留在文档，Ctrl+Shift+V 粘贴时编码
+                    // 字母落地文档旧位置）
                     if let Some(comp) = g.composition.clone() {
-                        unsafe {
-                            let _ = comp.EndComposition(ec);
-                        }
+                        end_comp_clear(ec, &comp);
                     }
                     g.composition = None;
                 }
@@ -1368,11 +1379,10 @@ impl EditSession_Impl {
                 // 回删已上屏字符（composition 之外）：选区起点向前扩 n
                 // 字符后清空该范围。「1.」再按 . → 删半角点 → 提交「。」
                 if g.composition.is_some() {
-                    // 有活动组段先结束（正常不该发生，防御）
+                    // 有活动组段先结束（正常不该发生，防御；清空段内
+                    // 文本——同 Op::Insert 注记）
                     if let Some(comp) = g.composition.clone() {
-                        unsafe {
-                            let _ = comp.EndComposition(ec);
-                        }
+                        end_comp_clear(ec, &comp);
                     }
                     g.composition = None;
                 }
@@ -1392,12 +1402,7 @@ impl EditSession_Impl {
             }
             Op::End => {
                 if let Some(comp) = g.composition.clone() {
-                    let range: ITfRange = unsafe { comp.GetRange()? };
-                    let empty: Vec<u16> = Vec::new();
-                    unsafe {
-                        let _ = range.SetText(ec, 0, &empty);
-                        let _ = comp.EndComposition(ec);
-                    }
+                    end_comp_clear(ec, &comp);
                 }
                 g.composition = None;
                 Ok(())
@@ -1406,11 +1411,28 @@ impl EditSession_Impl {
     }
 }
 
+/// 【弃段清文本 2026-09-11】结束组段前先清空段内文本，再
+/// EndComposition。裸 EndComposition 会把组段里的旧预编辑（编码
+/// 字母）残留在文档旧位置——跨进程焦点竞态实测 A 侧 'uj' 残留的
+/// 机制根因；Op::End 此前就是「清空再结束」（正确样板），全部弃段
+/// 路径（漂移自愈 ×3、Insert/DeleteBack 防御 ×2）统一收敛到这。
+/// 清空失败（宿主只读等）也无害：EndComposition 照发，残留风险
+/// 至少不高于旧实现。
+fn end_comp_clear(ec: u32, comp: &ITfComposition) {
+    unsafe {
+        if let Ok(range) = comp.GetRange() {
+            let empty: Vec<u16> = Vec::new();
+            let _ = range.SetText(ec, 0, &empty);
+        }
+        let _ = comp.EndComposition(ec);
+    }
+}
+
 /// 在指定上下文当前选区新开组段并写入预编辑（StartPreedit 主体 + 死组段自愈复用）。
 fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -> Result<()> {
     let cc: ITfContextComposition = ctx.cast()?;
     let range: ITfRange = selection_range(ctx, ec)?;
-    let sink: ITfCompositionSink = CompSinkObj.into();
+    let sink: ITfCompositionSink = CompSinkObj { shared: shared.clone() }.into();
     let comp: ITfComposition = unsafe { cc.StartComposition(ec, &range, &sink)? };
     let crange: ITfRange = unsafe { comp.GetRange()? };
     let wstr: Vec<u16> = text.encode_utf16().collect();
@@ -1478,6 +1500,12 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
     let mut sel = [TF_SELECTION::default()];
     let mut fetched: u32 = 0;
     unsafe {
+        // 【ulCount=TF_DEFAULT_SELECTION 2026-09-11 回滚】审计建议改
+        // 实数 1（担心 WPS 对 -1 校验失败）——实测 WinForms/EDIT 宿主
+        // 传 1 反而 GetSelection 失败（TF_E_NOSELECTION 类），组段
+        // 建不起来=打字全不上屏（真机 jav+空格 edit 零字实录）。
+        // u32::MAX 是 v1.5.1 全量装机验证过的写法，以实测为准回滚；
+        // WPS 兼容顾虑无实锤，若将来 WPS 出问题再按宿主名单分派。
         ctx.GetSelection(ec, u32::MAX, &mut sel, &mut fetched)?;
     }
     if fetched == 0 {
@@ -1495,6 +1523,11 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
 /// 整段矩形的左缘是组段起点、宽度随打字膨胀、换行时上下跳行，
 /// 拿它当锚点正是候选框水平/垂直抖动的病根。
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    // 【旧锚点快照 2026-09-11】旧实现开头即 g.caret=None，末尾失败
+    // 分支却注释「保留旧 caret」——实际锚点已丢（候选窗闪回兜底位）。
+    // 先快照，失败时真恢复。
+    let prev_caret = g.caret;
+    let prev_line_end = g.line_end;
     g.caret = None;
     g.caret_force = false; // 消费即清（补显强制重查一次性）
     let Some(comp) = g.composition.clone() else {
@@ -1557,7 +1590,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         }
     }
     let Some(rect) = last_ok else {
-        // 两次均失败/退化：保留旧 caret（比丢锚点稳）
+        // 两次均失败/退化：恢复快照的旧锚点（比丢锚点稳；旧实现因
+        // 开头清 None 实际没保住——见函数头注记）
+        g.caret = prev_caret;
+        g.line_end = prev_line_end;
         trace("qc: GetTextExt 两次均失败/退化，沿用旧锚点");
         return;
     };
@@ -1589,11 +1625,23 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
 }
 
 /// 空组段接收器。
+/// 【终止回调实装 2026-09-11】此前 OnCompositionTerminated 空实现——
+/// 宿主单方面终止组段后 g.composition 悬挂死句柄，全靠漂移检测 +
+/// SetText 失败自愈兜底。现在回调里 try_lock 清引用（抢不到锁说明
+/// 正在 edit session 内持锁——自愈链会处理，不死锁）。
 #[implement(ITfCompositionSink)]
-struct CompSinkObj;
+struct CompSinkObj {
+    shared: SharedRef,
+}
 
 impl ITfCompositionSink_Impl for CompSinkObj_Impl {
     fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Option<&ITfComposition>) -> Result<()> {
+        if let Ok(mut g) = self.shared.try_lock() {
+            if g.composition.is_some() {
+                trace("OnCompositionTerminated: 宿主终止组段——清悬挂句柄");
+                g.composition = None;
+            }
+        }
         Ok(())
     }
 }
@@ -1797,12 +1845,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
-        if let Some(c) = g.cand3.as_mut() {
-            c.hide();
-        }
-        if let Some(c) = g.cand.take() {
-            c.hide();
-        }
         if g.cand_ui_active {
             drop(g);
             ui_element_hide(&shared);
@@ -1817,12 +1859,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.caret_force = true; // 补显时强制重查锚点（旧行框矫正）
         arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
-        }
-        if let Some(c) = g.cand3.as_mut() {
-            c.hide();
-        }
-        if let Some(c) = g.cand.take() {
             c.hide();
         }
     } else if host_is_packaged() {
@@ -2003,11 +2039,16 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         };
         (target, g.client_id, g.focus_epoch)
     };
+    // 结果槽：同步档回调内联执行，受理返回时槽已填——把真实执行
+    // 结果上抛（旧实现受理=成功的假阳性，见 struct 注记）；异步档
+    // 无法同步等待（回调要本线程泵消息），如实按「已排队」返回。
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
         op,
         ctx_override: Some(target.clone()),
         epoch,
+        result_slot: Some(slot.clone()),
     }
     .into();
     unsafe {
@@ -2016,7 +2057,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
             match target.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(flags)) {
                 Ok(h) => {
                     trace(&format!("session grant = 0x{:08X} (flags={flags})", h.0 as u32));
-                    granted = Some(h);
+                    granted = Some((h, flags));
                     break;
                 }
                 Err(e) => {
@@ -2024,8 +2065,20 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
                 }
             }
         }
-        if granted.is_none() {
+        let Some((_, flags)) = granted else {
             return Err(Error::from(HRESULT(-2147467259)));
+        };
+        if flags == 0x6 {
+            // 同步档：读回调真实结果
+            if let Ok(s) = slot.lock() {
+                if let Some(ok) = *s {
+                    if !ok {
+                        return Err(Error::from(HRESULT(-2147467259)));
+                    }
+                }
+            }
+        } else {
+            trace("run_session: 异步档已排队（结果不可同步等待）");
         }
     }
     Ok(())
@@ -2044,6 +2097,7 @@ fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<
         op,
         ctx_override: Some(ctx.clone()),
         epoch,
+        result_slot: None,
     }
     .into();
     unsafe {
@@ -2134,16 +2188,34 @@ fn ui_element_show(
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.cand_ui_active = true;
     g.cand_ui_host_draws = false;
-    let skin = g.skin.clone();
+    // 【皮肤去重推送 2026-09-11】仅换肤/首推/上次失败时携带 skin
+    //（server 端缓存上帧皮肤），其余帧省掉整份 JSON 的 clone+序列化
+    //+管道字节——沉浸宿主逐键帧是无谓的 KB 级重复开销。
+    let need_skin = g.srv_skin_ver_pushed != g.skin_ver_last;
+    let skin = if need_skin {
+        g.skin.clone()
+    } else {
+        serde_json::Value::Null
+    };
     drop(g);
     // 宿主顶层窗（前台窗——代画显示时宿主必为前台）：交给 server 自守
     //（宿主窗不可见时 server 自收代画窗——开始菜单残留的根治）
     let host_hwnd = unsafe { GetForegroundWindow() };
     let host_hwnd = if host_hwnd.0.is_null() { 0 } else { host_hwnd.0 as isize };
-    pipe_cand_push(cands, raw, sel, x, y, &skin, host_hwnd);
+    let ok = pipe_cand_push(cands, raw, sel, x, y, &skin, host_hwnd);
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        if need_skin {
+            g.srv_skin_ver_pushed = g.skin_ver_last;
+        }
+    } else {
+        // 推送失败（server 重启/管道断）：皮肤缓存失效，下帧重推
+        g.srv_skin_ver_pushed = u64::MAX;
+    }
 }
 
-/// server 代画：pipe 推送候选帧（含皮肤，server 按皮肤渲染）
+/// server 代画：pipe 推送候选帧（皮肤仅换肤时携带，server 按皮肤渲染；
+/// 返回是否推送成功——失败时调用方标记下帧重推皮肤）
 fn pipe_cand_push(
     cands: &[(String, String)],
     raw: &str,
@@ -2152,12 +2224,12 @@ fn pipe_cand_push(
     y: i32,
     skin: &serde_json::Value,
     host_hwnd: isize,
-) {
+) -> bool {
     let items: Vec<serde_json::Value> = cands
         .iter()
         .map(|(t, c)| serde_json::json!({"text": t, "comment": c}))
         .collect();
-    let _ = crate::ipc::call(&serde_json::json!({
+    let r = crate::ipc::call(&serde_json::json!({
         "op": "cand",
         "items": items,
         "raw": raw,
@@ -2167,11 +2239,16 @@ fn pipe_cand_push(
         "skin": skin,
         "host_hwnd": host_hwnd,
     }));
-    diag_note(&format!(
-        "srv push n={} perr={}",
-        cands.len(),
-        crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst)
-    ));
+    // 【诊断降噪 2026-09-11】旧实现每帧 diag_note（沉浸宿主逐键帧
+    // 写盘）——只在出错时落一条。
+    if r.is_none() {
+        diag_note(&format!(
+            "srv push FAIL n={} err={:?}",
+            cands.len(),
+            crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst)
+        ));
+    }
+    r.is_some()
 }
 
 /// 结束沉浸式候选（编码结束/失焦）：两通道各自收尾
@@ -2502,27 +2579,35 @@ fn poll_tick() {
                     any_visible |= c.is_visible();
                     c.hide();
                 }
-                if let Some(c) = g.cand3.as_mut() {
-                    any_visible |= c.is_visible();
-                    c.hide();
-                }
                 // 沉浸式宿主两通道也收尾（UWP/搜索框走 UIElement 或
                 // server 代画——只藏 cand2 不够，残留正是缺这段）：
-                if g.cand_ui_active {
-                    if g.cand_ui_host_draws {
-                        let mgr = g.thread_mgr.as_ref().and_then(|tm| {
-                            tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>().ok()
-                        });
-                        let id = g.cand_ui_id;
+                // 【锁外 IPC 2026-09-11】EndUIElement（COM，宿主回调）
+                // 与 ipc::call（同步管道，server 卡住最坏秒级）都在持
+                // shared 锁内做——server 一卡，键路径抢锁失败=宿主 UI
+                // 卡死（对照 ui_element_show 先 drop(g) 的正确姿势）。
+                // 先摘参数、放锁、锁外执行。
+                let ui_active = g.cand_ui_active;
+                let ui_host_draws = g.cand_ui_host_draws;
+                let ui_id = g.cand_ui_id;
+                let mgr = if ui_active && ui_host_draws {
+                    g.thread_mgr.as_ref().and_then(|tm| {
+                        tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>().ok()
+                    })
+                } else {
+                    None
+                };
+                g.cand_ui_active = false;
+                drop(g);
+                if ui_active {
+                    if ui_host_draws {
                         if let Some(mgr) = &mgr {
-                            let _ = unsafe { mgr.EndUIElement(id) };
+                            let _ = unsafe { mgr.EndUIElement(ui_id) };
                             diag_note("poll: 前台他进程 → EndUIElement（残留兜底）");
                         }
                     } else {
                         let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
                         diag_note("poll: 前台他进程 → srv cand_hide（残留兜底）");
                     }
-                    g.cand_ui_active = false;
                 }
                 if any_visible {
                     diag_note(&format!(

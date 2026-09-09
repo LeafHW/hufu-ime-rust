@@ -208,18 +208,35 @@ pub fn open_weight() {
     open_common();
 }
 
+/// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
+/// 结束清零。短锁使用，绝不跨消息循环持有。
+static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
+
 fn open_common() {
     std::thread::spawn(|| unsafe {
         crate::tsf::trace("addword open（线程已起）");
         // 【单例 2026-09-06】窗口已在（本进程）→ 前置复用，不再多开
         //（用户连按 /jq 会叠开多个同位窗口，只看得见第一个）
+        // 【竞态闸门 2026-09-11】FindWindow(无)→CreateWindow 两步无锁：
+        // 连按 /jq 两个线程同时查空 → 各建一窗（旧实现真实竞态）。
+        // 临界区（ADDWORD_HWND 锁）内复查+建窗+登记；锁绝不跨消息
+        // 循环持有。
+        let mut guard = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
+        if *guard != 0 && IsWindow(HWND(*guard as *mut _)).as_bool() {
+            let existing = HWND(*guard as *mut _);
+            let _ = ShowWindow(existing, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(existing);
+            crate::tsf::trace("addword 窗口已在，前置复用");
+            return;
+        }
         if let Ok(existing) = FindWindowW(CLASS, None) {
             let mut pid: u32 = 0;
             let _ = GetWindowThreadProcessId(existing, Some(&mut pid));
             if pid == std::process::id() && !existing.0.is_null() {
+                *guard = existing.0 as isize;
                 let _ = ShowWindow(existing, SW_SHOWNORMAL);
                 let _ = SetForegroundWindow(existing);
-                crate::tsf::trace("addword 窗口已在，前置复用");
+                crate::tsf::trace("addword 窗口已在（FindWindow 复用）");
                 return;
             }
         }
@@ -264,6 +281,9 @@ fn open_common() {
             crate::tsf::trace("addword CreateWindow 失败（窗口未建）");
             return;
         }
+        // 登记本窗口句柄（后续 open 前置复用），放锁再跑消息循环
+        *guard = hwnd.0 as isize;
+        drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let mut msg = MSG::default();
@@ -273,6 +293,9 @@ fn open_common() {
                 DispatchMessageW(&msg);
             }
         }
+        // 消息循环退出（窗口已销毁）——清登记，下次 open 可再建
+        let mut guard = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = 0;
     });
 }
 
@@ -375,6 +398,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     *id,
                 );
                 set_item_font(ed, false);
+                // 【EDIT 免 IME 2026-09-11】输入法自己的加词框里再唤起
+                // 输入法=鸡生蛋（编码框打 jav 会先出候选不上字母）。
+                // 断开 EDIT 的输入上下文，恢复纯字母数字输入。
+                // 动态取 ImmAssociateContext：mingw 交叉工具链无 imm32
+                // import lib（链接报 cannot find -limm32），imm32.dll
+                // 运行期必然在（IMM 子系统）——GetProcAddress 最稳。
+                {
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GetModuleHandleW(name: *const u16) -> isize;
+                        fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
+                    }
+                    unsafe {
+                        let mn: Vec<u16> = "imm32.dll\0".encode_utf16().collect();
+                        let md = GetModuleHandleW(mn.as_ptr());
+                        if md != 0 {
+                            let p = GetProcAddress(md, c"ImmAssociateContext".as_ptr() as *const u8);
+                            if !p.is_null() {
+                                type Iac = unsafe extern "system" fn(isize, isize) -> isize;
+                                let f: Iac = std::mem::transmute(p);
+                                let _ = f(ed.0 as isize, 0);
+                            }
+                        }
+                    }
+                }
                 if i == 0 {
                     first_edit = ed;
                 }
@@ -802,6 +850,9 @@ fn code_preview(code: &str) -> Option<Vec<String>> {
         "GET /api/code_preview?code={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     );
     let mut s = std::net::TcpStream::connect(("127.0.0.1", 4390)).ok()?;
+    // 【读超时 2026-09-11】与 http_post_json 同款：实时预览路径在
+    // EN_UPDATE 每键触发，server 卡住会冻结加词窗 UI。
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     s.write_all(req.as_bytes()).ok()?;
     let mut resp = String::new();
@@ -871,22 +922,17 @@ unsafe fn submit(hwnd: HWND) {
 }
 
 /// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/weight。
+/// 【JSON 安全 2026-09-11】旧手拼 esc 只转义 \ 和 "——词里带换行/
+/// 制表符等控制字符会拼出非法 JSON（server 端解析 400，加词静默
+/// 失败）。改 serde_json 正规序列化。
 fn post_weight(word: &str, weight: i64) -> bool {
-    let esc = |s: &str| -> String { s.replace('\\', "\\\\").replace('"', "\\\"") };
-    let body = format!("{{\"text\":\"{}\",\"weight\":{}}}", esc(word), weight);
+    let body = serde_json::json!({"text": word, "weight": weight}).to_string();
     http_post_json("/api/user_word/weight", &body)
 }
 
-/// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/add。
+/// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/add。（同上 JSON 安全）
 fn post_add(code: &str, word: &str, pos: i64) -> bool {
-    use std::io::{Read, Write};
-    let esc = |s: &str| -> String { s.replace('\\', "\\\\").replace('"', "\\\"") };
-    let body = format!(
-        "{{\"code\":\"{}\",\"text\":\"{}\",\"pos\":{}}}",
-        esc(code),
-        esc(word),
-        pos
-    );
+    let body = serde_json::json!({"code": code, "text": word, "pos": pos}).to_string();
     http_post_json("/api/user_word/add", &body)
 }
 
@@ -905,6 +951,9 @@ fn http_post_json(path: &str, body: &str) -> bool {
             return false;
         }
     };
+    // 【读超时 2026-09-11】旧实现只有写超时，读无超时——server 卡住
+    // 时加词窗 UI 线程（submit 是按钮点击路径）无限冻结。
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     if let Err(e) = s.write_all(req.as_bytes()) {
         crate::tsf::trace(&format!("addword tcp write err: {e}"));

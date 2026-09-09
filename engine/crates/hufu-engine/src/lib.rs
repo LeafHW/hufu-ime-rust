@@ -315,6 +315,13 @@ pub fn parse_rank_locks(raw: &str) -> RankLocks {
     }
 }
 
+/// 【修复标签 2026-09-11】数字后缀探测窗口上限。原因 → 数字延续判定
+/// 原先从任意长度 raw 回扫全部后缀并逐个查码表，病态长 raw 下每键
+/// O(n²) 字符扫描 + 无界查询。手段 → 只探测尾部 ≤8 码的后缀：虎码类
+/// 全码 ≤6 位、跨段延续（如 vvb8 的 b8=如）只需 2 位，超窗后缀不可能
+/// 与单个数字组成码表词条，截断不改变正常行为。
+const DIGIT_SUFFIX_WINDOW: usize = 8;
+
 /// 【数字编码 2026-09-05】数字编码表的锁解析：raw 里的数字按「码表
 /// 延续」逐个判定——到该数字为止的前缀在码表有延续（如 a8、u3 的
 /// 8/3）则保留为编码字符；无延续（如 ve; 锁转成的内部数字 ve2）则
@@ -410,6 +417,13 @@ pub struct Engine {
     ///（证sf+不cb）抢跑分段。分道扬镳（后续键与全部变体不一致）后
     /// 自动恢复置信上屏。
     supp_hold: std::sync::Mutex<Option<(String, Vec<String>, Vec<(String, String)>)>>,
+    /// 【修复标签 2026-09-11】user-adjust.log 写盘防抖：learn 原先每词
+    /// 开文件追加一行的写盘，改为内存累积（pending 行缓冲）+ 脏标记，
+    /// 节流落盘（距上次 ≥5s 且累积 ≥8 条才写），会话断段（process_key
+    /// 出口缓冲全空）强制 flush 兜底——频繁学习不再每词一次磁盘 IO，
+    /// 落盘行序与逐条写完全一致。
+    learn_log_pending: Vec<String>,
+    learn_log_last_flush: std::time::Instant,
 }
 
 impl Engine {
@@ -420,9 +434,13 @@ impl Engine {
             let dict = &self.schema.dict;
             // 整体或任意后缀是词条/前缀都算编码延续（跨段：vvb8 的
             // b8=如）。锁数字（ve2：e2/2 均无）不命中。
+            // 【修复标签 2026-09-11】原因 → 后缀枚举无上限（1..=全长），
+            // base 任意长时逐后缀查码表，病态输入下无界扫描。手段 →
+            // 枚举窗口限到尾部 ≤DIGIT_SUFFIX_WINDOW 码（见常量注释）。
             let is_code = |p: &str| {
                 let cs: Vec<char> = p.chars().collect();
-                (1..=cs.len()).any(|j| {
+                let max_j = cs.len().min(DIGIT_SUFFIX_WINDOW);
+                (1..=max_j).any(|j| {
                     let s: String = cs[cs.len() - j..].iter().collect();
                     !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
                 })
@@ -488,6 +506,8 @@ impl Engine {
             opencc_loaded: false,
             pending_user_reload: false,
             supp_hold: std::sync::Mutex::new(None),
+            learn_log_pending: Vec::new(),
+            learn_log_last_flush: std::time::Instant::now(),
         };
         // 全局资源（反查/注释/拆分）大统一应用——见 apply_global_assets
         engine.apply_global_assets();
@@ -516,6 +536,8 @@ impl Engine {
             opencc_loaded: false,
             pending_user_reload: false,
             supp_hold: std::sync::Mutex::new(None),
+            learn_log_pending: Vec::new(),
+            learn_log_last_flush: std::time::Instant::now(),
         };
         engine.apply_global_assets();
         Ok(engine)
@@ -736,6 +758,15 @@ impl Engine {
             self.pending_user_reload = false;
             self.reload_user_data();
         }
+        // 【修复标签 2026-09-11】会话断段（缓冲全空/候选框消失）——
+        // user-adjust.log 防抖缓冲强制落盘：不足节流阈值（<8 条或
+        // <5s）的尾部学习记录也不丢。缓冲为空时 no-op，零额外 IO。
+        if session.raw.is_empty()
+            && session.pending_commit.is_none()
+            && session.candidates.is_empty()
+        {
+            self.learn_log_flush(true);
+        }
         // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
         if self.config.sound.enabled && out.consumed {
             let tag = self.sound_hint.unwrap_or(if out.commit.is_some() {
@@ -796,7 +827,19 @@ impl Engine {
                 }
             }
             // Ctrl+Delete：软删当前页首选
+            // 【修复标签 2026-09-11】原因 → 空输入态（raw/committed_raw/
+            // 候选全空）下 Ctrl+Delete 仍进 op_hide_candidate：走候选
+            // 克隆 + state() 重组重活，且空候选分支返回 consumed 吞掉
+            // 应用自身的 Ctrl+Delete（删后一词）快捷键。手段 → 全空直接
+            // passthrough 短路，不做任何引擎调用（与上方 Ctrl+数字空态
+            // 守卫同策略）。
             if key.key == KeyCode::Delete && self.config.user.allow_delete_word {
+                if session.raw.is_empty()
+                    && session.committed_raw.is_empty()
+                    && session.candidates.is_empty()
+                {
+                    return KeyOutcome::passthrough();
+                }
                 return self.op_hide_candidate(session, 0);
             }
             return KeyOutcome::passthrough();
@@ -1170,9 +1213,16 @@ impl Engine {
             // 无词条，但后缀 b8=如 是词条）——数字对 raw 的任意
             // 后缀构成词条/前缀即当编码字符，交给整句解码切分。
             let digit_extends = extends || {
+                // 【修复标签 2026-09-11】原因 → 原先 (1..=raw 全长) 回扫
+                // 全部后缀且每轮重数 chars().count()，病态长 raw 下每键
+                // O(n²) 扫描 + 无界码表查询。手段 → 窗口上限：只看尾部
+                // ≤DIGIT_SUFFIX_WINDOW 码（只看当前段尾部，跨段延续
+                // 如 b8=如 仍在窗内，行为不变）。
                 let raw = &session.raw;
-                (1..=raw.chars().count()).any(|k| {
-                    let start = raw.chars().count() - k;
+                let n = raw.chars().count();
+                let max_k = n.min(DIGIT_SUFFIX_WINDOW);
+                (1..=max_k).any(|k| {
+                    let start = n - k;
                     let suffix: String = raw.chars().skip(start).collect();
                     let probe = format!("{}{c}", suffix);
                     !self.schema.dict.lookup(&probe).is_empty()
@@ -1255,16 +1305,20 @@ impl Engine {
 
     /// 编码追加后的顶功 / 自动上屏 / 快符唯一上屏判定。
     fn after_append(&mut self, session: &mut Session) {
-        let prev_cands = session.candidates.clone(); // 追加前 raw 的候选
+        // 【修复标签 2026-09-11】原因 → 每键深拷贝整页候选 Vec + 整条
+        // raw String：prev_cands 全量 clone 后只用了首个候选（顶功上屏
+        // 分支），raw 全部用途均为只读（长度/大写/前缀/续码判定）。
+        // 手段 → 候选只浅取首个 Option<Candidate>；raw 改借用
+        // session.raw 引用传参，去掉每键的 String/Vec 分配，行为不变。
+        let prev_first = session.candidates.first().cloned(); // 追加前 raw 的首选
         let c = session.raw.chars().last().unwrap_or(' ');
         self.refresh_candidates(session);
-        let raw = session.raw.clone();
-        let len = raw.chars().count();
+        let len = session.raw.chars().count();
         let max_len = self.config.input.max_code_length;
-        let has_upper = raw.chars().any(|x| x.is_ascii_uppercase());
+        let has_upper = session.raw.chars().any(|x| x.is_ascii_uppercase());
 
         // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
-        if (raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\'))
+        if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\'))
             && len >= 2
             && session.candidates.len() == 1
         {
@@ -1292,11 +1346,11 @@ impl Engine {
         // 上屏」的顶功定义不符（用户实测拍板）。死路走下方空码清屏
         // 分支（auto_clear_empty 开则清缓冲重打，关则留空码由退格/空格
         // 处理）。
-        let dead_end = session.candidates.is_empty() && !self.has_continuation(&raw);
+        let dead_end = session.candidates.is_empty() && !self.has_continuation(&session.raw);
         let over_length = len > max_len;
         if over_length && !sentence_mode && self.config.input.auto_push && !has_upper
         {
-            if let Some(first) = prev_cands.first().cloned() {
+            if let Some(first) = prev_first {
                 // 提交追加前 raw 的首选，新 raw 从刚输入的字符重新开始
                 self.learn(&first);
                 session.clear();
@@ -2323,15 +2377,37 @@ impl Engine {
                 "{secs}\t{}\t{}\t{:?}\n",
                 cand.code, cand.text, cand.source
             );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.data_dir.join("user-adjust.log"))
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(line.as_bytes())
-                });
+            // 【修复标签 2026-09-11】原因 → 每次学习即开文件逐行追加，
+            // 连续打字下每词触发一次磁盘 IO。手段 → 行入内存缓冲累积 +
+            // 脏标记，节流条件（距上次落盘 ≥5s 且变更 ≥8 条，见
+            // learn_log_flush）满足才真正写盘；不足部分由 process_key
+            // 出口的会话断段强制 flush 兜底，行序与逐条写一致。
+            self.learn_log_pending.push(line);
+            self.learn_log_flush(false);
         }
+    }
+
+    /// 【修复标签 2026-09-11】user-adjust.log 防抖落盘。原因 → learn 每
+    /// 次调整即写盘。手段 → force=true 无条件写（会话断段兜底）；否则
+    /// 节流——距上次落盘 <5s 或变更 <8 条时跳过。缓冲为空时 no-op。
+    fn learn_log_flush(&mut self, force: bool) {
+        if self.learn_log_pending.is_empty() {
+            return;
+        }
+        if !force
+            && (self.learn_log_last_flush.elapsed().as_secs() < 5
+                || self.learn_log_pending.len() < 8)
+        {
+            return;
+        }
+        use std::io::Write;
+        let buf: String = std::mem::take(&mut self.learn_log_pending).concat();
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.data_dir.join("user-adjust.log"))
+            .and_then(|mut f| f.write_all(buf.as_bytes()));
+        self.learn_log_last_flush = std::time::Instant::now();
     }
 
     /// 重建候选列表（含整句模式切换）。
@@ -2476,7 +2552,6 @@ impl Engine {
         let full = format!("{}{}", session.committed_raw, session.raw);
         let rich = dec.decode_rich(&full);
         let committed_text = session.committed_text.clone();
-        let skip = committed_text.chars().count();
         // 【进行态（partial）不进候选】（2026-09-05 定版）：partial=前段
         // 精确+尾键进行中（消耗不满 raw），无论码表域还是整句域都不显
         // 示——用户规则：候选=与实打编码精确对应的完成态组合。历轮案

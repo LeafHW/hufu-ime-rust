@@ -2,7 +2,6 @@
 
 use hufu_config::Config;
 use hufu_engine::{Engine, Session};
-use hufu_sentence::SentenceEngine;
 use hufu_types::{KeyCode, KeyInput, Modifiers};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -166,66 +165,13 @@ impl Host {
         ))
     }
 
-    /// 依据配置与磁盘可用性装配整句解码器。
-    /// **整句只属于「整句系」方案**（方案名含「整句」，与设置页的
-    /// 整句标签同约定）：其余方案一律不启用整句引擎——码表类方案
-    /// 与整句模型词典不匹配，混装只会空转耗内存。
-    pub fn setup_sentence(&mut self) {
-        let cur = self.engine.config.schema.current.clone();
-        if !cur.contains("整句") {
-            self.engine.set_sentence_decoder(None);
-            // 【拖入模型补装 2026-09-06】神经重排线程同理只在启动/配置
-            // 变更时建——小包先装、事后拖入 模型\qwen 的场景下线程从未
-            // 建起。这里补位：线程缺位且模型文件如今在 → 建线程（已有
-            // 线程不动，避免切方案反复重载几百 MB）。
-            self.ensure_rerank_if_late();
-            return;
-        }
-        let path = hufu_engine::Engine::resolve_data_sub(
-            &self.data_dir,
-            &self.engine.config.sentence.ngram_path,
-        );
-        if self.engine.config.sentence.enabled && path.exists() {
-            let mut weights = self.engine.config.sentence.weights.clone();
-            // 【数字编码 2026-09-05】按码表内容自动标记（同 sentence_plan）
-            weights.digit_codes = self.engine.schema.dict.digit_coded;
-            match SentenceEngine::load(
-                &path,
-                self.engine.schema.dict.clone(),
-                &self.engine.schema.supplement,
-                weights,
-            ) {
-                Ok(dec) => {
-                    let dec = std::sync::Arc::new(dec);
-                    // 预热：ngram bin 走 mmap，首次解码会整段触页（实测
-                    // 冷启动首键 ~490ms、热后同码 4ms）。加载后立刻空跑
-                    // 两次长 raw 解码把页拉进缓存：假码只触 trie 结构页，
-                    // 真实码组合才触 ngram 概率数据页（两者冷启都要付）。
-                    let _ = dec.decode_to_strings("buhuibuhuibuhuibuhuibuhuibuhui");
-                    let _ = dec.decode_to_strings("geaenwlcghxirlwddsyftuuuwwjjgffdd");
-                    self.engine.set_sentence_decoder(Some(dec));
-                    // 【用户词注入 2026-09-06】启动即注入（/jc 加词参与
-                    // 整句词图；后续 reload_user_data 热更）
-                    self.engine.sync_sentence_user_words();
-                    eprintln!("整句引擎已加载: {}", path.display());
-                    // 拖入模型补装：ngram 已就位，qwen 若也是事后拖入
-                    // 的则一并补建重排线程（见 ensure_rerank_if_late）。
-                    self.ensure_rerank_if_late();
-                    return;
-                }
-                Err(e) => eprintln!("整句模型加载失败: {e}"),
-            }
-        }
-        self.engine.set_sentence_decoder(None);
-        // 同上：切到整句方案但 ngram 仍缺（还没拖模型）——重排线程若也
-        // 缺位且 qwen 已在，顺手补建（两模型可以分两次拖入的场景）。
-        self.ensure_rerank_if_late();
-    }
-
-    /// 拖入模型补装（2026-09-06）：rerank 线程从未建起而模型文件如今
-    /// 在场 → 补建。已有线程不碰（防切方案反复重载）。配置关 rerank
-    /// 时 setup_rerank 自己会短路，这里无需再判。
-    fn ensure_rerank_if_late(&mut self) {
+    /// 【已删除 2026-09-11】setup_sentence（持锁同步载 546MB 模型，切方案
+    /// /重载码表/改配置路径全机打字卡死秒级）——全部调用点改经
+    /// main::reload_sentence_bg 后台装载（与启动路径同款：短锁决策、
+    /// 不持锁载、载完短锁热挂；期间码表模式服务）。语义保留两处：
+    /// ①非整句方案/模型缺位 → 拆旧解码器；②ensure_rerank_if_late
+    /// 拖入模型补装——已并入 reload_sentence_bg 的短锁段。
+    pub fn ensure_rerank_if_late(&mut self) {
         if self.rerank_tx.is_none() && self.resolve_rerank_model().is_some() {
             eprintln!("神经重排：检测到事后拖入的模型，补建重排线程");
             self.setup_rerank();
@@ -279,6 +225,14 @@ impl Host {
         std::thread::Builder::new()
             .name("hufu-rerank".into())
             .spawn(move || {
+                // 【线程自愈 2026-09-11】旧实现 panic（坏 GGUF 越界等）→
+                // rerank 线程死亡且无人重建，重排从此哑火直到重启。外层
+                // 监督循环：panic 兜住、落诊断、冷却后整线程重来（引擎随
+                // 每次重来重建）。连续 5 次恐慌（模型真坏）放弃——
+                // setup_rerank 下次配置变更仍可重建。
+                let mut panics: u32 = 0;
+                loop {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // ── 双引擎：优先虎爪 llama.cpp 原生（81ms/2cand），失败回落纯 Rust ──
                 // 两引擎同 GGUF 文件、同判序语义（native 侧 ctx 拼串整句概率，
                 // 句首/句中/成语三案实测全判对）。
@@ -332,9 +286,6 @@ impl Host {
                 // 键断流」。mmap 页落 standby 本就省内存，收缩只换来
                 // 任务管理器数字好看，代价是打字恢复卡顿——不值得。
                 const IDLE_UNLOAD_MIN: u64 = 30;
-                let trim_working_set = || {
-                    // 已废弃为空操作：见上注释②（工作集收缩有害无益）
-                };
                 let mut idle_secs: u64 = 0;
                 let mut loaded = native.is_some() || model.is_some();
                 let mut ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
@@ -442,11 +393,22 @@ impl Host {
                     order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
                     // GUI 子系统 eprintln 无人见——重排计时落文件（性能排查生命线）
+                    // 【轮转 2026-09-11】无上限增长 → 超 4MB 翻转 .old
                     let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                    const RERANK_LOG: &str = r"C:\ProgramData\HuFu\diag\rerank.log";
+                    if std::fs::metadata(RERANK_LOG)
+                        .map(|m| m.len() > 4 << 20)
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::rename(
+                            RERANK_LOG,
+                            r"C:\ProgramData\HuFu\diag\rerank.log.old",
+                        );
+                    }
                     let _ = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(r"C:\ProgramData\HuFu\diag\rerank.log")
+                        .open(RERANK_LOG)
                         .and_then(|mut f| {
                             use std::io::Write;
                             f.write_all(
@@ -465,11 +427,34 @@ impl Host {
                             )
                         });
                     if let Ok(mut c) = cache.lock() {
-                        if c.len() > 64 {
-                            c.clear();
+                        // 【近似 LRU 2026-09-11】旧实现超 64 全清（命中率
+                        // 周期性归零）。改逐条淘汰：满了先弹一条再插。
+                        if c.len() >= 64 {
+                            if let Some(k) = c.keys().next().cloned() {
+                                c.remove(&k);
+                            }
                         }
                         c.insert(cur.key, texts);
                     }
+                }
+                }));
+                match r {
+                    Ok(()) => break,
+                    Err(_) => {
+                        panics += 1;
+                        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                        let _ = std::fs::write(
+                            r"C:\ProgramData\HuFu\diag\rerank-panic.txt",
+                            format!("rerank 线程第 {panics} 次恐慌，冷却重建\n"),
+                        );
+                        eprintln!("神经重排线程恐慌（第 {panics} 次），1s 后重建");
+                        if panics >= 5 {
+                            eprintln!("神经重排线程连续恐慌达上限，停用（配置变更可重建）");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
                 }
             })
             .ok();
@@ -580,8 +565,14 @@ impl Host {
         serde_json::json!({ "outcome": outcome, "state": state })
     }
 
-    /// 应用新配置：落盘 + 热更新 + 必要时重装整句/重排。
-    pub fn apply_config(&mut self, cfg: Config) -> std::io::Result<()> {
+    /// 应用新配置：落盘 + 热更新 + 必要时重装重排。
+    /// 【返回值改造 2026-09-11】整句重建不再在此持锁同步做（旧
+    /// setup_sentence 载 546MB 模型秒级卡全机打字）——返回
+    /// (need_sentence_reload, teardown_old) 由调用方经
+    /// main::reload_sentence_bg 后台执行。teardown_old=方案变化（旧
+    /// 模型词典不符，须先拆）；sentence-only 变化（权重等）保留旧模型
+    /// 服务到新模型就位。
+    pub fn apply_config(&mut self, cfg: Config) -> std::io::Result<(bool, bool)> {
         let sentence_changed = cfg.sentence != self.engine.config.sentence;
         let rerank_changed = sentence_changed;
         let schema_changed = cfg.schema.current != self.engine.config.schema.current
@@ -602,13 +593,10 @@ impl Host {
             self.engine.apply_global_assets();
             self.session.clear();
         }
-        if sentence_changed || schema_changed {
-            self.setup_sentence();
-        }
         if rerank_changed {
             self.setup_rerank();
         }
-        Ok(())
+        Ok((sentence_changed || schema_changed, schema_changed))
     }
 
     /// 皮肤目录。

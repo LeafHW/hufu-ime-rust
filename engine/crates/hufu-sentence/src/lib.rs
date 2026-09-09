@@ -281,27 +281,22 @@ impl SentenceEngine {
             return false;
         }
         let tail_s: String = tail.iter().collect();
-        // 必须是某码的前缀
-        let any_prefix = self
-            .dict
-            .prefix_matches(&tail_s)
-            .iter()
-            .any(|(len, _)| *len >= tail.len());
-        if !any_prefix {
-            return false;
-        }
-        // 长尾不得恰为完整码
-        if tail.len() >= 2 {
-            let complete = self
-                .dict
-                .prefix_matches(&tail_s)
-                .iter()
-                .any(|(len, _)| *len == tail.len());
-            if complete {
-                return false;
+        // 【单次字典查询 2026-09-11】旧实现连查两次 prefix_matches
+        //（any_prefix 一次、complete 一次）——emit 期尾循环逐档调用，
+        // 白做一倍 Trie 走查。一轮判定两个条件。
+        let matches = self.dict.prefix_matches(&tail_s);
+        let mut any_prefix = false;
+        let mut complete = false;
+        for (len, _) in &matches {
+            if *len >= tail.len() {
+                any_prefix = true;
+            }
+            if tail.len() >= 2 && *len == tail.len() {
+                complete = true;
             }
         }
-        true
+        // 必须是某码的前缀；长尾不得恰为完整码
+        any_prefix && !complete
     }
 
     /// 核心解码（对齐 Rime decode_full + emit + build_early_commit_candidates）。
@@ -364,9 +359,24 @@ impl SentenceEngine {
             entries: Vec<(String, usize, bool)>,
         }
         let mut segs: Vec<Vec<Seg>> = vec![Vec::new(); n];
+        // 【修复 segs O(n²) 2026-09-11】原因：原先每个 pos 都重建
+        // base[pos..] 整串（下方码表 tail 与用户词 tail_s 两处，各
+        // O(n-pos)，n 个 pos 合计 O(n²) 字符拷贝+堆分配——外层逐 pos
+        // 遍历、内层每次从 pos 重扫到串尾）→ 手段：一次遍历建全文
+        // String + 每字符字节游标表 offs，pos 处 O(1) 借切片复用同一
+        // 尾串。切片内容与原重建逐字节相同（prefix_matches 在首个
+        // 失配字符处即停走，尾串传多长都不改变返回），语义等价。
+        let base_s: String = base.iter().collect();
+        let mut offs: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut byte_at = 0usize;
+        for &c in &base {
+            offs.push(byte_at);
+            byte_at += c.len_utf8();
+        }
+        offs.push(byte_at);
         for pos in start_pos..n {
-            let tail: String = base[pos..].iter().collect();
-            for (code_len, idxs) in self.dict.prefix_matches(&tail) {
+            let tail: &str = &base_s[offs[pos]..];
+            for (code_len, idxs) in self.dict.prefix_matches(tail) {
                 if code_len == 0 || pos + code_len > n {
                     continue;
                 }
@@ -417,7 +427,9 @@ impl SentenceEngine {
             // 码表段同规则。码表已有同码同词时跳过（去重）。
             if let Ok(uw) = self.user_words.read() {
                 if !uw.is_empty() {
-                    let tail_s: String = base[pos..].iter().collect();
+                    // 【修复 segs O(n²) 2026-09-11】同上：复用尾串切片，
+                    // 不再每个 pos 重建 tail_s 整串（O(n-pos)×n）。
+                    let tail_s: &str = tail;
                     for (code, text) in uw.iter() {
                         let cl = code.chars().count();
                         // 【码长放宽 2026-09-09】原 cl>4 一刀切拒收——虎码
@@ -858,7 +870,13 @@ impl SentenceEngine {
         } else {
             None
         };
-        let dbg = std::env::var("HUFU_INC_DEBUG").is_ok();
+        // 【修复 env 每调读 2026-09-11】原因：decode_cached 每次调用
+        //（= 每键解码）同步读 HUFU_INC_DEBUG——Windows 上 env::var 走
+        // 进程环境块+内部锁，热路径白读（decode_internal 内同类读取
+        // 已于 2026-09-08 移出循环改 OnceLock，此处漏网）→ 手段：同款
+        // OnceLock 一次定型。
+        static INC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dbg = *INC_DEBUG.get_or_init(|| std::env::var("HUFU_INC_DEBUG").is_ok());
         if dbg {
             let sp = resume.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
             eprintln!("[cache] raw={raw} start={sp}");
@@ -879,43 +897,12 @@ impl SentenceEngine {
         self.decode_cached(raw).hits.iter().map(|h| h.text.clone()).collect()
     }
 
-    /// 置信前缀提案（Rime confidence_proposal）：软最大前缀质量占比 ≥ 阈值的最长真前缀。
-    pub fn confidence_proposal(
-        &self,
-        cands: &[&SentenceHit],
-        threshold: f64,
-    ) -> String {
-        if cands.is_empty() {
-            return String::new();
-        }
-        let max_score = cands.iter().map(|c| c.confidence).fold(f64::NEG_INFINITY, f64::max);
-        let total: f64 = cands.iter().map(|c| (c.confidence - max_score).exp()).sum();
-        // 前缀质量（按字符前缀）
-        let mut prefix_mass: Vec<(Vec<char>, f64)> = Vec::new(); // (prefix chars, mass)
-        for c in cands {
-            let weight = (c.confidence - max_score).exp();
-            let chars = chars_of(&c.text);
-            let mut prefix: Vec<char> = Vec::new();
-            for l in 1..chars.len().saturating_sub(1) + 1 {
-                if l > chars.len() - 1 {
-                    break;
-                }
-                prefix.push(chars[l - 1]);
-                if let Some((_, m)) = prefix_mass.iter_mut().find(|(p, _)| *p == prefix) {
-                    *m += weight;
-                } else {
-                    prefix_mass.push((prefix.clone(), weight));
-                }
-            }
-        }
-        let mut proposal: Vec<char> = Vec::new();
-        for (p, m) in &prefix_mass {
-            if m / total >= threshold && p.len() > proposal.len() {
-                proposal = p.clone();
-            }
-        }
-        proposal.into_iter().collect()
-    }
+    // 【去重 confidence_proposal 2026-09-11】此处原有一份
+    // confidence_proposal 方法实现，与 hufu_engine::confidence_proposal
+    // 自由函数近似重复（后者多返回份额值，且为全仓库唯一被使用的版本：
+    // hufu-engine 提前上屏与 examples/sentenceprobe 均调用它；本方法
+    // 无任何调用点，系迁移残余）→ 删除副本，调用点统一走
+    // hufu_engine::confidence_proposal。
 }
 
 impl SentenceDecoder for SentenceEngine {

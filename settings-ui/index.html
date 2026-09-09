@@ -499,7 +499,7 @@ function bindInputs() {
     tm.value = CFG.input.tab_clear === false ? "nav" : "clear";
     tm.onchange = async () => {
       CFG.input.tab_clear = tm.value !== "nav";
-      try { await api("POST", "/api/config", CFG); msg(tm.value === "nav" ? "Tab=选重导航 ✓（高亮下一候选，空格上屏）" : "Tab=清屏 ✓", "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
+      try { await saveConfig(); msg(tm.value === "nav" ? "Tab=选重导航 ✓（高亮下一候选，空格上屏）" : "Tab=清屏 ✓", "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
     };
   }
   // #c-v（竖排候选）在 bindSkin 里接皮肤 layout.horizontal，不绑 config
@@ -560,7 +560,7 @@ function bindInputs() {
     $(selId).onchange = async e => {
       try {
         fn(e.target.value);
-        await api("POST", "/api/config", CFG);
+        await saveConfig();
         msg("已切换并生效 ✓", "ok");
       } catch (err) { msg(err.message, "err"); }
     };
@@ -613,12 +613,89 @@ $("#w-reset").onclick = async () => {
     Object.assign(CFG.sentence.weights, W_DEFAULTS);
     CFG.sentence.early_need = 2; /* 恢复为 1.4.8 出厂档 */
     buildSliders();
-    await api("POST", "/api/config", CFG);
+    await saveConfig();
     msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
   } catch (e) { msg(e.message, "err"); }
 };
 
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+/* 【修复标签 2026-09-11】XSS：esc 补单引号转义（& < > " ' 全覆盖，属性插值双保险） */
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/* ── 【修复标签 2026-09-11】保存收口：数字 clamp + 导入校验 ──
+   ① 所有数值配置保存前统一钳制（NaN/越界 → 界内），不只改显示。
+     上限取任务规定值与滑杆/Rust scale_geometry 上限（同源，lib.rs:265）
+     的较大者，保证不截断 UI 可达的合法值（如 margin 滑杆上限 60）。
+   ② saveConfig/saveSkin 是 POST /api/config、/api/skin 的唯一出口：
+     后端 apply_config（main.rs:575）整体替换 self.engine.config = cfg，
+     不做字段合并——必须全量发送，不可改为只发变更字段；收集变更仍
+     在内存 CFG/SKIN，动作触发时一次全量发送（与原行为一致，仅收口）。 */
+const clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
+const NUM_CLAMPS = {
+  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100] },
+  layout: {
+    font_point: [8, 72], label_font_point: [0, 72], width: [0, 1200], min_width: [0, 1200],
+    margin_x: [0, 60], margin_y: [0, 60], corner_radius: [0, 40], hilited_corner_radius: [0, 40],
+    spacing: [0, 48], candidate_spacing: [0, 48], hilite_spacing: [0, 48], hilite_padding: [0, 40],
+    line_spacing: [0, 40], border_width: [0, 12], shadow_radius: [0, 60],
+    shadow_offset_x: [-5, 5], shadow_offset_y: [-5, 5], blur_radius: [0, 100],
+  },
+  material: {
+    opacity: [0, 1], darken: [0, 1], noise: [0, 1],
+    master_alpha: [0, 1], hilite_alpha: [0, 1], shadow_alpha: [0, 1], border_alpha: [0, 1],
+    glass_alpha: [0, 1], glass_shadow_alpha: [0, 1], glass_shadow_size: [2, 16],
+  },
+};
+function sanitizeConfig(c) {
+  if (!c) return;
+  for (const p in NUM_CLAMPS.config) {
+    if (typeof getP(c, p) === "number") setP(c, p, clampNum(getP(c, p), NUM_CLAMPS.config[p][0], NUM_CLAMPS.config[p][1]));
+  }
+}
+function sanitizeSkin(s) {
+  if (!s) return;
+  for (const sec of ["layout", "material"]) {
+    const o = s[sec]; if (!o) continue;
+    for (const k in NUM_CLAMPS[sec]) {
+      if (typeof o[k] === "number") o[k] = clampNum(o[k], NUM_CLAMPS[sec][k][0], NUM_CLAMPS[sec][k][1]);
+    }
+  }
+}
+const saveConfig = () => { sanitizeConfig(CFG); return api("POST", "/api/config", CFG); };
+const saveSkin = () => { sanitizeSkin(SKIN); return api("POST", "/api/skin", SKIN); };
+
+/* 【修复标签 2026-09-11】导入校验：hufu config 12 节必须齐全且类型对
+   （后端 serde(default) 整体替换——缺节会静默回出厂值，前端先拦）；
+   非法一律 alert 且不应用 */
+const CFG_SECTIONS = ["general", "schema", "input", "candidates", "reverse", "sentence", "punct", "clipboard", "appearance", "sound", "opencc", "user"];
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/;
+function validateConfig(c) {
+  if (typeof c !== "object" || c === null || Array.isArray(c)) return "顶层必须是 JSON 对象";
+  for (const sec of CFG_SECTIONS)
+    if (typeof c[sec] !== "object" || c[sec] === null || Array.isArray(c[sec]))
+      return `缺少配置节 "${sec}"（后端整体替换，缺节将回出厂值）`;
+  if (typeof c.schema.current !== "string") return "schema.current 必须是字符串";
+  const numFields = [["input", "max_code_length"], ["candidates", "page_size"], ["candidates", "delay_show_ms"], ["sound", "volume"], ["appearance", "font_size"]];
+  for (const [sec, key] of numFields)
+    if (c[sec][key] !== undefined && typeof c[sec][key] !== "number") return `${sec}.${key} 必须是数字`;
+  return null;
+}
+/* weasel 导入：后端 from_weasel_colors（lib.rs:388）只消费数字色值
+   （0xAABBGGRR）。#RRGGBB 6 位串可无歧义换算（后端 ≤0xFFFFFF 自动补 FF）
+   故接受并转换；8 位串端序有歧义（AA 前置还是 RR 前置）→ 拒绝并提示。 */
+const WEASEL_COLOR_KEYS = ["back_color", "border_color", "text_color", "preedit_back_color", "candidate_text_color", "candidate_back_color", "comment_text_color", "label_color", "hilited_text_color", "hilited_back_color", "hilited_candidate_text_color", "hilited_candidate_back_color", "hilited_candidate_label_color", "hilited_comment_text_color", "hilited_label_color", "hilited_mark_color", "shadow_color"];
+function validateWeaselColors(colors) {
+  if (typeof colors !== "object" || colors === null || Array.isArray(colors)) return { err: "配色必须是 JSON 对象" };
+  const out = Object.assign({}, colors); let n = 0;
+  for (const k of WEASEL_COLOR_KEYS) {
+    const v = colors[k]; if (v === undefined) continue;
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) { n++; continue; }
+    const m = typeof v === "string" ? /^#?([0-9a-fA-F]{6})$/.exec(v.trim()) : null;
+    if (m) { out[k] = parseInt(m[1].slice(4, 6) + m[1].slice(2, 4) + m[1].slice(0, 2), 16); n++; }
+    else return { err: `颜色 "${k}" 非法：须为数字（0xAABBGGRR）或 #RRGGBB 串（${HEX_COLOR_RE} 的 6 位形式）` };
+  }
+  if (!n) return { err: "未发现任何可识别的颜色字段（back_color/text_color 等 17 项）" };
+  return { colors: out };
+}
 
 /* ── 方案 ── */
 async function loadSchemas() {
@@ -717,13 +794,13 @@ function buildColorGrid() {
     const ci = g.querySelector(`#ck-${k}`);
     const sync = () => { ci.value = hexOf(SKIN.colors[k] || "#000000"); };
     ci.oninput = () => { SKIN.colors[k] = ci.value + "FF"; preview(); };
-    ci.onchange = () => api("POST", "/api/skin", SKIN).catch(() => {});
+    ci.onchange = () => saveSkin().catch(() => {});
     sync();
   });
 }
 function bindSkin() {
   $$("[data-skin]").forEach(el => { el.value = SKIN[el.dataset.skin] ?? ""; el.oninput = () => SKIN[el.dataset.skin] = el.value; });
-  const saveSkinQuiet = async () => { try { await api("POST", "/api/skin", SKIN); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
+  const saveSkinQuiet = async () => { try { await saveSkin(); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
   // 【纯色模型·用户定稿】不再有材质（kind/tint/暗化/旧透明度全撤）：
   // 窗底=colors.back_color（alpha×整体透明度）、高亮底=自带alpha×高亮
   // 透明度、其余非文字元素=自带alpha×整体透明度；文字 alpha 恒满。
@@ -913,7 +990,7 @@ function bindSkin() {
     si.onchange = async () => {
       CFG.candidates.show_index = si.checked;
       try {
-        await api("POST", "/api/config", CFG);
+        await saveConfig();
         preview();
         msg(si.checked ? "候选序号已开启 ✓" : "候选序号已隐藏 ✓", "ok");
       } catch (e) { msg("保存失败：" + e.message, "err"); }
@@ -949,7 +1026,7 @@ function bindSkin() {
   af.value = SKIN.layout.font_face || "";
   asz.value = SKIN.layout.font_point;
   const saveSkinNow = async () => {
-    try { await api("POST", "/api/skin", SKIN); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
+    try { await saveSkin(); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
   };
   af.onchange = () => { SKIN.layout.font_face = af.value.trim(); saveSkinNow(); };
   // 【序号字级联动 2026-09-08】字号变化时若联动开启，序号字级按原比例
@@ -1014,10 +1091,13 @@ function bindSkin() {
   }
   // ② 恢复默认值：颜色/布局/材质回出厂（保留皮肤 ID/名称/作者）
   {
+    /* 【修复标签 2026-09-11】前端默认对齐 Rust 真值：Layout::default
+       （lib.rs:302/305）margin_y=6.0、hilite_spacing=4.0（原 5/2 与渲染
+       默认不一致）；MaterialConfig::default（lib.rs:140）补 glass_alpha=0.0 */
     const F = {
-      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 12, shadow_offset_x: 0, shadow_offset_y: 0, blur_level: "low", mark_text: "·" },
+      layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 6, spacing: 6, candidate_spacing: 4, hilite_spacing: 4, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 12, shadow_offset_x: 0, shadow_offset_y: 0, blur_level: "low", mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
-      material: { kind: "solid", tint: "#1C1C1E00", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_shadow_alpha: 0.38, glass_shadow_size: 6 },
+      material: { kind: "solid", tint: "#1C1C1E00", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_alpha: 0, glass_shadow_alpha: 0.38, glass_shadow_size: 6 },
     };
     $("#skin-reset").onclick = async () => {
       try {
@@ -1041,7 +1121,7 @@ function bindSkin() {
           SKIN.material = JSON.parse(JSON.stringify(F.material));
         }
         bindSkin(); buildColorGrid(); preview();
-        await api("POST", "/api/skin", SKIN);
+        await saveSkin();
         msg(isOfficial
           ? `已恢复「${SKIN.name || SKIN.id}」的出厂配置并保存生效 ✓`
           : "自建皮肤：已恢复为统一默认布局/配色（ID/名称保留）✓", "ok");
@@ -1061,11 +1141,13 @@ function preview() {
   const ha = Math.max(0, Math.min(1, M.hilite_alpha ?? 1));
   const sAlpha = Math.max(0, Math.min(1, M.shadow_alpha ?? 1));
   const bAlpha = Math.max(0, Math.min(1, M.border_alpha ?? 1));
-  const elemA = hex => withA(hex.slice(0, 7), Math.round(ma * 255));
-  const hiA = hex => withA(hex.slice(0, 7), Math.round(ha * 255));
-  const shA = hex => withA(hex.slice(0, 7), Math.round(sAlpha * 255)); // 阴影独立
-  const bdA = hex => withA(hex.slice(0, 7), Math.round(bAlpha * 255)); // 边框独立
-  const solid = hex => hex.slice(0, 7); // 文字恒不透明
+  /* 【修复标签 2026-09-11】XSS：色值出自皮肤文件（用户可改 JSON），经
+     innerHTML 的 style 属性插值——统一 esc()（合法 #RRGGBBAA 不受影响） */
+  const elemA = hex => esc(withA(hex.slice(0, 7), Math.round(ma * 255)));
+  const hiA = hex => esc(withA(hex.slice(0, 7), Math.round(ha * 255)));
+  const shA = hex => esc(withA(hex.slice(0, 7), Math.round(sAlpha * 255))); // 阴影独立
+  const bdA = hex => esc(withA(hex.slice(0, 7), Math.round(bAlpha * 255))); // 边框独立
+  const solid = hex => esc(hex.slice(0, 7)); // 文字恒不透明
   // 边框预览 = 真窗消费键（elemA 只处理 hex 色值——先定义后使用，防 TDZ）
   const border = L.border_width > 0 ? `${L.border_width}px solid ${bdA(c.border_color)}` : "none";
   const bgc = elemA(c.back_color);
@@ -1111,7 +1193,7 @@ function preview() {
     return k === 10 ? 0 : k;
   };
   const fmtLbl = n => { const f = L.label_format || "%s."; const d = lblDigits(n); return f.includes("%s") ? f.replace("%s", d) : d + "."; };
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius}px;padding:${L.hilite_padding}px;` : `padding:${L.hilite_padding}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${fmtLbl(i)}</span>` : ""}${t}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${cmt}</span>` : ""}</div>`;
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${esc(L.hilited_corner_radius)}px;padding:${esc(L.hilite_padding)}px;` : `padding:${esc(L.hilite_padding)}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${esc(fmtLbl(i))}</span>` : ""}${esc(t)}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${esc(cmt)}</span>` : ""}</div>`;
   inner.innerHTML =
     `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
@@ -1208,7 +1290,7 @@ document.addEventListener("visibilitychange", () => {
 
 $("#btn-save").onclick = async () => {
   try {
-    await api("POST", "/api/config", CFG);
+    await saveConfig();
     msg("已保存并应用 ✓", "ok"); await refreshInfo();
   } catch (e) { msg(e.message, "err"); }
 };
@@ -1218,7 +1300,7 @@ $("#s-test-go").onclick = async () => {
   const raw = $("#s-test-in").value.trim(); if (!raw) return;
   try {
     // 先应用当前权重
-    await api("POST", "/api/config", CFG);
+    await saveConfig();
     const r = await api("POST", "/api/sentence_test", { raw });
     $("#s-test-out").innerHTML = r.candidates.length
       ? r.candidates.slice(0, 8).map((t, i) => (i === 0 ? "<b>" : "") + esc(t) + (i === 0 ? "</b>" : "")).join("　·　")
@@ -1228,7 +1310,7 @@ $("#s-test-go").onclick = async () => {
 };
 
 $("#skin-save").onclick = async () => {
-  try { const r = await api("POST", "/api/skin", SKIN); msg("皮肤已保存 ✓", "ok"); await loadSkinList(SKIN.id); }
+  try { const r = await saveSkin(); msg("皮肤已保存 ✓", "ok"); await loadSkinList(SKIN.id); }
   catch (e) { msg(e.message, "err"); }
 };
 $("#skin-new").onclick = () => {
@@ -1237,10 +1319,16 @@ $("#skin-new").onclick = () => {
   bindSkin(); preview(); msg("已复制为新皮肤，保存后生效");
 };
 $("#weasel-import").onclick = async () => {
+  /* 【修复标签 2026-09-11】导入校验：JSON.parse 后先结构校验（颜色须为
+     数字/#RRGGBB），非法弹 alert 不应用，不再直接提交后端 */
+  let colors;
+  try { colors = JSON.parse($("#weasel-in").value); }
+  catch (e) { alert("导入失败：JSON 解析错误 " + e.message); return; }
+  const r = validateWeaselColors(colors);
+  if (r.err) { alert("导入失败：" + r.err); return; }
   try {
-    const colors = JSON.parse($("#weasel-in").value);
     const id = "weasel-" + Date.now().toString(36);
-    SKIN = await api("POST", "/api/weasel_import", { id, colors });
+    SKIN = await api("POST", "/api/weasel_import", { id, colors: r.colors });
     bindSkin(); buildColorGrid(); preview(); msg("weasel 配色已导入，保存后生效", "ok");
   } catch (e) { msg("导入失败：" + e.message, "err"); }
 };
@@ -1269,13 +1357,24 @@ $("#exp-dl").onclick = () => {
 };
 $("#imp-btn").onclick = () => $("#imp-file").click();
 $("#imp-file").onchange = async ev => {
+  /* 【修复标签 2026-09-11】导入校验：文件导入先结构校验（12 节齐全、
+     类型对），非法弹 alert 不应用（后端整体替换，缺节会回出厂值） */
   const f = ev.target.files[0]; if (!f) return;
-  try { CFG = JSON.parse(await f.text()); await $("#btn-save").click(); }
-  catch (e) { msg("导入失败：" + e.message, "err"); }
+  let c;
+  try { c = JSON.parse(await f.text()); }
+  catch (e) { alert("导入失败：JSON 解析错误 " + e.message); return; }
+  const err = validateConfig(c);
+  if (err) { alert("导入已取消：" + err); return; }
+  CFG = c; await $("#btn-save").click();
 };
 $("#cfg-apply").onclick = async () => {
-  try { CFG = JSON.parse($("#cfg-raw").value); await $("#btn-save").click(); }
-  catch (e) { msg("JSON 无效：" + e.message, "err"); }
+  /* 【修复标签 2026-09-11】导入校验：文本框应用同文件导入——先校验后应用 */
+  let c;
+  try { c = JSON.parse($("#cfg-raw").value); }
+  catch (e) { alert("JSON 无效：" + e.message); return; }
+  const err = validateConfig(c);
+  if (err) { alert("未应用：" + err); return; }
+  CFG = c; await $("#btn-save").click();
 };
 
 async function init() {

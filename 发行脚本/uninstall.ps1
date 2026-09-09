@@ -16,7 +16,9 @@ try {
 } catch {}
 $hklm = $isAdmin
 if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
-    $ps = Join-Path $PSHOME 'powershell.exe'
+    # 【修复标签 2026-09-11】$PSHOME 在 pwsh7 下指向 pwsh 目录（无 powershell.exe，
+    # 提权重启会失败）→ 改固定 Windows PowerShell 路径（与 install.ps1 提权路径一致）（任务6）。
+    $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     Start-Process $ps -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Wait
     exit
 }
@@ -83,7 +85,8 @@ if ($hklm) {
         }
     }
     # 诊断画像（load-*/act-*.txt，几十 KB）
-    Remove-Item 'C:\ProgramData\HuFu' -Recurse -Force -ErrorAction SilentlyContinue
+    # 【修复标签 2026-09-11】硬编码盘符路径 C:\ProgramData → $env:ProgramData 推导（任务5）
+    Remove-Item (Join-Path $env:ProgramData 'HuFu') -Recurse -Force -ErrorAction SilentlyContinue
 }
 # 临时安装/提权日志（%TEMP%\hufu-*.log）
 Get-ChildItem "$env:TEMP\hufu-*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue

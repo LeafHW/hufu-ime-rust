@@ -12,7 +12,10 @@ const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
 const BUF: usize = 1 << 20;
 
 /// 分派一个操作。返回 JSON 响应。
-pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Value {
+/// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
+/// 反查，不可伪造）——敏感操作（剪贴板读取）的白名单以此为准；None =
+/// 反查不可用（unix 回退/极端失败），退回客户端自报值。
+pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<&str>) -> serde_json::Value {
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     match req.get("op").and_then(|o| o.as_str()).unwrap_or("") {
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
@@ -22,10 +25,11 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
                 host.session.line_end_hint =
                     req.get("line_end").and_then(|v| v.as_bool()).unwrap_or(false);
                 let mut r = host.process_key(k);
-                // Ctrl+M 切方案：落盘 + 重装整句（与 HTTP /api/schema 行为一致）
+                // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
+                // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）
                 if host.engine.config.schema.current != schema_before {
                     let _ = host.engine.config.save(&host.config_path);
-                    host.setup_sentence();
+                    crate::reload_sentence_bg(true, false);
                 }
                 // 【重排派发去重 2026-09-08】process_key 内部已调
                 // after_ime_op（host.rs）——此处再调=每键双份 RerankJob
@@ -204,7 +208,8 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if !name.is_empty() && host.engine.switch_schema(name).is_ok() {
                 host.session.clear();
-                host.setup_sentence();
+                // 【卡死修复】后台重建整句（不持锁载 546MB 模型）
+                crate::reload_sentence_bg(true, false);
                 let _ = host.engine.config.save(&host.config_path);
             }
             let dir = hufu_engine::Engine::resolve_data_sub(
@@ -231,7 +236,8 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             let ok = host.engine.switch_schema(&name).is_ok();
             if ok {
                 host.session.clear();
-                host.setup_sentence();
+                // 【卡死修复】后台重建整句（重读补充语料语义）
+                crate::reload_sentence_bg(true, true);
             }
             serde_json::json!({"ok": ok, "current": name})
         }
@@ -299,7 +305,25 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             let sel = req.get("selected").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
             let x = req.get("x").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
             let y = req.get("y").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
-            let skin = req.get("skin").cloned().unwrap_or(serde_json::Value::Null);
+            // 【皮肤缓存 2026-09-11】DLL 侧仅换肤/首推/重推时携带
+            // "skin"（逐帧全量推送是 KB 级管道浪费——对齐 tsf.rs 的
+            // srv_skin_ver_pushed 去重）；缺省沿用上帧皮肤。
+            static LAST_SKIN: std::sync::Mutex<Option<serde_json::Value>> =
+                std::sync::Mutex::new(None);
+            let skin = match req.get("skin") {
+                Some(v) if !v.is_null() => {
+                    let v = v.clone();
+                    if let Ok(mut c) = LAST_SKIN.lock() {
+                        *c = Some(v.clone());
+                    }
+                    v
+                }
+                _ => LAST_SKIN
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.clone())
+                    .unwrap_or(serde_json::Value::Null),
+            };
             crate::candwin::show(
                 crate::candwin::CandFrame { items, raw, selected: sel, skin },
                 x,
@@ -334,8 +358,11 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value) -> serde_json::Valu
             if !cfg.enabled {
                 return serde_json::json!({"text": null, "reason": "disabled"});
             }
-            let exe = req.get("exe").and_then(|t| t.as_str()).unwrap_or("");
-            let exe = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+            // 【白名单反查 2026-09-11】旧实现信客户端自报 exe（任意进程
+            // 谎报即过白名单）。优先用服务端反查的管道对端映像名。
+            let claimed = req.get("exe").and_then(|t| t.as_str()).unwrap_or("");
+            let exe_ref: &str = client_exe.unwrap_or(claimed);
+            let exe = exe_ref.rsplit(['\\', '/']).next().unwrap_or(exe_ref);
             if !cfg.allows(exe) {
                 return serde_json::json!({"text": null, "reason": "whitelist"});
             }
@@ -430,6 +457,43 @@ mod imp {
         s.encode_utf16().chain([0]).collect()
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetNamedPipeClientProcessId(pipe: isize, pid: *mut u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            proc: isize,
+            flags: u32,
+            name: *mut u16,
+            len: *mut u32,
+        ) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    /// 管道对端进程映像名（服务端反查，客户端无法伪造）。失败返回 None。
+    fn client_process_exe(h: isize) -> Option<String> {
+        unsafe {
+            let mut pid: u32 = 0;
+            if GetNamedPipeClientProcessId(h, &mut pid) == 0 {
+                return None;
+            }
+            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if proc == 0 {
+                return None;
+            }
+            let mut buf = [0u16; 512];
+            let mut len: u32 = 512;
+            let ok = QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(proc);
+            if ok == 0 {
+                return None;
+            }
+            let s = String::from_utf16_lossy(&buf[..len as usize]);
+            let base = s.rsplit(['\\', '/']).next().unwrap_or(&s).to_string();
+            Some(base)
+        }
+    }
+
     fn read_exact(h: isize, n: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
         let mut done = 0usize;
@@ -463,6 +527,8 @@ mod imp {
 
     /// 单连接处理：读帧 → 派发 → 写帧，直至断开。
     fn serve_conn(h: isize, host: &Mutex<Host>) {
+        // 对端进程名：本连接生命周期内不变，一次反查全程使用
+        let client_exe = client_process_exe(h);
         loop {
             let head = match read_exact(h, 4) {
                 Ok(b) => b,
@@ -478,10 +544,36 @@ mod imp {
             };
             let req: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
-                Err(e) => serde_json::json!({"error": e.to_string()}),
+                // 【错误信封 2026-09-11】坏 JSON 不再当请求喂 dispatch 靠
+                // op="" 巧合落错——直接回错误，连接保活
+                Err(e) => {
+                    let resp = serde_json::json!({"error": format!("无效 JSON: {e}")});
+                    let out = serde_json::to_vec(&resp).unwrap_or_default();
+                    if out.len() <= BUF {
+                        let mut frame = (out.len() as u32).to_le_bytes().to_vec();
+                        frame.extend_from_slice(&out);
+                        if write_all(h, &frame).is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
             };
-            let resp = dispatch(host, &req);
-            let mut out = serde_json::to_vec(&resp).unwrap_or_default();
+            // 【panic 防护 2026-09-11】dispatch 内 panic（坏模型数据等）
+            // 旧实现直接穿越 → 本 serve_conn 的 Disconnect/Close 被跳过
+            //（管道实例泄漏，上限 255）。兜住：按错误响应写出，连接
+            // 生命周期照常走完。主机线程不再被单帧毒死。
+            let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch(host, &req, client_exe.as_deref())
+            })) {
+                Ok(v) => v,
+                Err(_) => serde_json::json!({"error": "服务内部错误（已恢复）"}),
+            };
+            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|_| {
+                // 【Zero-length frame fix 2026-09-11】Old implementation wrote a len=0 frame on serialization failure
+                //(client interprets as disconnect) — write minimal error JSON instead
+                b"{\"error\":\"resp serialize failed\"}".to_vec()
+            });
             if out.len() > BUF {
                 out = serde_json::json!({"error": "响应过大"}).to_string().into_bytes();
             }
@@ -552,7 +644,14 @@ mod imp {
                 )
             };
             if h == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error());
+                // 【生命线重试 2026-09-11】旧实现直接 return Err → 监听
+                // 线程永久退出，进程活着但输入法瘫痪（与下方「绝不退出」
+                // 注释自相矛盾）。退避重试（100ms 起、上限 5s），除非进程
+                // 正在退出。
+                let err = std::io::Error::last_os_error();
+                eprintln!("管道创建失败: {err}，退避重试");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
             }
             if unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) } == 0 {
                 let err = std::io::Error::last_os_error();
@@ -615,7 +714,7 @@ mod unix_imp {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             };
-            let resp = dispatch(host, &req);
+            let resp = dispatch(host, &req, None);
             let out = serde_json::to_vec(&resp).unwrap_or_default();
             let mut frame = (out.len() as u32).to_le_bytes().to_vec();
             frame.extend_from_slice(&out);

@@ -384,8 +384,20 @@ impl Skin {
             .unwrap_or(id)
             .to_string();
         let colors = &mut skin.colors;
+        // 【字符串颜色兼容 2026-09-11】weasel 社区配置常见 "0xC0303030"
+        // 字符串形式——旧实现 as_u64 返回 None 整色静默丢弃（连 RGB
+        // 都不导入）。兼容解析 0x 前缀十进制/hex 字符串。
+        let field_u64 = |field: &str| -> Option<u64> {
+            let v = scheme.get(field)?;
+            if let Some(u) = v.as_u64() {
+                return Some(u);
+            }
+            let s = v.as_str()?.trim();
+            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        };
         let mut set = |field: &str, slot: &mut Color| {
-            if let Some(v) = scheme.get(field).and_then(|v| v.as_u64()) {
+            if let Some(v) = field_u64(field) {
                 let raw = v as u32;
                 let a = if (raw >> 24) == 0 && raw <= 0xFFFFFF { 0xFF } else { (raw >> 24) as u8 };
                 *slot = Color([raw as u8, (raw >> 8) as u8, (raw >> 16) as u8, a]);

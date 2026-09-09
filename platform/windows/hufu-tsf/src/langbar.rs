@@ -260,9 +260,21 @@ fn advise_conversion(cm: Option<ITfCompartmentMgr>, _tid: u32) {
         let Ok(src) = comp.cast::<ITfSource>() else {
             return;
         };
+        // 【cookie 重挂防泄漏 2026-09-11】旧实现 advise 后丢弃 cookie
+        //（注释称「进程存续期常驻」）——但本函数在每次 Activate 都跑：
+        // ctfmon 重启/宿主反复激活会向同一 compartment 重复挂 sink，
+        // 旧 sink 永不摘除（泄漏+重复回调）。先 Unadvise 旧 cookie。
+        thread_local! {
+            static CONV_COOKIE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let old = CONV_COOKIE.with(|c| c.replace(0));
+        if old != 0 {
+            let _ = src.UnadviseSink(old);
+        }
         let sink: ITfCompartmentEventSink = ModeSink {}.into();
-        let _ = src.AdviseSink(&ITfCompartmentEventSink::IID, &sink);
-        // cookie 不存（进程存续期常驻；Deactivate 只摘线程那份）
+        if let Ok(cookie) = src.AdviseSink(&ITfCompartmentEventSink::IID, &sink) {
+            CONV_COOKIE.with(|c| c.set(cookie));
+        }
     }
 }
 
@@ -338,6 +350,26 @@ impl HuFuLangBar {
         HuFuLangBar {
             icon_zh: make_glyph_icon("虎"),
             icon_en: make_glyph_icon("虎"),
+        }
+    }
+}
+
+impl Drop for HuFuLangBar {
+    fn drop(&mut self) {
+        // 【HICON 泄漏修复 2026-09-11】new() 每次 Activate 建两个
+        // HICON，RemoveItem 后 COM 引用清零触发 Drop——旧实现不
+        // 销毁，ctfmon 重启/宿主反复激活循环下逐轮泄漏。
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn DestroyIcon(h: isize) -> i32;
+        }
+        unsafe {
+            if self.icon_zh != 0 {
+                let _ = DestroyIcon(self.icon_zh);
+            }
+            if self.icon_en != 0 {
+                let _ = DestroyIcon(self.icon_en);
+            }
         }
     }
 }

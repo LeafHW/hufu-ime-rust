@@ -125,6 +125,7 @@ extern "system" {
     ) -> i32;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+    fn GetDpiForWindow(hwnd: isize) -> u32;
 }
 
 #[link(name = "gdi32")]
@@ -155,7 +156,10 @@ extern "system" {
 /// hex → RGBA(0-255)；#RRGGBB 视为不透明
 fn parse_hex4(s: &str) -> Option<(u8, u8, u8, u8)> {
     let s = s.trim_start_matches('#');
-    if s.len() != 6 && s.len() != 8 {
+    // 【panic 防护 2026-09-11】与 candwin2 同款：非 ASCII 颜色串（手改
+    // 皮肤含中文，两个 3 字节汉字恰 6 字节）按 &str 字节切片会切进
+    // UTF-8 字符中间 panic——渲染线程 panic=进程崩。先校验 ASCII。
+    if !s.is_ascii() || (s.len() != 6 && s.len() != 8) {
         return None;
     }
     let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
@@ -337,30 +341,36 @@ fn composite_text(
 }
 
 /// 渲染整帧 → (w_out, h_out, BGRA 预乘字节, shadow_m)
-fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
+/// `scale`：DPI 缩放（GetDpiForWindow/96，进程已声明 Per-Monitor V2）。
+/// 【DPI 修复 2026-09-11】旧实现把 96-DPI 逻辑像素当物理像素——
+/// 150%/200% 屏候选窗整体偏小、与 candwin2 观感不一致。全部布局
+/// 值统一乘 scale（与 candwin2 的位图×scale 同语义）。
+fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
     let skin = &f.skin;
+    let s = scale.max(0.5).min(4.0);
 
     // ── 皮肤参数（与 candwin2 show() 同公式）──
     let font_pt = skin_layout(skin, "font_point", 16.0);
-    let radius = skin_layout(skin, "corner_radius", 8.0);
-    let margin_x = skin_layout(skin, "margin_x", 8.0);
-    let margin_y = skin_layout(skin, "margin_y", 5.0);
-    let line_h = font_pt * 96.0 / 72.0 + skin_layout(skin, "line_spacing", 3.0) + 5.0;
-    let width_cfg = skin_layout(skin, "width", 0.0);
-    let min_width = skin_layout(skin, "min_width", 150.0).max(100.0);
-    let label_pt = skin_layout(skin, "label_font_point", 0.0);
-    let em = font_pt * 96.0 / 72.0;
-    let cand_spacing = skin_layout(skin, "candidate_spacing", 6.0);
-    let hilite_pad = skin_layout(skin, "hilite_padding", 4.0);
-    let hi_radius = skin_layout(skin, "hilited_corner_radius", 6.0);
+    let radius = skin_layout(skin, "corner_radius", 8.0) * s;
+    let margin_x = skin_layout(skin, "margin_x", 8.0) * s;
+    let margin_y = skin_layout(skin, "margin_y", 5.0) * s;
+    let line_h =
+        (font_pt * 96.0 / 72.0 + skin_layout(skin, "line_spacing", 3.0) + 5.0) * s;
+    let width_cfg = skin_layout(skin, "width", 0.0) * s;
+    let min_width = (skin_layout(skin, "min_width", 150.0) * s).max(100.0);
+    let label_pt = skin_layout(skin, "label_font_point", 0.0) * s;
+    let em = font_pt * 96.0 / 72.0 * s;
+    let cand_spacing = skin_layout(skin, "candidate_spacing", 6.0) * s;
+    let hilite_pad = skin_layout(skin, "hilite_padding", 4.0) * s;
+    let hi_radius = skin_layout(skin, "hilited_corner_radius", 6.0) * s;
     let show_index = skin
         .get("show_index")
         .and_then(|x| x.as_bool())
         .unwrap_or(true);
-    let label_w = if show_index { 26.0f32 } else { 0.0 };
+    let label_w = if show_index { 26.0f32 * s } else { 0.0 };
 
     // 投影（多层外扩衰减）
-    let shadow_radius = skin_layout(skin, "shadow_radius", 6.0).clamp(0.0, 24.0);
+    let shadow_radius = (skin_layout(skin, "shadow_radius", 6.0) * s).clamp(0.0, 24.0 * s);
     // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（与 DLL 侧钳制
     // 同款——server 代画窗也保持一致语义）
     let kind_early = skin
@@ -371,35 +381,19 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
     let shadow_off_y = if kind_early == "glass" {
         0.0
     } else {
-        skin_layout(skin, "shadow_offset_y", 0.0)
+        skin_layout(skin, "shadow_offset_y", 0.0) * s
     };
     let has_shadow = shadow_radius >= 1.0;
     let shadow_m = if has_shadow {
-        (shadow_radius * 1.6 + 5.0 + shadow_off_y.abs()).ceil() as i32
+        (shadow_radius * 1.6 + (5.0 * s) + shadow_off_y.abs()).ceil() as i32
     } else {
         0
     };
 
-    // 材质：solid=底色 / translucent|glass|frosted=tint 半透明（×opacity）
-    let kind = skin
-        .pointer("/skin/material/kind")
-        .or_else(|| skin.get("material").and_then(|m| m.get("kind")))
-        .and_then(|x| x.as_str())
-        .unwrap_or("solid")
-        .to_string();
-    let mat = skin.pointer("/skin/material").or_else(|| skin.get("material"));
-    let opacity = mat
-        .and_then(|m| m.get("opacity"))
-        .and_then(|x| x.as_f64())
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0) as f32;
-    let tint_hex = skin
-        .pointer("/skin/material/tint")
-        .or_else(|| skin.get("material").and_then(|m| m.get("tint")))
-        .and_then(|x| x.as_str())
-        .and_then(parse_hex4);
     // 【纯色模型 v2·与 candwin2/预览同步】颜色只管色相（自带 alpha 忽略）：
     // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 255。
+    //（旧 opacity/tint 模型残留变量已清——kind 只在上方 kind_early 用于
+    // 玻璃零偏移判定）
     let master = skin
         .pointer("/skin/material/master_alpha")
         .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
@@ -422,7 +416,7 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
         .unwrap_or(1.0)
         .clamp(0.0, 1.0) as f32;
     let border_col = (bc.0, bc.1, bc.2, (border_alpha * 255.0) as u8); // 边框独立透明度
-    let border_w = skin_layout(skin, "border_width", 1.0).max(0.0);
+    let border_w = (skin_layout(skin, "border_width", 1.0) * s).max(0.0);
 
     // ── GDI：字体 + 测宽 + 文字 coverage ──
     let face: Vec<u16> = {
@@ -459,7 +453,9 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
             sz.cx as f32
         };
 
-        let n = f.items.len().min(9);
+        // 【上限对齐 2026-09-11】旧 min(9) 与 DLL 侧两份渲染器（min(10)）
+        // 不一致——server 代画宿主第 10 候选永远不显示。
+        let n = f.items.len().min(10);
         let mut max_text = 0.0f32;
         let mut max_cmt = 0.0f32;
         for (t, c) in f.items.iter().take(n) {
@@ -672,10 +668,41 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
             }
             // 候选行
             let text_x = margin_x + label_w;
+            // 【注释配额 2026-09-11】固定宽皮肤（width_cfg 大 max_cmt）
+            // 下 cmt_x 可小于 text_x → 注释直接压在候选文本上。与
+            // candwin2/candwin3 同款配额语义：可用宽不足（<24px）干脆
+            // 不画注释列；够则右对齐且逐条按预算截断（…）。
+            let mut cmt_budget = 0.0f32;
             let cmt_x = if max_cmt > 0.0 {
-                width - margin_x - max_cmt - 2.0
+                let b = width - margin_x - 2.0 - text_x - max_text - 8.0;
+                if b < 24.0 {
+                    max_cmt = 0.0;
+                    width
+                } else {
+                    cmt_budget = b.min(max_cmt);
+                    width - margin_x - 2.0 - cmt_budget
+                }
             } else {
                 width
+            };
+            let trunc_cmt = |sm: &str, budget: f32| -> String {
+                if budget <= 0.0 || sm.is_empty() {
+                    return String::new();
+                }
+                if measure(h_small, sm) <= budget {
+                    return sm.to_string();
+                }
+                let mut t: String = sm.to_string();
+                loop {
+                    if t.is_empty() {
+                        return String::new();
+                    }
+                    t.pop();
+                    let with_dots = format!("{t}…");
+                    if measure(h_small, &with_dots) <= budget {
+                        return with_dots;
+                    }
+                }
             };
             for (i, (text, cmt)) in f.items.iter().take(n).enumerate() {
                 let y = y0 + (line_h + cand_spacing) * i as f32;
@@ -699,8 +726,11 @@ fn render_frame(f: &CandFrame) -> (i32, i32, Vec<u8>, i32) {
                     draw_text(&mut canvas, h_label, &format!("{}.", i + 1), m + margin_x, m + y, if label_pt > 0.0 { label_pt * 96.0 / 72.0 } else { em * 0.78 }, c_label);
                 }
                 draw_text(&mut canvas, h_main, text, m + text_x, m + y, em, c_text);
-                if !cmt.is_empty() && max_cmt > 0.0 {
-                    draw_text(&mut canvas, h_small, cmt, m + cmt_x, m + y, em * 0.78, c_cmt);
+                if !cmt.is_empty() && cmt_budget > 0.0 {
+                    let shown = trunc_cmt(cmt, cmt_budget);
+                    if !shown.is_empty() {
+                        draw_text(&mut canvas, h_small, &shown, m + cmt_x, m + y, em * 0.78, c_cmt);
+                    }
                 }
             }
             let _ = SelectObject(hdc, old_bmp);
@@ -738,7 +768,10 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
         WM_APP_CAND => unsafe {
             // lparam = Box<CandFrame> 指针（pipe 线程移交所有权）
             let frame: Box<CandFrame> = Box::from_raw(lparam as *mut CandFrame);
-            let (w_out, h_out, bytes, shadow_m) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_frame(&frame))) {
+            // 【DPI】窗口实际 DPI → 布局缩放（进程已声明 Per-Monitor V2）
+            let dpi = GetDpiForWindow(hwnd);
+            let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+            let (w_out, h_out, bytes, shadow_m) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_frame(&frame, scale))) {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\ulw-dbg.txt", "render_frame PANIC\n");
@@ -830,7 +863,9 @@ fn mark_raised() {
 /// NOTOPMOST→TOPMOST 重挂即可越过沉浸层（实测像素可见）。
 /// 【禁忌】不要 AttachThreadInput：挂到宿主（AppContainer）线程后
 /// 若对方不泵消息，本线程整体卡死——实测白窗+忙碌光标+候选永不再现。
-/// rebanded=真时做重挂（仅会话首帧，防闪）。
+/// rebanded=真时做重挂。WM_APP_HIDE 会清 RAISED → 每次 popup 都重挂
+///（2026-09-11 注释对齐行为：沉浸宿主下每轮显示都需重新越过沉浸层，
+/// 「仅会话首帧」的旧注释与行为不符；重挂本身无闪烁实害）。
 unsafe fn force_top(hwnd: isize, rebanded: bool) {
     if rebanded {
         let _ = SetWindowPos(
@@ -873,8 +908,10 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
     let hwnd = match *WND.lock().unwrap() {
         Some(h) => h,
         None => {
-            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-            let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\srv-cand.txt", "show: WND=None（窗口未建）\n");
+            if srv_cand_dbg() {
+                let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\srv-cand.txt", "show: WND=None（窗口未建）\n");
+            }
             return;
         }
     };
@@ -883,12 +920,31 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
     let wp = ((x as u64 as usize) << 32) | (y as u32 as usize);
     unsafe {
         let r = PostMessageW(hwnd, WM_APP_CAND, wp, boxed as isize);
-        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-        let _ = std::fs::write(
-            r"C:\ProgramData\HuFu\diag\srv-cand.txt",
-            format!("show n={n} x={x} y={y} post={r}\n"),
-        );
+        if r == 0 {
+            // 【Box 泄漏修复 2026-09-11】投递失败（队列满/窗口刚死）旧
+            // 实现无人回收——CandFrame 含整份 skin JSON，打字速率持续
+            // 泄漏。此处收回所有权。
+            drop(Box::from_raw(boxed));
+        }
+        // 【诊断写盘开关化 2026-09-11】旧实现每次 show（每键）无条件
+        // create_dir_all+全量写 srv-cand.txt——tsf.rs 给 trace 做缓存+
+        // 轮转的教训（"trace 成了卡顿放大器"）没惠及这里。默认关，排障
+        // 时设 HUFU_SRV_CAND_DBG=1 复现旧行为。
+        if srv_cand_dbg() {
+            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            let _ = std::fs::write(
+                r"C:\ProgramData\HuFu\diag\srv-cand.txt",
+                format!("show n={n} x={x} y={y} post={r}\n"),
+            );
+        }
     }
+}
+
+/// srv-cand.txt 调试写盘开关（进程级一次判定）
+fn srv_cand_dbg() -> bool {
+    use std::sync::OnceLock;
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| std::env::var("HUFU_SRV_CAND_DBG").is_ok())
 }
 
 /// pipe 线程调用：隐藏

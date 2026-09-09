@@ -4,7 +4,10 @@
 # - HKLM 机器级键 + msctf 原生登记（本机实测需提权才 0x00000000）交给一次 UAC 的
 #   提权子进程（-PhaseElevated），日志回流本窗口可见。
 # - -NoHKLM：完全跳过提权（无管理员机器的每用户安装；msctf 登记尽力而为）。
-param([switch]$NoHKLM, [switch]$PhaseElevated)
+# 【修复标签 2026-09-11】HKCU 注册表段（当前用户 IME 配置）拆为可独立执行 →
+# 新增 -UserOnly 开关：只跑 Install-UserConfig（HKCU COM+TIP+InstallDir）；
+# 不带开关时默认行为完全不变（任务3）。
+param([switch]$NoHKLM, [switch]$PhaseElevated, [switch]$UserOnly)
 
 $ErrorActionPreference = 'Continue'
 
@@ -115,7 +118,8 @@ if ($PhaseElevated) {
         }
     }
     # 2) 诊断日志（ProgramData\HuFu\diag——升级即清，日志无需跨版本保留）
-    $diag = 'C:\ProgramData\HuFu\diag'
+    # 【修复标签 2026-09-11】硬编码盘符路径 C:\ProgramData → $env:ProgramData 推导（任务5）
+    $diag = Join-Path $env:ProgramData 'HuFu\diag'
     if (Test-Path $diag) {
         $n = @(Get-ChildItem $diag -Force -ErrorAction SilentlyContinue).Count
         Get-ChildItem $diag -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -170,7 +174,10 @@ if ($PhaseElevated) {
     Set-ItemProperty -Path $lp -Name 'IconIndex' -Value 0 -Type DWord
     Write-Host 'OK HKLM 机器级已注册（指向 SystemIME）'
     Write-Host '—— 提权阶段：msctf 原生登记 ——'
+    # 【修复标签 2026-09-11】退出码未传播：smoke 登记失败原先仍以 0 退出 →
+    # 捕获退出码，提权阶段按真实结果退出（正常退出与失败双路径，任务7/D7）。
     & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $sysdll
+    $rcSmoke = $LASTEXITCODE
     # 【顺序铁律·回写半边】完整安装下每用户段先写了 HKCU→安装目录 DLL
     # （当时 SystemIME 尚未建立）。此刻 SystemIME 已就位：HKCU COM 必须
     # 回写为 SystemIME 路径——否则打包进程（开始菜单/UWP）按 HKCU 优先
@@ -183,7 +190,9 @@ if ($PhaseElevated) {
     if ($chkCU -ne $sysdll) { Write-Host "⚠ HKCU 回写校验失败：$chkCU" }
     else { Write-Host 'OK HKCU COM 已回写 → SystemIME（打包进程可读）' }
     Write-Host '提权阶段完成。'
-    exit
+    # 【修复标签 2026-09-11】退出码传播：smoke 登记失败 → 非 0 退出；成功 → 0
+    if ($rcSmoke -ne 0) { Write-Host "⚠ msctf 登记退出码 $rcSmoke"; exit $rcSmoke }
+    exit 0
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -215,59 +224,80 @@ if (-not (Test-Path $dll)) { Write-Host "✗ 缺少 $dll，请完整解压安装
 if (-not (Test-Path $exe)) { Write-Host "✗ 缺少 $exe，请完整解压安装包后重试"; exit 1 }
 Write-Host 'OK 文件就位（原地运行，不占用 C 盘额外空间）'
 
-# ── 1.5) 记录安装目录（DLL 自愈链 / 卸载器读取）──
-Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $inst
+# 【修复标签 2026-09-11】原 1.5)+2) 两段（HKCU 注册表：当前用户 IME 配置）原样
+# 拆为独立函数 Install-UserConfig → 可被 -UserOnly 单独执行；默认主流程照旧
+# 依次调用，行为不变（任务3）。
+function Install-UserConfig {
+    # 1.5) 记录安装目录（DLL 自愈链 / 卸载器读取）
+    Set-Reg 'HKCU:\Software\HuFu' 'InstallDir' $inst
 
-# ── 2) HKCU COM + TIP 键树注册（每用户；COM 解析 HKCU 优先）──
-# DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索/UWP 可用）；
-# 未提权安装（无 SystemIME 副本）时退回用户目录——此时开始菜单搜索
-# 框不可用（SystemApps 进程读不了用户目录），记事本等普通应用不受影响。
-$dllReg = if (Test-Path $sysdll) { $sysdll } else { $dll }
-$ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
-# 【顺序铁律】regsvr32 必须先跑：DllRegisterServer 会把 HKCU CLSID
-# 默认值覆盖为 DLL 自身路径（安装目录，AppContainer 宿主读不了——
-# 开始菜单/UWP 因此打不了字）。之后我们重写为 $dllReg（SystemIME
-# 副本，打包进程可读），最终值必须落 SystemIME。
-regsvr32 /s $dll
-Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
-Set-Reg $ipsUser '(default)' $dllReg
-Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
-$finalDll = [string](Get-Item "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32").GetValue('')
-if ($finalDll -ne $dllReg) { Set-Reg $ipsUser '(default)' $dllReg }  # 双保险
+    # 2) HKCU COM + TIP 键树注册（每用户；COM 解析 HKCU 优先）
+    # DLL 路径：优先 SystemIME 副本（打包进程可读，开始菜单搜索/UWP 可用）；
+    # 未提权安装（无 SystemIME 副本）时退回用户目录——此时开始菜单搜索
+    # 框不可用（SystemApps 进程读不了用户目录），记事本等普通应用不受影响。
+    $dllReg = if (Test-Path $sysdll) { $sysdll } else { $dll }
+    $ipsUser = "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32"
+    # 【顺序铁律】regsvr32 必须先跑：DllRegisterServer 会把 HKCU CLSID
+    # 默认值覆盖为 DLL 自身路径（安装目录，AppContainer 宿主读不了——
+    # 开始菜单/UWP 因此打不了字）。之后我们重写为 $dllReg（SystemIME
+    # 副本，打包进程可读），最终值必须落 SystemIME。
+    regsvr32 /s $dll
+    Set-Reg "HKCU:\Software\Classes\CLSID\$CLSID" '(default)' 'HuFu TSF Service'
+    Set-Reg $ipsUser '(default)' $dllReg
+    Set-Reg $ipsUser 'ThreadingModel' 'Apartment'
+    $finalDll = [string](Get-Item "HKCU:\Software\Classes\CLSID\$CLSID\InprocServer32").GetValue('')
+    if ($finalDll -ne $dllReg) { Set-Reg $ipsUser '(default)' $dllReg }  # 双保险
 
-# 【HKCU TIP 键树——切换器/搜索框的生命线，不可省】（dae3baf/23978b3
-# 历史定案，afc2dfc 曾误删致 Win+空格 切不到虎符，实测回归后恢复）：
-# Win+空格切换器只列「带键盘分类」的 TIP（Category 两层键）；语言档案
-# 启用状态（LanguageProfile Enable）与切换器图标（IconFile）也在此树。
-# regsvr32 写的副本 IconFile 指向安装目录 DLL（打包进程读不了），故
-# 安装器直写一遍并统一指向 $dllReg——与 regsvr32 双保险，缺一不可。
-$tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
-Set-Reg $tipU '(default)' 'HuFu 输入法'
-Set-Reg "$tipU\Description" '(default)' 'HuFu 虎符输入法（虎码）'
-New-Item -Path "$tipU\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
-New-Item -Path "$tipU\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
-# 【键盘分类（34745C63）只写 HKLM 全局库】（dae3baf 定案：切换器按
-# HKLM CTF\Category 识别键盘 TIP；提权段 RegisterCategory / oneshot
-# 补全）——HKCU TIP 树里写键盘分类键会被 msctf 判非法周期删除
-# （净室实测稳定复现：MASTER 键存活、34745C63 键必消失），勿双写。
-$lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
-Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
-Set-RegDWord $lpU 'Enable' 1          # DWORD（msctf 标准）
-Set-RegDWord $lpU 'IconIndex' 0
-Set-Reg $lpU 'IconFile' $dllReg       # SystemIME 副本（打包进程可读）
-Set-Reg $lpU 'Icon' "$dllReg,0"       # 图标双写（3544b61：Index+字符串两制式）
-Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
+    # 【HKCU TIP 键树——切换器/搜索框的生命线，不可省】（dae3baf/23978b3
+    # 历史定案，afc2dfc 曾误删致 Win+空格 切不到虎符，实测回归后恢复）：
+    # Win+空格切换器只列「带键盘分类」的 TIP（Category 两层键）；语言档案
+    # 启用状态（LanguageProfile Enable）与切换器图标（IconFile）也在此树。
+    # regsvr32 写的副本 IconFile 指向安装目录 DLL（打包进程读不了），故
+    # 安装器直写一遍并统一指向 $dllReg——与 regsvr32 双保险，缺一不可。
+    $tipU = "HKCU:\Software\Microsoft\CTF\TIP\$CLSID"
+    Set-Reg $tipU '(default)' 'HuFu 输入法'
+    Set-Reg "$tipU\Description" '(default)' 'HuFu 虎符输入法（虎码）'
+    New-Item -Path "$tipU\Category\Category\$TFCAT_KBD\$CLSID" -Force | Out-Null
+    New-Item -Path "$tipU\Category\Item\$CLSID\$TFCAT_KBD" -Force | Out-Null
+    # 【键盘分类（34745C63）只写 HKLM 全局库】（dae3baf 定案：切换器按
+    # HKLM CTF\Category 识别键盘 TIP；提权段 RegisterCategory / oneshot
+    # 补全）——HKCU TIP 树里写键盘分类键会被 msctf 判非法周期删除
+    # （净室实测稳定复现：MASTER 键存活、34745C63 键必消失），勿双写。
+    $lpU = "$tipU\LanguageProfile\0x00000804\$PROFILE"
+    Set-Reg $lpU '(default)' 'HuFu 虎符输入法'
+    Set-RegDWord $lpU 'Enable' 1          # DWORD（msctf 标准）
+    Set-RegDWord $lpU 'IconIndex' 0
+    Set-Reg $lpU 'IconFile' $dllReg       # SystemIME 副本（打包进程可读）
+    Set-Reg $lpU 'Icon' "$dllReg,0"       # 图标双写（3544b61：Index+字符串两制式）
+    Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
+    return $true
+}
+
+if ($UserOnly) {
+    # 【修复标签 2026-09-11】-UserOnly：只写当前用户 HKCU IME 配置后退出——
+    # 不动 HKLM/msctf/语言列表/自启/server（多用户机器：机器级底座已由首位
+    # 用户装好，新用户免提权开通当前用户配置）。
+    if (-not (Install-UserConfig)) { exit 1 }
+    Write-Host 'OK -UserOnly 完成：仅当前用户 HKCU 配置已写入（HKLM/msctf/server 未动）'
+    exit 0
+}
+
+if (-not (Install-UserConfig)) { exit 1 }   # 默认主流程：行为与拆分前一致
 
 # ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
 if (-not $NoHKLM) {
     if ($isAdmin) {
         & $PSCommandPath -PhaseElevated
+        # 【修复标签 2026-09-11】提权子阶段失败原先静默继续 → 检查退出码并告警（不中断主流程）
+        if ($LASTEXITCODE -ne 0) { Write-Host "⚠ 提权阶段退出码 $LASTEXITCODE（msctf 登记可能未完成）" }
     } elseif ($inAdminGroup) {
         Write-Host '（弹出 UAC：机器级注册 + msctf 登记，请点「是」）'
         $elog = Join-Path $env:TEMP 'hufu-install-elevated.log'
         $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
         $arg = "-NoProfile -ExecutionPolicy Bypass -Command `"[Console]::OutputEncoding=[Text.Encoding]::UTF8; & '$PSCommandPath' -PhaseElevated *> '$elog'`""
-        Start-Process $ps -Verb RunAs -ArgumentList $arg -Wait
+        # 【修复标签 2026-09-11】提权子进程退出码原先丢弃 → -PassThru 捕获并告警（不中断主流程）
+        $evProc = Start-Process $ps -Verb RunAs -ArgumentList $arg -Wait -PassThru
+        if ($evProc.ExitCode -ne 0) { Write-Host "⚠ 提权阶段退出码 $($evProc.ExitCode)（msctf 登记可能未完成）" }
         if (Test-Path $elog) {
             # smoke 输出为 UTF-8 字节：按 UTF-8 读回（默认 ANSI 会乱码）
             Get-Content $elog -Encoding UTF8 | ForEach-Object { Write-Host "  $_" }

@@ -113,6 +113,38 @@ impl NgramModel {
         let tri_blocks_off = rd_i64(data_ref, 88) as usize;
         let tri_index_off = rd_i64(data_ref, 96) as usize;
 
+        // 【边界校验 2026-09-11】头字段全信旧实现：截断/损坏文件
+        // uni_count 巨大 → Vec::with_capacity 溢出 abort；uni_off 越界
+        // → 循环 rd_i32 直接 index panic（server 后台线程死亡/互斥中毒
+        // 级联）。装载期一次性验完全部区间，坏文件 = Err 降级。
+        let bad = |what: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ngram 头部区间越界（{what}）"),
+            )
+        };
+        if index_stride == 0 || index_stride > 65536 {
+            return Err(bad("index_stride"));
+        }
+        let uni_end = uni_off
+            .checked_add(uni_count.checked_mul(8).ok_or_else(|| bad("unigram"))?)
+            .ok_or_else(|| bad("unigram"))?;
+        let bi_index_end = bi_index_off
+            .checked_add(bi_index_count.checked_mul(16).ok_or_else(|| bad("bigram 索引"))?)
+            .ok_or_else(|| bad("bigram 索引"))?;
+        let tri_index_end = tri_index_off
+            .checked_add(tri_index_count.checked_mul(16).ok_or_else(|| bad("trigram 索引"))?)
+            .ok_or_else(|| bad("trigram 索引"))?;
+        // blocks 区间起点也须落在文件内（块内容本身由查询期页内
+        // off+16 界检兜底，起点只须合法）
+        let len = data_ref.len();
+        if uni_off > len || uni_end > len
+            || bi_blocks_off > len || bi_index_off > len || bi_index_end > len
+            || tri_blocks_off > len || tri_index_off > len || tri_index_end > len
+        {
+            return Err(bad("区间超文件长度"));
+        }
+
         let mut uni_pos = HashMap::with_capacity(uni_count);
         let mut unigrams: Vec<(u32, f32)> = Vec::with_capacity(uni_count);
         for i in 0..uni_count {
@@ -225,6 +257,11 @@ impl NgramModel {
         cp: u32,
     ) -> Option<(f32, f32)> {
         let (succ_off, lambda, succ) = self.find_ctx(blocks_off, index_off, index_count, key)?;
+        // 【越界防护 2026-09-11】坏文件 succ_count 可指天——后继数组
+        // 区间先验界检（旧实现二分/线性读裸索引 panic）。
+        if succ_off.checked_add(succ.checked_mul(8)?)? > self.data.len() {
+            return None;
+        }
         // succ 按码点升序：二分（短表 ≤4 条时线性更省分支）
         if succ > 4 {
             let (mut lo, mut hi) = (0usize, succ);

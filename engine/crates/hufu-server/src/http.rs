@@ -10,6 +10,9 @@ pub struct Request {
     pub path: String,
     pub query: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// 全部请求头（小写键）。【浏览器源加固 2026-09-11】副作用端点
+    /// 校验 Origin/Host 用——此前头部解析后被丢弃，路由无从设防。
+    pub headers: HashMap<String, String>,
 }
 
 impl Request {
@@ -53,6 +56,7 @@ fn status_text(code: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        403 => "Forbidden",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -99,6 +103,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         path,
         query,
         body,
+        headers,
     })
 }
 

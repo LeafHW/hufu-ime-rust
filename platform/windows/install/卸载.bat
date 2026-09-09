@@ -19,6 +19,12 @@ exit /b
 echo [HuFu] 管理员模式，卸载中（含早期版本残留清理）…
 cd /d "%USERPROFILE%"
 powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0uninstall.ps1"
-echo.
-echo [HuFu] 卸载完成。按任意键关闭…
+powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0uninstall.ps1"
+if errorlevel 1 (
+    echo.
+    echo [HuFu] 卸载脚本报错（退出码非 0）。部分项目可能未清完。
+) else (
+    echo.
+    echo [HuFu] 卸载完成。按任意键关闭…
+)
 pause >nul

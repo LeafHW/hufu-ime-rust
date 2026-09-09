@@ -128,7 +128,7 @@ fn reg_set_dword(subkey: &str, name: &str, value: u32) -> WIN32_ERROR {
         if r != WIN32_ERROR(0) {
             return r;
         }
-        let (vn, ptr) = {
+        let (_vn, ptr) = {
             let v: Vec<u16> = name.encode_utf16().chain([0]).collect();
             let p = v.as_ptr();
             (v, p)
