@@ -151,11 +151,13 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
             )
         })
         .collect();
-    if let Some(fp) = font_ovr {
+    if force_v || font_ovr.is_some() {
         // 皮肤 JSON 顶层即 layout（无 "skin" 包裹层——server 响应
         // {"skin": <Skin>}，Skin 直含 colors/layout/material）
         if let Some(l) = skin.get_mut("layout").and_then(|l| l.as_object_mut()) {
-            l.insert("font_point".into(), serde_json::json!(fp));
+            if let Some(fp) = font_ovr {
+                l.insert("font_point".into(), serde_json::json!(fp));
+            }
             if force_v {
                 l.insert("horizontal".into(), serde_json::json!(false));
             }
