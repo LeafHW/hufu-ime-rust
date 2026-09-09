@@ -1640,12 +1640,11 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
             if g.composition.is_some() {
                 trace("OnCompositionTerminated: 宿主终止组段——清悬挂句柄");
                 g.composition = None;
-                // 【交互后焦点自愈 2026-09-10】Chromium 系宿主在用户按下
-                // 候选窗瞬间杀组段+blur 编辑器（caret 消失、键盘不进
-                // TSF）——置位全局标志，拖动松手/右键时补合成点击恢复。
-                *crate::candwin2::HOST_KILLED_COMP
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = true;
+                // 注：Chromium 系宿主在按下候选窗时杀组段+blur 编辑器
+                //（caret 消失）——曾试过合成点击焦点自愈，实测反噬
+                //（合成点击再触发焦点清理把候选窗藏掉），已按用户拍板
+                // 移除：拖动不要求光标存活，用户自己点回，位置由
+                // CAND_PINNED 锁定（见 candwin2 0x202 pin 双保险）。
             }
         }
         Ok(())
