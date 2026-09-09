@@ -348,11 +348,21 @@ impl Schema {
         // 后插不受先插者下标位移影响）
         placed.sort_by(|a, b| b.0.cmp(&a.0));
         for (n, ue) in placed {
-            if merged.iter().any(|x| x.text == ue.text) {
-                continue;
-            }
+            // 删除态先判（动 merged 之前——否则会误删码表同词后又不插）
             if self.adjust.removed(&ue.code, &ue.text) {
                 continue;
+            }
+            // 【选重位顶替码表同词 2026-09-10】/jc 显式指定第 N 选的
+            // 用户词若与码表同 text 词撞车（码表行里本来就有该词，常见
+            // 于空格多词格式的行尾词），旧逻辑按 text 查重直接跳过插入
+            // ——用户词被码表原位屏蔽，实测「/jc ae 二 候选2 加完仍在
+            // 最后」。选重位是明确意图：移除码表位的同词，把用户词放
+            // 到第 N 位。置顶（pinned）语义更强，仍然赢。
+            if let Some(hit) = merged.iter().position(|x| x.text == ue.text) {
+                if merged[hit].pinned {
+                    continue;
+                }
+                merged.remove(hit);
             }
             let idx = (n - 1).min(merged.len());
             merged.insert(idx, ue);
@@ -532,6 +542,32 @@ mod tests {
             ],
             "选重位插入: {texts:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【选重位顶替码表同词 2026-09-10】码表行里已有同 text 词（空格
+    // 多词格式的行尾词常见）时，/jc 显式选重位的用户词顶替码表位插
+    // 到第 N 位——旧逻辑按 text 查重直接跳过插入，用户词被码表原位
+    // 屏蔽（实测：/jc ae 二 候选2，加完「二」仍在最后）。
+    #[test]
+    fn user_word_placement_replaces_dict_dupe() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(&tmp, "码表.txt", "ae 闲 那样 二\n");
+        write(&tmp, "用户调整.txt", "{添加}ae\t二\tp2\n");
+        let s = Schema::load(&tmp).unwrap();
+        let texts: Vec<String> = s.candidates("ae").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts,
+            ["闲".to_string(), "二".to_string(), "那样".to_string()],
+            "选重位顶替码表同词: {texts:?}"
+        );
+        // 删除态：先判 removed 再动码表位（否则误删码表词后又不插）
+        let mut s2 = Schema::load(&tmp).unwrap();
+        s2.adjust.remove("ae", "二");
+        let texts2: Vec<String> = s2.candidates("ae").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts2, ["闲".to_string(), "那样".to_string()], "删除态恢复码表原序: {texts2:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
