@@ -352,8 +352,29 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
     // ── 皮肤参数（与 candwin2 show() 同公式）──
     let font_pt = skin_layout(skin, "font_point", 16.0);
     let radius = skin_layout(skin, "corner_radius", 8.0) * s;
-    let margin_x = skin_layout(skin, "margin_x", 8.0) * s;
-    let margin_y = skin_layout(skin, "margin_y", 5.0) * s;
+    // 【玻璃独立留白 2026-09-10】kind 判定提前：毛玻璃用 material.
+    // glass_margin_x/y（默认 1，与 DLL 侧同款独立两套），非玻璃沿用
+    // layout.margin_x/y。
+    let kind_early = skin
+        .pointer("/skin/material/kind")
+        .or_else(|| skin.get("material").and_then(|m| m.get("kind")))
+        .and_then(|x| x.as_str())
+        .unwrap_or("solid");
+    let mat_f = |key: &str, dflt: f32| -> f32 {
+        skin.pointer(("/skin/material/".to_string() + key).as_str())
+            .or_else(|| skin.get("material").and_then(|m| m.get(key)))
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or(dflt)
+    };
+    let (margin_x, margin_y) = if kind_early == "glass" {
+        (mat_f("glass_margin_x", 1.0) * s, mat_f("glass_margin_y", 1.0) * s)
+    } else {
+        (
+            skin_layout(skin, "margin_x", 8.0) * s,
+            skin_layout(skin, "margin_y", 5.0) * s,
+        )
+    };
     let line_h =
         (font_pt * 96.0 / 72.0 + skin_layout(skin, "line_spacing", 3.0) + 5.0) * s;
     let width_cfg = skin_layout(skin, "width", 0.0) * s;
@@ -373,11 +394,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
     let shadow_radius = (skin_layout(skin, "shadow_radius", 6.0) * s).clamp(0.0, 24.0 * s);
     // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（与 DLL 侧钳制
     // 同款——server 代画窗也保持一致语义）
-    let kind_early = skin
-        .pointer("/skin/material/kind")
-        .or_else(|| skin.get("material").and_then(|m| m.get("kind")))
-        .and_then(|x| x.as_str())
-        .unwrap_or("solid");
+    //（kind_early 已提前到 margin 读取处【2026-09-10】，此处直接复用）
     let shadow_off_y = if kind_early == "glass" {
         0.0
     } else {
