@@ -808,10 +808,10 @@ impl CandidateWindowV2 {
                 // 中/高=重模糊（ACRYLIC——Windows 仅两档模糊深度）
                 ACCENT_ENABLE_ACRYLICBLURBEHIND
             };
-            // 染色=tint RGBA（无 tint 时深灰 50% 兜底）
+            // 染色=tint RGBA（无 tint 时兜底同默认：色相深灰、浓度 0）
             let (tr, tg, tb, ta) = match tint_hex {
                 Some([r, g, b, a]) => (r as u32, g as u32, b as u32, a as u32),
-                None => (28, 28, 30, 128),
+                None => (28, 28, 30, 0),
             };
             // 幂等键含全 RGBA（拖色板/浓度即时重设）
             let key: u64 = ((state as u64) << 32) | ((tr << 24) | (tg << 16) | (tb << 8) | ta) as u64;

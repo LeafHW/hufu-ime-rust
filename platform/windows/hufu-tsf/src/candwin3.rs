@@ -379,7 +379,8 @@ impl CandWin3 {
             let c = skin_color4(skin, "back_color", "#202022E6");
             (c.0, c.1, c.2, (c.3 as f32 * opacity) as u8)
         } else {
-            let t = tint_hex.unwrap_or((28, 28, 30, 204));
+            // 【染色浓度默认 0】兜底与全链默认一致（色相深灰、浓度 0）
+            let t = tint_hex.unwrap_or((28, 28, 30, 0));
             let a = match kind.as_str() {
                 "glass" => t.3 as f32 / 255.0 * 0.55,
                 _ => t.3 as f32 / 255.0 * 0.85,

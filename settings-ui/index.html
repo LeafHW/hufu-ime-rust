@@ -775,8 +775,9 @@ function bindSkin() {
         tc.value = "#" + t.slice(0, 6);
         ta.value = Math.round(parseInt(t.slice(6, 8), 16) / 255 * 100);
       } else {
+        // 【染色浓度默认 0】无 tint 字段的旧皮肤：色相用默认深灰、浓度 0
         tc.value = "#1c1c1e";
-        ta.value = 45;
+        ta.value = 0;
       }
       $("#mat-ta-v").textContent = ta.value + "%";
       syncShadowOff();
@@ -1016,7 +1017,7 @@ function bindSkin() {
     const F = {
       layout: { horizontal: false, inline_preedit: true, font_face: "", font_point: 14.5, label_font_point: 11.5, label_format: "%s.", label_style: "digit", corner_radius: 8, hilited_corner_radius: 6, border_width: 1, margin_x: 8, margin_y: 5, spacing: 6, candidate_spacing: 4, hilite_spacing: 2, hilite_padding: 4, line_spacing: 3, min_width: 120, width: 250, shadow_radius: 12, shadow_offset_x: 0, shadow_offset_y: 0, blur_level: "low", mark_text: "·" },
       colors: { back_color: "#202022E6", border_color: "#FFFFFF26", text_color: "#E8E8EAFF", preedit_back_color: "#20202200", candidate_text_color: "#E8E8EAFF", candidate_back_color: "#20202200", candidate_shadow_color: "#00000000", comment_text_color: "#9A9AA0FF", label_color: "#C9C9C9FF", hilited_text_color: "#FFFFFFFF", hilited_back_color: "#20202200", hilited_candidate_text_color: "#FFFFFFFF", hilited_candidate_back_color: "#404046FF", hilited_candidate_label_color: "#FFD75EFF", hilited_comment_text_color: "#C9C9C9FF", hilited_label_color: "#FFD75EFF", hilited_mark_color: "#FFD75EFF", shadow_color: "#00000059", hilited_shadow_color: "#00000059", hilited_candidate_shadow_color: "#00000000", capsule_text_color: "#E8E8EAFF", capsule_back_color: "#202022CC" },
-      material: { kind: "solid", tint: "#1C1C1E80", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_shadow_alpha: 0.38, glass_shadow_size: 6 },
+      material: { kind: "solid", tint: "#1C1C1E00", opacity: 1, darken: 0, noise: 0, border_width: 1, border_color: "#FFFFFF33", master_alpha: 1, hilite_alpha: 1, shadow_alpha: 1, border_alpha: 1, glass_shadow_alpha: 0.38, glass_shadow_size: 6 },
     };
     $("#skin-reset").onclick = async () => {
       try {

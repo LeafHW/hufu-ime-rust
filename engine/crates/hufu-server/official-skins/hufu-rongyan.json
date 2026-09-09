@@ -53,7 +53,7 @@
                },
     "material":  {
                      "kind":  "solid",
-                     "tint":  "#1C1C1ECC",
+                     "tint": "#1C1C1E00",
                      "opacity":  1.0,
                      "darken":  0.0,
                      "noise":  0.0,
