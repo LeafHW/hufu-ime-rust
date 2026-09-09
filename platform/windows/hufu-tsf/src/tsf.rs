@@ -22,6 +22,30 @@ unsafe impl Send for GShared {}
 unsafe impl Sync for GShared {}
 pub static G_SHARED: std::sync::OnceLock<GShared> = std::sync::OnceLock::new();
 
+// 【重入死锁防护 2026-09-09】DoEditSession 全程持 shared 锁并跨越
+// SetText/GetTextExt 等宿主回调；宿主在回调链内泵消息+焦点变化会
+// 同线程再触发 OnSetFocus——其 lock(shared) 重入 std::sync::Mutex
+// = 死锁（WPS/多窗口切换「打不出字」多人实录）。守卫：edit session
+// 期间焦点事件延迟到 session 出口回放（同线程，同套间，安全）。
+thread_local! {
+    static IN_EDIT_SESSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DEFERRED_FOCUS: std::cell::RefCell<
+        Option<(Option<ITfDocumentMgr>, Option<ITfDocumentMgr>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+fn edit_session_enter() {
+    IN_EDIT_SESSION.with(|d| d.set(d.get() + 1));
+}
+fn edit_session_exit() {
+    IN_EDIT_SESSION.with(|d| d.set(d.get() - 1));
+}
+fn in_edit_session() -> bool {
+    IN_EDIT_SESSION.with(|d| d.get() > 0)
+}
+fn take_deferred_focus() -> Option<(Option<ITfDocumentMgr>, Option<ITfDocumentMgr>)> {
+    DEFERRED_FOCUS.with(|d| d.borrow_mut().take())
+}
+
 /// 线程共享状态（文本服务 / 按键接收 / 编辑会话共用）。
 pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
@@ -258,7 +282,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                     if let Ok(cookie) =
                         unsafe { src.AdviseSink(&ITfThreadMgrEventSink::IID, Some(&unk)) }
                     {
-                        self.shared.lock().unwrap().tm_sink_cookie = cookie;
+                        self.shared.lock().unwrap_or_else(|e| e.into_inner()).tm_sink_cookie = cookie;
                     }
                 }
             }
@@ -271,7 +295,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                 }
             }
         }
-        let mut g = self.shared.lock().unwrap();
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         g.thread_mgr = Some(tm);
         g.client_id = tid;
         // 语言栏「中/A」状态牌（用户需求：任务栏语言区显示中英态，
@@ -319,7 +343,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
     fn Deactivate(&self) -> Result<()> {
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
-        let mut g = self.shared.lock().unwrap();
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         // compartment 监听摘除（语言栏项同理，各自对称）
         crate::langbar::uninstall_compartments();
         if let Some(tm) = g.thread_mgr.clone() {
@@ -398,7 +422,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         // 不动——切回原宿主时组段还在，可继续。poll_tick 另有前台
         // 判据兜底（防个别宿主不走此回调）。
         if !fforeground.as_bool() {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
@@ -497,23 +521,49 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         pdimfocus: Option<&ITfDocumentMgr>,
         pdimprevfocus: Option<&ITfDocumentMgr>,
     ) -> Result<()> {
-        let _ = pdimfocus;
-        // 【交互守卫】鼠标悬停在候选窗上 = 用户正在拖拽/右键固定。
-        // 点击候选窗会让宿主连发 docmgr 焦点事件（实测点击即触发
-        // OnSetFocus）——此刻绝不能清组段/隐藏候选窗（表现为「点击
-        // 后候选框消失、拖拽刚按住就断」）。真失焦时鼠标不在候选窗
-        // 上，正常走清理路径。
-        {
-            let g = self.shared.lock().unwrap();
-            if g.cand2.as_ref().map(|c| c.is_mouse_over()).unwrap_or(false) {
-                trace("OnSetFocus: 鼠标在候选窗上——交互中，跳过清理");
-                return Ok(());
-            }
+        // 【重入死锁防护】见 thread_local 声明处注释：edit session 内
+        // 触发的焦点事件延迟回放，避免同线程锁重入。
+        if in_edit_session() {
+            DEFERRED_FOCUS.with(|d| {
+                *d.borrow_mut() = Some((pdimfocus.cloned(), pdimprevfocus.cloned()))
+            });
+            return Ok(());
         }
-        let (composing, preedit) = {
-            let g = self.shared.lock().unwrap();
-            (g.composing, g.preedit_last.clone())
-        };
+        handle_set_focus(&self.shared, pdimfocus, pdimprevfocus)
+    }
+
+    fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// OnSetFocus 主体（从 trait 方法抽出，供 edit session 出口回放共用）。
+fn handle_set_focus(
+    shared: &SharedRef,
+    pdimfocus: Option<&ITfDocumentMgr>,
+    pdimprevfocus: Option<&ITfDocumentMgr>,
+) -> Result<()> {
+    let _ = pdimfocus;
+    // 【交互守卫】鼠标悬停在候选窗上 = 用户正在拖拽/右键固定。
+    // 点击候选窗会让宿主连发 docmgr 焦点事件（实测点击即触发
+    // OnSetFocus）——此刻绝不能清组段/隐藏候选窗（表现为「点击
+    // 后候选框消失、拖拽刚按住就断」）。真失焦时鼠标不在候选窗
+    // 上，正常走清理路径。
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.cand2.as_ref().map(|c| c.is_mouse_over()).unwrap_or(false) {
+            trace("OnSetFocus: 鼠标在候选窗上——交互中，跳过清理");
+            return Ok(());
+        }
+    }
+    let (composing, preedit) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (g.composing, g.preedit_last.clone())
+    };
         // 【焦点风暴去抖 2026-09-08】QQ 实测 40ms 内连发 8 次
         // OnSetFocus（宿主内部焦点抖动）——每次 spawn 线程+focus
         // 管道+抢锁，与打字键路径竞争 → 打字卡顿（用户实测「打着
@@ -521,7 +571,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         // false 且 preedit 空）时这些全是幂等空操作：200ms 内已
         // 处理过一次的直接跳过。有组段永不去抖（冲销必须执行）。
         if !composing && preedit.is_empty() {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             let now = std::time::Instant::now();
             let skip = g
                 .focus_idle_at
@@ -549,7 +599,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         //    放弃提交——切焦点丢半个未成词，不可拿宿主冻结换。
         if composing && !preedit.is_empty() {
             let raw_last = {
-                let g = self.shared.lock().unwrap();
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 g.raw_last.clone()
             };
             // 【失焦编码冲销 2026-09-07】兜底提交只保「中文形态」preedit
@@ -565,7 +615,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
                 } else {
                     preedit.clone()
                 };
-                let _ = run_session_sync_only(&self.shared, Op::Commit(payload), ctx);
+                let _ = run_session_sync_only(shared, Op::Commit(payload), ctx);
             }
         }
         trace("foc: B commit完");
@@ -581,7 +631,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         });
         trace("foc: C spawn完");
         {
-            let mut g = self.shared.lock().unwrap();
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             trace("foc: D 拿锁");
             g.composition = None; // 死组段句柄必须丢，后续走全新 StartPreedit
             g.composing = false;
@@ -619,7 +669,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
                 g.cand_ui = None;
                 drop(g);
                 if host_draws {
-                    let mgr = self.shared.lock().unwrap().thread_mgr.as_ref().and_then(|tm| {
+                    let mgr = shared.lock().unwrap_or_else(|e| e.into_inner()).thread_mgr.as_ref().and_then(|tm| {
                         tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>().ok()
                     });
                     if let Some(m) = &mgr {
@@ -635,15 +685,6 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         trace("foc: F 返回前");
         Ok(())
     }
-
-    fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
-        Ok(())
-    }
-
-    fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
-        Ok(())
-    }
-}
 
 /// 轨迹日志（诊断 UI 线程卡死）：追加到 %TEMP%\hufu-tsf-trace.log。
 /// 环境变量 HUFU_TRACE=0 可关。多进程各写各行（带进程名）。
@@ -731,7 +772,7 @@ impl HuFuTs_Impl {
         if wparam == 0x10 {
             if !up {
                 // TestDown/KeyDown：只记 pending，不吞（物理 Shift 由应用照常处理）
-                let mut g = self.shared.lock().unwrap();
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 g.shift_pending = true;
                 g.shift_down = true;
                 return BOOL(0);
@@ -742,7 +783,7 @@ impl HuFuTs_Impl {
             // TestDown 预判错报 TRUE → 宿主不产字、IME 也不产 → 字符
             // 消失（跟打器「英文打不进」实测）。返回 BOOL(0) 不吞 keyup。
             let fire = {
-                let mut g = self.shared.lock().unwrap();
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let f = g.shift_pending;
                 g.shift_pending = false;
                 g.shift_down = false;
@@ -757,7 +798,7 @@ impl HuFuTs_Impl {
                             .get("chinese")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        let mut g = self.shared.lock().unwrap();
+                        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                         if g.chinese != zh {
                             g.chinese = zh;
                             crate::langbar::set_mode(zh);
@@ -774,7 +815,7 @@ impl HuFuTs_Impl {
         } else {
             if !up {
                 // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
-                self.shared.lock().unwrap().shift_pending = false;
+                self.shared.lock().unwrap_or_else(|e| e.into_inner()).shift_pending = false;
             } else {
                 // 其余键的 keyup/testup 一律直通——放行字母 keyup 会造成
                 // 每键双发（「按一下等于按两下」回归）。
@@ -787,14 +828,14 @@ impl HuFuTs_Impl {
         // 把切换翻回去——净效果为零（「caps 无效」实测）。
         if mode_key {
             let dup = {
-                let g = self.shared.lock().unwrap();
+                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 matches!(&g.modekey_last, Some((vk, t))
                     if *vk == wparam && t.elapsed().as_millis() < 80)
             };
             if dup {
                 return BOOL(0);
             }
-            self.shared.lock().unwrap().modekey_last =
+            self.shared.lock().unwrap_or_else(|e| e.into_inner()).modekey_last =
                 Some((wparam, std::time::Instant::now()));
             // fallthrough：走通用路径发 server + 完整响应处理
         }
@@ -803,7 +844,7 @@ impl HuFuTs_Impl {
         // （Shift 的 TestUp 触发与模式键直发已豁免：fallthrough 发 server。）
         if test_only && !mode_key && wparam != 0x10 {
             let (chinese, composing, hint) = {
-                let g = self.shared.lock().unwrap();
+                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 (g.chinese, g.composing, g.shift_down)
             };
             let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
@@ -859,7 +900,7 @@ impl HuFuTs_Impl {
                 }
             }
         }
-        let hint = self.shared.lock().unwrap().shift_down;
+        let hint = self.shared.lock().unwrap_or_else(|e| e.into_inner()).shift_down;
         let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
             return BOOL(0);
         };
@@ -869,9 +910,9 @@ impl HuFuTs_Impl {
         };
         // 行尾瞬态（query_caret 每帧刷新）：组段逼近窗口右缘时本键
         // 的提前上屏确认放宽（engine need 2→1）
-        let line_end = self.shared.lock().unwrap().line_end;
+        let line_end = self.shared.lock().unwrap_or_else(|e| e.into_inner()).line_end;
         // 【打字期 poll 静默】记最近按键时刻（poll 500ms 窗口内跳过）
-        self.shared.lock().unwrap().last_key_at = Some(std::time::Instant::now());
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).last_key_at = Some(std::time::Instant::now());
         let Some((consumed, commit, back, state, sound, sound_vol)) =
             ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end)
         else {
@@ -1012,7 +1053,16 @@ struct EditSession {
 impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         trace("DoEditSession enter");
+        // 【重入死锁防护 2026-09-09】标记本线程进入 edit session：
+        // 期间宿主回调链内触发的 OnSetFocus 延迟（见 OnSetFocus 处），
+        // 出口回放（此刻 shared 锁空闲、焦点状态已稳定）。
+        edit_session_enter();
         let r = self.do_edit_session(ec);
+        edit_session_exit();
+        if let Some((f, p)) = take_deferred_focus() {
+            trace("DoEditSession: 回放延迟焦点事件（session 内触发）");
+            let _ = handle_set_focus(&self.shared, f.as_ref(), p.as_ref());
+        }
         trace(&format!("DoEditSession exit ok={}", r.is_ok()));
         r
     }
@@ -1020,7 +1070,7 @@ impl ITfEditSession_Impl for EditSession_Impl {
 
 impl EditSession_Impl {
     fn do_edit_session(&self, ec: u32) -> Result<()> {
-        let mut g = self.shared.lock().unwrap();
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = match self.ctx_override.clone() {
             Some(c) => c,
             None => g
@@ -1124,12 +1174,26 @@ impl EditSession_Impl {
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = text.encode_utf16().collect();
-                    unsafe {
-                        range.SetText(ec, 0, &wstr)?;
-                        comp.EndComposition(ec)?;
+                    // 【空格清屏修复 2026-09-09】组段 SetText 失败（焦点
+                    // 已切/组段被宿主终止）原实现直接 ? 上抛：server 端
+                    // session 已清（空格已消费）而文本没落进文档——候选
+                    // 有字但屏清了（多人实录，切窗恢复）。自愈：终止死组
+                    // 段后在当前 context 直插保字（照 SetPreedit 自愈先例）。
+                    let set_ok = unsafe { range.SetText(ec, 0, &wstr).is_ok() };
+                    if set_ok {
+                        let _ = unsafe { comp.EndComposition(ec) };
+                        // 提交后选区放到已提交文本之后
+                        let _ = set_selection_at_end(&ctx, ec, &range);
+                    } else {
+                        trace("Commit: 死组段 SetText 失败——自愈直插保字");
+                        let _ = unsafe { comp.EndComposition(ec) };
+                        if !text.is_empty() {
+                            if let Ok(r2) = selection_range(&ctx, ec) {
+                                let _ = unsafe { r2.SetText(ec, 0, &wstr) };
+                                let _ = set_selection_at_end(&ctx, ec, &r2);
+                            }
+                        }
                     }
-                    // 提交后选区放到已提交文本之后
-                    let _ = set_selection_at_end(&ctx, ec, &range);
                 } else if !text.is_empty() {
                     // 无活动组段的直接提交（如开头标点「，」）：
                     // 在当前选区（插入点）处插入文本，等价于 StartPreedit 的定位流程但不开组段
@@ -1189,14 +1253,25 @@ impl EditSession_Impl {
                     return Ok(());
                 }
                 // 1) 提交前缀：组段文本置为 commit → EndComposition 落地
+                // 【空格清屏修复】与 Op::Commit 同款自愈：死组段 SetText
+                // 失败时直插保字，不让已消费的 commit 丢失。
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
-                    unsafe {
-                        range.SetText(ec, 0, &wstr)?;
-                        comp.EndComposition(ec)?;
+                    let set_ok = unsafe { range.SetText(ec, 0, &wstr).is_ok() };
+                    if set_ok {
+                        let _ = unsafe { comp.EndComposition(ec) };
+                        let _ = set_selection_at_end(&ctx, ec, &range);
+                    } else {
+                        trace("C&R: 死组段 SetText 失败——自愈直插保字");
+                        let _ = unsafe { comp.EndComposition(ec) };
+                        if !commit_text.is_empty() {
+                            if let Ok(r2) = selection_range(&ctx, ec) {
+                                let _ = unsafe { r2.SetText(ec, 0, &wstr) };
+                                let _ = set_selection_at_end(&ctx, ec, &r2);
+                            }
+                        }
                     }
-                    let _ = set_selection_at_end(&ctx, ec, &range);
                 } else if !commit_text.is_empty() {
                     let range = selection_range(&ctx, ec)?;
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
@@ -1289,7 +1364,7 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     let wstr: Vec<u16> = text.encode_utf16().collect();
     unsafe { crange.SetText(ec, 0, &wstr)? };
     let _ = set_selection_at_end(ctx, ec, &crange);
-    let mut g = shared.lock().unwrap();
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.composition = Some(comp);
     query_caret(&mut g, ctx, ec);
     Ok(())
@@ -1299,14 +1374,20 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
 fn set_selection_at_end(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Result<()> {
     let r: ITfRange = unsafe { range.Clone()? };
     unsafe { r.Collapse(ec, TF_ANCHOR_END)? };
-    let sel = [TF_SELECTION {
+    let mut sel = [TF_SELECTION {
         range: core::mem::ManuallyDrop::new(Some(r)),
         style: TF_SELECTIONSTYLE {
             ase: TF_AE_NONE,
             fInterimChar: BOOL(0),
         },
     }];
-    unsafe { ctx.SetSelection(ec, &sel)? };
+    let hr = unsafe { ctx.SetSelection(ec, &sel) };
+    // 【COM 泄漏修复 2026-09-09】ManuallyDrop 包裹的克隆 ITfRange 引用
+    // 计数永不释放——每建段/上屏泄漏一个 COM 对象（全天打字数千次）。
+    // SetSelection 无论成败都接管不了所有权（COM 数组约定：调用方
+    // 保留所有权），必须手动 drop。
+    unsafe { core::mem::ManuallyDrop::drop(&mut sel[0].range) };
+    hr?;
     Ok(())
 }
 
@@ -1321,7 +1402,10 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
         return Err(Error::from(HRESULT(-2147467259)));
     }
     let r = unsafe { core::mem::ManuallyDrop::take(&mut sel[0].range) };
-    Ok(r.expect("GetSelection 未返回 range"))
+    // 【panic 修复 2026-09-09】宿主返回 fetched>0 但 range=NULL（病态
+    // 宿主/竞态）时原 expect 在 DoEditSession（COM 回调）内 panic
+    // =宿主进程崩溃。改为 Err 走上层重试/降级。
+    r.ok_or_else(|| Error::from(HRESULT(-2147467259)))
 }
 
 /// 组段内文本的屏幕矩形（插入点跟随）。
@@ -1437,12 +1521,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 停顿期轮询武装（幂等；进程内一次）+ 记录本次展示签名
     poll_arm(&shared);
     {
-        let mut g0 = shared.lock().unwrap();
+        let mut g0 = shared.lock().unwrap_or_else(|e| e.into_inner());
         g0.cand_sig_last = state_sig(&state);
     }
     // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
     let (op, has_ctx, suppress_win) = {
-        let mut g = shared.lock().unwrap();
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【皮肤首键】inline 判定依赖皮肤——首键无皮肤时先拉取（原在
         // op 决策之后，会让 inline_preedit=false 的皮肤首键先建组段）。
         if g.skin.is_null() {
@@ -1547,7 +1631,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 
     // 缓存引擎态（TestKeyDown 预判 + 失焦冲销）+ 语言栏中英态同步
     {
-        let mut g2 = shared.lock().unwrap();
+        let mut g2 = shared.lock().unwrap_or_else(|e| e.into_inner());
         let zh = state.get("chinese").and_then(|v| v.as_bool()).unwrap_or(true);
         if g2.chinese != zh {
             g2.chinese = zh;
@@ -1563,7 +1647,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     }
 
     // 候选窗（v2 优先，初始化失败回退 v1）
-    let mut g = shared.lock().unwrap();
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     let show_code = state.get("show_code").and_then(|v| v.as_bool()).unwrap_or(true);
     let raw_state = state.get("raw").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1678,7 +1762,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         drop(g);
         diag_note("打包宿主 → server 代画（开始菜单=左上角，其他=跟光标）");
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
-        shared.lock().unwrap().suppress_pending = false;
+        shared.lock().unwrap_or_else(|e| e.into_inner()).suppress_pending = false;
     } else if g.cand_ui_active {
         // server 代画续帧（开始菜单=左上角固定；其他打包宿主每帧跟光标）
         let (x, y) = if host_is_searchhost() {
@@ -1691,7 +1775,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let raw_c = raw.clone();
         drop(g);
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
-        shared.lock().unwrap().suppress_pending = false;
+        shared.lock().unwrap_or_else(|e| e.into_inner()).suppress_pending = false;
     } else if !g.cand2_dead {
         if g.cand2.is_none() {
             match CandidateWindowV2::new() {
@@ -1752,7 +1836,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 "cw2 持续 cloaked（非开始菜单）→ server 跟光标代画"
             });
             ui_element_show(&shared, &cands, &raw_c, sel, x, y);
-            shared.lock().unwrap().suppress_pending = false;
+            shared.lock().unwrap_or_else(|e| e.into_inner()).suppress_pending = false;
             return Ok(());
         }
         // 【首帧锚点缺失抑制 2026-09-06】WPS 类宿主组段首帧 GetTextExt
@@ -1762,7 +1846,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 锚点后就位——首键慢一拍（35ms≈1 帧）但位置直接正确不跳。
         // SearchHost 豁免：其 GetTextExt 常态失败，焦点窗定位候选是
         // 刚需；用户固定（pinned）时无视锚点，不抑制。
-        let pinned_now = crate::candwin2::CAND_PINNED.lock().unwrap().is_some();
+        let pinned_now = crate::candwin2::CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         // 【WPS caret 收敛 2026-09-07】固定 35ms 补显不够 WPS 表格布局
         // 稳定：首键帧抑制了，但第二键（raw=2）不再命中 wps_first_key，
         // 直接以陈旧 caret 显示 → 依旧跳。改为按「组段首显」管理：WPS
@@ -1828,7 +1912,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 /// （0x80040209）时再退 0xA 纯异步（读态操作/冲销尽力而为）。
 fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()> {
     let (target, client_id) = {
-        let g = shared.lock().unwrap();
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         let target = match ctx {
             Some(c) => c,
             None => g
@@ -1868,7 +1952,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 /// 异步 session 的回调需要宿主 UI 线程泵消息，Chromium 系应用在焦点
 /// 切换期持内部锁 → 排队即死锁（VSCode 点击候选框冻结事故）。
 fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {
-    let client_id = shared.lock().unwrap().client_id;
+    let client_id = shared.lock().unwrap_or_else(|e| e.into_inner()).client_id;
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
         op,
@@ -1960,7 +2044,7 @@ fn ui_element_show(
     // 传 12,12），真·持续 cloak 的其他宿主=跟光标（调用方传光标坐
     // 标）。系统自带候选条仅微软自家 IME 可用；自绘窗被
     // DWM_CLOAKED_SHELL 隐身；server topmost 窗已验证像素级可见。
-    let mut g = shared.lock().unwrap();
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.cand_ui_active = true;
     g.cand_ui_host_draws = false;
     let skin = g.skin.clone();
@@ -2006,7 +2090,7 @@ fn pipe_cand_push(
 /// 结束沉浸式候选（编码结束/失焦）：两通道各自收尾
 fn ui_element_hide(shared: &SharedRef) {
     use windows::Win32::UI::TextServices::ITfUIElementMgr;
-    let mut g = shared.lock().unwrap();
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     if !g.cand_ui_active {
         return;
     }
@@ -2160,7 +2244,7 @@ extern "system" fn poll_wndproc(
                 .map(|p| p.0.clone());
             if let Some(shared) = shared {
                 {
-                    let mut g = shared.lock().unwrap();
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     g.caret_recheck_due = false;
                 }
                 if let Some(state) = crate::ipc::state_request() {
@@ -2171,7 +2255,7 @@ extern "system" fn poll_wndproc(
                         .is_empty();
                     if !raw_empty {
                         // 候选签名不参与判断（内容没变也要移动位置）
-                        let mut g = shared.lock().unwrap();
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                         g.cand_sig_last = String::new();
                         drop(g);
                         let _ = update_ui(shared, String::new(), state);
@@ -2188,7 +2272,7 @@ fn poll_arm(shared: &SharedRef) {
     if POLL_HWND.load(AtomicOrdering::Relaxed) != 0 {
         return;
     }
-    *POLL_SHARED.lock().unwrap() = Some(PollShared(shared.clone()));
+    *POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(PollShared(shared.clone()));
     let cls: Vec<u16> = "HuFuPollWnd".encode_utf16().chain([0]).collect();
     let name: Vec<u16> = "hufu-poll".encode_utf16().chain([0]).collect();
     unsafe {
@@ -2278,7 +2362,7 @@ fn poll_tick() {
             .as_ref()
             .map(|p| p.0.clone());
         if let Some(s) = sp {
-            let g = s.lock().unwrap();
+            let g = s.lock().unwrap_or_else(|e| e.into_inner());
             let busy = g
                 .last_key_at
                 .is_some_and(|t| t.elapsed().as_millis() < 500);
@@ -2325,7 +2409,7 @@ fn poll_tick() {
                 && !(host_is_packaged() && !host_is_searchhost())
                 && !fg_same_app_dir(pid)
             {
-                let mut g = shared.lock().unwrap();
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 let mut any_visible = false;
                 if let Some(c) = g.cand2.as_mut() {
                     any_visible |= c.is_visible();
@@ -2371,7 +2455,7 @@ fn poll_tick() {
     let sig = state_sig(&state);
     let mut need_show = false;
     {
-        let mut g = shared.lock().unwrap();
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【皮肤版本失效 2026-09-08】server 保存过皮肤（版本号变化）
         // → 强制重拉绕 2.5s 时限：设置页连续调参时实机预览即时生效。
         // 放 raw_empty 判定前——预览流程 reset（断段）与打 w 之间的

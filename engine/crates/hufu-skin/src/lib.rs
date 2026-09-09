@@ -24,6 +24,14 @@ mod color_serde {
         match &v {
             serde_json::Value::String(t) => {
                 let t = t.trim_start_matches('#');
+                // 【panic 防护 2026-09-09】非 ASCII 颜色串（len 恰 6/8，
+                // 如「あい」）按字节切片切进 UTF-8 字符中间 panic——
+                // server 反序列化手改皮肤直接崩进程。先校验 ASCII。
+                if !t.is_ascii() {
+                    return Err(<D::Error as serde::de::Error>::custom(
+                        "颜色须为 ASCII 十六进制",
+                    ));
+                }
                 if t.len() == 6 || t.len() == 8 {
                     let mut buf = [0u8; 4];
                     let mut ok = true;

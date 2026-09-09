@@ -75,8 +75,8 @@ extern "system" fn cand2_wndproc(
             unsafe {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                *CAND_DOWN.lock().unwrap() = Some((pt.x, pt.y));
-                *CAND_DRAG.lock().unwrap() = None;
+                *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some((pt.x, pt.y));
+                *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = SetCapture(hwnd);
             }
             return LRESULT(0);
@@ -88,8 +88,8 @@ extern "system" fn cand2_wndproc(
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 // 死区判定：未激活时距离起点 >4px 才升级为拖拽
-                if CAND_DRAG.lock().unwrap().is_none() {
-                    let down = *CAND_DOWN.lock().unwrap();
+                if CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                    let down = *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner());
                     match down {
                         Some((sx, sy)) => {
                             if (pt.x - sx).abs() <= 4 && (pt.y - sy).abs() <= 4 {
@@ -101,9 +101,9 @@ extern "system" fn cand2_wndproc(
                     // 越过死区：此刻激活拖拽（偏移=当前鼠标−窗口原点）
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
-                    *CAND_DRAG.lock().unwrap() = Some((pt.x - wr.left, pt.y - wr.top));
+                    *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = Some((pt.x - wr.left, pt.y - wr.top));
                 }
-                let drag = *CAND_DRAG.lock().unwrap();
+                let drag = *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((dx, dy)) = drag {
                     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
                     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -136,14 +136,14 @@ extern "system" fn cand2_wndproc(
             // 什么都不动（锁定位不被单击固化偏移）。
             unsafe {
                 let _ = ReleaseCapture();
-                *CAND_DOWN.lock().unwrap() = None;
-                if CAND_DRAG.lock().unwrap().take().is_some() {
+                *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                if CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() {
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
-                    *CAND_DROP_AT.lock().unwrap() = Some((wr.left, wr.top));
+                    *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
                     // 【固定态拖动】锁定期拖到哪锁到哪：松手位置同步写回
                     // 固定坐标（旧行为：永远弹回第一次右键锁定处）。
-                    let mut pinned = CAND_PINNED.lock().unwrap();
+                    let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
                     if pinned.is_some() {
                         *pinned = Some((wr.left, wr.top));
                         drop(pinned);
@@ -154,13 +154,13 @@ extern "system" fn cand2_wndproc(
                     }
                 }
             }
-            *CAND_DRAG.lock().unwrap() = None;
+            *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return LRESULT(0);
         }
         0x204 => {
             // WM_RBUTTONDOWN：固定/解除固定（锁标志即时反馈）
             crate::tsf::trace("cw2: rdown 到达");
-            let mut pinned = CAND_PINNED.lock().unwrap();
+            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
             if pinned.is_some() {
                 *pinned = None;
                 lockwin_hide();
@@ -196,7 +196,7 @@ extern "system" fn cand2_wndproc(
                 if new_pt > 0.0 {
                     if let Some(gsh) = crate::tsf::G_SHARED.get() {
                         let shared = gsh.0.clone();
-                        let mut g = shared.lock().unwrap();
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                         let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
                             l["font_point"] = serde_json::json!(new_pt);
                             if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
@@ -306,7 +306,10 @@ fn apply_accent(hwnd: HWND, state: u32, tint: [u8; 4]) {
 
 fn parse_hex(s: &str) -> Option<[u8; 4]> {
     let s = s.trim_start_matches('#');
-    if s.len() != 8 && s.len() != 6 {
+    // 【panic 防护 2026-09-09】非 ASCII 颜色串（手改皮肤含中文，len 恰
+    // 6/8）按 &str 字节切片会切进 UTF-8 字符中间 panic——渲染线程
+    // panic=宿主进程崩。先校验 ASCII 再按字节取。
+    if !s.is_ascii() || (s.len() != 8 && s.len() != 6) {
         return None;
     }
     let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
@@ -1214,7 +1217,13 @@ impl CandidateWindowV2 {
                 let width = if width_cfg > 0.0 {
                     width_cfg
                 } else {
-                    need.clamp(min_width, 300.0)
+                    // 【最大号溢出修复 2026-09-09】原 clamp(min,300) 硬上
+                    // 限：大字号（滚轮最大）下 margin/pad/label 随字号联动
+                    // 放大，need≈内容(≤260)+边距≈358 被 300 砍——编码行/
+                    // 候选文字超窗绘制（多人实测「元素溢出边框包不住」）。
+                    // 上限改工作区宽（与横排 w_cap 同源）：大字号=宽窗，
+                    // 仅超屏封顶；内容已有显示层截断（260/240）兜底。
+                    need.clamp(min_width, w_cap)
                 };
                 let text_x = rm_x + hilite_pad + label_w;
                 // 注释列配额：右端对齐不变，宽压到「文本列右侧余量」；
@@ -2179,7 +2188,7 @@ impl CandidateWindowV2 {
             // 坐标（"x,y"，窗口原点系）。自动化验证用（把窗口钉在屏幕
             // 中央壁纸上肉眼看模糊），删文件即恢复正常。
             {
-                let mut pinned = CAND_PINNED.lock().unwrap();
+                let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
                 if pinned.is_none() {
                     if let Ok(s) = std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\pin.txt") {
                         let t = s.trim();
@@ -2192,11 +2201,11 @@ impl CandidateWindowV2 {
                     }
                 }
             }
-            if let Some(p) = CAND_DROP_AT.lock().unwrap().take() {
+            if let Some(p) = CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 self.sticky_pos = Some((p.0 + m_off, p.1 + m_off));
                 self.sticky_drag = true;
             }
-            let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap() {
+            let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
                 //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
                 // 拖动松手会回写 pin（见 WM_LBUTTONUP）——打字必然用
@@ -2356,7 +2365,7 @@ impl CandidateWindowV2 {
             // show() 的定位（渲染/Present 照常，位置交给拖拽消息控制；
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
-            let dragging = CAND_DRAG.lock().unwrap().is_some();
+            let dragging = CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             // 【毛玻璃 v3】自绘路径停用——不抓屏（v3 由 DWM acrylic 承担）
             let glass_on = false;
             if glass_on && !dragging {
@@ -2558,7 +2567,7 @@ impl CandidateWindowV2 {
             }
             // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
             // 锁与候选窗同进退；show_at 幂等：定位+显示）
-            if CAND_PINNED.lock().unwrap().is_some() {
+            if CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                 lockwin_show_at(self.hwnd);
             }
         }
@@ -2636,7 +2645,7 @@ static LOCK_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
 
 /// 创建锁指示窗（幂等）：注册类 → 分层小窗 → GDI 画锁 → ULW 上屏（隐藏态）
 fn lockwin_create() -> isize {
-    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             if IsWindow(HWND(h as *mut _)).as_bool() {
                 return h;
@@ -2757,7 +2766,7 @@ fn lockwin_create() -> isize {
         );
         let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
         let _ = DeleteDC(hdc);
-        *LOCK_HWND.lock().unwrap() = Some(hwnd.0 as isize);
+        *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) = Some(hwnd.0 as isize);
         crate::tsf::trace(&format!("lockwin: created hwnd={:p}", hwnd.0));
         hwnd.0 as isize
     }
@@ -2794,7 +2803,7 @@ fn lockwin_show_at(cand: HWND) {
 
 /// 解除固定/失焦隐藏锁
 fn lockwin_hide() {
-    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             let _ = ShowWindow(HWND(h as _), SW_HIDE);
         }
@@ -2803,10 +2812,10 @@ fn lockwin_hide() {
 
 /// 候选窗移动时联动锁窗（仅当固定中）
 fn lockwin_follow(cand: HWND) {
-    if CAND_PINNED.lock().unwrap().is_none() {
+    if CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return;
     }
-    if let Some(h) = *LOCK_HWND.lock().unwrap() {
+    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             if IsWindow(HWND(h as _)).as_bool() {
                 let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
@@ -2865,10 +2874,13 @@ unsafe fn shadowwin_render(
     g_alpha: f32,
 ) {
     let key = format!("{w}:{h}:{m}:{radius}:{g_size:.1}:{off_x}:{off_y}:{g_alpha:.2}");
-    if *SHADOW_KEY.lock().unwrap() == key {
+    if *SHADOW_KEY.lock().unwrap_or_else(|e| e.into_inner()) == key {
         return;
     }
-    *SHADOW_KEY.lock().unwrap() = key;
+    // 【KEY 提交时序 2026-09-09】幂等键改为渲染成功后提交——原实现
+    // 先写后渲染，CreateDIBSection 失败（GDI 内存耗尽等）后同 key 永
+    // 不重试：窗口尺寸已变而位图是旧的，UpdateLayeredWindow 把旧位图
+    // 拉伸到新尺寸=阴影变形「糊成一坨」（多人实测截图实锤）。
     let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
     let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
         bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
@@ -2897,7 +2909,7 @@ unsafe fn shadowwin_render(
             return;
         }
     };
-    let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
+    let old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
     // SDF 双高斯衰减【v3.9 玻璃阴影独立可调】σ₁=g_size（拖尾 2.6σ₁）、
     // 浓度=g_alpha——与纯色阴影（shadow_radius/shadow_alpha）完全独立。
     let (fw, fh) = (w as f32, h as f32);
@@ -2947,10 +2959,17 @@ unsafe fn shadowwin_render(
         Some(&blend),
         ULW_ALPHA,
     );
+    // 【DIB 泄漏修复 2026-09-09】GDI 规定：选入 DC 的对象 DeleteObject
+    // 必失败——原实现在选入状态直接删，每次参数/尺寸变化泄漏一张
+    // w×h×4 位图（数百 KB/键），累积耗尽 GDI 内存→后续 CreateDIBSection
+    // 失败（联动 KEY 时序 bug=阴影变形）。先恢复 old 出选再删。
+    SelectObject(hdc, old);
     let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
     let _ = DeleteDC(hdc);
     // bmi 仅用一次（字段都被赋值），消未用警告
     let _ = &mut bmi;
+    // 渲染成功才提交幂等键
+    *SHADOW_KEY.lock().unwrap_or_else(|e| e.into_inner()) = key;
 }
 
 /// glass 候选窗定位前调用：阴影窗先就位（目标坐标 x,y），随后候选窗
@@ -2967,8 +2986,28 @@ pub fn shadowwin_show(
     off_y: i32,
     g_alpha: f32,
 ) {
+    // 【创建竞态修复 2026-09-09】check（锁内）→create（锁外）→写回（锁
+    // 内）原实现两线程并发时各建一个阴影窗，先建的永不销毁=「阴影在别
+    // 的地方糊成一坨」（旧窗停留旧帧）。创建全程持锁（double-check）。
     let h = {
-        let mut g = SHADOW_HWND.lock().unwrap();
+        let mut g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = *g {
+            unsafe {
+                if IsWindow(HWND(h as *mut _)).as_bool() {
+                    h
+                } else {
+                    0
+                }
+            }
+        } else {
+            0
+        }
+    };
+    let h = if h != 0 {
+        h
+    } else {
+        let mut g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
+        // double-check：等锁期间另一线程可能已创建
         if let Some(h) = *g {
             unsafe {
                 if IsWindow(HWND(h as *mut _)).as_bool() {
@@ -3011,7 +3050,17 @@ pub fn shadowwin_show(
                 None,
             ) {
                 Ok(hw) if !hw.0.is_null() => {
-                    *SHADOW_HWND.lock().unwrap() = Some(hw.0 as isize);
+                    // 持锁写回：竞态双建时后建的也记录（先建的已被
+                    // 另一线程写回则此处覆盖前先销毁新建的，防泄漏）
+                    let mut g2 = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(prev) = *g2 {
+                        if prev != hw.0 as isize
+                            && IsWindow(HWND(prev as *mut _)).as_bool()
+                        {
+                            let _ = DestroyWindow(HWND(prev as *mut _));
+                        }
+                    }
+                    *g2 = Some(hw.0 as isize);
                     hw.0 as isize
                 }
                 _ => return,
@@ -3024,7 +3073,7 @@ pub fn shadowwin_show(
     unsafe {
         // 边距按独立 σ₂（拖尾 3σ₂≈47px 覆盖）——位图边界截断拖尾会出硬边
         let m = (g_size.max(0.1) * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
-        *SHADOW_M.lock().unwrap() = m;
+        *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner()) = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
         let _ = cand;
@@ -3044,7 +3093,7 @@ pub fn shadowwin_show(
 
 /// 候选窗隐藏时联动隐藏阴影
 pub fn shadowwin_hide() {
-    if let Some(h) = *SHADOW_HWND.lock().unwrap() {
+    if let Some(h) = *SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             let _ = ShowWindow(HWND(h as _), SW_HIDE);
         }
@@ -3053,11 +3102,11 @@ pub fn shadowwin_hide() {
 
 /// 拖拽移动时阴影窗跟随（候选窗原点-m 边距）
 pub fn shadowwin_follow(cand: HWND) {
-    let m = *SHADOW_M.lock().unwrap();
+    let m = *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner());
     if m == 0 {
         return;
     }
-    if let Some(h) = *SHADOW_HWND.lock().unwrap() {
+    if let Some(h) = *SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             if IsWindow(HWND(h as _)).as_bool() && IsWindowVisible(HWND(h as _)).as_bool() {
                 let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
