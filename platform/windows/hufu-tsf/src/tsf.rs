@@ -1105,6 +1105,18 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::SetPreedit(text) => {
+                // 【组段漂移自愈 2026-09-09】选区已离段（用户点了别处，
+                // 宿主未按契约终止组段）——弃旧段在当前光标处重组段，
+                // 否则本键的预编辑写进旧位置（「首键不在光标处」）。
+                if composition_drifted(&g, &ctx, ec) {
+                    trace("SetPreedit: 选区离段——重组段跟随光标");
+                    if let Some(comp) = g.composition.clone() {
+                        let _ = unsafe { comp.EndComposition(ec) };
+                    }
+                    g.composition = None;
+                    drop(g);
+                    return start_preedit_on(&ctx, &self.shared, ec, &text);
+                }
                 let comp = g
                     .composition
                     .clone()
@@ -1170,6 +1182,16 @@ impl EditSession_Impl {
                         }
                     }
                     return Ok(());
+                }
+                // 【组段漂移自愈 2026-09-09】上屏前同款检测：选区离段
+                //（用户点击别处、宿主未终止组段）时旧段锚在旧位——弃段
+                // 走下方「无组段直插」在光标处落字，否则整词上到旧位置。
+                if composition_drifted(&g, &ctx, ec) {
+                    trace("Commit: 选区离段——弃旧段改光标直插");
+                    if let Some(comp) = g.composition.clone() {
+                        let _ = unsafe { comp.EndComposition(ec) };
+                    }
+                    g.composition = None;
                 }
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
@@ -1255,6 +1277,15 @@ impl EditSession_Impl {
                 // 1) 提交前缀：组段文本置为 commit → EndComposition 落地
                 // 【空格清屏修复】与 Op::Commit 同款自愈：死组段 SetText
                 // 失败时直插保字，不让已消费的 commit 丢失。
+                // 【组段漂移自愈 2026-09-09】选区离段同款：弃段走直插，
+                // 重开组段（第 2 步）本就读当前选区=剩余编码落在光标处。
+                if composition_drifted(&g, &ctx, ec) {
+                    trace("C&R: 选区离段——弃旧段改光标直插");
+                    if let Some(comp) = g.composition.clone() {
+                        let _ = unsafe { comp.EndComposition(ec) };
+                    }
+                    g.composition = None;
+                }
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
@@ -1389,6 +1420,36 @@ fn set_selection_at_end(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Result<(
     unsafe { core::mem::ManuallyDrop::drop(&mut sel[0].range) };
     hr?;
     Ok(())
+}
+
+/// 【组段漂移检测 2026-09-09】当前选区是否已离开组段范围——用户点击
+/// 别处而宿主未按 TSF 契约终止组段（OnCompositionTerminated 空实现收
+/// 不到/收了也不清句柄）时，组段仍活且锚在旧位：继续 SetText/上屏全
+/// 部落在旧位置而非光标处（实测「选候选后首键不在光标处」）。
+/// 判定=选区起点在段 [start,end] 之外（两端含）；正常打字选区恒在
+/// 段内（建段时设过一次选区、跟随宿主自行走到段尾，皆在界内）。
+/// GetSelection/CompareStart 是纯文档锚点查询（无布局无通知链），
+/// 逐键一次的代价远低于已剔除的 GetTextExt/SetSelection。
+fn composition_drifted(g: &Shared, ctx: &ITfContext, ec: u32) -> bool {
+    let Some(comp) = g.composition.as_ref() else {
+        return false;
+    };
+    let Ok(range) = (unsafe { comp.GetRange() }) else {
+        return true; // 句柄已死，交上层重开/直插
+    };
+    let Ok(sel) = selection_range(ctx, ec) else {
+        return false; // 查不到选区：保守不动
+    };
+    let (before, after) = unsafe {
+        (
+            sel.CompareStart(ec, &range, TF_ANCHOR_START),
+            sel.CompareStart(ec, &range, TF_ANCHOR_END),
+        )
+    };
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return false; // 比较失败：保守不动
+    };
+    before < 0 || after > 0
 }
 
 /// 当前选区（= 光标插入点）克隆出的范围，作为组段起点。
