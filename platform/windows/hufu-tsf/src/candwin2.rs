@@ -64,7 +64,10 @@ extern "system" fn cand2_wndproc(
         // WM_NCHITTEST → HTCLIENT
         return LRESULT(1);
     }
-    // 【鼠标交互】左键按住拖拽移动候选窗；右键固定/解除固定位置。
+    // 【鼠标交互 2026-09-10 用户拍板】左键按住拖动=拖到哪里固定在哪
+    // 里（跨组段保持）；右键=解除固定，候选窗回光标处恢复跟随。
+    // （旧「拖动+右键锁定/再右键解除」双路径已废——分叉时序曾实测
+    // 拖 A 锁定→拖 B→打字回 A；锁标小窗一并移除。）
     // 冻结事故教训（已修）：本窗口过程的按钮消息自持自理、绝不经
     // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
     // 消息路径（非 TSF 焦点回调），无死锁面。
@@ -124,7 +127,6 @@ extern "system" fn cand2_wndproc(
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
-                    lockwin_follow(hwnd);
                     shadowwin_follow(hwnd);
                 }
             }
@@ -132,8 +134,11 @@ extern "system" fn cand2_wndproc(
         }
         0x202 => {
             // WM_LBUTTONUP：结束拖拽；只有真拖过（越过死区）松手位置才
-            // 交给 show() 作 sticky / 回写 pin——纯单击（抖动在死区内）
-            // 什么都不动（锁定位不被单击固化偏移）。
+            // 交给 show() 作 sticky——纯单击（抖动在死区内）什么都不动。
+            // 【拖动即固定 2026-09-10 用户拍板】松手同时把固定位更新为
+            // 松手处：拖到哪里就固定在哪里，无需再右键锁定（旧两套
+            // 分叉语义——未固定态松手只 sticky 本组段+固定态松手回写
+            // ——叠加右键时序曾实测「拖 A 锁定→拖 B→打字回 A」）。
             unsafe {
                 let _ = ReleaseCapture();
                 *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -141,37 +146,27 @@ extern "system" fn cand2_wndproc(
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
-                    // 【固定态拖动】锁定期拖到哪锁到哪：松手位置同步写回
-                    // 固定坐标（旧行为：永远弹回第一次右键锁定处）。
-                    let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
-                    if pinned.is_some() {
-                        *pinned = Some((wr.left, wr.top));
-                        drop(pinned);
-                        crate::tsf::diag_note(&format!(
-                            "cw2 pin 拖动松手回写 ({},{})",
-                            wr.left, wr.top
-                        ));
-                    }
+                    *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
+                    crate::tsf::diag_note(&format!(
+                        "cw2 pin 拖动即固定 ({},{})",
+                        wr.left, wr.top
+                    ));
                 }
             }
             *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return LRESULT(0);
         }
         0x204 => {
-            // WM_RBUTTONDOWN：固定/解除固定（锁标志即时反馈）
-            crate::tsf::trace("cw2: rdown 到达");
+            // WM_RBUTTONDOWN：【右键=解锁 2026-09-10 用户拍板】清除固定
+            // 位与拖拽钉住残留——候选窗回到光标处恢复跟随。未固定时
+            // 右键无操作（不再有「右键固定」路径）。
             let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
             if pinned.is_some() {
                 *pinned = None;
-                lockwin_hide();
-            } else {
-                unsafe {
-                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                    let _ = GetWindowRect(hwnd, &mut wr);
-                    *pinned = Some((wr.left, wr.top));
-                }
                 drop(pinned);
-                lockwin_show_at(hwnd);
+                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                crate::tsf::diag_note("cw2 pin 右键解除（回跟随光标）");
             }
             return LRESULT(0);
         }
@@ -2243,6 +2238,18 @@ impl CandidateWindowV2 {
                 self.sticky_pos = Some((p.0 + m_off, p.1 + m_off));
                 self.sticky_drag = true;
             }
+            // 【右键解锁 2026-09-10】清除拖拽钉住残留（sticky 是实例
+            // 字段、wndproc 摸不到 self——经全局标记转交：右键置位，
+            // 下一帧 show 消费），否则解除固定后本组段仍钉旧位置不回
+            // 跟随光标。
+            {
+                let mut un = CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner());
+                if *un {
+                    *un = false;
+                    self.sticky_pos = None;
+                    self.sticky_drag = false;
+                }
+            }
             let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
                 //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
@@ -2603,11 +2610,8 @@ impl CandidateWindowV2 {
                     }
                 }
             }
-            // 固定中：锁指示窗跟随/重现（组段间 hide/show 循环里
-            // 锁与候选窗同进退；show_at 幂等：定位+显示）
-            if CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-                lockwin_show_at(self.hwnd);
-            }
+            // 【锁标已移除 2026-09-10】固定态不再有视觉指示（拖动即
+            // 固定、右键即解锁——位置本身即状态，无需锁标小窗）。
         }
     }
 
@@ -2636,8 +2640,7 @@ impl CandidateWindowV2 {
         // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
         // ——下一组段恢复跟随 caret。
         self.sticky_drag = false;
-        // 候选窗隐藏时锁指示窗/阴影窗同退（组段间不孤零零挂着）
-        lockwin_hide();
+        // 候选窗隐藏时阴影窗同退（组段间不孤零零挂着）
         shadowwin_hide();
         // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
         // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
@@ -2661,220 +2664,27 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 static CAND_DRAG: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 /// 【点击死区 2026-09-08】左键按下时的鼠标屏幕位（未激活拖拽）。
 /// MOUSEMOVE 累计位移 >4px 才激活 CAND_DRAG——单击的鼠标抖动
-/// （1-2px）不拖窗、松手不回写 pin（用户实测「锁了之后左键点一下
+/// （1-2px）不拖窗、松手不固化 pin（用户实测「锁了之后左键点一下
 /// 跳一下/位移一下」：抖动被当拖拽，窗口挪一点还把偏移固化）。
 static CAND_DOWN: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
 /// 候选窗固定位置（窗口原点，屏幕坐标）；None=未固定。
-/// 右键切换：固定后 show() 忽略光标锚点钉在此处，跨组段/上屏保持；
-/// 再次右键解除恢复跟随光标。进程级（每个应用独立记忆）。
+/// 【2026-09-10 用户拍板】拖动松手即固定（拖到哪里固定在哪里，跨组
+/// 段/上屏保持）；右键解除恢复跟随光标。进程级（每应用独立记忆）。
 pub static CAND_PINNED: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
 /// 拖拽松手位置（wndproc → show() 一次性消费：设为 sticky_pos，
 /// 本组段内留在松手处；新组段锚点就绪即恢复跟随光标）。
 static CAND_DROP_AT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
-// ── 固定锁指示小窗（独立 GDI 分层窗）──
-// 右键固定/解除【即时】反馈：锁不画在候选窗渲染帧里（那要等下一次
-// 键入触发渲染），而是独立小窗——右键当场显示/隐藏，并跟随候选窗
-// 移动（拖拽/show() 定位联动）。鼠标穿透，纯视觉指示。
-
-static LOCK_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
-
-/// 创建锁指示窗（幂等）：注册类 → 分层小窗 → GDI 画锁 → ULW 上屏（隐藏态）
-fn lockwin_create() -> isize {
-    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
-        unsafe {
-            if IsWindow(HWND(h as *mut _)).as_bool() {
-                return h;
-            }
-        }
-    }
-    unsafe {
-        let class: Vec<u16> = "HuFuCandLock\0".encode_utf16().collect();
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(defwindowproc_w),
-            hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
-                .unwrap_or(HCURSOR(std::ptr::null_mut())),
-            lpszClassName: PCWSTR(class.as_ptr()),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            ..Default::default()
-        };
-        let atom = RegisterClassW(&wc);
-        if atom == 0 {
-            crate::tsf::trace(&format!("lockwin: RegisterClass 失败 err={}", GetLastError().0));
-        }
-        let ex = WINDOW_EX_STYLE(
-            WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0
-                | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0,
-        );
-        let hwnd = match CreateWindowExW(
-            ex,
-            PCWSTR(class.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE(WS_POPUP.0),
-            0, 0, 10, 12,
-            HWND(std::ptr::null_mut()),
-            HMENU(std::ptr::null_mut()),
-            HINSTANCE(std::ptr::null_mut()),
-            None,
-        ) {
-            Ok(h) if !h.0.is_null() => h,
-            _ => {
-                crate::tsf::trace(&format!("lockwin: CreateWindow 失败 err={}", GetLastError().0));
-                return 0;
-            }
-        };
-        // 画锁位图（预乘 alpha）：锁环白描边 + 锁体白填充（10x12 小锁）
-        let (w, h) = (10i32, 12i32);
-        let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
-        let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
-            bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: 0,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            },
-            bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
-        };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = match CreateDIBSection(hdc, &bmi as *const _, windows::Win32::Graphics::Gdi::DIB_USAGE(0), &mut bits, None, 0) {
-            Ok(d) if !bits.is_null() => d,
-            _ => {
-                crate::tsf::trace(&format!("lockwin: DIB 失败 err={}", GetLastError().0));
-                let _ = DeleteDC(hdc);
-                return 0;
-            }
-        };
-        let _old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-        // 黑底（透明）上画白锁
-        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
-        let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
-        let oldb = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
-        let oldp = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
-        // 锁体（圆角矩形填充）
-        let _ = RoundRect(hdc, 1, 6, 9, 11, 2, 2);
-        // 锁环（上半弧描边）
-        let _ = Arc(hdc, 2, 0, 8, 8, 8, 4, 2, 4);
-        let _ = SelectObject(hdc, oldb);
-        let _ = SelectObject(hdc, oldp);
-        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
-        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(pen.0));
-        // 【关键】此处【不可】把 DIB 选出 DC——ULW 用 hdcSrc 当前选入
-        // 的位图上屏，提前恢复 old（空 1x1 单色位图）会让锁窗内容
-        // 全空（vis=1 但屏幕上无锁——Chrome/QQ/跟打器全看不见的
-        // 病根；PS 验证版没做恢复所以显示成功）。位图随 DC 一起销毁
-        // 即可，old 无须恢复。
-        // GDI 不写 alpha：非黑像素 alpha 置 255（预乘已满足，白=255×1.0）
-        {
-            let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-            for i in (0..px.len()).step_by(4) {
-                if px[i] != 0 || px[i + 1] != 0 || px[i + 2] != 0 {
-                    px[i + 3] = 255;
-                } else {
-                    px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 0;
-                }
-            }
-        }
-        // ULW 上屏（窗口保持隐藏，显示由 ShowWindow 控制）。
-        // pptDst=None：不动位置（Some(0,0) 会把窗拽到屏幕左上角——
-        // 位置由 show_at 的 SetWindowPos 负责）。
-        let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
-            BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 235, AlphaFormat: 1,
-        };
-        let pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-        let sz = windows::Win32::Foundation::SIZE { cx: w, cy: h };
-        let _ = UpdateLayeredWindow(
-            hwnd,
-            None,
-            None,
-            Some(&sz as *const windows::Win32::Foundation::SIZE),
-            hdc,
-            Some(&pt as *const windows::Win32::Foundation::POINT),
-            windows::Win32::Foundation::COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-        let _ = DeleteDC(hdc);
-        *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) = Some(hwnd.0 as isize);
-        crate::tsf::trace(&format!("lockwin: created hwnd={:p}", hwnd.0));
-        hwnd.0 as isize
-    }
-}
-
-/// 右键固定：立即显示锁（定位于候选窗内容区右上角附近）
-fn lockwin_show_at(cand: HWND) {
-    let h = lockwin_create();
-    if h == 0 {
-        return;
-    }
-    unsafe {
-        let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        let _ = GetWindowRect(cand, &mut wr);
-        // 左上角（候选窗窗口矩形左上角内侧）
-        let x = wr.left + 5;
-        let y = wr.top + 5;
-        // 候选窗每帧 SetWindowPos(HWND_TOPMOST) 会把自己顶到 TOPMOST
-        // 层最上——锁窗若不跟着置顶会被候选窗盖住（vis=1 但看不见
-        // 的病根）。置顶而非 NOZORDER。
-        let _ = SetWindowPos(
-            HWND(h as *mut _),
-            HWND_TOPMOST,
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        let _ = ShowWindow(HWND(h as *mut _), SW_SHOWNOACTIVATE);
-        crate::tsf::trace(&format!("lockwin: show L-top ({x},{y}) vis={} err={}", IsWindowVisible(HWND(h as *mut _)).0, GetLastError().0));
-    }
-}
-
-/// 解除固定/失焦隐藏锁
-fn lockwin_hide() {
-    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
-        unsafe {
-            let _ = ShowWindow(HWND(h as _), SW_HIDE);
-        }
-    }
-}
-
-/// 候选窗移动时联动锁窗（仅当固定中）
-fn lockwin_follow(cand: HWND) {
-    if CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-        return;
-    }
-    if let Some(h) = *LOCK_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
-        unsafe {
-            if IsWindow(HWND(h as _)).as_bool() {
-                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                let _ = GetWindowRect(cand, &mut wr);
-                let _ = SetWindowPos(
-                    HWND(h as *mut _),
-                    HWND_TOPMOST,
-                    wr.left + 5,
-                    wr.top + 5,
-                    0, 0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        }
-    }
-}
+/// 【右键解锁 2026-09-10】wndproc → show() 一次性标记：右键解除固定
+/// 时置位，下一帧 show 清 sticky_pos/sticky_drag（拖拽钉住残留）。
+static CAND_UNSTICK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 // ── 独立阴影窗（毛玻璃 v3.5）──
 // glass 候选窗无边距（accent 限制窗口=面板）——自绘阴影没有边距区
 // 可画、DwmExtendFrame 对 DComp 直呈窗无效（实测无阴影）。独立分层
-// 窗（lockwin 同模式）：尺寸=面板+2m 边距，SDF 高斯衰减 alpha 阴影，
+// 窗（分层 ULW）：尺寸=面板+2m 边距，SDF 高斯衰减 alpha 阴影，
 // ULW 上屏，Z 序在候选窗下（先置顶，候选窗随后 TOPMOST 盖上）。
 static SHADOW_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
 static SHADOW_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -3161,13 +2971,4 @@ pub fn shadowwin_follow(cand: HWND) {
             }
         }
     }
-}
-
-unsafe extern "system" fn defwindowproc_w(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
