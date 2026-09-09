@@ -265,9 +265,20 @@ fn play_sync(c: Clip, is_key: bool) {
         };
         if waveOutPrepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32) != 0 {
             unregister_active(h);
+            retire_handle(h, c.samples_per_sec, c.channels, c.bits);
             return;
         }
-        let _ = waveOutWrite(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
+        if waveOutWrite(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32) != 0 {
+            // 【设备热插拔自愈 2026-09-11】写失败≈输出设备移除/默认设备
+            // 切换——旧实现静默失败到进程结束（音效从此无声）。退役死
+            // 句柄：Close + 从池剔除；池空删条目，下次播放 take_handle
+            // 全新重开（拿到新默认设备）。
+            let _ = waveOutReset(h);
+            let _ = waveOutUnprepareHeader(h, &mut hdr, std::mem::size_of::<WAVEHDR>() as u32);
+            unregister_active(h);
+            retire_handle(h, c.samples_per_sec, c.channels, c.bits);
+            return;
+        }
         // 等 WHDR_DONE：键音 160-175ms；key_up() 的 waveOutReset 会把头标
         // 置 DONE 提前出循环（松开即停）。超时兜底 Reset 防 UAF：栈上
         // WAVEHDR 若仍被驱动写，函数返回后就是悬垂指针。
@@ -293,6 +304,22 @@ fn unregister_active(h: HWAVEOUT) {
     let mut act = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(pos) = act.iter().position(|ah| ah.0 == h) {
         act.swap_remove(pos);
+    }
+}
+
+/// 退役失效句柄（设备热插拔）：Close 死句柄并从对应格式池剔除；
+/// 池空则删整条目（下次 take_handle 重建拿新设备）。
+fn retire_handle(h: HWAVEOUT, rate: u32, channels: u16, bits: u16) {
+    unsafe {
+        let _ = waveOutClose(h);
+    }
+    let mut pools = POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (rate, channels, bits);
+    if let Some(pool) = pools.iter_mut().find(|p| p.key == key) {
+        pool.handles.retain(|x| *x != h);
+        if pool.handles.is_empty() {
+            pools.retain(|p| p.key != key);
+        }
     }
 }
 

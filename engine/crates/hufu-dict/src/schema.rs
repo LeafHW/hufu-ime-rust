@@ -3,7 +3,7 @@
 use crate::annotation::{AnnotationTable, ReverseTable};
 use crate::dict::Dict;
 use crate::entry::DictEntry;
-use crate::parse::{self, parse_file, TableFormat};
+use crate::parse::{self, parse_file};
 use crate::supplement::Supplement;
 use crate::symbols::SymbolTables;
 use crate::user::{UserAdjust, UserDict};

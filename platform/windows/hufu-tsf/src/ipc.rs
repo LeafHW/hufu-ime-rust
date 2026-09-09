@@ -114,10 +114,29 @@ fn read_installdir() -> Option<String> {
 }
 
 fn ensure_server() -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static TRIED: AtomicBool = AtomicBool::new(false);
-    if TRIED.swap(true, Ordering::SeqCst) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // 【退避重试 2026-09-11】旧实现 AtomicBool 一次性闸门：首次拉起
+    // 失败（安装目录未就绪/杀毒拦截）后本进程永远不再尝试——用户
+    // 表现为「打字失效直到重启宿主」。改时间戳退避：失败 30s 后放行
+    // 重试；成功后置 u64::MAX（进程内不再拉）。
+    static NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
+    const OK: u64 = u64::MAX;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cur = NEXT_TRY_MS.load(Ordering::SeqCst);
+    if cur == OK {
         return false;
+    }
+    if now < cur {
+        return false; // 退避窗口内
+    }
+    if NEXT_TRY_MS
+        .compare_exchange(cur, now + 30_000, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false; // 并发拉起：让先到者去
     }
     // 候选：宿主 exe 同目录（开发态）→ 注册表 InstallDir（绿色原地安装：
     // DLL 在 SystemIME 而程序在安装目录，安装器写入 HKCU\Software\HuFu）
@@ -190,10 +209,12 @@ fn ensure_server() -> bool {
                 CloseHandle(blk.pi[0]);
                 CloseHandle(blk.pi[1]);
             }
+            NEXT_TRY_MS.store(OK, Ordering::SeqCst);
             crate::tsf::trace("ipc: 已自愈拉起 hufu-server");
             return true;
         }
     }
+    crate::tsf::trace("ipc: ensure_server 全候选失败（30s 后重试）");
     false
 }
 
@@ -239,8 +260,11 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
         if !spawned {
             spawned = true;
             if ensure_server() {
-                wait_ms = 1000;
-                max_tries = 3;
+                // 【拉起预算 2026-09-11】新进程冷启（载词典）需要余量，
+                // 但 3×1000ms 太肥（后台 poll 线程会陪等 3s+）；压到
+                // 2×800ms——实测词典装 <1s，够用且不拖死通道上限。
+                wait_ms = 800;
+                max_tries = 2;
             }
         }
         if WaitNamedPipeW(name.as_ptr(), wait_ms) == 0 || tries >= max_tries {

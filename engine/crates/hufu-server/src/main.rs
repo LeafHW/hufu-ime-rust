@@ -94,6 +94,20 @@ fn main() {
         eprintln!("数据目录不可创建: {e}");
         std::process::exit(1);
     }
+    // 【单实例互斥 2026-09-11】此前靠 4390 端口 bind 冲突兜底，但管道
+    // 线程先于 HTTP 启动 → 双实例并存窗口期（双 pipe、双托盘消息窗）。
+    // 命名互斥体进程级兜底：已存在即本进程直接退（老实例继续服务）。
+    #[cfg(windows)]
+    if sys_win::already_running() {
+        eprintln!("hufu-server 已在运行（命名互斥体命中），本实例退出");
+        std::process::exit(0);
+    }
+    // 【DPI 感知 2026-09-11】server 代画候选窗此前按 96-DPI 逻辑像素
+    // 当物理像素用：进程默认 DPI-unaware，窗口被系统拉伸模糊、坐标
+    // 与 DLL（物理像素）错位。声明 Per-Monitor V2 后按窗口实际 DPI
+    // 缩放渲染（candwin.rs render_frame），与 candwin2 同款语义。
+    #[cfg(windows)]
+    sys_win::declare_per_monitor_dpi();
     let host = match Host::new(&data_dir) {
         Ok(h) => h,
         Err(e) => {
@@ -103,12 +117,17 @@ fn main() {
     };
     {
         // 【性能插桩】main 侧总戳（与 host.rs 的 Host::new 打点配套）
+        // 【轮转 2026-09-11】启动追加了无上限增长——超 4MB 翻转 .old
         use std::io::Write;
+        let p = r"C:\ProgramData\HuFu\diag\startup-trace.txt";
         let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+        if std::fs::metadata(p).map(|m| m.len() > 4 << 20).unwrap_or(false) {
+            let _ = std::fs::rename(p, r"C:\ProgramData\HuFu\diag\startup-trace.old.txt");
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+            .open(p)
         {
             let _ = writeln!(f, "--- Host::new 完成（含 spawn 前全部同步工作）---");
         }
@@ -140,11 +159,11 @@ fn main() {
     // （默认 `）前即已就绪。
     {
         let shared_bg = shared.clone();
-        std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("hufu-reverse-warm".into())
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let mut h = shared_bg.lock().unwrap();
+                let mut h = shared_bg.lock().unwrap_or_else(|p| p.into_inner());
                 h.engine.ensure_reverse();
             });
     }
@@ -210,7 +229,11 @@ fn main() {
         });
         std::thread::spawn(move || {
             if quit_rx.recv().is_ok() {
-                let _ = std::fs::remove_file(std::env::current_dir().unwrap_or_default().join("server.pid"));
+                // 【pid 路径修复 2026-09-11】旧实现用 current_dir()（GUI
+                // 子系统 CWD 不可控，基本删不中）。谁都不写 server.pid
+                //（历史上只有开发脚本假定它存在）——按脚本期望路径防御
+                // 性清理一次。
+                let _ = std::fs::remove_file(data_dir.join("server.pid"));
                 std::process::exit(0);
             }
         });
@@ -227,83 +250,135 @@ fn main() {
 }
 
 /// 【/jq→补充语料 2026-09-06】weight API 运行时触发整句模型重载需要
-/// 'static 句柄——main 里登记，API 里取用。
+/// 'static 句柄——main 里登记，全局登记。
 static HOST_HANDLE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Host>>> =
     std::sync::OnceLock::new();
+
+/// 【卡死修复 2026-09-11】切方案/重载码表/改配置路径经此入口重建整句：
+/// 旧 setup_sentence 在持锁状态同步载 546MB ngram（秒级~10s），期间
+/// 全机按键/轮询阻塞。现统一为：独立线程短锁决策——门控不满足
+///（切到非整句方案/关整句）立即拆旧模型（便宜）；teardown_old=真
+///（方案切换，旧模型词典与新方案不符）也先拆——打字暂时走码表
+///（词典模式），后台不持锁装载、载完短锁热挂（与启动路径同款）。
+/// 调用方可能正持有 Host 锁（pipe dispatch/HTTP 路由/tray）：函数
+/// 体内再入锁会死锁，故先 spawn 井线程、由它等锁释放。
+pub fn reload_sentence_bg(teardown_old: bool, resupplement: bool) {
+    std::thread::Builder::new()
+        .name("hufu-sentence-reload-kick".into())
+        .spawn(move || {
+            let Some(shared) = HOST_HANDLE.get() else { return };
+            {
+                let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                if teardown_old || h.sentence_load_plan().is_none() {
+                    h.engine.set_sentence_decoder(None);
+                }
+                // 拖入模型补装（原 setup_sentence 尾部语义）：rerank 线程
+                // 缺位而 qwen 模型如今在场 → 补建
+                h.ensure_rerank_if_late();
+            }
+            spawn_sentence_reload(shared.clone(), resupplement);
+        })
+        .ok();
+}
 
 /// 整句模型后台装载（启动与 /jq 加权后共用）：短锁取装载计划
 ///（resupplement=true 时先重读 补充语料.txt 刷新内存快照——补充语料
 /// 只在模型装载时生效，写入后必须重载模型），不持锁载 ngram
 ///（page cache 热时 ~2s），载完短锁热挂。期间管道/设置页/打字照常
 ///（旧模型继续服务）。
+/// 【加载去重 2026-09-11】连续触发（weight API 连续调/快速切方案）
+/// 不再各起一个装载线程并发载 N 份 546MB：BUSY 闸门 + PENDING 重跑，
+/// 装载串行、最后一次请求语义不丢。
+static NGRAM_LOAD_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NGRAM_LOAD_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_sentence_reload(
     shared: std::sync::Arc<std::sync::Mutex<Host>>,
     resupplement: bool,
 ) {
+    use std::sync::atomic::Ordering;
+    if NGRAM_LOAD_BUSY.swap(true, Ordering::SeqCst) {
+        // 已有装载在跑：只记「再来一次」（装载完成后补跑，覆盖最新
+        // 配置——补跑按重读补充语料语义，保证 weight 类变更生效）
+        NGRAM_LOAD_PENDING.store(true, Ordering::SeqCst);
+        return;
+    }
     std::thread::Builder::new()
         .name("hufu-ngram-load".into())
         .spawn(move || {
-            let t0 = std::time::Instant::now();
-            let plan = {
-                let mut h = shared.lock().unwrap();
-                if resupplement {
-                    let p = h.engine.schema.dir.join("补充语料.txt");
-                    match hufu_dict::supplement::Supplement::load(&p) {
-                        Ok(s) => h.engine.schema.supplement = s,
-                        Err(e) => eprintln!("补充语料重读失败: {e}"),
+            let mut first = true;
+            loop {
+                let resupplement = if first { resupplement } else { true };
+                first = false;
+                let t0 = std::time::Instant::now();
+                let plan = {
+                    let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    if resupplement {
+                        let p = h.engine.schema.dir.join("补充语料.txt");
+                        match hufu_dict::supplement::Supplement::load(&p) {
+                            Ok(s) => h.engine.schema.supplement = s,
+                            Err(e) => eprintln!("补充语料重读失败: {e}"),
+                        }
                     }
-                }
-                h.sentence_load_plan()
-            };
-            let Some((path, dict, supplement, weights)) = plan else {
-                return;
-            };
-            // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
-            // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
-            // 重载时页缓存已热，顺序读很快返回。
-            {
-                let p = path.clone();
-                std::thread::Builder::new()
-                    .name("hufu-ngram-warm".into())
-                    .spawn(move || {
-                        let t0 = std::time::Instant::now();
-                        if let Ok(mut f) = std::fs::File::open(&p) {
-                            use std::io::Read;
-                            let mut buf = vec![0u8; 4 << 20];
-                            while let Ok(n) = f.read(&mut buf) {
-                                if n == 0 {
-                                    break;
+                    h.sentence_load_plan()
+                };
+                let Some((path, dict, supplement, weights)) = plan else {
+                    break;
+                };
+                // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
+                // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
+                // 重载时页缓存已热，顺序读很快返回。
+                {
+                    let p = path.clone();
+                    std::thread::Builder::new()
+                        .name("hufu-ngram-warm".into())
+                        .spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            if let Ok(mut f) = std::fs::File::open(&p) {
+                                use std::io::Read;
+                                let mut buf = vec![0u8; 4 << 20];
+                                while let Ok(n) = f.read(&mut buf) {
+                                    if n == 0 {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        eprintln!(
-                            "ngram 页缓存预热完成（{:.1}s）",
-                            t0.elapsed().as_secs_f32()
-                        );
-                    })
-                    .ok();
-            }
-            match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
-                Ok(dec) => {
-                    let mut h = shared.lock().unwrap();
-                    // 装载期间用户可能切方案/关整句：只在仍满足
-                    // 门控时挂载，否则弃用本次结果
-                    if h.engine.config.schema.current.contains("整句")
-                        && h.engine.config.sentence.enabled
-                    {
-                        h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
-                        // 【用户词注入 2026-09-06】装载后即注入
-                        //（/jc 加词参与整句词图）
-                        h.engine.sync_sentence_user_words();
-                        eprintln!(
-                            "整句引擎已加载（后台 {:.1}s）: {}",
-                            t0.elapsed().as_secs_f32(),
-                            path.display()
-                        );
-                    }
+                            eprintln!(
+                                "ngram 页缓存预热完成（{:.1}s）",
+                                t0.elapsed().as_secs_f32()
+                            );
+                        })
+                        .ok();
                 }
-                Err(e) => eprintln!("整句模型后台加载失败: {e}"),
+                match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
+                    Ok(dec) => {
+                        let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                        // 装载期间用户可能切方案/关整句：只在仍满足
+                        // 门控时挂载，否则弃用本次结果
+                        if h.engine.config.schema.current.contains("整句")
+                            && h.engine.config.sentence.enabled
+                        {
+                            h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+                            // 【用户词注入 2026-09-06】装载后即注入
+                            //（/jc 加词参与整句词图）
+                            h.engine.sync_sentence_user_words();
+                            eprintln!(
+                                "整句引擎已加载（后台 {:.1}s）: {}",
+                                t0.elapsed().as_secs_f32(),
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("整句模型后台加载失败: {e}"),
+                }
+                if !NGRAM_LOAD_PENDING.swap(false, Ordering::SeqCst) {
+                    break;
+                }
+                eprintln!("整句模型装载：排队中的重载请求，补跑一轮");
             }
+            NGRAM_LOAD_BUSY.store(false, Ordering::SeqCst);
         })
         .ok();
 }
@@ -374,6 +449,32 @@ fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
 }
 
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
+    // 【浏览器源加固 2026-09-11】所有副作用端点（POST）拒绝跨源网页：
+    // 浏览器跨源 POST 必带 Origin 头且值非本站（页面 JS 无法伪造）；
+    // 本机原生调用方（设置页同源 fetch、托盘、管道 DLL）要么同源
+    // 要么无 Origin。恶意网页 fetch no-cors POST 直达 127.0.0.1:4390
+    // 杀 server（/api/shutdown 无鉴权审计项）由此封死；Host 白名单
+    // 同时防 DNS rebinding（外域域名解析到 127.0.0.1 的请求 Host
+    // 不是本机名）。
+    if req.method == "POST" {
+        if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
+            let local = origin.starts_with("http://127.0.0.1:")
+                || origin.starts_with("http://localhost:")
+                || origin.starts_with("http://[::1]:");
+            if !local {
+                return Response::err(403, "跨源请求被拒绝");
+            }
+        }
+        if let Some(h) = req.headers.get("host").filter(|h| !h.is_empty()) {
+            let h = h.to_lowercase();
+            let local_host = h.starts_with("127.0.0.1")
+                || h.starts_with("localhost")
+                || h.starts_with("[::1]");
+            if !local_host {
+                return Response::err(403, "非法 Host");
+            }
+        }
+    }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
     let path = req.path.as_str();
@@ -477,7 +578,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => return Response::err(400, &format!("配置无效: {e}")),
             };
             match host.apply_config(cfg) {
-                Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                Ok((need_sentence, teardown)) => {
+                    if need_sentence {
+                        // 【卡死修复】后台重建整句（旧 setup_sentence 持锁
+                        // 载 546MB 模型秒级卡全机打字）
+                        reload_sentence_bg(teardown, true);
+                    }
+                    Response::json(&serde_json::json!({"ok": true}))
+                }
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
             }
         }
@@ -794,7 +902,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match host.engine.switch_schema(&name) {
                 Ok(()) => {
                     host.session.clear();
-                    host.setup_sentence();
+                    // 【卡死修复】旧 setup_sentence 持锁同步载模型（秒级
+                    // 卡全机）——改后台重建（先拆旧防跨方案词典串扰）
+                    reload_sentence_bg(true, false);
                     let _ = host.engine.config.save(&host.config_path);
                     Response::json(&serde_json::json!({"ok": true, "current": name}))
                 }
@@ -848,8 +958,48 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
         }
         ("POST", "/api/shutdown") => {
+            // 源校验已在 route 入口完成（跨源网页 403）；此处只剩本机
+            // 设置页/托盘语义的合法调用
             std::process::exit(0);
         }
         _ => Response::err(404, "not found"),
+    }
+}
+
+/// Windows 原生小件：单实例互斥 + DPI 感知声明（零依赖 extern）。
+#[cfg(windows)]
+mod sys_win {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(sa: *const core::ffi::c_void, initial: i32, name: *const u16) -> isize;
+        fn GetLastError() -> u32;
+        fn SetProcessDpiAwarenessContext(value: *mut core::ffi::c_void) -> i32;
+        fn SetProcessDpiAwareness(value: u32) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    /// 已有实例在跑（命名互斥体命中）→ true。句柄故意不关：进程存续
+    /// 期间互斥体必须持有；退出时系统自动回收。
+    pub fn already_running() -> bool {
+        let name: Vec<u16> = "HuFu-IME-Server-Single-Instance\0"
+            .encode_utf16()
+            .collect();
+        unsafe {
+            let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            // 句柄无效（极端：句柄表满）当「未命中」走老路：端口 bind 兜底
+            h != 0 && GetLastError() == ERROR_ALREADY_EXISTS
+        }
+    }
+
+    /// Per-Monitor V2（Win10 1703+）；旧系统回落 per-monitor v1。
+    pub fn declare_per_monitor_dpi() {
+        unsafe {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ((HANDLE)-4)
+            let pm_v2: *mut core::ffi::c_void = -4isize as *mut core::ffi::c_void;
+            if SetProcessDpiAwarenessContext(pm_v2) == 0 {
+                // PROCESS_PER_MONITOR_DPI_AWARE = 2
+                let _ = SetProcessDpiAwareness(2);
+            }
+        }
     }
 }

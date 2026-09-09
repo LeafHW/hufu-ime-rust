@@ -4,9 +4,14 @@
 //! 引擎，取回 {consumed, commit, state} 后操作 TSF 组段并绘制候选窗。
 
 mod addword;
-mod candwin;
+// 【死模块移除 2026-09-11】candwin.rs（v1 候选窗）与 candwin3.rs 同理：
+// CandidateWindow::new 无调用点（g.cand 恒 None），v2（DComp 直通）+
+// server 代画双通道定稿后 v1 只剩死分支。整模块删除（git 可回溯）。
 mod candwin2;
-mod candwin3;
+// 【死模块移除 2026-09-11】candwin3（v1 考古路线的普通分层窗）自
+// server 代画定稿后从未被构造（CandWin3::new 无调用点，cand3 字段
+// 恒 None）——打包宿主实测普通分层窗同样被 DWM cloak，唯一活路是
+// server 进程代画。整模块删除（git 历史可回溯）。
 mod canduielement;
 mod com;
 // i686 windows-gnu 交叉链接补丁：llvm libmingw32 无 _DllEntryPoint@12，
@@ -14,9 +19,8 @@ mod com;
 #[cfg(all(target_arch = "x86", target_env = "gnu"))]
 mod dll_entry_x86;
 mod ipc;
-// 语言栏按钮已下线（Win11 桌面语言栏为可拖浮动条，用户实测否决）；
-// langbar.rs 源码保留，备将来做中/英态切换时复用。
-#[allow(unused)]
+// 语言栏品牌按钮（「虎」牌）+ 中/英模式 compartment 同步——Activate
+// 时安装（tsf.rs L312-321 实际调用链），非死代码。
 mod langbar;
 mod sound;
 mod tsf;

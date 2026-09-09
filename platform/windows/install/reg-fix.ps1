@@ -4,12 +4,16 @@
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    $ps = Join-Path $PSHOME 'powershell.exe'
+    # 【修复标签 2026-09-11】$PSHOME 在 pwsh7 下指向 pwsh 目录（无 powershell.exe，
+    # 提权重启会失败）→ 改固定 Windows PowerShell 路径（与 install.ps1 提权路径一致）（任务6）。
+    $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     Start-Process $ps -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
     exit
 }
 
-$smoke = 'E:\DSH-KF\hufu\platform\windows\target\release\hufu-tsf-smoke.exe'
+# 【修复标签 2026-09-11】硬编码 E:\ 盘绝对路径 → $PSScriptRoot 相对推导
+# （本脚本在 platform\windows\install\，smoke 在 ..\target\release\）（任务5）。
+$smoke = Join-Path $PSScriptRoot '..\target\release\hufu-tsf-smoke.exe'
 if (-not (Test-Path $smoke)) { throw "找不到 $smoke" }
 
 Write-Host '── 1) msctf 档案 + 分类注册' -ForegroundColor Cyan

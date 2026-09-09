@@ -188,6 +188,9 @@ extern "system" fn cand2_wndproc(
             // server 响应带回新 label_font_point，一并写进本地副本，
             // 主字与序号同一帧同步缩放。
             let delta: i32 = if ((wparam.0 >> 16) as i16) > 0 { 1 } else { -1 };
+            // 【锁外渲染 2026-09-11】旧实现持 shared 锁整帧重绘（show
+            // 5-15ms）——滚轮期间按键路径抢不到锁（打字卡手）。锁内
+            // 只取渲染参数，take 窗口对象后放锁渲染，再放回。
             if let Some(r) = crate::ipc::call(&serde_json::json!({
                 "op": "skin_font_delta", "delta": delta
             })) {
@@ -196,33 +199,53 @@ extern "system" fn cand2_wndproc(
                 if new_pt > 0.0 {
                     if let Some(gsh) = crate::tsf::G_SHARED.get() {
                         let shared = gsh.0.clone();
-                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
-                            l["font_point"] = serde_json::json!(new_pt);
-                            if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
-                            true
-                        } else if let Some(l) = g.skin.get_mut("layout") {
-                            l["font_point"] = serde_json::json!(new_pt);
-                            if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
-                            true
-                        } else {
-                            false
+                        let (mut cand2, mut last, skin, caret) = {
+                            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
+                                l["font_point"] = serde_json::json!(new_pt);
+                                if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
+                                true
+                            } else if let Some(l) = g.skin.get_mut("layout") {
+                                l["font_point"] = serde_json::json!(new_pt);
+                                if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
+                                true
+                            } else {
+                                false
+                            };
+                            if patched {
+                                // 副本已同步新字号：刷新缓存时限，暂不重拉
+                                g.skin_stale = false;
+                                g.skin_loaded_at = std::time::Instant::now();
+                            }
+                            (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret)
                         };
-                        if patched {
-                            // 副本已同步新字号：刷新缓存时限，暂不重拉
-                            g.skin_stale = false;
-                            g.skin_loaded_at = std::time::Instant::now();
+                        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_mut()) {
+                            c.show(cands, raw, &skin, caret.as_ref(), *sel);
                         }
-                        let last = g.last_show.take();
-                        let skin = g.skin.clone();
-                        let caret = g.caret;
-                        if let (Some(c), Some((cands, raw, sel))) = (g.cand2.as_mut(), last) {
-                            c.show(&cands, &raw, &skin, caret.as_ref(), sel);
-                            g.last_show = Some((cands, raw, sel));
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.last_show = last;
+                        // 放回：期间若有线程重建了 cand2（cand2_dead 自愈路径），
+                        // 保留新的，旧窗隐藏丢弃
+                        match (g.cand2.take(), cand2) {
+                            (None, mine) => g.cand2 = mine,
+                            (Some(newer), Some(mut mine)) => {
+                                mine.hide();
+                                g.cand2 = Some(newer);
+                            }
+                            (Some(newer), None) => g.cand2 = Some(newer),
+                            (None, None) => {}
                         }
                     }
                 }
             }
+            return LRESULT(0);
+        }
+        0x215 => {
+            // 【CAPTURECHANGED 2026-09-11】拖拽中捕获被系统夺走（弹窗/
+            // 切窗/权限 UAC）时旧实现不清拖拽态——之后无按键的
+            // MOUSEMOVE 也会继续拖着候选窗走（真按钮已松）。清之。
+            *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return LRESULT(0);
         }
         0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
@@ -645,7 +668,7 @@ impl CandidateWindowV2 {
             let _ = context; // 无需常驻 D3D 上下文，D2D 自管
 
             let dxgi_dev: IDXGIDevice = device.cast().ok()?;
-            let factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
+            let _factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
             let factory2d: ID2D1Factory1 = D2D1CreateFactory(
                 D2D1_FACTORY_TYPE_MULTI_THREADED,
                 None,
@@ -1256,7 +1279,7 @@ impl CandidateWindowV2 {
             };
             (tf, tf_label, tf_small, cand_ws, (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)))
         };
-        let (v_width, text_x, cmt_x, cmt_w, dy, raw_w) = geo.1;
+        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w) = geo.1;
         let cmt_disp = geo.0;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）

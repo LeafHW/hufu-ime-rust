@@ -30,7 +30,9 @@ foreach ($l in $langs) {
 }
 
 Write-Host '── 3) server 进程 ──'
-$pid_f = 'E:\DSH-KF\hufu\hufu-data\server.pid'
+# 【修复标签 2026-09-11】硬编码 E:\ 盘绝对路径 → $PSScriptRoot 相对推导
+# （本脚本在 platform\windows\install\，数据在仓库根 ..\..\..\hufu-data\）（任务5）。
+$pid_f = Join-Path $PSScriptRoot '..\..\..\hufu-data\server.pid'
 if (Test-Path $pid_f) {
   $sp = [int](Get-Content $pid_f -Raw)
   $proc = Get-Process -Id $sp -ErrorAction SilentlyContinue

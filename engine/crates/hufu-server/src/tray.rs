@@ -13,6 +13,7 @@ use std::sync::mpsc::Sender;
 #[link(name = "shell32")]
 extern "system" {
     fn Shell_NotifyIconW(dwMessage: u32, lpData: *const NOTIFYICONDATAW) -> i32;
+    fn DestroyIcon(hicon: isize) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -420,28 +421,25 @@ const IDM_SCHEMA_BASE: i32 = 100;
 const SCHEMA_MAX: usize = 40;
 
 /// 打开设置页的信号（主线程 select 循环外执行）
-static mut OPEN_SETTINGS: Option<Sender<()>> = None;
+/// 【static mut → OnceLock 2026-09-11】tray 线程写、pipe 线程读的裸
+/// static mut 是数据竞争 UB（窗口期毫秒级）——改 OnceLock 原子安置。
+static OPEN_SETTINGS: std::sync::OnceLock<Sender<()>> = std::sync::OnceLock::new();
 
 /// 外部（管道 op "settings"：语言栏「中」按钮点击）请求打开设置页
 pub fn open_settings() {
-    unsafe {
-        if let Some(tx) = OPEN_SETTINGS.as_ref() {
-            let _ = tx.send(());
-        }
+    if let Some(tx) = OPEN_SETTINGS.get() {
+        let _ = tx.send(());
     }
 }
 /// 引擎宿主（托盘右键「切换方案」直调，与 HTTP 路由同源逻辑）
-static mut SHARED: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>> = None;
+static SHARED: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<crate::host::Host>>> =
+    std::sync::OnceLock::new();
 
 /// 码表目录方案列表 + 当前方案名（快照；锁内只做目录读与字段拷贝）。
 /// 【死锁教训】pipe 线程已在 dispatch 持锁，不可经此函数二次锁——
 /// 只供托盘自己的菜单线程使用。
 fn schema_snapshot() -> (Vec<String>, String) {
-    let shared = unsafe {
-        #[allow(static_mut_refs)]
-        SHARED.as_ref()
-    };
-    let Some(shared) = shared else { return (Vec::new(), String::new()) };
+    let Some(shared) = SHARED.get() else { return (Vec::new(), String::new()) };
     let Ok(host) = shared.lock() else { return (Vec::new(), String::new()) };
     let dir = hufu_engine::Engine::resolve_data_sub(
         &host.data_dir,
@@ -464,15 +462,14 @@ fn schema_snapshot() -> (Vec<String>, String) {
 /// 切换方案（与 POST /api/schema 同逻辑：换方案 + 清会话 + 重建整句 + 落盘）。
 /// pipe "set_schema" 在 dispatch 持锁内直做同逻辑（见 pipe.rs），不绕这里。
 fn switch_schema(name: &str) {
-    let shared = unsafe {
-        #[allow(static_mut_refs)]
-        SHARED.as_ref()
-    };
-    let Some(shared) = shared else { return };
+    let Some(shared) = SHARED.get() else { return };
     let Ok(mut host) = shared.lock() else { return };
     if host.engine.switch_schema(name).is_ok() {
         host.session.clear();
-        host.setup_sentence();
+        // 【卡死修复 2026-09-11】后台重建整句（旧 setup_sentence 持锁
+        // 载 546MB 模型秒级卡全机打字）。本线程持锁中——reload 内部
+        // 再 spawn 井线程等锁，无死锁。
+        crate::reload_sentence_bg(true, false);
         let _ = host.engine.config.save(&host.config_path);
     }
 }
@@ -488,7 +485,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
             WM_HOTKEY => {
                 // Ctrl+Alt+H → 设置页（与托盘双击同通道）
                 if wparam == 0x4846 {
-                    if let Some(tx) = OPEN_SETTINGS.as_ref() {
+                    if let Some(tx) = OPEN_SETTINGS.get() {
                         let _ = tx.send(());
                     }
                 }
@@ -497,7 +494,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
             WM_APP => {
                 match (lparam & 0xFFFF) as u32 {
                     WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-                        if let Some(tx) = OPEN_SETTINGS.as_ref() {
+                        if let Some(tx) = OPEN_SETTINGS.get() {
                             let _ = tx.send(());
                         }
                     }
@@ -546,7 +543,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         {
                             switch_schema(&submenu_names[(cmd - IDM_SCHEMA_BASE) as usize]);
                         } else if cmd == IDM_SETTINGS as i32 {
-                            if let Some(tx) = OPEN_SETTINGS.as_ref() {
+                            if let Some(tx) = OPEN_SETTINGS.get() {
                                 let _ = tx.send(());
                             }
                         } else if cmd == IDM_QUIT as i32 {
@@ -571,8 +568,11 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
             }
             WM_COMMAND => 0,
             WM_DESTROY => {
-                let nid = nid_of(hwnd);
+                let (nid, owned_icon) = nid_of(hwnd);
                 Shell_NotifyIconW(NIM_DELETE, &nid);
+                if owned_icon != 0 {
+                    DestroyIcon(owned_icon);
+                }
                 PostQuitMessage(0);
                 0
             }
@@ -581,15 +581,22 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
     }
 }
 
-fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
+/// 构造托盘项数据。返回 (nid, 自建图标句柄)：自建 HICON 用毕必须
+/// DestroyIcon（LoadImageW 共享兜底图标传 0——共享图标禁止销毁）。
+/// 【图标泄漏修复 2026-09-11】nid_of 每次调用 CreateIconIndirect 造
+/// 新图标，旧实现从不销毁。
+fn nid_of(hwnd: isize) -> (NOTIFYICONDATAW, isize) {
     let mut tip = [0u16; 128];
     let t: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
     tip[..t.len()].copy_from_slice(&t);
     let hicon = make_zh_icon();
+    let owned;
     let hicon = if hicon != 0 {
+        owned = hicon;
         hicon
     } else {
-        // 兜底：系统默认图标，至少可见
+        // 兜底：系统默认图标，至少可见（共享资源，不销毁）
+        owned = 0;
         unsafe {
             LoadImageW(0, 32512 as *const u16, 1, 0, 0, 0x8000)
         }
@@ -604,7 +611,7 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
         0x44, 0x2B, 0x9A, 0x7C, 0x11, 0x3E, 0x5A, 0x4F, 0x9D, 0x6C, 0x8B, 0x1E, 0x0A, 0x55,
         0xF3, 0xA2,
     ];
-    NOTIFYICONDATAW {
+    let nid_ret = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
@@ -621,7 +628,8 @@ fn nid_of(hwnd: isize) -> NOTIFYICONDATAW {
         dwInfoFlags: 0,
         guidItem: TRAY_GUID,
         hBalloonIcon: 0,
-    }
+    };
+    (nid_ret, owned)
 }
 
 /// 在独立线程跑托盘消息循环。返回 (ask_quit 标志引用, 设置页请求接收端)。
@@ -632,9 +640,9 @@ pub fn spawn(
     shared: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>>,
 ) {
     std::thread::spawn(move || unsafe {
-        unsafe {
-            OPEN_SETTINGS = Some(open_tx);
-            SHARED = shared;
+        let _ = OPEN_SETTINGS.set(open_tx);
+        if let Some(sh) = &shared {
+            let _ = SHARED.set(sh.clone());
         }
         let hinst = GetModuleHandleW(std::ptr::null());
         let cls: Vec<u16> = "HuFuTrayWnd\0".encode_utf16().collect();
@@ -652,6 +660,9 @@ pub fn spawn(
         };
         let atom = RegisterClassW(&wc);
         if atom == 0 {
+            // 【静默失效修复 2026-09-11】热键/退出通道随窗口一起无声死
+            // 亡——至少落一条诊断
+            eprintln!("托盘窗口 RegisterClassW 失败: {}", std::io::Error::last_os_error());
             return;
         }
         let hwnd = CreateWindowExW(
@@ -659,6 +670,7 @@ pub fn spawn(
             0, 0, 0, 0, 0, 0, hinst, 0,
         );
         if hwnd == 0 {
+            eprintln!("托盘窗口 CreateWindowExW 失败: {}", std::io::Error::last_os_error());
             return;
         }
         TRAY_HWND.store(hwnd, Ordering::SeqCst);
@@ -688,7 +700,11 @@ pub fn spawn(
         }
         // 通知主循环退出
         let _ = quit_tx.send(());
-        let _ = Shell_NotifyIconW(NIM_DELETE, &nid_of(hwnd));
+        let (nid, owned_icon) = nid_of(hwnd);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        if owned_icon != 0 {
+            DestroyIcon(owned_icon);
+        }
     });
 }
 

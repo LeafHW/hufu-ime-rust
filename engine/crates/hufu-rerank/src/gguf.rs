@@ -278,7 +278,10 @@ impl GgufFile {
         let pos = f.stream_position()?;
         let data_start = pos.div_ceil(32) * 32; // GGUF 数据段 32 对齐
         let total = f.metadata()?.len();
-        let data_len = (total - data_start) as usize;
+        // 【下溢防护 2026-09-11】文件比数据段起点还短（截断/损坏）时
+        // total - data_start 在 u64 下溢 → debug panic / release 回绕 →
+        // Vec::with_capacity 巨量分配 abort。saturating 到 0。
+        let data_len = total.saturating_sub(data_start) as usize;
         let mut data = Vec::with_capacity(data_len);
         f.seek(SeekFrom::Start(data_start))?;
         f.take(data_len as u64).read_to_end(&mut data)?;
@@ -353,8 +356,23 @@ impl GgufFile {
         let mut buf = vec![0u8; len];
         if !self.data.is_empty() {
             // 常驻：data 从 data_start 起存，张量偏移已是段内相对
-            let start = info.offset as usize + p0 * row_bytes;
-            buf.copy_from_slice(&self.data[start..start + len]);
+            // 【越界防护 2026-09-11】坏头部 offset/shape 可指到 data 外
+            // ——mmap 路径有界检，此处同款（旧实现裸切片 panic）。
+            let overflow = || {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "张量尺寸溢出")
+            };
+            let start = info.offset as usize;
+            let start = start
+                .checked_add(p0.checked_mul(row_bytes).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+            let end = start.checked_add(len).ok_or_else(overflow)?;
+            if end > self.data.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "张量越界（常驻数据段）",
+                ));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
             Ok(buf)
         } else if let Some(m) = &self.map {
             // mmap 热路径：零 open/零 read 系统调用（map 覆盖整个文件，
@@ -383,12 +401,14 @@ impl GgufFile {
     }
 
     fn row_bytes(info: &TensorInfo) -> usize {
-        let k = info.shape[0];
+        // 【空 shape 防护 2026-09-11】坏文件 n_dims=0 → shape 空 →
+        // shape[0] panic。空维按 0 行宽处理（调用侧 len=0 自然短路）。
+        let k = info.shape.first().copied().unwrap_or(0);
         match info.dtype {
-            GgmlDType::Q8_0 => k.div_ceil(32) * 34,
-            GgmlDType::F32 => k * 4,
-            GgmlDType::F16 => k * 2,
-            GgmlDType::Other(_) => k * 4,
+            GgmlDType::Q8_0 => k.div_ceil(32).saturating_mul(34),
+            GgmlDType::F32 => k.saturating_mul(4),
+            GgmlDType::F16 => k.saturating_mul(2),
+            GgmlDType::Other(_) => k.saturating_mul(4),
         }
     }
 
@@ -485,16 +505,29 @@ impl GgufFile {
 
     /// 读张量并反量化为 f32（行主 [rows, cols]）。
     /// GGUF 维度序：ne[0]=内维（列），ne[1]=行 → 2D shape=[cols, rows]
+    /// 【越界防护 2026-09-11】懒模式（data 空）直接 None（调用方走
+    /// raw_rows）；坏头部 rows/cols 乘法溢出或超出数据段物理可能 →
+    /// None 而非 panic（旧实现 Vec::with_capacity 溢出 abort / 裸索引
+    /// panic——rerank 线程曾因此死亡无人重建）。
     pub fn tensor_f32(&self, name: &str) -> Option<Vec<f32>> {
         let info = self.tensors.get(name)?;
+        let d = &self.data;
+        if d.is_empty() {
+            return None; // 懒模式：常驻张量才有直读语义
+        }
         let (rows, cols) = if info.shape.len() == 1 {
-            (info.shape[0], 1)
+            (info.shape.first().copied()?, 1)
         } else {
-            (info.shape[1], info.shape[0])
+            (*info.shape.get(1)?, *info.shape.first()?)
         };
         let start = info.offset as usize;
-        let mut out = Vec::with_capacity(rows * cols);
-        let d = &self.data;
+        let total = rows.checked_mul(cols)?;
+        // 物理上界：Q8_0 每元素 ≥1 字节，F32 每元素 4 字节
+        let per_byte = if info.dtype == GgmlDType::F32 { 4 } else { 1 };
+        if start.checked_add(total.checked_mul(per_byte)?)? > d.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(total);
         if info.dtype.is_q8_0() {
             let blocks = cols.div_ceil(32);
             for r in 0..rows {
