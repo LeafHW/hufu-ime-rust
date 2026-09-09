@@ -368,7 +368,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
             .unwrap_or(dflt)
     };
     let (margin_x, margin_y) = if kind_early == "glass" {
-        (mat_f("glass_margin_x", 1.0) * s, mat_f("glass_margin_y", 1.0) * s)
+        (mat_f("glass_margin_x", 4.0) * s, mat_f("glass_margin_y", 4.0) * s)
     } else {
         (
             skin_layout(skin, "margin_x", 8.0) * s,

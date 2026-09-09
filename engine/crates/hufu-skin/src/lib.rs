@@ -120,9 +120,10 @@ pub struct MaterialConfig {
     pub glass_shadow_size: f32,
     /// 【玻璃独立留白 2026-09-10】毛玻璃模式的水平留白——与纯色
     /// layout.margin_x 完全独立两套（用户定稿：玻璃视觉贴边，非玻璃
-    /// 保持原有留白）。默认 1。旧皮肤无此字段走 serde default。
+    /// 保持原有留白）。默认 4（用户实测定稿；最早 1 过贴）。
+    /// 旧皮肤无此字段走 serde default。
     pub glass_margin_x: f32,
-    /// 【玻璃独立留白 2026-09-10】同上，垂直留白。默认 1。
+    /// 【玻璃独立留白 2026-09-10】同上，垂直留白。默认 4。
     pub glass_margin_y: f32,
 }
 
@@ -146,9 +147,9 @@ impl Default for MaterialConfig {
             glass_alpha: 0.0,
             glass_shadow_alpha: 0.38,
             glass_shadow_size: 6.0,
-            // 【玻璃独立留白 2026-09-10】默认 1（裸玻璃贴边）
-            glass_margin_x: 1.0,
-            glass_margin_y: 1.0,
+            // 【玻璃独立留白 2026-09-10】默认 4（用户实测定稿）
+            glass_margin_x: 4.0,
+            glass_margin_y: 4.0,
         }
     }
 }
