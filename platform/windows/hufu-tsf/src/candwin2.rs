@@ -2519,11 +2519,20 @@ impl CandidateWindowV2 {
                 0.0
             };
             if GLASS_SHADOW && gs_alpha > 0.005 && !dragging {
-                let gs_size = skin
+                let gs_base = skin
                     .pointer("/skin/material/glass_shadow_size")
                     .or_else(|| skin.get("material").and_then(|m| m.get("glass_shadow_size")))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(6.0) as f32;
+                // 【玻璃阴影字号弱联动 2026-09-10】与非玻璃自绘阴影同款
+                //（shadow_radius = base×√font_scale，见上 font_scale 注
+                // 释——等比会把同 alpha 高斯摊到平方倍面积，视觉浓度骤
+                // 降；√比例摊薄减半、浓度观感保留）。此前玻璃阴影大小
+                // 固定不随滚轮字号联动——放大时候选窗变大而阴影比例
+                // 显小（用户实测「毛玻璃放大时比例没跟着放大」）。
+                // 渲染时计算不落盘：滚轮缩放来回不漂移、皮肤数据不动。
+                // 阴影窗边距 m 由 g_size 推导（shadowwin_show）自动跟随。
+                let gs_size = gs_base * font_scale.sqrt();
                 shadowwin_show(
                     self.hwnd,
                     x - (shadow_m * dpi_scale) as i32,
