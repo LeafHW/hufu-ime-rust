@@ -170,13 +170,15 @@ fn main() {
 
     // 【拖入模型自动生效 2026-09-10】无模型小包用户事后把模型文件拖进
     // 目录，此前不会自动装载——须切一次方案/重载一次码表才生效（用户
-    // 实测确认）。本线程每 5s 探测模型文件（GGUF 重排 + ngram 整句），
+    // 实测确认）。本线程每 2s 探测模型文件（GGUF 重排 + ngram 整句），
     // 「先缺后在且尺寸稳定（拷贝完成：两轮同 size+mtime）」边沿触发
     // 一次 reload_sentence_bg——GGUF 补建重排线程、ngram 后台装载、
     // 整句门控判断一条通道全办（幂等：BUSY 闸门+装载内部门控）。
     // 启动时已在场的文件视为「启动路径已装载」不触发；文件被删除重置
     // 边沿（再次拖入可再触发）；装载失败（文件损坏）不重试，手动重载
-    // 码表仍可救。探测开销：每 5s 两次 metadata 读取。
+    // 码表仍可救。探测开销：每 2s 两次 metadata 读取，可忽略。
+    //（5s→2s 2026-09-10：稳定判定占一轮周期，2s 周期把「拖入到触发」
+    // 从平均 ~7.5s 缩到 ~3s；两轮同参的防半截拷贝语义不变。）
     {
         let shared_w = shared.clone();
         let data_dir_w = data_dir.clone();
@@ -227,7 +229,7 @@ fn main() {
                 let mut seen_ngram = false;
                 let mut first_round = true;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                     let (ngram_path, rerank_enabled) = {
                         let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
                         (
