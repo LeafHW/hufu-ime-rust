@@ -125,7 +125,9 @@ impl Default for MaterialConfig {
         MaterialConfig {
             // 【毛玻璃默认关】用户定稿：默认纯色（此前 Frosted）。
             kind: Material::Solid,
-            tint: Color([28, 28, 30, 0xCC]),
+            // 【染色浓度默认 0】2026-09-09 用户定稿：tint 默认不染色
+            //（alpha=0=纯模糊；色相保留供需要时拖浓度）。
+            tint: Color([28, 28, 30, 0x00]),
             opacity: 1.0,
             darken: 0.0,
             noise: 0.0,
