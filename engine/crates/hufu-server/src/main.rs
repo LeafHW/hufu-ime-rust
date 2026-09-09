@@ -168,6 +168,100 @@ fn main() {
             });
     }
 
+    // 【拖入模型自动生效 2026-09-10】无模型小包用户事后把模型文件拖进
+    // 目录，此前不会自动装载——须切一次方案/重载一次码表才生效（用户
+    // 实测确认）。本线程每 5s 探测模型文件（GGUF 重排 + ngram 整句），
+    // 「先缺后在且尺寸稳定（拷贝完成：两轮同 size+mtime）」边沿触发
+    // 一次 reload_sentence_bg——GGUF 补建重排线程、ngram 后台装载、
+    // 整句门控判断一条通道全办（幂等：BUSY 闸门+装载内部门控）。
+    // 启动时已在场的文件视为「启动路径已装载」不触发；文件被删除重置
+    // 边沿（再次拖入可再触发）；装载失败（文件损坏）不重试，手动重载
+    // 码表仍可救。探测开销：每 5s 两次 metadata 读取。
+    {
+        let shared_w = shared.clone();
+        let data_dir_w = data_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("hufu-model-watch".into())
+            .spawn(move || {
+                let stat_of = |p: &std::path::Path| -> Option<(u64, i64)> {
+                    let m = p.metadata().ok()?;
+                    Some((
+                        m.len(),
+                        m.modified()
+                            .ok()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()?
+                            .as_secs() as i64,
+                    ))
+                };
+                let gguf_stat = |data_dir: &std::path::Path| -> Option<(u64, i64)> {
+                    let model_dir = hufu_engine::Engine::resolve_data_sub(data_dir, "模型");
+                    std::fs::read_dir(&model_dir)
+                        .ok()?
+                        .filter_map(|e| e.ok())
+                        .find(|e| {
+                            e.path()
+                                .extension()
+                                .map(|x| x.eq_ignore_ascii_case("gguf"))
+                                .unwrap_or(false)
+                        })
+                        .and_then(|e| stat_of(&e.path()))
+                };
+                // 状态机：0=不在 1=首轮见 2=稳定（两轮同参）3=消失
+                // prev 永远同步为本轮快照（cur）。
+                let step = |prev: &mut Option<(u64, i64)>, cur: Option<(u64, i64)>| -> u8 {
+                    let old = prev.take();
+                    *prev = cur;
+                    match (old, cur) {
+                        (None, None) => 0,
+                        (None, Some(_)) => 1,
+                        (Some(_), None) => 3,
+                        (Some(p), Some(c)) => {
+                            if p == c { 2 } else { 1 }
+                        }
+                    }
+                };
+                let mut prev_gguf: Option<(u64, i64)> = None;
+                let mut prev_ngram: Option<(u64, i64)> = None;
+                let mut seen_gguf = false; // 已在场/已触发过（防重复）
+                let mut seen_ngram = false;
+                let mut first_round = true;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let (ngram_path, rerank_enabled) = {
+                        let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            hufu_engine::Engine::resolve_data_sub(
+                                &data_dir_w,
+                                &h.engine.config.sentence.ngram_path,
+                            ),
+                            h.engine.config.sentence.rerank.enabled,
+                        )
+                    };
+                    let cur_gguf = if rerank_enabled { gguf_stat(&data_dir_w) } else { None };
+                    let cur_ngram = stat_of(&ngram_path);
+                    let g = step(&mut prev_gguf, cur_gguf);
+                    let n = step(&mut prev_ngram, cur_ngram);
+                    // 启动首轮在场：视为已装载（启动路径自己会装），不算边沿
+                    if first_round {
+                        first_round = false;
+                        if cur_gguf.is_some() { seen_gguf = true; }
+                        if cur_ngram.is_some() { seen_ngram = true; }
+                        continue;
+                    }
+                    if g == 3 { seen_gguf = false; }
+                    if n == 3 { seen_ngram = false; }
+                    let trig = (g == 2 && !seen_gguf) || (n == 2 && !seen_ngram);
+                    if g == 2 { seen_gguf = true; }
+                    if n == 2 { seen_ngram = true; }
+                    if trig {
+                        eprintln!("模型监视：检测到新拖入的模型文件，自动装载（GGUF/整句通道）");
+                        reload_sentence_bg(false, false);
+                    }
+                }
+            });
+    }
+
     // Windows 托盘（双击开设置页 / 右键退出）
     #[cfg(windows)]
     {
