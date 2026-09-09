@@ -153,17 +153,18 @@ extern "system" fn cand2_wndproc(
                         "cw2 pin 拖动即固定 ({},{})",
                         wr.left, wr.top
                     ));
-                    // 【交互后焦点自愈 2026-09-10】Chromium 系宿主
-                    //（VSCode/Electron/QQ NT）在鼠标按下候选窗瞬间主动
-                    // 终止组段并 blur 编辑器（实测 trace：ldown 前 2ms
-                    // OnCompositionTerminated）——caret 消失、键盘不再
-                    // 进 TSF，用户须手动点回。交互期间宿主杀过组段时，
-                    // 松手后向 caret 所在窗口补一对合成点击（位置=caret
-                    // 中心，原地置焦不挪光标）恢复编辑焦点。
-                    restore_host_focus_if_killed();
                 } else {
                     crate::tsf::trace("cw2: lup 未拖动（死区内）");
                 }
+                // 【交互后焦点自愈 2026-09-10】Chromium 系宿主
+                //（VSCode/Electron/QQ NT）在鼠标按下候选窗瞬间主动
+                // 终止组段并 blur 编辑器（实测 trace：ldown 前 2ms
+                // OnCompositionTerminated）——caret 消失、键盘不再
+                // 进 TSF，用户须手动点回。按下期间宿主杀过组段时，
+                // 松手后向 caret 所在窗口补一对合成点击（位置=caret
+                // 中心，原地置焦不挪光标）恢复编辑焦点。
+                //（公共路径：未拖动的单击同样可能杀过组段。）
+                restore_host_focus_if_killed();
             }
             *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return LRESULT(0);
@@ -253,8 +254,22 @@ extern "system" fn cand2_wndproc(
             // 【CAPTURECHANGED 2026-09-11】拖拽中捕获被系统夺走（弹窗/
             // 切窗/权限 UAC）时旧实现不清拖拽态——之后无按键的
             // MOUSEMOVE 也会继续拖着候选窗走（真按钮已松）。清之。
-            *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // 【拖拽中夺回 2026-09-10】实测 VSCode/Chromium 在按下候选
+            // 窗杀组段后会异步 SetCapture 抢走鼠标（trace：drag 激活
+            // →1.1s→ lup「未拖动」=DRAG 已被本分支清掉，拖动白做、
+            // pin 不写）。按钮仍按住（CAND_DOWN 有值）= 用户拖拽
+            // 进行中：立即 SetCapture 夺回，拖拽不断；真松手由 0x202
+            // 收尾。真弹窗抢鼠标时用户必松手，同样由 0x202 收尾，
+            // 不会死循环（夺回后无按下态的 0x215 不再触发本路径）。
+            unsafe {
+                let down = *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+                if down.is_some() {
+                    let _ = SetCapture(hwnd);
+                    crate::tsf::trace("cw2: 捕获被夺→夺回（拖拽进行中）");
+                } else {
+                    *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+            }
             return LRESULT(0);
         }
         0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
