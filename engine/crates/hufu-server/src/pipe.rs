@@ -126,6 +126,10 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
                             s.layout.label_font_point = (np as f32 * r2).clamp(4.0, 40.0);
                         }
                         s.layout.scale_geometry(ratio);
+                        // 【玻璃留白字号联动 2026-09-10】玻璃独立留白同
+                        // 比例联动（此前缺位——毛玻璃放大时留白不变，
+                        // 用户实测「内边距没有跟着变」）。
+                        s.material.scale_glass_geometry(ratio);
                     }
                     s.layout.font_point = np as f32;
                     let nl = s.layout.label_font_point;

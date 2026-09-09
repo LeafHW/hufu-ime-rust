@@ -898,6 +898,11 @@ impl CandidateWindowV2 {
                 .unwrap_or(dflt)
         };
         let (margin_x, margin_y) = if kind == "glass" {
+            // 【玻璃留白字号联动 2026-09-10】留白随字号的比例跟随在
+            // **数据层**做（hufu_skin::MaterialConfig::scale_glass_geometry
+            //，滚轮 skin_font_delta/设置页字号滑杆同路）——与普通皮肤
+            // Layout::scale_geometry 同语义。此处直读数据即可（渲染层
+            // 再乘会双重放大）。
             (mat_f("glass_margin_x", 4.0), mat_f("glass_margin_y", 4.0))
         } else {
             (layout_f(skin, "margin_x", 8.0), layout_f(skin, "margin_y", 6.0))
