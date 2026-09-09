@@ -141,8 +141,13 @@ extern "system" fn cand2_wndproc(
             // 分叉语义——未固定态松手只 sticky 本组段+固定态松手回写
             // ——叠加右键时序曾实测「拖 A 锁定→拖 B→打字回 A」）。
             unsafe {
-                let _ = ReleaseCapture();
+                // 【顺序关键 2026-09-10】必须先清 CAND_DOWN 再
+                // ReleaseCapture：后者会【同步】派发 0x215，若此刻
+                // DOWN 仍非空会被「拖拽进行中」判定 SetCapture 夺回
+                // ——捕获永远不释放，全屏其他窗口点不了（用户实测
+                // VSCode/QQ 拖一次后别处全锁死）。
                 *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = ReleaseCapture();
                 if CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() {
                     crate::tsf::trace("cw2: lup 拖动结束");
                     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
