@@ -122,24 +122,51 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
         eprintln!("pad-dump: skin op 失败");
         return 0;
     };
-    let skin = resp.get("skin").cloned().unwrap_or(serde_json::Value::Null);
-    let Some(mut w) = crate::candwin2::CandidateWindowV2::new() else {
-        eprintln!("pad-dump: 候选窗初始化失败");
-        return 0;
-    };
+    let mut skin = resp.get("skin").cloned().unwrap_or(serde_json::Value::Null);
     // 候选数可用 HUFU_PAD_N 控制（默认 5；10=验证第 10 序号显示 0）
     let n = std::env::var("HUFU_PAD_N")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(5)
         .clamp(1, 10);
+    // 【皮肤自省增强 2026-09-09】HUFU_PAD_RAW=编码串（长编码溢出验证，
+    // 默认 uu）；HUFU_PAD_FONT=字号覆盖（最大号场景）；HUFU_PAD_CMT=1
+    // 候选带注释（注释列宽度参与验证）。
+    let raw_str = std::env::var("HUFU_PAD_RAW").unwrap_or_else(|_| "uu".into());
+    let font_ovr = std::env::var("HUFU_PAD_FONT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let with_cmt = std::env::var("HUFU_PAD_CMT").ok().as_deref() == Some("1");
+    // HUFU_PAD_V=1：强制竖排（溢出修复验证用——当前配置横排）
+    let force_v = std::env::var("HUFU_PAD_V").ok().as_deref() == Some("1");
     let words = ["你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有"];
+    let cmt_src = ["ni hao", "shijie", "shaoyong", "ne", "ba", "de", "le", "shi", "zai", "you"];
     let cands: Vec<(String, String)> = words[..n]
         .iter()
-        .map(|w| (w.to_string(), String::new()))
+        .enumerate()
+        .map(|(i, w)| {
+            (
+                w.to_string(),
+                if with_cmt && i < 4 { cmt_src[i].to_string() } else { String::new() },
+            )
+        })
         .collect();
+    if let Some(fp) = font_ovr {
+        // 皮肤 JSON 顶层即 layout（无 "skin" 包裹层——server 响应
+        // {"skin": <Skin>}，Skin 直含 colors/layout/material）
+        if let Some(l) = skin.get_mut("layout").and_then(|l| l.as_object_mut()) {
+            l.insert("font_point".into(), serde_json::json!(fp));
+            if force_v {
+                l.insert("horizontal".into(), serde_json::json!(false));
+            }
+        }
+    }
+    let Some(mut w) = crate::candwin2::CandidateWindowV2::new() else {
+        eprintln!("pad-dump: 候选窗初始化失败");
+        return 0;
+    };
     w.readback = true;
-    w.show(&cands, "uu", &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(&cands, &raw_str, &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
     std::thread::sleep(std::time::Duration::from_millis(80));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
