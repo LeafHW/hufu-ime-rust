@@ -167,6 +167,45 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
             }
         }
     }
+    // 【全档 DPI 扫描皮肤控制 2026-09-11】外部用户 100%~500% 全档验
+    // 证用：强制材质/阴影参数/横竖排——不继承 server 当前皮肤（用户
+    // 实测中皮肤随时在变，扫档必须控变量）。全部环境变量门控，真机
+    // 打字路径零影响。HUFU_PAD_GEO=1 时另落 %TEMP%\hufu-pad-geo.txt
+    //（候选窗/玻璃阴影窗屏幕矩形，供居中外扩断言）。
+    let kind_ovr = std::env::var("HUFU_PAD_KIND")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let sh_r = std::env::var("HUFU_PAD_SHADOW_R")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let off_x = std::env::var("HUFU_PAD_OFF_X")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let off_y = std::env::var("HUFU_PAD_OFF_Y")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let force_h = std::env::var("HUFU_PAD_LAYOUT_H").ok().as_deref() == Some("1");
+    if kind_ovr.is_some() || sh_r.is_some() || off_x.is_some() || off_y.is_some() || force_h {
+        if let Some(l) = skin.get_mut("layout").and_then(|l| l.as_object_mut()) {
+            if let Some(r) = sh_r {
+                l.insert("shadow_radius".into(), serde_json::json!(r));
+            }
+            if let Some(v) = off_x {
+                l.insert("shadow_offset_x".into(), serde_json::json!(v));
+            }
+            if let Some(v) = off_y {
+                l.insert("shadow_offset_y".into(), serde_json::json!(v));
+            }
+            if force_h {
+                l.insert("horizontal".into(), serde_json::json!(true));
+            }
+        }
+        if let Some(k) = &kind_ovr {
+            if let Some(m) = skin.get_mut("material").and_then(|m| m.as_object_mut()) {
+                m.insert("kind".into(), serde_json::json!(k));
+            }
+        }
+    }
     let Some(mut w) = crate::candwin2::CandidateWindowV2::new() else {
         eprintln!("pad-dump: 候选窗初始化失败");
         return 0;
@@ -177,6 +216,24 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;
+    // 【几何取证】hide 前抓候选窗/阴影窗矩形（窗口还活着）
+    if std::env::var("HUFU_PAD_GEO").ok().as_deref() == Some("1") {
+        let geo_path = std::env::temp_dir().join("hufu-pad-geo.txt");
+        match crate::candwin2::shadow_geo(w.hwnd) {
+            Some((cc, sc)) => {
+                let _ = std::fs::write(
+                    &geo_path,
+                    format!(
+                        "cand {} {} {} {}\nshadow {} {} {} {}\n",
+                        cc.left, cc.top, cc.right, cc.bottom, sc.left, sc.top, sc.right, sc.bottom
+                    ),
+                );
+            }
+            None => {
+                let _ = std::fs::write(&geo_path, "none\n");
+            }
+        }
+    }
     // 【取证模式 2026-09-08】HUFU_PAD_HOLD=<ms>：渲染帧保持显示指定时长
     // （不立即 hide），供外部截屏做实机白边取证；窗口位置 (100,100)。
     let hold = std::env::var("HUFU_PAD_HOLD")
