@@ -1663,7 +1663,12 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(None);
             } else if was_visible
                 && self.size_ms > 0
-                && ((target.0 - cur.0).abs() > 10 || (target.1 - cur.1).abs() > 8)
+                // 【起臂阈值 24/14 2026-09-11】普通逐字打字的行宽增长
+                // （~8-17px/键）不动画——文字即时更新（连打不闪不滞后，
+                // 用户实测逐键闪的规避）；动画留给结构性大变化（注释
+                // 展开、横竖切换、候选大改）。旧 10/8 阈值=几乎每键起
+                // 臂 → 内容层遮罩逐键在岗 = 文字闪的放大器。
+                && ((target.0 - cur.0).abs() > 24 || (target.1 - cur.1).abs() > 14)
             {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
@@ -2209,6 +2214,19 @@ impl CandidateWindowV2 {
                                 lp.contentBounds = clip_rect;
                                 lp.geometricMask = std::mem::ManuallyDrop::new(Some(g));
                                 lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                // 【maskTransform 必须显式单位阵 2026-09-11】
+                                // default() 的零矩阵在部分驱动上把遮罩塌缩
+                                // 成点 → 层内内容整帧不画=「文字闪」（壳在
+                                // 层外不闪）且圆角失效退直角。对齐
+                                // push_shadow_mask 的显式单位阵写法。
+                                lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
+                                    M11: 1.0,
+                                    M12: 0.0,
+                                    M21: 0.0,
+                                    M22: 1.0,
+                                    M31: 0.0,
+                                    M32: 0.0,
+                                };
                                 ctx.PushLayer(&lp, None);
                             }
                             None => {
