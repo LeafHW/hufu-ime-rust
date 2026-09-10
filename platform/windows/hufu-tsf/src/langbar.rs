@@ -6,14 +6,15 @@
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use windows::core::{implement, Interface, PCWSTR, Result, GUID, VARIANT};
+use windows::core::{implement, Interface, Result, GUID, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::TextServices::{
-    GUID_LBI_INPUTMODE, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
-    ITfCompartmentMgr, ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
-    ITfLangBarItem_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl,
-    ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
+    ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
+    ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
+    ITfLangBarItemSink, ITfLangBarItem_Impl, ITfSource, ITfSource_Impl, ITfThreadMgr,
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+    GUID_LBI_INPUTMODE, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
+    TF_LANGBARITEMINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW,
@@ -158,7 +159,13 @@ fn log_diag(s: &str) {
         .append(true)
         .open(std::env::temp_dir().join("hufu-langbar.log"))
     {
-        let _ = writeln!(f, "[{:02}:{:02}:{:02}] {s}", t / 3_600_000, t / 60_000 % 60, t / 1000 % 60);
+        let _ = writeln!(
+            f,
+            "[{:02}:{:02}:{:02}] {s}",
+            t / 3_600_000,
+            t / 60_000 % 60,
+            t / 1000 % 60
+        );
     }
 }
 
@@ -194,7 +201,9 @@ pub fn uninstall_compartments() {
     let cookie = COMP_COOKIE.with(|c| c.replace(0));
     if cookie != 0 {
         if let Some(cm) = COMP_THREAD.with(|c| c.borrow().clone()) {
-            if let Ok(comp) = unsafe { cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) } {
+            if let Ok(comp) =
+                unsafe { cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) }
+            {
                 if let Ok(src) = comp.cast::<ITfSource>() {
                     unsafe {
                         let _ = src.UnadviseSink(cookie);
@@ -247,7 +256,12 @@ unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
             return None;
         }
         let b = v as *const VARIANT as *const u8;
-        Some(i32::from_le_bytes([*b.add(8), *b.add(9), *b.add(10), *b.add(11)]))
+        Some(i32::from_le_bytes([
+            *b.add(8),
+            *b.add(9),
+            *b.add(10),
+            *b.add(11),
+        ]))
     }
 }
 
@@ -378,11 +392,7 @@ impl Drop for HuFuLangBar {
 /// 不实现该接口时 AddItem 在真实宿主里可能 E_FAIL。名单进程全局共享
 ///（多线程的项一起收广播，cookie 全局唯一防误删）。
 impl ITfSource_Impl for HuFuLangBar_Impl {
-    fn AdviseSink(
-        &self,
-        riid: *const GUID,
-        punk: Option<&windows::core::IUnknown>,
-    ) -> Result<u32> {
+    fn AdviseSink(&self, riid: *const GUID, punk: Option<&windows::core::IUnknown>) -> Result<u32> {
         if unsafe { riid.as_ref() } != Some(&ITfLangBarItemSink::IID) {
             return Err(windows::core::Error::from(E_INVALIDARG));
         }
@@ -416,7 +426,11 @@ pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     let r = unsafe { mgr.AddItem(&item) };
     match &r {
         Ok(()) => log_diag(&format!("install ok pid={}", std::process::id())),
-        Err(e) => log_diag(&format!("install FAIL pid={} err={:?}", std::process::id(), e.code())),
+        Err(e) => log_diag(&format!(
+            "install FAIL pid={} err={:?}",
+            std::process::id(),
+            e.code()
+        )),
     }
     r?;
     LANGBAR_ITEM.with(|c| *c.borrow_mut() = Some(item));
@@ -531,12 +545,7 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         }
         for (i, name) in schemas.iter().enumerate() {
             let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
-            let flags = MF_STRING
-                + if name == &current {
-                    MF_CHECKED
-                } else {
-                    0
-                };
+            let flags = MF_STRING + if name == &current { MF_CHECKED } else { 0 };
             AppendMenuW(m, flags, 100 + i, w.as_ptr());
         }
         if !schemas.is_empty() {
@@ -709,7 +718,13 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     }
 
     fn GetIcon(&self) -> Result<HICON> {
-        Ok(HICON((if is_chinese() { self.icon_zh } else { self.icon_en }) as *mut _))
+        Ok(HICON(
+            (if is_chinese() {
+                self.icon_zh
+            } else {
+                self.icon_en
+            }) as *mut _,
+        ))
     }
 
     fn GetText(&self) -> Result<windows::core::BSTR> {
@@ -758,8 +773,8 @@ fn make_glyph_icon(ch: &str) -> isize {
             ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(hdc, &hdr, DIB_RGB_COLORS, &mut bits, None, 0)
-            .unwrap_or_default();
+        let dib =
+            CreateDIBSection(hdc, &hdr, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
         if dib.is_invalid() || bits.is_null() || hf.is_invalid() {
             if !hf.is_invalid() {
                 let _ = DeleteObject(HGDIOBJ(hf.0));

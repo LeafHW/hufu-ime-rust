@@ -118,10 +118,7 @@ fn load_skin() {
     let s = Skin {
         // 窗口底色提亮 20%：候选窗小面积用原底色可以，整窗大面积
         // 直接用会死黑（用户反馈），向白混一档。
-        bg: lighten(
-            get_color("back_color").unwrap_or(0x22_2E_16_u32),
-            0.20,
-        ),
+        bg: lighten(get_color("back_color").unwrap_or(0x22_2E_16_u32), 0.20),
         text: get_color("text_color")
             .or_else(|| get_color("candidate_text_color"))
             .unwrap_or(0xEC_E2_D7_u32),
@@ -366,7 +363,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 vec![
                     ("词（要打出的内容）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
                     ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
-                    ("选重位（第几选，留空=首选）", ID_POS, WS_TABSTOP.0 | 0x80u32 | 0x2000u32),
+                    (
+                        "选重位（第几选，留空=首选）",
+                        ID_POS,
+                        WS_TABSTOP.0 | 0x80u32 | 0x2000u32,
+                    ),
                 ]
             };
             for (i, (label, id, extra)) in rows.iter().enumerate() {
@@ -411,13 +412,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     #[link(name = "kernel32")]
                     unsafe extern "system" {
                         fn GetModuleHandleW(name: *const u16) -> isize;
-                        fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
+                        fn GetProcAddress(
+                            module: isize,
+                            name: *const u8,
+                        ) -> *const core::ffi::c_void;
                     }
                     unsafe {
                         let mn: Vec<u16> = "imm32.dll\0".encode_utf16().collect();
                         let md = GetModuleHandleW(mn.as_ptr());
                         if md != 0 {
-                            let p = GetProcAddress(md, c"ImmAssociateContext".as_ptr() as *const u8);
+                            let p =
+                                GetProcAddress(md, c"ImmAssociateContext".as_ptr() as *const u8);
                             if !p.is_null() {
                                 type Iac = unsafe extern "system" fn(isize, isize) -> isize;
                                 let f: Iac = std::mem::transmute(p);
@@ -563,7 +568,13 @@ unsafe fn set_new_font(h: HWND) {
 /// 文本显示宽估算（正文字号：CJK=1em、ASCII≈0.56em）。
 fn text_w(s: &str, em: i32) -> i32 {
     s.chars()
-        .map(|c| if c.is_ascii() { (em as f32 * 0.56) as i32 } else { em })
+        .map(|c| {
+            if c.is_ascii() {
+                (em as f32 * 0.56) as i32
+            } else {
+                em
+            }
+        })
         .sum()
 }
 
@@ -612,7 +623,10 @@ unsafe fn draw_items(
         0,
     );
     set_item_font(h, true);
-    ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(h.0 as isize);
+    ITEMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(h.0 as isize);
 
     let mut x = PV_X + head_w;
     let mut y = y0;
@@ -644,7 +658,10 @@ unsafe fn draw_items(
             if is_new { base } else { base },
         );
         set_item_font(hl, true);
-        ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(hl.0 as isize);
+        ITEMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(hl.0 as isize);
         // 词（新词用加粗+下划线字体）
         let w_txt = utf16z(t);
         let wd = create_child(
@@ -664,7 +681,10 @@ unsafe fn draw_items(
         } else {
             set_item_font(wd, false);
         }
-        ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(wd.0 as isize);
+        ITEMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(wd.0 as isize);
         x += need;
         cid += 2;
         let _ = cid;
@@ -684,7 +704,9 @@ unsafe fn clear_items() {
 /// 刷新预览 + 自适应布局。
 unsafe fn refresh_preview(hwnd: HWND) {
     let read_box = |id: i32| -> String {
-        let Ok(h) = GetDlgItem(hwnd, id) else { return String::new() };
+        let Ok(h) = GetDlgItem(hwnd, id) else {
+            return String::new();
+        };
         let len = GetWindowTextLengthW(h);
         if len <= 0 {
             return String::new();
@@ -699,7 +721,11 @@ unsafe fn refresh_preview(hwnd: HWND) {
         clear_items();
         let word = read_box(ID_WORD).trim().to_string();
         let wv: i64 = read_box(ID_CODE).trim().parse().unwrap_or(1000);
-        let wv = if read_box(ID_CODE).trim().is_empty() { 1000 } else { wv };
+        let wv = if read_box(ID_CODE).trim().is_empty() {
+            1000
+        } else {
+            wv
+        };
         let msg = if word.is_empty() {
             "输入词后确定：编码自动反查，该词将提到候选前部。".to_string()
         } else {
@@ -725,7 +751,10 @@ unsafe fn refresh_preview(hwnd: HWND) {
             0,
         );
         set_item_font(h, false);
-        ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(h.0 as isize);
+        ITEMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(h.0 as isize);
         let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
         return;
     }
@@ -758,7 +787,10 @@ unsafe fn refresh_preview(hwnd: HWND) {
             0,
         );
         set_item_font(h, true);
-        ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(h.0 as isize);
+        ITEMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(h.0 as isize);
         y += line_h;
     } else {
         match code_preview(&code) {
@@ -773,7 +805,11 @@ unsafe fn refresh_preview(hwnd: HWND) {
                     // 与 server add / Schema 插入同规则模拟
                     let mut sim: Vec<String> =
                         texts.iter().filter(|t| **t != word).cloned().collect();
-                    let idx = if pos >= 1 { (pos - 1).min(sim.len()) } else { 0 };
+                    let idx = if pos >= 1 {
+                        (pos - 1).min(sim.len())
+                    } else {
+                        0
+                    };
                     sim.insert(idx, word.clone());
                     // 「现有」与「加入后」隔开一行距，视觉分组
                     y = draw_items(
@@ -802,7 +838,10 @@ unsafe fn refresh_preview(hwnd: HWND) {
                     0,
                 );
                 set_item_font(h, true);
-                ITEMS.lock().unwrap_or_else(|p| p.into_inner()).push(h.0 as isize);
+                ITEMS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(h.0 as isize);
                 y += line_h;
             }
         }
@@ -862,13 +901,11 @@ fn code_preview(code: &str) -> Option<Vec<String>> {
     let _ = s.read_to_string(&mut resp);
     let body = resp.split_once("\r\n\r\n").map(|(_, b)| b)?;
     let v: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
-    v.get("texts")
-        .and_then(|t| t.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
+    v.get("texts").and_then(|t| t.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect()
+    })
 }
 
 /// 读输入框 → POST server 加词。

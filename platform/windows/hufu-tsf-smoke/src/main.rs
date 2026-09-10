@@ -5,8 +5,8 @@
 //! [引擎链] hufu_test_key 直驱（VK → 管道 → hufu-server 引擎 → consumed）
 
 use windows::core::*;
-use windows::Win32::Foundation::{HMODULE, BOOL, LPARAM, WPARAM};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IClassFactory};
+use windows::Win32::Foundation::{BOOL, HMODULE, LPARAM, WPARAM};
+use windows::Win32::System::Com::{CoCreateInstance, IClassFactory, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
@@ -82,7 +82,8 @@ fn main() {
                         GUID::from_u128(0x533c5e0e_5ac0_4abd_b6f1_251b82b7be7d);
                     const TFCAT_ASM_KBD: GUID =
                         GUID::from_u128(0x34745c63_b2f0_4784_8b67_5e12c8701a31);
-                    let c1 = code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU));
+                    let c1 =
+                        code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU));
                     let c2 = code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_ASM_KBD, &CLSID_HUFU));
                     println!("RegisterCategory(kbd) → 0x{c1:08X} (asm) → 0x{c2:08X}");
                 }
@@ -131,7 +132,10 @@ fn main() {
             let p = GetProcAddress(hmod, PCSTR(b"hufu_test_pad_dump\0".as_ptr())).unwrap();
             let pd: P = std::mem::transmute(p);
             let r = pd();
-            println!("pad_dump → {}（%TEMP%\\hufu-pad.bmp）", if r == 1 { "OK" } else { "FAIL" });
+            println!(
+                "pad_dump → {}（%TEMP%\\hufu-pad.bmp）",
+                if r == 1 { "OK" } else { "FAIL" }
+            );
         }
         return;
     }
@@ -140,23 +144,24 @@ fn main() {
         let hmod: HMODULE = LoadLibraryW(PCWSTR(wide.as_ptr())).unwrap();
         println!("[1] LoadLibrary ✓");
 
-        let reg: DllRegisterServerFn =
-            std::mem::transmute(GetProcAddress(hmod, PCSTR(b"DllRegisterServer\0".as_ptr())).unwrap());
+        let reg: DllRegisterServerFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"DllRegisterServer\0".as_ptr())).unwrap(),
+        );
         let hr = reg();
         assert_eq!(hr.0, 0, "DllRegisterServer 失败: 0x{:08X}", hr.0 as u32);
         println!("[2] DllRegisterServer ✓（HKCU CLSID/CTF\\TIP + msctf 语言档案）");
 
-        let gco: DllGetClassObjectFn =
-            std::mem::transmute(GetProcAddress(hmod, PCSTR(b"DllGetClassObject\0".as_ptr())).unwrap());
+        let gco: DllGetClassObjectFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"DllGetClassObject\0".as_ptr())).unwrap(),
+        );
         let mut factory: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = gco(&CLSID_HUFU, &IClassFactory::IID, &mut factory);
         assert_eq!(hr.0, 0, "DllGetClassObject 失败: 0x{:08X}", hr.0 as u32);
         let factory: IClassFactory = std::mem::transmute(factory);
         println!("[3] DllGetClassObject → IClassFactory ✓");
 
-        let tip: ITfTextInputProcessorEx = factory
-            .CreateInstance(None)
-            .expect("CreateInstance 失败");
+        let tip: ITfTextInputProcessorEx =
+            factory.CreateInstance(None).expect("CreateInstance 失败");
         println!("[4] CreateInstance → ITfTextInputProcessorEx ✓（多接口 vtable 正常）");
 
         let _ = OleInitialize(None);
@@ -186,7 +191,8 @@ fn main() {
                 // 真正的 TFCAT_TIP_KEYBOARD 是 34745C63（此前误用 533C5E0E）
                 const TFCAT_TIP_KEYBOARD: GUID =
                     GUID::from_u128(0x34745c63_b2f0_4784_8b67_5e12c8701a31);
-                let r = unsafe { cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU) };
+                let r =
+                    unsafe { cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU) };
                 println!("    ITfCategoryMgr::RegisterCategory → {r:?}");
             }
             match unsafe {
@@ -194,16 +200,14 @@ fn main() {
                     .Register(&CLSID_HUFU)
                     .and_then(|()| {
                         let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().collect();
-            // 图标随档案登记进 msctf 原生库（浮层只读这里，
-            // 注册表 IconFile/IconIndex 对浮层无效——25H2 实测）。
-            // 可用环境变量 HUFU_ICON_FILE 换图标文件做鉴别实验。
+                        // 图标随档案登记进 msctf 原生库（浮层只读这里，
+                        // 注册表 IconFile/IconIndex 对浮层无效——25H2 实测）。
+                        // 可用环境变量 HUFU_ICON_FILE 换图标文件做鉴别实验。
                         let icon_path = std::env::var("HUFU_ICON_FILE").unwrap_or_else(|_| {
-                            "E:\\DSH-KF\\hufu\\platform\\windows\\target\\release\\hufu_tsf.dll".into()
+                            "E:\\DSH-KF\\hufu\\platform\\windows\\target\\release\\hufu_tsf.dll"
+                                .into()
                         });
-                        let icon: Vec<u16> = icon_path
-                            .encode_utf16()
-                            .chain([0])
-                            .collect();
+                        let icon: Vec<u16> = icon_path.encode_utf16().chain([0]).collect();
                         profiles.AddLanguageProfile(
                             &CLSID_HUFU,
                             0x0804,
@@ -214,12 +218,7 @@ fn main() {
                         )
                     })
                     .and_then(|()| {
-                        profiles.EnableLanguageProfile(
-                            &CLSID_HUFU,
-                            0x0804,
-                            &PROFILE_GUID,
-                            BOOL(1),
-                        )
+                        profiles.EnableLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, BOOL(1))
                     })
             } {
                 Ok(()) => println!("[6] 语言档案 Register+AddLanguageProfile+Enable ✓"),
@@ -266,7 +265,9 @@ fn main() {
                     }
                 }
                 if !seen_hufu {
-                    println!("    EnumProfiles 共 {n} 项，未含我们的 TIP（HKCU 键未被 msctf 枚举）");
+                    println!(
+                        "    EnumProfiles 共 {n} 项，未含我们的 TIP（HKCU 键未被 msctf 枚举）"
+                    );
                 }
             }
 
@@ -324,7 +325,10 @@ fn main() {
             let _tid: u32 = tm.Activate().unwrap();
             let km: ITfKeystrokeMgr = tm.cast().unwrap();
             let eaten = km.TestKeyDown(WPARAM(0x55), LPARAM(1)).unwrap();
-            println!("[9] msctf TestKeyDown('u') consumed={} （若 sink 已激活即全链路通）", eaten.as_bool());
+            println!(
+                "[9] msctf TestKeyDown('u') consumed={} （若 sink 已激活即全链路通）",
+                eaten.as_bool()
+            );
             let _ = tm.Deactivate();
         }
 
@@ -371,6 +375,25 @@ fn main() {
             let name = ["solid", "translucent", "frosted", "glass"][(mode % 4) as usize];
             assert_eq!(r, 1, "candwin2({name}) 渲染应成功");
             println!("[12.{mode}] candwin2 {name} ✓");
+        }
+
+        // ── 动效端到端：渐显 ramp / 注释展开 / 渐隐退场（合成级像素取证）──
+        type AnimFn = unsafe extern "system" fn() -> i32;
+        let an: AnimFn =
+            std::mem::transmute(GetProcAddress(hmod, PCSTR(b"hufu_test_anim\0".as_ptr())).unwrap());
+        let mask = unsafe { an() };
+        // 【断言口径 2026-09-11】bit1=注释延时展开 bit2=渐隐隐藏 为确定
+        // 性特性必过；bit0=渐显亮度 ramp 受 DWM MPO 提升拍平影响不可
+        // 靠（内容仍正确）——观察项。
+        assert_eq!(
+            mask & 0b110,
+            0b110,
+            "动效确定性项应全通（bit1=展开 bit2=隐藏），实得 {mask:03b}"
+        );
+        if mask & 1 != 0 {
+            println!("[17] 动效 E2E ✓（展开/隐藏 + 渐显 ramp）");
+        } else {
+            println!("[17] 动效 E2E ✓（展开/隐藏；渐显 ramp 被 MPO 拍平=已知限制）");
         }
 
         // ── 音效池化连打：16 连击（4 句柄排队深度压力）不得崩/死锁 ──
@@ -422,9 +445,8 @@ fn main() {
                 s.read_to_string(&mut buf).unwrap();
                 buf
             };
-            let body_of = |resp: &str| -> String {
-                resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
-            };
+            let body_of =
+                |resp: &str| -> String { resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string() };
             // 保存当前皮肤 JSON（稍后还原）
             let cur = body_of(&http("GET", "/api/skins", ""));
             let cur_id = cur
@@ -449,10 +471,8 @@ fn main() {
                 unsafe { std::mem::transmute::<_, P>(p) }
             };
             let bmp_dims = || -> (i32, i32) {
-                let mut b = std::fs::read(
-                    std::env::temp_dir().join("hufu-pad.bmp"),
-                )
-                .expect("pad bmp 应已生成");
+                let mut b = std::fs::read(std::env::temp_dir().join("hufu-pad.bmp"))
+                    .expect("pad bmp 应已生成");
                 let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]);
                 let h = i32::from_le_bytes([b[22], b[23], b[24], b[25]]);
                 b.clear();

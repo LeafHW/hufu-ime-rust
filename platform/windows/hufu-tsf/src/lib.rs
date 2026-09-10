@@ -143,15 +143,23 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     let with_cmt = std::env::var("HUFU_PAD_CMT").ok().as_deref() == Some("1");
     // HUFU_PAD_V=1：强制竖排（溢出修复验证用——当前配置横排）
     let force_v = std::env::var("HUFU_PAD_V").ok().as_deref() == Some("1");
-    let words = ["你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有"];
-    let cmt_src = ["ni hao", "shijie", "shaoyong", "ne", "ba", "de", "le", "shi", "zai", "you"];
+    let words = [
+        "你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有",
+    ];
+    let cmt_src = [
+        "ni hao", "shijie", "shaoyong", "ne", "ba", "de", "le", "shi", "zai", "you",
+    ];
     let cands: Vec<(String, String)> = words[..n]
         .iter()
         .enumerate()
         .map(|(i, w)| {
             (
                 w.to_string(),
-                if with_cmt && i < 4 { cmt_src[i].to_string() } else { String::new() },
+                if with_cmt && i < 4 {
+                    cmt_src[i].to_string()
+                } else {
+                    String::new()
+                },
             )
         })
         .collect();
@@ -211,7 +219,18 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
         return 0;
     };
     w.readback = true;
-    w.show(&cands, &raw_str, &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        &raw_str,
+        &skin,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     std::thread::sleep(std::time::Duration::from_millis(80));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
@@ -274,7 +293,11 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     let path = std::env::temp_dir().join("hufu-pad.bmp");
     match std::fs::write(&path, &bmp) {
         Ok(()) => {
-            eprintln!("pad-dump: {} {wq}x{hq} → {}", path.display(), path.display());
+            eprintln!(
+                "pad-dump: {} {wq}x{hq} → {}",
+                path.display(),
+                path.display()
+            );
             1
         }
         Err(e) => {
@@ -332,7 +355,18 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
         ("您好".to_string(), "".to_string()),
         ("拟好".to_string(), "少用".to_string()),
     ];
-    w.show(&cands, "nih", &skin, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        "nih",
+        &skin,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     std::thread::sleep(std::time::Duration::from_millis(400));
     w.hide();
     eprintln!("candwin2: {kind} 材质渲染+隐藏完成");
@@ -354,6 +388,391 @@ extern "system" fn hufu_test_sound_burst() -> i32 {
     1
 }
 
+/// 测试钩子：动效端到端取证（渐隐渐显 + 注释展开延时 + 渐隐退场）。
+/// 测试窗换入 G_SHARED——走生产同款 WM_TIMER→wndproc→take/put-back
+/// 链；屏幕合成像素（GetPixel 网格）采样验证 DComp Opacity 真 ramp。
+/// 返回位掩码：bit0=渐显 ramp、bit1=注释展开变宽、bit2=隐藏收尾；
+/// 7=全通。
+#[no_mangle]
+extern "system" fn hufu_test_anim() -> i32 {
+    use crate::candwin2::{CandidateWindowV2, FADE_TICK_MS, FADE_TIMER_ID};
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetWindowRect, IsWindow, IsWindowVisible, PeekMessageW, ShowWindow,
+        TranslateMessage, MSG, PM_REMOVE, SW_HIDE,
+    };
+
+    /// 合成级亮度采样：BitBlt 整窗到 DIB 后内存均值（GetPixel 逐点
+    /// ~1ms×800 点会卡死采样循环；BitBlt 整帧亚毫秒）。
+    fn sample_bright(r: &RECT) -> f64 {
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{
+                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
+                ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+                SRCCOPY,
+            };
+            let w = (r.right - r.left).max(1);
+            let h = (r.bottom - r.top).max(1);
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(screen);
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
+            if bmp.is_invalid() || bits.is_null() {
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                return -1.0;
+            }
+            let old = SelectObject(mem, bmp);
+            let ok = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY);
+            let mut mean = -1.0f64;
+            if ok.is_ok() {
+                let px = bits as *const u8;
+                let stride = (w as usize) * 4;
+                let mut vals: Vec<f64> = Vec::new();
+                let mut y = 6usize;
+                while y + 6 < h as usize {
+                    let mut x = 8usize;
+                    while x + 8 < w as usize {
+                        let o = y * stride + x * 4;
+                        let b = *px.add(o) as f64;
+                        let g = *px.add(o + 1) as f64;
+                        let rr = *px.add(o + 2) as f64;
+                        let _ = (b, g);
+                        vals.push(rr);
+                        x += 7;
+                    }
+                    y += 7;
+                }
+                if !vals.is_empty() {
+                    // 红通道均值：纯红面板对任意桌面背景的反差载体
+                    mean = vals.iter().sum::<f64>() / vals.len() as f64;
+                }
+            }
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            mean
+        }
+    }
+
+    /// DWMWA_CLOAKED 读取（诊断：DComp 窗被 DWM 隐身时 rect/像素照旧但
+    /// 合成不可见——cloaked_streak 换 v1 窗正是此态）。
+    unsafe fn DwmGetWindowAttributeCloaked(hwnd: HWND, out: &mut u32) {
+        let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!(
+            "dwmapi.dll"
+        ));
+        if let Ok(m) = m {
+            let p = windows::Win32::System::LibraryLoader::GetProcAddress(
+                m,
+                windows::core::s!("DwmGetWindowAttribute"),
+            );
+            if let Some(p) = p {
+                type Get = unsafe extern "system" fn(
+                    HWND,
+                    u32,
+                    *mut core::ffi::c_void,
+                    u32,
+                ) -> windows::core::HRESULT;
+                let f: Get = std::mem::transmute(p);
+                let _ = f(hwnd, 14, out as *mut u32 as *mut core::ffi::c_void, 4);
+            }
+        }
+    }
+
+    let Some(w) = CandidateWindowV2::new() else {
+        return 0;
+    };
+    let hwnd = w.hwnd;
+    // 纯红面板 + solid：只测 R 通道——任意桌面背景 R 分量都低，全显红
+    // vs 半透红反差 ~150，断言与用户屏幕内容完全解耦
+    let skin = serde_json::json!({
+        "skin": {
+            "colors": {
+                "back_color": "#FF2222FF", "border_color": "#FFFFFF40",
+                "text_color": "#FFFFFFFF", "candidate_text_color": "#FFFFFFFF",
+                "comment_text_color": "#FFDDDDFF", "label_color": "#FFFFFFCC",
+                "hilited_candidate_back_color": "#CC0000FF",
+                "hilited_candidate_text_color": "#FFFFFFFF",
+                "hilited_label_color": "#FFFFAAFF"
+            },
+            "layout": { "font_point": 17.6, "corner_radius": 8.0,
+                        "hilited_corner_radius": 6.0, "border_width": 1.0,
+                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0,
+                        "fade_ms": 400, "comment_delay_ms": 400 },
+            "material": { "kind": "solid" }
+        }
+    });
+    let cands = vec![
+        ("你好".to_string(), "ni hao 拆分注释很长很长".to_string()),
+        ("您好".to_string(), "nin hao 注释也长长长长".to_string()),
+        ("拟好".to_string(), "少用".to_string()),
+    ];
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return 0;
+    };
+    let shared = gsh.0.clone();
+    let saved = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2 = Some(w);
+        // expand_tick 重渲染走 last_show/skin 缓存——必须与首帧一致
+        g.last_show = Some((cands.clone(), "nih".to_string(), 0));
+        g.skin = skin.clone();
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(
+                &cands,
+                "nih",
+                &skin,
+                Some(&RECT {
+                    left: 160,
+                    top: 160,
+                    right: 160,
+                    bottom: 184,
+                }),
+                0,
+            );
+        }
+    }
+    let pump = || unsafe {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    };
+    // ── 机制 sanity：fade 态驱动的渲染级透明度（超长 fade≈alpha0 vs 无 fade=1）──
+    {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let (cands, raw, sel) = g.last_show.clone().unwrap();
+            let skin = g.skin.clone();
+            if let Some(c) = g.cand2.as_mut() {
+                c.fade_ms = u32::MAX;
+                c.fade = Some((true, std::time::Instant::now()));
+                c.internal_rerender = true;
+                c.show(&cands, &raw, &skin, None, sel);
+                c.internal_rerender = false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        pump();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+        let dim = sample_bright(&r);
+        crate::tsf::trace("anim: sanity-dim 已采样");
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let (cands, raw, sel) = g.last_show.clone().unwrap();
+            let skin = g.skin.clone();
+            if let Some(c) = g.cand2.as_mut() {
+                c.fade = None;
+                c.internal_rerender = true;
+                c.show(&cands, &raw, &skin, None, sel);
+                c.internal_rerender = false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        pump();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+        let full = sample_bright(&r);
+        crate::tsf::trace("anim: sanity-full 已采样");
+        eprintln!("anim sanity: alpha≈0→{dim:.0} alpha1→{full:.0}（红通道差≥45 为机制通）");
+    }
+    // 重启一轮受时序驱动的完整动效——不走 SW_HIDE/重显（DWM 对
+    // NOREDIRECTIONBITMAP 窗 hide/show 后的合成重绑有数百 ms 迟滞，
+    // 取证会全程滞留旧帧），改用已证实的「可见窗直接改 fade 态」路径：
+    // 渐显启动 + 展开计时武装 + 注释收起复渲染
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (cands, raw, sel) = g.last_show.clone().unwrap();
+        let skin2 = g.skin.clone();
+        let empty_cands: Vec<(String, String)> = cands
+            .iter()
+            .map(|(t, _)| (t.clone(), String::new()))
+            .collect();
+        if let Some(c) = g.cand2.as_mut() {
+            // 【Clip 反 MPO 验证】真实收起路径 + 窄窗（188）+ SetClip：
+            // ramp 恢复 → Clip 即优雅修复
+            c.comments_expanded = false;
+            c.fade = Some((true, std::time::Instant::now()));
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    c.hwnd,
+                    FADE_TIMER_ID,
+                    FADE_TICK_MS,
+                    None,
+                )
+            };
+            c.internal_rerender = true;
+            c.show(
+                &cands,
+                &raw,
+                &skin2,
+                Some(&RECT {
+                    left: 160,
+                    top: 160,
+                    right: 160,
+                    bottom: 184,
+                }),
+                0,
+            );
+            c.internal_rerender = false;
+        }
+    }
+    crate::tsf::trace("anim: restart show 完成，进入计时循环");
+    let mut bright_early = -1.0f64;
+    let mut bright_late = -1.0f64;
+    let mut w_narrow = 0i32;
+    let mut w_wide = 0i32;
+    let mut diag_last = 0u128;
+    let t0 = std::time::Instant::now();
+    // fade_ms=400（慢速取证）：早段半透（亮）vs 全显（暗），桌面捕获
+    // 滞后 ~1-2 帧在 400ms 尺度下可忽略
+    while t0.elapsed().as_millis() < 900 {
+        pump();
+        // 打字期静默豁免：smoke 控制台非前台，poll 前台兜底会 110ms
+        // 收走测试窗——持续刷新 last_key_at 令 poll 跳拍（既有语义）
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.last_key_at = Some(std::time::Instant::now());
+        }
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+        // 【内容区取样】窗口 rect 有透明余量（MIN_ANIM_W 反 MPO），
+        // 亮度采样与宽度计量都取内容实际宽
+        let (cw, ch) = {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.cand2
+                .as_ref()
+                .map(|c| c.content_size.get())
+                .unwrap_or((0, 0))
+        };
+        let content_rect = RECT {
+            left: r.left,
+            top: r.top,
+            right: r.left + cw.max(60),
+            bottom: r.top + ch.max(40),
+        };
+        let t = t0.elapsed().as_millis();
+        if t - diag_last >= 500 {
+            let alive = unsafe { IsWindow(hwnd) };
+            let vis = unsafe { IsWindowVisible(hwnd) };
+            let mut cloaked = 0u32;
+            unsafe { DwmGetWindowAttributeCloaked(hwnd, &mut cloaked) };
+            eprintln!(
+                "anim diag t={t} rect=({},{},{},{}) alive={} vis={} cloaked=0x{cloaked:X}",
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+                alive.as_bool(),
+                vis.as_bool()
+            );
+        }
+        let wpx = content_rect.right - content_rect.left;
+        // 【t≈450 手动暗帧探针】已退役（根因定位完毕：MPO 小窗提升）
+        if t - diag_last >= 50 {
+            diag_last = t;
+            let fa = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.cand2.as_ref().map(|c| c.fade_alpha()).unwrap_or(-1.0)
+            };
+            eprintln!(
+                "anim curve t={t} fade_a={fa:.2} R={:.0}",
+                sample_bright(&content_rect)
+            );
+        }
+        if (50..150).contains(&t) && bright_early < 0.0 {
+            bright_early = sample_bright(&content_rect);
+        }
+        if (620..760).contains(&t) && bright_late < 0.0 {
+            bright_late = sample_bright(&content_rect);
+        }
+        if (240..380).contains(&t) && wpx > w_narrow {
+            w_narrow = wpx;
+        }
+        if t >= 560 && wpx > w_wide {
+            w_wide = wpx;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(6));
+    }
+    // 渐隐退场：hide() 异步 → fade-out → 限时不可见
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            c.hide();
+        }
+    }
+    let mut hidden = false;
+    let t1 = std::time::Instant::now();
+    while t1.elapsed().as_millis() < 600 {
+        pump();
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.last_key_at = Some(std::time::Instant::now());
+        }
+        if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+            hidden = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    pump();
+    // 清理：销毁测试窗、恢复原窗
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = g.cand2.take();
+        drop(mine);
+        g.cand2 = saved;
+    }
+    let mut mask = 0u32;
+    // 红通道渐显：early（半透，R 中等）应显著低于 late（全显，R 满）
+    if bright_late - bright_early >= 45.0 {
+        mask |= 1;
+    }
+    if w_wide > w_narrow + 20 {
+        mask |= 2;
+    }
+    if hidden {
+        mask |= 4;
+    }
+    eprintln!(
+        "anim: 渐显(R) 早={:.0} 晚={:.0}（观察项：DWM/MPO 会拍平底显） 宽 {}→{}（+20 判过） 隐藏={} mask={:03b}",
+        bright_early, bright_late, w_narrow, w_wide, hidden, mask
+    );
+    // 【断言口径】bit1（注释延时展开）+ bit2（渐隐隐藏）为确定性特性；
+    // bit0（渐显亮度 ramp）受 DWM MPO 提升影响不可靠——观察项，返回
+    // 原始 mask 由调用方按口径断言。
+    mask as i32
+}
+
 /// 皮肤热更新 E2E：同一窗口连续两帧不同皮肤 → 屏幕捕获像素必须显著变化。
 /// 返回 1 = 变化检出（渲染管线吃到了新皮肤值）；0 = 两帧几乎一样（热更新失效）。
 #[no_mangle]
@@ -361,7 +780,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     use crate::candwin2::CandidateWindowV2;
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
-        ReleaseDC, SRCCOPY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -370,9 +789,9 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         return 0;
     };
     // 基础皮肤来自引擎（结构/字体真实），只覆盖颜色做 A/B
-    let mut base = crate::ipc::call(&serde_json::json!({"op": "skin"})).unwrap_or_else(|| {
-        serde_json::json!({"skin": {"colors": {}, "layout": {}, "material": {"kind": "solid"}}})
-    });
+    let mut base = crate::ipc::call(&serde_json::json!({"op": "skin"})).unwrap_or_else(
+        || serde_json::json!({"skin": {"colors": {}, "layout": {}, "material": {"kind": "solid"}}}),
+    );
     // 强制 solid + 不透明底色：排除 accent 语义干扰，纯看颜色渲染。
     // 【基线钉死】master/hilite/shadow/border 四个透明度也一并锁 1.0
     // ——皮肤热数据（用户滑条设置）会随「服务器当前皮肤」混进基线，
@@ -397,8 +816,14 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         if let Some(s) = sk.get_mut("skin").and_then(|s| s.as_object_mut()) {
             if let Some(c) = s.get_mut("colors").and_then(|c| c.as_object_mut()) {
                 c.insert("back_color".into(), serde_json::json!(back));
-                c.insert("hilited_candidate_back_color".into(), serde_json::json!(hilight));
-                c.insert("hilited_candidate_text_color".into(), serde_json::json!(hitext));
+                c.insert(
+                    "hilited_candidate_back_color".into(),
+                    serde_json::json!(hilight),
+                );
+                c.insert(
+                    "hilited_candidate_text_color".into(),
+                    serde_json::json!(hitext),
+                );
             }
         }
     };
@@ -406,8 +831,8 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     set_colors(&mut skin_a, "#101014FF", "#3050A0FF", "#FFFFFFFF"); // 深底·蓝高亮
     let mut skin_b = base.clone();
     set_colors(&mut skin_b, "#F5F0E6FF", "#C03030FF", "#101010FF"); // 浅底·红高亮
-    // 首候选行 y：阴影边距下有平移——胶囊检查用竖带扫描（见②）
-    // 行内水平扫描范围：避开序号列，覆盖胶囊主体
+                                                                    // 首候选行 y：阴影边距下有平移——胶囊检查用竖带扫描（见②）
+                                                                    // 行内水平扫描范围：避开序号列，覆盖胶囊主体
     let margin_probe = |w: usize| -> std::ops::Range<usize> {
         let s = (w * 15 / 100).max(20);
         let e = (w * 70 / 100).min(w.saturating_sub(4));
@@ -479,15 +904,41 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             let _ = DeleteObject(hb);
             let _ = DeleteDC(hdc_mem);
             ReleaseDC(None, hdc_screen);
-            if copied == n { Some(buf) } else { None }
+            if copied == n {
+                Some(buf)
+            } else {
+                None
+            }
         }
     };
 
     // 帧 A → 捕获；帧 B（同一窗口实例，模拟词边界热换肤）→ 捕获
-    w.show(&cands, "nih", &skin_a, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        "nih",
+        &skin_a,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let cap_a = capture(&w);
-    w.show(&cands, "nih", &skin_b, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        "nih",
+        &skin_b,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let cap_b = capture(&w);
     w.hide();
@@ -527,7 +978,18 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         }
     }
     w.readback = true;
-    w.show(&cands, "nih", &skin_f, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        "nih",
+        &skin_f,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     let mut rc_f = windows::Win32::Foundation::RECT::default();
     let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_f) };
     let (fw, fh) = (rc_f.right - rc_f.left, rc_f.bottom - rc_f.top);
@@ -536,7 +998,11 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         return 0;
     };
     {
-        let (wq, hq) = (fw as usize, fh as usize);
+        // 【no-shrink 适配】用 last_size（内容尺寸）而非窗口 rect
+        let (wq, hq) = (
+            (w.last_size.0.max(1)) as usize,
+            (w.last_size.1.max(1)) as usize,
+        );
         let px = |x: usize, y: usize| -> [u8; 4] {
             let i = (y * wq + x) * 4;
             [f_px[i], f_px[i + 1], f_px[i + 2], f_px[i + 3]]
@@ -619,14 +1085,27 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             l.insert("horizontal".into(), serde_json::json!(true));
         }
     }
-    w.show(&cands, "nih", &skin_h, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
-    // 轮询等待尺寸真正变化上屏（SetWindowPos 异步，固定 sleep 有竞态）
+    w.show(
+        &cands,
+        "nih",
+        &skin_h,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
+    // 轮询等待尺寸真正变化上屏（SetWindowPos 异步，固定 sleep 有竞态）。
+    // 【no-shrink 适配】窗口 rect 高度不收缩——判定与计量都用
+    // content_size（内容实际尺寸）
     let mut rc_h = windows::Win32::Foundation::RECT::default();
     let mut settled = false;
     for _ in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = unsafe { GetWindowRect(w.hwnd, &mut rc_h) };
-        let (cw, chh) = (rc_h.right - rc_h.left, rc_h.bottom - rc_h.top);
+        let (cw, chh) = w.content_size.get();
         if cw > fw + 15 && chh < fh - 8 {
             settled = true;
             break;
@@ -634,11 +1113,24 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     }
     // 横排留白回读（用户皮肤即横排；窗口可能比内容先到，再等一帧）
     w.readback = true;
-    w.show(&cands, "nih", &skin_h, Some(&windows::Win32::Foundation::RECT { left: 120, top: 120, right: 120, bottom: 144 }), 0);
+    w.show(
+        &cands,
+        "nih",
+        &skin_h,
+        Some(&windows::Win32::Foundation::RECT {
+            left: 120,
+            top: 120,
+            right: 120,
+            bottom: 144,
+        }),
+        0,
+    );
     std::thread::sleep(std::time::Duration::from_millis(60));
+    // 【no-shrink 适配】窗口 rect 可能有透明余量——回读尺寸必须用
+    // last_size（内容实际渲染尺寸），否则索引越界
     let (wq, hq) = (
-        ((rc_h.right - rc_h.left).max(1)) as usize,
-        ((rc_h.bottom - rc_h.top).max(1)) as usize,
+        (w.last_size.0.max(1)) as usize,
+        (w.last_size.1.max(1)) as usize,
     );
     if let Some(h_px) = w.last_pixels.take() {
         let mut top_b = usize::MAX;
