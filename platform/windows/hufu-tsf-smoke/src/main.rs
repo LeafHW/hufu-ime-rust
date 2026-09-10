@@ -377,7 +377,6 @@ fn main() {
             println!("[12.{mode}] candwin2 {name} ✓");
         }
 
-
         // ── 动效端到端：渐显 ramp / 注释展开 / 渐隐退场（合成级像素取证）──
         type AnimFn = unsafe extern "system" fn() -> i32;
         let an: AnimFn =
@@ -409,6 +408,14 @@ fn main() {
             "动效×9 档缩放应全通（100~500%），实得 {smask:09b}"
         );
         println!("[18] 动效×缩放 100%~500% ✓（9 档起臂→完成→渲染全通）");
+
+        // ── 拉伸圆角取证（慢速 sim 200%+ 观感）：中途帧/完成帧角内采样 ──
+        type CornerFn = unsafe extern "system" fn() -> i32;
+        let crn: CornerFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"hufu_test_stretch_corner\0".as_ptr())).unwrap(),
+        );
+        let cmask = unsafe { crn() };
+        println!("[19] 拉伸圆角取证 mask={cmask:02b}（3=两帧圆角；观察项）");
 
         // ── 音效池化连打：16 连击（4 句柄排队深度压力）不得崩/死锁 ──
         type SndBurstFn = unsafe extern "system" fn() -> i32;

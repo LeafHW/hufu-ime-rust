@@ -928,7 +928,7 @@ impl CandidateWindowV2 {
                 pos_anim: None,
                 pos_ms: 120,
                 anim_on: std::cell::Cell::new(true),
-                fade_ms_eff: 150,
+                fade_ms_eff: 120,
                 live_pos: std::cell::Cell::new((0, 0)),
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1093,7 +1093,7 @@ impl CandidateWindowV2 {
         // /收尾改纯运动：首键从 72% 长大到目标（边框阴影跟着拉出），
         // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
         self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        self.fade_ms_eff = (150.0 * anim_spd) as u32;
+        self.fade_ms_eff = (120.0 * anim_spd) as u32;
         self.size_ms = (layout_f(skin, "size_ms", 90.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 120.0).clamp(0.0, 600.0) * anim_spd) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
@@ -2197,19 +2197,50 @@ impl CandidateWindowV2 {
                 }
                 // 【拉伸动效】内容裁剪：动效帧中外壳小于目标布局——把
                 // 编码行/候选/注释裁在外壳内（增长=渐进露出，收拢=渐进
-                // 收起）；稳态帧不推（零开销）
+                // 收起）；稳态帧不推（零开销）。
+                // 【圆角裁剪 2026-09-11】用户实测慢速（200%+速度）下延伸
+                // 过程中「边框/阴影是直角」：面板/边框/阴影几何全程圆，
+                // 直角来自此处方形 Clip 把贴边元素（编码行底、高亮胶囊）
+                // 切出直边——改 PushLayer+圆角几何遮罩（与外壳同 radius），
+                // 动画中内容缘也随圆角收边，完成帧恢复全圆。
                 let chrome_clip_on = self.chrome_override.get().is_some();
                 if chrome_clip_on {
                     unsafe {
-                        ctx.PushAxisAlignedClip(
-                            &D2D_RECT_F {
-                                left: bx,
-                                top: by,
-                                right: bx + chw,
-                                bottom: by + chh,
-                            },
-                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        );
+                        let clip_rect = D2D_RECT_F {
+                            left: bx,
+                            top: by,
+                            right: bx + chw,
+                            bottom: by + chh,
+                        };
+                        // 圆角几何遮罩（与外壳同 radius；PushLayer 内部
+                        // AddRef，局部几何可随作用域释放）
+                        let geom: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> =
+                            ctx.GetFactory().ok().and_then(|f| {
+                                f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                                    rect: clip_rect,
+                                    radiusX: radius,
+                                    radiusY: radius,
+                                })
+                                .ok()
+                                .and_then(|g| g.cast().ok())
+                            });
+                        match geom {
+                            Some(g) => {
+                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
+                                lp.contentBounds = clip_rect;
+                                lp.geometricMask = std::mem::ManuallyDrop::new(Some(g));
+                                lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                ctx.PushLayer(&lp, None);
+                            }
+                            None => {
+                                // 几何创建失败兜底：无 mask 的层=方形
+                                // contentBounds 裁剪（与旧 Clip 等效）——
+                                // Push/Pop 两侧统一走 Layer，配对无忧
+                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
+                                lp.contentBounds = clip_rect;
+                                ctx.PushLayer(&lp, None);
+                            }
+                        }
                     }
                 }
 
@@ -2545,10 +2576,11 @@ impl CandidateWindowV2 {
                         let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
                     }
                 } // draw_content
-                  // 【拉伸动效】内容裁剪收层（与上方 Push 配对）
+                  // 【拉伸动效】内容裁剪收层（与上方 Push 配对；圆角遮罩
+                  // 与方形兜底都走 Layer——Pop 恒为 PopLayer）
                 if chrome_clip_on {
                     unsafe {
-                        ctx.PopAxisAlignedClip();
+                        ctx.PopLayer();
                     }
                 }
 
@@ -2969,8 +3001,12 @@ impl CandidateWindowV2 {
             None => 1.0,
             Some((fading_in, t0)) => {
                 // 【淡出专用 2026-09-11】进场=下限曲线（防透底重叠）；
-                // 退场=全幅 1→0（窗正在离开，透底即目的——用户点名要
-                // 淡出）。退场时长：fade_ms>0 用之，否则 150ms 默认。
+                // 退场=全幅 1→0（窗正在离开，透底即目的）。退场时长：
+                // fade_ms>0 用之，否则 120ms 默认。
+                // 【退场起步即沉 2026-09-11】二次缓动起步太平（前 1/3 程
+                // 几乎不透明）+200%+速度拉长后被观感为「先压重再消失」
+                // （半透明面板压在新上屏文字上=变重）——改三次曲线：首帧
+                // 即显著下沉，全程只做「变淡」。
                 let dur_ms = if fading_in {
                     self.fade_ms.max(1)
                 } else if self.fade_ms > 0 {
@@ -2982,7 +3018,7 @@ impl CandidateWindowV2 {
                 if fading_in {
                     (FADE_FLOOR + (1.0 - FADE_FLOOR) * (1.0 - (1.0 - p) * (1.0 - p))) as f32
                 } else {
-                    (((1.0 - p) * (1.0 - p)) * 1.0) as f32
+                    (((1.0 - p) * (1.0 - p) * (1.0 - p)) * 1.0) as f32
                 }
             }
         }
@@ -2997,7 +3033,7 @@ impl CandidateWindowV2 {
         let Some((fading_in, t0)) = self.fade else {
             return true;
         };
-        // 时长：皮肤 fade_ms>0 用之，否则全局速度版的 150ms 默认
+        // 时长：皮肤 fade_ms>0 用之，否则全局速度版的 120ms 默认
         let ms = if self.fade_ms > 0 {
             self.fade_ms as f64
         } else {
