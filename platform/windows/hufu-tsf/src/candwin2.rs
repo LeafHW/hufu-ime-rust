@@ -1062,7 +1062,9 @@ impl CandidateWindowV2 {
             .or_else(|| skin.get("anim_speed"))
             .and_then(|x| x.as_f64())
             .unwrap_or(1.0)
-            .clamp(0.25, 4.0) as f32;
+            // 【口径 0~2 2026-09-11 用户拍板】滑条 0%–200%（0=瞬跳：
+            // 时长×0=0，各动效起臂门 size_ms>0 等自然不臂）
+            .clamp(0.0, 2.0) as f32;
         self.anim_on.set(anim_on);
         let anim_spd = if anim_on { anim_spd } else { 0.0 };
         // 【动效口径 2026-09-11 终版④】透明度渐变终判弃用（半透面板+
@@ -1677,19 +1679,14 @@ impl CandidateWindowV2 {
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
-            } else if !was_visible
-                && self.size_ms > 0
-                && self.fade_ms == 0
-                && self
-                    .last_hide_at
-                    .map(|t| {
-                        std::time::Instant::now().duration_since(t).as_millis() >= FADE_QUIET_MS
-                    })
-                    .unwrap_or(true)
-            {
-                // 【首出长大 2026-09-11】刻意出现的窗（静默门外）从 72%
-                // 拉到目标——纯尺寸动效（零透明度变化=无变深/透底），
-                // 盒心锚定高亮胶囊（「从高亮区出现」）；连打循环直接全显
+            } else if !was_visible && self.size_ms > 0 && self.fade_ms == 0 {
+                // 【首出长大 2026-09-11】刻意出现的窗从 72% 拉到目标——
+                // 纯尺寸动效（零透明度变化=无变深/透底），盒心锚定高亮
+                // 胶囊（「从高亮区出现」）；连打循环直接全显。
+                // 【静默门移除 2026-09-11】用户实测跟打器里入场只在首
+                // 次生效（句间收放 <250ms 被 FADE_QUIET_MS 门拦）；
+                // 纯长大无透明度变化、无频闪风险，门拆除——每次重新
+                // 出现的窗都做入场长大。
                 let start = (
                     (target.0 as f32 * 0.72) as i32,
                     (target.1 as f32 * 0.72) as i32,

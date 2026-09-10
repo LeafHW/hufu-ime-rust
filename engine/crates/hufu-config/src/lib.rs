@@ -459,7 +459,7 @@ pub struct AppearanceSection {
     pub status_capsule: bool,
     /// 【动效开关 2026-09-11】候选窗动效总开关（false=一切动效瞬跳）
     pub anim: bool,
-    /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0.25~4）
+    /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0~2，0=瞬跳）
     pub anim_speed: f32,
 }
 
