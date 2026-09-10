@@ -2193,76 +2193,42 @@ impl CandidateWindowV2 {
                 // 【拉伸动效】内容裁剪：动效帧中外壳小于目标布局——把
                 // 编码行/候选/注释裁在外壳内（增长=渐进露出，收拢=渐进
                 // 收起）；稳态帧不推（零开销）。
-                // 【圆角裁剪 v2 2026-09-11】方形 Clip 版无闪但切出直角。
-                // 换「阴影外遮罩」形态重试圆角：push_shadow_mask 自 v3
-                // 起在用户机每帧跑 PushLayer+圆角几何从未闪——差异在它
-                // 于 identity 变换+物理坐标下推层，而旧圆角版在 dpi 缩放
-                // 变换下推（用户驱动层内丢画仅见于后者）。照抄安全形态：
-                // SetTransform(单位阵)→物理坐标几何→±1e6 contentBounds→
-                // PushLayer→还原内容变换。几何失败兜底=方形 Clip（无闪）。
+                // 【方形 Clip 定稿 2026-09-11】两种圆角层形态（dpi 变换下
+                // 推层 / identity+物理坐标照抄阴影外遮罩）在用户驱动上都
+                // 引发「层内文字逐帧丢画」=文字闪——用户机对「文字画在
+                // 几何遮罩层里」不稳（阴影遮罩只包几何填充且有缓存，故
+                // 从未暴露）。定稿=恒方形 AxisAlignedClip（实锤无闪）。
+                // 直角由「填充元素几何钳制」解决：编码行底/高亮胶囊的
+                // 矩形在动效帧钳进动画壳内（各自自带圆角），直边不再触
+                // 遮罩缘；文字仅稀疏字形碰缘（90ms 内不可见）。
                 let chrome_clip_on = self.chrome_override.get().is_some();
-                let mut chrome_clip_via_layer = false;
                 if chrome_clip_on {
                     unsafe {
-                        let clip_rect = D2D_RECT_F {
-                            left: bx,
-                            top: by,
-                            right: bx + chw,
-                            bottom: by + chh,
-                        };
-                        let mut content_t = windows::Foundation::Numerics::Matrix3x2::default();
-                        ctx.GetTransform(&mut content_t as *mut _);
-                        let ident = windows::Foundation::Numerics::Matrix3x2 {
-                            M11: 1.0,
-                            M12: 0.0,
-                            M21: 0.0,
-                            M22: 1.0,
-                            M31: 0.0,
-                            M32: 0.0,
-                        };
-                        let geom: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> =
-                            ctx.GetFactory().ok().and_then(|f| {
-                                ctx.SetTransform(&ident);
-                                let g = f
-                                    .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F {
-                                            left: (shadow_m + bx) * dpi_scale,
-                                            top: (shadow_m + by) * dpi_scale,
-                                            right: (shadow_m + bx + chw) * dpi_scale,
-                                            bottom: (shadow_m + by + chh) * dpi_scale,
-                                        },
-                                        radiusX: radius * dpi_scale,
-                                        radiusY: radius * dpi_scale,
-                                    })
-                                    .ok()
-                                    .and_then(|g| g.cast().ok());
-                                ctx.SetTransform(&content_t);
-                                g
-                            });
-                        match geom {
-                            Some(g) => {
-                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
-                                lp.contentBounds = D2D_RECT_F {
-                                    left: -1.0e6,
-                                    top: -1.0e6,
-                                    right: 1.0e6,
-                                    bottom: 1.0e6,
-                                };
-                                lp.geometricMask = std::mem::ManuallyDrop::new(Some(g));
-                                lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                                lp.maskTransform = ident;
-                                ctx.PushLayer(&lp, None);
-                                chrome_clip_via_layer = true;
-                            }
-                            None => {
-                                ctx.PushAxisAlignedClip(
-                                    &clip_rect,
-                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                );
-                            }
-                        }
+                        ctx.PushAxisAlignedClip(
+                            &D2D_RECT_F {
+                                left: bx,
+                                top: by,
+                                right: bx + chw,
+                                bottom: by + chh,
+                            },
+                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        );
                     }
                 }
+                // 【直角消除 2026-09-11】动效帧把填充元素（编码行底/高亮
+                // 胶囊）的几何钳进动画壳内（右/下缘收到壳内缩进处）——
+                // 它们自带圆角，钳入后直边不再触方形遮罩缘=无直角；稳态
+                // 帧 None=原样。D2D 对退化圆角矩形自动缩半径，安全。
+                let chrome_in_r: Option<f32> = chrome_clip_on.then_some(bx + chw - rm_x);
+                let chrome_in_b: Option<f32> = chrome_clip_on.then_some(by + chh - rm_y);
+                let cr = |v: f32| match chrome_in_r {
+                    Some(lim) => v.min(lim),
+                    None => v,
+                };
+                let cb = |v: f32| match chrome_in_b {
+                    Some(lim) => v.min(lim),
+                    None => v,
+                };
 
                 // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
                 // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
@@ -2367,8 +2333,8 @@ impl CandidateWindowV2 {
                                 rect: D2D_RECT_F {
                                     left: rm_x,
                                     top: rm_y,
-                                    right: width - rm_x,
-                                    bottom: rm_y + line_h,
+                                    right: cr(width - rm_x),
+                                    bottom: cb(rm_y + line_h),
                                 },
                                 radiusX: 4.0,
                                 radiusY: 4.0,
@@ -2432,8 +2398,8 @@ impl CandidateWindowV2 {
                                         rect: D2D_RECT_F {
                                             left: x - hilite_pad,
                                             top: pt,
-                                            right: x + cell_w + hilite_pad,
-                                            bottom: pb,
+                                            right: cr(x + cell_w + hilite_pad),
+                                            bottom: cb(pb),
                                         },
                                         radiusX: layout_f(skin, "hilited_corner_radius", radius),
                                         radiusY: layout_f(skin, "hilited_corner_radius", radius),
@@ -2448,9 +2414,9 @@ impl CandidateWindowV2 {
                                             rect: D2D_RECT_F {
                                                 left: x - hilite_pad + (hilite_pad - mw) / 2.0,
                                                 top: my,
-                                                right: x - hilite_pad
+                                                right: cr(x - hilite_pad
                                                     + (hilite_pad - mw) / 2.0
-                                                    + mw,
+                                                    + mw),
                                                 bottom: my + mh,
                                             },
                                             radiusX: 1.0,
@@ -2507,8 +2473,8 @@ impl CandidateWindowV2 {
                                         rect: D2D_RECT_F {
                                             left: rm_x,
                                             top: pt,
-                                            right: width - rm_x,
-                                            bottom: pb,
+                                            right: cr(width - rm_x),
+                                            bottom: cb(pb),
                                         },
                                         radiusX: layout_f(skin, "hilited_corner_radius", radius),
                                         radiusY: layout_f(skin, "hilited_corner_radius", radius),
@@ -2596,14 +2562,10 @@ impl CandidateWindowV2 {
                         let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
                     }
                 } // draw_content
-                  // 【拉伸动效】内容裁剪收层（层路径=PopLayer；方形兜底=PopAxisAlignedClip）
+                  // 【拉伸动效】内容裁剪收层（与上方 PushAxisAlignedClip 配对）
                 if chrome_clip_on {
                     unsafe {
-                        if chrome_clip_via_layer {
-                            ctx.PopLayer();
-                        } else {
-                            ctx.PopAxisAlignedClip();
-                        }
+                        ctx.PopAxisAlignedClip();
                     }
                 }
 
