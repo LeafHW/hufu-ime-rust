@@ -344,3 +344,52 @@ fn freq1500_priority_within_four_codes() {
     let texts5: Vec<&str> = cands5.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(texts5, vec!["词组长码", "是"], ">4 码正常权重: {texts5:?}");
 }
+
+/// 【单字永不换序·词下沉 2026-09-11 二次修正】用户实测回归：kc 全码组
+/// [寸,泥,⼨]（泥在 1500 表、寸不在）被平铺浮前错排成泥首位——形码同码
+/// 单字组的官方序不容频表重排。正确语义：1500 单字只浮到「多字候选」
+/// 之前（wfsi→征压「写止」词），锚后罕字不回退、已达标组零扰动。
+#[test]
+fn freq1500_singles_never_reorder_words_sink() {
+    let dir = std::env::temp_dir().join(format!("hufu-freq1500-fix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dict_dir = dir.join("码表").join("虎码单字");
+    std::fs::create_dir_all(&dict_dir).unwrap();
+    std::fs::write(
+        dict_dir.join("tiger.dict.yaml"),
+        "---\nname: tiger\nsort: by_weight\n...\n\
+         寸\tkc\t9000\n\
+         泥\tkc\t10\n\
+         ⼨\tkc\t5\n\
+         写止\twfsi\t9000\n\
+         征\twfsi\t10\n\
+         𡧡\twfsi\t8\n\
+         象\twx\t9000\n\
+         彻底\twx\t8000\n\
+         𧰼\twx\t7000\n",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.schema.current = "虎码单字".into();
+    let mut engine = Engine::new(&dir, config).unwrap();
+    let type_raw = |engine: &mut Engine, raw: &str| {
+        let mut session = Session::new(true);
+        let mut out = None;
+        for ch in raw.chars() {
+            out = Some(engine.process_key(&mut session, key(ch)));
+        }
+        out.unwrap().state.unwrap().candidates
+    };
+    // kc：同码单字组官方序不动（泥在 1500 表也不浮过寸）
+    let cands = type_raw(&mut engine, "kc");
+    let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, vec!["寸", "泥", "⼨"], "单字组永不换序: {texts:?}");
+    // wfsi：词「写止」下沉，征浮首，锚后罕字保位
+    let cands = type_raw(&mut engine, "wfsi");
+    let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, vec!["征", "写止", "𡧡"], "1500 单字压词、罕字不回退: {texts:?}");
+    // wx：权重序 [象,彻底,𧰼]，象本就在首——整表不动
+    let cands = type_raw(&mut engine, "wx");
+    let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, vec!["象", "彻底", "𧰼"], "已达标组零扰动: {texts:?}");
+}

@@ -2842,32 +2842,51 @@ impl Engine {
                     }
                 }
             }
-            // 【4 码内高频字优先 2026-09-11 用户拍板】当前实打编码 ≤4
-            //（含 4，码表域、无锁）时，前 1500 高频单字（Jun Da 字频表）
-            // 候选优先首选——「wfsi→征」压过「写止」类现切组合；继续打
-            // 到第 5 键（超 4 码）/带锁/已有上屏前缀即回归正常权重排序。
-            // 只动顺序不动权重：置顶（pinned）区不受影响；获优先的
-            // 单字组内保持原相对序（字频高者在先），其余候选原序补后。
-            // 用户显式意图仍赢：置顶在分区范围外，/jc 选重位词被压后
-            // 属本规则预期（冲突时按本规则，用户可再调）。
+            // 【4 码内高频字优先 2026-09-11 用户拍板；同晚二次修正】实打
+            // 编码 ≤4（含 4，码表域、无锁）时，前 1500 高频单字（Jun Da
+            // 字频表）浮到多字候选（词组/整句现切）之前——「wfsi→征」压
+            // 「写止」；第 5 键起/带锁/带上屏前缀回归正常权重。
+            // 【边界修正·单字永不换序】首版整域平铺置前，实测「kc 全码组
+            // [寸,泥,⼨] 中表内的泥被浮到寸前」——形码同码单字组的官方
+            // 序不容频表重排。正确语义：1500 单字只下沉「词」，构造法=
+            // 以最后一个 1500 单字为锚：锚前非词保序 → 全部词保序 → 其
+            // 余非词保序。无 1500 单字则完全不动。只动序不动权重，置顶区
+            // （pinned）不受影响。
             let freq_boost_domain = !parsed.has_locks()
                 && raw_len > 0
                 && raw_len <= self.config.input.max_code_length;
             if freq_boost_domain {
                 let pinned_n = session.candidates.iter().take_while(|c| c.pinned).count();
                 let rest = session.candidates.split_off(pinned_n);
-                let (freq_chars, others): (Vec<Candidate>, Vec<Candidate>) =
-                    rest.into_iter().partition(|c| {
-                        c.source == CandidateKind::Dict
-                            && c.text.chars().count() == 1
-                            && c.text
-                                .chars()
-                                .next()
-                                .map(hufu_dict::freq::is_top1500)
-                                .unwrap_or(false)
-                    });
-                session.candidates.extend(freq_chars);
-                session.candidates.extend(others);
+                let is_top_single = |c: &Candidate| {
+                    c.source == CandidateKind::Dict
+                        && c.text.chars().count() == 1
+                        && c.text
+                            .chars()
+                            .next()
+                            .map(hufu_dict::freq::is_top1500)
+                            .unwrap_or(false)
+                };
+                // 锚 = 最后一个 1500 单字（无则整段不动——含纯罕字单字组）
+                if let Some(anchor) = rest.iter().rposition(|c| is_top_single(c)) {
+                    let mut out: Vec<Candidate> = Vec::with_capacity(rest.len());
+                    let mut words: Vec<Candidate> = Vec::new();
+                    let mut after: Vec<Candidate> = Vec::new();
+                    for (i, c) in rest.into_iter().enumerate() {
+                        if i <= anchor && !is_top_single(&c) && c.text.chars().count() > 1 {
+                            words.push(c);
+                        } else if i <= anchor {
+                            out.push(c);
+                        } else {
+                            after.push(c);
+                        }
+                    }
+                    out.append(&mut words);
+                    out.extend(after);
+                    session.candidates.extend(out);
+                } else {
+                    session.candidates.extend(rest);
+                }
             }
             return;
         }
