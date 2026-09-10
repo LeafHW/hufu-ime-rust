@@ -19,6 +19,7 @@
 pub mod annotation;
 pub mod dict;
 pub mod entry;
+pub mod freq;
 pub mod opencc;
 pub mod parse;
 pub mod schema;

@@ -305,3 +305,42 @@ fn enter_clear_and_escape() {
 fn setup_with_dir() -> (Engine, Session, std::path::PathBuf) {
     setup()
 }
+
+/// 【4 码内高频字优先 2026-09-11】当前实打编码 ≤4（含 4）时前 1500
+/// 高频单字候选压多字候选置首（同码竞争中权重低也置先）；第 5 键起
+///（超 4 码）回归正常权重排序。置顶（pinned）仍压过优先规则。
+#[test]
+fn freq1500_priority_within_four_codes() {
+    let dir = std::env::temp_dir().join(format!("hufu-freq1500-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dict_dir = dir.join("码表").join("虎码单字");
+    std::fs::create_dir_all(&dict_dir).unwrap();
+    std::fs::write(
+        dict_dir.join("tiger.dict.yaml"),
+        "---\nname: tiger\nsort: by_weight\n...\n\
+         写组\twx\t9000\n\
+         的\twx\t10\n\
+         一\twx\t5\n\
+         词组长码\twxyzx\t9000\n\
+         是\twxyzx\t10\n",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.schema.current = "虎码单字".into();
+    let mut engine = Engine::new(&dir, config).unwrap();
+    let mut session = Session::new(true);
+    // wx（2 码 ≤4）：的/一（前 1500 字频）压过高权重「写组」，且字频
+    // 序 的(排1) 在 一(排2) 前
+    engine.process_key(&mut session, key('w'));
+    let out = engine.process_key(&mut session, key('x'));
+    let cands = out.state.unwrap().candidates;
+    let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, vec!["的", "一", "写组"], "≤4 码高频字优先首选: {texts:?}");
+    // wxyzx（5 码 >4）：正常权重——高权重「词组长码」在先
+    engine.process_key(&mut session, key('y'));
+    engine.process_key(&mut session, key('z'));
+    let out5 = engine.process_key(&mut session, key('x'));
+    let cands5 = out5.state.unwrap().candidates;
+    let texts5: Vec<&str> = cands5.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts5, vec!["词组长码", "是"], ">4 码正常权重: {texts5:?}");
+}
