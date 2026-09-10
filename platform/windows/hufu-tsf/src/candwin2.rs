@@ -20,8 +20,8 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetCapture, ReleaseCapture};
 use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
@@ -29,12 +29,7 @@ use windows_core::PCWSTR;
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
 /// 【排查中】用户实测「正常应用里点击候选框导致应用卡死」——本过程
 /// 记录点击/移动消息到达与时刻，卡死复现后由日志定位卡点。
-extern "system" fn cand2_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     const DIAG: once_bool::Diag = once_bool::Diag::new();
     if DIAG.enabled() {
         let tag = match msg {
@@ -52,7 +47,10 @@ extern "system" fn cand2_wndproc(
             _ => "",
         };
         if !tag.is_empty() {
-            crate::tsf::diag_note(&format!("cw2 mouse {tag} t={:?}", std::time::SystemTime::now()));
+            crate::tsf::diag_note(&format!(
+                "cw2 mouse {tag} t={:?}",
+                std::time::SystemTime::now()
+            ));
         }
     }
     // 【NOREDIRECTIONBITMAP+DComp 窗的 hit-test 修正】DWM 按 visual
@@ -91,7 +89,11 @@ extern "system" fn cand2_wndproc(
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 // 死区判定：未激活时距离起点 >4px 才升级为拖拽
-                if CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                if CAND_DRAG
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
+                {
                     let down = *CAND_DOWN.lock().unwrap_or_else(|e| e.into_inner());
                     match down {
                         Some((sx, sy)) => {
@@ -102,9 +104,15 @@ extern "system" fn cand2_wndproc(
                         None => return LRESULT(0),
                     }
                     // 越过死区：此刻激活拖拽（偏移=当前鼠标−窗口原点）
-                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let mut wr = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
                     let _ = GetWindowRect(hwnd, &mut wr);
-                    *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = Some((pt.x - wr.left, pt.y - wr.top));
+                    *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((pt.x - wr.left, pt.y - wr.top));
                     // 【pin 双保险】本按下周期内真正拖过——置一次性
                     // 标记，0x202 兜底锁定（见 WM_LBUTTONUP）。
                     *CAND_DRAGGED_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -116,7 +124,12 @@ extern "system" fn cand2_wndproc(
                     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
                     let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                     let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let mut wr = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
                     let _ = GetWindowRect(hwnd, &mut wr);
                     let w = (wr.right - wr.left).max(1);
                     let h = (wr.bottom - wr.top).max(1);
@@ -161,23 +174,27 @@ extern "system" fn cand2_wndproc(
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .is_some();
-                let dragged_once = std::mem::take(&mut *CAND_DRAGGED_ONCE
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()));
+                let dragged_once = std::mem::take(
+                    &mut *CAND_DRAGGED_ONCE.lock().unwrap_or_else(|e| e.into_inner()),
+                );
                 if dragged || dragged_once {
                     crate::tsf::trace(if dragged {
                         "cw2: lup 拖动结束"
                     } else {
                         "cw2: lup 拖动结束（DRAG 已失，按曾拖过锁定）"
                     });
-                    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let mut wr = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
                     let _ = GetWindowRect(hwnd, &mut wr);
-                    *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
-                    *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) = Some((wr.left, wr.top));
-                    crate::tsf::diag_note(&format!(
-                        "cw2 pin 拖动即固定 ({},{})",
-                        wr.left, wr.top
-                    ));
+                    *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((wr.left, wr.top));
+                    *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((wr.left, wr.top));
+                    crate::tsf::diag_note(&format!("cw2 pin 拖动即固定 ({},{})", wr.left, wr.top));
                 } else {
                     crate::tsf::trace("cw2: lup 未拖动（死区内）");
                 }
@@ -228,11 +245,15 @@ extern "system" fn cand2_wndproc(
                             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                             let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
                                 l["font_point"] = serde_json::json!(new_pt);
-                                if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
+                                if let Some(lb) = new_lb {
+                                    l["label_font_point"] = serde_json::json!(lb);
+                                }
                                 true
                             } else if let Some(l) = g.skin.get_mut("layout") {
                                 l["font_point"] = serde_json::json!(new_pt);
-                                if let Some(lb) = new_lb { l["label_font_point"] = serde_json::json!(lb); }
+                                if let Some(lb) = new_lb {
+                                    l["label_font_point"] = serde_json::json!(lb);
+                                }
                                 true
                             } else {
                                 false
@@ -244,7 +265,8 @@ extern "system" fn cand2_wndproc(
                             }
                             (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret)
                         };
-                        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_mut()) {
+                        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_mut())
+                        {
                             c.show(cands, raw, &skin, caret.as_ref(), *sel);
                         }
                         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -288,11 +310,102 @@ extern "system" fn cand2_wndproc(
             return LRESULT(0);
         }
         0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
+        // 【rect 只增不减 2026-09-11】内容余量区（窗口 rect 大于内容
+        // 的透明部分）鼠标穿透——不挡住底下去往宿主应用的点击。
+        0x0084 => {
+            // WM_NCHITTEST：lparam 屏幕坐标
+            if let Some(gsh) = crate::tsf::G_SHARED.get() {
+                let shared = gsh.0.clone();
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = g.cand2.as_ref() {
+                    let (cw, ch) = c.content_size.get();
+                    let mut pt = POINT { x: 0, y: 0 };
+                    let mut ok = false;
+                    unsafe {
+                        let mut p = POINT {
+                            x: (lparam.0 as u32 & 0xFFFF) as i16 as i32,
+                            y: ((lparam.0 as u32 >> 16) & 0xFFFF) as i16 as i32,
+                        };
+                        if ScreenToClient(hwnd, &mut p).as_bool() {
+                            pt = p;
+                            ok = true;
+                        }
+                    }
+                    if ok && (pt.x >= cw || pt.y >= ch || pt.x < 0 || pt.y < 0) {
+                        return LRESULT(-1); // HTTRANSPARENT
+                    }
+                }
+            }
+        }
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
-            unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
+            // 【动效 2026-09-11】渐隐退场：动效开启且窗已可见 ≥250ms
+            // （刻意在场的窗）→ 启动渐隐，tick 完成时真隐藏；否则直接
+            // 隐藏（连打静默期防频闪/动效关）。已在渐隐中不重启（防
+            // 重复 hide 消息把不透明度弹回 1）。渐显中收到隐藏→转渐隐。
+            unsafe {
+                let mut do_fade = false;
+                if let Some(gsh) = crate::tsf::G_SHARED.get() {
+                    let shared = gsh.0.clone();
+                    let mut cand2 = {
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.cand2.take()
+                    };
+                    if let Some(c) = cand2.as_mut() {
+                        let vis_long = c
+                            .last_show_at
+                            .map(|t| t.elapsed().as_millis() >= FADE_QUIET_MS)
+                            .unwrap_or(false);
+                        let already_out = matches!(c.fade, Some((false, _)));
+                        if c.fade_ms > 0 && IsWindowVisible(hwnd).as_bool() && vis_long {
+                            if !already_out {
+                                c.fade = Some((false, std::time::Instant::now()));
+                            }
+                            let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                            do_fade = true;
+                        }
+                    }
+                    if !do_fade {
+                        if let Some(c) = cand2.as_mut() {
+                            c.last_hide_at = Some(std::time::Instant::now());
+                            // 【rect 只增不减】隐藏即整窗退役——余量基准
+                            // 归零，下个会话按首个内容重定
+                            c.live_size.set((0, 0));
+                        }
+                    }
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    match (g.cand2.take(), cand2) {
+                        (None, mine) => g.cand2 = mine,
+                        (Some(newer), Some(mut mine)) => {
+                            mine.hide();
+                            g.cand2 = Some(newer);
+                        }
+                        (Some(newer), None) => g.cand2 = Some(newer),
+                        (None, None) => {}
+                    }
+                }
+                if !do_fade {
+                    let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                    let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+            }
             return LRESULT(0);
+        }
+        // 【动效 2026-09-11】WM_TIMER：渐隐渐显 tick + 注释展开延时。
+        // 渲染/状态变更走滚轮缩放同款 take/put-back（锁外渲染，不抢
+        // 按键路径的锁）。
+        0x113 => {
+            let id = wparam.0 as usize;
+            if id == FADE_TIMER_ID {
+                unsafe { fade_tick_shared(hwnd) };
+                return LRESULT(0);
+            }
+            if id == EXPAND_TIMER_ID {
+                unsafe { expand_tick_shared(hwnd) };
+                return LRESULT(0);
+            }
         }
         _ => {}
     }
@@ -308,7 +421,9 @@ mod once_bool {
         }
         pub fn enabled(&self) -> bool {
             static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *V.get_or_init(|| std::path::Path::new(r"C:\ProgramData\HuFu\diag\cand2-mouse").exists())
+            *V.get_or_init(|| {
+                std::path::Path::new(r"C:\ProgramData\HuFu\diag\cand2-mouse").exists()
+            })
         }
     }
 }
@@ -375,19 +490,18 @@ fn parse_hex(s: &str) -> Option<[u8; 4]> {
         return None;
     }
     let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
-    Some([
-        b(0)?,
-        b(2)?,
-        b(4)?,
-        if s.len() == 8 { b(6)? } else { 0xFF },
-    ])
+    Some([b(0)?, b(2)?, b(4)?, if s.len() == 8 { b(6)? } else { 0xFF }])
 }
 
 fn color_f(v: &Value, key: &str, default: &str) -> D2D1_COLOR_F {
     let hex = v
         .pointer(&format!("/skin/colors/{key}"))
         .and_then(|x| x.as_str())
-        .or_else(|| v.get("colors").and_then(|c| c.get(key)).and_then(|x| x.as_str()))
+        .or_else(|| {
+            v.get("colors")
+                .and_then(|c| c.get(key))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or(default);
     let c = parse_hex(hex).unwrap_or([32, 32, 34, 230]);
     D2D1_COLOR_F {
@@ -451,13 +565,23 @@ pub struct CandidateWindowV2 {
     /// 【每帧开销缓存】字体格式三件套按 (face,pt,label_pt) 复用——
     /// CreateTextFormat 含系统字体匹配（百 µs 级），打字每键一帧
     /// ×3 个格式是渲染路径大头；皮肤/字号不变时零创建。
-    pub(crate) tf_cache: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))>,
+    pub(crate) tf_cache: Option<(
+        (String, f32, f32),
+        (
+            Option<IDWriteTextFormat>,
+            Option<IDWriteTextFormat>,
+            Option<IDWriteTextFormat>,
+        ),
+    )>,
     /// 【每帧开销缓存】光学垂直补偿 dy 按 (face,pt) 复用——probe
     /// 每帧两次 CreateTextLayout+GetOverhangMetrics 可省。
     pub(crate) dy_cache: Option<((String, f32), f32)>,
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
-    pub(crate) shadow_cache: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))>,
+    pub(crate) shadow_cache: Option<(
+        (u32, u32, u32, u32, (i32, i32), u32, u32),
+        (ID2D1CommandList, ID2D1Effect),
+    )>,
     /// 【毛玻璃 2026-09-08】材质 kind="glass"：show 定位前 BitBlt 抓窗
     /// 底屏幕（此刻窗口未画到新位置=干净底），paint 时 D2D 高斯模糊
     /// +圆角裁剪画为窗底。缓存键=(屏幕x,y,w,h)——位置/尺寸不变（打
@@ -467,12 +591,44 @@ pub struct CandidateWindowV2 {
     /// 滑杆时每帧 CreateBitmap(~700KB 上传)+CreateEffect——QQ（Chromium
     /// GPU 合成）实测高频竞态崩（事件日志 QQNT.dll_unloaded c0000005）。
     /// 缓存键=(w_out,h_out,blur)——不变则复用 bitmap+effect，零重建。
-    pub(crate) glass_cache: Option<((u32, u32, u32), windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)>,
+    pub(crate) glass_cache: Option<(
+        (u32, u32, u32),
+        windows::Win32::Graphics::Direct2D::ID2D1Bitmap1,
+    )>,
     /// 【毛玻璃 v3】上次 accent 状态：argb 值；u32::MAX=OFF（幂等判断
     /// 含 tint——用户拖「染色浓度」滑杆时 kind 不变也须重设 accent）
     pub(crate) acrylic_last: std::cell::Cell<u64>,
     /// RGN 幂等键（尺寸+半径打包；MAX=未设）
     pub(crate) rgn_last: std::cell::Cell<u64>,
+    /// 【动效 2026-09-11·虎爪对标】渐隐渐显时长 ms（皮肤 layout.fade_ms，
+    /// 代码默认 120，0=关）。动画纯表现层：每 tick 仅改 DComp visual
+    /// Opacity + Commit（µs 级，不重绘）；内容首帧即全量渲染，绝不延迟
+    /// 候选刷新；连打静默期（250ms）内直接全显防频闪。
+    pub(crate) fade_ms: u32,
+    /// 渐变进行态：Some((渐显?, 起点))；None=静止
+    pub(crate) fade: Option<(bool, std::time::Instant)>,
+    /// 【动效 tick 重渲染标记】fade_tick 驱动的 show() 复渲染——不得
+    /// 触发「内容更新打断渐隐」的取消规则（那是用户键入路径专用）。
+    pub(crate) internal_rerender: bool,
+    /// 上次真正隐藏时刻（静默期判定：show 距 hide <250ms 全显不动画）
+    pub(crate) last_hide_at: Option<std::time::Instant>,
+    /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
+    pub(crate) last_show_at: Option<std::time::Instant>,
+    /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
+    last_swp_size: std::cell::Cell<(i32, i32)>,
+    /// 【rect 只增不减 2026-09-11】可见期间窗口 rect 的当前生效尺寸
+    ///（内容收窄时窗口不缩——DWM 对「收缩」的 DComp 表面重绑会丢弃
+    /// 后续半透明呈现，渐显会全程不上屏；增长/初始放置无此问题）。
+    /// 隐藏时归零（新会话按首个内容重新定基准）。余量区域由
+    /// WM_NCHITTEST 返回 HTTRANSPARENT 穿透鼠标。
+    live_size: std::cell::Cell<(i32, i32)>,
+    /// 当前内容实际尺寸（逻辑 px，用于命中测试区分内容区/透明余量）
+    pub(crate) content_size: std::cell::Cell<(i32, i32)>,
+    /// 【注释展开延时】本组段注释是否已展开：首显（hidden→visible）重置，
+    /// 连打期间每帧重置倒计时，停手 comment_delay_ms 后补一帧全注释
+    /// （展开后保持到组段结束）。抑制期空注释参与布局——列宽自然收起，
+    /// 渲染路径零改动；兼防连打期长注释的窗宽抖动。
+    pub(crate) comments_expanded: bool,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -526,15 +682,14 @@ unsafe fn push_shadow_mask(
         Ok(g) => g,
         Err(_) => return false,
     };
-    let grp: windows::Win32::Graphics::Direct2D::ID2D1Geometry = match f
-        .CreateGeometryGroup(D2D1_FILL_MODE_ALTERNATE, &[Some(big), Some(win)])
-    {
-        Ok(g) => match g.cast() {
-            Ok(g) => g,
+    let grp: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
+        match f.CreateGeometryGroup(D2D1_FILL_MODE_ALTERNATE, &[Some(big), Some(win)]) {
+            Ok(g) => match g.cast() {
+                Ok(g) => g,
+                Err(_) => return false,
+            },
             Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
+        };
     let mut lp = D2D1_LAYER_PARAMETERS1::default();
     lp.contentBounds = D2D_RECT_F {
         left: -1.0e6,
@@ -582,9 +737,8 @@ fn read_diag_stage() -> u32 {
 /// 自己黑块的死结消除）、零模糊算法。染色=GradientColor(0xAABBGGRR)。
 unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
-        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        HGDIOBJ, SRCCOPY,
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
     };
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return None;
@@ -613,17 +767,7 @@ unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>>
     }
     let memdc = CreateCompatibleDC(screen);
     let old = SelectObject(memdc, HGDIOBJ(dib.0));
-    let ok = BitBlt(
-        memdc,
-        0,
-        0,
-        w as i32,
-        h as i32,
-        screen,
-        x,
-        y,
-        SRCCOPY,
-    );
+    let ok = BitBlt(memdc, 0, 0, w as i32, h as i32, screen, x, y, SRCCOPY);
     let _ = SelectObject(memdc, old);
     let out = if ok.is_ok() {
         let mut px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
@@ -713,11 +857,8 @@ impl CandidateWindowV2 {
 
             let dxgi_dev: IDXGIDevice = device.cast().ok()?;
             let _factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
-            let factory2d: ID2D1Factory1 = D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_MULTI_THREADED,
-                None,
-            )
-            .ok()?;
+            let factory2d: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None).ok()?;
             let d2d_dev: ID2D1Device = factory2d.CreateDevice(&dxgi_dev).ok()?;
             let ctx: ID2D1DeviceContext = d2d_dev
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
@@ -725,8 +866,7 @@ impl CandidateWindowV2 {
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_dev).ok()?;
             let target = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
             let visual = dcomp.CreateVisual().ok()?;
-            let dwrite: IDWriteFactory =
-                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
 
             Some(CandidateWindowV2 {
                 hwnd,
@@ -753,21 +893,40 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
+                fade_ms: 0,
+                fade: None,
+                internal_rerender: false,
+                last_hide_at: None,
+                last_show_at: None,
+                last_swp_size: std::cell::Cell::new((0, 0)),
+                live_size: std::cell::Cell::new((0, 0)),
+                content_size: std::cell::Cell::new((0, 0)),
+                comments_expanded: true,
             })
         }
     }
 
     fn ensure_swapchain(&mut self, w: u32, h: u32) -> bool {
-        if self.size == (w as i32, h as i32) && self.swapchain.is_some() {
+        // 【grow-only 2026-09-11】缓冲只增不减：内容变窄不再重建链。
+        // 动机：重建（SetContent 重绑）后 DWM 会停止跟踪半透明帧的
+        // 合成（像素取证：resize 后整段渐显 ramp 不上屏，直到某帧
+        // 全不透明才「唤醒」）——收起→展开、连打变宽全中招。缓冲大
+        // 于窗口的部分由 DWM 按窗口裁剪（旧帧残留实验已证）。
+        // 代价：单窗 VRAM 上限 ~4MB（1024²×2buf×4B），可忽略。
+        if self.swapchain.is_some() && w <= self.size.0 as u32 && h <= self.size.1 as u32 {
             return true;
         }
         unsafe {
             if let Some(ctx) = &self.ctx {
                 ctx.SetTarget(None);
             }
+            // 尺寸向上取整到 64 的倍数：减少重建次数（连打宽度微变不再
+            // 触发）；下限 256×160 覆盖最小面板。
+            let alloc_w = (((w.max(256)) + 63) / 64) * 64;
+            let alloc_h = (((h.max(160)) + 63) / 64) * 64;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: w,
-                Height: h,
+                Width: alloc_w,
+                Height: alloc_h,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 Stereo: BOOL(0),
                 SampleDesc: DXGI_SAMPLE_DESC {
@@ -781,7 +940,7 @@ impl CandidateWindowV2 {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 Flags: 0,
             };
-            // 重建 swapchain（尺寸变更；候选窗小、代价可忽略）
+            // 重建 swapchain（仅增长时；候选窗小、代价可忽略）
             self.swapchain = None;
             let chain = match self.create_chain_from_ctx(&desc) {
                 Some(c) => c,
@@ -790,18 +949,32 @@ impl CandidateWindowV2 {
             if let (Some(visual), Some(target), Some(dc)) =
                 (&self.visual, &self.target, &self.dcomp)
             {
-                if visual.SetContent(&chain).is_err() || target.SetRoot(visual).is_err() || dc.Commit().is_err() {
+                if visual.SetContent(&chain).is_err()
+                    || target.SetRoot(visual).is_err()
+                    || dc.Commit().is_err()
+                {
                     crate::tsf::trace("cw2: dcomp attach FAIL");
                     return false;
                 }
+                // 【已知限制 2026-09-11】曾试 SetClip（windows 0.58 无
+                // float 重载→静态动画对象亦无效）。DWM 对部分窗口状态
+                // 会把 DComp 表面提升到 MPO overlay——半透帧被拍平
+                // （渐显退化为直接出现，内容仍正确）。动效因此默认关
+                // （fade_ms=0 皮肤可开）。
+                crate::tsf::trace(&format!(
+                    "cw2: swapchain 重建+重绑 {alloc_w}×{alloc_h}（内容 {w}×{h}）+Clip"
+                ));
             }
             self.swapchain = Some(chain);
-            self.size = (w as i32, h as i32);
+            self.size = (alloc_w as i32, alloc_h as i32);
             true
         }
     }
 
-    unsafe fn create_chain_from_ctx(&mut self, desc: &DXGI_SWAP_CHAIN_DESC1) -> Option<IDXGISwapChain1> {
+    unsafe fn create_chain_from_ctx(
+        &mut self,
+        desc: &DXGI_SWAP_CHAIN_DESC1,
+    ) -> Option<IDXGISwapChain1> {
         // 用 new() 时存下的 DXGI 设备（ID2D1Device QI 不出 IDXGIDevice）；
         // factory 必须与设备同源（device→adapter→GetParent），否则 INVALID_CALL
         let dxgi_dev: IDXGIDevice = self.dxgi.clone()?;
@@ -819,23 +992,33 @@ impl CandidateWindowV2 {
                 return None;
             }
         };
-        factory.CreateSwapChainForComposition(&dxgi_dev, desc, None)
+        factory
+            .CreateSwapChainForComposition(&dxgi_dev, desc, None)
             .map_err(|e| {
-                crate::tsf::trace(&format!("cw2: CreateSwapChain err 0x{:08X}", e.code().0 as u32));
+                crate::tsf::trace(&format!(
+                    "cw2: CreateSwapChain err 0x{:08X}",
+                    e.code().0 as u32
+                ));
                 e
             })
             .ok()
     }
     /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。selected=高亮行（页内 0 起）。
-    pub fn show(&mut self, cands: &[(String, String)], raw: &str, skin: &Value, anchor: Option<&RECT>, selected: usize) {
+    pub fn show(
+        &mut self,
+        cands: &[(String, String)],
+        raw: &str,
+        skin: &Value,
+        anchor: Option<&RECT>,
+        selected: usize,
+    ) {
         // 【5K/高 DPI 缩放 2026-09-06】窗口尺寸/渲染此前全部按 96-DPI 逻辑
         // 像素算——宿主 Per-Monitor V2 时这些被当物理像素用，200%/300%
         // 缩放屏上候选窗整体偏小。中心化修法：取窗口 DPI 得 scale，位图/
         // 窗口尺寸×scale，渲染层 SetTransform 缩放（DWrite 文本按目标
         // 分辨率光栅化，不糊），内容逻辑坐标全部不变。
-        let dpi_scale = unsafe {
-            windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0
-        };
+        let dpi_scale =
+            unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0 };
         // 【DPI 测试旋钮 2026-09-11】HUFU_FAKE_DPI=<dpi>：pad-dump/smoke
         // 取证用——100% 屏上伪造高 DPI 复现「高 DPI 阴影二次缩放」类
         // 问题（真机该值不存在，零影响）。值=目标 DPI（如 144=150%）。
@@ -845,6 +1028,64 @@ impl CandidateWindowV2 {
             .filter(|v| *v >= 96.0 && *v <= 480.0)
             .map(|v| v / 96.0)
             .unwrap_or(dpi_scale);
+        // 【动效 2026-09-11·虎爪对标】渐隐渐显 + 注释展开延时。
+        // 皮肤键（layout 节，缺省走代码默认）：fade_ms=0（默认关；开
+        // 启后若窗口被 DWM 提升到 MPO overlay，渐变退化为直接出现，
+        // 内容仍正确）、comment_delay_ms=400（0=注释常显）。
+        let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        let now = std::time::Instant::now();
+        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
+        let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
+        if !was_visible {
+            // 新组段首显：注释展开态重置（0=常显直接展开）
+            self.comments_expanded = cmt_delay == 0;
+            // 静默期防频闪：距上次隐藏 <250ms（连打逐字上屏的收放循环）
+            // 直接全显——刻意出现的窗才做渐显
+            let quiet = self
+                .last_hide_at
+                .map(|t| now.duration_since(t).as_millis() >= FADE_QUIET_MS)
+                .unwrap_or(true);
+            if self.fade_ms > 0 && quiet {
+                self.fade = Some((true, now));
+                unsafe {
+                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                }
+            } else {
+                self.fade = None;
+            }
+            self.last_show_at = Some(now);
+        } else {
+            // 内容更新帧：渐显进行中照常换内容不打断；渐隐被新内容打断
+            // → 立即回全显（窗口复活，不该继续淡出）。动效 tick 的内部
+            // 复渲染不算用户内容更新，不触发取消。
+            if let Some((false, _)) = self.fade {
+                if !self.internal_rerender {
+                    self.fade = None;
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
+                    }
+                }
+            }
+            self.last_show_at = Some(now);
+        }
+        if !self.comments_expanded && cmt_delay > 0 {
+            // 连打期间逐帧重置倒计时（同 id SetTimer=重置）→ 停手
+            // delay 后补一帧全注释；展开后保持到本组段结束
+            unsafe {
+                let _ = SetTimer(self.hwnd, EXPAND_TIMER_ID, cmt_delay.max(1), None);
+            }
+        }
+        // 注释抑制：未展开时空注释参与布局（列宽自然收起，渲染路径零改动）
+        let cands_suppressed: Vec<(String, String)>;
+        let cands: &[(String, String)] = if self.comments_expanded {
+            cands
+        } else {
+            cands_suppressed = cands
+                .iter()
+                .map(|(t, _)| (t.clone(), String::new()))
+                .collect();
+            &cands_suppressed
+        };
         // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
         let show_index = skin
             .get("show_index")
@@ -873,7 +1114,13 @@ impl CandidateWindowV2 {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
                     let bv = layout_f(skin, "blur_radius", 24.0);
-                    if bv <= 50.0 { "low".into() } else if bv <= 80.0 { "mid".into() } else { "high".into() }
+                    if bv <= 50.0 {
+                        "low".into()
+                    } else if bv <= 80.0 {
+                        "mid".into()
+                    } else {
+                        "high".into()
+                    }
                 });
             let state: u32 = if !want_acrylic {
                 ACCENT_DISABLED
@@ -890,7 +1137,8 @@ impl CandidateWindowV2 {
                 None => (28, 28, 30, 0),
             };
             // 幂等键含全 RGBA（拖色板/浓度即时重设）
-            let key: u64 = ((state as u64) << 32) | ((tr << 24) | (tg << 16) | (tb << 8) | ta) as u64;
+            let key: u64 =
+                ((state as u64) << 32) | ((tr << 24) | (tg << 16) | (tb << 8) | ta) as u64;
             if self.acrylic_last.get() != key {
                 apply_accent(self.hwnd, state, [tr as u8, tg as u8, tb as u8, ta as u8]);
                 self.acrylic_last.set(key);
@@ -919,7 +1167,10 @@ impl CandidateWindowV2 {
             // 再乘会双重放大）。
             (mat_f("glass_margin_x", 4.0), mat_f("glass_margin_y", 4.0))
         } else {
-            (layout_f(skin, "margin_x", 8.0), layout_f(skin, "margin_y", 6.0))
+            (
+                layout_f(skin, "margin_x", 8.0),
+                layout_f(skin, "margin_y", 6.0),
+            )
         };
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
@@ -950,7 +1201,8 @@ impl CandidateWindowV2 {
             let est = |s: &str| {
                 s.chars()
                     .map(|c| if c.is_ascii() { em * 0.55 } else { em })
-                    .sum::<f32>() + em // 「…」前缀余量
+                    .sum::<f32>()
+                    + em // 「…」前缀余量
             };
             if est(s) <= cap {
                 return s.to_string();
@@ -1011,20 +1263,21 @@ impl CandidateWindowV2 {
         let fmt_label = |n: usize| -> String {
             let d: String = match label_style.as_str() {
                 "zh" => {
-                    const ZH: [&str; 10] = [
-                        "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
-                    ];
+                    const ZH: [&str; 10] =
+                        ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
                     ZH[(if n == 10 { 10 } else { n }) - 1].to_string()
                 }
                 "roman" => {
-                    const RM: [&str; 10] = [
-                        "Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ",
-                    ];
+                    const RM: [&str; 10] = ["Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ"];
                     RM[(if n == 10 { 10 } else { n }) - 1].to_string()
                 }
                 _ => {
                     // 【10 选序号】第 10 候选显示 0（1234567890）
-                    if n == 10 { "0".to_string() } else { n.to_string() }
+                    if n == 10 {
+                        "0".to_string()
+                    } else {
+                        n.to_string()
+                    }
                 }
             };
             match label_fmt.find("%s") {
@@ -1058,10 +1311,23 @@ impl CandidateWindowV2 {
         let row_h = line_h.max(pill_h);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
-        let mut tf_cache_out: Option<((String, f32, f32), (Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, Option<IDWriteTextFormat>))> = None;
+        let mut tf_cache_out: Option<(
+            (String, f32, f32),
+            (
+                Option<IDWriteTextFormat>,
+                Option<IDWriteTextFormat>,
+                Option<IDWriteTextFormat>,
+            ),
+        )> = None;
         let mut dy_cache_out: Option<((String, f32), f32)> = None;
-        let mut shadow_cache_out: Option<((u32, u32, u32, u32, (i32, i32), u32, u32), (ID2D1CommandList, ID2D1Effect))> = None;
-        let mut glass_cache_out: Option<((u32, u32, u32), windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)> = None;
+        let mut shadow_cache_out: Option<(
+            (u32, u32, u32, u32, (i32, i32), u32, u32),
+            (ID2D1CommandList, ID2D1Effect),
+        )> = None;
+        let mut glass_cache_out: Option<(
+            (u32, u32, u32),
+            windows::Win32::Graphics::Direct2D::ID2D1Bitmap1,
+        )> = None;
         let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
@@ -1131,10 +1397,7 @@ impl CandidateWindowV2 {
                 if let Some(t) = &tf_label {
                     let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 }
-                tf_cache_out = Some((
-                    tf_key,
-                    (tf.clone(), tf_small.clone(), tf_label.clone()),
-                ));
+                tf_cache_out = Some((tf_key, (tf.clone(), tf_small.clone(), tf_label.clone())));
             }
 
             let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
@@ -1168,7 +1431,11 @@ impl CandidateWindowV2 {
             let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
             for (i, (t, c)) in cands.iter().enumerate() {
                 let tw = measure(&tf, t.as_str());
-                let cw = if c.is_empty() { 0.0 } else { measure(&tf_small, c.as_str()) };
+                let cw = if c.is_empty() {
+                    0.0
+                } else {
+                    measure(&tf_small, c.as_str())
+                };
                 // 本格序号宽（label_format 格式化实测 + hsp 紧贴间距）：横排正文紧跟序号
                 let iw = if show_index && i < 10 {
                     measure(&tf_label, &fmt_label(i + 1)).max(10.0) + hsp
@@ -1198,15 +1465,16 @@ impl CandidateWindowV2 {
             };
             // 光学补偿计算（缓存 miss 时用）：墨盒在行盒内偏上，
             // 位移 = 行中心 − 墨盒中心（底 slack − 顶 slack 的一半）
-            let probe_dy = |probe: &dyn Fn(&str, &Option<IDWriteTextFormat>) -> Option<(f32, f32)>,
-                            t: &Option<IDWriteTextFormat>|
-             -> f32 {
-                if let Some((top_slack, bot_slack)) = probe("永", t) {
-                    ((bot_slack - top_slack) * 0.5).clamp(-6.0, 6.0)
-                } else {
-                    0.0
-                }
-            };
+            let probe_dy =
+                |probe: &dyn Fn(&str, &Option<IDWriteTextFormat>) -> Option<(f32, f32)>,
+                 t: &Option<IDWriteTextFormat>|
+                 -> f32 {
+                    if let Some((top_slack, bot_slack)) = probe("永", t) {
+                        ((bot_slack - top_slack) * 0.5).clamp(-6.0, 6.0)
+                    } else {
+                        0.0
+                    }
+                };
             let dy;
             let dy_key = (font_face.clone(), font_pt);
             if let Some((k, v)) = &dy_cache_in {
@@ -1303,7 +1571,8 @@ impl CandidateWindowV2 {
                 // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
                 // 【口径统一】胶囊四边=gap：文字列从 gap+hp 起、width 含
                 // 两端 hp；胶囊 [gap, width-gap] 不再 ±hp 外扩。
-                let mut need = rm_x + hilite_pad + label_w + max_text.max(raw_w) + hilite_pad + rm_x + 6.0;
+                let mut need =
+                    rm_x + hilite_pad + label_w + max_text.max(raw_w) + hilite_pad + rm_x + 6.0;
                 if max_cmt > 0.0 {
                     need += 6.0 + max_cmt;
                 }
@@ -1347,13 +1616,23 @@ impl CandidateWindowV2 {
                 };
                 (width, text_x, cmt_x, cmt_w)
             };
-            (tf, tf_label, tf_small, cand_ws, (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)))
+            (
+                tf,
+                tf_label,
+                tf_small,
+                cand_ws,
+                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)),
+            )
         };
         let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w) = geo.1;
         let cmt_disp = geo.0;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
-        let code_row = if raw.is_empty() || horizontal { 0.0 } else { 1.0 };
+        let code_row = if raw.is_empty() || horizontal {
+            0.0
+        } else {
+            1.0
+        };
         // 横排：内容即宽（纯自适应）；竖排：固定宽/自适应原逻辑
         let width = v_width;
         let height = if horizontal {
@@ -1382,9 +1661,17 @@ impl CandidateWindowV2 {
         // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（SDF 居中
         // 投影，偏移破坏对称）——即使皮肤数据带偏移也钳为 0（与
         // hufu-skin save 归一、设置页禁用滑杆三重一致）。
-        let shadow_off_y = if kind == "glass" { 0.0 } else { layout_f(skin, "shadow_offset_y", 0.0) };
+        let shadow_off_y = if kind == "glass" {
+            0.0
+        } else {
+            layout_f(skin, "shadow_offset_y", 0.0)
+        };
         // 【2026-09-06 阴影水平偏移】用户规格：阴影加左右偏移（默认 0=居中）
-        let shadow_off_x = if kind == "glass" { 0.0 } else { layout_f(skin, "shadow_offset_x", 0.0) };
+        let shadow_off_x = if kind == "glass" {
+            0.0
+        } else {
+            layout_f(skin, "shadow_offset_x", 0.0)
+        };
         let has_shadow = shadow_radius >= 1.0;
         // 【毛玻璃 v3.5.3·玻璃加大】用户方向：与其改阴影不如把玻璃加大
         // ——glass 窗口=面板+6px 玻璃边（accent 盖整窗，视觉玻璃大于
@@ -1436,6 +1723,22 @@ impl CandidateWindowV2 {
             };
             ctx.SetTarget(&bitmap);
             ctx.BeginDraw();
+            // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
+            // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
+            // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
+            let fade_a = self.fade_alpha();
+            let fade_layer_on = fade_a < 0.999;
+            if fade_layer_on {
+                let mut lp = D2D1_LAYER_PARAMETERS1::default();
+                lp.contentBounds = D2D_RECT_F {
+                    left: -1.0e6,
+                    top: -1.0e6,
+                    right: 1.0e6,
+                    bottom: 1.0e6,
+                };
+                lp.opacity = fade_a;
+                ctx.PushLayer(&lp, None);
+            }
             // 【阶段验证】stage 分层渲染开关（见 read_diag_stage 注释）
             let stage = read_diag_stage();
             ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
@@ -1452,7 +1755,12 @@ impl CandidateWindowV2 {
             // 材质简化：solid=底色 / translucent|frosted(旧皮肤兼容)=tint 半透明 /
             // glass=毛玻璃（抓屏+D2D 高斯模糊+圆角裁剪，2026-09-08）；
             // material.opacity(0-1) 统一控透明度。
-            let _ = ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            let _ = ctx.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
             // 【毛玻璃层】glass_raw（show 定位前抓的干净底）→ D2D bitmap
             // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
             // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
@@ -1463,7 +1771,10 @@ impl CandidateWindowV2 {
             if GLASS_SELF_DRAW && kind == "glass" {
                 crate::tsf::diag_note(&format!(
                     "gstep1: enter dpi={dpi_scale} raw={}",
-                    match &self.glass_raw { Some(_) => "some", None => "none" }
+                    match &self.glass_raw {
+                        Some(_) => "some",
+                        None => "none",
+                    }
                 ));
                 if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
                     let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
@@ -1478,27 +1789,28 @@ impl CandidateWindowV2 {
                     // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
                     //   窗体区（模糊底拉伸无感知）——打字全程连续显示
                     if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
-                    let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
-                    let g_cached = self.glass_cache.take();
-                    let bmp = match &g_cached {
-                        Some((k, v)) if *k == g_key => v.clone(),
-                        _ => unsafe {
-                            // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
-                            // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
-                            // 实测梯度比 0.78（含文字行干扰）仍偏轻
-                            let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
-                            let sw = (*gw / k).max(1);
-                            let sh = (*gh / k).max(1);
-                            let mut small: Vec<u8> = Vec::with_capacity((sw * sh * 4) as usize);
-                            for y in 0..sh {
-                                let sy = ((y as usize) * (k as usize)).min(*gh as usize - 1);
-                                for x in 0..sw {
-                                    let sx = ((x as usize) * (k as usize)).min(*gw as usize - 1);
-                                    let o = (sy * (*gw as usize) + sx) * 4;
-                                    small.extend_from_slice(&raw_px[o..o + 4]);
+                        let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
+                        let g_cached = self.glass_cache.take();
+                        let bmp = match &g_cached {
+                            Some((k, v)) if *k == g_key => v.clone(),
+                            _ => unsafe {
+                                // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
+                                // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
+                                // 实测梯度比 0.78（含文字行干扰）仍偏轻
+                                let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
+                                let sw = (*gw / k).max(1);
+                                let sh = (*gh / k).max(1);
+                                let mut small: Vec<u8> = Vec::with_capacity((sw * sh * 4) as usize);
+                                for y in 0..sh {
+                                    let sy = ((y as usize) * (k as usize)).min(*gh as usize - 1);
+                                    for x in 0..sw {
+                                        let sx =
+                                            ((x as usize) * (k as usize)).min(*gw as usize - 1);
+                                        let o = (sy * (*gw as usize) + sx) * 4;
+                                        small.extend_from_slice(&raw_px[o..o + 4]);
+                                    }
                                 }
-                            }
-                            let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                                let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                                 pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
                                     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                                     alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -1508,54 +1820,70 @@ impl CandidateWindowV2 {
                                 bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_NONE.0),
                                 ..Default::default()
                             };
-                            let r = ctx.CreateBitmap(
-                                D2D_SIZE_U { width: sw, height: sh },
-                                Some(small.as_ptr() as *const core::ffi::c_void),
-                                sw * 4,
-                                &bmp_props,
-                            );
-                            match r {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    crate::tsf::diag_note(&format!(
-                                        "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
-                                    ));
-                                    return;
+                                let r = ctx.CreateBitmap(
+                                    D2D_SIZE_U {
+                                        width: sw,
+                                        height: sh,
+                                    },
+                                    Some(small.as_ptr() as *const core::ffi::c_void),
+                                    sw * 4,
+                                    &bmp_props,
+                                );
+                                match r {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        crate::tsf::diag_note(&format!(
+                                            "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
+                                        ));
+                                        return;
+                                    }
                                 }
+                            },
+                        };
+                        glass_cache_out = Some((g_key, bmp.clone()));
+                        if stage == 1 || stage == 2 {
+                            // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
+                            unsafe {
+                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                    M11: 1.0,
+                                    M12: 0.0,
+                                    M21: 0.0,
+                                    M22: 1.0,
+                                    M31: 0.0,
+                                    M32: 0.0,
+                                });
+                                let full = D2D_RECT_F {
+                                    left: 0.0,
+                                    top: 0.0,
+                                    right: w_out as f32,
+                                    bottom: h_out as f32,
+                                };
+                                // 真实抓屏位图全幅直画（最小毛玻璃管线）
+                                let _ = ctx.DrawBitmap(
+                                    &bmp,
+                                    Some(&full as *const _),
+                                    1.0,
+                                    D2D1_INTERPOLATION_MODE_LINEAR,
+                                    None,
+                                    None,
+                                );
+                                crate::tsf::diag_note(&format!(
+                                    "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
+                                ));
+                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                    M11: dpi_scale,
+                                    M12: 0.0,
+                                    M21: 0.0,
+                                    M22: dpi_scale,
+                                    M31: 0.0,
+                                    M32: 0.0,
+                                });
                             }
-                        },
-                    };
-                    glass_cache_out = Some((g_key, bmp.clone()));
-                    if stage == 1 || stage == 2 {
-                        // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
-                        unsafe {
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
-                            });
-                            let full = D2D_RECT_F {
-                                left: 0.0,
-                                top: 0.0,
-                                right: w_out as f32,
-                                bottom: h_out as f32,
-                            };
-                            // 真实抓屏位图全幅直画（最小毛玻璃管线）
-                            let _ = ctx.DrawBitmap(&bmp, Some(&full as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                            crate::tsf::diag_note(&format!(
-                                "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
-                            ));
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: dpi_scale, M12: 0.0, M21: 0.0, M22: dpi_scale, M31: 0.0, M32: 0.0,
-                            });
-                        }
-                    } else {
-                    unsafe {
-                        // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
-                        let mask = ctx
-                            .GetFactory()
-                            .ok()
-                            .and_then(|f| {
-                                f.CreateRoundedRectangleGeometry(
-                                    &D2D1_ROUNDED_RECT {
+                        } else {
+                            unsafe {
+                                // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
+                                let mask = ctx.GetFactory().ok().and_then(|f| {
+                                    f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
                                         rect: D2D_RECT_F {
                                             left: shadow_m * dpi_scale,
                                             top: shadow_m * dpi_scale,
@@ -1564,69 +1892,80 @@ impl CandidateWindowV2 {
                                         },
                                         radiusX: radius * dpi_scale,
                                         radiusY: radius * dpi_scale,
-                                    },
-                                )
-                                .ok()
-                            });
-                        if let Some(mask) = mask {
-                            if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
-                                    // 【根因修复 2026-09-08】PushLayer 的 mask
-                                    // 按当时 transform 解释——此前在 Push 后才切
-                                    // identity，mask（物理坐标）被 dpi 主变换二
-                                    // 次缩放跑出窗外→层内所有绘制全被裁掉
-                                    //（红色裁决实测：层没画、窗口半透明穿透）。
-                                    // 正序：先切 identity 再 Push。
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
-                                    lp.contentBounds = D2D_RECT_F {
-                                        left: -1.0e6,
-                                        top: -1.0e6,
-                                        right: 1.0e6,
-                                        bottom: 1.0e6,
-                                    };
-                                    lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
-                                    lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                                    // 【终极根因 2026-09-08】default() 的 maskTransform
-                                    // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
-                                    // 一点，Layer 内一切绘制全被裁掉（对照阴影段
-                                    // push_shadow_mask 显式设 identity 才正常显示）。
-                                    lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    };
-                                    ctx.PushLayer(&lp, None);
-                                    let dst = D2D_RECT_F {
-                                        left: shadow_m * dpi_scale,
-                                        top: shadow_m * dpi_scale,
-                                        right: (shadow_m + width) * dpi_scale,
-                                        bottom: (shadow_m + height) * dpi_scale,
-                                    };
-                                    let _ = ctx.DrawBitmap(&bmp, Some(&dst as *const _), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                                    // 恢复渲染主变换（dpi 缩放）
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: dpi_scale,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: dpi_scale,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    ctx.PopLayer();
+                                    })
+                                    .ok()
+                                });
+                                if let Some(mask) = mask {
+                                    if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                        // 【根因修复 2026-09-08】PushLayer 的 mask
+                                        // 按当时 transform 解释——此前在 Push 后才切
+                                        // identity，mask（物理坐标）被 dpi 主变换二
+                                        // 次缩放跑出窗外→层内所有绘制全被裁掉
+                                        //（红色裁决实测：层没画、窗口半透明穿透）。
+                                        // 正序：先切 identity 再 Push。
+                                        ctx.SetTransform(
+                                            &windows::Foundation::Numerics::Matrix3x2 {
+                                                M11: 1.0,
+                                                M12: 0.0,
+                                                M21: 0.0,
+                                                M22: 1.0,
+                                                M31: 0.0,
+                                                M32: 0.0,
+                                            },
+                                        );
+                                        let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
+                                        lp.contentBounds = D2D_RECT_F {
+                                            left: -1.0e6,
+                                            top: -1.0e6,
+                                            right: 1.0e6,
+                                            bottom: 1.0e6,
+                                        };
+                                        lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
+                                        lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                        // 【终极根因 2026-09-08】default() 的 maskTransform
+                                        // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
+                                        // 一点，Layer 内一切绘制全被裁掉（对照阴影段
+                                        // push_shadow_mask 显式设 identity 才正常显示）。
+                                        lp.maskTransform =
+                                            windows::Foundation::Numerics::Matrix3x2 {
+                                                M11: 1.0,
+                                                M12: 0.0,
+                                                M21: 0.0,
+                                                M22: 1.0,
+                                                M31: 0.0,
+                                                M32: 0.0,
+                                            };
+                                        ctx.PushLayer(&lp, None);
+                                        let dst = D2D_RECT_F {
+                                            left: shadow_m * dpi_scale,
+                                            top: shadow_m * dpi_scale,
+                                            right: (shadow_m + width) * dpi_scale,
+                                            bottom: (shadow_m + height) * dpi_scale,
+                                        };
+                                        let _ = ctx.DrawBitmap(
+                                            &bmp,
+                                            Some(&dst as *const _),
+                                            1.0,
+                                            D2D1_INTERPOLATION_MODE_LINEAR,
+                                            None,
+                                            None,
+                                        );
+                                        // 恢复渲染主变换（dpi 缩放）
+                                        ctx.SetTransform(
+                                            &windows::Foundation::Numerics::Matrix3x2 {
+                                                M11: dpi_scale,
+                                                M12: 0.0,
+                                                M21: 0.0,
+                                                M22: dpi_scale,
+                                                M31: 0.0,
+                                                M32: 0.0,
+                                            },
+                                        );
+                                        ctx.PopLayer();
+                                    }
+                                }
                             }
-                        }
-                    }
-                    } // else Layer 路径（stage 0/3+）
+                        } // else Layer 路径（stage 0/3+）
                     }
                 }
             }
@@ -1696,13 +2035,7 @@ impl CandidateWindowV2 {
                                         M32: 0.0,
                                     });
                                     let mask_ok = push_shadow_mask(
-                                        &ctx,
-                                        width,
-                                        height,
-                                        w_out,
-                                        h_out,
-                                        shadow_m,
-                                        radius,
+                                        &ctx, width, height, w_out, h_out, shadow_m, radius,
                                         dpi_scale,
                                     );
                                     // 【阴影分离修复·终版 2026-09-08】曾加
@@ -1745,7 +2078,12 @@ impl CandidateWindowV2 {
                             ctx.SetTarget(Some(&cl_img));
                             let wb = ctx
                                 .CreateSolidColorBrush(
-                                    &D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                                    &D2D1_COLOR_F {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 1.0,
+                                    },
                                     None,
                                 )
                                 .ok()?;
@@ -1764,12 +2102,14 @@ impl CandidateWindowV2 {
                             ctx.SetTarget(saved.as_ref());
                             let effect = ctx.CreateEffect(&CLSID_D2D1Shadow).ok()?;
                             let blur = shadow_radius * 0.5 + 1.0;
-                            let _ = effect.SetValue(
-                                0,
-                                D2D1_PROPERTY_TYPE_FLOAT,
-                                &blur.to_ne_bytes(),
-                            );
-                            let col = D2D_VECTOR_4F { x: sc.r, y: sc.g, z: sc.b, w: sc.a };
+                            let _ =
+                                effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &blur.to_ne_bytes());
+                            let col = D2D_VECTOR_4F {
+                                x: sc.r,
+                                y: sc.g,
+                                z: sc.b,
+                                w: sc.a,
+                            };
                             let _ = effect.SetValue(
                                 1,
                                 D2D1_PROPERTY_TYPE_VECTOR4,
@@ -1799,14 +2139,7 @@ impl CandidateWindowV2 {
                                 M32: 0.0,
                             });
                             let mask_ok = push_shadow_mask(
-                                &ctx,
-                                width,
-                                height,
-                                w_out,
-                                h_out,
-                                shadow_m,
-                                radius,
-                                dpi_scale,
+                                &ctx, width, height, w_out, h_out, shadow_m, radius, dpi_scale,
                             );
                             // 【阴影分离修复·终版】同缓存命中分支：无补偿
                             // 原语义（详见上方注释）。
@@ -1840,96 +2173,96 @@ impl CandidateWindowV2 {
                     })();
                     // 兜底：效果路径失败（老驱动）→ 下方环带多层近似
                     if fx.is_none() {
-                    // 【阴影诊断 2026-09-08】用户实测「辐射状阴影+与候选分离」
-                    // ——症状指向本兜底分支（环带多层）。记录失败原因到 trace。
-                    unsafe {
-                        let line = format!(
-                            "[shadow] D2D effect 失败→环带兜底 r={} w={} h={} m={:.1}\n",
-                            shadow_radius, w, h, shadow_m
-                        );
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(std::env::temp_dir().join("hufu-tsf-trace.log"))
-                        {
-                            use std::io::Write;
-                            let _ = f.write_all(line.as_bytes());
-                        }
-                    }
-                    if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
-                        // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
-                        // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满
-                        // 整窗（用户实测 bug）。改 even-odd 几何环带：每层
-                        // 只画「外圈 − 窗口」的环，窗口内部永远无阴影。
-                        let factory = ctx.GetFactory().ok();
-                        // 模糊感：层数多 + 高斯衰减（exp(-kt²)）——层间
-                        // 台阶不可见，观感≈CSS box-shadow 的高斯模糊。
-                        const PASSES: usize = 28;
-                        // 窗口自身圆角矩形（环带的内边界）
-                        let win_geom = factory.as_ref().and_then(|f| {
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: shadow_m,
-                                    top: shadow_m,
-                                    right: shadow_m + width,
-                                    bottom: shadow_m + height,
-                                },
-                                radiusX: radius,
-                                radiusY: radius,
-                            };
-                            f.CreateRoundedRectangleGeometry(&rr).ok()
-                        });
-                        for i in (1..=PASSES).rev() {
-                            let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈趋 0
-                            let grow = shadow_radius * t;
-                            // 高斯衰减：贴边最浓向外平滑消散（旧 (1-t)²
-                            // 台阶感强——「阴影太锐利」的根因）
-                            let a = sc.a * (-4.5 * t * t).exp();
-                            b.SetColor(&D2D1_COLOR_F {
-                                r: sc.r,
-                                g: sc.g,
-                                b: sc.b,
-                                a,
-                            });
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: shadow_m - grow + shadow_off_x * t,
-                                    top: shadow_m - grow + shadow_off_y * t,
-                                    right: shadow_m + width + grow
-                                        + shadow_off_x * t,
-                                    bottom: shadow_m + height + grow
-                                        + shadow_off_y * t,
-                                },
-                                radiusX: radius + grow,
-                                radiusY: radius + grow,
-                            };
-                            // 每层 = 外圈几何 − 窗口几何 的 even-odd 环带
-                            //（窗口内部永远无阴影；全透明窗只剩轮廓外投影）
-                            let ring = (|| -> Option<()> {
-                                let f = factory.as_ref()?;
-                                let wg = win_geom.as_ref()?;
-                                let outer: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> = f
-                                    .CreateRoundedRectangleGeometry(&rr)
-                                    .ok()
-                                    .and_then(|g| g.cast().ok());
-                                let outer = outer?;
-                                let inner: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
-                                    wg.clone().cast().ok()?;
-                                let grp = f
-                                    .CreateGeometryGroup(
-                                        D2D1_FILL_MODE_ALTERNATE,
-                                        &[Some(outer), Some(inner)],
-                                    )
-                                    .ok()?;
-                                ctx.FillGeometry(&grp, &b, None);
-                                Some(())
-                            })();
-                            if ring.is_none() {
-                                // 几何路径失败兜底：退回实心（旧行为）
-                                ctx.FillRoundedRectangle(&rr, &b);
+                        // 【阴影诊断 2026-09-08】用户实测「辐射状阴影+与候选分离」
+                        // ——症状指向本兜底分支（环带多层）。记录失败原因到 trace。
+                        unsafe {
+                            let line = format!(
+                                "[shadow] D2D effect 失败→环带兜底 r={} w={} h={} m={:.1}\n",
+                                shadow_radius, w, h, shadow_m
+                            );
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(std::env::temp_dir().join("hufu-tsf-trace.log"))
+                            {
+                                use std::io::Write;
+                                let _ = f.write_all(line.as_bytes());
                             }
                         }
-                    }
+                        if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
+                            // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
+                            // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满
+                            // 整窗（用户实测 bug）。改 even-odd 几何环带：每层
+                            // 只画「外圈 − 窗口」的环，窗口内部永远无阴影。
+                            let factory = ctx.GetFactory().ok();
+                            // 模糊感：层数多 + 高斯衰减（exp(-kt²)）——层间
+                            // 台阶不可见，观感≈CSS box-shadow 的高斯模糊。
+                            const PASSES: usize = 28;
+                            // 窗口自身圆角矩形（环带的内边界）
+                            let win_geom = factory.as_ref().and_then(|f| {
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: shadow_m,
+                                        top: shadow_m,
+                                        right: shadow_m + width,
+                                        bottom: shadow_m + height,
+                                    },
+                                    radiusX: radius,
+                                    radiusY: radius,
+                                };
+                                f.CreateRoundedRectangleGeometry(&rr).ok()
+                            });
+                            for i in (1..=PASSES).rev() {
+                                let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈趋 0
+                                let grow = shadow_radius * t;
+                                // 高斯衰减：贴边最浓向外平滑消散（旧 (1-t)²
+                                // 台阶感强——「阴影太锐利」的根因）
+                                let a = sc.a * (-4.5 * t * t).exp();
+                                b.SetColor(&D2D1_COLOR_F {
+                                    r: sc.r,
+                                    g: sc.g,
+                                    b: sc.b,
+                                    a,
+                                });
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: shadow_m - grow + shadow_off_x * t,
+                                        top: shadow_m - grow + shadow_off_y * t,
+                                        right: shadow_m + width + grow + shadow_off_x * t,
+                                        bottom: shadow_m + height + grow + shadow_off_y * t,
+                                    },
+                                    radiusX: radius + grow,
+                                    radiusY: radius + grow,
+                                };
+                                // 每层 = 外圈几何 − 窗口几何 的 even-odd 环带
+                                //（窗口内部永远无阴影；全透明窗只剩轮廓外投影）
+                                let ring = (|| -> Option<()> {
+                                    let f = factory.as_ref()?;
+                                    let wg = win_geom.as_ref()?;
+                                    let outer: Option<
+                                        windows::Win32::Graphics::Direct2D::ID2D1Geometry,
+                                    > = f
+                                        .CreateRoundedRectangleGeometry(&rr)
+                                        .ok()
+                                        .and_then(|g| g.cast().ok());
+                                    let outer = outer?;
+                                    let inner: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
+                                        wg.clone().cast().ok()?;
+                                    let grp = f
+                                        .CreateGeometryGroup(
+                                            D2D1_FILL_MODE_ALTERNATE,
+                                            &[Some(outer), Some(inner)],
+                                        )
+                                        .ok()?;
+                                    ctx.FillGeometry(&grp, &b, None);
+                                    Some(())
+                                })();
+                                if ring.is_none() {
+                                    // 几何路径失败兜底：退回实心（旧行为）
+                                    ctx.FillRoundedRectangle(&rr, &b);
+                                }
+                            }
+                        }
                     } // fx.is_none() 环带兜底结束
                 }
             }
@@ -1969,14 +2302,29 @@ impl CandidateWindowV2 {
                 //（accent 模糊）直接裸露，元素浮在玻璃上。视觉不行可回退
                 // 此段（恢复 v3.3 染色面板）。
                 let bg_c = if kind == "glass" {
-                    D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                    D2D1_COLOR_F {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }
                 } else {
-                    D2D1_COLOR_F { r: back.r, g: back.g, b: back.b, a: if stage == 1 { 0.0 } else { master } }
+                    D2D1_COLOR_F {
+                        r: back.r,
+                        g: back.g,
+                        b: back.b,
+                        a: if stage == 1 { 0.0 } else { master },
+                    }
                 };
                 if bg_c.a > 0.004 {
                     if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                         let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: height },
+                            rect: D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: width,
+                                bottom: height,
+                            },
                             radiusX: radius,
                             radiusY: radius,
                         };
@@ -1996,26 +2344,45 @@ impl CandidateWindowV2 {
                 c.a = 1.0;
                 c
             };
-            let mkbrush = |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
-                ctx.CreateSolidColorBrush(&c, None).ok()
-            };
-            let b_text = mkbrush(&ctx, text_alpha(color_f(skin, "candidate_text_color", "#E8E8EAFF")));
+            let mkbrush =
+                |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
+                    ctx.CreateSolidColorBrush(&c, None).ok()
+                };
+            let b_text = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "candidate_text_color", "#E8E8EAFF")),
+            );
             let b_label = mkbrush(&ctx, text_alpha(color_f(skin, "label_color", "#C9C9C9FF")));
-            let b_raw = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")));
+            let b_raw = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")),
+            );
             // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
             let b_preedit_bg = {
                 let c = elem_alpha(color_f(skin, "preedit_back_color", "#00000000"));
                 (c.a > 0.01).then(|| mkbrush(&ctx, c)).flatten()
             };
-            let b_cmt = mkbrush(&ctx, text_alpha(color_f(skin, "comment_text_color", "#9A9AA0FF")));
+            let b_cmt = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "comment_text_color", "#9A9AA0FF")),
+            );
             let b_hi = mkbrush(&ctx, {
                 let mut c = color_f(skin, "hilited_candidate_back_color", "#404046FF");
                 c.a = hilite_a;
                 c
             });
-            let b_hi_txt = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF")));
-            let b_hi_lbl = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_candidate_label_color", "#FFD75EFF")));
-            let b_hi_cmt = mkbrush(&ctx, text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")));
+            let b_hi_txt = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF")),
+            );
+            let b_hi_lbl = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "hilited_candidate_label_color", "#FFD75EFF")),
+            );
+            let b_hi_cmt = mkbrush(
+                &ctx,
+                text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")),
+            );
             let b_border = mkbrush(&ctx, {
                 // 【边框透明度】material.border_alpha 独立滑条（颜色自带 a 忽略）
                 let border_alpha = skin
@@ -2042,7 +2409,12 @@ impl CandidateWindowV2 {
                     if ws.is_empty() {
                         return;
                     }
-                    let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+                    let rect = D2D_RECT_F {
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
+                    };
                     let _ = ctx.DrawText(
                         &ws,
                         tf,
@@ -2057,198 +2429,254 @@ impl CandidateWindowV2 {
             // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
             let draw_content = !(stage >= 1 && stage <= 4);
             if draw_content {
-            // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
-            if !raw.is_empty() {
-                // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
-                // 【v3.9.1 裸玻璃】glass 时编码底块一并隐藏（用户「有些
-                // 元素没挡住」——实色底块浮在玻璃上突兀；编码文字保留）。
-                if kind != "glass" {
-                if let Some(bg) = &b_preedit_bg {
-                    let rr = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: rm_x,
-                            top: rm_y,
-                            right: width - rm_x,
-                            bottom: rm_y + line_h,
-                        },
-                        radiusX: 4.0,
-                        radiusY: 4.0,
-                    };
-                    unsafe {
-                        ctx.FillRoundedRectangle(&rr, bg);
-                    }
-                }
-                }
-                draw(&ctx, &tf, raw.as_str(), rm_x, rm_y + dy, width - rm_x * 2.0, row_h, &b_raw);
-            }
-            // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
-            // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
-            // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
-            // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
-            // 布置。
-            let y0 = rm_y + (row_h + cand_spacing) * code_row;
-
-            // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
-            // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
-            // 行槽 row_h 已在测量段撑高到能装下胶囊（max(line_h,
-            // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
-            // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
-            // 补丁链全部废除。
-            let pill_v = |y: f32| -> (f32, f32) {
-                let off = (row_h - pill_h) / 2.0;
-                (y + off, y + off + pill_h)
-            };
-
-            // 候选行
-            let sel = selected.min(cands.len().saturating_sub(1));
-            if horizontal {
-                // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
-                // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
-                let mut x = rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
-                let y = y0;
-                for (i, (text, _)) in cands.iter().enumerate().take(10) {
-                    let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                    let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
-                    let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
-                    if i > 0 {
-                        x += cand_spacing;
-                    }
-                    if i == sel {
-                        if let Some(b) = &b_hi {
-                            let (pt, pb) = pill_v(y);
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: x - hilite_pad,
-                                    top: pt,
-                                    right: x + cell_w + hilite_pad,
-                                    bottom: pb,
-                                },
-                                radiusX: layout_f(skin, "hilited_corner_radius", radius),
-                                radiusY: layout_f(skin, "hilited_corner_radius", radius),
-                            };
-                            ctx.FillRoundedRectangle(&rr, b);
-                            // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
-                            if mark_en {
-                                let mw = 2.0f32.min(hilite_pad);
-                                let my = y + row_h * 0.2;
-                                let mh = row_h * 0.6;
-                                let mrr = D2D1_ROUNDED_RECT {
-                                    rect: D2D_RECT_F {
-                                        left: x - hilite_pad + (hilite_pad - mw) / 2.0,
-                                        top: my,
-                                        right: x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
-                                        bottom: my + mh,
-                                    },
-                                    radiusX: 1.0,
-                                    radiusY: 1.0,
-                                };
-                                let mb = b_hi_lbl.as_ref().or_else(|| b_hi_txt.as_ref()).unwrap_or(b);
-                                ctx.FillRoundedRectangle(&mrr, mb);
-                            }
-                        }
-                    }
-                    let (bt, bl, bc) = if i == sel {
-                        (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
-                    } else {
-                        (&b_text, &b_label, &b_cmt)
-                    };
-                    let mut cx = x;
-                    if show_index {
-                        draw(&ctx, &tf_label, &fmt_label(i + 1), cx, y + dy, iw, row_h, bl);
-                        cx += iw;
-                    }
-                    draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
-                    cx += tw;
-                    if !cmt.is_empty() && cw > 0.0 {
-                        draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
-                    }
-                    x += cell_w;
-                }
-            } else {
-                // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
-                for (i, (text, _)) in cands.iter().enumerate().take(10) {
-                    let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                    let y = y0 + (row_h + cand_spacing) * i as f32;
-                    if i == sel {
-                        // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
-                        // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
-                        // 已在胶囊内 gap+hp 起）
-                        if let Some(b) = &b_hi {
-                            let (pt, pb) = pill_v(y);
+                // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
+                if !raw.is_empty() {
+                    // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
+                    // 【v3.9.1 裸玻璃】glass 时编码底块一并隐藏（用户「有些
+                    // 元素没挡住」——实色底块浮在玻璃上突兀；编码文字保留）。
+                    if kind != "glass" {
+                        if let Some(bg) = &b_preedit_bg {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
                                     left: rm_x,
-                                    top: pt,
+                                    top: rm_y,
                                     right: width - rm_x,
-                                    bottom: pb,
+                                    bottom: rm_y + line_h,
                                 },
-                                radiusX: layout_f(skin, "hilited_corner_radius", radius),
-                                radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                radiusX: 4.0,
+                                radiusY: 4.0,
                             };
-                            ctx.FillRoundedRectangle(&rr, b);
-                            // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
-                            if mark_en {
-                                let mw = 2.0f32.min(hilite_pad);
-                                let my = y + row_h * 0.2;
-                                let mh = row_h * 0.6;
-                                let mrr = D2D1_ROUNDED_RECT {
-                                    rect: D2D_RECT_F {
-                                        left: rm_x + (hilite_pad - mw) / 2.0,
-                                        top: my,
-                                        right: rm_x + (hilite_pad - mw) / 2.0 + mw,
-                                        bottom: my + mh,
-                                    },
-                                    radiusX: 1.0,
-                                    radiusY: 1.0,
-                                };
-                                let mb = b_hi_lbl.as_ref().or_else(|| b_hi_txt.as_ref()).unwrap_or(b);
-                                ctx.FillRoundedRectangle(&mrr, mb);
+                            unsafe {
+                                ctx.FillRoundedRectangle(&rr, bg);
                             }
                         }
                     }
-                    let (bt, bl, bc) = if i == sel {
-                        (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
-                    } else {
-                        (&b_text, &b_label, &b_cmt)
-                    };
-                    if show_index {
-                        draw(&ctx, &tf_label, &fmt_label(i + 1), rm_x + hilite_pad, y + dy, label_w, row_h, bl);
-                    }
-                    draw(&ctx, &tf, text, text_x, y + dy, cmt_x - text_x - 4.0, row_h, bt);
-                    if !cmt.is_empty() {
-                        draw(&ctx, &tf_small, cmt, cmt_x, y + dy, width - cmt_x - rm_x + 4.0, row_h, bc);
-                    }
+                    draw(
+                        &ctx,
+                        &tf,
+                        raw.as_str(),
+                        rm_x,
+                        rm_y + dy,
+                        width - rm_x * 2.0,
+                        row_h,
+                        &b_raw,
+                    );
                 }
-            }
+                // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
+                // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
+                // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
+                // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
+                // 布置。
+                let y0 = rm_y + (row_h + cand_spacing) * code_row;
 
-            // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
-            // 描边方案用户否决已撤】
-            if let Some(b) = &b_border {
-                if kind != "glass" {
-                    let bw = layout_f(skin, "border_width", 1.0);
-                let rr = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: bw / 2.0,
-                        top: bw / 2.0,
-                        right: width - bw / 2.0,
-                        bottom: height - bw / 2.0,
-                    },
-                    radiusX: radius,
-                    radiusY: radius,
+                // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
+                // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
+                // 行槽 row_h 已在测量段撑高到能装下胶囊（max(line_h,
+                // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
+                // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
+                // 补丁链全部废除。
+                let pill_v = |y: f32| -> (f32, f32) {
+                    let off = (row_h - pill_h) / 2.0;
+                    (y + off, y + off + pill_h)
                 };
-                let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+
+                // 候选行
+                let sel = selected.min(cands.len().saturating_sub(1));
+                if horizontal {
+                    // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
+                    // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
+                    let mut x = rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
+                    let y = y0;
+                    for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
+                        let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                        let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
+                        if i > 0 {
+                            x += cand_spacing;
+                        }
+                        if i == sel {
+                            if let Some(b) = &b_hi {
+                                let (pt, pb) = pill_v(y);
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: x - hilite_pad,
+                                        top: pt,
+                                        right: x + cell_w + hilite_pad,
+                                        bottom: pb,
+                                    },
+                                    radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                    radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                };
+                                ctx.FillRoundedRectangle(&rr, b);
+                                // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
+                                if mark_en {
+                                    let mw = 2.0f32.min(hilite_pad);
+                                    let my = y + row_h * 0.2;
+                                    let mh = row_h * 0.6;
+                                    let mrr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: x - hilite_pad + (hilite_pad - mw) / 2.0,
+                                            top: my,
+                                            right: x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
+                                            bottom: my + mh,
+                                        },
+                                        radiusX: 1.0,
+                                        radiusY: 1.0,
+                                    };
+                                    let mb = b_hi_lbl
+                                        .as_ref()
+                                        .or_else(|| b_hi_txt.as_ref())
+                                        .unwrap_or(b);
+                                    ctx.FillRoundedRectangle(&mrr, mb);
+                                }
+                            }
+                        }
+                        let (bt, bl, bc) = if i == sel {
+                            (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                        } else {
+                            (&b_text, &b_label, &b_cmt)
+                        };
+                        let mut cx = x;
+                        if show_index {
+                            draw(
+                                &ctx,
+                                &tf_label,
+                                &fmt_label(i + 1),
+                                cx,
+                                y + dy,
+                                iw,
+                                row_h,
+                                bl,
+                            );
+                            cx += iw;
+                        }
+                        draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
+                        cx += tw;
+                        if !cmt.is_empty() && cw > 0.0 {
+                            draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
+                        }
+                        x += cell_w;
+                    }
+                } else {
+                    // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
+                    for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
+                        let y = y0 + (row_h + cand_spacing) * i as f32;
+                        if i == sel {
+                            // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
+                            // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
+                            // 已在胶囊内 gap+hp 起）
+                            if let Some(b) = &b_hi {
+                                let (pt, pb) = pill_v(y);
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: rm_x,
+                                        top: pt,
+                                        right: width - rm_x,
+                                        bottom: pb,
+                                    },
+                                    radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                    radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                };
+                                ctx.FillRoundedRectangle(&rr, b);
+                                // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
+                                if mark_en {
+                                    let mw = 2.0f32.min(hilite_pad);
+                                    let my = y + row_h * 0.2;
+                                    let mh = row_h * 0.6;
+                                    let mrr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: rm_x + (hilite_pad - mw) / 2.0,
+                                            top: my,
+                                            right: rm_x + (hilite_pad - mw) / 2.0 + mw,
+                                            bottom: my + mh,
+                                        },
+                                        radiusX: 1.0,
+                                        radiusY: 1.0,
+                                    };
+                                    let mb = b_hi_lbl
+                                        .as_ref()
+                                        .or_else(|| b_hi_txt.as_ref())
+                                        .unwrap_or(b);
+                                    ctx.FillRoundedRectangle(&mrr, mb);
+                                }
+                            }
+                        }
+                        let (bt, bl, bc) = if i == sel {
+                            (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                        } else {
+                            (&b_text, &b_label, &b_cmt)
+                        };
+                        if show_index {
+                            draw(
+                                &ctx,
+                                &tf_label,
+                                &fmt_label(i + 1),
+                                rm_x + hilite_pad,
+                                y + dy,
+                                label_w,
+                                row_h,
+                                bl,
+                            );
+                        }
+                        draw(
+                            &ctx,
+                            &tf,
+                            text,
+                            text_x,
+                            y + dy,
+                            cmt_x - text_x - 4.0,
+                            row_h,
+                            bt,
+                        );
+                        if !cmt.is_empty() {
+                            draw(
+                                &ctx,
+                                &tf_small,
+                                cmt,
+                                cmt_x,
+                                y + dy,
+                                width - cmt_x - rm_x + 4.0,
+                                row_h,
+                                bc,
+                            );
+                        }
+                    }
                 }
-            }
+
+                // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
+                // 描边方案用户否决已撤】
+                if let Some(b) = &b_border {
+                    if kind != "glass" {
+                        let bw = layout_f(skin, "border_width", 1.0);
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: bw / 2.0,
+                                top: bw / 2.0,
+                                right: width - bw / 2.0,
+                                bottom: height - bw / 2.0,
+                            },
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+                    }
+                }
             } // draw_content
 
+            // 【动效 2026-09-11】过渡帧收层（与 BeginDraw 后的 PushLayer
+            // 配对；稳态未 Push 不 Pop）
+            if fade_layer_on {
+                ctx.PopLayer();
+            }
             let _ = ctx.EndDraw(None, None);
             ctx.SetTarget(None);
 
             // 测试回读：EndDraw 后目标位图已非活动，拷到 CPU 位图取整帧 BGRA
             if self.readback {
                 use windows::Win32::Graphics::Direct2D::{
-                    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CPU_READ,
-                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1_BITMAP_OPTIONS_CPU_READ,
                 };
                 // 回读整窗（含阴影边距），与 SetWindowPos 尺寸一致
                 let (w_px, h_px) = (w_out, h_out);
@@ -2265,7 +2693,10 @@ impl CandidateWindowV2 {
                     };
                     let _ = D2D1_BITMAP_OPTIONS::default();
                     if let Ok(cpu) = ctx.CreateBitmap(
-                        windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: w_px, height: h_px },
+                        windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                            width: w_px,
+                            height: h_px,
+                        },
                         None,
                         0,
                         &props,
@@ -2307,7 +2738,18 @@ impl CandidateWindowV2 {
                 }
             }
 
-            let _ = chain.Present(1, DXGI_PRESENT(0));
+            // 【动效帧即时呈现】半透明帧用 SyncInterval=0（跳 vsync 排
+            // 队）：MPO 提升锁定后 Present(1) 的半透帧被拍平（像素取证
+            // 反复证实）；Present(0) 走同步 blit 路径保持 alpha。稳态帧
+            // （layer 关）维持 Present(1) 防撕裂。
+            let hr = if fade_layer_on {
+                chain.Present(0, DXGI_PRESENT(0))
+            } else {
+                chain.Present(1, DXGI_PRESENT(0))
+            };
+            if hr.is_err() {
+                crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
+            }
         }
 
         // DWM accent 已弃用：NOREDIRECTIONBITMAP+DComp 窗口上不生效，
@@ -2346,7 +2788,9 @@ impl CandidateWindowV2 {
                     if let Ok(s) = std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\pin.txt") {
                         let t = s.trim();
                         if let Some((a, b)) = t.split_once(',') {
-                            if let (Ok(px), Ok(py)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                            if let (Ok(px), Ok(py)) =
+                                (a.trim().parse::<i32>(), b.trim().parse::<i32>())
+                            {
                                 *pinned = Some((px, py));
                                 crate::tsf::diag_note(&format!("cw2 pin.txt 钩子 ({px},{py})"));
                             }
@@ -2354,7 +2798,11 @@ impl CandidateWindowV2 {
                     }
                 }
             }
-            if let Some(p) = CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(p) = CAND_DROP_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 self.sticky_pos = Some((p.0 + m_off, p.1 + m_off));
                 self.sticky_drag = true;
             }
@@ -2370,7 +2818,9 @@ impl CandidateWindowV2 {
                     self.sticky_drag = false;
                 }
             }
-            let (x, y) = if let Some((px, py)) = *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()) {
+            let (x, y) = if let Some((px, py)) =
+                *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner())
+            {
                 // 【固定模式】右键固定：忽略光标锚点，钉在用户固定处
                 //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
                 // 拖动松手会回写 pin（见 WM_LBUTTONUP）——打字必然用
@@ -2387,60 +2837,69 @@ impl CandidateWindowV2 {
                 let y = oy.clamp(vy, (vy + vh - height as i32).max(vy));
                 (x, y)
             } else {
-            match anchor {
-                Some(r) => {
-                    let x = (r.left).clamp(vx, (vx + vw - width as i32).max(vx));
-                    let below = r.bottom + 4;
-                    let y = if below + height as i32 <= vy + vh {
-                        below
-                    } else {
-                        (r.top - height as i32 - 4).max(vy)
-                    };
-                    match self.sticky_pos {
-                        Some((ox, oy)) => {
-                            // 软换行判定：x 想回退（<旧行尾）且 y 发生换行级
-                            // 变化（>26px 行高阈值）同时成立 = 新行开始——
-                            // x 回到新行行首是合法回退，禁令解除。否则单调锁
-                            // 会把换行后的 X 钉死在旧行尾（实测虎魄：换行
-                            // x 2361→1625 被拒，候选框只上下动、不横向跟到
-                            // 新行打字点）。仅 y 超阈值不构成豁免——跟打器
-                            // 滚动步进可达 29px，x 正常增长帧不得误放行。
-                            let line_broke = x < ox - 2 && (y - oy).abs() > 26;
-                            // x：正向打字拒绝回退（旧布局值）；软换行除外
-                            let x = if grew && !line_broke && x < ox - 2 { ox } else { x };
-                            // y：正向打字只认换行级变化（行高 ~29px，阈值 26）
-                            let y = if grew && (y - oy).abs() <= 26 { oy } else { y };
-                            // 2px 迟滞：亚像素取整误差/回流微动不搬窗
-                            if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 {
-                                (ox, oy)
-                            } else {
-                                (x, y)
+                match anchor {
+                    Some(r) => {
+                        let x = (r.left).clamp(vx, (vx + vw - width as i32).max(vx));
+                        let below = r.bottom + 4;
+                        let y = if below + height as i32 <= vy + vh {
+                            below
+                        } else {
+                            (r.top - height as i32 - 4).max(vy)
+                        };
+                        match self.sticky_pos {
+                            Some((ox, oy)) => {
+                                // 软换行判定：x 想回退（<旧行尾）且 y 发生换行级
+                                // 变化（>26px 行高阈值）同时成立 = 新行开始——
+                                // x 回到新行行首是合法回退，禁令解除。否则单调锁
+                                // 会把换行后的 X 钉死在旧行尾（实测虎魄：换行
+                                // x 2361→1625 被拒，候选框只上下动、不横向跟到
+                                // 新行打字点）。仅 y 超阈值不构成豁免——跟打器
+                                // 滚动步进可达 29px，x 正常增长帧不得误放行。
+                                let line_broke = x < ox - 2 && (y - oy).abs() > 26;
+                                // x：正向打字拒绝回退（旧布局值）；软换行除外
+                                let x = if grew && !line_broke && x < ox - 2 {
+                                    ox
+                                } else {
+                                    x
+                                };
+                                // y：正向打字只认换行级变化（行高 ~29px，阈值 26）
+                                let y = if grew && (y - oy).abs() <= 26 { oy } else { y };
+                                // 2px 迟滞：亚像素取整误差/回流微动不搬窗
+                                if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 {
+                                    (ox, oy)
+                                } else {
+                                    (x, y)
+                                }
                             }
+                            None => (x, y),
                         }
-                        None => (x, y),
                     }
+                    None => match self.sticky_pos {
+                        Some(p) => p,
+                        // 从未有过真实锚点且本帧也取不到：先记诊断；若无
+                        // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
+                        //（SearchHost 等宿主 GetTextExt 常失败——搜索框候选
+                        // 框不显示的病根）。下一帧锚点就绪即回到正常定位。
+                        None => {
+                            crate::tsf::diag_note("cw2 anchor+sticky 双缺，退到焦点窗口定位");
+                            let fg = GetForegroundWindow();
+                            if fg.0.is_null() {
+                                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                                return;
+                            }
+                            let mut fr = RECT {
+                                left: 0,
+                                top: 0,
+                                right: 0,
+                                bottom: 0,
+                            };
+                            let _ = GetWindowRect(fg, &mut fr);
+                            let x = fr.left + 16;
+                            let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
+                            (x, below.max(fr.top))
+                        }
+                    },
                 }
-                None => match self.sticky_pos {
-                    Some(p) => p,
-                    // 从未有过真实锚点且本帧也取不到：先记诊断；若无
-                    // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
-                    //（SearchHost 等宿主 GetTextExt 常失败——搜索框候选
-                    // 框不显示的病根）。下一帧锚点就绪即回到正常定位。
-                    None => {
-                        crate::tsf::diag_note("cw2 anchor+sticky 双缺，退到焦点窗口定位");
-                        let fg = GetForegroundWindow();
-                        if fg.0.is_null() {
-                            let _ = ShowWindow(self.hwnd, SW_HIDE);
-                            return;
-                        }
-                        let mut fr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                        let _ = GetWindowRect(fg, &mut fr);
-                        let x = fr.left + 16;
-                        let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
-                        (x, below.max(fr.top))
-                    }
-                },
-            }
             };
             // 【右缘兜底】正向打字的 x 单调锁（宽度增长时拒回退）会把
             // 已 clamp 的新 x 顶回旧位置——窗口变宽后旧 x+新宽超右缘
@@ -2465,7 +2924,8 @@ impl CandidateWindowV2 {
                 // 【i386 ABI】必须 extern "system"（stdcall）：x64 上 Rust
                 // 默认约定与 Win64 恰好兼容掩盖了此错，32 位下 cdecl 调用
                 // stdcall 函数 → 栈清理错位 → 崩（Pain 打器按键闪退根因）。
-                type Dwma = unsafe extern "system" fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
+                type Dwma =
+                    unsafe extern "system" fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
                 let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
                 let m = GetModuleHandleW(mn.as_ptr());
                 if m != 0 {
@@ -2530,7 +2990,10 @@ impl CandidateWindowV2 {
             // show() 的定位（渲染/Present 照常，位置交给拖拽消息控制；
             // 拖动 NOSIZE 尺寸不变，全跳过安全）；松手后 CAND_DROP_AT
             // 生效回正。
-            let dragging = CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            let dragging = CAND_DRAG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
             // 【毛玻璃 v3】自绘路径停用——不抓屏（v3 由 DWM acrylic 承担）
             let glass_on = false;
             if glass_on && !dragging {
@@ -2561,7 +3024,9 @@ impl CandidateWindowV2 {
                     let cap = capture_screen_rgba(gx, gy, w_out, h_out);
                     crate::tsf::diag_note(&format!(
                         "diag: cap({gx},{gy}) 首像素={:?}",
-                        cap.as_ref().map(|v| &v[0..4]).unwrap_or(&[9u8, 9, 9, 9][..])
+                        cap.as_ref()
+                            .map(|v| &v[0..4])
+                            .unwrap_or(&[9u8, 9, 9, 9][..])
                     ));
                     self.glass_raw = cap.map(|v| (gx, gy, w_out, h_out, std::sync::Arc::new(v)));
                 }
@@ -2586,9 +3051,11 @@ impl CandidateWindowV2 {
             // 开关：皮肤 shadow_radius=0 只关纯色自绘阴影，玻璃阴影由
             // glass_shadow_alpha 自己决定）
             let gs_alpha = if kind == "glass" {
-                skin
-                    .pointer("/skin/material/glass_shadow_alpha")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("glass_shadow_alpha")))
+                skin.pointer("/skin/material/glass_shadow_alpha")
+                    .or_else(|| {
+                        skin.get("material")
+                            .and_then(|m| m.get("glass_shadow_alpha"))
+                    })
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.38) as f32
             } else {
@@ -2597,7 +3064,10 @@ impl CandidateWindowV2 {
             if GLASS_SHADOW && gs_alpha > 0.005 && !dragging {
                 let gs_base = skin
                     .pointer("/skin/material/glass_shadow_size")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("glass_shadow_size")))
+                    .or_else(|| {
+                        skin.get("material")
+                            .and_then(|m| m.get("glass_shadow_size"))
+                    })
                     .and_then(|v| v.as_f64())
                     .unwrap_or(6.0) as f32;
                 // 【玻璃阴影字号弱联动 2026-09-10】与非玻璃自绘阴影同款
@@ -2625,13 +3095,23 @@ impl CandidateWindowV2 {
                 );
             }
             let sp_ok = if !dragging {
+                // 【rect 只增不减】可见期间不收缩窗口（DWM 收缩重绑丢弃
+                // 半透明呈现）；内容收窄时窗口保持原尺寸、内容画在左上、
+                let live = self.live_size.get();
+                // 【rect 只增不减】可见期间窗口 rect 不收缩（减少 swapchain
+                // 重建与 DWM 表面重绑抖动）；内容收窄时余量透明 +
+                // WM_NCHITTEST HTTRANSPARENT 穿透。隐藏时 live 归零。
+                let apply_w = (w_out as i32).max(live.0);
+                let apply_h = (h_out as i32).max(live.1);
+                self.live_size.set((apply_w, apply_h));
+                self.content_size.set((w_out as i32, h_out as i32));
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
-                    w_out as i32,
-                    h_out as i32,
+                    apply_w,
+                    apply_h,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
             } else {
@@ -2691,9 +3171,9 @@ impl CandidateWindowV2 {
             // 用系统合成级圆角裁掉（v3.2 实测有效：accent+窗口一起圆角化）。
             // 玻璃圆角=系统固定（~8px），面板主圆角仍由自绘 radius 决定。
             unsafe {
-                let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(
-                    windows::core::w!("dwmapi.dll"),
-                );
+                let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!(
+                    "dwmapi.dll"
+                ));
                 if let Ok(m) = m {
                     let p = windows::Win32::System::LibraryLoader::GetProcAddress(
                         m,
@@ -2705,7 +3185,8 @@ impl CandidateWindowV2 {
                             u32,
                             *const core::ffi::c_void,
                             u32,
-                        ) -> windows::core::HRESULT;
+                        )
+                            -> windows::core::HRESULT;
                         let f: DwmaSet = std::mem::transmute(p);
                         let pref: u32 = if kind == "glass" { 2 } else { 1 }; // ROUND / DONOTROUND
                         let _ = f(
@@ -2725,16 +3206,16 @@ impl CandidateWindowV2 {
                                 &nc as *const u32 as *const core::ffi::c_void,
                                 4,
                             );
-                        // 【无边框+圆角定稿】BORDER=NONE（无任何边框线），
-                        // 圆角=DWM ROUND（系统 8px）。四角的轻微 AA 亮线
-                        // 是系统圆角自带行为，保留不再处理。
-                        let none_border: u32 = 0xFFFFFFFE;
-                        let _ = f(
-                            self.hwnd,
-                            34, // DWMWA_BORDER_COLOR
-                            &none_border as *const u32 as *const core::ffi::c_void,
-                            4,
-                        );
+                            // 【无边框+圆角定稿】BORDER=NONE（无任何边框线），
+                            // 圆角=DWM ROUND（系统 8px）。四角的轻微 AA 亮线
+                            // 是系统圆角自带行为，保留不再处理。
+                            let none_border: u32 = 0xFFFFFFFE;
+                            let _ = f(
+                                self.hwnd,
+                                34, // DWMWA_BORDER_COLOR
+                                &none_border as *const u32 as *const core::ffi::c_void,
+                                4,
+                            );
                         }
                     }
                 }
@@ -2742,6 +3223,53 @@ impl CandidateWindowV2 {
             // 【锁标已移除 2026-09-10】固定态不再有视觉指示（拖动即
             // 固定、右键即解锁——位置本身即状态，无需锁标小窗）。
         }
+    }
+
+    /// 【动效 2026-09-11】渐隐渐显当前帧透明度（渲染级）：由 fade 状态
+    /// 推导，二次缓动（起手快收尾缓）。稳态（fade=None）恒 1.0。
+    /// 【方案变更】DComp Visual3::SetOpacity2 对 NOREDIRECTIONBITMAP+
+    /// swapchain 窗实测无效（overlay 直通绕过合成属性——GPI 像素取证
+    /// 0.15/1.0 均亮 147），改 D2D PushLayer(opacity) 包整帧：仅过渡帧
+    /// 生效、稳态零开销，且玻璃/阴影随内容一起淡入（比 visual 级更完整）。
+    pub(crate) fn fade_alpha(&self) -> f32 {
+        match self.fade {
+            None => 1.0,
+            Some((fading_in, t0)) => {
+                let ms = self.fade_ms.max(1) as f64;
+                let p = (t0.elapsed().as_secs_f64() * 1000.0 / ms).clamp(0.0, 1.0);
+                if fading_in {
+                    (1.0 - (1.0 - p) * (1.0 - p)) as f32
+                } else {
+                    ((1.0 - p) * (1.0 - p)) as f32
+                }
+            }
+        }
+    }
+
+    /// 【动效 2026-09-11】渐隐渐显 tick（FADE_TIMER_ID 驱动）：只管状态
+    /// 推进（完成/真隐藏），alpha 由 fade_alpha() 推导、fade_tick_shared
+    /// 用 last_show 参数复渲染呈现。返回 true=动画结束（调用方 KillTimer）。
+    /// 渐隐完成时真隐藏——本 tick 在 wndproc 消息线程（非 TSF 焦点
+    /// 回调），同步 SW_HIDE 安全。
+    pub(crate) fn fade_tick(&mut self) -> bool {
+        let Some((fading_in, t0)) = self.fade else {
+            return true;
+        };
+        let ms = self.fade_ms.max(1) as f64;
+        let done = t0.elapsed().as_secs_f64() * 1000.0 >= ms;
+        if done {
+            self.fade = None;
+            if !fading_in {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, EXPAND_TIMER_ID);
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                self.last_hide_at = Some(std::time::Instant::now());
+                // 【rect 只增不减】窗退役：余量基准归零，下会话重定
+                self.live_size.set((0, 0));
+            }
+        }
+        done
     }
 
     /// 鼠标当前是否悬停在本候选窗上（OnSetFocus 守卫用：交互中的
@@ -2776,18 +3304,94 @@ impl CandidateWindowV2 {
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
         // 排队，焦点回调返回后由消息循环执行隐藏。
         unsafe {
-            let _ = PostMessageW(
-                self.hwnd,
-                WM_APP_HIDE_CAND,
-                WPARAM(0),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
     }
 }
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
+
+/// 【动效 2026-09-11】渐隐渐显 tick 定时器 id（15ms≈67fps）与
+/// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
+pub const FADE_TIMER_ID: usize = 0x4846_5550; // 'HuFZ'
+pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
+pub const FADE_TICK_MS: u32 = 15;
+/// 静默期：show↔hide 间隔小于此值直接跳过动画（连打逐字上屏的
+/// 收放循环不频闪）
+const FADE_QUIET_MS: u128 = 250;
+
+/// 【动效】渐隐渐显 tick：take cand2+last_show → 推进状态 → 按当前
+/// fade alpha 复渲染（滚轮同款锁外渲染）→ 放回。动画结束 KillTimer。
+unsafe fn fade_tick_shared(hwnd: HWND) {
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return;
+    };
+    let shared = gsh.0.clone();
+    let (mut cand2, last, skin, caret) = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+    };
+    let mut done = false;
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+        done = c.fade_tick();
+        // 仍在显示（渐显过渡/完成帧；渐隐完成时已 SW_HIDE 跳过复渲染
+        // ——show() 的 SWP_SHOWWINDOW 会把刚藏的窗复活）
+        if c.is_visible() {
+            c.internal_rerender = true;
+            c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            c.internal_rerender = false;
+        }
+    }
+    if done {
+        let _ = KillTimer(hwnd, FADE_TIMER_ID);
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    match (g.cand2.take(), cand2) {
+        (None, Some(mine)) => g.cand2 = Some(mine),
+        (Some(newer), Some(mut mine)) => {
+            mine.hide();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+        (None, None) => {}
+    }
+}
+
+/// 【注释展开延时】到点补一帧全注释：窗口已不可见（组段已收）则弃；
+/// 已展开则幂等清理；否则置展开位并按 last_show 缓存参数重渲染
+/// （take/put-back，锁外渲染）。
+unsafe fn expand_tick_shared(hwnd: HWND) {
+    if !IsWindowVisible(hwnd).as_bool() {
+        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+        return;
+    }
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return;
+    };
+    let shared = gsh.0.clone();
+    let (mut cand2, last, skin, caret) = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+    };
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+        if !c.comments_expanded {
+            c.comments_expanded = true;
+            let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+            c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+        }
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    match (g.cand2.take(), cand2) {
+        (None, Some(mine)) => g.cand2 = Some(mine),
+        (Some(newer), Some(mut mine)) => {
+            mine.hide();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+        (None, None) => {}
+    }
+}
 
 /// 拖拽状态：(鼠标屏幕位 − 窗口原点) 偏移；None=非拖拽中。
 static CAND_DRAG: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
@@ -2904,7 +3508,15 @@ unsafe fn shadowwin_render(
     let mut o = 0usize;
     for y in 0..h {
         for x in 0..w {
-            let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, scx, scy, phw, phh, radius as f32);
+            let d = sd_round_rect(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                scx,
+                scy,
+                phw,
+                phh,
+                radius as f32,
+            );
             // 面板内部无影；外侧双高斯（近浓+远晕）
             let a = if d <= 0.0 {
                 0.0
@@ -2929,7 +3541,10 @@ unsafe fn shadowwin_render(
         AlphaFormat: 1, // AC_SRC_ALPHA（预乘）
     };
     let pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-    let sz = windows::Win32::Foundation::SIZE { cx: w as i32, cy: h as i32 };
+    let sz = windows::Win32::Foundation::SIZE {
+        cx: w as i32,
+        cy: h as i32,
+    };
     let _ = UpdateLayeredWindow(
         hwnd,
         None,
@@ -3017,15 +3632,21 @@ pub fn shadowwin_show(
             };
             let _atom = RegisterClassW(&wc);
             let ex = WINDOW_EX_STYLE(
-                WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0
-                    | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0,
+                WS_EX_TOOLWINDOW.0
+                    | WS_EX_TOPMOST.0
+                    | WS_EX_NOACTIVATE.0
+                    | WS_EX_LAYERED.0
+                    | WS_EX_TRANSPARENT.0,
             );
             match CreateWindowExW(
                 ex,
                 PCWSTR(class.as_ptr()),
                 PCWSTR::null(),
                 WINDOW_STYLE(WS_POPUP.0),
-                0, 0, 10, 10,
+                0,
+                0,
+                10,
+                10,
                 HWND(std::ptr::null_mut()),
                 HMENU(std::ptr::null_mut()),
                 HINSTANCE(std::ptr::null_mut()),
@@ -3036,9 +3657,7 @@ pub fn shadowwin_show(
                     // 另一线程写回则此处覆盖前先销毁新建的，防泄漏）
                     let mut g2 = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(prev) = *g2 {
-                        if prev != hw.0 as isize
-                            && IsWindow(HWND(prev as *mut _)).as_bool()
-                        {
+                        if prev != hw.0 as isize && IsWindow(HWND(prev as *mut _)).as_bool() {
                             let _ = DestroyWindow(HWND(prev as *mut _));
                         }
                     }
@@ -3054,7 +3673,8 @@ pub fn shadowwin_show(
     }
     unsafe {
         // 边距按独立 σ₂（拖尾 3σ₂≈47px 覆盖）——位图边界截断拖尾会出硬边
-        let m = (g_size.max(0.1) * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
+        let m =
+            (g_size.max(0.1) * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
         *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner()) = m;
         let sw = w_out + 2 * m;
         let sh2 = h_out + 2 * m;
@@ -3069,7 +3689,17 @@ pub fn shadowwin_show(
             sh2 as i32,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        shadowwin_render(HWND(h as *mut _), sw, sh2, m, radius_phys, g_size, off_x, off_y, g_alpha);
+        shadowwin_render(
+            HWND(h as *mut _),
+            sw,
+            sh2,
+            m,
+            radius_phys,
+            g_size,
+            off_x,
+            off_y,
+            g_alpha,
+        );
     }
 }
 
@@ -3112,7 +3742,12 @@ pub fn shadowwin_follow(cand: HWND) {
     if let Some(h) = *SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
             if IsWindow(HWND(h as _)).as_bool() && IsWindowVisible(HWND(h as _)).as_bool() {
-                let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let mut wr = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
                 let _ = GetWindowRect(cand, &mut wr);
                 let _ = SetWindowPos(
                     HWND(h as *mut _),

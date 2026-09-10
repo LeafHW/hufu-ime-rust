@@ -77,8 +77,21 @@ fn read_installdir() -> Option<String> {
     use std::ffi::c_void;
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn RegOpenKeyExW(hkey: *mut c_void, name: *const u16, opt: u32, access: u32, out: *mut *mut c_void) -> i32;
-        fn RegQueryValueExW(hkey: *mut c_void, name: *const u16, res: *mut u32, typ: *mut u32, data: *mut u8, size: *mut u32) -> i32;
+        fn RegOpenKeyExW(
+            hkey: *mut c_void,
+            name: *const u16,
+            opt: u32,
+            access: u32,
+            out: *mut *mut c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: *mut c_void,
+            name: *const u16,
+            res: *mut u32,
+            typ: *mut u32,
+            data: *mut u8,
+            size: *mut u32,
+        ) -> i32;
         fn RegCloseKey(hkey: *mut c_void) -> i32;
     }
     const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001usize as *mut c_void;
@@ -89,21 +102,46 @@ fn read_installdir() -> Option<String> {
         let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
         let val: Vec<u16> = "InstallDir".encode_utf16().chain([0]).collect();
         let mut hk = std::ptr::null_mut::<c_void>();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &mut hk) != 0 {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+            &mut hk,
+        ) != 0
+        {
             return None;
         }
         let mut typ = 0u32;
         let mut size = 0u32;
-        if RegQueryValueExW(hk, val.as_ptr(), std::ptr::null_mut(), &mut typ, std::ptr::null_mut(), &mut size) != 0
-            || typ != REG_SZ || size == 0 {
+        if RegQueryValueExW(
+            hk,
+            val.as_ptr(),
+            std::ptr::null_mut(),
+            &mut typ,
+            std::ptr::null_mut(),
+            &mut size,
+        ) != 0
+            || typ != REG_SZ
+            || size == 0
+        {
             RegCloseKey(hk);
             return None;
         }
         let mut size = size.min(32768);
         let mut buf = vec![0u8; size as usize];
-        let ok = RegQueryValueExW(hk, val.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), buf.as_mut_ptr(), &mut size) == 0;
+        let ok = RegQueryValueExW(
+            hk,
+            val.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut size,
+        ) == 0;
         RegCloseKey(hk);
-        if !ok { return None; }
+        if !ok {
+            return None;
+        }
         let units: Vec<u16> = buf[..size as usize]
             .chunks_exact(2)
             .map(|c| u16::from_ne_bytes([c[0], c[1]]))
@@ -148,9 +186,7 @@ fn ensure_server() -> bool {
         .unwrap_or_default();
     let dev_data = std::env::var("HUFU_DEV_DATA").unwrap_or_default(); // 配套 HUFU_DEV_SERVER
     let local_app = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let mut candidates = vec![
-        format!("{exe_dir}\\hufu-server.exe"),
-    ];
+    let mut candidates = vec![format!("{exe_dir}\\hufu-server.exe")];
     if let Some(dir) = read_installdir() {
         candidates.push(format!("{}\\hufu-server.exe", dir.trim_end_matches('\\')));
     }
@@ -255,7 +291,10 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
         if h != INVALID {
             return Some(std::fs::File::from_raw_handle(h as RawHandle));
         }
-        LAST_PIPE_ERR.store(unsafe { GetLastError() }, std::sync::atomic::Ordering::SeqCst);
+        LAST_PIPE_ERR.store(
+            unsafe { GetLastError() },
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // 打不开：server 不在则拉起（首遇给足启动时间）
         if !spawned {
             spawned = true;
@@ -310,14 +349,23 @@ fn call_on(
             // 响应」事故）。PeekNamedPipe 轮询，超时走降级。
             let raw_pipe = f.as_raw_handle() as isize;
             let wait_response = |total_ms: u64| -> Option<()> {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
                 // 【响应等待分级】server 处理一次 key 通常 <3ms：先自旋让快
                 // 响应零等待，再让步、再 1ms/10ms 粒度递进。旧版上来就
                 // sleep(10ms)——每键白交 10ms 量子税，真实打字延迟的大头。
                 let start = std::time::Instant::now();
                 loop {
                     let mut avail: u32 = 0;
-                    if PeekNamedPipe(raw_pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0 {
+                    if PeekNamedPipe(
+                        raw_pipe,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut avail,
+                        std::ptr::null_mut(),
+                    ) != 0
+                    {
                         if avail > 0 {
                             return Some(());
                         }
@@ -345,48 +393,45 @@ fn call_on(
             // read_exact 等满 4 字节头/整帧 body 时若 server 中途挂死
             // （大帧分片到达后对端崩溃）仍会无限阻塞冻结宿主 UI 线程
             // ——改为循环 Peek 直到凑满 n 字节或超时，不满即弃连接。
-            let read_full_timeout = |f: &mut std::fs::File,
-                                     buf: &mut [u8],
-                                     raw_pipe: isize,
-                                     total_ms: u64|
-             -> bool {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
-                let mut filled = 0usize;
-                while filled < buf.len() {
-                    let mut avail: u32 = 0;
-                    if PeekNamedPipe(
-                        raw_pipe,
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut avail,
-                        std::ptr::null_mut(),
-                    ) == 0
-                    {
-                        return false; // 管道断
-                    }
-                    if avail as usize >= buf.len() - filled {
-                        if f.read_exact(&mut buf[filled..]).is_err() {
+            let read_full_timeout =
+                |f: &mut std::fs::File, buf: &mut [u8], raw_pipe: isize, total_ms: u64| -> bool {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+                    let mut filled = 0usize;
+                    while filled < buf.len() {
+                        let mut avail: u32 = 0;
+                        if PeekNamedPipe(
+                            raw_pipe,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            &mut avail,
+                            std::ptr::null_mut(),
+                        ) == 0
+                        {
+                            return false; // 管道断
+                        }
+                        if avail as usize >= buf.len() - filled {
+                            if f.read_exact(&mut buf[filled..]).is_err() {
+                                return false;
+                            }
+                            return true;
+                        }
+                        if avail > 0 {
+                            // 先取走已到部分，继续等剩余
+                            let take = (avail as usize).min(buf.len() - filled);
+                            if f.read_exact(&mut buf[filled..filled + take]).is_err() {
+                                return false;
+                            }
+                            filled += take;
+                        }
+                        if std::time::Instant::now() >= deadline {
                             return false;
                         }
-                        return true;
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     }
-                    if avail > 0 {
-                        // 先取走已到部分，继续等剩余
-                        let take = (avail as usize).min(buf.len() - filled);
-                        if f.read_exact(&mut buf[filled..filled + take]).is_err() {
-                            return false;
-                        }
-                        filled += take;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                true
-            };
+                    true
+                };
             if f.write_all(&frame).is_err() {
                 // 断线：弃连接重试一次
                 *g = None;
@@ -436,7 +481,10 @@ pub fn key_request(
         "line_end": line_end
     }))?;
     let outcome = resp.get("outcome")?;
-    let consumed = outcome.get("consumed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let consumed = outcome
+        .get("consumed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let commit = outcome
         .get("commit")
         .and_then(|v| v.as_str())

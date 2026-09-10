@@ -14,7 +14,11 @@ fn main() {
     // （machine 0x8664→0x14C、重定位 AMD64_ADDR64NB(3)→I386_DIR32NB(7)；
     // .rsrc 图标目录树与 DIB 数据本身架构无关）。
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let name = if arch == "x86" { "hufu_rsrc32.o" } else { "hufu_rsrc.o" };
+    let name = if arch == "x86" {
+        "hufu_rsrc32.o"
+    } else {
+        "hufu_rsrc.o"
+    };
     let obj = manifest.join("assets").join(name);
     assert!(obj.exists(), "缺少 assets/{name}（图标资源目标文件）");
     println!("cargo:rustc-link-arg={}", obj.to_string_lossy());

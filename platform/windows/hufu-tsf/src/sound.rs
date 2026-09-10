@@ -75,9 +75,8 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
             // 要求恢复 8 路交叠原版听感/行为。
             for _ in 0..8 {
                 let mut h = HWAVEOUT(std::ptr::null_mut());
-                let ok = unsafe {
-                    waveOutOpen(Some(&mut h), 0xFFFFFFFF, &wfx, 0, 0, CALLBACK_NULL)
-                };
+                let ok =
+                    unsafe { waveOutOpen(Some(&mut h), 0xFFFFFFFF, &wfx, 0, 0, CALLBACK_NULL) };
                 if ok == 0 && !h.0.is_null() {
                     handles.push(h);
                 }
@@ -379,12 +378,8 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
     let mut pos = 12usize;
     while pos + 8 <= raw.len() {
         let id = &raw[pos..pos + 4];
-        let size = u32::from_le_bytes([
-            raw[pos + 4],
-            raw[pos + 5],
-            raw[pos + 6],
-            raw[pos + 7],
-        ]) as usize;
+        let size =
+            u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]]) as usize;
         let body = pos + 8;
         if id == b"fmt " && size >= 16 {
             // 【越界修复 2026-09-09】截断/损坏 wav（fmt 头声称 16 字节但
@@ -394,12 +389,7 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
                 return None;
             }
             channels = u16::from_le_bytes([raw[body + 2], raw[body + 3]]);
-            rate = u32::from_le_bytes([
-                raw[body + 4],
-                raw[body + 5],
-                raw[body + 6],
-                raw[body + 7],
-            ]);
+            rate = u32::from_le_bytes([raw[body + 4], raw[body + 5], raw[body + 6], raw[body + 7]]);
             bits = u16::from_le_bytes([raw[body + 14], raw[body + 15]]);
         } else if id == b"data" {
             let end = (body + size).min(raw.len());

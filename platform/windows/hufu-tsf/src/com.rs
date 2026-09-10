@@ -96,13 +96,7 @@ fn reg_set(subkey: &str, name: Option<&str>, value: &str) -> WIN32_ERROR {
         };
         let val: Vec<u16> = value.encode_utf16().chain([0]).collect();
         let val_bytes: Vec<u8> = val.iter().flat_map(|c| c.to_le_bytes()).collect();
-        let r = RegSetValueExW(
-            hkey,
-            PCWSTR(ptr),
-            0,
-            REG_SZ,
-            Some(&val_bytes),
-        );
+        let r = RegSetValueExW(hkey, PCWSTR(ptr), 0, REG_SZ, Some(&val_bytes));
         let _ = RegCloseKey(hkey);
         r
     }
@@ -133,13 +127,7 @@ fn reg_set_dword(subkey: &str, name: &str, value: u32) -> WIN32_ERROR {
             let p = v.as_ptr();
             (v, p)
         };
-        let r = RegSetValueExW(
-            hkey,
-            PCWSTR(ptr),
-            0,
-            REG_DWORD,
-            Some(&value.to_le_bytes()),
-        );
+        let r = RegSetValueExW(hkey, PCWSTR(ptr), 0, REG_DWORD, Some(&value.to_le_bytes()));
         let _ = RegCloseKey(hkey);
         r
     }
@@ -165,7 +153,11 @@ pub fn register_server() -> HRESULT {
     let tip = r"Software\Microsoft\CTF\TIP";
     let tip_root = format!(r"{tip}\{CLSID_STR}");
     let _ = reg_set(&tip_root, None, "HuFu 输入法");
-    let _ = reg_set(&format!(r"{tip_root}\Description"), None, "HuFu 虎符输入法（虎码）");
+    let _ = reg_set(
+        &format!(r"{tip_root}\Description"),
+        None,
+        "HuFu 虎符输入法（虎码）",
+    );
     // 微拼/MS Sample 实测布局：Category 两层子键（纯存在性，值留空）
     const TFCAT_TIP_KEYBOARD: &str = "{533C5E0E-5AC0-4ABD-B6F1-251B82B7BE7D}";
     let _ = reg_set(
@@ -182,9 +174,9 @@ pub fn register_server() -> HRESULT {
     let lp = format!(r"{tip_root}\LanguageProfile\0x00000804\{PROFILE_GUID_STR}");
     let _ = reg_set(&lp, None, "HuFu 虎符输入法");
     let _ = reg_set_dword(&lp, "Enable", 1); // DWORD（msctf 标准；REG_SZ 会被部分宿主忽略）
-    // 档案图标（微软拼音同构写法：IconFile+IconIndex，无 Icon 字符串）。
-    // IconFile 指向 DLL 自身（内嵌虎符图标资源，IconIndex=0）——路径无关，
-    // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
+                                             // 档案图标（微软拼音同构写法：IconFile+IconIndex，无 Icon 字符串）。
+                                             // IconFile 指向 DLL 自身（内嵌虎符图标资源，IconIndex=0）——路径无关，
+                                             // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
     let _ = reg_set(&lp, Some("IconFile"), &self_path());
     HRESULT(0)
@@ -203,14 +195,7 @@ pub fn register_profile() {
             let clsid = crate::CLSID_HUFU_TSF;
             let langid = 0x0804u16; // zh-CN
             let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().chain([0]).collect();
-            profiles.AddLanguageProfile(
-                &clsid,
-                langid,
-                &PROFILE_GUID,
-                &desc,
-                &[],
-                0,
-            )?;
+            profiles.AddLanguageProfile(&clsid, langid, &PROFILE_GUID, &desc, &[], 0)?;
             profiles.EnableLanguageProfile(
                 &clsid,
                 langid,
