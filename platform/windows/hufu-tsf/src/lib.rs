@@ -827,7 +827,8 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
     let skin = serde_json::json!({
         "skin": {
             "colors": {
-                "back_color": "#202022E6", "border_color": "#FFFFFF40",
+                "back_color": "#FFFFFFE6", "border_color": "#00000060",
+                "preedit_back_color": "#000000D0",
                 "text_color": "#FFFFFFFF", "candidate_text_color": "#FFFFFFFF",
                 "comment_text_color": "#FFDDDDFF", "label_color": "#FFFFFFCC",
                 "hilited_candidate_back_color": "#CC0000FF",
@@ -952,6 +953,260 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         g.cand2 = saved;
     }
     eprintln!("anim-scales: mask={mask:09b}（0x1FF=9 档全通）");
+    mask as i32
+}
+
+/// 测试钩子：拉伸动效圆角取证（慢速 sim 200%+速度）。流程：窄窗稳态 →
+/// size_ms 拉到 700ms → 宽内容触发拉伸 → 中途（≈45%）与完成各抓一帧
+/// 屏幕像素，比对「角内 3px（圆角应为阴影/桌面）vs 面板内部 vs 边缘」：
+/// 角内≈面板色 = 直角残片。返回 bit0=中途帧圆角 OK，bit1=完成帧圆角 OK
+/// （3=通过）；eprintln 输出采样值供人工核对。
+#[no_mangle]
+extern "system" fn hufu_test_stretch_corner() -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    let skin = serde_json::json!({
+        "skin": {
+            "colors": {
+                "back_color": "#FFFFFFE6", "border_color": "#00000060",
+                "preedit_back_color": "#000000D0",
+                "text_color": "#FFFFFFFF", "candidate_text_color": "#FFFFFFFF",
+                "comment_text_color": "#FFDDDDFF", "label_color": "#FFFFFFCC",
+                "hilited_candidate_back_color": "#CC0000FF",
+                "hilited_candidate_text_color": "#FFFFFFFF"
+            },
+            "layout": { "font_point": 17.6, "corner_radius": 20.0,
+                        "hilited_corner_radius": 6.0, "border_width": 1.0,
+                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0,
+                        "shadow_radius": 10.0 },
+            "material": { "kind": "solid" }
+        }
+    });
+    let narrow = vec![
+        ("你好".to_string(), "".to_string()),
+        ("您好".to_string(), "".to_string()),
+    ];
+    let wide = vec![
+        ("你好你好你好你好你好".to_string(), "".to_string()),
+        ("您好您好您好您好您好".to_string(), "".to_string()),
+        ("拟好拟好拟好拟好拟好".to_string(), "".to_string()),
+    ];
+    let anchor = RECT {
+        left: 200,
+        top: 200,
+        right: 200,
+        bottom: 224,
+    };
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return 0;
+    };
+    let shared = gsh.0.clone();
+    let saved = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    let Some(w) = CandidateWindowV2::new() else {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2 = saved;
+        return 0;
+    };
+    let hwnd = w.hwnd;
+    let pump = || unsafe {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    };
+    // 稳态窄窗
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2 = Some(w);
+        g.last_show = Some((narrow.clone(), "ni".to_string(), 0));
+        g.skin = skin.clone();
+        if let Some(c) = g.cand2.as_mut() {
+            c.last_hide_at = None;
+            c.size_ms = 1; // 稳态阶段动效近零（show 会以皮肤 layout.size_ms 再覆盖）
+            c.show(&narrow, "ni", &skin, Some(&anchor), 0);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    pump();
+    // 抓帧辅助：窗口矩形 → 三采样点（角内3 / 内部 / 边缘），返回 BGR
+    let grab = |tag: &str| -> Option<((i32, i32, i32), RECT)> {
+        unsafe {
+            let mut wr = RECT::default();
+            if GetWindowRect(hwnd, &mut wr).is_err() {
+                return None;
+            }
+            let sm = 24i32; // shadow_m 物理（σ=6, 3σ+6≈24）
+            let cx = wr.right - sm; // 面板右上角
+            let cy = wr.top + sm;
+            let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+            if w < sm * 2 + 40 || h < sm * 2 + 40 {
+                return None;
+            }
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let hdc = GetDC(None);
+            let mdc = CreateCompatibleDC(hdc);
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbmp =
+                CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+            if hbmp.is_invalid() {
+                let _ = DeleteDC(mdc);
+                ReleaseDC(None, hdc);
+                return None;
+            }
+            let old = windows::Win32::Graphics::Gdi::SelectObject(mdc, hbmp);
+            let _ = BitBlt(mdc, 0, 0, w, h, hdc, wr.left, wr.top, SRCCOPY);
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            let got = GetDIBits(
+                mdc,
+                hbmp,
+                0,
+                h as u32,
+                Some(buf.as_mut_ptr().cast()),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            let _ = windows::Win32::Graphics::Gdi::SelectObject(mdc, old);
+            let _ = DeleteObject(hbmp);
+            let _ = DeleteDC(mdc);
+            ReleaseDC(None, hdc);
+            if got == 0 {
+                return None;
+            }
+            let px = |gx: i32, gy: i32| -> (i32, i32, i32) {
+                let lx = (gx - wr.left).clamp(0, w - 1) as usize;
+                let ly = (gy - wr.top).clamp(0, h - 1) as usize;
+                let o = (ly * w as usize + lx) * 4;
+                (buf[o + 2] as i32, buf[o + 1] as i32, buf[o] as i32) // BGR→RGB
+            };
+            let corner = px(cx - 3, cy + 3);
+            let inside = px(cx - 14, cy + 14);
+            let edge = px(cx - 14, cy + 2);
+            // 取证落盘：BMP（54B 头 + BGRA 当 BGRX 用）直接目检
+            {
+                use std::io::Write;
+                let mut bmp: Vec<u8> = Vec::with_capacity(54 + buf.len());
+                let stride = (w as usize * 4) as u32;
+                bmp.extend_from_slice(b"BM");
+                bmp.extend_from_slice(&(54u32 + stride * h as u32).to_le_bytes());
+                bmp.extend_from_slice(&[0u8; 4]);
+                bmp.extend_from_slice(&54u32.to_le_bytes());
+                bmp.extend_from_slice(&40u32.to_le_bytes());
+                bmp.extend_from_slice(&(w as i32).to_le_bytes());
+                bmp.extend_from_slice(&(h as i32).to_le_bytes());
+                bmp.extend_from_slice(&1u16.to_le_bytes());
+                bmp.extend_from_slice(&32u16.to_le_bytes());
+                bmp.extend_from_slice(&[0u8; 24]);
+                bmp.extend_from_slice(&buf);
+                if let Ok(mut f) = std::fs::File::create(
+                    std::env::temp_dir().join(format!("hufu-stretch-{tag}.bmp")),
+                ) {
+                    let _ = f.write_all(&bmp);
+                }
+            }
+            eprintln!(
+                "stretch-corner[{tag}] win={w}x{h} 角内3=({},{},{}) 内部=({},{},{}) 边缘=({},{},{})",
+                corner.0, corner.1, corner.2, inside.0, inside.1, inside.2, edge.0, edge.1, edge.2
+            );
+            Some(((corner.0, inside.0, edge.0), wr))
+        }
+    };
+    // 慢速拉伸（sim 200%+ 观感）：宽帧皮肤 layout.size_ms=700——show()
+    // 每帧以皮肤值覆盖 size_ms，直接改字段无效（首版取证即因此跑成 90ms）
+    let skin_slow = {
+        let mut s = skin.clone();
+        s["skin"]["layout"]["size_ms"] = serde_json::json!(700);
+        s
+    };
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_show = Some((wide.clone(), "nih".to_string(), 0));
+        g.skin = skin_slow.clone();
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&wide, "nih", &skin_slow, Some(&anchor), 0);
+        }
+    }
+    let mut mask = 0u32;
+    // 中途帧（≈45%）：角内应明显亮于面板内部（圆角让位给阴影/桌面）
+    let mut mid = None;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_millis() < 900 {
+        pump();
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.last_key_at = Some(std::time::Instant::now());
+        }
+        if t0.elapsed().as_millis() >= 300 && mid.is_none() {
+            mid = grab("mid");
+        }
+        let anim_on = {
+            let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.cand2
+                .as_ref()
+                .map(|c| c.size_anim.is_some())
+                .unwrap_or(false)
+        };
+        if !anim_on && mid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(6));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    pump();
+    let fin = grab("fin");
+    // 判定：角内R − 内部R ≥ 22 为圆角（面板R≈暗）；< 22 且边缘≈内部 → 直角
+    if let Some(((cr, ir, er), _)) = mid {
+        if cr - ir >= 22 || (er - ir).abs() > 22 {
+            mask |= 1;
+        }
+        eprintln!(
+            "stretch-corner[mid] 判定: 角内-内部={} 边缘-内部={} → {}",
+            cr - ir,
+            er - ir,
+            if mask & 1 != 0 { "圆角" } else { "直角!" }
+        );
+    }
+    if let Some(((cr, ir, er), _)) = fin {
+        if cr - ir >= 22 || (er - ir).abs() > 22 {
+            mask |= 2;
+        }
+        eprintln!(
+            "stretch-corner[fin] 判定: 角内-内部={} 边缘-内部={} → {}",
+            cr - ir,
+            er - ir,
+            if mask & 2 != 0 { "圆角" } else { "直角!" }
+        );
+    }
+    // 清理
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = g.cand2.take();
+        drop(mine);
+        g.cand2 = saved;
+    }
+    eprintln!("stretch-corner: mask={mask:02b}（3=两帧皆圆角）");
     mask as i32
 }
 
