@@ -365,17 +365,18 @@ fn main() {
         let p2 = tk(0xBE);
         println!("[11.p2] 标点句号 down={p2}（应 1）");
 
-        // ── 候选窗 v2：D3D11+DComp+D2D+Acrylic accent 四材质各渲染一帧 ──
+        // ── 候选窗 v2：D3D11+DComp+D2D 两材质各渲染一帧（毛玻璃已退役）──
         type TestCandFn = unsafe extern "system" fn(u32) -> i32;
         let tc: TestCandFn = std::mem::transmute(
             GetProcAddress(hmod, PCSTR(b"hufu_test_candwin2\0".as_ptr())).unwrap(),
         );
-        for mode in 0..4u32 {
+        for mode in 0..2u32 {
             let r = unsafe { tc(mode) };
-            let name = ["solid", "translucent", "frosted", "glass"][(mode % 4) as usize];
+            let name = ["solid", "translucent"][(mode % 2) as usize];
             assert_eq!(r, 1, "candwin2({name}) 渲染应成功");
             println!("[12.{mode}] candwin2 {name} ✓");
         }
+
 
         // ── 动效端到端：渐显 ramp / 注释展开 / 渐隐退场（合成级像素取证）──
         type AnimFn = unsafe extern "system" fn() -> i32;
@@ -396,6 +397,18 @@ fn main() {
         } else {
             println!("[17] 动效 E2E ✓（展开/隐藏；渐显 ramp=宿主伪象拍平，真机肉眼验）");
         }
+
+        // ── 动效×缩放 100%~500% 矩阵（HUFU_FAKE_DPI，与阴影取证同旋钮）──
+        type AnimScaleFn = unsafe extern "system" fn() -> i32;
+        let asc: AnimScaleFn = std::mem::transmute(
+            GetProcAddress(hmod, PCSTR(b"hufu_test_anim_scales\0".as_ptr())).unwrap(),
+        );
+        let smask = unsafe { asc() };
+        assert_eq!(
+            smask, 0x1FF,
+            "动效×9 档缩放应全通（100~500%），实得 {smask:09b}"
+        );
+        println!("[18] 动效×缩放 100%~500% ✓（9 档起臂→完成→渲染全通）");
 
         // ── 音效池化连打：16 连击（4 句柄排队深度压力）不得崩/死锁 ──
         type SndBurstFn = unsafe extern "system" fn() -> i32;

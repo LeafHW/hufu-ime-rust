@@ -19,8 +19,12 @@ extern "system" {
 #[link(name = "gdi32")]
 extern "system" {
     fn CreateDIBSection(
-        hdc: isize, pbmi: *const BITMAPINFO, usage: u32,
-        ppvbits: *mut *mut std::ffi::c_void, hsection: isize, offset: u32,
+        hdc: isize,
+        pbmi: *const BITMAPINFO,
+        usage: u32,
+        ppvbits: *mut *mut std::ffi::c_void,
+        hsection: isize,
+        offset: u32,
     ) -> isize;
     fn CreateCompatibleDC(hdc: isize) -> isize;
     fn DeleteDC(hdc: isize) -> i32;
@@ -67,7 +71,7 @@ struct BITMAPINFO {
 fn make_zh_icon() -> isize {
     const S: usize = 32; // 图标边长
     const SS: usize = 4; // 超采样倍数
-    // 「中」几何：口 外沿 + 笔宽；竖：中心 x 与上下端
+                         // 「中」几何：口 外沿 + 笔宽；竖：中心 x 与上下端
     let (bx0, by0, bx1, by1) = (8.8f32, 10.6, 23.2, 25.4);
     let stroke = 2.5f32;
     let (vx, vy0, vy1) = (16.0f32, 5.4, 27.6);
@@ -127,7 +131,7 @@ fn make_zh_icon() -> isize {
 fn make_hu_icon() -> isize {
     const S: usize = 32; // 图标边长
     const SS: usize = 4; // 超采样倍数
-    // 爪痕线段（单位像素，32 空间）：右上→左下三道，长度渐短
+                         // 爪痕线段（单位像素，32 空间）：右上→左下三道，长度渐短
     let claws: [((f32, f32), (f32, f32)); 3] = [
         ((9.0, 6.5), (17.5, 25.0)),
         ((15.5, 6.0), (22.0, 20.5)),
@@ -214,8 +218,12 @@ fn make_hu_icon() -> isize {
         let mut mbits: *mut std::ffi::c_void = std::ptr::null_mut();
         let hmask = CreateDIBSection(hdc, &mbi, 0, &mut mbits, 0, 0);
         if hcolor == 0 || hmask == 0 || bits.is_null() || mbits.is_null() {
-            if hcolor != 0 { let _ = DeleteObject(hcolor); }
-            if hmask != 0 { let _ = DeleteObject(hmask); }
+            if hcolor != 0 {
+                let _ = DeleteObject(hcolor);
+            }
+            if hmask != 0 {
+                let _ = DeleteObject(hmask);
+            }
             let _ = DeleteDC(hdc);
             eprintln!("托盘图标位图创建失败");
             return 0;
@@ -270,8 +278,12 @@ fn bgra_to_hicon(buf: &[u8]) -> isize {
         let mut mbits: *mut std::ffi::c_void = std::ptr::null_mut();
         let hmask = CreateDIBSection(hdc, &mbi, 0, &mut mbits, 0, 0);
         if hcolor == 0 || hmask == 0 || bits.is_null() || mbits.is_null() {
-            if hcolor != 0 { let _ = DeleteObject(hcolor); }
-            if hmask != 0 { let _ = DeleteObject(hmask); }
+            if hcolor != 0 {
+                let _ = DeleteObject(hcolor);
+            }
+            if hmask != 0 {
+                let _ = DeleteObject(hmask);
+            }
             let _ = DeleteDC(hdc);
             eprintln!("托盘图标位图创建失败");
             return 0;
@@ -299,9 +311,18 @@ fn bgra_to_hicon(buf: &[u8]) -> isize {
 #[link(name = "user32")]
 extern "system" {
     fn CreateWindowExW(
-        dwExStyle: u32, lpClassName: *const u16, lpWindowName: *const u16,
-        dwStyle: u32, x: i32, y: i32, nWidth: i32, nHeight: i32,
-        hWndParent: isize, hMenu: isize, hInstance: isize, lpParam: isize,
+        dwExStyle: u32,
+        lpClassName: *const u16,
+        lpWindowName: *const u16,
+        dwStyle: u32,
+        x: i32,
+        y: i32,
+        nWidth: i32,
+        nHeight: i32,
+        hWndParent: isize,
+        hMenu: isize,
+        hInstance: isize,
+        lpParam: isize,
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn RegisterHotKey(hwnd: isize, id: i32, modifiers: u32, vk: u32) -> i32;
@@ -309,8 +330,13 @@ extern "system" {
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(hmenu: isize, uflags: u32, idm: usize, text: *const u16) -> i32;
     fn TrackPopupMenu(
-        hmenu: isize, uflags: u32, x: i32, y: i32, nres: i32,
-        hwnd: isize, prcrect: isize,
+        hmenu: isize,
+        uflags: u32,
+        x: i32,
+        y: i32,
+        nres: i32,
+        hwnd: isize,
+        prcrect: isize,
     ) -> i32;
     fn GetCursorPos(lppoint: *mut POINT) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
@@ -328,7 +354,10 @@ extern "system" {
 }
 
 #[repr(C)]
-struct POINT { x: i32, y: i32 }
+struct POINT {
+    x: i32,
+    y: i32,
+}
 
 #[repr(C)]
 struct WNDCLASSW {
@@ -439,12 +468,13 @@ static SHARED: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<crate::host::
 /// 【死锁教训】pipe 线程已在 dispatch 持锁，不可经此函数二次锁——
 /// 只供托盘自己的菜单线程使用。
 fn schema_snapshot() -> (Vec<String>, String) {
-    let Some(shared) = SHARED.get() else { return (Vec::new(), String::new()) };
-    let Ok(host) = shared.lock() else { return (Vec::new(), String::new()) };
-    let dir = hufu_engine::Engine::resolve_data_sub(
-        &host.data_dir,
-        &host.engine.config.schema.dir,
-    );
+    let Some(shared) = SHARED.get() else {
+        return (Vec::new(), String::new());
+    };
+    let Ok(host) = shared.lock() else {
+        return (Vec::new(), String::new());
+    };
+    let dir = hufu_engine::Engine::resolve_data_sub(&host.data_dir, &host.engine.config.schema.dir);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -506,8 +536,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         if !schemas.is_empty() {
                             let sub = CreatePopupMenu();
                             for (i, name) in schemas.iter().enumerate() {
-                                let label: Vec<u16> =
-                                    format!("{name}\0").encode_utf16().collect();
+                                let label: Vec<u16> = format!("{name}\0").encode_utf16().collect();
                                 let flags = if *name == current {
                                     MF_STRING | MF_CHECKED
                                 } else {
@@ -534,8 +563,13 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         GetCursorPos(&mut pt);
                         SetForegroundWindow(hwnd);
                         let cmd = TrackPopupMenu(
-                            hmenu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                            pt.x, pt.y, 0, hwnd, 0,
+                            hmenu,
+                            TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                            pt.x,
+                            pt.y,
+                            0,
+                            hwnd,
+                            0,
                         );
                         DestroyMenu(hmenu);
                         if cmd >= IDM_SCHEMA_BASE
@@ -597,9 +631,7 @@ fn nid_of(hwnd: isize) -> (NOTIFYICONDATAW, isize) {
     } else {
         // 兜底：系统默认图标，至少可见（共享资源，不销毁）
         owned = 0;
-        unsafe {
-            LoadImageW(0, 32512 as *const u16, 1, 0, 0, 0x8000)
-        }
+        unsafe { LoadImageW(0, 32512 as *const u16, 1, 0, 0, 0x8000) }
     };
     // 固定 GUID 身份（NIF_GUID）：无 GUID 时 Windows 按「窗口+图标」
     // 指纹识别托盘项——进程重启/重装后指纹变化，用户设过的「常驻
@@ -608,8 +640,8 @@ fn nid_of(hwnd: isize) -> (NOTIFYICONDATAW, isize) {
     const NIF_GUID: u32 = 0x10;
     // {7C9A2B44-3E11-4F5A-9D6C-8B1E0A55F3A2}（GUID 内存序）
     const TRAY_GUID: [u8; 16] = [
-        0x44, 0x2B, 0x9A, 0x7C, 0x11, 0x3E, 0x5A, 0x4F, 0x9D, 0x6C, 0x8B, 0x1E, 0x0A, 0x55,
-        0xF3, 0xA2,
+        0x44, 0x2B, 0x9A, 0x7C, 0x11, 0x3E, 0x5A, 0x4F, 0x9D, 0x6C, 0x8B, 0x1E, 0x0A, 0x55, 0xF3,
+        0xA2,
     ];
     let nid_ret = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -662,15 +694,31 @@ pub fn spawn(
         if atom == 0 {
             // 【静默失效修复 2026-09-11】热键/退出通道随窗口一起无声死
             // 亡——至少落一条诊断
-            eprintln!("托盘窗口 RegisterClassW 失败: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "托盘窗口 RegisterClassW 失败: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         let hwnd = CreateWindowExW(
-            0, cls.as_ptr(), std::ptr::null(), 0,
-            0, 0, 0, 0, 0, 0, hinst, 0,
+            0,
+            cls.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            hinst,
+            0,
         );
         if hwnd == 0 {
-            eprintln!("托盘窗口 CreateWindowExW 失败: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "托盘窗口 CreateWindowExW 失败: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         TRAY_HWND.store(hwnd, Ordering::SeqCst);
@@ -680,16 +728,28 @@ pub fn spawn(
         const MOD_ALT: u32 = 0x1;
         const MOD_CONTROL: u32 = 0x2;
         const HOTKEY_ID_SETTINGS: i32 = 0x4846; // "HF"
-        let hk = RegisterHotKey(hwnd, HOTKEY_ID_SETTINGS, MOD_CONTROL | MOD_ALT, 0x48 /*'H'*/);
+        let hk = RegisterHotKey(
+            hwnd,
+            HOTKEY_ID_SETTINGS,
+            MOD_CONTROL | MOD_ALT,
+            0x48, /*'H'*/
+        );
         let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
-        // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
-        // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
-        // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
+                    // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
+                    // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
+                    // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
         let _ = GetCurrentThreadId();
         // 越进程候选窗：在 tray 线程创建（消息循环共用）——沉浸式
         // 宿主（开始菜单搜索）里 DLL 自绘窗被 DWM cloaked，server 代画
         crate::candwin::init_on_tray_thread();
-        let mut m = MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, pt: POINT { x: 0, y: 0 } };
+        let mut m = MSG {
+            hwnd: 0,
+            message: 0,
+            wParam: 0,
+            lParam: 0,
+            time: 0,
+            pt: POINT { x: 0, y: 0 },
+        };
         loop {
             let r = GetMessageW(&mut m, 0, 0, 0);
             if r <= 0 {

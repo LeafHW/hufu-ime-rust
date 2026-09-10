@@ -15,15 +15,21 @@ const BUF: usize = 1 << 20;
 /// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
 /// 反查，不可伪造）——敏感操作（剪贴板读取）的白名单以此为准；None =
 /// 反查不可用（unix 回退/极端失败），退回客户端自报值。
-pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<&str>) -> serde_json::Value {
+pub fn dispatch(
+    host: &Mutex<Host>,
+    req: &serde_json::Value,
+    client_exe: Option<&str>,
+) -> serde_json::Value {
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     match req.get("op").and_then(|o| o.as_str()).unwrap_or("") {
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
         "key" => match parse_key(req) {
             Some(k) => {
                 let schema_before = host.engine.config.schema.current.clone();
-                host.session.line_end_hint =
-                    req.get("line_end").and_then(|v| v.as_bool()).unwrap_or(false);
+                host.session.line_end_hint = req
+                    .get("line_end")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let mut r = host.process_key(k);
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
                 // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）
@@ -37,8 +43,7 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
                 // 音效热生效：每键带上当前音量（DLL 端 wav 数据可缓存，
                 // 音量取响应值——设置页改音量无需重启/失效缓存）
                 if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
-                    r["outcome"]["sound_vol"] =
-                        serde_json::json!(host.engine.config.sound.volume);
+                    r["outcome"]["sound_vol"] = serde_json::json!(host.engine.config.sound.volume);
                 }
                 r
             }
@@ -84,14 +89,29 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
             let p = host.skins_dir().join(format!("{id}.json"));
             let show_index = host.engine.config.candidates.show_index;
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            // 【动效全局开关+速度 2026-09-11】注入皮肤对象顶层（DLL 读
+            // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
+            let anim = host.engine.config.appearance.anim;
+            let anim_speed = host.engine.config.appearance.anim_speed;
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => {
-                    serde_json::json!({"skin": s, "show_index": show_index, "delay_show_ms": delay_show_ms})
+                    let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(o) = sv.as_object_mut() {
+                        o.insert("anim".into(), serde_json::json!(anim));
+                        o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                    }
+                    serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
                 Err(e) => {
                     eprintln!("皮肤 {id} 加载失败，候选窗回默认: {e}");
+                    let mut sv = serde_json::to_value(hufu_skin::Skin::default())
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(o) = sv.as_object_mut() {
+                        o.insert("anim".into(), serde_json::json!(anim));
+                        o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                    }
                     serde_json::json!({
-                        "skin": hufu_skin::Skin::default(),
+                        "skin": sv,
                         "show_index": show_index,
                         "delay_show_ms": delay_show_ms
                     })
@@ -260,23 +280,19 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
         }
         // 语言栏右键「导出码表」：导出当前方案（用户调整合并快照）并
         // explorer 打开导出子文件夹（码表导出\<方案名>\）。
-        "export_schema" => {
-            match host.export_schema(None) {
-                Ok((path, n)) => {
-                    let dir = std::path::Path::new(&path)
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default();
-                    if dir.is_dir() {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(&dir)
-                            .spawn();
-                    }
-                    serde_json::json!({"ok": true, "path": path, "lines": n})
+        "export_schema" => match host.export_schema(None) {
+            Ok((path, n)) => {
+                let dir = std::path::Path::new(&path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                if dir.is_dir() {
+                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                 }
-                Err(e) => serde_json::json!({"ok": false, "error": e}),
+                serde_json::json!({"ok": true, "path": path, "lines": n})
             }
-        }
+            Err(e) => serde_json::json!({"ok": false, "error": e}),
+        },
         // 语言栏菜单音效开关：读态 / 切换（落盘，热生效）
         "sound_state" => serde_json::json!({
             "enabled": host.engine.config.sound.enabled,
@@ -298,14 +314,24 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
                     a.iter()
                         .map(|c| {
                             (
-                                c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                                c.get("comment").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                c.get("text")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                c.get("comment")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
                             )
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            let raw = req.get("raw").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let raw = req
+                .get("raw")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let sel = req.get("selected").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
             let x = req.get("x").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
             let y = req.get("y").and_then(|x| x.as_i64()).unwrap_or(100) as i32;
@@ -329,7 +355,12 @@ pub fn dispatch(host: &Mutex<Host>, req: &serde_json::Value, client_exe: Option<
                     .unwrap_or(serde_json::Value::Null),
             };
             crate::candwin::show(
-                crate::candwin::CandFrame { items, raw, selected: sel, skin },
+                crate::candwin::CandFrame {
+                    items,
+                    raw,
+                    selected: sel,
+                    skin,
+                },
                 x,
                 y,
             );
@@ -504,7 +535,13 @@ mod imp {
         while done < n {
             let mut got = 0u32;
             let ok = unsafe {
-                ReadFile(h, buf.as_mut_ptr().add(done), (n - done) as u32, &mut got, std::ptr::null_mut())
+                ReadFile(
+                    h,
+                    buf.as_mut_ptr().add(done),
+                    (n - done) as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                )
             };
             if ok == 0 || got == 0 {
                 return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "管道关闭"));
@@ -519,7 +556,13 @@ mod imp {
         while done < buf.len() {
             let mut wrote = 0u32;
             let ok = unsafe {
-                WriteFile(h, buf.as_ptr().add(done), (buf.len() - done) as u32, &mut wrote, std::ptr::null_mut())
+                WriteFile(
+                    h,
+                    buf.as_ptr().add(done),
+                    (buf.len() - done) as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
             };
             if ok == 0 {
                 return Err(std::io::Error::new(ErrorKind::BrokenPipe, "管道写入失败"));
@@ -579,7 +622,9 @@ mod imp {
                 b"{\"error\":\"resp serialize failed\"}".to_vec()
             });
             if out.len() > BUF {
-                out = serde_json::json!({"error": "响应过大"}).to_string().into_bytes();
+                out = serde_json::json!({"error": "响应过大"})
+                    .to_string()
+                    .into_bytes();
             }
             let mut frame = (out.len() as u32).to_le_bytes().to_vec();
             frame.extend_from_slice(&out);

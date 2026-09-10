@@ -320,7 +320,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 皮肤 ════ -->
   <section id="tab-skin">
     <h2>皮肤<span class="en">Skin</span></h2>
-    <div class="sub">19 个颜色角色 + 布局 + 材质（毛玻璃 / 玻璃 / 半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。</div>
+    <div class="sub">19 个颜色角色 + 布局 + 材质（半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。毛玻璃已退役（2026-09-11），旧玻璃皮肤自动按纯色渲染。</div>
     <div class="row" style="margin-bottom:18px">
       <div class="field"><label>皮肤</label><select id="skin-select" style="min-width:200px"></select></div>
       <div class="field"><label>名称</label><input type="text" data-skin="name" style="width:160px"></div>
@@ -328,6 +328,11 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="skin-save" class="primary">保存皮肤</button>
       <button id="skin-new">新建</button>
       <button id="skin-reset" title="把当前皮肤的颜色、布局、材质全部恢复为出厂默认（保留皮肤 ID/名称）">恢复默认值</button>
+    </div>
+    <h3>动效</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：入场长大、尺寸过渡、跟光标滑动、退场淡出；关闭=一切瞬跳">候选窗动效</label></div>
+      <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="25" max="400" step="5" title="整体速度倍率：100%=默认速度；调小更快、调大更慢（作用于所有动效时长）"></div>
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
@@ -343,14 +348,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div style="flex:1;min-width:330px">
         <h3>材质</h3>
         <div class="row">
-          <div class="checkline"><input type="checkbox" id="mat-glass"><label for="mat-glass" title="窗底实时抓取屏幕内容并高斯模糊（真窗口毛玻璃；预览图以半透明近似）">毛玻璃底</label></div>
-          <div class="field"><label>模糊档位</label><select id="l-blur" title="三档：低=轻模糊、中/高=重模糊。Windows 系统只有两档模糊深度，中/高同为重模糊"><option value="low">低</option><option value="mid">中</option><option value="high">高</option></select></div>
-          <div class="field"><label>毛玻璃染色</label><input type="color" id="mat-tint" title="毛玻璃的染色层颜色（叠在模糊之上压深底色）"></div>
-          <div class="field"><label>染色浓度 <span class="val" id="mat-ta-v"></span></label><input type="range" id="mat-ta" min="0" max="100" title="毛玻璃染色的不透明度：0%=只模糊不染色，100%=完全不透明色块"></div>
-          <div class="field"><label>玻璃阴影浓度 <span class="val" id="mat-gsa-v"></span></label><input type="range" id="mat-gsa" min="0" max="100" title="毛玻璃模式专用投影浓度（独立于纯色阴影的透明度）；0%=无玻璃阴影"></div>
-          <div class="field"><label>玻璃阴影大小 <span class="val" id="mat-gss-v"></span></label><input type="range" id="mat-gss" min="2" max="16" step="0.5" title="毛玻璃模式专用投影扩散范围（独立于纯色阴影大小）"></div>
-          <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc" title="纯色模式的窗底色（毛玻璃模式下面板隐藏，改此色无效果）"></div>
-          <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="纯色模式下窗底/边框/编码底的透明度（毛玻璃模式下无效，玻璃浓度用染色浓度调）"></div>
+          <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc" title="窗底色"></div>
+          <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="窗底/边框/编码底的透明度"></div>
           <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
           <div class="field"><label>高亮色</label><input type="color" id="mat-hi" title="高亮候选的底色（配合高亮透明度）"></div>
           <div class="field"><label>阴影透明度 <span class="val" id="mat-sa-v"></span></label><input type="range" id="mat-sa" min="0" max="100" title="纯色模式自绘阴影的透明度（毛玻璃模式的阴影用下方玻璃阴影浓度独立调）"></div>
@@ -676,19 +675,17 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
      在内存 CFG/SKIN，动作触发时一次全量发送（与原行为一致，仅收口）。 */
 const clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
 const NUM_CLAMPS = {
-  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100] },
+  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0.25, 4] },
   layout: {
     font_point: [8, 72], label_font_point: [0, 72], width: [0, 1200], min_width: [0, 1200],
     margin_x: [0, 60], margin_y: [0, 60], corner_radius: [0, 40], hilited_corner_radius: [0, 40],
     spacing: [0, 48], candidate_spacing: [0, 48], hilite_spacing: [0, 48], hilite_padding: [0, 40],
     line_spacing: [0, 40], border_width: [0, 12], shadow_radius: [0, 60],
-    shadow_offset_x: [-5, 5], shadow_offset_y: [-5, 5], blur_radius: [0, 100],
+    shadow_offset_x: [-5, 5], shadow_offset_y: [-5, 5],
   },
   material: {
     opacity: [0, 1], darken: [0, 1], noise: [0, 1],
     master_alpha: [0, 1], hilite_alpha: [0, 1], shadow_alpha: [0, 1], border_alpha: [0, 1],
-    glass_alpha: [0, 1], glass_shadow_alpha: [0, 1], glass_shadow_size: [2, 16],
-    glass_margin_x: [0, 60], glass_margin_y: [0, 60],
   },
 };
 function sanitizeConfig(c) {
@@ -872,82 +869,41 @@ function bindSkin() {
     bcv.onchange = saveSkinQuiet;
     syncB();
   }
-  // 【毛玻璃 2026-09-08】material.kind=glass：真窗口=抓屏+D2D 高斯模糊
-  //+圆角裁剪（预览以半透明近似）；layout.blur_radius 模糊半径。
-  //【v3.2】染色=material.tint（#RRGGBBAA）：色→RGB、浓度→AA，
-  //真窗 acrylic GradientColor 直读（UI 值即真值）。
+  // 【毛玻璃退役 2026-09-11】glass 材质整链删除——旧皮肤 material.kind
+  // 残值一律按 solid 归一（server 渲染层同口径：不再分支）。
   {
-    const gc = $("#mat-glass"), bl = $("#l-blur"), tc = $("#mat-tint"), ta = $("#mat-ta");
     if (!SKIN.material) SKIN.material = {};
-    if (!SKIN.layout) SKIN.layout = {};
-    const parseTint = s => {
-      const m = /^#?([0-9A-Fa-f]{8})$/.exec(s || "");
-      return m ? m[1] : null;
-    };
-    const syncG = () => {
-      gc.checked = SKIN.material.kind === "glass";
-      // 真三档枚举 blur_level；旧皮肤无此字段从 blur_radius 推档
-      if (SKIN.layout.blur_level) {
-        bl.value = SKIN.layout.blur_level;
-      } else {
-        const bv = SKIN.layout.blur_radius ?? 24;
-        bl.value = bv <= 50 ? "low" : (bv <= 80 ? "mid" : "high");
-      }
-      const t = parseTint(SKIN.material.tint);
-      if (t) {
-        tc.value = "#" + t.slice(0, 6);
-        ta.value = Math.round(parseInt(t.slice(6, 8), 16) / 255 * 100);
-      } else {
-        // 【染色浓度默认 0】无 tint 字段的旧皮肤：色相用默认深灰、浓度 0
-        tc.value = "#1c1c1e";
-        ta.value = 0;
-      }
-      $("#mat-ta-v").textContent = ta.value + "%";
-      syncShadowOff();
-    };
-    // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移：勾选玻璃时
-    // 偏移滑杆禁用并归 0（SKIN 数据同步清零，保存走 server 归一双保险）。
+    if (SKIN.material.kind === "glass" || SKIN.material.kind === "frosted") {
+      SKIN.material.kind = "solid";
+    }
+    // 【玻璃零偏移退役】偏移滑杆不再被玻璃模式禁用
     const sox = $("#l-sox"), soy = $("#l-soy");
-    const syncShadowOff = () => {
-      const glass = SKIN.material.kind === "glass";
-      if (glass) {
-        SKIN.layout.shadow_offset_x = 0; SKIN.layout.shadow_offset_y = 0;
-        sox.value = 0; soy.value = 0;
-        $("#l-sox-v").textContent = "0"; $("#l-soy-v").textContent = "0";
-      }
-      sox.disabled = glass; soy.disabled = glass;
-      sox.title = soy.title = glass ? "毛玻璃模式不允许阴影偏移（强制 0）" : "";
+    sox.disabled = false; soy.disabled = false;
+    sox.title = soy.title = "";
+  }
+  // 【动效全局开关+速度 2026-09-11】皮肤页控件，真源=全局配置
+  // appearance.anim / appearance.anim_speed（DLL 经 skin op 注入读取）
+  {
+    const an = $("#g-anim"), sp = $("#g-animsp");
+    const syncAnim = () => {
+      an.checked = CFG.appearance?.anim !== false;
+      sp.value = Math.round((CFG.appearance?.anim_speed ?? 1) * 100);
+      sp.disabled = !an.checked;
+      $("#g-animsp-v").textContent = sp.value + "%";
     };
-    gc.oninput = () => { SKIN.material.kind = gc.checked ? "glass" : "solid"; syncShadowOff(); /* 【玻璃独立留白 2026-09-10】切换材质即切换留白滑杆数据源 */ if (window.__syncGlassMargins) window.__syncGlassMargins(); preview(); };
-    gc.onchange = saveSkinQuiet;
-    bl.oninput = () => { SKIN.layout.blur_level = bl.value; preview(); };
-    bl.onchange = saveSkinQuiet;
-    const tintOf = () => tc.value + Math.round(ta.value / 100 * 255).toString(16).padStart(2, "0");
-    tc.oninput = () => { SKIN.material.tint = tintOf(); preview(); };
-    tc.onchange = saveSkinQuiet;
-    ta.oninput = () => {
-      SKIN.material.tint = tintOf();
-      $("#mat-ta-v").textContent = ta.value + "%";
-      preview();
+    an.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.anim = an.checked;
+      syncAnim();
     };
-    ta.onchange = saveSkinQuiet;
-    // 【v3.9 玻璃阴影独立参数】gsa=浓度(0-1) gss=σ 基准(2-16)
-    const gsa = $("#mat-gsa"), gss = $("#mat-gss");
-    gsa.value = Math.round((SKIN.material.glass_shadow_alpha ?? 0.38) * 100);
-    $("#mat-gsa-v").textContent = gsa.value + "%";
-    gsa.oninput = () => {
-      SKIN.material.glass_shadow_alpha = gsa.value / 100;
-      $("#mat-gsa-v").textContent = gsa.value + "%";
+    an.onchange = saveConfig;
+    sp.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.anim_speed = sp.value / 100;
+      $("#g-animsp-v").textContent = sp.value + "%";
     };
-    gsa.onchange = saveSkinQuiet;
-    gss.value = SKIN.material.glass_shadow_size ?? 6;
-    $("#mat-gss-v").textContent = gss.value;
-    gss.oninput = () => {
-      SKIN.material.glass_shadow_size = parseFloat(gss.value);
-      $("#mat-gss-v").textContent = gss.value;
-    };
-    gss.onchange = saveSkinQuiet;
-    syncG();
+    sp.onchange = saveConfig;
+    syncAnim();
   }
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
   if (SKIN.material.master_alpha == null) SKIN.material.master_alpha = 1;
@@ -1061,28 +1017,15 @@ function bindSkin() {
     ls.onchange = () => { SKIN.layout.label_style = ls.value; preview(); saveSkinQuiet(); };
   }
   lrng("#l-hsp", "hilite_spacing");
-  // 【玻璃独立留白 2026-09-10】水平/垂直留白双源：毛玻璃材质时滑杆
-  // 编辑 material.glass_margin_x/y（默认 4，与 layout 两套完全独立），
-  // 非玻璃编辑 layout.margin_x/y——不用 lrng 静态绑定，动态切目标。
-  // 【字段映射修复 2026-09-10】旧版玻璃时误写 material.margin_x（该
-  // 字段渲染端根本不读——glass_margin_x 恒缺省，实测拖滑杆不生效）。
+  // 留白滑杆：毛玻璃退役后单一数据源 layout.margin_x/y
   {
     const mx = $("#l-mx"), my = $("#l-my"), mxv = $("#l-mx-v"), myv = $("#l-my-v");
-    const isGlass = () => SKIN.material && SKIN.material.kind === "glass";
-    const getV = axis => isGlass() ? (SKIN.material["glass_margin_" + axis] ?? 4) : (SKIN.layout["margin_" + axis] ?? 8);
-    const setV = (axis, v) => {
-      if (isGlass()) SKIN.material["glass_margin_" + axis] = v;
-      else SKIN.layout["margin_" + axis] = v;
-    };
     const syncMarginSliders = () => {
-      mx.value = getV("x"); my.value = getV("y");
+      mx.value = SKIN.layout.margin_x ?? 8; my.value = SKIN.layout.margin_y ?? 6;
       mxv.textContent = fmtV(mx.value); myv.textContent = fmtV(my.value);
-      const hint = isGlass() ? "毛玻璃独立留白（与纯色两套）" : "";
-      mx.title = my.title = hint;
     };
-    mx.oninput = () => { setV("x", parseFloat(mx.value)); mxv.textContent = fmtV(mx.value); preview(); saveSkinDebounced(); };
-    my.oninput = () => { setV("y", parseFloat(my.value)); myv.textContent = fmtV(my.value); preview(); saveSkinDebounced(); };
-    window.__syncGlassMargins = syncMarginSliders;
+    mx.oninput = () => { SKIN.layout.margin_x = parseFloat(mx.value); mxv.textContent = fmtV(mx.value); preview(); saveSkinDebounced(); };
+    my.oninput = () => { SKIN.layout.margin_y = parseFloat(my.value); myv.textContent = fmtV(my.value); preview(); saveSkinDebounced(); };
     syncMarginSliders();
   }
   lrng("#l-hp", "hilite_padding");
@@ -1139,13 +1082,6 @@ function bindSkin() {
             SKIN.layout[k] = Math.min(Math.max(nv, 0), hi);
             if (sel) { const e = $(sel); if (e) e.value = SKIN.layout[k]; const t = $(sel + "-v"); if (t) t.textContent = fmtV(SKIN.layout[k]); }
           }
-          // 【玻璃留白字号联动 2026-09-10】glass_margin_* 与 server 滚轮
-          // 缩放（scale_glass_geometry）同语义同比联动——毛玻璃放大时
-          // 留白跟着变（此前缺位）。非玻璃皮肤同样改数据（不读无副作用）。
-          // 双源滑杆显示走 __syncGlassMargins 刷新（玻璃时显示 glass 值）。
-          SKIN.material.glass_margin_x = Math.min(60, Math.max(0, Math.round((SKIN.material.glass_margin_x ?? 4) * r * 2) / 2));
-          SKIN.material.glass_margin_y = Math.min(60, Math.max(0, Math.round((SKIN.material.glass_margin_y ?? 4) * r * 2) / 2));
-          if (window.__syncGlassMargins) window.__syncGlassMargins();
         }
       }
       SKIN.layout.font_point = v;
@@ -1237,32 +1173,12 @@ function preview() {
   const inner = document.createElement("div");
   w.innerHTML = "";
   inner.className = "candwin" + (L.horizontal ? " horizontal" : "");
-  // 【毛玻璃预览近似】真窗口=DWM acrylic；预览用 backdrop-filter+染色层
-  //（tint 半透明叠加，与真窗 GradientColor 语义一致）。
-  const tintPx = (() => {
-    const m = /^#?([0-9A-Fa-f]{8})$/.exec(SKIN.material && SKIN.material.tint || "");
-    if (!m) return null;
-    const r = parseInt(m[1].slice(0, 2), 16), g = parseInt(m[1].slice(2, 4), 16);
-    const b = parseInt(m[1].slice(4, 6), 16), a = parseInt(m[1].slice(6, 8), 16) / 255;
-    return `rgba(${r},${g},${b},${a.toFixed(2)})`;
-  })();
-  // 模糊三档→预览 px（近似观感：低轻/中高重）
-  const blurPx = { low: 10, mid: 60, high: 100 }[L.blur_level]
-    ?? (L.blur_radius <= 50 ? 10 : (L.blur_radius <= 80 ? 60 : 100));
-  const glassCss = SKIN.material && SKIN.material.kind === "glass"
-    ? `backdrop-filter:blur(${blurPx}px);-webkit-backdrop-filter:blur(${blurPx}px);`
-      + (tintPx ? `background:${tintPx};` : "")
-    : "";
-  // glass 时底色交给 tint 层（真窗 bg alpha=0，accent 承担染色）
-  const bgPart = SKIN.material && SKIN.material.kind === "glass" ? "" : `background:${bgc};`;
-  /* 【玻璃独立留白 2026-09-10】预览与真窗同语义：玻璃用 material.
-     glass_margin_*（默认 4），非玻璃用 layout.margin_*；
-     【玻璃留白字号联动 2026-09-10】比例跟随在数据层（scale_glass_
-     geometry，字号滑杆 geo 联动同改数据）——预览直读即可。 */
-  const isGlassSkin = SKIN.material && SKIN.material.kind === "glass";
-  const padY = isGlassSkin ? (SKIN.material.glass_margin_y ?? 4) : L.margin_y;
-  const padX = isGlassSkin ? (SKIN.material.glass_margin_x ?? 4) : L.margin_x;
-  inner.style.cssText = `${glassCss}${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 0}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${padY}px ${padX}px;gap:${L.candidate_spacing}px`;
+  // 【毛玻璃退役 2026-09-11】预览不再有 glass 分支（backdrop-filter/
+  // tint 层/玻璃留白全撤），底色/留白单一来源。
+  const bgPart = `background:${bgc};`;
+  const padY = L.margin_y;
+  const padX = L.margin_x;
+  inner.style.cssText = `${bgPart}border:${border};border-radius:${L.corner_radius}px;box-shadow:0 ${L.shadow_offset_y || 0}px ${SKIN.layout.shadow_radius * 2 || 8}px ${shA(c.shadow_color)};padding:${padY}px ${padX}px;gap:${L.candidate_spacing}px`;
   // 【皮肤元素自查 2026-09-08】预览消费 label_format（序号 printf 格式，
   // %s→序号；与 DLL 同步——出厂统一 "%s."，皮肤可改 "%s" 得纯数字）
   // 与 mark_text（高亮行左缘细竖条，weasel 语义）。

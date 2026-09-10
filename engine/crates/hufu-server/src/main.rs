@@ -11,11 +11,11 @@
 #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
 mod candwin;
+#[cfg(windows)]
+mod clipboard;
 mod host;
 mod http;
 mod pipe;
-#[cfg(windows)]
-mod clipboard;
 #[cfg(windows)]
 mod tray;
 
@@ -58,7 +58,9 @@ fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
         let force = std::env::args().any(|a| a == "--console");
-        let dev = std::env::var("HUFU_DEV_CONSOLE").map(|v| v == "1").unwrap_or(false);
+        let dev = std::env::var("HUFU_DEV_CONSOLE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         attach_console_for_dev(force, dev);
     }
     let mut args = std::env::args().skip(1);
@@ -121,7 +123,10 @@ fn main() {
         use std::io::Write;
         let p = r"C:\ProgramData\HuFu\diag\startup-trace.txt";
         let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-        if std::fs::metadata(p).map(|m| m.len() > 4 << 20).unwrap_or(false) {
+        if std::fs::metadata(p)
+            .map(|m| m.len() > 4 << 20)
+            .unwrap_or(false)
+        {
             let _ = std::fs::rename(p, r"C:\ProgramData\HuFu\diag\startup-trace.old.txt");
         }
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -219,7 +224,11 @@ fn main() {
                         (None, Some(_)) => 1,
                         (Some(_), None) => 3,
                         (Some(p), Some(c)) => {
-                            if p == c { 2 } else { 1 }
+                            if p == c {
+                                2
+                            } else {
+                                1
+                            }
                         }
                     }
                 };
@@ -240,22 +249,38 @@ fn main() {
                             h.engine.config.sentence.rerank.enabled,
                         )
                     };
-                    let cur_gguf = if rerank_enabled { gguf_stat(&data_dir_w) } else { None };
+                    let cur_gguf = if rerank_enabled {
+                        gguf_stat(&data_dir_w)
+                    } else {
+                        None
+                    };
                     let cur_ngram = stat_of(&ngram_path);
                     let g = step(&mut prev_gguf, cur_gguf);
                     let n = step(&mut prev_ngram, cur_ngram);
                     // 启动首轮在场：视为已装载（启动路径自己会装），不算边沿
                     if first_round {
                         first_round = false;
-                        if cur_gguf.is_some() { seen_gguf = true; }
-                        if cur_ngram.is_some() { seen_ngram = true; }
+                        if cur_gguf.is_some() {
+                            seen_gguf = true;
+                        }
+                        if cur_ngram.is_some() {
+                            seen_ngram = true;
+                        }
                         continue;
                     }
-                    if g == 3 { seen_gguf = false; }
-                    if n == 3 { seen_ngram = false; }
+                    if g == 3 {
+                        seen_gguf = false;
+                    }
+                    if n == 3 {
+                        seen_ngram = false;
+                    }
                     let trig = (g == 2 && !seen_gguf) || (n == 2 && !seen_ngram);
-                    if g == 2 { seen_gguf = true; }
-                    if n == 2 { seen_ngram = true; }
+                    if g == 2 {
+                        seen_gguf = true;
+                    }
+                    if n == 2 {
+                        seen_ngram = true;
+                    }
                     if trig {
                         eprintln!("模型监视：检测到新拖入的模型文件，自动装载（GGUF/整句通道）");
                         reload_sentence_bg(false, false);
@@ -362,7 +387,9 @@ pub fn reload_sentence_bg(teardown_old: bool, resupplement: bool) {
     std::thread::Builder::new()
         .name("hufu-sentence-reload-kick".into())
         .spawn(move || {
-            let Some(shared) = HOST_HANDLE.get() else { return };
+            let Some(shared) = HOST_HANDLE.get() else {
+                return;
+            };
             {
                 let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
                 if teardown_old || h.sentence_load_plan().is_none() {
@@ -385,15 +412,11 @@ pub fn reload_sentence_bg(teardown_old: bool, resupplement: bool) {
 /// 【加载去重 2026-09-11】连续触发（weight API 连续调/快速切方案）
 /// 不再各起一个装载线程并发载 N 份 546MB：BUSY 闸门 + PENDING 重跑，
 /// 装载串行、最后一次请求语义不丢。
-static NGRAM_LOAD_BUSY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static NGRAM_LOAD_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NGRAM_LOAD_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn spawn_sentence_reload(
-    shared: std::sync::Arc<std::sync::Mutex<Host>>,
-    resupplement: bool,
-) {
+fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resupplement: bool) {
     use std::sync::atomic::Ordering;
     if NGRAM_LOAD_BUSY.swap(true, Ordering::SeqCst) {
         // 已有装载在跑：只记「再来一次」（装载完成后补跑，覆盖最新
@@ -441,10 +464,7 @@ fn spawn_sentence_reload(
                                     }
                                 }
                             }
-                            eprintln!(
-                                "ngram 页缓存预热完成（{:.1}s）",
-                                t0.elapsed().as_secs_f32()
-                            );
+                            eprintln!("ngram 页缓存预热完成（{:.1}s）", t0.elapsed().as_secs_f32());
                         })
                         .ok();
                 }
@@ -456,7 +476,8 @@ fn spawn_sentence_reload(
                         if h.engine.config.schema.current.contains("整句")
                             && h.engine.config.sentence.enabled
                         {
-                            h.engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+                            h.engine
+                                .set_sentence_decoder(Some(std::sync::Arc::new(dec)));
                             // 【用户词注入 2026-09-06】装载后即注入
                             //（/jc 加词参与整句词图）
                             h.engine.sync_sentence_user_words();
@@ -563,9 +584,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         if let Some(h) = req.headers.get("host").filter(|h| !h.is_empty()) {
             let h = h.to_lowercase();
-            let local_host = h.starts_with("127.0.0.1")
-                || h.starts_with("localhost")
-                || h.starts_with("[::1]");
+            let local_host =
+                h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]");
             if !local_host {
                 return Response::err(403, "非法 Host");
             }
@@ -616,13 +636,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let state = host.engine.state(&host.session);
             Response::json(&serde_json::json!({ "state": state }))
         }
-        ("GET", "/api/config") => Response::json(&serde_json::to_value(&host.engine.config).unwrap()),
+        ("GET", "/api/config") => {
+            Response::json(&serde_json::to_value(&host.engine.config).unwrap())
+        }
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表
             // （resolve_data_sub 与引擎同源判定）。
-            let dir =
-                hufu_engine::Engine::resolve_data_sub(&host.data_dir, &host.engine.config.schema.dir);
+            let dir = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.schema.dir,
+            );
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -748,7 +772,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let v = req.json();
             let x = v.get("x").and_then(|x| x.as_i64()).unwrap_or(0);
             let y = v.get("y").and_then(|x| x.as_i64()).unwrap_or(0);
-            host.preview_anchor = Some(((x, y), std::time::Instant::now() + std::time::Duration::from_millis(2500)));
+            host.preview_anchor = Some((
+                (x, y),
+                std::time::Instant::now() + std::time::Duration::from_millis(2500),
+            ));
             Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/skin/reset") => {
@@ -830,11 +857,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // /jc 加词窗「编码框」实时预览：该编码当前最终候选序
             //（码表 + 调整回放 + 用户词含选重位——所见即所得），供
             // 用户参考着填选重位。?code=xxx，限前 10。
-            let code = req
-                .query
-                .get("code")
-                .cloned()
-                .unwrap_or_default();
+            let code = req.query.get("code").cloned().unwrap_or_default();
             let texts: Vec<String> = host
                 .engine
                 .schema
@@ -869,7 +892,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 format!("{{添加}}{code}\t{text}\n")
             };
             use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+            let mut f = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+            {
                 Ok(f) => f,
                 Err(e) => return Response::err(500, &format!("写入失败: {e}")),
             };
@@ -888,7 +915,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             //（~2s，期间旧模型继续服务）。不再写 用户调整.txt 的
             // {加权} 行（旧行回放兼容保留）。
             let v = req.json();
-            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
             if text.is_empty() {
                 return Response::err(400, "词不能为空");
@@ -900,7 +932,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             rewrite_supplement_lines(&file, &text);
             let line = format!("{text} {weight}\n");
             use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+            let mut f = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+            {
                 Ok(f) => f,
                 Err(e) => return Response::err(500, &format!("写入失败: {e}")),
             };
@@ -915,8 +951,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/user_word/remove") => {
             let v = req.json();
-            let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let code = v
+                .get("code")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             // 硬删用户词条：清同码同词全部行（词行+调整行）
             let file = host.engine.schema.dir.join("用户调整.txt");
             if file.exists() {
@@ -927,8 +973,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/candidate/pin") => {
             let v = req.json();
-            let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let code = v
+                .get("code")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if code.is_empty() || text.is_empty() {
                 return Response::err(400, "编码与词不能为空");
             }
@@ -938,8 +994,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/candidate/hide") => {
             let v = req.json();
-            let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let code = v
+                .get("code")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if code.is_empty() || text.is_empty() {
                 return Response::err(400, "编码与词不能为空");
             }
@@ -1041,9 +1107,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     // 导出即达：explorer 打开导出子文件夹（码表导出\<方案名>\）
                     if let Some(dir) = std::path::Path::new(&path).parent() {
                         if dir.is_dir() {
-                            let _ = std::process::Command::new("explorer")
-                                .arg(dir)
-                                .spawn();
+                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
                         }
                     }
                     Response::json(&serde_json::json!({
@@ -1077,9 +1141,7 @@ mod sys_win {
     /// 已有实例在跑（命名互斥体命中）→ true。句柄故意不关：进程存续
     /// 期间互斥体必须持有；退出时系统自动回收。
     pub fn already_running() -> bool {
-        let name: Vec<u16> = "HuFu-IME-Server-Single-Instance\0"
-            .encode_utf16()
-            .collect();
+        let name: Vec<u16> = "HuFu-IME-Server-Single-Instance\0".encode_utf16().collect();
         unsafe {
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
             // 句柄无效（极端：句柄表满）当「未命中」走老路：端口 bind 兜底

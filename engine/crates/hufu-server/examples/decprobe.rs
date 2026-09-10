@@ -3,7 +3,6 @@
 
 use hufu_engine::SentenceDecoder;
 
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = std::path::PathBuf::from(&args[1]);
@@ -66,11 +65,26 @@ fn main() {
         let dec = eng.decode_rich(raw);
         println!("== decode_rich({raw}) hits ==");
         for (i, h) in dec.hits.iter().take(6).enumerate() {
-            println!("{}. {}  score={:.3} conf={:.3} max_rank={} seg=[{}]", i + 1, h.text, h.score, h.confidence, h.max_rank, h.segmented);
+            println!(
+                "{}. {}  score={:.3} conf={:.3} max_rank={} seg=[{}]",
+                i + 1,
+                h.text,
+                h.score,
+                h.confidence,
+                h.max_rank,
+                h.segmented
+            );
         }
         println!("-- early_hits --");
         for (i, h) in dec.early_hits.iter().take(4).enumerate() {
-            println!("{}. {}  conf={:.3} score={:.3} max_rank={}", i + 1, h.text, h.confidence, h.score, h.max_rank);
+            println!(
+                "{}. {}  conf={:.3} score={:.3} max_rank={}",
+                i + 1,
+                h.text,
+                h.confidence,
+                h.score,
+                h.max_rank
+            );
         }
     }
 }

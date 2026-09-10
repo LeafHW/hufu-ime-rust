@@ -38,13 +38,9 @@ fn main() {
         digit_codes: false,
     };
     let dict = schema.dict.clone();
-    let eng = hufu_sentence::SentenceEngine::load(
-        Path::new(ngram),
-        dict,
-        &schema.supplement,
-        weights,
-    )
-    .expect("ngram 加载失败");
+    let eng =
+        hufu_sentence::SentenceEngine::load(Path::new(ngram), dict, &schema.supplement, weights)
+            .expect("ngram 加载失败");
     let rr = hufu_rerank::Reranker::load(gguf).expect("重排模型加载失败");
 
     let text = std::fs::read_to_string(corpus).expect("语料读取失败");
@@ -149,8 +145,7 @@ fn best_code(schema: &Schema, ch: char) -> Option<String> {
             let better = match &best {
                 None => true,
                 Some((w, c)) => {
-                    e.weight > *w
-                        || (e.weight == *w && e.code.chars().count() < c.chars().count())
+                    e.weight > *w || (e.weight == *w && e.code.chars().count() < c.chars().count())
                 }
             };
             if better {
