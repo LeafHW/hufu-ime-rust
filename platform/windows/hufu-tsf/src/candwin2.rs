@@ -893,7 +893,7 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 0,
+                fade_ms: 120,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
@@ -1029,12 +1029,13 @@ impl CandidateWindowV2 {
             .map(|v| v / 96.0)
             .unwrap_or(dpi_scale);
         // 【动效 2026-09-11·虎爪对标】渐隐渐显 + 注释展开延时。
-        // 皮肤键（layout 节，缺省走代码默认）：fade_ms=0（默认关；开
-        // 启后若窗口被 DWM 提升到 MPO overlay，渐变退化为直接出现，
-        // 内容仍正确）、comment_delay_ms=400（0=注释常显）。
+        // 皮肤键（layout 节，缺省走代码默认）：fade_ms=120（0=关；
+        // DWM 把静态窄窗提升到 MPO overlay 时渐变退化为直接出现，
+        // 内容仍正确——生产路径弹窗必经尺寸增长，实测为合成态）、
+        // comment_delay_ms=400（0=注释常显）。
         let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
         let now = std::time::Instant::now();
-        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
+        self.fade_ms = layout_f(skin, "fade_ms", 120.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -1068,9 +1069,10 @@ impl CandidateWindowV2 {
             }
             self.last_show_at = Some(now);
         }
-        if !self.comments_expanded && cmt_delay > 0 {
+        if !self.comments_expanded && cmt_delay > 0 && !self.internal_rerender {
             // 连打期间逐帧重置倒计时（同 id SetTimer=重置）→ 停手
-            // delay 后补一帧全注释；展开后保持到本组段结束
+            // delay 后补一帧全注释；展开后保持到本组段结束。动效 tick
+            // 的内部复渲染不重置（否则渐显期每次 tick 都推迟展开）。
             unsafe {
                 let _ = SetTimer(self.hwnd, EXPAND_TIMER_ID, cmt_delay.max(1), None);
             }
@@ -2738,15 +2740,7 @@ impl CandidateWindowV2 {
                 }
             }
 
-            // 【动效帧即时呈现】半透明帧用 SyncInterval=0（跳 vsync 排
-            // 队）：MPO 提升锁定后 Present(1) 的半透帧被拍平（像素取证
-            // 反复证实）；Present(0) 走同步 blit 路径保持 alpha。稳态帧
-            // （layer 关）维持 Present(1) 防撕裂。
-            let hr = if fade_layer_on {
-                chain.Present(0, DXGI_PRESENT(0))
-            } else {
-                chain.Present(1, DXGI_PRESENT(0))
-            };
+            let hr = chain.Present(1, DXGI_PRESENT(0));
             if hr.is_err() {
                 crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
             }

@@ -382,9 +382,10 @@ fn main() {
         let an: AnimFn =
             std::mem::transmute(GetProcAddress(hmod, PCSTR(b"hufu_test_anim\0".as_ptr())).unwrap());
         let mask = unsafe { an() };
-        // 【断言口径 2026-09-11】bit1=注释延时展开 bit2=渐隐隐藏 为确定
-        // 性特性必过；bit0=渐显亮度 ramp 受 DWM MPO 提升拍平影响不可
-        // 靠（内容仍正确）——观察项。
+        // 【断言口径 2026-09-11】bit1=注释延时展开 bit2=渐隐隐藏 为确
+        // 定性项；bit0=渐显 ramp 在冒烟宿主（控制台进程）被 DWM 拍平
+        // 属宿主伪象——生产皮肤 master_alpha=0.68 日常半透合成正常，
+        // 真机以肉眼为准。
         assert_eq!(
             mask & 0b110,
             0b110,
@@ -393,7 +394,7 @@ fn main() {
         if mask & 1 != 0 {
             println!("[17] 动效 E2E ✓（展开/隐藏 + 渐显 ramp）");
         } else {
-            println!("[17] 动效 E2E ✓（展开/隐藏；渐显 ramp 被 MPO 拍平=已知限制）");
+            println!("[17] 动效 E2E ✓（展开/隐藏；渐显 ramp=宿主伪象拍平，真机肉眼验）");
         }
 
         // ── 音效池化连打：16 连击（4 句柄排队深度压力）不得崩/死锁 ──
