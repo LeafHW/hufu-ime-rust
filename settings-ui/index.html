@@ -332,7 +332,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <h3>动效</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：入场长大、尺寸过渡、跟光标滑动、退场淡出；关闭=一切瞬跳">候选窗动效</label></div>
-      <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="25" max="400" step="5" title="整体速度倍率：100%=默认速度；调小更快、调大更慢（作用于所有动效时长）"></div>
+      <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
@@ -675,7 +675,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
      在内存 CFG/SKIN，动作触发时一次全量发送（与原行为一致，仅收口）。 */
 const clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
 const NUM_CLAMPS = {
-  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0.25, 4] },
+  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0, 2] },
   layout: {
     font_point: [8, 72], label_font_point: [0, 72], width: [0, 1200], min_width: [0, 1200],
     margin_x: [0, 60], margin_y: [0, 60], corner_radius: [0, 40], hilited_corner_radius: [0, 40],
