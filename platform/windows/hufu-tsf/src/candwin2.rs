@@ -2193,25 +2193,74 @@ impl CandidateWindowV2 {
                 // 【拉伸动效】内容裁剪：动效帧中外壳小于目标布局——把
                 // 编码行/候选/注释裁在外壳内（增长=渐进露出，收拢=渐进
                 // 收起）；稳态帧不推（零开销）。
-                // 【回退方形 Clip 2026-09-11·终】圆角几何遮罩版（PushLayer
-                // +RoundedGeometry）在用户机器上引发「文字闪」（框不闪字
-                // 闪——层内内容逐帧丢画；本机取证无法复现=驱动差异），
-                // 历轮修补（maskTransform 单位阵等）均无效。用户定夺回退
-                // 到不闪的方形 Clip（毛玻璃移除版语义）。直角残边仅出现
-                // 在大尺寸动画的动画帧（起臂阈值 24/14 下普通打字不过
-                // 动画），可接受。
+                // 【圆角裁剪 v2 2026-09-11】方形 Clip 版无闪但切出直角。
+                // 换「阴影外遮罩」形态重试圆角：push_shadow_mask 自 v3
+                // 起在用户机每帧跑 PushLayer+圆角几何从未闪——差异在它
+                // 于 identity 变换+物理坐标下推层，而旧圆角版在 dpi 缩放
+                // 变换下推（用户驱动层内丢画仅见于后者）。照抄安全形态：
+                // SetTransform(单位阵)→物理坐标几何→±1e6 contentBounds→
+                // PushLayer→还原内容变换。几何失败兜底=方形 Clip（无闪）。
                 let chrome_clip_on = self.chrome_override.get().is_some();
+                let mut chrome_clip_via_layer = false;
                 if chrome_clip_on {
                     unsafe {
-                        ctx.PushAxisAlignedClip(
-                            &D2D_RECT_F {
-                                left: bx,
-                                top: by,
-                                right: bx + chw,
-                                bottom: by + chh,
-                            },
-                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        );
+                        let clip_rect = D2D_RECT_F {
+                            left: bx,
+                            top: by,
+                            right: bx + chw,
+                            bottom: by + chh,
+                        };
+                        let mut content_t = windows::Foundation::Numerics::Matrix3x2::default();
+                        ctx.GetTransform(&mut content_t as *mut _);
+                        let ident = windows::Foundation::Numerics::Matrix3x2 {
+                            M11: 1.0,
+                            M12: 0.0,
+                            M21: 0.0,
+                            M22: 1.0,
+                            M31: 0.0,
+                            M32: 0.0,
+                        };
+                        let geom: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> =
+                            ctx.GetFactory().ok().and_then(|f| {
+                                ctx.SetTransform(&ident);
+                                let g = f
+                                    .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: (shadow_m + bx) * dpi_scale,
+                                            top: (shadow_m + by) * dpi_scale,
+                                            right: (shadow_m + bx + chw) * dpi_scale,
+                                            bottom: (shadow_m + by + chh) * dpi_scale,
+                                        },
+                                        radiusX: radius * dpi_scale,
+                                        radiusY: radius * dpi_scale,
+                                    })
+                                    .ok()
+                                    .and_then(|g| g.cast().ok());
+                                ctx.SetTransform(&content_t);
+                                g
+                            });
+                        match geom {
+                            Some(g) => {
+                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
+                                lp.contentBounds = D2D_RECT_F {
+                                    left: -1.0e6,
+                                    top: -1.0e6,
+                                    right: 1.0e6,
+                                    bottom: 1.0e6,
+                                };
+                                lp.geometricMask = std::mem::ManuallyDrop::new(Some(g));
+                                lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                lp.maskTransform = ident;
+                                ctx.PushLayer(&lp, None);
+                                chrome_clip_via_layer = true;
+                            }
+                            None => {
+                                ctx.PushAxisAlignedClip(
+                                    &clip_rect,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -2547,10 +2596,14 @@ impl CandidateWindowV2 {
                         let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
                     }
                 } // draw_content
-                  // 【拉伸动效】内容裁剪收层（与上方 PushAxisAlignedClip 配对）
+                  // 【拉伸动效】内容裁剪收层（层路径=PopLayer；方形兜底=PopAxisAlignedClip）
                 if chrome_clip_on {
                     unsafe {
-                        ctx.PopAxisAlignedClip();
+                        if chrome_clip_via_layer {
+                            ctx.PopLayer();
+                        } else {
+                            ctx.PopAxisAlignedClip();
+                        }
                     }
                 }
 
