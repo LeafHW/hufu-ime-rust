@@ -1296,11 +1296,12 @@ impl EditSession_Impl {
                 // range 自锚定，选区只在 StartPreedit 建段时设一次；
                 // Commit/上屏路径不受影响（EndComposition 后宿主按组段
                 // 末尾放置插入点）。
-                // 【锚组段起点宿主：段内零 GetTextExt】非跟随宿主组段
+                // 【锚组段起点宿主：段内零 GetTextExt】唯虎魄跟打器组段
                 // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
-                // 只会把布局锁压力（每次×2 连查）无谓压给宿主（虎魄
-                // 跟打器卡顿根因）。跟随宿主/锚点缺失/首帧补显（懒布局
-                // 首查常为旧行框，补显必须重拿稳定值）才查。
+                // 只会把布局锁压力（每次×2 连查）无谓压给宿主（卡顿
+                // 根因）。跟随宿主/锚点缺失/首帧补显（懒布局首查常为
+                // 旧行框，补显必须重拿稳定值）才查。【2026-09-11 默认
+                // 跟随后】常规宿主全部逐键查询（标准 IME 行为）。
                 if host_follow_caret() || g.caret.is_none() || g.caret_force {
                     query_caret(&mut g, &ctx, ec);
                 }
@@ -1661,16 +1662,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: Clone 失败");
         return;
     };
-    // 候选窗锚点按宿主分化：
-    // - 跟随宿主（晴跟打Pro，整句长编码场景）：锚 END（光标处）。
-    //   长编码段光标持续前进，窗钉在段首会越离越远。
-    // - 其余宿主（含虎魄跟打器）：锚 START（组段起始）——编码期间
-    //   位置恒定，逐键右移的「跳」由此消除；首帧错位另由稳定期抑制。
-    //   【2026-09-08 虎魄移出跟随名单】跟随=每键 GetTextExt×2（强迫
-    //   懒布局收敛）——跑在跟打器布局引擎上的同步调用，布局锁被大
-    //   范围重排占住时卡秒级（用户实测 02:23:49 卡 5.1s，卡点在
-    //   SetPreedit 会话内 GetTextExt；换虎爪输入法不卡——虎爪无逐键
-    //   布局查询）。虎魄改锚组段起点：段内零查询，首键查一次定位。
+    // 候选窗锚点按宿主分化（【默认跟随光标 2026-09-11】用户拍板）：
+    // - 默认（全部常规宿主+晴跟打Pro）：锚 END（最新光标处）——候选
+    //   框最左=最新光标，逐键前进由位置滑动动效平滑化。
+    // - 虎魄跟打器：锚 START（组段起始）+段内零查询——其布局锁下
+    //   每键 GetTextExt×2（强迫懒布局收敛）卡秒级（2026-09-08 实测
+    //   5.1s，卡点在 SetPreedit 会话内 GetTextExt）。
     let anchor = if host_follow_caret() {
         TF_ANCHOR_END
     } else {
@@ -2904,11 +2901,17 @@ fn host_async_layout() -> bool {
 fn host_follow_caret() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
+        // 【默认跟随光标 2026-09-11 用户拍板】候选框最左=最新光标处。
+        // 全部宿主默认锚 END（光标）——逐键前进由位置滑动动效平滑化
+        //（旧锁组段起点是为消逐键跳变，滑动动效落地后该理由失效）。
+        // 唯一例外：虎魄跟打器——其布局锁下段内逐键 GetTextExt×2
+        // 卡秒级（2026-09-08 实测 5.1s），保持锚组段起点+段内零查询。
+        // 晴跟打Pro 原本就在跟随名单（不变）。
         std::env::current_exe()
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.contains("晴"))
-            .unwrap_or(false)
+            .map(|n| !n.contains("虎魄"))
+            .unwrap_or(true)
     })
 }
 
