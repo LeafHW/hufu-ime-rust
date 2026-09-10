@@ -47,13 +47,24 @@ const AC_SRC_OVER: u8 = 1;
 const AC_SRC_ALPHA: u8 = 1;
 
 #[repr(C)]
-struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
+struct RECT {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
 
 #[repr(C)]
-struct POINT { x: i32, y: i32 }
+struct POINT {
+    x: i32,
+    y: i32,
+}
 
 #[repr(C)]
-struct SIZE { cx: i32, cy: i32 }
+struct SIZE {
+    cx: i32,
+    cy: i32,
+}
 
 #[repr(C)]
 struct WNDCLASSW {
@@ -105,9 +116,18 @@ extern "system" {
     /// 忙碌光标（开始菜单/UWP 里实测「沙漏/转圈」）——显式加载箭头。
     fn LoadCursorW(inst: isize, name: *const u16) -> isize;
     fn CreateWindowExW(
-        ex: u32, cls: *const u16, name: *const u16, style: u32,
-        x: i32, y: i32, w: i32, h: i32, parent: isize, menu: isize,
-        inst: isize, param: *const core::ffi::c_void,
+        ex: u32,
+        cls: *const u16,
+        name: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        parent: isize,
+        menu: isize,
+        inst: isize,
+        param: *const core::ffi::c_void,
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetClientRect(hwnd: isize, r: *mut RECT) -> i32;
@@ -119,9 +139,15 @@ extern "system" {
     fn IsWindow(hwnd: isize) -> i32;
     fn IsWindowVisible(hwnd: isize) -> i32;
     fn UpdateLayeredWindow(
-        hwnd: isize, hdcdst: isize, pptdst: *const POINT, psize: *const SIZE,
-        hdcsrc: isize, pptsrc: *const POINT, crkey: u32,
-        pblend: *const BLENDFUNCTION, flags: u32,
+        hwnd: isize,
+        hdcdst: isize,
+        pptdst: *const POINT,
+        psize: *const SIZE,
+        hdcsrc: isize,
+        pptsrc: *const POINT,
+        crkey: u32,
+        pblend: *const BLENDFUNCTION,
+        flags: u32,
     ) -> i32;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -132,9 +158,19 @@ extern "system" {
 extern "system" {
     fn DeleteObject(o: isize) -> i32;
     fn CreateFontW(
-        h: i32, w: i32, esc: i32, orient: i32, weight: i32,
-        italic: u32, underline: u32, strikeout: u32, charset: u32,
-        outprec: u32, clipprec: u32, quality: u32, pitch: u32,
+        h: i32,
+        w: i32,
+        esc: i32,
+        orient: i32,
+        weight: i32,
+        italic: u32,
+        underline: u32,
+        strikeout: u32,
+        charset: u32,
+        outprec: u32,
+        clipprec: u32,
+        quality: u32,
+        pitch: u32,
         face: *const u16,
     ) -> isize;
     fn SelectObject(hdc: isize, o: isize) -> isize;
@@ -145,8 +181,12 @@ extern "system" {
     fn CreateCompatibleDC(hdc: isize) -> isize;
     fn DeleteDC(hdc: isize) -> i32;
     fn CreateDIBSection(
-        hdc: isize, bmi: *const BITMAPINFO, usage: u32,
-        bits: *mut *mut core::ffi::c_void, section: isize, offset: u32,
+        hdc: isize,
+        bmi: *const BITMAPINFO,
+        usage: u32,
+        bits: *mut *mut core::ffi::c_void,
+        section: isize,
+        offset: u32,
     ) -> isize;
     fn GdiFlush() -> i32;
 }
@@ -163,12 +203,7 @@ fn parse_hex4(s: &str) -> Option<(u8, u8, u8, u8)> {
         return None;
     }
     let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
-    Some((
-        b(0)?,
-        b(2)?,
-        b(4)?,
-        if s.len() == 8 { b(6)? } else { 255 },
-    ))
+    Some((b(0)?, b(2)?, b(4)?, if s.len() == 8 { b(6)? } else { 255 }))
 }
 
 fn skin_color4(skin: &serde_json::Value, key: &str, default: &str) -> (u8, u8, u8, u8) {
@@ -207,7 +242,11 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: i32, h: i32) -> Canvas {
-        Canvas { w, h, px: vec![0.0; (w as usize) * (h as usize) * 4] }
+        Canvas {
+            w,
+            h,
+            px: vec![0.0; (w as usize) * (h as usize) * 4],
+        }
     }
 }
 
@@ -240,7 +279,11 @@ fn sd_round_rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -
 /// 会呈现为不透明（实测底色 #262626@68% 显示成纯 #262626）
 fn fill_round_rect(
     c: &mut Canvas,
-    x0: f32, y0: f32, x1: f32, y1: f32, r: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
     col: (u8, u8, u8, u8),
 ) {
     let (rb, gb, rb_, ra) = (
@@ -270,7 +313,12 @@ fn fill_round_rect(
 /// 描边圆角矩形（宽 bw，带 AA），预乘 src
 fn stroke_round_rect(
     c: &mut Canvas,
-    x0: f32, y0: f32, x1: f32, y1: f32, r: f32, bw: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    bw: f32,
     col: (u8, u8, u8, u8),
 ) {
     let (rb, gb, rb_, ra) = (
@@ -287,8 +335,13 @@ fn stroke_round_rect(
     for y in ya..yb {
         for x in xa..xb {
             let d = sd_round_rect(
-                x as f32 + 0.5, y as f32 + 0.5,
-                x0 + inset, y0 + inset, x1 - inset, y1 - inset, (r - inset).max(0.0),
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                x0 + inset,
+                y0 + inset,
+                x1 - inset,
+                y1 - inset,
+                (r - inset).max(0.0),
             );
             let cov = (bw * 0.5 + 0.5 - d.abs()).clamp(0.0, 1.0);
             if cov <= 0.0 {
@@ -304,8 +357,12 @@ fn stroke_round_rect(
 /// 把 GDI 灰度 AA 文字的 coverage 合成进画布（文字色 col）
 fn composite_text(
     c: &mut Canvas,
-    cov_bits: &[u8], pitch: usize,
-    bx: i32, by: i32, bw: i32, bh: i32,
+    cov_bits: &[u8],
+    pitch: usize,
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh: i32,
     col: (u8, u8, u8, u8),
 ) {
     let (rb, gb, rb_, base_a) = (
@@ -327,9 +384,8 @@ fn composite_text(
             // 【坐标病根】coverage 在 DIB 里是绝对位置 (bx+colx, by+row)
             // ——曾按相对索引读左上角空白区，文字全部丢失（窗口只剩
             // 底板+胶囊的空面板，用户实测 Store 候选无字即此）
-            let cov = cov_bits[((by + row) as usize) * pitch + ((bx + colx) as usize) * 4]
-                as f32
-                / 255.0;
+            let cov =
+                cov_bits[((by + row) as usize) * pitch + ((bx + colx) as usize) * 4] as f32 / 255.0;
             if cov <= 0.0 {
                 continue;
             }
@@ -352,33 +408,10 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
     // ── 皮肤参数（与 candwin2 show() 同公式）──
     let font_pt = skin_layout(skin, "font_point", 16.0);
     let radius = skin_layout(skin, "corner_radius", 8.0) * s;
-    // 【玻璃独立留白 2026-09-10】kind 判定提前：毛玻璃用 material.
-    // glass_margin_x/y（默认 1，与 DLL 侧同款独立两套），非玻璃沿用
-    // layout.margin_x/y。
-    let kind_early = skin
-        .pointer("/skin/material/kind")
-        .or_else(|| skin.get("material").and_then(|m| m.get("kind")))
-        .and_then(|x| x.as_str())
-        .unwrap_or("solid");
-    let mat_f = |key: &str, dflt: f32| -> f32 {
-        skin.pointer(("/skin/material/".to_string() + key).as_str())
-            .or_else(|| skin.get("material").and_then(|m| m.get(key)))
-            .and_then(|x| x.as_f64())
-            .map(|x| x as f32)
-            .unwrap_or(dflt)
-    };
-    let (margin_x, margin_y) = if kind_early == "glass" {
-        // 【玻璃留白字号联动 2026-09-10】比例跟随在数据层
-        //（scale_glass_geometry，与 DLL 同注释）——此处直读。
-        (mat_f("glass_margin_x", 4.0) * s, mat_f("glass_margin_y", 4.0) * s)
-    } else {
-        (
-            skin_layout(skin, "margin_x", 8.0) * s,
-            skin_layout(skin, "margin_y", 5.0) * s,
-        )
-    };
-    let line_h =
-        (font_pt * 96.0 / 72.0 + skin_layout(skin, "line_spacing", 3.0) + 5.0) * s;
+    // 【毛玻璃退役 2026-09-11】玻璃独立留白/零偏移分支删除，单一来源
+    let margin_x = skin_layout(skin, "margin_x", 8.0) * s;
+    let margin_y = skin_layout(skin, "margin_y", 5.0) * s;
+    let line_h = (font_pt * 96.0 / 72.0 + skin_layout(skin, "line_spacing", 3.0) + 5.0) * s;
     let width_cfg = skin_layout(skin, "width", 0.0) * s;
     let min_width = (skin_layout(skin, "min_width", 150.0) * s).max(100.0);
     let label_pt = skin_layout(skin, "label_font_point", 0.0) * s;
@@ -394,14 +427,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
 
     // 投影（多层外扩衰减）
     let shadow_radius = (skin_layout(skin, "shadow_radius", 6.0) * s).clamp(0.0, 24.0 * s);
-    // 【玻璃零偏移 2026-09-09】毛玻璃模式不允许阴影偏移（与 DLL 侧钳制
-    // 同款——server 代画窗也保持一致语义）
-    //（kind_early 已提前到 margin 读取处【2026-09-10】，此处直接复用）
-    let shadow_off_y = if kind_early == "glass" {
-        0.0
-    } else {
-        skin_layout(skin, "shadow_offset_y", 0.0) * s
-    };
+    let shadow_off_y = skin_layout(skin, "shadow_offset_y", 0.0) * s;
     let has_shadow = shadow_radius >= 1.0;
     let shadow_m = if has_shadow {
         (shadow_radius * 1.6 + (5.0 * s) + shadow_off_y.abs()).ceil() as i32
@@ -448,8 +474,20 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
         // 灰度 AA（quality=4）：coverage 通道一致，ClearType 会偏色
         let mk_font = |h: f32| {
             CreateFontW(
-                -(h.max(4.0).round() as i32), 0, 0, 0, 400, 0, 0, 0,
-                0x86 /*DEFAULT_CHARSET*/, 0, 0, 4 /*ANTIALIASED*/, 0, face.as_ptr(),
+                -(h.max(4.0).round() as i32),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                0x86, /*DEFAULT_CHARSET*/
+                0,
+                0,
+                4, /*ANTIALIASED*/
+                0,
+                face.as_ptr(),
             )
         };
         let h_main = mk_font(em);
@@ -479,7 +517,11 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
         let mut max_cmt = 0.0f32;
         for (t, c) in f.items.iter().take(n) {
             max_text = max_text.max(measure(h_main, t));
-            let cw = if c.is_empty() { 0.0 } else { measure(h_small, c) };
+            let cw = if c.is_empty() {
+                0.0
+            } else {
+                measure(h_small, c)
+            };
             if !c.is_empty() {
                 max_cmt = max_cmt.max(cw);
             }
@@ -546,7 +588,14 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
         fill_round_rect(&mut canvas, m, m, m + width, m + height, radius, bg_col);
         if border_w > 0.0 {
             stroke_round_rect(
-                &mut canvas, m, m, m + width, m + height, radius, border_w, border_col,
+                &mut canvas,
+                m,
+                m,
+                m + width,
+                m + height,
+                radius,
+                border_w,
+                border_col,
             );
         }
 
@@ -633,7 +682,8 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                     let mut bot = -1i32;
                     for row in 0..ph {
                         for col in 0..=pw {
-                            if (bits as *const u8).add(row as usize * pitch + col as usize * 4)
+                            if (bits as *const u8)
+                                .add(row as usize * pitch + col as usize * 4)
                                 .read_volatile()
                                 > 0
                             {
@@ -657,7 +707,13 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
             }
 
             // 一段文字：清 bbox → 画 → coverage 合成
-            let mut draw_text = |canvas: &mut Canvas, hf: isize, s: &str, x: f32, y_row: f32, fh: f32, col: (u8, u8, u8, u8)| {
+            let mut draw_text = |canvas: &mut Canvas,
+                                 hf: isize,
+                                 s: &str,
+                                 x: f32,
+                                 y_row: f32,
+                                 fh: f32,
+                                 col: (u8, u8, u8, u8)| {
                 if s.is_empty() || hf == 0 {
                     return;
                 }
@@ -674,9 +730,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                     let off = ((by.max(0) + row) as usize) * pitch + (bx.max(0) as usize) * 4;
                     let cnt = (bw.min(w_out - bx.max(0))).max(0) as usize * 4;
                     if off + cnt <= bits as usize + pitch * h_out as usize {
-                        std::ptr::write_bytes(
-                            (bits as *mut u8).add(off), 0, cnt,
-                        );
+                        std::ptr::write_bytes((bits as *mut u8).add(off), 0, cnt);
                     }
                 }
                 let ws: Vec<u16> = s.encode_utf16().collect();
@@ -684,14 +738,32 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                 let _ = TextOutW(hdc, bx, by, ws.as_ptr(), ws.len() as i32);
                 let _ = SelectObject(hdc, old_f);
                 let _ = GdiFlush();
-                composite_text(canvas, std::slice::from_raw_parts(bits as *const u8, pitch * h_out as usize), pitch, bx, by, bw, bh, col);
+                composite_text(
+                    canvas,
+                    std::slice::from_raw_parts(bits as *const u8, pitch * h_out as usize),
+                    pitch,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    col,
+                );
             };
 
             // 编码行（【文字恒满】alpha 强制 255——任何透明设置不影响文字）
             if !f.raw.is_empty() {
                 draw_text(
-                    &mut canvas, h_main, &f.raw, m + margin_x, m + margin_y, em,
-                    { let mut c = skin_color4(skin, "text_color", "#E8E8EAFF"); c.3 = 255; c },
+                    &mut canvas,
+                    h_main,
+                    &f.raw,
+                    m + margin_x,
+                    m + margin_y,
+                    em,
+                    {
+                        let mut c = skin_color4(skin, "text_color", "#E8E8EAFF");
+                        c.3 = 255;
+                        c
+                    },
                 );
             }
             // 候选行
@@ -736,28 +808,60 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                 let y = y0 + (line_h + cand_spacing) * i as f32;
                 let is_sel = i == sel;
                 let c_label = if is_sel {
-                    let mut c = skin_color4(skin, "hilited_candidate_label_color", "#FFD75EFF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "hilited_candidate_label_color", "#FFD75EFF");
+                    c.3 = 255;
+                    c
                 } else {
-                    let mut c = skin_color4(skin, "label_color", "#C9C9C9FF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "label_color", "#C9C9C9FF");
+                    c.3 = 255;
+                    c
                 };
                 let c_text = if is_sel {
-                    let mut c = skin_color4(skin, "hilited_candidate_text_color", "#FFFFFFFF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "hilited_candidate_text_color", "#FFFFFFFF");
+                    c.3 = 255;
+                    c
                 } else {
-                    let mut c = skin_color4(skin, "candidate_text_color", "#E8E8EAFF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "candidate_text_color", "#E8E8EAFF");
+                    c.3 = 255;
+                    c
                 };
                 let c_cmt = if is_sel {
-                    let mut c = skin_color4(skin, "hilited_comment_text_color", "#C9C9C9FF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "hilited_comment_text_color", "#C9C9C9FF");
+                    c.3 = 255;
+                    c
                 } else {
-                    let mut c = skin_color4(skin, "comment_text_color", "#9A9AA0FF"); c.3 = 255; c
+                    let mut c = skin_color4(skin, "comment_text_color", "#9A9AA0FF");
+                    c.3 = 255;
+                    c
                 };
                 if show_index {
-                    draw_text(&mut canvas, h_label, &format!("{}.", i + 1), m + margin_x, m + y, if label_pt > 0.0 { label_pt * 96.0 / 72.0 } else { em * 0.78 }, c_label);
+                    draw_text(
+                        &mut canvas,
+                        h_label,
+                        &format!("{}.", i + 1),
+                        m + margin_x,
+                        m + y,
+                        if label_pt > 0.0 {
+                            label_pt * 96.0 / 72.0
+                        } else {
+                            em * 0.78
+                        },
+                        c_label,
+                    );
                 }
                 draw_text(&mut canvas, h_main, text, m + text_x, m + y, em, c_text);
                 if !cmt.is_empty() && cmt_budget > 0.0 {
                     let shown = trunc_cmt(cmt, cmt_budget);
                     if !shown.is_empty() {
-                        draw_text(&mut canvas, h_small, &shown, m + cmt_x, m + y, em * 0.78, c_cmt);
+                        draw_text(
+                            &mut canvas,
+                            h_small,
+                            &shown,
+                            m + cmt_x,
+                            m + y,
+                            em * 0.78,
+                            c_cmt,
+                        );
                     }
                 }
             }
@@ -799,13 +903,20 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
             // 【DPI】窗口实际 DPI → 布局缩放（进程已声明 Per-Monitor V2）
             let dpi = GetDpiForWindow(hwnd);
             let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
-            let (w_out, h_out, bytes, shadow_m) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_frame(&frame, scale))) {
-                Ok(v) => v,
-                Err(_) => {
-                    let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\ulw-dbg.txt", "render_frame PANIC\n");
-                    return 0;
-                }
-            };            *frame_lock() = Some(*frame);
+            let (w_out, h_out, bytes, shadow_m) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_frame(&frame, scale)
+                })) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = std::fs::write(
+                            r"C:\ProgramData\HuFu\diag\ulw-dbg.txt",
+                            "render_frame PANIC\n",
+                        );
+                        return 0;
+                    }
+                };
+            *frame_lock() = Some(*frame);
             let x = (wparam >> 32) as i32;
             let y = (wparam as u32) as i32;
             // 内容锚点 (x,y) → 窗口原点 = (x-m, y-m)（投影边距外扩）
@@ -849,14 +960,19 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
                     alpha_format: AC_SRC_ALPHA,
                 };
                 let pt_dst = POINT { x: wx, y: wy };
-                let sz = SIZE { cx: w_out, cy: h_out };
+                let sz = SIZE {
+                    cx: w_out,
+                    cy: h_out,
+                };
                 let pt_src = POINT { x: 0, y: 0 };
-                let ulw_r = UpdateLayeredWindow(
-                    hwnd, 0, &pt_dst, &sz, hdc, &pt_src, 0, &blend, ULW_ALPHA,
-                );
+                let ulw_r =
+                    UpdateLayeredWindow(hwnd, 0, &pt_dst, &sz, hdc, &pt_src, 0, &blend, ULW_ALPHA);
                 if ulw_r == 0 {
                     let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-                    let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\ulw-dbg.txt", "UpdateLayeredWindow FAILED\n");
+                    let _ = std::fs::write(
+                        r"C:\ProgramData\HuFu\diag\ulw-dbg.txt",
+                        "UpdateLayeredWindow FAILED\n",
+                    );
                 }
                 let _ = SelectObject(hdc, old);
                 let _ = DeleteObject(dib);
@@ -897,12 +1013,22 @@ fn mark_raised() {
 unsafe fn force_top(hwnd: isize, rebanded: bool) {
     if rebanded {
         let _ = SetWindowPos(
-            hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
         );
     }
     let _ = SetWindowPos(
-        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
         SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
     );
     let _ = BringWindowToTop(hwnd);
@@ -929,7 +1055,10 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
                 }
             }
             let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-            let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\srv-cand.txt", "show: 窗口已死，请求重建\n");
+            let _ = std::fs::write(
+                r"C:\ProgramData\HuFu\diag\srv-cand.txt",
+                "show: 窗口已死，请求重建\n",
+            );
             return;
         }
     }
@@ -938,7 +1067,10 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
         None => {
             if srv_cand_dbg() {
                 let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-                let _ = std::fs::write(r"C:\ProgramData\HuFu\diag\srv-cand.txt", "show: WND=None（窗口未建）\n");
+                let _ = std::fs::write(
+                    r"C:\ProgramData\HuFu\diag\srv-cand.txt",
+                    "show: WND=None（窗口未建）\n",
+                );
             }
             return;
         }
@@ -1013,8 +1145,13 @@ pub fn init_on_tray_thread() {
             class.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
-            0, 0, 200, 60,
-            0, 0, 0,
+            0,
+            0,
+            200,
+            60,
+            0,
+            0,
+            0,
             std::ptr::null(),
         )
     };

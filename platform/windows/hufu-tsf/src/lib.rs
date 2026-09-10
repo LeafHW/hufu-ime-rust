@@ -307,7 +307,7 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     }
 }
 
-/// 测试钩子：驱动候选窗 v2（D3D11+DComp+D2D+Acrylic accent）完整渲染一帧。
+/// 测试钩子：驱动候选窗 v2（D3D11+DComp+D2D）完整渲染一帧。
 /// 返回 1 = 管线全通（设备/链/渲染/Present），0 = 初始化或渲染失败。
 #[no_mangle]
 extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
@@ -316,7 +316,7 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
         eprintln!("candwin2: 初始化失败（回退 v1 路径可用）");
         return 0;
     };
-    // 皮肤：优先从引擎取（材质 accent 用得上），失败用默认 frosted 样例
+    // 皮肤：优先从引擎取，失败用默认 translucent 样例
     let mut skin = crate::ipc::call(&serde_json::json!({"op": "skin"})).unwrap_or_else(|| {
         serde_json::json!({
             "skin": {
@@ -334,16 +334,14 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
                 "layout": { "font_point": 17.6, "corner_radius": 8.0,
                             "hilited_corner_radius": 6.0, "border_width": 1.0,
                             "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0 },
-                "material": { "kind": "frosted", "tint": "#1C1C1ECC" }
+                "material": { "kind": "translucent" }
             }
         })
     });
-    // mode: 0=solid 1=translucent 2=frosted(acrylic) 3=glass —— 轮一遍材质
-    let kind = match mode % 4 {
+    // mode: 0=solid 1=translucent —— 材质轮测（毛玻璃已退役）
+    let kind = match mode % 2 {
         0 => "solid",
-        1 => "translucent",
-        2 => "frosted",
-        _ => "glass",
+        _ => "translucent",
     };
     if let Some(s) = skin.get_mut("skin").and_then(|s| s.as_object_mut()) {
         if let Some(m) = s.get_mut("material").and_then(|m| m.as_object_mut()) {
@@ -809,6 +807,151 @@ extern "system" fn hufu_test_anim() -> i32 {
     // 【断言口径】bit1（注释延时展开）+ bit2（渐隐隐藏）为确定性特性；
     // bit0（渐显亮度 ramp）受 DWM MPO 提升影响不可靠——观察项，返回
     // 原始 mask 由调用方按口径断言。
+    mask as i32
+}
+
+/// 测试钩子：动效×缩放比例 100%~500% 矩阵（HUFU_FAKE_DPI 伪造高 DPI，
+/// 与阴影缩放取证同款旋钮）。每个比例跑完整入场动效周期：首显起臂
+/// （size_anim 武装）→ tick 推进到完成（chrome_override 清空）→ 渲染
+/// 尺寸随比例放大（≥100%×基础）。返回位掩码 bit_i=第 i 档通过，
+/// 0x1FF=9 档全通（100/125/150/175/200/250/300/400/500%）。
+#[no_mangle]
+extern "system" fn hufu_test_anim_scales() -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, IsWindowVisible, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    const SCALES: [f64; 9] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
+    let skin = serde_json::json!({
+        "skin": {
+            "colors": {
+                "back_color": "#202022E6", "border_color": "#FFFFFF40",
+                "text_color": "#FFFFFFFF", "candidate_text_color": "#FFFFFFFF",
+                "comment_text_color": "#FFDDDDFF", "label_color": "#FFFFFFCC",
+                "hilited_candidate_back_color": "#CC0000FF",
+                "hilited_candidate_text_color": "#FFFFFFFF"
+            },
+            "layout": { "font_point": 17.6, "corner_radius": 8.0,
+                        "hilited_corner_radius": 6.0, "border_width": 1.0,
+                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0 },
+            "material": { "kind": "solid" }
+        }
+    });
+    let cands = vec![
+        ("你好".to_string(), "ni hao".to_string()),
+        ("您好".to_string(), "".to_string()),
+        ("拟好".to_string(), "少用".to_string()),
+    ];
+    let anchor = RECT {
+        left: 160,
+        top: 160,
+        right: 160,
+        bottom: 184,
+    };
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return 0;
+    };
+    let shared = gsh.0.clone();
+    let saved = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    let mut mask = 0u32;
+    let mut base_w = 0i32;
+    for (i, sc) in SCALES.iter().enumerate() {
+        // 伪造 DPI（与阴影取证同旋钮）——env 进程内生效
+        std::env::set_var("HUFU_FAKE_DPI", format!("{}", (sc * 96.0) as i32));
+        let Some(w) = CandidateWindowV2::new() else {
+            continue;
+        };
+        let hwnd = w.hwnd;
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.cand2 = Some(w);
+            g.last_show = Some((cands.clone(), "nih".to_string(), 0));
+            g.skin = skin.clone();
+            if let Some(c) = g.cand2.as_mut() {
+                // 静默门外（首显）→ 高亮锚定入场起臂
+                c.last_hide_at = None;
+                c.show(&cands, "nih", &skin, Some(&anchor), 0);
+            }
+        }
+        // 起臂判定：入场动画已武装
+        let armed = {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.cand2
+                .as_ref()
+                .map(|c| c.size_anim.is_some())
+                .unwrap_or(false)
+        };
+        // 推进 tick 至完成（15ms×N，留 3×余量；90ms 默认 + 高 DPI 渲染）
+        let t0 = std::time::Instant::now();
+        let mut done = false;
+        let mut vis = false;
+        let mut fin_w = 0i32;
+        while t0.elapsed().as_millis() < 1200 {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.last_key_at = Some(std::time::Instant::now());
+            }
+            let (anim_on, cw2) = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    g.cand2
+                        .as_ref()
+                        .map(|c| c.size_anim.is_some())
+                        .unwrap_or(false),
+                    g.cand2
+                        .as_ref()
+                        .map(|c| c.content_size.get())
+                        .unwrap_or((0, 0)),
+                )
+            };
+            vis |= unsafe { IsWindowVisible(hwnd).as_bool() };
+            fin_w = fin_w.max(cw2.0);
+            if armed && !anim_on {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        if i == 0 {
+            base_w = fin_w;
+        }
+        // 通过口径：起臂 + 推进完成 + 可见 + 物理宽随档位走（≥基准，
+        // 175% 以上允许 1.6×——高 DPI 留白同乘）
+        let scaled_ok = base_w <= 0 || fin_w as f64 >= base_w as f64 * 0.95;
+        let ok = armed && done && vis && scaled_ok;
+        if ok {
+            mask |= 1 << i;
+        }
+        eprintln!(
+            "anim-scale {:3}%: armed={armed} done={done} vis={vis} w={fin_w}（base={base_w}）{}",
+            (sc * 100.0) as i32,
+            if ok { "✓" } else { "✗" }
+        );
+        // 清理本档窗口
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let mine = g.cand2.take();
+            drop(mine);
+        }
+    }
+    std::env::remove_var("HUFU_FAKE_DPI");
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2 = saved;
+    }
+    eprintln!("anim-scales: mask={mask:09b}（0x1FF=9 档全通）");
     mask as i32
 }
 

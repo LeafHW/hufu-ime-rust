@@ -19,15 +19,42 @@ struct RerankJob {
 /// 【2026-09-08 模块级】供 install_official_skins（缺失自愈）与
 /// reset_official_skin（按皮肤恢复出厂）共用。
 const OFFICIAL_SKINS: &[(&str, &str)] = &[
-    ("hufu-default.json", include_str!("../official-skins/hufu-default.json")),
-    ("hufu-yingxiong.json", include_str!("../official-skins/hufu-yingxiong.json")),
-    ("hufu-rongyan.json", include_str!("../official-skins/hufu-rongyan.json")),
-    ("hufu-moyan.json", include_str!("../official-skins/hufu-moyan.json")),
-    ("hufu-qingci.json", include_str!("../official-skins/hufu-qingci.json")),
-    ("hufu-mushan.json", include_str!("../official-skins/hufu-mushan.json")),
-    ("hufu-canghai.json", include_str!("../official-skins/hufu-canghai.json")),
-    ("hufu-shiyou.json", include_str!("../official-skins/hufu-shiyou.json")),
-    ("hufu-songyan.json", include_str!("../official-skins/hufu-songyan.json")),
+    (
+        "hufu-default.json",
+        include_str!("../official-skins/hufu-default.json"),
+    ),
+    (
+        "hufu-yingxiong.json",
+        include_str!("../official-skins/hufu-yingxiong.json"),
+    ),
+    (
+        "hufu-rongyan.json",
+        include_str!("../official-skins/hufu-rongyan.json"),
+    ),
+    (
+        "hufu-moyan.json",
+        include_str!("../official-skins/hufu-moyan.json"),
+    ),
+    (
+        "hufu-qingci.json",
+        include_str!("../official-skins/hufu-qingci.json"),
+    ),
+    (
+        "hufu-mushan.json",
+        include_str!("../official-skins/hufu-mushan.json"),
+    ),
+    (
+        "hufu-canghai.json",
+        include_str!("../official-skins/hufu-canghai.json"),
+    ),
+    (
+        "hufu-shiyou.json",
+        include_str!("../official-skins/hufu-shiyou.json"),
+    ),
+    (
+        "hufu-songyan.json",
+        include_str!("../official-skins/hufu-songyan.json"),
+    ),
 ];
 
 pub struct Host {
@@ -458,7 +485,10 @@ impl Host {
                 }
             })
             .ok();
-        eprintln!("神经重排线程就绪（模型 {}，去抖 {debounce}ms）", model.display());
+        eprintln!(
+            "神经重排线程就绪（模型 {}，去抖 {debounce}ms）",
+            model.display()
+        );
         self.rerank_tx = Some(tx);
     }
 
@@ -475,7 +505,10 @@ impl Host {
     /// 输出 数据\码表导出\<方案名> <yyyyMMdd-HHmm>.txt，返回 (路径, 行数)。
     pub fn export_schema(&self, name: Option<&str>) -> Result<(String, usize), String> {
         let current = self.engine.config.schema.current.clone();
-        let target = name.filter(|n| !n.is_empty()).unwrap_or(&current).to_string();
+        let target = name
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&current)
+            .to_string();
         if target != current {
             let dir = hufu_engine::Engine::resolve_data_sub(
                 &self.data_dir,
@@ -485,8 +518,7 @@ impl Host {
             if !dir.is_dir() {
                 return Err(format!("方案目录不存在: {target}"));
             }
-            let schema = hufu_dict::Schema::load(&dir)
-                .map_err(|e| format!("方案加载失败: {e}"))?;
+            let schema = hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
             let out = self.export_out_path(&target);
             let n = export_util::export_one(&schema, &out)?;
             return Ok((out.to_string_lossy().into_owned(), n));
@@ -549,12 +581,8 @@ impl Host {
                     let n = self.session.tail_context.chars().count();
                     if n > 32 {
                         let skip = n - 32;
-                        self.session.tail_context = self
-                            .session
-                            .tail_context
-                            .chars()
-                            .skip(skip)
-                            .collect();
+                        self.session.tail_context =
+                            self.session.tail_context.chars().skip(skip).collect();
                     }
                 }
             }
@@ -610,7 +638,11 @@ impl Host {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().map(|x| x == "json").unwrap_or(false) {
-                    let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let id = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     let name = hufu_skin::Skin::load(&p)
                         .map(|s| s.name)
                         .unwrap_or_else(|_| id.clone());
@@ -656,7 +688,10 @@ pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
             KeyCode::Char(c)
         }
     };
-    let m = v.get("modifiers").cloned().unwrap_or(serde_json::Value::Null);
+    let m = v
+        .get("modifiers")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let modifiers = Modifiers {
         shift: m.get("shift").and_then(|x| x.as_bool()).unwrap_or(false),
         ctrl: m.get("ctrl").and_then(|x| x.as_bool()).unwrap_or(false),
@@ -699,12 +734,7 @@ mod export_util {
     /// 拍板：导出语义只有「用户调整 + 原始码表」合一）。
     pub fn export_one(schema: &Schema, out_path: &std::path::Path) -> Result<usize, String> {
         // 1) 编码全集：码表条目 ∪ 用户词条目（/jc 加词的码可能不在码表）
-        let mut codes: Vec<String> = schema
-            .dict
-            .entries
-            .iter()
-            .map(|e| e.code.clone())
-            .collect();
+        let mut codes: Vec<String> = schema.dict.entries.iter().map(|e| e.code.clone()).collect();
         codes.extend(schema.user_dict.entries.iter().map(|e| e.code.clone()));
         codes.sort();
         codes.dedup();
@@ -712,8 +742,11 @@ mod export_util {
         // 2) 逐码取当前生效序
         let mut rows: Vec<(String, Vec<String>)> = Vec::new();
         for code in &codes {
-            let texts: Vec<String> =
-                schema.candidates(code).iter().map(|e| e.text.clone()).collect();
+            let texts: Vec<String> = schema
+                .candidates(code)
+                .iter()
+                .map(|e| e.text.clone())
+                .collect();
             if !texts.is_empty() {
                 rows.push((code.clone(), texts));
             }

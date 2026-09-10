@@ -442,9 +442,7 @@ impl ClipboardSection {
         if self.whitelist.is_empty() {
             return true;
         }
-        self.whitelist
-            .iter()
-            .any(|w| w.eq_ignore_ascii_case(exe))
+        self.whitelist.iter().any(|w| w.eq_ignore_ascii_case(exe))
     }
 }
 
@@ -459,6 +457,10 @@ pub struct AppearanceSection {
     pub font_size: f32,
     /// 显示状态胶囊
     pub status_capsule: bool,
+    /// 【动效开关 2026-09-11】候选窗动效总开关（false=一切动效瞬跳）
+    pub anim: bool,
+    /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0.25~4）
+    pub anim_speed: f32,
 }
 
 impl Default for AppearanceSection {
@@ -468,6 +470,8 @@ impl Default for AppearanceSection {
             font_family: String::new(),
             font_size: 17.6,
             status_capsule: true,
+            anim: true,
+            anim_speed: 1.0,
         }
     }
 }

@@ -9,7 +9,10 @@ use std::io::BufRead;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let corpus = &args[1];
-    let limit: usize = args.get(2).map(|s| s.parse().unwrap_or(1000)).unwrap_or(1000);
+    let limit: usize = args
+        .get(2)
+        .map(|s| s.parse().unwrap_or(1000))
+        .unwrap_or(1000);
     let data_dir = std::path::PathBuf::from(r"E:\DSH-KF\hufu\hufu-data");
     let cfg = hufu_config::Config::load(&data_dir.join("config.json")).unwrap_or_default();
     let mut engine = Engine::new(&data_dir, cfg).expect("引擎构建");
@@ -23,14 +26,13 @@ fn main() {
     .expect("ngram");
     engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
 
-    let sentences: Vec<String> = std::io::BufReader::new(
-        std::fs::File::open(corpus).expect("语料打开"),
-    )
-    .lines()
-    .map(|l| l.unwrap_or_default())
-    .filter(|l| !l.is_empty())
-    .take(limit)
-    .collect();
+    let sentences: Vec<String> =
+        std::io::BufReader::new(std::fs::File::open(corpus).expect("语料打开"))
+            .lines()
+            .map(|l| l.unwrap_or_default())
+            .filter(|l| !l.is_empty())
+            .take(limit)
+            .collect();
 
     // 二简转码（与 sentence_bench 同规则）
     let mut code_cache: HashMap<char, Option<String>> = HashMap::new();
@@ -60,7 +62,12 @@ fn main() {
                     if c.chars().count() < 2 {
                         continue;
                     }
-                    if engine.schema.dict.lookup(c).first().map(|e| e.text.as_str())
+                    if engine
+                        .schema
+                        .dict
+                        .lookup(c)
+                        .first()
+                        .map(|e| e.text.as_str())
                         == Some(t)
                     {
                         rank1 = Some(c.clone());
@@ -87,7 +94,13 @@ fn main() {
         let got = engine
             .sentence_decoder()
             .map(|d| d.decode(&raw))
-            .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) });
+            .and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            });
         let Some(top) = got else { continue };
         if top.text == *s {
             continue;
@@ -114,11 +127,17 @@ fn main() {
             *diffs.entry((de.clone(), dg)).or_insert(0) += 1;
             let has = engine.schema.dict.text_to_codes.contains_key(&de);
             in_dict.insert(de, has);
-        }    }
+        }
+    }
 
     let mut ranked: Vec<_> = diffs.iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(a.1));
-    println!("句数={} 错={} 缺字跳过={}", sentences.len(), wrong, untypeable);
+    println!(
+        "句数={} 错={} 缺字跳过={}",
+        sentences.len(),
+        wrong,
+        untypeable
+    );
     println!("══ 差异区 Top 40（期望段 → 实际段 ×次数 〔码表有词条?〕）══");
     for ((de, dg), n) in ranked.iter().take(40) {
         let has = in_dict.get(de).copied().unwrap_or(false);

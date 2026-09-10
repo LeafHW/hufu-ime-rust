@@ -7,7 +7,11 @@ use hufu_types::{KeyCode, KeyInput, Modifiers};
 use std::io::BufRead;
 
 fn key(c: char) -> KeyInput {
-    KeyInput { key: KeyCode::Char(c), modifiers: Modifiers::default(), is_press: true }
+    KeyInput {
+        key: KeyCode::Char(c),
+        modifiers: Modifiers::default(),
+        is_press: true,
+    }
 }
 
 fn main() {
@@ -30,11 +34,12 @@ fn main() {
     .expect("ngram");
     engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
 
-    let sentences: Vec<String> = std::io::BufReader::new(std::fs::File::open(corpus).expect("语料"))
-        .lines()
-        .map(|l| l.unwrap_or_default())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let sentences: Vec<String> =
+        std::io::BufReader::new(std::fs::File::open(corpus).expect("语料"))
+            .lines()
+            .map(|l| l.unwrap_or_default())
+            .filter(|l| !l.is_empty())
+            .collect();
 
     // 二简转码（与 bench 同规则：句中 ≥2 码）
     let mut code_cache: std::collections::HashMap<char, Option<String>> =
@@ -92,7 +97,11 @@ fn main() {
         // 空格收尾（尾段上屏不计入「提前」）
         let out = engine.process_key(
             &mut session,
-            KeyInput { key: KeyCode::Space, modifiers: Modifiers::default(), is_press: true },
+            KeyInput {
+                key: KeyCode::Space,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
         );
         let tail = out.commit.map(|t| t.chars().count()).unwrap_or(0);
         n_sent += 1;
@@ -104,8 +113,25 @@ fn main() {
     }
 
     println!("句数={n_sent} 总键数={total_keys} 总字数={total_chars}");
-    println!("提前上屏事件={events} （平均 {}/句, {:.2}/百键）", if n_sent > 0 { events / n_sent } else { 0 }, events as f64 * 100.0 / total_keys as f64);
-    println!("事件平均字数={:.2}", if events > 0 { event_chars as f64 / events as f64 } else { 0.0 });
-    println!("提前上屏字数占比={:.2}%", event_chars as f64 * 100.0 / total_chars as f64);
-    println!("发生过提前上屏的句子占比={:.2}%", sent_with_event as f64 * 100.0 / n_sent as f64);
+    println!(
+        "提前上屏事件={events} （平均 {}/句, {:.2}/百键）",
+        if n_sent > 0 { events / n_sent } else { 0 },
+        events as f64 * 100.0 / total_keys as f64
+    );
+    println!(
+        "事件平均字数={:.2}",
+        if events > 0 {
+            event_chars as f64 / events as f64
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "提前上屏字数占比={:.2}%",
+        event_chars as f64 * 100.0 / total_chars as f64
+    );
+    println!(
+        "发生过提前上屏的句子占比={:.2}%",
+        sent_with_event as f64 * 100.0 / n_sent as f64
+    );
 }

@@ -6,7 +6,11 @@ use hufu_engine::{Engine, Session};
 use hufu_types::{KeyCode, KeyInput, Modifiers};
 
 fn key(c: char) -> KeyInput {
-    KeyInput { key: KeyCode::Char(c), modifiers: Modifiers::default(), is_press: true }
+    KeyInput {
+        key: KeyCode::Char(c),
+        modifiers: Modifiers::default(),
+        is_press: true,
+    }
 }
 
 fn main() {
@@ -31,9 +35,19 @@ fn main() {
         let cs: Vec<String> = out
             .state
             .as_ref()
-            .map(|s| s.candidates.iter().take(4).map(|c| c.text.clone()).collect())
+            .map(|s| {
+                s.candidates
+                    .iter()
+                    .take(4)
+                    .map(|c| c.text.clone())
+                    .collect()
+            })
             .unwrap_or_default();
-        let raw = out.state.as_ref().map(|s| s.raw.clone()).unwrap_or_default();
+        let raw = out
+            .state
+            .as_ref()
+            .map(|s| s.raw.clone())
+            .unwrap_or_default();
         println!("键={ch} raw=[{raw}] commit=[{commit}] 候选={cs:?}");
     }
     // 对照：sentence_candidates 直读（decode_rich hits 序）
@@ -41,7 +55,13 @@ fn main() {
     let d = engine.sentence_decoder().expect("dec").decode_rich(&full);
     println!("── decode_rich({full}) hits 序:");
     for (i, h) in d.hits.iter().take(4).enumerate() {
-        println!("  {}. {} score={:.3} max_rank={}", i + 1, h.text, h.score, h.max_rank);
+        println!(
+            "  {}. {} score={:.3} max_rank={}",
+            i + 1,
+            h.text,
+            h.score,
+            h.max_rank
+        );
     }
     // ── 重排请求验证：句首空语境应跳过；有文章尾巴应带语境 ──
     session.tail_context.clear();
