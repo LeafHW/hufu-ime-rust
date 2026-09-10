@@ -372,6 +372,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                             // 【尺寸动效】隐藏即整窗退役——动效与余量基准
                             // 归零，下个会话按首个内容重定
                             c.size_anim = None;
+                            c.chrome_override.set(None);
                             c.live_size.set((0, 0));
                             let _ = KillTimer(hwnd, FADE_TIMER_ID);
                         }
@@ -622,11 +623,11 @@ pub struct CandidateWindowV2 {
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
-    /// 【收缩动效 2026-09-11】本帧是否延迟渲染：任一轴收缩时，内容
-    /// 保持旧布局（更大的画布），窗口 rect 渐进收拢=边缘可见地滑入；
-    /// 动效完成帧再渲染新（更小）布局——否则内容瞬跳到小布局、
-    /// rect 动画全在透明余量里进行（不可见=「变短没有动画」）。
-    pub(crate) size_defer_render: bool,
+    /// 【拉伸动效 2026-09-11】当前帧外壳（背景/边框/阴影/RGN）的物理
+    /// 窗口尺寸覆盖（含阴影边距）：动效 tick 每帧设置为当前插值尺寸
+    /// ——面板外壳被「拉过去」（延伸感），内容按目标布局裁在外壳内；
+    /// 稳态帧 None（目标尺寸渲染，零开销）。
+    pub(crate) chrome_override: std::cell::Cell<Option<(i32, i32)>>,
     /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
     pub(crate) last_show_at: Option<std::time::Instant>,
     /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
@@ -908,13 +909,13 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 150,
+                fade_ms: 0,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
-                size_defer_render: false,
+                chrome_override: std::cell::Cell::new(None),
                 size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1057,10 +1058,10 @@ impl CandidateWindowV2 {
             shadowwin_set_alpha(1.0);
         }
         let now = std::time::Instant::now();
-        // 【动效口径 2026-09-11 终版】fade 默认 150ms 开（下限 0.6：
-        // 柔和淡入淡出且不透出底层文字）；尺寸过渡默认 200ms
-        // smoothstep（宽高增减都平滑）。
-        self.fade_ms = layout_f(skin, "fade_ms", 150.0).clamp(0.0, 600.0) as u32;
+        // 【动效口径 2026-09-11 终版②】fade 默认关——任何透明度渐变都会
+        // 改变面板观感（用户「加深颜色/重叠感」），出/入场动感由尺寸
+        // 拉伸承担；皮肤键 layout.fade_ms 显式开启时才做（带 0.6 下限）。
+        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
         self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
@@ -1717,24 +1718,23 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
-        // 【收缩动效决策 2026-09-11】渲染前判定：任一轴收缩 → 本帧不
-        // 渲染（旧内容留在缓冲，窗口 rect 渐进收拢=边缘可见滑入；完成
-        // 帧由 tick 补渲染新布局）。增长照常即渲染（余量渐进揭示）。
-        // 回读取证帧不延迟（测试需立即拿到像素）。
-        {
+        // 【拉伸动效 2026-09-11】渲染前判定（仅真实内容更新/展开帧——
+        // 内部 tick 复渲染与回读取证帧不重臂）：宽高变化超阈值 → 启动/
+        // 重定尺寸动画；此后每 tick 由 fade_tick_shared 以「当前插值
+        // 尺寸」重绘外壳（背景/边框/阴影跟着边缘拉过去=延伸感），内容
+        // 按目标布局裁在外壳内。
+        if !self.internal_rerender {
             let target = (w_out as i32, h_out as i32);
             let cur = match self.size_anim {
                 Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
                 None => self.live_size.get(),
             };
-            let shrink = was_visible
+            if self.readback {
+                self.size_anim = None;
+            } else if was_visible
                 && self.size_ms > 0
-                && !self.readback
-                && (target.0 < cur.0 - 10 || target.1 < cur.1 - 8);
-            let grow =
-                was_visible && self.size_ms > 0 && (target.0 > cur.0 + 10 || target.1 > cur.1 + 8);
-            self.size_defer_render = shrink;
-            if shrink || grow {
+                && ((target.0 - cur.0).abs() > 10 || (target.1 - cur.1).abs() > 8)
+            {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
@@ -1743,14 +1743,22 @@ impl CandidateWindowV2 {
                 self.size_anim = None;
             }
         }
+        // 外壳有效物理尺寸：动效中=当前插值（窗口尺寸，含阴影边距），
+        // 稳态=目标
+        let (cw_out, ch_out) = match self.chrome_override.get() {
+            Some((cw, ch)) => (cw.max(1) as u32, ch.max(1) as u32),
+            None => (w_out.max(1), h_out.max(1)),
+        };
+        // 外壳内容盒（逻辑系）：从物理窗口尺寸减阴影边距换算
+        let (chw, chh) = match self.chrome_override.get() {
+            Some((cw, ch)) => (
+                ((cw as f32 / dpi_scale) - 2.0 * shadow_m).max(1.0),
+                ((ch as f32 / dpi_scale) - 2.0 * shadow_m).max(1.0),
+            ),
+            None => (width, height),
+        };
         'sizedraw: {
-            if self.size_defer_render {
-                // 收缩中：旧像素 + 收拢的 rect 已是完整视觉，跳过绘制
-                //（SWP 定位在块外照常执行）
-                crate::tsf::trace("cw2: 收缩动效——延迟渲染");
-                break 'sizedraw;
-            }
-            if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
+            if !self.ensure_swapchain(cw_out.max(1), ch_out.max(1)) {
                 crate::tsf::trace("cw2: ensure_swapchain FAIL");
                 return;
             }
@@ -1953,8 +1961,8 @@ impl CandidateWindowV2 {
                                             rect: D2D_RECT_F {
                                                 left: shadow_m * dpi_scale,
                                                 top: shadow_m * dpi_scale,
-                                                right: (shadow_m + width) * dpi_scale,
-                                                bottom: (shadow_m + height) * dpi_scale,
+                                                right: (shadow_m + chw) * dpi_scale,
+                                                bottom: (shadow_m + chh) * dpi_scale,
                                             },
                                             radiusX: radius * dpi_scale,
                                             radiusY: radius * dpi_scale,
@@ -2105,7 +2113,7 @@ impl CandidateWindowV2 {
                                             },
                                         );
                                         let mask_ok = push_shadow_mask(
-                                            &ctx, width, height, w_out, h_out, shadow_m, radius,
+                                            &ctx, chw, chh, cw_out, ch_out, shadow_m, radius,
                                             dpi_scale,
                                         );
                                         // 【阴影分离修复·终版 2026-09-08】曾加
@@ -2163,8 +2171,8 @@ impl CandidateWindowV2 {
                                     rect: D2D_RECT_F {
                                         left: shadow_m,
                                         top: shadow_m,
-                                        right: shadow_m + width,
-                                        bottom: shadow_m + height,
+                                        right: shadow_m + chw,
+                                        bottom: shadow_m + chh,
                                     },
                                     radiusX: radius,
                                     radiusY: radius,
@@ -2214,7 +2222,7 @@ impl CandidateWindowV2 {
                                     M32: 0.0,
                                 });
                                 let mask_ok = push_shadow_mask(
-                                    &ctx, width, height, w_out, h_out, shadow_m, radius, dpi_scale,
+                                    &ctx, chw, chh, cw_out, ch_out, shadow_m, radius, dpi_scale,
                                 );
                                 // 【阴影分离修复·终版】同缓存命中分支：无补偿
                                 // 原语义（详见上方注释）。
@@ -2279,8 +2287,8 @@ impl CandidateWindowV2 {
                                         rect: D2D_RECT_F {
                                             left: shadow_m,
                                             top: shadow_m,
-                                            right: shadow_m + width,
-                                            bottom: shadow_m + height,
+                                            right: shadow_m + chw,
+                                            bottom: shadow_m + chh,
                                         },
                                         radiusX: radius,
                                         radiusY: radius,
@@ -2303,8 +2311,8 @@ impl CandidateWindowV2 {
                                         rect: D2D_RECT_F {
                                             left: shadow_m - grow + shadow_off_x * t,
                                             top: shadow_m - grow + shadow_off_y * t,
-                                            right: shadow_m + width + grow + shadow_off_x * t,
-                                            bottom: shadow_m + height + grow + shadow_off_y * t,
+                                            right: shadow_m + chw + grow + shadow_off_x * t,
+                                            bottom: shadow_m + chh + grow + shadow_off_y * t,
                                         },
                                         radiusX: radius + grow,
                                         radiusY: radius + grow,
@@ -2397,8 +2405,8 @@ impl CandidateWindowV2 {
                                 rect: D2D_RECT_F {
                                     left: 0.0,
                                     top: 0.0,
-                                    right: width,
-                                    bottom: height,
+                                    right: chw,
+                                    bottom: chh,
                                 },
                                 radiusX: radius,
                                 radiusY: radius,
@@ -2407,6 +2415,23 @@ impl CandidateWindowV2 {
                         }
                     }
                     // 【纯色模型】暗化层已废弃（材质系统移除）——不画
+                }
+                // 【拉伸动效】内容裁剪：动效帧中外壳小于目标布局——把
+                // 编码行/候选/注释裁在外壳内（增长=渐进露出，收拢=渐进
+                // 收起）；稳态帧不推（零开销）
+                let chrome_clip_on = self.chrome_override.get().is_some();
+                if chrome_clip_on {
+                    unsafe {
+                        ctx.PushAxisAlignedClip(
+                            &D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: chw,
+                                bottom: chh,
+                            },
+                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        );
+                    }
                 }
 
                 // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
@@ -2731,8 +2756,8 @@ impl CandidateWindowV2 {
                                 rect: D2D_RECT_F {
                                     left: bw / 2.0,
                                     top: bw / 2.0,
-                                    right: width - bw / 2.0,
-                                    bottom: height - bw / 2.0,
+                                    right: chw - bw / 2.0,
+                                    bottom: chh - bw / 2.0,
                                 },
                                 radiusX: radius,
                                 radiusY: radius,
@@ -2741,6 +2766,12 @@ impl CandidateWindowV2 {
                         }
                     }
                 } // draw_content
+                  // 【拉伸动效】内容裁剪收层（与上方 Push 配对）
+                if chrome_clip_on {
+                    unsafe {
+                        ctx.PopAxisAlignedClip();
+                    }
+                }
 
                 // 【动效 2026-09-11】过渡帧收层（与 BeginDraw 后的 PushLayer
                 // 配对；稳态未 Push 不 Pop）
@@ -3215,14 +3246,16 @@ impl CandidateWindowV2 {
             // ——非 glass 分支显式清 RGN（SetWindowRgn NULL=恢复全窗）。
             if kind == "glass" {
                 let rgn_r = (radius * dpi_scale).round().max(1.0) as i32;
-                let rgn_key = ((w_out as u64) << 32) | ((h_out as u64) << 16) | rgn_r as u64;
+                // 【拉伸动效】RGN 按外壳有效尺寸（动效帧=插值）——圆角
+                // 裁剪跟边缘走
+                let rgn_key = ((cw_out as u64) << 32) | ((ch_out as u64) << 16) | rgn_r as u64;
                 if self.rgn_last.get() != rgn_key {
                     unsafe {
                         let rgn = CreateRoundRectRgn(
                             0,
                             0,
-                            w_out as i32 + 1,
-                            h_out as i32 + 1,
+                            cw_out as i32 + 1,
+                            ch_out as i32 + 1,
                             rgn_r,
                             rgn_r,
                         );
@@ -3345,6 +3378,7 @@ impl CandidateWindowV2 {
                 // 【rect 只增不减→尺寸动效】窗退役：动效与余量基准归零，
                 // 下会话重定
                 self.size_anim = None;
+                self.chrome_override.set(None);
                 self.live_size.set((0, 0));
             }
         }
@@ -3432,30 +3466,22 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 shadowwin_set_alpha(1.0);
             }
         }
-        // 尺寸动效步进：SWP 到插值尺寸（内容/位置不动——增长路径内容
-        // 已按目标渲染；收缩路径刻意保留旧像素=边缘可见收拢）；完成帧
-        // 精确就位并按 last_show 补渲染（收缩延迟的新布局此刻才上屏）
+        // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
+        // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
+        // 感），内容按目标布局裁在外壳内；完成帧解除覆盖按目标渲染。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
             let cur = size_ease(f, t, ms, c.size_ms);
             let finished = cur == t;
             if finished {
                 c.size_anim = None;
+                c.chrome_override.set(None);
             } else {
                 anim_done = false;
+                c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            let _ = SetWindowPos(
-                c.hwnd,
-                HWND(std::ptr::null_mut()),
-                0,
-                0,
-                cur.0,
-                cur.1,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            if finished && c.size_defer_render && c.is_visible() {
-                c.size_defer_render = false;
+            if c.is_visible() {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
