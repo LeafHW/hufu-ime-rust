@@ -760,7 +760,7 @@ extern "system" fn hufu_test_anim() -> i32 {
         }
         std::thread::sleep(std::time::Duration::from_millis(6));
     }
-    // 渐隐退场：hide() 异步 → fade-out → 限时不可见
+    // 收尾：hide() 异步 → 即时隐藏（退场动画已退役）
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = g.cand2.as_mut() {

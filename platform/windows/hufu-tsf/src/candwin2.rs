@@ -340,12 +340,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
-            // 【动效 2026-09-11】渐隐退场：动效开启且窗已可见 ≥250ms
-            // （刻意在场的窗）→ 启动渐隐，tick 完成时真隐藏；否则直接
-            // 隐藏（连打静默期防频闪/动效关）。已在渐隐中不重启（防
-            // 重复 hide 消息把不透明度弹回 1）。渐显中收到隐藏→转渐隐。
+            // 【退场动画退役 2026-09-11】用户判「调不好」：淡出与半透明
+            // 面板天然相克（渐隐帧压在新上屏文字上=变黑/重叠，连打时
+            // 收放循环=一闪一闪）。收窗一律即时隐藏——干净利落。
+            //（入场长大/尺寸过渡/跟光标滑动保留；入场淡入仍由皮肤
+            // fade_ms>0 显式开启才有。）
             unsafe {
-                let mut do_fade = false;
                 if let Some(gsh) = crate::tsf::G_SHARED.get() {
                     let shared = gsh.0.clone();
                     let mut cand2 = {
@@ -353,36 +353,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         g.cand2.take()
                     };
                     if let Some(c) = cand2.as_mut() {
-                        let vis_long = c
-                            .last_show_at
-                            .map(|t| t.elapsed().as_millis() >= EXIT_QUIET_MS)
-                            .unwrap_or(false);
-                        let already_out = matches!(c.fade, Some((false, _)));
-                        // 【收尾淡出 2026-09-11】用户点名「候选消失也给个
-                        // 淡出」——退场一律走透明度渐隐（fade_ms>0 用之，
-                        // 否则 150ms×全局速度；曲线落到真 0），阴影窗同
-                        // 步；连打循环（<120ms）照旧直接藏；动效总开关
-                        // 关闭时直藏
-                        if IsWindowVisible(hwnd).as_bool() && vis_long && c.anim_on.get() {
-                            if !already_out {
-                                c.fade = Some((false, std::time::Instant::now()));
-                            }
-                            let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                            do_fade = true;
-                        }
-                    }
-                    if !do_fade {
-                        if let Some(c) = cand2.as_mut() {
-                            c.last_hide_at = Some(std::time::Instant::now());
-                            // 【尺寸动效】隐藏即整窗退役——动效与余量基准
-                            // 归零，下个会话按首个内容重定
-                            c.size_anim = None;
-                            c.chrome_override.set(None);
-                            c.scale_in.set(false);
-                            c.pos_anim = None;
-                            c.live_size.set((0, 0));
-                            let _ = KillTimer(hwnd, FADE_TIMER_ID);
-                        }
+                        c.last_hide_at = Some(std::time::Instant::now());
+                        // 【尺寸动效】隐藏即整窗退役——动效与余量基准
+                        // 归零，下个会话按首个内容重定
+                        c.size_anim = None;
+                        c.chrome_override.set(None);
+                        c.scale_in.set(false);
+                        c.pos_anim = None;
+                        c.fade = None;
+                        c.live_size.set((0, 0));
                     }
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     match (g.cand2.take(), cand2) {
@@ -395,11 +374,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         (None, None) => {}
                     }
                 }
-                if !do_fade {
-                    let _ = KillTimer(hwnd, FADE_TIMER_ID);
-                    let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
+                let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
             return LRESULT(0);
         }
@@ -3112,10 +3089,8 @@ pub const FADE_TICK_MS: u32 = 15;
 /// 静默期：show↔hide 间隔小于此值直接跳过动画（连打逐字上屏的
 /// 收放循环不频闪）——仅管入场侧
 const FADE_QUIET_MS: u128 = 250;
-/// 【退场门 2026-09-11】独立于入场静默期：短码快打（两键+空格常
-/// <250ms）被 250ms 门判成连打直藏=「消失没动画」。退场降到 120ms
-///——持续连打（词间隔 <120ms）仍防频闪，正常上屏都给淡出。
-const EXIT_QUIET_MS: u128 = 120;
+/// 【退场门退役 2026-09-11】退场动画整体移除（收窗即时隐藏）——
+/// 常量随之删除；入场静默期（FADE_QUIET_MS）保留。
 /// 【淡入淡出下限 2026-09-11】动画期间整帧 alpha 的最低值——低于此
 /// 值面板接近全透、底层文字透出（用户「重叠感」）。0.6×皮肤自身
 /// master_alpha≈0.68 → 最低有效不透明 ≈0.41：柔和淡入且不重叠。
