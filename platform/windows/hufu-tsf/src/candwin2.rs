@@ -623,6 +623,12 @@ pub struct CandidateWindowV2 {
     /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
     /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
     pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
+    /// 【高亮锚定入场 2026-09-11】首出长大从高亮候选「长出来」：动画盒
+    /// 中心锚定高亮胶囊中心（内容平移 −bx/−by、窗口跟盒滑动），其余
+    /// 内容向四周展开——而非从窗口左上角出现。逻辑内容坐标。
+    pub(crate) hl_center: std::cell::Cell<Option<(f32, f32)>>,
+    /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
+    pub(crate) scale_in: std::cell::Cell<bool>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 200，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -920,6 +926,8 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                hl_center: std::cell::Cell::new(None),
+                scale_in: std::cell::Cell::new(false),
                 size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1099,7 +1107,9 @@ impl CandidateWindowV2 {
                     }
                 }
             }
-            self.last_show_at = Some(now);
+            // 【会话语义】last_show_at 只在本可见会话首显置位——vis_long
+            //（退场门控）量「窗刻意在场多久」；此前每键刷新导致正常打字
+            // 收尾总被判连打直藏（「消失没动画」根因）
         }
         if !self.comments_expanded && cmt_delay > 0 && !self.internal_rerender {
             // 连打期间逐帧重置倒计时（同 id SetTimer=重置）→ 停手
@@ -1760,17 +1770,18 @@ impl CandidateWindowV2 {
             {
                 // 【首出长大 2026-09-11】刻意出现的窗（静默门外）从 72%
                 // 拉到目标——纯尺寸动效（零透明度变化=无变深/透底），
-                // 边框阴影跟着拉出；连打循环（<250ms 复现）直接全显
+                // 盒心锚定高亮胶囊（「从高亮区出现」）；连打循环直接全显
                 let start = (
                     (target.0 as f32 * 0.72) as i32,
                     (target.1 as f32 * 0.72) as i32,
                 );
                 self.size_anim = Some((start, target, std::time::Instant::now()));
                 self.chrome_override.set(Some(start));
+                self.scale_in.set(true);
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
-            } else {
+            } else if !self.scale_in.get() {
                 self.size_anim = None;
                 self.chrome_override.set(None);
             }
@@ -1788,6 +1799,17 @@ impl CandidateWindowV2 {
                 ((ch as f32 / dpi_scale) - 2.0 * shadow_m).max(1.0),
             ),
             None => (width, height),
+        };
+        // 【高亮锚定】入场动画中：内容盒中心对准高亮胶囊中心——内容
+        // 平移 (−bx,−by)、窗口定位加 (bx,by)（稳态/普通尺寸动效 = 0）
+        let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
+            let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
+            (
+                (hx - chw * 0.5).clamp(-width * 0.5, width * 0.5),
+                (hy - chh * 0.5).clamp(-height * 0.5, height * 0.5),
+            )
+        } else {
+            (0.0, 0.0)
         };
         'sizedraw: {
             if !self.ensure_swapchain(cw_out.max(1), ch_out.max(1)) {
@@ -2470,6 +2492,22 @@ impl CandidateWindowV2 {
                         );
                     }
                 }
+                // 【高亮锚定】入场动画中内容平移 (−bx,−by)——高亮胶囊停
+                // 在动画盒中心，其余内容向四周展开；边框前还原（边框属
+                // 外壳，永远画在盒缘）
+                let hl_anchor_on = bx != 0.0 || by != 0.0;
+                if hl_anchor_on {
+                    unsafe {
+                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                            M11: dpi_scale,
+                            M12: 0.0,
+                            M21: 0.0,
+                            M22: dpi_scale,
+                            M31: (shadow_m - bx) * dpi_scale,
+                            M32: (shadow_m - by) * dpi_scale,
+                        });
+                    }
+                }
 
                 // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
                 // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
@@ -2633,6 +2671,10 @@ impl CandidateWindowV2 {
                                 x += cand_spacing;
                             }
                             if i == sel {
+                                // 【高亮锚定】横排：捕获高亮胶囊中心（入场
+                                // 动画盒以此为锚）
+                                self.hl_center
+                                    .set(Some((x + cell_w * 0.5, y + row_h * 0.5)));
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y);
                                     let rr = D2D1_ROUNDED_RECT {
@@ -2706,6 +2748,8 @@ impl CandidateWindowV2 {
                                 // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
                                 // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
                                 // 已在胶囊内 gap+hp 起）
+                                // 【高亮锚定】竖排：捕获胶囊中心（入场动画盒锚点）
+                                self.hl_center.set(Some((width * 0.5, y + row_h * 0.5)));
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y);
                                     let rr = D2D1_ROUNDED_RECT {
@@ -2785,7 +2829,19 @@ impl CandidateWindowV2 {
                     }
 
                     // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
-                    // 描边方案用户否决已撤】
+                    // 描边方案用户否决已撤】（属外壳——先还原内容平移）
+                    if hl_anchor_on {
+                        unsafe {
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: dpi_scale,
+                                M12: 0.0,
+                                M21: 0.0,
+                                M22: dpi_scale,
+                                M31: shadow_m * dpi_scale,
+                                M32: shadow_m * dpi_scale,
+                            });
+                        }
+                    }
                     if let Some(b) = &b_border {
                         if kind != "glass" {
                             let bw = layout_f(skin, "border_width", 1.0);
@@ -3245,11 +3301,18 @@ impl CandidateWindowV2 {
                 };
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
+                // 【高亮锚定】入场中窗口跟动画盒滑动（内容已平移 −bx/−by，
+                // 此处定位 +bx/+by 使高亮胶囊钉在屏上原地，盒向四周展开）
+                let (ax, ay) = if self.scale_in.get() && self.size_anim.is_some() {
+                    ((bx * dpi_scale) as i32, (by * dpi_scale) as i32)
+                } else {
+                    (0, 0)
+                };
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
-                    x - (shadow_m * dpi_scale) as i32,
-                    y - (shadow_m * dpi_scale) as i32,
+                    x - (shadow_m * dpi_scale) as i32 + ax,
+                    y - (shadow_m * dpi_scale) as i32 + ay,
                     apply.0,
                     apply.1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -3522,6 +3585,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             if finished {
                 c.size_anim = None;
                 c.chrome_override.set(None);
+                c.scale_in.set(false);
             } else {
                 anim_done = false;
                 c.chrome_override.set(Some(cur));
