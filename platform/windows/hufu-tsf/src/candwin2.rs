@@ -358,30 +358,16 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                             .map(|t| t.elapsed().as_millis() >= FADE_QUIET_MS)
                             .unwrap_or(false);
                         let already_out = matches!(c.fade, Some((false, _)));
-                        if c.fade_ms > 0 && IsWindowVisible(hwnd).as_bool() && vis_long {
+                        // 【收尾淡出 2026-09-11】用户点名「候选消失也给个
+                        // 淡出」——退场一律走透明度渐隐（fade_ms>0 用之，
+                        // 否则 150ms 默认；曲线落到真 0），阴影窗同步；
+                        // 连打循环（<250ms）照旧直接藏
+                        if IsWindowVisible(hwnd).as_bool() && vis_long {
                             if !already_out {
                                 c.fade = Some((false, std::time::Instant::now()));
                             }
                             let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                             do_fade = true;
-                        } else if c.size_ms > 0
-                            && IsWindowVisible(hwnd).as_bool()
-                            && vis_long
-                            && c.size_anim.is_none()
-                        {
-                            // 【收尾收拢 2026-09-11】fade 关闭时退出场=纯
-                            // 尺寸收拢（live→70%）后真隐藏——无透明度变
-                            // 化；连打循环（<250ms）照旧直接藏
-                            let live = c.live_size.get();
-                            if live.0 > 8 && live.1 > 8 {
-                                let shrunk =
-                                    ((live.0 as f32 * 0.7) as i32, (live.1 as f32 * 0.7) as i32);
-                                c.size_anim = Some((live, shrunk, std::time::Instant::now()));
-                                c.chrome_override.set(Some(live));
-                                c.hide_after_anim.set(true);
-                                let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                                do_fade = true;
-                            }
                         }
                     }
                     if !do_fade {
@@ -637,9 +623,6 @@ pub struct CandidateWindowV2 {
     /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
     /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
     pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
-    /// 【收尾收拢 2026-09-11】尺寸动效完成后真隐藏（退出场=收拢到 70%
-    /// 再 SW_HIDE，纯运动无透明度变化）；被新内容打断时取消。
-    pub(crate) hide_after_anim: std::cell::Cell<bool>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 200，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -937,7 +920,6 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
-                hide_after_anim: std::cell::Cell::new(false),
                 size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1116,10 +1098,6 @@ impl CandidateWindowV2 {
                         let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
                     }
                 }
-            }
-            // 收尾收拢被新内容打断：取消退场（窗复活），交由决策块重定
-            if self.hide_after_anim.get() && !self.internal_rerender {
-                self.hide_after_anim.set(false);
             }
             self.last_show_at = Some(now);
         }
@@ -3399,15 +3377,21 @@ impl CandidateWindowV2 {
         match self.fade {
             None => 1.0,
             Some((fading_in, t0)) => {
-                let ms = self.fade_ms.max(1) as f64;
-                let p = (t0.elapsed().as_secs_f64() * 1000.0 / ms).clamp(0.0, 1.0);
-                // 【下限淡入淡出 2026-09-11】alpha 永不低于 FADE_FLOOR
-                // ——面板不会接近全透（透出底层文字=「重叠感」），只在
-                // 稳态与下限之间柔和过渡。ease 保留二次曲线。
+                // 【淡出专用 2026-09-11】进场=下限曲线（防透底重叠）；
+                // 退场=全幅 1→0（窗正在离开，透底即目的——用户点名要
+                // 淡出）。退场时长：fade_ms>0 用之，否则 150ms 默认。
+                let dur_ms = if fading_in {
+                    self.fade_ms.max(1)
+                } else if self.fade_ms > 0 {
+                    self.fade_ms
+                } else {
+                    150
+                } as f64;
+                let p = (t0.elapsed().as_secs_f64() * 1000.0 / dur_ms).clamp(0.0, 1.0);
                 if fading_in {
                     (FADE_FLOOR + (1.0 - FADE_FLOOR) * (1.0 - (1.0 - p) * (1.0 - p))) as f32
                 } else {
-                    (FADE_FLOOR + (1.0 - FADE_FLOOR) * ((1.0 - p) * (1.0 - p))) as f32
+                    (((1.0 - p) * (1.0 - p)) * 1.0) as f32
                 }
             }
         }
@@ -3531,8 +3515,6 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
         // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
         // 感），内容按目标布局裁在外壳内；完成帧解除覆盖按目标渲染。
-        // 收尾收拢（hide_after_anim）：完成即真隐藏（SWP 已在收拢终
-        // 帧把窗缩到 70%，无需完成帧全尺寸渲染）。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
             let cur = size_ease(f, t, ms, c.size_ms);
@@ -3545,24 +3527,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            if c.hide_after_anim.get() {
-                if finished {
-                    // 退场完成：真隐藏 + 全清理
-                    c.hide_after_anim.set(false);
-                    unsafe {
-                        let _ = KillTimer(hwnd, FADE_TIMER_ID);
-                        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
-                        let _ = ShowWindow(c.hwnd, SW_HIDE);
-                    }
-                    shadowwin_set_alpha(1.0);
-                    c.last_hide_at = Some(std::time::Instant::now());
-                    c.live_size.set((0, 0));
-                } else if c.is_visible() {
-                    c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
-                    c.internal_rerender = false;
-                }
-            } else if c.is_visible() {
+            if c.is_visible() {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
