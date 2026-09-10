@@ -2077,8 +2077,13 @@ impl CandidateWindowV2 {
                             | (((sc.b * 255.0) as u32) << 16)
                             | (((sc.a * 255.0) as u32) << 24);
                         let sh_key = (
-                            width as u32,
-                            height as u32,
+                            // 【拉伸动效修残影 2026-09-11】键必须用「有效
+                            // 外壳尺寸」chw/chh——否则收窄动画（乃至完成后的
+                            // 稳态帧）命中起臂时录下的宽阴影缓存，右侧一直
+                            // 复放宽阴影=残留。逐 tick 尺寸变→逐帧重建
+                            //（command list+effect，亚毫秒）。
+                            chw as u32,
+                            chh as u32,
                             (radius * 4.0) as u32,
                             (shadow_radius * 4.0) as u32,
                             ((shadow_off_y * 4.0) as i32, (shadow_off_x * 4.0) as i32),
