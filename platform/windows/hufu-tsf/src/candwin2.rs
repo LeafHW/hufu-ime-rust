@@ -486,7 +486,12 @@ unsafe fn push_shadow_mask(
     h_out: u32,
     shadow_m: f32,
     radius: f32,
+    dpi: f32,
 ) -> bool {
+    // 【高DPI二次缩放修复 2026-09-11】调用方现已在 identity 世界变换
+    // 下 Push 本 mask（对齐玻璃段正序：先切 identity 再 Push——mask
+    // 按当时 transform 解释）。窗口洞几何原为逻辑坐标（靠 dpi 主变换
+    // 换算物理），identity 下必须显式乘 dpi；大矩形本就物理（w_out）。
     let f = match ctx.GetFactory() {
         Ok(f) => f,
         Err(_) => return false,
@@ -502,13 +507,13 @@ unsafe fn push_shadow_mask(
     };
     let win = match f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
-            left: shadow_m,
-            top: shadow_m,
-            right: shadow_m + width,
-            bottom: shadow_m + height,
+            left: shadow_m * dpi,
+            top: shadow_m * dpi,
+            right: (shadow_m + width) * dpi,
+            bottom: (shadow_m + height) * dpi,
         },
-        radiusX: radius,
-        radiusY: radius,
+        radiusX: radius * dpi,
+        radiusY: radius * dpi,
     }) {
         Ok(g) => g,
         Err(_) => return false,
@@ -831,6 +836,15 @@ impl CandidateWindowV2 {
         let dpi_scale = unsafe {
             windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0
         };
+        // 【DPI 测试旋钮 2026-09-11】HUFU_FAKE_DPI=<dpi>：pad-dump/smoke
+        // 取证用——100% 屏上伪造高 DPI 复现「高 DPI 阴影二次缩放」类
+        // 问题（真机该值不存在，零影响）。值=目标 DPI（如 144=150%）。
+        let dpi_scale = std::env::var("HUFU_FAKE_DPI")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v >= 96.0 && *v <= 480.0)
+            .map(|v| v / 96.0)
+            .unwrap_or(dpi_scale);
         // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
         let show_index = skin
             .get("show_index")
@@ -1660,6 +1674,27 @@ impl CandidateWindowV2 {
                                 if *k == sh_key {
                                     // 命中：直接绘制缓存的 effect 输出
                                     let eff_img: ID2D1Image = v.1.cast().ok()?;
+                                    // 【高DPI二次缩放修复 2026-09-11】
+                                    // effect 输出=物理像素（command list 录制
+                                    // 时几何已乘 dpi_scale）；此前 DrawImage
+                                    // 在 dpi 世界变换下画 → 高 DPI 屏内容再
+                                    // 乘一次 scale：150% 屏阴影 ×2.25 倍位、
+                                    // 右下偏移出窗（用户实测「阴影超大范围
+                                    // 偏离」，1.4.8 引入 dpi 中心化后高 DPI
+                                    // 机器必现、100% 屏 ×1 不可见——本机全
+                                    // 100% 故历轮复现不了）。玻璃段 2026-09-08
+                                    // 已修（identity+物理坐标），纯色段漏修。
+                                    // 正序（对齐玻璃段）：identity → Push mask
+                                    // （洞几何乘 dpi）→ DrawImage（物理偏移）
+                                    // → 恢复 dpi 主变换 → Pop。
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
                                     let mask_ok = push_shadow_mask(
                                         &ctx,
                                         width,
@@ -1668,6 +1703,7 @@ impl CandidateWindowV2 {
                                         h_out,
                                         shadow_m,
                                         radius,
+                                        dpi_scale,
                                     );
                                     // 【阴影分离修复·终版 2026-09-08】曾加
                                     // GetImageLocalBounds 补偿——实错：DrawImage
@@ -1677,7 +1713,11 @@ impl CandidateWindowV2 {
                                     // 上——补偿把阴影平移出左上角（白底像素
                                     // 分析：浓阴影聚窗口左上）。原始分离根因
                                     // 是缓存键漏 shadow_radius（本版已在键中）。
-                                    let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
+                                    // identity 下偏移同样须物理（×dpi）。
+                                    let off = D2D_POINT_2F {
+                                        x: shadow_off_x * dpi_scale,
+                                        y: shadow_off_y * dpi_scale,
+                                    };
                                     ctx.DrawImage(
                                         &eff_img,
                                         Some(&off as *const _),
@@ -1685,6 +1725,14 @@ impl CandidateWindowV2 {
                                         D2D1_INTERPOLATION_MODE_LINEAR,
                                         D2D1_COMPOSITE_MODE_SOURCE_OVER,
                                     );
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: dpi_scale,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: dpi_scale,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
                                     if mask_ok {
                                         ctx.PopLayer();
                                     }
@@ -1739,6 +1787,17 @@ impl CandidateWindowV2 {
                             // 直角矩形清除会在圆角外留直角切割痕（用户实测
                             // 「直角色块」）。改 Layer 几何遮罩：整画布 −
                             // 窗口圆角（even-odd）——阴影只在窗外绘制。
+                            // 【高DPI二次缩放修复 2026-09-11】同缓存命中
+                            // 分支：identity → Push mask（洞×dpi）→
+                            // DrawImage（物理偏移）→ 恢复 dpi → Pop。
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: 1.0,
+                                M12: 0.0,
+                                M21: 0.0,
+                                M22: 1.0,
+                                M31: 0.0,
+                                M32: 0.0,
+                            });
                             let mask_ok = push_shadow_mask(
                                 &ctx,
                                 width,
@@ -1747,10 +1806,14 @@ impl CandidateWindowV2 {
                                 h_out,
                                 shadow_m,
                                 radius,
+                                dpi_scale,
                             );
                             // 【阴影分离修复·终版】同缓存命中分支：无补偿
                             // 原语义（详见上方注释）。
-                            let off = D2D_POINT_2F { x: shadow_off_x, y: shadow_off_y };
+                            let off = D2D_POINT_2F {
+                                x: shadow_off_x * dpi_scale,
+                                y: shadow_off_y * dpi_scale,
+                            };
                             ctx.DrawImage(
                                 &eff_img,
                                 Some(&off as *const _),
@@ -1758,6 +1821,14 @@ impl CandidateWindowV2 {
                                 D2D1_INTERPOLATION_MODE_LINEAR,
                                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
                             );
+                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                M11: dpi_scale,
+                                M12: 0.0,
+                                M21: 0.0,
+                                M22: dpi_scale,
+                                M31: 0.0,
+                                M32: 0.0,
+                            });
                             if mask_ok {
                                 ctx.PopLayer();
                             }
