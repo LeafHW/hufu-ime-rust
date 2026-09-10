@@ -110,20 +110,24 @@ fn second_and_third_select() {
 fn dinggong_push() {
     // 顶功（语义定版 2026-08-31）：死路键【不】顶屏——只有超过最大
     // 码长（第 max+1 键）才顶首选。一简 a(来) 后跟死路 z：不上屏。
-    // 【空码绑码长 2026-09-08】2-3 键的暂时空码不再立即清（第 4 键
-    // 可能仍有解/用户词），不满码保留缓冲由退格/空格处理；满码
-    //（len≥max_code_length）空码才自动清。
+    // 【空码码长=max+1 2026-09-11】2-max-1 键的暂时空码不清（可能仍
+    // 有解/用户词）；恰满 max 码死路也保留缓冲；第 max+1 键仍空码才
+    // 清前 max 码、保留第 max+1 键为新起点。
     let (mut engine, mut session, _dir) = setup();
     engine.process_key(&mut session, key('a')); // 来
     let out = engine.process_key(&mut session, key('z')); // az 死路（2 键）
     assert_eq!(out.commit, None, "死路键不得自动上屏");
     let st = out.state.unwrap();
-    assert_eq!(st.raw, "az", "不满码空码保留缓冲（等满码再清）");
-    // 满 4 码仍空码 → 自动清（空码清屏绑最大码长）
+    assert_eq!(st.raw, "az", "不满码空码保留缓冲");
+    // 满 4 码仍空码 → 不清（等第 max+1 键定夺）
     engine.process_key(&mut session, key('z'));
     let out4 = engine.process_key(&mut session, key('z')); // azzz 满码死路
     assert_eq!(out4.commit, None);
-    assert_eq!(out4.state.unwrap().raw, "", "满码空码自动清屏");
+    assert_eq!(out4.state.unwrap().raw, "azzz", "满码空码不清（第 max+1 键才清）");
+    // 第 5 键（max+1）仍空码 → 清前 4 码、保留第 5 键自身
+    let out5 = engine.process_key(&mut session, key('q')); // azzzq 死路
+    assert_eq!(out5.commit, None);
+    assert_eq!(out5.state.unwrap().raw, "q", "第 max+1 键清前 max 码、保留自身");
 }
 
 #[test]

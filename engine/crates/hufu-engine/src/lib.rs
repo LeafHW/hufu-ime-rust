@@ -1359,25 +1359,32 @@ impl Engine {
                 session.pending_commit = Some(first.commit_text().to_string());
                 return;
             }
-            // 追加前也无候选：空码处理
+            // 追加前也无候选：空码清屏【码长 max+1 语义 2026-09-11 用户
+            // 拍板】清前 max 码、保留刚输入的第 max+1 键为新起点（此前
+            // 整缓冲连第 max+1 键一并清掉，新起点也丢）
             if dead_end && self.config.input.auto_clear_empty {
                 session.clear();
+                session.raw = c.to_string();
+                self.refresh_candidates(session);
             }
             return;
         }
 
         // 空码自动清屏（既无精确也无前缀，且未开启顶功短路；整句模式保留缓冲）
-        // 【绑最大码长 2026-09-08】仅满码（len≥max_code_length）才清：
-        // 此前 2-3 键的暂时空码也清——用户词/第 4 键可能仍有解，清了
-        // 就打断输入（用户实测「3 码也清屏」）。不满码的空码留在缓冲，
-        // 由退格/空格/继续输入处理。
+        // 【码长=max+1 2026-09-11 用户拍板】恰满 max 码的死路不清（留在
+        // 缓冲），第 max+1 键仍空码才清前 max 码、保留第 max+1 键为新起
+        // 点——与顶功超长顶屏对称（都是第 max+1 键定夺）。此前「满码即
+        // 清」（2026-09-08）在第 max 键就把缓冲全清，第 max+1 键从头空
+        // 码；不满码空码保留缓冲仍由退格/空格/继续输入处理。
         if dead_end
             && !sentence_mode
             && self.config.input.auto_clear_empty
             && !has_upper
-            && len >= max_len
+            && len > max_len
         {
             session.clear();
+            session.raw = c.to_string();
+            self.refresh_candidates(session);
         }
 
         // 提前上屏：整句接管/带锁/已有前缀时逐键评估（Rime 在 push_input 后立即评估）
