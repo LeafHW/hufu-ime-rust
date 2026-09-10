@@ -2182,13 +2182,21 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             arm_first_frame_timer();
             return Ok(());
         }
-        match g.cand2.as_mut() {
-            Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
-            None => {}
+        // 【退场淡出修复 2026-09-11】空帧到此不再下落 show：此前直落
+        // 2186 用空数据再 show 一次并把 last_show 覆盖成空——渐隐
+        // tick 复渲染空内容=无东西可淡，「退出无动画」的根因。
+        let content_empty = cands.is_empty() && raw.is_empty();
+        if !content_empty {
+            match g.cand2.as_mut() {
+                Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
+                None => {}
+            }
         }
         // 【滚轮缩放候选框】缓存渲染参数：WM_MOUSEWHEEL 改字号后
-        // 免键事件立即重绘
-        g.last_show = Some((cands.clone(), raw.clone(), sel));
+        // 免键事件立即重绘（空帧保留旧值供退场渐隐复渲染）
+        if !content_empty {
+            g.last_show = Some((cands.clone(), raw.clone(), sel));
+        }
         // 显示完成：清除首帧抑制补显标记
         g.cand_shown_this_segment = true;
         g.wps_caret_prev = None;
