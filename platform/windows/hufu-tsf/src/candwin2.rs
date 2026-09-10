@@ -377,6 +377,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                             // 归零，下个会话按首个内容重定
                             c.size_anim = None;
                             c.chrome_override.set(None);
+                            c.scale_in.set(false);
+                            c.pos_anim = None;
                             c.live_size.set((0, 0));
                             let _ = KillTimer(hwnd, FADE_TIMER_ID);
                         }
@@ -629,10 +631,18 @@ pub struct CandidateWindowV2 {
     pub(crate) hl_center: std::cell::Cell<Option<(f32, f32)>>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
     pub(crate) scale_in: std::cell::Cell<bool>,
-    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 200，0=瞬跳）——注释
+    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
+    /// 【位置滑动 2026-09-11】整句自动上屏后剩余内容跳到新光标、候选
+    /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
+    /// 而非一跳一跳。None=瞬移。
+    pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
+    /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 120，0=瞬跳）
+    pub(crate) pos_ms: u32,
+    /// 最近一次 SWP 应用过的窗口左上角屏幕坐标（位置动效的起臂基准）
+    pub(crate) live_pos: std::cell::Cell<(i32, i32)>,
     /// 【拉伸动效 2026-09-11】当前帧外壳（背景/边框/阴影/RGN）的物理
     /// 窗口尺寸覆盖（含阴影边距）：动效 tick 每帧设置为当前插值尺寸
     /// ——面板外壳被「拉过去」（延伸感），内容按目标布局裁在外壳内；
@@ -930,7 +940,10 @@ impl CandidateWindowV2 {
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
-                size_ms: 200,
+                size_ms: 120,
+                pos_anim: None,
+                pos_ms: 120,
+                live_pos: std::cell::Cell::new((0, 0)),
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
@@ -1077,7 +1090,8 @@ impl CandidateWindowV2 {
         // /收尾改纯运动：首键从 72% 长大到目标（边框阴影跟着拉出），
         // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
         self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
-        self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
+        self.size_ms = layout_f(skin, "size_ms", 120.0).clamp(0.0, 600.0) as u32;
+        self.pos_ms = layout_f(skin, "pos_ms", 120.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -3292,13 +3306,39 @@ impl CandidateWindowV2 {
                 } else {
                     apply
                 };
+                // 【位置滑动】可见中且目标位移动于 6px → 起臂位置动效
+                //（整句自动上屏：候选跟新光标丝滑滑过去）；首显/小位移
+                // 瞬移。tick 每 15ms move-only 步进（不重绘，零成本）。
+                let (tx, ty) = (
+                    x - (shadow_m * dpi_scale) as i32,
+                    y - (shadow_m * dpi_scale) as i32,
+                );
+                if was_visible && self.pos_ms > 0 && !self.internal_rerender {
+                    let (lx, ly) = self.live_pos.get();
+                    let d = (tx - lx).abs().max((ty - ly).abs());
+                    if d >= 6 {
+                        self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now()));
+                        unsafe {
+                            let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                        }
+                    } else if d > 0 {
+                        self.pos_anim = None;
+                    }
+                }
+                let (px, py) = match self.pos_anim {
+                    Some((f, t, t0)) => {
+                        size_ease(f, t, t0.elapsed().as_millis() as u32, self.pos_ms)
+                    }
+                    None => (tx, ty),
+                };
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
+                self.live_pos.set((px, py));
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
-                    x - (shadow_m * dpi_scale) as i32,
-                    y - (shadow_m * dpi_scale) as i32,
+                    px,
+                    py,
                     apply.0,
                     apply.1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -3474,6 +3514,8 @@ impl CandidateWindowV2 {
                 // 下会话重定
                 self.size_anim = None;
                 self.chrome_override.set(None);
+                self.scale_in.set(false);
+                self.pos_anim = None;
                 self.live_size.set((0, 0));
             }
         }
@@ -3502,6 +3544,8 @@ impl CandidateWindowV2 {
         // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
         // 中下方」的病根）。
         self.last_raw_len = usize::MAX;
+        // 【位置滑动】收窗即作废位置动效（下个组段首显瞬移新位）
+        self.pos_anim = None;
         // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
         // ——下一组段恢复跟随 caret。
         self.sticky_drag = false;
@@ -3588,6 +3632,29 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
+            }
+        }
+        // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
+        // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
+        if let Some((f, t, t0)) = c.pos_anim {
+            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, c.pos_ms);
+            if cur == t {
+                c.pos_anim = None;
+                c.live_pos.set(t);
+            } else {
+                anim_done = false;
+                c.live_pos.set(cur);
+                if c.is_visible() {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        cur.0,
+                        cur.1,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
         if c.fade.is_some() {
