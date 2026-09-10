@@ -510,15 +510,24 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
         let mut canvas = Canvas::new(w_out.max(1), h_out.max(1));
 
         // ── 投影：10 层外扩圆角矩形衰减（内浓外淡，同 DLL 顺序）──
+        // 【阴影黑块修复 2026-09-11】默认色曾为 #000000FF（全不透明），
+        // 10 层 src-over 累积后最内区 ≈94% 纯黑——server 代画路径（DComp
+        // 窗被宿主 cloaked / 打包宿主时启用）在皮肤未定义 shadow_color
+        // 的机器上出现「巨大实心黑阴影」（用户实拍截图）。两修：
+        // ① 默认对齐 DLL 侧 MaterialConfig 默认 0x59（35% alpha）；
+        // ② 单层 alpha 按 Σ(1-t)²≈2.85 归一化——任意 sa 下累积峰值≈sa
+        // 本身（与 DLL 单遍高斯语义一致），不再层叠超黑。
         if has_shadow {
-            let sc = skin_color4(skin, "shadow_color", "#000000FF");
+            let sc = skin_color4(skin, "shadow_color", "#00000059");
             let sa = sc.3 as f32 / 255.0;
             if sa > 0.004 {
                 const PASSES: usize = 10;
+                // Σ_{t=0.1..1.0} (1-t)² ≈ 2.85 —— 归一化因子
+                const ACCUM: f32 = 2.85;
                 for i in (1..=PASSES).rev() {
                     let t = i as f32 / PASSES as f32;
                     let grow = shadow_radius * t;
-                    let a = sa * (1.0 - t) * (1.0 - t);
+                    let a = (sa * (1.0 - t) * (1.0 - t) / ACCUM).min(1.0);
                     let col = (sc.0, sc.1, sc.2, (a * 255.0) as u8);
                     fill_round_rect(
                         &mut canvas,
@@ -1027,5 +1036,107 @@ pub fn reinit_if_dead() {
     };
     if dead {
         init_on_tray_thread();
+    }
+}
+
+// ══ 渲染回归门禁（发版流程阶段④）══════════════════════════════
+// 阴影路径为纯软件计算（无 GDI/D2D 依赖）→ 机器无关，可断言。
+// 【2026-09-11 黑阴影回归】皮肤缺 shadow_color 键时默认曾是
+// #000000FF，10 层 src-over 叠加峰值 ≈94% 纯黑——在只能触发
+// server 代画路径的机器上出现「巨大实心黑阴影块」。以下测试
+// 锁死：任何皮肤（含缺键）下阴影峰值 alpha 不得超温和上限。
+#[cfg(test)]
+mod shadow_gate_tests {
+    use super::*;
+
+    fn frame_with(skin: serde_json::Value) -> CandFrame {
+        CandFrame {
+            items: vec![
+                ("就".to_string(), String::new()),
+                ("地方".to_string(), String::new()),
+            ],
+            raw: "g".to_string(),
+            selected: 0,
+            skin,
+        }
+    }
+
+    /// 窗体（含 shadow_m 边距内侧）之外所有像素的峰值 alpha——
+    /// 即阴影最浓处的不透明度。
+    fn shadow_peak_alpha(w: i32, h: i32, px: &[u8], m: i32) -> u8 {
+        let pitch = w as usize * 4;
+        let (mi, mli, hli) = (m as usize, (w - m) as usize, (h - m) as usize);
+        let mut peak = 0u8;
+        for y in 0..h as usize {
+            let inside_rows = y >= mi && y < hli;
+            for x in 0..w as usize {
+                if inside_rows && x >= mi && x < mli {
+                    continue; // 窗体本体
+                }
+                let a = px[y * pitch + x * 4 + 3];
+                if a > peak {
+                    peak = a;
+                }
+            }
+        }
+        peak
+    }
+
+    /// ① 缺 shadow_color 键（旧皮肤/迁移皮肤）→ 温和默认（≤60%）
+    #[test]
+    fn shadow_soft_when_key_missing() {
+        let skin = serde_json::json!({
+            "skin": { "layout": { "shadow_radius": 12.0 } }
+            // 故意不定义 colors.shadow_color
+        });
+        let (w, h, px, m) = render_frame(&frame_with(skin), 1.0);
+        assert!(m > 0, "shadow_radius>0 必须产生阴影边距");
+        let peak = shadow_peak_alpha(w, h, &px, m);
+        assert!(
+            peak < 153,
+            "缺键皮肤阴影峰值 alpha={peak} 超 60% 上限——黑块回归（默认值/归一化又漂了）"
+        );
+    }
+
+    /// ② 默认皮肤（完整键）→ 同样温和
+    #[test]
+    fn shadow_soft_with_explicit_default() {
+        let skin = serde_json::json!({
+            "skin": {
+                "layout": { "shadow_radius": 12.0 },
+                "colors": { "shadow_color": "#00000059" }
+            }
+        });
+        let (w, h, px, m) = render_frame(&frame_with(skin), 1.0);
+        let peak = shadow_peak_alpha(w, h, &px, m);
+        assert!(peak < 153, "显式默认皮肤阴影峰值 alpha={peak} 超 60%");
+    }
+
+    /// ③ 用户显式设浓阴影（78%）→ 生效但永不近实心（<80%）
+    #[test]
+    fn shadow_respects_strong_setting_without_slab() {
+        let skin = serde_json::json!({
+            "skin": {
+                "layout": { "shadow_radius": 12.0 },
+                "colors": { "shadow_color": "#000000C8" }
+            }
+        });
+        let (w, h, px, m) = render_frame(&frame_with(skin), 1.0);
+        let peak = shadow_peak_alpha(w, h, &px, m);
+        assert!(
+            peak >= 89,
+            "浓阴影设定（sa=0.78）应比默认（≈0.30 累积）更浓，实测 {peak}"
+        );
+        assert!(peak < 204, "浓阴影峰值 alpha={peak} 仍近实心——黑块回归");
+    }
+
+    /// ④ shadow_radius=0 → 无阴影边距（结构不变式）
+    #[test]
+    fn no_shadow_when_radius_zero() {
+        let skin = serde_json::json!({
+            "skin": { "layout": { "shadow_radius": 0.0 } }
+        });
+        let (w, _h, _px, m) = render_frame(&frame_with(skin), 1.0);
+        assert_eq!(m, 0, "radius=0 时必须零阴影边距");
     }
 }
