@@ -355,7 +355,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     if let Some(c) = cand2.as_mut() {
                         let vis_long = c
                             .last_show_at
-                            .map(|t| t.elapsed().as_millis() >= FADE_QUIET_MS)
+                            .map(|t| t.elapsed().as_millis() >= EXIT_QUIET_MS)
                             .unwrap_or(false);
                         let already_out = matches!(c.fade, Some((false, _)));
                         // 【收尾淡出 2026-09-11】用户点名「候选消失也给个
@@ -1801,12 +1801,21 @@ impl CandidateWindowV2 {
             None => (width, height),
         };
         // 【高亮锚定】入场动画中：内容盒中心对准高亮胶囊中心——内容
-        // 平移 (−bx,−by)、窗口定位加 (bx,by)（稳态/普通尺寸动效 = 0）
+        // 平移 (−bx,−by)、窗口定位加 (bx,by)。锚点随进度 k 线性归零：
+        // 起臂时盒心=高亮，完成帧=自然盒心 (0,0)——否则终帧从锚位跳到
+        // 落位（用户「出来的时候很跳」根因）。稳态/普通尺寸动效 = 0。
         let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
+            let k = match self.size_anim {
+                Some((_, _, t0)) => {
+                    (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32).clamp(0.0, 1.0)
+                }
+                None => 1.0,
+            };
+            let damp = 1.0 - k;
             (
-                (hx - chw * 0.5).clamp(-width * 0.5, width * 0.5),
-                (hy - chh * 0.5).clamp(-height * 0.5, height * 0.5),
+                (damp * (hx - chw * 0.5)).clamp(-width * 0.5, width * 0.5),
+                (damp * (hy - chh * 0.5)).clamp(-height * 0.5, height * 0.5),
             )
         } else {
             (0.0, 0.0)
@@ -3537,8 +3546,12 @@ pub const FADE_TIMER_ID: usize = 0x4846_5550; // 'HuFZ'
 pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
 pub const FADE_TICK_MS: u32 = 15;
 /// 静默期：show↔hide 间隔小于此值直接跳过动画（连打逐字上屏的
-/// 收放循环不频闪）
+/// 收放循环不频闪）——仅管入场侧
 const FADE_QUIET_MS: u128 = 250;
+/// 【退场门 2026-09-11】独立于入场静默期：短码快打（两键+空格常
+/// <250ms）被 250ms 门判成连打直藏=「消失没动画」。退场降到 120ms
+///——持续连打（词间隔 <120ms）仍防频闪，正常上屏都给淡出。
+const EXIT_QUIET_MS: u128 = 120;
 /// 【淡入淡出下限 2026-09-11】动画期间整帧 alpha 的最低值——低于此
 /// 值面板接近全透、底层文字透出（用户「重叠感」）。0.6×皮肤自身
 /// master_alpha≈0.68 → 最低有效不透明 ≈0.41：柔和淡入且不重叠。
