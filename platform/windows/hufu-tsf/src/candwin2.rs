@@ -1737,7 +1737,9 @@ impl CandidateWindowV2 {
             (0.0, 0.0)
         };
         'sizedraw: {
-            if !self.ensure_swapchain(cw_out.max(1), ch_out.max(1)) {
+            // 【零位移配套】缓冲按目标窗口（非插值壳）——动画全程窗口
+            // 恒定，缓冲每键至多扩一次（grow-only），无逐 tick resize
+            if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
                 crate::tsf::trace("cw2: ensure_swapchain FAIL");
                 return;
             }
@@ -2882,22 +2884,13 @@ impl CandidateWindowV2 {
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
             let sp_ok = if !dragging {
-                // 【尺寸动效】决策已在渲染前完成（size_anim 已定）——
-                // 此处只应用：动效中=当前插值尺寸，否则=目标尺寸。
-                // 命中盒按目标内容（揭示中余量仍穿透）。
-                let apply = match self.size_anim {
-                    Some((f, t, t0)) => {
-                        size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms)
-                    }
-                    None => (w_out as i32, h_out as i32),
-                };
-                // 【高亮锚定 v2】入场动画=窗口内的盒生长：窗口位置/尺寸
-                // 全程=目标（零位移零跳变），盒偏移只体现在渲染（bx/by）
-                let apply = if self.scale_in.get() && self.size_anim.is_some() {
-                    (w_out as i32, h_out as i32)
-                } else {
-                    apply
-                };
+                // 【零位移 2026-09-11·终版】窗口尺寸一步到位=目标（每键
+                // 仅一次 SWP，与无动效时代同频——动画全程窗口不 resize，
+                // 杜绝 flip-model 逐帧中间态 resize 的 DWM 拉伸闪烁；
+                // 用户实测「按键一下字闪一下」的根源）。动画=壳盒
+                // （chrome_override）在稳定窗口内从小长大——入场 v2 与
+                // 拉伸动效统一此语义。命中盒按目标内容（揭示中余量仍穿透）。
+                let apply = (w_out as i32, h_out as i32);
                 // 【位置滑动】可见中且目标位移动于 6px → 起臂位置动效
                 //（整句自动上屏：候选跟新光标丝滑滑过去）；首显/小位移
                 // 瞬移。tick 每 15ms move-only 步进（不重绘，零成本）。
