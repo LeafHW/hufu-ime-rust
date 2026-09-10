@@ -669,6 +669,8 @@ unsafe fn push_shadow_mask(
     shadow_m: f32,
     radius: f32,
     dpi: f32,
+    bx: f32,
+    by: f32,
 ) -> bool {
     // 【高DPI二次缩放修复 2026-09-11】调用方现已在 identity 世界变换
     // 下 Push 本 mask（对齐玻璃段正序：先切 identity 再 Push——mask
@@ -689,10 +691,10 @@ unsafe fn push_shadow_mask(
     };
     let win = match f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
-            left: shadow_m * dpi,
-            top: shadow_m * dpi,
-            right: (shadow_m + width) * dpi,
-            bottom: (shadow_m + height) * dpi,
+            left: (shadow_m + bx) * dpi,
+            top: (shadow_m + by) * dpi,
+            right: (shadow_m + bx + width) * dpi,
+            bottom: (shadow_m + by + height) * dpi,
         },
         radiusX: radius * dpi,
         radiusY: radius * dpi,
@@ -1800,10 +1802,12 @@ impl CandidateWindowV2 {
             ),
             None => (width, height),
         };
-        // 【高亮锚定】入场动画中：内容盒中心对准高亮胶囊中心——内容
-        // 平移 (−bx,−by)、窗口定位加 (bx,by)。锚点随进度 k 线性归零：
-        // 起臂时盒心=高亮，完成帧=自然盒心 (0,0)——否则终帧从锚位跳到
-        // 落位（用户「出来的时候很跳」根因）。稳态/普通尺寸动效 = 0。
+        // 【高亮锚定 v2 2026-09-11】入场动画：窗口位置/尺寸=目标全程
+        // 稳定（零位移=零跳变），动画=窗口内的「外壳盒」从高亮胶囊处
+        // 长到全窗。盒左上 = damp·(高亮−盒半) 且钳制在窗内 [0, 尺寸−
+        // 盒]：高亮贴左/贴顶（横紧首候选、竖排首行）→ 盒贴对应边缘
+        // 就地生长（左/上无内容不空跳）；高亮居中 → 对称展开。damp 随
+        // 进度归零，完成帧=整窗。普通尺寸动效/稳态 bx=by=0。
         let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
@@ -1814,8 +1818,8 @@ impl CandidateWindowV2 {
             };
             let damp = 1.0 - k;
             (
-                (damp * (hx - chw * 0.5)).clamp(-width * 0.5, width * 0.5),
-                (damp * (hy - chh * 0.5)).clamp(-height * 0.5, height * 0.5),
+                (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
+                (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
             )
         } else {
             (0.0, 0.0)
@@ -2022,10 +2026,10 @@ impl CandidateWindowV2 {
                                     let mask = ctx.GetFactory().ok().and_then(|f| {
                                         f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
                                             rect: D2D_RECT_F {
-                                                left: shadow_m * dpi_scale,
-                                                top: shadow_m * dpi_scale,
-                                                right: (shadow_m + chw) * dpi_scale,
-                                                bottom: (shadow_m + chh) * dpi_scale,
+                                                left: (shadow_m + bx) * dpi_scale,
+                                                top: (shadow_m + by) * dpi_scale,
+                                                right: (shadow_m + bx + chw) * dpi_scale,
+                                                bottom: (shadow_m + by + chh) * dpi_scale,
                                             },
                                             radiusX: radius * dpi_scale,
                                             radiusY: radius * dpi_scale,
@@ -2182,7 +2186,7 @@ impl CandidateWindowV2 {
                                         );
                                         let mask_ok = push_shadow_mask(
                                             &ctx, chw, chh, cw_out, ch_out, shadow_m, radius,
-                                            dpi_scale,
+                                            dpi_scale, bx, by,
                                         );
                                         // 【阴影分离修复·终版 2026-09-08】曾加
                                         // GetImageLocalBounds 补偿——实错：DrawImage
@@ -2237,10 +2241,10 @@ impl CandidateWindowV2 {
                                     .ok()?;
                                 let rr_win = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
-                                        left: shadow_m,
-                                        top: shadow_m,
-                                        right: shadow_m + chw,
-                                        bottom: shadow_m + chh,
+                                        left: shadow_m + bx,
+                                        top: shadow_m + by,
+                                        right: shadow_m + bx + chw,
+                                        bottom: shadow_m + by + chh,
                                     },
                                     radiusX: radius,
                                     radiusY: radius,
@@ -2291,6 +2295,7 @@ impl CandidateWindowV2 {
                                 });
                                 let mask_ok = push_shadow_mask(
                                     &ctx, chw, chh, cw_out, ch_out, shadow_m, radius, dpi_scale,
+                                    bx, by,
                                 );
                                 // 【阴影分离修复·终版】同缓存命中分支：无补偿
                                 // 原语义（详见上方注释）。
@@ -2353,10 +2358,10 @@ impl CandidateWindowV2 {
                                 let win_geom = factory.as_ref().and_then(|f| {
                                     let rr = D2D1_ROUNDED_RECT {
                                         rect: D2D_RECT_F {
-                                            left: shadow_m,
-                                            top: shadow_m,
-                                            right: shadow_m + chw,
-                                            bottom: shadow_m + chh,
+                                            left: shadow_m + bx,
+                                            top: shadow_m + by,
+                                            right: shadow_m + bx + chw,
+                                            bottom: shadow_m + by + chh,
                                         },
                                         radiusX: radius,
                                         radiusY: radius,
@@ -2377,10 +2382,10 @@ impl CandidateWindowV2 {
                                     });
                                     let rr = D2D1_ROUNDED_RECT {
                                         rect: D2D_RECT_F {
-                                            left: shadow_m - grow + shadow_off_x * t,
-                                            top: shadow_m - grow + shadow_off_y * t,
-                                            right: shadow_m + chw + grow + shadow_off_x * t,
-                                            bottom: shadow_m + chh + grow + shadow_off_y * t,
+                                            left: shadow_m + bx - grow + shadow_off_x * t,
+                                            top: shadow_m + by - grow + shadow_off_y * t,
+                                            right: shadow_m + bx + chw + grow + shadow_off_x * t,
+                                            bottom: shadow_m + by + chh + grow + shadow_off_y * t,
                                         },
                                         radiusX: radius + grow,
                                         radiusY: radius + grow,
@@ -2471,10 +2476,10 @@ impl CandidateWindowV2 {
                         if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: 0.0,
-                                    top: 0.0,
-                                    right: chw,
-                                    bottom: chh,
+                                    left: bx,
+                                    top: by,
+                                    right: bx + chw,
+                                    bottom: by + chh,
                                 },
                                 radiusX: radius,
                                 radiusY: radius,
@@ -2492,29 +2497,13 @@ impl CandidateWindowV2 {
                     unsafe {
                         ctx.PushAxisAlignedClip(
                             &D2D_RECT_F {
-                                left: 0.0,
-                                top: 0.0,
-                                right: chw,
-                                bottom: chh,
+                                left: bx,
+                                top: by,
+                                right: bx + chw,
+                                bottom: by + chh,
                             },
                             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                         );
-                    }
-                }
-                // 【高亮锚定】入场动画中内容平移 (−bx,−by)——高亮胶囊停
-                // 在动画盒中心，其余内容向四周展开；边框前还原（边框属
-                // 外壳，永远画在盒缘）
-                let hl_anchor_on = bx != 0.0 || by != 0.0;
-                if hl_anchor_on {
-                    unsafe {
-                        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                            M11: dpi_scale,
-                            M12: 0.0,
-                            M21: 0.0,
-                            M22: dpi_scale,
-                            M31: (shadow_m - bx) * dpi_scale,
-                            M32: (shadow_m - by) * dpi_scale,
-                        });
                     }
                 }
 
@@ -2838,28 +2827,16 @@ impl CandidateWindowV2 {
                     }
 
                     // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
-                    // 描边方案用户否决已撤】（属外壳——先还原内容平移）
-                    if hl_anchor_on {
-                        unsafe {
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: dpi_scale,
-                                M12: 0.0,
-                                M21: 0.0,
-                                M22: dpi_scale,
-                                M31: shadow_m * dpi_scale,
-                                M32: shadow_m * dpi_scale,
-                            });
-                        }
-                    }
+                    // 描边方案用户否决已撤】（属外壳：画在动画盒缘 +bx/+by）
                     if let Some(b) = &b_border {
                         if kind != "glass" {
                             let bw = layout_f(skin, "border_width", 1.0);
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: bw / 2.0,
-                                    top: bw / 2.0,
-                                    right: chw - bw / 2.0,
-                                    bottom: chh - bw / 2.0,
+                                    left: bx + bw / 2.0,
+                                    top: by + bw / 2.0,
+                                    right: bx + chw - bw / 2.0,
+                                    bottom: by + chh - bw / 2.0,
                                 },
                                 radiusX: radius,
                                 radiusY: radius,
@@ -3308,20 +3285,20 @@ impl CandidateWindowV2 {
                     }
                     None => (w_out as i32, h_out as i32),
                 };
+                // 【高亮锚定 v2】入场动画=窗口内的盒生长：窗口位置/尺寸
+                // 全程=目标（零位移零跳变），盒偏移只体现在渲染（bx/by）
+                let apply = if self.scale_in.get() && self.size_anim.is_some() {
+                    (w_out as i32, h_out as i32)
+                } else {
+                    apply
+                };
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
-                // 【高亮锚定】入场中窗口跟动画盒滑动（内容已平移 −bx/−by，
-                // 此处定位 +bx/+by 使高亮胶囊钉在屏上原地，盒向四周展开）
-                let (ax, ay) = if self.scale_in.get() && self.size_anim.is_some() {
-                    ((bx * dpi_scale) as i32, (by * dpi_scale) as i32)
-                } else {
-                    (0, 0)
-                };
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
-                    x - (shadow_m * dpi_scale) as i32 + ax,
-                    y - (shadow_m * dpi_scale) as i32 + ay,
+                    x - (shadow_m * dpi_scale) as i32,
+                    y - (shadow_m * dpi_scale) as i32,
                     apply.0,
                     apply.1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -3355,16 +3332,19 @@ impl CandidateWindowV2 {
             // ——非 glass 分支显式清 RGN（SetWindowRgn NULL=恢复全窗）。
             if kind == "glass" {
                 let rgn_r = (radius * dpi_scale).round().max(1.0) as i32;
-                // 【拉伸动效】RGN 按外壳有效尺寸（动效帧=插值）——圆角
-                // 裁剪跟边缘走
-                let rgn_key = ((cw_out as u64) << 32) | ((ch_out as u64) << 16) | rgn_r as u64;
+                // 【拉伸动效】RGN 按外壳有效尺寸+盒偏移（动效帧=插值+锚位）
+                let rgn_key = ((cw_out as u64) << 48)
+                    | ((ch_out as u64) << 32)
+                    | (((bx * 4.0) as i64 as u64) & 0xFF_u64) << 24
+                    | (((by * 4.0) as i64 as u64) & 0xFF_u64) << 16
+                    | rgn_r as u64;
                 if self.rgn_last.get() != rgn_key {
                     unsafe {
                         let rgn = CreateRoundRectRgn(
-                            0,
-                            0,
-                            cw_out as i32 + 1,
-                            ch_out as i32 + 1,
+                            (bx * dpi_scale) as i32,
+                            (by * dpi_scale) as i32,
+                            (bx * dpi_scale) as i32 + cw_out as i32 + 1,
+                            (by * dpi_scale) as i32 + ch_out as i32 + 1,
                             rgn_r,
                             rgn_r,
                         );
