@@ -369,9 +369,11 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     if !do_fade {
                         if let Some(c) = cand2.as_mut() {
                             c.last_hide_at = Some(std::time::Instant::now());
-                            // 【rect 只增不减】隐藏即整窗退役——余量基准
+                            // 【尺寸动效】隐藏即整窗退役——动效与余量基准
                             // 归零，下个会话按首个内容重定
+                            c.size_anim = None;
                             c.live_size.set((0, 0));
+                            let _ = KillTimer(hwnd, FADE_TIMER_ID);
                         }
                     }
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -612,6 +614,14 @@ pub struct CandidateWindowV2 {
     pub(crate) internal_rerender: bool,
     /// 上次真正隐藏时刻（静默期判定：show 距 hide <250ms 全显不动画）
     pub(crate) last_hide_at: Option<std::time::Instant>,
+    /// 【尺寸动效 2026-09-11】(from, to, t0)：可见更新时窗口 rect 从当前
+    /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
+    /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
+    pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
+    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=关）——注释
+    /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
+    /// （从当前插值位置追赶新目标，不跳变）。
+    pub(crate) size_ms: u32,
     /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
     pub(crate) last_show_at: Option<std::time::Instant>,
     /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
@@ -898,6 +908,8 @@ impl CandidateWindowV2 {
                 internal_rerender: false,
                 last_hide_at: None,
                 last_show_at: None,
+                size_anim: None,
+                size_ms: 120,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
@@ -1034,8 +1046,13 @@ impl CandidateWindowV2 {
         // 内容仍正确——生产路径弹窗必经尺寸增长，实测为合成态）、
         // comment_delay_ms=400（0=注释常显）。
         let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        // 阴影 alpha 复位：上次渐变留下的整窗 alpha 不能带进无动画帧
+        if self.fade.is_none() {
+            shadowwin_set_alpha(1.0);
+        }
         let now = std::time::Instant::now();
         self.fade_ms = layout_f(skin, "fade_ms", 120.0).clamp(0.0, 600.0) as u32;
+        self.size_ms = layout_f(skin, "size_ms", 120.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -3089,23 +3106,45 @@ impl CandidateWindowV2 {
                 );
             }
             let sp_ok = if !dragging {
-                // 【rect 只增不减】可见期间不收缩窗口（DWM 收缩重绑丢弃
-                // 半透明呈现）；内容收窄时窗口保持原尺寸、内容画在左上、
-                let live = self.live_size.get();
-                // 【rect 只增不减】可见期间窗口 rect 不收缩（减少 swapchain
-                // 重建与 DWM 表面重绑抖动）；内容收窄时余量透明 +
-                // WM_NCHITTEST HTTRANSPARENT 穿透。隐藏时 live 归零。
-                let apply_w = (w_out as i32).max(live.0);
-                let apply_h = (h_out as i32).max(live.1);
-                self.live_size.set((apply_w, apply_h));
-                self.content_size.set((w_out as i32, h_out as i32));
+                // 【尺寸动效 2026-09-11】可见更新时宽高插值逼近目标：
+                // 内容按目标布局即刻渲染（缓冲只增不减），窗口 rect 每
+                // tick 靠近——增长=余量渐进揭示，收窄=渐进出口。小
+                // delta（<10px）直接就位不抖。首显（刚从隐藏来）与
+                // 拖拽直接跳目标。连打重定目标=从当前插值位置追赶。
+                let target = (w_out as i32, h_out as i32);
+                let cur = match self.size_anim {
+                    Some((f, t, t0)) => {
+                        size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms)
+                    }
+                    None => self.live_size.get(),
+                };
+                if was_visible
+                    && self.size_ms > 0
+                    && ((target.0 - cur.0).abs() > 10 || (target.1 - cur.1).abs() > 8)
+                {
+                    self.size_anim = Some((cur, target, std::time::Instant::now()));
+                    unsafe {
+                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                    }
+                } else {
+                    self.size_anim = None;
+                }
+                let apply = if self.size_anim.is_some() {
+                    cur
+                } else {
+                    target
+                };
+                self.live_size.set(apply);
+                // 命中测试按目标内容盒（揭示中余量仍穿透：HTTRANSPARENT
+                // 只认 content_size）
+                self.content_size.set(target);
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
-                    apply_w,
-                    apply_h,
+                    apply.0,
+                    apply.1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
             } else {
@@ -3256,10 +3295,14 @@ impl CandidateWindowV2 {
             if !fading_in {
                 unsafe {
                     let _ = KillTimer(self.hwnd, EXPAND_TIMER_ID);
+                    let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
+                shadowwin_set_alpha(1.0);
                 self.last_hide_at = Some(std::time::Instant::now());
-                // 【rect 只增不减】窗退役：余量基准归零，下会话重定
+                // 【rect 只增不减→尺寸动效】窗退役：动效与余量基准归零，
+                // 下会话重定
+                self.size_anim = None;
                 self.live_size.set((0, 0));
             }
         }
@@ -3315,8 +3358,9 @@ pub const FADE_TICK_MS: u32 = 15;
 /// 收放循环不频闪）
 const FADE_QUIET_MS: u128 = 250;
 
-/// 【动效】渐隐渐显 tick：take cand2+last_show → 推进状态 → 按当前
-/// fade alpha 复渲染（滚轮同款锁外渲染）→ 放回。动画结束 KillTimer。
+/// 【动效】渐隐渐显 + 尺寸动效 tick：take cand2+last_show → 推进 fade
+/// 状态 →（fade 活跃时）按当前 alpha 复渲染 → 尺寸插值步进（只 SWP
+/// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
 unsafe fn fade_tick_shared(hwnd: HWND) {
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
         return;
@@ -3326,18 +3370,49 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
     };
-    let mut done = false;
+    let mut anim_done = true;
     if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
-        done = c.fade_tick();
-        // 仍在显示（渐显过渡/完成帧；渐隐完成时已 SW_HIDE 跳过复渲染
-        // ——show() 的 SWP_SHOWWINDOW 会把刚藏的窗复活）
-        if c.is_visible() {
+        let had_fade = c.fade.is_some();
+        let fade_done = c.fade_tick();
+        if had_fade && c.is_visible() {
+            // 仍在显示（渐显过渡/完成帧；渐隐完成时已 SW_HIDE 跳过复渲染
+            // ——show() 的 SWP_SHOWWINDOW 会把刚藏的窗复活）
             c.internal_rerender = true;
             c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             c.internal_rerender = false;
+            // 阴影窗 alpha 同步面板（否则面板渐入、阴影全浓=重叠感）
+            shadowwin_set_alpha(c.fade_alpha());
+            if fade_done {
+                shadowwin_set_alpha(1.0);
+            }
+        }
+        // 尺寸动效步进：SWP 到插值尺寸（内容/位置不动——show 已按目标
+        // 布局渲染、锚点已定）；完成帧精确就位并清理
+        if let Some((f, t, t0)) = c.size_anim {
+            let ms = t0.elapsed().as_millis() as u32;
+            let cur = size_ease(f, t, ms, c.size_ms);
+            let finished = cur == t;
+            if finished {
+                c.size_anim = None;
+            } else {
+                anim_done = false;
+            }
+            c.live_size.set(cur);
+            let _ = SetWindowPos(
+                c.hwnd,
+                HWND(std::ptr::null_mut()),
+                0,
+                0,
+                cur.0,
+                cur.1,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        if c.fade.is_some() {
+            anim_done = false;
         }
     }
-    if done {
+    if anim_done {
         let _ = KillTimer(hwnd, FADE_TIMER_ID);
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -3694,6 +3769,34 @@ pub fn shadowwin_show(
             off_y,
             g_alpha,
         );
+    }
+}
+
+/// 【尺寸动效 2026-09-11】ease-out 二次插值：t∈[0,ms] 映射进度
+/// p=1-(1-t)²，返回 from→to 的即时尺寸（t≥ms 即 to）。
+pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
+    if dur_ms == 0 || t_ms >= dur_ms {
+        return to;
+    }
+    let x = t_ms as f32 / dur_ms as f32;
+    let p = 1.0 - (1.0 - x) * (1.0 - x);
+    let l = |a: i32, b: i32| a + ((b - a) as f32 * p).round() as i32;
+    (l(from.0, to.0), l(from.1, to.1))
+}
+
+/// 【动效】渐隐渐显阴影窗同步：整窗 alpha 跟随面板 fade 值（否则
+/// 面板半透渐入、阴影全浓=「重叠」感）。无阴影窗（纯色模式）安全跳过。
+pub(crate) fn shadowwin_set_alpha(a: f32) {
+    let g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = *g {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
+                HWND(h as *mut _),
+                windows::Win32::Foundation::COLORREF(0),
+                (a.clamp(0.0, 1.0) * 255.0) as u8,
+                LWA_ALPHA,
+            );
+        }
     }
 }
 
