@@ -1,6 +1,5 @@
-﻿# 【同步 2026-09-11】主=E:\DSH-KF\hufu-发行\打包源\install.ps1
-#   从=本文件（E:\DSH-KF\hufu\发行脚本\install.ps1，仓库副本）：随主文件整文件同步——
-#   除本同步注释（3 行）外须与主文件逐字一致；任何改动一律改主文件后重新覆盖本文件。
+﻿# 【同步 2026-09-11】主=E:\DSH-KF\hufu-发行\打包源\install.ps1（本文件，真实使用）；
+#   从=E:\DSH-KF\hufu\发行脚本\install.ps1（仓库副本）：以本文件为准整文件同步，改动一律改本文件后覆盖从文件。
 # HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
 # - 文件/HKCU/语言列表/自启/server 永远普通权限执行（server 提权启动会锁管道 ACL，
 #   导致所有普通应用连不上→只能打字母，2026-08-29 实测教训）。
@@ -32,6 +31,13 @@ $icon = Join-Path $inst '图标.ico'
 # 实测：SearchHost 不加载用户目录 DLL → 搜索框字母直通。
 $sysdir = 'C:\Windows\SystemIME\HuFu'
 $sysdll = Join-Path $sysdir 'hufu_tsf.dll'
+
+# 【虎爪保护 2026-09-11】升级检测：本输入法 TIP 键已存在 = 升级安装。
+# ctfmon 重启会触发 msctf 对 TIP 存储的一致性校验，注册结构非原生的
+# 第三方输入法（虎爪）概率被判非法周期删除（用户复报「安装概率杀
+# 死虎爪」）。升级场景：TIP 早已在列表，新文件随应用重开生效，无
+# 需刷新——跳过 ctfmon 杀启；仅首次安装（键不存在）才刷新。
+$tipAlready = (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") -or (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID")
 
 function Set-Reg([string]$path, [string]$name, [string]$val) {
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
@@ -387,9 +393,15 @@ Start-Sleep -Seconds 2
 # 非原生/不完整的第三方输入法（如虎爪）判非法周期删除——「装完
 # HuFu 虎爪从列表消失」的概率性根因。ctfmon 重载即可让新 TIP 进
 # Win+空格列表，无需动 shell 组件。
-Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
-Start-Process ctfmon -ErrorAction SilentlyContinue
+# 【2026-09-11 虎爪保护二阶】ctfmon 重启本身仍会触发同款校验——升级
+# 安装（$tipAlready）完全跳过刷新；仅首次安装执行。
+if (-not $tipAlready) {
+    Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    Start-Process ctfmon -ErrorAction SilentlyContinue
+} else {
+    Write-Host 'OK 升级安装：跳过 ctfmon 刷新（虎爪保护；新文件随应用重开生效）'
+}
 
 Write-Host ''
 Write-Host '=========================================='

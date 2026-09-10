@@ -1,4 +1,4 @@
-//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
+﻿//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
@@ -511,6 +511,26 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
 }
 
 /// OnSetFocus 主体（从 trait 方法抽出，供 edit session 出口回放共用）。
+/// 【焦点模式同步 2026-09-11】focus worker 线程回写的中英态
+/// （0=无待同步 1=中文 2=英文）——Shared 含 COM 原始指针不可跨
+/// 线程移动，经此原子中转；下一次 dispatch（UI 线程）懒应用。
+static CHINESE_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 懒应用待同步的中英态（dispatch 入口调用，UI 线程安全）。
+fn apply_chinese_sync(shared: &SharedRef) {
+    let v = CHINESE_SYNC.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if v == 0 {
+        return;
+    }
+    let zh = v == 1;
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if g.chinese != zh {
+        g.chinese = zh;
+        crate::langbar::set_mode(zh);
+        trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
+    }
+}
+
 fn handle_set_focus(
     shared: &SharedRef,
     pdimfocus: Option<&ITfDocumentMgr>,
@@ -599,8 +619,22 @@ fn handle_set_focus(
         //    冻结（实测「点击候选框应用未响应」）。focus 响应本就无需
         //    读取，丢弃安全。焦点切换到下次按键至少隔数百 ms，管道
         //    ms 级延迟不构成竞态。
+        // 【焦点模式同步 2026-09-11】中英切换是 server 全局会话态，
+        // 其他进程（如 QQ）切走后本进程缓存 g.chinese 即失同步——
+        // 焦点切换是拉齐的唯一时机。Shared 含 COM 原始指针不可跨
+        // 线程 → worker 经 CHINESE_SYNC 原子中转，下一次 dispatch
+        // （UI 线程）懒应用（焦点到首键间隔数百 ms，管道 ms 级）。
         std::thread::spawn(|| {
-            let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
+            if let Some(resp) = ipc::call(&serde_json::json!({ "op": "focus" })) {
+                let zh = resp
+                    .pointer("/state/chinese")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                CHINESE_SYNC.store(
+                    if zh { 1 } else { 2 },
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         });
         trace("foc: C spawn完");
         {
@@ -781,6 +815,9 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
+        // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
+        // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
+        apply_chinese_sync(&self.shared);
         // 模式键（无组合歧义）：CapsLock / Ctrl+Space（按着 Ctrl 的 space，
         // 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
         let mode_key = match vk_to_name(wparam, false) {
@@ -939,6 +976,23 @@ impl HuFuTs_Impl {
         };
         trace(&format!("pipe back consumed={consumed}"));
         if !consumed {
+            // 【中英失同步自愈 2026-09-11】直通键也回填模式缓存：
+            // server 全局会话可能被其他进程切走（QQ 切英文→切 WPS，
+            // WPS 本地 g.chinese 仍 true → TestDown 预判错报吞键 →
+            // 信任 TestDown 的宿主（WPS）字符蒸发「连字母都没有」，
+            // 且旧代码 consumed=false 提前返回永不回填→不自愈）。
+            if !test_only {
+                let zh = state
+                    .get("chinese")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                if g.chinese != zh {
+                    g.chinese = zh;
+                    crate::langbar::set_mode(zh);
+                    trace(&format!("自愈: 本地中英态回填 chinese={zh}"));
+                }
+            }
             return BOOL(0);
         }
         if !test_only || mode_key {
