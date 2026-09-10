@@ -364,6 +364,24 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                             }
                             let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                             do_fade = true;
+                        } else if c.size_ms > 0
+                            && IsWindowVisible(hwnd).as_bool()
+                            && vis_long
+                            && c.size_anim.is_none()
+                        {
+                            // 【收尾收拢 2026-09-11】fade 关闭时退出场=纯
+                            // 尺寸收拢（live→70%）后真隐藏——无透明度变
+                            // 化；连打循环（<250ms）照旧直接藏
+                            let live = c.live_size.get();
+                            if live.0 > 8 && live.1 > 8 {
+                                let shrunk =
+                                    ((live.0 as f32 * 0.7) as i32, (live.1 as f32 * 0.7) as i32);
+                                c.size_anim = Some((live, shrunk, std::time::Instant::now()));
+                                c.chrome_override.set(Some(live));
+                                c.hide_after_anim.set(true);
+                                let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                                do_fade = true;
+                            }
                         }
                     }
                     if !do_fade {
@@ -619,6 +637,9 @@ pub struct CandidateWindowV2 {
     /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
     /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
     pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
+    /// 【收尾收拢 2026-09-11】尺寸动效完成后真隐藏（退出场=收拢到 70%
+    /// 再 SW_HIDE，纯运动无透明度变化）；被新内容打断时取消。
+    pub(crate) hide_after_anim: std::cell::Cell<bool>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 200，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -909,13 +930,14 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 150,
+                fade_ms: 0,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                hide_after_anim: std::cell::Cell::new(false),
                 size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1058,11 +1080,11 @@ impl CandidateWindowV2 {
             shadowwin_set_alpha(1.0);
         }
         let now = std::time::Instant::now();
-        // 【动效口径 2026-09-11 终版③】首键淡入/收尾淡出默认 150ms 开
-        //（用户点名「首出候选直接出来」要有淡入）——静默门控 250ms 保
-        // 证只对刻意出/入场生效（连打循环不闪）；下限 0.6 防透底重叠；
-        // 打字中途的尺寸变化不带透明度（无变色感）。
-        self.fade_ms = layout_f(skin, "fade_ms", 150.0).clamp(0.0, 600.0) as u32;
+        // 【动效口径 2026-09-11 终版④】透明度渐变终判弃用（半透面板+
+        // 深色底，任何 alpha 过渡都「变深/透底」——用户三度否决）。首出
+        // /收尾改纯运动：首键从 72% 长大到目标（边框阴影跟着拉出），
+        // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
+        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
         self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
@@ -1094,6 +1116,10 @@ impl CandidateWindowV2 {
                         let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
                     }
                 }
+            }
+            // 收尾收拢被新内容打断：取消退场（窗复活），交由决策块重定
+            if self.hide_after_anim.get() && !self.internal_rerender {
+                self.hide_after_anim.set(false);
             }
             self.last_show_at = Some(now);
         }
@@ -1741,6 +1767,28 @@ impl CandidateWindowV2 {
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
+                unsafe {
+                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                }
+            } else if !was_visible
+                && self.size_ms > 0
+                && self.fade_ms == 0
+                && self
+                    .last_hide_at
+                    .map(|t| {
+                        std::time::Instant::now().duration_since(t).as_millis() >= FADE_QUIET_MS
+                    })
+                    .unwrap_or(true)
+            {
+                // 【首出长大 2026-09-11】刻意出现的窗（静默门外）从 72%
+                // 拉到目标——纯尺寸动效（零透明度变化=无变深/透底），
+                // 边框阴影跟着拉出；连打循环（<250ms 复现）直接全显
+                let start = (
+                    (target.0 as f32 * 0.72) as i32,
+                    (target.1 as f32 * 0.72) as i32,
+                );
+                self.size_anim = Some((start, target, std::time::Instant::now()));
+                self.chrome_override.set(Some(start));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
@@ -3483,6 +3531,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
         // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
         // 感），内容按目标布局裁在外壳内；完成帧解除覆盖按目标渲染。
+        // 收尾收拢（hide_after_anim）：完成即真隐藏（SWP 已在收拢终
+        // 帧把窗缩到 70%，无需完成帧全尺寸渲染）。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
             let cur = size_ease(f, t, ms, c.size_ms);
@@ -3495,7 +3545,24 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            if c.is_visible() {
+            if c.hide_after_anim.get() {
+                if finished {
+                    // 退场完成：真隐藏 + 全清理
+                    c.hide_after_anim.set(false);
+                    unsafe {
+                        let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                        let _ = ShowWindow(c.hwnd, SW_HIDE);
+                    }
+                    shadowwin_set_alpha(1.0);
+                    c.last_hide_at = Some(std::time::Instant::now());
+                    c.live_size.set((0, 0));
+                } else if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                }
+            } else if c.is_visible() {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
