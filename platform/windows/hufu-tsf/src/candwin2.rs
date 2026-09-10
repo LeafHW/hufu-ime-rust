@@ -3082,6 +3082,27 @@ pub fn shadowwin_hide() {
     }
 }
 
+/// 【玻璃阴影几何取证 2026-09-11】pad-dump 扫档用：候选窗与阴影窗的
+/// 屏幕矩形对（None=阴影窗未建/已亡——纯色模式无独立阴影窗）。
+/// 扫档器断言：阴影窗=候选窗四边等量外扩（居中，与 DPI 无关）。
+pub(crate) fn shadow_geo(cand: HWND) -> Option<(RECT, RECT)> {
+    let h = (*SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()))?;
+    unsafe {
+        if !IsWindow(HWND(h as *mut _)).as_bool() {
+            return None;
+        }
+        let mut sc = RECT::default();
+        if GetWindowRect(HWND(h as *mut _), &mut sc).is_err() {
+            return None;
+        }
+        let mut cc = RECT::default();
+        if GetWindowRect(cand, &mut cc).is_err() {
+            return None;
+        }
+        Some((cc, sc))
+    }
+}
+
 /// 拖拽移动时阴影窗跟随（候选窗原点-m 边距）
 pub fn shadowwin_follow(cand: HWND) {
     let m = *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner());
