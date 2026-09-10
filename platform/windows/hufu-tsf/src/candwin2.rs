@@ -1731,16 +1731,21 @@ impl CandidateWindowV2 {
             };
             if self.readback {
                 self.size_anim = None;
+                self.chrome_override.set(None);
             } else if was_visible
                 && self.size_ms > 0
                 && ((target.0 - cur.0).abs() > 10 || (target.1 - cur.1).abs() > 8)
             {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
+                // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
+                // tick 又缩回=边缘/阴影跳一下）
+                self.chrome_override.set(Some(cur));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
             } else {
                 self.size_anim = None;
+                self.chrome_override.set(None);
             }
         }
         // 外壳有效物理尺寸：动效中=当前插值（窗口尺寸，含阴影边距），
@@ -3448,6 +3453,9 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     let shared = gsh.0.clone();
     let (mut cand2, last, skin, caret) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【动效窗口让渡】标记持有中——TSF 线程此刻 is_none() 不新建
+        // 第二窗（短等放回），组段收尾挂 pending_cand_hide
+        g.cand2_busy = true;
         (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
     };
     let mut anim_done = true;
@@ -3495,8 +3503,17 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         let _ = KillTimer(hwnd, FADE_TIMER_ID);
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2_busy = false;
+    // 组段已在持有期间收尾 → 代为隐藏（旧窗漏藏=残留阴影）
+    let pending_hide = std::mem::take(&mut g.pending_cand_hide);
     match (g.cand2.take(), cand2) {
-        (None, Some(mine)) => g.cand2 = Some(mine),
+        (None, Some(mut mine)) => {
+            if pending_hide {
+                mine.hide();
+            } else {
+                g.cand2 = Some(mine);
+            }
+        }
         (Some(newer), Some(mut mine)) => {
             mine.hide();
             g.cand2 = Some(newer);
@@ -3520,6 +3537,8 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
     let shared = gsh.0.clone();
     let (mut cand2, last, skin, caret) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【动效窗口让渡】同 fade_tick：持有标记 + pending 隐藏
+        g.cand2_busy = true;
         (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
     };
     if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
@@ -3530,8 +3549,16 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
         }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2_busy = false;
+    let pending_hide = std::mem::take(&mut g.pending_cand_hide);
     match (g.cand2.take(), cand2) {
-        (None, Some(mine)) => g.cand2 = Some(mine),
+        (None, Some(mut mine)) => {
+            if pending_hide {
+                mine.hide();
+            } else {
+                g.cand2 = Some(mine);
+            }
+        }
         (Some(newer), Some(mut mine)) => {
             mine.hide();
             g.cand2 = Some(newer);

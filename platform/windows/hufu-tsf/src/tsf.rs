@@ -52,6 +52,12 @@ pub struct Shared {
     /// v2（DComp+Acrylic）初始化失败 → 回退 v1
     pub cand2: Option<CandidateWindowV2>,
     pub cand2_dead: bool,
+    /// 【动效窗口让渡 2026-09-11】动效/展开 tick 正持有 cand2 锁外渲染
+    /// ——此间 TSF 线程 is_none() 不许新建第二窗（否则双窗同屏=延伸
+    /// 部分重叠感），组段收尾 take() 落空时挂 pending_cand_hide 由
+    /// tick 放回时代为隐藏（否则旧窗漏藏=残留阴影，概率性时序 bug）。
+    pub cand2_busy: bool,
+    pub pending_cand_hide: bool,
     /// v3（普通分层窗，打包宿主 SearchHost/UWP 专用——DComp 直通窗
     /// 被 DWM cloak，普通分层窗考古验证在 UWP 可见可跟光标）
     /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
@@ -172,6 +178,8 @@ impl Shared {
             composition: None,
             cand2: None,
             cand2_dead: false,
+            cand2_busy: false,
+            pending_cand_hide: false,
             cand_ui: None,
             cand_ui_id: 0,
             cand_ui_active: false,
@@ -379,8 +387,12 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             }
         }
         g.composition = None;
+        // 【动效窗口让渡】tick 持有中 → 挂 pending 由 tick 放回时代为
+        // 隐藏（否则旧窗漏藏=残留阴影）
         if let Some(mut c) = g.cand2.take() {
             c.hide();
+        } else if g.cand2_busy {
+            g.pending_cand_hide = true;
         }
         // 【回归病根】ctfmon 重启等场景进程内本实例会被再次 Activate：
         // cand2_dead 若不清，重激活后所有显示分支被跳过、落入 v1 隐身窗
@@ -2048,6 +2060,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or_else(|e| e.into_inner())
             .suppress_pending = false;
     } else if !g.cand2_dead {
+        // 【动效窗口让渡】动效/展开 tick 持有 cand2 锁外渲染中——窗口
+        // 存在只是暂时不在槽里：短等放回后复用，严禁此刻新建第二窗
+        //（双窗同屏=延伸区重叠+阴影残留）
+        if g.cand2.is_none() && g.cand2_busy {
+            for _ in 0..25 {
+                drop(g);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                if g.cand2.is_some() || !g.cand2_busy {
+                    break;
+                }
+            }
+        }
         if g.cand2.is_none() {
             match CandidateWindowV2::new() {
                 Some(v2) => g.cand2 = Some(v2),
