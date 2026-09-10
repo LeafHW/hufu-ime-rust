@@ -616,8 +616,37 @@ extern "system" fn hufu_test_anim() -> i32 {
             .map(|(t, _)| (t.clone(), String::new()))
             .collect();
         if let Some(c) = g.cand2.as_mut() {
-            // 【Clip 反 MPO 验证】真实收起路径 + 窄窗（188）+ SetClip：
-            // ramp 恢复 → Clip 即优雅修复
+            // 【生产形态还原 2026-09-11】静态窄窗会被 DWM 提升到 MPO
+            // overlay（半透帧拍平）——但生产路径弹窗必经「尺寸增长」
+            // （隐藏→0 宽→内容宽），增长后表面处合成态（像素取证 #2/#3
+            // 双证）。本块复刻该序列：先宽渲染（窗口 188→348 增长），
+            // 再切收起内容 + 启动渐显（no-shrink 保窗口 348）。
+            // 清残留计时器：初显武装的展开定时器会在中途触发搅局。
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                    c.hwnd,
+                    crate::candwin2::EXPAND_TIMER_ID,
+                )
+            };
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(c.hwnd, FADE_TIMER_ID)
+            };
+            c.comments_expanded = true;
+            c.fade = None;
+            c.internal_rerender = true;
+            c.show(
+                &cands,
+                &raw,
+                &skin2,
+                Some(&RECT {
+                    left: 160,
+                    top: 160,
+                    right: 160,
+                    bottom: 184,
+                }),
+                0,
+            );
+            c.internal_rerender = false;
             c.comments_expanded = false;
             c.fade = Some((true, std::time::Instant::now()));
             let _ = unsafe {
@@ -625,6 +654,16 @@ extern "system" fn hufu_test_anim() -> i32 {
                     c.hwnd,
                     FADE_TIMER_ID,
                     FADE_TICK_MS,
+                    None,
+                )
+            };
+            // 内部渲染不走 show() 的展开武装分支（internal_rerender 抑制
+            // 重置）——手动武装，等价生产「停手 400ms 展开」
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    c.hwnd,
+                    crate::candwin2::EXPAND_TIMER_ID,
+                    400,
                     None,
                 )
             };
