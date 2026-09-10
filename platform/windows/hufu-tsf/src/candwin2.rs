@@ -903,13 +903,13 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 120,
+                fade_ms: 0,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
-                size_ms: 120,
+                size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
@@ -1051,8 +1051,11 @@ impl CandidateWindowV2 {
             shadowwin_set_alpha(1.0);
         }
         let now = std::time::Instant::now();
-        self.fade_ms = layout_f(skin, "fade_ms", 120.0).clamp(0.0, 600.0) as u32;
-        self.size_ms = layout_f(skin, "size_ms", 120.0).clamp(0.0, 600.0) as u32;
+        // 【动效口径 2026-09-11 用户拍板】fade 默认关——半透渐入会透出
+        // 底层文字（用户「重叠」感），只在皮肤显式开启时做；尺寸过渡
+        // 默认 200ms（120ms+ease-out 起步太快无动画感）。
+        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
+        self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -3772,14 +3775,15 @@ pub fn shadowwin_show(
     }
 }
 
-/// 【尺寸动效 2026-09-11】ease-out 二次插值：t∈[0,ms] 映射进度
-/// p=1-(1-t)²，返回 from→to 的即时尺寸（t≥ms 即 to）。
+/// 【尺寸动效 2026-09-11】smoothstep 插值：t∈[0,ms] 映射进度
+/// p=3t²-2t³（缓起-加速-缓收，「成长感」明确——ease-out 起步即
+/// 大位移被实测判「无动画感」），返回 from→to 的即时尺寸。
 pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
     if dur_ms == 0 || t_ms >= dur_ms {
         return to;
     }
     let x = t_ms as f32 / dur_ms as f32;
-    let p = 1.0 - (1.0 - x) * (1.0 - x);
+    let p = x * x * (3.0 - 2.0 * x);
     let l = |a: i32, b: i32| a + ((b - a) as f32 * p).round() as i32;
     (l(from.0, to.0), l(from.1, to.1))
 }
