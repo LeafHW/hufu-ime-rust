@@ -1920,7 +1920,29 @@ impl Engine {
         }
 
         // 3 键公共前缀 + 一致的消耗长度
-        let mut stable = common_history_prefix(&session.early_history);
+        // 【稳定提案模式实验 2026-09-10】HUFU_EARLY_STABLE：
+        //   0 = 证据史公共前缀（Rime 同构，默认）
+        //   1 = 最新提案直出（最激进：准率 99% 破线——跳变提案上错字）
+        //   2 = 最后 2 键提案的公共前缀（折中：比 3 键窗长、比直出稳）
+        // 公共前缀是 46% 上屏率天花板的机制根因（逐键提案分歧把每次
+        // 上屏削到 ~1 字）。bench 实验开关，默认 0（产品行为不变）。
+        let stable_mode = std::env::var("HUFU_EARLY_STABLE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut stable = match stable_mode {
+            1 => session
+                .early_history
+                .last()
+                .map(|e| e.proposal.clone())
+                .unwrap_or_default(),
+            2 => {
+                let n = session.early_history.len();
+                let win = &session.early_history[n.saturating_sub(2)..];
+                common_history_prefix(win)
+            }
+            _ => common_history_prefix(&session.early_history),
+        };
         let mut consumed = stable_history_raw_length(&session.early_history, &stable);
         while stable.chars().count() > committed_text.chars().count() && consumed == 0 {
             stable = stable.chars().take(stable.chars().count() - 1).collect();
@@ -2722,6 +2744,19 @@ impl Engine {
                     // ≥5.0（supplement 点名才会有的量级；常规 ngram 候选
                     // 差距 <2），合并后置顶——用户权重可感知生效。
                     let mut first_hit: Option<(String, f64, usize)> = None;
+                    // 【生僻精确码让位 2026-09-10】欦案例：jaeq 码表精确
+                    // 首选是生僻字（欦），而 exact 拆分项（们欠 = ja 们 +
+                    // eq 欠，两段均码表精确）因 ngram 弱分（非自然搭配，
+                    // ≈-21 与「午王」同级）落入 rest 组，被码表位的生僻
+                    // 精确项结构性压住——「框」修复（弱分不压词典精确）
+                    // 保护的是常用字精确首选；精确首选本身生僻时，exact
+                    // 拆分项（真拆分、键键有着落）应压前。「踹 pvl」等常
+                    // 用字全码不受影响（dict_exact_rare=false 走原逻辑）。
+                    let dec_r = self.sentence.as_ref().unwrap();
+                    let dict_exact_rare = entries.iter().any(|e| {
+                        e.code == session.raw
+                            && e.text.chars().any(|ch| dec_r.rare_hint(ch))
+                    });
                     for h in d.hits.iter() {
                         if !cmt.is_empty() && !h.text.starts_with(&cmt) {
                             continue;
@@ -2758,7 +2793,9 @@ impl Engine {
                         //（与 Rime 同拍）；弱切分产物（如 ennw 解出「午王」
                         // ≈-21.5，非词）不再压词典精确匹配——「框」应居首
                         //（虎爪/Rime 实测均首选）。弱项回落到词典之后补位。
-                        if h.max_rank == 1 && multi && h.score > SENT_PHRASE_FRONT_FLOOR {
+                        if (h.max_rank == 1 && multi && h.score > SENT_PHRASE_FRONT_FLOOR)
+                            || (dict_exact_rare && h.exact && multi)
+                        {
                             phrase.push(cand);
                         } else {
                             rest.push(cand);
