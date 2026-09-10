@@ -214,7 +214,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>最大码长</label><input type="number" data-path="input.max_code_length" min="1" max="10"></div>
       <div class="checkline"><input type="checkbox" id="i-push"><label for="i-push">超最大码长自动上屏</label></div>
       <div class="checkline"><input type="checkbox" id="i-uniq"><label for="i-uniq">满四码唯一自动上屏</label></div>
-      <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear" title="开启时只在编码长度达到「最大码长」后才清（如最大码长 4：1-3 码的暂时空码保留缓冲，第 4 键仍无解才清）">空码自动清屏<span class="sub">（满码才清）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear" title="第「最大码长+1」键仍无解才清，且只清前面的码、该键本身保留为新输入（如最大码长 4：满 4 码的空码留在缓冲，打第 5 键时清前 4 码，第 5 键不清）">空码自动清屏<span class="sub">（满码+1 才清，保末键）</span></label></div>
       <div class="checkline"><input type="checkbox" id="i-enter"><label for="i-enter">回车清屏</label></div>
       <div class="field"><label>Tab 键</label><select id="i-tabmode" style="min-width:150px">
         <option value="clear">清屏（默认）</option>
