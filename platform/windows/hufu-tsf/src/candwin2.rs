@@ -2193,62 +2193,25 @@ impl CandidateWindowV2 {
                 // 【拉伸动效】内容裁剪：动效帧中外壳小于目标布局——把
                 // 编码行/候选/注释裁在外壳内（增长=渐进露出，收拢=渐进
                 // 收起）；稳态帧不推（零开销）。
-                // 【圆角裁剪 2026-09-11】用户实测慢速（200%+速度）下延伸
-                // 过程中「边框/阴影是直角」：面板/边框/阴影几何全程圆，
-                // 直角来自此处方形 Clip 把贴边元素（编码行底、高亮胶囊）
-                // 切出直边——改 PushLayer+圆角几何遮罩（与外壳同 radius），
-                // 动画中内容缘也随圆角收边，完成帧恢复全圆。
+                // 【回退方形 Clip 2026-09-11·终】圆角几何遮罩版（PushLayer
+                // +RoundedGeometry）在用户机器上引发「文字闪」（框不闪字
+                // 闪——层内内容逐帧丢画；本机取证无法复现=驱动差异），
+                // 历轮修补（maskTransform 单位阵等）均无效。用户定夺回退
+                // 到不闪的方形 Clip（毛玻璃移除版语义）。直角残边仅出现
+                // 在大尺寸动画的动画帧（起臂阈值 24/14 下普通打字不过
+                // 动画），可接受。
                 let chrome_clip_on = self.chrome_override.get().is_some();
                 if chrome_clip_on {
                     unsafe {
-                        let clip_rect = D2D_RECT_F {
-                            left: bx,
-                            top: by,
-                            right: bx + chw,
-                            bottom: by + chh,
-                        };
-                        // 圆角几何遮罩（与外壳同 radius；PushLayer 内部
-                        // AddRef，局部几何可随作用域释放）
-                        let geom: Option<windows::Win32::Graphics::Direct2D::ID2D1Geometry> =
-                            ctx.GetFactory().ok().and_then(|f| {
-                                f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
-                                    rect: clip_rect,
-                                    radiusX: radius,
-                                    radiusY: radius,
-                                })
-                                .ok()
-                                .and_then(|g| g.cast().ok())
-                            });
-                        match geom {
-                            Some(g) => {
-                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
-                                lp.contentBounds = clip_rect;
-                                lp.geometricMask = std::mem::ManuallyDrop::new(Some(g));
-                                lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                                // 【maskTransform 必须显式单位阵 2026-09-11】
-                                // default() 的零矩阵在部分驱动上把遮罩塌缩
-                                // 成点 → 层内内容整帧不画=「文字闪」（壳在
-                                // 层外不闪）且圆角失效退直角。对齐
-                                // push_shadow_mask 的显式单位阵写法。
-                                lp.maskTransform = windows::Foundation::Numerics::Matrix3x2 {
-                                    M11: 1.0,
-                                    M12: 0.0,
-                                    M21: 0.0,
-                                    M22: 1.0,
-                                    M31: 0.0,
-                                    M32: 0.0,
-                                };
-                                ctx.PushLayer(&lp, None);
-                            }
-                            None => {
-                                // 几何创建失败兜底：无 mask 的层=方形
-                                // contentBounds 裁剪（与旧 Clip 等效）——
-                                // Push/Pop 两侧统一走 Layer，配对无忧
-                                let mut lp = D2D1_LAYER_PARAMETERS1::default();
-                                lp.contentBounds = clip_rect;
-                                ctx.PushLayer(&lp, None);
-                            }
-                        }
+                        ctx.PushAxisAlignedClip(
+                            &D2D_RECT_F {
+                                left: bx,
+                                top: by,
+                                right: bx + chw,
+                                bottom: by + chh,
+                            },
+                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        );
                     }
                 }
 
@@ -2584,11 +2547,10 @@ impl CandidateWindowV2 {
                         let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
                     }
                 } // draw_content
-                  // 【拉伸动效】内容裁剪收层（与上方 Push 配对；圆角遮罩
-                  // 与方形兜底都走 Layer——Pop 恒为 PopLayer）
+                  // 【拉伸动效】内容裁剪收层（与上方 PushAxisAlignedClip 配对）
                 if chrome_clip_on {
                     unsafe {
-                        ctx.PopLayer();
+                        ctx.PopAxisAlignedClip();
                     }
                 }
 
