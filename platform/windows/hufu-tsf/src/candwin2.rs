@@ -618,10 +618,15 @@ pub struct CandidateWindowV2 {
     /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
     /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
     pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
-    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=关）——注释
+    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 200，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
+    /// 【收缩动效 2026-09-11】本帧是否延迟渲染：任一轴收缩时，内容
+    /// 保持旧布局（更大的画布），窗口 rect 渐进收拢=边缘可见地滑入；
+    /// 动效完成帧再渲染新（更小）布局——否则内容瞬跳到小布局、
+    /// rect 动画全在透明余量里进行（不可见=「变短没有动画」）。
+    pub(crate) size_defer_render: bool,
     /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
     pub(crate) last_show_at: Option<std::time::Instant>,
     /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
@@ -903,12 +908,13 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 0,
+                fade_ms: 150,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
+                size_defer_render: false,
                 size_ms: 200,
                 last_swp_size: std::cell::Cell::new((0, 0)),
                 live_size: std::cell::Cell::new((0, 0)),
@@ -1051,10 +1057,10 @@ impl CandidateWindowV2 {
             shadowwin_set_alpha(1.0);
         }
         let now = std::time::Instant::now();
-        // 【动效口径 2026-09-11 用户拍板】fade 默认关——半透渐入会透出
-        // 底层文字（用户「重叠」感），只在皮肤显式开启时做；尺寸过渡
-        // 默认 200ms（120ms+ease-out 起步太快无动画感）。
-        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
+        // 【动效口径 2026-09-11 终版】fade 默认 150ms 开（下限 0.6：
+        // 柔和淡入淡出且不透出底层文字）；尺寸过渡默认 200ms
+        // smoothstep（宽高增减都平滑）。
+        self.fade_ms = layout_f(skin, "fade_ms", 150.0).clamp(0.0, 600.0) as u32;
         self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
@@ -1711,128 +1717,166 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
-        if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
-            crate::tsf::trace("cw2: ensure_swapchain FAIL");
-            return;
-        }
-
-        unsafe {
-            let chain = match &self.swapchain {
-                Some(c) => c.clone(),
-                None => return,
+        // 【收缩动效决策 2026-09-11】渲染前判定：任一轴收缩 → 本帧不
+        // 渲染（旧内容留在缓冲，窗口 rect 渐进收拢=边缘可见滑入；完成
+        // 帧由 tick 补渲染新布局）。增长照常即渲染（余量渐进揭示）。
+        // 回读取证帧不延迟（测试需立即拿到像素）。
+        {
+            let target = (w_out as i32, h_out as i32);
+            let cur = match self.size_anim {
+                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
+                None => self.live_size.get(),
             };
-            let surface: IDXGISurface = match chain.GetBuffer(0) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let ctx = match &self.ctx {
-                Some(c) => c.clone(),
-                None => return,
-            };
-            let bp = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                colorContext: std::mem::ManuallyDrop::new(None),
-            };
-            let bitmap = match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            ctx.SetTarget(&bitmap);
-            ctx.BeginDraw();
-            // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
-            // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
-            // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
-            let fade_a = self.fade_alpha();
-            let fade_layer_on = fade_a < 0.999;
-            if fade_layer_on {
-                let mut lp = D2D1_LAYER_PARAMETERS1::default();
-                lp.contentBounds = D2D_RECT_F {
-                    left: -1.0e6,
-                    top: -1.0e6,
-                    right: 1.0e6,
-                    bottom: 1.0e6,
-                };
-                lp.opacity = fade_a;
-                ctx.PushLayer(&lp, None);
+            let shrink = was_visible
+                && self.size_ms > 0
+                && !self.readback
+                && (target.0 < cur.0 - 10 || target.1 < cur.1 - 8);
+            let grow =
+                was_visible && self.size_ms > 0 && (target.0 > cur.0 + 10 || target.1 > cur.1 + 8);
+            self.size_defer_render = shrink;
+            if shrink || grow {
+                self.size_anim = Some((cur, target, std::time::Instant::now()));
+                unsafe {
+                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                }
+            } else {
+                self.size_anim = None;
             }
-            // 【阶段验证】stage 分层渲染开关（见 read_diag_stage 注释）
-            let stage = read_diag_stage();
-            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: dpi_scale,
-                M12: 0.0,
-                M21: 0.0,
-                M22: dpi_scale,
-                M31: 0.0,
-                M32: 0.0,
-            });
+        }
+        'sizedraw: {
+            if self.size_defer_render {
+                // 收缩中：旧像素 + 收拢的 rect 已是完整视觉，跳过绘制
+                //（SWP 定位在块外照常执行）
+                crate::tsf::trace("cw2: 收缩动效——延迟渲染");
+                break 'sizedraw;
+            }
+            if !self.ensure_swapchain(w_out.max(1), h_out.max(1)) {
+                crate::tsf::trace("cw2: ensure_swapchain FAIL");
+                return;
+            }
 
-            // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
-            // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
-            // 材质简化：solid=底色 / translucent|frosted(旧皮肤兼容)=tint 半透明 /
-            // glass=毛玻璃（抓屏+D2D 高斯模糊+圆角裁剪，2026-09-08）；
-            // material.opacity(0-1) 统一控透明度。
-            let _ = ctx.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-            // 【毛玻璃层】glass_raw（show 定位前抓的干净底）→ D2D bitmap
-            // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
-            // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
-            // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
-            // 【毛玻璃 v3】glass 走 DWM acrylic（show 开头）——自绘路径
-            // 整体停用，保留代码作回退（GLASS_SELF_DRAW=true 恢复）。
-            const GLASS_SELF_DRAW: bool = false;
-            if GLASS_SELF_DRAW && kind == "glass" {
-                crate::tsf::diag_note(&format!(
-                    "gstep1: enter dpi={dpi_scale} raw={}",
-                    match &self.glass_raw {
-                        Some(_) => "some",
-                        None => "none",
-                    }
-                ));
-                if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
-                    let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
-                    // 【毛玻璃 v2·降采样模糊 2026-09-08】两轮实测定位：
-                    // ① GaussianBlur effect 输出不模糊（透出但清晰）
-                    // ② 尺寸防御拦截——打字时候选宽度帧帧变（日志
-                    // 242→282→201→181），抓屏缓存永远追不上本帧尺寸
-                    // → 每帧跳过。v2 方案：
-                    // - 模糊=降采样上载（1/k 尺寸 bitmap）+DrawBitmap
-                    //   双线性放大（天然平滑模糊），k=blur/8——绕开
-                    //   effect；模糊半径直接映射采样步长
-                    // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
-                    //   窗体区（模糊底拉伸无感知）——打字全程连续显示
-                    if *gw >= 4 && *gh >= 4 && raw_px.len() == (*gw as usize) * (*gh as usize) * 4 {
-                        let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
-                        let g_cached = self.glass_cache.take();
-                        let bmp = match &g_cached {
-                            Some((k, v)) if *k == g_key => v.clone(),
-                            _ => unsafe {
-                                // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
-                                // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
-                                // 实测梯度比 0.78（含文字行干扰）仍偏轻
-                                let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
-                                let sw = (*gw / k).max(1);
-                                let sh = (*gh / k).max(1);
-                                let mut small: Vec<u8> = Vec::with_capacity((sw * sh * 4) as usize);
-                                for y in 0..sh {
-                                    let sy = ((y as usize) * (k as usize)).min(*gh as usize - 1);
-                                    for x in 0..sw {
-                                        let sx =
-                                            ((x as usize) * (k as usize)).min(*gw as usize - 1);
-                                        let o = (sy * (*gw as usize) + sx) * 4;
-                                        small.extend_from_slice(&raw_px[o..o + 4]);
+            unsafe {
+                let chain = match &self.swapchain {
+                    Some(c) => c.clone(),
+                    None => return,
+                };
+                let surface: IDXGISurface = match chain.GetBuffer(0) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let ctx = match &self.ctx {
+                    Some(c) => c.clone(),
+                    None => return,
+                };
+                let bp = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    colorContext: std::mem::ManuallyDrop::new(None),
+                };
+                let bitmap = match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                ctx.SetTarget(&bitmap);
+                ctx.BeginDraw();
+                // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
+                // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
+                // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
+                let fade_a = self.fade_alpha();
+                let fade_layer_on = fade_a < 0.999;
+                if fade_layer_on {
+                    let mut lp = D2D1_LAYER_PARAMETERS1::default();
+                    lp.contentBounds = D2D_RECT_F {
+                        left: -1.0e6,
+                        top: -1.0e6,
+                        right: 1.0e6,
+                        bottom: 1.0e6,
+                    };
+                    lp.opacity = fade_a;
+                    ctx.PushLayer(&lp, None);
+                }
+                // 【阶段验证】stage 分层渲染开关（见 read_diag_stage 注释）
+                let stage = read_diag_stage();
+                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                    M11: dpi_scale,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: dpi_scale,
+                    M31: 0.0,
+                    M32: 0.0,
+                });
+
+                // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
+                // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
+                // 材质简化：solid=底色 / translucent|frosted(旧皮肤兼容)=tint 半透明 /
+                // glass=毛玻璃（抓屏+D2D 高斯模糊+圆角裁剪，2026-09-08）；
+                // material.opacity(0-1) 统一控透明度。
+                let _ = ctx.Clear(Some(&D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }));
+                // 【毛玻璃层】glass_raw（show 定位前抓的干净底）→ D2D bitmap
+                // → 高斯模糊（layout.blur_radius，默认 24）→ 圆角几何裁剪
+                // 画满窗体区（物理像素坐标系）。叠 tint/底色在其上（后续
+                // b_back 半透明画法保持）——模糊底透出底下内容=毛玻璃质感。
+                // 【毛玻璃 v3】glass 走 DWM acrylic（show 开头）——自绘路径
+                // 整体停用，保留代码作回退（GLASS_SELF_DRAW=true 恢复）。
+                const GLASS_SELF_DRAW: bool = false;
+                if GLASS_SELF_DRAW && kind == "glass" {
+                    crate::tsf::diag_note(&format!(
+                        "gstep1: enter dpi={dpi_scale} raw={}",
+                        match &self.glass_raw {
+                            Some(_) => "some",
+                            None => "none",
+                        }
+                    ));
+                    if let Some((_, _, gw, gh, raw_px)) = &self.glass_raw {
+                        let blur_r = layout_f(skin, "blur_radius", 24.0).clamp(1.0, 80.0);
+                        // 【毛玻璃 v2·降采样模糊 2026-09-08】两轮实测定位：
+                        // ① GaussianBlur effect 输出不模糊（透出但清晰）
+                        // ② 尺寸防御拦截——打字时候选宽度帧帧变（日志
+                        // 242→282→201→181），抓屏缓存永远追不上本帧尺寸
+                        // → 每帧跳过。v2 方案：
+                        // - 模糊=降采样上载（1/k 尺寸 bitmap）+DrawBitmap
+                        //   双线性放大（天然平滑模糊），k=blur/8——绕开
+                        //   effect；模糊半径直接映射采样步长
+                        // - 尺寸不匹配也画：DrawBitmap dest rect 拉伸到本帧
+                        //   窗体区（模糊底拉伸无感知）——打字全程连续显示
+                        if *gw >= 4
+                            && *gh >= 4
+                            && raw_px.len() == (*gw as usize) * (*gh as usize) * 4
+                        {
+                            let g_key = (*gw, *gh, (blur_r * 4.0) as u32);
+                            let g_cached = self.glass_cache.take();
+                            let bmp = match &g_cached {
+                                Some((k, v)) if *k == g_key => v.clone(),
+                                _ => unsafe {
+                                    // 降采样：k 步长采样 → 小 bitmap（上载量 ~1/k²）
+                                    // 【模糊力度 2026-09-08】k=blur/3（上限 16）——
+                                    // 实测梯度比 0.78（含文字行干扰）仍偏轻
+                                    let k = ((blur_r / 3.0).ceil() as u32).clamp(1, 16);
+                                    let sw = (*gw / k).max(1);
+                                    let sh = (*gh / k).max(1);
+                                    let mut small: Vec<u8> =
+                                        Vec::with_capacity((sw * sh * 4) as usize);
+                                    for y in 0..sh {
+                                        let sy =
+                                            ((y as usize) * (k as usize)).min(*gh as usize - 1);
+                                        for x in 0..sw {
+                                            let sx =
+                                                ((x as usize) * (k as usize)).min(*gw as usize - 1);
+                                            let o = (sy * (*gw as usize) + sx) * 4;
+                                            small.extend_from_slice(&raw_px[o..o + 4]);
+                                        }
                                     }
-                                }
-                                let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                                    let bmp_props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                                 pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
                                     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                                     alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -1842,89 +1886,214 @@ impl CandidateWindowV2 {
                                 bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_NONE.0),
                                 ..Default::default()
                             };
-                                let r = ctx.CreateBitmap(
-                                    D2D_SIZE_U {
-                                        width: sw,
-                                        height: sh,
-                                    },
-                                    Some(small.as_ptr() as *const core::ffi::c_void),
-                                    sw * 4,
-                                    &bmp_props,
-                                );
-                                match r {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        crate::tsf::diag_note(&format!(
-                                            "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
-                                        ));
-                                        return;
+                                    let r = ctx.CreateBitmap(
+                                        D2D_SIZE_U {
+                                            width: sw,
+                                            height: sh,
+                                        },
+                                        Some(small.as_ptr() as *const core::ffi::c_void),
+                                        sw * 4,
+                                        &bmp_props,
+                                    );
+                                    match r {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            crate::tsf::diag_note(&format!(
+                                                "stage{stage} createbmp FAIL {e:?} sw={sw} sh={sh}"
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                },
+                            };
+                            glass_cache_out = Some((g_key, bmp.clone()));
+                            if stage == 1 || stage == 2 {
+                                // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
+                                unsafe {
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: 1.0,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                    let full = D2D_RECT_F {
+                                        left: 0.0,
+                                        top: 0.0,
+                                        right: w_out as f32,
+                                        bottom: h_out as f32,
+                                    };
+                                    // 真实抓屏位图全幅直画（最小毛玻璃管线）
+                                    let _ = ctx.DrawBitmap(
+                                        &bmp,
+                                        Some(&full as *const _),
+                                        1.0,
+                                        D2D1_INTERPOLATION_MODE_LINEAR,
+                                        None,
+                                        None,
+                                    );
+                                    crate::tsf::diag_note(&format!(
+                                        "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
+                                    ));
+                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                        M11: dpi_scale,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: dpi_scale,
+                                        M31: 0.0,
+                                        M32: 0.0,
+                                    });
+                                }
+                            } else {
+                                unsafe {
+                                    // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
+                                    let mask = ctx.GetFactory().ok().and_then(|f| {
+                                        f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                                            rect: D2D_RECT_F {
+                                                left: shadow_m * dpi_scale,
+                                                top: shadow_m * dpi_scale,
+                                                right: (shadow_m + width) * dpi_scale,
+                                                bottom: (shadow_m + height) * dpi_scale,
+                                            },
+                                            radiusX: radius * dpi_scale,
+                                            radiusY: radius * dpi_scale,
+                                        })
+                                        .ok()
+                                    });
+                                    if let Some(mask) = mask {
+                                        if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
+                                            // 【根因修复 2026-09-08】PushLayer 的 mask
+                                            // 按当时 transform 解释——此前在 Push 后才切
+                                            // identity，mask（物理坐标）被 dpi 主变换二
+                                            // 次缩放跑出窗外→层内所有绘制全被裁掉
+                                            //（红色裁决实测：层没画、窗口半透明穿透）。
+                                            // 正序：先切 identity 再 Push。
+                                            ctx.SetTransform(
+                                                &windows::Foundation::Numerics::Matrix3x2 {
+                                                    M11: 1.0,
+                                                    M12: 0.0,
+                                                    M21: 0.0,
+                                                    M22: 1.0,
+                                                    M31: 0.0,
+                                                    M32: 0.0,
+                                                },
+                                            );
+                                            let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
+                                            lp.contentBounds = D2D_RECT_F {
+                                                left: -1.0e6,
+                                                top: -1.0e6,
+                                                right: 1.0e6,
+                                                bottom: 1.0e6,
+                                            };
+                                            lp.geometricMask =
+                                                std::mem::ManuallyDrop::new(Some(geo));
+                                            lp.maskAntialiasMode =
+                                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+                                            // 【终极根因 2026-09-08】default() 的 maskTransform
+                                            // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
+                                            // 一点，Layer 内一切绘制全被裁掉（对照阴影段
+                                            // push_shadow_mask 显式设 identity 才正常显示）。
+                                            lp.maskTransform =
+                                                windows::Foundation::Numerics::Matrix3x2 {
+                                                    M11: 1.0,
+                                                    M12: 0.0,
+                                                    M21: 0.0,
+                                                    M22: 1.0,
+                                                    M31: 0.0,
+                                                    M32: 0.0,
+                                                };
+                                            ctx.PushLayer(&lp, None);
+                                            let dst = D2D_RECT_F {
+                                                left: shadow_m * dpi_scale,
+                                                top: shadow_m * dpi_scale,
+                                                right: (shadow_m + width) * dpi_scale,
+                                                bottom: (shadow_m + height) * dpi_scale,
+                                            };
+                                            let _ = ctx.DrawBitmap(
+                                                &bmp,
+                                                Some(&dst as *const _),
+                                                1.0,
+                                                D2D1_INTERPOLATION_MODE_LINEAR,
+                                                None,
+                                                None,
+                                            );
+                                            // 恢复渲染主变换（dpi 缩放）
+                                            ctx.SetTransform(
+                                                &windows::Foundation::Numerics::Matrix3x2 {
+                                                    M11: dpi_scale,
+                                                    M12: 0.0,
+                                                    M21: 0.0,
+                                                    M22: dpi_scale,
+                                                    M31: 0.0,
+                                                    M32: 0.0,
+                                                },
+                                            );
+                                            ctx.PopLayer();
+                                        }
                                     }
                                 }
-                            },
-                        };
-                        glass_cache_out = Some((g_key, bmp.clone()));
-                        if stage == 1 || stage == 2 {
-                            // 【阶段 1/2】最小管线：全幅直画（无 Layer 遮罩）
+                            } // else Layer 路径（stage 0/3+）
+                        }
+                    }
+                }
+                // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
+                // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
+                if has_shadow && !(stage >= 1 && stage <= 3) {
+                    // 【阴影透明度】material.shadow_alpha 独立滑条（颜色自带
+                    // alpha 忽略——与纯色模型一致的语义）
+                    let shadow_alpha = skin
+                        .pointer("/skin/material/shadow_alpha")
+                        .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0) as f32;
+                    let mut sc = color_f(skin, "shadow_color", "#000000FF");
+                    sc.a = shadow_alpha;
+                    if sc.a > 0.004 {
+                        // 【每帧缓存键】(w,h,corner_radius,shadow_radius,oy,ox,argb,dpi)
+                        // ——宽度不变的连续帧（同长度候选/翻页）零重建 command
+                        // list+effect。【2026-09-08 分离 BUG 修复】原键漏了
+                        // shadow_radius：拖「阴影大小」滑杆时 shadow_m→窗口
+                        // 尺寸变，但内容 w/h/圆角/偏移/颜色全没变→键命中→
+                        // 重放旧 effect（旧 blur、旧 shadow_m 坐标的圆角矩形）
+                        // 画进新窗口，阴影与窗体错位（用户实测「偶发阴影和
+                        // 候选分离」的根因）。
+                        let sc_packed = ((sc.r * 255.0) as u32)
+                            | (((sc.g * 255.0) as u32) << 8)
+                            | (((sc.b * 255.0) as u32) << 16)
+                            | (((sc.a * 255.0) as u32) << 24);
+                        let sh_key = (
+                            width as u32,
+                            height as u32,
+                            (radius * 4.0) as u32,
+                            (shadow_radius * 4.0) as u32,
+                            ((shadow_off_y * 4.0) as i32, (shadow_off_x * 4.0) as i32),
+                            sc_packed,
+                            (dpi_scale * 100.0) as u32,
+                        );
+                        // 【真 D2D 高斯阴影】用户两轮判多层近似「太锐利」——
+                        // 换 D2D1Shadow 效果（系统级高斯模糊）：窗口形状画进
+                        // command list → Shadow 效果 → DrawImage 回主画布。
+                        let fx = (|| -> Option<()> {
                             unsafe {
-                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                    M11: 1.0,
-                                    M12: 0.0,
-                                    M21: 0.0,
-                                    M22: 1.0,
-                                    M31: 0.0,
-                                    M32: 0.0,
-                                });
-                                let full = D2D_RECT_F {
-                                    left: 0.0,
-                                    top: 0.0,
-                                    right: w_out as f32,
-                                    bottom: h_out as f32,
-                                };
-                                // 真实抓屏位图全幅直画（最小毛玻璃管线）
-                                let _ = ctx.DrawBitmap(
-                                    &bmp,
-                                    Some(&full as *const _),
-                                    1.0,
-                                    D2D1_INTERPOLATION_MODE_LINEAR,
-                                    None,
-                                    None,
-                                );
-                                crate::tsf::diag_note(&format!(
-                                    "diag: stage={stage} DrawBitmap →{w_out}x{h_out}"
-                                ));
-                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                    M11: dpi_scale,
-                                    M12: 0.0,
-                                    M21: 0.0,
-                                    M22: dpi_scale,
-                                    M31: 0.0,
-                                    M32: 0.0,
-                                });
-                            }
-                        } else {
-                            unsafe {
-                                // 圆角裁剪（物理像素系）+ dest rect 拉伸绘制
-                                let mask = ctx.GetFactory().ok().and_then(|f| {
-                                    f.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F {
-                                            left: shadow_m * dpi_scale,
-                                            top: shadow_m * dpi_scale,
-                                            right: (shadow_m + width) * dpi_scale,
-                                            bottom: (shadow_m + height) * dpi_scale,
-                                        },
-                                        radiusX: radius * dpi_scale,
-                                        radiusY: radius * dpi_scale,
-                                    })
-                                    .ok()
-                                });
-                                if let Some(mask) = mask {
-                                    if let Ok(geo) = mask.cast::<ID2D1Geometry>() {
-                                        // 【根因修复 2026-09-08】PushLayer 的 mask
-                                        // 按当时 transform 解释——此前在 Push 后才切
-                                        // identity，mask（物理坐标）被 dpi 主变换二
-                                        // 次缩放跑出窗外→层内所有绘制全被裁掉
-                                        //（红色裁决实测：层没画、窗口半透明穿透）。
-                                        // 正序：先切 identity 再 Push。
+                                if let Some((k, v)) = &shadow_cache_in {
+                                    if *k == sh_key {
+                                        // 命中：直接绘制缓存的 effect 输出
+                                        let eff_img: ID2D1Image = v.1.cast().ok()?;
+                                        // 【高DPI二次缩放修复 2026-09-11】
+                                        // effect 输出=物理像素（command list 录制
+                                        // 时几何已乘 dpi_scale）；此前 DrawImage
+                                        // 在 dpi 世界变换下画 → 高 DPI 屏内容再
+                                        // 乘一次 scale：150% 屏阴影 ×2.25 倍位、
+                                        // 右下偏移出窗（用户实测「阴影超大范围
+                                        // 偏离」，1.4.8 引入 dpi 中心化后高 DPI
+                                        // 机器必现、100% 屏 ×1 不可见——本机全
+                                        // 100% 故历轮复现不了）。玻璃段 2026-09-08
+                                        // 已修（identity+物理坐标），纯色段漏修。
+                                        // 正序（对齐玻璃段）：identity → Push mask
+                                        // （洞几何乘 dpi）→ DrawImage（物理偏移）
+                                        // → 恢复 dpi 主变换 → Pop。
                                         ctx.SetTransform(
                                             &windows::Foundation::Numerics::Matrix3x2 {
                                                 M11: 1.0,
@@ -1935,44 +2104,30 @@ impl CandidateWindowV2 {
                                                 M32: 0.0,
                                             },
                                         );
-                                        let mut lp = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS1::default();
-                                        lp.contentBounds = D2D_RECT_F {
-                                            left: -1.0e6,
-                                            top: -1.0e6,
-                                            right: 1.0e6,
-                                            bottom: 1.0e6,
-                                        };
-                                        lp.geometricMask = std::mem::ManuallyDrop::new(Some(geo));
-                                        lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-                                        // 【终极根因 2026-09-08】default() 的 maskTransform
-                                        // 是全零矩阵（≠identity）——mask 几何被零矩阵压成
-                                        // 一点，Layer 内一切绘制全被裁掉（对照阴影段
-                                        // push_shadow_mask 显式设 identity 才正常显示）。
-                                        lp.maskTransform =
-                                            windows::Foundation::Numerics::Matrix3x2 {
-                                                M11: 1.0,
-                                                M12: 0.0,
-                                                M21: 0.0,
-                                                M22: 1.0,
-                                                M31: 0.0,
-                                                M32: 0.0,
-                                            };
-                                        ctx.PushLayer(&lp, None);
-                                        let dst = D2D_RECT_F {
-                                            left: shadow_m * dpi_scale,
-                                            top: shadow_m * dpi_scale,
-                                            right: (shadow_m + width) * dpi_scale,
-                                            bottom: (shadow_m + height) * dpi_scale,
-                                        };
-                                        let _ = ctx.DrawBitmap(
-                                            &bmp,
-                                            Some(&dst as *const _),
-                                            1.0,
-                                            D2D1_INTERPOLATION_MODE_LINEAR,
-                                            None,
-                                            None,
+                                        let mask_ok = push_shadow_mask(
+                                            &ctx, width, height, w_out, h_out, shadow_m, radius,
+                                            dpi_scale,
                                         );
-                                        // 恢复渲染主变换（dpi 缩放）
+                                        // 【阴影分离修复·终版 2026-09-08】曾加
+                                        // GetImageLocalBounds 补偿——实错：DrawImage
+                                        // 的 targetOffset 对齐 image 坐标原点 (0,0)
+                                        //（effect 输出继承 command list 坐标系，
+                                        // 圆角矩形在 shadow_m 处），不是 bounds 左
+                                        // 上——补偿把阴影平移出左上角（白底像素
+                                        // 分析：浓阴影聚窗口左上）。原始分离根因
+                                        // 是缓存键漏 shadow_radius（本版已在键中）。
+                                        // identity 下偏移同样须物理（×dpi）。
+                                        let off = D2D_POINT_2F {
+                                            x: shadow_off_x * dpi_scale,
+                                            y: shadow_off_y * dpi_scale,
+                                        };
+                                        ctx.DrawImage(
+                                            &eff_img,
+                                            Some(&off as *const _),
+                                            None,
+                                            D2D1_INTERPOLATION_MODE_LINEAR,
+                                            D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                                        );
                                         ctx.SetTransform(
                                             &windows::Foundation::Numerics::Matrix3x2 {
                                                 M11: dpi_scale,
@@ -1983,246 +2138,28 @@ impl CandidateWindowV2 {
                                                 M32: 0.0,
                                             },
                                         );
-                                        ctx.PopLayer();
+                                        if mask_ok {
+                                            ctx.PopLayer();
+                                        }
+                                        return Some(());
                                     }
                                 }
-                            }
-                        } // else Layer 路径（stage 0/3+）
-                    }
-                }
-            }
-            // 投影：多层外扩圆角矩形衰减近似高斯模糊（外坐标空间，
-            // 内容平移前画——内容面板会盖住投影内圈，只留柔和外沿）
-            if has_shadow && !(stage >= 1 && stage <= 3) {
-                // 【阴影透明度】material.shadow_alpha 独立滑条（颜色自带
-                // alpha 忽略——与纯色模型一致的语义）
-                let shadow_alpha = skin
-                    .pointer("/skin/material/shadow_alpha")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("shadow_alpha")))
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 1.0) as f32;
-                let mut sc = color_f(skin, "shadow_color", "#000000FF");
-                sc.a = shadow_alpha;
-                if sc.a > 0.004 {
-                    // 【每帧缓存键】(w,h,corner_radius,shadow_radius,oy,ox,argb,dpi)
-                    // ——宽度不变的连续帧（同长度候选/翻页）零重建 command
-                    // list+effect。【2026-09-08 分离 BUG 修复】原键漏了
-                    // shadow_radius：拖「阴影大小」滑杆时 shadow_m→窗口
-                    // 尺寸变，但内容 w/h/圆角/偏移/颜色全没变→键命中→
-                    // 重放旧 effect（旧 blur、旧 shadow_m 坐标的圆角矩形）
-                    // 画进新窗口，阴影与窗体错位（用户实测「偶发阴影和
-                    // 候选分离」的根因）。
-                    let sc_packed = ((sc.r * 255.0) as u32)
-                        | (((sc.g * 255.0) as u32) << 8)
-                        | (((sc.b * 255.0) as u32) << 16)
-                        | (((sc.a * 255.0) as u32) << 24);
-                    let sh_key = (
-                        width as u32,
-                        height as u32,
-                        (radius * 4.0) as u32,
-                        (shadow_radius * 4.0) as u32,
-                        ((shadow_off_y * 4.0) as i32, (shadow_off_x * 4.0) as i32),
-                        sc_packed,
-                        (dpi_scale * 100.0) as u32,
-                    );
-                    // 【真 D2D 高斯阴影】用户两轮判多层近似「太锐利」——
-                    // 换 D2D1Shadow 效果（系统级高斯模糊）：窗口形状画进
-                    // command list → Shadow 效果 → DrawImage 回主画布。
-                    let fx = (|| -> Option<()> {
-                        unsafe {
-                            if let Some((k, v)) = &shadow_cache_in {
-                                if *k == sh_key {
-                                    // 命中：直接绘制缓存的 effect 输出
-                                    let eff_img: ID2D1Image = v.1.cast().ok()?;
-                                    // 【高DPI二次缩放修复 2026-09-11】
-                                    // effect 输出=物理像素（command list 录制
-                                    // 时几何已乘 dpi_scale）；此前 DrawImage
-                                    // 在 dpi 世界变换下画 → 高 DPI 屏内容再
-                                    // 乘一次 scale：150% 屏阴影 ×2.25 倍位、
-                                    // 右下偏移出窗（用户实测「阴影超大范围
-                                    // 偏离」，1.4.8 引入 dpi 中心化后高 DPI
-                                    // 机器必现、100% 屏 ×1 不可见——本机全
-                                    // 100% 故历轮复现不了）。玻璃段 2026-09-08
-                                    // 已修（identity+物理坐标），纯色段漏修。
-                                    // 正序（对齐玻璃段）：identity → Push mask
-                                    // （洞几何乘 dpi）→ DrawImage（物理偏移）
-                                    // → 恢复 dpi 主变换 → Pop。
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: 1.0,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: 1.0,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    let mask_ok = push_shadow_mask(
-                                        &ctx, width, height, w_out, h_out, shadow_m, radius,
-                                        dpi_scale,
-                                    );
-                                    // 【阴影分离修复·终版 2026-09-08】曾加
-                                    // GetImageLocalBounds 补偿——实错：DrawImage
-                                    // 的 targetOffset 对齐 image 坐标原点 (0,0)
-                                    //（effect 输出继承 command list 坐标系，
-                                    // 圆角矩形在 shadow_m 处），不是 bounds 左
-                                    // 上——补偿把阴影平移出左上角（白底像素
-                                    // 分析：浓阴影聚窗口左上）。原始分离根因
-                                    // 是缓存键漏 shadow_radius（本版已在键中）。
-                                    // identity 下偏移同样须物理（×dpi）。
-                                    let off = D2D_POINT_2F {
-                                        x: shadow_off_x * dpi_scale,
-                                        y: shadow_off_y * dpi_scale,
-                                    };
-                                    ctx.DrawImage(
-                                        &eff_img,
-                                        Some(&off as *const _),
+                                let cl = ctx.CreateCommandList().ok()?;
+                                let saved = ctx.GetTarget().ok();
+                                let cl_img: ID2D1Image = cl.cast().ok()?;
+                                ctx.SetTarget(Some(&cl_img));
+                                let wb = ctx
+                                    .CreateSolidColorBrush(
+                                        &D2D1_COLOR_F {
+                                            r: 0.0,
+                                            g: 0.0,
+                                            b: 0.0,
+                                            a: 1.0,
+                                        },
                                         None,
-                                        D2D1_INTERPOLATION_MODE_LINEAR,
-                                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                                    );
-                                    ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                        M11: dpi_scale,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: dpi_scale,
-                                        M31: 0.0,
-                                        M32: 0.0,
-                                    });
-                                    if mask_ok {
-                                        ctx.PopLayer();
-                                    }
-                                    return Some(());
-                                }
-                            }
-                            let cl = ctx.CreateCommandList().ok()?;
-                            let saved = ctx.GetTarget().ok();
-                            let cl_img: ID2D1Image = cl.cast().ok()?;
-                            ctx.SetTarget(Some(&cl_img));
-                            let wb = ctx
-                                .CreateSolidColorBrush(
-                                    &D2D1_COLOR_F {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 1.0,
-                                    },
-                                    None,
-                                )
-                                .ok()?;
-                            let rr_win = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: shadow_m,
-                                    top: shadow_m,
-                                    right: shadow_m + width,
-                                    bottom: shadow_m + height,
-                                },
-                                radiusX: radius,
-                                radiusY: radius,
-                            };
-                            ctx.FillRoundedRectangle(&rr_win, &wb);
-                            cl.Close().ok()?;
-                            ctx.SetTarget(saved.as_ref());
-                            let effect = ctx.CreateEffect(&CLSID_D2D1Shadow).ok()?;
-                            let blur = shadow_radius * 0.5 + 1.0;
-                            let _ =
-                                effect.SetValue(0, D2D1_PROPERTY_TYPE_FLOAT, &blur.to_ne_bytes());
-                            let col = D2D_VECTOR_4F {
-                                x: sc.r,
-                                y: sc.g,
-                                z: sc.b,
-                                w: sc.a,
-                            };
-                            let _ = effect.SetValue(
-                                1,
-                                D2D1_PROPERTY_TYPE_VECTOR4,
-                                &[
-                                    col.x.to_ne_bytes(),
-                                    col.y.to_ne_bytes(),
-                                    col.z.to_ne_bytes(),
-                                    col.w.to_ne_bytes(),
-                                ]
-                                .concat(),
-                            );
-                            let eff_img: ID2D1Image = effect.cast().ok()?;
-                            effect.SetInput(0, &cl_img, true);
-                            // 【圆角外遮罩】高斯向内弥散会进窗口内部；用
-                            // 直角矩形清除会在圆角外留直角切割痕（用户实测
-                            // 「直角色块」）。改 Layer 几何遮罩：整画布 −
-                            // 窗口圆角（even-odd）——阴影只在窗外绘制。
-                            // 【高DPI二次缩放修复 2026-09-11】同缓存命中
-                            // 分支：identity → Push mask（洞×dpi）→
-                            // DrawImage（物理偏移）→ 恢复 dpi → Pop。
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: 1.0,
-                                M12: 0.0,
-                                M21: 0.0,
-                                M22: 1.0,
-                                M31: 0.0,
-                                M32: 0.0,
-                            });
-                            let mask_ok = push_shadow_mask(
-                                &ctx, width, height, w_out, h_out, shadow_m, radius, dpi_scale,
-                            );
-                            // 【阴影分离修复·终版】同缓存命中分支：无补偿
-                            // 原语义（详见上方注释）。
-                            let off = D2D_POINT_2F {
-                                x: shadow_off_x * dpi_scale,
-                                y: shadow_off_y * dpi_scale,
-                            };
-                            ctx.DrawImage(
-                                &eff_img,
-                                Some(&off as *const _),
-                                None,
-                                D2D1_INTERPOLATION_MODE_LINEAR,
-                                D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                            );
-                            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                                M11: dpi_scale,
-                                M12: 0.0,
-                                M21: 0.0,
-                                M22: dpi_scale,
-                                M31: 0.0,
-                                M32: 0.0,
-                            });
-                            if mask_ok {
-                                ctx.PopLayer();
-                            }
-                            // 【每帧缓存】存 command list+effect（键内含
-                            // w/h/圆角/偏移/颜色，任一变即重建）
-                            shadow_cache_out = Some((sh_key, (cl, effect)));
-                            Some(())
-                        }
-                    })();
-                    // 兜底：效果路径失败（老驱动）→ 下方环带多层近似
-                    if fx.is_none() {
-                        // 【阴影诊断 2026-09-08】用户实测「辐射状阴影+与候选分离」
-                        // ——症状指向本兜底分支（环带多层）。记录失败原因到 trace。
-                        unsafe {
-                            let line = format!(
-                                "[shadow] D2D effect 失败→环带兜底 r={} w={} h={} m={:.1}\n",
-                                shadow_radius, w, h, shadow_m
-                            );
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(std::env::temp_dir().join("hufu-tsf-trace.log"))
-                            {
-                                use std::io::Write;
-                                let _ = f.write_all(line.as_bytes());
-                            }
-                        }
-                        if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
-                            // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
-                            // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满
-                            // 整窗（用户实测 bug）。改 even-odd 几何环带：每层
-                            // 只画「外圈 − 窗口」的环，窗口内部永远无阴影。
-                            let factory = ctx.GetFactory().ok();
-                            // 模糊感：层数多 + 高斯衰减（exp(-kt²)）——层间
-                            // 台阶不可见，观感≈CSS box-shadow 的高斯模糊。
-                            const PASSES: usize = 28;
-                            // 窗口自身圆角矩形（环带的内边界）
-                            let win_geom = factory.as_ref().and_then(|f| {
-                                let rr = D2D1_ROUNDED_RECT {
+                                    )
+                                    .ok()?;
+                                let rr_win = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
                                         left: shadow_m,
                                         top: shadow_m,
@@ -2232,478 +2169,597 @@ impl CandidateWindowV2 {
                                     radiusX: radius,
                                     radiusY: radius,
                                 };
-                                f.CreateRoundedRectangleGeometry(&rr).ok()
-                            });
-                            for i in (1..=PASSES).rev() {
-                                let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈趋 0
-                                let grow = shadow_radius * t;
-                                // 高斯衰减：贴边最浓向外平滑消散（旧 (1-t)²
-                                // 台阶感强——「阴影太锐利」的根因）
-                                let a = sc.a * (-4.5 * t * t).exp();
-                                b.SetColor(&D2D1_COLOR_F {
-                                    r: sc.r,
-                                    g: sc.g,
-                                    b: sc.b,
-                                    a,
-                                });
-                                let rr = D2D1_ROUNDED_RECT {
-                                    rect: D2D_RECT_F {
-                                        left: shadow_m - grow + shadow_off_x * t,
-                                        top: shadow_m - grow + shadow_off_y * t,
-                                        right: shadow_m + width + grow + shadow_off_x * t,
-                                        bottom: shadow_m + height + grow + shadow_off_y * t,
-                                    },
-                                    radiusX: radius + grow,
-                                    radiusY: radius + grow,
+                                ctx.FillRoundedRectangle(&rr_win, &wb);
+                                cl.Close().ok()?;
+                                ctx.SetTarget(saved.as_ref());
+                                let effect = ctx.CreateEffect(&CLSID_D2D1Shadow).ok()?;
+                                let blur = shadow_radius * 0.5 + 1.0;
+                                let _ = effect.SetValue(
+                                    0,
+                                    D2D1_PROPERTY_TYPE_FLOAT,
+                                    &blur.to_ne_bytes(),
+                                );
+                                let col = D2D_VECTOR_4F {
+                                    x: sc.r,
+                                    y: sc.g,
+                                    z: sc.b,
+                                    w: sc.a,
                                 };
-                                // 每层 = 外圈几何 − 窗口几何 的 even-odd 环带
-                                //（窗口内部永远无阴影；全透明窗只剩轮廓外投影）
-                                let ring = (|| -> Option<()> {
-                                    let f = factory.as_ref()?;
-                                    let wg = win_geom.as_ref()?;
-                                    let outer: Option<
-                                        windows::Win32::Graphics::Direct2D::ID2D1Geometry,
-                                    > = f
-                                        .CreateRoundedRectangleGeometry(&rr)
-                                        .ok()
-                                        .and_then(|g| g.cast().ok());
-                                    let outer = outer?;
-                                    let inner: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
-                                        wg.clone().cast().ok()?;
-                                    let grp = f
-                                        .CreateGeometryGroup(
-                                            D2D1_FILL_MODE_ALTERNATE,
-                                            &[Some(outer), Some(inner)],
-                                        )
-                                        .ok()?;
-                                    ctx.FillGeometry(&grp, &b, None);
-                                    Some(())
-                                })();
-                                if ring.is_none() {
-                                    // 几何路径失败兜底：退回实心（旧行为）
-                                    ctx.FillRoundedRectangle(&rr, &b);
+                                let _ = effect.SetValue(
+                                    1,
+                                    D2D1_PROPERTY_TYPE_VECTOR4,
+                                    &[
+                                        col.x.to_ne_bytes(),
+                                        col.y.to_ne_bytes(),
+                                        col.z.to_ne_bytes(),
+                                        col.w.to_ne_bytes(),
+                                    ]
+                                    .concat(),
+                                );
+                                let eff_img: ID2D1Image = effect.cast().ok()?;
+                                effect.SetInput(0, &cl_img, true);
+                                // 【圆角外遮罩】高斯向内弥散会进窗口内部；用
+                                // 直角矩形清除会在圆角外留直角切割痕（用户实测
+                                // 「直角色块」）。改 Layer 几何遮罩：整画布 −
+                                // 窗口圆角（even-odd）——阴影只在窗外绘制。
+                                // 【高DPI二次缩放修复 2026-09-11】同缓存命中
+                                // 分支：identity → Push mask（洞×dpi）→
+                                // DrawImage（物理偏移）→ 恢复 dpi → Pop。
+                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                    M11: 1.0,
+                                    M12: 0.0,
+                                    M21: 0.0,
+                                    M22: 1.0,
+                                    M31: 0.0,
+                                    M32: 0.0,
+                                });
+                                let mask_ok = push_shadow_mask(
+                                    &ctx, width, height, w_out, h_out, shadow_m, radius, dpi_scale,
+                                );
+                                // 【阴影分离修复·终版】同缓存命中分支：无补偿
+                                // 原语义（详见上方注释）。
+                                let off = D2D_POINT_2F {
+                                    x: shadow_off_x * dpi_scale,
+                                    y: shadow_off_y * dpi_scale,
+                                };
+                                ctx.DrawImage(
+                                    &eff_img,
+                                    Some(&off as *const _),
+                                    None,
+                                    D2D1_INTERPOLATION_MODE_LINEAR,
+                                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                                );
+                                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                                    M11: dpi_scale,
+                                    M12: 0.0,
+                                    M21: 0.0,
+                                    M22: dpi_scale,
+                                    M31: 0.0,
+                                    M32: 0.0,
+                                });
+                                if mask_ok {
+                                    ctx.PopLayer();
+                                }
+                                // 【每帧缓存】存 command list+effect（键内含
+                                // w/h/圆角/偏移/颜色，任一变即重建）
+                                shadow_cache_out = Some((sh_key, (cl, effect)));
+                                Some(())
+                            }
+                        })();
+                        // 兜底：效果路径失败（老驱动）→ 下方环带多层近似
+                        if fx.is_none() {
+                            // 【阴影诊断 2026-09-08】用户实测「辐射状阴影+与候选分离」
+                            // ——症状指向本兜底分支（环带多层）。记录失败原因到 trace。
+                            unsafe {
+                                let line = format!(
+                                    "[shadow] D2D effect 失败→环带兜底 r={} w={} h={} m={:.1}\n",
+                                    shadow_radius, w, h, shadow_m
+                                );
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(std::env::temp_dir().join("hufu-tsf-trace.log"))
+                                {
+                                    use std::io::Write;
+                                    let _ = f.write_all(line.as_bytes());
                                 }
                             }
-                        }
-                    } // fx.is_none() 环带兜底结束
+                            if let Ok(b) = ctx.CreateSolidColorBrush(&sc, None) {
+                                // 【环带阴影】旧实现多层实心圆角矩形「内浓外淡」
+                                // 依赖不透明窗底盖住内圈——窗底全透明时阴影盖满
+                                // 整窗（用户实测 bug）。改 even-odd 几何环带：每层
+                                // 只画「外圈 − 窗口」的环，窗口内部永远无阴影。
+                                let factory = ctx.GetFactory().ok();
+                                // 模糊感：层数多 + 高斯衰减（exp(-kt²)）——层间
+                                // 台阶不可见，观感≈CSS box-shadow 的高斯模糊。
+                                const PASSES: usize = 28;
+                                // 窗口自身圆角矩形（环带的内边界）
+                                let win_geom = factory.as_ref().and_then(|f| {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: shadow_m,
+                                            top: shadow_m,
+                                            right: shadow_m + width,
+                                            bottom: shadow_m + height,
+                                        },
+                                        radiusX: radius,
+                                        radiusY: radius,
+                                    };
+                                    f.CreateRoundedRectangleGeometry(&rr).ok()
+                                });
+                                for i in (1..=PASSES).rev() {
+                                    let t = i as f32 / PASSES as f32; // 外圈 t=1 → 内圈趋 0
+                                    let grow = shadow_radius * t;
+                                    // 高斯衰减：贴边最浓向外平滑消散（旧 (1-t)²
+                                    // 台阶感强——「阴影太锐利」的根因）
+                                    let a = sc.a * (-4.5 * t * t).exp();
+                                    b.SetColor(&D2D1_COLOR_F {
+                                        r: sc.r,
+                                        g: sc.g,
+                                        b: sc.b,
+                                        a,
+                                    });
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: shadow_m - grow + shadow_off_x * t,
+                                            top: shadow_m - grow + shadow_off_y * t,
+                                            right: shadow_m + width + grow + shadow_off_x * t,
+                                            bottom: shadow_m + height + grow + shadow_off_y * t,
+                                        },
+                                        radiusX: radius + grow,
+                                        radiusY: radius + grow,
+                                    };
+                                    // 每层 = 外圈几何 − 窗口几何 的 even-odd 环带
+                                    //（窗口内部永远无阴影；全透明窗只剩轮廓外投影）
+                                    let ring = (|| -> Option<()> {
+                                        let f = factory.as_ref()?;
+                                        let wg = win_geom.as_ref()?;
+                                        let outer: Option<
+                                            windows::Win32::Graphics::Direct2D::ID2D1Geometry,
+                                        > = f
+                                            .CreateRoundedRectangleGeometry(&rr)
+                                            .ok()
+                                            .and_then(|g| g.cast().ok());
+                                        let outer = outer?;
+                                        let inner: windows::Win32::Graphics::Direct2D::ID2D1Geometry =
+                                        wg.clone().cast().ok()?;
+                                        let grp = f
+                                            .CreateGeometryGroup(
+                                                D2D1_FILL_MODE_ALTERNATE,
+                                                &[Some(outer), Some(inner)],
+                                            )
+                                            .ok()?;
+                                        ctx.FillGeometry(&grp, &b, None);
+                                        Some(())
+                                    })();
+                                    if ring.is_none() {
+                                        // 几何路径失败兜底：退回实心（旧行为）
+                                        ctx.FillRoundedRectangle(&rr, &b);
+                                    }
+                                }
+                            }
+                        } // fx.is_none() 环带兜底结束
+                    }
                 }
-            }
-            // 内容整体平移进阴影边距内（此后所有内容坐标不变）；
-            // 矩阵 = 缩放（高 DPI）× 平移（shadow_m 物理 px）
-            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: dpi_scale,
-                M12: 0.0,
-                M21: 0.0,
-                M22: dpi_scale,
-                M31: shadow_m * dpi_scale,
-                M32: shadow_m * dpi_scale,
-            });
-            // 【整体透明度】非文字元素的总乘法系数（块外供共用）
-            let master = skin
-                .pointer("/skin/material/master_alpha")
-                .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0) as f32;
-            // 【高亮透明度】高亮候选底独立系数
-            let hilite_a = skin
-                .pointer("/skin/material/hilite_alpha")
-                .or_else(|| skin.get("material").and_then(|m| m.get("hilite_alpha")))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0) as f32;
-            {
-                // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
-                // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 1。
-                // 【毛玻璃 2026-09-08】kind=glass 时底色是模糊底上的「染色
-                // 层」——保持 master 不透明会把毛玻璃完全盖死（用户实测
-                // 「画了但看不到」的根因），降为 0.55 让模糊底透出。
-                let back = color_f(skin, "back_color", "#202022E6");
-                // 【v3.6·裸玻璃实验】用户方向：glass 时隐藏候选框面板元素
-                //（底色/染色层不画），只保留高亮胶囊和文字——毛玻璃底
-                //（accent 模糊）直接裸露，元素浮在玻璃上。视觉不行可回退
-                // 此段（恢复 v3.3 染色面板）。
-                let bg_c = if kind == "glass" {
-                    D2D1_COLOR_F {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }
-                } else {
-                    D2D1_COLOR_F {
-                        r: back.r,
-                        g: back.g,
-                        b: back.b,
-                        a: if stage == 1 { 0.0 } else { master },
-                    }
-                };
-                if bg_c.a > 0.004 {
-                    if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: 0.0,
-                                top: 0.0,
-                                right: width,
-                                bottom: height,
-                            },
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        ctx.FillRoundedRectangle(&rr, &b);
-                    }
-                }
-                // 【纯色模型】暗化层已废弃（材质系统移除）——不画
-            }
-
-            // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
-            // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
-            let elem_alpha = |mut c: D2D1_COLOR_F| {
-                c.a = master;
-                c
-            };
-            let text_alpha = |mut c: D2D1_COLOR_F| {
-                c.a = 1.0;
-                c
-            };
-            let mkbrush =
-                |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
-                    ctx.CreateSolidColorBrush(&c, None).ok()
-                };
-            let b_text = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "candidate_text_color", "#E8E8EAFF")),
-            );
-            let b_label = mkbrush(&ctx, text_alpha(color_f(skin, "label_color", "#C9C9C9FF")));
-            let b_raw = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")),
-            );
-            // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
-            let b_preedit_bg = {
-                let c = elem_alpha(color_f(skin, "preedit_back_color", "#00000000"));
-                (c.a > 0.01).then(|| mkbrush(&ctx, c)).flatten()
-            };
-            let b_cmt = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "comment_text_color", "#9A9AA0FF")),
-            );
-            let b_hi = mkbrush(&ctx, {
-                let mut c = color_f(skin, "hilited_candidate_back_color", "#404046FF");
-                c.a = hilite_a;
-                c
-            });
-            let b_hi_txt = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF")),
-            );
-            let b_hi_lbl = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "hilited_candidate_label_color", "#FFD75EFF")),
-            );
-            let b_hi_cmt = mkbrush(
-                &ctx,
-                text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")),
-            );
-            let b_border = mkbrush(&ctx, {
-                // 【边框透明度】material.border_alpha 独立滑条（颜色自带 a 忽略）
-                let border_alpha = skin
-                    .pointer("/skin/material/border_alpha")
-                    .or_else(|| skin.get("material").and_then(|m| m.get("border_alpha")))
+                // 内容整体平移进阴影边距内（此后所有内容坐标不变）；
+                // 矩阵 = 缩放（高 DPI）× 平移（shadow_m 物理 px）
+                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                    M11: dpi_scale,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: dpi_scale,
+                    M31: shadow_m * dpi_scale,
+                    M32: shadow_m * dpi_scale,
+                });
+                // 【整体透明度】非文字元素的总乘法系数（块外供共用）
+                let master = skin
+                    .pointer("/skin/material/master_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
                     .and_then(|x| x.as_f64())
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0) as f32;
-                let mut c = color_f(skin, "border_color", "#FFFFFF26");
-                c.a = border_alpha;
-                c
-            });
-
-            let draw = |ctx: &ID2D1DeviceContext,
-                        tf: &Option<IDWriteTextFormat>,
-                        s: &str,
-                        x: f32,
-                        y: f32,
-                        w: f32,
-                        h: f32,
-                        brush: &Option<ID2D1SolidColorBrush>| {
-                if let (Some(tf), Some(brush)) = (tf, brush) {
-                    let ws: Vec<u16> = s.encode_utf16().collect();
-                    if ws.is_empty() {
-                        return;
-                    }
-                    let rect = D2D_RECT_F {
-                        left: x,
-                        top: y,
-                        right: x + w,
-                        bottom: y + h,
+                // 【高亮透明度】高亮候选底独立系数
+                let hilite_a = skin
+                    .pointer("/skin/material/hilite_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("hilite_alpha")))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                {
+                    // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
+                    // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 1。
+                    // 【毛玻璃 2026-09-08】kind=glass 时底色是模糊底上的「染色
+                    // 层」——保持 master 不透明会把毛玻璃完全盖死（用户实测
+                    // 「画了但看不到」的根因），降为 0.55 让模糊底透出。
+                    let back = color_f(skin, "back_color", "#202022E6");
+                    // 【v3.6·裸玻璃实验】用户方向：glass 时隐藏候选框面板元素
+                    //（底色/染色层不画），只保留高亮胶囊和文字——毛玻璃底
+                    //（accent 模糊）直接裸露，元素浮在玻璃上。视觉不行可回退
+                    // 此段（恢复 v3.3 染色面板）。
+                    let bg_c = if kind == "glass" {
+                        D2D1_COLOR_F {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }
+                    } else {
+                        D2D1_COLOR_F {
+                            r: back.r,
+                            g: back.g,
+                            b: back.b,
+                            a: if stage == 1 { 0.0 } else { master },
+                        }
                     };
-                    let _ = ctx.DrawText(
-                        &ws,
-                        tf,
-                        &rect,
-                        brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        DWRITE_MEASURING_MODE_NATURAL,
-                    );
-                }
-            };
-
-            // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
-            let draw_content = !(stage >= 1 && stage <= 4);
-            if draw_content {
-                // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
-                if !raw.is_empty() {
-                    // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
-                    // 【v3.9.1 裸玻璃】glass 时编码底块一并隐藏（用户「有些
-                    // 元素没挡住」——实色底块浮在玻璃上突兀；编码文字保留）。
-                    if kind != "glass" {
-                        if let Some(bg) = &b_preedit_bg {
+                    if bg_c.a > 0.004 {
+                        if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
-                                    left: rm_x,
-                                    top: rm_y,
-                                    right: width - rm_x,
-                                    bottom: rm_y + line_h,
+                                    left: 0.0,
+                                    top: 0.0,
+                                    right: width,
+                                    bottom: height,
                                 },
-                                radiusX: 4.0,
-                                radiusY: 4.0,
+                                radiusX: radius,
+                                radiusY: radius,
                             };
-                            unsafe {
-                                ctx.FillRoundedRectangle(&rr, bg);
-                            }
+                            ctx.FillRoundedRectangle(&rr, &b);
                         }
                     }
-                    draw(
-                        &ctx,
-                        &tf,
-                        raw.as_str(),
-                        rm_x,
-                        rm_y + dy,
-                        width - rm_x * 2.0,
-                        row_h,
-                        &b_raw,
-                    );
+                    // 【纯色模型】暗化层已废弃（材质系统移除）——不画
                 }
-                // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
-                // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
-                // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
-                // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
-                // 布置。
-                let y0 = rm_y + (row_h + cand_spacing) * code_row;
 
-                // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
-                // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
-                // 行槽 row_h 已在测量段撑高到能装下胶囊（max(line_h,
-                // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
-                // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
-                // 补丁链全部废除。
-                let pill_v = |y: f32| -> (f32, f32) {
-                    let off = (row_h - pill_h) / 2.0;
-                    (y + off, y + off + pill_h)
+                // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
+                // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
+                let elem_alpha = |mut c: D2D1_COLOR_F| {
+                    c.a = master;
+                    c
+                };
+                let text_alpha = |mut c: D2D1_COLOR_F| {
+                    c.a = 1.0;
+                    c
+                };
+                let mkbrush =
+                    |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
+                        ctx.CreateSolidColorBrush(&c, None).ok()
+                    };
+                let b_text = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "candidate_text_color", "#E8E8EAFF")),
+                );
+                let b_label = mkbrush(&ctx, text_alpha(color_f(skin, "label_color", "#C9C9C9FF")));
+                let b_raw = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")),
+                );
+                // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
+                let b_preedit_bg = {
+                    let c = elem_alpha(color_f(skin, "preedit_back_color", "#00000000"));
+                    (c.a > 0.01).then(|| mkbrush(&ctx, c)).flatten()
+                };
+                let b_cmt = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "comment_text_color", "#9A9AA0FF")),
+                );
+                let b_hi = mkbrush(&ctx, {
+                    let mut c = color_f(skin, "hilited_candidate_back_color", "#404046FF");
+                    c.a = hilite_a;
+                    c
+                });
+                let b_hi_txt = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "hilited_candidate_text_color", "#FFFFFFFF")),
+                );
+                let b_hi_lbl = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "hilited_candidate_label_color", "#FFD75EFF")),
+                );
+                let b_hi_cmt = mkbrush(
+                    &ctx,
+                    text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")),
+                );
+                let b_border = mkbrush(&ctx, {
+                    // 【边框透明度】material.border_alpha 独立滑条（颜色自带 a 忽略）
+                    let border_alpha = skin
+                        .pointer("/skin/material/border_alpha")
+                        .or_else(|| skin.get("material").and_then(|m| m.get("border_alpha")))
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0) as f32;
+                    let mut c = color_f(skin, "border_color", "#FFFFFF26");
+                    c.a = border_alpha;
+                    c
+                });
+
+                let draw = |ctx: &ID2D1DeviceContext,
+                            tf: &Option<IDWriteTextFormat>,
+                            s: &str,
+                            x: f32,
+                            y: f32,
+                            w: f32,
+                            h: f32,
+                            brush: &Option<ID2D1SolidColorBrush>| {
+                    if let (Some(tf), Some(brush)) = (tf, brush) {
+                        let ws: Vec<u16> = s.encode_utf16().collect();
+                        if ws.is_empty() {
+                            return;
+                        }
+                        let rect = D2D_RECT_F {
+                            left: x,
+                            top: y,
+                            right: x + w,
+                            bottom: y + h,
+                        };
+                        let _ = ctx.DrawText(
+                            &ws,
+                            tf,
+                            &rect,
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
                 };
 
-                // 候选行
-                let sel = selected.min(cands.len().saturating_sub(1));
-                if horizontal {
-                    // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
-                    // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
-                    let mut x = rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
-                    let y = y0;
-                    for (i, (text, _)) in cands.iter().enumerate().take(10) {
-                        let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                        let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
-                        let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
-                        if i > 0 {
-                            x += cand_spacing;
-                        }
-                        if i == sel {
-                            if let Some(b) = &b_hi {
-                                let (pt, pb) = pill_v(y);
-                                let rr = D2D1_ROUNDED_RECT {
-                                    rect: D2D_RECT_F {
-                                        left: x - hilite_pad,
-                                        top: pt,
-                                        right: x + cell_w + hilite_pad,
-                                        bottom: pb,
-                                    },
-                                    radiusX: layout_f(skin, "hilited_corner_radius", radius),
-                                    radiusY: layout_f(skin, "hilited_corner_radius", radius),
-                                };
-                                ctx.FillRoundedRectangle(&rr, b);
-                                // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
-                                if mark_en {
-                                    let mw = 2.0f32.min(hilite_pad);
-                                    let my = y + row_h * 0.2;
-                                    let mh = row_h * 0.6;
-                                    let mrr = D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F {
-                                            left: x - hilite_pad + (hilite_pad - mw) / 2.0,
-                                            top: my,
-                                            right: x - hilite_pad + (hilite_pad - mw) / 2.0 + mw,
-                                            bottom: my + mh,
-                                        },
-                                        radiusX: 1.0,
-                                        radiusY: 1.0,
-                                    };
-                                    let mb = b_hi_lbl
-                                        .as_ref()
-                                        .or_else(|| b_hi_txt.as_ref())
-                                        .unwrap_or(b);
-                                    ctx.FillRoundedRectangle(&mrr, mb);
-                                }
-                            }
-                        }
-                        let (bt, bl, bc) = if i == sel {
-                            (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
-                        } else {
-                            (&b_text, &b_label, &b_cmt)
-                        };
-                        let mut cx = x;
-                        if show_index {
-                            draw(
-                                &ctx,
-                                &tf_label,
-                                &fmt_label(i + 1),
-                                cx,
-                                y + dy,
-                                iw,
-                                row_h,
-                                bl,
-                            );
-                            cx += iw;
-                        }
-                        draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
-                        cx += tw;
-                        if !cmt.is_empty() && cw > 0.0 {
-                            draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
-                        }
-                        x += cell_w;
-                    }
-                } else {
-                    // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
-                    for (i, (text, _)) in cands.iter().enumerate().take(10) {
-                        let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                        let y = y0 + (row_h + cand_spacing) * i as f32;
-                        if i == sel {
-                            // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
-                            // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
-                            // 已在胶囊内 gap+hp 起）
-                            if let Some(b) = &b_hi {
-                                let (pt, pb) = pill_v(y);
+                // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
+                let draw_content = !(stage >= 1 && stage <= 4);
+                if draw_content {
+                    // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
+                    if !raw.is_empty() {
+                        // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
+                        // 【v3.9.1 裸玻璃】glass 时编码底块一并隐藏（用户「有些
+                        // 元素没挡住」——实色底块浮在玻璃上突兀；编码文字保留）。
+                        if kind != "glass" {
+                            if let Some(bg) = &b_preedit_bg {
                                 let rr = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
                                         left: rm_x,
-                                        top: pt,
+                                        top: rm_y,
                                         right: width - rm_x,
-                                        bottom: pb,
+                                        bottom: rm_y + line_h,
                                     },
-                                    radiusX: layout_f(skin, "hilited_corner_radius", radius),
-                                    radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                    radiusX: 4.0,
+                                    radiusY: 4.0,
                                 };
-                                ctx.FillRoundedRectangle(&rr, b);
-                                // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
-                                if mark_en {
-                                    let mw = 2.0f32.min(hilite_pad);
-                                    let my = y + row_h * 0.2;
-                                    let mh = row_h * 0.6;
-                                    let mrr = D2D1_ROUNDED_RECT {
-                                        rect: D2D_RECT_F {
-                                            left: rm_x + (hilite_pad - mw) / 2.0,
-                                            top: my,
-                                            right: rm_x + (hilite_pad - mw) / 2.0 + mw,
-                                            bottom: my + mh,
-                                        },
-                                        radiusX: 1.0,
-                                        radiusY: 1.0,
-                                    };
-                                    let mb = b_hi_lbl
-                                        .as_ref()
-                                        .or_else(|| b_hi_txt.as_ref())
-                                        .unwrap_or(b);
-                                    ctx.FillRoundedRectangle(&mrr, mb);
+                                unsafe {
+                                    ctx.FillRoundedRectangle(&rr, bg);
                                 }
                             }
-                        }
-                        let (bt, bl, bc) = if i == sel {
-                            (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
-                        } else {
-                            (&b_text, &b_label, &b_cmt)
-                        };
-                        if show_index {
-                            draw(
-                                &ctx,
-                                &tf_label,
-                                &fmt_label(i + 1),
-                                rm_x + hilite_pad,
-                                y + dy,
-                                label_w,
-                                row_h,
-                                bl,
-                            );
                         }
                         draw(
                             &ctx,
                             &tf,
-                            text,
-                            text_x,
-                            y + dy,
-                            cmt_x - text_x - 4.0,
+                            raw.as_str(),
+                            rm_x,
+                            rm_y + dy,
+                            width - rm_x * 2.0,
                             row_h,
-                            bt,
+                            &b_raw,
                         );
-                        if !cmt.is_empty() {
+                    }
+                    // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
+                    // 高亮胶囊/窗边距）——窗顶与窗底到高亮区的间隙差 ±dy（用户
+                    // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
+                    // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
+                    // 布置。
+                    let y0 = rm_y + (row_h + cand_spacing) * code_row;
+
+                    // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
+                    // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
+                    // 行槽 row_h 已在测量段撑高到能装下胶囊（max(line_h,
+                    // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
+                    // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
+                    // 补丁链全部废除。
+                    let pill_v = |y: f32| -> (f32, f32) {
+                        let off = (row_h - pill_h) / 2.0;
+                        (y + off, y + off + pill_h)
+                    };
+
+                    // 候选行
+                    let sel = selected.min(cands.len().saturating_sub(1));
+                    if horizontal {
+                        // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
+                        // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
+                        let mut x =
+                            rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
+                        let y = y0;
+                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                            let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
+                            let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                            let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
+                            if i > 0 {
+                                x += cand_spacing;
+                            }
+                            if i == sel {
+                                if let Some(b) = &b_hi {
+                                    let (pt, pb) = pill_v(y);
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: x - hilite_pad,
+                                            top: pt,
+                                            right: x + cell_w + hilite_pad,
+                                            bottom: pb,
+                                        },
+                                        radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                        radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, b);
+                                    // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
+                                    if mark_en {
+                                        let mw = 2.0f32.min(hilite_pad);
+                                        let my = y + row_h * 0.2;
+                                        let mh = row_h * 0.6;
+                                        let mrr = D2D1_ROUNDED_RECT {
+                                            rect: D2D_RECT_F {
+                                                left: x - hilite_pad + (hilite_pad - mw) / 2.0,
+                                                top: my,
+                                                right: x - hilite_pad
+                                                    + (hilite_pad - mw) / 2.0
+                                                    + mw,
+                                                bottom: my + mh,
+                                            },
+                                            radiusX: 1.0,
+                                            radiusY: 1.0,
+                                        };
+                                        let mb = b_hi_lbl
+                                            .as_ref()
+                                            .or_else(|| b_hi_txt.as_ref())
+                                            .unwrap_or(b);
+                                        ctx.FillRoundedRectangle(&mrr, mb);
+                                    }
+                                }
+                            }
+                            let (bt, bl, bc) = if i == sel {
+                                (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                            } else {
+                                (&b_text, &b_label, &b_cmt)
+                            };
+                            let mut cx = x;
+                            if show_index {
+                                draw(
+                                    &ctx,
+                                    &tf_label,
+                                    &fmt_label(i + 1),
+                                    cx,
+                                    y + dy,
+                                    iw,
+                                    row_h,
+                                    bl,
+                                );
+                                cx += iw;
+                            }
+                            draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
+                            cx += tw;
+                            if !cmt.is_empty() && cw > 0.0 {
+                                draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
+                            }
+                            x += cell_w;
+                        }
+                    } else {
+                        // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
+                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                            let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
+                            let y = y0 + (row_h + cand_spacing) * i as f32;
+                            if i == sel {
+                                // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
+                                // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
+                                // 已在胶囊内 gap+hp 起）
+                                if let Some(b) = &b_hi {
+                                    let (pt, pb) = pill_v(y);
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: rm_x,
+                                            top: pt,
+                                            right: width - rm_x,
+                                            bottom: pb,
+                                        },
+                                        radiusX: layout_f(skin, "hilited_corner_radius", radius),
+                                        radiusY: layout_f(skin, "hilited_corner_radius", radius),
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, b);
+                                    // mark_text：高亮胶囊左缘内侧细竖条（weasel 语义）
+                                    if mark_en {
+                                        let mw = 2.0f32.min(hilite_pad);
+                                        let my = y + row_h * 0.2;
+                                        let mh = row_h * 0.6;
+                                        let mrr = D2D1_ROUNDED_RECT {
+                                            rect: D2D_RECT_F {
+                                                left: rm_x + (hilite_pad - mw) / 2.0,
+                                                top: my,
+                                                right: rm_x + (hilite_pad - mw) / 2.0 + mw,
+                                                bottom: my + mh,
+                                            },
+                                            radiusX: 1.0,
+                                            radiusY: 1.0,
+                                        };
+                                        let mb = b_hi_lbl
+                                            .as_ref()
+                                            .or_else(|| b_hi_txt.as_ref())
+                                            .unwrap_or(b);
+                                        ctx.FillRoundedRectangle(&mrr, mb);
+                                    }
+                                }
+                            }
+                            let (bt, bl, bc) = if i == sel {
+                                (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
+                            } else {
+                                (&b_text, &b_label, &b_cmt)
+                            };
+                            if show_index {
+                                draw(
+                                    &ctx,
+                                    &tf_label,
+                                    &fmt_label(i + 1),
+                                    rm_x + hilite_pad,
+                                    y + dy,
+                                    label_w,
+                                    row_h,
+                                    bl,
+                                );
+                            }
                             draw(
                                 &ctx,
-                                &tf_small,
-                                cmt,
-                                cmt_x,
+                                &tf,
+                                text,
+                                text_x,
                                 y + dy,
-                                width - cmt_x - rm_x + 4.0,
+                                cmt_x - text_x - 4.0,
                                 row_h,
-                                bc,
+                                bt,
                             );
+                            if !cmt.is_empty() {
+                                draw(
+                                    &ctx,
+                                    &tf_small,
+                                    cmt,
+                                    cmt_x,
+                                    y + dy,
+                                    width - cmt_x - rm_x + 4.0,
+                                    row_h,
+                                    bc,
+                                );
+                            }
                         }
                     }
-                }
 
-                // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
-                // 描边方案用户否决已撤】
-                if let Some(b) = &b_border {
-                    if kind != "glass" {
-                        let bw = layout_f(skin, "border_width", 1.0);
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: bw / 2.0,
-                                top: bw / 2.0,
-                                right: width - bw / 2.0,
-                                bottom: height - bw / 2.0,
-                            },
-                            radiusX: radius,
-                            radiusY: radius,
-                        };
-                        let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+                    // 边框【v3.6 裸玻璃：glass 时隐藏（只留高亮+文字）；v3.7
+                    // 描边方案用户否决已撤】
+                    if let Some(b) = &b_border {
+                        if kind != "glass" {
+                            let bw = layout_f(skin, "border_width", 1.0);
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: bw / 2.0,
+                                    top: bw / 2.0,
+                                    right: width - bw / 2.0,
+                                    bottom: height - bw / 2.0,
+                                },
+                                radiusX: radius,
+                                radiusY: radius,
+                            };
+                            let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
+                        }
                     }
+                } // draw_content
+
+                // 【动效 2026-09-11】过渡帧收层（与 BeginDraw 后的 PushLayer
+                // 配对；稳态未 Push 不 Pop）
+                if fade_layer_on {
+                    ctx.PopLayer();
                 }
-            } // draw_content
+                let _ = ctx.EndDraw(None, None);
+                ctx.SetTarget(None);
 
-            // 【动效 2026-09-11】过渡帧收层（与 BeginDraw 后的 PushLayer
-            // 配对；稳态未 Push 不 Pop）
-            if fade_layer_on {
-                ctx.PopLayer();
-            }
-            let _ = ctx.EndDraw(None, None);
-            ctx.SetTarget(None);
-
-            // 测试回读：EndDraw 后目标位图已非活动，拷到 CPU 位图取整帧 BGRA
-            if self.readback {
-                use windows::Win32::Graphics::Direct2D::{
-                    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    D2D1_BITMAP_OPTIONS_CPU_READ,
-                };
-                // 回读整窗（含阴影边距），与 SetWindowPos 尺寸一致
-                let (w_px, h_px) = (w_out, h_out);
-                if w_px > 0 && h_px > 0 {
-                    let props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
+                // 测试回读：EndDraw 后目标位图已非活动，拷到 CPU 位图取整帧 BGRA
+                if self.readback {
+                    use windows::Win32::Graphics::Direct2D::{
+                        D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                        D2D1_BITMAP_OPTIONS_CPU_READ,
+                    };
+                    // 回读整窗（含阴影边距），与 SetWindowPos 尺寸一致
+                    let (w_px, h_px) = (w_out, h_out);
+                    if w_px > 0 && h_px > 0 {
+                        let props = windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1 {
                         pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
                             format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                             alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -2713,19 +2769,19 @@ impl CandidateWindowV2 {
                         bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0),
                         ..Default::default()
                     };
-                    let _ = D2D1_BITMAP_OPTIONS::default();
-                    if let Ok(cpu) = ctx.CreateBitmap(
-                        windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
-                            width: w_px,
-                            height: h_px,
-                        },
-                        None,
-                        0,
-                        &props,
-                    ) {
-                        unsafe {
-                            if let Ok(bmp0) = bitmap.cast::<ID2D1Bitmap>() {
-                                if cpu
+                        let _ = D2D1_BITMAP_OPTIONS::default();
+                        if let Ok(cpu) = ctx.CreateBitmap(
+                            windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                                width: w_px,
+                                height: h_px,
+                            },
+                            None,
+                            0,
+                            &props,
+                        ) {
+                            unsafe {
+                                if let Ok(bmp0) = bitmap.cast::<ID2D1Bitmap>() {
+                                    if cpu
                                     .CopyFromBitmap(
                                         None,
                                         Some(&bmp0),
@@ -2754,17 +2810,18 @@ impl CandidateWindowV2 {
                                         self.last_size = (w_px, h_px);
                                     }
                                 }
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let hr = chain.Present(1, DXGI_PRESENT(0));
-            if hr.is_err() {
-                crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
+                let hr = chain.Present(1, DXGI_PRESENT(0));
+                if hr.is_err() {
+                    crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
+                }
             }
-        }
+        } // 'sizedraw 结束（收缩动效延迟渲染时整段跳过）
 
         // DWM accent 已弃用：NOREDIRECTIONBITMAP+DComp 窗口上不生效，
         // 透明/半透明完全由自绘层 alpha（material.opacity + kind）承担。
@@ -3109,38 +3166,17 @@ impl CandidateWindowV2 {
                 );
             }
             let sp_ok = if !dragging {
-                // 【尺寸动效 2026-09-11】可见更新时宽高插值逼近目标：
-                // 内容按目标布局即刻渲染（缓冲只增不减），窗口 rect 每
-                // tick 靠近——增长=余量渐进揭示，收窄=渐进出口。小
-                // delta（<10px）直接就位不抖。首显（刚从隐藏来）与
-                // 拖拽直接跳目标。连打重定目标=从当前插值位置追赶。
-                let target = (w_out as i32, h_out as i32);
-                let cur = match self.size_anim {
+                // 【尺寸动效】决策已在渲染前完成（size_anim 已定）——
+                // 此处只应用：动效中=当前插值尺寸，否则=目标尺寸。
+                // 命中盒按目标内容（揭示中余量仍穿透）。
+                let apply = match self.size_anim {
                     Some((f, t, t0)) => {
                         size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms)
                     }
-                    None => self.live_size.get(),
-                };
-                if was_visible
-                    && self.size_ms > 0
-                    && ((target.0 - cur.0).abs() > 10 || (target.1 - cur.1).abs() > 8)
-                {
-                    self.size_anim = Some((cur, target, std::time::Instant::now()));
-                    unsafe {
-                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                    }
-                } else {
-                    self.size_anim = None;
-                }
-                let apply = if self.size_anim.is_some() {
-                    cur
-                } else {
-                    target
+                    None => (w_out as i32, h_out as i32),
                 };
                 self.live_size.set(apply);
-                // 命中测试按目标内容盒（揭示中余量仍穿透：HTTRANSPARENT
-                // 只认 content_size）
-                self.content_size.set(target);
+                self.content_size.set((w_out as i32, h_out as i32));
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
@@ -3273,10 +3309,13 @@ impl CandidateWindowV2 {
             Some((fading_in, t0)) => {
                 let ms = self.fade_ms.max(1) as f64;
                 let p = (t0.elapsed().as_secs_f64() * 1000.0 / ms).clamp(0.0, 1.0);
+                // 【下限淡入淡出 2026-09-11】alpha 永不低于 FADE_FLOOR
+                // ——面板不会接近全透（透出底层文字=「重叠感」），只在
+                // 稳态与下限之间柔和过渡。ease 保留二次曲线。
                 if fading_in {
-                    (1.0 - (1.0 - p) * (1.0 - p)) as f32
+                    (FADE_FLOOR + (1.0 - FADE_FLOOR) * (1.0 - (1.0 - p) * (1.0 - p))) as f32
                 } else {
-                    ((1.0 - p) * (1.0 - p)) as f32
+                    (FADE_FLOOR + (1.0 - FADE_FLOOR) * ((1.0 - p) * (1.0 - p))) as f32
                 }
             }
         }
@@ -3360,6 +3399,10 @@ pub const FADE_TICK_MS: u32 = 15;
 /// 静默期：show↔hide 间隔小于此值直接跳过动画（连打逐字上屏的
 /// 收放循环不频闪）
 const FADE_QUIET_MS: u128 = 250;
+/// 【淡入淡出下限 2026-09-11】动画期间整帧 alpha 的最低值——低于此
+/// 值面板接近全透、底层文字透出（用户「重叠感」）。0.6×皮肤自身
+/// master_alpha≈0.68 → 最低有效不透明 ≈0.41：柔和淡入且不重叠。
+const FADE_FLOOR: f64 = 0.6;
 
 /// 【动效】渐隐渐显 + 尺寸动效 tick：take cand2+last_show → 推进 fade
 /// 状态 →（fade 活跃时）按当前 alpha 复渲染 → 尺寸插值步进（只 SWP
@@ -3389,8 +3432,9 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 shadowwin_set_alpha(1.0);
             }
         }
-        // 尺寸动效步进：SWP 到插值尺寸（内容/位置不动——show 已按目标
-        // 布局渲染、锚点已定）；完成帧精确就位并清理
+        // 尺寸动效步进：SWP 到插值尺寸（内容/位置不动——增长路径内容
+        // 已按目标渲染；收缩路径刻意保留旧像素=边缘可见收拢）；完成帧
+        // 精确就位并按 last_show 补渲染（收缩延迟的新布局此刻才上屏）
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
             let cur = size_ease(f, t, ms, c.size_ms);
@@ -3410,6 +3454,12 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 cur.1,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            if finished && c.size_defer_render && c.is_visible() {
+                c.size_defer_render = false;
+                c.internal_rerender = true;
+                let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                c.internal_rerender = false;
+            }
         }
         if c.fade.is_some() {
             anim_done = false;
