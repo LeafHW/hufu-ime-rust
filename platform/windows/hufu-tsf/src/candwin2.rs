@@ -1754,7 +1754,18 @@ impl CandidateWindowV2 {
                     Some(c) => c.clone(),
                     None => return,
                 };
-                let surface: IDXGISurface = match chain.GetBuffer(0) {
+                // 【后台缓冲索引修复 2026-09-11】FLIP_DISCARD+BufferCount=2
+                // 下 Present 后索引在 0/1 轮转——此前恒画 GetBuffer(0)=
+                // 隔帧画进正在显示的前台缓冲：内容不变时同像素看不出来，
+                // 一变（候选框尺寸/内容更新）就闪（用户实测「体积有变
+                // 化文字就闪」的真根因，与动画无关、一直潜在）。必须画
+                // GetCurrentBackBufferIndex() 返回的当前后台缓冲。
+                //（windows 0.58 该方法 impl 在 IDXGISwapChain3 上——cast 取用）
+                let bb_index = match chain.cast::<IDXGISwapChain3>() {
+                    Ok(c3) => c3.GetCurrentBackBufferIndex(),
+                    Err(_) => 0,
+                };
+                let surface: IDXGISurface = match chain.GetBuffer(bb_index) {
                     Ok(s) => s,
                     Err(_) => return,
                 };
