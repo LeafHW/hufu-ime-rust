@@ -909,7 +909,7 @@ impl CandidateWindowV2 {
                 glass_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                fade_ms: 0,
+                fade_ms: 150,
                 fade: None,
                 internal_rerender: false,
                 last_hide_at: None,
@@ -1058,10 +1058,11 @@ impl CandidateWindowV2 {
             shadowwin_set_alpha(1.0);
         }
         let now = std::time::Instant::now();
-        // 【动效口径 2026-09-11 终版②】fade 默认关——任何透明度渐变都会
-        // 改变面板观感（用户「加深颜色/重叠感」），出/入场动感由尺寸
-        // 拉伸承担；皮肤键 layout.fade_ms 显式开启时才做（带 0.6 下限）。
-        self.fade_ms = layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) as u32;
+        // 【动效口径 2026-09-11 终版③】首键淡入/收尾淡出默认 150ms 开
+        //（用户点名「首出候选直接出来」要有淡入）——静默门控 250ms 保
+        // 证只对刻意出/入场生效（连打循环不闪）；下限 0.6 防透底重叠；
+        // 打字中途的尺寸变化不带透明度（无变色感）。
+        self.fade_ms = layout_f(skin, "fade_ms", 150.0).clamp(0.0, 600.0) as u32;
         self.size_ms = layout_f(skin, "size_ms", 200.0).clamp(0.0, 600.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
