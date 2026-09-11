@@ -266,6 +266,30 @@ impl Shared {
     }
 }
 
+/// 焦点上下文的视图窗（ITfContextView::GetWnd）：宿主进程自己的窗。
+/// 【右键菜单 owner / 打包宿主候选窗 owner 2026-09-11】weasel 生产
+/// 路线：菜单与候选窗挂在该窗下（同进程合法 owner；沉浸宿主里
+/// owned 窗不进 DWM cloak 名单——「UWP 候选窗隐身」的正解）。
+pub fn focus_view_hwnd() -> Option<isize> {
+    let Some(g) = G_SHARED.get() else {
+        return None;
+    };
+    let shared = g.0.clone();
+    let ctx = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.focus_context()
+    }?;
+    unsafe {
+        let view: ITfContextView = ctx.GetActiveView().ok()?;
+        let hwnd = view.GetWnd().ok()?;
+        if hwnd.0.is_null() {
+            None
+        } else {
+            Some(hwnd.0 as isize)
+        }
+    }
+}
+
 /// ── 文本服务（同时实现按键接收器：msctf 要求 fforeground sink 支持
 ///    ITfTextInputProcessor，因此 TIP 对象自身实现 ITfKeyEventSink）──
 #[implement(
@@ -448,6 +472,12 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         // TOPMOST 窗会在新前台里残留成「第二个候选框」。server 会话
         // 不动——切回原宿主时组段还在，可继续。poll_tick 另有前台
         // 判据兜底（防个别宿主不走此回调）。
+        // 【2026-09-11 poll 预武装】焦点事件到达即武装停顿期轮询：
+        // 打包宿主（开始菜单/UWP）里若无真实键流，update_ui 从未执行
+        // → poll 永不武装 → 外部管道键/设置页改状态后候选窗永不刷新。
+        // poll_arm 幂等（POLL_HWND 判重），110ms 空转查询由前台判据
+        // 兜底，无键宿主零负担。
+        poll_arm(&self.shared);
         if !fforeground.as_bool() {
             let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = g.cand2.as_mut() {
@@ -2062,37 +2092,180 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
-    } else if host_is_packaged() {
-        // 【打包宿主（SearchHost/UWP/Store）】进程内候选窗死路实锤：
-        // DComp 直通窗（candwin2）与普通分层窗（candwin3，v1 考古
-        // 路线，ulw=1 上屏成功）均被 DWM 以 DWM_CLOAKED_SHELL 持续
-        // 隐身——cloak 与窗口技术无关，是宿主级的。唯一出路=server
-        // 进程代画。位置定版（用户拍板）：开始菜单=桌面左上角 (12,12)
-        // 固定；其他打包宿主（Store/UWP）=跟光标（实测锚点精确，
-        // 从第一帧就跟）。
+    } else if host_is_packaged() && !g.cand2_dead {
+        // 【打包宿主 2026-09-11 二次实测定稿】owned 窗（weasel 路线）在
+        // 本引擎不可行：candwin2 渲染管线全绑 DComp（NOREDIRECTIONBITMAP
+        // + D3D11），打包宿主（Win11 记事本实测）D3D 初始化**卡死 TSF
+        // 线程**（trace 停在进分支后、无 init diag、poll 停摆）——不是
+        // cloak 问题，是沙盒 GPU 管线问题；weasel 不卡因其用普通分层
+        // 窗 GDI/D2D，无 DComp 依赖。改回 server 代画，但位置从
+        // (12,12) 硬编码升级为光标兜底链：SearchHost 搜索框有系统
+        // 插入符（gui_caret_fallback 可用）→ 开始菜单候选跟光标。
+        g.cand2_dead = true;
+        let caret_pos = g
+            .caret
+            .map(|r| (r.left, r.bottom + 4))
+            .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
         let (x, y) = if host_is_searchhost() {
-            (12, 12)
+            caret_pos.unwrap_or((12, 12))
         } else {
-            g.caret
-                .map(|r| (r.left, r.bottom + 4))
-                .unwrap_or((100, 100))
+            caret_pos.unwrap_or((100, 100))
         };
         let raw_c = raw.clone();
         drop(g);
-        diag_note("打包宿主 → server 代画（开始菜单=左上角，其他=跟光标）");
         ui_element_show(&shared, &cands, &raw_c, sel, x, y);
         shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .suppress_pending = false;
+        return Ok(());
+    } else if host_is_packaged() && false {
+        // （考古保留：owned 分支原文，DComp 卡死后停用）
+        if g.cand2.is_none() && g.cand2_busy {
+            for _ in 0..25 {
+                drop(g);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                if g.cand2.is_some() || !g.cand2_busy {
+                    break;
+                }
+            }
+        }
+        if g.cand2.is_none() {
+            let owner = focus_view_hwnd();
+            match CandidateWindowV2::new_owned(
+                owner.map(|h| windows::Win32::Foundation::HWND(h as *mut _)),
+            ) {
+                Some(v2) => g.cand2 = Some(v2),
+                None => g.cand2_dead = true,
+            }
+            diag_note(&format!(
+                "cand2(owned) init ok={} owner={:#x} dead={}",
+                g.cand2.is_some(),
+                owner.unwrap_or(0),
+                g.cand2_dead
+            ));
+        }
+        if g.cand2_dead {
+            // owned 窗建不出（DComp 管线失败等）→ server 代画兜底
+            let (x, y) = if host_is_searchhost() {
+                (12, 12)
+            } else {
+                g.caret
+                    .map(|r| (r.left, r.bottom + 4))
+                    .unwrap_or((100, 100))
+            };
+            let raw_c = raw.clone();
+            drop(g);
+            diag_note("打包宿主 owned 建窗失败 → server 代画");
+            ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_pending = false;
+            return Ok(());
+        }
+        // ↓ 与常规宿主同一条显示路径（共用锚点链/抑制逻辑/show）
+        let skin = g.skin.clone();
+        let preview_anchor = state.get("preview_anchor").cloned();
+        let caret = preview_anchor
+            .as_ref()
+            .and_then(|a| {
+                let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                Some(RECT {
+                    left: x,
+                    top: y,
+                    right: x,
+                    bottom: y,
+                })
+            })
+            .or(g.caret)
+            .or_else(gui_caret_fallback)
+            // 【owned 锚点 2026-09-11】打包宿主 GetTextExt 常态失败、
+            // XAML 自绘光标无系统插入符 → 退 owner 窗矩形：候选窗贴
+            // 宿主输入窗下缘（开始菜单=搜索框正下方）。
+            .or_else(|| {
+                g.cand2.as_ref().and_then(|c| {
+                    let o = c.owner_hwnd();
+                    if o == 0 {
+                        return None;
+                    }
+                    let mut r = RECT::default();
+                    unsafe { GetWindowRect(windows::Win32::Foundation::HWND(o as *mut _), &mut r) };
+                    if r.right > r.left && r.bottom > r.top {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                })
+            });
+        let is_preview = preview_anchor.is_some();
+        let sh = host_is_searchhost();
+        let cloaked_dead = g
+            .cand2
+            .as_ref()
+            .map(|c| c.cloaked_streak >= if sh { 1 } else { 3 })
+            .unwrap_or(false);
+        if cloaked_dead {
+            if let Some(mut c) = g.cand2.take() {
+                c.hide();
+            }
+            g.cand2_dead = true;
+            let (x, y) = if sh {
+                // 【用户定稿】开始菜单：候选固定屏幕左上角（cloak 兜底）
+                (12, 12)
+            } else {
+                caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
+            };
+            let raw_c = raw.clone();
+            drop(g);
+            diag_note("cw2 owned 仍被 cloaked → server 代画兜底");
+            ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_pending = false;
+            return Ok(());
+        }
+        // SearchHost 豁免 caret 抑制（同常规分支语义）；显示。抑制判据
+        // 用「算完兜底链的 caret」——owned 锚点在身就不抑制（防
+        // caret=None 死循环，反查首帧同款教训）。
+        let pinned_now = crate::candwin2::CAND_PINNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        let _ = pinned_now;
+        let suppress_caret = caret.is_none() && !is_preview && !sh;
+        if suppress_caret {
+            if let Some(c) = g.cand2.as_mut() {
+                c.hide();
+            }
+            g.suppress_pending = true;
+            g.caret_force = true;
+            arm_first_frame_timer();
+            return Ok(());
+        }
+        let content_empty = cands.is_empty() && raw.is_empty();
+        if !content_empty {
+            if let Some(c) = g.cand2.as_mut() {
+                c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            }
+            g.last_show = Some((cands.clone(), raw.clone(), sel));
+        }
+        g.cand_shown_this_segment = true;
+        g.suppress_pending = false;
     } else if g.cand_ui_active {
-        // server 代画续帧（开始菜单=左上角固定；其他打包宿主每帧跟光标）
+        // server 代画续帧：位置与首帧同链（SearchHost 也跟系统插入符，
+        // 兜不到才退 (12,12)——2026-09-11 从固定左上角升级）。
+        let caret_pos = g
+            .caret
+            .map(|r| (r.left, r.bottom + 4))
+            .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
         let (x, y) = if host_is_searchhost() {
-            (12, 12)
+            caret_pos.unwrap_or((12, 12))
         } else {
-            g.caret
-                .map(|r| (r.left, r.bottom + 4))
-                .unwrap_or((100, 100))
+            caret_pos.unwrap_or((100, 100))
         };
         let raw_c = raw.clone();
         drop(g);
@@ -2657,7 +2830,21 @@ fn state_sig(state: &serde_json::Value) -> String {
         })
         .unwrap_or_default();
     let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0);
-    format!("{}|{}", texts.join("\u{1}"), sel)
+    // 【2026-09-11 签名扩展】中英态/辅助提示纳入签名：外部改模式
+    //（设置页、管道 toggle）无按键时，原签名（候选+选中）不变 →
+    // poll 去重跳过 update_ui → 语言栏指示牌永不刷新（实测定格）。
+    let zh = state
+        .pointer("/chinese")
+        .or_else(|| state.pointer("/state/chinese"))
+        .and_then(|v| v.as_bool());
+    let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("");
+    format!(
+        "{}|{}|{}|{}",
+        texts.join("\u{1}"),
+        sel,
+        zh.map(|b| b as u8).unwrap_or(2),
+        aux
+    )
 }
 
 extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -2814,6 +3001,9 @@ fn poll_tick() {
     if n < 3 {
         diag_note(&format!("poll: tick #{} 开始", n + 1));
     }
+    // 【语言栏缓存 2026-09-11】方案清单/音效快照在 poll 线程刷新
+    //（5s 节流）——右键菜单 msctf 回调里零管道。
+    crate::langbar::refresh_schemas_cache();
     let shared = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
     let Some(shared) = shared else { return };
     // 【残留兜底】前台窗口属于别的进程（宿主失焦：切到别的应用打字、

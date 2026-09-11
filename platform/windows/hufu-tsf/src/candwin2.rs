@@ -790,8 +790,21 @@ unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>>
 }
 
 impl CandidateWindowV2 {
-    /// 初始化设备管线；任何一步失败返回 None（调用方回退 v1）。
+    /// 兼容入口：无主顶层窗（常规宿主原行为）。
     pub fn new() -> Option<CandidateWindowV2> {
+        CandidateWindowV2::new_owned(None)
+    }
+
+    /// 当前 owner 句柄（0=无主；owned 模式重建判定用）。
+    pub fn owner_hwnd(&self) -> isize {
+        unsafe { GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) as isize }
+    }
+
+    /// 初始化设备管线；任何一步失败返回 None（调用方回退 v1）。
+    /// 【owned 模式 2026-09-11】owner=Some(宿主视图窗) 时建为 owned 窗
+    ///（weasel 实证：沉浸宿主（开始菜单/UWP/Store）里 DWM 只 cloak
+    /// 无主顶层窗，owned 窗正常显示——自绘候选窗在打包宿主的正解）。
+    pub fn new_owned(owner: Option<HWND>) -> Option<CandidateWindowV2> {
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -814,6 +827,7 @@ impl CandidateWindowV2 {
                     | WS_EX_NOACTIVATE.0
                     | WS_EX_NOREDIRECTIONBITMAP.0,
             );
+            let owner_hwnd = owner.unwrap_or(HWND(std::ptr::null_mut()));
             let hwnd = CreateWindowExW(
                 ex,
                 PCWSTR(class.as_ptr()),
@@ -823,7 +837,7 @@ impl CandidateWindowV2 {
                 0,
                 10,
                 10,
-                HWND(std::ptr::null_mut()),
+                owner_hwnd,
                 HMENU(std::ptr::null_mut()),
                 HINSTANCE(std::ptr::null_mut()),
                 None,
