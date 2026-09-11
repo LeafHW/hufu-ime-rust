@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::core::{implement, Interface, Result, GUID, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
     ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
     ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
@@ -41,11 +42,22 @@ const CLSID_HUFU: GUID = GUID::from_values(
 
 const TF_LBI_STYLE_SHOWNINTRAY: u32 = 0x2; // 在任务栏角落（输入指示区）显示
 const TF_LBI_STYLE_BTN_BUTTON: u32 = 0x10000;
+/// 带菜单（右键走 TSF 菜单协议或 OnClick(RIGHT)；weasel 同款四样式）
+const TF_LBI_STYLE_BTN_MENU: u32 = 0x8;
 
 // ── 进程全局模式态（tsf.rs 每帧同步；点击切换也走这里）──
 static CHINESE: AtomicBool = AtomicBool::new(true);
-/// msctf 挂的更新 sink：进程全局（多线程各挂各的项，共用一份名单）
-static SINKS: Mutex<Vec<(u32, SendSink)>> = Mutex::new(Vec::new());
+/// 本线程的更新 sink（weasel 同款：项单 sink、AdviseSink 换人、
+/// 通知严格回到挂它的线程）。【2026-09-11 弃全局名单】全局 Vec 让
+/// 线程 A 的 defer 窗去调线程 B 挂的 sink = 跨套间裸调（msctf 代理
+/// 失败静默）——「图标冻结在旧状态」的根因：OnUpdate 打出去了但
+/// 没人重读。改为 thread_local 单槽，defer 窗也是每线程一个，
+/// 通知链全程同套间。
+thread_local! {
+    static SINK: std::cell::RefCell<Option<SendSink>> =
+        const { std::cell::RefCell::new(None) };
+    static SINK_PTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(0x4846_0001);
 
 /// 读取当前中英态（msctf 拉 GetText/GetIcon 时用）
@@ -77,8 +89,8 @@ pub fn set_mode(zh: bool) -> bool {
     // 取方即刻拿到），msctf 副作用 PostMessage 到本线程常驻窗，按键
     // 处理完毕、线程回到消息循环后才执行。
     PENDING_ZH.store(zh, Ordering::Relaxed);
-    let hwnd = DEFER_HWND.load(Ordering::Relaxed);
-    log_diag(&format!("set_mode {old}->{zh}（排队）"));
+    let hwnd = DEFER_HWND_T.with(|c| c.get());
+    log_diag(&format!("set_mode {old}->{zh}（排队 hwnd={hwnd:#x})"));
     if hwnd != 0 {
         unsafe {
             PostMessageW(hwnd, WM_APP_DEFER, 0, 0);
@@ -86,13 +98,16 @@ pub fn set_mode(zh: bool) -> bool {
     } else {
         // 窗还没建（理论不会）：直接执行兜底
         push_thread_compartment();
-        notify_sinks();
+        notify_sink_this_thread();
     }
     true
 }
 
-// ── 延迟执行窗（本线程 message-only；PostMessage 后消息泵空闲时执行）──
-static DEFER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+// ── 延迟执行窗（每线程一个 message-only；PostMessage 后本线程消息
+// 泵空闲时执行——sink 通知与 compartment 推送都严格留在本线程套间）──
+thread_local! {
+    static DEFER_HWND_T: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
 static PENDING_ZH: AtomicBool = AtomicBool::new(true);
 const WM_APP_DEFER: u32 = 0x8002;
 
@@ -106,16 +121,16 @@ unsafe extern "system" fn defer_wnd_proc(
         let zh = PENDING_ZH.load(Ordering::Relaxed);
         log_diag(&format!("defer 推 zh={zh}"));
         push_thread_compartment();
-        notify_sinks();
+        notify_sink_this_thread();
         return windows::Win32::Foundation::LRESULT(0);
     }
     unsafe { DefWindowProcW(h, m, _w, _l) }
 }
 
-/// 建（一次）延迟执行窗。必须在 UI 线程调（install 时）。
+/// 建（每线程一次）延迟执行窗。在 UI 线程调（install 时）。
 unsafe fn ensure_defer_window() {
     unsafe {
-        if DEFER_HWND.load(Ordering::Relaxed) != 0 {
+        if DEFER_HWND_T.with(|c| c.get()) != 0 {
             return;
         }
         let cls: Vec<u16> = "HUFU_LB_DEFER\0".encode_utf16().collect();
@@ -141,7 +156,7 @@ unsafe fn ensure_defer_window() {
             None,
             None,
         ) {
-            DEFER_HWND.store(w.0 as isize, Ordering::Relaxed);
+            DEFER_HWND_T.with(|c| c.set(w.0 as isize));
         }
     }
 }
@@ -238,7 +253,16 @@ fn push_thread_compartment() {
         }
         if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
             let v = VARIANT::from(conv);
-            let _ = comp.SetValue(tid, &v);
+            let hr = comp.SetValue(tid, &v);
+            let mut back = String::new();
+            if let Ok(rv) = comp.GetValue() {
+                if let Some(i) = var_i32(&rv) {
+                    back = format!(" 读回={i}");
+                }
+            }
+            if let Err(e) = &hr {
+                log_diag(&format!("comp CONV 写失败 0x{:08X}", e.code().0 as u32));
+            }
         }
     }
 }
@@ -337,60 +361,60 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
     }
 }
 
-fn notify_sinks() {
-    // TF_LBI_ICON|TF_LBI_TEXT|TF_LBI_TOOLTIP
-    const UPD: u32 = 0x1 | 0x2 | 0x4;
-    if let Ok(v) = SINKS.lock() {
-        for (_, sink) in v.iter() {
-            unsafe {
-                let _ = sink.0.OnUpdate(UPD);
+/// 通知本线程挂的 sink（严格同线程调用：defer_wnd_proc / set_mode
+/// 兜底路径）。跨套间调用是「图标冻结」根因，绝不越线程。
+fn notify_sink_this_thread() {
+    // TF_LBI_ICON|TF_LBI_TEXT|TF_LBI_TOOLTIP|TF_LBI_STATUS
+    const UPD: u32 = 0x1 | 0x2 | 0x4 | 0x10;
+    SINK.with(|s| {
+        let mut had_err = false;
+        if let Some(sink) = s.borrow().as_ref() {
+            let hr = unsafe { sink.0.OnUpdate(UPD) };
+            let code = match &hr {
+                Ok(_) => 0u32,
+                Err(e) => e.code().0 as u32,
+            };
+            if hr.is_err() {
+                had_err = true;
+            }
+            if code != 0 {
+                log_diag(&format!("notify sink hr=0x{code:08X}（失败弃槽）"));
             }
         }
-    }
+        if had_err {
+            // 失败一次即弃（死代理越调越坏）
+            *s.borrow_mut() = None;
+        }
+    });
 }
 
 #[implement(ITfLangBarItem, ITfLangBarItemButton, ITfSource)]
-pub struct HuFuLangBar {
-    icon_zh: isize, // HICON（纯字符「中」，无底牌）
-    icon_en: isize, // 「英」
-}
+pub struct HuFuLangBar {}
 
 impl HuFuLangBar {
     pub fn new() -> HuFuLangBar {
-        // 【品牌按钮】牌图标固定「虎」，不随模式变——系统牌只在
-        // 输入法/焦点切换时重读图标（平台缓存），若显示中/英状态则
-        // 会冻结在旧状态：用户看着错的字、系统点牌时还按错的字
-        // 执行。品牌字永不撒谎；模式看打字即知。
-        HuFuLangBar {
-            icon_zh: make_glyph_icon("虎"),
-            icon_en: make_glyph_icon("虎"),
-        }
+        // 【2026-09-11 中/英动态化】旧「虎」占位的依据（平台缓存导致
+        // 冻结）已定位为真因：sink 名单是进程全局的，通知从别的线程
+        // defer 窗打过去 = 跨套间裸调静默失败。修法（weasel 同款）：
+        // 项单 sink + 每线程 defer 窗 + 同线程通知 + BTN_MENU 样式。
+        // 图标随之恢复动态：中/英各一枚（make_glyph_icon 白字黑晕）。
+        HuFuLangBar {}
     }
 }
 
 impl Drop for HuFuLangBar {
     fn drop(&mut self) {
         // 【HICON 泄漏修复 2026-09-11】new() 每次 Activate 建两个
-        // HICON，RemoveItem 后 COM 引用清零触发 Drop——旧实现不
-        // 销毁，ctfmon 重启/宿主反复激活循环下逐轮泄漏。
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn DestroyIcon(h: isize) -> i32;
-        }
-        unsafe {
-            if self.icon_zh != 0 {
-                let _ = DestroyIcon(self.icon_zh);
-            }
-            if self.icon_en != 0 {
-                let _ = DestroyIcon(self.icon_en);
-            }
-        }
+        // HICON，RemoveItem 后 COM 引用清零触发 Drop。图标已改为
+        // GetIcon 现画（句柄交给系统托管，本侧无存货可销毁），Drop
+        // 不再持有句柄——只保留注释防止回头加字段忘记销毁。
     }
 }
 
 /// ITfSource：msctf（语言栏宿主）会对项 AdviseSink(ITfLangBarItemSink)。
-/// 不实现该接口时 AddItem 在真实宿主里可能 E_FAIL。名单进程全局共享
-///（多线程的项一起收广播，cookie 全局唯一防误删）。
+/// 不实现该接口时 AddItem 在真实宿主里可能 E_FAIL。【weasel 同款】
+/// 单槽 sink 存 thread_local：Advise 发生在本线程（msctf 代理到本
+/// STA），通知也严格从本线程发。
 impl ITfSource_Impl for HuFuLangBar_Impl {
     fn AdviseSink(&self, riid: *const GUID, punk: Option<&windows::core::IUnknown>) -> Result<u32> {
         if unsafe { riid.as_ref() } != Some(&ITfLangBarItemSink::IID) {
@@ -400,21 +424,18 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
             .and_then(|u| u.cast().ok())
             .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
         let cookie = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut v) = SINKS.lock() {
-            v.push((cookie, SendSink(sink)));
-        }
+        let ptr = punk.map(|u| u as *const _ as usize).unwrap_or(0);
+        SINK.with(|s| *s.borrow_mut() = Some(SendSink(sink)));
+        SINK_PTR.with(|c| c.set(ptr));
         Ok(cookie)
     }
 
-    fn UnadviseSink(&self, dwcookie: u32) -> Result<()> {
-        if let Ok(mut v) = SINKS.lock() {
-            let before = v.len();
-            v.retain(|(c, _)| *c != dwcookie);
-            if v.len() != before {
-                return Ok(());
-            }
-        }
-        Err(windows::core::Error::from(E_INVALIDARG))
+    fn UnadviseSink(&self, _dwcookie: u32) -> Result<()> {
+        // 单槽模型：本线程槽即本项的 sink（一项一线程一槽，换项时
+        // 新项的 AdviseSink 会重写槽），清槽即可。
+        SINK.with(|s| *s.borrow_mut() = None);
+        SINK_PTR.with(|c| c.set(0));
+        Ok(())
     }
 }
 
@@ -464,7 +485,11 @@ impl ITfLangBarItem_Impl for HuFuLangBar_Impl {
         unsafe {
             (*pclbid).clsidService = CLSID_HUFU;
             (*pclbid).guidItem = LANGBAR_ITEM_GUID;
-            (*pclbid).dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
+            // 【BTN_MENU 2026-09-11】weasel 同款四样式：告知宿主本项带
+            // 菜单——右键走 TSF 菜单协议（InitMenu/OnMenuSelect）或
+            // OnClick(RIGHT) 二选一由宿主定，两条路都已实现。
+            (*pclbid).dwStyle =
+                TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU | TF_LBI_STYLE_SHOWNINTRAY;
             (*pclbid).ulSort = 1;
             (*pclbid).szDescription = text;
         }
@@ -513,32 +538,77 @@ const TPM_RIGHTBUTTON: u32 = 0x2;
 const TPM_RIGHTALIGN: u32 = 0x8;
 const TPM_BOTTOMALIGN: u32 = 0x20;
 
+// ── 方案清单缓存（msctf 回调里零管道：poll 线程负责刷新）──
+static SCHEMAS_CACHE: Mutex<Option<(std::time::Instant, Vec<String>, String)>> = Mutex::new(None);
+
+/// poll 线程/空闲路径刷新缓存（方案清单 5s 节流；音效开关快照同刷）。
+pub fn refresh_schemas_cache() {
+    {
+        let fresh = {
+            let Ok(g) = SCHEMAS_CACHE.lock() else { return };
+            g.as_ref()
+                .is_some_and(|g| g.0.elapsed() < std::time::Duration::from_secs(5))
+        };
+        if fresh {
+            return;
+        }
+    }
+    if let Some(r) = crate::ipc::call(&serde_json::json!({"op": "schemas"})) {
+        let list: Vec<String> = r
+            .get("schemas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cur = r
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Ok(mut g) = SCHEMAS_CACHE.lock() {
+            *g = Some((std::time::Instant::now(), list, cur));
+        }
+    } else {
+        // 拉失败也计时刻，防 msctf 之外无脑重试
+        if let Ok(mut g) = SCHEMAS_CACHE.lock() {
+            let old = g.take();
+            *g = old.map(|(_, l, cur)| (std::time::Instant::now(), l, cur));
+        }
+    }
+    let snd = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
+        .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()));
+    if let Some(on) = snd {
+        SND_ON.store(on, Ordering::Relaxed);
+    }
+}
+
+/// 异步执行管道 op（msctf 回调里绝不同步等管道——右键菜单
+/// 「时有时无」的嫌疑之一就是回调内同步管道把 explorer 等超时）。
+fn pipe_async(op: serde_json::Value) {
+    std::thread::spawn(move || {
+        let _ = crate::ipc::call(&op);
+    });
+}
+
 /// 右键小菜单：码表清单（当前 ✓）+ 分隔线 + 设置…
-/// 【owner 教训】TrackPopupMenu 的 owner 窗口必须属于调用线程——借
-/// GetForegroundWindow（他进程的窗口）会被静默拒绝（菜单不弹）。
-/// 这里现建一个 message-only 窗口（HWND_MESSAGE 父）作 owner，
-/// SetForegroundWindow 保焦点使外部点击可撤销，用完即毁。
+/// 【owner=上下文窗 2026-09-11·weasel 实证路线】TrackPopupMenu 的
+/// owner 用**焦点上下文的视图窗**（ITfContextView::GetWnd——DLL 就
+/// 跑在宿主进程里，同进程合法 owner；weasel 生产验证多年）。取不
+/// 到时退 GetFocus（本线程前台窗），再取不到才自建窗。
+/// 【零阻塞】菜单数据全走缓存（SCHEMAS_CACHE，poll 线程刷新），
+/// 菜单动作异步管道——msctf 回调里不再有任何同步管道等价物。
 unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
     unsafe {
-        // 取码表清单（server 不可达时只给设置项）
-        let (schemas, current): (Vec<String>, String) =
-            match crate::ipc::call(&serde_json::json!({"op": "schemas"})) {
-                Some(r) => (
-                    r.get("schemas")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    r.get("current")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ),
-                None => (Vec::new(), String::new()),
-            };
+        // 取方案清单（缓存；msctf 回调里零管道）
+        let (schemas, current): (Vec<String>, String) = {
+            let g = SCHEMAS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_ref()
+                .map(|(_, l, c)| (l.clone(), c.clone()))
+                .unwrap_or_default()
+        };
         let m = CreatePopupMenu();
         if m == 0 {
             return;
@@ -561,10 +631,9 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         //（server 侧导出后自动打开该文件夹）
         let wexp: Vec<u16> = "导出码表".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 5, wexp.as_ptr());
-        // 按键音效开关（勾选态=当前 enabled；音量滑条在设置窗「输入与候选」页）
-        let snd_on = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
-            .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
+        // 按键音效开关（勾选态走缓存快照；真实值由 server 侧维护，
+        // 这里显示抖动无害——音效开关非高频变更项）
+        let snd_on = SND_ON.load(Ordering::Relaxed);
         let wsnd: Vec<u16> = "按键音效".encode_utf16().chain([0]).collect();
         AppendMenuW(
             m,
@@ -574,41 +643,63 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         );
         let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
-        // 自建真弹出窗作 owner（调用线程持有 → 合法 owner）。
-        // 【教训】message-only 窗口不能 SetForegroundWindow（不可见），
-        // 焦点保不住 → 菜单有时秒关（sel=0）。真 WS_POPUP 0×0 窗可以。
-        unsafe extern "system" fn menu_wnd_proc(
-            h: windows::Win32::Foundation::HWND,
-            m: u32,
-            w: windows::Win32::Foundation::WPARAM,
-            l: windows::Win32::Foundation::LPARAM,
-        ) -> windows::Win32::Foundation::LRESULT {
-            unsafe { DefWindowProcW(h, m, w, l) }
+        // ── owner 选择（右键菜单稳定性的核心）──
+        // 优先级：焦点上下文视图窗（weasel 生产路线）→ GetFocus（本
+        // 线程输入焦点窗）→ 自建 0×0 WS_POPUP 窗（保底）。
+        let mut owner: windows::Win32::Foundation::HWND =
+            windows::Win32::Foundation::HWND(std::ptr::null_mut());
+        let mut owner_self_made = false;
+        if let Some(vw) = crate::tsf::focus_view_hwnd() {
+            if vw != 0 {
+                owner = windows::Win32::Foundation::HWND(vw as *mut _);
+                log_diag(&format!("popup owner=上下文窗 {vw:#x}"));
+            }
         }
-        let cls: Vec<u16> = "HUFU_LB_MENU\0".encode_utf16().collect();
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(menu_wnd_proc),
-            lpszClassName: PCWSTR(cls.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&wc);
-        let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
-        let owner = CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-            PCWSTR(cls.as_ptr()),
-            PCWSTR(nm.as_ptr()),
-            windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
-            pt.x,
-            pt.y,
-            0,
-            0,
-            HWND_MESSAGE, // message-only 父：不进任务栏/切档
-            None,
-            None,
-            None,
-        )
-        .unwrap_or_default();
+        if owner.0.is_null() {
+            let f = GetFocus();
+            if !f.0.is_null() {
+                owner = f;
+                log_diag("popup owner=GetFocus");
+            }
+        }
+        if owner.0.is_null() {
+            unsafe extern "system" fn menu_wnd_proc(
+                h: windows::Win32::Foundation::HWND,
+                m: u32,
+                w: windows::Win32::Foundation::WPARAM,
+                l: windows::Win32::Foundation::LPARAM,
+            ) -> windows::Win32::Foundation::LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
+            }
+            let cls: Vec<u16> = "HUFU_LB_MENU\0".encode_utf16().collect();
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(menu_wnd_proc),
+                lpszClassName: PCWSTR(cls.as_ptr()),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+            let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
+            owner = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(
+                    windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0,
+                ),
+                PCWSTR(cls.as_ptr()),
+                PCWSTR(nm.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                pt.x,
+                pt.y,
+                0,
+                0,
+                windows::Win32::Foundation::HWND(std::ptr::null_mut()), // 真顶层（message-only 不能 SetForegroundWindow）
+                None,
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            owner_self_made = true;
+            log_diag("popup owner=自建窗");
+        }
         if owner.is_invalid() {
             log_diag("popup: 建窗失败");
             DestroyMenu(m);
@@ -631,32 +722,42 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         );
         // WM_NULL 复位（KB135788：菜单系统状态机要求，缺它二次失灵）
         PostMessageW(owner.0 as isize, 0x0000, 0, 0);
-        let _ = DestroyWindow(owner);
+        if owner_self_made {
+            let _ = DestroyWindow(owner);
+        }
         DestroyMenu(m);
         log_diag(&format!("popup sel={sel} schemas={}", schemas.len()));
+        // 菜单动作全部异步管道（msctf 回调里零阻塞）
         if sel == 1 {
-            let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+            pipe_async(serde_json::json!({"op": "settings"}));
         } else if sel == 2 {
             // 重载码表（当前方案原样重载；server 侧清会话+重建整句）
-            let _ = crate::ipc::call(&serde_json::json!({"op": "reload_schema"}));
+            pipe_async(serde_json::json!({"op": "reload_schema"}));
         } else if sel == 3 {
             // 打开当前方案码表目录（server 侧 explorer）
-            let _ = crate::ipc::call(&serde_json::json!({"op": "open_schema_dir"}));
+            pipe_async(serde_json::json!({"op": "open_schema_dir"}));
         } else if sel == 5 {
             // 导出码表（server 侧导出+打开导出文件夹）
-            let _ = crate::ipc::call(&serde_json::json!({"op": "export_schema"}));
+            pipe_async(serde_json::json!({"op": "export_schema"}));
         } else if sel == 4 {
             // 按键音效开关：server 侧取反+落盘（热生效）
-            let _ = crate::ipc::call(&serde_json::json!({"op": "sound_toggle"}));
+            SND_ON.store(!snd_on, Ordering::Relaxed);
+            pipe_async(serde_json::json!({"op": "sound_toggle"}));
         } else if sel >= 100 {
             let idx = (sel - 100) as usize;
             if let Some(name) = schemas.get(idx) {
-                let _ = crate::ipc::call(&serde_json::json!({
-                    "op": "set_schema", "name": name
-                }));
+                pipe_async(serde_json::json!({"op": "set_schema", "name": name}));
             }
         }
     }
+}
+
+/// 音效开关快照（音效状态轮询同步；右键菜单勾选显示用）
+static SND_ON: AtomicBool = AtomicBool::new(false);
+
+/// poll 线程同步音效开关快照
+pub fn refresh_sound_snapshot(on: bool) {
+    SND_ON.store(on, Ordering::Relaxed);
 }
 
 impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
@@ -718,13 +819,12 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     }
 
     fn GetIcon(&self) -> Result<HICON> {
-        Ok(HICON(
-            (if is_chinese() {
-                self.icon_zh
-            } else {
-                self.icon_en
-            }) as *mut _,
-        ))
+        // 【2026-09-11 缓存对抗】托盘对第三方 IME 牌面按 HICON 句柄缓存
+        // 像素：句柄值不变=像素不重画（OnUpdate/compartment 全无效，weasel
+        // 同困）。每次现画新句柄 → 缓存必 miss → 强制重读。泄漏量级：
+        // 每次模式切换一枚 32px 图标（~5KB），日切换百次≈0.5MB，可接受。
+        let glyph = if is_chinese() { "中" } else { "英" };
+        Ok(HICON(make_glyph_icon(glyph) as *mut _))
     }
 
     fn GetText(&self) -> Result<windows::core::BSTR> {
