@@ -1873,22 +1873,41 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             trace("qc: GetTextExt 失败，系统插入符兜底");
             return;
         }
-        // 【估算链兜底 2026-09-12 六次修正·系数校准】Chromium 系上过
-        // 屏后 GetTextExt 持续失败（跨帧自愈救不了）——以最近成功锚
-        // （上屏瞬间重校或任何成功查询）为基准推算：基准右缘+累计上
-        // 屏宽+编码宽。系数按 Typora 实测校准：半角 11px/行高 27≈0.41；
-        // 全角=字号≈行高×0.6（旧值 1.0=行高，远大于真实字宽——用户
-        // 实锤长编码移过头）。估算仍武装 60ms 重查（持续自愈机会）。
+        // 【估算链兜底 2026-09-12 八次修正·y 折算行数】x=基准右缘+
+        // 累计上屏宽+编码宽（半角 0.41×行高、全角 0.6×行高——Typora
+        // 实测校准）；y=基准行+增量宽度按行宽折算的行数下移——Typora
+        // （Chromium 系）打过一段后 GetTextExt 前后全灭，估算链是唯一
+        // 活锚，恒用基准 y 会把窗钉死第一行（用户实测飘顶）；折算粗
+        // 略（行宽=前台窗宽-160 边距余量，首行余宽按基准距窗左扣减）
+        // 但多行打字方向正确，点击后新段首查必然成功重校。
         if let Some(base) = g.caret_est_base {
             if g.caret_est_line_h > 0 {
                 let raw_px =
                     (g.cur_raw_len as f32 * g.caret_est_line_h as f32 * 0.41) as i32;
                 let off = g.caret_est_commit_px + raw_px;
+                let (ey, eb) = unsafe {
+                    let mut top = base.top;
+                    let mut bottom = base.bottom;
+                    let fg = GetForegroundWindow();
+                    if !fg.0.is_null() {
+                        let mut wr = RECT::default();
+                        if GetWindowRect(fg, &mut wr).is_ok() && wr.right > wr.left {
+                            let line_w = (wr.right - wr.left - 160).max(240);
+                            let first_avail = (line_w - (base.left - wr.left)).max(200);
+                            if off > first_avail {
+                                let lines = (off - first_avail) / line_w + 1;
+                                top += lines * g.caret_est_line_h;
+                                bottom += lines * g.caret_est_line_h;
+                            }
+                        }
+                    }
+                    (top, bottom)
+                };
                 let est = RECT {
                     left: base.left + off,
-                    top: base.top,
+                    top: ey,
                     right: base.right + off,
-                    bottom: base.bottom,
+                    bottom: eb,
                 };
                 g.caret = Some(est);
                 arm_caret_recheck_timer();
