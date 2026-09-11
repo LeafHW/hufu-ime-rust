@@ -519,6 +519,17 @@ pub struct CandidateWindowV2 {
     visual: Option<IDCompositionVisual>,
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
+    /// 【ULW 模式 2026-09-11】owned 窗（打包宿主）不走 DComp 呈现：
+    /// D2D 照画到离屏位图（WARP 软件），每帧读回 → DIB →
+    /// UpdateLayeredWindow 上屏。无 swapchain/无 NOREDIRECTIONBITMAP，
+    /// 沙盒内仅依赖 GDI，规避 DComp/硬件 D3D 卡死。
+    ulw: bool,
+    offscreen: Option<windows::Win32::Graphics::Direct2D::ID2D1Bitmap1>,
+    ulw_dc: isize,
+    ulw_hbm: isize,
+    ulw_bits: isize,
+    ulw_w: i32,
+    ulw_h: i32,
     size: (i32, i32),
     /// 粘性定位：最近一次有效锚点坐标。锚点偶发丢失（GetTextExt 在
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
@@ -791,26 +802,13 @@ unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>>
 
 impl CandidateWindowV2 {
     /// 兼容入口：无主顶层窗（常规宿主原行为）。
+    /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
+    /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
     pub fn new() -> Option<CandidateWindowV2> {
-        CandidateWindowV2::new_owned(None)
-    }
-
-    /// 当前 owner 句柄（0=无主；owned 模式重建判定用）。
-    pub fn owner_hwnd(&self) -> isize {
-        unsafe { GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) as isize }
-    }
-
-    /// 初始化设备管线；任何一步失败返回 None（调用方回退 v1）。
-    /// 【owned 模式 2026-09-11】owner=Some(宿主视图窗) 时建为 owned 窗
-    ///（weasel 实证：沉浸宿主（开始菜单/UWP/Store）里 DWM 只 cloak
-    /// 无主顶层窗，owned 窗正常显示——自绘候选窗在打包宿主的正解）。
-    pub fn new_owned(owner: Option<HWND>) -> Option<CandidateWindowV2> {
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(cand2_wndproc),
-                // 类光标：NULL 会让鼠标移入时系统 fallback 到忙碌光标
-                //（开始菜单/UWP 里实测「沙漏/转圈」）——显式箭头。
                 hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
                     .unwrap_or(HCURSOR(std::ptr::null_mut())),
                 lpszClassName: PCWSTR(class.as_ptr()),
@@ -818,16 +816,12 @@ impl CandidateWindowV2 {
                 ..Default::default()
             };
             let _atom = RegisterClassW(&wc);
-            // 注：曾因「点击候选框冻结」加过 WS_EX_TRANSPARENT 鼠标穿透
-            // ——后经反汇编定位真凶为焦点回调内同步 ShowWindow 死锁
-            // （已修），穿透撤销以支持拖拽/右键固定交互。
             let ex = WINDOW_EX_STYLE(
                 WS_EX_TOOLWINDOW.0
                     | WS_EX_TOPMOST.0
                     | WS_EX_NOACTIVATE.0
                     | WS_EX_NOREDIRECTIONBITMAP.0,
             );
-            let owner_hwnd = owner.unwrap_or(HWND(std::ptr::null_mut()));
             let hwnd = CreateWindowExW(
                 ex,
                 PCWSTR(class.as_ptr()),
@@ -837,7 +831,7 @@ impl CandidateWindowV2 {
                 0,
                 10,
                 10,
-                owner_hwnd,
+                HWND(std::ptr::null_mut()),
                 HMENU(std::ptr::null_mut()),
                 HINSTANCE(std::ptr::null_mut()),
                 None,
@@ -892,6 +886,177 @@ impl CandidateWindowV2 {
                 visual: Some(visual),
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
+                ulw: false,
+                offscreen: None,
+                ulw_dc: 0,
+                ulw_hbm: 0,
+                ulw_bits: 0,
+                ulw_w: 0,
+                ulw_h: 0,
+                readback: false,
+                sticky_pos: None,
+                sticky_drag: false,
+                last_raw_len: 0,
+                last_pixels: None,
+                last_dy: None,
+                last_size: (0, 0),
+                size: (0, 0),
+                cloaked_streak: 0,
+                tf_cache: None,
+                dy_cache: None,
+                shadow_cache: None,
+                acrylic_last: std::cell::Cell::new(u64::MAX),
+                rgn_last: std::cell::Cell::new(u64::MAX),
+                fade_ms: 0,
+                fade: None,
+                internal_rerender: false,
+                last_hide_at: None,
+                last_show_at: None,
+                size_anim: None,
+                chrome_override: std::cell::Cell::new(None),
+                hl_center: std::cell::Cell::new(None),
+                scale_in: std::cell::Cell::new(false),
+                size_ms: 90,
+                pos_anim: None,
+                pos_ms: 120,
+                anim_on: std::cell::Cell::new(true),
+                fade_ms_eff: 120,
+                live_pos: std::cell::Cell::new((0, 0)),
+                last_swp_size: std::cell::Cell::new((0, 0)),
+                live_size: std::cell::Cell::new((0, 0)),
+                content_size: std::cell::Cell::new((0, 0)),
+                comments_expanded: true,
+            })
+        }
+    }
+
+    /// 当前 owner 句柄（0=无主；owned 模式重建判定用）。
+    pub fn owner_hwnd(&self) -> isize {
+        unsafe { GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) as isize }
+    }
+
+    /// 初始化设备管线；任何一步失败返回 None（调用方回退 v1）。
+    /// 【ULW owned 模式 2026-09-11】owner=Some(宿主视图窗) 时建为
+    /// owned 分层窗 + 软件呈现（WARP D3D + D2D 离屏位图 + GDI
+    /// UpdateLayeredWindow）。此前直接 DComp 路线在打包宿主（Win11
+    /// 记事本实测）D3D11CreateDevice **卡死 TSF 线程**（沙盒 GPU
+    /// 管线）——现在：① 仅 WARP 驱动（纯 CPU 光栅，无内核 GPU 句柄
+    /// 依赖）；② 设备初始化全部搬到工作线程，2.5s 超时守护——再
+    /// 卡死也只卡孤儿线程，主线程返回 None 回退 server 代画；③ 窗口
+    /// 无 WS_EX_NOREDIRECTIONBITMAP（ULW 需要 redirection surface）。
+    pub fn new_owned(owner: Option<HWND>) -> Option<CandidateWindowV2> {
+        unsafe {
+            let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(cand2_wndproc),
+                // 类光标：NULL 会让鼠标移入时系统 fallback 到忙碌光标
+                //（开始菜单/UWP 里实测「沙漏/转圈」）——显式箭头。
+                hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
+                    .unwrap_or(HCURSOR(std::ptr::null_mut())),
+                lpszClassName: PCWSTR(class.as_ptr()),
+                hbrBackground: HBRUSH(std::ptr::null_mut()),
+                ..Default::default()
+            };
+            let _atom = RegisterClassW(&wc);
+            // ULW：WS_EX_LAYERED 必需；绝不加 NOREDIRECTIONBITMAP
+            let ex = WINDOW_EX_STYLE(
+                WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0,
+            );
+            let owner_hwnd = owner.unwrap_or(HWND(std::ptr::null_mut()));
+            let hwnd = CreateWindowExW(
+                ex,
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0),
+                0,
+                0,
+                10,
+                10,
+                owner_hwnd,
+                HMENU(std::ptr::null_mut()),
+                HINSTANCE(std::ptr::null_mut()),
+                None,
+            )
+            .unwrap_or_default();
+            if hwnd.0.is_null() {
+                return None;
+            }
+
+            // ── 设备管线：工作线程初始化（卡死守护）──
+            let (tx, rx) = std::sync::mpsc::channel::<
+                Option<(ID2D1DeviceContext, IDWriteFactory, IDXGIDevice)>,
+            >();
+            std::thread::spawn(move || {
+                // COM：本线程自初始化（宿主 STA 环境里 spawn 的线程默认无）
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+                let r = (|| {
+                    // 仅 WARP：打包沙盒里硬件驱动调用是卡死源；WARP
+                    // 纯 CPU 光栅。BGRA 供 D2D 互操作。
+                    let mut device: Option<ID3D11Device> = None;
+                    let mut context: Option<ID3D11DeviceContext> = None;
+                    let ok = D3D11CreateDevice(
+                        None,
+                        D3D_DRIVER_TYPE_WARP,
+                        HMODULE(std::ptr::null_mut()),
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                    .is_ok();
+                    if !ok || device.is_none() {
+                        return None;
+                    }
+                    let device = device?;
+                    let _ = context;
+                    let dxgi_dev: IDXGIDevice = device.cast().ok()?;
+                    let factory2d: ID2D1Factory1 =
+                        D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None).ok()?;
+                    let d2d_dev: ID2D1Device = factory2d.CreateDevice(&dxgi_dev).ok()?;
+                    let ctx: ID2D1DeviceContext = d2d_dev
+                        .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
+                        .ok()?;
+                    let dwrite: IDWriteFactory =
+                        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+                    Some((ctx, dwrite, dxgi_dev))
+                })();
+                let _ = tx.send(r);
+            });
+            let (ctx, dwrite, dxgi_dev) =
+                match rx.recv_timeout(std::time::Duration::from_millis(2500)) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        crate::tsf::diag_note("cw2 owned: WARP 管线初始化失败 → 回退");
+                        return None;
+                    }
+                    Err(_) => {
+                        // 超时：工作线程卡在驱动调用（孤儿线程泄漏一枚）
+                        crate::tsf::diag_note("cw2 owned: 设备初始化 2.5s 超时（沙盒卡死）→ 回退");
+                        return None;
+                    }
+                };
+
+            Some(CandidateWindowV2 {
+                hwnd,
+                ctx: Some(ctx),
+                swapchain: None,
+                dcomp: None,
+                target: None,
+                visual: None,
+                dwrite: Some(dwrite),
+                dxgi: Some(dxgi_dev.clone()),
+                ulw: true,
+                offscreen: None,
+                ulw_dc: 0,
+                ulw_hbm: 0,
+                ulw_bits: 0,
+                ulw_w: 0,
+                ulw_h: 0,
                 readback: false,
                 sticky_pos: None,
                 sticky_drag: false,
@@ -930,6 +1095,216 @@ impl CandidateWindowV2 {
     }
 
     fn ensure_swapchain(&mut self, w: u32, h: u32) -> bool {
+        // 【ULW 模式】无 swapchain：离屏 D2D 位图当渲染目标（grow-only
+        // 同策略）。Present 侧读回 → DIB → UpdateLayeredWindow。
+        if self.ulw {
+            if self.offscreen.is_some() && w <= self.size.0 as u32 && h <= self.size.1 as u32 {
+                return true;
+            }
+            unsafe {
+                if let Some(ctx) = &self.ctx {
+                    ctx.SetTarget(None);
+                }
+                let alloc_w = (((w.max(256)) + 63) / 64) * 64;
+                let alloc_h = (((h.max(160)) + 63) / 64) * 64;
+                let Some(ctx) = &self.ctx else { return false };
+                let bp = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                    colorContext: std::mem::ManuallyDrop::new(None),
+                };
+                match ctx.CreateBitmap(
+                    windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                        width: alloc_w,
+                        height: alloc_h,
+                    },
+                    None,
+                    0,
+                    &bp,
+                ) {
+                    Ok(b) => {
+                        self.offscreen = Some(b);
+                        self.size = (alloc_w as i32, alloc_h as i32);
+                        crate::tsf::trace(&format!(
+                            "cw2 ulw: 离屏位图 {alloc_w}×{alloc_h}（内容 {w}×{h}）"
+                        ));
+                        true
+                    }
+                    Err(_) => {
+                        crate::tsf::trace("cw2 ulw: CreateBitmap FAIL");
+                        false
+                    }
+                }
+            }
+        } else {
+            self.ensure_swapchain_dcomp(w, h)
+        }
+    }
+
+    /// 【ULW 呈现】离屏 D2D 位图读回 → DIB → UpdateLayeredWindow。
+    /// w/h = 本帧内容尺寸（像素，含阴影边距，与 SetWindowPos 一致）。
+    /// 失败静默（下帧重试）；DIB/DC 按尺寸变化重建（常驻复用）。
+    unsafe fn present_ulw(&mut self, w: i32, h: i32) {
+        use windows::Win32::Graphics::Direct2D::{
+            ID2D1Bitmap, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_PROPERTIES1,
+        };
+
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (Some(ctx), Some(off)) = (&self.ctx, &self.offscreen) else {
+            return;
+        };
+        // 1) 读回：offscreen(TARGET) → cpu(CPU_READ) → Map
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS(
+                D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0,
+            ),
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let Ok(cpu) = ctx.CreateBitmap(
+            windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                width: w as u32,
+                height: h as u32,
+            },
+            None,
+            0,
+            &props,
+        ) else {
+            return;
+        };
+        let copied = (|| {
+            let src: ID2D1Bitmap = off.cast().ok()?;
+            cpu.CopyFromBitmap(
+                None,
+                Some(&src),
+                Some(&windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U {
+                    left: 0,
+                    top: 0,
+                    right: w as u32,
+                    bottom: h as u32,
+                }),
+            )
+            .ok()
+        })();
+        if copied.is_none() {
+            return; // cpu 引用 drop 即释放
+        }
+        let Ok(mapped) = cpu.Map(windows::Win32::Graphics::Direct2D::D2D1_MAP_OPTIONS_READ) else {
+            return;
+        };
+
+        // 2) DIB（尺寸变化重建；top-down 32bpp，premultiplied 直传）
+        if self.ulw_hbm == 0 || self.ulw_w != w || self.ulw_h != h {
+            if self.ulw_hbm != 0 {
+                let _ = DeleteObject(HGDIOBJ(self.ulw_hbm as *mut _));
+                self.ulw_hbm = 0;
+            }
+            if self.ulw_dc != 0 {
+                let _ = DeleteDC(HDC(self.ulw_dc as *mut _));
+                self.ulw_dc = 0;
+            }
+            let bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0, // BI_RGB
+                    biSizeImage: (w * h * 4) as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = match CreateDIBSection(
+                HDC(std::ptr::null_mut()),
+                &bi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = cpu.Unmap();
+                    return;
+                }
+            };
+            if hbm.is_invalid() || bits.is_null() {
+                let _ = cpu.Unmap();
+                return;
+            }
+            let dc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
+            if dc.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(hbm.0));
+                let _ = cpu.Unmap();
+                return;
+            }
+            let old = SelectObject(dc, HGDIOBJ(hbm.0));
+            if old.is_invalid() {
+                let _ = DeleteDC(dc);
+                let _ = DeleteObject(HGDIOBJ(hbm.0));
+                let _ = cpu.Unmap();
+                return;
+            }
+            self.ulw_hbm = hbm.0 as isize;
+            self.ulw_dc = dc.0 as isize;
+            self.ulw_w = w;
+            self.ulw_h = h;
+            self.ulw_bits = bits as isize;
+        }
+        // 3) 像素搬运（Map pitch → DIB 连续）
+        if self.ulw_bits != 0 {
+            let dst = self.ulw_bits as *mut u8;
+            let pitch = mapped.pitch as usize;
+            let src = mapped.bits as *const u8;
+            let row = (w as usize) * 4;
+            for r in 0..(h as usize) {
+                std::ptr::copy_nonoverlapping(src.add(r * pitch), dst.add(r * row), row);
+            }
+        }
+        let _ = cpu.Unmap();
+
+        // 4) ULW 上屏（premultiplied AC_SRC_ALPHA；尺寸=窗口尺寸）
+        let blend = BLENDFUNCTION {
+            BlendOp: 0, // AC_SRC_OVER
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: 1, // AC_SRC_ALPHA（预乘；同阴影窗）
+        };
+        let pt = POINT { x: 0, y: 0 };
+        let sz = SIZE { cx: w, cy: h };
+        let ok = UpdateLayeredWindow(
+            self.hwnd,
+            None,
+            None,
+            Some(&sz as *const SIZE),
+            HDC(self.ulw_dc as *mut _),
+            Some(&pt as *const POINT),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        if ok.is_err() {
+            crate::tsf::trace("cw2 ulw: UpdateLayeredWindow FAIL");
+        }
+    }
+
+    fn ensure_swapchain_dcomp(&mut self, w: u32, h: u32) -> bool {
         // 【grow-only 2026-09-11】缓冲只增不减：内容变窄不再重建链。
         // 动机：重建（SetContent 重绑）后 DWM 会停止跟踪半透明帧的
         // 合成（像素取证：resize 后整段渐显 ramp 不上屏，直到某帧
@@ -1779,42 +2154,51 @@ impl CandidateWindowV2 {
             }
 
             unsafe {
-                let chain = match &self.swapchain {
-                    Some(c) => c.clone(),
-                    None => return,
-                };
-                // 【后台缓冲索引修复 2026-09-11】FLIP_DISCARD+BufferCount=2
-                // 下 Present 后索引在 0/1 轮转——此前恒画 GetBuffer(0)=
-                // 隔帧画进正在显示的前台缓冲：内容不变时同像素看不出来，
-                // 一变（候选框尺寸/内容更新）就闪（用户实测「体积有变
-                // 化文字就闪」的真根因，与动画无关、一直潜在）。必须画
-                // GetCurrentBackBufferIndex() 返回的当前后台缓冲。
-                //（windows 0.58 该方法 impl 在 IDXGISwapChain3 上——cast 取用）
-                let bb_index = match chain.cast::<IDXGISwapChain3>() {
-                    Ok(c3) => c3.GetCurrentBackBufferIndex(),
-                    Err(_) => 0,
-                };
-                let surface: IDXGISurface = match chain.GetBuffer(bb_index) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
                 let ctx = match &self.ctx {
                     Some(c) => c.clone(),
                     None => return,
                 };
-                let bp = D2D1_BITMAP_PROPERTIES1 {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    },
-                    dpiX: 96.0,
-                    dpiY: 96.0,
-                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    colorContext: std::mem::ManuallyDrop::new(None),
-                };
-                let bitmap = match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
-                    Ok(b) => b,
-                    Err(_) => return,
+                // 【ULW 模式】目标=离屏位图（无 swapchain/GetBuffer），
+                // 绘制代码零改动（同 ID2D1DeviceContext），Present 侧分叉。
+                let bitmap = if self.ulw {
+                    match &self.offscreen {
+                        Some(b) => b.clone(),
+                        None => return,
+                    }
+                } else {
+                    let chain = match &self.swapchain {
+                        Some(c) => c.clone(),
+                        None => return,
+                    };
+                    // 【后台缓冲索引修复 2026-09-11】FLIP_DISCARD+BufferCount=2
+                    // 下 Present 后索引在 0/1 轮转——此前恒画 GetBuffer(0)=
+                    // 隔帧画进正在显示的前台缓冲：内容不变时同像素看不出来，
+                    // 一变（候选框尺寸/内容更新）就闪（用户实测「体积有变
+                    // 化文字就闪」的真根因，与动画无关、一直潜在）。必须画
+                    // GetCurrentBackBufferIndex() 返回的当前后台缓冲。
+                    //（windows 0.58 该方法 impl 在 IDXGISwapChain3 上——cast 取用）
+                    let bb_index = match chain.cast::<IDXGISwapChain3>() {
+                        Ok(c3) => c3.GetCurrentBackBufferIndex(),
+                        Err(_) => 0,
+                    };
+                    let surface: IDXGISurface = match chain.GetBuffer(bb_index) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let bp = D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                        colorContext: std::mem::ManuallyDrop::new(None),
+                    };
+                    match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    }
                 };
                 ctx.SetTarget(&bitmap);
                 ctx.BeginDraw();
@@ -2679,9 +3063,19 @@ impl CandidateWindowV2 {
                     }
                 }
 
-                let hr = chain.Present(1, DXGI_PRESENT(0));
-                if hr.is_err() {
-                    crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
+                if self.ulw {
+                    // 【ULW 呈现】离屏位图 → CPU_READ 拷贝 → DIB →
+                    // UpdateLayeredWindow（沙盒安全：纯 GDI 上屏）。
+                    self.present_ulw(w_out as i32, h_out as i32);
+                } else {
+                    let chain = match &self.swapchain {
+                        Some(c) => c.clone(),
+                        None => return,
+                    };
+                    let hr = chain.Present(1, DXGI_PRESENT(0));
+                    if hr.is_err() {
+                        crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
+                    }
                 }
             }
         } // 'sizedraw 结束（收缩动效延迟渲染时整段跳过）

@@ -2082,6 +2082,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             return Ok(());
         }
     } else if suppress_win {
+        trace("分支: suppress（35ms 补显）");
         // 候选延时窗口内：快速输入防闪烁，先不显示。
         // 置补显标记 + 【精确一次性定时器】35ms 后主动补显（不等
         // 110ms 轮询周期——「首键候选慢半拍」的 122ms 主耗曾在此；
@@ -2093,34 +2094,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             c.hide();
         }
     } else if host_is_packaged() && !g.cand2_dead {
-        // 【打包宿主 2026-09-11 二次实测定稿】owned 窗（weasel 路线）在
-        // 本引擎不可行：candwin2 渲染管线全绑 DComp（NOREDIRECTIONBITMAP
-        // + D3D11），打包宿主（Win11 记事本实测）D3D 初始化**卡死 TSF
-        // 线程**（trace 停在进分支后、无 init diag、poll 停摆）——不是
-        // cloak 问题，是沙盒 GPU 管线问题；weasel 不卡因其用普通分层
-        // 窗 GDI/D2D，无 DComp 依赖。改回 server 代画，但位置从
-        // (12,12) 硬编码升级为光标兜底链：SearchHost 搜索框有系统
-        // 插入符（gui_caret_fallback 可用）→ 开始菜单候选跟光标。
-        g.cand2_dead = true;
-        let caret_pos = g
-            .caret
-            .map(|r| (r.left, r.bottom + 4))
-            .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
-        let (x, y) = if host_is_searchhost() {
-            caret_pos.unwrap_or((12, 12))
-        } else {
-            caret_pos.unwrap_or((100, 100))
-        };
-        let raw_c = raw.clone();
-        drop(g);
-        ui_element_show(&shared, &cands, &raw_c, sel, x, y);
-        shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .suppress_pending = false;
-        return Ok(());
-    } else if host_is_packaged() && false {
-        // （考古保留：owned 分支原文，DComp 卡死后停用）
+        trace("OWNED分支: 进入");
+        // 【打包宿主 2026-09-11 三次尝试·ULW owned 窗】DComp 直通窗在
+        // 沙盒里 D3D 初始化卡死（二次实测），本轮改用 owned 分层窗 +
+        // 软件呈现（WARP D3D + D2D 离屏 + GDI UpdateLayeredWindow——
+        // weasel 同思路），new_owned 内设备初始化已线程化（2.5s 超时
+        // 守护，卡死只卡孤儿线程）。失败/超时/被 cloak → 下方 caret-
+        // follow server 代画兜底（位置也跟光标）。
         if g.cand2.is_none() && g.cand2_busy {
             for _ in 0..25 {
                 drop(g);
@@ -2132,32 +2112,49 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             }
         }
         if g.cand2.is_none() {
+            // 【死锁修复 2026-09-11】focus_view_hwnd() 内部要拿同一把
+            // Shared 锁——持锁调用=同线程 Mutex 重入=TSF 线程卡死
+            //（前两轮「OWNED 进入后无下文」的真凶，与 D3D/沙盒无关）。
+            // 先放锁取 owner，再重新拿锁并复查（期间他人可能已建窗）。
+            drop(g);
             let owner = focus_view_hwnd();
-            match CandidateWindowV2::new_owned(
-                owner.map(|h| windows::Win32::Foundation::HWND(h as *mut _)),
-            ) {
-                Some(v2) => g.cand2 = Some(v2),
-                None => g.cand2_dead = true,
+            g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.cand2.is_none() {
+                match CandidateWindowV2::new_owned(
+                    owner.map(|h| windows::Win32::Foundation::HWND(h as *mut _)),
+                ) {
+                    Some(v2) => g.cand2 = Some(v2),
+                    None => g.cand2_dead = true,
+                }
+                trace(&format!(
+                    "cand2(owned-ulw) init ok={} owner={:#x} dead={}",
+                    g.cand2.is_some(),
+                    owner.unwrap_or(0),
+                    g.cand2_dead
+                ));
+                diag_note(&format!(
+                    "cand2(owned-ulw) init ok={} owner={:#x} dead={}",
+                    g.cand2.is_some(),
+                    owner.unwrap_or(0),
+                    g.cand2_dead
+                ));
             }
-            diag_note(&format!(
-                "cand2(owned) init ok={} owner={:#x} dead={}",
-                g.cand2.is_some(),
-                owner.unwrap_or(0),
-                g.cand2_dead
-            ));
         }
         if g.cand2_dead {
-            // owned 窗建不出（DComp 管线失败等）→ server 代画兜底
+            // owned 窗建不出（WARP 失败/超时等）→ server 代画兜底
+            //（位置同链跟光标：SearchHost 兜不到才退 (12,12)）
+            let caret_pos = g
+                .caret
+                .map(|r| (r.left, r.bottom + 4))
+                .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
             let (x, y) = if host_is_searchhost() {
-                (12, 12)
+                caret_pos.unwrap_or((12, 12))
             } else {
-                g.caret
-                    .map(|r| (r.left, r.bottom + 4))
-                    .unwrap_or((100, 100))
+                caret_pos.unwrap_or((100, 100))
             };
             let raw_c = raw.clone();
             drop(g);
-            diag_note("打包宿主 owned 建窗失败 → server 代画");
+            diag_note("打包宿主 owned(ULW) 建窗失败 → server 代画");
             ui_element_show(&shared, &cands, &raw_c, sel, x, y);
             shared
                 .lock()

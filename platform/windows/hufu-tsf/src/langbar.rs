@@ -78,8 +78,17 @@ fn is_chinese() -> bool {
 /// 故整条工作线程 + 全局侧拆除：只在本线程（STA）做线程 compartment
 /// 推送与 sink 通知，进程内零跨套间调用。
 pub fn set_mode(zh: bool) -> bool {
+    set_mode_opt(zh, false)
+}
+
+/// force=true：无条件排队 defer（重画牌面）。跨进程切换场景必须用：
+/// 牌面显示的是**焦点进程** item 的图标，各进程本地 CHINESE 独立——
+/// 在 A 切英文后 B 的本地态还是「中」，在 B 点牌时 engine 翻回「中」
+/// 但 B 本地已是「中」→ 旧逻辑判「无变化」跳过重画 → 牌面不动
+///（「假死一格/切不回」实锤）。OnClick 回执后永远 force。
+pub fn set_mode_opt(zh: bool, force: bool) -> bool {
     let old = CHINESE.swap(zh, Ordering::Relaxed);
-    if old == zh {
+    if old == zh && !force {
         return false;
     }
     // 【v6：延迟到消息泵空闲】铁证（v5 日志）：左键路径（OnClick 内）
@@ -90,7 +99,9 @@ pub fn set_mode(zh: bool) -> bool {
     // 处理完毕、线程回到消息循环后才执行。
     PENDING_ZH.store(zh, Ordering::Relaxed);
     let hwnd = DEFER_HWND_T.with(|c| c.get());
-    log_diag(&format!("set_mode {old}->{zh}（排队 hwnd={hwnd:#x})"));
+    log_diag(&format!(
+        "set_mode {old}->{zh}（排队 hwnd={hwnd:#x} force={force}）"
+    ));
     if hwnd != 0 {
         unsafe {
             PostMessageW(hwnd, WM_APP_DEFER, 0, 0);
@@ -784,7 +795,9 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(pre);
                     log_diag(&format!("toggle → engine_zh={zh}"));
-                    set_mode(zh);
+                    // force：跨进程切换后本地态可能恰好等于回执值，
+                    // 但牌面仍需按 engine 重画（假死一格修复）
+                    set_mode_opt(zh, true);
                 }
                 None => log_diag("toggle 管道失败"),
             }
