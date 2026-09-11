@@ -3085,7 +3085,27 @@ impl CandidateWindowV2 {
                 if self.ulw {
                     // 【ULW 呈现】离屏位图 → CPU_READ 拷贝 → DIB →
                     // UpdateLayeredWindow（沙盒安全：纯 GDI 上屏）。
-                    self.present_ulw(w_out as i32, h_out as i32);
+                    // 【变窄直角根除 2026-09-12】present 尺寸必须与
+                    // SWP 的 apply 同算法（增轴=目标一步到位、减轴=当前
+                    // 缓动）——ULW 的 psize 会覆盖窗口尺寸：若按目标
+                    // w_out 传，收窄帧窗口被一步拉到小目标，壳（缓动
+                    // 中、比目标大）被窗口边缘垂直切断=直角（用户实测
+                    // UWP/开始菜单变窄出直角；notepad owned 复现实锤，
+                    // 中间帧右上角 90° 硬切边）。DComp 路径 Present 不
+                    // 改窗口尺寸故无此问题。
+                    let (pw, ph) = match self.size_anim {
+                        Some((f, t, t0)) => {
+                            let e = size_ease(
+                                f,
+                                t,
+                                t0.elapsed().as_millis() as u32,
+                                self.size_ms,
+                            );
+                            (e.0.max(w_out as i32), e.1.max(h_out as i32))
+                        }
+                        None => (w_out as i32, h_out as i32),
+                    };
+                    self.present_ulw(pw, ph);
                 } else {
                     let chain = match &self.swapchain {
                         Some(c) => c.clone(),
