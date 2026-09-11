@@ -2989,14 +2989,14 @@ fn poll_arm(shared: &SharedRef) {
 /// 前台窗口进程是否与本 DLL 宿主同应用族（同一安装目录）。
 /// WPS 多进程架构：编辑在 wpspdf.exe、前台窗属于 wps.exe——两者
 /// exe 同目录。同族不当「他进程」（poll 残留兜底不收窗）。
-fn fg_same_app_dir(pid: u32) -> bool {
+fn fg_exe_lower(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return false;
+            return None;
         };
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
@@ -3005,18 +3005,45 @@ fn fg_same_app_dir(pid: u32) -> bool {
                 .is_ok();
         let _ = CloseHandle(h);
         if !ok {
-            return false;
+            return None;
         }
-        let fg_dir = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))
-            .parent()
-            .map(|p| p.to_path_buf());
-        let my_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        match (fg_dir, my_dir) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
+        Some(String::from_utf16_lossy(&buf[..len as usize]).to_lowercase())
+    }
+}
+
+/// 【双候选窗修复 2026-09-11】前台进程是否 UWP 框架族（打包应用/
+/// ApplicationFrameHost/搜索宿主）。原「打包宿主一律豁免他进程收窗」
+/// 太宽：notepad 打完字切到普通应用（Typora 等），notepad 的 owned
+/// 窗既收不到失焦回调（UWP 焦点通知不可靠）也不被 poll 收——残留
+/// 第二个候选窗且内容还跟着引擎刷新（用户实测「两个候选框都生效，
+/// 分别在两个主体里」）。收紧：豁免仅当前台进程仍是 UWP 框架族
+/// （Store 打字时前台=ApplicationFrameHost，pid 永远≠内容进程，
+/// 不豁免会把正在打字的候选误收——原 Store 只闪一下的教训）；
+/// 前台是普通桌面应用=真离开了，照收残留。
+fn fg_is_uwp_frame(pid: u32) -> bool {
+    match fg_exe_lower(pid) {
+        Some(p) => {
+            p.contains("\\windowsapps\\")
+                || p.contains("\\systemapps\\")
+                || p.ends_with("\\applicationframehost.exe")
         }
+        None => true, // 查不到（权限/竞态）——保守豁免，不误收
+    }
+}
+
+fn fg_same_app_dir(pid: u32) -> bool {
+    let Some(fg_path) = fg_exe_lower(pid) else {
+        return false;
+    };
+    let fg_dir = std::path::PathBuf::from(fg_path)
+        .parent()
+        .map(|p| p.to_path_buf());
+    let my_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    match (fg_dir, my_dir) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -3076,7 +3103,7 @@ fn poll_tick() {
             // 消失（空格上字正常）。同应用族=前台进程 exe 与本进程
             // exe 同目录（WPS 全家同目录），不当他进程收窗。
             if pid != std::process::id()
-                && !(host_is_packaged() && !host_is_searchhost())
+                && !(host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid))
                 && !fg_same_app_dir(pid)
             {
                 let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
