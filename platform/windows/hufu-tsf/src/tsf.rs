@@ -1377,7 +1377,20 @@ impl EditSession_Impl {
                 // 根因）。跟随宿主/锚点缺失/首帧补显（懒布局首查常为
                 // 旧行框，补显必须重拿稳定值）才查。【2026-09-11 默认
                 // 跟随后】常规宿主全部逐键查询（标准 IME 行为）。
-                if host_follow_caret() || g.caret.is_none() || g.caret_force {
+                // 【虎魄改系统插入符跟随 2026-09-12 用户拍板】其
+                // GetTextExt 返回恒定值（窗钉死首键处，notes 实锤
+                // x 恒 120 不跟键入），而布局锁下逐键 GetTextExt 曾
+                // 卡秒级（2026-09-08 实测 5.1s）——段内改查系统插入符
+                //（GUITHREADINFO 纯 user32、零 TSF 回调、不进布局锁）：
+                // 逐键轻量跟随最新键入处；查不到（自绘光标场景）回落
+                // 原 query_caret 路径不劣化。
+                if host_caret_via_system() {
+                    if let Some(r) = gui_caret_fallback() {
+                        g.caret = Some(r);
+                    } else if g.caret.is_none() || g.caret_force {
+                        query_caret(&mut g, &ctx, ec);
+                    }
+                } else if host_follow_caret() || g.caret.is_none() || g.caret_force {
                     query_caret(&mut g, &ctx, ec);
                 }
                 Ok(())
@@ -3280,6 +3293,22 @@ fn host_follow_caret() -> bool {
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
             .map(|n| !n.contains("虎魄"))
             .unwrap_or(true)
+    })
+}
+
+/// 【虎魄系统插入符跟随 2026-09-12】TigerClaw（虎魄跟打器，exe 名
+/// TigerClaw.*——旧中文名单「虎魄」匹配不上，其 GetTextExt 一直走
+/// 常规路径但返回恒定值：窗钉死首键处不跟键入，notes 实锤 x 恒 120）。
+/// 段内改用 GUITHREADINFO 系统插入符跟随（零 TSF 回调不进布局锁，
+/// 规避 2026-09-08 的逐键 GetTextExt 卡 5.1s）。
+fn host_caret_via_system() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(|n| n.to_lowercase().contains("tigerclaw"))
+            .unwrap_or(false)
     })
 }
 
