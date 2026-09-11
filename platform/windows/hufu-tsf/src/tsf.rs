@@ -3161,9 +3161,16 @@ fn fg_same_app_dir(pid: u32) -> bool {
     let fg_dir = std::path::PathBuf::from(fg_path)
         .parent()
         .map(|p| p.to_path_buf());
+    // 【大小写统一 2026-09-12 WPS 被挡根因】fg 路径经 fg_exe_lower 已
+    // 小写化，current_exe 保持原样（`Kingsoft\WPS Office` vs `kingsoft/
+    // wps office`）——WPS 多进程同 exe（前台 wps.exe ≠ 打字 wps.exe
+    // 实例）同目录豁免失效，poll 每拍收窗：候选「闪现一下就被挡/消
+    // 失、新键入又闪现」（notes 实锤收窗日志）。两侧统一小写比较。
     let my_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .map(|p| p.to_string_lossy().to_lowercase());
+    let fg_dir = fg_dir.map(|p| p.to_string_lossy().to_lowercase());
     match (fg_dir, my_dir) {
         (Some(a), Some(b)) => a == b,
         _ => false,

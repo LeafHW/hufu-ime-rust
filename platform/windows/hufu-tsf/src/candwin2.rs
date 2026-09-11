@@ -3361,17 +3361,23 @@ impl CandidateWindowV2 {
                     }
                     None => (w_out as i32, h_out as i32),
                 };
-                // 【位置滑动】可见中且目标位移动于 6px → 起臂位置动效
-                //（整句自动上屏：候选跟新光标丝滑滑过去）；首显/小位移
-                // 瞬移。tick 每 15ms move-only 步进（不重绘，零成本）。
+                // 【位置滑动·只前进 2026-09-12 用户拍板】可见中且目标
+                // 位移大于 6px → 起臂位置动效（整句自动上屏：候选跟新
+                // 光标丝滑滑过去）；首显/小位移瞬移。【不要回头】仅右
+                // 移起臂滑动——左移（顶功上屏残余估算回缩/删键）瞬移
+                // 直接贴新位置：回退滑动视觉上像窗「往回走」，用户实测
+                // 嫌弃；瞬移=立即出现在光标处，干净利落。
                 let (tx, ty) = (
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
                 );
+                // 前进=右移或下移（换行 x 回行首但 y 下移也是前进）；
+                // 只有左移且不上移才瞬移。换行滑动保留（视觉连贯）。
                 if was_visible && self.pos_ms > 0 && !self.internal_rerender {
                     let (lx, ly) = self.live_pos.get();
                     let d = (tx - lx).abs().max((ty - ly).abs());
-                    if d >= 6 {
+                    let forward = tx >= lx || ty > ly + 6;
+                    if d >= 6 && forward {
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now()));
                         unsafe {
                             let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
