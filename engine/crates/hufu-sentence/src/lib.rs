@@ -595,12 +595,24 @@ impl SentenceEngine {
                     }
                     for (text, rank, seg_exact) in &seg.entries {
                         let rank1b = rank + 1; // 码表名次（1 起）
+                        // 【隐式二选 2026-09-12 用户需求】整句录入时允许
+                        // 3/4 码段的编码 2 选在无锁（不打选重键）情况下
+                        // 参与组句：brybks 出「奴隶」（隶=bks 二选）、
+                        // eyieqdk 出「桎梏」（桎=eyi 二选）。1/2 码段不放开
+                        //（用户拍板：只限 3 码和 4 码的字，1 码 2 码不计入）；
+                        // rank≥3 一律不放开（只放开「2 选」）。
+                        let implicit2 = lock.is_none()
+                            && rank1b == 2
+                            && {
+                                let seg_keys = end - pos;
+                                seg_keys == 3 || seg_keys == 4
+                            };
                         if let Some(r) = lock {
                             if rank1b != r {
                                 continue;
                             }
-                        } else if !allow_all_ranks && rank1b != 1 {
-                            // >4 码无锁只取第 1 候选
+                        } else if !allow_all_ranks && rank1b != 1 && !implicit2 {
+                            // >4 码无锁只取第 1 候选（隐式二选除外）
                             continue;
                         }
                         let mut ns = state.clone();
@@ -623,6 +635,16 @@ impl SentenceEngine {
                             ns.score -= pen;
                             ns.mass -= pen;
                         }
+                        // 【隐式二选记账】隐式二选段（无锁 3/4 码 rank2）
+                        // 的 max_rank/sum_rank 按 1 记：排序门槛
+                        //（max_rank 硬优先）与 rerank 深度约束
+                        //（sum_rank=用户选重代价——用户没打选重键，没
+                        // 付这个代价）都不得歧视它；分数竞争里的
+                        // rank_penalty 折价保留——「权重（ngram 分数）
+                        // 高才首选，不高就靠后」（用户拍板的排序语义）。
+                        // 显式锁定的 rank2（打了 ;/'/数字）保持真实记
+                        // 账——那是用户真实付出的选重代价。
+                        let book_rank = if implicit2 { 1 } else { rank1b };
                         // 【dict_bias 接线 2026-09-03】短码窗口（n≤4）多字
                         // 码表词条温和加成：只进 score 不进 mass（与
                         // supplement 同语义——非概率项，不污染提前上屏置
@@ -637,8 +659,8 @@ impl SentenceEngine {
                             ns.score += w.dict_bias;
                         }
                         ns.text.push_str(text);
-                        ns.max_rank = ns.max_rank.max(rank1b);
-                        ns.sum_rank += rank1b;
+                        ns.max_rank = ns.max_rank.max(book_rank);
+                        ns.sum_rank += book_rank;
                         // 精确累计：段词条码长==消耗键数（无前缀扩展）且
                         // 无选重（rank1，或被锁钉名次=用户打了选重键）。
                         // 任何一段不精确则整条路径 exact=false。
