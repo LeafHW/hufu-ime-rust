@@ -1679,7 +1679,18 @@ impl CandidateWindowV2 {
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
-            } else if !was_visible && self.size_ms > 0 && self.fade_ms == 0 {
+            } else if !was_visible
+                && self.size_ms > 0
+                && self.fade_ms == 0
+                // 【入场按方案 2026-09-11】server 注入 entrance_anim
+                //（方案名含「整句」=true）：非整句方案首显直接全尺寸；
+                // 缺省 true（旧 server/测试直连兼容）。
+                && skin
+                    .pointer("/skin/entrance_anim")
+                    .or_else(|| skin.get("entrance_anim"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true)
+            {
                 // 【首出长大 2026-09-11】刻意出现的窗从 72% 拉到目标——
                 // 纯尺寸动效（零透明度变化=无变深/透底），盒心锚定高亮
                 // 胶囊（「从高亮区出现」）；连打循环直接全显。

@@ -93,12 +93,17 @@ pub fn dispatch(
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
             let anim = host.engine.config.appearance.anim;
             let anim_speed = host.engine.config.appearance.anim_speed;
+            // 【入场动效按方案 2026-09-11】用户拍板：只有整句方案才有
+            // 入场长大动效（长编码场景反馈有价值）；单字/字词等方案首显
+            // 直接全尺寸。方案名含「整句」即认定；DLL 缺省 true 兼容。
+            let entrance_anim = host.engine.config.schema.current.contains("整句");
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => {
                     let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
                     }
                     serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
@@ -109,6 +114,7 @@ pub fn dispatch(
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
                     }
                     serde_json::json!({
                         "skin": sv,
