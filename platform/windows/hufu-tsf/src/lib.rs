@@ -371,6 +371,149 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
     1
 }
 
+/// 测试钩子：反查窗口取证——按真实反查态内容（aux 编码行「·〔反查〕 ni」
+/// + 汉字候选（注释=虎码））用当前 server 皮肤渲染，屏幕合成级截屏存
+/// %TEMP%\hufu-fancha.bmp（供白底灰条等渲染缺陷目检）。
+#[no_mangle]
+extern "system" fn hufu_test_fancha(mode: u32) -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
+    };
+
+    let Some(mut w) = CandidateWindowV2::new() else {
+        eprintln!("fancha: candwin2 初始化失败");
+        return 0;
+    };
+    // 皮肤：真实 server（用户当前皮肤+动效参数）
+    let Some(mut skin) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+        eprintln!("fancha: server 皮肤拉取失败");
+        return 0;
+    };
+    // 覆盖通道：%TEMP%\fancha-override.json → 深合并进 skin.skin（二分
+    // 定位渲染层用：{"material":{"shadow_alpha":0}} 等）
+    if let Ok(ov) = std::fs::read_to_string(std::env::temp_dir().join("fancha-override.json")) {
+        if let Ok(patch) = serde_json::from_str::<serde_json::Value>(&ov) {
+            if let (Some(dst), Some(src)) = (skin.get_mut("skin"), patch.as_object()) {
+                let mut keys = Vec::new();
+                for (k, v) in src {
+                    dst[k] = v.clone();
+                    keys.push(format!("{k}={v}"));
+                }
+                eprintln!("fancha: 覆盖 {}", keys.join(","));
+            }
+        }
+    }
+    let cands: Vec<(String, String)> = match mode % 3 {
+        0 => vec![
+            ("你".into(), "vs zc".into()),
+            ("泥".into(), "xspk".into()),
+            ("尼".into(), "xcwu".into()),
+            ("妮".into(), "zvzo".into()),
+            ("昵".into(), "djd".into()),
+        ],
+        // 横排
+        1 => vec![
+            ("你".into(), "vs zc".into()),
+            ("泥".into(), "xspk".into()),
+            ("尼".into(), "xcwu".into()),
+        ],
+        // 对照组：普通打字形态（同皮肤）
+        _ => vec![
+            ("中心".into(), "vsik".into()),
+            ("忠心".into(), "orvs".into()),
+            ("衷心".into(), "aavb".into()),
+        ],
+    };
+    let raw = match mode % 5 {
+        0 | 1 => "·〔反查〕 ni",
+        // 3=无编码行（只有候选）
+        3 => "",
+        // 4=只有编码行（无候选）
+        4 => "·〔反查〕 ni",
+        _ => "vsik",
+    };
+    let cands: Vec<(String, String)> = if mode % 5 == 4 { vec![] } else { cands };
+    let anchor = RECT {
+        left: 160,
+        top: 160,
+        right: 160,
+        bottom: 184,
+    };
+    w.show(&cands, raw, &skin, Some(&anchor), 0);
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    unsafe {
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(w.hwnd, &mut wr);
+        let wq = (wr.right - wr.left).max(1);
+        let hq = (wr.bottom - wr.top).max(1);
+        // 窗外扩 24px（含阴影区）
+        let ex = wr.left - 24;
+        let ey = wr.top - 24;
+        let ew = (wq + 48).min(GetSystemMetrics(SM_CXSCREEN) - ex);
+        let eh = (hq + 48).min(GetSystemMetrics(SM_CYSCREEN) - ey);
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: ew,
+                biHeight: -eh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        if let Ok(ib) = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(mem, ib);
+            let _ = BitBlt(mem, 0, 0, ew, eh, screen, ex, ey, SRCCOPY);
+            // BMP 文件头 + 像素
+            let mut bmp: Vec<u8> = Vec::with_capacity(54 + (ew * eh * 4) as usize);
+            bmp.extend_from_slice(&b"BM".to_owned());
+            bmp.extend_from_slice(&((54 + ew * eh * 4) as u32).to_le_bytes());
+            bmp.extend_from_slice(&0u32.to_le_bytes());
+            bmp.extend_from_slice(&54u32.to_le_bytes());
+            bmp.extend_from_slice(&40u32.to_le_bytes());
+            bmp.extend_from_slice(&(ew as i32).to_le_bytes());
+            bmp.extend_from_slice(&(eh as i32).to_le_bytes());
+            bmp.extend_from_slice(&1u16.to_le_bytes());
+            bmp.extend_from_slice(&32u16.to_le_bytes());
+            bmp.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+            bmp.extend_from_slice(&((ew * eh * 4) as u32).to_le_bytes()); // biSizeImage
+            bmp.extend_from_slice(&2835u32.to_le_bytes()); // 72dpi
+            bmp.extend_from_slice(&2835u32.to_le_bytes());
+            bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+            bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+            let px = std::slice::from_raw_parts(bits as *const u8, (ew * eh * 4) as usize);
+            bmp.extend_from_slice(px);
+            let path = std::env::temp_dir().join(format!("hufu-fancha{mode}.bmp"));
+            match std::fs::write(&path, &bmp) {
+                Ok(()) => eprintln!(
+                    "fancha: {} {ew}x{eh} 截屏 → {}",
+                    wr.right - wr.left,
+                    path.display()
+                ),
+                Err(e) => eprintln!("fancha: 写盘失败 {e}"),
+            }
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(ib);
+        }
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    w.hide();
+    1
+}
+
 /// 音效池化播放练习：16 次急速连击（0/15ms 间隔），压排队深度；
 /// 任何一次崩溃/死锁返回 0（崩溃使进程直接退出）。
 #[no_mangle]

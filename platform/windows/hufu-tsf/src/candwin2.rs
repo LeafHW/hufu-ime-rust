@@ -2269,9 +2269,16 @@ impl CandidateWindowV2 {
                     text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")),
                 );
                 // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
+                // 【反查灰条修复 2026-09-11】判定必须用皮肤自带 alpha——
+                // 旧代码先 elem_alpha（a←master）再判 >0.01：皮肤明确
+                // 透明（出厂全皮肤 alpha=00）也被强改 0.68 恒画。深色底
+                // 不可见，白底（Typora）露出编码行位置的全宽暗带；普通
+                // 打字编码行为空（内联）不触发，反查必带编码行 → 反查
+                // 专属症状。顺序：自带 alpha 判定 → 可见者才按 master
+                // 归一出画刷（可见皮肤的既有语义不变）。
                 let b_preedit_bg = {
-                    let c = elem_alpha(color_f(skin, "preedit_back_color", "#00000000"));
-                    (c.a > 0.01).then(|| mkbrush(&ctx, c)).flatten()
+                    let c = color_f(skin, "preedit_back_color", "#00000000");
+                    (c.a > 0.01).then(|| mkbrush(&ctx, elem_alpha(c))).flatten()
                 };
                 let b_cmt = mkbrush(
                     &ctx,
