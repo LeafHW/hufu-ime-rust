@@ -170,6 +170,17 @@ pub struct Shared {
     /// 候选窗按旧行框显示到下一段（用户实测「候选框乱跳」）。置位
     /// 于 arm_first_frame_timer 各抑制点，query_caret 消费即清。
     pub caret_force: bool,
+    /// 【估算链跟随 2026-09-12 五次修正】Chromium 系（Typora/QQ）一旦
+    /// 上过屏，GetTextExt 对后续组段持续失败（点击可重置、跨帧 60ms
+    /// 自愈救不了持续失败）——只能以最近一次成功锚为基准推算：
+    /// est_base=成功锚；est_commit_px=其后累计上屏宽度（Commit 时按
+    /// 文本宽估算累加）；cur_raw_len=当前编码长。失败帧锚 =
+    /// base.right + est_commit_px + raw×(行高×0.45 半角系数)。
+    /// 任何成功查询自动重校（点击后首个组段必然成功）。
+    pub caret_est_base: Option<RECT>,
+    pub caret_est_commit_px: i32,
+    pub caret_est_line_h: i32,
+    pub cur_raw_len: usize,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -224,6 +235,10 @@ impl Shared {
             cand_sig_last: String::new(),
             caret_recheck_due: false,
             caret_force: false,
+    caret_est_base: None,
+    caret_est_commit_px: 0,
+    caret_est_line_h: 0,
+    cur_raw_len: 0,
             line_end: false,
             last_show: None,
         }
@@ -1357,48 +1372,29 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
-                // 【段内免 SetSelection 2026-09-08】每键 SetSelection 触发
-                // 宿主选区通知链（跟打器 UI 线程上又一逐键负担——虎爪
-                // 对照流畅，我们卡：段内逐键压宿主的点全部剔除）。组段
-                // range 自锚定，选区只在 StartPreedit 建段时设一次；
-                // Commit/上屏路径不受影响（EndComposition 后宿主按组段
-                // 末尾放置插入点）。
-                // 【打包宿主例外 2026-09-11】Win11 记事本/UWP 文本栈的
-                // 插入符只按 selection 画——段内不更新选区=光标竖线
-                // 滞留段首、编码向右生长（用户实测「光标一直在左边，
-                // 上屏一次才到最右」）。打包宿主里逐键把选区折叠到段
-                // 末（跟打器非打包应用，性能豁免不受影响）。
-                if host_is_packaged() || focus_is_uwp_shell() {
-                    let _ = set_selection_at_end(&ctx, ec, &range);
-                }
-                // 【实时光标跟随 2026-09-12 用户拍板·全局】所有应用：
-                // 光标一动窗就动，候选窗最左=实时光标最右。三处配合：
-                // ①锚点源优先系统插入符（GUITHREADINFO——系统实时维
-                // 护、零 TSF 回调、无布局锁/旧行框问题，虎魄跟打器亦
-                // 覆盖）；查不到再回落 GetTextExt（query_caret）。
-                // ②show() 锚 x=光标右缘（rect.right）。③删 x 单调锁/
-                // y 行高锁（顶功上屏 raw 等长但光标已跳——锁导致窗
-                // 不跟；旧行框问题由系统插入符从根上绕开）。
-                if host_follow_caret() || g.caret.is_none() || g.caret_force {
+                // 【逐键跟随最新光标 2026-09-12 定版】用户拍板：打一个
+                // 编码/字母，窗就跟到最新光标处（不是旧的「上屏动一
+                // 次、段内钉住」）。段内每键两步：
+                // ①SetSelection 推选区到编码尾——宿主随之移动插入符
+                //（Chromium 系实测有效：Typora 键 u→r 锚 184→195 前进；
+                // Win11 记事本插入符也只按 selection 画）。
+                // ②查锚：虎魄/打包/UWP 壳走系统插入符（其 GetTextExt
+                // 恒定/常态失败；①已推 caret 到编码尾）；其余走
+                // GetTextExt 编码尾。失败回落系统插入符，再失败保留
+                // 旧锚并武装 60ms 重查（Chromium 布局跨帧竞态自愈：
+                // SetText 后同帧双查也等不到，60ms 后必得新位置）。
+                let _ = set_selection_at_end(&ctx, ec, &range);
+                // 估算链输入：当前编码长（失败帧推算用）。
+                g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
+                if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
                     if let Some(r) = gui_caret_fallback() {
                         g.caret_force = false;
                         g.caret = Some(r);
-                        g.line_end = unsafe {
-                            let fg = GetForegroundWindow();
-                            if fg.0.is_null() {
-                                false
-                            } else {
-                                let mut wr = RECT::default();
-                                if GetWindowRect(fg, &mut wr).is_ok() {
-                                    wr.right - r.right < 56 && r.right <= wr.right
-                                } else {
-                                    false
-                                }
-                            }
-                        };
                     } else {
                         query_caret(&mut g, &ctx, ec);
                     }
+                } else {
+                    query_caret(&mut g, &ctx, ec);
                 }
                 Ok(())
             }
@@ -1474,6 +1470,19 @@ impl EditSession_Impl {
                     let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 g.composition = None;
+                // 【估算链 2026-09-12】上屏文本宽度累计（Chromium 系
+                // 上屏后 GetTextExt 持续失败，失败帧锚靠推算）。
+                if g.caret_est_line_h > 0 {
+                    let mut w = 0.0f32;
+                    for c in text.chars() {
+                        w += if c.is_ascii() {
+                            g.caret_est_line_h as f32 * 0.45
+                        } else {
+                            g.caret_est_line_h as f32
+                        };
+                    }
+                    g.caret_est_commit_px += w as i32;
+                }
                 Ok(())
             }
             Op::CommitAndRepreedit(commit_text, preedit) => {
@@ -1556,6 +1565,20 @@ impl EditSession_Impl {
                 }
                 g.composition = None;
                 // 2) 重开组段显示剩余预编辑
+                // 【估算链 2026-09-12】顶功提前上屏：commit 宽度先累计
+                //（下方 query_caret 若成功会重校清零，失败则作为推算
+                // 偏移的一部分）。
+                if g.caret_est_line_h > 0 && !commit_text.is_empty() {
+                    let mut w = 0.0f32;
+                    for c in commit_text.chars() {
+                        w += if c.is_ascii() {
+                            g.caret_est_line_h as f32 * 0.45
+                        } else {
+                            g.caret_est_line_h as f32
+                        };
+                    }
+                    g.caret_est_commit_px += w as i32;
+                }
                 let cc: ITfContextComposition = ctx.cast()?;
                 let range: ITfRange = selection_range(&ctx, ec)?;
                 let sink: ITfCompositionSink = CompSinkObj {
@@ -1745,6 +1768,15 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     let prev_line_end = g.line_end;
     g.caret = None;
     g.caret_force = false; // 消费即清（补显强制重查一次性）
+    // 【虎魄跟打器 2026-09-12】其 GetTextExt 返回恒定值（上屏后窗不
+    // 跳），改查系统插入符（GUITHREADINFO，零 TSF 回调不进布局锁）
+    // ——上屏后插入符在上屏文字尾，恰好是「上屏动一次」要的位置。
+    if exe_is_hupo() {
+        if let Some(r) = gui_caret_fallback() {
+            g.caret = Some(r);
+            return;
+        }
+    }
     let Some(comp) = g.composition.clone() else {
         trace("qc: 无组段");
         return;
@@ -1757,21 +1789,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: Clone 失败");
         return;
     };
-    // 候选窗锚点按宿主分化（【默认跟随光标 2026-09-11】用户拍板）：
-    // - 默认（全部常规宿主+晴跟打Pro）：锚 END（最新光标处）——候选
-    //   框最左=最新光标，逐键前进由位置滑动动效平滑化。
-    // - 虎魄跟打器：锚 START（组段起始）+段内零查询——其布局锁下
-    //   每键 GetTextExt×2（强迫懒布局收敛）卡秒级（2026-09-08 实测
-    //   5.1s，卡点在 SetPreedit 会话内 GetTextExt）。
-    let anchor = if host_follow_caret() {
-        TF_ANCHOR_END
-    } else {
-        TF_ANCHOR_START
-    };
-    if unsafe { caret.Collapse(ec, anchor) }.is_err() {
+    // 【锚=编码尾 2026-09-12 定版】逐键跟随：SetSelection 已把选区推
+    // 到段末，collapse END 量的就是编码尾（Chromium 按 selection 返回
+    // ——实测键 u→r 锚 184→195 前进；EDIT 型返回 END 折叠点同义）。
+    if unsafe { caret.Collapse(ec, TF_ANCHOR_END) }.is_err() {
         trace("qc: Collapse 失败");
         return;
-    };
+    }
     let Ok(view) = (unsafe { ctx.GetActiveView() }) else {
         trace("qc: GetActiveView 失败");
         return;
@@ -1801,11 +1825,45 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         }
     }
     let Some(rect) = last_ok else {
-        // 两次均失败/退化：恢复快照的旧锚点（比丢锚点稳；旧实现因
-        // 开头清 None 实际没保住——见函数头注记）
+        // 两次均失败/退化：先试系统插入符（打包宿主 GetTextExt 常态
+        // 失败——但段内 SetSelection 已把插入符推到段尾/上屏后 commit
+        // 尾，系统插入符恰是要的锚点）。
+        if let Some(r) = gui_caret_fallback() {
+            g.caret = Some(r);
+            trace("qc: GetTextExt 失败，系统插入符兜底");
+            return;
+        }
+        // 【估算链兜底 2026-09-12 五次修正】Chromium 系上过屏后
+        // GetTextExt 持续失败（跨帧自愈救不了）——以最近成功锚为
+        // 基准推算当前锚：基准右缘 + 累计上屏宽 + 编码宽。任何成功
+        // 查询自动重校，点击后首个组段必然成功重校。
+        if let Some(base) = g.caret_est_base {
+            if g.caret_est_line_h > 0 {
+                let raw_px =
+                    (g.cur_raw_len as f32 * g.caret_est_line_h as f32 * 0.45) as i32;
+                let off = g.caret_est_commit_px + raw_px;
+                let est = RECT {
+                    left: base.left + off,
+                    top: base.top,
+                    right: base.right + off,
+                    bottom: base.bottom,
+                };
+                g.caret = Some(est);
+                trace(&format!(
+                    "qc: est=({},{}) off={} (commit={} raw={})",
+                    est.left, est.top, off, g.caret_est_commit_px, g.cur_raw_len
+                ));
+                return;
+            }
+        }
         g.caret = prev_caret;
         g.line_end = prev_line_end;
-        trace("qc: GetTextExt 两次均失败/退化，沿用旧锚点");
+        // 【Chromium 跨帧竞态自愈 2026-09-12】SetText 后立即 GetTextExt
+        // 可能失败（渲染进程异步布局，同帧双查也等不到——Typora 第三
+        // 键实录）：武装 60ms 重查定时器，到点强制 update_ui 重跑本键
+        // SetPreedit（CARET_TIMER 已置 caret_force），跨帧拿到新锚。
+        arm_caret_recheck_timer();
+        trace("qc: GetTextExt 失败，武装 60ms 跨帧重查");
         return;
     };
     // GetTextExt 返回屏幕坐标（MSDN）——不再做客户区→屏幕转换
@@ -1813,12 +1871,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         "qc: raw=({},{},{},{})",
         rect.left, rect.top, rect.right, rect.bottom
     ));
-    g.caret = Some(RECT {
-        left: rect.left,
-        top: rect.top,
-        right: rect.right,
-        bottom: rect.bottom,
-    });
+    // 成功查询=估算链重校点：新基准、清累计。
+    g.caret_est_base = Some(rect);
+    g.caret_est_commit_px = 0;
+    g.caret_est_line_h = (rect.bottom - rect.top).max(8);
+    g.caret = Some(rect);
     // 【行尾检测】caret 右缘距前台窗口右缘 < 56px（≈2-3 个全角字 +
     // 滚动条余量，二者同为屏幕物理像素可直接比）→ 软换行边界将至。
     // 页面视图/分栏等行宽 < 窗口宽的宿主检测不到（不触发，无害）；
@@ -2943,6 +3000,9 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     g.caret_recheck_due = false;
+                    // 到点强制重查：置 caret_force（SetPreedit 段内查询
+                    // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
+                    g.caret_force = true;
                 }
                 if let Some(state) = crate::ipc::state_request() {
                     let raw_empty = state
@@ -3287,13 +3347,24 @@ fn host_async_layout() -> bool {
 ///（虎魄 2026-09-08 移出：逐键布局查询×2 在跟打器上卡秒级，见
 /// query_caret 注释）。
 fn host_follow_caret() -> bool {
-    // 【恒 true 2026-09-12 用户拍板】所有应用实时跟随最新光标。旧
-    // 「虎魄」名单（锚组段起点防 GetTextExt 布局锁卡 5.1s）退役：
-    // 实时光标实现在名单为 true 时优先系统插入符（GUITHREADINFO，
-    // 零 TSF 回调不进布局锁）——虎魄跟打器（真宿主名「虎魄跟打器
-    // .exe」，此前 TigerClaw 判定是错靶）也走此轻量路径，卡顿前提
-    // 不复存在。查不到系统插入符才回落 GetTextExt。
+    // 【恒 true 2026-09-12 用户拍板】所有应用实时跟随最新光标（按宿
+    // 主分化锚源：打包/UWP 壳/虎魄走系统插入符，其余走 GetTextExt
+    // 编码尾锚——见 SetPreedit 处注释）。
     true
+}
+
+/// 【虎魄跟打器判定 2026-09-12】真打字宿主名（此前 TigerClaw 判定
+/// 是错靶——那是虎魄的组件进程）。其 GetTextExt 返回恒定值（窗钉
+/// 死首键处），且布局锁下逐键 GetTextExt 卡秒级——走系统插入符。
+fn exe_is_hupo() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(|n| n.contains("虎魄"))
+            .unwrap_or(false)
+    })
 }
 
 
