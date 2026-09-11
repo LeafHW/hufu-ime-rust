@@ -2117,7 +2117,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     bottom: y,
                 })
             })
-            .or(g.caret);
+            .or(g.caret)
+            // 【反查首帧锚点 2026-09-11】无组段帧 caret 恒 None——退
+            // 系统插入符（GUITHREADINFO hCaret）：反查提示窗直接落在
+            // 真实输入位置，打出首字母后组段锚点接管（位置滑动过渡）。
+            .or_else(gui_caret_fallback);
         let is_preview = preview_anchor.is_some();
         // DComp 直通窗在 SearchHost（开始菜单搜索）里被 DWM 整体
         // cloaked（显示中但不可见，实测 cloak=2 逐帧持续）；v1 混合窗
@@ -2181,7 +2185,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let wps_deadline = g
             .wps_settle_start
             .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(300));
-        let suppress = (g.caret.is_none() || (wps_settle && !(wps_stable || wps_deadline)))
+        // 【反查首帧修复 2026-09-11】无组段帧（反查/命令模式刚进入：仅
+        // aux 提示行、编码空、应用文本流无内容）豁免 caret 抑制链——
+        // query_caret 需要组段，这类帧 caret 恒 None，抑制+35ms 补显
+        // 重查永远查不出（死循环），实测 WPS/Typora 里按 ` 后反查窗
+        // 口不出现，打出第一个字母才有。等待无意义：直接显示，锚点
+        // 用旧 caret（上一段落点）→ 无则系统插入符（GUITHREADINFO）
+        // → 再无则 candwin2 焦点窗兜底。
+        let compless = g.composition.is_none();
+        let suppress = !compless
+            && (g.caret.is_none() || (wps_settle && !(wps_stable || wps_deadline)))
             && !pinned_now
             && !host_is_searchhost()
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
@@ -2521,9 +2534,44 @@ fn ui_element_hide(shared: &SharedRef) {
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    KillTimer, RegisterClassW, SetTimer, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect,
+    GetWindowThreadProcessId, KillTimer, RegisterClassW, SetTimer, GUITHREADINFO, HWND_MESSAGE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
+
+/// 【反查首帧锚点 2026-09-11】无组段帧（反查/命令模式刚进入：仅 aux
+/// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
+/// 的系统插入符（hCaret/rcCaret 客户区坐标→屏幕）。这是不依赖组段的
+/// 唯一光标来源——query_caret 需要组段（GetTextExt），首帧查不出。
+fn gui_caret_fallback() -> Option<RECT> {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(fg, None);
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gi).is_ok() && !gi.hwndCaret.0.is_null() {
+            let w = (gi.rcCaret.right - gi.rcCaret.left).max(2);
+            let mut pt = POINT {
+                x: gi.rcCaret.left,
+                y: gi.rcCaret.bottom,
+            };
+            if windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt).as_bool() {
+                return Some(RECT {
+                    left: pt.x,
+                    top: pt.y,
+                    right: pt.x + w,
+                    bottom: pt.y,
+                });
+            }
+        }
+        None
+    }
+}
 
 const POLL_TIMER_ID: usize = 0x4846_5546; // 'HuFU'
 const POLL_MS: u32 = 110;
