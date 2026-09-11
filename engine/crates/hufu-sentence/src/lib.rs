@@ -116,6 +116,10 @@ struct St {
     /// 加权的词（补充语料.txt）理应也影响提案，否则「上屏真爽」案
     /// 显示翻盘而提案仍被「火藏」拆段抢跑。dict_bias 仍不进置信。）
     supp_bonus: f64,
+    /// 【隐式二选 2026-09-12】路径含隐式二选段（无锁 3/4 码 rank2）：
+    /// engine 据此在候选组装时把过真词地板的隐式二选词初排压前
+    ///（不等 Qwen 异步重排——用户实测「重排到首位有反应时间」）。
+    implicit2: bool,
 }
 
 /// emit 期由词边界重建切分串（对齐旧 St.segmented 语义）。
@@ -512,6 +516,7 @@ impl SentenceEngine {
                 word_ends: Vec::new(),
                 supp_state: 0,
                 supp_bonus: 0.0,
+                implicit2: false,
             });
         }
 
@@ -671,6 +676,9 @@ impl SentenceEngine {
                             ns.exact = false;
                         }
                         ns.word_ends.push((ns.text.chars().count(), end));
+                        if implicit2 {
+                            ns.implicit2 = true;
+                        }
                         buckets[end].add(ns);
                     }
                 }
@@ -709,6 +717,7 @@ impl SentenceEngine {
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
+                    implicit2: st.implicit2,
                 }
             })
             .collect();
@@ -750,6 +759,7 @@ impl SentenceEngine {
                     word_ends: st.word_ends.clone(),
                     segmented: segmented_of(&st.word_ends, &base),
                     partial: false,
+                    implicit2: st.implicit2,
                 },
             );
         }
@@ -794,10 +804,11 @@ impl SentenceEngine {
                                 text: st.text.clone(),
                                 max_rank: st.max_rank.max(1),
                                 sum_rank: st.sum_rank,
-                    exact: st.exact,
+                                exact: st.exact,
                                 word_ends: st.word_ends.clone(),
                                 segmented: segmented_of(&st.word_ends, &base),
                                 partial: true,
+                                implicit2: st.implicit2,
                             },
                         );
                     }
