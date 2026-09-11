@@ -99,6 +99,11 @@ pub struct Shared {
     /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
     /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
     pub focus_idle_at: Option<std::time::Instant>,
+    /// 【反查退格 2026-09-11】引擎处于反查/命令模式但无组段（仅 aux
+    /// 提示态）：退格=退出模式（引擎 consumed）。TestDown 须据此声明
+    /// 吞键——否则宿主直接吃掉退格删前字、反查态悬空（WPS 实测）。
+    /// update_ui 按引擎 state 每帧刷新；焦点切换清零。
+    pub aux_active: bool,
     /// 【打字期 poll 静默 2026-09-08】最近一次按键时刻——poll_tick 在
     /// 500ms 活跃窗口内直接跳过（键路径自会刷新 UI；poll 在打字中
     /// 只有抢管道/抢锁的副作用）。对齐虎爪「打字时零后台」行为。
@@ -206,6 +211,7 @@ impl Shared {
             composing: false,
             shift_pending: false,
             shift_down: false,
+            aux_active: false,
             suppress_pending: false,
             wps_caret_prev: None,
             wps_settle_start: None,
@@ -688,6 +694,7 @@ fn handle_set_focus(
         }
         g.raw_last.clear();
         g.preedit_last.clear();
+        g.aux_active = false; // 【反查退格】焦点切换：server 会话已清，aux 态作废
         g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
@@ -968,6 +975,11 @@ impl HuFuTs_Impl {
                 }
                 return BOOL(0); // 其余组合键直通（Ctrl+Shift+V 剪贴板在 KeyDown 处理）
             }
+            let g_aux = self
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .aux_active;
             let will = chinese
                 && match name.as_str() {
                     // 编码中：可打印键与控制键都可能被吞
@@ -983,8 +995,14 @@ impl HuFuTs_Impl {
                         let plain_digit = n.chars().all(|c| c.is_ascii_digit());
                         !plain_digit || shift
                     }
+                    // 【反查退格 2026-09-11】反查/命令已进入但无组段
+                    //（仅 aux 提示态）时，退格=退出模式（引擎 consumed）
+                    // ——TestDown 须声明吞键，否则宿主直接吃掉退格删前
+                    // 字、反查态悬空（WPS 实测：窗口残留+后续编码不进
+                    // 反查）。有组段的反查（打字中）走 composing 分支。
+                    "backspace" => g_aux,
                     // 空闲：编码字母/分号/引号会起段
-                    "space" | "enter" | "escape" | "backspace" | "tab" => false,
+                    "space" | "enter" | "escape" | "tab" => false,
                     _ => false,
                 };
             return BOOL(will as i32);
@@ -1918,6 +1936,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         g2.composing = !state
             .get("raw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
+        // 【反查退格 2026-09-11】aux 态（反查/命令已进入、无组段）标记：
+        // TestDown 据此声明吞退格（退出模式而非漏给宿主删前字）。
+        // 引擎 state 每帧刷新；退出模式/上屏后 aux 空 → false。
+        g2.aux_active = !state
+            .get("aux")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .is_empty();
