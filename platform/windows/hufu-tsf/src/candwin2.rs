@@ -608,8 +608,13 @@ pub struct CandidateWindowV2 {
     /// 【位置滑动 2026-09-11】整句自动上屏后剩余内容跳到新光标、候选
     /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
     /// 而非一跳一跳。None=瞬移。
-    pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
-    /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 120，0=瞬跳）
+    pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant, u32)>,
+    /// 【顶功钳位许可 2026-09-12 二十四次修正】仅 C&R（顶功上屏）路径
+    /// 置 true——「字宽<编码宽」的显示回退由正向钳位钉住原地等光标。
+    /// 点击换位（SP 路径）不置=永不钳（用户实锤 75px 换位被幅度法误
+    /// 伤）。锚追回/换行/大跳即自动解除。
+    pub(crate) forward_hold: bool,
+    /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 100，0=瞬跳）
     pub(crate) pos_ms: u32,
     /// 【动效开关 2026-09-11】设置页全局：false=一切动效瞬跳
     pub(crate) anim_on: std::cell::Cell<bool>,
@@ -801,6 +806,21 @@ unsafe fn capture_screen_rgba(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>>
 }
 
 impl CandidateWindowV2 {
+    /// 【WPS 抑制放宽探针 2026-09-12】有历史位置即可先按旧位显示
+    /// （tsf.rs 首帧抑制判定用——WPS 每键重组段的即时出候选）。
+    pub(crate) fn has_sticky(&self) -> bool {
+        self.sticky_pos.is_some()
+    }
+
+    /// 【三十一次修正·sticky 近锚判定 2026-09-12】用户实锤「首键定位
+    /// 不对」：点击换位后立刻打字，布局未稳锚是旧值，即时显示贴旧位
+    /// 跳错地方；单打快打光标没动时锚≈sticky，即时显示才安全。比较
+    /// 传入锚（换算后的窗目标位）与 sticky 的距离，±24px 内算近。
+    pub(crate) fn sticky_near(&self, x: i32, y: i32) -> bool {
+        self.sticky_pos
+            .is_some_and(|(sx, sy)| (x - sx).abs() <= 24 && (y - sy).abs() <= 24)
+    }
+
     /// 兼容入口：无主顶层窗（常规宿主原行为）。
     /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
     /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
@@ -910,6 +930,7 @@ impl CandidateWindowV2 {
                 fade_ms: 0,
                 fade: None,
                 internal_rerender: false,
+            forward_hold: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -918,7 +939,7 @@ impl CandidateWindowV2 {
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
-                pos_ms: 120,
+                pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
                 fade_ms_eff: 120,
                 live_pos: std::cell::Cell::new((0, 0)),
@@ -1074,6 +1095,7 @@ impl CandidateWindowV2 {
                 fade_ms: 0,
                 fade: None,
                 internal_rerender: false,
+            forward_hold: false,
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -1082,7 +1104,7 @@ impl CandidateWindowV2 {
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
-                pos_ms: 120,
+                pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
                 fade_ms_eff: 120,
                 live_pos: std::cell::Cell::new((0, 0)),
@@ -1410,6 +1432,15 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【三十九次修正·show 级焦点守卫】本进程非前台宿主（且非同族
+        // /UWP 框架）→ 隐藏返回：失焦进程的残留会话不再显示。et.exe
+        //（表格宿主）经同目录豁免放行——前台框架窗属 wps.exe。
+        if !crate::tsf::host_may_show() {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            return;
+        }
         // 【5K/高 DPI 缩放 2026-09-06】窗口尺寸/渲染此前全部按 96-DPI 逻辑
         // 像素算——宿主 Per-Monitor V2 时这些被当物理像素用，200%/300%
         // 缩放屏上候选窗整体偏小。中心化修法：取窗口 DPI 得 scale，位图/
@@ -1468,7 +1499,7 @@ impl CandidateWindowV2 {
         self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.fade_ms_eff = (120.0 * anim_spd) as u32;
         self.size_ms = (layout_f(skin, "size_ms", 90.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        self.pos_ms = (layout_f(skin, "pos_ms", 120.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.pos_ms = (layout_f(skin, "pos_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -3211,25 +3242,51 @@ impl CandidateWindowV2 {
                         } else {
                             (r.top - height as i32 - 4).max(vy)
                         };
-                        // 【棘轮稳态 2026-09-12 八次修正·温和版】逐键
-                        // 跟随「太跳」的修法=同行棘轮吃小回缩，但全钉
-                        // 会把估算/真实交替的偏差渐进锁大（实测 51px
-                        // 漂移）——温和化：只吃 <15px 小抖（防逐键跳），
-                        // ≥15px 回退照常跟随（防偏差累积）。换行（y 下
-                        // 移>26）或新组段大位移照常跟随。
-                        let x = match self.sticky_pos {
+                        // 【删棘轮 2026-09-12 十六次修正】poll 真实帧的
+                        // 小拉回（2-15px）正是校准（est 单键误差），棘轮
+                        // 吃掉=误差攒到 15px 阶梯放行（用户实锤「跳一下
+                        // 又回来」「打多了离光标远」）。双向滑动时代位
+                        // 移全靠滑动呈现，亚像素由死区吸收。
+                        // 【二十二次修正·正向钳位 2026-09-12 用户拍板】
+                        // 单字版 dddd 顶功：第 5 键触发前 4 码上屏 1 字，
+                        // 字宽(~20px) < 编码宽(4×11=44px) → 光标真实回
+                        // 退 → 候选回跳（用户要求：不回跳，原地等光标
+                        // 过来再跟）。同行 x 回退 >6px 一律钉住原位；y
+                        // 下移（换行）不受限；est/raw 内部照常对齐真
+                        // 相——钉住的只是显示层，后续打字锚前进越过
+                        // 原位即恢复跟随（通常 2 键内）。
+                        // 【二十二次/二十四次修正·顶功钳位（许可制）】
+                        // 单字版顶功上屏「字宽<编码宽」→ 光标回退 → 候选
+                        // 回跳（用户拍板：原地等光标过来再跟）。幅度法
+                        //（≤80px）误伤 75px 的点击换位——改许可制：仅
+                        // C&R 路径置 forward_hold，SP（点击换位）永不钳。
+                        // 锚追回（x≥ox-6）/换行（y 下移）/大跳（>300px）
+                        // 时钳位条件自然失效并清除许可。
+                        // 【三十二次修正·钳位窗口 300→80px 2026-09-12】用户
+                        // 实锤「还是首键的问题，别的没问题」：点击换位左移
+                        // 100-300px 落进钳位保持窗 → 首键钉在旧位（新段第
+                        // 一键显示错误位置），后续键锚前进越过旧位才恢复。
+                        // 顶功真实回退量=编码宽-上屏字宽（4 键 44-20=24px、
+                        // 6 键 66-20=46px），80px 上限足够覆盖且不再吞点击
+                        // 换位；换行（y 下移）/大跳照旧自动释放。
+                        let hold = self.forward_hold;
+                        let (x, y) = match self.sticky_pos {
                             Some((ox, oy))
-                                if x < ox - 2 && x > ox - 15 && (y - oy).abs() <= 26 =>
+                                if hold && x < ox - 6 && x >= ox - 80 && y <= oy + 6 =>
                             {
-                                let _ = oy;
                                 (ox, y)
                             }
-                            Some((ox, oy)) if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 => {
+                            Some((ox, oy)) if (x - ox).abs() <= 6 && (y - oy).abs() <= 6 => {
                                 (ox, oy)
                             }
-                            _ => (x, y),
+                            _ => {
+                                if hold {
+                                    self.forward_hold = false;
+                                }
+                                (x, y)
+                            }
                         };
-                        x
+                        (x, y)
                     }
                     None => match self.sticky_pos {
                         Some(p) => p,
@@ -3367,24 +3424,29 @@ impl CandidateWindowV2 {
                     }
                     None => (w_out as i32, h_out as i32),
                 };
-                // 【位置滑动·只前进 2026-09-12 用户拍板】可见中且目标
-                // 位移大于 6px → 起臂位置动效（整句自动上屏：候选跟新
-                // 光标丝滑滑过去）；首显/小位移瞬移。【不要回头】仅右
-                // 移起臂滑动——左移（顶功上屏残余估算回缩/删键）瞬移
-                // 直接贴新位置：回退滑动视觉上像窗「往回走」，用户实测
-                // 嫌弃；瞬移=立即出现在光标处，干净利落。
+                // 【位置滑动·双向 2026-09-12 十六次修正】poll 真实帧把
+                // est 超前拉回（按键即时 est +11/键，110ms 后 poll 真实
+                // 校准）——左移瞬移规则把 30-40px 拉回变成可见跳变（用
+                // 户实锤「第二键跳一下」「打多了离光标远」）。改为双向
+                // 滑动：拉回也是 120ms 平滑滑——观感=恒定微调，与记事
+                // 本同稳；误差上限=一键 est 误差（1-2px），永不累积。
                 let (tx, ty) = (
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
                 );
-                // 前进=右移或下移（换行 x 回行首但 y 下移也是前进）；
-                // 只有左移且不上移才瞬移。换行滑动保留（视觉连贯）。
                 if was_visible && self.pos_ms > 0 && !self.internal_rerender {
                     let (lx, ly) = self.live_pos.get();
                     let d = (tx - lx).abs().max((ty - ly).abs());
-                    let forward = tx >= lx || ty > ly + 6;
-                    if d >= 6 && forward {
-                        self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now()));
+                    // 【统一节奏 2026-09-12 十次修正】小步进（3-6px）也
+                    // 滑动——记事本流畅的本质=每键恒一次滑动节奏一致；
+                    // 钉-跳交替=抖动感。亚像素抖由 sticky 2px 死区吃。
+                    // 【十八次修正·动态时长】快打（~100ms/键）时固定时
+                    // 长滑动被下一键打断，窗恒滞后锚（用户「跟不上」）。
+                    // 时长按距离动态：小步短滑（60ms 下限）大步快滑。
+                    // 【二十次修正 2026-09-12 用户拍板】上限 100ms。
+                    if d >= 3 {
+                        let dur = (d as u32 * 5).clamp(60, 100);
+                        self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
                         unsafe {
                             let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                         }
@@ -3393,8 +3455,8 @@ impl CandidateWindowV2 {
                     }
                 }
                 let (px, py) = match self.pos_anim {
-                    Some((f, t, t0)) => {
-                        size_ease(f, t, t0.elapsed().as_millis() as u32, self.pos_ms)
+                    Some((f, t, t0, dur)) => {
+                        size_ease(f, t, t0.elapsed().as_millis() as u32, dur)
                     }
                     None => (tx, ty),
                 };
@@ -3626,8 +3688,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         }
         // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
         // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
-        if let Some((f, t, t0)) = c.pos_anim {
-            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, c.pos_ms);
+        if let Some((f, t, t0, dur)) = c.pos_anim {
+            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
             if cur == t {
                 c.pos_anim = None;
                 c.live_pos.set(t);
