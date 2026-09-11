@@ -91,6 +91,10 @@ pub struct Shared {
     /// 皮肤 JSON 随管道全量推送（沉浸宿主逐键帧，KB 级浪费）；现仅
     /// 换肤/首推/推送失败重推时携带，server 端缓存上帧皮肤。
     pub srv_skin_ver_pushed: u64,
+    /// 【方案变更兜底 2026-09-11】poll 见过的当前方案名——server state
+    /// 常带 current_schema，比对变化即置皮肤失效（entrance_anim 等
+    /// 方案相关字段即时跟随；覆盖设置页/langbar 等非键路径切方案）。
+    pub last_schema_seen: String,
     /// 【焦点风暴去抖 2026-09-08】上次「无组段」OnSetFocus 处理时刻——
     /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
     /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
@@ -191,6 +195,7 @@ impl Shared {
             skin_ver_last: 0,
             skin_repaint: false,
             srv_skin_ver_pushed: u64::MAX,
+            last_schema_seen: String::new(),
             focus_idle_at: None,
             last_key_at: None,
             delay_show_ms: 0,
@@ -1025,6 +1030,20 @@ impl HuFuTs_Impl {
         else {
             return BOOL(0);
         };
+        // 【换方案即失效皮肤 2026-09-11】Ctrl+M 换方案后 entrance_anim
+        // 等方案相关字段变化——键路径不拉皮肤（性能），不失效则缓存
+        // 沿用到断段+2.5s（实测：单字切回整句后无入场动效，切窗才
+        // 恢复）。server 在键响应 state 里带 schema_changed 标记。
+        if state
+            .get("schema_changed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            self.shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .skin_stale = true;
+        }
         trace(&format!("pipe back consumed={consumed}"));
         if !consumed {
             // 【中英失同步自愈 2026-09-11】直通键也回填模式缓存：
@@ -2818,6 +2837,17 @@ fn poll_tick() {
             if !g.skin.is_null() {
                 g.load_skin_forced();
                 g.skin_repaint = true;
+            }
+        }
+        // 【方案变更兜底 2026-09-11】state 常带 current_schema：比对变
+        // 化即置皮肤失效——entrance_anim 等方案相关字段即时跟随
+        //（覆盖设置页/langbar 切方案；Ctrl+M 键路径另有即时标记）。
+        if let Some(cs) = state.get("current_schema").and_then(|v| v.as_str()) {
+            if !cs.is_empty() && cs != g.last_schema_seen {
+                g.last_schema_seen = cs.to_string();
+                if !g.skin.is_null() {
+                    g.skin_stale = true;
+                }
             }
         }
         if raw_empty {
