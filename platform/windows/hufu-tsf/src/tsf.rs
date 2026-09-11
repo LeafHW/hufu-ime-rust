@@ -1470,15 +1470,15 @@ impl EditSession_Impl {
                     let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 g.composition = None;
-                // 【估算链 2026-09-12】上屏文本宽度累计（Chromium 系
-                // 上屏后 GetTextExt 持续失败，失败帧锚靠推算）。
+                // 【估算链 2026-09-12·系数校准】上屏文本宽度累计（0.6
+                // 全角/0.41 半角——旧 1.0 全角偏大是「移太多」根因之一）。
                 if g.caret_est_line_h > 0 {
                     let mut w = 0.0f32;
                     for c in text.chars() {
                         w += if c.is_ascii() {
-                            g.caret_est_line_h as f32 * 0.45
+                            g.caret_est_line_h as f32 * 0.41
                         } else {
-                            g.caret_est_line_h as f32
+                            g.caret_est_line_h as f32 * 0.6
                         };
                     }
                     g.caret_est_commit_px += w as i32;
@@ -1543,6 +1543,25 @@ impl EditSession_Impl {
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
                     let set_ok = unsafe { range.SetText(ec, 0, &wstr).is_ok() };
                     if set_ok {
+                        // 【上屏瞬间真实重校 2026-09-12 六次修正】用户实锤
+                        // 长编码「syftuuu;w;jgfd」窗移过头——估算链全角系
+                        // 数（=行高）远大于真实字宽（=字号），逐次上屏偏
+                        // 差累积。EndComposition 前组段 range 仍有效（上
+                        // 屏坏态只在结束后出现）——先推选区到段尾（commit
+                        // 文字尾），再量折叠 END 矩形=上屏文字尾真实位置，
+                        // 直接重校基准；估算链仅在此查询也失败时才接管。
+                        let _ = set_selection_at_end(&ctx, ec, &range);
+                        if let Some(cl) = (unsafe { range.Clone() }).ok() {
+                            if unsafe { cl.Collapse(ec, TF_ANCHOR_END) }.is_ok() {
+                                if let Some(r) = measure_range_rect(&ctx, ec, &cl) {
+                                    g.caret = Some(r);
+                                    g.caret_est_base = Some(r);
+                                    g.caret_est_commit_px = 0;
+                                    g.caret_est_line_h = (r.bottom - r.top).max(8);
+                                    trace(&format!("C&R 重校=({},{})", r.left, r.top));
+                                }
+                            }
+                        }
                         let _ = unsafe { comp.EndComposition(ec) };
                         let _ = set_selection_at_end(&ctx, ec, &range);
                     } else {
@@ -1566,15 +1585,15 @@ impl EditSession_Impl {
                 g.composition = None;
                 // 2) 重开组段显示剩余预编辑
                 // 【估算链 2026-09-12】顶功提前上屏：commit 宽度先累计
-                //（下方 query_caret 若成功会重校清零，失败则作为推算
-                // 偏移的一部分）。
+                //（系数 0.6 全角/0.41 半角，与估算链一致；若上方瞬间重
+                // 校成功已清零，此累计只在重校失败时生效）。
                 if g.caret_est_line_h > 0 && !commit_text.is_empty() {
                     let mut w = 0.0f32;
                     for c in commit_text.chars() {
                         w += if c.is_ascii() {
-                            g.caret_est_line_h as f32 * 0.45
+                            g.caret_est_line_h as f32 * 0.41
                         } else {
-                            g.caret_est_line_h as f32
+                            g.caret_est_line_h as f32 * 0.6
                         };
                     }
                     g.caret_est_commit_px += w as i32;
@@ -1756,6 +1775,27 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
     r.ok_or_else(|| Error::from(HRESULT(-2147467259)))
 }
 
+/// 量一个 range 的屏幕矩形（双查取末次非退化，与 query_caret 同法）。
+/// 【上屏瞬间真实重校 2026-09-12】EndComposition 前组段 range 仍有效，
+/// 此时量组段文本（含刚 SetText 的上屏文字）右缘=上屏文字尾真实位置。
+fn measure_range_rect(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<RECT> {
+    let view = (unsafe { ctx.GetActiveView() }).ok()?;
+    let mut last_ok: Option<RECT> = None;
+    for _ in 0..2 {
+        let mut rect = RECT::default();
+        let mut clipped = BOOL(0);
+        if unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }.is_ok() {
+            let degenerate = rect.bottom <= rect.top
+                || rect.right < rect.left
+                || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0);
+            if !degenerate {
+                last_ok = Some(rect);
+            }
+        }
+    }
+    last_ok
+}
+
 /// 组段内文本的屏幕矩形（插入点跟随）。
 /// 量的是**组段末尾折叠后的零宽范围**=光标点本身，不是整段矩形——
 /// 整段矩形的左缘是组段起点、宽度随打字膨胀、换行时上下跳行，
@@ -1833,14 +1873,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             trace("qc: GetTextExt 失败，系统插入符兜底");
             return;
         }
-        // 【估算链兜底 2026-09-12 五次修正】Chromium 系上过屏后
-        // GetTextExt 持续失败（跨帧自愈救不了）——以最近成功锚为
-        // 基准推算当前锚：基准右缘 + 累计上屏宽 + 编码宽。任何成功
-        // 查询自动重校，点击后首个组段必然成功重校。
+        // 【估算链兜底 2026-09-12 六次修正·系数校准】Chromium 系上过
+        // 屏后 GetTextExt 持续失败（跨帧自愈救不了）——以最近成功锚
+        // （上屏瞬间重校或任何成功查询）为基准推算：基准右缘+累计上
+        // 屏宽+编码宽。系数按 Typora 实测校准：半角 11px/行高 27≈0.41；
+        // 全角=字号≈行高×0.6（旧值 1.0=行高，远大于真实字宽——用户
+        // 实锤长编码移过头）。估算仍武装 60ms 重查（持续自愈机会）。
         if let Some(base) = g.caret_est_base {
             if g.caret_est_line_h > 0 {
                 let raw_px =
-                    (g.cur_raw_len as f32 * g.caret_est_line_h as f32 * 0.45) as i32;
+                    (g.cur_raw_len as f32 * g.caret_est_line_h as f32 * 0.41) as i32;
                 let off = g.caret_est_commit_px + raw_px;
                 let est = RECT {
                     left: base.left + off,
@@ -1849,6 +1891,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     bottom: base.bottom,
                 };
                 g.caret = Some(est);
+                arm_caret_recheck_timer();
                 trace(&format!(
                     "qc: est=({},{}) off={} (commit={} raw={})",
                     est.left, est.top, off, g.caret_est_commit_px, g.cur_raw_len
