@@ -1363,6 +1363,14 @@ impl EditSession_Impl {
                 // range 自锚定，选区只在 StartPreedit 建段时设一次；
                 // Commit/上屏路径不受影响（EndComposition 后宿主按组段
                 // 末尾放置插入点）。
+                // 【打包宿主例外 2026-09-11】Win11 记事本/UWP 文本栈的
+                // 插入符只按 selection 画——段内不更新选区=光标竖线
+                // 滞留段首、编码向右生长（用户实测「光标一直在左边，
+                // 上屏一次才到最右」）。打包宿主里逐键把选区折叠到段
+                // 末（跟打器非打包应用，性能豁免不受影响）。
+                if host_is_packaged() {
+                    let _ = set_selection_at_end(&ctx, ec, &range);
+                }
                 // 【锚组段起点宿主：段内零 GetTextExt】唯虎魄跟打器组段
                 // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
                 // 只会把布局锁压力（每次×2 连查）无谓压给宿主（卡顿

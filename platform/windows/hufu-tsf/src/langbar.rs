@@ -655,43 +655,39 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         let wset: Vec<u16> = "设置…".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 1, wset.as_ptr());
         // ── owner 选择（右键菜单稳定性的核心）──
-        // 优先级：焦点上下文视图窗（weasel 生产路线）→ GetFocus（本
-        // 线程输入焦点窗）→ 自建 0×0 WS_POPUP 窗（保底）。
+        // 【自建顶层窗优先 2026-09-11 QQ 修复】上下文窗路线在 QQ 里
+        // 实测失败：上下文窗（0x60928，与回调同线程）是**宿主输入区的
+        // 子窗**——SetForegroundWindow 对子窗无效，QQ 的前台管理一
+        // 参与竞争，菜单显示瞬间失焦自动关闭（TrackPopupMenu 运行
+        // 数百 ms 后 sel=0，全程无菜单窗）。自建 0×0 顶层 TOOLWINDOW
+        // （DLL 就在宿主进程内创建）可真正接收前台——菜单全程持有
+        // 焦点不丢。msctf 指示器回调自带 SetForegroundWindow 特权，
+        // 设自己进程的顶层窗恒成功。菜单消息路由由 TrackPopupMenu
+        // 模态循环自理，owner 仅收 WM_COMMAND——DefWindowProc 足矣。
+        // 上下文窗/GetFocus 仅作建窗失败的兜底。
+        let cur_tid = windows::Win32::System::Threading::GetCurrentThreadId();
         let mut owner: windows::Win32::Foundation::HWND =
             windows::Win32::Foundation::HWND(std::ptr::null_mut());
         let mut owner_self_made = false;
-        if let Some(vw) = crate::tsf::focus_view_hwnd() {
-            if vw != 0 {
-                owner = windows::Win32::Foundation::HWND(vw as *mut _);
-                log_diag(&format!("popup owner=上下文窗 {vw:#x}"));
-            }
+        unsafe extern "system" fn menu_wnd_proc(
+            h: windows::Win32::Foundation::HWND,
+            m: u32,
+            w: windows::Win32::Foundation::WPARAM,
+            l: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            unsafe { DefWindowProcW(h, m, w, l) }
         }
-        if owner.0.is_null() {
-            let f = GetFocus();
-            if !f.0.is_null() {
-                owner = f;
-                log_diag("popup owner=GetFocus");
-            }
-        }
-        if owner.0.is_null() {
-            unsafe extern "system" fn menu_wnd_proc(
-                h: windows::Win32::Foundation::HWND,
-                m: u32,
-                w: windows::Win32::Foundation::WPARAM,
-                l: windows::Win32::Foundation::LPARAM,
-            ) -> windows::Win32::Foundation::LRESULT {
-                unsafe { DefWindowProcW(h, m, w, l) }
-            }
-            let cls: Vec<u16> = "HUFU_LB_MENU\0".encode_utf16().collect();
-            let wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(menu_wnd_proc),
-                lpszClassName: PCWSTR(cls.as_ptr()),
-                ..Default::default()
-            };
-            let _ = RegisterClassExW(&wc);
-            let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
-            owner = CreateWindowExW(
+        let cls: Vec<u16> = "HUFU_LB_MENU\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(menu_wnd_proc),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
+        if let Ok(h) = (|| unsafe {
+            CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(
                     windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0,
                 ),
@@ -702,14 +698,44 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
                 pt.y,
                 0,
                 0,
-                windows::Win32::Foundation::HWND(std::ptr::null_mut()), // 真顶层（message-only 不能 SetForegroundWindow）
+                windows::Win32::Foundation::HWND(std::ptr::null_mut()), // 真顶层（可接收前台）
                 None,
                 None,
                 None,
             )
-            .unwrap_or_default();
-            owner_self_made = true;
-            log_diag("popup owner=自建窗");
+        })() {
+            if !h.is_invalid() {
+                owner = h;
+                owner_self_made = true;
+                log_diag("popup owner=自建顶层窗");
+            }
+        }
+        // 兜底：上下文窗（同线程校验）→ GetFocus（同线程校验）
+        if owner.0.is_null() {
+            if let Some(vw) = crate::tsf::focus_view_hwnd() {
+                if vw != 0 {
+                    let h = windows::Win32::Foundation::HWND(vw as *mut _);
+                    let tid = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                        h, None,
+                    );
+                    if tid == cur_tid {
+                        owner = h;
+                        log_diag(&format!("popup owner=上下文窗(兜底) {vw:#x}"));
+                    }
+                }
+            }
+        }
+        if owner.0.is_null() {
+            let f = GetFocus();
+            if !f.0.is_null() {
+                let tid = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    f, None,
+                );
+                if tid == cur_tid {
+                    owner = f;
+                    log_diag("popup owner=GetFocus(兜底)");
+                }
+            }
         }
         if owner.is_invalid() {
             log_diag("popup: 建窗失败");
@@ -720,7 +746,8 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         // explorer 正阻塞在本 OnClick 的 COM 调用里，挂上它的输入队列
         // 后菜单模态循环拿不到输入 → TrackPopupMenu 秒回 0（菜单从未
         // 显示，日志 sel=0 铁证）。直接 SetForegroundWindow 即可——
-        // 任务栏指示牌右键时系统本来就给了显示许可。
+        // 任务栏指示牌右键时系统本来就给了显示许可（自建顶层窗可真
+        // 正接收前台，这是与子窗 owner 的本质区别）。
         let _ = SetForegroundWindow(owner);
         let sel = TrackPopupMenu(
             m,
