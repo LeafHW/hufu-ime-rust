@@ -2070,6 +2070,7 @@ impl CandidateWindowV2 {
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
+                crate::tsf::diag_note(&format!("cw2 尺寸起臂: {cur:?}→{target:?}"));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
@@ -2099,10 +2100,23 @@ impl CandidateWindowV2 {
                 self.size_anim = Some((start, target, std::time::Instant::now()));
                 self.chrome_override.set(Some(start));
                 self.scale_in.set(true);
+                crate::tsf::diag_note(&format!("cw2 入场起臂: {start:?}→{target:?}"));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
             } else if !self.scale_in.get() {
+                // 【owned 入场诊断 2026-09-11】首显却没起臂——记录条件值
+                if !was_visible {
+                    let ent = skin
+                        .pointer("/skin/entrance_anim")
+                        .or_else(|| skin.get("entrance_anim"))
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true);
+                    crate::tsf::diag_note(&format!(
+                        "cw2 首显未起臂: size_ms={} fade_ms={} entrance={} was_vis={}",
+                        self.size_ms, self.fade_ms, ent, was_visible
+                    ));
+                }
                 self.size_anim = None;
                 self.chrome_override.set(None);
             }
