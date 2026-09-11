@@ -1371,27 +1371,34 @@ impl EditSession_Impl {
                 if host_is_packaged() || focus_is_uwp_shell() {
                     let _ = set_selection_at_end(&ctx, ec, &range);
                 }
-                // 【锚组段起点宿主：段内零 GetTextExt】唯虎魄跟打器组段
-                // 位置恒定（锚 START），首键已查得锚点——段内逐键查询
-                // 只会把布局锁压力（每次×2 连查）无谓压给宿主（卡顿
-                // 根因）。跟随宿主/锚点缺失/首帧补显（懒布局首查常为
-                // 旧行框，补显必须重拿稳定值）才查。【2026-09-11 默认
-                // 跟随后】常规宿主全部逐键查询（标准 IME 行为）。
-                // 【虎魄改系统插入符跟随 2026-09-12 用户拍板】其
-                // GetTextExt 返回恒定值（窗钉死首键处，notes 实锤
-                // x 恒 120 不跟键入），而布局锁下逐键 GetTextExt 曾
-                // 卡秒级（2026-09-08 实测 5.1s）——段内改查系统插入符
-                //（GUITHREADINFO 纯 user32、零 TSF 回调、不进布局锁）：
-                // 逐键轻量跟随最新键入处；查不到（自绘光标场景）回落
-                // 原 query_caret 路径不劣化。
-                if host_caret_via_system() {
+                // 【实时光标跟随 2026-09-12 用户拍板·全局】所有应用：
+                // 光标一动窗就动，候选窗最左=实时光标最右。三处配合：
+                // ①锚点源优先系统插入符（GUITHREADINFO——系统实时维
+                // 护、零 TSF 回调、无布局锁/旧行框问题，虎魄跟打器亦
+                // 覆盖）；查不到再回落 GetTextExt（query_caret）。
+                // ②show() 锚 x=光标右缘（rect.right）。③删 x 单调锁/
+                // y 行高锁（顶功上屏 raw 等长但光标已跳——锁导致窗
+                // 不跟；旧行框问题由系统插入符从根上绕开）。
+                if host_follow_caret() || g.caret.is_none() || g.caret_force {
                     if let Some(r) = gui_caret_fallback() {
+                        g.caret_force = false;
                         g.caret = Some(r);
-                    } else if g.caret.is_none() || g.caret_force {
+                        g.line_end = unsafe {
+                            let fg = GetForegroundWindow();
+                            if fg.0.is_null() {
+                                false
+                            } else {
+                                let mut wr = RECT::default();
+                                if GetWindowRect(fg, &mut wr).is_ok() {
+                                    wr.right - r.right < 56 && r.right <= wr.right
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                    } else {
                         query_caret(&mut g, &ctx, ec);
                     }
-                } else if host_follow_caret() || g.caret.is_none() || g.caret_force {
-                    query_caret(&mut g, &ctx, ec);
                 }
                 Ok(())
             }
@@ -3280,37 +3287,15 @@ fn host_async_layout() -> bool {
 ///（虎魄 2026-09-08 移出：逐键布局查询×2 在跟打器上卡秒级，见
 /// query_caret 注释）。
 fn host_follow_caret() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        // 【默认跟随光标 2026-09-11 用户拍板】候选框最左=最新光标处。
-        // 全部宿主默认锚 END（光标）——逐键前进由位置滑动动效平滑化
-        //（旧锁组段起点是为消逐键跳变，滑动动效落地后该理由失效）。
-        // 唯一例外：虎魄跟打器——其布局锁下段内逐键 GetTextExt×2
-        // 卡秒级（2026-09-08 实测 5.1s），保持锚组段起点+段内零查询。
-        // 晴跟打Pro 原本就在跟随名单（不变）。
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| !n.contains("虎魄"))
-            .unwrap_or(true)
-    })
+    // 【恒 true 2026-09-12 用户拍板】所有应用实时跟随最新光标。旧
+    // 「虎魄」名单（锚组段起点防 GetTextExt 布局锁卡 5.1s）退役：
+    // 实时光标实现在名单为 true 时优先系统插入符（GUITHREADINFO，
+    // 零 TSF 回调不进布局锁）——虎魄跟打器（真宿主名「虎魄跟打器
+    // .exe」，此前 TigerClaw 判定是错靶）也走此轻量路径，卡顿前提
+    // 不复存在。查不到系统插入符才回落 GetTextExt。
+    true
 }
 
-/// 【虎魄系统插入符跟随 2026-09-12】TigerClaw（虎魄跟打器，exe 名
-/// TigerClaw.*——旧中文名单「虎魄」匹配不上，其 GetTextExt 一直走
-/// 常规路径但返回恒定值：窗钉死首键处不跟键入，notes 实锤 x 恒 120）。
-/// 段内改用 GUITHREADINFO 系统插入符跟随（零 TSF 回调不进布局锁，
-/// 规避 2026-09-08 的逐键 GetTextExt 卡 5.1s）。
-fn host_caret_via_system() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.to_lowercase().contains("tigerclaw"))
-            .unwrap_or(false)
-    })
-}
 
 fn scopeguard_release() -> PollGuard {
     PollGuard

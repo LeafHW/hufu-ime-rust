@@ -3132,7 +3132,7 @@ impl CandidateWindowV2 {
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let grew = raw.len() >= self.last_raw_len;
+            let _ = raw.len(); // 【锁全删 2026-09-12】grew 判定随单调锁退役
             self.last_raw_len = raw.len();
             // 拖拽松手交接：一次性消费（设 sticky 并标记组段级钉住——
             // 本组段留在松手处，hide 时解除）。
@@ -3202,40 +3202,28 @@ impl CandidateWindowV2 {
             } else {
                 match anchor {
                     Some(r) => {
-                        let x = (r.left).clamp(vx, (vx + vw - width as i32).max(vx));
+                        // 【实时光标跟随 2026-09-12 用户拍板】窗最左=
+                        // 光标最右（rect.right）——紧贴光标右侧出现。
+                        let x = (r.right).clamp(vx, (vx + vw - width as i32).max(vx));
                         let below = r.bottom + 4;
                         let y = if below + height as i32 <= vy + vh {
                             below
                         } else {
                             (r.top - height as i32 - 4).max(vy)
                         };
-                        match self.sticky_pos {
-                            Some((ox, oy)) => {
-                                // 软换行判定：x 想回退（<旧行尾）且 y 发生换行级
-                                // 变化（>26px 行高阈值）同时成立 = 新行开始——
-                                // x 回到新行行首是合法回退，禁令解除。否则单调锁
-                                // 会把换行后的 X 钉死在旧行尾（实测虎魄：换行
-                                // x 2361→1625 被拒，候选框只上下动、不横向跟到
-                                // 新行打字点）。仅 y 超阈值不构成豁免——跟打器
-                                // 滚动步进可达 29px，x 正常增长帧不得误放行。
-                                let line_broke = x < ox - 2 && (y - oy).abs() > 26;
-                                // x：正向打字拒绝回退（旧布局值）；软换行除外
-                                let x = if grew && !line_broke && x < ox - 2 {
-                                    ox
-                                } else {
-                                    x
-                                };
-                                // y：正向打字只认换行级变化（行高 ~29px，阈值 26）
-                                let y = if grew && (y - oy).abs() <= 26 { oy } else { y };
-                                // 2px 迟滞：亚像素取整误差/回流微动不搬窗
-                                if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 {
-                                    (ox, oy)
-                                } else {
-                                    (x, y)
-                                }
+                        // 【锁全删 2026-09-12】旧 x 单调锁/y 行高锁是
+                        // 为防跟打器异步布局旧行框跳动的——现锚点源已
+                        // 换系统插入符（无旧行框问题），锁反成「光标动
+                        // 了窗不动」的病根（顶功上屏 raw 等长但光标已
+                        // 跳，x 拒回退把窗钉死）。只留 2px 迟滞防亚像素
+                        // 取整微抖。
+                        let x = match self.sticky_pos {
+                            Some((ox, oy)) if (x - ox).abs() <= 2 && (y - oy).abs() <= 2 => {
+                                (ox, oy)
                             }
-                            None => (x, y),
-                        }
+                            _ => (x, y),
+                        };
+                        x
                     }
                     None => match self.sticky_pos {
                         Some(p) => p,
