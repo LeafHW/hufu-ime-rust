@@ -36,6 +36,11 @@ pub fn dispatch(
                 if host.engine.config.schema.current != schema_before {
                     let _ = host.engine.config.save(&host.config_path);
                     crate::reload_sentence_bg(true, false);
+                    // 【换方案通知 2026-09-11】键路径响应携带标记：DLL
+                    // 收到即置皮肤失效（entrance_anim 等方案相关字段跟
+                    // 方案走——不通知则缓存沿用到断段+2.5s，实测切回
+                    // 整句无入场动效）。
+                    r["state"]["schema_changed"] = serde_json::json!(true);
                 }
                 // 【重排派发去重 2026-09-08】process_key 内部已调
                 // after_ime_op（host.rs）——此处再调=每键双份 RerankJob
@@ -60,6 +65,10 @@ pub fn dispatch(
                 .unwrap_or_else(|_| serde_json::json!({}));
             // 【皮肤版本】DLL poll 比对后强制重拉（连续调参即时生效）
             state["skin_ver"] = serde_json::json!(host.skin_ver);
+            // 【方案变更兜底 2026-09-11】state 常带当前方案名：DLL poll
+            // 比对后置皮肤失效——覆盖设置页/langbar 等非键路径切方案
+            //（entrance_anim 等方案相关皮肤字段即时跟随）。
+            state["current_schema"] = serde_json::json!(host.engine.config.schema.current);
             // 【实机预览锚点】有效期内携带：DLL 预览窗弹在设置窗中心
             if let Some(((x, y), until)) = host.preview_anchor {
                 if until > std::time::Instant::now() {
