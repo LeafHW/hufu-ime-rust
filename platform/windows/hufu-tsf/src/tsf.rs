@@ -1368,7 +1368,7 @@ impl EditSession_Impl {
                 // 滞留段首、编码向右生长（用户实测「光标一直在左边，
                 // 上屏一次才到最右」）。打包宿主里逐键把选区折叠到段
                 // 末（跟打器非打包应用，性能豁免不受影响）。
-                if host_is_packaged() {
+                if host_is_packaged() || focus_is_uwp_shell() {
                     let _ = set_selection_at_end(&ctx, ec, &range);
                 }
                 // 【锚组段起点宿主：段内零 GetTextExt】唯虎魄跟打器组段
@@ -2101,7 +2101,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
-    } else if host_is_packaged() && !g.cand2_dead {
+    } else if (host_is_packaged() || focus_is_uwp_shell()) && !g.cand2_dead {
         trace("OWNED分支: 进入");
         // 【打包宿主 2026-09-11 三次尝试·ULW owned 窗】DComp 直通窗在
         // 沙盒里 D3D 初始化卡死（二次实测），本轮改用 owned 分层窗 +
@@ -2574,6 +2574,48 @@ fn host_is_packaged() -> bool {
         let l = exe.to_lowercase();
         l.contains("\\windowsapps\\") || l.contains("\\systemapps\\")
     })
+}
+
+/// 【开始菜单=explorer 承载 2026-09-11】Win11 部分版本开始菜单搜索的
+/// 输入焦点窗在 Explorer.EXE 的 ApplicationFrameWindow（UWP 壳）里，
+/// 不在 SearchHost/SystemApps——按 exe 路径判不出「打包」。此时视同
+/// 打包宿主：owned 窗（动效瞬跳，DComp 中间帧直角根除）+ 逐键选区
+/// 跟随（组段光标冻结同修）。判定=本进程 explorer 且当前线程焦点窗
+/// 的顶层类是 UWP 壳窗（文件管理器重命名=CabinetWClass 不受影响）。
+/// GetFocus/GetClassName 均为无锁 user32 调用——持 G_SHARED 锁处调用
+/// 无重入风险（focus_view_hwnd 有锁，勿用它）。
+fn focus_is_uwp_shell() -> bool {
+    static EXE_IS_EXPLORER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*EXE_IS_EXPLORER.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .map(|s| s.eq_ignore_ascii_case("explorer.exe"))
+            .unwrap_or(false)
+    }) {
+        return false;
+    }
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetClassNameW, GA_ROOT,
+        };
+        let f = GetFocus();
+        if f.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(f, GA_ROOT);
+        if root.is_invalid() {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(root, &mut buf);
+        if n <= 0 {
+            return false;
+        }
+        let cls = String::from_utf16_lossy(&buf[..n as usize]);
+        cls == "ApplicationFrameWindow" || cls == "Windows.UI.Core.CoreWindow"
+    }
 }
 
 /// 宿主是否开始菜单搜索（SearchHost.exe）。DLL 跑在宿主进程里，
