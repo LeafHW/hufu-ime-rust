@@ -52,6 +52,7 @@ impl SentenceDecoder for MockDecoder {
             word_ends: Vec::new(),
             segmented: raw.to_string(),
             partial: false,
+            implicit2: false,
         }];
         std::sync::Arc::new(hufu_engine::SentenceDecode {
             hits,

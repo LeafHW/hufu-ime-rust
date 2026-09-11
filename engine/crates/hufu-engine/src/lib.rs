@@ -55,6 +55,12 @@ pub struct SentenceHit {
     /// 不完全尾候选（尾部编码未完成，text 为 raw 的真前缀产物）：
     /// 录入中间态候选框用（正在打的词），完整态恒 false。
     pub partial: bool,
+    /// 【隐式二选 2026-09-12】路径含隐式二选段（无锁 3/4 码 rank2，
+    /// brybks 出「奴隶」类）：exact=false 会把它结构性压在 exact 组
+    ///（「奴弘」类拆分产物）之后，等 Qwen 异步重排才跳首位（用户
+    /// 实测「有一个反应时间」）。真词地板（score > -12）内的隐式
+    /// 二选初排即压前——权重高立即首选，不等 rerank。
+    pub implicit2: bool,
 }
 
 /// 整句解码结果（含提前上屏置信源）。
@@ -2601,6 +2607,15 @@ impl Engine {
             !has_locks && live_len > 0 && live_len <= self.config.input.max_code_length;
         let mut exact_cands: Vec<Candidate> = Vec::new();
         let mut inexact_cands: Vec<Candidate> = Vec::new();
+        // 【隐式二选真词压前 2026-09-12】隐式二选路径（brybks 出「奴隶」
+        // 类）exact=false 会被结构性压在 exact 组（「奴弘」类拆分产物）
+        // 之后，等 Qwen 异步重排到达才跳首位——用户实测「桎梏/奴隶/
+        // 羊羔都是重排到首位，有一个反应时间」。过真词地板（score >
+        // SENT_PHRASE_FRONT_FLOOR，与码表域短语压前同门槛）的隐式
+        // 二选词初排即压到最前：ngram 权重高立即首选（用户拍板「权重
+        // 高才首选」），不再等 rerank；不过地板的弱词（桎窖 -33 类）
+        // 照旧在 exact 组之后。
+        let mut front_cands: Vec<Candidate> = Vec::new();
         for h in rich.hits.iter() {
             if !committed_text.is_empty() && !h.text.starts_with(&committed_text) {
                 continue;
@@ -2617,7 +2632,9 @@ impl Engine {
             c.weight = h.score;
             // 【2026-09-07 用户拍板】整句候选（现切多字组合）不带注释/
             // 拆分——多音拼音串冗长无意义；注释功能仅码表域（Dict）生效。
-            if h.exact {
+            if h.implicit2 && h.score > SENT_PHRASE_FRONT_FLOOR {
+                front_cands.push(c);
+            } else if h.exact {
                 exact_cands.push(c);
             } else {
                 inexact_cands.push(c);
@@ -2628,7 +2645,8 @@ impl Engine {
             // 僻码 wvn）回退全显保持可见性
             cands = exact_cands;
         } else {
-            cands = exact_cands;
+            cands = front_cands;
+            cands.extend(exact_cands);
             cands.extend(inexact_cands);
         }
         // 完整态构成整个候选列表（partial 已全局退出，见上）。
@@ -3319,6 +3337,7 @@ mod tests {
                     word_ends: Vec::new(),
                     segmented: p.base.clone(),
                     partial: false,
+                    implicit2: false,
                 }]
             };
             std::sync::Arc::new(SentenceDecode {
@@ -3683,6 +3702,7 @@ mod tests {
                     word_ends: vec![(0, 2)],
                     segmented: "do".into(),
                     partial: false,
+                    implicit2: false,
                 }]
             } else {
                 Vec::new()
@@ -4154,9 +4174,9 @@ mod tests {
         fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
             let hits = if raw == "javz" {
                 vec![
-                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
-                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false },
-                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false },
+                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
                 ]
             } else {
                 Vec::new()
