@@ -1454,6 +1454,12 @@ impl CandidateWindowV2 {
             // 【口径 0~2 2026-09-11 用户拍板】滑条 0%–200%（0=瞬跳：
             // 时长×0=0，各动效起臂门 size_ms>0 等自然不臂）
             .clamp(0.0, 2.0) as f32;
+        // 【owned 窗动效瞬跳 2026-09-11】UWP/开始菜单的 owned-ULW 窗：
+        // 逐帧 SetWindowPos+ULW 上屏的尺寸动画中间帧在打包宿主里被
+        // 用户实测「直角遮罩」（变宽窄/变高低都有），且逐帧 resize 也
+        // 压沙盒合成——owned 窗动效一律瞬跳（无中间帧=无直角可能），
+        // 常规宿主（DComp）动效不受影响。
+        let anim_on = if self.ulw { false } else { anim_on };
         self.anim_on.set(anim_on);
         let anim_spd = if anim_on { anim_spd } else { 0.0 };
         // 【动效口径 2026-09-11 终版④】透明度渐变终判弃用（半透面板+
