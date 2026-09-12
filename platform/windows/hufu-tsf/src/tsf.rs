@@ -78,6 +78,17 @@ thread_local! {
     static TL_CAND2: std::cell::RefCell<Option<CandidateWindowV2>> =
         const { std::cell::RefCell::new(None) };
 }
+/// candwin2 动画 tick 用的线程判定（小窗线程 → tick 只管 TL 实例）。
+pub fn addword_tl_thread() -> bool {
+    crate::addword::in_window_thread()
+}
+/// TL 实例借出/归还（fade/expand tick 线程感知路径用）。
+pub fn tl_cand_take() -> Option<CandidateWindowV2> {
+    TL_CAND2.with(|t| t.borrow_mut().take())
+}
+pub fn tl_cand_put_back(c: Option<CandidateWindowV2>) {
+    TL_CAND2.with(|t| *t.borrow_mut() = c);
+}
 /// 小窗线程的候选窗渲染（懒创建；参数与 g.cand2.show 同构）。
 /// 【竖排强制 2026-09-12 十一修】词框场景强制竖排——横排宽度公式在
 /// raw 为空（词框组段无编码行）时算出的窗宽装不下「序号+词」（实测
@@ -91,10 +102,15 @@ fn tl_cand_show(
     selected: usize,
 ) {
     let mut skin_v = skin.clone();
+    // 竖排覆盖写两级（读取优先 /skin/layout/horizontal，次顶层 layout）
     if let Some(obj) = skin_v.as_object_mut() {
         obj.insert(
             "layout".into(),
             serde_json::json!({ "horizontal": false }),
+        );
+        obj.insert(
+            "skin".into(),
+            serde_json::json!({ "layout": { "horizontal": false } }),
         );
     }
     TL_CAND2.with(|t| {
@@ -1320,6 +1336,7 @@ impl HuFuTs_Impl {
             if back > 0 {
                 let _ = run_session(&self.shared, Op::DeleteBack(back as u32), None);
             }
+            trace(&format!("dispatch commit='{}'", commit));
             trace("before update_ui");
             let _ = update_ui(self.shared.clone(), commit, state);
             trace("after update_ui");
@@ -1634,10 +1651,21 @@ impl EditSession_Impl {
                         }
                     }
                     g.composition = None;
+                    // 【弹窗前清残留候选窗 2026-09-12 十四修】功能词
+                    // 上屏瞬间 update_ui 已渲染过（终极门此刻未生效——
+                    // is_open 尚为 false），主线程候选窗（「加权」候选
+                    // 残留）会一直挂到小窗关闭。自动复现实锤：弹窗后
+                    // 两个可见候选窗（记事本光标处残留 + 词框 TL）。
                     if text == "{加词}" {
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.hide();
+                        }
                         drop(g);
                         crate::addword::open();
                     } else if text == "{加权}" {
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.hide();
+                        }
                         drop(g);
                         crate::addword::open_weight();
                     } else {
@@ -2621,7 +2649,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
-    } else if (host_is_packaged() || focus_is_uwp_shell()) && !g.cand2_dead {
+        // 【小窗线程不进 OWNED 2026-09-12 十六修】自动复现决定性证据：
+        // 词框 d 时 cand2=false → 本分支在小窗线程 new_owned 主文档窗
+        // 并渲染「、」=残留窗——渲染点分流（TL）盖不到这分支内部。
+        // 小窗线程的词框渲染由下方渲染点 tl_cand_show 负责。
+    } else if (host_is_packaged() || focus_is_uwp_shell())
+        && !g.cand2_dead
+        && !crate::addword::in_window_thread()
+    {
         trace("OWNED分支: 进入");
         // 【打包宿主 2026-09-11 三次尝试·ULW owned 窗】DComp 直通窗在
         // 沙盒里 D3D 初始化卡死（二次实测），本轮改用 owned 分层窗 +
@@ -2778,8 +2813,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             // 【小窗专属候选窗·十修】小窗线程用自己的 cw2 实例（独立
             // D2D 设备）——跨线程绘制损坏根治，且是正常独立候选窗
             // （标题栏方案用户否决）。
+            // 【弹窗同帧防残留·十五修】函数头终极门检查时小窗还没开
+            //（Op::Commit 在渲染前执行）——开窗后此处照画旧候选=残留
+            // 窗挂屏（自动复现实锤）。渲染点再验一次。
             if crate::addword::in_window_thread() {
                 tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
+            } else if crate::addword::is_open() {
+                // 小窗刚开：主线程跳过渲染（旧候选不上屏）
             } else if let Some(c) = g.cand2.as_mut() {
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
@@ -2820,7 +2860,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 }
             }
         }
-        if g.cand2.is_none() {
+        if g.cand2.is_none() && !crate::addword::in_window_thread() {
             match CandidateWindowV2::new() {
                 Some(v2) => g.cand2 = Some(v2),
                 None => g.cand2_dead = true,
@@ -3060,6 +3100,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if !content_empty {
             if crate::addword::in_window_thread() {
                 tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
+            } else if crate::addword::is_open() {
+                // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
                 match g.cand2.as_mut() {
                     Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
