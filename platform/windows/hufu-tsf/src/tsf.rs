@@ -672,27 +672,18 @@ fn handle_set_focus(
     // **即时**（trace 实测 4ms）重发 OnSetFocus——此前走到「旧文档冲销」
     // 把 preedit 冲销：Excel 对 EndComposition 的反应是把当前文本定格
     // 提交（首键字母 'd' 落格上屏，第二键才重新组段）。docmgr 身份比较
-    // 无效（Excel 每次声明传新建对象，首版修复实锤未命中）。改时间窗：
-    // 组段刚建立（最近 SP: SetText <80ms）且 composing 中=宿主焦点抖动
-    //（真人点击切窗从最后一键到焦点事件物理上 >100ms）——保组段跳过
-    // 冲销与清理。真切换（>80ms 或 docmgr 判定命中）照旧冲销。
+    // 无效（Excel 每次声明传新建对象，首版修复实锤未命中）。
+    // 【时窗判定移除 2026-09-12 六修】二修的 80ms 组段时窗在五修选区
+    // 判定就位后成为冗余，且误伤真实切格：顶功上屏后立刻 Tab/回车切
+    // 格（键盘流 <80ms 完全可达）被时窗吞掉清理——组段状态滞留旧格、
+    // est 不重置，新格锚全程被 dx<-300 拦（trace 实锤 est 卡 1194 真
+    // 实 888，候选「乱跳」）。选区判定独挑大梁：抖动（选区在段内，
+    // 4ms/256ms 两型均命中）保组段；切格/切窗（选区离段）冲销。
     let same_doc = matches!((pdimfocus, pdimprevfocus), (Some(f), Some(p)) if f == p);
     if same_doc {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.composing && !g.preedit_last.is_empty() {
             trace("OnSetFocus: 同文档重复声明（宿主抖动）——保组段跳过");
-            return Ok(());
-        }
-    }
-    {
-        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if g.composing
-            && !g.preedit_last.is_empty()
-            && g
-                .compose_at
-                .is_some_and(|t| t.elapsed().as_millis() < 80)
-        {
-            trace("OnSetFocus: 组段刚建（<80ms 宿主抖动）——保组段跳过");
             return Ok(());
         }
     }
