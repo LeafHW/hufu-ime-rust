@@ -48,7 +48,8 @@ struct Skin {
 }
 static SKIN: std::sync::Mutex<Option<Skin>> = std::sync::Mutex::new(None);
 static BG_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-static HILITE_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+// 【三十四修·死代码删除】HILITE_BRUSH（建后无消费，wndproc 只用
+// BG_BRUSH）已删。
 static FONT_MAIN: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 static FONT_LABEL: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 /// 新词专用：加粗+下划线（红色由 CTLCOLOR 分段着色）
@@ -178,8 +179,6 @@ fn load_skin() {
         *FONT_NEW.lock().unwrap_or_else(|p| p.into_inner()) = Some(bold_underline.0 as usize);
         *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) =
             Some(CreateSolidBrush(COLORREF(s.bg)).0 as usize);
-        *HILITE_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(CreateSolidBrush(COLORREF(s.hilite_bg)).0 as usize);
     }
     *g = Some(s);
 }
@@ -213,10 +212,7 @@ pub fn is_open() -> bool {
     *g != 0 && unsafe { IsWindow(HWND(*g as *mut _)).as_bool() }
 }
 
-/// 小窗句柄（0=无）——dispatch 直通的前台比对用。
-pub fn current_hwnd() -> isize {
-    *ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner())
-}
+// 【三十四修·死代码删除】current_hwnd()（十二修无条件直通门后零调用）已删。
 
 /// 小窗线程 id 登记（0=无）——五修：dispatch 直通门只挡非小窗线程。
 static ADDWORD_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -239,7 +235,35 @@ static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
 fn open_common() {
     std::thread::spawn(|| unsafe {
-        // 登记小窗线程 id（五修：直通门判定用）
+        // 【B1 修复 2026-09-13 三十四修】单例复查提前到线程起手（store
+        // tid 与 TIP 自激活**之前**）：旧序 = store tid → 全套自激活 →
+        // 临界区才发现窗口已在 → return——连按 /jc 每次 (a) B 线程
+        // 覆盖 ADDWORD_TID 后悬空（真小窗线程 A 的键被直通门判为主
+        // 线程，词框打不了中文）(b) 泄漏一套 TIP 激活+键 sink 不回收。
+        // 新序：先查窗口在不在——在=前置复用直接退出（零登记零激活）。
+        {
+            let mut guard = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
+            if *guard != 0 && IsWindow(HWND(*guard as *mut _)).as_bool() {
+                let existing = HWND(*guard as *mut _);
+                let _ = ShowWindow(existing, SW_SHOWNORMAL);
+                let _ = SetForegroundWindow(existing);
+                crate::tsf::trace("addword 窗口已在，前置复用（早退）");
+                return;
+            }
+            if let Ok(existing) = FindWindowW(CLASS, None) {
+                let mut pid: u32 = 0;
+                let _ = GetWindowThreadProcessId(existing, Some(&mut pid));
+                if pid == std::process::id() && !existing.0.is_null() {
+                    *guard = existing.0 as isize;
+                    let _ = ShowWindow(existing, SW_SHOWNORMAL);
+                    let _ = SetForegroundWindow(existing);
+                    crate::tsf::trace("addword 窗口已在（FindWindow 早退复用）");
+                    return;
+                }
+            }
+        }
+        // 登记小窗线程 id（五修：直通门判定用）——已确认本线程要建窗
+        //（B1：窗口存活场景不会走到这里，tid 不会被覆盖悬挂）
         #[link(name = "kernel32")]
         unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
         ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
@@ -839,7 +863,7 @@ unsafe fn draw_items(
             y + (line_h - lem - 4),
             lw,
             lem + 4,
-            if is_new { base } else { base },
+            base, // 【三十四修】旧 `if is_new { base } else { base }` 恒等式简化
         );
         set_item_font(hl, true);
         ITEMS
@@ -870,8 +894,8 @@ unsafe fn draw_items(
             .unwrap_or_else(|p| p.into_inner())
             .push(wd.0 as isize);
         x += need;
-        cid += 2;
-        let _ = cid;
+        // 【三十四修·死代码删除】cid 计数器（`cid += 2; let _ = cid;`
+        // 只写不读）已删。
     }
     y + line_h
 }

@@ -56,7 +56,7 @@ static CHINESE: AtomicBool = AtomicBool::new(true);
 thread_local! {
     static SINK: std::cell::RefCell<Option<SendSink>> =
         const { std::cell::RefCell::new(None) };
-    static SINK_PTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // 【三十四修·死代码删除】SINK_PTR（只写不读的诊断残留）已删。
 }
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(0x4846_0001);
 
@@ -241,10 +241,7 @@ pub fn uninstall_compartments() {
     COMP_THREAD.with(|c| *c.borrow_mut() = None);
 }
 
-/// 把当前模式推进本线程 compartment（OPENCLOSE + CONV）。
-pub fn push_compartments() {
-    push_thread_compartment();
-}
+// 【三十四修·死代码删除】push_compartments()（零调用的转发壳）已删。
 
 /// 线程 compartment（本线程上下文；set_mode/Activate 在 UI 线程调）
 fn push_thread_compartment() {
@@ -413,14 +410,8 @@ impl HuFuLangBar {
     }
 }
 
-impl Drop for HuFuLangBar {
-    fn drop(&mut self) {
-        // 【HICON 泄漏修复 2026-09-11】new() 每次 Activate 建两个
-        // HICON，RemoveItem 后 COM 引用清零触发 Drop。图标已改为
-        // GetIcon 现画（句柄交给系统托管，本侧无存货可销毁），Drop
-        // 不再持有句柄——只保留注释防止回头加字段忘记销毁。
-    }
-}
+// 【三十四修·死代码删除】impl Drop for HuFuLangBar 空壳已删（图标改
+// GetIcon 现画后无字段可清理，注释归档：防回头加字段忘记销毁）。
 
 /// ITfSource：msctf（语言栏宿主）会对项 AdviseSink(ITfLangBarItemSink)。
 /// 不实现该接口时 AddItem 在真实宿主里可能 E_FAIL。【weasel 同款】
@@ -435,9 +426,7 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
             .and_then(|u| u.cast().ok())
             .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
         let cookie = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed);
-        let ptr = punk.map(|u| u as *const _ as usize).unwrap_or(0);
         SINK.with(|s| *s.borrow_mut() = Some(SendSink(sink)));
-        SINK_PTR.with(|c| c.set(ptr));
         Ok(cookie)
     }
 
@@ -445,7 +434,6 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
         // 单槽模型：本线程槽即本项的 sink（一项一线程一槽，换项时
         // 新项的 AdviseSink 会重写槽），清槽即可。
         SINK.with(|s| *s.borrow_mut() = None);
-        SINK_PTR.with(|c| c.set(0));
         Ok(())
     }
 }
@@ -592,7 +580,13 @@ pub fn refresh_schemas_cache() {
     let snd = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
         .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()));
     if let Some(on) = snd {
-        SND_ON.store(on, Ordering::Relaxed);
+        let was = SND_ON.swap(on, Ordering::Relaxed);
+        // 【B6 修复 2026-09-13 三十四修】开关状态翻转时清本进程音效
+        // 缓存——invalidate() 原本零调用，wav/开关变更后旧缓存永不
+        // 失效（换音效文件+重开开关也放旧音）。
+        if was != on {
+            crate::sound::invalidate();
+        }
     }
 }
 
@@ -793,10 +787,8 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
 /// 音效开关快照（音效状态轮询同步；右键菜单勾选显示用）
 static SND_ON: AtomicBool = AtomicBool::new(false);
 
-/// poll 线程同步音效开关快照
-pub fn refresh_sound_snapshot(on: bool) {
-    SND_ON.store(on, Ordering::Relaxed);
-}
+// 【三十四修·死代码删除】refresh_sound_snapshot()（零调用——SND_ON
+// 实际由 refresh_schemas_cache 内 sound_state 管道同步）已删。
 
 impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     fn OnClick(
@@ -853,7 +845,10 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
 
     fn OnMenuSelect(&self, id: u32) -> Result<()> {
         if id == 1 {
-            let _ = crate::ipc::call(&serde_json::json!({"op": "settings"}));
+            // 【B5 修复 2026-09-13 三十四修】改异步：本回调跑在 msctf/
+            // 宿主线程，同步管道（最多 2s 超时）会拖住菜单协议宿主
+            // （explorer）——与 popup_menu 全异步原则对齐。
+            pipe_async(serde_json::json!({"op": "settings"}));
         }
         Ok(())
     }

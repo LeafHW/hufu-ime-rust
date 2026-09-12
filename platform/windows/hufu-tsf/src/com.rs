@@ -182,36 +182,9 @@ pub fn register_server() -> HRESULT {
     HRESULT(0)
 }
 
-/// 语言档案 GUID（供安装器使用；DLL 内不再做 COM 调用——
-/// 真实安装器模式：安装 EXE 在 COM 初始化后调 ITfInputProcessorProfiles）。
-pub fn register_profile() {
-    unsafe {
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let need_uninit = hr.is_ok();
-        let res: Result<()> = (|| {
-            let profiles: ITfInputProcessorProfiles =
-                CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
-            profiles.Register(&crate::CLSID_HUFU_TSF)?;
-            let clsid = crate::CLSID_HUFU_TSF;
-            let langid = 0x0804u16; // zh-CN
-            let desc: Vec<u16> = "HuFu 虎符输入法".encode_utf16().chain([0]).collect();
-            profiles.AddLanguageProfile(&clsid, langid, &PROFILE_GUID, &desc, &[], 0)?;
-            profiles.EnableLanguageProfile(
-                &clsid,
-                langid,
-                &PROFILE_GUID,
-                windows::Win32::Foundation::BOOL(1),
-            )?;
-            Ok(())
-        })();
-        if let Err(e) = res {
-            eprintln!("hufu-tsf: 语言档案注册失败 {e:?}");
-        }
-        if need_uninit {
-            CoUninitialize();
-        }
-    }
-}
+// 【三十四修·死代码删除】register_profile()（注释自称供安装器，但安装
+// EXE 是独立进程不会链 DLL 内部符号；全库零调用）已删。语言档案注册
+// 由 install.ps1 的注册表直写完成。
 
 pub fn unregister_server() -> HRESULT {
     let _ = reg_del_tree(&format!(r"Software\Classes\CLSID\{CLSID_STR}"));
