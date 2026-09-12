@@ -1691,7 +1691,20 @@ impl EditSession_Impl {
                 // 估算链输入：当前编码长（失败帧推算用）。
                 g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
                 g.seg_key_index += 1;
-                if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
+                // 【四十三修·最终：虎魄 v1.5.2 对照实锤】v1.5.2 二进制
+                // 实测（11/12 键有候选/0 跳/全窗内）：其段首 GetTextExt
+                // 同样首次失败，但 35ms 补显帧重跑 SetPreedit→query_caret
+                // （+36ms Qt 布局收敛）成功立锚。1.5.3+ 的 L1694 分支
+                // （fallback→est_step）把补显帧的 query_caret 截胡——
+                // est 无基线早退=零查询零重试=锚永远立不起来（「首段
+                // 无候选、上屏一次才有」根因）。虎魄 qie 恢复 v1.5.2
+                // 语义：无锚→query_caret（补显重试链通）；有锚→恒定
+                // 保持（段内零查询零估算，1.5.2 同款）。
+                if exe_is_hupo_qie() {
+                    if g.caret.is_none() {
+                        query_caret(&mut g, &ctx, ec);
+                    }
+                } else if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
                     if let Some(mut r) = gui_caret_fallback() {
                         hupo_clamp(&mut r);
                                         g.caret = Some(r);
@@ -2325,31 +2338,59 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【虎魄跟打器 2026-09-12】其 GetTextExt 返回恒定值（上屏后窗不
     // 跳），改查系统插入符（GUITHREADINFO，零 TSF 回调不进布局锁）
     // ——上屏后插入符在上屏文字尾，恰好是「上屏动一次」要的位置。
+    // 【四十三修·虎魄回归 v1.5.2 行为】用户实锤：1.5.2 及更早虎魄完全
+    // 正常（无偏上/无超窗/无首两键缺候选），1.5.3+ 的 est 估算链在
+    // 虎魄（PyQt5 自绘 PromptCanvas 打字区，无系统 caret、GetTextExt
+    // 恒定值）上全是负资产：恒定值污染 est 基线（偏上/没跟随）、est
+    // 累计出窗（超窗）、probe 段首两键 suppress（首两键无候选）。
+    // v1.5.2 模式=「锚组段起点 + 段内零查询零估算」：段首键查一次
+    // （虎魄 GetTextExt 恒定值恰好=段起点，歪打正着），段内候选钉住
+    // 不动，上屏后新段再查一次（「上屏动一次」）。晴/pain 的 est 链
+    // 现状良好（用户只夸晴），分家保留。
     if exe_is_hupo() {
-        if let Some(mut r) = gui_caret_fallback() {
-            hupo_clamp(&mut r);
-            g.caret = Some(r);
-            return;
+        if exe_is_hupo_qie() {
+            // 虎魄专属：段首/无锚才查一次，段内恒定保持
+            if g.seg_key_index <= 1 || g.caret.is_none() {
+                // 【四十三修补】不设 hupo_single_probe——段首保持 v1.5.2
+                // 的默认双查（39 修单查在 Qt 布局锁下首查失败即弃，
+                // g.caret=None 永久 suppress=「首两键无候选」根因）。
+                // 落标准链：首键自由采纳段首值；est 基线照建但段内
+                // 不步进（下分支直接 return，est 状态无人读=无害）
+            } else {
+                // 段内：1.5.2 行为——保持段首锚恒定，零查询零估算。
+                // clamp 兜底仅防段首值本身出窗（横向滚动场景）。
+                let mut r = g.caret.unwrap();
+                hupo_clamp(&mut r);
+                g.caret = Some(r);
+                return;
+            }
+        } else {
+            // 晴/pain：保持现状（fallback → est → probe 链）
+            if let Some(mut r) = gui_caret_fallback() {
+                hupo_clamp(&mut r);
+                g.caret = Some(r);
+                return;
+            }
+            // 【三十四修·段内零查询】fallback 结构性 None（自绘 caret）时
+            // 不再跌进标准链（GetTextExt 布局锁 30-60ms）。est 有基线→纯
+            // 内存步进；无基线（段首）→标准链**单查**建一次基线。
+            // 【三十八修补·虎魄步宽校准】三十八修的 unit_w 采样在标准链
+            // 重校点——旧条件 est 有基线即 return，虎魄段首建过基线后
+            // 永远不再进标准链 → unit_w 恒 0，est_step 恒用 0.41×行高
+            //（虎魄 caret 高 140 → 57px/键，乱飞没修掉，用户实锤"还是
+            // 一样"）。改：步宽未校准时（unit_w<=0.5），段内前两键各走
+            // 一次单查（probe）——第一键建基线，第二键与第一键的位移差
+            // =干净步宽样本（同段真实位置，无上屏估算污染）；此后段内
+            // 全程零查询。跟打器每段头最多 2×30-60ms（段首节奏间隙内）。
+            if g.caret_est_line_h > 0
+                && !(g.caret_est_x == 0 && g.caret_est_y == 0)
+                && !(g.caret_est_unit_w <= 0.5 && g.seg_key_index <= 2)
+            {
+                est_step(g);
+                return;
+            }
+            g.hupo_single_probe = true; // 本次允许单查（GetTextExt 循环里消费）
         }
-        // 【三十四修·段内零查询】fallback 结构性 None（自绘 caret）时
-        // 不再跌进标准链（GetTextExt 布局锁 30-60ms）。est 有基线→纯
-        // 内存步进；无基线（段首）→标准链**单查**建一次基线。
-        // 【三十八修补·虎魄步宽校准】三十八修的 unit_w 采样在标准链
-        // 重校点——旧条件 est 有基线即 return，虎魄段首建过基线后
-        // 永远不再进标准链 → unit_w 恒 0，est_step 恒用 0.41×行高
-        //（虎魄 caret 高 140 → 57px/键，乱飞没修掉，用户实锤"还是
-        // 一样"）。改：步宽未校准时（unit_w<=0.5），段内前两键各走
-        // 一次单查（probe）——第一键建基线，第二键与第一键的位移差
-        // =干净步宽样本（同段真实位置，无上屏估算污染）；此后段内
-        // 全程零查询。跟打器每段头最多 2×30-60ms（段首节奏间隙内）。
-        if g.caret_est_line_h > 0
-            && !(g.caret_est_x == 0 && g.caret_est_y == 0)
-            && !(g.caret_est_unit_w <= 0.5 && g.seg_key_index <= 2)
-        {
-            est_step(g);
-            return;
-        }
-        g.hupo_single_probe = true; // 本次允许单查（GetTextExt 循环里消费）
     }
     // 【单源锚·连续性过滤 2026-09-12 十三次修正】不再在入口拦查询
     //（曾因差一错误第二键未被拦——用户实锤「第二个编码跳一下」）。
@@ -2390,7 +2431,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     //（dx>80 / dy>60，留真换行余量）判旧布局——弃 selection 落标
     // 准链（GetTextExt 段末→est 兜底），并补观测行（旧路径静默无
     // trace 是本案诊断盲区）。
-    if g.seg_key_index == 1 {
+    // 【四十三修补·虎魄豁免】Qt ACP 宿主上 selection 的 GetTextExt
+    // 会先触发一次内部布局调用——虎魄（PyQt5）上它失败且疑似连坐
+    // 后续组段主查询（43c 实测 START 双查也被拒）。v1.5.2 该宿主
+    // 段首直查组段 START 恒成功——虎魄跳过 selection 优先。
+    if g.seg_key_index == 1 && !exe_is_hupo_qie() {
         if let Some(r) = selection_caret_rect(ctx, ec) {
             let est_ok = g.caret_est_line_h > 0
                 && !(g.caret_est_x == 0 && g.caret_est_y == 0);
@@ -2430,7 +2475,17 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【锚=编码尾 2026-09-12 定版】逐键跟随：SetSelection 已把选区推
     // 到段末，collapse END 量的就是编码尾（Chromium 按 selection 返回
     // ——实测键 u→r 锚 184→195 前进；EDIT 型返回 END 折叠点同义）。
-    if unsafe { caret.Collapse(ec, TF_ANCHOR_END) }.is_err() {
+    // 【四十三修补·虎魄锚 START】v1.5.2 虎魄=锚组段起点
+    //（Collapse START），查询恒成功；1.5.3+ 全局改 END 后 Qt 桥对
+    // END 折叠点直接拒绝（qc: GetTextExt 失败→suppress→首键无候选，
+    // 用户实锤 1.5.2 无此症状）。虎魄 qie 复刻 v1.5.2 用 START——
+    // 段内恒定模式下 START≈END 语义（段首一查钉住）。
+    let anchor = if exe_is_hupo_qie() {
+        TF_ANCHOR_START
+    } else {
+        TF_ANCHOR_END
+    };
+    if unsafe { caret.Collapse(ec, anchor) }.is_err() {
         trace("qc: Collapse 失败");
         return;
     }
@@ -2537,7 +2592,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 键实录）：武装 60ms 重查定时器，到点强制 update_ui 重跑本键
         // SetPreedit（CARET_TIMER 已置 caret_force），跨帧拿到新锚。
         // 【三十四修】跟打器豁免同上。
-        if !exe_is_hupo() {
+        // 【四十三修补】虎魄例外：43 修模式=段首一查+段内零查询，段首
+        // 失败必须能重查（一次性 60ms 非性能负担；段内不进标准链，
+        // timer 链不会在段内反复触发）。晴/pain 维持豁免。
+        if !exe_is_hupo() || exe_is_hupo_qie() {
             arm_caret_recheck_timer();
         }
         trace("qc: GetTextExt 失败，武装 60ms 跨帧重查");
@@ -4627,6 +4685,23 @@ fn exe_is_hupo() -> bool {
             });
         }
         false
+    })
+}
+
+/// 【四十三修·虎魄分家】虎魄严格判定：est 估算链（步宽校准/折行/
+/// probe）只服务晴/pain（GetTextExt 步进可靠的宿主）；虎魄
+/// （PyQt5 自绘 PromptCanvas，GetTextExt 恒定值+无系统 caret）
+/// 回归 v1.5.2 的「锚组段起点+段内恒定零查询」模式。外部名单
+///（typing-trainers.txt）的新跟打器默认走 est 链（晴模式），名字
+/// 含"虎魄"才走恒定模式。
+fn exe_is_hupo_qie() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(|n| n.to_lowercase().contains("虎魄"))
+            .unwrap_or(false)
     })
 }
 
