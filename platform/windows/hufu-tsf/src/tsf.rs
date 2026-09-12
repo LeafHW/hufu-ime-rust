@@ -813,6 +813,15 @@ fn handle_set_focus(
         }
         g.raw_last.clear();
         g.preedit_last.clear();
+        // 【切格 est 重置 2026-09-12 七修】切格/切窗后旧格 est 全失效
+        //（滞留会让新格首键用旧位置显示，且新格真实帧被 dx 上限拦
+        // 截——trace 实锤 est 卡旧格 1080 真实 1896，dx=816 >800 拦
+        // 死，候选乱跳到差值缩小才放行）。归零=强制靠真实帧/系统插
+        // 入符重建基线；est_line_h 保留（行高学习值可跨格复用）。
+        g.caret_est_x = 0;
+        g.caret_est_y = 0;
+        g.caret_est_wrap = 0;
+        g.caret_est_last_raw = 0;
         g.aux_active = false; // 【反查退格】焦点切换：server 会话已清，aux 态作废
         g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
         if let Some(c) = g.cand2.as_mut() {
@@ -1937,6 +1946,11 @@ fn est_step(g: &mut Shared) {
     if g.caret_est_line_h <= 0 {
         return;
     }
+    // 【est 未初始化跳过 2026-09-12 七修】切格后 est 归零无基线——
+    // 无基线步进只会从 (0,0) 累积出屏外垃圾坐标，等真实帧建基线。
+    if g.caret_est_x == 0 && g.caret_est_y == 0 {
+        return;
+    }
     let lh = g.caret_est_line_h;
     let d = g.cur_raw_len as i32 - g.caret_est_last_raw;
     let step = (d as f32 * lh as f32 * 0.41) as i32;
@@ -2153,7 +2167,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 发行版效果好」——发行版靠 est 折行周期性侥幸自救）。跟打器
     // GetTextExt 步进全程可靠（trace 全段证明），虎魄 dx 下限放宽到
     // -3000：真实优先，死锁解。
-    if g.seg_key_index >= 2 && g.caret_est_line_h > 0 {
+    if g.seg_key_index >= 2
+        && g.caret_est_line_h > 0
+        && !(g.caret_est_x == 0 && g.caret_est_y == 0)
+    {
+        // 【est 未初始化跳过 2026-09-12 七修】切格后 est 已归零（无基
+        // 线哨兵 x=y=0）——此时无锚可拦：真实帧直接采纳（否则拿 (0,0)
+        // 比较出的巨大 dx 会拦死真实帧，锁死无效 est）。
         let dy = rect.top - g.caret_est_y;
         let dx = rect.left - g.caret_est_x;
         let lo = if exe_is_hupo() { -3000 } else { -300 };
