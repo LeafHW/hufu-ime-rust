@@ -396,7 +396,45 @@ fn open_common() {
         *guard = hwnd.0 as isize;
         drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        // 【六修 2026-09-12】AttachThreadInput 抢前台——此前裸调
+        // SetForegroundWindow 被系统前台锁定静默拒绝（跨线程输入队
+        // 列：小窗线程≠前台线程），trace 实锤小窗从未成为前台：键全
+        // 被 QQ 主线程 sink 吃掉、组段建在主文档 (1085,793)（「原光
+        // 标残留+词框只有字母」的真正根因）。AttachThreadInput 共享
+        // 前台线程的输入状态后 SetForegroundWindow/SetFocus 才有效；
+        // 抢完立刻脱离 attach（短窗，不留输入耦合）。附带诊断：前台
+        // 抢夺成败打 trace。
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
+        }
+        let fg = GetForegroundWindow();
+        let fg_tid = if fg.0.is_null() {
+            0
+        } else {
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(fg, Some(&mut pid))
+        };
+        let my_tid = GetCurrentThreadId();
+        let mut fg_ok = SetForegroundWindow(hwnd).as_bool();
+        if !fg_ok && fg_tid != 0 && fg_tid != my_tid {
+            let at = AttachThreadInput(my_tid, fg_tid, 1);
+            fg_ok = SetForegroundWindow(hwnd).as_bool();
+            // 焦点直接给词框（attach 态下跨线程 SetFocus 有效）
+            if let Some(fe) = FIRST_EDIT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(|h| HWND(h as *mut _))
+            {
+                let _ = SetFocus(fe);
+            }
+            let _ = AttachThreadInput(my_tid, fg_tid, 0);
+            crate::tsf::trace(&format!(
+                "addword: attach={at} 前台抢夺={fg_ok}（fg_tid={fg_tid}）"
+            ));
+        } else {
+            crate::tsf::trace(&format!("addword: 前台抢夺={fg_ok}（直接成功）"));
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if !IsDialogMessageW(hwnd, &mut msg).as_bool() {
