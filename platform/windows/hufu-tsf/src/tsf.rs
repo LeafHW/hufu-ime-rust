@@ -991,14 +991,17 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
-        // 【加词/加权小窗直通 2026-09-12 v1.5.3+】/jc /jq 弹窗打开期间，
-        // 本（主文档）sink 的按键全部直通——小窗有独立的输入上下文，
-        // 此前激活间隙里键被主文档组段吃掉：原光标处 preedit 残留 +
-        // 候选框弹在主文档旁而词框打不进字（trace 实锤 SP 组段坐标在
-        // 主文档）。小窗键由其自身线程的 EDIT 处理（词框 IME 组段/
-        // 编码框免 IME 直通），与本 sink 无关。
+        // 【加词/加权小窗直通 2026-09-12 v1.5.3+】/jc /jq 弹窗打开且
+        // **处于前台**时，本（主文档）sink 的按键直通——小窗有独立
+        // 输入上下文，激活间隙里键被主文档组段吃掉（原光标 preedit
+        // 残留+候选框弹主文档旁，trace 实锤）。仅前台判定：用户点回
+        // 主文档（或小窗销毁）立即恢复本 sink 正常处理——首版无前台
+        // 判定，小窗开着就永久直通，用户实测「打不了中文了」。
         if crate::addword::is_open() {
-            return BOOL(0);
+            let fg = unsafe { GetForegroundWindow() };
+            if fg.0 as isize == crate::addword::current_hwnd() {
+                return BOOL(0);
+            }
         }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。

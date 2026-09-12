@@ -213,6 +213,11 @@ pub fn is_open() -> bool {
     *g != 0 && unsafe { IsWindow(HWND(*g as *mut _)).as_bool() }
 }
 
+/// 小窗句柄（0=无）——dispatch 直通的前台比对用。
+pub fn current_hwnd() -> isize {
+    *ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
 /// 结束清零。短锁使用，绝不跨消息循环持有。
 static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
