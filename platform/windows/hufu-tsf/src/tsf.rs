@@ -964,9 +964,9 @@ fn handle_set_focus(
         g.caret_est_y = 0;
         g.caret_est_wrap = 0;
         g.caret_est_last_raw = 0;
-        // 【三十八修】切窗重置校准采样点（新窗新样本）；unit_w 保留
-        //（同宿主的字宽是稳定属性，跨窗可复用）。
-        g.caret_est_cal_raw = 0;
+        // 【三十八修补】切窗重置校准采样点为哨兵；unit_w 保留（同宿主
+        // 的字宽是稳定属性，跨窗可复用）。
+        g.caret_est_cal_raw = -1;
         g.caret_est_cal_x = 0;
         g.aux_active = false; // 【反查退格】焦点切换：server 会话已清，aux 态作废
         g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
@@ -1835,10 +1835,11 @@ impl EditSession_Impl {
                     g.caret_est_x += w as i32;
                     g.caret_est_wrap += w as i32;
                     g.caret_est_last_raw = 0;
-                    // 【三十八修】上屏重置步宽校准采样点（跨段样本无
-                    // 意义——新段 raw 从 0 起）。
-                    g.caret_est_cal_raw = 0;
-                    g.caret_est_cal_x = g.caret_est_x;
+                    // 【三十八修补】上屏重置步宽校准采样点为哨兵
+                    //（est 前移是估算值不能当基准，下个重校只记点
+                    // 不出样本——新段需要两个真实重校才有干净样本）。
+                    g.caret_est_cal_raw = -1;
+                    g.caret_est_cal_x = 0;
                 }
                 Ok(())
             }
@@ -1950,9 +1951,10 @@ impl EditSession_Impl {
                     g.caret_est_x += w as i32;
                     g.caret_est_wrap += w as i32;
                     g.caret_est_last_raw = 0;
-                    // 【三十八修】C&R 上屏同样重置校准采样点（新段 raw 起点）。
-                    g.caret_est_cal_raw = 0;
-                    g.caret_est_cal_x = g.caret_est_x;
+                    // 【三十八修补】C&R 上屏同样重置为哨兵（估算值不作
+                    // 采样基准）。
+                    g.caret_est_cal_raw = -1;
+                    g.caret_est_cal_x = 0;
                 }
                 let cc: ITfContextComposition = ctx.cast()?;
                 let range: ITfRange = selection_range(&ctx, ec)?;
@@ -2310,9 +2312,19 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         }
         // 【三十四修·段内零查询】fallback 结构性 None（自绘 caret）时
         // 不再跌进标准链（GetTextExt 布局锁 30-60ms）。est 有基线→纯
-        // 内存步进；无基线（段首）→标准链**单查**建一次基线（首键一次
-        // 慢可忍，后续每键 0 查询）。
-        if g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0) {
+        // 内存步进；无基线（段首）→标准链**单查**建一次基线。
+        // 【三十八修补·虎魄步宽校准】三十八修的 unit_w 采样在标准链
+        // 重校点——旧条件 est 有基线即 return，虎魄段首建过基线后
+        // 永远不再进标准链 → unit_w 恒 0，est_step 恒用 0.41×行高
+        //（虎魄 caret 高 140 → 57px/键，乱飞没修掉，用户实锤"还是
+        // 一样"）。改：步宽未校准时（unit_w<=0.5），段内前两键各走
+        // 一次单查（probe）——第一键建基线，第二键与第一键的位移差
+        // =干净步宽样本（同段真实位置，无上屏估算污染）；此后段内
+        // 全程零查询。跟打器每段头最多 2×30-60ms（段首节奏间隙内）。
+        if g.caret_est_line_h > 0
+            && !(g.caret_est_x == 0 && g.caret_est_y == 0)
+            && !(g.caret_est_unit_w <= 0.5 && g.seg_key_index <= 2)
+        {
             est_step(g);
             return;
         }
@@ -2552,9 +2564,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     //（同段内，键数差 d>0）的 (Δx/Δraw)=真实每键宽样本，指数平滑进
     // unit_w（样本须同向合理：0<Δx<400，防上屏换行/点击混入）。上
     // 屏/断段已重置 cal 点，跨段样本不会进来。首个样本直接采用。
+    // 【三十八修补】cal_raw=-1=哨兵（上屏 est 前移是估算值，不能当
+    // 采样基准——否则首个样本混入 commit 估宽误差，虎魄 lh=140 时
+    // 污染 ~70px/字）。哨兵帧只重记采样点不出样本。
     {
         let draw = g.cur_raw_len as i32 - g.caret_est_cal_raw;
-        if draw > 0 {
+        if draw > 0 && g.caret_est_cal_raw >= 0 {
             let dxr = (rect.left - g.caret_est_cal_x) as f32;
             if dxr > 0.0 && dxr < 400.0 {
                 let sample = dxr / draw as f32;
