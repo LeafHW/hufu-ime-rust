@@ -1077,17 +1077,16 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
-        // 【加词/加权小窗直通 2026-09-12 五修】小窗前台时只挡**非小窗
-        // 线程**的 dispatch（主线程的键进主文档会建残留组段——trace
-        // 实锤原光标 preedit 残留）；**小窗线程自己的 dispatch 放行**
-        // ——那是词框键入的正常处理路径。二版门无差别直通，把词框的
-        // 键也放行了（用户实测「只有字母上屏」「别的输入法能打虎符
-        // 不行」——通道是通的，HuFu 自己的门拦死了自己）。
+        // 【加词/加权小窗直通 2026-09-12 十二修】小窗打开期间，主线程
+        // 的 dispatch **无条件直通**——五版门带前台比对（fg==小窗才
+        // 挡），实测存在缝隙：attach 脱离后前台闪回宿主窗/cuas 把词
+        // 框键入分给主线程 sink 的瞬间，主线程照样 dispatch→server→
+        // 主文档组段+候选（用户实拍「、」窗在 VSCode 光标处完整动画
+        // ——与词框候选并存成两个）。用户明确只要主焦点（词框）一个
+        // 候选窗。小窗期间主文档打字诉求≈0（操作就在小窗），关窗立即
+        // 恢复。小窗线程自己的 dispatch 不受此门影响（键入正常）。
         if crate::addword::is_open() && !crate::addword::in_window_thread() {
-            let fg = unsafe { GetForegroundWindow() };
-            if fg.0 as isize == crate::addword::current_hwnd() {
-                return BOOL(0);
-            }
+            return BOOL(0);
         }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
