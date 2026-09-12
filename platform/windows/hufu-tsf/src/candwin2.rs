@@ -3710,6 +3710,20 @@ impl CandidateWindowV2 {
             let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
     }
+
+    /// 【焦点重置·三十三修】跨焦点（切窗口/切应用）时抹掉候选窗的全部
+    /// 位置记忆——用户定稿「换到另一个窗口就是一个新的开始，上一个窗
+    /// 口的遗留残留记忆全部抹掉」。hide() 故意保留 sticky_pos（同窗口
+    /// 组段间位置连续性），焦点切换时必须清：新窗口锚点全空时若沿用
+    /// 旧 sticky，候选会出现在上一个窗口的位置（「从别的窗口过来」
+    /// 观感的实体根源）。cloaked_streak 同清（cloak 计数不跨焦点）。
+    pub fn focus_reset(&mut self) {
+        self.sticky_pos = None;
+        self.sticky_drag = false;
+        self.pos_anim = None;
+        self.last_raw_len = usize::MAX;
+        self.cloaked_streak = 0;
+    }
 }
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
