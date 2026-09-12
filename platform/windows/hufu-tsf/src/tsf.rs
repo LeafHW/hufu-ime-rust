@@ -2488,8 +2488,20 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.wps_settle_start = None;
             // 【三十九次修正·补】断段主动收窗：上屏后窗残留可见会在
             // 下一格首键采样期遮挡/冒充新 show（旧位残留），立即收。
-            if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+            // 【单按反查键修复·三十修】aux 提示帧（反查刚进入：raw 空
+            // 但 aux="·〔反查〕"）跳过——hide 是 PostMessage 异步，排
+            // 在同帧 show 之后被处理会把刚显示的反查提示窗吃掉（用户
+            // 实锤「单按一次 ` 没有反查，必须有编码才出来」；探针实锤
+            // show 已调、窗不可见）。
+            let aux_now = !state
+                .get("aux")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty();
+            if !aux_now {
+                if let Some(c) = g.cand2.as_mut() {
+                    c.hide();
+                }
             }
         }
         // raw 变化 → 记时刻（候选延时显示用）
