@@ -68,6 +68,43 @@ pub fn set_thread_tm(tm: ITfThreadMgr, tid: u32) {
     THREAD_TID.with(|t| t.set(tid));
 }
 
+// 【小窗线程专属候选窗 2026-09-12 十修】加词/加权小窗线程自己 new
+// 一个 CandidateWindowV2（独立 D2D 设备/上下文/窗口），渲染/隐藏全在
+// 本线程——主线程的 g.cand2 跨线程绘制=未定义行为（八修实锤：候选窗
+// 画出进程内存碎片「权重（留空=1000）」）。实例随线程 TLS 存活，小窗
+// 销毁线程退出自动回收。标题栏方案（八/九修）用户否决（丑），此为
+// 正常独立候选窗形态。
+thread_local! {
+    static TL_CAND2: std::cell::RefCell<Option<CandidateWindowV2>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// 小窗线程的候选窗渲染（懒创建；参数与 g.cand2.show 同构）。
+fn tl_cand_show(
+    cands: &[(String, String)],
+    raw: &str,
+    skin: &serde_json::Value,
+    anchor: Option<&RECT>,
+    selected: usize,
+) {
+    TL_CAND2.with(|t| {
+        let mut slot = t.borrow_mut();
+        if slot.is_none() {
+            *slot = CandidateWindowV2::new();
+        }
+        if let Some(c) = slot.as_mut() {
+            c.show(cands, raw, skin, anchor, selected);
+        }
+    });
+}
+/// 小窗线程的候选窗隐藏。
+fn tl_cand_hide() {
+    TL_CAND2.with(|t| {
+        if let Some(c) = t.borrow_mut().as_mut() {
+            c.hide();
+        }
+    });
+}
+
 /// 线程共享状态（文本服务 / 按键接收 / 编辑会话共用）。
 pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
@@ -1595,7 +1632,7 @@ impl EditSession_Impl {
                         crate::addword::open_weight();
                     } else {
                         if crate::addword::in_window_thread() {
-                            crate::addword::show_cands(&[], "", 0);
+                            tl_cand_hide();
                         } else if let Some(c) = g.cand2.as_mut() {
                             c.hide();
                         }
@@ -2706,7 +2743,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let suppress_caret = caret.is_none() && !is_preview && !sh;
         if suppress_caret {
             if crate::addword::in_window_thread() {
-                crate::addword::show_cands(&[], "", 0);
+                tl_cand_hide();
             } else if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
@@ -2717,11 +2754,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         let content_empty = cands.is_empty() && raw.is_empty();
         if !content_empty {
-            // 【词框候选内嵌·九修】小窗线程：候选画标题栏（GDI 同线程，
-            // 跨线程 D2D 损坏根治——八修实锤内存碎片）；组段更新在下方
-            // 照常走（八修 return 跳过组段=「候选都没了」的教训）。
+            // 【小窗专属候选窗·十修】小窗线程用自己的 cw2 实例（独立
+            // D2D 设备）——跨线程绘制损坏根治，且是正常独立候选窗
+            // （标题栏方案用户否决）。
             if crate::addword::in_window_thread() {
-                crate::addword::show_cands(&cands, &raw, sel);
+                tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
             } else if let Some(c) = g.cand2.as_mut() {
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
@@ -3001,7 +3038,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let content_empty = cands.is_empty() && raw.is_empty();
         if !content_empty {
             if crate::addword::in_window_thread() {
-                crate::addword::show_cands(&cands, &raw, sel);
+                tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
             } else {
                 match g.cand2.as_mut() {
                     Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
@@ -3921,7 +3958,11 @@ fn poll_tick() {
                         })
                     });
                     let caret2 = anchor_rect.or(caret);
-                    c.show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                    if crate::addword::in_window_thread() {
+                        tl_cand_show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                    } else if let Some(c) = g.cand2.as_mut() {
+                        c.show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                    }
                     g.last_show = Some((cands, raw2, sel));
                 }
             }
