@@ -340,6 +340,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
+            crate::tsf::trace(&format!("IH收 hwnd={:?}", hwnd.0 as isize));
             // 【退场动画退役 2026-09-11】用户判「调不好」：淡出与半透明
             // 面板天然相克（渐隐帧压在新上屏文字上=变黑/重叠，连打时
             // 收放循环=一闪一闪）。收窗一律即时隐藏——干净利落。
@@ -3620,7 +3621,12 @@ impl CandidateWindowV2 {
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
         // 排队，焦点回调返回后由消息循环执行隐藏。
         unsafe {
-            let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
+            let ok = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
+            crate::tsf::trace(&format!(
+                "hide Post hwnd={:?} ok={:?}",
+                self.hwnd.0 as isize,
+                ok
+            ));
         }
     }
 }
@@ -3647,6 +3653,24 @@ const FADE_FLOOR: f64 = 0.6;
 /// 状态 →（fade 活跃时）按当前 alpha 复渲染 → 尺寸插值步进（只 SWP
 /// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
 unsafe fn fade_tick_shared(hwnd: HWND) {
+    // 【动画 tick 线程感知 2026-09-12 十七修】残留窗最终根因：小窗
+    // 线程 TL 候选的入场动画 tick 走到这里 → take g.cand2（主线程窗）
+    // → c.show 跨线程 SWP_SHOWWINDOW 把刚 SW_HIDE 的主文档窗复活+
+    // 渲染（「、」残留窗、跨线程 D2D 损坏内容）。小窗线程：动画全
+    // 跳过（词框候选不需要花式动画——tl_cand_show 首帧已完整渲染）。
+    if crate::tsf::addword_tl_thread() {
+        let mut tl = crate::tsf::tl_cand_take();
+        if let Some(c) = tl.as_mut() {
+            c.fade = None;
+            c.size_anim = None;
+            c.pos_anim = None;
+            c.chrome_override.set(None);
+            c.scale_in.set(false);
+        }
+        crate::tsf::tl_cand_put_back(tl);
+        let _ = KillTimer(hwnd, FADE_TIMER_ID);
+        return;
+    }
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
         return;
     };
@@ -3752,6 +3776,11 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
 /// （take/put-back，锁外渲染）。
 unsafe fn expand_tick_shared(hwnd: HWND) {
     if !IsWindowVisible(hwnd).as_bool() {
+        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+        return;
+    }
+    // 【动画 tick 线程感知·十七修】同 fade_tick：小窗线程不碰 g.cand2
+    if crate::tsf::addword_tl_thread() {
         let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
         return;
     }
