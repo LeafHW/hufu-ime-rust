@@ -959,8 +959,21 @@ fn handle_set_focus(
         g.caret_est_last_raw = 0;
         g.aux_active = false; // 【反查退格】焦点切换：server 会话已清，aux 态作废
         g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
+        // 【焦点重置·三十三修】跨焦点抹掉全部位置/渲染记忆——「换窗口
+        // =全新开始，无任何遗留」（用户定稿）。g.caret 不清则新窗口
+        // 首帧锚点查询失败时候选出现在上一个窗口的光标位置；last_show
+        // 不清则失焦瞬间的动画 tick 会用旧窗口内容复渲染（复活窗）。
+        g.caret = None;
+        g.last_show = None;
+        g.cand_sig_last = String::new();
+        g.suppress_pending = false;
+        g.caret_force = false;
+        g.cand_shown_this_segment = false;
+        g.wps_caret_prev = None;
+        g.wps_settle_start = None;
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
+            c.focus_reset();
         }
         trace("foc: E hide完");
         // 【UWP 失焦收候选】沉浸式宿主（Store/UWP/搜索框）的候选由
