@@ -2469,7 +2469,15 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 比较出的巨大 dx 会拦死真实帧，锁死无效 est）。
         let dy = rect.top - g.caret_est_y;
         let dx = rect.left - g.caret_est_x;
-        let lo = if exe_is_hupo() { -3000 } else { -300 };
+        // 【三十六修·QQ est 超前死锁 2026-09-13】用户实锤 QQ 里
+        // 「Ctrl+A 删光重打，候选偏到别处」：已上屏文本的删除不经组段，
+        // est 不可见（est 只跟组段 raw_len），新段继承旧段终点；真实
+        // 光标已大幅回退（trace：est=2425 vs raw=1991，dx=-434）——原
+        // 非跟打器阈 -300 把真实帧拦死，est 永不重校=死锁错位。真实帧
+        // 是事实、est 是猜测：非跟打器阈放宽到 -1500（拦真疯狂值
+        // 错窗口级），QQ 类删除/重排场景 dx∈[-1500,0] 的真实帧一律
+        // 放行重校。跟打器维持 -3000（文档坐标特性）。
+        let lo = if exe_is_hupo() { -3000 } else { -1500 };
         if dx > 800 || dx < lo || dy < -300 {
             trace(&format!(
                 "qc: 极端锚拦截 dx={} dy={}（est 步进）",
