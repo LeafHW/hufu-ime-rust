@@ -3307,20 +3307,65 @@ impl CandidateWindowV2 {
                         None => {
                             crate::tsf::diag_note("cw2 anchor+sticky 双缺，退到焦点窗口定位");
                             let fg = GetForegroundWindow();
-                            if fg.0.is_null() {
-                                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                                return;
-                            }
-                            let mut fr = RECT {
-                                left: 0,
-                                top: 0,
-                                right: 0,
-                                bottom: 0,
+                            // 【任务栏误兜底修复 2026-09-12】开始菜单打开时
+                            // 前台偶发是任务栏（Shell_TrayWnd）——拿它的 rect
+                            // 兜底=候选贴到任务栏底（用户实锤「候选出现在
+                            // 任务栏最下面」）。任务栏不可作定位锚：退屏幕
+                            // 安全位（工作区上部，与 SearchHost (12,12) 兜底
+                            // 同族——可见、不压任务栏）。
+                            let mut cls: [u16; 64] = [0; 64];
+                            let fg_ok = unsafe {
+                                !fg.0.is_null() && {
+                                    #[link(name = "user32")]
+                                    unsafe extern "system" {
+                                        fn GetClassNameW(hwnd: HWND, s: *mut u16, c: i32) -> i32;
+                                    }
+                                    GetClassNameW(fg, cls.as_mut_ptr(), 64) > 0
+                                }
                             };
-                            let _ = GetWindowRect(fg, &mut fr);
-                            let x = fr.left + 16;
-                            let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
-                            (x, below.max(fr.top))
+                            let name: String = if fg_ok {
+                                String::from_utf16_lossy(
+                                    &cls[..cls.iter().position(|&c| c == 0).unwrap_or(64)],
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let tray_like = !fg_ok
+                                || name.contains("Shell_TrayWnd")
+                                || name.contains("TrayShowDesktop")
+                                || name.contains("Shell_SecondaryTrayWnd");
+                            if tray_like {
+                                let mut wa = RECT {
+                                    left: 0,
+                                    top: 0,
+                                    right: 0,
+                                    bottom: 0,
+                                };
+                                unsafe {
+                                    #[link(name = "user32")]
+                                    unsafe extern "system" {
+                                        fn SystemParametersInfoW(
+                                            a: u32,
+                                            b: u32,
+                                            p: *mut core::ffi::c_void,
+                                            f: u32,
+                                        ) -> i32;
+                                    }
+                                    SystemParametersInfoW(0x30, 0, &mut wa as *mut RECT as *mut core::ffi::c_void, 0);
+                                }
+                                (wa.left + 16, wa.top + 16)
+                            } else {
+                                let mut fr = RECT {
+                                    left: 0,
+                                    top: 0,
+                                    right: 0,
+                                    bottom: 0,
+                                };
+                                let _ = GetWindowRect(fg, &mut fr);
+                                let x = fr.left + 16;
+                                let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
+                                (x, below.max(fr.top))
+                            }
                         }
                     },
                 }
@@ -3673,11 +3718,18 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 【动效接上·二十一修】词框候选的动画 tick 完整步进（与主线程
         // 路径同款：渐隐/拉伸/滑动），操作对象=TL 实例（本线程的窗），
         // 绝不碰 g.cand2（那是主线程窗——跨线程 show=残留窗根因）。
-        // last_show 数据复用 g 的（小窗线程 update_ui 写的就是词框候选）。
-        let Some(gsh) = crate::tsf::G_SHARED.get() else {
-            return;
+        // 【Shared 实例修正·二十六修】小窗线程 TIP 的 Shared 进不了
+        // G_SHARED（只留主线程首激活）——优先取线程局部登记的小窗
+        // Shared，last_show/skin 才是词框渲染写的那些。
+        let shared = match crate::tsf::tl_shared() {
+            Some(s) => s,
+            None => {
+                let Some(gsh) = crate::tsf::G_SHARED.get() else {
+                    return;
+                };
+                gsh.0.clone()
+            }
         };
-        let shared = gsh.0.clone();
         let (mut tl, last, skin) = {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -3865,10 +3917,16 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
     }
     // 【动画 tick 线程感知·二十一修】小窗线程：注释展开同样走 TL 实例
     if crate::tsf::addword_tl_thread() {
-        let Some(gsh) = crate::tsf::G_SHARED.get() else {
-            return;
+        // 【Shared 实例修正·二十六修】同 fade tick：优先小窗线程的 Shared
+        let shared = match crate::tsf::tl_shared() {
+            Some(s) => s,
+            None => {
+                let Some(gsh) = crate::tsf::G_SHARED.get() else {
+                    return;
+                };
+                gsh.0.clone()
+            }
         };
-        let shared = gsh.0.clone();
         let (mut tl, last, skin) = {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             (

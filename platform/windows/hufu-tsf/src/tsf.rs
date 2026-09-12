@@ -19,6 +19,30 @@ pub struct GShared(pub SharedRef);
 unsafe impl Send for GShared {}
 unsafe impl Sync for GShared {}
 pub static G_SHARED: std::sync::OnceLock<GShared> = std::sync::OnceLock::new();
+// 【小窗线程 Shared 登记·二十六修】G_SHARED 只留首激活（主线程）锚
+// 不漂移（刻意设计）——但小窗线程 TIP 自建实例的 Shared 因此进不了
+// G_SHARED：词框渲染写的是自己的 Shared（B），而动画 tick
+// （fade_tick_shared TL 分支）读 G_SHARED（A）→ last_show 永远读不
+// 到 → 动画 armed 后一步不跑（实锤：写last g=1f4e2088ff8 读
+// tick g=1f4cce3b378 两个实例）。小窗线程 Activate set 失败时把
+// 自己的 Shared 登记线程局部，TL tick 优先取它。
+thread_local! {
+    static TL_SHARED: std::cell::RefCell<Option<SharedRef>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// 小窗线程的 Shared（渲染点登记；主线程/未登记返回 None）。
+pub fn tl_shared() -> Option<SharedRef> {
+    TL_SHARED.with(|s| s.borrow().clone())
+}
+/// 【当前 update_ui 的 Shared·二十六修】update_ui 入口登记（线程局部），
+/// tl_cand_show 经此取「本渲染写 last_show 的那把锁」登记进 TL_SHARED。
+thread_local! {
+    static CUR_UPDATE_SHARED: std::cell::RefCell<Option<SharedRef>> =
+        const { std::cell::RefCell::new(None) };
+}
+fn tl_shared_of_update() -> Option<SharedRef> {
+    CUR_UPDATE_SHARED.with(|s| s.borrow().clone())
+}
 
 // 【重入死锁防护 2026-09-09】DoEditSession 全程持 shared 锁并跨越
 // SetText/GetTextExt 等宿主回调；宿主在回调链内泵消息+焦点变化会
@@ -102,13 +126,29 @@ fn tl_cand_show(
     anchor: Option<&RECT>,
     selected: usize,
 ) {
+    // 【Shared 同源登记·二十六修】Activate 登记不可靠（词框 sink 实例
+    // 与显式激活实例不是同一个，tick 读到的 g 与渲染写 last 的 g 不同
+    // ——实锤三个实例地址）。渲染点直接登记本渲染的 Shared：tick 取
+    // tl_shared 永远与最近一次写 last_show 同源。
+    if let Some(sh) = tl_shared_of_update() {
+        TL_SHARED.with(|s| *s.borrow_mut() = Some(sh));
+    }
     TL_CAND2.with(|t| {
         let mut slot = t.borrow_mut();
         if slot.is_none() {
             *slot = CandidateWindowV2::new();
         }
         if let Some(c) = slot.as_mut() {
-            c.show(cands, raw, skin, anchor, selected);
+            // 【词框入场动效·二十五修】用户实锤「弹窗候选没动效」——
+            // 入场长大（首出 72%→100%）被 server 注入的 entrance_anim
+            // 门控（仅整句方案 true），词框方案非整句→首显直接全尺寸。
+            // 词框候选窗是刻意弹出的新窗，与主窗观感对齐：本地注入
+            // entrance_anim=true（只影响 TL 实例，不动皮肤文件/设置）。
+            let mut skin_tl = skin.clone();
+            if let Some(obj) = skin_tl.as_object_mut() {
+                obj.insert("entrance_anim".to_string(), serde_json::json!(true));
+            }
+            c.show(cands, raw, &skin_tl, anchor, selected);
         }
     });
 }
@@ -435,7 +475,11 @@ impl HuFuTs {
 impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
     fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         // 【滚轮缩放候选框】进程级锚点：candwin2 窗口过程静态重入用
-        let _ = G_SHARED.set(GShared(self.shared.clone()));
+        // 【二十六修】set 失败=非首激活（G_SHARED 已有主线程的）：
+        // 小窗线程场景把自己的 Shared 登记线程局部（TL tick 用）。
+        if G_SHARED.set(GShared(self.shared.clone())).is_err() {
+            TL_SHARED.with(|s| *s.borrow_mut() = Some(self.shared.clone()));
+        }
         let tm = ptim
             .cloned()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
@@ -1640,22 +1684,36 @@ impl EditSession_Impl {
                         }
                     }
                     g.composition = None;
-                    // 【弹窗前清残留候选窗 2026-09-12 十四修】功能词
+                    // 【弹窗前清残留 2026-09-12 十四修】功能词
                     // 上屏瞬间 update_ui 已渲染过（终极门此刻未生效——
                     // is_open 尚为 false），主线程候选窗（「加权」候选
                     // 残留）会一直挂到小窗关闭。自动复现实锤：弹窗后
                     // 两个可见候选窗（记事本光标处残留 + 词框 TL）。
+                    // 【清 last_show 2026-09-12 二十三修】用户实锤「词框
+                    // 打什么编码都显示「、」」——弹窗前的旧候选帧
+                    //（「/」的顿号候选）留在 g.last_show，词框首键前
+                    // tick 复渲染拿它=「、」闪显/污染。弹窗即清。
                     if text == "{加词}" {
+                        g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
                             c.hide();
                         }
                         drop(g);
+                        // 【server 会话重置 2026-09-12 二十四修】用户实锤
+                        // 「词框打什么编码都显示「、」」——主文档与词框共用
+                        // 同一个 server session，「/」的顿号候选（或探测键
+                        // 残留 raw，实测 w 首帧返回「得」「怎么」=d 残留）
+                        // 会污染词框首键候选。弹窗即 reset，词框从干净
+                        // 会话开始。
+                        let _ = crate::ipc::call(&serde_json::json!({"op": "reset"}));
                         crate::addword::open();
                     } else if text == "{加权}" {
+                        g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
                             c.hide();
                         }
                         drop(g);
+                        let _ = crate::ipc::call(&serde_json::json!({"op": "reset"}));
                         crate::addword::open_weight();
                     } else {
                         if crate::addword::in_window_thread() {
@@ -2368,6 +2426,10 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 
 /// 引擎结果 → 组段与候选窗更新。
 fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    // 【Shared 同源登记·二十六修】本帧渲染（含 tl_cand_show 写
+    // last_show）用的锁登记线程局部——fade/expand tick 的 TL 分支取
+    // tl_shared() 与本帧同源，动画数据不再读错实例。
+    CUR_UPDATE_SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
     // 【函数级终极门 2026-09-12 十三修】小窗打开期间，主线程的
     // update_ui **一律直接返回**——十二修只堵 dispatch 入口，实测
     // 「、」候选窗仍在 VSCode 光标处出现（渲染入口比预想多：timer/
@@ -2821,6 +2883,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
+            if crate::addword::in_window_thread() {
+                crate::tsf::trace("写last@渲染点1");
+            }
         } else if crate::addword::in_window_thread() {
             // 【选词收窗·十八修】词框选字/删空后候选应收起（与主文档
             // 行为对齐——深度回归实测选 2 后候选窗滞留）
@@ -4017,24 +4082,45 @@ fn poll_tick() {
                 let skin = g.skin.clone();
                 let caret = g.caret;
                 let anchor = state.get("preview_anchor").cloned();
-                if let (Some(c), Some((cands, raw2, sel))) = (g.cand2.as_mut(), last) {
-                    let anchor_rect = anchor.and_then(|a| {
-                        let x = a.get("x").and_then(|v| v.as_i64())? as i32;
-                        let y = a.get("y").and_then(|v| v.as_i64())? as i32;
-                        Some(RECT {
-                            left: x,
-                            top: y,
-                            right: x,
-                            bottom: y,
-                        })
-                    });
-                    let caret2 = anchor_rect.or(caret);
+                // 【小窗线程 last_show 丢失修复·二十六修】原条件只匹配
+                // g.cand2（主线程窗）——小窗线程 g.cand2=None → if 不进
+                // → take 出的 last 直接丢弃 → g.last_show 永久为 None →
+                // 动画 tick（fade_tick TL 分支靠 last_show 复渲染）断粮，
+                // 入场/尺寸动画 armed 后一步不跑（实锤 tick取
+                // last_some=false）。先放回再按线程取窗。
+                if let Some((cands, raw2, sel)) = last {
                     if crate::addword::in_window_thread() {
+                        let anchor_rect = anchor.and_then(|a| {
+                            let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                            let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                            Some(RECT {
+                                left: x,
+                                top: y,
+                                right: x,
+                                bottom: y,
+                            })
+                        });
+                        let caret2 = anchor_rect.or(caret);
                         tl_cand_show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                        g.last_show = Some((cands, raw2, sel));
                     } else if let Some(c) = g.cand2.as_mut() {
+                        let anchor_rect = anchor.and_then(|a| {
+                            let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                            let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                            Some(RECT {
+                                left: x,
+                                top: y,
+                                right: x,
+                                bottom: y,
+                            })
+                        });
+                        let caret2 = anchor_rect.or(caret);
                         c.show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                        g.last_show = Some((cands, raw2, sel));
+                    } else {
+                        // 无可用窗：放回，别丢动画数据
+                        g.last_show = Some((cands, raw2, sel));
                     }
-                    g.last_show = Some((cands, raw2, sel));
                 }
             }
             return;
