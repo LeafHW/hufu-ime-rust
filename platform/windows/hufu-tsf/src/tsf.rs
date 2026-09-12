@@ -2317,10 +2317,34 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 同源病，Store 记事本实测反查首键 Δy 偏 31~90px）。selection 是
     // 空 range（纯插入点），宿主即时给出真实位置；查不出（退化/拒绝）
     // 落组段 GetTextExt 老链，行为不劣于旧版。
+    // 【三十七修·段首 selection 连续性过滤 2026-09-13】QQ 实锤：上屏
+    // 后新段首键的 selection 矩形仍为旧布局值（上屏 14 全角字真实光
+    // 标 +210px，selection 报上屏前位置——候选钉在旧位落后 210px，
+    // 用户「偏到别处」）。est 基线在上屏帧已 +commit 宽（Op::Commit/
+    // C&R 的 est 前移），比异步旧布局 selection 可信：两者差超阈
+    //（dx>80 / dy>60，留真换行余量）判旧布局——弃 selection 落标
+    // 准链（GetTextExt 段末→est 兜底），并补观测行（旧路径静默无
+    // trace 是本案诊断盲区）。
     if g.seg_key_index == 1 {
         if let Some(r) = selection_caret_rect(ctx, ec) {
-            g.caret = Some(r);
-            return;
+            let est_ok = g.caret_est_line_h > 0
+                && !(g.caret_est_x == 0 && g.caret_est_y == 0);
+            if est_ok {
+                let dx = r.left - g.caret_est_x;
+                let dy = r.top - g.caret_est_y;
+                if dx.abs() > 80 || dy.abs() > 60 {
+                    trace(&format!(
+                        "qc: seg1 selection 旧布局拦截 dx={} dy={}（走标准链）",
+                        dx, dy
+                    ));
+                } else {
+                    g.caret = Some(r);
+                    return;
+                }
+            } else {
+                g.caret = Some(r);
+                return;
+            }
         }
     }
     // 【锚=编码尾 2026-09-12 定版】逐键跟随：SetSelection 已把选区推
