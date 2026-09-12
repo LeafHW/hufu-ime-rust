@@ -4183,6 +4183,47 @@ pub(crate) fn host_may_show() -> bool {
     }
 }
 
+/// 【三十五修】收起本进程候选窗（含沉浸式两通道）——供两处复用：
+/// ①前台他进程残留兜底（原内联逻辑抽出）；②非输入宿主进程的闪窗
+/// 收拾（双实例闪窗修复）。锁外执行 COM/IPC（EndUIElement 回宿主、
+/// cand_hide 走同步管道——持 shared 锁做会卡键路径，参照
+/// ui_element_show 的先 drop 再调姿势）。
+fn poll_collapse_stale(shared: &SharedRef) {
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut any_visible = false;
+    if let Some(c) = g.cand2.as_mut() {
+        any_visible |= c.is_visible();
+        c.hide();
+    }
+    let ui_active = g.cand_ui_active;
+    let ui_host_draws = g.cand_ui_host_draws;
+    let ui_id = g.cand_ui_id;
+    let mgr = if ui_active && ui_host_draws {
+        g.thread_mgr.as_ref().and_then(|tm| {
+            tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>()
+                .ok()
+        })
+    } else {
+        None
+    };
+    g.cand_ui_active = false;
+    drop(g);
+    if ui_active {
+        if ui_host_draws {
+            if let Some(m) = &mgr {
+                let _ = unsafe { m.EndUIElement(ui_id) };
+                diag_note("poll: 收起 → EndUIElement");
+            }
+        } else {
+            let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
+            diag_note("poll: 收起 → srv cand_hide");
+        }
+    }
+    if any_visible {
+        diag_note("poll: 非输入宿主/前台他进程 → 收起候选窗（三十五修）");
+    }
+}
+
 fn poll_tick() {
     // 重入保护（update_ui 过程中不会再泵本消息，双保险）
     if POLL_IN_TICK.swap(1, AtomicOrdering::Relaxed) != 0 {
@@ -4204,14 +4245,28 @@ fn poll_tick() {
     // 打字期全静默把补显也饿死（用户实测「没有候选框」：连打期间
     // suppress_pending 永不消费）。豁免：待补显/上屏重查/皮肤重绘
     // 在身时 poll 必须跑（跑一拍消费掉标志后恢复静默）。
+    // 【三十五修·双实例闪窗 2026-09-13】WPS 全家（wps.exe 框架/文字 +
+    // et.exe 表格）各自加载本 DLL、各持候选窗。同应用族豁免
+    // （fg_same_app_dir）保住了"打字进程不被误收"，但**另一个进程**
+    // 的 poll 仍按全局候选签名刷窗/补显——两窗各画各的锚在屏上交替
+    // 闪（用户实锤"WPS 里候选位置很跳"；trace：前台 wps.exe 打字时
+    // et.exe 同时跑「首帧抑制→补显」46 次/刷新 140 次）。刷窗资格
+    // 收紧为"本进程是当前输入宿主"：近 2s 有键或组段活着；否则只收
+    // 残留窗后跳过本拍（残留收起复用下方兜底逻辑，抽 poll_collapse）。
     {
         let sp = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
         if let Some(s) = sp {
             let g = s.lock().unwrap_or_else(|e| e.into_inner());
             let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
             let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
+            let mine = g.last_key_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                || g.composition.is_some();
             drop(g);
             if busy && !owes {
+                return;
+            }
+            if !mine {
+                poll_collapse_stale(&s);
                 return;
             }
         }
@@ -4253,48 +4308,8 @@ fn poll_tick() {
                 && !(host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid))
                 && !fg_same_app_dir(pid)
             {
-                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                let mut any_visible = false;
-                if let Some(c) = g.cand2.as_mut() {
-                    any_visible |= c.is_visible();
-                    c.hide();
-                }
-                // 沉浸式宿主两通道也收尾（UWP/搜索框走 UIElement 或
-                // server 代画——只藏 cand2 不够，残留正是缺这段）：
-                // 【锁外 IPC 2026-09-11】EndUIElement（COM，宿主回调）
-                // 与 ipc::call（同步管道，server 卡住最坏秒级）都在持
-                // shared 锁内做——server 一卡，键路径抢锁失败=宿主 UI
-                // 卡死（对照 ui_element_show 先 drop(g) 的正确姿势）。
-                // 先摘参数、放锁、锁外执行。
-                let ui_active = g.cand_ui_active;
-                let ui_host_draws = g.cand_ui_host_draws;
-                let ui_id = g.cand_ui_id;
-                let mgr = if ui_active && ui_host_draws {
-                    g.thread_mgr.as_ref().and_then(|tm| {
-                        tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>()
-                            .ok()
-                    })
-                } else {
-                    None
-                };
-                g.cand_ui_active = false;
-                drop(g);
-                if ui_active {
-                    if ui_host_draws {
-                        if let Some(mgr) = &mgr {
-                            let _ = unsafe { mgr.EndUIElement(ui_id) };
-                            diag_note("poll: 前台他进程 → EndUIElement（残留兜底）");
-                        }
-                    } else {
-                        let _ = crate::ipc::call(&serde_json::json!({"op": "cand_hide"}));
-                        diag_note("poll: 前台他进程 → srv cand_hide（残留兜底）");
-                    }
-                }
-                if any_visible {
-                    diag_note(&format!(
-                        "poll: 前台他进程(pid={pid}) → 收起候选窗（残留兜底）"
-                    ));
-                }
+                // 【三十五修】内联收窗逻辑抽出为 poll_collapse_stale 复用
+                poll_collapse_stale(&shared);
                 return;
             }
         }
