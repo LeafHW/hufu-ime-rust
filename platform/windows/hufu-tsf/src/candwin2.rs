@@ -3602,6 +3602,23 @@ impl CandidateWindowV2 {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
+    /// 【词框候选零动效 2026-09-12 二十修】清全部动效状态并停表——
+    /// 窗口保持当前完整帧。动效 tick（fade/expand WM_TIMER）在加词
+    /// 小窗线程接不上泵（fade_tick_shared 的 TL 分流只清不做），入场
+    /// 长大/渐隐会卡在中间态（椭圆/胶囊形/滞留）——词框候选全禁，
+    /// show() 首帧即完整渲染，稳定可靠。
+    pub fn kill_animations(&mut self) {
+        self.fade = None;
+        self.size_anim = None;
+        self.pos_anim = None;
+        self.chrome_override.set(None);
+        self.scale_in.set(false);
+        unsafe {
+            let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
+            let _ = KillTimer(self.hwnd, EXPAND_TIMER_ID);
+        }
+    }
+
     pub fn hide(&mut self) {
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。

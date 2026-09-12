@@ -119,12 +119,17 @@ fn tl_cand_show(
             *slot = CandidateWindowV2::new();
         }
         if let Some(c) = slot.as_mut() {
+            // 【零动效·二十修】前后双杀：先清（show 首帧不带动画起点
+            // ——小尺寸/透明起始帧），show 武装后再杀+停表。
+            c.kill_animations();
             c.show(cands, raw, &skin_v, anchor, selected);
+            c.kill_animations();
         }
     });
 }
 /// 小窗线程的候选窗隐藏。
 fn tl_cand_hide() {
+    crate::tsf::trace("tl_cand_hide 调用");
     TL_CAND2.with(|t| {
         if let Some(c) = t.borrow_mut().as_mut() {
             c.hide();
@@ -2629,6 +2634,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.load_skin();
     }
     if cands.is_empty() && raw.is_empty() {
+        // 【空帧收 TL·十九修】词框选字/删空后的空帧走这里（深度回归
+        // 实测选 2 后候选滞留——此处 hide 无 TL 分流）。cand_ui_active
+        // 的小窗线程不会真（词框渲染不走 UIElement），不早退。
+        if crate::addword::in_window_thread() {
+            tl_cand_hide();
+            drop(g);
+            return Ok(());
+        }
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
         }
@@ -2824,6 +2837,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
+        } else if crate::addword::in_window_thread() {
+            // 【选词收窗·十八修】词框选字/删空后候选应收起（与主文档
+            // 行为对齐——深度回归实测选 2 后候选窗滞留）
+            tl_cand_hide();
         }
         g.cand_shown_this_segment = true;
         g.suppress_pending = false;
