@@ -144,7 +144,6 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
-                    shadowwin_follow(hwnd);
                 }
             }
             return LRESULT(0);
@@ -229,6 +228,13 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 推后，滚轮时序号原地不动、要等下一组段才跳变。现在
             // server 响应带回新 label_font_point，一并写进本地副本，
             // 主字与序号同一帧同步缩放。
+            // 【B3 修复 2026-09-13 三十四修】TL 词框小窗上的滚轮不再
+            // 渲染主窗实例（跨线程 take g.cand2 show=残留窗同型病根；
+            // fade_tick_shared 已分流、此处漏）。TL 线程直接忽略字号
+            // 滚轮（词框字号由皮肤统一管理）。
+            if crate::tsf::addword_tl_thread() {
+                return LRESULT(0);
+            }
             let delta: i32 = if ((wparam.0 >> 16) as i16) > 0 { 1 } else { -1 };
             // 【锁外渲染 2026-09-11】旧实现持 shared 锁整帧重绘（show
             // 5-15ms）——滚轮期间按键路径抢不到锁（打字卡手）。锁内
@@ -345,6 +351,29 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 收放循环=一闪一闪）。收窗一律即时隐藏——干净利落。
             //（入场长大/尺寸过渡/跟光标滑动保留；入场淡入仍由皮肤
             // fade_ms>0 显式开启才有。）
+            // 【B2 修复 2026-09-13 三十四修】TL 词框小窗线程的隐藏消息
+            // 走共用 wndproc 时，旧实现 take 的是 g.cand2 主实例——把
+            // 主窗动效状态清掉（真 TL 实例只被 ShowWindow 隐藏、内部状
+            // 态无人清=残留窗病根的没修完的腿）。按消息到达线程分流
+            //（与 fade_tick_shared 同款）：TL 线程只动 TL 实例。
+            if crate::tsf::addword_tl_thread() {
+                unsafe {
+                    if let Some(mut c) = crate::tsf::tl_cand_take() {
+                        c.last_hide_at = Some(std::time::Instant::now());
+                        c.size_anim = None;
+                        c.chrome_override.set(None);
+                        c.scale_in.set(false);
+                        c.pos_anim = None;
+                        c.fade = None;
+                        c.live_size.set((0, 0));
+                        crate::tsf::tl_cand_put_back(Some(c));
+                    }
+                    let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                    let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                return LRESULT(0);
+            }
             unsafe {
                 if let Some(gsh) = crate::tsf::G_SHARED.get() {
                     let shared = gsh.0.clone();
@@ -541,9 +570,9 @@ pub struct CandidateWindowV2 {
     /// 防抖基准，松手后下一次重绘即弹回 caret（用户实测「拖动后
     /// 回到原位」）。永久固定仍走右键 pin。
     sticky_drag: bool,
-    /// 上次 show 的编码长度：判断「正向打字」还是「退格/新组段」。
-    /// 正向打字时光标只应右移/不动——据此过滤应用返回的旧布局回退值。
-    last_raw_len: usize,
+    /// 【三十四修·死字段删除】last_raw_len（grew 判定随单调锁 8707fc4
+    /// 退役后只写不读，3 处写点全删）——「正向打字」过滤现由 est 与
+    /// 位置动效的 2px 死区承担。
     /// 测试回读：show() 后从 D2D 目标位图取整帧 BGRA（渲染层真值，不经 DWM）
     pub(crate) readback: bool,
     pub(crate) last_pixels: Option<Vec<u8>>,
@@ -740,11 +769,18 @@ unsafe fn push_shadow_mask(
 /// 2=+染色 3=+圆角遮罩 4=+阴影 5/0=全功能。每加一层自动化验证
 /// （条纹探针+梯度量化），定位第一个打破毛玻璃的层。
 fn read_diag_stage() -> u32 {
-    std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\stage.txt")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        .min(5)
+    // 【P6 修复 2026-09-13 三十四修】OnceLock 缓存：本函数在 show() 每
+    // 帧调用（动画期 15ms 一次）——每帧同步文件 IO（stage.txt 即便不
+    // 存在也要走一次 CreateFile 失败路径）。毛玻璃阶段验证早已完成，
+    // 阶段旋钮进程生命周期内读一次足够。
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\stage.txt")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(5)
+    })
 }
 
 /// 【毛玻璃 v3·DWM acrylic 2026-09-08】参照 window-vibrancy / TranslucentTB
@@ -916,7 +952,6 @@ impl CandidateWindowV2 {
                 readback: false,
                 sticky_pos: None,
                 sticky_drag: false,
-                last_raw_len: 0,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -1081,7 +1116,6 @@ impl CandidateWindowV2 {
                 readback: false,
                 sticky_pos: None,
                 sticky_drag: false,
-                last_raw_len: 0,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -1463,10 +1497,6 @@ impl CandidateWindowV2 {
         // 内容仍正确——生产路径弹窗必经尺寸增长，实测为合成态）、
         // comment_delay_ms=400（0=注释常显）。
         let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
-        // 阴影 alpha 复位：上次渐变留下的整窗 alpha 不能带进无动画帧
-        if self.fade.is_none() {
-            shadowwin_set_alpha(1.0);
-        }
         let now = std::time::Instant::now();
         // 【动效全局开关+速度 2026-09-11】设置页·皮肤页：anim（bool，
         // 默认开）/ anim_speed（倍率，默认 1.0=当前速度）——server 注入
@@ -3174,7 +3204,6 @@ impl CandidateWindowV2 {
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let _ = raw.len(); // 【锁全删 2026-09-12】grew 判定随单调锁退役
-            self.last_raw_len = raw.len();
             // 拖拽松手交接：一次性消费（设 sticky 并标记组段级钉住——
             // 本组段留在松手处，hide 时解除）。
             // 【坐标系统一 2026-09-08】DROP_AT 来自 wndproc 的
@@ -3186,19 +3215,29 @@ impl CandidateWindowV2 {
             // 【毛玻璃诊断钩子 2026-09-08】pin.txt 存在 → 固定到其中
             // 坐标（"x,y"，窗口原点系）。自动化验证用（把窗口钉在屏幕
             // 中央壁纸上肉眼看模糊），删文件即恢复正常。
+            // 【P6 修复 2026-09-13 三十四修】OnceLock：原版每帧同步文件
+            // IO（未固定态每次 show 都读 pin.txt）——诊断旋钮读一次足够。
             {
+                static PIN_HOOK: std::sync::OnceLock<Option<(i32, i32)>> =
+                    std::sync::OnceLock::new();
+                let hook = *PIN_HOOK.get_or_init(|| {
+                    std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\pin.txt")
+                        .ok()
+                        .and_then(|s| {
+                            let t = s.trim().to_string();
+                            t.split_once(',').and_then(|(a, b)| {
+                                match (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                                    (Ok(px), Ok(py)) => Some((px, py)),
+                                    _ => None,
+                                }
+                            })
+                        })
+                });
                 let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
                 if pinned.is_none() {
-                    if let Ok(s) = std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\pin.txt") {
-                        let t = s.trim();
-                        if let Some((a, b)) = t.split_once(',') {
-                            if let (Ok(px), Ok(py)) =
-                                (a.trim().parse::<i32>(), b.trim().parse::<i32>())
-                            {
-                                *pinned = Some((px, py));
-                                crate::tsf::diag_note(&format!("cw2 pin.txt 钩子 ({px},{py})"));
-                            }
-                        }
+                    if let Some((px, py)) = hook {
+                        *pinned = Some((px, py));
+                        crate::tsf::diag_note(&format!("cw2 pin.txt 钩子 ({px},{py})"));
                     }
                 }
             }
@@ -3403,29 +3442,38 @@ impl CandidateWindowV2 {
             let mut cloaked: u32 = 0;
             let mut hr: i32 = -1;
             unsafe {
-                #[link(name = "kernel32")]
-                unsafe extern "system" {
-                    fn GetModuleHandleW(name: *const u16) -> isize;
-                    fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
-                }
+                // 【P7 修复 2026-09-13 三十四修】函数指针 OnceLock：原版
+                // 每帧 GetModuleHandleW + UTF-16 分配 + GetProcAddress
+                // （动画期 15ms 一次全白付）。dwmapi 经 GetProcAddress
+                // 动态获取（mingw 工具链无 dwmapi 导入库）。
                 // 【i386 ABI】必须 extern "system"（stdcall）：x64 上 Rust
                 // 默认约定与 Win64 恰好兼容掩盖了此错，32 位下 cdecl 调用
                 // stdcall 函数 → 栈清理错位 → 崩（Pain 打器按键闪退根因）。
                 type Dwma =
                     unsafe extern "system" fn(HWND, u32, *mut core::ffi::c_void, u32) -> i32;
-                let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
-                let m = GetModuleHandleW(mn.as_ptr());
-                if m != 0 {
-                    let p = GetProcAddress(m, c"DwmGetWindowAttribute".as_ptr() as *const u8);
-                    if !p.is_null() {
-                        let f: Dwma = std::mem::transmute(p);
-                        hr = f(
-                            self.hwnd,
-                            14, // DWMWA_CLOAKED
-                            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
-                            4,
-                        );
+                static DWMA_GET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let p = *DWMA_GET.get_or_init(|| {
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GetModuleHandleW(name: *const u16) -> isize;
+                        fn GetProcAddress(module: isize, name: *const u8) -> *const core::ffi::c_void;
                     }
+                    let mn: Vec<u16> = "dwmapi.dll\0".encode_utf16().collect();
+                    let m = GetModuleHandleW(mn.as_ptr());
+                    if m != 0 {
+                        GetProcAddress(m, c"DwmGetWindowAttribute".as_ptr() as *const u8) as usize
+                    } else {
+                        0
+                    }
+                });
+                if p != 0 {
+                    let f: Dwma = std::mem::transmute(p as *const core::ffi::c_void);
+                    hr = f(
+                        self.hwnd,
+                        14, // DWMWA_CLOAKED
+                        &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                        4,
+                    );
                 }
             }
             if cloaked != 0 {
@@ -3433,29 +3481,35 @@ impl CandidateWindowV2 {
             } else {
                 self.cloaked_streak = 0;
             }
-            crate::tsf::diag_note(&format!(
-                "cw2 layout dbg: font_pt={font_pt} em={em} line_h={line_h} horiz={horizontal} \
-                 cands={} rawlen={} max_text={} width={width} height={height} w_out={w_out} h_out={h_out}",
-                cands.len(),
-                raw.chars().count(),
-                cand_ws
-                    .iter()
-                    .map(|(tw, _, _)| *tw)
-                    .fold(0.0f32, f32::max)
-            ));
-            crate::tsf::diag_note(&format!(
-                "cw2 show anchor={} x={} y={} w={} h={} vis={} cloak={}({:#x}) hr={:#x} streak={}",
-                anchor.is_some(),
-                x,
-                y,
-                w_out,
-                h_out,
-                IsWindowVisible(self.hwnd).0,
-                cloaked,
-                cloaked,
-                hr,
-                self.cloaked_streak
-            ));
+            // 【P8 修复 2026-09-13 三十四修】两条布局/锚点诊断日志原来
+            // 每帧无条件 format!+写文件（生产路径热开销）；改为诊断
+            // 开关开启才输出（C:\ProgramData\HuFu\diag\note 存在时——
+            // diag_note 自身已有开关，这里先挡掉 format! 的分配本身）。
+            if crate::tsf::diag_enabled() {
+                crate::tsf::diag_note(&format!(
+                    "cw2 layout dbg: font_pt={font_pt} em={em} line_h={line_h} horiz={horizontal} \
+                     cands={} rawlen={} max_text={} width={width} height={height} w_out={w_out} h_out={h_out}",
+                    cands.len(),
+                    raw.chars().count(),
+                    cand_ws
+                        .iter()
+                        .map(|(tw, _, _)| *tw)
+                        .fold(0.0f32, f32::max)
+                ));
+                crate::tsf::diag_note(&format!(
+                    "cw2 show anchor={} x={} y={} w={} h={} vis={} cloak={}({:#x}) hr={:#x} streak={}",
+                    anchor.is_some(),
+                    x,
+                    y,
+                    w_out,
+                    h_out,
+                    IsWindowVisible(self.hwnd).0,
+                    cloaked,
+                    cloaked,
+                    hr,
+                    self.cloaked_streak
+                ));
+            }
             // 【每帧缓存】块后存回（测量/渲染块内 self 有借用）
             if let Some(v) = tf_cache_out {
                 self.tf_cache = Some(v);
@@ -3642,7 +3696,6 @@ impl CandidateWindowV2 {
                     let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
-                shadowwin_set_alpha(1.0);
                 self.last_hide_at = Some(std::time::Instant::now());
                 // 【rect 只增不减→尺寸动效】窗退役：动效与余量基准归零，
                 // 下会话重定
@@ -3671,22 +3724,6 @@ impl CandidateWindowV2 {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 
-    /// 【词框候选零动效 2026-09-12 二十修】清全部动效状态并停表——
-    /// 窗口保持当前完整帧。动效 tick（fade/expand WM_TIMER）在加词
-    /// 小窗线程接不上泵（fade_tick_shared 的 TL 分流只清不做），入场
-    /// 长大/渐隐会卡在中间态（椭圆/胶囊形/滞留）——词框候选全禁，
-    /// show() 首帧即完整渲染，稳定可靠。
-    pub fn kill_animations(&mut self) {
-        self.fade = None;
-        self.size_anim = None;
-        self.pos_anim = None;
-        self.chrome_override.set(None);
-        self.scale_in.set(false);
-        unsafe {
-            let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
-            let _ = KillTimer(self.hwnd, EXPAND_TIMER_ID);
-        }
-    }
 
     pub fn hide(&mut self) {
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
@@ -3694,14 +3731,11 @@ impl CandidateWindowV2 {
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
         // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
         // 中下方」的病根）。
-        self.last_raw_len = usize::MAX;
         // 【位置滑动】收窗即作废位置动效（下个组段首显瞬移新位）
         self.pos_anim = None;
         // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
         // ——下一组段恢复跟随 caret。
         self.sticky_drag = false;
-        // 候选窗隐藏时阴影窗同退（组段间不孤零零挂着）
-        shadowwin_hide();
         // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
         // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
@@ -3721,7 +3755,6 @@ impl CandidateWindowV2 {
         self.sticky_pos = None;
         self.sticky_drag = false;
         self.pos_anim = None;
-        self.last_raw_len = usize::MAX;
         self.cloaked_streak = 0;
     }
 }
@@ -3791,10 +3824,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 // 确）。fade/size/pos 动画用自身状态照走。
                 c.show(&cands, &raw, &skin, None, sel);
                 c.internal_rerender = false;
-                shadowwin_set_alpha(c.fade_alpha());
-                if fade_done {
-                    shadowwin_set_alpha(1.0);
-                }
+                let _ = fade_done;
             }
             if let Some((f, t, t0)) = c.size_anim {
                 let ms = t0.elapsed().as_millis() as u32;
@@ -3861,21 +3891,22 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
         let had_fade = c.fade.is_some();
         let fade_done = c.fade_tick();
+        let mut shown_this_tick = false;
         if had_fade && c.is_visible() {
             // 仍在显示（渐显过渡/完成帧；渐隐完成时已 SW_HIDE 跳过复渲染
             // ——show() 的 SWP_SHOWWINDOW 会把刚藏的窗复活）
             c.internal_rerender = true;
             c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             c.internal_rerender = false;
-            // 阴影窗 alpha 同步面板（否则面板渐入、阴影全浓=重叠感）
-            shadowwin_set_alpha(c.fade_alpha());
-            if fade_done {
-                shadowwin_set_alpha(1.0);
-            }
+            shown_this_tick = true;
+            let _ = fade_done;
         }
         // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
         // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
         // 感），内容按目标布局裁在外壳内；完成帧解除覆盖按目标渲染。
+        // 【P11 修复 2026-09-13 三十四修】fade 分支本 tick 已整帧 show
+        // 过则跳过第二次 show（旧版 fade+size 并行=一个 tick 双 show，
+        // 全帧开销 ×67fps 翻倍）；size 插值滞后一帧（15ms）无视觉差。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
             let cur = size_ease(f, t, ms, c.size_ms);
@@ -3889,7 +3920,12 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            if c.is_visible() {
+            if !finished && c.is_visible() && !shown_this_tick {
+                c.internal_rerender = true;
+                let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                c.internal_rerender = false;
+            } else if finished && c.is_visible() && !shown_this_tick {
+                // 完成帧解除覆盖后按目标渲染一次（无 fade 并行时）
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
@@ -4048,293 +4084,14 @@ static CAND_UNSTICK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 ///（用户拍板：拖动时不要求光标存活，只要位置能锁住）。
 static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
-// ── 独立阴影窗（毛玻璃 v3.5）──
-// glass 候选窗无边距（accent 限制窗口=面板）——自绘阴影没有边距区
-// 可画、DwmExtendFrame 对 DComp 直呈窗无效（实测无阴影）。独立分层
-// 窗（分层 ULW）：尺寸=面板+2m 边距，SDF 高斯衰减 alpha 阴影，
-// ULW 上屏，Z 序在候选窗下（先置顶，候选窗随后 TOPMOST 盖上）。
-static SHADOW_HWND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
-static SHADOW_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-static SHADOW_M: std::sync::Mutex<u32> = std::sync::Mutex::new(0); // 当前边距（follow 用）
-
-unsafe extern "system" fn shadow_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// 圆角矩形 SDF（带符号距离，外正内负）
-fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
-    let qx = (px - cx).abs() - (hw - r);
-    let qy = (py - cy).abs() - (hh - r);
-    let ax = qx.max(0.0);
-    let ay = qy.max(0.0);
-    ((ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - r) as f32
-}
-
-/// 渲染阴影位图并 ULW 上屏（尺寸/参数变化才重渲染）
-/// g_size=σ₁ 基准（glass_shadow_size）、g_alpha=浓度（glass_shadow_alpha）
-unsafe fn shadowwin_render(
-    hwnd: HWND,
-    w: u32,
-    h: u32,
-    m: u32,
-    radius: u32,
-    g_size: f32,
-    off_x: i32,
-    off_y: i32,
-    g_alpha: f32,
-) {
-    let key = format!("{w}:{h}:{m}:{radius}:{g_size:.1}:{off_x}:{off_y}:{g_alpha:.2}");
-    if *SHADOW_KEY.lock().unwrap_or_else(|e| e.into_inner()) == key {
-        return;
-    }
-    // 【KEY 提交时序 2026-09-09】幂等键改为渲染成功后提交——原实现
-    // 先写后渲染，CreateDIBSection 失败（GDI 内存耗尽等）后同 key 永
-    // 不重试：窗口尺寸已变而位图是旧的，UpdateLayeredWindow 把旧位图
-    // 拉伸到新尺寸=阴影变形「糊成一坨」（多人实测截图实锤）。
-    let hdc = CreateCompatibleDC(HDC(std::ptr::null_mut()));
-    let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
-        bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
-            biWidth: w as i32,
-            biHeight: -(h as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            ..Default::default()
-        },
-        bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
-    };
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let dib = match CreateDIBSection(
-        hdc,
-        &bmi as *const _,
-        windows::Win32::Graphics::Gdi::DIB_USAGE(0),
-        &mut bits,
-        None,
-        0,
-    ) {
-        Ok(d) if !bits.is_null() => d,
-        _ => {
-            let _ = DeleteDC(hdc);
-            return;
-        }
-    };
-    let old = SelectObject(hdc, windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    // SDF 双高斯衰减【v3.9 玻璃阴影独立可调】σ₁=g_size（拖尾 2.6σ₁）、
-    // 浓度=g_alpha——与纯色阴影（shadow_radius/shadow_alpha）完全独立。
-    let (fw, fh) = (w as f32, h as f32);
-    let (phw, phh) = ((fw - 2.0 * m as f32) / 2.0, (fh - 2.0 * m as f32) / 2.0);
-    let (scx, scy) = (fw / 2.0 - off_x as f32, fh / 2.0 - off_y as f32);
-    let sigma1 = g_size.max(0.1);
-    let sigma2 = sigma1 * 2.6;
-    let base_a = g_alpha.clamp(0.0, 1.0);
-    let px = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-    let mut o = 0usize;
-    for y in 0..h {
-        for x in 0..w {
-            let d = sd_round_rect(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                scx,
-                scy,
-                phw,
-                phh,
-                radius as f32,
-            );
-            // 面板内部无影；外侧双高斯（近浓+远晕）
-            let a = if d <= 0.0 {
-                0.0
-            } else {
-                let t1 = d / sigma1;
-                let t2 = d / sigma2;
-                base_a * (0.62 * (-t1 * t1 * 0.5).exp() + 0.38 * (-t2 * t2 * 0.5).exp())
-            };
-            let a8 = (a * 255.0).round() as u8;
-            // BGRA 预乘（黑影：BGR=0）
-            px[o] = 0;
-            px[o + 1] = 0;
-            px[o + 2] = 0;
-            px[o + 3] = a8;
-            o += 4;
-        }
-    }
-    let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
-        BlendOp: 0,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: 1, // AC_SRC_ALPHA（预乘）
-    };
-    let pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-    let sz = windows::Win32::Foundation::SIZE {
-        cx: w as i32,
-        cy: h as i32,
-    };
-    let _ = UpdateLayeredWindow(
-        hwnd,
-        None,
-        None,
-        Some(&sz as *const windows::Win32::Foundation::SIZE),
-        hdc,
-        Some(&pt as *const windows::Win32::Foundation::POINT),
-        windows::Win32::Foundation::COLORREF(0),
-        Some(&blend),
-        ULW_ALPHA,
-    );
-    // 【DIB 泄漏修复 2026-09-09】GDI 规定：选入 DC 的对象 DeleteObject
-    // 必失败——原实现在选入状态直接删，每次参数/尺寸变化泄漏一张
-    // w×h×4 位图（数百 KB/键），累积耗尽 GDI 内存→后续 CreateDIBSection
-    // 失败（联动 KEY 时序 bug=阴影变形）。先恢复 old 出选再删。
-    SelectObject(hdc, old);
-    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(dib.0));
-    let _ = DeleteDC(hdc);
-    // bmi 仅用一次（字段都被赋值），消未用警告
-    let _ = &mut bmi;
-    // 渲染成功才提交幂等键
-    *SHADOW_KEY.lock().unwrap_or_else(|e| e.into_inner()) = key;
-}
-
-/// glass 候选窗定位前调用：阴影窗先就位（目标坐标 x,y），随后候选窗
-/// TOPMOST 压在其上（Z 序正确：阴影在候选窗下、桌面上）。
-pub fn shadowwin_show(
-    cand: HWND,
-    x: i32,
-    y: i32,
-    w_out: u32,
-    h_out: u32,
-    radius_phys: u32,
-    g_size: f32,
-    off_x: i32,
-    off_y: i32,
-    g_alpha: f32,
-) {
-    // 【创建竞态修复 2026-09-09】check（锁内）→create（锁外）→写回（锁
-    // 内）原实现两线程并发时各建一个阴影窗，先建的永不销毁=「阴影在别
-    // 的地方糊成一坨」（旧窗停留旧帧）。创建全程持锁（double-check）。
-    let h = {
-        let mut g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = *g {
-            unsafe {
-                if IsWindow(HWND(h as *mut _)).as_bool() {
-                    h
-                } else {
-                    0
-                }
-            }
-        } else {
-            0
-        }
-    };
-    let h = if h != 0 {
-        h
-    } else {
-        let mut g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
-        // double-check：等锁期间另一线程可能已创建
-        if let Some(h) = *g {
-            unsafe {
-                if IsWindow(HWND(h as *mut _)).as_bool() {
-                    h
-                } else {
-                    0
-                }
-            }
-        } else {
-            0
-        }
-    };
-    let h = if h != 0 {
-        h
-    } else {
-        unsafe {
-            let class: Vec<u16> = "HuFuCandShadow\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(shadow_wndproc),
-                hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
-                    .unwrap_or(HCURSOR(std::ptr::null_mut())),
-                lpszClassName: PCWSTR(class.as_ptr()),
-                hbrBackground: HBRUSH(std::ptr::null_mut()),
-                ..Default::default()
-            };
-            let _atom = RegisterClassW(&wc);
-            let ex = WINDOW_EX_STYLE(
-                WS_EX_TOOLWINDOW.0
-                    | WS_EX_TOPMOST.0
-                    | WS_EX_NOACTIVATE.0
-                    | WS_EX_LAYERED.0
-                    | WS_EX_TRANSPARENT.0,
-            );
-            match CreateWindowExW(
-                ex,
-                PCWSTR(class.as_ptr()),
-                PCWSTR::null(),
-                WINDOW_STYLE(WS_POPUP.0),
-                0,
-                0,
-                10,
-                10,
-                HWND(std::ptr::null_mut()),
-                HMENU(std::ptr::null_mut()),
-                HINSTANCE(std::ptr::null_mut()),
-                None,
-            ) {
-                Ok(hw) if !hw.0.is_null() => {
-                    // 持锁写回：竞态双建时后建的也记录（先建的已被
-                    // 另一线程写回则此处覆盖前先销毁新建的，防泄漏）
-                    let mut g2 = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(prev) = *g2 {
-                        if prev != hw.0 as isize && IsWindow(HWND(prev as *mut _)).as_bool() {
-                            let _ = DestroyWindow(HWND(prev as *mut _));
-                        }
-                    }
-                    *g2 = Some(hw.0 as isize);
-                    hw.0 as isize
-                }
-                _ => return,
-            }
-        }
-    };
-    if h == 0 {
-        return;
-    }
-    unsafe {
-        // 边距按独立 σ₂（拖尾 3σ₂≈47px 覆盖）——位图边界截断拖尾会出硬边
-        let m =
-            (g_size.max(0.1) * 2.6 * 3.0 + 6.0 + off_x.abs().max(off_y.abs()) as f32).ceil() as u32;
-        *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner()) = m;
-        let sw = w_out + 2 * m;
-        let sh2 = h_out + 2 * m;
-        let _ = cand;
-        // 先渲染内容再定位显示（避免空白帧）
-        SetWindowPos(
-            HWND(h as *mut _),
-            HWND_TOPMOST,
-            x - m as i32,
-            y - m as i32,
-            sw as i32,
-            sh2 as i32,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-        shadowwin_render(
-            HWND(h as *mut _),
-            sw,
-            sh2,
-            m,
-            radius_phys,
-            g_size,
-            off_x,
-            off_y,
-            g_alpha,
-        );
-    }
-}
-
 /// 【尺寸动效 2026-09-11】smoothstep 插值：t∈[0,ms] 映射进度
 /// p=3t²-2t³（缓起-加速-缓收，「成长感」明确——ease-out 起步即
 /// 大位移被实测判「无动画感」），返回 from→to 的即时尺寸。
+/// 【三十四修·死代码清理】shadowwin 整链（SHADOW_*、shadow_wndproc、
+/// shadowwin_render/show/set_alpha/hide/follow、sd_round_rect、
+/// shadow_geo 共 ~370 行）删除：shadowwin_show 全项目零调用 →
+/// SHADOW_HWND 恒 None → 7 个调用点纯空锁空转（grep 验证）。链内
+/// 的 size_ease 是活函数（动效核心），保留。
 pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
     if dur_ms == 0 || t_ms >= dur_ms {
         return to;
@@ -4343,80 +4100,4 @@ pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32
     let p = x * x * (3.0 - 2.0 * x);
     let l = |a: i32, b: i32| a + ((b - a) as f32 * p).round() as i32;
     (l(from.0, to.0), l(from.1, to.1))
-}
-
-/// 【动效】渐隐渐显阴影窗同步：整窗 alpha 跟随面板 fade 值（否则
-/// 面板半透渐入、阴影全浓=「重叠」感）。无阴影窗（纯色模式）安全跳过。
-pub(crate) fn shadowwin_set_alpha(a: f32) {
-    let g = SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = *g {
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
-                HWND(h as *mut _),
-                windows::Win32::Foundation::COLORREF(0),
-                (a.clamp(0.0, 1.0) * 255.0) as u8,
-                LWA_ALPHA,
-            );
-        }
-    }
-}
-
-/// 候选窗隐藏时联动隐藏阴影
-pub fn shadowwin_hide() {
-    if let Some(h) = *SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
-        unsafe {
-            let _ = ShowWindow(HWND(h as _), SW_HIDE);
-        }
-    }
-}
-
-/// 【玻璃阴影几何取证 2026-09-11】pad-dump 扫档用：候选窗与阴影窗的
-/// 屏幕矩形对（None=阴影窗未建/已亡——纯色模式无独立阴影窗）。
-/// 扫档器断言：阴影窗=候选窗四边等量外扩（居中，与 DPI 无关）。
-pub(crate) fn shadow_geo(cand: HWND) -> Option<(RECT, RECT)> {
-    let h = (*SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()))?;
-    unsafe {
-        if !IsWindow(HWND(h as *mut _)).as_bool() {
-            return None;
-        }
-        let mut sc = RECT::default();
-        if GetWindowRect(HWND(h as *mut _), &mut sc).is_err() {
-            return None;
-        }
-        let mut cc = RECT::default();
-        if GetWindowRect(cand, &mut cc).is_err() {
-            return None;
-        }
-        Some((cc, sc))
-    }
-}
-
-/// 拖拽移动时阴影窗跟随（候选窗原点-m 边距）
-pub fn shadowwin_follow(cand: HWND) {
-    let m = *SHADOW_M.lock().unwrap_or_else(|e| e.into_inner());
-    if m == 0 {
-        return;
-    }
-    if let Some(h) = *SHADOW_HWND.lock().unwrap_or_else(|e| e.into_inner()) {
-        unsafe {
-            if IsWindow(HWND(h as _)).as_bool() && IsWindowVisible(HWND(h as _)).as_bool() {
-                let mut wr = RECT {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                let _ = GetWindowRect(cand, &mut wr);
-                let _ = SetWindowPos(
-                    HWND(h as *mut _),
-                    HWND(std::ptr::null_mut()),
-                    wr.left - m as i32,
-                    wr.top - m as i32,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        }
-    }
 }

@@ -504,12 +504,7 @@ pub fn key_request(
     Some((consumed, commit, back, state, sound, sound_vol))
 }
 
-/// 唤醒：探测服务器是否在。
-pub fn ping() -> bool {
-    call(&serde_json::json!({"op": "ping"}))
-        .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
-        .unwrap_or(false)
-}
+// 【三十四修·死代码删除】ping()（零调用）已删。
 
 /// 轮询用：拉当前会话态（不产生按键副作用）。供候选窗停顿期刷新
 /// （异步重排到达后主动换序，用户不必按键即可看到新首选）。

@@ -261,8 +261,8 @@ pub struct Shared {
     /// 有值时更新（保留「本会话见过编辑框」语义）——四十次修正的
     /// cell_seg 判定依赖（表格每段同文档首段 200ms 等待）。
     pub ed6_prev: Option<RECT>,
-    /// GetTextExt 最近一次成功查询时刻（停用，保留字段）。
-    pub caret_at: Option<std::time::Instant>,
+    /// 【三十四修·死字段删除】caret_at（三十六修"click 黏性解除判据"
+    /// 的计时戳）零读取已删——黏性机制改由 sticky_near/cand_shown 判定。
     /// 【失焦残留拦截 2026-09-07】OnSetFocus 后 focus op 异步清 server
     /// session，窗口期内补显 timer/轮询可能拿着失焦前的 raw（如 'd'）
     /// 在新焦点重建组段——用户实测 WPS 表格 A1 打 d 点 B2，A1/B2 双双
@@ -276,13 +276,9 @@ pub struct Shared {
     pub modekey_last: Option<(usize, std::time::Instant)>,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
-    /// 【Excel 保组段 2026-09-12】最近一次 SP: SetText 成功时刻：
-    /// Excel cell editor 在组段 SetText 后**即时**（实测 4ms）重发
-    /// OnSetFocus（焦点从未离开，docmgr 对象每次新建身份比较无效）
-    /// ——组段建立后 80ms 内的焦点声明视为宿主抖动，保组段跳过
-    /// 冲销（Excel 对 EndComposition 的反应是把文本定格=首键字母
-    /// 上屏）。真人点击切窗从最后一键到焦点事件物理上 >100ms。
-    pub compose_at: Option<std::time::Instant>,
+    /// 【三十四修·死字段删除】compose_at（Excel 保组段 80ms 时窗，六修
+    /// 整体移除后只剩 3 处写入零读取）已删——现行判据是 CommitFocusRevoke
+    /// 的选区验证（session 内）+ focus_revoke_kept 回传短路。
     /// 【Excel 保组段 2026-09-12】CommitFocusRevoke 在 EditSession 内
     /// 判定「选区在段内（宿主抖动）保组段」后置位——handle_set_focus
     /// 读到即整体短路（跳过 B~F 全部清理：丢组段句柄/清状态/藏窗）。
@@ -293,18 +289,18 @@ pub struct Shared {
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
     /// 异步重排换序后主动刷新候选窗）
     pub cand_sig_last: String,
+    /// 【三十四修】跟打器 est 无基线的建基线探测帧标记（GetTextExt
+    /// 双查循环里消费：true=只查一次即返回）。
+    pub hupo_single_probe: bool,
     /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
     /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
     /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
     /// 重查 caret 并移动候选窗到最新插入点——「每自动上屏一次就跟随，
     /// 哪怕候选里还有内容」。
     pub caret_recheck_due: bool,
-    /// 【锚组段起点·补显强制重查 2026-09-08】非跟随宿主段内跳过
-    /// query_caret（布局锁减压）——但组段首帧查到的常是旧行框（懒
-    /// 布局），首帧抑制 35ms 补显时必须强制重查一次拿稳定值，否则
-    /// 候选窗按旧行框显示到下一段（用户实测「候选框乱跳」）。置位
-    /// 于 arm_first_frame_timer 各抑制点，query_caret 消费即清。
-    pub caret_force: bool,
+    /// 【三十四修·死字段删除】caret_force（十三修"入口不拦查询"后彻底
+    /// 架空：4 处置位全库零读取）已删——段内查询策略现由 est/锚源分化
+    /// 显式管理。
     /// 【估算链跟随 2026-09-12 五次修正】Chromium 系（Typora/QQ）一旦
     /// 上过屏，GetTextExt 对后续组段持续失败（点击可重置、跨帧 60ms
     /// 自愈救不了持续失败）——只能以最近一次成功锚为基准推算：
@@ -366,17 +362,15 @@ impl Shared {
             wps_settle_start: None,
             cand_shown_this_segment: false,
             ed6_prev: None,
-            caret_at: None,
             stale_raw: String::new(),
             stale_raw_until: None,
             modekey_last: None,
             preedit_last: String::new(),
-        compose_at: None,
         focus_revoke_kept: false,
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
+            hupo_single_probe: false,
             caret_recheck_due: false,
-            caret_force: false,
     caret_est_x: 0,
     caret_est_y: 0,
     caret_est_wrap: 0,
@@ -967,7 +961,6 @@ fn handle_set_focus(
         g.last_show = None;
         g.cand_sig_last = String::new();
         g.suppress_pending = false;
-        g.caret_force = false;
         g.cand_shown_this_segment = false;
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
@@ -1070,7 +1063,18 @@ pub fn trace(msg: &str) {
 /// 【常驻句柄 + 轮转 2026-09-11】旧实现每条 open/close 且无上限——
 /// 残留兜底路径每次 poll 命中都写，宿主异常日可涨到 MB 级。改常驻
 /// 句柄 + 8MB 轮转（对齐 trace 的教训：日志别成卡顿放大器）。
+pub fn diag_enabled() -> bool {
+    // 【P8 修复 2026-09-13 三十四修】诊断日志总开关：默认关（生产路径
+    // 零开销——此前所有 diag_note 无条件 format!+写盘，show() 每帧两条
+    // 是热路径明账）。开法：创建 C:\ProgramData\HuFu\diag\note 文件。
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::path::Path::new(r"C:\ProgramData\HuFu\diag\note").exists())
+}
+
 pub fn diag_note(msg: &str) {
+    if !diag_enabled() {
+        return;
+    }
     use std::io::Write;
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
     let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
@@ -1597,8 +1601,6 @@ impl EditSession_Impl {
                 trace("SP: SetText ok");
                 // 选区跟随到组段末尾（否则下次插入点停在开头）
                 let _ = set_selection_at_end(&ctx, ec, &crange);
-                // 【Excel 保组段】组段建立时刻（焦点冲销的抖动判据）
-                g.compose_at = Some(std::time::Instant::now());
                 // 【十七次修正·SP 同步 raw】监控实锤（04:11:19）：SP 不更
                 // 新 cur_raw_len，重校把旧段 last_raw=19 当新段基准，下一
                 // 键 d=2-19=-17 → est 跳 -188px（窗被拽出屏）。
@@ -1654,8 +1656,18 @@ impl EditSession_Impl {
                 if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
                     if let Some(mut r) = gui_caret_fallback() {
                         hupo_clamp(&mut r);
-                        g.caret_force = false;
-                        g.caret = Some(r);
+                                        g.caret = Some(r);
+                    } else if exe_is_hupo() {
+                        // 【三十四修·跟打器段内零查询】自绘 caret 宿主
+                        // fallback 结构性 None——旧版跌进 query_caret：
+                        // 全线程快照 + GetTextExt 双查（布局锁 30-60ms/
+                        // 次），v1.5.2 特意为该宿主豁免的零查询被「逐键
+                        // 跟随」推翻 = 跟打器 61ms/键 的主源（trace 实锤
+                        // DoEditSession enter→qc: raw 间隔 58ms）。恢复
+                        // 豁免：est 有基线→纯内存步进（0ms）；无基线
+                        // （段首/点击后）→本帧保留旧锚，基线由 query_caret
+                        // 段首单查建立（见其 hupo 分支）。
+                        est_step(&mut g);
                     } else {
                         query_caret(&mut g, &ctx, ec);
                     }
@@ -1830,8 +1842,6 @@ impl EditSession_Impl {
                         unsafe { crange.SetText(ec, 0, &wstr2)? };
                         let _ = set_selection_at_end(&ctx, ec, &crange);
                         g.composition = Some(comp);
-                        // 【Excel 保组段】重开组段同样记时戳（抖动判据）
-                        g.compose_at = Some(std::time::Instant::now());
                         // 【十四次修正】C&R 顶屏重开段不重置键计数（同
                         // 位置续打，首查也过连续性过滤）。
                         // 【十七次修正】raw 同步（防重校吸入旧段 last_raw）。
@@ -1932,8 +1942,6 @@ impl EditSession_Impl {
                 unsafe { crange.SetText(ec, 0, &wstr2)? };
                 let _ = set_selection_at_end(&ctx, ec, &crange);
                 g.composition = Some(comp);
-                // 【Excel 保组段】重开组段同样记时戳（抖动判据）
-                g.compose_at = Some(std::time::Instant::now());
                 // 【十四次修正】C&R 顶屏重开段=同位置续打，不重置段内
                 // 键计数——重开后的首查也过连续性过滤（est 已含 commit
                 // 宽，位置连续；烂锚走 est）。重置会让顶屏那键成为漏
@@ -2144,7 +2152,12 @@ fn est_step(g: &mut Shared) {
     }
     // 【est 未初始化跳过 2026-09-12 七修】切格后 est 归零无基线——
     // 无基线步进只会从 (0,0) 累积出屏外垃圾坐标，等真实帧建基线。
+    // 【三十四修·半基线】焦点清理归零后折行分支可能只重建 x（y 仍
+    // 0，trace 实锤 est=(1289,0) 从屏顶步进）——y 无基线同样不步进。
     if g.caret_est_x == 0 && g.caret_est_y == 0 {
+        return;
+    }
+    if g.caret_est_y == 0 {
         return;
     }
     let lh = g.caret_est_line_h;
@@ -2183,6 +2196,23 @@ fn est_step(g: &mut Shared) {
             }
             if wrapped {
                 g.caret_est_x = wr.left + ind + g.caret_est_wrap;
+                est = RECT {
+                    left: g.caret_est_x,
+                    top: g.caret_est_y,
+                    right: g.caret_est_x + 2,
+                    bottom: g.caret_est_y + lh,
+                };
+            }
+            // 【三十四修·Y 轴钳制】跟打器打字区满屏后自动滚动（视口不
+            // 动、内容滚），est 无真实帧校准（自绘 caret 拿不到）→ y 跨
+            // 段累计漂移（实测 200s 打字 y=29676 飞出屏幕）。折行累计
+            // 的 y 超宿主窗底=视口早已滚过——钉在打字区可视底带（窗底
+            // -行高），候选窗留在打字区附近不飞屏。
+            if hupo && g.caret_est_y > wr.bottom - lh {
+                g.caret_est_y = wr.bottom - lh;
+                if g.caret_est_y < wr.top {
+                    g.caret_est_y = wr.top;
+                }
                 est = RECT {
                     left: g.caret_est_x,
                     top: g.caret_est_y,
@@ -2237,7 +2267,6 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     let prev_caret = g.caret;
     let prev_line_end = g.line_end;
     g.caret = None;
-    g.caret_force = false; // 消费即清（补显强制重查一次性）
     // 【虎魄跟打器 2026-09-12】其 GetTextExt 返回恒定值（上屏后窗不
     // 跳），改查系统插入符（GUITHREADINFO，零 TSF 回调不进布局锁）
     // ——上屏后插入符在上屏文字尾，恰好是「上屏动一次」要的位置。
@@ -2247,6 +2276,15 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             g.caret = Some(r);
             return;
         }
+        // 【三十四修·段内零查询】fallback 结构性 None（自绘 caret）时
+        // 不再跌进标准链（GetTextExt 布局锁 30-60ms）。est 有基线→纯
+        // 内存步进；无基线（段首）→标准链**单查**建一次基线（首键一次
+        // 慢可忍，后续每键 0 查询）。
+        if g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0) {
+            est_step(g);
+            return;
+        }
+        g.hupo_single_probe = true; // 本次允许单查（GetTextExt 循环里消费）
     }
     // 【单源锚·连续性过滤 2026-09-12 十三次修正】不再在入口拦查询
     //（曾因差一错误第二键未被拦——用户实锤「第二个编码跳一下」）。
@@ -2302,8 +2340,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 查询常返回旧布局（前一位置），第二次才反映新光标。锚点在旧/新
     // 之间交替正是候选窗「中间→下面→中间」跳动的病根。连查两次取
     // 末次非退化结果，迫使懒布局在本次渲染前完成。
+    // 【三十四修·单查】跟打器 est 无基线的建基线探测帧只查一次
+    // （布局锁下每次 30-60ms，双查无谓翻倍；基线允许粗糙——est 步进
+    // 与 hupo_clamp 会消化）。
+    let probes: u32 = if std::mem::take(&mut g.hupo_single_probe) {
+        1
+    } else {
+        2
+    };
     let mut last_ok: Option<RECT> = None;
-    for _ in 0..2 {
+    for _ in 0..probes {
         rect = RECT::default();
         if unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) }.is_ok() {
             // 【撤销 64px 高度过滤 2026-09-08】跟打器大字号行高 ~135px、
@@ -2372,7 +2418,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             // 帧重查：60ms 后布局完成，重查成功→真实校准（双向滑动+
             // 2px 死区+动态时长可平滑消化拉回，不似旧瞬移时代会抖）。
             // 重查失败→est_step 幂等（d=0 位置不变），无害。
-            arm_caret_recheck_timer();
+            // 【三十四修】跟打器豁免：重查=再来一次布局锁 GetTextExt
+            //（30-60ms），est+hupo_clamp 已够——豁免即恢复 v1.5.2 该
+            // 宿主「段内零查询」的性能决策。
+            if !exe_is_hupo() {
+                arm_caret_recheck_timer();
+            }
             return;
         }
         g.caret = prev_caret;
@@ -2381,7 +2432,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 可能失败（渲染进程异步布局，同帧双查也等不到——Typora 第三
         // 键实录）：武装 60ms 重查定时器，到点强制 update_ui 重跑本键
         // SetPreedit（CARET_TIMER 已置 caret_force），跨帧拿到新锚。
-        arm_caret_recheck_timer();
+        // 【三十四修】跟打器豁免同上。
+        if !exe_is_hupo() {
+            arm_caret_recheck_timer();
+        }
         trace("qc: GetTextExt 失败，武装 60ms 跨帧重查");
         return;
     };
@@ -2438,7 +2492,6 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret = Some(rect);
     // 【三十六次修正】查询时间戳：click 黏性的解除要求「本段内新查过」
     //（防止置位帧的上一段旧查询值 near-自吞黏性）。
-    g.caret_at = Some(std::time::Instant::now());
     // 【行尾检测】caret 右缘距前台窗口右缘 < 56px（≈2-3 个全角字 +
     // 滚动条余量，二者同为屏幕物理像素可直接比）→ 软换行边界将至。
     // 页面视图/分栏等行宽 < 窗口宽的宿主检测不到（不触发，无害）；
@@ -2616,7 +2669,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             // 【上屏跟随】懒布局宿主上屏帧 caret 常是旧行框——布置 60ms
             // 重查（见 caret_recheck_due 注释）。锚组段起点宿主不需要：
             // CommitAndRepreet 新组段 StartPreedit 会话自会查首帧锚点。
-            if host_follow_caret() {
+            // 【三十四修】跟打器豁免：重查会话=布局锁 GetTextExt 再来
+            // 一次（30-60ms）；上屏宽度已由 Op::Commit 的 est 累加消化。
+            // 【三十四修·死代码清理】host_follow_caret() 恒 true（用户
+            // 拍板全宿主跟随光标后函数退化），内联删除；跟打器豁免
+            // 由 exe_is_hupo() 承担。
+            if !exe_is_hupo() {
                 g.caret_recheck_due = true;
                 arm_caret_recheck_timer();
             }
@@ -2789,7 +2847,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 110ms 轮询周期——「首键候选慢半拍」的 122ms 主耗曾在此；
         // 立即显示又会首帧旧行框跳变，35ms≈1 帧布局稳定下限）。
         g.suppress_pending = true;
-        g.caret_force = true; // 补显时强制重查锚点（旧行框矫正）
         arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
             c.hide();
@@ -2936,11 +2993,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // SearchHost 豁免 caret 抑制（同常规分支语义）；显示。抑制判据
         // 用「算完兜底链的 caret」——owned 锚点在身就不抑制（防
         // caret=None 死循环，反查首帧同款教训）。
-        let pinned_now = crate::candwin2::CAND_PINNED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        let _ = pinned_now;
+        // 【三十四修·死块删除】pinned_now 取 CAND_PINNED 后 `let _ =`
+        // 丢弃（零消费）已删。
         let suppress_caret = caret.is_none() && !is_preview && !sh;
         if suppress_caret {
             if crate::addword::in_window_thread() {
@@ -2949,7 +3003,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 c.hide();
             }
             g.suppress_pending = true;
-            g.caret_force = true;
             arm_first_frame_timer();
             return Ok(());
         }
@@ -2969,9 +3022,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
-            if crate::addword::in_window_thread() {
-                crate::tsf::trace("写last@渲染点1");
-            }
         } else if crate::addword::in_window_thread() {
             // 【选词收窗·十八修】词框选字/删空后候选应收起（与主文档
             // 行为对齐——深度回归实测选 2 后候选窗滞留）
@@ -3241,8 +3291,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 g.wps_settle_start = Some(std::time::Instant::now());
             }
             g.suppress_pending = true;
-            g.caret_force = true; // 补显时强制重查锚点（旧行框矫正）
-            arm_first_frame_timer();
+                arm_first_frame_timer();
             return Ok(());
         }
         // 【退场淡出修复 2026-09-11】空帧到此不再下落 show：此前直落
@@ -3720,9 +3769,25 @@ fn gui_caret_fallback() -> Option<RECT> {
         // 「A 窗口打过字后开始菜单候选位置不对」）。枚举前台进程的所有
         // 线程逐个 GetGUIThreadInfo，找到 caret 非空且屏幕坐标在工作区
         // 内的第一个（开始菜单场景通常只有搜索框有 caret）。
+        // 【三十四修·快照节流】CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0)
+        // 是全系统线程表复制（数千线程，实测数十 ms）；无经典 caret 的
+        // 宿主（SearchHost/UWP/跟打器）每键最多触发 3 次。200ms 内复用
+        // 上次结果——打字期间 caret 连续帧间基本不动，缓存无损。
         let mut fg_pid: u32 = 0;
         GetWindowThreadProcessId(fg, Some(&mut fg_pid));
         if fg_pid != 0 {
+            static LAST: std::sync::Mutex<(Option<std::time::Instant>, u32, Option<RECT>)> =
+                std::sync::Mutex::new((None, 0, None));
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let cached_hit = last.0.is_some()
+                && last.1 == fg_pid
+                && last.0.unwrap().elapsed().as_millis() < 200;
+            if cached_hit {
+                return last.2;
+            }
+            last.0 = Some(std::time::Instant::now());
+            last.1 = fg_pid;
+            last.2 = None;
             #[repr(C)]
             struct ThreadEntry32 {
                 dw_size: u32,
@@ -3764,6 +3829,7 @@ fn gui_caret_fallback() -> Option<RECT> {
                                 // 的残留 caret 一律不认（偶发掉任务栏根因）
                                 if let Some(rc) = caret_valid(&gi2) {
                                     CloseHandle(snap);
+                                    last.2 = Some(rc);
                                     return Some(rc);
                                 }
                             }
@@ -3811,8 +3877,29 @@ unsafe extern "system" fn excel6_enum_proc(h: HWND, _l: LPARAM) -> BOOL {
 }
 
 /// 前台 WPS 表格的单元格编辑框锚（递归枚举子窗，编辑态才有）。
+/// 【三十四修·宿主门】原版对所有宿主每帧跑 EnumChildWindows 递归全子
+/// 窗枚举（每子窗一次 GetClassNameW）——记事本/跟打器/QQ 等用不到
+/// EXCEL6 的宿主白付这项成本（逐提交审计表b 最大固定新增）。改：仅
+/// 前台进程名含 excel/wps/et 时才枚举（OnceLock 缓存判定）。
 fn excel6_anchor() -> Option<RECT> {
     unsafe {
+        // 宿主门：前台进程名判定，进程级 OnceLock 缓存。
+        static HOST_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ok = *HOST_OK.get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .map(|n| {
+                    let nl = n.to_lowercase();
+                    // excel.exe / wps.exe / et.exe（WPS 表格）——et 用
+                    // 前缀+点号防误命中（notepad 含 "et"）。
+                    nl.contains("excel") || nl.contains("wps") || nl.starts_with("et.")
+                })
+                .unwrap_or(false)
+        });
+        if !ok {
+            return None;
+        }
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
             return None;
@@ -3930,8 +4017,7 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     g.caret_recheck_due = false;
                     // 到点强制重查：置 caret_force（SetPreedit 段内查询
                     // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
-                    g.caret_force = true;
-                }
+                        }
                 if let Some(state) = crate::ipc::state_request() {
                     let raw_empty = state
                         .get("raw")
@@ -4069,24 +4155,13 @@ fn fg_same_app_dir(pid: u32) -> bool {
     }
 }
 
-/// 【三十九次修正·勘误】et.exe 不是启动器——是表格的真实宿主
-///（打字会话/EXCEL6 编辑框/候选窗全在 et.exe 进程；wps.exe 只是
-/// 框架窗容器）。此前「et 僵尸窗」判定为误诊：EXCEL6 框外过滤部署
-/// 后 et 的窗全程贴格正确。此函数保留供诊断，不再参与拦截。
-pub(crate) fn i_am_launcher() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
-            .is_some_and(|s| s == "et" || s == "wpp")
-    })
-}
+/// 【三十四修·死代码清理】i_am_launcher() 已删：三十九修勘误后不再
+/// 参与拦截、全库零调用（保留诊断价值由 git 历史承担）。
 
 /// 【三十九次修正·show 级焦点守卫】本进程是否有资格显示候选窗：
 /// 前台=本进程，或同应用族（WPS 全家同目录：et.exe 打字会话的前台
 /// 是 wps.exe 框架窗），或 UWP 框架。在 candwin2::show 入口调用。
-/// （勘误：et.exe 是表格真实宿主，不做启动器排除——见 i_am_launcher。）
+///（et.exe 是表格真实宿主，不做启动器排除。）
 pub(crate) fn host_may_show() -> bool {
     unsafe {
         let fg = GetForegroundWindow();
@@ -4264,7 +4339,6 @@ fn poll_tick() {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
             g.cand_shown_this_segment = false;
-            g.caret_force = false; // 断段：补显强制重查标志失效
             g.wps_caret_prev = None;
             g.wps_settle_start = None; // click_sticky 保留：上屏帧垃圾锚需黏性拦
             // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
@@ -4358,17 +4432,9 @@ fn host_async_layout() -> bool {
     })
 }
 
-/// 跟随光标宿主（晴跟打器类）：整句长编码场景，候选窗需随光标前进
-/// （锚 END）。此类宿主布局同步、GetTextExt 稳定，跟随不会产生跳动。
-/// 其余宿主（含虎魄跟打器）锚组段起点——段内位置恒定且零 GetTextExt
-///（虎魄 2026-09-08 移出：逐键布局查询×2 在跟打器上卡秒级，见
-/// query_caret 注释）。
-fn host_follow_caret() -> bool {
-    // 【恒 true 2026-09-12 用户拍板】所有应用实时跟随最新光标（按宿
-    // 主分化锚源：打包/UWP 壳/虎魄走系统插入符，其余走 GetTextExt
-    // 编码尾锚——见 SetPreedit 处注释）。
-    true
-}
+/// 【三十四修·死代码清理】host_follow_caret() 已删：恒 true（用户拍板
+/// 全宿主跟随光标后函数退化，唯一调用点已内联）；跟打器豁免由
+/// exe_is_hupo() 承担。分化历史见 git（v1.5.2 时代虎魄锚组段起点）。
 
 /// 【虎魄跟打器判定 2026-09-12】真打字宿主名（此前 TigerClaw 判定
 /// 是错靶——那是虎魄的组件进程）。其 GetTextExt 返回恒定值（窗钉
