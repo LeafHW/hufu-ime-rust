@@ -2042,10 +2042,18 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 贴」的真正根因是我自己的过滤）。改为：真实成功即采纳重校
     //（est 短基线归零，误差累积不过一键），仅极端疯狂值（错窗口/
     // 错控件级）拦截。est 只在真失败时兜底。
+    // 【虎魄死锁修 2026-09-12 三修】trace 实锤（43.28-43.56 时段）：
+    // 跟打器 est 飞到 2333-2881（出窗），真实帧 1002-1452 每键 +50px
+    // 步进稳定却全被 dx<-300 拦截——**est 超前型死锁**：真实帧永远
+    // 进不来，est 永不重校，候选挂窗右缘不贴光标（用户实测「没有
+    // 发行版效果好」——发行版靠 est 折行周期性侥幸自救）。跟打器
+    // GetTextExt 步进全程可靠（trace 全段证明），虎魄 dx 下限放宽到
+    // -3000：真实优先，死锁解。
     if g.seg_key_index >= 2 && g.caret_est_line_h > 0 {
         let dy = rect.top - g.caret_est_y;
         let dx = rect.left - g.caret_est_x;
-        if dx > 800 || dx < -300 || dy < -300 {
+        let lo = if exe_is_hupo() { -3000 } else { -300 };
+        if dx > 800 || dx < lo || dy < -300 {
             trace(&format!(
                 "qc: 极端锚拦截 dx={} dy={}（est 步进）",
                 dx, dy
