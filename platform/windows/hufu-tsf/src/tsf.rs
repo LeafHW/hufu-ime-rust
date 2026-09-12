@@ -79,6 +79,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 /// 小窗线程的候选窗渲染（懒创建；参数与 g.cand2.show 同构）。
+/// 【竖排强制 2026-09-12 十一修】词框场景强制竖排——横排宽度公式在
+/// raw 为空（词框组段无编码行）时算出的窗宽装不下「序号+词」（实测
+/// w=93 装序号+22+43 溢出→序号被裁/"右边字缺"）；竖排布局每行=序号
+/// +词，主线程大量使用成熟稳定。
 fn tl_cand_show(
     cands: &[(String, String)],
     raw: &str,
@@ -86,13 +90,20 @@ fn tl_cand_show(
     anchor: Option<&RECT>,
     selected: usize,
 ) {
+    let mut skin_v = skin.clone();
+    if let Some(obj) = skin_v.as_object_mut() {
+        obj.insert(
+            "layout".into(),
+            serde_json::json!({ "horizontal": false }),
+        );
+    }
     TL_CAND2.with(|t| {
         let mut slot = t.borrow_mut();
         if slot.is_none() {
             *slot = CandidateWindowV2::new();
         }
         if let Some(c) = slot.as_mut() {
-            c.show(cands, raw, skin, anchor, selected);
+            c.show(cands, raw, &skin_v, anchor, selected);
         }
     });
 }
@@ -3602,6 +3613,13 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         .unwrap_or("")
                         .is_empty();
                     if !raw_empty {
+                        // 【小窗期间主线程跳过 2026-09-12 十一修】补显
+                        // timer 走主线程——小窗打开时词框线程在渲染，
+                        // 主线程此刻 update_ui 会用旧 session 状态画
+                        // 主文档候选（用户实测残留窗「这是正常的候选」）。
+                        if crate::addword::is_open() && !crate::addword::in_window_thread() {
+                            return LRESULT(0);
+                        }
                         // 候选签名不参与判断（内容没变也要移动位置）
                         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                         g.cand_sig_last = String::new();
