@@ -1594,7 +1594,9 @@ impl EditSession_Impl {
                         drop(g);
                         crate::addword::open_weight();
                     } else {
-                        if let Some(c) = g.cand2.as_mut() {
+                        if crate::addword::in_window_thread() {
+                            crate::addword::show_cands(&[], "", 0);
+                        } else if let Some(c) = g.cand2.as_mut() {
                             c.hide();
                         }
                     }
@@ -2528,17 +2530,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.cand2.is_some(),
         g.cand2_dead
     ));
-
-    // 【词框候选内嵌 2026-09-12 八修】小窗线程：候选显示在加词/加权
-    // 小窗自己的预览区（GDI 同线程绘制），**不走 cw2**——候选窗的
-    // D2D 上下文由主线程创建，小窗线程跨线程绘制=未定义行为（实测
-    // 候选窗里画出小窗标签「权重（留空=1000）」的内存碎片、字被
-    // 裁错位——监视器+放大图实锤）。数字/空格选字仍走 dispatch →
-    // server → 小窗线程组段上屏（已验证链路）。cands 空=清空预览。
-    if crate::addword::in_window_thread() {
-        crate::addword::show_cands(&cands, &raw, sel);
-        return Ok(());
-    }
+    // 【词框候选内嵌 2026-09-12 九修】八修在此 return 分流——跳过了
+    // 后半段组段 preedit 更新（词框无组段文本、选字无处上屏），用户
+    // 实测「候选都没了」。九修：不 return，只把**渲染调用点**换成
+    // 标题栏（show_cands），组段更新（SetPreedit）照常走。
 
     // 【性能】皮肤拉取只在「无皮肤（首键）」时走按键路径——首次必须
     // 拉否则无皮肤可渲染。此后 2.5s 过期拉取全部挪到 poll_tick 的
@@ -2710,7 +2705,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let _ = pinned_now;
         let suppress_caret = caret.is_none() && !is_preview && !sh;
         if suppress_caret {
-            if let Some(c) = g.cand2.as_mut() {
+            if crate::addword::in_window_thread() {
+                crate::addword::show_cands(&[], "", 0);
+            } else if let Some(c) = g.cand2.as_mut() {
                 c.hide();
             }
             g.suppress_pending = true;
@@ -2720,7 +2717,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         let content_empty = cands.is_empty() && raw.is_empty();
         if !content_empty {
-            if let Some(c) = g.cand2.as_mut() {
+            // 【词框候选内嵌·九修】小窗线程：候选画标题栏（GDI 同线程，
+            // 跨线程 D2D 损坏根治——八修实锤内存碎片）；组段更新在下方
+            // 照常走（八修 return 跳过组段=「候选都没了」的教训）。
+            if crate::addword::in_window_thread() {
+                crate::addword::show_cands(&cands, &raw, sel);
+            } else if let Some(c) = g.cand2.as_mut() {
                 c.show(&cands, &raw, &skin, caret.as_ref(), sel);
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
@@ -2998,9 +3000,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // tick 复渲染空内容=无东西可淡，「退出无动画」的根因。
         let content_empty = cands.is_empty() && raw.is_empty();
         if !content_empty {
-            match g.cand2.as_mut() {
-                Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
-                None => {}
+            if crate::addword::in_window_thread() {
+                crate::addword::show_cands(&cands, &raw, sel);
+            } else {
+                match g.cand2.as_mut() {
+                    Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
+                    None => {}
+                }
             }
         }
         // 【滚轮缩放候选框】缓存渲染参数：WM_MOUSEWHEEL 改字号后
