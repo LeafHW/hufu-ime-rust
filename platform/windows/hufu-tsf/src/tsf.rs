@@ -3548,24 +3548,146 @@ fn gui_caret_fallback() -> Option<RECT> {
         if fg.0.is_null() {
             return None;
         }
-        let tid = GetWindowThreadProcessId(fg, None);
-        let mut gi = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
+        // 【工作区合法性】找到的 caret 必须落在屏幕工作区内（烂锚防护）
+        let in_workarea = |rc: &RECT| -> bool {
+            let mut wa = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            #[link(name = "user32")]
+            unsafe extern "system" {
+                fn SystemParametersInfoW(
+                    a: u32,
+                    b: u32,
+                    p: *mut core::ffi::c_void,
+                    f: u32,
+                ) -> i32;
+            }
+            SystemParametersInfoW(0x30, 0, &mut wa as *mut RECT as *mut core::ffi::c_void, 0);
+            rc.left >= wa.left && rc.right <= wa.right && rc.top >= wa.top && rc.bottom <= wa.bottom
         };
-        if GetGUIThreadInfo(tid, &mut gi).is_ok() && !gi.hwndCaret.0.is_null() {
+        // 【二十九修·caret 宿主合法性】GUITHREADINFO 的 caret 位置是
+        // 线程级残留——宿主窗已隐藏/最小化，值还在；explorer 全线程扫
+        // 描会命中任务栏搜索框/地址栏线程的残留 caret → 候选偶发掉任
+        // 务栏（用户实锤「偶发」）。两级共用此过滤：
+        //   1) hwndCaret 可见（IsWindowVisible）
+        //   2) hwndCaret 顶层窗不是任务栏族（Shell_TrayWnd 等）
+        //   3) 屏幕坐标在工作区内
+        let caret_valid = |gi: &GUITHREADINFO| -> Option<RECT> {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetAncestor, GetClassNameW, IsWindowVisible, GA_ROOT,
+            };
+            if gi.hwndCaret.0.is_null() || !IsWindowVisible(gi.hwndCaret).as_bool() {
+                return None;
+            }
+            let root = GetAncestor(gi.hwndCaret, GA_ROOT);
+            if !root.is_invalid() {
+                let mut buf = [0u16; 64];
+                let n = GetClassNameW(root, &mut buf);
+                if n > 0 {
+                    let cls = String::from_utf16_lossy(&buf[..n as usize]);
+                    if cls.contains("Shell_TrayWnd")
+                        || cls.contains("Shell_SecondaryTrayWnd")
+                        || cls.contains("TrayShowDesktop")
+                    {
+                        return None;
+                    }
+                }
+            }
             let w = (gi.rcCaret.right - gi.rcCaret.left).max(2);
             let mut pt = POINT {
                 x: gi.rcCaret.left,
                 y: gi.rcCaret.bottom,
             };
-            if windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt).as_bool() {
-                return Some(RECT {
-                    left: pt.x,
-                    top: pt.y,
-                    right: pt.x + w,
-                    bottom: pt.y,
-                });
+            if !windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt).as_bool() {
+                return None;
+            }
+            let rc = RECT {
+                left: pt.x,
+                top: pt.y,
+                right: pt.x + w,
+                bottom: pt.y,
+            };
+            if in_workarea(&rc) {
+                Some(rc)
+            } else {
+                None
+            }
+        };
+        // 第一级：前台窗口线程的 caret（经典路径，带合法性过滤）
+        let tid = GetWindowThreadProcessId(fg, None);
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gi).is_ok() {
+            if let Some(rc) = caret_valid(&gi) {
+                return Some(rc);
+            }
+        }
+        // 【二十八修·开始菜单跟随】第二级：前台进程全线程 caret 扫描。
+        // SearchHost（开始菜单）前台窗口是 CoreWindow，但搜索框 caret
+        // 在同进程另一线程的输入宿主窗（XAML/WindowsInputHost）——只查
+        // 前台窗口线程永远拿不到 → 锚点链全空 → 兜底 (12,12)（用户实锤
+        // 「A 窗口打过字后开始菜单候选位置不对」）。枚举前台进程的所有
+        // 线程逐个 GetGUIThreadInfo，找到 caret 非空且屏幕坐标在工作区
+        // 内的第一个（开始菜单场景通常只有搜索框有 caret）。
+        let mut fg_pid: u32 = 0;
+        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+        if fg_pid != 0 {
+            #[repr(C)]
+            struct ThreadEntry32 {
+                dw_size: u32,
+                cnt_usage: u32,
+                th32_thread_id: u32,
+                th32_owner_process_id: u32,
+                tp_base_pri: i32,
+                tp_delta_pri: i32,
+                dw_flags: u32,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+                fn Thread32First(snap: isize, entry: *mut ThreadEntry32) -> i32;
+                fn Thread32Next(snap: isize, entry: *mut ThreadEntry32) -> i32;
+                fn CloseHandle(h: isize) -> i32;
+            }
+            const TH32CS_SNAPTHREAD: u32 = 0x4;
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap != -1 {
+                let mut te = ThreadEntry32 {
+                    dw_size: std::mem::size_of::<ThreadEntry32>() as u32,
+                    cnt_usage: 0,
+                    th32_thread_id: 0,
+                    th32_owner_process_id: 0,
+                    tp_base_pri: 0,
+                    tp_delta_pri: 0,
+                    dw_flags: 0,
+                };
+                if Thread32First(snap, &mut te) != 0 {
+                    loop {
+                        if te.th32_owner_process_id == fg_pid && te.th32_thread_id != tid {
+                            let mut gi2 = GUITHREADINFO {
+                                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                                ..Default::default()
+                            };
+                            if GetGUIThreadInfo(te.th32_thread_id, &mut gi2).is_ok() {
+                                // 【二十九修】同款合法性过滤：隐藏窗/任务栏
+                                // 的残留 caret 一律不认（偶发掉任务栏根因）
+                                if let Some(rc) = caret_valid(&gi2) {
+                                    CloseHandle(snap);
+                                    return Some(rc);
+                                }
+                            }
+                        }
+                        if Thread32Next(snap, &mut te) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap);
             }
         }
         None
