@@ -2007,7 +2007,14 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             let degenerate = rect.bottom <= rect.top
                 || rect.right < rect.left
                 || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0);
-            if !degenerate {
+            // 【Excel 首键整框矩形 2026-09-12】Excel cell editor 首键
+            // GetTextExt 返回**整个编辑框**矩形（trace 实测宽 1584px，
+            // left=框左缘≠点击处，候选框「太偏」）——竖线 caret 锚恒窄
+            //（2-65px），超宽=整框烂锚：丢弃走系统插入符/est。Excel
+            // 第二键起返回正常窄矩形（60px）不受影响；正常宿主竖线
+            // 锚不会 >300 宽，零误伤。
+            let too_wide = rect.right - rect.left > 300;
+            if !degenerate && !too_wide {
                 last_ok = Some(rect);
             }
         }
