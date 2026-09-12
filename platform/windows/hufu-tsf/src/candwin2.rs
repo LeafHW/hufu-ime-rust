@@ -2045,6 +2045,16 @@ impl CandidateWindowV2 {
 
         let w = width as u32;
         let h = height as u32;
+        // 【词框候选诊断 2026-09-12】用户实测词框候选「右边字缺」——
+        // 打印布局输入与产物，一次复现定位宽度错在测量还是裁剪。
+        if crate::addword::is_open() {
+            crate::tsf::trace(&format!(
+                "cw2diag: cands={} 每行测量宽={:?} 编码行={} w={w} h={h} 行槽={row_h:.1} 横排={horizontal}",
+                cands.len(),
+                cand_ws.iter().map(|x| (x.0 as i32, x.1 as i32, (x.2 * 100.0) as i32)).collect::<Vec<_>>(),
+                code_row,
+            ));
+        }
         // 投影：shadow_radius>0 时窗口四周外扩边距，阴影画在边距里
         //（内容绘制整体平移进边距内，见渲染段 SetTransform）
         // 【阴影弱联动 2026-09-08】字号放大时阴影半径按 √比例 放大：
