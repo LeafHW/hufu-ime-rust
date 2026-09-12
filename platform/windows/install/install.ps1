@@ -25,6 +25,12 @@ $data = Join-Path $inst '数据'
 $dll  = Join-Path $inst 'hufu_tsf.dll'
 $exe  = Join-Path $inst 'hufu-server.exe'
 $icon = Join-Path $inst '图标.ico'
+# 【三十四修补 2026-09-13】$dll32/$sysdll32 原先只在提权段（$PhaseElevated
+# 块内）定义——主流程 Install-UserConfig 的 32 位视图注册引用 $null →
+# Test-Path 抛「参数绑定空值」（Continue 型：安装继续但 32 位 HKCU 视图
+# 被跳过，v1.5.3 起存量 bug）。提到脚本头全路径定义。
+$dll32     = Join-Path $inst 'hufu_tsf32.dll'
+$sysdll32  = Join-Path "$env:SystemRoot\SysWOW64\SystemIME\HuFu" 'hufu_tsf32.dll'
 # SystemIME 副本：开始菜单搜索/任务栏等 SystemApps 打包进程读不了用户目录
 # （%LOCALAPPDATA% 无 ALL APPLICATION PACKAGES 权限），DLL 必须住在
 # C:\Windows\SystemIME（系统输入法同款目录，打包进程可读）——2026-08-29
@@ -57,6 +63,22 @@ function Set-RegHKLM([string]$path, [string]$name, [string]$val) {
         $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(($path -replace '^HKLM:\\', ''), $true)
         if ($k) { $k.SetValue('', $val); $k.Close() }
     } else { Set-ItemProperty -Path $path -Name $name -Value $val -Type String }
+}
+
+# 【三十四修补 2026-09-13】smoke 的 msctf 原生登记（COM 调
+# ITfInputProcessorProfiles）在 CTF 服务未就绪的机器上会无限挂起
+#（本机实测：清理过 explorer/ctfmon 后重装，安装窗口卡死在「OK DLL →
+# SystemIME」之后）。同步调用（& exe）无超时手段——改 Start-Process
+# + 60 秒等待，超时杀进程按「跳过原生登记」处理（与无管理员分支同
+# 语义：文件与注册表已铺好，切换器列表可能要等 ctfmon 自愈）。
+function Invoke-SmokeReg([string]$regArg) {
+    $smokeExe = Join-Path $inst 'hufu-tsf-smoke.exe'
+    if (-not (Test-Path $smokeExe)) { return 0 }
+    $p = Start-Process $smokeExe -ArgumentList 'reg', $regArg -WindowStyle Hidden -PassThru
+    if ($p.WaitForExit(60000)) { return $p.ExitCode }
+    try { $p.Kill() } catch {}
+    Write-Host '⚠ msctf 登记超时（60 秒）——已跳过原生登记（注册表已写好，重开应用或重启后一般自愈）' -ForegroundColor Yellow
+    return 0
 }
 
 # ═══ 提权子阶段：只做 HKLM 注册 + msctf 登记，绝不启动 server ═══
@@ -185,8 +207,9 @@ if ($PhaseElevated) {
     Write-Host '—— 提权阶段：msctf 原生登记 ——'
     # 【修复标签 2026-09-11】退出码未传播：smoke 登记失败原先仍以 0 退出 →
     # 捕获退出码，提权阶段按真实结果退出（正常退出与失败双路径，任务7/D7）。
-    & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $sysdll
-    $rcSmoke = $LASTEXITCODE
+    # 【三十四修补】同步 & 调用换 Invoke-SmokeReg（60 秒超时，COM 服务未
+    # 就绪的机器不再无限挂死安装窗口）。
+    $rcSmoke = Invoke-SmokeReg $sysdll
     # 【顺序铁律·回写半边】完整安装下每用户段先写了 HKCU→安装目录 DLL
     # （当时 SystemIME 尚未建立）。此刻 SystemIME 已就位：HKCU COM 必须
     # 回写为 SystemIME 路径——否则打包进程（开始菜单/UWP）按 HKCU 优先
@@ -339,7 +362,7 @@ if (-not $NoHKLM) {
         Write-Host '⚠ 无管理员权限：msctf 输入法注册需机器级写入（TSF 平台限制，'
         Write-Host '  同类输入法如虎爪同样要求管理员）。文件与语言列表已铺好，'
         Write-Host '  但输入法要能用，需以管理员身份重跑本安装器完成登记。'
-        & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+        $null = Invoke-SmokeReg $icon
     }
 } else {
         # 本机已有机器级底座（SystemIME/HKLM 档案/8 分类）时，每用户装
@@ -351,7 +374,7 @@ if (-not $NoHKLM) {
             Write-Host '· -NoHKLM 且本机无机器级底座：输入法将不可用。全新机器'
             Write-Host '  首次安装请不带 -NoHKLM 运行（一次 UAC 完成机器级注册）。'
         }
-        & (Join-Path $inst 'hufu-tsf-smoke.exe') reg $icon
+        $null = Invoke-SmokeReg $icon
 }
 
 # ── 4) 语言列表（虎符插第 0 位=默认输入法）+ 切换器装配 ──
