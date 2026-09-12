@@ -742,12 +742,13 @@ fn handle_set_focus(
         let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
         trace("foc: A 取ctx");
         if let Some(ctx) = prev_ctx {
-            let payload = if is_code_form {
-                String::new()
+            // 编码形态走焦点冲销专用变体（选区在段内=抖动保组段）；
+            // 中文形态照旧落词（切窗保词语义不变）。
+            if is_code_form {
+                let _ = run_session_sync_only(shared, Op::CommitFocusRevoke, ctx);
             } else {
-                preedit.clone()
-            };
-            let _ = run_session_sync_only(shared, Op::Commit(payload), ctx);
+                let _ = run_session_sync_only(shared, Op::Commit(preedit.clone()), ctx);
+            }
         }
     }
     trace("foc: B commit完");
@@ -1291,6 +1292,10 @@ enum Op {
     StartPreedit(String),
     SetPreedit(String),
     Commit(String),
+    /// 焦点冲销专用（编码形态空冲销）：执行前先验选区是否仍在组段内
+    /// ——未离段=宿主焦点抖动（Excel cell editor 组段后重声明焦点），
+    /// 保组段不冲销；离段=真切换，空文本清段不落字母（防 WPS 残留）。
+    CommitFocusRevoke,
     /// 提前上屏：先提交前缀（结束当前组段），再开新组段继续显示剩余
     CommitAndRepreedit(String, String),
     /// 无组段直接插入文本（剪贴板上屏）
@@ -1456,6 +1461,32 @@ impl EditSession_Impl {
                 } else {
                     query_caret(&mut g, &ctx, ec);
                 }
+                Ok(())
+            }
+            Op::CommitFocusRevoke => {
+                // 【Excel 保组段 2026-09-12 三修】焦点冲销专用变体：冲销
+                // 前先验选区——仍在组段内=焦点从未真正离开（Excel cell
+                // editor 组段后重声明焦点：即时 4ms 型与首格 256ms 型
+                // 两型实测；docmgr 每次新建对象身份判定无效；时窗放宽
+                // 会误吞真切换）——保组段直接返回。真切换/切格选区必被
+                // 宿主挪走（drifted）→ 照旧冲销（空文本清段不落字母，
+                // 防 WPS A1 残留）。空格清屏走普通 Commit 不受影响。
+                let drifted = composition_drifted(&g, &ctx, ec);
+                if !drifted && g.composition.is_some() && !g.preedit_last.is_empty() {
+                    trace("CommitFocusRevoke: 选区在段内（宿主焦点抖动）——保组段");
+                    return Ok(());
+                }
+                trace("CommitFocusRevoke: 选区离段——真切换冲销");
+                if let Some(comp) = g.composition.clone() {
+                    if drifted {
+                        end_comp_clear(ec, &comp);
+                    } else if let Ok(range) = unsafe { comp.GetRange() } {
+                        let empty: Vec<u16> = Vec::new();
+                        let _ = unsafe { range.SetText(ec, 0, &empty) };
+                        let _ = unsafe { comp.EndComposition(ec) };
+                    }
+                }
+                g.composition = None;
                 Ok(())
             }
             Op::Commit(text) => {
