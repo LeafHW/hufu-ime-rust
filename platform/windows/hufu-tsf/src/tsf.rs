@@ -2529,6 +2529,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.cand2_dead
     ));
 
+    // 【词框候选内嵌 2026-09-12 八修】小窗线程：候选显示在加词/加权
+    // 小窗自己的预览区（GDI 同线程绘制），**不走 cw2**——候选窗的
+    // D2D 上下文由主线程创建，小窗线程跨线程绘制=未定义行为（实测
+    // 候选窗里画出小窗标签「权重（留空=1000）」的内存碎片、字被
+    // 裁错位——监视器+放大图实锤）。数字/空格选字仍走 dispatch →
+    // server → 小窗线程组段上屏（已验证链路）。cands 空=清空预览。
+    if crate::addword::in_window_thread() {
+        crate::addword::show_cands(&cands, &raw, sel);
+        return Ok(());
+    }
+
     // 【性能】皮肤拉取只在「无皮肤（首键）」时走按键路径——首次必须
     // 拉否则无皮肤可渲染。此后 2.5s 过期拉取全部挪到 poll_tick 的
     // 断段分支（raw 空）：改皮肤在下一组段生效，键路径零管道往返
