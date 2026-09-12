@@ -166,6 +166,11 @@ pub struct Shared {
     /// 冲销（Excel 对 EndComposition 的反应是把文本定格=首键字母
     /// 上屏）。真人点击切窗从最后一键到焦点事件物理上 >100ms。
     pub compose_at: Option<std::time::Instant>,
+    /// 【Excel 保组段 2026-09-12】CommitFocusRevoke 在 EditSession 内
+    /// 判定「选区在段内（宿主抖动）保组段」后置位——handle_set_focus
+    /// 读到即整体短路（跳过 B~F 全部清理：丢组段句柄/清状态/藏窗）。
+    /// 三修教训：只在 session 内保组段不够，后续清理照样杀组段。
+    pub focus_revoke_kept: bool,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
@@ -250,6 +255,7 @@ impl Shared {
             modekey_last: None,
             preedit_last: String::new(),
         compose_at: None,
+        focus_revoke_kept: false,
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
             caret_recheck_due: false,
@@ -745,7 +751,23 @@ fn handle_set_focus(
             // 编码形态走焦点冲销专用变体（选区在段内=抖动保组段）；
             // 中文形态照旧落词（切窗保词语义不变）。
             if is_code_form {
+                {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.focus_revoke_kept = false;
+                }
                 let _ = run_session_sync_only(shared, Op::CommitFocusRevoke, ctx);
+                let kept = {
+                    let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.focus_revoke_kept
+                };
+                if kept {
+                    // 【三修补 2026-09-12】EditSession 内已判定保组段——
+                    // 整个焦点处理短路：B~F 的清理（丢组段句柄/清 composing
+                    // /藏候选窗）全部跳过，否则照样把组段杀掉（三修实测：
+                    // session 保住了、清理照跑、's' 仍悬挂上屏）。
+                    trace("foc: 抖动保组段——短路清理，组段继续");
+                    return Ok(());
+                }
             } else {
                 let _ = run_session_sync_only(shared, Op::Commit(preedit.clone()), ctx);
             }
@@ -1474,6 +1496,7 @@ impl EditSession_Impl {
                 let drifted = composition_drifted(&g, &ctx, ec);
                 if !drifted && g.composition.is_some() && !g.preedit_last.is_empty() {
                     trace("CommitFocusRevoke: 选区在段内（宿主焦点抖动）——保组段");
+                    g.focus_revoke_kept = true;
                     return Ok(());
                 }
                 trace("CommitFocusRevoke: 选区离段——真切换冲销");
