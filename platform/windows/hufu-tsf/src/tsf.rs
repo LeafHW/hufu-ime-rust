@@ -159,6 +159,13 @@ pub struct Shared {
     pub modekey_last: Option<(usize, std::time::Instant)>,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
+    /// 【Excel 保组段 2026-09-12】最近一次 SP: SetText 成功时刻：
+    /// Excel cell editor 在组段 SetText 后**即时**（实测 4ms）重发
+    /// OnSetFocus（焦点从未离开，docmgr 对象每次新建身份比较无效）
+    /// ——组段建立后 80ms 内的焦点声明视为宿主抖动，保组段跳过
+    /// 冲销（Excel 对 EndComposition 的反应是把文本定格=首键字母
+    /// 上屏）。真人点击切窗从最后一键到焦点事件物理上 >100ms。
+    pub compose_at: Option<std::time::Instant>,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
@@ -242,6 +249,7 @@ impl Shared {
             stale_raw_until: None,
             modekey_last: None,
             preedit_last: String::new(),
+        compose_at: None,
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
             caret_recheck_due: false,
@@ -652,20 +660,31 @@ fn handle_set_focus(
             return Ok(());
         }
     }
-    // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段建立后
-    // ~250ms 会再发一次**同一文档**的 OnSetFocus（首键 SetText 触发
-    // 其内部焦点重声明，trace 实锤 composing=true prev=true 紧跟首键
-    // SP: SetText ok）——此前走到「旧文档冲销」把 preedit 冲销掉：
-    // Excel 对 EndComposition 的反应是把当前文本定格提交（首键字母
-    // 'd' 落格上屏），第二键才重新组段（用户实测「首键直通 2 键才有
-    // 候选」）。同 DocumentMgr 的重复声明=宿主焦点抖动而非真切换
-    //（docmgr 相同=同一编辑文档，焦点从未离开）——composing 中时
-    // 跳过冲销与清理，组段活着继续打。真切换（docmgr 不同）照旧。
+    // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段 SetText 后
+    // **即时**（trace 实测 4ms）重发 OnSetFocus——此前走到「旧文档冲销」
+    // 把 preedit 冲销：Excel 对 EndComposition 的反应是把当前文本定格
+    // 提交（首键字母 'd' 落格上屏，第二键才重新组段）。docmgr 身份比较
+    // 无效（Excel 每次声明传新建对象，首版修复实锤未命中）。改时间窗：
+    // 组段刚建立（最近 SP: SetText <80ms）且 composing 中=宿主焦点抖动
+    //（真人点击切窗从最后一键到焦点事件物理上 >100ms）——保组段跳过
+    // 冲销与清理。真切换（>80ms 或 docmgr 判定命中）照旧冲销。
     let same_doc = matches!((pdimfocus, pdimprevfocus), (Some(f), Some(p)) if f == p);
     if same_doc {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.composing && !g.preedit_last.is_empty() {
             trace("OnSetFocus: 同文档重复声明（宿主抖动）——保组段跳过");
+            return Ok(());
+        }
+    }
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.composing
+            && !g.preedit_last.is_empty()
+            && g
+                .compose_at
+                .is_some_and(|t| t.elapsed().as_millis() < 80)
+        {
+            trace("OnSetFocus: 组段刚建（<80ms 宿主抖动）——保组段跳过");
             return Ok(());
         }
     }
@@ -1372,6 +1391,8 @@ impl EditSession_Impl {
                 trace("SP: SetText ok");
                 // 选区跟随到组段末尾（否则下次插入点停在开头）
                 let _ = set_selection_at_end(&ctx, ec, &crange);
+                // 【Excel 保组段】组段建立时刻（焦点冲销的抖动判据）
+                g.compose_at = Some(std::time::Instant::now());
                 // 【十七次修正·SP 同步 raw】监控实锤（04:11:19）：SP 不更
                 // 新 cur_raw_len，重校把旧段 last_raw=19 当新段基准，下一
                 // 键 d=2-19=-17 → est 跳 -188px（窗被拽出屏）。
@@ -1549,6 +1570,8 @@ impl EditSession_Impl {
                         unsafe { crange.SetText(ec, 0, &wstr2)? };
                         let _ = set_selection_at_end(&ctx, ec, &crange);
                         g.composition = Some(comp);
+                        // 【Excel 保组段】重开组段同样记时戳（抖动判据）
+                        g.compose_at = Some(std::time::Instant::now());
                         // 【十四次修正】C&R 顶功重开段不重置键计数（同
                         // 位置续打，首查也过连续性过滤）。
                         // 【十七次修正】raw 同步（防重校吸入旧段 last_raw）。
@@ -1649,6 +1672,8 @@ impl EditSession_Impl {
                 unsafe { crange.SetText(ec, 0, &wstr2)? };
                 let _ = set_selection_at_end(&ctx, ec, &crange);
                 g.composition = Some(comp);
+                // 【Excel 保组段】重开组段同样记时戳（抖动判据）
+                g.compose_at = Some(std::time::Instant::now());
                 // 【十四次修正】C&R 顶功重开段=同位置续打，不重置段内
                 // 键计数——重开后的首查也过连续性过滤（est 已含 commit
                 // 宽，位置连续；烂锚走 est）。重置会让顶屏那键成为漏
