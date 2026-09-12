@@ -232,6 +232,41 @@ pub fn in_window_thread() -> bool {
         } == ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 【词框候选内嵌·标题栏 2026-09-12 八修】小窗线程的候选显示在小窗
+/// 标题栏（GDI 同线程），**不走 cw2 独立候选窗**——cw2 的 D2D 上下文
+/// 由主线程创建，小窗线程跨线程绘制=未定义行为（实测候选窗里画出
+/// 本窗标签「权重（留空=1000）」的内存碎片、右侧字裁错——窗口监视
+/// +放大图实锤）。标题显示「编码 ｜ 1词 2词 …」；数字/空格选字仍走
+/// dispatch → server → 小窗线程组段上屏（已验证链路）。候选清空恢复
+/// 原标题。
+pub fn show_cands(cands: &[(String, String)], raw: &str, _sel: usize) {
+    let h = current_hwnd();
+    if h == 0 {
+        return;
+    }
+    let hwnd = HWND(h as *mut _);
+    let base = if is_weight_mode() { "虎符 · 加权" } else { "虎符 · 加词" };
+    let title: String = if cands.is_empty() {
+        if raw.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base} ｜ {raw}_")
+        }
+    } else {
+        let items: Vec<String> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, (t, _))| format!("{}.{}", i + 1, t))
+            .collect();
+        format!("{base} ｜ {raw} → {}", items.join(" "))
+    };
+    let mut w: Vec<u16> = title.encode_utf16().collect();
+    w.push(0);
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    }
+}
+
 /// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
 /// 结束清零。短锁使用，绝不跨消息循环持有。
 static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
