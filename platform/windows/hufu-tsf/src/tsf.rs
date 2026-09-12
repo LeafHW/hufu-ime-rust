@@ -2351,6 +2351,17 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 
 /// 引擎结果 → 组段与候选窗更新。
 fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    // 【函数级终极门 2026-09-12 十三修】小窗打开期间，主线程的
+    // update_ui **一律直接返回**——十二修只堵 dispatch 入口，实测
+    // 「、」候选窗仍在 VSCode 光标处出现（渲染入口比预想多：timer/
+    // poll/焦点路径都可能到达）。update_ui 是唯一渲染入口，函数头
+    // 一刀切死最稳。小窗线程不受影响（词框候选/组段照常）。副作用：
+    // 主线程的组段操作（commit 冲销等）也被跳过——但小窗期间主文档
+    // 本就不该有组段活动（键全被直通门放行），commit 为空即无操作。
+    if crate::addword::is_open() && !crate::addword::in_window_thread() {
+        trace("update_ui: 主线程·小窗期间——终极门拦截");
+        return Ok(());
+    }
     // 停顿期轮询武装（幂等；进程内一次）+ 记录本次展示签名
     poll_arm(&shared);
     {
