@@ -1408,7 +1408,8 @@ impl EditSession_Impl {
                 g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
                 g.seg_key_index += 1;
                 if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
-                    if let Some(r) = gui_caret_fallback() {
+                    if let Some(mut r) = gui_caret_fallback() {
+                        hupo_clamp(&mut r);
                         g.caret_force = false;
                         g.caret = Some(r);
                     } else {
@@ -1805,6 +1806,32 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
     r.ok_or_else(|| Error::from(HRESULT(-2147467259)))
 }
 
+/// 【虎魄跟打器横向滚动钳制 2026-09-12】监控实锤（08:04 时段）：跟打器
+/// 打字区=单行横向滚动，GetTextExt 返回**文档坐标**（行首+累计文本宽，
+/// 一路右涨）——候选窗锚点 X 冲出主窗右边界 420px 在桌面飘（2269>
+/// 1849）；上屏全宽一步进 +316px 大跳。真实屏幕 caret 因文本左滚保持
+/// 在可视区内。修：锚点 X 钳到宿主窗内（右缘 -60 钉住，左缘 +20 兜
+/// 底）——横向滚动模式 caret 视觉上贴打字区右侧，钳制即近似真实位
+/// 置；Y 监控正常不动。仅虎魄跟打器（单行打字区语义），其余宿主不受
+/// 影响。
+fn hupo_clamp(rect: &mut RECT) {
+    if !exe_is_hupo() {
+        return;
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return;
+    }
+    let mut wr = RECT::default();
+    if unsafe { GetWindowRect(fg, &mut wr) }.is_err() || wr.right <= wr.left {
+        return;
+    }
+    let capped = rect.left.min(wr.right - 60).max(wr.left + 20);
+    let d = capped - rect.left;
+    rect.left = capped;
+    rect.right += d;
+}
+
 /// 【增量估算步进 2026-09-12 十二次修正】单源锚：每键 x += (raw 增量)
 /// ×0.41×行高；行内累计超行宽（前台窗宽-160）折行：y+=行高、x 回行
 /// 首。上屏宽度由 Commit/C&R 直接累加（0.6 全角/0.41 半角）。成功查询
@@ -1831,10 +1858,15 @@ fn est_step(g: &mut Shared) {
         if unsafe { GetWindowRect(fg, &mut wr) }.is_ok() && wr.right > wr.left {
             let line_w = (wr.right - wr.left - 160).max(240);
             let mut wrapped = false;
-            while g.caret_est_wrap > line_w {
-                g.caret_est_wrap -= line_w;
-                g.caret_est_y += lh;
-                wrapped = true;
+            // 【虎魄单行语义】跟打器打字区不折行（横向滚动）——折行会
+            // 凭空 +行高 把锚点推到下一行（监控 Y 实测恒定不换行）。
+            // 出窗由 hupo_clamp 钳制吸收。
+            if !exe_is_hupo() {
+                while g.caret_est_wrap > line_w {
+                    g.caret_est_wrap -= line_w;
+                    g.caret_est_y += lh;
+                    wrapped = true;
+                }
             }
             if wrapped {
                 g.caret_est_x = wr.left + 90 + g.caret_est_wrap;
@@ -1847,6 +1879,8 @@ fn est_step(g: &mut Shared) {
             }
         }
     }
+    // 【虎魄钳制】est 矩形出窗（文档坐标累计宽）时钳回宿主窗内右带。
+    hupo_clamp(&mut est);
     g.caret = Some(est);
     trace(&format!(
         "qc: est=({},{}) step={} raw={}",
@@ -1870,7 +1904,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 跳），改查系统插入符（GUITHREADINFO，零 TSF 回调不进布局锁）
     // ——上屏后插入符在上屏文字尾，恰好是「上屏动一次」要的位置。
     if exe_is_hupo() {
-        if let Some(r) = gui_caret_fallback() {
+        if let Some(mut r) = gui_caret_fallback() {
+            hupo_clamp(&mut r);
             g.caret = Some(r);
             return;
         }
@@ -1929,7 +1964,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             }
         }
     }
-    let Some(rect) = last_ok else {
+    let Some(mut rect) = last_ok else {
         // 两次均失败/退化：先试系统插入符（打包宿主 GetTextExt 常态
         // 失败——但段内 SetSelection 已把插入符推到段尾/上屏后 commit
         // 尾，系统插入符恰是要的锚点）。
@@ -2014,6 +2049,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         }
     }
     // 成功查询=增量估算重校点：步进位置对齐真实矩形。
+    // 【虎魄钳制】跟打器 GetTextExt 返回文档坐标（横向滚动累计宽，
+    // 监控实测一路涨出主窗右缘 420px）——钳到宿主窗内右带后再对齐
+    // est 基线（est 从钳位点起步，est 矩形天然在窗内）。
+    hupo_clamp(&mut rect);
     g.caret_est_x = rect.left;
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
