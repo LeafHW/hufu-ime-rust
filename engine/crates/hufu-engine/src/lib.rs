@@ -2534,6 +2534,13 @@ impl Engine {
         // 要打「舒服」规范打法 ja2vz）。rerank 换序不得把深度超过原
         // 首选的候选提到前面——Qwen 觉得「舒服/坏人/势力」是高频词也
         // 不行：那是在替用户付出他没同意的选重代价。
+        // 【隐式二选钉位 2026-09-12】implicit2 真词（过 SENT_PHRASE_
+        // FRONT_FLOOR，初排已压最前）不参与 Qwen 重排——保持初排位。
+        // 用户实测「奴隶/羊羔/桎梏有的首选有的不是，要等一下重排」：
+        // Qwen 排序对这些 3/4 码二选组合词不如 ngram 稳（且旧缓存
+        // 命中时立即覆盖初排首位）。打了 6 键二选组合=意图明确，
+        // ngram 权重序就是用户拍板的「权重高才首选」。
+        let mut pin_set: std::collections::HashSet<String> = Default::default();
         let depth_map: std::collections::HashMap<String, usize> = self
             .sentence
             .as_ref()
@@ -2541,11 +2548,21 @@ impl Engine {
                 dec.decode_rich(&key)
                     .hits
                     .iter()
-                    .map(|h| (h.text.clone(), h.sum_rank))
+                    .map(|h| {
+                        if h.implicit2 && h.score > SENT_PHRASE_FRONT_FLOOR {
+                            pin_set.insert(h.text.clone());
+                        }
+                        (h.text.clone(), h.sum_rank)
+                    })
                     .collect()
             })
             .unwrap_or_default();
         let base_depth = depth_map.get(&session.candidates[idxs[0]].text).copied();
+        let pos_map: std::collections::HashMap<usize, usize> = idxs
+            .iter()
+            .enumerate()
+            .map(|(ord, &i)| (i, ord))
+            .collect();
         let mut sorted: Vec<usize> = idxs.clone();
         // 【过程态硬防御】partial（未消耗全部 raw 的前缀形态）恒沉底：
         // 即使旧缓存（过滤前产生的 Qwen 顺序）含过程态文本也不得提前
@@ -2553,10 +2570,14 @@ impl Engine {
         // 【深度约束】完整态中 sum_rank 超过原首位深度者沉到缺席者
         // 之前（仍在候选可见，只是不占前）。无深度数据（decode 未返）
         // 时不约束。
+        // 【隐式二选钉位】pin 成员固定初排序（idxs 原序），Qwen 序只
+        // 排其余候选。
         sorted.sort_by_key(|&i| {
             let c = &session.candidates[i];
             if c.partial {
                 usize::MAX
+            } else if pin_set.contains(&c.text) {
+                pos_map.get(&i).copied().unwrap_or(usize::MAX - 3)
             } else if let (Some(base), Some(&d)) = (base_depth, depth_map.get(&c.text)) {
                 if d > base {
                     usize::MAX - 1
