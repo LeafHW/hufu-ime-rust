@@ -3608,6 +3608,20 @@ impl CandidateWindowV2 {
                     }
                     None => (tx, ty),
                 };
+                // 【三十九修·显示层观测】用户实锤"候选在两个位置来回
+                // 跳"而锚序列（qc: raw/est）完全平滑——跳在锚→窗位
+                // 置的显示层（suppress 补显/滑动/钳位交替），此前零
+                // 观测=盲区。每次目标位移 >10px 打一行（小步进不打防
+                // 日志爆炸），诊断直读。
+                {
+                    let (lx2, ly2) = self.live_pos.get();
+                    let dd = (tx - lx2).abs().max((ty - ly2).abs());
+                    if dd > 10 {
+                        crate::tsf::trace(&format!(
+                            "cw2: pos 目标({tx},{ty}) 当前({lx2},{ly2}) d={dd}"
+                        ));
+                    }
+                }
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
