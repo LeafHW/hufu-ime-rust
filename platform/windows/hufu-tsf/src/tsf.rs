@@ -652,6 +652,23 @@ fn handle_set_focus(
             return Ok(());
         }
     }
+    // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段建立后
+    // ~250ms 会再发一次**同一文档**的 OnSetFocus（首键 SetText 触发
+    // 其内部焦点重声明，trace 实锤 composing=true prev=true 紧跟首键
+    // SP: SetText ok）——此前走到「旧文档冲销」把 preedit 冲销掉：
+    // Excel 对 EndComposition 的反应是把当前文本定格提交（首键字母
+    // 'd' 落格上屏），第二键才重新组段（用户实测「首键直通 2 键才有
+    // 候选」）。同 DocumentMgr 的重复声明=宿主焦点抖动而非真切换
+    //（docmgr 相同=同一编辑文档，焦点从未离开）——composing 中时
+    // 跳过冲销与清理，组段活着继续打。真切换（docmgr 不同）照旧。
+    let same_doc = matches!((pdimfocus, pdimprevfocus), (Some(f), Some(p)) if f == p);
+    if same_doc {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.composing && !g.preedit_last.is_empty() {
+            trace("OnSetFocus: 同文档重复声明（宿主抖动）——保组段跳过");
+            return Ok(());
+        }
+    }
     let (composing, preedit) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【焦点代际 2026-09-09】真实焦点事件到达即 +1：此前请求的
