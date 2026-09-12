@@ -653,7 +653,9 @@ fn handle_set_focus(
     pdimfocus: Option<&ITfDocumentMgr>,
     pdimprevfocus: Option<&ITfDocumentMgr>,
 ) -> Result<()> {
-    let _ = pdimfocus;
+    // pdimfocus：冲销目标兜底用（Excel 第三次声明 prev=NULL，四修
+    // 实锤 prev_ctx=None 绕过冲销分支直通清理杀组段——焦点 ctx 即
+    // 组段所在文档，用它跑保组段判定）。
     // 【交互守卫】鼠标悬停在候选窗上 = 用户正在拖拽/右键固定。
     // 点击候选窗会让宿主连发 docmgr 焦点事件（实测点击即触发
     // OnSetFocus）——此刻绝不能清组段/隐藏候选窗（表现为「点击
@@ -745,7 +747,15 @@ fn handle_set_focus(
         // 进行中）原样 commit 会把字母写进旧单元格（WPS 表格实测：
         // A1 打 d 点 B2，A1 出字母 d）——改为冲销组段（清空不写）。
         let is_code_form = !raw_last.is_empty() && preedit == raw_last;
-        let prev_ctx = pdimprevfocus.and_then(|d| unsafe { d.GetTop().ok() });
+        // 【五修补 2026-09-12】Excel 第三次声明 prev=NULL（trace 实锤
+        // composing=true prev=false 紧跟第二次之后 3ms）——prev_ctx=None
+        // 绕过冲销分支，清理直通把组段杀掉。兜底：prev 缺席时用**焦点
+        // ctx**（即组段所在文档）跑同款判定——选区在段内=抖动保组段；
+        // 真切换时组段与选区分属两文档，跨文档 Compare 失败按保守处理
+        // （保组段），悬挂的旧段由宿主按契约终止（原路径本也冲销不了）。
+        let prev_ctx = pdimprevfocus
+            .and_then(|d| unsafe { d.GetTop().ok() })
+            .or_else(|| pdimfocus.and_then(|d| unsafe { d.GetTop().ok() }));
         trace("foc: A 取ctx");
         if let Some(ctx) = prev_ctx {
             // 编码形态走焦点冲销专用变体（选区在段内=抖动保组段）；
