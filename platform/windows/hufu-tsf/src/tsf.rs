@@ -90,10 +90,11 @@ pub fn tl_cand_put_back(c: Option<CandidateWindowV2>) {
     TL_CAND2.with(|t| *t.borrow_mut() = c);
 }
 /// 小窗线程的候选窗渲染（懒创建；参数与 g.cand2.show 同构）。
-/// 【竖排强制 2026-09-12 十一修】词框场景强制竖排——横排宽度公式在
-/// raw 为空（词框组段无编码行）时算出的窗宽装不下「序号+词」（实测
-/// w=93 装序号+22+43 溢出→序号被裁/"右边字缺"）；竖排布局每行=序号
-/// +词，主线程大量使用成熟稳定。
+/// 【皮肤原样 2026-09-12 二十一修】用户实锤「皮肤跟用的不一样、显示
+/// 不全、动效没有」——此前强制竖排（覆盖横排皮肤布局）+零动效（tick
+/// 接不上）都是绕跨线程问题的错误妥协。现在：皮肤原样（用户横排就
+/// 横排，宽度自适应公式成熟）、动效由 fade_tick_shared 的 TL 完整
+/// 步进路径驱动（同款动画体验）。
 fn tl_cand_show(
     cands: &[(String, String)],
     raw: &str,
@@ -101,29 +102,13 @@ fn tl_cand_show(
     anchor: Option<&RECT>,
     selected: usize,
 ) {
-    let mut skin_v = skin.clone();
-    // 竖排覆盖写两级（读取优先 /skin/layout/horizontal，次顶层 layout）
-    if let Some(obj) = skin_v.as_object_mut() {
-        obj.insert(
-            "layout".into(),
-            serde_json::json!({ "horizontal": false }),
-        );
-        obj.insert(
-            "skin".into(),
-            serde_json::json!({ "layout": { "horizontal": false } }),
-        );
-    }
     TL_CAND2.with(|t| {
         let mut slot = t.borrow_mut();
         if slot.is_none() {
             *slot = CandidateWindowV2::new();
         }
         if let Some(c) = slot.as_mut() {
-            // 【零动效·二十修】前后双杀：先清（show 首帧不带动画起点
-            // ——小尺寸/透明起始帧），show 武装后再杀+停表。
-            c.kill_animations();
-            c.show(cands, raw, &skin_v, anchor, selected);
-            c.kill_animations();
+            c.show(cands, raw, skin, anchor, selected);
         }
     });
 }

@@ -3670,16 +3670,89 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     // 渲染（「、」残留窗、跨线程 D2D 损坏内容）。小窗线程：动画全
     // 跳过（词框候选不需要花式动画——tl_cand_show 首帧已完整渲染）。
     if crate::tsf::addword_tl_thread() {
-        let mut tl = crate::tsf::tl_cand_take();
-        if let Some(c) = tl.as_mut() {
-            c.fade = None;
-            c.size_anim = None;
-            c.pos_anim = None;
-            c.chrome_override.set(None);
-            c.scale_in.set(false);
+        // 【动效接上·二十一修】词框候选的动画 tick 完整步进（与主线程
+        // 路径同款：渐隐/拉伸/滑动），操作对象=TL 实例（本线程的窗），
+        // 绝不碰 g.cand2（那是主线程窗——跨线程 show=残留窗根因）。
+        // last_show 数据复用 g 的（小窗线程 update_ui 写的就是词框候选）。
+        let Some(gsh) = crate::tsf::G_SHARED.get() else {
+            return;
+        };
+        let shared = gsh.0.clone();
+        let (mut tl, last, skin) = {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                crate::tsf::tl_cand_take(),
+                g.last_show.clone(),
+                g.skin.clone(),
+            )
+        };
+        let mut anim_done = true;
+        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last) {
+            let had_fade = c.fade.is_some();
+            let fade_done = c.fade_tick();
+            if had_fade && c.is_visible() {
+                c.internal_rerender = true;
+                // 【锚点修正 2026-09-12 二十二修】tick 复渲染不传
+                // anchor——g.caret 是主文档旧值（记事本光标），tick 每帧
+                // 拿它定位=窗被拽回主文档（实测 x=38 y=145 持续覆盖渲染
+                // 帧的正确位 1108,826）。anchor=None → 定位链走 sticky
+                // （上次渲染帧位置=词框下，渲染帧 anchor=系统插入符正
+                // 确）。fade/size/pos 动画用自身状态照走。
+                c.show(&cands, &raw, &skin, None, sel);
+                c.internal_rerender = false;
+                shadowwin_set_alpha(c.fade_alpha());
+                if fade_done {
+                    shadowwin_set_alpha(1.0);
+                }
+            }
+            if let Some((f, t, t0)) = c.size_anim {
+                let ms = t0.elapsed().as_millis() as u32;
+                let cur = size_ease(f, t, ms, c.size_ms);
+                let finished = cur == t;
+                if finished {
+                    c.size_anim = None;
+                    c.chrome_override.set(None);
+                    c.scale_in.set(false);
+                } else {
+                    anim_done = false;
+                    c.chrome_override.set(Some(cur));
+                }
+                c.live_size.set(cur);
+                if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, None, sel);
+                    c.internal_rerender = false;
+                }
+            }
+            if let Some((f, t, t0, dur)) = c.pos_anim {
+                let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
+                if cur == t {
+                    c.pos_anim = None;
+                    c.live_pos.set(t);
+                } else {
+                    anim_done = false;
+                    c.live_pos.set(cur);
+                    if c.is_visible() {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            cur.0,
+                            cur.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            }
+            if c.fade.is_some() {
+                anim_done = false;
+            }
+        }
+        if anim_done {
+            let _ = KillTimer(hwnd, FADE_TIMER_ID);
         }
         crate::tsf::tl_cand_put_back(tl);
-        let _ = KillTimer(hwnd, FADE_TIMER_ID);
         return;
     }
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
@@ -3790,9 +3863,29 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
         let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
         return;
     }
-    // 【动画 tick 线程感知·十七修】同 fade_tick：小窗线程不碰 g.cand2
+    // 【动画 tick 线程感知·二十一修】小窗线程：注释展开同样走 TL 实例
     if crate::tsf::addword_tl_thread() {
-        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+        let Some(gsh) = crate::tsf::G_SHARED.get() else {
+            return;
+        };
+        let shared = gsh.0.clone();
+        let (mut tl, last, skin) = {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                crate::tsf::tl_cand_take(),
+                g.last_show.clone(),
+                g.skin.clone(),
+            )
+        };
+        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last) {
+            if !c.comments_expanded {
+                c.comments_expanded = true;
+                let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                // 【锚点修正·二十二修】同 fade tick：anchor=None 钉 sticky
+                c.show(&cands, &raw, &skin, None, sel);
+            }
+        }
+        crate::tsf::tl_cand_put_back(tl);
         return;
     }
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
