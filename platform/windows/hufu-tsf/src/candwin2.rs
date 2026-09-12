@@ -3284,12 +3284,18 @@ impl CandidateWindowV2 {
                     Some(r) => {
                         // 【实时光标跟随 2026-09-12 用户拍板】窗最左=
                         // 光标最右（rect.right）——紧贴光标右侧出现。
-                        let x = (r.right).clamp(vx, (vx + vw - width as i32).max(vx));
+                        // 【三十八修·总高屏幕判断】x/y 的 clamp 与翻转
+                        // 判断原用内容高宽——最终窗口还外扩 2×m_off
+                        //（阴影边距，大皮肤 20-40px）：竖排候选行多窗高
+                        // +大阴影时底部出屏 40-80px（用户实测"竖排靠下
+                        // 超出屏幕"）。统一改用含阴影的总尺寸。
+                        let ext = 2 * m_off;
+                        let x = (r.right).clamp(vx, (vx + vw - width as i32 - ext).max(vx));
                         let below = r.bottom + 4;
-                        let y = if below + height as i32 <= vy + vh {
+                        let y = if below + height as i32 + ext <= vy + vh {
                             below
                         } else {
-                            (r.top - height as i32 - 4).max(vy)
+                            (r.top - height as i32 - ext - 4).max(vy)
                         };
                         // 【删棘轮 2026-09-12 十六次修正】poll 真实帧的
                         // 小拉回（2-15px）正是校准（est 单键误差），棘轮
@@ -3566,10 +3572,16 @@ impl CandidateWindowV2 {
                     let d = (tx - lx).abs().max((ty - ly).abs());
                     // 【大跳瞬跳·三十二修】用户拍板「光标在哪候选就从哪
                     // 出来，不从别的地方过来」——大距离跳变（点击换位/
-                    // 反查跳行/切窗级，>40px）不再滑动，直接出现在新光
-                    // 标处；打字小步进（≤40px，11px/键、快打 22px）保留
-                    // 滑动节奏（记事本跟手流畅的来源，用户认可过）。
-                    if d > 40 {
+                    // 反查跳行/切窗级，>150px）不再滑动，直接出现在新光
+                    // 标处。
+                    // 【三十八修·打字期快速滑动】40-150px 档原先也瞬跳
+                    // ——est 批步进（重查帧一次 +多键）与真实帧拉回正
+                    // 落这档（虎魄 344px 校准后 ~50px、QQ 重校 210px
+                    // 拦截放开后 40-100px），瞬跳=用户"打着打着突然跳
+                    // 很远"。改快速滑动（90-160ms）：位置变化可见但成
+                    // 一个连续动作，非闪现。步宽自适应落地后这档出现
+                    // 频率大降，滑动只是兜底。
+                    if d > 150 {
                         self.pos_anim = None;
                     } else if d >= 3 {
                         // 【统一节奏 2026-09-12 十次修正】小步进（3-6px）也
@@ -3579,7 +3591,9 @@ impl CandidateWindowV2 {
                         // 长滑动被下一键打断，窗恒滞后锚（用户「跟不上」）。
                         // 时长按距离动态：小步短滑（60ms 下限）大步快滑。
                         // 【二十次修正 2026-09-12 用户拍板】上限 100ms。
-                        let dur = (d as u32 * 5).clamp(60, 100);
+                        // 【三十八修】40-150px 档（打字期批步进/拉回）上限
+                        // 提到 160ms——距离更大需要稍长滑行才不显急促。
+                        let dur = (d as u32 * 5).clamp(60, if d > 40 { 160 } else { 100 });
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
                         unsafe {
                             let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
