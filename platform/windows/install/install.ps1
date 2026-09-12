@@ -1,4 +1,6 @@
-﻿# HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
+﻿# 【同步 2026-09-11】主=E:\DSH-KF\hufu-发行\打包源\install.ps1（本文件，真实使用）；
+#   从=E:\DSH-KF\hufu\发行脚本\install.ps1（仓库副本）：以本文件为准整文件同步，改动一律改本文件后覆盖从文件。
+# HuFu 虎符输入法 — 安装脚本（双阶段：普通权限主导，提权只做注册）
 # - 文件/HKCU/语言列表/自启/server 永远普通权限执行（server 提权启动会锁管道 ACL，
 #   导致所有普通应用连不上→只能打字母，2026-08-29 实测教训）。
 # - HKLM 机器级键 + msctf 原生登记（本机实测需提权才 0x00000000）交给一次 UAC 的
@@ -29,6 +31,13 @@ $icon = Join-Path $inst '图标.ico'
 # 实测：SearchHost 不加载用户目录 DLL → 搜索框字母直通。
 $sysdir = 'C:\Windows\SystemIME\HuFu'
 $sysdll = Join-Path $sysdir 'hufu_tsf.dll'
+
+# 【虎爪保护 2026-09-11】升级检测：本输入法 TIP 键已存在 = 升级安装。
+# ctfmon 重启会触发 msctf 对 TIP 存储的一致性校验，注册结构非原生的
+# 第三方输入法（虎爪）概率被判非法周期删除（用户复报「安装概率杀
+# 死虎爪」）。升级场景：TIP 早已在列表，新文件随应用重开生效，无
+# 需刷新——跳过 ctfmon 杀启；仅首次安装（键不存在）才刷新。
+$tipAlready = (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") -or (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID")
 
 function Set-Reg([string]$path, [string]$name, [string]$val) {
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
@@ -269,6 +278,20 @@ function Install-UserConfig {
     Set-RegDWord $lpU 'IconIndex' 0
     Set-Reg $lpU 'IconFile' $dllReg       # SystemIME 副本（打包进程可读）
     Set-Reg $lpU 'Icon' "$dllReg,0"       # 图标双写（3544b61：Index+字符串两制式）
+
+    # 【32 位宿主注册 2026-09-12 v1.5.3】32 位进程（Pain 跟打器等）的
+    # COM 解析读 HKCU 的 Wow6432Node 视图（InprocServer32 键重定向），
+    # 缺键时回落 HKLM→SysWOW64——未提权安装（-NoHKLM/无 SystemIME 副本）
+    # 时 32 位宿主将无 DLL 可载（v1.5.2 实测 Pain 跟打器全旧版）。
+    # 提权安装指向 SystemIME 32 位副本；未提权指向安装目录。
+    if (Test-Path $dll32) {
+        $dllReg32 = if (Test-Path $sysdll32) { $sysdll32 } else { $dll32 }
+        $wowU = "HKCU:\Software\Classes\Wow6432Node\CLSID\$CLSID"
+        Set-Reg $wowU '(default)' 'HuFu TSF Service'
+        Set-Reg "$wowU\InprocServer32" '(default)' $dllReg32
+        Set-Reg "$wowU\InprocServer32" 'ThreadingModel' 'Apartment'
+        Write-Host "OK HKCU 32 位视图已注册（DLL → $dllReg32）"
+    }
     Write-Host "OK HKCU COM + TIP 键树已注册（DLL → $dllReg）"
     return $true
 }
@@ -287,9 +310,12 @@ if (-not (Install-UserConfig)) { exit 1 }   # 默认主流程：行为与拆分�
 # ── 3) 提权注册（HKLM + msctf；一次 UAC，日志回流本窗口）──
 if (-not $NoHKLM) {
     if ($isAdmin) {
-        & $PSCommandPath -PhaseElevated
-        # 【修复标签 2026-09-11】提权子阶段失败原先静默继续 → 检查退出码并告警（不中断主流程）
-        if ($LASTEXITCODE -ne 0) { Write-Host "⚠ 提权阶段退出码 $LASTEXITCODE（msctf 登记可能未完成）" }
+        # 【三十四修 2026-09-13】& 调用 .ps1 不设置 $LASTEXITCODE（只有原生
+        # exe 才设）——旧判定 `$LASTEXITCODE -ne 0` 对 $null 恒真，管理员
+        # 直跑时代每次都打假告警「msctf 登记可能未完成」。改查 $?
+        # （脚本 exit 1 → $? 为 false）。
+        $null = & $PSCommandPath -PhaseElevated
+        if (-not $?) { Write-Host '⚠ 提权阶段报告失败（msctf 登记可能未完成）' }
     } elseif ($inAdminGroup) {
         Write-Host '（弹出 UAC：机器级注册 + msctf 登记，请点「是」）'
         $elog = Join-Path $env:TEMP 'hufu-install-elevated.log'
@@ -384,9 +410,15 @@ Start-Sleep -Seconds 2
 # 非原生/不完整的第三方输入法（如虎爪）判非法周期删除——「装完
 # HuFu 虎爪从列表消失」的概率性根因。ctfmon 重载即可让新 TIP 进
 # Win+空格列表，无需动 shell 组件。
-Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
-Start-Process ctfmon -ErrorAction SilentlyContinue
+# 【2026-09-11 虎爪保护二阶】ctfmon 重启本身仍会触发同款校验——升级
+# 安装（$tipAlready）完全跳过刷新；仅首次安装执行。
+if (-not $tipAlready) {
+    Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    Start-Process ctfmon -ErrorAction SilentlyContinue
+} else {
+    Write-Host 'OK 升级安装：跳过 ctfmon 刷新（虎爪保护；新文件随应用重开生效）'
+}
 
 Write-Host ''
 Write-Host '=========================================='
