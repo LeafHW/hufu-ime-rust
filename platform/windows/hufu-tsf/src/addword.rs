@@ -218,12 +218,30 @@ pub fn current_hwnd() -> isize {
     *ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// 小窗线程 id 登记（0=无）——五修：dispatch 直通门只挡非小窗线程。
+static ADDWORD_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 当前线程是否小窗线程——直通门放行判定（词框键由小窗线程自己的
+/// sink 处理，主线程的才需要直通防残留）。
+pub fn in_window_thread() -> bool {
+    ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+            GetCurrentThreadId()
+        } == ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
 /// 结束清零。短锁使用，绝不跨消息循环持有。
 static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
 fn open_common() {
     std::thread::spawn(|| unsafe {
+        // 登记小窗线程 id（五修：直通门判定用）
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+        ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
         // 【词框 TSF 化 2026-09-12 三修】线程 TSF 化的完整链：STA COM
         // → 显式 CoCreateInstance(ThreadMgr)（msctf 判定线程 TSF-
         // enabled 的标志=线程持有 ThreadMgr；只有 CoInitialize 不够，
@@ -271,16 +289,37 @@ fn open_common() {
                 0x0804u16,
                 &crate::com::PROFILE_GUID,
             )?;
-            let tm = _tm.as_ref().map_err(|e| e.clone())?;
-            let tid = tm.Activate()?;
+            let tm = match _tm.as_ref() {
+                Ok(t) => t.clone(),
+                Err(e) => {
+                    crate::tsf::trace(&format!("addword自激活: ThreadMgr缺失 {e:?}"));
+                    return Err(e.clone());
+                }
+            };
+            let tid = match tm.Activate() {
+                Ok(t) => t,
+                Err(e) => {
+                    crate::tsf::trace(&format!("addword自激活: ThreadMgr.Activate失败 {e:?}"));
+                    return Err(e);
+                }
+            };
             crate::tsf::set_thread_tm(tm.clone(), tid);
             let tip: windows::Win32::UI::TextServices::ITfTextInputProcessor =
-                windows::Win32::System::Com::CoCreateInstance(
+                match windows::Win32::System::Com::CoCreateInstance(
                     &crate::CLSID_HUFU_TSF,
                     None,
                     windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
-                )?;
-            tip.Activate(tm, tid)?;
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        crate::tsf::trace(&format!("addword自激活: CoCreate自家CLSID失败 {e:?}"));
+                        return Err(e);
+                    }
+                };
+            if let Err(e) = tip.Activate(&tm, tid) {
+                crate::tsf::trace(&format!("addword自激活: tip.Activate失败 {e:?}"));
+                return Err(e);
+            }
             crate::tsf::trace(&format!(
                 "addword: 小窗线程 TIP 已自激活 tid={tid}（词框键 sink 装上）"
             ));
@@ -368,6 +407,8 @@ fn open_common() {
         // 消息循环退出（窗口已销毁）——清登记，下次 open 可再建
         let mut guard = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
         *guard = 0;
+        // 清线程 id（防系统复用该 tid 时误判 in_window_thread）
+        ADDWORD_TID.store(0, std::sync::atomic::Ordering::Relaxed);
     });
 }
 

@@ -1029,13 +1029,13 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
-        // 【加词/加权小窗直通 2026-09-12 v1.5.3+】/jc /jq 弹窗打开且
-        // **处于前台**时，本（主文档）sink 的按键直通——小窗有独立
-        // 输入上下文，激活间隙里键被主文档组段吃掉（原光标 preedit
-        // 残留+候选框弹主文档旁，trace 实锤）。仅前台判定：用户点回
-        // 主文档（或小窗销毁）立即恢复本 sink 正常处理——首版无前台
-        // 判定，小窗开着就永久直通，用户实测「打不了中文了」。
-        if crate::addword::is_open() {
+        // 【加词/加权小窗直通 2026-09-12 五修】小窗前台时只挡**非小窗
+        // 线程**的 dispatch（主线程的键进主文档会建残留组段——trace
+        // 实锤原光标 preedit 残留）；**小窗线程自己的 dispatch 放行**
+        // ——那是词框键入的正常处理路径。二版门无差别直通，把词框的
+        // 键也放行了（用户实测「只有字母上屏」「别的输入法能打虎符
+        // 不行」——通道是通的，HuFu 自己的门拦死了自己）。
+        if crate::addword::is_open() && !crate::addword::in_window_thread() {
             let fg = unsafe { GetForegroundWindow() };
             if fg.0 as isize == crate::addword::current_hwnd() {
                 return BOOL(0);
