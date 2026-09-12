@@ -3306,65 +3306,83 @@ impl CandidateWindowV2 {
                         // 框不显示的病根）。下一帧锚点就绪即回到正常定位。
                         None => {
                             crate::tsf::diag_note("cw2 anchor+sticky 双缺，退到焦点窗口定位");
-                            let fg = GetForegroundWindow();
-                            // 【任务栏误兜底修复 2026-09-12】开始菜单打开时
-                            // 前台偶发是任务栏（Shell_TrayWnd）——拿它的 rect
-                            // 兜底=候选贴到任务栏底（用户实锤「候选出现在
-                            // 任务栏最下面」）。任务栏不可作定位锚：退屏幕
-                            // 安全位（工作区上部，与 SearchHost (12,12) 兜底
-                            // 同族——可见、不压任务栏）。
-                            let mut cls: [u16; 64] = [0; 64];
-                            let fg_ok = unsafe {
-                                !fg.0.is_null() && {
-                                    #[link(name = "user32")]
-                                    unsafe extern "system" {
-                                        fn GetClassNameW(hwnd: HWND, s: *mut u16, c: i32) -> i32;
-                                    }
-                                    GetClassNameW(fg, cls.as_mut_ptr(), 64) > 0
+                            // 【任务栏误兜底修复·根治 2026-09-12】开始菜单
+                            // 打开时前台=SearchHost 的 CoreWindow——rect 覆盖
+                            // 全屏，且 XAML 搜索框无经典 caret（锚点链全空）
+                            // → 落「焦点窗口内左下」兜底 → fr.bottom-2h =
+                            // 屏底 = 候选贴任务栏（用户实锤「A 窗口打完字
+                            // 后开始菜单候选到任务栏」）。上一版只过滤了
+                            // 任务栏类名，全屏宿主漏网。修：SearchHost 直接
+                            // (12,12)（与 server 代画路径兜底同款）；前台是
+                            // 任务栏类名或全屏/近全屏窗（覆盖工作区 ≥95%）
+                            // 退工作区左上安全位——全屏窗的「内左下」永远
+                            // 是屏底。
+                            let mut wa = RECT {
+                                left: 0,
+                                top: 0,
+                                right: 0,
+                                bottom: 0,
+                            };
+                            unsafe {
+                                #[link(name = "user32")]
+                                unsafe extern "system" {
+                                    fn SystemParametersInfoW(
+                                        a: u32,
+                                        b: u32,
+                                        p: *mut core::ffi::c_void,
+                                        f: u32,
+                                    ) -> i32;
                                 }
-                            };
-                            let name: String = if fg_ok {
-                                String::from_utf16_lossy(
-                                    &cls[..cls.iter().position(|&c| c == 0).unwrap_or(64)],
-                                )
+                                SystemParametersInfoW(0x30, 0, &mut wa as *mut RECT as *mut core::ffi::c_void, 0);
+                            }
+                            if crate::tsf::host_is_searchhost() {
+                                (12, 12)
                             } else {
-                                String::new()
-                            };
-                            let tray_like = !fg_ok
-                                || name.contains("Shell_TrayWnd")
-                                || name.contains("TrayShowDesktop")
-                                || name.contains("Shell_SecondaryTrayWnd");
-                            if tray_like {
-                                let mut wa = RECT {
-                                    left: 0,
-                                    top: 0,
-                                    right: 0,
-                                    bottom: 0,
+                                let fg = GetForegroundWindow();
+                                let mut cls: [u16; 64] = [0; 64];
+                                let fg_ok = unsafe {
+                                    !fg.0.is_null() && {
+                                        #[link(name = "user32")]
+                                        unsafe extern "system" {
+                                            fn GetClassNameW(hwnd: HWND, s: *mut u16, c: i32) -> i32;
+                                        }
+                                        GetClassNameW(fg, cls.as_mut_ptr(), 64) > 0
+                                    }
                                 };
-                                unsafe {
-                                    #[link(name = "user32")]
-                                    unsafe extern "system" {
-                                        fn SystemParametersInfoW(
-                                            a: u32,
-                                            b: u32,
-                                            p: *mut core::ffi::c_void,
-                                            f: u32,
-                                        ) -> i32;
-                                    }
-                                    SystemParametersInfoW(0x30, 0, &mut wa as *mut RECT as *mut core::ffi::c_void, 0);
-                                }
-                                (wa.left + 16, wa.top + 16)
-                            } else {
+                                let name: String = if fg_ok {
+                                    String::from_utf16_lossy(
+                                        &cls[..cls.iter().position(|&c| c == 0).unwrap_or(64)],
+                                    )
+                                } else {
+                                    String::new()
+                                };
                                 let mut fr = RECT {
                                     left: 0,
                                     top: 0,
                                     right: 0,
                                     bottom: 0,
                                 };
-                                let _ = GetWindowRect(fg, &mut fr);
-                                let x = fr.left + 16;
-                                let below = fr.bottom - ((height as i32) * 2).min(fr.bottom - fr.top);
-                                (x, below.max(fr.top))
+                                let have_rect =
+                                    fg_ok && GetWindowRect(fg, &mut fr).is_ok();
+                                let waw = (wa.right - wa.left).max(1) as f32;
+                                let wah = (wa.bottom - wa.top).max(1) as f32;
+                                let fullscreen = have_rect && {
+                                    let fw = (fr.right - fr.left).max(0) as f32;
+                                    let fh = (fr.bottom - fr.top).max(0) as f32;
+                                    fw >= waw * 0.95 && fh >= wah * 0.95
+                                };
+                                let tray_like = !fg_ok
+                                    || name.contains("Shell_TrayWnd")
+                                    || name.contains("TrayShowDesktop")
+                                    || name.contains("Shell_SecondaryTrayWnd");
+                                if tray_like || fullscreen || !have_rect {
+                                    (wa.left + 16, wa.top + 16)
+                                } else {
+                                    let x = fr.left + 16;
+                                    let below = fr.bottom
+                                        - ((height as i32) * 2).min(fr.bottom - fr.top);
+                                    (x, below.max(fr.top))
+                                }
                             }
                         }
                     },
