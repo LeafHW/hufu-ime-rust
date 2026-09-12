@@ -3764,13 +3764,20 @@ fn host_follow_caret() -> bool {
 /// 【虎魄跟打器判定 2026-09-12】真打字宿主名（此前 TigerClaw 判定
 /// 是错靶——那是虎魄的组件进程）。其 GetTextExt 返回恒定值（窗钉
 /// 死首键处），且布局锁下逐键 GetTextExt 卡秒级——走系统插入符。
+/// 【跟打器家族 2026-09-12 扩】用户三跟打器并存：虎魄、晴跟打、
+/// Pain 跟打器（trace 实锤进程 Pain跟打器.exe，est 超前死锁同款）
+/// ——同属「打字区多行软换行 + GetTextExt 步进可靠 + est 会超前
+/// 死锁」类宿主，钳制/折行校准/dx 放宽全家统一。匹配不区分大小写。
 fn exe_is_hupo() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.contains("虎魄"))
+            .map(|n| {
+                let nl = n.to_lowercase();
+                nl.contains("虎魄") || nl.contains("晴") || nl.contains("pain")
+            })
             .unwrap_or(false)
     })
 }
