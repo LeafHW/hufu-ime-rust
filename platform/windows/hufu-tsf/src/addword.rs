@@ -246,11 +246,20 @@ fn open_common() {
             windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
         );
         if let Ok(tm) = &_tm {
-            // tid=0 占位（本线程尚未正式 Activate，无真实 client id；
-            // EDIT 获焦激活时会写入真值——Activate 的 set_thread_tm）
+            // tid=0 占位（下方四修会用 ThreadMgr::Activate 的真 tid 覆盖）
             crate::tsf::set_thread_tm(tm.clone(), 0);
         }
         let _ = (|| -> windows::core::Result<()> {
+            // 【四修 2026-09-12】ActivateLanguageProfile 只是"选择"当前
+            // 输入法——TIP 实例**不激活**（激活标记实锤：小窗线程 tid
+            // 从未出现，键 sink 从未装，词框键入无 TIP 接收，字母直通）。
+            // 焦点驱动的懒激活对该 EDIT 不发生（msctf 不接管非标准宿主
+            // 线程的焦点），故显式自激活：
+            //   ThreadMgr::Activate() → client id（本线程）
+            //   CoCreateInstance(自家 CLSID) → ITfTextInputProcessor
+            //   tip.Activate(tm, tid) → AdviseKeyEventSink 装上
+            // 三修的线程局部化保证此激活不覆盖主线程锚（g.thread_mgr
+            // 只认首激活；本线程走 THREAD_TM/THREAD_TID）。
             let profiles: windows::Win32::UI::TextServices::ITfInputProcessorProfiles =
                 windows::Win32::System::Com::CoCreateInstance(
                     &windows::Win32::UI::TextServices::CLSID_TF_InputProcessorProfiles,
@@ -262,7 +271,19 @@ fn open_common() {
                 0x0804u16,
                 &crate::com::PROFILE_GUID,
             )?;
-            crate::tsf::trace("addword: 小窗线程已 TSF 化（ThreadMgr+TIP）");
+            let tm = _tm.as_ref().map_err(|e| e.clone())?;
+            let tid = tm.Activate()?;
+            crate::tsf::set_thread_tm(tm.clone(), tid);
+            let tip: windows::Win32::UI::TextServices::ITfTextInputProcessor =
+                windows::Win32::System::Com::CoCreateInstance(
+                    &crate::CLSID_HUFU_TSF,
+                    None,
+                    windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+                )?;
+            tip.Activate(tm, tid)?;
+            crate::tsf::trace(&format!(
+                "addword: 小窗线程 TIP 已自激活 tid={tid}（词框键 sink 装上）"
+            ));
             Ok(())
         })();
         crate::tsf::trace("addword open（线程已起）");
