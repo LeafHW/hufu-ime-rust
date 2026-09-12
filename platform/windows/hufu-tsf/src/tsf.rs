@@ -129,7 +129,6 @@ fn tl_cand_show(
 }
 /// 小窗线程的候选窗隐藏。
 fn tl_cand_hide() {
-    crate::tsf::trace("tl_cand_hide 调用");
     TL_CAND2.with(|t| {
         if let Some(c) = t.borrow_mut().as_mut() {
             c.hide();

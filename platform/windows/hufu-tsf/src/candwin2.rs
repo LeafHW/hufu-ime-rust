@@ -340,7 +340,6 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
-            crate::tsf::trace(&format!("IH收 hwnd={:?}", hwnd.0 as isize));
             // 【退场动画退役 2026-09-11】用户判「调不好」：淡出与半透明
             // 面板天然相克（渐隐帧压在新上屏文字上=变黑/重叠，连打时
             // 收放循环=一闪一闪）。收窗一律即时隐藏——干净利落。
@@ -3638,12 +3637,7 @@ impl CandidateWindowV2 {
         // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
         // 排队，焦点回调返回后由消息循环执行隐藏。
         unsafe {
-            let ok = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
-            crate::tsf::trace(&format!(
-                "hide Post hwnd={:?} ok={:?}",
-                self.hwnd.0 as isize,
-                ok
-            ));
+            let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
     }
 }
