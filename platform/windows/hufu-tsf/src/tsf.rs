@@ -329,6 +329,10 @@ pub struct Shared {
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
     pub line_end: bool,
+    /// 【四十一修·键路由上下文】最近键会话的 ctx（WPS 多标签 GetFocus
+    /// 摇摆，poll 补显用它而不是 GetFocus）。切窗/切标签清除——新键
+    /// 会话到来时在 DoEditSession 重新记录。
+    pub last_key_ctx: Option<ITfContext>,
     /// 【滚轮缩放候选框】最近一次 show 的渲染参数（候选/编码/选中）：
     /// WM_MOUSEWHEEL 改字号后用它立即重绘（无键事件触发 update_ui）。
     pub last_show: Option<(Vec<(String, String)>, String, usize)>,
@@ -392,6 +396,7 @@ impl Shared {
     seg_key_index: 0,
     cur_raw_len: 0,
             line_end: false,
+            last_key_ctx: None,
             last_show: None,
         }
     }
@@ -432,6 +437,12 @@ impl Shared {
         let tm = thread_tm().or_else(|| self.thread_mgr.clone())?;
         let doc: ITfDocumentMgr = unsafe { tm.GetFocus().ok()? };
         unsafe { doc.GetTop().ok() }
+    }
+    /// 【四十一修】键路由上下文（最近一次键会话的 ctx，DoEditSession
+    /// 记录）。WPS 多标签下 GetFocus 摇摆——无显式 ctx 的会话优先用
+    /// 它；None（尚无键会话）回落 GetFocus。
+    fn key_context(&self) -> Option<ITfContext> {
+        self.last_key_ctx.clone().or_else(|| self.focus_context())
     }
 }
 
@@ -835,6 +846,8 @@ fn handle_set_focus(
         // 在途编辑会话（异步档排队中）执行时代际不符即被丢弃——
         // 否则会把组段/文字写进旧焦点文档（切窗竞态残余）。
         g.focus_epoch += 1;
+        // 【四十一修】键路由上下文随代际失效（切窗/切标签后新键重记）。
+        g.last_key_ctx = None;
         (g.composing, g.preedit_last.clone())
     };
     // 【焦点风暴去抖 2026-09-08】QQ 实测 40ms 内连发 8 次
@@ -1582,6 +1595,14 @@ impl EditSession_Impl {
                 .focus_context()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
+        // 【四十一修·键路由上下文锁定】WPS 多标签（表格+文档同进程）实
+        // 锤：GetFocus 中途反复报表格上下文（切换后焦点声明摇摆），补
+        // 显/轮询帧经 run_session(None)→focus_context 拿到表格 → 候选
+        // 窗在"文档光标"与"表格打过字的单元"间按一键一跳（用户实测
+        // 步骤：表格打字→回文档打字→来回跳）。键会话真实 ctx 在此记
+        // 录；后续无显式 ctx 的会话（poll 补显等）优先复用它——补显=
+        // 重画键事件建立的会话状态，本就该用键的上下文。
+        g.last_key_ctx = Some(ctx.clone());
         match &self.op {
             Op::QueryAnchor => {
                 // 【三十一修】只查锚不动文本（无组段帧：反查提示窗）
@@ -2386,8 +2407,23 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     return;
                 }
             } else {
-                g.caret = Some(r);
-                return;
+                // 【四十二修·无基线段首防摇摆】est 无基线时段首 selection
+                // 原为无条件采纳——WPS 多标签 GetSelection 摇摆（表格标
+                // 签值混入）直达 g.caret（且采纳即 return 使 est 永远建不
+                // 了基线，过滤恒失效）。加与最近锚(prev_caret)的连续性：
+                // 差>100/60 判非本文档值，弃 selection 落标准链（GetTextExt
+                // 段末建基线——此后 est_ok=true 走正常过滤，自愈）。
+                let near = match prev_caret {
+                    Some(p) => {
+                        (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60
+                    }
+                    None => true,
+                };
+                if near {
+                    g.caret = Some(r);
+                    return;
+                }
+                trace("qc: seg1 selection 摇摆拦截（无基线，走标准链）");
             }
         }
     }
@@ -3448,7 +3484,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         let target = match ctx {
             Some(c) => c,
             None => g
-                .focus_context()
+                .key_context()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
         // 【线程局部 2026-09-12】tid 优先本线程（小窗线程会话用本线程 id）。
@@ -3768,8 +3804,9 @@ use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, EnumChildWindows, GetClassNameW, GetForegroundWindow,
-    GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, KillTimer, RegisterClassW, SetTimer,
-    GUITHREADINFO, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, KillTimer,
+    RegisterClassW, SetTimer, GUITHREADINFO, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WNDCLASSW,
 };
 
 /// 【反查首帧锚点 2026-09-11】无组段帧（反查/命令模式刚进入：仅 aux
@@ -4009,8 +4046,19 @@ fn excel6_anchor() -> Option<RECT> {
         if hit == 0 {
             return None;
         }
+        let hcell = HWND(hit as *mut _);
+        // 【四十二修·可见性门】WPS 多标签（表格+文档同进程同主窗）：
+        // 表格标签的 EXCEL6 框是主窗子窗，当前显示文档标签时框被隐
+        // 藏——但 EnumChildWindows 不筛可见性，旧版恒命中，L3238 框
+        // 外过滤把文档锚（离框几百 px）当"换格滞后"钉到表格框=候选
+        // 跳到表格单元（用户实锤：表格打字→回文档打字→两位置按一
+        // 键一跳）。框不可见=焦点不在表格标签：返回 None，不参与过
+        // 滤与兜底。表格编辑态框可见，行为不变。
+        if !IsWindowVisible(hcell).as_bool() {
+            return None;
+        }
         let mut r = RECT::default();
-        if GetWindowRect(HWND(hit as *mut _), &mut r).is_ok() {
+        if GetWindowRect(hcell, &mut r).is_ok() {
             return Some(r);
         }
         None

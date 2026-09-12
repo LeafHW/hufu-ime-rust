@@ -1466,10 +1466,24 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
+        // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
+        // 或别的 SetWindowPos 直调）。
+        match anchor {
+            Some(a) => crate::tsf::trace(&format!(
+                "cw2: show[入] 锚=({},{},{},{})",
+                a.left, a.top, a.right, a.bottom
+            )),
+            None => crate::tsf::trace("cw2: show[入] 锚=None"),
+        }
+        // 【排障后注】本观测+SWP主观测已破案（四十二修：EXCEL6 框外
+        // 钉死），保留为诊断资产但降频：锚=None（tick 重渲染等非锚帧）
+        // 不打，减少常规 trace 量。
         // 【三十九次修正·show 级焦点守卫】本进程非前台宿主（且非同族
         // /UWP 框架）→ 隐藏返回：失焦进程的残留会话不再显示。et.exe
         //（表格宿主）经同目录豁免放行——前台框架窗属 wps.exe。
         if !crate::tsf::host_may_show() {
+            crate::tsf::trace("cw2: show被host门拦→SW_HIDE");
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -3608,6 +3622,13 @@ impl CandidateWindowV2 {
                     }
                     None => (tx, ty),
                 };
+                // 【四十一修·主 SWP 观测（破案后降频）】锚位与目标差>10
+                // 才打——常规小步进不打（对齐四十修 pos 观测）。
+                if (tx - x).abs() > 10 || (ty - y).abs() > 10 {
+                    crate::tsf::trace(&format!(
+                        "cw2: SWP主 pos=({px},{py}) 目标=({tx},{ty}) 锚位=({x},{y})"
+                    ));
+                }
                 // 【三十九修·显示层观测】用户实锤"候选在两个位置来回
                 // 跳"而锚序列（qc: raw/est）完全平滑——跳在锚→窗位
                 // 置的显示层（suppress 补显/滑动/钳位交替），此前零
@@ -3636,6 +3657,7 @@ impl CandidateWindowV2 {
                 )
             } else {
                 // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
+                crate::tsf::trace("cw2: SWP纯显示(NOMOVE)——窗留在当前位置显示");
                 SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
@@ -3882,6 +3904,10 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     anim_done = false;
                     c.live_pos.set(cur);
                     if c.is_visible() {
+                        crate::tsf::trace(&format!(
+                            "cw2: SWP动画 cur=({},{})",
+                            cur.0, cur.1
+                        ));
                         let _ = SetWindowPos(
                             hwnd,
                             HWND_TOPMOST,
@@ -3970,6 +3996,10 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 anim_done = false;
                 c.live_pos.set(cur);
                 if c.is_visible() {
+                    crate::tsf::trace(&format!(
+                        "cw2: SWP动画2 cur=({},{})",
+                        cur.0, cur.1
+                    ));
                     let _ = SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
