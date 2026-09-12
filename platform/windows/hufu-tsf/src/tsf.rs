@@ -3454,14 +3454,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 口不出现，打出第一个字母才有。等待无意义：直接显示，锚点
         // 用旧 caret（上一段落点）→ 无则系统插入符（GUITHREADINFO）
         // → 再无则 candwin2 焦点窗兜底。
-        // 【四十三修补·aux 无锚首两帧】虎魄实锤：反查刚进入时锚查询
-        //（QueryAnchor→selection 插入点）在 35ms 补显帧才执行，此前
-        // 的帧直接显示在「无锚兜底位」(1389,1510)=窗外+错位，闪
-        // 200ms 后跳正位。31 修后补显帧 QueryAnchor 会查 selection
-        //（虎魄/WPS/Typora 实测可成功）——aux 提示帧无锚不再立即
-        // 显示，等补显带锚显示（不再死循环；有锚时行为不变）。防
-        // 极端宿主 selection 永远查不出：500ms 死线放行（沿用 WPS
-        // 收敛死线通道）。
         let compless = g.composition.is_none();
         // 【三十九次修正·勘误回退】换格压制链（ed6_new_cell/cell_wait）
         // 由四十次修正的「表格每段同文档首段 200ms 等待」接管。此处
@@ -3478,11 +3470,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let wps_wait = wps_settle
             && !(wps_stable || wps_deadline)
             && !((any_has_prev && !cell_seg) && sticky_near);
-        let aux_frame = compless && !aux.is_empty();
-        let aux_deadline = g
-            .wps_settle_start
-            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500));
-        let suppress = (!compless || (aux_frame && !aux_deadline))
+        let suppress = !compless
             && (no_anchor || wps_wait)
             && !pinned_now
             && !host_is_searchhost()
