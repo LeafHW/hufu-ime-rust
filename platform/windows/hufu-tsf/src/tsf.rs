@@ -1644,7 +1644,13 @@ impl EditSession_Impl {
                 // 键 d=2-19=-17 → est 跳 -188px（窗被拽出屏）。
                 g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
                 g.composition = Some(comp);
-                query_caret(&mut g, &ctx, ec);
+                // 【四十四修】虎魄 qie 首键优先 selection 真实位（即时），
+                // 失败落 query_caret（43 修补显重试链）
+                if exe_is_hupo_qie() {
+                    hupo_qie_step(&mut g, &ctx, ec);
+                } else {
+                    query_caret(&mut g, &ctx, ec);
+                }
                 Ok(())
             }
             Op::SetPreedit(text) => {
@@ -1698,12 +1704,18 @@ impl EditSession_Impl {
                 // （fallback→est_step）把补显帧的 query_caret 截胡——
                 // est 无基线早退=零查询零重试=锚永远立不起来（「首段
                 // 无候选、上屏一次才有」根因）。虎魄 qie 恢复 v1.5.2
-                // 语义：无锚→query_caret（补显重试链通）；有锚→恒定
-                // 保持（段内零查询零估算，1.5.2 同款）。
+                // 语义：无锚→query_caret（补显重试链通）。
+                // 【四十四修·段内 selection 跟手】用户主诉「候选还是
+                // 有点不跟手」——43 修恒定锚钉段首，段内光标前进后
+                // 候选逐键落后（4 键段末落后 ~60-90px）。反查链实测
+                // （43 修后）：selection 插入点查询（空 range 的
+                // GetTextExt）在虎魄上可用且即时（不进 Qt 组段布局锁，
+                // 反查每帧 35ms 补显连续调用无卡顿）。故段内每键改为：
+                // selection 查询真实插入位+连续性过滤采纳；失败/烂值
+                // 保持当前锚（恒定兜底不变）。全真实步进、零估算——
+                // 不回到 est 链（43 修定案它在这宿主是负资产）。
                 if exe_is_hupo_qie() {
-                    if g.caret.is_none() {
-                        query_caret(&mut g, &ctx, ec);
-                    }
+                    hupo_qie_step(&mut g, &ctx, ec);
                 } else if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
                     if let Some(mut r) = gui_caret_fallback() {
                         hupo_clamp(&mut r);
@@ -2098,7 +2110,12 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     // 新段：首键重新真实锚定（raw 同步，防旧段 last_raw 污染 est）
     g.seg_key_index = 1;
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
-    query_caret(&mut g, ctx, ec);
+    // 【四十四修】虎魄 qie 首键优先 selection 真实位（同 DoEditSession）
+    if exe_is_hupo_qie() {
+        hupo_qie_step(&mut g, ctx, ec);
+    } else {
+        query_caret(&mut g, ctx, ec);
+    }
     Ok(())
 }
 
@@ -2326,6 +2343,52 @@ fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
         }
     }
     None
+}
+
+/// 【四十四修·虎魄段内 selection 跟手】段内每键的真实插入位步进。
+/// 背景：43 修恒定锚解决了稳定（无偏/无超窗/无首段缺候选）但用户
+/// 主诉「候选还是有点不跟手」——候选钉段首，光标前进后逐键落后。
+/// 【四十五修·同值跨帧重查】微软拼音对照实锤（虎魄打字截图）：Qt
+/// 的插入点数据是准的（微软候选 x 精确跟随光标 x≈455，y=行底）——
+/// 44 修同帧查询拿到恒定值的原因=Qt 布局异步（43 修已证 +36ms 收
+/// 敛），不是 Qt 不给。修：selection 值与当前锚相同（位移≤2px=
+/// 疑似旧布局）时武装 60ms 跨帧重查（caret_force 到点重跑本键
+/// session 再查——布局收敛后出真值，锚前进）。连续性过滤+clamp
+/// 兜底不变；有位移（真值）直接采纳。
+fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    if let Some(mut r) = selection_caret_rect(ctx, ec) {
+        let ok = match g.caret {
+            None => true,
+            Some(c) => {
+                let dx = r.left - c.left;
+                let dy = r.top - c.top;
+                if dy > 26 {
+                    true // 换行下移
+                } else {
+                    dy >= -15 && dx >= -25 && dx <= 70
+                }
+            }
+        };
+        if ok {
+            let moved = match g.caret {
+                Some(c) => (r.left - c.left).abs() > 2 || (r.top - c.top).abs() > 2,
+                None => true,
+            };
+            hupo_clamp(&mut r);
+            g.caret = Some(r);
+            if !moved {
+                // 同值=旧布局：60ms timer 到点拉 state 强制重跑 update_ui
+                //（CARET_TIMER_ID 处理器，无需 caret_force——34 修已删）
+                arm_caret_recheck_timer();
+            }
+        } else {
+            trace("qie: selection 段内烂值拦截（保持锚）");
+        }
+        return;
+    }
+    if g.caret.is_none() {
+        query_caret(g, ctx, ec);
+    }
 }
 
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
