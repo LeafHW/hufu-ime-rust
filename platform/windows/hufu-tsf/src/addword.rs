@@ -205,6 +205,14 @@ pub fn open_weight() {
     open_common();
 }
 
+/// 【小窗打开判定 2026-09-12】加词/加权窗存活且可见——主文档 sink
+/// 的按键直通用（激活间隙防组段写进主文档，见 tsf::dispatch 头部）。
+/// 复用 ADDWORD_HWND 登记句柄；异常清理态由 IsWindow 兜底。
+pub fn is_open() -> bool {
+    let g = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
+    *g != 0 && unsafe { IsWindow(HWND(*g as *mut _)).as_bool() }
+}
+
 /// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
 /// 结束清零。短锁使用，绝不跨消息循环持有。
 static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
@@ -339,8 +347,32 @@ unsafe fn create_child(
     .unwrap_or_default()
 }
 
+/// 【词框聚焦 2026-09-12】小窗首个 EDIT（词框）句柄——WM_ACTIVATE
+/// 激活时聚焦用（isize 规避 HWND 跨静态的 Sync 问题）。
+static FIRST_EDIT: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_ACTIVATE => {
+            // 【词框聚焦 2026-09-12 v1.5.3+】小窗激活时把键盘焦点落
+            // 到词框 EDIT——此前只在 WM_CREATE 里 SetFocus（窗口未
+            // 激活时设置无效），激活后焦点停在顶层窗自身：用户在词框
+            // 打虎码，键全部被宿主主文档的 TSF sink 吃掉——组段建在
+            // 主文档（原光标处 preedit 残留+候选框弹在主文档旁），
+            // 词框打不进字。标准对话框模式：激活即聚焦首控件。
+            // 低字节 WA_ACTIVE/WA_CLICKACTIVE 均聚焦；WA_INACTIVE 跳过。
+            let lo = (wp.0 & 0xFFFF) as u16;
+            if lo != 0 {
+                let fe = FIRST_EDIT
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or(0);
+                if fe != 0 {
+                    let _ = SetFocus(HWND(fe as *mut _));
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_CREATE => {
             let mk = |s: &str| -> Vec<u16> {
                 let mut v: Vec<u16> = s.encode_utf16().collect();
@@ -469,6 +501,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             if !first_edit.0.is_null() {
                 let _ = SetFocus(first_edit);
+                // 【词框聚焦 2026-09-12】存静态：WM_ACTIVATE 激活时聚焦
+                //（WM_CREATE 时窗口未激活 SetFocus 无效）。
+                *FIRST_EDIT
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(first_edit.0 as isize);
             }
             LRESULT(0)
         }

@@ -991,6 +991,15 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
+        // 【加词/加权小窗直通 2026-09-12 v1.5.3+】/jc /jq 弹窗打开期间，
+        // 本（主文档）sink 的按键全部直通——小窗有独立的输入上下文，
+        // 此前激活间隙里键被主文档组段吃掉：原光标处 preedit 残留 +
+        // 候选框弹在主文档旁而词框打不进字（trace 实锤 SP 组段坐标在
+        // 主文档）。小窗键由其自身线程的 EDIT 处理（词框 IME 组段/
+        // 编码框免 IME 直通），与本 sink 无关。
+        if crate::addword::is_open() {
+            return BOOL(0);
+        }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
         apply_chinese_sync(&self.shared);
