@@ -3375,7 +3375,7 @@ fn focus_is_uwp_shell() -> bool {
 /// current_exe 即宿主路径。开始菜单的 DWM_CLOAKED_SHELL 是逐帧
 /// 持续的真隐身（首帧即切、位置=左上角）；其他宿主（含 UWP/Store）
 /// 首帧 cloak=2 是建窗瞬态，streak>=3 才算真隐身且位置跟光标。
-fn host_is_searchhost() -> bool {
+pub fn host_is_searchhost() -> bool {
     static SH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SH.get_or_init(|| {
         let exe = std::env::current_exe()
