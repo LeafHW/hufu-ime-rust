@@ -224,6 +224,35 @@ static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
 fn open_common() {
     std::thread::spawn(|| unsafe {
+        // 【词框 TSF 化 2026-09-12 二修】线程的 COM STA + TIP 激活必须
+        // 在**任何窗口创建之前**——首版放在 CreateWindow 后：窗口在
+        // 线程 TSF-disabled 期创建，EDIT 永不被 msctf 接管（键不走
+        // TSF，字母直通，用户实测词框打不了中文）。线程先 STA 化，
+        // msctf 视本线程为 TSF-enabled，随后创建/获焦的 EDIT 自动关
+        // 联 DocumentMgr；ActivateLanguageProfile 让本线程当前输入
+        // 法=HuFu，键 sink 随焦点激活。线程退出即整体回收。
+        // 另：Shared.client_id/thread_mgr 是进程级——Activate 会换主
+        // 线程引用，故这里**只激活不实例化**（不手动 Activate）；焦点
+        // 驱动的激活由 msctf 自管。
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+        let _ = (|| -> windows::core::Result<()> {
+            let profiles: windows::Win32::UI::TextServices::ITfInputProcessorProfiles =
+                windows::Win32::System::Com::CoCreateInstance(
+                    &windows::Win32::UI::TextServices::CLSID_TF_InputProcessorProfiles,
+                    None,
+                    windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+                )?;
+            profiles.ActivateLanguageProfile(
+                &crate::CLSID_HUFU_TSF,
+                0x0804u16,
+                &crate::com::PROFILE_GUID,
+            )?;
+            crate::tsf::trace("addword: 小窗线程已 STA 化 + TIP 指向 HuFu");
+            Ok(())
+        })();
         crate::tsf::trace("addword open（线程已起）");
         // 【单例 2026-09-06】窗口已在（本进程）→ 前置复用，不再多开
         //（用户连按 /jq 会叠开多个同位窗口，只看得见第一个）
@@ -294,33 +323,6 @@ fn open_common() {
         // 登记本窗口句柄（后续 open 前置复用），放锁再跑消息循环
         *guard = hwnd.0 as isize;
         drop(guard);
-        // 【词框 TSF 激活 2026-09-12】小窗线程激活 HuFu TIP——词框
-        // EDIT 是 TSF-aware 控件，但 TIP 激活是 per-thread：主线程的
-        // 激活管不到本线程，词框打字没有键 sink 接（字母直通，用户
-        // 实测「打不了中文」）。本线程独立激活（STA COM +
-        // ActivateLanguageProfile），msctf 在本线程装键 sink，词框
-        // 虎码组段出候选；线程随窗口销毁退出，激活随线程回收。
-        // 小窗期间 server session 归词框输入用，关闭后焦点事件触发
-        // focus op 清 session（既有路径），主文档状态不受残留影响。
-        unsafe {
-            let hr = windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-            );
-            let com_inited = hr.is_ok();
-            let _ = (|| -> windows::core::Result<()> {
-                let profiles: windows::Win32::UI::TextServices::ITfInputProcessorProfiles =
-                    windows::Win32::System::Com::CoCreateInstance(
-                        &windows::Win32::UI::TextServices::CLSID_TF_InputProcessorProfiles,
-                        None,
-                        windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
-                    )?;
-                profiles.ActivateLanguageProfile(&crate::CLSID_HUFU_TSF, 0x0804u16, &crate::com::PROFILE_GUID)?;
-                crate::tsf::trace("addword: 小窗线程 TIP 已激活（词框可打中文）");
-                Ok(())
-            })();
-            let _ = com_inited;
-        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let mut msg = MSG::default();
