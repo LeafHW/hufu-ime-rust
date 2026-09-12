@@ -1481,6 +1481,10 @@ enum Op {
     Insert(String),
     /// 回删已上屏字符（数字后「1.」再按 . 换「。」：先删旧点再提交句号）
     DeleteBack(u32),
+    /// 【三十一修·反查提示窗锚】无组段帧（反查刚进入）的纯锚查询：
+    /// 不建组段不动文本，只跑 query_caret（无组段分支走 selection
+    /// 插入点）——提示窗锚=实时光标而非 sticky 旧位。
+    QueryAnchor,
     End,
 }
 
@@ -1545,6 +1549,11 @@ impl EditSession_Impl {
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
         match &self.op {
+            Op::QueryAnchor => {
+                // 【三十一修】只查锚不动文本（无组段帧：反查提示窗）
+                query_caret(&mut g, &ctx, ec);
+                Ok(())
+            }
             Op::StartPreedit(text) => {
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
                 // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
@@ -2183,6 +2192,31 @@ fn est_step(g: &mut Shared) {
 /// 量的是**组段末尾折叠后的零宽范围**=光标点本身，不是整段矩形——
 /// 整段矩形的左缘是组段起点、宽度随打字膨胀、换行时上下跳行，
 /// 拿它当锚点正是候选框水平/垂直抖动的病根。
+/// 【三十一修·反查提示窗锚】selection 插入点的屏幕矩形（GetTextExt）。
+/// 无组段帧（反查/命令刚进入：仅 aux 提示、raw 空）的实时锚——旧实现
+/// 只能退旧值/系统插入符，Store 记事本等 XAML 宿主两者皆无 → 提示窗
+/// 钉在 sticky 旧位（用户实锤「首键反查候选位置不准」，Δy=90px）。
+/// selection 不依赖组段（GetSelection 任何时候可查），插入点矩形由
+/// 宿主文本引擎即时给出——即真实光标。
+fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
+    let range = selection_range(ctx, ec).ok()?;
+    let view = (unsafe { ctx.GetActiveView() }).ok()?;
+    let mut rect = RECT::default();
+    let mut clipped = BOOL(0);
+    for _ in 0..2 {
+        rect = RECT::default();
+        if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_ok() {
+            let degenerate = rect.bottom <= rect.top
+                || rect.right < rect.left
+                || (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0);
+            if !degenerate {
+                return Some(rect);
+            }
+        }
+    }
+    None
+}
+
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【旧锚点快照 2026-09-11】旧实现开头即 g.caret=None，末尾失败
     // 分支却注释「保留旧 caret」——实际锚点已丢（候选窗闪回兜底位）。
@@ -2209,7 +2243,14 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // est 步进（单一位置源，不跳不漂）。首键（seg=1）自由采纳（点击
     // 换位/新段合法大跳）。记事本每键 +11px 全过，无感。
     let Some(comp) = g.composition.clone() else {
-        trace("qc: 无组段");
+        // 【三十一修·反查提示窗锚】无组段帧：查 selection 插入点（实时
+        // 光标——反查提示窗的正确锚）；查不出（宿主拒绝/退化）保旧值
+        // （比 None→sticky 旧位强：至少是最近的查询值）。
+        if let Some(r) = selection_caret_rect(ctx, ec) {
+            g.caret = Some(r);
+        } else {
+            g.caret = prev_caret;
+        }
         return;
     };
     let Ok(range) = (unsafe { comp.GetRange() }) else {
@@ -2220,6 +2261,17 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: Clone 失败");
         return;
     };
+    // 【三十一修·首键锚 selection 优先】组段首键（seg=1）GetTextExt 对
+    // 含文本的组段范围常返回旧行框（SetText 后布局未更——WPS 首键跳位
+    // 同源病，Store 记事本实测反查首键 Δy 偏 31~90px）。selection 是
+    // 空 range（纯插入点），宿主即时给出真实位置；查不出（退化/拒绝）
+    // 落组段 GetTextExt 老链，行为不劣于旧版。
+    if g.seg_key_index == 1 {
+        if let Some(r) = selection_caret_rect(ctx, ec) {
+            g.caret = Some(r);
+            return;
+        }
+    }
     // 【锚=编码尾 2026-09-12 定版】逐键跟随：SetSelection 已把选区推
     // 到段末，collapse END 量的就是编码尾（Chromium 按 selection 返回
     // ——实测键 u→r 锚 184→195 前进；EDIT 型返回 END 折叠点同义）。
@@ -2534,6 +2586,15 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let op = if raw.is_empty() && preedit.is_empty() {
             if !commit.is_empty() || g.composition.is_some() {
                 Some(Op::Commit(commit.clone()))
+            } else if !state
+                .get("aux")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                // 【三十一修·反查提示窗锚】aux 提示帧（反查刚进入）：
+                // 查一次 selection 锚——提示窗跟实时光标而非 sticky 旧位
+                Some(Op::QueryAnchor)
             } else {
                 None
             }
