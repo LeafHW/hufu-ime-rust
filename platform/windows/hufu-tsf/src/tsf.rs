@@ -3716,6 +3716,15 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【加词小窗独占渲染 2026-09-12】小窗打开期间，主线程（本 poll）
+    // 跳过——cand2/D2D 上下文是进程级单例，小窗线程的 dispatch 渲染
+    // 与主线程 poll 渲染交错会污染 D2D/DWrite 状态（用户实测词框候选
+    // 「右边字缺且持续」：宽度/裁剪按旧布局渲染后不再修正）。小窗期
+    // 间 server session 归词框用，主线程无组段无需刷新；小窗关闭后
+    // 本 poll 自然恢复。
+    if crate::addword::is_open() && !crate::addword::in_window_thread() {
+        return;
+    }
     // 【打字期静默】500ms 内有按键 → 键路径在活跃，poll 只会抢管道
     // /抢锁（键请求被队头阻塞的温床）。跳过本拍。
     // 【回归修复 2026-09-08】首帧抑制的 35ms 补显走 poll 路径——
