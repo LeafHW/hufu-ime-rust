@@ -1856,20 +1856,26 @@ fn est_step(g: &mut Shared) {
     if !fg.0.is_null() {
         let mut wr = RECT::default();
         if unsafe { GetWindowRect(fg, &mut wr) }.is_ok() && wr.right > wr.left {
+            let hupo = exe_is_hupo();
+            // 【虎魄校准 2026-09-12 二修】跟打器打字区实际是**多行软换行**
+            //（监控实锤 Y 702→757→835；用户实测「换行了候选还在上一行」
+            // ——首版误判单行横向滚动禁了折行，Y 滞留上一行）。折行恢复，
+            // 虎魄专属两校准：①换行基点 ind=24（监控实测新行行首≈主窗左
+            // 缘+14，旧魔数 90 偏 115px）；②折行步长 1.42×lh（竖线 caret
+            // 高 55 vs 真实行距 78 实测）。X 出窗仍由 hupo_clamp 兜底
+            //（跟打器 GetTextExt 返回文档坐标，成功查询会重置 wrap=0，
+            // 折行由 est 帧间或换行后的真实帧触发）。
             let line_w = (wr.right - wr.left - 160).max(240);
+            let ind = if hupo { 24 } else { 90 };
+            let lh_w = if hupo { (lh as f32 * 1.42) as i32 } else { lh };
             let mut wrapped = false;
-            // 【虎魄单行语义】跟打器打字区不折行（横向滚动）——折行会
-            // 凭空 +行高 把锚点推到下一行（监控 Y 实测恒定不换行）。
-            // 出窗由 hupo_clamp 钳制吸收。
-            if !exe_is_hupo() {
-                while g.caret_est_wrap > line_w {
-                    g.caret_est_wrap -= line_w;
-                    g.caret_est_y += lh;
-                    wrapped = true;
-                }
+            while g.caret_est_wrap > line_w {
+                g.caret_est_wrap -= line_w;
+                g.caret_est_y += lh_w;
+                wrapped = true;
             }
             if wrapped {
-                g.caret_est_x = wr.left + 90 + g.caret_est_wrap;
+                g.caret_est_x = wr.left + ind + g.caret_est_wrap;
                 est = RECT {
                     left: g.caret_est_x,
                     top: g.caret_est_y,
