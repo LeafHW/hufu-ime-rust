@@ -313,6 +313,16 @@ pub struct Shared {
     pub caret_est_wrap: i32,
     pub caret_est_last_raw: i32,
     pub caret_est_line_h: i32,
+    /// 【三十八修·步宽实测自适应】est 步宽旧公式 0.41×行高在 caret
+    /// 矩形异常高的宿主上全错（虎魄 caret 高 140px → 57px/键，真实半
+    /// 角字宽 ~7px，超 8 倍——批步进 d=6 一步飞 344px，候选乱飞）。
+    /// 改为实测校准：真实帧重校时记录 (raw_len, x)，下次重校的位移/
+    /// 键数=真实步宽样本，指数平滑进 unit_w；est_step 优先用 unit_w，
+    /// 未校准（<=0）才退 0.41×行高。cal_raw/cal_x 为校准采样点（上
+    /// 屏/断段时重置，跨段样本无意义）。
+    pub caret_est_unit_w: f32,
+    pub caret_est_cal_raw: i32,
+    pub caret_est_cal_x: i32,
     pub seg_key_index: i32,
     pub cur_raw_len: usize,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
@@ -376,6 +386,9 @@ impl Shared {
     caret_est_wrap: 0,
     caret_est_last_raw: 0,
     caret_est_line_h: 0,
+    caret_est_unit_w: 0.0,
+    caret_est_cal_raw: 0,
+    caret_est_cal_x: 0,
     seg_key_index: 0,
     cur_raw_len: 0,
             line_end: false,
@@ -951,6 +964,10 @@ fn handle_set_focus(
         g.caret_est_y = 0;
         g.caret_est_wrap = 0;
         g.caret_est_last_raw = 0;
+        // 【三十八修】切窗重置校准采样点（新窗新样本）；unit_w 保留
+        //（同宿主的字宽是稳定属性，跨窗可复用）。
+        g.caret_est_cal_raw = 0;
+        g.caret_est_cal_x = 0;
         g.aux_active = false; // 【反查退格】焦点切换：server 会话已清，aux 态作废
         g.skin_stale = true; // 新焦点重新拉皮肤（也许用户刚改）
         // 【焦点重置·三十三修】跨焦点抹掉全部位置/渲染记忆——「换窗口
@@ -1818,6 +1835,10 @@ impl EditSession_Impl {
                     g.caret_est_x += w as i32;
                     g.caret_est_wrap += w as i32;
                     g.caret_est_last_raw = 0;
+                    // 【三十八修】上屏重置步宽校准采样点（跨段样本无
+                    // 意义——新段 raw 从 0 起）。
+                    g.caret_est_cal_raw = 0;
+                    g.caret_est_cal_x = g.caret_est_x;
                 }
                 Ok(())
             }
@@ -1929,6 +1950,9 @@ impl EditSession_Impl {
                     g.caret_est_x += w as i32;
                     g.caret_est_wrap += w as i32;
                     g.caret_est_last_raw = 0;
+                    // 【三十八修】C&R 上屏同样重置校准采样点（新段 raw 起点）。
+                    g.caret_est_cal_raw = 0;
+                    g.caret_est_cal_x = g.caret_est_x;
                 }
                 let cc: ITfContextComposition = ctx.cast()?;
                 let range: ITfRange = selection_range(&ctx, ec)?;
@@ -2162,7 +2186,15 @@ fn est_step(g: &mut Shared) {
     }
     let lh = g.caret_est_line_h;
     let d = g.cur_raw_len as i32 - g.caret_est_last_raw;
-    let step = (d as f32 * lh as f32 * 0.41) as i32;
+    // 【三十八修·步宽自适应】优先用实测校准的每键宽（虎魄 caret 高
+    // 140px 的宿主上 0.41×行高=57px/键 vs 真实 ~7px，est 疯狂超前=
+    // 乱飞主源）；未校准（unit_w<=0）退旧行高系数。
+    let unit = if g.caret_est_unit_w > 0.5 {
+        g.caret_est_unit_w
+    } else {
+        lh as f32 * 0.41
+    };
+    let step = (d as f32 * unit) as i32;
     g.caret_est_x += step;
     g.caret_est_wrap += step;
     g.caret_est_last_raw = g.cur_raw_len as i32;
@@ -2516,6 +2548,26 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 监控实测一路涨出主窗右缘 420px）——钳到宿主窗内右带后再对齐
     // est 基线（est 从钳位点起步，est 矩形天然在窗内）。
     hupo_clamp(&mut rect);
+    // 【三十八修·步宽校准采样】重校点间距=真实位移——与上次采样点
+    //（同段内，键数差 d>0）的 (Δx/Δraw)=真实每键宽样本，指数平滑进
+    // unit_w（样本须同向合理：0<Δx<400，防上屏换行/点击混入）。上
+    // 屏/断段已重置 cal 点，跨段样本不会进来。首个样本直接采用。
+    {
+        let draw = g.cur_raw_len as i32 - g.caret_est_cal_raw;
+        if draw > 0 {
+            let dxr = (rect.left - g.caret_est_cal_x) as f32;
+            if dxr > 0.0 && dxr < 400.0 {
+                let sample = dxr / draw as f32;
+                g.caret_est_unit_w = if g.caret_est_unit_w <= 0.5 {
+                    sample
+                } else {
+                    g.caret_est_unit_w * 0.6 + sample * 0.4
+                };
+            }
+        }
+    }
+    g.caret_est_cal_raw = g.cur_raw_len as i32;
+    g.caret_est_cal_x = rect.left;
     g.caret_est_x = rect.left;
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
