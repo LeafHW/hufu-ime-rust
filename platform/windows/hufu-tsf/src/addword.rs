@@ -224,20 +224,32 @@ static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
 fn open_common() {
     std::thread::spawn(|| unsafe {
-        // 【词框 TSF 化 2026-09-12 二修】线程的 COM STA + TIP 激活必须
-        // 在**任何窗口创建之前**——首版放在 CreateWindow 后：窗口在
-        // 线程 TSF-disabled 期创建，EDIT 永不被 msctf 接管（键不走
-        // TSF，字母直通，用户实测词框打不了中文）。线程先 STA 化，
-        // msctf 视本线程为 TSF-enabled，随后创建/获焦的 EDIT 自动关
-        // 联 DocumentMgr；ActivateLanguageProfile 让本线程当前输入
-        // 法=HuFu，键 sink 随焦点激活。线程退出即整体回收。
-        // 另：Shared.client_id/thread_mgr 是进程级——Activate 会换主
-        // 线程引用，故这里**只激活不实例化**（不手动 Activate）；焦点
-        // 驱动的激活由 msctf 自管。
+        // 【词框 TSF 化 2026-09-12 三修】线程 TSF 化的完整链：STA COM
+        // → 显式 CoCreateInstance(ThreadMgr)（msctf 判定线程 TSF-
+        // enabled 的标志=线程持有 ThreadMgr；只有 CoInitialize 不够，
+        // 二修实锤键仍不进 sink）→ ActivateLanguageProfile（本线程
+        // 当前输入法=HuFu）→ 而后创建的 EDIT 被 msctf 接管：获焦时
+        // 关联 DocumentMgr + 激活 TIP（HuFuTs 实例化，Activate 在本
+        // 线程跑，键 sink 装上）。ThreadMgr 保活到消息循环结束（变量
+        // _tm 活着）；线程退出全部回收。
+        // ThreadMgr/tid 写线程局部（tsf::set_thread_tm）——每线程各
+        // 持自己的；进程级 Shared 只留首激活（主线程）锚不漂移。
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
             windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
         );
+        let _tm: windows::core::Result<
+            windows::Win32::UI::TextServices::ITfThreadMgr,
+        > = windows::Win32::System::Com::CoCreateInstance(
+            &windows::Win32::UI::TextServices::CLSID_TF_ThreadMgr,
+            None,
+            windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+        );
+        if let Ok(tm) = &_tm {
+            // tid=0 占位（本线程尚未正式 Activate，无真实 client id；
+            // EDIT 获焦激活时会写入真值——Activate 的 set_thread_tm）
+            crate::tsf::set_thread_tm(tm.clone(), 0);
+        }
         let _ = (|| -> windows::core::Result<()> {
             let profiles: windows::Win32::UI::TextServices::ITfInputProcessorProfiles =
                 windows::Win32::System::Com::CoCreateInstance(
@@ -250,7 +262,7 @@ fn open_common() {
                 0x0804u16,
                 &crate::com::PROFILE_GUID,
             )?;
-            crate::tsf::trace("addword: 小窗线程已 STA 化 + TIP 指向 HuFu");
+            crate::tsf::trace("addword: 小窗线程已 TSF 化（ThreadMgr+TIP）");
             Ok(())
         })();
         crate::tsf::trace("addword open（线程已起）");

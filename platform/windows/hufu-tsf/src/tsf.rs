@@ -44,6 +44,30 @@ fn take_deferred_focus() -> Option<(Option<ITfDocumentMgr>, Option<ITfDocumentMg
     DEFERRED_FOCUS.with(|d| d.borrow_mut().take())
 }
 
+// 【线程局部 TSF 态 2026-09-12】加词/加权小窗线程独立 TSF 化后，
+// ThreadMgr 与 client_id 必须 per-thread（进程级共享会把主文档会话
+// 的锚错换到小窗线程：GetFocus 拿错文档、RequestEditSession 用错
+// tid）。每线程 Activate 写自己的；Shared 里保留首激活（主线程）
+// 的值作兼容兜底（旧路径/无 thread_local 场景）。
+thread_local! {
+    static THREAD_TM: std::cell::RefCell<Option<ITfThreadMgr>> =
+        const { std::cell::RefCell::new(None) };
+    static THREAD_TID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+/// 当前线程的 ThreadMgr（无则 None）。
+pub fn thread_tm() -> Option<ITfThreadMgr> {
+    THREAD_TM.with(|t| t.borrow().clone())
+}
+/// 当前线程的 TSF client id（无则 0）。
+pub fn thread_tid() -> u32 {
+    THREAD_TID.with(|t| t.get())
+}
+/// 设置当前线程的 ThreadMgr（小窗线程显式 TSF 化用；Activate 也会写）。
+pub fn set_thread_tm(tm: ITfThreadMgr, tid: u32) {
+    THREAD_TM.with(|t| *t.borrow_mut() = Some(tm));
+    THREAD_TID.with(|t| t.set(tid));
+}
+
 /// 线程共享状态（文本服务 / 按键接收 / 编辑会话共用）。
 pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
@@ -302,8 +326,10 @@ impl Shared {
     }
 
     /// 焦点上下文（当前文档顶层）。
+    /// 【线程局部 2026-09-12】优先本线程 ThreadMgr（小窗线程的 GetFocus
+    /// =词框 EDIT；主线程=主文档）；无则回落进程级（兼容旧路径）。
     fn focus_context(&self) -> Option<ITfContext> {
-        let tm = self.thread_mgr.as_ref()?;
+        let tm = thread_tm().or_else(|| self.thread_mgr.clone())?;
         let doc: ITfDocumentMgr = unsafe { tm.GetFocus().ok()? };
         unsafe { doc.GetTop().ok() }
     }
@@ -391,23 +417,35 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             }
         }
         let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.thread_mgr = Some(tm);
-        g.client_id = tid;
+        // 【线程局部 2026-09-12】每线程写自己的 ThreadMgr/tid；进程级
+        // 只在首激活（主线程）落锚——后续线程（加词小窗）激活不覆盖，
+        // 主文档会话的 GetFocus/RequestEditSession 锚不漂移。
+        set_thread_tm(tm.clone(), tid);
+        let first_activation = g.thread_mgr.is_none();
+        if first_activation {
+            g.thread_mgr = Some(tm.clone());
+            g.client_id = tid;
+        }
         // 语言栏「中/A」状态牌（用户需求：任务栏语言区显示中英态，
         // 左键切换、右键设置）。每线程挂自己的项（weasel 模式）；
         // 项数据（图标/文字）读进程全局 CHINESE，模式由 update_ui
         // 每帧从引擎 state 同步。
-        if let Some(tm) = g.thread_mgr.clone() {
-            if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
-                if crate::langbar::install(&lbm).is_err() {
-                    // 多线程重复挂同 GUID 会失败（正常）；留诊断即可
+        // 【线程局部 2026-09-12】langbar/compartment 只在首激活线程挂
+        //（小窗线程的 Activate 不重复挂——跨线程 LangBarItemMgr 操作
+        // 无意义且可能失败刷诊断）。
+        if first_activation {
+            if let Some(tm) = g.thread_mgr.clone() {
+                if let Ok(lbm) = tm.cast::<ITfLangBarItemMgr>() {
+                    if crate::langbar::install(&lbm).is_err() {
+                        // 多线程重复挂同 GUID 会失败（正常）；留诊断即可
+                    }
                 }
             }
-        }
-        // 系统输入指示「中/A」：compartment 同步（本线程 + 全局），
-        // 推 OPENCLOSE=1 + 转换模式初值（微软拼音/Rime 同路线）
-        if let Some(tm) = g.thread_mgr.clone() {
-            crate::langbar::install_compartments(&tm, tid);
+            // 系统输入指示「中/A」：compartment 同步（本线程 + 全局），
+            // 推 OPENCLOSE=1 + 转换模式初值（微软拼音/Rime 同路线）
+            if let Some(tm) = g.thread_mgr.clone() {
+                crate::langbar::install_compartments(&tm, tid);
+            }
         }
         // 激活标记（冒烟测试读取：证明 msctf 真实激活管线走到了这里）
         let marker = std::env::temp_dir().join("hufu-tsf-activated.txt");
@@ -2996,7 +3034,8 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
                 .focus_context()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
-        (target, g.client_id, g.focus_epoch)
+        // 【线程局部 2026-09-12】tid 优先本线程（小窗线程会话用本线程 id）。
+        (target, { let t = thread_tid(); if t != 0 { t } else { g.client_id } }, g.focus_epoch)
     };
     // 结果槽：同步档回调内联执行，受理返回时槽已填——把真实执行
     // 结果上抛（旧实现受理=成功的假阳性，见 struct 注记）；异步档
@@ -3059,7 +3098,9 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {
     let (client_id, epoch) = {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        (g.client_id, g.focus_epoch)
+        // 【线程局部 2026-09-12】tid 优先本线程（小窗线程的编辑会话
+        // 必须用本线程 client id——进程级的属于主线程）。
+        ({ let t = thread_tid(); if t != 0 { t } else { g.client_id } }, g.focus_epoch)
     };
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
