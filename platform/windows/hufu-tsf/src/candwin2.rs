@@ -548,6 +548,15 @@ pub struct CandidateWindowV2 {
     visual: Option<IDCompositionVisual>,
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
+    /// 【八十三修·动效重做 v1 2026-09-14】形态动效总控（S0 隐匿/
+    /// S1 光标点/S3 候选框）。v1 消费链：皮肤 motion.enable 开启后，
+    /// 上屏断段不再直接收窗——收场形变为 S1 小圆（高亮色）驻留，
+    /// idle 超时淡出隐藏；A 态渲染照旧（涌现 morph 为 v2）。
+    pub(crate) motion: crate::motion::Motion,
+    /// S1 驻留中最近一次锚点（小圆位置——上屏后光标处）。
+    dot_at: (i32, i32),
+    /// 小圆颜色（ARGB，皮肤高亮色，show_dot 前刷新）。
+    dot_argb: u32,
     /// 【ULW 模式 2026-09-11】owned 窗（打包宿主）不走 DComp 呈现：
     /// D2D 照画到离屏位图（WARP 软件），每帧读回 → DIB →
     /// UpdateLayeredWindow 上屏。无 swapchain/无 NOREDIRECTIONBITMAP，
@@ -957,6 +966,9 @@ impl CandidateWindowV2 {
                 visual: Some(visual),
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
+                motion: crate::motion::Motion::new(),
+                dot_at: (0, 0),
+                dot_argb: 0xFF404046,
                 ulw: false,
                 offscreen: None,
                 ulw_dc: 0,
@@ -1123,6 +1135,9 @@ impl CandidateWindowV2 {
                 visual: None,
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
+                motion: crate::motion::Motion::new(),
+                dot_at: (0, 0),
+                dot_argb: 0xFF404046,
                 ulw: true,
                 offscreen: None,
                 ulw_dc: 0,
@@ -2148,6 +2163,11 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
+        // 【八十三修 v1】motion 皮肤注入+面板形态记录（涌现 morph 的
+        // 目标锚点——v1 仅记录，v2 接管 A 态渲染）。放在布局定型后
+        //（w_out/h_out/radius 就绪）。呼吸/淡出参数由皮肤 motion 节
+        // 控制（缺省 enabled=false：不开不扰动现有动效）。
+        self.motion_note_show(skin, w_out as f32, h_out as f32, radius);
         // 【拉伸动效 2026-09-11】渲染前判定（仅真实内容更新/展开帧——
         // 内部 tick 复渲染与回读取证帧不重臂）：宽高变化超阈值 → 启动/
         // 重定尺寸动画；此后每 tick 由 fade_tick_shared 以「当前插值
@@ -3847,6 +3867,10 @@ impl CandidateWindowV2 {
 
 
     pub fn hide(&mut self) {
+        // 【八十三修 v1】普通 hide 路径=真隐藏（失焦/宿主切换/收窗兜底）
+        // ——motion 状态机同步归零（若正处于 S1 驻留，小圆一并消失）。
+        // 上屏断段的「收场形变为小圆」不走这里，走 hide_to_motion。
+        self.motion.on_external_hide();
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -3877,6 +3901,184 @@ impl CandidateWindowV2 {
         self.sticky_drag = false;
         self.pos_anim = None;
         self.cloaked_streak = 0;
+        // 跨焦点=全新开始：S1 驻留小圆一并终止（下个窗口新起）。
+        self.motion.on_external_hide();
+    }
+
+    // ══════════ 【八十三修·动效重做 v1】S1 小圆链 ══════════
+
+    /// 上屏断段的收场入口：motion.enable 开启（且面板当前在屏）时
+    /// 不收窗——收场形变为 S1 小圆（高亮色）驻留在 (cx,cy)（上屏后
+    /// 光标处），idle 超时淡出隐藏；否则回落普通 hide()。
+    /// 面板从未在屏（单键顶屏直上屏等）不冒小圆——凭空出现一个点
+    /// 比没有更怪。快打（Pulse 画像）时 on_collapse 内部不进 Dot——
+    /// v1 渲染层对此照旧收窗（脉冲渲染 v2）。
+    pub fn hide_to_motion(&mut self, cx: i32, cy: i32) {
+        if !self.motion.enabled
+            || self.ulw
+            || !unsafe { IsWindowVisible(self.hwnd).as_bool() }
+        {
+            self.hide();
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.motion.is_dot_dwell() {
+            // 已在驻留中再次断段（罕见）：只刷新锚点重绘。
+            self.dot_at = (cx, cy);
+            unsafe { self.render_dot(1.0) };
+            return;
+        }
+        self.motion.on_collapse(now);
+        if self.motion.is_dot_dwell() {
+            self.pos_anim = None;
+            self.sticky_drag = false;
+            self.size_anim = None;
+            self.chrome_override.set(None);
+            self.dot_at = (cx, cy);
+            // 起臂首帧：小圆全显（收场 morph v2 接管，v1 直接到位）
+            unsafe { self.render_dot(1.0) };
+            unsafe {
+                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+            }
+        } else {
+            self.hide();
+        }
+    }
+
+    /// S1 小圆渲染（v1：无阴影无呼吸——v2 接管）。alpha=整帧透明度
+    /// （超时淡出用）。DComp 主窗专用（owned/ULW 窗不走 motion）。
+    unsafe fn render_dot(&mut self, alpha: f32) {
+        use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_PROPERTIES1, D2D1_BRUSH_PROPERTIES};
+        use windows::Win32::Graphics::Dxgi::IDXGISurface;
+
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
+        let d = (self.motion.dot_size.max(6.0) * dpi).ceil() as i32;
+        let margin = (6.0 * dpi).ceil() as i32;
+        let side = d + margin * 2;
+        // 窗口缩小到圆位（居中于锚点；swapchain grow-only 不缩缓冲）
+        let x = self.dot_at.0 - side / 2;
+        let y = self.dot_at.1 - side / 2;
+        let _ = SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            side,
+            side,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        if !self.ensure_swapchain(side as u32, side as u32) {
+            return;
+        }
+        let (Some(ctx), Some(chain)) = (self.ctx.clone(), self.swapchain.clone()) else {
+            return;
+        };
+        let Ok(buf) = chain.GetBuffer::<IDXGISurface>(0) else {
+            return;
+        };
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let Ok(bitmap) = ctx.CreateBitmapFromDxgiSurface(&buf, Some(&props)) else {
+            return;
+        };
+        ctx.SetTarget(&bitmap);
+        let _ = ctx.BeginDraw();
+        ctx.Clear(
+            Some(&windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }),
+        );
+        // 高亮色圆（ARGB u32 → COLOR_F）
+        let c = self.dot_argb;
+        let (rr, gg, bb, aa) = (
+            ((c >> 16) & 0xFF) as f32 / 255.0,
+            ((c >> 8) & 0xFF) as f32 / 255.0,
+            (c & 0xFF) as f32 / 255.0,
+            ((c >> 24) & 0xFF) as f32 / 255.0,
+        );
+        let color = D2D1_COLOR_F { r: rr, g: gg, b: bb, a: aa * alpha.clamp(0.0, 1.0) };
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&color, Some(&D2D1_BRUSH_PROPERTIES::default()))
+        {
+            let cx = side as f32 / 2.0;
+            let rad = d as f32 / 2.0;
+            ctx.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cx - rad,
+                        top: cx - rad,
+                        right: cx + rad,
+                        bottom: cx + rad,
+                    },
+                    radiusX: rad,
+                    radiusY: rad,
+                },
+                &brush,
+            );
+        }
+        let _ = ctx.EndDraw(None, None);
+        ctx.SetTarget(None);
+        drop(bitmap);
+        drop(buf);
+        let _ = chain.Present(1, DXGI_PRESENT(0));
+    }
+
+    /// 【八十三修 v1】motion dwell tick：S1 驻留/淡出的重绘推进。
+    /// fade_tick_shared 前置分支调用；返回 true=仍在 motion 动画中
+    /// （继续 tick），false=motion 链结束（隐藏/静止）。
+    pub(crate) fn motion_tick(&mut self) -> bool {
+        if !self.motion.enabled || self.ulw {
+            return false;
+        }
+        if !self.motion.is_dot_dwell() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let frame = self.motion.sample(now);
+        if !frame.visible {
+            // 淡出完成：收窗（异步 hide 防死锁路径同 hide()）
+            unsafe {
+                let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
+            }
+            return false;
+        }
+        unsafe {
+            self.render_dot(frame.form.shell);
+        }
+        matches!(self.motion.tick(now), Some(true))
+    }
+
+    /// motion 皮肤参数注入+涌现记录（show() 每帧调）。
+    pub(crate) fn motion_note_show(&mut self, skin: &Value, w: f32, h: f32, corner: f32) {
+        self.motion.apply_skin(skin);
+        if self.motion.enabled {
+            // 小圆色=皮肤高亮色（与 parse_hex/color_f 同源语义，RGB+FF）
+            let hi = skin
+                .pointer("/colors/hilited_candidate_back_color")
+                .or_else(|| skin.get("colors").and_then(|_| None))
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    skin.get("colors")
+                        .and_then(|c| c.get("hilited_candidate_back_color"))
+                        .and_then(|v| v.as_str())
+                });
+            if let Some(rgb) = hi.and_then(parse_hex) {
+                self.dot_argb =
+                    ((rgb[3] as u32) << 24) | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+            }
+            let _ = self
+                .motion
+                .on_emerge(crate::motion::Form::panel(w, h, corner), std::time::Instant::now());
+        }
     }
 }
 
@@ -4031,7 +4233,21 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
     };
     let mut anim_done = true;
-    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+    // 【八十三修 v1】motion dwell 前置分支：S1 小圆驻留/淡出的重绘
+    // 推进。此时面板链若还有 last_show 残留数据，同 tick 再走一次
+    // c.show 会把小圆窗整帧重绘回大面板（窗口尺寸被 SWP 回去）——
+    // dwell 期间面板链必须整体跳过，只在 motion 结束后交还。
+    let mut motion_dwell = false;
+    {
+        if let Some(c) = cand2.as_mut() {
+            if c.motion_tick() {
+                motion_dwell = true;
+                anim_done = false;
+            }
+        }
+    }
+    if !motion_dwell {
+        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
         let had_fade = c.fade.is_some();
         let fade_done = c.fade_tick();
         let mut shown_this_tick = false;
@@ -4103,6 +4319,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         }
         if c.fade.is_some() {
             anim_done = false;
+        }
         }
     }
     if anim_done {

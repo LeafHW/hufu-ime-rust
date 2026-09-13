@@ -3610,8 +3610,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             drop(g);
             return Ok(());
         }
+        // 【八十三修 v1】上屏断段收场：motion.enable 开启且面板在屏
+        // 时不直接收窗——收场转 S1 小圆驻留（上屏后光标处；g.caret
+        // 是最近一次锚点/插入符矩形——上屏帧 DoEditSession 后已更新
+        // 为新光标位）。否则内部回落普通 hide()。
+        let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            if let Some((cx, cy)) = caret_pt {
+                c.hide_to_motion(cx, cy);
+            } else {
+                c.hide();
+            }
         }
         if g.cand_ui_active {
             drop(g);

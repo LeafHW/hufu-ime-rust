@@ -4,6 +4,10 @@
 //! 引擎，取回 {consumed, commit, state} 后操作 TSF 组段并绘制候选窗。
 
 mod addword;
+// 【动效重做 2026-09-14 八十三修】motion：形态动效总控（S0 隐匿/
+// S1 光标点/S3 候选框的参数空间锚点+morph 单曲线+三级节奏自适应）。
+// candwin2 渲染层消费其 sample() 输出。
+mod motion;
 // 【死模块移除 2026-09-11】candwin.rs（v1 候选窗）与 candwin3.rs 同理：
 // CandidateWindow::new 无调用点（g.cand 恒 None），v2（DComp 直通）+
 // server 代画双通道定稿后 v1 只剩死分支。整模块删除（git 可回溯）。
