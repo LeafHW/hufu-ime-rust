@@ -371,6 +371,10 @@ pub struct Shared {
     /// 的 y 步进。0=未测得（用行框高兜底）。
     pub hupo_line_dy: i32,
     pub hupo_last_seg_y: i32,
+    /// 【六十五修补·键序采纳基点】上次真值采纳（前进/换行/顶死/立段）
+    /// 时的 seg_key_index——键序轻推 dkeys=seg_key_index-adopt_key（单调，
+    /// 顶功消耗不断档）。
+    pub hupo_adopt_key: i32,
     /// 【五十九修·句内顶功标记】真上屏（text 非空）置位。raw==1 立段
     /// 保护：句内顶功后剩余 raw==1 不重新立段（selection 组段框恒=
     /// 句首行，立段=跳回句首）。raw 空帧（组段结束）与 start_preedit_on
@@ -465,6 +469,7 @@ impl Shared {
     hupo_long_mode: false,
     hupo_line_dy: 0,
     hupo_last_seg_y: 0,
+    hupo_adopt_key: 0,
     hupo_had_commit: false,
     cur_raw_len: 0,
             line_end: false,
@@ -1118,7 +1123,7 @@ pub fn trace(msg: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
-    if !*ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() != Ok("0")) {
+    if !*ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() == Ok("1")) {
         return;
     }
     let exe = EXE.get_or_init(|| {
@@ -2447,26 +2452,18 @@ fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
 /// 续前进则采纳 x=right-14（候选窗左缘贴编码尾），y/行高钉段首
 ///（用户认可「文字下面」位置）。
 fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
-    // 【五十九修·raw 空帧复位】组段真正结束（句末上屏：pipe back
-    // raw=''）才复位段标志——取代 47 补 2 在 Op::Commit 的复位（那
-    // 会把整句流顶功上屏误判为段结束：轻推链冻结+raw==1 立段跳回
-    // 句首，58 修前所有「跳一下又跳回去」的真正病根）。
+    // 【六十一修·raw 空帧零副作用】顶功 pipe back 是 commit='字'
+    // raw='' 同帧——59 修在 raw==0 复位 had_commit 会把顶功保护洗
+    // 掉。真句末判据=start_preedit_on（开新组段）；顶功不重建组段。
     if g.cur_raw_len == 0 {
-        g.hupo_seg_started = false;
-        g.hupo_had_commit = false;
-        g.hupo_long_mode = false;
-        g.hupo_prev_raw = 0;
         return;
     }
     if g.cur_raw_len == 1 {
-        // 【五十九修·句内顶功保护】顶功上屏后剩余 raw==1 不是新句
-        // 首键——不立段（selection 组段框恒=句首行，立段=跳回句首），
-        // 保持当前锚不动。新句（start_preedit_on 已复位 had_commit）
-        // 正常立段。
-        if g.hupo_had_commit {
-            g.hupo_prev_raw = g.cur_raw_len;
-            return;
-        }
+        // 【六十二修·句内 raw==1 不 return】hc=true（句内顶功后剩余）
+        // 落入下方句内真值跟踪——return 会使位置永不变（61 版死锁）。
+        if !g.hupo_had_commit {
+            // 新句首键（start_preedit_on 已复位 hc）：强制重立段
+            g.hupo_seg_started = false;
         // 段首键：selection 立段。
         // 【五十二修·矮框不立段】版本行为档案实锤：顶功自动上屏后的
         // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
@@ -2515,6 +2512,8 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     // 【五十八修】新句立段退出长流模式（重查/重立链恢复）
                     g.hupo_long_mode = false;
                     g.hupo_prev_raw = g.cur_raw_len;
+                    // 【六十五修补】键序采纳基点=当前键序
+                    g.hupo_adopt_key = g.seg_key_index;
                 }
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
@@ -2546,7 +2545,8 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 虎魄 qie 一律不走 query_caret（START 值 991 与 selection 立段
         // 1045 差一行的框，采纳即偏上）。无锚期由 suppress→35ms 补显
         // →本函数重查 selection 接管。
-        return;
+            return;
+        }
     }
     // 【五十三修·段内零查询零重查】+【五十五修·段内轻推】锚=段首+
     // (raw-1)×键宽：虎魄不给段内光标数据（实测全部查询姿势恒定/拒
@@ -2571,129 +2571,107 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 随」）。改用 seg_key_index（句内累计键序号：每键递增、顶功不
     // 减、start_preedit_on 新句重置）>6 判定——逐字流每句 4 键不受
     // 影响，整句流句内 7 键起进纯推断模式（溢出换行立即跟随）。
-    if g.cur_raw_len > 6 || g.seg_key_index > 6 {
-        g.hupo_long_mode = true;
-    }
-    if g.hupo_long_mode {
-        // 顶功消耗补偿（同 57）
-        if g.hupo_prev_raw > 0 && g.cur_raw_len < g.hupo_prev_raw {
-            let used = g.hupo_prev_raw - g.cur_raw_len;
-            let adv = ((used as f32) * g.hupo_key_w * 0.5).round() as i32;
-            g.hupo_seg_start_x += adv;
-            g.hupo_seg_raw0 = g.hupo_seg_raw0.saturating_sub(used).max(1);
-        }
-        g.hupo_prev_raw = g.cur_raw_len;
-        if g.hupo_seg_started {
-            let keys = g.cur_raw_len.saturating_sub(g.hupo_seg_raw0);
-            let mut nudge = (keys as f32 * g.hupo_key_w).round() as i32;
-            // 【五十八修补·溢出判据只用真实行宽】span 未测得（0）时绝不
-            // 溢出（此前回退 last_jump=126 当 cap 导致简码/整句流每键
-            // 误判换行、y 疯涨 450px 的病）。span 有值 → cap=span-250。
-            let cap = if g.hupo_line_span > 250 {
-                g.hupo_line_span - 250
-            } else {
-                i32::MAX / 4
-            };
-            // 溢出=换行：y 下移一行（行距真值，未测得退行框高）、x 回
-            // 行首、基点重置——立即跟随到新行，不等上屏。零查询零重查。
-            if cap != i32::MAX / 4 && nudge >= cap && cap > 0 {
-                let dy = if g.hupo_line_dy > 0 { g.hupo_line_dy } else { g.hupo_seg_h };
-                g.hupo_seg_y += dy;
-                g.hupo_seg_raw0 = g.cur_raw_len;
-                nudge = 0;
-                trace("qie: 整句换行推断（溢出）");
-            }
-            let x = g.hupo_seg_start_x + nudge.min(if cap == i32::MAX / 4 { nudge } else { cap });
-            let mut rr = RECT {
-                left: x,
-                top: g.hupo_seg_y,
-                right: x + 14,
-                bottom: g.hupo_seg_y + g.hupo_seg_h,
-            };
-            hupo_clamp(&mut rr);
-            g.caret = Some(rr);
-        }
+    // 【六十二~六十五修·句内每帧真值跟踪统一模型】数据链（90 秒真实
+    // 监控×3 + 多行自测，逐轮实证）：
+    // - 61 版死锁：key_w 只在立段校准（句首 dx=0 校不了）→ 轻推恒 0
+    //   → 位置永不变 → 永无跳量（诊断帧 seg/nud/span 全程钉死）。
+    // - 虎魄句内 selection 偶给真值（跟打进度处 1931/2115/2207 实测）
+    //   ——前进采纳（单调锁）+ key_w 自举（dx/keys，20..90 域内才收）。
+    // - 62 版 y 漂移：前进采纳带 y 跟（dy<60 逐帧累计 +317px）→ 63
+    //   y 锁：同行前进只写 x，y 不动。
+    // - 63 版换行飘移：溢出兜底 y+=line_dy 是纯推断——虎魄打字区滚
+    //   动后新行 y 回网格上方而非 +dy，推断 y 无限递增=「越飘越多」
+    //   （用户多行实测）→ 六十五：推断零 y 写入；y 只由真值改——
+    //   换行采纳（下移 dy 40..300=正常换行；上移 |dy|≤行距×3 且已有
+    //   行距真值=滚动换行）与新句首立段。
+    // - 顶死（轻推≥行宽-250）：x 回行首、基点重置，y 不动等下一帧
+    //   换行真值。
+    if !g.hupo_seg_started {
         return;
     }
-    if g.hupo_reseg {
-        g.hupo_reseg = false;
-        g.hupo_reseg_armed = false;
-        if let Some(mut r) = selection_caret_rect(ctx, ec) {
-            let h = r.bottom - r.top;
-            if h >= 60 {
-                let dy = r.top - g.hupo_seg_y;
-                let dx = r.left - g.hupo_seg_start_x;
-                if dx < -200 || dy.abs() > 50 {
+    // 【六十五修补·键序轻推】raw 轻推被顶功回落打断（消耗帧 keys 归
+    // 零+补偿欠账=x 回退，自测 k24 后 -1000px 实锤）。seg_key_index
+    // 每键+1、顶功不减——x=采纳点+(键序差)×w，斜率 w 由「采纳对采纳」
+    // 自举（dx/键数差，域内才收）。顶功补偿链删除（键序模型天然覆盖
+    // 上屏前进——上屏的字也是打过的键）。
+    // 每帧真值跟踪（单调前进锁，GetTextExt 即时返回不卡——43 修实证）
+    if let Some(r) = selection_caret_rect(ctx, ec) {
+        let h = r.bottom - r.top;
+        if h >= 60 {
+            let dx = r.left - g.hupo_seg_start_x;
+            let dy = r.top - g.hupo_seg_y;
+            if dx > 40 && dx < 800 && dy.abs() < 60 {
+                // 同行前进真值：采 x + 斜率自举；y 锁（63）
+                let dkeys = g.seg_key_index.saturating_sub(g.hupo_adopt_key);
+                if dkeys >= 2 {
+                    let w = dx as f32 / dkeys as f32;
+                    if (15.0..60.0).contains(&w) {
+                        g.hupo_key_w = w;
+                    }
                     trace(&format!(
-                        "qie: 重查重立段 ({},{})->({},{}) dx={} dy={}",
-                        g.hupo_seg_start_x, g.hupo_seg_y, r.left, r.top, dx, dy
+                        "qie: 采纳前进 dx={} dkeys={} w={:.1} →({},{})",
+                        dx, dkeys, w, r.left, g.hupo_seg_y
                     ));
-                    // 【五十七修补】换行回退量=一行总宽真值
-                    if dx < -200 { g.hupo_line_span = -dx; }
-                    g.hupo_seg_start_x = r.left;
-                    g.hupo_seg_y = r.top;
-                    g.hupo_seg_h = h.max(16);
-                    g.hupo_last_seg_x = r.left;
-                    // 【五十七修】新行基点=当前 raw（轻推从新行首重新起算）
-                    g.hupo_seg_raw0 = g.cur_raw_len.max(1);
                 }
+                g.hupo_seg_start_x = r.left;
+                g.hupo_adopt_key = g.seg_key_index;
+                g.hupo_last_seg_x = r.left;
+            } else if dx < -200 && dy > 40 && dy < 300 {
+                // 换行真值（下移）：新行首 + 记行宽/行距
+                g.hupo_line_span = -dx;
+                g.hupo_line_dy = dy;
+                trace(&format!(
+                    "qie: 采纳换行 span={} dy={} →({},{})",
+                    -dx, dy, r.left, r.top
+                ));
+                g.hupo_seg_start_x = r.left;
+                g.hupo_seg_y = r.top;
+                g.hupo_adopt_key = g.seg_key_index;
+                g.hupo_last_seg_x = r.left;
+                g.hupo_last_seg_y = r.top;
+            } else if dx < -200 && g.hupo_line_dy > 0 && dy < 0 && dy > -(g.hupo_line_dy * 3) {
+                // 【六十五】滚动换行真值（上移≤行距×3）：采真值 x+y
+                g.hupo_line_span = -dx;
+                trace(&format!(
+                    "qie: 采纳滚动换行 dy={} →({},{})",
+                    dy, r.left, r.top
+                ));
+                g.hupo_seg_start_x = r.left;
+                g.hupo_seg_y = r.top;
+                g.hupo_adopt_key = g.seg_key_index;
+                g.hupo_last_seg_x = r.left;
+                g.hupo_last_seg_y = r.top;
             }
         }
     }
-    if g.hupo_seg_started {
-        // 【五十七修补·顶功消耗补偿】raw 变短=顶功上屏：光标实际前进
-        // 了上屏字宽——基点前移 消耗×键宽/2，并把 raw0 基点同步到新
-        // raw（轻推从新位置继续，不回退）。
-        if g.hupo_prev_raw > 0 && g.cur_raw_len < g.hupo_prev_raw {
-            let used = g.hupo_prev_raw - g.cur_raw_len;
-            let adv = ((used as f32) * g.hupo_key_w * 0.5).round() as i32;
-            g.hupo_seg_start_x += adv;
-            g.hupo_seg_raw0 = g.hupo_seg_raw0.saturating_sub(used).max(1);
-            g.hupo_last_seg_x = g.hupo_seg_start_x;
-            trace(&format!(
-                "qie: 顶功补偿 +{}（消耗{}键）段首→{}",
-                adv, used, g.hupo_seg_start_x
-            ));
-        }
-        g.hupo_prev_raw = g.cur_raw_len;
-        // 【五十七修·整句流】轻推从行首 raw 基点起算（整句 raw 连续
-        // 增长，若从 1 起算第二行立即顶死旧行尾）。
-        let nudge = if g.hupo_key_w > 0.0 && g.cur_raw_len >= g.hupo_seg_raw0 {
-            let keys = g.cur_raw_len - g.hupo_seg_raw0;
-            let raw_nudge = (keys as f32 * g.hupo_key_w).round() as i32;
-            // 【五十七修补·行宽放开】轻推≤跳量（逐字流段末防超前）；
-            // 超过跳量（整句流一行多字）且已测得行宽 → 放开到行宽-250
-            //（候选窗右缘留白）——一行内持续跟随，不中途顶死。
-            let cap = if raw_nudge > g.hupo_last_jump && g.hupo_line_span > 250 {
-                g.hupo_line_span - 250
-            } else {
-                g.hupo_last_jump
-            };
-            let capped = raw_nudge.min(cap);
-            // 【五十七修·顶死武装】本行轻推已达上限（行将满/已换行）→
-            // 武装一次重查：换行后 reseg 重立到新行首（基点重置，轻推
-            // 从新行起算）；同行（守卫不过）不再武装——零多余帧。
-            // 【六十修补】整句句内（had_commit）不武装——reseg 的
-            // selection 组段框=句首行，重立=跳回句首（逐字流组段每段
-            // 重建无害；整句句内第 7 键起由长流溢出推断接管换行）。
-            if raw_nudge >= cap && !g.hupo_reseg_armed && !g.hupo_had_commit {
-                g.hupo_reseg_armed = true;
-                arm_caret_recheck_timer();
-            }
-            capped
-        } else {
-            0
-        };
-        let x = g.hupo_seg_start_x + nudge;
-        let mut rr = RECT {
-            left: x,
-            top: g.hupo_seg_y,
-            right: x + 14,
-            bottom: g.hupo_seg_y + g.hupo_seg_h,
-        };
-        hupo_clamp(&mut rr);
-        g.caret = Some(rr);
+    // 键序轻推 + 顶死（x-only；y 等真值——六十五）
+    let dkeys = g.seg_key_index.saturating_sub(g.hupo_adopt_key);
+    let mut nudge = (dkeys as f32 * g.hupo_key_w).round() as i32;
+    let cap = if g.hupo_line_span > 250 {
+        g.hupo_line_span - 250
+    } else {
+        i32::MAX / 4
+    };
+    if cap != i32::MAX / 4 && cap > 0 && nudge >= cap {
+        g.hupo_adopt_key = g.seg_key_index;
+        nudge = 0;
+        trace("qie: 顶死回行首（y 等真值）");
     }
+    let x = g.hupo_seg_start_x + nudge.min(if cap == i32::MAX / 4 { nudge } else { cap });
+    let mut rr = RECT {
+        left: x,
+        top: g.hupo_seg_y,
+        right: x + 14,
+        bottom: g.hupo_seg_y + g.hupo_seg_h,
+    };
+    hupo_clamp(&mut rr);
+    g.caret = Some(rr);
+    trace(&format!(
+        "qie: 帧 raw={} segKey={} hc={} 段=({},{}) dk={} w={:.1} cap={} 锚=({},{})",
+        g.cur_raw_len, g.seg_key_index, g.hupo_had_commit,
+        g.hupo_seg_start_x, g.hupo_seg_y, dkeys, g.hupo_key_w, cap,
+        rr.left, rr.top
+    ));
 }
 
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
