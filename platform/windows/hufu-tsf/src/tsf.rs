@@ -3616,6 +3616,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 为新光标位）。否则内部回落普通 hide()。
         let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
         if let Some(c) = g.cand2.as_mut() {
+            if caret_pt.is_none() && c.is_visible() {
+                // 【八十三修·v1 诊断】空帧断段但 caret 缺失（面板在屏却
+                // 拿不到光标位→回落普通 hide 的实例实证）
+                crate::tsf::diag_note("motion空帧: caret=None 面板在屏→普通hide");
+            }
             if let Some((cx, cy)) = caret_pt {
                 c.hide_to_motion(cx, cy);
             } else {

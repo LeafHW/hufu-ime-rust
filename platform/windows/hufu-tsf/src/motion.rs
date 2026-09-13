@@ -42,12 +42,15 @@ pub struct Form {
 }
 
 impl Form {
-    /// S1 光标点：正圆小点。
+    /// S1 光标点：正圆小点。口径=窗口尺寸（含渲染边距，逻辑 px）——
+    /// 与 panel 同口径（panel 含阴影边距），形变全程几何连续。
     pub fn dot(dot_size: f32) -> Self {
+        // dot_size=圆直径；窗口边距每侧 6（render_dot 同款）
+        let side = dot_size + 12.0;
         Form {
-            w: dot_size,
-            h: dot_size,
-            corner: dot_size * 0.5,
+            w: side,
+            h: side,
+            corner: side * 0.5,
             shell: 1.0,
             content: 0.0,
         }
@@ -226,9 +229,18 @@ impl Motion {
     }
 
     /// 皮肤参数注入（show() 每帧调，幂等）。
+    /// 【双形态 2026-09-14】DLL 从管道拿到的皮肤响应是 {skin:{...}}
+    /// 嵌套形态（server pipe.rs op=skin），测试直连/设置页预览是顶层
+    /// 平铺形态——与 candwin2 现有 layout_f/skin.pointer 双形态同款。
     pub fn apply_skin(&mut self, skin: &serde_json::Value) {
-        let m = skin.pointer("/motion").or_else(|| skin.get("motion"));
-        let Some(m) = m else { return };
+        let m = skin
+            .pointer("/skin/motion")
+            .or_else(|| skin.pointer("/motion"))
+            .or_else(|| skin.get("motion"));
+        let Some(m) = m else {
+            // 两形态都无 motion 节：保持缺省（enable=false）
+            return;
+        };
         let b = |k: &str, d: bool| {
             m.get(k).and_then(|x| x.as_bool()).unwrap_or(d)
         };
@@ -424,6 +436,12 @@ impl Motion {
     pub fn is_dot_dwell(&self) -> bool {
         matches!(self.phase, Phase::Dot { .. }) && self.dest == Some(Dest::Dot)
     }
+
+    /// 是否正处于形态飞行中（涌现/收场 morph——渲染层据此接管壳
+    /// 尺寸/圆角/内容透明度）。
+    pub fn in_flight(&self) -> bool {
+        self.flight.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +450,25 @@ mod tests {
 
     fn panel() -> Form {
         Form::panel(240.0, 90.0, 10.0)
+    }
+
+    #[test]
+    fn pipe_form_skin_enables_motion() {
+        // 管道形态：server op=skin 返回 {skin:{motion:...}}（嵌套）——
+        // v1 实机断点实证（只查 /motion 落空→enabled=false 恒关）。
+        let mut m = Motion::new();
+        let skin = serde_json::json!({
+            "skin": {"motion": {"enable": true, "dot_size": 18.0, "idle_timeout_ms": 5000.0}}
+        });
+        m.apply_skin(&skin);
+        assert!(m.enabled, "管道嵌套形态必须开启 motion");
+        assert!((m.dot_size - 18.0).abs() < 0.01);
+        assert_eq!(m.idle_ms, 5000);
+        // 平铺形态（测试直连/设置页预览）也通
+        let mut m2 = Motion::new();
+        let flat = serde_json::json!({"motion": {"enable": true}});
+        m2.apply_skin(&flat);
+        assert!(m2.enabled);
     }
 
     #[test]
