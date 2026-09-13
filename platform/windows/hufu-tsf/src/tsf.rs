@@ -3583,8 +3583,23 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 拉否则无皮肤可渲染。此后 2.5s 过期拉取全部挪到 poll_tick 的
     // 断段分支（raw 空）：改皮肤在下一组段生效，键路径零管道往返
     //（「响应速度变慢」的修复——过期拉取曾在每键路径上同步等管道）。
+    // 【八十二修·首显强制拉 2026-09-14】「改皮肤几秒才生效」收口：
+    // 组段首显（cand_shown_this_segment=false 且有内容）且皮肤缓存
+    // 超 500ms 时强制重拉——「候选窗显示的永远是最新皮肤」成为不
+    // 变量。为什么 500ms 而非每次首显：连打族段间隔常 <500ms（逐字
+    // 上屏流），每段首键都拉=键路径重回管道往返（2026-09-08 教训）；
+    // 改皮肤的场景（设置页操作）段间隔必然秒级——500ms 窗精确区分
+    // 两者：连打零额外往返（每键均摊 0），换肤后首显必新（1-4ms 一次）。
+    // 打字中改皮肤的主通道仍是 poll 的 skin_ver 比对（110ms），此处
+    // 只兜「失焦改皮→回窗首显」的缝——失焦期 poll 静默（窗已收无需
+    // 检测），回焦首帧即本路径渲染。
     if g.skin.is_null() {
         g.load_skin();
+    } else if !g.cand_shown_this_segment
+        && !cands.is_empty()
+        && g.skin_loaded_at.elapsed() > std::time::Duration::from_millis(500)
+    {
+        g.load_skin_forced();
     }
     if cands.is_empty() && raw.is_empty() {
         // 【空帧收 TL·十九修】词框选字/删空后的空帧走这里（深度回归
