@@ -347,6 +347,10 @@ pub struct Shared {
     /// 单调前进，杜绝段末超前光标→段切换回跳（实测 4 键轻推 189>
     /// 字宽 126 时段切换回退 69px 的病）。
     pub hupo_last_jump: i32,
+    /// 【五十六修·重查重立段】CARET_TIMER 到点置位，下帧 SetPreedit
+    /// 的段内分支重查 selection（守卫通过则重立段）——换行立段竞态
+    ///（立到旧行框）的自愈通道。
+    pub hupo_reseg: bool,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -423,6 +427,7 @@ impl Shared {
     hupo_key_w: 0.0,
     hupo_last_seg_x: 0,
     hupo_last_jump: 0,
+    hupo_reseg: false,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -2459,6 +2464,32 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 绝），但键宽可从段间真值自校准（上屏字宽×0.5）——段内候选随
     // 编码逐键右移贴光标（纯计算零查询，不拖动效节奏）。未校准期
     //（首段/换行后）钉段首（保守）。
+    // 【五十六修·重查帧重立段】换行时刻的立段竞态：新段首键到达时
+    // 虎魄滚动动画进行中，selection 立段拿到旧行框=锚卡旧行末；下一
+    // 段立段跳新行、再下段又踩竞态=「新行和上一行末来回跳」实测的
+    // 病根。自愈：60ms 重查帧（立段同值 arm 的）置 hupo_reseg，到点
+    // 重查 selection——守卫（x 回退>200 或 |dy|>50=换行/滚屏级）通过
+    // 才重立段，防段内值抖动误伤。
+    if g.hupo_reseg {
+        g.hupo_reseg = false;
+        if let Some(mut r) = selection_caret_rect(ctx, ec) {
+            let h = r.bottom - r.top;
+            if h >= 60 {
+                let dy = r.top - g.hupo_seg_y;
+                let dx = r.left - g.hupo_seg_start_x;
+                if dx < -200 || dy.abs() > 50 {
+                    trace(&format!(
+                        "qie: 重查重立段 ({},{})->({},{}) dx={} dy={}",
+                        g.hupo_seg_start_x, g.hupo_seg_y, r.left, r.top, dx, dy
+                    ));
+                    g.hupo_seg_start_x = r.left;
+                    g.hupo_seg_y = r.top;
+                    g.hupo_seg_h = h.max(16);
+                    g.hupo_last_seg_x = r.left;
+                }
+            }
+        }
+    }
     if g.hupo_seg_started {
         let nudge = if g.hupo_key_w > 0.0 {
             let raw_nudge =
@@ -4385,6 +4416,9 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     g.caret_recheck_due = false;
+                    // 【五十六修】qie 的重查帧置重立段标志（段内分支带守
+                    // 卫重查 selection——换行立段竞态自愈）。
+                    g.hupo_reseg = true;
                     // 到点强制重查：置 caret_force（SetPreedit 段内查询
                     // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
                         }
