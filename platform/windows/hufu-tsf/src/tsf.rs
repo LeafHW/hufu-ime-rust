@@ -1610,7 +1610,6 @@ fn inject_back_and_text(back: u8, text: &str) {
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
         KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK,
     };
-    let mut inputs: Vec<INPUT> = Vec::new();
     let kb = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -1623,18 +1622,30 @@ fn inject_back_and_text(back: u8, text: &str) {
             },
         },
     };
+    let mut backs: Vec<INPUT> = Vec::new();
     for _ in 0..back {
-        inputs.push(kb(VK_BACK, 0, KEYBD_EVENT_FLAGS(0)));
-        inputs.push(kb(VK_BACK, 0, KEYEVENTF_KEYUP));
+        backs.push(kb(VK_BACK, 0, KEYBD_EVENT_FLAGS(0)));
+        backs.push(kb(VK_BACK, 0, KEYEVENTF_KEYUP));
     }
-    for ch in text.encode_utf16() {
-        inputs.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE));
-        inputs.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_KEYUP | KEYEVENTF_UNICODE));
-    }
-    if !inputs.is_empty() {
+    if !backs.is_empty() {
         unsafe {
-            let n = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-            trace(&format!("76dbg: 注入 {} 键（back={} text={:?}）", n, back, text));
+            let n = SendInput(&backs, std::mem::size_of::<INPUT>() as i32);
+            trace(&format!("77dbg: 注入退格 {} 键", n));
+        }
+        // 【拆段时序】VSCode（Chromium 异步输入管线）单批 [退格+文本]
+        // 的文本先落、退格后删=删错字符（实测 1.。）——退格先发，隔
+        // 40ms 让宿主处理完删除再收文本插入。
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let mut texts: Vec<INPUT> = Vec::new();
+    for ch in text.encode_utf16() {
+        texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE));
+        texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_KEYUP | KEYEVENTF_UNICODE));
+    }
+    if !texts.is_empty() {
+        unsafe {
+            let n = SendInput(&texts, std::mem::size_of::<INPUT>() as i32);
+            trace(&format!("77dbg: 注入文本 {} 键（back={} text={:?}）", n, back, text));
         }
     }
 }
@@ -2301,7 +2312,14 @@ impl EditSession_Impl {
                     total_moved += moved;
                 }
                 // 【七十七修】扩选没动=宿主 TSF 哑（WinForms/WPS/VSCode）
-                // ——不 SetText（空范围无意义），回报 false 走键盘注入。
+                // ——先试 ACP 通道（ITfContextACP::CreateRange 直接按文档
+                // 位置建删除范围——VSCode/Chromium 是 ACP 文档模型，比
+                // ShiftStart 可靠），再不行才回键盘注入。
+                // 【七十七修】扩选没动=宿主 TSF 哑（WinForms/WPS/VSCode）
+                // ——回报 false 走键盘注入。（ACP SetExtent 借用宿主选区
+                // range 改范围再删——WinForms 64 实测键流乱（轮次数据
+                // 错乱），弃用；注入退格在 VSCode 被忽略的问题由注入拆
+                // 段时序解决。）
                 if total_moved == 0 {
                     g.delete_back_ok = false;
                     return Ok(());

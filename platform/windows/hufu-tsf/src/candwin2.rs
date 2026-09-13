@@ -654,6 +654,11 @@ pub struct CandidateWindowV2 {
     pub(crate) pos_ms: u32,
     /// 【动效开关 2026-09-11】设置页全局：false=一切动效瞬跳
     pub(crate) anim_on: std::cell::Cell<bool>,
+    /// 【动效提速 2026-10-08】全局速度倍率（设置页滑条 anim_speed，0~2，
+    /// 0=瞬跳 1=默认 2=慢一倍）——原实现只乘尺寸/淡出时长，平移走距离
+    /// 动态公式不乘滑条（调滑条平移不变）。现平移公式也乘，滑条统管
+    /// 一切动效速度。
+    pub(crate) anim_spd: std::cell::Cell<f32>,
     /// 退场淡出默认时长（150ms × 全局速度）
     pub(crate) fade_ms_eff: u32,
     /// 最近一次 SWP 应用过的窗口左上角屏幕坐标（位置动效的起臂基准）
@@ -987,6 +992,7 @@ impl CandidateWindowV2 {
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
+            anim_spd: std::cell::Cell::new(1.0),
                 fade_ms_eff: 120,
                 live_pos: std::cell::Cell::new((0, 0)),
                 last_swp_size: std::cell::Cell::new((0, 0)),
@@ -1152,6 +1158,7 @@ impl CandidateWindowV2 {
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
+            anim_spd: std::cell::Cell::new(1.0),
                 fade_ms_eff: 120,
                 live_pos: std::cell::Cell::new((0, 0)),
                 last_swp_size: std::cell::Cell::new((0, 0)),
@@ -1548,14 +1555,15 @@ impl CandidateWindowV2 {
         // 再回退瞬跳（用户拍板）。
         self.anim_on.set(anim_on);
         let anim_spd = if anim_on { anim_spd } else { 0.0 };
+        self.anim_spd.set(anim_spd);
         // 【动效口径 2026-09-11 终版④】透明度渐变终判弃用（半透面板+
         // 深色底，任何 alpha 过渡都「变深/透底」——用户三度否决）。首出
         // /收尾改纯运动：首键从 72% 长大到目标（边框阴影跟着拉出），
         // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
         self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        self.fade_ms_eff = (120.0 * anim_spd) as u32;
-        self.size_ms = (layout_f(skin, "size_ms", 90.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        self.pos_ms = (layout_f(skin, "pos_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.fade_ms_eff = (60.0 * anim_spd) as u32;
+        self.size_ms = (layout_f(skin, "size_ms", 60.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -3655,7 +3663,11 @@ impl CandidateWindowV2 {
                         // 【七十四修】40px 以上档时长上限 220ms（覆盖
                         // 上屏大位移平移：400px/220ms≈2px/ms 快滑不拖
                         // 沓；下一键到达即重置新目标，无滞后）。
-                        let dur = (d as u32 * 5).clamp(60, if d > 40 { 220 } else { 100 });
+                        // 【动效提速 2026-10-08】整体提速约 30%：系数 5→3.5、
+                        // 下限 60→45、40px 内档上限 100→75、大步上限 220→150；
+                        // 且乘全局速度倍率（滑条统管平移）。
+                        let spd = self.anim_spd.get().max(0.05);
+                        let dur = ((d as f32 * 3.5 / spd) as u32).clamp(45, if d > 40 { 100 } else { 75 });
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
                         unsafe {
                             let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
