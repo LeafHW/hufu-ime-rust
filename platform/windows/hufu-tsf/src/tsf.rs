@@ -374,6 +374,10 @@ pub struct Shared {
     /// 【六十五修补·键序采纳基点】上次真值采纳（前进/换行/顶死/立段）
     /// 时的 seg_key_index——键序轻推 dkeys=seg_key_index-adopt_key（单调，
     /// 顶功消耗不断档）。
+    /// 【七十三修·光标直跟】本帧 selection 真值（虎魄自绘光标线，宽
+    /// 2px 竖框）——帧末作锚（用户定稿：光标不动窗不动，动了平移过
+    /// 去）。None=本帧无真值，锚落段模型兜底。
+    pub hupo_cursor_truth: Option<RECT>,
     pub hupo_adopt_key: i32,
     /// 【五十九修·句内顶功标记】真上屏（text 非空）置位。raw==1 立段
     /// 保护：句内顶功后剩余 raw==1 不重新立段（selection 组段框恒=
@@ -469,6 +473,7 @@ impl Shared {
     hupo_long_mode: false,
     hupo_line_dy: 0,
     hupo_last_seg_y: 0,
+    hupo_cursor_truth: None,
     hupo_adopt_key: 0,
     hupo_had_commit: false,
     cur_raw_len: 0,
@@ -2607,6 +2612,9 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 上屏前进——上屏的字也是打过的键）。
     // 每帧真值跟踪（单调前进锁，GetTextExt 即时返回不卡——43 修实证）
     if let Some(r) = selection_caret_rect(ctx, ec) {
+        // 【七十三修·光标直跟】真值帧：光标线直存（帧末作锚），采纳
+        // 分支照跑（段模型字段维护=无真值帧的兜底基线）。
+        g.hupo_cursor_truth = Some(r);
         let h = r.bottom - r.top;
         if h >= 60 {
             let dx = r.left - g.hupo_seg_start_x;
@@ -2686,6 +2694,19 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         right: x + 14,
         bottom: g.hupo_seg_y + g.hupo_seg_h,
     };
+    // 【七十三修·光标直跟】用户定稿：候选就在自绘光标下面，光标不
+    // 动窗不动，光标动了再平移过去。实测 selection 真值=虎魄自绘光
+    // 标线（宽 2px 竖框：x 随打字逐键前进、y 精确跟换行与打字区滚
+    // 动）——真值即锚，直接用；上方推进模型（轻推/前进锁/换行判
+    // 别）降级为无真值帧的兜底（rr 保持段模型计算值）。
+    if let Some(r) = g.hupo_cursor_truth.take() {
+        rr = RECT {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        };
+    }
     hupo_clamp(&mut rr);
     g.caret = Some(rr);
     trace(&format!(
@@ -2717,15 +2738,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 现状良好（用户只夸晴），分家保留。
     if exe_is_hupo() {
         if exe_is_hupo_qie() {
-            // 【七十二修·光标跟随】用户定稿方向：虎魄打字区向上滚动
-            //（正在打的行始终保持在打字区中间）——换行+行距推进模型
-            // 是错的方向（新行不在「下一行 y」，还在光标位附近）；
-            // 正确=每帧跟随虎魄光标。GUITHREADINFO 插入符=Qt 光标线
-            //（五十修实证虎魄进程内拿得到：随打字前进 x、随滚动上移
-            // y、换行到新行即光标位）——恒定单源直查，无行底/行内切
-            // 换（五十修当年「往上面移」=selection 行底锚与光标线行
-            // 内锚互相切换，单源无此问题）。查不到（瞬时）落段模型
-            // 重建兜底（七十一修补3，不再碰 GetTextExt 恒定值）。
+            // 【七十三修·光标直跟】虎魄无系统插入符（31 线程实测全无
+            // caret，GUITHREADINFO 恒 None）。真值=selection 光标线
+            //（自绘光标，宽 2px 竖框：x 逐键前进、y 跟换行与滚动）
+            // 每帧直查直写；失败落段模型重建（七十一修补3 兜底，
+            // 不碰 GetTextExt 恒定值）。
+            if let Some(mut r2) = selection_caret_rect(ctx, ec) {
+                hupo_clamp(&mut r2);
+                g.caret = Some(r2);
+                return;
+            }
             if let Some(mut r) = gui_caret_fallback() {
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
