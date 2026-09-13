@@ -2401,56 +2401,47 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     arm_caret_recheck_timer();
                 }
             } else {
-                // 矮框：布局未收敛，不立段不采纳，等重查帧
-                arm_caret_recheck_timer();
-                if g.caret.is_none() {
-                    query_caret(g, ctx, ec);
+                // 【五十三修·矮框速显】矮框（顶屏上屏后新段首布局未收
+                // 敛）的 x/top 是真值、只有高度矮。已立过段（已知行高）
+                // → 真值 x/y + 已知行高立即显示（不 arm 重查——位置已
+                // 正确，多一帧重查只会拖慢平移动效）；未立过段（首段）
+                // → arm 60ms 重查等整行框。两 case 都不走 query_caret
+                //（START 折叠查询返回的行框 y 比 selection 立段高 ~54px
+                // =「抽风上移一下又回来/刚开打偏上」的病根，五十三修禁）。
+                if g.hupo_seg_started && g.hupo_seg_h >= 60 {
+                    let mut rr = RECT {
+                        left: r.left,
+                        top: r.top,
+                        right: r.left + 14,
+                        bottom: r.top + g.hupo_seg_h,
+                    };
+                    hupo_clamp(&mut rr);
+                    g.caret = Some(rr);
+                } else {
+                    arm_caret_recheck_timer();
                 }
             }
-        } else if g.caret.is_none() {
-            query_caret(g, ctx, ec);
         }
+        // 虎魄 qie 一律不走 query_caret（START 值 991 与 selection 立段
+        // 1045 差一行的框，采纳即偏上）。无锚期由 suppress→35ms 补显
+        // →本函数重查 selection 接管。
         return;
     }
-    // 段内键：组段完整 range 包围盒 right=编码尾真值（60ms 补显帧采）
+    // 【五十三修·段内 v1.5.2 语义】段内零查询零重查：锚=段首立段锚恒
+    // 定（实测包围盒 right 段内不动——虎魄布局不给段内数据，任何查
+    // 询都是浪费帧；每键 arm 60ms 重查会让平移动效拖慢一倍）。仅当
+    // 锚意外丢失时用立段数据重建。
     if g.hupo_seg_started {
-        if let Some(comp) = g.composition.clone() {
-            if let Ok(range) = (unsafe { comp.GetRange() }) {
-                if let Ok(view) = (unsafe { ctx.GetActiveView() }) {
-                    let mut rect = RECT::default();
-                    let mut clipped = BOOL(0);
-                    if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_ok()
-                        && rect.right > rect.left
-                    {
-                        // 编码尾 x=包围盒右缘；连续性（相对当前锚 x 前
-                        // 进方向 [-25,+90]，含同位旧值不动）+同行校验
-                        let cur_x = g.caret
-                            .map(|c| c.left + 14)
-                            .unwrap_or(g.hupo_seg_start_x);
-                        let dx = rect.right - cur_x;
-                        let dy = rect.top - g.hupo_seg_y;
-                        if dy.abs() < 40 && dx >= -25 && dx <= 90 {
-                            let mut r = RECT {
-                                left: rect.right - 14,
-                                top: g.hupo_seg_y,
-                                right: rect.right,
-                                bottom: g.hupo_seg_y + g.hupo_seg_h,
-                            };
-                            hupo_clamp(&mut r);
-                            g.caret = Some(r);
-                            trace(&format!(
-                                "qie: 包围盒 right={} dx={}（采纳编码尾）",
-                                rect.right, dx
-                            ));
-                        }
-                    }
-                }
-            }
+        if g.caret.is_none() {
+            let mut rr = RECT {
+                left: g.hupo_seg_start_x,
+                top: g.hupo_seg_y,
+                right: g.hupo_seg_start_x + 14,
+                bottom: g.hupo_seg_y + g.hupo_seg_h,
+            };
+            hupo_clamp(&mut rr);
+            g.caret = Some(rr);
         }
-        // 每键武装 60ms 补显重查（本帧多为旧布局值，收敛后出真值）
-        arm_caret_recheck_timer();
-    } else if g.caret.is_none() {
-        query_caret(g, ctx, ec);
     }
 }
 
