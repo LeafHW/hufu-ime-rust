@@ -30,6 +30,19 @@ pub fn dispatch(
                     .get("line_end")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // 【七十七修·QQ 诊断】server 侧键流落盘（HUFU_TRACE 门控）
+                if std::env::var("HUFU_TRACE").is_ok() {
+                    let _ = std::fs::write(
+                        std::env::temp_dir().join("hufu-server-trace.log"),
+                        format!(
+                            "pid={} key={:?} tail_sync={:?} ctx={:?}\n",
+                            std::process::id(),
+                            k,
+                            req.get("tail_sync").and_then(|v| v.as_str()),
+                            host.session.tail_context
+                        ),
+                    );
+                }
                 // 【七十五修·tail 同步】DLL 随空态键携带宿主侧尾巴
                 //（含直通数字——宿主 TestDown 放行自上屏的数字键事件
                 // 到不了 engine，session.tail_context 断粮=数字后 . 出
