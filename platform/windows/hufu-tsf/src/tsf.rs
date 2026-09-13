@@ -2717,34 +2717,30 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 现状良好（用户只夸晴），分家保留。
     if exe_is_hupo() {
         if exe_is_hupo_qie() {
-            // 虎魄专属：段首/无锚才查一次，段内恒定保持
-            // 【七十一修补3·恒定值隔离】本函数开头已 g.caret=None——
-            // 旧条件 `seg<=1 || caret.is_none()` 在上屏续段（seg 续打
-            // 不归 1）也因 is_none 命中而落标准链——虎魄 GetTextExt
-            // 恒定值（打字区底部固定位置≈下一行 y）写进 g.caret，
-            // 与 qie 帧段模型每帧交替=换行后候选窗两行间反复跳的终
-            // 极根因（全帧 trace 实锤 锚 y 1448↔1305-1378 交替）。
-            // 修：虎魄 qie 一律不走标准链——真首键（新句段模型未建）
-            // 才查一次建基线；段内/续段由段模型直接重建锚。
-            if g.seg_key_index <= 1 && g.caret.is_none() {
-                // 【四十三修补】不设 hupo_single_probe——段首保持 v1.5.2
-                // 的默认双查（39 修单查在 Qt 布局锁下首查失败即弃，
-                // g.caret=None 永久 suppress=「首两键无候选」根因）。
-                // 落标准链：首键自由采纳段首值；est 基线照建但段内
-                // 不步进（下分支直接 return，est 状态无人读=无害）
-            } else {
-                // 段内/上屏续段：锚=段模型重建（零查询），clamp 兜底
-                // 仅防出窗。
-                let mut r = RECT {
-                    left: g.hupo_seg_start_x,
-                    top: g.hupo_seg_y,
-                    right: g.hupo_seg_start_x + 14,
-                    bottom: g.hupo_seg_y + g.hupo_seg_h.max(20),
-                };
+            // 【七十二修·光标跟随】用户定稿方向：虎魄打字区向上滚动
+            //（正在打的行始终保持在打字区中间）——换行+行距推进模型
+            // 是错的方向（新行不在「下一行 y」，还在光标位附近）；
+            // 正确=每帧跟随虎魄光标。GUITHREADINFO 插入符=Qt 光标线
+            //（五十修实证虎魄进程内拿得到：随打字前进 x、随滚动上移
+            // y、换行到新行即光标位）——恒定单源直查，无行底/行内切
+            // 换（五十修当年「往上面移」=selection 行底锚与光标线行
+            // 内锚互相切换，单源无此问题）。查不到（瞬时）落段模型
+            // 重建兜底（七十一修补3，不再碰 GetTextExt 恒定值）。
+            if let Some(mut r) = gui_caret_fallback() {
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
                 return;
             }
+            // 兜底：段模型重建（零查询零宿主值）
+            let mut r = RECT {
+                left: g.hupo_seg_start_x,
+                top: g.hupo_seg_y,
+                right: g.hupo_seg_start_x + 14,
+                bottom: g.hupo_seg_y + g.hupo_seg_h.max(20),
+            };
+            hupo_clamp(&mut r);
+            g.caret = Some(r);
+            return;
         } else {
             // 晴/pain：保持现状（fallback → est → probe 链）
             if let Some(mut r) = gui_caret_fallback() {
@@ -3504,15 +3500,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // ↓ 与常规宿主同一条显示路径（共用锚点链/抑制逻辑/show）
         let skin = g.skin.clone();
         let preview_anchor = state.get("preview_anchor").cloned();
-        // 【七十一修补2·虎魄禁落系统插入符】五十修在 3675 分支挡了
-        // first_show 的 gui 兜底，但本链（show 主路径用的 caret）的
-        // .or_else(gui_caret_fallback) 没挡——上屏帧 g.caret 短暂
-        // None 时虎魄拿到 Qt 光标线旧值（旧行 y），下一键段模型恢复
-        // → 显示目标 y 每上屏一次在对/错值间交替=换行后候选窗上下
-        // 跳（实测 cw2 pos 目标 1420↔1250-1351 每键交替，七十一修
-        // 数据实锤）。虎魄 qie 此处跳过 gui 兜底：None → show 收
-        // anchor=None → cw2 内部走 sticky（上次渲染位），下一键段
-        // 模型锚恢复即正确。
+        // 【七十二修·虎魄光标跟随】七十一修补2 曾对虎魄跳过 gui 兜底
+        //（Qt 光标线旧值污染）——七十二修后虎魄锚恒=GUITHREADINFO 插
+        // 入符每帧实查（query_caret 直查），本链恢复统一兜底（与
+        // query_caret 同源，无交替）。
         let caret = preview_anchor
             .as_ref()
             .and_then(|a| {
@@ -3526,11 +3517,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 })
             })
             .or(g.caret)
-            .or_else(if exe_is_hupo_qie() {
-                || None
-            } else {
-                gui_caret_fallback
-            })
+            .or_else(gui_caret_fallback)
             // 【owned 锚点 2026-09-11】打包宿主 GetTextExt 常态失败、
             // XAML 自绘光标无系统插入符 → 退 owner 窗矩形：候选窗贴
             // 宿主输入窗下缘（开始菜单=搜索框正下方）。
@@ -3692,13 +3679,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 })
             })
             .or_else(|| {
-                // 【五十修·虎魄禁走系统插入符】用户实锤「打了两个字候
-                // 选就往上面移」：虎魄进程内 GUITHREADINFO 拿得到 Qt 的
-                // 光标线（零高度 rect，位于文字行内），补显帧
-                // first_show_of_seg 让它优先于段锚（selection 整行框，
-                // bottom=行底）→ 第二键起窗 y 从行底跳到行内=「往上
-                // 面 移」。虎魄 qie 一律用 g.caret（段锚），不走 fallback。
-                if first_show_of_seg && !exe_is_hupo_qie() {
+                // 【五十修→七十二修·光标单源】五十修曾禁虎魄走系统插
+                // 入符（当时锚=selection 行底，插入符行内，切换=「往上
+                // 面移」）。七十二修定稿：虎魄锚恒=GUITHREADINFO 插入符
+                //（光标跟随），first_show 与段内同源无切换。
+                if first_show_of_seg {
                     gui_caret_fallback().or(g.caret)
                 } else {
                     g.caret
