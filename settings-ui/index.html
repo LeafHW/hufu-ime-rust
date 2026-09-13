@@ -296,11 +296,25 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="s-en"><label for="s-en">启用整句</label></div>
       <div class="checkline"><input type="checkbox" id="s-auto"><label for="s-auto">「整句」方案自动启用</label></div>
       <div class="checkline"><input type="checkbox" id="s-early"><label for="s-early">提前上屏（稳 3 键）</label></div>
+      <div class="checkline"><input type="checkbox" id="s-empty"><label for="s-empty" title="编码缓冲被顶功推空时自动落屏剩余：整句流的收尾通道">空码自动上屏</label></div>
       <span class="pill" id="s-model-state">模型：检测中…</span>
     </div>
     <div class="row">
       <div class="field"><label>ngram 模型文件（安装根下相对路径，如 模型\xxx.bin）</label><input type="text" data-path="sentence.ngram_path" style="width:330px"></div>
     </div>
+    <h3>整句行为</h3>
+    <div class="row">
+      <div class="field"><label>提前上屏稳定键数（观察窗，默认 3）</label><input type="number" data-path="sentence.early_need" min="1" max="8" step="1" style="width:110px"></div>
+      <div class="field"><label>残码水位线（上屏后至少保留的码长，0=不限）</label><input type="number" data-path="sentence.min_retained_raw" min="0" max="8" step="1" style="width:110px"></div>
+    </div>
+    <div class="sub">观察窗=提案需连续稳定 N 键才落屏（越大越稳、上屏越迟）；水位线=防最后一击清空缓冲的兜底保留。</div>
+    <h3>神经重排</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="s-rr"><label for="s-rr" title="打字停顿时用 Qwen 小模型对整句候选重排序（需 gguf 模型文件）">停顿重排</label></div>
+      <div class="field"><label>重排候选数 top_k</label><input type="number" data-path="sentence.rerank.top_k" min="2" max="10" step="1" style="width:110px"></div>
+      <div class="field"><label>停顿判定（毫秒）</label><input type="number" data-path="sentence.rerank.debounce_ms" min="50" max="2000" step="50" style="width:110px"></div>
+    </div>
+    <div class="sub">打字停顿超过设定毫秒后触发一次神经重排；模型缺失时自动跳过，不影响打字。</div>
     <div class="row" style="align-items:center;justify-content:space-between">
       <h3 style="margin:0">组句权重</h3>
       <button id="w-reset" title="把下方所有权重恢复为出厂调校值（自动保存生效）">恢复初始值</button>
@@ -508,6 +522,14 @@ function bindInputs() {
   B("#c-split", "candidates.show_split");
   B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
   B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
+  B("#s-empty", "sentence.empty_code_auto_commit"); B("#s-rr", "sentence.rerank.enabled");
+  /* 【八十一修】「稳 N 键」文案跟随 early_need 数值；改观察窗即刷新 */
+  {
+    const earlyLbl = () => { const l = document.querySelector('label[for="s-early"]'); if (l) l.textContent = `提前上屏（稳 ${CFG.sentence.early_need} 键）`; };
+    earlyLbl();
+    const en = document.querySelector('input[data-path="sentence.early_need"]');
+    if (en) en.addEventListener("input", earlyLbl);
+  }
   B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
   B("#snd-en", "sound.enabled");
   $("#snd-vol").value = CFG.sound?.volume ?? 50;
@@ -575,6 +597,8 @@ function bindInputs() {
 /* ── 整句权重滑杆（1.4.8 版式：九项原术语，拖动后点「保存并应用」生效）── */
 const WDEFS = [
   ["beam_width", "Beam 宽度", 10, 32000, 1],
+  ["candidate_limit", "候选上限", 5, 50, 1],
+  ["max_raw_length", "缓冲码长上限", 16, 256, 4],
   ["rank_penalty", "名次惩罚", 0, 1, 0.005],
   ["emitted_character_reward", "出字奖励", 0, 8, 0.05],
   ["isolation_lambda", "孤立生僻惩罚", 0, 20, 0.1],
@@ -582,13 +606,13 @@ const WDEFS = [
   ["confidence", "提前上屏置信", 0.5, 1, 0.001],
   ["supplement_baseline", "语料奖励基准", 0, 20, 0.1],
   ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
-  ["supplement_maximum", "语料奖励上限", 1, 30, 0.5],
+  ["supplement_maximum", "语料奖励上限", 1, 40, 0.5],
 ];
 /* 出厂调校值：恢复初始值按钮用
    【2026-09-08 默认回归 1.4.8 模型值】W1 束宽 30000 实机每键解码
    数百 ms 致「越打越卡」（1.4.8 基线对照实锤）——出厂回 1.4.8 值。 */
 const W_DEFAULTS = {
-  beam_width: 200, candidate_limit: 20,
+  beam_width: 200, candidate_limit: 20, max_raw_length: 128,
   rank_penalty: 0.03, emitted_character_reward: 2.0,
   isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
   dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
@@ -651,14 +675,21 @@ function buildSliders() {
   });
   hookValFields();
 }
-/* 恢复初始值：权重一键还原出厂调校值 + 自动保存应用 */
+/* 恢复初始值：整句参数一键还原出厂调校值 + 自动保存应用 */
 $("#w-reset").onclick = async () => {
   try {
     Object.assign(CFG.sentence.weights, W_DEFAULTS);
-    CFG.sentence.early_need = 2; /* 恢复为 1.4.8 出厂档 */
+    /* 【八十一修 2026-09-14】出厂档=本机实测调校值（八十修定版）：
+       稳 3 键 / 无水位线 / 空码上屏开 / 重排 5 选 350ms */
+    CFG.sentence.early_need = 3;
+    CFG.sentence.min_retained_raw = 0;
+    CFG.sentence.empty_code_auto_commit = true;
+    CFG.sentence.rerank = Object.assign({}, CFG.sentence.rerank, { enabled: true, top_k: 5, debounce_ms: 350 });
     buildSliders();
+    $$("[data-path]").forEach(el => { const v = getP(CFG, el.dataset.path); if (el.type === "number") el.value = v; else el.value = v ?? ""; });
+    $("#s-empty").checked = true; $("#s-rr").checked = CFG.sentence.rerank.enabled;
     await saveConfig();
-    msg("组句权重已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
+    msg("整句参数已恢复初始值并保存生效 ✓", "ok"); await refreshInfo();
   } catch (e) { msg(e.message, "err"); }
 };
 
@@ -675,7 +706,9 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
      在内存 CFG/SKIN，动作触发时一次全量发送（与原行为一致，仅收口）。 */
 const clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
 const NUM_CLAMPS = {
-  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0, 2] },
+  config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0, 2],
+    /* 【八十一修】整句行为参数保存钳制（与 number 框 min/max 同源） */
+    "sentence.early_need": [1, 8], "sentence.min_retained_raw": [0, 8], "sentence.rerank.top_k": [2, 10], "sentence.rerank.debounce_ms": [50, 2000] },
   layout: {
     font_point: [8, 72], label_font_point: [0, 72], width: [0, 1200], min_width: [0, 1200],
     margin_x: [0, 60], margin_y: [0, 60], corner_radius: [0, 40], hilited_corner_radius: [0, 40],
