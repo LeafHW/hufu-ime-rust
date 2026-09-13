@@ -351,6 +351,23 @@ pub struct Shared {
     /// 的段内分支重查 selection（守卫通过则重立段）——换行立段竞态
     ///（立到旧行框）的自愈通道。
     pub hupo_reseg: bool,
+    /// 【五十七修·整句流换行】立段时的 raw 基点（该行首键数）。整句
+    /// 打法 raw 连续增长（10-20+ 键），轻推必须从行首 raw 起算——
+    /// 否则整句第二行起轻推立即顶死在旧行尾（用户实测「跳过来一下
+    /// 又回到上一行行尾」的病根）。顶死（本行轻推≥跳量）时武装重
+    /// 查：换行后重立段到新行行首、基点重置，轻推从新行重新起算。
+    pub hupo_seg_raw0: usize,
+    pub hupo_reseg_armed: bool,
+    /// 【五十七修补·行宽真值】换行回退量=打字区一行总宽（reseg 重立
+    /// 时 dx<-200 记录 |dx|）。整句流一行内轻推放开到行宽-余量（候选
+    /// 窗右缘留白 250），逐字流保持跳量 cap（防段末超前）。0=未测得，
+    /// 用跳量保守。
+    pub hupo_line_span: i32,
+    /// 【五十七修补·顶屏消耗补偿】整句流中顶屏自动上屏使 raw 变短，
+    /// 但光标实际前进了（上屏字宽）——轻推基点必须同步：seg_start_x
+    /// 前移 消耗键数×键宽/2（=消耗字数×字宽，键宽=字宽/2 自洽），
+    /// 否则 x 回退（实测顶屏后 1792→1383 的病）。
+    pub hupo_prev_raw: usize,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -428,6 +445,10 @@ impl Shared {
     hupo_last_seg_x: 0,
     hupo_last_jump: 0,
     hupo_reseg: false,
+    hupo_seg_raw0: 1,
+    hupo_reseg_armed: false,
+    hupo_line_span: 0,
+    hupo_prev_raw: 0,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -2426,6 +2447,9 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     g.hupo_seg_y = r.top;
                     g.hupo_seg_h = h.max(16);
                     g.hupo_seg_started = true;
+                    // 【五十七修】行首 raw 基点（raw==1 时=1）
+                    g.hupo_seg_raw0 = g.cur_raw_len.max(1);
+                    g.hupo_reseg_armed = false;
                 }
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
@@ -2472,6 +2496,7 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 才重立段，防段内值抖动误伤。
     if g.hupo_reseg {
         g.hupo_reseg = false;
+        g.hupo_reseg_armed = false;
         if let Some(mut r) = selection_caret_rect(ctx, ec) {
             let h = r.bottom - r.top;
             if h >= 60 {
@@ -2482,21 +2507,56 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         "qie: 重查重立段 ({},{})->({},{}) dx={} dy={}",
                         g.hupo_seg_start_x, g.hupo_seg_y, r.left, r.top, dx, dy
                     ));
+                    // 【五十七修补】换行回退量=一行总宽真值
+                    if dx < -200 { g.hupo_line_span = -dx; }
                     g.hupo_seg_start_x = r.left;
                     g.hupo_seg_y = r.top;
                     g.hupo_seg_h = h.max(16);
                     g.hupo_last_seg_x = r.left;
+                    // 【五十七修】新行基点=当前 raw（轻推从新行首重新起算）
+                    g.hupo_seg_raw0 = g.cur_raw_len.max(1);
                 }
             }
         }
     }
     if g.hupo_seg_started {
-        let nudge = if g.hupo_key_w > 0.0 {
-            let raw_nudge =
-                ((g.cur_raw_len.saturating_sub(1)) as f32 * g.hupo_key_w).round() as i32;
-            // 【五十五修补·封顶】轻推≤段间跳量：段末恰好推到下段段首，
-            // 全程单调（超前→段切换回跳的病根）。
-            raw_nudge.min(g.hupo_last_jump)
+        // 【五十七修补·顶屏消耗补偿】raw 变短=顶屏上屏：光标实际前进
+        // 了上屏字宽——基点前移 消耗×键宽/2，并把 raw0 基点同步到新
+        // raw（轻推从新位置继续，不回退）。
+        if g.hupo_prev_raw > 0 && g.cur_raw_len < g.hupo_prev_raw {
+            let used = g.hupo_prev_raw - g.cur_raw_len;
+            let adv = ((used as f32) * g.hupo_key_w * 0.5).round() as i32;
+            g.hupo_seg_start_x += adv;
+            g.hupo_seg_raw0 = g.hupo_seg_raw0.saturating_sub(used).max(1);
+            g.hupo_last_seg_x = g.hupo_seg_start_x;
+            trace(&format!(
+                "qie: 顶屏补偿 +{}（消耗{}键）段首→{}",
+                adv, used, g.hupo_seg_start_x
+            ));
+        }
+        g.hupo_prev_raw = g.cur_raw_len;
+        // 【五十七修·整句流】轻推从行首 raw 基点起算（整句 raw 连续
+        // 增长，若从 1 起算第二行立即顶死旧行尾）。
+        let nudge = if g.hupo_key_w > 0.0 && g.cur_raw_len >= g.hupo_seg_raw0 {
+            let keys = g.cur_raw_len - g.hupo_seg_raw0;
+            let raw_nudge = (keys as f32 * g.hupo_key_w).round() as i32;
+            // 【五十七修补·行宽放开】轻推≤跳量（逐字流段末防超前）；
+            // 超过跳量（整句流一行多字）且已测得行宽 → 放开到行宽-250
+            //（候选窗右缘留白）——一行内持续跟随，不中途顶死。
+            let cap = if raw_nudge > g.hupo_last_jump && g.hupo_line_span > 250 {
+                g.hupo_line_span - 250
+            } else {
+                g.hupo_last_jump
+            };
+            let capped = raw_nudge.min(cap);
+            // 【五十七修·顶死武装】本行轻推已达上限（行将满/已换行）→
+            // 武装一次重查：换行后 reseg 重立到新行首（基点重置，轻推
+            // 从新行起算）；同行（守卫不过）不再武装——零多余帧。
+            if raw_nudge >= cap && !g.hupo_reseg_armed {
+                g.hupo_reseg_armed = true;
+                arm_caret_recheck_timer();
+            }
+            capped
         } else {
             0
         };
