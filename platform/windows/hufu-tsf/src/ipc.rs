@@ -473,18 +473,19 @@ pub fn key_request(
     ctrl: bool,
     alt: bool,
     line_end: bool,
-    tail_sync: Option<&str>,
+    digit_tail: Option<&str>,
 ) -> Option<(bool, String, u8, Value, Option<String>, u8)> {
-    // 【七十五修·tail 同步】空态键随带宿主侧尾巴（含直通数字）——
-    // server 覆盖 session.tail_context（数字后标点半角化数据源）。
+    // 【七十七修·digit_tail 补齐】空态键随带 TestDown 记的直通数字
+    // 尾巴——server 端做后缀补齐（engine tail 没有这段才追加，递键
+    // 宿主 QQ 的 tail 不被覆盖污染）。
     let mut req = serde_json::json!({
         "op": "key",
         "key": key,
         "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt },
         "line_end": line_end
     });
-    if let Some(t) = tail_sync {
-        req["tail_sync"] = serde_json::json!(t);
+    if let Some(t) = digit_tail {
+        req["digit_tail"] = serde_json::json!(t);
     }
     let resp = call_key(&req)?;
     let outcome = resp.get("outcome")?;

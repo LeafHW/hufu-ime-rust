@@ -377,14 +377,18 @@ pub struct Shared {
     /// 【七十三修·光标直跟】本帧 selection 真值（虎魄自绘光标线，宽
     /// 2px 竖框）——帧末作锚（用户定稿：光标不动窗不动，动了平移过
     /// 去）。None=本帧无真值，锚落段模型兜底。
-    /// 【七十五修·tail 同步】本地尾巴缓存：直通数字（宿主自上屏，
-    /// engine 看不到）+ 本地 commit 应用。随空态键同步 server 的
-    /// tail_context（数字后标点半角化的数据源）。
-    pub hufu_tail: String,
-    /// 七十五修：TestDown 数字去重（同 vk 20ms 窗口——TestDown 可能
+    /// 【七十七修·统一重做】直通数字尾巴：只在 TestDown 空闲数字放行时
+    /// 记（宿主自上屏、engine 看不到的数字），随下一空态键 digit_tail
+    /// 发往 server 做「后缀补齐」（不覆盖 engine tail——递键宿主 QQ
+    /// 的 engine tail 是正确的，覆盖会污染）。
+    pub digit_tail: String,
+    /// 七十七修：TestDown 数字去重（同 vk 20ms 窗口——TestDown 可能
     /// 被宿主重复查询；auto-repeat 33ms 保留）。
     pub last_digit_vk: u32,
     pub last_digit_at: Option<std::time::Instant>,
+    /// 七十七修：Op::DeleteBack 执行结果回传（TSF 扩选成功与否），
+    /// dispatch 层据此决定走 TSF 提交还是键盘层注入。
+    pub delete_back_ok: bool,
     pub hupo_cursor_truth: Option<RECT>,
     pub hupo_adopt_key: i32,
     /// 【五十九修·句内顶功标记】真上屏（text 非空）置位。raw==1 立段
@@ -481,9 +485,10 @@ impl Shared {
     hupo_long_mode: false,
     hupo_line_dy: 0,
     hupo_last_seg_y: 0,
-    hufu_tail: String::new(),
+    digit_tail: String::new(),
     last_digit_vk: 0,
     last_digit_at: None,
+    delete_back_ok: false,
     hupo_cursor_truth: None,
     hupo_adopt_key: 0,
     hupo_had_commit: false,
@@ -1407,14 +1412,13 @@ impl HuFuTs_Impl {
                     // 否则自己上屏 ^ 之类的 US shift 形态（Shift+6 实测）。
                     n if n.len() == 1 => {
                         let plain_digit = n.chars().all(|c| c.is_ascii_digit());
-                        // 【七十五修·直通数字记尾】空闲数字放行=宿主自
-                        // 上屏，engine 的 tail_context 看不到它——数字
-                        // 后标点半角化（1.5 / 1.）断粮出全角「。」（32
-                        // 位 WinForms 类宿主 TestDown 后不递 KeyDown，
-                        // 实测 1. 出「。」；键事件到不了 pipe）。本层
-                        // 乐观记入 hufu_tail，随下一空态键 tail_sync
-                        // 同步 engine。同 vk 20ms 去重（TestDown 可能
-                        // 被重复查询；auto-repeat 33ms 不受影响）。
+                        // 【七十七修·直通数字记尾】空闲数字放行=宿主自
+                        // 上屏；不递键宿主（跟打器/WinForms/pain 类）的
+                        // 键事件到不了 engine，tail 断粮=数字后 . 出全
+                        // 角。TestDown 层乐观记入 digit_tail，随下一空
+                        // 态键发 server 做后缀补齐（递键宿主 engine 已
+                        // 自记，补齐去重无害）。同 vk 20ms 去重（TestDown
+                        // 可能被重复查询；auto-repeat 33ms 保留）。
                         if plain_digit && !shift {
                             let ch = n.chars().next().unwrap_or('0');
                             let vk_ch = ch as u32;
@@ -1428,18 +1432,22 @@ impl HuFuTs_Impl {
                                     .map(|t| t.elapsed().as_millis() < 20)
                                     .unwrap_or(false);
                             if !dup {
-                                g.hufu_tail.push(ch);
-                                let cnt = g.hufu_tail.chars().count();
-                                if cnt > 32 {
-                                    let skip = cnt - 32;
-                                    g.hufu_tail = g
-                                        .hufu_tail
+                                g.digit_tail.push(ch);
+                                let cnt = g.digit_tail.chars().count();
+                                if cnt > 8 {
+                                    let skip = cnt - 8;
+                                    g.digit_tail = g
+                                        .digit_tail
                                         .chars()
                                         .skip(skip)
                                         .collect();
                                 }
                                 g.last_digit_vk = vk_ch;
                                 g.last_digit_at = Some(now);
+                                trace(&format!(
+                                    "77dbg: TestDown 记尾 {} digit_tail={}",
+                                    ch, g.digit_tail
+                                ));
                             }
                         }
                         !plain_digit || shift
@@ -1492,39 +1500,29 @@ impl HuFuTs_Impl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last_key_at = Some(std::time::Instant::now());
-        // 【七十五修·tail 同步】无组段（空态）键随带本地尾巴——server
-        // 覆盖 session.tail_context（数字后标点半角化的数据源；本地
-        // tail 含直通数字+本地 commit 应用，比 engine 视角更全）。
-        // 有组段时跳过（编码中 engine tail 自洽，覆盖无益）。
-        let tail_sync = {
-            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            if g.composition.is_some() || g.hufu_tail.is_empty() {
+        // 【七十七修·digit_tail 补齐】空态（无组段）键随带 TestDown 记
+        // 的直通数字尾巴，发走即清（组段键到达=engine 自记，旧尾巴过
+        // 期）。server 端做后缀补齐（不覆盖递键宿主的正确 tail）。
+        let digit_tail = {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.composition.is_some() {
+                g.digit_tail.clear();
+                None
+            } else if g.digit_tail.is_empty() {
                 None
             } else {
-                Some(g.hufu_tail.clone())
+                Some(std::mem::take(&mut g.digit_tail))
             }
         };
         let Some((consumed, commit, back, state, sound, sound_vol)) =
-            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end, tail_sync.as_deref())
+            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end, digit_tail.as_deref())
         else {
             return BOOL(0);
         };
-        // 七十五修：本地尾应用（commit 追加 / back 回退）——与 server
-        // 端 host.rs 的 tail 维护同构（DLL 侧含直通数字，覆盖权威）。
-        {
-            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            for _ in 0..back {
-                g.hufu_tail.pop();
-            }
-            if !commit.is_empty() && commit != "{加词}" && commit != "{隐藏候选}" {
-                g.hufu_tail.push_str(&commit);
-                let cnt = g.hufu_tail.chars().count();
-                if cnt > 32 {
-                    let skip = cnt - 32;
-                    g.hufu_tail = g.hufu_tail.chars().skip(skip).collect();
-                }
-            }
-        }
+        trace(&format!(
+            "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
+            name, consumed, commit, back, digit_tail
+        ));
         // 【换方案即失效皮肤 2026-09-11】Ctrl+M 换方案后 entrance_anim
         // 等方案相关字段变化——键路径不拉皮肤（性能），不失效则缓存
         // 沿用到断段+2.5s（实测：单字切回整句后无入场动效，切窗才
@@ -1568,18 +1566,34 @@ impl HuFuTs_Impl {
             if let Some(tag) = sound {
                 crate::sound::play(&tag, sound_vol);
             }
-            // 回删替换（数字后 1. 再按 . → 。）：先删旧字符再走正常提交
-            // 【七十六修·键盘层注入】TSF ShiftStart 扩选在 WinForms/WPS
-            // 静默不动（实测 hr=ok moved=0，2 的点没删=「1.。」根因）。
-            // 改走键盘层：SendInput 退格×n + VK_PACKET 文本——队列保序
-            // （退格先处理删旧点、再插文本），任何宿主通用。此路径的
-            // commit 不再走 InsertTextAtSelection（避免插入先于删除的
-            // 乱序）：update_ui 收空 commit（仅状态/候选刷新）。
-            if back > 0 && !commit.is_empty() {
-                Self::inject_back_and_text(back, &commit);
-                let _ = update_ui(self.shared.clone(), String::new(), state);
-            } else if back > 0 {
+            // 【七十七修·回删替换两级通道】数字后 1. 再按 . → 删半角
+            // 点+提交「。」。先走 TSF 扩选删除（QQ/记事本等正常宿主）；
+            // 宿主 ShiftStart 哑（WinForms/WPS/VSCode 实测 hr=ok
+            // moved=0）时回退键盘层注入：SendInput 退格×n + VK_PACKET
+            // 文本，队列保序（先删后插），任何宿主通用。注入路径的
+            // commit 不走 InsertTextAtSelection（避免插入先于删除的
+            // 乱序），update_ui 收空 commit 仅做状态/候选刷新。
+            if back > 0 {
+                let tsf_ok = {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.delete_back_ok = false;
+                    g
+                };
+                drop(tsf_ok);
                 let _ = run_session(&self.shared, Op::DeleteBack(back as u32), None);
+                let deleted = {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let ok = g.delete_back_ok;
+                    g.delete_back_ok = false;
+                    ok
+                };
+                trace(&format!("77dbg: 回删 back={} TSF删除={} ", back, deleted));
+                if deleted {
+                    let _ = update_ui(self.shared.clone(), commit, state);
+                } else {
+                    Self::inject_back_and_text(back, &commit);
+                    let _ = update_ui(self.shared.clone(), String::new(), state);
+                }
             } else {
                 let _ = update_ui(self.shared.clone(), commit, state);
             }
@@ -2277,19 +2291,29 @@ impl EditSession_Impl {
                     let hr = unsafe { range.ShiftStart(ec, -1, &mut moved, std::ptr::null_mut()) };
                     if hr.is_err() || moved == 0 {
                         trace(&format!(
-                            "75dbg: ShiftStart 停 err={} moved={} total={}",
-                            hr.is_err(), moved, total_moved
+                            "77dbg: ShiftStart 停 err={} moved={} total={}",
+                            hr.is_err(),
+                            moved,
+                            total_moved
                         ));
                         break;
                     }
                     total_moved += moved;
                 }
+                // 【七十七修】扩选没动=宿主 TSF 哑（WinForms/WPS/VSCode）
+                // ——不 SetText（空范围无意义），回报 false 走键盘注入。
+                if total_moved == 0 {
+                    g.delete_back_ok = false;
+                    return Ok(());
+                }
                 let empty: Vec<u16> = Vec::new();
                 let hr2 = unsafe { range.SetText(ec, 0, &empty) };
+                let ok = hr2.is_ok();
                 trace(&format!(
-                    "75dbg: DeleteBack n={} moved={} SetText err={}",
-                    n, total_moved, hr2.is_err()
+                    "77dbg: DeleteBack n={} moved={} SetText ok={}",
+                    n, total_moved, ok
                 ));
+                g.delete_back_ok = ok;
                 Ok(())
             }
             Op::End => {

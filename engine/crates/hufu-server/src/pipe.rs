@@ -30,28 +30,52 @@ pub fn dispatch(
                     .get("line_end")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // 【七十七修·QQ 诊断】server 侧键流落盘（HUFU_TRACE 门控）
+                // 【七十七修·键流落盘】server 侧诊断（HUFU_TRACE 门控）
+                let diag_tail = req.get("digit_tail").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if std::env::var("HUFU_TRACE").is_ok() {
                     let _ = std::fs::write(
                         std::env::temp_dir().join("hufu-server-trace.log"),
                         format!(
-                            "pid={} key={:?} tail_sync={:?} ctx={:?}\n",
+                            "pid={} key={:?} digit_tail={:?} ctx={:?}\n",
                             std::process::id(),
                             k,
-                            req.get("tail_sync").and_then(|v| v.as_str()),
+                            diag_tail,
                             host.session.tail_context
                         ),
                     );
                 }
-                // 【七十五修·tail 同步】DLL 随空态键携带宿主侧尾巴
-                //（含直通数字——宿主 TestDown 放行自上屏的数字键事件
-                // 到不了 engine，session.tail_context 断粮=数字后 . 出
-                // 「。」；32 位 WinForms 类宿主实测）。非空覆盖，截尾
-                // 32 与 host.rs 维护同构。
-                if let Some(ts) = req.get("tail_sync").and_then(|v| v.as_str()) {
-                    let chars: Vec<char> = ts.chars().collect();
-                    let skip = chars.len().saturating_sub(32);
-                    host.session.tail_context = chars.into_iter().skip(skip).collect();
+                // 【七十七修·digit_tail 后缀补齐】DLL 随空态键携带
+                // TestDown 记的直通数字尾巴（不递键宿主跟打器/WinForms/
+                // pain 的数字到不了 engine，tail 断粮=数字后 . 出全角；
+                // 递键宿主 QQ 的 OnKeyDown 让 engine 自记）。**只补齐
+                // 不覆盖**：求 digit_tail 与 engine tail 的最长公共后缀
+                // 重叠，仅追加缺失部分——QQ 的正确 tail 不被污染（七
+                // 十五修覆盖式同步的教训）。截尾 32 与 host.rs 同构。
+                if let Some(dt) = diag_tail {
+                    if !dt.is_empty() {
+                        let dt_chars: Vec<char> = dt.chars().collect();
+                        let tail_len = host.session.tail_context.chars().count();
+                        let tail_chars: Vec<char> = host.session.tail_context.chars().collect();
+                        let mut overlap = 0;
+                        while overlap < dt_chars.len()
+                            && overlap < tail_len
+                            && dt_chars[dt_chars.len() - 1 - overlap]
+                                == tail_chars[tail_chars.len() - 1 - overlap]
+                        {
+                            overlap += 1;
+                        }
+                        if overlap < dt_chars.len() {
+                            let add: String =
+                                dt_chars[..dt_chars.len() - overlap].iter().collect();
+                            host.session.tail_context.push_str(&add);
+                            let cnt = host.session.tail_context.chars().count();
+                            if cnt > 32 {
+                                let skip = cnt - 32;
+                                host.session.tail_context =
+                                    host.session.tail_context.chars().skip(skip).collect();
+                            }
+                        }
+                    }
                 }
                 let mut r = host.process_key(k);
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
