@@ -1801,6 +1801,8 @@ impl Engine {
     /// 提前上屏（Rime try_early_commit 逐行移植）：
     /// 置信前缀提案 + 3 键证据史公共前缀 → 增量上屏，编码留在上下文继续组句。
     fn try_early_commit(&mut self, session: &mut Session) {
+        static EC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ec_dbg = *EC_DEBUG.get_or_init(|| std::env::var("HUFU_EARLY_DEBUG").is_ok());
         if !self.config.sentence.early_commit || session.early_suspended {
             session.early_history.clear();
             session.line_end_hint = false;
@@ -1815,7 +1817,12 @@ impl Engine {
         }
         let dec = match &self.sentence {
             Some(d) => d.clone(),
-            None => return,
+            None => {
+                if ec_dbg {
+                    eprintln!("[early] 停:无解码器");
+                }
+                return;
+            }
         };
         let full = format!("{}{}", session.committed_raw, live);
         // 【语料前缀挂起】full 是语料词编码变体的真前缀且词尾将近
@@ -1834,7 +1841,15 @@ impl Engine {
         } else {
             (&dec.hits[..], dec.truncated)
         };
-        if truncated {
+        if truncated && !session.early_resid_armed {
+            // 【六十六修补2·截断放行】truncated=beam 剪枝标志（bucket 状态
+            // 超 beam 被剪），长句必然发生——Rime 保守规则一票否决=长句
+            // 提前上屏停摆（实测 42 键 full_len≥27 连环截断 12 次停）。
+            // armed（残码水位已触发）态放行——top1 结果仍可信；普通
+            // 通道保持 Rime 原语义。
+            if ec_dbg {
+                eprintln!("[early] 停:截断 full_len={}", full.chars().count());
+            }
             session.early_history.clear();
             return;
         }
@@ -1850,9 +1865,19 @@ impl Engine {
 
         let (proposal, proposal_share) =
             confidence_proposal(&cands, self.config.sentence.weights.confidence);
-        if proposal.is_empty()
-            || proposal.chars().count() <= committed_text.chars().count()
+        if (proposal.is_empty()
+            || proposal.chars().count() <= committed_text.chars().count())
+            && !session.early_resid_armed
         {
+            // 【六十六修补2·武装豁免】前缀共识被候选分歧削平（proposal
+            // =committed 无增量，长句第二轮实测停摆源）——普通通道停；
+            // armed 态豁免（下方武装快通道直出 top1，不靠共识前缀）。
+            if ec_dbg {
+                eprintln!(
+                    "[early] 停:提案空/不超 committed='{}' proposal='{}'",
+                    committed_text, proposal
+                );
+            }
             session.early_history.clear();
             return;
         }
@@ -1898,6 +1923,45 @@ impl Engine {
             session.early_history.remove(0);
         }
 
+        // 【六十六修补2·武装快通道】用户算法：残码>水位线（15）触发一
+        // 次后句内持续武装，每键高置信（top1 软最大份额≥strong 线）直
+        // 接上屏。绕过普通通道的三个长句杀手（42 键实测全部停摆源）：
+        //   a) 证据史公共前缀被候选分歧削平（提案=committed 无增量，
+        //      实测第二轮 让我看看怎么个事=committed 停）→ 直出 top1
+        //      全句（src 已优先不完全尾——不带进行态尾字）
+        //   b) consumed 需 2 条历史一致（单条恒 0 停）→ 用本条 raw_lengths
+        //   c) 证据窗 need=2 在长句里攒不齐（史频繁被清）→ 单键直出
+        // 普通通道（未武装）一字不动。delta 游标=committed_text（武装态
+        // 下游标语义纯净：committed 即已上屏文本）。
+        if session.early_resid_armed && proposal_share >= strong_line {
+            let top: String = cands[0].text.clone();
+            let hist = session.early_history.last().cloned();
+            if let Some(e) = hist {
+                let consumed = e
+                    .raw_lengths
+                    .iter()
+                    .find(|(p, _)| p == &top)
+                    .map(|(_, l)| *l)
+                    .unwrap_or(0);
+                let committed_raw_len = session.committed_raw.chars().count();
+                if consumed > committed_raw_len && consumed <= full.chars().count() {
+                    let delta: String = top.chars().skip(committed_text.chars().count()).collect();
+                    if delta.chars().count() >= 1 && live.chars().count() >= 2 {
+                        if ec_dbg {
+                            eprintln!("[early] 武装直出 上屏'{}' 消耗{}", delta, consumed);
+                        }
+                        session.committed_text = top;
+                        let full_chars: Vec<char> = full.chars().collect();
+                        session.committed_raw = full_chars[..consumed].iter().collect();
+                        session.raw = full_chars[consumed..].iter().collect();
+                        session.early_history.clear();
+                        session.pending_commit = Some(delta);
+                        return;
+                    }
+                }
+            }
+        }
+
         // 观察窗口按证据强度自适应：强证据 2 键确认；普通证据 2 键
         // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）。
         // 行尾（组段逼近窗口右缘）1 键即确认——commit 的仍是同一置信
@@ -1921,7 +1985,29 @@ impl Engine {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(need_k);
         let cur_strong = session.early_history.last().map(|e| e.strong).unwrap_or(false);
+        // 【六十六修·残码水位线】用户拍板算法：残算编码（live raw）>20
+        //（初版 10，用户实测偏短——候选攒不久就上屏；改 20 让整句候选
+        // 充分成型）且当前提案高置信（strong 份额线）→ 立即上屏（need=1）
+        // 把水位降回；置信度不高 → 不强制，按原证据窗攒（「置信度实在
+        // 不高就不上屏，只要高就上屏」）。上屏后剩余残码继续按原逻辑，
+        // 再次累计到 20 重复。现有机制（证据窗/公共前缀/行尾 1 键）全保持。
+        static RESID_LINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let resid_line = *RESID_LINE.get_or_init(|| {
+            std::env::var("HUFU_EARLY_RESID_LINE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15)
+        });
+        // 【六十六修补·水位武装】>20 触发过一次即句内持续武装：之后
+        // 每键高置信直接上屏（不等再攒 20——用户实测否则每次都卡在
+        // 20 附近，候选越攒越长）。句末 clear 复位，新句重新按水位线启动。
+        if live.chars().count() > resid_line {
+            session.early_resid_armed = true;
+        }
+        let resid_go = session.early_resid_armed;
         let need = if line_end {
+            1
+        } else if cur_strong && resid_go {
             1
         } else if cur_strong {
             strong_k.min(need_k.max(1))
@@ -1962,10 +2048,20 @@ impl Engine {
             consumed = stable_history_raw_length(&session.early_history, &stable);
         }
         if consumed == 0 {
+            if ec_dbg {
+                eprintln!("[early] 停:消耗0 stable='{}'", stable);
+            }
             return;
         }
         let committed_raw_len = session.committed_raw.chars().count();
         if consumed <= committed_raw_len || consumed > full.chars().count() {
+            if ec_dbg {
+                eprintln!(
+                    "[early] 停:消耗{}<=已提{} full_len={}",
+                    consumed, committed_raw_len,
+                    full.chars().count()
+                );
+            }
             return;
         }
         let mut delta: String = stable.chars().skip(committed_text.chars().count()).collect();
