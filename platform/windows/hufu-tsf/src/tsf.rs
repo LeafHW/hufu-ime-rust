@@ -371,6 +371,11 @@ pub struct Shared {
     /// 的 y 步进。0=未测得（用行框高兜底）。
     pub hupo_line_dy: i32,
     pub hupo_last_seg_y: i32,
+    /// 【五十九修·句内顶功标记】真上屏（text 非空）置位。raw==1 立段
+    /// 保护：句内顶功后剩余 raw==1 不重新立段（selection 组段框恒=
+    /// 句首行，立段=跳回句首）。raw 空帧（组段结束）与 start_preedit_on
+    ///（新句）复位。
+    pub hupo_had_commit: bool,
     /// 【五十七修补·顶功消耗补偿】整句流中顶功自动上屏使 raw 变短，
     /// 但光标实际前进了（上屏字宽）——轻推基点必须同步：seg_start_x
     /// 前移 消耗键数×键宽/2（=消耗字数×字宽，键宽=字宽/2 自洽），
@@ -460,6 +465,7 @@ impl Shared {
     hupo_long_mode: false,
     hupo_line_dy: 0,
     hupo_last_seg_y: 0,
+    hupo_had_commit: false,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -1940,8 +1946,17 @@ impl EditSession_Impl {
                 // 复位 hupo_seg_started：下一段首键（raw==1）重新立
                 // 段（selection 已收敛到新段首）。48 修起段内不再算
                 // 术步进，校准快照字段已删。
+                // 【五十九修·顶功上屏不复位】47 补 2 的复位对逐字流
+                //（SP 上屏→raw 空→新段首键立段）正确；但整句流顶功
+                // 上屏（text 非空、raw 仍有剩余）也触发复位——段内
+                // 分支整体跳过（轻推/补偿链冻结），且顶功后剩余
+                // raw==1 帧走立段分支，selection 组段框恒=句首行→
+                // 跳回句首（用户实测「换了行跳一下又跳回去」的真正
+                // 病根，此前 56/57/58 修全在与它打架）。改为：复位只
+                // 由 raw 空帧做（组段真正结束），顶功上屏仅记
+                // hupo_had_commit（raw==1 立段保护：句内不重新立段）。
                 if !text.is_empty() {
-                    g.hupo_seg_started = false;
+                    g.hupo_had_commit = true;
                 }
                 if g.caret_est_line_h > 0 {
                     let mut w = 0.0f32;
@@ -2184,6 +2199,8 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     // 新段：首键重新真实锚定（raw 同步，防旧段 last_raw 污染 est）
     g.seg_key_index = 1;
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
+    // 【五十九修】新句：复位句内顶功标记（新句首键立段合法）
+    g.hupo_had_commit = false;
     // 【四十四修】虎魄 qie 首键优先 selection 真实位（同 DoEditSession）
     if exe_is_hupo_qie() {
         hupo_qie_step(&mut g, ctx, ec);
@@ -2430,7 +2447,26 @@ fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
 /// 续前进则采纳 x=right-14（候选窗左缘贴编码尾），y/行高钉段首
 ///（用户认可「文字下面」位置）。
 fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    // 【五十九修·raw 空帧复位】组段真正结束（句末上屏：pipe back
+    // raw=''）才复位段标志——取代 47 补 2 在 Op::Commit 的复位（那
+    // 会把整句流顶功上屏误判为段结束：轻推链冻结+raw==1 立段跳回
+    // 句首，58 修前所有「跳一下又跳回去」的真正病根）。
+    if g.cur_raw_len == 0 {
+        g.hupo_seg_started = false;
+        g.hupo_had_commit = false;
+        g.hupo_long_mode = false;
+        g.hupo_prev_raw = 0;
+        return;
+    }
     if g.cur_raw_len == 1 {
+        // 【五十九修·句内顶功保护】顶功上屏后剩余 raw==1 不是新句
+        // 首键——不立段（selection 组段框恒=句首行，立段=跳回句首），
+        // 保持当前锚不动。新句（start_preedit_on 已复位 had_commit）
+        // 正常立段。
+        if g.hupo_had_commit {
+            g.hupo_prev_raw = g.cur_raw_len;
+            return;
+        }
         // 段首键：selection 立段。
         // 【五十二修·矮框不立段】版本行为档案实锤：顶功自动上屏后的
         // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
