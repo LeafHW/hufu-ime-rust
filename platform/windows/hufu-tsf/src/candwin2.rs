@@ -868,6 +868,9 @@ impl CandidateWindowV2 {
     /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
     /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
     pub fn new() -> Option<CandidateWindowV2> {
+        // 【七十修】进程时钟精度 1ms（动画 tick 5ms 生效前提）——候选窗
+        // 首次创建时一次性提升（DllMain 内调不安全：loader lock）。
+        raise_timer_resolution_once();
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -3855,7 +3858,25 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
 pub const FADE_TIMER_ID: usize = 0x4846_5550; // 'HuFZ'
 pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
-pub const FADE_TICK_MS: u32 = 15;
+/// 【七十修·动效帧率】动画 tick 周期。原 15ms：SetTimer 实际 ~15.6ms
+/// → 动画 ~64fps——60Hz 屏（16.7ms/帧）恰每帧 1 步无感；240Hz 屏
+///（4.2ms/帧）每 3.7 帧才 1 步=高刷用户必见跳帧。降至 5ms + 进程
+/// 时钟精度 timeBeginPeriod(1)（候选窗创建时一次性，见 new()）→
+/// 动画 ~150-200fps，高刷观感对齐；60Hz 无感不退化。动画窗外
+/// timer 自动 Kill，常驻开销为零。
+pub const FADE_TICK_MS: u32 = 5;
+/// 提升系统定时器粒度到 1ms（SetTimer(5) 实际生效的前提）。进程内
+/// 一次（OnceLock）；winmm 直连 FFI（免 Cargo feature）。
+fn raise_timer_resolution_once() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| unsafe {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(ms: u32) -> u32;
+        }
+        let _ = timeBeginPeriod(1);
+    });
+}
 /// 静默期：show↔hide 间隔小于此值直接跳过动画（连打逐字上屏的
 /// 收放循环不频闪）——仅管入场侧
 const FADE_QUIET_MS: u128 = 250;
