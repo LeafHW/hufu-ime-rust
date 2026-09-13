@@ -2202,9 +2202,20 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.composition = Some(comp);
     // 新段：首键重新真实锚定（raw 同步，防旧段 last_raw 污染 est）
-    g.seg_key_index = 1;
+    // 【六十九修·平移连续】上屏后的段重开=同句延续：seg_key_index 续
+    // 打不归 1（hupo_adopt_key 同步对齐，dkeys 从 0 起步），斜率 w /
+    // y 锁全保留——候选窗平移不间断。此前归 1 后 saturating_sub(旧
+    // adopt) 恒 0，轻推死区=N 键——高频上屏下每段头卡一截=「平移没
+    // 之前流畅」。真新句（句内无上屏）才真重置——顺修新句同款死区
+    //（旧 adopt 残留 → 轻推死到追上为止）。
+    if g.hupo_had_commit {
+        g.hupo_adopt_key = g.seg_key_index;
+    } else {
+        g.seg_key_index = 1;
+        g.hupo_adopt_key = 0;
+    }
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
-    // 【五十九修】新句：复位句内顶屏标记（新句首键立段合法）
+    // 【五十九修】新句：复位句内上屏标记（新句首键立段合法）
     g.hupo_had_commit = false;
     // 【四十四修】虎魄 qie 首键优先 selection 真实位（同 DoEditSession）
     if exe_is_hupo_qie() {
