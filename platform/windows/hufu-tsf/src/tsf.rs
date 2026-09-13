@@ -1569,18 +1569,63 @@ impl HuFuTs_Impl {
                 crate::sound::play(&tag, sound_vol);
             }
             // 回删替换（数字后 1. 再按 . → 。）：先删旧字符再走正常提交
-            if back > 0 {
+            // 【七十六修·键盘层注入】TSF ShiftStart 扩选在 WinForms/WPS
+            // 静默不动（实测 hr=ok moved=0，2 的点没删=「1.。」根因）。
+            // 改走键盘层：SendInput 退格×n + VK_PACKET 文本——队列保序
+            // （退格先处理删旧点、再插文本），任何宿主通用。此路径的
+            // commit 不再走 InsertTextAtSelection（避免插入先于删除的
+            // 乱序）：update_ui 收空 commit（仅状态/候选刷新）。
+            if back > 0 && !commit.is_empty() {
+                Self::inject_back_and_text(back, &commit);
+                let _ = update_ui(self.shared.clone(), String::new(), state);
+            } else if back > 0 {
                 let _ = run_session(&self.shared, Op::DeleteBack(back as u32), None);
+            } else {
+                let _ = update_ui(self.shared.clone(), commit, state);
             }
-            trace(&format!("dispatch commit='{}'", commit));
-            trace("before update_ui");
-            let _ = update_ui(self.shared.clone(), commit, state);
-            trace("after update_ui");
         }
         BOOL(1)
     }
 
-    /// Ctrl+Shift+V 剪贴板上屏：管道取文本（server 校验配置/白名单），
+    /// 【七十六修·键盘层回删+注入】宿主 TSF ShiftStart 静默不动（WinForms/
+/// WPS 实测）时的回删替换通道：SendInput 退格×n + VK_PACKET 逐字符注入
+/// 文本。键盘队列保序（退格先删、文本后插），任何宿主通用。注入的退格
+/// 空态被 TestDown 放行（宿主自删）；VK_PACKET 直产字符不进 IME。
+fn inject_back_and_text(back: u8, text: &str) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK,
+    };
+    let mut inputs: Vec<INPUT> = Vec::new();
+    let kb = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    for _ in 0..back {
+        inputs.push(kb(VK_BACK, 0, KEYBD_EVENT_FLAGS(0)));
+        inputs.push(kb(VK_BACK, 0, KEYEVENTF_KEYUP));
+    }
+    for ch in text.encode_utf16() {
+        inputs.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE));
+        inputs.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_KEYUP | KEYEVENTF_UNICODE));
+    }
+    if !inputs.is_empty() {
+        unsafe {
+            let n = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            trace(&format!("76dbg: 注入 {} 键（back={} text={:?}）", n, back, text));
+        }
+    }
+}
+
+/// Ctrl+Shift+V 剪贴板上屏：管道取文本（server 校验配置/白名单），
     /// 有文本则插入光标处并吞键。
     fn paste_clipboard(&self, test_only: bool) -> BOOL {
         let exe = std::env::current_exe()
@@ -2226,15 +2271,25 @@ impl EditSession_Impl {
                     g.composition = None;
                 }
                 let range: ITfRange = selection_range(&ctx, ec)?;
+                let mut total_moved: i32 = 0;
                 for _ in 0..*n {
                     let mut moved: i32 = 0;
                     let hr = unsafe { range.ShiftStart(ec, -1, &mut moved, std::ptr::null_mut()) };
                     if hr.is_err() || moved == 0 {
+                        trace(&format!(
+                            "75dbg: ShiftStart 停 err={} moved={} total={}",
+                            hr.is_err(), moved, total_moved
+                        ));
                         break;
                     }
+                    total_moved += moved;
                 }
                 let empty: Vec<u16> = Vec::new();
-                unsafe { range.SetText(ec, 0, &empty)? };
+                let hr2 = unsafe { range.SetText(ec, 0, &empty) };
+                trace(&format!(
+                    "75dbg: DeleteBack n={} moved={} SetText err={}",
+                    n, total_moved, hr2.is_err()
+                ));
                 Ok(())
             }
             Op::End => {
