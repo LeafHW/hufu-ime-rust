@@ -196,9 +196,13 @@ fn common_history_prefix(history: &[crate::session::EarlyHistory]) -> String {
     common.into_iter().collect()
 }
 
-/// 前缀在证据史中的一致消耗长度（最少 2 键、全部同值；Rime stable_history_raw_length）。
+/// 前缀在证据史中的一致消耗长度（全部同值；虎爪 FindStableSentenceRawLength 同款）。
+/// 【六十七修·对齐虎爪】原版 `history.len() < 2 → 0`（Rime 移植时多加的
+/// 最少 2 条）——虎爪 IL 实证无此检查（遍历全部证据取一致，单条也算
+/// 一致）：残码水位线 armed 态单键确认（need=1）时单条证据可出消耗，
+/// 否则恒 0 停（42 键复现「停:消耗0」的来源）。
 fn stable_history_raw_length(history: &[crate::session::EarlyHistory], text: &str) -> usize {
-    if text.is_empty() || history.len() < 2 {
+    if text.is_empty() || history.is_empty() {
         return 0;
     }
     let mut stable = 0usize;
@@ -1841,12 +1845,10 @@ impl Engine {
         } else {
             (&dec.hits[..], dec.truncated)
         };
-        if truncated && !session.early_resid_armed {
-            // 【六十六修补2·截断放行】truncated=beam 剪枝标志（bucket 状态
-            // 超 beam 被剪），长句必然发生——Rime 保守规则一票否决=长句
-            // 提前上屏停摆（实测 42 键 full_len≥27 连环截断 12 次停）。
-            // armed（残码水位已触发）态放行——top1 结果仍可信；普通
-            // 通道保持 Rime 原语义。
+        if truncated {
+            // 截断=beam 剪枝标志（Rime/虎爪同语义：结果不稳不上屏）。
+            // 【六十七修·回归虎爪】曾按水位线放行——beam 不稳态 top1
+            // 可信度无保证（70 键复现错句流），撤。
             if ec_dbg {
                 eprintln!("[early] 停:截断 full_len={}", full.chars().count());
             }
@@ -1865,13 +1867,9 @@ impl Engine {
 
         let (proposal, proposal_share) =
             confidence_proposal(&cands, self.config.sentence.weights.confidence);
-        if (proposal.is_empty()
-            || proposal.chars().count() <= committed_text.chars().count())
-            && !session.early_resid_armed
+        if proposal.is_empty()
+            || proposal.chars().count() <= committed_text.chars().count()
         {
-            // 【六十六修补2·武装豁免】前缀共识被候选分歧削平（proposal
-            // =committed 无增量，长句第二轮实测停摆源）——普通通道停；
-            // armed 态豁免（下方武装快通道直出 top1，不靠共识前缀）。
             if ec_dbg {
                 eprintln!(
                     "[early] 停:提案空/不超 committed='{}' proposal='{}'",
@@ -1923,44 +1921,13 @@ impl Engine {
             session.early_history.remove(0);
         }
 
-        // 【六十六修补2·武装快通道】用户算法：残码>水位线（15）触发一
-        // 次后句内持续武装，每键高置信（top1 软最大份额≥strong 线）直
-        // 接上屏。绕过普通通道的三个长句杀手（42 键实测全部停摆源）：
-        //   a) 证据史公共前缀被候选分歧削平（提案=committed 无增量，
-        //      实测第二轮 让我看看怎么个事=committed 停）→ 直出 top1
-        //      全句（src 已优先不完全尾——不带进行态尾字）
-        //   b) consumed 需 2 条历史一致（单条恒 0 停）→ 用本条 raw_lengths
-        //   c) 证据窗 need=2 在长句里攒不齐（史频繁被清）→ 单键直出
-        // 普通通道（未武装）一字不动。delta 游标=committed_text（武装态
-        // 下游标语义纯净：committed 即已上屏文本）。
-        if session.early_resid_armed && proposal_share >= strong_line {
-            let top: String = cands[0].text.clone();
-            let hist = session.early_history.last().cloned();
-            if let Some(e) = hist {
-                let consumed = e
-                    .raw_lengths
-                    .iter()
-                    .find(|(p, _)| p == &top)
-                    .map(|(_, l)| *l)
-                    .unwrap_or(0);
-                let committed_raw_len = session.committed_raw.chars().count();
-                if consumed > committed_raw_len && consumed <= full.chars().count() {
-                    let delta: String = top.chars().skip(committed_text.chars().count()).collect();
-                    if delta.chars().count() >= 1 && live.chars().count() >= 2 {
-                        if ec_dbg {
-                            eprintln!("[early] 武装直出 上屏'{}' 消耗{}", delta, consumed);
-                        }
-                        session.committed_text = top;
-                        let full_chars: Vec<char> = full.chars().collect();
-                        session.committed_raw = full_chars[..consumed].iter().collect();
-                        session.raw = full_chars[consumed..].iter().collect();
-                        session.early_history.clear();
-                        session.pending_commit = Some(delta);
-                        return;
-                    }
-                }
-            }
-        }
+        // 【六十七修·水位线收进虎爪语义】撤六十六修补2 的武装直出
+        //（top1 直出绕过公共前缀/稳定消耗——beam 不稳态错句流，70 键
+        // 复现实锤）。残码水位线（用户拍板：残算编码含数字与；>15，
+        // HUFU_EARLY_RESID_LINE 可调）保留，但只做一件事：水位触发一
+        // 次后句内持续武装，armed 态确认键数降为 1——上屏内容仍走
+        // 虎爪同构判定（份额→提案→证据史→公共前缀→稳定消耗），高
+        // 置信单键即确认，普通置信照 early_need 攒。
 
         // 观察窗口按证据强度自适应：强证据 2 键确认；普通证据 2 键
         // （原 3 键双保险——实测 v5 下偏保守，统一 2 键提高积极性）。
