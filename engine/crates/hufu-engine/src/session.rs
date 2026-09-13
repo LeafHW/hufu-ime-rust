@@ -37,6 +37,11 @@ pub struct Session {
     pub committed_text: String,
     /// 提前上屏证据史（最近 3 键）
     pub early_history: Vec<EarlyHistory>,
+    /// 【六十六修·水位武装】残码水位线（>15）触发过一次后句内持续
+    /// 武装——之后每键只要高置信（strong 份额线）就直接上屏（武装快
+    /// 通道：top1 直出，绕过证据史公共前缀削平/截断否决/双条消耗一致
+    /// 三个长句停摆源）。句末 clear 复位，新句重新按水位线启动。
+    pub early_resid_armed: bool,
     /// 用户翻页/选字后暂停提前上屏，直至整句提交
     pub early_suspended: bool,
     /// 本次按键内联产生的上屏文本（顶屏/唯一上屏/提前上屏增量），由 take_or_state 消费
@@ -72,6 +77,7 @@ impl Session {
             committed_raw: String::new(),
             committed_text: String::new(),
             early_history: Vec::new(),
+            early_resid_armed: false,
             early_suspended: false,
             pending_commit: None,
             tail_context: String::new(),
@@ -89,6 +95,7 @@ impl Session {
         self.committed_raw.clear();
         self.committed_text.clear();
         self.early_history.clear();
+        self.early_resid_armed = false;
         self.early_suspended = false;
         self.pending_commit = None;
     }
