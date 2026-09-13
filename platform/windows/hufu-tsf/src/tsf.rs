@@ -2565,7 +2565,13 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 时每键 arm 一帧重查=动效变慢。整句长流切换纯推断模型：零查询
     // 零重查零 arm——换行靠 x 溢出推断（行宽/行高全真值校准，行高
     // 初值=立段行框高，SP 流换行时自然校准）。
-    if g.cur_raw_len > 6 {
+    // 【六十修·长流判定改句内累计键数】raw>6 判定被顶屏消耗压垮——
+    // 真实整句流 raw 在 1-5 徘徊（每 2-4 键被顶屏上屏消耗），长流模
+    // 式永远不进 → 轻推钉死一字宽、无换行机制（用户实测「换行没跟
+    // 随」）。改用 seg_key_index（句内累计键序号：每键递增、顶屏不
+    // 减、start_preedit_on 新句重置）>6 判定——逐字流每句 4 键不受
+    // 影响，整句流句内 7 键起进纯推断模式（溢出换行立即跟随）。
+    if g.cur_raw_len > 6 || g.seg_key_index > 6 {
         g.hupo_long_mode = true;
     }
     if g.hupo_long_mode {
@@ -2667,7 +2673,10 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             // 【五十七修·顶死武装】本行轻推已达上限（行将满/已换行）→
             // 武装一次重查：换行后 reseg 重立到新行首（基点重置，轻推
             // 从新行起算）；同行（守卫不过）不再武装——零多余帧。
-            if raw_nudge >= cap && !g.hupo_reseg_armed {
+            // 【六十修补】整句句内（had_commit）不武装——reseg 的
+            // selection 组段框=句首行，重立=跳回句首（逐字流组段每段
+            // 重建无害；整句句内第 7 键起由长流溢出推断接管换行）。
+            if raw_nudge >= cap && !g.hupo_reseg_armed && !g.hupo_had_commit {
                 g.hupo_reseg_armed = true;
                 arm_caret_recheck_timer();
             }
