@@ -790,6 +790,61 @@ impl Engine {
     }
 
     fn process_key_inner(&mut self, session: &mut Session, key: KeyInput) -> KeyOutcome {
+        // 【七十八修·pending dot flush】raw=="."（数字后延迟点）时本键：
+        // · 再按 . → 直接「。」上屏（没上过屏，无需回删）
+        // · Esc/Backspace → 取消（组段语义：清组段，点丢弃）
+        // · 其他键 → 半角 . 先落屏（并入本键 commit）再正常处理该键
+        //   （passthrough 的可打印字符也并入：consumed+commit ".<c>"，
+        //   保证数字/空格等直通字符不丢；非可打印键罕见，commit "."
+        //   +吞键，可接受）
+        if session.raw == "." {
+            let m = key.modifiers;
+            if let Some(c) = key.key.as_char() {
+                if !m.ctrl && !m.alt {
+                    if c == '.' && !m.shift {
+                        session.raw.clear();
+                        return KeyOutcome::commit("。".to_string(), self.state(session));
+                    }
+                    if c == ',' && !m.shift {
+                        // 逗号并入（数字尾巴还在——半角逗号路径）
+                        session.raw.clear();
+                        let mut out = self.process_key_inner(session, key);
+                        out.commit = Some(match out.commit.take() {
+                            Some(t) => format!(".{t}"),
+                            None => ".".to_string(),
+                        });
+                        out.consumed = true;
+                        return out;
+                    }
+                    // 可打印直通字符（数字等）与字母：flush 并入
+                    session.raw.clear();
+                    let mut out = self.process_key_inner(session, key);
+                    if out.consumed {
+                        out.commit = Some(match out.commit.take() {
+                            Some(t) => format!(".{t}"),
+                            None => ".".to_string(),
+                        });
+                    } else if c.is_ascii_graphic() || c == ' ' {
+                        // passthrough 可打印/空格：并成一条 commit（直通
+                        // 通道会被 consumed=true 挡住，字符必须随行）
+                        out.consumed = true;
+                        out.commit = Some(format!(".{c}"));
+                        out.state = Some(self.state(session));
+                    } else {
+                        // 非可打印 passthrough：落 . 并吞键（罕见路径）
+                        out.consumed = true;
+                        out.commit = Some(".".to_string());
+                        out.state = Some(self.state(session));
+                    }
+                    return out;
+                }
+            }
+            // Esc / Backspace / 组合键：取消 pending（清组段、点丢弃）
+            if key.key == KeyCode::Escape || key.key == KeyCode::Backspace || m.ctrl || m.alt {
+                session.raw.clear();
+                return KeyOutcome::consumed(self.state(session));
+            }
+        }
         let m = key.modifiers;
         if m.ctrl && !m.alt {
             if let Some(c) = key.key.as_char() {
@@ -1064,6 +1119,25 @@ impl Engine {
             if c.is_ascii_digit() {
                 session.tail_context.push(c);
                 return KeyOutcome::passthrough();
+            }
+            // 【七十八修·pending dot】数字后按 . 延迟上屏：第一下不落
+            // 屏，进组段显示（raw="."，像编码的下划线预编辑）；再按
+            // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
+            // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
+            // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
+            // 依赖回删）。逗号（,）保持立即半角。
+            if c == '.'
+                && !shift
+                && session
+                    .tail_context
+                    .chars()
+                    .last()
+                    .map(|t| t.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                session.raw = ".".into();
+                self.refresh_candidates(session);
+                return KeyOutcome::consumed(self.state(session));
             }
             // 标点
             if let Some((text, back)) = self.punct_output(session, c) {
@@ -4489,6 +4563,74 @@ mod tests {
     }
 
     // calc_command/word_making_encoder 随 \ 命令模式下线（2026-09-06）。
+
+    #[test]
+    fn pending_dot_after_digit() {
+        // 【七十八修】数字后 . 延迟上屏：第一下组段显示（raw=".")，
+        // 第二下直出「。」（无回删），其他键 flush 半角 . 并入。
+        let dir = std::env::temp_dir().join(format!("hufu-eng-pd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nh\t后\nma\t码\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&schema, hufu_config::Config::default()).unwrap();
+
+        // 1 . . → 第二下出「。」（back=0——从未上屏无需回删）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('1'));
+        let o1 = eng.process_key(&mut s, key('.'));
+        assert!(o1.consumed && o1.commit.is_none(), "第一下 pending（不上屏）");
+        assert_eq!(s.raw, ".", "pending 显示在组段");
+        let o2 = eng.process_key(&mut s, key('.'));
+        assert_eq!(o2.commit.as_deref(), Some("。"), "第二下「。」: {:?}", o2.commit);
+        assert_eq!(o2.back, 0, "无回删");
+
+        // 1 . 2 3 → flush：".23" 一次上屏（数字不丢）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('1'));
+        eng.process_key(&mut s2, key('.'));
+        let o3 = eng.process_key(&mut s2, key('2'));
+        assert_eq!(o3.commit.as_deref(), Some(".2"), "flush 并数字: {:?}", o3.commit);
+        assert!(o3.consumed, "consumed 保证直通数字随行");
+        let o4 = eng.process_key(&mut s2, key('3'));
+        assert_eq!(o4.commit, None, "后续数字恢复直通");
+
+        // 1 . 逗号 → ".,"（逗号保持数字后半角）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('1'));
+        eng.process_key(&mut s3, key('.'));
+        let o5 = eng.process_key(&mut s3, key(','));
+        assert_eq!(o5.commit.as_deref(), Some(".,"), "flush 并逗号: {:?}", o5.commit);
+
+        // 1 . 字母 → "." 上屏 + 字母进组段
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('1'));
+        eng.process_key(&mut s4, key('.'));
+        let o6 = eng.process_key(&mut s4, key('h'));
+        assert_eq!(o6.commit.as_deref(), Some("."), "flush 点先落: {:?}", o6.commit);
+        assert_eq!(s4.raw, "h", "字母进组段");
+
+        // pending 时 Esc 取消（点丢弃）
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('1'));
+        eng.process_key(&mut s5, key('.'));
+        let o7 = eng.process_key(&mut s5, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        assert!(o7.consumed && o7.commit.is_none(), "Esc 取消");
+        assert_eq!(s5.raw, "", "组段已清");
+
+        // 非数字尾巴的 . 不 pending（原全角路径）
+        let mut s6 = Session::new(true);
+        eng.process_key(&mut s6, key('h'));
+        eng.process_key(&mut s6, key(' ')); // 上屏「后」
+        let o8 = eng.process_key(&mut s6, key('.'));
+        assert_eq!(o8.commit.as_deref(), Some("。"), "非数字尾巴照常全角: {:?}", o8.commit);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn opencc_variants() {
