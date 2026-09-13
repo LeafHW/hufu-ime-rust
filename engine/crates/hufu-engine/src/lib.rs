@@ -1807,6 +1807,15 @@ impl Engine {
     fn try_early_commit(&mut self, session: &mut Session) {
         static EC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let ec_dbg = *EC_DEBUG.get_or_init(|| std::env::var("HUFU_EARLY_DEBUG").is_ok());
+        // 【六十八诊断·单键耗时】平移流畅度排查：截断放行后长句每键
+        // 全走判定流（build_raw_lengths 词典探测 O(前缀²)），量化每键
+        // 增量耗时（>8ms 打点——30/60fps 帧预算 16/33ms）。
+        let ec_t0 = std::time::Instant::now();
+        macro_rules! ec_dur {
+            () => {
+                ec_t0.elapsed().as_millis()
+            };
+        }
         if !self.config.sentence.early_commit || session.early_suspended {
             session.early_history.clear();
             session.line_end_hint = false;
@@ -1898,7 +1907,16 @@ impl Engine {
                     !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
                 })
             };
-            build_raw_lengths(&cands, &full, dict.digit_coded, &is_code)
+            let rl = build_raw_lengths(&cands, &full, dict.digit_coded, &is_code);
+            if ec_dbg && ec_dur!() > 8 {
+                eprintln!(
+                    "[early] 耗时={}ms full_len={} cands={}（截断放行路径）",
+                    ec_t0.elapsed().as_millis(),
+                    full.chars().count(),
+                    cands.len()
+                );
+            }
+            rl
         };
         // 【strong 份额线 2026-09-06 自由探索】判定提案为强证据的份额
         // 线（原硬编码 0.999）。HUFU_EARLY_STRONG_SHARE 可调（bench 探
