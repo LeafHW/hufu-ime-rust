@@ -325,6 +325,16 @@ pub struct Shared {
     pub caret_est_cal_x: i32,
     pub seg_key_index: i32,
     pub cur_raw_len: usize,
+    /// 【四十六修·虎魄段首锚+段内步进】虎魄 GetTextExt 只回「当前跟
+    /// 打段首」（顶部固定行左缘，像素 diff 实锤：打字推进在段内右移
+    /// 而查询值钉死段首=用户「跟一下没多久就远」的根因）。段内锚=
+    /// 段首 + 编码数 × 字母宽（hupo_unit_w，虎码编码与微软拼音组合
+    /// 区同字体，初始 38px）。上屏后新段首真值差 → 动态校准 unit_w
+    /// （hupo_cal_x/hupo_cal_raw 为上屏时快照）。
+    pub hupo_seg_start_x: i32,
+    pub hupo_seg_y: i32,
+    pub hupo_seg_h: i32,
+    pub hupo_seg_started: bool,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -394,6 +404,10 @@ impl Shared {
     caret_est_cal_raw: 0,
     caret_est_cal_x: 0,
     seg_key_index: 0,
+    hupo_seg_start_x: 0,
+    hupo_seg_y: 0,
+    hupo_seg_h: 16,
+    hupo_seg_started: false,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -1869,6 +1883,14 @@ impl EditSession_Impl {
                 // 上屏文本宽度直接加进步进位置（0.6 全角/0.41 半角×行
                 // 高）；新段编码从 0 起数。est 不算绝对位置只算步进——
                 // 每键一个 +N 矩形，与记事本真实查询的数据流同形。
+                // 【四十六修·虎魄上屏复位段标志】真上屏（非空 text；
+                // 每键 pipe back 的 commit='' 空串不算——47 补 2）后
+                // 复位 hupo_seg_started：下一段首键（raw==1）重新立
+                // 段（selection 已收敛到新段首）。48 修起段内不再算
+                // 术步进，校准快照字段已删。
+                if !text.is_empty() {
+                    g.hupo_seg_started = false;
+                }
                 if g.caret_est_line_h > 0 {
                     let mut w = 0.0f32;
                     for c in text.chars() {
@@ -2345,48 +2367,89 @@ fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
     None
 }
 
-/// 【四十四修·虎魄段内 selection 跟手】段内每键的真实插入位步进。
-/// 背景：43 修恒定锚解决了稳定（无偏/无超窗/无首段缺候选）但用户
-/// 主诉「候选还是有点不跟手」——候选钉段首，光标前进后逐键落后。
-/// 【四十五修·同值跨帧重查】微软拼音对照实锤（虎魄打字截图）：Qt
-/// 的插入点数据是准的（微软候选 x 精确跟随光标 x≈455，y=行底）——
-/// 44 修同帧查询拿到恒定值的原因=Qt 布局异步（43 修已证 +36ms 收
-/// 敛），不是 Qt 不给。修：selection 值与当前锚相同（位移≤2px=
-/// 疑似旧布局）时武装 60ms 跨帧重查（caret_force 到点重跑本键
-/// session 再查——布局收敛后出真值，锚前进）。连续性过滤+clamp
-/// 兜底不变；有位移（真值）直接采纳。
+/// 【四十九修·虎魄段内跟随=组段包围盒右缘】历史考古定案：8-31
+/// cadb6d5 用户认可的跟随=END 锚逐键查询；9-08 起虎魄（新 Qt 桥）
+/// 拒绝 END 折叠点查询（43 修实测 qc: GetTextExt 失败）+布局锁卡
+/// 5.1s。48 修实测 selection（空 range）恒定不前进。最后未试的真
+/// 值源：**组段完整 range（不折叠）的 GetTextExt**——返回整个编码
+/// 串的包围盒，编码每加一键 right 右移=编码末端真实位置（Qt 布局
+/// 算的，零字号依赖）。用法：段内每键先跳过同帧旧值，60ms 补显帧
+///（布局收敛，即时返回不卡——43 修补显链实证）查包围盒，right 连
+/// 续前进则采纳 x=right-14（候选窗左缘贴编码尾），y/行高钉段首
+///（用户认可「文字下面」位置）。
 fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
-    if let Some(mut r) = selection_caret_rect(ctx, ec) {
-        let ok = match g.caret {
-            None => true,
-            Some(c) => {
-                let dx = r.left - c.left;
-                let dy = r.top - c.top;
-                if dy > 26 {
-                    true // 换行下移
-                } else {
-                    dy >= -15 && dx >= -25 && dx <= 70
+    if g.cur_raw_len == 1 {
+        // 段首键：selection 立段。
+        // 【五十二修·矮框不立段】版本行为档案实锤：顶屏自动上屏后的
+        // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
+        // 高 124px）——立段 seg_h=16 → 锚 bottom 上抬 → 候选窗逐段
+        // 上移（用户「打第二个编码就往上面移」的病根）。整行框任何
+        // 输入场景都远大于 60px、矮框远小于它，以此分类：矮帧不立段
+        // （arm 60ms 重查，布局收敛帧拿到整行框再立，位置语义不变）。
+        if let Some(mut r) = selection_caret_rect(ctx, ec) {
+            let h = r.bottom - r.top;
+            if h >= 60 {
+                if !g.hupo_seg_started {
+                    g.hupo_seg_start_x = r.left;
+                    g.hupo_seg_y = r.top;
+                    g.hupo_seg_h = h.max(16);
+                    g.hupo_seg_started = true;
+                }
+                hupo_clamp(&mut r);
+                g.caret = Some(r);
+                if r.left == g.hupo_seg_start_x && r.top == g.hupo_seg_y {
+                    arm_caret_recheck_timer();
+                }
+            } else {
+                // 矮框：布局未收敛，不立段不采纳，等重查帧
+                arm_caret_recheck_timer();
+                if g.caret.is_none() {
+                    query_caret(g, ctx, ec);
                 }
             }
-        };
-        if ok {
-            let moved = match g.caret {
-                Some(c) => (r.left - c.left).abs() > 2 || (r.top - c.top).abs() > 2,
-                None => true,
-            };
-            hupo_clamp(&mut r);
-            g.caret = Some(r);
-            if !moved {
-                // 同值=旧布局：60ms timer 到点拉 state 强制重跑 update_ui
-                //（CARET_TIMER_ID 处理器，无需 caret_force——34 修已删）
-                arm_caret_recheck_timer();
-            }
-        } else {
-            trace("qie: selection 段内烂值拦截（保持锚）");
+        } else if g.caret.is_none() {
+            query_caret(g, ctx, ec);
         }
         return;
     }
-    if g.caret.is_none() {
+    // 段内键：组段完整 range 包围盒 right=编码尾真值（60ms 补显帧采）
+    if g.hupo_seg_started {
+        if let Some(comp) = g.composition.clone() {
+            if let Ok(range) = (unsafe { comp.GetRange() }) {
+                if let Ok(view) = (unsafe { ctx.GetActiveView() }) {
+                    let mut rect = RECT::default();
+                    let mut clipped = BOOL(0);
+                    if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_ok()
+                        && rect.right > rect.left
+                    {
+                        // 编码尾 x=包围盒右缘；连续性（相对当前锚 x 前
+                        // 进方向 [-25,+90]，含同位旧值不动）+同行校验
+                        let cur_x = g.caret
+                            .map(|c| c.left + 14)
+                            .unwrap_or(g.hupo_seg_start_x);
+                        let dx = rect.right - cur_x;
+                        let dy = rect.top - g.hupo_seg_y;
+                        if dy.abs() < 40 && dx >= -25 && dx <= 90 {
+                            let mut r = RECT {
+                                left: rect.right - 14,
+                                top: g.hupo_seg_y,
+                                right: rect.right,
+                                bottom: g.hupo_seg_y + g.hupo_seg_h,
+                            };
+                            hupo_clamp(&mut r);
+                            g.caret = Some(r);
+                            trace(&format!(
+                                "qie: 包围盒 right={} dx={}（采纳编码尾）",
+                                rect.right, dx
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // 每键武装 60ms 补显重查（本帧多为旧布局值，收敛后出真值）
+        arm_caret_recheck_timer();
+    } else if g.caret.is_none() {
         query_caret(g, ctx, ec);
     }
 }
@@ -3361,7 +3424,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 })
             })
             .or_else(|| {
-                if first_show_of_seg {
+                // 【五十修·虎魄禁走系统插入符】用户实锤「打了两个字候
+                // 选就往上面移」：虎魄进程内 GUITHREADINFO 拿得到 Qt 的
+                // 光标线（零高度 rect，位于文字行内），补显帧
+                // first_show_of_seg 让它优先于段锚（selection 整行框，
+                // bottom=行底）→ 第二键起窗 y 从行底跳到行内=「往上
+                // 面 移」。虎魄 qie 一律用 g.caret（段锚），不走 fallback。
+                if first_show_of_seg && !exe_is_hupo_qie() {
                     gui_caret_fallback().or(g.caret)
                 } else {
                     g.caret
@@ -3393,7 +3462,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 【反查首帧锚点 2026-09-11】无组段帧 caret 恒 None——退
         // 系统插入符（GUITHREADINFO hCaret）：反查提示窗直接落在
         // 真实输入位置，打出首字母后组段锚点接管（位置滑动过渡）。
-        let caret = caret.or_else(gui_caret_fallback);
+        // 【五十修】虎魄 qie 不走此兜底（Qt 光标线会把窗拽到文字行
+        // 内=「往上移」，同 first_show_of_seg 分支根因）。
+        let caret = if exe_is_hupo_qie() {
+            caret
+        } else {
+            caret.or_else(gui_caret_fallback)
+        };
         let is_preview = preview_anchor.is_some();
         // DComp 直通窗在 SearchHost（开始菜单搜索）里被 DWM 整体
         // cloaked（显示中但不可见，实测 cloak=2 逐帧持续）；v1 混合窗
