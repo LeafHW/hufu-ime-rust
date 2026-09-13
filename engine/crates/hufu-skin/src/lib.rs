@@ -361,6 +361,42 @@ pub struct Skin {
     pub colors: Colors,
     pub layout: Layout,
     pub material: MaterialConfig,
+    /// 【八十三修·动效重做 2026-09-14】形态动效节（S1 光标点/收场
+    /// 形变/超时淡出）。缺省 enable=false——老皮肤零扰动；开启后
+    /// 上屏断段收场转小圆驻留（v1；涌现 morph v2）。
+    #[serde(default)]
+    pub motion: MotionConfig,
+}
+
+/// 形态动效参数（皮肤 motion 节）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionConfig {
+    /// 总开关（默认关——实测转正后随打包默认开）。
+    pub enable: bool,
+    /// S1 小圆直径（逻辑 px）。
+    pub dot_size: f64,
+    /// S1 驻留超时（ms，超时淡出）。
+    pub idle_timeout_ms: f64,
+    /// 慢打完整形变时长（ms）。
+    pub morph_ms: f64,
+    /// 中速快速形变时长（ms）。
+    pub fast_morph_ms: f64,
+    /// S1→S0 淡出时长（ms）。
+    pub fade_ms: f64,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        MotionConfig {
+            enable: false,
+            dot_size: 14.0,
+            idle_timeout_ms: 4000.0,
+            morph_ms: 160.0,
+            fast_morph_ms: 90.0,
+            fade_ms: 300.0,
+        }
+    }
 }
 
 impl Default for Skin {
@@ -373,6 +409,7 @@ impl Default for Skin {
             colors: Colors::default(),
             layout: Layout::default(),
             material: MaterialConfig::default(),
+            motion: MotionConfig::default(),
         }
     }
 }
