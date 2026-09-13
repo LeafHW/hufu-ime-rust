@@ -10,5 +10,3 @@ hufu-dict = { path = "../hufu-dict" }
 hufu-config = { path = "../hufu-config" }
 serde = { workspace = true }
 
-[dev-dependencies]
-hufu-sentence = { path = "../hufu-sentence" }
