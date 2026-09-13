@@ -377,6 +377,14 @@ pub struct Shared {
     /// 【七十三修·光标直跟】本帧 selection 真值（虎魄自绘光标线，宽
     /// 2px 竖框）——帧末作锚（用户定稿：光标不动窗不动，动了平移过
     /// 去）。None=本帧无真值，锚落段模型兜底。
+    /// 【七十五修·tail 同步】本地尾巴缓存：直通数字（宿主自上屏，
+    /// engine 看不到）+ 本地 commit 应用。随空态键同步 server 的
+    /// tail_context（数字后标点半角化的数据源）。
+    pub hufu_tail: String,
+    /// 七十五修：TestDown 数字去重（同 vk 20ms 窗口——TestDown 可能
+    /// 被宿主重复查询；auto-repeat 33ms 保留）。
+    pub last_digit_vk: u32,
+    pub last_digit_at: Option<std::time::Instant>,
     pub hupo_cursor_truth: Option<RECT>,
     pub hupo_adopt_key: i32,
     /// 【五十九修·句内顶屏标记】真上屏（text 非空）置位。raw==1 立段
@@ -473,6 +481,9 @@ impl Shared {
     hupo_long_mode: false,
     hupo_line_dy: 0,
     hupo_last_seg_y: 0,
+    hufu_tail: String::new(),
+    last_digit_vk: 0,
+    last_digit_at: None,
     hupo_cursor_truth: None,
     hupo_adopt_key: 0,
     hupo_had_commit: false,
@@ -1298,7 +1309,7 @@ impl HuFuTs_Impl {
             };
             if fire {
                 if let Some((consumed, _commit, _back, state, _sound, _vol)) =
-                    ipc::key_request("shift", false, false, false, false)
+                    ipc::key_request("shift", false, false, false, false, None)
                 {
                     if consumed {
                         let zh = state
@@ -1396,6 +1407,41 @@ impl HuFuTs_Impl {
                     // 否则自己上屏 ^ 之类的 US shift 形态（Shift+6 实测）。
                     n if n.len() == 1 => {
                         let plain_digit = n.chars().all(|c| c.is_ascii_digit());
+                        // 【七十五修·直通数字记尾】空闲数字放行=宿主自
+                        // 上屏，engine 的 tail_context 看不到它——数字
+                        // 后标点半角化（1.5 / 1.）断粮出全角「。」（32
+                        // 位 WinForms 类宿主 TestDown 后不递 KeyDown，
+                        // 实测 1. 出「。」；键事件到不了 pipe）。本层
+                        // 乐观记入 hufu_tail，随下一空态键 tail_sync
+                        // 同步 engine。同 vk 20ms 去重（TestDown 可能
+                        // 被重复查询；auto-repeat 33ms 不受影响）。
+                        if plain_digit && !shift {
+                            let ch = n.chars().next().unwrap_or('0');
+                            let vk_ch = ch as u32;
+                            let now = std::time::Instant::now();
+                            let mut g = self
+                                .shared
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let dup = g.last_digit_vk == vk_ch
+                                && g.last_digit_at
+                                    .map(|t| t.elapsed().as_millis() < 20)
+                                    .unwrap_or(false);
+                            if !dup {
+                                g.hufu_tail.push(ch);
+                                let cnt = g.hufu_tail.chars().count();
+                                if cnt > 32 {
+                                    let skip = cnt - 32;
+                                    g.hufu_tail = g
+                                        .hufu_tail
+                                        .chars()
+                                        .skip(skip)
+                                        .collect();
+                                }
+                                g.last_digit_vk = vk_ch;
+                                g.last_digit_at = Some(now);
+                            }
+                        }
                         !plain_digit || shift
                     }
                     // 【反查退格 2026-09-11】反查/命令已进入但无组段
@@ -1446,11 +1492,39 @@ impl HuFuTs_Impl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last_key_at = Some(std::time::Instant::now());
+        // 【七十五修·tail 同步】无组段（空态）键随带本地尾巴——server
+        // 覆盖 session.tail_context（数字后标点半角化的数据源；本地
+        // tail 含直通数字+本地 commit 应用，比 engine 视角更全）。
+        // 有组段时跳过（编码中 engine tail 自洽，覆盖无益）。
+        let tail_sync = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.composition.is_some() || g.hufu_tail.is_empty() {
+                None
+            } else {
+                Some(g.hufu_tail.clone())
+            }
+        };
         let Some((consumed, commit, back, state, sound, sound_vol)) =
-            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end)
+            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end, tail_sync.as_deref())
         else {
             return BOOL(0);
         };
+        // 七十五修：本地尾应用（commit 追加 / back 回退）——与 server
+        // 端 host.rs 的 tail 维护同构（DLL 侧含直通数字，覆盖权威）。
+        {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            for _ in 0..back {
+                g.hufu_tail.pop();
+            }
+            if !commit.is_empty() && commit != "{加词}" && commit != "{隐藏候选}" {
+                g.hufu_tail.push_str(&commit);
+                let cnt = g.hufu_tail.chars().count();
+                if cnt > 32 {
+                    let skip = cnt - 32;
+                    g.hufu_tail = g.hufu_tail.chars().skip(skip).collect();
+                }
+            }
+        }
         // 【换方案即失效皮肤 2026-09-11】Ctrl+M 换方案后 entrance_anim
         // 等方案相关字段变化——键路径不拉皮肤（性能），不失效则缓存
         // 沿用到断段+2.5s（实测：单字切回整句后无入场动效，切窗才
@@ -1533,7 +1607,7 @@ pub fn test_key(vk: u32) -> i32 {
         return 0;
     };
     let _ = (shift, ctrl, alt);
-    let r = ipc::key_request(&name, false, false, false, false);
+    let r = ipc::key_request(&name, false, false, false, false, None);
     match r {
         Some((consumed, _commit, _back, _state, _sound, _vol)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
