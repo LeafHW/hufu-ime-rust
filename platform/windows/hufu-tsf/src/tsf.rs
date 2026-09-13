@@ -2640,8 +2640,19 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                 g.hupo_adopt_key = g.seg_key_index;
                 g.hupo_last_seg_x = r.left;
                 g.hupo_last_seg_y = r.top;
-            } else if dx < -200 && g.hupo_line_dy > 0 && dy < 0 && dy > -(g.hupo_line_dy * 3) {
-                // 【六十五】滚动换行真值（上移≤行距×3）：采真值 x+y
+            } else if dx < -200
+                && g.hupo_line_dy > 0
+                && dy <= -(g.hupo_line_dy / 3)
+                && dy > -(g.hupo_line_dy * 3)
+            {
+                // 【六十五】滚动换行真值（上移 行距/3..行距×3）：采真值 x+y。
+                // 【七十一修·近零带排除】原条件 dy∈(-3×行距, 0) 会误收
+                // 虎魄渲染中间态（换行帧 x 已回行首、y 未更新——实测
+                // dx=-322 dy=-8 被采，y 钉在旧值-8，后续完整换行真值因
+                // dx 条件不再满足而卡死，y 在对错值间震荡=换行后候选
+                // 跳动根因）。真实滚动换行 |dy| 至少 1/3 行距可感——近
+                // 零带（|dy|<行距/3）拒绝采纳，等下一帧完整真值（正常
+                // 换行分支 dx<-200+dy 40..300 接住）。
                 g.hupo_line_span = -dx;
                 trace(&format!(
                     "qie: 采纳滚动换行 dy={} →({},{})",
@@ -2707,16 +2718,29 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     if exe_is_hupo() {
         if exe_is_hupo_qie() {
             // 虎魄专属：段首/无锚才查一次，段内恒定保持
-            if g.seg_key_index <= 1 || g.caret.is_none() {
+            // 【七十一修补3·恒定值隔离】本函数开头已 g.caret=None——
+            // 旧条件 `seg<=1 || caret.is_none()` 在上屏续段（seg 续打
+            // 不归 1）也因 is_none 命中而落标准链——虎魄 GetTextExt
+            // 恒定值（打字区底部固定位置≈下一行 y）写进 g.caret，
+            // 与 qie 帧段模型每帧交替=换行后候选窗两行间反复跳的终
+            // 极根因（全帧 trace 实锤 锚 y 1448↔1305-1378 交替）。
+            // 修：虎魄 qie 一律不走标准链——真首键（新句段模型未建）
+            // 才查一次建基线；段内/续段由段模型直接重建锚。
+            if g.seg_key_index <= 1 && g.caret.is_none() {
                 // 【四十三修补】不设 hupo_single_probe——段首保持 v1.5.2
                 // 的默认双查（39 修单查在 Qt 布局锁下首查失败即弃，
                 // g.caret=None 永久 suppress=「首两键无候选」根因）。
                 // 落标准链：首键自由采纳段首值；est 基线照建但段内
                 // 不步进（下分支直接 return，est 状态无人读=无害）
             } else {
-                // 段内：1.5.2 行为——保持段首锚恒定，零查询零估算。
-                // clamp 兜底仅防段首值本身出窗（横向滚动场景）。
-                let mut r = g.caret.unwrap();
+                // 段内/上屏续段：锚=段模型重建（零查询），clamp 兜底
+                // 仅防出窗。
+                let mut r = RECT {
+                    left: g.hupo_seg_start_x,
+                    top: g.hupo_seg_y,
+                    right: g.hupo_seg_start_x + 14,
+                    bottom: g.hupo_seg_y + g.hupo_seg_h.max(20),
+                };
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
                 return;
@@ -3480,6 +3504,15 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // ↓ 与常规宿主同一条显示路径（共用锚点链/抑制逻辑/show）
         let skin = g.skin.clone();
         let preview_anchor = state.get("preview_anchor").cloned();
+        // 【七十一修补2·虎魄禁落系统插入符】五十修在 3675 分支挡了
+        // first_show 的 gui 兜底，但本链（show 主路径用的 caret）的
+        // .or_else(gui_caret_fallback) 没挡——上屏帧 g.caret 短暂
+        // None 时虎魄拿到 Qt 光标线旧值（旧行 y），下一键段模型恢复
+        // → 显示目标 y 每上屏一次在对/错值间交替=换行后候选窗上下
+        // 跳（实测 cw2 pos 目标 1420↔1250-1351 每键交替，七十一修
+        // 数据实锤）。虎魄 qie 此处跳过 gui 兜底：None → show 收
+        // anchor=None → cw2 内部走 sticky（上次渲染位），下一键段
+        // 模型锚恢复即正确。
         let caret = preview_anchor
             .as_ref()
             .and_then(|a| {
@@ -3493,7 +3526,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 })
             })
             .or(g.caret)
-            .or_else(gui_caret_fallback)
+            .or_else(if exe_is_hupo_qie() {
+                || None
+            } else {
+                gui_caret_fallback
+            })
             // 【owned 锚点 2026-09-11】打包宿主 GetTextExt 常态失败、
             // XAML 自绘光标无系统插入符 → 退 owner 窗矩形：候选窗贴
             // 宿主输入窗下缘（开始菜单=搜索框正下方）。

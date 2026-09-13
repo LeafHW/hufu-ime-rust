@@ -3671,6 +3671,17 @@ impl CandidateWindowV2 {
                         "cw2: SWP主 pos=({px},{py}) 目标=({tx},{ty}) 锚位=({x},{y})"
                     ));
                 }
+                // 【七十一修诊断·锚全帧】show 每帧打锚+sticky+目标+动
+                // 效态（换行震荡排查：段模型已证稳定，显示层低值来源
+                // 待定位——非降频，全帧）。
+                {
+                    let (sx, sy) = self.sticky_pos.unwrap_or((0, 0));
+                    let anim = if self.pos_anim.is_some() { "pos" } else { "-" };
+                    let ain = if anchor.is_some() { "y" } else { "n" };
+                    crate::tsf::trace(&format!(
+                        "cw2: 全帧 锚入={ain} 锚位=({x},{y}) sticky=({sx},{sy}) 目标=({tx},{ty}) 显示=({px},{py}) anim={anim}"
+                    ));
+                }
                 // 【三十九修·显示层观测】用户实锤"候选在两个位置来回
                 // 跳"而锚序列（qc: raw/est）完全平滑——跳在锚→窗位
                 // 置的显示层（suppress 补显/滑动/钳位交替），此前零
