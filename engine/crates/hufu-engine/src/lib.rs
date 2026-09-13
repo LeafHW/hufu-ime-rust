@@ -2158,6 +2158,45 @@ impl Engine {
             }
         }
 
+        // 【七十九修·完整态首字否决】劫持指纹（jxjcdnp 实锤）：partial
+        // 态（尾码留白的前缀态）不为残尾付费、conf 天然虚高，与完整
+        // 态混池劫持提案——jxjcdnp 打「斜劈」：完整态首选「斜劈」
+        // -19.8 压倒性领先（次名 -27.5），4 键处 partial「你做」（尾
+        // dnp 未成码）不付「𠯔/劈」的生僻字概率反超，「你」提前上
+        // 屏、raw 缩段后「斜劈」永久丢失（v1.5.2 起固有，非新版退
+        // 化）。指纹=与完整态子池强提案（share≥0.999）**首字分叉**
+        //（你≠斜）；千句流式的正常落屏即使与完整态分叉也在**深字位**
+        //（「我们爱」vs「我们和」——前段成型一致尾段重组，分段上屏
+        // 常态，不可挡：全挡=提前上屏停摆、1k 句 exact 92.8→40.1 崩
+        // 盘）。故只挡首字分叉：首字都定不下来的 stable 是 partial 假
+        // 设的产物，落屏必错；挡后证据史清零，后续键自然辨析，用户
+        // 停手则空格走完整态首选（「斜劈」）。深分叉/无强提案/同路
+        //（互为前缀）一律原行为——分段上屏节奏与整句流全部特性（观
+        // 察窗、武装快通道、残码水位线、隐式二选、截断放行）不变。
+        {
+            let full_pool: Vec<&SentenceHit> =
+                cands.iter().copied().filter(|h| !h.partial).collect();
+            if !full_pool.is_empty() {
+                let (pf, sf) =
+                    confidence_proposal(&full_pool, self.config.sentence.weights.confidence);
+                if !pf.is_empty()
+                    && sf >= 0.999
+                    && !pf.starts_with(stable.as_str())
+                    && !stable.starts_with(&pf)
+                    && pf.chars().next() != stable.chars().next()
+                {
+                    if ec_dbg {
+                        eprintln!(
+                            "[early] 首字否决: stable='{}' vs 完整态'{}' share={:.5}",
+                            stable, pf, sf
+                        );
+                    }
+                    session.early_history.clear();
+                    return;
+                }
+            }
+        }
+
         // 提交：committed 前缀增长，live raw 缩为剩余
         session.committed_text = stable;
         let full_chars: Vec<char> = full.chars().collect();
