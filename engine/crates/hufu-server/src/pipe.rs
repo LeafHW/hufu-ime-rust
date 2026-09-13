@@ -30,6 +30,16 @@ pub fn dispatch(
                     .get("line_end")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // 【七十五修·tail 同步】DLL 随空态键携带宿主侧尾巴
+                //（含直通数字——宿主 TestDown 放行自上屏的数字键事件
+                // 到不了 engine，session.tail_context 断粮=数字后 . 出
+                // 「。」；32 位 WinForms 类宿主实测）。非空覆盖，截尾
+                // 32 与 host.rs 维护同构。
+                if let Some(ts) = req.get("tail_sync").and_then(|v| v.as_str()) {
+                    let chars: Vec<char> = ts.chars().collect();
+                    let skip = chars.len().saturating_sub(32);
+                    host.session.tail_context = chars.into_iter().skip(skip).collect();
+                }
                 let mut r = host.process_key(k);
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
                 // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）

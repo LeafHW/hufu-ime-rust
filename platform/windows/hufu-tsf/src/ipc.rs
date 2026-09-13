@@ -473,13 +473,20 @@ pub fn key_request(
     ctrl: bool,
     alt: bool,
     line_end: bool,
+    tail_sync: Option<&str>,
 ) -> Option<(bool, String, u8, Value, Option<String>, u8)> {
-    let resp = call_key(&serde_json::json!({
+    // 【七十五修·tail 同步】空态键随带宿主侧尾巴（含直通数字）——
+    // server 覆盖 session.tail_context（数字后标点半角化数据源）。
+    let mut req = serde_json::json!({
         "op": "key",
         "key": key,
         "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt },
         "line_end": line_end
-    }))?;
+    });
+    if let Some(t) = tail_sync {
+        req["tail_sync"] = serde_json::json!(t);
+    }
+    let resp = call_key(&req)?;
     let outcome = resp.get("outcome")?;
     let consumed = outcome
         .get("consumed")
