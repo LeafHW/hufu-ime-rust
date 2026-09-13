@@ -335,6 +335,18 @@ pub struct Shared {
     pub hupo_seg_y: i32,
     pub hupo_seg_h: i32,
     pub hupo_seg_started: bool,
+    /// 【五十五修·段内轻推】键宽自校准（0=未校准，段内钉段首）：
+    /// 段间跳变量（新段首 x−上段首 x）=上屏字符真实渲染宽（真值，
+    /// 字体变了自动适应）；中文等宽排版字母≈半字宽 → 键宽=跳量×0.5
+    /// （排版常识系数，非像素魔法数）。hupo_last_seg_x 为校准用的
+    /// 上一段首 x。
+    pub hupo_key_w: f32,
+    pub hupo_last_seg_x: i32,
+    /// 【五十五修补·轻推封顶】最近一次段间跳量（上屏字符渲染宽）。
+    /// 轻推量上限=跳量：段末推到段首+一字符宽≈下一段段首——全程
+    /// 单调前进，杜绝段末超前光标→段切换回跳（实测 4 键轻推 189>
+    /// 字宽 126 时段切换回退 69px 的病）。
+    pub hupo_last_jump: i32,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -408,6 +420,9 @@ impl Shared {
     hupo_seg_y: 0,
     hupo_seg_h: 16,
     hupo_seg_started: false,
+    hupo_key_w: 0.0,
+    hupo_last_seg_x: 0,
+    hupo_last_jump: 0,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -2390,6 +2405,18 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             let h = r.bottom - r.top;
             if h >= 60 {
                 if !g.hupo_seg_started {
+                    // 【五十五修·键宽自校准】段间跳变量=上屏字符真实渲染
+                    // 宽（同行跳 40..320px 才校准——换行回退/大跳不算）。
+                    // 中文等宽排版字母≈半字宽 → 键宽=跳量×0.5。纯真值
+                    // 派生，字体变化自动适应（零像素魔法数）。
+                    if g.hupo_last_seg_x > 0 {
+                        let dx = r.left - g.hupo_last_seg_x;
+                        if (40..320).contains(&dx) {
+                            g.hupo_key_w = (dx as f32) * 0.5;
+                            g.hupo_last_jump = dx;
+                        }
+                    }
+                    g.hupo_last_seg_x = r.left;
                     g.hupo_seg_start_x = r.left;
                     g.hupo_seg_y = r.top;
                     g.hupo_seg_h = h.max(16);
@@ -2427,21 +2454,30 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // →本函数重查 selection 接管。
         return;
     }
-    // 【五十三修·段内 v1.5.2 语义】段内零查询零重查：锚=段首立段锚恒
-    // 定（实测包围盒 right 段内不动——虎魄布局不给段内数据，任何查
-    // 询都是浪费帧；每键 arm 60ms 重查会让平移动效拖慢一倍）。仅当
-    // 锚意外丢失时用立段数据重建。
+    // 【五十三修·段内零查询零重查】+【五十五修·段内轻推】锚=段首+
+    // (raw-1)×键宽：虎魄不给段内光标数据（实测全部查询姿势恒定/拒
+    // 绝），但键宽可从段间真值自校准（上屏字宽×0.5）——段内候选随
+    // 编码逐键右移贴光标（纯计算零查询，不拖动效节奏）。未校准期
+    //（首段/换行后）钉段首（保守）。
     if g.hupo_seg_started {
-        if g.caret.is_none() {
-            let mut rr = RECT {
-                left: g.hupo_seg_start_x,
-                top: g.hupo_seg_y,
-                right: g.hupo_seg_start_x + 14,
-                bottom: g.hupo_seg_y + g.hupo_seg_h,
-            };
-            hupo_clamp(&mut rr);
-            g.caret = Some(rr);
-        }
+        let nudge = if g.hupo_key_w > 0.0 {
+            let raw_nudge =
+                ((g.cur_raw_len.saturating_sub(1)) as f32 * g.hupo_key_w).round() as i32;
+            // 【五十五修补·封顶】轻推≤段间跳量：段末恰好推到下段段首，
+            // 全程单调（超前→段切换回跳的病根）。
+            raw_nudge.min(g.hupo_last_jump)
+        } else {
+            0
+        };
+        let x = g.hupo_seg_start_x + nudge;
+        let mut rr = RECT {
+            left: x,
+            top: g.hupo_seg_y,
+            right: x + 14,
+            bottom: g.hupo_seg_y + g.hupo_seg_h,
+        };
+        hupo_clamp(&mut rr);
+        g.caret = Some(rr);
     }
 }
 
