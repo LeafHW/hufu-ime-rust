@@ -363,6 +363,14 @@ pub struct Shared {
     /// 窗右缘留白 250），逐字流保持跳量 cap（防段末超前）。0=未测得，
     /// 用跳量保守。
     pub hupo_line_span: i32,
+    /// 【五十八修·整句长流模式】raw 涨超 6 键进入：selection 组段框恒
+    /// 句首（重查重立=跳回句首）+ 顶死武装每键一帧（动效慢）——长流
+    /// 一律纯推断（零查询零重查零 arm）。raw==1 新句立段时退出。
+    pub hupo_long_mode: bool,
+    /// 【五十八修补·行距真值】立段间 dy（50..300）=换行行距；溢出推断
+    /// 的 y 步进。0=未测得（用行框高兜底）。
+    pub hupo_line_dy: i32,
+    pub hupo_last_seg_y: i32,
     /// 【五十七修补·顶屏消耗补偿】整句流中顶屏自动上屏使 raw 变短，
     /// 但光标实际前进了（上屏字宽）——轻推基点必须同步：seg_start_x
     /// 前移 消耗键数×键宽/2（=消耗字数×字宽，键宽=字宽/2 自洽），
@@ -449,6 +457,9 @@ impl Shared {
     hupo_reseg_armed: false,
     hupo_line_span: 0,
     hupo_prev_raw: 0,
+    hupo_long_mode: false,
+    hupo_line_dy: 0,
+    hupo_last_seg_y: 0,
     cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -2441,7 +2452,22 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             g.hupo_key_w = (dx as f32) * 0.5;
                             g.hupo_last_jump = dx;
                         }
+                        // 【五十八修补·立段记行宽】换行回退量=一行总宽
+                        //（溢出推断的 cap 真值；reseg 之外立段也记——
+                        // 长模式禁 reseg 后 span 的唯一来源）。
+                        if dx < -200 {
+                            g.hupo_line_span = -dx;
+                        }
                     }
+                    // 【五十八修补·立段记行距】dy 50..300=换行行距真值
+                    //（溢出推断的 y 步进，比行框高更准）。
+                    if g.hupo_last_seg_y > 0 {
+                        let dyl = r.top - g.hupo_last_seg_y;
+                        if dyl > 50 && dyl < 300 {
+                            g.hupo_line_dy = dyl;
+                        }
+                    }
+                    g.hupo_last_seg_y = r.top;
                     g.hupo_last_seg_x = r.left;
                     g.hupo_seg_start_x = r.left;
                     g.hupo_seg_y = r.top;
@@ -2450,6 +2476,9 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     // 【五十七修】行首 raw 基点（raw==1 时=1）
                     g.hupo_seg_raw0 = g.cur_raw_len.max(1);
                     g.hupo_reseg_armed = false;
+                    // 【五十八修】新句立段退出长流模式（重查/重立链恢复）
+                    g.hupo_long_mode = false;
+                    g.hupo_prev_raw = g.cur_raw_len;
                 }
                 hupo_clamp(&mut r);
                 g.caret = Some(r);
@@ -2494,6 +2523,56 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 病根。自愈：60ms 重查帧（立段同值 arm 的）置 hupo_reseg，到点
     // 重查 selection——守卫（x 回退>200 或 |dy|>50=换行/滚屏级）通过
     // 才重立段，防段内值抖动误伤。
+    // 【五十八修·整句长流纯推断】整句流（raw 涨超 6 键）中 selection
+    // 组段框恒=句首行（虎魄组段 range 在句首不动）——56/57 的重查重
+    // 立段会跳回句首（用户实测「还是跳回去」）；顶死武装在 raw 恒涨
+    // 时每键 arm 一帧重查=动效变慢。整句长流切换纯推断模型：零查询
+    // 零重查零 arm——换行靠 x 溢出推断（行宽/行高全真值校准，行高
+    // 初值=立段行框高，SP 流换行时自然校准）。
+    if g.cur_raw_len > 6 {
+        g.hupo_long_mode = true;
+    }
+    if g.hupo_long_mode {
+        // 顶屏消耗补偿（同 57）
+        if g.hupo_prev_raw > 0 && g.cur_raw_len < g.hupo_prev_raw {
+            let used = g.hupo_prev_raw - g.cur_raw_len;
+            let adv = ((used as f32) * g.hupo_key_w * 0.5).round() as i32;
+            g.hupo_seg_start_x += adv;
+            g.hupo_seg_raw0 = g.hupo_seg_raw0.saturating_sub(used).max(1);
+        }
+        g.hupo_prev_raw = g.cur_raw_len;
+        if g.hupo_seg_started {
+            let keys = g.cur_raw_len.saturating_sub(g.hupo_seg_raw0);
+            let mut nudge = (keys as f32 * g.hupo_key_w).round() as i32;
+            // 【五十八修补·溢出判据只用真实行宽】span 未测得（0）时绝不
+            // 溢出（此前回退 last_jump=126 当 cap 导致简码/整句流每键
+            // 误判换行、y 疯涨 450px 的病）。span 有值 → cap=span-250。
+            let cap = if g.hupo_line_span > 250 {
+                g.hupo_line_span - 250
+            } else {
+                i32::MAX / 4
+            };
+            // 溢出=换行：y 下移一行（行距真值，未测得退行框高）、x 回
+            // 行首、基点重置——立即跟随到新行，不等上屏。零查询零重查。
+            if cap != i32::MAX / 4 && nudge >= cap && cap > 0 {
+                let dy = if g.hupo_line_dy > 0 { g.hupo_line_dy } else { g.hupo_seg_h };
+                g.hupo_seg_y += dy;
+                g.hupo_seg_raw0 = g.cur_raw_len;
+                nudge = 0;
+                trace("qie: 整句换行推断（溢出）");
+            }
+            let x = g.hupo_seg_start_x + nudge.min(if cap == i32::MAX / 4 { nudge } else { cap });
+            let mut rr = RECT {
+                left: x,
+                top: g.hupo_seg_y,
+                right: x + 14,
+                bottom: g.hupo_seg_y + g.hupo_seg_h,
+            };
+            hupo_clamp(&mut rr);
+            g.caret = Some(rr);
+        }
+        return;
+    }
     if g.hupo_reseg {
         g.hupo_reseg = false;
         g.hupo_reseg_armed = false;
