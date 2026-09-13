@@ -1845,15 +1845,13 @@ impl Engine {
         } else {
             (&dec.hits[..], dec.truncated)
         };
-        if truncated {
-            // 截断=beam 剪枝标志（Rime/虎爪同语义：结果不稳不上屏）。
-            // 【六十七修·回归虎爪】曾按水位线放行——beam 不稳态 top1
-            // 可信度无保证（70 键复现错句流），撤。
-            if ec_dbg {
-                eprintln!("[early] 停:截断 full_len={}", full.chars().count());
-            }
-            session.early_history.clear();
-            return;
+        // 【六十八修·截断不否决】用户拍板「不稳的也让」：truncated=beam
+        // 剪枝标志，长句必然——不再一票否决（不清史、不 return），继
+        // 续走完整判定流；上不上屏由份额线+证据史+稳定消耗说了算（判
+        // 定流本身就是质量闸门）。错句由判定流兜底（对比六十六直出：
+        // 直出绕过判定才出过错句流）。
+        if truncated && ec_dbg {
+            eprintln!("[early] 截断放行 full_len={}", full.chars().count());
         }
         let committed_text = session.committed_text.clone();
         let cands: Vec<&SentenceHit> = src
@@ -1923,7 +1921,7 @@ impl Engine {
 
         // 【六十七修·水位线收进虎爪语义】撤六十六修补2 的武装直出
         //（top1 直出绕过公共前缀/稳定消耗——beam 不稳态错句流，70 键
-        // 复现实锤）。残码水位线（用户拍板：残算编码含数字与；>15，
+        // 复现实锤）。残码水位线（用户拍板：残算编码含数字与；>10，
         // HUFU_EARLY_RESID_LINE 可调）保留，但只做一件事：水位触发一
         // 次后句内持续武装，armed 态确认键数降为 1——上屏内容仍走
         // 虎爪同构判定（份额→提案→证据史→公共前缀→稳定消耗），高
@@ -1952,7 +1950,7 @@ impl Engine {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(need_k);
         let cur_strong = session.early_history.last().map(|e| e.strong).unwrap_or(false);
-        // 【六十六修·残码水位线】用户拍板算法：残算编码（live raw）>20
+        // 【六十六修·残码水位线】用户拍板算法：残算编码（live raw）>10
         //（初版 10，用户实测偏短——候选攒不久就上屏；改 20 让整句候选
         // 充分成型）且当前提案高置信（strong 份额线）→ 立即上屏（need=1）
         // 把水位降回；置信度不高 → 不强制，按原证据窗攒（「置信度实在
@@ -1963,7 +1961,7 @@ impl Engine {
             std::env::var("HUFU_EARLY_RESID_LINE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(15)
+                .unwrap_or(10)
         });
         // 【六十六修补·水位武装】>20 触发过一次即句内持续武装：之后
         // 每键高置信直接上屏（不等再攒 20——用户实测否则每次都卡在
