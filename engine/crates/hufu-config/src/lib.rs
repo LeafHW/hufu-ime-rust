@@ -308,9 +308,15 @@ impl Default for SentenceSection {
             ngram_path: "models/sentence-ngram.bin".into(),
             // 【回归 1.4.8 模型默认 2026-09-08】W1 束宽 30000 实测引发
             // 「越打越卡」（每键全量解码数百 ms，1.4.8 基线对照实锤）
-            //——默认回 1.4.8 值（beam200/cl20/need2/supp32），W1 档位
+            //——默认回 1.4.8 值（beam200/cl20/supp32），W1 档位
             // 保留在设置页预设里按需一键切换。
-            early_need: 2,
+            // 【八十修·默认参数统一 2026-09-14】early_need 2→3：与
+            // serde 缺省（default_early_need）、设置页「提前上屏（稳
+            // 3 键）」、设置页 W_DEFAULTS 出厂值、打包源模板 config、
+            // 本机实测调校值五方对齐——Default impl 是新装机首启
+            // （config.json 不存在）与 tbench 基准的兜底，此前 2 与
+            // 产品定版 3 不一致（bench 口径偏差来源之一）。
+            early_need: 3,
             weights: SentenceWeights::default(),
         }
     }
@@ -571,7 +577,8 @@ mod tests {
         // 2026-09-08 默认回归 1.4.8 模型值（W1 30000 实测致越打越卡）
         assert_eq!(cfg.sentence.weights.beam_width, 200);
         assert_eq!(cfg.sentence.weights.candidate_limit, 20);
-        assert_eq!(cfg.sentence.early_need, 2);
+        // 八十修：默认 3 与 serde 缺省/设置页「稳 3 键」对齐
+        assert_eq!(cfg.sentence.early_need, 3);
 
         // 部分 JSON：未给字段用默认值
         let partial = r#"{ "input": { "max_code_length": 5 } }"#;
