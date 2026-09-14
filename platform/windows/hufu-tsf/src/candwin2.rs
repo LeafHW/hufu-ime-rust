@@ -1,4 +1,4 @@
-//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -752,6 +752,9 @@ pub struct CandidateWindowV2 {
     dot_em_px: std::cell::Cell<f32>,
     /// 【S6 三修】外圈色（皮肤底色 back_color）。
     dot_ring_argb: std::cell::Cell<u32>,
+    /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
+    dot_grp_in: Option<IDCompositionEffectGroup>,
+    dot_grp_sh: Option<IDCompositionEffectGroup>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1155,6 +1158,8 @@ impl CandidateWindowV2 {
                 expand_dir: std::cell::Cell::new(false),
                 expand_t0: std::cell::Cell::new(None),
                 dot_grp: None,
+                dot_grp_in: None,
+                dot_grp_sh: None,
                 fade_t0: std::cell::Cell::new(None),
                 fade_main_grp: None,
                 idle_since: std::cell::Cell::new(None),
@@ -1358,6 +1363,8 @@ impl CandidateWindowV2 {
                 expand_dir: std::cell::Cell::new(false),
                 expand_t0: std::cell::Cell::new(None),
                 dot_grp: None,
+                dot_grp_in: None,
+                dot_grp_sh: None,
                 fade_t0: std::cell::Cell::new(None),
                 fade_main_grp: None,
                 idle_since: std::cell::Cell::new(None),
@@ -4286,10 +4293,11 @@ impl CandidateWindowV2 {
             // 边（与 caret 同侧），morph 锚=圆实际显示位（连续性保持）。
             let rw = (r.right - r.left).max(DOT_SIDE as i32);
             let rh = (r.bottom - r.top).max(DOT_SIDE as i32);
-            // 【S6 三修·位置】外圈左缘贴光标右侧（用户定稿「圆在光标
-            // 的右边」——文字流向的下一个位置），垂直=光标下方一行
-            // （候选窗出现的位置）。圆是窗的化身：同点形变。
-            let cy2 = cy + (self.dot_em_px.get() * 1.0) as i32; // 下一行中心
+            // 【S6 四修·位置】外圈左缘贴光标右侧（用户定稿「圆在光标
+            // 的右边」），垂直=光标下方约 1.6 行（用户判「太偏上」——
+            // 1.0 行时圆顶压着光标行文字；对齐窗展开后首行高亮条中心
+            // 的近似位）。圆是窗的化身：同点形变。
+            let cy2 = cy + (self.dot_em_px.get() * 1.6) as i32; // 光标下方 1.6 行中心
             let gap = 4.0f32; // 与光标竖线的间隙
             let ox = (cx as f32 + gap - r.left as f32).clamp(0.0, (rw - DOT_SIDE) as f32);
             let oy = (cy2 as f32 - DOT_SIDE as f32 * 0.5 - r.top as f32)
@@ -4307,132 +4315,16 @@ impl CandidateWindowV2 {
             // 静态 clip setter+Commit——IDCompositionAnimation 在本机
             // 不被驱动（高速截帧实证：属性停 from 值），而静态 clip+
             // Commit 每帧更新已验证可靠）。arm_collapse 内含首帧步进。
+            //
+            // 【S6 四修·单元素形变】圆=收场终态的**窗本身**：不再挂独立
+            // dot 层（用户判词「跟这个圆没有什么关系」的根源——两层
+            // 叠加永远读成两个东西）。窗 clip 由 arm_collapse 收缩到圆
+            // 盒；morph 完成帧（collapse_step p>=1.0）把窗内容重渲为同
+            // 心圆帧（D2D FillRoundedRectangle 抗锯齿——独立 dot 层
+            // Clear+DComp clip 硬边锯齿的根治）。涌现：show 重渲完整
+            // 内容（clip 仍停在圆盒，只露圆位置）→arm_expand 展开
+            // clip→候选框所有元素从圆里长出来——单元素，无独立圆淡出。
             let _ = self.arm_collapse(ox, oy);
-            let (dc, vd, v, ch) = match (&self.dcomp, &self.visual_dot, &self.visual, &self.dot_chain)
-            {
-                (Some(d), Some(a), Some(b), Some(c)) => (d, a, b, c),
-                _ => return false,
-            };
-            // 圆形 clip：buffer=Clear 全色块（Fill 系列视觉失败的坑），
-            // 形状=RectangleClip 四角半径=半边（正圆）。挂在 dot visual
-            // 上（root 无 transform，clip 不会被变换）。
-            let side_f = DOT_SIDE as f32;
-            let rad_f = side_f * 0.5;
-            let clip = match dc.CreateRectangleClip() {
-                Ok(c) => c,
-                Err(_) => {
-                    crate::tsf::diag_note("v4圆: clip 创建失败");
-                    return false;
-                }
-            };
-            let clip_ok = clip.SetLeft2(0.0).is_ok()
-                && clip.SetTop2(0.0).is_ok()
-                && clip.SetRight2(side_f).is_ok()
-                && clip.SetBottom2(side_f).is_ok()
-                && clip.SetTopLeftRadiusX2(rad_f).is_ok()
-                && clip.SetTopLeftRadiusY2(rad_f).is_ok()
-                && clip.SetTopRightRadiusX2(rad_f).is_ok()
-                && clip.SetTopRightRadiusY2(rad_f).is_ok()
-                && clip.SetBottomLeftRadiusX2(rad_f).is_ok()
-                && clip.SetBottomLeftRadiusY2(rad_f).is_ok()
-                && clip.SetBottomRightRadiusX2(rad_f).is_ok()
-                && clip.SetBottomRightRadiusY2(rad_f).is_ok();
-            if !clip_ok {
-                crate::tsf::diag_note("v4圆: clip 参数失败");
-                return false;
-            }
-            if vd.SetContent(ch).is_err()
-                || vd.SetOffsetX2(ox).is_err()
-                || vd.SetOffsetY2(oy).is_err()
-                || vd.SetClip(&clip).is_err()
-                || dc.Commit().is_err()
-            {
-                crate::tsf::diag_note("v4圆: attach失败");
-                return false;
-            }
-            // 【S6 三修】外圈阴影：IDCompositionDevice3::CreateShadowEffect
-            //（注意 Visual3 QI 在本机失败过——Device3 QI 也可能失败，失败
-            // 则无阴影继续，两层圆仍有质感）。静态 setter 本机可靠。
-            // effect 位交给阴影——dot 透明度改 render_dot_frame 重渲。
-            if let Ok(d3) = dc.cast::<IDCompositionDevice3>() {
-                if let Ok(sh) = d3.CreateShadowEffect() {
-                    let _ = sh.SetStandardDeviation2(3.0);
-                    // 阴影色=黑色 30%（D2D_VECTOR_4F rgba）
-                    let _ = sh.SetColor(&windows::Win32::Graphics::Direct2D::Common::D2D_VECTOR_4F {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                        w: 0.3,
-                    });
-                    if vd.SetEffect(&sh).is_err() {
-                        crate::tsf::diag_note("v4圆: 阴影挂接失败（无阴影继续）");
-                    }
-                }
-            } else {
-                static NO3: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !NO3.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    crate::tsf::diag_note("v4圆: Device3 QI 失败（无阴影模式）");
-                }
-            }
-            // 【S6 三修】中心点：皮肤高亮色小圆（DOT_INNER），叠在外圈
-            // 中心。独立 swapchain+独立 clip（一个 clip 不能挂两个
-            // visual——COM 引用互偷坑）。
-            if let (Some(vin), Some(dcin)) = (&self.visual_dot_in, &self.dot_chain_in) {
-                let chin: IDXGISwapChain1 = dcin.clone();
-                let in_f = DOT_INNER as f32;
-                let in_rad = in_f * 0.5;
-                let off_in = (DOT_SIDE - DOT_INNER) as f32 * 0.5;
-                if let Ok(cic) = dc.CreateRectangleClip() {
-                    let _ = cic.SetLeft2(0.0);
-                    let _ = cic.SetTop2(0.0);
-                    let _ = cic.SetRight2(in_f);
-                    let _ = cic.SetBottom2(in_f);
-                    let _ = cic.SetTopLeftRadiusX2(in_rad);
-                    let _ = cic.SetTopLeftRadiusY2(in_rad);
-                    let _ = cic.SetTopRightRadiusX2(in_rad);
-                    let _ = cic.SetTopRightRadiusY2(in_rad);
-                    let _ = cic.SetBottomLeftRadiusX2(in_rad);
-                    let _ = cic.SetBottomLeftRadiusY2(in_rad);
-                    let _ = cic.SetBottomRightRadiusX2(in_rad);
-                    let _ = cic.SetBottomRightRadiusY2(in_rad);
-                    let _ = vin.SetContent(&chin);
-                    let _ = vin.SetOffsetX2(ox + off_in);
-                    let _ = vin.SetOffsetY2(oy + off_in);
-                    let _ = vin.SetClip(&cic);
-                    let _ = dc.Commit();
-                }
-            }
-            // 【S6 三修·伪阴影】半透明深色大圆垫底（真阴影 Device3 QI
-            // 本机失败——CreateShadowEffect 拿不到）。位置=外圈外扩 PAD。
-            if let (Some(vsh), Some(dcs)) = (&self.visual_dot_sh, &self.dot_chain_sh) {
-                let chsh: IDXGISwapChain1 = dcs.clone();
-                let sh_f = (DOT_SIDE + DOT_SHADOW_PAD * 2) as f32;
-                let sh_rad = sh_f * 0.5;
-                if let Ok(csc) = dc.CreateRectangleClip() {
-                    let _ = csc.SetLeft2(0.0);
-                    let _ = csc.SetTop2(0.0);
-                    let _ = csc.SetRight2(sh_f);
-                    let _ = csc.SetBottom2(sh_f);
-                    let _ = csc.SetTopLeftRadiusX2(sh_rad);
-                    let _ = csc.SetTopLeftRadiusY2(sh_rad);
-                    let _ = csc.SetTopRightRadiusX2(sh_rad);
-                    let _ = csc.SetTopRightRadiusY2(sh_rad);
-                    let _ = csc.SetBottomLeftRadiusX2(sh_rad);
-                    let _ = csc.SetBottomLeftRadiusY2(sh_rad);
-                    let _ = csc.SetBottomRightRadiusX2(sh_rad);
-                    let _ = csc.SetBottomRightRadiusY2(sh_rad);
-                    let _ = vsh.SetContent(&chsh);
-                    let _ = vsh.SetOffsetX2(ox - DOT_SHADOW_PAD as f32);
-                    let _ = vsh.SetOffsetY2(oy - DOT_SHADOW_PAD as f32);
-                    let _ = vsh.SetClip(&csc);
-                    let _ = dc.Commit();
-                }
-            }
-            // attach 完成后再画圆+Present（内容就绪后的唤醒帧）。
-            if !self.render_dot_frame(1.0) {
-                crate::tsf::diag_note("v4圆: 首帧绘制失败（仍驻留）");
-            }
             // morph timer（16ms tick；完成时 dot_step 内重挂 4s 驻留）。
             let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
             let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None);
@@ -4481,7 +4373,16 @@ impl CandidateWindowV2 {
             }
             self.panel_clip = Some(pc);
             self.collapse_from.set((0.0, 0.0, w_f, h_f, r0));
-            self.collapse_to.set((ox, oy, ox + side_f, oy + side_f, side_f * 0.5));
+            // 【S6 四修】终态盒=阴影圈外接方（罩住整组同心圆，clip 硬边
+            // 藏在半透明阴影外——圆帧本体是 D2D 抗锯齿的）。
+            let pad_f = DOT_SHADOW_PAD as f32;
+            self.collapse_to.set((
+                ox - pad_f,
+                oy - pad_f,
+                ox - pad_f + side_f + pad_f * 2.0,
+                oy - pad_f + side_f + pad_f * 2.0,
+                (side_f + pad_f * 2.0) * 0.5,
+            ));
             self.collapse_t0.set(Some(std::time::Instant::now()));
             self.expand_dir.set(false);
             true
@@ -4528,6 +4429,15 @@ impl CandidateWindowV2 {
         }
         if p >= 1.0 {
             self.collapse_t0.set(None);
+            // 【S6 四修】morph 完成=窗内容切「同心圆帧」（圆=终态窗）。
+            // 驻留期与淡出期都渲这帧（fade 用重渲半透明，见 fade_step）。
+            if !self.expand_dir.get() {
+                unsafe {
+                    if !self.render_dot_layer_frame(1.0) {
+                        crate::tsf::diag_note("v4圆: 圆帧绘制失败（仍驻留）");
+                    }
+                }
+            }
             // 不重挂长 timer（本机 DOT_TIMER_ID 长挂会被静默杀——心跳
             // 对照实证）；16ms tick 保持常开，idle 到点由 tick 自判。
             self.idle_since.set(Some(std::time::Instant::now()));
@@ -4570,6 +4480,8 @@ impl CandidateWindowV2 {
             let _ = vd.SetClip(None);
             let _ = vd.SetEffect(None);
             self.dot_grp = None;
+            self.dot_grp_in = None;
+            self.dot_grp_sh = None;
             // 【S6 三修】中心点层+伪阴影层同清。
             if let Some(vin) = &self.visual_dot_in {
                 let _ = vin.SetContent(None);
@@ -4629,10 +4541,120 @@ impl CandidateWindowV2 {
             _ => self.collapse_to.get(),
         };
         self.collapse_from.set(from);
+        // 【S6 四修·涌现辅助层】三层 dot overlay attach 到圆盒位置：
+        // 驻留圆帧（窗内容）在 show 重渲内容时消失——此层同位置同三色
+        // 接棒（涌现第 1 帧视觉连续），expand 期间随进度淡出=圆融化
+        // 进长出来的内容。终态盒暂存后再写回（overlay 需要圆盒坐标）。
+        let dot_box = self.collapse_to.get();
+        unsafe {
+            self.attach_dot_overlay(dot_box);
+        }
         self.collapse_to.set((0.0, 0.0, w_f, h_f, r1));
         self.collapse_t0.set(Some(std::time::Instant::now()));
         self.expand_dir.set(true);
         let _ = unsafe { SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None) };
+    }
+
+    /// 【S6 四修】三层 overlay attach（arm_expand 调）：三层独立
+    /// swapchain+clip 正圆+effect 组（透明度通道），位置=收场终态盒。
+    unsafe fn attach_dot_overlay(&mut self, dot_box: (f32, f32, f32, f32, f32)) {
+        if !self.ensure_dot_chain() {
+            return;
+        }
+        let (dc, vd, vin, vsh) = match (
+            &self.dcomp,
+            &self.visual_dot,
+            &self.visual_dot_in,
+            &self.visual_dot_sh,
+        ) {
+            (Some(d), Some(a), Some(b), Some(c)) => (d.clone(), a.clone(), b.clone(), c.clone()),
+            _ => return,
+        };
+        let pad_f = DOT_SHADOW_PAD as f32;
+        let side_f = DOT_SIDE as f32;
+        let in_f = DOT_INNER as f32;
+        let sh_f = side_f + pad_f * 2.0;
+        // 外圈圆盒左上 = 终态盒（阴影圈外接方）中心 - DOT_SIDE/2
+        let ox = (dot_box.0 + dot_box.2) * 0.5 - side_f * 0.5;
+        let oy = (dot_box.1 + dot_box.3) * 0.5 - side_f * 0.5;
+        // 单层 attach 小工具：content+offset+圆 clip+effect 组
+        let attach = |v: &IDCompositionVisual,
+                      chain: &Option<IDXGISwapChain1>,
+                      x: f32,
+                      y: f32,
+                      side: f32,
+                      grp: &mut Option<IDCompositionEffectGroup>|
+         -> bool {
+            let ch = match chain {
+                Some(c) => c.clone(),
+                None => return false,
+            };
+            let rad = side * 0.5;
+            let clip = match dc.CreateRectangleClip() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let _ = clip.SetLeft2(0.0);
+            let _ = clip.SetTop2(0.0);
+            let _ = clip.SetRight2(side);
+            let _ = clip.SetBottom2(side);
+            let _ = clip.SetTopLeftRadiusX2(rad);
+            let _ = clip.SetTopLeftRadiusY2(rad);
+            let _ = clip.SetTopRightRadiusX2(rad);
+            let _ = clip.SetTopRightRadiusY2(rad);
+            let _ = clip.SetBottomLeftRadiusX2(rad);
+            let _ = clip.SetBottomLeftRadiusY2(rad);
+            let _ = clip.SetBottomRightRadiusX2(rad);
+            let _ = clip.SetBottomRightRadiusY2(rad);
+            if v.SetContent(&ch).is_err()
+                || v.SetOffsetX2(x).is_err()
+                || v.SetOffsetY2(y).is_err()
+                || v.SetClip(&clip).is_err()
+            {
+                return false;
+            }
+            if let Ok(g) = dc.CreateEffectGroup() {
+                let _ = g.SetOpacity2(1.0);
+                if v.SetEffect(&g).is_ok() {
+                    *grp = Some(g);
+                }
+            }
+            true
+        };
+        let ok_ring = attach(&vd, &self.dot_chain, ox, oy, side_f, &mut self.dot_grp);
+        let ok_in = attach(
+            &vin,
+            &self.dot_chain_in,
+            ox + (side_f - in_f) * 0.5,
+            oy + (side_f - in_f) * 0.5,
+            in_f,
+            &mut self.dot_grp_in,
+        );
+        let ok_sh = attach(
+            &vsh,
+            &self.dot_chain_sh,
+            ox - pad_f,
+            oy - pad_f,
+            sh_f,
+            &mut self.dot_grp_sh,
+        );
+        // 三层内容（Clear 色块）
+        if ok_ring {
+            if let Some(c) = self.dot_chain.clone() {
+                let _ = self.paint_dot_overlay(&c, self.dot_ring_argb.get());
+            }
+        }
+        if ok_in {
+            if let Some(c) = self.dot_chain_in.clone() {
+                let _ = self.paint_dot_overlay(&c, self.dot_argb.get());
+            }
+        }
+        if ok_sh {
+            if let Some(c) = self.dot_chain_sh.clone() {
+                let _ = self.paint_dot_overlay(&c, self.dot_shadow_argb.get());
+            }
+        }
+        let _ = dc.Commit();
     }
 
     /// 【动效 v4·S4】涌现步进：clip 圆→面板生长+dot 渐隐（同一 tick）。
@@ -4666,13 +4688,19 @@ impl CandidateWindowV2 {
                 let _ = pc.SetBottomRightRadiusY2(rad);
                 let _ = dc.Commit();
             }
-            // dot 渐隐后置（进度 70% 前圆保持全显——「圆变成窗」的
-            // 连续感：用户定稿「是形变不是淡入淡出」——圆陪跑到形变
-            // 大部分完成，收尾 30% 才淡出且极快，形变主导感知）。
-            // 【S6 三修】effect 位已让给阴影——透明度=重渲半透明色。
-            let d = ((e - 0.7) / 0.3).clamp(0.0, 1.0);
-            if d > 0.0 {
-                let _ = self.render_dot_frame(1.0 - d);
+            // 【S6 四修·涌现辅助层淡出】三层 overlay 随进度融化（后置
+            // 55%：前 55% 圆全显陪跑形变，收尾快速淡出——形变主导感知
+            // 而非淡入淡出）。
+            let d = ((e - 0.55) / 0.45).clamp(0.0, 1.0);
+            let op = 1.0 - d;
+            if let Some(g) = &self.dot_grp {
+                let _ = g.SetOpacity2(op);
+            }
+            if let Some(g) = &self.dot_grp_in {
+                let _ = g.SetOpacity2(op);
+            }
+            if let Some(g) = &self.dot_grp_sh {
+                let _ = g.SetOpacity2(op);
             }
             if p >= 1.0 {
                 self.collapse_t0.set(None);
@@ -4754,8 +4782,8 @@ impl CandidateWindowV2 {
             if let Some(rg) = &self.fade_main_grp {
                 let _ = rg.SetOpacity2(op);
             }
-            // 【S6 三修】dot 层透明度=重渲半透明色（effect 位让给阴影）
-            let _ = self.render_dot_frame(op);
+            // 【S6 四修】圆帧淡出=重渲半透明同心圆（窗内容本体）
+            let _ = self.render_dot_layer_frame(op);
             if let Some(dc) = &self.dcomp {
                 let _ = dc.Commit();
             }
@@ -4854,32 +4882,23 @@ impl CandidateWindowV2 {
         ok
     }
 
-    /// 【S6 三修】双层圆帧：外圈=皮肤底色（ring），中心点=皮肤高亮
-    ///（dot）。alpha_mult<1 时为重渲淡出帧（effect 位已让给阴影——
-    /// 透明度靠 Clear 半透明色，premultiplied：RGB×A）。
-    unsafe fn render_dot_frame(&mut self, alpha_mult: f32) -> bool {
-        let (chain, ctx) = match (&self.dot_chain, &self.ctx) {
-            (Some(c), Some(x)) => (c.clone(), x.clone()),
-            _ => return false,
+    /// 【S6 四修·涌现辅助层】三层圆 overlay：arm_expand 时 attach 到
+    /// 圆盒位置（Clear 色块+clip 正圆——独立 dot 链，视觉已实证），
+    /// expand 期间随进度淡出——驻留圆帧（窗内容抗锯齿三层）→涌现第
+    /// 1 帧被此 overlay 无缝接棒（同位置同三色）→clip 展开露出内容+
+    /// 圆融化淡出=「圆变成窗」的连续叙事。
+    unsafe fn paint_dot_overlay(&mut self, chain: &IDXGISwapChain1, argb: u32) -> bool {
+        let ctx = match &self.ctx {
+            Some(x) => x.clone(),
+            None => return false,
         };
-        let chain_in = self.dot_chain_in.clone();
-        // 高亮色（中心点）
-        let argb = self.dot_argb.get();
-        let a = ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha_mult;
-        let color = D2D1_COLOR_F {
-            r: ((argb >> 16) & 0xFF) as f32 / 255.0,
-            g: ((argb >> 8) & 0xFF) as f32 / 255.0,
-            b: (argb & 0xFF) as f32 / 255.0,
-            a,
-        };
+        let a = ((argb >> 24) & 0xFF) as f32 / 255.0;
         let premul = D2D1_COLOR_F {
-            r: color.r * a,
-            g: color.g * a,
-            b: color.b * a,
+            r: ((argb >> 16) & 0xFF) as f32 / 255.0 * a,
+            g: ((argb >> 8) & 0xFF) as f32 / 255.0 * a,
+            b: (argb & 0xFF) as f32 / 255.0 * a,
             a,
         };
-        // 【坑】options=None 的 bitmap 不能当 target（主链同款
-        // TARGET|CANNOT_DRAW+PREMULTIPLIED 才能画）。
         let bp = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -4890,84 +4909,126 @@ impl CandidateWindowV2 {
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             colorContext: std::mem::ManuallyDrop::new(None),
         };
-        // 外圈=皮肤底色
-        let rargb = self.dot_ring_argb.get();
-        let ra = ((rargb >> 24) & 0xFF) as f32 / 255.0 * alpha_mult;
-        let rcolor = D2D1_COLOR_F {
-            r: ((rargb >> 16) & 0xFF) as f32 / 255.0,
-            g: ((rargb >> 8) & 0xFF) as f32 / 255.0,
-            b: (rargb & 0xFF) as f32 / 255.0,
-            a: ra,
-        };
-        let rpremul = D2D1_COLOR_F {
-            r: rcolor.r * ra,
-            g: rcolor.g * ra,
-            b: rcolor.b * ra,
-            a: ra,
-        };
-        // 画外圈
-        if !self.clear_chain(&chain, &ctx, &bp, &rpremul) {
-            return false;
-        }
-        // 画中心点
-        if let Some(cin) = &chain_in {
-            let _ = self.clear_chain(cin, &ctx, &bp, &premul);
-        }
-        // 画伪阴影（半透明深色）
-        if let Some(csh) = self.dot_chain_sh.clone() {
-            let sargb = self.dot_shadow_argb.get();
-            let sa = ((sargb >> 24) & 0xFF) as f32 / 255.0 * alpha_mult;
-            let scolor = D2D1_COLOR_F {
-                r: ((sargb >> 16) & 0xFF) as f32 / 255.0,
-                g: ((sargb >> 8) & 0xFF) as f32 / 255.0,
-                b: (sargb & 0xFF) as f32 / 255.0,
-                a: sa,
-            };
-            let spremul = D2D1_COLOR_F {
-                r: scolor.r * sa,
-                g: scolor.g * sa,
-                b: scolor.b * sa,
-                a: sa,
-            };
-            let _ = self.clear_chain(&csh, &ctx, &bp, &spremul);
-        }
-        true
-    }
-
-    /// 单链 Clear+Present（render_dot_frame 的原子步）。
-    unsafe fn clear_chain(
-        &mut self,
-        chain: &IDXGISwapChain1,
-        ctx: &ID2D1DeviceContext,
-        bp: &D2D1_BITMAP_PROPERTIES1,
-        premul: &D2D1_COLOR_F,
-    ) -> bool {
         let buffer: IDXGISurface = match chain.GetBuffer(0) {
             Ok(b) => b,
             Err(_) => return false,
         };
-        let bmp: ID2D1Bitmap1 = match ctx.CreateBitmapFromDxgiSurface(&buffer, Some(bp)) {
+        let bmp: ID2D1Bitmap1 = match ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&bp)) {
             Ok(b) => b,
             Err(_) => return false,
         };
         ctx.SetTarget(&bmp);
         let _ = ctx.BeginDraw();
-        // 【坑：Fill 系列在长寿命 ctx 上视觉失败（Clear 有效）——v3
-        // 实证过的老坑】圆的形状由 DComp 圆角 clip 负责（enter_dot 挂
-        // RectangleClip 正圆半径），buffer=Clear 直填色块即可。
-        ctx.Clear(Some(premul));
-        let hr = ctx.EndDraw(None, None);
-        if hr.is_err() {
-            crate::tsf::diag_note(&format!(
-                "v4圆: EndDraw hr=0x{:08X}",
-                hr.map(|_| 0u32).unwrap_or_else(|e| e.code().0 as u32)
-            ));
-        }
-        let hr_p = chain.Present(1, DXGI_PRESENT(0));
-        if hr_p.0 != 0 {
-            return false;
-        }
-        true
+        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2::identity());
+        ctx.Clear(Some(&premul));
+        let _ = ctx.EndDraw(None, None);
+        ctx.SetTarget(None);
+        chain.Present(1, DXGI_PRESENT(0)).0 == 0
+    }
+
+    /// 【S6 四修】同心圆帧：画在**窗 swapchain**（圆=收场终态的窗——
+    /// 单元素形变的本体）。D2D FillRoundedRectangle（GPU 抗锯齿——
+    /// 独立 dot 层 Clear+DComp clip 硬边锯齿的根治；窗渲染管线实证
+    /// Fill 正常）。圆心=collapse_to 盒中心。alpha_mult<1=淡出重渲帧。
+    unsafe fn render_dot_layer_frame(&mut self, alpha_mult: f32) -> bool {
+        let (chain, ctx) = match (&self.swapchain, &self.ctx) {
+            (Some(c), Some(x)) => (c.clone(), x.clone()),
+            _ => return false,
+        };
+        // 后台缓冲索引（FLIP_DISCARD 轮转——画错缓冲=隔帧闪，窗渲染
+        // 同款修复）。
+        let bb_index = match chain.cast::<IDXGISwapChain3>() {
+            Ok(c3) => c3.GetCurrentBackBufferIndex(),
+            Err(_) => 0,
+        };
+        let surface: IDXGISurface = match chain.GetBuffer(bb_index) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let bp = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let bitmap = match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        // 圆心=collapse_to 盒中心（to 盒=阴影圈外接方）
+        let t = self.collapse_to.get();
+        let ccx = (t.0 + t.2) * 0.5;
+        let ccy = (t.1 + t.3) * 0.5;
+        // premultiplied 颜色（argb×alpha_mult）
+        let premul = |argb: u32| -> D2D1_COLOR_F {
+            let a = ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha_mult;
+            D2D1_COLOR_F {
+                r: ((argb >> 16) & 0xFF) as f32 / 255.0 * a,
+                g: ((argb >> 8) & 0xFF) as f32 / 255.0 * a,
+                b: (argb & 0xFF) as f32 / 255.0 * a,
+                a,
+            }
+        };
+        // 抗锯齿实心圆（FillRoundedRect 半径=半宽）
+        let fill_circle = |ctx: &ID2D1DeviceContext, cx: f32, cy: f32, rad: f32, col: &D2D1_COLOR_F| {
+            if let Ok(br) = ctx.CreateSolidColorBrush(col, None) {
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cx - rad,
+                        top: cy - rad,
+                        right: cx + rad,
+                        bottom: cy + rad,
+                    },
+                    radiusX: rad,
+                    radiusY: rad,
+                };
+                ctx.FillRoundedRectangle(&rr, &br);
+            }
+        };
+        ctx.SetTarget(&bitmap);
+        let _ = ctx.BeginDraw();
+        // 【根因】窗渲染管线的内容带 dpi_scale×平移 的 transform 且
+        // EndDraw 后不还原——残留下来的矩阵会把圆画到 clip 盒外
+        //（DPI>1 完全不可见，本机实测）。圆帧坐标=DComp/窗物理 px
+        // ——先归一恒等变换。
+        ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2::identity());
+        // 全透明清屏（旧候选内容全清——圆帧独占）
+        ctx.Clear(Some(&D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }));
+        // 三层同心圆（从大到小）：伪阴影→底色托盘→高亮中心点
+        let pad_f = DOT_SHADOW_PAD as f32;
+        fill_circle(
+            &ctx,
+            ccx,
+            ccy,
+            DOT_SIDE as f32 * 0.5 + pad_f,
+            &premul(self.dot_shadow_argb.get()),
+        );
+        fill_circle(
+            &ctx,
+            ccx,
+            ccy,
+            DOT_SIDE as f32 * 0.5,
+            &premul(self.dot_ring_argb.get()),
+        );
+        fill_circle(
+            &ctx,
+            ccx,
+            ccy,
+            DOT_INNER as f32 * 0.5,
+            &premul(self.dot_argb.get()),
+        );
+        let _ = ctx.EndDraw(None, None);
+        ctx.SetTarget(None);
+        chain.Present(1, DXGI_PRESENT(0)).0 == 0
     }
 }
 
@@ -5001,13 +5062,12 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 pub const WM_APP_FADE_TICK: u32 = 0x4949; // "II"
 
 /// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id、morph 时长、tick。
-/// 【S6 三修】双层圆+伪阴影：外圈 28（皮肤底色托盘），中心点 12
-///（皮肤高亮点），阴影垫 36（半透明深色——Device3 QI 本机失败，
-/// CreateShadowEffect 不可用，用大一号半透明圆垫底代替）。
-/// 用户定稿设计「中间是皮肤高亮点，周边是皮肤底色」。
-pub const DOT_SIDE: i32 = 28;
-pub const DOT_INNER: i32 = 12;
-pub const DOT_SHADOW_PAD: i32 = 4;
+/// 【S6 四修】单元素形变：圆=收场终态的窗（画在窗 swapchain，D2D 抗
+/// 锯齿）。尺寸收小（用户判 28 偏大）：外圈 20，中心点 9，伪阴影垫 3
+///（外扩后 26，clip 盒罩住整组）。
+pub const DOT_SIDE: i32 = 20;
+pub const DOT_INNER: i32 = 9;
+pub const DOT_SHADOW_PAD: i32 = 3;
 pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 pub const DOT_MORPH_MS: u32 = 180;
