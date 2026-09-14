@@ -3632,13 +3632,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         // 【动效 v4】上屏断段收场：光标点可得→转圆点驻留（hide_as_dot
         // 内部 DComp 树不可用时自动回落普通 hide）；否则直收。
-        // 【S6 修】带上屏文本（Op::Commit 落字时记，取用即清）——
-        // hide_as_dot 按字宽右移圆心（断段 caret 还是上屏前旧光标）。
+        // 【S6 二修】圆心=光标正下方（hide_as_dot 内定位，不做字宽
+        // 补偿——圆是窗的化身，与窗同点形变）。
         let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
-        let commit_txt = g.last_commit_txt.take().unwrap_or_default();
         if let Some(c) = g.cand2.as_mut() {
             match caret_pt {
-                Some((cx, cy)) => c.hide_as_dot(cx, cy, &commit_txt),
+                Some((cx, cy)) => c.hide_as_dot(cx, cy),
                 None => c.hide(),
             }
         }
@@ -5225,10 +5224,9 @@ fn poll_tick() {
                 .unwrap_or((false, false));
             if vis && !dot {
                 let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
-                let commit_txt = g.last_commit_txt.take().unwrap_or_default();
                 if let Some(c) = g.cand2.as_mut() {
                     match caret_pt {
-                        Some((cx, cy)) => c.hide_as_dot(cx, cy, &commit_txt),
+                        Some((cx, cy)) => c.hide_as_dot(cx, cy),
                         None => c.hide(),
                     }
                 }

@@ -1701,9 +1701,10 @@ impl CandidateWindowV2 {
             .or_else(|| skin.pointer("/skin/motion/dot_color"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
+        // 【S6 二修】用户定稿：默认=高亮区底色（圆是高亮词条的化身）。
         let hex = explicit_dot
-            .or_else(|| cval("hilited_candidate_text_color"))
-            .or_else(|| cval("hilited_candidate_back_color"));
+            .or_else(|| cval("hilited_candidate_back_color"))
+            .or_else(|| cval("hilited_candidate_text_color"));
         if let Some(hex) = hex {
             if let Some(argb) = parse_hex_argb(hex) {
                 self.dot_argb.set(argb);
@@ -4197,13 +4198,15 @@ impl CandidateWindowV2 {
 
     /// 上屏收场入口（tsf 层调）：DComp 树可用→转圆驻留；否则普通 hide。
     /// 【S5 节奏自适应】以两次上屏间隔分流（hide_as_dot 即上屏时刻）：
-    /// 连打（<rapid_ms）不冒圆直收；快打（<fast_ms）快速 morph；
+    /// 连打（<rapid_ms）快速脉冲 morph（60ms——**不瞬收**：直收=候选
+    /// 一开一关闪烁感，动效的初衷就是消闪烁；连打时窗收/长连续形变
+    /// =呼吸感，圆刚成形就被下一次涌现吞掉）；快打（<fast_ms）90ms；
     /// 慢打完整 morph。【S6】皮肤 motion.mode 覆盖：plain=朴素即隐，
     /// snap=直切圆（一帧形变）。
-    /// 【S6 修·位置】断段时的 caret 是**上屏前**旧光标（上屏文字的起
-    /// 点）——直接用圆会压在刚上屏的字上。按上屏文本宽度右移
-    /// （全角≈em、半角≈0.55em）——圆落在「文字后面」（=新光标处）。
-    pub fn hide_as_dot(&mut self, cx: i32, cy: i32, commit_text: &str) {
+    /// 【S6 二修·位置】圆心=光标正下方（不做字宽补偿——圆是候选窗
+    /// 的化身，窗在光标下方出现，圆也在光标下方，expand 才是「同点
+    /// 形变」而非两个独立元素的位置跳变）。
+    pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
         if self.dot_mode_cfg.get() == DotMode2::Plain {
             self.hide();
             return;
@@ -4214,29 +4217,17 @@ impl CandidateWindowV2 {
             .replace(Some(now))
             .map(|t| now.duration_since(t).as_millis() as u32)
             .unwrap_or(u32::MAX);
-        if dt_ms < self.dot_rapid_cfg.get() {
-            // 连打：脉冲式直收（无圆无 morph——连发不闪）
-            self.hide();
-            return;
-        }
-        let em = self.dot_em_px.get();
-        let advance: f32 = commit_text
-            .chars()
-            .map(|ch| {
-                let wide = (ch as u32) >= 0x2E80; // CJK 及全角区
-                if wide { em } else { em * 0.55 }
-            })
-            .sum();
-        let cx2 = cx + advance.round() as i32;
         let dur = if self.dot_mode_cfg.get() == DotMode2::Snap {
             1 // 直切圆（一帧形变）
+        } else if dt_ms < self.dot_rapid_cfg.get() {
+            60 // 连打：快速脉冲形变（不瞬收——防开一关一闪）
         } else if dt_ms < self.dot_fast_cfg.get() {
             self.dot_fast_morph_cfg.get() // 快打=快速形变时长
         } else {
             self.dot_morph_cfg.get() // 慢打=完整
         };
         self.morph_dur.set(dur);
-        if !self.enter_dot(cx2, cy) {
+        if !self.enter_dot(cx, cy) {
             self.hide();
         }
     }
@@ -4260,9 +4251,14 @@ impl CandidateWindowV2 {
             // 边（与 caret 同侧），morph 锚=圆实际显示位（连续性保持）。
             let rw = (r.right - r.left).max(DOT_SIDE as i32);
             let rh = (r.bottom - r.top).max(DOT_SIDE as i32);
+            // 【S6 二修·位置】圆心=光标正下方一行（候选窗出现的位置
+            // ——窗悬在光标下，首行高亮条处）。圆是窗的化身：同点形变
+            // （收场窗→此圆；涌现此圆→窗），不做字宽右移（那会让圆
+            // 和窗变成两个位置的独立元素）。
+            let cy2 = cy + (self.dot_em_px.get() * 1.0) as i32; // 下一行中心
             let ox = (cx - r.left - DOT_SIDE as i32 / 2).clamp(0, rw - DOT_SIDE as i32) as f32;
-            let oy = (cy - r.top - DOT_SIDE as i32 / 2).clamp(0, rh - DOT_SIDE as i32) as f32;
-            // 【S6 修·诊断】圆心定位取证（首 3 次打）
+            let oy = (cy2 - r.top - DOT_SIDE as i32 / 2).clamp(0, rh - DOT_SIDE as i32) as f32;
+            // 【S6 诊断】圆心定位取证（首 3 次打）
             static DOTPOS: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
             if DOTPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
@@ -4489,8 +4485,27 @@ impl CandidateWindowV2 {
         let w_f = self.live_size.get().0.max(DOT_SIDE as i32) as f32;
         let h_f = self.live_size.get().1.max(DOT_SIDE as i32) as f32;
         let r1 = self.last_corner_px.get().clamp(0.0, (w_f.min(h_f)) * 0.5);
-        // from=上次 collapse 的圆盒终态（clip 仍停在那）；to=新面板盒。
-        let from = self.collapse_to.get();
+        // 【S6 二修·连打形变】collapse 进行中被涌现打断（连打脉冲：
+        // 收到一半新键来了）——from 取**当前插值帧**而非圆盒终态，
+        // 形变从中间态无缝反转（不跳变）。
+        let from = match self.collapse_t0.get() {
+            Some(t0) if !self.expand_dir.get() => {
+                let p = (t0.elapsed().as_millis() as f32
+                    / self.morph_dur.get().max(1) as f32)
+                    .clamp(0.0, 1.0);
+                let e = 1.0 - (1.0 - p).powi(3);
+                let f = self.collapse_from.get();
+                let t = self.collapse_to.get();
+                (
+                    f.0 + (t.0 - f.0) * e,
+                    f.1 + (t.1 - f.1) * e,
+                    f.2 + (t.2 - f.2) * e,
+                    f.3 + (t.3 - f.3) * e,
+                    f.4 + (t.4 - f.4) * e,
+                )
+            }
+            _ => self.collapse_to.get(),
+        };
         self.collapse_from.set(from);
         self.collapse_to.set((0.0, 0.0, w_f, h_f, r1));
         self.collapse_t0.set(Some(std::time::Instant::now()));
@@ -4529,11 +4544,11 @@ impl CandidateWindowV2 {
                 let _ = pc.SetBottomRightRadiusY2(rad);
                 let _ = dc.Commit();
             }
-            // dot 渐隐后置（进度 55% 前圆保持全显——「圆变成窗」的
-            // 连续感：圆先陪跑形变大半程，收尾 45% 才淡出，而不是
-            // 从头同步淡出=圆很快没了只剩窗在长）。
+            // dot 渐隐后置（进度 70% 前圆保持全显——「圆变成窗」的
+            // 连续感：用户定稿「是形变不是淡入淡出」——圆陪跑到形变
+            // 大部分完成，收尾 30% 才淡出且极快，形变主导感知）。
             if let Some(gd) = &self.dot_grp {
-                let d = ((e - 0.55) / 0.45).clamp(0.0, 1.0);
+                let d = ((e - 0.7) / 0.3).clamp(0.0, 1.0);
                 let _ = gd.SetOpacity2(1.0 - d);
             }
             if p >= 1.0 {
@@ -4645,8 +4660,8 @@ impl CandidateWindowV2 {
             return true;
         }
         let desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: DOT_SIDE,
-            Height: DOT_SIDE,
+            Width: DOT_SIDE as u32,
+            Height: DOT_SIDE as u32,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC {
@@ -4763,7 +4778,8 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 pub const WM_APP_FADE_TICK: u32 = 0x4949; // "II"
 
 /// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id、morph 时长、tick。
-pub const DOT_SIDE: u32 = 26;
+/// 【S6 二修】圆径 22（用户实测 26 偏大；≈高亮词条高度）。
+pub const DOT_SIDE: i32 = 22;
 pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 pub const DOT_MORPH_MS: u32 = 180;
