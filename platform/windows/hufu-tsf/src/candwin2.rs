@@ -1,4 +1,4 @@
-﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -731,6 +731,13 @@ pub struct CandidateWindowV2 {
     /// 【S5】上次上屏时刻+morph 时长（节奏自适应）。
     last_dot_at: std::cell::Cell<Option<std::time::Instant>>,
     morph_dur: std::cell::Cell<u32>,
+    /// 【S6】皮肤 motion 配置（show 每帧刷新）。
+    dot_mode_cfg: std::cell::Cell<DotMode2>,
+    dot_idle_cfg: std::cell::Cell<u32>,
+    dot_morph_cfg: std::cell::Cell<u32>,
+    dot_fast_morph_cfg: std::cell::Cell<u32>,
+    dot_rapid_cfg: std::cell::Cell<u32>,
+    dot_fast_cfg: std::cell::Cell<u32>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1130,6 +1137,12 @@ impl CandidateWindowV2 {
                 idle_since: std::cell::Cell::new(None),
                 last_dot_at: std::cell::Cell::new(None),
                 morph_dur: std::cell::Cell::new(DOT_MORPH_MS),
+                dot_mode_cfg: std::cell::Cell::new(DotMode2::Morph),
+                dot_idle_cfg: std::cell::Cell::new(DOT_IDLE_MS),
+                dot_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS),
+                dot_fast_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS / 2),
+                dot_rapid_cfg: std::cell::Cell::new(DOT_RAPID_MS),
+                dot_fast_cfg: std::cell::Cell::new(DOT_FAST_MS),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1320,6 +1333,12 @@ impl CandidateWindowV2 {
                 idle_since: std::cell::Cell::new(None),
                 last_dot_at: std::cell::Cell::new(None),
                 morph_dur: std::cell::Cell::new(DOT_MORPH_MS),
+                dot_mode_cfg: std::cell::Cell::new(DotMode2::Morph),
+                dot_idle_cfg: std::cell::Cell::new(DOT_IDLE_MS),
+                dot_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS),
+                dot_fast_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS / 2),
+                dot_rapid_cfg: std::cell::Cell::new(DOT_RAPID_MS),
+                dot_fast_cfg: std::cell::Cell::new(DOT_FAST_MS),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1670,6 +1689,53 @@ impl CandidateWindowV2 {
                 self.dot_argb.set(argb);
             }
         }
+        // 【动效 v4·S6】皮肤 motion 节点（每帧刷新；字段名对齐
+        // hufu-skin::MotionConfig——server 强类型皮肤）。tsf 层传入的
+        // skin 是 IPC 应答根（motion 在 /skin/motion 下）——与顶层
+        // 两形态都认（对齐 anim 的既有约定）：
+        //   mode: "morph"（默认，完整形变）|"snap"（直切圆）|"plain"
+        //         （朴素即隐）；enable=false 等价 plain；
+        //   idle_timeout_ms: 驻留；morph_ms/fast_morph_ms: 形变时长；
+        //   rapid_ms/fast_ms: 节奏阈值；dot_size: 圆径。
+        let mval = |k: &str| -> Option<&serde_json::Value> {
+            skin
+                .pointer(&format!("/motion/{k}"))
+                .or_else(|| skin.pointer(&format!("/skin/motion/{k}")))
+        };
+        let mf = |k: &str, d: f32| -> f32 {
+            mval(k)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(d)
+        };
+        let mode_str = mval("mode").and_then(|v| v.as_str()).unwrap_or("morph");
+        let en = mval("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mode = if !en || mode_str == "plain" {
+            DotMode2::Plain
+        } else if mode_str == "snap" {
+            DotMode2::Snap
+        } else {
+            DotMode2::Morph
+        };
+        // 【S6 诊断】mode 变化打一条（皮肤配置链取证）
+        if self.dot_mode_cfg.replace(mode) != mode {
+            let name = match mode {
+                DotMode2::Morph => "morph",
+                DotMode2::Snap => "snap",
+                DotMode2::Plain => "plain",
+            };
+            crate::tsf::diag_note(&format!("v4皮肤: mode={} en={}", name, en));
+        }
+        self.dot_idle_cfg
+            .set(mf("idle_timeout_ms", DOT_IDLE_MS as f32).max(200.0) as u32);
+        self.dot_morph_cfg
+            .set(mf("morph_ms", DOT_MORPH_MS as f32).max(1.0) as u32);
+        self.dot_fast_morph_cfg
+            .set(mf("fast_morph_ms", (DOT_MORPH_MS as f32 / 2.0)).max(20.0) as u32);
+        self.dot_rapid_cfg
+            .set(mf("rapid_ms", DOT_RAPID_MS as f32).max(50.0) as u32);
+        self.dot_fast_cfg
+            .set(mf("fast_ms", DOT_FAST_MS as f32) as u32);
         // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
         // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
         // 或别的 SetWindowPos 直调）。
@@ -4109,22 +4175,33 @@ impl CandidateWindowV2 {
 
     /// 上屏收场入口（tsf 层调）：DComp 树可用→转圆驻留；否则普通 hide。
     /// 【S5 节奏自适应】以两次上屏间隔分流（hide_as_dot 即上屏时刻）：
-    /// 连打（<600ms）不冒圆直收（流畅优先）；快打（<1.5s）快速 morph
-    /// 90ms；慢打完整 morph 180ms。
+    /// 连打（<rapid_ms）不冒圆直收；快打（<fast_ms）快速 morph；
+    /// 慢打完整 morph。【S6】皮肤 motion.mode 覆盖：plain=朴素即隐，
+    /// snap=直切圆（一帧形变）。
     pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
+        if self.dot_mode_cfg.get() == DotMode2::Plain {
+            self.hide();
+            return;
+        }
         let now = std::time::Instant::now();
         let dt_ms = self
             .last_dot_at
             .replace(Some(now))
             .map(|t| now.duration_since(t).as_millis() as u32)
             .unwrap_or(u32::MAX);
-        if dt_ms < DOT_RAPID_MS {
+        if dt_ms < self.dot_rapid_cfg.get() {
             // 连打：脉冲式直收（无圆无 morph——连发不闪）
             self.hide();
             return;
         }
-        self.morph_dur
-            .set(if dt_ms < DOT_FAST_MS { 90 } else { DOT_MORPH_MS });
+        let dur = if self.dot_mode_cfg.get() == DotMode2::Snap {
+            1 // 直切圆（一帧形变）
+        } else if dt_ms < self.dot_fast_cfg.get() {
+            self.dot_fast_morph_cfg.get() // 快打=快速形变时长
+        } else {
+            self.dot_morph_cfg.get() // 慢打=完整
+        };
+        self.morph_dur.set(dur);
         if !self.enter_dot(cx, cy) {
             self.hide();
         }
@@ -4452,7 +4529,7 @@ impl CandidateWindowV2 {
             && self
                 .idle_since
                 .get()
-                .map(|t| t.elapsed().as_millis() as u32 >= DOT_IDLE_MS)
+                .map(|t| t.elapsed().as_millis() as u32 >= self.dot_idle_cfg.get())
                 .unwrap_or(false)
     }
 
@@ -4635,6 +4712,13 @@ pub const DOT_MORPH_MS: u32 = 180;
 pub const DOT_TICK_MS: u32 = 16;
 pub const DOT_FADE_MS: u32 = 200;
 /// 【S5】节奏阈值：连打 <600ms 直收；快打 <1.5s 快速 morph 90ms。
+/// 【S6】收场方案（皮肤 motion.mode）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DotMode2 {
+    Morph,
+    Snap,
+    Plain,
+}
 pub const DOT_RAPID_MS: u32 = 600;
 pub const DOT_FAST_MS: u32 = 1500;
 

@@ -387,6 +387,12 @@ pub struct MotionConfig {
     /// S1 小圆颜色（#RRGGBBAA；空=皮肤高亮色。浅色皮肤高亮近白，
     /// 白底宿主上小圆不可见——显式给深色夺回可见性）。
     pub dot_color: String,
+    /// 【动效 v4·S6】收场方案："morph"（完整形变，默认）|"snap"
+    /// （直切圆）|"plain"（朴素即隐）。enable=false 等价 plain。
+    pub mode: String,
+    /// 【S5】节奏阈值：连打 <rapid_ms 直收；快打 <fast_ms 快速形变。
+    pub rapid_ms: f64,
+    pub fast_ms: f64,
 }
 
 impl Default for MotionConfig {
@@ -399,6 +405,9 @@ impl Default for MotionConfig {
             fast_morph_ms: 90.0,
             fade_ms: 300.0,
             dot_color: String::new(),
+            mode: "morph".into(),
+            rapid_ms: 600.0,
+            fast_ms: 1500.0,
         }
     }
 }
