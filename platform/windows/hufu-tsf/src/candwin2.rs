@@ -1,4 +1,4 @@
-﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -550,24 +550,13 @@ pub struct CandidateWindowV2 {
     visual: Option<IDCompositionVisual>,
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
-    /// 【八十三修·动效重做 v1 2026-09-14】形态动效总控（S0 隐匿/
-    /// S1 光标点/S3 候选框）。v1 消费链：皮肤 motion.enable 开启后，
-    /// 上屏断段不再直接收窗——收场形变为 S1 小圆（高亮色）驻留，
-    /// idle 超时淡出隐藏；A 态渲染照旧（涌现 morph 为 v2）。
-    pub(crate) motion: crate::motion::Motion,
-    /// S1 驻留中最近一次锚点（小圆位置——上屏后光标处）。
-    dot_at: (i32, i32),
-    /// 小圆颜色（ARGB，皮肤高亮色，show_dot 前刷新）。
-    dot_argb: u32,
-    /// 【八十三修 v2】morph 飞行中的壳圆角覆盖（逻辑 px；None=皮肤值）。
+    /// 【拉伸动效遗留】morph 时期的壳圆角覆盖。现仅保留结构位（恒
+    /// None），入场/尺寸动画不消费。
     corner_override: std::cell::Cell<Option<f32>>,
-    /// 【八十三修 v2】morph 飞行中的内容透明度（壳/内容错峰——内容
-    /// 绘制段整体 PushLayer 乘此值；稳态 1.0 零开销）。
+    /// 【拉伸动效遗留】内容透明度覆盖（绘制段整体 PushLayer 乘此值；
+    /// 稳态 1.0 零开销）。
     content_alpha: std::cell::Cell<f32>,
-    /// 【八十三修 v2b】收场 morph 重绘快照：断段后 g.last_show 已清，
-    /// S3→S1 缩回飞行期间用最近一帧完整渲染参数（候选/编码/皮肤）
-    /// 逐帧重绘收缩中的壳（内容淡出+壳缩回小圆）。上屏断段的
-    /// hide_to_motion 装载；飞行完成/外部隐藏时清。
+    /// 【拉伸动效遗留】断段后重绘快照（最近一帧完整渲染参数）。
     last_draw: Option<(Vec<(String, String)>, String, usize, serde_json::Value)>,
     /// 【ULW 模式 2026-09-11】owned 窗（打包宿主）不走 DComp 呈现：
     /// D2D 照画到离屏位图（WARP 软件），每帧读回 → DIB →
@@ -692,7 +681,6 @@ pub struct CandidateWindowV2 {
     /// 【v3.1】dwell 期 buffer 被 ResizeBuffers 缩到 side——回面板渲染
     /// 时 ensure_swapchain_dcomp 必须强制重建（self.size 是 alloc 口径
     /// 发现不了 shrink）。
-    pub(crate) dot_shrunk: std::cell::Cell<bool>,
     /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
     pub(crate) last_show_at: Option<std::time::Instant>,
     /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
@@ -982,9 +970,6 @@ impl CandidateWindowV2 {
                 visual: Some(visual),
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
-                motion: crate::motion::Motion::new(),
-                dot_at: (0, 0),
-                dot_argb: 0xFF404046,
                 corner_override: std::cell::Cell::new(None),
                 content_alpha: std::cell::Cell::new(1.0),
                 last_draw: None,
@@ -1017,7 +1002,6 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
-                dot_shrunk: std::cell::Cell::new(false),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
@@ -1155,9 +1139,6 @@ impl CandidateWindowV2 {
                 visual: None,
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
-                motion: crate::motion::Motion::new(),
-                dot_at: (0, 0),
-                dot_argb: 0xFF404046,
                 corner_override: std::cell::Cell::new(None),
                 content_alpha: std::cell::Cell::new(1.0),
                 last_draw: None,
@@ -1190,7 +1171,6 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
-                dot_shrunk: std::cell::Cell::new(false),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
@@ -1425,15 +1405,7 @@ impl CandidateWindowV2 {
         // 全不透明才「唤醒」）——收起→展开、连打变宽全中招。缓冲大
         // 于窗口的部分由 DWM 按窗口裁剪（旧帧残留实验已证）。
         // 代价：单窗 VRAM 上限 ~4MB（1024²×2buf×4B），可忽略。
-        //
-        // 【v3.1 dwell 缩窗返回修复】render_dot 曾把 buffer ResizeBuffers
-        // 到 26px 而 self.size 仍记旧 alloc 值——涌现回面板时下方 grow
-        // 检查（w<=self.size）误判"已够大"直接 return：26px buffer 被
-        // 拉伸进 206px 窗=候选内容废掉（用户实锤「看不到候选框，红色
-        // 元素跳几下但最终没变成候选框」）。dot_shrunk 标志强制走重建。
-        if self.dot_shrunk.get() {
-            self.dot_shrunk.set(false);
-        } else if self.swapchain.is_some()
+        if self.swapchain.is_some()
             && w <= self.size.0 as u32
             && h <= self.size.1 as u32
         {
@@ -2208,21 +2180,12 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
-        // 【八十三修 v2】motion 皮肤注入+涌现 morph 接管（飞行中壳
-        // 尺寸/圆角/内容透明度=插值；非飞行=皮肤值直通）。放在布局
-        // 定型后（w_out/h_out/radius 就绪）。呼吸/淡出参数由皮肤
-        // motion 节控制（缺省 enabled=false：不开不扰动现有动效）。
-        self.motion_note_show(skin, w_out as f32, h_out as f32, radius, dpi_scale);
-        // 【八十三修 v2】morph 飞行中的圆角覆盖（小圆态→皮肤值插值）
-        let radius = self.corner_override.get().unwrap_or(radius);
         // 【拉伸动效 2026-09-11】渲染前判定（仅真实内容更新/展开帧——
         // 内部 tick 复渲染与回读取证帧不重臂）：宽高变化超阈值 → 启动/
         // 重定尺寸动画；此后每 tick 由 fade_tick_shared 以「当前插值
         // 尺寸」重绘外壳（背景/边框/阴影跟着边缘拉过去=延伸感），内容
         // 按目标布局裁在外壳内。
-        // 【八十三修 v2】morph 飞行中尺寸动画由 motion 主管（壳=形态
-        // 插值）——本判定整体跳过，防双动画/覆盖竞态。
-        if !self.internal_rerender && !(self.motion.enabled && self.motion.in_flight()) {
+        if !self.internal_rerender {
             let target = (w_out as i32, h_out as i32);
             let cur = match self.size_anim {
                 Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
@@ -2315,10 +2278,6 @@ impl CandidateWindowV2 {
         // 盒]：高亮贴左/贴顶（横紧首候选、竖排首行）→ 盒贴对应边缘
         // 就地生长（左/上无内容不空跳）；高亮居中 → 对称展开。damp 随
         // 进度归零，完成帧=整窗。普通尺寸动效/稳态 bx=by=0。
-        // 【八十三修 v2】morph 飞行同款锚定：涌现时小圆→面板从高亮
-        // 中心生长（小圆驻留位≈光标≈首候选高亮处，视觉连续）；收场
-        // 反向缩回。进度=flight 插值（motion_note_show 已采样本帧）。
-        let morph_flight = self.motion.enabled && self.motion.in_flight();
         let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
@@ -2328,16 +2287,6 @@ impl CandidateWindowV2 {
                 None => 1.0,
             };
             let damp = 1.0 - k;
-            (
-                (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
-                (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
-            )
-        } else if morph_flight {
-            // morph：壳盒当前占窗比例=插值尺寸/目标尺寸 → damp=1-比例
-            let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
-            let fw = (chw / width.max(1.0)).clamp(0.0, 1.0);
-            let fh = (chh / height.max(1.0)).clamp(0.0, 1.0);
-            let damp = 1.0 - ((fw + fh) * 0.5);
             (
                 (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
                 (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
@@ -3957,20 +3906,6 @@ impl CandidateWindowV2 {
 
 
     pub fn hide(&mut self) {
-        // 【八十三修 v3·根治】motion 收场链活跃（S1 小圆驻留/飞行）时
-        // hide() 让位为 no-op——不再逐调用点围堵（suppress 两处修后仍
-        // 有第三处在 motion 活跃时调 hide：实机 hide消息×N 连环，调用
-        // 点分散在 poll/焦点/收尾多条链）。小圆的生命周期由 motion 自
-        // 管（驻留超时→淡出→自行 hide）。真隐藏场景（失焦切窗/
-        // OnDeactivate/宿主隐身/用户指令）调 force_hide()。
-        if self.motion.enabled && (self.motion.is_dot_dwell() || self.motion.in_flight()) {
-            crate::tsf::diag_note("motion网: hide()让位(motion活跃)");
-            return;
-        }
-        // 【八十三修 v1】普通 hide 路径=真隐藏（失焦/宿主切换/收窗兜底）
-        // ——motion 状态机同步归零（若正处于 S1 驻留，小圆一并消失）。
-        // 上屏断段的「收场形变为小圆」不走这里，走 hide_to_motion。
-        self.motion.on_external_hide();
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -3988,657 +3923,6 @@ impl CandidateWindowV2 {
         unsafe {
             let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
-    }
-
-    /// 【八十三修 v3】强制隐藏（无视 motion 驻留）：失焦切窗/
-    /// OnDeactivate（输入法停用）/宿主隐身/用户指令（隐藏候选）等
-    /// 真隐藏语义。motion 状态机归零+异步 SW_HIDE（防焦点临界区
-    /// 死锁路径同 hide()）。
-    pub fn force_hide(&mut self) {
-        // 【八十三修·v3 诊断】force 调用点名（×7 连发元凶定位）
-        crate::tsf::diag_note("motion网: force_hide被调");
-        self.motion.on_external_hide();
-        self.last_draw = None;
-        self.pos_anim = None;
-        // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
-        // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
-        // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
-        // 用时沿用近处而非瞬移屏幕中下（清掉它正是「时不时跳到屏幕
-        // 中下方」的病根）。
-        // 【位置滑动】收窗即作废位置动效（下个组段首显瞬移新位）
-        self.pos_anim = None;
-        // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
-        // ——下一组段恢复跟随 caret。
-        self.sticky_drag = false;
-        // 【绝不同步 ShowWindow】焦点回调（OnSetFocus）里同步 SW_HIDE
-        // 与 MSCTF/Chromium 焦点临界区死锁——VSCode 点击冻结事故实锤
-        // （栈：OnSetFocus → ShowWindow 永不返回）。改为 PostMessage
-        // 排队，焦点回调返回后由消息循环执行隐藏。
-        unsafe {
-            let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
-        }
-    }
-
-    /// 【焦点重置·三十三修】跨焦点（切窗口/切应用）时抹掉候选窗的全部
-    /// 位置记忆——用户定稿「换到另一个窗口就是一个新的开始，上一个窗
-    /// 口的遗留残留记忆全部抹掉」。hide() 故意保留 sticky_pos（同窗口
-    /// 组段间位置连续性），焦点切换时必须清：新窗口锚点全空时若沿用
-    /// 旧 sticky，候选会出现在上一个窗口的位置（「从别的窗口过来」
-    /// 观感的实体根源）。cloaked_streak 同清（cloak 计数不跨焦点）。
-    pub fn focus_reset(&mut self) {
-        self.sticky_pos = None;
-        self.sticky_drag = false;
-        self.pos_anim = None;
-        self.cloaked_streak = 0;
-        // 跨焦点=全新开始：S1 驻留小圆一并终止（下个窗口新起）。
-        self.motion.on_external_hide();
-    }
-
-    // ══════════ 【八十三修·动效重做 v1】S1 小圆链 ══════════
-
-    /// 上屏断段的收场入口：motion.enable 开启（且面板当前在屏）时
-    /// 不收窗——收场 morph（S3→S3 小圆：壳缩小+圆角变大、内容淡出、
-    /// 窗位滑到上屏后光标处）→ S1 小圆驻留 → idle 超时淡出隐藏；
-    /// 【八十三修 v3】窗当前屏幕左上角（poll 收场兜底的 dot 锚回退：
-    /// caret 不可得时用窗自身位置，小圆落在候选框原位附近）。
-    pub fn window_topleft(&self) -> Option<(i32, i32)> {
-        let mut r = windows::Win32::Foundation::RECT::default();
-        unsafe {
-            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut r).is_ok() {
-                Some((r.left + 12, (r.top + r.bottom) / 2))
-            } else {
-                None
-            }
-        }
-    }
-
-    /// 否则回落普通 hide()。面板从未在屏（单键顶屏直上屏等）不冒
-    /// 小圆——凭空出现一个点比没有更怪。快打（Pulse 画像）时
-    /// on_collapse 内部不进 Dot——v2 渲染层照旧收窗（脉冲 v3）。
-    pub fn hide_to_motion(&mut self, cx: i32, cy: i32) {
-        // 【v2 起 owned/ULW 窗同样支持 motion】（render_dot 双呈现路径）
-        if !self.motion.enabled
-            || !unsafe { IsWindowVisible(self.hwnd).as_bool() }
-        {
-            // 【八十三修·v1 诊断】收场回落普通 hide 的原因实证
-            crate::tsf::diag_note(&format!(
-                "motion收场回落: enabled={} ulw={} visible={} cx={cx} cy={cy}",
-                self.motion.enabled,
-                self.ulw,
-                unsafe { IsWindowVisible(self.hwnd).as_bool() },
-            ));
-            self.hide();
-            return;
-        }
-        let now = std::time::Instant::now();
-        if self.motion.is_dot_dwell() && !self.motion.in_flight() {
-            // 已在驻留中再次断段（罕见）：小圆挪到新锚点。
-            self.dot_at = (cx, cy);
-            // 【v3.1】alpha 取本帧 shell（fade 期渐暗值）而非硬编码
-            // 1.0——poll 周期重画曾把淡出中的圆反复拉回全亮。
-            let shell = self.motion.sample(now).form.shell;
-            unsafe { self.render_dot(shell) };
-            return;
-        }
-        self.motion.on_collapse(now);
-        if self.motion.is_dot_dwell() {
-            crate::tsf::diag_note(&format!(
-                "motion收场进入dot: ({cx},{cy}) flight={}",
-                self.motion.in_flight()
-            ));
-            self.pos_anim = None;
-            self.sticky_drag = false;
-            self.size_anim = None;
-            self.chrome_override.set(None);
-            self.scale_in.set(false);
-            self.dot_at = (cx, cy);
-            if self.motion.in_flight() {
-                // 【v2b 收场 morph 起臂】窗位滑动：面板位→小圆位
-                //（pos_anim 由 motion_tick 推进——断段后主 tick 链无
-                // last_show 不跑 pos 分支）；壳尺寸/圆角/内容淡出=形态
-                // 插值（show 内 motion_note_show 采样接管）。
-                unsafe {
-                    let mut rc = windows::Win32::Foundation::RECT::default();
-                    let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(
-                        self.hwnd,
-                        &mut rc,
-                    );
-                    let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32
-                        / 96.0;
-                    let side =
-                        ((self.motion.dot_size.max(6.0) + 12.0) * dpi).ceil() as i32;
-                    let to = (cx - side / 2, cy - side / 2);
-                    let dur = self.motion.fast_ms.max(30);
-                    self.pos_anim =
-                        Some(((rc.left, rc.top), to, std::time::Instant::now(), dur));
-                }
-                self.motion_tick();
-            } else {
-                unsafe { self.render_dot(1.0) };
-            }
-            // 【八十三修·v2 诊断】tick 链实证：SetTimer 返回值（0=失败）
-            let tid = unsafe { SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None) };
-            crate::tsf::diag_note(&format!(
-                "motion收场挂timer: SetTimer={tid:?} flight={} dwell={}",
-                self.motion.in_flight(),
-                self.motion.is_dot_dwell()
-            ));
-        } else {
-            // 【八十三修·v1 诊断】on_collapse 未进 Dot（Pulse 画像——
-            // 2s 内 ≥6 次收场）——v1 照旧收窗
-            crate::tsf::diag_note("motion收场Pulse: 不进小圆直接hide");
-            self.hide();
-        }
-    }
-
-    /// S1 小圆渲染（v1：无阴影无呼吸——v2 接管）。alpha=整帧透明度
-    /// （超时淡出用）。双呈现路径：DComp 主窗（swapchain 直呈）/
-    /// owned 打包宿主窗（WARP offscreen→读回→ULW——Store 记事本等
-    /// 打包沙盒是小圆的主要测试场，v2 起同样支持 motion）。
-    unsafe fn render_dot(&mut self, alpha: f32) {
-        use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_PROPERTIES1, D2D1_BRUSH_PROPERTIES};
-        use windows::Win32::Graphics::Dxgi::IDXGISurface;
-
-        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
-        let d = (self.motion.dot_size.max(6.0) * dpi).ceil() as i32;
-        let margin = (6.0 * dpi).ceil() as i32;
-        let side = d + margin * 2;
-        if !self.ensure_swapchain(side as u32, side as u32) {
-            crate::tsf::diag_note(&format!("motion圆: ensure_swapchain失败 side={side}"));
-            return;
-        }
-        // ── ULW（owned 打包窗）：offscreen 画圆 → present_ulw ──
-        //（ULW 窗尺寸=UpdateLayeredWindow 的 psize——present_ulw(side)
-        // 即完成缩窗；SWP 只挪位置。物理坐标直画（无 dpi 变换）。）
-        if self.ulw {
-            let (Some(ctx), Some(off)) = (self.ctx.clone(), self.offscreen.clone()) else {
-                crate::tsf::diag_note("motion圆: ulw ctx/off缺");
-                return;
-            };
-            let x = self.dot_at.0 - side / 2;
-            let y = self.dot_at.1 - side / 2;
-            let _ = SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            ctx.SetTarget(&off);
-            let _ = ctx.BeginDraw();
-            // 【v3】同 DComp 分支：清主路径遗留 transform（防圆画到 buffer 外）
-            ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: 1.0,
-                M12: 0.0,
-                M21: 0.0,
-                M22: 1.0,
-                M31: 0.0,
-                M32: 0.0,
-            });
-            ctx.Clear(Some(&windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-            let c = self.dot_argb;
-            // 【八十三修 v3】alpha 下限=dot_alpha：皮肤高亮色常带 0.28
-            // 级低 alpha（樱色/墨岩实测），直用则 14px 圆淡成 1-2px 白点
-            // 观感（用户实锤）。小圆需要醒目：max(皮肤alpha, dot_alpha)。
-            let aa = (((c >> 24) & 0xFF) as f32 / 255.0).max(self.motion.dot_alpha);
-            let (rr, gg, bb) = (
-                ((c >> 16) & 0xFF) as f32 / 255.0,
-                ((c >> 8) & 0xFF) as f32 / 255.0,
-                (c & 0xFF) as f32 / 255.0,
-            );
-            let color = windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
-                r: rr,
-                g: gg,
-                b: bb,
-                a: aa * alpha.clamp(0.0, 1.0),
-            };
-            if let Ok(brush) =
-                ctx.CreateSolidColorBrush(&color, Some(&D2D1_BRUSH_PROPERTIES::default()))
-            {
-                let cx = side as f32 / 2.0;
-                let rad = d as f32 / 2.0;
-                ctx.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: cx - rad,
-                            top: cx - rad,
-                            right: cx + rad,
-                            bottom: cx + rad,
-                        },
-                        radiusX: rad,
-                        radiusY: rad,
-                    },
-                    &brush,
-                );
-            }
-            let _ = ctx.EndDraw(None, None);
-            ctx.SetTarget(None);
-            self.present_ulw(side, side);
-            dot_diag_once(self, side, alpha);
-            return;
-        }
-        // ── DComp 主窗：swapchain 后台缓冲画圆 → Present ──
-        let (Some(ctx), Some(chain)) = (self.ctx.clone(), self.swapchain.clone()) else {
-            crate::tsf::diag_note("motion圆: ctx/swapchain缺");
-            return;
-        };
-        // 【八十三修 v3·圆尺寸修复】grow-only swapchain 在面板→小圆缩窗
-        // 后 buffer 仍是面板尺寸（如 206px）——Present 会把大 buffer 整体
-        // 缩到 26px 窗，圆半径同步缩成 ~1.8px（「白点只有 1-2 像素」的
-        // DComp 根因）。dwell 渲染前 ResizeBuffers 到 side 方可 1:1。
-        {
-            let desc = chain.GetDesc1();
-            if let Ok(d) = desc.as_ref() {
-                if d.Width != side as u32 || d.Height != side as u32 {
-                    ctx.SetTarget(None);
-                    let hr = chain.ResizeBuffers(
-                        0,
-                        side as u32,
-                        side as u32,
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                        windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0),
-                    );
-                    let after = chain.GetDesc1();
-                    let aw = after.as_ref().map(|x| x.Width).unwrap_or(0);
-                    let hrv: i32 = match &hr {
-                        Ok(_) => 0,
-                        Err(e) => e.code().0,
-                    };
-                    crate::tsf::diag_note(&format!(
-                        "motion圆: resize {}→{side} hr=0x{:08X} 实际={aw}",
-                        d.Width, hrv as u32
-                    ));
-                    // 【v3.1】部分驱动在 ResizeBuffers 后 DComp visual 的
-                    // content 绑定失效（窗可见但内容全透明）——re-attach +
-                    // Commit 恢复树。仅 resize 那一帧执行，开销 µs 级。
-                    if let (Some(v), Some(dc)) = (&self.visual, &self.dcomp) {
-                        let _ = v.SetContent(&chain);
-                        let _ = dc.Commit();
-                        crate::tsf::diag_note("motion圆: re-attach+Commit 完成");
-                    }
-                    // 【v3.1】置 shrink 标志：ensure_swapchain_dcomp 的
-                    // grow 检查看 self.size（alloc 口径）发现不了 buffer
-                    // 已缩——回面板渲染必须强制重建（否则 26px buffer
-                    // 拉伸进 206px 窗，候选内容废）。
-                    self.dot_shrunk.set(true);
-                }
-            }
-        }
-        // 窗口缩小到圆位（居中于锚点；swapchain grow-only 不缩缓冲）
-        let x = self.dot_at.0 - side / 2;
-        let y = self.dot_at.1 - side / 2;
-        let _ = SetWindowPos(
-            self.hwnd,
-            HWND_TOPMOST,
-            x,
-            y,
-            side,
-            side,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-        let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
-                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            // 【八十三修 v3】与主渲染路径（2385）完全同款：TARGET|
-            // CANNOT_DRAW + ManuallyDrop；且必须 GetCurrentBackBufferIndex
-            //（FLIP 双缓冲轮转，恒画 0=画进正在显示的缓冲）。
-            bitmapOptions: windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_TARGET
-                | windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            colorContext: std::mem::ManuallyDrop::new(None),
-        };
-        let bb_index = match chain.cast::<windows::Win32::Graphics::Dxgi::IDXGISwapChain3>() {
-            Ok(c3) => c3.GetCurrentBackBufferIndex(),
-            Err(_) => 0,
-        };
-        let Ok(buf) = chain.GetBuffer::<IDXGISurface>(bb_index) else {
-            crate::tsf::diag_note("motion圆: GetBuffer失败");
-            return;
-        };
-        let Ok(bitmap) = ctx.CreateBitmapFromDxgiSurface(&buf, Some(&props)) else {
-            crate::tsf::diag_note("motion圆: Bitmap包装失败");
-            return;
-        };
-        ctx.SetTarget(&bitmap);
-        ctx.BeginDraw();
-        // 【八十三修 v3·Clear 大法定稿】A/B 实证矩阵：Clear 直写 target
-        // 100% 上屏（红块 677px）；Fill 系（FillRectangle/FillRounded/
-        // brush 全部）在该 ctx 上视觉无效（同帧绿 FillRect 于红 Clear
-        // 上零显示）——与 transform/brush/color 无关的 Fill 链路故障。
-        // 故弃 Fill：圆色整体 Clear + DComp visual 圆形 clip（clip 在
-        // 合成层做，不依赖 D2D 绘制状态）。Clear 不受 transform 影响。
-        let c = self.dot_argb;
-        let aa = (((c >> 24) & 0xFF) as f32 / 255.0).max(self.motion.dot_alpha);
-        // 【v3.1 诊断】fade 帧实收 alpha（一次性）——fade 计算链是否
-        // 到达渲染的判定证据。
-        {
-            static FADE_P: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if alpha < 0.995 && !FADE_P.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::tsf::diag_note(&format!(
-                    "motion圆: fade首帧 alpha={alpha:.3}（应≈0.9x 渐降）"
-                ));
-            }
-        }
-        // 【v3.1 premultiplied 修复】swapchain 是 PREMULTIPLIED 格式，
-        // Clear 直写像素不帮你乘 alpha——之前 alpha 降了但 RGB 满值，
-        // 视觉恒不透明（fade 无渐隐、idle 后瞬变消失——用户实锤+圆心
-        // RGB 恒 (232,85,122) 实证）。手动预乘：显示色=目标色×alpha。
-        let a_eff = (aa * alpha.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        ctx.Clear(Some(
-            &windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
-                r: ((c >> 16) & 0xFF) as f32 / 255.0 * a_eff,
-                g: ((c >> 8) & 0xFF) as f32 / 255.0 * a_eff,
-                b: (c & 0xFF) as f32 / 255.0 * a_eff,
-                a: a_eff,
-            },
-        ));
-        // DComp 圆形 clip：rect=圆的外接矩形（不是全窗！全窗+radius
-        // 只出圆角方块——用户实锤「红色小方块不是圆」）。圆心=窗中心，
-        // 半径=rad；Clear 填的圆色只在 clip 内可见。
-        if let (Some(dc), Some(visual)) = (&self.dcomp, &self.visual) {
-            if let Ok(clip) = dc.CreateRectangleClip() {
-                let cx = side as f32 / 2.0;
-                let cy = side as f32 / 2.0;
-                let rad = d as f32 / 2.0;
-                unsafe {
-                    let _ = clip.SetLeft2(cx - rad);
-                    let _ = clip.SetTop2(cy - rad);
-                    let _ = clip.SetRight2(cx + rad);
-                    let _ = clip.SetBottom2(cy + rad);
-                    let _ = clip.SetTopLeftRadiusX2(rad);
-                    let _ = clip.SetTopLeftRadiusY2(rad);
-                    let _ = clip.SetBottomRightRadiusX2(rad);
-                    let _ = clip.SetBottomRightRadiusY2(rad);
-                    let _ = visual.SetClip(&clip);
-                    let _ = dc.Commit();
-                }
-            }
-        }
-        let ed = ctx.EndDraw(None, None);
-        ctx.SetTarget(None);
-        drop(bitmap);
-        drop(buf);
-        let hr = chain.Present(1, DXGI_PRESENT(0));
-        // 【v3】EndDraw/Present 静默错误仅一次性打点（曾经的全量探针
-        // 每帧刷屏，收敛为 ONCE）。
-        {
-            static ONCE2: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            let bad = ed.is_err() || hr.is_err();
-            if bad
-                && !ONCE2.swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                crate::tsf::diag_note(&format!(
-                    "motion圆: 画链异常 End={:?} Present=0x{:08X}",
-                    ed.as_ref().map(|_| ()).map_err(|e| e.code().0),
-                    hr.0 as u32
-                ));
-            }
-        }
-        // 【v3】DComp 内容帧的显式提交（树刷新）——多数驱动 Present 即
-        // 可，个别组合时序下需要 Commit 兜底。每帧 µs 级。
-        if let Some(dc) = &self.dcomp {
-            let _ = dc.Commit();
-        }
-        dot_diag_once(self, side, alpha);
-        let _ = hr;
-    }
-
-    /// 【八十三修 v2】motion tick：收场 morph（S3→S1 飞行：快照重绘
-    /// +窗位滑动）与 S1 驻留/淡出的重绘推进。fade_tick_shared 前置
-    /// 分支调用；返回 true=仍在 motion 动画中（继续 tick+面板链跳过），
-    /// false=motion 链结束（隐藏/静止）。
-    pub(crate) fn motion_tick(&mut self) -> bool {
-        if !self.motion.enabled {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        // 【八十三修·v2 诊断】motion_tick 分支实证（首条）
-        static M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let m = M.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if m == 0 {
-            crate::tsf::diag_note(&format!(
-                "motion_tick首达: flight={} dwell={} last_draw={}",
-                self.motion.in_flight(),
-                self.motion.is_dot_dwell(),
-                self.last_draw.is_some()
-            ));
-        }
-        // ── 收场飞行（dest=Dot 且 flight 活跃）：快照重绘收缩壳 ──
-        if self.motion.in_flight() && self.motion.is_dot_dwell() {
-            // 【八十三修·v2 诊断】飞行进度采样（首条+每 8 条）
-            static F: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let f = F.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if f < 24 {
-                crate::tsf::diag_note(&format!(
-                    "motion飞行#{f}: w={:.0} shell={:.2} last_draw={}",
-                    self.motion.sample(now).form.w,
-                    self.motion.sample(now).form.shell,
-                    self.last_draw.is_some()
-                ));
-            }
-            // 【v3.1 形变衔接】飞行末段（progress≥0.7：窗已缩到 ~40px、
-            // 内容已错峰淡出）直接切 render_dot——红圆在收缩末段显现，
-            // 替代「浅色快照块→红圆」的落定帧颜色跳变（用户实锤「红
-            // 色小方块突然出现、没有形变过程」）。
-            if self.motion.sample(now).progress >= 0.7 {
-                // 窗位滑动推进（断段后主 tick 链不跑 pos 分支）
-                if let Some((f, t, t0, dur)) = self.pos_anim {
-                    let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
-                    if cur == t {
-                        self.pos_anim = None;
-                    }
-                    unsafe {
-                        let _ = SetWindowPos(
-                            self.hwnd,
-                            HWND_TOPMOST,
-                            cur.0,
-                            cur.1,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
-                }
-                self.last_draw = None;
-                unsafe {
-                    self.render_dot(1.0);
-                }
-                let _ = self.motion.tick(now);
-                return true;
-            }
-            // 窗位滑动推进（断段后主 tick 链不跑 pos 分支）
-            if let Some((f, t, t0, dur)) = self.pos_anim {
-                let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
-                if cur == t {
-                    self.pos_anim = None;
-                }
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        HWND_TOPMOST,
-                        cur.0,
-                        cur.1,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
-            }
-            if let Some((cands, raw, sel, skin)) = self.last_draw.take() {
-                self.internal_rerender = true;
-                let _ = self.show(&cands, &raw, &skin, None, sel);
-                self.internal_rerender = false;
-                self.last_draw = Some((cands, raw, sel, skin));
-            }
-            let _ = self.motion.tick(now);
-            return true;
-        }
-        // ── 飞行刚完成：落定小圆渲染（清快照）──
-        if self.motion.is_dot_dwell() && !self.last_draw.is_none() {
-            self.last_draw = None;
-            self.pos_anim = None;
-        }
-        // ── S1 驻留/超时淡出 ──
-        if self.motion.is_dot_dwell() {
-            let frame = self.motion.sample(now);
-            // 【v3.1 诊断】dwell 帧 shell 演化（前 3+每 60 帧采样——fade
-            // 期 shell 是否真的在降的判定证据）
-            {
-                static DW: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let dw = DW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if dw < 3 || dw % 60 == 0 {
-                    crate::tsf::diag_note(&format!(
-                        "dwell#{dw}: shell={:.3} visible={}",
-                        frame.form.shell, frame.visible
-                    ));
-                }
-            }
-            if !frame.visible {
-                // 淡出完成：收窗（异步 hide 防死锁路径同 hide()）
-                unsafe {
-                    let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
-                }
-                return false;
-            }
-            unsafe {
-                self.render_dot(frame.form.shell);
-            }
-            // 【八十三修 v3·修A】驻留静止期（无 flight/pulse/未超时）
-            // motion.tick 返回 Some(false)——此前原样透传导致
-            // fade_tick_shared 判 anim_done→KillTimer→超时淡出检测
-            // 死亡，小圆永久滞留。驻留期必须保持 tick 链存活直到淡出
-            // 完成（is_dot_dwell 转 Hidden 才 false）。
-            let _ = self.motion.tick(now);
-            return true;
-        }
-        false
-    }
-
-    /// motion 皮肤参数注入+涌现记录（show() 每帧调）。
-    /// v2：飞行中（涌现/收场 morph）时接管三组渲染参数——
-    /// chrome_override（壳物理尺寸=插值）、corner_override（壳圆角=
-    /// 插值：小圆态=半宽、面板态=皮肤值）、content_alpha（内容错峰
-    /// 淡入/淡出）；非飞行帧全部还原（皮肤值直通）。
-    /// internal_rerender 帧（tick 复渲染，含收场 morph 重绘）只采样
-    /// 不 emerge——收场飞行中误调 on_emerge 会把目标改回面板。
-    pub(crate) fn motion_note_show(&mut self, skin: &Value, w: f32, h: f32, corner: f32, dpi: f32) {
-        self.motion.apply_skin(skin);
-        if !self.motion.enabled {
-            self.corner_override.set(None);
-            self.content_alpha.set(1.0);
-            return;
-        }
-        // 【八十三修·v1 诊断】motion 皮肤链实证（进程首帧打一次）
-        static SEEN: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let has_node = skin.pointer("/skin/motion").is_some()
-                || skin.pointer("/motion").is_some();
-            crate::tsf::diag_note(&format!(
-                "motion皮肤链: enable已通 dot={} idle={}ms 皮肤json含motion节={}",
-                self.motion.dot_size, self.motion.idle_ms, has_node
-            ));
-        }
-        // 小圆色=皮肤高亮色（双形态：管道 {skin:{colors:...}} / 顶层
-        // 平铺；与 parse_hex/color_f 同源语义，RGB+FF）
-        let hi = skin
-            .pointer("/skin/colors/hilited_candidate_back_color")
-            .or_else(|| skin.pointer("/colors/hilited_candidate_back_color"))
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                skin.get("skin")
-                    .or_else(|| Some(skin))
-                    .and_then(|s| s.get("colors"))
-                    .and_then(|c| c.get("hilited_candidate_back_color"))
-                    .and_then(|v| v.as_str())
-            });
-        if let Some(rgb) = hi.and_then(parse_hex) {
-            self.dot_argb = ((rgb[3] as u32) << 24)
-                | ((rgb[0] as u32) << 16)
-                | ((rgb[1] as u32) << 8)
-                | rgb[2] as u32;
-        }
-        // 【八十三修 v3】motion.dot_color 覆盖：浅色皮肤（樱色等）的高亮
-        // 色近白，白底宿主上小圆不可见——皮肤可显式给 dot_color（如
-        // #E8557AFF 深樱红）夺回视觉存在感。双形态 pointer 同款。
-        let dc = skin
-            .pointer("/skin/motion/dot_color")
-            .or_else(|| skin.pointer("/motion/dot_color"))
-            .and_then(|v| v.as_str());
-        if let Some(rgb) = dc.and_then(parse_hex) {
-            self.dot_argb = ((rgb[3] as u32) << 24)
-                | ((rgb[0] as u32) << 16)
-                | ((rgb[1] as u32) << 8)
-                | rgb[2] as u32;
-        }
-        let now = std::time::Instant::now();
-        // Form 口径=窗口尺寸（含阴影边距）逻辑 px
-        let panel = crate::motion::Form::panel(w / dpi, h / dpi, corner);
-        if !self.internal_rerender {
-            let _ = self.motion.on_emerge(panel, now);
-        }
-        if self.motion.in_flight() {
-            let f = self.motion.sample(now).form;
-            // 壳物理尺寸=插值（chrome_override 消费：窗 SWP+壳盒）；
-            // 残留的拉伸动画清掉（morph 主管尺寸，防 tick 链双动画）
-            self.size_anim = None;
-            self.scale_in.set(false);
-            self.chrome_override
-                .set(Some(((f.w * dpi).round() as i32, (f.h * dpi).round() as i32)));
-            self.corner_override.set(Some(f.corner));
-            self.content_alpha.set(f.content.clamp(0.0, 1.0));
-            // 【v3.1】涌现/飞行帧立即解除 dwell 期 DComp 圆形 clip——
-            // 否则红圆裁剪残留在长出的窗上（首帧被裁成圆）。
-            if let (Some(dc), Some(visual)) = (&self.dcomp, &self.visual) {
-                unsafe {
-                    let _ = visual.SetClip(None);
-                    let _ = dc.Commit();
-                }
-            }
-            unsafe {
-                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-            }
-        } else {
-            self.corner_override.set(None);
-            self.content_alpha.set(1.0);
-            // 涌现完成帧解除壳尺寸覆盖（面板链/稳态渲染接管）
-            if !self.motion.is_dot_dwell() {
-                self.chrome_override.set(None);
-                // 【v3 Clear 大法】回面板链时解除 dwell 期设置的 DComp
-                // 圆形 clip（visual.SetClip(空矩形=不裁剪)+Commit）。
-                if let (Some(dc), Some(visual)) = (&self.dcomp, &self.visual) {
-                    unsafe {
-                        let _ = visual.SetClip(None);
-                        let _ = dc.Commit();
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// 【八十三修·v2 诊断】圆渲染完成实证（进程首帧，ULW/DComp 双路径
-/// 共用——render_dot 末尾调）。
-unsafe fn dot_diag_once(c: &CandidateWindowV2, side: i32, alpha: f32) {
-    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::tsf::diag_note(&format!(
-            "motion圆: 渲染完成 ulw={} side={side}px dot_at=({},{}) argb={:08X} alpha={alpha:.2}",
-            c.ulw, c.dot_at.0, c.dot_at.1, c.dot_argb
-        ));
     }
 }
 
@@ -4800,21 +4084,6 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
     };
     let mut anim_done = true;
-    // 【八十三修 v2】motion 前置分支：收场 morph（S3→S1 飞行）与
-    // S1 驻留/淡出由 motion_tick 全包——此期间面板链整体跳过（同
-    // tick 再 c.show 会把收缩中的窗 SWP 回大面板）。motion_tick
-    // false 但涌现飞行（dest=Panel）活跃时：面板链加 morph 重绘
-    // 分支（show 消费插值：壳从高亮中心长大+内容淡入）。
-    let mut motion_dwell = false;
-    {
-        if let Some(c) = cand2.as_mut() {
-            if c.motion_tick() {
-                motion_dwell = true;
-                anim_done = false;
-            }
-        }
-    }
-    if !motion_dwell {
         if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
         let had_fade = c.fade.is_some();
         let fade_done = c.fade_tick();
@@ -4827,22 +4096,6 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             c.internal_rerender = false;
             shown_this_tick = true;
             let _ = fade_done;
-        }
-        // 【八十三修 v2】涌现 morph 步进：S1/S0→S3 飞行中每 tick 以
-        // 形态插值重绘（壳尺寸/圆角/内容淡出=motion 采样；窗口 SWP
-        // 由 chrome_override 物理值驱动=窗随壳长大）。锚点 None（沿用
-        // 首帧定位——飞行中窗位稳定=零位移原则）。
-        if !shown_this_tick
-            && c.motion.enabled
-            && c.motion.in_flight()
-            && !c.motion.is_dot_dwell()
-            && c.is_visible()
-        {
-            c.internal_rerender = true;
-            let _ = c.show(&cands, &raw, &skin, None, sel);
-            c.internal_rerender = false;
-            shown_this_tick = true;
-            anim_done = false;
         }
         // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
         // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
@@ -4905,7 +4158,6 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             anim_done = false;
         }
         }
-    }
     if anim_done {
         // 【八十三修·v2 诊断】tick 链自然结束杀点
         crate::tsf::diag_note("motion网: anim_done Kill");
