@@ -3623,8 +3623,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             drop(g);
             return Ok(());
         }
+        // 【动效 v4】上屏断段收场：光标点可得→转圆点驻留（hide_as_dot
+        // 内部 DComp 树不可用时自动回落普通 hide）；否则直收。
+        let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            match caret_pt {
+                Some((cx, cy)) => c.hide_as_dot(cx, cy),
+                None => c.hide(),
+            }
         }
         if g.cand_ui_active {
             drop(g);
@@ -3793,10 +3799,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 丢弃（零消费）已删。
         let suppress_caret = caret.is_none() && !is_preview && !sh;
         if suppress_caret {
-            if crate::addword::in_window_thread() {
-                tl_cand_hide();
-            } else if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+            // 【动效 v4】圆点驻留态由 DOT_TIMER 自管生命周期（4s 收），
+            // 锚丢失链（上屏后 caret=None 每 poll 触发）不杀圆。
+            let dot_alive = g
+                .cand2
+                .as_ref()
+                .map(|c| c.is_dot())
+                .unwrap_or(false);
+            if !dot_alive {
+                if crate::addword::in_window_thread() {
+                    tl_cand_hide();
+                } else if let Some(c) = g.cand2.as_mut() {
+                    c.hide();
+                }
             }
             g.suppress_pending = true;
             arm_first_frame_timer();
@@ -4090,8 +4105,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             && !host_is_searchhost()
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
-            if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+            // 【动效 v4】圆点驻留态不杀（同 suppress_caret 分支）。
+            let dot_alive = g
+                .cand2
+                .as_ref()
+                .map(|c| c.is_dot())
+                .unwrap_or(false);
+            if !dot_alive {
+                if let Some(c) = g.cand2.as_mut() {
+                    c.hide();
+                }
             }
             g.wps_caret_prev = g.caret;
             if g.wps_settle_start.is_none() {
@@ -5173,6 +5196,23 @@ fn poll_tick() {
             }
         }
         if raw_empty {
+            // 【动效 v4】poll 兜底收场：RichEdit 系空格 commit 后下一
+            // 拍落到这里（键路径空帧没跑到的宿主）——窗在屏且非圆态时
+            // 补转圆点驻留（caret 缺则普通 hide；圆态不重复触发）。
+            let (vis, dot) = g
+                .cand2
+                .as_ref()
+                .map(|c| (c.is_visible(), c.is_dot()))
+                .unwrap_or((false, false));
+            if vis && !dot {
+                let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
+                if let Some(c) = g.cand2.as_mut() {
+                    match caret_pt {
+                        Some((cx, cy)) => c.hide_as_dot(cx, cy),
+                        None => c.hide(),
+                    }
+                }
+            }
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
             g.cand_shown_this_segment = false;

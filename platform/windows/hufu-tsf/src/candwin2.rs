@@ -405,6 +405,23 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
                 // 【八十三修·v2 诊断】hide 消息消费点（谁 Post 的）
                 crate::tsf::diag_note("motion网: hide消息到达(Kill+SW_HIDE)");
+                // 【动效 v4】圆点驻留态让位：上屏帧 suppress/收尾链的
+                // 异步 hide Post 与 hide_as_dot 竞态——驻留开始后才到达
+                // 的排队消息不杀圆（生命周期归 DOT_TIMER）。真隐藏场景
+                // （失焦/停用）经 hide() 时已 exit_dot，不受影响。
+                let dot_holding = match crate::tsf::G_SHARED.get() {
+                    Some(gsh) => {
+                        let g = gsh.0.lock().unwrap_or_else(|e| e.into_inner());
+                        g.cand2
+                            .as_ref()
+                            .map(|c| c.hwnd == hwnd && c.is_dot())
+                            .unwrap_or(false)
+                    }
+                    None => false,
+                };
+                if dot_holding {
+                    return LRESULT(0);
+                }
                 let _ = KillTimer(hwnd, FADE_TIMER_ID);
                 let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -422,6 +439,10 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             if id == EXPAND_TIMER_ID {
                 unsafe { expand_tick_shared(hwnd) };
+                return LRESULT(0);
+            }
+            if id == DOT_TIMER_ID {
+                unsafe { dot_timeout_shared(hwnd) };
                 return LRESULT(0);
             }
         }
@@ -642,6 +663,11 @@ pub struct CandidateWindowV2 {
     /// 中心锚定高亮胶囊中心（内容平移 −bx/−by、窗口跟盒滑动），其余
     /// 内容向四周展开——而非从窗口左上角出现。逻辑内容坐标。
     pub(crate) hl_center: std::cell::Cell<Option<(f32, f32)>>,
+    /// 【动效 v4】圆点驻留态标志+颜色（show 时从皮肤高亮色刷新）。
+    dot_mode: std::cell::Cell<bool>,
+    dot_argb: std::cell::Cell<u32>,
+    /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
+    dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
     pub(crate) scale_in: std::cell::Cell<bool>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=瞬跳）——注释
@@ -1023,6 +1049,9 @@ impl CandidateWindowV2 {
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
+                dot_mode: std::cell::Cell::new(false),
+                dot_argb: std::cell::Cell::new(0xFF404046),
+                dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
@@ -1195,6 +1224,9 @@ impl CandidateWindowV2 {
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
+                dot_mode: std::cell::Cell::new(false),
+                dot_argb: std::cell::Cell::new(0xFF404046),
+                dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
@@ -1530,6 +1562,19 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【动效 v4】涌现前退出圆点驻留态（还原面板层，dot timer 清）。
+        if self.dot_mode.get() {
+            self.exit_dot();
+        }
+        // 【动效 v4】圆点颜色=皮肤高亮色（每帧刷新，热更即生效）。
+        if let Some(hex) = skin
+            .pointer("/colors/hilited_candidate_back_color")
+            .and_then(|v| v.as_str())
+        {
+            if let Some(argb) = parse_hex_argb(hex) {
+                self.dot_argb.set(argb);
+            }
+        }
         // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
         // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
         // 或别的 SetWindowPos 直调）。
@@ -3929,6 +3974,8 @@ impl CandidateWindowV2 {
 
 
     pub fn hide(&mut self) {
+        // 【动效 v4】真隐藏前先退出圆点态（清 dot timer+还原面板层）。
+        self.exit_dot();
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -3947,10 +3994,253 @@ impl CandidateWindowV2 {
             let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
     }
+
+    // ═══ 动效 v4·S2：静态圆（直切版）═══
+    // 收场=面板层 opacity 0 + 圆点层（独立 26px 链）显示在光标处；
+    // 驻留 DOT_IDLE_MS 后真隐藏。涌现（show 开头）exit_dot 还原面板。
+    // 窗口本体全程不动——一切在 visual 树上（v4 铁律）。
+
+    /// 圆点驻留态？（tsf 层 poll 让位判据）
+    pub fn is_dot(&self) -> bool {
+        self.dot_mode.get()
+    }
+
+    /// 上屏收场入口（tsf 层调）：DComp 树可用→转圆驻留；否则普通 hide。
+    pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
+        if !self.enter_dot(cx, cy) {
+            self.hide();
+        }
+    }
+
+    fn enter_dot(&mut self, cx: i32, cy: i32) -> bool {
+        if self.ulw || self.visual_dot.is_none() || self.visual.is_none() {
+            return false;
+        }
+        unsafe {
+            // 先建链（不画）：attach 后再画+Present——SetContent 先于
+            // 首次 Present（DComp 绑定后 Present 唤醒合成，调研 §5）。
+            if !self.ensure_dot_chain() {
+                return false;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(self.hwnd, &mut r).is_err() {
+                return false;
+            }
+            // 圆心（cx,cy）可能在窗 rect 外（窗悬于锚点下方时 caret 在
+            // 窗顶上方）——visual 出窗即被裁。钳到窗内最近位置：圆贴窗
+            // 边（与 caret 同侧），morph 锚=圆实际显示位（连续性保持）。
+            let rw = (r.right - r.left).max(DOT_SIDE as i32);
+            let rh = (r.bottom - r.top).max(DOT_SIDE as i32);
+            let ox = (cx - r.left - DOT_SIDE as i32 / 2).clamp(0, rw - DOT_SIDE as i32) as f32;
+            let oy = (cy - r.top - DOT_SIDE as i32 / 2).clamp(0, rh - DOT_SIDE as i32) as f32;
+            let (dc, vd, v, ch) = match (&self.dcomp, &self.visual_dot, &self.visual, &self.dot_chain)
+            {
+                (Some(d), Some(a), Some(b), Some(c)) => (d, a, b, c),
+                _ => return false,
+            };
+            // Visual3 QI 在本机 DComp 设备失败 → Win8 兼容路径：
+            // EffectGroup.SetOpacity + visual.SetEffect（调研报告 §1.1）。
+            let grp = match dc.CreateEffectGroup() {
+                Ok(g) => g,
+                Err(_) => {
+                    crate::tsf::diag_note("v4圆: EffectGroup 创建失败");
+                    return false;
+                }
+            };
+            // 圆形 clip：buffer=Clear 全色块（Fill 系列视觉失败的坑），
+            // 形状=RectangleClip 四角半径=半边（正圆）。挂在 dot visual
+            // 上（root 无 transform，clip 不会被变换）。
+            let side_f = DOT_SIDE as f32;
+            let rad_f = side_f * 0.5;
+            let clip = match dc.CreateRectangleClip() {
+                Ok(c) => c,
+                Err(_) => {
+                    crate::tsf::diag_note("v4圆: clip 创建失败");
+                    return false;
+                }
+            };
+            let clip_ok = clip.SetLeft2(0.0).is_ok()
+                && clip.SetTop2(0.0).is_ok()
+                && clip.SetRight2(side_f).is_ok()
+                && clip.SetBottom2(side_f).is_ok()
+                && clip.SetTopLeftRadiusX2(rad_f).is_ok()
+                && clip.SetTopLeftRadiusY2(rad_f).is_ok()
+                && clip.SetTopRightRadiusX2(rad_f).is_ok()
+                && clip.SetTopRightRadiusY2(rad_f).is_ok()
+                && clip.SetBottomLeftRadiusX2(rad_f).is_ok()
+                && clip.SetBottomLeftRadiusY2(rad_f).is_ok()
+                && clip.SetBottomRightRadiusX2(rad_f).is_ok()
+                && clip.SetBottomRightRadiusY2(rad_f).is_ok();
+            if !clip_ok {
+                crate::tsf::diag_note("v4圆: clip 参数失败");
+                return false;
+            }
+            if vd.SetContent(ch).is_err()
+                || vd.SetOffsetX2(ox).is_err()
+                || vd.SetOffsetY2(oy).is_err()
+                || vd.SetClip(&clip).is_err()
+                || grp.SetOpacity2(0.0).is_err()
+                || v.SetEffect(&grp).is_err()
+                || dc.Commit().is_err()
+            {
+                crate::tsf::diag_note("v4圆: attach失败");
+                return false;
+            }
+            self.dot_effect = Some(grp);
+            // attach 完成后再画圆+Present（内容就绪后的唤醒帧）。
+            if !self.render_dot_frame() {
+                crate::tsf::diag_note("v4圆: 首帧绘制失败（仍驻留）");
+            }
+            let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
+            let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_IDLE_MS, None);
+            self.dot_mode.set(true);
+            crate::tsf::diag_note("v4圆: 驻留开始");
+            true
+        }
+    }
+    /// 退出圆点态（涌现/真隐藏前调）：面板层还原，dot 层清空。
+    fn exit_dot(&mut self) {
+        if !self.dot_mode.get() {
+            return;
+        }
+        self.dot_mode.set(false);
+        unsafe {
+            let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
+            if let (Some(dc), Some(vd), Some(v)) = (&self.dcomp, &self.visual_dot, &self.visual) {
+                let _ = vd.SetContent(None);
+                let _ = vd.SetOffsetX2(0.0);
+                let _ = vd.SetOffsetY2(0.0);
+                let _ = vd.SetClip(None);
+                if self.dot_effect.take().is_some() {
+                    let _ = v.SetEffect(None);
+                }
+                let _ = dc.Commit();
+            }
+        }
+    }
+
+    /// 驻留超时：淡出（S4 前直切）。timer 线程经 dot_timeout_shared 调。
+    fn dot_timeout(&mut self) {
+        self.exit_dot();
+        self.hide();
+    }
+
+    unsafe fn ensure_dot_chain(&mut self) -> bool {
+        if self.dot_chain.is_some() {
+            return true;
+        }
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: DOT_SIDE,
+            Height: DOT_SIDE,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            Flags: 0,
+        };
+        match self.create_chain_from_ctx(&desc) {
+            Some(c) => {
+                self.dot_chain = Some(c);
+                true
+            }
+            None => {
+                crate::tsf::diag_note("v4圆: dot链创建失败");
+                false
+            }
+        }
+    }
+
+    unsafe fn render_dot_frame(&mut self) -> bool {
+        let (chain, ctx) = match (&self.dot_chain, &self.ctx) {
+            (Some(c), Some(x)) => (c.clone(), x.clone()),
+            _ => return false,
+        };
+        // 高亮色（premultiplied：RGB×A）
+        let argb = self.dot_argb.get();
+        let a = ((argb >> 24) & 0xFF) as f32 / 255.0;
+        let color = D2D1_COLOR_F {
+            r: ((argb >> 16) & 0xFF) as f32 / 255.0,
+            g: ((argb >> 8) & 0xFF) as f32 / 255.0,
+            b: (argb & 0xFF) as f32 / 255.0,
+            a,
+        };
+        let premul = D2D1_COLOR_F {
+            r: color.r * a,
+            g: color.g * a,
+            b: color.b * a,
+            a,
+        };
+        let buffer: IDXGISurface = match chain.GetBuffer(0) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        // 【坑】options=None 的 bitmap 不能当 target（主链同款
+        // TARGET|CANNOT_DRAW+PREMULTIPLIED 才能画）。
+        let bp = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let bmp: ID2D1Bitmap1 = match ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&bp)) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        ctx.SetTarget(&bmp);
+        let _ = ctx.BeginDraw();
+        // 【坑：Fill 系列在长寿命 ctx 上视觉失败（Clear 有效）——v3
+        // 实证过的老坑】圆的形状由 DComp 圆角 clip 负责（enter_dot 挂
+        // RectangleClip 正圆半径），buffer=Clear 直填色块即可。
+        ctx.Clear(Some(&premul));
+        let hr = ctx.EndDraw(None, None);
+        if hr.is_err() {
+            crate::tsf::diag_note(&format!(
+                "v4圆: EndDraw hr=0x{:08X}",
+                hr.map(|_| 0u32).unwrap_or_else(|e| e.code().0 as u32)
+            ));
+        }
+        let hr_p = chain.Present(1, DXGI_PRESENT(0));
+        if hr_p.0 != 0 {
+            return false;
+        }
+        true
+    }
+}
+
+/// 【动效 v4】"#RRGGBBAA" → 0xAARRGGBB（皮肤高亮色→圆点色）。
+fn parse_hex_argb(s: &str) -> Option<u32> {
+    let h = s.trim_start_matches('#');
+    if h.len() != 8 {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    let (r, g, b, a) = (
+        (v >> 24) & 0xFF,
+        (v >> 16) & 0xFF,
+        (v >> 8) & 0xFF,
+        v & 0xFF,
+    );
+    Some((a << 24) | (r << 16) | (g << 8) | b)
 }
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
+
+/// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id。
+pub const DOT_SIDE: u32 = 26;
+pub const DOT_IDLE_MS: u32 = 4000;
+pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 
 /// 【动效 2026-09-11】渐隐渐显 tick 定时器 id（15ms≈67fps）与
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
@@ -3988,6 +4278,25 @@ const FADE_FLOOR: f64 = 0.6;
 /// 【动效】渐隐渐显 + 尺寸动效 tick：take cand2+last_show → 推进 fade
 /// 状态 →（fade 活跃时）按当前 alpha 复渲染 → 尺寸插值步进（只 SWP
 /// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
+/// 【动效 v4】圆点驻留超时（WM_TIMER）：退出圆态+真隐藏（S4 前直切，
+/// 之后换 opacity 动画淡出）。
+unsafe fn dot_timeout_shared(hwnd: HWND) {
+    let _ = hwnd;
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return;
+    };
+    let shared = gsh.0.clone();
+    let mut c2 = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    if let Some(c) = c2.as_mut() {
+        c.dot_timeout();
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2 = c2;
+}
+
 unsafe fn fade_tick_shared(hwnd: HWND) {
     // 【八十三修·v2 诊断】WM_TIMER 到达实证（前 300 条全量——收场后
     // tick 是否存活的决定性证据；之后每 200 条采样）
