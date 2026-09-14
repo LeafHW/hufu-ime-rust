@@ -369,10 +369,25 @@ impl Motion {
             if self.flight.is_none() || self.dest != Some(Dest::Dot) || progress >= 1.0 {
                 let idle = Duration::from_millis(self.idle_ms as u64);
                 if now >= since + idle {
-                    let p = (((now - since - idle).as_secs_f64()
+                    // 【v3.1 单位修复】分子 as_secs_f64()（秒）曾除以
+                    // fade_ms（毫秒数值）——p 恒小 1000 倍，fade 实际
+                    // 变 300 秒（shell 帧序列 0.999/0.998 微降+fade 实参
+                    // p=0.000 实锤）。分子改 as_millis() 对齐毫秒。
+                    let p = (((now - since - idle).as_millis() as f64
                         / self.fade_ms.max(1) as f64) as f32)
                         .clamp(0.0, 1.0);
                     let a = 1.0 - ease(p);
+                    // 【v3.1 诊断】fade 分支实参（一次性）
+                    {
+                        static FP: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !FP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            crate::tsf::diag_note(&format!(
+                                "fade实参: idle={} fade={} p={p:.3} a={a:.3} shell前={:.3}",
+                                self.idle_ms, self.fade_ms, form.shell
+                            ));
+                        }
+                    }
                     form.shell *= a;
                     form.content *= a;
                 }

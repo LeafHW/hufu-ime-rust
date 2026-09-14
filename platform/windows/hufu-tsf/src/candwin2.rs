@@ -4057,7 +4057,10 @@ impl CandidateWindowV2 {
         if self.motion.is_dot_dwell() && !self.motion.in_flight() {
             // 已在驻留中再次断段（罕见）：小圆挪到新锚点。
             self.dot_at = (cx, cy);
-            unsafe { self.render_dot(1.0) };
+            // 【v3.1】alpha 取本帧 shell（fade 期渐暗值）而非硬编码
+            // 1.0——poll 周期重画曾把淡出中的圆反复拉回全亮。
+            let shell = self.motion.sample(now).form.shell;
+            unsafe { self.render_dot(shell) };
             return;
         }
         self.motion.on_collapse(now);
@@ -4294,23 +4297,43 @@ impl CandidateWindowV2 {
         // 合成层做，不依赖 D2D 绘制状态）。Clear 不受 transform 影响。
         let c = self.dot_argb;
         let aa = (((c >> 24) & 0xFF) as f32 / 255.0).max(self.motion.dot_alpha);
+        // 【v3.1 诊断】fade 帧实收 alpha（一次性）——fade 计算链是否
+        // 到达渲染的判定证据。
+        {
+            static FADE_P: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if alpha < 0.995 && !FADE_P.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::tsf::diag_note(&format!(
+                    "motion圆: fade首帧 alpha={alpha:.3}（应≈0.9x 渐降）"
+                ));
+            }
+        }
+        // 【v3.1 premultiplied 修复】swapchain 是 PREMULTIPLIED 格式，
+        // Clear 直写像素不帮你乘 alpha——之前 alpha 降了但 RGB 满值，
+        // 视觉恒不透明（fade 无渐隐、idle 后瞬变消失——用户实锤+圆心
+        // RGB 恒 (232,85,122) 实证）。手动预乘：显示色=目标色×alpha。
+        let a_eff = (aa * alpha.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         ctx.Clear(Some(
             &windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
-                r: ((c >> 16) & 0xFF) as f32 / 255.0,
-                g: ((c >> 8) & 0xFF) as f32 / 255.0,
-                b: (c & 0xFF) as f32 / 255.0,
-                a: aa * alpha.clamp(0.0, 1.0),
+                r: ((c >> 16) & 0xFF) as f32 / 255.0 * a_eff,
+                g: ((c >> 8) & 0xFF) as f32 / 255.0 * a_eff,
+                b: (c & 0xFF) as f32 / 255.0 * a_eff,
+                a: a_eff,
             },
         ));
-        // DComp 圆形 clip（静态值 setter 在 windows-rs 里带 2 后缀）。
+        // DComp 圆形 clip：rect=圆的外接矩形（不是全窗！全窗+radius
+        // 只出圆角方块——用户实锤「红色小方块不是圆」）。圆心=窗中心，
+        // 半径=rad；Clear 填的圆色只在 clip 内可见。
         if let (Some(dc), Some(visual)) = (&self.dcomp, &self.visual) {
             if let Ok(clip) = dc.CreateRectangleClip() {
+                let cx = side as f32 / 2.0;
+                let cy = side as f32 / 2.0;
                 let rad = d as f32 / 2.0;
                 unsafe {
-                    let _ = clip.SetLeft2(0.0);
-                    let _ = clip.SetTop2(0.0);
-                    let _ = clip.SetRight2(side as f32);
-                    let _ = clip.SetBottom2(side as f32);
+                    let _ = clip.SetLeft2(cx - rad);
+                    let _ = clip.SetTop2(cy - rad);
+                    let _ = clip.SetRight2(cx + rad);
+                    let _ = clip.SetBottom2(cy + rad);
                     let _ = clip.SetTopLeftRadiusX2(rad);
                     let _ = clip.SetTopLeftRadiusY2(rad);
                     let _ = clip.SetBottomRightRadiusX2(rad);
@@ -4383,6 +4406,36 @@ impl CandidateWindowV2 {
                     self.last_draw.is_some()
                 ));
             }
+            // 【v3.1 形变衔接】飞行末段（progress≥0.7：窗已缩到 ~40px、
+            // 内容已错峰淡出）直接切 render_dot——红圆在收缩末段显现，
+            // 替代「浅色快照块→红圆」的落定帧颜色跳变（用户实锤「红
+            // 色小方块突然出现、没有形变过程」）。
+            if self.motion.sample(now).progress >= 0.7 {
+                // 窗位滑动推进（断段后主 tick 链不跑 pos 分支）
+                if let Some((f, t, t0, dur)) = self.pos_anim {
+                    let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
+                    if cur == t {
+                        self.pos_anim = None;
+                    }
+                    unsafe {
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            HWND_TOPMOST,
+                            cur.0,
+                            cur.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                self.last_draw = None;
+                unsafe {
+                    self.render_dot(1.0);
+                }
+                let _ = self.motion.tick(now);
+                return true;
+            }
             // 窗位滑动推进（断段后主 tick 链不跑 pos 分支）
             if let Some((f, t, t0, dur)) = self.pos_anim {
                 let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
@@ -4418,6 +4471,19 @@ impl CandidateWindowV2 {
         // ── S1 驻留/超时淡出 ──
         if self.motion.is_dot_dwell() {
             let frame = self.motion.sample(now);
+            // 【v3.1 诊断】dwell 帧 shell 演化（前 3+每 60 帧采样——fade
+            // 期 shell 是否真的在降的判定证据）
+            {
+                static DW: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let dw = DW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if dw < 3 || dw % 60 == 0 {
+                    crate::tsf::diag_note(&format!(
+                        "dwell#{dw}: shell={:.3} visible={}",
+                        frame.form.shell, frame.visible
+                    ));
+                }
+            }
             if !frame.visible {
                 // 淡出完成：收窗（异步 hide 防死锁路径同 hide()）
                 unsafe {
@@ -4512,6 +4578,14 @@ impl CandidateWindowV2 {
                 .set(Some(((f.w * dpi).round() as i32, (f.h * dpi).round() as i32)));
             self.corner_override.set(Some(f.corner));
             self.content_alpha.set(f.content.clamp(0.0, 1.0));
+            // 【v3.1】涌现/飞行帧立即解除 dwell 期 DComp 圆形 clip——
+            // 否则红圆裁剪残留在长出的窗上（首帧被裁成圆）。
+            if let (Some(dc), Some(visual)) = (&self.dcomp, &self.visual) {
+                unsafe {
+                    let _ = visual.SetClip(None);
+                    let _ = dc.Commit();
+                }
+            }
             unsafe {
                 let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
             }

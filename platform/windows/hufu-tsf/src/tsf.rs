@@ -1215,6 +1215,12 @@ pub fn diag_note(msg: &str) {
     if !diag_enabled() {
         return;
     }
+    // 【v3.1 诊断时刻戳】进程起点相对秒——动效时间线（收场/fade/kill
+    // 的先后顺序）肉眼可判，不再靠行序猜。
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t0 = T0.get_or_init(std::time::Instant::now);
+    let stamp = t0.elapsed().as_secs_f32();
+    let msg = format!("[{stamp:8.3}] {msg}");
     use std::io::Write;
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
     let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
