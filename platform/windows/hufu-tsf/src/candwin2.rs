@@ -1,4 +1,4 @@
-//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -728,6 +728,9 @@ pub struct CandidateWindowV2 {
     fade_main_grp: Option<IDCompositionEffectGroup>,
     /// 驻留起点（16ms tick 内自判到点——长 timer 在本机会被静默杀）。
     idle_since: std::cell::Cell<Option<std::time::Instant>>,
+    /// 【S5】上次上屏时刻+morph 时长（节奏自适应）。
+    last_dot_at: std::cell::Cell<Option<std::time::Instant>>,
+    morph_dur: std::cell::Cell<u32>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1125,6 +1128,8 @@ impl CandidateWindowV2 {
                 fade_t0: std::cell::Cell::new(None),
                 fade_main_grp: None,
                 idle_since: std::cell::Cell::new(None),
+                last_dot_at: std::cell::Cell::new(None),
+                morph_dur: std::cell::Cell::new(DOT_MORPH_MS),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1313,6 +1318,8 @@ impl CandidateWindowV2 {
                 fade_t0: std::cell::Cell::new(None),
                 fade_main_grp: None,
                 idle_since: std::cell::Cell::new(None),
+                last_dot_at: std::cell::Cell::new(None),
+                morph_dur: std::cell::Cell::new(DOT_MORPH_MS),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -4101,7 +4108,23 @@ impl CandidateWindowV2 {
     }
 
     /// 上屏收场入口（tsf 层调）：DComp 树可用→转圆驻留；否则普通 hide。
+    /// 【S5 节奏自适应】以两次上屏间隔分流（hide_as_dot 即上屏时刻）：
+    /// 连打（<600ms）不冒圆直收（流畅优先）；快打（<1.5s）快速 morph
+    /// 90ms；慢打完整 morph 180ms。
     pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
+        let now = std::time::Instant::now();
+        let dt_ms = self
+            .last_dot_at
+            .replace(Some(now))
+            .map(|t| now.duration_since(t).as_millis() as u32)
+            .unwrap_or(u32::MAX);
+        if dt_ms < DOT_RAPID_MS {
+            // 连打：脉冲式直收（无圆无 morph——连发不闪）
+            self.hide();
+            return;
+        }
+        self.morph_dur
+            .set(if dt_ms < DOT_FAST_MS { 90 } else { DOT_MORPH_MS });
         if !self.enter_dot(cx, cy) {
             self.hide();
         }
@@ -4252,7 +4275,7 @@ impl CandidateWindowV2 {
             Some(t) => t,
             None => return,
         };
-        let p = (t0.elapsed().as_millis() as f32 / DOT_MORPH_MS as f32).clamp(0.0, 1.0);
+        let p = (t0.elapsed().as_millis() as f32 / self.morph_dur.get().max(1) as f32).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(3); // ease-out-cubic
         let f = self.collapse_from.get();
         let t = self.collapse_to.get();
@@ -4357,7 +4380,7 @@ impl CandidateWindowV2 {
             Some(t) => t,
             None => return,
         };
-        let p = (t0.elapsed().as_millis() as f32 / DOT_MORPH_MS as f32).clamp(0.0, 1.0);
+        let p = (t0.elapsed().as_millis() as f32 / self.morph_dur.get().max(1) as f32).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(3);
         let f = self.collapse_from.get();
         let t = self.collapse_to.get();
@@ -4611,6 +4634,9 @@ pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 pub const DOT_MORPH_MS: u32 = 180;
 pub const DOT_TICK_MS: u32 = 16;
 pub const DOT_FADE_MS: u32 = 200;
+/// 【S5】节奏阈值：连打 <600ms 直收；快打 <1.5s 快速 morph 90ms。
+pub const DOT_RAPID_MS: u32 = 600;
+pub const DOT_FAST_MS: u32 = 1500;
 
 /// 【动效 2026-09-11】渐隐渐显 tick 定时器 id（15ms≈67fps）与
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
