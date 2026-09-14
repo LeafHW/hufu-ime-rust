@@ -65,18 +65,17 @@ pub enum BallForm {
 }
 
 /// 窗口线程 → 合成线程 命令（全部非阻塞 Send）。
-/// 【morph v2】形变=CPU 插值帧（合成线程 15ms tick 逐帧画）——合成器
-/// Size 动画在 Stretch.None 下只是「裁剪揭幕」且内容首帧即终态帧，
-/// 形变感为零（用户实证）。几何(尺寸+位置)与内容帧必须逐帧同步，
-/// 故全走 CPU；窗口恒定不移动（元素位移=content.Offset 插值）。
+/// 【morph v3·屏位锚】形变=CPU 插值帧（15ms tick）；几何与内容帧同帧
+/// 应用。**位置全部屏幕坐标语义**：from 恒=当前视觉位置（合成线程自
+/// 跟踪 cur+窗口原点换算）——打断（连打反转）/重复命令（poll 重复收
+/// 球）天然无位置跳变（v2 的 from=命令指定=跳变抖动源，用户实证）。
 pub enum BallCmd {
     /// 画球帧（环色/心色；热更色用——纯重画不动几何）。
     PaintBall { ring: u32, core: u32 },
-    /// 球→框（快，可打断）。w/h=框尺寸；fx/fy=起点 Offset（窗口相对，
-    /// 调用方已做窗口移动补偿）；tx/ty=框位 Offset。
-    MorphOpen { w: f32, h: f32, fx: f32, fy: f32, tx: f32, ty: f32 },
-    /// 框→球（慢，可被打断反转）。fx/fy=当前框位 Offset；tx/ty=球位。
-    MorphClose { fx: f32, fy: f32, tx: f32, ty: f32 },
+    /// 球→框（快，可打断）。w/h=框尺寸；tx/ty=框屏位（左上）。
+    MorphOpen { w: f32, h: f32, tx: f32, ty: f32 },
+    /// 框→球（慢，可被打断反转）。tx/ty=球屏位（元素框左上）。
+    MorphClose { tx: f32, ty: f32 },
     /// 渐隐。
     FadeOut,
     /// 渐显（Opacity=1）。
@@ -126,11 +125,11 @@ impl BallWin {
     pub fn paint_ball(&self, ring: u32, core: u32) {
         self.send(BallCmd::PaintBall { ring, core });
     }
-    pub fn morph_open(&self, w: f32, h: f32, fx: f32, fy: f32, tx: f32, ty: f32) {
-        self.send(BallCmd::MorphOpen { w, h, fx, fy, tx, ty });
+    pub fn morph_open(&self, w: f32, h: f32, tx: f32, ty: f32) {
+        self.send(BallCmd::MorphOpen { w, h, tx, ty });
     }
-    pub fn morph_close(&self, fx: f32, fy: f32, tx: f32, ty: f32) {
-        self.send(BallCmd::MorphClose { fx, fy, tx, ty });
+    pub fn morph_close(&self, tx: f32, ty: f32) {
+        self.send(BallCmd::MorphClose { tx, ty });
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
@@ -373,16 +372,21 @@ unsafe fn synth_thread(
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
     };
-    // 【morph v2 状态机】cur=当前几何（尺寸+窗口内 Offset，含中间态）；
-    // morph=进行中的插值（from→to，任意时刻可被新 morph 替换=打断续动）。
+    // 【morph v3 状态机·屏位锚】cur=当前几何（尺寸+**屏幕**位置，含
+    // 中间态）；morph=进行中的插值。命令只给「目标」——from 恒=cur
+    //（当前视觉位）——打断/重复命令无跳变（抖动根治）。窗口原点
+    // win_org 缓存：命令到达时刷新（SWP 已由窗口线程先做）；morph
+    // 期间窗口恒定不动（包围盒设计）。
     struct Geo {
         w: f32,
         h: f32,
-        ox: f32,
-        oy: f32,
+        sx: f32,
+        sy: f32,
     }
     let ball_side = BALL_D + 2.0 * BALL_PAD;
-    let mut cur = Geo { w: ball_side, h: ball_side, ox: 0.0, oy: 0.0 };
+    let mut cur = Geo { w: ball_side, h: ball_side, sx: 0.0, sy: 0.0 };
+    let mut cur_valid = false; // 首命令前 cur 无效——from=to（原地起步）
+    let mut win_org: (f32, f32) = (0.0, 0.0);
     let mut morph: Option<(Geo, Geo, std::time::Instant, u32, bool)> = None; // (from,to,t0,ms,closing)
     let mut ballness = 1.0f32; // 球接近度（1=纯球：core 满显+inset=pad；0=纯框）
     let mut idle_ticks: u32 = 0;
@@ -409,11 +413,14 @@ unsafe fn synth_thread(
                     crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
                 }
             }
-            BallCmd::MorphOpen { w, h, fx, fy, tx, ty } => {
-                // 打断续动：from=当前尺寸（中间态）+命令指定的起点 Offset
-                //（调用方已做窗口移动补偿——球视觉静止起步）。
-                let from = Geo { w: cur.w, h: cur.h, ox: fx, oy: fy };
-                let to = Geo { w, h, ox: tx, oy: ty };
+            BallCmd::MorphOpen { w, h, tx, ty } => {
+                // 屏位锚：from=cur（当前视觉位——打断续动/无跳变）；
+                // 首命令 cur 无效→from=to（原地起步——球在框位冒出
+                // 长大成框，不从屏幕外飞入）。
+                refresh_win_org(hwnd, &mut win_org);
+                let to = Geo { w, h, sx: tx, sy: ty };
+                let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
+                cur_valid = true;
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
@@ -423,14 +430,12 @@ unsafe fn synth_thread(
                 // morph 中停呼吸（Scale 干扰逐帧 SetSize）。
                 content.StopAnimation(&HSTRING::from("Scale"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
-                crate::tsf::diag_note(&format!(
-                    "v5球T: open {:.0}x{:.0} ({:.0},{:.0})→({:.0},{:.0})",
-                    w, h, fx, fy, tx, ty
-                ));
             }
-            BallCmd::MorphClose { fx, fy, tx, ty } => {
-                let from = Geo { w: cur.w, h: cur.h, ox: fx, oy: fy };
-                let to = Geo { w: ball_side, h: ball_side, ox: tx, oy: ty };
+            BallCmd::MorphClose { tx, ty } => {
+                refresh_win_org(hwnd, &mut win_org);
+                let to = Geo { w: ball_side, h: ball_side, sx: tx, sy: ty };
+                let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
+                cur_valid = true;
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
@@ -439,10 +444,6 @@ unsafe fn synth_thread(
                 ));
                 content.StopAnimation(&HSTRING::from("Scale"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
-                crate::tsf::diag_note(&format!(
-                    "v5球T: close ({:.0},{:.0})→({:.0},{:.0})",
-                    fx, fy, tx, ty
-                ));
             }
             BallCmd::FadeOut => {
                 if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
@@ -498,11 +499,17 @@ unsafe fn synth_thread(
                 let e = if *closing { ease_in_out(t) } else { ease_out(t) };
                 cur.w = lerp(from.w, to.w, e);
                 cur.h = lerp(from.h, to.h, e);
-                cur.ox = lerp(from.ox, to.ox, e);
-                cur.oy = lerp(from.oy, to.oy, e);
+                cur.sx = lerp(from.sx, to.sx, e);
+                cur.sy = lerp(from.sy, to.sy, e);
                 ballness = if *closing { e } else { 1.0 - e };
                 let _ = content.SetSize(N::Vector2 { X: cur.w.max(2.0), Y: cur.h.max(2.0) });
-                let _ = content.SetOffset(N::Vector3 { X: cur.ox, Y: cur.oy, Z: 0.0 });
+                // 屏位→窗口 Offset（morph 期间窗口恒定——win_org 命令
+                // 时已刷新）。
+                let _ = content.SetOffset(N::Vector3 {
+                    X: cur.sx - win_org.0,
+                    Y: cur.sy - win_org.1,
+                    Z: 0.0,
+                });
                 let _ = paint_morph_frame(
                     &chain, &d2d_dev, cur.w, cur.h, ballness,
                     last_ring, last_core,
@@ -561,6 +568,14 @@ fn ease_in_out(t: f32) -> f32 {
     } else {
         let x = -2.0 * t + 2.0;
         1.0 - x * x / 2.0
+    }
+}
+
+/// 窗口原点刷新（命令到达时调——SWP 已由窗口线程先做）。
+unsafe fn refresh_win_org(hwnd: HWND, org: &mut (f32, f32)) {
+    let mut rr = windows::Win32::Foundation::RECT::default();
+    if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rr).is_ok() {
+        *org = (rr.left as f32, rr.top as f32);
     }
 }
 

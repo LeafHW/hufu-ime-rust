@@ -754,11 +754,11 @@ pub struct CandidateWindowV2 {
     dot_ring_argb: std::cell::Cell<u32>,
     /// 【动效 v5】球窗（Windows.UI.Composition；diag HUFU_BALL=1 启用）。
     pub ball: Option<crate::ballwin::BallWin>,
-    /// 【morph v2】球屏位（元素框左上，屏幕坐标）——morph_open 的补偿
-    /// 起点（窗口包围盒移动后 Offset 反向补偿=球视觉静止起步）。
-    ball_screen: std::cell::Cell<(f32, f32)>,
-    /// 【morph v2】框屏位（上帧面板布局位）——morph_close 的补偿起点。
+    /// 【morph v3】框屏位（上帧面板布局位）——扩窗包围盒用。
     ball_frame: std::cell::Cell<(f32, f32)>,
+    /// 【morph v3·去重】上次收球目标 caret——tsf poll 同 caret 重复
+    /// 调 hide_as_dot 时跳过（驻留期抖动根治）。新键入复位。
+    ball_target: std::cell::Cell<(i32, i32)>,
     /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
     dot_grp_in: Option<IDCompositionEffectGroup>,
     dot_grp_sh: Option<IDCompositionEffectGroup>,
@@ -1140,8 +1140,8 @@ impl CandidateWindowV2 {
             Some(CandidateWindowV2 {
                 hwnd,
                 ball,
-                ball_screen: std::cell::Cell::new((0.0, 0.0)),
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
+                ball_target: std::cell::Cell::new((0, 0)),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: Some(dcomp),
@@ -1348,8 +1348,8 @@ impl CandidateWindowV2 {
             Some(CandidateWindowV2 {
                 hwnd,
                 ball: None,
-                ball_screen: std::cell::Cell::new((0.0, 0.0)),
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
+                ball_target: std::cell::Cell::new((0, 0)),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: None,
@@ -4128,9 +4128,10 @@ impl CandidateWindowV2 {
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
                     let fx = px as f32;
                     let fy = py as f32;
-                    // 首次（无球史）：球位=光标右下（anchor 中心）——
-                    // 否则从 (0,0) 飞入。
-                    let (sx0, sy0) = self.ball_screen.get();
+                    // 窗口=「球位∪框位」包围盒。球位未知时（首键，无
+                    // 球史）用 anchor 光标右下估位。morph 引擎屏位锚：
+                    // from=当前视觉位（首键=原地起步）——无跳变。
+                    let (sx0, sy0) = self.ball_frame.get();
                     let (sx, sy) = if sx0 == 0.0 && sy0 == 0.0 {
                         match anchor {
                             Some(a) => (
@@ -4156,17 +4157,9 @@ impl CandidateWindowV2 {
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
                     b.fade_in();
-                    // from=球屏位-新窗口原点（补偿窗口移动→球视觉静止）；
-                    // to=框屏位-新窗口原点。
-                    b.morph_open(
-                        apply.0 as f32,
-                        apply.1 as f32,
-                        sx - x0,
-                        sy - y0,
-                        fx - x0,
-                        fy - y0,
-                    );
+                    b.morph_open(apply.0 as f32, apply.1 as f32, fx, fy);
                     self.ball_frame.set((fx, fy));
+                    self.ball_target.set((0, 0)); // 新键入=收球去重复位
                 } else {
                     let _ = SetWindowPos(
                         self.hwnd,
@@ -4358,28 +4351,34 @@ impl CandidateWindowV2 {
     /// 的化身，窗在光标下方出现，圆也在光标下方，expand 才是「同点
     /// 形变」而非两个独立元素的位置跳变）。
     pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
-        // 【动效 v5·morph v2】球窗接管：框→球 CPU 插值帧（合成线程
-        // 260ms 慢收，可被下一键入的 morph_open 打断反转）。窗口尽量
-        // 不动（morph 期间恒定）；仅当新球位跑出窗口覆盖时才扩窗——
-        // 扩窗的视觉跳变由 morph from Offset 反向补偿（框视觉静止起步）。
-        // idle 渐隐=合成线程自理。
+        // 【动效 v5·morph v3·屏位锚】球窗接管：框→球 CPU 插值帧（可被
+        // 下一键入的 morph_open 打断反转——from 恒=当前视觉位，打断无
+        // 跳变）。idle 渐隐=合成线程自理。
         if let Some(b) = &self.ball {
             let side = crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD;
             // 新球屏位（元素框左上；球心=光标右下 ~28px、下方 ~38px——
             // 既有驻留观感）。
             let sx = cx as f32 + 6.0;
             let sy = cy as f32 + 16.0;
-            let (fx, fy) = self.ball_frame.get();
+            // 【去重·抖动根治①】tsf poll 会按 tick 重复调本函数（同
+            // caret）——重复收球=反复重置 morph+fade_in 翻转=驻留期抖
+            // 动（用户实证）。同目标直接跳过。
+            if self.ball_target.get() == (cx, cy) {
+                return;
+            }
+            self.ball_target.set((cx, cy));
             unsafe {
                 let mut rr = RECT::default();
                 let _ = GetWindowRect(self.hwnd, &mut rr);
                 // 覆盖检查：新球位+side ⊄ 当前窗口 → 扩窗到「球∪框」
-                // 包围盒（框仍被覆盖——morph from 补偿）。
+                // 包围盒（morph from=当前视觉位——合成线程命令时刷新
+                // 窗口原点自适应，无需手动补偿）。
                 let need = sx < rr.left as f32
                     || sy < rr.top as f32
                     || sx + side > rr.right as f32
                     || sy + side > rr.bottom as f32;
-                let (wx0, wy0) = if need {
+                if need {
+                    let (fx, fy) = self.ball_frame.get();
                     let x0 = sx.min(fx) - 10.0;
                     let y0 = sy.min(fy) - 10.0;
                     let x1 = (sx + side).max(fx + 200.0).max(rr.right as f32) + 10.0;
@@ -4393,27 +4392,11 @@ impl CandidateWindowV2 {
                         (y1 - y0) as i32,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
-                    (x0, y0)
-                } else {
-                    (rr.left as f32, rr.top as f32)
-                };
-                // from=当前框屏位-窗口原点（补偿扩窗）；to=新球位。
-                // fade_in：Opacity 归一+IsVisible 翻转（本机实证树在
-                // morph 逐帧 SetSize/SetOffset 后不再自动提交——翻转强
-                // 制合成器重评估整棵树；open 路径每键 show 自带 fade_in
-                // 所以显示，close 缺它所以黑——本轮隔离出）。
-                b.fade_in();
-                b.morph_close(fx - wx0, fy - wy0, sx - wx0, sy - wy0);
-                self.ball_screen.set((sx, sy));
-                // 【低频日志】收球取证（前 3 次）。
-                static CLOSEPOS: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                if CLOSEPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                    crate::tsf::diag_note(&format!(
-                        "v5球: 收球 caret=({},{}) 球位=({:.0},{:.0}) 框位=({:.0},{:.0}) need={}",
-                        cx, cy, sx, sy, fx, fy, need
-                    ));
                 }
+                // fade_in：Opacity 归一+IsVisible 翻转（树重提交——
+                // 收球起始帧上屏）。
+                b.fade_in();
+                b.morph_close(sx, sy);
             }
             return;
         }
