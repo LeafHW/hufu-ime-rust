@@ -666,6 +666,13 @@ pub struct CandidateWindowV2 {
     /// 【动效 v4】圆点驻留态标志+颜色（show 时从皮肤高亮色刷新）。
     dot_mode: std::cell::Cell<bool>,
     dot_argb: std::cell::Cell<u32>,
+    /// 【动效 v4】最近一帧的面板物理圆角（morph 起点）。
+    last_corner_px: std::cell::Cell<f32>,
+    /// 【动效 v4·S3】CPU 逐帧 morph：起止 clip 盒（L,T,R,B,r）+计时。
+    collapse_t0: std::cell::Cell<Option<std::time::Instant>>,
+    collapse_from: std::cell::Cell<(f32, f32, f32, f32, f32)>,
+    collapse_to: std::cell::Cell<(f32, f32, f32, f32, f32)>,
+    panel_clip: Option<IDCompositionRectangleClip>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1050,6 +1057,11 @@ impl CandidateWindowV2 {
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
                 dot_mode: std::cell::Cell::new(false),
+                last_corner_px: std::cell::Cell::new(8.0),
+                collapse_t0: std::cell::Cell::new(None),
+                collapse_from: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
+                collapse_to: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
+                panel_clip: None,
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1225,6 +1237,11 @@ impl CandidateWindowV2 {
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
                 dot_mode: std::cell::Cell::new(false),
+                last_corner_px: std::cell::Cell::new(8.0),
+                collapse_t0: std::cell::Cell::new(None),
+                collapse_from: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
+                collapse_to: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
+                panel_clip: None,
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1736,6 +1753,8 @@ impl CandidateWindowV2 {
 
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
+        // 【动效 v4】记录物理圆角（收场 morph 的 clip 起始半径）。
+        self.last_corner_px.set(radius * dpi_scale);
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 6.0);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
@@ -4033,19 +4052,15 @@ impl CandidateWindowV2 {
             let rh = (r.bottom - r.top).max(DOT_SIDE as i32);
             let ox = (cx - r.left - DOT_SIDE as i32 / 2).clamp(0, rw - DOT_SIDE as i32) as f32;
             let oy = (cy - r.top - DOT_SIDE as i32 / 2).clamp(0, rh - DOT_SIDE as i32) as f32;
+            // 【S3】收场 morph 改 CPU 逐帧驱动（DOT_TIMER 16ms tick，
+            // 静态 clip setter+Commit——IDCompositionAnimation 在本机
+            // 不被驱动（高速截帧实证：属性停 from 值），而静态 clip+
+            // Commit 每帧更新已验证可靠）。arm_collapse 内含首帧步进。
+            let _ = self.arm_collapse(ox, oy);
             let (dc, vd, v, ch) = match (&self.dcomp, &self.visual_dot, &self.visual, &self.dot_chain)
             {
                 (Some(d), Some(a), Some(b), Some(c)) => (d, a, b, c),
                 _ => return false,
-            };
-            // Visual3 QI 在本机 DComp 设备失败 → Win8 兼容路径：
-            // EffectGroup.SetOpacity + visual.SetEffect（调研报告 §1.1）。
-            let grp = match dc.CreateEffectGroup() {
-                Ok(g) => g,
-                Err(_) => {
-                    crate::tsf::diag_note("v4圆: EffectGroup 创建失败");
-                    return false;
-                }
             };
             // 圆形 clip：buffer=Clear 全色块（Fill 系列视觉失败的坑），
             // 形状=RectangleClip 四角半径=半边（正圆）。挂在 dot visual
@@ -4079,31 +4094,119 @@ impl CandidateWindowV2 {
                 || vd.SetOffsetX2(ox).is_err()
                 || vd.SetOffsetY2(oy).is_err()
                 || vd.SetClip(&clip).is_err()
-                || grp.SetOpacity2(0.0).is_err()
-                || v.SetEffect(&grp).is_err()
                 || dc.Commit().is_err()
             {
                 crate::tsf::diag_note("v4圆: attach失败");
                 return false;
             }
-            self.dot_effect = Some(grp);
             // attach 完成后再画圆+Present（内容就绪后的唤醒帧）。
             if !self.render_dot_frame() {
                 crate::tsf::diag_note("v4圆: 首帧绘制失败（仍驻留）");
             }
+            // morph timer（16ms tick；完成时 dot_step 内重挂 4s 驻留）。
             let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
-            let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_IDLE_MS, None);
+            let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None);
             self.dot_mode.set(true);
-            crate::tsf::diag_note("v4圆: 驻留开始");
+            crate::tsf::diag_note("v4圆: 驻留开始（morph CPU 驱动）");
             true
         }
     }
-    /// 退出圆点态（涌现/真隐藏前调）：面板层还原，dot 层清空。
+
+    /// 【动效 v4·S3】武装收场 morph：建 panel_clip（挂面板层），记录
+    /// from/to 盒。首帧步进由 arm 后的 attach Commit+首个 tick 完成。
+    fn arm_collapse(&mut self, ox: f32, oy: f32) -> bool {
+        let dc = match &self.dcomp {
+            Some(d) => d.clone(),
+            None => return false,
+        };
+        let v = match &self.visual {
+            Some(x) => x.clone(),
+            None => return false,
+        };
+        let w_f = self.live_size.get().0.max(DOT_SIDE as i32) as f32;
+        let h_f = self.live_size.get().1.max(DOT_SIDE as i32) as f32;
+        let r0 = self.last_corner_px.get().clamp(0.0, (w_f.min(h_f)) * 0.5);
+        let side_f = DOT_SIDE as f32;
+        unsafe {
+            let pc = match dc.CreateRectangleClip() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            // 初值=from（面板盒）——首个 tick 起步进。
+            let _ = pc.SetLeft2(0.0);
+            let _ = pc.SetTop2(0.0);
+            let _ = pc.SetRight2(w_f);
+            let _ = pc.SetBottom2(h_f);
+            let _ = pc.SetTopLeftRadiusX2(r0);
+            let _ = pc.SetTopLeftRadiusY2(r0);
+            let _ = pc.SetTopRightRadiusX2(r0);
+            let _ = pc.SetTopRightRadiusY2(r0);
+            let _ = pc.SetBottomLeftRadiusX2(r0);
+            let _ = pc.SetBottomLeftRadiusY2(r0);
+            let _ = pc.SetBottomRightRadiusX2(r0);
+            let _ = pc.SetBottomRightRadiusY2(r0);
+            if v.SetClip(&pc).is_err() {
+                return false;
+            }
+            self.panel_clip = Some(pc);
+            self.collapse_from.set((0.0, 0.0, w_f, h_f, r0));
+            self.collapse_to.set((ox, oy, ox + side_f, oy + side_f, side_f * 0.5));
+            self.collapse_t0.set(Some(std::time::Instant::now()));
+            true
+        }
+    }
+
+    /// morph 是否活跃（dot_tick_shared 分流）。
+    fn is_collapsing(&self) -> bool {
+        self.collapse_t0.get().is_some()
+    }
+
+    /// 【动效 v4·S3】morph 步进（WM_TIMER 16ms）：ease-out-cubic 插值
+    /// clip 五元组+Commit；完成时重挂 4s 驻留 timer。
+    fn collapse_step(&mut self) {
+        let t0 = match self.collapse_t0.get() {
+            Some(t) => t,
+            None => return,
+        };
+        let p = (t0.elapsed().as_millis() as f32 / DOT_MORPH_MS as f32).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p).powi(3); // ease-out-cubic
+        let f = self.collapse_from.get();
+        let t = self.collapse_to.get();
+        let l = f.0 + (t.0 - f.0) * e;
+        let tp = f.1 + (t.1 - f.1) * e;
+        let r_ = f.2 + (t.2 - f.2) * e;
+        let b = f.3 + (t.3 - f.3) * e;
+        let rad = f.4 + (t.4 - f.4) * e;
+        unsafe {
+            if let (Some(dc), Some(pc)) = (&self.dcomp, &self.panel_clip) {
+                let _ = pc.SetLeft2(l);
+                let _ = pc.SetTop2(tp);
+                let _ = pc.SetRight2(r_);
+                let _ = pc.SetBottom2(b);
+                let _ = pc.SetTopLeftRadiusX2(rad);
+                let _ = pc.SetTopLeftRadiusY2(rad);
+                let _ = pc.SetTopRightRadiusX2(rad);
+                let _ = pc.SetTopRightRadiusY2(rad);
+                let _ = pc.SetBottomLeftRadiusX2(rad);
+                let _ = pc.SetBottomLeftRadiusY2(rad);
+                let _ = pc.SetBottomRightRadiusX2(rad);
+                let _ = pc.SetBottomRightRadiusY2(rad);
+                let _ = dc.Commit();
+            }
+        }
+        if p >= 1.0 {
+            self.collapse_t0.set(None);
+            let _ = unsafe { SetTimer(self.hwnd, DOT_TIMER_ID, DOT_IDLE_MS, None) };
+            crate::tsf::diag_note("v4圆: morph 完成，转驻留计时");
+        }
+    }
+    /// 退出圆点态（涌现/真隐藏前调）：面板层还原（clip/effect 清），dot 层清空。
     fn exit_dot(&mut self) {
         if !self.dot_mode.get() {
             return;
         }
         self.dot_mode.set(false);
+        self.collapse_t0.set(None);
         unsafe {
             let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
             if let (Some(dc), Some(vd), Some(v)) = (&self.dcomp, &self.visual_dot, &self.visual) {
@@ -4111,6 +4214,9 @@ impl CandidateWindowV2 {
                 let _ = vd.SetOffsetX2(0.0);
                 let _ = vd.SetOffsetY2(0.0);
                 let _ = vd.SetClip(None);
+                let _ = vd.SetEffect(None);
+                // 面板层 clip（S3 收场动画挂的）解除——涌现直切回全窗。
+                let _ = v.SetClip(None);
                 if self.dot_effect.take().is_some() {
                     let _ = v.SetEffect(None);
                 }
@@ -4237,10 +4343,12 @@ fn parse_hex_argb(s: &str) -> Option<u32> {
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 
-/// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id。
+/// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id、morph 时长、tick。
 pub const DOT_SIDE: u32 = 26;
 pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
+pub const DOT_MORPH_MS: u32 = 180;
+pub const DOT_TICK_MS: u32 = 16;
 
 /// 【动效 2026-09-11】渐隐渐显 tick 定时器 id（15ms≈67fps）与
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
@@ -4278,8 +4386,8 @@ const FADE_FLOOR: f64 = 0.6;
 /// 【动效】渐隐渐显 + 尺寸动效 tick：take cand2+last_show → 推进 fade
 /// 状态 →（fade 活跃时）按当前 alpha 复渲染 → 尺寸插值步进（只 SWP
 /// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
-/// 【动效 v4】圆点驻留超时（WM_TIMER）：退出圆态+真隐藏（S4 前直切，
-/// 之后换 opacity 动画淡出）。
+/// 【动效 v4】圆点 timer（WM_TIMER）：morph 活跃→步进 clip 插值；
+/// 驻留态到点→真隐藏（S4 换淡出）。
 unsafe fn dot_timeout_shared(hwnd: HWND) {
     let _ = hwnd;
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
@@ -4291,7 +4399,11 @@ unsafe fn dot_timeout_shared(hwnd: HWND) {
         g.cand2.take()
     };
     if let Some(c) = c2.as_mut() {
-        c.dot_timeout();
+        if c.is_collapsing() {
+            c.collapse_step();
+        } else {
+            c.dot_timeout();
+        }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.cand2 = c2;
