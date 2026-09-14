@@ -384,6 +384,9 @@ pub struct MotionConfig {
     pub fast_morph_ms: f64,
     /// S1→S0 淡出时长（ms）。
     pub fade_ms: f64,
+    /// S1 小圆颜色（#RRGGBBAA；空=皮肤高亮色。浅色皮肤高亮近白，
+    /// 白底宿主上小圆不可见——显式给深色夺回可见性）。
+    pub dot_color: String,
 }
 
 impl Default for MotionConfig {
@@ -395,6 +398,7 @@ impl Default for MotionConfig {
             morph_ms: 160.0,
             fast_morph_ms: 90.0,
             fade_ms: 300.0,
+            dot_color: String::new(),
         }
     }
 }

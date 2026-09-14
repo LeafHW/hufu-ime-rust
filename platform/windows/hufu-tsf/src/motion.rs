@@ -194,6 +194,9 @@ pub struct Motion {
     pub morph_ms: u32,
     pub fast_ms: u32,
     pub fade_ms: u32,
+    /// 小圆最低不透明度（皮肤高亮色自带 alpha 常低至 0.28——直用则
+    /// 小圆淡成白点；渲染时取 max(皮肤alpha, dot_alpha)）。
+    pub dot_alpha: f32,
 
     // —— 状态 ——
     phase: Phase,
@@ -217,6 +220,7 @@ impl Motion {
             morph_ms: 160,
             fast_ms: 90,
             fade_ms: 300,
+            dot_alpha: 0.95,
             phase: Phase::Hidden,
             dest: None,
             flight: None,
@@ -256,6 +260,7 @@ impl Motion {
         self.morph_ms = f("morph_ms", 160.0).clamp(40.0, 600.0) as u32;
         self.fast_ms = f("fast_morph_ms", 90.0).clamp(30.0, 400.0) as u32;
         self.fade_ms = f("fade_ms", 300.0).clamp(60.0, 1500.0) as u32;
+        self.dot_alpha = f("dot_alpha", 0.95).clamp(0.1, 1.0);
         self.dot_form = Form::dot(self.dot_size);
     }
 

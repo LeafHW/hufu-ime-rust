@@ -147,6 +147,12 @@ fn tl_cand_show(
             let mut skin_tl = skin.clone();
             if let Some(obj) = skin_tl.as_object_mut() {
                 obj.insert("entrance_anim".to_string(), serde_json::json!(true));
+                // 【八十三修 v3】TL 词框禁用 motion（词框候选的收场走
+                // tl_cand_hide 直收；motion 驻留会让 hide() 让位→残留）
+                obj.insert(
+                    "motion".to_string(),
+                    serde_json::json!({"enable": false}),
+                );
             }
             c.show(cands, raw, &skin_tl, anchor, selected);
         }
@@ -717,9 +723,13 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         }
         g.composition = None;
         // 【动效窗口让渡】tick 持有中 → 挂 pending 由 tick 放回时代为
-        // 隐藏（否则旧窗漏藏=残留阴影）
+        // 隐藏（否则旧窗漏藏=残留阴影）。OnDeactivate=输入法停用（切
+        // 窗/切输入法）：motion 小圆同样该收（hide 内 on_external_hide
+        // 同步状态机归零）。
         if let Some(mut c) = g.cand2.take() {
-            c.hide();
+            // 【八十三修 v3】OnDeactivate=输入法停用：真隐藏（force）
+            crate::tsf::diag_note("motion网: force←OnDeactivate停用");
+            c.force_hide();
         } else if g.cand2_busy {
             g.pending_cand_hide = true;
         }
@@ -1093,7 +1103,9 @@ fn handle_set_focus(
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            // 【八十三修 v3】失焦切窗=真隐藏（force_hide：无视小圆驻留）
+            crate::tsf::diag_note("motion网: force←OnSetFocus失焦");
+            c.force_hide();
             c.focus_reset();
         }
         trace("foc: E hide完");
@@ -2019,7 +2031,7 @@ impl EditSession_Impl {
                     if text == "{加词}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.force_hide();
                         }
                         drop(g);
                         // 【server 会话重置 2026-09-12 二十四修】用户实锤
@@ -2033,7 +2045,7 @@ impl EditSession_Impl {
                     } else if text == "{加权}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.force_hide();
                         }
                         drop(g);
                         let _ = crate::ipc::call(&serde_json::json!({"op": "reset"}));
@@ -2042,7 +2054,7 @@ impl EditSession_Impl {
                         if crate::addword::in_window_thread() {
                             tl_cand_hide();
                         } else if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.force_hide();
                         }
                     }
                     return Ok(());
@@ -2163,7 +2175,9 @@ impl EditSession_Impl {
                     }
                     if commit_text == "{隐藏候选}" {
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            // 【八十三修 v3】用户指令=真隐藏（force）
+                            crate::tsf::diag_note("motion网: force←隐藏候选指令");
+                            c.force_hide();
                         }
                     } else {
                         let weighted = commit_text == "{加权}";
@@ -3767,7 +3781,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                // 【八十三修 v3】宿主隐身=真隐藏（force）
+                c.force_hide();
             }
             g.cand2_dead = true;
             let (x, y) = if sh {
@@ -3793,10 +3808,23 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 丢弃（零消费）已删。
         let suppress_caret = caret.is_none() && !is_preview && !sh;
         if suppress_caret {
-            if crate::addword::in_window_thread() {
-                tl_cand_hide();
-            } else if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+            // 【八十三修 v2】同主分支 suppress 让位：motion 收场链活跃
+            //（S1 小圆驻留/飞行）时不杀小圆（owned/打包宿主的上屏断段
+            // 后 caret=None 每 poll 触发一次——记事本实机「上屏白点
+            // 即失」的凶手）。
+            let motion_alive = g
+                .cand2
+                .as_ref()
+                .map(|c| {
+                    c.motion.enabled && (c.motion.is_dot_dwell() || c.motion.in_flight())
+                })
+                .unwrap_or(false);
+            if !motion_alive {
+                if crate::addword::in_window_thread() {
+                    tl_cand_hide();
+                } else if let Some(c) = g.cand2.as_mut() {
+                    c.hide();
+                }
             }
             g.suppress_pending = true;
             arm_first_frame_timer();
@@ -3960,7 +3988,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                // 【八十三修 v3】宿主隐身=真隐藏（force）
+                c.force_hide();
             }
             // 不预置 cand_ui_active——由 ui_element_show 先问宿主
             // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
@@ -4089,8 +4118,22 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             && !host_is_searchhost()
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
-            if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+            // 【八十三修 v2】motion 收场链活跃（S1 小圆驻留/飞行）时
+            // suppress 的 hide 让位——上屏断段后 caret 链失效，poll 每
+            // 110ms 判 no_anchor→hide，把刚转的小圆连环杀掉（实机
+            // 断链根因之三：hide消息到达×N 的源头）。小圆不需要锚
+            //（已在 dot_at）；真新组段由 on_emerge 自然接管。
+            let motion_alive = g
+                .cand2
+                .as_ref()
+                .map(|c| {
+                    c.motion.enabled && (c.motion.is_dot_dwell() || c.motion.in_flight())
+                })
+                .unwrap_or(false);
+            if !motion_alive {
+                if let Some(c) = g.cand2.as_mut() {
+                    c.hide();
+                }
             }
             g.wps_caret_prev = g.caret;
             if g.wps_settle_start.is_none() {
@@ -5172,6 +5215,36 @@ fn poll_tick() {
             }
         }
         if raw_empty {
+            // 【八十三修 v3·poll 收场兜底】断段（上屏/删空）但键路径的
+            // 空帧 update_ui 没跑到的宿主（RichEdit 系：空格 commit 后
+            // 响应时 state 尚未清空，下一拍落到这里）——此前只清状态不
+            // 动窗：motion 收场链永不触发，候选窗直留到 stale 收拾。
+            // motion enabled 且窗在屏 → 补 hide_to_motion（锚=caret，
+            // 缺则窗 rect 左上）。非 motion 宿主保持原状（不额外动窗）。
+            if g.cand2.is_some() {
+                let motion_on = g
+                    .cand2
+                    .as_ref()
+                    .map(|c| c.motion.enabled)
+                    .unwrap_or(false);
+                if motion_on {
+                    let vis = g
+                        .cand2
+                        .as_ref()
+                        .map(|c| c.is_visible())
+                        .unwrap_or(false);
+                    if vis {
+                        let (cx, cy) = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2))
+                            .or_else(|| {
+                                g.cand2.as_ref().and_then(|c| c.window_topleft())
+                            })
+                            .unwrap_or((0, 0));
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.hide_to_motion(cx, cy);
+                        }
+                    }
+                }
+            }
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
             g.cand_shown_this_segment = false;
