@@ -1,9 +1,12 @@
-﻿//! hufu-tsf —— HuFu 输入法 Windows TSF 前端（纯 Rust COM DLL）。
+//! hufu-tsf —— HuFu 输入法 Windows TSF 前端（纯 Rust COM DLL）。
 //!
 //! 架构（同小狼毫）：本 DLL 是薄壳——按键事件通过命名管道发给 hufu-server
 //! 引擎，取回 {consumed, commit, state} 后操作 TSF 组段并绘制候选窗。
 
 mod addword;
+// 【动效 v5】球窗：候选框=一个可变形元素（球↔框），Windows.UI.Composition
+// 合成器线程驱动动画（高刷自适应/零 CPU）+真 DropShadow。
+mod ballwin;
 // 【死模块移除 2026-09-11】candwin.rs（v1 候选窗）与 candwin3.rs 同理：
 // CandidateWindow::new 无调用点（g.cand 恒 None），v2（DComp 直通）+
 // server 代画双通道定稿后 v1 只剩死分支。整模块删除（git 可回溯）。

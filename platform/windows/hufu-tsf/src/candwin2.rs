@@ -1,4 +1,4 @@
-﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -752,6 +752,8 @@ pub struct CandidateWindowV2 {
     dot_em_px: std::cell::Cell<f32>,
     /// 【S6 三修】外圈色（皮肤底色 back_color）。
     dot_ring_argb: std::cell::Cell<u32>,
+    /// 【动效 v5】球窗（Windows.UI.Composition；diag HUFU_BALL=1 启用）。
+    pub ball: Option<crate::ballwin::BallWin>,
     /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
     dot_grp_in: Option<IDCompositionEffectGroup>,
     dot_grp_sh: Option<IDCompositionEffectGroup>,
@@ -1075,8 +1077,24 @@ impl CandidateWindowV2 {
             let ctx: ID2D1DeviceContext = d2d_dev
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
                 .ok()?;
+            // 【动效 v5·球窗】diag 开关（HUFU_BALL=1）：Windows.UI.Composition
+            // 专用合成线程接管 morph（合成器驱动/高刷/真阴影）。宿主线程
+            // apartment 不可控（本机实证 DQ 静默失效）——树全困在专线程。
+            let ball = if std::env::var("HUFU_BALL").ok().as_deref() == Some("1") {
+                match crate::ballwin::BallWin::new(hwnd) {
+                    Some(b) => {
+                        crate::tsf::diag_note("v5球: 线程已起（建树结果见后续日志）");
+                        Some(b)
+                    }
+                    None => {
+                        crate::tsf::diag_note("v5球: 线程 spawn 失败");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_dev).ok()?;
-            let target = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
             // 【动效 v4】三层树：root(clip 容器，恒等变换) → visual(面板内容)
             // + visual_dot(圆点层，独立小 swapchain)。clip 与 scale 分属
             // 不同 visual（官方语义：clip 会被所在 visual 的 Transform 一起
@@ -1087,23 +1105,40 @@ impl CandidateWindowV2 {
             // 【S6 三修】中心点层+伪阴影层（z 序：面板→阴影→外圈→中心）。
             let visual_dot_in = dcomp.CreateVisual().ok()?;
             let visual_dot_sh = dcomp.CreateVisual().ok()?;
-            if visual_root.AddVisual(&visual, false, None).is_err()
-                || visual_root.AddVisual(&visual_dot_sh, false, None).is_err()
-                || visual_root.AddVisual(&visual_dot, false, None).is_err()
-                || visual_root.AddVisual(&visual_dot_in, false, None).is_err()
-                || target.SetRoot(&visual_root).is_err()
-                || dcomp.Commit().is_err()
-            {
-                return None;
-            }
+            // 【动效 v5】v5 模式（WinRT DesktopWindowTarget）下不建 v4
+            // DComp target——同一 HWND 只能绑一个合成树（本机实证
+            // CreateDesktopWindowTarget 0x88980800=窗已被占）。visual
+            // 层级照建，target=None 时 show() 的 swapchain 绑定分支
+            // 自动跳过（候选内容后续迁到 composition surface）。
+            let target = if ball.is_none() {
+                let t = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
+                if visual_root.AddVisual(&visual, false, None).is_err()
+                    || visual_root.AddVisual(&visual_dot_sh, false, None).is_err()
+                    || visual_root.AddVisual(&visual_dot, false, None).is_err()
+                    || visual_root.AddVisual(&visual_dot_in, false, None).is_err()
+                    || t.SetRoot(&visual_root).is_err()
+                    || dcomp.Commit().is_err()
+                {
+                    return None;
+                }
+                Some(t)
+            } else {
+                crate::tsf::diag_note("v5球: v4 DComp target 让位（v5 独占 HWND）");
+                let _ = visual_root.AddVisual(&visual, false, None);
+                let _ = visual_root.AddVisual(&visual_dot_sh, false, None);
+                let _ = visual_root.AddVisual(&visual_dot, false, None);
+                let _ = visual_root.AddVisual(&visual_dot_in, false, None);
+                None
+            };
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
 
             Some(CandidateWindowV2 {
                 hwnd,
+                ball,
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: Some(dcomp),
-                target: Some(target),
+                target,
                 visual_root: Some(visual_root),
                 visual: Some(visual),
                 visual_dot: Some(visual_dot),
@@ -1305,6 +1340,7 @@ impl CandidateWindowV2 {
 
             Some(CandidateWindowV2 {
                 hwnd,
+                ball: None,
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: None,
@@ -1751,6 +1787,11 @@ impl CandidateWindowV2 {
             if let Some(argb) = parse_hex_argb(rhex) {
                 self.dot_ring_argb.set(argb);
             }
+        }
+        // 【动效 v5】球帧色=当前皮肤（每帧刷新热更——全皮肤通用，
+        // 不绑死任何皮肤色值）：环=皮肤底色，心=高亮点色。
+        if let Some(b) = &self.ball {
+            b.paint_ball(self.dot_ring_argb.get(), self.dot_argb.get());
         }
         // 【动效 v4·S6】皮肤 motion 节点（每帧刷新；字段名对齐
         // hufu-skin::MotionConfig——server 强类型皮肤）。tsf 层传入的
@@ -4070,15 +4111,25 @@ impl CandidateWindowV2 {
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
-                SetWindowPos(
-                    self.hwnd,
-                    HWND_TOPMOST,
-                    px,
-                    py,
-                    apply.0,
-                    apply.1,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                 SetWindowPos(
+                     self.hwnd,
+                     HWND_TOPMOST,
+                     px,
+                     py,
+                     apply.0,
+                     apply.1,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                 )
+                 // 【动效 v5】球→框展开（合成器 Size 动画；swapchain
+                 // 面板渲染接入前=球色块展开——节奏先行验证）。
+                 .and_then(|_| {
+                     if let Some(b) = &self.ball {
+                         b.breath_off();
+                         b.fade_in();
+                         b.morph_open(apply.0 as f32, apply.1 as f32, 12.0);
+                     }
+                     Ok(())
+                 })
             } else {
                 // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
                 crate::tsf::trace("cw2: SWP纯显示(NOMOVE)——窗留在当前位置显示");
@@ -4207,6 +4258,16 @@ impl CandidateWindowV2 {
 
 
     pub fn hide(&mut self) {
+        // 【动效 v5】树级隐藏：窗口绝不能 SW_HIDE——NOREDIR+DWT 的树
+        // 在窗口隐藏时被 DWM 卸载，SWP_SHOWWINDOW 恢复窗口后**树不会
+        // 重建**（本机实证：上屏时 poll/focus 链先 hide() 再收球，
+        // morph_close 后永远黑屏）。视觉消失=root.SetIsVisible(false)，
+        // 窗口保持 visible（透明无副作用）。
+        if let Some(b) = &self.ball {
+            b.breath_off();
+            b.hide();
+            return;
+        }
         // 【动效 v4】真隐藏前先退出圆点态（立即清 dot 视觉/timer）。
         self.exit_dot(true);
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
@@ -4249,6 +4310,46 @@ impl CandidateWindowV2 {
     /// 的化身，窗在光标下方出现，圆也在光标下方，expand 才是「同点
     /// 形变」而非两个独立元素的位置跳变）。
     pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
+        // 【动效 v5】球窗接管：不进 v4 dot 链（clip/DComp/timer 全免）
+        //——morph_close 动画在合成线程（可被下一键入打断反转）；
+        // 窗口缩到球画布尺寸、贴光标右下。idle 渐隐=合成线程自理。
+        if let Some(b) = &self.ball {
+            // 窗口贴光标右下（球在树内容左上区）。窗口尺寸用「面板级」
+            //（44 小窗 NOREDIR+DWT 组合本机不渲染）。
+            // 【DWM invalidate 关键】SWP（位置变化）触发 DWM 重读
+            // swapchain 内容——不移动则 surface 更新不上屏（k×3 实证：
+            // 前两次窗口变→显示，第三次无变化→丢）。
+            let side_w = 160i32;
+            let side_h = 120i32;
+            unsafe {
+                let _swp_ok = SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    cx + 6,
+                    cy + 16,
+                    side_w,
+                    side_h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                let mut rr = RECT::default();
+                let _ = GetWindowRect(self.hwnd, &mut rr);
+                // 【低频日志】收球定位取证（前 3 次）。
+                static CLOSEPOS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if CLOSEPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                    crate::tsf::diag_note(&format!(
+                        "v5球: 收球 rect=({},{}) caret=({},{}) vis={}",
+                        rr.left, rr.top, cx, cy,
+                        IsWindowVisible(self.hwnd).0
+                    ));
+                }
+            }
+            b.paint_ball(self.dot_ring_argb.get(), self.dot_argb.get());
+            b.breath_on();
+            b.morph_close();
+            b.fade_in();
+            return;
+        }
         if self.dot_mode_cfg.get() == DotMode2::Plain {
             self.hide();
             return;
@@ -4638,22 +4739,10 @@ impl CandidateWindowV2 {
             sh_f,
             &mut self.dot_grp_sh,
         );
-        // 三层内容（Clear 色块）
-        if ok_ring {
-            if let Some(c) = self.dot_chain.clone() {
-                let _ = self.paint_dot_overlay(&c, self.dot_ring_argb.get());
-            }
-        }
-        if ok_in {
-            if let Some(c) = self.dot_chain_in.clone() {
-                let _ = self.paint_dot_overlay(&c, self.dot_argb.get());
-            }
-        }
-        if ok_sh {
-            if let Some(c) = self.dot_chain_sh.clone() {
-                let _ = self.paint_dot_overlay(&c, self.dot_shadow_argb.get());
-            }
-        }
+        // 【v5 接管】三层 overlay 的 Clear 色块绘制由 v5 球窗
+        //（Windows.UI.Composition 合成器驱动 morph）替代——不再逐层
+        // paint（避免与 v5 双通道视觉冲突）。
+        let _ = (ok_ring, ok_in, ok_sh);
         let _ = dc.Commit();
     }
 
@@ -4882,22 +4971,52 @@ impl CandidateWindowV2 {
         ok
     }
 
-    /// 【S6 四修·涌现辅助层】三层圆 overlay：arm_expand 时 attach 到
-    /// 圆盒位置（Clear 色块+clip 正圆——独立 dot 链，视觉已实证），
-    /// expand 期间随进度淡出——驻留圆帧（窗内容抗锯齿三层）→涌现第
-    /// 1 帧被此 overlay 无缝接棒（同位置同三色）→clip 展开露出内容+
-    /// 圆融化淡出=「圆变成窗」的连续叙事。
-    unsafe fn paint_dot_overlay(&mut self, chain: &IDXGISwapChain1, argb: u32) -> bool {
-        let ctx = match &self.ctx {
-            Some(x) => x.clone(),
-            None => return false,
+    /// 【S6 五修·同一元素】三层同心圆绘制核心——驻留圆帧（窗内容）
+    /// 与涌现 overlay（dot 链）**共用此函数**：像素级一致是「圆和候选
+    /// 是同一个元素的不同形态」的成立前提（涌现第 1 帧不穿帮）。
+    /// 前置：已 SetTarget+BeginDraw+SetTransform(identity)+Clear 透明。
+    unsafe fn draw_concentric(&self, ctx: &ID2D1DeviceContext, ccx: f32, ccy: f32, alpha: f32) {
+        let premul = |argb: u32| -> D2D1_COLOR_F {
+            let a = ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha;
+            D2D1_COLOR_F {
+                r: ((argb >> 16) & 0xFF) as f32 / 255.0 * a,
+                g: ((argb >> 8) & 0xFF) as f32 / 255.0 * a,
+                b: (argb & 0xFF) as f32 / 255.0 * a,
+                a,
+            }
         };
-        let a = ((argb >> 24) & 0xFF) as f32 / 255.0;
-        let premul = D2D1_COLOR_F {
-            r: ((argb >> 16) & 0xFF) as f32 / 255.0 * a,
-            g: ((argb >> 8) & 0xFF) as f32 / 255.0 * a,
-            b: (argb & 0xFF) as f32 / 255.0 * a,
-            a,
+        let fill_circle = |rad: f32, col: &D2D1_COLOR_F| {
+            if let Ok(br) = ctx.CreateSolidColorBrush(col, None) {
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: ccx - rad,
+                        top: ccy - rad,
+                        right: ccx + rad,
+                        bottom: ccy + rad,
+                    },
+                    radiusX: rad,
+                    radiusY: rad,
+                };
+                ctx.FillRoundedRectangle(&rr, &br);
+            }
+        };
+        let pad_f = DOT_SHADOW_PAD as f32;
+        fill_circle(
+            DOT_SIDE as f32 * 0.5 + pad_f,
+            &premul(self.dot_shadow_argb.get()),
+        );
+        fill_circle(DOT_SIDE as f32 * 0.5, &premul(self.dot_ring_argb.get()));
+        fill_circle(DOT_INNER as f32 * 0.5, &premul(self.dot_argb.get()));
+    }
+
+    /// 【S6 五修·涌现辅助层】单链 overlay：buffer=抗锯齿三层圆（与
+    /// 驻留圆帧同一绘制核心 draw_concentric），透明外围——**无 clip**
+    ///（旧 Clear 色块+clip 硬边=涌现第 1 帧质感突变穿帮的根源）。
+    /// 淡出走 dot_grp 组透明度。
+    unsafe fn paint_dot_overlay(&mut self, ccx: f32, ccy: f32) -> bool {
+        let (chain, ctx) = match (&self.dot_chain, &self.ctx) {
+            (Some(c), Some(x)) => (c.clone(), x.clone()),
+            _ => return false,
         };
         let bp = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
@@ -4920,7 +5039,13 @@ impl CandidateWindowV2 {
         ctx.SetTarget(&bmp);
         let _ = ctx.BeginDraw();
         ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2::identity());
-        ctx.Clear(Some(&premul));
+        ctx.Clear(Some(&D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }));
+        self.draw_concentric(&ctx, ccx, ccy, 1.0);
         let _ = ctx.EndDraw(None, None);
         ctx.SetTarget(None);
         chain.Present(1, DXGI_PRESENT(0)).0 == 0
@@ -4963,32 +5088,6 @@ impl CandidateWindowV2 {
         let t = self.collapse_to.get();
         let ccx = (t.0 + t.2) * 0.5;
         let ccy = (t.1 + t.3) * 0.5;
-        // premultiplied 颜色（argb×alpha_mult）
-        let premul = |argb: u32| -> D2D1_COLOR_F {
-            let a = ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha_mult;
-            D2D1_COLOR_F {
-                r: ((argb >> 16) & 0xFF) as f32 / 255.0 * a,
-                g: ((argb >> 8) & 0xFF) as f32 / 255.0 * a,
-                b: (argb & 0xFF) as f32 / 255.0 * a,
-                a,
-            }
-        };
-        // 抗锯齿实心圆（FillRoundedRect 半径=半宽）
-        let fill_circle = |ctx: &ID2D1DeviceContext, cx: f32, cy: f32, rad: f32, col: &D2D1_COLOR_F| {
-            if let Ok(br) = ctx.CreateSolidColorBrush(col, None) {
-                let rr = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: cx - rad,
-                        top: cy - rad,
-                        right: cx + rad,
-                        bottom: cy + rad,
-                    },
-                    radiusX: rad,
-                    radiusY: rad,
-                };
-                ctx.FillRoundedRectangle(&rr, &br);
-            }
-        };
         ctx.SetTarget(&bitmap);
         let _ = ctx.BeginDraw();
         // 【根因】窗渲染管线的内容带 dpi_scale×平移 的 transform 且
@@ -5003,29 +5102,8 @@ impl CandidateWindowV2 {
             b: 0.0,
             a: 0.0,
         }));
-        // 三层同心圆（从大到小）：伪阴影→底色托盘→高亮中心点
-        let pad_f = DOT_SHADOW_PAD as f32;
-        fill_circle(
-            &ctx,
-            ccx,
-            ccy,
-            DOT_SIDE as f32 * 0.5 + pad_f,
-            &premul(self.dot_shadow_argb.get()),
-        );
-        fill_circle(
-            &ctx,
-            ccx,
-            ccy,
-            DOT_SIDE as f32 * 0.5,
-            &premul(self.dot_ring_argb.get()),
-        );
-        fill_circle(
-            &ctx,
-            ccx,
-            ccy,
-            DOT_INNER as f32 * 0.5,
-            &premul(self.dot_argb.get()),
-        );
+        // 【S6 五修】与 overlay 共用绘制核心（像素级一致）
+        self.draw_concentric(&ctx, ccx, ccy, alpha_mult);
         let _ = ctx.EndDraw(None, None);
         ctx.SetTarget(None);
         chain.Present(1, DXGI_PRESENT(0)).0 == 0

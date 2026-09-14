@@ -34,6 +34,18 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_DirectComposition",
     "Foundation_Numerics",
     "Win32_Media_Audio",
+    # 【动效 v5·WinRT 合成层】Windows.UI.Composition：合成器线程驱动
+    # 动画（高刷自适应/零 CPU）+真 DropShadow+可动画 clip+隐式跟随。
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "Graphics_DirectX",
+    "Foundation",
+    # 合成渐变/形状集合（GradientStops().Append/Shapes().InsertAtTop）。
+    "Foundation_Collections",
+    # DispatcherQueue（桌面应用 WinRT 合成前置——coremessaging.dll）。
+    "System",
 ] }
 windows-core = "0.58"
 serde = { version = "1", features = ["derive"] }
