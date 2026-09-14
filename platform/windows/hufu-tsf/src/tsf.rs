@@ -1,4 +1,4 @@
-﻿//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
+//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
@@ -412,6 +412,9 @@ pub struct Shared {
     /// 【滚轮缩放候选框】最近一次 show 的渲染参数（候选/编码/选中）：
     /// WM_MOUSEWHEEL 改字号后用它立即重绘（无键事件触发 update_ui）。
     pub last_show: Option<(Vec<(String, String)>, String, usize)>,
+    /// 【动效 v4·S6 修】最近一次真上屏文本（Op::Commit 落字时写，
+    /// hide_as_dot 圆心补偿取用即清——上屏后新光标=旧光标+字宽）。
+    pub last_commit_txt: Option<String>,
 }
 
 impl Shared {
@@ -496,6 +499,7 @@ impl Shared {
             line_end: false,
             last_key_ctx: None,
             last_show: None,
+            last_commit_txt: None,
         }
     }
 
@@ -2122,6 +2126,9 @@ impl EditSession_Impl {
                 // hupo_had_commit（raw==1 立段保护：句内不重新立段）。
                 if !text.is_empty() {
                     g.hupo_had_commit = true;
+                    // 【动效 v4·S6 修】记上屏文本——断段收场圆心按字宽
+                    // 右移（贴上屏后新光标，不压刚上屏的字）。
+                    g.last_commit_txt = Some(text.clone());
                 }
                 if g.caret_est_line_h > 0 {
                     let mut w = 0.0f32;
@@ -3625,10 +3632,13 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         // 【动效 v4】上屏断段收场：光标点可得→转圆点驻留（hide_as_dot
         // 内部 DComp 树不可用时自动回落普通 hide）；否则直收。
+        // 【S6 修】带上屏文本（Op::Commit 落字时记，取用即清）——
+        // hide_as_dot 按字宽右移圆心（断段 caret 还是上屏前旧光标）。
         let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
+        let commit_txt = g.last_commit_txt.take().unwrap_or_default();
         if let Some(c) = g.cand2.as_mut() {
             match caret_pt {
-                Some((cx, cy)) => c.hide_as_dot(cx, cy),
+                Some((cx, cy)) => c.hide_as_dot(cx, cy, &commit_txt),
                 None => c.hide(),
             }
         }
@@ -5215,9 +5225,10 @@ fn poll_tick() {
                 .unwrap_or((false, false));
             if vis && !dot {
                 let caret_pt = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
+                let commit_txt = g.last_commit_txt.take().unwrap_or_default();
                 if let Some(c) = g.cand2.as_mut() {
                     match caret_pt {
-                        Some((cx, cy)) => c.hide_as_dot(cx, cy),
+                        Some((cx, cy)) => c.hide_as_dot(cx, cy, &commit_txt),
                         None => c.hide(),
                     }
                 }

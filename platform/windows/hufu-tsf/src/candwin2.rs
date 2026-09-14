@@ -738,6 +738,8 @@ pub struct CandidateWindowV2 {
     dot_fast_morph_cfg: std::cell::Cell<u32>,
     dot_rapid_cfg: std::cell::Cell<u32>,
     dot_fast_cfg: std::cell::Cell<u32>,
+    /// 【S6 修】主字号像素（em）——上屏字宽补偿用（show 每帧刷新）。
+    dot_em_px: std::cell::Cell<f32>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1143,6 +1145,7 @@ impl CandidateWindowV2 {
                 dot_fast_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS / 2),
                 dot_rapid_cfg: std::cell::Cell::new(DOT_RAPID_MS),
                 dot_fast_cfg: std::cell::Cell::new(DOT_FAST_MS),
+                dot_em_px: std::cell::Cell::new(23.0),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1339,6 +1342,7 @@ impl CandidateWindowV2 {
                 dot_fast_morph_cfg: std::cell::Cell::new(DOT_MORPH_MS / 2),
                 dot_rapid_cfg: std::cell::Cell::new(DOT_RAPID_MS),
                 dot_fast_cfg: std::cell::Cell::new(DOT_FAST_MS),
+                dot_em_px: std::cell::Cell::new(23.0),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1680,11 +1684,27 @@ impl CandidateWindowV2 {
         if self.dot_mode.get() {
             self.exit_dot(false);
         }
-        // 【动效 v4】圆点颜色=皮肤高亮色（每帧刷新，热更即生效）。
-        if let Some(hex) = skin
-            .pointer("/colors/hilited_candidate_back_color")
+        // 【动效 v4·S6 修】圆点颜色（每帧刷新，热更即生效）：
+        //   motion.dot_color 显式 > 皮肤高亮文字色 > 皮肤高亮底色。
+        // 高亮文字色优先——浅色皮肤的高亮底色近白（白底宿主上小圆
+        // 不可见，八十三修实证），文字色与底色天然有对比（设计师
+        // 保证）；读取双形态（/colors 与 /skin/colors——skin 参数是
+        // IPC 应答根，motion/colors 都在 /skin 下）。
+        let cval = |k: &str| -> Option<&str> {
+            skin
+                .pointer(&format!("/colors/{k}"))
+                .or_else(|| skin.pointer(&format!("/skin/colors/{k}")))
+                .and_then(|v| v.as_str())
+        };
+        let explicit_dot = skin
+            .pointer("/motion/dot_color")
+            .or_else(|| skin.pointer("/skin/motion/dot_color"))
             .and_then(|v| v.as_str())
-        {
+            .filter(|s| !s.is_empty());
+        let hex = explicit_dot
+            .or_else(|| cval("hilited_candidate_text_color"))
+            .or_else(|| cval("hilited_candidate_back_color"));
+        if let Some(hex) = hex {
             if let Some(argb) = parse_hex_argb(hex) {
                 self.dot_argb.set(argb);
             }
@@ -1911,6 +1931,8 @@ impl CandidateWindowV2 {
         // 实测宽 + 2px）。
         let mut label_w = if show_index { 0.0f32 } else { 0.0 };
         let em = font_pt * 96.0 / 72.0;
+        // 【S6 修】存主字号 px——上屏字宽补偿（圆心贴上屏后新光标）
+        self.dot_em_px.set(em);
         // 横排（skin.layout.horizontal）：候选单行横铺，weasel 式
         let horizontal = skin
             .pointer("/skin/layout/horizontal")
@@ -4178,7 +4200,10 @@ impl CandidateWindowV2 {
     /// 连打（<rapid_ms）不冒圆直收；快打（<fast_ms）快速 morph；
     /// 慢打完整 morph。【S6】皮肤 motion.mode 覆盖：plain=朴素即隐，
     /// snap=直切圆（一帧形变）。
-    pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
+    /// 【S6 修·位置】断段时的 caret 是**上屏前**旧光标（上屏文字的起
+    /// 点）——直接用圆会压在刚上屏的字上。按上屏文本宽度右移
+    /// （全角≈em、半角≈0.55em）——圆落在「文字后面」（=新光标处）。
+    pub fn hide_as_dot(&mut self, cx: i32, cy: i32, commit_text: &str) {
         if self.dot_mode_cfg.get() == DotMode2::Plain {
             self.hide();
             return;
@@ -4194,6 +4219,15 @@ impl CandidateWindowV2 {
             self.hide();
             return;
         }
+        let em = self.dot_em_px.get();
+        let advance: f32 = commit_text
+            .chars()
+            .map(|ch| {
+                let wide = (ch as u32) >= 0x2E80; // CJK 及全角区
+                if wide { em } else { em * 0.55 }
+            })
+            .sum();
+        let cx2 = cx + advance.round() as i32;
         let dur = if self.dot_mode_cfg.get() == DotMode2::Snap {
             1 // 直切圆（一帧形变）
         } else if dt_ms < self.dot_fast_cfg.get() {
@@ -4202,7 +4236,7 @@ impl CandidateWindowV2 {
             self.dot_morph_cfg.get() // 慢打=完整
         };
         self.morph_dur.set(dur);
-        if !self.enter_dot(cx, cy) {
+        if !self.enter_dot(cx2, cy) {
             self.hide();
         }
     }
@@ -4228,6 +4262,15 @@ impl CandidateWindowV2 {
             let rh = (r.bottom - r.top).max(DOT_SIDE as i32);
             let ox = (cx - r.left - DOT_SIDE as i32 / 2).clamp(0, rw - DOT_SIDE as i32) as f32;
             let oy = (cy - r.top - DOT_SIDE as i32 / 2).clamp(0, rh - DOT_SIDE as i32) as f32;
+            // 【S6 修·诊断】圆心定位取证（首 3 次打）
+            static DOTPOS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if DOTPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                crate::tsf::diag_note(&format!(
+                    "v4圆位: caret=({},{}) rect=({},{},{},{}) 圆偏=({},{})",
+                    cx, cy, r.left, r.top, r.right, r.bottom, ox, oy
+                ));
+            }
             // 【S3】收场 morph 改 CPU 逐帧驱动（DOT_TIMER 16ms tick，
             // 静态 clip setter+Commit——IDCompositionAnimation 在本机
             // 不被驱动（高速截帧实证：属性停 from 值），而静态 clip+
@@ -4439,6 +4482,10 @@ impl CandidateWindowV2 {
     /// 生长到新面板盒；dot 层 opacity 1→0 同步渐隐（expand_step）。
     fn arm_expand(&mut self) {
         self.expand_pending.set(false);
+        // 【S6 修】涌现=内容回来的仪式时刻——永远完整时长（不随快打
+        // 节奏降半；连打直收不走到这）。「圆变成候选」的叙事要给足
+        // 感知时间。
+        self.morph_dur.set(self.dot_morph_cfg.get());
         let w_f = self.live_size.get().0.max(DOT_SIDE as i32) as f32;
         let h_f = self.live_size.get().1.max(DOT_SIDE as i32) as f32;
         let r1 = self.last_corner_px.get().clamp(0.0, (w_f.min(h_f)) * 0.5);
@@ -4482,9 +4529,12 @@ impl CandidateWindowV2 {
                 let _ = pc.SetBottomRightRadiusY2(rad);
                 let _ = dc.Commit();
             }
-            // dot 渐隐（与生长同步）
+            // dot 渐隐后置（进度 55% 前圆保持全显——「圆变成窗」的
+            // 连续感：圆先陪跑形变大半程，收尾 45% 才淡出，而不是
+            // 从头同步淡出=圆很快没了只剩窗在长）。
             if let Some(gd) = &self.dot_grp {
-                let _ = gd.SetOpacity2(1.0 - e);
+                let d = ((e - 0.55) / 0.45).clamp(0.0, 1.0);
+                let _ = gd.SetOpacity2(1.0 - d);
             }
             if p >= 1.0 {
                 self.collapse_t0.set(None);
@@ -4686,6 +4736,14 @@ impl CandidateWindowV2 {
 /// 【动效 v4】"#RRGGBBAA" → 0xAARRGGBB（皮肤高亮色→圆点色）。
 fn parse_hex_argb(s: &str) -> Option<u32> {
     let h = s.trim_start_matches('#');
+    // 6 位 #RRGGBB 补 FF 透明（皮肤惯例两种长度都有）
+    let owned;
+    let h = if h.len() == 6 {
+        owned = format!("{h}FF");
+        &owned
+    } else {
+        h
+    };
     if h.len() != 8 {
         return None;
     }
