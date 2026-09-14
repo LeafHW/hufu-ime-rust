@@ -40,8 +40,9 @@ use windows::Win32::System::WinRT::Composition::{
 pub const BALL_D: f32 = 22.0;
 /// 球画布边距（阴影余量；画布=BALL_D+2*PAD）。
 pub const BALL_PAD: f32 = 11.0;
-/// 球→框（快）。【四修】150→80ms（用户实证偏慢一倍——提速）。
-pub const MORPH_OPEN_MS: i32 = 80;
+/// 球→框。【四修补】用户「速度慢一倍」=放慢：150→300ms（初解反了
+/// 提成 80ms——本条回摆）。
+pub const MORPH_OPEN_MS: i32 = 300;
 /// 框→球（慢——连打空格防闪烁；可被键入打断反转）。
 pub const MORPH_CLOSE_MS: i32 = 260;
 /// 渐隐时长。
@@ -456,11 +457,14 @@ unsafe fn synth_thread(
             BallCmd::FadeIn => {
                 root.StopAnimation(&HSTRING::from("Opacity"));
                 let _ = root.SetOpacity(1.0);
-                // 【移动后刷新】窗口 SWP 移动+缩尺后树疑似不重提交
-                //（本机实证 morph_close 后不渲染）——IsVisible 翻转强制
-                // 合成器重评估整棵树。
-                let _ = root.SetIsVisible(false);
-                let _ = root.SetIsVisible(true);
+                // 【防闪·五修】翻转仅在树不可见时做（观察窗内框本就
+                // 可见，show 每键盲翻 false→true=一帧闪，用户实证
+                // 「打下一个编码会闪一下」的嫌疑主源）。
+                let vis = root.IsVisible().unwrap_or(true);
+                if !vis {
+                    let _ = root.SetIsVisible(false);
+                    let _ = root.SetIsVisible(true);
+                }
             }
             BallCmd::BreathOn => {
                 if let Ok(a) = compositor.CreateExpressionAnimation() {

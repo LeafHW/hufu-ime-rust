@@ -4142,14 +4142,14 @@ impl CandidateWindowV2 {
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
                     let mut fx = px as f32;
                     let mut fy = py as f32;
-                    // 【四修·避光标】框完全展开后不得遮挡光标：面板上缘
-                    // 至少在光标底下方 6px。
+                    // 【四修·避光标】框完全展开后最高点不得高于光标：
+                    // anchor.bottom 实测比视觉光标条底浅 ~8px（曾重叠
+                    // 2px），+12 安全垫保证整条光标露出。
                     if let Some(a) = anchor {
-                        let floor = a.bottom as f32 + 6.0;
+                        let floor = a.bottom as f32 + 12.0;
                         if fy < floor {
                             fy = floor;
                         }
-                        // x 同理：面板左缘不越过光标条右缘（右移避开）。
                         let xfloor = a.right as f32 + 4.0;
                         if fx < xfloor && fx + apply.0 as f32 > xfloor {
                             fx = xfloor;
