@@ -1,4 +1,4 @@
-//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -689,6 +689,10 @@ pub struct CandidateWindowV2 {
     /// ——面板外壳被「拉过去」（延伸感），内容按目标布局裁在外壳内；
     /// 稳态帧 None（目标尺寸渲染，零开销）。
     pub(crate) chrome_override: std::cell::Cell<Option<(i32, i32)>>,
+    /// 【v3.1】dwell 期 buffer 被 ResizeBuffers 缩到 side——回面板渲染
+    /// 时 ensure_swapchain_dcomp 必须强制重建（self.size 是 alloc 口径
+    /// 发现不了 shrink）。
+    pub(crate) dot_shrunk: std::cell::Cell<bool>,
     /// 上次显示时刻（hide 距 show <250ms 直接隐藏不动画）
     pub(crate) last_show_at: Option<std::time::Instant>,
     /// 最近 SetWindowPos 应用过的窗口尺寸（检测尺寸变化→rect 同步）
@@ -1013,6 +1017,7 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                dot_shrunk: std::cell::Cell::new(false),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
@@ -1185,6 +1190,7 @@ impl CandidateWindowV2 {
                 last_show_at: None,
                 size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                dot_shrunk: std::cell::Cell::new(false),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
                 size_ms: 90,
@@ -1419,7 +1425,18 @@ impl CandidateWindowV2 {
         // 全不透明才「唤醒」）——收起→展开、连打变宽全中招。缓冲大
         // 于窗口的部分由 DWM 按窗口裁剪（旧帧残留实验已证）。
         // 代价：单窗 VRAM 上限 ~4MB（1024²×2buf×4B），可忽略。
-        if self.swapchain.is_some() && w <= self.size.0 as u32 && h <= self.size.1 as u32 {
+        //
+        // 【v3.1 dwell 缩窗返回修复】render_dot 曾把 buffer ResizeBuffers
+        // 到 26px 而 self.size 仍记旧 alloc 值——涌现回面板时下方 grow
+        // 检查（w<=self.size）误判"已够大"直接 return：26px buffer 被
+        // 拉伸进 206px 窗=候选内容废掉（用户实锤「看不到候选框，红色
+        // 元素跳几下但最终没变成候选框」）。dot_shrunk 标志强制走重建。
+        if self.dot_shrunk.get() {
+            self.dot_shrunk.set(false);
+        } else if self.swapchain.is_some()
+            && w <= self.size.0 as u32
+            && h <= self.size.1 as u32
+        {
             return true;
         }
         unsafe {
@@ -4238,7 +4255,7 @@ impl CandidateWindowV2 {
                         "motion圆: resize {}→{side} hr=0x{:08X} 实际={aw}",
                         d.Width, hrv as u32
                     ));
-                    // 【v3】部分驱动在 ResizeBuffers 后 DComp visual 的
+                    // 【v3.1】部分驱动在 ResizeBuffers 后 DComp visual 的
                     // content 绑定失效（窗可见但内容全透明）——re-attach +
                     // Commit 恢复树。仅 resize 那一帧执行，开销 µs 级。
                     if let (Some(v), Some(dc)) = (&self.visual, &self.dcomp) {
@@ -4246,6 +4263,11 @@ impl CandidateWindowV2 {
                         let _ = dc.Commit();
                         crate::tsf::diag_note("motion圆: re-attach+Commit 完成");
                     }
+                    // 【v3.1】置 shrink 标志：ensure_swapchain_dcomp 的
+                    // grow 检查看 self.size（alloc 口径）发现不了 buffer
+                    // 已缩——回面板渲染必须强制重建（否则 26px buffer
+                    // 拉伸进 206px 窗，候选内容废）。
+                    self.dot_shrunk.set(true);
                 }
             }
         }
