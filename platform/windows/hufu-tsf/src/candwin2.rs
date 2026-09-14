@@ -547,7 +547,11 @@ pub struct CandidateWindowV2 {
     swapchain: Option<IDXGISwapChain1>,
     dcomp: Option<IDCompositionDevice>,
     target: Option<IDCompositionTarget>,
+    visual_root: Option<IDCompositionVisual>,
     visual: Option<IDCompositionVisual>,
+    /// 【动效 v4】圆点层：独立 26px swapchain，morph 末态的驻留圆。
+    visual_dot: Option<IDCompositionVisual>,
+    dot_chain: Option<IDXGISwapChain1>,
     dwrite: Option<IDWriteFactory>,
     dxgi: Option<IDXGIDevice>,
     /// 【拉伸动效遗留】morph 时期的壳圆角覆盖。现仅保留结构位（恒
@@ -958,7 +962,20 @@ impl CandidateWindowV2 {
                 .ok()?;
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_dev).ok()?;
             let target = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
+            // 【动效 v4】三层树：root(clip 容器，恒等变换) → visual(面板内容)
+            // + visual_dot(圆点层，独立小 swapchain)。clip 与 scale 分属
+            // 不同 visual（官方语义：clip 会被所在 visual 的 Transform 一起
+            // 变换）——morph 的形变全在这棵树上做，buffer 恒定不动。
+            let visual_root = dcomp.CreateVisual().ok()?;
             let visual = dcomp.CreateVisual().ok()?;
+            let visual_dot = dcomp.CreateVisual().ok()?;
+            if visual_root.AddVisual(&visual, false, None).is_err()
+                || visual_root.AddVisual(&visual_dot, false, None).is_err()
+                || target.SetRoot(&visual_root).is_err()
+                || dcomp.Commit().is_err()
+            {
+                return None;
+            }
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
 
             Some(CandidateWindowV2 {
@@ -967,7 +984,10 @@ impl CandidateWindowV2 {
                 swapchain: None,
                 dcomp: Some(dcomp),
                 target: Some(target),
+                visual_root: Some(visual_root),
                 visual: Some(visual),
+                visual_dot: Some(visual_dot),
+                dot_chain: None,
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
                 corner_override: std::cell::Cell::new(None),
@@ -1136,7 +1156,10 @@ impl CandidateWindowV2 {
                 swapchain: None,
                 dcomp: None,
                 target: None,
+                visual_root: None,
                 visual: None,
+                visual_dot: None,
+                dot_chain: None,
                 dwrite: Some(dwrite),
                 dxgi: Some(dxgi_dev.clone()),
                 corner_override: std::cell::Cell::new(None),
@@ -1441,11 +1464,11 @@ impl CandidateWindowV2 {
                 Some(c) => c,
                 None => return false,
             };
-            if let (Some(visual), Some(target), Some(dc)) =
-                (&self.visual, &self.target, &self.dcomp)
+            if let (Some(visual_root), Some(visual), Some(target), Some(dc)) =
+                (&self.visual_root, &self.visual, &self.target, &self.dcomp)
             {
                 if visual.SetContent(&chain).is_err()
-                    || target.SetRoot(visual).is_err()
+                    || target.SetRoot(visual_root).is_err()
                     || dc.Commit().is_err()
                 {
                     crate::tsf::trace("cw2: dcomp attach FAIL");
