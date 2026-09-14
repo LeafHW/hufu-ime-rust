@@ -485,6 +485,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 crate::tsf::diag_note("v4圆: 心跳tick到达(2.5s)");
                 return LRESULT(0);
             }
+            if id == BALL_DELAY_ID {
+                // 【v5·四修】收球观察窗到点（半秒无键入）→框→球。
+                unsafe { KillTimer(hwnd, BALL_DELAY_ID) };
+                unsafe { ball_delay_fire_shared(hwnd) };
+                return LRESULT(0);
+            }
         }
         _ => {}
     }
@@ -759,6 +765,10 @@ pub struct CandidateWindowV2 {
     /// 【morph v3·去重】上次收球目标 caret——tsf poll 同 caret 重复
     /// 调 hide_as_dot 时跳过（驻留期抖动根治）。新键入复位。
     ball_target: std::cell::Cell<(i32, i32)>,
+    /// 【v5·四修】收球观察窗的目标 caret（500ms 到点用它收球）。
+    ball_pending: std::cell::Cell<(i32, i32)>,
+    /// 【v5·四修】收球观察窗挂着（hide 上屏链跳过判据）。
+    ball_delay_armed: std::cell::Cell<bool>,
     /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
     dot_grp_in: Option<IDCompositionEffectGroup>,
     dot_grp_sh: Option<IDCompositionEffectGroup>,
@@ -1142,6 +1152,8 @@ impl CandidateWindowV2 {
                 ball,
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ball_target: std::cell::Cell::new((0, 0)),
+                ball_pending: std::cell::Cell::new((0, 0)),
+                ball_delay_armed: std::cell::Cell::new(false),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: Some(dcomp),
@@ -1350,6 +1362,8 @@ impl CandidateWindowV2 {
                 ball: None,
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ball_target: std::cell::Cell::new((0, 0)),
+                ball_pending: std::cell::Cell::new((0, 0)),
+                ball_delay_armed: std::cell::Cell::new(false),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: None,
@@ -4126,8 +4140,27 @@ impl CandidateWindowV2 {
                 // Offset 补偿（球屏位不变起步）。
                 if let Some(b) = &self.ball {
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
-                    let fx = px as f32;
-                    let fy = py as f32;
+                    let mut fx = px as f32;
+                    let mut fy = py as f32;
+                    // 【四修·避光标】框完全展开后不得遮挡光标：面板上缘
+                    // 至少在光标底下方 6px。
+                    if let Some(a) = anchor {
+                        let floor = a.bottom as f32 + 6.0;
+                        if fy < floor {
+                            fy = floor;
+                        }
+                        // x 同理：面板左缘不越过光标条右缘（右移避开）。
+                        let xfloor = a.right as f32 + 4.0;
+                        if fx < xfloor && fx + apply.0 as f32 > xfloor {
+                            fx = xfloor;
+                        }
+                    }
+                    // 【四修·收球观察窗取消】新键入=框跟随光标平滑移动
+                    // （屏位锚 from=cur 续动），不收球。
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, BALL_DELAY_ID);
+                    }
+                    self.ball_delay_armed.set(false);
                     // 窗口=「球位∪框位」包围盒。球位未知时（首键，无
                     // 球史）用 anchor 光标右下估位。morph 引擎屏位锚：
                     // from=当前视觉位（首键=原地起步）——无跳变。
@@ -4298,18 +4331,29 @@ impl CandidateWindowV2 {
     }
 
 
+    /// v5 球窗启用？（tsf 断段收窗跳过判据——观察窗语义。）
+    pub fn ball_on(&self) -> bool {
+        self.ball.is_some()
+    }
+
     pub fn hide(&mut self) {
-        // 【动效 v5】树级隐藏：窗口绝不能 SW_HIDE——NOREDIR+DWT 的树
+        // 【动效 v5·四修】树级隐藏：窗口绝不能 SW_HIDE——NOREDIR+DWT 的树
         // 在窗口隐藏时被 DWM 卸载，SWP_SHOWWINDOW 恢复窗口后**树不会
         // 重建**（本机实证：上屏时 poll/focus 链先 hide() 再收球，
         // morph_close 后永远黑屏）。视觉消失=root.SetIsVisible(false)，
         // 窗口保持 visible（透明无副作用）。
+        // 【观察窗语义】收球观察窗（500ms）挂着期间的上屏链 hide
+        //（tsf 断段收窗等）=跳过——框保持；真收场由观察窗到点的
+        // morph_close 接管。焦点丢失等场景若恰在窗内，最多延 500ms
+        // 收（观察窗 timer 宿主线程照跑）——可接受。
         if let Some(b) = &self.ball {
+            if self.ball_delay_armed.get() {
+                return;
+            }
             b.breath_off();
             b.hide();
             return;
-        }
-        // 【动效 v4】真隐藏前先退出圆点态（立即清 dot 视觉/timer）。
+        }        // 【动效 v4】真隐藏前先退出圆点态（立即清 dot 视觉/timer）。
         self.exit_dot(true);
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
@@ -4356,23 +4400,19 @@ impl CandidateWindowV2 {
         // 跳变）。idle 渐隐=合成线程自理。
         if let Some(b) = &self.ball {
             let side = crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD;
-            // 新球屏位（元素框左上；球心=光标右下 ~28px、下方 ~38px——
-            // 既有驻留观感）。
             let sx = cx as f32 + 6.0;
             let sy = cy as f32 + 16.0;
-            // 【去重·抖动根治①】tsf poll 会按 tick 重复调本函数（同
-            // caret）——重复收球=反复重置 morph+fade_in 翻转=驻留期抖
-            // 动（用户实证）。同目标直接跳过。
+            // 【去重】tsf poll 会按 tick 重复调本函数（同 caret）。
             if self.ball_target.get() == (cx, cy) {
                 return;
             }
             self.ball_target.set((cx, cy));
+            // 【四修·收球观察窗】上屏后不立即框→球——半秒观察：期内
+            // 键入（show 杀 timer，框平滑跟去新位）；无键入到点收球。
+            self.ball_pending.set((cx, cy));
             unsafe {
                 let mut rr = RECT::default();
                 let _ = GetWindowRect(self.hwnd, &mut rr);
-                // 覆盖检查：新球位+side ⊄ 当前窗口 → 扩窗到「球∪框」
-                // 包围盒（morph from=当前视觉位——合成线程命令时刷新
-                // 窗口原点自适应，无需手动补偿）。
                 let need = sx < rr.left as f32
                     || sy < rr.top as f32
                     || sx + side > rr.right as f32
@@ -4393,10 +4433,9 @@ impl CandidateWindowV2 {
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
                 }
-                // fade_in：Opacity 归一+IsVisible 翻转（树重提交——
-                // 收球起始帧上屏）。
-                b.fade_in();
-                b.morph_close(sx, sy);
+                let _ = KillTimer(self.hwnd, BALL_DELAY_ID);
+                let _ = SetTimer(self.hwnd, BALL_DELAY_ID, BALL_DELAY_MS, None);
+                self.ball_delay_armed.set(true);
             }
             return;
         }
@@ -5198,6 +5237,11 @@ pub const DOT_INNER: i32 = 9;
 pub const DOT_SHADOW_PAD: i32 = 3;
 pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
+/// 【v5·四修】收球延迟 timer：上屏后不立即框→球——半秒观察窗（期内
+/// 键入=框跟随光标平滑移动不收；无键入才收球）。500ms 短于本机 timer
+/// 静默杀阈值（>1-2s），安全。
+pub const BALL_DELAY_ID: usize = DOT_TIMER_ID + 2;
+pub const BALL_DELAY_MS: u32 = 500;
 pub const DOT_MORPH_MS: u32 = 180;
 pub const DOT_TICK_MS: u32 = 16;
 pub const DOT_FADE_MS: u32 = 200;
@@ -5250,8 +5294,33 @@ const FADE_FLOOR: f64 = 0.6;
 /// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
 /// 【动效 v4】圆点 timer（WM_TIMER）：morph 活跃→步进 clip 插值；
 /// 驻留态到点→真隐藏（S4 换淡出）。
-unsafe fn dot_timeout_shared(hwnd: HWND) {
+/// 【v5·四修】收球观察窗到点：真收球（框→球 morph）。半秒内键入则
+/// show() 已杀 timer（框平滑跟去新光标位——屏位锚 from=cur 续动）。
+unsafe fn ball_delay_fire_shared(hwnd: HWND) {
     let _ = hwnd;
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return;
+    };
+    let shared = gsh.0.clone();
+    let mut c2 = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    if let Some(c) = c2.as_mut() {
+        if let Some(b) = &c.ball {
+            c.ball_delay_armed.set(false);
+            let (pcx, pcy) = c.ball_pending.get();
+            let sx = pcx as f32 + 6.0;
+            let sy = pcy as f32 + 16.0;
+            b.fade_in();
+            b.morph_close(sx, sy);
+        }
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2 = c2;
+}
+
+unsafe fn dot_timeout_shared(hwnd: HWND) {
     // 【诊断】tick 存活节流日志（每 ~30 条打 1 条）
     static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nt = NT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

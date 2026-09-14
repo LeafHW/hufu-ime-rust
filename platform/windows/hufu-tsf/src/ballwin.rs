@@ -40,8 +40,8 @@ use windows::Win32::System::WinRT::Composition::{
 pub const BALL_D: f32 = 22.0;
 /// 球画布边距（阴影余量；画布=BALL_D+2*PAD）。
 pub const BALL_PAD: f32 = 11.0;
-/// 球→框（快）。
-pub const MORPH_OPEN_MS: i32 = 150;
+/// 球→框（快）。【四修】150→80ms（用户实证偏慢一倍——提速）。
+pub const MORPH_OPEN_MS: i32 = 80;
 /// 框→球（慢——连打空格防闪烁；可被键入打断反转）。
 pub const MORPH_CLOSE_MS: i32 = 260;
 /// 渐隐时长。

@@ -3400,8 +3400,20 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 .unwrap_or("")
                 .is_empty();
             if !aux_now {
+                let caret_now = g.caret.map(|r| (r.left + 4, (r.top + r.bottom) / 2));
                 if let Some(c) = g.cand2.as_mut() {
-                    c.hide();
+                    // 【动效 v5·四修】断段收窗：v5 走 hide_as_dot（观察
+                    // 窗链——框保持 500ms；本分支先于 3633 收场段执行，
+                    // 首调起观察窗，3633 同 caret 去重）。v4 保持原 hide。
+                    if c.ball_on() {
+                        if let Some((cx, cy)) = caret_now {
+                            c.hide_as_dot(cx, cy);
+                        } else {
+                            c.hide();
+                        }
+                    } else {
+                        c.hide();
+                    }
                 }
             }
         }
