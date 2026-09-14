@@ -343,6 +343,27 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
             }
         }
+        // 【动效 v4】圆点淡出驱动（poll 线程 Post 而来；窗口线程执行
+        // DComp——跨线程 Commit 会挂死 poll）。
+        crate::candwin2::WM_APP_FADE_TICK => {
+            if let Some(gsh) = crate::tsf::G_SHARED.get() {
+                let shared = gsh.0.clone();
+                let mut c2 = {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.cand2.take()
+                };
+                if let Some(c) = c2.as_mut() {
+                    if c.is_fading() {
+                        c.fade_step();
+                    } else if c.dot_idle_due() {
+                        c.fade_start();
+                    }
+                }
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.cand2 = c2;
+            }
+            return LRESULT(0);
+        }
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
@@ -425,6 +446,19 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let _ = KillTimer(hwnd, FADE_TIMER_ID);
                 let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                // 【动效 v4】hide 时处于圆态：DComp 清理在此（窗口线程）
+                // 补做——exit_dot(true) 只清状态（跨线程 Commit 挂死）。
+                if let Some(gsh) = crate::tsf::G_SHARED.get() {
+                    let shared = gsh.0.clone();
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mine = g.cand2.take();
+                    if let Some(c) = mine.as_mut() {
+                        if c.dot_cleanup_pending.replace(false) {
+                            c.detach_dot_visual();
+                        }
+                    }
+                    g.cand2 = mine;
+                }
             }
             return LRESULT(0);
         }
@@ -443,6 +477,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             if id == DOT_TIMER_ID {
                 unsafe { dot_timeout_shared(hwnd) };
+                return LRESULT(0);
+            }
+            if id == DOT_TIMER_ID + 1 {
+                // 【诊断】心跳：驻留期试探 tick 到达（单发，自灭）
+                unsafe { KillTimer(hwnd, DOT_TIMER_ID + 1) };
+                crate::tsf::diag_note("v4圆: 心跳tick到达(2.5s)");
                 return LRESULT(0);
             }
         }
@@ -673,6 +713,21 @@ pub struct CandidateWindowV2 {
     collapse_from: std::cell::Cell<(f32, f32, f32, f32, f32)>,
     collapse_to: std::cell::Cell<(f32, f32, f32, f32, f32)>,
     panel_clip: Option<IDCompositionRectangleClip>,
+    /// 【动效 v4·S4】涌现（圆→窗）：pending 标志+计时+dot 淡出组。
+    expand_pending: std::cell::Cell<bool>,
+    /// 【动效 v4】hide 时处于圆态：DComp 清理移交 WM_APP_HIDE_CAND
+    /// handler（窗口线程）补做（跨线程 Commit 会挂死调用线程）。
+    dot_cleanup_pending: std::cell::Cell<bool>,
+    /// morph 方向：true=涌现（圆→窗），false=收场（窗→圆）。
+    expand_dir: std::cell::Cell<bool>,
+    expand_t0: std::cell::Cell<Option<std::time::Instant>>,
+    dot_grp: Option<IDCompositionEffectGroup>,
+    /// 【动效 v4·S4】驻留淡出：root 是纯容器（effect 不传导子树——
+    /// 官方语义），改对 main/dot 两层各挂 opacity 组同步渐隐。
+    fade_t0: std::cell::Cell<Option<std::time::Instant>>,
+    fade_main_grp: Option<IDCompositionEffectGroup>,
+    /// 驻留起点（16ms tick 内自判到点——长 timer 在本机会被静默杀）。
+    idle_since: std::cell::Cell<Option<std::time::Instant>>,
     /// 【动效 v4】面板层隐藏用的 EffectGroup（enter 建/exit 还原）。
     dot_effect: Option<IDCompositionEffectGroup>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
@@ -1062,6 +1117,14 @@ impl CandidateWindowV2 {
                 collapse_from: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
                 collapse_to: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
                 panel_clip: None,
+                expand_pending: std::cell::Cell::new(false),
+                dot_cleanup_pending: std::cell::Cell::new(false),
+                expand_dir: std::cell::Cell::new(false),
+                expand_t0: std::cell::Cell::new(None),
+                dot_grp: None,
+                fade_t0: std::cell::Cell::new(None),
+                fade_main_grp: None,
+                idle_since: std::cell::Cell::new(None),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1242,6 +1305,14 @@ impl CandidateWindowV2 {
                 collapse_from: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
                 collapse_to: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
                 panel_clip: None,
+                expand_pending: std::cell::Cell::new(false),
+                dot_cleanup_pending: std::cell::Cell::new(false),
+                expand_dir: std::cell::Cell::new(false),
+                expand_t0: std::cell::Cell::new(None),
+                dot_grp: None,
+                fade_t0: std::cell::Cell::new(None),
+                fade_main_grp: None,
+                idle_since: std::cell::Cell::new(None),
                 dot_argb: std::cell::Cell::new(0xFF404046),
                 dot_effect: None,
                 scale_in: std::cell::Cell::new(false),
@@ -1579,9 +1650,9 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
-        // 【动效 v4】涌现前退出圆点驻留态（还原面板层，dot timer 清）。
+        // 【动效 v4】涌现前退出圆点驻留态（视觉留给 expand 动画清理）。
         if self.dot_mode.get() {
-            self.exit_dot();
+            self.exit_dot(false);
         }
         // 【动效 v4】圆点颜色=皮肤高亮色（每帧刷新，热更即生效）。
         if let Some(hex) = skin
@@ -3901,6 +3972,11 @@ impl CandidateWindowV2 {
             // 【锁标已移除 2026-09-10】固定态不再有视觉指示（拖动即
             // 固定、右键即解锁——位置本身即状态，无需锁标小窗）。
         }
+        // 【动效 v4·S4】渲染完（新内容+新尺寸已就绪）→武装涌现动画
+        //（panel_clip 从圆盒生长到新面板盒+dot 同步渐隐）。
+        if self.expand_pending.get() {
+            self.arm_expand();
+        }
     }
 
     /// 【动效 2026-09-11】渐隐渐显当前帧透明度（渲染级）：由 fade 状态
@@ -3993,8 +4069,8 @@ impl CandidateWindowV2 {
 
 
     pub fn hide(&mut self) {
-        // 【动效 v4】真隐藏前先退出圆点态（清 dot timer+还原面板层）。
-        self.exit_dot();
+        // 【动效 v4】真隐藏前先退出圆点态（立即清 dot 视觉/timer）。
+        self.exit_dot(true);
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -4099,6 +4175,12 @@ impl CandidateWindowV2 {
                 crate::tsf::diag_note("v4圆: attach失败");
                 return false;
             }
+            // 【S4】dot 层淡出通道：静态 opacity 1（涌现时逐帧插值）。
+            if let Ok(gd) = dc.CreateEffectGroup() {
+                if gd.SetOpacity2(1.0).is_ok() && vd.SetEffect(&gd).is_ok() {
+                    self.dot_grp = Some(gd);
+                }
+            }
             // attach 完成后再画圆+Present（内容就绪后的唤醒帧）。
             if !self.render_dot_frame() {
                 crate::tsf::diag_note("v4圆: 首帧绘制失败（仍驻留）");
@@ -4107,6 +4189,7 @@ impl CandidateWindowV2 {
             let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
             let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None);
             self.dot_mode.set(true);
+            self.fade_t0.set(None);
             crate::tsf::diag_note("v4圆: 驻留开始（morph CPU 驱动）");
             true
         }
@@ -4152,6 +4235,7 @@ impl CandidateWindowV2 {
             self.collapse_from.set((0.0, 0.0, w_f, h_f, r0));
             self.collapse_to.set((ox, oy, ox + side_f, oy + side_f, side_f * 0.5));
             self.collapse_t0.set(Some(std::time::Instant::now()));
+            self.expand_dir.set(false);
             true
         }
     }
@@ -4196,12 +4280,19 @@ impl CandidateWindowV2 {
         }
         if p >= 1.0 {
             self.collapse_t0.set(None);
-            let _ = unsafe { SetTimer(self.hwnd, DOT_TIMER_ID, DOT_IDLE_MS, None) };
-            crate::tsf::diag_note("v4圆: morph 完成，转驻留计时");
+            // 不重挂长 timer（本机 DOT_TIMER_ID 长挂会被静默杀——心跳
+            // 对照实证）；16ms tick 保持常开，idle 到点由 tick 自判。
+            self.idle_since.set(Some(std::time::Instant::now()));
+            crate::tsf::diag_note("v4圆: morph 完成，tick 自判驻留");
         }
     }
-    /// 退出圆点态（涌现/真隐藏前调）：面板层还原（clip/effect 清），dot 层清空。
-    fn exit_dot(&mut self) {
+    /// 退出圆点态。`immediate=false`（show 路径，再打字涌现）：视觉留
+    /// 给 expand 动画步进清理（圆渐隐+窗生长）；`immediate=true`（hide
+    /// 路径）：**只清状态**（跨线程安全——poll/TSF 线程会调 hide，DComp
+    /// 操作绝不能在调用线程做——Commit 跨线程会挂死整个 poll 线程，
+    /// 三十五修链实锤）。DComp 清理由 WM_APP_HIDE_CAND handler（窗口
+    /// 线程）经 dot_cleanup_pending 补做。
+    fn exit_dot(&mut self, immediate: bool) {
         if !self.dot_mode.get() {
             return;
         }
@@ -4209,25 +4300,193 @@ impl CandidateWindowV2 {
         self.collapse_t0.set(None);
         unsafe {
             let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
-            if let (Some(dc), Some(vd), Some(v)) = (&self.dcomp, &self.visual_dot, &self.visual) {
-                let _ = vd.SetContent(None);
-                let _ = vd.SetOffsetX2(0.0);
-                let _ = vd.SetOffsetY2(0.0);
-                let _ = vd.SetClip(None);
-                let _ = vd.SetEffect(None);
-                // 面板层 clip（S3 收场动画挂的）解除——涌现直切回全窗。
-                let _ = v.SetClip(None);
-                if self.dot_effect.take().is_some() {
-                    let _ = v.SetEffect(None);
-                }
-                let _ = dc.Commit();
+            if immediate {
+                // 状态全清（无 DComp）；视觉清理移交窗口线程。
+                self.fade_t0.set(None);
+                self.idle_since.set(None);
+                self.expand_pending.set(false);
+                self.dot_cleanup_pending.set(true);
+            } else {
+                // 涌现：等 show 渲染完（新内容/新尺寸）再武装 expand。
+                self.expand_pending.set(true);
             }
         }
     }
 
-    /// 驻留超时：淡出（S4 前直切）。timer 线程经 dot_timeout_shared 调。
+    /// dot 相关视觉的彻底清理（立即路径/expand 完成时调）。
+    unsafe fn detach_dot_visual(&mut self) {
+        if let (Some(dc), Some(vd), Some(v)) = (&self.dcomp, &self.visual_dot, &self.visual) {
+            let _ = vd.SetContent(None);
+            let _ = vd.SetOffsetX2(0.0);
+            let _ = vd.SetOffsetY2(0.0);
+            let _ = vd.SetClip(None);
+            let _ = vd.SetEffect(None);
+            self.dot_grp = None;
+            // 面板层 clip（收场动画挂的）解除——回全窗。
+            let _ = v.SetClip(None);
+            if self.dot_effect.take().is_some() {
+                let _ = v.SetEffect(None);
+            }
+            // 淡出组还原（驻留淡出被 show 打断时）。
+            self.fade_main_grp = None;
+            self.fade_t0.set(None);
+            self.idle_since.set(None);
+            let _ = dc.Commit();
+        }
+    }
+
+    /// 【动效 v4·S4】涌现武装（show 渲染完调）：panel_clip 从圆盒反向
+    /// 生长到新面板盒；dot 层 opacity 1→0 同步渐隐（expand_step）。
+    fn arm_expand(&mut self) {
+        self.expand_pending.set(false);
+        let w_f = self.live_size.get().0.max(DOT_SIDE as i32) as f32;
+        let h_f = self.live_size.get().1.max(DOT_SIDE as i32) as f32;
+        let r1 = self.last_corner_px.get().clamp(0.0, (w_f.min(h_f)) * 0.5);
+        // from=上次 collapse 的圆盒终态（clip 仍停在那）；to=新面板盒。
+        let from = self.collapse_to.get();
+        self.collapse_from.set(from);
+        self.collapse_to.set((0.0, 0.0, w_f, h_f, r1));
+        self.collapse_t0.set(Some(std::time::Instant::now()));
+        self.expand_dir.set(true);
+        let _ = unsafe { SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None) };
+    }
+
+    /// 【动效 v4·S4】涌现步进：clip 圆→面板生长+dot 渐隐（同一 tick）。
+    fn expand_step(&mut self) {
+        let t0 = match self.collapse_t0.get() {
+            Some(t) => t,
+            None => return,
+        };
+        let p = (t0.elapsed().as_millis() as f32 / DOT_MORPH_MS as f32).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p).powi(3);
+        let f = self.collapse_from.get();
+        let t = self.collapse_to.get();
+        let l = f.0 + (t.0 - f.0) * e;
+        let tp = f.1 + (t.1 - f.1) * e;
+        let r_ = f.2 + (t.2 - f.2) * e;
+        let b = f.3 + (t.3 - f.3) * e;
+        let rad = f.4 + (t.4 - f.4) * e;
+        unsafe {
+            if let (Some(dc), Some(pc)) = (&self.dcomp, &self.panel_clip) {
+                let _ = pc.SetLeft2(l);
+                let _ = pc.SetTop2(tp);
+                let _ = pc.SetRight2(r_);
+                let _ = pc.SetBottom2(b);
+                let _ = pc.SetTopLeftRadiusX2(rad);
+                let _ = pc.SetTopLeftRadiusY2(rad);
+                let _ = pc.SetTopRightRadiusX2(rad);
+                let _ = pc.SetTopRightRadiusY2(rad);
+                let _ = pc.SetBottomLeftRadiusX2(rad);
+                let _ = pc.SetBottomLeftRadiusY2(rad);
+                let _ = pc.SetBottomRightRadiusX2(rad);
+                let _ = pc.SetBottomRightRadiusY2(rad);
+                let _ = dc.Commit();
+            }
+            // dot 渐隐（与生长同步）
+            if let Some(gd) = &self.dot_grp {
+                let _ = gd.SetOpacity2(1.0 - e);
+            }
+            if p >= 1.0 {
+                self.collapse_t0.set(None);
+                let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
+                self.detach_dot_visual();
+                crate::tsf::diag_note("v4圆: 涌现完成");
+            }
+        }
+    }
+
+    /// 【动效 v4·S4】驻留淡出启动（idle 到点）：main/dot 双 opacity 组
+    ///（root 纯容器——effect 不传导子树，官方语义）。
+    pub(crate) fn fade_start(&mut self) {
+        // 守卫：只在驻留态启动（淡出完成后排队的 tick 不许重启）。
+        if !self.dot_mode.get() || self.is_collapsing() || self.is_fading() {
+            return;
+        }
+        unsafe {
+            if self.fade_main_grp.is_none() {
+                if let Some(dc) = &self.dcomp {
+                    if let (Ok(rg), Some(v)) = (dc.CreateEffectGroup(), &self.visual) {
+                        if rg.SetOpacity2(1.0).is_ok() && v.SetEffect(&rg).is_ok() {
+                            self.fade_main_grp = Some(rg);
+                        }
+                    }
+                }
+            }
+            // dot 组驻留时已挂（opacity 1）。
+            self.idle_since.set(None);
+            self.fade_t0.set(Some(std::time::Instant::now()));
+            let _ = SetTimer(self.hwnd, DOT_TIMER_ID, DOT_TICK_MS, None);
+            crate::tsf::diag_note("v4圆: 淡出启动");
+        }
+    }
+
+    /// 【动效 v4】驻留到点判定（tsf poll 线程 125ms 周期驱动——窗口
+    /// timer 长挂在本机会被静默杀，tick 取证实证；poll 是独立活线程）。
+    pub(crate) fn dot_idle_due(&self) -> bool {
+        self.dot_mode.get()
+            && self.collapse_t0.get().is_none()
+            && self.fade_t0.get().is_none()
+            && self
+                .idle_since
+                .get()
+                .map(|t| t.elapsed().as_millis() as u32 >= DOT_IDLE_MS)
+                .unwrap_or(false)
+    }
+
+    /// 淡出驱动兜底（poll 125ms 粒度）。poll 线程绝不能直接碰 DComp
+    ///（跨线程 Commit 挂死）——只 Post 消息，推进在窗口线程做。
+    pub(crate) fn dot_fade_kick(&self) {
+        if self.is_fading() || self.dot_idle_due() {
+            unsafe {
+                let _ = PostMessageW(
+                    self.hwnd,
+                    WM_APP_FADE_TICK,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    fn is_fading(&self) -> bool {
+        self.fade_t0.get().is_some()
+    }
+
+    /// 【动效 v4·S4】淡出步进（200ms）：main+dot 双组 opacity 同步
+    /// 1→0；完成真隐藏。
+    fn fade_step(&mut self) {
+        let t0 = match self.fade_t0.get() {
+            Some(t) => t,
+            None => return,
+        };
+        let p = (t0.elapsed().as_millis() as f32 / DOT_FADE_MS as f32).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p).powi(3);
+        unsafe {
+            let op = 1.0 - e;
+            if let Some(rg) = &self.fade_main_grp {
+                let _ = rg.SetOpacity2(op);
+            }
+            if let Some(gd) = &self.dot_grp {
+                let _ = gd.SetOpacity2(op);
+            }
+            if let Some(dc) = &self.dcomp {
+                let _ = dc.Commit();
+            }
+            if p >= 1.0 {
+                // 先清状态+杀 timer（否则排队的 tick 会再进 fade_start
+                // 重启淡出→「淡出完成」死循环——实证过）。
+                self.fade_t0.set(None);
+                let _ = KillTimer(self.hwnd, DOT_TIMER_ID);
+                crate::tsf::diag_note("v4圆: 淡出完成→真隐藏");
+                self.exit_dot(true);
+                self.hide();
+            }
+        }
+    }
+
+    /// 驻留超时（S4 后由淡出接管；此函数保留为非 morph 兜底直收）。
     fn dot_timeout(&mut self) {
-        self.exit_dot();
+        self.exit_dot(true);
         self.hide();
     }
 
@@ -4342,6 +4601,8 @@ fn parse_hex_argb(s: &str) -> Option<u32> {
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
+/// 【动效 v4】圆点淡出驱动（poll 线程 Post→窗口线程执行 DComp）。
+pub const WM_APP_FADE_TICK: u32 = 0x4949; // "II"
 
 /// 【动效 v4】圆点驻留：dot 链边长（px）、驻留时长、timer id、morph 时长、tick。
 pub const DOT_SIDE: u32 = 26;
@@ -4349,6 +4610,7 @@ pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 pub const DOT_MORPH_MS: u32 = 180;
 pub const DOT_TICK_MS: u32 = 16;
+pub const DOT_FADE_MS: u32 = 200;
 
 /// 【动效 2026-09-11】渐隐渐显 tick 定时器 id（15ms≈67fps）与
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
@@ -4390,6 +4652,12 @@ const FADE_FLOOR: f64 = 0.6;
 /// 驻留态到点→真隐藏（S4 换淡出）。
 unsafe fn dot_timeout_shared(hwnd: HWND) {
     let _ = hwnd;
+    // 【诊断】tick 存活节流日志（每 ~30 条打 1 条）
+    static NT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nt = NT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if nt % 30 == 0 {
+        crate::tsf::diag_note(&format!("v4圆: dot tick #{nt}"));
+    }
     let Some(gsh) = crate::tsf::G_SHARED.get() else {
         return;
     };
@@ -4399,10 +4667,25 @@ unsafe fn dot_timeout_shared(hwnd: HWND) {
         g.cand2.take()
     };
     if let Some(c) = c2.as_mut() {
-        if c.is_collapsing() {
-            c.collapse_step();
+        if c.is_fading() {
+            c.fade_step();
+        } else if c.is_collapsing() {
+            if c.expand_dir.get() {
+                c.expand_step();
+            } else {
+                c.collapse_step();
+            }
         } else {
-            c.dot_timeout();
+            // 驻留 idle 到点自判（长 timer 被杀的绕法：16ms tick 常开，
+            // elapsed>=DOT_IDLE_MS 才启动淡出）。
+            let due = c
+                .idle_since
+                .get()
+                .map(|t| t.elapsed().as_millis() as u32 >= DOT_IDLE_MS)
+                .unwrap_or(false);
+            if due {
+                c.fade_start();
+            }
         }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,4 +1,4 @@
-//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
+﻿//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
@@ -5070,6 +5070,15 @@ fn poll_collapse_stale(shared: &SharedRef) {
 }
 
 fn poll_tick() {
+    // 【动效 v4】驻留淡出由 poll 线程驱动（DOT timer 长挂会被静默杀
+    // ——取证实证；poll 125ms 独立活线程，作 idle 判定+fade 兜底泵）。
+    if let Some(gsh) = G_SHARED.get() {
+        let shared = gsh.0.clone();
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            c.dot_fade_kick();
+        }
+    }
     // 重入保护（update_ui 过程中不会再泵本消息，双保险）
     if POLL_IN_TICK.swap(1, AtomicOrdering::Relaxed) != 0 {
         return;
