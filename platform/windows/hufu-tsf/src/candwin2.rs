@@ -754,6 +754,11 @@ pub struct CandidateWindowV2 {
     dot_ring_argb: std::cell::Cell<u32>,
     /// 【动效 v5】球窗（Windows.UI.Composition；diag HUFU_BALL=1 启用）。
     pub ball: Option<crate::ballwin::BallWin>,
+    /// 【morph v2】球屏位（元素框左上，屏幕坐标）——morph_open 的补偿
+    /// 起点（窗口包围盒移动后 Offset 反向补偿=球视觉静止起步）。
+    ball_screen: std::cell::Cell<(f32, f32)>,
+    /// 【morph v2】框屏位（上帧面板布局位）——morph_close 的补偿起点。
+    ball_frame: std::cell::Cell<(f32, f32)>,
     /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
     dot_grp_in: Option<IDCompositionEffectGroup>,
     dot_grp_sh: Option<IDCompositionEffectGroup>,
@@ -1135,6 +1140,8 @@ impl CandidateWindowV2 {
             Some(CandidateWindowV2 {
                 hwnd,
                 ball,
+                ball_screen: std::cell::Cell::new((0.0, 0.0)),
+                ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: Some(dcomp),
@@ -1341,6 +1348,8 @@ impl CandidateWindowV2 {
             Some(CandidateWindowV2 {
                 hwnd,
                 ball: None,
+                ball_screen: std::cell::Cell::new((0.0, 0.0)),
+                ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ctx: Some(ctx),
                 swapchain: None,
                 dcomp: None,
@@ -4000,7 +4009,7 @@ impl CandidateWindowV2 {
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
-            let sp_ok = if !dragging {
+            if !dragging {
                 // 【零位移·收窄轴向例外 2026-09-11】变宽轴向：窗口一步
                 // 到位=目标（每键仅一次 SWP，壳在稳定窗口内长大——用户
                 // 实锤变宽无直角）；收窄轴向：窗口必须跟缓动走——否则
@@ -4111,29 +4120,68 @@ impl CandidateWindowV2 {
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
-                 SetWindowPos(
-                     self.hwnd,
-                     HWND_TOPMOST,
-                     px,
-                     py,
-                     apply.0,
-                     apply.1,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                 )
-                 // 【动效 v5】球→框展开（合成器 Size 动画；swapchain
-                 // 面板渲染接入前=球色块展开——节奏先行验证）。
-                 .and_then(|_| {
-                     if let Some(b) = &self.ball {
-                         b.breath_off();
-                         b.fade_in();
-                         b.morph_open(apply.0 as f32, apply.1 as f32, 12.0);
-                     }
-                     Ok(())
-                 })
+                // 【动效 v5·morph v2】窗口=「球位∪框位」包围盒（morph 期间
+                // 恒定不移动——元素位移全走树内 content.Offset 插值=「一整
+                // 个元素顺滑平移」）。SWP 移动的视觉跳变由 morph from
+                // Offset 补偿（球屏位不变起步）。
+                if let Some(b) = &self.ball {
+                    let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
+                    let fx = px as f32;
+                    let fy = py as f32;
+                    // 首次（无球史）：球位=光标右下（anchor 中心）——
+                    // 否则从 (0,0) 飞入。
+                    let (sx0, sy0) = self.ball_screen.get();
+                    let (sx, sy) = if sx0 == 0.0 && sy0 == 0.0 {
+                        match anchor {
+                            Some(a) => (
+                                ((a.left + a.right) / 2) as f32 + 6.0,
+                                a.bottom as f32 + 4.0,
+                            ),
+                            None => (fx, fy),
+                        }
+                    } else {
+                        (sx0, sy0)
+                    };
+                    let x0 = sx.min(fx) - 10.0;
+                    let y0 = sy.min(fy) - 10.0;
+                    let x1 = (sx + side).max(fx + apply.0 as f32) + 10.0;
+                    let y1 = (sy + side).max(fy + apply.1 as f32) + 10.0;
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        x0 as i32,
+                        y0 as i32,
+                        (x1 - x0) as i32,
+                        (y1 - y0) as i32,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    b.fade_in();
+                    // from=球屏位-新窗口原点（补偿窗口移动→球视觉静止）；
+                    // to=框屏位-新窗口原点。
+                    b.morph_open(
+                        apply.0 as f32,
+                        apply.1 as f32,
+                        sx - x0,
+                        sy - y0,
+                        fx - x0,
+                        fy - y0,
+                    );
+                    self.ball_frame.set((fx, fy));
+                } else {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        px,
+                        py,
+                        apply.0,
+                        apply.1,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
             } else {
                 // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
                 crate::tsf::trace("cw2: SWP纯显示(NOMOVE)——窗留在当前位置显示");
-                SetWindowPos(
+                let sp_ok = SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     0,
@@ -4141,15 +4189,15 @@ impl CandidateWindowV2 {
                     0,
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                );
+                if sp_ok.is_err() {
+                    crate::tsf::trace(&format!(
+                        "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
+                        sp_ok,
+                        IsWindowVisible(self.hwnd).0
+                    ));
+                }
             };
-            if sp_ok.is_err() {
-                crate::tsf::trace(&format!(
-                    "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
-                    sp_ok,
-                    IsWindowVisible(self.hwnd).0
-                ));
-            }
             // 【毛玻璃退役 2026-09-11】glass RGN/DWM 圆角/NC 链整块删除；
             // 仅保留残留清理（曾开过毛玻璃的窗恢复全窗区域+方角）。
             if self.rgn_last.get() != 0 {
@@ -4310,44 +4358,63 @@ impl CandidateWindowV2 {
     /// 的化身，窗在光标下方出现，圆也在光标下方，expand 才是「同点
     /// 形变」而非两个独立元素的位置跳变）。
     pub fn hide_as_dot(&mut self, cx: i32, cy: i32) {
-        // 【动效 v5】球窗接管：不进 v4 dot 链（clip/DComp/timer 全免）
-        //——morph_close 动画在合成线程（可被下一键入打断反转）；
-        // 窗口缩到球画布尺寸、贴光标右下。idle 渐隐=合成线程自理。
+        // 【动效 v5·morph v2】球窗接管：框→球 CPU 插值帧（合成线程
+        // 260ms 慢收，可被下一键入的 morph_open 打断反转）。窗口尽量
+        // 不动（morph 期间恒定）；仅当新球位跑出窗口覆盖时才扩窗——
+        // 扩窗的视觉跳变由 morph from Offset 反向补偿（框视觉静止起步）。
+        // idle 渐隐=合成线程自理。
         if let Some(b) = &self.ball {
-            // 窗口贴光标右下（球在树内容左上区）。窗口尺寸用「面板级」
-            //（44 小窗 NOREDIR+DWT 组合本机不渲染）。
-            // 【DWM invalidate 关键】SWP（位置变化）触发 DWM 重读
-            // swapchain 内容——不移动则 surface 更新不上屏（k×3 实证：
-            // 前两次窗口变→显示，第三次无变化→丢）。
-            let side_w = 160i32;
-            let side_h = 120i32;
+            let side = crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD;
+            // 新球屏位（元素框左上；球心=光标右下 ~28px、下方 ~38px——
+            // 既有驻留观感）。
+            let sx = cx as f32 + 6.0;
+            let sy = cy as f32 + 16.0;
+            let (fx, fy) = self.ball_frame.get();
             unsafe {
-                let _swp_ok = SetWindowPos(
-                    self.hwnd,
-                    HWND_TOPMOST,
-                    cx + 6,
-                    cy + 16,
-                    side_w,
-                    side_h,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
                 let mut rr = RECT::default();
                 let _ = GetWindowRect(self.hwnd, &mut rr);
-                // 【低频日志】收球定位取证（前 3 次）。
+                // 覆盖检查：新球位+side ⊄ 当前窗口 → 扩窗到「球∪框」
+                // 包围盒（框仍被覆盖——morph from 补偿）。
+                let need = sx < rr.left as f32
+                    || sy < rr.top as f32
+                    || sx + side > rr.right as f32
+                    || sy + side > rr.bottom as f32;
+                let (wx0, wy0) = if need {
+                    let x0 = sx.min(fx) - 10.0;
+                    let y0 = sy.min(fy) - 10.0;
+                    let x1 = (sx + side).max(fx + 200.0).max(rr.right as f32) + 10.0;
+                    let y1 = (sy + side).max(fy + 160.0).max(rr.bottom as f32) + 10.0;
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        x0 as i32,
+                        y0 as i32,
+                        (x1 - x0) as i32,
+                        (y1 - y0) as i32,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    (x0, y0)
+                } else {
+                    (rr.left as f32, rr.top as f32)
+                };
+                // from=当前框屏位-窗口原点（补偿扩窗）；to=新球位。
+                // fade_in：Opacity 归一+IsVisible 翻转（本机实证树在
+                // morph 逐帧 SetSize/SetOffset 后不再自动提交——翻转强
+                // 制合成器重评估整棵树；open 路径每键 show 自带 fade_in
+                // 所以显示，close 缺它所以黑——本轮隔离出）。
+                b.fade_in();
+                b.morph_close(fx - wx0, fy - wy0, sx - wx0, sy - wy0);
+                self.ball_screen.set((sx, sy));
+                // 【低频日志】收球取证（前 3 次）。
                 static CLOSEPOS: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 if CLOSEPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
                     crate::tsf::diag_note(&format!(
-                        "v5球: 收球 rect=({},{}) caret=({},{}) vis={}",
-                        rr.left, rr.top, cx, cy,
-                        IsWindowVisible(self.hwnd).0
+                        "v5球: 收球 caret=({},{}) 球位=({:.0},{:.0}) 框位=({:.0},{:.0}) need={}",
+                        cx, cy, sx, sy, fx, fy, need
                     ));
                 }
             }
-            b.paint_ball(self.dot_ring_argb.get(), self.dot_argb.get());
-            b.breath_on();
-            b.morph_close();
-            b.fade_in();
             return;
         }
         if self.dot_mode_cfg.get() == DotMode2::Plain {

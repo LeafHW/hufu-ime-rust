@@ -65,17 +65,18 @@ pub enum BallForm {
 }
 
 /// 窗口线程 → 合成线程 命令（全部非阻塞 Send）。
+/// 【morph v2】形变=CPU 插值帧（合成线程 15ms tick 逐帧画）——合成器
+/// Size 动画在 Stretch.None 下只是「裁剪揭幕」且内容首帧即终态帧，
+/// 形变感为零（用户实证）。几何(尺寸+位置)与内容帧必须逐帧同步，
+/// 故全走 CPU；窗口恒定不移动（元素位移=content.Offset 插值）。
 pub enum BallCmd {
-    /// 画球帧（环色/心色）。
+    /// 画球帧（环色/心色；热更色用——纯重画不动几何）。
     PaintBall { ring: u32, core: u32 },
-    /// 元素平移到（窗口坐标，相对 HWND 左上角）。
-    MoveTo { x: f32, y: f32 },
-    /// 球→框 morph（快）。(w,h,corner)。
-    MorphOpen { w: f32, h: f32, corner: f32 },
-    /// 框→球 morph（慢，可被 MorphOpen 打断反转）。
-    MorphClose,
-    /// 画框帧进 surface（框尺寸=(w,h)——内容=候选面板渲染结果）。
-    ResizeSurface { w: f32, h: f32 },
+    /// 球→框（快，可打断）。w/h=框尺寸；fx/fy=起点 Offset（窗口相对，
+    /// 调用方已做窗口移动补偿）；tx/ty=框位 Offset。
+    MorphOpen { w: f32, h: f32, fx: f32, fy: f32, tx: f32, ty: f32 },
+    /// 框→球（慢，可被打断反转）。fx/fy=当前框位 Offset；tx/ty=球位。
+    MorphClose { fx: f32, fy: f32, tx: f32, ty: f32 },
     /// 渐隐。
     FadeOut,
     /// 渐显（Opacity=1）。
@@ -125,17 +126,11 @@ impl BallWin {
     pub fn paint_ball(&self, ring: u32, core: u32) {
         self.send(BallCmd::PaintBall { ring, core });
     }
-    pub fn move_to(&self, x: f32, y: f32) {
-        self.send(BallCmd::MoveTo { x, y });
+    pub fn morph_open(&self, w: f32, h: f32, fx: f32, fy: f32, tx: f32, ty: f32) {
+        self.send(BallCmd::MorphOpen { w, h, fx, fy, tx, ty });
     }
-    pub fn morph_open(&self, w: f32, h: f32, corner: f32) {
-        self.send(BallCmd::MorphOpen { w, h, corner });
-    }
-    pub fn morph_close(&self) {
-        self.send(BallCmd::MorphClose);
-    }
-    pub fn resize_surface(&self, w: f32, h: f32) {
-        self.send(BallCmd::ResizeSurface { w, h });
+    pub fn morph_close(&self, fx: f32, fy: f32, tx: f32, ty: f32) {
+        self.send(BallCmd::MorphClose { fx, fy, tx, ty });
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
@@ -358,18 +353,6 @@ unsafe fn synth_thread(
     step!("Ctr-Off", content
         .SetOffset(N::Vector3 { X: 0.0, Y: 0.0, Z: 0.0 })
         .map_err(|e| e.clone()));
-    // 跟随平滑：Offset 键帧（光标移动时合成器插值——「一整个元素
-    // 顺滑平移」，球/框态都生效；0.58 缺 ImplicitAnimationCollection
-    // 的 InsertAnimation——MoveTo 命令手动起 KeyFrame 等效）。
-    fn move_to(compositor: &Compositor, root: &ContainerVisual, x: f32, y: f32) {
-        if let Ok(a) = compositor.CreateVector3KeyFrameAnimation() {
-            let from = root.Offset().unwrap_or(N::Vector3 { X: 0.0, Y: 0.0, Z: 0.0 });
-            let _ = a.InsertKeyFrame(0.0, from);
-            let _ = a.InsertKeyFrame(1.0, N::Vector3 { X: x, Y: y, Z: 0.0 });
-            let _ = a.SetDuration(dur(120));
-            let _ = root.StartAnimation(&HSTRING::from("Offset"), &a);
-        }
-    }
     let shadow = step!("Shadow", compositor.CreateDropShadow().map_err(|e| e.clone()));
     // 【阴影画帧内】DropShadow 挂 content 吞内容（本机 DWT 实证）——
     // 阴影改为 D2D 画进 swapchain 帧（球下模糊圆=v4 同款，morph 同帧
@@ -385,14 +368,23 @@ unsafe fn synth_thread(
     crate::tsf::diag_note("v5球: 合成树建立 ok");
     // ⑥ 命令泵：recv 超时+线程消息泵混合——**WinRT 合成的提交调度
     //    走创建线程的消息队列**（DispatcherQueue 需要泵；纯阻塞 recv
-    //    的树挂上不 flush，本机实证不渲染）。15ms 只在空闲时醒（动画
-    //    期间合成器线程独立跑，不占 IME 线程）。
+    //    的树挂上不 flush，本机实证不渲染）。15ms tick 兼任 morph 帧
+    //    驱动（≈66fps 插值帧）。
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
     };
-    let mut panel_w = BALL_D;
-    let mut panel_h = BALL_D;
-    let mut corner = 12.0f32;
+    // 【morph v2 状态机】cur=当前几何（尺寸+窗口内 Offset，含中间态）；
+    // morph=进行中的插值（from→to，任意时刻可被新 morph 替换=打断续动）。
+    struct Geo {
+        w: f32,
+        h: f32,
+        ox: f32,
+        oy: f32,
+    }
+    let ball_side = BALL_D + 2.0 * BALL_PAD;
+    let mut cur = Geo { w: ball_side, h: ball_side, ox: 0.0, oy: 0.0 };
+    let mut morph: Option<(Geo, Geo, std::time::Instant, u32, bool)> = None; // (from,to,t0,ms,closing)
+    let mut ballness = 1.0f32; // 球接近度（1=纯球：core 满显+inset=pad；0=纯框）
     let mut idle_ticks: u32 = 0;
     let mut last_ring: u32 = 0xFF101014;
     let mut last_core: u32 = 0xFFE8E8EC;
@@ -410,50 +402,47 @@ unsafe fn synth_thread(
             BallCmd::PaintBall { ring, core } => {
                 last_ring = ring;
                 last_core = core;
-                let ok = paint_ball_into(&chain, &d2d_dev, ring, core);
-                crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
+                // 纯重画（球色热更）——morph 进行中则下一 tick 会覆盖，
+                // 驻留球态=立即刷新。
+                if morph.is_none() {
+                    let ok = paint_ball_into(&chain, &d2d_dev, ring, core);
+                    crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
+                }
             }
-            BallCmd::MoveTo { x, y } => {
-                move_to(&compositor, &root, x, y);
+            BallCmd::MorphOpen { w, h, fx, fy, tx, ty } => {
+                // 打断续动：from=当前尺寸（中间态）+命令指定的起点 Offset
+                //（调用方已做窗口移动补偿——球视觉静止起步）。
+                let from = Geo { w: cur.w, h: cur.h, ox: fx, oy: fy };
+                let to = Geo { w, h, ox: tx, oy: ty };
+                morph = Some((
+                    from, to,
+                    std::time::Instant::now(),
+                    MORPH_OPEN_MS as u32,
+                    false,
+                ));
+                // morph 中停呼吸（Scale 干扰逐帧 SetSize）。
+                content.StopAnimation(&HSTRING::from("Scale"));
+                let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
+                crate::tsf::diag_note(&format!(
+                    "v5球T: open {:.0}x{:.0} ({:.0},{:.0})→({:.0},{:.0})",
+                    w, h, fx, fy, tx, ty
+                ));
             }
-            BallCmd::MorphOpen { w, h, corner: c2 } => {
-                panel_w = w;
-                panel_h = h;
-                corner = c2;
-                // 形变走 CPU 插值帧（morph 帧）；视觉尺寸/阴影同步动画。
-                animate_geo(
-                    &compositor, &content, &shadow,
-                    N::Vector2 { X: w, Y: h },
-                    24.0, MORPH_OPEN_MS,
-                );
-                // 展开帧：面板尺寸的 ring 色圆角矩形（渐变延续球感；
-                // 面板文字层接入前=球色块展开）。
-                let _ = paint_frame_into(&chain, &d2d_dev, w, h, c2, last_ring);
-            }
-            BallCmd::MorphClose => {
-                corner = BALL_D * 0.5;
-                // 框→球：慢收（260ms，可被下一键入的 MorphOpen 打断
-                // 反转——animate_geo 的 from=current 语义天然可打断）。
-                animate_geo(
-                    &compositor, &content, &shadow,
-                    N::Vector2 { X: BALL_D + 2.0 * BALL_PAD, Y: BALL_D + 2.0 * BALL_PAD },
-                    10.0, MORPH_CLOSE_MS,
-                );
-                let ok = paint_ball_into(&chain, &d2d_dev, last_ring, last_core);
-                crate::tsf::diag_note(&format!("v5球T: close paint={}", ok));
-            }
-            BallCmd::ResizeSurface { w, h } => {
-                // swapchain ResizeBuffers（0=保留配置）+视觉尺寸。
-                let _ = chain.ResizeBuffers(
-                    0,
-                    w as u32,
-                    h as u32,
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                );
-                let _ = content.SetSize(N::Vector2 { X: w, Y: h });
-                panel_w = w;
-                panel_h = h;
+            BallCmd::MorphClose { fx, fy, tx, ty } => {
+                let from = Geo { w: cur.w, h: cur.h, ox: fx, oy: fy };
+                let to = Geo { w: ball_side, h: ball_side, ox: tx, oy: ty };
+                morph = Some((
+                    from, to,
+                    std::time::Instant::now(),
+                    MORPH_CLOSE_MS as u32,
+                    true,
+                ));
+                content.StopAnimation(&HSTRING::from("Scale"));
+                let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
+                crate::tsf::diag_note(&format!(
+                    "v5球T: close ({:.0},{:.0})→({:.0},{:.0})",
+                    fx, fy, tx, ty
+                ));
             }
             BallCmd::FadeOut => {
                 if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
@@ -501,20 +490,51 @@ unsafe fn synth_thread(
             }
             }
         } else {
-            // 空闲计数（15ms/tick）：BALL_IDLE_MS 无命令→球渐隐→隐藏。
-            // 任何命令在别处已重置 idle_ticks（Show/键入路径）。
-            idle_ticks += 1;
-            if idle_ticks as u32 == BALL_IDLE_MS / 15 {
-                if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
-                    let _ = a.InsertKeyFrame(0.0, 1.0);
-                    let _ = a.InsertKeyFrame(1.0, 0.0);
-                    let _ = a.SetDuration(dur(BALL_FADE_MS));
-                    let _ = root.StartAnimation(&HSTRING::from("Opacity"), &a);
-                }
-                crate::tsf::diag_note("v5球T: idle→渐隐");
-            } else if idle_ticks as u32 > (BALL_IDLE_MS + (BALL_FADE_MS as u32) * 4) / 15 {
+            // 【morph v2 插值帧驱动】15ms/tick：progress→ease→几何+内容
+            // 同帧应用（SetSize/SetOffset+画插值帧+Present——Stretch.None
+            // 下合成器动画只是揭幕裁剪，形变必须内容帧逐帧画）。
+            if let Some((from, to, t0, ms, closing)) = &morph {
+                let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
+                let e = if *closing { ease_in_out(t) } else { ease_out(t) };
+                cur.w = lerp(from.w, to.w, e);
+                cur.h = lerp(from.h, to.h, e);
+                cur.ox = lerp(from.ox, to.ox, e);
+                cur.oy = lerp(from.oy, to.oy, e);
+                ballness = if *closing { e } else { 1.0 - e };
+                let _ = content.SetSize(N::Vector2 { X: cur.w.max(2.0), Y: cur.h.max(2.0) });
+                let _ = content.SetOffset(N::Vector3 { X: cur.ox, Y: cur.oy, Z: 0.0 });
+                let _ = paint_morph_frame(
+                    &chain, &d2d_dev, cur.w, cur.h, ballness,
+                    last_ring, last_core,
+                );
+                // 【树重提交】本机实证：morph 逐帧 SetSize/SetOffset 后
+                // 合成器不自动提交新 surface 帧——IsVisible 翻转强制整
+                // 棵树重评估（open 路径靠 show 每键 fade_in 翻转显示，
+                // close 靠收球时一次；中间帧靠这里的逐帧翻转）。
                 let _ = root.SetIsVisible(false);
-                crate::tsf::diag_note("v5球T: idle→隐藏");
+                let _ = root.SetIsVisible(true);
+                if t >= 1.0 {
+                    let closing = *closing;
+                    morph = None;
+                    let _ = closing;
+                    crate::tsf::diag_note("v5球T: 收球完成");
+                    // 【取证】收球终态帧 readback（swapchain 里有没有球）。
+                    readback_probe(&chain, &d3d_dev);
+                }
+            } else {
+                // 空闲计数（15ms/tick）：BALL_IDLE_MS 无命令→球渐隐→隐藏。
+                idle_ticks += 1;
+                if idle_ticks as u32 == BALL_IDLE_MS / 15 {
+                    if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
+                        let _ = a.InsertKeyFrame(0.0, 1.0);
+                        let _ = a.InsertKeyFrame(1.0, 0.0);
+                        let _ = a.SetDuration(dur(BALL_FADE_MS));
+                        let _ = root.StartAnimation(&HSTRING::from("Opacity"), &a);
+                    }
+                    crate::tsf::diag_note("v5球T: idle→渐隐");
+                } else if idle_ticks as u32 > (BALL_IDLE_MS + (BALL_FADE_MS as u32) * 4) / 15 {
+                    let _ = root.SetIsVisible(false);
+                }
             }
         }
         // 泵线程消息（DQ 提交调度——WinRT 合成的 flush 必需）。
@@ -528,32 +548,155 @@ unsafe fn synth_thread(
     Ok(())
 }
 
-/// 视觉 Size morph（形变动画：content Size+阴影模糊同步 KeyFrame；
-/// KeyFrame 起点取当前值——中断续动语义。形状内容=morph 插值帧由
-/// 命令泵空闲态补齐）。
-fn animate_geo(
-    compositor: &Compositor,
-    content: &SpriteVisual,
-    shadow: &DropShadow,
-    to_size: N::Vector2,
-    to_blur: f32,
-    ms: i32,
-) {
-    let d = dur(ms);
-    if let Ok(a) = compositor.CreateVector2KeyFrameAnimation() {
-        let from = content.Size().unwrap_or(N::Vector2 { X: BALL_D, Y: BALL_D });
-        let _ = a.InsertKeyFrame(0.0, from);
-        let _ = a.InsertKeyFrame(1.0, to_size);
-        let _ = a.SetDuration(d);
-        let _ = content.StartAnimation(&HSTRING::from("Size"), &a);
+/// 插值数学：线性/easeOut（快出）/easeInOut（慢收用——收球要缓）。
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+fn ease_in_out(t: f32) -> f32 {
+    if t < 0.5 {
+        2.0 * t * t
+    } else {
+        let x = -2.0 * t + 2.0;
+        1.0 - x * x / 2.0
     }
-    if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
-        let from = shadow.BlurRadius().unwrap_or(10.0);
-        let _ = a.InsertKeyFrame(0.0, from);
-        let _ = a.InsertKeyFrame(1.0, to_blur);
-        let _ = a.SetDuration(d);
-        let _ = shadow.StartAnimation(&HSTRING::from("BlurRadius"), &a);
+}
+
+/// 【morph v2 插值帧】画「ballness 球接近度」的中间形态进 swapchain。
+/// 形状族=内缩圆角矩形：球端 inset=BALL_PAD（主体=22px，corner=11=
+/// 正圆）；框端 inset=0（主体=全幅 w×h，corner=12）。渐变/阴影/core
+/// 随 ballness 连续过渡——一整个元素无级形变的视觉本体。
+unsafe fn paint_morph_frame(
+    chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+    d2d_dev: &ID2D1Device,
+    w: f32,
+    h: f32,
+    ballness: f32,
+    ring: u32,
+    core: u32,
+) -> bool {
+    let buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D =
+        match chain.GetBuffer(0) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    };
+    let ctx: ID2D1DeviceContext =
+        match d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+    let dxgi_surf: IDXGISurface = match buffer.cast() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let bmp: ID2D1Bitmap1 = match ctx.CreateBitmapFromDxgiSurface(&dxgi_surf, Some(&props)) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let target_img: ID2D1Image = match bmp.cast() {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    ctx.SetTarget(Some(&target_img));
+    let _ = ctx.BeginDraw();
+    ctx.SetTransform(&N::Matrix3x2::identity());
+    ctx.Clear(None);
+    // 主体矩形：inset 随 ballness（球端=pad 内缩=22px 圆，框端=全幅）。
+    let inset = BALL_PAD * ballness;
+    let bx0 = inset;
+    let by0 = inset;
+    let bx1 = (w - inset).max(bx0 + 2.0);
+    let by1 = (h - inset).max(by0 + 2.0);
+    let bw = bx1 - bx0;
+    let bh = by1 - by0;
+    let bcx = bx0 + bw * 0.5;
+    let bcy = by0 + bh * 0.5;
+    let corner = lerp(12.0, BALL_D * 0.5, ballness);
+    let main_rect = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F { left: bx0, top: by0, right: bx1, bottom: by1 },
+        radiusX: corner,
+        radiusY: corner,
+    };
+    let rt: ID2D1RenderTarget = ctx.cast().unwrap();
+    // 底部软阴影（帧内径向，随主体缩放）。
+    let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+        center: D2D_POINT_2F { x: bcx + 1.5, y: bcy + 3.0 },
+        gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
+        radiusX: bw * 0.75,
+        radiusY: bh * 0.85,
+    };
+    let sh_stops = [
+        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.35, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.16, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
+    ];
+    if let Ok(gsc) = rt.CreateGradientStopCollection(&sh_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+        if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
+            ctx.FillRoundedRectangle(&main_rect, &shb);
+        }
     }
+    // 主体：ring 色径向渐变（高光偏左上——球感延续到框）。
+    let fill_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+        center: D2D_POINT_2F { x: bcx, y: bcy },
+        gradientOriginOffset: D2D_POINT_2F { x: -bw * 0.18, y: -bh * 0.2 },
+        radiusX: bw * 0.9,
+        radiusY: bh * 1.0,
+    };
+    let stops = [
+        D2D1_GRADIENT_STOP { position: 0.0, color: argb_to_color(lighten(ring, 0.3)) },
+        D2D1_GRADIENT_STOP { position: 1.0, color: argb_to_color(darken(ring, 0.12)) },
+    ];
+    if let Ok(gsc) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+        if let Ok(br) = ctx.CreateRadialGradientBrush(&fill_prop, None, &gsc) {
+            ctx.FillRoundedRectangle(&main_rect, &br);
+        }
+    }
+    // core 高亮点（球心——morph 中渐隐/渐显）。
+    if ballness > 0.02 {
+        let cstops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: argb_to_color(core) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: fade_a(core, 0.0) },
+        ];
+        if let Ok(gsc) = rt.CreateGradientStopCollection(&cstops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+            if let Ok(cb) = ctx.CreateRadialGradientBrush(
+                &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                    center: D2D_POINT_2F { x: bcx - bw * 0.06, y: bcy - bh * 0.08 },
+                    gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
+                    radiusX: 5.0,
+                    radiusY: 5.0,
+                },
+                None,
+                &gsc,
+            ) {
+                let r = (BALL_D * 0.24) * (0.4 + 0.6 * ballness);
+                ctx.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: bcx, y: bcy },
+                        radiusX: r,
+                        radiusY: r,
+                    },
+                    &cb,
+                );
+            }
+        }
+    }
+    let hr = ctx.EndDraw(None, None);
+    if hr.is_err() {
+        return false;
+    }
+    chain.Present(0, DXGI_PRESENT_RESTART).is_ok()
 }
 
 /// 画球帧（swapchain 路线：D2D 直接画 backbuffer→Present；渐变立体球
@@ -638,107 +781,6 @@ unsafe fn paint_ball_into(
     // Present(0)=异步提交（Present(1) 在合成 swapchain 上会等 DWM
     // 消费——泵线程阻塞→树 flush 停→全树黑，本机实证；打字节奏的
     // 内容更新不需要撕裂同步）。
-    chain.Present(0, DXGI_PRESENT_RESTART).is_ok()
-}
-
-/// 画框帧（morph 展开/面板态）：ring 色径向渐变圆角矩形+底部阴影
-///（球色延续=形色同源；文字层接入前为纯色块）。画布 256 常驻——框画
-/// 在 (0..w,0..h) 左上区，零 ResizeBuffers。
-unsafe fn paint_frame_into(
-    chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
-    d2d_dev: &ID2D1Device,
-    w: f32,
-    h: f32,
-    corner: f32,
-    ring: u32,
-) -> bool {
-    let buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D =
-        match chain.GetBuffer(0) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-    let props = D2D1_BITMAP_PROPERTIES1 {
-        pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-        },
-        dpiX: 96.0,
-        dpiY: 96.0,
-        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-        colorContext: std::mem::ManuallyDrop::new(None),
-    };
-    let ctx: ID2D1DeviceContext = match d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let dxgi_surf: IDXGISurface = match buffer.cast() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let bmp: ID2D1Bitmap1 = match ctx.CreateBitmapFromDxgiSurface(&dxgi_surf, Some(&props)) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    let target_img: ID2D1Image = match bmp.cast() {
-        Ok(i) => i,
-        Err(_) => return false,
-    };
-    ctx.SetTarget(Some(&target_img));
-    let _ = ctx.BeginDraw();
-    ctx.SetTransform(&N::Matrix3x2::identity());
-    ctx.Clear(None);
-    // 底部软阴影（帧内）。
-    let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: w * 0.5 + 1.5, y: h * 0.5 + 3.0 },
-        gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-        radiusX: w * 0.75,
-        radiusY: h * 0.85,
-    };
-    let sh_stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.35, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.16, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
-    ];
-    let rt: ID2D1RenderTarget = ctx.cast().unwrap();
-    if let Ok(gsc) = rt.CreateGradientStopCollection(&sh_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
-        if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
-            ctx.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h },
-                    radiusX: corner,
-                    radiusY: corner,
-                },
-                &shb,
-            );
-        }
-    }
-    // ring 色径向渐变圆角矩形（左上高光延续球感）。
-    let fill_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: w * 0.5, y: h * 0.5 },
-        gradientOriginOffset: D2D_POINT_2F { x: -w * 0.18, y: -h * 0.2 },
-        radiusX: w * 0.9,
-        radiusY: h * 1.0,
-    };
-    let stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: argb_to_color(lighten(ring, 0.3)) },
-        D2D1_GRADIENT_STOP { position: 1.0, color: argb_to_color(darken(ring, 0.12)) },
-    ];
-    if let Ok(gsc) = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
-        if let Ok(br) = ctx.CreateRadialGradientBrush(&fill_prop, None, &gsc) {
-            ctx.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h },
-                    radiusX: corner,
-                    radiusY: corner,
-                },
-                &br,
-            );
-        }
-    }
-    let hr = ctx.EndDraw(None, None);
-    if hr.is_err() {
-        return false;
-    }
     chain.Present(0, DXGI_PRESENT_RESTART).is_ok()
 }
 
@@ -899,4 +941,14 @@ fn darken(argb: u32, k: f32) -> u32 {
         v.clamp(0.0, 255.0) as u32
     };
     (argb & 0xFF000000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// 同色降 alpha（core 渐隐渐显）。
+fn fade_a(argb: u32, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        a,
+        r: ((argb >> 16) & 0xFF) as f32 / 255.0,
+        g: ((argb >> 8) & 0xFF) as f32 / 255.0,
+        b: (argb & 0xFF) as f32 / 255.0,
+    }
 }
