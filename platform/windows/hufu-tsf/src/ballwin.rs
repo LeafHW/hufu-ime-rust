@@ -21,6 +21,11 @@
 
 use std::sync::mpsc::Sender;
 use windows::core::{Interface, HSTRING};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+};
 use windows::Foundation::Numerics as N;
 use windows::Foundation::TimeSpan;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
@@ -113,6 +118,17 @@ pub enum BallCmd {
     /// 整树显/隐（root.IsVisible）。
     Show,
     Hide,
+    /// 【十二修·面板真实内容】候选文本进合成线程（morph 帧实时画）。
+    SetContent {
+        /// 显示行（已拼好「1.词 注」）。
+        lines: Vec<String>,
+        /// 选中行索引。
+        selected: usize,
+        /// 文本色（普通行）。
+        text: u32,
+        /// 文本色（选中行）。
+        text_sel: u32,
+    },
 }
 
 /// v5 球窗句柄（窗口线程持有；COM 全困在合成线程）。
@@ -168,6 +184,13 @@ impl BallWin {
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
+    }
+    /// 【十二修】候选内容（每次 show 调用——内容变了合成线程重画）。
+    pub fn set_content(
+        &self, lines: Vec<String>, selected: usize,
+        text: u32, text_sel: u32,
+    ) {
+        self.send(BallCmd::SetContent { lines, selected, text, text_sel });
     }
     pub fn fade_in(&self) {
         self.send(BallCmd::FadeIn);
@@ -431,6 +454,39 @@ unsafe fn synth_thread(
     let mut fading = false;
     let mut last_ring: u32 = 0xFF101014;
     let mut last_core: u32 = 0xFFE8E8EC;
+    // 【十二修·面板真实内容】候选文本缓存 + DWrite 格式（一次建）。
+    let mut content_lines: Vec<String> = Vec::new();
+    let mut content_sel: usize = 0;
+    let mut text_col: u32 = 0xFF333333;
+    let mut text_sel_col: u32 = 0xFF101014;
+    let dwrite: Option<IDWriteFactory> =
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok();
+    let text_fmt: Option<windows::Win32::Graphics::DirectWrite::IDWriteTextFormat> =
+        dwrite.as_ref().and_then(|f| {
+            f.CreateTextFormat(
+                &HSTRING::from("Microsoft YaHei UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                15.0,
+                &HSTRING::from("zh-CN"),
+            )
+            .ok()
+        });
+    let text_fmt_sel: Option<windows::Win32::Graphics::DirectWrite::IDWriteTextFormat> =
+        dwrite.as_ref().and_then(|f| {
+            f.CreateTextFormat(
+                &HSTRING::from("Microsoft YaHei UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                15.0,
+                &HSTRING::from("zh-CN"),
+            )
+            .ok()
+        });
     loop {
         let got = rx.recv_timeout(std::time::Duration::from_millis(15)).ok();
         if let Some(cmd) = got {
@@ -632,6 +688,32 @@ unsafe fn synth_thread(
             BallCmd::Hide => {
                 let _ = root.SetIsVisible(false);
             }
+            BallCmd::SetContent { lines, selected, text, text_sel } => {
+                let changed = lines != content_lines || selected != content_sel
+                    || text != text_col || text_sel != text_sel_col;
+                content_lines = lines;
+                content_sel = selected;
+                text_col = text;
+                text_sel_col = text_sel;
+                // 【十二修】框态驻留时内容更新=立即重画当前帧（morph
+                // 期间不用——插值循环每 tick 都画，自然带上新内容）。
+                if changed && morph.is_none() && cur.w > ball_side + 0.5 {
+                    let _ = content.SetSize(N::Vector2 {
+                        X: cur.w.max(2.0) + 2.0 * SH_PAD,
+                        Y: cur.h.max(2.0) + 2.0 * SH_PAD,
+                    });
+                    let ok = paint_morph_frame(
+                        &chain, &d2d_dev, cur.w, cur.h, ballness,
+                        last_ring, last_core,
+                        &content_lines, content_sel, text_col, text_sel_col,
+                        text_fmt.as_ref(), text_fmt_sel.as_ref(),
+                    );
+                    if ok {
+                        let _ = root.SetIsVisible(false);
+                        let _ = root.SetIsVisible(true);
+                    }
+                }
+            }
             }
         } else {
             // 【morph v2 插值帧驱动】15ms/tick：progress→ease→几何+内容
@@ -669,6 +751,8 @@ unsafe fn synth_thread(
                 let _ = paint_morph_frame(
                     &chain, &d2d_dev, cur.w, cur.h, ballness,
                     last_ring, last_core,
+                    &content_lines, content_sel, text_col, text_sel_col,
+                    text_fmt.as_ref(), text_fmt_sel.as_ref(),
                 );
                 // 【树重提交】本机实证：morph 逐帧 SetSize/SetOffset 后
                 // 合成器不自动提交新 surface 帧——IsVisible 翻转强制整
@@ -763,6 +847,13 @@ unsafe fn paint_morph_frame(
     ballness: f32,
     ring: u32,
     core: u32,
+    // 【十二修】候选文本（面板真实内容）。
+    lines: &[String],
+    sel: usize,
+    text_col: u32,
+    text_sel_col: u32,
+    text_fmt: Option<&windows::Win32::Graphics::DirectWrite::IDWriteTextFormat>,
+    text_fmt_sel: Option<&windows::Win32::Graphics::DirectWrite::IDWriteTextFormat>,
 ) -> bool {
     let buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D =
         match chain.GetBuffer(0) {
@@ -891,6 +982,55 @@ unsafe fn paint_morph_frame(
                     },
                     &cb,
                 );
+            }
+        }
+    }
+    // 【十二修·面板真实内容】候选文本：alpha=1-ballness（球态无字、
+    // 框态满显——文本随形变展开浮现=一体感）。左上起点，20px 行距，
+    // 选中行半粗体+高亮色。裁剪=主体 rect（球态 inset 大=文本自然
+    // 被圆内区域容纳不下→ballness 低才可见）。
+    if let Some(fmt) = text_fmt {
+                    let rt_txt: ID2D1RenderTarget = ctx.cast().unwrap();
+        let talpha = (1.0 - ballness).clamp(0.0, 1.0);
+        if talpha > 0.02 {
+            if let Ok(tb) = ctx.CreateSolidColorBrush(
+                &D2D1_COLOR_F { a: talpha, ..argb_to_color(text_col) },
+                None,
+            ) {
+                if let Ok(tsb) = ctx.CreateSolidColorBrush(
+                    &D2D1_COLOR_F { a: talpha, ..argb_to_color(text_sel_col) },
+                    None,
+                ) {
+                    let lh = 21.0f32;
+                    for (i, line) in lines.iter().enumerate().take(8) {
+                        let ly = by0 + 5.0 + i as f32 * lh;
+                        if ly + lh > by1 { break; }
+                        let (brush, f) = if i == sel {
+                            (&tsb, text_fmt_sel.or(Some(fmt)))
+                        } else {
+                            (&tb, Some(fmt))
+                        };
+                        if let Some(f2) = f {
+                            let _ = f2.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                            let _ = f2.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                            let rect = D2D_RECT_F {
+                                left: bx0 + 10.0,
+                                top: ly,
+                                right: bx1 - 6.0,
+                                bottom: ly + lh,
+                            };
+                            let ws = HSTRING::from(line.as_str());
+                            rt_txt.DrawText(
+                                ws.as_wide(),
+                                f2,
+                                &rect,
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
+                    }
+                }
             }
         }
     }

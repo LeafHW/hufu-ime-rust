@@ -1043,7 +1043,14 @@ impl CandidateWindowV2 {
                 WS_EX_TOOLWINDOW.0
                     | WS_EX_TOPMOST.0
                     | WS_EX_NOACTIVATE.0
-                    | WS_EX_NOREDIRECTIONBITMAP.0,
+                    | WS_EX_NOREDIRECTIONBITMAP.0
+                    // 【P0·十二修】鼠标穿透：v5 包围盒大窗（球∪框+前瞻
+                    // ~210px）rect 区域拦截点击=「看不见的元素挡住屏幕，
+                    // 点不了别的软件」（用户实证）。v5 框纯展示无交互
+                    // ——WS_EX_TRANSPARENT 让 hit-test 完全透传（独立
+                    // 使用即可，不加 LAYERED——会破坏 NOREDIRECTIONBITMAP
+                    // 的 DComp 渲染路径）。
+                    | WS_EX_TRANSPARENT.0,
             );
             let hwnd = CreateWindowExW(
                 ex,
@@ -4144,6 +4151,21 @@ impl CandidateWindowV2 {
                 // 个元素顺滑平移」）。SWP 移动的视觉跳变由 morph from
                 // Offset 补偿（球屏位不变起步）。
                 if let Some(b) = &self.ball {
+                    // 【十二修·面板真实内容】候选行进合成线程（morph 帧
+                    // 实时画——框态驻留时内容更新立即重画）。
+                    let lines: Vec<String> = cands
+                        .iter()
+                        .take(8)
+                        .enumerate()
+                        .map(|(i, (t, c))| {
+                            if c.is_empty() {
+                                format!("{}.{}", i + 1, t)
+                            } else {
+                                format!("{}.{} {}", i + 1, t, c)
+                            }
+                        })
+                        .collect();
+                    b.set_content(lines, selected, 0xFF3A3340, 0xFF1A1520);
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
                     let mut fx = px as f32;
                     let mut fy = py as f32;
