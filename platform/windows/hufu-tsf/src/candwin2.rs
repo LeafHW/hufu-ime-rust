@@ -1680,12 +1680,28 @@ impl CandidateWindowV2 {
                 (motion_f(skin, "morph_ms", 500.0).clamp(60.0, 3000.0)) as u32,
             );
             // 【R6】材质整窗透明度（material.opacity——与候选窗同一滑条）。
-            let mat_op = skin
-                .pointer("/skin/material/opacity")
-                .or_else(|| skin.get("material").and_then(|m| m.get("opacity")))
+            let mat_node = skin
+                .pointer("/skin/material")
+                .or_else(|| skin.get("material"));
+            let mat_op = mat_node
+                .and_then(|m| m.get("opacity"))
                 .and_then(|x| x.as_f64())
                 .unwrap_or(1.0)
                 .clamp(0.1, 1.0) as f32;
+            // 首次必打一次（诊断 server 注入的 material 结构）。
+            static MAT_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !MAT_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let raw = mat_node
+                    .and_then(|m| m.as_str().map(|s| s.to_string()).or_else(|| {
+                        serde_json::to_string(&m).ok()
+                    }))
+                    .unwrap_or_else(|| "<无 material 节点>".into());
+                crate::tsf::diag_note(&format!("v6dbg material 原文: {}", raw));
+            }
+            if (self.ball_mat_opacity.get() - mat_op).abs() > 0.001 {
+                crate::tsf::diag_note(&format!("v6dbg mat_op={}", mat_op));
+            }
             self.ball_mat_opacity.set(mat_op);
             // 【打断=真实新键入】签名变化或键活性（600ms 内有键）+
             // 非内部复渲染（联想刷新同签名且无键=不打断；整句模式
@@ -1734,16 +1750,37 @@ impl CandidateWindowV2 {
                     .and_then(|s| parse(&s))
             };
             if let Some(v) = cget("back_color") {
-                self.ball_ring.set(v);
+                // 【R8·纯色模型对齐】候选窗=「颜色只管色相、alpha 由
+                // material 滑条控」（窗底=master_alpha、高亮=hilite_
+                // alpha）——球用同一模型：环=窗底色相+master 透明度、
+                // 芯=高亮条色相+hilite 透明度（用户：「跟皮肤一样的
+                // 透明设置」；此前球直接用颜色自带 FF alpha=永远实心）。
+                let master = skin
+                    .pointer("/skin/material/master_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("master_alpha")))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let hue_only = (v & 0x00FF_FFFF) | ((master * 255.0) as u32) << 24;
+                self.ball_ring.set(hue_only);
+                self.ball_mat_opacity.set(1.0);
             }
             // 芯=皮肤高亮色（R5 定稿：**候选高亮条的背景色**——用户
             // 每天看到的高亮红；此前选的 hilited_mark_color 是序号标
-            // 色（亮红），用户实锤「不是高亮的红」）。透明度原样继承。
+            // 色（亮红），用户实锤「不是高亮的红」）。透明度=hilite_
+            // alpha 滑条（高亮条的独立透明度——同一模型）。
             let core = cget("hilited_candidate_back_color")
                 .or_else(|| cget("hilited_mark_color"))
                 .or_else(|| cget("hilited_label_color"));
             if let Some(v) = core {
-                self.ball_core.set(v);
+                let hilite_a = skin
+                    .pointer("/skin/material/hilite_alpha")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("hilite_alpha")))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0) as f32;
+                let hue_only = (v & 0x00FF_FFFF) | ((hilite_a * 255.0) as u32) << 24;
+                self.ball_core.set(hue_only);
             }
         }
         let now = std::time::Instant::now();
@@ -2605,6 +2642,18 @@ impl CandidateWindowV2 {
                 // 【v6·R2】形变=morph_ms（R3 定稿 0.5s）。
                 self.size_anim_ms.set(self.ball_morph_ms.get());
                 self.chrome_override.set(Some((bd, bd)));
+                // 【R8·中心钉住展开】框从球心向四周长大（窗口中心恒=
+                // 球心，尺寸缓动）——不再边长大边滑向布局位（那=壳
+                // 视觉上「从框内左上角长出去」，用户实锤）。完成后由
+                // 位置滑动段（expanding 退役后自然恢复）快滑到 1.5.9
+                // 布局位=「球变框」+「框归位」两步，与收球两段对称。
+                let (bpx, bpy) = self.ball_pos.get();
+                let from = self.live_pos.get();
+                let ctr_to = (
+                    bpx - w_out as i32 / 2,
+                    bpy - h_out as i32 / 2,
+                );
+                self.pos_anim = Some((from, ctr_to, std::time::Instant::now(), self.ball_morph_ms.get()));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
                 // 展开=复活：退场渐隐状态一并清（渐隐中键入=球立即可见
@@ -4459,6 +4508,29 @@ impl CandidateWindowV2 {
             );
             let _ = br;
         }
+    }
+
+    /// 【v6·R8·失焦清球】焦点/前台切换（OnSetFocus(false)）=用户离开
+    /// 本输入场——球立即消失（不等 4s 驻留钟/渐隐）。清全部球状态并
+    /// 真隐藏（绕过 hide 的球系统吞掉保护——那是给打字期空帧用的）。
+    pub fn kill_ball(&mut self) {
+        if !ball_gate() {
+            return;
+        }
+        self.ball_armed.set(false);
+        self.ball_form.set(false);
+        self.ball_closing.set(false);
+        self.ball_expanding.set(false);
+        self.ball_mix.set(0.0);
+        self.ball_exit_t0.set(None);
+        self.ball_idle_t0.set(None);
+        self.size_anim = None;
+        self.chrome_override.set(None);
+        unsafe {
+            let _ = KillTimer(self.hwnd, BALL_DELAY6_ID);
+        }
+        crate::tsf::diag_note("v6球R8: 失焦清球");
+        self.hide();
     }
 
     /// 【v6·S1】上屏收球入口（替代 hide 的球化路径）：起观察窗

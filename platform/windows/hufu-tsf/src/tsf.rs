@@ -775,7 +775,9 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         if !fforeground.as_bool() {
             let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                // 【v6·R8】失焦=离开输入场：球强制消失（kill_ball 绕过
+                // 球系统吞掉保护——否则切窗后球一直挂着=用户实锤）。
+                c.kill_ball();
             }
         }
         Ok(())
@@ -5042,6 +5044,25 @@ pub(crate) fn host_may_show() -> bool {
 fn poll_collapse_stale(shared: &SharedRef) {
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut any_visible = false;
+    // 【v6·R8·切窗清球】停手收球前先验前台：前台已是他进程=用户切窗
+    // （此路径在 mine 门提前 return——下方 poll_tick 的前台判据段到
+    // 不了这里）——球化跟随会把球挂到新窗口的光标上=「切窗后球一直
+    // 在」（用户实锤）。异进程直接 kill（同应用族豁免照旧）。
+    unsafe {
+        let fg = GetForegroundWindow();
+        if !fg.0.is_null() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            if pid != std::process::id()
+                && !(host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid))
+                && !fg_same_app_dir(pid)
+            {
+                if let Some(c) = g.cand2.as_mut() {
+                    c.kill_ball();
+                }
+            }
+        }
+    }
     // 【v6·S1】停手/断段收窗球化（联想框的正规收尾点——观察窗
     // →收球）。caret 已失效则普通隐藏。
     // 【R7·真实光标】上屏后 g.caret 缓存停在打字末位（上屏插入
@@ -5180,7 +5201,14 @@ fn poll_tick() {
                 && !(host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid))
                 && !fg_same_app_dir(pid)
             {
-                // 【三十五修】内联收窗逻辑抽出为 poll_collapse_stale 复用
+                // 【v6·R8】前台他进程=用户已切走：球强制消失（球化
+                // 挂 4s 驻留=切窗后球一直在=用户实锤），普通窗照旧收。
+                {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.kill_ball();
+                    }
+                }
                 poll_collapse_stale(&shared);
                 return;
             }
