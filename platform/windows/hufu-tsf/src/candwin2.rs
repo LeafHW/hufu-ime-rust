@@ -697,6 +697,12 @@ pub struct CandidateWindowV2 {
     /// 的补充：d 候选=[的,得] 与联想内容同签名时，内容无法区分，
     /// 有键=必展开。
     pub(crate) ball_key_recent: std::cell::Cell<bool>,
+    /// 【v6·R2】形变时长 ms（框↔球/首键球入场=1s 定稿；皮肤
+    /// motion.morph_ms 可调）。
+    pub(crate) ball_morph_ms: std::cell::Cell<u32>,
+    /// 【v6·R2】当前 size_anim 的时长（起臂点设：普通起臂=size_ms、
+    /// 球形变=morph_ms；消费点统一读此值）。
+    pub(crate) size_anim_ms: std::cell::Cell<u32>,
     /// 【v6·S4】皮肤参数缓存（show 每帧刷）：球径/球窗/观察窗/驻留ms。
     pub(crate) ball_d_run: std::cell::Cell<f32>,
     pub(crate) ball_win_run: std::cell::Cell<f32>,
@@ -1067,6 +1073,8 @@ impl CandidateWindowV2 {
                 ball_enabled: std::cell::Cell::new(ball_gate()),
                 ball_last_sig: std::cell::RefCell::new(String::new()),
                 ball_key_recent: std::cell::Cell::new(false),
+                ball_morph_ms: std::cell::Cell::new(1000),
+                size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
                 ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
@@ -1250,6 +1258,8 @@ impl CandidateWindowV2 {
                 ball_enabled: std::cell::Cell::new(ball_gate()),
                 ball_last_sig: std::cell::RefCell::new(String::new()),
                 ball_key_recent: std::cell::Cell::new(false),
+                ball_morph_ms: std::cell::Cell::new(1000),
+                size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
                 ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
@@ -1656,6 +1666,9 @@ impl CandidateWindowV2 {
             self.ball_idle_ms_run.set(
                 motion_f(skin, "idle_ms", BALL_IDLE6_MS as f32).clamp(500.0, 60_000.0) as u32,
             );
+            self.ball_morph_ms.set(
+                (motion_f(skin, "morph_ms", 1000.0).clamp(60.0, 3000.0)) as u32,
+            );
             // 【打断=真实新键入】签名变化或键活性（600ms 内有键）+
             // 非内部复渲染（联想刷新同签名且无键=不打断；整句模式
             // d 候选与联想同签名时靠键活性兜底）。
@@ -1679,8 +1692,9 @@ impl CandidateWindowV2 {
             }
             let cget = |k: &str| -> Option<u32> {
                 // 皮肤色=#RRGGBBAA（weasel 语义）。转内部 ARGB u32：
-                // r=v>>24, g=v>>16, b=v>>8, a=v&FF（a=0 视为不透明——
-                // 皮肤大量用 00 表示"无透明度含义的填充"）。
+                // r=v>>24, g=v>>16, b=v>>8, a=v&FF。
+                // 【R2 定稿】透明度原样继承（用户：中心/周边色「一定」
+                // 是皮肤色并继承透明度——不做 00→FF 补全）。
                 // 【S4 修复】此前按 AARRGGBB 解包——RR/GG/BB 全错位，
                 // 蓝通道拿到 alpha 字节=球恒蓝（墨言 #0D0D0FFF→纯蓝）。
                 let parse = |s: &str| -> Option<u32> {
@@ -1688,10 +1702,7 @@ impl CandidateWindowV2 {
                     let r = (v >> 24) & 0xFF;
                     let g = (v >> 16) & 0xFF;
                     let b = (v >> 8) & 0xFF;
-                    let a = match v & 0xFF {
-                        0 => 0xFF,
-                        a => a,
-                    };
+                    let a = v & 0xFF;
                     Some((a << 24) | (r << 16) | (g << 8) | b)
                 };
                 skin.pointer(&format!("/colors/{k}"))
@@ -1742,6 +1753,11 @@ impl CandidateWindowV2 {
         self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.fade_ms_eff = (60.0 * anim_spd) as u32;
         self.size_ms = (layout_f(skin, "size_ms", 60.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【v6·R2】size_anim 时长基线——仅无动画进行中时重置（球形态变
+        // 1s 期间每帧 show 会把此处刷回 size_ms=60=形变被提速的根因）。
+        if self.size_anim.is_none() {
+            self.size_anim_ms.set(self.size_ms);
+        }
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
@@ -2335,7 +2351,7 @@ impl CandidateWindowV2 {
         if !self.internal_rerender {
             let target = (w_out as i32, h_out as i32);
             let cur = match self.size_anim {
-                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
+                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_ms.get()),
                 None => self.live_size.get(),
             };
             if self.readback {
@@ -2343,6 +2359,11 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(None);
             } else if was_visible
                 && self.size_ms > 0
+                // 【v6·R2·形变保护】球形态变进行中（收球 closing/展开
+                // 叠加未淡完）不接受普通尺寸起臂——后续内容帧的普通
+                // 起臂（90ms）会覆盖 1s 形变=展开瞬间完成看不出变形。
+                && self.ball_mix.get() <= 0.02
+                && !self.ball_closing.get()
                 // 【起臂阈值 24/14 2026-09-11】普通逐字打字的行宽增长
                 // （~8-17px/键）不动画——文字即时更新（连打不闪不滞后，
                 // 用户实测逐键闪的规避）；动画留给结构性大变化（注释
@@ -2351,6 +2372,7 @@ impl CandidateWindowV2 {
                 && ((target.0 - cur.0).abs() > 24 || (target.1 - cur.1).abs() > 14)
             {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
+                self.size_anim_ms.set(self.size_ms);
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
@@ -2394,6 +2416,10 @@ impl CandidateWindowV2 {
                     )
                 };
                 self.size_anim = Some((start, target, std::time::Instant::now()));
+                // 【v6·R2】形变时长：球入场（球→框的长大）=1s；普通
+                // 72% 入场保持 size_ms。
+                self.size_anim_ms
+                    .set(if ball_entry { self.ball_morph_ms.get() } else { self.size_ms });
                 self.chrome_override.set(Some(start));
                 self.scale_in.set(true);
                 crate::tsf::diag_note(&format!(
@@ -2403,7 +2429,13 @@ impl CandidateWindowV2 {
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
-            } else if !self.scale_in.get() {
+            } else if !self.scale_in.get()
+                // 【v6·R2·形变保护】球形态变中不清 size_anim/chrome_
+                // override（展开起臂不带 scale_in，此分支会把 1s 形变
+                // 一步清掉=瞬间全框）。
+                && self.ball_mix.get() <= 0.02
+                && !self.ball_closing.get()
+            {
                 // 【owned 入场诊断 2026-09-11】首显却没起臂——记录条件值
                 if !was_visible {
                     let ent = skin
@@ -2444,7 +2476,8 @@ impl CandidateWindowV2 {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
                 Some((_, _, t0)) => {
-                    (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32).clamp(0.0, 1.0)
+                    (t0.elapsed().as_millis() as f32 / self.size_anim_ms.get().max(1) as f32)
+                        .clamp(0.0, 1.0)
                 }
                 None => 1.0,
             };
@@ -2477,6 +2510,8 @@ impl CandidateWindowV2 {
                     (w_out as i32, h_out as i32),
                     std::time::Instant::now(),
                 ));
+                // 【v6·R2】形变 1s（用户定稿：变框变球都 1 秒）。
+                self.size_anim_ms.set(self.ball_morph_ms.get());
                 self.chrome_override.set(Some((bw, bw)));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
@@ -2506,7 +2541,7 @@ impl CandidateWindowV2 {
             // 窗口=缓动≥目标；grow-only 下不触发重建，宽缓冲沿用）。
             let (buf_w, buf_h) = match self.size_anim {
                 Some((f, t, t0)) => {
-                    let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                    let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_ms.get());
                     (e.0.max(w_out as i32), e.1.max(h_out as i32))
                 }
                 None => (w_out as i32, h_out as i32),
@@ -3366,7 +3401,7 @@ impl CandidateWindowV2 {
                 if self.ball_mix.get() > 0.02 {
                     let t = match self.size_anim {
                         Some((_, _, t0)) => {
-                            (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32)
+                            (t0.elapsed().as_millis() as f32 / self.size_anim_ms.get().max(1) as f32)
                                 .clamp(0.0, 1.0)
                         }
                         None => 1.0,
@@ -3475,7 +3510,7 @@ impl CandidateWindowV2 {
                                 f,
                                 t,
                                 t0.elapsed().as_millis() as u32,
-                                self.size_ms,
+                                self.size_anim_ms.get(),
                             );
                             (e.0.max(w_out as i32), e.1.max(h_out as i32))
                         }
@@ -3897,7 +3932,12 @@ impl CandidateWindowV2 {
                 } else {
                     match self.size_anim {
                         Some((f, t, t0)) => {
-                            let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                            let e = size_ease(
+                                f,
+                                t,
+                                t0.elapsed().as_millis() as u32,
+                                self.size_anim_ms.get(),
+                            );
                             (e.0.max(w_out as i32), e.1.max(h_out as i32))
                         }
                         None => (w_out as i32, h_out as i32),
@@ -4266,6 +4306,9 @@ impl CandidateWindowV2 {
     }
 
     /// 渐变圆（中心色→边缘亮/暗渐变；v5 归档画法简化版·S2 加 alpha）。
+    /// 【v6·R2·纯色】球体填充=皮肤色原样（用户定稿：环=皮肤窗口色、
+    /// 芯=皮肤高亮色，「一定是」=不做任何明暗渐变偏移，透明度原样
+    /// 继承）。立体感由外层柔影承担（阴影不动）。
     unsafe fn fill_grad_ball6c(
         ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         cx: f32,
@@ -4274,61 +4317,25 @@ impl CandidateWindowV2 {
         argb: u32,
         alpha: f32,
     ) {
-        use windows::Win32::Graphics::Direct2D as D2;
         let (a, r8, g8, b8) = (
             ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha,
             ((argb >> 16) & 0xFF) as f32 / 255.0,
             ((argb >> 8) & 0xFF) as f32 / 255.0,
             (argb & 0xFF) as f32 / 255.0,
         );
-        let stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: D2D1_COLOR_F {
-                    a,
-                    r: (r8 * 1.25 + 0.05).min(1.0),
-                    g: (g8 * 1.25 + 0.05).min(1.0),
-                    b: (b8 * 1.25 + 0.05).min(1.0),
-                },
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: D2D1_COLOR_F {
-                    a,
-                    r: r8 * 0.82,
-                    g: g8 * 0.82,
-                    b: b8 * 0.82,
-                },
-            },
-        ];
-        let rt: D2::ID2D1RenderTarget = match ctx.cast() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        if let Ok(gs) = rt.CreateGradientStopCollection(
-            &stops,
-            D2D1_GAMMA_2_2,
-            D2D1_EXTEND_MODE_CLAMP,
+        if let Ok(br) = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F { a, r: r8, g: g8, b: b8 },
+            None,
         ) {
-            let prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-                center: D2D_POINT_2F { x: cx, y: cy },
-                gradientOriginOffset: D2D_POINT_2F {
-                    x: -r * 0.25,
-                    y: -r * 0.3,
+            ctx.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: D2D_POINT_2F { x: cx, y: cy },
+                    radiusX: r,
+                    radiusY: r,
                 },
-                radiusX: r,
-                radiusY: r,
-            };
-            if let Ok(br) = ctx.CreateRadialGradientBrush(&prop, None, &gs) {
-                ctx.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F { x: cx, y: cy },
-                        radiusX: r,
-                        radiusY: r,
-                    },
-                    &br,
-                );
-            }
+                &br,
+            );
+            let _ = br;
         }
     }
 
@@ -4399,12 +4406,14 @@ impl CandidateWindowV2 {
         let cur_sz = self.live_size.get();
         let cur_pos = self.live_pos.get();
         // 尺寸+位置同帧起臂（1.5.9 机制——tick 驱动壳按缓动画）。
+        // 【v6·R2】形变 1s（用户定稿）+框滑向球位的位移同步 1s
+        //（形变=尺寸+位移一体）。
         let bw = self.ball_win_run.get() as i32;
         self.size_anim = Some((cur_sz, (bw, bw), std::time::Instant::now()));
+        self.size_anim_ms.set(self.ball_morph_ms.get());
         self.chrome_override.set(Some(cur_sz));
         let d = ((bx - cur_pos.0).abs() + (by - cur_pos.1).abs()) as f32;
-        let spd = self.anim_spd.get().max(0.05);
-        let dur = ((d * 3.5 / spd) as u32).clamp(45, 150);
+        let dur = self.ball_morph_ms.get();
         self.pos_anim = Some((cur_pos, (bx, by), std::time::Instant::now(), dur));
         self.ball_closing.set(true);
         unsafe {
@@ -4476,7 +4485,8 @@ pub const BALL_D6: i32 = 22;
 pub const BALL_WIN: i32 = 48;
 /// [v6-S1] close observation window: keep the box this long after commit;
 /// typing within = box follows instead of closing.
-pub const BALL_DELAY6_MS: u32 = 500;
+/// [v6-R2] 500→1000（用户定稿：空格上屏后 1 秒无录入才变球）。
+pub const BALL_DELAY6_MS: u32 = 1000;
 /// [v6-S1] timer id for the observation window (EXPAND_TIMER_ID + 1).
 pub const BALL_DELAY6_ID: usize = 0x4846_5552; // 'HuFb'
 /// [v6-S1] ball dwell before dismissal (real clock, 4s).
@@ -4626,7 +4636,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             }
             if let Some((f, t, t0)) = c.size_anim {
                 let ms = t0.elapsed().as_millis() as u32;
-                let cur = size_ease(f, t, ms, c.size_ms);
+                let cur = size_ease(f, t, ms, c.size_anim_ms.get());
                 let finished = cur == t;
                 if finished {
                     c.size_anim = None;
@@ -4760,7 +4770,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 全帧开销 ×67fps 翻倍）；size 插值滞后一帧（15ms）无视觉差。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
-            let cur = size_ease(f, t, ms, c.size_ms);
+            let cur = size_ease(f, t, ms, c.size_anim_ms.get());
             let finished = cur == t;
             if finished {
                 c.size_anim = None;
