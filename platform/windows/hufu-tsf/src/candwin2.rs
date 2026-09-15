@@ -1723,9 +1723,12 @@ impl CandidateWindowV2 {
             if let Some(v) = cget("back_color") {
                 self.ball_ring.set(v);
             }
-            // 芯=皮肤高亮标色（hilited_mark；缺省回落 hilited_label）——
-            // hilited_back_color 在多数皮肤是透明填充（xx00）不适合做球。
-            let core = cget("hilited_mark_color").or_else(|| cget("hilited_label_color"));
+            // 芯=皮肤高亮色（R5 定稿：**候选高亮条的背景色**——用户
+            // 每天看到的高亮红；此前选的 hilited_mark_color 是序号标
+            // 色（亮红），用户实锤「不是高亮的红」）。透明度原样继承。
+            let core = cget("hilited_candidate_back_color")
+                .or_else(|| cget("hilited_mark_color"))
+                .or_else(|| cget("hilited_label_color"));
             if let Some(v) = core {
                 self.ball_core.set(v);
             }
@@ -4462,11 +4465,14 @@ impl CandidateWindowV2 {
         // 编辑）→ 球平滑滑到新光标（复用 pos_anim；poll 每 ~110ms 喂
         // 新 caret）。不动（±2px 容差）不重臂（防抖）。
         if self.ball_form.get() {
-            let bx = cx + 6;
-            let by = cy + 16;
-            let (px, py) = self.ball_pos.get();
+            // 【R5】目标左上=球心-半窗（球心语义统一；48 窗球画在
+            // 中心=屏位球心）。
+            let win = self.ball_win_run.get() as i32;
+            let bx = cx + 6 - win / 2;
+            let by = cy + 16 - win / 2;
+            let (px, py) = self.live_pos.get();
             if (px - bx).abs() + (py - by).abs() > 2 {
-                self.ball_pos.set((bx, by));
+                self.ball_pos.set((cx + 6, cy + 16));
                 let spd = self.anim_spd.get().max(0.05);
                 let d = ((bx - px).abs() + (by - py).abs()) as f32;
                 let dur = ((d * 3.5 / spd) as u32).clamp(45, 150);
@@ -4497,7 +4503,10 @@ impl CandidateWindowV2 {
     pub(crate) fn ball_delay_fire6(&mut self) {
         self.ball_armed.set(false);
         let (cx, cy) = self.ball_pending.get();
-        // 球位=caret 右下（v5 校准偏移）。
+        // 球位=caret 右下（v5 校准偏移）。【R5】ball_pos 恒存**球心**；
+        // 形变终点窗口（=球直径圆）的左上=球心-半径——此前把球心
+        // 坐标直接当窗口左上=收球滑到位后球帧（48 窗）球心偏出 24px
+        //=「收完球闪现在别处」（用户实锤）。
         let bx = cx + 6;
         let by = cy + 16;
         self.ball_pos.set((bx, by));
@@ -4506,13 +4515,18 @@ impl CandidateWindowV2 {
         // 尺寸+位置同帧起臂（1.5.9 机制——tick 驱动壳按缓动画）。
         // 【R4】形变终点=球直径（球视觉本体——末帧壳圆=球帧的球，
         // 无跳变；球帧随后钉窗=球窗 48=球+柔影 pad，透明区扩展
-        // 不可见）。
+        // 不可见）。【R5】终点左上=球心-半径（球直径圆的正确左上）。
         let bd_px = self.ball_d_run.get() as i32;
         self.size_anim = Some((cur_sz, (bd_px, bd_px), std::time::Instant::now()));
         self.size_anim_ms.set(self.ball_morph_ms.get());
         self.chrome_override.set(Some(cur_sz));
         let dur = self.ball_morph_ms.get();
-        self.pos_anim = Some((cur_pos, (bx, by), std::time::Instant::now(), dur));
+        self.pos_anim = Some((
+            cur_pos,
+            (bx - bd_px / 2, by - bd_px / 2),
+            std::time::Instant::now(),
+            dur,
+        ));
         self.ball_closing.set(true);
         // 【v6·R3】收球球渐显 base=1（框缩小的同时球从中心浮现=
         // 同一个东西在变形，而不是框没了球突然出现）。
@@ -4889,6 +4903,28 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.ball_idle_t0.set(Some(std::time::Instant::now()));
                     shown_this_tick = true;
                     c.internal_rerender = true;
+                    // 【R5·球心对齐】形变末窗=球直径(32)左上=球心-16；
+                    // 球帧窗=球窗(48)左上应=球心-24——先 SWP 左上外扩
+                    // pad（透明区扩展，球视觉零位移），球帧在窗中心画
+                    // 球即与形变末帧壳圆同位（此前左上不动=球心偏移
+                    // 8px + 老版本偏 24px=「球闪现」）。
+                    {
+                        let win = c.ball_win_run.get() as i32;
+                        let (lp0, lp1) = c.live_pos.get();
+                        let pad = (win - c.ball_d_run.get() as i32) / 2;
+                        unsafe {
+                            let _ = SetWindowPos(
+                                c.hwnd,
+                                HWND_TOPMOST,
+                                lp0 - pad,
+                                lp1 - pad,
+                                win,
+                                win,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            );
+                        }
+                        c.live_pos.set((lp0 - pad, lp1 - pad));
+                    }
                     let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                     c.internal_rerender = false;
                     crate::tsf::diag_note("v6球S1: 球态驻留开始(4s)·主");
