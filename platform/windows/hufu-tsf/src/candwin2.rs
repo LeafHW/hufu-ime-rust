@@ -686,6 +686,13 @@ pub struct CandidateWindowV2 {
     pub(crate) ball_mix: std::cell::Cell<f32>,
     /// 【v6·S3】退场渐隐起点（Some=渐隐中；150ms 线性到 0 后 SW_HIDE）。
     pub(crate) ball_exit_t0: std::cell::Cell<Option<std::time::Instant>>,
+    /// 【v6·S4】运行时球开关缓存（env || 皮肤 motion.ball；show 每帧刷）。
+    pub(crate) ball_enabled: std::cell::Cell<bool>,
+    /// 【v6·S4】皮肤参数缓存（show 每帧刷）：球径/球窗/观察窗/驻留ms。
+    pub(crate) ball_d_run: std::cell::Cell<f32>,
+    pub(crate) ball_win_run: std::cell::Cell<f32>,
+    pub(crate) ball_obs_ms: std::cell::Cell<u32>,
+    pub(crate) ball_idle_ms_run: std::cell::Cell<u32>,
     /// 【顶屏钳位许可 2026-09-12 二十四次修正】仅 C&R（顶屏上屏）路径
     /// 置 true——「字宽<编码宽」的显示回退由正向钳位钉住原地等光标。
     /// 点击换位（SP 路径）不置=永不钳（用户实锤 75px 换位被幅度法误
@@ -1048,6 +1055,11 @@ impl CandidateWindowV2 {
                 ball_closing: std::cell::Cell::new(false),
                 ball_mix: std::cell::Cell::new(0.0),
                 ball_exit_t0: std::cell::Cell::new(None),
+                ball_enabled: std::cell::Cell::new(ball_gate()),
+                ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
+                ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
+                ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
+                ball_idle_ms_run: std::cell::Cell::new(BALL_IDLE6_MS),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -1224,6 +1236,11 @@ impl CandidateWindowV2 {
                 ball_closing: std::cell::Cell::new(false),
                 ball_mix: std::cell::Cell::new(0.0),
                 ball_exit_t0: std::cell::Cell::new(None),
+                ball_enabled: std::cell::Cell::new(ball_gate()),
+                ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
+                ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
+                ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
+                ball_idle_ms_run: std::cell::Cell::new(BALL_IDLE6_MS),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -1601,7 +1618,21 @@ impl CandidateWindowV2 {
         // 【v6·S1】球形态前置：①观察窗打断（期内键入=框跟随不收球
         // ——杀 timer+清 armed）；②球色热取（环=皮肤底色、心=高亮
         /// 底色——show 每帧刷，换肤即时生效）。
-        if ball_gate() {
+        // 【v6·S4】开关=env || 皮肤 motion.ball；参数缓存每帧刷。
+        let ball_on = ball_gate() || skin_ball_on(skin);
+        self.ball_enabled.set(ball_on);
+        BALL_ON_RUNTIME.store(skin_ball_on(skin), std::sync::atomic::Ordering::Relaxed);
+        if ball_on {
+            self.ball_d_run
+                .set(motion_f(skin, "ball_size", BALL_D6 as f32).clamp(6.0, 64.0));
+            self.ball_win_run
+                .set(motion_f(skin, "ball_win", BALL_WIN as f32).clamp(24.0, 160.0));
+            self.ball_obs_ms.set(
+                motion_f(skin, "observe_ms", BALL_DELAY6_MS as f32).clamp(0.0, 3000.0) as u32,
+            );
+            self.ball_idle_ms_run.set(
+                motion_f(skin, "idle_ms", BALL_IDLE6_MS as f32).clamp(500.0, 60_000.0) as u32,
+            );
             // 【打断=真实新键入】cands 非空 + 非内部复渲染（动画 tick
             // 的完成帧复渲染会把联想 last_show 喂进来——它打断=球每
             // 500ms 重收一次=脉动振荡）。
@@ -2374,12 +2405,13 @@ impl CandidateWindowV2 {
             let has_content = !cands.is_empty() && !raw.is_empty();
             if has_content && !self.internal_rerender {
                 let cur_sz = self.live_size.get();
+                let bw = self.ball_win_run.get() as i32;
                 self.size_anim = Some((
-                    (BALL_WIN, BALL_WIN),
+                    (bw, bw),
                     (w_out as i32, h_out as i32),
                     std::time::Instant::now(),
                 ));
-                self.chrome_override.set(Some((BALL_WIN, BALL_WIN)));
+                self.chrome_override.set(Some((bw, bw)));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
                 // 展开=复活：退场渐隐状态一并清（渐隐中键入=球立即可见
@@ -3274,8 +3306,9 @@ impl CandidateWindowV2 {
                     if alpha > 0.02 {
                         let (lx, ly) = self.live_pos.get();
                         let (bxp, byp) = self.ball_pos.get();
-                        let scx = (bxp as f32 + BALL_WIN as f32 * 0.5 - lx as f32) * dpi_scale;
-                        let scy = (byp as f32 + BALL_WIN as f32 * 0.5 - ly as f32) * dpi_scale;
+                        let bw = self.ball_win_run.get();
+                        let scx = (bxp as f32 + bw * 0.5 - lx as f32) * dpi_scale;
+                        let scy = (byp as f32 + bw * 0.5 - ly as f32) * dpi_scale;
                         self.draw_ball_into6(&ctx, scx, scy, alpha);
                     }
                     self.ball_mix.set(alpha);
@@ -4041,7 +4074,7 @@ impl CandidateWindowV2 {
         if alpha <= 0.02 {
             return;
         }
-        let d = BALL_D6 as f32;
+        let d = self.ball_d_run.get();
         let r = d * 0.5;
         // 软晕阴影（8 层方向性——底厚顶薄）。
         if let Ok(shb) = ctx.CreateSolidColorBrush(
@@ -4071,7 +4104,7 @@ impl CandidateWindowV2 {
     /// + 多层软晕阴影（v5 归档校准画法移植）。DPI 缩放同主渲染
     /// （窗口物理尺寸、逻辑坐标绘制）。alpha=整体透明度（S3 退场渐隐）。
     unsafe fn render_ball6(&mut self, dpi_scale: f32, alpha: f32) {
-        let win = ((BALL_WIN as f32 * dpi_scale) as i32).max(24);
+        let win = ((self.ball_win_run.get() * dpi_scale) as i32).max(24);
         if !self.ensure_swapchain(win as u32, win as u32) {
             return;
         }
@@ -4143,8 +4176,10 @@ impl CandidateWindowV2 {
             M12: 0.0, M21: 0.0, M31: 0.0, M32: 0.0,
         });
         ctx.Clear(None);
-        let pad = (BALL_WIN - BALL_D6) as f32 * 0.5;
-        let bc = pad + BALL_D6 as f32 * 0.5;
+        let bwin = self.ball_win_run.get();
+        let bd = self.ball_d_run.get();
+        let pad = (bwin - bd) * 0.5;
+        let bc = pad + bd * 0.5;
         self.draw_ball_into6(&ctx, bc, bc, alpha);
         let _ = ctx.EndDraw(None, None);
         if self.ulw {
@@ -4249,7 +4284,7 @@ impl CandidateWindowV2 {
         ));
         unsafe {
             let _ = KillTimer(self.hwnd, BALL_DELAY6_ID);
-            let tk = SetTimer(self.hwnd, BALL_DELAY6_ID, BALL_DELAY6_MS, None);
+            let tk = SetTimer(self.hwnd, BALL_DELAY6_ID, self.ball_obs_ms.get(), None);
             crate::tsf::diag_note(&format!(
                 "v6球S1: SetTimer ret={:?} tid={:?}",
                 tk,
@@ -4269,11 +4304,8 @@ impl CandidateWindowV2 {
         let cur_sz = self.live_size.get();
         let cur_pos = self.live_pos.get();
         // 尺寸+位置同帧起臂（1.5.9 机制——tick 驱动壳按缓动画）。
-        self.size_anim = Some((
-            cur_sz,
-            (BALL_WIN, BALL_WIN),
-            std::time::Instant::now(),
-        ));
+        let bw = self.ball_win_run.get() as i32;
+        self.size_anim = Some((cur_sz, (bw, bw), std::time::Instant::now()));
         self.chrome_override.set(Some(cur_sz));
         let d = ((bx - cur_pos.0).abs() + (by - cur_pos.1).abs()) as f32;
         let spd = self.anim_spd.get().max(0.05);
@@ -4354,10 +4386,48 @@ pub const BALL_DELAY6_MS: u32 = 500;
 pub const BALL_DELAY6_ID: usize = 0x4846_5552; // 'HuFb'
 /// [v6-S1] ball dwell before dismissal (real clock, 4s).
 pub const BALL_IDLE6_MS: u32 = 4000;
-/// [v6-S1] gate: ball-form paths active when HUFU_BALL=1 (retires at S4).
+/// [v6-S4] 运行时球开关（皮肤 motion.ball 结果——show 每帧刷新）。
+/// env 未设时 gate 读它；wndproc/hide 等无皮肤上下文的路径同读。
+pub static BALL_ON_RUNTIME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [v6-S4] gate: env 显式优先（HUFU_BALL=1 强制开 / =0 强制关），
+/// 未设=皮肤 motion.ball 的运行时缓存（出厂皮肤无此键=1.5.9 行为）。
 pub fn ball_gate() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("HUFU_BALL").map(|v| v == "1").unwrap_or(false))
+    let env_on = *V.get_or_init(|| match std::env::var("HUFU_BALL") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    });
+    if env_on {
+        return true;
+    }
+    // env=0 显式关；env 未设=皮肤缓存
+    if std::env::var("HUFU_BALL").is_ok() {
+        return false;
+    }
+    BALL_ON_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [v6-S4] 皮肤动效节点：/skin/motion/ball（或顶层 motion.ball）
+/// =true 开球形态。皮肤键派（每帧读，换肤即时生效）。
+pub fn skin_ball_on(skin: &serde_json::Value) -> bool {
+    skin.pointer("/skin/motion/ball")
+        .or_else(|| skin.get("motion").and_then(|m| m.get("ball")))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+}
+
+/// [v6-S4] 皮肤 motion 节点浮点参数（缺省 fallback）。
+fn motion_f(skin: &serde_json::Value, key: &str, dft: f32) -> f32 {
+    skin.pointer(&format!("/skin/motion/{key}"))
+        .or_else(|| {
+            skin.get("motion")
+                .and_then(|m| m.get(key))
+        })
+        .and_then(|x| x.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(dft)
 }
 /// 提升系统定时器粒度到 1ms（SetTimer(5) 实际生效的前提）。进程内
 /// 一次（OnceLock）；winmm 直连 FFI（免 Cargo feature）。
@@ -4541,7 +4611,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 4s（真实时钟）到点=退场（S1 直接 SW_HIDE；渐隐动画 S3）。
         if c.ball_form.get() {
             if let Some(t0) = c.ball_idle_t0.get() {
-                if t0.elapsed().as_millis() as u32 >= BALL_IDLE6_MS {
+                if t0.elapsed().as_millis() as u32 >= c.ball_idle_ms_run.get() {
                     // 【v6·S3】退场渐隐（150ms）替代硬 SW_HIDE：
                     // 起臂 exit_t0 → 每 tick 画渐隐球 → 归零后 SW_HIDE。
                     if c.ball_exit_t0.get().is_none() {

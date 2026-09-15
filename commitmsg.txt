@@ -1,21 +1,27 @@
-动效v6·S3：球退场渐隐+窗口尺寸钉死
+动效v6·S4：皮肤动效节点+门退役（HUFU_BALL→motion.ball）
 
-退场渐隐（替代 S1 硬 SW_HIDE）：
-- 驻留 4s 到点 → ball_exit_t0 起臂 → 150ms 线性 alpha 1→0
-- 渐隐期每 tick 渲染（render_ball6 带 alpha 参数，球体/阴影/高光
-  全乘 alpha）；归零后 SW_HIDE + 状态清
-- 展开打断渐隐=复活（exit_t0 清，球立即可见地长大成框）
-- 验收：diag「退场渐隐起臂(150ms)」+「渐隐完→退场」双日志；尾帧
-  采样回到纯底（球无残留）
+开关三层化：
+- HUFU_BALL=1 强制开 / =0 强制关（逃生舱，显式优先）
+- env 未设：皮肤 /skin/motion/ball=true 开（出厂皮肤无此键=1.5.9
+  行为——用户按皮肤自助启用，不影响存量）
+- 皮肤结果缓存进 BALL_ON_RUNTIME（AtomicBool，show 每帧刷）——
+  wndproc/hide 等无皮肤上下文的路径经 ball_gate() 读同一真值
 
-球帧窗口尺寸钉死：
-- 收球缓动末帧的 SWP 时机受 tick/show 路径影响有残差（实测 62×120
-  vs 目标 48×48）——render_ball6 每帧 SetWindowPos(win,win)（NOMOVE
-  只钉尺寸），球窗恒=球尺寸
+参数化（皮肤 motion 节点，show 每帧读=换肤即时生效）：
+- ball_size：球径（6-64，默认 22）
+- ball_win：球窗边长（24-160，默认 48）
+- observe_ms：观察窗（0-3000，默认 500）
+- idle_ms：球驻留（500-60000，默认 4000）
+球色沿用 back_color（环）/hilited_back_color（芯）。
 
-回归：HUFU_BALL 未设=1.5.9 纯净（v6 行=0）。
+皮肤启用示例（皮肤 json 顶层）：
+  "motion": { "ball": true, "ball_size": 22, "observe_ms": 500,
+              "idle_ms": 4000 }
 
-遗留（用户实机占用，测试焦点被抢）：
-- fsp 25 轮连打验收、收球/展开帧序列精拍——待空闲时段跑
-  motest\s2diag6.ps1 / wdiag6.ps1 复核
-- S4：皮肤动效节点（morph_ms/idle/dot 尺寸配色）+ HUFU_BALL 门退役
+验收：
+- 关门（env 未设+皮肤无键）：1.5.9 纯净（v6 行=0）✓
+- 开门（env=1 冒烟）：球驻留 3201px→退场渐隐→纯底 2908 ✓
+
+v6 四步全部落地（S1 球形态 / S2 展开一体感+三根修 / S3 退场渐隐
++尺寸钉死 / S4 皮肤化）。遗留：用户空闲时段跑 s2diag6/wdiag6 复核
+fsp 连打与帧序列。
