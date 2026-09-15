@@ -688,6 +688,15 @@ pub struct CandidateWindowV2 {
     pub(crate) ball_exit_t0: std::cell::Cell<Option<std::time::Instant>>,
     /// 【v6·S4】运行时球开关缓存（env || 皮肤 motion.ball；show 每帧刷）。
     pub(crate) ball_enabled: std::cell::Cell<bool>,
+    /// 【v6·R】球态内容签名（候选文本+raw 拼接）：球态期间签名变化=
+    /// 真实键入（展开）；同签名=联想刷新（保持球）。整句模式 raw 恒空
+    /// （编码内联），旧的 !raw.is_empty() 展开门永不触发=用户实测
+    /// 「框变球变不回去」的根因。
+    pub(crate) ball_last_sig: std::cell::RefCell<String>,
+    /// 【v6·R】键活性（渲染分支喂：600ms 内有真实按键）——签名门
+    /// 的补充：d 候选=[的,得] 与联想内容同签名时，内容无法区分，
+    /// 有键=必展开。
+    pub(crate) ball_key_recent: std::cell::Cell<bool>,
     /// 【v6·S4】皮肤参数缓存（show 每帧刷）：球径/球窗/观察窗/驻留ms。
     pub(crate) ball_d_run: std::cell::Cell<f32>,
     pub(crate) ball_win_run: std::cell::Cell<f32>,
@@ -1048,7 +1057,7 @@ impl CandidateWindowV2 {
                 ball_form: std::cell::Cell::new(false),
                 ball_pos: std::cell::Cell::new((0, 0)),
                 ball_ring: std::cell::Cell::new(0xFF101014),
-                ball_core: std::cell::Cell::new(0xFFE8E8EC),
+                ball_core: std::cell::Cell::new(0xFFFFD75E),
                 ball_armed: std::cell::Cell::new(false),
                 ball_pending: std::cell::Cell::new((0, 0)),
                 ball_idle_t0: std::cell::Cell::new(None),
@@ -1056,6 +1065,8 @@ impl CandidateWindowV2 {
                 ball_mix: std::cell::Cell::new(0.0),
                 ball_exit_t0: std::cell::Cell::new(None),
                 ball_enabled: std::cell::Cell::new(ball_gate()),
+                ball_last_sig: std::cell::RefCell::new(String::new()),
+                ball_key_recent: std::cell::Cell::new(false),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
                 ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
@@ -1229,7 +1240,7 @@ impl CandidateWindowV2 {
                 ball_form: std::cell::Cell::new(false),
                 ball_pos: std::cell::Cell::new((0, 0)),
                 ball_ring: std::cell::Cell::new(0xFF101014),
-                ball_core: std::cell::Cell::new(0xFFE8E8EC),
+                ball_core: std::cell::Cell::new(0xFFFFD75E),
                 ball_armed: std::cell::Cell::new(false),
                 ball_pending: std::cell::Cell::new((0, 0)),
                 ball_idle_t0: std::cell::Cell::new(None),
@@ -1237,6 +1248,8 @@ impl CandidateWindowV2 {
                 ball_mix: std::cell::Cell::new(0.0),
                 ball_exit_t0: std::cell::Cell::new(None),
                 ball_enabled: std::cell::Cell::new(ball_gate()),
+                ball_last_sig: std::cell::RefCell::new(String::new()),
+                ball_key_recent: std::cell::Cell::new(false),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
                 ball_obs_ms: std::cell::Cell::new(BALL_DELAY6_MS),
@@ -1580,6 +1593,16 @@ impl CandidateWindowV2 {
             )),
             None => crate::tsf::trace("cw2: show[入] 锚=None"),
         }
+        // 【v6·R·内容签名】候选文本+raw 拼接——球态「真实键入 vs 联想
+        // 刷新」的统一判据（整句模式 raw 恒空，旧 raw 门失效）。
+        let ball_sig_now: String = {
+            let mut s = raw.to_string();
+            for c in cands.iter() {
+                s.push('|');
+                s.push_str(c.0.as_str());
+            }
+            s
+        };
         // 【排障后注】本观测+SWP主观测已破案（四十二修：EXCEL6 框外
         // 钉死），保留为诊断资产但降频：锚=None（tick 重渲染等非锚帧）
         // 不打，减少常规 trace 量。
@@ -1633,14 +1656,21 @@ impl CandidateWindowV2 {
             self.ball_idle_ms_run.set(
                 motion_f(skin, "idle_ms", BALL_IDLE6_MS as f32).clamp(500.0, 60_000.0) as u32,
             );
-            // 【打断=真实新键入】cands 非空 + 非内部复渲染（动画 tick
-            // 的完成帧复渲染会把联想 last_show 喂进来——它打断=球每
-            // 500ms 重收一次=脉动振荡）。
-            if self.ball_armed.get() && !cands.is_empty() && !self.internal_rerender {
+            // 【打断=真实新键入】签名变化或键活性（600ms 内有键）+
+            // 非内部复渲染（联想刷新同签名且无键=不打断；整句模式
+            // d 候选与联想同签名时靠键活性兜底）。
+            let key_recent = self.ball_key_recent.get();
+            if self.ball_armed.get()
+                && !cands.is_empty()
+                && !self.internal_rerender
+                && (ball_sig_now != *self.ball_last_sig.borrow() || key_recent)
+            {
                 unsafe {
                     let _ = KillTimer(self.hwnd, BALL_DELAY6_ID);
                 }
                 self.ball_armed.set(false);
+                // 签名随打断推进（框跟随期签名=新帧）
+                *self.ball_last_sig.borrow_mut() = ball_sig_now.clone();
                 crate::tsf::diag_note(&format!(
                     "v6球S1: 观察窗打断(框跟随) n={} raw={:?}",
                     cands.len(),
@@ -1648,16 +1678,34 @@ impl CandidateWindowV2 {
                 ));
             }
             let cget = |k: &str| -> Option<u32> {
+                // 皮肤色=#RRGGBBAA（weasel 语义）。转内部 ARGB u32：
+                // r=v>>24, g=v>>16, b=v>>8, a=v&FF（a=0 视为不透明——
+                // 皮肤大量用 00 表示"无透明度含义的填充"）。
+                // 【S4 修复】此前按 AARRGGBB 解包——RR/GG/BB 全错位，
+                // 蓝通道拿到 alpha 字节=球恒蓝（墨言 #0D0D0FFF→纯蓝）。
+                let parse = |s: &str| -> Option<u32> {
+                    let v = u32::from_str_radix(s.trim_start_matches('#'), 16).ok()?;
+                    let r = (v >> 24) & 0xFF;
+                    let g = (v >> 16) & 0xFF;
+                    let b = (v >> 8) & 0xFF;
+                    let a = match v & 0xFF {
+                        0 => 0xFF,
+                        a => a,
+                    };
+                    Some((a << 24) | (r << 16) | (g << 8) | b)
+                };
                 skin.pointer(&format!("/colors/{k}"))
                     .or_else(|| skin.pointer(&format!("/skin/colors/{k}")))
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .and_then(|s| u32::from_str_radix(s.trim_start_matches('#'), 16).ok())
-                    .map(|v| v | 0xFF000000)
+                    .and_then(|s| parse(&s))
             };
             if let Some(v) = cget("back_color") {
                 self.ball_ring.set(v);
             }
-            if let Some(v) = cget("hilited_back_color") {
+            // 芯=皮肤高亮标色（hilited_mark；缺省回落 hilited_label）——
+            // hilited_back_color 在多数皮肤是透明填充（xx00）不适合做球。
+            let core = cget("hilited_mark_color").or_else(|| cget("hilited_label_color"));
+            if let Some(v) = core {
                 self.ball_core.set(v);
             }
         }
@@ -2316,11 +2364,14 @@ impl CandidateWindowV2 {
                 // 【入场按方案 2026-09-11】server 注入 entrance_anim
                 //（方案名含「整句」=true）：非整句方案首显直接全尺寸；
                 // 缺省 true（旧 server/测试直连兼容）。
-                && skin
-                    .pointer("/skin/entrance_anim")
-                    .or_else(|| skin.get("entrance_anim"))
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(true)
+                // 【v6·R】球模式入场独立于此方案开关（球→框是 v6 自身
+                // 行为，不受 1.5.9 entrance 方案控制）。
+                && (ball_on
+                    || skin
+                        .pointer("/skin/entrance_anim")
+                        .or_else(|| skin.get("entrance_anim"))
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true))
             {
                 // 【首出长大 2026-09-11】刻意出现的窗从 72% 拉到目标——
                 // 纯尺寸动效（零透明度变化=无变深/透底），盒心锚定高亮
@@ -2329,14 +2380,26 @@ impl CandidateWindowV2 {
                 // 次生效（句间收放 <250ms 被 FADE_QUIET_MS 门拦）；
                 // 纯长大无透明度变化、无频闪风险，门拆除——每次重新
                 // 出现的窗都做入场长大。
-                let start = (
-                    (target.0 as f32 * 0.72) as i32,
-                    (target.1 as f32 * 0.72) as i32,
-                );
+                // 【v6·R·首键球入场】球模式下首显从**球尺寸**长大（非
+                // 72%），配 ball_mix=1 球叠加渐隐——首键视觉=「球冒出
+                // →长大成框」（愿景：开始打字=球变形成候选框）。
+                let (start, ball_entry) = if ball_on {
+                    let bw = self.ball_win_run.get() as i32;
+                    self.ball_mix.set(1.0);
+                    ((bw.min(target.0), bw.min(target.1)), true)
+                } else {
+                    (
+                        ((target.0 as f32 * 0.72) as i32, (target.1 as f32 * 0.72) as i32),
+                        false,
+                    )
+                };
                 self.size_anim = Some((start, target, std::time::Instant::now()));
                 self.chrome_override.set(Some(start));
                 self.scale_in.set(true);
-                crate::tsf::diag_note(&format!("cw2 入场起臂: {start:?}→{target:?}"));
+                crate::tsf::diag_note(&format!(
+                    "cw2 入场起臂{}: {start:?}→{target:?}",
+                    if ball_entry { "(球)" } else { "" }
+                ));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                 }
@@ -2399,11 +2462,14 @@ impl CandidateWindowV2 {
         //   S2 将补球帧混合插值），ball_form 退役走正常渲染；
         // - internal_rerender（动画 tick 复渲染）且仍球态=纯球帧。
         if self.ball_form.get() {
-            // 【展开=真实键入】raw 非空（有编码）才算——联想刷新的
-            // cands 非空但 raw=""（S1 实测），补显/poll 都会喂联想帧，
-            // 它们不该把球展回框（否则球↔框振荡）。
-            let has_content = !cands.is_empty() && !raw.is_empty();
-            if has_content && !self.internal_rerender {
+            // 【v6·R·签名门】真实键入判定=内容签名变化（候选文本+raw）。
+            // 整句模式编码内联 state.raw 恒空——旧 !raw.is_empty() 门
+            // 永不触发（用户实锤「框变球变不回去」）；联想刷新（poll
+            // 反复喂同帧）同签名不展开（振荡根修保持）。
+            let sig_changed = ball_sig_now != *self.ball_last_sig.borrow();
+            let key_recent = self.ball_key_recent.get();
+            if !cands.is_empty() && (sig_changed || key_recent) && !self.internal_rerender {
+                *self.ball_last_sig.borrow_mut() = ball_sig_now.clone();
                 let cur_sz = self.live_size.get();
                 let bw = self.ball_win_run.get() as i32;
                 self.size_anim = Some((
@@ -2426,6 +2492,9 @@ impl CandidateWindowV2 {
                 // 落到正常渲染（小壳首帧）；定位段 pos_anim 起臂滑向
                 // 布局位（球位→框位=展开的位移分量）。
             } else {
+                // 球帧路径：签名随最新帧推进（联想刷新会反复写同值——
+                // 无害；真实键入因签名已变走不到这里）。
+                *self.ball_last_sig.borrow_mut() = ball_sig_now.clone();
                 unsafe {
                     self.render_ball6(dpi_scale, self.ball_exit_alpha());
                 }
@@ -3305,10 +3374,17 @@ impl CandidateWindowV2 {
                     let alpha = (1.0 - t).clamp(0.0, 1.0);
                     if alpha > 0.02 {
                         let (lx, ly) = self.live_pos.get();
-                        let (bxp, byp) = self.ball_pos.get();
+                        // 球心：球态展开=原球屏位（球→框的连续感）；
+                        // 首键入场=窗口起点（球从光标处冒出——ball_pos
+                        // 是上一颗球的旧位，不可信）。
+                        let (cx0, cy0) = if self.ball_form.get() || self.ball_closing.get() {
+                            self.ball_pos.get()
+                        } else {
+                            (lx, ly)
+                        };
                         let bw = self.ball_win_run.get();
-                        let scx = (bxp as f32 + bw * 0.5 - lx as f32) * dpi_scale;
-                        let scy = (byp as f32 + bw * 0.5 - ly as f32) * dpi_scale;
+                        let scx = (cx0 as f32 + bw * 0.5 - lx as f32) * dpi_scale;
+                        let scy = (cy0 as f32 + bw * 0.5 - ly as f32) * dpi_scale;
                         self.draw_ball_into6(&ctx, scx, scy, alpha);
                     }
                     self.ball_mix.set(alpha);
@@ -4109,8 +4185,8 @@ impl CandidateWindowV2 {
             return;
         }
         // 【v6·S3·尺寸钉死】球帧窗口尺寸恒=球窗（收球缓动末帧的
-        // SWP 时机受 tick/show 路径影响可能有残差——每球帧钉一次，
-        // 位置不动）。
+        // SWP 时机受 tick/show 路径影响可能有残差——每球帧钉一次）。
+        // 位置由 fade_tick 的 pos_anim 段 SWP（跟随滑动）；此处不动位置。
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -4274,7 +4350,26 @@ impl CandidateWindowV2 {
         // 已真则保持原 timer（重复 SetTimer=观察窗被无限重置永不收球）；
         // 球态已驻留则完全忽略（球自管 4s 退场——重复 arm 会无限重置
         // 驻留钟=球永不消失）。
-        if self.ball_armed.get() || self.ball_form.get() {
+        if self.ball_armed.get() {
+            return;
+        }
+        // 【v6·R·球跟随光标】球态驻留期 caret 移动（方向键/点击/继续
+        // 编辑）→ 球平滑滑到新光标（复用 pos_anim；poll 每 ~110ms 喂
+        // 新 caret）。不动（±2px 容差）不重臂（防抖）。
+        if self.ball_form.get() {
+            let bx = cx + 6;
+            let by = cy + 16;
+            let (px, py) = self.ball_pos.get();
+            if (px - bx).abs() + (py - by).abs() > 2 {
+                self.ball_pos.set((bx, by));
+                let spd = self.anim_spd.get().max(0.05);
+                let d = ((bx - px).abs() + (by - py).abs()) as f32;
+                let dur = ((d * 3.5 / spd) as u32).clamp(45, 150);
+                self.pos_anim = Some(((px, py), (bx, by), std::time::Instant::now(), dur));
+                unsafe {
+                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                }
+            }
             return;
         }
         self.ball_pending.set((cx, cy));

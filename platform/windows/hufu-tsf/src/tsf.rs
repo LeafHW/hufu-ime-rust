@@ -3829,6 +3829,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     .as_ref()
                     .is_some_and(|c| c.ball_form.get());
                 if let Some(c) = g.cand2.as_mut() {
+                    // 【v6·R】键活性交给 candwin2（球态展开判据之一：
+                    // 整句模式 d 候选可能与联想内容完全同签名，内容
+                    // 无法区分——recent 有键=真实键入必展开）。
+                    c.ball_key_recent.set(recent);
                     if !crate::candwin2::ball_gate() || !ball_dwelling || recent {
                         c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                     }
@@ -4127,8 +4131,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
+                // 【v6·R】键活性喂给球分支（update_ui 第二渲染点——
+                // 第一渲染点在上方 cloaked 分支；此处漏喂=d 键展开
+                // 判据 key_recent 恒 false=球变不回框的根因之一）。
+                let recent = g
+                    .last_key_at
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
                 match g.cand2.as_mut() {
-                    Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
+                    Some(c) => {
+                        c.ball_key_recent.set(recent);
+                        c.show(&cands, &raw, &skin, caret.as_ref(), sel)
+                    }
                     None => {}
                 }
             }
