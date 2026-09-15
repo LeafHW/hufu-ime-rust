@@ -4194,27 +4194,29 @@ impl CandidateWindowV2 {
                     let y0 = sy.min(fy) - 70.0;
                     let x1 = (sx + side).max(fx + apply.0 as f32) + 210.0;
                     let y1 = (sy + side).max(fy + apply.1 as f32) + 70.0;
-                    unsafe {
+                    // 【八修·原子窗动】rect 随命令发给合成线程（SWP+
+                    // Offset 补偿同命令原子完成——窗口线程不再 SWP，
+                    // 根治「窗口先跳一帧」的球瞬移）。覆盖则 None=不动。
+                    let win = unsafe {
                         let mut rr = RECT::default();
                         let _ = GetWindowRect(self.hwnd, &mut rr);
                         let covered = x0 >= rr.left as f32
                             && y0 >= rr.top as f32
                             && x1 <= rr.right as f32
                             && y1 <= rr.bottom as f32;
-                        if !covered {
-                            let _ = SetWindowPos(
-                                self.hwnd,
-                                HWND_TOPMOST,
+                        if covered {
+                            None
+                        } else {
+                            Some((
                                 x0 as i32,
                                 y0 as i32,
                                 (x1 - x0) as i32,
                                 (y1 - y0) as i32,
-                                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                            );
+                            ))
                         }
-                    }
+                    };
                     b.fade_in();
-                    b.morph_open(apply.0 as f32, apply.1 as f32, fx, fy);
+                    b.morph_open_win(apply.0 as f32, apply.1 as f32, fx, fy, win);
                     self.ball_frame.set((fx, fy));
                     self.ball_target.set((0, 0)); // 新键入=收球去重复位
                 } else {
@@ -4449,11 +4451,12 @@ impl CandidateWindowV2 {
                     fy2 = floor;
                 }
                 b.fade_in();
-                b.morph_move(fx2, fy2);
+                b.morph_move(fx2, fy2, None);
                 self.ball_frame.set((fx2, fy2));
             }
             // 【四修·收球观察窗】上屏后不立即框→球——半秒观察：期内
             // 键入（show 杀 timer，框平滑跟去新位）；无键入到点收球。
+            // 【八修·原子窗动】扩窗 rect 随收球命令发（合成线程 SWP）。
             self.ball_pending.set((cx, cy));
             unsafe {
                 let mut rr = RECT::default();
@@ -4463,6 +4466,7 @@ impl CandidateWindowV2 {
                     || sx + side > rr.right as f32
                     || sy + side > rr.bottom as f32
                     || armed;
+                let mut win = None;
                 if need {
                     let (fx, fy) = self.ball_frame.get();
                     let (bw, bh) = if armed {
@@ -4474,16 +4478,14 @@ impl CandidateWindowV2 {
                     let y0 = sy.min(fy) - 10.0;
                     let x1 = (sx + side).max(fx + bw).max(rr.right as f32) + 10.0;
                     let y1 = (sy + side).max(fy + bh).max(rr.bottom as f32) + 10.0;
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        HWND_TOPMOST,
+                    win = Some((
                         x0 as i32,
                         y0 as i32,
                         (x1 - x0) as i32,
                         (y1 - y0) as i32,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
+                    ));
                 }
+                BALL_PENDING_WIN.with(|c| c.set(win));
                 let _ = KillTimer(self.hwnd, BALL_DELAY_ID);
                 let _ = SetTimer(self.hwnd, BALL_DELAY_ID, BALL_DELAY_MS, None);
                 self.ball_delay_armed.set(true);
@@ -5345,6 +5347,13 @@ const FADE_FLOOR: f64 = 0.6;
 /// 不重绘——内容按目标布局早已在缓冲）→ 放回。两者皆结束 KillTimer。
 /// 【动效 v4】圆点 timer（WM_TIMER）：morph 活跃→步进 clip 插值；
 /// 驻留态到点→真隐藏（S4 换淡出）。
+/// 【v5·八修】收球观察窗伴随的窗口 rect（hide_as_dot 存，fire 取——
+/// 共享对象路径经 G_SHARED 取 cand2，无法带 self 字段）。
+thread_local! {
+    static BALL_PENDING_WIN: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// 【v5·四修】收球观察窗到点：真收球（框→球 morph）。半秒内键入则
 /// show() 已杀 timer（框平滑跟去新光标位——屏位锚 from=cur 续动）。
 unsafe fn ball_delay_fire_shared(hwnd: HWND) {
@@ -5363,8 +5372,9 @@ unsafe fn ball_delay_fire_shared(hwnd: HWND) {
             let (pcx, pcy) = c.ball_pending.get();
             let sx = pcx as f32 + 6.0;
             let sy = pcy as f32 + 16.0;
+            let win = BALL_PENDING_WIN.with(|c2| c2.replace(None));
             b.fade_in();
-            b.morph_close(sx, sy);
+            b.morph_close(sx, sy, win);
         }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());

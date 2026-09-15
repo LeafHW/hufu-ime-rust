@@ -49,6 +49,9 @@ pub const MORPH_CLOSE_MS: i32 = 260;
 pub const BALL_FADE_MS: i32 = 260;
 /// 无键入驻留（渐隐启动点，皮肤 motion.idle_timeout_ms 可覆盖）。
 pub const BALL_IDLE_MS: u32 = 4000;
+/// 【八修】主体外底阴影高度（content SetSize 高度加此值——阴影不被
+/// 揭幕裁剪）。
+pub const SHADOW_DROP: f32 = 7.0;
 
 fn dur(ms: i32) -> TimeSpan {
     TimeSpan::from(std::time::Duration::from_millis(ms as u64))
@@ -71,15 +74,31 @@ pub enum BallForm {
 /// 跟踪 cur+窗口原点换算）——打断（连打反转）/重复命令（poll 重复收
 /// 球）天然无位置跳变（v2 的 from=命令指定=跳变抖动源，用户实证）。
 pub enum BallCmd {
-    /// 画球帧（环色/心色；热更色用——纯重画不动几何）。
+    /// 画球帧（环色/心色用——纯重画不动几何）。
     PaintBall { ring: u32, core: u32 },
-    /// 球→框（快，可打断）。w/h=框尺寸；tx/ty=框屏位（左上）。
-    MorphOpen { w: f32, h: f32, tx: f32, ty: f32 },
+    /// 球→框（可打断）。w/h=框尺寸；tx/ty=框屏位（左上）。
+    /// win=伴随窗口目标 rect（Some=合成线程内原子 SWP+Offset 补偿，
+    /// 根治「窗口先跳一帧、树慢半拍」的割裂）。
+    MorphOpen {
+        w: f32,
+        h: f32,
+        tx: f32,
+        ty: f32,
+        win: Option<(i32, i32, i32, i32)>,
+    },
     /// 框→球（慢，可被打断反转）。tx/ty=球屏位（元素框左上）。
-    MorphClose { tx: f32, ty: f32 },
-    /// 【七修】框态纯平移（观察窗跟随专用）：120ms 线性、尺寸不变、
+    MorphClose {
+        tx: f32,
+        ty: f32,
+        win: Option<(i32, i32, i32, i32)>,
+    },
+    /// 框态纯平移（观察窗跟随专用）：120ms 线性、尺寸不变、
     /// ballness 恒 0——短线性=被打断重启的视觉痕迹最小。
-    MorphMove { tx: f32, ty: f32 },
+    MorphMove {
+        tx: f32,
+        ty: f32,
+        win: Option<(i32, i32, i32, i32)>,
+    },
     /// 渐隐。
     FadeOut,
     /// 渐显（Opacity=1）。
@@ -129,15 +148,25 @@ impl BallWin {
     pub fn paint_ball(&self, ring: u32, core: u32) {
         self.send(BallCmd::PaintBall { ring, core });
     }
-    pub fn morph_open(&self, w: f32, h: f32, tx: f32, ty: f32) {
-        self.send(BallCmd::MorphOpen { w, h, tx, ty });
+    pub fn morph_open(
+        &self, w: f32, h: f32, tx: f32, ty: f32,
+        win: Option<(i32, i32, i32, i32)>,
+    ) {
+        self.send(BallCmd::MorphOpen { w, h, tx, ty, win });
     }
-    pub fn morph_close(&self, tx: f32, ty: f32) {
-        self.send(BallCmd::MorphClose { tx, ty });
+    pub fn morph_close(&self, tx: f32, ty: f32, win: Option<(i32, i32, i32, i32)>) {
+        self.send(BallCmd::MorphClose { tx, ty, win });
     }
-    /// 【七修】观察窗跟随平移（框态，120ms 线性）。
-    pub fn morph_move(&self, tx: f32, ty: f32) {
-        self.send(BallCmd::MorphMove { tx, ty });
+    /// 观察窗跟随平移（框态，120ms 线性）。
+    pub fn morph_move(&self, tx: f32, ty: f32, win: Option<(i32, i32, i32, i32)>) {
+        self.send(BallCmd::MorphMove { tx, ty, win });
+    }
+    /// 【八修】兼容简写（不动窗口）。
+    pub fn morph_open_win(
+        &self, w: f32, h: f32, tx: f32, ty: f32,
+        win: Option<(i32, i32, i32, i32)>,
+    ) {
+        self.morph_open(w, h, tx, ty, win);
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
@@ -378,7 +407,8 @@ unsafe fn synth_thread(
     //    的树挂上不 flush，本机实证不渲染）。15ms tick 兼任 morph 帧
     //    驱动（≈66fps 插值帧）。
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
+        DispatchMessageW, PeekMessageW, SetWindowPos, MSG, PM_REMOVE,
+        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
     };
     // 【morph v3 状态机·屏位锚】cur=当前几何（尺寸+**屏幕**位置，含
     // 中间态）；morph=进行中的插值。命令只给「目标」——from 恒=cur
@@ -397,19 +427,48 @@ unsafe fn synth_thread(
     let mut win_org: (f32, f32) = (0.0, 0.0);
     let mut morph: Option<(Geo, Geo, std::time::Instant, u32, u8)> = None; // (from,to,t0,ms,mode: 0=open 1=close 2=move)
     let mut ballness = 1.0f32; // 球接近度（1=纯球：core 满显+inset=pad；0=纯框）
-    let mut idle_ticks: u32 = 0;
+    // 【八修】idle=真实时钟（旧 idle_ticks 按泵循环计数——DQ 消息
+    // 频繁时虚快=「球 2 秒消失」的根源）；None=活跃/morph 中。
+    let mut idle_since: Option<std::time::Instant> = None;
+    let mut fading = false;
     let mut last_ring: u32 = 0xFF101014;
     let mut last_core: u32 = 0xFFE8E8EC;
     loop {
         let got = rx.recv_timeout(std::time::Duration::from_millis(15)).ok();
         if let Some(cmd) = got {
-            // 键入=活跃：复位 idle 计数（渐隐中再键入→FadeIn 恢复）。
-            if idle_ticks as u32 >= BALL_IDLE_MS / 15 {
+            // 【九修·终极竞态】morph 设好后首帧插值（≤15ms tick）没跑
+            // 就来新命令——cur 还是旧值（首组段=初值 (0,0)）→ from=
+            // (0,0) → 元素瞬移屏幕左上再 morph 回来=「球闪到别处」
+            // （diag 实锤 from=(0,0,44x44)）。修：命令处理前先把
+            // 进行中的 morph 按真实 elapsed 推进 cur（纯数值，不画帧）。
+            if let Some((from, to, t0, ms, mode)) = &morph {
+                let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
+                let e = match *mode {
+                    1 => ease_in_out(t),
+                    _ => t,
+                };
+                cur.w = lerp(from.w, to.w, e);
+                cur.h = lerp(from.h, to.h, e);
+                cur.sx = lerp(from.sx, to.sx, e);
+                cur.sy = lerp(from.sy, to.sy, e);
+                ballness = match *mode {
+                    1 => e,
+                    2 => 0.0,
+                    _ => 1.0 - e,
+                };
+                if t >= 1.0 {
+                    morph = None;
+                    idle_since = Some(std::time::Instant::now());
+                }
+            }
+            // 键入=活跃：渐隐中再键入→恢复。
+            if fading {
                 root.StopAnimation(&HSTRING::from("Opacity"));
                 let _ = root.SetOpacity(1.0);
                 let _ = root.SetIsVisible(true);
+                fading = false;
             }
-            idle_ticks = 0;
+            idle_since = None;
             match cmd {
             BallCmd::PaintBall { ring, core } => {
                 last_ring = ring;
@@ -426,16 +485,32 @@ unsafe fn synth_thread(
                     crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
                 }
             }
-            BallCmd::MorphOpen { w, h, tx, ty } => {
+            BallCmd::MorphOpen { w, h, tx, ty, win } => {
                 // 屏位锚：from=cur（当前视觉位——打断续动/无跳变）；
                 // 首命令 cur 无效→from=to（原地起步——球在框位冒出
                 // 长大成框，不从屏幕外飞入）。
+                // 【八修·原子窗动】SWP 移进合成线程：SetWindowPos→
+                // refresh_win_org→立即 SetOffset 补偿，同一命令内完成
+                // ——根治「窗口先跳一帧、树慢半拍」的球瞬移（用户实证
+                // 「球闪一下到别处去」）。
+                if let Some((wx, wy, ww, wh)) = win {
+                    let _ = SetWindowPos(
+                        hwnd, None,
+                        wx, wy, ww, wh,
+                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                    );
+                }
                 refresh_win_org(hwnd, &mut win_org);
+                // SWP 后立即补偿 Offset（cur 屏位不变——窗口动则窗内
+                // Offset 反向抵消）。
+                let _ = content.SetOffset(N::Vector3 {
+                    X: cur.sx - win_org.0,
+                    Y: cur.sy - win_org.1,
+                    Z: 0.0,
+                });
                 let to = Geo { w, h, sx: tx, sy: ty };
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
                 cur_valid = true;
-                // 【七修·取证】open 的 from→to 距离（「两个独立个体」
-                // 诊断：球位与框位差多少）。
                 crate::tsf::diag_note(&format!(
                     "v5球T: open from=({:.0},{:.0},{:.0}x{:.0}) to=({:.0},{:.0},{:.0}x{:.0})",
                     from.sx, from.sy, from.w, from.h, to.sx, to.sy, to.w, to.h
@@ -450,8 +525,20 @@ unsafe fn synth_thread(
                 content.StopAnimation(&HSTRING::from("Scale"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
             }
-            BallCmd::MorphClose { tx, ty } => {
+            BallCmd::MorphClose { tx, ty, win } => {
+                if let Some((wx, wy, ww, wh)) = win {
+                    let _ = SetWindowPos(
+                        hwnd, None,
+                        wx, wy, ww, wh,
+                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                    );
+                }
                 refresh_win_org(hwnd, &mut win_org);
+                let _ = content.SetOffset(N::Vector3 {
+                    X: cur.sx - win_org.0,
+                    Y: cur.sy - win_org.1,
+                    Z: 0.0,
+                });
                 let to = Geo { w: ball_side, h: ball_side, sx: tx, sy: ty };
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
                 cur_valid = true;
@@ -464,12 +551,22 @@ unsafe fn synth_thread(
                 content.StopAnimation(&HSTRING::from("Scale"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
             }
-            BallCmd::MorphMove { tx, ty } => {
-                // 【七修·观察窗跟随专用】框态纯平移：尺寸不变、
-                // ballness 恒 0、120ms 线性——短+线性=被打断重启的视觉
-                // 痕迹最小（300ms ease 反复重启=一顿一顿的抖动源，
-                // 用户实证「快速 d+空格 有抖动」）。
+            BallCmd::MorphMove { tx, ty, win } => {
+                // 框态纯平移（观察窗跟随专用）：尺寸不变、ballness 恒 0、
+                // 120ms 线性——短+线性=被打断重启的视觉痕迹最小。
+                if let Some((wx, wy, ww, wh)) = win {
+                    let _ = SetWindowPos(
+                        hwnd, None,
+                        wx, wy, ww, wh,
+                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                    );
+                }
                 refresh_win_org(hwnd, &mut win_org);
+                let _ = content.SetOffset(N::Vector3 {
+                    X: cur.sx - win_org.0,
+                    Y: cur.sy - win_org.1,
+                    Z: 0.0,
+                });
                 let (w0, h0) = if cur_valid { (cur.w, cur.h) } else { (200.0, 160.0) };
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: w0, h: h0, sx: tx, sy: ty } };
                 let to = Geo { w: w0, h: h0, sx: tx, sy: ty };
@@ -537,11 +634,11 @@ unsafe fn synth_thread(
             // 下合成器动画只是揭幕裁剪，形变必须内容帧逐帧画）。
             if let Some((from, to, t0, ms, mode)) = &morph {
                 let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
-                // 【七修】mode 2=move：线性（短平移，重启痕迹最小）。
+                // 【八修】open 也线性：ease_out 被连打打断重启=快慢突变
+                // （顿挫感的速度源）；线性打断重启=速度恒定连续。
                 let e = match *mode {
                     1 => ease_in_out(t),
-                    2 => t,
-                    _ => ease_out(t),
+                    _ => t,
                 };
                 cur.w = lerp(from.w, to.w, e);
                 cur.h = lerp(from.h, to.h, e);
@@ -553,7 +650,10 @@ unsafe fn synth_thread(
                     2 => 0.0,
                     _ => 1.0 - e,
                 };
-                let _ = content.SetSize(N::Vector2 { X: cur.w.max(2.0), Y: cur.h.max(2.0) });
+                let _ = content.SetSize(N::Vector2 {
+                    X: cur.w.max(2.0),
+                    Y: cur.h.max(2.0) + SHADOW_DROP,
+                });
                 // 屏位→窗口 Offset（morph 期间窗口恒定——win_org 命令
                 // 时已刷新）。
                 let _ = content.SetOffset(N::Vector3 {
@@ -574,6 +674,9 @@ unsafe fn synth_thread(
                 if t >= 1.0 {
                     let closing = *mode == 1;
                     morph = None;
+                    // 【八修】完成即起真实时钟 idle（框态免疫渐隐——
+                    // 编码驻留中途框不得消失，用户实证）。
+                    idle_since = Some(std::time::Instant::now());
                     if closing {
                         crate::tsf::diag_note("v5球T: 收球完成");
                         // 【取证】收球终态帧 readback（swapchain 里有没有球）。
@@ -581,18 +684,30 @@ unsafe fn synth_thread(
                     }
                 }
             } else {
-                // 空闲计数（15ms/tick）：BALL_IDLE_MS 无命令→球渐隐→隐藏。
-                idle_ticks += 1;
-                if idle_ticks as u32 == BALL_IDLE_MS / 15 {
-                    if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
-                        let _ = a.InsertKeyFrame(0.0, 1.0);
-                        let _ = a.InsertKeyFrame(1.0, 0.0);
-                        let _ = a.SetDuration(dur(BALL_FADE_MS));
-                        let _ = root.StartAnimation(&HSTRING::from("Opacity"), &a);
+                // 【八修·真实时钟+球态限定】框态（ballness<0.5，编码
+                // 驻留）永不渐隐；球态 4s 渐隐（旧按泵循环计数虚快=
+                // 「球 2 秒消失」）。
+                let ball_like = ballness > 0.5
+                    && cur.w <= ball_side + 0.5
+                    && cur.h <= ball_side + 0.5;
+                if ball_like {
+                    if let Some(t) = idle_since {
+                        let el = t.elapsed().as_millis() as u32;
+                        if !fading && el >= BALL_IDLE_MS as u32 {
+                            if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
+                                let _ = a.InsertKeyFrame(0.0, 1.0);
+                                let _ = a.InsertKeyFrame(1.0, 0.0);
+                                let _ = a.SetDuration(dur(BALL_FADE_MS));
+                                let _ = root.StartAnimation(&HSTRING::from("Opacity"), &a);
+                            }
+                            fading = true;
+                            crate::tsf::diag_note("v5球T: idle→渐隐(真实时钟)");
+                        } else if fading && el >= (BALL_IDLE_MS as u32 + (BALL_FADE_MS * 4) as u32) {
+                            let _ = root.SetIsVisible(false);
+                        }
                     }
-                    crate::tsf::diag_note("v5球T: idle→渐隐");
-                } else if idle_ticks as u32 > (BALL_IDLE_MS + (BALL_FADE_MS as u32) * 4) / 15 {
-                    let _ = root.SetIsVisible(false);
+                } else {
+                    fading = false;
                 }
             }
         }
@@ -697,21 +812,34 @@ unsafe fn paint_morph_frame(
         radiusY: corner,
     };
     let rt: ID2D1RenderTarget = ctx.cast().unwrap();
-    // 底部软阴影（帧内径向，随主体缩放）。
+    // 【八修·阴影修复】旧实现把暗渐变画在 main_rect 内部，随后被主体
+    // 渐变整块覆盖=永远不可见（「做了没显示」的真相，用户实证）。
+    // 正解：阴影=主体外的下偏移暗晕——content 高度需多出 SHADOW_DROP
+    // （插值循环 SetSize 已加）。
+    let shadow_rect = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: bx0,
+            top: by0 + 3.0,
+            right: bx1,
+            bottom: by1 + 3.0 + SHADOW_DROP,
+        },
+        radiusX: corner,
+        radiusY: corner,
+    };
     let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: bcx + 1.5, y: bcy + 3.0 },
+        center: D2D_POINT_2F { x: bcx, y: bcy + 4.0 },
         gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-        radiusX: bw * 0.75,
-        radiusY: bh * 0.85,
+        radiusX: bw * 0.85,
+        radiusY: bh * 0.95,
     };
     let sh_stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.35, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.16, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.38, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 0.72, color: D2D1_COLOR_F { a: 0.18, r: 0.0, g: 0.0, b: 0.0 } },
         D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
     ];
     if let Ok(gsc) = rt.CreateGradientStopCollection(&sh_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
         if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
-            ctx.FillRoundedRectangle(&main_rect, &shb);
+            ctx.FillRoundedRectangle(&shadow_rect, &shb);
         }
     }
     // 主体：ring 色径向渐变（高光偏左上——球感延续到框）。
@@ -731,7 +859,11 @@ unsafe fn paint_morph_frame(
         }
     }
     // core 高亮点（球心——morph 中渐隐/渐显）。
-    if ballness > 0.02 {
+    // 【八修·一体感】core 后段才隐（ballness>0.25 恒满显，<0.25 才随
+    // 形状收尾同步淡出）——旧曲线 core 前期就没=「先丢心再变形」的
+    // 分两步感（用户实证）。
+    let cvis = ((ballness - 0.25) / 0.75).clamp(0.0, 1.0);
+    if cvis > 0.01 {
         let cstops = [
             D2D1_GRADIENT_STOP { position: 0.0, color: argb_to_color(core) },
             D2D1_GRADIENT_STOP { position: 1.0, color: fade_a(core, 0.0) },
@@ -747,7 +879,7 @@ unsafe fn paint_morph_frame(
                 None,
                 &gsc,
             ) {
-                let r = (BALL_D * 0.24) * (0.4 + 0.6 * ballness);
+                let r = (BALL_D * 0.24) * (0.55 + 0.45 * cvis);
                 ctx.FillEllipse(
                     &D2D1_ELLIPSE {
                         point: D2D_POINT_2F { x: bcx, y: bcy },
@@ -811,18 +943,18 @@ unsafe fn paint_ball_into(
     let _ = ctx.BeginDraw();
     ctx.SetTransform(&N::Matrix3x2::identity());
     ctx.Clear(None);
-    // 阴影（帧内）：球下偏移 1.5px 的黑径向渐变（r 放大 1.25）——
-    // 「浮」感；morph 时阴影与形状同帧插值（面板帧同画法）。
+    // 阴影（帧内）：球下偏移暗晕（r 放大 1.35——球体后画盖中心，
+    // 外圈 35% 露出=可见浮感；morph 帧同画法）。
     let bc = BALL_PAD + BALL_D * 0.5;
     let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: bc + 1.5, y: bc + 2.0 },
+        center: D2D_POINT_2F { x: bc + 2.0, y: bc + 3.5 },
         gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-        radiusX: BALL_D * 0.5 * 1.25,
-        radiusY: BALL_D * 0.5 * 1.25,
+        radiusX: BALL_D * 0.5 * 1.35,
+        radiusY: BALL_D * 0.5 * 1.35,
     };
     let sh_stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.35, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.18, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.4, r: 0.0, g: 0.0, b: 0.0 } },
+        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.2, r: 0.0, g: 0.0, b: 0.0 } },
         D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
     ];
     let rt: ID2D1RenderTarget = ctx.cast().unwrap();
@@ -830,9 +962,9 @@ unsafe fn paint_ball_into(
         if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
             ctx.FillEllipse(
                 &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: bc + 1.5, y: bc + 2.0 },
-                    radiusX: BALL_D * 0.5 * 1.25,
-                    radiusY: BALL_D * 0.5 * 1.25,
+                    point: D2D_POINT_2F { x: bc + 2.0, y: bc + 3.5 },
+                    radiusX: BALL_D * 0.5 * 1.35,
+                    radiusY: BALL_D * 0.5 * 1.35,
                 },
                 &shb,
             );
