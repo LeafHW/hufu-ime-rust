@@ -1668,18 +1668,11 @@ impl CandidateWindowV2 {
         // 分辨率光栅化，不糊），内容逻辑坐标全部不变。
         let dpi_scale =
             unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0 };
-        // 【R10·驻留球帧全短路】球态驻留（form 且非展开中）：任何
-        // show 调用直接走球渲染并返回——**定位/布局/pos_anim 段全
-        // 旁路**。此前球帧路径在定位段之后：每 poll 空帧的 show 先
-        // 按抖动 caret 起布局 SWP/pos_anim，再被球渲染覆盖=驻留期
-        // 窗口漂移（用户实锤「球还是会动」，实测 (32,59)→(44,71)
-        // →(19,46) 循环）。render_ball6 每帧 SWP 钉回 ball_pin。
-        if ball_gate() && self.ball_form.get() && !self.ball_expanding.get() {
-            unsafe {
-                self.render_ball6(dpi_scale, self.ball_exit_alpha());
-            }
-            return;
-        }
+        // 【R10b·撤掉 show 全短路】开头短路把展开链挡死（球驻留时
+        // 打字→签名已变该走展开起臂，但开头 return=候选永不出现
+        // ——用户实锤「上屏一次后候选没了」）。防漂移全靠 tick 位置
+        // 段的球态守卫（单点权威：清残余 pos_anim+钉回 pin）；show
+        // 定位段即使 arm 了 pos_anim，tick 每 5ms 钉回=稳定保持。
         // 【DPI 测试旋钮 2026-09-11】HUFU_FAKE_DPI=<dpi>：pad-dump/smoke
         // 取证用——100% 屏上伪造高 DPI 复现「高 DPI 阴影二次缩放」类
         // 问题（真机该值不存在，零影响）。值=目标 DPI（如 144=150%）。
@@ -4907,12 +4900,37 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.scale_in.set(false);
                     // 【v6·S1】收球动画完成=进球态：球帧接管渲染+起
                     // 4s 驻留钟（真实时钟渐隐）。
+                    // 【R10b】扩窗+钉（与 5030 主钩子同逻辑：真实 rect
+                    // 中心保持——球视觉零位移；两处完成钩子谁先到谁配，
+                    // 后到的 closing 已 false 自然跳过）。
                     if c.ball_closing.get() {
                         c.ball_closing.set(false);
                         c.ball_form.set(true);
                         BALL_FORM_MIRROR.store(true, std::sync::atomic::Ordering::Relaxed);
                         c.ball_idle_t0.set(Some(std::time::Instant::now()));
                         c.internal_rerender = true;
+                        {
+                            let win = c.ball_win_run.get() as i32;
+                            let mut rc = RECT::default();
+                            let _ = GetWindowRect(c.hwnd, &mut rc);
+                            let cx_r = (rc.left + rc.right) / 2;
+                            let cy_r = (rc.top + rc.bottom) / 2;
+                            let nx = cx_r - win / 2;
+                            let ny = cy_r - win / 2;
+                            unsafe {
+                                let _ = SetWindowPos(
+                                    c.hwnd,
+                                    HWND_TOPMOST,
+                                    nx,
+                                    ny,
+                                    win,
+                                    win,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                );
+                            }
+                            c.live_pos.set((nx, ny));
+                            c.ball_pin.set((nx, ny));
+                        }
                         let _ = c.show(&cands, &raw, &skin, None, sel);
                         c.internal_rerender = false;
                         crate::tsf::diag_note("v6球S1: 球态驻留开始(4s)");
@@ -5058,25 +5076,35 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     // pad（透明区扩展，球视觉零位移），球帧在窗中心画
                     // 球即与形变末帧壳圆同位（此前左上不动=球心偏移
                     // 8px + 老版本偏 24px=「球闪现」）。
+                    // 【R10b·真实 rect 权威】live_pos 内部账本可能与
+                    // 窗口真实位脱钩（pos_anim 布局 arm 残尾/dwell 时
+                    // 序交错——实测形变末 (32,59) 驻留跳 (19,46)=13px
+                    // 跳变=用户「框缩到消失球再出来」的体感）。扩窗
+                    // 以 GetWindowRect 真实位为锚：新左上=真实中心-半
+                    // 窗（球心严格保持=零位移）。
                     {
                         let win = c.ball_win_run.get() as i32;
-                        let (lp0, lp1) = c.live_pos.get();
-                        let pad = (win - c.ball_d_run.get() as i32) / 2;
+                        let mut rc = RECT::default();
+                        let _ = GetWindowRect(c.hwnd, &mut rc);
+                        let cx_r = (rc.left + rc.right) / 2;
+                        let cy_r = (rc.top + rc.bottom) / 2;
+                        let nx = cx_r - win / 2;
+                        let ny = cy_r - win / 2;
                         unsafe {
                             let _ = SetWindowPos(
                                 c.hwnd,
                                 HWND_TOPMOST,
-                                lp0 - pad,
-                                lp1 - pad,
+                                nx,
+                                ny,
                                 win,
                                 win,
                                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
                             );
                         }
-                        c.live_pos.set((lp0 - pad, lp1 - pad));
+                        c.live_pos.set((nx, ny));
                         // 【R10·驻留硬钉】记钉死点：此后每帧球渲染强制
                         // SWP 回此点（show 布局/caret 抖动全被覆盖）。
-                        c.ball_pin.set((lp0 - pad, lp1 - pad));
+                        c.ball_pin.set((nx, ny));
                     }
                     let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                     c.internal_rerender = false;
