@@ -5064,18 +5064,11 @@ fn poll_collapse_stale(shared: &SharedRef) {
         }
     }
     // 【v6·S1】停手/断段收窗球化（联想框的正规收尾点——观察窗
-    // →收球）。caret 已失效则普通隐藏。
-    // 【R7·真实光标】上屏后 g.caret 缓存停在打字末位（上屏插入
-    // 文字后插入符已右移但无人更新缓存）=球滑向旧位偏离真实光标
-    // （多字实测球偏光标 (-35,+45)）。球化前直查系统插入符。
-    let mut bcx = g.caret.map(|a| (a.left + a.right) / 2);
-    let mut bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
-    if crate::candwin2::ball_gate() {
-        if let Some(r) = gui_caret_fallback() {
-            bcx = Some((r.left + r.right) / 2);
-            bcy = Some((r.top + r.bottom) / 2);
-        }
-    }
+    // →收球）。caret 已失效则普通隐藏。（R10：驻留期此路径每
+    // 110ms 反复调——球化锚定的直查已移入 hide_as_ball 入口的
+    // 非 form 分支，此处不再覆盖=跟随喂食走事件缓存防抖。）
+    let bcx = g.caret.map(|a| (a.left + a.right) / 2);
+    let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
         if crate::candwin2::ball_gate() {

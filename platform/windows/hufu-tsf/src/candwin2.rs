@@ -26,6 +26,10 @@ use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
+/// 【R10·SWP 间谍镜像】球态标志的模块级镜像（wndproc 无法访问
+/// self——dwell 钩子/展开起臂/kill_ball 维护此原子，spy 据此开关）。
+static BALL_FORM_MIRROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
 /// 【排查中】用户实测「正常应用里点击候选框导致应用卡死」——本过程
 /// 记录点击/移动消息到达与时刻，卡死复现后由日志定位卡点。
@@ -61,6 +65,21 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     if msg == 0x84 {
         // WM_NCHITTEST → HTCLIENT
         return LRESULT(1);
+    }
+    // 【R10·SWP 间谍】WM_WINDOWPOSCHANGING：抓驻留期窗口漂移的
+    // 真凶（谁来 SetWindowPos）。只在球态时记（form 由全局原子
+    // 镜像——wndproc 无 self 访问）。
+    if msg == 0x0046 {
+        unsafe {
+            if BALL_FORM_MIRROR.load(std::sync::atomic::Ordering::Relaxed) {
+                use windows::Win32::UI::WindowsAndMessaging::WINDOWPOS;
+                let wp = &*(lparam.0 as *const WINDOWPOS);
+                crate::tsf::diag_note(&format!(
+                    "v6spy SWPCHANGING ({},{}) {}x{} flags={:x}",
+                    wp.x, wp.y, wp.cx, wp.cy, wp.flags.0
+                ));
+            }
+        }
     }
     // 【鼠标交互 2026-09-10 用户拍板】左键按住拖动=拖到哪里固定在哪
     // 里（跨组段保持）；右键=解除固定，候选窗回光标处恢复跟随。
@@ -703,6 +722,10 @@ pub struct CandidateWindowV2 {
     /// 【v6·R6】皮肤整窗透明度缓存（material.opacity——show 时刷新；
     /// 球帧渲染乘它=球的透明设置跟随皮肤）。
     pub(crate) ball_mat_opacity: std::cell::Cell<f32>,
+    /// 【v6·R10·驻留硬钉】球态驻留钉死点（左上屏坐标；dwell 钩子记，
+    /// render_ball6 每帧 SWP 强制钉回——防 show 布局/caret 抖动微调
+    /// 造成的驻留漂移，用户实锤「球还是会动」）。
+    pub(crate) ball_pin: std::cell::Cell<(i32, i32)>,
     /// 【v6·R2】形变时长 ms（框↔球/首键球入场；皮肤
     /// motion.morph_ms 可调）。
     pub(crate) ball_morph_ms: std::cell::Cell<u32>,
@@ -1082,6 +1105,7 @@ impl CandidateWindowV2 {
                 ball_morph_ms: std::cell::Cell::new(500),
                 ball_expanding: std::cell::Cell::new(false),
                 ball_mat_opacity: std::cell::Cell::new(1.0),
+                ball_pin: std::cell::Cell::new((0, 0)),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1269,6 +1293,7 @@ impl CandidateWindowV2 {
                 ball_morph_ms: std::cell::Cell::new(500),
                 ball_expanding: std::cell::Cell::new(false),
                 ball_mat_opacity: std::cell::Cell::new(1.0),
+                ball_pin: std::cell::Cell::new((0, 0)),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1643,6 +1668,18 @@ impl CandidateWindowV2 {
         // 分辨率光栅化，不糊），内容逻辑坐标全部不变。
         let dpi_scale =
             unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0 };
+        // 【R10·驻留球帧全短路】球态驻留（form 且非展开中）：任何
+        // show 调用直接走球渲染并返回——**定位/布局/pos_anim 段全
+        // 旁路**。此前球帧路径在定位段之后：每 poll 空帧的 show 先
+        // 按抖动 caret 起布局 SWP/pos_anim，再被球渲染覆盖=驻留期
+        // 窗口漂移（用户实锤「球还是会动」，实测 (32,59)→(44,71)
+        // →(19,46) 循环）。render_ball6 每帧 SWP 钉回 ball_pin。
+        if ball_gate() && self.ball_form.get() && !self.ball_expanding.get() {
+            unsafe {
+                self.render_ball6(dpi_scale, self.ball_exit_alpha());
+            }
+            return;
+        }
         // 【DPI 测试旋钮 2026-09-11】HUFU_FAKE_DPI=<dpi>：pad-dump/smoke
         // 取证用——100% 屏上伪造高 DPI 复现「高 DPI 阴影二次缩放」类
         // 问题（真机该值不存在，零影响）。值=目标 DPI（如 144=150%）。
@@ -2655,6 +2692,7 @@ impl CandidateWindowV2 {
                 );
                 self.pos_anim = Some((from, ctr_to, std::time::Instant::now(), self.ball_morph_ms.get()));
                 self.ball_form.set(false);
+                BALL_FORM_MIRROR.store(false, std::sync::atomic::Ordering::Relaxed);
                 self.ball_idle_t0.set(None);
                 // 展开=复活：退场渐隐状态一并清（渐隐中键入=球立即可见
                 // 地长大成框，不从半透明起跳）。
@@ -4397,16 +4435,19 @@ impl CandidateWindowV2 {
         }
         // 【v6·S3·尺寸钉死】球帧窗口尺寸恒=球窗（收球缓动末帧的
         // SWP 时机受 tick/show 路径影响可能有残差——每球帧钉一次）。
-        // 位置由 fade_tick 的 pos_anim 段 SWP（跟随滑动）；此处不动位置。
+        // 【R10·驻留硬钉】位置也钉：每帧 SWP 回 ball_pin（dwell 钩子
+        // 记的驻留点）——show 布局/caret 查询抖动/缓动残尾全被覆盖
+        //（用户实锤「球还是会动」：实测驻留后 1s 内漂 +12px）。
+        let (pinx, piny) = self.ball_pin.get();
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                0,
-                0,
+                pinx,
+                piny,
                 win,
                 win,
-                SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
         let ctx = match &self.ctx {
@@ -4519,6 +4560,7 @@ impl CandidateWindowV2 {
         }
         self.ball_armed.set(false);
         self.ball_form.set(false);
+                BALL_FORM_MIRROR.store(false, std::sync::atomic::Ordering::Relaxed);
         self.ball_closing.set(false);
         self.ball_expanding.set(false);
         self.ball_mix.set(0.0);
@@ -4547,12 +4589,19 @@ impl CandidateWindowV2 {
             self.hide();
             return;
         }
-        // 【R7·真实光标统一入口】上屏后 g.caret 缓存停在打字末位（上
-        // 屏插入文字后插入符已右移）——球化/跟随一律优先系统插入符
-        // 直查值，无（虎魄等无系统 caret 的宿主）回落调用方参数。
-        let (cx, cy) = match crate::tsf::gui_caret_fallback() {
-            Some(r) => ((r.left + r.right) / 2, (r.top + r.bottom) / 2),
-            None => (cx, cy),
+        // 【R10·分路径】球化锚定（非 form：arm/收球起点）=系统插入符
+        // 直查（上屏后 g.caret 缓存旧值，锚要准——R7）。驻留跟随
+        //（form）=参数 g.caret 事件缓存（只在真实键入/点击更新）——
+        // 每 110ms 直查的查询值 ±10px 抖=驻留期球来回慢漂（用户
+        // 实锤，实测 (32,59)↔(42,69) 循环重臂）。虎魄等无系统插入
+        // 符宿主回落参数。
+        let (cx, cy) = if self.ball_form.get() {
+            (cx, cy)
+        } else {
+            match crate::tsf::gui_caret_fallback() {
+                Some(r) => ((r.left + r.right) / 2, (r.top + r.bottom) / 2),
+                None => (cx, cy),
+            }
         };
         // 【竞态修复】poll 空帧（~110ms/次）会重复走球化入口——armed
         // 已真则保持原 timer（重复 SetTimer=观察窗被无限重置永不收球）；
@@ -4561,27 +4610,15 @@ impl CandidateWindowV2 {
         if self.ball_armed.get() {
             return;
         }
-        // 【v6·R·球跟随光标】球态驻留期 caret 移动（方向键/点击/继续
-        // 编辑）→ 球平滑滑到新光标（复用 pos_anim；poll 每 ~110ms 喂
-        // 新 caret）。不动（±2px 容差）不重臂（防抖）。
+        // 【R10·驻留冻结】球态驻留期**完全静止**：poll 每 110ms 的
+        // hide_as_ball 一律忽略。原因：caret 查询在两个源（TSF
+        // GetTextExt / GUI 插入符）间交替=值跳变 ±15px 且与真实移动
+        // 同量级，容差滤波无效；ball_key_recent 是陈旧标志（空帧路
+        // 径不喂，停在打字时的 true）无法当门。用户痛点=「球还是会
+        // 动」（实测 (32,59)↔(23,48) 循环重臂）。球钉死在球化点
+        //（光标旁），4s idle 渐隐；下次键入=展开链自然接管，球在
+        // 新光标处出现——「球跟随光标」由每次球化锚定承担。
         if self.ball_form.get() {
-            // 【R7】cx,cy 已在入口被系统插入符直查值覆盖（统一入口）。
-            // 【R5】目标左上=球心-半窗（球心语义统一；48 窗球画在
-            // 中心=屏位球心）。
-            let win = self.ball_win_run.get() as i32;
-            let bx = cx + 6 - win / 2;
-            let by = cy + 16 - win / 2;
-            let (px, py) = self.live_pos.get();
-            if (px - bx).abs() + (py - by).abs() > 2 {
-                self.ball_pos.set((cx + 6, cy + 16));
-                let spd = self.anim_spd.get().max(0.05);
-                let d = ((bx - px).abs() + (by - py).abs()) as f32;
-                let dur = ((d * 3.5 / spd) as u32).clamp(45, 150);
-                self.pos_anim = Some(((px, py), (bx, by), std::time::Instant::now(), dur));
-                unsafe {
-                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                }
-            }
             return;
         }
         self.ball_pending.set((cx, cy));
@@ -4625,15 +4662,18 @@ impl CandidateWindowV2 {
         self.size_anim = Some((cur_sz, (bd_px, bd_px), std::time::Instant::now()));
         self.size_anim_ms.set(self.ball_morph_ms.get());
         self.chrome_override.set(Some(cur_sz));
-        // 位置=向框中心收拢（同步 morph）：框在原地向自己的中心缩成
-        // 球（球出现在框中心=「框变成球」），驻留后跟随分支再滑向
-        // 光标。cur_pos 变量保留给 diag；_ 抑制未用警告。
+        // 【R10·一段到位】位置终点=球位-半径（bx,by=光标旁球位，R7
+        // 直查真实插入符）。框缩小+滑向光标+变圆=一体的连续形变；
+        // 球出现即在光标旁=驻留不动（用户实锤「球还是会动」：此前
+        // R6 向心收拢到框中心，驻留后跟随分支又把球滑到光标处=
+        // 先到框中心再到球位=两次移动）。_ 抑制未用警告。
         let _ = &cur_pos;
-        let ctr = (
-            cur_pos.0 + cur_sz.0 / 2 - bd_px / 2,
-            cur_pos.1 + cur_sz.1 / 2 - bd_px / 2,
-        );
-        self.pos_anim = Some((cur_pos, ctr, std::time::Instant::now(), self.ball_morph_ms.get()));
+        self.pos_anim = Some((
+            cur_pos,
+            (bx - bd_px / 2, by - bd_px / 2),
+            std::time::Instant::now(),
+            self.ball_morph_ms.get(),
+        ));
         self.ball_pending.set((cx, cy));
         self.ball_closing.set(true);
         // 【v6·R3】收球球渐显 base=1（框缩小的同时球从中心浮现=
@@ -4870,6 +4910,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     if c.ball_closing.get() {
                         c.ball_closing.set(false);
                         c.ball_form.set(true);
+                        BALL_FORM_MIRROR.store(true, std::sync::atomic::Ordering::Relaxed);
                         c.ball_idle_t0.set(Some(std::time::Instant::now()));
                         c.internal_rerender = true;
                         let _ = c.show(&cands, &raw, &skin, None, sel);
@@ -4948,6 +4989,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         anim_done = false;
                     } else if c.ball_exit_alpha() <= 0.0 {
                         c.ball_form.set(false);
+                        BALL_FORM_MIRROR.store(false, std::sync::atomic::Ordering::Relaxed);
                         c.ball_idle_t0.set(None);
                         c.ball_exit_t0.set(None);
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -5032,10 +5074,14 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             );
                         }
                         c.live_pos.set((lp0 - pad, lp1 - pad));
+                        // 【R10·驻留硬钉】记钉死点：此后每帧球渲染强制
+                        // SWP 回此点（show 布局/caret 抖动全被覆盖）。
+                        c.ball_pin.set((lp0 - pad, lp1 - pad));
                     }
                     let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                     c.internal_rerender = false;
                     crate::tsf::diag_note("v6球S1: 球态驻留开始(4s)·主");
+                        BALL_FORM_MIRROR.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             } else {
                 anim_done = false;
@@ -5055,7 +5101,24 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         }
         // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
         // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
+        // 【R10·驻留钉死】球态驻留时任何残余 pos_anim（dwell 前布局
+        // arm 的残尾等）一律清除并 SWP 钉回 ball_pin——单点权威，
+        // 驻留期窗口纹丝不动（用户实锤「球还是会动」）。
         if let Some((f, t, t0, dur)) = c.pos_anim {
+            if c.ball_form.get() {
+                c.pos_anim = None;
+                let (pinx, piny) = c.ball_pin.get();
+                c.live_pos.set((pinx, piny));
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    pinx,
+                    piny,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            } else {
             let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
             if cur == t {
                 c.pos_anim = None;
@@ -5078,6 +5141,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                 }
+            }
             }
         }
         if c.fade.is_some() {
