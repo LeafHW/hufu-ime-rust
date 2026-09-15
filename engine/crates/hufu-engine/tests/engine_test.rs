@@ -285,6 +285,32 @@ fn shift_toggle_and_english_passthrough() {
     assert!(!out.consumed);
 }
 
+/// 【切英文上屏编码 2026-09-14】有编码时单击 Shift = 已打编码字母
+/// 直接上屏 + 切英文（用户拍板：编码不丢）。
+#[test]
+fn shift_with_composition_commits_raw_and_switches() {
+    let (mut engine, mut session, _dir) = setup();
+    // 打编码 dk（有组段、无上屏）
+    engine.process_key(&mut session, key('d'));
+    engine.process_key(&mut session, key('k'));
+    let out = engine.process_key(
+        &mut session,
+        KeyInput {
+            key: hufu_types::KeyCode::ShiftLeft,
+            ..KeyInput::char_key(' ')
+        },
+    );
+    // 编码字母原样上屏
+    assert!(out.consumed);
+    assert_eq!(out.commit.as_deref(), Some("dk"));
+    let st = out.state.unwrap();
+    assert!(!st.chinese, "切英文");
+    assert!(st.is_idle(), "组段清空");
+    // 英文态：后续字母直通
+    let out2 = engine.process_key(&mut session, key('x'));
+    assert!(!out2.consumed);
+}
+
 #[test]
 fn enter_clear_and_escape() {
     let (mut engine, mut session, _dir) = setup();

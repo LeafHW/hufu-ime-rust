@@ -1,4 +1,4 @@
-//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
+﻿//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
@@ -568,13 +568,30 @@ pub fn focus_view_hwnd() -> Option<isize> {
     }
 }
 
+/// 【首键延迟分解 2026-09-14】只记组段首键（raw 空→本键将建段）附近
+/// 的戳，避免每键刷屏：raw_last 空+本键可打印=首键。线程安全由
+/// dispatch 的 UI 线程语义保证。
+fn g_first_key_probe() -> bool {
+    let Some(g) = G_SHARED.get() else {
+        return false;
+    };
+    let g = g.0.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.raw_last.is_empty() {
+        return false;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering as O2};
+    static PROBED: AtomicU32 = AtomicU32::new(0);
+    PROBED.fetch_add(1, O2::Relaxed) < 6
+}
+
 /// ── 文本服务（同时实现按键接收器：msctf 要求 fforeground sink 支持
 ///    ITfTextInputProcessor，因此 TIP 对象自身实现 ITfKeyEventSink）──
 #[implement(
     ITfTextInputProcessor,
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
-    ITfThreadMgrEventSink
+    ITfThreadMgrEventSink,
+    windows::Win32::UI::TextServices::ITfDisplayAttributeProvider
 )]
 pub struct HuFuTs {
     shared: SharedRef,
@@ -1320,7 +1337,7 @@ impl HuFuTs_Impl {
                 f
             };
             if fire {
-                if let Some((consumed, _commit, _back, state, _sound, _vol)) =
+                if let Some((consumed, commit, _back, state, _sound, _vol)) =
                     ipc::key_request("shift", false, false, false, false, None)
                 {
                     if consumed {
@@ -1328,16 +1345,18 @@ impl HuFuTs_Impl {
                             .get("chinese")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
-                        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                        if g.chinese != zh {
-                            g.chinese = zh;
-                            crate::langbar::set_mode(zh);
+                        {
+                            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                            if g.chinese != zh {
+                                g.chinese = zh;
+                                crate::langbar::set_mode(zh);
+                            }
                         }
-                        g.composing = !state
-                            .get("raw")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .is_empty();
+                        // 【切英文上屏编码 2026-09-14】引擎侧有编码时按
+                        // Shift=上屏编码字母+切英文（commit 带回字母）。
+                        // 走通用 update_ui（Op::Commit 组段上屏同款链），
+                        // TestUp 无 ctx 但组段活着 focus_context 必在。
+                        let _ = update_ui(self.shared.clone(), commit, state.clone());
                     }
                 }
             }
@@ -1521,11 +1540,19 @@ impl HuFuTs_Impl {
                 Some(std::mem::take(&mut g.digit_tail))
             }
         };
+        // 【首键延迟分解 2026-09-14】KEY 前/后各记一戳（diag unix ms）
+        // ——与 show 帧对齐可分解 注入→引擎→上屏 链各段耗时。
+        if g_first_key_probe() {
+            diag_note(&format!("lat: KEY前 name={name} test={test_only}"));
+        }
         let Some((consumed, commit, back, state, sound, sound_vol)) =
             ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end, digit_tail.as_deref())
         else {
             return BOOL(0);
         };
+        if g_first_key_probe() {
+            diag_note(&format!("lat: KEY后 name={name} consumed={consumed}"));
+        }
         trace(&format!(
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
@@ -1870,6 +1897,9 @@ impl EditSession_Impl {
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { crange.SetText(ec, 0, &wstr)? };
                 trace("SP: SetText ok");
+                // 【组段下划线·CUAS】编码文本打上「输入中」属性——
+                // 32 位/UWP/开始菜单（CUAS 渲染）据此画下划线。
+                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &crange) };
                 // 选区跟随到组段末尾（否则下次插入点停在开头）
                 let _ = set_selection_at_end(&ctx, ec, &crange);
                 // 【十七次修正·SP 同步 raw】监控实锤（04:11:19）：SP 不更
@@ -1915,6 +1945,9 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
+                // 【组段下划线·CUAS】编码更新后重打属性（SetText 会
+                // 重置 range 属性——每键重标）。
+                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &range) };
                 // 【逐键跟随最新光标 2026-09-12 定版】用户拍板：打一个
                 // 编码/字母，窗就跟到最新光标处（不是旧的「上屏动一
                 // 次、段内钉住」）。段内每键两步：
@@ -2072,7 +2105,12 @@ impl EditSession_Impl {
                     // session 已清（空格已消费）而文本没落进文档——候选
                     // 有字但屏清了（多人实录，切窗恢复）。自愈：终止死组
                     // 段后在当前 context 直插保字（照 SetPreedit 自愈先例）。
-                    let set_ok = unsafe { range.SetText(ec, 0, &wstr).is_ok() };
+                    let set_ok = unsafe {
+                        // 【组段下划线·CUAS】提交前清「输入中」属性——
+                        // 否则下划线残留到已上屏文本（属性跟 range 走）。
+                        crate::displayattr::unmark_range(ec, &ctx, &range);
+                        range.SetText(ec, 0, &wstr).is_ok()
+                    };
                     if set_ok {
                         let _ = unsafe { comp.EndComposition(ec) };
                         // 提交后选区放到已提交文本之后
@@ -2199,7 +2237,11 @@ impl EditSession_Impl {
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
-                    let set_ok = unsafe { range.SetText(ec, 0, &wstr).is_ok() };
+                    let set_ok = unsafe {
+                        // 【组段下划线·CUAS】顶屏提交前同样清属性。
+                        crate::displayattr::unmark_range(ec, &ctx, &range);
+                        range.SetText(ec, 0, &wstr).is_ok()
+                    };
                     if set_ok {
                         // 【增量估算 2026-09-12 十一次修正】不再做上屏
                         // 瞬间重校（真实/估算两套位置交替=抖动与远跳的
@@ -5055,6 +5097,32 @@ fn poll_tick() {
     // 本 poll 自然恢复。
     if crate::addword::is_open() && !crate::addword::in_window_thread() {
         return;
+    }
+    // 【首键延迟优化·候选窗预热 2026-09-14】首键 110ms 实测大头=
+    // 候选窗冷创建（DComp 设备+DWrite 系统字体集首次加载；引擎
+    // 全链仅 1ms、热显示 2ms）。poll 窗与 TSF dispatch 同线程（窗口
+    // 线程亲和正确）：闲拍顺手把窗建好（隐藏态不显示），首键直接
+    // show。进程生命周期只发生一次。
+    {
+        let sp = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
+        if let Some(s) = sp {
+            let (none, dead, busy) = {
+                let g = s.lock().unwrap_or_else(|e| e.into_inner());
+                (g.cand2.is_none(), g.cand2_dead, g.cand2_busy)
+            };
+            if none && !dead && !busy && !crate::addword::is_open() {
+                match CandidateWindowV2::new() {
+                    Some(v2) => {
+                        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.cand2.is_none() {
+                            g.cand2 = Some(v2);
+                            diag_note("preheat: 候选窗预热完成（闲拍冷创建挪出首键路径）");
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
     }
     // 【打字期静默】500ms 内有按键 → 键路径在活跃，poll 只会抢管道
     // /抢锁（键请求被队头阻塞的温床）。跳过本拍。

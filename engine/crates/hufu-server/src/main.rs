@@ -316,6 +316,26 @@ fn main() {
                     .map(|p| format!("{p}\\HuFuSettingsProfile"))
                     .unwrap_or_else(|_| "HuFuSettingsProfile".to_string());
                 let size_arg = "--window-size=900,800";
+                // 【用户反馈】设置窗口默认开在左上角——改为屏幕正中：
+                // 主屏工作区尺寸算 (900,800) 居中坐标，--window-position
+                // 随 --window-size 一起传（独立 user-data-dir 自成实例，
+                // 参数永远生效）。多屏用户拖去副屏后下次仍回主屏居中
+                //（设置窗非常驻窗口，固定居中开场）。
+                #[cfg(windows)]
+                let pos_arg = {
+                    #[link(name = "user32")]
+                    unsafe extern "system" {
+                        fn GetSystemMetrics(nindex: i32) -> i32;
+                    }
+                    let (sw, sh) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
+                    format!(
+                        "--window-position={},{}",
+                        ((sw - 900) / 2).max(0),
+                        ((sh - 800) / 2).max(0)
+                    )
+                };
+                #[cfg(not(windows))]
+                let pos_arg = String::new();
                 let extra_args = [
                     format!("--user-data-dir={profile}"),
                     "--no-first-run".to_string(),
@@ -334,6 +354,9 @@ fn main() {
                     Some(exe) => {
                         let mut c = std::process::Command::new(exe);
                         c.arg(&app_arg).arg(size_arg);
+                        if !pos_arg.is_empty() {
+                            c.arg(&pos_arg);
+                        }
                         for a in &extra_args {
                             c.arg(a);
                         }
