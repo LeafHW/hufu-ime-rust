@@ -4514,7 +4514,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
 /// 的系统插入符（hCaret/rcCaret 客户区坐标→屏幕）。这是不依赖组段的
 /// 唯一光标来源——query_caret 需要组段（GetTextExt），首帧查不出。
-fn gui_caret_fallback() -> Option<RECT> {
+pub(crate) fn gui_caret_fallback() -> Option<RECT> {
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
@@ -5044,8 +5044,17 @@ fn poll_collapse_stale(shared: &SharedRef) {
     let mut any_visible = false;
     // 【v6·S1】停手/断段收窗球化（联想框的正规收尾点——观察窗
     // →收球）。caret 已失效则普通隐藏。
-    let bcx = g.caret.map(|a| (a.left + a.right) / 2);
-    let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+    // 【R7·真实光标】上屏后 g.caret 缓存停在打字末位（上屏插入
+    // 文字后插入符已右移但无人更新缓存）=球滑向旧位偏离真实光标
+    // （多字实测球偏光标 (-35,+45)）。球化前直查系统插入符。
+    let mut bcx = g.caret.map(|a| (a.left + a.right) / 2);
+    let mut bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+    if crate::candwin2::ball_gate() {
+        if let Some(r) = gui_caret_fallback() {
+            bcx = Some((r.left + r.right) / 2);
+            bcy = Some((r.top + r.bottom) / 2);
+        }
+    }
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
         if crate::candwin2::ball_gate() {

@@ -4475,6 +4475,13 @@ impl CandidateWindowV2 {
             self.hide();
             return;
         }
+        // 【R7·真实光标统一入口】上屏后 g.caret 缓存停在打字末位（上
+        // 屏插入文字后插入符已右移）——球化/跟随一律优先系统插入符
+        // 直查值，无（虎魄等无系统 caret 的宿主）回落调用方参数。
+        let (cx, cy) = match crate::tsf::gui_caret_fallback() {
+            Some(r) => ((r.left + r.right) / 2, (r.top + r.bottom) / 2),
+            None => (cx, cy),
+        };
         // 【竞态修复】poll 空帧（~110ms/次）会重复走球化入口——armed
         // 已真则保持原 timer（重复 SetTimer=观察窗被无限重置永不收球）；
         // 球态已驻留则完全忽略（球自管 4s 退场——重复 arm 会无限重置
@@ -4486,6 +4493,7 @@ impl CandidateWindowV2 {
         // 编辑）→ 球平滑滑到新光标（复用 pos_anim；poll 每 ~110ms 喂
         // 新 caret）。不动（±2px 容差）不重臂（防抖）。
         if self.ball_form.get() {
+            // 【R7】cx,cy 已在入口被系统插入符直查值覆盖（统一入口）。
             // 【R5】目标左上=球心-半窗（球心语义统一；48 窗球画在
             // 中心=屏位球心）。
             let win = self.ball_win_run.get() as i32;
