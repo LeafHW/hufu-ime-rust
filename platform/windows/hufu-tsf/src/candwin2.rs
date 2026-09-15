@@ -2766,32 +2766,11 @@ impl CandidateWindowV2 {
                 // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
                 // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
                 // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
-                // 【R12·真形变·壳渐变】形变期间（expanding/closing）壳的
-                // 整帧 alpha=形变进度：展开 0→1（首帧纯球——壳全透明，
-                // 球在同一形状位置渐变成框，不是「球没了框出来」），
-                // 收球 1→0（末帧纯球——框渐隐成球）。球叠加层画在
-                // PopLayer 之后不受此乘。配合 R4 圆角插值=同一个东西
-                // 的连续变形（尺寸+圆角+alpha 三轴同步）。
-                let mut fade_a = self.fade_alpha();
-                if self.ball_expanding.get() || self.ball_closing.get() {
-                    let t = match self.size_anim {
-                        Some((_, _, t0)) => (t0.elapsed().as_millis() as f32
-                            / self.size_anim_ms.get().max(1) as f32)
-                            .clamp(0.0, 1.0),
-                        None => 1.0,
-                    };
-                    // 【R12b·前段起量】线性 alpha 前 100ms 太淡（t=0.12
-                    // ≈真空——实测展开首帧截图空白）=用户「球突然没了
-                    // 框出来」。前 40% 快速起量（t*2.5 clamp 1）。
-                    let lin = if self.ball_closing.get() { 1.0 - t } else { t };
-                    let shell_f = if self.ball_closing.get() {
-                        (1.0 - t * 2.5).max(0.0)
-                    } else {
-                        (t * 2.5).min(1.0)
-                    };
-                    let _ = lin;
-                    fade_a = fade_a.min(shell_f);
-                }
+                // 【R13·壳透明交叉退役】R12 曾让形变期壳 alpha=进度（展开
+                // 首帧壳透明）+球叠层画整球交叉——两个渲染层交替显隐=
+                // 「两个独立元素」的观感来源。R13 统一：壳=唯一实体全程
+                // 不透明（32×32 全圆即球），叠加层只补芯（渐显渐隐）。
+                let fade_a = self.fade_alpha();
                 let fade_layer_on = fade_a < 0.999;
                 if fade_layer_on {
                     let mut lp = D2D1_LAYER_PARAMETERS1::default();
@@ -3618,13 +3597,11 @@ impl CandidateWindowV2 {
                             .unwrap_or((buf_w.max(1), buf_h.max(1)));
                         let scx = cw as f32 * 0.5 * dpi_scale;
                         let scy = ch as f32 * 0.5 * dpi_scale;
-                        // 【R12b·完整球叠加】画整球（环+芯）不只芯——
-                        // 展开首帧（壳近透明）球环=唯一可见物（此前
-                        // core_only 首帧只剩淡芯=视觉真空=「球突然没了
-                        // 框出来」）；收球末帧（壳全隐）球环接住壳的
-                        // 圆（同色同位=无缝交接，此前末帧只剩芯悬浮
-                        // 然后球帧全球闪现）。
-                        self.draw_ball_into6(&ctx, scx, scy, alpha, false);
+                        // 【R13·叠加=只画芯】壳圆即球体（同色平涂，R4
+                        // 圆角插值连续变形）——叠加层只补高亮芯：收球
+                        // 从中心浮现（=高亮候选收拢成芯）、展开融回
+                        //（=芯散开成高亮条）。壳=唯一实体。
+                        self.draw_ball_into6(&ctx, scx, scy, alpha, true);
                     }
                 }
                 let _ = ctx.EndDraw(None, None);
@@ -4391,7 +4368,11 @@ impl CandidateWindowV2 {
     /// 【v6·S2】纯球绘制（不建链不 Present——供球帧/展开叠加共用）：
     /// 中心 (cx,cy)（画布像素坐标）、整体 alpha（展开交叉淡化用）。
     /// 【R4】core_only：形变期间壳圆即球体（真形变），叠加只需画
-    /// 高亮芯（渐隐/渐现）——不重复画环和柔影。
+    /// 高亮芯（渐隐/渐现）——不重复画环。
+    /// 【R13·柔影退役】8 层软晕阴影删除——壳（唯一实体）无柔影，
+    /// 球带柔影=切换瞬间光晕凭空消失/出现=「球突然没了框出来了」
+    /// 的存在感断裂（用户多版本实锤两个独立元素）。球=壳同款平涂
+    /// 圆+芯：形变全程一个元素。
     unsafe fn draw_ball_into6(
         &self,
         ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
@@ -4406,25 +4387,6 @@ impl CandidateWindowV2 {
         let d = self.ball_d_run.get();
         let r = d * 0.5;
         if !core_only {
-            // 软晕阴影（8 层方向性——底厚顶薄）。
-            if let Ok(shb) = ctx.CreateSolidColorBrush(
-                &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
-                None,
-            ) {
-                for i in 0..8i32 {
-                    let ext = (i + 1) as f32 * 1.7;
-                    let k = 1.0 - i as f32 / 8.0;
-                    let _ = shb.SetOpacity(0.22 * k * k * alpha);
-                    ctx.FillEllipse(
-                        &D2D1_ELLIPSE {
-                            point: D2D_POINT_2F { x: cx + 1.5, y: cy + 2.5 },
-                            radiusX: r + ext,
-                            radiusY: r + ext,
-                        },
-                        &shb,
-                    );
-                }
-            }
             Self::fill_grad_ball6c(ctx, cx, cy, r, self.ball_ring.get(), alpha);
         }
         Self::fill_grad_ball6c(ctx, cx, cy, r * 0.4, self.ball_core.get(), alpha);
