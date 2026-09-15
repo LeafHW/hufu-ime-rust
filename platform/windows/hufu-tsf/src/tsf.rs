@@ -2041,8 +2041,21 @@ impl EditSession_Impl {
                     } else {
                         if crate::addword::in_window_thread() {
                             tl_cand_hide();
-                        } else if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                        } else {
+                            // 【v6·S1】普通上屏收窗球化（观察窗→收球）。
+                            let bcx = g.caret.map(|a| (a.left + a.right) / 2);
+                            let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+                            if let Some(c) = g.cand2.as_mut() {
+                                if crate::candwin2::ball_gate() {
+                                    if let (Some(x), Some(y)) = (bcx, bcy) {
+                                        c.hide_as_ball(x, y);
+                                    } else {
+                                        c.hide();
+                                    }
+                                } else {
+                                    c.hide();
+                                }
+                            }
                         }
                     }
                     return Ok(());
@@ -3595,8 +3608,26 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             drop(g);
             return Ok(());
         }
+        // 【v6·S1】上屏/清空收窗球化：观察窗 500ms（期内键入=框跟随
+        // 去新位）→到点收球动画。caret 中心=球锚。
+        let bcx = g.caret.map(|a| (a.left + a.right) / 2);
+        let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+        if crate::candwin2::ball_gate() {
+            crate::tsf::diag_note(&format!(
+                "v6球S1: 空帧球化入口 caret={:?}",
+                g.caret.map(|a| (a.left, a.top, a.right, a.bottom))
+            ));
+        }
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            if crate::candwin2::ball_gate() {
+                if let (Some(x), Some(y)) = (bcx, bcy) {
+                    c.hide_as_ball(x, y);
+                } else {
+                    c.hide();
+                }
+            } else {
+                c.hide();
+            }
         }
         if g.cand_ui_active {
             drop(g);
@@ -4983,9 +5014,21 @@ pub(crate) fn host_may_show() -> bool {
 fn poll_collapse_stale(shared: &SharedRef) {
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut any_visible = false;
+    // 【v6·S1】停手/断段收窗球化（联想框的正规收尾点——观察窗
+    // →收球）。caret 已失效则普通隐藏。
+    let bcx = g.caret.map(|a| (a.left + a.right) / 2);
+    let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
-        c.hide();
+        if crate::candwin2::ball_gate() {
+            if let (Some(x), Some(y)) = (bcx, bcy) {
+                c.hide_as_ball(x, y);
+            } else {
+                c.hide();
+            }
+        } else {
+            c.hide();
+        }
     }
     let ui_active = g.cand_ui_active;
     let ui_host_draws = g.cand_ui_host_draws;
