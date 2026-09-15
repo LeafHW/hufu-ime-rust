@@ -1,4 +1,4 @@
-//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -4150,7 +4150,11 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(None);
                 c.scale_in.set(false);
                 // 【动效·退场完成】缩到 72% 即真隐藏（跳过完成帧重绘）。
-                if c.scale_out.get() {
+                // 【有编码不消失 2026-09-16】用户拍板不变量：编码在手
+                //（raw 非空）候选窗不准消失——退场完成帧若发现 last_
+                // show 的 raw 非空（键入中断迟到的竞态帧：中断清了
+                // scale_out 但本分支仍走到隐藏），放弃隐藏按目标重绘。
+                if c.scale_out.get() && raw.is_empty() {
                     c.scale_out.set(false);
                     shown_this_tick = true;
                     unsafe {
@@ -4162,6 +4166,11 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.pos_anim = None;
                     c.live_size.set((0, 0));
                     crate::tsf::diag_note("动效: 退场完成→隐藏");
+                } else if c.scale_out.get() && !raw.is_empty() {
+                    // 编码在身：退场中止，恢复全尺寸显示
+                    // live_size 保持当前插值（72%）：下帧 show 从 72% 平滑恢复
+                    c.scale_out.set(false);
+                    crate::tsf::diag_note("动效: 退场中止（编码在身，不消失）");
                 }
             } else {
                 anim_done = false;
@@ -4245,6 +4254,18 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
     };
     let shared = gsh.0.clone();
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // 【有编码不消失 2026-09-16】用户拍板不变量：编码在手（raw_last
+    // 非空）候选窗不准消失——停留钟到点时若发现编码在身（键入中断
+    // 竞态的迟到 fire），作废退场直接返回，窗口继续显示。
+    if !g.raw_last.is_empty() {
+        let mut cand2 = g.cand2.take();
+        if let Some(c) = cand2.as_mut() {
+            c.commit_hold.set(None);
+        }
+        g.cand2 = cand2;
+        crate::tsf::diag_note("动效: 停留钟到点但编码在身→不退场");
+        return;
+    }
     let mut cand2 = g.cand2.take();
     if let Some(c) = cand2.as_mut() {
         c.commit_hold.set(None);

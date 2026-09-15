@@ -1,4 +1,4 @@
-﻿//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
+//! TSF 文本服务：按键 → 管道引擎 → 组段/上屏 + 候选窗。
 
 use crate::candwin2::CandidateWindowV2;
 use crate::ipc;
@@ -212,6 +212,11 @@ pub struct Shared {
     /// 常带 current_schema，比对变化即置皮肤失效（entrance_anim 等
     /// 方案相关字段即时跟随；覆盖设置页/langbar 等非键路径切方案）。
     pub last_schema_seen: String,
+    /// 【Shift 上屏立即收窗 2026-09-16】切英文上屏编码（fire 分支带
+    /// commit）时置位；update_ui 空帧分支消费——走 hide_now（真隐
+    /// 藏，无 1s hold 无退场动效）。用户拍板：Shift 上屏=会话终了，
+    /// 候选窗立马消失。
+    pub shift_now_hide: bool,
     /// 【焦点风暴去抖 2026-09-08】上次「无组段」OnSetFocus 处理时刻——
     /// QQ 类宿主 40ms 内连发 8 次焦点事件（trace 实锤），无组段时重复
     /// 处理全是空操作（spawn+管道+锁白白与打字路径竞争），200ms 去抖。
@@ -436,6 +441,7 @@ impl Shared {
             skin_repaint: false,
             srv_skin_ver_pushed: u64::MAX,
             last_schema_seen: String::new(),
+            shift_now_hide: false,
             focus_idle_at: None,
             last_key_at: None,
             delay_show_ms: 0,
@@ -1350,6 +1356,12 @@ impl HuFuTs_Impl {
                             if g.chinese != zh {
                                 g.chinese = zh;
                                 crate::langbar::set_mode(zh);
+                            }
+                            // 【Shift 上屏立即收窗 2026-09-16】带 commit=
+                            // 上屏编码：空帧分支改走 hide_now（无 hold
+                            // 无退场动效，用户拍板立马消失）。
+                            if !commit.is_empty() {
+                                g.shift_now_hide = true;
                             }
                         }
                         // 【切英文上屏编码 2026-09-14】引擎侧有编码时按
@@ -3659,8 +3671,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             drop(g);
             return Ok(());
         }
+        // 【Shift 上屏立即收窗 2026-09-16】fire 分支带 commit 时置位：
+        // hide_now（真隐藏清 hold 清动效）而非 hide（1s hold+退场缩
+        // 放）——「Shift 切英文上屏时候选要立马消失，不要动效」。
+        let now_hide = g.shift_now_hide;
+        g.shift_now_hide = false;
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            if now_hide {
+                c.hide_now();
+            } else {
+                c.hide();
+            }
         }
         if g.cand_ui_active {
             drop(g);
@@ -5046,6 +5067,12 @@ pub(crate) fn host_may_show() -> bool {
 /// ui_element_show 的先 drop 再调姿势）。
 fn poll_collapse_stale(shared: &SharedRef) {
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // 【有编码不消失 2026-09-16】编码在手（raw_last 非空）不收窗——
+    // 用户拍板不变量「只要有编码就不准消失」（mine 判定的 composition
+    // 竞态兜底：组段句柄丢失但编码仍显示中的窗口）。
+    if !g.raw_last.is_empty() {
+        return;
+    }
     let mut any_visible = false;
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
@@ -5252,6 +5279,20 @@ fn poll_tick() {
         // 无条件刷新——此时 220ms 稳定期已过、布局已稳，update_ui
         // 以正确 rect 显示（op 重跑 edit session 顺带重查 caret）。
         need_show = g.suppress_pending;
+        // 【有编码必显示·恢复通道 2026-09-16】用户实锤「编码在手候选
+        // 还是消失了」（输入法切换抖动/Deactivate 等生命周期路径
+        // hide_now 藏窗后无人恢复——sig 没变 poll 不重画）。编码在手
+        //（raw 非空）而窗口在但不可见 → 强制走一遍 update_ui 重显
+        //（update_ui 内的 suppress/delay/host 门全部照走，不破坏任何
+        // 故意不显示的语义；焦点真不在本进程时 show 的 host 门自拦）。
+        if !need_show
+            && g
+                .cand2
+                .as_ref()
+                .is_some_and(|c| !c.is_visible())
+        {
+            need_show = true;
+        }
         if sig == g.cand_sig_last && !need_show {
             // 【实机预览重绘·仅限皮肤刚变化 2026-09-08】签名未变且
             // 皮肤刚重拉（skin_repaint 一次性标志）时按上帧渲染参数
