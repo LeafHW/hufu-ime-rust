@@ -156,7 +156,7 @@ fn tl_cand_show(
 fn tl_cand_hide() {
     TL_CAND2.with(|t| {
         if let Some(c) = t.borrow_mut().as_mut() {
-            c.hide();
+            c.hide_now_tag("N158"); // 【R16】词框 TL 不做停留
         }
     });
 }
@@ -719,7 +719,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【动效窗口让渡】tick 持有中 → 挂 pending 由 tick 放回时代为
         // 隐藏（否则旧窗漏藏=残留阴影）
         if let Some(mut c) = g.cand2.take() {
-            c.hide();
+            c.hide_now_tag("N721");
         } else if g.cand2_busy {
             g.pending_cand_hide = true;
         }
@@ -775,9 +775,8 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         if !fforeground.as_bool() {
             let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = g.cand2.as_mut() {
-                // 【v6·R8】失焦=离开输入场：球强制消失（kill_ball 绕过
-                // 球系统吞掉保护——否则切窗后球一直挂着=用户实锤）。
-                c.kill_ball();
+                    // 【R16】失焦=离开输入场：立即真隐藏。
+                    c.hide_now_tag("N778");
             }
         }
         Ok(())
@@ -1095,7 +1094,7 @@ fn handle_set_focus(
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            c.hide_now_tag("N1096");
             c.focus_reset();
         }
         trace("foc: E hide完");
@@ -1223,7 +1222,14 @@ pub fn diag_note(msg: &str) {
             .ok();
     }
     if let Some(f) = g.as_mut() {
-        if writeln!(f, "{msg}").is_err() {
+        // 【R16b·对时】每行带 Unix epoch 毫秒——采样脚本同源
+        //（[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()）可精确
+        // 对齐「窗口 rect 采样」与「diag 事件」。
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if writeln!(f, "[{ms}] {msg}").is_err() {
             *g = None; // 下次重开（句柄失效）
         }
     }
@@ -2021,7 +2027,7 @@ impl EditSession_Impl {
                     if text == "{加词}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now_tag("N2022");
                         }
                         drop(g);
                         // 【server 会话重置 2026-09-12 二十四修】用户实锤
@@ -2035,7 +2041,7 @@ impl EditSession_Impl {
                     } else if text == "{加权}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now_tag("N2036");
                         }
                         drop(g);
                         let _ = crate::ipc::call(&serde_json::json!({"op": "reset"}));
@@ -2044,21 +2050,10 @@ impl EditSession_Impl {
                         if crate::addword::in_window_thread() {
                             tl_cand_hide();
                         } else {
-                            // 【v6·S1】普通上屏收窗球化（观察窗→收球）。
-                            let bcx = g.caret.map(|a| (a.left + a.right) / 2);
-                            let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+                            // 【R16】hide()=hold 语义（窗口亮着→1s 停留
+                            // 后缩放退场）。
                             if let Some(c) = g.cand2.as_mut() {
-                                if crate::candwin2::ball_gate() {
-                                    if let (Some(x), Some(y)) = (bcx, bcy) {
-                                        c.hide_as_ball(x, y);
-                                    } else {
-                                        c.hide();
-                                    }
-                                } else {
-                                    // 【R14·上屏停留】窗口亮着=上屏：
-                                    // 1s 停留后渐隐（用户拍板）。
-                                    c.hide_or_hold();
-                                }
+                                c.hide();
                             }
                         }
                     }
@@ -2180,7 +2175,7 @@ impl EditSession_Impl {
                     }
                     if commit_text == "{隐藏候选}" {
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now_tag("N2170");
                         }
                     } else {
                         let weighted = commit_text == "{加权}";
@@ -3400,7 +3395,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 if let Some(c) = g.cand2.as_mut() {
                     // 【R14·上屏停留】断段收窗同款：窗口亮着=1s 停留
                     // 后渐隐（hold 在身=维持不重复起臂）。
-                    c.hide_or_hold();
+                    c.hide();
                 }
             }
         }
@@ -3614,28 +3609,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             drop(g);
             return Ok(());
         }
-        // 【v6·S1】上屏/清空收窗球化：观察窗 500ms（期内键入=框跟随
-        // 去新位）→到点收球动画。caret 中心=球锚。
-        let bcx = g.caret.map(|a| (a.left + a.right) / 2);
-        let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
-        if crate::candwin2::ball_gate() {
-            crate::tsf::diag_note(&format!(
-                "v6球S1: 空帧球化入口 caret={:?}",
-                g.caret.map(|a| (a.left, a.top, a.right, a.bottom))
-            ));
-        }
+        // 【R16】hide()=hold 语义（空帧但窗口亮着=上屏/断段：1s 停留
+        // 后缩放退场；不可见=常规隐藏幂等）。
         if let Some(c) = g.cand2.as_mut() {
-            if crate::candwin2::ball_gate() {
-                if let (Some(x), Some(y)) = (bcx, bcy) {
-                    c.hide_as_ball(x, y);
-                } else {
-                    c.hide();
-                }
-            } else {
-                // 【R14·上屏停留】空帧但窗口亮着=上屏/断段：1s 停留
-                // 后渐隐（用户拍板）；不可见=常规隐藏。
-                c.hide_or_hold();
-            }
+            c.hide();
         }
         if g.cand_ui_active {
             drop(g);
@@ -3651,7 +3628,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.suppress_pending = true;
         arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            c.hide_suppress();
         }
         // 【小窗线程不进 OWNED 2026-09-12 十六修】自动复现决定性证据：
         // 词框 d 时 cand2=false → 本分支在小窗线程 new_owned 主文档窗
@@ -3777,7 +3754,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                c.hide_now_tag("N3749");
             }
             g.cand2_dead = true;
             let (x, y) = if sh {
@@ -3806,7 +3783,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             if crate::addword::in_window_thread() {
                 tl_cand_hide();
             } else if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                c.hide_suppress();
             }
             g.suppress_pending = true;
             arm_first_frame_timer();
@@ -3825,25 +3802,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
             } else {
-                // 【v6·S2·振荡根修】球态驻留时：联想刷新（无近期键）
-                // 不再喂 show——球只在真实键入（600ms 内有键）时展开。
-                // 否则停手后的联想 poll 刷新会把刚收的球又展成框，
-                // 与 poll_collapse 的球化形成球↔框振荡。
-                let recent = g
-                    .last_key_at
-                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
-                let ball_dwelling = g
-                    .cand2
-                    .as_ref()
-                    .is_some_and(|c| c.ball_form.get());
                 if let Some(c) = g.cand2.as_mut() {
-                    // 【v6·R】键活性交给 candwin2（球态展开判据之一：
-                    // 整句模式 d 候选可能与联想内容完全同签名，内容
-                    // 无法区分——recent 有键=真实键入必展开）。
-                    c.ball_key_recent.set(recent);
-                    if !crate::candwin2::ball_gate() || !ball_dwelling || recent {
-                        c.show(&cands, &raw, &skin, caret.as_ref(), sel);
-                    }
+                    c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 }
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
@@ -3989,7 +3949,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                c.hide_now_tag("N3944");
             }
             // 不预置 cand_ui_active——由 ui_element_show 先问宿主
             // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
@@ -4119,7 +4079,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
             if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                c.hide_suppress();
             }
             g.wps_caret_prev = g.caret;
             if g.wps_settle_start.is_none() {
@@ -4139,18 +4099,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
-                // 【v6·R】键活性喂给球分支（update_ui 第二渲染点——
-                // 第一渲染点在上方 cloaked 分支；此处漏喂=d 键展开
-                // 判据 key_recent 恒 false=球变不回框的根因之一）。
-                let recent = g
-                    .last_key_at
-                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
-                match g.cand2.as_mut() {
-                    Some(c) => {
-                        c.ball_key_recent.set(recent);
-                        c.show(&cands, &raw, &skin, caret.as_ref(), sel)
-                    }
-                    None => {}
+                if let Some(c) = g.cand2.as_mut() {
+                    c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 }
             }
         }
@@ -5050,10 +5000,9 @@ pub(crate) fn host_may_show() -> bool {
 fn poll_collapse_stale(shared: &SharedRef) {
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut any_visible = false;
-    // 【v6·R8·切窗清球】停手收球前先验前台：前台已是他进程=用户切窗
-    // （此路径在 mine 门提前 return——下方 poll_tick 的前台判据段到
-    // 不了这里）——球化跟随会把球挂到新窗口的光标上=「切窗后球一直
-    // 在」（用户实锤）。异进程直接 kill（同应用族豁免照旧）。
+    // 【v6·R8→R16】停手收窗前先验前台：前台已是他进程=用户切窗
+    //（此路径在 mine 门提前 return——下方 poll_tick 的前台判据段到
+    // 不了这里）。异进程直接真隐藏（同应用族豁免照旧）。
     unsafe {
         let fg = GetForegroundWindow();
         if !fg.0.is_null() {
@@ -5064,28 +5013,19 @@ fn poll_collapse_stale(shared: &SharedRef) {
                 && !fg_same_app_dir(pid)
             {
                 if let Some(c) = g.cand2.as_mut() {
-                    c.kill_ball();
+                    c.hide_now_tag("N5008");
                 }
             }
         }
     }
-    // 【v6·S1】停手/断段收窗球化（联想框的正规收尾点——观察窗
-    // →收球）。caret 已失效则普通隐藏。（R10：驻留期此路径每
-    // 110ms 反复调——球化锚定的直查已移入 hide_as_ball 入口的
-    // 非 form 分支，此处不再覆盖=跟随喂食走事件缓存防抖。）
-    let bcx = g.caret.map(|a| (a.left + a.right) / 2);
-    let bcy = g.caret.map(|a| (a.top + a.bottom) / 2);
+    // 【R16b·停留修复实锤】poll_collapse_stale 在断段后每 110ms 反复
+    // 收窗——此前 hide_now 把刚起臂的停留钟秒杀（N5016 实锤：S2/SP
+    // 上屏后 ~200ms 窗口消失）。改 hide()（hold 语义，幂等）：断段=
+    // 上屏停留 1s 场景；停手 2s stale 的挂窗也统一走停留（到点退场，
+    // 不再无限挂）。
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
-        if crate::candwin2::ball_gate() {
-            if let (Some(x), Some(y)) = (bcx, bcy) {
-                c.hide_as_ball(x, y);
-            } else {
-                c.hide();
-            }
-        } else {
-            c.hide();
-        }
+        c.hide();
     }
     let ui_active = g.cand_ui_active;
     let ui_host_draws = g.cand_ui_host_draws;
@@ -5205,7 +5145,7 @@ fn poll_tick() {
                 {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = g.cand2.as_mut() {
-                        c.kill_ball();
+                        c.hide_now_tag("N5136");
                     }
                 }
                 poll_collapse_stale(&shared);
