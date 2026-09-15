@@ -1840,7 +1840,31 @@ impl CandidateWindowV2 {
         }
 
         let font_pt = layout_f(skin, "font_point", 16.0);
-        let radius = layout_f(skin, "corner_radius", 8.0);
+        let radius_skin = layout_f(skin, "corner_radius", 8.0);
+        // 【v6·R4·真形变】球↔框形变期间壳的圆角半径插值：球态=半宽
+        //（正圆），框态=皮肤 corner_radius。壳的背景色两端同色
+        //（back_color）→视觉=【同一个圆在长大变方】=球变成候选框
+        //（不再是"两个东西交叉淡化"）。收球反向（框变方为圆缩小）。
+        // radius 单位=逻辑 px（SetTransform 已含 dpi）；chrome_override
+        // 是物理 px → 换算。
+        let radius = if self.ball_expanding.get() || self.ball_closing.get() {
+            let t = match self.size_anim {
+                Some((_, _, t0)) => (t0.elapsed().as_millis() as f32
+                    / self.size_anim_ms.get().max(1) as f32)
+                    .clamp(0.0, 1.0),
+                None => 1.0,
+            };
+            let t = if self.ball_closing.get() { 1.0 - t } else { t };
+            let (cw, ch) = self
+                .chrome_override
+                .get()
+                .unwrap_or(self.live_size.get());
+            let logical = (cw.min(ch) as f32 / dpi_scale.max(0.1)) * 0.5;
+            let circle_r = logical.max(1.0);
+            circle_r + (radius_skin - circle_r) * t
+        } else {
+            radius_skin
+        };
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 6.0);
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
@@ -2417,9 +2441,12 @@ impl CandidateWindowV2 {
                 // 72%），配 ball_mix=1 球叠加渐隐——首键视觉=「球冒出
                 // →长大成框」（愿景：开始打字=球变形成候选框）。
                 let (start, ball_entry) = if ball_on {
-                    let bw = self.ball_win_run.get() as i32;
+                    // 【R4】起点=球直径（球视觉本体，同展开）+真形变
+                    //（expanding：圆角插值=圆长大变方）。
+                    let bd = self.ball_d_run.get() as i32;
                     self.ball_mix.set(1.0);
-                    ((bw.min(target.0), bw.min(target.1)), true)
+                    self.ball_expanding.set(true);
+                    ((bd.min(target.0), bd.min(target.1)), true)
                 } else {
                     (
                         ((target.0 as f32 * 0.72) as i32, (target.1 as f32 * 0.72) as i32),
@@ -2551,15 +2578,17 @@ impl CandidateWindowV2 {
             let key_recent = self.ball_key_recent.get();
             if !cands.is_empty() && (sig_changed || key_recent) && !self.internal_rerender {
                 *self.ball_last_sig.borrow_mut() = ball_sig_now.clone();
-                let bw = self.ball_win_run.get() as i32;
+                // 【R4】形变起点=球直径（球视觉本体；球窗=球+柔影 pad，
+                // 壳从球窗起=首帧跳大 16px）。窗口随后缓动到布局位。
+                let bd = self.ball_d_run.get() as i32;
                 self.size_anim = Some((
-                    (bw, bw),
+                    (bd, bd),
                     (w_out as i32, h_out as i32),
                     std::time::Instant::now(),
                 ));
                 // 【v6·R2】形变=morph_ms（R3 定稿 0.5s）。
                 self.size_anim_ms.set(self.ball_morph_ms.get());
-                self.chrome_override.set(Some((bw, bw)));
+                self.chrome_override.set(Some((bd, bd)));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
                 // 展开=复活：退场渐隐状态一并清（渐隐中键入=球立即可见
@@ -3469,15 +3498,17 @@ impl CandidateWindowV2 {
                         (base * env * (1.0 - t)).clamp(0.0, 1.0)
                     };
                     if alpha > 0.02 {
-                        // 球心=当前壳中心（chrome_override 插值尺寸的
-                        // 中心；无壳时=窗口起点）。
+                        // 【R4·真形变】壳圆即球体——叠加只画高亮芯
+                        //（core_only：不重复画环/柔影）。
                         let (cw, ch) = self
                             .chrome_override
                             .get()
                             .unwrap_or((buf_w.max(1), buf_h.max(1)));
                         let scx = cw as f32 * 0.5 * dpi_scale;
                         let scy = ch as f32 * 0.5 * dpi_scale;
-                        self.draw_ball_into6(&ctx, scx, scy, alpha);
+                        let core_r = self.ball_d_run.get() * 0.2;
+                        let _ = core_r;
+                        self.draw_ball_into6(&ctx, scx, scy, alpha, true);
                     }
                 }
                 let _ = ctx.EndDraw(None, None);
@@ -4243,40 +4274,44 @@ impl CandidateWindowV2 {
 
     /// 【v6·S2】纯球绘制（不建链不 Present——供球帧/展开叠加共用）：
     /// 中心 (cx,cy)（画布像素坐标）、整体 alpha（展开交叉淡化用）。
+    /// 【R4】core_only：形变期间壳圆即球体（真形变），叠加只需画
+    /// 高亮芯（渐隐/渐现）——不重复画环和柔影。
     unsafe fn draw_ball_into6(
         &self,
         ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         cx: f32,
         cy: f32,
         alpha: f32,
+        core_only: bool,
     ) {
         if alpha <= 0.02 {
             return;
         }
         let d = self.ball_d_run.get();
         let r = d * 0.5;
-        // 软晕阴影（8 层方向性——底厚顶薄）。
-        if let Ok(shb) = ctx.CreateSolidColorBrush(
-            &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
-            None,
-        ) {
-            for i in 0..8i32 {
-                let ext = (i + 1) as f32 * 1.7;
-                let k = 1.0 - i as f32 / 8.0;
-                let _ = shb.SetOpacity(0.22 * k * k * alpha);
-                ctx.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F { x: cx + 1.5, y: cy + 2.5 },
-                        radiusX: r + ext,
-                        radiusY: r + ext,
-                    },
-                    &shb,
-                );
+        if !core_only {
+            // 软晕阴影（8 层方向性——底厚顶薄）。
+            if let Ok(shb) = ctx.CreateSolidColorBrush(
+                &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
+                None,
+            ) {
+                for i in 0..8i32 {
+                    let ext = (i + 1) as f32 * 1.7;
+                    let k = 1.0 - i as f32 / 8.0;
+                    let _ = shb.SetOpacity(0.22 * k * k * alpha);
+                    ctx.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: D2D_POINT_2F { x: cx + 1.5, y: cy + 2.5 },
+                            radiusX: r + ext,
+                            radiusY: r + ext,
+                        },
+                        &shb,
+                    );
+                }
             }
+            Self::fill_grad_ball6c(ctx, cx, cy, r, self.ball_ring.get(), alpha);
         }
-        // 渐变球体（左上高光=立体感）+ 高亮心。
-        Self::fill_grad_ball6c(ctx, cx, cy, r, self.ball_ring.get(), alpha);
-        Self::fill_grad_ball6c(ctx, cx, cy, 4.5, self.ball_core.get(), alpha);
+        Self::fill_grad_ball6c(ctx, cx, cy, r * 0.4, self.ball_core.get(), alpha);
     }
 
     /// 【v6·S1】球帧渲染：整窗=渐变立体球（环=皮肤底色、心=高亮点）
@@ -4359,7 +4394,7 @@ impl CandidateWindowV2 {
         let bd = self.ball_d_run.get();
         let pad = (bwin - bd) * 0.5;
         let bc = pad + bd * 0.5;
-        self.draw_ball_into6(&ctx, bc, bc, alpha);
+        self.draw_ball_into6(&ctx, bc, bc, alpha, false);
         let _ = ctx.EndDraw(None, None);
         if self.ulw {
             self.present_ulw(win, win);
@@ -4469,10 +4504,11 @@ impl CandidateWindowV2 {
         let cur_sz = self.live_size.get();
         let cur_pos = self.live_pos.get();
         // 尺寸+位置同帧起臂（1.5.9 机制——tick 驱动壳按缓动画）。
-        // 【v6·R2】形变 1s（用户定稿）+框滑向球位的位移同步 1s
-        //（形变=尺寸+位移一体）。
-        let bw = self.ball_win_run.get() as i32;
-        self.size_anim = Some((cur_sz, (bw, bw), std::time::Instant::now()));
+        // 【R4】形变终点=球直径（球视觉本体——末帧壳圆=球帧的球，
+        // 无跳变；球帧随后钉窗=球窗 48=球+柔影 pad，透明区扩展
+        // 不可见）。
+        let bd_px = self.ball_d_run.get() as i32;
+        self.size_anim = Some((cur_sz, (bd_px, bd_px), std::time::Instant::now()));
         self.size_anim_ms.set(self.ball_morph_ms.get());
         self.chrome_override.set(Some(cur_sz));
         let dur = self.ball_morph_ms.get();
