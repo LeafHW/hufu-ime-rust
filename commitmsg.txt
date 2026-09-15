@@ -1,21 +1,10 @@
-Shift上屏立即收窗+编码不消失不变量（四路守卫+恢复通道）
+预热排除打包宿主：开始菜单候选窗「跑右上角」修复
 
-1.【Shift 上屏立即收窗】用户拍板：切英文上屏编码时候选窗立马消失，
-   不要动效。fire 分支带 commit 置 shift_now_hide，update_ui 空帧
-   分支消费走 hide_now（真隐藏：清 hold 清 scale_out KillTimer，
-   PostMessage 异步 SW_HIDE）——不走 hide（1s hold+退场缩放）。
-2.【有编码不准消失】用户实锤「动效触发一两次后，打一个编码不上屏
-   不继续打，候选还是会消失」。根因=输入法切换抖动（TIP Deactivate
-   /焦点链）hide_now 藏窗后无人恢复（poll 见签名没变不重画）；叠加
-   键入中断与停留钟/退场动画的三处竞态。四路修复：
-   a. hold_fire：fire 时 raw_last 非空→作废退场直接返回；
-   b. fade 退场完成帧：last_show raw 非空→中止隐藏恢复显示；
-   c. poll_collapse_stale：raw_last 非空→不收窗；
-   d. poll 恢复通道：raw 非空而窗口在但不可见→强制 update_ui 重显
-     （内部 suppress/delay/host 门全照走，不破坏故意不显示的语义；
-      焦点真离开时 show 的 host 门自拦）。
-   「候选窗显示的永远是当前编码状态」成为不变量。
-3. codehold 实测（06:45 部署版）：2 次上屏退场后打 k 停手 6s+
-   窗口稳定显示不消失；退场中止路径 live_size 保持 72% 插值，
-   下帧平滑恢复 100%。
-4. 32 位同批（x86 DLL 同源构建，四点部署 hash 核对一致）。
+v1.6.0 实机回归：SearchHost（开始菜单）里 poll 闲拍预热建了普通 DComp
+候选窗，OWNED 分支见 cand2=Some 直接复用——沙盒进程里 D3D/锚点异常，
+候选窗落在屏幕右上角（1.5.9 无预热时 OWNED 分支首需 new_owned，位置
+正常）。修复：预热条件加 !host_is_packaged()——打包宿主保持 1.5.9
+行为，普通桌面宿主预热照旧（首键 17ms 提速保留）。
+
+随行：码表\虎码单字 恢复 1.5.9 原样（tiger.dict.yaml 主码表——真机
+镜像时误带了虎码单简码表）。
