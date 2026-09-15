@@ -1,22 +1,21 @@
-六项批次：焦点首键预热/设置窗居中/Shift上屏编码/CUAS下划线
+Shift上屏立即收窗+编码不消失不变量（四路守卫+恢复通道）
 
-1. 【首键延迟·预热】焦点切换后首键候选慢的实测分解（diag 戳）：
-   引擎全链 1ms、热显示 2ms、首键 110ms——大头=候选窗冷创建（DComp
-   设备+DWrite 字体集首次加载）。poll_tick 闲拍预热（TSF 同线程，
-   线程亲和对；隐藏态建窗不显示）：首键 110ms→17ms（-85%）。lat
-   诊断戳限每进程前 6 段防刷屏。
-2. 【设置窗居中】Ctrl+Alt+H 设置窗（Edge app 900x800）默认左上角
-   →GetSystemMetrics 屏幕尺寸计算 --window-position 居中。
-3. 【Shift 上屏编码】有编码时单击 Shift=编码字母直接上屏+切英文
-   （原：切英文但编码悬挂）。engine process_key Shift 分支 commit
-   raw；DLL TestUp fire 分支响应接 update_ui 通道（Op::Commit 组段
-   上屏同款链）。单测 shift_with_composition_commits_raw_and_
-   switches 过（dk→Shift→commit"dk"+chinese=false+idle+后续直通）。
-4. 【CUAS 组段下划线】64 位应用（QQ）自画编码下划线，32 位/UWP/
-   开始菜单（CUAS 渲染）无线——IME 未提供 display attribute。新增
-   displayattr.rs：ITfDisplayAttributeProvider 挂 TIP（ATTR_GUID，
-   TF_ATTR_INPUT 输入中语义）+注册表 DisplayAttribute 键（msctf
-   发现入口）+组段 SetText 后 SetValue(VT_I4 atom) 标记、上屏/断段
-   前 Clear 防残留。32 位 DLL 同批部署（同一源）。
-5. 回归：selhold（151x103/hold≈1s/选2 上屏）+dspace2（hold re-arm
-   语义保持）+engine shift 单测全过。
+1.【Shift 上屏立即收窗】用户拍板：切英文上屏编码时候选窗立马消失，
+   不要动效。fire 分支带 commit 置 shift_now_hide，update_ui 空帧
+   分支消费走 hide_now（真隐藏：清 hold 清 scale_out KillTimer，
+   PostMessage 异步 SW_HIDE）——不走 hide（1s hold+退场缩放）。
+2.【有编码不准消失】用户实锤「动效触发一两次后，打一个编码不上屏
+   不继续打，候选还是会消失」。根因=输入法切换抖动（TIP Deactivate
+   /焦点链）hide_now 藏窗后无人恢复（poll 见签名没变不重画）；叠加
+   键入中断与停留钟/退场动画的三处竞态。四路修复：
+   a. hold_fire：fire 时 raw_last 非空→作废退场直接返回；
+   b. fade 退场完成帧：last_show raw 非空→中止隐藏恢复显示；
+   c. poll_collapse_stale：raw_last 非空→不收窗；
+   d. poll 恢复通道：raw 非空而窗口在但不可见→强制 update_ui 重显
+     （内部 suppress/delay/host 门全照走，不破坏故意不显示的语义；
+      焦点真离开时 show 的 host 门自拦）。
+   「候选窗显示的永远是当前编码状态」成为不变量。
+3. codehold 实测（06:45 部署版）：2 次上屏退场后打 k 停手 6s+
+   窗口稳定显示不消失；退场中止路径 live_size 保持 72% 插值，
+   下帧平滑恢复 100%。
+4. 32 位同批（x86 DLL 同源构建，四点部署 hash 核对一致）。
