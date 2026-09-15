@@ -684,6 +684,8 @@ pub struct CandidateWindowV2 {
     /// 【v6·S2】展开混合：球叠加 alpha（起臂=1，随 size_anim 进度衰减
     /// 到 0——球渐隐+壳长大的交叉淡化=「同一个东西长大展开」）。
     pub(crate) ball_mix: std::cell::Cell<f32>,
+    /// 【v6·S3】退场渐隐起点（Some=渐隐中；150ms 线性到 0 后 SW_HIDE）。
+    pub(crate) ball_exit_t0: std::cell::Cell<Option<std::time::Instant>>,
     /// 【顶屏钳位许可 2026-09-12 二十四次修正】仅 C&R（顶屏上屏）路径
     /// 置 true——「字宽<编码宽」的显示回退由正向钳位钉住原地等光标。
     /// 点击换位（SP 路径）不置=永不钳（用户实锤 75px 换位被幅度法误
@@ -1045,6 +1047,7 @@ impl CandidateWindowV2 {
                 ball_idle_t0: std::cell::Cell::new(None),
                 ball_closing: std::cell::Cell::new(false),
                 ball_mix: std::cell::Cell::new(0.0),
+                ball_exit_t0: std::cell::Cell::new(None),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -1220,6 +1223,7 @@ impl CandidateWindowV2 {
                 ball_idle_t0: std::cell::Cell::new(None),
                 ball_closing: std::cell::Cell::new(false),
                 ball_mix: std::cell::Cell::new(0.0),
+                ball_exit_t0: std::cell::Cell::new(None),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -2378,6 +2382,9 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(Some((BALL_WIN, BALL_WIN)));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
+                // 展开=复活：退场渐隐状态一并清（渐隐中键入=球立即可见
+                // 地长大成框，不从半透明起跳）。
+                self.ball_exit_t0.set(None);
                 // 【关键】收球标志必须同时退役——否则 size_anim 完成钩子
                 // 把展开完成误判为收球完成 → 球态回归吞掉展开后的框帧。
                 self.ball_closing.set(false);
@@ -2388,7 +2395,7 @@ impl CandidateWindowV2 {
                 // 布局位（球位→框位=展开的位移分量）。
             } else {
                 unsafe {
-                    self.render_ball6(dpi_scale);
+                    self.render_ball6(dpi_scale, self.ball_exit_alpha());
                 }
                 return;
             }
@@ -4006,6 +4013,16 @@ impl CandidateWindowV2 {
         }
     }
 
+    /// 【v6·S3】退场渐隐 alpha（150ms 线性；未起臂=1）。
+    pub(crate) fn ball_exit_alpha(&self) -> f32 {
+        match self.ball_exit_t0.get() {
+            None => 1.0,
+            Some(t0) => {
+                (1.0 - t0.elapsed().as_millis() as f32 / 150.0).clamp(0.0, 1.0)
+            }
+        }
+    }
+
     /// 窗口当前是否可见（poll 前台兜底用：只在可见时记日志/收尾）
     pub fn is_visible(&self) -> bool {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
@@ -4052,11 +4069,25 @@ impl CandidateWindowV2 {
 
     /// 【v6·S1】球帧渲染：整窗=渐变立体球（环=皮肤底色、心=高亮点）
     /// + 多层软晕阴影（v5 归档校准画法移植）。DPI 缩放同主渲染
-    /// （窗口物理尺寸、逻辑坐标绘制）。
-    unsafe fn render_ball6(&mut self, dpi_scale: f32) {
+    /// （窗口物理尺寸、逻辑坐标绘制）。alpha=整体透明度（S3 退场渐隐）。
+    unsafe fn render_ball6(&mut self, dpi_scale: f32, alpha: f32) {
         let win = ((BALL_WIN as f32 * dpi_scale) as i32).max(24);
         if !self.ensure_swapchain(win as u32, win as u32) {
             return;
+        }
+        // 【v6·S3·尺寸钉死】球帧窗口尺寸恒=球窗（收球缓动末帧的
+        // SWP 时机受 tick/show 路径影响可能有残差——每球帧钉一次，
+        // 位置不动）。
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                win,
+                win,
+                SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
         }
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
@@ -4114,7 +4145,7 @@ impl CandidateWindowV2 {
         ctx.Clear(None);
         let pad = (BALL_WIN - BALL_D6) as f32 * 0.5;
         let bc = pad + BALL_D6 as f32 * 0.5;
-        self.draw_ball_into6(&ctx, bc, bc, 1.0);
+        self.draw_ball_into6(&ctx, bc, bc, alpha);
         let _ = ctx.EndDraw(None, None);
         if self.ulw {
             self.present_ulw(win, win);
@@ -4511,11 +4542,26 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         if c.ball_form.get() {
             if let Some(t0) = c.ball_idle_t0.get() {
                 if t0.elapsed().as_millis() as u32 >= BALL_IDLE6_MS {
-                    c.ball_form.set(false);
-                    c.ball_idle_t0.set(None);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    c.last_hide_at = Some(std::time::Instant::now());
-                    crate::tsf::diag_note("v6球S1: 驻留4s到→退场");
+                    // 【v6·S3】退场渐隐（150ms）替代硬 SW_HIDE：
+                    // 起臂 exit_t0 → 每 tick 画渐隐球 → 归零后 SW_HIDE。
+                    if c.ball_exit_t0.get().is_none() {
+                        c.ball_exit_t0.set(Some(std::time::Instant::now()));
+                        crate::tsf::diag_note("v6球S3: 退场渐隐起臂(150ms)");
+                        anim_done = false;
+                    } else if c.ball_exit_alpha() <= 0.0 {
+                        c.ball_form.set(false);
+                        c.ball_idle_t0.set(None);
+                        c.ball_exit_t0.set(None);
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        c.last_hide_at = Some(std::time::Instant::now());
+                        crate::tsf::diag_note("v6球S3: 渐隐完→退场");
+                    } else {
+                        anim_done = false;
+                        // 渐隐逐帧画（150ms 短窗，无节流必要）。
+                        c.internal_rerender = true;
+                        let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                        c.internal_rerender = false;
+                    }
                 } else {
                     anim_done = false;
                     // 【v6·S2·驻留期节流重绘】球帧只在完成帧画过一次——
