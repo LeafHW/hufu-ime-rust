@@ -149,10 +149,10 @@ pub fn dispatch(
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
             let anim = host.engine.config.appearance.anim;
             let anim_speed = host.engine.config.appearance.anim_speed;
-            // 【入场动效按方案 2026-09-11】用户拍板：只有整句方案才有
-            // 入场长大动效（长编码场景反馈有价值）；单字/字词等方案首显
-            // 直接全尺寸。方案名含「整句」即认定；DLL 缺省 true 兼容。
-            let entrance_anim = host.engine.config.schema.current.contains("整句");
+            // 【R15·全方案入场 2026-10】用户拍板：单字方案也做入场
+            //（此前仅整句——「单字没有入场，只有整句有」用户要求统一）。
+            // 方案不再区分，恒 true；DLL 读到即入场长大。
+            let entrance_anim = true;
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => {
                     let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));

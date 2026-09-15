@@ -727,6 +727,10 @@ pub struct CandidateWindowV2 {
     /// 停留到点=渐隐退场（fade 三次曲线≈120ms）→SW_HIDE。
     pub(crate) raw_active: std::cell::Cell<bool>,
     pub(crate) commit_hold: std::cell::Cell<Option<std::time::Instant>>,
+    /// 【R15·退场】缩放退场进行中（100%→72% 盒心锚定=入场镜像，
+    /// size_anim 完成→真隐藏；真实内容帧 show 即打断并从当前插值
+    /// 尺寸重新长出来）。
+    pub(crate) scale_out: std::cell::Cell<bool>,
     /// 【v6·R2】形变时长 ms（框↔球/首键球入场；皮肤
     /// motion.morph_ms 可调）。
     pub(crate) ball_morph_ms: std::cell::Cell<u32>,
@@ -1109,6 +1113,7 @@ impl CandidateWindowV2 {
                 ball_pin: std::cell::Cell::new((0, 0)),
                 raw_active: std::cell::Cell::new(false),
                 commit_hold: std::cell::Cell::new(None),
+                scale_out: std::cell::Cell::new(false),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1299,6 +1304,7 @@ impl CandidateWindowV2 {
                 ball_pin: std::cell::Cell::new((0, 0)),
                 raw_active: std::cell::Cell::new(false),
                 commit_hold: std::cell::Cell::new(None),
+                scale_out: std::cell::Cell::new(false),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1633,6 +1639,19 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【R15·键入打断】真实内容帧（非动画复渲染）：退场即刻作废
+        //（此帧走下方 was_visible 尺寸续接=从当前插值尺寸重新长出来）；
+        // 编码非空=真实键入，停留钟一并作废（「可被新键入打断」）。
+        // 退场中到达的预测/联想刷新（raw 空但内容变）同样打断退场。
+        if !self.internal_rerender {
+            self.scale_out.set(false);
+            if !raw.is_empty() {
+                self.commit_hold.set(None);
+                unsafe {
+                    let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+                }
+            }
+        }
         // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
         // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
         // 或别的 SetWindowPos 直调）。
@@ -1697,9 +1716,12 @@ impl CandidateWindowV2 {
         // ——杀 timer+清 armed）；②球色热取（环=皮肤底色、心=高亮
         /// 底色——show 每帧刷，换肤即时生效）。
         // 【v6·S4】开关=env || 皮肤 motion.ball；参数缓存每帧刷。
-        let ball_on = ball_gate() || skin_ball_on(skin);
+        // 【R15·球全灭】ball_on 恒 false——用户拍板删球：皮肤
+        // motion.ball=true 也不再激活（此前 gate 关了但皮肤键仍让
+        // show 走球入场分支=首键从球尺寸长大的残留行为）。
+        let ball_on = false;
         self.ball_enabled.set(ball_on);
-        BALL_ON_RUNTIME.store(skin_ball_on(skin), std::sync::atomic::Ordering::Relaxed);
+        BALL_ON_RUNTIME.store(false, std::sync::atomic::Ordering::Relaxed);
         if ball_on {
             self.ball_d_run
                 .set(motion_f(skin, "ball_size", BALL_D6 as f32).clamp(6.0, 64.0));
@@ -2599,7 +2621,10 @@ impl CandidateWindowV2 {
         // 盒]：高亮贴左/贴顶（横紧首候选、竖排首行）→ 盒贴对应边缘
         // 就地生长（左/上无内容不空跳）；高亮居中 → 对称展开。damp 随
         // 进度归零，完成帧=整窗。普通尺寸动效/稳态 bx=by=0。
-        let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
+        // 【R15】scale_out 同款（退场=入场镜像：盒向高亮胶囊收拢）。
+        let (bx, by) = if (self.scale_in.get() || self.scale_out.get())
+            && self.size_anim.is_some()
+        {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
                 Some((_, _, t0)) => {
@@ -2608,7 +2633,12 @@ impl CandidateWindowV2 {
                 }
                 None => 1.0,
             };
-            let damp = 1.0 - k;
+            let damp = if self.scale_out.get() {
+                // 退场镜像：整窗→向高亮胶囊收拢（入场反向）
+                k
+            } else {
+                1.0 - k
+            };
             (
                 (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
                 (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
@@ -4707,11 +4737,13 @@ impl CandidateWindowV2 {
     }
 
     pub fn hide(&mut self) {
-        // 【R14】停留钟作废（隐藏=停留无意义）。
+        // 【R14】停留钟作废（隐藏=停留无意义）；【R15】退场作废（外
+        // 部隐藏请求=立即收，不再缩完）。
         if self.commit_hold.get().is_some() {
             crate::tsf::diag_note("R14: hold在身被hide——谁杀的（看前置日志）");
         }
         self.commit_hold.set(None);
+        self.scale_out.set(false);
         unsafe {
             let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
         }
@@ -4771,8 +4803,12 @@ pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
 /// 动画 ~150-200fps，高刷观感对齐；60Hz 无感不退化。动画窗外
 /// timer 自动 Kill，常驻开销为零。
 pub const FADE_TICK_MS: u32 = 5;
-/// 【R14·上屏停留钟】上屏后 1s 停留→到点渐隐退场。
-pub const HOLD_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
+/// 【R14·上屏停留钟】上屏后 1s 停留→到点缩放退场。
+/// 【R15·撞号修复】原 0x4846_5552 与 BALL_DELAY6_ID 撞号：hold 到点
+/// 被 wndproc 先命中的收球分支吃掉→走球链（观察窗 fire→收球→球
+/// 驻留 48×48 挂屏）——diag「观察窗timer fire 紧跟 hold起臂」实锤。
+/// 改 0x4846_5553（'HuFc'，5550/5551/5552 已被 FADE/EXPAND/BALL 占用）。
+pub const HOLD_TIMER_ID: usize = 0x4846_5553; // 'HuFc'
 /// [v6-S1] ball diameter px (logical).
 pub const BALL_D6: i32 = 22;
 /// [v6-S1] ball window side (diameter + soft-shadow margin; DPI-scaled at render).
@@ -4872,9 +4908,10 @@ unsafe fn ball_delay_fire_shared(hwnd: HWND) {
     let _ = hwnd;
 }
 
-/// 【R14·上屏停留到点】渐隐退场起臂：可见=fade=(false) + FADE_TIMER
-/// 5ms（复渲染带 fade_alpha 三次曲线→完成 SW_HIDE——全走现有
-/// fade_tick_shared 机制）；不可见/实例缺=清态。
+/// 【R14·上屏停留到点】→【R15·缩放退场】与入场对称：当前尺寸→72%
+/// （盒心锚定，size_anim 复用 FADE_TIMER 每帧插值重绘），完成帧真
+/// 隐藏。退场中真实内容帧 show=打断并从当前插值尺寸重新长出来
+///（用户拍板「可被新键入打断，在打断处重新长出来」）。
 unsafe fn hold_fire_shared(hwnd: HWND) {
     let shared = match crate::tsf::G_SHARED.get() {
         Some(s) => s.0.clone(),
@@ -4885,10 +4922,31 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
     if let Some(c) = cand2.as_mut() {
         c.commit_hold.set(None);
         if c.is_visible() {
-            c.fade = Some((false, std::time::Instant::now()));
-            let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(c.hwnd, &mut rc);
+            let cur = (rc.right - rc.left, rc.bottom - rc.top);
+            let tgt = (
+                (cur.0 as f32 * 0.72) as i32,
+                (cur.1 as f32 * 0.72) as i32,
+            );
+            if tgt.0 > 4 && tgt.1 > 4 && c.size_ms > 0 {
+                c.fade = None;
+                c.scale_out.set(true);
+                c.size_anim = Some((cur, tgt, std::time::Instant::now()));
+                c.size_anim_ms.set(c.size_ms);
+                c.chrome_override.set(Some(cur));
+                let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                crate::tsf::diag_note(&format!(
+                    "R15: 退场起臂(缩放) {cur:?}→{tgt:?}"
+                ));
+            } else {
+                // 极小窗/动效关：直接隐藏
+                c.scale_out.set(false);
+                c.hide();
+            }
         } else {
             c.fade = None;
+            c.scale_out.set(false);
         }
     }
     g.cand2 = cand2;
@@ -5109,6 +5167,20 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.size_anim = None;
                 c.chrome_override.set(None);
                 c.scale_in.set(false);
+                // 【R15·退场完成】缩到 72% 即真隐藏（跳过完成帧重绘）。
+                if c.scale_out.get() {
+                    c.scale_out.set(false);
+                    shown_this_tick = true;
+                    unsafe {
+                        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                        let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                        let _ = ShowWindow(c.hwnd, SW_HIDE);
+                    }
+                    c.last_hide_at = Some(std::time::Instant::now());
+                    c.pos_anim = None;
+                    c.live_size.set((0, 0));
+                    crate::tsf::diag_note("R15: 退场完成→隐藏");
+                }
                 // 【v6·R3】形变完成收尾：expanding 退役+球叠加强度清零。
                 if c.ball_expanding.get() {
                     c.ball_expanding.set(false);
