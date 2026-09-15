@@ -681,6 +681,9 @@ pub struct CandidateWindowV2 {
     pub(crate) ball_idle_t0: std::cell::Cell<Option<std::time::Instant>>,
     /// 收球动画进行中（size_anim 完成=进球态）。
     pub(crate) ball_closing: std::cell::Cell<bool>,
+    /// 【v6·S2】展开混合：球叠加 alpha（起臂=1，随 size_anim 进度衰减
+    /// 到 0——球渐隐+壳长大的交叉淡化=「同一个东西长大展开」）。
+    pub(crate) ball_mix: std::cell::Cell<f32>,
     /// 【顶屏钳位许可 2026-09-12 二十四次修正】仅 C&R（顶屏上屏）路径
     /// 置 true——「字宽<编码宽」的显示回退由正向钳位钉住原地等光标。
     /// 点击换位（SP 路径）不置=永不钳（用户实锤 75px 换位被幅度法误
@@ -1041,6 +1044,7 @@ impl CandidateWindowV2 {
                 ball_pending: std::cell::Cell::new((0, 0)),
                 ball_idle_t0: std::cell::Cell::new(None),
                 ball_closing: std::cell::Cell::new(false),
+                ball_mix: std::cell::Cell::new(0.0),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -1215,6 +1219,7 @@ impl CandidateWindowV2 {
                 ball_pending: std::cell::Cell::new((0, 0)),
                 ball_idle_t0: std::cell::Cell::new(None),
                 ball_closing: std::cell::Cell::new(false),
+                ball_mix: std::cell::Cell::new(0.0),
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
             anim_spd: std::cell::Cell::new(1.0),
@@ -2359,7 +2364,10 @@ impl CandidateWindowV2 {
         //   S2 将补球帧混合插值），ball_form 退役走正常渲染；
         // - internal_rerender（动画 tick 复渲染）且仍球态=纯球帧。
         if self.ball_form.get() {
-            let has_content = !cands.is_empty();
+            // 【展开=真实键入】raw 非空（有编码）才算——联想刷新的
+            // cands 非空但 raw=""（S1 实测），补显/poll 都会喂联想帧，
+            // 它们不该把球展回框（否则球↔框振荡）。
+            let has_content = !cands.is_empty() && !raw.is_empty();
             if has_content && !self.internal_rerender {
                 let cur_sz = self.live_size.get();
                 self.size_anim = Some((
@@ -2370,6 +2378,11 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(Some((BALL_WIN, BALL_WIN)));
                 self.ball_form.set(false);
                 self.ball_idle_t0.set(None);
+                // 【关键】收球标志必须同时退役——否则 size_anim 完成钩子
+                // 把展开完成误判为收球完成 → 球态回归吞掉展开后的框帧。
+                self.ball_closing.set(false);
+                // 【v6·S2】球叠加起臂（1→0 随展开进度——交叉淡化）。
+                self.ball_mix.set(1.0);
                 crate::tsf::diag_note("v6球S1: 展开起臂(球→框)");
                 // 落到正常渲染（小壳首帧）；定位段 pos_anim 起臂滑向
                 // 布局位（球位→框位=展开的位移分量）。
@@ -3236,6 +3249,30 @@ impl CandidateWindowV2 {
                 if fade_layer_on {
                     ctx.PopLayer();
                 }
+                // 【v6·S2·展开交叉淡化】展开期间（ball_mix>0）：球叠加
+                // 画在原球屏位（窗口内偏移=ball_pos-live_pos），alpha 随
+                // size_anim 进度 1→0——球渐隐+壳长大同帧共存=「同一个
+                // 东西长大展开」（不是球消失+框出现）。必须画在 EndDraw
+                // 之前（EndDraw 后再 Draw 会让 ctx 进粘性错误态，之后
+                // 所有帧静默失败=画面空白）。
+                if self.ball_mix.get() > 0.02 {
+                    let t = match self.size_anim {
+                        Some((_, _, t0)) => {
+                            (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32)
+                                .clamp(0.0, 1.0)
+                        }
+                        None => 1.0,
+                    };
+                    let alpha = (1.0 - t).clamp(0.0, 1.0);
+                    if alpha > 0.02 {
+                        let (lx, ly) = self.live_pos.get();
+                        let (bxp, byp) = self.ball_pos.get();
+                        let scx = (bxp as f32 + BALL_WIN as f32 * 0.5 - lx as f32) * dpi_scale;
+                        let scy = (byp as f32 + BALL_WIN as f32 * 0.5 - ly as f32) * dpi_scale;
+                        self.draw_ball_into6(&ctx, scx, scy, alpha);
+                    }
+                    self.ball_mix.set(alpha);
+                }
                 let _ = ctx.EndDraw(None, None);
                 ctx.SetTarget(None);
 
@@ -3732,12 +3769,23 @@ impl CandidateWindowV2 {
                 // 口边缘直角切断（面板/边框/阴影一起切=「变窄出直角」
                 // 的根源；变低同）。按轴取 max(eased,target)：增轴=target
                 // （零位移），减轴=eased（窗缘恒=壳缘）。命中盒按目标。
-                let apply = match self.size_anim {
-                    Some((f, t, t0)) => {
-                        let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
-                        (e.0.max(w_out as i32), e.1.max(h_out as i32))
+                // 【v6·S2·收球缩窗修复】球收球帧的目标 w_out=联想框
+                // 尺寸（last_show 布局）≠动画终点（球 48）——max 恒被
+                // w_out 顶住=窗口永不缩（S1 球画在大窗左上角的原因）。
+                // 收球期 chrome_override（tick 逐帧缓动）才是 SWP 权威。
+                let apply = if self.ball_closing.get() {
+                    match self.chrome_override.get() {
+                        Some((cw, ch)) => (cw.max(1), ch.max(1)),
+                        None => (w_out as i32, h_out as i32),
                     }
-                    None => (w_out as i32, h_out as i32),
+                } else {
+                    match self.size_anim {
+                        Some((f, t, t0)) => {
+                            let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                            (e.0.max(w_out as i32), e.1.max(h_out as i32))
+                        }
+                        None => (w_out as i32, h_out as i32),
+                    }
                 };
                 // 【位置滑动·双向 2026-09-12 十六次修正】poll 真实帧把
                 // est 超前拉回（按键即时 est +11/键，110ms 后 poll 真实
@@ -3964,6 +4012,44 @@ impl CandidateWindowV2 {
     }
 
 
+    /// 【v6·S2】纯球绘制（不建链不 Present——供球帧/展开叠加共用）：
+    /// 中心 (cx,cy)（画布像素坐标）、整体 alpha（展开交叉淡化用）。
+    unsafe fn draw_ball_into6(
+        &self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        cx: f32,
+        cy: f32,
+        alpha: f32,
+    ) {
+        if alpha <= 0.02 {
+            return;
+        }
+        let d = BALL_D6 as f32;
+        let r = d * 0.5;
+        // 软晕阴影（8 层方向性——底厚顶薄）。
+        if let Ok(shb) = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
+            None,
+        ) {
+            for i in 0..8i32 {
+                let ext = (i + 1) as f32 * 1.7;
+                let k = 1.0 - i as f32 / 8.0;
+                let _ = shb.SetOpacity(0.22 * k * k * alpha);
+                ctx.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: cx + 1.5, y: cy + 2.5 },
+                        radiusX: r + ext,
+                        radiusY: r + ext,
+                    },
+                    &shb,
+                );
+            }
+        }
+        // 渐变球体（左上高光=立体感）+ 高亮心。
+        Self::fill_grad_ball6c(ctx, cx, cy, r, self.ball_ring.get(), alpha);
+        Self::fill_grad_ball6c(ctx, cx, cy, 4.5, self.ball_core.get(), alpha);
+    }
+
     /// 【v6·S1】球帧渲染：整窗=渐变立体球（环=皮肤底色、心=高亮点）
     /// + 多层软晕阴影（v5 归档校准画法移植）。DPI 缩放同主渲染
     /// （窗口物理尺寸、逻辑坐标绘制）。
@@ -3985,6 +4071,10 @@ impl CandidateWindowV2 {
                 None => return,
             }
         } else {
+            // 【根修】swapchain buffer 是 D3D 资源，QI ID2D1Image 必失败
+            // （S1 起球帧一直静默 return——此前看到的「球」其实是收球
+            // 缩小的壳）。主渲染同款路径：surface → CreateBitmapFromDxgi
+            // Surface → 作为 bitmap target。
             let chain = match &self.swapchain {
                 Some(c) => c.clone(),
                 None => return,
@@ -3993,8 +4083,22 @@ impl CandidateWindowV2 {
                 Ok(c3) => c3.GetCurrentBackBufferIndex(),
                 Err(_) => 0,
             };
-            match chain.GetBuffer::<IDXGISurface>(bb) {
-                Ok(s) => match s.cast::<ID2D1Image>() {
+            let surface = match chain.GetBuffer::<IDXGISurface>(bb) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let bp = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
+                Ok(b) => match b.cast::<ID2D1Image>() {
                     Ok(i) => i,
                     Err(_) => return,
                 },
@@ -4002,74 +4106,35 @@ impl CandidateWindowV2 {
             }
         };
         ctx.SetTarget(Some(&target));
-        let _ = ctx.BeginDraw();
+        ctx.BeginDraw();
         ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
             M11: dpi_scale, M22: dpi_scale,
             M12: 0.0, M21: 0.0, M31: 0.0, M32: 0.0,
         });
         ctx.Clear(None);
-        let d = BALL_D6 as f32;
         let pad = (BALL_WIN - BALL_D6) as f32 * 0.5;
-        let bc = pad + d * 0.5;
-        crate::tsf::diag_note(&format!(
-            "v6球S1: render_ball 起笔 bc={bc} ulw={} ctx={}",
-            self.ulw,
-            self.ctx.is_some()
-        ));
-        // 软晕阴影（8 层方向性——底厚顶薄）。
-        let shb: ID2D1SolidColorBrush = match ctx.CreateSolidColorBrush(
-            &D2D1_COLOR_F {
-                a: 1.0, r: 0.0, g: 0.0, b: 0.0,
-            },
-            None,
-        ) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        for i in 0..8i32 {
-            let ext = (i + 1) as f32 * 1.7;
-            let k = 1.0 - i as f32 / 8.0;
-            let _ = shb.SetOpacity(0.22 * k * k);
-            ctx.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: bc + 1.5, y: bc + 2.5 },
-                    radiusX: d * 0.5 + ext,
-                    radiusY: d * 0.5 + ext,
-                },
-                &shb,
-            );
-        }
-        // 渐变球体（左上高光=立体感）。
-        self.fill_grad_ball6(&ctx, bc, bc, d * 0.5, self.ball_ring.get());
-        self.fill_grad_ball6(&ctx, bc, bc, 4.5, self.ball_core.get());
-        let hr = ctx.EndDraw(None, None);
-        crate::tsf::diag_note(&format!(
-            "v6球S1: render_ball EndDraw err={}",
-            hr.is_err()
-        ));
+        let bc = pad + BALL_D6 as f32 * 0.5;
+        self.draw_ball_into6(&ctx, bc, bc, 1.0);
+        let _ = ctx.EndDraw(None, None);
         if self.ulw {
             self.present_ulw(win, win);
         } else if let Some(chain) = &self.swapchain {
-            let phr = chain.Present(1, DXGI_PRESENT(0));
-            crate::tsf::diag_note(&format!(
-                "v6球S1: render_ball Present err={}",
-                phr.is_err()
-            ));
+            let _ = chain.Present(1, DXGI_PRESENT(0));
         }
     }
 
-    /// 渐变圆（中心色→边缘亮/暗渐变；v5 归档画法简化版）。
-    unsafe fn fill_grad_ball6(
-        &self,
+    /// 渐变圆（中心色→边缘亮/暗渐变；v5 归档画法简化版·S2 加 alpha）。
+    unsafe fn fill_grad_ball6c(
         ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         cx: f32,
         cy: f32,
         r: f32,
         argb: u32,
+        alpha: f32,
     ) {
         use windows::Win32::Graphics::Direct2D as D2;
         let (a, r8, g8, b8) = (
-            ((argb >> 24) & 0xFF) as f32 / 255.0,
+            ((argb >> 24) & 0xFF) as f32 / 255.0 * alpha,
             ((argb >> 16) & 0xFF) as f32 / 255.0,
             ((argb >> 8) & 0xFF) as f32 / 255.0,
             (argb & 0xFF) as f32 / 255.0,
@@ -4453,6 +4518,14 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     crate::tsf::diag_note("v6球S1: 驻留4s到→退场");
                 } else {
                     anim_done = false;
+                    // 【v6·S2·驻留期节流重绘】球帧只在完成帧画过一次——
+                    // 任何路径清掉 buffer（异常帧/系统回收）球就无声消
+                    // 失。每 ~200ms 复渲染一帧球（小窗开销可忽略）兜底。
+                    if t0.elapsed().as_millis() % 200 < FADE_TICK_MS as u128 {
+                        c.internal_rerender = true;
+                        let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                        c.internal_rerender = false;
+                    }
                 }
             }
         }

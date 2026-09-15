@@ -1,26 +1,38 @@
-动效v6·S1：球形态落地（窗内形变·1.5.9 机制零改动）
+动效v6·S2：展开一体感+球帧根修（三个静默失败链）
 
-架构（v6 方案定稿：同一窗口的尺寸/位置/内容渐变——零第二窗口/零独立线程/零包围盒）：
-- 球态：整窗=渐变立体球（环=皮肤底色、心=高亮底色）+8 层软晕方向阴影；DPI 同主渲染
-- 收球：上屏/停手/断段→观察窗 500ms（期内真实键入=框跟随打断）→size_anim+pos_anim
-  框→球（复用 1.5.9 尺寸动画+平移引擎，tick 驱动壳按缓动尺寸收缩）→完成进 4s 驻留
-- 退场：驻留 4s（真实时钟）→SW_HIDE
-- 展开：球态新键入→size_anim 球→框尺寸（壳从球位长大的入场机制扩展；球帧混合=S2）
+根修一·球帧从未真渲染（S1 遗留）：
+render_ball6 原用 GetBuffer(IDXGISurface).cast::<ID2D1Image>()——swapchain
+buffer 是 D3D 资源，QI ID2D1Image 必失败→球帧自 S1 起全部静默 return。
+此前测试看到的「球」其实是收球动画缩小的壳（联想内容按 chrome_override
+缩画，48px 圆角近似球形）。根修=主渲染同款路径：
+surface → CreateBitmapFromDxgiSurface(TARGET|CANNOT_DRAW) → SetTarget。
+修复后 vision 实证：真球（皮肤底色渐变环+高亮芯+8 层右下柔影）。
 
-球化入口（三处，覆盖全收尾路径）：
-- Op::Commit 普通上屏（EditSession 内）
-- update_ui 空帧（cands 空+raw 空）
-- poll_collapse_stale（停手 2s/断段——联想框的正规收尾点）
+根修二·收球窗口永不缩小：
+show 的主 SWP 尺寸=max(缓动, w_out)（1.5.9「增轴一步到位」设计）——
+收球帧的 w_out=联想框布局尺寸（last_show），把缓动终点 48 顶住→窗口
+恒为框尺寸（球画在大窗左上）。收球期（ball_closing）改 chrome_override
+（tick 逐帧缓动）为 SWP 权威；正常路径零改动。
 
-竞态修复（迭代实证）：
-- poll 空帧 110ms 重复 arm→观察窗被无限重置：armed 门
-- 球态重复 arm→驻留钟无限重置：ball_form 门
-- WM_APP_HIDE_CAND/hide() 在球系统持有期吞掉（否则正规收窗在观察窗内藏窗=球失效）
-- 观察窗打断=真实新键入（cands 非空+非 internal_rerender——联想 show/补显不 break）
+根修三·展开帧后渲染全灭（ctx 粘性错误态）：
+S2 初版球叠加段画在主渲染 EndDraw 之后——EndDraw 后的 Draw 调用把
+D2D ctx 打入粘性错误态，之后所有帧 BeginDraw/Draw/EndDraw 静默失败=
+候选框从此空白。叠加段移至 PopLayer 后、EndDraw 前（同帧共存=球渐隐
++壳长大的交叉淡化，「同一个东西长大展开」）。
 
-验收（bdiag6）：
-- 收球链路：arm→fire→收球起臂→球态驻留→4s 退场 ✓
-- 球视觉：22px 深灰渐变球+柔影，caret 右下 ✓（vision 确认）
-- 关门回归：HUFU_BALL 未设=1.5.9 纯净（无 v6 行为）✓
+振荡根修（球↔框）：
+- 展开条件收紧：cands 非空 + raw 非空（真实键入）——联想刷新
+  （cands=2 raw=""）不再把驻留球展回框
+- tsf 渲染分支：球态驻留时联想刷新（600ms 无键）跳过 show
+- 展开起臂补清 ball_closing（完成钩子曾把展开误判为收球完成→球态回归）
 
-门控：HUFU_BALL=1（S4 皮肤化后退役）。
+驻留期节流重绘：球帧每 ~200ms 复渲染一帧兜底（防异常帧清掉 buffer）。
+
+验收：
+- 球渲染：vision 实证真球（渐变+柔影+高光芯）✓
+- 收球缩窗：rect 151×167→62×120 方向正确（尺寸微调留 S3）✓
+- 展开：e0 过渡（球+小壳 3173）→e1 完整框 4681 ✓（交叉淡化管线通）
+- 驻留稳定：无球↔框振荡；4s 退场 ✓
+- 关门回归：HUFU_BALL 未设=1.5.9 纯净（v6 行=0）✓
+
+门控：HUFU_BALL=1。

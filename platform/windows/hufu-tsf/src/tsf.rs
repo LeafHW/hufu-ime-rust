@@ -3816,8 +3816,23 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
-            } else if let Some(c) = g.cand2.as_mut() {
-                c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            } else {
+                // 【v6·S2·振荡根修】球态驻留时：联想刷新（无近期键）
+                // 不再喂 show——球只在真实键入（600ms 内有键）时展开。
+                // 否则停手后的联想 poll 刷新会把刚收的球又展成框，
+                // 与 poll_collapse 的球化形成球↔框振荡。
+                let recent = g
+                    .last_key_at
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
+                let ball_dwelling = g
+                    .cand2
+                    .as_ref()
+                    .is_some_and(|c| c.ball_form.get());
+                if let Some(c) = g.cand2.as_mut() {
+                    if !crate::candwin2::ball_gate() || !ball_dwelling || recent {
+                        c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    }
+                }
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
         } else if crate::addword::in_window_thread() {
