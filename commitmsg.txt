@@ -1,0 +1,22 @@
+六项批次：焦点首键预热/设置窗居中/Shift上屏编码/CUAS下划线
+
+1. 【首键延迟·预热】焦点切换后首键候选慢的实测分解（diag 戳）：
+   引擎全链 1ms、热显示 2ms、首键 110ms——大头=候选窗冷创建（DComp
+   设备+DWrite 字体集首次加载）。poll_tick 闲拍预热（TSF 同线程，
+   线程亲和对；隐藏态建窗不显示）：首键 110ms→17ms（-85%）。lat
+   诊断戳限每进程前 6 段防刷屏。
+2. 【设置窗居中】Ctrl+Alt+H 设置窗（Edge app 900x800）默认左上角
+   →GetSystemMetrics 屏幕尺寸计算 --window-position 居中。
+3. 【Shift 上屏编码】有编码时单击 Shift=编码字母直接上屏+切英文
+   （原：切英文但编码悬挂）。engine process_key Shift 分支 commit
+   raw；DLL TestUp fire 分支响应接 update_ui 通道（Op::Commit 组段
+   上屏同款链）。单测 shift_with_composition_commits_raw_and_
+   switches 过（dk→Shift→commit"dk"+chinese=false+idle+后续直通）。
+4. 【CUAS 组段下划线】64 位应用（QQ）自画编码下划线，32 位/UWP/
+   开始菜单（CUAS 渲染）无线——IME 未提供 display attribute。新增
+   displayattr.rs：ITfDisplayAttributeProvider 挂 TIP（ATTR_GUID，
+   TF_ATTR_INPUT 输入中语义）+注册表 DisplayAttribute 键（msctf
+   发现入口）+组段 SetText 后 SetValue(VT_I4 atom) 标记、上屏/断段
+   前 Clear 防残留。32 位 DLL 同批部署（同一源）。
+5. 回归：selhold（151x103/hold≈1s/选2 上屏）+dspace2（hold re-arm
+   语义保持）+engine shift 单测全过。

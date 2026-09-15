@@ -18,6 +18,10 @@ mod com;
 // 由本模块 stub 提供（转发 DllMainCRTStartup）。x86_64 不编入。
 #[cfg(all(target_arch = "x86", target_env = "gnu"))]
 mod dll_entry_x86;
+// 【组段下划线·CUAS 2026-09-14】TSF display attribute 提供方（32 位/
+// UWP/开始菜单的编码下划线）：ITfDisplayAttributeProvider 挂在 TIP +
+// 注册表 DisplayAttribute 键 + 组段 range 设/清属性。
+mod displayattr;
 mod ipc;
 // 语言栏品牌按钮（「虎」牌）+ 中/英模式 compartment 同步——Activate
 // 时安装（tsf.rs L312-321 实际调用链），非死代码。

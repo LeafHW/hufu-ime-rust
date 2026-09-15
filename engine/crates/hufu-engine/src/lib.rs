@@ -932,7 +932,10 @@ impl Engine {
             return KeyOutcome::passthrough();
         }
 
-        // Shift 单击切换中英（有编码时不处理）
+        // Shift 单击切换中英。有编码时：已打编码字母直接上屏并切英文
+        //（用户拍板 2026-09-14：切英文语境下编码不该丢——原行为组段
+        // 挂着且不切换，用户观感「按 Shift 没反应」）。commit 走原始
+        // raw（字母原样），引擎侧不动用户词。
         if matches!(key.key, KeyCode::ShiftLeft | KeyCode::ShiftRight)
             && self.config.general.shift_switch
         {
@@ -941,7 +944,11 @@ impl Engine {
                 session.pair.reset();
                 return KeyOutcome::consumed(self.state(session));
             }
-            return KeyOutcome::passthrough();
+            let raw = std::mem::take(&mut session.raw);
+            session.candidates.clear();
+            session.chinese = false;
+            session.pair.reset();
+            return KeyOutcome::commit(raw, self.state(session));
         }
 
         match key.key {
