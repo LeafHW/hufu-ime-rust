@@ -700,6 +700,9 @@ pub struct CandidateWindowV2 {
     /// 【v6·R3】展开中标志（球→框形变进行中：SWP 以 chrome_override
     /// 为权威=窗口双轴缓动而非增轴一步；位置滑动用 morph 时长同步）。
     pub(crate) ball_expanding: std::cell::Cell<bool>,
+    /// 【v6·R6】皮肤整窗透明度缓存（material.opacity——show 时刷新；
+    /// 球帧渲染乘它=球的透明设置跟随皮肤）。
+    pub(crate) ball_mat_opacity: std::cell::Cell<f32>,
     /// 【v6·R2】形变时长 ms（框↔球/首键球入场；皮肤
     /// motion.morph_ms 可调）。
     pub(crate) ball_morph_ms: std::cell::Cell<u32>,
@@ -1078,6 +1081,7 @@ impl CandidateWindowV2 {
                 ball_key_recent: std::cell::Cell::new(false),
                 ball_morph_ms: std::cell::Cell::new(500),
                 ball_expanding: std::cell::Cell::new(false),
+                ball_mat_opacity: std::cell::Cell::new(1.0),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1264,6 +1268,7 @@ impl CandidateWindowV2 {
                 ball_key_recent: std::cell::Cell::new(false),
                 ball_morph_ms: std::cell::Cell::new(500),
                 ball_expanding: std::cell::Cell::new(false),
+                ball_mat_opacity: std::cell::Cell::new(1.0),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1674,6 +1679,14 @@ impl CandidateWindowV2 {
             self.ball_morph_ms.set(
                 (motion_f(skin, "morph_ms", 500.0).clamp(60.0, 3000.0)) as u32,
             );
+            // 【R6】材质整窗透明度（material.opacity——与候选窗同一滑条）。
+            let mat_op = skin
+                .pointer("/skin/material/opacity")
+                .or_else(|| skin.get("material").and_then(|m| m.get("opacity")))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1.0)
+                .clamp(0.1, 1.0) as f32;
+            self.ball_mat_opacity.set(mat_op);
             // 【打断=真实新键入】签名变化或键活性（600ms 内有键）+
             // 非内部复渲染（联想刷新同签名且无键=不打断；整句模式
             // d 候选与联想同签名时靠键活性兜底）。
@@ -3490,8 +3503,9 @@ impl CandidateWindowV2 {
                         None => 1.0,
                     };
                     // base=起臂强度（展开=1；收球中断反转时=中断时刻值
-                    // ——视觉连续：半显的球继续渐隐/渐显）。
-                    let base = self.ball_mix.get();
+                    // ——视觉连续：半显的球继续渐隐/渐显）。材质整窗
+                    // 透明度同乘（R6：球的透明设置=皮肤 material.opacity）。
+                    let base = self.ball_mix.get() * self.ball_mat_opacity.get();
                     // 出现包络：前 1/4 快速浮现（球「冒出」感，不是
                     // 一瞬间满显）后随形变进度渐隐/渐显。
                     let env = (t * 3.5).min(1.0);
@@ -4321,6 +4335,13 @@ impl CandidateWindowV2 {
     /// + 多层软晕阴影（v5 归档校准画法移植）。DPI 缩放同主渲染
     /// （窗口物理尺寸、逻辑坐标绘制）。alpha=整体透明度（S3 退场渐隐）。
     unsafe fn render_ball6(&mut self, dpi_scale: f32, alpha: f32) {
+        // 【R6·皮肤整窗透明度】球的透明设置=皮肤 material.opacity
+        //（候选窗的整窗透明滑条）——皮肤调透明球跟着透明（用户：
+        // 「要跟皮肤一样的透明设置」）。颜色自带 alpha 已原样继承，
+        // 此处再乘材质整窗透明度（solid 材质=1.0 无感；translucent
+        // 皮肤 opacity<1 时球同步半透明）。
+        let mat_opacity = self.ball_mat_opacity.get();
+        let alpha = alpha * mat_opacity;
         let win = ((self.ball_win_run.get() * dpi_scale) as i32).max(24);
         if !self.ensure_swapchain(win as u32, win as u32) {
             return;
@@ -4515,18 +4536,25 @@ impl CandidateWindowV2 {
         // 尺寸+位置同帧起臂（1.5.9 机制——tick 驱动壳按缓动画）。
         // 【R4】形变终点=球直径（球视觉本体——末帧壳圆=球帧的球，
         // 无跳变；球帧随后钉窗=球窗 48=球+柔影 pad，透明区扩展
-        // 不可见）。【R5】终点左上=球心-半径（球直径圆的正确左上）。
+        // 不可见）。【R6·分两段】收球**位置钉在框位**（不滑动）——
+        // 末段窗口已缩到 30px 还要滑 70-300px 到光标=「小球飞驰」
+        // =用户「框在这消失、球在远处出现」的根因。改为：框原地
+        // 缩成球（morph）→球态驻留后由跟随分支（poll 喂 caret）滑
+        // 向光标=「框变球」与「球跟随光标」两个行为清晰分离。
         let bd_px = self.ball_d_run.get() as i32;
         self.size_anim = Some((cur_sz, (bd_px, bd_px), std::time::Instant::now()));
         self.size_anim_ms.set(self.ball_morph_ms.get());
         self.chrome_override.set(Some(cur_sz));
-        let dur = self.ball_morph_ms.get();
-        self.pos_anim = Some((
-            cur_pos,
-            (bx - bd_px / 2, by - bd_px / 2),
-            std::time::Instant::now(),
-            dur,
-        ));
+        // 位置=向框中心收拢（同步 morph）：框在原地向自己的中心缩成
+        // 球（球出现在框中心=「框变成球」），驻留后跟随分支再滑向
+        // 光标。cur_pos 变量保留给 diag；_ 抑制未用警告。
+        let _ = &cur_pos;
+        let ctr = (
+            cur_pos.0 + cur_sz.0 / 2 - bd_px / 2,
+            cur_pos.1 + cur_sz.1 / 2 - bd_px / 2,
+        );
+        self.pos_anim = Some((cur_pos, ctr, std::time::Instant::now(), self.ball_morph_ms.get()));
+        self.ball_pending.set((cx, cy));
         self.ball_closing.set(true);
         // 【v6·R3】收球球渐显 base=1（框缩小的同时球从中心浮现=
         // 同一个东西在变形，而不是框没了球突然出现）。
