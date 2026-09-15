@@ -4166,6 +4166,8 @@ impl CandidateWindowV2 {
                     self.ball_size.set((apply.0 as f32, apply.1 as f32));
                     // 【四修·收球观察窗取消】新键入=框跟随光标平滑移动
                     // （屏位锚 from=cur 续动），不收球。
+                    // was_armed=观察窗内键入（连打节奏判据）。
+                    let was_armed = self.ball_delay_armed.get();
                     unsafe {
                         let _ = KillTimer(self.hwnd, BALL_DELAY_ID);
                     }
@@ -4215,8 +4217,16 @@ impl CandidateWindowV2 {
                             ))
                         }
                     };
+                    // 【十修·连打节奏】观察窗期内（armed 刚被清但仍算连
+                    // 打）——open 用 120ms+左上锚定（尺寸只向右下扩，
+                    // 平移交给 MorphMove 同节奏）；首键=完整 300ms 形变。
+                    let rapid = was_armed;
                     b.fade_in();
-                    b.morph_open_win(apply.0 as f32, apply.1 as f32, fx, fy, win);
+                    b.morph_open(
+                        apply.0 as f32, apply.1 as f32, fx, fy, win,
+                        if rapid { 120 } else { 0 },
+                        rapid,
+                    );
                     self.ball_frame.set((fx, fy));
                     self.ball_target.set((0, 0)); // 新键入=收球去重复位
                 } else {

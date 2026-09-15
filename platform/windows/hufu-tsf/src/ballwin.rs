@@ -49,9 +49,9 @@ pub const MORPH_CLOSE_MS: i32 = 260;
 pub const BALL_FADE_MS: i32 = 260;
 /// 无键入驻留（渐隐启动点，皮肤 motion.idle_timeout_ms 可覆盖）。
 pub const BALL_IDLE_MS: u32 = 4000;
-/// 【八修】主体外底阴影高度（content SetSize 高度加此值——阴影不被
-/// 揭幕裁剪）。
-pub const SHADOW_DROP: f32 = 7.0;
+/// 【八修→十修】阴影四向留白（多层软晕外扩 ~12px+下偏移 3.5——
+/// content SetSize/Offset 全部让位，阴影不被揭幕裁剪）。
+pub const SH_PAD: f32 = 15.0;
 
 fn dur(ms: i32) -> TimeSpan {
     TimeSpan::from(std::time::Duration::from_millis(ms as u64))
@@ -85,6 +85,10 @@ pub enum BallCmd {
         tx: f32,
         ty: f32,
         win: Option<(i32, i32, i32, i32)>,
+        /// 【十修·连打节奏】时长 ms + 左上锚定（lock_lu=true 时 to 的
+        /// sx/sy=from——尺寸只向右下扩展，平移交给 MorphMove）。
+        ms: i32,
+        lock_lu: bool,
     },
     /// 框→球（慢，可被打断反转）。tx/ty=球屏位（元素框左上）。
     MorphClose {
@@ -151,8 +155,9 @@ impl BallWin {
     pub fn morph_open(
         &self, w: f32, h: f32, tx: f32, ty: f32,
         win: Option<(i32, i32, i32, i32)>,
+        ms: i32, lock_lu: bool,
     ) {
-        self.send(BallCmd::MorphOpen { w, h, tx, ty, win });
+        self.send(BallCmd::MorphOpen { w, h, tx, ty, win, ms, lock_lu });
     }
     pub fn morph_close(&self, tx: f32, ty: f32, win: Option<(i32, i32, i32, i32)>) {
         self.send(BallCmd::MorphClose { tx, ty, win });
@@ -160,13 +165,6 @@ impl BallWin {
     /// 观察窗跟随平移（框态，120ms 线性）。
     pub fn morph_move(&self, tx: f32, ty: f32, win: Option<(i32, i32, i32, i32)>) {
         self.send(BallCmd::MorphMove { tx, ty, win });
-    }
-    /// 【八修】兼容简写（不动窗口）。
-    pub fn morph_open_win(
-        &self, w: f32, h: f32, tx: f32, ty: f32,
-        win: Option<(i32, i32, i32, i32)>,
-    ) {
-        self.morph_open(w, h, tx, ty, win);
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
@@ -485,7 +483,7 @@ unsafe fn synth_thread(
                     crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
                 }
             }
-            BallCmd::MorphOpen { w, h, tx, ty, win } => {
+            BallCmd::MorphOpen { w, h, tx, ty, win, ms, lock_lu } => {
                 // 屏位锚：from=cur（当前视觉位——打断续动/无跳变）；
                 // 首命令 cur 无效→from=to（原地起步——球在框位冒出
                 // 长大成框，不从屏幕外飞入）。
@@ -504,21 +502,28 @@ unsafe fn synth_thread(
                 // SWP 后立即补偿 Offset（cur 屏位不变——窗口动则窗内
                 // Offset 反向抵消）。
                 let _ = content.SetOffset(N::Vector3 {
-                    X: cur.sx - win_org.0,
+                    X: cur.sx - SH_PAD - win_org.0,
                     Y: cur.sy - win_org.1,
                     Z: 0.0,
                 });
-                let to = Geo { w, h, sx: tx, sy: ty };
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
+                // 【十修】连打左上锚定：尺寸只向右下扩展，平移交给
+                // MorphMove（同 120ms 节奏——速度统一无顿挫）。
+                let to = if lock_lu {
+                    Geo { w, h, sx: from.sx, sy: from.sy }
+                } else {
+                    Geo { w, h, sx: tx, sy: ty }
+                };
                 cur_valid = true;
                 crate::tsf::diag_note(&format!(
                     "v5球T: open from=({:.0},{:.0},{:.0}x{:.0}) to=({:.0},{:.0},{:.0}x{:.0})",
                     from.sx, from.sy, from.w, from.h, to.sx, to.sy, to.w, to.h
                 ));
+                let dur = if ms > 0 { ms as u32 } else { MORPH_OPEN_MS as u32 };
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
-                    MORPH_OPEN_MS as u32,
+                    dur,
                     0,
                 ));
                 // morph 中停呼吸（Scale 干扰逐帧 SetSize）。
@@ -535,7 +540,7 @@ unsafe fn synth_thread(
                 }
                 refresh_win_org(hwnd, &mut win_org);
                 let _ = content.SetOffset(N::Vector3 {
-                    X: cur.sx - win_org.0,
+                    X: cur.sx - SH_PAD - win_org.0,
                     Y: cur.sy - win_org.1,
                     Z: 0.0,
                 });
@@ -563,7 +568,7 @@ unsafe fn synth_thread(
                 }
                 refresh_win_org(hwnd, &mut win_org);
                 let _ = content.SetOffset(N::Vector3 {
-                    X: cur.sx - win_org.0,
+                    X: cur.sx - SH_PAD - win_org.0,
                     Y: cur.sy - win_org.1,
                     Z: 0.0,
                 });
@@ -651,13 +656,13 @@ unsafe fn synth_thread(
                     _ => 1.0 - e,
                 };
                 let _ = content.SetSize(N::Vector2 {
-                    X: cur.w.max(2.0),
-                    Y: cur.h.max(2.0) + SHADOW_DROP,
+                    X: cur.w.max(2.0) + 2.0 * SH_PAD,
+                    Y: cur.h.max(2.0) + 2.0 * SH_PAD,
                 });
                 // 屏位→窗口 Offset（morph 期间窗口恒定——win_org 命令
                 // 时已刷新）。
                 let _ = content.SetOffset(N::Vector3 {
-                    X: cur.sx - win_org.0,
+                    X: cur.sx - SH_PAD - win_org.0,
                     Y: cur.sy - win_org.1,
                     Z: 0.0,
                 });
@@ -796,11 +801,13 @@ unsafe fn paint_morph_frame(
     ctx.SetTransform(&N::Matrix3x2::identity());
     ctx.Clear(None);
     // 主体矩形：inset 随 ballness（球端=pad 内缩=22px 圆，框端=全幅）。
+    // 【十修】画布四向 SH_PAD 让位（阴影外扩不被 content 揭幕裁剪=
+    // 「框的阴影被挡住」的另一半根源——X 向原无 pad）。
     let inset = BALL_PAD * ballness;
-    let bx0 = inset;
-    let by0 = inset;
-    let bx1 = (w - inset).max(bx0 + 2.0);
-    let by1 = (h - inset).max(by0 + 2.0);
+    let bx0 = SH_PAD + inset;
+    let by0 = SH_PAD + inset;
+    let bx1 = (SH_PAD + w - inset).max(bx0 + 2.0);
+    let by1 = (SH_PAD + h - inset).max(by0 + 2.0);
     let bw = bx1 - bx0;
     let bh = by1 - by0;
     let bcx = bx0 + bw * 0.5;
@@ -812,35 +819,30 @@ unsafe fn paint_morph_frame(
         radiusY: corner,
     };
     let rt: ID2D1RenderTarget = ctx.cast().unwrap();
-    // 【八修·阴影修复】旧实现把暗渐变画在 main_rect 内部，随后被主体
-    // 渐变整块覆盖=永远不可见（「做了没显示」的真相，用户实证）。
-    // 正解：阴影=主体外的下偏移暗晕——content 高度需多出 SHADOW_DROP
-    // （插值循环 SetSize 已加）。
-    let shadow_rect = D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F {
-            left: bx0,
-            top: by0 + 3.0,
-            right: bx1,
-            bottom: by1 + 3.0 + SHADOW_DROP,
-        },
-        radiusX: corner,
-        radiusY: corner,
-    };
-    let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: bcx, y: bcy + 4.0 },
-        gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-        radiusX: bw * 0.85,
-        radiusY: bh * 0.95,
-    };
-    let sh_stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.38, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 0.72, color: D2D1_COLOR_F { a: 0.18, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
-    ];
-    if let Ok(gsc) = rt.CreateGradientStopCollection(&sh_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
-        if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
-            ctx.FillRoundedRectangle(&shadow_rect, &shb);
+    // 【十修·真模糊感阴影】多层软晕近似高斯（5 层外扩递增+alpha 平方
+    // 递减+下偏移）：单层径向渐变的硬边=「图形元素」感（用户实证）。
+    // 主体后画盖住中心——露出的=外围软衰减。
+    if let Ok(shb) = ctx.CreateSolidColorBrush(
+        &D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 },
+        None,
+    ) {
+        for i in 0..5i32 {
+            let ext = (i + 1) as f32 * 2.3;
+            let a = 0.30 * (1.0 - i as f32 / 5.0) * (1.0 - i as f32 / 5.0);
+            let _ = shb.SetOpacity(a);
+            let srect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: bx0 - ext,
+                    top: by0 - ext + 3.5,
+                    right: bx1 + ext,
+                    bottom: by1 + ext + 3.5,
+                },
+                radiusX: corner + ext,
+                radiusY: corner + ext,
+            };
+            ctx.FillRoundedRectangle(&srect, &shb);
         }
+        let _ = shb.SetOpacity(1.0);
     }
     // 主体：ring 色径向渐变（高光偏左上——球感延续到框）。
     let fill_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -943,32 +945,27 @@ unsafe fn paint_ball_into(
     let _ = ctx.BeginDraw();
     ctx.SetTransform(&N::Matrix3x2::identity());
     ctx.Clear(None);
-    // 阴影（帧内）：球下偏移暗晕（r 放大 1.35——球体后画盖中心，
-    // 外圈 35% 露出=可见浮感；morph 帧同画法）。
-    let bc = BALL_PAD + BALL_D * 0.5;
-    let sh_prop = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-        center: D2D_POINT_2F { x: bc + 2.0, y: bc + 3.5 },
-        gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-        radiusX: BALL_D * 0.5 * 1.35,
-        radiusY: BALL_D * 0.5 * 1.35,
-    };
-    let sh_stops = [
-        D2D1_GRADIENT_STOP { position: 0.0, color: D2D1_COLOR_F { a: 0.4, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 0.7, color: D2D1_COLOR_F { a: 0.2, r: 0.0, g: 0.0, b: 0.0 } },
-        D2D1_GRADIENT_STOP { position: 1.0, color: D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 } },
-    ];
-    let rt: ID2D1RenderTarget = ctx.cast().unwrap();
-    if let Ok(gsc) = rt.CreateGradientStopCollection(&sh_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
-        if let Ok(shb) = ctx.CreateRadialGradientBrush(&sh_prop, None, &gsc) {
+    // 阴影+球心：坐标统一 +SH_PAD（content 四向让位后的画布原点——
+    // 视觉位置经 Offset=cur-SH_PAD 保持不变）。多层软晕=真模糊感。
+    let bc = SH_PAD + BALL_PAD + BALL_D * 0.5;
+    if let Ok(shb) = ctx.CreateSolidColorBrush(
+        &D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 },
+        None,
+    ) {
+        for i in 0..5i32 {
+            let ext = (i + 1) as f32 * 2.0;
+            let a = 0.30 * (1.0 - i as f32 / 5.0) * (1.0 - i as f32 / 5.0);
+            let _ = shb.SetOpacity(a);
             ctx.FillEllipse(
                 &D2D1_ELLIPSE {
                     point: D2D_POINT_2F { x: bc + 2.0, y: bc + 3.5 },
-                    radiusX: BALL_D * 0.5 * 1.35,
-                    radiusY: BALL_D * 0.5 * 1.35,
+                    radiusX: BALL_D * 0.5 + ext,
+                    radiusY: BALL_D * 0.5 + ext,
                 },
                 &shb,
             );
         }
+        let _ = shb.SetOpacity(1.0);
     }
     // 渐变球：左上高光=立体感；皮肤主色由 ring/core 参数传入（皮肤无关）。
     fill_grad_ball(&ctx, bc, bc, BALL_D * 0.5, ring);
