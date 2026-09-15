@@ -156,7 +156,7 @@ fn tl_cand_show(
 fn tl_cand_hide() {
     TL_CAND2.with(|t| {
         if let Some(c) = t.borrow_mut().as_mut() {
-            c.hide();
+            c.hide_now();
         }
     });
 }
@@ -719,7 +719,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【动效窗口让渡】tick 持有中 → 挂 pending 由 tick 放回时代为
         // 隐藏（否则旧窗漏藏=残留阴影）
         if let Some(mut c) = g.cand2.take() {
-            c.hide();
+            c.hide_now();
         } else if g.cand2_busy {
             g.pending_cand_hide = true;
         }
@@ -775,7 +775,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         if !fforeground.as_bool() {
             let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                c.hide_now();
             }
         }
         Ok(())
@@ -1093,7 +1093,7 @@ fn handle_set_focus(
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            c.hide_now();
             c.focus_reset();
         }
         trace("foc: E hide完");
@@ -1221,7 +1221,14 @@ pub fn diag_note(msg: &str) {
             .ok();
     }
     if let Some(f) = g.as_mut() {
-        if writeln!(f, "{msg}").is_err() {
+        // 【动效诊断·对时】每行带 Unix epoch 毫秒——采样脚本同源
+        //（[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()）可精确
+        // 对齐「窗口 rect 采样」与「diag 事件」两个时钟域。
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if writeln!(f, "[{ms}] {msg}").is_err() {
             *g = None; // 下次重开（句柄失效）
         }
     }
@@ -2019,7 +2026,7 @@ impl EditSession_Impl {
                     if text == "{加词}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now();
                         }
                         drop(g);
                         // 【server 会话重置 2026-09-12 二十四修】用户实锤
@@ -2033,7 +2040,7 @@ impl EditSession_Impl {
                     } else if text == "{加权}" {
                         g.last_show = None;
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now();
                         }
                         drop(g);
                         let _ = crate::ipc::call(&serde_json::json!({"op": "reset"}));
@@ -2163,7 +2170,7 @@ impl EditSession_Impl {
                     }
                     if commit_text == "{隐藏候选}" {
                         if let Some(c) = g.cand2.as_mut() {
-                            c.hide();
+                            c.hide_now();
                         }
                     } else {
                         let weighted = commit_text == "{加权}";
@@ -3627,7 +3634,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.suppress_pending = true;
         arm_first_frame_timer();
         if let Some(c) = g.cand2.as_mut() {
-            c.hide();
+            c.hide_suppress();
         }
         // 【小窗线程不进 OWNED 2026-09-12 十六修】自动复现决定性证据：
         // 词框 d 时 cand2=false → 本分支在小窗线程 new_owned 主文档窗
@@ -3753,7 +3760,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                c.hide_now();
             }
             g.cand2_dead = true;
             let (x, y) = if sh {
@@ -3782,7 +3789,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             if crate::addword::in_window_thread() {
                 tl_cand_hide();
             } else if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                c.hide_suppress();
             }
             g.suppress_pending = true;
             arm_first_frame_timer();
@@ -3946,7 +3953,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .unwrap_or(false);
         if cloaked_dead {
             if let Some(mut c) = g.cand2.take() {
-                c.hide();
+                c.hide_now();
             }
             // 不预置 cand_ui_active——由 ui_element_show 先问宿主
             // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
@@ -4076,7 +4083,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
             if let Some(c) = g.cand2.as_mut() {
-                c.hide();
+                c.hide_suppress();
             }
             g.wps_caret_prev = g.caret;
             if g.wps_settle_start.is_none() {
@@ -5000,7 +5007,10 @@ fn poll_collapse_stale(shared: &SharedRef) {
     let mut any_visible = false;
     if let Some(c) = g.cand2.as_mut() {
         any_visible |= c.is_visible();
-        c.hide();
+        // 【动效·stale 不续期】hide_stale：停留钟在身不动（照走），
+        // 无钟才起臂——这里 110ms 轮询反复调，用 hide() 会把停留钟
+        // 无限重臂=永不退场。
+        c.hide_stale();
     }
     let ui_active = g.cand_ui_active;
     let ui_host_draws = g.cand_ui_host_draws;

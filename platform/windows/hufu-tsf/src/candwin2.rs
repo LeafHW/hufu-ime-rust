@@ -422,6 +422,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 unsafe { expand_tick_shared(hwnd) };
                 return LRESULT(0);
             }
+            // 【动效·上屏停留】停留 1s 到点 → 缩放退场起臂（当前尺寸
+            // →72% 盒心收拢，完成帧真隐藏）。
+            if id == HOLD_TIMER_ID {
+                unsafe { hold_fire_shared(hwnd) };
+                return LRESULT(0);
+            }
         }
         _ => {}
     }
@@ -630,6 +636,14 @@ pub struct CandidateWindowV2 {
     pub(crate) hl_center: std::cell::Cell<Option<(f32, f32)>>,
     /// 入场动效进行中（盒心锚定模式；完成/隐藏即清）
     pub(crate) scale_in: std::cell::Cell<bool>,
+    /// 【动效·上屏停留】commit_hold=Some：上屏/断段后候选窗停留计时
+    /// 起点在身（HOLD_TIMER 1s 到点→缩放退场）。真实键入帧（raw 非
+    /// 空）即打断（show 顶部清）。
+    pub(crate) commit_hold: std::cell::Cell<Option<std::time::Instant>>,
+    /// 【动效·缩放退场】scale_out=true：停留到点后 100%→72% 盒心收拢
+    /// （入场的镜像），size_anim 完成帧真隐藏；真实键入帧打断并从当前
+    /// 插值尺寸重新长出来。
+    pub(crate) scale_out: std::cell::Cell<bool>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -988,6 +1002,8 @@ impl CandidateWindowV2 {
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
+                commit_hold: std::cell::Cell::new(None),
+                scale_out: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
                 pos_ms: 100,
@@ -1154,6 +1170,8 @@ impl CandidateWindowV2 {
                 chrome_override: std::cell::Cell::new(None),
                 hl_center: std::cell::Cell::new(None),
                 scale_in: std::cell::Cell::new(false),
+                commit_hold: std::cell::Cell::new(None),
+                scale_out: std::cell::Cell::new(false),
                 size_ms: 90,
                 pos_anim: None,
                 pos_ms: 100,
@@ -2148,6 +2166,17 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
+        // 【动效·键入打断】真实键入帧（raw 非空）：停留钟/退场即刻作
+        // 废（「可被新键入打断」）——退场打断后下方尺寸链从当前插值
+        // 尺寸续到新目标=在打断处重新长出来。raw 空的迟到预测刷新不
+        // 打断（预测迟到就迟到，退场照走）。
+        if !self.internal_rerender && !raw.is_empty() {
+            self.scale_out.set(false);
+            self.commit_hold.set(None);
+            unsafe {
+                let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+            }
+        }
         // 【拉伸动效 2026-09-11】渲染前判定（仅真实内容更新/展开帧——
         // 内部 tick 复渲染与回读取证帧不重臂）：宽高变化超阈值 → 启动/
         // 重定尺寸动画；此后每 tick 由 fade_tick_shared 以「当前插值
@@ -2164,6 +2193,9 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(None);
             } else if was_visible
                 && self.size_ms > 0
+                // 【动效·退场保护】scale_out 期间不接受普通尺寸臂（迟到
+                // 预测的宽高变化会覆盖退场动画=中断且无人收）。
+                && !self.scale_out.get()
                 // 【起臂阈值 24/14 2026-09-11】普通逐字打字的行宽增长
                 // （~8-17px/键）不动画——文字即时更新（连打不闪不滞后，
                 // 用户实测逐键闪的规避）；动画留给结构性大变化（注释
@@ -2246,7 +2278,9 @@ impl CandidateWindowV2 {
         // 盒]：高亮贴左/贴顶（横紧首候选、竖排首行）→ 盒贴对应边缘
         // 就地生长（左/上无内容不空跳）；高亮居中 → 对称展开。damp 随
         // 进度归零，完成帧=整窗。普通尺寸动效/稳态 bx=by=0。
-        let (bx, by) = if self.scale_in.get() && self.size_anim.is_some() {
+        // 【动效·退场】scale_out 同一机制反向（退场=入场的镜像）：
+        // damp=k 随进度增至 1（盒收拢回高亮胶囊处）。
+        let (bx, by) = if (self.scale_in.get() || self.scale_out.get()) && self.size_anim.is_some() {
             let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
                 Some((_, _, t0)) => {
@@ -2254,7 +2288,7 @@ impl CandidateWindowV2 {
                 }
                 None => 1.0,
             };
-            let damp = 1.0 - k;
+            let damp = if self.scale_out.get() { k } else { 1.0 - k };
             (
                 (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
                 (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
@@ -3846,7 +3880,51 @@ impl CandidateWindowV2 {
     }
 
 
+    /// 【动效·停留语义】hide()=内容路径统一收窗入口：窗口亮着 → 起
+    /// 1s 停留钟（到点缩放退场）——**每次调用都重臂**（连续上屏各自
+    /// 重新计时：用户实测「D+空格连打，上屏后继续打字，上一个窗口
+    /// 的消失时间没有重新计时」——顶屏单键顶屏后的预测帧 raw 为空，
+    /// show 的键入打断清不到钟，靠 hide() 重臂兜住「每次上屏=新1s」）；
+    /// 窗口不可见 → 真隐藏。上屏/断段/空帧各路径全走这里。轮询
+    /// stale 走 hide_stale()（hold 在身不重臂——否则 110ms 轮询把
+    /// 停留钟无限续期永不退场）。失焦/切窗/生命周期收窗走
+    /// hide_now()，抑制路径走 hide_suppress()。
     pub fn hide(&mut self) {
+        if self.is_visible() {
+            self.scale_out.set(false);
+            unsafe {
+                let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+            }
+            if self.commit_hold.get().is_none() {
+                crate::tsf::diag_note("动效: hold起臂(1s)");
+            }
+            self.commit_hold.set(Some(std::time::Instant::now()));
+            unsafe {
+                let _ = SetTimer(self.hwnd, HOLD_TIMER_ID, 1000, None);
+            }
+            return;
+        }
+        self.hide_now();
+    }
+
+    /// 轮询 stale 专用：hold 在身 → 不动（停留钟照走，不被 110ms 轮
+    /// 询反复重臂=无限续期）；无 hold → 走 hide()（挂窗起臂停留后收）。
+    pub fn hide_stale(&mut self) {
+        if self.commit_hold.get().is_some() {
+            return;
+        }
+        self.hide();
+    }
+
+    /// 真隐藏（原 1.5.9 hide）：停留钟/退场作废，PostMessage 异步
+    /// SW_HIDE。失焦/切窗/Deactivate/{隐藏候选}/词框弹窗/cloaked/
+    /// 前台他进程等生命周期路径用。
+    pub fn hide_now(&mut self) {
+        self.commit_hold.set(None);
+        self.scale_out.set(false);
+        unsafe {
+            let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+        }
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -3864,6 +3942,16 @@ impl CandidateWindowV2 {
         unsafe {
             let _ = PostMessageW(self.hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
         }
+    }
+
+    /// 抑制路径（首帧 35ms 补显/caret 锚点抑制）的收窗：hold 在身
+    /// （用户刚上屏又立刻打字）→ 跳过——窗口继续亮着等补显帧，不闪
+    /// 藏；否则走 hide()（hold 语义——不可见时真隐藏幂等）。
+    pub fn hide_suppress(&mut self) {
+        if self.commit_hold.get().is_some() {
+            return;
+        }
+        self.hide();
     }
 
     /// 【焦点重置·三十三修】跨焦点（切窗口/切应用）时抹掉候选窗的全部
@@ -3887,6 +3975,9 @@ pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
 /// 注释展开延时定时器 id——挂在本窗消息队列，wndproc 0x113 消费。
 pub const FADE_TIMER_ID: usize = 0x4846_5550; // 'HuFZ'
 pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
+/// 【动效·上屏停留】停留钟 timer id（1s 到点=缩放退场起臂）。挂本窗
+/// 消息队列，wndproc 0x113 消费（与 FADE/EXPAND 同段，id 唯一）。
+pub const HOLD_TIMER_ID: usize = 0x4846_5552; // 'HuFb'
 /// 【七十修·动效帧率】动画 tick 周期。原 15ms：SetTimer 实际 ~15.6ms
 /// → 动画 ~64fps——60Hz 屏（16.7ms/帧）恰每帧 1 步无感；240Hz 屏
 ///（4.2ms/帧）每 3.7 帧才 1 步=高刷用户必见跳帧。降至 5ms + 进程
@@ -4058,6 +4149,20 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.size_anim = None;
                 c.chrome_override.set(None);
                 c.scale_in.set(false);
+                // 【动效·退场完成】缩到 72% 即真隐藏（跳过完成帧重绘）。
+                if c.scale_out.get() {
+                    c.scale_out.set(false);
+                    shown_this_tick = true;
+                    unsafe {
+                        let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                        let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                        let _ = ShowWindow(c.hwnd, SW_HIDE);
+                    }
+                    c.last_hide_at = Some(std::time::Instant::now());
+                    c.pos_anim = None;
+                    c.live_size.set((0, 0));
+                    crate::tsf::diag_note("动效: 退场完成→隐藏");
+                }
             } else {
                 anim_done = false;
                 c.chrome_override.set(Some(cur));
@@ -4115,18 +4220,59 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     match (g.cand2.take(), cand2) {
         (None, Some(mut mine)) => {
             if pending_hide {
-                mine.hide();
+                mine.hide_now();
             } else {
                 g.cand2 = Some(mine);
             }
         }
         (Some(newer), Some(mut mine)) => {
-            mine.hide();
+            mine.hide_now();
             g.cand2 = Some(newer);
         }
         (Some(newer), None) => g.cand2 = Some(newer),
         (None, None) => {}
     }
+}
+
+/// 【动效·上屏停留到点】缩放退场起臂：当前真实尺寸 → 72%（入场的
+/// 镜像，盒心锚定由 show 的 scale_out 分支承担），FADE_TIMER 每帧
+/// 插值重绘，size_anim 完成帧真隐藏（fade_tick_shared 完成钩子）。
+/// 窗口已不可见（停留期间被失焦藏掉）→ 清尾直接返回。size_ms=0
+///（皮肤关动效）或窗太小 → 不演，立即真隐藏。
+unsafe fn hold_fire_shared(hwnd: HWND) {
+    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+        return;
+    };
+    let shared = gsh.0.clone();
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cand2 = g.cand2.take();
+    if let Some(c) = cand2.as_mut() {
+        c.commit_hold.set(None);
+        if c.is_visible() {
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(c.hwnd, &mut rc);
+            let cur = (rc.right - rc.left, rc.bottom - rc.top);
+            let tgt = (
+                (cur.0 as f32 * 0.72) as i32,
+                (cur.1 as f32 * 0.72) as i32,
+            );
+            if tgt.0 > 4 && tgt.1 > 4 && c.size_ms > 0 {
+                c.fade = None;
+                c.scale_out.set(true);
+                c.size_anim = Some((cur, tgt, std::time::Instant::now()));
+                c.chrome_override.set(Some(cur));
+                let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                crate::tsf::diag_note(&format!("动效: 退场起臂 {cur:?}→{tgt:?}"));
+            } else {
+                crate::tsf::diag_note("动效: 退场跳过→真隐藏");
+                c.hide_now();
+            }
+        } else {
+            c.scale_out.set(false);
+        }
+    }
+    g.cand2 = cand2;
+    let _ = hwnd;
 }
 
 /// 【注释展开延时】到点补一帧全注释：窗口已不可见（组段已收）则弃；
