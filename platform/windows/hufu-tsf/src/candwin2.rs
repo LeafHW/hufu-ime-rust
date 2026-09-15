@@ -4220,6 +4220,9 @@ impl CandidateWindowV2 {
                     // 【十修·连打节奏】观察窗期内（armed 刚被清但仍算连
                     // 打）——open 用 120ms+左上锚定（尺寸只向右下扩，
                     // 平移交给 MorphMove 同节奏）；首键=完整 300ms 形变。
+                    // 【十修补】lock 时视觉左上=from（不动）——ball_frame
+                    // 保持旧值（记布局 fx 会让跟随/包围盒逐轮漂移=「越
+                    // 打越窄」，用户实证）。
                     let rapid = was_armed;
                     b.fade_in();
                     b.morph_open(
@@ -4227,7 +4230,9 @@ impl CandidateWindowV2 {
                         if rapid { 120 } else { 0 },
                         rapid,
                     );
-                    self.ball_frame.set((fx, fy));
+                    if !rapid {
+                        self.ball_frame.set((fx, fy));
+                    }
                     self.ball_target.set((0, 0)); // 新键入=收球去重复位
                 } else {
                     let _ = SetWindowPos(

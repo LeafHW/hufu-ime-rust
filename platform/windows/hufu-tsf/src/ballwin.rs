@@ -49,9 +49,9 @@ pub const MORPH_CLOSE_MS: i32 = 260;
 pub const BALL_FADE_MS: i32 = 260;
 /// 无键入驻留（渐隐启动点，皮肤 motion.idle_timeout_ms 可覆盖）。
 pub const BALL_IDLE_MS: u32 = 4000;
-/// 【八修→十修】阴影四向留白（多层软晕外扩 ~12px+下偏移 3.5——
+/// 【八修→十一修】阴影四向留白（8 层软晕外扩 ~25.6px+下偏 7——
 /// content SetSize/Offset 全部让位，阴影不被揭幕裁剪）。
-pub const SH_PAD: f32 = 15.0;
+pub const SH_PAD: f32 = 28.0;
 
 fn dur(ms: i32) -> TimeSpan {
     TimeSpan::from(std::time::Duration::from_millis(ms as u64))
@@ -503,7 +503,7 @@ unsafe fn synth_thread(
                 // Offset 反向抵消）。
                 let _ = content.SetOffset(N::Vector3 {
                     X: cur.sx - SH_PAD - win_org.0,
-                    Y: cur.sy - win_org.1,
+                    Y: cur.sy - SH_PAD - win_org.1,
                     Z: 0.0,
                 });
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
@@ -541,7 +541,7 @@ unsafe fn synth_thread(
                 refresh_win_org(hwnd, &mut win_org);
                 let _ = content.SetOffset(N::Vector3 {
                     X: cur.sx - SH_PAD - win_org.0,
-                    Y: cur.sy - win_org.1,
+                    Y: cur.sy - SH_PAD - win_org.1,
                     Z: 0.0,
                 });
                 let to = Geo { w: ball_side, h: ball_side, sx: tx, sy: ty };
@@ -569,7 +569,7 @@ unsafe fn synth_thread(
                 refresh_win_org(hwnd, &mut win_org);
                 let _ = content.SetOffset(N::Vector3 {
                     X: cur.sx - SH_PAD - win_org.0,
-                    Y: cur.sy - win_org.1,
+                    Y: cur.sy - SH_PAD - win_org.1,
                     Z: 0.0,
                 });
                 let (w0, h0) = if cur_valid { (cur.w, cur.h) } else { (200.0, 160.0) };
@@ -663,7 +663,7 @@ unsafe fn synth_thread(
                 // 时已刷新）。
                 let _ = content.SetOffset(N::Vector3 {
                     X: cur.sx - SH_PAD - win_org.0,
-                    Y: cur.sy - win_org.1,
+                    Y: cur.sy - SH_PAD - win_org.1,
                     Z: 0.0,
                 });
                 let _ = paint_morph_frame(
@@ -819,23 +819,24 @@ unsafe fn paint_morph_frame(
         radiusY: corner,
     };
     let rt: ID2D1RenderTarget = ctx.cast().unwrap();
-    // 【十修·真模糊感阴影】多层软晕近似高斯（5 层外扩递增+alpha 平方
-    // 递减+下偏移）：单层径向渐变的硬边=「图形元素」感（用户实证）。
-    // 主体后画盖住中心——露出的=外围软衰减。
+    // 【十修·真模糊感阴影→十一修加强】多层软晕近似高斯（6 层外扩
+    // 递增+alpha 平方递减+下偏移）——十修版在浅色面板上「若有若无」
+    // （用户实测），加强：基数 0.45、下偏 4.5、步长 2.6。
     if let Ok(shb) = ctx.CreateSolidColorBrush(
-        &D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 },
+        &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
         None,
     ) {
-        for i in 0..5i32 {
-            let ext = (i + 1) as f32 * 2.3;
-            let a = 0.30 * (1.0 - i as f32 / 5.0) * (1.0 - i as f32 / 5.0);
+        for i in 0..8i32 {
+            let ext = (i + 1) as f32 * 3.2;
+            let k = 1.0 - i as f32 / 8.0;
+            let a = 0.25 * k * k;
             let _ = shb.SetOpacity(a);
             let srect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: bx0 - ext,
-                    top: by0 - ext + 3.5,
+                    top: by0 - ext * 0.3 + 8.0,
                     right: bx1 + ext,
-                    bottom: by1 + ext + 3.5,
+                    bottom: by1 + ext + 8.0,
                 },
                 radiusX: corner + ext,
                 radiusY: corner + ext,
@@ -949,16 +950,17 @@ unsafe fn paint_ball_into(
     // 视觉位置经 Offset=cur-SH_PAD 保持不变）。多层软晕=真模糊感。
     let bc = SH_PAD + BALL_PAD + BALL_D * 0.5;
     if let Ok(shb) = ctx.CreateSolidColorBrush(
-        &D2D1_COLOR_F { a: 0.0, r: 0.0, g: 0.0, b: 0.0 },
+        &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
         None,
     ) {
-        for i in 0..5i32 {
-            let ext = (i + 1) as f32 * 2.0;
-            let a = 0.30 * (1.0 - i as f32 / 5.0) * (1.0 - i as f32 / 5.0);
+        for i in 0..8i32 {
+            let ext = (i + 1) as f32 * 2.4;
+            let k = 1.0 - i as f32 / 8.0;
+            let a = 0.8 * k * k;
             let _ = shb.SetOpacity(a);
             ctx.FillEllipse(
                 &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: bc + 2.0, y: bc + 3.5 },
+                    point: D2D_POINT_2F { x: bc + 2.0, y: bc + 5.0 },
                     radiusX: BALL_D * 0.5 + ext,
                     radiusY: BALL_D * 0.5 + ext,
                 },
