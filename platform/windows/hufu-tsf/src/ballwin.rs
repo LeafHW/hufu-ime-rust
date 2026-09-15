@@ -129,6 +129,12 @@ pub enum BallCmd {
         /// 文本色（选中行）。
         text_sel: u32,
     },
+    /// 【十三修·时序接皮肤】morph_ms/fast_morph_ms/idle_timeout_ms。
+    SetTiming {
+        open_ms: u32,
+        fast_ms: u32,
+        idle_ms: u32,
+    },
 }
 
 /// v5 球窗句柄（窗口线程持有；COM 全困在合成线程）。
@@ -184,6 +190,10 @@ impl BallWin {
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
+    }
+    /// 【十三修】皮肤 motion 时序（每次 show 刷新——热更生效）。
+    pub fn set_timing(&self, open_ms: u32, fast_ms: u32, idle_ms: u32) {
+        self.send(BallCmd::SetTiming { open_ms, fast_ms, idle_ms });
     }
     /// 【十二修】候选内容（每次 show 调用——内容变了合成线程重画）。
     pub fn set_content(
@@ -456,6 +466,10 @@ unsafe fn synth_thread(
     let mut last_core: u32 = 0xFFE8E8EC;
     // 【十二修·面板真实内容】候选文本缓存 + DWrite 格式（一次建）。
     let mut content_lines: Vec<String> = Vec::new();
+    // 【十三修】可配时序（SetTiming 覆盖；默认=原常量）。
+    let mut cfg_open_ms: u32 = MORPH_OPEN_MS as u32;
+    let mut cfg_fast_ms: u32 = 120;
+    let mut cfg_idle_ms: u32 = BALL_IDLE_MS;
     let mut content_sel: usize = 0;
     let mut text_col: u32 = 0xFF333333;
     let mut text_sel_col: u32 = 0xFF101014;
@@ -498,7 +512,7 @@ unsafe fn synth_thread(
             if let Some((from, to, t0, ms, mode)) = &morph {
                 let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
                 let e = match *mode {
-                    1 => ease_in_out(t),
+                    1 => t * t,
                     _ => t,
                 };
                 cur.w = lerp(from.w, to.w, e);
@@ -575,7 +589,7 @@ unsafe fn synth_thread(
                     "v5球T: open from=({:.0},{:.0},{:.0}x{:.0}) to=({:.0},{:.0},{:.0}x{:.0})",
                     from.sx, from.sy, from.w, from.h, to.sx, to.sy, to.w, to.h
                 ));
-                let dur = if ms > 0 { ms as u32 } else { MORPH_OPEN_MS as u32 };
+                let dur = if ms > 0 { ms as u32 } else { cfg_open_ms };
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
@@ -583,7 +597,8 @@ unsafe fn synth_thread(
                     0,
                 ));
                 // morph 中停呼吸（Scale 干扰逐帧 SetSize）。
-                content.StopAnimation(&HSTRING::from("Scale"));
+                content.StopAnimation(&HSTRING::from("Scale.X"));
+                content.StopAnimation(&HSTRING::from("Scale.Y"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
             }
             BallCmd::MorphClose { tx, ty, win } => {
@@ -609,7 +624,8 @@ unsafe fn synth_thread(
                     MORPH_CLOSE_MS as u32,
                     1,
                 ));
-                content.StopAnimation(&HSTRING::from("Scale"));
+                content.StopAnimation(&HSTRING::from("Scale.X"));
+                content.StopAnimation(&HSTRING::from("Scale.Y"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
             }
             BallCmd::MorphMove { tx, ty, win } => {
@@ -635,10 +651,11 @@ unsafe fn synth_thread(
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
-                    120,
+                    cfg_fast_ms,
                     2,
                 ));
-                content.StopAnimation(&HSTRING::from("Scale"));
+                content.StopAnimation(&HSTRING::from("Scale.X"));
+                content.StopAnimation(&HSTRING::from("Scale.Y"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
             }
             BallCmd::FadeOut => {
@@ -662,25 +679,47 @@ unsafe fn synth_thread(
                 }
             }
             BallCmd::BreathOn => {
-                if let Ok(a) = compositor.CreateExpressionAnimation() {
-                    let _ = a.SetExpression(&HSTRING::from(
-                        "Vector3(1+0.035*sin(this.currentTime/480), 1+0.035*sin(this.currentTime/480), 1)",
-                    ));
-                    let _ = content.StartAnimation(&HSTRING::from("Scale"), &a);
-                }
+                // 【十三修·呼吸重做】旧版三重错：①ExpressionAnimation
+                // 与 morph 逐帧 SetSize 互相打断（Scale 被 open 的
+                // StopAnimation 杀掉后再无人重启——「疑似 vanish」）；
+                // ②SetCenterPoint 在 StartAnimation 之后（首帧绕错点）；
+                // ③CenterPoint 坐标不含 SH_PAD（画布球心=SH_PAD+半径）。
+                // 且 breath_on 从无人调用（呼吸从未开启）。新版：
+                // KeyFrame 标量动画×2 绑 Scale.X/Y，先 Center 后 Start；
+                // 收球完成时合成线程自动开（球驻留=呼吸态）。
+                content.StopAnimation(&HSTRING::from("Scale.X"));
+                content.StopAnimation(&HSTRING::from("Scale.Y"));
+                let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
                 let _ = content.SetCenterPoint(N::Vector3 {
-                    X: BALL_D * 0.5,
-                    Y: BALL_D * 0.5,
+                    X: SH_PAD + cur.w * 0.5,
+                    Y: SH_PAD + cur.h * 0.5,
                     Z: 0.0,
                 });
+                if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
+                    let _ = a.InsertKeyFrame(0.0, 1.0);
+                    let _ = a.InsertKeyFrame(0.5, 1.045);
+                    let _ = a.InsertKeyFrame(1.0, 1.0);
+                    let _ = a.SetDuration(dur(1600));
+                    let _ = a.SetIterationBehavior(
+                        windows::UI::Composition::AnimationIterationBehavior::Forever,
+                    );
+                    content.StartAnimation(&HSTRING::from("Scale.X"), &a);
+                    content.StartAnimation(&HSTRING::from("Scale.Y"), &a);
+                }
             }
             BallCmd::BreathOff => {
-                content.StopAnimation(&HSTRING::from("Scale"));
+                content.StopAnimation(&HSTRING::from("Scale.X"));
+                content.StopAnimation(&HSTRING::from("Scale.Y"));
                 let _ = content.SetScale(N::Vector3 {
                     X: 1.0,
                     Y: 1.0,
                     Z: 1.0,
                 });
+            }
+            BallCmd::SetTiming { open_ms, fast_ms, idle_ms } => {
+                cfg_open_ms = open_ms.max(40);
+                cfg_fast_ms = fast_ms.max(40);
+                cfg_idle_ms = idle_ms.max(500);
             }
             BallCmd::Show => {
                 let _ = root.SetIsVisible(true);
@@ -723,8 +762,12 @@ unsafe fn synth_thread(
                 let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
                 // 【八修】open 也线性：ease_out 被连打打断重启=快慢突变
                 // （顿挫感的速度源）；线性打断重启=速度恒定连续。
+                // 【十三修·收缩惰性】close 前段极慢（平方）：连打节奏
+                // （f→空格→f…）中若观察窗 700ms 内没等到下一键，close
+                // 起跑的前 ~150ms 只缩 10%——下一键打断时视觉几乎没
+                // 缩过=「一缩一放」消失（用户实证连打仍有缩放感）。
                 let e = match *mode {
-                    1 => ease_in_out(t),
+                    1 => t * t,
                     _ => t,
                 };
                 cur.w = lerp(from.w, to.w, e);
@@ -770,6 +813,27 @@ unsafe fn synth_thread(
                         crate::tsf::diag_note("v5球T: 收球完成");
                         // 【取证】收球终态帧 readback（swapchain 里有没有球）。
                         readback_probe(&chain, &d3d_dev);
+                        // 【十三修】收球完成=球驻留→自动开呼吸（旧版
+                        // breath_on 无调用点=从未开启）。
+                        let _ = content.StopAnimation(&HSTRING::from("Scale.X"));
+                        let _ = content.StopAnimation(&HSTRING::from("Scale.Y"));
+                        let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
+                        let _ = content.SetCenterPoint(N::Vector3 {
+                            X: SH_PAD + cur.w * 0.5,
+                            Y: SH_PAD + cur.h * 0.5,
+                            Z: 0.0,
+                        });
+                        if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
+                            let _ = a.InsertKeyFrame(0.0, 1.0);
+                            let _ = a.InsertKeyFrame(0.5, 1.045);
+                            let _ = a.InsertKeyFrame(1.0, 1.0);
+                            let _ = a.SetDuration(dur(1600));
+                            let _ = a.SetIterationBehavior(
+                                windows::UI::Composition::AnimationIterationBehavior::Forever,
+                            );
+                            content.StartAnimation(&HSTRING::from("Scale.X"), &a);
+                            content.StartAnimation(&HSTRING::from("Scale.Y"), &a);
+                        }
                     }
                 }
             } else {
@@ -782,7 +846,7 @@ unsafe fn synth_thread(
                 if ball_like {
                     if let Some(t) = idle_since {
                         let el = t.elapsed().as_millis() as u32;
-                        if !fading && el >= BALL_IDLE_MS as u32 {
+                        if !fading && el >= cfg_idle_ms {
                             if let Ok(a) = compositor.CreateScalarKeyFrameAnimation() {
                                 let _ = a.InsertKeyFrame(0.0, 1.0);
                                 let _ = a.InsertKeyFrame(1.0, 0.0);
@@ -917,6 +981,9 @@ unsafe fn paint_morph_frame(
         &D2D1_COLOR_F { a: 1.0, r: 0.0, g: 0.0, b: 0.0 },
         None,
     ) {
+        // 【十三修·方向性阴影】四向均匀扩散=「描边感」（用户「阴影
+        // 不好看」）。改单侧投影：底边厚+下偏移大，顶边几乎不扩
+        // （光从上来），左右微扩。
         for i in 0..8i32 {
             let ext = (i + 1) as f32 * 3.2;
             let k = 1.0 - i as f32 / 8.0;
@@ -924,10 +991,10 @@ unsafe fn paint_morph_frame(
             let _ = shb.SetOpacity(a);
             let srect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
-                    left: bx0 - ext,
-                    top: by0 - ext * 0.3 + 8.0,
-                    right: bx1 + ext,
-                    bottom: by1 + ext + 8.0,
+                    left: bx0 - ext * 0.35,
+                    top: by0 - ext * 0.15 + 9.0,
+                    right: bx1 + ext * 0.35,
+                    bottom: by1 + ext + 9.0,
                 },
                 radiusX: corner + ext,
                 radiusY: corner + ext,

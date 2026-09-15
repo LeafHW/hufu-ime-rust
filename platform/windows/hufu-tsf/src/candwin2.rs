@@ -4151,6 +4151,14 @@ impl CandidateWindowV2 {
                 // 个元素顺滑平移」）。SWP 移动的视觉跳变由 morph from
                 // Offset 补偿（球屏位不变起步）。
                 if let Some(b) = &self.ball {
+                    // 【十三修·时序接皮肤】motion 节点（morph_ms=首键
+                    // open；fast_morph_ms=连打/跟随；idle_timeout_ms=
+                    // 球驻留渐隐）——热更生效。
+                    b.set_timing(
+                        mf("morph_ms", 300.0) as u32,
+                        mf("fast_morph_ms", 120.0) as u32,
+                        mf("idle_timeout_ms", 4000.0) as u32,
+                    );
                     // 【十二修·面板真实内容】候选行进合成线程（morph 帧
                     // 实时画——框态驻留时内容更新立即重画）。
                     let lines: Vec<String> = cands
@@ -5327,11 +5335,12 @@ pub const DOT_INNER: i32 = 9;
 pub const DOT_SHADOW_PAD: i32 = 3;
 pub const DOT_IDLE_MS: u32 = 4000;
 pub const DOT_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
-/// 【v5·四修】收球延迟 timer：上屏后不立即框→球——半秒观察窗（期内
-/// 键入=框跟随光标平滑移动不收；无键入才收球）。500ms 短于本机 timer
-/// 静默杀阈值（>1-2s），安全。
+/// 【v5·四修→十三修】收球延迟 timer：上屏后不立即框→球——观察窗（期
+/// 内键入=框跟随光标平滑移动不收；无键入才收球）。700ms 盖住典型连打
+/// 轮距（f→空格→f ≈500-650ms——500ms 窗漏=close 起跑被下一键打断=
+/// 「一缩一放」，用户实证）；仍短于本机 timer 静默杀阈值（>1-2s）。
 pub const BALL_DELAY_ID: usize = DOT_TIMER_ID + 2;
-pub const BALL_DELAY_MS: u32 = 500;
+pub const BALL_DELAY_MS: u32 = 700;
 pub const DOT_MORPH_MS: u32 = 180;
 pub const DOT_TICK_MS: u32 = 16;
 pub const DOT_FADE_MS: u32 = 200;
