@@ -453,6 +453,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
                 return LRESULT(0);
             }
+            // 【R14·上屏停留到点】渐隐退场起臂（fade 三次曲线≈120ms
+            // →SW_HIDE，全走现有 fade_tick_shared 机制）。
+            if id == HOLD_TIMER_ID {
+                unsafe {
+                    KillTimer(hwnd, HOLD_TIMER_ID);
+                    hold_fire_shared(hwnd);
+                }
+                return LRESULT(0);
+            }
         }
         _ => {}
     }
@@ -714,6 +723,10 @@ pub struct CandidateWindowV2 {
     /// render_ball6 每帧 SWP 强制钉回——防 show 布局/caret 抖动微调
     /// 造成的驻留漂移，用户实锤「球还是会动」）。
     pub(crate) ball_pin: std::cell::Cell<(i32, i32)>,
+    /// 【R14·上屏停留】上屏/断段检测（raw 非空→空）+1s 停留计时起点。
+    /// 停留到点=渐隐退场（fade 三次曲线≈120ms）→SW_HIDE。
+    pub(crate) raw_active: std::cell::Cell<bool>,
+    pub(crate) commit_hold: std::cell::Cell<Option<std::time::Instant>>,
     /// 【v6·R2】形变时长 ms（框↔球/首键球入场；皮肤
     /// motion.morph_ms 可调）。
     pub(crate) ball_morph_ms: std::cell::Cell<u32>,
@@ -1094,6 +1107,8 @@ impl CandidateWindowV2 {
                 ball_expanding: std::cell::Cell::new(false),
                 ball_mat_opacity: std::cell::Cell::new(1.0),
                 ball_pin: std::cell::Cell::new((0, 0)),
+                raw_active: std::cell::Cell::new(false),
+                commit_hold: std::cell::Cell::new(None),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -1282,6 +1297,8 @@ impl CandidateWindowV2 {
                 ball_expanding: std::cell::Cell::new(false),
                 ball_mat_opacity: std::cell::Cell::new(1.0),
                 ball_pin: std::cell::Cell::new((0, 0)),
+                raw_active: std::cell::Cell::new(false),
+                commit_hold: std::cell::Cell::new(None),
                 size_anim_ms: std::cell::Cell::new(90),
                 ball_d_run: std::cell::Cell::new(BALL_D6 as f32),
                 ball_win_run: std::cell::Cell::new(BALL_WIN as f32),
@@ -4668,7 +4685,36 @@ impl CandidateWindowV2 {
         crate::tsf::diag_note("v6球S1: 收球起臂");
     }
 
+    /// 【R14·上屏停留】空帧（上屏/断段清空）时的收窗决策：窗口还
+    /// 亮着（上一帧内容在屏）→ 起 1s 停留钟（到点渐隐退场——用户
+    /// 拍板「上屏后 1 秒停留」），不立即隐藏；hold 已在计时→维持；
+    /// 窗口本就不可见 → 常规 hide（幂等）。hold 期间新键入走 show
+    /// 正常续用（raw 非空帧 show 不清 hold——到点渐隐由打字的下一
+    /// 次上屏周期接管；hold 期间失焦/切窗走 hide() 清 hold+真藏）。
+    pub fn hide_or_hold(&mut self) {
+        if self.commit_hold.get().is_some() {
+            return;
+        }
+        if self.is_visible() {
+            crate::tsf::diag_note("R14: hold起臂(1s)");
+            self.commit_hold.set(Some(std::time::Instant::now()));
+            unsafe {
+                let _ = SetTimer(self.hwnd, HOLD_TIMER_ID, 1000, None);
+            }
+            return;
+        }
+        self.hide();
+    }
+
     pub fn hide(&mut self) {
+        // 【R14】停留钟作废（隐藏=停留无意义）。
+        if self.commit_hold.get().is_some() {
+            crate::tsf::diag_note("R14: hold在身被hide——谁杀的（看前置日志）");
+        }
+        self.commit_hold.set(None);
+        unsafe {
+            let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+        }
         // 【v6·S1·观察窗保活】球系统持有窗口生命周期期间（观察窗
         // armed/球态驻留），一切常规隐藏请求吞掉——否则正规收窗
         // 路径（空帧/焦点/poll）会在 500ms 观察窗内把窗口藏掉，
@@ -4725,6 +4771,8 @@ pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
 /// 动画 ~150-200fps，高刷观感对齐；60Hz 无感不退化。动画窗外
 /// timer 自动 Kill，常驻开销为零。
 pub const FADE_TICK_MS: u32 = 5;
+/// 【R14·上屏停留钟】上屏后 1s 停留→到点渐隐退场。
+pub const HOLD_TIMER_ID: usize = 0x4846_5552; // 'HuFr'
 /// [v6-S1] ball diameter px (logical).
 pub const BALL_D6: i32 = 22;
 /// [v6-S1] ball window side (diameter + soft-shadow margin; DPI-scaled at render).
@@ -4742,22 +4790,12 @@ pub const BALL_IDLE6_MS: u32 = 4000;
 pub static BALL_ON_RUNTIME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// [v6-S4] gate: env 显式优先（HUFU_BALL=1 强制开 / =0 强制关），
-/// 未设=皮肤 motion.ball 的运行时缓存（出厂皮肤无此键=1.5.9 行为）。
+/// [v6-S4] gate: 【R14·球退役】用户拍板删球（2026-10「只保留进场
+/// 出场和上屏后1秒停留，球删了」）——恒 false，HUFU_BALL 环境变量
+/// 与皮肤 motion.ball 均不再激活球系统。球代码保留但死寂（回滚=
+/// 恢复此函数原逻辑）。
 pub fn ball_gate() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let env_on = *V.get_or_init(|| match std::env::var("HUFU_BALL") {
-        Ok(v) => v == "1",
-        Err(_) => false,
-    });
-    if env_on {
-        return true;
-    }
-    // env=0 显式关；env 未设=皮肤缓存
-    if std::env::var("HUFU_BALL").is_ok() {
-        return false;
-    }
-    BALL_ON_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+    false
 }
 
 /// [v6-S4] 皮肤动效节点：/skin/motion/ball（或顶层 motion.ball）
@@ -4832,6 +4870,28 @@ unsafe fn ball_delay_fire_shared(hwnd: HWND) {
     g.cand2_busy = false;
     g.cand2 = cand2;
     let _ = hwnd;
+}
+
+/// 【R14·上屏停留到点】渐隐退场起臂：可见=fade=(false) + FADE_TIMER
+/// 5ms（复渲染带 fade_alpha 三次曲线→完成 SW_HIDE——全走现有
+/// fade_tick_shared 机制）；不可见/实例缺=清态。
+unsafe fn hold_fire_shared(hwnd: HWND) {
+    let shared = match crate::tsf::G_SHARED.get() {
+        Some(s) => s.0.clone(),
+        None => return,
+    };
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cand2 = g.cand2.take();
+    if let Some(c) = cand2.as_mut() {
+        c.commit_hold.set(None);
+        if c.is_visible() {
+            c.fade = Some((false, std::time::Instant::now()));
+            let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+        } else {
+            c.fade = None;
+        }
+    }
+    g.cand2 = cand2;
 }
 
 unsafe fn fade_tick_shared(hwnd: HWND) {

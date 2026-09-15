@@ -2055,7 +2055,9 @@ impl EditSession_Impl {
                                         c.hide();
                                     }
                                 } else {
-                                    c.hide();
+                                    // 【R14·上屏停留】窗口亮着=上屏：
+                                    // 1s 停留后渐隐（用户拍板）。
+                                    c.hide_or_hold();
                                 }
                             }
                         }
@@ -3396,7 +3398,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 .is_empty();
             if !aux_now {
                 if let Some(c) = g.cand2.as_mut() {
-                    c.hide();
+                    // 【R14·上屏停留】断段收窗同款：窗口亮着=1s 停留
+                    // 后渐隐（hold 在身=维持不重复起臂）。
+                    c.hide_or_hold();
                 }
             }
         }
@@ -3628,7 +3632,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     c.hide();
                 }
             } else {
-                c.hide();
+                // 【R14·上屏停留】空帧但窗口亮着=上屏/断段：1s 停留
+                // 后渐隐（用户拍板）；不可见=常规隐藏。
+                c.hide_or_hold();
             }
         }
         if g.cand_ui_active {
