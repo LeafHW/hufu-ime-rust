@@ -2778,7 +2778,32 @@ impl CandidateWindowV2 {
                 // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
                 // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
                 // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
-                let fade_a = self.fade_alpha();
+                // 【R12·真形变·壳渐变】形变期间（expanding/closing）壳的
+                // 整帧 alpha=形变进度：展开 0→1（首帧纯球——壳全透明，
+                // 球在同一形状位置渐变成框，不是「球没了框出来」），
+                // 收球 1→0（末帧纯球——框渐隐成球）。球叠加层画在
+                // PopLayer 之后不受此乘。配合 R4 圆角插值=同一个东西
+                // 的连续变形（尺寸+圆角+alpha 三轴同步）。
+                let mut fade_a = self.fade_alpha();
+                if self.ball_expanding.get() || self.ball_closing.get() {
+                    let t = match self.size_anim {
+                        Some((_, _, t0)) => (t0.elapsed().as_millis() as f32
+                            / self.size_anim_ms.get().max(1) as f32)
+                            .clamp(0.0, 1.0),
+                        None => 1.0,
+                    };
+                    // 【R12b·前段起量】线性 alpha 前 100ms 太淡（t=0.12
+                    // ≈真空——实测展开首帧截图空白）=用户「球突然没了
+                    // 框出来」。前 40% 快速起量（t*2.5 clamp 1）。
+                    let lin = if self.ball_closing.get() { 1.0 - t } else { t };
+                    let shell_f = if self.ball_closing.get() {
+                        (1.0 - t * 2.5).max(0.0)
+                    } else {
+                        (t * 2.5).min(1.0)
+                    };
+                    let _ = lin;
+                    fade_a = fade_a.min(shell_f);
+                }
                 let fade_layer_on = fade_a < 0.999;
                 if fade_layer_on {
                     let mut lp = D2D1_LAYER_PARAMETERS1::default();
@@ -3586,13 +3611,15 @@ impl CandidateWindowV2 {
                     // ——视觉连续：半显的球继续渐隐/渐显）。材质整窗
                     // 透明度同乘（R6：球的透明设置=皮肤 material.opacity）。
                     let base = self.ball_mix.get() * self.ball_mat_opacity.get();
-                    // 出现包络：前 1/4 快速浮现（球「冒出」感，不是
-                    // 一瞬间满显）后随形变进度渐隐/渐显。
-                    let env = (t * 3.5).min(1.0);
+                    // 【R12c·首帧连续】展开球 alpha=base*(1-t)：首帧 t=0
+                    // →alpha=base=1=与驻留球全显连续（此前 env=t*3.5
+                    // 的浮现包络让首帧球从 0 起跳=展开瞬间球消失，实
+                    // 测首帧截图纯空白——「球突然没了框出来」的真凶）。
+                    // 收球 alpha=base*t：首帧 0（框全显）→末帧 1（纯球）。
                     let alpha = if self.ball_closing.get() {
                         (base * t).clamp(0.0, 1.0)
                     } else {
-                        (base * env * (1.0 - t)).clamp(0.0, 1.0)
+                        (base * (1.0 - t)).clamp(0.0, 1.0)
                     };
                     if alpha > 0.02 {
                         // 【R4·真形变】壳圆即球体——叠加只画高亮芯
@@ -3603,9 +3630,13 @@ impl CandidateWindowV2 {
                             .unwrap_or((buf_w.max(1), buf_h.max(1)));
                         let scx = cw as f32 * 0.5 * dpi_scale;
                         let scy = ch as f32 * 0.5 * dpi_scale;
-                        let core_r = self.ball_d_run.get() * 0.2;
-                        let _ = core_r;
-                        self.draw_ball_into6(&ctx, scx, scy, alpha, true);
+                        // 【R12b·完整球叠加】画整球（环+芯）不只芯——
+                        // 展开首帧（壳近透明）球环=唯一可见物（此前
+                        // core_only 首帧只剩淡芯=视觉真空=「球突然没了
+                        // 框出来」）；收球末帧（壳全隐）球环接住壳的
+                        // 圆（同色同位=无缝交接，此前末帧只剩芯悬浮
+                        // 然后球帧全球闪现）。
+                        self.draw_ball_into6(&ctx, scx, scy, alpha, false);
                     }
                 }
                 let _ = ctx.EndDraw(None, None);
@@ -4634,6 +4665,15 @@ impl CandidateWindowV2 {
     pub(crate) fn ball_delay_fire6(&mut self) {
         self.ball_armed.set(false);
         let (cx, cy) = self.ball_pending.get();
+        // 【R12·锚稳定】观察窗到期时**重新直查**系统插入符（arm 时刻
+        // 的 pending 可能是上屏瞬间的过渡 caret；1s 后插入符已稳定=
+        // 球位一致）。失败回落 pending（VSCode 等 Electron 无系统
+        // caret 宿主——恒定用 pending=同应用内位置恒定，不再「一下
+        // 光标下一下光标右」）。
+        let (cx, cy) = match crate::tsf::gui_caret_fallback() {
+            Some(r) => ((r.left + r.right) / 2, (r.top + r.bottom) / 2),
+            None => (cx, cy),
+        };
         // 球位=caret 右下（v5 校准偏移）。【R5】ball_pos 恒存**球心**；
         // 形变终点窗口（=球直径圆）的左上=球心-半径——此前把球心
         // 坐标直接当窗口左上=收球滑到位后球帧（48 窗）球心偏出 24px
