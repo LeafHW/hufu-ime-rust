@@ -5137,7 +5137,13 @@ fn poll_tick() {
                 let g = s.lock().unwrap_or_else(|e| e.into_inner());
                 (g.cand2.is_none(), g.cand2_dead, g.cand2_busy)
             };
-            if none && !dead && !busy && !crate::addword::is_open() {
+            // 【预热排除打包宿主 2026-09-16】SearchHost（开始菜单）/UWP
+            // 沙盒进程的候选窗走 OWNED 分层窗（new_owned）或 server 代画
+            // ——闲拍预热的是普通 DComp 窗，建进 SearchHost 后 OWNED 分支
+            // 见 cand2=Some 直接复用（沙盒里 D3D/锚点异常=「开始菜单候选
+            // 跑右上角」实锤）。打包宿主不预热，保持 1.5.9 行为：首需时
+            // new_owned。
+            if none && !dead && !busy && !crate::addword::is_open() && !host_is_packaged() {
                 match CandidateWindowV2::new() {
                     Some(v2) => {
                         let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
