@@ -66,21 +66,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // WM_NCHITTEST → HTCLIENT
         return LRESULT(1);
     }
-    // 【R10·SWP 间谍】WM_WINDOWPOSCHANGING：抓驻留期窗口漂移的
-    // 真凶（谁来 SetWindowPos）。只在球态时记（form 由全局原子
-    // 镜像——wndproc 无 self 访问）。
-    if msg == 0x0046 {
-        unsafe {
-            if BALL_FORM_MIRROR.load(std::sync::atomic::Ordering::Relaxed) {
-                use windows::Win32::UI::WindowsAndMessaging::WINDOWPOS;
-                let wp = &*(lparam.0 as *const WINDOWPOS);
-                crate::tsf::diag_note(&format!(
-                    "v6spy SWPCHANGING ({},{}) {}x{} flags={:x}",
-                    wp.x, wp.y, wp.cx, wp.cy, wp.flags.0
-                ));
-            }
-        }
-    }
+    // 【R10·SWP 间谍——已退役 2026 R12b】使命完成（抓到漂移真凶=
+    // tick 位置段残余 pos_anim），且球驻留期每帧 SWP 触发 150fps
+    // 日志风暴（实测 notes 3 分钟 3MB，IO 拖垮测试）。整块删除。
     // 【鼠标交互 2026-09-10 用户拍板】左键按住拖动=拖到哪里固定在哪
     // 里（跨组段保持）；右键=解除固定，候选窗回光标处恢复跟随。
     // （旧「拖动+右键锁定/再右键解除」双路径已废——分叉时序曾实测
