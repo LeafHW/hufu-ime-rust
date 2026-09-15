@@ -767,6 +767,9 @@ pub struct CandidateWindowV2 {
     ball_target: std::cell::Cell<(i32, i32)>,
     /// 【v5·四修】收球观察窗的目标 caret（500ms 到点用它收球）。
     ball_pending: std::cell::Cell<(i32, i32)>,
+    /// 【v5·六修】观察窗跟随：当前框尺寸（show 布局记录——上屏后
+    /// caret 前移时框平移跟随用）。
+    ball_size: std::cell::Cell<(f32, f32)>,
     /// 【v5·四修】收球观察窗挂着（hide 上屏链跳过判据）。
     ball_delay_armed: std::cell::Cell<bool>,
     /// 【S6 四修】涌现辅助层 effect 组（三层 overlay 淡出通道）。
@@ -1153,6 +1156,7 @@ impl CandidateWindowV2 {
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ball_target: std::cell::Cell::new((0, 0)),
                 ball_pending: std::cell::Cell::new((0, 0)),
+                ball_size: std::cell::Cell::new((0.0, 0.0)),
                 ball_delay_armed: std::cell::Cell::new(false),
                 ctx: Some(ctx),
                 swapchain: None,
@@ -1363,6 +1367,7 @@ impl CandidateWindowV2 {
                 ball_frame: std::cell::Cell::new((0.0, 0.0)),
                 ball_target: std::cell::Cell::new((0, 0)),
                 ball_pending: std::cell::Cell::new((0, 0)),
+                ball_size: std::cell::Cell::new((0.0, 0.0)),
                 ball_delay_armed: std::cell::Cell::new(false),
                 ctx: Some(ctx),
                 swapchain: None,
@@ -4142,11 +4147,11 @@ impl CandidateWindowV2 {
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
                     let mut fx = px as f32;
                     let mut fy = py as f32;
-                    // 【四修·避光标】框完全展开后最高点不得高于光标：
-                    // anchor.bottom 实测比视觉光标条底浅 ~8px（曾重叠
-                    // 2px），+12 安全垫保证整条光标露出。
+                    // 【四修·避光标→六修加深】框最高点不得高于光标：
+                    // +12 实测仍盖字（anchor.bottom 比视觉行底浅）——
+                    // +20：面板顶整条光标+已打字行完全露出。
                     if let Some(a) = anchor {
-                        let floor = a.bottom as f32 + 12.0;
+                        let floor = a.bottom as f32 + 20.0;
                         if fy < floor {
                             fy = floor;
                         }
@@ -4155,6 +4160,8 @@ impl CandidateWindowV2 {
                             fx = xfloor;
                         }
                     }
+                    // 【六修】记录当前框尺寸（观察窗 caret 跟随用）。
+                    self.ball_size.set((apply.0 as f32, apply.1 as f32));
                     // 【四修·收球观察窗取消】新键入=框跟随光标平滑移动
                     // （屏位锚 from=cur 续动），不收球。
                     unsafe {
@@ -4164,6 +4171,11 @@ impl CandidateWindowV2 {
                     // 窗口=「球位∪框位」包围盒。球位未知时（首键，无
                     // 球史）用 anchor 光标右下估位。morph 引擎屏位锚：
                     // from=当前视觉位（首键=原地起步）——无跳变。
+                    // 【六修·need 判定+前瞻余量】窗口每键 SWP=窗口瞬
+                    // 移，树 Offset 慢一帧补偿=「球先跳再形变」的两个
+                    // 个体感（用户实证）。覆盖即不动；扩窗时向 caret
+                    // 行进方向（右）+下一行（下）各留 200px 前瞻——
+                    // 连打多次不再逐键动窗。
                     let (sx0, sy0) = self.ball_frame.get();
                     let (sx, sy) = if sx0 == 0.0 && sy0 == 0.0 {
                         match anchor {
@@ -4178,17 +4190,27 @@ impl CandidateWindowV2 {
                     };
                     let x0 = sx.min(fx) - 10.0;
                     let y0 = sy.min(fy) - 10.0;
-                    let x1 = (sx + side).max(fx + apply.0 as f32) + 10.0;
-                    let y1 = (sy + side).max(fy + apply.1 as f32) + 10.0;
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        HWND_TOPMOST,
-                        x0 as i32,
-                        y0 as i32,
-                        (x1 - x0) as i32,
-                        (y1 - y0) as i32,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
+                    let x1 = (sx + side).max(fx + apply.0 as f32) + 210.0;
+                    let y1 = (sy + side).max(fy + apply.1 as f32) + 60.0;
+                    unsafe {
+                        let mut rr = RECT::default();
+                        let _ = GetWindowRect(self.hwnd, &mut rr);
+                        let covered = x0 >= rr.left as f32
+                            && y0 >= rr.top as f32
+                            && x1 <= rr.right as f32
+                            && y1 <= rr.bottom as f32;
+                        if !covered {
+                            let _ = SetWindowPos(
+                                self.hwnd,
+                                HWND_TOPMOST,
+                                x0 as i32,
+                                y0 as i32,
+                                (x1 - x0) as i32,
+                                (y1 - y0) as i32,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            );
+                        }
+                    }
                     b.fade_in();
                     b.morph_open(apply.0 as f32, apply.1 as f32, fx, fy);
                     self.ball_frame.set((fx, fy));
@@ -4406,7 +4428,28 @@ impl CandidateWindowV2 {
             if self.ball_target.get() == (cx, cy) {
                 return;
             }
+            let (ocx, ocy) = self.ball_target.get();
+            let armed = self.ball_delay_armed.get();
             self.ball_target.set((cx, cy));
+            // 【六修·观察窗跟随】上屏后 caret 前移（字宽推进）：框平移
+            // 跟随（caret 位移增量——屏位锚 from=cur 续动）+重起观察
+            // 窗。不跟随=字打进框底（用户实证「盖住打出来的字」）。
+            if armed {
+                let (bw, bh) = self.ball_size.get();
+                let (fx0, fy0) = self.ball_frame.get();
+                let fx2 = fx0 + (cx - ocx) as f32;
+                let mut fy2 = fy0 + (cy - ocy) as f32;
+                // 框顶不得高于光标（+20 同 show clamp）。
+                let floor = cy as f32 + 20.0;
+                if fy2 < floor {
+                    fy2 = floor;
+                }
+                if bw > 0.0 && bh > 0.0 {
+                    b.fade_in();
+                    b.morph_open(bw, bh, fx2, fy2);
+                    self.ball_frame.set((fx2, fy2));
+                }
+            }
             // 【四修·收球观察窗】上屏后不立即框→球——半秒观察：期内
             // 键入（show 杀 timer，框平滑跟去新位）；无键入到点收球。
             self.ball_pending.set((cx, cy));
@@ -4416,13 +4459,19 @@ impl CandidateWindowV2 {
                 let need = sx < rr.left as f32
                     || sy < rr.top as f32
                     || sx + side > rr.right as f32
-                    || sy + side > rr.bottom as f32;
+                    || sy + side > rr.bottom as f32
+                    || armed;
                 if need {
                     let (fx, fy) = self.ball_frame.get();
+                    let (bw, bh) = if armed {
+                        self.ball_size.get()
+                    } else {
+                        (200.0, 160.0)
+                    };
                     let x0 = sx.min(fx) - 10.0;
                     let y0 = sy.min(fy) - 10.0;
-                    let x1 = (sx + side).max(fx + 200.0).max(rr.right as f32) + 10.0;
-                    let y1 = (sy + side).max(fy + 160.0).max(rr.bottom as f32) + 10.0;
+                    let x1 = (sx + side).max(fx + bw).max(rr.right as f32) + 10.0;
+                    let y1 = (sy + side).max(fy + bh).max(rr.bottom as f32) + 10.0;
                     let _ = SetWindowPos(
                         self.hwnd,
                         HWND_TOPMOST,

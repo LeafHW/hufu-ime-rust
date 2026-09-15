@@ -407,9 +407,14 @@ unsafe fn synth_thread(
             BallCmd::PaintBall { ring, core } => {
                 last_ring = ring;
                 last_core = core;
-                // 纯重画（球色热更）——morph 进行中则下一 tick 会覆盖，
-                // 驻留球态=立即刷新。
-                if morph.is_none() {
+                // 【六修】仅球态重画：框态（morph 完成后 morph=None、
+                // cur=框尺寸）paint_ball 会把球帧盖进框 content——连打
+                // 时 show 每帧覆盖=框里只剩小球（「形变不是球变框」+
+                // 交替闪的根源，用户实证）。色缓存照常（morph 帧自取）。
+                if morph.is_none()
+                    && cur.w <= ball_side + 0.5
+                    && cur.h <= ball_side + 0.5
+                {
                     let ok = paint_ball_into(&chain, &d2d_dev, ring, core);
                     crate::tsf::diag_note(&format!("v5球T: paint={} ring={:08X}", ok, ring));
                 }
