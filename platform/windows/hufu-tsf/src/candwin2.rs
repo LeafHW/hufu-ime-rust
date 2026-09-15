@@ -4147,11 +4147,13 @@ impl CandidateWindowV2 {
                     let side = (crate::ballwin::BALL_D + 2.0 * crate::ballwin::BALL_PAD) as f32;
                     let mut fx = px as f32;
                     let mut fy = py as f32;
-                    // 【四修·避光标→六修加深】框最高点不得高于光标：
-                    // +12 实测仍盖字（anchor.bottom 比视觉行底浅）——
-                    // +20：面板顶整条光标+已打字行完全露出。
+                    // 【四修→七修行高感知】框最高点不得高于光标：
+                    // anchor.bottom 在大行高应用（Word 等）只到光标条
+                    // 底而非整行底——固定 +20 仍盖字（用户多次实证）。
+                    // 深垫=max(24, 光标条高×0.8)：行高越大垫越深。
                     if let Some(a) = anchor {
-                        let floor = a.bottom as f32 + 20.0;
+                        let carret_h = (a.bottom - a.top).max(1) as f32;
+                        let floor = a.bottom as f32 + (24.0f32).max(carret_h * 0.8);
                         if fy < floor {
                             fy = floor;
                         }
@@ -4188,10 +4190,10 @@ impl CandidateWindowV2 {
                     } else {
                         (sx0, sy0)
                     };
-                    let x0 = sx.min(fx) - 10.0;
-                    let y0 = sy.min(fy) - 10.0;
+                    let x0 = sx.min(fx) - 70.0;
+                    let y0 = sy.min(fy) - 70.0;
                     let x1 = (sx + side).max(fx + apply.0 as f32) + 210.0;
-                    let y1 = (sy + side).max(fy + apply.1 as f32) + 60.0;
+                    let y1 = (sy + side).max(fy + apply.1 as f32) + 70.0;
                     unsafe {
                         let mut rr = RECT::default();
                         let _ = GetWindowRect(self.hwnd, &mut rr);
@@ -4431,24 +4433,24 @@ impl CandidateWindowV2 {
             let (ocx, ocy) = self.ball_target.get();
             let armed = self.ball_delay_armed.get();
             self.ball_target.set((cx, cy));
-            // 【六修·观察窗跟随】上屏后 caret 前移（字宽推进）：框平移
-            // 跟随（caret 位移增量——屏位锚 from=cur 续动）+重起观察
-            // 窗。不跟随=字打进框底（用户实证「盖住打出来的字」）。
-            if armed {
-                let (bw, bh) = self.ball_size.get();
+            // 【七修·跟随去抖+move】caret 位移 <3px 的 poll 噪声不触发
+            // 平移（宿主重排版的微小 caret 抖动）；平移用 MorphMove
+            // （120ms 线性——300ms ease 每 110ms 重启=一顿一顿的抖
+            // 动源，用户实证「快速 d+空格 有抖动」）。
+            let dx = (cx - ocx).abs();
+            let dy = (cy - ocy).abs();
+            if armed && (dx >= 3 || dy >= 3) {
                 let (fx0, fy0) = self.ball_frame.get();
                 let fx2 = fx0 + (cx - ocx) as f32;
                 let mut fy2 = fy0 + (cy - ocy) as f32;
-                // 框顶不得高于光标（+20 同 show clamp）。
+                // 框顶不得低于光标（caret 中心+20 深垫）。
                 let floor = cy as f32 + 20.0;
                 if fy2 < floor {
                     fy2 = floor;
                 }
-                if bw > 0.0 && bh > 0.0 {
-                    b.fade_in();
-                    b.morph_open(bw, bh, fx2, fy2);
-                    self.ball_frame.set((fx2, fy2));
-                }
+                b.fade_in();
+                b.morph_move(fx2, fy2);
+                self.ball_frame.set((fx2, fy2));
             }
             // 【四修·收球观察窗】上屏后不立即框→球——半秒观察：期内
             // 键入（show 杀 timer，框平滑跟去新位）；无键入到点收球。

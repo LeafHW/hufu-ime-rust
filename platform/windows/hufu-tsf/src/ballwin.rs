@@ -77,6 +77,9 @@ pub enum BallCmd {
     MorphOpen { w: f32, h: f32, tx: f32, ty: f32 },
     /// 框→球（慢，可被打断反转）。tx/ty=球屏位（元素框左上）。
     MorphClose { tx: f32, ty: f32 },
+    /// 【七修】框态纯平移（观察窗跟随专用）：120ms 线性、尺寸不变、
+    /// ballness 恒 0——短线性=被打断重启的视觉痕迹最小。
+    MorphMove { tx: f32, ty: f32 },
     /// 渐隐。
     FadeOut,
     /// 渐显（Opacity=1）。
@@ -131,6 +134,10 @@ impl BallWin {
     }
     pub fn morph_close(&self, tx: f32, ty: f32) {
         self.send(BallCmd::MorphClose { tx, ty });
+    }
+    /// 【七修】观察窗跟随平移（框态，120ms 线性）。
+    pub fn morph_move(&self, tx: f32, ty: f32) {
+        self.send(BallCmd::MorphMove { tx, ty });
     }
     pub fn fade_out(&self) {
         self.send(BallCmd::FadeOut);
@@ -388,7 +395,7 @@ unsafe fn synth_thread(
     let mut cur = Geo { w: ball_side, h: ball_side, sx: 0.0, sy: 0.0 };
     let mut cur_valid = false; // 首命令前 cur 无效——from=to（原地起步）
     let mut win_org: (f32, f32) = (0.0, 0.0);
-    let mut morph: Option<(Geo, Geo, std::time::Instant, u32, bool)> = None; // (from,to,t0,ms,closing)
+    let mut morph: Option<(Geo, Geo, std::time::Instant, u32, u8)> = None; // (from,to,t0,ms,mode: 0=open 1=close 2=move)
     let mut ballness = 1.0f32; // 球接近度（1=纯球：core 满显+inset=pad；0=纯框）
     let mut idle_ticks: u32 = 0;
     let mut last_ring: u32 = 0xFF101014;
@@ -427,11 +434,17 @@ unsafe fn synth_thread(
                 let to = Geo { w, h, sx: tx, sy: ty };
                 let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: ball_side, h: ball_side, sx: tx, sy: ty } };
                 cur_valid = true;
+                // 【七修·取证】open 的 from→to 距离（「两个独立个体」
+                // 诊断：球位与框位差多少）。
+                crate::tsf::diag_note(&format!(
+                    "v5球T: open from=({:.0},{:.0},{:.0}x{:.0}) to=({:.0},{:.0},{:.0}x{:.0})",
+                    from.sx, from.sy, from.w, from.h, to.sx, to.sy, to.w, to.h
+                ));
                 morph = Some((
                     from, to,
                     std::time::Instant::now(),
                     MORPH_OPEN_MS as u32,
-                    false,
+                    0,
                 ));
                 // morph 中停呼吸（Scale 干扰逐帧 SetSize）。
                 content.StopAnimation(&HSTRING::from("Scale"));
@@ -446,7 +459,26 @@ unsafe fn synth_thread(
                     from, to,
                     std::time::Instant::now(),
                     MORPH_CLOSE_MS as u32,
-                    true,
+                    1,
+                ));
+                content.StopAnimation(&HSTRING::from("Scale"));
+                let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
+            }
+            BallCmd::MorphMove { tx, ty } => {
+                // 【七修·观察窗跟随专用】框态纯平移：尺寸不变、
+                // ballness 恒 0、120ms 线性——短+线性=被打断重启的视觉
+                // 痕迹最小（300ms ease 反复重启=一顿一顿的抖动源，
+                // 用户实证「快速 d+空格 有抖动」）。
+                refresh_win_org(hwnd, &mut win_org);
+                let (w0, h0) = if cur_valid { (cur.w, cur.h) } else { (200.0, 160.0) };
+                let from = if cur_valid { Geo { w: cur.w, h: cur.h, sx: cur.sx, sy: cur.sy } } else { Geo { w: w0, h: h0, sx: tx, sy: ty } };
+                let to = Geo { w: w0, h: h0, sx: tx, sy: ty };
+                cur_valid = true;
+                morph = Some((
+                    from, to,
+                    std::time::Instant::now(),
+                    120,
+                    2,
                 ));
                 content.StopAnimation(&HSTRING::from("Scale"));
                 let _ = content.SetScale(N::Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
@@ -503,14 +535,24 @@ unsafe fn synth_thread(
             // 【morph v2 插值帧驱动】15ms/tick：progress→ease→几何+内容
             // 同帧应用（SetSize/SetOffset+画插值帧+Present——Stretch.None
             // 下合成器动画只是揭幕裁剪，形变必须内容帧逐帧画）。
-            if let Some((from, to, t0, ms, closing)) = &morph {
+            if let Some((from, to, t0, ms, mode)) = &morph {
                 let t = (t0.elapsed().as_millis() as f32 / *ms as f32).min(1.0);
-                let e = if *closing { ease_in_out(t) } else { ease_out(t) };
+                // 【七修】mode 2=move：线性（短平移，重启痕迹最小）。
+                let e = match *mode {
+                    1 => ease_in_out(t),
+                    2 => t,
+                    _ => ease_out(t),
+                };
                 cur.w = lerp(from.w, to.w, e);
                 cur.h = lerp(from.h, to.h, e);
                 cur.sx = lerp(from.sx, to.sx, e);
                 cur.sy = lerp(from.sy, to.sy, e);
-                ballness = if *closing { e } else { 1.0 - e };
+                // 【七修】mode 2=move：框态恒定（ballness=0）。
+                ballness = match *mode {
+                    1 => e,
+                    2 => 0.0,
+                    _ => 1.0 - e,
+                };
                 let _ = content.SetSize(N::Vector2 { X: cur.w.max(2.0), Y: cur.h.max(2.0) });
                 // 屏位→窗口 Offset（morph 期间窗口恒定——win_org 命令
                 // 时已刷新）。
@@ -530,12 +572,13 @@ unsafe fn synth_thread(
                 let _ = root.SetIsVisible(false);
                 let _ = root.SetIsVisible(true);
                 if t >= 1.0 {
-                    let closing = *closing;
+                    let closing = *mode == 1;
                     morph = None;
-                    let _ = closing;
-                    crate::tsf::diag_note("v5球T: 收球完成");
-                    // 【取证】收球终态帧 readback（swapchain 里有没有球）。
-                    readback_probe(&chain, &d3d_dev);
+                    if closing {
+                        crate::tsf::diag_note("v5球T: 收球完成");
+                        // 【取证】收球终态帧 readback（swapchain 里有没有球）。
+                        readback_probe(&chain, &d3d_dev);
+                    }
                 }
             } else {
                 // 空闲计数（15ms/tick）：BALL_IDLE_MS 无命令→球渐隐→隐藏。
