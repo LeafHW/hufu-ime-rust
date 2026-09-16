@@ -2387,30 +2387,15 @@ impl CandidateWindowV2 {
             ),
             None => (width, height),
         };
-        // 【高亮锚定 v4·出入同锚 2026-10-09 十】入场动画：窗口位置/尺寸
-        // =目标全程稳定（零位移=零跳变），动画=窗口内的「外壳盒」从锚点
-        // 长到全窗；退场=同一锚点反向收拢。锚点=**首项**高亮胶囊中心
-        // （渲染帧捕获 i==0——入退场共用：从哪来回哪去，出入都在左上
-        // 首项高亮区，用户口径）。缺省（无捕获）回退窗口中心。
-        // damp 随进度归零（入场）/增至 1（退场），完成帧=整窗。普通尺寸
-        // 动效/稳态 bx=by=0。
-        let (bx, by) = if (self.scale_in.get() || self.scale_out.get()) && self.size_anim.is_some() {
-            let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
-            let k = match self.size_anim {
-                Some((_, _, t0)) => {
-                    (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32).clamp(0.0, 1.0)
-                }
-                None => 1.0,
-            };
-            let damp = if self.scale_out.get() { k } else { 1.0 - k };
-            (
-                (damp * (hx - chw * 0.5)).clamp(0.0, (width - chw).max(0.0)),
-                (damp * (hy - chh * 0.5)).clamp(0.0, (height - chh).max(0.0)),
-            )
-        } else {
-            (0.0, 0.0)
-        };
-        'sizedraw: {
+        // 【左上角生长·出入同款 2026-10-09 十一】入场/退场动画：窗口位
+        // 置/尺寸=目标全程稳定（零位移=零跳变），动画=窗口内的「外壳
+        // 盒」贴**窗口左上角**生长/收拢——入场从左上角小块向右下拉
+        // 开到全窗；退场反向缩回左上角小块再隐藏（「从左上角出来、回
+        // 左上角去」用户口径；此前对称锚高亮中心=「整个高亮一起」中
+        // 心缩放，观感不对）。盒偏移恒 (0,0)=贴左上；盒尺寸由
+        // size_anim 缓动值（chrome_override）驱动。稳态 bx=by=0 同值。
+        let (bx, by) = (0.0f32, 0.0f32);
+        {
             // 【零位移配套】缓冲按实际窗口（含收窄轴向的缓动值——收窄帧
             // 窗口=缓动≥目标；grow-only 下不触发重建，宽缓冲沿用）。
             let (buf_w, buf_h) = match self.size_anim {
