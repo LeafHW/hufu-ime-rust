@@ -1663,42 +1663,31 @@ impl CandidateWindowV2 {
             //（退场门控）量「窗刻意在场多久」；此前每键刷新导致正常打字
             // 收尾总被判连打直藏（「消失没动画」根因）
         }
-        // 【高亮滑动 2026-10-09】同一候选列表上高亮下标变化（↑↓ 移动 /
-        // 数字、；选重闪帧）→ 胶囊从上一帧矩形滑到新位（用户规格：uru3
-        // 要看到高亮移过去，箭头移动同款动效）。列表变化（新组段/翻页）
-        // 或跨会话首显不滑——直接就位；动效 tick 复渲染不算变化。prev 记
-        // 在窗体（shared.last_show 锁外不可达，窗自记即够；比较用抑制前
-        // 的原列表，与渲染入参同源）。
+        // 【高亮滑动 2026-10-09】高亮下标变化（↑↓ 移动 / 数字、；选重
+        // 闪帧）→ 胶囊从上一帧渲染矩形滑到新位（用户规格：uru3 要看
+        // 到高亮移过去，箭头移动同款动效）。【二修 2026-10-09】列表变
+        // 化也滑：提前上屏后的新段首键（bu;「好的」上屏→按 b，高亮从
+        // 锁位次跳回第 1 项）从上一帧矩形滑过去——只对「位次跳变」生
+        // 效；同位不滑（普通逐键 0→0，列表宽度微变，连打不漂移不闪）。
+        // 跨会话首显（was_visible=false）不滑；动效 tick 复渲染不算。
+        // prev 记在窗体（shared.last_show 锁外不可达，窗自记即够；比较
+        // 用抑制前的原列表，与渲染入参同源）。
         if !self.internal_rerender && self.hl_ms > 0 {
             let prev = self.hl_prev.take();
             if was_visible {
-                let same_list = prev
-                    .as_ref()
-                    .map(|(lc, _)| {
-                        lc.len() == cands.len()
-                            && lc
-                                .iter()
-                                .zip(cands.iter())
-                                .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
-                    })
-                    .unwrap_or(false);
-                if same_list {
-                    let prev_sel = prev.map(|(_, s)| s).unwrap_or(selected);
-                    if prev_sel != selected {
-                        if let Some(fr) = self.hl_rect.get() {
-                            crate::tsf::diag_note("动效: 高亮滑动起臂");
-                            self.hl_anim
-                                .set(Some((fr, std::time::Instant::now(), self.hl_ms)));
-                            unsafe {
-                                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                            }
+                let prev_sel = prev.map(|(_, s)| s).unwrap_or(selected);
+                if prev_sel != selected {
+                    if let Some(fr) = self.hl_rect.get() {
+                        crate::tsf::diag_note("动效: 高亮滑动起臂");
+                        self.hl_anim
+                            .set(Some((fr, std::time::Instant::now(), self.hl_ms)));
+                        unsafe {
+                            let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                         }
                     }
-                    // 同位（常规逐键刷新/闪帧尾段二次渲染）：不动在身滑动
-                    //——到点自清，列表变才作废（连续反向移动=矩形连续插值）。
                 } else {
-                    // 列表变了：旧矩形无意义，滑动作废
-                    self.hl_anim.set(None);
+                    // 同位（常规逐键刷新/闪帧尾段二次渲染）：不动在身滑动
+                    //——到点自清（连续反向移动=矩形连续插值）。
                 }
             }
             self.hl_prev.set(Some((cands.to_vec(), selected)));
