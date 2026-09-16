@@ -4242,10 +4242,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 行（sticky_near 豁免 + 补显早于布局刷新）。表格段同时不吃
         // sticky_near 豁免（豁免=立即放行，旧值必错）。
         let cell_seg = g.ed6_prev.is_some();
+        // 【首段等待分流 2026-10-09 八】200ms 线当年为 et 表格慢布局
+        // 定（表格换格布局 150ms+ 才就绪）。文字文档布局 35-70ms 就绪
+        // ——非表格首段 200ms 全等满=焦点切换首键实测 262-361ms 的主
+        // 因。分流：表格段保留 200（宁慢勿错），文字首段 100ms（已盖
+        // 住 2 轮 35ms 补显重查 + Qt 36ms 布局）；错位防线不变——
+        // caret.is_some() 门未就绪依然不显示。
         let (wps_stable, wps_deadline) = if first_seg_ever || cell_seg {
+            let wait_ms = if cell_seg { 200 } else { 100 };
             (
                 g.wps_settle_start.is_some_and(|t| {
-                    t.elapsed() > std::time::Duration::from_millis(200)
+                    t.elapsed() > std::time::Duration::from_millis(wait_ms)
                 }) && g.caret.is_some(),
                 g.wps_settle_start.is_some_and(|t| {
                     t.elapsed() > std::time::Duration::from_millis(500)

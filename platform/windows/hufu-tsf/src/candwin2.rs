@@ -391,6 +391,10 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         c.pos_anim = None;
                         c.fade = None;
                         c.live_size.set((0, 0));
+                        // 【跨会话首帧自由 2026-10-09 八】
+                        c.ylock_last_dir.set(0);
+                        c.ylock_acc.set(0);
+                        c.show_frame_fresh.set(true);
                     }
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     match (g.cand2.take(), cand2) {
@@ -686,6 +690,10 @@ pub struct CandidateWindowV2 {
     /// 抖动借「同向放行」穿透：±1/±2 连续爬升-回落是抖动，累计小；
     /// 真滚动每帧 7-40px 累计快。方向反转时归零重计）。
     pub(crate) ylock_acc: std::cell::Cell<i32>,
+    /// 【跨会话首帧自由 2026-10-09 八】hide→show 新会话首帧不背旧 y 锁
+    /// 状态（焦点切换后新锚与旧显示位差 4-26px 且反向时会被钉旧 y
+    /// 错位）。真隐藏时置 true；show 消费后归 false——首帧自由定位。
+    pub(crate) show_frame_fresh: std::cell::Cell<bool>,
     /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 100，0=瞬跳）
     pub(crate) pos_ms: u32,
     /// 【动效开关 2026-09-11】设置页全局：false=一切动效瞬跳
@@ -1023,6 +1031,7 @@ impl CandidateWindowV2 {
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
                 ylock_acc: std::cell::Cell::new(0),
+                show_frame_fresh: std::cell::Cell::new(true),
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -1198,6 +1207,7 @@ impl CandidateWindowV2 {
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
                 ylock_acc: std::cell::Cell::new(0),
+                show_frame_fresh: std::cell::Cell::new(true),
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -3509,10 +3519,18 @@ impl CandidateWindowV2 {
                         // 刺；同向累计 ≥8px 且单步 ≥4px 才放行（真滚动
                         // 每帧 7-40 一步即过，锯齿累计小步全钉）；换行
                         // 级 >26px 立即放行；方向反转清零重计。
+                        // 【跨会话首帧自由 2026-10-09 八】真隐藏后的第
+                        // 一个显示帧自由定位（焦点切换新位置不背旧锁/
+                        // 旧累计——反向 4-26px 小位移钉错位洞）。
+                        let fresh = self.show_frame_fresh.replace(false);
                         let dy_lock = y - match self.sticky_pos {
                             Some((_, oy)) => oy,
                             None => y,
                         };
+                        if fresh {
+                            self.ylock_last_dir.set(0);
+                            self.ylock_acc.set(0);
+                        }
                         let same_dir = self.ylock_last_dir.get() != 0
                             && dy_lock != 0
                             && (self.ylock_last_dir.get() > 0) == (dy_lock > 0);
@@ -3521,7 +3539,8 @@ impl CandidateWindowV2 {
                         } else {
                             dy_lock.abs()
                         };
-                        let allow = dy_lock.abs() > 26
+                        let allow = fresh
+                            || dy_lock.abs() > 26
                             || (same_dir && acc_now >= 8 && dy_lock.abs() >= 4);
                         if dy_lock.abs() > 26 {
                             self.ylock_last_dir.set(0);
@@ -4079,6 +4098,11 @@ impl CandidateWindowV2 {
         // 中下方」的病根）。
         // 【位置滑动】收窗即作废位置动效（下个组段首显瞬移新位）
         self.pos_anim = None;
+        // 【跨会话首帧自由 2026-10-09 八】真隐藏=显示会话结束——y 锁状
+        // 态清零 + 首帧自由标记（下个 show 首帧不背旧位置锁）。
+        self.ylock_last_dir.set(0);
+        self.ylock_acc.set(0);
+        self.show_frame_fresh.set(true);
         // 【拖拽钉住解除】收窗（上屏断段/失焦/翻段）即解除拖拽钉住
         // ——下一组段恢复跟随 caret。
         self.sticky_drag = false;
