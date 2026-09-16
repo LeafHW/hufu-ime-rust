@@ -4013,8 +4013,21 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
-            } else if let Some(c) = g.cand2.as_mut() {
-                c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            } else {
+                // 【十七修·真信号打断 2026-10-09】真实键入帧（raw_state
+                // 非空）先作废停留钟/退场：本路径 inline_preedit 默认开
+                // 时传给 show() 的 raw 是编码行剥离值（恒空），渲染段
+                // 的 raw 打断条件从未生效——退场动画中打新编码会卡
+                // scale_out=true → 候选永存（用户实测：关暂留+上屏后
+                // 动画内快打新编码）。打断必须用 raw_state 真值。
+                if !raw_state.is_empty() {
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.interrupt_effects();
+                    }
+                }
+                if let Some(c) = g.cand2.as_mut() {
+                    c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                }
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
         } else if crate::addword::in_window_thread() {

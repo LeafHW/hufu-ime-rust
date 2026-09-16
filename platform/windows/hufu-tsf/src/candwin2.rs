@@ -2302,6 +2302,13 @@ impl CandidateWindowV2 {
         // 废（「可被新键入打断」）——退场打断后下方尺寸链从当前插值
         // 尺寸续到新目标=在打断处重新长出来。raw 空的迟到预测刷新不
         // 打断（预测迟到就迟到，退场照走）。
+        // 【十七修·真信号打断 2026-10-09】此处的 raw 是**显示用编码行**
+        //（inline_preedit 默认开 → update_ui 主显示路径传给 show 的 raw
+        // 恒空——条件对它从未生效，退场中打新键 → scale_out 卡 true →
+        // hide 守卫+poll 全空转=候选永存，用户实测「关暂留+上屏后动画
+        // 内快打新编码」即踩中）。真实键入帧的打断由 update_ui 在调
+        // show 前按 raw_state 调 interrupt_effects()（真信号）；此处
+        // 条件保留，覆盖 D/A 等传真 raw 的路径，双保险。
         if !self.internal_rerender && !raw.is_empty() {
             self.scale_out.set(false);
             self.commit_hold.set(None);
@@ -4085,7 +4092,16 @@ impl CandidateWindowV2 {
         // SetTimer0→10ms hold_fire→size_anim.t0 重置），完成判定永不
         // 满足=退场动画无限重启、窗口永不隐藏（实测连续退场起臂 15ms
         // 一条）。守卫：退场中直接 return，动画完成帧自会 hide_now。
+        // 【十七修·卡死兜底】scale_out=true 正常寿命=out_ms(≤600ms)+tick
+        // 粒度——size_anim 起臂超 1.5s 仍卡在退场态 = FADE tick 死/标志
+        // 漏清（历史 bug 形态），强制真隐收窗，绝不允许候选永存。
         if self.scale_out.get() {
+            if let Some((_, _, t0)) = self.size_anim {
+                if t0.elapsed() > std::time::Duration::from_millis(1500) {
+                    crate::tsf::diag_note("动效: 退场卡死兜底→真隐藏");
+                    self.hide_now();
+                }
+            }
             return;
         }
         if self.is_visible() {
@@ -4112,6 +4128,19 @@ impl CandidateWindowV2 {
             return;
         }
         self.hide();
+    }
+
+    /// 【十七修·真信号打断 2026-10-09】真实键入帧作废停留钟/退场——
+    /// 与渲染段内 raw 非空打断块同一效果，但由调用方（update_ui 主
+    /// 显示路径）按 raw_state 真值触发：该路径 inline_preedit 默认开
+    /// 时传给 show() 的 raw 恒空（编码行剥离），渲染段条件从未生效
+    /// （退场中打新编码 → scale_out 卡 true → 候选永存，用户实测）。
+    pub fn interrupt_effects(&mut self) {
+        self.scale_out.set(false);
+        self.commit_hold.set(None);
+        unsafe {
+            let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+        }
     }
 
     /// 真隐藏（原 1.5.9 hide）：停留钟/退场作废，PostMessage 异步
