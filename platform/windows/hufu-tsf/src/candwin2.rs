@@ -4453,14 +4453,15 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
             let mut rc = RECT::default();
             let _ = GetWindowRect(c.hwnd, &mut rc);
             let cur = (rc.right - rc.left, rc.bottom - rc.top);
-            // 【退场柔化 2026-10-09 三】收到 40%（原 72%：窗口还很大就硬
-            // 隐藏=「啪」地闪断）+ 200ms 缓收（原 60ms=抖一下就没）——缩
-            // 到很小再隐藏，硬切几乎无感；时长走 out_ms（scale_out 态下
-            // 插值/完成判定自动切换）。
-            let tgt = (
-                (cur.0 as f32 * 0.40) as i32,
-                (cur.1 as f32 * 0.40) as i32,
-            );
+            // 【退场柔化 2026-10-09 三】收到 50% + 200ms 缓收——缩到很
+            // 小再隐藏，硬切几乎无感；时长走 out_ms（scale_out 态下插
+            // 值/完成判定自动切换）。
+            // 【收拢正圆 2026-10-09 十二】等比收拢终点是缩小长方形=
+            // 「椭圆」观感（用户反馈不好看）。终点改**正方形**（宽=高=
+            // min 边×50%）——收完是个正圆点再隐，更干净。比例 40→50
+            //（用户拍板试试）。
+            let side = (cur.0.min(cur.1) as f32 * 0.50) as i32;
+            let tgt = (side, side);
             if tgt.0 > 4 && tgt.1 > 4 && c.out_ms > 0 {
                 c.fade = None;
                 c.scale_out.set(true);
