@@ -3612,6 +3612,87 @@ mod tests {
         assert_eq!(r5.locks, vec![(2, 2)]);
     }
 
+    /// 【无模型=纯码表总闸 2026-10-09 十九】用户口径：模型存在与否是
+    /// 唯一算法开关——安装根目录无模型文件（server 的 sentence_load_plan
+    /// 探测 ngram 路径失败 → engine.sentence=None）时，**任何方案**
+    ///（含名字带「整句」的整句虎）都是纯码表：码表原样候选、顶屏/空码
+    /// /选重/翻页纯码表语义，整句类算法零介入。本测试用虎整句格式码表
+    /// （一简+简词行）+无 decoder 锁定行为快照，防任何算法路径在
+    /// sentence.is_none() 时漏出。
+    #[test]
+    fn no_model_pure_dict_total_gate() {
+        let dir = std::env::temp_dir().join(format!("hufu-nomodel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dict_dir = dir.join("码表").join("虎整句");
+        std::fs::create_dir_all(&dict_dir).unwrap();
+        // 虎整句原生格式：一行多候选（空格分隔）
+        std::fs::write(
+            dict_dir.join("码表.txt"),
+            "#hufu-dict v1 name=虎整句测试\n\
+             bu 建 好的\n\
+             a 来 那个\n\
+             aaaa 魑魅魍魉\n\
+             jd 就 到的 加\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.schema.current = "虎整句".into();
+        config.input.auto_clear_empty = true;
+        let mut engine = Engine::new(&dir, config).unwrap();
+        // 无模型总闸：decoder 必不在身，sentence_active 必关（哪怕方案名带整句+配置开）
+        assert!(engine.sentence.is_none(), "无模型: 不得装载解码器");
+        assert!(!engine.sentence_active(), "无模型: 整句不激活");
+
+        // ① 码表原序候选（无浮字/无短语压前/无重排——上一行就是终序）
+        let mut s = Session::new(true);
+        engine.process_key(&mut s, key('b'));
+        engine.process_key(&mut s, key('u'));
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["建", "好的"], "码表原序即终序");
+
+        // ② 次选键=码表第 2 位（bu; 恒=好的）；且不进学习（十八修）
+        let mut s2 = Session::new(true);
+        engine.process_key(&mut s2, key('b'));
+        engine.process_key(&mut s2, key('u'));
+        let out = engine.process_key(&mut s2, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("好的"), "; 次选=码表第 2 词");
+
+        // ③ 空格首选 = 码表第 1 词
+        let mut s3 = Session::new(true);
+        engine.process_key(&mut s3, key('b'));
+        engine.process_key(&mut s3, key('u'));
+        let out3 = engine.process_key(&mut s3, key(' '));
+        assert_eq!(out3.commit.as_deref(), Some("建"), "空格首选=码表第 1 词");
+
+        // ④ 数字选重 = 码表位次
+        let mut s4 = Session::new(true);
+        engine.process_key(&mut s4, key('j'));
+        engine.process_key(&mut s4, key('d'));
+        let out4 = engine.process_key(&mut s4, key('2'));
+        assert_eq!(out4.commit.as_deref(), Some("到的"), "数字 2=码表第 2 词");
+
+        // ⑤ 满 4 码+第 5 键=顶屏首选（码表顶屏语义，非整句接管）
+        let mut s5 = Session::new(true);
+        for c in ['a', 'a', 'a', 'a'] {
+            engine.process_key(&mut s5, key(c));
+        }
+        let out5 = engine.process_key(&mut s5, key('t'));
+        assert_eq!(out5.commit.as_deref(), Some("魑魅魍魉"), "第 5 键顶屏码表首选");
+        assert_eq!(out5.state.unwrap().raw, "t", "第 5 键成为新串起点");
+
+        // ⑥ 无提前上屏/无整句拼接：committed_raw 恒空（上屏都走码表语义）
+        let mut s6 = Session::new(true);
+        engine.process_key(&mut s6, key('b'));
+        engine.process_key(&mut s6, key('u'));
+        engine.process_key(&mut s6, key(';'));
+        engine.process_key(&mut s6, key('a'));
+        let st6 = engine.process_key(&mut s6, key(' '));
+        assert_eq!(st6.commit.as_deref(), Some("来"), "上屏后新段=码表词");
+        assert!(st6.state.unwrap().raw.is_empty(), "空格上屏后组段清空");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rank_locks_parse() {
         // 无锁：base 原样
