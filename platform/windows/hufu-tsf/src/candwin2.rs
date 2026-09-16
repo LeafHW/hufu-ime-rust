@@ -682,6 +682,10 @@ pub struct CandidateWindowV2 {
     /// 锁住（防单帧毛刺），连续同向的第二个小步起放行（真实滚动跟随，
     /// 一帧滞后）。0=无方向记忆。
     pub(crate) ylock_last_dir: std::cell::Cell<i32>,
+    /// 【y 锁累计 2026-10-09 七】连续同向小步的累计幅度（防 WPS 锯齿
+    /// 抖动借「同向放行」穿透：±1/±2 连续爬升-回落是抖动，累计小；
+    /// 真滚动每帧 7-40px 累计快。方向反转时归零重计）。
+    pub(crate) ylock_acc: std::cell::Cell<i32>,
     /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 100，0=瞬跳）
     pub(crate) pos_ms: u32,
     /// 【动效开关 2026-09-11】设置页全局：false=一切动效瞬跳
@@ -1018,6 +1022,7 @@ impl CandidateWindowV2 {
                 internal_rerender: false,
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
+                ylock_acc: std::cell::Cell::new(0),
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -1192,6 +1197,7 @@ impl CandidateWindowV2 {
                 internal_rerender: false,
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
+                ylock_acc: std::cell::Cell::new(0),
                 last_hide_at: None,
                 last_show_at: None,
                 size_anim: None,
@@ -2371,16 +2377,16 @@ impl CandidateWindowV2 {
             ),
             None => (width, height),
         };
-        // 【高亮锚定 v2 2026-09-11】入场动画：窗口位置/尺寸=目标全程
-        // 稳定（零位移=零跳变），动画=窗口内的「外壳盒」从高亮胶囊处
-        // 长到全窗。盒左上 = damp·(高亮−盒半) 且钳制在窗内 [0, 尺寸−
-        // 盒]：高亮贴左/贴顶（横紧首候选、竖排首行）→ 盒贴对应边缘
-        // 就地生长（左/上无内容不空跳）；高亮居中 → 对称展开。damp 随
-        // 进度归零，完成帧=整窗。普通尺寸动效/稳态 bx=by=0。
-        // 【动效·退场】scale_out 同一机制反向（退场=入场的镜像）：
-        // damp=k 随进度增至 1（盒收拢回高亮胶囊处）。
+        // 【高亮锚定 v3·盒心对称 2026-10-09 七】入场动画：窗口位置/尺寸
+        // =目标全程稳定（零位移=零跳变），动画=窗口内的「外壳盒」从窗口
+        // 中心长到全窗；退场=镜像收拢回窗口中心。此前锚定高亮胶囊（入
+        // 场高亮在第 1 项=左上角「从左上出」、退场高亮在选中项=「收到
+        // 中间」）——出入不对称（用户反馈「收回在候选中心、出去在左上
+        // 角」）。统一真·盒心：从哪来回哪去，名实相符。
+        // damp 随进度归零（入场）/增至 1（退场），完成帧=整窗。普通尺寸
+        // 动效/稳态 bx=by=0。
         let (bx, by) = if (self.scale_in.get() || self.scale_out.get()) && self.size_anim.is_some() {
-            let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
+            let (hx, hy) = (width * 0.5, height * 0.5);
             let k = match self.size_anim {
                 Some((_, _, t0)) => {
                     (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32).clamp(0.0, 1.0)
@@ -3493,8 +3499,16 @@ impl CandidateWindowV2 {
                         // 【五十四修·方向连续性】51 修锁把打字区平滑滚
                         // 动（单向每段 -7~-40）也吃掉=窗滞后文字半行、
                         // 累积>26 才跳（用户「换行跟随不准」实测 trace
-                        // 实锤）。抖动双向、滚动单向连续：首个小步锁住
-                        // （防单帧毛刺），连续同向第二个小步起放行。
+                        // 实锤）。抖动双向、滚动单向连续：同向小步累计
+                        // 到门槛才放行。
+                        // 【y 锁累计 2026-10-09 七】54 修「同向第二步即
+                        // 放行」留洞：WPS 锚 y 锯齿（连续 2-3 帧 ±1~±2
+                        // 同向爬升后回落）借放行窗穿透=「Y 轴轻微抖动」
+                        //（WPS 单字打法四轮 180 段实测：y 微变 173 次，
+                        // ±1/±2 双向游走）。改累计门槛：单帧 ≤3px 钉毛
+                        // 刺；同向累计 ≥8px 且单步 ≥4px 才放行（真滚动
+                        // 每帧 7-40 一步即过，锯齿累计小步全钉）；换行
+                        // 级 >26px 立即放行；方向反转清零重计。
                         let dy_lock = y - match self.sticky_pos {
                             Some((_, oy)) => oy,
                             None => y,
@@ -3502,13 +3516,22 @@ impl CandidateWindowV2 {
                         let same_dir = self.ylock_last_dir.get() != 0
                             && dy_lock != 0
                             && (self.ylock_last_dir.get() > 0) == (dy_lock > 0);
+                        let acc_now = if same_dir {
+                            self.ylock_acc.get() + dy_lock.abs()
+                        } else {
+                            dy_lock.abs()
+                        };
+                        let allow = dy_lock.abs() > 26
+                            || (same_dir && acc_now >= 8 && dy_lock.abs() >= 4);
                         if dy_lock.abs() > 26 {
                             self.ylock_last_dir.set(0);
+                            self.ylock_acc.set(0);
                         } else if dy_lock != 0 {
                             self.ylock_last_dir.set(if dy_lock > 0 { 1 } else { -1 });
+                            self.ylock_acc.set(acc_now);
                         }
                         let y = match self.sticky_pos {
-                            Some((_, oy)) if dy_lock.abs() <= 26 && !same_dir => oy,
+                            Some((_, oy)) if !allow => oy,
                             _ => y,
                         };
                         // 【删棘轮 2026-09-12 十六次修正】poll 真实帧的
