@@ -4006,6 +4006,14 @@ impl CandidateWindowV2 {
     /// 停留钟无限续期永不退场）。失焦/切窗/生命周期收窗走
     /// hide_now()，抑制路径走 hide_suppress()。
     pub fn hide(&mut self) {
+        // 【动效总开关口径 2026-10-09 六】候选动效关（皮肤 anim=false）
+        // = 上屏后立即消失——暂留/收拢/滑动全套都是动效的一部分（用户
+        // 实测关动效后延时消失仍在=口径漏洞；hold_ms 是时长旋钮不是
+        // 开关，开关就是 anim）。
+        if !self.anim_on.get() {
+            self.hide_now();
+            return;
+        }
         if self.is_visible() {
             self.scale_out.set(false);
             unsafe {
