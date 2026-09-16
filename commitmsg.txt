@@ -1,25 +1,26 @@
-ngram 模型自动探测+拖入即用实测闭环（二十修）
+多宿主卡窗补全+孤儿组段兜底+Caps 默认回正（二十一修）
 
-【场景】无模型小包发给他人：接收者把模型文件拖进安装根「模型」
-文件夹、切到整句方案 → 整句算法自动介入；实时生效。
-【旧缺陷】sentence_load_plan 只认 config.sentence.ngram_path（默认
-models/sentence-ngram.bin）精确路径——文件名对不上时整句**静默
-不装载**（无任何提示），用户以为有模型其实在跑纯码表（本机实况：
-模型\mohu-sentence-ngram-v5.bin 在场而 config 是默认值，整句从未
-装载过）。
-【修法】两处同口径对齐 GGUF 的自动探测：
-  · host.rs sentence_load_plan：config 路径不存在时探测安装根
-    「模型」目录 .bin（多个取最大，主模型通常远大于附属文件）；
-  · main.rs hufu-model-watch 线程：探测口径同步（否则拖任意名
-    bin 时监视线程看不到边沿，不会触发自动装载）。
-【实测闭环（真机 D:\HUFU）】
-  ① 启动在场自动探测：整句引擎已加载（后台 0.0s）…模型\
-    mohu-sentence-ngram-v5.bin（文件名与 config 默认不符仍装载）；
-  ② 无模型启动（移走「模型」文件夹）：零装载日志=纯码表态；
-  ③ 运行中拖回：模型监视线程 2s 轮询，拖入到「自动装载+整句
-    引擎已加载」约 4-6s，无需重启无需切方案；触发与装载日志
-    连续两轮实验各命中（幂等，BUSY 闸门防重入）。
-  ④ 切方案路径：reload_sentence_bg 由切方案触发（既有链），
-    切到整句虎即重新评估装载。
-【注意】删除模型文件不会自动卸载（watch 只做「先缺后在」正向
-边沿）——移走模型后重启 server 或切一次方案即回纯码表。
+【问题一·多宿主复现】用户实测关闭「上屏后延时收候选」后，退场动
+画中快打新编码在 QQ/Typora/VSCode 仍候选永存（此前只修了记事本
+走的渲染分支）。根因：update_ui 有两个常规渲染分支（L4029 与
+L4333），十七修只给前者补了「真实键入帧打断」——后者（QQ/VSCode/
+Typora 等宿主走的路径）漏网，其 raw 同为编码行剥离值（inline_
+preedit 默认开恒空），show 内部打断条件不生效。
+【修】第二分支同款补 interrupt_effects（raw_state 真值触发）。
+【问题二·30ms 极限快打竞态】30-40ms 键距偶发复现（diag 实锤：i 的
+候选窗正确打断退场并显示，此后 3 秒完全静止——无 hide、无空帧，
+poll 被 raw_last 拦截静默）。根因：DLL 的 raw_last 是本地缓存，
+server 侧组段被外部清掉/空帧丢失时它成孤儿，「有编码不消失」的
+收窗拦截被孤儿变成永久显示。
+【修·双源判定】Shared 新增 srv_raw_empty_since（poll_tick 每 40ms
+记录 server 侧 raw 连续空时长）；poll_collapse_stale 拦截条件改为：
+raw_last 非空且 server 侧也连续空超 800ms = 孤儿，解除保护照常收
+窗。正常打字 server 几十 ms 内必有 raw，800ms 阈值不误伤「思考中
+编码在手」（回归实测：编码在手 2.5s 窗口仍在=不变量保住，ESC 正
+常收）。
+【问题三·Caps 默认】caps_action 默认误设 Clear（清屏），回正
+Switch（切英文）；老安装 config 已显式写值不受默认影响（本机
+config.json 已同步改回 Switch）。
+【验证】记事本/VSCode/QQ ×（50/40/30ms 键距 × 单键/双键序列）共
+20+ 轮快打全过（上屏后探测 0-1/18=动画尾巴正常）；编码在手 2.5s
+保护不误伤；caps 配置生效。

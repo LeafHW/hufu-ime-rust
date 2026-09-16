@@ -64,21 +64,24 @@ pub struct GeneralSection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CapsAction {
-    #[default]
     Clear,
+    #[default]
     Switch,
     None,
 }
 
 impl Default for GeneralSection {
     fn default() -> Self {
-        GeneralSection {
+        Self {
             autostart: true,
             hide_status_bar: false,
             follow_system_lang: true,
             shift_switch: true,
             ctrl_space_switch: true,
-            caps_action: CapsAction::Clear,
+            // 【2026-10-09 默认回正】Caps 默认=切英文（用户定稿；此前
+            // 误设 Clear）。老用户 config.json 里已显式写Clear 的不受
+            // 影响（序列化值优先于默认）。
+            caps_action: CapsAction::Switch,
             switch_recent_schema: true,
         }
     }

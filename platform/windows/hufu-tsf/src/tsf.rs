@@ -236,6 +236,12 @@ pub struct Shared {
     pub raw_last: String,
     /// raw 最近一次变化时刻
     pub raw_changed_at: Option<std::time::Instant>,
+    /// 【二十一修·孤儿组段兜底】server 侧 raw 连续为空的起始时刻
+    ///（非空即清 None）。DLL 的 raw_last 是本地缓存——server 组段被
+    /// 外部清掉/空帧丢失时它成孤儿，把「有编码不消失」的收窗拦截
+    /// 变成永久显示（30ms 快打竞态实锤：候选永存）。双源判定：
+    /// server 也空超 800ms = 孤儿，解除保护照常收窗。
+    pub srv_raw_empty_since: Option<std::time::Instant>,
     /// 插入点（屏幕坐标，GetTextExt 实测）
     pub caret: Option<RECT>,
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
@@ -452,6 +458,7 @@ impl Shared {
             delay_show_ms: 0,
             raw_last: String::new(),
             raw_changed_at: None,
+            srv_raw_empty_since: None,
             caret: None,
             chinese: true,
             composing: false,
@@ -4329,6 +4336,16 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
+                // 【十七修补全·二 2026-10-09】与 L4029 分支同款：真实
+                // 键入帧（raw_state 非空）先打断退场/停留——本分支的
+                // raw 是编码行剥离值（inline_preedit 默认开恒空），show
+                // 内部的 raw 打断条件不生效（QQ/VSCode/Typora 等宿主
+                // 走此分支，用户实测退场中打新编码候选永存）。
+                if !raw_state.is_empty() {
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.interrupt_effects();
+                    }
+                }
                 match g.cand2.as_mut() {
                     Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
                     None => {}
@@ -5233,8 +5250,19 @@ fn poll_collapse_stale(shared: &SharedRef) {
     // 【有编码不消失 2026-09-16】编码在手（raw_last 非空）不收窗——
     // 用户拍板不变量「只要有编码就不准消失」（mine 判定的 composition
     // 竞态兜底：组段句柄丢失但编码仍显示中的窗口）。
+    // 【二十一修·双源判定】raw_last 是 DLL 本地缓存，server 组段被
+    // 外部清掉/空帧丢失时它是孤儿——孤儿把本拦截变成永久显示（30ms
+    // 快打竞态实锤：候选永存）。server 侧 raw 也连续空超 800ms =
+    // 孤儿，解除保护照常收窗（正常打字 server 几十 ms 内必有 raw，
+    // 800ms 阈值不会误伤「思考中编码在手」的真场景）。
     if !g.raw_last.is_empty() {
-        return;
+        let orphan = g
+            .srv_raw_empty_since
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(800));
+        if !orphan {
+            return;
+        }
+        diag_note("poll: 孤儿编码（server 侧已空>800ms）→ 解除不消失保护，收窗");
     }
     let mut any_visible = false;
     if let Some(c) = g.cand2.as_mut() {
@@ -5398,6 +5426,21 @@ fn poll_tick() {
     let Some(state) = ipc::state_request() else {
         return;
     };
+    // 【二十一修·孤儿组段兜底】记录 server 侧 raw 连续空的时长
+    //（poll_collapse_stale 双源判定用）。
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let srv_raw_empty = state
+            .get("raw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
+        g.srv_raw_empty_since = if srv_raw_empty {
+            g.srv_raw_empty_since.or_else(|| Some(std::time::Instant::now()))
+        } else {
+            None
+        };
+    }
     let raw_empty = state
         .get("raw")
         .and_then(|v| v.as_str())
