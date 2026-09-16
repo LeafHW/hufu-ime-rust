@@ -651,7 +651,7 @@ pub struct CandidateWindowV2 {
     /// 起点在身（HOLD_TIMER 1s 到点→缩放退场）。真实键入帧（raw 非
     /// 空）即打断（show 顶部清）。
     pub(crate) commit_hold: std::cell::Cell<Option<std::time::Instant>>,
-    /// 【动效·缩放退场】scale_out=true：停留到点后 100%→72% 盒心收拢
+    /// 【动效·缩放退场】scale_out=true：停留到点后 100%→40% 盒心收拢
     /// （入场的镜像），size_anim 完成帧真隐藏；真实键入帧打断并从当前
     /// 插值尺寸重新长出来。
     pub(crate) scale_out: std::cell::Cell<bool>,
@@ -659,6 +659,13 @@ pub struct CandidateWindowV2 {
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
+    /// 【退场动效柔化 2026-10-09 三】退场专用时长（皮肤 layout.out_ms，
+    /// 默认 200，0=瞬跳）——收拢是「送别」不是「抖一下」，独立于入场
+    /// size_ms（入场要快、退场要缓）；scale_out 时取代 size_ms 生效。
+    pub(crate) out_ms: u32,
+    /// 【暂留可调 2026-10-09 三】上屏后暂留时长（皮肤 layout.hold_ms，
+    /// 默认 1000，0=立即收）——不乘 anim_speed（是停留时长非运动时长）。
+    pub(crate) hold_ms: u32,
     /// 【位置滑动 2026-09-11】整句自动上屏后剩余内容跳到新光标、候选
     /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
     /// 而非一跳一跳。None=瞬移。
@@ -1020,6 +1027,8 @@ impl CandidateWindowV2 {
                 commit_hold: std::cell::Cell::new(None),
                 scale_out: std::cell::Cell::new(false),
                 size_ms: 90,
+                out_ms: 200,
+                hold_ms: 1000,
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
@@ -1192,6 +1201,8 @@ impl CandidateWindowV2 {
                 commit_hold: std::cell::Cell::new(None),
                 scale_out: std::cell::Cell::new(false),
                 size_ms: 90,
+                out_ms: 200,
+                hold_ms: 1000,
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
@@ -1628,6 +1639,10 @@ impl CandidateWindowV2 {
         // 【高亮滑动 2026-10-09】胶囊滑动时长（用户口径 0.2~0.3s，取
         // 240ms；皮肤 hl_ms 可调，0=瞬跳）。
         self.hl_ms = (layout_f(skin, "hl_ms", 240.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【退场柔化 2026-10-09 三】out_ms 独立（默认 200ms 缓收）；hold_ms
+        // 默认 1s（0=上屏立即收），不乘 anim_speed。
+        self.out_ms = (layout_f(skin, "out_ms", 200.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.hold_ms = layout_f(skin, "hold_ms", 1000.0).clamp(0.0, 5000.0) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
@@ -2260,7 +2275,16 @@ impl CandidateWindowV2 {
         if !self.internal_rerender {
             let target = (w_out as i32, h_out as i32);
             let cur = match self.size_anim {
-                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
+                Some((f, t, t0)) => size_ease(
+                f,
+                t,
+                t0.elapsed().as_millis() as u32,
+                if self.scale_out.get() {
+                    self.out_ms
+                } else {
+                    self.size_ms
+                },
+            ),
                 None => self.live_size.get(),
             };
             if self.readback {
@@ -3992,7 +4016,7 @@ impl CandidateWindowV2 {
             }
             self.commit_hold.set(Some(std::time::Instant::now()));
             unsafe {
-                let _ = SetTimer(self.hwnd, HOLD_TIMER_ID, 1000, None);
+                let _ = SetTimer(self.hwnd, HOLD_TIMER_ID, self.hold_ms, None);
             }
             return;
         }
@@ -4150,7 +4174,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             }
             if let Some((f, t, t0)) = c.size_anim {
                 let ms = t0.elapsed().as_millis() as u32;
-                let cur = size_ease(f, t, ms, c.size_ms);
+                let cur = size_ease(f, t, ms, if c.scale_out.get() { c.out_ms } else { c.size_ms });
                 let finished = cur == t;
                 if finished {
                     c.size_anim = None;
@@ -4235,7 +4259,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 全帧开销 ×67fps 翻倍）；size 插值滞后一帧（15ms）无视觉差。
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
-            let cur = size_ease(f, t, ms, c.size_ms);
+            let cur = size_ease(f, t, ms, if c.scale_out.get() { c.out_ms } else { c.size_ms });
             let finished = cur == t;
             if finished {
                 c.size_anim = None;
@@ -4376,11 +4400,15 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
             let mut rc = RECT::default();
             let _ = GetWindowRect(c.hwnd, &mut rc);
             let cur = (rc.right - rc.left, rc.bottom - rc.top);
+            // 【退场柔化 2026-10-09 三】收到 40%（原 72%：窗口还很大就硬
+            // 隐藏=「啪」地闪断）+ 200ms 缓收（原 60ms=抖一下就没）——缩
+            // 到很小再隐藏，硬切几乎无感；时长走 out_ms（scale_out 态下
+            // 插值/完成判定自动切换）。
             let tgt = (
-                (cur.0 as f32 * 0.72) as i32,
-                (cur.1 as f32 * 0.72) as i32,
+                (cur.0 as f32 * 0.40) as i32,
+                (cur.1 as f32 * 0.40) as i32,
             );
-            if tgt.0 > 4 && tgt.1 > 4 && c.size_ms > 0 {
+            if tgt.0 > 4 && tgt.1 > 4 && c.out_ms > 0 {
                 c.fade = None;
                 c.scale_out.set(true);
                 c.size_anim = Some((cur, tgt, std::time::Instant::now()));

@@ -5391,7 +5391,11 @@ fn poll_tick() {
             if let Some(c) = g.cand2.as_mut() {
                 if c.is_visible() {
                     if let Some(t0h) = c.commit_hold.get() {
-                        if t0h.elapsed() > std::time::Duration::from_millis(2000) {
+                        // 【停留可调联动 2026-10-09 三】hold_ms 可调后兜
+                        // 底阈值联动（hold_ms+1.5s），避免长暂留被误杀。
+                        if t0h.elapsed()
+                            > std::time::Duration::from_millis(c.hold_ms as u64 + 1500)
+                        {
                             crate::tsf::diag_note("poll: 停留钟停摆兜底→真隐藏");
                             c.hide_now();
                         }
