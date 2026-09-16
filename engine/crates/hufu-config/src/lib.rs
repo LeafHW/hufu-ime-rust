@@ -467,6 +467,12 @@ pub struct AppearanceSection {
     pub anim: bool,
     /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0~2，0=瞬跳）
     pub anim_speed: f32,
+    /// 【上屏暂留开关 2026-10-09 十三】上屏后延时收候选（暂留）总开关
+    /// （false=上屏立即收，与动效开关独立——动效管"怎么动"，这个管
+    /// "留不留"）
+    pub commit_hold: bool,
+    /// 【上屏暂留时长 2026-10-09 十三】暂留毫秒（100~2000，默认 1000）
+    pub commit_hold_ms: u32,
 }
 
 impl Default for AppearanceSection {
@@ -478,6 +484,8 @@ impl Default for AppearanceSection {
             status_capsule: true,
             anim: true,
             anim_speed: 1.0,
+            commit_hold: true,
+            commit_hold_ms: 1000,
         }
     }
 }

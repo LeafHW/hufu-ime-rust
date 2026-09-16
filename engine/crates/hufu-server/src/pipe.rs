@@ -153,6 +153,11 @@ pub fn dispatch(
             // 都有（不再限整句方案）——单字/字词/整句统一 72%→100%
             // 纯尺寸入场；DLL 侧缺省 true（旧 server/测试直连兼容）。
             let entrance_anim = true;
+            // 【上屏暂留开关+时长 2026-10-09 十三】注入顶层 commit_hold
+            // （bool）+ commit_hold_ms（100~2000）——DLL 侧覆盖皮肤
+            // layout.hold_ms：commit_hold=false → 0（上屏立即收）。
+            let commit_hold = host.engine.config.appearance.commit_hold;
+            let commit_hold_ms = host.engine.config.appearance.commit_hold_ms.clamp(100, 2000);
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => {
                     let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
@@ -160,6 +165,8 @@ pub fn dispatch(
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
                         o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
+                        o.insert("commit_hold".into(), serde_json::json!(commit_hold));
+                        o.insert("commit_hold_ms".into(), serde_json::json!(commit_hold_ms));
                     }
                     serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
@@ -171,6 +178,8 @@ pub fn dispatch(
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
                         o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
+                        o.insert("commit_hold".into(), serde_json::json!(commit_hold));
+                        o.insert("commit_hold_ms".into(), serde_json::json!(commit_hold_ms));
                     }
                     serde_json::json!({
                         "skin": sv,

@@ -1659,6 +1659,30 @@ impl CandidateWindowV2 {
         // 默认 1s（0=上屏立即收），不乘 anim_speed。
         self.out_ms = (layout_f(skin, "out_ms", 200.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.hold_ms = layout_f(skin, "hold_ms", 1000.0).clamp(0.0, 5000.0) as u32;
+        // 【上屏暂留开关+时长 2026-10-09 十三】设置页 appearance.
+        // commit_hold/commit_hold_ms（server 注入顶层）覆盖皮肤
+        // layout.hold_ms：开关关 → 0（上屏立即收，与动效开关独立——
+        // 动效管怎么动、这个管留不留）；开 → clamp(100,2000)。老
+        // server 无此键 → 皮肤 hold_ms 原逻辑（兼容）。
+        {
+            let hold_on = skin
+                .pointer("/skin/commit_hold")
+                .or_else(|| skin.get("commit_hold"))
+                .and_then(|x| x.as_bool());
+            let hold_cfg = skin
+                .pointer("/skin/commit_hold_ms")
+                .or_else(|| skin.get("commit_hold_ms"))
+                .and_then(|x| x.as_f64());
+            if let Some(on) = hold_on {
+                self.hold_ms = if on {
+                    hold_cfg.unwrap_or(1000.0).clamp(100.0, 2000.0) as u32
+                } else {
+                    0
+                };
+            } else if let Some(ms) = hold_cfg {
+                self.hold_ms = ms.clamp(0.0, 5000.0) as u32;
+            }
+        }
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）

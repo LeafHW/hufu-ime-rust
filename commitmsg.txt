@@ -1,8 +1,15 @@
-退场收拢改正圆（宽=高=min 边×50%）
+上屏暂留独立开关 + 时长设置（0.1~2s，默认 1s，实时生效）
 
-【用户反馈】收拢时窗口是「椭圆」（等比缩小的长方形）不好看，要正圆；
-比例改 50% 试试（原 40%）。
-【修法】hold_fire 收拢目标从 (w×0.40, h×0.40) 等比长方形改为
-side = min(w,h) × 0.50，tgt=(side, side) 正方形——收完是个正圆点再隐。
-【验证】notepad u→空格上屏：退场起臂 (206,140)→(70, 70)（min 140×
-0.5=70 正方 ✓）→200ms 收拢完成隐藏。
+【需求】上屏后延时关候选（暂留）做独立开关，放设置页动效开关旁；
+时长 0.1~2s 可调；默认开/1s；改动实时生效。
+【config】hufu-config appearance 增 commit_hold（bool，默认 true）/
+commit_hold_ms（u32，默认 1000）。
+【server】pipe.rs 皮肤注入顶层 commit_hold/commit_hold_ms（与 anim 同
+通道：保存即失效皮肤→重注入→DLL 下次拉取即达，秒级热生效）。
+【DLL】candwin2 皮肤解析：顶层 commit_hold=false → hold_ms=0（上屏
+立即收，走退场收拢立即起臂，与动效开关独立——动效管怎么动、这个管
+留不留）；true → clamp(100,2000)；老 server 无键 → 皮肤 layout.
+hold_ms 原逻辑（兼容）。
+【设置页】settings-ui 动效行旁新增「上屏后延时收候选」开关 + 「暂留
+时长」滑条（1~20 → 0.1~2.0s 步 0.1，实时显示 x.x 秒）；onchange 即存
+（与 anim 同款 saveConfig 通道）。
