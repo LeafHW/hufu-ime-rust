@@ -4078,13 +4078,21 @@ impl CandidateWindowV2 {
             self.hide_now();
             return;
         }
+        // 【暂留关·退场不重臂 2026-10-09 十三】hold_ms=0（暂留开关关）
+        // 时上屏帧/空帧连续调 hide()——若退场动画进行中还重臂（Kill+
+        // SetTimer0→10ms hold_fire→size_anim.t0 重置），完成判定永不
+        // 满足=退场动画无限重启、窗口永不隐藏（实测连续退场起臂 15ms
+        // 一条）。守卫：退场中直接 return，动画完成帧自会 hide_now。
+        if self.scale_out.get() {
+            return;
+        }
         if self.is_visible() {
             self.scale_out.set(false);
             unsafe {
                 let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
             }
             if self.commit_hold.get().is_none() {
-                crate::tsf::diag_note("动效: hold起臂(1s)");
+                crate::tsf::diag_note(&format!("动效: hold起臂({}ms)", self.hold_ms));
             }
             self.commit_hold.set(Some(std::time::Instant::now()));
             unsafe {
@@ -4488,6 +4496,14 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
             let tgt = (side, side);
             if tgt.0 > 4 && tgt.1 > 4 && c.out_ms > 0 {
                 c.fade = None;
+                // 【暂留关·杀钟 2026-10-09 十三】hold_ms=200 与退场
+                // out_ms=200 同长时：timer 二次 fire 落在动画完成帧
+                // hide_now 之前（is_visible 仍真）→ hold_fire 重臂退场
+                // （size_anim.t0 重置）→ 完成判定永不满足=无限重臂循环
+                // （实测每 200ms 一条退场起臂）。钟已响过：杀掉。
+                unsafe {
+                    let _ = KillTimer(hwnd, HOLD_TIMER_ID);
+                }
                 c.scale_out.set(true);
                 c.size_anim = Some((cur, tgt, std::time::Instant::now()));
                 c.chrome_override.set(Some(cur));

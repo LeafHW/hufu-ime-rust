@@ -1,15 +1,17 @@
-上屏暂留独立开关 + 时长设置（0.1~2s，默认 1s，实时生效）
+暂留开关两边界修复：退场中不重臂 + 钟响即杀（三态实测通过）
 
-【需求】上屏后延时关候选（暂留）做独立开关，放设置页动效开关旁；
-时长 0.1~2s 可调；默认开/1s；改动实时生效。
-【config】hufu-config appearance 增 commit_hold（bool，默认 true）/
-commit_hold_ms（u32，默认 1000）。
-【server】pipe.rs 皮肤注入顶层 commit_hold/commit_hold_ms（与 anim 同
-通道：保存即失效皮肤→重注入→DLL 下次拉取即达，秒级热生效）。
-【DLL】candwin2 皮肤解析：顶层 commit_hold=false → hold_ms=0（上屏
-立即收，走退场收拢立即起臂，与动效开关独立——动效管怎么动、这个管
-留不留）；true → clamp(100,2000)；老 server 无键 → 皮肤 layout.
-hold_ms 原逻辑（兼容）。
-【设置页】settings-ui 动效行旁新增「上屏后延时收候选」开关 + 「暂留
-时长」滑条（1~20 → 0.1~2.0s 步 0.1，实时显示 x.x 秒）；onchange 即存
-（与 anim 同款 saveConfig 通道）。
+【承接 b825621 上屏暂留开关】真机三态验证暴露两个边界 bug：
+① hold_ms=0（开关关）时上屏帧/空帧连续调 hide()——退场动画进行中
+仍重臂（Kill+SetTimer0→10ms hold_fire→size_anim.t0 重置），完成判
+定永不满足=退场无限重启、窗口永不隐藏（实测连续「退场起臂」15ms
+一条）。修：hide() 加 scale_out 守卫，退场中直接 return（动画完成帧
+自会 hide_now）。
+② hold_ms=200 与退场 out_ms=200 同长时：停留钟二次 fire 落在动画完
+成帧 hide_now 之前（is_visible 仍真）→ hold_fire 重臂退场=同款无限
+循环（实测每 200ms 一条）。修：hold_fire 起臂退场时 KillTimer(HOLD)
+——钟已响过。
+【顺带】hold起臂 日志文案带实际毫秒值（原硬编码"(1s)"误导）。
+【三态实测】（API 改配置→下一次上屏即生效，实时链实证）
+· 200ms 配置 → 起臂 200ms → 退场完成 404ms（暂留≈204ms+200ms 收拢）
+· 1000ms 配置 → 起臂 1000ms → 退场完成 1199ms（暂留≈999ms）
+· 关 → 起臂 0ms → 31ms 内起收、203ms 完成隐藏、无重臂循环
