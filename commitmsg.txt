@@ -1,10 +1,16 @@
-预热排除打包宿主：开始菜单候选窗「跑右上角」修复
+下划线退役：撤 displayattr 整链，恢复 TSF 默认组段下划线
 
-v1.6.0 实机回归：SearchHost（开始菜单）里 poll 闲拍预热建了普通 DComp
-候选窗，OWNED 分支见 cand2=Some 直接复用——沙盒进程里 D3D/锚点异常，
-候选窗落在屏幕右上角（1.5.9 无预热时 OWNED 分支首需 new_owned，位置
-正常）。修复：预热条件加 !host_is_packaged()——打包宿主保持 1.5.9
-行为，普通桌面宿主预热照旧（首键 17ms 提速保留）。
+用户实锤：QQ/开始菜单/记事本编码下划线全部消失。根因=v1.6.0 的
+displayattr 链给组段 range 标自定义属性 GUID，宿主经 msctf 解析该
+GUID 的显示信息失败时连默认下划线都不画（没有回退）。对照本机微拼/
+Rime/虎爪：均无 DisplayAttribute 注册表键、无 provider——下划线全部
+来自 TSF 默认组段渲染（1.5.9 同款）。
 
-随行：码表\虎码单字 恢复 1.5.9 原样（tiger.dict.yaml 主码表——真机
-镜像时误带了虎码单简码表）。
+修复=整链退役：
+- tsf.rs：删 4 处 mark_range_input/unmark_range 调用
+- lib.rs/com.rs：删 mod displayattr、provider implement、注册表键写入
+- displayattr.rs 删除
+- install.ps1：撤 HKLM DisplayAttribute 写入（实测 msctf 周期校验会删
+  HKCU 侧同款键，且本机三个可用 IME 均无此键）
+- install.ps1：新增 Set-WinDefaultInputMethodOverride（装机后默认输入法
+  显式=虎符；仅列表首位在用户机器上实测不够）

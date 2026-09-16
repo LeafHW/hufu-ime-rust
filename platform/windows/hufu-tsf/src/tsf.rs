@@ -596,8 +596,7 @@ fn g_first_key_probe() -> bool {
     ITfTextInputProcessor,
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
-    ITfThreadMgrEventSink,
-    windows::Win32::UI::TextServices::ITfDisplayAttributeProvider
+    ITfThreadMgrEventSink
 )]
 pub struct HuFuTs {
     shared: SharedRef,
@@ -1909,9 +1908,6 @@ impl EditSession_Impl {
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { crange.SetText(ec, 0, &wstr)? };
                 trace("SP: SetText ok");
-                // 【组段下划线·CUAS】编码文本打上「输入中」属性——
-                // 32 位/UWP/开始菜单（CUAS 渲染）据此画下划线。
-                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &crange) };
                 // 选区跟随到组段末尾（否则下次插入点停在开头）
                 let _ = set_selection_at_end(&ctx, ec, &crange);
                 // 【十七次修正·SP 同步 raw】监控实锤（04:11:19）：SP 不更
@@ -1957,9 +1953,6 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
-                // 【组段下划线·CUAS】编码更新后重打属性（SetText 会
-                // 重置 range 属性——每键重标）。
-                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &range) };
                 // 【逐键跟随最新光标 2026-09-12 定版】用户拍板：打一个
                 // 编码/字母，窗就跟到最新光标处（不是旧的「上屏动一
                 // 次、段内钉住」）。段内每键两步：
@@ -2118,9 +2111,6 @@ impl EditSession_Impl {
                     // 有字但屏清了（多人实录，切窗恢复）。自愈：终止死组
                     // 段后在当前 context 直插保字（照 SetPreedit 自愈先例）。
                     let set_ok = unsafe {
-                        // 【组段下划线·CUAS】提交前清「输入中」属性——
-                        // 否则下划线残留到已上屏文本（属性跟 range 走）。
-                        crate::displayattr::unmark_range(ec, &ctx, &range);
                         range.SetText(ec, 0, &wstr).is_ok()
                     };
                     if set_ok {
@@ -2250,8 +2240,6 @@ impl EditSession_Impl {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
                     let set_ok = unsafe {
-                        // 【组段下划线·CUAS】顶屏提交前同样清属性。
-                        crate::displayattr::unmark_range(ec, &ctx, &range);
                         range.SetText(ec, 0, &wstr).is_ok()
                     };
                     if set_ok {

@@ -1,4 +1,4 @@
-//! COM 基础设施：类厂与注册。
+﻿//! COM 基础设施：类厂与注册。
 
 use windows::Win32::Foundation::{HMODULE, WIN32_ERROR};
 use windows::Win32::System::Com::{
@@ -179,16 +179,6 @@ pub fn register_server() -> HRESULT {
                                              // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
     let _ = reg_set(&lp, Some("IconFile"), &self_path());
-    // 【组段下划线·CUAS 2026-09-14】DisplayAttribute 键：msctf 据此
-    // 发现 IME 的 display attribute（ITfDisplayAttributeProvider 枚举
-    // 的 ATTR_GUID 与此一致）——32 位/UWP/开始菜单（CUAS）画编码下
-    // 划线的发现入口（微拼同构写法：键=attr GUID，值=描述）。
-    const ATTR_GUID_STR: &str = "{8F5C2A12-3E77-4B9C-A1D4-9E0B7C2F5A88}";
-    let _ = reg_set(
-        &format!(r"{tip_root}\DisplayAttribute\{ATTR_GUID_STR}"),
-        None,
-        "HuFu 编码输入",
-    );
     HRESULT(0)
 }
 

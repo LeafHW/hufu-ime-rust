@@ -1,4 +1,4 @@
-//! hufu-tsf —— HuFu 输入法 Windows TSF 前端（纯 Rust COM DLL）。
+﻿//! hufu-tsf —— HuFu 输入法 Windows TSF 前端（纯 Rust COM DLL）。
 //!
 //! 架构（同小狼毫）：本 DLL 是薄壳——按键事件通过命名管道发给 hufu-server
 //! 引擎，取回 {consumed, commit, state} 后操作 TSF 组段并绘制候选窗。
@@ -18,10 +18,9 @@ mod com;
 // 由本模块 stub 提供（转发 DllMainCRTStartup）。x86_64 不编入。
 #[cfg(all(target_arch = "x86", target_env = "gnu"))]
 mod dll_entry_x86;
-// 【组段下划线·CUAS 2026-09-14】TSF display attribute 提供方（32 位/
-// UWP/开始菜单的编码下划线）：ITfDisplayAttributeProvider 挂在 TIP +
-// 注册表 DisplayAttribute 键 + 组段 range 设/清属性。
-mod displayattr;
+// 【下划线退役 2026-09-16】displayattr 整链已删——自定义属性标记让宿主
+// 查不到显示信息时连默认下划线都不画（QQ/开始菜单/记事本实锤）。
+// 不标属性=TSF 默认组段渲染（各宿主自带下划线/虚线，1.5.9 行为）。
 mod ipc;
 // 语言栏品牌按钮（「虎」牌）+ 中/英模式 compartment 同步——Activate
 // 时安装（tsf.rs L312-321 实际调用链），非死代码。
