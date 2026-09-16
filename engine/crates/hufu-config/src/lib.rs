@@ -491,7 +491,8 @@ impl Default for AppearanceSection {
             anim: true,
             anim_speed: 1.0,
             commit_hold: true,
-            commit_hold_ms: 1000,
+            // 【2026-10-09 默认调整】上屏后延时收候选 0.5s（用户定稿，原 1s）
+            commit_hold_ms: 500,
         }
     }
 }

@@ -659,7 +659,7 @@ pub struct CandidateWindowV2 {
     /// （入场的镜像），size_anim 完成帧真隐藏；真实键入帧打断并从当前
     /// 插值尺寸重新长出来。
     pub(crate) scale_out: std::cell::Cell<bool>,
-    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 120，0=瞬跳）——注释
+    /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 150，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
@@ -1652,7 +1652,7 @@ impl CandidateWindowV2 {
         self.fade_ms_eff = (60.0 * anim_spd) as u32;
         // 【尺寸过渡 100ms 2026-10-09 十四】变宽/变窄内容层缓动（用户
         // 拍板试 100，原 60 偏快「跳」）——与入场共用（同 size_anim）。
-        self.size_ms = (layout_f(skin, "size_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.size_ms = (layout_f(skin, "size_ms", 150.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【高亮滑动 2026-10-09】胶囊滑动时长（用户口径 0.2~0.3s，取
         // 240ms；皮肤 hl_ms 可调，0=瞬跳）。
