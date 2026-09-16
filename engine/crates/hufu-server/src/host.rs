@@ -589,7 +589,15 @@ impl Host {
         }
         // 【真机重排模拟】process_key 后派发重排任务（与 pipe 路径同序）
         self.after_ime_op();
-        let state = self.engine.state(&self.session);
+        // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
+        // 上屏的闪帧（旧候选+高亮=选中项）在 outcome.state 里；此处按
+        // clear 后会话重建会把候选清成空，闪帧永远到不了 DLL。非闪帧
+        //（consumed/passthrough/普通上屏）outcome.state 与重建结果同值
+        //（state() 在键处理末尾构建，此后仅动 tail_context，不入状态）。
+        let state = outcome
+            .state
+            .clone()
+            .unwrap_or_else(|| self.engine.state(&self.session));
         serde_json::json!({ "outcome": outcome, "state": state })
     }
 

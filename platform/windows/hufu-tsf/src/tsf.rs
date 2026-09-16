@@ -417,6 +417,11 @@ pub struct Shared {
     /// 【滚轮缩放候选框】最近一次 show 的渲染参数（候选/编码/选中）：
     /// WM_MOUSEWHEEL 改字号后用它立即重绘（无键事件触发 update_ui）。
     pub last_show: Option<(Vec<(String, String)>, String, usize)>,
+    /// 【选重闪帧 2026-10-09】数字选重键上屏标记（页内下标）：引擎纯选
+    /// 重路径在 state 里自带闪帧；锁+提前上屏路径（uru+3=指了指）state
+    /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
+    /// 第 N 项再暂留收场）。
+    pub rank_flash: Option<usize>,
 }
 
 impl Shared {
@@ -502,6 +507,7 @@ impl Shared {
             line_end: false,
             last_key_ctx: None,
             last_show: None,
+            rank_flash: None,
         }
     }
 
@@ -1585,6 +1591,19 @@ impl HuFuTs_Impl {
                 .unwrap_or_else(|e| e.into_inner())
                 .shift_now_hide = true;
         }
+        // 【选重闪帧 2026-10-09】数字键上屏（选重/锁提前上屏皆是「第 N
+        // 项胜出」语义）→ 标记页内下标；引擎纯选重路径自带闪帧时
+        // update_ui 优先用引擎帧，锁路径（state 空）用 last_show 自建。
+        // 仅数字——；等符号选重键语义随方案配置（DLL 不知情），只走
+        // 引擎闪帧路径。
+        if consumed && !commit.is_empty() && !test_only {
+            if let Some(idx) = rank_key_index(&name) {
+                self.shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .rank_flash = Some(idx);
+            }
+        }
         // 【换方案即失效皮肤 2026-09-11】Ctrl+M 换方案后 entrance_anim
         // 等方案相关字段变化——键路径不拉皮肤（性能），不失效则缓存
         // 沿用到断段+2.5s（实测：单字切回整句后无入场动效，切窗才
@@ -1798,6 +1817,20 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             _ => return None,
         };
         Some((name, shift, ctrl, alt))
+    }
+}
+
+/// 【选重闪帧 2026-10-09】数字选重键 → 页内下标（1..9→0..8，0=第10→9）。
+fn rank_key_index(name: &str) -> Option<usize> {
+    let mut it = name.chars();
+    let c = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    match c {
+        '1'..='9' => Some(c as usize - '1' as usize),
+        '0' => Some(9),
+        _ => None,
     }
 }
 
@@ -3460,7 +3493,65 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 .unwrap_or("")
                 .is_empty();
             if !aux_now {
-                if let Some(c) = g.cand2.as_mut() {
+                // 【选重闪帧 2026-10-09】raw 空 + 候选非空 = 引擎选重上屏
+                // 带回的闪帧（旧候选+高亮=选中项——引擎 on_rank_key/
+                // select_candidate 选重路径专属，普通上屏候选已清）：
+                // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），收场
+                // 交给轮询 hide_stale→停留(1s)→收拢链；否则照旧收窗。
+                let flash: Vec<(String, String)> = state
+                    .get("candidates")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|c| {
+                                (
+                                    c.get("text")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    c.get("comment")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !flash.is_empty() {
+                    let sel_flash =
+                        state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let skin_f = g.skin.clone();
+                    let caret_f = g.caret;
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.show(&flash, "", &skin_f, caret_f.as_ref(), sel_flash);
+                        // 闪帧后立即起臂停留钟（hide 只起臂不重画——窗面
+                        // 保持闪帧：滑动动效在 1s 停留内播完，到点收拢；
+                        // 连打下一键（raw 非空）照常打断停留/收拢）。
+                        c.hide();
+                    }
+                    // tick 复渲染读 shared.last_show——同步为闪帧（否则
+                    // 动效 tick 拿旧组段帧把高亮拽回原位）。
+                    g.last_show = Some((flash, String::new(), sel_flash));
+                    g.rank_flash = None;
+                } else if let Some(idx) = g.rank_flash.take() {
+                    // 【选重闪帧·锁路径兜底 2026-10-09】引擎 state 为空
+                    //（uru+3=锁+提前上屏）但键是数字且已上屏——用上一显示
+                    // 帧的候选列表自建闪帧：高亮滑到第 N 项再暂留收场。
+                    let prior = g.last_show.clone().filter(|v| !v.0.is_empty());
+                    if let Some((lc, _, _)) = prior {
+                        let sel_flash = idx.min(lc.len() - 1);
+                        let skin_f = g.skin.clone();
+                        let caret_f = g.caret;
+                        if let Some(c) = g.cand2.as_mut() {
+                            c.show(&lc, "", &skin_f, caret_f.as_ref(), sel_flash);
+                            c.hide();
+                        }
+                        g.last_show = Some((lc, String::new(), sel_flash));
+                    } else if let Some(c) = g.cand2.as_mut() {
+                        c.hide();
+                    }
+                } else if let Some(c) = g.cand2.as_mut() {
                     c.hide();
                 }
             }
@@ -5293,6 +5384,20 @@ fn poll_tick() {
             g.cand_shown_this_segment = false;
             g.wps_caret_prev = None;
             g.wps_settle_start = None; // click_sticky 保留：上屏帧垃圾锚需黏性拦
+            // 【选重闪帧·停留钟兜底 2026-10-09】闪帧起臂的停留钟偶发
+            // 停摆（宿主线程 WM_TIMER 迟迟不分发，实测一次 3s+ 未 fire
+            // =候选窗滞留）。轮询兜底：hold 在身超 2s 仍未退场 → 真隐
+            // 藏（PostMessage 异步 SW_HIDE，不依赖动画 tick）。
+            if let Some(c) = g.cand2.as_mut() {
+                if c.is_visible() {
+                    if let Some(t0h) = c.commit_hold.get() {
+                        if t0h.elapsed() > std::time::Duration::from_millis(2000) {
+                            crate::tsf::diag_note("poll: 停留钟停摆兜底→真隐藏");
+                            c.hide_now();
+                        }
+                    }
+                }
+            }
             // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
             // 内）：键路径不再做管道往返（性能），改皮肤下一组段生效。
             if !g.skin.is_null() {

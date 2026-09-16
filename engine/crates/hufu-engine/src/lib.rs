@@ -1648,8 +1648,19 @@ impl Engine {
                     if session.committed_raw.is_empty() {
                         if !tail_is_sub && !had_locks || tail_locked && !tail_is_sub {
                             // 单段纯净态或尾锁改选：选中即上屏
+                            // 【选重闪帧 2026-10-09】上屏即刻（零迟滞），状态
+                            // 帧带回旧候选+高亮=选中项——候选窗播高亮滑动
+                            // 确认动效后再照常暂留收场。raw/preedit 清空
+                            //（编码已清，不留幽灵组段），候选/高亮保留。
+                            session.selected = (session.page
+                                * self.config.candidates.page_size.max(1) as usize
+                                + (disp_rank - 1))
+                                .min(session.candidates.len().saturating_sub(1));
+                            let mut st = self.state(session);
                             session.clear();
-                            return KeyOutcome::commit(pk, self.state(session));
+                            st.raw = String::new();
+                            st.preedit = String::new();
+                            return KeyOutcome::commit(pk, st);
                         }
                         // 【多段/带锁流前缀未上屏 2026-09-06】
                         // cbae3 = cb|ae → 「不」+行 =「不行」；
@@ -1677,18 +1688,33 @@ impl Engine {
                                         })
                                     });
                             if let Some(pt) = prefix_text {
+                                // 【选重闪帧 2026-10-09】同单段：高亮滑到
+                                // 选中项的确认帧（raw/preedit 清空）。
+                                session.selected = (session.page
+                                    * self.config.candidates.page_size.max(1) as usize
+                                    + (disp_rank - 1))
+                                    .min(session.candidates.len().saturating_sub(1));
+                                let mut st = self.state(session);
                                 session.clear();
-                                return KeyOutcome::commit(
-                                    format!("{}{}", pt, pk),
-                                    self.state(session),
-                                );
+                                st.raw = String::new();
+                                st.preedit = String::new();
+                                return KeyOutcome::commit(format!("{}{}", pt, pk), st);
                             }
                         }
                     } else {
                         // 前缀已提前上屏（early_commit）：commit 该词
                         // 接在前缀后
+                        // 【选重闪帧 2026-10-09】同单段：高亮滑到选中项
+                        //（raw/preedit 清空）。
+                        session.selected = (session.page
+                            * self.config.candidates.page_size.max(1) as usize
+                            + (disp_rank - 1))
+                            .min(session.candidates.len().saturating_sub(1));
+                        let mut st = self.state(session);
                         session.clear();
-                        return KeyOutcome::commit(pk, self.state(session));
+                        st.raw = String::new();
+                        st.preedit = String::new();
+                        return KeyOutcome::commit(pk, st);
                     }
                 }
             }
@@ -1740,7 +1766,7 @@ impl Engine {
                 }
             }
         };
-        self.select_candidate(session, idx)
+        self.select_candidate(session, idx, true)
     }
 
     /// raw 是否还有编码延续（前缀树或符号表）。
@@ -2248,7 +2274,7 @@ impl Engine {
             let idx = session
                 .selected
                 .min(session.candidates.len().saturating_sub(1));
-            return self.select_candidate_abs(session, idx);
+            return self.select_candidate_abs(session, idx, false);
         }
         // 空码：大写混合输入直接上屏原串，否则清屏
         if session.raw.chars().any(|c| c.is_ascii_uppercase()) {
@@ -2261,14 +2287,21 @@ impl Engine {
     }
 
     /// 选第 idx 个候选（当前页内，0 起）。
-    fn select_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+    fn select_candidate(&mut self, session: &mut Session, idx: usize, flash: bool) -> KeyOutcome {
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
-        self.select_candidate_abs(session, start + idx)
+        self.select_candidate_abs(session, start + idx, flash)
     }
 
-    /// 选绝对下标候选。
-    fn select_candidate_abs(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+    /// 选绝对下标候选。flash=true（数字/；选重键路径）带回选重闪帧
+    ///（旧候选+高亮=选中项，raw 清空）；空格首选/翻页顶字传 false——
+    /// is_idle 语义保持（上屏即空态），高亮本在位无需确认动效。
+    fn select_candidate_abs(
+        &mut self,
+        session: &mut Session,
+        idx: usize,
+        flash: bool,
+    ) -> KeyOutcome {
         let pick = session.candidates.get(idx).cloned();
         if let Some(cand) = pick {
             self.sound_hint = Some("select");
@@ -2280,8 +2313,19 @@ impl Engine {
             if text.starts_with('{') {
                 text = self.resolve_dynamic(&text);
             }
+            if !flash {
+                session.clear();
+                return KeyOutcome::commit(text, self.state(session));
+            }
+            // 【选重闪帧 2026-10-09】上屏即刻（零迟滞），状态帧带回旧候选
+            // +高亮=选中项（idx 即绝对下标）——候选窗播高亮滑动确认动效
+            // 后再照常暂留收场。raw/preedit 清空（不留幽灵组段）。
+            session.selected = idx.min(session.candidates.len().saturating_sub(1));
+            let mut st = self.state(session);
             session.clear();
-            return KeyOutcome::commit(text, self.state(session));
+            st.raw = String::new();
+            st.preedit = String::new();
+            return KeyOutcome::commit(text, st);
         }
         KeyOutcome::consumed(self.state(session))
     }
@@ -4065,6 +4109,38 @@ mod tests {
         // 新(p3) ；加 被旧文件删除
         assert_eq!(texts, vec!["就", "到的", "新"], "混载回放: {texts:?}");
         assert_eq!(eng.schema.user_dict.entries.len(), 1, "TSV 词行入用户词库");
+    }
+
+    // 【选重闪帧 2026-10-09】uru+3：上屏即刻（零迟滞），状态帧带回旧
+    // 候选+高亮=选中项——DLL 据此播高亮滑动确认动效后再暂留收场。
+    #[test]
+    fn rank_flash_state_carried() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-dyn-flash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\nuru\t一\nuru\t二\nuru\t三\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let mut s = Session::new(true);
+        for c in "uru".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let before = s.candidates.len();
+        assert!(before >= 3, "uru 应有 ≥3 候选: {before}");
+        let out = eng.process_key(&mut s, key('3'));
+        assert!(out.commit.is_some(), "数字选重应上屏: {out:?}");
+        let st = out.state.expect("选重上屏应带状态帧");
+        assert_eq!(
+            st.candidates.len(),
+            before,
+            "闪帧带回旧候选（原样）: {:?}",
+            st.candidates
+        );
+        assert_eq!(st.selected, 2, "高亮 = 第 3 项（页内下标 2）");
+        assert!(st.raw.is_empty(), "选重后编码已清");
     }
 
     // 【` 键四态 2026-09-06】空态单击=反查、反查态再按=「·」上屏、

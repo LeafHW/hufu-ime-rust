@@ -1,20 +1,14 @@
-下划线实线定稿 + 回车立即收窗 + 渐隐渐现动效改版
+高亮选重滑动 + 渐隐渐现回退（motion159 暂留回归）
 
-【组段下划线·三连环根因闭合】首轮（displayattr 初版）QQ/UWP 全无线
-的根因链：属性 GUID 解析依赖 provider 发现（安装器 8 类别注册表键已
-足够——实证宿主每次按键都来查询 provider、mark 零失败），但样式给了
-TF_LS_NONE（"宿主按 INPUT 语义自画"是想当然）——XAML/CUAS 宿主严格
-按 lsStyle 画线，NONE=一根不画。定稿 TF_ATTR_INPUT + TF_LS_SOLID
-实线。像素级终验：商店记事本（XAML 宿主）组段字形下方出现 9px 实线
-行，上屏后消失；诊断同刻「provider 按 GUID 被查询」。
-
-- displayattr.rs 回归 + attr_style 实线；tsf.rs 恢复 4 处 mark/unmark
-  + provider implement + 自愈路径补标
-- RegisterCategory 装机/Activate 双路兜底（实测注册表键已够发现路，
-  RegisterCategory E_FAIL 无碍，留作正规化）
-- 【回车立即收窗】回车（清屏/编码上屏两模式）与 Shift 同款：候选立
-  即消失不走渐隐；引擎侧两模式本就正确，DLL 侧复用 shift_now_hide
-- 【渐隐渐现】hide() 1s 停留+盒心收拢退役：上屏后内容 0.2s 渐隐（画
-  刷级 alpha——背景/边框/阴影不衰减，框样式不变），到点隐藏；渐隐
-  中新编码从当前 alpha 反向渐现 0.2s（允许重叠）；首显内容渐现；
-  fade_ms 默认 200（皮肤 0=关回旧行为）；hide_now 作废渐变态
+· 渐隐渐现回退：连打实测更闪（alpha 每次上屏都探底），恢复 motion159
+  语义——上屏暂留 1s + 盒心收拢，连打零动画（窗口持续在场不闪）。
+· 高亮选重滑动动效：数字/选重键上屏后高亮胶囊 0.24s 滑到选中项（uru+3
+  高亮移到第 3 项）再照常暂留收场；↑↓ 移动高亮同款滑动（原瞬跳）。
+  皮肤 layout.hl_ms 可调（0=关）。上屏零迟滞。
+· 引擎选重闪帧：on_rank_key/select_candidate 上屏帧带回旧候选+高亮=
+  选中项（raw 清空防幽灵组段；空格首选保持 is_idle 语义）；server 回包
+  顶层 state 优先透传 outcome.state（此前重建把闪帧丢弃）。
+· DLL 兜底：数字键上屏（锁+提前上屏路径如 uru+3=指了指）引擎 state 为
+  空——update_ui 用 last_show 候选自建闪帧；停留钟停摆（宿主 WM_TIMER
+  迟滞）超 2s 轮询兜底真隐藏，杜绝对窗滞留。
+· 32 位 DLL 同批（x86 同源构建）。
