@@ -173,13 +173,38 @@ impl Host {
         if !self.engine.config.schema.current.contains("整句") {
             return None;
         }
-        let path = hufu_engine::Engine::resolve_data_sub(
+        if !self.engine.config.sentence.enabled {
+            return None;
+        }
+        // 【ngram 自动探测 2026-10-09 二十】与 GGUF 重排对齐：配置路径
+        //（相对→数据目录，一级布局优先）不存在时，自动探测安装根
+        //「模型」目录下任意 .bin——无模型小包用户把 ngram 文件随手
+        // 拖进「模型」文件夹即可用（文件名不必匹配 config 默认的
+        // models/sentence-ngram.bin；旧版对不上名字时整句静默不装载，
+        // 用户以为有模型其实在跑纯码表）。多个 bin 取最大（主模型
+        // 通常远大于附属文件）。
+        let cfg_path = hufu_engine::Engine::resolve_data_sub(
             &self.data_dir,
             &self.engine.config.sentence.ngram_path,
         );
-        if !(self.engine.config.sentence.enabled && path.exists()) {
-            return None;
-        }
+        let path = if cfg_path.exists() {
+            cfg_path
+        } else {
+            let model_dir = hufu_engine::Engine::resolve_data_sub(&self.data_dir, "模型");
+            let mut bins: Vec<PathBuf> = std::fs::read_dir(&model_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .map(|x| x.eq_ignore_ascii_case("bin"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            bins.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+            bins.pop()?
+        };
         let mut weights = self.engine.config.sentence.weights.clone();
         // 【数字编码 2026-09-05】按码表内容自动标记：数字做编码字符
         // （a8=来、u3=的）的表，整句解码时数字保留为编码不做选重锁。

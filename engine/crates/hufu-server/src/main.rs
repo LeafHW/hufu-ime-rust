@@ -249,12 +249,34 @@ fn main() {
                             h.engine.config.sentence.rerank.enabled,
                         )
                     };
+                    // 【ngram 自动探测 2026-10-09 二十】与装载计划同口径：
+                    // config 路径不存在时探测「模型」目录最大 .bin——拖
+                    // 任意名 ngram 进来 watch 线程才能看到边沿触发装载。
+                    let ngram_stat = |cfg_p: &std::path::Path, data_dir: &std::path::Path| -> Option<(u64, i64)> {
+                        if cfg_p.exists() {
+                            return stat_of(cfg_p);
+                        }
+                        let model_dir = hufu_engine::Engine::resolve_data_sub(data_dir, "模型");
+                        let mut bins: Vec<std::path::PathBuf> = std::fs::read_dir(&model_dir)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.extension()
+                                    .map(|x| x.eq_ignore_ascii_case("bin"))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        bins.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+                        stat_of(bins.last()?)
+                    };
                     let cur_gguf = if rerank_enabled {
                         gguf_stat(&data_dir_w)
                     } else {
                         None
                     };
-                    let cur_ngram = stat_of(&ngram_path);
+                    let cur_ngram = ngram_stat(&ngram_path, &data_dir_w);
                     let g = step(&mut prev_gguf, cur_gguf);
                     let n = step(&mut prev_ngram, cur_ngram);
                     // 启动首轮在场：视为已装载（启动路径自己会装），不算边沿
