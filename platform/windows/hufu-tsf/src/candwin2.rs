@@ -1650,7 +1650,9 @@ impl CandidateWindowV2 {
         // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
         self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.fade_ms_eff = (60.0 * anim_spd) as u32;
-        self.size_ms = (layout_f(skin, "size_ms", 60.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【尺寸过渡 100ms 2026-10-09 十四】变宽/变窄内容层缓动（用户
+        // 拍板试 100，原 60 偏快「跳」）——与入场共用（同 size_anim）。
+        self.size_ms = (layout_f(skin, "size_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【高亮滑动 2026-10-09】胶囊滑动时长（用户口径 0.2~0.3s，取
         // 240ms；皮肤 hl_ms 可调，0=瞬跳）。

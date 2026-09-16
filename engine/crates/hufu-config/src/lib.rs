@@ -157,10 +157,13 @@ impl Default for InputSection {
             max_code_length: 4,
             auto_push: true,
             auto_select_unique: false,
-            auto_clear_empty: true,
-            enter_clear: true,
+            // 【默认关 2026-10-09 十四】用户拍板：空码自动清屏/回车清屏/
+            // 中英混输默认关（新用户更接近传统输入法行为，避免「打着
+            // 打着编码没了」「大小写字母混进来」的困惑）。
+            auto_clear_empty: false,
+            enter_clear: false,
             tab_clear: true,
-            mixed_input: true,
+            mixed_input: false,
             code_disguise: String::new(),
             show_code: true,
             hide_candidates: false,
@@ -216,7 +219,7 @@ pub struct CandidatesSection {
 impl Default for CandidatesSection {
     fn default() -> Self {
         CandidatesSection {
-            page_size: 5,
+            page_size: 4, // 【默认 4 2026-10-09 十四】用户拍板（原 5）
             paging_keys: "-=".into(),
             second_select: ';',
             third_select: '\'',

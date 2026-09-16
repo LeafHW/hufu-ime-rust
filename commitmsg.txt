@@ -1,17 +1,13 @@
-暂留开关两边界修复：退场中不重臂 + 钟响即杀（三态实测通过）
+默认值修正：空码清屏/回车清屏/中英混输默认关 + 每页 4 + 尺寸过渡 100ms
 
-【承接 b825621 上屏暂留开关】真机三态验证暴露两个边界 bug：
-① hold_ms=0（开关关）时上屏帧/空帧连续调 hide()——退场动画进行中
-仍重臂（Kill+SetTimer0→10ms hold_fire→size_anim.t0 重置），完成判
-定永不满足=退场无限重启、窗口永不隐藏（实测连续「退场起臂」15ms
-一条）。修：hide() 加 scale_out 守卫，退场中直接 return（动画完成帧
-自会 hide_now）。
-② hold_ms=200 与退场 out_ms=200 同长时：停留钟二次 fire 落在动画完
-成帧 hide_now 之前（is_visible 仍真）→ hold_fire 重臂退场=同款无限
-循环（实测每 200ms 一条）。修：hold_fire 起臂退场时 KillTimer(HOLD)
-——钟已响过。
-【顺带】hold起臂 日志文案带实际毫秒值（原硬编码"(1s)"误导）。
-【三态实测】（API 改配置→下一次上屏即生效，实时链实证）
-· 200ms 配置 → 起臂 200ms → 退场完成 404ms（暂留≈204ms+200ms 收拢）
-· 1000ms 配置 → 起臂 1000ms → 退场完成 1199ms（暂留≈999ms）
-· 关 → 起臂 0ms → 31ms 内起收、203ms 完成隐藏、无重臂循环
+【用户拍板】①「空码自动清屏（满码+1 才清，保末键）」「回车清屏」
+「中英混输（保留大小写）」默认关（原默认开，新用户易困惑：编码
+突然没了/大小写字母混进候选）；②每页候选数默认 4（原 5）；③候选
+变宽变窄动效 60→100ms 试试。
+【改】hufu-config InputSection：auto_clear_empty/enter_clear/
+mixed_input 默认 true→false；CandidatesSection.page_size 5→4；
+candwin2 size_ms 默认 60→100（与入场共用 size_anim，同过渡时长）。
+【本机】config.json 已显式写死旧值——API 热翻正（auto_clear_empty=
+false/enter_clear=false/mixed_input=false/page_size=4），即时生效。
+【验证】notepad u：候选窗 h=103（原 5 项时 140——每页 4 生效，窗口
+矮了）；代码默认对全新安装/恢复默认值生效。
