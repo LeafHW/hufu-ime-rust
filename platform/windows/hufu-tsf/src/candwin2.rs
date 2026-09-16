@@ -2387,16 +2387,15 @@ impl CandidateWindowV2 {
             ),
             None => (width, height),
         };
-        // 【高亮锚定 v3·盒心对称 2026-10-09 七】入场动画：窗口位置/尺寸
-        // =目标全程稳定（零位移=零跳变），动画=窗口内的「外壳盒」从窗口
-        // 中心长到全窗；退场=镜像收拢回窗口中心。此前锚定高亮胶囊（入
-        // 场高亮在第 1 项=左上角「从左上出」、退场高亮在选中项=「收到
-        // 中间」）——出入不对称（用户反馈「收回在候选中心、出去在左上
-        // 角」）。统一真·盒心：从哪来回哪去，名实相符。
+        // 【高亮锚定 v4·出入同锚 2026-10-09 十】入场动画：窗口位置/尺寸
+        // =目标全程稳定（零位移=零跳变），动画=窗口内的「外壳盒」从锚点
+        // 长到全窗；退场=同一锚点反向收拢。锚点=**首项**高亮胶囊中心
+        // （渲染帧捕获 i==0——入退场共用：从哪来回哪去，出入都在左上
+        // 首项高亮区，用户口径）。缺省（无捕获）回退窗口中心。
         // damp 随进度归零（入场）/增至 1（退场），完成帧=整窗。普通尺寸
         // 动效/稳态 bx=by=0。
         let (bx, by) = if (self.scale_in.get() || self.scale_out.get()) && self.size_anim.is_some() {
-            let (hx, hy) = (width * 0.5, height * 0.5);
+            let (hx, hy) = self.hl_center.get().unwrap_or((width * 0.5, height * 0.5));
             let k = match self.size_anim {
                 Some((_, _, t0)) => {
                     (t0.elapsed().as_millis() as f32 / self.size_ms.max(1) as f32).clamp(0.0, 1.0)
@@ -3080,11 +3079,17 @@ impl CandidateWindowV2 {
                             if i > 0 {
                                 x += cand_spacing;
                             }
-                            if i == sel {
-                                // 【高亮锚定】横排：捕获高亮胶囊中心（入场
-                                // 动画盒以此为锚）
+                            if i == 0 {
+                                // 【高亮锚定 v4·出入同锚 2026-10-09 十】捕获
+                                // **首项**高亮胶囊中心（i==0，非选中项）——
+                                // 入场与退场共用此锚：从哪来回哪去（出入都在
+                                // 左上首项高亮区）。此前入场锚首项、退场锚
+                                // 选中项（中间）不对称（用户反馈「出去在左
+                                // 上角、收回在中心」）。
                                 self.hl_center
                                     .set(Some((x + cell_w * 0.5, y + row_h * 0.5)));
+                            }
+                            if i == sel {
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y);
                                     // 【高亮滑动 2026-10-09】目标矩形→与上
@@ -3163,12 +3168,16 @@ impl CandidateWindowV2 {
                         for (i, (text, _)) in cands.iter().enumerate().take(10) {
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                             let y = y0 + (row_h + cand_spacing) * i as f32;
+                            if i == 0 {
+                                // 【高亮锚定 v4·出入同锚 2026-10-09 十】竖排：
+                                // 捕获**首行**胶囊中心（i==0）——入退场共用锚。
+                                self.hl_center
+                                    .set(Some((width * 0.5, y + row_h * 0.5)));
+                            }
                             if i == sel {
                                 // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
                                 // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
                                 // 已在胶囊内 gap+hp 起）
-                                // 【高亮锚定】竖排：捕获胶囊中心（入场动画盒锚点）
-                                self.hl_center.set(Some((width * 0.5, y + row_h * 0.5)));
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y);
                                     // 【高亮滑动 2026-10-09】竖排：上下滑动
@@ -3522,6 +3531,10 @@ impl CandidateWindowV2 {
                         // 【跨会话首帧自由 2026-10-09 八】真隐藏后的第
                         // 一个显示帧自由定位（焦点切换新位置不背旧锁/
                         // 旧累计——反向 4-26px 小位移钉错位洞）。
+                        // 【首帧微差仍钉 2026-10-09 十】fresh 只放行
+                        // >3px 位移：≤3px 的段首锚差（WPS 锯齿 ±1/±2，
+                        // u+空格 单键上屏流每段重现）钉住旧 y——跨焦点
+                        // 大跳照常自由、段首微抖吃掉。
                         let fresh = self.show_frame_fresh.replace(false);
                         let dy_lock = y - match self.sticky_pos {
                             Some((_, oy)) => oy,
@@ -3539,7 +3552,7 @@ impl CandidateWindowV2 {
                         } else {
                             dy_lock.abs()
                         };
-                        let allow = fresh
+                        let allow = (fresh && dy_lock.abs() > 3)
                             || dy_lock.abs() > 26
                             || (same_dir && acc_now >= 8 && dy_lock.abs() >= 4);
                         if dy_lock.abs() > 26 {
