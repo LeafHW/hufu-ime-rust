@@ -1539,6 +1539,22 @@ impl HuFuTs_Impl {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
         };
+        // 【空态退格立即收窗 2026-10-09 五】上屏后无编码（候选窗暂留/
+        // 收拢中）按退格=要改已上屏的字，旧候选列表已无意义——立即收。
+        // 实测通道：CUAS 宿主空态退格 TestDown 不来（直通路由），KeyDown
+        // 回调必到（dbg 探针实证）——在此层处理。组段中退格（删编码）
+        // 不动：由引擎路径处理（删空那一下另有立即收）。
+        if name == "backspace" && !m_ctrl && !m_shift && !m_alt {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if !g.composing && g.raw_last.is_empty() {
+                if let Some(c) = g.cand2.as_mut() {
+                    if c.is_visible() {
+                        crate::tsf::diag_note("退格: 空态立即收窗");
+                        c.hide_now();
+                    }
+                }
+            }
+        }
         // 行尾瞬态（query_caret 每帧刷新）：组段逼近窗口右缘时本键
         // 的提前上屏确认放宽（engine need 2→1）
         let line_end = self
