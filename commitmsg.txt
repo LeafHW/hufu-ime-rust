@@ -1,16 +1,20 @@
-下划线退役：撤 displayattr 整链，恢复 TSF 默认组段下划线
+下划线实线定稿 + 回车立即收窗 + 渐隐渐现动效改版
 
-用户实锤：QQ/开始菜单/记事本编码下划线全部消失。根因=v1.6.0 的
-displayattr 链给组段 range 标自定义属性 GUID，宿主经 msctf 解析该
-GUID 的显示信息失败时连默认下划线都不画（没有回退）。对照本机微拼/
-Rime/虎爪：均无 DisplayAttribute 注册表键、无 provider——下划线全部
-来自 TSF 默认组段渲染（1.5.9 同款）。
+【组段下划线·三连环根因闭合】首轮（displayattr 初版）QQ/UWP 全无线
+的根因链：属性 GUID 解析依赖 provider 发现（安装器 8 类别注册表键已
+足够——实证宿主每次按键都来查询 provider、mark 零失败），但样式给了
+TF_LS_NONE（"宿主按 INPUT 语义自画"是想当然）——XAML/CUAS 宿主严格
+按 lsStyle 画线，NONE=一根不画。定稿 TF_ATTR_INPUT + TF_LS_SOLID
+实线。像素级终验：商店记事本（XAML 宿主）组段字形下方出现 9px 实线
+行，上屏后消失；诊断同刻「provider 按 GUID 被查询」。
 
-修复=整链退役：
-- tsf.rs：删 4 处 mark_range_input/unmark_range 调用
-- lib.rs/com.rs：删 mod displayattr、provider implement、注册表键写入
-- displayattr.rs 删除
-- install.ps1：撤 HKLM DisplayAttribute 写入（实测 msctf 周期校验会删
-  HKCU 侧同款键，且本机三个可用 IME 均无此键）
-- install.ps1：新增 Set-WinDefaultInputMethodOverride（装机后默认输入法
-  显式=虎符；仅列表首位在用户机器上实测不够）
+- displayattr.rs 回归 + attr_style 实线；tsf.rs 恢复 4 处 mark/unmark
+  + provider implement + 自愈路径补标
+- RegisterCategory 装机/Activate 双路兜底（实测注册表键已够发现路，
+  RegisterCategory E_FAIL 无碍，留作正规化）
+- 【回车立即收窗】回车（清屏/编码上屏两模式）与 Shift 同款：候选立
+  即消失不走渐隐；引擎侧两模式本就正确，DLL 侧复用 shift_now_hide
+- 【渐隐渐现】hide() 1s 停留+盒心收拢退役：上屏后内容 0.2s 渐隐（画
+  刷级 alpha——背景/边框/阴影不衰减，框样式不变），到点隐藏；渐隐
+  中新编码从当前 alpha 反向渐现 0.2s（允许重叠）；首显内容渐现；
+  fade_ms 默认 200（皮肤 0=关回旧行为）；hide_now 作废渐变态

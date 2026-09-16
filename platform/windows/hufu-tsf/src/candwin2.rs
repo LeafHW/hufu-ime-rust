@@ -1,4 +1,4 @@
-﻿//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
+//! 候选窗 v2：D3D11 + DirectComposition + Direct2D + DWM 真实材质。
 //!
 //! - 窗口：WS_POPUP + WS_EX_NOREDIRECTIONBITMAP（DComp 直通，逐像素 alpha）
 //! - 材质（皮肤 material.kind）→ SetWindowCompositionAttribute accent：
@@ -621,6 +621,11 @@ pub struct CandidateWindowV2 {
     pub(crate) fade_ms: u32,
     /// 渐变进行态：Some((渐显?, 起点))；None=静止
     pub(crate) fade: Option<(bool, std::time::Instant)>,
+    /// 【渐隐渐现改版 2026-10-09】本阶段起始 alpha：新显从 0 起；
+    /// 渐隐被新编码打断反向渐现时=打断瞬间的 alpha（允许重叠交叠）；
+    /// 渐隐起臂=1.0。渲染只乘内容画刷（背景/边框/阴影不衰减——
+    /// 「候选框还是之前的样式，不要变」）。
+    pub(crate) fade_base: f32,
     /// 【动效 tick 重渲染标记】fade_tick 驱动的 show() 复渲染——不得
     /// 触发「内容更新打断渐隐」的取消规则（那是用户键入路径专用）。
     pub(crate) internal_rerender: bool,
@@ -993,6 +998,7 @@ impl CandidateWindowV2 {
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 fade_ms: 0,
                 fade: None,
+                fade_base: 1.0,
                 internal_rerender: false,
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
@@ -1161,6 +1167,7 @@ impl CandidateWindowV2 {
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 fade_ms: 0,
                 fade: None,
+                fade_base: 1.0,
                 internal_rerender: false,
             forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
@@ -1578,8 +1585,11 @@ impl CandidateWindowV2 {
         // 深色底，任何 alpha 过渡都「变深/透底」——用户三度否决）。首出
         // /收尾改纯运动：首键从 72% 长大到目标（边框阴影跟着拉出），
         // 收尾收拢到 70% 后隐藏。fade_ms 皮肤键保留可开。
-        self.fade_ms = (layout_f(skin, "fade_ms", 0.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        self.fade_ms_eff = (60.0 * anim_spd) as u32;
+        // 【渐隐渐现改版 2026-10-09】默认 0→200：上屏后内容 0.2s 渐隐、
+        // 框样式不变；渐隐中新编码 → 0.2s 反向渐现（允许重叠）。皮肤
+        // fade_ms=0 显式关闭（回旧立即隐藏+入场缩放）。
+        self.fade_ms = (layout_f(skin, "fade_ms", 200.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.fade_ms_eff = (200.0 * anim_spd) as u32;
         self.size_ms = (layout_f(skin, "size_ms", 60.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         let cmt_delay = layout_f(skin, "comment_delay_ms", 400.0).clamp(0.0, 5000.0) as u32;
@@ -1593,6 +1603,8 @@ impl CandidateWindowV2 {
                 .map(|t| now.duration_since(t).as_millis() >= FADE_QUIET_MS)
                 .unwrap_or(true);
             if self.fade_ms > 0 && quiet {
+                // 新组段首显：内容从全透明 0.2s 渐现（窗样式即到即全显）
+                self.fade_base = 0.0;
                 self.fade = Some((true, now));
                 unsafe {
                     let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
@@ -1602,14 +1614,16 @@ impl CandidateWindowV2 {
             }
             self.last_show_at = Some(now);
         } else {
-            // 内容更新帧：渐显进行中照常换内容不打断；渐隐被新内容打断
-            // → 立即回全显（窗口复活，不该继续淡出）。动效 tick 的内部
-            // 复渲染不算用户内容更新，不触发取消。
+            // 内容更新帧：渐显进行中照常换内容不打断；渐隐被新编码打断
+            // → 反向渐现（从打断瞬间的 alpha 起，允许重叠——用户口径
+            // 「0.2 秒后如果有新编码，也在 0.2 秒内渐现」）。动效 tick 的
+            // 内部复渲染不算用户内容更新，不触发。
             if let Some((false, _)) = self.fade {
                 if !self.internal_rerender {
-                    self.fade = None;
+                    self.fade_base = self.fade_alpha();
+                    self.fade = Some((true, std::time::Instant::now()));
                     unsafe {
-                        let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
+                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                     }
                 }
             }
@@ -2360,22 +2374,11 @@ impl CandidateWindowV2 {
                 };
                 ctx.SetTarget(&bitmap);
                 ctx.BeginDraw();
-                // 【动效 2026-09-11】过渡帧整帧透明度（渐隐渐显）：PushLayer
-                // opacity 包住全部绘制（含玻璃/自绘阴影内容）——稳态 alpha=1
-                // 零开销（不 Push）。alpha 由 fade 状态推导（fade_alpha）。
+                // 【渐隐渐现改版 2026-10-09】整帧 PushLayer(opacity) 退役：
+                // 改为只乘内容画刷 alpha（文字/高亮胶囊/编码行底）——背景/
+                // 边框/阴影保持全不透明，「候选框还是之前的样式，不要变」。
+                // 画刷创建处（text_alpha/elem_alpha/b_hi）统一乘 fade_a。
                 let fade_a = self.fade_alpha();
-                let fade_layer_on = fade_a < 0.999;
-                if fade_layer_on {
-                    let mut lp = D2D1_LAYER_PARAMETERS1::default();
-                    lp.contentBounds = D2D_RECT_F {
-                        left: -1.0e6,
-                        top: -1.0e6,
-                        right: 1.0e6,
-                        bottom: 1.0e6,
-                    };
-                    lp.opacity = fade_a;
-                    ctx.PushLayer(&lp, None);
-                }
                 // 【阶段验证】stage 分层渲染开关（见 read_diag_stage 注释）
                 let stage = read_diag_stage();
                 ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
@@ -2803,12 +2806,15 @@ impl CandidateWindowV2 {
 
                 // 【纯色模型 v2】非文字元素 alpha = master（颜色自带 a 忽略）；
                 // 高亮底 alpha = hilite_a；文字画刷 alpha 恒 1.0。
+                // 【渐隐渐现改版 2026-10-09】内容元素（编码行底/高亮胶囊）
+                // 与全部文字画刷统一乘 fade_a——渐隐渐现只作用于内容，
+                // 背景/边框/阴影不衰减（框样式不变）。
                 let elem_alpha = |mut c: D2D1_COLOR_F| {
-                    c.a = master;
+                    c.a = master * fade_a;
                     c
                 };
                 let text_alpha = |mut c: D2D1_COLOR_F| {
-                    c.a = 1.0;
+                    c.a = fade_a;
                     c
                 };
                 let mkbrush =
@@ -2842,7 +2848,7 @@ impl CandidateWindowV2 {
                 );
                 let b_hi = mkbrush(&ctx, {
                     let mut c = color_f(skin, "hilited_candidate_back_color", "#404046FF");
-                    c.a = hilite_a;
+                    c.a = hilite_a * fade_a;
                     c
                 });
                 let b_hi_txt = mkbrush(
@@ -3147,11 +3153,6 @@ impl CandidateWindowV2 {
                     }
                 }
 
-                // 【动效 2026-09-11】过渡帧收层（与 BeginDraw 后的 PushLayer
-                // 配对；稳态未 Push 不 Pop）
-                if fade_layer_on {
-                    ctx.PopLayer();
-                }
                 let _ = ctx.EndDraw(None, None);
                 ctx.SetTarget(None);
 
@@ -3793,35 +3794,21 @@ impl CandidateWindowV2 {
         }
     }
 
-    /// 【动效 2026-09-11】渐隐渐显当前帧透明度（渲染级）：由 fade 状态
-    /// 推导，二次缓动（起手快收尾缓）。稳态（fade=None）恒 1.0。
-    /// 【方案变更】DComp Visual3::SetOpacity2 对 NOREDIRECTIONBITMAP+
-    /// swapchain 窗实测无效（overlay 直通绕过合成属性——GPI 像素取证
-    /// 0.15/1.0 均亮 147），改 D2D PushLayer(opacity) 包整帧：仅过渡帧
-    /// 生效、稳态零开销，且玻璃/阴影随内容一起淡入（比 visual 级更完整）。
+    /// 【渐隐渐现改版 2026-10-09】内容层 alpha（只乘内容画刷）：由 fade
+    /// 状态 + fade_base（阶段起始 alpha）推导。渐显 = base→1 二次缓动；
+    /// 渐隐 = base→0 三次急落（首帧即显著下沉，全程只变淡）。稳态 1.0。
+    /// 旧整帧 PushLayer(opacity) 方案已退役（框要保样式不变）。
     pub(crate) fn fade_alpha(&self) -> f32 {
         match self.fade {
             None => 1.0,
             Some((fading_in, t0)) => {
-                // 【淡出专用 2026-09-11】进场=下限曲线（防透底重叠）；
-                // 退场=全幅 1→0（窗正在离开，透底即目的）。退场时长：
-                // fade_ms>0 用之，否则 120ms 默认。
-                // 【退场起步即沉 2026-09-11】二次缓动起步太平（前 1/3 程
-                // 几乎不透明）+200%+速度拉长后被观感为「先压重再消失」
-                // （半透明面板压在新上屏文字上=变重）——改三次曲线：首帧
-                // 即显著下沉，全程只做「变淡」。
-                let dur_ms = if fading_in {
-                    self.fade_ms.max(1)
-                } else if self.fade_ms > 0 {
-                    self.fade_ms
-                } else {
-                    self.fade_ms_eff.max(1)
-                } as f64;
+                let dur_ms = self.fade_ms.max(1) as f64;
                 let p = (t0.elapsed().as_secs_f64() * 1000.0 / dur_ms).clamp(0.0, 1.0);
+                let a0 = self.fade_base as f64;
                 if fading_in {
-                    (FADE_FLOOR + (1.0 - FADE_FLOOR) * (1.0 - (1.0 - p) * (1.0 - p))) as f32
+                    (a0 + (1.0 - a0) * (1.0 - (1.0 - p) * (1.0 - p))) as f32
                 } else {
-                    (((1.0 - p) * (1.0 - p) * (1.0 - p)) * 1.0) as f32
+                    (a0 * (1.0 - p) * (1.0 - p) * (1.0 - p)) as f32
                 }
             }
         }
@@ -3889,19 +3876,36 @@ impl CandidateWindowV2 {
     /// stale 走 hide_stale()（hold 在身不重臂——否则 110ms 轮询把
     /// 停留钟无限续期永不退场）。失焦/切窗/生命周期收窗走
     /// hide_now()，抑制路径走 hide_suppress()。
+    /// 【渐隐渐现改版 2026-10-09】内容路径退场改版：上屏后内容 0.2s
+    /// 渐隐（窗样式不变），到点真隐藏。旧「1s 停留钟 + 盒心收拢到
+    /// 72%」整链退役（hold 不再起臂 → hold_fire_shared 不再可达）。
+    /// 渐隐进行中重复调用=幂等续走；皮肤 fade_ms=0（显式关）→ 立即
+    /// 真隐藏。Shift/回车路径不走这里（shift_now_hide → hide_now
+    /// 立即消失）。
     pub fn hide(&mut self) {
         if self.is_visible() {
+            if self.fade_ms == 0 {
+                self.hide_now();
+                return;
+            }
+            if matches!(self.fade, Some((false, _))) {
+                // 渐隐已在走——续走不重臂
+                return;
+            }
+            // 渐显中途反转（罕见）：从当前 alpha 起渐隐
+            self.fade_base = if matches!(self.fade, Some((true, _))) {
+                self.fade_alpha()
+            } else {
+                1.0
+            };
+            self.fade = Some((false, std::time::Instant::now()));
+            self.commit_hold.set(None);
             self.scale_out.set(false);
             unsafe {
                 let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
             }
-            if self.commit_hold.get().is_none() {
-                crate::tsf::diag_note("动效: hold起臂(1s)");
-            }
-            self.commit_hold.set(Some(std::time::Instant::now()));
-            unsafe {
-                let _ = SetTimer(self.hwnd, HOLD_TIMER_ID, 1000, None);
-            }
+            crate::tsf::diag_note("动效: 渐隐起臂(0.2s 内容渐隐)");
             return;
         }
         self.hide_now();
@@ -3922,8 +3926,13 @@ impl CandidateWindowV2 {
     pub fn hide_now(&mut self) {
         self.commit_hold.set(None);
         self.scale_out.set(false);
+        // 【渐隐渐现改版 2026-10-09】立即收窗同时作废渐变态（防隐藏后
+        // 残留 tick 复渲染半透明内容）；fade_base 归 1（稳态）。
+        self.fade = None;
+        self.fade_base = 1.0;
         unsafe {
             let _ = KillTimer(self.hwnd, HOLD_TIMER_ID);
+            let _ = KillTimer(self.hwnd, FADE_TIMER_ID);
         }
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。

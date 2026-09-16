@@ -1,4 +1,4 @@
-﻿//! COM 基础设施：类厂与注册。
+//! COM 基础设施：类厂与注册。
 
 use windows::Win32::Foundation::{HMODULE, WIN32_ERROR};
 use windows::Win32::System::Com::{
@@ -179,6 +179,12 @@ pub fn register_server() -> HRESULT {
                                              // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
     let _ = reg_set(&lp, Some("IconFile"), &self_path());
+    // 【类别注册补课 2026-10-09】display attribute provider 类别——
+    // msctf 解析属性 GUID→TIP 的唯一发现机制（官方 Providing Display
+    // Attributes 第一步）。注册表键不是机制（本机微拼无键也有线）；
+    // 必须走 CategoryMgr（其自管存储）。此处装机侧（smoke reg 提权），
+    // TIP Activate 每进程兜底幂等再注册。
+    crate::displayattr::register_provider_category();
     HRESULT(0)
 }
 
@@ -189,5 +195,7 @@ pub fn register_server() -> HRESULT {
 pub fn unregister_server() -> HRESULT {
     let _ = reg_del_tree(&format!(r"Software\Classes\CLSID\{CLSID_STR}"));
     let _ = reg_del_tree(&format!(r"Software\Microsoft\CTF\TIP\{CLSID_STR}"));
+    // 【类别注册补课 2026-10-09】对称清理 DA provider 类别注册。
+    crate::displayattr::unregister_provider_category();
     HRESULT(0)
 }

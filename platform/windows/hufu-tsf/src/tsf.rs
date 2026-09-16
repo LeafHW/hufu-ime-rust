@@ -596,7 +596,8 @@ fn g_first_key_probe() -> bool {
     ITfTextInputProcessor,
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
-    ITfThreadMgrEventSink
+    ITfThreadMgrEventSink,
+    windows::Win32::UI::TextServices::ITfDisplayAttributeProvider
 )]
 pub struct HuFuTs {
     shared: SharedRef,
@@ -617,6 +618,13 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 小窗线程场景把自己的 Shared 登记线程局部（TL tick 用）。
         if G_SHARED.set(GShared(self.shared.clone())).is_err() {
             TL_SHARED.with(|s| *s.borrow_mut() = Some(self.shared.clone()));
+        }
+        // 【类别注册兜底 2026-10-09】每进程首激活补注册 display
+        // attribute 类别（幂等；装机侧 DllRegisterServer 已注册，这里
+        // 兜住各类边角）——msctf 解析属性 GUID 全靠它找 provider。
+        static DA_REG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DA_REG.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            crate::displayattr::register_provider_category();
         }
         let tm = ptim
             .cloned()
@@ -1568,6 +1576,15 @@ impl HuFuTs_Impl {
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
         ));
+        // 【回车立即收窗 2026-10-09】回车与 Shift 上屏同款：无论「回车
+        // 清屏」勾否（清屏=清组段 / 未勾=编码字母上屏），候选一律立即
+        // 消失，不走渐隐——用户口径「跟 Shift 一样的效果」。
+        if name == "enter" && consumed && !test_only {
+            self.shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shift_now_hide = true;
+        }
         // 【换方案即失效皮肤 2026-09-11】Ctrl+M 换方案后 entrance_anim
         // 等方案相关字段变化——键路径不拉皮肤（性能），不失效则缓存
         // 沿用到断段+2.5s（实测：单字切回整句后无入场动效，切窗才
@@ -1908,6 +1925,9 @@ impl EditSession_Impl {
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { crange.SetText(ec, 0, &wstr)? };
                 trace("SP: SetText ok");
+                // 【组段下划线·CUAS】编码文本打上「输入中」属性——
+                // 32 位/UWP/开始菜单（CUAS 渲染）据此画下划线。
+                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &crange) };
                 // 选区跟随到组段末尾（否则下次插入点停在开头）
                 let _ = set_selection_at_end(&ctx, ec, &crange);
                 // 【十七次修正·SP 同步 raw】监控实锤（04:11:19）：SP 不更
@@ -1953,6 +1973,9 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
+                // 【组段下划线·CUAS】编码更新后重打属性（SetText 会
+                // 重置 range 属性——每键重标）。
+                unsafe { crate::displayattr::mark_range_input(ec, &ctx, &range) };
                 // 【逐键跟随最新光标 2026-09-12 定版】用户拍板：打一个
                 // 编码/字母，窗就跟到最新光标处（不是旧的「上屏动一
                 // 次、段内钉住」）。段内每键两步：
@@ -2111,6 +2134,9 @@ impl EditSession_Impl {
                     // 有字但屏清了（多人实录，切窗恢复）。自愈：终止死组
                     // 段后在当前 context 直插保字（照 SetPreedit 自愈先例）。
                     let set_ok = unsafe {
+                        // 【组段下划线·CUAS】提交前清「输入中」属性——
+                        // 否则下划线残留到已上屏文本（属性跟 range 走）。
+                        crate::displayattr::unmark_range(ec, &ctx, &range);
                         range.SetText(ec, 0, &wstr).is_ok()
                     };
                     if set_ok {
@@ -2240,6 +2266,8 @@ impl EditSession_Impl {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
                     let set_ok = unsafe {
+                        // 【组段下划线·CUAS】顶屏提交前同样清属性。
+                        crate::displayattr::unmark_range(ec, &ctx, &range);
                         range.SetText(ec, 0, &wstr).is_ok()
                     };
                     if set_ok {
@@ -2423,6 +2451,9 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     let crange: ITfRange = unsafe { comp.GetRange()? };
     let wstr: Vec<u16> = text.encode_utf16().collect();
     unsafe { crange.SetText(ec, 0, &wstr)? };
+    // 【组段下划线·CUAS】自愈/重开路径同样打属性（无标记则 CUAS
+    // 宿主线缺——与 SP 主路径同款）。
+    unsafe { crate::displayattr::mark_range_input(ec, ctx, &crange) };
     let _ = set_selection_at_end(ctx, ec, &crange);
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.composition = Some(comp);
