@@ -1754,6 +1754,13 @@ impl Engine {
             return self.take_or_state(session);
         }
         // 非整句：按名次立即选重上屏
+        // 【;/' 不进调频 2026-10-09 十八】虎整句无模型态：;/' = 码表
+        // 第 2/3 位的**固定打法规程**（bu; 恒 = 码表第 2 词「好的」）
+        // ——选重学习会把固定码漂移（实测 bu; 上屏「好的」×15 次后
+        // 「好的」被顶到 bu 一选、; 锁位语义失效）。数字选重 = 用户
+        // 真偏好，保留调频；;/' 只选不学。
+        let no_learn = c == self.config.candidates.second_select
+            || c == self.config.candidates.third_select;
         let idx = match c {
             x if x == self.config.candidates.second_select => 1,
             x if x == self.config.candidates.third_select => 2,
@@ -1766,7 +1773,7 @@ impl Engine {
                 }
             }
         };
-        self.select_candidate(session, idx, true)
+        self.select_candidate_ex(session, idx, true, no_learn)
     }
 
     /// raw 是否还有编码延续（前缀树或符号表）。
@@ -2291,6 +2298,41 @@ impl Engine {
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
         self.select_candidate_abs(session, start + idx, flash)
+    }
+
+    /// 【十八修】no_learn 版（;/' 选重用）：只上屏不进用户词学习。
+    fn select_candidate_ex(
+        &mut self,
+        session: &mut Session,
+        idx: usize,
+        flash: bool,
+        no_learn: bool,
+    ) -> KeyOutcome {
+        let page_size = self.config.candidates.page_size.max(1);
+        let start = session.page * page_size;
+        let abs = start + idx;
+        if no_learn {
+            let pick = session.candidates.get(abs).cloned();
+            if let Some(cand) = pick {
+                self.sound_hint = Some("select");
+                let mut text = cand.commit_text().to_string();
+                if text.starts_with('{') {
+                    text = self.resolve_dynamic(&text);
+                }
+                if !flash {
+                    session.clear();
+                    return KeyOutcome::commit(text, self.state(session));
+                }
+                session.selected = abs.min(session.candidates.len().saturating_sub(1));
+                let mut st = self.state(session);
+                session.clear();
+                st.raw = String::new();
+                st.preedit = String::new();
+                return KeyOutcome::commit(text, st);
+            }
+            return KeyOutcome::consumed(self.state(session));
+        }
+        self.select_candidate_abs(session, abs, flash)
     }
 
     /// 选绝对下标候选。flash=true（数字/；选重键路径）带回选重闪帧
@@ -3704,6 +3746,29 @@ mod tests {
         // 纯码表原序 [就,到的,加]（频表浮字只在整句方案）→ 第 2 = 到的
         let out = eng.process_key(&mut s, key('2'));
         assert_eq!(out.commit.unwrap(), "到的", "非整句数字选重立即上屏第 2");
+    }
+
+    /// 【十八修】;/' 次选不进调频：虎整句无模型态 bu; 恒 = 码表第 2 词，
+    /// 连续 ; 选重不得把第 2 词顶到一选（实测 bu; 好的 ×15 → 好的霸占
+    /// bu 一选、; 锁位语义失效）。数字选重仍学习（真偏好）。
+    #[test]
+    fn second_select_key_does_not_rerank() {
+        let (mut eng, dir) = test_engine("ssk");
+        // 连续三轮：jd → ;（次选上屏「到的」）→ 再查 jd 序应保持原序
+        for _ in 0..3 {
+            let mut s = Session::new(true);
+            eng.process_key(&mut s, key('j'));
+            eng.process_key(&mut s, key('d'));
+            let out = eng.process_key(&mut s, key(';'));
+            assert_eq!(out.commit.unwrap(), "到的", "; 次选上屏码表第 2 词");
+        }
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let texts: Vec<String> = s2.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["就", "到的", "加"], "; 选重后码表原序不变");
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap_or_default();
+        assert!(!log.contains("jd\t到的"), "; 选重不落学习日志: {log}");
     }
 
     // 【用户词选重 2026-09-06】整句方案锁式选重只认码表位次：/jc 加
