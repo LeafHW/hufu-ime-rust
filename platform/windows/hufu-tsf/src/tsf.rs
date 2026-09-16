@@ -1591,6 +1591,23 @@ impl HuFuTs_Impl {
                 .unwrap_or_else(|e| e.into_inner())
                 .shift_now_hide = true;
         }
+        // 【退格删空立即收窗 2026-10-09 四】与回车/Shift 同款：退格把
+        // 编码删空的这一下（按前有码、按后空码）候选立即消失不走暂留
+        //——删空=明确放弃，无确认意义。编码未删光（正常删一位）照常
+        // 显示；空态退格（直通删宿主字符，consumed=false）不受影响。
+        if name == "backspace" && consumed && !test_only {
+            let now_empty = state
+                .get("raw")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty();
+            if now_empty {
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.raw_last.is_empty() {
+                    g.shift_now_hide = true;
+                }
+            }
+        }
         // 【选重闪帧 2026-10-09】数字键上屏（选重/锁提前上屏皆是「第 N
         // 项胜出」语义）→ 标记页内下标；引擎纯选重路径自带闪帧时
         // update_ui 优先用引擎帧，锁路径（state 空）用 last_show 自建。

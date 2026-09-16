@@ -3260,6 +3260,16 @@ impl Engine {
 
     /// 注释：拆分 / 拼音 / Unicode 分区（按配置与可用性）。
     pub fn annotate(&self, word: &str) -> String {
+        // 【注释口径 2026-10-09 四】①整句模式开启=注释全关（设置页早已
+        // 标注「不可用」，引擎补齐真语义——组句流候选不带任何注释，原
+        // 整句下码表域兜底项仍挂注释的漏口堵上）；②仅单字显示（词不
+        // 显示——拆分/拼音/Unicode 一律免，多音拼音串冗长无意义）。
+        if self.sentence_active() {
+            return String::new();
+        }
+        if word.chars().count() != 1 {
+            return String::new();
+        }
         let mut parts: Vec<String> = Vec::new();
         // 【2026-09-05 修复】拆分/注释原为 else-if 互斥——开拆分时注释
         // 被短路（用户实测「显示注释不生效」）。两开关独立生效：
@@ -3268,6 +3278,19 @@ impl Engine {
             if let Some(sp) = &self.schema.split {
                 let s = sp.annotate_word(word, 2);
                 if !s.is_empty() {
+                    // 【拆分截断 2026-10-09 四】最多 4 部件：前 3 顺笔 +
+                    // 末 1（末笔）——生僻大字（𰻝 全 11 部件「穴言幺幺马
+                    // 长长月刂心辶」）只显「穴言幺辶」，编码提示够了，
+                    // 全串反而淹没候选窗。
+                    let cs: Vec<char> =
+                        s.chars().filter(|c| !c.is_whitespace()).collect();
+                    let s = if cs.len() > 4 {
+                        let head: String = cs[..3].iter().collect();
+                        let tail: String = cs[cs.len() - 1..].iter().collect();
+                        format!("{head}{tail}")
+                    } else {
+                        s
+                    };
                     parts.push(s);
                 }
             }
