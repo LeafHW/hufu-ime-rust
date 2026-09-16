@@ -108,13 +108,16 @@ fn second_and_third_select() {
 }
 
 #[test]
-fn overmax_push() {
+fn empty_clear_beyond_max() {
     // 顶屏（语义定版 2026-08-31）：死路键【不】顶屏——只有超过最大
     // 码长（第 max+1 键）才顶首选。一简 a(来) 后跟死路 z：不上屏。
     // 【空码码长=max+1 2026-09-11】2-max-1 键的暂时空码不清（可能仍
     // 有解/用户词）；恰满 max 码死路也保留缓冲；第 max+1 键仍空码才
     // 清前 max 码、保留第 max+1 键为新起点。
+    // 【默认关适配 2026-10-09】auto_clear_empty 默认已改关——本用例
+    // 显式开（测开关行为，非默认值）。
     let (mut engine, mut session, _dir) = setup();
+    engine.config.input.auto_clear_empty = true;
     engine.process_key(&mut session, key('a')); // 来
     let out = engine.process_key(&mut session, key('z')); // az 死路（2 键）
     assert_eq!(out.commit, None, "死路键不得自动上屏");
@@ -262,6 +265,8 @@ fn sentence_mode_after_max_length() {
 #[test]
 fn mixed_input_uppercase() {
     let (mut engine, mut session, _dir) = setup();
+    // 开关行为测试（默认值 2026-10-09 起为关——本用例显式开）
+    engine.config.input.mixed_input = true;
     engine.process_key(&mut session, key('A'));
     engine.process_key(&mut session, key('B'));
     let out = engine.process_key(&mut session, key(' '));
@@ -314,6 +319,8 @@ fn shift_with_composition_commits_raw_and_switches() {
 #[test]
 fn enter_clear_and_escape() {
     let (mut engine, mut session, _dir) = setup();
+    // 开关行为测试（默认值 2026-10-09 起为关——本用例显式开）
+    engine.config.input.enter_clear = true;
     engine.process_key(&mut session, key('t'));
     let out = engine.process_key(
         &mut session,
@@ -333,9 +340,10 @@ fn setup_with_dir() -> (Engine, Session, std::path::PathBuf) {
     setup()
 }
 
-/// 【4 码内高频字优先 2026-09-11】当前实打编码 ≤4（含 4）时前 1500
-/// 高频单字候选压多字候选置首（同码竞争中权重低也置先）；第 5 键起
-///（超 4 码）回归正常权重排序。置顶（pinned）仍压过优先规则。
+/// 【纯码表=纯频序 2026-10-09 十五】频表浮字规则已整句方案限定
+///（见 lib.rs 同名注释）——纯码表方案（虎码单字等）多表合并后谁字频
+/// 词频高谁在前，任何浮字/重排不生效。本测试锁定该口径：wx 原序
+/// [写组(9000), 的(10), 一(5)]；wxyzx（>4 码）同样原序。
 #[test]
 fn freq1500_priority_within_four_codes() {
     let dir = std::env::temp_dir().join(format!("hufu-freq1500-{}", std::process::id()));
@@ -356,26 +364,24 @@ fn freq1500_priority_within_four_codes() {
     config.schema.current = "虎码单字".into();
     let mut engine = Engine::new(&dir, config).unwrap();
     let mut session = Session::new(true);
-    // wx（2 码 ≤4）：的/一（前 1500 字频）压过高权重「写组」，且字频
-    // 序 的(排1) 在 一(排2) 前
+    // wx（2 码 ≤4）：纯频序——写组(9000) 在 的(10)/一(5) 前
     engine.process_key(&mut session, key('w'));
     let out = engine.process_key(&mut session, key('x'));
     let cands = out.state.unwrap().candidates;
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(texts, vec!["的", "一", "写组"], "≤4 码高频字优先首选: {texts:?}");
-    // wxyzx（5 码 >4）：正常权重——高权重「词组长码」在先
+    assert_eq!(texts, vec!["写组", "的", "一"], "≤4 码纯频序: {texts:?}");
+    // wxyzx（5 码 >4）：同样原序——高权重「词组长码」在先
     engine.process_key(&mut session, key('y'));
     engine.process_key(&mut session, key('z'));
     let out5 = engine.process_key(&mut session, key('x'));
     let cands5 = out5.state.unwrap().candidates;
     let texts5: Vec<&str> = cands5.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(texts5, vec!["词组长码", "是"], ">4 码正常权重: {texts5:?}");
+    assert_eq!(texts5, vec!["词组长码", "是"], ">4 码纯频序: {texts5:?}");
 }
 
-/// 【单字永不换序·词下沉 2026-09-11 二次修正】用户实测回归：kc 全码组
-/// [寸,泥,⼨]（泥在 1500 表、寸不在）被平铺浮前错排成泥首位——形码同码
-/// 单字组的官方序不容频表重排。正确语义：1500 单字只浮到「多字候选」
-/// 之前（wfsi→征压「写止」词），锚后罕字不回退、已达标组零扰动。
+/// 【单字组官方序 + 纯码表纯频序 2026-10-09 十五】kc 同码单字组
+/// [寸,泥,⼨] 官方序不动；wfsi/wx 同为码表原序（浮字已整句限定，
+/// 词「写止」不再被 1500 单字压到「征」后）。
 #[test]
 fn freq1500_singles_never_reorder_words_sink() {
     let dir = std::env::temp_dir().join(format!("hufu-freq1500-fix-{}", std::process::id()));
@@ -407,16 +413,16 @@ fn freq1500_singles_never_reorder_words_sink() {
         }
         out.unwrap().state.unwrap().candidates
     };
-    // kc：同码单字组官方序不动（泥在 1500 表也不浮过寸）
+    // kc：同码单字组官方序不动（浮字规则不在纯码表生效，序本就原序）
     let cands = type_raw(&mut engine, "kc");
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(texts, vec!["寸", "泥", "⼨"], "单字组永不换序: {texts:?}");
-    // wfsi：词「写止」下沉，征浮首，锚后罕字保位
+    assert_eq!(texts, vec!["寸", "泥", "⼨"], "单字组官方序: {texts:?}");
+    // wfsi：纯频序——写止(9000) 在 征(10)/𡧡(8) 前
     let cands = type_raw(&mut engine, "wfsi");
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(texts, vec!["征", "写止", "𡧡"], "1500 单字压词、罕字不回退: {texts:?}");
-    // wx：权重序 [象,彻底,𧰼]，象本就在首——整表不动
+    assert_eq!(texts, vec!["写止", "征", "𡧡"], "纯码表纯频序: {texts:?}");
+    // wx：权重序 [象,彻底,𧰼]
     let cands = type_raw(&mut engine, "wx");
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(texts, vec!["象", "彻底", "𧰼"], "已达标组零扰动: {texts:?}");
+    assert_eq!(texts, vec!["象", "彻底", "𧰼"], "权重序: {texts:?}");
 }

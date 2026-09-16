@@ -114,7 +114,7 @@ pub struct InputSection {
     pub alphabet: String,
     /// 最大码长
     pub max_code_length: usize,
-    /// 超最大码长自动上屏：编码长度超过 max_code_length 时自动顶屏首选（设置界面显示名；旧称「顶屏」）
+    /// 超最大码长自动上屏：编码长度超过 max_code_length 时自动顶屏首选（设置界面显示名）
     pub auto_push: bool,
     /// 满码且唯一候选时自动上屏
     pub auto_select_unique: bool,
@@ -596,7 +596,12 @@ mod tests {
         let cfg2: Config = serde_json::from_str(partial).unwrap();
         assert_eq!(cfg2.input.max_code_length, 5);
         assert_eq!(cfg2.input.auto_push, true);
-        assert_eq!(cfg2.candidates.page_size, 5);
+        // 【默认 4 2026-10-09 十四】每页候选默认 5→4（用户拍板）
+        assert_eq!(cfg2.candidates.page_size, 4);
+        // 【默认关 2026-10-09 十四】空码清屏/回车清屏/中英混输默认关
+        assert_eq!(cfg2.input.auto_clear_empty, false);
+        assert_eq!(cfg2.input.enter_clear, false);
+        assert_eq!(cfg2.input.mixed_input, false);
     }
 
     #[test]

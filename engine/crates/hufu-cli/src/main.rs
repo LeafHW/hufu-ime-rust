@@ -334,14 +334,34 @@ fn cmd_cands(dir: &str, ngram: &str, raws: &[String]) {
     }
     for raw in raws {
         println!("━━ raw = {raw}");
+        // 直查对照：dict 原始序 vs schema.candidates（adjust+user 后）序
+        let lk: Vec<String> = schema
+            .dict
+            .lookup(raw)
+            .iter()
+            .take(6)
+            .map(|e| format!("{}({:.0})", e.text, e.weight))
+            .collect();
+        println!("   dict.lookup: [{}]", lk.join(" "));
+        let fin: Vec<String> = schema
+            .candidates(raw)
+            .iter()
+            .take(6)
+            .map(|e| format!("{}({:.0})", e.text, e.weight))
+            .collect();
+        println!("   schema.cands: [{}]", fin.join(" "));
         let mut sess = Session::new(true);
         for ch in raw.chars() {
             let out = engine.process_key(&mut sess, KeyInput::char_key(ch));
             if let Some(c) = out.commit {
                 println!("   [commit] {c}");
             }
-            let show: Vec<String> =
-                sess.candidates.iter().take(6).map(|c| c.text.clone()).collect();
+            let show: Vec<String> = sess
+                .candidates
+                .iter()
+                .take(6)
+                .map(|c| format!("{}({:.0})", c.text, c.weight))
+                .collect();
             println!("   {ch} → [{}]", show.join(" "));
         }
     }

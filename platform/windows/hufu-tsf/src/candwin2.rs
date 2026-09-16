@@ -4506,6 +4506,12 @@ unsafe fn hold_fire_shared(hwnd: HWND) {
                 unsafe {
                     let _ = KillTimer(hwnd, HOLD_TIMER_ID);
                 }
+                // 【状态同步清 2026-10-09 十六】钟已响：hold 在身标记同
+                // 步清空——否则退场被新键 show 打断后，poll stale 的
+                // 「hold 在身不重臂」判定永远为真（钟已杀不会再响），
+                // hide_stale 永不收窗=候选永存（用户实测：关暂留+上屏
+                // 后退场动画内快速打新编码即触发）。
+                c.commit_hold.set(None);
                 c.scale_out.set(true);
                 c.size_anim = Some((cur, tgt, std::time::Instant::now()));
                 c.chrome_override.set(Some(cur));

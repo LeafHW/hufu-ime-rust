@@ -3134,7 +3134,14 @@ impl Engine {
             // 以最后一个 1500 单字为锚：锚前非词保序 → 全部词保序 → 其
             // 余非词保序。无 1500 单字则完全不动。只动序不动权重，置顶区
             // （pinned）不受影响。
-            let freq_boost_domain = !parsed.has_locks()
+            // 【整句方案限定 2026-10-09 十五】用户口径：纯码表方案=纯频
+            // 数序（多表同步合并后谁字频词频高谁在前），不搞任何频表
+            // 浮字。本规则（2026-09-11 wfsi→征 压「写止」拍板）的对象
+            // 是**整句方案**码表域里混入的整句现切多字——只在整句方案
+            // （sentence_active）启用；虎码字词等纯码表方案整条规则不
+            // 生效（is→[经常485 络397 …] 频序即终序）。
+            let freq_boost_domain = self.sentence_active()
+                && !parsed.has_locks()
                 && raw_len > 0
                 && raw_len <= self.config.input.max_code_length;
             if freq_boost_domain {
@@ -3149,13 +3156,17 @@ impl Engine {
                             .map(hufu_dict::freq::is_top1500)
                             .unwrap_or(false)
                 };
+                // 被「浮字」下沉的多字 = 仅整句现切组合（原拍板语义）
+                let is_sentence_word = |c: &Candidate| {
+                    c.text.chars().count() > 1 && c.source == CandidateKind::Sentence
+                };
                 // 锚 = 最后一个 1500 单字（无则整段不动——含纯罕字单字组）
                 if let Some(anchor) = rest.iter().rposition(|c| is_top_single(c)) {
                     let mut out: Vec<Candidate> = Vec::with_capacity(rest.len());
                     let mut words: Vec<Candidate> = Vec::new();
                     let mut after: Vec<Candidate> = Vec::new();
                     for (i, c) in rest.into_iter().enumerate() {
-                        if i <= anchor && !is_top_single(&c) && c.text.chars().count() > 1 {
+                        if i <= anchor && is_sentence_word(&c) {
                             words.push(c);
                         } else if i <= anchor {
                             out.push(c);
@@ -3690,8 +3701,9 @@ mod tests {
         let mut s = Session::new(true);
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
+        // 纯码表原序 [就,到的,加]（频表浮字只在整句方案）→ 第 2 = 到的
         let out = eng.process_key(&mut s, key('2'));
-        assert_eq!(out.commit.unwrap(), "加", "非整句数字选重立即上屏第 2");
+        assert_eq!(out.commit.unwrap(), "到的", "非整句数字选重立即上屏第 2");
     }
 
     // 【用户词选重 2026-09-06】整句方案锁式选重只认码表位次：/jc 加
@@ -3796,10 +3808,10 @@ mod tests {
         let out4 = eng.process_key(&mut s4, key('='));
         assert!(out4.commit.is_none(), "= 有下页时翻页不上屏");
         assert_eq!(s4.page, 1, "翻到第 2 页");
-        // 到末页再按 = → 顶字（末页页首「到的」——4码内高频字优先后
-        // jd 序 = [就,加,到的]，page_size 2 时末页只剩 到的）
+        // 到末页再按 = → 顶字（末页页首「加」——纯码表原序
+        // jd = [就,到的,加]，page_size 2 时末页只剩 加）
         let out5 = eng.process_key(&mut s4, key('='));
-        assert_eq!(out5.commit.unwrap(), "到的=", "末页再 = 顶字");
+        assert_eq!(out5.commit.unwrap(), "加=", "末页再 = 顶字");
         // - 回翻：第 2 页按 - 回第 1 页
         let mut s5 = Session::new(true);
         eng.process_key(&mut s5, key('j'));
@@ -4063,12 +4075,12 @@ mod tests {
             .iter()
             .map(|c| c.text.clone())
             .collect();
-        assert_eq!(texts0, vec!["就", "新", "加", "到的"], "初始序");
-        // Ctrl+2：把第 2 位「新」（用户词，boost 序 [就,新,加,到的]）移到首位
+        assert_eq!(texts0, vec!["就", "到的", "新", "加"], "初始序");
+        // Ctrl+3：把第 3 位「新」（用户词 p3，原序 [就,到的,(新),加]）移到首位
         let out = eng.process_key(
             &mut s,
             KeyInput {
-                key: KeyCode::Char('2'),
+                key: KeyCode::Char('3'),
                 modifiers: Modifiers {
                     ctrl: true,
                     ..Default::default()
@@ -4078,8 +4090,8 @@ mod tests {
         );
         assert!(out.commit.is_none());
         let texts1: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
-        assert_eq!(texts1, vec!["新", "就", "加", "到的"], "Ctrl+2 调频：新 到首位其余后移");
-        // Ctrl+2 后序 [新,就,加,到的] → Ctrl+Shift+2 删除第 2 位「就」
+        assert_eq!(texts1, vec!["新", "就", "到的", "加"], "Ctrl+3 调频：新 到首位其余后移");
+        // Ctrl+3 后序 [新,就,到的,加] → Ctrl+Shift+2 删除第 2 位「就」
         eng.process_key(
             &mut s,
             KeyInput {
@@ -4093,7 +4105,7 @@ mod tests {
             },
         );
         let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
-        assert_eq!(texts2, vec!["新", "加", "到的"], "Ctrl+Shift+2 删词：码表词就 隐藏");
+        assert_eq!(texts2, vec!["新", "到的", "加"], "Ctrl+Shift+2 删词：码表词就 隐藏");
         // 持久化验证：【格式统一 2026-09-06】调整行落 用户调整.txt
         //（统一 {标记} 格式）；词行（旧 用户词.txt）保留不动
         let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
@@ -4663,8 +4675,8 @@ mod tests {
     fn pin_and_hide_via_keys() {
         let (mut eng, _dir) = test_engine("pin");
         let mut s = Session::new(true);
-        // jd → 就/加/到的（4码内高频字优先）；【2026-09-06 新绑定】
-        // Ctrl+2 置顶第 2 个（加）
+        // jd → 就/到的/加（纯码表原序，频表浮字只在整句方案）；
+        // 【2026-09-06 新绑定】Ctrl+2 置顶第 2 个（到的）
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let st = eng.state(&s);
@@ -4676,18 +4688,18 @@ mod tests {
             k
         });
         let st = eng.state(&s);
-        assert_eq!(st.candidates[0].text, "加", "Ctrl+2 置顶后『加』应在首位");
+        assert_eq!(st.candidates[0].text, "到的", "Ctrl+2 置顶后『到的』应在首位");
 
         // 日志落盘 + 回放等价（【格式统一 2026-09-06】落 用户调整.txt）
         let dir = eng.schema.dir.clone();
         let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
-        assert!(log.contains("{置顶}jd\t加"), "{log}");
+        assert!(log.contains("{置顶}jd\t到的"), "{log}");
         let adj = hufu_dict::user::UserAdjust::parse(
             &log.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
         let base = eng.schema.dict.lookup("jd").into_iter().cloned().collect::<Vec<_>>();
         let out = adj.apply("jd", &base);
-        assert_eq!(out[0].text, "加");
+        assert_eq!(out[0].text, "到的");
 
         // Ctrl+Delete 软删首选（到的）→ 首选回到 就
         let mut s3 = Session::new(true);
