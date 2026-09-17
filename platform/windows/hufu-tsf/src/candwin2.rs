@@ -608,7 +608,7 @@ pub struct CandidateWindowV2 {
     /// 【高亮滑动 2026-10-09】高亮胶囊位移动效：Some((起点矩形 LTRB,
     /// t0, 时长 ms))。渲染时胶囊从起点矩形 ease-out 插值到目标位，完成
     /// 即清。数字/；选重闪帧与 ↑↓ 移动共用（皮肤 layout.hl_ms 默认
-    /// 150，0=关）。
+    /// 100，0=关）。
     pub(crate) hl_anim: std::cell::Cell<Option<((f32, f32, f32, f32), std::time::Instant, u32)>>,
     /// 上一帧渲染的胶囊矩形（下一程滑动的起点）。Cell：渲染路径 &self。
     pub(crate) hl_rect: std::cell::Cell<Option<(f32, f32, f32, f32)>>,
@@ -929,7 +929,7 @@ impl CandidateWindowV2 {
                 hl_anim: std::cell::Cell::new(None),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
-                hl_ms: 150,
+                hl_ms: 100,
                 internal_rerender: false,
                 forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
@@ -1094,7 +1094,7 @@ impl CandidateWindowV2 {
                 hl_anim: std::cell::Cell::new(None),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
-                hl_ms: 150,
+                hl_ms: 100,
                 internal_rerender: false,
                 forward_hold: false,
                 ylock_last_dir: std::cell::Cell::new(0),
@@ -1544,9 +1544,10 @@ impl CandidateWindowV2 {
         // 过渡都「变深/透底」（用户三度否决）——fade 全链已删。
         self.size_ms = (layout_f(skin, "size_ms", 150.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        // 【高亮滑动 2026-10-09】胶囊滑动时长（二十七修定稿 0.15s——
-        // 与选重闪帧收场钟同拍：滑动恰播完即收；皮肤 hl_ms 可调，0=瞬跳）。
-        self.hl_ms = (layout_f(skin, "hl_ms", 150.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【高亮滑动 2026-10-09】胶囊滑动时长（二十七修定稿 100ms——
+        // 收场钟 150ms 不变：滑动先播完，留一拍确认再收；皮肤 hl_ms
+        // 可调，0=瞬跳）。
+        self.hl_ms = (layout_f(skin, "hl_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【二十五修·注释提速 2026-10-09】默认 400→200：注释列晚半拍
         // 展开=「候选慢半拍」观感主源之一（皮肤显式配置不受影响）。
         let cmt_delay = layout_f(skin, "comment_delay_ms", 200.0).clamp(0.0, 5000.0) as u32;
