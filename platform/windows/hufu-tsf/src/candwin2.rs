@@ -630,6 +630,12 @@ pub struct CandidateWindowV2 {
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
     pub(crate) size_ms: u32,
+    /// 【虎娘对齐 2026-09-18 六修→七修修订】尺寸形变动效开关（皮肤
+    /// layout.size_morph，默认开）。回弹感的根源是 smoothstep 逐键重
+    /// 臂反复慢起——线性化（size_ease 七修）已根除，形变本身保留
+    ///（用户实测：变长变宽变矮的过渡是要的，去掉的是弹）。皮肤
+    /// "size_morph": 0 可关。
+    pub(crate) size_morph: bool,
     /// 【位置滑动 2026-09-11】整句自动上屏后剩余内容跳到新光标、候选
     /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
     /// 而非一跳一跳。None=瞬移。
@@ -939,6 +945,7 @@ impl CandidateWindowV2 {
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
+                size_morph: false,
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
@@ -1104,6 +1111,7 @@ impl CandidateWindowV2 {
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
+                size_morph: false,
                 pos_anim: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
@@ -1544,6 +1552,27 @@ impl CandidateWindowV2 {
         // 过渡都「变深/透底」（用户三度否决）——fade 全链已删。
         self.size_ms = (layout_f(skin, "size_ms", 150.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【六修·虎娘对齐】形变退役 → 【七修修订】形变保留（用户实测
+        // 要的是去回弹不是去形变；线性化已根除回弹），默认开，
+        // 皮肤 layout.size_morph=0 显式关。
+        self.size_morph = layout_f(skin, "size_morph", 1.0) > 0.5;
+        // 【虎娘对齐·首显滑动 2026-09-18】非整句组段首显：server 方案门
+        // 控（first_show_slide，缺键=不滑）+ 渲染点注入的每键宽
+        // （first_show_unit）。起点不靠注入坐标——四修：注入帧的
+        // raw/caret 新鲜度随宿主帧序漂移，改为 show() 内从目标位反推：
+        // fx = tx − 编码长×unit（「编码左端」= 光标右 − 编码宽，时序
+        // 无关）。时长固定 ~100ms（虎娘探针实测同拍；逐键跟随原本就
+        // 有；入场长大已随二十四修退役，不叠加）。
+        // 【三修·两形态】g.skin=管道响应包装层（{skin:{...},...}）——
+        // anim 同款「顶层或 /skin/ 两形态都认」，只查顶层永远 None
+        //（实测 slide 恒 false=「怎么没效果」的真根因）。
+        let skin_value = |key: &str| -> Option<&serde_json::Value> {
+            skin.get(key).or_else(|| skin.get("skin").and_then(|s| s.get(key)))
+        };
+        let first_show_unit = skin_value("first_show_unit").and_then(|v| v.as_f64());
+        let first_show_slide = skin_value("first_show_slide")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // 【高亮滑动 2026-10-09】胶囊滑动时长（二十七修定稿 100ms——
         // 收场钟 150ms 不变：滑动先播完，留一拍确认再收；皮肤 hl_ms
         // 可调，0=瞬跳）。
@@ -1626,7 +1655,12 @@ impl CandidateWindowV2 {
         let line_h = font_pt * 96.0 / 72.0 + layout_f(skin, "line_spacing", 3.0) + 5.0;
         // width>0 固定宽；0=按内容自适应（min_width~340 收夹）
         let width_cfg = layout_f(skin, "width", 0.0);
-        let min_width = layout_f(skin, "min_width", 150.0).max(100.0);
+        // 【八修·竖排最低宽裁剪 2026-09-18 用户拍板】竖排短内容被皮肤
+        // min_width(150/120) 顶出右侧留白，观感空旷——读取后统一 ×⅔
+        //（150→100、120→80），硬底 100→66。乘法在显式键之后=全皮肤
+        // 生效（改默认值对显式皮肤无效）；横排不走此值（09-08 已纯
+        // 自适应），固定宽皮肤（width>0）不经过 clamp，均不受影响。
+        let min_width = (layout_f(skin, "min_width", 150.0) * 2.0 / 3.0).max(66.0);
         // 序号列宽：按本页实际序号宽度自适应（测量块内计算）。
         // 滚轮放大序号后列宽随字号缩放（「1.」「10.」不换行摞字），
         // 序号与正文紧贴（2026-09-06 用户两轮实测反馈后：无固定基准，
@@ -2151,13 +2185,18 @@ impl CandidateWindowV2 {
                 self.size_anim = None;
                 self.chrome_override.set(None);
             } else if was_visible
+                && self.size_morph
                 && self.size_ms > 0
                 // 【起臂阈值 24/14 2026-09-11】普通逐字打字的行宽增长
                 // （~8-17px/键）不动画——文字即时更新（连打不闪不滞后，
                 // 用户实测逐键闪的规避）；动画留给结构性大变化（注释
                 // 展开、横竖切换、候选大改）。旧 10/8 阈值=几乎每键起
                 // 臂 → 内容层遮罩逐键在岗 = 文字闪的放大器。
-                && ((target.0 - cur.0).abs() > 24 || (target.1 - cur.1).abs() > 14)
+                // 【八修配套·阈值 14 2026-09-18 用户拍板「降到14看看」】
+                // 竖排窄窗后 14-24px 的宽度变化也常见（最低宽裁剪），
+                // 瞬跳显突兀——宽度阈值 24→14（高度 14 不动），小变化
+                // 也走形变；胶囊右缘已贴壳（ chw），逐键起臂不再闪。
+                && ((target.0 - cur.0).abs() > 14 || (target.1 - cur.1).abs() > 14)
             {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
@@ -2924,8 +2963,14 @@ impl CandidateWindowV2 {
                                     let (pt, pb) = pill_v(y);
                                     // 【高亮滑动 2026-10-09】竖排：上下滑动
                                     //（左右恒满宽）；mark 竖条随胶囊走。
+                                    // 【八修配套 2026-09-18】右缘贴外壳插值
+                                    // 宽 chw（稳态恒等 width）：宽度形变中
+                                    // 无 hl_anim 时 hl_slide_rect 直接返回
+                                    // 目标矩形——用目标 width 会「壳未到而
+                                    // 胶囊先到」=闪现；贴 chw 即随壳生长/
+                                    // 收拢，与拉伸动效同步。
                                     let hr =
-                                        self.hl_slide_rect((rm_x, pt, cr(width - rm_x), cb(pb)));
+                                        self.hl_slide_rect((rm_x, pt, cr(chw - rm_x), cb(pb)));
                                     let rr = D2D1_ROUNDED_RECT {
                                         rect: D2D_RECT_F {
                                             left: hr.0,
@@ -3616,13 +3661,66 @@ impl CandidateWindowV2 {
                         // 【动效提速 2026-10-08】整体提速约 30%：系数 5→3.5、
                         // 下限 60→45、40px 内档上限 100→75、大步上限 220→150；
                         // 且乘全局速度倍率（滑条统管平移）。
+                        // 【七修·速度对齐虎娘 2026-09-18 用户拍板】系数
+                        // 3.5→7.5：打字档恒速 ≈130px/s = 虎娘实测（12px/
+                        // 90ms，64Hz 2px/tick 等效）；上限放宽 160ms 让恒速
+                        // 到 ~21px 都不打折，更大位移仍是快滑（400px 落
+                        // 160ms ≈ 2.5px/ms，74 修「不拖沓」语义保留）。
                         let spd = self.anim_spd.get().max(0.05);
-                        let dur = ((d as f32 * 3.5 / spd) as u32)
-                            .clamp(45, if d > 40 { 100 } else { 75 });
+                        let dur = ((d as f32 * 7.5 / spd) as u32).clamp(45, 160);
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
                         let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                     } else if d > 0 {
                         self.pos_anim = None;
+                    }
+                } else if !was_visible && self.pos_ms > 0 && !self.internal_rerender {
+                    // 【虎娘对齐·首显滑动】组段首显（was_visible=false）原本
+                    // 直接落锚；非整句方案改为从编码左端滑向光标右（虎娘
+                    // 单字实测：窗口首现于编码左端，~100ms 滑到编码右端）。
+                    // 臂门：距离 3..=150px——<3px 死区同逐键；>150px 是跨
+                    // 焦点/点击换位级大跳，新位置直接出现（三十二修语义）。
+                    // 时长固定 100ms（anim_speed 统管），不走逐键的距离
+                    // clamp——一段首显 12px 会被压到 45ms，比虎娘急。
+                    // 【冒烟豁免 2026-09-18】smoke 的 [18] 断言确定性时序，
+                    // 首显滑动（100ms 位移）会打乱其可见性采样（实测
+                    // 100% 档 vis=false）——冒烟进程内禁用（视觉时序特
+                    // 性本就无法在冒烟里断言，实机由 trace 首显臂门覆盖）。
+                    if first_show_slide
+                        && std::env::var("HUFU_TSF_SMOKE").as_deref() != Ok("1")
+                    {
+                        if let Some(unit) = first_show_unit {
+                            // 【四修·时序无关】起点从目标反推：编码左端=
+                            // 光标右 − 编码宽；首显帧 raw 可能晚一拍
+                            //（探针实测 raw='' cands=2），至少按一键宽走。
+                            let raw_len = raw.chars().count();
+                            let travel = ((raw_len.max(1)) as f32 * unit as f32).round()
+                                as i32;
+                            let fx = tx - travel;
+                            if crate::tsf::trace_on() {
+                                crate::tsf::trace(&format!(
+                                    "首显臂门: unit={unit} raw_len={raw_len} travel={travel} fx={fx} tx={tx} slide={first_show_slide}"
+                                ));
+                            }
+                            if (3..=150).contains(&travel) {
+                                let spd = self.anim_spd.get().max(0.05);
+                                // 【五修·首显提速 2026-09-18 用户拍板】固定
+                                // 100ms 比逐键滑慢半拍，观感「出现慢」——
+                                // 与逐键同一距离公式（统一节奏）。
+                                // 【七修·速度对齐虎娘】同逐键：7.5 系数恒速
+                                // ≈130px/s，上限 160ms。
+                                let dur = ((travel as f32 * 7.5 / spd) as u32)
+                                    .clamp(45, 160);
+                                self.pos_anim =
+                                    Some(((fx, ty), (tx, ty), std::time::Instant::now(), dur));
+                                // 起臂帧即记真实显示位：下一键 per-key 滑动
+                                // 从滑行起点接续，而不是从上一段残值起步。
+                                self.live_pos.set((fx, ty));
+                                unsafe {
+                                    let _ =
+                                        SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                                }
+                            }
+                        }
                     }
                 }
                 let (px, py) = match self.pos_anim {
@@ -4113,12 +4211,15 @@ static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// shadow_geo 共 ~370 行）删除：shadowwin_show 全项目零调用 →
 /// SHADOW_HWND 恒 None → 7 个调用点纯空锁空转（grep 验证）。链内
 /// 的 size_ease 是活函数（动效核心），保留。
+/// 【六修·虎娘对齐 2026-09-18】smoothstep（S 曲线慢-快-慢）→ 线性匀速
+/// ——虎娘实测恒速小步进（64Hz ~2px/tick），逐键重定目标时匀速续走
+/// 无「慢起-加速-减速」脉动=回弹感根除。全部动效（平移/形变/插值
+/// tick）共用本函数，一并转线性。
 pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
     if dur_ms == 0 || t_ms >= dur_ms {
         return to;
     }
     let x = t_ms as f32 / dur_ms as f32;
-    let p = x * x * (3.0 - 2.0 * x);
-    let l = |a: i32, b: i32| a + ((b - a) as f32 * p).round() as i32;
+    let l = |a: i32, b: i32| a + ((b - a) as f32 * x).round() as i32;
     (l(from.0, to.0), l(from.1, to.1))
 }

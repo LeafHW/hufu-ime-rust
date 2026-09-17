@@ -396,7 +396,8 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
             },
             "layout": { "font_point": 17.6, "corner_radius": 8.0,
                         "hilited_corner_radius": 6.0, "border_width": 1.0,
-                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0 },
+                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0,
+                        "size_morph": 1.0 },
             "material": { "kind": "solid" }
         }
     });

@@ -158,6 +158,16 @@ pub fn dispatch(
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        // 【虎娘对齐·首显滑动 2026-09-18 二修】显式 opt-in
+                        // 门控：非整句方案才允许组段首显滑动。不用
+                        // sentence_active()——无模型包里 sentence.is_none()
+                        // 恒 false，门控形同虚设（实测整句也滑了）；方案名
+                        // 判定与 engine 的 auto_enable 同源。DLL 侧缺键=
+                        // 不滑（旧缓存皮肤安全退化瞬显）。
+                        o.insert(
+                            "first_show_slide".into(),
+                            serde_json::json!(!host.engine.config.schema.current.contains("整句")),
+                        );
                     }
                     serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
@@ -168,6 +178,10 @@ pub fn dispatch(
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert(
+                            "first_show_slide".into(),
+                            serde_json::json!(!host.engine.config.schema.current.contains("整句")),
+                        );
                     }
                     serde_json::json!({
                         "skin": sv,

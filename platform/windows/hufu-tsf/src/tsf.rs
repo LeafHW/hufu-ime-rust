@@ -4347,6 +4347,56 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 2186 用空数据再 show 一次并把 last_show 覆盖成空——渐隐
         // tick 复渲染空内容=无东西可淡，「退出无动画」的根因。
         let content_empty = cands.is_empty() && raw.is_empty();
+        // 【虎娘对齐·首显滑动 2026-09-18】非整句组段首显：注入编码左端
+        // x（=首键前光标位：锚 left − raw 键数×每键宽），show() 据此臂
+        // 一次「编码左端→光标右」的位置滑动（虎娘单字模式实测观感，探
+        // 针数据见 E:\DSH-KF\虎娘\单字模式候选窗轨迹实测.md——窗口首现
+        // 于编码左端，~100ms 滑到编码右端；逐键跟随原本就有，此处只补
+        // 首显那一滑）。每键宽=est 校准值（无基线=不注入，该段稳退瞬
+        // 显）；整句由 skin.sentence_active 门控（server 注入，跟方案
+        // 走）；小窗线程（加词/加权弹窗候选）与设置页预览不滑。
+        let mut skin = skin;
+        if first_show_of_seg && !is_preview && !crate::addword::in_window_thread() {
+            // 【首显滑动 2026-09-18 三修】每键宽兜底链：est 校准值 →
+            // est 行高×0.41 → 锚矩形高×0.41（新进程首段 est 全零时，
+            // 细光标宿主的 caret 高=真实行高，直接可用——否则进程
+            // 起来后第一段永远不滑，用户实测「怎么没效果」同源）。
+            let anchor_h = caret
+                .as_ref()
+                .map(|r| (r.bottom - r.top) as f32)
+                .unwrap_or(0.0);
+            let unit = if g.caret_est_unit_w > 0.5 {
+                g.caret_est_unit_w
+            } else if g.caret_est_line_h > 0 {
+                g.caret_est_line_h as f32 * 0.41
+            } else if anchor_h > 4.0 {
+                anchor_h * 0.41
+            } else {
+                0.0
+            };
+            // 【首显滑动 2026-09-18 四修】不再注入 from_x——注入帧的
+            // raw/caret 新鲜度随宿主帧序漂移（实测探针宿主首显帧
+            // raw=''+键前 caret → from_x 落死区永不臂；别的宿主帧序
+            // 更不同）。改为只注入每键宽，起点由 show() 内从目标位
+            // 反推：fx = tx − 编码长×unit——时序无关，恒有意义。
+            if trace_on() {
+                trace(&format!(
+                    "首显注入: fseg={} prev={} unit={unit:.1} raw='{}' cands={}",
+                    first_show_of_seg,
+                    is_preview,
+                    raw,
+                    cands.len()
+                ));
+            }
+            if unit > 0.5 {
+                if let Some(ro) = skin.as_object_mut() {
+                    ro.insert(
+                        "first_show_unit".into(),
+                        serde_json::json!(unit),
+                    );
+                }
+            }
+        }
         if !content_empty {
             if crate::addword::in_window_thread() {
                 tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
