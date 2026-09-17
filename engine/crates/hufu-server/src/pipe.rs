@@ -520,7 +520,6 @@ mod imp {
             sd: *mut *mut core::ffi::c_void,
             returned: *mut u32,
         ) -> i32;
-        fn LocalFree(h: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
         fn ConnectNamedPipe(pipe: isize, overlapped: *mut core::ffi::c_void) -> i32;
         fn DisconnectNamedPipe(pipe: isize) -> i32;
         fn ReadFile(
@@ -705,6 +704,7 @@ mod imp {
         //（开始菜单搜索 SearchHost 等 SystemApps）→ 搜索框里虎符取词
         // 失败、字母直通（2026-08-29 实测病灶之一）。
         #[repr(C)]
+        #[allow(non_snake_case)] // Win32 原名（FFI 手写声明）
         struct SecurityAttributes {
             nLength: u32,
             lp_security_descriptor: *mut core::ffi::c_void,

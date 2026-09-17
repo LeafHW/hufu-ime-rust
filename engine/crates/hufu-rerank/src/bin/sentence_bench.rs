@@ -132,7 +132,6 @@ struct Stats {
     /// 按句长分桶：(全对句数, 句数)
     buckets: Vec<(usize, usize)>,
     key_total: usize,
-    ms_total: f64,
 }
 
 impl Stats {

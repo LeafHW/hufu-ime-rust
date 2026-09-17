@@ -425,7 +425,7 @@ impl Skin {
             let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
             u64::from_str_radix(s, 16).ok()
         };
-        let mut set = |field: &str, slot: &mut Color| {
+        let set = |field: &str, slot: &mut Color| {
             if let Some(v) = field_u64(field) {
                 let raw = v as u32;
                 let a = if (raw >> 24) == 0 && raw <= 0xFFFFFF { 0xFF } else { (raw >> 24) as u8 };

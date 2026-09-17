@@ -498,7 +498,6 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut sent_events: Vec<usize> = Vec::new(); // 每句上屏事件数（提前+收尾，越少越一气呵成）
     let mut total_rerank_fired = 0usize; // 【rerank B 组】句中停顿重排实际触发次数
     let mut total_rerank_changed = 0usize; // 【rerank B 组】qwen 首选≠引擎原序首选的次数
-    let mut total_ms: Vec<u128> = Vec::new();
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dumped = 0usize;
@@ -521,7 +520,6 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         total += 1;
         let mut sess = Session::new(true);
         let mut committed = String::new();
-        let t1 = Instant::now();
         if ngram == "-" || no_lock_scan {
             // 纯码表单字打法 / 无锁整句扫描：逐字打码，顶屏自动推字；
             // 未被顶出的字补一次空格强上（真实单字打法用户的行为）。
@@ -664,7 +662,6 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         }
         sent_events.push(sent_events_this);
         }
-        total_ms.push(t1.elapsed().as_millis());
         total_chars += s.chars().count() as u64;
         if committed == *s {
             exact += 1;
@@ -688,7 +685,6 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     sorted.sort_unstable();
     let n = sorted.len().max(1);
     let p = |q: usize| sorted[(n * q / 100).min(n - 1)];
-    let avg = total_ms.iter().sum::<u128>() as f64 / total_ms.len().max(1) as f64;
     println!(
         "句数 {total}  准率 {}/{} = {:.2}%  提前上屏 {} 次（平均 {:.2} 次/句）  键 {}  触达延迟 p50 {}µs p95 {}µs avg {}µs max {}µs",
         exact,

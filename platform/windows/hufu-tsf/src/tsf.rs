@@ -34,8 +34,8 @@ thread_local! {
 pub fn tl_shared() -> Option<SharedRef> {
     TL_SHARED.with(|s| s.borrow().clone())
 }
-/// 【当前 update_ui 的 Shared·二十六修】update_ui 入口登记（线程局部），
-/// tl_cand_show 经此取「本渲染写 last_show 的那把锁」登记进 TL_SHARED。
+// 【当前 update_ui 的 Shared·二十六修】update_ui 入口登记（线程局部），
+// tl_cand_show 经此取「本渲染写 last_show 的那把锁」登记进 TL_SHARED。
 thread_local! {
     static CUR_UPDATE_SHARED: std::cell::RefCell<Option<SharedRef>> =
         const { std::cell::RefCell::new(None) };
@@ -303,6 +303,9 @@ pub struct Shared {
     /// 【三十四修】跟打器 est 无基线的建基线探测帧标记（GetTextExt
     /// 双查循环里消费：true=只查一次即返回）。
     pub hupo_single_probe: bool,
+    /// 【二十五修·自适应单查】连续「双查同值」帧计数——≥3 转单查
+    ///（省一半宿主布局回调）；烂锚/失败清零回双查。
+    pub qc_probe_steady: u32,
     /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
     /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
     /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
@@ -474,43 +477,44 @@ impl Shared {
             stale_raw_until: None,
             modekey_last: None,
             preedit_last: String::new(),
-        focus_revoke_kept: false,
+            focus_revoke_kept: false,
             tm_sink_cookie: 0,
             cand_sig_last: String::new(),
             hupo_single_probe: false,
+            qc_probe_steady: 0,
             caret_recheck_due: false,
-    caret_est_x: 0,
-    caret_est_y: 0,
-    caret_est_wrap: 0,
-    caret_est_last_raw: 0,
-    caret_est_line_h: 0,
-    caret_est_unit_w: 0.0,
-    caret_est_cal_raw: 0,
-    caret_est_cal_x: 0,
-    seg_key_index: 0,
-    hupo_seg_start_x: 0,
-    hupo_seg_y: 0,
-    hupo_seg_h: 16,
-    hupo_seg_started: false,
-    hupo_key_w: 0.0,
-    hupo_last_seg_x: 0,
-    hupo_last_jump: 0,
-    hupo_reseg: false,
-    hupo_seg_raw0: 1,
-    hupo_reseg_armed: false,
-    hupo_line_span: 0,
-    hupo_prev_raw: 0,
-    hupo_long_mode: false,
-    hupo_line_dy: 0,
-    hupo_last_seg_y: 0,
-    digit_tail: String::new(),
-    last_digit_vk: 0,
-    last_digit_at: None,
-    delete_back_ok: false,
-    hupo_cursor_truth: None,
-    hupo_adopt_key: 0,
-    hupo_had_commit: false,
-    cur_raw_len: 0,
+            caret_est_x: 0,
+            caret_est_y: 0,
+            caret_est_wrap: 0,
+            caret_est_last_raw: 0,
+            caret_est_line_h: 0,
+            caret_est_unit_w: 0.0,
+            caret_est_cal_raw: 0,
+            caret_est_cal_x: 0,
+            seg_key_index: 0,
+            hupo_seg_start_x: 0,
+            hupo_seg_y: 0,
+            hupo_seg_h: 16,
+            hupo_seg_started: false,
+            hupo_key_w: 0.0,
+            hupo_last_seg_x: 0,
+            hupo_last_jump: 0,
+            hupo_reseg: false,
+            hupo_seg_raw0: 1,
+            hupo_reseg_armed: false,
+            hupo_line_span: 0,
+            hupo_prev_raw: 0,
+            hupo_long_mode: false,
+            hupo_line_dy: 0,
+            hupo_last_seg_y: 0,
+            digit_tail: String::new(),
+            last_digit_vk: 0,
+            last_digit_at: None,
+            delete_back_ok: false,
+            hupo_cursor_truth: None,
+            hupo_adopt_key: 0,
+            hupo_had_commit: false,
+            cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
             last_show: None,
@@ -573,7 +577,7 @@ pub fn focus_view_hwnd() -> Option<isize> {
     };
     let shared = g.0.clone();
     let ctx = {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.focus_context()
     }?;
     unsafe {
@@ -649,12 +653,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             km.AdviseKeyEventSink(tid, &sink, BOOL(1))?;
             // 文档焦点事件：失焦冲销会话+关候选窗（修「切窗后候选不关/回不来」）
             {
-                let tm_sink: ITfThreadMgrEventSink = unsafe { self.cast()? };
+                let tm_sink: ITfThreadMgrEventSink = self.cast()?;
                 if let Ok(src) = tm.cast::<ITfSource>() {
                     let unk: IUnknown = tm_sink.cast()?;
-                    if let Ok(cookie) =
-                        unsafe { src.AdviseSink(&ITfThreadMgrEventSink::IID, Some(&unk)) }
-                    {
+                    if let Ok(cookie) = src.AdviseSink(&ITfThreadMgrEventSink::IID, Some(&unk)) {
                         self.shared
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -665,10 +667,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             // 输入法默认「开+中文」：部分应用读 OPENCLOSE 档位决定是否走 IME，
             // 不设会表现为「先按一下 Shift 才能打中文」
             if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
-                if let Ok(comp) = unsafe { cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) }
-                {
+                if let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
                     let v = VARIANT::from(1i32);
-                    let _ = unsafe { comp.SetValue(tid, &v) };
+                    let _ = comp.SetValue(tid, &v);
                 }
             }
         }
@@ -1182,6 +1183,13 @@ fn handle_set_focus(
 /// 键路径上每秒几百次磁盘 I/O（trace 本身成了卡顿放大器）。现：
 /// 开关/exe 名 OnceLock 缓存；句柄进程级常驻（append 打开一次）；
 /// 超 8MB 自动轮转（.old 覆盖）。
+/// 【二十五修】trace 开关快速查询：观测调用点在 format! 之前先查
+/// ——生产（trace 关）时每帧白付 format! 分配（动画期 5ms/帧）。
+pub fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() == Ok("1"))
+}
+
 pub fn trace(msg: &str) {
     use std::io::Write;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1481,10 +1489,7 @@ impl HuFuTs_Impl {
                             let ch = n.chars().next().unwrap_or('0');
                             let vk_ch = ch as u32;
                             let now = std::time::Instant::now();
-                            let mut g = self
-                                .shared
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
+                            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                             let dup = g.last_digit_vk == vk_ch
                                 && g.last_digit_at
                                     .map(|t| t.elapsed().as_millis() < 20)
@@ -1494,11 +1499,7 @@ impl HuFuTs_Impl {
                                 let cnt = g.digit_tail.chars().count();
                                 if cnt > 8 {
                                     let skip = cnt - 8;
-                                    g.digit_tail = g
-                                        .digit_tail
-                                        .chars()
-                                        .skip(skip)
-                                        .collect();
+                                    g.digit_tail = g.digit_tail.chars().skip(skip).collect();
                                 }
                                 g.last_digit_vk = vk_ch;
                                 g.last_digit_at = Some(now);
@@ -1593,9 +1594,14 @@ impl HuFuTs_Impl {
         if g_first_key_probe() {
             diag_note(&format!("lat: KEY前 name={name} test={test_only}"));
         }
-        let Some((consumed, commit, back, state, sound, sound_vol)) =
-            ipc::key_request(&name, m_shift, m_ctrl, m_alt, line_end, digit_tail.as_deref())
-        else {
+        let Some((consumed, commit, back, state, sound, sound_vol)) = ipc::key_request(
+            &name,
+            m_shift,
+            m_ctrl,
+            m_alt,
+            line_end,
+            digit_tail.as_deref(),
+        ) else {
             return BOOL(0);
         };
         if g_first_key_probe() {
@@ -1723,55 +1729,58 @@ impl HuFuTs_Impl {
     }
 
     /// 【七十六修·键盘层回删+注入】宿主 TSF ShiftStart 静默不动（WinForms/
-/// WPS 实测）时的回删替换通道：SendInput 退格×n + VK_PACKET 逐字符注入
-/// 文本。键盘队列保序（退格先删、文本后插），任何宿主通用。注入的退格
-/// 空态被 TestDown 放行（宿主自删）；VK_PACKET 直产字符不进 IME。
-fn inject_back_and_text(back: u8, text: &str) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK,
-    };
-    let kb = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: scan,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
+    /// WPS 实测）时的回删替换通道：SendInput 退格×n + VK_PACKET 逐字符注入
+    /// 文本。键盘队列保序（退格先删、文本后插），任何宿主通用。注入的退格
+    /// 空态被 TestDown 放行（宿主自删）；VK_PACKET 直产字符不进 IME。
+    fn inject_back_and_text(back: u8, text: &str) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+            KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK,
+        };
+        let kb = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
             },
-        },
-    };
-    let mut backs: Vec<INPUT> = Vec::new();
-    for _ in 0..back {
-        backs.push(kb(VK_BACK, 0, KEYBD_EVENT_FLAGS(0)));
-        backs.push(kb(VK_BACK, 0, KEYEVENTF_KEYUP));
-    }
-    if !backs.is_empty() {
-        unsafe {
-            let n = SendInput(&backs, std::mem::size_of::<INPUT>() as i32);
-            trace(&format!("77dbg: 注入退格 {} 键", n));
+        };
+        let mut backs: Vec<INPUT> = Vec::new();
+        for _ in 0..back {
+            backs.push(kb(VK_BACK, 0, KEYBD_EVENT_FLAGS(0)));
+            backs.push(kb(VK_BACK, 0, KEYEVENTF_KEYUP));
         }
-        // 【拆段时序】VSCode（Chromium 异步输入管线）单批 [退格+文本]
-        // 的文本先落、退格后删=删错字符（实测 1.。）——退格先发，隔
-        // 40ms 让宿主处理完删除再收文本插入。
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
-    let mut texts: Vec<INPUT> = Vec::new();
-    for ch in text.encode_utf16() {
-        texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE));
-        texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_KEYUP | KEYEVENTF_UNICODE));
-    }
-    if !texts.is_empty() {
-        unsafe {
-            let n = SendInput(&texts, std::mem::size_of::<INPUT>() as i32);
-            trace(&format!("77dbg: 注入文本 {} 键（back={} text={:?}）", n, back, text));
+        if !backs.is_empty() {
+            unsafe {
+                let n = SendInput(&backs, std::mem::size_of::<INPUT>() as i32);
+                trace(&format!("77dbg: 注入退格 {} 键", n));
+            }
+            // 【拆段时序】VSCode（Chromium 异步输入管线）单批 [退格+文本]
+            // 的文本先落、退格后删=删错字符（实测 1.。）——退格先发，隔
+            // 40ms 让宿主处理完删除再收文本插入。
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let mut texts: Vec<INPUT> = Vec::new();
+        for ch in text.encode_utf16() {
+            texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE));
+            texts.push(kb(VIRTUAL_KEY(0), ch, KEYEVENTF_KEYUP | KEYEVENTF_UNICODE));
+        }
+        if !texts.is_empty() {
+            unsafe {
+                let n = SendInput(&texts, std::mem::size_of::<INPUT>() as i32);
+                trace(&format!(
+                    "77dbg: 注入文本 {} 键（back={} text={:?}）",
+                    n, back, text
+                ));
+            }
         }
     }
-}
 
-/// Ctrl+Shift+V 剪贴板上屏：管道取文本（server 校验配置/白名单），
+    /// Ctrl+Shift+V 剪贴板上屏：管道取文本（server 校验配置/白名单），
     /// 有文本则插入光标处并吞键。
     fn paste_clipboard(&self, test_only: bool) -> BOOL {
         let exe = std::env::current_exe()
@@ -1802,11 +1811,7 @@ pub fn test_key(vk: u32) -> i32 {
     match r {
         Some((consumed, _commit, _back, _state, _sound, _vol)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
-            if consumed {
-                1
-            } else {
-                0
-            }
+            if consumed { 1 } else { 0 }
         }
         None => {
             eprintln!("hufu-tsf: test_key '{name}' → 管道失败");
@@ -1893,7 +1898,6 @@ enum Op {
     /// 不建组段不动文本，只跑 query_caret（无组段分支走 selection
     /// 插入点）——提示窗锚=实时光标而非 sticky 旧位。
     QueryAnchor,
-    End,
 }
 
 #[implement(ITfEditSession)]
@@ -2086,7 +2090,7 @@ impl EditSession_Impl {
                 } else if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
                     if let Some(mut r) = gui_caret_fallback() {
                         hupo_clamp(&mut r);
-                                        g.caret = Some(r);
+                        g.caret = Some(r);
                     } else if exe_is_hupo() {
                         // 【三十四修·跟打器段内零查询】自绘 caret 宿主
                         // fallback 结构性 None——旧版跌进 query_caret：
@@ -2141,7 +2145,7 @@ impl EditSession_Impl {
                 // 里的 /jc 之类不落文档）。
                 if text == "{加词}" || text == "{加权}" || text == "{隐藏候选}" {
                     if let Some(comp) = g.composition.clone() {
-                        if let Ok(range) = (unsafe { comp.GetRange() }) {
+                        if let Ok(range) = unsafe { comp.GetRange() } {
                             let empty: Vec<u16> = Vec::new();
                             let _ = unsafe { range.SetText(ec, 0, &empty) };
                             let _ = unsafe { comp.EndComposition(ec) };
@@ -2484,13 +2488,6 @@ impl EditSession_Impl {
                 g.delete_back_ok = ok;
                 Ok(())
             }
-            Op::End => {
-                if let Some(comp) = g.composition.clone() {
-                    end_comp_clear(ec, &comp);
-                }
-                g.composition = None;
-                Ok(())
-            }
         }
     }
 }
@@ -2765,10 +2762,9 @@ fn est_step(g: &mut Shared) {
 fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
     let range = selection_range(ctx, ec).ok()?;
     let view = (unsafe { ctx.GetActiveView() }).ok()?;
-    let mut rect = RECT::default();
     let mut clipped = BOOL(0);
     for _ in 0..2 {
-        rect = RECT::default();
+        let mut rect = RECT::default();
         if unsafe { view.GetTextExt(ec, &range, &mut rect, &mut clipped) }.is_ok() {
             let degenerate = rect.bottom <= rect.top
                 || rect.right < rect.left
@@ -2804,87 +2800,87 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         if !g.hupo_had_commit {
             // 新句首键（start_preedit_on 已复位 hc）：强制重立段
             g.hupo_seg_started = false;
-        // 段首键：selection 立段。
-        // 【五十二修·矮框不立段】版本行为档案实锤：顶屏自动上屏后的
-        // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
-        // 高 124px）——立段 seg_h=16 → 锚 bottom 上抬 → 候选窗逐段
-        // 上移（用户「打第二个编码就往上面移」的病根）。整行框任何
-        // 输入场景都远大于 60px、矮框远小于它，以此分类：矮帧不立段
-        // （arm 60ms 重查，布局收敛帧拿到整行框再立，位置语义不变）。
-        if let Some(mut r) = selection_caret_rect(ctx, ec) {
-            let h = r.bottom - r.top;
-            if h >= 60 {
-                if !g.hupo_seg_started {
-                    // 【五十五修·键宽自校准】段间跳变量=上屏字符真实渲染
-                    // 宽（同行跳 40..320px 才校准——换行回退/大跳不算）。
-                    // 中文等宽排版字母≈半字宽 → 键宽=跳量×0.5。纯真值
-                    // 派生，字体变化自动适应（零像素魔法数）。
-                    if g.hupo_last_seg_x > 0 {
-                        let dx = r.left - g.hupo_last_seg_x;
-                        if (40..320).contains(&dx) {
-                            g.hupo_key_w = (dx as f32) * 0.5;
-                            g.hupo_last_jump = dx;
+            // 段首键：selection 立段。
+            // 【五十二修·矮框不立段】版本行为档案实锤：顶屏自动上屏后的
+            // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
+            // 高 124px）——立段 seg_h=16 → 锚 bottom 上抬 → 候选窗逐段
+            // 上移（用户「打第二个编码就往上面移」的病根）。整行框任何
+            // 输入场景都远大于 60px、矮框远小于它，以此分类：矮帧不立段
+            // （arm 60ms 重查，布局收敛帧拿到整行框再立，位置语义不变）。
+            if let Some(mut r) = selection_caret_rect(ctx, ec) {
+                let h = r.bottom - r.top;
+                if h >= 60 {
+                    if !g.hupo_seg_started {
+                        // 【五十五修·键宽自校准】段间跳变量=上屏字符真实渲染
+                        // 宽（同行跳 40..320px 才校准——换行回退/大跳不算）。
+                        // 中文等宽排版字母≈半字宽 → 键宽=跳量×0.5。纯真值
+                        // 派生，字体变化自动适应（零像素魔法数）。
+                        if g.hupo_last_seg_x > 0 {
+                            let dx = r.left - g.hupo_last_seg_x;
+                            if (40..320).contains(&dx) {
+                                g.hupo_key_w = (dx as f32) * 0.5;
+                                g.hupo_last_jump = dx;
+                            }
+                            // 【五十八修补·立段记行宽】换行回退量=一行总宽
+                            //（溢出推断的 cap 真值；reseg 之外立段也记——
+                            // 长模式禁 reseg 后 span 的唯一来源）。
+                            if dx < -200 {
+                                g.hupo_line_span = -dx;
+                            }
                         }
-                        // 【五十八修补·立段记行宽】换行回退量=一行总宽
-                        //（溢出推断的 cap 真值；reseg 之外立段也记——
-                        // 长模式禁 reseg 后 span 的唯一来源）。
-                        if dx < -200 {
-                            g.hupo_line_span = -dx;
+                        // 【五十八修补·立段记行距】dy 50..300=换行行距真值
+                        //（溢出推断的 y 步进，比行框高更准）。
+                        if g.hupo_last_seg_y > 0 {
+                            let dyl = r.top - g.hupo_last_seg_y;
+                            if dyl > 50 && dyl < 300 {
+                                g.hupo_line_dy = dyl;
+                            }
                         }
+                        g.hupo_last_seg_y = r.top;
+                        g.hupo_last_seg_x = r.left;
+                        g.hupo_seg_start_x = r.left;
+                        g.hupo_seg_y = r.top;
+                        g.hupo_seg_h = h.max(16);
+                        g.hupo_seg_started = true;
+                        // 【五十七修】行首 raw 基点（raw==1 时=1）
+                        g.hupo_seg_raw0 = g.cur_raw_len.max(1);
+                        g.hupo_reseg_armed = false;
+                        // 【五十八修】新句立段退出长流模式（重查/重立链恢复）
+                        g.hupo_long_mode = false;
+                        g.hupo_prev_raw = g.cur_raw_len;
+                        // 【六十五修补】键序采纳基点=当前键序
+                        g.hupo_adopt_key = g.seg_key_index;
                     }
-                    // 【五十八修补·立段记行距】dy 50..300=换行行距真值
-                    //（溢出推断的 y 步进，比行框高更准）。
-                    if g.hupo_last_seg_y > 0 {
-                        let dyl = r.top - g.hupo_last_seg_y;
-                        if dyl > 50 && dyl < 300 {
-                            g.hupo_line_dy = dyl;
-                        }
+                    hupo_clamp(&mut r);
+                    g.caret = Some(r);
+                    if r.left == g.hupo_seg_start_x && r.top == g.hupo_seg_y {
+                        arm_caret_recheck_timer();
                     }
-                    g.hupo_last_seg_y = r.top;
-                    g.hupo_last_seg_x = r.left;
-                    g.hupo_seg_start_x = r.left;
-                    g.hupo_seg_y = r.top;
-                    g.hupo_seg_h = h.max(16);
-                    g.hupo_seg_started = true;
-                    // 【五十七修】行首 raw 基点（raw==1 时=1）
-                    g.hupo_seg_raw0 = g.cur_raw_len.max(1);
-                    g.hupo_reseg_armed = false;
-                    // 【五十八修】新句立段退出长流模式（重查/重立链恢复）
-                    g.hupo_long_mode = false;
-                    g.hupo_prev_raw = g.cur_raw_len;
-                    // 【六十五修补】键序采纳基点=当前键序
-                    g.hupo_adopt_key = g.seg_key_index;
-                }
-                hupo_clamp(&mut r);
-                g.caret = Some(r);
-                if r.left == g.hupo_seg_start_x && r.top == g.hupo_seg_y {
-                    arm_caret_recheck_timer();
-                }
-            } else {
-                // 【五十三修·矮框速显】矮框（顶屏上屏后新段首布局未收
-                // 敛）的 x/top 是真值、只有高度矮。已立过段（已知行高）
-                // → 真值 x/y + 已知行高立即显示（不 arm 重查——位置已
-                // 正确，多一帧重查只会拖慢平移动效）；未立过段（首段）
-                // → arm 60ms 重查等整行框。两 case 都不走 query_caret
-                //（START 折叠查询返回的行框 y 比 selection 立段高 ~54px
-                // =「抽风上移一下又回来/刚开打偏上」的病根，五十三修禁）。
-                if g.hupo_seg_started && g.hupo_seg_h >= 60 {
-                    let mut rr = RECT {
-                        left: r.left,
-                        top: r.top,
-                        right: r.left + 14,
-                        bottom: r.top + g.hupo_seg_h,
-                    };
-                    hupo_clamp(&mut rr);
-                    g.caret = Some(rr);
                 } else {
-                    arm_caret_recheck_timer();
+                    // 【五十三修·矮框速显】矮框（顶屏上屏后新段首布局未收
+                    // 敛）的 x/top 是真值、只有高度矮。已立过段（已知行高）
+                    // → 真值 x/y + 已知行高立即显示（不 arm 重查——位置已
+                    // 正确，多一帧重查只会拖慢平移动效）；未立过段（首段）
+                    // → arm 60ms 重查等整行框。两 case 都不走 query_caret
+                    //（START 折叠查询返回的行框 y 比 selection 立段高 ~54px
+                    // =「抽风上移一下又回来/刚开打偏上」的病根，五十三修禁）。
+                    if g.hupo_seg_started && g.hupo_seg_h >= 60 {
+                        let mut rr = RECT {
+                            left: r.left,
+                            top: r.top,
+                            right: r.left + 14,
+                            bottom: r.top + g.hupo_seg_h,
+                        };
+                        hupo_clamp(&mut rr);
+                        g.caret = Some(rr);
+                    } else {
+                        arm_caret_recheck_timer();
+                    }
                 }
             }
-        }
-        // 虎魄 qie 一律不走 query_caret（START 值 991 与 selection 立段
-        // 1045 差一行的框，采纳即偏上）。无锚期由 suppress→35ms 补显
-        // →本函数重查 selection 接管。
+            // 虎魄 qie 一律不走 query_caret（START 值 991 与 selection 立段
+            // 1045 差一行的框，采纳即偏上）。无锚期由 suppress→35ms 补显
+            // →本函数重查 selection 接管。
             return;
         }
     }
@@ -3035,9 +3031,16 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret = Some(rr);
     trace(&format!(
         "qie: 帧 raw={} segKey={} hc={} 段=({},{}) dk={} w={:.1} cap={} 锚=({},{})",
-        g.cur_raw_len, g.seg_key_index, g.hupo_had_commit,
-        g.hupo_seg_start_x, g.hupo_seg_y, dkeys, g.hupo_key_w, cap,
-        rr.left, rr.top
+        g.cur_raw_len,
+        g.seg_key_index,
+        g.hupo_had_commit,
+        g.hupo_seg_start_x,
+        g.hupo_seg_y,
+        dkeys,
+        g.hupo_key_w,
+        cap,
+        rr.left,
+        rr.top
     ));
 }
 
@@ -3160,8 +3163,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 段首直查组段 START 恒成功——虎魄跳过 selection 优先。
     if g.seg_key_index == 1 && !exe_is_hupo_qie() {
         if let Some(r) = selection_caret_rect(ctx, ec) {
-            let est_ok = g.caret_est_line_h > 0
-                && !(g.caret_est_x == 0 && g.caret_est_y == 0);
+            let est_ok = g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0);
             if est_ok {
                 let dx = r.left - g.caret_est_x;
                 let dy = r.top - g.caret_est_y;
@@ -3182,9 +3184,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                 // 差>100/60 判非本文档值，弃 selection 落标准链（GetTextExt
                 // 段末建基线——此后 est_ok=true 走正常过滤，自愈）。
                 let near = match prev_caret {
-                    Some(p) => {
-                        (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60
-                    }
+                    Some(p) => (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60,
                     None => true,
                 };
                 if near {
@@ -3216,7 +3216,6 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         trace("qc: GetActiveView 失败");
         return;
     };
-    let mut rect = RECT::default();
     let mut clipped = BOOL(0);
     // 双查取末次：部分应用（如跟打器）文本布局异步——按键后第一次
     // 查询常返回旧布局（前一位置），第二次才反映新光标。锚点在旧/新
@@ -3225,14 +3224,21 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【三十四修·单查】跟打器 est 无基线的建基线探测帧只查一次
     // （布局锁下每次 30-60ms，双查无谓翻倍；基线允许粗糙——est 步进
     // 与 hupo_clamp 会消化）。
+    // 【二十五修·自适应单查】双查的第二查为懒布局宿主强制收敛；布局
+    // 已稳的宿主两查恒同值=白付一次宿主布局回调（WPS Qt 布局锁下
+    // 10-30ms/次，逐键 ×2 是全键延迟大头）。连续 3 帧双查同值 →
+    // 转单查；单查被判烂锚/失败 → 清计数回双查。
     let probes: u32 = if std::mem::take(&mut g.hupo_single_probe) {
+        1
+    } else if g.qc_probe_steady >= 3 {
         1
     } else {
         2
     };
+    let mut prev_ok: Option<RECT> = None;
     let mut last_ok: Option<RECT> = None;
     for _ in 0..probes {
-        rect = RECT::default();
+        let mut rect = RECT::default();
         if unsafe { view.GetTextExt(ec, &caret, &mut rect, &mut clipped) }.is_ok() {
             // 【撤销 64px 高度过滤 2026-09-08】跟打器大字号行高 ~135px、
             // 竖线 caret 宽 2px——此前误判为「整行框」全量丢弃，导致
@@ -3251,11 +3257,23 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             // 锚不会 >300 宽，零误伤。
             let too_wide = rect.right - rect.left > 300;
             if !degenerate && !too_wide {
+                prev_ok = last_ok;
                 last_ok = Some(rect);
             }
         }
     }
+    // 自适应计数：双查两值同 → 稳态计数 +1（3 帧后转单查省一半
+    // 宿主布局回调）；不同/缺值 → 归零（懒布局仍在抖，保双查）。
+    if probes == 2 {
+        g.qc_probe_steady = match (prev_ok, last_ok) {
+            (Some(a), Some(b)) if a.left == b.left && a.top == b.top => {
+                g.qc_probe_steady.saturating_add(1)
+            }
+            _ => 0,
+        };
+    }
     let Some(mut rect) = last_ok else {
+        g.qc_probe_steady = 0; // 单查失败可能是布局未收敛——回双查
         // 两次均失败/退化：先试系统插入符（打包宿主 GetTextExt 常态
         // 失败——但段内 SetSelection 已把插入符推到段尾/上屏后 commit
         // 尾，系统插入符恰是要的锚点）。
@@ -3345,9 +3363,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 发行版效果好」——发行版靠 est 折行周期性侥幸自救）。跟打器
     // GetTextExt 步进全程可靠（trace 全段证明），虎魄 dx 下限放宽到
     // -3000：真实优先，死锁解。
-    if g.seg_key_index >= 2
-        && g.caret_est_line_h > 0
-        && !(g.caret_est_x == 0 && g.caret_est_y == 0)
+    if g.seg_key_index >= 2 && g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0)
     {
         // 【est 未初始化跳过 2026-09-12 七修】切格后 est 已归零（无基
         // 线哨兵 x=y=0）——此时无锚可拦：真实帧直接采纳（否则拿 (0,0)
@@ -3364,10 +3380,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 放行重校。跟打器维持 -3000（文档坐标特性）。
         let lo = if exe_is_hupo() { -3000 } else { -1500 };
         if dx > 800 || dx < lo || dy < -300 {
-            trace(&format!(
-                "qc: 极端锚拦截 dx={} dy={}（est 步进）",
-                dx, dy
-            ));
+            g.qc_probe_steady = 0; // 烂锚：单查拿到旧布局值，回双查
+            trace(&format!("qc: 极端锚拦截 dx={} dy={}（est 步进）", dx, dy));
             est_step(g);
             return;
         }
@@ -3536,8 +3550,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 【选重闪帧 2026-10-09】raw 空 + 候选非空 = 引擎选重上屏
                 // 带回的闪帧（旧候选+高亮=选中项——引擎 on_rank_key/
                 // select_candidate 选重路径专属，普通上屏候选已清）：
-                // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），收场
-                // 交给轮询 hide_stale→停留(1s)→收拢链；否则照旧收窗。
+                // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），
+                // 收场交给 hide_later(320) 短停留定时器；否则照旧收窗。
                 let flash: Vec<(String, String)> = state
                     .get("candidates")
                     .and_then(|v| v.as_array())
@@ -3565,10 +3579,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     let caret_f = g.caret;
                     if let Some(c) = g.cand2.as_mut() {
                         c.show(&flash, "", &skin_f, caret_f.as_ref(), sel_flash);
-                        // 闪帧后立即起臂停留钟（hide 只起臂不重画——窗面
-                        // 保持闪帧：滑动动效在 1s 停留内播完，到点收拢；
-                        // 连打下一键（raw 非空）照常打断停留/收拢）。
-                        c.hide();
+                        // 【二十五修·闪帧复活】二十四修起 hide()=立即收，
+                        // 闪帧 ~10ms 被收走等于失效。改专用短停留：240ms
+                        // 高亮滑动播完 + 收尾余量后异步真隐藏；新 show
+                        // 到来自动取消（candwin2 show 头 KillTimer）。
+                        c.hide_later(320);
                     }
                     // tick 复渲染读 shared.last_show——同步为闪帧（否则
                     // 动效 tick 拿旧组段帧把高亮拽回原位）。
@@ -3956,7 +3971,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                         return None;
                     }
                     let mut r = RECT::default();
-                    unsafe { GetWindowRect(windows::Win32::Foundation::HWND(o as *mut _), &mut r) };
+                    let _ = unsafe {
+                        GetWindowRect(windows::Win32::Foundation::HWND(o as *mut _), &mut r)
+                    };
                     if r.right > r.left && r.bottom > r.top {
                         Some(r)
                     } else {
@@ -4124,10 +4141,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 框外旧值过滤：编辑态的查询值必然落在编辑框附近——框外远值
         //（>30px）是上一格滞留 → 钉到编辑框左（首键输入位）。
         let caret = match (&caret, &ed6) {
-            (
-                Some(c),
-                Some(e),
-            )
+            (Some(c), Some(e))
                 if c.left < e.left - 30
                     || c.left > e.right + 30
                     || c.top < e.top - 30
@@ -4224,10 +4238,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // sticky 一致（±24px，单打快打光标未动）才即时显示；锚跳开
         // （用户点了新位置）恢复 35ms 收敛等待——布局稳后显示新锚。
         let any_has_prev = g.cand2.as_ref().is_some_and(|c| c.has_sticky());
-        let sticky_near = g
-            .cand2
-            .as_ref()
-            .is_some_and(|c| c.sticky_near(caret.map(|rc| rc.left).unwrap_or(i32::MIN), caret.map(|rc| rc.bottom + 4).unwrap_or(i32::MIN)));
+        let sticky_near = g.cand2.as_ref().is_some_and(|c| {
+            c.sticky_near(
+                caret.map(|rc| rc.left).unwrap_or(i32::MIN),
+                caret.map(|rc| rc.bottom + 4).unwrap_or(i32::MIN),
+            )
+        });
         // 【三十三次修正·首键陈旧锚 2026-09-12】纯键盘录入实锤（verify45/46）：
         // 打字前光标真实位 (1516,381)（像素扫描竖线），首键窗却显示在
         // (1114,242)——WPS 文档刚打开后 ~200ms 内 GetTextExt 持续返回
@@ -4260,19 +4276,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let (wps_stable, wps_deadline) = if first_seg_ever || cell_seg {
             let wait_ms = if cell_seg { 200 } else { 100 };
             (
-                g.wps_settle_start.is_some_and(|t| {
-                    t.elapsed() > std::time::Duration::from_millis(wait_ms)
-                }) && g.caret.is_some(),
-                g.wps_settle_start.is_some_and(|t| {
-                    t.elapsed() > std::time::Duration::from_millis(500)
-                }) && g.caret.is_some(),
+                g.wps_settle_start
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(wait_ms))
+                    && g.caret.is_some(),
+                g.wps_settle_start
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500))
+                    && g.caret.is_some(),
             )
         } else {
             (
                 g.wps_caret_prev.is_some(),
-                g.wps_settle_start.is_some_and(|t| {
-                    t.elapsed() > std::time::Duration::from_millis(120)
-                }) && g.caret.is_some(),
+                g.wps_settle_start
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(120))
+                    && g.caret.is_some(),
             )
         };
         // 【反查首帧修复 2026-09-11】无组段帧（反查/命令模式刚进入：仅
@@ -4312,7 +4328,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 g.wps_settle_start = Some(std::time::Instant::now());
             }
             g.suppress_pending = true;
-                arm_first_frame_timer();
+            arm_first_frame_timer();
             return Ok(());
         }
         // 【退场淡出修复 2026-09-11】空帧到此不再下落 show：此前直落
@@ -4374,7 +4390,14 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
                 .ok_or_else(|| Error::from(HRESULT(-2147467259)))?,
         };
         // 【线程局部 2026-09-12】tid 优先本线程（小窗线程会话用本线程 id）。
-        (target, { let t = thread_tid(); if t != 0 { t } else { g.client_id } }, g.focus_epoch)
+        (
+            target,
+            {
+                let t = thread_tid();
+                if t != 0 { t } else { g.client_id }
+            },
+            g.focus_epoch,
+        )
     };
     // 结果槽：同步档回调内联执行，受理返回时槽已填——把真实执行
     // 结果上抛（旧实现受理=成功的假阳性，见 struct 注记）；异步档
@@ -4439,7 +4462,13 @@ fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【线程局部 2026-09-12】tid 优先本线程（小窗线程的编辑会话
         // 必须用本线程 client id——进程级的属于主线程）。
-        ({ let t = thread_tid(); if t != 0 { t } else { g.client_id } }, g.focus_epoch)
+        (
+            {
+                let t = thread_tid();
+                if t != 0 { t } else { g.client_id }
+            },
+            g.focus_epoch,
+        )
     };
     let session: ITfEditSession = EditSession {
         shared: shared.clone(),
@@ -4506,9 +4535,7 @@ fn focus_is_uwp_shell() -> bool {
     }
     unsafe {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetAncestor, GetClassNameW, GA_ROOT,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetClassNameW};
         let f = GetFocus();
         if f.is_invalid() {
             return false;
@@ -4689,10 +4716,9 @@ fn ui_element_hide(shared: &SharedRef) {
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, EnumChildWindows, GetClassNameW, GetForegroundWindow,
-    GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, KillTimer,
-    RegisterClassW, SetTimer, GUITHREADINFO, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, EnumChildWindows, GUITHREADINFO, GetClassNameW,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE,
+    IsWindowVisible, KillTimer, RegisterClassW, SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 
 /// 【反查首帧锚点 2026-09-11】无组段帧（反查/命令模式刚进入：仅 aux
@@ -4715,12 +4741,7 @@ fn gui_caret_fallback() -> Option<RECT> {
             };
             #[link(name = "user32")]
             unsafe extern "system" {
-                fn SystemParametersInfoW(
-                    a: u32,
-                    b: u32,
-                    p: *mut core::ffi::c_void,
-                    f: u32,
-                ) -> i32;
+                fn SystemParametersInfoW(a: u32, b: u32, p: *mut core::ffi::c_void, f: u32) -> i32;
             }
             SystemParametersInfoW(0x30, 0, &mut wa as *mut RECT as *mut core::ffi::c_void, 0);
             rc.left >= wa.left && rc.right <= wa.right && rc.top >= wa.top && rc.bottom <= wa.bottom
@@ -4734,7 +4755,7 @@ fn gui_caret_fallback() -> Option<RECT> {
         //   3) 屏幕坐标在工作区内
         let caret_valid = |gi: &GUITHREADINFO| -> Option<RECT> {
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetAncestor, GetClassNameW, IsWindowVisible, GA_ROOT,
+                GA_ROOT, GetAncestor, GetClassNameW, IsWindowVisible,
             };
             if gi.hwndCaret.0.is_null() || !IsWindowVisible(gi.hwndCaret).as_bool() {
                 return None;
@@ -4767,11 +4788,7 @@ fn gui_caret_fallback() -> Option<RECT> {
                 right: pt.x + w,
                 bottom: pt.y,
             };
-            if in_workarea(&rc) {
-                Some(rc)
-            } else {
-                None
-            }
+            if in_workarea(&rc) { Some(rc) } else { None }
         };
         // 第一级：前台窗口线程的 caret（经典路径，带合法性过滤）
         let tid = GetWindowThreadProcessId(fg, None);
@@ -4801,9 +4818,8 @@ fn gui_caret_fallback() -> Option<RECT> {
             static LAST: std::sync::Mutex<(Option<std::time::Instant>, u32, Option<RECT>)> =
                 std::sync::Mutex::new((None, 0, None));
             let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-            let cached_hit = last.0.is_some()
-                && last.1 == fg_pid
-                && last.0.unwrap().elapsed().as_millis() < 200;
+            let cached_hit =
+                last.0.is_some() && last.1 == fg_pid && last.0.unwrap().elapsed().as_millis() < 200;
             if cached_hit {
                 return last.2;
             }
@@ -5053,7 +5069,7 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     g.hupo_reseg = true;
                     // 到点强制重查：置 caret_force（SetPreedit 段内查询
                     // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
-                        }
+                }
                 if let Some(state) = crate::ipc::state_request() {
                     let raw_empty = state
                         .get("raw")
@@ -5128,8 +5144,8 @@ fn poll_arm(shared: &SharedRef) {
 /// exe 同目录。同族不当「他进程」（poll 残留兜底不收窗）。
 fn fg_exe_lower(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
@@ -5353,7 +5369,9 @@ fn poll_tick() {
             let g = s.lock().unwrap_or_else(|e| e.into_inner());
             let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
             let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
-            let mine = g.last_key_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+            let mine = g
+                .last_key_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
                 || g.composition.is_some();
             drop(g);
             if busy && !owes {
@@ -5421,7 +5439,8 @@ fn poll_tick() {
             .unwrap_or("")
             .is_empty();
         g.srv_raw_empty_since = if srv_raw_empty {
-            g.srv_raw_empty_since.or_else(|| Some(std::time::Instant::now()))
+            g.srv_raw_empty_since
+                .or_else(|| Some(std::time::Instant::now()))
         } else {
             None
         };
@@ -5432,7 +5451,7 @@ fn poll_tick() {
         .unwrap_or("")
         .is_empty();
     let sig = state_sig(&state);
-    let mut need_show = false;
+    let mut need_show;
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【皮肤版本失效 2026-09-08】server 保存过皮肤（版本号变化）
@@ -5482,12 +5501,7 @@ fn poll_tick() {
         //（raw 非空）而窗口在但不可见 → 强制走一遍 update_ui 重显
         //（update_ui 内的 suppress/delay/host 门全部照走，不破坏任何
         // 故意不显示的语义；焦点真不在本进程时 show 的 host 门自拦）。
-        if !need_show
-            && g
-                .cand2
-                .as_ref()
-                .is_some_and(|c| !c.is_visible())
-        {
+        if !need_show && g.cand2.as_ref().is_some_and(|c| !c.is_visible()) {
             need_show = true;
         }
         if sig == g.cand_sig_last && !need_show {
@@ -5622,7 +5636,6 @@ fn exe_is_hupo_qie() -> bool {
             .unwrap_or(false)
     })
 }
-
 
 fn scopeguard_release() -> PollGuard {
     PollGuard

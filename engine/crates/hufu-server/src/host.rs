@@ -5,7 +5,6 @@ use hufu_engine::{Engine, Session};
 use hufu_types::{KeyCode, KeyInput, Modifiers};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 /// 重排任务：key=committed_raw+raw（结果只对同 key 生效）
 struct RerankJob {
@@ -79,7 +78,7 @@ impl Host {
     pub fn new(data_dir: &Path) -> std::io::Result<Host> {
         // 【性能插桩】启动阶段毫秒戳（diag/startup-trace.txt；常开开销≈0）
         let t0 = std::time::Instant::now();
-        let mut mark = |label: &str, t: &std::time::Instant| {
+        let mark = |label: &str, t: &std::time::Instant| {
             let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -340,7 +339,7 @@ impl Host {
                 const IDLE_UNLOAD_MIN: u64 = 30;
                 let mut idle_secs: u64 = 0;
                 let mut loaded = native.is_some() || model.is_some();
-                let mut ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
+                let ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
                                           model: &mut Option<hufu_rerank::Reranker>| {
                     if native.is_none() && model.is_none() {
                         let mp = std::path::PathBuf::from(&model_path);
@@ -738,9 +737,6 @@ pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
         is_press: true,
     })
 }
-
-/// 供管道线程共享的宿主句柄。
-pub type SharedHost = Arc<Mutex<Host>>;
 
 /// 简单公历换算（Unix 天数 → 年月日，Howard Hinnant 算法）——
 /// 导出文件名时间戳用，避免引入 chrono 依赖。

@@ -4,23 +4,22 @@
 //! - 左键 → 管道 op "toggle_lang" 切换中英（与 Shift 单击同语义）
 //! - 右键 → 管道 op "settings" 打开设置页（与托盘双击同通道）
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use windows::core::{implement, Interface, Result, GUID, PCWSTR, VARIANT};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
-    ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
-    ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
-    ITfLangBarItemSink, ITfLangBarItem_Impl, ITfSource, ITfSource_Impl, ITfThreadMgr,
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-    GUID_LBI_INPUTMODE, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
-    TF_LANGBARITEMINFO,
+    GUID_LBI_INPUTMODE, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
+    ITfCompartmentMgr, ITfLangBarItem, ITfLangBarItem_Impl, ITfLangBarItemButton,
+    ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl,
+    ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW,
-    SetForegroundWindow, HICON, HWND_MESSAGE, ICONINFO, WNDCLASSEXW,
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, HICON, HWND_MESSAGE,
+    ICONINFO, RegisterClassExW, SetForegroundWindow, WNDCLASSEXW,
 };
+use windows::core::{GUID, Interface, PCWSTR, Result, VARIANT, implement};
 
 /// COM 指针跨线程搬运套（sink 由 msctf 线程 Advise、模式切换线程通知：
 /// 实际调用仍是 COM 默认自由线程封送语义，这里只解除 Rust 的静态限制）
@@ -47,12 +46,13 @@ const TF_LBI_STYLE_BTN_MENU: u32 = 0x8;
 
 // ── 进程全局模式态（tsf.rs 每帧同步；点击切换也走这里）──
 static CHINESE: AtomicBool = AtomicBool::new(true);
-/// 本线程的更新 sink（weasel 同款：项单 sink、AdviseSink 换人、
-/// 通知严格回到挂它的线程）。【2026-09-11 弃全局名单】全局 Vec 让
-/// 线程 A 的 defer 窗去调线程 B 挂的 sink = 跨套间裸调（msctf 代理
-/// 失败静默）——「图标冻结在旧状态」的根因：OnUpdate 打出去了但
-/// 没人重读。改为 thread_local 单槽，defer 窗也是每线程一个，
-/// 通知链全程同套间。
+// 本线程的更新 sink（weasel 同款：项单 sink、AdviseSink 换人、
+// 通知严格回到挂它的线程）。【2026-09-11 弃全局名单】全局 Vec 让
+// 线程 A 的 defer 窗去调线程 B 挂的 sink = 跨套间裸调（msctf 代理
+// 失败静默）——「图标冻结在旧状态」的根因：OnUpdate 打出去了但
+// 没人重读。改为 thread_local 单槽，defer 窗也是每线程一个，
+// 通知链全程同套间。
+//（`//` 而非 `///`：doc 注释挂在宏调用上不生效，rustc unused doc comment）
 thread_local! {
     static SINK: std::cell::RefCell<Option<SendSink>> =
         const { std::cell::RefCell::new(None) };
@@ -262,12 +262,6 @@ fn push_thread_compartment() {
         if let Ok(comp) = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
             let v = VARIANT::from(conv);
             let hr = comp.SetValue(tid, &v);
-            let mut back = String::new();
-            if let Ok(rv) = comp.GetValue() {
-                if let Some(i) = var_i32(&rv) {
-                    back = format!(" 读回={i}");
-                }
-            }
             if let Err(e) = &hr {
                 log_diag(&format!("comp CONV 写失败 0x{:08X}", e.code().0 as u32));
             }
@@ -442,7 +436,7 @@ impl ITfSource_Impl for HuFuLangBar_Impl {
 /// msctf 的 AddItem/RemoveItem 按对象引用操作（同一 GUID 认领）。
 pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     unsafe { ensure_defer_window() };
-    let item: ITfLangBarItem = unsafe { HuFuLangBar::new().into() };
+    let item: ITfLangBarItem = HuFuLangBar::new().into();
     let r = unsafe { mgr.AddItem(&item) };
     match &r {
         Ok(()) => log_diag(&format!("install ok pid={}", std::process::id())),
@@ -680,7 +674,7 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         };
         let _ = RegisterClassExW(&wc);
         let nm: Vec<u16> = "HuFu 菜单宿主\0".encode_utf16().collect();
-        if let Ok(h) = (|| unsafe {
+        if let Ok(h) = (|| {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(
                     windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0,
@@ -709,9 +703,8 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
             if let Some(vw) = crate::tsf::focus_view_hwnd() {
                 if vw != 0 {
                     let h = windows::Win32::Foundation::HWND(vw as *mut _);
-                    let tid = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                        h, None,
-                    );
+                    let tid =
+                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, None);
                     if tid == cur_tid {
                         owner = h;
                         log_diag(&format!("popup owner=上下文窗(兜底) {vw:#x}"));
@@ -722,9 +715,8 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         if owner.0.is_null() {
             let f = GetFocus();
             if !f.0.is_null() {
-                let tid = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                    f, None,
-                );
+                let tid =
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(f, None);
                 if tid == cur_tid {
                     owner = f;
                     log_diag("popup owner=GetFocus(兜底)");
@@ -895,7 +887,7 @@ fn make_glyph_icon(ch: &str) -> isize {
             0,
             PCWSTR(face.as_ptr()),
         );
-        let mut hdr = BITMAPINFO {
+        let hdr = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: S,

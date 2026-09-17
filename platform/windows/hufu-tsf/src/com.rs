@@ -2,14 +2,10 @@
 
 use windows::Win32::Foundation::{HMODULE, WIN32_ERROR};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IClassFactory, IClassFactory_Impl,
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    IClassFactory, IClassFactory_Impl,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::UI::TextServices::{
-    CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfiles,
-};
 use windows_core::*;
 
 /// 类厂（#[implement] 生成 IUnknown/IClassFactory vtable）。

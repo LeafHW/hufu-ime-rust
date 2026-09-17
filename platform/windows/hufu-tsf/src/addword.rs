@@ -6,14 +6,14 @@
 //!（EN_UPDATE=0x400）立即刷新；预览变多窗口自适应加高，确定/取消恒
 //! 在底部。窗口独立线程跑消息循环不阻塞 TSF。
 
-use windows::core::*;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL,
+    CLEARTYPE_QUALITY, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::*;
 
 const ID_WORD: i32 = 101;
 const ID_CODE: i32 = 102;
@@ -38,9 +38,9 @@ struct Skin {
     bg: u32,
     text: u32,
     label: u32,
-    hilite: u32,
-    hilite_label: u32,
-    hilite_bg: u32,
+    // 【死字段删除】hilite/hilite_label/hilite_bg 三字段只写不读——
+    // 预览着色已收敛为 NEW_RED（新词）/text（其余）/label（表头），
+    // 高亮底块不再参与弹窗渲染。
     font_face: Vec<u16>, // UTF-16 含 null
     font_pt: i32,
     label_pt: i32,
@@ -91,7 +91,7 @@ fn load_skin() {
     if g.is_some() {
         return;
     }
-    let mut sk = crate::ipc::call(&serde_json::json!({"op": "skin"}))
+    let sk = crate::ipc::call(&serde_json::json!({"op": "skin"}))
         .and_then(|v| v.get("skin").cloned())
         .unwrap_or(serde_json::Value::Null);
     let get_color = |k: &str| -> Option<u32> {
@@ -126,9 +126,6 @@ fn load_skin() {
         label: get_color("label_color")
             .or_else(|| get_color("comment_text_color"))
             .unwrap_or(0xB5_A6_8A),
-        hilite: get_color("hilited_candidate_text_color").unwrap_or(0xF0_C7_8C),
-        hilite_label: get_color("hilited_label_color").unwrap_or(0xF0_C7_8C),
-        hilite_bg: get_color("hilited_candidate_back_color").unwrap_or(0x66_4A_2C),
         font_face: utf16z(&face),
         // 字号比皮肤候选窗大两档（弹窗阅读距离远；用户两轮要求加大）
         font_pt: (font_pt + 6).max(17),
@@ -223,7 +220,9 @@ pub fn in_window_thread() -> bool {
     ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed) != 0
         && unsafe {
             #[link(name = "kernel32")]
-            unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+            unsafe extern "system" {
+                fn GetCurrentThreadId() -> u32;
+            }
             GetCurrentThreadId()
         } == ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -265,7 +264,9 @@ fn open_common() {
         // 登记小窗线程 id（五修：直通门判定用）——已确认本线程要建窗
         //（B1：窗口存活场景不会走到这里，tid 不会被覆盖悬挂）
         #[link(name = "kernel32")]
-        unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+        unsafe extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
         ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
         // 【词框 TSF 化 2026-09-12 三修】线程 TSF 化的完整链：STA COM
         // → 显式 CoCreateInstance(ThreadMgr)（msctf 判定线程 TSF-
@@ -281,13 +282,12 @@ fn open_common() {
             None,
             windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
         );
-        let _tm: windows::core::Result<
-            windows::Win32::UI::TextServices::ITfThreadMgr,
-        > = windows::Win32::System::Com::CoCreateInstance(
-            &windows::Win32::UI::TextServices::CLSID_TF_ThreadMgr,
-            None,
-            windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
-        );
+        let _tm: windows::core::Result<windows::Win32::UI::TextServices::ITfThreadMgr> =
+            windows::Win32::System::Com::CoCreateInstance(
+                &windows::Win32::UI::TextServices::CLSID_TF_ThreadMgr,
+                None,
+                windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+            );
         if let Ok(tm) = &_tm {
             // tid=0 占位（下方四修会用 ThreadMgr::Activate 的真 tid 覆盖）
             crate::tsf::set_thread_tm(tm.clone(), 0);
@@ -674,9 +674,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = SetFocus(first_edit);
                 // 【词框聚焦 2026-09-12】存静态：WM_ACTIVATE 激活时聚焦
                 //（WM_CREATE 时窗口未激活 SetFocus 无效）。
-                *FIRST_EDIT
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(first_edit.0 as isize);
+                *FIRST_EDIT.lock().unwrap_or_else(|p| p.into_inner()) = Some(first_edit.0 as isize);
             }
             LRESULT(0)
         }
@@ -703,10 +701,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return DefWindowProcW(hwnd, msg, wp, lp);
             };
             let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as _);
-            // 新词项：红色（字体已加粗带下划线）；其余按段取皮肤色
+            // 新词项：红色（字体已加粗带下划线）；其余按段取皮肤色。
+            //（ID_CUR_BASE=2000 < ID_AFT_BASE=2200 < ID_AFT_NEW=2600，
+            // 单条 `>= ID_CUR_BASE` 即覆盖两个普通段）
             let fg: u32 = if cid >= ID_AFT_NEW {
                 NEW_RED
-            } else if cid >= ID_AFT_BASE || cid >= ID_CUR_BASE {
+            } else if cid >= ID_CUR_BASE {
                 c.text
             } else {
                 c.label
@@ -839,7 +839,6 @@ unsafe fn draw_items(
     let mut x = PV_X + head_w;
     let mut y = y0;
     let right = PV_X + PV_W;
-    let mut cid = id_base;
     for (i, t) in texts.iter().enumerate() {
         let label = format!("{}.", i + 1);
         let lw = text_w(&label, lem) + 2;

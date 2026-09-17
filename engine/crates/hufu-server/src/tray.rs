@@ -322,7 +322,7 @@ extern "system" {
         hWndParent: isize,
         hMenu: isize,
         hInstance: isize,
-        lpParam: isize,
+        lpParam: *const core::ffi::c_void,
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn RegisterHotKey(hwnd: isize, id: i32, modifiers: u32, vk: u32) -> i32;
@@ -343,7 +343,6 @@ extern "system" {
     fn DestroyMenu(hmenu: isize) -> i32;
     fn PostQuitMessage(exitcode: i32);
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
-    fn SetTimer(hwnd: isize, idevent: usize, elapse: u32, timerproc: isize) -> usize;
     fn KillTimer(hwnd: isize, idevent: usize) -> i32;
     fn LoadImageW(hinst: isize, name: *const u16, typ: u32, cx: i32, cy: i32, load: u32) -> isize;
 }
@@ -360,6 +359,7 @@ struct POINT {
 }
 
 #[repr(C)]
+#[allow(non_snake_case)] // Win32 原名（FFI 手写声明）
 struct WNDCLASSW {
     style: u32,
     lpfnWndProc: extern "system" fn(isize, u32, usize, isize) -> isize,
@@ -374,6 +374,7 @@ struct WNDCLASSW {
 }
 
 #[repr(C)]
+#[allow(non_snake_case)] // Win32 原名（FFI 手写声明）
 struct NOTIFYICONDATAW {
     cbSize: u32,
     hWnd: isize,
@@ -392,8 +393,6 @@ struct NOTIFYICONDATAW {
     hBalloonIcon: isize,
 }
 
-const NIM_ADD: u32 = 0x0;
-const NIM_MODIFY: u32 = 0x1;
 const NIM_DELETE: u32 = 0x2;
 const NIF_MESSAGE: u32 = 0x1;
 const NIF_ICON: u32 = 0x2;
@@ -411,8 +410,6 @@ static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 static ASK_QUIT: AtomicBool = AtomicBool::new(false);
 /// 虎符输入法当前是否激活（任一进程的 DLL Activate 上报）
 static IME_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// 托盘图标当前是否已添加（显隐由输入法激活态驱动）
-static ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
 /// tray 隐藏窗口句柄（candwin 死窗重建请求用）
 pub fn tray_hwnd() -> isize {
@@ -712,7 +709,7 @@ pub fn spawn(
             0,
             0,
             hinst,
-            0,
+            std::ptr::null(),
         );
         if hwnd == 0 {
             eprintln!(

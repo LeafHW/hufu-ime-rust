@@ -371,8 +371,6 @@ extern "system" fn hufu_test_sound_burst() -> i32 {
     1
 }
 
-
-
 /// 测试钩子：尺寸动效（变宽变窄）×缩放比例 100%~500% 矩阵（HUFU_FAKE_DPI
 /// 伪造高 DPI）。每档：窄窗稳态 → 换宽内容（delta>24px）→ size_anim 起臂
 /// → tick 推进完成 → 渲染宽随比例放大。返回位掩码 bit_i=第 i 档通过，
@@ -382,7 +380,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
     use crate::candwin2::CandidateWindowV2;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, IsWindowVisible, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
 
     const SCALES: [f64; 9] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -489,7 +487,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
 
         // 起臂判定：变宽动画已武装
         let armed = {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let g = shared.lock().unwrap_or_else(|e| e.into_inner());
             g.cand2
                 .as_ref()
                 .map(|c| c.size_anim.is_some())
@@ -513,7 +511,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
                 g.last_key_at = Some(std::time::Instant::now());
             }
             let (anim_on, cw2) = {
-                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 (
                     g.cand2
                         .as_ref()
@@ -574,11 +572,11 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
     use crate::candwin2::CandidateWindowV2;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
-        ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetWindowRect, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
 
     let skin = serde_json::json!({
@@ -641,7 +639,7 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
         g.last_show = Some((narrow.clone(), "ni".to_string(), 0));
         g.skin = skin.clone();
         if let Some(c) = g.cand2.as_mut() {
-            c.last_hide_at = None;
+            c.last_hide_at.set(None);
             c.size_ms = 1; // 稳态阶段动效近零（show 会以皮肤 layout.size_ms 再覆盖）
             c.show(&narrow, "ni", &skin, Some(&anchor), 0);
         }
@@ -824,8 +822,8 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
 extern "system" fn hufu_test_skin_hot() -> i32 {
     use crate::candwin2::CandidateWindowV2;
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
-        ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -876,8 +874,8 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
     set_colors(&mut skin_a, "#101014FF", "#3050A0FF", "#FFFFFFFF"); // 深底·蓝高亮
     let mut skin_b = base.clone();
     set_colors(&mut skin_b, "#F5F0E6FF", "#C03030FF", "#101010FF"); // 浅底·红高亮
-                                                                    // 首候选行 y：阴影边距下有平移——胶囊检查用竖带扫描（见②）
-                                                                    // 行内水平扫描范围：避开序号列，覆盖胶囊主体
+    // 首候选行 y：阴影边距下有平移——胶囊检查用竖带扫描（见②）
+    // 行内水平扫描范围：避开序号列，覆盖胶囊主体
     let margin_probe = |w: usize| -> std::ops::Range<usize> {
         let s = (w * 15 / 100).max(20);
         let e = (w * 70 / 100).min(w.saturating_sub(4));
@@ -930,7 +928,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             }
             let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc_mem, hb);
             // DComp/NOREDIRECTIONBITMAP 窗口对 PrintWindow 免疫，BitBlt 屏幕坐标捕获
-            BitBlt(hdc_mem, 0, 0, wd, ht, hdc_screen, rc.left, rc.top, SRCCOPY);
+            let _ = BitBlt(hdc_mem, 0, 0, wd, ht, hdc_screen, rc.left, rc.top, SRCCOPY);
             let n = (wd * ht * 4) as usize;
             let mut buf = vec![0u8; n];
             let mut copied = 0usize;
@@ -949,11 +947,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
             let _ = DeleteObject(hb);
             let _ = DeleteDC(hdc_mem);
             ReleaseDC(None, hdc_screen);
-            if copied == n {
-                Some(buf)
-            } else {
-                None
-            }
+            if copied == n { Some(buf) } else { None }
         }
     };
 
@@ -1066,7 +1060,7 @@ extern "system" fn hufu_test_skin_hot() -> i32 {
         let y_lo = (fh as usize * 12 / 100).max(8);
         let y_hi = (fh as usize * 32 / 100).min(hq.saturating_sub(2));
         for y in y_lo..y_hi.max(y_lo + 1) {
-            for gx in (margin_probe(wq)) {
+            for gx in margin_probe(wq) {
                 let c = px(gx, y);
                 if c[2] >= 40 && c[2] <= 60 && c[0] >= 145 && c[0] <= 175 && c[3] > 200 {
                     pill_hit += 1;

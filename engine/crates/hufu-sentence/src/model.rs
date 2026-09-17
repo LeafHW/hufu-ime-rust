@@ -201,7 +201,7 @@ impl NgramModel {
     /// 分页块中查找上下文键 → (后继数组偏移, λ, 后继数)。
     fn find_ctx(
         &self,
-        blocks_off: usize,
+        _blocks_off: usize,
         index_off: usize,
         index_count: usize,
         key: i64,

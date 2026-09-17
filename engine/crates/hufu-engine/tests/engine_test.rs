@@ -6,7 +6,16 @@ use hufu_types::{Candidate, KeyInput};
 use std::sync::Arc;
 
 fn setup() -> (Engine, Session, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("hufu-engine-test-{}", std::process::id()));
+    // 【并行竞态修复 2026-10-09】原固定 hufu-engine-test-{pid}：同进程
+    // 并行测试共享同目录，后进场的 setup remove_dir_all 清掉先进场正
+    // 在用的词典 → quick_symbol_auto_commit 偶发 None（并行时序 flake，
+    // 单测/复跑恒绿）。原子计数每次全新目录，互不踩踏。
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "hufu-engine-test-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     // 与 Config::default 的 schema.dir（"码表"）保持一致——1c94901
     // 改 default 目录名后 fixture 未同步，Engine::new 找不到方案目录

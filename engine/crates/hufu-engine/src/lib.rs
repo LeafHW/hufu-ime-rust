@@ -241,10 +241,9 @@ fn build_raw_lengths(
     let full_len = full_raw.chars().count();
     let mut out: Vec<(String, usize)> = Vec::new();
     for h in cands {
-        let mut cum = 0usize;
         let text_all: Vec<char> = h.text.chars().collect();
         for (chars_cum, base_end) in &h.word_ends {
-            cum = *chars_cum;
+            let cum = *chars_cum;
             if cum == 0 || cum > text_all.len() {
                 continue;
             }
@@ -490,7 +489,7 @@ impl Engine {
         };
         let dict_root = Engine::resolve_data_sub(data_dir, &config.schema.dir);
         let current = dict_root.join(&config.schema.current);
-        let mut schema = Schema::load(&current)?;
+        let schema = Schema::load(&current)?;
         mark("schema_load");
         let mut schemas = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dict_root) {
@@ -527,7 +526,7 @@ impl Engine {
 
     /// 直接从方案目录构建引擎（CLI / 测试用，无 dictionaries/ 包装）。
     pub fn with_schema_dir(schema_dir: &Path, config: Config) -> std::io::Result<Engine> {
-        let mut schema = Schema::load(schema_dir)?;
+        let schema = Schema::load(schema_dir)?;
         let name = schema.name.clone();
         let mut engine = Engine {
             config,
@@ -660,7 +659,7 @@ impl Engine {
         }
         let old = self.config.schema.current.clone();
         let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
-        let mut schema = Schema::load(&dir)?;
+        let schema = Schema::load(&dir)?;
         self.schema = schema;
         self.apply_global_assets();
         self.config.schema.current = name.to_string();
@@ -806,7 +805,8 @@ impl Engine {
                         return KeyOutcome::commit("。".to_string(), self.state(session));
                     }
                     if c == ',' && !m.shift {
-                        // 逗号并入（数字尾巴还在——半角逗号路径）
+                        // 逗号并入：先落半角 .，逗号走全角「，」（二十五
+                        // 修后数字尾逗号不再半角化）
                         session.raw.clear();
                         let mut out = self.process_key_inner(session, key);
                         out.commit = Some(match out.commit.take() {
@@ -1121,8 +1121,8 @@ impl Engine {
                 return KeyOutcome::consumed(self.state(session));
             }
             // 空态数字：直通（系统原生半角上屏），但记入跨句尾巴——
-            // 数字后的标点半角化（1.5 / 3.14 / 2,500）依赖 tail 判
-            // 「上一个已上屏字符是 ASCII 数字」；不记则判不出。
+            // 数字后的句点半角化（1.5 / 3.14）依赖 tail 判「上一个
+            // 已上屏字符是 ASCII 数字」；不记则判不出。
             if c.is_ascii_digit() {
                 session.tail_context.push(c);
                 return KeyOutcome::passthrough();
@@ -1132,7 +1132,7 @@ impl Engine {
             // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
             // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
             // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
-            // 依赖回删）。逗号（,）保持立即半角。
+            // 依赖回删）。逗号（,）全角直出（二十五修）。
             if c == '.'
                 && !shift
                 && session
@@ -1309,13 +1309,16 @@ impl Engine {
                 // O(n²) 扫描 + 无界码表查询。手段 → 窗口上限：只看尾部
                 // ≤DIGIT_SUFFIX_WINDOW 码（只看当前段尾部，跨段延续
                 // 如 b8=如 仍在窗内，行为不变）。
-                let raw = &session.raw;
-                let n = raw.chars().count();
+                // 【性能】chars 一次收集，循环内切片拼接——原先每轮
+                // chars().skip(start) 从头扫到 start，k 轮合计 O(k·n)。
+                let chars: Vec<char> = session.raw.chars().collect();
+                let n = chars.len();
                 let max_k = n.min(DIGIT_SUFFIX_WINDOW);
                 (1..=max_k).any(|k| {
                     let start = n - k;
-                    let suffix: String = raw.chars().skip(start).collect();
-                    let probe = format!("{}{c}", suffix);
+                    let mut probe = String::with_capacity(k + 1);
+                    probe.extend(&chars[start..]);
+                    probe.push(c);
                     !self.schema.dict.lookup(&probe).is_empty()
                         || !self.schema.dict.completions(&probe, 1).is_empty()
                 })
@@ -1369,12 +1372,15 @@ impl Engine {
         if self.config.input.ascii_punct {
             return Some((c.to_string(), 0));
         }
-        // 数字后的标点半角化（对齐 Rime/虎爪）：已上屏尾是 ASCII 数字时，
-        // . 与 , 直通半角（1.5 / 3.14 / 2,500）；尾恰是刚直通的半角 . 时
-        // 再按 . → 回删替换为全角句号（「1.」后想打中文句号的通道）。
+        // 数字后的标点半角化（对齐 Rime/虎爪）：已上屏尾是 ASCII 数字
+        // 时 . 直通半角（1.5 / 3.14）；尾恰是刚直通的半角 . 时再按 .
+        // → 回删替换为全角句号（「1.」后想打中文句号的通道）。
+        // 【二十五修·逗号回归全角 2026-10-09】数字后 , 不再半角化——
+        // 用户定稿「数字后打逗号就是要正常的全角，这个特性只有句号
+        // 有」。半角智能仅保留 . 路径；, 一律走全角映射（英文态除外）。
         let tail_last = session.tail_context.chars().last();
-        if c == '.' || c == ',' {
-            if tail_last == Some('.') && c == '.' {
+        if c == '.' {
+            if tail_last == Some('.') {
                 // 上一键刚直通半角点：本键语义为中文句号，回删替换
                 return Some(("。".into(), 1));
             }
@@ -1798,17 +1804,6 @@ impl Engine {
             return map.keys().any(|k| k.starts_with(s) || k == s);
         }
         false
-    }
-
-    /// 【满码判定】编码是否存在严格更长的码表条目。注意 completions
-    /// 含自身条目——必须过滤长度；结果以 code 为前缀、长度 ≥ code、
-    /// 排序后自身居首，limit=2 足够抓到「更长」。
-    fn has_longer_code(&self, code: &str) -> bool {
-        self.schema
-            .dict
-            .completions(code, 2)
-            .iter()
-            .any(|e| e.code.chars().count() > code.chars().count())
     }
 
     /// 内联提交首选（顶屏 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
@@ -2246,27 +2241,6 @@ impl Engine {
         session.pending_commit = Some(delta);
     }
 
-    /// refresh_candidates 的无早屏递归体。
-    fn refresh_candidates_inner(&mut self, session: &mut Session) {
-        let entries = self.schema.candidates(&session.raw);
-        if !entries.is_empty() {
-            session.candidates = entries.iter().map(|e| self.entry_to_candidate(e)).collect();
-            return;
-        }
-        let map = self.schema.symbols.merge_code_map();
-        if let Some(list) = map.get(&session.raw) {
-            session.candidates = list
-                .iter()
-                .map(|s| {
-                    let mut c =
-                        Candidate::new(s.text.clone(), s.code.clone(), CandidateKind::Symbol);
-                    c.weight = s.weight;
-                    c
-                })
-                .collect();
-        }
-    }
-
     fn take_or_state(&mut self, session: &mut Session) -> KeyOutcome {
         if let Some(text) = session.pending_commit.take() {
             KeyOutcome::commit(text, self.state(session))
@@ -2291,13 +2265,6 @@ impl Engine {
         }
         session.clear();
         KeyOutcome::consumed(self.state(session))
-    }
-
-    /// 选第 idx 个候选（当前页内，0 起）。
-    fn select_candidate(&mut self, session: &mut Session, idx: usize, flash: bool) -> KeyOutcome {
-        let page_size = self.config.candidates.page_size.max(1);
-        let start = session.page * page_size;
-        self.select_candidate_abs(session, start + idx, flash)
     }
 
     /// 【十八修】no_learn 版（;/' 选重用）：只上屏不进用户词学习。
@@ -2654,9 +2621,7 @@ impl Engine {
                 }
             }
         }
-        let n = variants.len();
         session.candidates.append(&mut variants);
-        let _ = n;
     }
 
     /// 用户学习：自动调频 + 可选调整日志（user-adjust.log，log_adjust=true 时记录）。
@@ -2889,6 +2854,7 @@ impl Engine {
         &self,
         session: &Session,
         dec: &dyn SentenceDecoder,
+        parsed: &RankLocks,
     ) -> Vec<Candidate> {
         let full = format!("{}{}", session.committed_raw, session.raw);
         let rich = dec.decode_rich(&full);
@@ -2900,8 +2866,9 @@ impl Engine {
         //（含一简尾段）、pvlc 时刻的「踹」——进行态一律退出候选框；
         // 要上屏走顶屏/继续打完整码。2026-09-03「它存 wvn 提示它」的
         // 中间态并入已被此规则取代（3943a9b 踹修复同方向收口）。
-        let has_locks = self.parse_locks(&session.raw).has_locks();
-        let mut cands: Vec<Candidate> = Vec::new();
+        // parsed 由调用方（refresh_candidates）传入——同键内复用，
+        // 数字码表下 parse_locks 含逐字符词典探测，避免每键重扫。
+        let has_locks = parsed.has_locks();
         // 【无锁短码候选=精确对应】（2026-09-05 用户规则）：live raw ≤
         // 最大码长且无锁=码表域——候选只留每段精确对应实打编码的完整
         // 态（段词条码表码长==消耗键数、名次 1）：javz 只出「们服」与
@@ -2946,15 +2913,16 @@ impl Engine {
                 inexact_cands.push(c);
             }
         }
-        if dict_domain && !exact_cands.is_empty() {
+        let cands: Vec<Candidate> = if dict_domain && !exact_cands.is_empty() {
             // 码表域：只显精确对应项；exact 全空（无精确组合，如全生
             // 僻码 wvn）回退全显保持可见性
-            cands = exact_cands;
+            exact_cands
         } else {
-            cands = front_cands;
-            cands.extend(exact_cands);
-            cands.extend(inexact_cands);
-        }
+            let mut c = front_cands;
+            c.extend(exact_cands);
+            c.extend(inexact_cands);
+            c
+        };
         // 完整态构成整个候选列表（partial 已全局退出，见上）。
         cands
     }
@@ -2996,7 +2964,7 @@ impl Engine {
                 || !session.committed_raw.is_empty());
         if sentence_mode {
             if let Some(dec) = &self.sentence {
-                let cands = self.sentence_candidates(session, dec.as_ref());
+                let cands = self.sentence_candidates(session, dec.as_ref(), &parsed);
                 if !cands.is_empty() {
                     session.candidates = cands;
                     self.apply_rerank(session);
@@ -3226,7 +3194,7 @@ impl Engine {
         // n≤4 全名次参与，nq|bh 两段即出「真好」）
         if self.sentence_active() {
             if let Some(dec) = &self.sentence {
-                let cands = self.sentence_candidates(session, dec.as_ref());
+                let cands = self.sentence_candidates(session, dec.as_ref(), &parsed);
                 if !cands.is_empty() {
                     session.candidates = cands;
                     self.apply_rerank(session);
@@ -3445,7 +3413,10 @@ impl Engine {
         let pages = (session.candidates.len() + page_size - 1) / page_size;
         let start = (session.page * page_size).min(session.candidates.len());
         let end = (start + page_size).min(session.candidates.len());
-        let mut preedit = self.display_raw(session);
+        // 【性能】display_raw 整句模式下重活（parse_locks+码表查询+
+        // 候选重算）——同一快照内只算一次，raw 与 preedit 共用。
+        let raw_disp = self.display_raw(session);
+        let mut preedit = raw_disp.clone();
         if !self.config.input.code_disguise.is_empty() && !preedit.is_empty() {
             preedit = format!("{}{}", self.config.input.code_disguise, preedit);
         }
@@ -3479,7 +3450,7 @@ impl Engine {
             })
             .collect();
         SessionState {
-            raw: self.display_raw(session),
+            raw: raw_disp,
             preedit,
             candidates: shown,
             page: session.page,
@@ -4899,12 +4870,26 @@ mod tests {
         let o4 = eng.process_key(&mut s2, key('3'));
         assert_eq!(o4.commit, None, "后续数字恢复直通");
 
-        // 1 . 逗号 → ".,"（逗号保持数字后半角）
+        // 1 . 逗号 → ".，"（flush 点 + 逗号全角——二十五修：数字尾
+        // 逗号不再半角化）
         let mut s3 = Session::new(true);
         eng.process_key(&mut s3, key('1'));
         eng.process_key(&mut s3, key('.'));
         let o5 = eng.process_key(&mut s3, key(','));
-        assert_eq!(o5.commit.as_deref(), Some(".,"), "flush 并逗号: {:?}", o5.commit);
+        assert_eq!(o5.commit.as_deref(), Some(".，"), "flush 点+全角逗号: {:?}", o5.commit);
+
+        // 1 逗号 → 「，」直出全角（数字尾逗号不半角化）
+        let mut s3b = Session::new(true);
+        eng.process_key(&mut s3b, key('1'));
+        let o5b = eng.process_key(&mut s3b, key(','));
+        assert_eq!(o5b.commit.as_deref(), Some("，"), "数字后逗号全角直出: {:?}", o5b.commit);
+
+        // 2 3 逗号 → 「，」（连数字尾巴同判全角）
+        let mut s3c = Session::new(true);
+        eng.process_key(&mut s3c, key('2'));
+        eng.process_key(&mut s3c, key('3'));
+        let o5c = eng.process_key(&mut s3c, key(','));
+        assert_eq!(o5c.commit.as_deref(), Some("，"), "多数字尾同全角: {:?}", o5c.commit);
 
         // 1 . 字母 → "." 上屏 + 字母进组段
         let mut s4 = Session::new(true);

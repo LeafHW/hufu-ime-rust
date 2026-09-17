@@ -55,7 +55,6 @@ fn parse_header(lines: &[String]) -> Header {
     let mut i = 0;
     let mut in_columns = false;
     let mut in_imports = false;
-    let mut in_encoder_rules = false;
     let mut cur_rule: Option<(usize, usize, String)> = None;
 
     let flush_rule = |cur: &mut Option<(usize, usize, String)>, rules: &mut Vec<EncoderRule>| {
@@ -106,7 +105,6 @@ fn parse_header(lines: &[String]) -> Header {
             let value = value.trim();
             in_columns = false;
             in_imports = false;
-            in_encoder_rules = false;
             match key {
                 "name" => meta.name = unquote(value).to_string(),
                 "version" => meta.version = unquote(value).to_string(),
@@ -128,9 +126,6 @@ fn parse_header(lines: &[String]) -> Header {
                     if meta.imports.is_empty() {
                         in_imports = true;
                     }
-                }
-                "rules" => {
-                    in_encoder_rules = true;
                 }
                 _ => {}
             }

@@ -266,10 +266,24 @@ fn ensure_server() -> bool {
 /// 音效）物理分离——单连接时代一次慢响应（读超时上限 2s）会把
 /// PIPE_CONN 锁占住，后续按键全部排队（用户实测重启后仍卡：打字
 /// 高峰撞上 poll 即卡）。键通道永不与后台争抢。
-static PIPE_KEY: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// 通道状态：连接 + 响应 body 复用缓冲。【热路径缓冲复用】旧版每响应
+/// `vec![0u8; len]`（每键一次分配 + 全量零填）——改为通道级缓冲
+/// `clear()+resize()`，容量足够时零分配，零填只发生在扩容段；断线
+/// 弃连接时缓冲保留复用。
+struct Chan {
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+static PIPE_KEY: std::sync::Mutex<Chan> = std::sync::Mutex::new(Chan {
+    file: None,
+    buf: Vec::new(),
+});
 /// 后台通道（poll/focus/音效/探测）：读上限压到 150ms——后台慢就
 /// 弃连接重来，绝不长时间占锁。
-static PIPE_BG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+static PIPE_BG: std::sync::Mutex<Chan> = std::sync::Mutex::new(Chan {
+    file: None,
+    buf: Vec::new(),
+});
 
 /// 建立新连接（含 server 缺席拉起逻辑——与旧版一致）。
 unsafe fn connect_pipe() -> Option<std::fs::File> {
@@ -314,35 +328,36 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
 }
 
 /// 后台请求（poll/focus/音效/探测）：后台通道 + 150ms 响应上限。
+/// 【热路径】Value → 帧一次成型：4B 长度占位 + to_writer 直接序列化
+/// 进同一 Vec（旧版 to_vec 出 body、再 to_le_bytes().to_vec() 出头、
+/// extend 拼帧 = 每请求两次分配 + 一次多余 memcpy）。
 pub fn call(req: &Value) -> Option<Value> {
-    call_on(&PIPE_BG, req, 150, 150)
-}
-
-/// 键路径请求：键通道（与后台物理分离）+ 完整超时（server 正常
-/// <3ms；上限保留给极端恢复场景）。
-pub fn call_key(req: &Value) -> Option<Value> {
-    call_on(&PIPE_KEY, req, 2000, 1000)
+    let mut frame: Vec<u8> = Vec::with_capacity(128);
+    frame.extend_from_slice(&[0u8; 4]); // 长度占位，序列化后回填
+    serde_json::to_writer(&mut frame, req).ok()?;
+    let n = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&n.to_le_bytes());
+    call_on(&PIPE_BG, &frame, 150, 150)
 }
 
 fn call_on(
-    slot: &std::sync::Mutex<Option<std::fs::File>>,
-    req: &Value,
+    slot: &std::sync::Mutex<Chan>,
+    frame: &[u8],
     resp_timeout: u64,
     body_timeout: u64,
 ) -> Option<Value> {
     unsafe {
         let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
-        let body = serde_json::to_vec(req).ok()?;
-        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
-        frame.extend_from_slice(&body);
         for _attempt in 0..2 {
-            if g.is_none() {
-                *g = connect_pipe();
-                if g.is_none() {
+            if g.file.is_none() {
+                g.file = connect_pipe();
+                if g.file.is_none() {
                     return None;
                 }
             }
-            let mut f = g.as_mut().unwrap();
+            // 字段拆借：file 与 buf 互不重叠可同时可变借用（body 直写复用缓冲）
+            let Chan { file, buf } = &mut *g;
+            let f = file.as_mut().unwrap();
             // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
             // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
             // 线程（常为宿主 UI 线程）永久冻结（VSCode「点击候选框应用未
@@ -432,33 +447,35 @@ fn call_on(
                     }
                     true
                 };
-            if f.write_all(&frame).is_err() {
+            if f.write_all(frame).is_err() {
                 // 断线：弃连接重试一次
-                *g = None;
+                *file = None;
                 continue;
             }
             if wait_response(resp_timeout).is_none() {
                 // 超时/断线：弃连接（防响应错位）走降级
-                *g = None;
+                *file = None;
                 return None;
             }
             let mut head = [0u8; 4];
-            if !read_full_timeout(&mut f, &mut head, raw_pipe, body_timeout.max(500)) {
-                *g = None;
+            if !read_full_timeout(f, &mut head, raw_pipe, body_timeout.max(500)) {
+                *file = None;
                 return None;
             }
             let len = u32::from_le_bytes(head) as usize;
             if len == 0 || len > (1 << 20) {
-                *g = None;
+                *file = None;
                 return None;
             }
-            // body 可能分片到达：头 4 字节已到不代表全帧已到
-            let mut buf = vec![0u8; len];
-            if !read_full_timeout(&mut f, &mut buf, raw_pipe, body_timeout.max(500)) {
-                *g = None;
+            // body 可能分片到达：头 4 字节已到不代表全帧已到。
+            // 【缓冲复用】直写通道级 buf（见 Chan 注释）
+            buf.clear();
+            buf.resize(len, 0);
+            if !read_full_timeout(f, buf, raw_pipe, body_timeout.max(500)) {
+                *file = None;
                 return None;
             }
-            return serde_json::from_slice(&buf).ok();
+            return serde_json::from_slice(buf).ok();
         }
         None
     }
@@ -478,16 +495,38 @@ pub fn key_request(
     // 【七十七修·digit_tail 补齐】空态键随带 TestDown 记的直通数字
     // 尾巴——server 端做后缀补齐（engine tail 没有这段才追加，递键
     // 宿主 QQ 的 tail 不被覆盖污染）。
-    let mut req = serde_json::json!({
-        "op": "key",
-        "key": key,
-        "modifiers": { "shift": shift, "ctrl": ctrl, "alt": alt },
-        "line_end": line_end
-    });
+    // 【热路径手写序列化】键请求是最高频 IPC（每键一次）：json! 宏每次
+    // 堆一棵 Value 树（两层 Map + 键值字符串 ~10 次分配）再遍历序列化。
+    // 字面量字段直接写文本零分配；动态串（key/digit_tail）走
+    // serde_json::to_writer 的标准字符串转义，与 json! 输出等价。
+    let mut body: Vec<u8> = Vec::with_capacity(96);
+    body.extend_from_slice(b"{\"op\":\"key\",\"key\":");
+    serde_json::to_writer(&mut body, key).ok()?;
+    body.extend_from_slice(b",\"modifiers\":{\"shift\":");
+    body.extend_from_slice(if shift { b"true" } else { b"false" });
+    body.extend_from_slice(b",\"ctrl\":");
+    body.extend_from_slice(if ctrl { b"true" } else { b"false" });
+    body.extend_from_slice(b",\"alt\":");
+    body.extend_from_slice(if alt { b"true" } else { b"false" });
+    body.extend_from_slice(b"},\"line_end\":");
+    body.extend_from_slice(if line_end { b"true" } else { b"false" });
     if let Some(t) = digit_tail {
-        req["digit_tail"] = serde_json::json!(t);
+        body.extend_from_slice(b",\"digit_tail\":");
+        serde_json::to_writer(&mut body, t).ok()?;
     }
-    let resp = call_key(&req)?;
+    body.extend_from_slice(b"}");
+    let mut frame: Vec<u8> = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    // 键通道（与后台物理分离）+ 完整超时（server 正常 <3ms；上限保留
+    // 给极端恢复场景）
+    let mut resp = call_on(&PIPE_KEY, &frame, 2000, 1000)?;
+    // 【热路径】state 用 take 移交所有权——旧版 .cloned() 每键深拷
+    // 整棵 state 子树（候选数组/编码串全在里面）
+    let state = resp
+        .get_mut("state")
+        .map(std::mem::take)
+        .unwrap_or(Value::Null);
     let outcome = resp.get("outcome")?;
     let consumed = outcome
         .get("consumed")
@@ -499,7 +538,6 @@ pub fn key_request(
         .unwrap_or("")
         .to_string();
     let back = outcome.get("back").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-    let state = resp.get("state").cloned().unwrap_or(Value::Null);
     let sound = outcome
         .get("sound")
         .and_then(|v| v.as_str())

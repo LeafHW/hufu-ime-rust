@@ -41,7 +41,6 @@ const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_TOPMOST: u32 = 0x0000_0008;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
-const GWL_EXSTYLE: i32 = -20;
 const ULW_ALPHA: u32 = 2;
 const AC_SRC_OVER: u8 = 1;
 const AC_SRC_ALPHA: u8 = 1;
@@ -67,6 +66,7 @@ struct SIZE {
 }
 
 #[repr(C)]
+#[allow(non_snake_case)] // Win32 原名（FFI 手写声明，与 tray.rs 同风格）
 struct WNDCLASSW {
     style: u32,
     lpfnWndProc: extern "system" fn(isize, u32, usize, isize) -> isize,
@@ -130,14 +130,12 @@ extern "system" {
         param: *const core::ffi::c_void,
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
-    fn GetClientRect(hwnd: isize, r: *mut RECT) -> i32;
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     fn ValidateRect(hwnd: isize, r: *const RECT) -> i32;
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
     fn BringWindowToTop(hwnd: isize) -> i32;
     fn IsWindow(hwnd: isize) -> i32;
-    fn IsWindowVisible(hwnd: isize) -> i32;
     fn UpdateLayeredWindow(
         hwnd: isize,
         hdcdst: isize,
@@ -149,8 +147,6 @@ extern "system" {
         pblend: *const BLENDFUNCTION,
         flags: u32,
     ) -> i32;
-    fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
-    fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn GetDpiForWindow(hwnd: isize) -> u32;
 }
 
@@ -632,7 +628,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
 
         // ── 文字（GDI coverage → 合成）──
         // 文字 DIB（顶朝下 biHeight 负，32bpp）
-        let mut bmi = BITMAPINFO {
+        let bmi = BITMAPINFO {
             bmi_header: BITMAPINFOHEADER {
                 bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 bi_width: w_out.max(1),
@@ -707,7 +703,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
             }
 
             // 一段文字：清 bbox → 画 → coverage 合成
-            let mut draw_text = |canvas: &mut Canvas,
+            let draw_text = |canvas: &mut Canvas,
                                  hf: isize,
                                  s: &str,
                                  x: f32,
@@ -776,7 +772,6 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
             let cmt_x = if max_cmt > 0.0 {
                 let b = width - margin_x - 2.0 - text_x - max_text - 8.0;
                 if b < 24.0 {
-                    max_cmt = 0.0;
                     width
                 } else {
                     cmt_budget = b.min(max_cmt);
@@ -932,7 +927,7 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
             let _ = ShowWindow(hwnd, 4 /*SW_SHOWNOACTIVATE*/);
             // 逐像素 alpha 上屏（同时完成 移动+尺寸+显示）
             let hdc = CreateCompatibleDC(0);
-            let mut bmi = BITMAPINFO {
+            let bmi = BITMAPINFO {
                 bmi_header: BITMAPINFOHEADER {
                     bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                     bi_width: w_out,
