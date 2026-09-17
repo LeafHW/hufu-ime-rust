@@ -3551,7 +3551,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 带回的闪帧（旧候选+高亮=选中项——引擎 on_rank_key/
                 // select_candidate 选重路径专属，普通上屏候选已清）：
                 // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），
-                // 收场交给 hide_later(320) 短停留定时器；否则照旧收窗。
+                // 收场交给 hide_later(200) 短停留定时器；否则照旧收窗。
                 let flash: Vec<(String, String)> = state
                     .get("candidates")
                     .and_then(|v| v.as_array())
@@ -3579,11 +3579,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     let caret_f = g.caret;
                     if let Some(c) = g.cand2.as_mut() {
                         c.show(&flash, "", &skin_f, caret_f.as_ref(), sel_flash);
-                        // 【二十五修·闪帧复活】二十四修起 hide()=立即收，
-                        // 闪帧 ~10ms 被收走等于失效。改专用短停留：240ms
-                        // 高亮滑动播完 + 收尾余量后异步真隐藏；新 show
+                        // 【二十六修·闪帧提速】用户拍板 0.2s（原 320ms 偏
+                        // 慢——上屏后窗口滞留感）：240ms 高亮滑动前段已足
+                        // 够看到「高亮移到选重位」，200ms 收场；新 show
                         // 到来自动取消（candwin2 show 头 KillTimer）。
-                        c.hide_later(320);
+                        c.hide_later(200);
                     }
                     // tick 复渲染读 shared.last_show——同步为闪帧（否则
                     // 动效 tick 拿旧组段帧把高亮拽回原位）。

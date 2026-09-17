@@ -3154,8 +3154,14 @@ impl Engine {
             // 句运算，本规则不生效，用户口径「已上屏的部分参与计算时
             // 不干预」）。
 
+            // 【二十六修·独立段口径加固】committed_raw 非空（提前上屏段）
+            // 时解码器无产物的兜底路径会回落到本分支——原 freq_boost_
+            // domain 未显式排除，理论上提前上屏后的续打段也会被置顶。
+            // 用户口径重申「已上屏的部分参与计算时不干预」：显式加上
+            // committed_raw 空判，把注释承诺变成代码事实。
             let freq_boost_domain = self.sentence_active()
                 && !parsed.has_locks()
+                && session.committed_raw.is_empty()
                 && raw_len > 0
                 && raw_len <= self.config.input.max_code_length;
             if freq_boost_domain {
@@ -5099,5 +5105,16 @@ mod tests {
         let st3 = eng.state(&s3);
         let texts3: Vec<&str> = st3.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts3, vec!["一点点", "𥙫", "𮠙"], "全表外码位保持码表原序");
+
+        // ④ 提前上屏后的续打段（committed_raw 非空 + 解码器无产物兜底
+        // 路径）：置顶不生效——用户口径「已上屏的部分参与计算时不干预」
+        //（二十六修把注释承诺固化为 freq_boost_domain 的显式判）。
+        let mut s4 = Session::new(true);
+        s4.committed_raw = "le".into();
+        s4.raw = "kb".into();
+        eng.refresh_candidates(&mut s4);
+        let st4 = eng.state(&s4);
+        let texts4: Vec<&str> = st4.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts4, vec!["一点", "的", "𥙫"], "提前上屏段不置顶（码表原序）");
     }
 }
