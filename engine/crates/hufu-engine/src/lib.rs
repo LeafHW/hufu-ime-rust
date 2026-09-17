@@ -3167,21 +3167,25 @@ impl Engine {
                 }
             }
             // 【4 码内高频字优先 2026-09-11 用户拍板；同晚二次修正】实打
-            // 编码 ≤4（含 4，码表域、无锁）时，前 1500 高频单字（Jun Da
-            // 字频表）浮到多字候选（词组/整句现切）之前——「wfsi→征」压
-            // 「写止」；第 5 键起/带锁/带上屏前缀回归正常权重。
-            // 【边界修正·单字永不换序】首版整域平铺置前，实测「kc 全码组
-            // [寸,泥,⼨] 中表内的泥被浮到寸前」——形码同码单字组的官方
-            // 序不容频表重排。正确语义：1500 单字只下沉「词」，构造法=
-            // 以最后一个 1500 单字为锚：锚前非词保序 → 全部词保序 → 其
-            // 余非词保序。无 1500 单字则完全不动。只动序不动权重，置顶区
-            // （pinned）不受影响。
+            // 编码 ≤4（含 4，码表域、无锁）时，高频单字浮到多字候选
+            //（词组/整句现切）之前——「wfsi→征」压「写止」；第 5 键起/
+            // 带锁/带上屏前缀回归正常权重。
+            // 【边界修正·单字永不换序】形码同码单字组的官方序不容频表
+            // 重排（kc 全码组 [寸,泥,⼨] 教训）——置顶区内部保持码表原
+            // 相对序，stable partition 语义。
             // 【整句方案限定 2026-10-09 十五】用户口径：纯码表方案=纯频
-            // 数序（多表同步合并后谁字频词频高谁在前），不搞任何频表
-            // 浮字。本规则（2026-09-11 wfsi→征 压「写止」拍板）的对象
-            // 是**整句方案**码表域里混入的整句现切多字——只在整句方案
-            // （sentence_active）启用；虎码字词等纯码表方案整条规则不
-            // 生效（is→[经常485 络397 …] 频序即终序）。
+            // 数序，不搞任何频表浮字；本规则只在整句方案（sentence_
+            // active）的码表域启用。
+            // 【二十三修·前 4000 表 2026-10-09 用户拍板】频表从 Jun Da
+            // 前 1500 换成虎魄输入法的「前4000」字频表；口径从「只下沉
+            // 整句现切词（锚点法）」升级为「表内单字整体置顶（stable
+            // partition）」：表内单字（保码表原序）→ 词（码表词+整句现
+            // 切，保原序）→ 表外生僻字（保原序）。触发窗口不变：整句方
+            // 案、码表域、无锁、raw≤4 的**独立段**（用户主动空格后/首
+            // 键起——committed_raw 非空的提前上屏段走 sentence_mode 整
+            // 句运算，本规则不生效，用户口径「已上屏的部分参与计算时
+            // 不干预」）。
+
             let freq_boost_domain = self.sentence_active()
                 && !parsed.has_locks()
                 && raw_len > 0
@@ -3195,30 +3199,23 @@ impl Engine {
                         && c.text
                             .chars()
                             .next()
-                            .map(hufu_dict::freq::is_top1500)
+                            .map(hufu_dict::freq::is_top4000)
                             .unwrap_or(false)
                 };
-                // 被「浮字」下沉的多字 = 仅整句现切组合（原拍板语义）
-                let is_sentence_word = |c: &Candidate| {
-                    c.text.chars().count() > 1 && c.source == CandidateKind::Sentence
-                };
-                // 锚 = 最后一个 1500 单字（无则整段不动——含纯罕字单字组）
-                if let Some(anchor) = rest.iter().rposition(|c| is_top_single(c)) {
-                    let mut out: Vec<Candidate> = Vec::with_capacity(rest.len());
-                    let mut words: Vec<Candidate> = Vec::new();
-                    let mut after: Vec<Candidate> = Vec::new();
-                    for (i, c) in rest.into_iter().enumerate() {
-                        if i <= anchor && is_sentence_word(&c) {
-                            words.push(c);
-                        } else if i <= anchor {
-                            out.push(c);
+                // 【二十三修】无表内单字则整段不动（fyy=[𥙫,一点点,𮠙]
+                // 类全表外码位保持码表原序）。
+                if rest.iter().any(|c| is_top_single(c)) {
+                    let mut singles: Vec<Candidate> = Vec::with_capacity(rest.len());
+                    let mut others: Vec<Candidate> = Vec::new();
+                    for c in rest {
+                        if is_top_single(&c) {
+                            singles.push(c);
                         } else {
-                            after.push(c);
+                            others.push(c);
                         }
                     }
-                    out.append(&mut words);
-                    out.extend(after);
-                    session.candidates.extend(out);
+                    singles.extend(others);
+                    session.candidates.extend(singles);
                 } else {
                     session.candidates.extend(rest);
                 }
@@ -5045,5 +5042,77 @@ mod tests {
         let o = eng.on_char(&mut s7, ',', false);
         assert_eq!(o.commit.as_deref(), Some("啊，"), "无 shift 行为不变");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 整句方案码表域短码「前4000单字置顶」（二十三修 2026-10-09 用户
+    /// 拍板）：独立段（无锁、raw≤4、无提前上屏前缀）时，表内单字整体
+    /// 置顶（stable——同码单字组保码表原序），词/表外生僻保原序排后；
+    /// 全表外码位完全不动；第 5 键起（>max_code_length）不再干预。
+    /// decoder 用空产物 mock：只激活 sentence_active 门，不注入整句
+    /// 候选——码表域纯净可断言。
+    struct MockDecEmpty;
+    impl SentenceDecoder for MockDecEmpty {
+        fn decode_rich(&self, _raw: &str) -> std::sync::Arc<SentenceDecode> {
+            std::sync::Arc::new(SentenceDecode {
+                hits: Vec::new(),
+                truncated: false,
+                early_hits: Vec::new(),
+                early_truncated: false,
+            })
+        }
+    }
+
+    #[test]
+    fn top4000_short_code_single_first() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-整句top4000-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // kb：词第1、表内单字第2、表外生僻第3（码表原序刻意错排）
+        // kbc：5 键位（>4）——同序不干预（第 5 键正常排序）
+        // fyy 形态：全表外（词+两个表外生僻）——完全不动
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句测试top4000\n\
+             kb\t一点\n\
+             kb\t的\n\
+             kb\t𥙫\n\
+             kbcde\t一点\n\
+             kbcde\t的\n\
+             kbcde\t𥙫\n\
+             qq\t一点点\n\
+             qq\t𥙫\n\
+             qq\t𮠙\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDecEmpty)));
+
+        // ① 独立段短码：表内单字「的」置顶，词/生僻保持原相对序
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('k'));
+        eng.process_key(&mut s, key('b'));
+        let st = eng.state(&s);
+        let texts: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["的", "一点", "𥙫"], "二十三修：表内单字置顶，词+表外生僻保序排后");
+
+        // ② 第 5 键起：>max_code_length 不再干预（码表原序即终序）
+        let mut s5 = Session::new(true);
+        for ch in ['k', 'b', 'c', 'd', 'e'] {
+            eng.process_key(&mut s5, key(ch));
+        }
+        let st5 = eng.state(&s5);
+        let texts5: Vec<&str> = st5.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts5, vec!["一点", "的", "𥙫"], "第 5 键恢复正常排序（码表原序）");
+
+        // ③ 全表外码位：无表内单字 → 完全不动（fyy 形态）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('q'));
+        eng.process_key(&mut s3, key('q'));
+        let st3 = eng.state(&s3);
+        let texts3: Vec<&str> = st3.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts3, vec!["一点点", "𥙫", "𮠙"], "全表外码位保持码表原序");
     }
 }
