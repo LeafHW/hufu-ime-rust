@@ -606,8 +606,15 @@ impl SentenceEngine {
                         // eyieqdk 出「桎梏」（桎=eyi 二选）。1/2 码段不放开
                         //（用户拍板：只限 3 码和 4 码的字，1 码 2 码不计入）；
                         // rank≥3 一律不放开（只放开「2 选」）。
+                        // 【二十二修 2026-10-09 词不提权】隐式二选收窄为
+                        // 「单字」：实现原先对多字词条同样放行（fyy 的
+                        // 2 选「一点点」3 字词免选重组句+记账 rank1），
+                        // 高频词在流式 raw≤4 窗口靠 LM+出字奖励结构性
+                        // 压过 1 选单字，fyyciugk（下车维持）被抢跑成
+                        // 「一点点…」——超出「的字」拍板范围，收回。
                         let implicit2 = lock.is_none()
                             && rank1b == 2
+                            && text.chars().count() == 1
                             && {
                                 let seg_keys = end - pos;
                                 seg_keys == 3 || seg_keys == 4
@@ -621,12 +628,21 @@ impl SentenceEngine {
                             continue;
                         }
                         let mut ns = state.clone();
+                        // 【二十二修·出字奖励按段计】原实现每输出一字加
+                        // 一份 emitted_character_reward——多字词按字数放
+                        // 大（「一点点」3 份 vs「下」1 份），词在分数上
+                        // 结构性碾压 1 选单字=变相提权。用户拍板「词不
+                        // 提权，单字该怎么样怎么样」：奖励改为每段一次
+                        //（同段内单字/词同酬），字数优势只剩 LM 概率
+                        // 本身。mass（提前上屏置信）同口径，抢跑虚高
+                        // 一并消除。
+                        ns.score += w.emitted_character_reward;
+                        ns.mass += w.emitted_character_reward;
                         for c in text.chars() {
                             let cp = c as u32;
                             let p3 = self.model.trigram_prob(ns.prev2, ns.prev1, cp);
                             ns.score += (p3.max(1e-12).ln()) as f64;
-                            ns.score += w.emitted_character_reward;
-                            ns.mass += (p3.max(1e-12).ln()) as f64 + w.emitted_character_reward;
+                            ns.mass += (p3.max(1e-12).ln()) as f64;
                             ns.prev2 = ns.prev1;
                             ns.prev1 = cp;
                             // 补充词：AC 自动机沿全文推进（任意位置命中都加分）
