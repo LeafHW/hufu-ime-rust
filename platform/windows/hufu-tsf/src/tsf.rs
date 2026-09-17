@@ -3496,7 +3496,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g0.cand_sig_last = state_sig(&state);
     }
     // 【二十六修·闪帧免二次渲染】闪帧帧（raw 空+候选非空+无 aux）在
-    // 下方 op 派生块内的闪帧臂里渲染并装 0.2s 收场钟——尾部渲染
+    // 下方 op 派生块内的闪帧臂里渲染并装 0.15s 收场钟——尾部渲染
     // lanes（OWNED/常规）的 c.show 是「新内容」级 show，show 头会杀
     // 收场钟（trace 实锤：bu; 后 Op::Commit 落地，尾部 OWNED 分支又
     // show 一次，收场钟被合法击杀，窗口残留到 2 秒宿主资格窗过期）。
@@ -3558,7 +3558,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 带回的闪帧（旧候选+高亮=选中项——引擎 on_rank_key/
                 // select_candidate 选重路径专属，普通上屏候选已清）：
                 // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），
-                // 收场交给 hide_later(200) 短停留定时器；否则照旧收窗。
+                // 收场交给 hide_later(150) 短停留定时器；否则照旧收窗。
                 let flash: Vec<(String, String)> = state
                     .get("candidates")
                     .and_then(|v| v.as_array())
@@ -3586,11 +3586,11 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     let caret_f = g.caret;
                     if let Some(c) = g.cand2.as_mut() {
                         c.show(&flash, "", &skin_f, caret_f.as_ref(), sel_flash);
-                        // 【二十六修·闪帧提速】用户拍板 0.2s（原 320ms 偏
-                        // 慢——上屏后窗口滞留感）：240ms 高亮滑动前段已足
-                        // 够看到「高亮移到选重位」，200ms 收场；新 show
+                        // 【二十七修·闪帧提速定稿】用户拍板 0.15s（320ms→
+                        // 200ms→150ms 递减实测）：高亮滑向选重项的前段已
+                        // 够看清「高亮移过去」，150ms 收场更利落；新 show
                         // 到来自动取消（candwin2 show 头 KillTimer）。
-                        c.hide_later(200);
+                        c.hide_later(150);
                         flash_frame_rendered = true;
                     }
                     // tick 复渲染读 shared.last_show——同步为闪帧（否则
@@ -4081,7 +4081,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             .suppress_pending = false;
     } else if !g.cand2_dead && !flash_frame_rendered {
         // 【二十六修·闪帧免二次渲染】闪帧帧已在本头渲染（收场钟在身），
-        // 本常规 lane 的 c.show 会杀钟 → 跳过（窗口由 0.2s 收场钟收）。
+        // 本常规 lane 的 c.show 会杀钟 → 跳过（窗口由 0.15s 收场钟收）。
         // 【动效窗口让渡】动效/展开 tick 持有 cand2 锁外渲染中——窗口
         // 存在只是暂时不在槽里：短等放回后复用，严禁此刻新建第二窗
         //（双窗同屏=延伸区重叠+阴影残留）
