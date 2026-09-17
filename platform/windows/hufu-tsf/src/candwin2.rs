@@ -1471,14 +1471,16 @@ impl CandidateWindowV2 {
         // 【二十五修·闪帧收窗取消】新 show 到来=新组段开打——挂起的
         // hide_later 定时器（上段选重闪帧的收尾）必须取消，否则会在
         // 新组段显示中把窗收走（110ms 内 poll 才补回=一闪）。
-        unsafe {
-            let _ = KillTimer(self.hwnd, HIDE_LATER_TIMER_ID);
-        }
-        // 【二十五修·闪帧收窗取消】新 show 到来=新组段开打——挂起的
-        // hide_later 定时器（上段选重闪帧的收尾）必须取消，否则会在
-        // 新组段显示中把窗收走（110ms 内 poll 才补回=一闪）。
-        unsafe {
-            let _ = KillTimer(self.hwnd, HIDE_LATER_TIMER_ID);
+        // 【二十六修·复渲染豁免】动画 tick 的复渲染（internal_rerender=
+        // true：fade_tick 尺寸/高亮滑动步进）不是新内容，却同样走到这
+        // 里——高亮滑动 ~240ms 内每 5ms 杀一次收场定时器，把闪帧的
+        // 0.2s 收尾吃成永不触发，窗口残留到 2 秒宿主资格窗过期才被
+        // 轮询兜底收掉（用户实锤「bu; 选重后候选留约两秒」，实测
+        // 1.4s/~2s，组段句柄未清的宿主 >4s 不收）。复渲染不杀定时器。
+        if !self.internal_rerender {
+            unsafe {
+                let _ = KillTimer(self.hwnd, HIDE_LATER_TIMER_ID);
+            }
         }
         // 【排障后注】本观测+SWP主观测已破案（四十二修：EXCEL6 框外
         // 钉死），保留为诊断资产但降频：锚=None（tick 重渲染等非锚帧）
