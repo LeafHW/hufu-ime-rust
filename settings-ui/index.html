@@ -345,12 +345,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     </div>
     <h3>动效</h3>
     <div class="row">
-      <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：入场长大、尺寸过渡、跟光标滑动、退场淡出；关闭=一切瞬跳">候选窗动效</label></div>
+      <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：尺寸过渡、跟光标滑动、高亮滑动；关闭=一切瞬跳">候选窗动效</label></div>
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
-    </div>
-    <div class="row">
-      <div class="checkline"><input type="checkbox" id="g-hold"><label for="g-hold" title="上屏后候选窗延时收起（暂留）：开了先留在原地，到时再收；关=上屏立即收起">上屏后延时收候选</label></div>
-      <div class="field"><label>暂留时长 <span class="val" id="g-holdms-v"></span></label><input type="range" id="g-holdms" min="1" max="20" step="1" title="上屏后候选窗停留多久再收（0.1~2 秒，默认 1 秒）；改动实时生效"></div>
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
@@ -942,31 +938,7 @@ function bindSkin() {
     sp.onchange = saveConfig;
     syncAnim();
   }
-  // 【上屏暂留开关+时长 2026-10-09 十三】appearance.commit_hold（默认
-  // true）/ commit_hold_ms（100~2000，默认 1000）——DLL 每次显示拉皮肤
-  // 即时生效（与 anim 同通道：保存即注入，秒级热达）。
-  {
-    const hd = $("#g-hold"), hm = $("#g-holdms");
-    const syncHold = () => {
-      hd.checked = CFG.appearance?.commit_hold !== false;
-      hm.value = Math.round((CFG.appearance?.commit_hold_ms ?? 1000) / 100);
-      hm.disabled = !hd.checked;
-      $("#g-holdms-v").textContent = (hm.value / 10).toFixed(1) + " 秒";
-    };
-    hd.oninput = () => {
-      CFG.appearance = CFG.appearance || {};
-      CFG.appearance.commit_hold = hd.checked;
-      syncHold();
-    };
-    hd.onchange = saveConfig;
-    hm.oninput = () => {
-      CFG.appearance = CFG.appearance || {};
-      CFG.appearance.commit_hold_ms = hm.value * 100;
-      $("#g-holdms-v").textContent = (hm.value / 10).toFixed(1) + " 秒";
-    };
-    hm.onchange = saveConfig;
-    syncHold();
-  }
+  // 【二十四修·动效大瘦身】上屏暂留控件整体退役（hide 即收）——JS 块删除。
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
   if (SKIN.material.master_alpha == null) SKIN.material.master_alpha = 1;
   {

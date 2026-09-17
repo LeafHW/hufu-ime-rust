@@ -149,24 +149,15 @@ pub fn dispatch(
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
             let anim = host.engine.config.appearance.anim;
             let anim_speed = host.engine.config.appearance.anim_speed;
-            // 【动效·全方案入场】用户拍板（动效定稿）：入场长大所有方案
-            // 都有（不再限整句方案）——单字/字词/整句统一 72%→100%
-            // 纯尺寸入场；DLL 侧缺省 true（旧 server/测试直连兼容）。
-            let entrance_anim = true;
-            // 【上屏暂留开关+时长 2026-10-09 十三】注入顶层 commit_hold
-            // （bool）+ commit_hold_ms（100~2000）——DLL 侧覆盖皮肤
-            // layout.hold_ms：commit_hold=false → 0（上屏立即收）。
-            let commit_hold = host.engine.config.appearance.commit_hold;
-            let commit_hold_ms = host.engine.config.appearance.commit_hold_ms.clamp(100, 2000);
+            // 【二十四修·动效大瘦身 2026-10-09】入场/退场/上屏停留全线
+            // 退役（用户拍板只留平移/尺寸/高亮滑动）——DLL 侧不再消费
+            // entrance_anim/commit_hold，注入一并移除。
             match hufu_skin::Skin::load(&p) {
                 Ok(s) => {
                     let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
-                        o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
-                        o.insert("commit_hold".into(), serde_json::json!(commit_hold));
-                        o.insert("commit_hold_ms".into(), serde_json::json!(commit_hold_ms));
                     }
                     serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
                 }
@@ -177,9 +168,6 @@ pub fn dispatch(
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
-                        o.insert("entrance_anim".into(), serde_json::json!(entrance_anim));
-                        o.insert("commit_hold".into(), serde_json::json!(commit_hold));
-                        o.insert("commit_hold_ms".into(), serde_json::json!(commit_hold_ms));
                     }
                     serde_json::json!({
                         "skin": sv,

@@ -4021,17 +4021,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
             } else {
-                // 【十七修·真信号打断 2026-10-09】真实键入帧（raw_state
-                // 非空）先作废停留钟/退场：本路径 inline_preedit 默认开
-                // 时传给 show() 的 raw 是编码行剥离值（恒空），渲染段
-                // 的 raw 打断条件从未生效——退场动画中打新编码会卡
-                // scale_out=true → 候选永存（用户实测：关暂留+上屏后
-                // 动画内快打新编码）。打断必须用 raw_state 真值。
-                if !raw_state.is_empty() {
-                    if let Some(c) = g.cand2.as_mut() {
-                        c.interrupt_effects();
-                    }
-                }
                 if let Some(c) = g.cand2.as_mut() {
                     c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 }
@@ -4336,16 +4325,6 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
-                // 【十七修补全·二 2026-10-09】与 L4029 分支同款：真实
-                // 键入帧（raw_state 非空）先打断退场/停留——本分支的
-                // raw 是编码行剥离值（inline_preedit 默认开恒空），show
-                // 内部的 raw 打断条件不生效（QQ/VSCode/Typora 等宿主
-                // 走此分支，用户实测退场中打新编码候选永存）。
-                if !raw_state.is_empty() {
-                    if let Some(c) = g.cand2.as_mut() {
-                        c.interrupt_effects();
-                    }
-                }
                 match g.cand2.as_mut() {
                     Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
                     None => {}
@@ -5220,6 +5199,12 @@ fn fg_same_app_dir(pid: u32) -> bool {
 /// 是 wps.exe 框架窗），或 UWP 框架。在 candwin2::show 入口调用。
 ///（et.exe 是表格真实宿主，不做启动器排除。）
 pub(crate) fn host_may_show() -> bool {
+    // 【二十四修·冒烟豁免】hufu-tsf-smoke 自测进程设置 HUFU_TSF_SMOKE=1：
+    // 前台焦点门只对生产宿主有意义（无控制台的测试进程前台判定随机
+    // 翻脸——本会话实测 [12] 放行、2 秒后 [18] 全拦）。冒烟显式豁免。
+    if std::env::var("HUFU_TSF_SMOKE").as_deref() == Ok("1") {
+        return true;
+    }
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
@@ -5480,24 +5465,6 @@ fn poll_tick() {
             g.cand_shown_this_segment = false;
             g.wps_caret_prev = None;
             g.wps_settle_start = None; // click_sticky 保留：上屏帧垃圾锚需黏性拦
-            // 【选重闪帧·停留钟兜底 2026-10-09】闪帧起臂的停留钟偶发
-            // 停摆（宿主线程 WM_TIMER 迟迟不分发，实测一次 3s+ 未 fire
-            // =候选窗滞留）。轮询兜底：hold 在身超 2s 仍未退场 → 真隐
-            // 藏（PostMessage 异步 SW_HIDE，不依赖动画 tick）。
-            if let Some(c) = g.cand2.as_mut() {
-                if c.is_visible() {
-                    if let Some(t0h) = c.commit_hold.get() {
-                        // 【停留可调联动 2026-10-09 三】hold_ms 可调后兜
-                        // 底阈值联动（hold_ms+1.5s），避免长暂留被误杀。
-                        if t0h.elapsed()
-                            > std::time::Duration::from_millis(c.hold_ms as u64 + 1500)
-                        {
-                            crate::tsf::diag_note("poll: 停留钟停摆兜底→真隐藏");
-                            c.hide_now();
-                        }
-                    }
-                }
-            }
             // 【皮肤热更新】断段时拉新皮肤（2.5s 过期检查在 load_skin
             // 内）：键路径不再做管道往返（性能），改皮肤下一组段生效。
             if !g.skin.is_null() {

@@ -371,434 +371,11 @@ extern "system" fn hufu_test_sound_burst() -> i32 {
     1
 }
 
-/// 测试钩子：动效端到端取证（渐隐渐显 + 注释展开延时 + 渐隐退场）。
-/// 测试窗换入 G_SHARED——走生产同款 WM_TIMER→wndproc→take/put-back
-/// 链；屏幕合成像素（GetPixel 网格）采样验证 DComp Opacity 真 ramp。
-/// 返回位掩码：bit0=渐显 ramp、bit1=注释展开变宽、bit2=隐藏收尾；
-/// 7=全通。
-#[no_mangle]
-extern "system" fn hufu_test_anim() -> i32 {
-    use crate::candwin2::{CandidateWindowV2, FADE_TICK_MS, FADE_TIMER_ID};
-    use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetWindowRect, IsWindow, IsWindowVisible, PeekMessageW, ShowWindow,
-        TranslateMessage, MSG, PM_REMOVE, SW_HIDE,
-    };
 
-    /// 合成级亮度采样：BitBlt 整窗到 DIB 后内存均值（GetPixel 逐点
-    /// ~1ms×800 点会卡死采样循环；BitBlt 整帧亚毫秒）。
-    fn sample_bright(r: &RECT) -> f64 {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{
-                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
-                ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-                SRCCOPY,
-            };
-            let w = (r.right - r.left).max(1);
-            let h = (r.bottom - r.top).max(1);
-            let screen = GetDC(None);
-            let mem = CreateCompatibleDC(screen);
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-                .unwrap_or_default();
-            if bmp.is_invalid() || bits.is_null() {
-                let _ = DeleteDC(mem);
-                ReleaseDC(None, screen);
-                return -1.0;
-            }
-            let old = SelectObject(mem, bmp);
-            let ok = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY);
-            let mut mean = -1.0f64;
-            if ok.is_ok() {
-                let px = bits as *const u8;
-                let stride = (w as usize) * 4;
-                let mut vals: Vec<f64> = Vec::new();
-                let mut y = 6usize;
-                while y + 6 < h as usize {
-                    let mut x = 8usize;
-                    while x + 8 < w as usize {
-                        let o = y * stride + x * 4;
-                        let b = *px.add(o) as f64;
-                        let g = *px.add(o + 1) as f64;
-                        let rr = *px.add(o + 2) as f64;
-                        let _ = (b, g);
-                        vals.push(rr);
-                        x += 7;
-                    }
-                    y += 7;
-                }
-                if !vals.is_empty() {
-                    // 红通道均值：纯红面板对任意桌面背景的反差载体
-                    mean = vals.iter().sum::<f64>() / vals.len() as f64;
-                }
-            }
-            SelectObject(mem, old);
-            let _ = DeleteObject(bmp);
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
-            mean
-        }
-    }
 
-    /// DWMWA_CLOAKED 读取（诊断：DComp 窗被 DWM 隐身时 rect/像素照旧但
-    /// 合成不可见——cloaked_streak 换 v1 窗正是此态）。
-    unsafe fn DwmGetWindowAttributeCloaked(hwnd: HWND, out: &mut u32) {
-        let m = windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!(
-            "dwmapi.dll"
-        ));
-        if let Ok(m) = m {
-            let p = windows::Win32::System::LibraryLoader::GetProcAddress(
-                m,
-                windows::core::s!("DwmGetWindowAttribute"),
-            );
-            if let Some(p) = p {
-                type Get = unsafe extern "system" fn(
-                    HWND,
-                    u32,
-                    *mut core::ffi::c_void,
-                    u32,
-                ) -> windows::core::HRESULT;
-                let f: Get = std::mem::transmute(p);
-                let _ = f(hwnd, 14, out as *mut u32 as *mut core::ffi::c_void, 4);
-            }
-        }
-    }
-
-    let Some(w) = CandidateWindowV2::new() else {
-        return 0;
-    };
-    let hwnd = w.hwnd;
-    // 纯红面板 + solid：只测 R 通道——任意桌面背景 R 分量都低，全显红
-    // vs 半透红反差 ~150，断言与用户屏幕内容完全解耦
-    let skin = serde_json::json!({
-        "skin": {
-            "colors": {
-                "back_color": "#FF2222FF", "border_color": "#FFFFFF40",
-                "text_color": "#FFFFFFFF", "candidate_text_color": "#FFFFFFFF",
-                "comment_text_color": "#FFDDDDFF", "label_color": "#FFFFFFCC",
-                "hilited_candidate_back_color": "#CC0000FF",
-                "hilited_candidate_text_color": "#FFFFFFFF",
-                "hilited_label_color": "#FFFFAAFF"
-            },
-            "layout": { "font_point": 17.6, "corner_radius": 8.0,
-                        "hilited_corner_radius": 6.0, "border_width": 1.0,
-                        "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0,
-                        "fade_ms": 400, "comment_delay_ms": 400 },
-            "material": { "kind": "solid" }
-        }
-    });
-    let cands = vec![
-        ("你好".to_string(), "ni hao 拆分注释很长很长".to_string()),
-        ("您好".to_string(), "nin hao 注释也长长长长".to_string()),
-        ("拟好".to_string(), "少用".to_string()),
-    ];
-    let Some(gsh) = crate::tsf::G_SHARED.get() else {
-        return 0;
-    };
-    let shared = gsh.0.clone();
-    let saved = {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.cand2.take()
-    };
-    {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.cand2 = Some(w);
-        // expand_tick 重渲染走 last_show/skin 缓存——必须与首帧一致
-        g.last_show = Some((cands.clone(), "nih".to_string(), 0));
-        g.skin = skin.clone();
-        if let Some(c) = g.cand2.as_mut() {
-            c.show(
-                &cands,
-                "nih",
-                &skin,
-                Some(&RECT {
-                    left: 160,
-                    top: 160,
-                    right: 160,
-                    bottom: 184,
-                }),
-                0,
-            );
-        }
-    }
-    let pump = || unsafe {
-        let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    };
-    // ── 机制 sanity：fade 态驱动的渲染级透明度（超长 fade≈alpha0 vs 无 fade=1）──
-    {
-        let mut r = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-        {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let (cands, raw, sel) = g.last_show.clone().unwrap();
-            let skin = g.skin.clone();
-            if let Some(c) = g.cand2.as_mut() {
-                c.fade_ms = u32::MAX;
-                c.fade = Some((true, std::time::Instant::now()));
-                c.internal_rerender = true;
-                c.show(&cands, &raw, &skin, None, sel);
-                c.internal_rerender = false;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        pump();
-        unsafe {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-        let dim = sample_bright(&r);
-        crate::tsf::trace("anim: sanity-dim 已采样");
-        {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let (cands, raw, sel) = g.last_show.clone().unwrap();
-            let skin = g.skin.clone();
-            if let Some(c) = g.cand2.as_mut() {
-                c.fade = None;
-                c.internal_rerender = true;
-                c.show(&cands, &raw, &skin, None, sel);
-                c.internal_rerender = false;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        pump();
-        unsafe {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-        let full = sample_bright(&r);
-        crate::tsf::trace("anim: sanity-full 已采样");
-        eprintln!("anim sanity: alpha≈0→{dim:.0} alpha1→{full:.0}（红通道差≥45 为机制通）");
-    }
-    // 重启一轮受时序驱动的完整动效——不走 SW_HIDE/重显（DWM 对
-    // NOREDIRECTIONBITMAP 窗 hide/show 后的合成重绑有数百 ms 迟滞，
-    // 取证会全程滞留旧帧），改用已证实的「可见窗直接改 fade 态」路径：
-    // 渐显启动 + 展开计时武装 + 注释收起复渲染
-    {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let (cands, raw, sel) = g.last_show.clone().unwrap();
-        let skin2 = g.skin.clone();
-        let empty_cands: Vec<(String, String)> = cands
-            .iter()
-            .map(|(t, _)| (t.clone(), String::new()))
-            .collect();
-        if let Some(c) = g.cand2.as_mut() {
-            // 【生产形态还原 2026-09-11】静态窄窗会被 DWM 提升到 MPO
-            // overlay（半透帧拍平）——但生产路径弹窗必经「尺寸增长」
-            // （隐藏→0 宽→内容宽），增长后表面处合成态（像素取证 #2/#3
-            // 双证）。本块复刻该序列：先宽渲染（窗口 188→348 增长），
-            // 再切收起内容 + 启动渐显（no-shrink 保窗口 348）。
-            // 清残留计时器：初显武装的展开定时器会在中途触发搅局。
-            let _ = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::KillTimer(
-                    c.hwnd,
-                    crate::candwin2::EXPAND_TIMER_ID,
-                )
-            };
-            let _ = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::KillTimer(c.hwnd, FADE_TIMER_ID)
-            };
-            c.comments_expanded = true;
-            c.fade = None;
-            c.internal_rerender = true;
-            c.show(
-                &cands,
-                &raw,
-                &skin2,
-                Some(&RECT {
-                    left: 160,
-                    top: 160,
-                    right: 160,
-                    bottom: 184,
-                }),
-                0,
-            );
-            c.internal_rerender = false;
-            c.comments_expanded = false;
-            c.fade = Some((true, std::time::Instant::now()));
-            let _ = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::SetTimer(
-                    c.hwnd,
-                    FADE_TIMER_ID,
-                    FADE_TICK_MS,
-                    None,
-                )
-            };
-            // 内部渲染不走 show() 的展开武装分支（internal_rerender 抑制
-            // 重置）——手动武装，等价生产「停手 400ms 展开」
-            let _ = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::SetTimer(
-                    c.hwnd,
-                    crate::candwin2::EXPAND_TIMER_ID,
-                    400,
-                    None,
-                )
-            };
-            c.internal_rerender = true;
-            c.show(
-                &cands,
-                &raw,
-                &skin2,
-                Some(&RECT {
-                    left: 160,
-                    top: 160,
-                    right: 160,
-                    bottom: 184,
-                }),
-                0,
-            );
-            c.internal_rerender = false;
-        }
-    }
-    crate::tsf::trace("anim: restart show 完成，进入计时循环");
-    let mut bright_early = -1.0f64;
-    let mut bright_late = -1.0f64;
-    let mut w_narrow = 0i32;
-    let mut w_wide = 0i32;
-    let mut diag_last = 0u128;
-    let t0 = std::time::Instant::now();
-    // fade_ms=400（慢速取证）：早段半透（亮）vs 全显（暗），桌面捕获
-    // 滞后 ~1-2 帧在 400ms 尺度下可忽略
-    while t0.elapsed().as_millis() < 900 {
-        pump();
-        // 打字期静默豁免：smoke 控制台非前台，poll 前台兜底会 110ms
-        // 收走测试窗——持续刷新 last_key_at 令 poll 跳拍（既有语义）
-        {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.last_key_at = Some(std::time::Instant::now());
-        }
-        let mut r = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-        // 【内容区取样】窗口 rect 有透明余量（MIN_ANIM_W 反 MPO），
-        // 亮度采样与宽度计量都取内容实际宽
-        let (cw, ch) = {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.cand2
-                .as_ref()
-                .map(|c| c.content_size.get())
-                .unwrap_or((0, 0))
-        };
-        let content_rect = RECT {
-            left: r.left,
-            top: r.top,
-            right: r.left + cw.max(60),
-            bottom: r.top + ch.max(40),
-        };
-        let t = t0.elapsed().as_millis();
-        if t - diag_last >= 500 {
-            let alive = unsafe { IsWindow(hwnd) };
-            let vis = unsafe { IsWindowVisible(hwnd) };
-            let mut cloaked = 0u32;
-            unsafe { DwmGetWindowAttributeCloaked(hwnd, &mut cloaked) };
-            eprintln!(
-                "anim diag t={t} rect=({},{},{},{}) alive={} vis={} cloaked=0x{cloaked:X}",
-                r.left,
-                r.top,
-                r.right,
-                r.bottom,
-                alive.as_bool(),
-                vis.as_bool()
-            );
-        }
-        let wpx = content_rect.right - content_rect.left;
-        // 【t≈450 手动暗帧探针】已退役（根因定位完毕：MPO 小窗提升）
-        if t - diag_last >= 50 {
-            diag_last = t;
-            let fa = {
-                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                g.cand2.as_ref().map(|c| c.fade_alpha()).unwrap_or(-1.0)
-            };
-            eprintln!(
-                "anim curve t={t} fade_a={fa:.2} R={:.0}",
-                sample_bright(&content_rect)
-            );
-        }
-        if (50..150).contains(&t) && bright_early < 0.0 {
-            bright_early = sample_bright(&content_rect);
-        }
-        if (620..760).contains(&t) && bright_late < 0.0 {
-            bright_late = sample_bright(&content_rect);
-        }
-        if (240..380).contains(&t) && wpx > w_narrow {
-            w_narrow = wpx;
-        }
-        if t >= 560 && wpx > w_wide {
-            w_wide = wpx;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(6));
-    }
-    // 收尾：hide() 异步 → 即时隐藏（退场动画已退役）
-    {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = g.cand2.as_mut() {
-            c.hide();
-        }
-    }
-    let mut hidden = false;
-    let t1 = std::time::Instant::now();
-    while t1.elapsed().as_millis() < 600 {
-        pump();
-        {
-            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.last_key_at = Some(std::time::Instant::now());
-        }
-        if !unsafe { IsWindowVisible(hwnd).as_bool() } {
-            hidden = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-    pump();
-    // 清理：销毁测试窗、恢复原窗
-    {
-        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let mine = g.cand2.take();
-        drop(mine);
-        g.cand2 = saved;
-    }
-    let mut mask = 0u32;
-    // 红通道渐显：early（半透，R 中等）应显著低于 late（全显，R 满）
-    if bright_late - bright_early >= 45.0 {
-        mask |= 1;
-    }
-    if w_wide > w_narrow + 20 {
-        mask |= 2;
-    }
-    if hidden {
-        mask |= 4;
-    }
-    eprintln!(
-        "anim: 渐显(R) 早={:.0} 晚={:.0}（观察项：DWM/MPO 会拍平底显） 宽 {}→{}（+20 判过） 隐藏={} mask={:03b}",
-        bright_early, bright_late, w_narrow, w_wide, hidden, mask
-    );
-    // 【断言口径】bit1（注释延时展开）+ bit2（渐隐隐藏）为确定性特性；
-    // bit0（渐显亮度 ramp）受 DWM MPO 提升影响不可靠——观察项，返回
-    // 原始 mask 由调用方按口径断言。
-    mask as i32
-}
-
-/// 测试钩子：动效×缩放比例 100%~500% 矩阵（HUFU_FAKE_DPI 伪造高 DPI，
-/// 与阴影缩放取证同款旋钮）。每个比例跑完整入场动效周期：首显起臂
-/// （size_anim 武装）→ tick 推进到完成（chrome_override 清空）→ 渲染
-/// 尺寸随比例放大（≥100%×基础）。返回位掩码 bit_i=第 i 档通过，
+/// 测试钩子：尺寸动效（变宽变窄）×缩放比例 100%~500% 矩阵（HUFU_FAKE_DPI
+/// 伪造高 DPI）。每档：窄窗稳态 → 换宽内容（delta>24px）→ size_anim 起臂
+/// → tick 推进完成 → 渲染宽随比例放大。返回位掩码 bit_i=第 i 档通过，
 /// 0x1FF=9 档全通（100/125/150/175/200/250/300/400/500%）。
 #[no_mangle]
 extern "system" fn hufu_test_anim_scales() -> i32 {
@@ -830,6 +407,12 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         ("您好".to_string(), "".to_string()),
         ("拟好".to_string(), "少用".to_string()),
     ];
+    // 【二十四修改写】入场已退役——改测「变宽变窄」尺寸动效：
+    let narrow = vec![
+        ("你好".to_string(), "ni".to_string()),
+        ("您好".to_string(), String::new()),
+    ];
+    let wide = cands.clone(); // 带长注释（ni hao …）
     let anchor = RECT {
         left: 160,
         top: 160,
@@ -856,15 +439,55 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             g.cand2 = Some(w);
-            g.last_show = Some((cands.clone(), "nih".to_string(), 0));
             g.skin = skin.clone();
+            // 稳态窄窗：首显直接全尺寸（无入场动效）
+            g.last_show = Some((narrow.clone(), "nih".to_string(), 0));
             if let Some(c) = g.cand2.as_mut() {
-                // 静默门外（首显）→ 高亮锚定入场起臂
-                c.last_hide_at = None;
-                c.show(&cands, "nih", &skin, Some(&anchor), 0);
+                c.show(&narrow, "nih", &skin, Some(&anchor), 0);
             }
         }
-        // 起臂判定：入场动画已武装
+        // 窄稳态收敛：等窗真正可见。首档 DWrite/D2D 冷启动时首次
+        // ensure_swapchain 可能失败（show 早退窗不可见）→ 宽帧会走
+        // 首显直达路径不起臂——可见前重试窄显（≤3 次）。
+        for attempt in 0..3u32 {
+            let t_st = std::time::Instant::now();
+            while t_st.elapsed().as_millis() < 300 {
+                unsafe {
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&mut msg);
+                        DispatchMessageW(&mut msg);
+                    }
+                }
+                if unsafe { IsWindowVisible(hwnd).as_bool() } {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+            if unsafe { IsWindowVisible(hwnd).as_bool() } {
+                break;
+            }
+            let _ = attempt;
+            // 冷启动重试：再窄显一次（下次 ensure_swapchain 已热）
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.last_show = Some((narrow.clone(), "nih".to_string(), 0));
+                if let Some(c) = g.cand2.as_mut() {
+                    c.show(&narrow, "nih", &skin, Some(&anchor), 0);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30)); // 可见后再稳一拍
+        // 变宽起臂：换宽内容（阈值 24px 以上 → size_anim 武装）
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.last_show = Some((wide.clone(), "nih".to_string(), 0));
+            if let Some(c) = g.cand2.as_mut() {
+                c.show(&wide, "nih", &skin, Some(&anchor), 0);
+            }
+        }
+
+        // 起臂判定：变宽动画已武装
         let armed = {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             g.cand2

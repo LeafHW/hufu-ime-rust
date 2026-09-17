@@ -473,12 +473,8 @@ pub struct AppearanceSection {
     pub anim: bool,
     /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0~2，0=瞬跳）
     pub anim_speed: f32,
-    /// 【上屏暂留开关 2026-10-09 十三】上屏后延时收候选（暂留）总开关
-    /// （false=上屏立即收，与动效开关独立——动效管"怎么动"，这个管
-    /// "留不留"）
-    pub commit_hold: bool,
-    /// 【上屏暂留时长 2026-10-09 十三】暂留毫秒（100~2000，默认 1000）
-    pub commit_hold_ms: u32,
+    // 【二十四修·动效大瘦身】上屏暂留（commit_hold/commit_hold_ms）
+    // 已整体退役——上屏即收；字段删除，旧配置文件多余键自动忽略。
 }
 
 impl Default for AppearanceSection {
@@ -490,9 +486,6 @@ impl Default for AppearanceSection {
             status_capsule: true,
             anim: true,
             anim_speed: 1.0,
-            commit_hold: true,
-            // 【2026-10-09 默认调整】上屏后延时收候选 0.5s（用户定稿，原 1s）
-            commit_hold_ms: 500,
         }
     }
 }
