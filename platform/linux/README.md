@@ -87,6 +87,23 @@ fcitx5-configtool            # 输入法 → 添加「虎符」
 首次安装生成 `数据/config.json`：默认方案 `虎码字词`；反查/拆分/音效默认关
 （对应资源未就位，后续补齐）。
 
+## 回归电池（Unix socket）
+
+```sh
+# 1) 专用数据目录 + 专用 runtime 起一个测试 server（不碰日常安装）
+mkdir -p _tmp/battery/数据 _tmp/battery/模型 && cp -r ~/.local/share/hufu/码表 _tmp/battery/
+cp ~/.local/share/hufu/数据/config.json _tmp/battery/数据/
+XDG_RUNTIME_DIR=/tmp/hufu-battery engine/target/release/hufu-server \
+    --data _tmp/battery/数据 --port 4393 &
+
+# 2) 18 项电池：协议/键流（候选、数字选重、; 次选、退格、Esc、顶屏、空格上屏）/
+#    方案列表与切换/音效开关/focus/reset/HTTP（state、schemas、设置页）
+XDG_RUNTIME_DIR=/tmp/hufu-battery HUFU_PORT=4393 \
+    cargo run --release -p hufu-cli --example socketbattery
+```
+
+Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
+
 ## 与 Windows / macOS 前端对齐
 
 | 能力 | Windows TSF | macOS IMK | Linux fcitx5 |

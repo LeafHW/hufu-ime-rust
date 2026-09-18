@@ -86,6 +86,7 @@ hufu/
 - 引擎 workspace：**95 测试 0 失败**（Linux/Windows 双端跑；1 个作者本机对照件默认 `#[ignore]`）（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/Shift 标点/音效标签/皮肤/配置/GGUF f16/GEMM/q8 对 llama.cpp F32 基准/wav 解析）
 - Linux 前端单测：hufu-fcitx5-client 4/4（mock socket：commit/update/回删/透传/断线直通）
 - Linux 冒烟：真实码表 server + Unix socket（ping/key/state/中英切换）+ HTTP 设置页 + 三方案装配（脚本 `_tmp/dev-data/smoke.py`）
+- Linux 回归电池：`cargo run -p hufu-cli --example socketbattery` **18/18**（协议帧/键流：候选·数字选重·`;` 次选·退格·Esc·顶屏·空格上屏/方案列表与切换/音效开关/focus·reset/HTTP）
 - 管道回归电池：lock 12/12、battery2 16/16、edge 17/17、flow 全过、设置生效性 7/7（皮肤热反映/横排/序号/延时/音效/调整日志）
 - Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
 - 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效
