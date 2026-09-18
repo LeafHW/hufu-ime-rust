@@ -78,9 +78,11 @@ std::string keyNameOf(const fcitx::Key &key) {
     case FcitxKey_End: return "end";
     case FcitxKey_Prior: return "pageup";
     case FcitxKey_Next: return "pagedown";
-    case FcitxKey_Caps_Lock: return "capslock";
-    case FcitxKey_Shift_L: return "shift";
-    case FcitxKey_Shift_R: return "shiftright";
+    // 【Linux 策略 2026-09-19】不向引擎转发独立的 Shift/CapsLock：
+    // Linux 的英文输入由 fcitx5 键盘布局（keyboard-us 等）提供，
+    // 引擎不应自带中英切换（Shift 单击切中英 / Caps 切英文）。
+    // 说明：Shift+标点（Shift+, → 《）等带修饰的可打印键不受影响，
+    // 仍按「基准字符 + shift」转发给引擎处理。
     case FcitxKey_Control_L: return "ctrl";
     case FcitxKey_Control_R: return "ctrlright";
     case FcitxKey_Alt_L: return "alt";
@@ -167,14 +169,8 @@ public:
         resetSession(event);
     }
 
-    /// 状态栏副模式：中/英（引擎侧中英态）。
-    std::string subMode(const fcitx::InputMethodEntry & /*entry*/,
-                        fcitx::InputContext & /*inputContext*/) override {
-        if (engine_ == nullptr) {
-            return {};
-        }
-        return hufu_client_chinese(engine_) == 1 ? "中" : "英";
-    }
+    // 【Linux 策略】不实现 subMode()：中/英副模式属引擎自带英文输入，
+    // Linux 上英文由 fcitx5 键盘布局输入法提供，状态栏不再显示中/英。
 
 private:
     /// 清引擎会话 + UI（activate/deactivate/reset 共用）。

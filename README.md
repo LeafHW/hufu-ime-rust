@@ -79,14 +79,14 @@ hufu/
 | `hufu-server` + 设置 GUI | ✅          | 20 REST 路由（+候选置顶/隐藏/音效试听/全量快照导出）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/音效开关+试听/繁简开关/快照导出/导入导出） |
 | Windows TSF              | ✅ 真机全通 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；**系统级激活实测**：Win+空格 第 4 项（虎图标）、汉字上屏、候选窗贴光标跟随、选区顺序正确；**应用矩阵**：记事本/浏览器/VSCode/QQ/DSH/Listary 全通过。注册九步一键化（install.ps1 + reg-fix.ps1）；DLL 轨迹日志 `%TEMP%\hufu-tsf-trace.log`。运行时铁律：EditSession 用 ASYNCDONTCARE、组段走 GetSelection→StartComposition、GetTextExt 即屏幕坐标 |
 | macOS IMK                | 🔨 骨架     | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
-| Linux fcitx5             | ✅ 可用     | `platform/linux`：Rust staticlib（Unix socket 客户端 + C ABI）+ C++ 薄壳（~300 行）；候选/组段/上屏/中英副模式；install.sh 系统级装 addon + systemd user 服务托管引擎 + zhmn 码表装配；**待实机 fcitx5 全量回归** |
+| Linux fcitx5             | ✅ 可用     | `platform/linux`：Rust staticlib（Unix socket 客户端 + C ABI）+ C++ 薄壳（~300 行）；候选/组段/上屏；**英文输入由 fcitx5 键盘布局提供**（引擎不带中英切换，Shift/Caps 不下发）；install.sh 系统级装 addon + systemd user 服务托管引擎 + zhmn 码表装配；**待实机 fcitx5 全量回归** |
 
 ### 测试
 
 - 引擎 workspace：**95 测试 0 失败**（Linux/Windows 双端跑；1 个作者本机对照件默认 `#[ignore]`）（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/Shift 标点/音效标签/皮肤/配置/GGUF f16/GEMM/q8 对 llama.cpp F32 基准/wav 解析）
 - Linux 前端单测：hufu-fcitx5-client 4/4（mock socket：commit/update/回删/透传/断线直通）
 - Linux 冒烟：真实码表 server + Unix socket（ping/key/state/中英切换）+ HTTP 设置页 + 三方案装配（脚本 `_tmp/dev-data/smoke.py`）
-- Linux 回归电池：`cargo run -p hufu-cli --example socketbattery` **18/18**（协议帧/键流：候选·数字选重·`;` 次选·退格·Esc·顶屏·空格上屏/方案列表与切换/音效开关/focus·reset/HTTP）
+- Linux 回归电池：`cargo run -p hufu-cli --example socketbattery` **22/22**（协议帧/键流：候选·数字选重·`;` 次选·`'` 三选·退格·Esc·顶屏·空格上屏·`-/=` 翻页/方案列表与切换/音效开关/Shift·Caps 不切中英（Linux 策略）/focus·reset/HTTP）
 - 管道回归电池：lock 12/12、battery2 16/16、edge 17/17、flow 全过、设置生效性 7/7（皮肤热反映/横排/序号/延时/音效/调整日志）
 - Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
 - 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效

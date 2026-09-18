@@ -96,13 +96,28 @@ cp ~/.local/share/hufu/数据/config.json _tmp/battery/数据/
 XDG_RUNTIME_DIR=/tmp/hufu-battery engine/target/release/hufu-server \
     --data _tmp/battery/数据 --port 4393 &
 
-# 2) 18 项电池：协议/键流（候选、数字选重、; 次选、退格、Esc、顶屏、空格上屏）/
-#    方案列表与切换/音效开关/focus/reset/HTTP（state、schemas、设置页）
+# 2) 22 项电池：协议/键流（候选、数字选重、; 次选、' 三选、退格、Esc、顶屏、
+#    空格上屏、-/= 翻页）/方案列表与切换/音效开关/Shift·Caps 不切中英（Linux 策略）/
+#    focus/reset/HTTP（state、schemas、设置页）
 XDG_RUNTIME_DIR=/tmp/hufu-battery HUFU_PORT=4393 \
     cargo run --release -p hufu-cli --example socketbattery
 ```
 
 Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
+
+## 中英切换 / 英文输入（Linux 策略）
+
+Linux 上**引擎不自带英文输入**：英文由 fcitx5 的键盘布局输入法提供
+（`Ctrl+Space` 切到 `keyboard-us*` 布局）。因此：
+
+- addon 不向引擎转发独立的 `Shift` / `CapsLock` 按键（`Shift`+标点等
+  带修饰键的可打印键不受影响，`Shift+,` → 《 照常）；
+- 引擎默认配置关闭中英切换：`general.shift_switch=false`、
+  `ctrl_space_switch=false`、`caps_action=None`（`install.sh` 生成）；
+- 设置页在非 Windows 平台隐藏这组「中英切换」开关（`/api/platform` 门控）；
+- 引擎 `chinese` 恒为中文态，状态栏不显示中/英副模式。
+
+Windows 侧行为不变（仍由引擎自带中英切换）。
 
 ## 与 Windows / macOS 前端对齐
 

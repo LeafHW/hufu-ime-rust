@@ -715,6 +715,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         ("GET", "/api/config") => {
             Response::json(&serde_json::to_value(&host.engine.config).unwrap())
         }
+        ("GET", "/api/platform") => Response::json(&serde_json::json!({
+            // 平台标识（设置页据此隐藏平台无关项：Linux 不用引擎自带中英切换）
+            "os": std::env::consts::OS,
+        })),
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表

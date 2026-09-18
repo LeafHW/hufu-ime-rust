@@ -110,16 +110,22 @@ assemble_data() {
         echo "  ✓ 数据/转换词典/ ← opencc/"
     fi
 
-    # 首次安装写默认配置：默认方案=虎码字词；反查/拆分/音效先关（资源未就位）
+    # 首次安装写默认配置：默认方案=虎码字词；反查/拆分/音效先关（资源未就位）；
+    # 中英切换交由 fcitx5 键盘布局（Linux 不用引擎自带英文输入）。
     if [[ ! -f "$DATA_DIR/config.json" ]]; then
         cat > "$DATA_DIR/config.json" <<'JSON'
 {
   "schema": { "dir": "码表", "current": "虎码字词" },
   "reverse": { "scheme": "" },
-  "candidates": { "split_scheme": "" }
+  "candidates": { "split_scheme": "" },
+  "general": {
+    "shift_switch": false,
+    "ctrl_space_switch": false,
+    "caps_action": "None"
+  }
 }
 JSON
-        echo "  ✓ 生成 数据/config.json（默认方案：虎码字词）"
+        echo "  ✓ 生成 数据/config.json（默认方案：虎码字词；中英切换交由 fcitx5 布局）"
     else
         echo "  · 已存在 数据/config.json，保持不动（如需切换默认方案请在设置页操作）"
     fi
@@ -141,8 +147,11 @@ install_user() {
 
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         systemctl --user daemon-reload
-        systemctl --user enable --now hufu-server.service
-        echo '  ✓ systemd user 服务已启动（hufu-server.service）'
+        systemctl --user enable hufu-server.service
+        # 【必须 restart】enable --now 对已运行服务不重启——升级二进制后
+        # 旧进程继续服务（/api/platform 曾因此 404）。
+        systemctl --user restart hufu-server.service
+        echo '  ✓ systemd user 服务已重启（hufu-server.service）'
     else
         echo '  · 无 systemd user 会话：请手动运行 hufu-server（~/.local/bin/hufu-server）'
     fi

@@ -246,6 +246,75 @@ mod imp {
         );
         let _ = c.call(serde_json::json!({"op": "sound_toggle"})); // 还原
 
+        // ── 翻页（默认 -/=/[/] 等由配置决定；引擎消费）──
+        c.reset();
+        let _ = c.key("t");
+        let _ = c.key("i");
+        let page0_first = c.candidates().first().cloned().unwrap_or_default();
+        let _ = c.key("=");
+        let st = c.call(serde_json::json!({"op": "state"}));
+        let page1 = st["state"]["page"].as_u64().unwrap_or(0);
+        let page1_first = c.candidates().first().cloned().unwrap_or_default();
+        c.check(
+            "19. = 翻到第 2 页且候选变化",
+            page1 == 1 && !page1_first.is_empty() && page1_first != page0_first,
+            &format!("page={page1} first={page1_first} (原 {page0_first})"),
+        );
+        let _ = c.key("-");
+        let st = c.call(serde_json::json!({"op": "state"}));
+        c.check(
+            "20. - 翻回第 1 页",
+            st["state"]["page"].as_u64() == Some(0),
+            &st["state"]["page"].to_string(),
+        );
+
+        // ── 三选键（'）──
+        c.reset();
+        let _ = c.key("t");
+        let _ = c.key("i");
+        let cands = c.candidates();
+        if cands.len() >= 3 {
+            let third = cands[2].clone();
+            c.reset();
+            let _ = c.key("t");
+            let _ = c.key("i");
+            let o = c.key("'");
+            c.check(
+                "21. ' 三选上屏第 3 候选",
+                o["commit"].as_str() == Some(third.as_str()),
+                &format!("commit={:?} 期望={third}", o["commit"]),
+            );
+        } else {
+            c.check("21. ' 三选（数据候选不足，跳过）", true, "");
+        }
+        c.reset();
+
+        // ── Linux 策略：引擎不自带中英切换（英文输入交给 fcitx5 键盘布局）──
+        let (_, cfg_body) = c.http("/api/config");
+        let shift_off = serde_json::from_str::<serde_json::Value>(&cfg_body)
+            .ok()
+            .and_then(|v| v["general"]["shift_switch"].as_bool())
+            .map(|v| !v)
+            .unwrap_or(false);
+        if shift_off {
+            let _ = c.call(serde_json::json!({"op": "reset"}));
+            let before = c.call(serde_json::json!({"op": "state"}))["state"]["chinese"]
+                .as_bool()
+                .unwrap_or(true);
+            let _ = c.key("shift");
+            let _ = c.key("capslock");
+            let after = c.call(serde_json::json!({"op": "state"}))["state"]["chinese"]
+                .as_bool()
+                .unwrap_or(true);
+            c.check(
+                "22. Shift/Caps 不切中英（Linux 策略）",
+                before == after,
+                &format!("chinese {before} → {after}"),
+            );
+        } else {
+            c.check("22. Shift/Caps 不切中英（配置未关闭，跳过）", true, "");
+        }
+
         // ── 焦点/reset 幂等 ──
         let _ = c.key("t");
         let _ = c.call(serde_json::json!({"op": "focus"}));
