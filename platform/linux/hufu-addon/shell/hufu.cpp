@@ -125,7 +125,12 @@ public:
             return; // 引擎只处理按下
         }
         fcitx::InputContext *inputContext = keyEvent.inputContext();
-        const fcitx::Key &key = keyEvent.key();
+        // 【Shift 修饰修复 2026-09-19】`key()` 是「归一化」事件：Shift+符号
+        // 时 Shift 被并入符号本身（states 里不再有 Shift），引擎会当成
+        // 「无 shift 的普通键」——实测 Shift+, 出「，」而非《、Shift+字母
+        // 被当编码。`rawKey()` 是布局转换后、保留真实修饰态的原始事件
+        //（日志实测：Shift+a → Key(A states=0) / rawKey Key(Shift+A states=1)）。
+        const fcitx::Key &key = keyEvent.rawKey();
         const std::string name = keyNameOf(key);
         if (name.empty()) {
             return; // 不归本引擎：透传
