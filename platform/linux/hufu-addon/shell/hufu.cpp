@@ -250,6 +250,25 @@ private:
             return;
         }
         const std::string rawString = raw != nullptr ? raw : "";
+        const std::string preeditString = preedit != nullptr ? preedit : "";
+        const std::string auxString = aux != nullptr ? aux : "";
+        // 【切换气泡修复 2026-09-19】没有我方内容时**完全不碰输入面板**：
+        // fcitx5 的「输入法信息」气泡画在 InputPanel overlay 上，只在面板
+        // 为空时显示；此前 activate/deactivate（无组段也）无条件下发
+        // setPreedit/候选/aux + updateUserInterface，把别的输入法/系统刚
+        // 弹的气泡顶掉——用户实测：虎符在输入法列表里时，切换气泡全部
+        // 不显示（删掉虎符即恢复）。
+        const bool hadComposition = hasComposition_;
+        const bool emptyState = count <= 0 && rawString.empty() &&
+                                preeditString.empty() && auxString.empty();
+        hasComposition_ = count > 0 || !rawString.empty();
+        topCommit_ = (count > 0 && commitTexts != nullptr &&
+                      commitTexts[0] != nullptr)
+                         ? commitTexts[0]
+                         : "";
+        if (emptyState && !hadComposition) {
+            return; // 面板本来就没有我方内容：不发 UI 更新（保护系统 overlay）
+        }
         // 【选重闪帧】数字/; 选重上屏：引擎回「raw 空 + 旧候选 + 高亮」的
         // 确认帧（raw/preedit 已清）。Windows 侧靠 150ms 收场钟清窗；
         // Linux 无皮肤动效，直接清（否则候选窗滞留——用户实测反馈）。
@@ -265,12 +284,6 @@ private:
                 fcitx::UserInterfaceComponent::InputPanel);
             return;
         }
-        hasComposition_ = count > 0 || !rawString.empty();
-        topCommit_ = (count > 0 && commitTexts != nullptr &&
-                      commitTexts[0] != nullptr)
-                         ? commitTexts[0]
-                         : "";
-        const std::string preeditString = preedit != nullptr ? preedit : "";
         const fcitx::Text preeditText(preeditString);
         context_->inputPanel().setPreedit(preeditText);
         // 客户端内联预编辑：跟随 fcitx5 全局预编辑设置
