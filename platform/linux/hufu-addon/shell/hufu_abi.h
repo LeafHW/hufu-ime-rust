@@ -29,6 +29,7 @@ typedef struct hufu_host {
     void (*update)(void *user, const char *preedit_utf8, const char *raw_utf8,
                    const char *const *candidate_texts,
                    const char *const *candidate_comments,
+                   const char *const *candidate_commit_texts,
                    int32_t candidate_count, int32_t candidate_selected,
                    const char *aux_utf8, int32_t chinese);
 } hufu_host;

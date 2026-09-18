@@ -115,7 +115,10 @@ Linux 上**引擎不自带英文输入**：英文由 fcitx5 的键盘布局输�
 - 引擎默认配置关闭中英切换：`general.shift_switch=false`、
   `ctrl_space_switch=false`、`caps_action=None`（`install.sh` 生成）；
 - 设置页在非 Windows 平台隐藏这组「中英切换」开关（`/api/platform` 门控）；
-- 引擎 `chinese` 恒为中文态，状态栏不显示中/英副模式。
+- 引擎 `chinese` 恒为中文态，状态栏不显示中/英副模式；
+- **有编码/候选态按 `Shift`+字母**：引擎对编码态 `Shift`+字母是「吞键」
+  语义（Windows 防漏进宿主）；Linux 侧壳按「**首选上屏 + 打字母**」处理
+  （顶字：首选候选上屏 → 清组段 → 字母交回应用）。
 
 Windows 侧行为不变（仍由引擎自带中英切换）。
 

@@ -31,9 +31,10 @@ pub const HUFU_KEY_BACK_SHIFT: u32 = 8;
 ///
 /// - `commit`：立即上屏文本（UTF-8，NUL 结尾）。
 /// - `update`：UI 快照——preedit + raw（UTF-8；raw 空且候选非空=选重闪帧，
-///   壳应直接清窗）+ 候选文本/注释数组（各 NUL 结尾；`count==0` 时必须清除
-///   候选列表）+ 高亮索引（页内 0 起）+ aux 提示 + 中英态（1=中）。
-///   回调期指针有效，C++ 侧须同步拷走。
+///   壳应直接清窗）+ 候选文本/注释/实际上屏文本三个平行数组（各 NUL 结尾；
+///   `count==0` 时必须清除候选列表）+ 高亮索引（页内 0 起）+ aux 提示 +
+///   中英态（1=中）。回调期指针有效，C++ 侧须同步拷走。
+///   上屏文本数组用于「顶字」：`显示=>输出` 覆盖时与显示文本不同。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HufuHost {
@@ -44,6 +45,7 @@ pub struct HufuHost {
             *mut c_void,
             *const c_char,
             *const c_char,
+            *const *const c_char,
             *const *const c_char,
             *const *const c_char,
             c_int,
@@ -62,8 +64,11 @@ struct Scratch {
     aux: CString,
     texts: Vec<CString>,
     comments: Vec<CString>,
+    /// 候选的实际上屏文本（commit_override 优先；顶字用）
+    commits: Vec<CString>,
     text_ptrs: Vec<*const c_char>,
     comment_ptrs: Vec<*const c_char>,
+    commit_ptrs: Vec<*const c_char>,
 }
 
 /// 前置声明：默认 socket 路径（`$XDG_RUNTIME_DIR/hufu-ime.sock`，回退 `/tmp`）。
@@ -285,8 +290,14 @@ impl HufuClient {
             .iter()
             .map(|c| CString::new(c.comment.as_str()).unwrap_or_default())
             .collect();
+        self.scratch.commits = state
+            .candidates
+            .iter()
+            .map(|c| CString::new(c.commit_text()).unwrap_or_default())
+            .collect();
         self.scratch.text_ptrs = self.scratch.texts.iter().map(|c| c.as_ptr()).collect();
         self.scratch.comment_ptrs = self.scratch.comments.iter().map(|c| c.as_ptr()).collect();
+        self.scratch.commit_ptrs = self.scratch.commits.iter().map(|c| c.as_ptr()).collect();
         self.chinese = state.chinese;
         if let Some(cb) = self.host.update {
             unsafe {
@@ -296,6 +307,7 @@ impl HufuClient {
                     self.scratch.raw.as_ptr(),
                     self.scratch.text_ptrs.as_ptr(),
                     self.scratch.comment_ptrs.as_ptr(),
+                    self.scratch.commit_ptrs.as_ptr(),
                     self.scratch.texts.len() as c_int,
                     state.selected as c_int,
                     self.scratch.aux.as_ptr(),
@@ -451,8 +463,8 @@ mod tests {
     #[derive(Default)]
     struct Capture {
         commits: Vec<String>,
-        /// (preedit, raw, candidates, selected, chinese)
-        updates: Vec<(String, String, Vec<String>, usize, bool)>,
+        /// (preedit, raw, candidates, commit_texts, selected, chinese)
+        updates: Vec<(String, String, Vec<String>, Vec<String>, usize, bool)>,
     }
 
     fn cap_mut<'a>(user: *mut c_void) -> &'a mut Capture {
@@ -470,6 +482,7 @@ mod tests {
         raw: *const c_char,
         texts: *const *const c_char,
         _comments: *const *const c_char,
+        commits: *const *const c_char,
         count: c_int,
         selected: c_int,
         _aux: *const c_char,
@@ -480,14 +493,18 @@ mod tests {
             .into_owned();
         let raw = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
         let mut cands = Vec::new();
+        let mut commits_v = Vec::new();
         for i in 0..count.max(0) as isize {
             let p = unsafe { *texts.offset(i) };
             cands.push(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+            let cp = unsafe { *commits.offset(i) };
+            commits_v.push(unsafe { CStr::from_ptr(cp) }.to_string_lossy().into_owned());
         }
         cap_mut(user).updates.push((
             pre,
             raw,
             cands,
+            commits_v,
             selected.max(0) as usize,
             chinese == 1,
         ));
@@ -581,8 +598,13 @@ mod tests {
             cap.updates[0].2,
             vec!["的".to_string(), "得".to_string()]
         );
-        assert_eq!(cap.updates[0].3, 1);
-        assert!(cap.updates[0].4);
+        assert_eq!(
+            cap.updates[0].3,
+            vec!["的".to_string(), "得".to_string()],
+            "上屏文本数组（无 commit_override 时=显示文本）"
+        );
+        assert_eq!(cap.updates[0].4, 1);
+        assert!(cap.updates[0].5);
         handle.join().unwrap();
     }
 

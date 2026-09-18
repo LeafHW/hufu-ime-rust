@@ -136,6 +136,25 @@ public:
             return; // 不归本引擎：透传
         }
         const auto states = key.states();
+        // 【Shift+字母（有编码/候选态）2026-09-19】引擎在编码态对 Shift+字母
+        // 返回「吞键」（Windows 语义：防漏进宿主）；Linux 无引擎英文态，
+        // 产品口径=「首选上屏 + 打字母」：顶字首选 → 清组段 → 字母交回应用。
+        if (states.test(fcitx::KeyState::Shift) && hasComposition_ &&
+            name.size() == 1 && name[0] >= 'a' && name[0] <= 'z') {
+            // 【context_ 必须置位 2026-09-19】focus() 会同步回调 update，
+            // 用它来清候选窗；applyUpdate 在 context_ 为空时直接返回——
+            // 漏置位=上屏后候选窗滞留（用户实测复现）。
+            context_ = inputContext;
+            if (!topCommit_.empty()) {
+                inputContext->commitString(topCommit_);
+            }
+            hufu_client_focus(engine_); // 清引擎组段并同步清 UI
+            inputContext->forwardKey(keyEvent.rawKey(), keyEvent.isRelease(),
+                                     keyEvent.time());
+            context_ = nullptr;
+            keyEvent.filterAndAccept();
+            return;
+        }
         // 行尾提示：周边文本可用时上报（组段逼近右缘的提前上屏放宽用）
         int32_t lineEnd = -1;
         const auto &surrounding = inputContext->surroundingText();
@@ -191,12 +210,14 @@ private:
 
     static void updateCallback(void *user, const char *preedit, const char *raw,
                                const char *const *texts,
-                               const char *const *comments, int32_t count,
+                               const char *const *comments,
+                               const char *const *commitTexts, int32_t count,
                                int32_t selected, const char *aux,
                                int32_t chinese) {
         static_cast<HufuEngine *>(user)->applyUpdate(preedit, raw, texts,
-                                                     comments, count, selected,
-                                                     aux, chinese);
+                                                     comments, commitTexts,
+                                                     count, selected, aux,
+                                                     chinese);
     }
 
     /// 上屏：先按引擎回删数清掉已上屏字符（如「1.」→「。」），再提交。
@@ -219,10 +240,12 @@ private:
     }
 
     /// UI 快照：preedit（面板 + 客户端内联）+ 候选列表 + aux。
+    /// `commitTexts`：候选的实际上屏文本（`显示=>输出` 覆盖时与显示不同），
+    /// 顶字（Shift+字母）用。
     void applyUpdate(const char *preedit, const char *raw,
                      const char *const *texts, const char *const *comments,
-                     int32_t count, int32_t selected, const char *aux,
-                     int32_t chinese) {
+                     const char *const *commitTexts, int32_t count,
+                     int32_t selected, const char *aux, int32_t chinese) {
         if (context_ == nullptr) {
             return;
         }
@@ -231,6 +254,8 @@ private:
         // 确认帧（raw/preedit 已清）。Windows 侧靠 150ms 收场钟清窗；
         // Linux 无皮肤动效，直接清（否则候选窗滞留——用户实测反馈）。
         if (rawString.empty() && count > 0) {
+            hasComposition_ = false;
+            topCommit_.clear();
             context_->inputPanel().setCandidateList(nullptr);
             context_->inputPanel().setPreedit(fcitx::Text());
             context_->inputPanel().setClientPreedit(fcitx::Text());
@@ -240,6 +265,11 @@ private:
                 fcitx::UserInterfaceComponent::InputPanel);
             return;
         }
+        hasComposition_ = count > 0 || !rawString.empty();
+        topCommit_ = (count > 0 && commitTexts != nullptr &&
+                      commitTexts[0] != nullptr)
+                         ? commitTexts[0]
+                         : "";
         const std::string preeditString = preedit != nullptr ? preedit : "";
         const fcitx::Text preeditText(preeditString);
         context_->inputPanel().setPreedit(preeditText);
@@ -275,6 +305,10 @@ private:
     fcitx::Instance *instance_;
     hufu_client *engine_ = nullptr;
     fcitx::InputContext *context_ = nullptr;
+    /// 有编码或候选（更新回调维护；Shift+字母「顶字」判定用）
+    bool hasComposition_ = false;
+    /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）
+    std::string topCommit_;
 };
 
 class HufuFactory : public fcitx::AddonFactory {
