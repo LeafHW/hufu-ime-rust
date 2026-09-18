@@ -2232,6 +2232,79 @@ impl Engine {
             }
         }
 
+        // 【同码分歧护栏 2026-09-19】gkzpuvjihujinkbky（却足以绊住流…）
+        // 实锤：v5 下「收拾主流」从第 15 键起稳定领先、句尾也领先 ~2 分，
+        // 3 键证据窗把「收拾」提前上屏（吃 11 键，切进「绊=ihu」的词内），
+        // 句子被钉死；句末 qwen 重排能选对（-62.4 压倒 -77.7），但前提
+        // 是中途没锁死。护栏规则：本次上屏增量 ≥2 字，且候选池内存在
+        // 「置信度距池首 ≤Δ（默认 8，HUFU_EARLY_DIVERG_GAP）且文本在
+        // 本次消耗跨度内与 stable 分歧」的活候选（分歧字符的起始 raw
+        // 位落在 [committed_raw_len, consumed) 内——上屏会摧毁该候选
+        // 的词内切分）→ 本键不上屏，证据史保留（分歧候选消亡后，同一
+        // 证据窗立即可上）。Δ 实证：同码孪生（绊住流）全程落后 2~7 分，
+        // 噪音候选（去钊指/䐁半类）落后 ≥9 分——Δ=8 恰好分开两类。
+        // 单字增量不拦：单字是提前上屏主力节奏，且单字级错误句末重排
+        // 可整体换句兜底。行尾快通道不拦（组段缩短优先）。
+        // HUFU_EARLY_DIVERG_GUARD=1 环境变量等效开启（优先）；
+        // config sentence.early_diverg_guard 常驻开启（推荐——TSF 拉起
+        // 的 server 进程环境变量不可靠）。缺省关，产品行为不变。
+        static DIVERG_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let diverg_env = *DIVERG_ENV.get_or_init(|| {
+            std::env::var("HUFU_EARLY_DIVERG_GUARD")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+        let diverg_guard = diverg_env || self.config.sentence.early_diverg_guard;
+        if diverg_guard && !line_end && delta.chars().count() >= 2 {
+            let diverg_gap = std::env::var("HUFU_EARLY_DIVERG_GAP")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(self.config.sentence.early_diverg_gap);
+            let leader_conf = cands
+                .iter()
+                .map(|h| h.confidence)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let stable_chars: Vec<char> = stable.chars().collect();
+            let committed_n = committed_text.chars().count();
+            let contested = cands.iter().any(|h| {
+                if h.confidence < leader_conf - diverg_gap {
+                    return false; // 距池首太远：噪音候选，不保护
+                }
+                let hc: Vec<char> = h.text.chars().collect();
+                if hc.len() <= stable_chars.len() {
+                    return false; // stable 覆盖 h 全文或一致：上屏不伤它
+                }
+                if hc[..stable_chars.len()] == stable_chars[..] {
+                    return false; // stable 是 h 的前缀：跨度内文本一致
+                }
+                // 首个分歧字符位（已提交段前缀一致由 cands 过滤保证）
+                let mut di = committed_n;
+                while di < stable_chars.len() && hc[di] == stable_chars[di] {
+                    di += 1;
+                }
+                if di >= stable_chars.len() {
+                    return false;
+                }
+                // 分歧字符的起始 raw 位（word_ends：前 c 字消耗 r raw）
+                let mut raw_at = committed_raw_len;
+                for (cc, re) in &h.word_ends {
+                    if *cc <= di && *re > raw_at {
+                        raw_at = *re;
+                    }
+                }
+                raw_at < consumed // 分歧起点将被吞掉 → 活候选被毁
+            });
+            if contested {
+                if ec_dbg {
+                    eprintln!(
+                        "[early] 分歧护栏: stable='{}' consumed={}（池内活候选在跨度内分歧，本键不上屏）",
+                        stable, consumed
+                    );
+                }
+                return;
+            }
+        }
+
         // 提交：committed 前缀增长，live raw 缩为剩余
         session.committed_text = stable;
         let full_chars: Vec<char> = full.chars().collect();
