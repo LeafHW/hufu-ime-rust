@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=虎符设置
+Name[en_US]=HuFu Settings
+Comment=打开虎符输入法设置页
+Comment[en_US]=Open the HuFu IME settings page
+Exec=xdg-open http://127.0.0.1:4390/
+Icon=input-keyboard
+Terminal=false
+Categories=Settings;Utility;
+Keywords=ime;input;hufu;虎符;虎码;

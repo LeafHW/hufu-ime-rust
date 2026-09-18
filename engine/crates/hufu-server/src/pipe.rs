@@ -5,9 +5,11 @@
 //! 与 HTTP API 共享 Host 与 parse_key。
 
 use crate::host::{parse_key, Host};
+#[cfg(windows)]
 use std::io::ErrorKind;
 use std::sync::Mutex;
 
+#[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
 const BUF: usize = 1 << 20;
 
@@ -246,12 +248,12 @@ pub fn dispatch(
         // 输入法激活态上报（DLL Activate/Deactivate）：驱动托盘图标显隐
         "ime" => {
             let active = req.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-            crate::tray::on_ime_state(active);
+            crate::platform::on_ime_state(active);
             serde_json::json!({"ok": true})
         }
         // 语言栏「中」按钮点击：开设置页（与托盘双击/Ctrl+Alt+H 同通道）
         "settings" => {
-            crate::tray::open_settings();
+            crate::platform::open_settings();
             serde_json::json!({"ok": true})
         }
         // 语言栏「中/英」左键切换中英（语言指示牌语义：切换即放弃
@@ -347,7 +349,7 @@ pub fn dispatch(
             )
             .join(&name);
             if dir.is_dir() {
-                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                crate::platform::open_path(&dir);
             }
             serde_json::json!({"ok": dir.is_dir(), "path": dir})
         }
@@ -360,7 +362,7 @@ pub fn dispatch(
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
                 if dir.is_dir() {
-                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    crate::platform::open_path(&dir);
                 }
                 serde_json::json!({"ok": true, "path": path, "lines": n})
             }
@@ -427,20 +429,11 @@ pub fn dispatch(
                     .and_then(|c| c.clone())
                     .unwrap_or(serde_json::Value::Null),
             };
-            crate::candwin::show(
-                crate::candwin::CandFrame {
-                    items,
-                    raw,
-                    selected: sel,
-                    skin,
-                },
-                x,
-                y,
-            );
+            crate::platform::cand_show(items, raw, sel, x, y, skin);
             serde_json::json!({"ok": true})
         }
         "cand_hide" => {
-            crate::candwin::hide();
+            crate::platform::cand_hide();
             serde_json::json!({"ok": true})
         }
         "sound" => {
@@ -848,8 +841,16 @@ mod unix_imp {
 
     pub fn run(host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
         let path = sock_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        // 仅本人可读写（与 Windows 命名管道 ACL 对齐）
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         eprintln!("HuFu unix socket: {}", path.display());
         for stream in listener.incoming() {
             match stream {

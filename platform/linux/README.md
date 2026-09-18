@@ -1,0 +1,120 @@
+# hufu linux — fcitx5 前端
+
+薄壳架构（与 Windows TSF / macOS IMK 一致）：输入法进程只做事件转发与绘制，
+引擎在 `hufu-server` 守护进程里。
+
+```
+按键 → fcitx5 addon（libhufu.so：C++ 薄壳 + Rust staticlib）
+      → Unix socket（$XDG_RUNTIME_DIR/hufu-ime.sock，4B 小端长度 + JSON 帧）
+      → hufu-server 引擎 → {outcome, state}
+      → fcitx5：commitString 上屏 / setPreedit 组段 / 候选面板
+```
+
+## 文件
+
+- `hufu-fcitx5-client/` — Rust staticlib：Unix socket 客户端 + C ABI
+  （`hufu_client_key/reset/focus/ping`，宿主回调 commit/update），含 mock
+  socket 单测；C++ 侧经 `hufu-addon/shell/hufu_abi.h` 调用。
+- `hufu-addon/shell/hufu.cpp` — C++ 薄壳：fcitx5 接口适配（键名映射、
+  `filterAndAccept`、`commitString`/回删、`CommonCandidateList`、中英副模式）。
+- `hufu-addon/conf/` — addon 与输入法条目（`Library=libhufu`、`OnDemand=True`）。
+- `hufu-addon/CMakeLists.txt` — 构建并安装 `libhufu.so` 与 conf。
+- `systemd/hufu-server.service` — 引擎常驻（user 服务，Restart=always）。
+- `desktop/hufu-settings.desktop` — 设置页入口（xdg-open 本地设置页）。
+- `install.sh` / `uninstall.sh` — 一键安装/卸载。
+
+## 依赖
+
+- Rust（构建 `hufu-server` 与 staticlib）
+- CMake 3.20+、C++20 编译器、`Fcitx5Core` 开发包
+  （Arch：`fcitx5`；Fedora：`fcitx5-devel`；Debian/Ubuntu：`libfcitx5core-dev`）
+- fcitx5（运行）
+
+## 构建
+
+```sh
+# 引擎守护进程
+cd engine && cargo build --release -p hufu-server
+
+# fcitx5 addon
+cmake -S platform/linux/hufu-addon -B platform/linux/build \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build platform/linux/build -j
+```
+
+## 安装 / 卸载
+
+```sh
+# 一条：构建 + 装配数据 + 用户级服务 + 系统级 addon（中途会要 sudo 密码）
+platform/linux/install.sh
+
+# 已有产物、只装配数据/装服务：
+platform/linux/install.sh --no-build --no-system   # 跳过 sudo 部分
+sudo cmake --install platform/linux/build          # 系统级 addon
+
+# 卸载（--purge 连用户数据一起删）
+platform/linux/uninstall.sh [--purge]
+```
+
+安装产物：
+
+- 系统级：`/usr/lib/fcitx5/libhufu.so`、`/usr/share/fcitx5/{addon,inputmethod}/hufu.conf`
+- 用户级：`~/.local/bin/hufu-server`、`~/.config/systemd/user/hufu-server.service`、
+  `~/.local/share/applications/hufu-settings.desktop`
+- 数据：`~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置/皮肤/用户词/音效）
+
+装完后：
+
+```sh
+fcitx5 -r -d                 # 重启 fcitx5
+fcitx5-configtool            # 输入法 → 添加「虎符」
+```
+
+设置页：应用菜单「虎符设置」，或浏览器打开 `http://127.0.0.1:4390/`。
+
+## 数据装配（install.sh --from <目录>）
+
+默认数据源 `/home/crux/下载/_res/zhmn`（虎码官方 Rime 资源包）：
+
+| 目标 | 来源 |
+|---|---|
+| `码表/虎码字词/`（默认方案） | `虎码秃版 小狼毫（Win）/tigress*.dict.yaml`（import 闭包 ≈250k 条） |
+| `码表/虎码单字/` | `虎码秃版 小狼毫（Win）/tiger.dict.yaml` |
+| `码表/多多B/` | `publish/定制/b/多多B*.txt`（多多格式） |
+| 各方案 `补充语料.txt` | 仓库 `发行临时/补充语料.txt` |
+| `数据/转换词典/` | `opencc/{STPhrases,STCharacters_Tu,TSPhrases,TSCharacters,emoji}.txt` |
+
+首次安装生成 `数据/config.json`：默认方案 `虎码字词`；反查/拆分/音效默认关
+（对应资源未就位，后续补齐）。
+
+## 与 Windows / macOS 前端对齐
+
+| 能力 | Windows TSF | macOS IMK | Linux fcitx5 |
+|---|---|---|---|
+| 键→引擎 IPC | 命名管道 | Unix socket | Unix socket（同帧协议） |
+| 组段 | ITfComposition | setMarkedText | preedit + clientPreedit |
+| 上屏 | SetText+EndComposition | insertText | commitString（回删走 forwardKey/deleteSurroundingText） |
+| 候选窗 | D2D+Acrylic 自绘 | NSVisualEffectView | fcitx5 自带面板（classicui/kimpanel） |
+| 设置 | localhost Web UI | 同 | 同（systemd user 服务托管） |
+| 中英切换 | Shift | Shift | Shift（引擎内态，subMode 显示） |
+
+## 已知限制（第一版）
+
+- 候选为展示型（点击不上屏）；候选窗样式为 fcitx5 主题，未复刻虎符皮肤材质/动效。
+- 引擎单会话（与 Windows 一致），焦点切换靠 `focus` 清态。
+- 注释/拆分/拼音反查/符号/音效资源未装配，对应功能关闭。
+- `多多拼音反查表`（`$ddcmd` 格式）需转换后才可用。
+
+## 排障
+
+```sh
+systemctl --user status hufu-server     # 引擎状态
+journalctl --user -u hufu-server -f     # 引擎日志
+ls -l "$XDG_RUNTIME_DIR/hufu-ime.sock"  # IPC socket（应为 0600）
+fcitx5 -r -d                            # 重载 addon / 输入法列表
+```
+
+- fcitx5 配置工具里没有「虎符」：确认 `/usr/share/fcitx5/addon/hufu.conf` 与
+  `/usr/share/fcitx5/inputmethod/hufu.conf` 存在，然后 `fcitx5 -r -d`。
+- 打字没反应：确认 `hufu-server` 在跑（引擎不可达时按键直通，不阻塞输入）。
+- addon 加载失败看 fcitx5 日志：`fcitx5 -D --verbose default=5`（前台调试）。

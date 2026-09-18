@@ -13,3 +13,9 @@ target-slim/
 target159/
 
 platform/windows/target-verify/
+
+# Linux 前端构建产物
+platform/linux/build/
+platform/linux/target/
+
+_tmp

@@ -79,12 +79,13 @@ impl Host {
         // 【性能插桩】启动阶段毫秒戳（diag/startup-trace.txt；常开开销≈0）
         let t0 = std::time::Instant::now();
         let mark = |label: &str, t: &std::time::Instant| {
-            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            let diag = hufu_engine::diag_dir(data_dir);
+            let _ = std::fs::create_dir_all(&diag);
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+                .open(diag.join("startup-trace.txt"))
             {
                 let _ = writeln!(f, "{label}: {}ms", t.elapsed().as_millis());
             }
@@ -272,6 +273,7 @@ impl Host {
         let debounce = self.engine.config.sentence.rerank.debounce_ms;
         let cache = self.engine.rerank_cache.clone();
         let model_path = model.to_string_lossy().into_owned();
+        let diag_dir = hufu_engine::diag_dir(&self.data_dir);
         let (tx, rx) = mpsc::channel::<RerankJob>();
         std::thread::Builder::new()
             .name("hufu-rerank".into())
@@ -291,18 +293,12 @@ impl Host {
                 let mp = std::path::PathBuf::from(&model_path);
                 if let Some(ns) = hufu_rerank::native::NativeScorer::try_new(&[], &mp) {
                     let _ = ns.score("。", &["预热".to_string()]);
-                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-                    let _ = std::fs::write(
-                        r"C:\ProgramData\HuFu\diag\rerank-engine.txt",
-                        "native(llama.cpp)",
-                    );
+                    let _ = std::fs::create_dir_all(&diag_dir);
+                    let _ = std::fs::write(diag_dir.join("rerank-engine.txt"), "native(llama.cpp)");
                     native = Some(ns);
                 } else {
-                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-                    let _ = std::fs::write(
-                        r"C:\ProgramData\HuFu\diag\rerank-engine.txt",
-                        "rust(fallback)",
-                    );
+                    let _ = std::fs::create_dir_all(&diag_dir);
+                    let _ = std::fs::write(diag_dir.join("rerank-engine.txt"), "rust(fallback)");
                 }
                 let mut model: Option<hufu_rerank::Reranker> = None;
                 let mut model_failed = false;
@@ -445,21 +441,18 @@ impl Host {
                     let texts: Vec<String> = order.into_iter().map(|(_, t)| t).collect();
                     // GUI 子系统 eprintln 无人见——重排计时落文件（性能排查生命线）
                     // 【轮转 2026-09-11】无上限增长 → 超 4MB 翻转 .old
-                    let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-                    const RERANK_LOG: &str = r"C:\ProgramData\HuFu\diag\rerank.log";
-                    if std::fs::metadata(RERANK_LOG)
+                    let rerank_log = diag_dir.join("rerank.log");
+                    let _ = std::fs::create_dir_all(&diag_dir);
+                    if std::fs::metadata(&rerank_log)
                         .map(|m| m.len() > 4 << 20)
                         .unwrap_or(false)
                     {
-                        let _ = std::fs::rename(
-                            RERANK_LOG,
-                            r"C:\ProgramData\HuFu\diag\rerank.log.old",
-                        );
+                        let _ = std::fs::rename(&rerank_log, diag_dir.join("rerank.log.old"));
                     }
                     let _ = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(RERANK_LOG)
+                        .open(&rerank_log)
                         .and_then(|mut f| {
                             use std::io::Write;
                             f.write_all(
@@ -493,9 +486,9 @@ impl Host {
                     Ok(()) => break,
                     Err(_) => {
                         panics += 1;
-                        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+                        let _ = std::fs::create_dir_all(&diag_dir);
                         let _ = std::fs::write(
-                            r"C:\ProgramData\HuFu\diag\rerank-panic.txt",
+                            diag_dir.join("rerank-panic.txt"),
                             format!("rerank 线程第 {panics} 次恐慌，冷却重建\n"),
                         );
                         eprintln!("神经重排线程恐慌（第 {panics} 次），1s 后重建");

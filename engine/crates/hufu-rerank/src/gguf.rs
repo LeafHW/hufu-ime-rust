@@ -3,6 +3,28 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
+/// 定位读（不改文件游标）：Windows `seek_read` / Unix `read_at`。
+/// 【Linux 适配 2026-09-19】原先只有 Windows 版本，非 Windows 编译不过。
+#[cfg(windows)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    f.seek_read(buf, offset)
+}
+
+#[cfg(unix)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    f.read_at(buf, offset)
+}
+
+/// 其他平台保底：seek + read（克隆句柄，不动原文件游标）。
+#[cfg(not(any(unix, windows)))]
+fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut f = f.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read(buf)
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     U8(u8),
@@ -385,14 +407,18 @@ impl GgufFile {
                 Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mmap 越界"))
             }
         } else {
-            use std::os::windows::fs::FileExt;
+            // 懒模式回退：定位读（Windows seek_read / Unix read_at / 其他
+            // seek+read）。mmap 与常驻之外的最后一条冷路径。
             let start = self.data_start + info.offset + (p0 * row_bytes) as u64;
             let f = std::fs::File::open(self.path.as_deref().unwrap_or(""))?;
             let mut got = 0usize;
             while got < len {
-                let n = f.seek_read(&mut buf[got..], start + got as u64)?;
+                let n = read_at(&f, &mut buf[got..], start + got as u64)?;
                 if n == 0 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "读张量越界"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "读张量越界",
+                    ));
                 }
                 got += n;
             }

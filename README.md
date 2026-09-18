@@ -1,8 +1,9 @@
 # 虎符 HuFu — 以虎码为核心的跨平台输入法平台
 
-> 名字取自古代调兵信物「虎符」：以虎码为主码的输入法平台，Windows / macOS 双端（**macOS 端尚未开始开发**，目前仅 Windows 可用）。
+> 名字取自古代调兵信物「虎符」：以虎码为主码的输入法平台，Windows / Linux / macOS 三端
+> （**macOS 端尚未开始开发**；Windows 真机全通，Linux fcitx5 前端可用）。
 > 目标：吸收 **虎爪输入法（TigerClaw）** 与 **Rime（虎码配置）** 的全部能力，重新实现为一个
-> 统一引擎 + 双平台前端 + 图形化设置的产品级输入法。
+> 统一引擎 + 多平台前端 + 图形化设置的产品级输入法。
 
 ## 功能总览
 
@@ -41,12 +42,12 @@
 └─────────────────────────────────────────────────────────────┘
         ▲                                    ▲
         │ IPC (命名管道 / Unix socket)        │ HTTP+WS (localhost)
-┌───────┴────────────┐              ┌────────┴─────────┐
-│ platform/windows   │              │ platform/macos    │
-│ hufu-tsf: TSF COM  │              │ HuFuIME:          │
-│ 组件(Rust+windows-rs)│             │ InputMethodKit    │
-│ 候选窗 D2D+Acrylic  │              │ NSVisualEffectView│
-└────────────────────┘              └──────────────────┘
+┌───────┴────────────┐ ┌──────────────────┐ ┌────────┴─────────┐
+│ platform/windows   │ │ platform/linux    │ │ platform/macos    │
+│ hufu-tsf: TSF COM  │ │ fcitx5 addon:     │ │ HuFuIME:          │
+│ 组件(Rust+windows-rs)│ │ C++ 薄壳 + Rust  │ │ InputMethodKit    │
+│ 候选窗 D2D+Acrylic  │ │ staticlib（socket）│ │ NSVisualEffectView│
+└────────────────────┘ └──────────────────┘ └──────────────────┘
         设置 UI = 浏览器/WebView 打开 daemon 的 Web 设置页
 ```
 
@@ -54,8 +55,9 @@
 
 ```
 hufu/
-├── engine/          Rust workspace（核心引擎，双平台共享）
+├── engine/          Rust workspace（核心引擎，全平台共享）
 ├── platform/windows Windows TSF 输入法前端
+├── platform/linux   Linux fcitx5 前端（Rust staticlib + C++ 薄壳 + CMake）
 ├── platform/macos   macOS InputMethodKit 前端（尚未开始开发，仅有骨架代码）
 ├── settings-ui/     设置 Web UI（由 hufu-server 托管）
 ├── dictionaries/    预置/转换出的码表（HuFu 原生格式）
@@ -77,10 +79,13 @@ hufu/
 | `hufu-server` + 设置 GUI | ✅          | 20 REST 路由（+候选置顶/隐藏/音效试听/全量快照导出）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/音效开关+试听/繁简开关/快照导出/导入导出） |
 | Windows TSF              | ✅ 真机全通 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；**系统级激活实测**：Win+空格 第 4 项（虎图标）、汉字上屏、候选窗贴光标跟随、选区顺序正确；**应用矩阵**：记事本/浏览器/VSCode/QQ/DSH/Listary 全通过。注册九步一键化（install.ps1 + reg-fix.ps1）；DLL 轨迹日志 `%TEMP%\hufu-tsf-trace.log`。运行时铁律：EditSession 用 ASYNCDONTCARE、组段走 GetSelection→StartComposition、GetTextExt 即屏幕坐标 |
 | macOS IMK                | 🔨 骨架     | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
+| Linux fcitx5             | ✅ 可用     | `platform/linux`：Rust staticlib（Unix socket 客户端 + C ABI）+ C++ 薄壳（~300 行）；候选/组段/上屏/中英副模式；install.sh 系统级装 addon + systemd user 服务托管引擎 + zhmn 码表装配；**待实机 fcitx5 全量回归** |
 
 ### 测试
 
-- 引擎 workspace：**67 测试 0 失败**（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/Shift 标点/音效标签/皮肤/配置/GGUF f16/GEMM/q8 对 llama.cpp F32 基准/wav 解析）
+- 引擎 workspace：**95 测试 0 失败**（Linux/Windows 双端跑；1 个作者本机对照件默认 `#[ignore]`）（字典格式/引擎状态机/动态变量/数字转中文/置顶回放/整句/Shift 标点/音效标签/皮肤/配置/GGUF f16/GEMM/q8 对 llama.cpp F32 基准/wav 解析）
+- Linux 前端单测：hufu-fcitx5-client 4/4（mock socket：commit/update/回删/透传/断线直通）
+- Linux 冒烟：真实码表 server + Unix socket（ping/key/state/中英切换）+ HTTP 设置页 + 三方案装配（脚本 `_tmp/dev-data/smoke.py`）
 - 管道回归电池：lock 12/12、battery2 16/16、edge 17/17、flow 全过、设置生效性 7/7（皮肤热反映/横排/序号/延时/音效/调整日志）
 - Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
 - 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效
@@ -102,6 +107,18 @@ cargo run --release -p hufu-rerank --bin sentence-bench -- `
 
 从 [Releases](../../releases) 下载最新 `HuFu-IME-x.y.z.zip`（约 1GB，即「虎符输入法」完整安装包：双位 TSF 组件、码表、ngram 整句模型、Qwen3 重排模型与全部数据），解压到任意位置后运行 **`安装.bat`**（自动 UAC 提权，双阶段安装）。系统级部署：64/32 位 TSF 组件进 `C:\Windows\SystemIME\HuFu\`，数据随安装目录；卸载跑 `卸载.bat` 即清干净。Windows 10/11 x64。
 
+### Linux（fcitx5）
+
+```sh
+platform/linux/install.sh   # 构建 + 码表装配 + systemd user 服务 + 系统级 addon（中途要 sudo）
+fcitx5 -r -d                # 重启 fcitx5
+fcitx5-configtool           # 输入法 → 添加「虎符」
+```
+
+默认从 `/home/crux/下载/_res/zhmn` 装配码表（`--from <目录>` 可换源）；
+设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。详见
+[platform/linux/README.md](platform/linux/README.md)。
+
 ## 构建
 
 ```powershell
@@ -118,6 +135,16 @@ cd platform/windows
 cargo build --release          # hufu_tsf.dll + hufu-tsf-smoke.exe
 ./target/release/hufu-tsf-smoke.exe   # 冒烟：COM 层 + 管道引擎链
 # 注册见 platform/windows/install/README.md
+```
+
+```bash
+# Linux fcitx5 前端（Rust staticlib + C++ 薄壳）
+cmake -S platform/linux/hufu-addon -B platform/linux/build \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build platform/linux/build -j
+# 一键安装（addon 系统级 + 引擎 systemd user 服务 + 码表装配）：
+platform/linux/install.sh
+fcitx5 -r -d && fcitx5-configtool   # 重启后在配置工具添加「虎符」
 ```
 
 ### 系统激活（真机安装）
