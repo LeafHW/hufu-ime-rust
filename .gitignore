@@ -13,3 +13,4 @@ target-slim/
 target159/
 
 platform/windows/target-verify/
+platform/windows/target-fix/

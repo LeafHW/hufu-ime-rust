@@ -1040,7 +1040,7 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
     // 宿主（如 SearchHost）退出会连带销毁子窗口——检测死后请求
     // tray 线程重建（窗口必须由有消息循环的线程创建）
     {
-        let hwnd = *WND.lock().unwrap();
+        let hwnd = *WND.lock().unwrap_or_else(|p| p.into_inner());
         let dead = hwnd.map(|h| unsafe { IsWindow(h) } == 0).unwrap_or(true);
         if dead {
             let tray = crate::tray::tray_hwnd();
@@ -1057,7 +1057,7 @@ pub fn show(frame: CandFrame, x: i32, y: i32) {
             return;
         }
     }
-    let hwnd = match *WND.lock().unwrap() {
+    let hwnd = match *WND.lock().unwrap_or_else(|p| p.into_inner()) {
         Some(h) => h,
         None => {
             if srv_cand_dbg() {
@@ -1104,7 +1104,7 @@ fn srv_cand_dbg() -> bool {
 
 /// pipe 线程调用：隐藏
 pub fn hide() {
-    let hwnd = match *WND.lock().unwrap() {
+    let hwnd = match *WND.lock().unwrap_or_else(|p| p.into_inner()) {
         Some(h) => h,
         None => return,
     };
@@ -1151,7 +1151,7 @@ pub fn init_on_tray_thread() {
         )
     };
     if hwnd != 0 {
-        *WND.lock().unwrap() = Some(hwnd);
+        *WND.lock().unwrap_or_else(|p| p.into_inner()) = Some(hwnd);
     }
     let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
     let _ = std::fs::write(
@@ -1163,7 +1163,7 @@ pub fn init_on_tray_thread() {
 /// tray 线程：宿主退出销毁子窗口后重建（由 tray wnd_proc 0x8003 调用）
 pub fn reinit_if_dead() {
     let dead = {
-        let hwnd = *WND.lock().unwrap();
+        let hwnd = *WND.lock().unwrap_or_else(|p| p.into_inner());
         hwnd.map(|h| unsafe { IsWindow(h) } == 0).unwrap_or(true)
     };
     if dead {

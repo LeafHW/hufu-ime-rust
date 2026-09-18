@@ -427,6 +427,7 @@ pub fn dispatch(
                     .and_then(|c| c.clone())
                     .unwrap_or(serde_json::Value::Null),
             };
+            // 【二十九修·首显滑动】组段首帧带滑动起点（None=常规帧）
             crate::candwin::show(
                 crate::candwin::CandFrame {
                     items,
