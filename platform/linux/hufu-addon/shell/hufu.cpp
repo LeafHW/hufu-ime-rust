@@ -188,14 +188,14 @@ private:
         static_cast<HufuEngine *>(user)->applyCommit(text);
     }
 
-    static void updateCallback(void *user, const char *preedit,
+    static void updateCallback(void *user, const char *preedit, const char *raw,
                                const char *const *texts,
                                const char *const *comments, int32_t count,
                                int32_t selected, const char *aux,
                                int32_t chinese) {
-        static_cast<HufuEngine *>(user)->applyUpdate(preedit, texts, comments,
-                                                     count, selected, aux,
-                                                     chinese);
+        static_cast<HufuEngine *>(user)->applyUpdate(preedit, raw, texts,
+                                                     comments, count, selected,
+                                                     aux, chinese);
     }
 
     /// 上屏：先按引擎回删数清掉已上屏字符（如「1.」→「。」），再提交。
@@ -218,10 +218,25 @@ private:
     }
 
     /// UI 快照：preedit（面板 + 客户端内联）+ 候选列表 + aux。
-    void applyUpdate(const char *preedit, const char *const *texts,
-                     const char *const *comments, int32_t count,
-                     int32_t selected, const char *aux, int32_t chinese) {
+    void applyUpdate(const char *preedit, const char *raw,
+                     const char *const *texts, const char *const *comments,
+                     int32_t count, int32_t selected, const char *aux,
+                     int32_t chinese) {
         if (context_ == nullptr) {
+            return;
+        }
+        const std::string rawString = raw != nullptr ? raw : "";
+        // 【选重闪帧】数字/; 选重上屏：引擎回「raw 空 + 旧候选 + 高亮」的
+        // 确认帧（raw/preedit 已清）。Windows 侧靠 150ms 收场钟清窗；
+        // Linux 无皮肤动效，直接清（否则候选窗滞留——用户实测反馈）。
+        if (rawString.empty() && count > 0) {
+            context_->inputPanel().setCandidateList(nullptr);
+            context_->inputPanel().setPreedit(fcitx::Text());
+            context_->inputPanel().setClientPreedit(fcitx::Text());
+            context_->inputPanel().setAuxUp(fcitx::Text());
+            context_->updatePreedit();
+            context_->updateUserInterface(
+                fcitx::UserInterfaceComponent::InputPanel);
             return;
         }
         const std::string preeditString = preedit != nullptr ? preedit : "";

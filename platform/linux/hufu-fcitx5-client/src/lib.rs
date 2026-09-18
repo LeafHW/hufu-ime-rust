@@ -30,9 +30,10 @@ pub const HUFU_KEY_BACK_SHIFT: u32 = 8;
 /// 宿主回调表（C++ 薄壳实现；函数指针可为 NULL）。
 ///
 /// - `commit`：立即上屏文本（UTF-8，NUL 结尾）。
-/// - `update`：UI 快照——preedit（UTF-8）+ 候选文本/注释数组（各 NUL
-///   结尾；`count==0` 时必须清除候选列表）+ 高亮索引（页内 0 起）+
-///   aux 提示 + 中英态（1=中）。回调期指针有效，C++ 侧须同步拷走。
+/// - `update`：UI 快照——preedit + raw（UTF-8；raw 空且候选非空=选重闪帧，
+///   壳应直接清窗）+ 候选文本/注释数组（各 NUL 结尾；`count==0` 时必须清除
+///   候选列表）+ 高亮索引（页内 0 起）+ aux 提示 + 中英态（1=中）。
+///   回调期指针有效，C++ 侧须同步拷走。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HufuHost {
@@ -41,6 +42,7 @@ pub struct HufuHost {
     pub update: Option<
         unsafe extern "C" fn(
             *mut c_void,
+            *const c_char,
             *const c_char,
             *const *const c_char,
             *const *const c_char,
@@ -56,6 +58,7 @@ pub struct HufuHost {
 #[derive(Default)]
 struct Scratch {
     preedit: CString,
+    raw: CString,
     aux: CString,
     texts: Vec<CString>,
     comments: Vec<CString>,
@@ -270,6 +273,7 @@ impl HufuClient {
             state.preedit.as_str()
         };
         self.scratch.preedit = CString::new(preedit).unwrap_or_default();
+        self.scratch.raw = CString::new(state.raw.as_str()).unwrap_or_default();
         self.scratch.aux = CString::new(state.aux.as_str()).unwrap_or_default();
         self.scratch.texts = state
             .candidates
@@ -289,6 +293,7 @@ impl HufuClient {
                 cb(
                     self.host.user,
                     self.scratch.preedit.as_ptr(),
+                    self.scratch.raw.as_ptr(),
                     self.scratch.text_ptrs.as_ptr(),
                     self.scratch.comment_ptrs.as_ptr(),
                     self.scratch.texts.len() as c_int,
@@ -446,7 +451,8 @@ mod tests {
     #[derive(Default)]
     struct Capture {
         commits: Vec<String>,
-        updates: Vec<(String, Vec<String>, usize, bool)>,
+        /// (preedit, raw, candidates, selected, chinese)
+        updates: Vec<(String, String, Vec<String>, usize, bool)>,
     }
 
     fn cap_mut<'a>(user: *mut c_void) -> &'a mut Capture {
@@ -461,6 +467,7 @@ mod tests {
     unsafe extern "C" fn on_update(
         user: *mut c_void,
         preedit: *const c_char,
+        raw: *const c_char,
         texts: *const *const c_char,
         _comments: *const *const c_char,
         count: c_int,
@@ -471,6 +478,7 @@ mod tests {
         let pre = unsafe { CStr::from_ptr(preedit) }
             .to_string_lossy()
             .into_owned();
+        let raw = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
         let mut cands = Vec::new();
         for i in 0..count.max(0) as isize {
             let p = unsafe { *texts.offset(i) };
@@ -478,6 +486,7 @@ mod tests {
         }
         cap_mut(user).updates.push((
             pre,
+            raw,
             cands,
             selected.max(0) as usize,
             chinese == 1,
@@ -567,12 +576,13 @@ mod tests {
         assert_eq!(cap.commits.as_slice(), ["的"]);
         assert_eq!(cap.updates.len(), 1);
         assert_eq!(cap.updates[0].0, "u");
+        assert_eq!(cap.updates[0].1, "u");
         assert_eq!(
-            cap.updates[0].1,
+            cap.updates[0].2,
             vec!["的".to_string(), "得".to_string()]
         );
-        assert_eq!(cap.updates[0].2, 1);
-        assert!(cap.updates[0].3);
+        assert_eq!(cap.updates[0].3, 1);
+        assert!(cap.updates[0].4);
         handle.join().unwrap();
     }
 
@@ -611,6 +621,44 @@ mod tests {
     }
 
     #[test]
+    fn flash_frame_raw_empty_with_candidates() {
+        // 数字/; 选重上屏：引擎回闪帧（raw/preedit 空 + 旧候选 + 高亮）。
+        // 壳据此清窗；此处验证 raw 通道确实送达空串。
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("flash");
+        let handle = mock_server(
+            path.clone(),
+            vec![serde_json::json!({
+                "outcome": {
+                    "consumed": true,
+                    "commit": "的",
+                    "state": {
+                        "raw": "",
+                        "preedit": "",
+                        "candidates": [
+                            {"text": "的", "code": "u", "source": {"kind": "dict"}},
+                            {"text": "得", "code": "u", "source": {"kind": "dict"}}
+                        ],
+                        "page": 0, "page_count": 1, "selected": 0,
+                        "mode": "Normal", "chinese": true,
+                        "full_shape": false, "ascii_punct": false
+                    }
+                }
+            })],
+        );
+        let mut c = client_for(path, cap_ptr);
+        let (consumed, _) = c.key("1", false, false, false, false, false, -1);
+        assert!(consumed);
+        assert_eq!(cap.commits.as_slice(), ["的"]);
+        assert_eq!(cap.updates.len(), 1);
+        assert_eq!(cap.updates[0].0, ""); // preedit
+        assert_eq!(cap.updates[0].1, ""); // raw —— 壳以「raw 空 + 有候选」判闪帧
+        assert_eq!(cap.updates[0].2.len(), 2);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn reset_clears_panel() {
         let mut cap = Box::new(Capture::default());
         let cap_ptr: *mut Capture = &mut *cap;
@@ -626,7 +674,8 @@ mod tests {
         c.reset();
         assert_eq!(cap.updates.len(), 1);
         assert_eq!(cap.updates[0].0, "");
-        assert!(cap.updates[0].1.is_empty());
+        assert_eq!(cap.updates[0].1, "");
+        assert!(cap.updates[0].2.is_empty());
         handle.join().unwrap();
     }
 }

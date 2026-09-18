@@ -26,7 +26,7 @@ typedef struct hufu_client hufu_client;
 typedef struct hufu_host {
     void *user;
     void (*commit)(void *user, const char *utf8);
-    void (*update)(void *user, const char *preedit_utf8,
+    void (*update)(void *user, const char *preedit_utf8, const char *raw_utf8,
                    const char *const *candidate_texts,
                    const char *const *candidate_comments,
                    int32_t candidate_count, int32_t candidate_selected,
