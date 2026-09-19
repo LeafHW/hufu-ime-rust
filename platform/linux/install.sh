@@ -5,13 +5,15 @@
 # 用户级：hufu-server（~/.local/bin）+ 数据（~/.local/share/hufu）+ systemd user 服务 + 设置入口
 #
 # 用法（仓库根目录执行）：platform/linux/install.sh [选项]
-#   --from <目录>     码表资源目录（默认 /home/crux/下载/_res/zhmn）
-#   --tigerclaw <7z>  虎爪安装包路径（注释/拆分/反查/符号/音效装配源；默认自动探测）
+#   默认数据/资源来源 = 仓库 assets/（自足，无需外部下载；模型除外）
+#   --from <目录>     改用外部虎码资源目录（码表；资源另从虎爪 7z 取）
+#   --tigerclaw <7z>  虎爪安装包路径（外部源模式的注释/拆分/反查/符号/音效）
 #   --no-build 跳过构建 | --no-system 跳过系统级 addon(sudo) | --no-assets 跳过资源装配
 #   --data-only 只装配数据+资源 | --assets-only 只装配资源
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ASSETS_DIR="$ROOT/assets"
 SRC="${HUFU_DATA_SRC:-/home/crux/下载/_res/zhmn}"
 HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
 DATA_DIR="$HUFU_ROOT/数据"
@@ -32,12 +34,13 @@ DATA_ONLY=0
 NO_SYSTEM=0
 NO_ASSETS=0
 ASSETS_ONLY=0
+SRC_OVERRIDE=0
 TC7Z=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --from) SRC="$2"; shift 2 ;;
-        --from=*) SRC="${1#--from=}"; shift ;;
+        --from) SRC="$2"; SRC_OVERRIDE=1; shift 2 ;;
+        --from=*) SRC="${1#--from=}"; SRC_OVERRIDE=1; shift ;;
         --tigerclaw) TC7Z="$2"; shift 2 ;;
         --tigerclaw=*) TC7Z="${1#--tigerclaw=}"; shift ;;
         --no-build) DO_BUILD=0; shift ;;
@@ -45,10 +48,19 @@ while [[ $# -gt 0 ]]; do
         --no-system) NO_SYSTEM=1; shift ;;
         --no-assets) NO_ASSETS=1; shift ;;
         --assets-only) ASSETS_ONLY=1; DO_BUILD=0; shift ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) echo "未知参数: $1（--help 看用法）" >&2; exit 2 ;;
     esac
 done
+
+# 数据/资源来源：默认仓库 assets/；--from 走外部目录（资源再从虎爪 7z 取）
+USE_ASSETS=1
+if [[ "$SRC_OVERRIDE" == 1 ]]; then
+    USE_ASSETS=0
+elif [[ ! -d "$ASSETS_DIR/码表" ]]; then
+    echo "• 仓库 assets/ 缺失，回退外部源：$SRC" >&2
+    USE_ASSETS=0
+fi
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
@@ -68,15 +80,49 @@ ADDON_SO="$BUILD_DIR/libhufu.so"
 [[ -x "$SERVER_BIN" ]] || die "缺少 $SERVER_BIN（先构建，或去掉 --no-build）"
 [[ -f "$ADDON_SO" ]] || die "缺少 $ADDON_SO（先构建，或去掉 --no-build）"
 
-# ── 2) 数据装配 ────────────────────────────────────────────────────────────
+# 首次安装写默认配置（含资源就位后的推荐值；已存在则保持不动）。
+write_default_config() {
+    if [[ ! -f "$DATA_DIR/config.json" ]]; then
+        cat > "$DATA_DIR/config.json" <<'JSON'
+{
+  "schema": { "dir": "码表", "current": "虎码字词" },
+  "reverse": { "scheme": "拼音" },
+  "candidates": {
+    "split_scheme": "虎码",
+    "show_unicode_comment": true,
+    "show_split": true
+  },
+  "general": {
+    "shift_switch": false,
+    "ctrl_space_switch": false,
+    "caps_action": "None"
+  }
+}
+JSON
+        echo '  ✓ 生成 数据/config.json（默认方案：虎码字词；反查=拼音；注释/拆分显示开；中英切换交由 fcitx5 布局）'
+    else
+        echo '  · 已存在 数据/config.json，保持不动（如需切换默认方案/开关请在设置页操作）'
+    fi
+}
+
+# ── 2) 数据装配（码表 + 转换词典）──────────────────────────────────────────
 assemble_data() {
+    mkdir -p "$DATA_DIR" "$HUFU_ROOT/码表" "$HUFU_ROOT/模型"
+
+    if [[ "$USE_ASSETS" == 1 ]]; then
+        say '③ 装配数据（来源：仓库 assets/）'
+        cp -a "$ASSETS_DIR/码表/." "$HUFU_ROOT/码表/"
+        cp -a "$ASSETS_DIR/数据/." "$DATA_DIR/"
+        echo '  ✓ 码表（虎码字词/虎码单字/多多B）+ 数据（注释/拆分/反查/转换词典/音效）'
+        write_default_config
+        return 0
+    fi
+
     say "③ 装配数据（来源：$SRC）"
     [[ -d "$SRC" ]] || die "数据源不存在：$SRC"
     local rime="$SRC/虎码秃版 小狼毫（Win）"
     local opencc="$rime/opencc"
     local duoduo="$SRC/publish/定制/b"
-
-    mkdir -p "$DATA_DIR" "$HUFU_ROOT/码表" "$HUFU_ROOT/模型"
 
     copy_schema() { # <目标方案名> <文件...>
         local name="$1"; shift
@@ -117,31 +163,17 @@ assemble_data() {
         echo "  ✓ 数据/转换词典/ ← opencc/"
     fi
 
-    # 首次安装写默认配置：默认方案=虎码字词；反查/拆分/音效先关（资源未就位）；
-    # 中英切换交由 fcitx5 键盘布局（Linux 不用引擎自带英文输入）。
-    if [[ ! -f "$DATA_DIR/config.json" ]]; then
-        cat > "$DATA_DIR/config.json" <<'JSON'
-{
-  "schema": { "dir": "码表", "current": "虎码字词" },
-  "reverse": { "scheme": "" },
-  "candidates": { "split_scheme": "" },
-  "general": {
-    "shift_switch": false,
-    "ctrl_space_switch": false,
-    "caps_action": "None"
-  }
-}
-JSON
-        echo "  ✓ 生成 数据/config.json（默认方案：虎码字词；中英切换交由 fcitx5 布局）"
-    else
-        echo "  · 已存在 数据/config.json，保持不动（如需切换默认方案请在设置页操作）"
-    fi
+    write_default_config
 }
 
-# ── 2b) 资源装配（虎爪 7z：注释/拆分/反查/符号/音效）──────────────────────
-# 源：虎爪输入法-*.7z（默认从 $SRC 自动探测；--tigerclaw 显式指定）。
-# 按需流式取单文件（7z e -so），不解整包。缺 7z / 找不到包时跳过（不阻断安装）。
+# ── 3) 资源装配（注释/拆分/反查/符号/音效）────────────────────────────────
+# 默认随 assets/ 一起装配；仅外部源模式（--from）从虎爪 7z 按需流式取
+# 单文件（7z e -so，不解整包）。缺 7z/找不到包时跳过（不阻断安装）。
 assemble_assets() {
+    if [[ "$USE_ASSETS" == 1 ]]; then
+        echo '  · 资源已随仓库 assets/ 装配（跳过虎爪 7z）'
+        return 0
+    fi
     local tc7z="${TC7Z:-}"
     if [[ -z "$tc7z" ]]; then
         tc7z="$(ls "$SRC"/虎爪输入法-*.7z 2>/dev/null | head -1 || true)"
@@ -186,28 +218,17 @@ assemble_assets() {
     extract 'TigerClaw/sounds/KeyPop.wav' "$DATA_DIR/音效/select.wav"
     extract 'TigerClaw/sounds/KeySpace.wav' "$DATA_DIR/音效/commit.wav"
     extract 'TigerClaw/sounds/KeyFunc.wav' "$DATA_DIR/音效/page.wav"
-
-    # 配置：反查=全拼（虎爪 拼音.txt）；unicode 注释与拆分显示打开
-    if [[ -f "$DATA_DIR/config.json" ]] && command -v jq >/dev/null 2>&1; then
-        local t="$DATA_DIR/config.json.tmp.$$"
-        if jq '.reverse.scheme = "拼音"
-               | .candidates.split_scheme = "虎码"
-               | .candidates.show_unicode_comment = true
-               | .candidates.show_split = true' \
-            "$DATA_DIR/config.json" > "$t" 2>/dev/null; then
-            mv "$t" "$DATA_DIR/config.json"
-            echo '  ✓ 配置：反查=拼音（全拼）；unicode 注释/拆分显示已开'
-        else
-            rm -f "$t"
-            echo '  • 配置更新失败（jq），请在设置页手动开启反查/注释'
+    echo '  ✓ 注释/拆分/反查/符号/音效 已就位'
+    if command -v jq >/dev/null 2>&1 && [[ -f "$DATA_DIR/config.json" ]]; then
+        if [[ "$(jq -r '.reverse.scheme // ""' "$DATA_DIR/config.json" 2>/dev/null)" == "" ]]; then
+            echo '  · 提示：反查方案为空——如需拼音反查，请在设置页把「反查方案」设为 拼音'
         fi
     fi
-    echo '  ✓ 注释/拆分/反查/符号/音效 已就位'
 }
 
-# ── 3) 用户级安装（引擎 + 服务 + 设置入口） ────────────────────────────────
+# ── 4) 用户级安装（引擎 + 服务 + 设置入口） ────────────────────────────────
 install_user() {
-    say '④ 安装 hufu-server + systemd user 服务 + 设置入口'
+    say '⑤ 安装 hufu-server + systemd user 服务 + 设置入口'
     mkdir -p "$BIN_DIR"
     install -m 755 "$SERVER_BIN" "$BIN_DIR/hufu-server"
 
@@ -231,9 +252,9 @@ install_user() {
     fi
 }
 
-# ── 4) 系统级安装（fcitx5 addon） ──────────────────────────────────────────
+# ── 5) 系统级安装（fcitx5 addon） ──────────────────────────────────────────
 install_system() {
-    say '⑤ 安装 fcitx5 addon（需要 sudo）'
+    say '⑥ 安装 fcitx5 addon（需要 sudo）'
     sudo install -Dm755 "$ADDON_SO" /usr/lib/fcitx5/libhufu.so
     sudo install -Dm644 "$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf" \
         /usr/share/fcitx5/addon/hufu.conf
@@ -267,7 +288,7 @@ install_user
 if [[ "$NO_SYSTEM" == 0 ]]; then
     install_system
 else
-    say '⑤ 跳过系统级 addon 安装（--no-system）'
+    say '⑥ 跳过系统级 addon 安装（--no-system）'
     echo "  之后执行：sudo install -Dm755 $ADDON_SO /usr/lib/fcitx5/libhufu.so"
     echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf /usr/share/fcitx5/addon/hufu.conf"
     echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf /usr/share/fcitx5/inputmethod/hufu.conf"

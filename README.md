@@ -116,8 +116,8 @@ fcitx5 -r -d                # 重启 fcitx5
 fcitx5-configtool           # 输入法 → 添加「虎符」
 ```
 
-默认从 `/home/crux/下载/_res/zhmn` 装配码表（`--from <目录>` 可换源）；
-设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。详见
+默认数据**随仓库自带**（`assets/`，模型除外），`--from <目录>`
+可换外部码表源；设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。详见
 [platform/linux/README.md](platform/linux/README.md)。
 
 ## 构建
