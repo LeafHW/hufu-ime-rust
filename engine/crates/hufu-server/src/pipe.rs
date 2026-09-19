@@ -466,7 +466,12 @@ pub fn dispatch(
                     .and_then(|c| c.clone())
                     .unwrap_or(serde_json::Value::Null),
             };
+
+            // 【二十九修·首显滑动】组段首帧带滑动起点（None=常规帧）
+            // 【Linux 适配】候选窗代画收口到 platform::cand_show：Windows
+            // 转发 candwin（保留上述首显滑动语义），Linux 由前端自绘（no-op）。
             crate::platform::cand_show(items, raw, sel, x, y, skin);
+          
             serde_json::json!({"ok": true})
         }
         "cand_hide" => {

@@ -258,6 +258,27 @@ pub struct Shared {
     /// 候选窗首帧抑制后的补显标记：poll 轮询看到本位且 raw 非空时
     /// 无条件刷新（布局稳定后以正确位置显示，消除首帧错位跳变）。
     pub suppress_pending: bool,
+    /// 【三十修·抑制保险丝】组段首帧抑制（无锚/WPS 收敛）的起始时刻：
+    /// 超过 500ms 强制放行（用现有锚链尽力显示）——原稳定判据与熔断
+    /// 都以 g.caret.is_some() 为闸，GetTextExt 持续失败的宿主=永不显
+    /// 示（探针 NO-SHOW 实锤的代码洞）。正常显示/断段即清。
+    pub suppress_since: Option<std::time::Instant>,
+    /// 【三十修·迟到首显免滑】首帧因无锚/WPS 收敛被抑制过（等了一轮
+    /// 35ms+ 才显示）的首显：不再播入场滑——等待已经吃掉「入场」的
+    /// 心理时段，迟到后再滑 75ms=145ms 拖尾（用户实锤「划动明显卡」
+    /// 的组成）。直接落位一次出现。正常首显（帧 1 锚就位）照滑。
+    pub entered_late: bool,
+    /// 【三十修·WPS 伪首段】本进程内是否已成功显示过候选。三十三修焦点
+    /// 重置清 sticky 后，切焦回来的首个组段被当「进程首段」吃 100ms
+    /// 固定等待（真防御目标=进程第一次在 WPS 打字的旧布局期）——
+    /// 用本旗区分真首段（等 100ms）与切焦伪首段（锚在即显，记事本
+    /// 同语义）。跨焦点保留（进程生命周期）。
+    pub cand_shown_in_proc: bool,
+    /// 【三十四修·段间键宽自校准】单 CJK 字上屏待采样旗：Op::Commit
+    /// 置位，下一段首键锚点与上段 sticky 落点作差=真实全角字宽，半之
+    /// 校准 caret_est_unit_w（修 WPS/QQ 兜底 0.41×行高低估 40%）。一次性
+    /// 消费；焦点切换即清（跨窗无效配对）。
+    pub commit_cjk1: bool,
     /// 【WPS caret 收敛 2026-09-07】WPS 族（et 表格实测）组段首显前
     /// 做插入点收敛检测：每轮记录 GetTextExt rect，连续两轮相同视为
     /// 布局稳定才首显；上限 300ms 兜底强制显示。此前固定 35ms 补显
@@ -469,6 +490,10 @@ impl Shared {
             shift_down: false,
             aux_active: false,
             suppress_pending: false,
+            suppress_since: None,
+            entered_late: false,
+            cand_shown_in_proc: false,
+            commit_cjk1: false,
             wps_caret_prev: None,
             wps_settle_start: None,
             cand_shown_this_segment: false,
@@ -1133,6 +1158,9 @@ fn handle_set_focus(
         g.last_show = None;
         g.cand_sig_last = String::new();
         g.suppress_pending = false;
+        g.suppress_since = None;
+        g.entered_late = false;
+        g.commit_cjk1 = false; // 【三十四修】跨焦点配对无效
         g.cand_shown_this_segment = false;
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
@@ -1186,8 +1214,47 @@ fn handle_set_focus(
 /// 【二十五修】trace 开关快速查询：观测调用点在 format! 之前先查
 /// ——生产（trace 关）时每帧白付 format! 分配（动画期 5ms/帧）。
 pub fn trace_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() == Ok("1"))
+    // 【三十四修·热生效】旗标文件每 500ms 重查一次（时间戳节流，热路径
+    // 零 stat 开销）——不再 OnceLock 终身缓存：此前开 trace 必须重启宿
+    // 主（DCOM 拉起的进程永远拿不到后创建的旗标），诊断一轮一重启。
+    // 状态：-1 未初始化 0 关 1 开；环境变量通道仅初始化时查一次。
+    use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+    static STATE: AtomicI8 = AtomicI8::new(-1);
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_CHECK_MS.load(Ordering::Relaxed);
+    if STATE.load(Ordering::Relaxed) < 0 || now_ms < last || now_ms - last > 500 {
+        let on = std::path::Path::new(r"C:\ProgramData\HuFu\trace\trace-on").exists();
+        if !on {
+            let v = std::env::var("HUFU_TRACE").unwrap_or_default();
+            let env_on = !v.is_empty() && v != "0";
+            STATE.store(if env_on { 1 } else { 0 }, Ordering::Relaxed);
+        } else {
+            STATE.store(1, Ordering::Relaxed);
+        }
+        LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+    }
+    STATE.load(Ordering::Relaxed) == 1
+}
+
+/// 【二十九修·诊断】trace 落盘路径：HUFU_TRACE=1 → %TEMP% 默认名；
+/// 其余非空值 → 字面路径（AppContainer 宿主如 SearchHost 写不了
+/// %TEMP%——「SearchHost 永远无 trace」的根因；配一个对所有应用包
+/// 开写的目录即可取到内部分支视角）。
+pub fn trace_path() -> std::path::PathBuf {
+    // 【三十修·旗标文件】同 trace_on：DCOM 宿主走文件旗标通道。
+    if std::path::Path::new(r"C:\ProgramData\HuFu\trace\trace-on").exists() {
+        return std::path::PathBuf::from(r"C:\ProgramData\HuFu\trace\trace.log");
+    }
+    let v = std::env::var("HUFU_TRACE").unwrap_or_default();
+    if v.is_empty() || v == "0" || v == "1" {
+        std::env::temp_dir().join("hufu-tsf-trace.log")
+    } else {
+        std::path::PathBuf::from(&v)
+    }
 }
 
 pub fn trace(msg: &str) {
@@ -1195,7 +1262,10 @@ pub fn trace(msg: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
-    if !*ON.get_or_init(|| std::env::var("HUFU_TRACE").as_deref() == Ok("1")) {
+    // 【三十修·开关统一】旧实现本函数自有一道 HUFU_TRACE=="1" 直查——
+    // trace_on() 的旗标文件通道对它恒灭（WPS 实测零 trace 的根因：
+    // DCOM 宿主无环境变量，旗标又只点亮别处）。统一走 trace_on()。
+    if !trace_on() {
         return;
     }
     let exe = EXE.get_or_init(|| {
@@ -1210,7 +1280,7 @@ pub fn trace(msg: &str) {
         .unwrap_or(0);
     let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
     let reopen = |_g: &mut Option<std::fs::File>| -> Option<std::fs::File> {
-        let path = std::env::temp_dir().join("hufu-tsf-trace.log");
+        let path = trace_path();
         // 轮转：超 8MB 归档 .old（旧 .old 覆盖）
         if let Ok(md) = std::fs::metadata(&path) {
             if md.len() > 8 * 1024 * 1024 {
@@ -2262,11 +2332,29 @@ impl EditSession_Impl {
                 if !text.is_empty() {
                     g.hupo_had_commit = true;
                 }
+                // 【三十四修·段间键宽自校准】单 CJK 字上屏 → 记待采样旗：
+                // 下一段首键锚点 − 本段 sticky 落点 = 真实全角字宽（观察
+                // 量，零估算），半之即半角键宽。多字/整句上屏不采样。
+                if text.chars().count() == 1
+                    && is_cjk_fullwidth(text.chars().next().unwrap_or(' '))
+                {
+                    g.commit_cjk1 = true;
+                }
                 if g.caret_est_line_h > 0 {
                     let mut w = 0.0f32;
                     for c in text.chars() {
+                        // 【三十四修·估宽用校准键宽】全角=2×unit（校准后即
+                        // 真实字宽）、半角=unit——替代 0.41/0.6×行高的粗略
+                        // 系数（实测 WPS 行高 18 时估 10.8 vs 真实 22，est
+                        // 落后真值 → 过期 GetTextExt 被放行=回弹温床）。
                         w += if c.is_ascii() {
-                            g.caret_est_line_h as f32 * 0.41
+                            if g.caret_est_unit_w > 0.5 {
+                                g.caret_est_unit_w
+                            } else {
+                                g.caret_est_line_h as f32 * 0.41
+                            }
+                        } else if g.caret_est_unit_w > 0.5 {
+                            g.caret_est_unit_w * 2.0
                         } else {
                             g.caret_est_line_h as f32 * 0.6
                         };
@@ -3044,6 +3132,41 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     ));
 }
 
+/// 【三十四修·chase 实验通道】追赶式跟随开关：C:\ProgramData\HuFu\diag\chase
+/// 旗标文件存在=启用（指数逼近+限速，替代 pos_anim 逐段插值）。即开即
+/// 关：每次 show 现查文件，下一次首显生效，无需重启宿主。生产默认关。
+pub fn chase_on() -> bool {
+    std::path::Path::new(r"C:\ProgramData\HuFu\diag\chase").exists()
+}
+
+/// 【三十四修·段间键宽自校准】CJK 全角字判定（上屏宽度采样配对用）。
+fn is_cjk_fullwidth(c: char) -> bool {
+    matches!(c as u32,
+        0x3000..=0x303F   // CJK 标点
+        | 0x3400..=0x4DBF // 扩展 A
+        | 0x4E00..=0x9FFF // 基本区
+        | 0xF900..=0xFAFF // 兼容
+        | 0xFF00..=0xFF60 // 全角形式
+    )
+}
+
+/// 【三十四修·selection 播种 est】组段首键 selection 锚被采纳时，把 est
+/// 基线一并播种到该真值（x/y/行高/校准采样点）——否则 est 停在上屏估宽
+/// 推进的位置（0.6×行高/字，系统性小于真实字宽），下一键 WPS 惰性
+/// GetTextExt 返回的过期位置相对落后 est 仅几 px 被连续性过滤器放行，
+/// 锚点序列倒退（trace 实锤 963→937=chase 回弹）。播种后：过期值相对真
+/// 值倒退超阈被拒，est 步进从真值出发前推；下一键标准链重校自然接管。
+fn seed_est_from_anchor(g: &mut Shared, r: &RECT) {
+    g.caret_est_x = r.left;
+    g.caret_est_y = r.top;
+    g.caret_est_line_h = (r.bottom - r.top).max(8);
+    g.caret_est_wrap = 0;
+    g.caret_est_last_raw = g.cur_raw_len as i32;
+    // 校准采样点=本锚：下一键标准链成功查询时 Δraw=1 出干净键宽样本。
+    g.caret_est_cal_raw = g.cur_raw_len as i32;
+    g.caret_est_cal_x = r.left;
+}
+
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【旧锚点快照 2026-09-11】旧实现开头即 g.caret=None，末尾失败
     // 分支却注释「保留旧 caret」——实际锚点已丢（候选窗闪回兜底位）。
@@ -3173,6 +3296,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         dx, dy
                     ));
                 } else {
+                    // 【三十四修·selection 播种 est】采纳时同步播种 est 基
+                    // 线（原只设 g.caret，est 还停在上屏估宽值——估宽 0.6×
+                    // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
+                    // 性 GetTextExt 返回的过期值「相对 est 合理」被连续性
+                    // 过滤器放行 → 锚点序列倒退=chase 回弹，trace 实锤 963
+                    // →937）。播种后过滤器以真值为参照，过期值被正确拒绝。
+                    seed_est_from_anchor(g, &r);
                     g.caret = Some(r);
                     return;
                 }
@@ -3188,6 +3318,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     None => true,
                 };
                 if near {
+                    // 【三十四修·selection 播种 est】同上
+                    seed_est_from_anchor(g, &r);
                     g.caret = Some(r);
                     return;
                 }
@@ -3930,11 +4062,20 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         if g.cand2_dead {
             // owned 窗建不出（WARP 失败/超时等）→ server 代画兜底
-            //（位置同链跟光标：SearchHost 兜不到才退 (12,12)）
+            //（位置同链跟光标）。
             let caret_pos = g
                 .caret
                 .map(|r| (r.left, r.bottom + 4))
                 .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
+            // 【二十九修·删角落框 2026-09-18】SearchHost 锚点链偶发全灭
+            //（段切换瞬间），v1.6.1 的 (12,12) 兜底=屏幕左上角幻影候选框
+            //（用户实锤「偶尔出来一个候选框」）。锚缺失时跳过本帧不推
+            //——下一帧锚即回（跟随语义已验证），不画比画错好。
+            if host_is_searchhost() && caret_pos.is_none() {
+                drop(g);
+                trace("SearchHost 锚缺失 → 跳过本帧（不推左上角兜底）");
+                return Ok(());
+            }
             let (x, y) = if host_is_searchhost() {
                 caret_pos.unwrap_or((12, 12))
             } else {
@@ -3951,7 +4092,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             return Ok(());
         }
         // ↓ 与常规宿主同一条显示路径（共用锚点链/抑制逻辑/show）
-        let skin = g.skin.clone();
+        let mut skin = g.skin.clone();
         let preview_anchor = state.get("preview_anchor").cloned();
         // 【七十二修·虎魄光标跟随】七十一修补2 曾对虎魄跳过 gui 兜底
         //（Qt 光标线旧值污染）——七十二修后虎魄锚恒=GUITHREADINFO 插
@@ -4004,8 +4145,20 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             }
             g.cand2_dead = true;
             let (x, y) = if sh {
-                // 【用户定稿】开始菜单：候选固定屏幕左上角（cloak 兜底）
-                (12, 12)
+                // 【二十九修·删角落框 2026-09-18】原「定稿固定左上角
+                // (12,12)」——用户实锤「打字时屏幕左上角偶尔冒候选框」：
+                // 本分支是 SearchHost 每段首个可见帧，(12,12) 后下一帧
+                // 才跳回搜索框=肉眼可见的角落闪框。本分支的 caret 链
+                //（组段锚→系统插入符→owner 窗矩形）在此早已算好——
+                // 用真实锚；全灭才跳帧不画（下一帧锚回来即恢复）。
+                match caret.map(|r| (r.left, r.bottom + 4)) {
+                    Some(p) => p,
+                    None => {
+                        drop(g);
+                        trace("SearchHost cloak 兜底帧锚缺失 → 跳过");
+                        return Ok(());
+                    }
+                }
             } else {
                 caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
             };
@@ -4048,6 +4201,48 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
             } else {
+                // 【二十九修 2026-09-18】owned 车道补首显注入：打包宿主
+                // （商店版记事本/开始菜单/UWP 应用）的候选窗走本车道渲
+                // 染，而首显滑动注入只装在常规车道——这些宿主的首显滑
+                // 动永不臂（用户实锤「记事本/UWP/开始菜单没有入场划动
+                // 效果」，notepad 探针 trace 里连一行『首显注入』都没
+                // 有，show 直落）。unit 链砍掉锚高档：本车道兜底锚=宿
+                // 主窗矩形（不是光标），高度没有每键宽语义，×0.41 会得
+                // 到荒谬大值；est 全灭时直接字号 em（全角近似，随字号
+                // 缩放/滚轮放大跟随）。注入帧的 raw 新鲜度随宿主帧序漂
+                // 移（同常规车道四修教训），只注 unit，起点由 show() 从
+                // 目标位反推。
+                // 【三十三修回退 2026-09-19】owned 车道与常规车道同口径
+                // 回退：行程基准回到半角键宽（est ×1、行高 0.41、em×0.5）；
+                // 入场快滑节奏保留。
+                let fseg_own = !g.cand_shown_this_segment && !is_preview;
+                if fseg_own {
+                    let unit = if g.caret_est_unit_w > 0.5 {
+                        g.caret_est_unit_w
+                    } else if g.caret_est_line_h > 0 {
+                        g.caret_est_line_h as f32 * 0.41
+                    } else {
+                        crate::candwin2::layout_f(&skin, "font_point", 16.0)
+                            * 96.0
+                            / 72.0
+                            * 0.5
+                    };
+                    if trace_on() {
+                        trace(&format!(
+                            "首显注入(owned): unit={unit:.1} raw='{}' cands={}",
+                            raw,
+                            cands.len()
+                        ));
+                    }
+                    if unit > 0.5 {
+                        if let Some(ro) = skin.as_object_mut() {
+                            ro.insert(
+                                "first_show_unit".into(),
+                                serde_json::json!(unit),
+                            );
+                        }
+                    }
+                }
                 if let Some(c) = g.cand2.as_mut() {
                     c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 }
@@ -4061,12 +4256,19 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         g.cand_shown_this_segment = true;
         g.suppress_pending = false;
     } else if g.cand_ui_active {
-        // server 代画续帧：位置与首帧同链（SearchHost 也跟系统插入符，
-        // 兜不到才退 (12,12)——2026-09-11 从固定左上角升级）。
+        // server 代画续帧：位置与首帧同链（SearchHost 也跟系统插入符）。
         let caret_pos = g
             .caret
             .map(|r| (r.left, r.bottom + 4))
             .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
+        // 【二十九修·删角落框】同上：SearchHost 锚偶发全灭的瞬间帧
+        //（段切换等）不推 (12,12)——server 窗保持上一位置，下一帧锚
+        // 回来即恢复跟随。角落幻影框的最后一个源头。
+        if host_is_searchhost() && caret_pos.is_none() {
+            drop(g);
+            trace("SearchHost 续帧锚缺失 → 跳过本帧");
+            return Ok(());
+        }
         let (x, y) = if host_is_searchhost() {
             caret_pos.unwrap_or((12, 12))
         } else {
@@ -4142,8 +4344,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 入符（当时锚=selection 行底，插入符行内，切换=「往上
                 // 面移」）。七十二修定稿：虎魄锚恒=GUITHREADINFO 插入符
                 //（光标跟随），first_show 与段内同源无切换。
+                // 【二十九修 2026-09-18】gui 插入符退化挡路修复：焦点
+                // 切换后首键 GUITHREADINFO 常给点矩形（右=左+2、上下
+                // 相等，无行高语义，AB 探针+trace 实锤 (111,436,113,
+                // 436)）——它 Some() 挡住 g.caret（GetTextExt 整行框）
+                // →首显锚错位→~140ms 后真锚到达再滑正=「切窗首键动
+                // 效卡」多版本根因。点矩形视为无值让位查询锚；有效
+                // 插入符（WPS/Qt 真光标线）行为不变仍优先。
                 if first_show_of_seg {
-                    gui_caret_fallback().or(g.caret)
+                    gui_caret_fallback()
+                        .filter(|r| r.bottom - r.top > 2)
+                        .or(g.caret)
                 } else {
                     g.caret
                 }
@@ -4179,6 +4390,38 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             caret.or_else(gui_caret_fallback)
         };
         let is_preview = preview_anchor.is_some();
+        // 【三十四修·段间键宽自校准】单 CJK 字上屏后，下一组段首锚点与
+        // 上段窗口 sticky 落点（内容锚点系，同系可作差）的差=真实全角
+        // 字宽，半之即半角键宽——直接校准 est unit，修 WPS/QQ 兜底
+        // 0.41×行高的系统性低估（实测 WPS 4.3 vs 真实 7、QQ 6 vs 11，
+        // 首显滑行程同步变短=「虎娘更快」的观感来源）。首次采纳、其后
+        // 0.5/0.5 平滑；同行(|dy|≤12)且前进量合理(4..=200px)才采纳；
+        // 一次性消费（点击/换行/跨窗的无效配对直接弃用）。
+        if g.seg_key_index == 1 && g.commit_cjk1 && g.caret.is_some() {
+            g.commit_cjk1 = false;
+            let c = g.caret.unwrap();
+            if let Some((sx, sy)) = g.cand2.as_ref().and_then(|cc| cc.sticky_xy()) {
+                let dx = c.left - sx;
+                let dy = (c.top - sy).abs();
+                if dy <= 12 && (4..=200).contains(&dx) {
+                    let sample = dx as f32 / 2.0;
+                    let old = g.caret_est_unit_w;
+                    g.caret_est_unit_w = if old <= 0.5 {
+                        sample
+                    } else {
+                        (old * 0.5 + sample * 0.5).clamp(2.0, 120.0)
+                    };
+                    if trace_on() {
+                        trace(&format!(
+                            "段间键宽校准: dx={dx} sample={sample:.2} unit {old:.2}→{:.2}",
+                            g.caret_est_unit_w
+                        ));
+                    }
+                } else if trace_on() {
+                    trace(&format!("段间键宽配对弃用: dx={dx} dy={dy}"));
+                }
+            }
+        }
         // DComp 直通窗在 SearchHost（开始菜单搜索）里被 DWM 整体
         // cloaked（显示中但不可见，实测 cloak=2 逐帧持续）；v1 混合窗
         // 同被隐身，自绘路线在该宿主是死路 → 切 server 代画（左上角）。
@@ -4200,15 +4443,23 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             // （BeginUIElement）再定通道，否则首轮直接落入 server 分支
             g.cand2_dead = true;
             let (x, y) = if sh {
-                // 【用户定稿】开始菜单：候选固定屏幕左上角
-                (12, 12)
+                // 【二十九修·删角落框】同 owned 分支：用真实锚链，缺失跳帧
+                //（原「定稿固定左上角」=用户实锤的偶发角落框源头）。
+                match caret.map(|r| (r.left, r.bottom + 4)) {
+                    Some(p) => p,
+                    None => {
+                        drop(g);
+                        trace("SearchHost cloak 死亡帧锚缺失 → 跳过");
+                        return Ok(());
+                    }
+                }
             } else {
                 caret.map(|r| (r.left, r.bottom + 4)).unwrap_or((100, 100))
             };
             let raw_c = raw.clone();
             drop(g);
             diag_note(if sh {
-                "cw2 连续 cloaked → 切换双通道候选（左上角）"
+                "cw2 连续 cloaked → 切换双通道候选（跟光标）"
             } else {
                 "cw2 持续 cloaked（非开始菜单）→ server 跟光标代画"
             });
@@ -4286,14 +4537,25 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 住 2 轮 35ms 补显重查 + Qt 36ms 布局）；错位防线不变——
         // caret.is_some() 门未就绪依然不显示。
         let (wps_stable, wps_deadline) = if first_seg_ever || cell_seg {
-            let wait_ms = if cell_seg { 200 } else { 100 };
+            // 【三十修·伪首段分流】切焦回来 sticky 被三十三修清掉→first_seg_ever
+            // 真假难辨——进程已显示过（cand_shown_in_proc）=切焦伪首段，锚在
+            // 即显（wait 0，记事本同语义）；真首段（进程第一次）保留 100ms
+            // 旧布局防御；表格段维持 200ms（用户拍板宁慢勿错）。
+            let wait_ms = if cell_seg {
+                200
+            } else if g.cand_shown_in_proc {
+                0
+            } else {
+                100
+            };
             (
                 g.wps_settle_start
                     .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(wait_ms))
                     && g.caret.is_some(),
+                // 【三十修·熔断解绑】原 500ms 熔断也要求 caret.is_some()——
+                // GetTextExt 持续失败=永不显示。熔断只看时间，锚尽力。
                 g.wps_settle_start
-                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500))
-                    && g.caret.is_some(),
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500)),
             )
         } else {
             (
@@ -4317,21 +4579,48 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if ed6.is_some() {
             g.ed6_prev = ed6;
         }
-        let no_anchor = g.caret.is_none() && !any_has_prev && ed6.is_none();
+        // 【三十修·锚到即显】no_anchor 判链尾锚（含有效系统插入符）而非
+        // 仅 GetTextExt：WPS/Qt 宿主帧 1 查询锚常败但插入符线就在真位
+        // ——原判据无视它 → 35ms 抑制重查 → 首键 70ms+ 才见窗（用户
+        // 实锤「首键出候选慢」的残留）。链尾有锚=立即显示。
+        let no_anchor = caret.is_none() && !any_has_prev && ed6.is_none();
         // 【四十次修正·定稿】删 ed6 豁免：EXCEL6 与 GetTextExt 同样
         // 滞后一拍（上格编辑框残留、窗口移动晚于 TSF 组段——probe+
         // trace 同轮实锤：格1 帧 ed6=上轮格3 残留框、查询值=旧格）。
         // 表格每段首显固定 200ms 等待（同文档首段），框外过滤在到点
         // 后兜底拦旧布局值。
+        // 【三十一修·活锚即显 2026-09-18】切焦首段首键的三重结构性延迟：
+        // ①焦点重置清 sticky → sticky_near 豁免永不可达；②wps_stable 的
+        // settle 计时器只在抑制帧武装 → 首帧 settle_start 恒 None → 即使
+        // wait_ms=0 也必吃一轮 35ms 补显钟；③抑制过的首显又被 entered_late
+        // 剥掉入场滑 = 「首键又慢又没动效」。而首键锚源本就是活值（seg=1
+        // selection 优先，宿主实时给插入点；切焦场景光标未动，即便懒布局
+        // 返回旧值也≈真值），等 35ms 后显示用的还是同一个 g.caret——纯延
+        // 迟零收益。处理：伪首段（进程已显示过=切焦回来）+ 非表格段 +
+        // TSF 活锚在 → 首帧即显，入场滑照播（与连打段 sticky_near 豁免同
+        // 语义）。真首段（进程第一段，WPS 文档刚打开旧布局期 100ms 防御）
+        // 与表格段（200ms 宁慢勿错，用户拍板）维持原等待。
+        let fresh_anchor = !cell_seg && g.cand_shown_in_proc && g.caret.is_some();
         let wps_wait = wps_settle
             && !(wps_stable || wps_deadline)
-            && !((any_has_prev && !cell_seg) && sticky_near);
+            && !((any_has_prev && !cell_seg) && sticky_near)
+            && !fresh_anchor;
+        // 【三十修·无锚熔断】no_anchor 抑制同样只看时间（500ms 后放行，
+        // 锚链尽力显示）——原链无时间上限，GetTextExt 永败宿主=永不显示。
+        let starved = g
+            .suppress_since
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500));
         let suppress = !compless
             && (no_anchor || wps_wait)
+            && !starved
             && !pinned_now
             && !host_is_searchhost()
             && !is_preview; // 实机预览：锚点即位置，不走 caret 抑制链
         if suppress {
+            if g.suppress_since.is_none() {
+                g.suppress_since = Some(std::time::Instant::now());
+            }
+            g.entered_late = true; // 【三十修】迟到首显：显示帧免入场滑
             if let Some(c) = g.cand2.as_mut() {
                 c.hide_suppress();
             }
@@ -4356,11 +4645,21 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 显）；整句由 skin.sentence_active 门控（server 注入，跟方案
         // 走）；小窗线程（加词/加权弹窗候选）与设置页预览不滑。
         let mut skin = skin;
-        if first_show_of_seg && !is_preview && !crate::addword::in_window_thread() {
+        // 【三十修·迟到免滑】抑制等待过的首显不注入每键宽=不臂入场滑
+        //（等待即入场，迟到再滑=拖尾卡感）。
+        if first_show_of_seg && !g.entered_late && !is_preview && !crate::addword::in_window_thread() {
             // 【首显滑动 2026-09-18 三修】每键宽兜底链：est 校准值 →
             // est 行高×0.41 → 锚矩形高×0.41（新进程首段 est 全零时，
             // 细光标宿主的 caret 高=真实行高，直接可用——否则进程
             // 起来后第一段永远不滑，用户实测「怎么没效果」同源）。
+            // 【二十九修 2026-09-18】最终档=皮肤字号 em：UWP/开始菜单
+            // 宿主 est 链全灭且 caret 矩形退化为 0 高，前三档全灭→
+            // 这些宿主永远不滑（用户 10h 实测报告）。距离是近似值，
+            // 但动效恒在且随字号缩放/滚轮放大自动跟随。
+            // 【三十三修回退 2026-09-19 用户实测】全角行程在多数宿主
+            // 过头（Typora 起点偏远），回退半角键宽基准；candwin2 侧
+            // 的入场快滑节奏（4.0 系数/100ms 上限）保留——行程回小后
+            // 落定更快。
             let anchor_h = caret
                 .as_ref()
                 .map(|r| (r.bottom - r.top) as f32)
@@ -4372,7 +4671,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             } else if anchor_h > 4.0 {
                 anchor_h * 0.41
             } else {
-                0.0
+                crate::candwin2::layout_f(&skin, "font_point", 16.0) * 96.0 / 72.0 * 0.5
             };
             // 【首显滑动 2026-09-18 四修】不再注入 from_x——注入帧的
             // raw/caret 新鲜度随宿主帧序漂移（实测探针宿主首显帧
@@ -4416,18 +4715,37 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         // 显示完成：清除首帧抑制补显标记
         g.cand_shown_this_segment = true;
+        // 【三十修】进程级显示过旗（伪首段分流）+ 抑制熔断/迟到标记复位
+        g.cand_shown_in_proc = true;
+        g.suppress_since = None;
+        g.entered_late = false;
         g.wps_caret_prev = None;
         g.wps_settle_start = None;
         g.suppress_pending = false;
     } else {
         // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
         // （Deactivate→再 Activate 的状态漂移）：SearchHost 直接
-        // server 代画自愈（左上角）；其他宿主复位 dead 下一帧重建自绘
+        // server 代画自愈；其他宿主复位 dead 下一帧重建自绘
         if host_is_searchhost() {
-            let raw_c = raw.clone();
-            drop(g);
-            diag_note("cand2_dead 漂移自愈 → server 代画（左上角）");
-            ui_element_show(&shared, &cands, &raw_c, sel, 12, 12);
+            // 【二十九修·删角落框】原硬编码 (12,12)=用户实锤的偶发左上
+            // 角候选框（Deactivate/Activate 漂移时机触发、滞留到下次收
+            // 窗）。改锚点链，缺失跳帧不画。
+            let pos = g
+                .caret
+                .map(|r| (r.left, r.bottom + 4))
+                .or_else(|| gui_caret_fallback().map(|r| (r.left, r.bottom + 4)));
+            match pos {
+                Some((x, y)) => {
+                    let raw_c = raw.clone();
+                    drop(g);
+                    diag_note("cand2_dead 漂移自愈 → server 代画（跟锚）");
+                    ui_element_show(&shared, &cands, &raw_c, sel, x, y);
+                }
+                None => {
+                    drop(g);
+                    trace("漂移自愈帧锚缺失 → 跳过");
+                }
+            }
         } else {
             g.cand2_dead = false;
         }
@@ -4736,6 +5054,7 @@ fn pipe_cand_push(
 fn ui_element_hide(shared: &SharedRef) {
     use windows::Win32::UI::TextServices::ITfUIElementMgr;
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.suppress_since = None;
     if !g.cand_ui_active {
         return;
     }
@@ -5543,6 +5862,7 @@ fn poll_tick() {
         if raw_empty {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
+            g.suppress_since = None;
             g.cand_shown_this_segment = false;
             g.wps_caret_prev = None;
             g.wps_settle_start = None; // click_sticky 保留：上屏帧垃圾锚需黏性拦

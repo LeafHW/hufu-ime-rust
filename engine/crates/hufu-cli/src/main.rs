@@ -499,6 +499,14 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut total_rerank_fired = 0usize; // 【rerank B 组】句中停顿重排实际触发次数
     let mut total_rerank_changed = 0usize; // 【rerank B 组】qwen 首选≠引擎原序首选的次数
     let mut key_us: Vec<u64> = Vec::new(); // 每键触达延迟（µs）
+    // 【残码档位 2026-09-19】每次提前上屏事件的残留码长（µs 无关，
+    // 字符数）：HUFU_BENCH_RESID_OUT=<文件> 时逐事件落盘，供档位分布
+    // 统计（残码档位-*.csv 同源数据）。
+    let mut resid_events: Vec<u64> = Vec::new();
+    // 【触达率 2026-09-19】每句的提前上屏事件数（不含收尾空格）：
+    // HUFU_BENCH_SENT_EARLY=<文件> 时逐句落盘——触达率=有≥1次提前上屏
+    // 的句子占比（护栏 A/B 对比的流畅度指标）。
+    let mut sent_early: Vec<u64> = Vec::new();
     let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dumped = 0usize;
     // 【行尾模拟 A/B】HUFU_BENCH_LINE_END=W（W>0 启用）：模拟 TSF 侧行尾
@@ -573,6 +581,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             }
         } else {
         let mut sent_events_this = 0usize;
+        let mut early_this = 0usize;
         // 【rerank B 组 v2】句中停顿点：打满 60% 编码时同步重排一次
         //（真机收益场景——句中停顿时 raw 尚长、Sentence 候选 ≥2；
         // 句末收尾时顶屏已推空 raw，request 恒 None，测不出重排）。
@@ -593,8 +602,11 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
                 early_commits += 1;
                 early_chars += c.chars().count() as u64;
                 early_max = early_max.max(c.chars().count());
+                let rl = sess.raw.chars().count() as u64;
                 early_resid += sess.raw.chars().count();
+                resid_events.push(rl);
                 sent_events_this += 1;
+                early_this += 1;
             }
             // 句中停顿重排（同步：等结果落地再继续打）
             if rerank_gguf.is_some() && keys_done == pause_at {
@@ -661,6 +673,7 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
             sent_events_this += 1; // 收尾空格也是一次上屏事件
         }
         sent_events.push(sent_events_this);
+        sent_early.push(early_this as u64);
         }
         total_chars += s.chars().count() as u64;
         if committed == *s {
@@ -675,6 +688,14 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     if let Some(path) = lat_out {
         std::fs::write(&path, key_us.iter().map(|u| u.to_string()).collect::<Vec<_>>().join("\n"))
             .expect("延迟文件写出失败");
+    }
+    if let Ok(path) = std::env::var("HUFU_BENCH_RESID_OUT") {
+        std::fs::write(&path, resid_events.iter().map(|u| u.to_string()).collect::<Vec<_>>().join("\n"))
+            .expect("残码事件文件写出失败");
+    }
+    if let Ok(path) = std::env::var("HUFU_BENCH_SENT_EARLY") {
+        std::fs::write(&path, sent_early.iter().map(|u| u.to_string()).collect::<Vec<_>>().join("\n"))
+            .expect("每句提前上屏文件写出失败");
     }
     if rerank_gguf.is_some() {
         println!("[RERANK] 句中停顿重排触发 {total_rerank_fired} 次 · qwen 首选与引擎原序分歧 {total_rerank_changed} 次（{}/{:.0}%）",

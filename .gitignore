@@ -7,15 +7,14 @@ dist/
 Thumbs.db
 hufu-data/
 
+# 平台构建产物
+platform/linux/build/
+platform/linux/target/
 platform/windows/target2/
+platform/windows/target-fix/
+platform/windows/target-verify/
 
 target-slim/
 target159/
-
-platform/windows/target-verify/
-
-# Linux 前端构建产物
-platform/linux/build/
-platform/linux/target/
 
 _tmp

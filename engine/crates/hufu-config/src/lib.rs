@@ -290,12 +290,29 @@ pub struct SentenceSection {
     /// 优先（bench 覆盖）。
     #[serde(default = "default_early_need")]
     pub early_need: usize,
+    /// 【同码分歧护栏 2026-09-19】提前上屏提交前，若候选池内存在距池首
+    /// 分差 ≤ early_diverg_gap、且文本在本次消耗跨度内与稳定前缀分歧的
+    /// 活候选（上屏将摧毁其词内切分），本键不上屏——保住句尾/停顿重排
+    /// （qwen）的换句余地。实例：gkzpuvjihujinkbky（却足以绊住流…）在
+    /// v5 模型下「收拾」第 17 键锁死整句。缺省关；HUFU_EARLY_DIVERG_GUARD=1
+    /// 环境变量等效开启（优先）。
+    #[serde(default)]
+    pub early_diverg_guard: bool,
+    /// 护栏分界 Δ（活候选距池首的分差上限）。实证：同码孪生全程落后
+    /// 2~7 分（拦），噪音候选（生僻字类）落后 ≥9 分（放）。默认 8.0；
+    /// HUFU_EARLY_DIVERG_GAP 环境变量优先。
+    #[serde(default = "default_diverg_gap")]
+    pub early_diverg_gap: f64,
     /// 组句权重（全部可调）
     pub weights: SentenceWeights,
 }
 
 fn default_early_need() -> usize {
     3
+}
+
+fn default_diverg_gap() -> f64 {
+    8.0
 }
 
 fn default_true() -> bool {
@@ -323,6 +340,8 @@ impl Default for SentenceSection {
             // （config.json 不存在）与 tbench 基准的兜底，此前 2 与
             // 产品定版 3 不一致（bench 口径偏差来源之一）。
             early_need: 3,
+            early_diverg_guard: false,
+            early_diverg_gap: 8.0,
             weights: SentenceWeights::default(),
         }
     }

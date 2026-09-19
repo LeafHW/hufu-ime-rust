@@ -527,7 +527,7 @@ fn color_f(v: &Value, key: &str, default: &str) -> D2D1_COLOR_F {
     }
 }
 
-fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
+pub(crate) fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
     v.pointer(&format!("/skin/layout/{key}"))
         .or_else(|| v.get("layout").and_then(|l| l.get(key)))
         .and_then(|x| x.as_f64())
@@ -640,6 +640,14 @@ pub struct CandidateWindowV2 {
     /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
     /// 而非一跳一跳。None=瞬移。
     pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant, u32)>,
+    /// 【三十四修·chase 实验通道】追赶式跟随目标：Some=正向该点收敛
+    /// （指数逼近+限速，纯时间基准）。与 pos_anim 互斥——臂发时互清。
+    /// 开关=C:\ProgramData\HuFu\diag\chase 旗标文件（tsf::chase_on）。
+    pub(crate) chase_target: Option<(i32, i32)>,
+    /// chase 的 dt 基准：上次 tick 时刻。None=臂发后首 tick（默认 8ms）。
+    chase_last: Option<std::time::Instant>,
+    /// chase 的浮点实位（子像素积分器；live_pos 是其取整镜像）。
+    chase_pos: Option<(f32, f32)>,
     /// 【顶屏钳位许可 2026-09-12 二十四次修正】仅 C&R（顶屏上屏）路径
     /// 置 true——「字宽<编码宽」的显示回退由正向钳位钉住原地等光标。
     /// 点击换位（SP 路径）不置=永不钳（用户实锤 75px 换位被幅度法误
@@ -824,6 +832,12 @@ impl CandidateWindowV2 {
             .is_some_and(|(sx, sy)| (x - sx).abs() <= 24 && (y - sy).abs() <= 24)
     }
 
+    /// 【三十四修·段间键宽自校准】sticky 落点（内容锚点坐标系，与
+    /// 锚点 rect 同系可直接作差）。
+    pub(crate) fn sticky_xy(&self) -> Option<(i32, i32)> {
+        self.sticky_pos
+    }
+
     /// 兼容入口：无主顶层窗（常规宿主原行为）。
     /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
     /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
@@ -947,6 +961,9 @@ impl CandidateWindowV2 {
                 size_ms: 90,
                 size_morph: false,
                 pos_anim: None,
+                chase_target: None,
+                chase_last: None,
+                chase_pos: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
                 anim_spd: std::cell::Cell::new(1.0),
@@ -1113,6 +1130,9 @@ impl CandidateWindowV2 {
                 size_ms: 90,
                 size_morph: false,
                 pos_anim: None,
+                chase_target: None,
+                chase_last: None,
+                chase_pos: None,
                 pos_ms: 100,
                 anim_on: std::cell::Cell::new(true),
                 anim_spd: std::cell::Cell::new(1.0),
@@ -1463,6 +1483,11 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
+        // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
+        // 「上一段落点」已变「本段落点」，起点≡终点，追赶永不臂=全程直
+        // 出（用户实测）。函数头先抢救上一帧的 sticky。
+        let sticky_prev = self.sticky_pos;
         // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
         // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
         // 或别的 SetWindowPos 直调）。
@@ -3261,18 +3286,20 @@ impl CandidateWindowV2 {
                     Some(r) => {
                         // 【实时光标跟随 2026-09-12 用户拍板】窗最左=
                         // 光标最右（rect.right）——紧贴光标右侧出现。
-                        // 【三十八修·总高屏幕判断】x/y 的 clamp 与翻转
-                        // 判断原用内容高宽——最终窗口还外扩 2×m_off
-                        //（阴影边距，大皮肤 20-40px）：竖排候选行多窗高
-                        // +大阴影时底部出屏 40-80px（用户实测"竖排靠下
-                        // 超出屏幕"）。统一改用含阴影的总尺寸。
-                        let ext = 2 * m_off;
-                        let x = (r.right).clamp(vx, (vx + vw - width as i32 - ext).max(vx));
+                        // 【三十八修·总高屏幕判断】曾把 2×m_off（阴影边
+                        // 距）计入 clamp 与翻转判断——【二十九修 2026-09-18
+                        // 用户拍板】废除：阴影是候选的附带装饰，边界收缩
+                        // 只该看候选本体。大阴影皮肤（radius 拉满→m_off
+                        // ~90px）被 ext=180px 平白顶离屏边，阴影越大推得
+                        // 越远=本末倒置。改回纯内容尺寸：内容贴边即可，
+                        // 阴影出屏由 DWM 裁掉（分层窗部分出屏无害，阴影
+                        // 本就不可交互）。竖排贴底若再现，另查内容高口径。
+                        let x = (r.right).clamp(vx, (vx + vw - width as i32).max(vx));
                         let below = r.bottom + 4;
-                        let y = if below + height as i32 + ext <= vy + vh {
+                        let y = if below + height as i32 <= vy + vh {
                             below
                         } else {
-                            (r.top - height as i32 - ext - 4).max(vy)
+                            (r.top - height as i32 - 4).max(vy)
                         };
                         // 【五十一修·y 稳定锁复刻 v1.5.2】老版本行为档
                         // 案实测（同 harness）：v1.5.0/1.5.2 段内 T 恒定
@@ -3496,7 +3523,9 @@ impl CandidateWindowV2 {
             // 已 clamp 的新 x 顶回旧位置——窗口变宽后旧 x+新宽超右缘
             //（用户实测：跟打器超长句候选框超出屏幕；宽度封顶后根因
             // 转到这里）。每帧输出前统一夹回，屏幕边界优先于位置记忆。
-            let x = x.clamp(vx, (vx + vw - width as i32 - shadow_m as i32).max(vx));
+            // 【二十九修】不再预留 shadow_m（同锚点 clamp 口径：只算
+            // 候选本体，阴影出屏裁掉）。
+            let x = x.clamp(vx, (vx + vw - width as i32).max(vx));
             let y = y.clamp(vy, (vy + vh - height as i32).max(vy));
             self.sticky_pos = Some((x, y));
             // 诊断：搜索框等宿主锚点缺失排查（visible=0 说明本帧被隐藏）
@@ -3601,6 +3630,13 @@ impl CandidateWindowV2 {
             // 【err=183 噪声修复 2026-09-08】GetLastError 在 API 成功时
             // 不清零——历史日志大量 err=183 是前序调用残留，误导排查
             //（SetWindowPos 实际成功）。仅真失败（返回 0）才报错。
+            // 【三十二修·首显时钟重锚 2026-09-19】入场滑的 t0 起算于臂
+            // 帧，但窗口真正出现在屏幕还要过 Present(1) 垂直同步等待 +
+            // DWM 合成——切焦点后宿主 UI 线程最忙，这段延迟放大到 1-3
+            // 个 vsync：窗口「出现在半路」再被 tick 拽着跳完剩余段 =
+            // 「切焦首显动效顿顿」（全宿主共有的观感）。SWP 之后把
+            // t0 重锚到当下，滑动从实际可见帧起播满全程。
+            let mut entrance_armed = false;
             let sp_ok = if !dragging {
                 // 【零位移·收窄轴向例外 2026-09-11】变宽轴向：窗口一步
                 // 到位=目标（每键仅一次 SWP，壳在稳定窗口内长大——用户
@@ -3626,7 +3662,90 @@ impl CandidateWindowV2 {
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
                 );
-                if was_visible && self.pos_ms > 0 && !self.internal_rerender {
+                let chase = crate::tsf::chase_on();
+                // 【三十四修·chase 实验通道】旗标文件即开即关（无需重启
+                // 宿主，下次首显生效）。语义=「窗口永远追赶光标」：目标=
+                // 本帧锚位，起点=当前实位（首显=sticky 旧位=本段编码左
+                // 端——真实位移零估算，距离恒准）；指数逼近（τ=35ms）+
+                // 限速（2.5px/ms），tick 饥饿时步幅自适应无跳变。臂发后
+                // 逐 tick 由 fade_tick_shared 步进。
+                if chase && self.pos_ms > 0 && !self.internal_rerender {
+                    self.pos_anim = None;
+                    let start = if was_visible {
+                        self.live_pos.get()
+                    } else {
+                        // sticky 存的是锚点坐标（未减阴影边距，见 3525 赋值
+                        // 与主 SWP 的 tx=x−shadow 同源）——先转窗口坐标系再
+                        // 作起点/距离门，否则首显起点偏右下=「从光标右下
+                        // 角移过来」（用户实测）。读 sticky_prev（函数头抢
+                        // 救的上一帧值）而非已被本帧覆盖的 self.sticky_pos。
+                        let m = (shadow_m * dpi_scale) as i32;
+                        let s = match sticky_prev {
+                            Some(s) => {
+                                let sw = (s.0 - m, s.1 - m);
+                                if (tx - sw.0).abs().max((ty - sw.1).abs()) <= 150 {
+                                    Some(sw)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
+                        // 【三十四修补·首段也有入场】无历史位（进程首段/焦
+                        // 点切换后首段）不直出：编码左端=锚左−码长×键宽
+                        // （tsf 注入的 first_show_unit，三十四修校准后即真
+                        // 实键宽；未校准进程首段用兜底值，仅近似一次）。
+                        let s = s.or_else(|| {
+                            first_show_unit.and_then(|u| {
+                                if u <= 0.5 {
+                                    return None;
+                                }
+                                let travel = ((raw.chars().count().max(1)) as f32
+                                    * u as f32)
+                                    .round() as i32;
+                                let cand = (tx - travel, ty);
+                                if (3..=150).contains(&travel) {
+                                    Some(cand)
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        let st = s.unwrap_or((tx, ty));
+                        self.live_pos.set(st);
+                        st
+                    };
+                    // 【三十四修补·死区】位移 <3px 直接落位（复刻旧动效
+                    // d<3 瞬跳语义）：锚点在 selection/GetTextExt/est 换
+                    // 源之间的 ±1-3px 抖动若逐帧追赶，会变成可见的来回
+                    // 蠕动=「回弹」（用户实测 srs+空格，旧版无此问题）。
+                    let dmax = (tx - start.0).abs().max((ty - start.1).abs());
+                    if dmax >= 3 {
+                        self.chase_target = Some((tx, ty));
+                        self.chase_last = None;
+                        unsafe {
+                            let _ =
+                                SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                        }
+                    } else {
+                        self.live_pos.set((tx, ty));
+                        self.chase_target = None;
+                        self.chase_last = None;
+                        self.chase_pos = None;
+                    }
+                    if self.chase_target.is_some() {
+                        self.chase_pos = Some((start.0 as f32, start.1 as f32));
+                    }
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "chase 臂: start=({},{}) target=({},{}) was_vis={}",
+                            start.0, start.1, tx, ty, was_visible
+                        ));
+                    }
+                } else if was_visible && self.pos_ms > 0 && !self.internal_rerender {
+                    self.chase_target = None;
+                    self.chase_last = None;
+                    self.chase_pos = None;
                     let (lx, ly) = self.live_pos.get();
                     let d = (tx - lx).abs().max((ty - ly).abs());
                     // 【大跳瞬跳·三十二修】用户拍板「光标在哪候选就从哪
@@ -3674,6 +3793,9 @@ impl CandidateWindowV2 {
                         self.pos_anim = None;
                     }
                 } else if !was_visible && self.pos_ms > 0 && !self.internal_rerender {
+                    self.chase_target = None;
+                    self.chase_last = None;
+                    self.chase_pos = None;
                     // 【虎娘对齐·首显滑动】组段首显（was_visible=false）原本
                     // 直接落锚；非整句方案改为从编码左端滑向光标右（虎娘
                     // 单字实测：窗口首现于编码左端，~100ms 滑到编码右端）。
@@ -3708,10 +3830,16 @@ impl CandidateWindowV2 {
                                 // 与逐键同一距离公式（统一节奏）。
                                 // 【七修·速度对齐虎娘】同逐键：7.5 系数恒速
                                 // ≈130px/s，上限 160ms。
+                                // 【三十三修回退 2026-09-19】曾试入场快滑
+                                // （4.0 系数/100ms 上限）配合全角行程，后
+                                // 全角行程被用户否决、快滑随之回退——恢复
+                                // 七修口径（7.5/160ms），仅保留三十一/三十
+                                // 二修的即显与时钟重锚。
                                 let dur = ((travel as f32 * 7.5 / spd) as u32)
                                     .clamp(45, 160);
                                 self.pos_anim =
                                     Some(((fx, ty), (tx, ty), std::time::Instant::now(), dur));
+                                entrance_armed = true;
                                 // 起臂帧即记真实显示位：下一键 per-key 滑动
                                 // 从滑行起点接续，而不是从上一段残值起步。
                                 self.live_pos.set((fx, ty));
@@ -3723,9 +3851,17 @@ impl CandidateWindowV2 {
                         }
                     }
                 }
-                let (px, py) = match self.pos_anim {
-                    Some((f, t, t0, dur)) => size_ease(f, t, t0.elapsed().as_millis() as u32, dur),
-                    None => (tx, ty),
+                // 【三十四修·chase】chase 生效时窗口停/起在 live_pos（当前
+                // 实位或首显起点），由 tick 逐步逼近目标；非 chase 走原插值。
+                let (px, py) = if chase && self.chase_target.is_some() && self.pos_ms > 0 {
+                    self.live_pos.get()
+                } else {
+                    match self.pos_anim {
+                        Some((f, t, t0, dur)) => {
+                            size_ease(f, t, t0.elapsed().as_millis() as u32, dur)
+                        }
+                        None => (tx, ty),
+                    }
                 };
                 // 【四十一修·主 SWP 观测（破案后降频）】锚位与目标差>10
                 // 才打——常规小步进不打（对齐四十修 pos 观测）。
@@ -3762,7 +3898,7 @@ impl CandidateWindowV2 {
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
-                SetWindowPos(
+                let swp_r = SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     px,
@@ -3770,7 +3906,21 @@ impl CandidateWindowV2 {
                     apply.0,
                     apply.1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                );
+                // 【三十二修·首显时钟重锚】滑动从「窗口实际可见」起播满
+                // 全程（臂帧→SWP 之间隔着渲染+Present 同步等待，见上）。
+                // 仅入场滑重锚；逐键跟随的节奏是用户拍板调好的，不动。
+                if entrance_armed {
+                    if let Some((f, t, _, dur)) = self.pos_anim {
+                        self.pos_anim = Some((f, t, std::time::Instant::now(), dur));
+                        if crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!(
+                                "cw2: 首显时钟重锚 pos=({px},{py})→({tx},{ty}) dur={dur}"
+                            ));
+                        }
+                    }
+                }
+                swp_r
             } else {
                 // 拖拽中窗口可能仍隐藏（首次 show 未显示）：确保可见
                 crate::tsf::trace("cw2: SWP纯显示(NOMOVE)——窗留在当前位置显示");
@@ -3849,6 +3999,10 @@ impl CandidateWindowV2 {
         // 中下方」的病根）。
         // 【位置滑动】收窗即作废位置动效（下个组段首显瞬移新位）
         self.pos_anim = None;
+        // 【三十四修】chase 同步作废（与 pos_anim 同生命周期）
+        self.chase_target = None;
+        self.chase_last = None;
+        self.chase_pos = None;
         // 【二十五修·y 锁跨段延续】不再无条件清 y 锁/置首帧自由——
         // 上屏即收语义下每段都走 hide→show，无条件清锁使段间锚 y
         // 锯齿穿透（WPS 偶发抖动根源）。改为只记收窗时刻；首帧自由
@@ -3885,6 +4039,10 @@ impl CandidateWindowV2 {
         self.sticky_pos = None;
         self.sticky_drag = false;
         self.pos_anim = None;
+        // 【三十四修】chase 同步硬清（焦点切换=全新开始）
+        self.chase_target = None;
+        self.chase_last = None;
+        self.chase_pos = None;
         self.cloaked_streak = 0;
         // 【二十五修】y 锁/首帧自由/收窗时刻一并硬清：焦点切换=全新
         // 开始（跨会话首帧自由 2026-10-09 八的原语义在此兜底——新窗
@@ -3987,7 +4145,11 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     anim_done = false;
                     c.live_pos.set(cur);
                     if c.is_visible() {
-                        crate::tsf::trace(&format!("cw2: SWP动画 cur=({},{})", cur.0, cur.1));
+                        // 【三十二修·门控】二十五修口径：trace 关时不白付
+                        // format! 分配（动画期每 5ms tick 一次）。
+                        if crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!("cw2: SWP动画 cur=({},{})", cur.0, cur.1));
+                        }
                         let _ = SetWindowPos(
                             hwnd,
                             HWND_TOPMOST,
@@ -4042,29 +4204,103 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = false;
             }
         }
-        // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
-        // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
-        if let Some((f, t, t0, dur)) = c.pos_anim {
-            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
-            if cur == t {
-                c.pos_anim = None;
-                c.live_pos.set(t);
-            } else {
-                anim_done = false;
-                c.live_pos.set(cur);
+        // 【三十四修·chase 步进】指数逼近（τ=35ms）+限速（2.5px/ms）：
+        // 纯时间基准，dt 自适应——tick 饥饿时步幅自动变大、位置无跳变；
+        // 子像素在 chase_pos 积分，<1px 落定收钟。与 pos_anim 互斥。
+        if let Some(tgt) = c.chase_target {
+            let now = std::time::Instant::now();
+            let dt_ms = c
+                .chase_last
+                .map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
+                .unwrap_or(8.0)
+                .clamp(1.0, 120.0);
+            c.chase_last = Some(now);
+            // 以浮点实位积分（chase_pos），live_pos 为其取整镜像。
+            let (cx, cy) = c.chase_pos.unwrap_or({
+                let lp = c.live_pos.get();
+                (lp.0 as f32, lp.1 as f32)
+            });
+            let (dxf, dyf) = (tgt.0 as f32 - cx, tgt.1 as f32 - cy);
+            let dist = (dxf * dxf + dyf * dyf).sqrt();
+            if dist < 1.0 {
+                c.chase_target = None;
+                c.chase_last = None;
+                c.chase_pos = None;
+                c.live_pos.set(tgt);
                 if c.is_visible() {
-                    crate::tsf::trace(&format!("cw2: SWP动画2 cur=({},{})", cur.0, cur.1));
                     let _ = SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
-                        cur.0,
-                        cur.1,
+                        tgt.0,
+                        tgt.1,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            } else {
+                let k = 1.0 - (-dt_ms / 35.0).exp();
+                let mut frac = k;
+                let max_step = 2.5 * dt_ms;
+                if dist * frac > max_step {
+                    frac = max_step / dist;
+                }
+                let nx = cx + dxf * frac;
+                let ny = cy + dyf * frac;
+                let np = ((nx.round() as i32), (ny.round() as i32));
+                c.chase_pos = Some((nx, ny));
+                c.live_pos.set(np);
+                anim_done = false;
+                if c.is_visible() && np != (cx.round() as i32, cy.round() as i32) {
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "chase 步: cur=({},{}) target=({},{}) dt={dt_ms:.0}",
+                            np.0,
+                            np.1,
+                            tgt.0,
+                            tgt.1
+                        ));
+                    }
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        np.0,
+                        np.1,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                 }
             }
+        }
+        // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
+        // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
+        if c.chase_target.is_none() {
+        if let Some((f, t, t0, dur)) = c.pos_anim {
+            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
+            if cur == t {
+                c.pos_anim = None;
+                c.live_pos.set(t);
+                } else {
+                    anim_done = false;
+                    c.live_pos.set(cur);
+                    if c.is_visible() {
+                        // 【三十二修·门控】同上：tick 热路径 trace 关不分配。
+                        if crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!("cw2: SWP动画2 cur=({},{})", cur.0, cur.1));
+                        }
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            cur.0,
+                            cur.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+        }
         }
         // 【高亮滑动步进 2026-10-09】hl_anim 在身：逐 tick 复渲染呈现插值
         // 帧（FADE_TIMER 驱动；完成在渲染内自清 → anim_done 收 timer）。
