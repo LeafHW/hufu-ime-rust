@@ -58,6 +58,26 @@ void hufu_client_reset(hufu_client *client);
 /* 鼠标点击候选：index 为页内下标（当前候选窗列表序号，0 起）；1=已处理。
  * 语义与数字选重一致（学习、无闪帧即时上屏）。 */
 int32_t hufu_client_select(hufu_client *client, int32_t index);
+
+/* ── 配置读写（fcitx5 设置页用；Windows 前端不使用）───────────────────── */
+
+/* 拉取引擎配置快照（打开设置页时调用）：1=成功。 */
+int32_t hufu_client_config_refresh(hufu_client *client);
+
+/* 配置补丁：json 为 JSON 对象字符串（如 {"candidates":{"page_size":5}}），
+ * 客户端侧「读-改-写」深合并后写回引擎（热生效）：1=成功。 */
+int32_t hufu_client_config_patch(hufu_client *client, const char *json);
+
+/* 配置读取 bool：1/0，-1=未知（未拉取或路径不存在）。path 形如
+ * "candidates.show_split"。 */
+int32_t hufu_client_config_bool(const hufu_client *client, const char *path);
+
+/* 配置读取整数：1=成功（写 *out），0=未知/失败。 */
+int32_t hufu_client_config_int(const hufu_client *client, const char *path,
+                               int64_t *out);
+
+/* 配置读取字符串：NUL 结尾（空串=未知；下次调用前有效）。 */
+const char *hufu_client_config_str(hufu_client *client, const char *path);
 /* 焦点切换：清会话与文章尾巴（保留中英态）。 */
 void hufu_client_focus(hufu_client *client);
 

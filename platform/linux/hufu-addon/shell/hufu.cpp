@@ -13,6 +13,9 @@
 #include <fcitx/surroundingtext.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/iniparser.h>
+#include <fcitx-config/option.h>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/keysym.h>
@@ -97,6 +100,23 @@ std::string keyNameOf(const fcitx::Key &key) {
     return std::string(1, unshiftAscii(static_cast<char>(u)));
 }
 
+/// JSON 字符串转义（配置补丁值都是短字符/短串，只处理 `"`、`\` 与控制符）。
+std::string jesc(const std::string &s) {
+    std::string o;
+    o.reserve(s.size() + 2);
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            o.push_back('\\');
+            o.push_back(static_cast<char>(c));
+        } else if (c >= 0x20) {
+            o.push_back(static_cast<char>(c));
+        }
+    }
+    return o;
+}
+
+inline const char *jbool(bool v) { return v ? "true" : "false"; }
+
 class HufuEngine;
 
 /// 面板候选：点击（`select`）按页内下标上屏——与数字选重同语义
@@ -116,6 +136,194 @@ private:
     int32_t index_;
 };
 
+/// ── fcitx5 设置页 schema（fcitx5-configtool「虎符」页）────────────────────
+/// 两类选项：
+/// - 宿主项（候选窗内预编辑 / 强制竖排）：本层直接生效，只存
+///   `~/.config/fcitx5/conf/hufu.conf`。
+/// - 引擎项：打开页面时从 hufu-server 拉取（`config_get`），应用时深合并
+///   写回（`config_set`）——与 Web 设置页同一份配置，热生效。
+/// 说明：中英切换等 Linux 策略项不在此暴露（英文输入交给 fcitx5 布局）。
+FCITX_CONFIGURATION(
+    HufuBehaviorConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> panelPreedit{{
+        .parent = this,
+        .path{"PanelPreedit"},
+        .description{"候选窗内显示编码"},
+        .defaultValue = false,
+        .annotation{"在候选窗顶部显示编码串；默认关（组段仍随光标内联显示）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> forceVertical{{
+        .parent = this,
+        .path{"ForceVertical"},
+        .description{"强制竖排候选"},
+        .defaultValue = false,
+        .annotation{"勾选=强制竖排；不勾=跟随 fcitx5 全局候选排列设置。"}}};
+    fcitx::Option<int, fcitx::IntConstrain, fcitx::DefaultMarshaller<int>,
+                  fcitx::ToolTipAnnotation>
+        pageSize{{
+            .parent = this,
+            .path{"PageSize"},
+            .description{"每页候选数"},
+            .defaultValue = 4,
+            .constrain = fcitx::IntConstrain(1, 10),
+            .annotation{"候选列表每页个数（1–10）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> autoPush{{
+        .parent = this,
+        .path{"AutoPush"},
+        .description{"超最大码长自动上屏"},
+        .defaultValue = true,
+        .annotation{"编码超过最大码长时，前串首选自动上屏、新键成为新串起点。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> autoSelectUnique{{
+        .parent = this,
+        .path{"AutoSelectUnique"},
+        .description{"满码唯一自动上屏"},
+        .defaultValue = false,
+        .annotation{"满最大码长且只有一个候选时直接上屏。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> autoClearEmpty{{
+        .parent = this,
+        .path{"AutoClearEmpty"},
+        .description{"空码自动清屏"},
+        .defaultValue = false,
+        .annotation{"第「最大码长+1」键仍无解才清，且只清前面的码（该键保留为新输入）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> enterClear{{
+        .parent = this,
+        .path{"EnterClear"},
+        .description{"回车清屏"},
+        .defaultValue = false,
+        .annotation{"按回车清空当前编码（不提交）。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuPunctConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> fullShape{{
+        .parent = this,
+        .path{"FullShape"},
+        .description{"全角标点"},
+        .defaultValue = true,
+        .annotation{"标点输出全角形式（如 `,` → `，`）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> asciiPunct{{
+        .parent = this,
+        .path{"AsciiPunct"},
+        .description{"中文态英文标点"},
+        .defaultValue = false,
+        .annotation{"中文输入时标点不做中文映射，直接输出 ASCII。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuFilterConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> opencc{{
+        .parent = this,
+        .path{"OpenCC"},
+        .description{"启用简繁转换"},
+        .defaultValue = false,
+        .annotation{"按下方方向转换候选（打简出繁/打繁出简）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> toTraditional{{
+        .parent = this,
+        .path{"ToTraditional"},
+        .description{"打简出繁"},
+        .defaultValue = true,
+        .annotation{"勾选=简体→繁体；不勾=繁体→简体。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> emoji{{
+        .parent = this,
+        .path{"Emoji"},
+        .description{"emoji 候选变体"},
+        .defaultValue = false,
+        .annotation{"前几个候选追加 emoji 注解变体。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> showPinyin{{
+        .parent = this,
+        .path{"ShowPinyin"},
+        .description{"候选显示拼音"},
+        .defaultValue = false,
+        .annotation{"候选注释显示拼音（需随包拼音注释数据）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> showUnicode{{
+        .parent = this,
+        .path{"ShowUnicode"},
+        .description{"候选显示 Unicode 分区"},
+        .defaultValue = true,
+        .annotation{"非基本区字符显示分区名，如 [平假名]。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> showSplit{{
+        .parent = this,
+        .path{"ShowSplit"},
+        .description{"候选显示拆分"},
+        .defaultValue = true,
+        .annotation{"候选注释显示部件拆分（最多 4 部件）。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuSentenceConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> sentence{{
+        .parent = this,
+        .path{"Sentence"},
+        .description{"整句模式"},
+        .defaultValue = true,
+        .annotation{"启用整句组句（需方案名含「整句」或关闭自动启用）。"}}};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> rerank{{
+        .parent = this,
+        .path{"Rerank"},
+        .description{"神经重排"},
+        .defaultValue = true,
+        .annotation{"停顿后用 Qwen3 GGUF 模型对候选重排（需模型文件）。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuReverseConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> enabled{{
+        .parent = this,
+        .path{"ReverseEnabled"},
+        .description{"启用反查"},
+        .defaultValue = true,
+        .annotation{"反查前缀进入拼音反查模式（需反查表数据）。"}}};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> prefix{{
+        .parent = this,
+        .path{"ReversePrefix"},
+        .description{"反查前缀"},
+        .defaultValue = "`",
+        .annotation{"单字符前缀，默认 `。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuSoundConfig,
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> enabled{{
+        .parent = this,
+        .path{"SoundEnabled"},
+        .description{"启用按键音"},
+        .defaultValue = false,
+        .annotation{"按键/选词/上屏/翻页四类提示音（需音效 wav 数据）。"}}};
+    fcitx::Option<int, fcitx::IntConstrain, fcitx::DefaultMarshaller<int>,
+                  fcitx::ToolTipAnnotation>
+        volume{{
+            .parent = this,
+            .path{"SoundVolume"},
+            .description{"音量"},
+            .defaultValue = 50,
+            .constrain = fcitx::IntConstrain(0, 100),
+            .annotation{"0–100。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuKeysConfig,
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> secondSelect{{
+        .parent = this,
+        .path{"SecondSelect"},
+        .description{"次选键"},
+        .defaultValue = ";",
+        .annotation{"单字符，默认 ;（有编码延续时作编码字符）。"}}};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> thirdSelect{{
+        .parent = this,
+        .path{"ThirdSelect"},
+        .description{"三选键"},
+        .defaultValue = "'",
+        .annotation{"单字符，默认 '。"}}};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> pagingKeys{{
+        .parent = this,
+        .path{"PagingKeys"},
+        .description{"翻页键"},
+        .defaultValue = "-=",
+        .annotation{"字符序列，前半上翻、后半下翻（默认 -=）。"}}};);
+
+FCITX_CONFIGURATION(
+    HufuConfig,
+    fcitx::Option<HufuBehaviorConfig> behavior{this, "Behavior", "行为"};
+    fcitx::Option<HufuPunctConfig> punct{this, "Punct", "标点"};
+    fcitx::Option<HufuFilterConfig> filter{this, "Filter", "滤镜（简繁/注释）"};
+    fcitx::Option<HufuSentenceConfig> sentence{this, "Sentence", "整句"};
+    fcitx::Option<HufuReverseConfig> reverse{this, "Reverse", "反查"};
+    fcitx::Option<HufuSoundConfig> sound{this, "Sound", "音效"};
+    fcitx::Option<HufuKeysConfig> keys{this, "Keys", "选重与翻页"};);
+
 class HufuEngine : public fcitx::InputMethodEngine {
 public:
     explicit HufuEngine(fcitx::Instance *instance) : instance_(instance) {
@@ -130,6 +338,22 @@ public:
         if (engine_ != nullptr && hufu_client_ping(engine_) == 0) {
             FCITX_WARN() << "hufu: hufu-server 不可达（先启动引擎，按键将直通）";
         }
+        // 设置页：先读用户已保存值（宿主项），再以引擎配置覆盖引擎映射项
+        fcitx::readAsIni(config_, "conf/hufu.conf");
+        pullConfig();
+    }
+
+    /// 设置页 schema（fcitx5-configtool「虎符」页）。打开页面时从引擎拉取
+    /// 最新值（Web 设置页的改动可同步显示）。
+    const fcitx::Configuration *getConfig() const override {
+        const_cast<HufuEngine *>(this)->pullConfig();
+        return &config_;
+    }
+
+    /// 配置工具保存：载入 schema 后写回引擎（深合并，热生效）。
+    void setConfig(const fcitx::RawConfig &raw) override {
+        config_.load(raw, true);
+        pushConfig();
     }
 
     ~HufuEngine() override {
@@ -312,10 +536,10 @@ private:
             return;
         }
         const fcitx::Text preeditText(preeditString);
-        // 【候选窗预编辑 默认关】编码串不画进候选窗（与虎虚 PanelPreedit
-        // 默认一致）——组段走客户端内联预编辑（下方 setClientPreedit），
-        // 编码/锁名在应用内随组段可见，候选窗只出候选与注释。
-        context_->inputPanel().setPreedit(fcitx::Text());
+        // 【候选窗预编辑】默认关（组段走客户端内联）；设置页可开
+        // （fcitx5-configtool → 虎符 → 行为 → 候选窗内显示编码）。
+        context_->inputPanel().setPreedit(
+            config_.behavior->panelPreedit.value() ? preeditText : fcitx::Text());
         // 客户端内联预编辑：跟随 fcitx5 全局预编辑设置
         context_->inputPanel().setClientPreedit(
             context_->isPreeditEnabled() ? preeditText : fcitx::Text());
@@ -334,6 +558,10 @@ private:
                 candidateList->append<HufuCandidateWord>(
                     fcitx::Text(t), fcitx::Text(c), this, i);
             }
+            // 设置页「强制竖排候选」：仅勾选时下发（不勾=跟随 fcitx5 全局）
+            if (config_.behavior->forceVertical.value()) {
+                candidateList->setLayoutHint(fcitx::CandidateLayoutHint::Vertical);
+            }
             candidateList->setPageSize(count);
             const int32_t index = std::min(std::max(selected, 0), count - 1);
             candidateList->setGlobalCursorIndex(index);
@@ -345,9 +573,137 @@ private:
         context_->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     }
 
+    /// 引擎 → schema（引擎映射项）。引擎不可达时保持现状。
+    /// 用 RawConfig + load（与配置工具读 ini 同一路径；子配置项不能
+    /// 直接 setValue）。宿主项（候选窗内编码/强制竖排）填当前值。
+    void pullConfig() {
+        if (engine_ == nullptr || hufu_client_config_refresh(engine_) != 1) {
+            return;
+        }
+        const auto getBool = [&](const char *path, bool fallback) {
+            const int v = hufu_client_config_bool(engine_, path);
+            return v < 0 ? fallback : v == 1;
+        };
+        const auto getInt = [&](const char *path, int fallback) {
+            int64_t v = 0;
+            return hufu_client_config_int(engine_, path, &v) == 1
+                       ? static_cast<int>(v)
+                       : fallback;
+        };
+        const auto getStr = [&](const char *path, const std::string &fallback) {
+            const char *s = hufu_client_config_str(engine_, path);
+            return (s != nullptr && *s != '\0') ? std::string(s) : fallback;
+        };
+        fcitx::RawConfig raw;
+        raw.setValueByPath("Behavior/PanelPreedit",
+                           jbool(config_.behavior->panelPreedit.value()));
+        raw.setValueByPath("Behavior/ForceVertical",
+                           jbool(config_.behavior->forceVertical.value()));
+        raw.setValueByPath("Behavior/PageSize",
+                           std::to_string(getInt("candidates.page_size", 4)));
+        raw.setValueByPath("Behavior/AutoPush",
+                           jbool(getBool("input.auto_push", true)));
+        raw.setValueByPath(
+            "Behavior/AutoSelectUnique",
+            jbool(getBool("input.auto_select_unique", false)));
+        raw.setValueByPath(
+            "Behavior/AutoClearEmpty",
+            jbool(getBool("input.auto_clear_empty", false)));
+        raw.setValueByPath("Behavior/EnterClear",
+                           jbool(getBool("input.enter_clear", false)));
+        raw.setValueByPath("Punct/FullShape",
+                           jbool(getBool("punct.full_shape", true)));
+        raw.setValueByPath("Punct/AsciiPunct",
+                           jbool(getBool("input.ascii_punct", false)));
+        raw.setValueByPath("Filter/OpenCC",
+                           jbool(getBool("opencc.enabled", false)));
+        raw.setValueByPath("Filter/ToTraditional",
+                           jbool(getBool("opencc.to_traditional", true)));
+        raw.setValueByPath("Filter/Emoji",
+                           jbool(getBool("opencc.emoji", false)));
+        raw.setValueByPath(
+            "Filter/ShowPinyin",
+            jbool(getBool("candidates.show_pinyin_comment", false)));
+        raw.setValueByPath(
+            "Filter/ShowUnicode",
+            jbool(getBool("candidates.show_unicode_comment", true)));
+        raw.setValueByPath("Filter/ShowSplit",
+                           jbool(getBool("candidates.show_split", true)));
+        raw.setValueByPath("Sentence/Sentence",
+                           jbool(getBool("sentence.enabled", true)));
+        raw.setValueByPath("Sentence/Rerank",
+                           jbool(getBool("sentence.rerank.enabled", true)));
+        raw.setValueByPath("Reverse/ReverseEnabled",
+                           jbool(getBool("reverse.enabled", true)));
+        raw.setValueByPath("Reverse/ReversePrefix",
+                           getStr("reverse.prefix", "`"));
+        raw.setValueByPath("Sound/SoundEnabled",
+                           jbool(getBool("sound.enabled", false)));
+        raw.setValueByPath("Sound/SoundVolume",
+                           std::to_string(getInt("sound.volume", 50)));
+        raw.setValueByPath("Keys/SecondSelect",
+                           getStr("candidates.second_select", ";"));
+        raw.setValueByPath("Keys/ThirdSelect",
+                           getStr("candidates.third_select", "'"));
+        raw.setValueByPath("Keys/PagingKeys",
+                           getStr("candidates.paging_keys", "-="));
+        config_.load(raw, true);
+    }
+
+    /// schema → 引擎（JSON 补丁；仅引擎映射项；深合并，热生效）。
+    void pushConfig() {
+        if (engine_ == nullptr) {
+            return;
+        }
+        const auto &b = config_.behavior.value();
+        const auto &p = config_.punct.value();
+        const auto &f = config_.filter.value();
+        const auto &s = config_.sentence.value();
+        const auto &r = config_.reverse.value();
+        const auto &so = config_.sound.value();
+        const auto &k = config_.keys.value();
+        const auto firstChar = [](const std::string &v, char fallback) {
+            return v.empty() ? fallback : v[0];
+        };
+        std::string patch = "{";
+        patch += "\"candidates\":{";
+        patch += "\"page_size\":" + std::to_string(b.pageSize.value()) + ",";
+        patch += "\"second_select\":\"" +
+                 jesc(std::string(1, firstChar(k.secondSelect.value(), ';'))) +
+                 "\",";
+        patch += "\"third_select\":\"" +
+                 jesc(std::string(1, firstChar(k.thirdSelect.value(), '\''))) +
+                 "\",";
+        patch += "\"paging_keys\":\"" + jesc(k.pagingKeys.value()) + "\",";
+        patch += "\"show_pinyin_comment\":" + std::string(jbool(f.showPinyin.value())) + ",";
+        patch += "\"show_unicode_comment\":" + std::string(jbool(f.showUnicode.value())) + ",";
+        patch += "\"show_split\":" + std::string(jbool(f.showSplit.value())) + "},";
+        patch += "\"input\":{";
+        patch += "\"auto_push\":" + std::string(jbool(b.autoPush.value())) + ",";
+        patch += "\"auto_select_unique\":" + std::string(jbool(b.autoSelectUnique.value())) + ",";
+        patch += "\"auto_clear_empty\":" + std::string(jbool(b.autoClearEmpty.value())) + ",";
+        patch += "\"enter_clear\":" + std::string(jbool(b.enterClear.value())) + ",";
+        patch += "\"ascii_punct\":" + std::string(jbool(p.asciiPunct.value())) + "},";
+        patch += "\"punct\":{\"full_shape\":" + std::string(jbool(p.fullShape.value())) + "},";
+        patch += "\"opencc\":{\"enabled\":" + std::string(jbool(f.opencc.value())) +
+                 ",\"to_traditional\":" + std::string(jbool(f.toTraditional.value())) +
+                 ",\"emoji\":" + std::string(jbool(f.emoji.value())) + "},";
+        patch += "\"sentence\":{\"enabled\":" + std::string(jbool(s.sentence.value())) +
+                 ",\"rerank\":{\"enabled\":" + std::string(jbool(s.rerank.value())) + "}},";
+        patch += "\"reverse\":{\"enabled\":" + std::string(jbool(r.enabled.value())) +
+                 ",\"prefix\":\"" + jesc(r.prefix.value()) + "\"},";
+        patch += "\"sound\":{\"enabled\":" + std::string(jbool(so.enabled.value())) +
+                 ",\"volume\":" + std::to_string(so.volume.value()) + "}}";
+        if (hufu_client_config_patch(engine_, patch.c_str()) != 1) {
+            FCITX_WARN() << "hufu: 配置写入引擎失败（hufu-server 在跑吗）";
+        }
+    }
+
     fcitx::Instance *instance_;
     hufu_client *engine_ = nullptr;
     fcitx::InputContext *context_ = nullptr;
+    /// fcitx5 设置页 schema（fcitx5-configtool）
+    HufuConfig config_;
     /// 有编码或候选（更新回调维护；Shift+字母「顶字」判定用）
     bool hasComposition_ = false;
     /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）

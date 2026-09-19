@@ -80,6 +80,22 @@ pub fn default_socket_path() -> PathBuf {
         .join("hufu-ime.sock")
 }
 
+/// JSON 深合并：对象递归合并，其余类型整体覆盖（配置补丁用）。
+fn merge_json(dst: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (serde_json::Value::Object(d), serde_json::Value::Object(p)) = (&mut *dst, patch) {
+        for (k, v) in p {
+            match d.get_mut(k) {
+                Some(slot) => merge_json(slot, v),
+                None => {
+                    d.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    } else {
+        *dst = patch.clone();
+    }
+}
+
 /// 单会话引擎客户端（惰性连接 + 断线重连）。
 pub struct HufuClient {
     sock_path: PathBuf,
@@ -92,6 +108,10 @@ pub struct HufuClient {
     /// 最近一次按键的回删数（commit 回调发生在 `key` 返回前，C++ 侧
     /// 经 `hufu_client_last_back` 读取以先回删再上屏）。
     last_back: u8,
+    /// 引擎配置快照（config_get；fcitx5 设置页读写用）
+    config: Option<serde_json::Value>,
+    /// `hufu_client_config_str` 返回值缓存（C++ 侧同步拷走）
+    config_scratch: CString,
 }
 
 impl HufuClient {
@@ -106,6 +126,8 @@ impl HufuClient {
             scratch: Scratch::default(),
             chinese: true,
             last_back: 0,
+            config: None,
+            config_scratch: CString::default(),
         }
     }
 
@@ -181,6 +203,79 @@ impl HufuClient {
         self.call(&serde_json::json!({"op": "ping"}))
             .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// 拉取引擎配置快照（fcitx5 设置页打开时调用）。
+    pub fn refresh_config(&mut self) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({"op": "config_get"})) else {
+            return false;
+        };
+        match resp.get("config") {
+            Some(c) if !c.is_null() => {
+                self.config = Some(c.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 按 `a.b.c` 路径取配置值（需先 refresh_config）。
+    fn config_get(&self, path: &str) -> Option<&serde_json::Value> {
+        let mut cur = self.config.as_ref()?;
+        for seg in path.split('.') {
+            cur = cur.get(seg)?;
+        }
+        Some(cur)
+    }
+
+    /// 配置补丁：拉取当前配置 → 深合并 → config_set → 成功后更新缓存。
+    /// （读-改-写：避免部分 JSON 缺省字段被 serde 默认值覆盖。）
+    pub fn config_patch(&mut self, patch: &serde_json::Value) -> bool {
+        if self.config.is_none() && !self.refresh_config() {
+            return false;
+        }
+        let Some(mut merged) = self.config.clone() else {
+            return false;
+        };
+        merge_json(&mut merged, patch);
+        let Some(resp) = self.call(&serde_json::json!({"op": "config_set", "config": merged})) else {
+            return false;
+        };
+        if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            self.config = Some(merged);
+            true
+        } else {
+            self.set_status(format!(
+                "配置写入失败: {}",
+                resp.get("error").and_then(|v| v.as_str()).unwrap_or("未知")
+            ));
+            false
+        }
+    }
+
+    /// 配置读取（C++ ABI 用）：bool →（1/0/-1 未知）。
+    pub fn config_bool(&self, path: &str) -> i32 {
+        match self.config_get(path).and_then(|v| v.as_bool()) {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        }
+    }
+
+    /// 配置读取：整数（返回 Some）。
+    pub fn config_int(&self, path: &str) -> Option<i64> {
+        self.config_get(path).and_then(|v| v.as_i64())
+    }
+
+    /// 配置读取：字符串（写入 `config_scratch`，返回 C 指针）。
+    pub fn config_str_ptr(&mut self, path: &str) -> *const std::ffi::c_char {
+        let s = self
+            .config_get(path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        self.config_scratch = CString::new(s).unwrap_or_default();
+        self.config_scratch.as_ptr()
     }
 
     /// 一次按键：返回 `(consumed, back)`；回调同步送达 commit/update。
@@ -426,6 +521,85 @@ pub extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int 
     }
 }
 
+/// 拉取引擎配置（fcitx5 设置页打开时调用）：1=成功。
+#[no_mangle]
+pub extern "C" fn hufu_client_config_refresh(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.refresh_config() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 配置补丁（JSON 对象字符串，深合并后写回引擎）：1=成功。
+#[no_mangle]
+pub extern "C" fn hufu_client_config_patch(
+    c: *mut HufuClient,
+    json: *const c_char,
+) -> c_int {
+    if c.is_null() || json.is_null() {
+        return 0;
+    }
+    let s = unsafe { CStr::from_ptr(json) }.to_string_lossy();
+    let Ok(patch) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return 0;
+    };
+    if unsafe { &mut *c }.config_patch(&patch) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 配置读取 bool：1/0，-1=未知（未拉取或路径不存在）。
+#[no_mangle]
+pub extern "C" fn hufu_client_config_bool(
+    c: *const HufuClient,
+    path: *const c_char,
+) -> c_int {
+    if c.is_null() || path.is_null() {
+        return -1;
+    }
+    let p = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    unsafe { &*c }.config_bool(&p)
+}
+
+/// 配置读取整数：1=成功（写 `*out`），0=未知/失败。
+#[no_mangle]
+pub extern "C" fn hufu_client_config_int(
+    c: *const HufuClient,
+    path: *const c_char,
+    out: *mut i64,
+) -> c_int {
+    if c.is_null() || path.is_null() || out.is_null() {
+        return 0;
+    }
+    let p = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    match unsafe { &*c }.config_int(&p) {
+        Some(v) => {
+            unsafe { *out = v };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// 配置读取字符串：返回 NUL 结尾指针（空串=未知；下次调用前有效）。
+#[no_mangle]
+pub extern "C" fn hufu_client_config_str(
+    c: *mut HufuClient,
+    path: *const c_char,
+) -> *const c_char {
+    if c.is_null() || path.is_null() {
+        return std::ptr::null();
+    }
+    let p = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
+    unsafe { &mut *c }.config_str_ptr(&p)
+}
+
 #[no_mangle]
 pub extern "C" fn hufu_client_focus(c: *mut HufuClient) {
     if !c.is_null() {
@@ -486,6 +660,7 @@ pub extern "C" fn hufu_client_last_back(c: *const HufuClient) -> c_int {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
 
     /// 每个测试独立的回调捕获（并行测试互不干扰）。
     #[derive(Default)]
@@ -734,6 +909,85 @@ mod tests {
         assert!(c.select(0), "select 应返回已处理");
         assert_eq!(cap.commits.as_slice(), ["衣"]);
         assert_eq!(cap.updates.len(), 1);
+        handle.join().unwrap();
+    }
+
+    /// mock server（带请求捕获）：返回 (句柄, 收到的请求列表)。
+    fn mock_server_capture(
+        path: PathBuf,
+        responses: Vec<serde_json::Value>,
+    ) -> (std::thread::JoinHandle<()>, std::sync::Arc<Mutex<Vec<serde_json::Value>>>) {
+        let listener = UnixListener::bind(&path).expect("bind");
+        let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            for resp in responses {
+                let mut head = [0u8; 4];
+                if s.read_exact(&mut head).is_err() {
+                    return;
+                }
+                let n = u32::from_le_bytes(head) as usize;
+                let mut buf = vec![0u8; n];
+                if s.read_exact(&mut buf).is_err() {
+                    return;
+                }
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                    cap2.lock().unwrap().push(v);
+                }
+                let body = serde_json::to_vec(&resp).unwrap();
+                let _ = s.write_all(&(body.len() as u32).to_le_bytes());
+                let _ = s.write_all(&body);
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+        (handle, captured)
+    }
+
+    #[test]
+    fn config_roundtrip_merge_and_get() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("config");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({
+                    "config": {
+                        "candidates": {"page_size": 4, "show_split": true},
+                        "input": {"alphabet": "abc", "enter_clear": false},
+                        "sound": {"enabled": false, "volume": 50}
+                    }
+                }),
+                serde_json::json!({"ok": true}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.refresh_config(), "拉取配置");
+        assert_eq!(c.config_int("candidates.page_size"), Some(4));
+        assert_eq!(c.config_bool("candidates.show_split"), 1);
+        assert_eq!(c.config_bool("不存在的路径"), -1);
+
+        // 补丁：改 page_size/sound，其余字段必须保留（深合并）
+        assert!(c.config_patch(&serde_json::json!({
+            "candidates": {"page_size": 6},
+            "sound": {"enabled": true},
+        })));
+        assert_eq!(c.config_int("candidates.page_size"), Some(6), "缓存更新");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let posted = &reqs[1]["config"];
+        assert_eq!(posted["candidates"]["page_size"], 6);
+        assert_eq!(
+            posted["candidates"]["show_split"], true,
+            "未提及字段须保留（读-改-写）"
+        );
+        assert_eq!(posted["input"]["alphabet"], "abc");
+        assert_eq!(posted["sound"]["enabled"], true);
+        drop(reqs);
+        assert_eq!(c.config_bool("sound.enabled"), 1);
         handle.join().unwrap();
     }
 

@@ -117,6 +117,29 @@ pub fn dispatch(
             }
             r
         }
+        // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。
+        // 读=全量 JSON；写=全量 JSON（客户端侧做「读-改-写」合并，避免
+        // 部分字段缺省被 serde 默认值覆盖——与 Web 设置页同语义）。
+        "config_get" => serde_json::json!({
+            "config": serde_json::to_value(&host.engine.config)
+                .unwrap_or(serde_json::Value::Null),
+        }),
+        "config_set" => {
+            let v = req.get("config").cloned().unwrap_or(serde_json::Value::Null);
+            match serde_json::from_value::<hufu_config::Config>(v) {
+                Ok(cfg) => match host.apply_config(cfg) {
+                    Ok((need_sentence, teardown)) => {
+                        if need_sentence {
+                            // 与 HTTP /api/config 同源（后台重建，不持锁载模型）
+                            crate::reload_sentence_bg(teardown, true);
+                        }
+                        serde_json::json!({"ok": true})
+                    }
+                    Err(e) => serde_json::json!({"error": format!("应用失败: {e}")}),
+                },
+                Err(e) => serde_json::json!({"error": format!("配置无效: {e}")}),
+            }
+        }
         "state" => {
             // 先应用已到达的重排缓存：停顿期轮询（DLL poll_tick）拉 state
             // 时立即拿到换序后的新首选，用户无需按键即可看到候选窗刷新。
