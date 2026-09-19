@@ -1417,11 +1417,34 @@ async function init() {
     CFG = await api("GET", "/api/config");
     $("#cfg-raw").value = JSON.stringify(CFG, null, 2);
     bindInputs(); buildSliders();
+    applyPlatform();
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
     await loadUserWords();
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
+}
+
+/* 【Linux 2026-09-19】引擎自带中英切换仅 Windows 适用——Linux 的英文输入
+   由 fcitx5 键盘布局提供（Ctrl+Space 切布局），这里隐藏对应开关（不影响
+   Windows 行为）。 */
+async function applyPlatform() {
+  let os = "";
+  try { os = (await api("GET", "/api/platform")).os || ""; } catch (_) {}
+  if (os === "" || os === "windows") return;
+  const hide = sel => {
+    const el = document.querySelector(sel);
+    const box = el && (el.closest(".checkline") || el.closest(".field"));
+    if (box) box.style.display = "none";
+  };
+  ["#g-shift", "#g-ctrl", "#g-caps", "#i-mixed"].forEach(hide);
+  const row = document.querySelector("#g-shift")?.closest(".row");
+  if (row) {
+    const hint = document.createElement("div");
+    hint.className = "sub";
+    hint.textContent = "中英切换由 fcitx5 键盘布局提供（Ctrl+Space 切换布局），引擎不自带英文输入。";
+    row.appendChild(hint);
+  }
 }
 init();
 </script>

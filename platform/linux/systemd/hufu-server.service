@@ -1,0 +1,14 @@
+[Unit]
+Description=HuFu 虎符输入法引擎（hufu-server）
+Documentation=file:///%h/.local/share/hufu
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hufu-server
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

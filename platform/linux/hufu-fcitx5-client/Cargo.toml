@@ -1,0 +1,16 @@
+[package]
+name = "hufu-fcitx5-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "虎符（hufu-ime）fcitx5 addon 的 Rust 侧：hufu-server Unix socket 客户端 + C ABI"
+
+[lib]
+name = "hufu_fcitx5_client"
+# staticlib：由 C++ 薄壳（shell/hufu.cpp）链入 addon .so；
+# rlib：供本 crate 单测（mock socket server）。
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+hufu-types = { path = "../../../engine/crates/hufu-types" }
