@@ -52,6 +52,11 @@ fn main() {
             args.get(4).expect("用法: tbench <方案目录> <语料> <ngram路径> [延迟输出]"),
             args.get(5).cloned(),
         ),
+        "cbench" => cmd_cbench(
+            args.get(2).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
+            args.get(3).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
+            args.get(4).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
+        ),
         // 【真机重排对比 2026-09-05】逐句输出 v2 口径（整句虎规则）码串：
         // probe 真机 HTTP 逐键模拟用，保证和 tbench 同打法。
         "codes" => {
@@ -242,7 +247,7 @@ fn cmd_bench(dir: &str, corpus: &str, ngram: Option<String>) {
         "句数 {total}  exact {}/{} = {:.2}%  码级 {}/{} = {:.2}%  解码 avg {:.1}ms  p95 {}ms  max {}ms",
         exact,
         total,
-        exact as f64 / total as f64 * 100.0,
+        exact as f64 / total.max(1) as f64 * 100.0,
         code_exact,
         total,
         code_exact as f64 / total as f64 * 100.0,
@@ -425,6 +430,90 @@ fn cmd_convert(input: &str, output: &str) {
 /// 逐键打字基准：真实整句打法（一简 2 码 + 同码锁）逐键喂引擎，
 /// 统计 准率 / 提前上屏次数 / 每键触达延迟（击键→解码可用）。
 /// lat_out 可选：每键延迟 µs 逐行写文件（多进程分片汇总用）。
+/// 【虎爪口径整码解码基准 2026-09-19】复刻 tiger-sentence-testset 口径
+///（manifest: whole-code decode; no learning, Qwen or early commit）：
+/// 每条 case（id/source/code/text，TSV 无表头）全新 Session、完整 code
+/// 一次喂入、不提前上屏、不学习、不重排；候选首位与 text 完全一致计
+/// Top-1，分母=全部条数，候选缺失计错。按 source 分类输出。
+fn cmd_cbench(dir: &str, cases_path: &str, ngram: &str) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = bench_config();
+    let mut bench_cfg = Config::default();
+    bench_cfg.sentence.early_commit = false;
+    // 【三十六修】该配置本轮接通（select_first 断供兜底）——虎爪口径
+    // 显式关掉，保持「候选首位计 Top-1」判据纯度（cbench 不按空格，
+    // 兜底本不可达，显式关闭防未来口径漂移）。
+    bench_cfg.sentence.empty_code_auto_commit = false;
+    bench_cfg.user.auto_frequency = false;
+    bench_cfg.user.log_adjust = false;
+    if ngram == "-" {
+        // 【三十六修】tbench 同款教训（见 cmd_tbench 纯码表分支）：
+        // 整串喂码在纯码表模式不可用——无整句解码，码流粘连成多字词/
+        // 长码生僻字，整批失真且无对照即无人察觉。拒绝跑（exit 2）。
+        eprintln!("[cbench] 纯码表模式（ngram=-）不支持整码整串喂入：无整句解码，码流会粘连失真（tbench:609 教训）。请传 ngram 模型路径。");
+        std::process::exit(2);
+    }
+    let mut engine = Engine::with_schema_dir(Path::new(dir), bench_cfg).expect("引擎初始化失败");
+    if ngram != "-" {
+        let dec = hufu_sentence::SentenceEngine::load(
+            Path::new(ngram),
+            schema.dict.clone(),
+            &schema.supplement,
+            { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
+        )
+        .expect("ngram 装载失败");
+        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    }
+    let dump: usize = std::env::var("BENCH_DUMP_FAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut dumped = 0usize;
+    let mut total = 0usize;
+    let mut top1 = 0usize;
+    let mut by_source: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let file = std::fs::File::open(cases_path).expect("cases 打开失败");
+    let mut skipped = 0usize;
+    for line in std::io::BufReader::new(file).lines() {
+        // 【三十六修】畸形行不再静默吞：计数并在末尾报告；非法 UTF-8
+        // 行不 panic；CRLF 文件的回车符剥除（否则 text 尾带它全批判错）。
+        let raw_line = match line {
+            Ok(l) => l,
+            Err(_) => { skipped += 1; continue; }
+        };
+        let line = raw_line.trim_end();
+        if line.trim().is_empty() { continue; }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 { skipped += 1; continue; }
+        if parts[0].trim() == "id" && parts[1].trim() == "source" { continue; } // 表头
+        let source = parts[1].to_string();
+        let code = parts[2].trim();
+        let text = parts[3].trim_end().to_string();
+        if code.is_empty() { skipped += 1; continue; }
+        total += 1;
+        let mut sess = Session::new(true);
+        for ch in code.chars() {
+            engine.process_key(&mut sess, KeyInput::char_key(ch));
+        }
+        let got = sess.candidates.first().map(|c| c.text.clone()).unwrap_or_default();
+        let e = by_source.entry(source).or_insert((0usize, 0usize));
+        e.0 += 1;
+        if got == text {
+            top1 += 1;
+            e.1 += 1;
+        } else if dumped < dump {
+            dumped += 1;
+            println!("[FAIL] 原: {text}");
+            println!("       码: {code}");
+            println!("       出: {got}");
+        }
+    }
+    if skipped > 0 {
+        println!("[cbench] 跳过畸形/空行 {skipped} 条（不计分母）");
+    }
+    println!("条数 {total}  Top1 {top1}/{total} = {:.2}%", top1 as f64 / total.max(1) as f64 * 100.0);
+    for (src, (n, ok)) in &by_source {
+        println!("  {src}: {ok}/{n} = {:.2}%", *ok as f64 / *n as f64 * 100.0);
+    }
+}
+
 fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
     let cfg = bench_config();
@@ -449,7 +538,18 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
         c.user.log_adjust = false;
         c
     } else {
-        Config::default()
+        // 【真实部署态基准 2026-09-19】HUFU_BENCH_NOLEARN=1：关学习
+        //（对齐真机 config 的 auto_frequency/log_adjust=false），
+        // 打法/其余配置不变——排除逐句调频对后续句候选序的污染。
+        let mut c = Config::default();
+        if std::env::var("HUFU_BENCH_NOLEARN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            c.user.auto_frequency = false;
+            c.user.log_adjust = false;
+        }
+        c
     };
     let mut engine = Engine::with_schema_dir(Path::new(dir), bench_cfg).expect("引擎初始化失败");
     if ngram != "-" {
@@ -705,7 +805,8 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let mut sorted = key_us.clone();
     sorted.sort_unstable();
     let n = sorted.len().max(1);
-    let p = |q: usize| sorted[(n * q / 100).min(n - 1)];
+    // 【三十六修】空语料（total=0/key_us 空）此前 sorted[0] 越界 panic
+    let p = |q: usize| sorted.get((n * q / 100).min(n - 1)).copied().unwrap_or(0);
     println!(
         "句数 {total}  准率 {}/{} = {:.2}%  提前上屏 {} 次（平均 {:.2} 次/句）  键 {}  触达延迟 p50 {}µs p95 {}µs avg {}µs max {}µs",
         exact,
@@ -733,7 +834,9 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     );
     // 「几次上屏打完一句」分布（含收尾空格共 1 次，越小越一气呵成）：
     // 1 次=整句全靠句尾空格一次落地；N 次=中途 N-1 次提前+收尾。
-    {
+    if !sent_events.is_empty() {
+        // 【三十六修】纯码表/no_lock 模式不产上屏事件序列——此前空
+        // Vec 直接 ev[0] 越界 panic（q(25)）。无数据时整块跳过。
         let mut ev = sent_events.clone();
         ev.sort_unstable();
         let sn = ev.len().max(1);

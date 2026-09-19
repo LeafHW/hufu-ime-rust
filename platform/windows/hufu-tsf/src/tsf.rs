@@ -306,6 +306,10 @@ pub struct Shared {
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
+    /// 【三十六修】模式键 down 已直发的一次性标记（vk）：对应 up 到达
+    /// 即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不翻回）；
+    /// 跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行切中英。
+    pub modekey_down_seen: Option<usize>,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
     /// 【三十四修·死字段删除】compose_at（Excel 保组段 80ms 时窗，六修
@@ -377,31 +381,18 @@ pub struct Shared {
     /// 上一段首 x。
     pub hupo_key_w: f32,
     pub hupo_last_seg_x: i32,
-    /// 【五十五修补·轻推封顶】最近一次段间跳量（上屏字符渲染宽）。
-    /// 轻推量上限=跳量：段末推到段首+一字符宽≈下一段段首——全程
-    /// 单调前进，杜绝段末超前光标→段切换回跳（实测 4 键轻推 189>
-    /// 字宽 126 时段切换回退 69px 的病）。
-    pub hupo_last_jump: i32,
-    /// 【五十六修·重查重立段】CARET_TIMER 到点置位，下帧 SetPreedit
-    /// 的段内分支重查 selection（守卫通过则重立段）——换行立段竞态
-    ///（立到旧行框）的自愈通道。
-    pub hupo_reseg: bool,
-    /// 【五十七修·整句流换行】立段时的 raw 基点（该行首键数）。整句
-    /// 打法 raw 连续增长（10-20+ 键），轻推必须从行首 raw 起算——
-    /// 否则整句第二行起轻推立即顶死在旧行尾（用户实测「跳过来一下
-    /// 又回到上一行行尾」的病根）。顶死（本行轻推≥跳量）时武装重
-    /// 查：换行后重立段到新行行首、基点重置，轻推从新行重新起算。
-    pub hupo_seg_raw0: usize,
-    pub hupo_reseg_armed: bool,
-    /// 【五十七修补·行宽真值】换行回退量=打字区一行总宽（reseg 重立
-    /// 时 dx<-200 记录 |dx|）。整句流一行内轻推放开到行宽-余量（候选
+    /// 【三十六修·死旗标清理】hupo_last_jump（只写不读，封顶语义由
+    /// hupo_line_span 承担）、hupo_reseg / hupo_reseg_armed /
+    /// hupo_seg_raw0 / hupo_long_mode / hupo_prev_raw 五组删除——
+    /// 五十六~五十八修注释描述的「重查重立段/行首 raw 基点/整句长流
+    /// 模式/顶屏消耗补偿」机制在代码中从未实现（旗标只写零读或恒
+    /// false，长注释是档案）。行宽/行距推断的真值字段（hupo_line_
+    /// span/line_dy）为活代码保留。归档详见 三十六修交接单。
+    /// 【五十七修补·行宽真值】换行回退量=打字区一行总宽（立段
+    /// dx<-200 记录 |dx|）。整句流一行内轻推放开到行宽-余量（候选
     /// 窗右缘留白 250），逐字流保持跳量 cap（防段末超前）。0=未测得，
     /// 用跳量保守。
     pub hupo_line_span: i32,
-    /// 【五十八修·整句长流模式】raw 涨超 6 键进入：selection 组段框恒
-    /// 句首（重查重立=跳回句首）+ 顶死武装每键一帧（动效慢）——长流
-    /// 一律纯推断（零查询零重查零 arm）。raw==1 新句立段时退出。
-    pub hupo_long_mode: bool,
     /// 【五十八修补·行距真值】立段间 dy（50..300）=换行行距；溢出推断
     /// 的 y 步进。0=未测得（用行框高兜底）。
     pub hupo_line_dy: i32,
@@ -431,11 +422,6 @@ pub struct Shared {
     /// 句首行，立段=跳回句首）。raw 空帧（组段结束）与 start_preedit_on
     ///（新句）复位。
     pub hupo_had_commit: bool,
-    /// 【五十七修补·顶屏消耗补偿】整句流中顶屏自动上屏使 raw 变短，
-    /// 但光标实际前进了（上屏字宽）——轻推基点必须同步：seg_start_x
-    /// 前移 消耗键数×键宽/2（=消耗字数×字宽，键宽=字宽/2 自洽），
-    /// 否则 x 回退（实测顶屏后 1792→1383 的病）。
-    pub hupo_prev_raw: usize,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -501,6 +487,7 @@ impl Shared {
             stale_raw: String::new(),
             stale_raw_until: None,
             modekey_last: None,
+            modekey_down_seen: None,
             preedit_last: String::new(),
             focus_revoke_kept: false,
             tm_sink_cookie: 0,
@@ -523,13 +510,7 @@ impl Shared {
             hupo_seg_started: false,
             hupo_key_w: 0.0,
             hupo_last_seg_x: 0,
-            hupo_last_jump: 0,
-            hupo_reseg: false,
-            hupo_seg_raw0: 1,
-            hupo_reseg_armed: false,
             hupo_line_span: 0,
-            hupo_prev_raw: 0,
-            hupo_long_mode: false,
             hupo_line_dy: 0,
             hupo_last_seg_y: 0,
             digit_tail: String::new(),
@@ -1259,7 +1240,6 @@ pub fn trace_path() -> std::path::PathBuf {
 
 pub fn trace(msg: &str) {
     use std::io::Write;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
     // 【三十修·开关统一】旧实现本函数自有一道 HUFU_TRACE=="1" 直查——
@@ -1478,29 +1458,40 @@ impl HuFuTs_Impl {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .shift_pending = false;
-            } else {
+            } else if !mode_key {
                 // 其余键的 keyup/testup 一律直通——放行字母 keyup 会造成
                 // 每键双发（「按一下等于按两下」回归）。
                 return BOOL(0);
             }
+            // 【三十六修】mode_key（Ctrl+Space）的 up 继续走模式键通道：
+            // 跟打器类宿主 space 只投 TestKeyUp（Down 全无，1394 实测）——
+            // 此前被「keyup 一律直通」拦死，1416 注释承诺的 TestKeyUp
+            // 通道实际不可达，该宿主 Ctrl+Space 永远切不了中英。普通
+            // 宿主的 up 双发由 modekey_down_seen 一次性标记挡（见下）。
         }
         // ── 模式键直发 + 去重 ──
-        // 只在按下事件直发（TestDown 或 KeyDown）。松开（testup/keyup）
-        // 一律直通：实测按住 CapsLock 常 >80ms 去重窗，keyup 再直发会
-        // 把切换翻回去——净效果为零（「caps 无效」实测）。
+        // 按下事件（TestDown 或 KeyDown）直发；松开仅限「down 未直发过」
+        // 的跟打器形态。同键 80ms 去重挡 test+down 成对宿主的双发；up
+        // 一旦因 down 已发被吞即清标记——按住 Ctrl+Space 再久也不会
+        // 被迟到的 keyup 翻回（CapsLock「按住 >80ms 翻回」同源教训）。
         if mode_key {
-            let dup = {
-                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                matches!(&g.modekey_last, Some((vk, t))
-                    if *vk == wparam && t.elapsed().as_millis() < 80)
-            };
-            if dup {
-                return BOOL(0);
+            {
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                if up {
+                    if g.modekey_down_seen == Some(wparam) {
+                        g.modekey_down_seen = None;
+                        return BOOL(0);
+                    }
+                } else {
+                    g.modekey_down_seen = Some(wparam);
+                }
+                let dup = matches!(&g.modekey_last, Some((vk, t))
+                    if *vk == wparam && t.elapsed().as_millis() < 80);
+                if dup {
+                    return BOOL(0);
+                }
+                g.modekey_last = Some((wparam, std::time::Instant::now()));
             }
-            self.shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .modekey_last = Some((wparam, std::time::Instant::now()));
             // fallthrough：走通用路径发 server + 完整响应处理
         }
         // TestKeyDown：本地预判（缓存引擎态），不碰管道——
@@ -2907,11 +2898,9 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             let dx = r.left - g.hupo_last_seg_x;
                             if (40..320).contains(&dx) {
                                 g.hupo_key_w = (dx as f32) * 0.5;
-                                g.hupo_last_jump = dx;
                             }
                             // 【五十八修补·立段记行宽】换行回退量=一行总宽
-                            //（溢出推断的 cap 真值；reseg 之外立段也记——
-                            // 长模式禁 reseg 后 span 的唯一来源）。
+                            //（溢出推断的 cap 真值）。
                             if dx < -200 {
                                 g.hupo_line_span = -dx;
                             }
@@ -2930,12 +2919,9 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         g.hupo_seg_y = r.top;
                         g.hupo_seg_h = h.max(16);
                         g.hupo_seg_started = true;
-                        // 【五十七修】行首 raw 基点（raw==1 时=1）
-                        g.hupo_seg_raw0 = g.cur_raw_len.max(1);
-                        g.hupo_reseg_armed = false;
-                        // 【五十八修】新句立段退出长流模式（重查/重立链恢复）
-                        g.hupo_long_mode = false;
-                        g.hupo_prev_raw = g.cur_raw_len;
+                        // 【三十六修】此处原五十七/五十八修的 行首 raw 基点/
+                        // reseg_armed/长流模式/顶屏补偿 四组旗标写点已删
+                        //（机制从未实现，见 Shared 字段区归档注释）。
                         // 【六十五修补】键序采纳基点=当前键序
                         g.hupo_adopt_key = g.seg_key_index;
                     }
@@ -2977,12 +2963,11 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 绝），但键宽可从段间真值自校准（上屏字宽×0.5）——段内候选随
     // 编码逐键右移贴光标（纯计算零查询，不拖动效节奏）。未校准期
     //（首段/换行后）钉段首（保守）。
-    // 【五十六修·重查帧重立段】换行时刻的立段竞态：新段首键到达时
-    // 虎魄滚动动画进行中，selection 立段拿到旧行框=锚卡旧行末；下一
-    // 段立段跳新行、再下段又踩竞态=「新行和上一行末来回跳」实测的
-    // 病根。自愈：60ms 重查帧（立段同值 arm 的）置 hupo_reseg，到点
-    // 重查 selection——守卫（x 回退>200 或 |dy|>50=换行/滚屏级）通过
-    // 才重立段，防段内值抖动误伤。
+    // 【五十六修·重查帧重立段（三十六修归档：未实现）】换行时刻的
+    // 立段竞态自愈通道只存在于注释：hupo_reseg 旗标在 CARET_TIMER 有
+    // 置位、段内分支从无消费——「重查 selection+守卫重立段」整链缺失
+    //（「新行和上一行末来回跳」的自愈实际未生效）。旗标已删；58/60 修
+    // 的长流纯推断模型（下方）承担换行跟随。
     // 【五十八修·整句长流纯推断】整句流（raw 涨超 6 键）中 selection
     // 组段框恒=句首行（虎魄组段 range 在句首不动）——56/57 的重查重
     // 立段会跳回句首（用户实测「还是跳回去」）；顶死武装在 raw 恒涨
@@ -3135,8 +3120,23 @@ fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
 /// 【三十四修·chase 实验通道】追赶式跟随开关：C:\ProgramData\HuFu\diag\chase
 /// 旗标文件存在=启用（指数逼近+限速，替代 pos_anim 逐段插值）。即开即
 /// 关：每次 show 现查文件，下一次首显生效，无需重启宿主。生产默认关。
+/// 【三十六修】show() 每帧调用 → 500ms 时间戳节流（同 trace_on 口径，
+/// 旗标仍秒级热生效，热路径零 stat）。
 pub fn chase_on() -> bool {
-    std::path::Path::new(r"C:\ProgramData\HuFu\diag\chase").exists()
+    use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+    static STATE: AtomicI8 = AtomicI8::new(-1);
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_CHECK_MS.load(Ordering::Relaxed);
+    if STATE.load(Ordering::Relaxed) < 0 || now_ms < last || now_ms - last > 500 {
+        let on = std::path::Path::new(r"C:\ProgramData\HuFu\diag\chase").exists();
+        STATE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+        LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+    }
+    STATE.load(Ordering::Relaxed) == 1
 }
 
 /// 【三十四修·段间键宽自校准】CJK 全角字判定（上屏宽度采样配对用）。
@@ -3261,10 +3261,18 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     };
     let Ok(range) = (unsafe { comp.GetRange() }) else {
         trace("qc: GetRange 失败");
+        // 【三十六修】中段失败恢复旧锚：开头快照注释承诺「失败时真
+        // 恢复」，此前只有最末失败分支做到——这四个早退把锚丢成 None，
+        // 本帧走 no_anchor 抑制链白付一轮 35ms 补显。
+        g.caret = prev_caret;
+        g.line_end = prev_line_end;
         return;
     };
     let Ok(caret) = (unsafe { range.Clone() }) else {
         trace("qc: Clone 失败");
+        // 【三十六修】同上：恢复旧锚
+        g.caret = prev_caret;
+        g.line_end = prev_line_end;
         return;
     };
     // 【三十一修·首键锚 selection 优先】组段首键（seg=1）GetTextExt 对
@@ -3346,6 +3354,9 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     }
     let Ok(view) = (unsafe { ctx.GetActiveView() }) else {
         trace("qc: GetActiveView 失败");
+        // 【三十六修】同 GetRange/Clone 早退：恢复旧锚，不掉成 None
+        g.caret = prev_caret;
+        g.line_end = prev_line_end;
         return;
     };
     let mut clipped = BOOL(0);
@@ -3673,6 +3684,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             g.cand_shown_this_segment = false;
             g.wps_caret_prev = None;
             g.wps_settle_start = None;
+            // 【三十六修】断段清抑制链旗标：纯键路径断段（Shift/回车/
+            // 退格立即收窗的空帧）此前不清——entered_late 带入下一段
+            // 首显被错误免滑；suppress_since 旧时间戳让 starved 熔断
+            // 提前放行下段抑制（旧布局锚显示）。
+            g.suppress_since = None;
+            g.entered_late = false;
             // 【三十九次修正·补】断段主动收窗：上屏后窗残留可见会在
             // 下一格首键采样期遮挡/冒充新 show（旧位残留），立即收。
             // 【单按反查键修复·三十修】aux 提示帧（反查刚进入：raw 空
@@ -4749,8 +4766,26 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         } else {
             g.cand2_dead = false;
         }
+        // 【三十六修】早退路径同样收尾（见下）；g 可能已 drop——
+        // 重拿锁兜底，不依赖守卫存活。
+        let _ = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rank_flash
+            .take();
         return Ok(());
     }
+    // 【三十六修】rank_flash 一次性收尾：dispatch 置位后必跟且仅跟
+    // 一次 update_ui——raw 空帧已消费/渲染；raw 非空的提前上屏路径
+    //（CommitAndRepreedit）闪帧被续打候选帧取代，不再渲染。此处兜底
+    // 丢弃，防旗标滞留到整句 commit 的空帧、用当时的 last_show 把
+    // 高亮打在与选重无关的候选列表上（多余 show+hide）。g 在部分
+    // 路径已 drop——重拿锁，不依赖守卫存活。
+    let _ = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rank_flash
+        .take();
     Ok(())
 }
 
@@ -5440,14 +5475,14 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             unsafe {
                 let _ = KillTimer(hwnd, CARET_TIMER_ID);
             }
-            let shared = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
+            let shared = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
             if let Some(shared) = shared {
                 {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     g.caret_recheck_due = false;
-                    // 【五十六修】qie 的重查帧置重立段标志（段内分支带守
-                    // 卫重查 selection——换行立段竞态自愈）。
-                    g.hupo_reseg = true;
+                    // 【三十六修】五十六修「重查重立段」（hupo_reseg 置位
+                    // →段内带守卫重查 selection）从未实现——旗标只写零
+                    // 读已删。本 timer 现存作用=caret_force 强制重查。
                     // 到点强制重查：置 caret_force（SetPreedit 段内查询
                     // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
                 }
@@ -5704,7 +5739,7 @@ fn poll_tick() {
     // 线程亲和正确）：闲拍顺手把窗建好（隐藏态不显示），首键直接
     // show。进程生命周期只发生一次。
     {
-        let sp = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
+        let sp = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
         if let Some(s) = sp {
             let (none, dead, busy) = {
                 let g = s.lock().unwrap_or_else(|e| e.into_inner());
@@ -5745,7 +5780,7 @@ fn poll_tick() {
     // 收紧为"本进程是当前输入宿主"：近 2s 有键或组段活着；否则只收
     // 残留窗后跳过本拍（残留收起复用下方兜底逻辑，抽 poll_collapse）。
     {
-        let sp = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
+        let sp = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
         if let Some(s) = sp {
             let g = s.lock().unwrap_or_else(|e| e.into_inner());
             let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
@@ -5771,7 +5806,7 @@ fn poll_tick() {
     // 【语言栏缓存 2026-09-11】方案清单/音效快照在 poll 线程刷新
     //（5s 节流）——右键菜单 msctf 回调里零管道。
     crate::langbar::refresh_schemas_cache();
-    let shared = POLL_SHARED.lock().unwrap().as_ref().map(|p| p.0.clone());
+    let shared = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
     let Some(shared) = shared else { return };
     // 【残留兜底】前台窗口属于别的进程（宿主失焦：切到别的应用打字、
     // 开始菜单/UWP 宿主关闭）→ 收起本进程候选窗并跳过本帧刷新。
@@ -5863,6 +5898,9 @@ fn poll_tick() {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;
             g.suppress_since = None;
+            // 【三十六修】同 update_ui 空帧分支：迟到首显旗标一并清，
+            // 防带入下一段首显（错误免入场滑）。
+            g.entered_late = false;
             g.cand_shown_this_segment = false;
             g.wps_caret_prev = None;
             g.wps_settle_start = None; // click_sticky 保留：上屏帧垃圾锚需黏性拦

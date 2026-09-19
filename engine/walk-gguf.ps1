@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $path = 'E:\DSH-KF\TigerClaw\sentence\Models\sentence-qwen-q8.gguf'
 $fs = [System.IO.File]::OpenRead($path)
 $br = New-Object System.IO.BinaryReader($fs)

@@ -648,20 +648,38 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         },
         ("GET", "/api/state") => {
             let state = host.engine.state(&host.session);
+            // 【三十六修】与装载计划（host.rs load_plan）/模型监视线同
+            // 口径：配置路径不存在时回退「模型\ 目录探测任意 .bin」——
+            // 旧版只查 config 路径，新装机拖模型进目录后整句实际可用、
+            // 设置页却显示「未安装」弹补装指引（两条判定口径不一致）。
+            // 无模型小包 2026-09-07 语义（设置页「整句模型」页判断用）
+            // 不变，仅补探测回退。json! 值须是表达式——先算后引。
+            let cfg_path = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.sentence.ngram_path,
+            );
+            let model_present = if cfg_path.exists() {
+                true
+            } else {
+                let model_dir =
+                    hufu_engine::Engine::resolve_data_sub(&host.data_dir, "模型");
+                std::fs::read_dir(&model_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .any(|e| {
+                        e.path()
+                            .extension()
+                            .map(|x| x.eq_ignore_ascii_case("bin"))
+                            .unwrap_or(false)
+                    })
+            };
             Response::json(&serde_json::json!({
                 "state": state,
                 "schemas": host.engine.schemas,
                 "current_schema": host.engine.config.schema.current,
                 "sentence_active": host.engine.sentence_active(),
-                // 【无模型小包 2026-09-07】设置页「整句模型」页判断用：
-                // ngram 模型文件是否在数据目录（小包默认不带，设置页
-                // 显示下载/放置指引；与 sentence_active 分开——后者还
-                // 受当前方案是否整句方案影响）。
-                "model_present": hufu_engine::Engine::resolve_data_sub(
-                    &host.data_dir,
-                    &host.engine.config.sentence.ngram_path,
-                )
-                .exists(),
+                "model_present": model_present,
             }))
         }
         ("POST", "/api/key") => {

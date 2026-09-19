@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'SilentlyContinue'
+﻿$ErrorActionPreference = 'SilentlyContinue'
 Get-ChildItem 'E:\DSH-KF\hufu\platform\windows\target\release\hufu_tsf.dll.lock*' | ForEach-Object {
   Write-Host ("占用副本: {0}  {1}" -f $_.Name, $_.LastWriteTime.ToString('HH:mm:ss'))
 }

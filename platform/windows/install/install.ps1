@@ -301,6 +301,9 @@ function Install-UserConfig {
     Set-RegDWord $lpU 'IconIndex' 0
     Set-Reg $lpU 'IconFile' $dllReg       # SystemIME 副本（打包进程可读）
     Set-Reg $lpU 'Icon' "$dllReg,0"       # 图标双写（3544b61：Index+字符串两制式）
+    # 【下划线退役 2026-09-16】DisplayAttribute 注册表键全撤——对照本机
+    # 微拼/Rime/虎爪：均无此键，下划线来自 TSF 默认组段渲染；自定义标记
+    # 反而让宿主连默认下划线都不画（QQ/开始菜单/记事本实锤）。
 
     # 【32 位宿主注册 2026-09-12 v1.5.3】32 位进程（Pain 跟打器等）的
     # COM 解析读 HKCU 的 Wow6432Node 视图（InprocServer32 键重定向），
@@ -400,6 +403,13 @@ New-Item -Path $asm -Force | Out-Null
 Set-ItemProperty -Path $asm -Name 'CLSID' -Value $CLSID -Type String
 Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
 Set-ItemProperty -Path $asm -Name 'Profile' -Value $PROFILE -Type String
+# 【默认首选输入法 2026-09-16】显式设默认输入法覆盖=虎符（用户实锤：
+# 仅靠列表首位，重启后默认输入法可能不是虎符）。覆盖优先于列表序，
+# 重启/新会话/新宿主一律默认虎符；用户手动 Win+空格 切换不受影响。
+try {
+    Set-WinDefaultInputMethodOverride $tipStr -ErrorAction Stop
+    Write-Host 'OK 默认输入法覆盖 = 虎符（重启/新会话默认首选）'
+} catch { Write-Host '· 默认输入法覆盖写入失败（不影响列表首位默认）' }
 Write-Host 'OK 语言列表 + 切换器装配已写入'
 
 # ── 5) 开机自启（server 常驻 = 托盘 + 设置页 + 管道）+ 开始菜单快捷方式 ──

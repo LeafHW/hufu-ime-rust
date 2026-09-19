@@ -1,4 +1,4 @@
-# HuFu 管道批量测试：模拟 DLL 逐键发送，断言预期
+﻿# HuFu 管道批量测试：模拟 DLL 逐键发送，断言预期
 param([string]$Script = 'basic')
 $ErrorActionPreference = 'Stop'
 $enc = [System.Text.Encoding]::UTF8

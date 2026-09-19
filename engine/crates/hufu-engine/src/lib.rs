@@ -433,6 +433,11 @@ pub struct Engine {
     /// 落盘行序与逐条写完全一致。
     learn_log_pending: Vec<String>,
     learn_log_last_flush: std::time::Instant,
+    /// 【三十六修】会话学习保留：add_word 只写内存 user_dict，
+    /// reload_user_data 按文件重建会把会话内自动调频无痕清零——
+    /// learn 时登记 (code,text)→次数，reload 重建后回放（用户本会话
+    /// 显式 {删除} 过的词跳过）。切方案时清空（码义随方案变）。
+    session_learned: std::collections::HashMap<(String, String), u32>,
 }
 
 impl Engine {
@@ -517,6 +522,7 @@ impl Engine {
             supp_hold: std::sync::Mutex::new(None),
             learn_log_pending: Vec::new(),
             learn_log_last_flush: std::time::Instant::now(),
+            session_learned: std::collections::HashMap::new(),
         };
         // 全局资源（反查/注释/拆分）大统一应用——见 apply_global_assets
         engine.apply_global_assets();
@@ -547,6 +553,7 @@ impl Engine {
             supp_hold: std::sync::Mutex::new(None),
             learn_log_pending: Vec::new(),
             learn_log_last_flush: std::time::Instant::now(),
+            session_learned: std::collections::HashMap::new(),
         };
         engine.apply_global_assets();
         Ok(engine)
@@ -661,6 +668,9 @@ impl Engine {
         let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
         let schema = Schema::load(&dir)?;
         self.schema = schema;
+        // 【三十六修】会话学习按 (code,text) 登记，码义随方案变——
+        // 切方案即作废，防跨方案错配回放。
+        self.session_learned.clear();
         self.apply_global_assets();
         self.config.schema.current = name.to_string();
         // 只记录两端皆非空的方案对（启动期 old 为空时不污染——
@@ -700,6 +710,17 @@ impl Engine {
                 .user_dict
                 .weights
                 .insert((c.clone(), w.clone()), *v);
+        }
+        // 【三十六修】回放会话学习（reload 按文件重建把 add_word 的内存
+        // 调频清零——置顶/删词一次就丢光整场打字的自动调频）。本会话
+        // 显式 {删除} 过的词不回放（用户意志优先）。
+        let learned: Vec<((String, String), u32)> = self.session_learned.drain().collect();
+        for ((c, w), n) in learned {
+            if !self.schema.adjust.removed(&c, &w) {
+                for _ in 0..n {
+                    self.schema.user_dict.add_word(&c, &w);
+                }
+            }
         }
         // 【用户词注入整句 2026-09-06】加词后整句词图同步热更
         self.sync_sentence_user_words();
@@ -2336,6 +2357,44 @@ impl Engine {
             session.clear();
             return KeyOutcome::commit(raw, self.state(session));
         }
+        // 【三十六修·断供兜底（丢字根治）】提前上屏把错误前缀写进
+        // committed_text 后（单字增量豁免/深字位分叉不在七十九修首字
+        // 否决与同码分歧护栏的拦截面内），完整态候选池里以该前缀开头
+        // 的路径耗尽——sentence_candidates 的 starts_with 过滤清空候选
+        // （lib.rs 池构建处），码表兜底对 >4 键剩码也无精确词条，此后
+        // 一路空挂到句尾，空格在这里 clear() 把剩余 raw 连同其全部文
+        // 本静默丢弃——万句基准 ~18% 错句的「丢字」即此，护栏开/关一
+        // 致（护栏只拦提交时刻，对断供无恢复逻辑）。兜底 = 把断供视作
+        // 强制分段：丢弃 committed 约束、用剩余 raw 重开一段解码取首选
+        // 上屏；不进学习（机器猜测不污染用户词）。显式 {删除} 的词、
+        // 切方案语义不受影响。开关 sentence.empty_code_auto_commit
+        //（serde 默认 true；此前该配置零消费，本轮接通）。
+        // HUFU_EMPTY_AUTO_COMMIT 环境变量最高优先（bench A/B 用：
+        // 1=强制开 0=强制关），缺省走 config。
+        let salvage_on = match std::env::var("HUFU_EMPTY_AUTO_COMMIT").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => self.config.sentence.empty_code_auto_commit,
+        };
+        if salvage_on
+            && !session.committed_text.is_empty()
+            && !session.raw.is_empty()
+        {
+            let leftover = std::mem::take(&mut session.raw);
+            session.clear();
+            session.raw = leftover;
+            self.refresh_candidates(session);
+            if let Some(cand) = session.candidates.first().cloned() {
+                let mut text = cand.commit_text().to_string();
+                if text.starts_with('{') {
+                    text = self.resolve_dynamic(&text);
+                }
+                session.clear();
+                return KeyOutcome::commit(text, self.state(session));
+            }
+            session.clear();
+            return KeyOutcome::consumed(self.state(session));
+        }
         session.clear();
         KeyOutcome::consumed(self.state(session))
     }
@@ -2725,6 +2784,12 @@ impl Engine {
             cand.source != CandidateKind::Sentence && cand.code.chars().count() <= 16;
         if learnable && self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
+            // 【三十六修】同步登记会话学习（reload_user_data 重建后回放，
+            // 见 Engine::session_learned 注释）。
+            *self
+                .session_learned
+                .entry((cand.code.clone(), cand.text.clone()))
+                .or_insert(0) += 1;
         }
         if self.config.user.log_adjust {
             let secs = std::time::SystemTime::now()
@@ -3238,8 +3303,23 @@ impl Engine {
                 && raw_len > 0
                 && raw_len <= self.config.input.max_code_length;
             if freq_boost_domain {
-                let pinned_n = session.candidates.iter().take_while(|c| c.pinned).count();
-                let rest = session.candidates.split_off(pinned_n);
+                // 【三十六修·置顶失位修复】pinned 保护原为 take_while
+                // 前导连续段：二十三修短语压前合并把 pinned 词挤出前导
+                // 段后，置顶词被划入 rest 参与表内单字分区、被压到单字
+                // 之后（用户 #固 置顶在 raw≤4 同码含常用单字时失效）。
+                // 改为对全列表稳定分区：pinned（保原相对序）恒在前。
+                let (pinned_c, rest): (Vec<Candidate>, Vec<Candidate>) = {
+                    let mut p = Vec::new();
+                    let mut r = Vec::new();
+                    for c in session.candidates.drain(..) {
+                        if c.pinned {
+                            p.push(c);
+                        } else {
+                            r.push(c);
+                        }
+                    }
+                    (p, r)
+                };
                 let is_top_single = |c: &Candidate| {
                     c.source == CandidateKind::Dict
                         && c.text.chars().count() == 1
@@ -3251,7 +3331,7 @@ impl Engine {
                 };
                 // 【二十三修】无表内单字则整段不动（fyy=[𥙫,一点点,𮠙]
                 // 类全表外码位保持码表原序）。
-                if rest.iter().any(|c| is_top_single(c)) {
+                let boosted = if rest.iter().any(|c| is_top_single(c)) {
                     let mut singles: Vec<Candidate> = Vec::with_capacity(rest.len());
                     let mut others: Vec<Candidate> = Vec::new();
                     for c in rest {
@@ -3262,10 +3342,12 @@ impl Engine {
                         }
                     }
                     singles.extend(others);
-                    session.candidates.extend(singles);
+                    singles
                 } else {
-                    session.candidates.extend(rest);
-                }
+                    rest
+                };
+                session.candidates = pinned_c;
+                session.candidates.extend(boosted);
             }
             return;
         }

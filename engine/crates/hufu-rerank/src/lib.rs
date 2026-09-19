@@ -20,8 +20,12 @@ pub struct Reranker {
 impl Reranker {
     pub fn load(path: &str) -> Result<Self, String> {
         let m = Qwen3::load(path)?;
-        // BPE 从元数据构建（重开文件只读 meta，页缓存共享）
-        let g = gguf::GgufFile::open(path).map_err(|e| e.to_string())?;
+        // BPE 从元数据构建。//【三十六修】open 会 read_to_end 整个数据段
+        //（550MB q8 全量读入临时 Vec 再丢弃）——即使 Qwen3::load 已走
+        // mmap，这里也白付一次全文件读+550MB 瞬态分配（空闲 30 分钟卸
+        // 载→下句重载、模型监视边沿触发、bench 每次都吃）。open_lazy
+        // 只解析头部+mmap，与「页缓存共享」的注释意图一致。
+        let g = gguf::GgufFile::open_lazy(path).map_err(|e| e.to_string())?;
         let tok = bpe::Bpe::from_gguf(&g).ok_or("GGUF 缺 tokenizer.ggml 元数据")?;
         Ok(Self { m, tok })
     }

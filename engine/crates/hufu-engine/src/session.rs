@@ -100,11 +100,6 @@ impl Session {
         self.pending_commit = None;
     }
 
-    /// 清提前上屏瞬态（保留已提交前缀）。
-    pub fn early_reset(&mut self) {
-        self.early_history.clear();
-    }
-
     pub fn is_idle(&self) -> bool {
         self.raw.is_empty() && self.candidates.is_empty() && self.mode == InputMode::Normal
     }

@@ -270,14 +270,15 @@ pub struct SentenceSection {
     pub auto_enable: bool,
     /// 提前上屏
     pub early_commit: bool,
-    /// 整句空码自动顶屏（虎爪 2026-09 同步）：新键使「已提交前缀」
-    /// 断供（无完整候选）时，自动顶出追加前的强首选，新键留在缓冲
-    /// 继续组新字——而非干挂缓冲死等。
+    /// 【三十六修·断供兜底】提前上屏锁定错误前缀后完整态候选池断供
+    ///（以 committed_text 为前缀的候选耗尽），空格本会 clear() 把剩余
+    /// raw 连同其文本静默丢弃（「丢字」根因）——开启时把断供视作强制
+    /// 分段：丢弃 committed 约束、用剩余 raw 重开一段解码取首选上屏
+    ///（不进学习）。serde 默认 true（虎爪 2026-09 同步语义的落地实现）。
     #[serde(default = "default_true")]
     pub empty_code_auto_commit: bool,
-    /// 空码顶屏后缓冲至少保留的编码键数（虎爪「保留最少编码数量」，
-    /// 默认 0=不限）：断供时若顶出后缓冲剩余键数不足该值，先挂起
-    /// 等继续打键攒够再顶——防止把码流上下文一次掏空。
+    /// 预留参数，当前未消费（虎爪同步占位）：断供顶屏后缓冲保留最少
+    /// 编码键数。当前兜底只在空格时刻整体重开一段，无逐键顶屏路径。
     #[serde(default)]
     pub min_retained_raw: usize,
     /// 神经重排（llama.cpp 子进程）
@@ -328,7 +329,11 @@ impl Default for SentenceSection {
             empty_code_auto_commit: true,
             min_retained_raw: 0,
             rerank: RerankSection::default(),
-            ngram_path: "models/sentence-ngram.bin".into(),
+            // 【三十六修】默认路径对齐发行布局（模型\ 一级目录，与
+            // 数据说明/设置页指引/装载计划探测一致）——旧 models/ 前缀
+            // 使 Default 态永远 miss、全靠目录探测兜底（配合 /api/state
+            // 的探测口径修复消除「有模型显示未安装」）。
+            ngram_path: "模型/sentence-ngram.bin".into(),
             // 【回归 1.4.8 模型默认 2026-09-08】W1 束宽 30000 实测引发
             // 「越打越卡」（每键全量解码数百 ms，1.4.8 基线对照实锤）
             //——默认回 1.4.8 值（beam200/cl20/supp32），W1 档位
@@ -366,7 +371,7 @@ impl Default for RerankSection {
     fn default() -> Self {
         RerankSection {
             enabled: true,
-            model_path: "models/sentence-qwen-q8.gguf".into(),
+            model_path: "模型/sentence-qwen-q8.gguf".into(),
             top_k: 5,
             debounce_ms: 350,
             endpoint: "127.0.0.1:0".into(),

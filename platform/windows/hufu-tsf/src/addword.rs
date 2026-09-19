@@ -217,14 +217,17 @@ static ADDWORD_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// 当前线程是否小窗线程——直通门放行判定（词框键由小窗线程自己的
 /// sink 处理，主线程的才需要直通防残留）。
 pub fn in_window_thread() -> bool {
-    ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed) != 0
+    // 【三十六修】单次 load（旧实现两次 load 之间存在 TOCTOU——首读
+    // 非零、次读已被另一线程改写/清零，判定失真）。
+    let tid = ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed);
+    tid != 0
         && unsafe {
             #[link(name = "kernel32")]
             unsafe extern "system" {
                 fn GetCurrentThreadId() -> u32;
             }
             GetCurrentThreadId()
-        } == ADDWORD_TID.load(std::sync::atomic::Ordering::Relaxed)
+        } == tid
 }
 
 /// 【词框候选内嵌·标题栏 2026-09-12 八修】小窗线程的候选显示在小窗
@@ -261,13 +264,12 @@ fn open_common() {
                 }
             }
         }
-        // 登记小窗线程 id（五修：直通门判定用）——已确认本线程要建窗
-        //（B1：窗口存活场景不会走到这里，tid 不会被覆盖悬挂）
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThreadId() -> u32;
-        }
-        ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
+        // 【三十六修·B1 残余竞态收口】tid 登记从这里（线程起手）移到
+        // 下方窗口登记临界区内：连按 /jc 两线程同过前置检查时，双线程
+        // 都在此 store tid → 后 store 者覆盖真窗口线程的 tid（悬挂），
+        // in_window_thread() 对真小窗线程失真 → 直通门误判（词框打
+        // 不了中文）+ 输家 TIP 激活泄漏。tid 现与 *guard 登记同临界区
+        // 同点写入——输家在任何早退路径都不再触碰 tid。
         // 【词框 TSF 化 2026-09-12 三修】线程 TSF 化的完整链：STA COM
         // → 显式 CoCreateInstance(ThreadMgr)（msctf 判定线程 TSF-
         // enabled 的标志=线程持有 ThreadMgr；只有 CoInitialize 不够，
@@ -417,8 +419,15 @@ fn open_common() {
             crate::tsf::trace("addword CreateWindow 失败（窗口未建）");
             return;
         }
-        // 登记本窗口句柄（后续 open 前置复用），放锁再跑消息循环
+        // 登记本窗口句柄（后续 open 前置复用）+ 本线程 id（五修：直通
+        // 门判定用）——同一临界区同一写入点，B1 残余竞态收口（三十六
+        // 修，见上方注释）。放锁再跑消息循环。
         *guard = hwnd.0 as isize;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
         drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
         // 【六修 2026-09-12】AttachThreadInput 抢前台——此前裸调

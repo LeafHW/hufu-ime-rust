@@ -1,8 +1,8 @@
 @echo off
-rem HuFu 设置：server 未在跑则先拉起，然后开独立窗口（GBK 控制台，双击场景 936 原生）
+rem HuFu settings: start server from install dir (portable layout) if not running
 tasklist /FI "IMAGENAME eq hufu-server.exe" 2>nul | find /I "hufu-server.exe" >nul
 if errorlevel 1 (
-  start "" /B "%LOCALAPPDATA%\HuFu\hufu-server.exe" --data "%LOCALAPPDATA%\HuFu\数据"
+  start "" /B "%~dp0hufu-server.exe" --data "%~dp0数据"
   timeout /t 3 /nobreak >nul
 )
 set "BROWSER="

@@ -30,19 +30,30 @@ pub fn dispatch(
                     .get("line_end")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // 【七十七修·键流落盘】server 侧诊断（HUFU_TRACE 门控）
+                // 【七十七修·键流落盘】server 侧诊断（HUFU_TRACE 门控）。
+                // 【三十六修】旧实现 fs::write 覆盖写——trace 永远只有最后
+                // 一键；且持 host 锁内逐键 env::var。改追加写 + 开关
+                // OnceLock 缓存（trace 开关对 server 属启动期诊断通道）。
                 let diag_tail = req.get("digit_tail").and_then(|v| v.as_str()).map(|s| s.to_string());
-                if std::env::var("HUFU_TRACE").is_ok() {
-                    let _ = std::fs::write(
-                        std::env::temp_dir().join("hufu-server-trace.log"),
-                        format!(
-                            "pid={} key={:?} digit_tail={:?} ctx={:?}\n",
-                            std::process::id(),
-                            k,
-                            diag_tail,
-                            host.session.tail_context
-                        ),
-                    );
+                static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE_ON.get_or_init(|| std::env::var("HUFU_TRACE").is_ok()) {
+                    use std::io::Write as _;
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(std::env::temp_dir().join("hufu-server-trace.log"))
+                        .and_then(|mut f| {
+                            f.write_all(
+                                format!(
+                                    "pid={} key={:?} digit_tail={:?} ctx={:?}\n",
+                                    std::process::id(),
+                                    k,
+                                    diag_tail,
+                                    host.session.tail_context
+                                )
+                                .as_bytes(),
+                            )
+                        });
                 }
                 // 【七十七修·digit_tail 后缀补齐】DLL 随空态键携带
                 // TestDown 记的直通数字尾巴（不递键宿主跟打器/WinForms/
@@ -536,6 +547,14 @@ mod imp {
             returned: *mut u32,
         ) -> i32;
         fn ConnectNamedPipe(pipe: isize, overlapped: *mut core::ffi::c_void) -> i32;
+        fn PeekNamedPipe(
+            h: isize,
+            buf: *mut core::ffi::c_void,
+            buf_size: u32,
+            read: *mut u32,
+            avail: *mut u32,
+            left: *mut u32,
+        ) -> i32;
         fn DisconnectNamedPipe(pipe: isize) -> i32;
         fn ReadFile(
             h: isize,
@@ -602,10 +621,54 @@ mod imp {
         }
     }
 
-    fn read_exact(h: isize, n: usize) -> std::io::Result<Vec<u8>> {
+    /// 【三十六修·对等防护】PeekNamedPipe 等数据到达：deadline 内有数
+    /// 据=继续，管道断/超时=false。客户端侧（ipc.rs call_on）早有同款
+    /// 轮询体系，服务端此前纯阻塞 ReadFile——建连后不发帧的僵尸连接
+    /// （本机进程开 255 个静默连接占满 PIPE_UNLIMITED_INSTANCES）会让
+    /// 监听线程 CreateNamedPipe 永败、合法 DLL 连不进。
+    fn wait_avail(h: isize, deadline: Option<std::time::Instant>) -> bool {
+        loop {
+            let mut avail: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    h,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut avail,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return false;
+            }
+            if avail > 0 {
+                return true;
+            }
+            match deadline {
+                Some(d) if std::time::Instant::now() >= d => return false,
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// 读 n 字节。deadline=Some 时，数据未到位的等待受其约束（数据一
+    /// 旦可见，阻塞 ReadFile 立即返回可用字节，不再受 deadline 影响）。
+    fn read_exact_dl(
+        h: isize,
+        n: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
         let mut done = 0usize;
         while done < n {
+            if !wait_avail(h, deadline) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "等待管道数据超时/断开",
+                ));
+            }
             let mut got = 0u32;
             let ok = unsafe {
                 ReadFile(
@@ -646,19 +709,37 @@ mod imp {
     }
 
     /// 单连接处理：读帧 → 派发 → 写帧，直至断开。
+    /// 【三十六修·读超时】首帧 10s / 帧头→帧体 2s：合法客户端按需建连、
+    /// 建连即发帧且 head+body 一次写出——两个窗口只拦「建连不发帧」
+    /// 与「只发帧头的半包」两类僵尸连接。既有通信史后的空闲等待不受限
+    ///（keep-alive 常驻语义不变，deadline=None 阻塞如旧）。
     fn serve_conn(h: isize, host: &Mutex<Host>) {
         // 对端进程名：本连接生命周期内不变，一次反查全程使用
         let client_exe = client_process_exe(h);
+        let connect_at = std::time::Instant::now();
+        let mut first_frame = true;
         loop {
-            let head = match read_exact(h, 4) {
-                Ok(b) => b,
-                Err(_) => break,
+            let head = {
+                let dl = if first_frame {
+                    Some(connect_at + std::time::Duration::from_secs(10))
+                } else {
+                    None
+                };
+                match read_exact_dl(h, 4, dl) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                }
             };
+            first_frame = false;
             let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
             if len == 0 || len > BUF {
                 break;
             }
-            let body = match read_exact(h, len) {
+            let body = match read_exact_dl(
+                h,
+                len,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+            ) {
                 Ok(b) => b,
                 Err(_) => break,
             };

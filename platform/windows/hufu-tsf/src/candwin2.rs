@@ -315,33 +315,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             return LRESULT(0);
         }
         0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
-        // 【rect 只增不减 2026-09-11】内容余量区（窗口 rect 大于内容
-        // 的透明部分）鼠标穿透——不挡住底下去往宿主应用的点击。
-        0x0084 => {
-            // WM_NCHITTEST：lparam 屏幕坐标
-            if let Some(gsh) = crate::tsf::G_SHARED.get() {
-                let shared = gsh.0.clone();
-                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(c) = g.cand2.as_ref() {
-                    let (cw, ch) = c.content_size.get();
-                    let mut pt = POINT { x: 0, y: 0 };
-                    let mut ok = false;
-                    unsafe {
-                        let mut p = POINT {
-                            x: (lparam.0 as u32 & 0xFFFF) as i16 as i32,
-                            y: ((lparam.0 as u32 >> 16) & 0xFFFF) as i16 as i32,
-                        };
-                        if ScreenToClient(hwnd, &mut p).as_bool() {
-                            pt = p;
-                            ok = true;
-                        }
-                    }
-                    if ok && (pt.x >= cw || pt.y >= ch || pt.x < 0 || pt.y < 0) {
-                        return LRESULT(-1); // HTTRANSPARENT
-                    }
-                }
-            }
-        }
+        // 【三十六修·死块删除】WM_NCHITTEST（0x84）已在 wndproc 头部
+        //（HTCLIENT 强制整窗命中，QQ 按钮消息实测教训）无条件 return，
+        // 此臂自那时起不可达——其「余量区 HTTRANSPARENT 穿透」设计与
+        // 头部强制 HTCLIENT 语义互斥（后者胜出）。B4 审计项随之关闭：
+        // 经 g.cand2 读 content_size 的跨线程疑虑连代码带块消亡。
+        // 阴影/余量带（约 90-150ms 动画帧）会挡宿主点击，属既定取舍。
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
@@ -361,11 +340,19 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         c.size_anim = None;
                         c.chrome_override.set(None);
                         c.pos_anim = None;
+                        // 【三十六修】chase 三元组同步清（与 hide_now/
+                        // focus_reset 同口径——残留 chase_target 会在下次
+                        // show 臂发前被 tick 拖向旧目标）
+                        c.chase_target = None;
+                        c.chase_last = None;
+                        c.chase_pos = None;
                         c.live_size.set((0, 0));
                         crate::tsf::tl_cand_put_back(Some(c));
                     }
                     let _ = KillTimer(hwnd, FADE_TIMER_ID);
                     let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
+                    // 【三十六修】主分支同款：HIDE_LATER 延迟收窗钟一并杀
+                    let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 return LRESULT(0);
@@ -388,6 +375,11 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         c.size_anim = None;
                         c.chrome_override.set(None);
                         c.pos_anim = None;
+                        // 【三十六修】chase 三元组同步清（与 hide_now/
+                        // focus_reset 同口径）
+                        c.chase_target = None;
+                        c.chase_last = None;
+                        c.chase_pos = None;
                         c.live_size.set((0, 0));
                     }
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1727,8 +1719,12 @@ impl CandidateWindowV2 {
                 }
                 k -= 2;
             }
+            // 【三十六修·下溢修复】串长 <6 时 chars.len()-6 usize 下溢
+            // panic（渲染线程崩=宿主崩）。可达路径：竖排 cap=260/240
+            // 且字号放大（滚轮 33-36pt 或皮肤 font_point 无钳位）时
+            // 5 字编码 est 超限直落终段。
             std::iter::once('…')
-                .chain(chars[chars.len() - 6..].iter().copied())
+                .chain(chars[chars.len().saturating_sub(6)..].iter().copied())
                 .collect()
         };
         let raw_disp_cap = if horizontal { w_cap * 0.7 } else { 260.0 };
@@ -3270,7 +3266,11 @@ impl CandidateWindowV2 {
                 //（跨组段/上屏/新一轮候选全部保持；右键再解除）。
                 // 拖动松手会回写 pin（见 WM_LBUTTONUP）——打字必然用
                 // 最新固定位。pin 同为窗口原点系：+m_off 转回锚点系。
-                crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
+                // 【三十六修·门控】diag_enabled 前置，pin 固定期每帧
+                // show 不再白付 format! 分配。
+                if crate::tsf::diag_enabled() {
+                    crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
+                }
                 let x = (px + m_off).clamp(vx, (vx + vw - width as i32).max(vx));
                 let y = (py + m_off).clamp(vy, (vy + vh - height as i32).max(vy));
                 (x, y)
@@ -3863,13 +3863,11 @@ impl CandidateWindowV2 {
                         None => (tx, ty),
                     }
                 };
-                // 【四十一修·主 SWP 观测（破案后降频）】锚位与目标差>10
-                // 才打——常规小步进不打（对齐四十修 pos 观测）。
-                if (tx - x).abs() > 10 || (ty - y).abs() > 10 {
-                    crate::tsf::trace(&format!(
-                        "cw2: SWP主 pos=({px},{py}) 目标=({tx},{ty}) 锚位=({x},{y})"
-                    ));
-                }
+                // 【四十一修·主 SWP 观测（三十六修删）】原条件
+                // `|tx-x|>10`：tx ≡ x − m_off（阴影边距，3678 处推导），
+                // 差值恒=m_off——凡带阴影皮肤恒真、日志每帧必发且信息
+                // 量为零（恒定 delta）。锚↔目标差=设计常量，运动观测由
+                // 下方三十九修（目标 vs 当前实位）承担，本块整删。
                 // 【七十一修诊断·锚全帧】show 每帧打锚+sticky+目标+动
                 // 效态（换行震荡排查：段模型已证稳定，显示层低值来源
                 // 待定位——非降频，全帧）。
@@ -3886,10 +3884,12 @@ impl CandidateWindowV2 {
                 // 置的显示层（suppress 补显/滑动/钳位交替），此前零
                 // 观测=盲区。每次目标位移 >10px 打一行（小步进不打防
                 // 日志爆炸），诊断直读。
+                // 【三十六修·门控】trace_on() 前置——动画期 dd>10 帧每
+                // 5ms 一次，关 trace 不该白付 format! 分配。
                 {
                     let (lx2, ly2) = self.live_pos.get();
                     let dd = (tx - lx2).abs().max((ty - ly2).abs());
-                    if dd > 10 {
+                    if dd > 10 && crate::tsf::trace_on() {
                         crate::tsf::trace(&format!(
                             "cw2: pos 目标({tx},{ty}) 当前({lx2},{ly2}) d={dd}"
                         ));
@@ -4136,6 +4136,67 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.internal_rerender = false;
                 }
             }
+            // 【三十六修·TL 补 chase 步进】chase 臂发在 show() 无线程
+            // 区分（TL 实例同样被置 target/清 pos_anim），主 tick 有步进
+            // 而本分支没有 → 开 chase 旗标时词框窗冻结在起点、timer 因
+            // anim_done 立即被杀永不追到光标。步进逻辑与主线程同款。
+            if let Some(tgt) = c.chase_target {
+                let now = std::time::Instant::now();
+                let dt_ms = c
+                    .chase_last
+                    .map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
+                    .unwrap_or(8.0)
+                    .clamp(1.0, 120.0);
+                c.chase_last = Some(now);
+                let (cx, cy) = c.chase_pos.unwrap_or({
+                    let lp = c.live_pos.get();
+                    (lp.0 as f32, lp.1 as f32)
+                });
+                let (dxf, dyf) = (tgt.0 as f32 - cx, tgt.1 as f32 - cy);
+                let dist = (dxf * dxf + dyf * dyf).sqrt();
+                if dist < 1.0 {
+                    c.chase_target = None;
+                    c.chase_last = None;
+                    c.chase_pos = None;
+                    c.live_pos.set(tgt);
+                    if c.is_visible() {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            tgt.0,
+                            tgt.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                } else {
+                    let k = 1.0 - (-dt_ms / 35.0).exp();
+                    let mut frac = k;
+                    let max_step = 2.5 * dt_ms;
+                    if dist * frac > max_step {
+                        frac = max_step / dist;
+                    }
+                    let np = (
+                        (cx + dxf * frac).round() as i32,
+                        (cy + dyf * frac).round() as i32,
+                    );
+                    c.chase_pos = Some((cx + dxf * frac, cy + dyf * frac));
+                    c.live_pos.set(np);
+                    anim_done = false;
+                    if c.is_visible() && np != (cx.round() as i32, cy.round() as i32) {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            np.0,
+                            np.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            }
             if let Some((f, t, t0, dur)) = c.pos_anim {
                 let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
                 if cur == t {
@@ -4160,6 +4221,17 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             SWP_NOSIZE | SWP_NOACTIVATE,
                         );
                     }
+                }
+            }
+            // 【三十六修·TL 补高亮滑动步进】hl 臂发同样无线程区分，
+            // 本分支缺步进 → 词框窗选重/换候选时胶囊冻在起点矩形
+            //（首 tick anim_done=true 即收钟）。注释「同款」自此属实。
+            if c.hl_anim.get().is_some() {
+                anim_done = false;
+                if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, None, sel);
+                    c.internal_rerender = false;
                 }
             }
         }

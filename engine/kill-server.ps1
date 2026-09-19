@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Continue'
+﻿$ErrorActionPreference = 'Continue'
 Get-Process hufu-server -ErrorAction SilentlyContinue | ForEach-Object {
   Write-Host ("found PID {0}" -f $_.Id)
   Stop-Process -Id $_.Id -Force

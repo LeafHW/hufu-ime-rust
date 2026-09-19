@@ -1,4 +1,4 @@
-# 三十一修·活锚即显 — SystemIME 双通道部署（需提权一次）
+﻿# 三十一修·活锚即显 — SystemIME 双通道部署（需提权一次）
 # 部署后给 Users 授 Modify 权，后续部署无需再提权。
 $ErrorActionPreference = 'Stop'
 $src64 = 'E:\DSH-KF\hufu\platform\windows\target-fix\release\hufu_tsf.dll'
