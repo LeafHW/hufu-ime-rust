@@ -79,7 +79,7 @@ hufu/
 | `hufu-server` + 设置 GUI | ✅          | 20 REST 路由（+候选置顶/隐藏/音效试听/全量快照导出）+ `\\.\pipe\hufu-ime` 命名管道 + Unix socket（macOS）；pipeclient 全操作通过；40KB 单文件设置 UI（试用台/方案/整句权重 10 滑杆/皮肤编辑器实况预览/用户词+置顶隐藏/任意候选调整/音效开关+试听/繁简开关/快照导出/导入导出） |
 | Windows TSF              | ✅ 真机全通 | `hufu_tsf.dll`（纯 Rust + windows-rs 0.58）；**系统级激活实测**：Win+空格 第 4 项（虎图标）、汉字上屏、候选窗贴光标跟随、选区顺序正确；**应用矩阵**：记事本/浏览器/VSCode/QQ/DSH/Listary 全通过。注册九步一键化（install.ps1 + reg-fix.ps1）；DLL 轨迹日志 `%TEMP%\hufu-tsf-trace.log`。运行时铁律：EditSession 用 ASYNCDONTCARE、组段走 GetSelection→StartComposition、GetTextExt 即屏幕坐标 |
 | macOS IMK                | 🔨 骨架     | HuFuInputController（键码→Unix socket→组段/上屏）+ CandidatePanel（NSVisualEffectView 四材质）+ Info.plist + build.sh；帧协议与 Windows 管道一致；**需在 Mac 上编译迭代** |
-| Linux fcitx5             | ✅ 可用     | `platform/linux`：Rust staticlib（Unix socket 客户端 + C ABI）+ C++ 薄壳（~300 行）；候选/组段/上屏；**英文输入由 fcitx5 键盘布局提供**（引擎不带中英切换，Shift/Caps 不下发）；install.sh 系统级装 addon + systemd user 服务托管引擎 + zhmn 码表装配；**待实机 fcitx5 全量回归** |
+| Linux fcitx5             | ✅ 可用     | `platform/linux`：Rust staticlib（Unix socket 客户端 + C ABI）+ C++ 薄壳；候选/组段/上屏/**候选点击上屏**；**英文输入由 fcitx5 键盘布局提供**（引擎不带中英切换，Shift/Caps 不下发）；install.sh 系统级装 addon + systemd user 服务 + zhmn 码表/**虎爪资源（注释/拆分/全拼反查/符号/音效 wav）**装配；**待实机 fcitx5 全量回归** |
 
 ### 测试
 
