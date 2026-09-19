@@ -2289,6 +2289,12 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
+    /// 鼠标点击候选（fcitx5 前端用）：页内下标 → 与数字选重同语义
+    ///（学习、无闪帧，点击即上屏）。Windows 前端不使用本入口。
+    pub fn select_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+        self.select_candidate_ex(session, idx, false, false)
+    }
+
     /// 【十八修】no_learn 版（;/' 选重用）：只上屏不进用户词学习。
     fn select_candidate_ex(
         &mut self,

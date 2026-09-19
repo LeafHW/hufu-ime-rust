@@ -315,6 +315,24 @@ mod imp {
             c.check("22. Shift/Caps 不切中英（配置未关闭，跳过）", true, "");
         }
 
+        // ── 鼠标点击候选（select op：页内下标，语义同数字选重）──
+        c.reset();
+        let _ = c.key("t");
+        let _ = c.key("i");
+        let cands = c.candidates();
+        if !cands.is_empty() {
+            let pick = cands[0].clone();
+            let r = c.call(serde_json::json!({"op": "select", "index": 0}));
+            c.check(
+                "23. select 点击候选上屏（页内下标）",
+                r["outcome"]["commit"].as_str() == Some(pick.as_str()),
+                &format!("commit={:?} 期望={pick}", r["outcome"]["commit"]),
+            );
+        } else {
+            c.check("23. select（数据无候选，跳过）", true, "");
+        }
+        c.reset();
+
         // ── 焦点/reset 幂等 ──
         let _ = c.key("t");
         let _ = c.call(serde_json::json!({"op": "focus"}));

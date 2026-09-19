@@ -618,6 +618,31 @@ impl Host {
         serde_json::json!({ "outcome": outcome, "state": state })
     }
 
+    /// 鼠标点击候选（页内下标）→ (结果, 状态快照)。
+    /// 语义与数字选重一致（学习、无闪帧）；供 Linux fcitx5 前端点击使用，
+    /// Windows 前端不走本入口。尾巴记账与 [`Self::process_key`] 同源。
+    pub fn select_candidate(&mut self, index: usize) -> serde_json::Value {
+        let outcome = self.engine.select_candidate(&mut self.session, index);
+        if let Some(c) = outcome.commit.as_deref() {
+            if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" {
+                self.engine.last_commit = c.to_string();
+                self.session.tail_context.push_str(c);
+                let n = self.session.tail_context.chars().count();
+                if n > 32 {
+                    let skip = n - 32;
+                    self.session.tail_context =
+                        self.session.tail_context.chars().skip(skip).collect();
+                }
+            }
+        }
+        self.after_ime_op();
+        let state = outcome
+            .state
+            .clone()
+            .unwrap_or_else(|| self.engine.state(&self.session));
+        serde_json::json!({ "outcome": outcome, "state": state })
+    }
+
     /// 应用新配置：落盘 + 热更新 + 必要时重装重排。
     /// 【返回值改造 2026-09-11】整句重建不再在此持锁同步做（旧
     /// setup_sentence 载 546MB 模型秒级卡全机打字）——返回

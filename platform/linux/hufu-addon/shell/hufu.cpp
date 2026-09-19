@@ -97,6 +97,25 @@ std::string keyNameOf(const fcitx::Key &key) {
     return std::string(1, unshiftAscii(static_cast<char>(u)));
 }
 
+class HufuEngine;
+
+/// 面板候选：点击（`select`）按页内下标上屏——与数字选重同语义
+///（学习、无闪帧）。此前用 `DisplayOnlyCandidateWord`，点击无反应。
+class HufuCandidateWord : public fcitx::CandidateWord {
+public:
+    HufuCandidateWord(fcitx::Text text, fcitx::Text comment,
+                      HufuEngine *owner, int32_t index)
+        : CandidateWord(std::move(text)), owner_(owner), index_(index) {
+        setComment(std::move(comment));
+    }
+
+    void select(fcitx::InputContext *inputContext) const override;
+
+private:
+    HufuEngine *owner_;
+    int32_t index_;
+};
+
 class HufuEngine : public fcitx::InputMethodEngine {
 public:
     explicit HufuEngine(fcitx::Instance *instance) : instance_(instance) {
@@ -193,8 +212,16 @@ public:
         resetSession(event);
     }
 
-    // 【Linux 策略】不实现 subMode()：中/英副模式属引擎自带英文输入，
-    // Linux 上英文由 fcitx5 键盘布局输入法提供，状态栏不再显示中/英。
+    /// 状态栏副模式：中/英（引擎侧中英态）。
+    // (subMode 已按 Linux 策略移除)
+
+    /// 鼠标点击候选（页内下标）：与数字选重同语义（学习、无闪帧）。
+    /// `context_` 必须在调用期间置位——commit/update 回调靠它清理面板。
+    void selectCandidate(fcitx::InputContext *inputContext, int32_t index) {
+        context_ = inputContext;
+        hufu_client_select(engine_, index);
+        context_ = nullptr;
+    }
 
 private:
     /// 清引擎会话 + UI（activate/deactivate/reset 共用）。
@@ -301,8 +328,8 @@ private:
                 const char *t = texts != nullptr && texts[i] != nullptr ? texts[i] : "";
                 const char *c =
                     comments != nullptr && comments[i] != nullptr ? comments[i] : "";
-                candidateList->append<fcitx::DisplayOnlyCandidateWord>(
-                    fcitx::Text(t), fcitx::Text(c));
+                candidateList->append<HufuCandidateWord>(
+                    fcitx::Text(t), fcitx::Text(c), this, i);
             }
             candidateList->setPageSize(count);
             const int32_t index = std::min(std::max(selected, 0), count - 1);
@@ -323,6 +350,11 @@ private:
     /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）
     std::string topCommit_;
 };
+
+/// 点击候选 = 上屏（页内下标；语义同数字选重）。
+void HufuCandidateWord::select(fcitx::InputContext *inputContext) const {
+    owner_->selectCandidate(inputContext, index_);
+}
 
 class HufuFactory : public fcitx::AddonFactory {
 public:

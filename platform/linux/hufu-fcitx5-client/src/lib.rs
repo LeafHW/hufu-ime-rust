@@ -210,6 +210,21 @@ impl HufuClient {
         let Some(resp) = self.call(&req) else {
             return (false, 0);
         };
+        self.apply_outcome_response(resp)
+    }
+
+    /// 鼠标点击候选（页内下标）：走引擎 `select` op，语义与数字选重一致
+    /// （学习、无闪帧）；返回是否消费。回调同步送达 commit/update。
+    pub fn select(&mut self, index: usize) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({"op": "select", "index": index})) else {
+            return false;
+        };
+        self.apply_outcome_response(resp).0
+    }
+
+    /// `{outcome, state}` 回包 → 回调送达 + `(consumed, back)`。
+    /// key/select 共用（协议同构）。
+    fn apply_outcome_response(&mut self, resp: serde_json::Value) -> (bool, u8) {
         let Some(outcome_v) = resp.get("outcome") else {
             return (false, 0);
         };
@@ -395,6 +410,19 @@ pub extern "C" fn hufu_client_key(
 pub extern "C" fn hufu_client_reset(c: *mut HufuClient) {
     if !c.is_null() {
         unsafe { &mut *c }.reset();
+    }
+}
+
+/// 鼠标点击候选：`index` 为页内下标（当前候选窗列表序号）；1=已处理。
+#[no_mangle]
+pub extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int {
+    if c.is_null() || index < 0 {
+        return 0;
+    }
+    if unsafe { &mut *c }.select(index as usize) {
+        1
+    } else {
+        0
     }
 }
 
@@ -677,6 +705,35 @@ mod tests {
         assert_eq!(cap.updates[0].0, ""); // preedit
         assert_eq!(cap.updates[0].1, ""); // raw —— 壳以「raw 空 + 有候选」判闪帧
         assert_eq!(cap.updates[0].2.len(), 2);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn select_candidate_commits() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("select");
+        let handle = mock_server(
+            path.clone(),
+            vec![serde_json::json!({
+                "outcome": {
+                    "consumed": true,
+                    "commit": "衣",
+                    "state": {
+                        "raw": "", "preedit": "", "candidates": [],
+                        "page": 0, "page_count": 0, "mode": "Normal", "chinese": true,
+                        "full_shape": false, "ascii_punct": false
+                    }
+                },
+                "state": {"raw": "", "candidates": [], "page": 0, "page_count": 0,
+                          "mode": "Normal", "chinese": true,
+                          "full_shape": false, "ascii_punct": false}
+            })],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.select(0), "select 应返回已处理");
+        assert_eq!(cap.commits.as_slice(), ["衣"]);
+        assert_eq!(cap.updates.len(), 1);
         handle.join().unwrap();
     }
 

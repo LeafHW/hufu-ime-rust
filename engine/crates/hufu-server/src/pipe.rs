@@ -103,6 +103,20 @@ pub fn dispatch(
             }
             None => serde_json::json!({"error": "按键描述无效"}),
         },
+        // 鼠标点击候选（Linux fcitx5 前端；index=页内下标）。语义与数字
+        // 选重一致（学习、无闪帧即时上屏）；Windows 前端不使用本 op。
+        "select" => {
+            let index = req
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX);
+            let mut r = host.select_candidate(index);
+            if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
+                r["outcome"]["sound_vol"] = serde_json::json!(host.engine.config.sound.volume);
+            }
+            r
+        }
         "state" => {
             // 先应用已到达的重排缓存：停顿期轮询（DLL poll_tick）拉 state
             // 时立即拿到换序后的新首选，用户无需按键即可看到候选窗刷新。

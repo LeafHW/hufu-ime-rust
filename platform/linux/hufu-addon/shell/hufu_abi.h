@@ -54,6 +54,10 @@ int32_t hufu_client_key(hufu_client *client, const char *key, int32_t shift,
 
 /* 清引擎会话并同步清 UI（activate/deactivate/reset 用）。 */
 void hufu_client_reset(hufu_client *client);
+
+/* 鼠标点击候选：index 为页内下标（当前候选窗列表序号，0 起）；1=已处理。
+ * 语义与数字选重一致（学习、无闪帧即时上屏）。 */
+int32_t hufu_client_select(hufu_client *client, int32_t index);
 /* 焦点切换：清会话与文章尾巴（保留中英态）。 */
 void hufu_client_focus(hufu_client *client);
 
