@@ -312,7 +312,10 @@ private:
             return;
         }
         const fcitx::Text preeditText(preeditString);
-        context_->inputPanel().setPreedit(preeditText);
+        // 【候选窗预编辑 默认关】编码串不画进候选窗（与虎虚 PanelPreedit
+        // 默认一致）——组段走客户端内联预编辑（下方 setClientPreedit），
+        // 编码/锁名在应用内随组段可见，候选窗只出候选与注释。
+        context_->inputPanel().setPreedit(fcitx::Text());
         // 客户端内联预编辑：跟随 fcitx5 全局预编辑设置
         context_->inputPanel().setClientPreedit(
             context_->isPreeditEnabled() ? preeditText : fcitx::Text());

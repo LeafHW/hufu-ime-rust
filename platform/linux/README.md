@@ -143,7 +143,7 @@ Windows 侧行为不变（仍由引擎自带中英切换）。
 | 能力 | Windows TSF | macOS IMK | Linux fcitx5 |
 |---|---|---|---|
 | 键→引擎 IPC | 命名管道 | Unix socket | Unix socket（同帧协议） |
-| 组段 | ITfComposition | setMarkedText | preedit + clientPreedit |
+| 组段 | ITfComposition | setMarkedText | clientPreedit（组段内联）；候选窗内预编辑默认关 |
 | 上屏 | SetText+EndComposition | insertText | commitString（回删走 forwardKey/deleteSurroundingText） |
 | 候选窗 | D2D+Acrylic 自绘 | NSVisualEffectView | fcitx5 自带面板（classicui/kimpanel） |
 | 设置 | localhost Web UI | 同 | 同（systemd user 服务托管） |
