@@ -14,7 +14,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ASSETS_DIR="$ROOT/assets"
-SRC="${HUFU_DATA_SRC:-/home/crux/下载/_res/zhmn}"
+# 外部数据源（仅 --from 或 assets/ 缺失时使用；无默认值——本机路径不该进仓库）
+SRC="${HUFU_DATA_SRC:-}"
 HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
 DATA_DIR="$HUFU_ROOT/数据"
 BIN_DIR="$HOME/.local/bin"
@@ -53,17 +54,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
 # 数据/资源来源：默认仓库 assets/；--from 走外部目录（资源再从虎爪 7z 取）
 USE_ASSETS=1
 if [[ "$SRC_OVERRIDE" == 1 ]]; then
     USE_ASSETS=0
 elif [[ ! -d "$ASSETS_DIR/码表" ]]; then
-    echo "• 仓库 assets/ 缺失，回退外部源：$SRC" >&2
+    echo "• 仓库 assets/ 缺失（不完整检出？）——将使用外部数据源" >&2
     USE_ASSETS=0
 fi
-
-say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
-die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+if [[ "$USE_ASSETS" == 0 && -z "$SRC" ]]; then
+    die 'assets/ 缺失且未指定外部源：请用 --from <虎码资源目录> 指定码表目录'
+fi
 
 # ── 1) 构建 ────────────────────────────────────────────────────────────────
 if [[ "$DO_BUILD" == 1 ]]; then
@@ -85,7 +89,7 @@ write_default_config() {
     if [[ ! -f "$DATA_DIR/config.json" ]]; then
         cat > "$DATA_DIR/config.json" <<'JSON'
 {
-  "schema": { "dir": "码表", "current": "虎码字词" },
+  "schema": { "dir": "码表", "current": "虎整句" },
   "reverse": { "scheme": "拼音" },
   "candidates": {
     "split_scheme": "虎码",
@@ -99,7 +103,7 @@ write_default_config() {
   }
 }
 JSON
-        echo '  ✓ 生成 数据/config.json（默认方案：虎码字词；反查=拼音；注释/拆分显示开；中英切换交由 fcitx5 布局）'
+        echo '  ✓ 生成 数据/config.json（默认方案：虎整句；反查=拼音；注释/拆分显示开；中英切换交由 fcitx5 布局）'
     else
         echo '  · 已存在 数据/config.json，保持不动（如需切换默认方案/开关请在设置页操作）'
     fi
@@ -113,7 +117,7 @@ assemble_data() {
         say '③ 装配数据（来源：仓库 assets/）'
         cp -a "$ASSETS_DIR/码表/." "$HUFU_ROOT/码表/"
         cp -a "$ASSETS_DIR/数据/." "$DATA_DIR/"
-        echo '  ✓ 码表（虎码字词/虎码单字/多多B）+ 数据（注释/拆分/反查/转换词典/音效）'
+        echo '  ✓ 码表（虎整句/虎码字词/虎码单字/多多B）+ 数据（注释/拆分/反查/转换词典/音效）'
         write_default_config
         return 0
     fi

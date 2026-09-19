@@ -49,7 +49,8 @@ fi
 
 say '③ 删除用户级文件'
 rm -f "$HOME/.local/bin/hufu-server" \
-    "$HOME/.local/share/applications/hufu-settings.desktop"
+    "$HOME/.local/share/applications/hufu-settings.desktop" \
+    "$HOME/.config/fcitx5/conf/hufu.conf"
 
 if [[ "$PURGE" == 1 ]]; then
     say '④ 删除用户数据（--purge）'

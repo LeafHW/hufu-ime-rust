@@ -60,7 +60,7 @@ platform/linux/uninstall.sh [--purge]
 
 - 系统级：`/usr/lib/fcitx5/libhufu.so`、`/usr/share/fcitx5/{addon,inputmethod}/hufu.conf`
 - 用户级：`~/.local/bin/hufu-server`、`~/.config/systemd/user/hufu-server.service`、
-  `~/.local/share/applications/hufu-settings.desktop`
+  `~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`
 - 数据：`~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置/皮肤/用户词/音效）
 
 装完后：
@@ -77,8 +77,12 @@ fcitx5-configtool            # 输入法 → 添加「虎符」
 Linux 端所需数据**全部随仓库分发**（`assets/`，与安装布局同构），
 安装脚本默认从此装配，**无需外部下载**：
 
+完整步骤（安装 / 资源获取 / 卸载）见 **[../../docs/linux-install.md](../../docs/linux-install.md)**；
+各资源来源、版本与许可见 **[../../docs/asset-sources.md](../../docs/asset-sources.md)**。
+
 | assets 目录 | 安装位置（`~/.local/share/hufu/`） | 内容 |
 |---|---|---|
+| `码表/虎整句/`（默认方案） | `码表/虎整句/` | 整句方案：tigress 单字+词 import 闭包（≈250k）、快符/常用符号/一简符号、补充语料；放入模型即启用整句 |
 | `码表/虎码字词/` | `码表/虎码字词/` | tigress 单字+词 import 闭包（≈250k）、快符/常用符号/一简符号、补充语料 |
 | `码表/虎码单字/` | `码表/虎码单字/` | tiger 单字表（≈117k）+ 符号 |
 | `码表/多多B/` | `码表/多多B/` | 多多格式常用字词/生僻字 |
@@ -94,8 +98,8 @@ Linux 端所需数据**全部随仓库分发**（`assets/`，与安装布局同�
 外部源覆盖（换版本用）：`--from <虎码资源目录>`（码表）+ `--tigerclaw <虎爪7z>`
 （注释/拆分/反查/符号/音效，`7z e -so` 按需流式取单文件）；`--no-assets` 跳过资源装配。
 
-首次安装生成 `数据/config.json`：默认方案 `虎码字词`；反查/拆分/音效默认关
-（对应资源未就位，后续补齐）。
+首次安装生成 `数据/config.json`：默认方案 `虎整句`（放入模型即启用整句）；反查=拼音、
+拆分=`虎码`、unicode 注释/拆分显示开；中英切换交由 fcitx5 布局（引擎不带英文输入）。
 
 ## 回归电池（Unix socket）
 
