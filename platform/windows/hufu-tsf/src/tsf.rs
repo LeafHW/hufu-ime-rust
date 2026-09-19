@@ -3678,6 +3678,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if !inline_on {
             preedit = "";
         }
+        // 【三十六修·死锁修复 2026-09-20】rank_flash 单点消费：raw 非空
+        // 的提前上屏续打帧（CommitAndRepreedit）闪帧被续打候选取代——
+        // 就地消费，防旗标滞留到整句 commit 的空帧、用当时的 last_show
+        // 把高亮打在与选重无关的候选列表上。放在此单流量点（而非函数
+        // 尾部）的原因：本函数 12 个早退出口且部分出口 g 已 drop——尾部
+        // 收尾要么 re-lock 同一把 std Mutex（g 存活的出口=同线程重入
+        // 自锁，首键卡死宿主实锤），要么 borrowck 不过。raw 空帧的闪帧
+        // 消费在下方块内原样保留。
+        if !raw.is_empty() {
+            let _ = g.rank_flash.take();
+        }
         if raw.is_empty() {
             g.skin_stale = true;
             // 断段：下一组段的候选首显重新走 WPS 收敛检测
@@ -4743,6 +4754,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 沉浸式锁定态（自绘窗 cloaked）但 UIElement 通道未激活
         // （Deactivate→再 Activate 的状态漂移）：SearchHost 直接
         // server 代画自愈；其他宿主复位 dead 下一帧重建自绘
+        // 【三十六修·死锁修复 2026-09-20】此处曾加 rank_flash 尾部
+        // 收尾（shared.lock()）——g 存活时同线程 re-lock 自锁，首键
+        // 卡死宿主。消费已上移到 op 派生块单流量点（见 rank_flash
+        // 单点消费注释），本函数尾部不再做任何锁操作。
         if host_is_searchhost() {
             // 【二十九修·删角落框】原硬编码 (12,12)=用户实锤的偶发左上
             // 角候选框（Deactivate/Activate 漂移时机触发、滞留到下次收
@@ -4766,26 +4781,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         } else {
             g.cand2_dead = false;
         }
-        // 【三十六修】早退路径同样收尾（见下）；g 可能已 drop——
-        // 重拿锁兜底，不依赖守卫存活。
-        let _ = shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rank_flash
-            .take();
         return Ok(());
     }
-    // 【三十六修】rank_flash 一次性收尾：dispatch 置位后必跟且仅跟
-    // 一次 update_ui——raw 空帧已消费/渲染；raw 非空的提前上屏路径
-    //（CommitAndRepreedit）闪帧被续打候选帧取代，不再渲染。此处兜底
-    // 丢弃，防旗标滞留到整句 commit 的空帧、用当时的 last_show 把
-    // 高亮打在与选重无关的候选列表上（多余 show+hide）。g 在部分
-    // 路径已 drop——重拿锁，不依赖守卫存活。
-    let _ = shared
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .rank_flash
-        .take();
+    // 【三十六修·死锁修复 2026-09-20】此处曾是 rank_flash 尾部收尾
+    //（shared.lock()）——部分到达路径 g 仍存活=同线程 re-lock 自锁
+    //（首键卡死宿主实锤），部分路径 g 已 drop=borrowck 不过。消费已
+    // 上移到 op 派生块单流量点，本函数尾部不再做任何锁操作。
     Ok(())
 }
 
