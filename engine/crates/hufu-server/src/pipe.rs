@@ -167,6 +167,8 @@ pub fn dispatch(
                 Ok(s) => {
                     let mut sv = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
                     if let Some(o) = sv.as_object_mut() {
+                        // 【特效退役 2026-09-22】commit_fx / stamp_font_scale
+                        // 注入移除（DLL 消费端已删）。
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
                         // 【虎娘对齐·首显滑动 2026-09-18 二修】显式 opt-in

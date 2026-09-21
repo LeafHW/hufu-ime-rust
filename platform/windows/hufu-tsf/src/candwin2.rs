@@ -500,7 +500,8 @@ fn parse_hex(s: &str) -> Option<[u8; 4]> {
     Some([b(0)?, b(2)?, b(4)?, if s.len() == 8 { b(6)? } else { 0xFF }])
 }
 
-fn color_f(v: &Value, key: &str, default: &str) -> D2D1_COLOR_F {
+/// 皮肤色读取（/skin/colors/{key} 包装层或顶层 colors 双形态口径）。
+pub(crate) fn color_f(v: &Value, key: &str, default: &str) -> D2D1_COLOR_F {
     let hex = v
         .pointer(&format!("/skin/colors/{key}"))
         .and_then(|x| x.as_str())
@@ -837,6 +838,7 @@ impl CandidateWindowV2 {
         // 【七十修】进程时钟精度 1ms（动画 tick 5ms 生效前提）——候选窗
         // 首次创建时一次性提升（DllMain 内调不安全：loader lock）。
         raise_timer_resolution_once();
+        // 【特效退役 2026-09-22】ensure_thread(上屏特效线程预热)撤除
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -3723,10 +3725,7 @@ impl CandidateWindowV2 {
                     if dmax >= 3 {
                         self.chase_target = Some((tx, ty));
                         self.chase_last = None;
-                        unsafe {
-                            let _ =
-                                SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                        }
+                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                     } else {
                         self.live_pos.set((tx, ty));
                         self.chase_target = None;
@@ -3843,10 +3842,7 @@ impl CandidateWindowV2 {
                                 // 起臂帧即记真实显示位：下一键 per-key 滑动
                                 // 从滑行起点接续，而不是从上一段残值起步。
                                 self.live_pos.set((fx, ty));
-                                unsafe {
-                                    let _ =
-                                        SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
-                                }
+                                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                             }
                         }
                     }

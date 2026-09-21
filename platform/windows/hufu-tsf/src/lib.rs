@@ -8,6 +8,9 @@ mod addword;
 // CandidateWindow::new 无调用点（g.cand 恒 None），v2（DComp 直通）+
 // server 代画双通道定稿后 v1 只剩死分支。整模块删除（git 可回溯）。
 mod candwin2;
+// 【特效退役 2026-09-22】commitfx（上屏特效:飘散/落印/像素链/学习引
+// 擎）与 fxprobe（落印诊断）整模块删除——用户拍板「删掉所有特效相
+// 关」。tsf.rs 的触发点/Shared 字段/尾锚实测同步清理。git 可回溯。
 // 【死模块移除 2026-09-13 三十四修】canduielement（ITfCandidateListUIElement
 // 宿主代画协议）整模块删除：HuFuCandElement 全库无构造点——UIElement
 // 代画通道被 server 代画「用户定稿」架空（ui_element_show 无条件 false），

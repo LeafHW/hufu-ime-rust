@@ -346,6 +346,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="row">
       <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：尺寸过渡、跟光标滑动、高亮滑动；关闭=一切瞬跳">候选窗动效</label></div>
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
+      <!-- 【特效退役 2026-09-22】上屏特效下拉+落印字号控件移除 -->
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap">
@@ -936,6 +937,8 @@ function bindSkin() {
     sp.onchange = saveConfig;
     syncAnim();
   }
+  // 【特效退役 2026-09-22】上屏特效下拉+落印字号控件整体退役
+  // （commit_fx / stamp_font_scale 链路全删）——JS 块删除，HTML 行见下。
   // 【二十四修·动效大瘦身】上屏暂留控件整体退役（hide 即收）——JS 块删除。
   // 整体透明度（master_alpha 0-1）：窗底/边框/编码底/阴影的总乘法系数
   if (SKIN.material.master_alpha == null) SKIN.material.master_alpha = 1;

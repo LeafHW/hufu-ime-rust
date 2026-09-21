@@ -497,8 +497,8 @@ pub struct AppearanceSection {
     pub anim: bool,
     /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0~2，0=瞬跳）
     pub anim_speed: f32,
-    // 【二十四修·动效大瘦身】上屏暂留（commit_hold/commit_hold_ms）
-    // 已整体退役——上屏即收；字段删除，旧配置文件多余键自动忽略。
+    // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
+    // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
 }
 
 impl Default for AppearanceSection {

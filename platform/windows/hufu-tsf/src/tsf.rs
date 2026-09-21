@@ -286,6 +286,8 @@ pub struct Shared {
     /// caret 显示 → 依旧跳）。
     pub wps_caret_prev: Option<RECT>,
     pub wps_settle_start: Option<std::time::Instant>,
+    // 【特效退役 2026-09-22】原 fx_*(落印学习引擎/像素链/字体探测/
+    // 手调系数)全组字段删除——commitfx.rs 已整模块移除,git 可回溯。
     /// 本组段候选窗是否已完成首显（raw 变空时重置）——WPS 收敛检测
     /// 只管首显，首显后正常跟随。
     pub cand_shown_this_segment: bool,
@@ -2263,6 +2265,8 @@ impl EditSession_Impl {
                     }
                     g.composition = None;
                 }
+                // 【特效退役 2026-09-22】上屏包围盒采集(GetTextExt)与
+                // learn/maybe_fire 全撤——提交路径少两次范围查询,更快。
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = text.encode_utf16().collect();
@@ -2418,6 +2422,7 @@ impl EditSession_Impl {
                     }
                     g.composition = None;
                 }
+                // 【特效退役 2026-09-22】包围盒采集与 learn/fire 撤除
                 if let Some(comp) = g.composition.clone() {
                     let range: ITfRange = unsafe { comp.GetRange()? };
                     let wstr: Vec<u16> = commit_text.encode_utf16().collect();
@@ -3140,7 +3145,7 @@ pub fn chase_on() -> bool {
 }
 
 /// 【三十四修·段间键宽自校准】CJK 全角字判定（上屏宽度采样配对用）。
-fn is_cjk_fullwidth(c: char) -> bool {
+pub(crate) fn is_cjk_fullwidth(c: char) -> bool {
     matches!(c as u32,
         0x3000..=0x303F   // CJK 标点
         | 0x3400..=0x4DBF // 扩展 A
@@ -3429,7 +3434,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 【十五次修正】gui 兜底同放宽：仅极端疯狂值拦（正常倒退=
         // 位置真相，est 超前时真实拉回是纠偏不是烂锚）。
         if let Some(r) = gui_caret_fallback() {
-            let plausible_gui = if g.caret_est_line_h > 0 {
+            // 【三十七修·首键活锚直采 2026-10-21】段首（seg=1）est 基线
+            // 还是上一格/上一文档的旧值——换格/切焦后真实插入符与 est
+            // 的差常超 dx 阈被拦（Excel 换格 dx 可达数百 px），活插入符
+            // 被 est 旧值否决=首键锚停在旧位。首键活锚无条件采
+            //（GUITHREADINFO 独立于宿主布局，GetTextExt 双失败帧它是
+            // 唯一真值）；段内（≥2 键）维持原连续性过滤不变。
+            let plausible_gui = if g.seg_key_index >= 2 && g.caret_est_line_h > 0 {
                 let dy = r.top - g.caret_est_y;
                 let dx = r.left - g.caret_est_x;
                 !(dx > 800 || dx < -300 || dy < -300)
@@ -4355,6 +4366,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 正常跟随。首键瞬间编辑框可能未建（ed6=None 走原等待链），
         // 35ms 补显时框已建即显示。
         let ed6 = excel6_anchor();
+        // 【三十七修·活插入符单查复用 2026-10-21】首显锚链与表格信任
+        // 判定（cell_trusted/excel_suspect）共用一次 GUITHREADINFO 查询。
+        // 保高修复（gui_caret_fallback）后：真插入符（行高>2）通过、
+        // 退化点值出局——下方 filter 曾恒假（旧 gui_caret_fallback 把
+        // 一切矩形归一成 0 高点，活插入符整链失效=Excel/WPS 表格首键
+        // 错位的根因之一），现语义回归二十九修原意：点矩形让位查询锚、
+        // 真插入符优先。
+        let live_caret = gui_caret_fallback().filter(|r| r.bottom - r.top > 2);
         let caret = preview_anchor
             .as_ref()
             .and_then(|a| {
@@ -4380,9 +4399,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 效卡」多版本根因。点矩形视为无值让位查询锚；有效
                 // 插入符（WPS/Qt 真光标线）行为不变仍优先。
                 if first_show_of_seg {
-                    gui_caret_fallback()
-                        .filter(|r| r.bottom - r.top > 2)
-                        .or(g.caret)
+                    live_caret.or(g.caret)
                 } else {
                     g.caret
                 }
@@ -4515,7 +4532,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 族组段候选窗首次显示前做插入点收敛检测——每 35ms 重查一轮，
         // 连续两轮 GetTextExt rect 相同（布局已稳）才首显；300ms 上限
         // 兜底强制显示（防极端慢布局永不显示）。首显后正常跟随。
-        let wps_settle = host_is_wps() && !g.cand_shown_this_segment;
+        // 【三十七修·Excel 纳入 2026-10-21】settle 门扩到 excel.exe：
+        // 换格首键无活插入符时不再旧锚直显（详见 host_is_excel 注）。
+        let wps_settle =
+            (host_is_wps() || host_is_excel()) && !g.cand_shown_this_segment;
         // 【二十六/二十七次修正·抑制全面放宽】WPS 单打快打实锤：每键
         // 断段→cand_shown_this_segment 复位→WPS 收敛检测（连续两轮锚
         // 相同才显示，≥70ms）→空格 90ms 先到→从未显示（用户「打得快
@@ -4558,6 +4578,29 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 行（sticky_near 豁免 + 补显早于布局刷新）。表格段同时不吃
         // sticky_near 豁免（豁免=立即放行，旧值必错）。
         let cell_seg = g.ed6_prev.is_some();
+        // 【三十七修·表格活锚即显 2026-10-21】固定 200ms「宁慢勿错」
+        //（四十修）在快打场景=表格会话每段必等 200ms：同格连打空格
+        // 90ms 先到=候选从未显示（用户实锤「打得快候选不出来」「首
+        // 编码候选出来很慢很慢」）。真值源其实早就在：格编辑器一旦
+        // 建立，GUITHREADINFO 插入符即在新格内（WPS/Qt 真光标线，二
+        // 十九修实证；Excel 格编辑器同理）——不必等 GetTextExt 布局
+        // 收敛（150-200ms）。信任判定（live_trusted）：活插入符存在
+        // 且（无 EXCEL6 框 或 插入符落在框±容差内）。表格段（cell_
+        // trusted）与文档首/伪首段共用：
+        //   · 同格连打（编辑器常驻）→ 帧 1 即显（0ms，原先 200ms）；
+        //   · 换格首键（编辑器 ~35ms 建立）→ 补显帧即显（~35ms）；
+        //   · 无活插入符的帧维持原 200ms 等待（宁慢勿错语义保留给
+        //     病理帧），120/500ms 熔断不变。
+        let live_trusted = live_caret.is_some_and(|rc| match &ed6 {
+            Some(e) => {
+                rc.left >= e.left - 40
+                    && rc.left <= e.right + 40
+                    && rc.top >= e.top - 40
+                    && rc.bottom <= e.bottom + 60
+            }
+            None => true,
+        });
+        let cell_trusted = cell_seg && live_trusted;
         // 【首段等待分流 2026-10-09 八】200ms 线当年为 et 表格慢布局
         // 定（表格换格布局 150ms+ 才就绪）。文字文档布局 35-70ms 就绪
         // ——非表格首段 200ms 全等满=焦点切换首键实测 262-361ms 的主
@@ -4577,9 +4620,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 100
             };
             (
-                g.wps_settle_start
+                // 【三十七修·活锚短路等待】活插入符可信（见 live_trusted
+                // 注）——不必陪 GetTextExt 布局走完 100/200ms 等待线。
+                (g.wps_settle_start
                     .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(wait_ms))
-                    && g.caret.is_some(),
+                    && g.caret.is_some())
+                    || live_trusted,
                 // 【三十修·熔断解绑】原 500ms 熔断也要求 caret.is_some()——
                 // GetTextExt 持续失败=永不显示。熔断只看时间，锚尽力。
                 g.wps_settle_start
@@ -4628,10 +4674,23 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // TSF 活锚在 → 首帧即显，入场滑照播（与连打段 sticky_near 豁免同
         // 语义）。真首段（进程第一段，WPS 文档刚打开旧布局期 100ms 防御）
         // 与表格段（200ms 宁慢勿错，用户拍板）维持原等待。
-        let fresh_anchor = !cell_seg && g.cand_shown_in_proc && g.caret.is_some();
+        // 【三十七修·Excel 首键锚疑 2026-10-21】Excel 换格首键帧编辑
+        // 器未建（键事件先于窗口创建）→ 无活插入符，g.caret 常是整
+        // 框/上一格旧值（too_wide 注实测 1584px 整框）。「活锚即显」
+        //（fresh_anchor）与 sticky_near 豁免对 Excel 表格首显=旧值直
+        // 显（用户实锤「不在附近但很流畅」的根因）。无活插入符的
+        // Excel 首显帧一律走等待链：35ms 补显轮到编辑器+插入符即显
+        //（~35ms，位置直接正确），120/500ms 熔断兜底不变；有活插入
+        // 符时锚链首选它，各豁免照常放行（流畅不变）。
+        let excel_suspect = host_is_excel() && first_show_of_seg && live_caret.is_none();
+        let fresh_anchor = !cell_seg
+            && g.cand_shown_in_proc
+            && g.caret.is_some()
+            && !excel_suspect;
         let wps_wait = wps_settle
             && !(wps_stable || wps_deadline)
-            && !((any_has_prev && !cell_seg) && sticky_near)
+            && !cell_trusted
+            && !((any_has_prev && !cell_seg) && sticky_near && !excel_suspect)
             && !fresh_anchor;
         // 【三十修·无锚熔断】no_anchor 抑制同样只看时间（500ms 后放行，
         // 锚链尽力显示）——原链无时间上限，GetTextExt 永败宿主=永不显示。
@@ -5003,6 +5062,24 @@ fn host_is_wps() -> bool {
     })
 }
 
+/// 【三十七修·Excel 纳入表格锚治理 2026-10-21】Excel（excel.exe）与
+/// WPS 表格同病：换格首键 GetTextExt 返回整个编辑框矩形（trace 实测
+/// 宽 1584px、left=框左缘≠点击处）或上一格旧值——旧版 settle 门只盖
+/// host_is_wps，Excel 无任何等待=旧锚直显（用户实锤「不同单元打字首
+/// 编码候选不在附近，但是很流畅」）。纳入 settle 链：无活插入符的
+/// 首显帧走 35ms 补显等待（编辑器建立后 GUITHREADINFO 插入符即真值），
+/// 有活插入符即显（excel_suspect/cell_trusted，见 update_ui）。
+fn host_is_excel() -> bool {
+    static X: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *X.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        exe.to_lowercase().contains("excel")
+    })
+}
+
 fn ui_element_show(
     shared: &SharedRef,
     cands: &[(String, String)],
@@ -5191,19 +5268,40 @@ fn gui_caret_fallback() -> Option<RECT> {
                     }
                 }
             }
+            // 【三十七修·插入符保高 2026-10-21】原实现把矩形压成点
+            //（top==bottom==caret 底线）——update_ui 首显锚的「点矩形
+            // 过滤」（filter(bottom-top>2)，二十九修为拦 GUITHREADINFO
+            // 退化点值而设）把返回值**全数**滤掉：活插入符（WPS/Qt 真
+            // 光标线）自二十九修起在首显锚链结构性失效，一切回退
+            // GetTextExt/est——Excel 换格首键「候选不在附近但很流畅」
+            //（整框/旧格值直显）的直接根因，WPS 表格也少了最快的真值
+            // 源。改如实保留插入符高度：真插入符（行高≥8px）通过过滤
+            // 被优先采纳；退化点值（高 0，二十九修实锤的 (111,436,
+            // 113,436) 类）依旧被滤，二十九修「切窗首键动效卡」防线
+            // 不变。left/right/bottom 与原值逐字段一致（right=pt+w、
+            // bottom=caret 底线），仅 top 从底线改为真顶——消费方全部
+            // 用 left/bottom+4（不变），anchor_h/框外过滤 反而拿到真实
+            // 行高。
             let w = (gi.rcCaret.right - gi.rcCaret.left).max(2);
-            let mut pt = POINT {
+            let mut pt_top = POINT {
+                x: gi.rcCaret.left,
+                y: gi.rcCaret.top,
+            };
+            let mut pt_bot = POINT {
                 x: gi.rcCaret.left,
                 y: gi.rcCaret.bottom,
             };
-            if !windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt).as_bool() {
+            if !windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt_top).as_bool()
+                || !windows::Win32::Graphics::Gdi::ClientToScreen(gi.hwndCaret, &mut pt_bot)
+                    .as_bool()
+            {
                 return None;
             }
             let rc = RECT {
-                left: pt.x,
-                top: pt.y,
-                right: pt.x + w,
-                bottom: pt.y,
+                left: pt_top.x,
+                top: pt_top.y,
+                right: pt_bot.x + w,
+                bottom: pt_bot.y,
             };
             if in_workarea(&rc) { Some(rc) } else { None }
         };
@@ -6020,7 +6118,7 @@ fn host_async_layout() -> bool {
 /// C:\ProgramData\HuFu\diag\typing-trainers.txt 一行一个关键词
 /// （进程名包含即命中，# 开头为注释），加完重开该应用生效。
 /// 每进程启动读一次（OnceLock 缓存）。
-fn exe_is_hupo() -> bool {
+pub(crate) fn exe_is_hupo() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         let name = std::env::current_exe()
