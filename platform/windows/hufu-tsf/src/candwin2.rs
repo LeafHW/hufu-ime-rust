@@ -560,6 +560,12 @@ pub struct CandidateWindowV2 {
     /// 防抖基准，松手后下一次重绘即弹回 caret（用户实测「拖动后
     /// 回到原位」）。永久固定仍走右键 pin。
     sticky_drag: bool,
+    /// 【四十四修·退化锚行高缓存】本进程见过的最后一个正常锚行高
+    /// （高度 ≥8px 的锚矩形）。微信4.0 对同一插入点交替上报 16px
+    /// 全高与 1px 退化两种矩形（top 恒同、bottom 差 15px），落点
+    /// y=bottom+4 逐键荡秋千——入口处用本缓存把退化锚 bottom 补齐
+    /// 到正常行高，两种形状算出同一落点。
+    last_line_h: Option<i32>,
     /// 【三十四修·死字段删除】last_raw_len（grew 判定随单调锁 8707fc4
     /// 退役后只写不读，3 处写点全删）——「正向打字」过滤现由 est 与
     /// 位置动效的 2px 死区承担。
@@ -930,6 +936,7 @@ impl CandidateWindowV2 {
                 readback: false,
                 sticky_pos: None,
                 sticky_drag: false,
+                last_line_h: None,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -1099,6 +1106,7 @@ impl CandidateWindowV2 {
                 readback: false,
                 sticky_pos: None,
                 sticky_drag: false,
+                last_line_h: None,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -1501,6 +1509,40 @@ impl CandidateWindowV2 {
             None
         } else {
             anchor
+        };
+        // 【四十四修·退化锚行高补齐 2026-09-22】微信4.0 实锤（用户
+        // 实打 trace）：同一插入点交替上报两种锚矩形——16px 全高
+        //（正常，(1142,1174,1156,1190)）与 1px 退化（GetTextExt 抽
+        // 风帧，(1151,1174,1153,1175)）。top 恒同（行根本没动）而
+        // bottom 差 15px → 落点 y=bottom+4 逐键 ±15px 荡秋千（y 稳
+        // 定锁拦不住：其放行条件=单步 ≥4 且同向累计 ≥8，双向 ±15
+        // 大步每步都过门槛——锁为 WPS ±1-2 锯齿与单向滚动设计）。
+        // 修法：高度 <8px 的退化锚用本进程缓存的上一个正常行高（≥8）
+        // 补齐 bottom——两种形状算出同一落点，Y 恒定。无缓存（从未
+        // 见过正常锚）不赌默认值，原样放行，拿到第一个正常锚即生效。
+        let norm_rect: RECT;
+        let anchor = match anchor {
+            Some(a) => {
+                let h = a.bottom - a.top;
+                if h < 8 {
+                    match self.last_line_h {
+                        Some(lh) if lh >= 8 => {
+                            norm_rect = RECT { bottom: a.top + lh, ..*a };
+                            if crate::tsf::trace_on() {
+                                crate::tsf::trace(&format!(
+                                    "cw2: 退化锚补齐 高{h}→{lh}（宿主抽风帧，Y 荡秋千根治）"
+                                ));
+                            }
+                            Some(&norm_rect)
+                        }
+                        _ => Some(a),
+                    }
+                } else {
+                    self.last_line_h = Some(h);
+                    Some(a)
+                }
+            }
+            None => None,
         };
         // 【四十一修·show 入口观测（排障期）】在一切检查之前无条件打：
         // 定位"窗显示在旧位但不经观测"的矛盾（疑似 host 门提前 return
