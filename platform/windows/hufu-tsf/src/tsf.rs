@@ -4434,6 +4434,25 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         } else {
             caret.or_else(gui_caret_fallback)
         };
+        // 【四十三修·整框垃圾锚拦截 2026-09-22】Excel 实测（探针+trace
+        // 实锤）：首显又快又准（+4ms、锚=所点格窄框），~195ms 后一帧
+        // 喂进 (750,531,2334,553)——1584px 宽的公式栏编辑条整框（Excel
+        // 把组段上下文短暂指到公式栏），候选窗追其右缘 x=2334 逃逸
+        // （「每个单元首键候选位置都不对」的真相：不是首键慢/偏，是
+        // 随后被垃圾宽锚拉走）。表格宿主（excel/wps 系）锚宽 >400px
+        // 一律视为垃圾（真实插入符/组段框/EXCEL6 框均 ≤~250px）→ 本
+        // 帧弃值钉原位，等下一帧真值。非表格宿主不动（长句 inline
+        // 组段框可合法超宽）。
+        let caret = if (host_is_wps() || host_is_excel())
+            && caret.is_some_and(|c| c.right - c.left > 400)
+        {
+            if trace_on() {
+                trace("锚宽>400 表格宿主整框垃圾锚 → 拦截");
+            }
+            None
+        } else {
+            caret
+        };
         let is_preview = preview_anchor.is_some();
         // 【三十四修·段间键宽自校准】单 CJK 字上屏后，下一组段首锚点与
         // 上段窗口 sticky 落点（内容锚点系，同系可作差）的差=真实全角
@@ -4600,7 +4619,25 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             }
             None => true,
         });
-        let cell_trusted = cell_seg && live_trusted;
+        // 【四十三修·框内锚即信 2026-09-22】WPS 表格实锤（et2-fast 探针+
+        // trace）：单元格编辑器（Qt 自绘光标）**没有系统插入符**——
+        // live_trusted 恒假，cell 分支唯一出口=200ms 死线（实测 270/
+        // 301/270ms，+62ms 起 4 帧锚点已正确稳定仍被压）。换信任源：
+        // GetTextExt 查询锚落在**当前 EXCEL6 框内**＝报的就是本格
+        //（换格旧值滞留必在框外——三十八修框外过滤同款几何判据反
+        // 用；ed6 滞后拍时锚在框外→不信，保守不出错）。锚框内即放
+        // 行：换格首键 ~62-110ms 出窗（等一拍布局，位置直接正确），
+        // 同格连打编辑器常驻锚即时在框内 → 帧 1 即显。
+        let anchor_in_cell = g.caret.is_some_and(|c| match &ed6 {
+            Some(e) => {
+                c.left >= e.left - 40
+                    && c.left <= e.right + 40
+                    && c.top >= e.top - 40
+                    && c.bottom <= e.bottom + 60
+            }
+            None => false,
+        });
+        let cell_trusted = cell_seg && (live_trusted || anchor_in_cell);
         // 【首段等待分流 2026-10-09 八】200ms 线当年为 et 表格慢布局
         // 定（表格换格布局 150ms+ 才就绪）。文字文档布局 35-70ms 就绪
         // ——非表格首段 200ms 全等满=焦点切换首键实测 262-361ms 的主
@@ -5050,7 +5087,7 @@ pub fn host_is_searchhost() -> bool {
 /// 抑制」只盖 caret=None，表格首键候选先显示旧位、第二帧跳回光标
 /// （用户实测首键跳、第二键才跟随）。WPS 族组段首键帧（raw 单键）
 /// 一律延迟一帧 + 35ms 补显，等表格布局把 caret 刷稳。
-fn host_is_wps() -> bool {
+pub fn host_is_wps() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
         let exe = std::env::current_exe()
@@ -5069,7 +5106,7 @@ fn host_is_wps() -> bool {
 /// 编码候选不在附近，但是很流畅」）。纳入 settle 链：无活插入符的
 /// 首显帧走 35ms 补显等待（编辑器建立后 GUITHREADINFO 插入符即真值），
 /// 有活插入符即显（excel_suspect/cell_trusted，见 update_ui）。
-fn host_is_excel() -> bool {
+pub fn host_is_excel() -> bool {
     static X: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *X.get_or_init(|| {
         let exe = std::env::current_exe()
@@ -5372,7 +5409,20 @@ fn gui_caret_fallback() -> Option<RECT> {
                 };
                 if Thread32First(snap, &mut te) != 0 {
                     loop {
-                        if te.th32_owner_process_id == fg_pid && te.th32_thread_id != tid {
+                        // 【四十三修·自家进程线程 2026-09-22】WPS prometheus
+                        // 分体架构实锤（探针+进程树）：键处理/单元格编辑在
+                        // et.exe（本 DLL 宿主），可见框架窗属于 wps.exe——
+                        // 插入符在**自家进程**的编辑线程上。一级查前台窗
+                        // 线程（wps 框架）无 caret，二级只扫前台进程
+                        // （wps.exe）线程同样扫不到 → WPS 表格里活插入符
+                        // 恒 None、cell_trusted 永不点火（「WPS 表格候选
+                        // 出得慢」的直接根因）。自家进程线程一并纳入扫描
+                        //（GetGUIThreadInfo 只读安全；caret_valid 过滤照常）。
+                        let own_pid = std::process::id();
+                        if (te.th32_owner_process_id == fg_pid
+                            || te.th32_owner_process_id == own_pid)
+                            && te.th32_thread_id != tid
+                        {
                             let mut gi2 = GUITHREADINFO {
                                 cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
                                 ..Default::default()
