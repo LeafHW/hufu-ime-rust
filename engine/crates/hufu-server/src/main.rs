@@ -10,12 +10,14 @@
 //! --console 强制 AllocConsole（双击 exe 调试用）。
 #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
+#[cfg(windows)]
 mod candwin;
 #[cfg(windows)]
 mod clipboard;
 mod host;
 mod http;
 mod pipe;
+mod platform;
 #[cfg(windows)]
 mod tray;
 
@@ -54,6 +56,37 @@ fn attach_console_for_dev(force: bool, dev_attach: bool) {
     }
 }
 
+/// 默认数据目录。
+/// - Windows：exe 同目录下的「数据」（安装布局 %LOCALAPPDATA%\HuFu\数据）。
+///   不用相对路径 hufu-data——CWD 不可控（开机自启/explorer 中转启动时
+///   CWD 是 system32 等），相对默认会凭空建出错误目录。
+/// - 其他平台（Linux）：`$XDG_DATA_HOME/hufu/数据`（回退
+///   `~/.local/share/hufu/数据`）。`resolve_data_sub` 以父级为安装根，
+///   于是 码表/模型 自然落在 `~/.local/share/hufu/` 下。
+fn default_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.join("数据"))
+            .unwrap_or_else(|| PathBuf::from("hufu-data"))
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                home.join(".local").join("share")
+            });
+        base.join("hufu").join("数据")
+    }
+}
+
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
@@ -66,16 +99,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut data_dir = std::env::var("HUFU_DATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            // 默认：exe 同目录下的「数据」（安装布局 %LOCALAPPDATA%\HuFu\数据）。
-            // 不再用相对路径 hufu-data——CWD 不可控（开机自启/explorer 中转启动时
-            // CWD 是 system32 等），相对默认会凭空建出错误目录。
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .map(|d| d.join("数据"))
-                .unwrap_or_else(|| PathBuf::from("hufu-data"))
-        });
+        .unwrap_or_else(|_| default_data_dir());
     let mut port: u16 = 4390;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -104,6 +128,11 @@ fn main() {
         eprintln!("hufu-server 已在运行（命名互斥体命中），本实例退出");
         std::process::exit(0);
     }
+    #[cfg(unix)]
+    if sys_unix::already_running(&data_dir) {
+        eprintln!("hufu-server 已在运行（flock 命中），本实例退出");
+        std::process::exit(0);
+    }
     // 【DPI 感知 2026-09-11】server 代画候选窗此前按 96-DPI 逻辑像素
     // 当物理像素用：进程默认 DPI-unaware，窗口被系统拉伸模糊、坐标
     // 与 DLL（物理像素）错位。声明 Per-Monitor V2 后按窗口实际 DPI
@@ -121,18 +150,19 @@ fn main() {
         // 【性能插桩】main 侧总戳（与 host.rs 的 Host::new 打点配套）
         // 【轮转 2026-09-11】启动追加了无上限增长——超 4MB 翻转 .old
         use std::io::Write;
-        let p = r"C:\ProgramData\HuFu\diag\startup-trace.txt";
-        let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
-        if std::fs::metadata(p)
+        let diag = hufu_engine::diag_dir(&data_dir);
+        let p = diag.join("startup-trace.txt");
+        let _ = std::fs::create_dir_all(&diag);
+        if std::fs::metadata(&p)
             .map(|m| m.len() > 4 << 20)
             .unwrap_or(false)
         {
-            let _ = std::fs::rename(p, r"C:\ProgramData\HuFu\diag\startup-trace.old.txt");
+            let _ = std::fs::rename(&p, diag.join("startup-trace.old.txt"));
         }
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(p)
+            .open(&p)
         {
             let _ = writeln!(f, "--- Host::new 完成（含 spawn 前全部同步工作）---");
         }
@@ -142,14 +172,15 @@ fn main() {
     // 需要 'static 句柄——全局登记。
     let _ = HOST_HANDLE.set(shared.clone());
     let addr = format!("127.0.0.1:{port}");
+    platform::set_http_port(port);
 
-    // 命名管道（Windows 前端 IPC）独立线程
-    #[cfg(windows)]
+    // 前端 IPC 独立线程（Windows 命名管道 `\\.\pipe\hufu-ime`，Unix
+    // `$XDG_RUNTIME_DIR/hufu-ime.sock`）——非 Windows 此前未启动 unix 分支。
     {
         let p = shared.clone();
         std::thread::spawn(move || {
             if let Err(e) = pipe::run_pipe(p) {
-                eprintln!("命名管道服务退出: {e}");
+                eprintln!("IPC 服务退出: {e}");
             }
         });
     }
@@ -702,6 +733,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         ("GET", "/api/config") => {
             Response::json(&serde_json::to_value(&host.engine.config).unwrap())
         }
+        ("GET", "/api/platform") => Response::json(&serde_json::json!({
+            // 平台标识（设置页据此隐藏平台无关项：Linux 不用引擎自带中英切换）
+            "os": std::env::consts::OS,
+        })),
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表
@@ -1153,7 +1188,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !dir.is_dir() {
                 return Response::err(404, &format!("方案目录不存在: {name}"));
             }
-            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+            crate::platform::open_path(&dir);
             Response::json(&serde_json::json!({"ok": true, "path": dir}))
         }
         ("POST", "/api/export_schema") => {
@@ -1167,10 +1202,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .to_string();
             match host.export_schema(if name.is_empty() { None } else { Some(&name) }) {
                 Ok((path, n)) => {
-                    // 导出即达：explorer 打开导出子文件夹（码表导出\<方案名>\）
+                    // 导出即达：文件管理器打开导出子文件夹（码表导出\<方案名>\）
                     if let Some(dir) = std::path::Path::new(&path).parent() {
                         if dir.is_dir() {
-                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                            crate::platform::open_path(dir);
                         }
                     }
                     Response::json(&serde_json::json!({
@@ -1222,5 +1257,38 @@ mod sys_win {
                 let _ = SetProcessDpiAwareness(2);
             }
         }
+    }
+}
+
+/// Unix 原生小件：flock 单实例（零依赖 extern）。Linux 适配 2026-09-19。
+#[cfg(unix)]
+mod sys_unix {
+    use std::os::unix::io::AsRawFd;
+    use std::path::Path;
+
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2; // 排他锁
+    const LOCK_NB: i32 = 4; // 非阻塞
+
+    /// 数据目录 `.lock` 文件排他锁；已被占用 → true。
+    /// 成功时故意不关 fd（`mem::forget`）：进程存续期间锁必须持有，
+    /// 退出时由内核自动释放。开不了锁文件时不拦（HTTP 端口 bind 兜底）。
+    pub fn already_running(data_dir: &Path) -> bool {
+        let f = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(data_dir.join(".lock"))
+        {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let r = unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if r != 0 {
+            return true;
+        }
+        std::mem::forget(f);
+        false
     }
 }

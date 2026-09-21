@@ -5,9 +5,11 @@
 //! 与 HTTP API 共享 Host 与 parse_key。
 
 use crate::host::{parse_key, Host};
+#[cfg(windows)]
 use std::io::ErrorKind;
 use std::sync::Mutex;
 
+#[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
 const BUF: usize = 1 << 20;
 
@@ -112,6 +114,43 @@ pub fn dispatch(
             }
             None => serde_json::json!({"error": "按键描述无效"}),
         },
+        // 鼠标点击候选（Linux fcitx5 前端；index=页内下标）。语义与数字
+        // 选重一致（学习、无闪帧即时上屏）；Windows 前端不使用本 op。
+        "select" => {
+            let index = req
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX);
+            let mut r = host.select_candidate(index);
+            if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
+                r["outcome"]["sound_vol"] = serde_json::json!(host.engine.config.sound.volume);
+            }
+            r
+        }
+        // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。
+        // 读=全量 JSON；写=全量 JSON（客户端侧做「读-改-写」合并，避免
+        // 部分字段缺省被 serde 默认值覆盖——与 Web 设置页同语义）。
+        "config_get" => serde_json::json!({
+            "config": serde_json::to_value(&host.engine.config)
+                .unwrap_or(serde_json::Value::Null),
+        }),
+        "config_set" => {
+            let v = req.get("config").cloned().unwrap_or(serde_json::Value::Null);
+            match serde_json::from_value::<hufu_config::Config>(v) {
+                Ok(cfg) => match host.apply_config(cfg) {
+                    Ok((need_sentence, teardown)) => {
+                        if need_sentence {
+                            // 与 HTTP /api/config 同源（后台重建，不持锁载模型）
+                            crate::reload_sentence_bg(teardown, true);
+                        }
+                        serde_json::json!({"ok": true})
+                    }
+                    Err(e) => serde_json::json!({"error": format!("应用失败: {e}")}),
+                },
+                Err(e) => serde_json::json!({"error": format!("配置无效: {e}")}),
+            }
+        }
         "state" => {
             // 先应用已到达的重排缓存：停顿期轮询（DLL poll_tick）拉 state
             // 时立即拿到换序后的新首选，用户无需按键即可看到候选窗刷新。
@@ -259,12 +298,12 @@ pub fn dispatch(
         // 输入法激活态上报（DLL Activate/Deactivate）：驱动托盘图标显隐
         "ime" => {
             let active = req.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-            crate::tray::on_ime_state(active);
+            crate::platform::on_ime_state(active);
             serde_json::json!({"ok": true})
         }
         // 语言栏「中」按钮点击：开设置页（与托盘双击/Ctrl+Alt+H 同通道）
         "settings" => {
-            crate::tray::open_settings();
+            crate::platform::open_settings();
             serde_json::json!({"ok": true})
         }
         // 语言栏「中/英」左键切换中英（语言指示牌语义：切换即放弃
@@ -360,7 +399,7 @@ pub fn dispatch(
             )
             .join(&name);
             if dir.is_dir() {
-                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                crate::platform::open_path(&dir);
             }
             serde_json::json!({"ok": dir.is_dir(), "path": dir})
         }
@@ -373,7 +412,7 @@ pub fn dispatch(
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
                 if dir.is_dir() {
-                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    crate::platform::open_path(&dir);
                 }
                 serde_json::json!({"ok": true, "path": path, "lines": n})
             }
@@ -440,21 +479,16 @@ pub fn dispatch(
                     .and_then(|c| c.clone())
                     .unwrap_or(serde_json::Value::Null),
             };
+
             // 【二十九修·首显滑动】组段首帧带滑动起点（None=常规帧）
-            crate::candwin::show(
-                crate::candwin::CandFrame {
-                    items,
-                    raw,
-                    selected: sel,
-                    skin,
-                },
-                x,
-                y,
-            );
+            // 【Linux 适配】候选窗代画收口到 platform::cand_show：Windows
+            // 转发 candwin（保留上述首显滑动语义），Linux 由前端自绘（no-op）。
+            crate::platform::cand_show(items, raw, sel, x, y, skin);
+          
             serde_json::json!({"ok": true})
         }
         "cand_hide" => {
-            crate::candwin::hide();
+            crate::platform::cand_hide();
             serde_json::json!({"ok": true})
         }
         "sound" => {
@@ -932,8 +966,16 @@ mod unix_imp {
 
     pub fn run(host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
         let path = sock_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        // 仅本人可读写（与 Windows 命名管道 ACL 对齐）
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         eprintln!("HuFu unix socket: {}", path.display());
         for stream in listener.incoming() {
             match stream {

@@ -26,6 +26,27 @@ use hufu_types::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 诊断目录：Windows 保持 `C:\ProgramData\HuFu\diag`（既有脚本/排障依赖）；
+/// 其他平台用 `<数据>/diag`（`HUFU_DIAG` 环境变量可覆盖，两平台通用）。
+/// 【Linux 适配 2026-09-19】此前 `C:\ProgramData\...` 硬编码在非 Windows 上
+/// 会按相对路径建出名为「C:\ProgramData\HuFu\diag」的怪目录。
+pub fn diag_dir(data_dir: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("HUFU_DIAG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = data_dir;
+        PathBuf::from(r"C:\ProgramData\HuFu\diag")
+    }
+    #[cfg(not(windows))]
+    {
+        data_dir.join("diag")
+    }
+}
+
 /// 单条整句解码命中（对齐 Rime emit 结果）。
 #[derive(Debug, Clone)]
 pub struct SentenceHit {
@@ -483,11 +504,12 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let mark = |label: &str| {
             use std::io::Write;
-            let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
+            let diag = crate::diag_dir(data_dir);
+            let _ = std::fs::create_dir_all(&diag);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(r"C:\ProgramData\HuFu\diag\startup-trace.txt")
+                .open(diag.join("startup-trace.txt"))
             {
                 let _ = writeln!(f, "  engine/{label}: {}ms", t0.elapsed().as_millis());
             }
@@ -2397,6 +2419,12 @@ impl Engine {
         }
         session.clear();
         KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 鼠标点击候选（fcitx5 前端用）：页内下标 → 与数字选重同语义
+    ///（学习、无闪帧，点击即上屏）。Windows 前端不使用本入口。
+    pub fn select_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
+        self.select_candidate_ex(session, idx, false, false)
     }
 
     /// 【十八修】no_learn 版（;/' 选重用）：只上屏不进用户词学习。

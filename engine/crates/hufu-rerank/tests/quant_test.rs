@@ -1,7 +1,12 @@
 //! q8_0 解码 vs llama.cpp F32 转换件对照
+//!
+//! 【Linux 适配 2026-09-19】本测试依赖作者本机 Windows 对照件
+//! （`E:\DSH-KF\...`），任何其他机器（含 Linux）都跑不了——默认跳过；
+//! 需要时在作者机器上 `cargo test -- --ignored` 单独跑。
 use hufu_rerank::gguf::GgufFile;
 
 #[test]
+#[ignore = "依赖作者本机 Windows 对照件（E:\\DSH-KF\\...），默认跳过"]
 fn q8_decode_matches_llama_f32() {
     let q8 = GgufFile::open("E:\\DSH-KF\\TigerClaw\\sentence\\Models\\sentence-qwen-q8.gguf").unwrap();
     let f32m = GgufFile::open_lazy("E:\\DSH-KF\\tools\\llamacpp\\sentence-f32.gguf").unwrap();
