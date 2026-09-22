@@ -3497,11 +3497,15 @@ impl CandidateWindowV2 {
                                     let mut fr = RECT::default();
                                     if GetWindowRect(gi.hwnd_focus, &mut fr).is_ok() {
                                         let w = fr.right - fr.left;
-                                        let inside = r.left >= fr.left - 8
-                                            && r.right <= fr.right + 8
-                                            && r.top >= fr.top - 8
-                                            && r.bottom <= fr.bottom + 8;
-                                        if w > 0 && w <= 400 && inside {
+                                        // 【勘误·同修】锚右缘=编码整段文本延伸
+                                        //（GetTextExt 全段矩形），小框里天然横向
+                                        // 溢出（桌面重命名框 84px、编码 60px+
+                                        // ——第二帧 r.right=1626>框右 1601 即
+                                        // 被原「锚在框内」校验弹回光标跟随，实
+                                        // 锤面板追着文本向右跑）。只要求垂直带
+                                        // 与框重叠：微型焦点框里的锚只会属于它。
+                                        let v_overlap = r.top < fr.bottom + 8 && r.bottom > fr.top - 8;
+                                        if w > 0 && w <= 400 && v_overlap {
                                             out = Some(fr.left);
                                         }
                                     }
