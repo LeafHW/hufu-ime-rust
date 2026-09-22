@@ -3434,6 +3434,20 @@ impl CandidateWindowV2 {
                 let y = oy.clamp(vy, (vy + vh - mp - hp).max(vy));
                 (x, y)
             } else {
+                // 【五十修·出屏锚作废】XAML 宿主（设置搜索等）GetTextExt
+                // 可能返回另一坐标空间的烂值（实测锚=(1155,-259,1163,-240)
+                //——y 出屏顶 259px，候选被带出屏；单屏 (0,0)-(2520,1680)
+                // 实锤非副屏坐标）。锚整体在屏外（±200px 容差）=无效，
+                // 转 None 走兜底链（焦点窗内定位，必然在屏内）。
+                let anchor = anchor.filter(|r| {
+                    !(r.right < vx - 200
+                        || r.left > vx + vw + 200
+                        || r.bottom < vy - 200
+                        || r.top > vy + vh + 200)
+                });
+                if anchor.is_none() && crate::tsf::trace_on() {
+                    crate::tsf::trace("cw2: 锚出屏作废 → 兜底链");
+                }
                 match anchor {
                     Some(r) => {
                         // 【实时光标跟随 2026-09-12 用户拍板】窗最左=

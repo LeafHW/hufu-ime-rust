@@ -5233,6 +5233,29 @@ fn host_is_packaged() -> bool {
     })
 }
 
+/// 【五十修·UWP 门缺口】设置（SystemSettings.exe 跑在
+/// C:\Windows\ImmersiveControlPanel\——既非 WindowsApps 也非
+/// SystemApps）打字时前台=ApplicationFrameHost 的框架窗，pid≠本
+/// 进程——host_may_show 只认 host_is_packaged → 三十九修门恒拒
+///（实测 trace「show被host门拦→SW_HIDE」×4，设置搜索打字全程
+/// 无候选，但空格仍能上屏）。本谓词=「UWP 框架族宿主」：打包
+/// 或系统沉浸目录。只用于门/poll 收窗豁免这对孪生判定；caret
+/// 步进与 OWNED 泳道判定维持 host_is_packaged 原语义（设置现状
+/// query_caret 锚点正确，不动）。
+fn host_is_uwp_family() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| {
+        if host_is_packaged() {
+            return true;
+        }
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        exe.contains("\\immersivecontrolpanel\\")
+    })
+}
+
 /// 【开始菜单=explorer 承载 2026-09-11】Win11 部分版本开始菜单搜索的
 /// 输入焦点窗在 Explorer.EXE 的 ApplicationFrameWindow（UWP 壳）里，
 /// 不在 SearchHost/SystemApps——按 exe 路径判不出「打包」。此时视同
@@ -6011,7 +6034,7 @@ pub(crate) fn host_may_show() -> bool {
         if pid == std::process::id() {
             return true;
         }
-        if host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
+        if host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
             return true;
         }
         if fg_same_app_dir(pid) {
@@ -6209,7 +6232,7 @@ fn poll_tick() {
             // （三十九次勘误：et.exe 是表格真实宿主不是启动器，
             // 保留同目录豁免。）
             if pid != std::process::id()
-                && !(host_is_packaged() && !host_is_searchhost() && fg_is_uwp_frame(pid))
+                && !(host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid))
                 && !fg_same_app_dir(pid)
             {
                 // 【三十五修】内联收窗逻辑抽出为 poll_collapse_stale 复用
