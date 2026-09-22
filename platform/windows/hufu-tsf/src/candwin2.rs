@@ -3456,7 +3456,66 @@ impl CandidateWindowV2 {
                         let m_phys = (shadow_m as f32 * dpi_scale) as i32;
                         let wpx = (width * dpi_scale) as i32;
                         let hpx = (height * dpi_scale) as i32;
-                        let x = (r.right).clamp(vx, (vx + vw - m_phys - wpx).max(vx));
+                        // 【四十九修·小编辑框正下方】重命名类小编辑框
+                        //（焦点 Edit 宽 ≤400 物理 px 且锚行在框内）：
+                        // 候选左对齐框左边（正下方）——桌面重命名框仅
+                        // ~84px，光标右对齐=面板大半悬在框外右侧（用户
+                        // 实锤「偏右了，不在正下方」）。宽编辑器（记事本
+                        // /WPS）维持光标跟随拍板语义不变。
+                        let caret_x = r.right;
+                        let small_edit_x = {
+                            #[repr(C)]
+                            struct GTI5 {
+                                cb: u32,
+                                flags: u32,
+                                hwnd_active: HWND,
+                                hwnd_focus: HWND,
+                                hwnd_capture: HWND,
+                                hwnd_menu_owner: HWND,
+                                hwnd_move_size: HWND,
+                                hwnd_caret: HWND,
+                                rc_caret: RECT,
+                            }
+                            #[link(name = "user32")]
+                            unsafe extern "system" {
+                                fn GetGUIThreadInfo(tid: u32, gi: *mut GTI5) -> i32;
+                            }
+                            let mut gi = GTI5 {
+                                cb: std::mem::size_of::<GTI5>() as u32,
+                                flags: 0,
+                                hwnd_active: HWND(std::ptr::null_mut()),
+                                hwnd_focus: HWND(std::ptr::null_mut()),
+                                hwnd_capture: HWND(std::ptr::null_mut()),
+                                hwnd_menu_owner: HWND(std::ptr::null_mut()),
+                                hwnd_move_size: HWND(std::ptr::null_mut()),
+                                hwnd_caret: HWND(std::ptr::null_mut()),
+                                rc_caret: RECT::default(),
+                            };
+                            let mut out = None;
+                            unsafe {
+                                if GetGUIThreadInfo(0, &mut gi) != 0 && !gi.hwnd_focus.0.is_null() {
+                                    let mut fr = RECT::default();
+                                    if GetWindowRect(gi.hwnd_focus, &mut fr).is_ok() {
+                                        let w = fr.right - fr.left;
+                                        let inside = r.left >= fr.left - 8
+                                            && r.right <= fr.right + 8
+                                            && r.top >= fr.top - 8
+                                            && r.bottom <= fr.bottom + 8;
+                                        if w > 0 && w <= 400 && inside {
+                                            out = Some(fr.left);
+                                        }
+                                    }
+                                }
+                            }
+                            out
+                        };
+                        let x_base = small_edit_x.unwrap_or(caret_x);
+                        if small_edit_x.is_some() && crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!(
+                                "cw2: 小编辑框左对齐 x={x_base}（光标x={caret_x}）"
+                            ));
+                        }
+                        let x = x_base.clamp(vx, (vx + vw - m_phys - wpx).max(vx));
                         let below = r.bottom + 4;
                         let y = if below + hpx + m_phys <= vy + vh {
                             below
