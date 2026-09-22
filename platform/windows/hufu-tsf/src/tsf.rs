@@ -324,6 +324,9 @@ pub struct Shared {
     pub focus_revoke_kept: bool,
     /// 线程焦点事件 sink cookie（Deactivate 反注册用）
     pub tm_sink_cookie: u32,
+    /// 【四十五修·切输入法收窗 2026-10-29】语言档案激活 sink cookie
+    ///（ITfActiveLanguageProfileNotifySink，Deactivate 反注册用）。
+    pub lang_sink_cookie: u32,
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
     /// 异步重排换序后主动刷新候选窗）
     pub cand_sig_last: String,
@@ -493,6 +496,7 @@ impl Shared {
             preedit_last: String::new(),
             focus_revoke_kept: false,
             tm_sink_cookie: 0,
+            lang_sink_cookie: 0,
             cand_sig_last: String::new(),
             hupo_single_probe: false,
             qc_probe_steady: 0,
@@ -622,7 +626,15 @@ fn g_first_key_probe() -> bool {
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
     ITfThreadMgrEventSink,
-    windows::Win32::UI::TextServices::ITfDisplayAttributeProvider
+    windows::Win32::UI::TextServices::ITfDisplayAttributeProvider,
+    // 【四十五修·切输入法收窗 2026-10-29】组段存续期间切走输入法，
+    // TSF 不调 Deactivate（实测候选窗在屏上停留不消失）——挂
+    // ITfActiveLanguageProfileNotifySink（线程管理器 ITfSource）感知
+    // 「别的 TIP 激活/自己失活」（跨进程激活广播实测可达），冲销组
+    // 段+收窗（微软拼音同款行为）。Win8+ 的
+    // ITfInputProcessorProfileActivationSink（ITfSourceSingle 通道）
+    // 实测 AdviseSingleSink 恒被拒（0x80040202），弃用。
+    windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink
 )]
 pub struct HuFuTs {
     shared: SharedRef,
@@ -669,6 +681,34 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .tm_sink_cookie = cookie;
+                    }
+                }
+            }
+            // 【四十五修·切输入法收窗 2026-10-29】语言档案激活通知：
+            // 组段存续期间切走输入法，TSF 不调 Deactivate（实测候选窗
+            // 停留原地不消失）。挂 ITfActiveLanguageProfileNotifySink 于
+            // 线程管理器 ITfSource——跨进程激活广播实测可达（pwsh 里
+            // ActivateProfile(HuFu) 时本 sink 收到 act=true）。「别的
+            // TIP 激活/自己失活」→ 冲销组段+收窗（OnActivated 见
+            // impl 块）。
+            {
+                let sink: windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink =
+                    self.cast()?;
+                if let Ok(src) = tm.cast::<ITfSource>() {
+                    let unk: IUnknown = sink.cast()?;
+                    match src.AdviseSink(
+                        &windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink::IID,
+                        Some(&unk),
+                    ) {
+                        Ok(cookie) => {
+                            self.shared
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .lang_sink_cookie = cookie;
+                        }
+                        Err(e) => {
+                            crate::tsf::trace(&format!("langsink advise fail {e:?}"));
+                        }
                     }
                 }
             }
@@ -742,6 +782,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
     }
 
     fn Deactivate(&self) -> Result<()> {
+        // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
+        // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
+        crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -764,6 +807,14 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                         let _ = src.UnadviseSink(cookie);
                     }
                     g.tm_sink_cookie = 0;
+                }
+                // 【四十五修】语言档案激活 sink 摘除（与挂载对称）
+                let lang_cookie = g.lang_sink_cookie;
+                if lang_cookie != 0 {
+                    unsafe {
+                        let _ = src.UnadviseSink(lang_cookie);
+                    }
+                    g.lang_sink_cookie = 0;
                 }
             }
         }
@@ -927,6 +978,134 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
 
     fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
         Ok(())
+    }
+}
+
+/// 【四十五修·切输入法收窗 2026-10-29】语言档案激活通知。
+/// 用户实测：候选窗有内容时切输入法（Ctrl+Shift 轮换 TIP），候选框
+/// 停留原地不消失——组段存续期间 TSF **不调 Deactivate**（探针实测
+/// notepad 组段中 Ctrl+Shift 切走后窗口 3s+ 仍在），Deactivate 里的
+/// 收窗路径整个被跳过。本 sink 在「别的 TIP 激活 / 自己被失活」时
+/// 立即冲销组段（空文本不落字母）+ 收本地/代画候选窗 + 清引擎会话
+/// （微软拼音切走时组段消失的同款行为）。
+/// 防误伤：档案事件是全局广播（别的应用/线程切档也发）。组段在身
+/// 时直接冲销（正在用=被换的必然是我们）；无组段时再用本线程
+/// ITfKeystrokeMgr::GetForeground 验证（仍是自己=别处切档，无视）。
+impl windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink_Impl
+    for HuFuTs_Impl
+{
+    fn OnActivated(
+        &self,
+        clsid: *const GUID,
+        _guidprofile: *const GUID,
+        factivated: BOOL,
+    ) -> Result<()> {
+        // 【四十五修·诊断】全量记录事件（排查切输入法事件路由）
+        if crate::tsf::trace_on() {
+            let c = if clsid.is_null() { GUID::zeroed() } else { unsafe { *clsid } };
+            crate::tsf::trace(&format!(
+                "langsink event clsid={c:?} act={}",
+                factivated.as_bool()
+            ));
+        }
+        let other_tip = unsafe { !clsid.is_null() && *clsid != crate::CLSID_HUFU_TSF };
+        let self_off = unsafe {
+            !clsid.is_null() && *clsid == crate::CLSID_HUFU_TSF && !factivated.as_bool()
+        };
+        if !other_tip && !self_off {
+            return Ok(());
+        }
+        // 【防误伤层次】事件是全局广播（别的应用/线程切档也发）。
+        // ①组段/候选在身=本线程正在用我们——「别的 TIP 激活」几乎
+        //   必是本线程被换（事件序上 GetForeground 可能尚未翻转，
+        //   探针实锤其滞后），直接冲销；
+        // ②无组段时用 ITfKeystrokeMgr::GetForeground 验证（仍是
+        //   自己=别处切档，无视）。
+        let (has_comp, still_fg) = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let has = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
+            let fg = g
+                .thread_mgr
+                .as_ref()
+                .and_then(|tm| tm.cast::<ITfKeystrokeMgr>().ok())
+                .and_then(|km| unsafe { km.GetForeground().ok() })
+                .is_some_and(|c| c == crate::CLSID_HUFU_TSF);
+            (has, fg)
+        };
+        if other_tip && !has_comp && still_fg {
+            if crate::tsf::trace_on() {
+                crate::tsf::trace("langswitch: 别处切档（本线程仍前景）——无视");
+            }
+            return Ok(());
+        }
+        crate::tsf::trace("langswitch: 本线程被切走 → 冲销组段+收窗");
+        ime_switch_abort(&self.shared);
+        Ok(())
+    }
+}
+
+/// 切输入法冲销：文档侧空清段（不落字母）+ 本地状态清零 + 收窗 +
+/// 引擎会话清零（fire-and-forget，与焦点清理同款不阻塞回调）。
+fn ime_switch_abort(shared: &SharedRef) {
+    // 1) 文档侧：组段文本置空并结束（当前焦点 ctx）
+    let ctx = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .thread_mgr
+        .clone()
+        .and_then(|tm| unsafe { tm.GetFocus().ok() })
+        .and_then(|d| unsafe { d.GetTop().ok() });
+    if let Some(ctx) = ctx {
+        let _ = run_session_sync_only(shared, Op::ClearComp, ctx);
+    }
+    // 2) 引擎会话清零（异步，与 OnSetFocus 同款 focus op）
+    std::thread::spawn(|| {
+        let _ = ipc::call(&serde_json::json!({ "op": "focus" }));
+    });
+    // 3) 本地状态 + 窗口（镜像焦点清理 D/E 块的必要子集）
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.composition = None;
+    g.composing = false;
+    g.raw_last.clear();
+    g.preedit_last.clear();
+    g.stale_raw.clear();
+    g.stale_raw_until = None;
+    g.caret = None;
+    g.last_show = None;
+    g.cand_sig_last = String::new();
+    g.suppress_pending = false;
+    g.suppress_since = None;
+    g.entered_late = false;
+    g.cand_shown_this_segment = false;
+    if let Some(c) = g.cand2.as_mut() {
+        c.hide_now();
+        c.focus_reset();
+    }
+    if g.cand_ui_active {
+        let host_draws = g.cand_ui_host_draws;
+        let ui_id = g.cand_ui_id;
+        g.cand_ui_active = false;
+        g.cand_ui_host_draws = false;
+        g.cand_ui = None;
+        drop(g);
+        if host_draws {
+            let mgr = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .thread_mgr
+                .as_ref()
+                .and_then(|tm| {
+                    tm.cast::<windows::Win32::UI::TextServices::ITfUIElementMgr>()
+                        .ok()
+                });
+            if let Some(m) = &mgr {
+                let _ = unsafe { m.EndUIElement(ui_id) };
+            }
+        } else {
+            std::thread::spawn(|| {
+                let _ = ipc::call(&serde_json::json!({ "op": "cand_hide" }));
+            });
+        }
     }
 }
 
@@ -1951,6 +2130,9 @@ enum Op {
     /// ——未离段=宿主焦点抖动（Excel cell editor 组段后重声明焦点），
     /// 保组段不冲销；离段=真切换，空文本清段不落字母（防 WPS 残留）。
     CommitFocusRevoke,
+    /// 【四十五修·切输入法收窗】无条件空冲销（切走输入法：清空组段
+    /// 文本不落字母、结束组段——不做选区判定，切走即冲）。
+    ClearComp,
     /// 提前上屏：先提交前缀（结束当前组段），再开新组段继续显示剩余
     CommitAndRepreedit(String, String),
     /// 无组段直接插入文本（剪贴板上屏）
@@ -2192,6 +2374,20 @@ impl EditSession_Impl {
                     if drifted {
                         end_comp_clear(ec, &comp);
                     } else if let Ok(range) = unsafe { comp.GetRange() } {
+                        let empty: Vec<u16> = Vec::new();
+                        let _ = unsafe { range.SetText(ec, 0, &empty) };
+                        let _ = unsafe { comp.EndComposition(ec) };
+                    }
+                }
+                g.composition = None;
+                Ok(())
+            }
+            // 【四十五修·切输入法收窗】无条件清段：组段文本置空 + 结束
+            //（切走输入法 = 拼音不落文档，微软拼音同款行为）。
+            Op::ClearComp => {
+                trace("ClearComp: 切输入法空冲销");
+                if let Some(comp) = g.composition.clone() {
+                    if let Ok(range) = unsafe { comp.GetRange() } {
                         let empty: Vec<u16> = Vec::new();
                         let _ = unsafe { range.SetText(ec, 0, &empty) };
                         let _ = unsafe { comp.EndComposition(ec) };
@@ -5931,16 +6127,43 @@ fn poll_tick() {
     {
         let sp = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
         if let Some(s) = sp {
-            let g = s.lock().unwrap_or_else(|e| e.into_inner());
-            let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
-            let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
-            let mine = g
-                .last_key_at
-                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
-                || g.composition.is_some();
-            drop(g);
+            let (busy, owes, mine, composing_or_shown, tm) = {
+                let g = s.lock().unwrap_or_else(|e| e.into_inner());
+                let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
+                let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
+                let mine = g
+                    .last_key_at
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                    || g.composition.is_some();
+                // 【四十五修·切输入法收窗 2026-10-29】组段/候选在身时，
+                // 顺带验本线程前景按键接收者仍是自己：Ctrl+Shift 切走
+                // TIP 时组段存续 → TSF 不调 Deactivate、语言档案事件
+                //（langsink）在 25H2 对 TIP 轮换不触发、键位 sink 的
+                // OnSetFocus(false) 也不来（探针三重实锤）——唯一可靠
+                // 信号就是主动查询 GetForeground。已不是自己 → 冲销组
+                // 段+收窗（≤110ms 拍延迟）。
+                let composing_or_shown = g.composition.is_some()
+                    || g.composing
+                    || g.last_show.is_some()
+                    || !g.raw_last.is_empty();
+                (busy, owes, mine, composing_or_shown, g.thread_mgr.clone())
+            };
             if busy && !owes {
                 return;
+            }
+            // 切输入法检测：组段/编码在身 + 前景键 sink 已易主
+            //（mine 判据之前：raw_last 非空会卡 poll_collapse_stale 的
+            // 编码保护，这里必须先行）
+            if composing_or_shown {
+                let fg = tm
+                    .as_ref()
+                    .and_then(|tm| tm.cast::<ITfKeystrokeMgr>().ok())
+                    .and_then(|km| unsafe { km.GetForeground().ok() });
+                if fg.is_some_and(|c| c != crate::CLSID_HUFU_TSF) {
+                    crate::tsf::trace("poll: 前景键 sink 已易主 → 冲销组段+收窗（切输入法）");
+                    ime_switch_abort(&s);
+                    return;
+                }
             }
             if !mine {
                 poll_collapse_stale(&s);

@@ -670,6 +670,13 @@ pub struct CandidateWindowV2 {
     /// 【二十五修】最近一次真隐藏时刻（y 锁跨段延续判据：1.5s 内
     /// 近距重显=同文档打字延续，不清 y 锁）
     pub(crate) last_hide_at: std::cell::Cell<Option<std::time::Instant>>,
+    /// 【四十五修·锚到滑入 2026-10-29】上一帧显示位置是否来自真实锚点
+    ///（GetTextExt/插入符）。XAML 宿主（资源管理器重命名/搜索框）组段
+    /// 首帧锚缺失 → 显示位=焦点窗兜底/sticky 钉位；锚迟到后目标跳到
+    /// 光标处——此前 d>500 一律瞬落=「动效不生效」。区分来源：从兜底
+    /// 位修正到真实锚=连续动作快滑（≤260ms），跨格大跳（两帧都是真锚
+    /// 之间）仍瞬落（四十三修语义保留）。
+    pub(crate) last_pos_anchored: std::cell::Cell<bool>,
     /// 位置动效时长 ms（皮肤 layout.pos_ms，默认 100，0=瞬跳）
     pub(crate) pos_ms: u32,
     /// 【动效开关 2026-09-11】设置页全局：false=一切动效瞬跳
@@ -957,6 +964,7 @@ impl CandidateWindowV2 {
                 ylock_acc: std::cell::Cell::new(0),
                 show_frame_fresh: std::cell::Cell::new(true),
             last_hide_at: std::cell::Cell::new(None),
+            last_pos_anchored: std::cell::Cell::new(false),
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
@@ -1127,6 +1135,7 @@ impl CandidateWindowV2 {
                 ylock_acc: std::cell::Cell::new(0),
                 show_frame_fresh: std::cell::Cell::new(true),
             last_hide_at: std::cell::Cell::new(None),
+            last_pos_anchored: std::cell::Cell::new(false),
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
@@ -1631,7 +1640,10 @@ impl CandidateWindowV2 {
         self.anim_spd.set(anim_spd);
         // 【透明度渐变退役·二十四修】半透面板+深色底下任何 alpha
         // 过渡都「变深/透底」（用户三度否决）——fade 全链已删。
-        self.size_ms = (layout_f(skin, "size_ms", 150.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        // 【四十五修·基准再提速 2026-10-29】皮肤缺省档同步提速：尺寸
+        // 形变 150→110ms、高亮滑动 100→80ms（「基准速度再快一些」；
+        // pos_ms 只管 chase/辅助路径不动）。
+        self.size_ms = (layout_f(skin, "size_ms", 110.0).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【六修·虎娘对齐】形变退役 → 【七修修订】形变保留（用户实测
         // 要的是去回弹不是去形变；线性化已根除回弹），默认开，
@@ -1657,7 +1669,7 @@ impl CandidateWindowV2 {
         // 【高亮滑动 2026-10-09】胶囊滑动时长（二十七修定稿 100ms——
         // 收场钟 150ms 不变：滑动先播完，留一拍确认再收；皮肤 hl_ms
         // 可调，0=瞬跳）。
-        self.hl_ms = (layout_f(skin, "hl_ms", 100.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.hl_ms = (layout_f(skin, "hl_ms", 80.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【二十五修·注释提速 2026-10-09】默认 400→200：注释列晚半拍
         // 展开=「候选慢半拍」观感主源之一（皮肤显式配置不受影响）。
         let cmt_delay = layout_f(skin, "comment_delay_ms", 200.0).clamp(0.0, 5000.0) as u32;
@@ -1762,7 +1774,11 @@ impl CandidateWindowV2 {
         // ② 横排宽度封顶工作区宽（见 width 计算处 w.min(w_cap)）。
         // ③ 位置 clamp 原已有——宽度封顶后 clamp 区间不再倒置。
         let screen_w = unsafe { GetSystemMetrics(SM_CXFULLSCREEN) }.max(200) as f32;
-        let w_cap = (screen_w - 24.0).max(320.0);
+        // 【DPI 口径修复】need/w 全是 96-DPI 逻辑像素，此前 w_cap 直接用
+        // 物理屏宽：150% 缩放时横排候选可长到 1.5×屏宽（逻辑）≈2.25×
+        // （物理）——资源管理器搜索框实测候选超出屏幕的主因之一。
+        // 换算到逻辑域再封顶。
+        let w_cap = ((screen_w - 24.0) / dpi_scale).max(320.0);
         let trunc_tail = |s: &str, cap: f32| -> String {
             let est = |s: &str| {
                 s.chars()
@@ -3323,6 +3339,18 @@ impl CandidateWindowV2 {
                     self.sticky_drag = false;
                 }
             }
+            // 【DPI 口径修复 2026-10-29】width/height 逻辑 → 物理
+            //（同锚点分支；pin/拖拽钉住的旧位在高分屏上同样可越
+            // 出屏幕右/下缘）。
+            let mp = (shadow_m * dpi_scale) as i32;
+            let wp = (width * dpi_scale) as i32;
+            let hp = (height * dpi_scale) as i32;
+            // 【四十五修·锚到滑入】是否走 pin 分支（末尾记
+            // last_pos_anchored 用）。
+            let pinned_used = CAND_PINNED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
             let (x, y) = if let Some((px, py)) =
                 *CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner())
             {
@@ -3335,15 +3363,15 @@ impl CandidateWindowV2 {
                 if crate::tsf::diag_enabled() {
                     crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
                 }
-                let x = (px + m_off).clamp(vx, (vx + vw - width as i32).max(vx));
-                let y = (py + m_off).clamp(vy, (vy + vh - height as i32).max(vy));
+                let x = (px + m_off).clamp(vx, (vx + vw - mp - wp).max(vx));
+                let y = (py + m_off).clamp(vy, (vy + vh - mp - hp).max(vy));
                 (x, y)
             } else if self.sticky_drag && self.sticky_pos.is_some() {
                 // 【拖拽钉住】松手设的 sticky 优先于锚点：本组段内
                 // 窗口钉在松手处不回弹（clamp 防出屏）
                 let (ox, oy) = self.sticky_pos.unwrap();
-                let x = ox.clamp(vx, (vx + vw - width as i32).max(vx));
-                let y = oy.clamp(vy, (vy + vh - height as i32).max(vy));
+                let x = ox.clamp(vx, (vx + vw - mp - wp).max(vx));
+                let y = oy.clamp(vy, (vy + vh - mp - hp).max(vy));
                 (x, y)
             } else {
                 match anchor {
@@ -3358,12 +3386,22 @@ impl CandidateWindowV2 {
                         // 越远=本末倒置。改回纯内容尺寸：内容贴边即可，
                         // 阴影出屏由 DWM 裁掉（分层窗部分出屏无害，阴影
                         // 本就不可交互）。竖排贴底若再现，另查内容高口径。
-                        let x = (r.right).clamp(vx, (vx + vw - width as i32).max(vx));
+                        // 【DPI 口径修复 2026-10-29】width/height 是逻辑
+                        // 像素，vx/vw 是物理像素——此前 clamp 混域：150%
+                        // 缩放时窗口物理宽=逻辑×1.5，右缘/底缘按逻辑宽
+                        // 放行=候选本体（还要加上内容在窗内左移的阴影边
+                        // 距 m_phys）整块超出屏幕（资源管理器搜索框实测
+                        // 「候选框超出屏幕」根因）。统一换物理像素，内容
+                        // 贴边、阴影照旧允许出屏裁掉（二十九修语义）。
+                        let m_phys = (shadow_m as f32 * dpi_scale) as i32;
+                        let wpx = (width * dpi_scale) as i32;
+                        let hpx = (height * dpi_scale) as i32;
+                        let x = (r.right).clamp(vx, (vx + vw - m_phys - wpx).max(vx));
                         let below = r.bottom + 4;
-                        let y = if below + height as i32 <= vy + vh {
+                        let y = if below + hpx + m_phys <= vy + vh {
                             below
                         } else {
-                            (r.top - height as i32 - 4).max(vy)
+                            (r.top - hpx - m_phys - 4).max(vy)
                         };
                         // 【五十一修·y 稳定锁复刻 v1.5.2】老版本行为档
                         // 案实测（同 harness）：v1.5.0/1.5.2 段内 T 恒定
@@ -3589,9 +3627,22 @@ impl CandidateWindowV2 {
             // 转到这里）。每帧输出前统一夹回，屏幕边界优先于位置记忆。
             // 【二十九修】不再预留 shadow_m（同锚点 clamp 口径：只算
             // 候选本体，阴影出屏裁掉）。
-            let x = x.clamp(vx, (vx + vw - width as i32).max(vx));
-            let y = y.clamp(vy, (vy + vh - height as i32).max(vy));
+            // 【DPI 口径修复 2026-10-29】同锚点分支：width/height 逻辑
+            // 像素 → 物理像素（含内容左移的阴影边距），否则 150% 缩放
+            // 屏上候选本体可越出屏幕右/下缘（实测「候选框超出屏幕」）。
+            let m_phys0 = (shadow_m * dpi_scale) as i32;
+            let wpx0 = (width * dpi_scale) as i32;
+            let hpx0 = (height * dpi_scale) as i32;
+            let x = x.clamp(vx, (vx + vw - m_phys0 - wpx0).max(vx));
+            let y = y.clamp(vy, (vy + vh - m_phys0 - hpx0).max(vy));
             self.sticky_pos = Some((x, y));
+            // 【四十五修·锚到滑入】记录本帧显示位是否来自真实锚点/
+            // 用户钉位（供 per-key 起臂读上一帧值：从兜底位→真锚的
+            // 修正位移走快滑而非瞬落——资源管理器重命名/搜索框组段
+            // 首帧锚缺失后锚迟到场景「动效不生效」的修复）。
+            let pinned_or_drag = pinned_used || self.sticky_drag;
+            self.last_pos_anchored
+                .set(pinned_or_drag || anchor.is_some());
             // 诊断：搜索框等宿主锚点缺失排查（visible=0 说明本帧被隐藏）
             // + DWM cloaked 检测（显示中但被 DWM 隐身 → 连续 2 帧后
             //   由调用方切换 v1 传统混合窗——SearchHost 里 DComp 直通
@@ -3832,7 +3883,14 @@ impl CandidateWindowV2 {
                     // 去」）。时长随距离动态、大步 clamp 快滑。
                     // 四十三修在 500px 处重开瞬落闸：七十四修的受害案例
                     // （上屏大串）≤400px，跨格/逃逸 ≥600px，500 界两全。
-                    if d > 500 {
+                    // 【四十五修·锚到滑入 2026-10-29】例外：上一帧显示位
+                    // 不来自真锚（XAML 宿主组段首帧锚缺失→焦点窗兜底/
+                    // sticky 钉位）——这是「兜底位→真锚」的修正位移，
+                    // 不是跨格大跳：走 2.2 系数快滑（≤260ms 封顶，大位
+                    // 移 ≈3px/ms，一个连续动作）。跨格/逃逸（两帧皆真
+                    // 锚）仍瞬落。资源管理器重命名/搜索框「动效不生效」
+                    // 的主修复。
+                    if d > 500 && self.last_pos_anchored.get() {
                         self.live_pos.set((tx, ty));
                         self.pos_anim = None;
                         if crate::tsf::trace_on() {
@@ -3861,8 +3919,18 @@ impl CandidateWindowV2 {
                         // 90ms，64Hz 2px/tick 等效）；上限放宽 160ms 让恒速
                         // 到 ~21px 都不打折，更大位移仍是快滑（400px 落
                         // 160ms ≈ 2.5px/ms，74 修「不拖沓」语义保留）。
+                        // 【四十五修·基准再提速 2026-10-29】用户实测
+                        // 「动效感觉不流畅，基准速度再快一些」：7.5→5.0
+                        // （恒速 ≈195px/s，1.5× 基准）、下限 45→40、上限
+                        // 160→140（13px 键距 97→65ms，21px 158→105ms）。
+                        // 修正位移（上一帧非锚位）：2.2 系数快滑 260ms
+                        // 封顶（同大跳例外档）。
                         let spd = self.anim_spd.get().max(0.05);
-                        let dur = ((d as f32 * 7.5 / spd) as u32).clamp(45, 160);
+                        let dur = if self.last_pos_anchored.get() {
+                            ((d as f32 * 5.0 / spd) as u32).clamp(40, 140)
+                        } else {
+                            ((d as f32 * 2.2 / spd) as u32).clamp(60, 260)
+                        };
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
                         let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                     } else if d > 0 {
@@ -3911,8 +3979,10 @@ impl CandidateWindowV2 {
                                 // 全角行程被用户否决、快滑随之回退——恢复
                                 // 七修口径（7.5/160ms），仅保留三十一/三十
                                 // 二修的即显与时钟重锚。
-                                let dur = ((travel as f32 * 7.5 / spd) as u32)
-                                    .clamp(45, 160);
+                                // 【四十五修·基准再提速 2026-10-29】同逐键
+                                // 5.0/40..140（首显 15px 行程 112→75ms）。
+                                let dur = ((travel as f32 * 5.0 / spd) as u32)
+                                    .clamp(40, 140);
                                 self.pos_anim =
                                     Some(((fx, ty), (tx, ty), std::time::Instant::now(), dur));
                                 entrance_armed = true;
