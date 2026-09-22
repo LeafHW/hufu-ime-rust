@@ -324,6 +324,16 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 异步隐藏（hide() PostMessage 而来——焦点回调里同步 ShowWindow
         // 会与 MSCTF/Chromium 焦点临界区死锁）
         crate::candwin2::WM_APP_HIDE_CAND => {
+            // 【五十五修·闪窗取证 2026-09-23】外部 25ms 采样证实闪不是
+            // 可见性翻转可捕的时长——藏窗消息落地（全部隐藏源的唯一必
+            // 经点）时窗口仍可见=真闪：毫秒级记档，与击键/commit 对齐
+            // 即可归因。窗口已不可见时不记（零噪音）。
+            if crate::tsf::trace_on() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                crate::tsf::trace(&format!(
+                    "cw2: 藏窗落地(可见→SW_HIDE) hwnd={:x}",
+                    hwnd.0 as usize
+                ));
+            }
             // 【退场动画退役 2026-09-11】用户判「调不好」：淡出与半透明
             // 面板天然相克（渐隐帧压在新上屏文字上=变黑/重叠，连打时
             // 收放循环=一闪一闪）。收窗一律即时隐藏——干净利落。
@@ -556,6 +566,13 @@ pub struct CandidateWindowV2 {
     ulw_bits: isize,
     ulw_w: i32,
     ulw_h: i32,
+    /// 【五十六修·空帧拦截】上一帧 ULW 是否已上过非空内容——
+    /// 全透明新帧（渲染偶发清屏后未落笔：清色全透明+绘制被裁剪/
+    /// 设备抖动）如果照常上屏，可见效果=候选整窗消失一瞬间再
+    /// 重现（用户实锤「候选闪」，30fps 像素抓帧抓到 646B 级全透
+    /// 明帧）。拦截：全透明且上一帧有内容 → 跳过本帧 ULW（屏上
+    /// 保留上一好帧），等下一帧真内容再上屏。
+    ulw_last_nonempty: bool,
     size: (i32, i32),
     /// 粘性定位：最近一次有效锚点坐标。锚点偶发丢失（GetTextExt 在
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
@@ -957,6 +974,7 @@ impl CandidateWindowV2 {
                 ulw_bits: 0,
                 ulw_w: 0,
                 ulw_h: 0,
+                ulw_last_nonempty: false,
                 readback: false,
                 sticky_pos: None,
                 sticky_focus_h: std::cell::Cell::new(0),
@@ -1129,6 +1147,7 @@ impl CandidateWindowV2 {
                 ulw_bits: 0,
                 ulw_w: 0,
                 ulw_h: 0,
+                ulw_last_nonempty: false,
                 readback: false,
                 sticky_pos: None,
                 sticky_focus_h: std::cell::Cell::new(0),
@@ -1359,6 +1378,41 @@ impl CandidateWindowV2 {
         }
         let _ = cpu.Unmap();
 
+        // 【五十六修·空帧拦截】扫 DIB alpha：全透明=渲染侧本帧清屏
+        // 后未落笔（裁剪错位/设备抖动等偶发）。此前照常上屏=用户看
+        // 到候选整窗消失一瞬（30fps 抓帧实锤 646B 级全透明帧）；现
+        // 在跳过本帧 ULW，屏上保留上一好帧，下一帧真内容接上——
+        // 闪不动。首帧（从未上过内容）不拦（窗口本来就没画面）。
+        // 采样步长 8（每 8 像素查一点的 alpha 字节），153×105 帧
+        // ~250 次字节读，纳秒级。
+        if self.ulw_bits != 0 {
+            let dst = self.ulw_bits as *const u8;
+            let row_bytes = (w as usize) * 4;
+            let stride = if w as usize > 8 { 8 } else { 1 };
+            let mut any_opaque = false;
+            'scan: for r in 0..(h as usize) {
+                let base = dst.add(r * row_bytes);
+                let mut c = 3usize; // BGRA 的 A 字节
+                while c < row_bytes {
+                    if *base.add(c) != 0 {
+                        any_opaque = true;
+                        break 'scan;
+                    }
+                    c += 4 * stride;
+                }
+            }
+            if !any_opaque {
+                if self.ulw_last_nonempty {
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace("cw2: 空帧拦截——本帧全透明，保留上一好帧（五十六修）");
+                    }
+                    return;
+                }
+            } else {
+                self.ulw_last_nonempty = true;
+            }
+        }
+
         // 4) ULW 上屏（premultiplied AC_SRC_ALPHA；尺寸=窗口尺寸）
         let blend = BLENDFUNCTION {
             BlendOp: 0, // AC_SRC_OVER
@@ -1579,8 +1633,13 @@ impl CandidateWindowV2 {
         if crate::tsf::trace_on() {
             match anchor {
                 Some(a) => crate::tsf::trace(&format!(
-                    "cw2: show[入] 锚=({},{},{},{})",
-                    a.left, a.top, a.right, a.bottom
+                    "cw2: show[入] 锚=({},{},{},{}) n={} raw='{}' ir={} pa={:?} sa={:?}",
+                    a.left, a.top, a.right, a.bottom,
+                    cands.len(),
+                    raw.chars().take(8).collect::<String>(),
+                    self.internal_rerender,
+                    self.pos_anim.is_some(),
+                    self.size_anim.map(|(f, t, _)| (f, t)),
                 )),
                 None => crate::tsf::trace("cw2: show[入] 锚=None"),
             }
@@ -2368,6 +2427,16 @@ impl CandidateWindowV2 {
                 // 瞬跳显突兀——宽度阈值 24→14（高度 14 不动），小变化
                 // 也走形变；胶囊右缘已贴壳（ chw），逐键起臂不再闪。
                 && ((target.0 - cur.0).abs() > 14 || (target.1 - cur.1).abs() > 14)
+                // 【五十七修·零臂禁发】cur 退化（≤4px：藏窗处理把
+                // live_size 清 (0,0)，藏后复显/焦点尾迹竞态里 show 在
+                // SW_HIDE 落地前后读到 was_visible=true + live_size=(0,0)）
+                // 时臂形变=从零长起：中间帧外壳≈0，内容裁剪全空=250fps
+                // 空帧风暴（五十六修空帧拦截 47 连击实锤，sa=Some((0,0),
+                // (153,105)) 60+ 帧全程空）。退化基准不臂——一步落目标
+                // 尺寸；新会话观感由入场滑入（pos_anim）负责，尺寸形变
+                // 只服务「真实壳→真实壳」的结构变化。
+                && cur.0 > 4
+                && cur.1 > 4
             {
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一

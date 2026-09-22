@@ -1216,6 +1216,26 @@ fn handle_set_focus(
         preedit,
         pdimprevfocus.is_some()
     ));
+    // 【五十五修·切换尾迹宽限 2026-09-23】候选窗「切窗后首键闪一下」
+    // 根因（多记事本/资源管理器实锤，trace+像素抓帧对齐）：
+    // 切回窗口后首键建组段显候选，宿主紧跟着补发上一轮切换的尾巴
+    // 事件（OnCompositionTerminated + 二次 OnSetFocus，RichEditD2DPT/
+    // DirectUI 异步布局典型）——旧路径把它当真切换：CommitFocusRevoke
+    // 冲销组段 + foc:E hide_now 藏窗，下一键重组段候选重现=整窗消失
+    // 又重现。判据：真切换的焦点事件必然在最后击键**之前**（人不能
+    // 对未聚焦的窗口打字）；键后 150ms 内到达的焦点事件必是尾迹/抖
+    // 动。此时组段活=它就是首键刚建的那个（在新文档里），冲销它正
+    // 是闪窗元凶——短路整个 A~F（冲销/清理/藏窗全跳），复用三修
+    // （2026-09-12）已验证的「保组段短路」模式。真切换场景此分支
+    // 不可能命中（键至少在切窗前数百 ms）。
+    if composing && !preedit.is_empty() && {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_key_at
+            .is_some_and(|t| t.elapsed().as_millis() < 150)
+    } {
+        trace("foc: 打字宽限——键后150ms内的焦点尾迹，跳过冲销藏窗（五十五修）");
+        return Ok(());
+    }
     // 1) 旧文档上冲销提交：显式 prev ctx；【焦点回调绝不排队异步
     //    session】Chromium 系应用在点击/焦点切换期持内部锁，异步
     //    edit session 的排队回调需要宿主 UI 线程泵消息执行——VSCode
