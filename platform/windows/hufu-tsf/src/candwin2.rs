@@ -645,7 +645,10 @@ pub struct CandidateWindowV2 {
     /// 【位置滑动 2026-09-11】整句自动上屏后剩余内容跳到新光标、候选
     /// 跟着走——位置过渡（从→到 屏幕坐标 + t0），窗口位置丝滑滑过去
     /// 而非一跳一跳。None=瞬移。
-    pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant, u32)>,
+    /// 位置滑动（起点,终点,起臂时刻,时长,曲线）。曲线 0=线性（逐键
+    /// 跟随等，历史口径）；1=入场 ease-out（五十一修：立方缓出——快
+    /// 出缓停，短时长下 15ms 级帧距也呈自然减速收尾）。
+    pub(crate) pos_anim: Option<((i32, i32), (i32, i32), std::time::Instant, u32, u8)>,
     /// 【三十四修·chase 实验通道】追赶式跟随目标：Some=正向该点收敛
     /// （指数逼近+限速，纯时间基准）。与 pos_anim 互斥——臂发时互清。
     /// 开关=C:\ProgramData\HuFu\diag\chase 旗标文件（tsf::chase_on）。
@@ -4119,7 +4122,7 @@ impl CandidateWindowV2 {
                         } else {
                             ((d as f32 * 2.2 / spd) as u32).clamp(60, 260)
                         };
-                        self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur));
+                        self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur, 0));
                         let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
                     } else if d > 0 {
                         self.pos_anim = None;
@@ -4169,10 +4172,15 @@ impl CandidateWindowV2 {
                                 // 二修的即显与时钟重锚。
                                 // 【四十五修·基准再提速 2026-10-29】同逐键
                                 // 5.0/40..140（首显 15px 行程 112→75ms）。
-                                let dur = ((travel as f32 * 5.0 / spd) as u32)
-                                    .clamp(40, 140);
+                                // 【五十一修·入场再提速 2026-11-05 用户
+                                // 拍板「更快速流畅」】3.2/28..110（15px
+                                // 行程 75→32ms，≈470px/s）+ 曲线转 ease-out
+                                //（曲线标志 1，见 pos_anim 注释）——快出
+                                // 缓停，肉眼读作「弹入且稳稳停住」。
+                                let dur = ((travel as f32 * 3.2 / spd) as u32)
+                                    .clamp(28, 110);
                                 self.pos_anim =
-                                    Some(((fx, ty), (tx, ty), std::time::Instant::now(), dur));
+                                    Some(((fx, ty), (tx, ty), std::time::Instant::now(), dur, 1));
                                 entrance_armed = true;
                                 // 起臂帧即记真实显示位：下一键 per-key 滑动
                                 // 从滑行起点接续，而不是从上一段残值起步。
@@ -4188,8 +4196,8 @@ impl CandidateWindowV2 {
                     self.live_pos.get()
                 } else {
                     match self.pos_anim {
-                        Some((f, t, t0, dur)) => {
-                            size_ease(f, t, t0.elapsed().as_millis() as u32, dur)
+                        Some((f, t, t0, dur, ez)) => {
+                            pos_anim_step(f, t, t0.elapsed().as_millis() as u32, dur, ez)
                         }
                         None => (tx, ty),
                     }
@@ -4242,8 +4250,8 @@ impl CandidateWindowV2 {
                 // 全程（臂帧→SWP 之间隔着渲染+Present 同步等待，见上）。
                 // 仅入场滑重锚；逐键跟随的节奏是用户拍板调好的，不动。
                 if entrance_armed {
-                    if let Some((f, t, _, dur)) = self.pos_anim {
-                        self.pos_anim = Some((f, t, std::time::Instant::now(), dur));
+                    if let Some((f, t, _, dur, ez)) = self.pos_anim {
+                        self.pos_anim = Some((f, t, std::time::Instant::now(), dur, ez));
                         if crate::tsf::trace_on() {
                             crate::tsf::trace(&format!(
                                 "cw2: 首显时钟重锚 pos=({px},{py})→({tx},{ty}) dur={dur}"
@@ -4651,8 +4659,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     }
                 }
             }
-            if let Some((f, t, t0, dur)) = c.pos_anim {
-                let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
+            if let Some((f, t, t0, dur, ez)) = c.pos_anim {
+                let cur = pos_anim_step(f, t, t0.elapsed().as_millis() as u32, dur, ez);
                 if cur == t {
                     c.pos_anim = None;
                     c.live_pos.set(t);
@@ -4802,8 +4810,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 【位置滑动步进】move-only（内容不变不重绘）：插值坐标推进
         // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
         if c.chase_target.is_none() {
-        if let Some((f, t, t0, dur)) = c.pos_anim {
-            let cur = size_ease(f, t, t0.elapsed().as_millis() as u32, dur);
+        if let Some((f, t, t0, dur, ez)) = c.pos_anim {
+            let cur = pos_anim_step(f, t, t0.elapsed().as_millis() as u32, dur, ez);
             if cur == t {
                 c.pos_anim = None;
                 c.live_pos.set(t);
@@ -4983,5 +4991,28 @@ pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32
     }
     let x = t_ms as f32 / dur_ms as f32;
     let l = |a: i32, b: i32| a + ((b - a) as f32 * x).round() as i32;
+    (l(from.0, to.0), l(from.1, to.1))
+}
+
+/// 【五十一修】位置滑动统一步进：曲线 0=线性（size_ease 原口径，
+/// 逐键跟随等沿用）；1=入场 ease-out（立方缓出 1-(1-x)³——首帧
+/// 即走 ~大头行程，尾段减速归零，无硬刹车感）。时间基准（真实
+/// 经耗时），帧距抖动只影响采样点不影响轨迹速度。
+pub(crate) fn pos_anim_step(
+    from: (i32, i32),
+    to: (i32, i32),
+    t_ms: u32,
+    dur_ms: u32,
+    ease: u8,
+) -> (i32, i32) {
+    if dur_ms == 0 || t_ms >= dur_ms {
+        return to;
+    }
+    if ease == 0 {
+        return size_ease(from, to, t_ms, dur_ms);
+    }
+    let x = t_ms as f32 / dur_ms as f32;
+    let k = 1.0 - (1.0 - x).powi(3);
+    let l = |a: i32, b: i32| a + ((b - a) as f32 * k).round() as i32;
     (l(from.0, to.0), l(from.1, to.1))
 }
