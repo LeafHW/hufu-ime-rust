@@ -6148,7 +6148,7 @@ fn poll_tick() {
     {
         let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
         if let Some(s) = sp {
-            let (busy, owes, mine, composing_or_shown, tm) = {
+            let (busy, owes, mine) = {
                 let g = s.lock().unwrap_or_else(|e| e.into_inner());
                 let busy = g.last_key_at.is_some_and(|t| t.elapsed().as_millis() < 500);
                 let owes = g.suppress_pending || g.caret_recheck_due || g.skin_repaint;
@@ -6156,35 +6156,18 @@ fn poll_tick() {
                     .last_key_at
                     .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
                     || g.composition.is_some();
-                // 【四十五修·切输入法收窗 2026-10-29】组段/候选在身时，
-                // 顺带验本线程前景按键接收者仍是自己：Ctrl+Shift 切走
-                // TIP 时组段存续 → TSF 不调 Deactivate、语言档案事件
-                //（langsink）在 25H2 对 TIP 轮换不触发、键位 sink 的
-                // OnSetFocus(false) 也不来（探针三重实锤）——唯一可靠
-                // 信号就是主动查询 GetForeground。已不是自己 → 冲销组
-                // 段+收窗（≤110ms 拍延迟）。
-                let composing_or_shown = g.composition.is_some()
-                    || g.composing
-                    || g.last_show.is_some()
-                    || !g.raw_last.is_empty();
-                (busy, owes, mine, composing_or_shown, g.thread_mgr.clone())
+                // 【四十六修·撤除前景键轮询检测 2026-10-29】四十五修在
+                // 此加过「组段在身 + ITfKeystrokeMgr::GetForeground 非
+                // 自己 → 冲销」兜底——多标签宿主（Win11 记事本第二窗口
+                // 独立线程）实测该查询在正常打字中会瞬时返回别的 CLSID
+                //（两次实锤：首段组段 200ms 内假阳性冲销，用户输入丢
+                // 失「首编录入失效」）。真实切输入法由 langsink（跨进程
+                // 广播实测可达）+ Deactivate + OnSetFocus 三路覆盖，此
+                // 兜底弊大于利，整体撤除。
+                (busy, owes, mine)
             };
             if busy && !owes {
                 return;
-            }
-            // 切输入法检测：组段/编码在身 + 前景键 sink 已易主
-            //（mine 判据之前：raw_last 非空会卡 poll_collapse_stale 的
-            // 编码保护，这里必须先行）
-            if composing_or_shown {
-                let fg = tm
-                    .as_ref()
-                    .and_then(|tm| tm.cast::<ITfKeystrokeMgr>().ok())
-                    .and_then(|km| unsafe { km.GetForeground().ok() });
-                if fg.is_some_and(|c| c != crate::CLSID_HUFU_TSF) {
-                    crate::tsf::trace("poll: 前景键 sink 已易主 → 冲销组段+收窗（切输入法）");
-                    ime_switch_abort(&s);
-                    return;
-                }
             }
             if !mine {
                 poll_collapse_stale(&s);
