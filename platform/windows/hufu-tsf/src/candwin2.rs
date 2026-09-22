@@ -4226,6 +4226,35 @@ fn raise_timer_resolution_once() {
         let _ = timeBeginPeriod(1);
     });
 }
+/// 【四十六修·多标签宿主】按「谁的 cand2 拥有本 tick 的 hwnd」选
+/// Shared：Win11 记事本等每个标签/窗口独立线程的宿主里，标签 2+
+/// 线程的 TIP 实例各有自己的 Shared/候选窗；tick 此前恒读 G_SHARED
+///（首线程）→ 标签 2+ 的计时器首 tick 即被误杀（动画永死，「第二
+/// 个窗口没动效候选还卡」实锤）。命中本线程 tl_shared() 即用之；
+/// 否则回落 G_SHARED（单线程宿主语义不变）。
+fn tick_shared_for_hwnd(hwnd: HWND) -> Option<crate::tsf::SharedRef> {
+    let owns_tick_hwnd = |s: &crate::tsf::SharedRef| {
+        s.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cand2
+            .as_ref()
+            .is_some_and(|c| c.hwnd == hwnd)
+    };
+    let g_shared = crate::tsf::G_SHARED.get().map(|x| x.0.clone());
+    let t_shared = crate::tsf::tl_shared();
+    match (g_shared, t_shared) {
+        (Some(a), Some(b)) => {
+            if !owns_tick_hwnd(&a) && owns_tick_hwnd(&b) {
+                Some(b)
+            } else {
+                Some(a)
+            }
+        }
+        (None, Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (None, None) => None,
+    }
+}
 /// 【动效】尺寸/位置/高亮滑动 tick：take cand2+last_show → 尺寸插值
 /// 步进（整帧复渲染外壳）→ 位置插值步进（只 SWP 不重绘——内容按
 /// 目标布局早已在缓冲）→ 高亮滑动复渲染 → 放回。全部结束 KillTimer。
@@ -4384,10 +4413,10 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         crate::tsf::tl_cand_put_back(tl);
         return;
     }
-    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+    // 【四十六修】多标签宿主：按 hwnd 定 Shared（见 helper 注释）
+    let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
-    let shared = gsh.0.clone();
     let (mut cand2, last, skin, caret) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【动效窗口让渡】标记持有中——TSF 线程此刻 is_none() 不新建
@@ -4591,10 +4620,10 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
         crate::tsf::tl_cand_put_back(tl);
         return;
     }
-    let Some(gsh) = crate::tsf::G_SHARED.get() else {
+    // 【四十六修】多标签宿主：按 hwnd 定 Shared（见 helper 注释）
+    let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
-    let shared = gsh.0.clone();
     let (mut cand2, last, skin, caret) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【动效窗口让渡】同 fade_tick：持有标记 + pending 隐藏

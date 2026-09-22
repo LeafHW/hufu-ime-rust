@@ -8,7 +8,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 use windows_core::*;
 
-type SharedRef = Arc<Mutex<Shared>>;
+/// 【四十六修】candwin2 的 tick-Shared 选择器需要按句柄比对，改
+/// pub(crate)（原模块私有）。
+pub(crate) type SharedRef = Arc<Mutex<Shared>>;
 
 /// 【滚轮缩放候选框】进程级 SharedRef 锚点：candwin2 的窗口过程是静态
 /// 函数拿不到 TSF 实例，WM_MOUSEWHEEL 里经此重入（取 cand2 + 上帧渲染
@@ -584,10 +586,19 @@ impl Shared {
 /// 路线：菜单与候选窗挂在该窗下（同进程合法 owner；沉浸宿主里
 /// owned 窗不进 DWM cloak 名单——「UWP 候选窗隐身」的正解）。
 pub fn focus_view_hwnd() -> Option<isize> {
-    let Some(g) = G_SHARED.get() else {
-        return None;
+    // 【四十六修·多标签宿主】本线程有独立激活的 TIP（标签 2+ 线程）
+    // 时优先用本线程 Shared——原恒读 G_SHARED（首线程）会把标签 2
+    // 的候选窗 owner 锚到标签 1 的视图窗（错窗所属，动画/置顶层
+    // 级跟随错主）。无 TL（单线程宿主/非 TSF 线程）回落 G_SHARED。
+    let shared = match tl_shared() {
+        Some(s) => s,
+        None => {
+            let Some(g) = G_SHARED.get() else {
+                return None;
+            };
+            g.0.clone()
+        }
     };
-    let shared = g.0.clone();
     let ctx = {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.focus_context()
@@ -5732,7 +5743,7 @@ const CARET_RECHECK_MS: u32 = 60;
 /// 武装首帧补显定时器（update_ui 的 suppress 分支调用；与 poll 窗口
 /// 同线程——TSF 回调线程，SetTimer 亲和无虞。重复调用同 id=重置）。
 fn arm_first_frame_timer() {
-    let h = POLL_HWND.load(AtomicOrdering::Relaxed);
+    let h = poll_hwnd_now();
     if h != 0 {
         unsafe {
             let _ = SetTimer(HWND(h as *mut _), FIRST_TIMER_ID, FIRST_FRAME_MS, None);
@@ -5743,7 +5754,7 @@ fn arm_first_frame_timer() {
 /// 武装上屏跟随重查定时器（update_ui 的 CommitAndRepreedit 分支调用；
 /// 与 poll 窗同线程。重复调用同 id=重置，幂等）。
 fn arm_caret_recheck_timer() {
-    let h = POLL_HWND.load(AtomicOrdering::Relaxed);
+    let h = poll_hwnd_now();
     if h != 0 {
         unsafe {
             let _ = SetTimer(HWND(h as *mut _), CARET_TIMER_ID, CARET_RECHECK_MS, None);
@@ -5751,16 +5762,23 @@ fn arm_caret_recheck_timer() {
     }
 }
 
-static POLL_HWND: AtomicIsize = AtomicIsize::new(0);
-
-// Shared 含 COM 接口指针（NonNull）非 Send/Sync——但 poll 窗口的
-// WM_TIMER 只在其创建线程（=TSF 回调线程）派发，poll_tick 与所有
-// COM 访问严格同线程；此 wrapper 仅满足 static 的类型约束。
-struct PollShared(SharedRef);
-unsafe impl Send for PollShared {}
-unsafe impl Sync for PollShared {}
-static POLL_SHARED: Mutex<Option<PollShared>> = Mutex::new(None);
-static POLL_IN_TICK: AtomicIsize = AtomicIsize::new(0);
+// 【四十六修·多标签宿主轮询线程化 2026-10-29】Win11 记事本等每个
+// 标签/窗口独立线程各自激活 TIP——原全局单例 poll 窗只服务首线程：
+// 标签 2+ 的首帧抑制补显/皮肤重绘/残留兜底/上屏重查全部失灵，且
+// 切输入法检测读了别线程的 thread_mgr 误冲销（用户实锤候选卡）。
+// 改为每 TSF 线程一个 message-only 轮询窗 + 各自 Shared（同线程
+// COM 语义不变；线程退出窗随线程销毁）。
+thread_local! {
+    static POLL_HWND_TL: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    // Shared 含 COM 接口指针（NonNull）非 Send/Sync——thread_local
+    // 无跨线程访问，无需 unsafe wrapper。
+    static POLL_SHARED_TL: std::cell::RefCell<Option<SharedRef>> =
+        const { std::cell::RefCell::new(None) };
+    static POLL_IN_TICK_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn poll_hwnd_now() -> isize {
+    POLL_HWND_TL.with(|h| h.get())
+}
 static POLL_TICKS: AtomicIsize = AtomicIsize::new(0);
 
 fn state_sig(state: &serde_json::Value) -> String {
@@ -5820,7 +5838,7 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             unsafe {
                 let _ = KillTimer(hwnd, CARET_TIMER_ID);
             }
-            let shared = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
+            let shared = POLL_SHARED_TL.with(|s| s.borrow().clone());
             if let Some(shared) = shared {
                 {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -5860,10 +5878,11 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 }
 
 fn poll_arm(shared: &SharedRef) {
-    if POLL_HWND.load(AtomicOrdering::Relaxed) != 0 {
+    // 【四十六修】每线程一窗（多标签宿主各自服务）；已武装即幂等返回
+    if poll_hwnd_now() != 0 {
         return;
     }
-    *POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(PollShared(shared.clone()));
+    POLL_SHARED_TL.with(|s| *s.borrow_mut() = Some(shared.clone()));
     let cls: Vec<u16> = "HuFuPollWnd".encode_utf16().chain([0]).collect();
     let name: Vec<u16> = "hufu-poll".encode_utf16().chain([0]).collect();
     unsafe {
@@ -5893,8 +5912,8 @@ fn poll_arm(shared: &SharedRef) {
         if let Ok(h) = h {
             if !h.0.is_null() {
                 let _ = SetTimer(h, POLL_TIMER_ID, POLL_MS, None);
-                POLL_HWND.store(h.0 as isize, AtomicOrdering::Relaxed);
-                diag_note("poll: 轮询窗已武装（140ms）");
+                POLL_HWND_TL.with(|c| c.set(h.0 as isize));
+                diag_note("poll: 轮询窗已武装（140ms，本线程）");
             }
         }
     }
@@ -6064,8 +6083,10 @@ fn poll_collapse_stale(shared: &SharedRef) {
 }
 
 fn poll_tick() {
-    // 重入保护（update_ui 过程中不会再泵本消息，双保险）
-    if POLL_IN_TICK.swap(1, AtomicOrdering::Relaxed) != 0 {
+    // 重入保护（update_ui 过程中不会再泵本消息，双保险）。
+    // 【四十六修】改线程局部：多标签宿主各线程的 poll 并发合法，
+    // 全局互斥会互相丢拍。
+    if POLL_IN_TICK_TL.with(|f| f.replace(true)) {
         return;
     }
     let _guard = scopeguard_release();
@@ -6084,7 +6105,7 @@ fn poll_tick() {
     // 线程亲和正确）：闲拍顺手把窗建好（隐藏态不显示），首键直接
     // show。进程生命周期只发生一次。
     {
-        let sp = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
+        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
         if let Some(s) = sp {
             let (none, dead, busy) = {
                 let g = s.lock().unwrap_or_else(|e| e.into_inner());
@@ -6125,7 +6146,7 @@ fn poll_tick() {
     // 收紧为"本进程是当前输入宿主"：近 2s 有键或组段活着；否则只收
     // 残留窗后跳过本拍（残留收起复用下方兜底逻辑，抽 poll_collapse）。
     {
-        let sp = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
+        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
         if let Some(s) = sp {
             let (busy, owes, mine, composing_or_shown, tm) = {
                 let g = s.lock().unwrap_or_else(|e| e.into_inner());
@@ -6178,7 +6199,7 @@ fn poll_tick() {
     // 【语言栏缓存 2026-09-11】方案清单/音效快照在 poll 线程刷新
     //（5s 节流）——右键菜单 msctf 回调里零管道。
     crate::langbar::refresh_schemas_cache();
-    let shared = POLL_SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.0.clone());
+    let shared = POLL_SHARED_TL.with(|s| s.borrow().clone());
     let Some(shared) = shared else { return };
     // 【残留兜底】前台窗口属于别的进程（宿主失焦：切到别的应用打字、
     // 开始菜单/UWP 宿主关闭）→ 收起本进程候选窗并跳过本帧刷新。
@@ -6435,6 +6456,7 @@ fn scopeguard_release() -> PollGuard {
 struct PollGuard;
 impl Drop for PollGuard {
     fn drop(&mut self) {
-        POLL_IN_TICK.store(0, AtomicOrdering::Relaxed);
+        // 【四十六修】线程局部版（见 poll_tick 注释）
+        POLL_IN_TICK_TL.with(|f| f.set(false));
     }
 }
