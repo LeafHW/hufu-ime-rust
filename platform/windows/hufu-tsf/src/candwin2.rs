@@ -399,6 +399,13 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             return LRESULT(0);
         }
+        // 【五十三修·动效高频驱动】winmm 5ms 回调投递的 posted tick：
+        // 与 WM_TIMER 同一处理（fade_tick_shared 时间基准幂等），帧数
+        // ≈3×——入场/逐键/高亮滑动的「一顿一顿」根治点。
+        crate::candwin2::WM_APP_ANIM => {
+            unsafe { fade_tick_shared(hwnd) };
+            return LRESULT(0);
+        }
         // 【动效】WM_TIMER：动画 tick（尺寸/位置/高亮滑动，FADE_TIMER
         // 历史名沿用）+ 注释展开延时。渲染/状态变更走滚轮缩放同款
         // take/put-back（锁外渲染，不抢按键路径的锁）。
@@ -1759,7 +1766,7 @@ impl CandidateWindowV2 {
                         self.hl_anim
                             .set(Some((fr, std::time::Instant::now(), self.hl_ms)));
                         unsafe {
-                            let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                            anim_tick_arm(self.hwnd);
                         }
                     }
                 } else {
@@ -2368,7 +2375,7 @@ impl CandidateWindowV2 {
                 self.chrome_override.set(Some(cur));
                 crate::tsf::diag_note(&format!("cw2 尺寸起臂: {cur:?}→{target:?}"));
                 unsafe {
-                    let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                    anim_tick_arm(self.hwnd);
                 }
             } else {
                 self.size_anim = None;
@@ -4029,7 +4036,7 @@ impl CandidateWindowV2 {
                     if dmax >= 3 {
                         self.chase_target = Some((tx, ty));
                         self.chase_last = None;
-                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                        anim_tick_arm(self.hwnd);
                     } else {
                         self.live_pos.set((tx, ty));
                         self.chase_target = None;
@@ -4123,7 +4130,7 @@ impl CandidateWindowV2 {
                             ((d as f32 * 2.2 / spd) as u32).clamp(60, 260)
                         };
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur, 0));
-                        let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                        anim_tick_arm(self.hwnd);
                     } else if d > 0 {
                         self.pos_anim = None;
                     }
@@ -4158,14 +4165,11 @@ impl CandidateWindowV2 {
                                     "首显臂门: unit={unit} raw_len={raw_len} travel={travel} fx={fx} tx={tx} slide={first_show_slide}"
                                 ));
                             }
-                            if (20..=150).contains(&travel) {
-                                // 【五十二修·小行程免滑】WM_TIMER 实际投递
-                                // 12~31ms 抖动，48ms 快滑只有 3 帧、每帧跳
-                                // 5~8px=「一顿一顿」（用户实锤）。行程 <20px
-                                //（单键首显 ~15px）滑动本身即不可感知的抖
-                                // 动——免滑直落终点（最快且零顿挫）；≥20px
-                                // 保留五十一修快滑（30px→4-5 帧、60px→7 帧，
-                                // 帧数足量不顿）。
+                            if (3..=150).contains(&travel) {
+                                // 【五十三修·撤免滑】用户拍板「不要免滑」：
+                                // 小行程保留滑动，顿挫改由动效高频驱动根治
+                                //（winmm 5ms 回调→PostMessage，见 anim_boost），
+                                // 15px/32ms 快滑在 ~5ms tick 下有 6-7 帧。
                                 let spd = self.anim_spd.get().max(0.05);
                                 // 【五修·首显提速 2026-09-18 用户拍板】固定
                                 // 100ms 比逐键滑慢半拍，观感「出现慢」——
@@ -4192,7 +4196,7 @@ impl CandidateWindowV2 {
                                 // 起臂帧即记真实显示位：下一键 per-key 滑动
                                 // 从滑行起点接续，而不是从上一段残值起步。
                                 self.live_pos.set((fx, ty));
-                                let _ = SetTimer(self.hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+                                anim_tick_arm(self.hwnd);
                             }
                         }
                     }
@@ -4522,6 +4526,103 @@ fn raise_timer_resolution_once() {
         }
         let _ = timeBeginPeriod(1);
     });
+}
+// ============================================================================
+// 【五十三修·动效高频驱动】WM_TIMER 投递颗粒 12~31ms 抖动（消息队列
+// 合并 + 闲时投递策略），48ms 入场只剩 3 帧=「一顿一顿」（用户实锤，
+// 且明确「不要免滑」）。补一路 winmm timeSetEvent(5ms) 回调 →
+// PostMessage(WM_APP_ANIM)：posted 消息不合并、不被闲时策略推迟，
+// 实际帧数≈3×。SetTimer 原路保留兜底（winmm 失败/极端宿主），两路
+// 都进 fade_tick_shared——步进是纯时间基准，多到的 tick 只重算当前
+// 位置（幂等），互不干扰。
+//
+// 自限：每次起臂刷新 400ms 截止（GetTickCount64）；无再臂回调里
+// 自杀（timeKillEvent）+ 清注册表——动画最长高亮滑 ~300ms，驱动
+// 最多多活 400ms 即停，常驻开销归零。多窗（双标签双线程）各自
+// hwnd 注册、各自线程消费 Post——互不串线。
+// ============================================================================
+/// 动效高频 tick 消息（wndproc 消费 → fade_tick_shared）。
+pub const WM_APP_ANIM: u32 = 0x4941; // "A"
+///（截止 GetTickCount64 ms, 注册 hwnd 列表）
+static ANIM_BOOST: std::sync::Mutex<(u64, Vec<isize>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+static ANIM_BOOST_EVENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetTickCount64() -> u64;
+}
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeSetEvent(
+        delay: u32,
+        resolution: u32,
+        cb: Option<unsafe extern "system" fn(u32, u32, usize, usize, usize)>,
+        user: usize,
+        event_type: u32,
+    ) -> u32;
+    fn timeKillEvent(id: u32) -> u32;
+}
+
+/// winmm 回调（winmm 工作线程）：过期自杀；否则向全部注册窗投递
+/// 动效 tick。只做 PostMessage（异步安全），不碰任何窗口状态。
+unsafe extern "system" fn anim_boost_cb(_id: u32, _m: u32, _u: usize, _a: usize, _b: usize) {
+    let (post, expired) = {
+        let mut g = match ANIM_BOOST.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let now = unsafe { GetTickCount64() };
+        if now > g.0 {
+            g.1.clear();
+            (Vec::new(), true)
+        } else {
+            (g.1.clone(), false)
+        }
+    };
+    if expired {
+        let ev = ANIM_BOOST_EVENT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if ev != 0 {
+            unsafe { let _ = timeKillEvent(ev as u32); }
+        }
+        return;
+    }
+    for h in post {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut core::ffi::c_void), WM_APP_ANIM, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// 起臂动效高频驱动：注册本窗 + 刷新截止 + 无事件则启周期回调。
+/// 幂等（重复调用=刷新截止）。失败静默退化为纯 SetTimer 路径。
+fn anim_boost_arm(hwnd: HWND) {
+    raise_timer_resolution_once();
+    let mut g = match ANIM_BOOST.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    g.0 = unsafe { GetTickCount64() } + 400;
+    let h = hwnd.0 as isize;
+    if !g.1.contains(&h) {
+        g.1.push(h);
+    }
+    if ANIM_BOOST_EVENT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        // TIME_PERIODIC=1；分辨率 1ms（timeBeginPeriod(1) 已提）。
+        let id = unsafe { timeSetEvent(FADE_TICK_MS, 1, Some(anim_boost_cb), 0, 1) };
+        if id != 0 {
+            ANIM_BOOST_EVENT.store(id as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// 动效 tick 起臂统一入口：SetTimer 兜底 + winmm 高频驱动双路。
+fn anim_tick_arm(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+    }
+    anim_boost_arm(hwnd);
 }
 /// 【四十六修·多标签宿主】按「谁的 cand2 拥有本 tick 的 hwnd」选
 /// Shared：Win11 记事本等每个标签/窗口独立线程的宿主里，标签 2+
