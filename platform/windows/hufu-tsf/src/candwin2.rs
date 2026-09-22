@@ -554,6 +554,13 @@ pub struct CandidateWindowV2 {
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
     /// 那正是候选框「在光标周围乱跳」的病根。
     sticky_pos: Option<(i32, i32)>,
+    /// 【四十八修·粘位焦点窗归属】sticky_pos 记录时所在的焦点窗
+    ///（GetGUIThreadInfo(0).hwndFocus，0=查询失败）。同一编辑框内
+    /// 锚丢失沿用旧位（原语义）；焦点窗已换（桌面连续重命名两个
+    /// 文件=两个 Edit）而新帧锚缺失时，旧位属于**别的编辑框**——
+    /// 沿用=候选停在上一个文件旁（用户实锤「桌面重命名候选离得
+    /// 远·偏左一两个图标」），改落当前焦点编辑框正下方。
+    sticky_focus_h: std::cell::Cell<isize>,
     /// 【拖拽钉住 2026-09-08】拖拽松手设的 sticky 是「组段级钉住」：
     /// 本组段内窗口留在松手处（忽略 caret 锚），hide（收窗/失焦/
     /// 上屏断段）时解除——下一组段恢复跟随。旧行为 sticky 只作
@@ -942,6 +949,7 @@ impl CandidateWindowV2 {
                 ulw_h: 0,
                 readback: false,
                 sticky_pos: None,
+                sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
                 last_pixels: None,
@@ -1113,6 +1121,7 @@ impl CandidateWindowV2 {
                 ulw_h: 0,
                 readback: false,
                 sticky_pos: None,
+                sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
                 last_pixels: None,
@@ -1564,6 +1573,57 @@ impl CandidateWindowV2 {
                     a.left, a.top, a.right, a.bottom
                 )),
                 None => crate::tsf::trace("cw2: show[入] 锚=None"),
+            }
+            // 【四十七修·锚点对照观测】桌面重命名「候选离得远」排查：
+            // 锚矩形与**焦点窗真实屏幕矩形**并排——锚来自哪条查询链
+            //（GetTextExt/selection/系统插入符/est）一眼可辨真伪。
+            unsafe {
+                #[link(name = "user32")]
+                unsafe extern "system" {
+                    fn GetGUIThreadInfo(tid: u32, gi: *mut GTI) -> i32;
+                    #[link_name = "GetClassNameW"]
+                    fn GetClassNameW2(hwnd: HWND, s: *mut u16, c: i32) -> i32;
+                }
+                #[repr(C)]
+                struct GTI {
+                    cb: u32,
+                    flags: u32,
+                    hwnd_active: HWND,
+                    hwnd_focus: HWND,
+                    hwnd_capture: HWND,
+                    hwnd_menu_owner: HWND,
+                    hwnd_move_size: HWND,
+                    hwnd_caret: HWND,
+                    rc_caret: RECT,
+                }
+                let mut gi = GTI {
+                    cb: std::mem::size_of::<GTI>() as u32,
+                    flags: 0,
+                    hwnd_active: HWND(std::ptr::null_mut()),
+                    hwnd_focus: HWND(std::ptr::null_mut()),
+                    hwnd_capture: HWND(std::ptr::null_mut()),
+                    hwnd_menu_owner: HWND(std::ptr::null_mut()),
+                    hwnd_move_size: HWND(std::ptr::null_mut()),
+                    hwnd_caret: HWND(std::ptr::null_mut()),
+                    rc_caret: RECT::default(),
+                };
+                if GetGUIThreadInfo(0, &mut gi) != 0 {
+                    let fw = gi.hwnd_focus;
+                    if !fw.0.is_null() {
+                        let mut fr = RECT::default();
+                        if GetWindowRect(fw, &mut fr).is_ok() {
+                            let mut cls = [0u16; 32];
+                            let n = GetClassNameW2(fw, cls.as_mut_ptr(), 32);
+                            let cn = String::from_utf16_lossy(
+                                &cls[..cls.iter().position(|&c| c == 0).unwrap_or(n.max(0) as usize)],
+                            );
+                            crate::tsf::trace(&format!(
+                                "cw2: 锚对照 焦点窗={cn}@0x{:x} rect=({},{},{},{})",
+                                fw.0 as usize, fr.left, fr.top, fr.right, fr.bottom
+                            ));
+                        }
+                    }
+                }
             }
         }
         // 【二十五修·闪帧收窗取消】新 show 到来=新组段开打——挂起的
@@ -3530,7 +3590,22 @@ impl CandidateWindowV2 {
                         (x, y)
                     }
                     None => match self.sticky_pos {
-                        Some(p) => p,
+                        // 【四十八修·跨编辑框粘位作废】焦点窗已换而本帧
+                        // 锚缺失：旧粘位属于上一个编辑框（桌面连续重命名
+                        // 两个文件），沿用=候选钉在上一个文件旁（用户
+                        // 实锤「偏左一两个图标」）。改落当前焦点编辑框
+                        // 正下方。同窗（正常打字中的锚丢失帧）沿用原语义。
+                        Some(p)
+                            if self.sticky_focus_matches() || self.sticky_drag =>
+                        {
+                            p
+                        }
+                        Some(_) => {
+                            if crate::tsf::trace_on() {
+                                crate::tsf::trace("cw2: 粘位跨编辑框作废 → 焦点编辑框正下方");
+                            }
+                            self.focus_edit_below((height * dpi_scale) as i32)
+                        }
                         // 从未有过真实锚点且本帧也取不到：先记诊断；若无
                         // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
                         //（SearchHost 等宿主 GetTextExt 常失败——搜索框候选
@@ -3636,6 +3711,42 @@ impl CandidateWindowV2 {
             let x = x.clamp(vx, (vx + vw - m_phys0 - wpx0).max(vx));
             let y = y.clamp(vy, (vy + vh - m_phys0 - hpx0).max(vy));
             self.sticky_pos = Some((x, y));
+            // 【四十八修】记录本帧粘位归属的焦点窗（沿用判据，见字段注释）
+            {
+                #[repr(C)]
+                struct GTI2 {
+                    cb: u32,
+                    flags: u32,
+                    hwnd_active: HWND,
+                    hwnd_focus: HWND,
+                    hwnd_capture: HWND,
+                    hwnd_menu_owner: HWND,
+                    hwnd_move_size: HWND,
+                    hwnd_caret: HWND,
+                    rc_caret: RECT,
+                }
+                #[link(name = "user32")]
+                unsafe extern "system" {
+                    fn GetGUIThreadInfo(tid: u32, gi: *mut GTI2) -> i32;
+                }
+                let mut gi = GTI2 {
+                    cb: std::mem::size_of::<GTI2>() as u32,
+                    flags: 0,
+                    hwnd_active: HWND(std::ptr::null_mut()),
+                    hwnd_focus: HWND(std::ptr::null_mut()),
+                    hwnd_capture: HWND(std::ptr::null_mut()),
+                    hwnd_menu_owner: HWND(std::ptr::null_mut()),
+                    hwnd_move_size: HWND(std::ptr::null_mut()),
+                    hwnd_caret: HWND(std::ptr::null_mut()),
+                    rc_caret: RECT::default(),
+                };
+                let fh = if GetGUIThreadInfo(0, &mut gi) != 0 && !gi.hwnd_focus.0.is_null() {
+                    gi.hwnd_focus.0 as isize
+                } else {
+                    0
+                };
+                self.sticky_focus_h.set(fh);
+            }
             // 【四十五修·锚到滑入】记录本帧显示位是否来自真实锚点/
             // 用户钉位（供 per-key 起臂读上一帧值：从兜底位→真锚的
             // 修正位移走快滑而非瞬落——资源管理器重命名/搜索框组段
@@ -4102,6 +4213,100 @@ impl CandidateWindowV2 {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             WindowFromPoint(pt).0 == self.hwnd.0
+        }
+    }
+
+    /// 【四十八修】本线程焦点窗是否仍是记录粘位时的那个（0=未知，
+    /// 保守视为同一窗沿用原语义）。
+    fn sticky_focus_matches(&self) -> bool {
+        let recorded = self.sticky_focus_h.get();
+        if recorded == 0 {
+            return true;
+        }
+        #[repr(C)]
+        struct GTI3 {
+            cb: u32,
+            flags: u32,
+            hwnd_active: HWND,
+            hwnd_focus: HWND,
+            hwnd_capture: HWND,
+            hwnd_menu_owner: HWND,
+            hwnd_move_size: HWND,
+            hwnd_caret: HWND,
+            rc_caret: RECT,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetGUIThreadInfo(tid: u32, gi: *mut GTI3) -> i32;
+        }
+        let mut gi = GTI3 {
+            cb: std::mem::size_of::<GTI3>() as u32,
+            flags: 0,
+            hwnd_active: HWND(std::ptr::null_mut()),
+            hwnd_focus: HWND(std::ptr::null_mut()),
+            hwnd_capture: HWND(std::ptr::null_mut()),
+            hwnd_menu_owner: HWND(std::ptr::null_mut()),
+            hwnd_move_size: HWND(std::ptr::null_mut()),
+            hwnd_caret: HWND(std::ptr::null_mut()),
+            rc_caret: RECT::default(),
+        };
+        unsafe {
+            GetGUIThreadInfo(0, &mut gi) == 0
+                || gi.hwnd_focus.0 as isize == recorded
+        }
+    }
+
+    /// 【四十八修】当前焦点编辑框正下方的落位（跨编辑框粘位作废后的
+    /// 兜底；h=候选物理高）。查询失败返回 None 退原「焦点窗口内左下」。
+    fn focus_edit_below(&self, h: i32) -> (i32, i32) {
+        #[repr(C)]
+        struct GTI4 {
+            cb: u32,
+            flags: u32,
+            hwnd_active: HWND,
+            hwnd_focus: HWND,
+            hwnd_capture: HWND,
+            hwnd_menu_owner: HWND,
+            hwnd_move_size: HWND,
+            hwnd_caret: HWND,
+            rc_caret: RECT,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetGUIThreadInfo(tid: u32, gi: *mut GTI4) -> i32;
+        }
+        let mut gi = GTI4 {
+            cb: std::mem::size_of::<GTI4>() as u32,
+            flags: 0,
+            hwnd_active: HWND(std::ptr::null_mut()),
+            hwnd_focus: HWND(std::ptr::null_mut()),
+            hwnd_capture: HWND(std::ptr::null_mut()),
+            hwnd_menu_owner: HWND(std::ptr::null_mut()),
+            hwnd_move_size: HWND(std::ptr::null_mut()),
+            hwnd_caret: HWND(std::ptr::null_mut()),
+            rc_caret: RECT::default(),
+        };
+        unsafe {
+            if GetGUIThreadInfo(0, &mut gi) == 0 || gi.hwnd_focus.0.is_null() {
+                // 查询失败：退「焦点窗口内左下」同款兜底（工作区左上）
+                return (16, 16);
+            }
+            let mut fr = RECT::default();
+            if GetWindowRect(gi.hwnd_focus, &mut fr).is_err() {
+                return (16, 16);
+            }
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let x = fr.left.clamp(vx, (vx + vw - 200).max(vx));
+            let below = fr.bottom + 4;
+            let y = if below + h <= vy + vh {
+                below
+            } else {
+                (fr.top - h - 4).max(vy)
+            };
+            (x, y)
         }
     }
 
