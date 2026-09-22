@@ -4158,7 +4158,14 @@ impl CandidateWindowV2 {
                                     "首显臂门: unit={unit} raw_len={raw_len} travel={travel} fx={fx} tx={tx} slide={first_show_slide}"
                                 ));
                             }
-                            if (3..=150).contains(&travel) {
+                            if (20..=150).contains(&travel) {
+                                // 【五十二修·小行程免滑】WM_TIMER 实际投递
+                                // 12~31ms 抖动，48ms 快滑只有 3 帧、每帧跳
+                                // 5~8px=「一顿一顿」（用户实锤）。行程 <20px
+                                //（单键首显 ~15px）滑动本身即不可感知的抖
+                                // 动——免滑直落终点（最快且零顿挫）；≥20px
+                                // 保留五十一修快滑（30px→4-5 帧、60px→7 帧，
+                                // 帧数足量不顿）。
                                 let spd = self.anim_spd.get().max(0.05);
                                 // 【五修·首显提速 2026-09-18 用户拍板】固定
                                 // 100ms 比逐键滑慢半拍，观感「出现慢」——
