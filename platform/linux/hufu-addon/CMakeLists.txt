@@ -14,7 +14,10 @@ project(hufu-addon VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Fcitx5Core REQUIRED)
+# fcitx5 下限 **5.1.15**：配置项用「指定初始化」构造 `Option(OptionParameters)`（该构造 5.1.15 才有），
+# 候选注释 `CandidateWord::setComment` 需 ≥5.1.9。低于下限时在这里直接报错，
+# 而不是在 C++ 模板深处炸开。
+find_package(Fcitx5Core 5.1.15 REQUIRED)
 
 # Rust 静态库（客户端层；cargo 自身增量，故每次构建都调用）。
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -40,7 +43,16 @@ target_include_directories(hufu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shell")
 target_link_libraries(hufu PRIVATE Fcitx5::Core "${HUFU_RUST_LIB}" dl pthread m)
 set_target_properties(hufu PROPERTIES OUTPUT_NAME "hufu")
 
-install(TARGETS hufu LIBRARY DESTINATION lib/fcitx5)
+# 插件安装目录：优先跟随 fcitx5 自身的 addon 目录（`Fcitx5Utils` 提供，如 Fedora 的
+# `lib64/fcitx5`、Debian 的 multilib 目录），未提供时退回 GNUInstallDirs 的 libdir。
+# 此前硬编码 `lib/fcitx5`，在 lib64 或多架构发行版上会落到 fcitx5 不扫描的目录。
+if(DEFINED FCITX_INSTALL_ADDONDIR AND NOT FCITX_INSTALL_ADDONDIR STREQUAL "")
+    set(HUFU_ADDON_DIR "${FCITX_INSTALL_ADDONDIR}")
+else()
+    include(GNUInstallDirs)
+    set(HUFU_ADDON_DIR "${CMAKE_INSTALL_LIBDIR}/fcitx5")
+endif()
+install(TARGETS hufu LIBRARY DESTINATION "${HUFU_ADDON_DIR}")
 install(FILES conf/hufu.addon.conf
         DESTINATION share/fcitx5/addon
         RENAME hufu.conf)
