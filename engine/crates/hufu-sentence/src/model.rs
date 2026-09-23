@@ -354,6 +354,10 @@ impl NgramModel {
     }
 }
 
+/// 合成 ngram 模型供 hufu-sentence 组句单测复用（仅在测试构建可见）。
+#[cfg(test)]
+pub(crate) use tests::tiny_model;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,7 +366,7 @@ mod tests {
     /// unigram: unk(1e-7), EOS(0.002), 我(0.5), 们(0.3), 是(0.2)
     /// bigram ctx 我 → 们 p=0.6 λ=0.4
     /// trigram ctx (我,们) → 是 p=0.7 λ=0.3
-    fn tiny_model() -> NgramModel {
+    pub(crate) fn tiny_model() -> NgramModel {
         let mut uni = vec![
             (0u32, 1e-7f32),
             (EOS, 0.002),

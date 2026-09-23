@@ -6,6 +6,10 @@
 //（保持码表相对序——同码单字组官方序不容重排，kc 案例教训），
 // 词/整句现切/表外生僻按原序排后；第 5 键起/带锁/已有提前上屏前缀
 // 回归正常整句权重排序。
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 pub const TOP4000: &str = "
     的一是了不在有个人这上中大为来我到出要以时和地们得可下对生也子就过能他会多发说而于自之用年行家方后作成开面事好小心前所道法如进着同经分定都然与本还其当起动已两点
     从问里主实天高去现长此三将无国全文理明日些看只公等十意正外想间把情者没重相那向知因样学应又手但信关使种见力名二处门并口么先位头回话很再由身入内第平被给次别几月真
@@ -65,3 +69,70 @@ pub fn is_top4000(c: char) -> bool {
     TOP4000.contains(c)
 }
 
+/// 字在 `TOP4000` 里的频序（1 起；不在表内 → `None`）。
+///
+/// 名次 = 该字在常量里出现的先后位置。表体里的换行与缩进空格只是排版，
+/// 建索引时跳过空白：空白不占名次，也不会被当成表内字。
+/// 索引在首次调用时建好（表 4000 字扫一遍），之后每次查询 O(1)：调用方
+/// 按码表逐字查频序（虎整句码表单字数可达十万级），逐次线性扫表是秒级
+/// 开销。
+pub fn rank_of(c: char) -> Option<usize> {
+    static RANKS: OnceLock<HashMap<char, usize>> = OnceLock::new();
+    RANKS.get_or_init(build_ranks).get(&c).copied()
+}
+
+/// 频序索引：字 → 名次（表内重复字取首次出现的位置）。
+fn build_ranks() -> HashMap<char, usize> {
+    let mut ranks: HashMap<char, usize> = HashMap::new();
+    let mut rank = 0usize;
+    for ch in TOP4000.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        rank += 1;
+        ranks.entry(ch).or_insert(rank);
+    }
+    ranks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// 表体（滤掉排版空白），按出现顺序。
+    fn table_chars() -> Vec<char> {
+        TOP4000.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn top4000_lists_4000_unique_chars() {
+        let chars = table_chars();
+        assert_eq!(chars.len(), 4000, "频序表应为 4000 字");
+        let unique: HashSet<char> = chars.iter().copied().collect();
+        assert_eq!(unique.len(), 4000, "频序表重复字会让名次有歧义");
+    }
+
+    #[test]
+    fn rank_of_uses_table_positions() {
+        let chars = table_chars();
+        // 表内首尾与抽点：与「滤掉空白后的第 i 个字」逐位对齐
+        for i in [0usize, 1, 2, 999, 2000, 3999] {
+            assert_eq!(rank_of(chars[i]), Some(i + 1), "表内第 {} 位", i + 1);
+        }
+        assert_eq!(rank_of('的'), Some(1));
+        assert_eq!(rank_of('僭'), Some(4000));
+        // 空白不占名次：'一' 是表体第 2 个字（换行/缩进若计入名次则不是）
+        assert_eq!(rank_of('一'), Some(2));
+        assert_eq!(rank_of('是'), Some(3));
+    }
+
+    #[test]
+    fn rank_of_rejects_blank_and_absent_chars() {
+        for c in ['\n', ' ', '\t', '\u{3000}'] {
+            assert_eq!(rank_of(c), None, "空白 {c:?} 不应有名次");
+        }
+        assert_eq!(rank_of('A'), None);
+        assert_eq!(rank_of('\u{20000}'), None);
+    }
+}

@@ -27,6 +27,7 @@ fn main() {
         supplement_scale: 2.0,
         supplement_maximum: 32.0,
         digit_codes: false,
+        ..Default::default()
     };
     let schema = hufu_dict::schema::Schema::load(&schema_dir).expect("方案加载失败");
     let dict = schema.dict.clone();

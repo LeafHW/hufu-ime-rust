@@ -62,7 +62,7 @@ hufu-engine Session::process_key()
 - **提前上屏**：候选前缀质量占比 ≥ confidence(0.995) 的最长公共前缀，连续 3 键一致才提交。
 - **权重全部可调**（config.sentence.*）：beam_width、candidate_limit、emitted_character_reward、
   rank_penalty、isolation_threshold/lambda、confidence、supplement_baseline/scale/maximum、
-  以及与码表首选融合的 dict_bias。
+  high_freq_limit（整句高频字上限，0 = 不限制）、以及与码表首选融合的 dict_bias。
 - **LLM 重排**：`Reranker` trait，v1 提供 NoopReranker；llama.cpp 子进程（Qwen3 GGUF）作为
   可选实现（与 TigerClaw 相同架构：独立进程、top-5 重排、超时回退 ngram 序）。
 
