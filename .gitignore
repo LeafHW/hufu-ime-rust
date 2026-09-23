@@ -19,3 +19,12 @@ target159/
 target-build/
 platform/windows/install/install.log
 _tmp
+
+# docs/corpus 测试集源料（大文件不入仓：cnews 130MB 原始 + 转换 jsonl + 评论 CSV；
+# 成品 test_sentences_50k*.txt 与脚本入仓，源料取回法见 prepare_corpus_50k.py 注释）
+docs/corpus/cnews.train.txt
+docs/corpus/THUCNews_*.jsonl
+docs/corpus/ChnSentiCorp_htl_all.csv
+docs/corpus/waimai_10k.csv
+docs/corpus/online_shopping/
+docs/corpus/__pycache__/

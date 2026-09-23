@@ -196,7 +196,10 @@ def main():
         groups.setdefault(key, []).append((src_name, s))
     print("group sizes:", {k: len(v) for k, v in groups.items()})
 
-    quota = {"LCSTS": 15000, "THUCNews": 30000, "REVIEW": 10000}
+    # 配额：LCSTS 源已不在本地（原 50k 制备后清理），新闻侧以 THUCNews
+    # （cnews 10 类 ×5000，GitHub LFS 取回）补位到 40000；评论三类
+    # 清洗后去重池 ~9k，min() 自动就池。50000 目标由 [:50000] 兜底截齐。
+    quota = {"LCSTS": 15000, "THUCNews": 40000, "REVIEW": 10000}
     picked = []
     for key, n in quota.items():
         pool = groups.get(key, [])
