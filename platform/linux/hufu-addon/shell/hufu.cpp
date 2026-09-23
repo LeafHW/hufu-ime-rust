@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 crux <crrvx@outlook.com>
+// SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // 虎符（hufu-ime）fcitx5 addon 的 C++ 薄壳：只做 fcitx5 接口适配，
