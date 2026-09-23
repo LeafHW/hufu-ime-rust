@@ -22,9 +22,11 @@
 #include <fcitx/userinterface.h>
 #include <fcitx/userinterfacemanager.h>
 #include <fcitx-config/configuration.h>
+#include <fcitx-config/enum.h>
 #include <fcitx-config/iniparser.h>
 #include <fcitx-config/option.h>
 #include <fcitx-utils/capabilityflags.h>
+#include <fcitx-utils/i18n.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/log.h>
@@ -164,9 +166,35 @@ private:
     int32_t index_;
 };
 
+/// 候选排列（默认跟随 fcitx5 全局「候选竖排」设置）。
+///
+/// 此前是布尔项 `ForceVertical`（勾选=竖排、不勾=跟随全局）；改成三态后多出「强制横排」，
+/// 代价是旧配置里的 `ForceVertical=True` 不再被读取（键名不同，静默回到默认）——
+/// 需要竖排的用户在配置页选「竖排」即可，迁移说明见 `platform/linux/README.md`。
+enum class HufuCandidateLayout { FollowGlobal, Horizontal, Vertical };
+FCITX_CONFIG_ENUM_NAME(HufuCandidateLayout, "跟随全局", "横排", "竖排");
+FCITX_CONFIG_ENUM_I18N_ANNOTATION(HufuCandidateLayout, "跟随全局", "横排", "竖排");
+
+/// 枚举注解 + 悬浮说明（`EnumI18n` 与 `Tooltip` 并存；fcitx5 自带注解只支持其一）。
+template <typename EnumAnnotation>
+struct EnumAnnotationWithTooltip : EnumAnnotation {
+    explicit EnumAnnotationWithTooltip(std::string tooltip)
+        : tooltip_(std::move(tooltip)) {}
+
+    bool skipDescription() const { return false; }
+    bool skipSave() const { return false; }
+    void dumpDescription(fcitx::RawConfig &config) const {
+        EnumAnnotation::dumpDescription(config);
+        config.setValueByPath("Tooltip", tooltip_);
+    }
+
+private:
+    std::string tooltip_;
+};
+
 /// ── fcitx5 设置页 schema（fcitx5-configtool「虎符」页）────────────────────
 /// 两类选项：
-/// - 宿主项（候选窗内预编辑 / 强制竖排）：本层直接生效，只存
+/// - 宿主项（候选窗内预编辑 / 候选排列）：本层直接生效，只存
 ///   `~/.config/fcitx5/conf/hufu.conf`。
 /// - 引擎项：打开页面时从 hufu-server 拉取（`config_get`），应用时深合并
 ///   写回（`config_set`）——与 Web 设置页同一份配置，热生效。
@@ -179,12 +207,16 @@ FCITX_CONFIGURATION(
         .description{"候选窗内显示编码"},
         .defaultValue = true,
         .annotation{"在候选窗顶部显示编码串；默认开（关闭后组段仍随光标内联显示）。"}}};
-    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> forceVertical{{
-        .parent = this,
-        .path{"ForceVertical"},
-        .description{"强制竖排候选"},
-        .defaultValue = false,
-        .annotation{"勾选=强制竖排；不勾=跟随 fcitx5 全局候选排列设置。"}}};
+    fcitx::OptionWithAnnotation<
+        HufuCandidateLayout,
+        EnumAnnotationWithTooltip<HufuCandidateLayoutI18NAnnotation>>
+        candidateLayout{{
+            .parent = this,
+            .path{"CandidateLayout"},
+            .description{"候选排列"},
+            .defaultValue = HufuCandidateLayout::FollowGlobal,
+            .annotation{"跟随全局：候选窗排列随 fcitx5 全局「候选竖排」；"
+                        "横排：强制横排；竖排：强制竖排。"}}};
     fcitx::Option<int, fcitx::IntConstrain, fcitx::DefaultMarshaller<int>,
                   fcitx::ToolTipAnnotation>
         pageSize{{
@@ -953,9 +985,14 @@ private:
                     fcitx::Text(snapshot.comments[i]), watch(),
                     static_cast<int32_t>(i));
             }
-            // 设置页「强制竖排候选」：仅勾选时下发（不勾=跟随 fcitx5 全局）
-            if (config_.behavior->forceVertical.value()) {
-                candidateList->setLayoutHint(fcitx::CandidateLayoutHint::Vertical);
+            // 设置页「候选排列」：跟随全局时不下发布局提示（由 fcitx5 全局「候选竖排」
+            // 决定），横排 / 竖排时强制对应方向。
+            const auto layout = config_.behavior->candidateLayout.value();
+            if (layout != HufuCandidateLayout::FollowGlobal) {
+                candidateList->setLayoutHint(
+                    layout == HufuCandidateLayout::Vertical
+                        ? fcitx::CandidateLayoutHint::Vertical
+                        : fcitx::CandidateLayoutHint::Horizontal);
             }
             candidateList->setPageSize(static_cast<int>(snapshot.texts.size()));
             const int32_t index = std::min(
@@ -994,8 +1031,13 @@ private:
         fcitx::RawConfig raw;
         raw.setValueByPath("Behavior/PanelPreedit",
                            jbool(config_.behavior->panelPreedit.value()));
-        raw.setValueByPath("Behavior/ForceVertical",
-                           jbool(config_.behavior->forceVertical.value()));
+        // 枚举项经 marshaller 取名字符串（与配置页 ini 里的写法一致）。
+        {
+            fcitx::RawConfig enumValue;
+            fcitx::DefaultMarshaller<HufuCandidateLayout>{}.marshall(
+                enumValue, config_.behavior->candidateLayout.value());
+            raw.setValueByPath("Behavior/CandidateLayout", enumValue.value());
+        }
         raw.setValueByPath("Behavior/PageSize",
                            std::to_string(getInt("candidates.page_size", 4)));
         raw.setValueByPath("Behavior/AutoPush",
