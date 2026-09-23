@@ -363,6 +363,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                     // 【三十六修】主分支同款：HIDE_LATER 延迟收窗钟一并杀
                     let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
+                    // 【六十修】看门狗随藏同杀
+                    let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                    unsafe { rawinput_listen(hwnd, false) };
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 return LRESULT(0);
@@ -405,6 +408,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let _ = KillTimer(hwnd, FADE_TIMER_ID);
                 let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                 let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
+                // 【六十修】看门狗随藏同杀
+                let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                unsafe { rawinput_listen(hwnd, false) };
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             return LRESULT(0);
@@ -415,6 +421,27 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         crate::candwin2::WM_APP_ANIM => {
             unsafe { fade_tick_shared(hwnd) };
             return LRESULT(0);
+        }
+        // 【六十修】冲销请求：转投消息泵执行（回调内同步会话会被拒）
+        WM_APP_IME_SWITCH => {
+            unsafe {
+                let shared = if crate::tsf::addword_tl_thread() {
+                    crate::tsf::tl_shared()
+                } else {
+                    tick_shared_for_hwnd(hwnd)
+                };
+                if let Some(shared) = shared {
+                    crate::tsf::trace("imeswitch: 消息泵执行冲销");
+                    crate::tsf::ime_switch_abort(&shared);
+                }
+            }
+            return LRESULT(0);
+        }
+        // 【六十修·三层】Raw Input 全局键流：物理按键不经路由直达。
+        // 切换热键图形现形即收尸（见 rawinput_switch_detect）。不吞，
+        // 交还 DefWindowProc 清理。
+        windows::Win32::UI::WindowsAndMessaging::WM_INPUT => {
+            unsafe { rawinput_switch_detect(lparam, hwnd) };
         }
         // 【动效】WM_TIMER：动画 tick（尺寸/位置/高亮滑动，FADE_TIMER
         // 历史名沿用）+ 注释展开延时。渲染/状态变更走滚轮缩放同款
@@ -434,6 +461,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                     let _ = PostMessageW(hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
                 }
+                return LRESULT(0);
+            }
+            // 【六十修·切输入法看门狗】慢钟：窗在屏时轮询前景 TIP，
+            // 易主即冲销+收窗（见 ime_watchdog_tick 注释）。
+            if id == IME_WATCHDOG_TIMER_ID {
+                unsafe { ime_watchdog_tick(hwnd) };
                 return LRESULT(0);
             }
         }
@@ -4398,6 +4431,22 @@ impl CandidateWindowV2 {
                     IsWindowVisible(self.hwnd).0
                 ));
             }
+            // 【六十修·切输入法看门狗】窗口可见即挂 200ms 慢钟：轮询本
+            // 线程前景 TIP，非我们且窗仍在屏 → 冲销+收窗。四十五修的
+            // ActiveLanguageProfileNotifySink 实测只收得见「切回来」
+            //（全量 trace 零外源 clsid 事件）——Win+Space 现代切换器
+            // 切走不广播给它，ISV 版 sink 又被系统恒拒（0x80040202），
+            // 事件路全盲。本钟不依赖任何事件：Win+Space/鼠标点语言栏/
+            // 触屏切法全兜住，最坏 200ms 残留（原=永留）。藏窗各执行
+            // 点杀钟（WM_APP_HIDE_CAND 双分支）。
+            if sp_ok.is_ok() {
+                let r = SetTimer(self.hwnd, IME_WATCHDOG_TIMER_ID, 200, None);
+                crate::tsf::trace(&format!(
+                    "watchdog armed r={r:?}（0=失败）"
+                ));
+                // 【六十修·三层】同点位订阅全局原始键流（物理层兜底）
+                unsafe { rawinput_listen(self.hwnd, true) };
+            }
             // 【毛玻璃退役 2026-09-11】glass RGN/DWM 圆角/NC 链整块删除；
             // 仅保留残留清理（曾开过毛玻璃的窗恢复全窗区域+方角）。
             if self.rgn_last.get() != 0 {
@@ -4607,12 +4656,60 @@ impl CandidateWindowV2 {
 
 /// 隐藏候选窗的应用层消息（PostMessage 异步隐藏用）
 pub const WM_APP_HIDE_CAND: u32 = 0x4948; // "IH"
+/// 【六十修】切输入法冲销请求（各检测层→wndproc 消息泵上下文统一
+/// 执行——按键回调/WM_INPUT 里跑同步 edit session 会被 TSF 拒）。
+pub const WM_APP_IME_SWITCH: u32 = 0x4953; // "IS"
+
+/// 【六十修·一刀】进程内全部候选窗强制隐藏：EnumWindows 按「类名
+/// HuFuCandWin2 + 本进程」过滤，每扇投递 WM_APP_HIDE_CAND（handler
+/// 内 SW_HIDE+杀钟+退订 rawinput）。不猜是哪扇——当前窗/暂留窗/
+/// 漏窗/让渡窗一律清场。切输入法、Deactivate、Activate 扫尸三处调用。
+pub fn hide_all_cand_windows() {
+    extern "system" fn enum_proc(hwnd: HWND, _l: LPARAM) -> BOOL {
+        unsafe {
+            let mut cls = [0u16; 32];
+            let n = GetClassNameW(hwnd, &mut cls);
+            let name = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+            if name.contains("HuFuCand") {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid == std::process::id() {
+                    let _ = PostMessageW(hwnd, WM_APP_HIDE_CAND, WPARAM(0), LPARAM(0));
+                }
+            }
+            BOOL(1)
+        }
+    }
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(0));
+    }
+}
+
+/// 【六十修】投递冲销请求到候选窗消息泵（无窗/投递失败 → false，
+/// 调用方直调兜底）。
+pub fn post_ime_switch(shared: &crate::tsf::SharedRef) -> bool {
+    let h = shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .cand2
+        .as_ref()
+        .map(|c| c.hwnd);
+    match h {
+        Some(hwnd) => {
+            let ok = unsafe { PostMessageW(hwnd, WM_APP_IME_SWITCH, WPARAM(0), LPARAM(0)) };
+            ok.is_ok()
+        }
+        None => false,
+    }
+}
 
 /// 【动效】动画 tick 定时器 id（尺寸/位置/高亮滑动共用；FADE 为
 /// 历史名沿用）与注释展开延时定时器 id——挂在本窗消息队列，
 /// wndproc 0x113 消费。
 pub const FADE_TIMER_ID: usize = 0x4846_5550; // 'HuFZ'
 pub const EXPAND_TIMER_ID: usize = 0x4846_5551; // 'HuFa'
+/// 【六十修·切输入法看门狗】窗可见期 200ms 慢钟 id。
+pub const IME_WATCHDOG_TIMER_ID: usize = 0x4846_5553; // 'HuFc'
 /// 闪帧收尾（选重确认帧的短停留到点真隐藏）
 pub const HIDE_LATER_TIMER_ID: usize = 0x4846_5552; // 'HuFb'
 /// 【七十修·动效帧率】动画 tick 周期。原 15ms：SetTimer 实际 ~15.6ms
@@ -4761,6 +4858,196 @@ fn tick_shared_for_hwnd(hwnd: HWND) -> Option<crate::tsf::SharedRef> {
     }
 }
 /// 【动效】尺寸/位置/高亮滑动 tick：take cand2+last_show → 尺寸插值
+/// 【六十修·三层】订阅/退订全局原始键流（RIDEV_INPUTSINK：不受焦
+/// 点、不受 TSF 路由、不被切走方吞键影响——物理按键必到本 wndproc）。
+unsafe fn rawinput_listen(hwnd: HWND, on: bool) {
+    use windows::Win32::UI::Input::*;
+    let dev = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x06,
+        dwFlags: if on {
+            RIDEV_INPUTSINK
+        } else {
+            RIDEV_REMOVE
+        },
+        hwndTarget: if on {
+            hwnd
+        } else {
+            HWND(std::ptr::null_mut())
+        },
+    };
+    let r = RegisterRawInputDevices(
+        &[dev],
+        std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+    );
+    if let Err(e) = r {
+        crate::tsf::trace(&format!(
+            "rawinput {} 失败: {e}",
+            if on { "订阅" } else { "退订" }
+        ));
+    }
+}
+
+/// 【六十修·三层】原始键流热键识别：Win 按住拍 Space / Ctrl+Shift
+/// 成对（任一组合键形态）→ 候选在身即收尸。物理层，路由盲区兜底。
+unsafe fn rawinput_switch_detect(lparam: LPARAM, hwnd: HWND) {
+    use windows::Win32::UI::Input::*;
+    static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CTRL_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SHIFT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut sz = 0u32;
+    let _ = GetRawInputData(
+        HRAWINPUT(lparam.0 as *mut core::ffi::c_void),
+        RID_INPUT,
+        None,
+        &mut sz,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if sz == 0 || sz as usize > std::mem::size_of::<RAWINPUT>() {
+        return;
+    }
+    let mut buf = RAWINPUT::default();
+    let got = GetRawInputData(
+        HRAWINPUT(lparam.0 as *mut core::ffi::c_void),
+        RID_INPUT,
+        Some(&mut buf as *mut RAWINPUT as *mut core::ffi::c_void),
+        &mut sz,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if got == u32::MAX || got == 0 {
+        return;
+    }
+    if buf.header.dwType != RIM_TYPEKEYBOARD.0 as u32 {
+        return;
+    }
+    let kb = buf.data.keyboard;
+    let vk = kb.VKey;
+    let is_up = (kb.Flags & RI_KEY_BREAK as u16) != 0;
+    match vk {
+        0x5B | 0x5C => {
+            WIN_DOWN.store(!is_up, Relaxed);
+            return;
+        }
+        0x11 => {
+            CTRL_DOWN.store(!is_up, Relaxed);
+        }
+        0x10 => {
+            SHIFT_DOWN.store(!is_up, Relaxed);
+        }
+        _ => {}
+    }
+    let fire = (vk == 0x20 && WIN_DOWN.load(Relaxed))
+        || (vk == 0x10 && CTRL_DOWN.load(Relaxed))
+        || (vk == 0x11 && SHIFT_DOWN.load(Relaxed));
+    if !fire || is_up {
+        return;
+    }
+    if !IsWindowVisible(hwnd).as_bool() {
+        return;
+    }
+    let shared = if crate::tsf::addword_tl_thread() {
+        match crate::tsf::tl_shared() {
+            Some(s) => s,
+            None => return,
+        }
+    } else {
+        match tick_shared_for_hwnd(hwnd) {
+            Some(s) => s,
+            None => return,
+        }
+    };
+    let in_use = {
+        let g = shared.lock().unwrap_or_else(|p| p.into_inner());
+        g.composition.is_some() || g.composing || !g.raw_last.is_empty()
+    };
+    if !in_use {
+        return;
+    }
+    crate::tsf::trace(&format!(
+        "rawinput: 切换热键现形(vk=0x{vk:X}) → 收尸（物理层，转消息泵）"
+    ));
+    if !post_ime_switch(&shared) {
+        crate::tsf::ime_switch_abort(&shared);
+    }
+}
+
+/// 【六十修·切输入法候选残留看门狗】四十五修挂的
+/// ITfActiveLanguageProfileNotifySink 只收得见「切回我们」的事件（全
+/// 量 trace 实锤：零外源 clsid 事件）——Win+Space 现代切换器切走时不
+/// 广播给该 sink，ISV 版 ITfInputProcessorProfileActivationSink 又被
+/// AdviseSingleSink 恒拒（0x80040202），事件驱动整条路是盲的；组段存
+/// 续期间 TSF 又不调 Deactivate → QQ/32 位应用/资源管理器搜索里
+/// Win+Space 切走后候选窗永留（用户实测三宿主一致）。
+/// 本钟（候选窗可见期 200ms，wndproc 天然在窗口创建线程=TSF 线程）
+/// 轮询 ITfKeystrokeMgr::GetForeground：非我们且窗仍在屏 → 复用
+/// ime_switch_abort（冲销组段+收窗+引擎会话清零）。不依赖任何事件，
+/// 切法无关（Win+Space/鼠标语言栏/触屏）；事件序上 GetForeground 的
+/// 翻转滞后由周期重查吸收（最坏多等一拍）。
+unsafe fn ime_watchdog_tick(hwnd: HWND) {
+    use windows::Win32::UI::TextServices::ITfKeystrokeMgr;
+    if !IsWindowVisible(hwnd).as_bool() {
+        // 窗已不可见（竞态：藏窗消息在途）——杀钟免空转
+        let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+        return;
+    }
+    // 线程归属路由：小窗线程走 TL 登记，否则按 hwnd 定 Shared
+    //（四十六修多标签宿主同款）
+    let shared = if crate::tsf::addword_tl_thread() {
+        match crate::tsf::tl_shared() {
+            Some(s) => s,
+            None => return,
+        }
+    } else {
+        match tick_shared_for_hwnd(hwnd) {
+            Some(s) => s,
+            None => return,
+        }
+    };
+    let tm = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .thread_mgr
+        .clone();
+    let Some(tm) = tm else { return };
+    let Ok(km) = tm.cast::<ITfKeystrokeMgr>() else { return };
+    let Ok(fg) = (unsafe { km.GetForeground() }) else { return };
+    // 【六十修·诊断轮】节流 2s/次落一行（fg+HKL+可见态）——定位残留
+    // 态下 GetForeground 是否翻转（若恒报我们=轮询信号失效，需换源）。
+    {
+        static LAST: std::sync::Mutex<(u64, [u32; 4])> = std::sync::Mutex::new((0, [0; 4]));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let cur = [fg.data1, fg.data2 as u32, fg.data3 as u32, fg.data4[0] as u32];
+        if crate::tsf::trace_on() && (now_ms.saturating_sub(last.0) > 2000 || cur != last.1) {
+            let hkl = unsafe {
+                let tid = GetWindowThreadProcessId(hwnd, None);
+                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(tid)
+            };
+            crate::tsf::trace(&format!(
+                "watchdog tick fg={fg:?} hkl={:x} vis={}",
+                hkl.0 as u64,
+                IsWindowVisible(hwnd).as_bool()
+            ));
+            *last = (now_ms, cur);
+        }
+    }
+    if fg == crate::CLSID_HUFU_TSF {
+        return;
+    }
+    crate::tsf::trace(&format!(
+        "watchdog: 前景 TIP 已易主({fg:?}) → 冲销+收窗（事件盲区兜底，转消息泵）"
+    ));
+    if !post_ime_switch(&shared) {
+        crate::tsf::ime_switch_abort(&shared);
+    }
+    // ime_switch_abort 内部走 ClearComp→藏窗消息，钟由藏窗执行点杀
+}
+
+
 /// 步进（整帧复渲染外壳）→ 位置插值步进（只 SWP 不重绘——内容按
 /// 目标布局早已在缓冲）→ 高亮滑动复渲染 → 放回。全部结束 KillTimer。
 unsafe fn fade_tick_shared(hwnd: HWND) {

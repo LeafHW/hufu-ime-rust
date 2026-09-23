@@ -168,6 +168,11 @@ pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub client_id: u32,
     pub composition: Option<ITfComposition>,
+    /// 【六十修·熔断】Deactivate 后= true 直到下一次 Activate：期间
+    /// 一切渲染入口（update_ui/轮询/焦点回放/迟到的引擎应答）一律
+    /// 早退——切走后迟到的「上屏暂留帧」曾把刚藏掉的候选窗复活
+    ///（trace 实锤：藏窗落地后 171ms 两次 show[入] raw=''）。
+    pub ime_dead: bool,
     /// v2（DComp+Acrylic）初始化失败 → 回退 v1
     pub cand2: Option<CandidateWindowV2>,
     pub cand2_dead: bool,
@@ -455,6 +460,7 @@ impl Shared {
             composition: None,
             cand2: None,
             cand2_dead: false,
+            ime_dead: false,
             cand2_busy: false,
             pending_cand_hide: false,
             cand_ui: None,
@@ -695,6 +701,38 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                     }
                 }
             }
+            // 【六十修·四层】Activate 无条件扫尸：切回虎符=全新状态。
+            // 切换期间各层若全失手（键路/前景钟/物理键流），残留的候
+            // 选窗与僵尸编码（raw/composing）在此一并清零——用户口
+            // 径：切走=虎符挂起，切回=正常使用（不是僵尸组段续命）。
+            {
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                // 【六十修·熔断解除】重新激活：渲染路复活
+                g.ime_dead = false;
+                let dirty = g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false)
+                    || g.composition.is_some()
+                    || g.composing
+                    || !g.raw_last.is_empty();
+                if dirty {
+                    crate::tsf::trace("activate: 无条件扫尸——残留清零（四层兜底）");
+                    g.composition = None;
+                    g.composing = false;
+                    g.raw_last.clear();
+                    g.preedit_last.clear();
+                    g.stale_raw.clear();
+                    g.stale_raw_until = None;
+                    g.caret = None;
+                    g.last_show = None;
+                    g.cand_sig_last = String::new();
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.hide_now();
+                        c.focus_reset();
+                    }
+                    // 【六十修·一刀】扫尸也广播：切回来瞬间屏上任何残影
+                    // （任何历史窗）全部清掉。
+                    crate::candwin2::hide_all_cand_windows();
+                }
+            }
             // 【四十五修·切输入法收窗 2026-10-29】语言档案激活通知：
             // 组段存续期间切走输入法，TSF 不调 Deactivate（实测候选窗
             // 停留原地不消失）。挂 ITfActiveLanguageProfileNotifySink 于
@@ -798,6 +836,12 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
+        // 【六十修】引擎侧会话一并清零（与 ime_switch_abort 同款）：
+        // 本地 raw 清了但引擎还留着的话，切回虎符后下个键会把旧组
+        // 段接回去（QQ 实测「残留编码继续用」的根子）。
+        std::thread::spawn(|| {
+            let _ = crate::ipc::call(&serde_json::json!({ "op": "focus" }));
+        });
         let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         // compartment 监听摘除（语言栏项同理，各自对称）
         crate::langbar::uninstall_compartments();
@@ -837,6 +881,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         } else if g.cand2_busy {
             g.pending_cand_hide = true;
         }
+        // 【六十修·一刀】Deactivate 同款广播清场：漏窗/暂留窗一并杀，
+        // 切输入法后屏上不许有任何虎符候选残影。
+        crate::candwin2::hide_all_cand_windows();
         // 【回归病根】ctfmon 重启等场景进程内本实例会被再次 Activate：
         // cand2_dead 若不清，重激活后所有显示分支被跳过、落入 v1 隐身窗
         // → 搜索框候选彻底消失（实测 notes 只有老会话记录）
@@ -861,6 +908,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         g.cand_ui = None;
         g.cand_ui_active = false;
         g.cand_ui_host_draws = false;
+        // 【六十修·熔断】失活到下次 Activate：迟到的渲染（轮询/上屏
+        // 暂留帧/引擎应答）一律早退——藏掉的窗不再被复活。
+        g.ime_dead = true;
         g.thread_mgr = None;
         g.client_id = 0;
         Ok(())
@@ -1057,7 +1107,8 @@ impl windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink_Impl
 
 /// 切输入法冲销：文档侧空清段（不落字母）+ 本地状态清零 + 收窗 +
 /// 引擎会话清零（fire-and-forget，与焦点清理同款不阻塞回调）。
-fn ime_switch_abort(shared: &SharedRef) {
+/// 【六十修】pub(crate)：候选窗看门狗（Win+Space 事件盲区兜底）复用。
+pub(crate) fn ime_switch_abort(shared: &SharedRef) {
     // 1) 文档侧：组段文本置空并结束（当前焦点 ctx）
     let ctx = shared
         .lock()
@@ -1092,6 +1143,9 @@ fn ime_switch_abort(shared: &SharedRef) {
         c.hide_now();
         c.focus_reset();
     }
+    // 【六十修·一刀】不赌单窗：进程内所有候选窗（漏窗/暂留窗/让渡
+    // 窗）广播级清场。
+    crate::candwin2::hide_all_cand_windows();
     if g.cand_ui_active {
         let host_draws = g.cand_ui_host_draws;
         let ui_id = g.cand_ui_id;
@@ -1797,6 +1851,49 @@ impl HuFuTs_Impl {
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
+        // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
+        // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
+        // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
+        // 但热键本身必经本 dispatch（实测 Win+Space 四连拍全到，vk 或
+        // 有失真、GetKeyState 不失真）。候选/组段在身时按下切换热键
+        // =必然切走 → 立即冲销+收窗（微软拼音同款观感：热键即收）。
+        // Ctrl+Shift+V 剪贴板不受影响（那是第三键 0x56 的组合，此处只
+        // 认「成对修饰键落下」与「Win 按住拍 Space」）。
+        unsafe {
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            let win = GetKeyState(VK_LWIN.0 as i32) < 0 || GetKeyState(VK_RWIN.0 as i32) < 0;
+            if win && wparam != 0x5B && wparam != 0x5C && wparam != 0x0 {
+                // 诊断：Win 按住期间的任何键（定位注入/真机的 vk 形态差）
+                crate::tsf::trace(&format!(
+                    "keyswitch diag: win按住 vk=0x{wparam:X} space? {}",
+                    wparam == 0x20
+                ));
+            }
+            let is_switch_hotkey = (win && (wparam == 0x20 || wparam == 0x0))
+                || (ctrl && shift && (wparam == 0x10 || wparam == 0x11));
+            if is_switch_hotkey {
+                let (in_use, has_win) = {
+                    let g = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        g.composition.is_some()
+                            || g.composing
+                            || !g.raw_last.is_empty()
+                            || g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false),
+                        g.cand2.is_some(),
+                    )
+                };
+                let _ = has_win;
+                if in_use {
+                    crate::tsf::trace(&format!(
+                        "keyswitch: 切换热键在身 → 冲销（win={win} ctrl={ctrl} shift={shift} vk=0x{wparam:X}，转消息泵）"
+                    ));
+                    if !crate::candwin2::post_ime_switch(&self.shared) {
+                        ime_switch_abort(&self.shared);
+                    }
+                }
+            }
+        }
         // Ctrl+Shift+V：剪贴板上屏（配置+白名单由 server 判定）
         if wparam == 0x56 {
             unsafe {
@@ -3868,6 +3965,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 本就不该有组段活动（键全被直通门放行），commit 为空即无操作。
     if crate::addword::is_open() && !crate::addword::in_window_thread() {
         trace("update_ui: 主线程·小窗期间——终极门拦截");
+        return Ok(());
+    }
+    // 【六十修·熔断】失活窗口期（切走后到下次 Activate 前）：任何来源
+    // 的渲染请求（停顿轮询/上屏暂留帧/迟到引擎应答/焦点回放）一律
+    // 早退——trace 实锤：藏窗落地后 171ms 的 raw='' 暂留帧把候选窗
+    // 复活成「切输入法残留」。
+    if shared.lock().unwrap_or_else(|e| e.into_inner()).ime_dead {
+        trace("update_ui: 失活熔断——丢弃渲染（切输入法窗口期）");
         return Ok(());
     }
     // 停顿期轮询武装（幂等；进程内一次）+ 记录本次展示签名
