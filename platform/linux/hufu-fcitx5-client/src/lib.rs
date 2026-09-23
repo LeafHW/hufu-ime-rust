@@ -80,6 +80,16 @@ pub fn default_socket_path() -> PathBuf {
         .join("hufu-ime.sock")
 }
 
+/// `{"enabled": bool}` 回包 → 1/0；回包缺失或字段不是 bool → -1（未知）。
+/// 音效读态/取反共用（引擎不在线时调用方拿到 -1，宿主保持现状）。
+fn enabled_flag(resp: Option<serde_json::Value>) -> i32 {
+    match resp.and_then(|v| v.get("enabled").and_then(|x| x.as_bool())) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    }
+}
+
 /// JSON 深合并：对象递归合并，其余类型整体覆盖（配置补丁用）。
 fn merge_json(dst: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (serde_json::Value::Object(d), serde_json::Value::Object(p)) = (&mut *dst, patch) {
@@ -203,6 +213,33 @@ impl HufuClient {
         self.call(&serde_json::json!({"op": "ping"}))
             .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// 托盘「重载码表」：当前方案原样重载（改码表/补充语料/符号表后免重启
+    /// server 生效，与 Windows 语言栏同款 op）；1=成功，0=失败（含引擎不在线）。
+    pub fn reload_schema(&mut self) -> bool {
+        self.call(&serde_json::json!({"op": "reload_schema"}))
+            .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// 托盘「打开方案文件夹」：请引擎打开当前方案码表目录（文件管理器由
+    /// server 侧拉起）；1=成功，0=失败（含引擎不在线、方案目录不存在）。
+    pub fn open_schema_dir(&mut self) -> bool {
+        self.call(&serde_json::json!({"op": "open_schema_dir"}))
+            .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
+    /// （1=开 / 0=关 / -1=未知——引擎不在线或回包异常）。
+    pub fn sound_toggle(&mut self) -> i32 {
+        enabled_flag(self.call(&serde_json::json!({"op": "sound_toggle"})))
+    }
+
+    /// 托盘「按键音效」勾选态：1=开 / 0=关 / -1=未知（引擎不在线或回包异常）。
+    pub fn sound_state(&mut self) -> i32 {
+        enabled_flag(self.call(&serde_json::json!({"op": "sound_state"})))
     }
 
     /// 拉取引擎配置快照（fcitx5 设置页打开时调用）。
@@ -519,6 +556,50 @@ pub extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int 
     } else {
         0
     }
+}
+
+/// 托盘「重载码表」：当前方案原样重载；1=成功（0=失败/引擎不在线，宿主保持现状）。
+#[no_mangle]
+pub extern "C" fn hufu_client_reload_schema(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.reload_schema() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 托盘「打开方案文件夹」：请引擎打开当前方案码表目录；1=成功（0=失败/引擎不在线）。
+#[no_mangle]
+pub extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.open_schema_dir() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 托盘「按键音效」：引擎侧取反并落盘；返回新态（1=开 / 0=关 / -1=未知）。
+#[no_mangle]
+pub extern "C" fn hufu_client_sound_toggle(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return -1;
+    }
+    unsafe { &mut *c }.sound_toggle()
+}
+
+/// 托盘「按键音效」勾选态：1=开 / 0=关 / -1=未知（引擎不在线）。
+#[no_mangle]
+pub extern "C" fn hufu_client_sound_state(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return -1;
+    }
+    unsafe { &mut *c }.sound_state()
 }
 
 /// 拉取引擎配置（fcitx5 设置页打开时调用）：1=成功。
@@ -1010,5 +1091,73 @@ mod tests {
         assert_eq!(cap.updates[0].1, "");
         assert!(cap.updates[0].2.is_empty());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn reload_schema_and_open_dir_requests() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("menu-ops");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"ok": true, "current": "虎整句"}),
+                serde_json::json!({"ok": true, "path": "/home/u/.local/share/hufu/码表/虎整句"}),
+                serde_json::json!({"ok": false, "path": "/不存在"}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.reload_schema(), "重载码表：引擎回 ok=true 即成功");
+        assert!(c.open_schema_dir(), "打开方案文件夹：ok=true 即成功");
+        assert!(!c.open_schema_dir(), "ok=false（方案目录不存在）按失败处理");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0]["op"], "reload_schema");
+        assert_eq!(reqs[1]["op"], "open_schema_dir");
+        assert_eq!(reqs[2]["op"], "open_schema_dir");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn sound_toggle_and_state() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("sound");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"enabled": false, "volume": 50}),
+                serde_json::json!({"enabled": true}),
+                serde_json::json!({"enabled": true, "volume": 50}),
+                serde_json::json!({}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert_eq!(c.sound_state(), 0, "默认关");
+        assert_eq!(c.sound_toggle(), 1, "取反返回新态（开）");
+        assert_eq!(c.sound_state(), 1, "再读=开");
+        assert_eq!(c.sound_state(), -1, "回包缺 enabled 字段=未知");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 4);
+        assert_eq!(reqs[0]["op"], "sound_state");
+        assert_eq!(reqs[1]["op"], "sound_toggle");
+        assert_eq!(reqs[2]["op"], "sound_state");
+        assert_eq!(reqs[3]["op"], "sound_state");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn menu_ops_offline_semantics() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("menu-offline");
+        let mut c = client_for(path, cap_ptr);
+        // 引擎不在线：动作类（1/0）回 0，状态类回 -1（未知）——宿主保持现状、不崩。
+        assert!(!c.reload_schema());
+        assert!(!c.open_schema_dir());
+        assert_eq!(c.sound_toggle(), -1);
+        assert_eq!(c.sound_state(), -1);
     }
 }

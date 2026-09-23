@@ -78,6 +78,24 @@ int32_t hufu_client_config_int(const hufu_client *client, const char *path,
 
 /* 配置读取字符串：NUL 结尾（空串=未知；下次调用前有效）。 */
 const char *hufu_client_config_str(hufu_client *client, const char *path);
+
+/* ── 状态区菜单动作（fcitx5 托盘「虎符」子菜单用；Windows 前端不使用）────── */
+
+/* 「重载码表」：当前方案原样重载（改码表/补充语料后免重启 server 生效）：
+ * 1=成功，0=失败（引擎不在线、方案缺失等；宿主保持现状）。 */
+int32_t hufu_client_reload_schema(hufu_client *client);
+
+/* 「打开方案文件夹」：请引擎打开当前方案码表目录：
+ * 1=成功，0=失败（引擎不在线、方案目录不存在）。 */
+int32_t hufu_client_open_schema_dir(hufu_client *client);
+
+/* 「按键音效」开关：引擎侧取反并落盘（热生效）：1=开，0=关，
+ * -1=未知（引擎不在线或回包异常）——宿主据此保持原勾选态。 */
+int32_t hufu_client_sound_toggle(hufu_client *client);
+
+/* 「按键音效」当前态（勾选态显示用）：1=开，0=关，-1=未知（引擎不在线）。 */
+int32_t hufu_client_sound_state(hufu_client *client);
+
 /* 焦点切换：清会话与文章尾巴（保留中英态）。 */
 void hufu_client_focus(hufu_client *client);
 
