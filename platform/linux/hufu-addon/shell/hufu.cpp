@@ -26,13 +26,16 @@
 #include <fcitx-config/iniparser.h>
 #include <fcitx-config/option.h>
 #include <fcitx-utils/capabilityflags.h>
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/trackableobject.h>
+#include <fcitx-utils/utf8.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -134,6 +137,90 @@ std::string jesc(const std::string &s) {
 }
 
 inline const char *jbool(bool v) { return v ? "true" : "false"; }
+
+/// 字反查数据根目录：`${XDG_DATA_HOME:-$HOME/.local/share}/hufu`（与 install.sh 同一口径）。
+/// `XDG_DATA_HOME` 与 `HOME` 都拿不到时返回空串——调用方按「数据不可用」处理，
+/// 不臆造一个相对路径去碰运气。
+std::string hufuRootDir() {
+    std::string base;
+    if (const char *xdg = std::getenv("XDG_DATA_HOME");
+        xdg != nullptr && *xdg != '\0') {
+        base = xdg;
+    } else if (const char *home = std::getenv("HOME");
+               home != nullptr && *home != '\0') {
+        base = std::string(home) + "/.local/share";
+    }
+    if (base.empty()) {
+        return {};
+    }
+    return base + "/hufu";
+}
+
+/// 是否汉字（字反查只认汉字：光标左侧是空白/标点/拉丁字母时不出提示）。
+/// 覆盖基本区、扩展 A、兼容表意文字与扩展 B 及以上（增补平面）。
+bool isHanCodePoint(uint32_t c) {
+    return (c >= 0x3400 && c <= 0x4dbf) || // 扩展 A
+           (c >= 0x4e00 && c <= 0x9fff) || // 基本区
+           (c >= 0xf900 && c <= 0xfaff) || // 兼容表意文字
+           (c >= 0x20000 && c <= 0x3ffff); // 扩展 B–G（增补平面）
+}
+
+/// 按键「实际产生的字符」（触发键归一用；0 = 该键不产字符，如功能键/独立修饰键）。
+///
+/// `~` 在物理键盘上是 Shift+`` ` ``：前端可能上报该 level 的 keysym（`asciitilde`），
+/// 也可能原样上报 `grave`+Shift——两者都归一为 `~`，与配置里「无修饰的 `~`」同形。
+/// 因此触发键比对只看字符与 Ctrl/Alt/Super，Shift 交给这里的字符归一。
+char triggerCharOf(const fcitx::Key &key) {
+    const uint32_t u = fcitx::Key::keySymToUnicode(key.sym());
+    if (u == 0 || u > 0x7f) {
+        return 0;
+    }
+    if (u == '`' && key.states().test(fcitx::KeyState::Shift)) {
+        return '~';
+    }
+    return static_cast<char>(u);
+}
+
+/// 字反查武装期间「不消费」的光标移动键（Left / Right / Home / End）。
+///
+/// 有意选择：这些键**不消费**，交回 fcitx5 转发给应用（应用光标照常移动），
+/// 查找结果由 30ms 量级的延迟重查异步跟随，用户感知为实时。
+/// 若日后要改成「消费方向键、移动一个虚拟查找光标」，改这里（不再让 `keyEvent` 早退）
+/// 与 `scheduleCharLookupRefresh` 的调用点：把移动量记在该输入上下文的
+/// `HufuUiState` 上，重查时按「光标位置 + 移动量」取字即可。
+bool isCharLookupMoveKey(const fcitx::Key &key) {
+    switch (key.sym()) {
+    case FcitxKey_Left:
+    case FcitxKey_Right:
+    case FcitxKey_Home:
+    case FcitxKey_End:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// 字反查延迟重查的间隔（微秒）：方向键交给应用后，等应用把光标移到位再读
+/// `surroundingText()`；30ms 量级在用户感知上等同实时，又不至于一个按键一次查询。
+constexpr uint64_t kCharLookupRefreshUsec = 30 * 1000;
+
+/// 按 TAB 切列（`hufu_client_char_lookup` 的结果串是「拼音\t虎码[\t拆分]」）。
+std::vector<std::string> splitTabs(const std::string &s) {
+    std::vector<std::string> out;
+    if (s.empty()) {
+        return out;
+    }
+    size_t start = 0;
+    while (true) {
+        const size_t tab = s.find('\t', start);
+        if (tab == std::string::npos) {
+            out.push_back(s.substr(start));
+            return out;
+        }
+        out.push_back(s.substr(start, tab - start));
+        start = tab + 1;
+    }
+}
 
 /// 本 addon 的配置文件（相对 fcitx5 的 `PkgConfig` 目录，即 `~/.config/fcitx5/`）：
 /// 构造时 `fcitx::readAsIni` 读入，状态菜单里的宿主开关用 `fcitx::safeSaveAsIni`
@@ -374,6 +461,28 @@ FCITX_CONFIGURATION(
         .defaultValue = "-=",
         .annotation{"字符序列，前半上翻、后半下翻（默认 -=）。"}}};);
 
+/// 快捷键（宿主项）：键都在本层匹配，只存 `~/.config/fcitx5/conf/hufu.conf`，不进引擎配置。
+///
+/// 「字反查」按**无修饰的 keysym** 声明（`~` = `asciitilde`）：`~` 物理上是 Shift+`` ` ``，
+/// 前端上报的是该 level 的 keysym，fcitx5 对「本身就产字符」的键会去掉 Shift，
+/// 故配置态与真实按键同为无修饰形态（匹配时另做 `grave`+Shift 的兼容，见
+/// `HufuEngine::charLookupTriggered`）。`AllowModifierLess` 允许无修饰键被保存。
+FCITX_CONFIGURATION(
+    HufuHotkeyConfig,
+    fcitx::Option<fcitx::Key, fcitx::KeyConstrain,
+                  fcitx::DefaultMarshaller<fcitx::Key>, fcitx::ToolTipAnnotation>
+        charLookup{{
+            .parent = this,
+            .path{"CharLookupKey"},
+            .description{"字反查"},
+            .defaultValue =
+                fcitx::Key(FcitxKey_asciitilde, fcitx::KeyState::NoState),
+            .constrain =
+                fcitx::KeyConstrain(fcitx::KeyConstrainFlag::AllowModifierLess),
+            .annotation{"显示光标左侧一个汉字的拼音（上排）与虎码（下排，"
+                        "有拆分数据时附在虎码后），需应用支持周边文本；"
+                        "触发键本身不再作为普通字符输入，清空即关闭本功能。"}}};);
+
 FCITX_CONFIGURATION(
     HufuConfig,
     fcitx::Option<HufuBehaviorConfig> behavior{this, "Behavior", "行为"};
@@ -382,7 +491,8 @@ FCITX_CONFIGURATION(
     fcitx::Option<HufuSentenceConfig> sentence{this, "Sentence", "整句"};
     fcitx::Option<HufuReverseConfig> reverse{this, "Reverse", "反查"};
     fcitx::Option<HufuSoundConfig> sound{this, "Sound", "音效"};
-    fcitx::Option<HufuKeysConfig> keys{this, "Keys", "选重与翻页"};);
+    fcitx::Option<HufuKeysConfig> keys{this, "Keys", "选重与翻页"};
+    fcitx::Option<HufuHotkeyConfig> hotkeys{this, "Hotkey", "快捷键"};);
 
 /// 最近一次 UI 快照（面板预编辑 / 候选与注释 / 高亮 / 辅助文本 / 中英态）。
 ///
@@ -405,14 +515,32 @@ struct HufuUiSnapshot {
     bool chinese = true;
 };
 
-/// 每输入上下文属性（fcitx5 `InputContextProperty`）：只存宿主侧 UI 快照。
+/// 宿主侧字反查视图：显示态 + 两排文案（随输入上下文存活）。
+///
+/// 记在 UI 快照属性里，是为了让 `render` 保持**唯一**的输入面板写入口：引擎下一次
+/// update 也走 render，若两排只写在面板上而不记在这里，重放路径会把上排换回引擎 aux、
+/// 下排却留在面板上。
+struct HufuCharLookupView {
+    bool shown = false;
+    std::string up;
+    std::string down;
+};
+
+/// 每输入上下文属性（fcitx5 `InputContextProperty`）：只存宿主侧 UI 快照与字反查视图。
 /// 引擎侧不建会话（见 `HufuUiSnapshot`），故本类不持任何引擎指针、析构也不回调引擎。
 class HufuUiState : public fcitx::InputContextProperty {
 public:
     HufuUiSnapshot &snapshot() { return snapshot_; }
+    HufuCharLookupView &charLookup() { return charLookup_; }
+    /// 字反查「已武装」：触发键按下后保持，按方向键移动光标时结果跟随更新；
+    /// Esc / 其它按键 / 失焦 / 切换输入法撤防（见 `HufuEngine::keyEvent` 与
+    /// `resetSession`）。武装态随输入上下文存活，不跨输入上下文共享。
+    bool &charLookupArmed() { return charLookupArmed_; }
 
 private:
     HufuUiSnapshot snapshot_;
+    HufuCharLookupView charLookup_;
+    bool charLookupArmed_ = false;
 };
 
 /// 状态菜单里的普通动作（「重载码表」「打开方案文件夹」）与信息行（「引擎状态」）：
@@ -547,6 +675,8 @@ public:
         // 真机核对顺序：`fcitx5 -r --verbose='hufu=5'` 前台运行后退出，确认本行日志
         // 之后没有针对已卸载 addon 的状态区访问。
         HUFU_DEBUG() << "hufu: ~HufuEngine";
+        // 0) 撤掉待处理的字反查重查：定时器归本对象所有，晚了就是悬垂回调。
+        cancelCharLookupRefresh();
         uiStateFactory_.unregister();
         clearStatusAreas();
         if (engine_ != nullptr) {
@@ -561,12 +691,37 @@ public:
             return; // 引擎只处理按下
         }
         fcitx::InputContext *inputContext = keyEvent.inputContext();
+        const fcitx::Key &raw = keyEvent.rawKey();
+        HufuUiState *state = uiState(inputContext);
+        // 【字反查·武装期间】Left/Right/Home/End **不消费**：交回 fcitx5 转发给应用
+        //（应用光标照常移动，见 `isCharLookupMoveKey` 的取舍说明），随后安排一次
+        // 很短的延迟重查，按新光标位置更新两排——用户感知为「边移动边反查」。
+        if (state != nullptr && state->charLookupArmed() && isCharLookupMoveKey(raw)) {
+            scheduleCharLookupRefresh(inputContext);
+            return;
+        }
+        if (charLookupTriggered(raw)) {
+            // 触发键优先于引擎：命中即消费（触发键不再作为普通字符输入）。
+            // 触发后**保持武装**：再按一次等于按当前光标位置刷新。
+            triggerCharLookup(inputContext);
+            keyEvent.filterAndAccept();
+            return;
+        }
+        // 武装期间按 Esc：撤防 + 清两排并消费该键（撤防是显式动作，不落到应用）。
+        if (state != nullptr && state->charLookupArmed() &&
+            raw.sym() == FcitxKey_Escape) {
+            disarmCharLookup(inputContext);
+            keyEvent.filterAndAccept();
+            return;
+        }
+        // 其余按键：撤防 + 清两排，随后照既有流程处理该键（不吞键）。
+        disarmCharLookup(inputContext);
         // 【Shift 修饰修复 2026-09-19】`key()` 是「归一化」事件：Shift+符号
         // 时 Shift 被并入符号本身（states 里不再有 Shift），引擎会当成
         // 「无 shift 的普通键」——实测 Shift+, 出「，」而非《、Shift+字母
         // 被当编码。`rawKey()` 是布局转换后、保留真实修饰态的原始事件
         //（日志实测：Shift+a → Key(A states=0) / rawKey Key(Shift+A states=1)）。
-        const fcitx::Key &key = keyEvent.rawKey();
+        const fcitx::Key &key = raw;
         const std::string name = keyNameOf(key);
         if (name.empty()) {
             return; // 不归本引擎：透传
@@ -644,6 +799,9 @@ public:
 private:
     /// 清引擎会话 + UI（activate/deactivate/reset 共用）。
     void resetSession(fcitx::InputContextEvent &event) {
+        // 失焦 / 切换输入法 / 重置：撤防字反查并收掉两排（本层视图清掉后，引擎 focus
+        // 的 update 会照快照重画面板，不会把旧的两排留在屏幕上）。
+        disarmCharLookup(event.inputContext());
         context_ = event.inputContext();
         hufu_client_focus(engine_); // 清会话与文章尾巴，保留中英态
         context_ = nullptr;
@@ -786,10 +944,15 @@ private:
     }
 
     /// 「重载码表」：失败只记日志并保持现状（引擎不在线时菜单项不该有任何副作用）。
+    ///
+    /// 成功后把字反查索引标为「未装载」：码表/注释文件可能刚被换掉，下一次触发热键
+    /// 会按同一数据目录重新读取（索引是只读快照，不重新读就会一直用旧数据）。
     void reloadSchema() {
         if (engine_ == nullptr || hufu_client_reload_schema(engine_) != 1) {
             FCITX_LOGC(hufuLog, Warn) << "hufu: 重载码表失败（hufu-server 在跑吗）";
+            return;
         }
+        charLookupState_ = 0;
     }
 
     /// 「打开方案文件夹」：同上；文件管理器由引擎侧拉起，本层不碰路径。
@@ -839,7 +1002,7 @@ private:
                      << config_.behavior->panelPreedit.value();
         if (HufuUiState *state = uiState(inputContext);
             state != nullptr && state->snapshot().valid) {
-            render(inputContext, state->snapshot());
+            render(inputContext, state->snapshot(), state->charLookup());
         }
         if (inputContext != nullptr && panelPreeditAction_ != nullptr) {
             panelPreeditAction_->update(inputContext);
@@ -853,6 +1016,219 @@ private:
             return nullptr;
         }
         return inputContext->propertyFor(&uiStateFactory_);
+    }
+
+    /// 字反查触发键命中判定（宿主项，默认 `~`；设置页清空该项即关闭本功能）。
+    ///
+    /// 产字符的键按「实际产生的字符」比对：`~` 物理上是 Shift+`` ` ``，前端可能上报
+    /// `asciitilde`，也可能原样上报 `grave`+Shift，两个形态都算命中（Shift 交由
+    /// `triggerCharOf` 归一）；不产字符的键（功能键等）按 keysym 比对。Ctrl/Alt/Super
+    /// 必须与配置一致，Shift 不参与比对（已由字符归一表达）。
+    bool charLookupTriggered(const fcitx::Key &pressed) const {
+        const fcitx::Key &configured = config_.hotkeys->charLookup.value();
+        if (configured.sym() == FcitxKey_None) {
+            return false; // 未绑定（清空）
+        }
+        const fcitx::KeyStates kModMask = fcitx::KeyStates(fcitx::KeyState::Ctrl) |
+                                          fcitx::KeyState::Alt |
+                                          fcitx::KeyState::Super;
+        if ((pressed.states() & kModMask).toInteger() !=
+            (configured.states() & kModMask).toInteger()) {
+            return false;
+        }
+        const char want = triggerCharOf(configured);
+        if (want == 0) {
+            return pressed.sym() == configured.sym();
+        }
+        return triggerCharOf(pressed) == want;
+    }
+
+    /// 装载字反查索引：**首次触发才装载**（不在构造期读文件/解析词典），
+    /// 装载失败只记一次 Warn 并静默关闭本功能（不重试——数据是安装期产物，
+    /// 反复重扫只会刷日志）。
+    bool ensureCharLookup() {
+        if (charLookupState_ != 0) {
+            return charLookupState_ == 1;
+        }
+        const std::string root = hufuRootDir();
+        if (engine_ == nullptr) {
+            charLookupState_ = -1;
+            FCITX_LOGC(hufuLog, Warn) << "hufu: 字反查数据不可用（客户端未创建）";
+        } else if (root.empty()) {
+            charLookupState_ = -1;
+            FCITX_LOGC(hufuLog, Warn)
+                << "hufu: 字反查数据不可用（XDG_DATA_HOME 与 HOME 皆未设置）";
+        } else if (hufu_client_char_lookup_init(engine_, root.c_str()) != 1) {
+            charLookupState_ = -1;
+            FCITX_LOGC(hufuLog, Warn)
+                << "hufu: 字反查数据不可用（" << root
+                << " 下缺 数据/注释/拼音.注释 与 码表/虎码单字/tiger.dict.yaml）";
+        } else {
+            charLookupState_ = 1;
+            HUFU_DEBUG() << "hufu: 字反查索引已装载（" << root << "）";
+        }
+        return charLookupState_ == 1;
+    }
+
+    /// 触发键按下：**武装** + 按当前光标位置查询并显示两排。
+    ///
+    /// 触发键在 `keyEvent` 里已被消费；这里只在**能查**时武装——数据不可用或应用
+    /// 不支持周边文本都不武装（那两种情况下方向键重查也不会有结果，各记一条 Debug，
+    /// 与既有的静默降级一致）。光标左侧不是汉字时清两排但**保持武装**：用户多半正是
+    /// 要用方向键移到一个字上。
+    void triggerCharLookup(fcitx::InputContext *inputContext) {
+        HufuUiState *state = uiState(inputContext);
+        if (inputContext == nullptr || state == nullptr) {
+            return;
+        }
+        if (!ensureCharLookup()) {
+            HUFU_DEBUG() << "hufu: 字反查跳过（数据不可用）";
+            return;
+        }
+        if (!inputContext->capabilityFlags().test(
+                fcitx::CapabilityFlag::SurroundingText)) {
+            HUFU_DEBUG() << "hufu: 字反查跳过（应用不支持周边文本）";
+            return;
+        }
+        state->charLookupArmed() = true;
+        refreshCharLookup(inputContext);
+    }
+
+    /// 按**当前**光标位置重查并更新两排（触发键与武装期间的延迟重查共用）。
+    /// 周边文本不可用或左侧不是汉字：清两排，但保持武装。
+    void refreshCharLookup(fcitx::InputContext *inputContext) {
+        HufuUiState *state = uiState(inputContext);
+        if (state == nullptr || !state->charLookupArmed()) {
+            return;
+        }
+        uint32_t ucs4 = fcitx::utf8::INVALID_CHAR;
+        if (!charLeftOfCursor(inputContext, ucs4)) {
+            hideCharLookup(inputContext);
+            return;
+        }
+        const char *row = hufu_client_char_lookup(engine_, ucs4);
+        const std::vector<std::string> columns =
+            splitTabs(row != nullptr ? row : "");
+        // 缺列按 `?` 显示：能查到「这个字没有数据」本身也是信息。
+        const std::string pinyin =
+            !columns.empty() && !columns[0].empty() ? columns[0] : "?";
+        std::string code =
+            columns.size() > 1 && !columns[1].empty() ? columns[1] : "?";
+        // 拆分（可选第三列）追加在下排；上排排头「咅」= 拼音、下排排头「虍」= 虎码，
+        // 两个排头用于一眼分清上下两排（与参照实现的观感一致）。
+        if (columns.size() > 2 && !columns[2].empty()) {
+            code += " · " + columns[2];
+        }
+        showCharLookup(inputContext, "咅 " + pinyin, "虍 " + code);
+    }
+
+    /// 取光标左侧那个字符（读 `surroundingText()`）。false = 周边文本不可用 /
+    /// 光标左侧没有字符 / 不是汉字——三种都不出提示，各记一条 Debug。
+    bool charLeftOfCursor(fcitx::InputContext *inputContext, uint32_t &ucs4) {
+        const auto &surrounding = inputContext->surroundingText();
+        if (!surrounding.isValid()) {
+            HUFU_DEBUG() << "hufu: 字反查跳过（周边文本不可用）";
+            return false;
+        }
+        // `cursor()` 是**字符（码点）偏移**（不是字节偏移）：先按字符切出光标左侧
+        // 前缀，再取该前缀的最后一个字符。
+        const std::string &text = surrounding.text();
+        const auto end = fcitx::utf8::nextNChar(text.begin(), surrounding.cursor());
+        if (end == text.begin()) {
+            HUFU_DEBUG() << "hufu: 字反查跳过（光标左侧没有字符）";
+            return false;
+        }
+        ucs4 = fcitx::utf8::getLastChar(text.begin(), end);
+        if (!isHanCodePoint(ucs4)) {
+            HUFU_DEBUG() << "hufu: 字反查跳过（光标左侧不是汉字）";
+            return false;
+        }
+        return true;
+    }
+
+    /// 安排一次延迟重查（武装期间方向键透传之后）。
+    ///
+    /// 已有待处理定时器就不再安排——连续按键合并成一次；也**不**把定时器往后推，
+    /// 故按住方向键时结果仍持续跟随（每个 30ms 窗口最多重查一次）。
+    void scheduleCharLookupRefresh(fcitx::InputContext *inputContext) {
+        if (inputContext == nullptr || instance_ == nullptr) {
+            return;
+        }
+        reapCharLookupTimer();
+        if (lookupTimer_) {
+            return; // 已有待处理：合并
+        }
+        // 弱引用目标输入上下文：IC 可能先于本引擎析构（见 `HufuUiState` 契约）。
+        lookupContext_ = inputContext->watch();
+        lookupTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + kCharLookupRefreshUsec,
+            0, [this](fcitx::EventSourceTime * /*source*/, uint64_t /*usec*/) {
+                lookupTimerSpent_ = true; // 单次：标记待回收（见 reapCharLookupTimer）
+                refreshCharLookup(lookupContext_.get());
+                return true;
+            });
+        lookupTimer_->setOneShot();
+    }
+
+    /// 回收**已触发**的定时器：sd-event 派发期间仍持有事件源，在它的回调里销毁它
+    /// 不安全，故回收推迟到回调之外——下一次安排重查或撤防时做。
+    void reapCharLookupTimer() {
+        if (lookupTimerSpent_) {
+            lookupTimer_.reset();
+            lookupTimerSpent_ = false;
+        }
+    }
+
+    /// 撤掉待处理的延迟重查（其它按键 / Esc / 失焦 / 切换输入法 / 析构）：
+    /// 未触发的定时器在这里销毁，回调不会再跑。
+    void cancelCharLookupRefresh() {
+        lookupTimer_.reset();
+        lookupTimerSpent_ = false;
+        lookupContext_ = fcitx::TrackableObjectReference<fcitx::InputContext>();
+    }
+
+    /// 撤防 + 清两排 + 撤掉待处理的延迟重查。
+    void disarmCharLookup(fcitx::InputContext *inputContext) {
+        cancelCharLookupRefresh();
+        if (HufuUiState *state = uiState(inputContext); state != nullptr) {
+            state->charLookupArmed() = false;
+        }
+        hideCharLookup(inputContext);
+    }
+
+    /// 显示两排字反查提示：只写 aux 上/下排——不占候选列表、也不伪造 preedit
+    /// （引擎的候选与预编辑原样留在面板上）。
+    void showCharLookup(fcitx::InputContext *inputContext, const std::string &up,
+                        const std::string &down) {
+        HufuUiState *state = uiState(inputContext);
+        if (state == nullptr) {
+            return;
+        }
+        HufuCharLookupView &view = state->charLookup();
+        view.shown = true;
+        view.up = up;
+        view.down = down;
+        inputContext->inputPanel().setAuxUp(fcitx::Text(view.up));
+        inputContext->inputPanel().setAuxDown(fcitx::Text(view.down));
+        inputContext->updateUserInterface(
+            fcitx::UserInterfaceComponent::InputPanel);
+        HUFU_DEBUG() << "hufu: 字反查 [" << view.up << "] [" << view.down << "]";
+    }
+
+    /// 收掉两排字反查提示（任意键 / Esc / 失焦）：面板还原成「引擎 aux（上排）+
+    /// 无下排」——这正是 `render` 在未显示字反查时的写法。
+    void hideCharLookup(fcitx::InputContext *inputContext) {
+        HufuUiState *state = uiState(inputContext);
+        if (state == nullptr || !state->charLookup().shown) {
+            return;
+        }
+        state->charLookup() = HufuCharLookupView();
+        const std::string &aux = state->snapshot().aux;
+        inputContext->inputPanel().setAuxUp(!aux.empty() ? fcitx::Text(aux)
+                                                        : fcitx::Text());
+        inputContext->inputPanel().setAuxDown(fcitx::Text());
+        inputContext->updateUserInterface(
+            fcitx::UserInterfaceComponent::InputPanel);
     }
 
     static void commitCallback(void *user, const char *text) {
@@ -944,7 +1320,8 @@ private:
                                                                   : "");
             }
         }
-        if (HufuUiState *state = uiState(context_)) {
+        HufuUiState *state = uiState(context_);
+        if (state != nullptr) {
             state->snapshot() = snapshot;
         }
         if (emptyState && !hadComposition) {
@@ -953,13 +1330,16 @@ private:
         HUFU_DEBUG() << "hufu: 快照 preedit=\"" << snapshot.preedit << "\" 候选="
                      << snapshot.texts.size() << " 高亮=" << snapshot.selected
                      << " 中英=" << (snapshot.chinese ? "中" : "英");
-        // 2) 按快照渲染（空快照 = 清面板）。
-        render(context_, snapshot);
+        // 2) 按快照渲染（空快照 = 清面板）；字反查视图一并带上，两排 aux 归它管。
+        render(context_, snapshot,
+               state != nullptr ? state->charLookup() : HufuCharLookupView());
     }
 
     /// 按快照刷新一个输入上下文的输入面板（`applyUpdate` 与宿主开关共用）。
+    /// `lookup` 是该输入上下文的字反查视图：显示中则两排 aux 归它，否则上排用引擎 aux。
     void render(fcitx::InputContext *inputContext,
-                const HufuUiSnapshot &snapshot) {
+                const HufuUiSnapshot &snapshot,
+                const HufuCharLookupView &lookup) {
         if (inputContext == nullptr) {
             return;
         }
@@ -1001,8 +1381,16 @@ private:
             candidateList->setGlobalCursorIndex(index);
             inputContext->inputPanel().setCandidateList(std::move(candidateList));
         }
-        inputContext->inputPanel().setAuxUp(
-            !snapshot.aux.empty() ? fcitx::Text(snapshot.aux) : fcitx::Text());
+        // aux 两排：字反查显示中时上排「咅 …」、下排「虍 …」；否则上排是引擎 aux、
+        // 下排留空（引擎没有第二排，下排只归字反查用）。
+        if (lookup.shown) {
+            inputContext->inputPanel().setAuxUp(fcitx::Text(lookup.up));
+            inputContext->inputPanel().setAuxDown(fcitx::Text(lookup.down));
+        } else {
+            inputContext->inputPanel().setAuxUp(
+                !snapshot.aux.empty() ? fcitx::Text(snapshot.aux) : fcitx::Text());
+            inputContext->inputPanel().setAuxDown(fcitx::Text());
+        }
         inputContext->updateUserInterface(
             fcitx::UserInterfaceComponent::InputPanel);
     }
@@ -1162,6 +1550,14 @@ private:
     std::string statusText_;
     /// 按键音效勾选态缓存：1=开 / 0=关 / -1=未知（未取到；菜单显示为未勾选）
     int32_t soundOn_ = -1;
+    /// 字反查索引装载状态：0=未装载（首次触发才装载）/ 1=可用 / -1=不可用（静默关闭）
+    int32_t charLookupState_ = 0;
+    /// 字反查武装期间「方向键透传后延迟重查」的定时器（`nullptr`=没有待处理的重查）
+    std::unique_ptr<fcitx::EventSourceTime> lookupTimer_;
+    /// `lookupTimer_` 是否已触发（单次定时器触发后等回调之外回收，见 `reapCharLookupTimer`）
+    bool lookupTimerSpent_ = false;
+    /// 延迟重查的目标输入上下文（弱引用：IC 可能先于本引擎析构）
+    fcitx::TrackableObjectReference<fcitx::InputContext> lookupContext_;
 };
 
 /// 点击候选 = 上屏（页内下标；语义同数字选重）。
