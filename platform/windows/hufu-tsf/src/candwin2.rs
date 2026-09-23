@@ -4257,6 +4257,12 @@ impl CandidateWindowV2 {
                                 // 行程 75→32ms，≈470px/s）+ 曲线转 ease-out
                                 //（曲线标志 1，见 pos_anim 注释）——快出
                                 // 缓停，肉眼读作「弹入且稳稳停住」。
+                                // 【五十八修】当日下午四轮曲线实验（并步
+                                // 阈值/匀速/四次缓出）全部被判「一帧一帧
+                                // /越来越卡」——真凶不在曲线：完成拍缺终
+                                // 点 SWP 落位（见 tick 终点落位注释）+实
+                                // 验期间 QQ 未重启测的是旧 DLL。曲线与
+                                // 时长回本口径（用户上午认可的观感）。
                                 let dur = ((travel as f32 * 3.2 / spd) as u32)
                                     .clamp(28, 110);
                                 self.pos_anim =
@@ -4988,14 +4994,45 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 窗口跟光标滑动；完成即清。首显起臂在 show() 的 SWP 处。
         if c.chase_target.is_none() {
         if let Some((f, t, t0, dur, ez)) = c.pos_anim {
-            let cur = pos_anim_step(f, t, t0.elapsed().as_millis() as u32, dur, ez);
+            let mut cur = pos_anim_step(f, t, t0.elapsed().as_millis() as u32, dur, ez);
+            // 【五十八修·末帧并步 2026-09-23】入场滑动收尾「多移一
+            // 帧还不流畅」根治：ease-out 立方尾部的亚像素增量经逐帧
+            // 取整=尾部 1px 蠕动一帧 + 0px 死帧，且尾巴步在合成器
+            //（vsync 采样）上抽签——孤悬的 +1px 悬一整拍=肉眼读作
+            // 减速停住后又顿一下（全宿主一致）。修：残距≤2px（两轴）
+            // 时并入本步一步落位，动画即清——末步至少 2px（够格当
+            // 真实运动步而非抽搐），缓停节奏保留（…4,3 收束式干净
+            // 停），蠕动帧/死帧/孤悬拍全消。逐键跟随同通道同受益。
+            if (t.0 - cur.0).abs() <= 2 && (t.1 - cur.1).abs() <= 2 {
+                cur = t;
+            }
             if cur == t {
                 c.pos_anim = None;
                 c.live_pos.set(t);
+                // 【五十八修·终点落位 2026-09-23】完成拍必须把窗送到
+                // 精确目标。原实现（含今晨版本）清了动画却不 SWP——
+                // 窗停在上一拍位置（差 1-2px），等下一次 show 的 SWP
+                // 才纠偏=「收尾多移一帧且不流畅」的真身：一次晚到的
+                // 纠偏步（用户从今晨反馈到下午，四轮曲线调参无效的
+                // 元凶——顿感从来不是曲线，是缺终拍落位）。
+                if c.is_visible() {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        t.0,
+                        t.1,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
                 } else {
                     anim_done = false;
+                    let prev = c.live_pos.get();
                     c.live_pos.set(cur);
-                    if c.is_visible() {
+                    // 死帧去重：坐标与上一拍相同（亚像素增量取整为0）
+                    // 则不动窗不落档——尾巴只留真实位移。
+                    if c.is_visible() && cur != prev {
                         // 【三十二修·门控】同上：tick 热路径 trace 关不分配。
                         if crate::tsf::trace_on() {
                             crate::tsf::trace(&format!("cw2: SWP动画2 cur=({},{})", cur.0, cur.1));
@@ -5187,6 +5224,27 @@ pub(crate) fn pos_anim_step(
     }
     if ease == 0 {
         return size_ease(from, to, t_ms, dur_ms);
+    }
+    if ease == 2 {
+        // 【五十八修·入场匀速】用户拍板「一次性滑到要停的位置」：
+        // 匀速直线，无减速拖尾——全程等速、到点即停（末步并步保证
+        // 最后一步恰好落在目标）。出速观感由时长收紧补偿（见起臂
+        // 处 travel*2.2/20..75）。
+        let x = t_ms as f32 / dur_ms as f32;
+        let l = |a: i32, b: i32| a + ((b - a) as f32 * x).round() as i32;
+        return (l(from.0, to.0), l(from.1, to.1));
+    }
+    if ease == 3 {
+        // 【五十八修·入场四次缓出】匀速版实测「一帧一帧」（合成器
+        // 60Hz 采样下等速小步=可见阶梯）；三次缓出尾部又蠕动悬帧。
+        // 四次缓出 1-(1-x)⁴：50% 时刻已走 94%、60% 走 97.4%——残距
+        // ≤2px 并步线在 ~60% 时长即触发，拖尾整段截肢（不存在亚像
+        // 素尾帧），前段保留三次版的「弹入」出速观感。时长回五十一
+        // 修被认可口径（3.2/28..110）。
+        let x = t_ms as f32 / dur_ms as f32;
+        let k = 1.0 - (1.0 - x).powi(4);
+        let l = |a: i32, b: i32| a + ((b - a) as f32 * k).round() as i32;
+        return (l(from.0, to.0), l(from.1, to.1));
     }
     let x = t_ms as f32 / dur_ms as f32;
     let k = 1.0 - (1.0 - x).powi(3);
