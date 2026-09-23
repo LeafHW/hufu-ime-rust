@@ -665,8 +665,10 @@ pub struct CandidateWindowV2 {
     /// 变」）。结构性大变化（≥60px）仍满速满时长，观感不变。
     pub(crate) size_anim_dur: std::cell::Cell<u32>,
     /// 【五十九修·形变帧率封顶】上一次形变帧渲染时刻——tick 里连
-    /// 续重绘间隔 <12ms（60fps）则跳过本帧渲染（完成帧除外），杀
-    /// 掉 1-3ms 突发连渲染（winmm 250fps 驱动下队列挤成一坨）。
+    /// 续重绘间隔小于「屏幕刷新帧距」（morph_frame_interval_ms：
+    /// 60Hz=16.7 / 144Hz=6.9 / 240Hz=4.2ms，窗口最近显示器实际刷
+    /// 新率）则跳过本帧渲染（完成帧除外），杀掉 1-3ms 突发连渲染
+    ///（winmm 250fps 驱动下队列挤成一坨）；高刷屏不少帧。
     pub(crate) size_anim_last_render: std::cell::Cell<std::time::Instant>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 150，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
@@ -4805,11 +4807,14 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.chrome_override.set(Some(cur));
                 }
                 c.live_size.set(cur);
-                // 【五十九修·形变帧率封顶】同主路径：中间帧 <12ms 不渲
-                //（完成帧必渲）。
+                // 【五十九修·形变帧率封顶】中间帧间隔小于「屏幕刷新
+                // 帧距」（60Hz=16.7ms / 144Hz=6.9 / 240Hz=4.2，见
+                // morph_frame_interval_ms）跳过渲染（完成帧必渲）。
                 let render_ok = finished || {
                     let now = std::time::Instant::now();
-                    if now.duration_since(c.size_anim_last_render.get()).as_millis() >= 12 {
+                    if now.duration_since(c.size_anim_last_render.get()).as_millis()
+                        >= morph_frame_interval_ms(hwnd)
+                    {
                         c.size_anim_last_render.set(now);
                         true
                     } else {
@@ -4956,12 +4961,15 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            // 【五十九修·形变帧率封顶】中间帧间隔 <12ms（60fps）跳过
-            // 渲染（完成帧必渲）——杀 winmm 250fps 驱动下 1-3ms 突发
-            // 连渲染（队列挤坨=UI 线程饱和的元凶之一）。
+            // 【五十九修·形变帧率封顶】中间帧间隔小于「屏幕刷新帧
+            // 距」（morph_frame_interval_ms：60Hz=16.7 / 144=6.9 /
+            // 240=4.2ms）跳过渲染（完成帧必渲）——杀 winmm 250fps
+            // 驱动下 1-3ms 突发连渲染；高刷屏按其实际刷新率足帧。
             let render_ok = finished || {
                 let now = std::time::Instant::now();
-                if now.duration_since(c.size_anim_last_render.get()).as_millis() >= 12 {
+                if now.duration_since(c.size_anim_last_render.get()).as_millis()
+                    >= morph_frame_interval_ms(hwnd)
+                {
                     c.size_anim_last_render.set(now);
                     true
                 } else {
@@ -5252,6 +5260,59 @@ static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// ——虎娘实测恒速小步进（64Hz ~2px/tick），逐键重定目标时匀速续走
 /// 无「慢起-加速-减速」脉动=回弹感根除。全部动效（平移/形变/插值
 /// tick）共用本函数，一并转线性。
+/// 【五十九修·补：形变帧率封顶=屏幕实际刷新率】用户点破硬编码
+/// 60fps「高刷屏怎么办」——封顶的本意是「每合成帧至多渲一次，
+/// 不白渲」，那么上限就该是候选窗所在显示器的当前刷新率：60Hz
+/// 屏 16.7ms/帧、120Hz 8.3、144Hz 6.9、165Hz 6.1、240Hz 4.2。
+/// 高刷屏不少帧（五十三修高频驱动的平滑它照吃），低刷屏不白渲
+///（超过刷新率的渲染合成器根本不上屏=纯浪费）。取窗口最近显示
+/// 器的 ENUM_CURRENT_SETTINGS.dmDisplayFrequency，进程级缓存一
+/// 次；查询失败兜底 60Hz。
+fn morph_frame_interval_ms(hwnd: HWND) -> u128 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u128> = OnceLock::new();
+    *CACHE.get_or_init(|| unsafe {
+        let mut hz: u32 = 60;
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if !mon.is_invalid() {
+            let mut mi: MONITORINFOEXW = std::mem::zeroed();
+            mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(
+                mon,
+                &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO,
+            )
+            .as_bool()
+            {
+                let mut dm: DEVMODEW = std::mem::zeroed();
+                dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+                if EnumDisplaySettingsExW(
+                    PCWSTR(mi.szDevice.as_ptr()),
+                    ENUM_CURRENT_SETTINGS,
+                    &mut dm,
+                    ENUM_DISPLAY_SETTINGS_FLAGS(0), // 无附加标志：取当前模式
+                )
+                .as_bool()
+                    && (30..=1000).contains(&dm.dmDisplayFrequency)
+                {
+                    hz = dm.dmDisplayFrequency;
+                }
+            }
+        }
+        let ms = 1000.0 / hz as f32;
+        if trace_on_guard_for_morph() {
+            crate::tsf::trace(&format!(
+                "cw2: 形变帧率封顶 刷新率={hz}Hz → {ms:.1}ms/帧"
+            ));
+        }
+        ms.ceil() as u128
+    })
+}
+
+/// 形变封顶首查的落档门（避免给热路径引 trace 依赖）。
+fn trace_on_guard_for_morph() -> bool {
+    crate::tsf::trace_on()
+}
+
 pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
     if dur_ms == 0 || t_ms >= dur_ms {
         return to;
