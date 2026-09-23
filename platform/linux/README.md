@@ -49,12 +49,17 @@ cmake --build platform/linux/build -j
 # 一条：构建 + 装配数据 + 用户级服务 + 系统级 addon（中途会要 sudo 密码）
 platform/linux/install.sh
 
+# 先预览：把要执行的每一个改动性动作（构建/拷贝/安装/sudo/systemctl）逐条列出，不落任何改动
+platform/linux/install.sh --dry-run
+platform/linux/uninstall.sh --dry-run
+
 # 已有产物、只装配数据/装服务：
 platform/linux/install.sh --no-build --no-system   # 跳过 sudo 部分
 sudo cmake --install platform/linux/build          # 系统级 addon
 
-# 卸载（--purge 连用户数据一起删）
-platform/linux/uninstall.sh [--purge]
+# 卸载：默认按台账删掉装配进去的数据（用户词/配置/模型保留）
+platform/linux/uninstall.sh
+platform/linux/uninstall.sh --purge                # 连用户数据一起删（整树）
 ```
 
 安装产物：
@@ -63,6 +68,15 @@ platform/linux/uninstall.sh [--purge]
 - 用户级：`~/.local/bin/hufu-server`、`~/.config/systemd/user/hufu-server.service`、
   `~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`
 - 数据：`~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置/皮肤/用户词/音效）
+
+装完即校验：装配后按 `assets/MANIFEST` 台账逐项核对 `~/.local/share/hufu/` 下的落盘文件
+（字节 + sha256），任一不符即报错退出；`--from`/`--tigerclaw` 外部源模式的内容由外部数据源
+决定，不做台账核对（脚本会显式说明跳过）。
+
+卸载与安装对称：默认按同一份 `assets/MANIFEST` 逐个删掉装配进去的文件并清理空目录；
+用户数据（`码表/<方案>/用户调整.txt` 用户词与调整、`数据/user-adjust.log` 调整日志、
+`数据/config.json` 配置、`数据/皮肤/`、`模型/`）不在台账里，默认保留（`--purge` 才整树删除）。
+检出里缺 `assets/MANIFEST` 时，卸载会明确提示原因并退回原行为（默认整树保留）。
 
 装完后：
 
@@ -98,6 +112,7 @@ Linux 端所需数据**全部随仓库分发**（`assets/`，与安装布局同�
 
 外部源覆盖（换版本用）：`--from <虎码资源目录>`（码表）+ `--tigerclaw <虎爪7z>`
 （注释/拆分/反查/符号/音效，`7z e -so` 按需流式取单文件）；`--no-assets` 跳过资源装配。
+外部源模式不走 `assets/MANIFEST` 台账（装配前不校验来源，装后校验显式跳过）。
 
 首次安装生成 `数据/config.json`：默认方案 `虎整句`（放入模型即启用整句）；反查=拼音、
 拆分=`虎码`、unicode 注释/拆分显示开；中英切换交由 fcitx5 布局（引擎不带英文输入）。
