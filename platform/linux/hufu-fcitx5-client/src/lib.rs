@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 虎符（hufu-ime）fcitx5 前端 · Rust 侧（staticlib）。
 //!
 //! 架构与 Windows TSF / macOS IMK 一致：本层是薄壳，按键经 Unix socket
@@ -9,10 +12,11 @@
 //! 本 crate 同时产出 rlib 供 mock socket 单测。
 #![allow(clippy::missing_safety_doc)]
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hufu_types::{KeyOutcome, SessionState};
@@ -106,6 +110,166 @@ fn merge_json(dst: &mut serde_json::Value, patch: &serde_json::Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 字反查（纯宿主侧）：按数据目录建「字 → 拼音 / 虎码 / 拆分」索引
+// ---------------------------------------------------------------------------
+
+/// 拼音注释（每行 `字\t拼音`；多音写在同一列里，以空格分隔）。
+const PINYIN_ANNOTATION: &str = "数据/注释/拼音.注释";
+/// 虎码单字表（Rime 词典：`columns:` 给列名，数据行 `字\t码\t权重`）。
+const CODE_DICT: &str = "码表/虎码单字/tiger.dict.yaml";
+/// 部件拆解（每行 `字\t拆解`；可选——缺文件只是没有拆分列）。
+const SPLIT_ANNOTATION: &str = "数据/拆分/虎码.拆分";
+
+/// 取「恰好一个字符」的键；空串、多字符都不是有效键。
+fn single_key_char(field: &str) -> Option<char> {
+    let mut chars = field.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Some(ch),
+        _ => None,
+    }
+}
+
+/// 读 `字\t值` 两列表（拼音注释与拆分注释同构）。
+///
+/// 坏行一律跳过（空行、`#` 注释、缺列、键不是单字符、值为空）；多出来的列忽略而不是
+/// 判错——实际数据里出现过「值后面多一个尾随空列」的行。同一字出现多次取首行。
+fn parse_char_map(text: &str) -> HashMap<char, String> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if let Some(ch) = single_key_char(key) {
+            if !value.is_empty() {
+                map.entry(ch).or_insert_with(|| value.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// 读 Rime 词典 `columns:` 里的列名，返回 `(text 列下标, code 列下标)`。
+///
+/// 列名对不上（没有 `text` 或 `code`）返回 `None`：宁可按「没有码表」降级，也不按
+/// 位置硬认列——换了列序的词典会把权重当码显示出去。
+fn rime_columns(text: &str) -> Option<(usize, usize)> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end_matches('\r').trim() != "columns:" {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for item in lines.by_ref() {
+            let item = item.trim_end_matches('\r');
+            let Some(name) = item.trim().strip_prefix('-') else {
+                break; // 列表结束（`...` 或数据行）
+            };
+            names.push(name.trim().to_string());
+        }
+        let text_idx = names.iter().position(|n| n == "text")?;
+        let code_idx = names.iter().position(|n| n == "code")?;
+        return Some((text_idx, code_idx));
+    }
+    None
+}
+
+/// 读 Rime 词典数据行：同字多码按文件序全收（简码在前、全码在后，展示时以 `/` 连接）。
+///
+/// 头部 YAML 行不含 TAB（或首列不是单字），`...`/`---` 标记与 `#` 注释按「列数不足 /
+/// 注释行」自然跳过，故不依赖 `...` 结束标记一定存在。
+fn parse_rime_dict(text: &str, text_idx: usize, code_idx: usize) -> HashMap<char, Vec<String>> {
+    let need = text_idx.max(code_idx);
+    let mut map: HashMap<char, Vec<String>> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() <= need {
+            continue;
+        }
+        let Some(ch) = single_key_char(fields[text_idx]) else {
+            continue;
+        };
+        let code = fields[code_idx];
+        if code.is_empty() {
+            continue;
+        }
+        let codes = map.entry(ch).or_default();
+        if !codes.iter().any(|c| c == code) {
+            codes.push(code.to_string());
+        }
+    }
+    map
+}
+
+/// 字反查索引（数据目录由宿主传入；本层不读环境变量）。
+///
+/// 三份数据各自独立降级：某个文件缺失/读失败只是该列没有数据，不影响其余列。
+#[derive(Default)]
+struct CharLookup {
+    /// 字 → 拼音（注释文件原样，多音以空格分隔）
+    pinyin: HashMap<char, String>,
+    /// 字 → 虎码（同字多码按文件序）
+    codes: HashMap<char, Vec<String>>,
+    /// 字 → 部件拆解
+    splits: HashMap<char, String>,
+}
+
+impl CharLookup {
+    /// 按数据根目录（`${XDG_DATA_HOME:-$HOME/.local/share}/hufu`）读三份数据。
+    /// 读失败按「该列无数据」处理：不报错、不 panic，由调用方决定是否启用。
+    fn load(root: &Path) -> CharLookup {
+        let pinyin = std::fs::read_to_string(root.join(PINYIN_ANNOTATION))
+            .map(|t| parse_char_map(&t))
+            .unwrap_or_default();
+        let codes = std::fs::read_to_string(root.join(CODE_DICT))
+            .ok()
+            .and_then(|t| rime_columns(&t).map(|(ti, ci)| parse_rime_dict(&t, ti, ci)))
+            .unwrap_or_default();
+        let splits = std::fs::read_to_string(root.join(SPLIT_ANNOTATION))
+            .map(|t| parse_char_map(&t))
+            .unwrap_or_default();
+        CharLookup {
+            pinyin,
+            codes,
+            splits,
+        }
+    }
+
+    /// 是否值得启用：拼音注释与码表至少一份有数据（只剩拆分列没有意义）。
+    fn is_usable(&self) -> bool {
+        !self.pinyin.is_empty() || !self.codes.is_empty()
+    }
+
+    /// 一个字的三列：`拼音\t虎码[\t拆分]`（缺项为空列；三列全空返回空串）。
+    fn row(&self, ch: char) -> String {
+        let pinyin = self.pinyin.get(&ch).cloned().unwrap_or_default();
+        let code = self
+            .codes
+            .get(&ch)
+            .map(|codes| codes.join("/"))
+            .unwrap_or_default();
+        let split = self.splits.get(&ch).cloned().unwrap_or_default();
+        if pinyin.is_empty() && code.is_empty() && split.is_empty() {
+            return String::new();
+        }
+        let mut row = format!("{pinyin}\t{code}");
+        if !split.is_empty() {
+            row.push('\t');
+            row.push_str(&split);
+        }
+        row
+    }
+}
+
 /// 单会话引擎客户端（惰性连接 + 断线重连）。
 pub struct HufuClient {
     sock_path: PathBuf,
@@ -122,6 +286,10 @@ pub struct HufuClient {
     config: Option<serde_json::Value>,
     /// `hufu_client_config_str` 返回值缓存（C++ 侧同步拷走）
     config_scratch: CString,
+    /// 字反查索引（宿主首次触发时才装载；`None` = 未初始化或数据不可用）
+    char_lookup: Option<CharLookup>,
+    /// `hufu_client_char_lookup` 返回值缓存（C++ 侧同步拷走）
+    char_lookup_row: CString,
 }
 
 impl HufuClient {
@@ -138,6 +306,8 @@ impl HufuClient {
             last_back: 0,
             config: None,
             config_scratch: CString::default(),
+            char_lookup: None,
+            char_lookup_row: CString::default(),
         }
     }
 
@@ -313,6 +483,25 @@ impl HufuClient {
             .to_string();
         self.config_scratch = CString::new(s).unwrap_or_default();
         self.config_scratch.as_ptr()
+    }
+
+    /// 装载字反查索引（宿主传入 `$HUFU_ROOT`；可重复调用，按新目录重载）。
+    /// 返回是否可用：拼音注释或码表至少一份读到数据即为可用。
+    pub fn char_lookup_init(&mut self, root: &Path) -> bool {
+        let lookup = CharLookup::load(root);
+        let usable = lookup.is_usable();
+        self.char_lookup = if usable { Some(lookup) } else { None };
+        usable
+    }
+
+    /// 查一个字符：结果写入 `char_lookup_row`（三列 TAB 分隔；无数据为空串）并返回其指针。
+    pub fn char_lookup(&mut self, ucs4: u32) -> *const c_char {
+        let row = match (char::from_u32(ucs4), self.char_lookup.as_ref()) {
+            (Some(ch), Some(lookup)) => lookup.row(ch),
+            _ => String::new(),
+        };
+        self.char_lookup_row = CString::new(row).unwrap_or_default();
+        self.char_lookup_row.as_ptr()
     }
 
     /// 一次按键：返回 `(consumed, back)`；回调同步送达 commit/update。
@@ -731,6 +920,41 @@ pub extern "C" fn hufu_client_last_back(c: *const HufuClient) -> c_int {
         return 0;
     }
     unsafe { &*c }.last_back as c_int
+}
+
+/// 装载字反查索引：`data_dir` 为数据根目录（`${XDG_DATA_HOME:-$HOME/.local/share}/hufu`，
+/// 由宿主解析后传入——本层不读环境变量）。1=可用（拼音注释或码表至少一份读到数据），
+/// 0=不可用（目录/文件缺失、参数非法）；可重复调用（按新目录重载，失败即清空索引）。
+#[no_mangle]
+pub extern "C" fn hufu_client_char_lookup_init(
+    c: *mut HufuClient,
+    data_dir: *const c_char,
+) -> c_int {
+    if c.is_null() || data_dir.is_null() {
+        return 0;
+    }
+    let dir = unsafe { CStr::from_ptr(data_dir) }
+        .to_string_lossy()
+        .into_owned();
+    if dir.is_empty() {
+        return 0;
+    }
+    if unsafe { &mut *c }.char_lookup_init(Path::new(&dir)) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 查一个字符的「拼音\t虎码[\t拆分]」：缺项为空列，整字无数据为空串。
+/// 返回 NUL 结尾指针，指向客户端内部缓冲——**下次对同一客户端调用本函数前有效**，
+/// 宿主须同步拷走；未初始化（或 `ucs4` 不是有效字符）时返回空串。
+#[no_mangle]
+pub extern "C" fn hufu_client_char_lookup(c: *mut HufuClient, ucs4: u32) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.char_lookup(ucs4)
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,5 +1383,145 @@ mod tests {
         assert!(!c.open_schema_dir());
         assert_eq!(c.sound_toggle(), -1);
         assert_eq!(c.sound_state(), -1);
+    }
+
+    /// 测试用数据根目录（按 `$HUFU_ROOT` 布局造小样本；Drop 时整树删除）。
+    struct TempDataDir(PathBuf);
+
+    impl TempDataDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "hufu-char-lookup-{}-{}",
+                std::process::id(),
+                name
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("建临时数据目录");
+            TempDataDir(dir)
+        }
+
+        /// 写一份样本数据（相对路径按 `$HUFU_ROOT` 布局，如 `数据/注释/拼音.注释`）。
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("父目录")).expect("建父目录");
+            std::fs::write(&path, content).expect("写样本数据");
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 一个不连引擎的客户端（字反查不碰 socket）。
+    fn offline_client(name: &str) -> HufuClient {
+        HufuClient::new(
+            test_sock(name),
+            HufuHost {
+                user: std::ptr::null_mut(),
+                commit: None,
+                update: None,
+            },
+        )
+    }
+
+    /// 取 C 指针里的字符串（`hufu_client_char_lookup` 的返回）。
+    fn cstr_of(p: *const c_char) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+
+    /// 正常数据：三列齐全（拼音原样、同字多码以 `/` 连接、拆分追加为第三列）。
+    #[test]
+    fn char_lookup_reads_pinyin_codes_and_split() {
+        let dir = TempDataDir::new("ok");
+        // 拼音注释带 CRLF（随包资源如此）与一行「尾随空列」的坏行。
+        dir.write(
+            PINYIN_ANNOTATION,
+            "中\tzhōng zhòng\r\n的\tdí dì de\r\n𱊳\tlěi\t\r\n坏行没有制表符\r\n多字键\tcuò\r\n",
+        );
+        dir.write(
+            CODE_DICT,
+            "\nname: tiger\nsort: by_weight\ncolumns:\n  - text\n  - code\n  - weight\n...\n\n\
+             中\td\t900\n中\tdgs\t900\n的\tu\t800\n的\tuni\t800\n# 注释行\n坏行\n",
+        );
+        dir.write(SPLIT_ANNOTATION, "中\t口丨\r\n");
+
+        let mut c = offline_client("lookup-ok");
+        assert!(c.char_lookup_init(&dir.0), "三份数据齐全应可用");
+        assert_eq!(
+            cstr_of(c.char_lookup('中' as u32)),
+            "zhōng zhòng\td/dgs\t口丨",
+            "拼音原样 + 同字多码 `/` 连接 + 拆分第三列"
+        );
+        assert_eq!(cstr_of(c.char_lookup('的' as u32)), "dí dì de\tu/uni");
+        assert_eq!(
+            cstr_of(c.char_lookup('𱊳' as u32)),
+            "lěi\t",
+            "尾随空列的行仍可用"
+        );
+        assert_eq!(cstr_of(c.char_lookup('多' as u32)), "", "多字键的行被跳过");
+        assert_eq!(
+            cstr_of(c.char_lookup('龘' as u32)),
+            "",
+            "三份数据都没有的字"
+        );
+    }
+
+    /// 缺文件：目录不存在 / 只有拼音注释（码表缺）都要优雅降级，不 panic。
+    #[test]
+    fn char_lookup_missing_files_degrade() {
+        let missing =
+            std::env::temp_dir().join(format!("hufu-char-lookup-{}-none", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let mut c = offline_client("lookup-missing");
+        assert!(!c.char_lookup_init(&missing), "目录不存在应判不可用");
+        assert_eq!(cstr_of(c.char_lookup('中' as u32)), "", "未装载时返回空串");
+
+        let dir = TempDataDir::new("pinyin-only");
+        dir.write(PINYIN_ANNOTATION, "中\tzhōng\n");
+        assert!(c.char_lookup_init(&dir.0), "拼音注释在即算可用");
+        assert_eq!(
+            cstr_of(c.char_lookup('中' as u32)),
+            "zhōng\t",
+            "码表缺失：虎码列留空"
+        );
+        // 重复初始化按新目录重载（同一客户端换数据目录）。
+        assert!(!c.char_lookup_init(&missing), "重载到坏目录应清空索引");
+        assert_eq!(cstr_of(c.char_lookup('中' as u32)), "");
+    }
+
+    /// 缺列/异常行：`columns` 列名不对时整表按「无码表」降级；坏行不影响其余数据。
+    #[test]
+    fn char_lookup_bad_columns_and_rows() {
+        let dir = TempDataDir::new("bad");
+        dir.write(PINYIN_ANNOTATION, "中\tzhōng\n");
+        // 列名对不上（word/stroke）⇒ 不按位置硬认，码表整体不可用。
+        dir.write(
+            CODE_DICT,
+            "name: tiger\ncolumns:\n  - word\n  - stroke\n...\n中\td\n",
+        );
+        let mut c = offline_client("lookup-bad-cols");
+        assert!(c.char_lookup_init(&dir.0), "拼音注释可用 ⇒ 索引仍可用");
+        assert_eq!(
+            cstr_of(c.char_lookup('中' as u32)),
+            "zhōng\t",
+            "码表列名不对 ⇒ 无虎码列"
+        );
+
+        // 列序不同（code 在 text 之前）：按列名下标的真实位置取，不认死列位。
+        dir.write(
+            CODE_DICT,
+            "name: tiger\ncolumns:\n  - code\n  - text\n...\ndgs\t中\n",
+        );
+        assert!(c.char_lookup_init(&dir.0));
+        assert_eq!(
+            cstr_of(c.char_lookup('中' as u32)),
+            "zhōng\tdgs",
+            "按 columns 声明的列位取字与码"
+        );
     }
 }
