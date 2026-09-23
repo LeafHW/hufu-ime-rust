@@ -1,5 +1,44 @@
 # HuFu 架构设计
 
+## 0. 模块总览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     engine/ (Rust, 跨平台核心)                │
+│  hufu-types    按键/候选/会话 等共享类型                       │
+│  hufu-dict     多格式码表解析 + Trie + 用户词 + 注释表          │
+│  hufu-engine   会话状态机：顶屏/选重/反查/符号/滤镜链            │
+│  hufu-sentence TCSKNM02 ngram 加载 + beam 组句 + 提前上屏      │
+│  hufu-rerank   纯 Rust GGUF/Qwen3 推理（q8_0 解码 + GEMM）     │
+│  hufu-config   设置模型(JSON) + 热更新                          │
+│  hufu-skin     皮肤模型(JSON) + weasel/squirrel 互导           │
+│  hufu-server   常驻 daemon：引擎实例 + IPC + 设置 Web UI 托管   │
+│  hufu-cli      码表转换 / REPL 测试 / 安装辅助                  │
+└─────────────────────────────────────────────────────────────┘
+        ▲                                    ▲
+        │ IPC (命名管道 / Unix socket)        │ HTTP+WS (localhost)
+┌───────┴────────────┐ ┌──────────────────┐ ┌────────┴─────────┐
+│ platform/windows   │ │ platform/linux    │ │ platform/macos    │
+│ hufu-tsf: TSF COM  │ │ fcitx5 addon:     │ │ HuFuIME:          │
+│ 组件(Rust+windows-rs)│ │ C++ 薄壳 + Rust  │ │ InputMethodKit    │
+│ 候选窗 D2D+Acrylic  │ │ staticlib（socket）│ │ NSVisualEffectView│
+└────────────────────┘ └──────────────────┘ └──────────────────┘
+        设置 UI = 浏览器/WebView 打开 daemon 的 Web 设置页
+```
+
+仓库目录：
+
+```
+hufu/
+├── engine/          Rust workspace（核心引擎，全平台共享）
+├── platform/windows Windows TSF 输入法前端
+├── platform/linux   Linux fcitx5 前端（Rust staticlib + C++ 薄壳 + CMake）
+├── platform/macos   macOS InputMethodKit 前端（尚未开始开发，仅有骨架代码）
+├── settings-ui/     设置 Web UI（由 hufu-server 托管）
+├── assets/          码表与数据资源（多方案码表/注释/拆分/反查/音效）
+└── docs/            架构与调研文档
+```
+
 ## 1. 设计原则
 
 1. **单引擎，双前端**：所有输入逻辑（键处理、码表检索、整句组句、用户词、滤镜）都在 Rust 引擎内，
@@ -56,7 +95,7 @@ hufu-engine Session::process_key()
 
 - **模型**：直接加载 TigerClaw 生态的 `sentence-ngram-*.bin`（TCSKNM02 明文布局：
   104B 头 / unigram 数组 / bigram、trigram 分页块 + 稀疏页索引；Kneser-Ney 插值概率）。
-  详见 docs/research/rime-config-analysis.md 第三节。
+  详见 [dictionary-formats.md](dictionary-formats.md) 的 TCSKNM02 一节。
 - **解码**：按 raw 前缀位置分桶的 beam search（beam_width 默认 200），
   字级 trigram 打分 + 每字出字奖励 + 名次惩罚 + 孤立生僻惩罚 + 补充语料 AC 自动机奖励。
 - **提前上屏**：候选前缀质量占比 ≥ confidence(0.995) 的最长公共前缀，连续 3 键一致才提交。
