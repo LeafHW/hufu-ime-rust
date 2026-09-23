@@ -99,6 +99,28 @@ int32_t hufu_client_sound_toggle(hufu_client *client);
 /* 「按键音效」当前态（勾选态显示用）：1=开，0=关，-1=未知（引擎不在线）。 */
 int32_t hufu_client_sound_state(hufu_client *client);
 
+/* ── 按键音效播放通道（key/select 响应里的 outcome.sound → wav 字节）──────── */
+
+/* 取走待处理音效 tag（key/select 响应里的 `outcome.sound`；引擎仅在
+ * sound.enabled 时填）：取走后清空，无待处理时为空串。
+ * 返回 NUL 结尾指针，指向客户端内部缓冲——**下次对同一客户端调用本函数前有效**，
+ * 宿主须同步拷走；client 为 NULL 时返回 NULL。 */
+const char *hufu_client_take_sound(hufu_client *client);
+
+/* 取回 tag 的完整 WAV（op `sound`）：成功返回引擎音量 0–100，并把字节缓存在
+ * 客户端里（`hufu_client_sound_data/size` 取，可直接落盘交给播放器）；失败、
+ * 未知 tag、音效文件缺失（回包 `data: null`）、引擎不在线返回 -1。
+ * 同一 tag 重复取用缓存（不再打扰引擎；操作「按键音效」开关后缓存失效）。 */
+int32_t hufu_client_sound_fetch(hufu_client *client, const char *tag);
+
+/* 最近一次成功 `hufu_client_sound_fetch` 的 WAV 字节（完整文件，含 RIFF 头）。
+ * 指针指向客户端内部缓冲——**下次 fetch 或释放客户端前有效**，宿主须同步拷走；
+ * 从未成功取过时返回 NULL。 */
+const uint8_t *hufu_client_sound_data(const hufu_client *client);
+
+/* 最近一次成功 `hufu_client_sound_fetch` 的字节数（0=没有）。 */
+int32_t hufu_client_sound_size(const hufu_client *client);
+
 /* ── 字反查（纯宿主侧：宿主取光标左侧汉字，本库按数据目录查拼音/虎码/拆分）────── */
 
 /* 装载字反查索引：data_dir = 数据根目录

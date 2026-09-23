@@ -35,11 +35,21 @@
 #include <fcitx-utils/utf8.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "hufu_abi.h"
 
@@ -226,6 +236,301 @@ std::vector<std::string> splitTabs(const std::string &s) {
 /// 构造时 `fcitx::readAsIni` 读入，状态菜单里的宿主开关用 `fcitx::safeSaveAsIni`
 /// 写回——两者必须同路径、同 API 家族，否则「界面上改了但重启就丢」或写进另一个文件。
 constexpr const char *kConfigPath = "conf/hufu.conf";
+
+/// ── 按键音效播放（宿主侧）────────────────────────────────────────────────
+/// 引擎在 key/select 回包里给音效 tag，wav 字节经 `sound` op 取回（见 hufu_abi.h）。
+/// 播放器由本层探测并后台 spawn：音量能映射的映射，不能的忽略（见 `soundPlayerArgs`）。
+
+/// 可用的播放器（按顺序探测：PulseAudio → PipeWire → ALSA → SoX）。
+enum class SoundPlayer {
+    Unknown, ///< 还没探测过
+    None,    ///< 一个都没有（已提示过安装）
+    Paplay,  ///< `paplay --volume=0..65536`（线性音量）
+    PwPlay,  ///< `pw-play --volume=0..1.0`
+    Aplay,   ///< aplay 没有音量选项：音量忽略（按引擎/系统侧音量放）
+    SoxPlay, ///< SoX 的 `play -v <0..1>`
+};
+
+/// 探测顺序与名字（`play` 是 SoX 的播放前端）。
+constexpr const char *kSoundPlayerNames[] = {"paplay", "pw-play", "aplay", "play"};
+
+/// 在 `$PATH` 里按 `kSoundPlayerNames` 顺序找第一个可执行的播放器：
+/// 找到则写回绝对路径并返回其种类，找不到返回 `None`。
+/// PATH 为空（未设置或清空）等于没有播放器——排障时可以清空 PATH 复现提示。
+SoundPlayer probeSoundPlayer(std::string *exe) {
+    const char *env = std::getenv("PATH");
+    if (env == nullptr || *env == '\0') {
+        return SoundPlayer::None;
+    }
+    std::vector<std::string> dirs;
+    std::string cur;
+    for (const char *p = env;; ++p) {
+        if (*p == ':' || *p == '\0') {
+            dirs.push_back(cur.empty() ? "." : cur);
+            cur.clear();
+            if (*p == '\0') {
+                break;
+            }
+            continue;
+        }
+        cur.push_back(*p);
+    }
+    for (const char *name : kSoundPlayerNames) {
+        for (const std::string &dir : dirs) {
+            const std::string candidate = dir + "/" + name;
+            struct stat st = {};
+            if (::stat(candidate.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+                ::access(candidate.c_str(), X_OK) != 0) {
+                continue;
+            }
+            *exe = candidate;
+            if (std::strcmp(name, "paplay") == 0) {
+                return SoundPlayer::Paplay;
+            }
+            if (std::strcmp(name, "pw-play") == 0) {
+                return SoundPlayer::PwPlay;
+            }
+            if (std::strcmp(name, "aplay") == 0) {
+                return SoundPlayer::Aplay;
+            }
+            return SoundPlayer::SoxPlay;
+        }
+    }
+    return SoundPlayer::None;
+}
+
+/// 引擎音量（0–100）→ 播放器音量因子（"0.00"–"1.00"）。
+std::string volumeFactor(int32_t volume) {
+    char buf[16] = {};
+    std::snprintf(buf, sizeof(buf), "%.2f", static_cast<double>(volume) / 100.0);
+    return buf;
+}
+
+/// 播放器参数（`path` 是已落盘的 wav）。音量映射按各播放器自己的选项：
+/// paplay 线性 0..65536、pw-play 0..1.0、SoX `-v` 0..1；aplay 无音量选项，
+/// 只能按系统/引擎侧音量播放（这里忽略音量，不臆造参数）。
+std::vector<std::string> soundPlayerArgs(SoundPlayer player, const std::string &path,
+                                         int32_t volume) {
+    const int32_t v = std::clamp(volume, 0, 100);
+    switch (player) {
+    case SoundPlayer::Paplay:
+        return {"--volume=" + std::to_string(v * 65536 / 100), path};
+    case SoundPlayer::PwPlay:
+        return {"--volume=" + volumeFactor(v), path};
+    case SoundPlayer::SoxPlay:
+        return {"-v", volumeFactor(v), path};
+    case SoundPlayer::Unknown:
+    case SoundPlayer::None:
+    case SoundPlayer::Aplay:
+        break;
+    }
+    return {path};
+}
+
+/// 后台 spawn 播放器：fork 两次——中间进程立刻退出并被本进程回收（不留僵尸），
+/// 孙进程改挂 init 后 exec 播放器；本进程**不等待**孙进程，UI 线程不被播放阻塞。
+/// 标准输入/输出/错误都接到 /dev/null（播放器的话不进 fcitx5 的终端）。
+///
+/// 路径与 argv 都在 fork **之前**备好：fork 之后只调用异步信号安全函数
+///（fork/open/dup2/close/execv/_exit）——这是多线程进程里 fork 仍然安全的前提。
+void spawnSoundPlayer(const std::string &exe, const std::vector<std::string> &args) {
+    if (exe.empty()) {
+        return;
+    }
+    std::vector<std::string> all;
+    all.reserve(args.size() + 1);
+    all.push_back(exe); // argv[0]
+    all.insert(all.end(), args.begin(), args.end());
+    std::vector<char *> argv;
+    argv.reserve(all.size() + 1);
+    for (std::string &s : all) {
+        argv.push_back(const_cast<char *>(s.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        return; // 起不来就算了：音效是锦上添花，不该影响输入
+    }
+    if (pid == 0) {
+        if (::fork() != 0) {
+            _exit(0); // 中间层：立刻退出，孙进程改挂 init（由 init 回收）
+        }
+        const int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) {
+                ::close(devnull);
+            }
+        }
+        ::execv(exe.c_str(), argv.data());
+        _exit(127); // exec 失败（文件被换掉等）：静默退场
+    }
+    int status = 0;
+    ::waitpid(pid, &status, 0); // 只回收中间层（它立刻退出）
+}
+
+/// 音效 wav 的落盘目录：`$XDG_RUNTIME_DIR/hufu-sound`（用户私有运行时目录，首选）；
+/// `XDG_RUNTIME_DIR` 缺失时退回 `$TMPDIR`（与 socket 默认路径同口径），再退回 `/tmp`。
+std::string soundDirPath() {
+    std::string base;
+    if (const char *runtime = std::getenv("XDG_RUNTIME_DIR");
+        runtime != nullptr && *runtime != '\0') {
+        base = runtime;
+    } else if (const char *tmp = std::getenv("TMPDIR");
+               tmp != nullptr && *tmp != '\0') {
+        base = tmp;
+    } else {
+        base = "/tmp";
+    }
+    return base + "/hufu-sound";
+}
+
+/// tag 只当文件名的一段用：引擎侧白名单是 key/select/commit/page，
+/// 这里再限一次字符集（不信任对端，也不让 `/`、`..` 进路径）。
+bool isSafeSoundTag(const std::string &tag) {
+    if (tag.empty() || tag.size() > 16) {
+        return false;
+    }
+    for (unsigned char c : tag) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// 确保落盘目录存在且属于本人（首次创建即 0700）。`/tmp` 回退路径上可能已经有
+/// 别人抢先建的同名目录——那种情况直接判失败：宁可不播，也不往别人的目录里写。
+bool ensureSoundDir(const std::string &dir) {
+    if (::mkdir(dir.c_str(), 0700) == 0) {
+        return true;
+    }
+    struct stat st = {};
+    if (errno != EEXIST || ::stat(dir.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISDIR(st.st_mode) && st.st_uid == ::geteuid();
+}
+
+/// 写 wav 文件（0600）：临时目录可能被别的用户读到，故不给组/他人权限；
+/// `O_NOFOLLOW` 防止回退路径上被同名符号链接顶掉（是链接就直接失败）。
+bool writeFile0600(const std::string &path, const uint8_t *data, size_t size) {
+    const int fd = ::open(path.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    size_t off = 0;
+    bool ok = true;
+    while (off < size) {
+        const ssize_t n = ::write(fd, data + off, size - off);
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        off += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    return ok;
+}
+
+/// 按键音效通道（宿主侧）：把「取 tag → 取 wav → 落盘 → 后台播放」收在一处，
+/// 输入上下文相关的东西一概不碰。失败一律静默降级：只记**一次** Warn，不影响输入。
+///
+/// 本层**不缓存引擎的开关态与音量**：引擎只在 `sound.enabled` 时才在回包里带 tag
+///（没带就是没开或本键无音效），音量由客户端每次现取。于是设置页/托盘的任何改动
+/// 都是即改即生效——此前宿主缓存开关、客户端缓存音量，都得等开关翻转一次才刷新。
+class HufuSoundChannel {
+public:
+    /// 一次 key/select 之后：取走待处理音效 tag（无论有无音效都要取走，否则会
+    /// 残留到下一次按键），取回 wav 并播放。
+    void drain(hufu_client *engine) {
+        if (engine == nullptr) {
+            return;
+        }
+        const char *tag = hufu_client_take_sound(engine);
+        if (tag == nullptr || *tag == '\0') {
+            return; // 本次没有音效（引擎侧 sound.enabled 关时就不会有）
+        }
+        const std::string name(tag);
+        const int32_t volume = hufu_client_sound_fetch(engine, name.c_str());
+        const uint8_t *data = hufu_client_sound_data(engine);
+        const int32_t size = hufu_client_sound_size(engine);
+        if (volume < 0 || data == nullptr || size <= 0) {
+            warnOnce("取按键音效失败（音效 wav 缺失或 hufu-server 不可达）");
+            return;
+        }
+        const std::string path = ensureSoundFile(name, data, static_cast<size_t>(size));
+        if (path.empty()) {
+            warnOnce("按键音效落盘失败");
+            return;
+        }
+        play(path, volume);
+    }
+
+private:
+    /// 一类音效的 wav 落盘路径（目录见 `soundDirPath`）。
+    static std::string soundFilePath(const std::string &tag) {
+        return soundDirPath() + "/" + tag + ".wav";
+    }
+
+    /// 该类音效首次播放前落盘（其后复用同一文件），返回可播路径；空串=写不了。
+    std::string ensureSoundFile(const std::string &tag, const uint8_t *data, size_t size) {
+        if (!isSafeSoundTag(tag)) {
+            return {};
+        }
+        const std::string path = soundFilePath(tag);
+        if (std::find(written_.begin(), written_.end(), tag) != written_.end()) {
+            return path;
+        }
+        if (!ensureSoundDir(soundDirPath()) || !writeFile0600(path, data, size)) {
+            return {};
+        }
+        written_.push_back(tag);
+        HUFU_DEBUG() << "hufu: 音效落盘 " << path << "（" << size << " 字节）";
+        return path;
+    }
+
+    /// 探测播放器（只探一次）并后台播放。
+    void play(const std::string &path, int32_t volume) {
+        if (player_ == SoundPlayer::Unknown) {
+            player_ = probeSoundPlayer(&playerExe_);
+            if (player_ == SoundPlayer::None) {
+                FCITX_LOGC(hufuLog, Warn)
+                    << "hufu: 未找到音频播放器，按键音效无法播放——请安装 "
+                       "pulseaudio-utils / pipewire-bin / alsa-utils（或 sox）之一";
+            }
+            HUFU_DEBUG() << "hufu: 音效播放器 " << playerExe_ << "（种类 "
+                         << static_cast<int>(player_) << "）";
+        }
+        if (player_ == SoundPlayer::None) {
+            return; // 已经提示过：不再刷屏
+        }
+        spawnSoundPlayer(playerExe_, soundPlayerArgs(player_, path, volume));
+    }
+
+    /// 同一类失败只记一次 Warn（音效是附加功能，缺数据/缺播放器不该刷日志）。
+    void warnOnce(const std::string &reason) {
+        if (warnedFetch_) {
+            return;
+        }
+        warnedFetch_ = true;
+        FCITX_LOGC(hufuLog, Warn) << "hufu: " << reason << "，已跳过播放";
+    }
+
+    /// 播放器探测结果（`Unknown` = 还没探过；`None` = 已探过且没有）
+    SoundPlayer player_ = SoundPlayer::Unknown;
+    std::string playerExe_;
+    /// 已落盘的 tag（每类只写一次）
+    std::vector<std::string> written_;
+    /// 取音效/落盘失败是否已记过 Warn
+    bool warnedFetch_ = false;
+};
 
 class HufuEngine;
 
@@ -764,6 +1069,9 @@ public:
             states.test(fcitx::KeyState::Super) ? 1 : 0,
             states.test(fcitx::KeyState::CapsLock) ? 1 : 0, lineEnd);
         context_ = nullptr;
+        // 音效：取走本键回包里的 tag（启用时取回 wav 并后台播放）。放在按键流程之外：
+        // 播放失败/没有播放器都不影响输入，也不碰 UI。
+        sound_.drain(engine_);
         if (rc & HUFU_KEY_CONSUMED) {
             keyEvent.filterAndAccept();
         }
@@ -794,6 +1102,8 @@ public:
         context_ = inputContext;
         hufu_client_select(engine_, index);
         context_ = nullptr;
+        // 鼠标选重同样带音效（引擎在 select 回包里给 tag）
+        sound_.drain(engine_);
     }
 
 private:
@@ -1550,6 +1860,8 @@ private:
     std::string statusText_;
     /// 按键音效勾选态缓存：1=开 / 0=关 / -1=未知（未取到；菜单显示为未勾选）
     int32_t soundOn_ = -1;
+    /// 按键音效播放通道（宿主侧；启用态由上面的刷新点写入）
+    HufuSoundChannel sound_;
     /// 字反查索引装载状态：0=未装载（首次触发才装载）/ 1=可用 / -1=不可用（静默关闭）
     int32_t charLookupState_ = 0;
     /// 字反查武装期间「方向键透传后延迟重查」的定时器（`nullptr`=没有待处理的重查）

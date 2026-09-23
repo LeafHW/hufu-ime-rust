@@ -11,6 +11,11 @@
 //! C++ 侧（`hufu-addon/shell/hufu.cpp`）经 `hufu_abi.h` 调用本库；
 //! 本 crate 同时产出 rlib 供 mock socket 单测。
 //!
+//! 按键音效：key/select 回包里的 `outcome.sound`（引擎仅在 `sound.enabled` 时填）
+//! 记为待处理 tag，宿主用 `hufu_client_take_sound` 取走后，再经 `hufu_client_sound_fetch`
+//! 取回完整 WAV 字节（op `sound`，按 tag 缓存）与当前音量（op `sound_state`，每次现取）——
+//! 播放由宿主负责（本层只搬字节）。
+//!
 //! 所有 `hufu_client_*` 导出都是 `unsafe fn`：调用方须保证指针有效（`hufu_client_new`
 //! 的返回值，或各函数注释里明确允许的 NULL）；返回的 `*const c_char` 指向客户端内部缓冲，
 //! 下次对同一客户端调用同类函数前有效，宿主须同步拷走。
@@ -274,6 +279,71 @@ impl CharLookup {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 按键音效：key/select 回包的 outcome.sound → op sound 取回完整 WAV
+// ---------------------------------------------------------------------------
+
+/// 一类音效的字节与音量（0–100）：首次 fetch 时取回，其后同类 tag 直接用缓存。
+struct SoundClip {
+    /// 完整 WAV 文件（含 RIFF 头），可直接落盘交给播放器
+    bytes: Vec<u8>,
+    /// 取回时的引擎音量（`sound.volume`，0–100）
+    volume: i32,
+}
+
+/// base64 单字符值（标准字母表；非法字符返回 None）。
+fn b64_val(b: u8) -> Option<u32> {
+    match b {
+        b'A'..=b'Z' => Some(u32::from(b - b'A')),
+        b'a'..=b'z' => Some(u32::from(b - b'a') + 26),
+        b'0'..=b'9' => Some(u32::from(b - b'0') + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// 标准 base64 解码（自足实现，不引依赖；引擎侧的编码同样是自足实现）。
+///
+/// 非法字符、长度不是 4 的倍数、`=` 不在结尾组或不在末尾，都返回 None——
+/// 宁可按「取音效失败」处理，也不把半截字节当 WAV 交给播放器。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let chunks = bytes.len() / 4;
+    let mut out = Vec::with_capacity(chunks * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let last = i + 1 == chunks;
+        let mut n: u32 = 0;
+        let mut pad = 0u32;
+        for (j, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                // 填充只能出现在最后一组的最后 1–2 位
+                if !last || j < 2 {
+                    return None;
+                }
+                pad += 1;
+                n <<= 6;
+                continue;
+            }
+            if pad > 0 {
+                return None; // `=` 之后不允许再有数据
+            }
+            n = (n << 6) | b64_val(b)?;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// 单会话引擎客户端（惰性连接 + 断线重连）。
 pub struct HufuClient {
     sock_path: PathBuf,
@@ -294,6 +364,15 @@ pub struct HufuClient {
     char_lookup: Option<CharLookup>,
     /// `hufu_client_char_lookup` 返回值缓存（C++ 侧同步拷走）
     char_lookup_row: CString,
+    /// 待处理音效 tag（key/select 回包的 `outcome.sound`；空 = 无），
+    /// 由宿主在每次 key/select 之后用 `take_sound` 取走。
+    sound_pending: CString,
+    /// `take_sound` 返回值缓存（取走后仍指向有效内存，C++ 侧同步拷走）
+    sound_tag_scratch: CString,
+    /// tag → 音效片段（首次 fetch 取回；其后同类 tag 用缓存，不再打扰引擎）
+    sound_clips: HashMap<String, SoundClip>,
+    /// 最近一次成功 fetch 的完整 WAV 字节（`sound_data` 暴露）
+    sound_bytes: Vec<u8>,
 }
 
 impl HufuClient {
@@ -311,6 +390,10 @@ impl HufuClient {
             config_scratch: CString::default(),
             char_lookup: None,
             char_lookup_row: CString::default(),
+            sound_pending: CString::default(),
+            sound_tag_scratch: CString::default(),
+            sound_clips: HashMap::new(),
+            sound_bytes: Vec::new(),
         }
     }
 
@@ -409,13 +492,91 @@ impl HufuClient {
 
     /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
     /// （1=开 / 0=关 / -1=未知——引擎不在线或回包异常）。
+    ///
+    /// 成功时清掉音效字节缓存：音量与「哪几类音效存在」都可能刚变过，下一次取用
+    /// 重新问引擎（否则要重启客户端才生效）。
     pub fn sound_toggle(&mut self) -> i32 {
-        enabled_flag(self.call(&serde_json::json!({"op": "sound_toggle"})))
+        let state = enabled_flag(self.call(&serde_json::json!({"op": "sound_toggle"})));
+        if state >= 0 {
+            self.sound_clips.clear();
+        }
+        state
     }
 
     /// 托盘「按键音效」勾选态：1=开 / 0=关 / -1=未知（引擎不在线或回包异常）。
     pub fn sound_state(&mut self) -> i32 {
         enabled_flag(self.call(&serde_json::json!({"op": "sound_state"})))
+    }
+
+    /// 取走待处理音效 tag（key/select 回包的 `outcome.sound`）：取走后清空，
+    /// 无待处理时为空串。返回的指针指向客户端内部缓冲，下次调用本函数前有效。
+    pub fn take_sound(&mut self) -> *const c_char {
+        self.sound_tag_scratch = std::mem::take(&mut self.sound_pending);
+        self.sound_tag_scratch.as_ptr()
+    }
+
+    /// 取回 tag 的完整 WAV（op `sound`）：成功返回**当前**音量 0–100，并把字节缓存在
+    /// 客户端里；失败、未知 tag、音效文件缺失（回包 `data: null`）、引擎不在线都返回 -1。
+    ///
+    /// 字节按 tag 缓存（音效 wav 是安装期产物，不随设置改动），音量则**每次现取**
+    /// （`sound_state`，小回包）：音量是随时可改的设置项，拖一次设置页滑块就该立刻
+    /// 生效，不该等到「按键音效」开关翻转才更新。现取失败的短暂窗口沿用上一次已知
+    /// 音量，让已在缓存里的音效照常出声（引擎挂起时不该突然静音）。
+    /// 缓存的失效点仍是 `sound_toggle`（音效文件集合可能刚变过）。
+    pub fn sound_fetch(&mut self, tag: &str) -> i32 {
+        if tag.is_empty() {
+            return -1;
+        }
+        if self.sound_clips.contains_key(tag) {
+            let live = self.sound_volume();
+            if let Some(clip) = self.sound_clips.get_mut(tag) {
+                if live >= 0 {
+                    clip.volume = live;
+                }
+                self.sound_bytes = clip.bytes.clone();
+                return clip.volume;
+            }
+        }
+        let Some(resp) = self.call(&serde_json::json!({"op": "sound", "tag": tag})) else {
+            return -1;
+        };
+        // 文件缺失时引擎回 `data: null`（volume 仍带）——按取不到处理。
+        let Some(data) = resp.get("data").and_then(|v| v.as_str()) else {
+            return -1;
+        };
+        let Some(bytes) = base64_decode(data) else {
+            self.set_status("音效 base64 解码失败");
+            return -1;
+        };
+        if bytes.is_empty() {
+            self.set_status("音效数据为空");
+            return -1;
+        }
+        let volume = resp
+            .get("volume")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(0, 100) as i32;
+        self.sound_bytes = bytes.clone();
+        self.sound_clips
+            .insert(tag.to_string(), SoundClip { bytes, volume });
+        volume
+    }
+
+    /// 引擎当前音量（op `sound_state`，0–100）；-1=未知（引擎不在线或回包没有 volume）。
+    fn sound_volume(&mut self) -> i32 {
+        let Some(resp) = self.call(&serde_json::json!({"op": "sound_state"})) else {
+            return -1;
+        };
+        resp.get("volume")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.clamp(0, 100) as i32)
+            .unwrap_or(-1)
+    }
+
+    /// 最近一次成功 `sound_fetch` 的 WAV 字节（从未成功取过时为空切片）。
+    pub fn sound_data(&self) -> &[u8] {
+        &self.sound_bytes
     }
 
     /// 拉取引擎配置快照（fcitx5 设置页打开时调用）。
@@ -573,6 +734,13 @@ impl HufuClient {
             })
             .unwrap_or_default();
         self.last_back = outcome.back;
+        // 音效 tag：引擎仅在 sound.enabled 时填；回包里没有就保持待处理态不变
+        //（宿主每次 key/select 之后都会 take_sound 取走，不会积压）。
+        if let Some(tag) = outcome.sound.as_deref() {
+            if !tag.is_empty() {
+                self.sound_pending = CString::new(tag).unwrap_or_default();
+            }
+        }
         if outcome.consumed || outcome.state.is_some() {
             self.deliver(&outcome, &state);
         }
@@ -800,6 +968,56 @@ pub unsafe extern "C" fn hufu_client_sound_state(c: *mut HufuClient) -> c_int {
         return -1;
     }
     unsafe { &mut *c }.sound_state()
+}
+
+/// 取走待处理音效 tag（key/select 回包里的 `outcome.sound`）：取走后清空，
+/// 无待处理时为空串。返回 NUL 结尾指针，指向客户端内部缓冲——**下次对同一客户端
+/// 调用本函数前有效**，宿主须同步拷走；`c` 为 NULL 时返回 NULL。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_take_sound(c: *mut HufuClient) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.take_sound()
+}
+
+/// 取回 tag 的完整 WAV（op `sound`）：成功返回**当前**音量 0–100，并把字节缓存在
+/// 客户端里；失败、未知 tag、音效文件缺失（回包 `data: null`）、引擎不在线都返回 -1。
+/// 字节按 tag 重复取用缓存（`sound_toggle` 时失效），音量每次现取（即改即生效）。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_sound_fetch(c: *mut HufuClient, tag: *const c_char) -> c_int {
+    if c.is_null() || tag.is_null() {
+        return -1;
+    }
+    let tag = unsafe { CStr::from_ptr(tag) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { &mut *c }.sound_fetch(&tag)
+}
+
+/// 最近一次成功 `hufu_client_sound_fetch` 的 WAV 字节（完整文件，含 RIFF 头）。
+/// 指针指向客户端内部缓冲，**下次 fetch 或释放客户端前有效**，宿主须同步拷走；
+/// 从未成功取过时返回 NULL。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_sound_data(c: *const HufuClient) -> *const u8 {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    let data = unsafe { &*c }.sound_data();
+    if data.is_empty() {
+        std::ptr::null()
+    } else {
+        data.as_ptr()
+    }
+}
+
+/// 最近一次成功 `hufu_client_sound_fetch` 的字节数（0=没有）。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_sound_size(c: *const HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    unsafe { &*c }.sound_data().len() as c_int
 }
 
 /// 拉取引擎配置（fcitx5 设置页打开时调用）：1=成功。
@@ -1405,6 +1623,244 @@ mod tests {
         assert!(!c.open_schema_dir());
         assert_eq!(c.sound_toggle(), -1);
         assert_eq!(c.sound_state(), -1);
+    }
+
+    /// 标准 base64 编码（测试侧的独立实现：给 mock 造真实回包，不与被测解码器共用代码）。
+    fn b64(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// base64 解码：对已知向量（外部可核对的编码）与非法输入的行为。
+    #[test]
+    fn base64_decode_known_vectors_and_bad_input() {
+        assert_eq!(base64_decode("UklGRg==").unwrap(), b"RIFF");
+        assert_eq!(base64_decode("V0FWRQ==").unwrap(), b"WAVE");
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode("AAECAwQ=").unwrap(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(base64_decode("+/8=").unwrap(), vec![0xfb, 0xff]);
+        // 非法输入一律 None（宁可不播，也不把半截字节当 WAV）。
+        assert!(base64_decode("").is_none(), "空串");
+        assert!(base64_decode("AAA").is_none(), "长度不是 4 的倍数");
+        assert!(base64_decode("AA*A").is_none(), "非法字符");
+        assert!(base64_decode("A=AA").is_none(), "填充不在末尾");
+        assert!(base64_decode("AA=A").is_none(), "填充后还有数据");
+        assert!(base64_decode("====").is_none(), "整组填充");
+    }
+
+    /// 音效通道：回包含 `outcome.sound` ⇒ `take_sound` 得到 tag，且只取一次。
+    #[test]
+    fn sound_tag_taken_once() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("sound-tag");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({
+                    "outcome": {"consumed": true, "sound": "key"},
+                    "state": {"raw": "u", "candidates": [], "page": 0, "page_count": 0,
+                              "mode": "Normal", "chinese": true}
+                }),
+                serde_json::json!({
+                    "outcome": {"consumed": true},
+                    "state": {"raw": "", "candidates": [], "page": 0, "page_count": 0,
+                              "mode": "Normal", "chinese": true}
+                }),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        let cptr: *mut HufuClient = &mut c;
+        assert_eq!(
+            cstr_of(unsafe { hufu_client_take_sound(cptr) }),
+            "",
+            "还没按键"
+        );
+        c.key("u", false, false, false, false, false, -1);
+        assert_eq!(
+            cstr_of(unsafe { hufu_client_take_sound(cptr) }),
+            "key",
+            "回包里的 tag"
+        );
+        assert_eq!(
+            cstr_of(unsafe { hufu_client_take_sound(cptr) }),
+            "",
+            "取走即清空"
+        );
+        // 第二个回包没有 sound 字段：待处理保持为空，不会把上一个 tag 再送一遍。
+        c.key("i", false, false, false, false, false, -1);
+        assert_eq!(cstr_of(unsafe { hufu_client_take_sound(cptr) }), "");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["op"], "key");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    /// 音效通道：`sound_fetch` 成功返回音量，字节与 base64 原文逐字节一致；
+    /// 同 tag 重复取用时字节走缓存，音量**每次现取**（改设置即刻生效，无需翻转开关）。
+    #[test]
+    fn sound_fetch_returns_volume_and_bytes() {
+        // 假 WAV：RIFF 头 + 一段含 0x00 与高位字节的负载（验证解码不截断二进制）。
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&[0x24, 0x00, 0x00, 0x00]);
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        wav.extend(0u8..=63);
+        let encoded = b64(&wav);
+
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("sound-fetch");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"data": encoded, "volume": 42}),
+                // 第二次的音量：与首次不同，用来证明「现取」而不是回放旧缓存。
+                serde_json::json!({"enabled": true, "volume": 77}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        let cptr: *mut HufuClient = &mut c;
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"key".as_ptr()) },
+            42,
+            "成功返回引擎音量"
+        );
+        let size = unsafe { hufu_client_sound_size(cptr) };
+        assert_eq!(size as usize, wav.len(), "长度=WAV 字节数");
+        let data = unsafe { hufu_client_sound_data(cptr) };
+        assert!(!data.is_null());
+        let got = unsafe { std::slice::from_raw_parts(data, size as usize) };
+        assert_eq!(got, wav.as_slice(), "字节与 base64 原文一致");
+        // 同 tag 第二次：字节走缓存（不再发 sound op），音量另取一次 sound_state。
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"key".as_ptr()) },
+            77,
+            "音量随引擎现值生效，不必等开关翻转"
+        );
+        let size2 = unsafe { hufu_client_sound_size(cptr) };
+        let data2 = unsafe { hufu_client_sound_data(cptr) };
+        assert_eq!(size2, size, "缓存命中的字节数不变");
+        let got2 = unsafe { std::slice::from_raw_parts(data2, size2 as usize) };
+        assert_eq!(got2, wav.as_slice(), "缓存命中的字节仍是同一份 WAV");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "第二次只补一个音量小回包");
+        assert_eq!(reqs[0]["op"], "sound");
+        assert_eq!(reqs[0]["tag"], "key");
+        assert_eq!(reqs[1]["op"], "sound_state");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    /// 音效通道：音量现取失败（引擎挂起/回包缺 volume）时沿用上一次已知音量，
+    /// 已在缓存里的音效照常出声——引擎的短暂沉默不该变成突然静音。
+    #[test]
+    fn sound_volume_falls_back_when_state_unavailable() {
+        let wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00".to_vec();
+        let encoded = b64(&wav);
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("sound-volume-fallback");
+        let (handle, _captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"data": encoded, "volume": 33}),
+                serde_json::json!({"enabled": true}), // 回包没有 volume
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        let cptr: *mut HufuClient = &mut c;
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"key".as_ptr()) },
+            33
+        );
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"key".as_ptr()) },
+            33,
+            "取不到现值就沿用上次音量"
+        );
+        assert_eq!(unsafe { hufu_client_sound_size(cptr) } as usize, wav.len());
+        handle.join().unwrap();
+    }
+
+    /// 音效通道的失败面：`data:null`（音效文件缺失）/ 未知 tag / 空 tag / 引擎不在线
+    /// 都返回 -1 且不产出字节；`c==NULL` 的导出返回 NULL/0，不崩。
+    #[test]
+    fn sound_fetch_failures_are_silent() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("sound-fail");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"data": null, "volume": 50}), // 音效文件缺失
+                serde_json::json!({"error": "未知音效"}),        // 引擎白名单外的 tag
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        let cptr: *mut HufuClient = &mut c;
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"key".as_ptr()) },
+            -1,
+            "data:null"
+        );
+        assert_eq!(unsafe { hufu_client_sound_size(cptr) }, 0, "失败不产出字节");
+        assert!(unsafe { hufu_client_sound_data(cptr) }.is_null());
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"bogus".as_ptr()) },
+            -1,
+            "未知 tag"
+        );
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(cptr, c"".as_ptr()) },
+            -1,
+            "空 tag"
+        );
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "空 tag 不发请求");
+        drop(reqs);
+        handle.join().unwrap();
+
+        // 引擎不在线：同样 -1，不 panic。
+        let mut off = client_for(test_sock("sound-offline"), cap_ptr);
+        let optr: *mut HufuClient = &mut off;
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(optr, c"key".as_ptr()) },
+            -1
+        );
+        assert_eq!(unsafe { hufu_client_sound_size(optr) }, 0);
+        assert_eq!(cstr_of(unsafe { hufu_client_take_sound(optr) }), "");
+
+        // NULL 句柄：导出按约定早退。
+        assert!(unsafe { hufu_client_take_sound(std::ptr::null_mut()) }.is_null());
+        assert!(unsafe { hufu_client_sound_data(std::ptr::null()) }.is_null());
+        assert_eq!(unsafe { hufu_client_sound_size(std::ptr::null()) }, 0);
+        assert_eq!(
+            unsafe { hufu_client_sound_fetch(std::ptr::null_mut(), c"key".as_ptr()) },
+            -1
+        );
     }
 
     /// 测试用数据根目录（按 `$HUFU_ROOT` 布局造小样本；Drop 时整树删除）。
