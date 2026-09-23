@@ -17,12 +17,8 @@ name: ci
 # latest 指向哪个发行版会漂。实际版本以 CI 日志里那步打印的为准；装到过旧版本时
 # configure 阶段直接报错，不会静默降级。
 #
-# 有意**没有**的两步（现状过不了，不在 CI 里假装绿，需单独一笔）：
-#   · cargo fmt -p hufu-fcitx5-client --check —— 本机实测 13 处 diff（exit 1）；
-#   · cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings —— 本机实测
-#     31 条 lint（29 条 not_unsafe_ptr_arg_deref + type_complexity + too_many_arguments）。
-# 先格式化 / 先修 lint（或对 C ABI 侧显式 allow）落地后，再把两步加回来，并同步加进
-# platform/linux/checks/ci-local.sh。
+# 静态检查（排版 / clippy）也在 `ci-local.sh` 里（⑨/⑩），本工作流只负责装环境与
+# 预热依赖缓存——检查逻辑只有一份，本地与 CI 不漂移。
 
 on:
   push:

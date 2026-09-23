@@ -24,10 +24,9 @@
 # 只跑一条 `cargo fetch --offline --locked` 做只读探测：过了说明缓存够用，
 # 没过就把补救命令打出来（见 ①）。
 #
-# 有意不在本脚本（也不在 CI）里的两项：`cargo fmt -p hufu-fcitx5-client --check`
-# 与 `cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings`——现有代码
-# 过不了（13 处 rustfmt diff；31 条 clippy lint），要单独一笔先格式化/先修 lint，
-# 不能为过 CI 顺手大改 C ABI 侧代码。
+# 静态检查两项也在本脚本里（⑨ 排版 / ⑩ clippy）：这两个 crate 的代码是我们自己的，
+# 排版与 lint 就该由守卫钉住，而不是靠自觉；`hufu-fcitx5-client` 的 C ABI 导出统一是
+# `unsafe extern "C" fn`（ABI 与 `hufu_abi.h` 不变），因此 clippy 的裸指针告警已消除。
 #
 # 退出码：全部通过 0；任一项失败即 1（失败即停，不留半套结论）。
 set -euo pipefail
@@ -139,5 +138,20 @@ if [ -e "$xdg_tmp" ]; then
     fail "dry-run 落了改动：$xdg_tmp 被创建（dry-run 应当只打印，不产生副作用）"
 fi
 ok "两个 dry-run 都是 exit 0，且 $xdg_tmp 未被创建"
+
+step '⑨ 排版（cargo fmt -p hufu-fcitx5-client --check）'
+if ! fmt_out=$(cd platform/linux && cargo fmt -p hufu-fcitx5-client --check 2>&1); then
+    printf '%s\n' "$fmt_out"
+    fail 'rustfmt 有差异：在 platform/linux 跑 cargo fmt -p hufu-fcitx5-client 后重试'
+fi
+ok '排版干净'
+
+step '⑩ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
+if ! clippy_out=$(cd platform/linux &&
+    cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings 2>&1); then
+    printf '%s\n' "$clippy_out"
+    fail 'clippy 有告警（-D warnings 视作错误）'
+fi
+ok 'clippy 无告警'
 
 printf '\n\033[1m全部通过 ✔\033[0m\n'

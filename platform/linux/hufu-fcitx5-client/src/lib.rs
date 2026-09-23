@@ -10,6 +10,10 @@
 //!
 //! C++ 侧（`hufu-addon/shell/hufu.cpp`）经 `hufu_abi.h` 调用本库；
 //! 本 crate 同时产出 rlib 供 mock socket 单测。
+//!
+//! 所有 `hufu_client_*` 导出都是 `unsafe fn`：调用方须保证指针有效（`hufu_client_new`
+//! 的返回值，或各函数注释里明确允许的 NULL）；返回的 `*const c_char` 指向客户端内部缓冲，
+//! 下次对同一客户端调用同类函数前有效，宿主须同步拷走。
 #![allow(clippy::missing_safety_doc)]
 
 use std::collections::HashMap;
@@ -294,8 +298,7 @@ pub struct HufuClient {
 
 impl HufuClient {
     pub fn new(sock_path: PathBuf, host: HufuHost) -> Self {
-        let status = CString::new(format!("未连接（{}）", sock_path.display()))
-            .unwrap_or_default();
+        let status = CString::new(format!("未连接（{}）", sock_path.display())).unwrap_or_default();
         HufuClient {
             sock_path,
             stream: None,
@@ -353,7 +356,10 @@ impl HufuClient {
         }
     }
 
-    fn roundtrip(s: &mut UnixStream, req: &serde_json::Value) -> std::io::Result<serde_json::Value> {
+    fn roundtrip(
+        s: &mut UnixStream,
+        req: &serde_json::Value,
+    ) -> std::io::Result<serde_json::Value> {
         let body = serde_json::to_vec(req)?;
         if body.len() > BUF {
             return Err(std::io::Error::new(
@@ -445,7 +451,8 @@ impl HufuClient {
             return false;
         };
         merge_json(&mut merged, patch);
-        let Some(resp) = self.call(&serde_json::json!({"op": "config_set", "config": merged})) else {
+        let Some(resp) = self.call(&serde_json::json!({"op": "config_set", "config": merged}))
+        else {
             return false;
         };
         if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
@@ -507,6 +514,8 @@ impl HufuClient {
     /// 一次按键：返回 `(consumed, back)`；回调同步送达 commit/update。
     ///
     /// `line_end`：1=光标在行尾，0=不在，-1=未知（未知不带该字段）。
+    // 参数逐个对应 ABI 与线上的修饰键字段，合成结构体只是搬运，故保留长参数表。
+    #[allow(clippy::too_many_arguments)]
     pub fn key(
         &mut self,
         key: &str,
@@ -661,7 +670,7 @@ impl HufuClient {
 /// 创建客户端；`sock_path` 为 NULL/空串时用默认路径。宿主回调表可 NULL。
 /// 引擎未运行时也返回非 NULL（惰性连接，首次按键失败即透传）。
 #[no_mangle]
-pub extern "C" fn hufu_client_new(
+pub unsafe extern "C" fn hufu_client_new(
     sock_path: *const c_char,
     host: *const HufuHost,
 ) -> *mut HufuClient {
@@ -688,7 +697,7 @@ pub extern "C" fn hufu_client_new(
 }
 
 #[no_mangle]
-pub extern "C" fn hufu_client_free(c: *mut HufuClient) {
+pub unsafe extern "C" fn hufu_client_free(c: *mut HufuClient) {
     if !c.is_null() {
         drop(unsafe { Box::from_raw(c) });
     }
@@ -696,7 +705,7 @@ pub extern "C" fn hufu_client_free(c: *mut HufuClient) {
 
 /// 一次按键：返回位掩码 `HUFU_KEY_CONSUMED | (back << HUFU_KEY_BACK_SHIFT)`。
 #[no_mangle]
-pub extern "C" fn hufu_client_key(
+pub unsafe extern "C" fn hufu_client_key(
     c: *mut HufuClient,
     key: *const c_char,
     shift: c_int,
@@ -710,7 +719,9 @@ pub extern "C" fn hufu_client_key(
         return 0;
     }
     let client = unsafe { &mut *c };
-    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy().into_owned();
+    let key = unsafe { CStr::from_ptr(key) }
+        .to_string_lossy()
+        .into_owned();
     let (consumed, back) = client.key(
         &key,
         shift != 0,
@@ -728,7 +739,7 @@ pub extern "C" fn hufu_client_key(
 }
 
 #[no_mangle]
-pub extern "C" fn hufu_client_reset(c: *mut HufuClient) {
+pub unsafe extern "C" fn hufu_client_reset(c: *mut HufuClient) {
     if !c.is_null() {
         unsafe { &mut *c }.reset();
     }
@@ -736,7 +747,7 @@ pub extern "C" fn hufu_client_reset(c: *mut HufuClient) {
 
 /// 鼠标点击候选：`index` 为页内下标（当前候选窗列表序号）；1=已处理。
 #[no_mangle]
-pub extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int {
+pub unsafe extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int {
     if c.is_null() || index < 0 {
         return 0;
     }
@@ -749,7 +760,7 @@ pub extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) -> c_int 
 
 /// 托盘「重载码表」：当前方案原样重载；1=成功（0=失败/引擎不在线，宿主保持现状）。
 #[no_mangle]
-pub extern "C" fn hufu_client_reload_schema(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_reload_schema(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return 0;
     }
@@ -762,7 +773,7 @@ pub extern "C" fn hufu_client_reload_schema(c: *mut HufuClient) -> c_int {
 
 /// 托盘「打开方案文件夹」：请引擎打开当前方案码表目录；1=成功（0=失败/引擎不在线）。
 #[no_mangle]
-pub extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return 0;
     }
@@ -775,7 +786,7 @@ pub extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_int {
 
 /// 托盘「按键音效」：引擎侧取反并落盘；返回新态（1=开 / 0=关 / -1=未知）。
 #[no_mangle]
-pub extern "C" fn hufu_client_sound_toggle(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_sound_toggle(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return -1;
     }
@@ -784,7 +795,7 @@ pub extern "C" fn hufu_client_sound_toggle(c: *mut HufuClient) -> c_int {
 
 /// 托盘「按键音效」勾选态：1=开 / 0=关 / -1=未知（引擎不在线）。
 #[no_mangle]
-pub extern "C" fn hufu_client_sound_state(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_sound_state(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return -1;
     }
@@ -793,7 +804,7 @@ pub extern "C" fn hufu_client_sound_state(c: *mut HufuClient) -> c_int {
 
 /// 拉取引擎配置（fcitx5 设置页打开时调用）：1=成功。
 #[no_mangle]
-pub extern "C" fn hufu_client_config_refresh(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_config_refresh(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return 0;
     }
@@ -806,7 +817,7 @@ pub extern "C" fn hufu_client_config_refresh(c: *mut HufuClient) -> c_int {
 
 /// 配置补丁（JSON 对象字符串，深合并后写回引擎）：1=成功。
 #[no_mangle]
-pub extern "C" fn hufu_client_config_patch(
+pub unsafe extern "C" fn hufu_client_config_patch(
     c: *mut HufuClient,
     json: *const c_char,
 ) -> c_int {
@@ -826,7 +837,7 @@ pub extern "C" fn hufu_client_config_patch(
 
 /// 配置读取 bool：1/0，-1=未知（未拉取或路径不存在）。
 #[no_mangle]
-pub extern "C" fn hufu_client_config_bool(
+pub unsafe extern "C" fn hufu_client_config_bool(
     c: *const HufuClient,
     path: *const c_char,
 ) -> c_int {
@@ -839,7 +850,7 @@ pub extern "C" fn hufu_client_config_bool(
 
 /// 配置读取整数：1=成功（写 `*out`），0=未知/失败。
 #[no_mangle]
-pub extern "C" fn hufu_client_config_int(
+pub unsafe extern "C" fn hufu_client_config_int(
     c: *const HufuClient,
     path: *const c_char,
     out: *mut i64,
@@ -859,19 +870,21 @@ pub extern "C" fn hufu_client_config_int(
 
 /// 配置读取字符串：返回 NUL 结尾指针（空串=未知；下次调用前有效）。
 #[no_mangle]
-pub extern "C" fn hufu_client_config_str(
+pub unsafe extern "C" fn hufu_client_config_str(
     c: *mut HufuClient,
     path: *const c_char,
 ) -> *const c_char {
     if c.is_null() || path.is_null() {
         return std::ptr::null();
     }
-    let p = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
+    let p = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { &mut *c }.config_str_ptr(&p)
 }
 
 #[no_mangle]
-pub extern "C" fn hufu_client_focus(c: *mut HufuClient) {
+pub unsafe extern "C" fn hufu_client_focus(c: *mut HufuClient) {
     if !c.is_null() {
         unsafe { &mut *c }.focus();
     }
@@ -879,7 +892,7 @@ pub extern "C" fn hufu_client_focus(c: *mut HufuClient) {
 
 /// ping：1=引擎可达。设置页/排障用。
 #[no_mangle]
-pub extern "C" fn hufu_client_ping(c: *mut HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_ping(c: *mut HufuClient) -> c_int {
     if c.is_null() {
         return 0;
     }
@@ -892,7 +905,7 @@ pub extern "C" fn hufu_client_ping(c: *mut HufuClient) -> c_int {
 
 /// 最近状态串（诊断；UTF-8，NUL 结尾）。
 #[no_mangle]
-pub extern "C" fn hufu_client_status(c: *const HufuClient) -> *const c_char {
+pub unsafe extern "C" fn hufu_client_status(c: *const HufuClient) -> *const c_char {
     if c.is_null() {
         return std::ptr::null();
     }
@@ -901,7 +914,7 @@ pub extern "C" fn hufu_client_status(c: *const HufuClient) -> *const c_char {
 
 /// 最近中英态（subMode）：1=中。
 #[no_mangle]
-pub extern "C" fn hufu_client_chinese(c: *const HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_chinese(c: *const HufuClient) -> c_int {
     if c.is_null() {
         return 1;
     }
@@ -915,7 +928,7 @@ pub extern "C" fn hufu_client_chinese(c: *const HufuClient) -> c_int {
 /// 最近一次按键的回删数（commit 回调发生在 `key` 返回前——C++ 侧在
 /// commit 回调里读它，先回删已上屏字符再上屏新文本）。
 #[no_mangle]
-pub extern "C" fn hufu_client_last_back(c: *const HufuClient) -> c_int {
+pub unsafe extern "C" fn hufu_client_last_back(c: *const HufuClient) -> c_int {
     if c.is_null() {
         return 0;
     }
@@ -926,7 +939,7 @@ pub extern "C" fn hufu_client_last_back(c: *const HufuClient) -> c_int {
 /// 由宿主解析后传入——本层不读环境变量）。1=可用（拼音注释或码表至少一份读到数据），
 /// 0=不可用（目录/文件缺失、参数非法）；可重复调用（按新目录重载，失败即清空索引）。
 #[no_mangle]
-pub extern "C" fn hufu_client_char_lookup_init(
+pub unsafe extern "C" fn hufu_client_char_lookup_init(
     c: *mut HufuClient,
     data_dir: *const c_char,
 ) -> c_int {
@@ -950,7 +963,7 @@ pub extern "C" fn hufu_client_char_lookup_init(
 /// 返回 NUL 结尾指针，指向客户端内部缓冲——**下次对同一客户端调用本函数前有效**，
 /// 宿主须同步拷走；未初始化（或 `ucs4` 不是有效字符）时返回空串。
 #[no_mangle]
-pub extern "C" fn hufu_client_char_lookup(c: *mut HufuClient, ucs4: u32) -> *const c_char {
+pub unsafe extern "C" fn hufu_client_char_lookup(c: *mut HufuClient, ucs4: u32) -> *const c_char {
     if c.is_null() {
         return std::ptr::null();
     }
@@ -967,12 +980,14 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
 
+    /// 一次 update 回调的字段：(preedit, raw, candidates, commit_texts, selected, chinese)
+    type UpdateRecord = (String, String, Vec<String>, Vec<String>, usize, bool);
+
     /// 每个测试独立的回调捕获（并行测试互不干扰）。
     #[derive(Default)]
     struct Capture {
         commits: Vec<String>,
-        /// (preedit, raw, candidates, commit_texts, selected, chinese)
-        updates: Vec<(String, String, Vec<String>, Vec<String>, usize, bool)>,
+        updates: Vec<UpdateRecord>,
     }
 
     fn cap_mut<'a>(user: *mut c_void) -> &'a mut Capture {
@@ -980,7 +995,9 @@ mod tests {
     }
 
     unsafe extern "C" fn on_commit(user: *mut c_void, text: *const c_char) {
-        let s = unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned();
+        let s = unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned();
         cap_mut(user).commits.push(s);
     }
 
@@ -999,7 +1016,9 @@ mod tests {
         let pre = unsafe { CStr::from_ptr(preedit) }
             .to_string_lossy()
             .into_owned();
-        let raw = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        let raw = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
         let mut cands = Vec::new();
         let mut commits_v = Vec::new();
         for i in 0..count.max(0) as isize {
@@ -1031,7 +1050,10 @@ mod tests {
     /// mock server：把一串预置响应依次回给一个连接。
     /// 注意 listener 必须在测试线程同步 bind——放进子线程会与客户端
     /// connect 竞态（ECONNREFUSED → 测试静默失败/挂起）。
-    fn mock_server(path: PathBuf, responses: Vec<serde_json::Value>) -> std::thread::JoinHandle<()> {
+    fn mock_server(
+        path: PathBuf,
+        responses: Vec<serde_json::Value>,
+    ) -> std::thread::JoinHandle<()> {
         let listener = UnixListener::bind(&path).expect("bind");
         std::thread::spawn(move || {
             let Ok((mut s, _)) = listener.accept() else {
@@ -1102,10 +1124,7 @@ mod tests {
         assert_eq!(cap.updates.len(), 1);
         assert_eq!(cap.updates[0].0, "u");
         assert_eq!(cap.updates[0].1, "u");
-        assert_eq!(
-            cap.updates[0].2,
-            vec!["的".to_string(), "得".to_string()]
-        );
+        assert_eq!(cap.updates[0].2, vec!["的".to_string(), "得".to_string()]);
         assert_eq!(
             cap.updates[0].3,
             vec!["的".to_string(), "得".to_string()],
@@ -1221,7 +1240,10 @@ mod tests {
     fn mock_server_capture(
         path: PathBuf,
         responses: Vec<serde_json::Value>,
-    ) -> (std::thread::JoinHandle<()>, std::sync::Arc<Mutex<Vec<serde_json::Value>>>) {
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
         let listener = UnixListener::bind(&path).expect("bind");
         let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
         let cap2 = captured.clone();
