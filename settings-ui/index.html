@@ -594,7 +594,7 @@ function bindInputs() {
   });
 }
 
-/* ── 整句权重滑杆（1.4.8 版式：九项原术语，拖动后点「保存并应用」生效）── */
+/* ── 整句权重滑杆（拖动后点「保存并应用」生效；项数与 W_DEFAULTS 一一对应）── */
 const WDEFS = [
   ["beam_width", "Beam 宽度", 10, 32000, 1],
   ["candidate_limit", "候选上限", 5, 50, 1],
@@ -607,6 +607,7 @@ const WDEFS = [
   ["supplement_baseline", "语料奖励基准", 0, 20, 0.1],
   ["supplement_scale", "语料奖励缩放", 0, 8, 0.1],
   ["supplement_maximum", "语料奖励上限", 1, 40, 0.5],
+  ["high_freq_limit", "整句高频字上限（0=不限）", 0, 4000, 1],
 ];
 /* 出厂调校值：恢复初始值按钮用
    【2026-09-08 默认回归 1.4.8 模型值】W1 束宽 30000 实机每键解码
@@ -616,6 +617,7 @@ const W_DEFAULTS = {
   rank_penalty: 0.03, emitted_character_reward: 2.0,
   isolation_lambda: 2.0, isolation_threshold: 3000, confidence: 0.99,
   dict_bias: 1.0, supplement_baseline: 9.0, supplement_scale: 2.0, supplement_maximum: 32.0,
+  high_freq_limit: 0,
 };
 /* ── 【数值显示与手输 2026-09-10】滑杆数值显示统一（用户规格）：
    ① 纯数值最多两位小数（去尾零）；② 点击数字行内手动输入（回车/

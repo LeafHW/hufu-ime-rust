@@ -410,6 +410,10 @@ pub struct SentenceWeights {
     /// 不解析成「选重第 N」。由引擎按码表内容自动填充（有无数字码
     /// 词条），非用户配置项。
     pub digit_codes: bool,
+    /// 整句高频字过滤上限：频序（hufu-dict 的 TOP4000）不超过该值的
+    /// 单字，在整句组句里只允许用整句最优码参与，其余码的单字段丢弃。
+    /// 0 = 不限制（默认：过滤集合为空、判定恒 false，与不启用逐位一致）。
+    pub high_freq_limit: usize,
 }
 
 impl Default for SentenceWeights {
@@ -432,6 +436,8 @@ impl Default for SentenceWeights {
             supplement_scale: 2.0,
             supplement_maximum: 32.0,
             digit_codes: false,
+            // 0 = 不限制：整句组句不做高频字过滤（既有行为）
+            high_freq_limit: 0,
         }
     }
 }
@@ -609,6 +615,8 @@ mod tests {
         // 2026-09-08 默认回归 1.4.8 模型值（W1 30000 实测致越打越卡）
         assert_eq!(cfg.sentence.weights.beam_width, 200);
         assert_eq!(cfg.sentence.weights.candidate_limit, 20);
+        // 新增键默认 0 = 不限制（既有行为）
+        assert_eq!(cfg.sentence.weights.high_freq_limit, 0);
         // 八十修：默认 3 与 serde 缺省/设置页「稳 3 键」对齐
         assert_eq!(cfg.sentence.early_need, 3);
 
@@ -623,6 +631,8 @@ mod tests {
         assert_eq!(cfg2.input.auto_clear_empty, false);
         assert_eq!(cfg2.input.enter_clear, false);
         assert_eq!(cfg2.input.mixed_input, false);
+        // 旧 config.json 无 sentence 节/无新键 → 取默认 0（不限制）
+        assert_eq!(cfg2.sentence.weights.high_freq_limit, 0);
     }
 
     #[test]

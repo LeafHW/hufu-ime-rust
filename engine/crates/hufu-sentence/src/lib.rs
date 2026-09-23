@@ -18,7 +18,7 @@ use hufu_engine::{
 };
 use hufu_types::{Candidate, CandidateKind};
 use model::{BOS, EOS, NgramModel};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +30,15 @@ pub struct SentenceEngine {
     pub dict: Arc<Dict>,
     supplement: SupplementAutomaton,
     pub weights: SentenceWeights,
+    /// 【整句高频字过滤上限】组句里的「字 → 被禁用的码」表：频序
+    /// （hufu-dict 的 TOP4000）不超过 `weights.high_freq_limit` 的单字，
+    /// 只允许用整句最优码 `Dict::best_code_with_min_len(ch, 2)` 参与
+    /// 组句，该字其余 ≥2 码记在这里，命中即丢弃该条目。
+    /// 装配期（`with_model`）一次性建好：遍历码表的「字 → 码」表，逐字
+    /// 查一次频序（`rank_of` 首次调用建 O(1) 索引）——虎整句码表单字数
+    /// 十万级，成本一次性落在装载路径内；热路径只查集合。上限 0 时是空表
+    /// ⇒ 判定恒 false、零构建开销 ⇒ 与不启用逐位一致。
+    blocked: HashMap<char, HashSet<String>>,
     /// 解码缓存：last=同 raw 结果缓存；prefix=上次解码的过程桶
     /// （增量解码：新 raw 为旧 raw 追加且 base 前缀一致时，复用
     /// 前部桶只重算尾部窗口）。
@@ -223,6 +232,48 @@ fn chars_of(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
+/// 【整句高频字过滤上限】装配期构建禁用表（语义见 `SentenceEngine::blocked`）。
+///
+/// 逐条固化规则与豁免：
+/// - 只扫单字（词条不参与）；
+/// - 频序表外的字不参与；
+/// - 频序 > N 的字不参与；
+/// - 整句最优码取不到（`None`）的整字不过滤——宁可不筛，不误删；
+/// - 只登记 ≥2 码：1 码条目在判定侧本就不比较（官方整句口径排除 1 码）。
+///
+/// N = 0 直接返回空表：不进循环、零构建成本，判定恒 false。
+fn build_blocked(dict: &Dict, limit: usize) -> HashMap<char, HashSet<String>> {
+    let mut blocked: HashMap<char, HashSet<String>> = HashMap::new();
+    if limit == 0 {
+        return blocked;
+    }
+    for (text, codes) in dict.text_to_codes.iter() {
+        let mut chars = text.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            continue; // 词条不参与
+        };
+        let Some(rank) = hufu_dict::freq::rank_of(ch) else {
+            continue; // 频序表外
+        };
+        if rank > limit {
+            continue;
+        }
+        // 整句最优码（官方口径：一简字不用 1 码）
+        let Some(best) = dict.best_code_with_min_len(text, 2) else {
+            continue; // 最优码取不到 ⇒ 整字不过滤
+        };
+        let banned: HashSet<String> = codes
+            .iter()
+            .filter(|code| code.chars().count() >= 2 && code.as_str() != best)
+            .cloned()
+            .collect();
+        if !banned.is_empty() {
+            blocked.insert(ch, banned);
+        }
+    }
+    blocked
+}
+
 impl SentenceEngine {
     pub fn load(
         model_path: &Path,
@@ -251,13 +302,34 @@ impl SentenceEngine {
             weights.supplement_scale,
             weights.supplement_maximum,
         );
+        // 【整句高频字过滤上限】禁用表随引擎装配一次定型（改 weights 的
+        // 该键需重建引擎，与码表/模型同为装配期数据）。
+        let blocked = build_blocked(&dict, weights.high_freq_limit);
         SentenceEngine {
             model,
             dict,
             supplement: automaton,
             weights,
+            blocked,
             cache: Mutex::new(EngineCache::default()),
             user_words: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    /// 【整句高频字过滤上限】条目级判定：单字条目 × 段消耗 ≥2 键 × 该字
+    /// 的该码在禁用表里 ⇒ 丢弃。1 码段不比较（官方整句口径排除 1 码）；
+    /// 词条不参与；上限 0（空表）恒 false。
+    fn entry_blocked(&self, code: &str, text: &str, code_len: usize) -> bool {
+        if code_len < 2 || self.blocked.is_empty() {
+            return false;
+        }
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => self
+                .blocked
+                .get(&ch)
+                .is_some_and(|codes| codes.contains(code)),
+            _ => false,
         }
     }
 
@@ -415,9 +487,15 @@ impl SentenceEngine {
                     .enumerate()
                     .take(SEG_RANK_LIMIT)
                     .filter_map(|(rank, &idx)| {
-                        self.dict.entries.get(idx as usize).map(|e| {
+                        self.dict.entries.get(idx as usize).and_then(|e| {
+                            // 【整句高频字过滤上限】单字 × 非最优码 × 频序 ≤ N
+                            // ⇒ 丢弃（判定查装配期建好的集合）。名次仍按原
+                            // enumerate 计——过滤不重编号。
+                            if self.entry_blocked(&e.code, &e.text, code_len) {
+                                return None;
+                            }
                             let exact = e.code.chars().count() == code_len;
-                            (e.text.clone(), rank, exact)
+                            Some((e.text.clone(), rank, exact))
                         })
                     })
                     .collect();
@@ -978,5 +1056,195 @@ impl SentenceDecoder for SentenceEngine {
     /// 【用户词注入 2026-09-06】/jc 加词参与整句词图（热更新+缓存失效）
     fn set_user_words(&self, words: &[(String, String)]) {
         SentenceEngine::set_user_words(self, words.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hufu_dict::entry::DictEntry;
+    use hufu_dict::freq;
+    use hufu_dict::supplement::Supplement;
+
+    /// 合成码表：覆盖组句里会碰到的五种条目形态。
+    /// - 的（频序 1）：a / aa / aab —— 多码单字（含 1 码）
+    /// - 一（频序 2）：b / bb / bbb —— 多码单字（边界上的第 N+1 个字）
+    /// - 是（频序 3）：c —— 只有 1 个码的字（整句最优码取不到）
+    /// - 鑫（表外）：dd / ddd —— 频序表外的字
+    /// - 我们：ab —— 多字词
+    fn tiny_dict() -> Dict {
+        let mk = |code: &str, text: &str, weight: f64, seq: u32| DictEntry {
+            weight,
+            ..DictEntry::new(code, text, seq)
+        };
+        Dict::from_entries(
+            "test",
+            vec![
+                mk("a", "的", 100.0, 0),
+                mk("aa", "的", 90.0, 1),
+                mk("aab", "的", 80.0, 2),
+                mk("b", "一", 100.0, 3),
+                mk("bb", "一", 90.0, 4),
+                mk("bbb", "一", 80.0, 5),
+                mk("c", "是", 100.0, 6),
+                mk("dd", "鑫", 100.0, 7),
+                mk("ddd", "鑫", 90.0, 8),
+                mk("ab", "我们", 100.0, 9),
+            ],
+        )
+    }
+
+    fn engine_with_weights(dict: Dict, weights: SentenceWeights) -> SentenceEngine {
+        SentenceEngine::with_model(
+            model::tiny_model(),
+            Arc::new(dict),
+            &Supplement::default(),
+            weights,
+        )
+    }
+
+    /// 显式设定上限的引擎。
+    fn engine(dict: Dict, limit: usize) -> SentenceEngine {
+        engine_with_weights(
+            dict,
+            SentenceWeights {
+                high_freq_limit: limit,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 该字码表里「不是整句最优码」的那个 ≥2 码（测试数据保证存在）。
+    fn non_best_code(dict: &Dict, text: &str) -> String {
+        let best = dict.best_code_with_min_len(text, 2).expect("有 ≥2 码");
+        dict.codes_of(text)
+            .into_iter()
+            .find(|code| code.chars().count() >= 2 && code != best)
+            .expect("存在非最优码")
+    }
+
+    fn hits(eng: &SentenceEngine, raw: &str) -> Vec<String> {
+        eng.decode_to_strings(raw)
+    }
+
+    /// 逐位转储（文本 + 分数 + 名次 + 精确位 + 分段 + 提前上屏），
+    /// 供「上限 0 与不启用逐位一致」的严格比较。
+    fn dump(eng: &SentenceEngine, raws: &[&str]) -> String {
+        let mut out = String::new();
+        for raw in raws {
+            let dec = eng.decode_rich(raw);
+            out.push_str(&format!(
+                "raw={raw} truncated={} early_truncated={} hits={:?} early={:?}\n",
+                dec.truncated, dec.early_truncated, dec.hits, dec.early_hits
+            ));
+        }
+        out
+    }
+
+    const CRAFTED_RAWS: [&str; 12] = [
+        "a", "aa", "aab", "aadd", "aabdd", "bbdd", "bbbdd", "c", "dd", "ddd", "dddd", "ab",
+    ];
+
+    /// 上下限为 0（默认，不限制）与不启用逐位一致：禁用表为空 ⇒ 判定对
+    /// 码表任意条目恒 false，且非最优码路径照常参与组句（不是空转）。
+    #[test]
+    fn zero_limit_is_identical_to_disabled() {
+        let off = engine(tiny_dict(), 0);
+        // ① 上限 0 ⇒ 空表：零构建成本、热路径只做一次空表判断
+        assert!(off.blocked.is_empty());
+        // ② 判定恒 false：码表全部条目逐条验证（1 码单字 / 多码单字 / 词 / 表外字）
+        let dict = tiny_dict();
+        for e in &dict.entries {
+            let len = e.code.chars().count();
+            assert!(
+                !off.entry_blocked(&e.code, &e.text, len),
+                "上限 0 不得过滤任何条目: {} {}",
+                e.code,
+                e.text
+            );
+            assert!(!off.entry_blocked(&e.code, &e.text, 2));
+        }
+        // ③ 与「不显式设键」的默认权重引擎逐位一致（分数、名次、提前上屏全量比较）
+        let disabled = engine_with_weights(tiny_dict(), SentenceWeights::default());
+        assert_eq!(dump(&off, &CRAFTED_RAWS), dump(&disabled, &CRAFTED_RAWS));
+        // ④ 非最优码路径确实在组句里（否则上面的一致性是空转）
+        let dict = tiny_dict();
+        let other = non_best_code(&dict, "的");
+        let raw = format!("{other}dd");
+        assert!(
+            hits(&off, &raw).iter().any(|t| t == "的鑫"),
+            "上限 0 时非最优码路径应参与组句: raw={raw} hits={:?}",
+            hits(&off, &raw)
+        );
+    }
+
+    /// 上限 N：前 N 高频字的非最优码单字段被剔除；最优码、1 码段、
+    /// 多字词、表外字、最优码取不到的字都不受影响。
+    #[test]
+    fn limit_drops_non_best_code_of_top_n_single_chars() {
+        let dict = tiny_dict();
+        assert_eq!(freq::rank_of('的'), Some(1));
+        assert_eq!(freq::rank_of('一'), Some(2));
+        assert_eq!(freq::rank_of('是'), Some(3));
+        assert!(freq::rank_of('鑫').is_none());
+        let best_de = dict.best_code_with_min_len("的", 2).unwrap().to_string();
+        let other_de = non_best_code(&dict, "的");
+        assert_ne!(best_de, other_de);
+
+        let off = engine(tiny_dict(), 0);
+        let on1 = engine(tiny_dict(), 1); // 只覆盖频序 1（的）
+        let on_all = engine(tiny_dict(), 4000);
+        // 非最优码：不限制时在，上限 1 时该条目被丢弃
+        let raw_other = format!("{other_de}dd");
+        assert!(hits(&off, &raw_other).iter().any(|t| t == "的鑫"));
+        assert!(!hits(&on1, &raw_other).iter().any(|t| t == "的鑫"));
+        assert!(on1.blocked.contains_key(&'的'));
+        assert!(!on1.blocked[&'的'].contains(&best_de));
+        // 该字的 1 码条目（最优码之外）不进禁用表，也不被判丢弃
+        assert!(!on1.blocked[&'的'].contains("a"));
+        assert!(!on1.entry_blocked("a", "的", 1));
+        // 最优码：上限 1 时照常参与组句
+        let raw_best = format!("{best_de}dd");
+        assert!(
+            hits(&on1, &raw_best).iter().any(|t| t == "的鑫"),
+            "最优码不应被过滤: raw={raw_best} hits={:?}",
+            hits(&on1, &raw_best)
+        );
+        // 多字词不受影响
+        assert!(hits(&on_all, "ab").iter().any(|t| t == "我们"));
+        assert!(!on_all.entry_blocked("ab", "我们", 2));
+        // 只有 1 码的字（最优码取不到）不受影响，也不进禁用表
+        assert!(hits(&on_all, "c").iter().any(|t| t == "是"));
+        assert!(!on_all.blocked.contains_key(&'是'));
+        // 表外字的非最优码不受影响
+        let other_xin = non_best_code(&dict, "鑫");
+        let raw_xin = format!("{other_xin}dd");
+        assert!(
+            hits(&on_all, &raw_xin).iter().any(|t| t == "鑫鑫"),
+            "表外字不应被过滤: raw={raw_xin} hits={:?}",
+            hits(&on_all, &raw_xin)
+        );
+    }
+
+    /// 频序边界：上限 N 覆盖第 N 个字、不覆盖第 N+1 个。
+    #[test]
+    fn limit_boundary_covers_exactly_n_chars() {
+        let dict = tiny_dict();
+        let raw_de = format!("{}dd", non_best_code(&dict, "的")); // 频序 1
+        let raw_yi = format!("{}dd", non_best_code(&dict, "一")); // 频序 2
+        let on1 = engine(tiny_dict(), 1);
+        let on2 = engine(tiny_dict(), 2);
+        // N=1：第 1 个字剔除，第 2 个字保留
+        assert!(!hits(&on1, &raw_de).iter().any(|t| t == "的鑫"));
+        assert!(
+            hits(&on1, &raw_yi).iter().any(|t| t == "一鑫"),
+            "上限 1 不该波及频序 2 的字: hits={:?}",
+            hits(&on1, &raw_yi)
+        );
+        assert!(on1.blocked.contains_key(&'的'));
+        assert!(!on1.blocked.contains_key(&'一'));
+        // N=2：第 2 个字也剔除
+        assert!(!hits(&on2, &raw_yi).iter().any(|t| t == "一鑫"));
+        assert!(on2.blocked.contains_key(&'一'));
     }
 }

@@ -53,6 +53,7 @@ fn main() {
             supplement_scale: 2.0,
             supplement_maximum: 32.0,
             digit_codes: false,
+            ..Default::default()
         },
     )
     .expect("解码器装配失败");

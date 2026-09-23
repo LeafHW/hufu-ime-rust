@@ -36,6 +36,7 @@ fn main() {
         supplement_scale: 2.0,
         supplement_maximum: 16.0,
         digit_codes: false,
+        ..Default::default()
     };
     let dict = schema.dict.clone();
     let eng =
