@@ -14,7 +14,8 @@
 
 - `hufu-fcitx5-client/` — Rust staticlib：Unix socket 客户端 + C ABI
   （`hufu_client_key/reset/focus/ping`、配置读写、状态区菜单动作
-  `hufu_client_reload_schema/open_schema_dir/sound_toggle/sound_state`，宿主回调
+  `hufu_client_reload_schema/open_schema_dir/sound_toggle/sound_state`、按键音效通道
+  `hufu_client_take_sound/sound_fetch/sound_data/sound_size`，宿主回调
   commit/update），含 mock socket 单测；C++ 侧经 `hufu-addon/shell/hufu_abi.h` 调用。
 - `hufu-addon/shell/hufu.cpp` — C++ 薄壳：fcitx5 接口适配（键名映射、
   `filterAndAccept`、`commitString`/回删、`CommonCandidateList`、状态区菜单）。
@@ -151,7 +152,7 @@ Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
 |---|---|
 | 重载码表 | 引擎侧当前方案原样重载（op `reload_schema`）：改码表/补充语料后免重启 server |
 | 打开方案文件夹 | 引擎侧打开当前方案码表目录（op `open_schema_dir`） |
-| 按键音效 | 勾选态读引擎（op `sound_state`），点击引擎侧取反并落盘（op `sound_toggle`）；默认关。Linux 前端目前不播放音效——wav 播放未接，本项改的是引擎配置 |
+| 按键音效 | 勾选态读引擎（op `sound_state`），点击引擎侧取反并落盘（op `sound_toggle`）；默认关。开启后本层播放四类音效（key/select/commit/page），见「按键音效」一节 |
 | 引擎状态 | 信息行（不可点）：连接状态（`ping`；不可达时附 `hufu_client_status` 的失败原因）+ 当前方案名（配置键 `schema.current`） |
 | 候选窗显示预编辑 | 宿主项（`~/.config/fcitx5/conf/hufu.conf` 的 `PanelPreedit`），**默认开**；切换后落盘并立即按该输入上下文最近一次 UI 快照重放 |
 
@@ -166,6 +167,34 @@ Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
 键名变了，旧的 `ForceVertical=True` **不再被读取**（静默回到默认「跟随全局」）——需要强制竖排的话，
 在 `fcitx5-configtool` 的「虎符 → 行为」里把「候选排列」选成「竖排」一次即可。
 
+## 按键音效
+
+引擎在按键（key/select）回包里带上音效 tag（`key`/`select`/`commit`/`page`，仅在
+`sound.enabled` 时填）；本层取走 tag 后取回**完整 wav 字节**（op `sound`，按 tag 缓存）
+与**当前音量**（op `sound_state`，每次现取），交给系统播放器后台播放。默认关
+（状态区菜单「按键音效」或设置页「音效 → 启用按键音」）。
+
+- **启用态与音量**：都不在宿主侧缓存——引擎只在 `sound.enabled` 时才在回包里带 tag
+  （没带就是没开或本键无音效），音量每次播放前现取（op `sound_state`，小回包）。
+  于是托盘的「按键音效」与设置页的音量滑块**即改即生效**，不必先翻转一次开关。
+- **播放器**：按 `paplay` → `pw-play` → `aplay` → `play` 顺序探测 `$PATH`，首次播放前探一次
+  并记住；对应安装包分别是 `pulseaudio-utils` / `pipewire-bin` / `alsa-utils` / `sox`。
+- **音量**：引擎音量 0–100 按各播放器自己的选项映射——`paplay --volume=0..65536`（线性）、
+  `pw-play --volume=0..1.0`、`play -v 0..1`；`aplay` **没有音量选项**，忽略音量（按系统音量播）。
+- **wav 落盘**：每类音效首次播放前写到 `$XDG_RUNTIME_DIR/hufu-sound/<tag>.wav`
+  （目录 0700、文件 0600；`XDG_RUNTIME_DIR` 缺失时退回 `$TMPDIR`，再退回 `/tmp`），其后复用
+  （字节按 tag 缓存；音量不随字节缓存）。
+- **不阻塞输入**：播放器是后台 spawn（双 fork，中间层立刻回收、孙进程归 init，不留僵尸；
+  标准输入输出接到 `/dev/null`），按键流程不等播放结束。
+
+无声时的排查顺序：
+
+1. 状态区菜单「虎符 → 按键音效」是否已勾选（设置页同一项是「音效 → 启用按键音」）；
+2. 数据目录里有没有 `数据/音效/{key,select,commit,page}.wav`（`install.sh` 装配）；
+3. 是否装了上面任一播放器（`command -v paplay pw-play aplay play`）；
+4. `fcitx5 -D --verbose='hufu=5'` 看 `hufu` 类别日志：取音效失败与「未找到音频播放器」
+   各只记一次 Warn（不刷屏），Debug 级别能看到落盘路径与选中的播放器。
+
 ## 字反查（纯宿主侧）
 
 默认按 `~`（设置页「快捷键 → 字反查」，存 `~/.config/fcitx5/conf/hufu.conf` 的
@@ -179,8 +208,12 @@ Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
   索引**首次触发才装载**，不在 addon 构造期读文件。
 - 只写输入面板的两排 aux：不占用候选列表、也不伪造预编辑（引擎的候选与预编辑原样留着）；
   显示期间上排暂时由字反查占用，清除后还原引擎 aux。
-- 触发键被本层消费（与引擎方案的反查触发键同语义，不再作为普通字符输入）；再按任意键
-  （含 `Esc`）或失焦即清除，重新按触发键等于按当前光标位置刷新。
+- **武装后方向键跟随**：触发键按下即「武装」并保持。武装期间 `Left`/`Right`/`Home`/`End`
+  **不被消费**——交回 fcitx5 转发给应用（应用光标照常移动），30 ms 量级后按**新**的光标
+  位置重查并更新两排（连续按键合并为一次查询，用户感知为实时）；新位置左侧不是汉字时
+  清两排但保持武装。这是有意选择：查找光标即应用光标，不做第二套虚拟光标。
+- 撤防：`Esc`（消费该键）、其它按键（撤防 + 清两排后仍按既有流程处理该键，**不吞键**）、
+  失焦 / 切换输入法 / 引擎重置；再按触发键等于按当前光标位置刷新（保持武装）。
 - 降级路径：应用不支持周边文本（如终端）或光标左侧不是汉字时不显示；数据缺项的那一列显示
   `?`；索引装载失败（`拼音.注释` 与 `tiger.dict.yaml` 都读不到）只记一条 `hufu` 类别
   Warn（`hufu: 字反查数据不可用（…）`），功能静默不可用——触发键仍被消费，改绑/清空该键
@@ -218,7 +251,7 @@ Windows 侧行为不变（仍由引擎自带中英切换）。
 
 - 候选点击已支持上屏（`CandidateWord::select` → 引擎 `select` op），与数字选重同语义（学习、无闪帧）；候选窗样式为 fcitx5 主题，未复刻虎符皮肤材质/动效。
 - 选重上屏的「闪帧确认」在 Linux 上即时清窗（Windows 侧是 150ms 收场钟 + 高亮滑动；无皮肤动效时不做此动画）。
-- 拼音反查当前为**全拼**（虎爪 `拼音.txt`）；小鹤双拼表待转换。音效 wav 已就位但前端播放未接（第二批次），开关默认关。
+- 拼音反查当前为**全拼**（虎爪 `拼音.txt`）；小鹤双拼表待转换。按键音效已接通（见「按键音效」一节，需装 `paplay` / `pw-play` / `aplay` / `play` 任一），开关默认关。
 - **多个输入上下文共享一个引擎会话**（最后激活者胜，与 Windows 一致），焦点切换靠 `focus` 清态；宿主侧另有每输入上下文的 UI 快照，只用于「候选窗显示预编辑」切换后的面板重放。
 - 注释/拆分/拼音反查/符号/音效资源未装配，对应功能关闭。
 - `多多拼音反查表`（`$ddcmd` 格式）需转换后才可用。
