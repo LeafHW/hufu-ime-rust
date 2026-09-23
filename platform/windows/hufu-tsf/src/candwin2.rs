@@ -4444,8 +4444,11 @@ impl CandidateWindowV2 {
                 crate::tsf::trace(&format!(
                     "watchdog armed r={r:?}（0=失败）"
                 ));
-                // 【六十修·三层】同点位订阅全局原始键流（物理层兜底）
-                unsafe { rawinput_listen(self.hwnd, true) };
+                // 【六十修补·裸输入层退役】WM_INPUT 洪泛落在宿主 UI 线程，
+                // 实锤干扰跟打器（虎魄）逐键事件采集（击键数据只剩组段级
+                // 1/13）。切走关窗由看门狗+Activate 扫尸+键路径三层兜底，
+                // 物理层裸输入监听停用（函数保留，热键层不再订阅）。
+                // unsafe { rawinput_listen(self.hwnd, true) };
             }
             // 【毛玻璃退役 2026-09-11】glass RGN/DWM 圆角/NC 链整块删除；
             // 仅保留残留清理（曾开过毛玻璃的窗恢复全窗区域+方角）。
