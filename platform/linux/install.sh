@@ -68,6 +68,11 @@ fi
 if [[ "$USE_ASSETS" == 0 && -z "$SRC" ]]; then
     die 'assets/ 缺失且未指定外部源：请用 --from <虎码资源目录> 指定码表目录'
 fi
+# 仓库 assets/ 装配前先按台账校验收（字节 + sha256）：挡住误替换/半途拷贝进来的资源。
+if [[ "$USE_ASSETS" == 1 ]]; then
+    bash "$ROOT/platform/linux/checks/check-assets.sh" \
+        || die 'assets/ 台账校验失败（用 platform/linux/checks/check-assets.sh --write 重新登记）'
+fi
 
 # ── 1) 构建 ────────────────────────────────────────────────────────────────
 if [[ "$DO_BUILD" == 1 ]]; then

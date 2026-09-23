@@ -74,6 +74,7 @@ OpenCC 是开源的简繁转换项目；该 `opencc/` 目录是一套 OpenCC 数
 
 **Linux 放置**：解压后把「模型」文件夹整体放到 `~/.local/share/hufu/` 下（成为
 `~/.local/share/hufu/模型/`；目录已存在时把文件夹内的文件放进去）。
+
 引擎自动探测（`*.bin` = ngram 整句、`*.gguf` = 神经重排，文件名不必匹配），并每 2 秒扫描新放入的模型自动装载。
 
 **整句启用**：Linux 随包方案为 虎整句 / 虎码字词 / 虎码单字 / 多多B，**默认方案即「虎整句」**；
@@ -85,3 +86,16 @@ OpenCC 是开源的简繁转换项目；该 `opencc/` 目录是一套 OpenCC 数
 | `模型/*.gguf` | Qwen3 神经重排模型 | Apache-2.0（Qwen3） |
 
 说明：缺模型时引擎为**纯码表模式**，输入/候选/符号等功能不受影响（仅无整句与神经重排）。
+
+## 机器可校验的台账
+
+上面各节的来源与许可是散文描述；**完整性**由台账保证，改资源时两步走：
+
+```sh
+bash platform/linux/checks/check-assets.sh          # 校验：清单 ↔ 实况（路径 / 字节 / sha256）
+bash platform/linux/checks/check-assets.sh --write  # 重新生成 assets/MANIFEST
+```
+
+- 覆盖范围：`assets/码表/**` 与 `assets/数据/**`（`install.sh` 装配的两棵子树）；`assets/README.md` 不入清单。
+- `platform/linux/install.sh` 装配前自动校验，不符即中止（防误替换 / 半途拷贝的资源进用户目录）。
+- 清单只记路径 + 字节 + sha256，不重复来源与许可——那两栏以本文档为准。
