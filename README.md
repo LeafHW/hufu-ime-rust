@@ -119,9 +119,8 @@ fcitx5-configtool           # 输入法 → 添加「虎符」
 默认数据**随仓库自带**（`assets/`，模型除外），`--from <目录>`
 可换外部码表源；设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。
 
-完整步骤见 **[docs/linux-install.md](docs/linux-install.md)**（安装 / 资源获取 / 卸载）；
-资源来源与许可见 **[docs/asset-sources.md](docs/asset-sources.md)**；
-前端结构与构建细节见 [platform/linux/README.md](platform/linux/README.md)。
+安装 / 卸载 / 功能与作者声明见 **[platform/linux/README.md](platform/linux/README.md)**；
+资源来源与许可见 **[docs/asset-sources.md](docs/asset-sources.md)**。
 
 ## 构建
 
@@ -170,7 +169,7 @@ powershell -ExecutionPolicy Bypass -File "platform\windows\install\reg-fix.ps1"
 ## 文档
 
 - [docs/architecture.md](docs/architecture.md) — 架构设计与数据流
-- [docs/linux-install.md](docs/linux-install.md) — **Linux（fcitx5）安装 / 资源获取 / 卸载**
+- [platform/linux/README.md](platform/linux/README.md) — **Linux（fcitx5）前端：简介 / 功能 / 安装卸载 / 作者声明**
 - [docs/asset-sources.md](docs/asset-sources.md) — **资源来源、版本与许可（含模型获取）**
 - [docs/research/ime-frontends.md](docs/research/ime-frontends.md) — TSF / IMK 前端研究纪要与 TigerClaw 行为语义
 - [docs/dictionary-formats.md](docs/dictionary-formats.md) — 支持的码表格式规范（含 TCSKNM02 模型布局实测）

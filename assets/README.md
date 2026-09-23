@@ -35,7 +35,7 @@ bash platform/linux/checks/check-assets.sh --write  # 改过 assets/ 后重新�
 | `数据/音效/` | 四类按键 wav（`key/select/commit/page`） |
 
 **各文件来源、版本与许可**见 [`../docs/asset-sources.md`](../docs/asset-sources.md)；
-**安装 / 资源获取 / 卸载步骤**见 [`../docs/linux-install.md`](../docs/linux-install.md)。
+**安装 / 卸载步骤**见 [`../platform/linux/README.md`](../platform/linux/README.md)。
 
 ## 说明
 
