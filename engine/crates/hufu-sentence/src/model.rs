@@ -22,6 +22,19 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"TCSKNM02";
+/// 【NM04 压缩格式 2026-09-22】TCSKNM04 = NM02 的 1 字节量化概率变体
+///（逆向自改良模型实文件，3.0M 概率对拟合 + 边界无缝验证）：
+///  · 头 104 字节/页索引/unigram 段与 NM02 完全一致（uni 段逐字节相同）；
+///  · bigram/trigram 上下文记录头仍 { key:i64, λ:f32, succ_count:i32 }，
+///    但每条后继从 8 字节 {cp:i32,p:f32} 压成 5 字节 {cp:i32, b:u8}；
+///  · b = clamp(floor(255.505 + log2(p)·12.6255), 0, 255)（99.92% 精确
+///    吻合、100% 半步内；解码取格心 p = 2^((b−255.005)/12.6255)，
+///    实测 3.0M 对平均 |Δln p| 0.0137，最大 0.0277）；
+///  · 尾部附加段（文件_size 之后 ~5.6KB）非模型数据，加载忽略。
+const MAGIC_NM04: &[u8; 8] = b"TCSKNM04";
+/// log2 域量化步长（格宽 0.07920 log2 ≈ 0.0549 ln）与 b=0 下界偏移。
+const NM04_Q_STEP: f64 = 12.6255;
+const NM04_Q_CENTER_OFF: f64 = 255.005;
 pub const BOS: u32 = 0x02;
 pub const EOS: u32 = 0x03;
 
@@ -48,6 +61,8 @@ impl std::ops::Deref for ModelData {
 /// 已加载的 ngram 模型（数据段 mmap 驻留，索引二分查询）。
 pub struct NgramModel {
     data: ModelData,
+    /// 【NM04】true = 后继概率为 1 字节量化（5 字节后继记录）
+    quantized: bool,
     pub index_stride: usize,
     uni_count: usize,
     uni_off: usize,
@@ -97,12 +112,16 @@ impl NgramModel {
 
     fn build(data: ModelData) -> std::io::Result<NgramModel> {
         let data_ref: &[u8] = &data;
-        if data_ref.len() < 104 || &data_ref[0..8] != MAGIC {
+        let quantized = if data_ref.len() >= 8 && &data_ref[0..8] == MAGIC_NM04 {
+            true
+        } else if data_ref.len() >= 8 && &data_ref[0..8] == MAGIC {
+            false
+        } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "非 TCSKNM02 模型文件（魔数不符）",
+                "非 TCSKNM02/04 模型文件（魔数不符）",
             ));
-        }
+        };
         let index_stride = rd_i64(data_ref, 24) as usize;
         let uni_count = rd_i64(data_ref, 32) as usize;
         let uni_off = rd_i64(data_ref, 40) as usize;
@@ -136,7 +155,7 @@ impl NgramModel {
             .checked_add(tri_index_count.checked_mul(16).ok_or_else(|| bad("trigram 索引"))?)
             .ok_or_else(|| bad("trigram 索引"))?;
         // blocks 区间起点也须落在文件内（块内容本身由查询期页内
-        // off+16 界检兜底，起点只须合法）
+        // off+16 界检兜底，起点只须合法）。NM04 尾部附加段不计入。
         let len = data_ref.len();
         if uni_off > len || uni_end > len
             || bi_blocks_off > len || bi_index_off > len || bi_index_end > len
@@ -169,6 +188,7 @@ impl NgramModel {
 
         Ok(NgramModel {
             data,
+            quantized,
             index_stride,
             uni_count,
             uni_off,
@@ -198,6 +218,30 @@ impl NgramModel {
         self.freq_rank.get(&cp).copied().unwrap_or(usize::MAX)
     }
 
+    /// 后继记录字节数与码点/概率读取（NM02: 8B {cp:i32,p:f32}；NM04: 5B {cp:i32,b:u8}）。
+    #[inline]
+    fn succ_rec_size(&self) -> usize {
+        if self.quantized { 5 } else { 8 }
+    }
+    #[inline]
+    fn succ_cp(&self, off: usize) -> u32 {
+        rd_i32(&self.data, off) as u32
+    }
+    /// NM04 量化格心解码（2^((b−255.005)/12.6255)）；b=0 保持 0（编码端
+    /// 下溢截断语义）。
+    #[inline]
+    fn succ_prob(&self, off: usize) -> f32 {
+        if self.quantized {
+            let b = self.data[off + 4] as f64;
+            if b == 0.0 {
+                return 0.0;
+            }
+            2f64.powf((b - NM04_Q_CENTER_OFF) / NM04_Q_STEP) as f32
+        } else {
+            rd_f32(&self.data, off + 4)
+        }
+    }
+
     /// 分页块中查找上下文键 → (后继数组偏移, λ, 后继数)。
     fn find_ctx(
         &self,
@@ -223,6 +267,7 @@ impl NgramModel {
         let page = lo - 1;
         let block = rd_i64(&self.data, index_off + page * 16 + 8) as usize;
         // 页内顺序扫描（≤ index_stride 条，键升序可提前退出）
+        let rec = self.succ_rec_size();
         let mut off = block;
         for _ in 0..self.index_stride {
             if off + 16 > self.data.len() {
@@ -238,7 +283,7 @@ impl NgramModel {
                 return None;
             }
             let succ = rd_i32(&self.data, off + 12) as usize;
-            off += 16 + succ * 8;
+            off += 16 + succ * rec;
         }
         None
     }
@@ -259,7 +304,8 @@ impl NgramModel {
         let (succ_off, lambda, succ) = self.find_ctx(blocks_off, index_off, index_count, key)?;
         // 【越界防护 2026-09-11】坏文件 succ_count 可指天——后继数组
         // 区间先验界检（旧实现二分/线性读裸索引 panic）。
-        if succ_off.checked_add(succ.checked_mul(8)?)? > self.data.len() {
+        let rec = self.succ_rec_size();
+        if succ_off.checked_add(succ.checked_mul(rec)?)? > self.data.len() {
             return None;
         }
         // succ 按码点升序：二分（短表 ≤4 条时线性更省分支）
@@ -267,20 +313,20 @@ impl NgramModel {
             let (mut lo, mut hi) = (0usize, succ);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                let c = rd_i32(&self.data, succ_off + mid * 8) as u32;
+                let c = self.succ_cp(succ_off + mid * rec);
                 if c < cp {
                     lo = mid + 1;
                 } else if c > cp {
                     hi = mid;
                 } else {
-                    return Some((rd_f32(&self.data, succ_off + mid * 8 + 4), lambda));
+                    return Some((self.succ_prob(succ_off + mid * rec), lambda));
                 }
             }
         } else {
             for i in 0..succ {
-                let off = succ_off + i * 8;
-                if rd_i32(&self.data, off) as u32 == cp {
-                    return Some((rd_f32(&self.data, off + 4), lambda));
+                let off = succ_off + i * rec;
+                if self.succ_cp(off) == cp {
+                    return Some((self.succ_prob(off), lambda));
                 }
             }
         }
@@ -326,10 +372,11 @@ impl NgramModel {
         ) {
             Some((succ_off, _lambda, succ)) => {
                 // succ 有序 → 二分（bigram succ 平均 317 条，p90 超 1172）
+                let rec = self.succ_rec_size();
                 let (mut lo, mut hi) = (0usize, succ);
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let cp = rd_i32(&self.data, succ_off + mid * 8) as u32;
+                    let cp = self.succ_cp(succ_off + mid * rec);
                     if cp < c {
                         lo = mid + 1;
                     } else if cp > c {
