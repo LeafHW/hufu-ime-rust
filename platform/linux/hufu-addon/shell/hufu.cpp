@@ -27,6 +27,11 @@
 
 #include "hufu_abi.h"
 
+// 日志类别：有了自己的类别，`--verbose='hufu=5'` 就能只把本插件的日志调到 Debug，
+// 不必连累其它 addon；类别默认级别为 Info，故现有 Info/Warning 的可见性不变。
+FCITX_DEFINE_LOG_CATEGORY(hufuLog, "hufu");
+#define HUFU_DEBUG() FCITX_LOGC(hufuLog, Debug)
+
 namespace {
 
 /// Shift 形态 → 基准字符（引擎按「基准字符 + shift 修饰」处理，
@@ -334,9 +339,9 @@ public:
         // 默认 socket 路径（$XDG_RUNTIME_DIR/hufu-ime.sock）
         engine_ = hufu_client_new(nullptr, &host);
         const char *status = hufu_client_status(engine_);
-        FCITX_INFO() << "hufu: client created (" << (status ? status : "") << ")";
+        FCITX_LOGC(hufuLog, Info) << "hufu: client created (" << (status ? status : "") << ")";
         if (engine_ != nullptr && hufu_client_ping(engine_) == 0) {
-            FCITX_WARN() << "hufu: hufu-server 不可达（先启动引擎，按键将直通）";
+            FCITX_LOGC(hufuLog, Warn) << "hufu: hufu-server 不可达（先启动引擎，按键将直通）";
         }
         // 设置页：先读用户已保存值（宿主项），再以引擎配置覆盖引擎映射项
         fcitx::readAsIni(config_, "conf/hufu.conf");
@@ -695,7 +700,7 @@ private:
         patch += "\"sound\":{\"enabled\":" + std::string(jbool(so.enabled.value())) +
                  ",\"volume\":" + std::to_string(so.volume.value()) + "}}";
         if (hufu_client_config_patch(engine_, patch.c_str()) != 1) {
-            FCITX_WARN() << "hufu: 配置写入引擎失败（hufu-server 在跑吗）";
+            FCITX_LOGC(hufuLog, Warn) << "hufu: 配置写入引擎失败（hufu-server 在跑吗）";
         }
     }
 
