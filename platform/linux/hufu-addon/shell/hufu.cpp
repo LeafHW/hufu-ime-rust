@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: 2026 crux <crrvx@outlook.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // 虎符（hufu-ime）fcitx5 addon 的 C++ 薄壳：只做 fcitx5 接口适配，
 // 按键经 C ABI（libhufu_fcitx5_client，Rust）走 Unix socket 到 hufu-server。
+#include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
@@ -10,9 +14,12 @@
 #include <fcitx/inputmethodentry.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
+#include <fcitx/menu.h>
+#include <fcitx/statusarea.h>
 #include <fcitx/surroundingtext.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
+#include <fcitx/userinterfacemanager.h>
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/iniparser.h>
 #include <fcitx-config/option.h>
@@ -20,8 +27,10 @@
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-utils/trackableobject.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -126,10 +135,17 @@ class HufuEngine;
 
 /// 面板候选：点击（`select`）按页内下标上屏——与数字选重同语义
 ///（学习、无闪帧）。此前用 `DisplayOnlyCandidateWord`，点击无反应。
+///
+/// 生命周期：候选列表归 `InputContext` 的输入面板所有，而 IC **晚于** addon 实例
+///（含本引擎）析构——`InstancePrivate` 先声明 `icManager_`、后声明 `addonManager_`，
+/// 反向析构 ⇒ `~AddonManager`（删 addon 实例）在 IC 之前。引擎释放后，面板里可能
+/// 仍留着本对象，用户点一下就走到已释放的引擎上（悬垂 `this` 调用 = UAF）。故这里
+/// 只持 `TrackableObjectReference` 弱引用：引擎析构即失效，`select` 里早退。
 class HufuCandidateWord : public fcitx::CandidateWord {
 public:
     HufuCandidateWord(fcitx::Text text, fcitx::Text comment,
-                      HufuEngine *owner, int32_t index)
+                      fcitx::TrackableObjectReference<HufuEngine> owner,
+                      int32_t index)
         : CandidateWord(std::move(text)), owner_(owner), index_(index) {
         setComment(std::move(comment));
     }
@@ -137,7 +153,7 @@ public:
     void select(fcitx::InputContext *inputContext) const override;
 
 private:
-    HufuEngine *owner_;
+    fcitx::TrackableObjectReference<HufuEngine> owner_;
     int32_t index_;
 };
 
@@ -329,7 +345,76 @@ FCITX_CONFIGURATION(
     fcitx::Option<HufuSoundConfig> sound{this, "Sound", "音效"};
     fcitx::Option<HufuKeysConfig> keys{this, "Keys", "选重与翻页"};);
 
-class HufuEngine : public fcitx::InputMethodEngine {
+/// 状态菜单里的普通动作（「重载码表」「打开方案文件夹」）与信息行（「引擎状态」）：
+/// 文案每次取用时现算——信息行随引擎可达性与当前方案名变化，宿主不另存一份；
+/// `activate` 为空即不可点（信息行点击为无操作）。动作归引擎成员所有，
+/// 生命周期见 `~HufuEngine` 的 UAF 契约。
+class HufuMenuAction : public fcitx::Action {
+public:
+    HufuMenuAction(std::function<std::string()> label,
+                   std::function<void()> activate = {})
+        : label_(std::move(label)), activate_(std::move(activate)) {}
+
+    std::string shortText(fcitx::InputContext * /*inputContext*/) const override {
+        return label_();
+    }
+
+    std::string icon(fcitx::InputContext * /*inputContext*/) const override {
+        return {};
+    }
+
+    void activate(fcitx::InputContext * /*inputContext*/) override {
+        if (activate_) {
+            activate_();
+        }
+    }
+
+private:
+    std::function<std::string()> label_;
+    std::function<void()> activate_;
+};
+
+/// 状态菜单里的勾选开关（「按键音效」）：勾选态现取宿主缓存，点击交给宿主处理。
+/// 之所以不在 `isChecked` 里直接问引擎：`isChecked` 会被 UI 线程在每次刷新菜单时
+/// 调用，而问引擎是一次 socket 往返——引擎挂起时最坏要等一个读超时，会冻住 UI。
+class HufuToggleAction : public fcitx::Action {
+public:
+    HufuToggleAction(std::string label, std::function<bool()> checked,
+                     std::function<void(fcitx::InputContext *)> toggled)
+        : label_(std::move(label)),
+          checked_(std::move(checked)),
+          toggled_(std::move(toggled)) {
+        setCheckable(true);
+    }
+
+    std::string shortText(fcitx::InputContext * /*inputContext*/) const override {
+        return label_;
+    }
+
+    std::string icon(fcitx::InputContext * /*inputContext*/) const override {
+        return {};
+    }
+
+    bool isChecked(fcitx::InputContext * /*inputContext*/) const override {
+        return checked_();
+    }
+
+    void activate(fcitx::InputContext *inputContext) override {
+        toggled_(inputContext);
+    }
+
+private:
+    std::string label_;
+    std::function<bool()> checked_;
+    std::function<void(fcitx::InputContext *)> toggled_;
+};
+
+/// 引擎 addon。
+///
+/// 继承 `fcitx::TrackableObject<HufuEngine>`：让「归 IC / 面板所有、可能比引擎活得久」
+/// 的 UI 对象（`HufuCandidateWord`）持弱引用，避免悬垂（见该类注释）。
+class HufuEngine : public fcitx::InputMethodEngine,
+                   public fcitx::TrackableObject<HufuEngine> {
 public:
     explicit HufuEngine(fcitx::Instance *instance) : instance_(instance) {
         hufu_host host = {};
@@ -346,6 +431,9 @@ public:
         // 设置页：先读用户已保存值（宿主项），再以引擎配置覆盖引擎映射项
         fcitx::readAsIni(config_, "conf/hufu.conf");
         pullConfig();
+        setupStatusMenu();
+        // 信息行与音效勾选态先取一次（此后在状态区刷新与每次菜单动作后重取）
+        refreshStatus(nullptr);
     }
 
     /// 设置页 schema（fcitx5-configtool「虎符」页）。打开页面时从引擎拉取
@@ -362,8 +450,18 @@ public:
     }
 
     ~HufuEngine() override {
+        // 析构契约：**先摘掉输入上下文状态区里指向本对象成员的裸指针，再释放客户端**。
+        // 状态区归 IC 所有，而 IC 晚于 addon 实例（含本引擎）析构（见 `HufuCandidateWord`
+        // 的生命周期注释）；若本对象成员已析构而某个 IC 的状态区仍挂着 `&menuAction_`
+        //（及其子菜单里的动作），UI 一刷新就是悬垂指针。故在成员仍存活时先逐个 IC
+        // `clearGroup`，之后再释放客户端。
+        // 真机核对顺序：`fcitx5 -r --verbose='hufu=5'` 前台运行后退出，确认本行日志
+        // 之后没有针对已卸载 addon 的状态区访问。
+        HUFU_DEBUG() << "hufu: ~HufuEngine";
+        clearStatusAreas();
         if (engine_ != nullptr) {
             hufu_client_free(engine_);
+            engine_ = nullptr;
         }
     }
 
@@ -429,6 +527,7 @@ public:
     void activate(const fcitx::InputMethodEntry & /*entry*/,
                   fcitx::InputContextEvent &event) override {
         resetSession(event);
+        updateStatusArea(event.inputContext());
     }
 
     void deactivate(const fcitx::InputMethodEntry & /*entry*/,
@@ -458,6 +557,158 @@ private:
         context_ = event.inputContext();
         hufu_client_focus(engine_); // 清会话与文章尾巴，保留中英态
         context_ = nullptr;
+    }
+
+    /// 状态菜单：一个「虎符」子菜单（`SimpleAction` + 自定义 `Action` 项），
+    /// 构造时建好，本输入法激活时挂到该输入上下文的状态区。
+    /// 引擎侧动作用 daemon 既有 op，本层只做薄封装（协议不动）。
+    void setupStatusMenu() {
+        menuAction_.setShortText("虎符");
+        // 1) 重载码表：引擎侧当前方案原样重载（改码表/补充语料后免重启生效）。
+        reloadAction_ = std::make_unique<HufuMenuAction>(
+            [] { return std::string("重载码表"); },
+            [this] { reloadSchema(); });
+        instance_->userInterfaceManager().registerAction("hufu-reload-schema",
+                                                         reloadAction_.get());
+        // 2) 打开方案文件夹：引擎侧打开当前方案码表目录。
+        openDirAction_ = std::make_unique<HufuMenuAction>(
+            [] { return std::string("打开方案文件夹"); },
+            [this] { openSchemaDir(); });
+        instance_->userInterfaceManager().registerAction("hufu-open-schema-dir",
+                                                         openDirAction_.get());
+        // 3) 按键音效（默认关）：勾选态取引擎（sound_state），点击是引擎侧取反 + 落盘。
+        soundAction_ = std::make_unique<HufuToggleAction>(
+            "按键音效", [this] { return soundOn_ == 1; },
+            [this](fcitx::InputContext *inputContext) {
+                toggleSound(inputContext);
+            });
+        instance_->userInterfaceManager().registerAction("hufu-sound",
+                                                         soundAction_.get());
+        // 4) 引擎状态（信息行，不可点）：连接状态 + 当前方案名，文案取缓存
+        //（`shortText` 会被 UI 线程反复调用，不能在里面做 socket 往返）。
+        statusAction_ = std::make_unique<HufuMenuAction>(
+            [this] { return statusText_; });
+        instance_->userInterfaceManager().registerAction("hufu-status",
+                                                         statusAction_.get());
+        menu_.addAction(reloadAction_.get());
+        menu_.addAction(openDirAction_.get());
+        menu_.addAction(soundAction_.get());
+        menu_.addAction(statusAction_.get());
+        menuAction_.setMenu(&menu_);
+        instance_->userInterfaceManager().registerAction("hufu-menu",
+                                                         &menuAction_);
+    }
+
+    /// 把「虎符」子菜单挂到当前输入上下文的状态区（仅本输入法激活时显示）。
+    /// `StatusGroup::InputMethod` 是 fcitx5 留给输入法自己的组，会在
+    /// `InputMethodEngine::activate` 前被清空，故这里先 `clearGroup` 再挂，幂等。
+    void updateStatusArea(fcitx::InputContext *inputContext) {
+        if (inputContext == nullptr) {
+            return;
+        }
+        auto &statusArea = inputContext->statusArea();
+        statusArea.clearGroup(fcitx::StatusGroup::InputMethod);
+        statusArea.addAction(fcitx::StatusGroup::InputMethod, &menuAction_);
+        // 挂上之后取一次信息行/勾选态（时点见 `refreshStatus`）。
+        refreshStatus(inputContext);
+    }
+
+    /// 摘掉**所有**输入上下文状态区里指向本对象成员的裸指针（`&menuAction_` 及其子菜单）。
+    ///
+    /// 用 `InputContextManager::foreach`（遍历现存 IC）+ `StatusArea::clearGroup`
+    ///（逐个 `removeAction`）。这也**不替代** fcitx5 自带清理：`StatusArea::addAction`
+    /// 连了 `Action::ObjectDestroyed`（动作析构时自摘），本调用是在成员仍有效时先把状态区
+    /// 清干净，不把安全性寄托在「析构中途才触发的自清」上。
+    void clearStatusAreas() {
+        if (instance_ == nullptr) {
+            return;
+        }
+        instance_->inputContextManager().foreach([](fcitx::InputContext *ic) {
+            ic->statusArea().clearGroup(fcitx::StatusGroup::InputMethod);
+            return true;
+        });
+    }
+
+    /// 状态菜单里「现取」的两项内容：信息行文案与音效勾选态。
+    /// 时点：状态区刷新（activate）与每次菜单动作之后——`shortText` / `isChecked`
+    /// 会被 UI 线程反复调用，不能在那里做 socket 往返（引擎挂起时最坏等一个读超时）。
+    /// `inputContext` 为空（如构造期、托盘调用）时只更新缓存，不通知 UI。
+    void refreshStatus(fcitx::InputContext *inputContext) {
+        refreshStatusText();
+        if (engine_ != nullptr) {
+            soundOn_ = hufu_client_sound_state(engine_);
+        }
+        if (inputContext == nullptr) {
+            return;
+        }
+        if (statusAction_ != nullptr) {
+            statusAction_->update(inputContext);
+        }
+        if (soundAction_ != nullptr) {
+            soundAction_->update(inputContext);
+        }
+    }
+
+    /// 信息行文案 = 连接状态（`ping`）+ 当前方案名（配置键 `schema.current`）。
+    /// 引擎不在线时如实显示不可达，并把最近状态串落 Debug 日志（排障入口）。
+    void refreshStatusText() {
+        if (engine_ == nullptr) {
+            statusText_ = "引擎状态：不可用";
+            return;
+        }
+        const bool alive = hufu_client_ping(engine_) == 1;
+        const char *status = hufu_client_status(engine_);
+        const std::string schema = currentSchema();
+        statusText_ = alive ? "引擎状态：已连接" : "引擎状态：不可达";
+        if (!schema.empty()) {
+            statusText_ += " · " + schema;
+        }
+        HUFU_DEBUG() << "hufu: " << statusText_ << "（"
+                     << (status != nullptr ? status : "") << "）";
+    }
+
+    /// 当前方案/码表名：走引擎配置快照的 `schema.current` 键。
+    /// `hufu_client_config_str` 返回客户端内部缓冲（下次调用前有效），故立即拷走；
+    /// 引擎不可达或键不存在时返回空串（信息行只显示连接状态）。
+    std::string currentSchema() {
+        if (engine_ == nullptr || hufu_client_config_refresh(engine_) != 1) {
+            return {};
+        }
+        const char *name = hufu_client_config_str(engine_, "schema.current");
+        return name != nullptr ? std::string(name) : std::string();
+    }
+
+    /// 「重载码表」：失败只记日志并保持现状（引擎不在线时菜单项不该有任何副作用）。
+    void reloadSchema() {
+        if (engine_ == nullptr || hufu_client_reload_schema(engine_) != 1) {
+            FCITX_LOGC(hufuLog, Warn) << "hufu: 重载码表失败（hufu-server 在跑吗）";
+        }
+    }
+
+    /// 「打开方案文件夹」：同上；文件管理器由引擎侧拉起，本层不碰路径。
+    void openSchemaDir() {
+        if (engine_ == nullptr || hufu_client_open_schema_dir(engine_) != 1) {
+            FCITX_LOGC(hufuLog, Warn)
+                << "hufu: 打开方案文件夹失败（hufu-server 在跑吗）";
+        }
+    }
+
+    /// 「按键音效」：引擎侧取反并落盘（热生效）；返回新态，-1=未知（引擎不在线）
+    /// 时保持原勾选态——不本地假翻转，避免菜单显示与引擎实际状态不一致。
+    void toggleSound(fcitx::InputContext *inputContext) {
+        if (engine_ == nullptr) {
+            return;
+        }
+        const int32_t next = hufu_client_sound_toggle(engine_);
+        if (next < 0) {
+            FCITX_LOGC(hufuLog, Warn) << "hufu: 音效开关失败（hufu-server 在跑吗）";
+        } else {
+            soundOn_ = next;
+        }
+        HUFU_DEBUG() << "hufu: 按键音效 -> " << soundOn_;
+        if (inputContext != nullptr && soundAction_ != nullptr) {
+            soundAction_->update(inputContext);
+        }
     }
 
     static void commitCallback(void *user, const char *text) {
@@ -561,7 +812,7 @@ private:
                 const char *c =
                     comments != nullptr && comments[i] != nullptr ? comments[i] : "";
                 candidateList->append<HufuCandidateWord>(
-                    fcitx::Text(t), fcitx::Text(c), this, i);
+                    fcitx::Text(t), fcitx::Text(c), watch(), i);
             }
             // 设置页「强制竖排候选」：仅勾选时下发（不勾=跟随 fcitx5 全局）
             if (config_.behavior->forceVertical.value()) {
@@ -713,11 +964,28 @@ private:
     bool hasComposition_ = false;
     /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）
     std::string topCommit_;
+    /// 状态区菜单：「虎符」子菜单与四项（见 `setupStatusMenu`）
+    fcitx::Menu menu_;
+    fcitx::SimpleAction menuAction_;
+    std::unique_ptr<HufuMenuAction> reloadAction_;
+    std::unique_ptr<HufuMenuAction> openDirAction_;
+    std::unique_ptr<HufuToggleAction> soundAction_;
+    std::unique_ptr<HufuMenuAction> statusAction_;
+    /// 「引擎状态」行缓存文案（`shortText` 不做 socket 往返，见 `refreshStatus`）
+    std::string statusText_;
+    /// 按键音效勾选态缓存：1=开 / 0=关 / -1=未知（未取到；菜单显示为未勾选）
+    int32_t soundOn_ = -1;
 };
 
 /// 点击候选 = 上屏（页内下标；语义同数字选重）。
 void HufuCandidateWord::select(fcitx::InputContext *inputContext) const {
-    owner_->selectCandidate(inputContext, index_);
+    // 引擎（addon 实例）可能已先于本候选对象析构（IC 晚于 addon，见类注释）：
+    // 弱引用失效即直接返回，**不触碰**已释放的引擎。
+    HufuEngine *owner = owner_.get();
+    if (owner == nullptr) {
+        return;
+    }
+    owner->selectCandidate(inputContext, index_);
 }
 
 class HufuFactory : public fcitx::AddonFactory {
