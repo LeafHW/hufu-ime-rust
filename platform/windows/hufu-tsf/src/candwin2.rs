@@ -656,6 +656,18 @@ pub struct CandidateWindowV2 {
     /// 插值平滑逼近目标（内容按目标布局即刻渲染，缓冲只增不减、余量
     /// 渐进揭示/收拢）。None=无进行中的尺寸动效。
     pub(crate) size_anim: Option<((i32, i32), (i32, i32), std::time::Instant)>,
+    /// 【五十九修·形变恒速】本次 size_anim 的实际时长 ms。起臂时按
+    /// 剩余距离定（60px=满程参照跑满 size_ms，小距离按比例缩短，
+    /// 下限 24ms）：连打每键 ~14px 增长只跑 ~25ms（2-3 帧），不再
+    /// 每键重臂重置全 110ms——后者=连打全程 200fps 整帧重绘风暴+
+    /// 末键后拖 145ms 的形变尾巴（机器复现实锤：末键后 36 帧到
+    /// +145ms；QQ 慢线程放大成秒级「打完了还在挨个出编码挨个形
+    /// 变」）。结构性大变化（≥60px）仍满速满时长，观感不变。
+    pub(crate) size_anim_dur: std::cell::Cell<u32>,
+    /// 【五十九修·形变帧率封顶】上一次形变帧渲染时刻——tick 里连
+    /// 续重绘间隔 <12ms（60fps）则跳过本帧渲染（完成帧除外），杀
+    /// 掉 1-3ms 突发连渲染（winmm 250fps 驱动下队列挤成一坨）。
+    pub(crate) size_anim_last_render: std::cell::Cell<std::time::Instant>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 150，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -1004,6 +1016,8 @@ impl CandidateWindowV2 {
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
+                size_anim_dur: std::cell::Cell::new(90),
+                size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 size_morph: false,
                 pos_anim: None,
                 chase_target: None,
@@ -1177,6 +1191,8 @@ impl CandidateWindowV2 {
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
                 size_ms: 90,
+                size_anim_dur: std::cell::Cell::new(90),
+                size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 size_morph: false,
                 pos_anim: None,
                 chase_target: None,
@@ -2408,7 +2424,7 @@ impl CandidateWindowV2 {
         if !self.internal_rerender {
             let target = (w_out as i32, h_out as i32);
             let cur = match self.size_anim {
-                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms),
+                Some((f, t, t0)) => size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_dur.get().max(1)),
                 None => self.live_size.get(),
             };
             if self.readback {
@@ -2438,11 +2454,25 @@ impl CandidateWindowV2 {
                 && cur.0 > 4
                 && cur.1 > 4
             {
+                // 【五十九修·形变恒速】时长按剩余距离定（60px 满程跑
+                // 满 size_ms，小距离按比例缩短、下限 24ms）——连打每
+                // 键 ~14px 增长只跑 ~25ms（2-3 帧），不再每键重臂重置
+                // 全 110ms（后者=连打全程 200fps 整帧重绘风暴 + 末键
+                // 后 36 帧/+145ms 的形变尾巴，QQ 慢线程放大成秒级
+                // 「打完了还在挨个出编码挨个形变」）。结构性大变化观
+                // 感不变。
+                let dist_px = (target.0 - cur.0)
+                    .abs()
+                    .max((target.1 - cur.1).abs())
+                    .max(1) as f32;
+                let dur = ((self.size_ms as f32) * (dist_px / 60.0))
+                    .clamp(24.0, self.size_ms.max(24) as f32) as u32;
+                self.size_anim_dur.set(dur.max(1));
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
-                crate::tsf::diag_note(&format!("cw2 尺寸起臂: {cur:?}→{target:?}"));
+                crate::tsf::diag_note(&format!("cw2 尺寸起臂: {cur:?}→{target:?} dur={dur}"));
                 unsafe {
                     anim_tick_arm(self.hwnd);
                 }
@@ -2472,7 +2502,7 @@ impl CandidateWindowV2 {
             // 窗口=缓动≥目标；grow-only 下不触发重建，宽缓冲沿用）。
             let (buf_w, buf_h) = match self.size_anim {
                 Some((f, t, t0)) => {
-                    let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                    let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_dur.get().max(1));
                     (e.0.max(w_out as i32), e.1.max(h_out as i32))
                 }
                 None => (w_out as i32, h_out as i32),
@@ -3389,7 +3419,7 @@ impl CandidateWindowV2 {
                     // 改窗口尺寸故无此问题。
                     let (pw, ph) = match self.size_anim {
                         Some((f, t, t0)) => {
-                            let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                            let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_dur.get().max(1));
                             (e.0.max(w_out as i32), e.1.max(h_out as i32))
                         }
                         None => (w_out as i32, h_out as i32),
@@ -4029,7 +4059,7 @@ impl CandidateWindowV2 {
                 // （零位移），减轴=eased（窗缘恒=壳缘）。命中盒按目标。
                 let apply = match self.size_anim {
                     Some((f, t, t0)) => {
-                        let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_ms);
+                        let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_dur.get().max(1));
                         (e.0.max(w_out as i32), e.1.max(h_out as i32))
                     }
                     None => (w_out as i32, h_out as i32),
@@ -4765,7 +4795,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last) {
             if let Some((f, t, t0)) = c.size_anim {
                 let ms = t0.elapsed().as_millis() as u32;
-                let cur = size_ease(f, t, ms, c.size_ms);
+                let cur = size_ease(f, t, ms, c.size_anim_dur.get().max(1));
                 let finished = cur == t;
                 if finished {
                     c.size_anim = None;
@@ -4775,7 +4805,18 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.chrome_override.set(Some(cur));
                 }
                 c.live_size.set(cur);
-                if c.is_visible() {
+                // 【五十九修·形变帧率封顶】同主路径：中间帧 <12ms 不渲
+                //（完成帧必渲）。
+                let render_ok = finished || {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(c.size_anim_last_render.get()).as_millis() >= 12 {
+                        c.size_anim_last_render.set(now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if c.is_visible() && render_ok {
                     c.internal_rerender = true;
                     let _ = c.show(&cands, &raw, &skin, None, sel);
                     c.internal_rerender = false;
@@ -4905,7 +4946,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         //（P11 曾为 fade+size 并行设本 tick 去重标记——fade 退役后删。）
         if let Some((f, t, t0)) = c.size_anim {
             let ms = t0.elapsed().as_millis() as u32;
-            let cur = size_ease(f, t, ms, c.size_ms);
+            let cur = size_ease(f, t, ms, c.size_anim_dur.get().max(1));
             let finished = cur == t;
             if finished {
                 c.size_anim = None;
@@ -4915,7 +4956,19 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            if c.is_visible() {
+            // 【五十九修·形变帧率封顶】中间帧间隔 <12ms（60fps）跳过
+            // 渲染（完成帧必渲）——杀 winmm 250fps 驱动下 1-3ms 突发
+            // 连渲染（队列挤坨=UI 线程饱和的元凶之一）。
+            let render_ok = finished || {
+                let now = std::time::Instant::now();
+                if now.duration_since(c.size_anim_last_render.get()).as_millis() >= 12 {
+                    c.size_anim_last_render.set(now);
+                    true
+                } else {
+                    false
+                }
+            };
+            if c.is_visible() && render_ok {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
