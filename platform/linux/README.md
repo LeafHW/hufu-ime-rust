@@ -13,10 +13,11 @@
 ## 文件
 
 - `hufu-fcitx5-client/` — Rust staticlib：Unix socket 客户端 + C ABI
-  （`hufu_client_key/reset/focus/ping`，宿主回调 commit/update），含 mock
-  socket 单测；C++ 侧经 `hufu-addon/shell/hufu_abi.h` 调用。
+  （`hufu_client_key/reset/focus/ping`、配置读写、状态区菜单动作
+  `hufu_client_reload_schema/open_schema_dir/sound_toggle/sound_state`，宿主回调
+  commit/update），含 mock socket 单测；C++ 侧经 `hufu-addon/shell/hufu_abi.h` 调用。
 - `hufu-addon/shell/hufu.cpp` — C++ 薄壳：fcitx5 接口适配（键名映射、
-  `filterAndAccept`、`commitString`/回删、`CommonCandidateList`、中英副模式）。
+  `filterAndAccept`、`commitString`/回删、`CommonCandidateList`、状态区菜单）。
 - `hufu-addon/conf/` — addon 与输入法条目（`Library=libhufu`、`OnDemand=True`）。
 - `hufu-addon/CMakeLists.txt` — 构建并安装 `libhufu.so` 与 conf。
 - `systemd/hufu-server.service` — 引擎常驻（user 服务，Restart=always）。
@@ -119,6 +120,22 @@ XDG_RUNTIME_DIR=/tmp/hufu-battery HUFU_PORT=4393 \
 
 Windows 侧对应的是 `engine/pipe-*.ps1` 电池（命名管道）。
 
+## 状态区菜单（托盘「虎符」）
+
+本输入法激活时，状态区出现「虎符」子菜单（`SimpleAction` + 自定义 `Action`，五项）：
+
+| 菜单项 | 行为 |
+|---|---|
+| 重载码表 | 引擎侧当前方案原样重载（op `reload_schema`）：改码表/补充语料后免重启 server |
+| 打开方案文件夹 | 引擎侧打开当前方案码表目录（op `open_schema_dir`） |
+| 按键音效 | 勾选态读引擎（op `sound_state`），点击引擎侧取反并落盘（op `sound_toggle`）；默认关。Linux 前端目前不播放音效——wav 播放未接，本项改的是引擎配置 |
+| 引擎状态 | 信息行（不可点）：连接状态（`ping`；不可达时附 `hufu_client_status` 的失败原因）+ 当前方案名（配置键 `schema.current`） |
+| 候选窗显示预编辑 | 宿主项（`~/.config/fcitx5/conf/hufu.conf` 的 `PanelPreedit`），**默认开**；切换后落盘并立即按该输入上下文最近一次 UI 快照重放 |
+
+引擎不在线时的降级：动作类 op 失败只记 `hufu` 类别日志、菜单状态不变（不本地假翻转）；
+信息行如实显示「不可达」。信息行文案与音效勾选态在状态区刷新（输入法激活）与每次
+菜单动作后各取一次并缓存——菜单文案会被 UI 线程反复取用，不在那里做 socket 往返。
+
 ## 中英切换 / 英文输入（Linux 策略）
 
 Linux 上**引擎不自带英文输入**：英文由 fcitx5 的键盘布局输入法提供
@@ -141,7 +158,7 @@ Windows 侧行为不变（仍由引擎自带中英切换）。
 | 能力 | Windows TSF | macOS IMK | Linux fcitx5 |
 |---|---|---|---|
 | 键→引擎 IPC | 命名管道 | Unix socket | Unix socket（同帧协议） |
-| 组段 | ITfComposition | setMarkedText | clientPreedit（组段内联）；候选窗内预编辑默认关 |
+| 组段 | ITfComposition | setMarkedText | clientPreedit（组段内联）；候选窗内预编辑默认开（托盘可切） |
 | 上屏 | SetText+EndComposition | insertText | commitString（回删走 forwardKey/deleteSurroundingText） |
 | 候选窗 | D2D+Acrylic 自绘 | NSVisualEffectView | fcitx5 自带面板（classicui/kimpanel） |
 | 设置 | localhost Web UI | 同 | 同（systemd user 服务托管） |
@@ -152,7 +169,7 @@ Windows 侧行为不变（仍由引擎自带中英切换）。
 - 候选点击已支持上屏（`CandidateWord::select` → 引擎 `select` op），与数字选重同语义（学习、无闪帧）；候选窗样式为 fcitx5 主题，未复刻虎符皮肤材质/动效。
 - 选重上屏的「闪帧确认」在 Linux 上即时清窗（Windows 侧是 150ms 收场钟 + 高亮滑动；无皮肤动效时不做此动画）。
 - 拼音反查当前为**全拼**（虎爪 `拼音.txt`）；小鹤双拼表待转换。音效 wav 已就位但前端播放未接（第二批次），开关默认关。
-- 引擎单会话（与 Windows 一致），焦点切换靠 `focus` 清态。
+- **多个输入上下文共享一个引擎会话**（最后激活者胜，与 Windows 一致），焦点切换靠 `focus` 清态；宿主侧另有每输入上下文的 UI 快照，只用于「候选窗显示预编辑」切换后的面板重放。
 - 注释/拆分/拼音反查/符号/音效资源未装配，对应功能关闭。
 - `多多拼音反查表`（`$ddcmd` 格式）需转换后才可用。
 

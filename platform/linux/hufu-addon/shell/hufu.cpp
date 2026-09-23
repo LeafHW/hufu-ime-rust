@@ -13,6 +13,7 @@
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/inputmethodentry.h>
 #include <fcitx/inputpanel.h>
+#include <fcitx/inputcontextproperty.h>
 #include <fcitx/instance.h>
 #include <fcitx/menu.h>
 #include <fcitx/statusarea.h>
@@ -33,6 +34,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "hufu_abi.h"
 
@@ -131,6 +133,11 @@ std::string jesc(const std::string &s) {
 
 inline const char *jbool(bool v) { return v ? "true" : "false"; }
 
+/// 本 addon 的配置文件（相对 fcitx5 的 `PkgConfig` 目录，即 `~/.config/fcitx5/`）：
+/// 构造时 `fcitx::readAsIni` 读入，状态菜单里的宿主开关用 `fcitx::safeSaveAsIni`
+/// 写回——两者必须同路径、同 API 家族，否则「界面上改了但重启就丢」或写进另一个文件。
+constexpr const char *kConfigPath = "conf/hufu.conf";
+
 class HufuEngine;
 
 /// 面板候选：点击（`select`）按页内下标上屏——与数字选重同语义
@@ -170,8 +177,8 @@ FCITX_CONFIGURATION(
         .parent = this,
         .path{"PanelPreedit"},
         .description{"候选窗内显示编码"},
-        .defaultValue = false,
-        .annotation{"在候选窗顶部显示编码串；默认关（组段仍随光标内联显示）。"}}};
+        .defaultValue = true,
+        .annotation{"在候选窗顶部显示编码串；默认开（关闭后组段仍随光标内联显示）。"}}};
     fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> forceVertical{{
         .parent = this,
         .path{"ForceVertical"},
@@ -345,6 +352,37 @@ FCITX_CONFIGURATION(
     fcitx::Option<HufuSoundConfig> sound{this, "Sound", "音效"};
     fcitx::Option<HufuKeysConfig> keys{this, "Keys", "选重与翻页"};);
 
+/// 最近一次 UI 快照（面板预编辑 / 候选与注释 / 高亮 / 辅助文本 / 中英态）。
+///
+/// 宿主开关（「候选窗显示预编辑」）切换后要**立即**重放当前界面：关闭期间面板里
+/// 已经没有预编辑原文，重开时若不重放就得等下一次按键才看得到。故 `applyUpdate`
+/// 顺手把快照记在**该输入上下文的属性**上（属性随输入上下文销毁 ⇒ 不留任何
+/// 跨调用存活的输入上下文指针）。
+/// 只放宿主侧内容：引擎侧沿用虎符既有的 focus 语义（不引入会话 id），多个输入
+/// 上下文**共享一个引擎会话**（最后激活者胜）——这是既定取舍，属性里的快照只用于
+/// 本输入上下文的面板重放，不改变它。
+/// 说明：虎符的 update 回调不下发字节光标、也只有一排 aux，故快照没有这两项——
+/// 宿主不臆造引擎没有给过的位置信息。
+struct HufuUiSnapshot {
+    bool valid = false;
+    std::string preedit;
+    std::vector<std::string> texts;
+    std::vector<std::string> comments;
+    int32_t selected = 0;
+    std::string aux;
+    bool chinese = true;
+};
+
+/// 每输入上下文属性（fcitx5 `InputContextProperty`）：只存宿主侧 UI 快照。
+/// 引擎侧不建会话（见 `HufuUiSnapshot`），故本类不持任何引擎指针、析构也不回调引擎。
+class HufuUiState : public fcitx::InputContextProperty {
+public:
+    HufuUiSnapshot &snapshot() { return snapshot_; }
+
+private:
+    HufuUiSnapshot snapshot_;
+};
+
 /// 状态菜单里的普通动作（「重载码表」「打开方案文件夹」）与信息行（「引擎状态」）：
 /// 文案每次取用时现算——信息行随引擎可达性与当前方案名变化，宿主不另存一份；
 /// `activate` 为空即不可点（信息行点击为无操作）。动作归引擎成员所有，
@@ -374,9 +412,11 @@ private:
     std::function<void()> activate_;
 };
 
-/// 状态菜单里的勾选开关（「按键音效」）：勾选态现取宿主缓存，点击交给宿主处理。
-/// 之所以不在 `isChecked` 里直接问引擎：`isChecked` 会被 UI 线程在每次刷新菜单时
-/// 调用，而问引擎是一次 socket 往返——引擎挂起时最坏要等一个读超时，会冻住 UI。
+/// 状态菜单里的勾选开关（「按键音效」「候选窗显示预编辑」）：勾选态现取宿主缓存，
+/// 点击交给宿主处理。
+/// 「按键音效」的勾选态之所以不在这里直接问引擎：`isChecked` 会被 UI 线程在每次
+/// 刷新菜单时调用，而问引擎是一次 socket 往返——引擎挂起时最坏要等一个读超时，
+/// 会冻住 UI（故缓存在成员里，由 `refreshStatus` 取）。
 class HufuToggleAction : public fcitx::Action {
 public:
     HufuToggleAction(std::string label, std::function<bool()> checked,
@@ -416,7 +456,12 @@ private:
 class HufuEngine : public fcitx::InputMethodEngine,
                    public fcitx::TrackableObject<HufuEngine> {
 public:
-    explicit HufuEngine(fcitx::Instance *instance) : instance_(instance) {
+    explicit HufuEngine(fcitx::Instance *instance)
+        : instance_(instance),
+          uiStateFactory_(
+              [](fcitx::InputContext & /*inputContext*/) {
+                  return new HufuUiState;
+              }) {
         hufu_host host = {};
         host.user = this;
         host.commit = &HufuEngine::commitCallback;
@@ -428,8 +473,16 @@ public:
         if (engine_ != nullptr && hufu_client_ping(engine_) == 0) {
             FCITX_LOGC(hufuLog, Warn) << "hufu: hufu-server 不可达（先启动引擎，按键将直通）";
         }
+        // 每输入上下文一份宿主侧 UI 快照（现存与后续新建的都经工厂创建）。
+        // 注册成功是属性随输入上下文销毁的前提；失败必须显式可见（否则重放拿不到
+        // 快照，只剩「下一次按键才生效」这一条路径）。
+        if (!instance_->inputContextManager().registerProperty("hufuUiState",
+                                                               &uiStateFactory_)) {
+            FCITX_LOGC(hufuLog, Warn)
+                << "hufu: UI 快照属性注册失败（hufuUiState 名字冲突？）";
+        }
         // 设置页：先读用户已保存值（宿主项），再以引擎配置覆盖引擎映射项
-        fcitx::readAsIni(config_, "conf/hufu.conf");
+        fcitx::readAsIni(config_, kConfigPath);
         pullConfig();
         setupStatusMenu();
         // 信息行与音效勾选态先取一次（此后在状态区刷新与每次菜单动作后重取）
@@ -450,14 +503,19 @@ public:
     }
 
     ~HufuEngine() override {
-        // 析构契约：**先摘掉输入上下文状态区里指向本对象成员的裸指针，再释放客户端**。
-        // 状态区归 IC 所有，而 IC 晚于 addon 实例（含本引擎）析构（见 `HufuCandidateWord`
-        // 的生命周期注释）；若本对象成员已析构而某个 IC 的状态区仍挂着 `&menuAction_`
-        //（及其子菜单里的动作），UI 一刷新就是悬垂指针。故在成员仍存活时先逐个 IC
-        // `clearGroup`，之后再释放客户端。
+        // 析构契约（三步，顺序是安全性的前提）：
+        // 1) 注销 UI 快照属性工厂：fcitx5 会立刻销毁各输入上下文上已注册的属性
+        //   （属性只存宿主侧快照，析构不回调引擎；注销是为了工厂对象本身先于
+        //   `InputContextManager` 失效——fcitx5 要求工厂先注销）。
+        // 2) 摘掉输入上下文状态区里指向本对象成员的裸指针：状态区归 IC 所有，而 IC
+        //   晚于 addon 实例（含本引擎）析构（见 `HufuCandidateWord` 的生命周期注释）；
+        //   若本对象成员已析构而某个 IC 的状态区仍挂着 `&menuAction_`（及其子菜单里
+        //   的动作），UI 一刷新就是悬垂指针。故在成员仍存活时先逐个 IC `clearGroup`。
+        // 3) 客户端最后释放，指针置空——任何迟到的宿主回调都只是无操作。
         // 真机核对顺序：`fcitx5 -r --verbose='hufu=5'` 前台运行后退出，确认本行日志
         // 之后没有针对已卸载 addon 的状态区访问。
         HUFU_DEBUG() << "hufu: ~HufuEngine";
+        uiStateFactory_.unregister();
         clearStatusAreas();
         if (engine_ != nullptr) {
             hufu_client_free(engine_);
@@ -594,6 +652,17 @@ private:
         menu_.addAction(openDirAction_.get());
         menu_.addAction(soundAction_.get());
         menu_.addAction(statusAction_.get());
+        // 5) 候选窗显示预编辑（宿主项，默认开）：本层直接生效，不打扰引擎；
+        //    切换后按该输入上下文的最近一次快照立即重放（见 `togglePanelPreedit`）。
+        panelPreeditAction_ = std::make_unique<HufuToggleAction>(
+            "候选窗显示预编辑",
+            [this] { return config_.behavior->panelPreedit.value(); },
+            [this](fcitx::InputContext *inputContext) {
+                togglePanelPreedit(inputContext);
+            });
+        instance_->userInterfaceManager().registerAction("hufu-panel-preedit",
+                                                         panelPreeditAction_.get());
+        menu_.addAction(panelPreeditAction_.get());
         menuAction_.setMenu(&menu_);
         instance_->userInterfaceManager().registerAction("hufu-menu",
                                                          &menuAction_);
@@ -649,22 +718,28 @@ private:
         }
     }
 
-    /// 信息行文案 = 连接状态（`ping`）+ 当前方案名（配置键 `schema.current`）。
-    /// 引擎不在线时如实显示不可达，并把最近状态串落 Debug 日志（排障入口）。
+    /// 信息行文案 = 连接状态（`ping`；不可达时补 `hufu_client_status` 的失败原因）
+    /// + 当前方案名（配置键 `schema.current`）。
+    /// 状态串只在失败路径更新（「连接失败: …」「请求失败（已断开）: …」），故只在不可达
+    /// 时展示——连上时它还是创建客户端时的那句「未连接」，摆出来会误导。
     void refreshStatusText() {
         if (engine_ == nullptr) {
             statusText_ = "引擎状态：不可用";
             return;
         }
         const bool alive = hufu_client_ping(engine_) == 1;
-        const char *status = hufu_client_status(engine_);
         const std::string schema = currentSchema();
         statusText_ = alive ? "引擎状态：已连接" : "引擎状态：不可达";
+        if (!alive) {
+            const char *status = hufu_client_status(engine_);
+            if (status != nullptr && *status != '\0') {
+                statusText_ += "（" + std::string(status) + "）";
+            }
+        }
         if (!schema.empty()) {
             statusText_ += " · " + schema;
         }
-        HUFU_DEBUG() << "hufu: " << statusText_ << "（"
-                     << (status != nullptr ? status : "") << "）";
+        HUFU_DEBUG() << "hufu: " << statusText_;
     }
 
     /// 当前方案/码表名：走引擎配置快照的 `schema.current` 键。
@@ -711,6 +786,43 @@ private:
         }
     }
 
+    /// 「候选窗显示预编辑」（宿主项，默认开）：改配置 → 落盘 → 按该输入上下文的
+    /// 最近一次快照**立即**重放（面板马上显示/隐藏编码，不必等下一次按键）。
+    ///
+    /// 落盘前先 `fcitx::readAsIni(config_, kConfigPath)` 合并磁盘现状：本层只改这
+    /// 一项，若把内存里的整份 schema 直接写回，会覆盖配置页刚保存的其它项（配置页与
+    /// 本菜单是两条写入路径）；读进来的值随后被本项覆盖再落盘，等价于「读-改-写」。
+    /// 兜底：托盘调用拿不到输入上下文（`inputContext == nullptr`）或该上下文还没出过
+    /// UI（无快照）时只落盘，下一次 `applyUpdate` 自然按新值渲染。
+    void togglePanelPreedit(fcitx::InputContext *inputContext) {
+        fcitx::readAsIni(config_, kConfigPath);
+        // `Option::operator->` 是 const 限定（只读视图），写入口是 `mutableValue()`。
+        HufuBehaviorConfig *behavior = config_.behavior.mutableValue();
+        behavior->panelPreedit.setValue(!behavior->panelPreedit.value());
+        if (!fcitx::safeSaveAsIni(config_, kConfigPath)) {
+            FCITX_LOGC(hufuLog, Warn) << "hufu: 写入 " << kConfigPath
+                                      << " 失败（候选窗显示预编辑）";
+        }
+        HUFU_DEBUG() << "hufu: 候选窗显示预编辑 -> "
+                     << config_.behavior->panelPreedit.value();
+        if (HufuUiState *state = uiState(inputContext);
+            state != nullptr && state->snapshot().valid) {
+            render(inputContext, state->snapshot());
+        }
+        if (inputContext != nullptr && panelPreeditAction_ != nullptr) {
+            panelPreeditAction_->update(inputContext);
+        }
+    }
+
+    /// 该输入上下文对应的宿主侧 UI 快照属性（未注册或尚未创建时为空指针；属性类型
+    /// 由工厂的 `PropertyType` 带出，无需强转）。
+    HufuUiState *uiState(fcitx::InputContext *inputContext) const {
+        if (inputContext == nullptr) {
+            return nullptr;
+        }
+        return inputContext->propertyFor(&uiStateFactory_);
+    }
+
     static void commitCallback(void *user, const char *text) {
         static_cast<HufuEngine *>(user)->applyCommit(text);
     }
@@ -746,7 +858,9 @@ private:
         context_->commitString(text);
     }
 
-    /// UI 快照：preedit（面板 + 客户端内联）+ 候选列表 + aux。
+    /// UI 更新回调：**先记快照（宿主侧），再 render**——分两段是为了宿主开关
+    ///（「候选窗显示预编辑」）切换后能按最近一次快照立即重放，不必等下一次按键。
+    /// 快照记在该输入上下文的属性上（见 `HufuUiSnapshot`）。
     /// `commitTexts`：候选的实际上屏文本（`显示=>输出` 覆盖时与显示不同），
     /// 顶字（Shift+字母）用。
     void applyUpdate(const char *preedit, const char *raw,
@@ -773,60 +887,87 @@ private:
                       commitTexts[0] != nullptr)
                          ? commitTexts[0]
                          : "";
-        if (emptyState && !hadComposition) {
-            return; // 面板本来就没有我方内容：不发 UI 更新（保护系统 overlay）
-        }
         // 【选重闪帧】数字/; 选重上屏：引擎回「raw 空 + 旧候选 + 高亮」的
         // 确认帧（raw/preedit 已清）。Windows 侧靠 150ms 收场钟清窗；
         // Linux 无皮肤动效，直接清（否则候选窗滞留——用户实测反馈）。
-        if (rawString.empty() && count > 0) {
+        const bool flashFrame = rawString.empty() && count > 0;
+        // 1) 记快照。闪帧记成**空**快照：那些候选已经作废，若留在快照里，
+        // 宿主开关重放会把它们又画回面板。空态（无组段）也照记——否则属性里
+        // 留着上一轮的旧组段，重放时复活。
+        HufuUiSnapshot snapshot;
+        snapshot.valid = true;
+        snapshot.chinese = chinese == 1;
+        if (flashFrame) {
             hasComposition_ = false;
             topCommit_.clear();
-            context_->inputPanel().setCandidateList(nullptr);
-            context_->inputPanel().setPreedit(fcitx::Text());
-            context_->inputPanel().setClientPreedit(fcitx::Text());
-            context_->inputPanel().setAuxUp(fcitx::Text());
-            context_->updatePreedit();
-            context_->updateUserInterface(
-                fcitx::UserInterfaceComponent::InputPanel);
+        } else {
+            snapshot.preedit = preeditString;
+            snapshot.selected = selected;
+            snapshot.aux = auxString;
+            for (int32_t i = 0; i < count; ++i) {
+                snapshot.texts.emplace_back(
+                    texts != nullptr && texts[i] != nullptr ? texts[i] : "");
+                snapshot.comments.emplace_back(
+                    comments != nullptr && comments[i] != nullptr ? comments[i]
+                                                                  : "");
+            }
+        }
+        if (HufuUiState *state = uiState(context_)) {
+            state->snapshot() = snapshot;
+        }
+        if (emptyState && !hadComposition) {
+            return; // 面板本来就没有我方内容：不发 UI 更新（保护系统 overlay）
+        }
+        HUFU_DEBUG() << "hufu: 快照 preedit=\"" << snapshot.preedit << "\" 候选="
+                     << snapshot.texts.size() << " 高亮=" << snapshot.selected
+                     << " 中英=" << (snapshot.chinese ? "中" : "英");
+        // 2) 按快照渲染（空快照 = 清面板）。
+        render(context_, snapshot);
+    }
+
+    /// 按快照刷新一个输入上下文的输入面板（`applyUpdate` 与宿主开关共用）。
+    void render(fcitx::InputContext *inputContext,
+                const HufuUiSnapshot &snapshot) {
+        if (inputContext == nullptr) {
             return;
         }
-        const fcitx::Text preeditText(preeditString);
-        // 【候选窗预编辑】默认关（组段走客户端内联）；设置页可开
-        // （fcitx5-configtool → 虎符 → 行为 → 候选窗内显示编码）。
-        context_->inputPanel().setPreedit(
+        const fcitx::Text preeditText(snapshot.preedit);
+        // 【候选窗预编辑】宿主项（默认开）：托盘「候选窗显示预编辑」/设置页
+        // 行为 → 候选窗内显示编码；关闭后编码仍随光标内联显示。
+        inputContext->inputPanel().setPreedit(
             config_.behavior->panelPreedit.value() ? preeditText : fcitx::Text());
         // 客户端内联预编辑：跟随 fcitx5 全局预编辑设置
-        context_->inputPanel().setClientPreedit(
-            context_->isPreeditEnabled() ? preeditText : fcitx::Text());
-        context_->updatePreedit();
+        inputContext->inputPanel().setClientPreedit(
+            inputContext->isPreeditEnabled() ? preeditText : fcitx::Text());
+        inputContext->updatePreedit();
 
         // 候选：无候选置 nullptr 清除（fcitx5 约定，不可留空列表）。
         // 翻页/数字选重由引擎消费，本层不自作分页（页大小=当前页数量）。
-        if (count <= 0) {
-            context_->inputPanel().setCandidateList(nullptr);
+        if (snapshot.texts.empty()) {
+            inputContext->inputPanel().setCandidateList(nullptr);
         } else {
             auto candidateList = std::make_unique<fcitx::CommonCandidateList>();
-            for (int32_t i = 0; i < count; ++i) {
-                const char *t = texts != nullptr && texts[i] != nullptr ? texts[i] : "";
-                const char *c =
-                    comments != nullptr && comments[i] != nullptr ? comments[i] : "";
+            for (size_t i = 0; i < snapshot.texts.size(); ++i) {
                 candidateList->append<HufuCandidateWord>(
-                    fcitx::Text(t), fcitx::Text(c), watch(), i);
+                    fcitx::Text(snapshot.texts[i]),
+                    fcitx::Text(snapshot.comments[i]), watch(),
+                    static_cast<int32_t>(i));
             }
             // 设置页「强制竖排候选」：仅勾选时下发（不勾=跟随 fcitx5 全局）
             if (config_.behavior->forceVertical.value()) {
                 candidateList->setLayoutHint(fcitx::CandidateLayoutHint::Vertical);
             }
-            candidateList->setPageSize(count);
-            const int32_t index = std::min(std::max(selected, 0), count - 1);
+            candidateList->setPageSize(static_cast<int>(snapshot.texts.size()));
+            const int32_t index = std::min(
+                std::max(snapshot.selected, 0),
+                static_cast<int32_t>(snapshot.texts.size()) - 1);
             candidateList->setGlobalCursorIndex(index);
-            context_->inputPanel().setCandidateList(std::move(candidateList));
+            inputContext->inputPanel().setCandidateList(std::move(candidateList));
         }
-        context_->inputPanel().setAuxUp(aux != nullptr && *aux != '\0'
-                                             ? fcitx::Text(aux)
-                                             : fcitx::Text());
-        context_->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+        inputContext->inputPanel().setAuxUp(
+            !snapshot.aux.empty() ? fcitx::Text(snapshot.aux) : fcitx::Text());
+        inputContext->updateUserInterface(
+            fcitx::UserInterfaceComponent::InputPanel);
     }
 
     /// 引擎 → schema（引擎映射项）。引擎不可达时保持现状。
@@ -960,6 +1101,8 @@ private:
     fcitx::InputContext *context_ = nullptr;
     /// fcitx5 设置页 schema（fcitx5-configtool）
     HufuConfig config_;
+    /// 每输入上下文宿主侧 UI 快照的工厂（见 `HufuUiState`；构造时注册）
+    fcitx::FactoryFor<HufuUiState> uiStateFactory_;
     /// 有编码或候选（更新回调维护；Shift+字母「顶字」判定用）
     bool hasComposition_ = false;
     /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）
@@ -971,6 +1114,8 @@ private:
     std::unique_ptr<HufuMenuAction> openDirAction_;
     std::unique_ptr<HufuToggleAction> soundAction_;
     std::unique_ptr<HufuMenuAction> statusAction_;
+    /// 宿主项开关「候选窗显示预编辑」（不进引擎选项，直接生效的配置项）
+    std::unique_ptr<HufuToggleAction> panelPreeditAction_;
     /// 「引擎状态」行缓存文案（`shortText` 不做 socket 往返，见 `refreshStatus`）
     std::string statusText_;
     /// 按键音效勾选态缓存：1=开 / 0=关 / -1=未知（未取到；菜单显示为未勾选）
