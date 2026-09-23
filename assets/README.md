@@ -9,6 +9,18 @@ platform/linux/install.sh          # 码表 + 注释/拆分/反查/符号/音效
 
 目录与安装布局同构（对应 `~/.local/share/hufu/` 下的同名结构）。
 
+## 台账（可机器校验）
+
+- `assets/MANIFEST`：`assets/码表/**` 与 `assets/数据/**` 全部文件的 **sha256 + 字节数**，按路径排序。
+- 校验 / 重新生成：
+
+```sh
+bash platform/linux/checks/check-assets.sh          # 校验（install.sh 装配前自动调用）
+bash platform/linux/checks/check-assets.sh --write  # 改过 assets/ 后重新登记
+```
+
+- 来源与许可：见 [`../docs/asset-sources.md`](../docs/asset-sources.md)。
+
 ## 内容
 
 | 目录 | 内容 |
