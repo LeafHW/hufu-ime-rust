@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /*
  * 虎符（hufu-ime）fcitx5 addon 的 C ABI（Rust 侧实现，C++ 薄壳调用）。
  * 头文件与 `hufu-fcitx5-client/src/lib.rs` 的导出符号一一对应。
@@ -95,6 +98,19 @@ int32_t hufu_client_sound_toggle(hufu_client *client);
 
 /* 「按键音效」当前态（勾选态显示用）：1=开，0=关，-1=未知（引擎不在线）。 */
 int32_t hufu_client_sound_state(hufu_client *client);
+
+/* ── 字反查（纯宿主侧：宿主取光标左侧汉字，本库按数据目录查拼音/虎码/拆分）────── */
+
+/* 装载字反查索引：data_dir = 数据根目录
+ * （${XDG_DATA_HOME:-$HOME/.local/share}/hufu，由宿主解析后传入；本库不读环境变量）。
+ * 1=可用（拼音注释或码表至少一份读到数据），0=不可用（目录/文件缺失、参数非法）。
+ * 可重复调用（按新目录重载，失败即清空索引）。 */
+int32_t hufu_client_char_lookup_init(hufu_client *client, const char *data_dir);
+
+/* 查一个字符的「拼音\t虎码[\t拆分]」三列（缺项为空列；整字无数据为空串）。
+ * 返回 NUL 结尾指针，指向客户端内部缓冲——**下次对同一客户端调用本函数前有效**，
+ * 宿主须同步拷走；未初始化时返回空串（client 为 NULL 时返回 NULL）。 */
+const char *hufu_client_char_lookup(hufu_client *client, uint32_t ucs4);
 
 /* 焦点切换：清会话与文章尾巴（保留中英态）。 */
 void hufu_client_focus(hufu_client *client);
