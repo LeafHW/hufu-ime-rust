@@ -12,15 +12,16 @@ usage() {
 虎符输入法 · Linux 卸载（在仓库根目录执行）
 用法：platform/linux/uninstall.sh [选项]
 
-  --purge       连用户数据一起删（用户词与调整/日志/配置/皮肤/模型；整树删除）
+  --purge       连「模型」一起删（整树删除，事后无需手动清理）
   --no-system   跳过系统级删除（/usr/lib/fcitx5 等，无需 sudo）
   --dry-run     只打印将要执行的每一个改动性动作（rm/sudo/systemctl/pkill），
                 不产生任何副作用，退出码 0
   -h, --help    显示本用法
 
-默认按 assets/MANIFEST 台账删数据：install.sh 落盘的就是台账里登记的那些文件，
-逐个删掉再清理空目录（装卸对称），用户数据（用户词与调整/日志/配置/皮肤/模型）保留。
-台账缺失（不完整检出）时给出提示并退回原行为：默认整树保留，--purge 整树删除。
+默认**除「模型」外全部删净**：系统级 addon、用户级文件与 systemd 服务、运行期 socket 与
+音效缓存，以及数据目录 `~/.local/share/hufu/` 下除 `模型/` 以外的全部内容（码表、配置、
+用户词与调整日志、皮肤、diag）。模型体积大且由用户手动获取，脚本不擅自删——结束时给出
+「手动删除模型命令」。
 EOF
 }
 
@@ -49,6 +50,15 @@ if [[ "$EUID" -eq 0 ]]; then
 fi
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# 收尾提示的两色（终端且未设 NO_COLOR 时才上色：管道/日志里不留转义码）
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_ORANGE=$'\033[38;5;208m'; C_GREEN=$'\033[32m'; C_OFF=$'\033[0m'
+else
+    C_ORANGE=''; C_GREEN=''; C_OFF=''
+fi
+hint() { printf '%s%s%s\n' "$C_ORANGE" "$*" "$C_OFF"; }      # 橙色：中文提示
+show_code() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_OFF"; }  # 绿色：命令
 
 # ── dry-run 支撑 ───────────────────────────────────────────────────────────
 # 约定：每一个改动性动作（rm / sudo / systemctl / pkill）都必须经 run() 落地，
@@ -86,6 +96,9 @@ fi
 # 收尾：手动拉起（非 systemd）的残留引擎进程 + 运行期 socket 文件
 run pkill -x hufu-server 2>/dev/null || true
 run rm -f "${XDG_RUNTIME_DIR:-/tmp}/hufu-ime.sock" /tmp/hufu-ime.sock 2>/dev/null || true
+# 运行期残留：按键音效缓存目录（addon 落的 wav）与引擎诊断日志
+run rm -rf "${XDG_RUNTIME_DIR:-/tmp}/hufu-sound" 2>/dev/null || true
+run rm -f "${TMPDIR:-/tmp}/hufu-server-trace.log" 2>/dev/null || true
 
 if [[ "$NO_SYSTEM" == 1 ]]; then
     say '② 跳过系统级删除（--no-system）'
@@ -103,43 +116,13 @@ run rm -f "$HOME/.local/bin/hufu-server" \
     "$HOME/.local/share/applications/hufu-settings.desktop" \
     "$HOME/.config/fcitx5/conf/hufu.conf"
 
-# ── 按台账删已装配的数据（与 install.sh 同一份 assets/MANIFEST）────────────
-# 清单路径是仓库相对（assets/码表/…），落地路径去掉 assets/ 前缀：$HUFU_ROOT/码表/…。
-# 只删台账登记的文件：用户词、调整日志、config.json、模型等不在台账里，默认保留。
-# 台账缺失（不完整检出/脚本被单独拷走）时返回 1，由调用处退回原行为。
-remove_manifest_data() {
-    if [[ ! -f "$MANIFEST" ]]; then
-        echo "  • 缺少 $MANIFEST（不完整检出？）：无法按台账逐项删除" >&2
-        echo '    → 退回原行为：默认整个数据目录原样保留（要清除用 --purge 整树删）' >&2
-        return 1
-    fi
-    local line path dst removed=0
-    while IFS= read -r line; do
-        line="${line%$'\r'}"
-        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
-        path="$(printf '%s' "$line" | cut -f3)"
-        [[ -n "$path" ]] || continue
-        dst="$HUFU_ROOT/${path#assets/}"
-        [[ -e "$dst" || -L "$dst" ]] || continue
-        run rm -f "$dst"
-        removed=$((removed + 1))
-    done <"$MANIFEST"
-    # 目录收尾：删空的方案/资源目录（-delete 隐含 -depth，父目录同趟一起处理）。
-    # 只删空目录——用户词/配置/模型所在目录非空，自然留下。
-    run find "$HUFU_ROOT" -mindepth 1 -type d -empty -delete
-    # 数据根目录本身：全空（没有用户词/配置/模型）时一并收掉，非空则保持不动。
-    if [[ -d "$HUFU_ROOT" ]] && [[ -z "$(ls -A "$HUFU_ROOT" 2>/dev/null)" ]]; then
-        run rmdir "$HUFU_ROOT"
-    fi
-    if [[ "$DRY_RUN" == 1 ]]; then
-        echo "  · [dry-run] 以上列出的是当前存在的 $removed 个台账文件（真实运行同样按存在与否跳过）"
-    fi
-    ok "按 assets/MANIFEST 删除 $HUFU_ROOT 下装配的 $removed 个文件 + 清空目录"
-    return 0
-}
-
+# ── 数据目录：默认除「模型」外全删（模型给出手动删除命令）──────────────────
+# 为什么不用台账逐个删：台账只登记 install.sh 装配进去的随包文件，用户词与调整
+# （码表/<方案>/用户调整.txt）、调整日志、config.json、皮肤、diag 都不在里面——
+# 逐个删会留下这些「用起来才有」的残留。默认按「除模型全删」执行，一次清干净。
+# 模型体积大（约 880MB）且由用户手动获取，脚本不擅自删：结束时打印手动删除命令。
 if [[ "$PURGE" == 1 ]]; then
-    say '④ 删除用户数据（--purge：台账文件 + 用户词与调整/配置/皮肤/模型 整树删）'
+    say '④ 删除数据目录（--purge：含「模型」整树删除）'
     if [[ -d "$HUFU_ROOT" ]]; then
         run rm -rf "$HUFU_ROOT"
         ok "删除 $HUFU_ROOT（整树）"
@@ -147,14 +130,27 @@ if [[ "$PURGE" == 1 ]]; then
         echo "  · $HUFU_ROOT 不存在，跳过"
     fi
 else
-    say '④ 按台账删除已装配的数据（保留用户词与调整/日志/配置/皮肤/模型；整树清除用 --purge）'
+    say '④ 删除数据目录（除「模型」外全部删净；模型由你手动删）'
     if [[ -d "$HUFU_ROOT" ]]; then
-        if ! remove_manifest_data; then
-            echo "  · 保留 $HUFU_ROOT（未做任何删除）"
-        fi
+        # 顶层逐项删（-maxdepth 1），只跳过「模型」：码表/数据 整树走，模型留下。
+        while IFS= read -r -d '' entry; do
+            run rm -rf "$entry"
+        done < <(find "$HUFU_ROOT" -mindepth 1 -maxdepth 1 ! -name 模型 -print0)
+        ok "删除 $HUFU_ROOT 下除「模型」以外的全部内容"
     else
         echo "  · $HUFU_ROOT 不存在，跳过"
     fi
 fi
 
-finish '完成 ✔'
+if [[ "$PURGE" == 1 ]]; then
+    finish '完成 ✔（含模型，已全部删除）'
+else
+    finish '完成 ✔'
+    if [[ -d "$HUFU_ROOT/模型" ]]; then
+        hint '模型（约 880MB）由你手动获取，卸载脚本不擅自删除；如不再需要：'
+        show_code "手动删除模型命令：rm -rf $HUFU_ROOT/模型"
+    fi
+    if command -v fcitx5-configtool >/dev/null 2>&1; then
+        hint '输入法列表里若还留着「虎符」条目，在 fcitx5-configtool 里移除即可。'
+    fi
+fi

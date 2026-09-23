@@ -28,6 +28,7 @@ usage() {
 
 默认走仓库 assets/：装配前按 assets/MANIFEST 台账校验来源，装配后按同一清单逐项
 核对落盘文件（字节 + sha256）；外部源模式不做清单核对（输出里会说明）。
+模型（整句与神经重排）体积大，不随包分发：结束时打印手动获取网址。
 EOF
 }
 
@@ -78,6 +79,23 @@ done
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+# 收尾提示的两色（终端且未设 NO_COLOR 时才上色：管道/日志里不留转义码）
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_ORANGE=$'\033[38;5;208m'; C_GREEN=$'\033[32m'; C_OFF=$'\033[0m'
+else
+    C_ORANGE=''; C_GREEN=''; C_OFF=''
+fi
+hint() { printf '%s%s%s\n' "$C_ORANGE" "$*" "$C_OFF"; }      # 橙色：中文提示
+show_code() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_OFF"; }  # 绿色：网址 / 命令
+
+# 模型（整句 / 神经重排）体积大，不随仓库分发——安装结束时给出获取地址。
+MODEL_URL='https://github.com/LeafHW/hufu-ime-rust/releases/tag/模型'
+model_hint() {
+    hint '模型（整句与神经重排，约 880MB）不随安装包分发，需要时请手动获取：'
+    show_code "手动获取模型网址：$MODEL_URL"
+    hint "下载解压后把「模型」文件夹整个放进 $HUFU_ROOT/（引擎自动探测装载；缺模型即纯码表模式）"
+}
 
 # ── dry-run 支撑 ───────────────────────────────────────────────────────────
 # 约定：脚本里每一个改动性动作（构建、拷贝、安装、sudo、systemctl、生成配置…）
@@ -439,6 +457,7 @@ if [[ "$DATA_ONLY" == 1 ]]; then
     [[ "$NO_ASSETS" == 1 ]] || assemble_assets
     verify_installed
     finish '数据装配完成（--data-only）'
+    model_hint
     exit 0
 fi
 
@@ -463,3 +482,5 @@ cat <<'EOF'
   3) 设置页：             应用菜单搜「虎符设置」，或浏览器开 http://127.0.0.1:4390/
   4) 引擎状态：           systemctl --user status hufu-server
 EOF
+echo
+model_hint
