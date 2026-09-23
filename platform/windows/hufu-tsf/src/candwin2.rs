@@ -5269,9 +5269,32 @@ static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// 器的 ENUM_CURRENT_SETTINGS.dmDisplayFrequency，进程级缓存一
 /// 次；查询失败兜底 60Hz。
 fn morph_frame_interval_ms(hwnd: HWND) -> u128 {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<u128> = OnceLock::new();
-    *CACHE.get_or_init(|| unsafe {
+    use std::sync::Mutex;
+    // 2s TTL 缓存（非首查永存）：窗口跨屏迁移（60Hz 外接 ↔ 高刷
+    // 主屏）至多 2s 内跟上新屏节奏；查询本身是轻 syscall，2s 一次
+    // 可忽略。
+    static CACHE: Mutex<(u64, u128)> = Mutex::new((0, 17));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if now_ms.saturating_sub(g.0) > 2000 {
+        let new = query_refresh_interval_ms(hwnd);
+        if new != g.1 && crate::tsf::trace_on() {
+            crate::tsf::trace(&format!("cw2: 形变帧率封顶 → {new}ms/帧（跨屏/初查）"));
+        }
+        *g = (now_ms, new);
+    }
+    g.1
+}
+
+/// 窗口最近显示器当前刷新率的帧距（ms，向上取整）。AppContainer
+///（SearchHost/UWP）或任何查询失败 → 兜底 60Hz。5ms winmm tick 是
+/// 渲染节拍地板：144Hz 屏阈值 ~7ms → 实际每 2 tick 渲一帧（≈100fps，
+/// 不超发合成帧的前提下最平滑；240Hz 阈值 5ms → 每 tick 一帧）。
+fn query_refresh_interval_ms(hwnd: HWND) -> u128 {
+    unsafe {
         let mut hz: u32 = 60;
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if !mon.is_invalid() {
@@ -5298,19 +5321,8 @@ fn morph_frame_interval_ms(hwnd: HWND) -> u128 {
                 }
             }
         }
-        let ms = 1000.0 / hz as f32;
-        if trace_on_guard_for_morph() {
-            crate::tsf::trace(&format!(
-                "cw2: 形变帧率封顶 刷新率={hz}Hz → {ms:.1}ms/帧"
-            ));
-        }
-        ms.ceil() as u128
-    })
-}
-
-/// 形变封顶首查的落档门（避免给热路径引 trace 依赖）。
-fn trace_on_guard_for_morph() -> bool {
-    crate::tsf::trace_on()
+        (1000.0 / hz as f32).ceil() as u128
+    }
 }
 
 pub(crate) fn size_ease(from: (i32, i32), to: (i32, i32), t_ms: u32, dur_ms: u32) -> (i32, i32) {
