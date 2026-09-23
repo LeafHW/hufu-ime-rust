@@ -25,15 +25,24 @@ platform/linux/install.sh
 
 1. **构建**：`hufu-server`（Rust）与 fcitx5 addon（Rust staticlib + C++ 薄壳）；
 2. **装配数据**：把仓库 `assets/`（码表 + 注释/拆分/反查/符号/音效）复制到
-   `~/.local/share/hufu/`，**无需任何外部下载**；
+   `~/.local/share/hufu/`，**无需任何外部下载**；装配后按 `assets/MANIFEST` 台账逐项
+   核对落盘文件（字节 + sha256），任一不符即报错退出；
 3. **用户级安装**：`~/.local/bin/hufu-server`、systemd 用户服务、应用菜单「虎符设置」；
 4. **系统级安装**：`/usr/lib/fcitx5/libhufu.so` 与 `/usr/share/fcitx5/{addon,inputmethod}/hufu.conf`
    （需要 sudo 授权，脚本会提示输入密码）。
+
+不确定脚本会动什么，可以先预览：
+
+```sh
+platform/linux/install.sh --dry-run     # 逐条列出构建/拷贝/安装/sudo/systemctl，不做任何改动
+platform/linux/uninstall.sh --dry-run   # 逐条列出要删的文件，不做任何删除
+```
 
 ### 常用参数
 
 | 参数 | 作用 |
 |---|---|
+| `--dry-run` | 只打印将要执行的每一个改动性动作（构建/拷贝/安装/sudo/systemctl），不产生任何副作用 |
 | `--no-build` | 跳过构建（已构建过，只重新安装） |
 | `--no-system` | 跳过系统级安装（无 sudo / 分步执行） |
 | `--data-only` | 只装配数据与资源 |
@@ -41,6 +50,9 @@ platform/linux/install.sh
 | `--no-assets` | 跳过资源装配 |
 | `--from <目录>` | 改用外部码表资源目录（自备数据源） |
 | `--tigerclaw <包>` | 外部资源包（注释/拆分/反查/符号/音效） |
+
+`--from` / `--tigerclaw` 走外部源，内容由外部数据决定，**不做台账核对**（装配前不校验来源、
+装后校验显式跳过并在输出里说明）。
 
 ### 启用
 
@@ -84,15 +96,23 @@ fcitx5-configtool     # 输入法 → 添加「虎符」
 ## 4. 卸载
 
 ```sh
-platform/linux/uninstall.sh           # 保留用户数据
-platform/linux/uninstall.sh --purge   # 连用户数据一起删除
+platform/linux/uninstall.sh --dry-run   # 先看会删哪些文件（不做任何删除）
+platform/linux/uninstall.sh             # 默认：按台账删已装配的数据，用户数据保留
+platform/linux/uninstall.sh --purge     # 连用户数据一起删（整树）
 ```
 
 无 sudo 环境：`uninstall.sh --no-system`，按脚本提示手动删除 `/usr` 三个文件。
 
 卸载动作：停用并移除 systemd 用户服务 → 删除 `/usr` 三件 → 删除用户级二进制、桌面项与
-`~/.config/fcitx5/conf/hufu.conf` → 清理残留引擎进程与运行期 socket →（仅 `--purge`）删除
-`~/.local/share/hufu`。最后 `fcitx5 -r -d` 使输入法列表刷新。
+`~/.config/fcitx5/conf/hufu.conf` → 清理残留引擎进程与运行期 socket → 按 `assets/MANIFEST`
+逐个删掉 `~/.local/share/hufu/` 下装配进去的文件并清理空目录（与安装同一份台账：
+装得上就卸得掉）。最后 `fcitx5 -r -d` 使输入法列表刷新。
+
+用户数据不在台账里，默认保留：`码表/<方案>/用户调整.txt`（用户词与置顶/删除调整）、
+`数据/user-adjust.log`（调整日志）、`数据/config.json`（方案与开关）、`数据/皮肤/`、`模型/`。
+要一并清除用 `--purge`（整树删除 `~/.local/share/hufu`）。检出里缺 `assets/MANIFEST`
+（不完整检出、或脚本被单独拷走）时，卸载会明确提示原因并退回原行为：默认不删数据，
+`--purge` 仍是整树删除。
 
 ## 5. 排障
 
