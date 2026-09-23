@@ -43,6 +43,14 @@ cmake -S platform/linux/hufu-addon -B platform/linux/build \
 cmake --build platform/linux/build -j
 ```
 
+CI（`.github/workflows/ci.yml`，ubuntu-26.04）与本地自测跑同一套检查：addon 构建、
+C ABI 符号一致（`hufu_abi.h` ↔ `libhufu.so`）、DESTDIR 安装布局、逐脚本 `bash -n`、
+assets 台账、install/uninstall `--dry-run` 冒烟——本地一条命令（依赖与依赖缓存需先备好）：
+
+```sh
+bash platform/linux/checks/ci-local.sh
+```
+
 ## 安装 / 卸载
 
 ```sh

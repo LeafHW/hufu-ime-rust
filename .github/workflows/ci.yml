@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: ci
+
+# linux 前端（platform/linux/）的**最小集**：能构建、C ABI 不漂移、安装布局对得上、
+# 脚本语法与 assets 台账不退化、install/uninstall 的 --dry-run 不落改动。
+# 真机 fcitx5 交互不进 CI（runner 无图形会话）；引擎与 windows/macos 平台不在此。
+#
+# 检查逻辑只有一份：本文件只管「装环境 + 预热依赖缓存」，其余全部调用
+# platform/linux/checks/ci-local.sh（本地自测跑的是同一个脚本，两边不会漂移；
+# 改检查项请改脚本，本文件的步骤名保持同步即可）。
+#
+# 运行环境 ubuntu-26.04：该标签现已是正式 runner（x64 / arm64），26.04 仓库里的
+# fcitx5 是 5.1.19，满足 CMakeLists 的 find_package(Fcitx5Core 5.1.15 REQUIRED) 下限。
+# 这里写死版本标签而不用 ubuntu-latest：本工作流对 fcitx5 版本有硬下限，而迁移窗口内
+# latest 指向哪个发行版会漂。实际版本以 CI 日志里那步打印的为准；装到过旧版本时
+# configure 阶段直接报错，不会静默降级。
+#
+# 有意**没有**的两步（现状过不了，不在 CI 里假装绿，需单独一笔）：
+#   · cargo fmt -p hufu-fcitx5-client --check —— 本机实测 13 处 diff（exit 1）；
+#   · cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings —— 本机实测
+#     31 条 lint（29 条 not_unsafe_ptr_arg_deref + type_complexity + too_many_arguments）。
+# 先格式化 / 先修 lint（或对 C ABI 侧显式 allow）落地后，再把两步加回来，并同步加进
+# platform/linux/checks/ci-local.sh。
+
+on:
+  push:
+  pull_request:
+
+# 同一分支的新推送取消旧运行（省额度、避免同时出两个结论）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux 最小集
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 装构建依赖（fcitx5 开发包 / cmake / 编译器）
+        run: |
+          sudo apt-get update
+          # binutils 提供 nm（④ 的 C ABI 符号核对）；make 是 cmake 默认生成器用的；
+          # bash / diffutils / findutils / coreutils 是基础镜像自带（脚本用到 diff/find/sort/sha256sum）。
+          sudo apt-get install -y cmake g++ make binutils libfcitx5core-dev
+
+      - name: 打印工具链与 fcitx5 版本（版本落差排障用）
+        run: |
+          rustc -V
+          cargo -V
+          cmake --version | head -1
+          g++ --version | head -1
+          # fcitx5 未必提供 pkg-config 文件，失败就回退到包管理器查询。
+          (pkg-config --modversion Fcitx5Core 2>/dev/null || dpkg -l libfcitx5core-dev | tail -1)
+
+      - name: 预热依赖缓存（cargo fetch --locked）
+        # 必须早于任何构建：hufu-addon/CMakeLists.txt 里是 `cargo build --offline`
+        # （Cargo.lock 已提交，离线环境不会挂在索引刷新上），而全新 runner 的 cargo
+        # 缓存是空的，--offline 会直接解析不出 serde_json 等依赖而失败。
+        # 在 platform/linux/ 下 fetch，读的就是本工作区的 Cargo.lock；--locked 保证
+        # CI 里 Cargo.lock 不被解析动过。
+        working-directory: platform/linux
+        run: cargo fetch --locked
+
+      - name: 检查（构建 / C ABI 符号 / DESTDIR 布局 / bash -n / 台账 / dry-run 冒烟）
+        run: bash platform/linux/checks/ci-local.sh
