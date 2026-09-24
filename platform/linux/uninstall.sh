@@ -32,6 +32,10 @@ DRY_RUN=0
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MANIFEST="$ROOT/assets/MANIFEST"
 HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
+
+# 用户级落点：遵守 XDG（与 install.sh 同一套定义）
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 for a in "$@"; do
     case "$a" in
         --purge) PURGE=1 ;;
@@ -90,7 +94,7 @@ finish() { # 收尾提示：dry-run 不报「完成」，避免与真实卸载�
 say '① 停止并禁用 hufu-server（systemd user）'
 if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     run systemctl --user disable --now hufu-server.service 2>/dev/null || true
-    run rm -f "$HOME/.config/systemd/user/hufu-server.service"
+    run rm -f "$XDG_CONFIG/systemd/user/hufu-server.service"
     run systemctl --user daemon-reload 2>/dev/null || true
 fi
 # 收尾：手动拉起（非 systemd）的残留引擎进程 + 运行期 socket 文件
@@ -112,33 +116,41 @@ else
 fi
 
 say '③ 删除用户级文件'
-run rm -f "$HOME/.local/bin/hufu-server" \
-    "$HOME/.local/share/applications/hufu-settings.desktop" \
-    "$HOME/.config/fcitx5/conf/hufu.conf" \
-    "$HOME/.local/share/icons/hicolor/scalable/apps/hufu.svg" \
-    "$HOME/.local/share/icons/hicolor/48x48/apps/hufu.png" \
-    "$HOME/.local/share/icons/hicolor/22x22/apps/hufu.png"
+run rm -f "$XDG_DATA/bin/hufu-server" \
+    "$XDG_DATA/applications/hufu-settings.desktop" \
+    "$XDG_CONFIG/fcitx5/conf/hufu.conf" \
+    "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg" \
+    "$XDG_DATA/icons/hicolor/48x48/apps/hufu.png" \
+    "$XDG_DATA/icons/hicolor/22x22/apps/hufu.png"
+# 皮肤（fcitx5 主题形式）：只删我们装的 hufu-*（用户自己的主题不动）
+for theme_dir in "$XDG_DATA"/fcitx5/themes/hufu-*; do
+    if [[ -d "$theme_dir" ]]; then
+        run rm -rf "$theme_dir"
+    fi
+done
+run rmdir --ignore-fail-on-non-empty \
+    "$XDG_DATA/fcitx5/themes" "$XDG_DATA/fcitx5" 2>/dev/null || true
+
 # 图标缓存里的残留记录：有工具就重刷一次（没有工具时图标按目录实时解析，无碍）
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    run gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    run gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
 fi
 # 收空目录：install 建过的这几处若空着就一并收掉（用户本来就有内容时 rmdir 失败，无副作用）
 run rmdir --ignore-fail-on-non-empty \
-    "$HOME/.local/share/icons/hicolor/scalable/apps" \
-    "$HOME/.local/share/icons/hicolor/48x48/apps" \
-    "$HOME/.local/share/icons/hicolor/22x22/apps" \
-    "$HOME/.local/share/icons/hicolor/scalable" \
-    "$HOME/.local/share/icons/hicolor/48x48" \
-    "$HOME/.local/share/icons/hicolor/22x22" \
-    "$HOME/.local/share/icons/hicolor" \
-    "$HOME/.local/share/icons" \
-    "$HOME/.local/share/applications" \
-    "$HOME/.local/bin" \
-    "$HOME/.config/systemd/user" \
-    "$HOME/.config/systemd" \
-    "$HOME/.local/share" \
-    "$HOME/.local" \
-    "$HOME/.config" 2>/dev/null || true
+    "$XDG_DATA/icons/hicolor/scalable/apps" \
+    "$XDG_DATA/icons/hicolor/48x48/apps" \
+    "$XDG_DATA/icons/hicolor/22x22/apps" \
+    "$XDG_DATA/icons/hicolor/scalable" \
+    "$XDG_DATA/icons/hicolor/48x48" \
+    "$XDG_DATA/icons/hicolor/22x22" \
+    "$XDG_DATA/icons/hicolor" \
+    "$XDG_DATA/icons" \
+    "$XDG_DATA/applications" \
+    "$XDG_DATA/bin" \
+    "$XDG_CONFIG/systemd/user" \
+    "$XDG_CONFIG/systemd" \
+    "$XDG_DATA" \
+    "$XDG_CONFIG" 2>/dev/null || true
 
 # ── 数据目录：默认除「模型」外全删（模型给出手动删除命令）──────────────────
 # 为什么不用台账逐个删：台账只登记 install.sh 装配进去的随包文件，用户词与调整
