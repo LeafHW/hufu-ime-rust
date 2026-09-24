@@ -282,6 +282,47 @@ fn mixed_input_uppercase() {
     assert_eq!(out.commit.as_deref(), Some("AB"));
 }
 
+/// 【八十四修】mixed_input 关闭（默认）：Shift+字母 = 大写直接上屏。
+/// 旧口径下大写字母引擎无处落（passthrough）而 TSF TestDown 已预吞
+/// → CUAS 宿主（资源管理器重命名框）字符蒸发「打不出大写」。
+#[test]
+fn uppercase_direct_commit_when_mixed_off() {
+    let (mut engine, mut session, _dir) = setup();
+    assert!(!engine.config.input.mixed_input, "默认关——直上屏分支生效");
+    let out = engine.process_key(&mut session, key('A'));
+    assert!(out.consumed);
+    assert_eq!(out.commit.as_deref(), Some("A"));
+    let out = engine.process_key(&mut session, key('B'));
+    assert_eq!(out.commit.as_deref(), Some("B"));
+    // 上屏后回空态，后续小写照常进编码
+    let out = engine.process_key(&mut session, key('t'));
+    assert!(out.state.unwrap().raw == "t");
+}
+
+/// 【八十四修】组段中 Shift+字母：编码原样上屏（不丢）+ 大写随行。
+#[test]
+fn uppercase_composing_commits_raw_then_upper() {
+    let (mut engine, mut session, _dir) = setup();
+    engine.process_key(&mut session, key('d'));
+    engine.process_key(&mut session, key('k'));
+    let out = engine.process_key(&mut session, key('A'));
+    assert!(out.consumed);
+    assert_eq!(out.commit.as_deref(), Some("dkA"));
+    assert!(session.raw.is_empty(), "上屏后组段清空");
+}
+
+/// 【八十四修】反查模式大写归一：反查缓冲收到小写（表全小写）。
+#[test]
+fn uppercase_in_reverse_mode_lowercased() {
+    let (mut engine, mut session, _dir) = setup();
+    engine.config.reverse.enabled = true;
+    engine.config.reverse.prefix = '`';
+    engine.process_key(&mut session, key('`')); // 进反查
+    let out = engine.process_key(&mut session, key('N'));
+    assert!(out.consumed);
+    assert_eq!(out.state.unwrap().raw, "n", "反查缓冲按小写归一");
+}
+
 #[test]
 fn shift_toggle_and_english_passthrough() {
     let (mut engine, mut session, _dir) = setup();

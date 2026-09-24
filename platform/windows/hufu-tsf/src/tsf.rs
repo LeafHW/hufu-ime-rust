@@ -319,6 +319,13 @@ pub struct Shared {
     /// 即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不翻回）；
     /// 跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行切中英。
     pub modekey_down_seen: Option<usize>,
+    /// 【八十五修·Ctrl+Space 抬序无关】space+ctrl 组合已成形标记：
+    /// Ctrl 按住期间 space 落下、或 Ctrl 抬起/落下时 space 仍按住 →
+    /// 置位；space 抬起时消费（无论此刻 Ctrl 是否已抬）。修「Ctrl
+    /// 先抬、Space 后抬切不了中英」：该序下 space up 到达时
+    /// GetKeyState(VK_CONTROL) 已松，旧判定按「此刻无 Ctrl」直通，
+    /// 但组合确实发生过。space 无 Ctrl 按下即清（防陈旧误触）。
+    pub space_ctrl_armed: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
     /// 【三十四修·死字段删除】compose_at（Excel 保组段 80ms 时窗，六修
@@ -501,6 +508,7 @@ impl Shared {
             stale_raw_until: None,
             modekey_last: None,
             modekey_down_seen: None,
+            space_ctrl_armed: false,
             preedit_last: String::new(),
             focus_revoke_kept: false,
             tm_sink_cookie: 0,
@@ -1661,9 +1669,25 @@ impl HuFuTs_Impl {
         apply_chinese_sync(&self.shared);
         // 模式键（无组合歧义）：CapsLock / Ctrl+Space（按着 Ctrl 的 space，
         // 含 TestKeyUp 时刻——跟打器 space 只在 testup 可见且此时 Ctrl 仍按）。
-        let mode_key = match vk_to_name(wparam, false) {
-            Some((n, sh, ct, al)) => n == "capslock" || (ct && !sh && !al && n == "space"),
-            None => false,
+        // 【八十五修·抬序无关】space 的 up 还认「组合已成形」：
+        // space_ctrl_armed = Ctrl 按住期间 space 落下过 / Ctrl 事件时
+        // space 仍按住。修「Ctrl 先抬、Space 后抬切不了中英」：该序下
+        // space up 到达时 GetKeyState(VK_CONTROL) 已松，旧判定按「此刻
+        // 无 Ctrl」直通不切——但组合确实发生过，应切。
+        let (name0, sh0, ct0, al0) = match vk_to_name(wparam, false) {
+            Some((n, sh, ct, al)) => (Some(n), sh, ct, al),
+            None => (None, false, false, false),
+        };
+        let chord_armed_up = up
+            && wparam == 0x20
+            && {
+                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.space_ctrl_armed
+            };
+        let mode_key = match name0.as_deref() {
+            Some("capslock") => true,
+            Some("space") => !sh0 && !al0 && (ct0 || chord_armed_up),
+            _ => false,
         };
         // ── Shift 单击判定（Test 层闭环）──
         if wparam == 0x10 {
@@ -1718,6 +1742,23 @@ impl HuFuTs_Impl {
             }
             return BOOL(0);
         } else {
+            // 【八十五修·Ctrl+Space 组合布防】
+            // · space 落下：Ctrl 按住 → 布防（组合成形）；无 Ctrl → 撤防
+            //   （清陈旧标记：后续 plain space 的 up 不得借旧组合触发）。
+            // · ctrl 落下/抬起：space 仍按住 → 布防。「Ctrl 先抬、Space
+            //   后抬」序的关键证据就在 ctrl 的 up：此刻 space 还按着，
+            //   之后的 space up 即使 GetKeyState 已无 Ctrl 也算组合成形。
+            if wparam == 0x20 && !up {
+                let armed = ct0;
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.space_ctrl_armed = armed;
+            } else if wparam == 0x11 {
+                let space_held = unsafe { GetKeyState(VK_SPACE.0 as i32) < 0 };
+                if space_held {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.space_ctrl_armed = true;
+                }
+            }
             if !up {
                 // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
                 self.shared
@@ -1734,6 +1775,7 @@ impl HuFuTs_Impl {
             // 此前被「keyup 一律直通」拦死，1416 注释承诺的 TestKeyUp
             // 通道实际不可达，该宿主 Ctrl+Space 永远切不了中英。普通
             // 宿主的 up 双发由 modekey_down_seen 一次性标记挡（见下）。
+            // 【八十五修】armed（组合成形）的 up 同走此通道（抬序无关）。
         }
         // ── 模式键直发 + 去重 ──
         // 按下事件（TestDown 或 KeyDown）直发；松开仅限「down 未直发过」
@@ -1746,7 +1788,15 @@ impl HuFuTs_Impl {
                 if up {
                     if g.modekey_down_seen == Some(wparam) {
                         g.modekey_down_seen = None;
+                        // 【八十五修】组合已由 down 消费——armed 同时终结
+                        //（防后续迟到的第二个 up 借旧组合再触发）。
+                        g.space_ctrl_armed = false;
                         return BOOL(0);
+                    }
+                    // 【八十五修】armed 通道放行即消费（同上防双发：慢
+                    // 宿主 testup/keyup 相隔可 >80ms，dup 挡不住）。
+                    if wparam == 0x20 && g.space_ctrl_armed {
+                        g.space_ctrl_armed = false;
                     }
                 } else {
                     g.modekey_down_seen = Some(wparam);
@@ -1917,6 +1967,11 @@ impl HuFuTs_Impl {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
             _ => (name, shift, ctrl, alt),
         };
+        // 【八十五修】armed 触发的 space up（Ctrl 已先抬）：此刻
+        // GetKeyState 无 Ctrl，但组合确实成形——按 Ctrl+Space 发给
+        // 引擎（ctrl_space_switch 分支只认 ctrl=true），否则引擎收到
+        // 裸 space=空态直通，切不动。
+        let m_ctrl = m_ctrl || (up && wparam == 0x20 && chord_armed_up);
         // 【空态退格立即收窗 2026-10-09 五】上屏后无编码（候选窗暂留/
         // 收拢中）按退格=要改已上屏的字，旧候选列表已无意义——立即收。
         // 实测通道：CUAS 宿主空态退格 TestDown 不来（直通路由），KeyDown
@@ -2215,7 +2270,18 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             0x28 => "down".to_string(),
             0x21 => "pageup".to_string(),
             0x22 => "pagedown".to_string(),
-            0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk as u32 | 32).unwrap_or(' ').to_string(),
+            // 【八十四修·Shift+字母传大写】字母键按 shift 实态保大小写：
+            // 旧口径一律 |32 转小写（引擎只知道 shift=true），而引擎的
+            // 大写通道（混输缓冲、大写直上屏）都认大写字符——小写+shift
+            // 在 mixed_input 关闭时引擎无处落=passthrough，但 TestDown
+            // 预判已吞键 → 信任 TestDown 的宿主（资源管理器重命名框等
+            // CUAS）字符蒸发「Shift 按住打不出大写」。数字/标点维持
+            // 基础键+shift 旧口径（引擎 shift_form 负责）。
+            0x41..=0x5A => {
+                let c = char::from_u32(vk as u32).unwrap_or(' ');
+                (if shift { c } else { c.to_ascii_lowercase() }).to_string()
+            }
+            0x30..=0x39 => char::from_u32(vk as u32).unwrap_or(' ').to_string(),
             0xBA => ";".to_string(),
             0xBB => "=".to_string(),
             0xBC => ",".to_string(),

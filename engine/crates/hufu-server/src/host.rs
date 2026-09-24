@@ -17,6 +17,10 @@ struct RerankJob {
 /// 【用户定稿】保留 4 款定稿 + 5 款新配色（青瓷/暮山紫/沧海/柿柚/松烟）
 /// 【2026-09-08 模块级】供 install_official_skins（缺失自愈）与
 /// reset_official_skin（按皮肤恢复出厂）共用。
+/// 【八十七修·全量官方化 2026-09-24 用户拍板】发行包 19 款皮肤全部
+/// 收编内嵌——每款默认值固定（打包源=官方真源，同步自真机镜像并
+/// 修正离群值：晨雾阴影 60→12.5 对齐家族；default 空字体/固定宽
+/// 250 对齐家族标准），设置页「恢复默认值」对任意一款都是出厂态。
 const OFFICIAL_SKINS: &[(&str, &str)] = &[
     (
         "hufu-default.json",
@@ -53,6 +57,46 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
     (
         "hufu-songyan.json",
         include_str!("../official-skins/hufu-songyan.json"),
+    ),
+    (
+        "hufu-chenwu.json",
+        include_str!("../official-skins/hufu-chenwu.json"),
+    ),
+    (
+        "hufu-huguang.json",
+        include_str!("../official-skins/hufu-huguang.json"),
+    ),
+    (
+        "hufu-hupo.json",
+        include_str!("../official-skins/hufu-hupo.json"),
+    ),
+    (
+        "hufu-luoxia.json",
+        include_str!("../official-skins/hufu-luoxia.json"),
+    ),
+    (
+        "hufu-mocha.json",
+        include_str!("../official-skins/hufu-mocha.json"),
+    ),
+    (
+        "hufu-ouhe.json",
+        include_str!("../official-skins/hufu-ouhe.json"),
+    ),
+    (
+        "hufu-sujian.json",
+        include_str!("../official-skins/hufu-sujian.json"),
+    ),
+    (
+        "hufu-xingyu.json",
+        include_str!("../official-skins/hufu-xingyu.json"),
+    ),
+    (
+        "hufu-xuanmo.json",
+        include_str!("../official-skins/hufu-xuanmo.json"),
+    ),
+    (
+        "hufu-yuebai.json",
+        include_str!("../official-skins/hufu-yuebai.json"),
     ),
 ];
 

@@ -1087,7 +1087,15 @@ impl Engine {
         }
 
         // 反查模式
+        // 【八十四修】反查缓冲按小写归一：Windows TSF 层现在按 shift
+        // 实态传大写字符（大写直上屏/混输需要），反查表全小写——大写
+        // 落进来与旧口径（TSF 一律传小写）行为对齐。
         if session.mode == InputMode::Reverse {
+            let c = if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            };
             return self.on_reverse_char(session, c);
         }
 
@@ -1162,6 +1170,15 @@ impl Engine {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
+            }
+            // 【八十四修·大写直上屏】mixed_input 关闭时 Shift+字母 =
+            // 临时英文：大写字母直接上屏（consumed+commit，DLL 走 TSF
+            // 插入通道，与 Shift+标点同链路——任何宿主都不依赖应用自
+            // 产 WM_CHAR。此前引擎 passthrough 而 DLL TestDown 预判已
+            // 吞键：信任 TestDown 的宿主（资源管理器重命名框等 CUAS）
+            // 字符蒸发「Shift 按住打不出大写字母」）。
+            if c.is_ascii_uppercase() {
+                return KeyOutcome::commit(c.to_string(), self.state(session));
             }
             // 空态数字：直通（系统原生半角上屏），但记入跨句尾巴——
             // 数字后的句点半角化（1.5 / 3.14）依赖 tail 判「上一个
@@ -1318,6 +1335,14 @@ impl Engine {
             session.raw.push(c);
             self.refresh_candidates(session);
             return KeyOutcome::consumed(self.state(session));
+        }
+        // 【八十四修·大写直上屏（组段中）】mixed_input 关闭时组段中
+        // 按下 Shift+字母：已打编码原样上屏（编码不丢——同「Shift 切
+        // 英文上屏编码」拍板）+ 大写字母随行，中英态不变。
+        if c.is_ascii_uppercase() {
+            let text = format!("{}{c}", session.raw);
+            session.clear();
+            return KeyOutcome::commit(text, self.state(session));
         }
         // 选重键
         if c == self.config.candidates.second_select || c == self.config.candidates.third_select

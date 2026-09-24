@@ -496,17 +496,19 @@ function bindInputs() {
     if (el.type === "number") el.value = v;
     else el.value = v ?? "";
   });
-  const B = (id, path, conv) => { const el = $(id); el.checked = !!getP(CFG, path); el.onchange = () => setP(CFG, path, conv ? conv(el) : el.checked); };
+  // 【八十六修·全页实时生效】B 绑定的开关改动即存（防抖 400ms）；
+  // 整句模型页控件由 autoSave 内部排除（该页保留「保存并应用」）。
+  const B = (id, path, conv) => { const el = $(id); el.checked = !!getP(CFG, path); el.onchange = () => { setP(CFG, path, conv ? conv(el) : el.checked); autoSave(el); }; };
   B("#g-shift", "general.shift_switch"); B("#g-ctrl", "general.ctrl_space_switch");
   B("#g-recent", "general.switch_recent_schema");
   $("#g-caps").value = { Clear: "clear", Switch: "switch", None: "none" }[CFG.general.caps_action] || "clear";
-  $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; };
+  $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; autoSave(e.target); };
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
   B("#i-enter", "input.enter_clear"); B("#i-mixed", "input.mixed_input");
   B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao"); B("#i-bdunhao", "input.backslash_dunhao");
   // 【Tab 双模式 2026-09-08】下拉映射 tab_clear（清屏=true / 导航=false），
-  // 切换即存（输入页其他项走统一「保存并应用」——此下拉独立直存避免
-  // 用户以为切换了没生效；语义即改即存与皮肤页一致）。
+  // 切换即存。【八十六修】输入页其他项已全部改动即存（防抖），此处的
+  // 独立直存保留（即时反馈文案）。
   {
     const tm = $("#i-tabmode");
     tm.value = CFG.input.tab_clear === false ? "nav" : "clear";
@@ -534,18 +536,19 @@ function bindInputs() {
   B("#snd-en", "sound.enabled");
   $("#snd-vol").value = CFG.sound?.volume ?? 50;
   $("#snd-vol-v").textContent = (CFG.sound?.volume ?? 50) + "%";
-  $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; };
+  $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; autoSave(e.target); };
   $("#snd-test").onclick = () => new Audio("/api/sound?tag=key").play().catch(() => msg("试听失败", "err"));
   // OpenCC 繁简 / emoji
   B("#oc-en", "opencc.enabled"); B("#oc-emoji", "opencc.emoji");
   $("#oc-dir").value = CFG.opencc?.to_traditional === false ? "t2s" : "s2t";
-  $("#oc-dir").onchange = e => { CFG.opencc = CFG.opencc || { enabled: false, to_traditional: true, emoji: false }; CFG.opencc.to_traditional = e.target.value === "s2t"; };
+  $("#oc-dir").onchange = e => { CFG.opencc = CFG.opencc || { enabled: false, to_traditional: true, emoji: false }; CFG.opencc.to_traditional = e.target.value === "s2t"; autoSave(e.target); };
   // 剪贴板上屏
   B("#cb-en", "clipboard.enabled");
   $("#cb-wl").value = (CFG.clipboard?.whitelist || []).join(", ");
   $("#cb-wl").onchange = e => {
     CFG.clipboard = CFG.clipboard || { enabled: false, whitelist: [] };
     CFG.clipboard.whitelist = e.target.value.split(/[,，;；\n]/).map(s => s.trim()).filter(Boolean);
+    autoSave(e.target);
   };
   $("#exp-all").onclick = async () => {
     try {
@@ -559,11 +562,11 @@ function bindInputs() {
     } catch (e) { msg(e.message, "err"); }
   };
   $("#c-2nd").value = CFG.candidates.second_select || "";
-  $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; };
+  $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; autoSave(e.target); };
   $("#c-3rd").value = CFG.candidates.third_select || "";
-  $("#c-3rd").oninput = e => { if (e.target.value) CFG.candidates.third_select = e.target.value[0]; };
+  $("#c-3rd").oninput = e => { if (e.target.value) CFG.candidates.third_select = e.target.value[0]; autoSave(e.target); };
   $("#r-prefix").value = CFG.reverse.prefix || "`";
-  $("#r-prefix").oninput = e => { if (e.target.value) CFG.reverse.prefix = e.target.value[0]; };
+  $("#r-prefix").oninput = e => { if (e.target.value) CFG.reverse.prefix = e.target.value[0]; autoSave(e.target); };
   // 【2026-09-06 大统一】反查/拆分方案下拉（/api/assets 实时列目录）
   const fillSel = (selId, cur, list, phOff) => {
     const el = $(selId); el.innerHTML = "";
@@ -589,8 +592,9 @@ function bindInputs() {
   pick("#rev-scheme", v => CFG.reverse.scheme = v);
   pick("#split-scheme", v => CFG.candidates.split_scheme = v);
   $$("[data-path]").forEach(el => {
-    if (el.type === "number") el.oninput = () => { const v = parseFloat(el.value); if (!isNaN(v)) setP(CFG, el.dataset.path, v); };
-    else el.oninput = () => setP(CFG, el.dataset.path, el.value);
+    // 【八十六修】数字/文本改动即存（防抖；整句页控件 autoSave 内排除）
+    if (el.type === "number") el.oninput = () => { const v = parseFloat(el.value); if (!isNaN(v)) setP(CFG, el.dataset.path, v); autoSave(el); };
+    else el.oninput = () => { setP(CFG, el.dataset.path, el.value); autoSave(el); };
   });
 }
 
@@ -739,6 +743,22 @@ function sanitizeSkin(s) {
 }
 const saveConfig = () => { sanitizeConfig(CFG); return api("POST", "/api/config", CFG); };
 const saveSkin = () => { sanitizeSkin(SKIN); return api("POST", "/api/skin", SKIN); };
+
+/* ── 【八十六修·全页实时生效】「保存并应用」按钮只保留在整句模型页
+   （权重调参语义）；其余页与皮肤页同款「改动即存」——统一 400ms
+   防抖 saveConfig（与皮肤滑杆同节奏）。整句页控件（#s-*、sentence.*
+   data-path、权重滑杆）不自动存：该页仍有显式「保存并应用」。 ── */
+let _cfgSaveTimer = null;
+const saveConfigDebounced = () => {
+  if (_cfgSaveTimer) clearTimeout(_cfgSaveTimer);
+  _cfgSaveTimer = setTimeout(async () => {
+    try { await saveConfig(); msg("已自动保存并应用 ✓", "ok"); } catch (e) { msg("自动保存失败：" + e.message, "err"); }
+  }, 400);
+};
+const autoSave = el => {
+  if (el && el.closest && el.closest("#tab-sentence")) return;
+  saveConfigDebounced();
+};
 
 /* 【修复标签 2026-09-11】导入校验：hufu config 12 节必须齐全且类型对
    （后端 serde(default) 整体替换——缺节会静默回出厂值，前端先拦）；
@@ -1316,10 +1336,13 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
   $$("nav a").forEach(x => x.classList.remove("on")); a.classList.add("on");
   $$("main section").forEach(s => s.classList.remove("on"));
   $("#tab-" + a.dataset.tab).classList.add("on");
-  // 【2026-09-06 用户规格】皮肤页隐藏全局「保存并应用」——皮肤改动全部
-  // 实时生效（滑杆防抖自动存），该按钮在皮肤页只会误导「要手动保存」。
-  $("#btn-save").style.display = a.dataset.tab === "skin" ? "none" : "";
+  // 【八十六修·全页实时生效】「保存并应用」只在整句模型页显示（权重
+  // 调参按用户拍板保留显式保存语义）；其余页全部改动即存（防抖 400ms
+  // 自动 saveConfig），与皮肤页同款实时生效——全局按钮在这些页只会
+  // 误导「要手动保存」。初始页=方案：按钮默认隐藏（下一行统一置）。
+  $("#btn-save").style.display = a.dataset.tab === "sentence" ? "" : "none";
 });
+$("#btn-save").style.display = "none"; // 初始页（方案）非整句模型——八十六修
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
 /* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
 document.addEventListener("visibilitychange", () => {

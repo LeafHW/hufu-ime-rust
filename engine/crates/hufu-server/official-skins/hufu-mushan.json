@@ -21,7 +21,7 @@
                    "hilited_comment_text_color":  "#B8B0D8FF",
                    "hilited_label_color":  "#C0A8FFFF",
                    "hilited_mark_color":  "#C0A8FFFF",
-                   "shadow_color":  "#000000FF",
+                   "shadow_color":  "#00000040",
                    "hilited_shadow_color":  "#00000000",
                    "hilited_candidate_shadow_color":  "#00000000",
                    "capsule_text_color":  "#E4E0F0FF",
@@ -35,10 +35,10 @@
                    "label_font_point":  12.0,
                    "label_format": "%s.", "label_style": "digit",
                    "corner_radius":  10.0,
-                   "hilited_corner_radius":  10,
+                   "hilited_corner_radius":  10.0,
                    "border_width":  0.5,
                    "margin_x": 8,
-                   "margin_y": 6.0,
+                   "margin_y": 6,
                    "spacing":  6.0,
                    "candidate_spacing":  4.0,
                    "hilite_spacing": 2.0,
@@ -53,7 +53,7 @@
                },
     "material":  {
                      "kind":  "solid",
-                     "tint": "#1C1C1E00",
+                     "tint":  "#1C1C1E00",
                      "opacity":  1.0,
                      "darken":  0.0,
                      "noise":  0.0,
@@ -61,7 +61,7 @@
                      "border_color":  "#FFFFFF2E",
                      "master_alpha":  0.9,
                      "hilite_alpha":  0.85,
-                     "shadow_alpha":  1,
+                     "shadow_alpha":  1.0,
                      "border_alpha":  0.55
                  }
 }

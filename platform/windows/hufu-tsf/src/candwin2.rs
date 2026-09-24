@@ -56,11 +56,52 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     // 【NOREDIRECTIONBITMAP+DComp 窗的 hit-test 修正】DWM 按 visual
     // 内容 alpha 判定命中：悬停时代码在候选字上命中，但阴影/圆角/
     // 透明边缘按下会被判穿透——按钮消息根本不进 wndproc（QQ 实测
-    // setcursor/move 到达、ldown/rdown 从未出现）。显式返回
-    // HTCLIENT 强制整窗客户区命中。
+    // setcursor/move 到达、ldown/rdown 从未出现）。
+    // 【八十七修·阴影零交互】旧修正一律返回 HTCLIENT 把**整窗含阴影
+    // 带**都划成客户区——阴影开大后直接挡住下层窗口的光标与点击、
+    // 还能按住阴影拖窗（用户实测「阴影挡住光标点不到、能拖」）。
+    // 阴影是纯装饰，不该有任何交互：按「当前窗口矩形四边内缩
+    // CAND_SHADOW_INSET」得到内容矩形，内容内保持 HTCLIENT（原修正
+    // 语义不变：候选字/圆角/透明边缘仍整块命中），阴影带改
+    // HTTRANSPARENT（鼠标穿透到下层窗口）。inset=0（无阴影）时
+    // 内容矩形=整窗，与旧行为逐像素一致。
     if msg == 0x84 {
-        // WM_NCHITTEST → HTCLIENT
-        return LRESULT(1);
+        // WM_NCHITTEST → 内容 HTCLIENT / 阴影带 HTTRANSPARENT
+        let inset = CAND_SHADOW_INSET
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(h, _)| *h == hwnd.0 as isize)
+            .map(|(_, m)| *m)
+            .unwrap_or(0);
+        let through = if inset > 0 {
+            unsafe {
+                let mut wr = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if GetWindowRect(hwnd, &mut wr).is_ok() {
+                    // lparam 屏幕坐标（有符号——多显示器可为负）
+                    let px = (lparam.0 as u16) as i16 as i32;
+                    let py = ((lparam.0 >> 16) as u16) as i16 as i32;
+                    px < wr.left + inset
+                        || px >= wr.right - inset
+                        || py < wr.top + inset
+                        || py >= wr.bottom - inset
+                } else {
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        return if through {
+            LRESULT(-1) // HTTRANSPARENT：穿透，消息落给下层窗口
+        } else {
+            LRESULT(1) // HTCLIENT
+        };
     }
     // 【鼠标交互 2026-09-10 用户拍板】左键按住拖动=拖到哪里固定在哪
     // 里（跨组段保持）；右键=解除固定，候选窗回光标处恢复跟随。
@@ -2451,6 +2492,17 @@ impl CandidateWindowV2 {
         };
         let w_out = ((w + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
         let h_out = ((h + 2 * shadow_m as u32) as f32 * dpi_scale) as u32;
+        // 【八十七修·阴影零交互】本帧阴影物理内缩量按 hwnd 落全局映射：
+        // NCHITTEST 用它把阴影带判 HTTRANSPARENT（内容矩形=窗口四边内
+        // 缩本值；内容恒位于窗口原点偏 m 处——见下方内容变换 M31/M32）。
+        {
+            let mut m = CAND_SHADOW_INSET.lock().unwrap_or_else(|e| e.into_inner());
+            let v = (shadow_m * dpi_scale) as i32;
+            match m.iter_mut().find(|(h, _)| *h == self.hwnd.0 as isize) {
+                Some(slot) => slot.1 = v,
+                None => m.push((self.hwnd.0 as isize, v)),
+            }
+        }
         // 【拉伸动效 2026-09-11】渲染前判定（仅真实内容更新/展开帧——
         // 内部 tick 复渲染与回读取证帧不重臂）：宽高变化超阈值 → 启动/
         // 重定尺寸动画；此后每 tick 由 fade_tick_shared 以「当前插值
@@ -3546,7 +3598,6 @@ impl CandidateWindowV2 {
             // 【DPI 口径修复 2026-10-29】width/height 逻辑 → 物理
             //（同锚点分支；pin/拖拽钉住的旧位在高分屏上同样可越
             // 出屏幕右/下缘）。
-            let mp = (shadow_m * dpi_scale) as i32;
             let wp = (width * dpi_scale) as i32;
             let hp = (height * dpi_scale) as i32;
             // 【四十五修·锚到滑入】是否走 pin 分支（末尾记
@@ -3567,15 +3618,20 @@ impl CandidateWindowV2 {
                 if crate::tsf::diag_enabled() {
                     crate::tsf::diag_note(&format!("cw2 pin use ({px},{py})"));
                 }
-                let x = (px + m_off).clamp(vx, (vx + vw - mp - wp).max(vx));
-                let y = (py + m_off).clamp(vy, (vy + vh - mp - hp).max(vy));
+                // 【八十三修·阴影不计入候选体积】上界不再预留阴影边距 mp：
+                // 候选本体贴屏幕右/下缘即可，阴影出屏由 DWM 裁掉（二十九修
+                // 用户拍板语义；四十五修 DPI 换算时误把阴影边距加回上界
+                // = 靠屏边打字候选被推进一个阴影带，阴影越大推得越远）。
+                let x = (px + m_off).clamp(vx, (vx + vw - wp).max(vx));
+                let y = (py + m_off).clamp(vy, (vy + vh - hp).max(vy));
                 (x, y)
             } else if self.sticky_drag && self.sticky_pos.is_some() {
                 // 【拖拽钉住】松手设的 sticky 优先于锚点：本组段内
                 // 窗口钉在松手处不回弹（clamp 防出屏）
                 let (ox, oy) = self.sticky_pos.unwrap();
-                let x = ox.clamp(vx, (vx + vw - mp - wp).max(vx));
-                let y = oy.clamp(vy, (vy + vh - mp - hp).max(vy));
+                // 【八十三修】同 pin 分支：上界只算候选本体（见上）。
+                let x = ox.clamp(vx, (vx + vw - wp).max(vx));
+                let y = oy.clamp(vy, (vy + vh - hp).max(vy));
                 (x, y)
             } else {
                 // 【五十修·出屏锚作废】XAML 宿主（设置搜索等）GetTextExt
@@ -3607,11 +3663,12 @@ impl CandidateWindowV2 {
                         // 【DPI 口径修复 2026-10-29】width/height 是逻辑
                         // 像素，vx/vw 是物理像素——此前 clamp 混域：150%
                         // 缩放时窗口物理宽=逻辑×1.5，右缘/底缘按逻辑宽
-                        // 放行=候选本体（还要加上内容在窗内左移的阴影边
-                        // 距 m_phys）整块超出屏幕（资源管理器搜索框实测
-                        // 「候选框超出屏幕」根因）。统一换物理像素，内容
-                        // 贴边、阴影照旧允许出屏裁掉（二十九修语义）。
-                        let m_phys = (shadow_m as f32 * dpi_scale) as i32;
+                        // 放行=候选本体整块超出屏幕（资源管理器搜索框实测
+                        // 「候选框超出屏幕」根因）。统一换物理像素。
+                        // 【八十三修】上界只算候选本体、不再减 m_phys：
+                        // 物理换算是必要的，但四十五修顺手把阴影边距也
+                        // 减了=靠屏边时候选被推进一个阴影带（回归二十九
+                        // 修前的病：内容贴边即可，阴影出屏由 DWM 裁掉）。
                         let wpx = (width * dpi_scale) as i32;
                         let hpx = (height * dpi_scale) as i32;
                         // 【四十九修·小编辑框正下方】重命名类小编辑框
@@ -3677,12 +3734,14 @@ impl CandidateWindowV2 {
                                 "cw2: 小编辑框左对齐 x={x_base}（光标x={caret_x}）"
                             ));
                         }
-                        let x = x_base.clamp(vx, (vx + vw - m_phys - wpx).max(vx));
+                        // 【八十三修】上界/翻转判断只算候选本体（wpx/hpx），
+                        // 不再预留阴影边距 m_phys（内容贴边、阴影出屏裁掉）。
+                        let x = x_base.clamp(vx, (vx + vw - wpx).max(vx));
                         let below = r.bottom + 4;
-                        let y = if below + hpx + m_phys <= vy + vh {
+                        let y = if below + hpx <= vy + vh {
                             below
                         } else {
-                            (r.top - hpx - m_phys - 4).max(vy)
+                            (r.top - hpx - 4).max(vy)
                         };
                         // 【五十一修·y 稳定锁复刻 v1.5.2】老版本行为档
                         // 案实测（同 harness）：v1.5.0/1.5.2 段内 T 恒定
@@ -3924,13 +3983,14 @@ impl CandidateWindowV2 {
             // 【二十九修】不再预留 shadow_m（同锚点 clamp 口径：只算
             // 候选本体，阴影出屏裁掉）。
             // 【DPI 口径修复 2026-10-29】同锚点分支：width/height 逻辑
-            // 像素 → 物理像素（含内容左移的阴影边距），否则 150% 缩放
-            // 屏上候选本体可越出屏幕右/下缘（实测「候选框超出屏幕」）。
-            let m_phys0 = (shadow_m * dpi_scale) as i32;
+            // 像素 → 物理像素，否则 150% 缩放屏上候选本体可越出屏幕
+            // 右/下缘（实测「候选框超出屏幕」）。
+            // 【八十三修】同锚点分支：上界不再减阴影边距（四十五修加回
+            // 的 m_phys0 = 靠屏边候选被推进一个阴影带的回归根源）。
             let wpx0 = (width * dpi_scale) as i32;
             let hpx0 = (height * dpi_scale) as i32;
-            let x = x.clamp(vx, (vx + vw - m_phys0 - wpx0).max(vx));
-            let y = y.clamp(vy, (vy + vh - m_phys0 - hpx0).max(vy));
+            let x = x.clamp(vx, (vx + vw - wpx0).max(vx));
+            let y = y.clamp(vy, (vy + vh - hpx0).max(vy));
             self.sticky_pos = Some((x, y));
             // 【四十八修】记录本帧粘位归属的焦点窗（沿用判据，见字段注释）
             {
@@ -5537,6 +5597,17 @@ static CAND_UNSTICK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// 即使拖拽态中途被意外清掉，0x202 松手仍按窗口当前位置写固定位
 ///（用户拍板：拖动时不要求光标存活，只要位置能锁住）。
 static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// 【八十七修·阴影零交互】每个候选窗当前渲染帧的阴影物理内缩量
+/// （px，0=无阴影），按 hwnd 记录（多线程宿主每窗独立实例，DPI/皮肤
+/// 可不同——全局单值会串窗）。窗口矩形四边内缩本值即「内容矩形」：
+/// WM_NCHITTEST 用它判定——内容矩形内 HTCLIENT（候选可点/可拖），
+/// 阴影带 HTTRANSPARENT（穿透：不挡下层点击、不能当拖拽把手）。
+/// 渲染线程每帧随 shadow_m×dpi 更新；窗口本体恒为 内容+2×m，动效
+/// 期间按「当前窗口矩形−内缩」计算天然自适应。窗口销毁不摘除
+/// （每进程窗口数有限，残留条目无害）。Vec 而非 HashMap：statics
+/// 里 HashMap::new 非 const，且条目数=窗口数（个位数）线性扫足够。
+static CAND_SHADOW_INSET: std::sync::Mutex<Vec<(isize, i32)>> = std::sync::Mutex::new(Vec::new());
 
 /// 【尺寸动效 2026-09-11】smoothstep 插值：t∈[0,ms] 映射进度
 /// p=3t²-2t³（缓起-加速-缓收，「成长感」明确——ease-out 起步即
