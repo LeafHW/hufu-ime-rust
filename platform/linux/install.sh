@@ -368,7 +368,7 @@ install_user() {
         run gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
     fi
 
-    # 皮肤（fcitx5 主题形式）：随包 9 套，由 platform/linux/themes/ 离线转换自引擎皮肤
+    # 皮肤（fcitx5 主题形式）：随包 19 套，由 platform/linux/themes/ 离线转换自引擎皮肤
     # （同 id、同中文名）。装进用户主题目录后，在 fcitx5 配置 → 外观 → 主题 里选。
     if compgen -G "$ROOT/platform/linux/themes/hufu-*" >/dev/null; then
         run mkdir -p "$XDG_DATA/fcitx5/themes"

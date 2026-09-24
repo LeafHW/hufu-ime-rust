@@ -3,7 +3,7 @@
 
 # platform/linux/theme — 虎符皮肤 → fcitx5 主题包（转换工具 + 说明）
 
-引擎的 9 套皮肤（`engine/crates/hufu-server/official-skins/*.json`）是给 **Windows 自绘候选窗**
+引擎的 19 套皮肤（`engine/crates/hufu-server/official-skins/*.json`）是给 **Windows 自绘候选窗**
 用的；Linux 的候选窗是 fcitx5 的面板，样式只能来自 **fcitx5 主题**。这里把每套皮肤**离线**
 转成一套 fcitx5 主题包，随包安装到 `~/.local/share/fcitx5/themes/hufu-<id>/`——
 **主题名与皮肤 id、中文名一致**（在引擎设置页选「墨岩」，到 fcitx5 里也选「墨岩（极简黑）」）。
@@ -13,7 +13,7 @@
 转换脚本后重跑：
 
 ```sh
-python3 platform/linux/theme/build-themes.py     # 重新生成 9 套主题包
+python3 platform/linux/theme/build-themes.py     # 重新生成 19 套主题包
 bash platform/linux/checks/check-themes.sh       # 自检：重跑转换与仓内产物逐字节比对
 ```
 
@@ -24,7 +24,8 @@ zlib 级别固定）。
 ## 怎么选
 
 `fcitx5-configtool → 附加组件 → Classic UI → 主题`（或 `~/.config/fcitx5/conf/classicui.conf`
-的 `Theme=` / `DarkTheme=`）里选 `虎符皮肤名`。注意**主题是全局的**：换虎符主题会一并改掉
+的 `Theme=` / `DarkTheme=`）里选 `虎符皮肤名`。皮肤里既有暗色也有亮色（沧海/墨岩/松烟… 暗，
+晨雾/湖光/抹茶/月白… 亮）：想跟随桌面明暗就把 `Theme=` 填亮色款、`DarkTheme=` 填暗色款。注意**主题是全局的**：换虎符主题会一并改掉
 其它输入法的候选窗样式——这是 fcitx5 主题体系本身的性质，不是本项目的取舍。
 
 ## 映射表（皮肤 → fcitx5 主题键）
@@ -44,7 +45,7 @@ zlib 级别固定）。
 
 ## 做不到的（有意为之，不是 bug）
 
-- **模糊 / 材质**：fcitx5 classicui 有 `EnableBlur` + `BlurMask`（且需合成器支持），但引擎 9 套
+- **模糊 / 材质**：fcitx5 classicui 有 `EnableBlur` + `BlurMask`（且需合成器支持），但引擎 19 套
   官方皮肤的 `material.kind` **全是 `solid`** ⇒ 转出来永远不会触发，故不做。将来真出现
   `glass/frosted` 皮肤时，加 `EnableBlur=True` + `BlurMask=mask.png`（同圆角）约 15 行。
 - **动效**：入场/高亮滑动/上屏停留等是自绘候选窗的能力，fcitx5 主题没有对应键。
