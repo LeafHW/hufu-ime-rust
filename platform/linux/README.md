@@ -25,6 +25,7 @@
 | 反查 | `` ` `` + 拼音（全拼）反查，候选旁带虎码编码注释 |
 | 字反查 | 按 `~` 看光标左侧汉字的拼音/虎码/拆分两排提示；方向键移动光标实时跟随 |
 | 候选 | fcitx5 自带面板（跟随主题）；横排/竖排/跟随全局；候选窗内显示预编辑（默认开）；点击上屏 |
+| 皮肤 | 随包 9 套（与引擎皮肤同名），以 fcitx5 主题形式装到 `~/.local/share/fcitx5/themes/`；在 fcitx5 配置 → 外观 → 主题里选（主题全局生效，模糊/动效等自绘能力不可表达，见 platform/linux/theme/README.md） |
 | 选重翻页 | 数字选重、`;` 次选、`'` 三选、`-=` 翻页（设置页可改，支持自定义选重键） |
 | 注释 | 拆分 / 拼音 / unicode 分区注释（整句态下按引擎口径不显示） |
 | 标点与转换 | 全角标点、OpenCC 简繁、emoji 变体、自定义符号表 |
@@ -57,7 +58,9 @@ platform/linux/uninstall.sh --purge     # 连「模型」一起删
 
 安装产物：系统级 `/usr/lib/fcitx5/libhufu.so` 与 `/usr/share/fcitx5/{addon,inputmethod}/hufu.conf`；
 用户级 `~/.local/bin/hufu-server`、`~/.config/systemd/user/hufu-server.service`、
-`~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`；
+`~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`
+与自带图标 `~/.local/share/icons/hicolor/{scalable,48x48,22x22}/apps/hufu.{svg,png}`（输入法条目、
+状态区菜单与桌面项都用它）、9 套 fcitx5 皮肤主题 `~/.local/share/fcitx5/themes/hufu-*`；
 数据 `~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置、皮肤、用户词、音效与诊断）。
 
 **模型（可选）**：整句与神经重排模型约 880MB，不随仓库分发——安装脚本结束时以绿色打印

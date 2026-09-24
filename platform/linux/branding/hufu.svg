@@ -1,0 +1,9 @@
+<!-- SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com> -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- 虎符图标（候选 A）：深底圆角方块 + 两半错金兵符（中缝锯齿）。
+     纯几何形状、不含文字与字体依赖，22–48 px 下均可辨识。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect x="3" y="3" width="58" height="58" rx="13" fill="#22252b"/>
+  <path d="M20 14 L32 14 L26 23 L38 32 L26 41 L32 50 L20 50 Z" fill="#a8762a"/>
+  <path d="M44 14 L32 14 L26 23 L38 32 L26 41 L32 50 L44 50 Z" fill="#e8c26a"/>
+</svg>

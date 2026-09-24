@@ -36,9 +36,12 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ASSETS_DIR="$ROOT/assets"
 # 外部数据源（仅 --from 或 assets/ 缺失时使用；无默认值——本机路径不该进仓库）
 SRC="${HUFU_DATA_SRC:-}"
-HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
+# 用户级落点：遵守 XDG（与 HUFU_ROOT 同一口径）；卸载脚本里是同一套定义。
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+HUFU_ROOT="$XDG_DATA/hufu"
 DATA_DIR="$HUFU_ROOT/数据"
-BIN_DIR="$HOME/.local/bin"
+BIN_DIR="$XDG_DATA/bin"
 BUILD_DIR="$ROOT/platform/linux/build"
 
 # 防呆：整个脚本不要用 sudo 跑——用户级部分会装进 /root（systemd user 服务
@@ -341,13 +344,41 @@ install_user() {
     run mkdir -p "$BIN_DIR"
     run install -m 755 "$SERVER_BIN" "$BIN_DIR/hufu-server"
 
-    run mkdir -p "$HOME/.config/systemd/user"
+    run mkdir -p "$XDG_CONFIG/systemd/user"
     run install -m 644 "$ROOT/platform/linux/systemd/hufu-server.service" \
-        "$HOME/.config/systemd/user/hufu-server.service"
+        "$XDG_CONFIG/systemd/user/hufu-server.service"
 
-    run mkdir -p "$HOME/.local/share/applications"
+    run mkdir -p "$XDG_DATA/applications"
     run install -m 644 "$ROOT/platform/linux/desktop/hufu-settings.desktop" \
-        "$HOME/.local/share/applications/hufu-settings.desktop"
+        "$XDG_DATA/applications/hufu-settings.desktop"
+
+    # 自带图标（platform/linux/branding/，唯一矢量源 + 生成的位图）：装进用户图标主题，
+    # 输入法条目（conf 的 Icon）、状态区菜单（menuAction_.setIcon）与桌面项都按主题名 hufu 解析。
+    run mkdir -p "$XDG_DATA/icons/hicolor/scalable/apps" \
+        "$XDG_DATA/icons/hicolor/48x48/apps" \
+        "$XDG_DATA/icons/hicolor/22x22/apps"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu.svg" \
+        "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu-48.png" \
+        "$XDG_DATA/icons/hicolor/48x48/apps/hufu.png"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu-22.png" \
+        "$XDG_DATA/icons/hicolor/22x22/apps/hufu.png"
+    # 有缓存工具就刷一次：某些桌面环境不刷会继续显示旧图标/缺图占位
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        run gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
+    fi
+
+    # 皮肤（fcitx5 主题形式）：随包 9 套，由 platform/linux/themes/ 离线转换自引擎皮肤
+    # （同 id、同中文名）。装进用户主题目录后，在 fcitx5 配置 → 外观 → 主题 里选。
+    if compgen -G "$ROOT/platform/linux/themes/hufu-*" >/dev/null; then
+        run mkdir -p "$XDG_DATA/fcitx5/themes"
+        for old_theme in "$XDG_DATA"/fcitx5/themes/hufu-*; do
+            if [[ -d "$old_theme" ]]; then
+                run rm -rf "$old_theme"      # 清旧包：皮肤改了圆角/文件集时不残留
+            fi
+        done
+        run cp -r "$ROOT"/platform/linux/themes/hufu-* "$XDG_DATA/fcitx5/themes/"
+    fi
 
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         run systemctl --user daemon-reload

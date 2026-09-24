@@ -1122,6 +1122,10 @@ private:
     /// 引擎侧动作用 daemon 既有 op，本层只做薄封装（协议不动）。
     void setupStatusMenu() {
         menuAction_.setShortText("虎符");
+        // 状态区图标用本包自带的主题名（与 `conf/hufu.inputmethod.conf` 的 `Icon` 一致，
+        // 由 install.sh 装到 hicolor）：不设时 fcitx5 回退到输入法条目图标，而条目图标
+        // 若指向别的包（如曾用的 fcitx-tiger）在缺包机器上就是缺图占位。
+        menuAction_.setIcon("hufu");
         // 1) 重载码表：引擎侧当前方案原样重载（改码表/补充语料后免重启生效）。
         reloadAction_ = std::make_unique<HufuMenuAction>(
             [] { return std::string("重载码表"); },
