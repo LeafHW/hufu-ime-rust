@@ -114,7 +114,31 @@ fi
 say '③ 删除用户级文件'
 run rm -f "$HOME/.local/bin/hufu-server" \
     "$HOME/.local/share/applications/hufu-settings.desktop" \
-    "$HOME/.config/fcitx5/conf/hufu.conf"
+    "$HOME/.config/fcitx5/conf/hufu.conf" \
+    "$HOME/.local/share/icons/hicolor/scalable/apps/hufu.svg" \
+    "$HOME/.local/share/icons/hicolor/48x48/apps/hufu.png" \
+    "$HOME/.local/share/icons/hicolor/22x22/apps/hufu.png"
+# 图标缓存里的残留记录：有工具就重刷一次（没有工具时图标按目录实时解析，无碍）
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    run gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+fi
+# 收空目录：install 建过的这几处若空着就一并收掉（用户本来就有内容时 rmdir 失败，无副作用）
+run rmdir --ignore-fail-on-non-empty \
+    "$HOME/.local/share/icons/hicolor/scalable/apps" \
+    "$HOME/.local/share/icons/hicolor/48x48/apps" \
+    "$HOME/.local/share/icons/hicolor/22x22/apps" \
+    "$HOME/.local/share/icons/hicolor/scalable" \
+    "$HOME/.local/share/icons/hicolor/48x48" \
+    "$HOME/.local/share/icons/hicolor/22x22" \
+    "$HOME/.local/share/icons/hicolor" \
+    "$HOME/.local/share/icons" \
+    "$HOME/.local/share/applications" \
+    "$HOME/.local/bin" \
+    "$HOME/.config/systemd/user" \
+    "$HOME/.config/systemd" \
+    "$HOME/.local/share" \
+    "$HOME/.local" \
+    "$HOME/.config" 2>/dev/null || true
 
 # ── 数据目录：默认除「模型」外全删（模型给出手动删除命令）──────────────────
 # 为什么不用台账逐个删：台账只登记 install.sh 装配进去的随包文件，用户词与调整

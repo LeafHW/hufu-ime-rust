@@ -349,6 +349,22 @@ install_user() {
     run install -m 644 "$ROOT/platform/linux/desktop/hufu-settings.desktop" \
         "$HOME/.local/share/applications/hufu-settings.desktop"
 
+    # 自带图标（platform/linux/branding/，唯一矢量源 + 生成的位图）：装进用户图标主题，
+    # 输入法条目（conf 的 Icon）、状态区菜单（menuAction_.setIcon）与桌面项都按主题名 hufu 解析。
+    run mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps" \
+        "$HOME/.local/share/icons/hicolor/48x48/apps" \
+        "$HOME/.local/share/icons/hicolor/22x22/apps"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu.svg" \
+        "$HOME/.local/share/icons/hicolor/scalable/apps/hufu.svg"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu-48.png" \
+        "$HOME/.local/share/icons/hicolor/48x48/apps/hufu.png"
+    run install -m 644 "$ROOT/platform/linux/branding/hufu-22.png" \
+        "$HOME/.local/share/icons/hicolor/22x22/apps/hufu.png"
+    # 有缓存工具就刷一次：某些桌面环境不刷会继续显示旧图标/缺图占位
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        run gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    fi
+
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         run systemctl --user daemon-reload
         run systemctl --user enable hufu-server.service

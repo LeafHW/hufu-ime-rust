@@ -57,7 +57,9 @@ platform/linux/uninstall.sh --purge     # 连「模型」一起删
 
 安装产物：系统级 `/usr/lib/fcitx5/libhufu.so` 与 `/usr/share/fcitx5/{addon,inputmethod}/hufu.conf`；
 用户级 `~/.local/bin/hufu-server`、`~/.config/systemd/user/hufu-server.service`、
-`~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`；
+`~/.local/share/applications/hufu-settings.desktop`、`~/.config/fcitx5/conf/hufu.conf`
+与自带图标 `~/.local/share/icons/hicolor/{scalable,48x48,22x22}/apps/hufu.{svg,png}`（输入法条目、
+状态区菜单与桌面项都用它）；
 数据 `~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置、皮肤、用户词、音效与诊断）。
 
 **模型（可选）**：整句与神经重排模型约 880MB，不随仓库分发——安装脚本结束时以绿色打印

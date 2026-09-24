@@ -124,7 +124,10 @@ ok "$checked 个脚本语法通过"
 step '⑦ assets 台账（字节 + sha256）'
 bash platform/linux/checks/check-assets.sh || fail 'assets/ 与 assets/MANIFEST 不一致'
 
-step '⑧ install / uninstall --dry-run 冒烟（临时 XDG_DATA_HOME，不落任何改动）'
+step '⑧ 品牌图形（branding/：矢量源 + 22/48 位图）'
+bash platform/linux/checks/check-branding.sh || fail '品牌图形自检失败'
+
+step '⑨ install / uninstall --dry-run 冒烟（临时 XDG_DATA_HOME，不落任何改动）'
 rm -rf "$xdg_tmp"
 if ! XDG_DATA_HOME="$xdg_tmp" bash platform/linux/install.sh --dry-run >"$tmp/install.log" 2>&1; then
     tail -20 "$tmp/install.log"
@@ -139,14 +142,14 @@ if [ -e "$xdg_tmp" ]; then
 fi
 ok "两个 dry-run 都是 exit 0，且 $xdg_tmp 未被创建"
 
-step '⑨ 排版（cargo fmt -p hufu-fcitx5-client --check）'
+step '⑩ 排版（cargo fmt -p hufu-fcitx5-client --check）'
 if ! fmt_out=$(cd platform/linux && cargo fmt -p hufu-fcitx5-client --check 2>&1); then
     printf '%s\n' "$fmt_out"
     fail 'rustfmt 有差异：在 platform/linux 跑 cargo fmt -p hufu-fcitx5-client 后重试'
 fi
 ok '排版干净'
 
-step '⑩ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
+step '⑪ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
 if ! clippy_out=$(cd platform/linux &&
     cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings 2>&1); then
     printf '%s\n' "$clippy_out"
