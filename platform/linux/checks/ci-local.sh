@@ -124,7 +124,7 @@ ok "$checked 个脚本语法通过"
 step '⑦ assets 台账（字节 + sha256）'
 bash platform/linux/checks/check-assets.sh || fail 'assets/ 与 assets/MANIFEST 不一致'
 
-step '⑧ 品牌图形（branding/：矢量源 + 22/48 位图）'
+step '⑧ 品牌图形（branding/：主源位图 + 自包含 SVG + 22/48 位图）'
 bash platform/linux/checks/check-branding.sh || fail '品牌图形自检失败'
 
 step '⑨ 皮肤 → fcitx5 主题包（重跑转换逐字节比对）'
