@@ -3551,7 +3551,7 @@ pub(crate) fn is_cjk_fullwidth(c: char) -> bool {
 /// GetTextExt 返回的过期位置相对落后 est 仅几 px 被连续性过滤器放行，
 /// 锚点序列倒退（trace 实锤 963→937=chase 回弹）。播种后：过期值相对真
 /// 值倒退超阈被拒，est 步进从真值出发前推；下一键标准链重校自然接管。
-fn seed_est_from_anchor(g: &mut Shared, r: &RECT) {
+fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
     g.caret_est_x = r.left;
     g.caret_est_y = r.top;
     g.caret_est_line_h = (r.bottom - r.top).max(8);
@@ -3560,6 +3560,16 @@ fn seed_est_from_anchor(g: &mut Shared, r: &RECT) {
     // 校准采样点=本锚：下一键标准链成功查询时 Δraw=1 出干净键宽样本。
     g.caret_est_cal_raw = g.cur_raw_len as i32;
     g.caret_est_cal_x = r.left;
+    // 【九十修·写入全观测 2026-09-25】est 基线此前有两条零日志写入路
+    //（seg1 selection 两分支）——垃圾基线无法归因，三轮盲修门都装不
+    // 中。此后每次播种都打一行：via=来源分支、rect=播种值。
+    // 【发布收口】trace_on() 前置——format! 求值不进生产热路径。
+    if crate::tsf::trace_on() {
+        trace(&format!(
+            "qc: seed est via={} rect=({},{},{},{}) → base=({},{})",
+            via, r.left, r.top, r.right, r.bottom, g.caret_est_x, g.caret_est_y
+        ));
+    }
 }
 
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
@@ -3689,44 +3699,134 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 段首直查组段 START 恒成功——虎魄跳过 selection 优先。
     if g.seg_key_index == 1 && !exe_is_hupo_qie() {
         if let Some(r) = selection_caret_rect(ctx, ec) {
-            let est_ok = g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0);
-            if est_ok {
-                let dx = r.left - g.caret_est_x;
-                let dy = r.top - g.caret_est_y;
-                if dx.abs() > 80 || dy.abs() > 60 {
-                    trace(&format!(
-                        "qc: seg1 selection 旧布局拦截 dx={} dy={}（走标准链）",
-                        dx, dy
-                    ));
-                } else {
-                    // 【三十四修·selection 播种 est】采纳时同步播种 est 基
-                    // 线（原只设 g.caret，est 还停在上屏估宽值——估宽 0.6×
-                    // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
-                    // 性 GetTextExt 返回的过期值「相对 est 合理」被连续性
-                    // 过滤器放行 → 锚点序列倒退=chase 回弹，trace 实锤 963
+            // 【九十修·观测 2026-09-25】seg1 selection 每次返回全量打点：
+            // 值 + 活插入符 + 上一锚 + est 现值——与各采纳/拦截分支日志
+            // 对照即可完整归因垃圾入口（此前该块两分支零日志=盲区）。
+            if crate::tsf::trace_on() {
+                let lv = gui_caret_fallback();
+                trace(&format!(
+                    "qc: seg1sel rect=({},{},{},{}) live=[{}] prev=[{}] est=({},{})",
+                    r.left, r.top, r.right, r.bottom,
+                    lv.as_ref().map(|x| format!("({},{},{},{})", x.left, x.top, x.right, x.bottom)).unwrap_or_default(),
+                    prev_caret.as_ref().map(|x| format!("({},{})", x.left, x.top)).unwrap_or_default(),
+                    g.caret_est_x, g.caret_est_y
+                ));
+            }
+            // 【八十八修·播种几何门 2026-09-25】WPS 表格双轮 trace 实锤
+            //（18:36 与 18:43 两轮，40 次 d≈700-1180px 大跳瞬落）：组段
+            // 建立瞬间 selection GetTextExt 偶发返回文档原点带（EXCEL7
+            // 左上 (93,241) 族）或跨标签坐标（(2486,1816) 族，四十二修
+            // 多标签摇摆同源）——此刻 prev_caret 已被上屏后的 OnSetFocus
+            // 清空、est 已归零，下方 near 恒 true，垃圾被**零日志**采纳
+            // 并 seed 进 est 基线；随后 GetTextExt 真值全被极端锚拦截
+            //（dx>800）拒收=est 死锁，首显帧靠活插入符救场、非首显帧吃
+            // 垃圾 est → 候选窗在格位与左上角之间来回瞬落。门：表格编
+            // 辑框（EXCEL6）在位时，selection 结果必须落在框 ±40/±60px
+            // 内——报的是本格才准采纳/播种（anchor_in_cell 同款判据）；
+            // 框外=垃圾，弃用落标准链（组段 GetTextExt 后方还有极端拦
+            // 截防线兜着）。ed6=None（框未建/非表格宿主）不拦，行为不
+            // 变。B 方案（est 死锁自愈）因被动等帧响应慢被用户否决——
+            // 本门在播种源头一帧拦掉，零等待。
+            let gate_block = match excel6_anchor() {
+                Some(e) => {
+                    let in_cell = r.left >= e.left - 40
+                        && r.left <= e.right + 40
+                        && r.top >= e.top - 40
+                        && r.bottom <= e.bottom + 60;
+                    if !in_cell {
+                        trace(&format!(
+                            "qc: seg1 selection 框外垃圾拦截 rect=({},{},{},{}) 框=({},{},{},{})——弃用落标准链",
+                            r.left, r.top, r.right, r.bottom,
+                            e.left, e.top, e.right, e.bottom
+                        ));
+                    }
+                    !in_cell
+                }
+                None => {
+                    // 【八十九修 B·焦点窗归属验证 2026-09-25】无编辑框形态
+                    //（焦点=表格视图 EXCEL7，单击选中直接打字）第二轮 trace
+                    // 实锤：seg1 selection 返回跨标签垃圾 (1858,1273)（焦
+                    // 点窗 EXCEL7 右/下界之外），prev=None 近邻防线恒过 →
+                    // 零日志播种 est=垃圾 → 23 次极端拦截 + 12 次大跳瞬落。
+                    // 修：selection 锚必须落在焦点窗矩形内——真光标必在焦
+                    // 点编辑区内，垃圾坐标系必在外。±8px 容差；焦点窗/矩形
+                    // 取不到时不拦（行为不变）。
+                    let mut block = false;
+                    unsafe {
+                        let fg0 = GetForegroundWindow();
+                        if !fg0.0.is_null() {
+                            let tid0 = GetWindowThreadProcessId(fg0, None);
+                            let mut gi = GUITHREADINFO {
+                                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                                ..Default::default()
+                            };
+                            if GetGUIThreadInfo(tid0, &mut gi).is_ok()
+                                && !gi.hwndFocus.0.is_null()
+                            {
+                                let mut fr = RECT::default();
+                                if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
+                                    && fr.right > fr.left
+                                {
+                                    let inside = r.left >= fr.left - 8
+                                        && r.left <= fr.right + 8
+                                        && r.top >= fr.top - 8
+                                        && r.bottom <= fr.bottom + 8;
+                                    if !inside {
+                                        trace(&format!(
+                                            "qc: seg1 selection 焦点窗外垃圾拦截 rect=({},{},{},{}) 焦点窗=({},{},{},{})——弃用落标准链",
+                                            r.left, r.top, r.right, r.bottom,
+                                            fr.left, fr.top, fr.right, fr.bottom
+                                        ));
+                                        block = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    block
+                }
+            };
+            if !gate_block {
+                let est_ok =
+                    g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0);
+                if est_ok {
+                    let dx = r.left - g.caret_est_x;
+                    let dy = r.top - g.caret_est_y;
+                    if dx.abs() > 80 || dy.abs() > 60 {
+                        trace(&format!(
+                            "qc: seg1 selection 旧布局拦截 dx={} dy={}（走标准链）",
+                            dx, dy
+                        ));
+                    } else {
+                        // 【三十四修·selection 播种 est】采纳时同步播种 est 基
+                        // 线（原只设 g.caret，est 还停在上屏估宽值——估宽 0.6×
+                        // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
+                        // 性 GetTextExt 返回的过期值「相对 est 合理」被连续性
+                        // 过滤器放行 → 锚点序列倒退=chase 回弹，trace 实锤 963
                     // →937）。播种后过滤器以真值为参照，过期值被正确拒绝。
-                    seed_est_from_anchor(g, &r);
-                    g.caret = Some(r);
-                    return;
+                    seed_est_from_anchor(g, &r, "seg1sel_estok");
+                        g.caret = Some(r);
+                        return;
+                    }
+                } else {
+                    // 【四十二修·无基线段首防摇摆】est 无基线时段首 selection
+                    // 原为无条件采纳——WPS 多标签 GetSelection 摇摆（表格标
+                    // 签值混入）直达 g.caret（且采纳即 return 使 est 永远建不
+                    // 了基线，过滤恒失效）。加与最近锚(prev_caret)的连续性：
+                    // 差>100/60 判非本文档值，弃 selection 落标准链（GetTextExt
+                    // 段末建基线——此后 est_ok=true 走正常过滤，自愈）。
+                    let near = match prev_caret {
+                        Some(p) => (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60,
+                        None => true,
+                    };
+                    if near {
+                        // 【三十四修·selection 播种 est】同上
+                        seed_est_from_anchor(g, &r, "seg1sel_near");
+                        g.caret = Some(r);
+                        return;
+                    }
+                    trace("qc: seg1 selection 摇摆拦截（无基线，走标准链）");
                 }
-            } else {
-                // 【四十二修·无基线段首防摇摆】est 无基线时段首 selection
-                // 原为无条件采纳——WPS 多标签 GetSelection 摇摆（表格标
-                // 签值混入）直达 g.caret（且采纳即 return 使 est 永远建不
-                // 了基线，过滤恒失效）。加与最近锚(prev_caret)的连续性：
-                // 差>100/60 判非本文档值，弃 selection 落标准链（GetTextExt
-                // 段末建基线——此后 est_ok=true 走正常过滤，自愈）。
-                let near = match prev_caret {
-                    Some(p) => (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60,
-                    None => true,
-                };
-                if near {
-                    // 【三十四修·selection 播种 est】同上
-                    seed_est_from_anchor(g, &r);
-                    g.caret = Some(r);
-                    return;
-                }
-                trace("qc: seg1 selection 摇摆拦截（无基线，走标准链）");
             }
         }
     }
@@ -3924,6 +4024,29 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 放行重校。跟打器维持 -3000（文档坐标特性）。
         let lo = if exe_is_hupo() { -3000 } else { -1500 };
         if dx > 800 || dx < lo || dy < -300 {
+            // 【九十二修·归属仲裁 2026-09-25】九十一修的活插入符仲裁在
+            // 本宿主从未触发（live=[] 结构性缺失，九十修插桩实锤）。改
+            // 焦点窗归属（live-free）：被拦值若落在焦点窗矩形内=被冤枉
+            // 的真值——WPS 表格换格不发 OnSetFocus（同文档焦点窗不变），
+            // est 基线跨组段存活，新格真值与旧格基线差恒定（实锤 dy=-446
+            // 每帧恒判烂锚=死锁，show 侧两格交替=AB 来回）。窗内 → est
+            // 重校为本帧真值并采纳，死锁一帧解除；窗外=真垃圾维持拦截
+            //（dy<-300 防线对窗外垃圾语义不变）。
+            if let Some(fr) = focus_window_rect() {
+                let inside = rect.left >= fr.left - 8
+                    && rect.left <= fr.right + 8
+                    && rect.top >= fr.top - 8
+                    && rect.bottom <= fr.bottom + 8;
+                if inside {
+                    trace(&format!(
+                        "qc: 换格归属仲裁 rect=({},{}) 焦点窗=({},{},{},{}) → 重校采纳",
+                        rect.left, rect.top, fr.left, fr.top, fr.right, fr.bottom
+                    ));
+                    seed_est_from_anchor(g, &rect, "recell_focus");
+                    g.caret = Some(rect);
+                    return;
+                }
+            }
             g.qc_probe_steady = 0; // 烂锚：单查拿到旧布局值，回双查
             trace(&format!("qc: 极端锚拦截 dx={} dy={}（est 步进）", dx, dy));
             est_step(g);
@@ -3935,6 +4058,32 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 监控实测一路涨出主窗右缘 420px）——钳到宿主窗内右带后再对齐
     // est 基线（est 从钳位点起步，est 矩形天然在窗内）。
     hupo_clamp(&mut rect);
+    // 【九十二修·无基线归属验证 2026-09-25】八十九修的活插入符交叉
+    // 验证在本宿主结构性失效（Qt 自绘光标，系统插入符恒缺失——九十
+    // 修插桩实锤 seg1sel 39 帧 live=[] 全空，该门一次未触发），标准
+    // 链无基线采纳点因此裸奔：垃圾 (1265,1928)（焦点窗外 612px）直
+    // 进 est 基线 → 真值全被极端拦截拒收=死锁+大跳瞬落。改用焦点窗
+    // 归属（live-free）：est 无基线时，GetTextExt 结果必须落在焦点窗
+    // 矩形内（±8）——真光标必在焦点编辑区，垃圾坐标系必在外。窗外=
+    // 垃圾，恢复旧锚不重校（真值帧随后到来自然采纳）。
+    if host_is_wps() && g.caret_est_x == 0 && g.caret_est_y == 0 {
+        if let Some(fr) = focus_window_rect() {
+            let inside = rect.left >= fr.left - 8
+                && rect.left <= fr.right + 8
+                && rect.top >= fr.top - 8
+                && rect.bottom <= fr.bottom + 8;
+            if !inside {
+                trace(&format!(
+                    "qc: 无基线归属拦截 rect=({},{},{},{}) 焦点窗=({},{},{},{})——恢复旧锚",
+                    rect.left, rect.top, rect.right, rect.bottom,
+                    fr.left, fr.top, fr.right, fr.bottom
+                ));
+                g.caret = prev_caret;
+                g.line_end = prev_line_end;
+                return;
+            }
+        }
+    }
     // 【三十八修·步宽校准采样】重校点间距=真实位移——与上次采样点
     //（同段内，键数差 d>0）的 (Δx/Δraw)=真实每键宽样本，指数平滑进
     // unit_w（样本须同向合理：0<Δx<400，防上屏换行/点击混入）。上
@@ -3958,6 +4107,15 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     }
     g.caret_est_cal_raw = g.cur_raw_len as i32;
     g.caret_est_cal_x = rect.left;
+    // 【九十修·观测】标准链成功采纳（重校）点显式打行——原只有前置
+    // 的 qc: raw（成功/被拦都打），采纳与拦截无法区分。
+    // 【发布收口】trace_on() 前置——每键热路径，format! 不进生产。
+    if crate::tsf::trace_on() {
+        trace(&format!(
+            "qc: 采纳重校 rect=({},{},{},{}) seg={}",
+            rect.left, rect.top, rect.right, rect.bottom, g.seg_key_index
+        ));
+    }
     g.caret_est_x = rect.left;
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
@@ -5905,6 +6063,32 @@ unsafe extern "system" fn excel6_enum_proc(h: HWND, _l: LPARAM) -> BOOL {
 /// 窗枚举（每子窗一次 GetClassNameW）——记事本/跟打器/QQ 等用不到
 /// EXCEL6 的宿主白付这项成本（逐提交审计表b 最大固定新增）。改：仅
 /// 前台进程名含 excel/wps/et 时才枚举（OnceLock 缓存判定）。
+/// 【九十二修·焦点窗矩形 2026-09-25】前台线程焦点窗的屏幕矩形。
+/// WPS 表格上唯一无条件成立的真值判据源：活插入符在 Qt 自绘光标宿主
+/// 结构性缺失（九十修插桩实锤 seg1sel 39 帧 live=[] 全空），而
+/// GetTextExt/selection 都会返回跨标签/页面坐标垃圾——只有「真值必
+/// 落在焦点窗矩形内」恒成立（垃圾坐标系必在外）。
+fn focus_window_rect() -> Option<RECT> {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(fg, None);
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gi).is_ok() && !gi.hwndFocus.0.is_null() {
+            let mut r = RECT::default();
+            if GetWindowRect(gi.hwndFocus, &mut r).is_ok() && r.right > r.left {
+                return Some(r);
+            }
+        }
+        None
+    }
+}
+
 fn excel6_anchor() -> Option<RECT> {
     unsafe {
         // 宿主门：前台进程名判定，进程级 OnceLock 缓存。
@@ -5923,6 +6107,39 @@ fn excel6_anchor() -> Option<RECT> {
         });
         if !ok {
             return None;
+        }
+        // 【八十八修补·焦点窗直查 2026-09-25】WPS 12.1 实锤（八十八修
+        // 验证轮 trace + 窗口树探针）：单元格编辑框 EXCEL6 编辑态存在
+        //（GUITHREADINFO 焦点窗 96 帧实锤）却**不在主窗子窗树**——
+        // 下方 EnumChildWindows 恒空 → excel6_anchor 恒 None → 八十八修
+        // seg1 播种几何门永不武装（垃圾锚照旧零日志采纳）。新增直查：
+        // 前台线程焦点窗类名 == EXCEL6 且可见 → 直接取其窗口矩形
+        //（与 candwin2「锚对照」观测同源）。类名严格等值，EXCEL7（表
+        // 格视图）不误入。
+        {
+            let fg0 = GetForegroundWindow();
+            if !fg0.0.is_null() {
+                let tid = GetWindowThreadProcessId(fg0, None);
+                let mut gi = GUITHREADINFO {
+                    cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetGUIThreadInfo(tid, &mut gi).is_ok() && !gi.hwndFocus.0.is_null() {
+                    let mut cn = [0u16; 16];
+                    let n = GetClassNameW(gi.hwndFocus, &mut cn);
+                    if n == 6 && String::from_utf16_lossy(&cn[..6]) == "EXCEL6" {
+                        // 【四十二修·可见性门】同款语义：框不可见=焦点不在
+                        // 表格编辑态，返回 None 不参与过滤与兜底。
+                        if IsWindowVisible(gi.hwndFocus).as_bool() {
+                            let mut r = RECT::default();
+                            if GetWindowRect(gi.hwndFocus, &mut r).is_ok() && r.right > r.left {
+                                return Some(r);
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
         }
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
