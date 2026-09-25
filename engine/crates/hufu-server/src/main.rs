@@ -283,24 +283,37 @@ fn main() {
                     // 【ngram 自动探测 2026-10-09 二十】与装载计划同口径：
                     // config 路径不存在时探测「模型」目录最大 .bin——拖
                     // 任意名 ngram 进来 watch 线程才能看到边沿触发装载。
+                    // 【指纹改 2026-09-25】旧探针只看「最大 bin 大小」，
+                    // 拖入比现有更小的模型时统计量不变→不触发重载。
+                    // 改为指纹（bin 数量, 最新 mtime）：任意拖入/删除
+                    // 都构成边沿；装载端逐候选试读，02/03/04 魔数自适配。
                     let ngram_stat = |cfg_p: &std::path::Path, data_dir: &std::path::Path| -> Option<(u64, i64)> {
                         if cfg_p.exists() {
                             return stat_of(cfg_p);
                         }
                         let model_dir = hufu_engine::Engine::resolve_data_sub(data_dir, "模型");
-                        let mut bins: Vec<std::path::PathBuf> = std::fs::read_dir(&model_dir)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|e| e.ok())
-                            .map(|e| e.path())
-                            .filter(|p| {
-                                p.extension()
-                                    .map(|x| x.eq_ignore_ascii_case("bin"))
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        bins.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
-                        stat_of(bins.last()?)
+                        let mut newest: i64 = 0;
+                        let mut count: u64 = 0;
+                        for e in std::fs::read_dir(&model_dir).into_iter().flatten().filter_map(|e| e.ok()) {
+                            let p = e.path();
+                            if !p.extension().map(|x| x.eq_ignore_ascii_case("bin")).unwrap_or(false) {
+                                continue;
+                            }
+                            let md = match std::fs::metadata(&p) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            count += 1;
+                            if let Ok(mt) = md.modified() {
+                                if let Ok(d) = mt.duration_since(std::time::UNIX_EPOCH) {
+                                    newest = newest.max(d.as_secs() as i64);
+                                }
+                            }
+                        }
+                        if count == 0 {
+                            return None;
+                        }
+                        Some((count, newest))
                     };
                     let cur_gguf = if rerank_enabled {
                         gguf_stat(&data_dir_w)
@@ -519,33 +532,72 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                     }
                     h.sentence_load_plan()
                 };
-                let Some((path, dict, supplement, weights)) = plan else {
+                let Some((candidates, dict, supplement, weights)) = plan else {
                     break;
                 };
+                // 【候选逐试 2026-09-25】装载计划给出候选清单（config
+                // 路径优先，其后「模型」目录全部 .bin 按 mtime 新→旧）。
+                // 逐个试读——魔数不符/文件损坏的候选跳过，首个装载
+                // 成功者生效（02/04 三阶、03 五阶由 Lm::load 自适配）。
                 // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
                 // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
                 // 重载时页缓存已热，顺序读很快返回。
-                {
-                    let p = path.clone();
-                    std::thread::Builder::new()
-                        .name("hufu-ngram-warm".into())
-                        .spawn(move || {
-                            let t0 = std::time::Instant::now();
-                            if let Ok(mut f) = std::fs::File::open(&p) {
-                                use std::io::Read;
-                                let mut buf = vec![0u8; 4 << 20];
-                                while let Ok(n) = f.read(&mut buf) {
-                                    if n == 0 {
-                                        break;
+                let mut loaded_path: Option<std::path::PathBuf> = None;
+                let mut last_err: Option<std::io::Error> = None;
+                let mut dec_opt = None;
+                for cand in &candidates {
+                    {
+                        let p = cand.clone();
+                        std::thread::Builder::new()
+                            .name("hufu-ngram-warm".into())
+                            .spawn(move || {
+                                let t0 = std::time::Instant::now();
+                                if let Ok(mut f) = std::fs::File::open(&p) {
+                                    use std::io::Read;
+                                    let mut buf = vec![0u8; 4 << 20];
+                                    while let Ok(n) = f.read(&mut buf) {
+                                        if n == 0 {
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            eprintln!("ngram 页缓存预热完成（{:.1}s）", t0.elapsed().as_secs_f32());
-                        })
-                        .ok();
+                                eprintln!("ngram 页缓存预热完成（{:.1}s）", t0.elapsed().as_secs_f32());
+                            })
+                            .ok();
+                    }
+                    match hufu_sentence::SentenceEngine::load(
+                        cand,
+                        dict.clone(),
+                        &supplement,
+                        weights.clone(),
+                    ) {
+                        Ok(dec) => {
+                            eprintln!(
+                                "ngram 候选装载成功: {}（{}MB）",
+                                cand.display(),
+                                std::fs::metadata(cand).map(|m| m.len() >> 20).unwrap_or(0)
+                            );
+                            loaded_path = Some(cand.clone());
+                            dec_opt = Some(dec);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("ngram 候选跳过 {}: {e}", cand.display());
+                            last_err = Some(e);
+                        }
+                    }
                 }
-                match hufu_sentence::SentenceEngine::load(&path, dict, &supplement, weights) {
-                    Ok(dec) => {
+                let path = match loaded_path {
+                    Some(p) => p,
+                    None => {
+                        let e = last_err.map(|e| e.to_string()).unwrap_or_default();
+                        eprintln!("整句模型后台加载失败（无可用候选）: {e}");
+                        NGRAM_LOAD_BUSY.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                if let Some(dec) = dec_opt {
+                    {
                         let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
                         // 装载期间用户可能切方案/关整句：只在仍满足
                         // 门控时挂载，否则弃用本次结果
@@ -564,7 +616,6 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                             );
                         }
                     }
-                    Err(e) => eprintln!("整句模型后台加载失败: {e}"),
                 }
                 if !NGRAM_LOAD_PENDING.swap(false, Ordering::SeqCst) {
                     break;

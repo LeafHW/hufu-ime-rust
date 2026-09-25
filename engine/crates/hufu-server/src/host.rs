@@ -209,7 +209,7 @@ impl Host {
     pub fn sentence_load_plan(
         &self,
     ) -> Option<(
-        PathBuf,
+        Vec<PathBuf>,
         std::sync::Arc<hufu_dict::dict::Dict>,
         hufu_dict::supplement::Supplement,
         hufu_config::SentenceWeights,
@@ -227,34 +227,50 @@ impl Host {
         // models/sentence-ngram.bin；旧版对不上名字时整句静默不装载，
         // 用户以为有模型其实在跑纯码表）。多个 bin 取最大（主模型
         // 通常远大于附属文件）。
+        // 【候选逐试 2026-09-25】改为返回候选清单（config 路径优先，
+        // 其后全部 .bin 按 mtime 新→旧），由装载端逐个试读、首个
+        // 成功者生效——旧「只取最大」在目录同时有旧模型与新拖入
+        // 模型时永远选旧的，拖新不生效；且单候选失败无回退。格式
+        // （02/04 三阶、03 五阶）由 Lm::load 按魔数自适配。
         let cfg_path = hufu_engine::Engine::resolve_data_sub(
             &self.data_dir,
             &self.engine.config.sentence.ngram_path,
         );
-        let path = if cfg_path.exists() {
-            cfg_path
-        } else {
-            let model_dir = hufu_engine::Engine::resolve_data_sub(&self.data_dir, "模型");
-            let mut bins: Vec<PathBuf> = std::fs::read_dir(&model_dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
-                        .map(|x| x.eq_ignore_ascii_case("bin"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            bins.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
-            bins.pop()?
-        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if cfg_path.exists() {
+            candidates.push(cfg_path);
+        }
+        let model_dir = hufu_engine::Engine::resolve_data_sub(&self.data_dir, "模型");
+        let mut bins: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&model_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("bin"))
+                    .unwrap_or(false)
+            })
+            .filter_map(|p| {
+                let mt = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                Some((mt, p))
+            })
+            .collect();
+        bins.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧：刚拖入的优先
+        for (_, p) in bins {
+            if !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
         let mut weights = self.engine.config.sentence.weights.clone();
         // 【数字编码 2026-09-05】按码表内容自动标记：数字做编码字符
         // （a8=来、u3=的）的表，整句解码时数字保留为编码不做选重锁。
         weights.digit_codes = self.engine.schema.dict.digit_coded;
         Some((
-            path,
+            candidates,
             self.engine.schema.dict.clone(),
             self.engine.schema.supplement.clone(),
             weights,

@@ -18,15 +18,79 @@ use hufu_engine::{
 };
 use hufu_types::{Candidate, CandidateKind};
 use model::{BOS, EOS, NgramModel};
+use model03::FivegramModel;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+mod model03;
+
+/// 语言模型统一入口：三阶 NM02（含 NM04 量化变体）或五阶 NM03。
+/// 【NM03 接入 2026-09-25】历史状态统一为码点数组（beam 侧存 4 字符）；
+/// 三阶路径忽略前两位（行为与旧实现逐位一致），五阶走完整回退链。
+pub enum Lm {
+    Tri(NgramModel),
+    Five(FivegramModel),
+}
+
+impl Lm {
+    /// 按魔数装载：TCSKNM02/04 → 三阶，TCSKNM03 → 五阶。
+    pub fn load(model_path: &Path) -> std::io::Result<Lm> {
+        let mut magic = [0u8; 8];
+        use std::io::Read;
+        let mut f = std::fs::File::open(model_path)?;
+        f.read_exact(&mut magic)?;
+        if &magic == b"TCSKNM03" {
+            Ok(Lm::Five(FivegramModel::load(model_path)?))
+        } else {
+            Ok(Lm::Tri(NgramModel::load(model_path)?))
+        }
+    }
+
+    /// 单字符事件条件概率（线性域）。h=按时间序的历史码点（≤4 位）。
+    #[inline]
+    pub fn step_prob(&self, h: &[u32], cp: u32) -> f32 {
+        match self {
+            Lm::Tri(m) => match h.len() {
+                0 | 1 => m.bigram_prob(*h.last().unwrap_or(&BOS), cp),
+                _ => m.trigram_prob(h[h.len() - 2], h[h.len() - 1], cp),
+            },
+            Lm::Five(m) => m.step_prob(h, cp) as f32,
+        }
+    }
+    #[inline]
+    pub fn has_bigram(&self, left: u32, right: u32) -> bool {
+        match self {
+            Lm::Tri(m) => m.has_bigram(left, right),
+            Lm::Five(m) => {
+                let l = m.id_of(left);
+                let r = m.id_of(right);
+                matches!(m.lookup(2, &[l], r), Some((_, _, true)))
+            }
+        }
+    }
+    #[inline]
+    pub fn freq_rank(&self, cp: u32) -> usize {
+        match self {
+            Lm::Tri(m) => m.freq_rank(cp),
+            Lm::Five(m) => m.freq_rank(cp),
+        }
+    }
+    /// 联合词表条数（unigram 总数）。
+    #[inline]
+    pub fn uni_count(&self) -> usize {
+        match self {
+            Lm::Tri(m) => m.uni_count(),
+            Lm::Five(m) => m.vocab_count,
+        }
+    }
+}
 
 use supplement_automaton::SupplementAutomaton;
 
 /// 整句引擎。
 pub struct SentenceEngine {
-    pub model: NgramModel,
+    pub model: Lm,
     pub dict: Arc<Dict>,
     supplement: SupplementAutomaton,
     pub weights: SentenceWeights,
@@ -105,6 +169,8 @@ const SEG_RANK_LIMIT: usize = 8;
 /// word_ends + base 重建（信息无损）。
 #[derive(Clone)]
 struct St {
+    prev4: u32,
+    prev3: u32,
     prev2: u32,
     prev1: u32,
     text: String,
@@ -129,6 +195,15 @@ struct St {
     /// engine 据此在候选组装时把过真词地板的隐式二选词初排压前
     ///（不等 Qwen 异步重排——用户实测「重排到首位有反应时间」）。
     implicit2: bool,
+}
+
+impl St {
+    /// 4 字符历史（时间序）——统一 LM 入口用。旧三阶只看末两位，
+    /// 行为与原 (prev2,prev1) 调用逐位一致。
+    #[inline]
+    fn history(&self) -> [u32; 4] {
+        [self.prev4, self.prev3, self.prev2, self.prev1]
+    }
 }
 
 /// emit 期由词边界重建切分串（对齐旧 St.segmented 语义）。
@@ -281,12 +356,21 @@ impl SentenceEngine {
         supplement: &Supplement,
         weights: SentenceWeights,
     ) -> std::io::Result<SentenceEngine> {
-        let model = NgramModel::load(model_path)?;
-        Ok(Self::with_model(model, dict, supplement, weights))
+        let model = Lm::load(model_path)?;
+        Ok(Self::with_lm(model, dict, supplement, weights))
     }
 
     pub fn with_model(
         model: NgramModel,
+        dict: Arc<Dict>,
+        supplement: &Supplement,
+        weights: SentenceWeights,
+    ) -> SentenceEngine {
+        Self::with_lm(Lm::Tri(model), dict, supplement, weights)
+    }
+
+    pub fn with_lm(
+        model: Lm,
         dict: Arc<Dict>,
         supplement: &Supplement,
         weights: SentenceWeights,
@@ -333,16 +417,28 @@ impl SentenceEngine {
         }
     }
 
+
+    /// 孤立生僻判定的 LM 包装（三阶/五阶共用）。
+    #[inline]
+    fn lm_freq_rank(&self, cp: u32) -> usize {
+        self.model.freq_rank(cp)
+    }
+
+    #[inline]
+    fn lm_has_bigram(&self, left: u32, right: u32) -> bool {
+        self.model.has_bigram(left, right)
+    }
+
     /// 终态孤立生僻惩罚（emit 期，全文一次）。
     fn isolation_penalty(&self, text: &str) -> f64 {
         let chars = chars_of(text);
         let mut penalty = 0.0;
         for (i, &c) in chars.iter().enumerate() {
             let cp = c as u32;
-            if self.model.freq_rank(cp) > self.weights.isolation_threshold {
-                let left_hit = i > 0 && self.model.has_bigram(chars[i - 1] as u32, cp);
+            if self.lm_freq_rank(cp) > self.weights.isolation_threshold {
+                let left_hit = i > 0 && self.lm_has_bigram(chars[i - 1] as u32, cp);
                 let right_hit =
-                    i + 1 < chars.len() && self.model.has_bigram(cp, chars[i + 1] as u32);
+                    i + 1 < chars.len() && self.lm_has_bigram(cp, chars[i + 1] as u32);
                 if !left_hit && !right_hit {
                     penalty += self.weights.isolation_lambda;
                 }
@@ -583,6 +679,8 @@ impl SentenceEngine {
         };
         if start_pos == 0 {
             buckets[0].add(St {
+                prev4: BOS,
+                prev3: BOS,
                 prev2: BOS,
                 prev1: BOS,
                 text: String::new(),
@@ -718,9 +816,11 @@ impl SentenceEngine {
                         ns.mass += w.emitted_character_reward;
                         for c in text.chars() {
                             let cp = c as u32;
-                            let p3 = self.model.trigram_prob(ns.prev2, ns.prev1, cp);
+                            let p3 = self.model.step_prob(&ns.history(), cp);
                             ns.score += (p3.max(1e-12).ln()) as f64;
                             ns.mass += (p3.max(1e-12).ln()) as f64;
+                            ns.prev4 = ns.prev3;
+                            ns.prev3 = ns.prev2;
                             ns.prev2 = ns.prev1;
                             ns.prev1 = cp;
                             // 补充词：AC 自动机沿全文推进（任意位置命中都加分）
@@ -799,7 +899,7 @@ impl SentenceEngine {
         let mut hits: Vec<SentenceHit> = finals
             .iter()
             .map(|st| {
-                let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
+                let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
                 let iso = iso_of(&st.text);
                 SentenceHit {
                     score: st.score + eos - iso,
@@ -831,7 +931,7 @@ impl SentenceEngine {
             if st.text.is_empty() {
                 continue;
             }
-            let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
+            let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
             let iso = iso_of(&st.text);
             let conf = st.mass + eos - iso + st.supp_bonus;
             let score = st.score + eos - iso;
@@ -875,7 +975,7 @@ impl SentenceEngine {
                     if st.text.is_empty() {
                         continue;
                     }
-                    let eos = (self.model.trigram_prob(st.prev2, st.prev1, EOS).max(1e-12).ln()) as f64;
+                    let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
                     let iso = iso_of(&st.text);
                     let conf = st.mass + eos - iso + st.supp_bonus;
                     let score = st.score + eos - iso;
@@ -1038,7 +1138,7 @@ impl SentenceDecoder for SentenceEngine {
     }
 
     fn rare_hint(&self, ch: char) -> bool {
-        self.model.is_rare(ch as u32, self.weights.isolation_threshold)
+        self.lm_freq_rank(ch as u32) > self.weights.isolation_threshold
     }
 
     fn decode(&self, raw: &str) -> Vec<Candidate> {
