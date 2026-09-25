@@ -100,6 +100,17 @@ model_hint() {
     hint "下载解压后把「模型」文件夹整个放进 $HUFU_ROOT/（引擎自动探测装载；缺模型即纯码表模式）"
 }
 
+# 图标随包自带（branding/ → 用户图标主题，装完已尽力刷新 icon-theme.cache）：
+# 输入法条目 / 状态区菜单 / 桌面项都按主题名 hufu 取用；这里说明两个常见困惑。
+icon_hint() {
+    hint '图标：本包自带，装到 ~/.local/share/icons/hicolor/（条目、状态区菜单与桌面项都按主题名 hufu 取）'
+    hint '      托盘显示「符」而不是图标，是经典界面开了「优先使用文字图标」（「符」是条目的 Label）——'
+    hint '      fcitx5-configtool → 附加组件 → 经典界面 里取消勾选即可'
+    hint '      重装后仍是旧图标属桌面面板/进程内的图标缓存：重启 fcitx5 与桌面面板'
+    show_code '      KDE：kquitapp6 plasmashell && kstart plasmashell'
+    hint '      （其它桌面重启各自的面板，或直接注销重登）'
+}
+
 # ── dry-run 支撑 ───────────────────────────────────────────────────────────
 # 约定：脚本里每一个改动性动作（构建、拷贝、安装、sudo、systemctl、生成配置…）
 # 都必须经 run() / run_in() / ok() 之一落地，不允许直接调用——漏一处，--dry-run
@@ -352,7 +363,7 @@ install_user() {
     run install -m 644 "$ROOT/platform/linux/desktop/hufu-settings.desktop" \
         "$XDG_DATA/applications/hufu-settings.desktop"
 
-    # 自带图标（platform/linux/branding/，唯一矢量源 + 生成的位图）：装进用户图标主题，
+    # 自带图标（platform/linux/branding/：主源位图 + 生成的自包含 SVG / 位图）：装进用户图标主题，
     # 输入法条目（conf 的 Icon）、状态区菜单（menuAction_.setIcon）与桌面项都按主题名 hufu 解析。
     run mkdir -p "$XDG_DATA/icons/hicolor/scalable/apps" \
         "$XDG_DATA/icons/hicolor/48x48/apps" \
@@ -515,3 +526,5 @@ cat <<'EOF'
 EOF
 echo
 model_hint
+echo
+icon_hint
