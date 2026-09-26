@@ -45,8 +45,6 @@ pub struct FivegramModel {
     quant: [Quant; 5],
     /// 码点 → 词表 id（单字 token；BOS/EOS 特判 0x02/0x03）
     cp2id: HashMap<u32, u16>,
-    /// 词表 id → 码点（单字 token 专用，None=多字/特殊 token）
-    id2cp: Vec<Option<u32>>,
     /// 码点 → 字频名次（1 起，按 unigram 概率降序；未收录 usize::MAX）
     freq_rank: HashMap<u32, usize>,
     unigram_p: Vec<f64>,
@@ -62,7 +60,6 @@ struct Quant {
 
 #[derive(Clone, Copy)]
 struct Bucket {
-    blocks_offset: u64,
     index_offset: u64,
     index_count: u32,
     block_count: u32,
@@ -135,8 +132,9 @@ impl FivegramModel {
             let mut v = Vec::with_capacity(256);
             for b in 0..256 {
                 let p = dir_off + b * BUCKET_META;
+                // p+0..16 是格式里的 blocks_offset：当前实现靠 index_offset/index_count/block_count
+                // 定位，用不到，故不读进结构体（字段已删，格式说明见文件头）。
                 v.push(Bucket {
-                    blocks_offset: rd_u64(d, p),
                     index_offset: rd_u64(d, p + 16),
                     index_count: rd_u32(d, p + 24),
                     block_count: rd_u32(d, p + 28),
@@ -211,7 +209,6 @@ impl FivegramModel {
             dirs,
             quant,
             cp2id,
-            id2cp,
             freq_rank,
             unigram_p,
         })
