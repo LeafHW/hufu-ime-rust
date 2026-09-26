@@ -62,6 +62,9 @@ platform/linux/uninstall.sh --purge     # 连「模型」一起删
 与自带图标 `~/.local/share/icons/hicolor/{scalable,48x48,22x22}/apps/hufu.{svg,png}`（输入法条目、
 状态区菜单与桌面项都用它）、19 套 fcitx5 皮肤主题 `~/.local/share/fcitx5/themes/hufu-*`；
 数据 `~/.local/share/hufu/{码表,模型,数据}`（`数据/` 存配置、皮肤、用户词、音效与诊断）。
+落点遵守 XDG：`XDG_DATA_HOME` / `XDG_CONFIG_HOME` 改了，数据与配置跟着走；可执行文件用
+`XDG_BIN_HOME`（默认 `~/.local/bin`——用户级 bin 的标准位置，`systemd-path user-binaries`
+的输出），改了它安装脚本会同步改写 systemd 单元的 `ExecStart`。
 
 **模型（可选）**：整句与神经重排模型约 880MB，不随仓库分发——安装脚本结束时以绿色打印
 获取网址，下载解压后把「模型」文件夹整个放进 `~/.local/share/hufu/`（引擎自动探测装载；

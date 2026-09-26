@@ -41,7 +41,10 @@ XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 HUFU_ROOT="$XDG_DATA/hufu"
 DATA_DIR="$HUFU_ROOT/数据"
-BIN_DIR="$XDG_DATA/bin"
+# 可执行文件不算「数据」：XDG 规范只定义 data/config/cache/runtime 四类，用户级 bin 的事实标准是
+# ~/.local/bin（`systemd-path user-binaries` 的输出，Debian/Ubuntu 默认已加进 PATH）——不能拼在
+# $XDG_DATA 下面。XDG_BIN_HOME 不是规范变量（systemd 不认），设了才用，属于零成本兼容。
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 BUILD_DIR="$ROOT/platform/linux/build"
 
 # 防呆：整个脚本不要用 sudo 跑——用户级部分会装进 /root（systemd user 服务
@@ -354,10 +357,20 @@ install_user() {
     say '⑤ 安装 hufu-server + systemd user 服务 + 设置入口'
     run mkdir -p "$BIN_DIR"
     run install -m 755 "$SERVER_BIN" "$BIN_DIR/hufu-server"
+    # 命令能不能直接敲，取决于 PATH（服务用的是绝对路径，不受影响）——不在就提示一句
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        hint "提示：$BIN_DIR 不在 PATH 里；命令行请用 $BIN_DIR/hufu-server，或在 shell 配置里把它加进 PATH"
+    fi
 
     run mkdir -p "$XDG_CONFIG/systemd/user"
     run install -m 644 "$ROOT/platform/linux/systemd/hufu-server.service" \
         "$XDG_CONFIG/systemd/user/hufu-server.service"
+    # 单元里的 ExecStart 是 %h/.local/bin/hufu-server（标准落点）。落点被 XDG_BIN_HOME 改过时
+    # 按实际路径改这一行，免得服务去执行不存在、或升级后仍执行旧文件。
+    if [[ "$BIN_DIR" != "$HOME/.local/bin" ]]; then
+        run sed -i "s|^ExecStart=.*|ExecStart=$BIN_DIR/hufu-server|" \
+            "$XDG_CONFIG/systemd/user/hufu-server.service"
+    fi
 
     run mkdir -p "$XDG_DATA/applications"
     run install -m 644 "$ROOT/platform/linux/desktop/hufu-settings.desktop" \
@@ -399,7 +412,7 @@ install_user() {
         run systemctl --user restart hufu-server.service
         ok 'systemd user 服务已重启（hufu-server.service）'
     else
-        echo '  · 无 systemd user 会话：请手动运行 hufu-server（~/.local/bin/hufu-server）'
+        echo "  · 无 systemd user 会话：请手动运行 hufu-server（$BIN_DIR/hufu-server）"
     fi
 }
 

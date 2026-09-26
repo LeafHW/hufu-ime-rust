@@ -36,6 +36,8 @@ HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
 # 用户级落点：遵守 XDG（与 install.sh 同一套定义）
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+# 可执行文件不在 $XDG_DATA 下：用户级 bin 的标准落点是 ~/.local/bin（见 install.sh 的说明）
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 for a in "$@"; do
     case "$a" in
         --purge) PURGE=1 ;;
@@ -116,7 +118,7 @@ else
 fi
 
 say '③ 删除用户级文件'
-run rm -f "$XDG_DATA/bin/hufu-server" \
+run rm -f "$BIN_DIR/hufu-server" \
     "$XDG_DATA/applications/hufu-settings.desktop" \
     "$XDG_CONFIG/fcitx5/conf/hufu.conf" \
     "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg" \
@@ -146,7 +148,7 @@ run rmdir --ignore-fail-on-non-empty \
     "$XDG_DATA/icons/hicolor" \
     "$XDG_DATA/icons" \
     "$XDG_DATA/applications" \
-    "$XDG_DATA/bin" \
+    "$BIN_DIR" \
     "$XDG_CONFIG/systemd/user" \
     "$XDG_CONFIG/systemd" \
     "$XDG_DATA" \
