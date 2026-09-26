@@ -10,7 +10,7 @@
 # __register_frame_info；llvm libunwind 无此符号）。
 # llvm libmingw32 无 _DllEntryPoint@12 → tsf 源码内 stub。
 [target.i686-pc-windows-gnu]
-linker = "C:\\Users\\Leafy\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\bin\\rust-lld.exe"
+linker = "C:\\Users\\Leafyin\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\bin\\rust-lld.exe"
 rustflags = [
   "-C", "link-self-contained=no",
   "-C", "link-arg=E:\\DSH-KF\\tools\\llvm-mingw-20260826-msvcrt-i686\\i686-w64-mingw32\\lib\\dllcrt2.o",

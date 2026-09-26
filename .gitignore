@@ -1,4 +1,4 @@
-target/
+﻿target/
 Cargo.lock.bak
 *.user
 node_modules/
@@ -28,3 +28,6 @@ docs/corpus/ChnSentiCorp_htl_all.csv
 docs/corpus/waimai_10k.csv
 docs/corpus/online_shopping/
 docs/corpus/__pycache__/
+
+assets/码表/user-adjust.log
+platform/windows/deploy-88/
