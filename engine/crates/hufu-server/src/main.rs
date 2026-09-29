@@ -374,34 +374,27 @@ fn main() {
                 let pf = std::env::var("ProgramFiles").unwrap_or_default();
                 let pflocal = std::env::var("LOCALAPPDATA").unwrap_or_default();
                 let app_arg = format!("--app={url}");
-                // 【用户定稿】900×800 紧凑窗口。Edge/Chrome 单实例驻留时
+                // 【用户定稿】900×800 紧凑窗口（DIP）。Edge/Chrome 单实例驻留时
                 // --window-size 会被忽略（参数转发给已有实例）——独立
                 // user-data-dir 让设置窗口自成实例，尺寸参数永远生效，
                 // 也避免与用户日常浏览器窗口互相干扰。
                 let profile = std::env::var("LOCALAPPDATA")
                     .map(|p| format!("{p}\\HuFuSettingsProfile"))
                     .unwrap_or_else(|_| "HuFuSettingsProfile".to_string());
-                let size_arg = "--window-size=900,800";
-                // 【用户反馈】设置窗口默认开在左上角——改为屏幕正中：
-                // 主屏工作区尺寸算 (900,800) 居中坐标，--window-position
-                // 随 --window-size 一起传（独立 user-data-dir 自成实例，
-                // 参数永远生效）。多屏用户拖去副屏后下次仍回主屏居中
-                //（设置窗非常驻窗口，固定居中开场）。
-                #[cfg(windows)]
-                let pos_arg = {
-                    #[link(name = "user32")]
-                    unsafe extern "system" {
-                        fn GetSystemMetrics(nindex: i32) -> i32;
-                    }
-                    let (sw, sh) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
-                    format!(
-                        "--window-position={},{}",
-                        ((sw - 900) / 2).max(0),
-                        ((sh - 800) / 2).max(0)
-                    )
-                };
-                #[cfg(not(windows))]
-                let pos_arg = String::new();
+                // 【DPI 缩放修复】Edge/Chrome 清单自带 Per-Monitor V2，
+                // --window-size/--window-position 一律按 DIP（96 基准逻辑
+                // 像素）解释，与屏幕缩放无关。旧实现把固定 900,800 和按
+                // 物理像素算的居中坐标当恒定值传：100% 时 DIP=物理像素没
+                // 事，别的缩放全错——150% 机器窗口实占 1350×1200 物理像
+                // 素（视觉大 1.5 倍），物理坐标又被当 DIP 用导致右/下溢出。
+                // 改为主屏有效 DPI 把工作区折算成 DIP，在 DIP 空间截断
+                // 900×800 并居中：任何缩放下窗口物理尺寸恒定（同一块屏
+                // 上厘米宽不变、内容布局不变），小屏（如 1366×768@150%
+                // 工作区 DIP 高仅 ~512）自动收窄不溢出。
+                let (size_arg, pos_arg) = sys_win::settings_window_args();
+                if std::env::var("HUFU_DEV_CONSOLE").is_ok() {
+                    eprintln!("设置窗口参数: {size_arg} {pos_arg}");
+                }
                 let extra_args = [
                     format!("--user-data-dir={profile}"),
                     "--no-first-run".to_string(),
@@ -419,10 +412,7 @@ fn main() {
                 let opened = match &browser {
                     Some(exe) => {
                         let mut c = std::process::Command::new(exe);
-                        c.arg(&app_arg).arg(size_arg);
-                        if !pos_arg.is_empty() {
-                            c.arg(&pos_arg);
-                        }
+                        c.arg(&app_arg).arg(&size_arg).arg(&pos_arg);
                         for a in &extra_args {
                             c.arg(a);
                         }
@@ -1308,6 +1298,144 @@ mod sys_win {
                 let _ = SetProcessDpiAwareness(2);
             }
         }
+    }
+
+    // ── 设置窗口（Chromium --app）居中参数 ──
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetSystemMetrics(nindex: i32) -> i32;
+        fn SystemParametersInfoW(
+            action: u32,
+            size: u32,
+            param: *mut core::ffi::c_void,
+            winini: u32,
+        ) -> i32;
+        fn MonitorFromPoint(pt: Point, flags: u32) -> isize;
+    }
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// 设置窗口期望 DIP 尺寸（900×800 用户定稿；逻辑像素，与屏幕缩放无关）。
+    const SETTINGS_W: i32 = 900;
+    const SETTINGS_H: i32 = 800;
+
+    // 动态解析小件（shcore/user32 的 DPI API 老系统没有——静态导入拒载）
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> isize;
+        fn GetProcAddress(h: isize, name: *const u8) -> *const core::ffi::c_void;
+    }
+
+    /// 主屏**当前**有效 DPI（实时缩放，Chromium 同口径）。
+    ///
+    /// 【GetDpiForSystem 失效修复】GetDpiForSystem 给的是登录时锁定的系统
+    /// DPI——用户登录后改缩放（Win10 1703+ 免注销立即生效）它不跟随，
+    /// 改完再开设置窗仍按旧缩放算坐标（实机复测「跟没改一样」）。
+    /// 改用 shcore!GetDpiForMonitor(主屏, MDT_EFFECTIVE_DPI) 拿实时值，
+    /// 失败再退 GetDpiForSystem、96 倍数反推。GetDpiForMonitor/GetDpiForSystem
+    /// 都动态解析：老系统没有这些入口，静态导入会让 exe 直接拒载。
+    fn primary_dpi() -> u32 {
+        unsafe {
+            let resolve = |dll: &str, proc: &str| -> Option<*const core::ffi::c_void> {
+                let mut d: Vec<u16> = dll.encode_utf16().collect();
+                d.push(0);
+                let mut p = proc.as_bytes().to_vec();
+                p.push(0);
+                let h = GetModuleHandleW(d.as_ptr());
+                if h == 0 {
+                    return None;
+                }
+                let a = GetProcAddress(h, p.as_ptr());
+                if a.is_null() { None } else { Some(a) }
+            };
+            // 1) shcore!GetDpiForMonitor(primary, MDT_EFFECTIVE_DPI=0)；
+            //    MONITOR_DEFAULTTOPRIMARY=1：主屏原点恒为 (0,0)
+            if let Some(f) = resolve("shcore.dll", "GetDpiForMonitor") {
+                let f: unsafe extern "system" fn(isize, i32, *mut u32, *mut u32) -> i32 =
+                    std::mem::transmute(f);
+                let mon = MonitorFromPoint(Point { x: 0, y: 0 }, 1);
+                let (mut dx, mut dy) = (0u32, 0u32);
+                // HRESULT S_OK = 0
+                if mon != 0 && f(mon, 0, &mut dx, &mut dy) == 0 {
+                    let d = dx.max(dy);
+                    if (96..=480).contains(&d) {
+                        return d;
+                    }
+                }
+            }
+            // 2) user32!GetDpiForSystem（登录系统 DPI，实时性差——兜底）
+            if let Some(f) = resolve("user32.dll", "GetDpiForSystem") {
+                let f: unsafe extern "system" fn() -> u32 = std::mem::transmute(f);
+                let d = f();
+                if (96..=480).contains(&d) {
+                    return d;
+                }
+            }
+            // 3) 极老系统：主屏宽恰为 96 整数倍且商在常见档位 → 反推
+            let sw = GetSystemMetrics(0);
+            if sw > 0 && sw % 96 == 0 {
+                let f = sw / 96;
+                if (1..=4).contains(&f) {
+                    return (96 * f) as u32;
+                }
+            }
+            96
+        }
+    }
+
+    /// 主屏 DIP 工作区（去任务栏）+ 主屏当前有效 DPI。
+    ///
+    /// 自进程是 Per-Monitor V2，SystemParametersInfoW(SPI_GETWORKAREA) 返回
+    /// 主屏物理像素；primary_dpi() 给主屏实时有效缩放（与 Edge/Chrome
+    /// manifest 的缩放口径一致）。折算成 96 基准 DIP——即 Chromium
+    /// --window-size/--window-position 的解释空间。
+    /// 返回 ((原点x, 原点y, 宽, 高), dpi)：原点非 (0,0)（任务栏在上/左）时
+    /// 居中要以它为基准。
+    fn work_area_and_dpi() -> ((i32, i32, i32, i32), u32) {
+        unsafe {
+            let mut wa = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+            // SPI_GETWORKAREA = 0x0030；仅主屏，不含副屏
+            SystemParametersInfoW(0x30, 0, &mut wa as *mut Rect as *mut core::ffi::c_void, 0);
+            (
+                (wa.left, wa.top, wa.right - wa.left, wa.bottom - wa.top),
+                primary_dpi(),
+            )
+        }
+    }
+
+    /// 设置窗口的 `--window-size` / `--window-position` 参数（DIP 空间）。
+    ///
+    /// 【尺寸定稿】固定 900×800 DIP（用户定稿：按工作区占比缩 DIP 会让
+    /// 高缩放下窗口变小、内容挤在一起——实寸恒定的代价不划算，放弃）。
+    /// 尺寸 clamp 到 DIP 工作区（小屏不溢出），工作区 DIP 中心居中
+    ///（任务栏在上/左的原点同样成立）。DPI 取实时值（primary_dpi），
+    /// 登录后改缩放不注销也能算对坐标。
+    pub fn settings_window_args() -> (String, String) {
+        let ((wa_x, wa_y, wa_w, wa_h), dpi) = work_area_and_dpi();
+        let scale = dpi as f64 / 96.0;
+        // 物理像素 → DIP（96 基准）；四舍五入 ±1 DIP 无感
+        let to_dip = |v: i32| (v as f64 / scale).round() as i32;
+        let (wa_x, wa_y, wa_w, wa_h) = (to_dip(wa_x), to_dip(wa_y), to_dip(wa_w), to_dip(wa_h));
+        let w = SETTINGS_W.min(wa_w.max(0));
+        let h = SETTINGS_H.min(wa_h.max(0));
+        let x = wa_x + (wa_w - w) / 2;
+        let y = wa_y + (wa_h - h) / 2;
+        (
+            format!("--window-size={w},{h}"),
+            format!("--window-position={x},{y}"),
+        )
     }
 }
 
