@@ -2067,7 +2067,13 @@ impl HuFuTs_Impl {
         // update_ui 优先用引擎帧，锁路径（state 空）用 last_show 自建。
         // 仅数字——；等符号选重键语义随方案配置（DLL 不知情），只走
         // 引擎闪帧路径。
-        if consumed && !commit.is_empty() && !test_only {
+        // 【闪帧误触修复 2026-09-29】排除 Shift 形态：引擎侧 Shift+数字
+        // 永远是符号上屏（shift 分支在数字选重之前，lib.rs:1303→（）
+        // ！＠＃等），不走选重——此处若照标 rank_flash，空帧分支的
+        // last_show 兜底臂会把上一组段的旧候选重新 show 一帧再异步
+        // hide，肉眼即「打括号时候选闪现一下」。m_shift 与引擎收到的
+        // shift 同源（vk_to_name 双保险），门在此=闪帧只属于真选重。
+        if consumed && !commit.is_empty() && !test_only && !m_shift {
             if let Some(idx) = rank_key_index(&name) {
                 self.shared
                     .lock()
@@ -5693,6 +5699,26 @@ pub fn host_is_excel() -> bool {
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_default();
         exe.to_lowercase().contains("excel")
+    })
+}
+
+/// 【微信锚语义 2026-09-30】Weixin.exe（微信 4.x，Qt51514QWindowIcon）聊天
+/// 输入框的 GetTextExt（组段与 selection 两条链同构）返回的矩形整体偏低一
+/// 个行盒：top=可见行底（实测 (1270,1460,1272,1461)，可见插入符行盒
+/// 1443~1462），bottom=top+16 为无意义延伸——按常规「bottom=行底」落点
+/// y=bottom+4 恒偏低 ~16px=「候选与光标差一行」（用户实锤，截图刻度尺
+/// 实测）。QQ（正常宿主）同查询返回 (1866,706,1866,736) 标准行盒做对照。
+/// 修法在显示层落点统一重解释（candwin2 show），本判定只认精确进程名——
+/// WeChatAppEx.exe（CEF 搜索面板，虎符未注入）不得匹配。
+pub fn host_is_weixin() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let l = exe.to_lowercase();
+        l == "weixin.exe" || l == "wechat.exe"
     })
 }
 

@@ -3737,11 +3737,26 @@ impl CandidateWindowV2 {
                         // 【八十三修】上界/翻转判断只算候选本体（wpx/hpx），
                         // 不再预留阴影边距 m_phys（内容贴边、阴影出屏裁掉）。
                         let x = x_base.clamp(vx, (vx + vw - wpx).max(vx));
-                        let below = r.bottom + 4;
+                        // 【微信锚语义 2026-09-30】Weixin.exe 聊天输入框
+                        // GetTextExt 矩形 top=可见行底、bottom=top+16 无意义
+                        // 延伸（实测 (1270,1460,1272,1461) vs 可见行盒
+                        // 1443~1462；QQ 对照 (1866,706,1866,736) 标准行盒）。
+                        // 按 bottom+4 落点恒差一行（用户实锤）。重解释：
+                        // 下方落点用 top+4；上方翻转基线用 top−行高（行高取
+                        // 进程内最近正常锚，四十四修同源，缺省 16）。x 侧
+                        // right 语义正常不动。1px 退化锚与 16px selection 锚
+                        // top 恒同 → 两源落点自然归一，四十四修的荡秋千
+                        // 修复语义保留（补齐块只改 bottom，此处不再读）。
+                        let (below, above_base) = if crate::tsf::host_is_weixin() {
+                            let lh = self.last_line_h.filter(|h| *h >= 8).unwrap_or(16);
+                            (r.top + 4, r.top - lh)
+                        } else {
+                            (r.bottom + 4, r.top)
+                        };
                         let y = if below + hpx <= vy + vh {
                             below
                         } else {
-                            (r.top - hpx - 4).max(vy)
+                            (above_base - hpx - 4).max(vy)
                         };
                         // 【五十一修·y 稳定锁复刻 v1.5.2】老版本行为档
                         // 案实测（同 harness）：v1.5.0/1.5.2 段内 T 恒定
