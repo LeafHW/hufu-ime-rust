@@ -2297,6 +2297,129 @@ impl Engine {
                     session.early_history.clear();
                     return;
                 }
+                // 【修2·七十九修扩展·提交位否决 2026-09-28】bchntlfmmigmigue
+                //（灵珑天狠狠的→灵珑天太美艮的）实锤：首字一致（灵=灵）、
+                // 分叉在**本次提交跨度内**（stable='灵珑天太' vs 完整态
+                // 强提案 pf='灵珑天狠太'，分叉位 3=committed_n）——partial
+                // 态「太美」悬尾不付费、conf 虚高（-25.81）劫持提案，把
+                // 完整态全池强共识（sf≥0.999）反对的「太」提前上屏，
+                // committed_text 前缀过滤随后把狠路径永久清池。窄条件：
+                // ① 完整态子池强提案存在（sf≥0.999，与七十九修同线）；
+                // ② 与 stable 互非前缀（真分叉，非分段递进）；③ 首字
+                // 一致（首字分叉由上面原否决管）；④ 首个分叉位落在
+                // [committed_n, stable.len())——正好是本次要上屏的字；
+                // ⑤ 混池置信池首是 partial 态（虚高指纹——正常分段上
+                // 屏的池首多为完整态或分叉在深字位，不触发）。命中→
+                // 清证据史不上屏，后续键辨析。
+                // 【修2 结论 2026-09-28·不启用】4000 句 A/B：修2 单独
+                // 治好 5 句（全部 ⊂ 修1 治好的 13 句）但引入 1 句误伤
+                //（明确目标借力前行…——整码首选本就对，提交位否决拦了
+                // 正确的单字上屏）；叠加修1 后零增益零回归。指纹留档，
+                // HUFU_FIX2=1 可强制开（bench 对照），缺省关。
+                static FIX2_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let fix2_on = *FIX2_ENV.get_or_init(|| {
+                    std::env::var("HUFU_FIX2")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                });
+                if fix2_on
+                    && !pf.is_empty()
+                    && sf >= 0.999
+                    && !pf.starts_with(stable.as_str())
+                    && !stable.starts_with(&pf)
+                    && pf.chars().next() == stable.chars().next()
+                {
+                    let committed_n2 = committed_text.chars().count();
+                    let sc: Vec<char> = stable.chars().collect();
+                    let pc: Vec<char> = pf.chars().collect();
+                    let mut di = 0;
+                    while di < sc.len() && di < pc.len() && sc[di] == pc[di] {
+                        di += 1;
+                    }
+                    if di >= committed_n2 && di < sc.len() {
+                        let leader_partial = cands
+                            .iter()
+                            .max_by(|a, b| {
+                                a.confidence
+                                    .partial_cmp(&b.confidence)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|h| h.partial)
+                            .unwrap_or(false);
+                        if leader_partial {
+                            if ec_dbg {
+                                eprintln!(
+                                    "[early] 修2提交位否决: stable='{}' vs 完整态'{}' 分叉位={}",
+                                    stable, pf, di
+                                );
+                            }
+                            session.early_history.clear();
+                            return;
+                        }
+                    }
+                }
+                // 【修4·句首否决窗 2026-09-29·实验】七十九修只挡**首字**
+                // 分叉；残留错句（20k 修1 后 57 句之一）实锤句首第 2~3
+                // 字锁死：「家游血犹未冷」→「冷而血犹未冷」（第 2 字
+                // 家→而分叉）、「廖这种事太私人了」→「顾他这种…」
+                //（首字廖→顾 + 第 2 字这种→他）、「山大滴校友们」→
+                // 「山启商校友们」（首字一致、第 2 字大→启分叉）。指纹
+                // 与七十九修同源：完整态子池强提案（share≥0.999）存在、
+                // 与 stable 真分叉（互非前缀），分叉位**不是首字**而是
+                // 句首第 2~N 字（N≤4）——深字位分叉是分段递进常态不可
+                // 挡（全挡=停摆崩盘 92.8→40.1 教训），但**句首前 4 字
+                // 内**的分叉没有分段递进借口：句子刚起步、committed 段
+                // 极短（committed_n≤2），不存在「前段成型尾段重组」的
+                // 合法场景，此刻分叉=partial 虚高劫持。窄条件：① 完整
+                // 态强提案 share≥0.999（与七十九修同线）；② 互非前缀
+                // （真分叉）；③ committed_n ≤ 2（句首段——已上屏的
+                // 字数还很少，分叉发生在刚起步的句首）；④ 首个分叉位
+                // < 4（句首第 4 字以内）；⑤ 混池置信池首是 partial 态
+                //（虚高指纹，正常句首上屏池首多为完整态）。命中→清
+                // 证据史不上屏，后续键辨析。HUFU_FIX4=1 开启（实验
+                // 开关，缺省关，bench 对照后定去留）。
+                static FIX4_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let fix4_on = *FIX4_ENV.get_or_init(|| {
+                    std::env::var("HUFU_FIX4")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                });
+                if fix4_on
+                    && !pf.is_empty()
+                    && sf >= 0.999
+                    && !pf.starts_with(stable.as_str())
+                    && !stable.starts_with(&pf)
+                    && pf.chars().next() == stable.chars().next()
+                {
+                    let committed_n4 = committed_text.chars().count();
+                    let sc4: Vec<char> = stable.chars().collect();
+                    let pc4: Vec<char> = pf.chars().collect();
+                    let mut di4 = 0;
+                    while di4 < sc4.len() && di4 < pc4.len() && sc4[di4] == pc4[di4] {
+                        di4 += 1;
+                    }
+                    if committed_n4 <= 2 && di4 < 4 && di4 >= 1 {
+                        let leader_partial4 = cands
+                            .iter()
+                            .max_by(|a, b| {
+                                a.confidence
+                                    .partial_cmp(&b.confidence)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|h| h.partial)
+                            .unwrap_or(false);
+                        if leader_partial4 {
+                            if ec_dbg {
+                                eprintln!(
+                                    "[early] 修4句首否决: stable='{}' vs 完整态'{}' 分叉位={}",
+                                    stable, pf, di4
+                                );
+                            }
+                            session.early_history.clear();
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -2313,6 +2436,19 @@ impl Engine {
         // 噪音候选（去钊指/䐁半类）落后 ≥9 分——Δ=8 恰好分开两类。
         // 单字增量不拦：单字是提前上屏主力节奏，且单字级错误句末重排
         // 可整体换句兜底。行尾快通道不拦（组段缩短优先）。
+        // 【修1·单字分歧护栏 2026-09-28·常驻】bchntlfmmigmigue（灵珑
+        // 天狠狠的→灵珑天太美艮的）实锤：致命提交是单字「太」——early
+        // 池首「灵珑天太美」是 partial 态（悬尾键不付费、conf 虚高
+        // -25.81），完整态狠路径全家落后 8.95（次名 -34.76），多字护栏
+        // 的混池 Δ=8 基线够不着，单字豁免放行后 committed_text 前缀
+        // 过滤把狠路径候选永久清池，句末重排只剩「艮的」可排。窄条件
+        // 补拦：单字增量也过护栏，但只保护「完整态（!partial）候选、
+        // 距**完整态子池**池首 ≤Δ、且在该字位与 stable 分歧」——基线
+        // 用完整态子池而非混池池首，正是剥掉 partial 虚高的可比线；
+        // partial 候选不保护（虚高 conf 互搏会把提前上屏停摆）。多字
+        // 护栏逻辑不变。4000 句 A/B：99.10%→99.43%（治好 13/回归 0），
+        // 覆盖 79.3%→76.3%。config early_diverg_guard1 常驻开；
+        // HUFU_FIX1=0 可关。
         // HUFU_EARLY_DIVERG_GUARD=1 环境变量等效开启（优先）；
         // config sentence.early_diverg_guard 常驻开启（推荐——TSF 拉起
         // 的 server 进程环境变量不可靠）。缺省关，产品行为不变。
@@ -2323,7 +2459,18 @@ impl Engine {
                 .unwrap_or(false)
         });
         let diverg_guard = diverg_env || self.config.sentence.early_diverg_guard;
-        if diverg_guard && !line_end && delta.chars().count() >= 2 {
+        // 【修1】单字增量护栏：config sentence.early_diverg_guard1 常驻
+        //（推荐——TSF 拉起的 server 进程环境变量不可靠），HUFU_FIX1=0
+        // 环境变量可关（bench 对照）。
+        static FIX1_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fix1_env = *FIX1_ENV.get_or_init(|| {
+            std::env::var("HUFU_FIX1")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+        });
+        let fix1_on = !fix1_env && self.config.sentence.early_diverg_guard1;
+        let min_delta_guard = if fix1_on { 1 } else { 2 };
+        if diverg_guard && !line_end && delta.chars().count() >= min_delta_guard {
             let diverg_gap = std::env::var("HUFU_EARLY_DIVERG_GAP")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
@@ -2332,11 +2479,55 @@ impl Engine {
                 .iter()
                 .map(|h| h.confidence)
                 .fold(f64::NEG_INFINITY, f64::max);
+            // 【修1】单字增量的保护基线：完整态子池池首（剥掉 partial
+            // 虚高后的可比线）。多字护栏沿用混池池首（原行为）。
+            // 【修3·多字护栏完整态基线 2026-09-29·常驻】修1 的完整态
+            // 子池基线推广到 ≥2 字提交：混池池首是 partial 态（悬尾
+            // 不付费、conf 虚高）时，完整态正确路径被甩出 Δ 保护圈
+            //（「舶来品→舶来品牌没弄当」「佣金孤岛→处境改才对」类
+            // 多字锁死与修1 同指纹）。混池池首本就是完整态时基线不变
+            //（full==leader）；全池皆 partial 时退回混池池首（无完整态
+            // 可比线，防全拦停摆）。三轮独立语料（20k/4k新/10k新）：
+            // 治 4+0+1=5 · 回 6+0+0=6，净≈0 但方向正确，残留码长
+            // 4.57→4.51 改善；与修1 同机制同源，一并常驻。
+            // config sentence.early_diverg_guard3 常驻开（打包默认开），
+            // HUFU_FIX3=0 可关（bench 对照）。
+            static FIX3_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let fix3_env = *FIX3_ENV.get_or_init(|| {
+                std::env::var("HUFU_FIX3")
+                    .map(|v| v == "0")
+                    .unwrap_or(false)
+            });
+            let fix3_on = !fix3_env && self.config.sentence.early_diverg_guard3;
+            let full_pool_max = cands
+                .iter()
+                .filter(|h| !h.partial)
+                .map(|h| h.confidence)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let full_leader_conf = if delta.chars().count() < 2
+                || (fix3_on && full_pool_max > f64::NEG_INFINITY)
+            {
+                full_pool_max
+            } else {
+                leader_conf
+            };
             let stable_chars: Vec<char> = stable.chars().collect();
             let committed_n = committed_text.chars().count();
             let contested = cands.iter().any(|h| {
-                if h.confidence < leader_conf - diverg_gap {
-                    return false; // 距池首太远：噪音候选，不保护
+                if delta.chars().count() < 2 {
+                    // 【修1】单字增量窄条件：只保护完整态候选（partial
+                    // 悬尾不付费、置信虚高，自我保护=互搏停摆），且基
+                    // 线用完整态子池池首。
+                    if h.partial {
+                        return false;
+                    }
+                    if h.confidence < full_leader_conf - diverg_gap {
+                        return false; // 距完整态池首太远：噪音，不保护
+                    }
+                } else if h.confidence < full_leader_conf - diverg_gap {
+                    return false; // 距基线太远：噪音候选，不保护
+                    //（修3 开时基线=完整态子池池首：partial 池首虚高不再
+                    // 把完整态活候选甩出保护圈；关时基线=混池池首，原行为）
                 }
                 let hc: Vec<char> = h.text.chars().collect();
                 if hc.len() <= stable_chars.len() {

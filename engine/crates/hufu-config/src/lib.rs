@@ -304,6 +304,25 @@ pub struct SentenceSection {
     /// HUFU_EARLY_DIVERG_GAP 环境变量优先。
     #[serde(default = "default_diverg_gap")]
     pub early_diverg_gap: f64,
+    /// 【修1·单字分歧护栏 2026-09-28】同码分歧护栏的单字增量扩展：
+    /// 单字上屏也过护栏，但只保护「完整态（!partial）候选、距完整态
+    /// 子池池首分差 ≤ early_diverg_gap、且在该字位与稳定前缀分歧」的
+    /// 活候选——基线用完整态子池池首（剥掉 partial 态悬尾不付费的
+    /// 置信虚高）。实例：bchntlfmmigmigue（灵珑天狠狠的→灵珑天太美
+    /// 艮的）单字「太」被 partial「太美」虚高劫持、狠路径永久清池。
+    /// 4000 句 A/B：准率 99.10%→99.43%（36→23 错句，治好 13、回归
+    /// 0），覆盖 79.3%→76.3%。缺省开；HUFU_FIX1=0 环境变量可关。
+    #[serde(default = "default_true")]
+    pub early_diverg_guard1: bool,
+    /// 【修3·多字护栏完整态基线 2026-09-29】修1 的完整态子池基线推广
+    /// 到 ≥2 字提交：混池池首是 partial 态（悬尾不付费、conf 虚高）时
+    /// ，完整态正确路径被甩出 Δ 保护圈（「舶来品→舶来品牌没弄当」类
+    /// 多字锁死）。混池池首本就是完整态时基线不变；全池皆 partial 退
+    /// 回混池池首（防全拦停摆）。三轮独立语料（20k/4k新/10k新）：
+    /// 治 5 · 回 6 · 净≈0，残留码长 4.57→4.51 改善，与修1 同机制同源。
+    /// 缺省开（打包默认开）；HUFU_FIX3=0 环境变量可关。
+    #[serde(default = "default_true")]
+    pub early_diverg_guard3: bool,
     /// 组句权重（全部可调）
     pub weights: SentenceWeights,
 }
@@ -347,6 +366,8 @@ impl Default for SentenceSection {
             early_need: 3,
             early_diverg_guard: false,
             early_diverg_gap: 8.0,
+            early_diverg_guard1: true,
+            early_diverg_guard3: true,
             weights: SentenceWeights::default(),
         }
     }

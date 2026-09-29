@@ -28,7 +28,7 @@ fn main() {
         (Some(r), Some(w)) => (r, w),
         _ => (RAW, WANT),
     };
-    let guard = std::env::var("HUFU_EARLY_DIVERG_GUARD").map(|v| v == "1").unwrap_or(false);
+    let guard = std::env::var("HUFU_EARLY_DIVERG_GUARD").map(|v| v == "1").unwrap_or(true);
     println!("句子: {want}  raw: {raw}  护栏: {}", if guard { "开" } else { "关" });
     let t0 = std::time::Instant::now();
 
