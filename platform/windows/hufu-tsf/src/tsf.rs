@@ -350,6 +350,12 @@ pub struct Shared {
     /// 【二十五修·自适应单查】连续「双查同值」帧计数——≥3 转单查
     ///（省一半宿主布局回调）；烂锚/失败清零回双查。
     pub qc_probe_steady: u32,
+    /// 【Scintilla 段首宽盒抑制 2026-09-30】seg1 查询回宽盒时本帧不出
+    /// 窗等布局（60ms 重查）的连击计数——组段刚建瞬间该内核一切 TSF
+    /// 查询返回上次提交处的旧布局盒（玉玉玉末尾实测），suppress 至多
+    /// 2 帧、第 3 帧中心化采纳（防慢打场景候选永不出）。窄盒/seg2 帧
+    /// 清零。字段放 Shared（段间要复位）。
+    pub seg1_wide_suppress: u32,
     /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
     /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
     /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
@@ -516,6 +522,7 @@ impl Shared {
             cand_sig_last: String::new(),
             hupo_single_probe: false,
             qc_probe_steady: 0,
+            seg1_wide_suppress: 0,
             caret_recheck_due: false,
             caret_est_x: 0,
             caret_est_y: 0,
@@ -3578,6 +3585,30 @@ fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
     }
 }
 
+/// 焦点视图窗类名（宿主编辑内核判定用：Scintilla 系锚语义特判）。
+/// 【死锁修复 2026-09-30】勿走 focus_view_hwnd——其内 TL shared.lock()
+/// 在 query_caret（edit session 持锁中）调用=同线程二次上锁自锁
+///（std Mutex 不可重入，Notepad3 首键未响应实录）。改 GUITHREADINFO
+/// 直查焦点窗：纯 Win32 零锁，qc 本就跑在宿主 UI 线程，hwndFocus 即
+/// 正在输入的编辑窗（与 candwin2 四十七修锚对照同源）。
+fn focus_view_class() -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    unsafe {
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(0, &mut gi).is_ok() && !gi.hwndFocus.0.is_null() {
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(gi.hwndFocus, &mut buf);
+            if n > 0 {
+                return Some(String::from_utf16_lossy(&buf[..n as usize]));
+            }
+        }
+    }
+    None
+}
+
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【旧锚点快照 2026-09-11】旧实现开头即 g.caret=None，末尾失败
     // 分支却注释「保留旧 caret」——实际锚点已丢（候选窗闪回兜底位）。
@@ -3703,7 +3734,21 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 会先触发一次内部布局调用——虎魄（PyQt5）上它失败且疑似连坐
     // 后续组段主查询（43c 实测 START 双查也被拒）。v1.5.2 该宿主
     // 段首直查组段 START 恒成功——虎魄跳过 selection 优先。
-    if g.seg_key_index == 1 && !exe_is_hupo_qie() {
+    // 【Scintilla selection 弃用 2026-09-30 三轮】一轮 live 直替治了
+    // 空文档行首；用户实测「第二行复现」+二轮三分支实测暴露 selection
+    // 宽盒/活插入符在 Notepad3（Scintilla）上**各有滞后时刻**：Enter
+    // 换行后首键盒滞后（live 即时，517626 帧）、点击后首键 live 滞后
+    //（盒即时，6049374 帧）、退格清组字重打双滞后（6050323 帧）——
+    // 盒/live/est 三源逐帧轮换错，没有稳定优先级；其间还埋过
+    // focus_view_class 走 shared.lock 的同线程自锁（Notepad3 未响应
+    // 实录，已改 GUITHREADINFO 无锁版）。而组段 END 折叠点查询在该
+    // 宿主 2 键起全程即时准确（用户「二键回正」实锤）→Scintilla 系
+    // seg1 整体跳过 selection 优先直接落标准链（43 修虎魄 qie 同款
+    // 决策）；查询失败仍有系统插入符/est/60ms 重查兜底。
+    if g.seg_key_index == 1
+        && !exe_is_hupo_qie()
+        && !focus_view_class().is_some_and(|c| c.contains("Scintilla"))
+    {
         if let Some(r) = selection_caret_rect(ctx, ec) {
             // 【九十修·观测 2026-09-25】seg1 selection 每次返回全量打点：
             // 值 + 活插入符 + 上一锚 + est 现值——与各采纳/拦截分支日志
@@ -3718,23 +3763,39 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     g.caret_est_x, g.caret_est_y
                 ));
             }
-            // 【Notepad3 首键宽盒修 2026-09-30】Scintilla 系宿主对
-            // selection 空 range 的 GetTextExt 返回以插入点为中心的
-            // ~40px 宽盒（trace 实锤 rect=(234,171,274,191) 而活插入符
-            // live=(251,171,253,191) 仅 2px）——锚位取右缘=插入点
-            // +21px。首显帧活插入符优先（show 侧 live_caret.or）掩盖
-            // 了错误，非首显帧 g.caret（宽盒）接管 → 候选窗右跳
-            // 21px（用户实锤「Notepad3 首键候选右移一段，二键回正」
-            // ——回正=第二键标准链 END 折叠点窄盒）。修：seg1 selection
-            // 宽盒（>10px；正常插入点语义 2-4px）且活插入符整体落在
-            // 盒内时，改用活插入符（盒内窄盒真值）为锚；live 缺席/
-            // 盒外维持原值（其他宿主行为不变）。
+            // 【Notepad3 首键宽盒修·二轮 2026-09-30】一轮修（盒内 live
+            // 直替）治了空文档行首，用户实测「第二行又复现」——trace 实
+            // 锤两型滞后：① 焦点切换/点击后首键（6049374 帧）：selection
+            // 宽盒即时（y=本行、中心=插入点），live 插入符滞留上一行（盒
+            // 外）→一轮修不触发，宽盒原样采纳（锚位=右缘=插入点+21 右
+            // 偏）；② 退格清组字立即重打（6050323 帧）：盒与 live 双双滞
+            // 后一拍（y=上一行），live 恰在盒内→一轮修把滞后的 live 当真
+            // 值采纳。Scintilla 宽盒语义两轮实测=以插入点为中心（首轮
+            // 中心 254↔插入符 252；本轮中心 298=点击处），据此三分支：
+            // A live 全在盒内且与 est 基线同带（无基线免检）→live（即时
+            //   窄真值，一轮语义保留，全宿主）；
+            // B Scintilla 系+est 有基线+盒(live 同错)相对基线整体偏移≈一
+            //   行、x 中心贴近 est→布局/caret 双滞后帧，est 基线（上段延
+            //   续）才是真值——锚=est 现值并武装 60ms 重查校准；
+            // C Scintilla 系其余（live 盒外/缺席）→锚=盒中心 x（插入点）。
+            // 非 Scintilla 宿主宽盒保持一轮行为（live 命中即替、否则原
+            // 样），影响面不扩大。
             let r = if r.right - r.left > 10 {
+                let lh = if g.caret_est_line_h > 0 {
+                    g.caret_est_line_h
+                } else {
+                    (r.bottom - r.top).max(8)
+                };
+                let est_has =
+                    g.caret_est_line_h > 0 && !(g.caret_est_x == 0 && g.caret_est_y == 0);
+                let scintilla = focus_view_class()
+                    .is_some_and(|c| c.contains("Scintilla"));
                 match gui_caret_fallback() {
                     Some(lv)
                         if lv.left >= r.left
                             && lv.right <= r.right
-                            && lv.bottom - lv.top > 2 =>
+                            && lv.bottom - lv.top > 2
+                            && (!est_has || (lv.top - g.caret_est_y).abs() < lh * 6 / 10) =>
                     {
                         if crate::tsf::trace_on() {
                             trace(&format!(
@@ -3743,6 +3804,40 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             ));
                         }
                         lv
+                    }
+                    _ if scintilla
+                        && est_has
+                        && (r.top - g.caret_est_y).abs() >= lh * 5 / 10
+                        && (r.top - g.caret_est_y).abs() <= lh * 16 / 10
+                        && ((r.left + r.right) / 2 - g.caret_est_x).abs() < 40 =>
+                    {
+                        if crate::tsf::trace_on() {
+                            trace(&format!(
+                                "qc: seg1 selection 宽盒滞后帧（盒 top={} vs est_y={}）→est 延续锚 ({},{})",
+                                r.top,
+                                g.caret_est_y,
+                                g.caret_est_x,
+                                g.caret_est_y
+                            ));
+                        }
+                        arm_caret_recheck_timer();
+                        RECT {
+                            left: g.caret_est_x,
+                            top: g.caret_est_y,
+                            right: g.caret_est_x + 2,
+                            bottom: g.caret_est_y + lh,
+                        }
+                    }
+                    _ if scintilla => {
+                        let cx = (r.left + r.right) / 2;
+                        if crate::tsf::trace_on() {
+                            trace(&format!(
+                                "qc: seg1 selection 宽盒{}px→中心锚 x={}（live 盒外/缺席）",
+                                r.right - r.left,
+                                cx
+                            ));
+                        }
+                        RECT { left: cx, right: cx, ..r }
                     }
                     _ => r,
                 }
@@ -4095,6 +4190,46 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 监控实测一路涨出主窗右缘 420px）——钳到宿主窗内右带后再对齐
     // est 基线（est 从钳位点起步，est 矩形天然在窗内）。
     hupo_clamp(&mut rect);
+    // 【Scintilla 折叠点宽盒·suppress 2026-09-30 三轮】seg1 跳过
+    // selection 后实测：组段 END 折叠点查询在组段刚建瞬间返回的仍是
+    // **上次提交处的旧布局盒**（实测 (299,182,339,202) y/x=上一行「玉
+    // 玉玉」末尾，而组字已换行）——该内核组段建立到布局生效有 ~60ms
+    // 滞后，期间一切即时查询（selection/组段折叠点）都是旧值；seg2
+    // 窄盒准是因为布局早已追平。修：seg1 查询回宽盒（>10px）→本帧
+    // suppress（g.caret=None 走显示层抑制链）+武装 60ms 重查；布局
+    // 追平后的重查帧/第二键窄盒自然正确。suppress 至多 2 帧，第 3 帧
+    // 中心化采纳（(left+right)/2≈插入点，两轮实证）防慢打场景候选
+    // 永不出。快打不受影响（第二键窄盒直出）。
+    if rect.right - rect.left > 10
+        && focus_view_class().is_some_and(|c| c.contains("Scintilla"))
+    {
+        if g.seg_key_index == 1 && g.seg1_wide_suppress < 2 {
+            g.seg1_wide_suppress += 1;
+            arm_caret_recheck_timer();
+            if crate::tsf::trace_on() {
+                trace(&format!(
+                    "qc: 组段折叠点宽盒{}px（y={}）→seg1 suppress 等布局（第{}帧）",
+                    rect.right - rect.left,
+                    rect.top,
+                    g.seg1_wide_suppress
+                ));
+            }
+            return; // g.caret=None → 显示层抑制 + 60ms 重查
+        }
+        let cx = (rect.left + rect.right) / 2;
+        if crate::tsf::trace_on() {
+            trace(&format!(
+                "qc: 组段折叠点宽盒{}px→中心化 x={}（插={}..{}）",
+                rect.right - rect.left,
+                cx,
+                rect.left,
+                rect.right
+            ));
+        }
+        rect.left = cx;
+        rect.right = cx;
+    }
+    g.seg1_wide_suppress = 0;
     // 【九十二修·无基线归属验证 2026-09-25】八十九修的活插入符交叉
     // 验证在本宿主结构性失效（Qt 自绘光标，系统插入符恒缺失——九十
     // 修插桩实锤 seg1sel 39 帧 live=[] 全空，该门一次未触发），标准
