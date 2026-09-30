@@ -3718,6 +3718,37 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     g.caret_est_x, g.caret_est_y
                 ));
             }
+            // 【Notepad3 首键宽盒修 2026-09-30】Scintilla 系宿主对
+            // selection 空 range 的 GetTextExt 返回以插入点为中心的
+            // ~40px 宽盒（trace 实锤 rect=(234,171,274,191) 而活插入符
+            // live=(251,171,253,191) 仅 2px）——锚位取右缘=插入点
+            // +21px。首显帧活插入符优先（show 侧 live_caret.or）掩盖
+            // 了错误，非首显帧 g.caret（宽盒）接管 → 候选窗右跳
+            // 21px（用户实锤「Notepad3 首键候选右移一段，二键回正」
+            // ——回正=第二键标准链 END 折叠点窄盒）。修：seg1 selection
+            // 宽盒（>10px；正常插入点语义 2-4px）且活插入符整体落在
+            // 盒内时，改用活插入符（盒内窄盒真值）为锚；live 缺席/
+            // 盒外维持原值（其他宿主行为不变）。
+            let r = if r.right - r.left > 10 {
+                match gui_caret_fallback() {
+                    Some(lv)
+                        if lv.left >= r.left
+                            && lv.right <= r.right
+                            && lv.bottom - lv.top > 2 =>
+                    {
+                        if crate::tsf::trace_on() {
+                            trace(&format!(
+                                "qc: seg1 selection 宽盒{}px→盒内活插入符 ({},{},{},{})",
+                                r.right - r.left, lv.left, lv.top, lv.right, lv.bottom
+                            ));
+                        }
+                        lv
+                    }
+                    _ => r,
+                }
+            } else {
+                r
+            };
             // 【八十八修·播种几何门 2026-09-25】WPS 表格双轮 trace 实锤
             //（18:36 与 18:43 两轮，40 次 d≈700-1180px 大跳瞬落）：组段
             // 建立瞬间 selection GetTextExt 偶发返回文档原点带（EXCEL7
