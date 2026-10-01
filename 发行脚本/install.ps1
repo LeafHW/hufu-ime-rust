@@ -398,7 +398,30 @@ if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
 }
-$asm = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}\00000003"
+# 【吃掉其他输入法修复 2026-10-02】装配表（AssemblyItem）槽位原先写死
+# 00000003：装机 ≥4 个键盘类输入法时（如微软拼音+多多+虎爪+…），
+# ActivateProfile 触发的 +1 位移后 3 号槽常是别人（多多）的条目——
+# 写死槽=覆盖他人 → 那个输入法从装配表消失，「安装吃掉多多」的根因。
+# 改为扫描：优先复用虎符自己的旧槽（升级场景），否则找第一个空槽/
+# 追加新槽；绝不写任何已被其他 CLSID 占用的槽位。
+$asmBase = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
+$mySlot = $null
+$freeSlot = $null
+$maxSlot = -1
+if (Test-Path $asmBase) {
+    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
+        $cl = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).CLSID
+        $n = 0
+                        if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot) { $maxSlot = $n }
+        if ($cl -eq $CLSID) { $mySlot = $k.PSChildName }
+        elseif ($null -eq $freeSlot) {
+            $pf = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).Profile
+            if (-not $pf) { $freeSlot = $k.PSChildName }   # 无 Profile 的空壳槽
+        }
+    }
+}
+$slot = if ($mySlot) { $mySlot } elseif ($freeSlot) { $freeSlot } else { '{0:D8}' -f ($maxSlot + 1) }
+$asm = "$asmBase\$slot"
 New-Item -Path $asm -Force | Out-Null
 Set-ItemProperty -Path $asm -Name 'CLSID' -Value $CLSID -Type String
 Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
