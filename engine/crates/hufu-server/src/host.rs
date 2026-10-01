@@ -653,15 +653,19 @@ impl Host {
                 //（engine 侧 {重复上屏} 展开时读）。功能词指令（{加词}/
                 // {隐藏候选}——DLL 拦截不上屏）不算上屏内容、不进语境尾巴。
                 if c != "{加词}" && c != "{隐藏候选}" {
-                    // 【重复上屏只记文字 2026-10-30 二修】纯符号/数字/西文
-                    // 标点上屏不当回放源——打了「会……」后 {重复上屏} 要回放
-                    //「会」而不是「……」。一修用 !is_ascii() 判文字是错的：
-                    // 「……」「。」等中文标点也不是 ASCII，照样覆盖。二修口径：
-                    // 含至少一个字母（汉字/西文字母，is_alphabetic）才算文字；
-                    // 纯符号（……。，！）、纯数字、数字+标点（3.）都不记。
-                    // 「第3条」这类混排含汉字 → 整体记（中英混排同理）。
-                    if c.chars().any(|ch| ch.is_alphabetic()) {
-                        self.engine.last_commit = c.to_string();
+                    // 【重复上屏只记文字 2026-10-30 三修】回放源只记
+                    // 「文字部分」：①纯符号/数字/西文标点上屏不当回放源
+                    //（打了「会……」后 {重复上屏} 要回放「会」而不是
+                    //「……」——一修 !is_ascii() 判文字是错的，中文标点
+                    // 也不是 ASCII）；②标点顶字「中，」整段是文字+标点，
+                    // 二修原样整记导致回放也带标点——用户拍板回放的是
+                    //「上次打的字」不含随行标点。口径：先剥尾随非字母
+                    // 字符（标点/空白），剩余含至少一个字母才记
+                    //（is_alphabetic：汉字/西文）；「第3条」这类混排
+                    // 剥掉尾标点后整体记。
+                    let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
+                    if text_part.chars().any(|ch| ch.is_alphabetic()) {
+                        self.engine.last_commit = text_part.to_string();
                     }
                     self.session.tail_context.push_str(c);
                     let n = self.session.tail_context.chars().count();
@@ -694,10 +698,11 @@ impl Host {
         let outcome = self.engine.select_candidate(&mut self.session, index);
         if let Some(c) = outcome.commit.as_deref() {
             if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" {
-                // 【重复上屏只记文字 2026-10-30 二修】与 process_key 同源：
-                // 含字母才记；纯符号/数字上屏不覆盖回放源。
-                if c.chars().any(|ch| ch.is_alphabetic()) {
-                    self.engine.last_commit = c.to_string();
+                // 【重复上屏只记文字 2026-10-30 三修】与 process_key 同源：
+                // 剥尾随标点后含字母才记；纯符号/数字上屏不覆盖回放源。
+                let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
+                if text_part.chars().any(|ch| ch.is_alphabetic()) {
+                    self.engine.last_commit = text_part.to_string();
                 }
                 self.session.tail_context.push_str(c);
                 let n = self.session.tail_context.chars().count();
