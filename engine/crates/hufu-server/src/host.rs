@@ -653,7 +653,16 @@ impl Host {
                 //（engine 侧 {重复上屏} 展开时读）。功能词指令（{加词}/
                 // {隐藏候选}——DLL 拦截不上屏）不算上屏内容、不进语境尾巴。
                 if c != "{加词}" && c != "{隐藏候选}" {
-                    self.engine.last_commit = c.to_string();
+                    // 【重复上屏只记文字 2026-10-30 二修】纯符号/数字/西文
+                    // 标点上屏不当回放源——打了「会……」后 {重复上屏} 要回放
+                    //「会」而不是「……」。一修用 !is_ascii() 判文字是错的：
+                    // 「……」「。」等中文标点也不是 ASCII，照样覆盖。二修口径：
+                    // 含至少一个字母（汉字/西文字母，is_alphabetic）才算文字；
+                    // 纯符号（……。，！）、纯数字、数字+标点（3.）都不记。
+                    // 「第3条」这类混排含汉字 → 整体记（中英混排同理）。
+                    if c.chars().any(|ch| ch.is_alphabetic()) {
+                        self.engine.last_commit = c.to_string();
+                    }
                     self.session.tail_context.push_str(c);
                     let n = self.session.tail_context.chars().count();
                     if n > 32 {
@@ -685,7 +694,11 @@ impl Host {
         let outcome = self.engine.select_candidate(&mut self.session, index);
         if let Some(c) = outcome.commit.as_deref() {
             if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" {
-                self.engine.last_commit = c.to_string();
+                // 【重复上屏只记文字 2026-10-30 二修】与 process_key 同源：
+                // 含字母才记；纯符号/数字上屏不覆盖回放源。
+                if c.chars().any(|ch| ch.is_alphabetic()) {
+                    self.engine.last_commit = c.to_string();
+                }
                 self.session.tail_context.push_str(c);
                 let n = self.session.tail_context.chars().count();
                 if n > 32 {

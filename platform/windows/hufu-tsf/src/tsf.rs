@@ -4458,26 +4458,40 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // select_candidate 选重路径专属，普通上屏候选已清）：
                 // 先渲染确认帧（高亮胶囊滑到选中项，~240ms 动效），
                 // 收场交给 hide_later(150) 短停留定时器；否则照旧收窗。
-                let flash: Vec<(String, String)> = state
-                    .get("candidates")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .map(|c| {
-                                (
-                                    c.get("text")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    c.get("comment")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // 【动效总开关 2026-10-30】anim=false 时闪帧/暂留一并
+                // 免掉（闪帧本质=高亮滑动确认动效）——立即收窗，与
+                // 「关闭动效=一切瞬跳」口径一致。anim 由 server 注入
+                // 皮肤顶层（candwin2 show 同源读法）。
+                let anim_on = g
+                    .skin
+                    .pointer("/skin/anim")
+                    .or_else(|| g.skin.get("anim"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
+                let flash: Vec<(String, String)> = if anim_on {
+                    state
+                        .get("candidates")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .map(|c| {
+                                    (
+                                        c.get("text")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        c.get("comment")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 if !flash.is_empty() {
                     let sel_flash =
                         state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -4500,7 +4514,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     // 【选重闪帧·锁路径兜底 2026-10-09】引擎 state 为空
                     //（uru+3=锁+提前上屏）但键是数字且已上屏——用上一显示
                     // 帧的候选列表自建闪帧：高亮滑到第 N 项再暂留收场。
-                    let prior = g.last_show.clone().filter(|v| !v.0.is_empty());
+                    // 【动效总开关 2026-10-30】anim=false 免闪帧（同上）。
+                    let prior = if anim_on {
+                        g.last_show.clone().filter(|v| !v.0.is_empty())
+                    } else {
+                        None
+                    };
                     if let Some((lc, _, _)) = prior {
                         let sel_flash = idx.min(lc.len() - 1);
                         let skin_f = g.skin.clone();

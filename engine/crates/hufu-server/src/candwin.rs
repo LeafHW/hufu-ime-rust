@@ -447,6 +447,13 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
         .and_then(|x| x.as_f64())
         .unwrap_or(1.0)
         .clamp(0.0, 1.0) as f32;
+    // 【高亮开关 2026-10-30】hilite_on=false → 高亮底不画（文字色
+    // 本就逐候选自选，GDI 预览路径文字恒白无需切换）。
+    let hilite_on = skin
+        .pointer("/skin/material/hilite_on")
+        .or_else(|| skin.get("material").and_then(|m| m.get("hilite_on")))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
     let bgc4 = skin_color4(skin, "back_color", "#202022E6");
     let bg_col = (bgc4.0, bgc4.1, bgc4.2, (master * 255.0) as u8);
     let bc = skin_color4(skin, "border_color", "#FFFFFF26");
@@ -609,7 +616,7 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                 (y + off, y + off + ih)
             }
         };
-        if n > 0 {
+        if n > 0 && hilite_on {
             let y_sel = y0 + (line_h + cand_spacing) * sel as f32;
             let (pt, pb) = pill_v(y_sel);
             fill_round_rect(

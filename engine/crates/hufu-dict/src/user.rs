@@ -245,6 +245,12 @@ pub struct UserDict {
     pub hidden: HashSet<(String, String)>,
     /// 自定义权重（词 → 权重）
     pub weights: HashMap<(String, String), f64>,
+    /// 【码索引 2026-10-02】code → entries 下标（merge_into 每键热路径
+    /// 用）。entries 的增删改必须经 add_word/absorb/retain_rebuild
+    /// 维护；直接 push 会漏登记（外部仅测试这么干，retain_rebuild
+    /// 可兜底重建）。十万级用户码表（多多导出误入）全量线性扫
+    /// 每键 1-2ms×多次调用——索引后只碰命中码的条目。
+    by_code: HashMap<String, Vec<usize>>,
 }
 
 impl UserDict {
@@ -254,7 +260,45 @@ impl UserDict {
             entries: t.rows,
             hidden: HashSet::new(),
             weights: HashMap::new(),
+            by_code: HashMap::new(),
         }
+        .reindexed()
+    }
+
+    /// 按 entries 重建码索引（吞并/裁剪后调用）。
+    pub fn reindexed(mut self) -> Self {
+        self.by_code = HashMap::with_capacity(self.entries.len());
+        for (i, e) in self.entries.iter().enumerate() {
+            self.by_code.entry(e.code.clone()).or_default().push(i);
+        }
+        self
+    }
+
+    /// 【多多用户码表并入 O(n) 2026-10-02】旧实现每行对 entries 全量
+    /// 线性查重——10.7 万行 ≈ 57 亿次比较 ≈ 118s（用户把多多导出当
+    /// 码表拖进方案目录的实测病灶）。HashSet 一次建成，并入整体线性。
+    /// 返回实际并入条数。
+    pub fn absorb(&mut self, rows: Vec<DictEntry>) -> usize {
+        let mut seen: HashSet<(String, String)> = self
+            .entries
+            .iter()
+            .map(|e| (e.code.clone(), e.text.clone()))
+            .collect();
+        let mut n = 0usize;
+        for mut e in rows {
+            if !seen.insert((e.code.clone(), e.text.clone())) {
+                continue;
+            }
+            e.weight = 1.0;
+            // 并入置顶标记清零（用户词默认不置顶，置顶由
+            // 用户调整.txt 的 {置顶} 行控制；原为 clippy 自赋值修复）
+            e.pinned = false;
+            let code = e.code.clone();
+            self.by_code.entry(code).or_default().push(self.entries.len());
+            self.entries.push(e);
+            n += 1;
+        }
+        n
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -275,29 +319,36 @@ impl UserDict {
     }
 
     pub fn add_word(&mut self, code: &str, word: &str) {
-        if let Some(e) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.code == code && e.text == word)
+        if let Some(&i) = self
+            .by_code
+            .get(code)
+            .and_then(|idxs| idxs.iter().find(|&&i| self.entries[i].text == word))
         {
-            e.weight += 1.0;
+            self.entries[i].weight += 1.0;
             self.hidden.remove(&(code.to_string(), word.to_string()));
         } else {
             let mut e = DictEntry::new(code, word, self.entries.len() as u32);
             e.weight = 1.0;
+            self.by_code.entry(code.to_string()).or_default().push(self.entries.len());
             self.entries.push(e);
         }
     }
 
     /// 合入字典检索结果：用户词优先于同码低权重系统词。
+    /// 【码索引 2026-10-02】旧实现每键全量扫 entries；十万级用户
+    /// 码表下每 candidates() 调用 1-2ms（每次按键调多次）。改走
+    /// by_code 只碰命中码条目。
     pub fn merge_into(&self, code: &str, base: &Dict, out: &mut Vec<DictEntry>) {
-        for e in &self.entries {
-            if e.code == code && !self.hidden.contains(&(e.code.clone(), e.text.clone())) {
-                let mut e = e.clone();
-                if let Some(w) = self.weights.get(&(e.code.clone(), e.text.clone())) {
-                    e.weight = *w;
+        if let Some(idxs) = self.by_code.get(code) {
+            for &i in idxs {
+                let e = &self.entries[i];
+                if !self.hidden.contains(&(e.code.clone(), e.text.clone())) {
+                    let mut e = e.clone();
+                    if let Some(w) = self.weights.get(&(e.code.clone(), e.text.clone())) {
+                        e.weight = *w;
+                    }
+                    out.push(e);
                 }
-                out.push(e);
             }
         }
         let _ = base;
@@ -349,6 +400,41 @@ mod tests {
         ud.add_word("jj", "自己");
         assert_eq!(ud.entries.len(), 1);
         assert_eq!(ud.entries[0].weight, 2.0);
+    }
+
+    // 【码索引/O(n) 并入 2026-10-02】十万级用户码表（多多导出误入方案
+    // 目录）旧实现：absorb 前身逐行线性查重 O(n²)≈118s、merge_into
+    // 每键全量扫 1-2ms。absorb 去重 + by_code 索引后两条路径都只碰
+    // 命中项；外部直接 push 的 entries 由 reindexed 兜底重建索引。
+    #[test]
+    fn absorb_dedup_and_index_consistency() {
+        let mut ud = UserDict::default();
+        ud.add_word("jj", "自己");
+        let rows = vec![
+            DictEntry::new("a", "工", 0),
+            DictEntry::new("jj", "自己", 0), // 与已有重复 → 跳过
+            DictEntry::new("a", "工", 1),    // 组内重复 → 跳过
+            DictEntry::new("zzt", "自造词", 0),
+        ];
+        let n = ud.absorb(rows);
+        assert_eq!(n, 2, "只并入两个新词");
+        assert_eq!(ud.entries.len(), 3);
+        // absorb 清零权重/置顶（用户词语义）
+        assert_eq!(ud.entries.iter().find(|e| e.text == "工").unwrap().weight, 1.0);
+        // 索引生效：merge_into 只出命中码
+        let mut out = Vec::new();
+        ud.merge_into("zzt", &Dict::new("t"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "自造词");
+        let mut out2 = Vec::new();
+        ud.merge_into("jj", &Dict::new("t"), &mut out2);
+        assert_eq!(out2.len(), 1, "旧词仍可命中（含重复行未重复并入）");
+        // 直接 push 绕过索引 → reindexed 兜底
+        ud.entries.push(DictEntry::new("qq", "补", 0));
+        let ud = ud.reindexed();
+        let mut out3 = Vec::new();
+        ud.merge_into("qq", &Dict::new("t"), &mut out3);
+        assert_eq!(out3.len(), 1, "reindexed 重建索引后命中");
     }
 
     // 【虎爪内嵌兼容】空格/全角空格分隔 + 第三列日期（任意形态）忽略

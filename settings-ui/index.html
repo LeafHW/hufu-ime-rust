@@ -364,6 +364,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="row">
           <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc" title="窗底色"></div>
           <div class="field"><label>整体透明度 <span class="val" id="mat-ma-v"></span></label><input type="range" id="mat-ma" min="0" max="100" title="窗底/边框/编码底的透明度"></div>
+          <div class="field"><label>高亮开关</label><input type="checkbox" id="mat-hon" title="候选高亮胶囊总开关：开=首选候选有高亮底+高亮文字色；关=完全不画高亮，所有候选统一普通样式（默认开）" style="align-self:center;margin-top:22px"></div>
           <div class="field"><label>高亮透明度 <span class="val" id="mat-ha-v"></span></label><input type="range" id="mat-ha" min="0" max="100" title="高亮候选底色的透明度（独立于整体透明度）"></div>
           <div class="field"><label>高亮色</label><input type="color" id="mat-hi" title="高亮候选的底色（配合高亮透明度）"></div>
           <div class="field"><label>阴影透明度 <span class="val" id="mat-sa-v"></span></label><input type="range" id="mat-sa" min="0" max="100" title="纯色模式自绘阴影的透明度（毛玻璃模式的阴影用下方玻璃阴影浓度独立调）"></div>
@@ -1023,6 +1024,14 @@ function bindSkin() {
     };
     ha.onchange = saveSkinQuiet;
   }
+  // 【高亮开关 2026-10-30】hilite_on：关=候选窗完全不画高亮胶囊，
+  // 高亮行文字/序号/注释也用普通色（与 DLL 渲染端同语义）。默认开。
+  if (SKIN.material.hilite_on == null) SKIN.material.hilite_on = true;
+  {
+    const hon = $("#mat-hon");
+    hon.checked = SKIN.material.hilite_on !== false;
+    hon.onchange = () => { SKIN.material.hilite_on = hon.checked; preview(); saveSkinQuiet(); };
+  }
   // rng("#mat-bw", ...) 已并入上方边框对齐块（真窗键 layout.border_width）
   $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
   $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
@@ -1251,12 +1260,12 @@ function preview() {
     return k === 10 ? 0 : k;
   };
   const fmtLbl = n => { const f = L.label_format || "%s."; const d = lblDigits(n); return f.includes("%s") ? f.replace("%s", d) : d + "."; };
-  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${esc(L.hilited_corner_radius)}px;padding:${esc(L.hilite_padding)}px;` : `padding:${esc(L.hilite_padding)}px 1px;`}color:${solid(hi ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi ? c.hilited_candidate_label_color : c.label_color)}">${esc(fmtLbl(i))}</span>` : ""}${esc(t)}${cmt ? ` <span class="cmt" style="color:${solid(hi ? c.hilited_comment_text_color : c.comment_text_color)}">${esc(cmt)}</span>` : ""}</div>`;
+  const cand = (i, t, cmt, hi) => `<div class="cand-line" style="${hi && M.hilite_on !== false ? `background:${hiA(c.hilited_candidate_back_color)};border-radius:${esc(L.hilited_corner_radius)}px;padding:${esc(L.hilite_padding)}px;` : `padding:${esc(L.hilite_padding)}px 1px;`}color:${solid(hi && M.hilite_on !== false ? c.hilited_candidate_text_color : c.candidate_text_color)}">${hi && M.hilite_on !== false && (L.mark_text || "").trim() ? `<span style="display:inline-block;width:2px;align-self:stretch;margin:-2px 4px 0 -3px;border-radius:1px;background:${solid(c.hilited_candidate_label_color)}"></span>` : ""}${CFG.candidates.show_index !== false ? `<span class="idx" style="color:${solid(hi && M.hilite_on !== false ? c.hilited_candidate_label_color : c.label_color)}">${esc(fmtLbl(i))}</span>` : ""}${esc(t)}${cmt ? ` <span class="cmt" style="color:${solid(hi && M.hilite_on !== false ? c.hilited_comment_text_color : c.comment_text_color)}">${esc(cmt)}</span>` : ""}</div>`;
   inner.innerHTML =
     `<div class="preedit-line" style="color:${solid(c.text_color)};background:${elemA(c.preedit_back_color)};border-radius:4px">tuja</div>` +
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
   w.appendChild(inner);
-  $("#material-note").textContent = `纯色 · 整体透明度 ${Math.round(ma * 100)}% · 高亮透明度 ${Math.round(ha * 100)}% · 文字恒不透明`;
+  $("#material-note").textContent = `纯色 · 整体透明度 ${Math.round(ma * 100)}% · 高亮${M.hilite_on === false ? "关" : `开 · 高亮透明度 ${Math.round(ha * 100)}%`} · 文字恒不透明`;
 }
 /* ── 真实屏幕背景：把实际屏幕作为预览底，透明度所见即所得 ── */
 {

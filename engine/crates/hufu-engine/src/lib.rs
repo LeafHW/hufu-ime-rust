@@ -5145,7 +5145,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("码表.txt"),
-            "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n",
+            "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n/sj {时分} {时间}\n",
         )
         .unwrap();
         let mut eng = Engine::with_schema_dir(&dir, {
@@ -5180,6 +5180,22 @@ mod tests {
         }
         let out = eng.process_key(&mut s, key(' '));
         assert_eq!(out.commit.unwrap(), "重复我", "z3 = 上次上屏内容");
+
+        // /sj：{时间} 带年月日（2026-10-30 用户规格；/sj 出 {时分}+
+        // {时间} 两候选，测试断言含年月日的那项在列；空格确认 {时分}
+        // 后组段收干净，再走 /jc）
+        for c in "/sj".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        assert!(
+            snap.candidates
+                .iter()
+                .any(|c| c.text.contains('年') && c.text.contains(':') && !c.text.contains('{')),
+            "{{时间}} 候选显示带年月日: {:?}",
+            snap.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+        );
+        let _ = eng.process_key(&mut s, key(' '));
 
         // /jc：加词指令原样透传给 DLL（唯一候选 → 末键自动顶字，
         // 无需空格确认）

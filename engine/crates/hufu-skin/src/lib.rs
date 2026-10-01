@@ -103,6 +103,10 @@ pub struct MaterialConfig {
     pub master_alpha: f32,
     /// 【纯色模型】高亮候选底独立透明度
     pub hilite_alpha: f32,
+    /// 【高亮开关 2026-10-30】候选高亮胶囊总开关（true=画高亮底+高亮
+    /// 文字色；false=完全不画胶囊，候选统一普通文字色）。旧皮肤缺键
+    /// 走 serde default=true（现状不变）。
+    pub hilite_on: bool,
     /// 【纯色模型】阴影独立透明度
     pub shadow_alpha: f32,
     /// 【纯色模型】边框独立透明度
@@ -142,6 +146,7 @@ impl Default for MaterialConfig {
             border_color: Color([255, 255, 255, 0x33]),
             master_alpha: 1.0,
             hilite_alpha: 1.0,
+            hilite_on: true,
             shadow_alpha: 1.0,
             border_alpha: 1.0,
             glass_alpha: 0.0,

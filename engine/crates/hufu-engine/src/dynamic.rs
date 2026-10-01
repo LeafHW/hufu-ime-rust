@@ -193,8 +193,11 @@ pub fn week_string() -> String {
 }
 
 /// 码表动态变量展开：`{日期}` `{日期.}` `{日期-}` `{日期/}` `{时分}`
-/// `{时分秒}` `{星期}` `{周}`。非时间标记（`{重复上屏}`/`{加词}`/
-/// `{隐藏候选}` 等功能词）返回 None，由提交收口另行处理。
+/// `{时分秒}` `{时间}` `{时间秒}` `{星期}` `{周}`。非时间标记
+/// （`{重复上屏}`/`{加词}`/`{隐藏候选}` 等功能词）返回 None，
+/// 由提交收口另行处理。
+/// 【{时间}带年月日 2026-10-30】用户规格：{时间}={日期}+时分（不带秒，
+/// 2026年10月02日01:50），{时间秒}=带秒变体；旧 {时分}/{时分秒} 保留。
 pub fn expand(tag: &str) -> Option<String> {
     let (y, m, d, h, mi, s, wd) = now_civil();
     let names = ["日", "一", "二", "三", "四", "五", "六"];
@@ -205,6 +208,8 @@ pub fn expand(tag: &str) -> Option<String> {
         "日期/" => Some(format!("{y}/{m:02}/{d:02}")),
         "时分" => Some(format!("{h:02}:{mi:02}")),
         "时分秒" => Some(format!("{h:02}:{mi:02}:{s:02}")),
+        "时间" => Some(format!("{y}年{m:02}月{d:02}日{h:02}:{mi:02}")),
+        "时间秒" => Some(format!("{y}年{m:02}月{d:02}日{h:02}:{mi:02}:{s:02}")),
         "星期" => Some(format!("星期{}", names[wd as usize])),
         "周" => Some(format!("周{}", names[wd as usize])),
         _ => None,
@@ -400,6 +405,13 @@ mod tests {
         assert!(expand("日期/").unwrap().matches('/').count() == 2);
         assert_eq!(expand("时分").unwrap().len(), 5); // 17:30
         assert_eq!(expand("时分秒").unwrap().len(), 8); // 17:30:45
+        // 【{时间}带年月日 2026-10-30】{时间}={日期}+时分；{时间秒}带秒
+        let t = expand("时间").unwrap();
+        assert!(t.contains('年') && t.contains('月') && t.contains('日') && t.contains(':'));
+        assert_eq!(t.chars().count(), 16, "2026年10月02日01:50");
+        let ts = expand("时间秒").unwrap();
+        assert_eq!(ts.chars().count(), 19, "2026年10月02日01:50:17");
+        assert!(ts.starts_with(&t), "时间秒=时间+秒");
         assert!(expand("星期").unwrap().starts_with("星期"));
         assert!(expand("周").unwrap().starts_with("周"));
         // 功能词不展开（上层处理）

@@ -67,7 +67,9 @@ impl Schema {
 
         let mut rime_dicts: Vec<PathBuf> = Vec::new();
         let mut big_tables: Vec<PathBuf> = Vec::new();
-        let mut duoduo_user: Option<PathBuf> = None;
+        // 用户码表/用户词类文件（多多/QQ五笔语义=个人用户词）。命名只作
+        // 初筛，是否晋升主码表见下方 BIG_USER_TABLE_AS_MAIN。
+        let mut user_tables: Vec<PathBuf> = Vec::new();
         // 【文件整合 2026-09-06】调整行不再即读即 set：统一收集到加载
         // 收尾回放（码表内嵌 ++ 旧用户调整.txt ++ 旧用户词.txt，
         // 后者最新在后，覆盖语义正确）。
@@ -136,23 +138,51 @@ impl Schema {
             } else if ext == "yaml" && stem.ends_with(".dict") {
                 rime_dicts.push(path.clone());
             } else if ext == "txt" {
-                if stem.contains("用户码表") {
-                    duoduo_user = Some(path.clone());
+                // 【用户码表/用户词 2026-10-02】精确 stem "用户词"/"用户调整"
+                // 已由上方 match 分支处理（用户调整.txt 本就进 big_tables
+                // 参加最大者胜选——历史行为保留）；此处只收"文件名含
+                // 用户码表/用户词"的导出类文件：不得冒然进主码表候选
+                // （/jc 落盘用户词文件若大于真码表，max_by_key 会把它选
+                // 成主表——整个输入法只剩几个用户词；测试
+                // user_word_placement 抓获）。先收集，体量分级见
+                // BIG_USER_TABLE_AS_MAIN。
+                if stem == "用户词" {
+                    // match 分支已并入，不重复处理
+                } else if stem.contains("用户码表") || stem.contains("用户词") {
+                    user_tables.push(path.clone());
                 } else if stem.contains("反查") {
                     // 【性能】懒加载：只记路径（见 reverse 字段注释）
                     schema.reverse_path = Some(path.clone());
                 } else {
-                    // 其余 txt：可能是主码表（多多/QQ五笔/虎整句/多多用户词）
-                    if stem.contains("用户词") {
-                        // 【2026-09-06】用户词不得进主码表候选：/jc 加词
-                        // 落盘 用户词.txt 后，文件大于真码表时 max_by_key
-                        // 会把它选成主表——整个输入法只剩几个用户词
-                        //（测试 user_word_placement 抓获）。只入用户词库。
-                        duoduo_user = Some(path.clone());
-                    } else {
-                        big_tables.push(path.clone());
-                    }
+                    // 其余 txt：可能是主码表（多多/QQ五笔/虎整句）
+                    big_tables.push(path.clone());
                 }
+            }
+        }
+
+        // 【大体量用户码表晋升主码表 2026-10-02】五用户实测病灶：把多多/
+        // QQ五笔「导出 - 主码 - 用户码表.txt」（10.7 万行≈全量词库，QQ五笔
+        // 用户码表会累积全部词汇）拖进方案目录——文件名含「用户码表」被
+        // 当个人用户词并入 UserDict：主词典 0 条（打不出字），且十万级
+        // 用户词把每键热路径拖慢。体量分级：≥512KB 的"用户码表"事实是
+        // 全量码表（QQ五笔86 主表也才 1.2MB），晋升 big_tables 走 Trie/
+        // HashMap 索引与正常排序；小文件维持用户词语义不变（/jc 落盘的
+        // 用户词.txt 永远是 KB 级）。注：晋升后仍参加 max_by_key 按最大
+        // 选主表，与目录里真主表并存时大的赢——语义正确（导出即用户
+        // 的完整词库快照）。
+        const BIG_USER_TABLE_AS_MAIN: u64 = 512 * 1024;
+        let mut duoduo_user: Option<PathBuf> = None;
+        for p in user_tables {
+            let mut big = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) >= BIG_USER_TABLE_AS_MAIN;
+            if big && !rime_dicts.is_empty() {
+                // Rime dict.yaml 在场=方案主体明确，用户导出不抢主表位
+                //（虎码等 Rime 方案目录混入多多导出的场景），仍并入用户词。
+                big = false;
+            }
+            if big {
+                big_tables.push(p);
+            } else {
+                duoduo_user = Some(p);
             }
         }
 
@@ -253,20 +283,11 @@ impl Schema {
             }
         }
 
-        // 多多用户码表并入用户词库
+        // 多多用户码表并入用户词库（【O(n) 2026-10-02】原逐行线性查重
+        // 是 10.7 万行≈118s 的二次方病灶，改 absorb 整体线性并入）
         if let Some(u) = duoduo_user {
             let t = parse_file(&u)?;
-            for e in t.rows {
-                if !schema.user_dict.entries.iter().any(|x| x.code == e.code && x.text == e.text) {
-                    let mut e = e;
-                    e.weight = 1.0;
-                    // 【clippy 修复】原 e.pinned = e.pinned 自赋值（无效果）
-                    //——多多用户码表并入时置顶标记清零（用户词默认不置顶，
-                    //置顶由用户调整.txt 的 {置顶} 行控制）。
-                    e.pinned = false;
-                    schema.user_dict.entries.push(e);
-                }
-            }
+            schema.user_dict.absorb(t.rows);
         }
 
         // 符号行并入符号命名空间（虎整句格式的 `/xx`、`;x` 行）
@@ -295,6 +316,11 @@ impl Schema {
         }
         schema.symbols.quick = quick;
         schema.symbols.slash = slash;
+
+        // 【码索引 2026-10-02】加载过程中 用户调整.txt/旧用户词.txt 词行
+        // 直接 extend 进 entries（绕过 UserDict 增改 API），此处统一
+        // 重建 by_code 索引，保证 merge_into 每键热路径命中。
+        schema.user_dict = std::mem::take(&mut schema.user_dict).reindexed();
 
         Ok(schema)
     }
@@ -568,6 +594,51 @@ mod tests {
         s2.adjust.remove("ae", "二");
         let texts2: Vec<String> = s2.candidates("ae").iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts2, ["闲".to_string(), "那样".to_string()], "删除态恢复码表原序: {texts2:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【大体量用户码表晋升主码表 2026-10-02】五用户实测：把多多/QQ五笔
+    // 「导出 - 主码 - 用户码表.txt」（全量词库）拖进方案目录。文件名含
+    // 「用户码表」→ 旧逻辑并入用户词：主词典 0 条打不出字 + 十万级
+    // 用户词二次方并入 118s。≥512KB 晋升主码表（Trie 索引正常排序），
+    // 小文件维持用户词语义。
+    #[test]
+    fn big_duoduo_user_export_becomes_main_table() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-biguser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 拼一个 ≥512KB 的 word-first 导出（多多/QQ五笔导出同构）
+        let mut body = String::from("#QQ五笔导出\n");
+        let fill = "工\ta\n匠\tar\n牙尖嘴利\taikt\n问题\tu\n";
+        while body.len() < 600 * 1024 {
+            body.push_str(fill);
+        }
+        write(&tmp, "导出 - 主码 - 用户码表.txt", &body);
+        let s = Schema::load(&tmp).unwrap();
+        assert!(
+            s.dict.len() > 1000,
+            "大体量用户码表应晋升主码表，实际词典 {} 条",
+            s.dict.len()
+        );
+        assert_eq!(s.user_dict.entries.len(), 0, "晋升后不再重复进用户词");
+        // 主表可正常出字
+        assert_eq!(s.candidates("a")[0].text, "工");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 小体量「用户码表」（个人用户词语义）不晋升：仍并入用户词库。
+    #[test]
+    fn small_duoduo_user_table_stays_user_dict() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-smalluser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(&tmp, "导出 - 主码 - 用户码表.txt", "自造词\tzzt\n工\ta\n");
+        write(&tmp, "QQ五笔86.txt", "工\ta\n问题\tu\n");
+        let s = Schema::load(&tmp).unwrap();
+        assert_eq!(s.dict.len(), 2, "小用户码表不抢主表位");
+        assert_eq!(s.user_dict.entries.len(), 2, "个人用户词（含表内同词）并入用户词库");
+        let texts: Vec<String> = s.candidates("zzt").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, ["自造词".to_string()], "用户词可出字: {texts:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

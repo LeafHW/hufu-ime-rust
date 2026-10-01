@@ -1907,7 +1907,14 @@ impl CandidateWindowV2 {
         // 跨会话首显（was_visible=false）不滑；动效 tick 复渲染不算。
         // prev 记在窗体（shared.last_show 锁外不可达，窗自记即够；比较
         // 用抑制前的原列表，与渲染入参同源）。
-        if !self.internal_rerender && self.hl_ms > 0 {
+        // 【高亮开关 2026-10-30】hilite_on=false → 不起高亮滑动动效
+        //（胶囊都没了，滑动无从呈现）。开关与渲染段同源读皮肤。
+        let hilite_on = skin
+            .pointer("/skin/material/hilite_on")
+            .or_else(|| skin.get("material").and_then(|m| m.get("hilite_on")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        if !self.internal_rerender && self.hl_ms > 0 && hilite_on {
             let prev = self.hl_prev.take();
             if was_visible {
                 let prev_sel = prev.map(|(_, s)| s).unwrap_or(selected);
@@ -3008,6 +3015,14 @@ impl CandidateWindowV2 {
                     .and_then(|x| x.as_f64())
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0) as f32;
+                // 【高亮开关 2026-10-30】hilite_on=false → 高亮胶囊整块
+                // 不画（alpha 归零由渲染段 b_hi=None 实现，此处仅带出
+                // 开关供滑动起臂门与画刷组装用）。
+                let hilite_on = skin
+                    .pointer("/skin/material/hilite_on")
+                    .or_else(|| skin.get("material").and_then(|m| m.get("hilite_on")))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
                 {
                     // 【纯色模型 v2·用户定稿】颜色只管色相（alpha 分量忽略）：
                     // 窗底/边框/编码底 alpha = master；高亮底 = hilite_a；文字恒 1。
@@ -3129,6 +3144,20 @@ impl CandidateWindowV2 {
                     &ctx,
                     text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")),
                 );
+                // 【高亮开关 2026-10-30】material.hilite_on=false：胶囊画刷
+                // 置 None（整格胶囊/mark 竖条都不画），高亮行文字/序号/
+                // 注释一律改用普通色——「关掉高亮」= 视觉全无高亮。
+                //（开关在渲染段头已读，此处复用同源值。）
+                let (b_hi, b_hi_txt, b_hi_lbl, b_hi_cmt) = if hilite_on {
+                    (b_hi, b_hi_txt, b_hi_lbl, b_hi_cmt)
+                } else {
+                    (
+                        None,
+                        b_text.clone(),
+                        b_label.clone(),
+                        b_cmt.clone(),
+                    )
+                };
                 let b_border = mkbrush(&ctx, {
                     // 【边框透明度】material.border_alpha 独立滑条（颜色自带 a 忽略）
                     let border_alpha = skin
