@@ -706,8 +706,9 @@ unsafe extern "system" fn overlay_wndproc(
         {
             let delay = entry.cfg.as_ref().map(|c| c.hide_delay_ms).unwrap_or(0);
             if delay > 0 {
-                // 保留播放钟(呼吸);挂延时钟,到点由 hide 钟无条件收窗
-                let _ = SetTimer(hwnd, OVERLAY_HIDE_TIMER_ID, delay.min(10_000), None);
+                // 保留播放钟(呼吸);记截止(补挂不延期)+挂钟,到点以
+                // hide_at 截止为准收窗(见 hide 钟分支)
+                arm_hide(entry, hwnd, delay);
                 return LRESULT(0);
             }
             let _ = KillTimer(hwnd, OVERLAY_TIMER_ID);
@@ -722,25 +723,43 @@ unsafe extern "system" fn overlay_wndproc(
         return LRESULT(0);
     }
     if msg == 0x0113 && wparam.0 as usize == OVERLAY_HIDE_TIMER_ID {
-        // 延时消失到点:无条件收窗。候选窗若已重现,它的 sync_for 会重新
-        // SWP_SHOWWINDOW 显示并撤本钟——先查可见性会与跨线程 sync 竞态
-        // (用户实测「消失前切到别的应用就不消失」:切换路径候选窗藏着
-        // 但 IsWindowVisible 误报/竞态漏收,挂件永久滞留)
-        let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
+        // 延时消失到点:以 hide_at 截止为准(单一真相),未到点重挂钟、
+        // 到点无条件收窗。候选窗若已重现,它的 sync_for 会清 hide_at
+        // 并杀本钟——先查可见性会与跨线程 sync 竞态(用户实测「消失前
+        // 切到别的应用就不消失」:切换路径候选窗藏着但 IsWindowVisible
+        // 误报/竞态漏收,挂件永久滞留)。
+        let now = std::time::Instant::now();
         let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = list
+        let Some(entry) = list
             .iter_mut()
             .find(|e| e.ov.as_ref().is_some_and(|o| o.hwnd == hwnd.0 as isize))
-        {
-            entry.hide_at = None;
-            if let Some(ov) = entry.ov.as_mut() {
-                let h = HWND(ov.hwnd as *mut _);
-                let _ = KillTimer(h, OVERLAY_TIMER_ID);
-                let _ = ShowWindow(h, SW_HIDE);
+        else {
+            let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
+            return LRESULT(0);
+        };
+        match entry.hide_at {
+            Some(t) if t > now => {
+                // 提前到点(多路补挂/丢拍自愈):按剩余时长重挂
+                let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
+                let _ = SetTimer(
+                    hwnd,
+                    OVERLAY_HIDE_TIMER_ID,
+                    (t - now).as_millis().min(u32::MAX as u128) as u32 + 1,
+                    None,
+                );
             }
-            entry.shown = false;
-            entry.timer_armed = false;
-            entry.frame_idx = 0;
+            _ => {
+                entry.hide_at = None;
+                if let Some(ov) = entry.ov.as_mut() {
+                    let h = HWND(ov.hwnd as *mut _);
+                    let _ = KillTimer(h, OVERLAY_TIMER_ID);
+                    let _ = KillTimer(h, OVERLAY_HIDE_TIMER_ID);
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+                entry.shown = false;
+                entry.timer_armed = false;
+                entry.frame_idx = 0;
+            }
         }
         return LRESULT(0);
     }
@@ -864,12 +883,15 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         }
         return;
     }
-    // 候选窗重现 → 撤销延时收窗(hide 钟作废)。不依赖 hide_at 标志:
-    // 广播路径(WM_APP_HIDE 转挂钟)不设 hide_at,无条件杀一次钟最稳。
-    if let Some(ov) = entry.ov.as_ref() {
-        let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
+    // 候选窗重现 → 撤销延时收窗:清 hide_at(handler 见 None 即收窗,
+    // 故必须连钟一起杀;万一杀钟与在途 WM_TIMER 竞态漏杀,handler 收
+    // 一次窗后下一拍 sync 经 !shown 重新显示——瞬时闪烁,无滞留)。
+    if entry.hide_at.is_some() {
+        entry.hide_at = None;
+        if let Some(ov) = entry.ov.as_ref() {
+            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
+        }
     }
-    entry.hide_at = None;
     let Some(cfg) = entry.cfg.clone() else {
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
@@ -1070,32 +1092,48 @@ unsafe fn tick_playback(
     }
 }
 
+/// 延时收窗统一臂钟:hide_at 截止时刻是**唯一真相**,钟只是叫醒手段——
+/// 已有更早截止不覆盖(多路隐藏信号都来臂钟,取最早=延时语义不因
+/// 广播风暴被拉长);钟挂到「最早截止+150% 兜底」(WM_TIMER 最小 ~
+/// 15.6ms 分辨率、丢拍后无再臂——真实到点由 handler 对表 hide_at
+/// 重挂收窗,自愈丢拍)。
+unsafe fn arm_hide(entry: &mut OverlayEntry, ov_hwnd: HWND, delay: u32) {
+    let now = std::time::Instant::now();
+    let deadline = match entry.hide_at {
+        Some(t) if t <= now + std::time::Duration::from_millis(delay as u64) => t,
+        _ => now + std::time::Duration::from_millis(delay as u64),
+    };
+    entry.hide_at = Some(deadline);
+    let span = (deadline - now).as_millis() as u32;
+    let _ = KillTimer(ov_hwnd, OVERLAY_HIDE_TIMER_ID);
+    let _ = SetTimer(ov_hwnd, OVERLAY_HIDE_TIMER_ID, span.saturating_add(span / 2).max(16), None);
+}
+
 /// 隐藏同步(WM_APP_HIDE_CAND 处理器内调用)。
 /// hide_delay_ms=0(默认):候选窗一收立即收,干净利落;
 /// >0:挂件原地停留该时长——期间候选窗重现(sync_for)则撤销收窗,
-/// 到点由 sync_for 的兜底钟/下次 tick 收窗。播放钟继续走(呼吸不停)。
+/// 到点由 hide 钟到点收窗。播放钟继续走(呼吸不停)。
 pub unsafe fn hide_for(cand: HWND) {
     let cand_key = cand.0 as isize;
     let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = list.iter_mut().find(|e| e.cand == cand_key) {
         let delay = entry.cfg.as_ref().map(|c| c.hide_delay_ms).unwrap_or(0);
         if delay > 0 && entry.ov.is_some() {
-            entry.hide_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(delay as u64));
-            // 动图继续播(呼吸),静图无需钟;到点收窗由 sync_for 兜底轮询
-            // (候选窗已藏,sync 不再被调——挂延时短钟驱动收窗)
+            // 动图继续播(呼吸),静图无需钟;延时收窗由 hide 钟对表 hide_at
             if let Some(ov) = entry.ov.as_ref() {
-                let hwnd = HWND(ov.hwnd as *mut _);
-                let _ = SetTimer(hwnd, OVERLAY_HIDE_TIMER_ID, delay.min(10_000), None);
+                arm_hide(entry, HWND(ov.hwnd as *mut _), delay);
             }
             return;
         }
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
+            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
             let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
         }
         entry.shown = false;
         entry.timer_armed = false;
         entry.frame_idx = 0;
+        entry.hide_at = None;
     }
 }
 
