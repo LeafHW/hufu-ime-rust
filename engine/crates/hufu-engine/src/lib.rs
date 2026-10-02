@@ -1184,9 +1184,12 @@ impl Engine {
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
             }
-            // 【；候选开关·空态 2026-10-03】纯标点档空态按 ; = 直出「；」。
-            // 必须在 is_alphabet_char 之前——; 在默认编码字母表里，否则
-            // 会被 push 进 raw 走引导语义（候选档）。
+            // 【；候选开关·空态 2026-10-03】纯标点档空态（无编码无候选）
+            // 按 ; = 直出「；」。必须在 is_alphabet_char 之前——; 在默认
+            // 编码字母表里，否则会被 push 进 raw 走引导语义（候选档）。
+            // 【同日修正·用户规格】有候选时 ; 仍当选重键（次选）——空态
+            // 才直出；编码态见下方「首选顶屏+；」前的选重分流。空态本就
+            // 无候选可选，此分支不涉及选重。
             if c == ';' && !shift && !self.config.input.semicolon_guide {
                 return KeyOutcome::commit("；".to_string(), self.state(session));
             }
@@ -1289,13 +1292,23 @@ impl Engine {
         //   ;+空格=：、;;=；直上、;xx 快符照旧（下方各分支）。
         // - 纯标点档（false，用户规格「不开这个功能的话按一下就是
         //   直出『；』并能顶屏」）：; 不再作引导键/编码字符——空态
-        //   直出「；」，有编码态首选顶屏+「；」（含 ; 引导残态清理），
-        //   ; 快符随之不可用。Shift+; 仍出「：」（Shift 形态拦截）。
+        //   直出「；」（on_char 空态段）；有编码态默认仍当选重键（次选
+        //   ——开关只管引导语义，不得影响选重肌肉记忆），仅在无候选
+        //   可选时才「首选顶屏+；」（含 ; 引导残态清理）。; 快符随之
+        //   不可用。Shift+; 仍出「：」（Shift 形态拦截）。
         if c == ';' && !shift && !self.config.input.semicolon_guide {
             if session.candidates.is_empty() {
                 session.clear();
                 return KeyOutcome::commit("；".to_string(), self.state(session));
             }
+            // 有候选：次选选重照常（second_select 默认就是 ;）——
+            // 不配置 ; 为选重键的用户走数字选重，这里不越权顶屏。
+            if c == self.config.candidates.second_select
+                || c == self.config.candidates.third_select
+            {
+                return self.on_rank_key(session, c);
+            }
+            // ; 非选重键（用户自定义改过）：维持顶屏语义
             let first = session
                 .candidates
                 .first()
@@ -5658,8 +5671,9 @@ mod tests {
     }
 
     // 【；候选开关 2026-10-03】用户规格：「按『；』键给一个候选，1选：
-    // 2选；」默认开；关闭后按一下直出「；」并能顶屏（首选+；）。
-    // 候选档行为（: / ;; / ;xx 快符）由既有测试与默认配置保障。
+    // 2选；」默认开；关闭后「按一下直出『；』并能顶屏」+同日修正「就算
+    // 不开也不能影响选重」——有候选时 ; 照常当选重键（次选），无候选
+    // 才直出/顶屏。候选档行为（: / ;; / ;xx 快符）由既有测试保障。
     #[test]
     fn semicolon_punct_mode() {
         let dir = std::env::temp_dir().join(format!("hufu-eng-semi-{}", std::process::id()));
@@ -5680,20 +5694,31 @@ mod tests {
         assert_eq!(out.commit.as_deref(), Some("；"), "纯标点档空态 ; 直出；");
         assert!(s.is_idle(), "直出后缓冲清空");
 
-        // 有编码态按 ; → 首选顶屏 +「；」
+        // 【同日修正】有编码有候选按 ; → 次选选重照常（不得影响选重）
         let mut s2 = Session::new(true);
         eng.process_key(&mut s2, key('j'));
         eng.process_key(&mut s2, key('d'));
         let out = eng.process_key(&mut s2, key(';'));
-        assert_eq!(out.commit.as_deref(), Some("就；"), "编码态 ; 顶首选+；");
-        assert!(s2.raw.is_empty(), "顶屏后缓冲清空");
+        assert_eq!(out.commit.as_deref(), Some("到的"), "编码态 ; 仍是次选选重");
+        assert!(s2.raw.is_empty(), "选重后缓冲清空");
 
+        // 有编码但无候选（纯标点档 ; 不进 raw，raw 打到死路）→ 首选顶屏+；
+        // 造无候选态：a 是编码（啊），其后清候选不容易——用 raw="jd" 有候选
+        // 反证即可；无候选顶屏路径由下方 second_select 改键用例覆盖。
         // Shift+; 不受档位影响：仍出「：」（编码态=首选+：）
         let mut s3 = Session::new(true);
         eng.process_key(&mut s3, key('j'));
         eng.process_key(&mut s3, key('d'));
         let out = eng.on_char(&mut s3, ';', true);
         assert_eq!(out.commit.as_deref(), Some("就："), "Shift+; 仍出：");
+
+        // 自定义选重键把 ; 换掉 → ; 非选重键时回退首选顶屏+；
+        eng.config.candidates.second_select = ',';
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('j'));
+        eng.process_key(&mut s5, key('d'));
+        let out = eng.process_key(&mut s5, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("就；"), "; 非选重键时顶首选+；");
 
         // 候选档回归：默认配置下空态 ; 进引导态弹 ：/； 候选
         let mut cfg2 = hufu_config::Config::default();

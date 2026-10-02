@@ -149,8 +149,8 @@ pub struct InputSection {
     pub backslash_dunhao: bool,
     /// 无编码时「;」引导标点——双档（2026-10-03 用户规格补全关闭档）：
     /// true=弹候选（1选「：」2选「；」；;+空格=：、;;=；直上，含 ;xx 快符）；
-    /// false=纯标点档（空态直出「；」，编码态首选顶屏+「；」，不再作
-    /// 引导键/编码字符，;xx 快符随之不可用）
+    /// false=纯标点档（空态直出「；」；编码态有候选仍当选重键，无候选
+    /// 才首选顶屏+「；」，不再作引导键/编码字符，;xx 快符随之不可用）
     pub semicolon_guide: bool,
     /// 数字键参与整句选重
     pub digits_in_sentence: bool,

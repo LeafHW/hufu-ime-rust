@@ -160,18 +160,22 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
    拉伸修复 2026-10-03：canvas 的 CSS width:auto 回退到 attribute 宽度
    （ovProcess 的像素缓冲宽，与 base_height 展示高无关）→ 纵横比随 buffer
    尺寸漂移=横向拉伸/压缩。改为 height:100% + aspect-ratio:attr 比——
-   宽度永远按「当前图像缓冲宽高比 × 显示高」计算，比例恒真 */
+   宽度永远按「当前图像缓冲宽高比 × 显示高」计算，比例恒真
+   手柄二修 2026-10-03：旧 14px 手柄中心钉在角点——3/4 命中面积悬在
+   图外，按到图内那小半则落入「移动」模式（高度不变=「拖不动」的真
+   体感）。新方案：16px 方块整体移到角点外（不遮图、不与移动区重
+   叠），::after 透明命中垫扩到 26×26——按方块或垫上任何一点都是缩放 */
 #ov-imgwrap { position: relative; display: inline-block; line-height: 0; cursor: move; }
 #ov-imgwrap canvas { display: block; pointer-events: none; height: 100%; width: auto; aspect-ratio: attr(width) / attr(height); }
-#ov-imgwrap .ov-h { position: absolute; width: 14px; height: 14px; border-radius: 4px;
-  background: var(--acc); border: 2px solid #17181c; opacity: .85; z-index: 2;
+#ov-imgwrap .ov-h { position: absolute; width: 16px; height: 16px; border-radius: 4px;
+  background: var(--acc); border: 2px solid #17181c; opacity: .9; z-index: 2;
   transition: box-shadow .15s; }
-/* 手柄常显（用户实测「hover 才出=完全找不到」；悬浮高亮仅加光晕） */
+#ov-imgwrap .ov-h::after { content: ""; position: absolute; inset: -5px; } /* 透明命中垫 26×26 */
 #ov-imgwrap.ov-dragging .ov-h, #ov-imgwrap:hover .ov-h { opacity: 1; box-shadow: 0 0 0 3px rgba(255,215,94,.25); }
-.ov-h-nw { left: -7px; top: -7px; cursor: nwse-resize; }
-.ov-h-ne { right: -7px; top: -7px; cursor: nesw-resize; }
-.ov-h-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
-.ov-h-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+.ov-h-nw { left: -18px; top: -18px; cursor: nwse-resize; }
+.ov-h-ne { right: -18px; top: -18px; cursor: nesw-resize; }
+.ov-h-sw { left: -18px; bottom: -18px; cursor: nesw-resize; }
+.ov-h-se { right: -18px; bottom: -18px; cursor: nwse-resize; }
 #ov-anim-badge { display: none; font-size: 12px; color: var(--ok); margin-left: 8px; }
 </style>
 </head>
@@ -247,7 +251,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="i-ascii-p"><label for="i-ascii-p">中文态英文标点</label></div>
       <div class="checkline"><input type="checkbox" id="i-dunhao"><label for="i-dunhao">/=顿时直出，屏蔽码表内/相关内容</label></div>
       <div class="checkline"><input type="checkbox" id="i-bdunhao"><label for="i-bdunhao" title="勾选：空态按 \ 直接上屏「、」；不勾（默认）：打 \ 弹「、」候选，空格确认">\=顿号直出</label></div>
-      <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：按 ; 弹出候选，1选「：」2选「；」，;+空格=：、;;=；直上，;xx 快符可用；不勾：按一下 ; 直接上屏「；」（有编码时首选上屏+「；」），不再作引导键">;=冒号分号候选<span class="sub">（关=直出；）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：按 ; 弹出候选，1选「：」2选「；」，;+空格=：、;;=；直上，;xx 快符可用；不勾：无候选时按 ; 直接上屏「；」（有编码且无候选时首选上屏+「；」），; 仍可当选重键，不再作引导键">;=冒号分号候选<span class="sub">（关=直出；不影响选重）</span></label></div>
       <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
     </div>
     <h3>候选</h3>
@@ -1724,7 +1728,9 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
   wrapEl.addEventListener("pointerdown", e => {
     if (!OV.img) return;
     const c = ovEnsureCfg();
-    const hc = e.target.dataset ? e.target.dataset.c : null;
+    // ::after 命中垫上的点击 target=垫的宿主手柄 span；closest 兜底
+    const hcEl = e.target.closest ? e.target.closest(".ov-h") : null;
+    const hc = hcEl ? hcEl.dataset.c : (e.target.dataset ? e.target.dataset.c : null);
     if (hc) {
       mode = "resize"; corner = hc;
       grab = { y: e.clientY, h: c.base_height || 240 };
