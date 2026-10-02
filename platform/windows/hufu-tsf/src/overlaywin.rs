@@ -552,6 +552,7 @@ impl OverlayWin {
     unsafe fn destroy(&mut self) {
         if self.hwnd != 0 {
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_TIMER_ID);
+            let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
             let _ = DestroyWindow(HWND(self.hwnd as *mut _));
             self.hwnd = 0;
         }
@@ -693,14 +694,25 @@ unsafe extern "system" fn overlay_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == crate::candwin2::WM_APP_HIDE_CAND {
-        let _ = KillTimer(hwnd, OVERLAY_TIMER_ID);
-        let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
-        let _ = ShowWindow(hwnd, SW_HIDE);
+        // 广播清场(hide_all_cand_windows 扫尸)也会命中本窗——但延时
+        // 消失语义下不能立即收:转为 hide_for 同款「挂钟延时」。
+        // (本消息此前无条件 SW_HIDE+杀双钟——用户实测「勾了延时消失、
+        // 消失前切应用就永不消失」的根因正是切换路径的 hide_all 广播
+        // 到本窗把延时钟杀掉、窗口却又被下面 sync/ULW 留在屏上)
         let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = list
             .iter_mut()
             .find(|e| e.ov.as_ref().is_some_and(|o| o.hwnd == hwnd.0 as isize))
         {
+            let delay = entry.cfg.as_ref().map(|c| c.hide_delay_ms).unwrap_or(0);
+            if delay > 0 {
+                // 保留播放钟(呼吸);挂延时钟,到点由 hide 钟无条件收窗
+                let _ = SetTimer(hwnd, OVERLAY_HIDE_TIMER_ID, delay.min(10_000), None);
+                return LRESULT(0);
+            }
+            let _ = KillTimer(hwnd, OVERLAY_TIMER_ID);
+            let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
+            let _ = ShowWindow(hwnd, SW_HIDE);
             entry.shown = false;
             entry.drawn = None;
             entry.timer_armed = false;
@@ -710,7 +722,10 @@ unsafe extern "system" fn overlay_wndproc(
         return LRESULT(0);
     }
     if msg == 0x0113 && wparam.0 as usize == OVERLAY_HIDE_TIMER_ID {
-        // 延时消失到点:候选窗仍藏着才收(候选窗重现则 sync_for 已撤钟)
+        // 延时消失到点:无条件收窗。候选窗若已重现,它的 sync_for 会重新
+        // SWP_SHOWWINDOW 显示并撤本钟——先查可见性会与跨线程 sync 竞态
+        // (用户实测「消失前切到别的应用就不消失」:切换路径候选窗藏着
+        // 但 IsWindowVisible 误报/竞态漏收,挂件永久滞留)
         let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
         let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = list
@@ -718,21 +733,14 @@ unsafe extern "system" fn overlay_wndproc(
             .find(|e| e.ov.as_ref().is_some_and(|o| o.hwnd == hwnd.0 as isize))
         {
             entry.hide_at = None;
-            let cand = entry.cand;
-            drop(list);
-            let cand_h = HWND(cand as *mut _);
-            if !IsWindowVisible(cand_h).as_bool() {
-                let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(entry) = list.iter_mut().find(|e| e.cand == cand) {
-                    if let Some(ov) = entry.ov.as_mut() {
-                        let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
-                        let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
-                    }
-                    entry.shown = false;
-                    entry.timer_armed = false;
-                    entry.frame_idx = 0;
-                }
+            if let Some(ov) = entry.ov.as_mut() {
+                let h = HWND(ov.hwnd as *mut _);
+                let _ = KillTimer(h, OVERLAY_TIMER_ID);
+                let _ = ShowWindow(h, SW_HIDE);
             }
+            entry.shown = false;
+            entry.timer_armed = false;
+            entry.frame_idx = 0;
         }
         return LRESULT(0);
     }
@@ -834,13 +842,12 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         }
         return;
     }
-    // 候选窗重现 → 撤销延时收窗(hide 钟作废)
-    if entry.hide_at.is_some() {
-        if let Some(ov) = entry.ov.as_ref() {
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
-        }
-        entry.hide_at = None;
+    // 候选窗重现 → 撤销延时收窗(hide 钟作废)。不依赖 hide_at 标志:
+    // 广播路径(WM_APP_HIDE 转挂钟)不设 hide_at,无条件杀一次钟最稳。
+    if let Some(ov) = entry.ov.as_ref() {
+        let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
     }
+    entry.hide_at = None;
     let Some(cfg) = entry.cfg.clone() else {
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
