@@ -5,6 +5,7 @@
 //! Windows: DWM Acrylic/Mica + DirectComposition；macOS: NSVisualEffectView。
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 
 /// RGBA 颜色（serde 兼容 0xAABBGGRR 整数与 #RRGGBBAA 字符串）。
@@ -355,6 +356,116 @@ impl Default for Layout {
     }
 }
 
+/// 候选窗贴图挂件（兄弟窗，一期静态图）。image 为成品图 data-URL：
+/// 裁剪/抠图/圆角/羽化已在设置页烤进 PNG，这里只存运行时布局参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayConfig {
+    pub enabled: bool,
+    /// 成品图，`data:image/png;base64,…`；空串 = 未设置
+    pub image: String,
+    /// 贴边方向：left / right
+    pub side: String,
+    /// 贴图逻辑高度（px @96DPI），渲染端乘 DPI
+    pub base_height: u32,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    /// 与候选框内容盒的间距
+    pub gap: i32,
+    /// 运行时水平翻转（换贴边方向时立绘朝向不动）
+    pub flip_h: bool,
+    /// 与候选框重叠时的层级：below=被候选框压住（默认）/ above=盖住候选框
+    pub layer: String,
+    /// 0-100，100=原样
+    pub opacity: u8,
+    /// 垂直对齐：center / top / bottom（相对候选框内容盒）
+    pub v_align: String,
+    /// 动图处理参数；None = image 已是烤好的静态 PNG（一期路径）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proc: Option<OverlayProc>,
+    /// 延时消失（毫秒）：0 = 候选窗一收挂件立即收（默认）；
+    /// >0 = 候选窗收起后挂件停留该时长再隐藏（200-2000）
+    #[serde(default)]
+    pub hide_delay_ms: u32,
+    /// 命名保存的整套配置（图片+处理参数+贴法+延时），设置页下拉切换
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presets: Vec<Value>,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        OverlayConfig {
+            enabled: false,
+            image: String::new(),
+            side: "right".into(),
+            base_height: 240,
+            offset_x: 0,
+            offset_y: 0,
+            gap: 8,
+            flip_h: false,
+            layer: "below".into(),
+            opacity: 100,
+            v_align: "center".into(),
+            proc: None,
+            hide_delay_ms: 0,
+            presets: Vec::new(),
+        }
+    }
+}
+
+impl OverlayConfig {
+    /// 渲染端安全读取：字段缺失/非法值回落默认，非法枚举不 panic。
+    pub fn side_is_left(&self) -> bool {
+        self.side == "left"
+    }
+    pub fn layer_is_above(&self) -> bool {
+        self.layer == "above"
+    }
+    pub fn opacity_factor(&self) -> f32 {
+        (self.opacity.min(100) as f32) / 100.0
+    }
+    /// 有效贴图高度：0/异常值回落默认 240。
+    pub fn effective_height(&self) -> f32 {
+        if self.base_height > 0 && self.base_height <= 4096 {
+            self.base_height as f32
+        } else {
+            240.0
+        }
+    }
+}
+
+/// 动图处理参数：动图走「原图 data-URL + 本参数」路径（设置页不烤成品，
+/// 渲染端逐帧套同样的处理管线）；静态图无此节 = image 已是烤好的 PNG。
+/// 处理口径与设置页 JS 管线逐式一致（裁剪→缩放→抠图→圆角/羽化 SDF）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayProc {
+    /// 源图裁剪区 [x, y, w, h]（源图像素）；None = 全图
+    pub crop: Option<[u32; 4]>,
+    /// 抠图键色 RGB；None = 不抠
+    pub key: Option<[u8; 3]>,
+    pub tol: u32,
+    /// 圆角/羽化（240px 输出高基准）
+    pub corner: u32,
+    pub feather: u32,
+    pub src_w: u32,
+    pub src_h: u32,
+}
+
+impl Default for OverlayProc {
+    fn default() -> Self {
+        OverlayProc {
+            crop: None,
+            key: None,
+            tol: 30,
+            corner: 0,
+            feather: 0,
+            src_w: 0,
+            src_h: 0,
+        }
+    }
+}
+
 /// 一套皮肤。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -366,8 +477,10 @@ pub struct Skin {
     pub colors: Colors,
     pub layout: Layout,
     pub material: MaterialConfig,
+    /// 贴图挂件；None/缺字段 = 老皮肤零感知，序列化时省略保持文件干净
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlayConfig>,
 }
-
 impl Default for Skin {
     fn default() -> Self {
         Skin {
@@ -378,6 +491,7 @@ impl Default for Skin {
             colors: Colors::default(),
             layout: Layout::default(),
             material: MaterialConfig::default(),
+            overlay: None,
         }
     }
 }

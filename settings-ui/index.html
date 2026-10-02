@@ -156,13 +156,18 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace; font-size: 12.5px; }
 .candtest-out { font-size: 15px; line-height: 2; }
 .candtest-out b { color: var(--acc); font-weight: 600; }
-/* 挂件预览交互：图片可拖拽定位 + 四角手柄/滚轮缩放 */
+/* 候选挂件预览交互：图片可拖拽定位 + 四角手柄/滚轮缩放。
+   拉伸修复 2026-10-03：canvas 的 CSS width:auto 回退到 attribute 宽度
+   （ovProcess 的像素缓冲宽，与 base_height 展示高无关）→ 纵横比随 buffer
+   尺寸漂移=横向拉伸/压缩。改为 height:100% + aspect-ratio:attr 比——
+   宽度永远按「当前图像缓冲宽高比 × 显示高」计算，比例恒真 */
 #ov-imgwrap { position: relative; display: inline-block; line-height: 0; cursor: move; }
-#ov-imgwrap canvas { display: block; pointer-events: none; height: 100%; width: auto; }
+#ov-imgwrap canvas { display: block; pointer-events: none; height: 100%; width: auto; aspect-ratio: attr(width) / attr(height); }
 #ov-imgwrap .ov-h { position: absolute; width: 14px; height: 14px; border-radius: 4px;
   background: var(--acc); border: 2px solid #17181c; opacity: .85; z-index: 2;
   transition: box-shadow .15s; }
-#ov-imgwrap:hover .ov-h, #ov-imgwrap.ov-dragging .ov-h { opacity: 1; box-shadow: 0 0 0 3px rgba(255,215,94,.25); }
+/* 手柄常显（用户实测「hover 才出=完全找不到」；悬浮高亮仅加光晕） */
+#ov-imgwrap.ov-dragging .ov-h, #ov-imgwrap:hover .ov-h { opacity: 1; box-shadow: 0 0 0 3px rgba(255,215,94,.25); }
 .ov-h-nw { left: -7px; top: -7px; cursor: nwse-resize; }
 .ov-h-ne { right: -7px; top: -7px; cursor: nesw-resize; }
 .ov-h-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
@@ -177,7 +182,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="input">输入与候选</a>
   <a data-tab="sentence">整句模型</a>
   <a data-tab="skin">皮肤</a>
-  <a data-tab="overlay">挂件</a>
+  <a data-tab="overlay">候选挂件</a>
   <a data-tab="user">用户词</a>
   <a data-tab="data">导入导出</a>
   <div class="spacer"></div>
@@ -438,8 +443,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
 
   <!-- ════ 挂件（候选窗贴图，兄弟窗）════ -->
   <section id="tab-overlay">
-    <h2>挂件<span class="en">Buddy</span></h2>
-    <div class="sub">候选窗旁跟随一张立绘/挂件图（兄弟窗实现，全程鼠标穿透，不影响打字）。参数随当前皮肤保存：贴法改动即存即生效；图片处理在左侧实时预览，满意后「烤成品」写入皮肤（候选窗下一帧生效，≤2.5s）。</div>
+    <h2>候选挂件<span class="en">Buddy</span></h2>
+    <div class="sub">候选窗旁跟随一张立绘/挂件图（兄弟窗实现，全程鼠标穿透，不影响打字）。所有改动（选图、裁剪、抠图、贴法）即存即生效，候选窗下一帧就能看到（≤2.5s）。可把整套参数存成多个配置随时切换。</div>
     <div class="row" style="margin-bottom:14px">
       <div class="checkline"><input type="checkbox" id="ov-en"><label for="ov-en">启用挂件</label></div>
       <label class="checkline" style="gap:12px">
@@ -475,6 +480,11 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>间距 <span class="val" id="ov-gap-v"></span></label><input type="range" id="ov-gap" min="-400" max="600" step="2" title="与候选框的间距；负数=重叠（拖图可代替）"></div>
           <div class="field"><label>不透明度 <span class="val" id="ov-op-v"></span></label><input type="range" id="ov-op" min="5" max="100" step="5"></div>
         </div>
+        <div class="row">
+          <div class="checkline"><input type="checkbox" id="ov-linger"><label for="ov-linger">延时消失</label></div>
+          <div class="field" id="ov-linger-row" style="display:none"><label>延迟 <span class="val" id="ov-linger-v"></span> s</label><input type="range" id="ov-linger-ms" min="0.2" max="2" step="0.1"></div>
+          <span class="sub" style="align-self:center">不勾选=候选框一消失挂件立即消失；勾选后按延迟时间收起</span>
+        </div>
         <h3>图片处理 <span class="sub" style="font-weight:400">（处理台上拖框裁剪；抠图先点「取背景色」再点图上背景处）</span></h3>
         <div class="row" style="align-items:flex-start">
           <canvas id="ov-work" width="320" height="280" style="border:1px solid var(--line);border-radius:10px;background:repeating-conic-gradient(#2a2c33 0 25%, #22242a 0 50%) 0 0/16px 16px;cursor:crosshair;flex-shrink:0"></canvas>
@@ -498,8 +508,11 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           </div>
         </div>
         <div class="row" style="margin-top:10px">
-          <button id="ov-bake" class="primary">烤成品并保存到皮肤</button>
-          <span class="sub" id="ov-bakehint" style="align-self:center">裁剪/抠图/圆角/羽化满意后点此烘焙写入皮肤；贴法参数改动即存、无需烘焙。</span>
+          <div class="field"><label>配置切换</label>
+            <select id="ov-preset-sel" style="min-width:150px" title="已保存的挂件配置；选择即整套应用（图片、位置、全部参数）"><option value="">— 未保存配置 —</option></select>
+            <button id="ov-preset-save" title="把当前图片与全部参数存为一个配置">保存为配置…</button>
+            <button id="ov-preset-del" title="删除当前选中的配置">删除</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1386,7 +1399,7 @@ async function loadSkinList(sel) {
 }
 async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
-  bindSkin(); buildColorGrid(); ovBindSkin();
+  bindSkin(); buildColorGrid(); ovBindSkin(); ovPresetsRefresh();
   // 选中即切换为当前皮肤（select 端点不写皮肤文件，避免覆盖）
   try { await api("POST", "/api/skin/select", { id }); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
   // 双保险重绘：同步一次 + 下一帧再一次（个别浏览器 select 切换后
@@ -1416,8 +1429,7 @@ const OV = {
 const ovEnsureCfg = () => {
   if (!SKIN.overlay) SKIN.overlay = { enabled: false, image: "", side: "right", base_height: 240, offset_x: 0, offset_y: 0, gap: 8, flip_h: false, layer: "below", opacity: 100, v_align: "center" };
   return SKIN.overlay;
-};
-let _ovSaveT = null;
+};let _ovSaveT = null;
 const ovSaveDeb = () => { clearTimeout(_ovSaveT); _ovSaveT = setTimeout(() => { saveSkin().catch(e => msg("皮肤保存失败：" + e.message, "err")); }, 400); };
 const ovSetR = (id, v) => { const el = $(id); if (el) el.value = v; const lab = $(id + "-v"); if (lab) lab.textContent = v; };
 
@@ -1431,6 +1443,14 @@ function ovBindSkin() {
   ovSetR("#ov-op", c.opacity ?? 100);
   ovSetR("#ov-tol", OV.tol); ovSetR("#ov-corner", OV.corner); ovSetR("#ov-feather", OV.feather);
   $("#ov-flip").checked = !!c.flip_h;
+  // 延时消失回填
+  {
+    const ms = c.hide_delay_ms || 0;
+    $("#ov-linger").checked = ms > 0;
+    $("#ov-linger-ms").value = Math.min(2, Math.max(0.2, ms / 1000 || 0.5)).toFixed(1);
+    $("#ov-linger-row").style.display = ms > 0 ? "" : "none";
+    $("#ov-linger-v").textContent = (ms > 0 ? ms / 1000 : 0.5).toFixed(1);
+  }
   OV.phase = "idle"; OV.animPos = 0;
   // 皮肤里已有挂件 → 载入：动图(proc 节)=原图+参数；静态=烤成品 PNG
   if (c.image && !OV.img) {
@@ -1623,20 +1643,42 @@ function ovMock() {
     `<div class="cand-line" style="background:${cut(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius ?? 6}px;padding:${L.hilite_padding ?? 4}px;color:${cut(c.hilited_candidate_text_color)}"><span class="idx" style="color:${cut(c.hilited_candidate_label_color)}">1.</span>我们 <span class="cmt" style="color:${cut(c.hilited_comment_text_color)}">wǒ men</span></div>` +
     `<div class="cand-line" style="padding:${L.hilite_padding ?? 4}px 1px;color:${cut(c.candidate_text_color)}"><span class="idx" style="color:${cut(c.label_color)}">2.</span>我 <span class="cmt" style="color:${cut(c.comment_text_color)}">wǒ</span></div>`;
 }
-/* ── 挂件事件绑定（一次） ── */
+/* ── 候选挂件：即存管线 ──
+   所有改动（选图、裁剪、抠图、圆角/羽化、翻转）都直接写
+   SKIN.overlay = { 原图 data-URL + proc 处理参数 }，防抖 400ms 存皮肤 →
+   server bump skin_ver → DLL 秒级重拉逐帧套同一管线。
+   原「烤成品」PNG 路径已退役：静态/动图统一走原图+参数，
+   dll 侧 process_frame 两条路径本就同式。 */
+const ovPersist = () => {
+  const cfg = ovEnsureCfg();
+  if (!OV.img || !OV.dataUrl) { cfg.image = ""; cfg.proc = null; }
+  else {
+    if (OV.dataUrl.length > 11_000_000) { msg("图片文件过大（>8MB），请精简", "err"); return false; }
+    cfg.image = OV.dataUrl;
+    cfg.proc = {
+      crop: OV.crop ? [Math.round(OV.crop.x), Math.round(OV.crop.y), Math.round(OV.crop.w), Math.round(OV.crop.h)] : null,
+      key: OV.key ? [Math.round(OV.key.r), Math.round(OV.key.g), Math.round(OV.key.b)] : null,
+      tol: OV.tol, corner: OV.corner, feather: OV.feather,
+      src_w: OV.img.naturalWidth, src_h: OV.img.naturalHeight,
+    };
+  }
+  cfg.enabled = $("#ov-en").checked;
+  ovSaveDeb();
+  return true;
+};
 $("#ov-pick").onclick = () => $("#ov-file").click();
 $("#ov-file").onchange = ev => {
   const f = ev.target.files[0]; if (!f) return;
   const rd = new FileReader();
-  rd.onload = () => ovLoadFromDataUrl(rd.result, f.name, false);
+  rd.onload = () => { ovLoadFromDataUrl(rd.result, f.name, false); if (ovPersist()) msg(`已载入并生效 ✓ ${f.name}`, "ok"); };
   rd.onerror = () => msg("图片读取失败", "err");
   rd.readAsDataURL(f);
   ev.target.value = "";
 };
 $("#ov-en").onchange = () => {
   const c = ovEnsureCfg(); c.enabled = $("#ov-en").checked;
-  if (c.enabled && !c.image) msg("启用成功——先「烤成品」写入图片才会显示", "");
-  else msg(c.enabled ? "挂件已启用 ✓（打字即见，≤2.5s）" : "挂件已关闭", "ok");
+  if (c.enabled && !c.image) msg("启用成功——选择图片后自动生效", "");
+  else msg(c.enabled ? "候选挂件已启用 ✓（打字即见，≤2.5s）" : "候选挂件已关闭", "ok");
   saveSkin().catch(e => msg("保存失败：" + e.message, "err"));
 };
 const ovLayR = (id, key) => {
@@ -1652,6 +1694,18 @@ const ovSel = (id, key) => {
 };
 ovSel("#ov-side", "side"); ovSel("#ov-layer", "layer"); ovSel("#ov-valign", "v_align");
 $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip").checked; ovPreview(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+/* 延时消失：不勾=0（候选框一收挂件立即收）；勾选 0.2–2s 由滑杆决定 */
+{
+  const syncLinger = () => {
+    const c = ovEnsureCfg();
+    c.hide_delay_ms = $("#ov-linger").checked ? Math.round(parseFloat($("#ov-linger-ms").value) * 1000) : 0;
+    $("#ov-linger-row").style.display = $("#ov-linger").checked ? "" : "none";
+    $("#ov-linger-v").textContent = (c.hide_delay_ms / 1000).toFixed(1);
+  };
+  $("#ov-linger").onchange = () => { syncLinger(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+  $("#ov-linger-ms").oninput = () => { syncLinger(); ovSaveDeb(); };
+  window.__ovSyncLinger = syncLinger;
+}
 /* 预览直接 manipulation：拖图=定位（自动换贴边/改间距/垂直微调），
    右下手柄或滚轮=改高度；松手/滚轮防抖保存 → skin_ver → DLL 秒级生效 */
 {
@@ -1712,7 +1766,6 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
         : c.v_align === "bottom" ? (mr.bottom - rr.top) - h
         : (mr.top - rr.top) + mr.height / 2 - h / 2;
       c.offset_y = Math.min(1000, Math.max(-1000, Math.round(top - alignedTop)));
-      ovSetR("#ov-oy", c.offset_y);
       // 回 flex 常规布局
       wrapEl.style.position = ""; wrapEl.style.left = ""; wrapEl.style.top = "";
       ovApplyLayout();
@@ -1777,21 +1830,22 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
     const p = toSrc(e); if (!p) return;
     OV.crop = clampRatio(OV.drag.x0, OV.drag.y0, p.x, p.y);
     ovRenderWork();
-    if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); });
+    if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); ovPersist(); });
   });
   cv.addEventListener("pointerup", () => {
     if (!OV.drag) return;
     OV.drag = null;
     if (OV.crop && (OV.crop.w < 4 || OV.crop.h < 4)) OV.crop = null; // 点一下=无框
     ovRenderWork();
+    ovPersist();
   });
 }
 $("#ov-ratio").onchange = () => { OV.ratio = $("#ov-ratio").value; };
 $("#ov-crop-apply").onclick = () => {
   if (!OV.crop) return msg("先在处理台上拖出裁剪框", "err");
-  msg(`裁剪已应用（${Math.round(OV.crop.w)}×${Math.round(OV.crop.h)}）——左侧预览同步`, "ok"); ovPreview();
+  msg(`裁剪已生效（${Math.round(OV.crop.w)}×${Math.round(OV.crop.h)}）`, "ok"); ovPersist();
 };
-$("#ov-crop-reset").onclick = () => { OV.crop = null; ovRenderWork(); ovPreview(); msg("裁剪已还原", "ok"); };
+$("#ov-crop-reset").onclick = () => { OV.crop = null; ovRenderWork(); ovPreview(); ovPersist(); msg("裁剪已还原", "ok"); };
 $("#ov-crop-auto").onclick = () => {
   if (!OV.img) return msg("先选择图片", "err");
   const c0 = OV.crop;
@@ -1815,7 +1869,7 @@ $("#ov-crop-auto").onclick = () => {
   }
   if (x1 < 0) return msg("没找到内容（背景判断失败，试试调容差）", "err");
   OV.crop = { x: sx + x0 / sc, y: sy + y0 / sc, w: (x1 - x0 + 1) / sc, h: (y1 - y0 + 1) / sc };
-  ovRenderWork(); ovPreview();
+  ovRenderWork(); ovPreview(); ovPersist();
   msg(`已自动裁到内容（${Math.round(OV.crop.w)}×${Math.round(OV.crop.h)}）`, "ok");
 };
 $("#ov-key-pick").onclick = () => {
@@ -1823,9 +1877,9 @@ $("#ov-key-pick").onclick = () => {
   OV.picking = true; $("#ov-work").style.cursor = "cell";
   msg("取色模式：在处理台上点一下背景处", "");
 };
-$("#ov-key-clear").onclick = () => { OV.key = null; OV.picking = false; $("#ov-work").style.cursor = "crosshair"; ovPreview(); msg("抠图已取消", "ok"); };
+$("#ov-key-clear").onclick = () => { OV.key = null; OV.picking = false; $("#ov-work").style.cursor = "crosshair"; ovPreview(); ovPersist(); msg("抠图已取消", "ok"); };
 const ovFxR = (id, key) => {
-  $(id).oninput = () => { OV[key] = parseFloat($(id).value); $(id + "-v").textContent = $(id).value; if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); }); };
+  $(id).oninput = () => { OV[key] = parseFloat($(id).value); $(id + "-v").textContent = $(id).value; if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); ovPersist(); }); };
 };
 ovFxR("#ov-tol", "tol"); ovFxR("#ov-corner", "corner"); ovFxR("#ov-feather", "feather");
 /* 上屏反应段:参数即存即生效(播放参数,无需烤成品) */
@@ -1836,39 +1890,54 @@ const ovNum = (id, key, cast) => {
     ovSaveDeb(); ovPreview();
   };
 }
-$("#ov-bake").onclick = async () => {
-  if (!OV.img) return msg("先选择图片", "err");
-  const cfg = ovEnsureCfg();
-  cfg.enabled = $("#ov-en").checked;
-  if (OV.anim) {
-    // 动图：存原图 data-URL + 处理参数（dll 逐帧套同一管线播放），
-    // 烤成逐帧 PNG 体积不可行（无压缩编码器），见 overlaywin 路径②
-    if ((OV.dataUrl || "").length > 11_000_000) return msg("动图文件过大（>8MB），请精简后再挂", "err");
-    cfg.image = OV.dataUrl;
-    cfg.proc = {
-      crop: OV.crop ? [Math.round(OV.crop.x), Math.round(OV.crop.y), Math.round(OV.crop.w), Math.round(OV.crop.h)] : null,
-      key: OV.key ? [Math.round(OV.key.r), Math.round(OV.key.g), Math.round(OV.key.b)] : null,
-      tol: OV.tol, corner: OV.corner, feather: OV.feather,
-      src_w: OV.img.naturalWidth, src_h: OV.img.naturalHeight,
-    };
-    try {
-      await saveSkin();
-      $("#ov-fileinfo").textContent = `${OV.name} → 动图 ${OV.anim.bitmaps.length} 帧（原图+参数）`;
-      msg("动图已写入皮肤 ✓ 打字即见逐帧播放（≤2.5s）", "ok");
-    } catch (e) { msg("保存失败：" + e.message, "err"); }
-    return;
-  }
-  // 静态图：烤成品 PNG
-  const maxH = Math.min(1200, Math.max(240, (cfg.base_height || 240) * 2));
-  const cv = document.createElement("canvas");
-  if (!ovProcess(cv, maxH)) return msg("处理失败（裁剪区过小？）", "err");
-  cfg.image = cv.toDataURL("image/png");
-  cfg.proc = null;
-  try {
-    await saveSkin();
-    $("#ov-fileinfo").textContent = `${OV.name} → 成品 ${cv.width}×${cv.height}`;
-    msg("成品已写入皮肤 ✓ 打字即见（≤2.5s）", "ok");
-  } catch (e) { msg("保存失败：" + e.message, "err"); }
+/* ── 配置（presets）：整套挂件参数（图+处理+贴法+延时）命名保存/切换 ── */
+const ovPresetKeys = ["enabled", "image", "side", "base_height", "offset_x", "offset_y", "gap", "flip_h", "layer", "opacity", "v_align", "hide_delay_ms"];
+function ovPresetsRefresh(selName) {
+  const s = $("#ov-preset-sel");
+  const list = (SKIN.overlay && SKIN.overlay.presets) || [];
+  const cur = selName !== undefined ? selName : s.value;
+  s.innerHTML = '<option value="">— 未保存配置 —</option>' +
+    list.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  s.value = list.some(p => p.name === cur) ? cur : "";
+}
+$("#ov-preset-save").onclick = async () => {
+  if (!OV.img && !(SKIN.overlay && SKIN.overlay.image)) return msg("先选择图片再保存配置", "err");
+  ovPersist();
+  const name = prompt("配置名称：", "");
+  if (!name || !name.trim()) return;
+  const c = ovEnsureCfg();
+  c.presets = c.presets || [];
+  const snap = { name: name.trim() };
+  for (const k of ovPresetKeys) snap[k] = c[k];
+  if (c.proc) snap.proc = JSON.parse(JSON.stringify(c.proc)); // 处理参数一并快照
+  const ex = c.presets.findIndex(p => p.name === snap.name);
+  if (ex >= 0) c.presets[ex] = snap; else c.presets.push(snap);
+  try { await saveSkin(); ovPresetsRefresh(snap.name); msg(`配置「${snap.name}」已保存 ✓`, "ok"); }
+  catch (e) { msg("保存失败：" + e.message, "err"); }
+};
+$("#ov-preset-sel").onchange = async () => {
+  const name = $("#ov-preset-sel").value;
+  if (!name) return;
+  const c = ovEnsureCfg();
+  const p = (c.presets || []).find(x => x.name === name);
+  if (!p) return;
+  for (const k of ovPresetKeys) if (k in p) c[k] = p[k];
+  // 处理参数回落 OV 状态并重载图
+  OV.crop = p.proc && p.proc.crop ? { x: p.proc.crop[0], y: p.proc.crop[1], w: p.proc.crop[2], h: p.proc.crop[3] } : null;
+  OV.key = p.proc && p.proc.key ? { r: p.proc.key[0], g: p.proc.key[1], b: p.proc.key[2] } : null;
+  OV.tol = p.proc ? (p.proc.tol ?? 30) : 30; OV.corner = p.proc ? (p.proc.corner ?? 0) : 0; OV.feather = p.proc ? (p.proc.feather ?? 0) : 0;
+  OV.img = null; OV.anim = null; OV.dataUrl = "";
+  // proc 快照也要带进 preset（ovPresetKeys 之外单存）
+  try { await saveSkin(); msg(`已切换到配置「${name}」✓`, "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
+  ovBindSkin(); // 载入 image/proc 并回填全部控件（含延时滑杆）
+};
+$("#ov-preset-del").onclick = async () => {
+  const name = $("#ov-preset-sel").value;
+  if (!name) return msg("先在下拉里选中要删的配置", "err");
+  const c = ovEnsureCfg();
+  c.presets = (c.presets || []).filter(p => p.name !== name);
+  try { await saveSkin(); ovPresetsRefresh(); msg(`配置「${name}」已删除`, "ok"); }
+  catch (e) { msg("删除失败：" + e.message, "err"); }
 };
 { // 深/浅底切换（与皮肤页同款）
   const wrap = $("#ov-wrap"), bd = $("#ov-pv-dark"), bl = $("#ov-pv-light");
