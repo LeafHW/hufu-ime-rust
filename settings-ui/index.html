@@ -156,6 +156,18 @@ th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace; font-size: 12.5px; }
 .candtest-out { font-size: 15px; line-height: 2; }
 .candtest-out b { color: var(--acc); font-weight: 600; }
+/* 挂件预览交互：图片可拖拽定位 + 四角手柄/滚轮缩放 */
+#ov-imgwrap { position: relative; display: inline-block; line-height: 0; cursor: move; }
+#ov-imgwrap canvas { display: block; pointer-events: none; height: 100%; width: auto; }
+#ov-imgwrap .ov-h { position: absolute; width: 14px; height: 14px; border-radius: 4px;
+  background: var(--acc); border: 2px solid #17181c; opacity: .85; z-index: 2;
+  transition: box-shadow .15s; }
+#ov-imgwrap:hover .ov-h, #ov-imgwrap.ov-dragging .ov-h { opacity: 1; box-shadow: 0 0 0 3px rgba(255,215,94,.25); }
+.ov-h-nw { left: -7px; top: -7px; cursor: nwse-resize; }
+.ov-h-ne { right: -7px; top: -7px; cursor: nesw-resize; }
+.ov-h-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+.ov-h-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+#ov-anim-badge { display: none; font-size: 12px; color: var(--ok); margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -165,6 +177,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="input">输入与候选</a>
   <a data-tab="sentence">整句模型</a>
   <a data-tab="skin">皮肤</a>
+  <a data-tab="overlay">挂件</a>
   <a data-tab="user">用户词</a>
   <a data-tab="data">导入导出</a>
   <div class="spacer"></div>
@@ -419,6 +432,75 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div style="display:flex;flex-direction:column;gap:8px">
         <button id="weasel-import">导入为皮肤</button>
         <button id="weasel-export">导出当前配色</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════ 挂件（候选窗贴图，兄弟窗）════ -->
+  <section id="tab-overlay">
+    <h2>挂件<span class="en">Buddy</span></h2>
+    <div class="sub">候选窗旁跟随一张立绘/挂件图（兄弟窗实现，全程鼠标穿透，不影响打字）。参数随当前皮肤保存：贴法改动即存即生效；图片处理在左侧实时预览，满意后「烤成品」写入皮肤（候选窗下一帧生效，≤2.5s）。</div>
+    <div class="row" style="margin-bottom:14px">
+      <div class="checkline"><input type="checkbox" id="ov-en"><label for="ov-en">启用挂件</label></div>
+      <label class="checkline" style="gap:12px">
+        <input type="file" id="ov-file" accept="image/*" style="display:none">
+        <button id="ov-pick">选择图片…</button>
+      </label>
+      <span class="sub" id="ov-fileinfo" style="align-self:center">未选图</span>
+      <span id="ov-anim-badge">🎞 动图</span>
+    </div>
+    <div class="skin-grid">
+      <div class="skin-preview-wrap" id="ov-wrap">
+        <div class="preview-tools">
+          <button id="ov-pv-dark" class="on">深色底</button>
+          <button id="ov-pv-light">浅色底</button>
+        </div>
+        <div class="preview-stage" style="display:flex;align-items:center;justify-content:center;height:auto;min-height:170px;padding:12px 0">
+          <div id="ov-row" style="display:flex;align-items:center;justify-content:center;width:100%;min-height:120px">
+            <span id="ov-imgwrap"><canvas id="ov-preview" width="10" height="10"></canvas><span class="ov-h ov-h-nw" data-c="nw" title="拖动改大小"></span><span class="ov-h ov-h-ne" data-c="ne" title="拖动改大小"></span><span class="ov-h ov-h-sw" data-c="sw" title="拖动改大小"></span><span class="ov-h ov-h-se" data-c="se" title="拖动改大小（滚轮也行）"></span></span>
+            <div id="ov-candmock"></div>
+          </div>
+        </div>
+        <div class="material-note" id="ov-note">直接拖图定位（跨过候选框自动换贴边）、四角金色手柄或滚轮改大小——松手即存即生效。</div>
+      </div>
+      <div style="flex:1;min-width:330px">
+        <h3>贴法（改动即存）</h3>
+        <div class="row">
+          <div class="field"><label>贴边</label><select id="ov-side" style="min-width:120px"><option value="right">候选框右侧</option><option value="left">候选框左侧</option></select></div>
+          <div class="field"><label>图层</label><select id="ov-layer" style="min-width:150px"><option value="below">图在下（被候选框压住）</option><option value="above">图在上（盖住候选框）</option></select></div>
+          <div class="field"><label>垂直对齐</label><select id="ov-valign" style="min-width:110px"><option value="center">居中</option><option value="top">顶对齐</option><option value="bottom">底对齐</option></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>高度 <span class="val" id="ov-bh-v"></span></label><input type="range" id="ov-bh" min="60" max="600" step="5" title="挂件显示高度（逻辑像素，随系统 DPI 缩放）；预览里也可直接拖手柄/滚轮调"></div>
+          <div class="field"><label>间距 <span class="val" id="ov-gap-v"></span></label><input type="range" id="ov-gap" min="-400" max="600" step="2" title="与候选框的间距；负数=重叠（拖图可代替）"></div>
+          <div class="field"><label>不透明度 <span class="val" id="ov-op-v"></span></label><input type="range" id="ov-op" min="5" max="100" step="5"></div>
+        </div>
+        <h3>图片处理 <span class="sub" style="font-weight:400">（处理台上拖框裁剪；抠图先点「取背景色」再点图上背景处）</span></h3>
+        <div class="row" style="align-items:flex-start">
+          <canvas id="ov-work" width="320" height="280" style="border:1px solid var(--line);border-radius:10px;background:repeating-conic-gradient(#2a2c33 0 25%, #22242a 0 50%) 0 0/16px 16px;cursor:crosshair;flex-shrink:0"></canvas>
+          <div style="display:flex;flex-direction:column;gap:8px;min-width:220px">
+            <div class="field"><label>裁剪比例</label><select id="ov-ratio" style="min-width:130px">
+              <option value="free">自由</option><option value="1">1:1</option><option value="2:3">2:3（竖）</option><option value="3:4">3:4（竖）</option><option value="9:16">9:16（竖屏）</option>
+            </select></div>
+            <div class="row" style="flex-wrap:wrap;gap:6px">
+              <button id="ov-crop-apply">应用裁剪</button>
+              <button id="ov-crop-auto">自动裁到内容</button>
+              <button id="ov-crop-reset">还原裁剪</button>
+            </div>
+            <div class="row" style="flex-wrap:wrap;gap:6px">
+              <button id="ov-key-pick">① 取背景色</button>
+              <button id="ov-key-clear">② 取消抠图</button>
+            </div>
+            <div class="field"><label>抠图容差 <span class="val" id="ov-tol-v"></span></label><input type="range" id="ov-tol" min="4" max="120" step="2"></div>
+            <div class="field"><label>圆角 <span class="val" id="ov-corner-v"></span></label><input type="range" id="ov-corner" min="0" max="120" step="2"></div>
+            <div class="field"><label>边缘羽化 <span class="val" id="ov-feather-v"></span></label><input type="range" id="ov-feather" min="0" max="80" step="2" title="边缘渐隐带宽（按 240px 高折算）；羽化自带圆角效果"></div>
+            <div class="checkline"><input type="checkbox" id="ov-flip"><label for="ov-flip">水平翻转（运行时，换贴边用）</label></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="ov-bake" class="primary">烤成品并保存到皮肤</button>
+          <span class="sub" id="ov-bakehint" style="align-self:center">裁剪/抠图/圆角/羽化满意后点此烘焙写入皮肤；贴法参数改动即存、无需烘焙。</span>
+        </div>
       </div>
     </div>
   </section>
@@ -1034,7 +1116,7 @@ function bindSkin() {
   }
   // rng("#mat-bw", ...) 已并入上方边框对齐块（真窗键 layout.border_width）
   $("#l-horiz").checked = SKIN.layout.horizontal; $("#l-horiz").onchange = e => { SKIN.layout.horizontal = e.target.checked; preview(); saveSkinQuiet(); msg(e.target.checked ? "已切换横排并保存皮肤 ✓（下次打字生效）" : "已切换竖排并保存皮肤 ✓", "ok"); };
-  $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; saveSkinQuiet(); };
+  $("#l-inline").checked = SKIN.layout.inline_preedit; $("#l-inline").onchange = e => { SKIN.layout.inline_preedit = e.target.checked; preview(); saveSkinQuiet(); };
   // 【2026-09-06 实时生效】布局滑杆（阴影/圆角/间距/字级/固定宽等）
   // 此前只改内存+预览图、无任何保存路径（用户实测「阴影大小不生效」
   // 根因）——现拖动防抖 400ms 自动存皮肤；server 保存即 bump 皮肤
@@ -1266,6 +1348,9 @@ function preview() {
     cand(1, "我们", "wǒ men", true) + cand(2, "我", "wǒ") + cand(3, "War", "") + cand(4, "我军", "");
   w.appendChild(inner);
   $("#material-note").textContent = `纯色 · 整体透明度 ${Math.round(ma * 100)}% · 高亮${M.hilite_on === false ? "关" : `开 · 高亮透明度 ${Math.round(ha * 100)}%`} · 文字恒不透明`;
+  // 挂件页的模拟候选框同步刷新（横排/竖排、编码行、配色、几何与皮肤
+  // 页同一真源——皮肤页任何改动即时联动，不用重开设置页）
+  if (typeof ovMock === "function") ovMock();
 }
 /* ── 真实屏幕背景：把实际屏幕作为预览底，透明度所见即所得 ── */
 {
@@ -1301,13 +1386,497 @@ async function loadSkinList(sel) {
 }
 async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
-  bindSkin(); buildColorGrid();
+  bindSkin(); buildColorGrid(); ovBindSkin();
   // 选中即切换为当前皮肤（select 端点不写皮肤文件，避免覆盖）
   try { await api("POST", "/api/skin/select", { id }); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
   // 双保险重绘：同步一次 + 下一帧再一次（个别浏览器 select 切换后
   // 首次重绘被合并掉——用户报「换皮肤预览不更新、动一下才变」）
   preview();
   requestAnimationFrame(() => preview());
+}
+
+/* ════ 挂件（候选窗贴图，兄弟窗）2026-10-02 ════
+   数据流：原图 →（裁剪/抠图/圆角/羽化 全客户端 canvas）→ 预览实时；
+   「烤成品」把处理结果烤成 PNG data-URL 写进 SKIN.overlay.image 走
+   既有 saveSkin 通道（server bump skin_ver → DLL 秒级重拉）。
+   贴法参数（side/height/gap/offset/layer/opacity/v_align/flip_h）不进
+   像素管线，改动即存即生效（与皮肤滑杆同款防抖）。 */
+const OV = {
+  img: null, name: "", basedOnBaked: false,
+  dataUrl: "", mime: "",   // 原文件 data-URL（动图烤成品走「原图+参数」路径）
+  anim: null,              // {bitmaps:[ImageBitmap], delays:[ms]} 动图帧
+  crop: null,              // {x,y,w,h} 源图像素；null=全图
+  ratio: "free",           // free | 1 | 2:3 | 3:4 | 9:16
+  key: null, tol: 30,      // 抠图键色 + 容差
+  corner: 0, feather: 0,   // 圆角/羽化（240px 高基准，运行时按实际高折算）
+  picking: false,          // 「取背景色」一次性取样模式
+  drag: null, view: null,  // 处理台拖拽状态 / 源图→画布映射
+  raf: 0, animPos: 0, animLast: 0, phase: "idle",
+};
+const ovEnsureCfg = () => {
+  if (!SKIN.overlay) SKIN.overlay = { enabled: false, image: "", side: "right", base_height: 240, offset_x: 0, offset_y: 0, gap: 8, flip_h: false, layer: "below", opacity: 100, v_align: "center" };
+  return SKIN.overlay;
+};
+let _ovSaveT = null;
+const ovSaveDeb = () => { clearTimeout(_ovSaveT); _ovSaveT = setTimeout(() => { saveSkin().catch(e => msg("皮肤保存失败：" + e.message, "err")); }, 400); };
+const ovSetR = (id, v) => { const el = $(id); if (el) el.value = v; const lab = $(id + "-v"); if (lab) lab.textContent = v; };
+
+function ovBindSkin() {
+  const c = ovEnsureCfg();
+  $("#ov-en").checked = !!c.enabled;
+  $("#ov-side").value = c.side === "left" ? "left" : "right";
+  $("#ov-layer").value = c.layer === "above" ? "above" : "below";
+  $("#ov-valign").value = ["center", "top", "bottom"].includes(c.v_align) ? c.v_align : "center";
+  ovSetR("#ov-bh", c.base_height || 240); ovSetR("#ov-gap", c.gap ?? 8);
+  ovSetR("#ov-op", c.opacity ?? 100);
+  ovSetR("#ov-tol", OV.tol); ovSetR("#ov-corner", OV.corner); ovSetR("#ov-feather", OV.feather);
+  $("#ov-flip").checked = !!c.flip_h;
+  OV.phase = "idle"; OV.animPos = 0;
+  // 皮肤里已有挂件 → 载入：动图(proc 节)=原图+参数；静态=烤成品 PNG
+  if (c.image && !OV.img) {
+    if (c.proc) {
+      const p = c.proc;
+      if (p.crop && p.crop[2] >= 2) OV.crop = { x: p.crop[0], y: p.crop[1], w: p.crop[2], h: p.crop[3] };
+      OV.key = p.key ? { r: p.key[0], g: p.key[1], b: p.key[2] } : null;
+      OV.tol = p.tol ?? 30; OV.corner = p.corner ?? 0; OV.feather = p.feather ?? 0;
+      ovSetR("#ov-tol", OV.tol); ovSetR("#ov-corner", OV.corner); ovSetR("#ov-feather", OV.feather);
+      ovLoadFromDataUrl(c.image, "（当前动图+参数）", true);
+    } else {
+      ovLoadFromDataUrl(c.image, "（当前成品图）", true);
+    }
+  }
+  ovMock(); ovPreview();
+}
+/* 载入 data-URL：统一走「解码→动图探测→首帧/帧序列」 */
+function ovLoadFromDataUrl(url, label, baked) {
+  const img = new Image();
+  img.onload = async () => {
+    OV.img = img; OV.name = label; OV.basedOnBaked = !!baked; OV.dataUrl = url;
+    OV.anim = null; OV.animPos = 0;
+    // 动图探测（Chromium ImageDecoder；不支持则静态首帧回退）
+    let anim = null;
+    if (typeof ImageDecoder !== "undefined") {
+      try {
+        const buf = await (await fetch(url)).arrayBuffer();
+        const mime = url.slice(5, url.indexOf(";")) || "image/gif";
+        const dec = new ImageDecoder({ data: buf, type: mime });
+        await dec.tracks.ready;
+        const tr = dec.tracks.selectedTrack;
+        if (tr && tr.frameCount > 1) {
+          const n = Math.min(tr.frameCount, 120);
+          const bitmaps = [], delays = [];
+          let lastTs = 0;
+          for (let i = 0; i < n; i++) {
+            const r = await dec.decode({ frameIndex: i });
+            bitmaps.push(await createImageBitmap(r.image));
+            const ms = i === 0 ? 100 : Math.round((r.image.timestamp - lastTs) / 1000);
+            delays.push(Math.min(1000, Math.max(20, ms || 100)));
+            lastTs = r.image.timestamp;
+            r.image.close();
+          }
+          anim = { bitmaps, delays };
+        }
+      } catch (e) { /* 解码失败→静态回退 */ }
+    }
+    OV.anim = anim; OV.phase = "idle"; OV.animPos = 0;
+    $("#ov-fileinfo").textContent = `${label} ${img.naturalWidth}×${img.naturalHeight}` + (anim ? `（动图 ${anim.bitmaps.length} 帧）` : "");
+    const badge = $("#ov-anim-badge"); if (badge) badge.style.display = anim ? "inline" : "none";
+    ovRenderWork();  ovPreview();
+    if (anim) ovAnimTick(0);
+  };
+  img.src = url;
+}
+/* 预览动图节拍：分段推进(呼吸循环/反应段一遍回呼吸)+啪加速,与 dll 同式 */
+/* 预览动图节拍:整段循环,按源帧时长推进(与 dll 同源) */
+function ovAnimTick(ts) {
+  if (!OV.anim) return;
+  let d = OV.anim.delays[OV.animPos % OV.anim.bitmaps.length] || 100;
+  if (!ts || ts - OV.animLast >= d) {
+    OV.animLast = ts || 0;
+    OV.animPos = (OV.animPos + 1) % OV.anim.bitmaps.length;
+    ovPreview();
+  }
+  requestAnimationFrame(ovAnimTick);
+}
+
+/* 处理管线：裁剪 → 翻转 → 抠图(软边) → 圆角/羽化(SDF) → 输出到 cv。
+   srcFrame=动图当前帧（ImageBitmap，尺寸与源图一致）；缺省=静态源图 */
+function ovProcess(cv, maxH, srcFrame) {
+  const img = OV.img; if (!img) return false;
+  const draw = srcFrame || img;
+  const c0 = OV.crop;
+  const sx = c0 ? c0.x : 0, sy = c0 ? c0.y : 0;
+  const sw = c0 ? c0.w : img.naturalWidth, sh = c0 ? c0.h : img.naturalHeight;
+  if (sw < 2 || sh < 2) return false;
+  const k = Math.min(1, maxH / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * k)), h = Math.max(1, Math.round(sh * k));
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  ctx.clearRect(0, 0, w, h);
+  if (ovEnsureCfg().flip_h) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(draw, sx, sy, sw, sh, 0, 0, w, h);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (!(OV.key || OV.corner > 0 || OV.feather > 0)) return true;
+  const id = ctx.getImageData(0, 0, w, h), d = id.data;
+  const key = OV.key, tol = OV.tol, soft = Math.max(6, tol * 0.35);
+  // 圆角/羽化按 240px 基准折算到当前输出高；SDF 半径取 max(圆角, 羽化)——
+  // 羽化自带圆润弧（纯羽化=软圆角矩形），圆角>羽化时羽化沿弧带渐隐
+  const rr = Math.max(OV.corner, OV.feather) * (h / 240);
+  const hard = OV.corner * (h / 240);
+  const f = OV.feather * (h / 240);
+  const halfW = w / 2, halfH = h / 2;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (d[i + 3] === 0) continue;
+      let a = d[i + 3];
+      if (key) {
+        const dist = Math.max(Math.abs(d[i] - key.r), Math.abs(d[i + 1] - key.g), Math.abs(d[i + 2] - key.b));
+        if (dist <= tol) { d[i + 3] = 0; continue; }
+        if (dist < tol + soft) a = a * (dist - tol) / soft;
+      }
+      if (rr > 0) {
+        const qx = Math.abs(x - halfW + 0.5) - halfW + rr;
+        const qy = Math.abs(y - halfH + 0.5) - halfH + rr;
+        const qxo = Math.max(qx, 0), qyo = Math.max(qy, 0);
+        const sd = Math.min(Math.max(qx, qy), 0) + Math.sqrt(qxo * qxo + qyo * qyo) - rr;
+        if (hard > 0 && sd >= 0) { d[i + 3] = 0; continue; }
+        if (f > 0) { let t = -sd / f; t = t < 0 ? 0 : t > 1 ? 1 : t; a *= t; }
+      }
+      d[i + 3] = a;
+    }
+  }
+  ctx.putImageData(id, 0, 0);
+  return true;
+}
+/* 处理台：源图适配绘制 + 裁剪框叠加 */
+function ovRenderWork() {
+  const cv = $("#ov-work"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!OV.img) { ctx.fillStyle = "#9a9aa0"; ctx.font = "13px sans-serif"; ctx.fillText("点「选择图片…」载入", 60, H / 2); OV.view = null; return; }
+  const iw = OV.img.naturalWidth, ih = OV.img.naturalHeight;
+  const k = Math.min((W - 8) / iw, (H - 8) / ih);
+  const dw = iw * k, dh = ih * k, ox = (W - dw) / 2, oy = (H - dh) / 2;
+  OV.view = { ox, oy, k, dw, dh };
+  ctx.drawImage(OV.img, ox, oy, dw, dh);
+  // 裁剪框外压暗 + 框线
+  const c = OV.crop;
+  const rx = c ? ox + c.x * k : ox, ry = c ? oy + c.y * k : oy;
+  const rw = c ? c.w * k : dw, rh = c ? c.h * k : dh;
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.beginPath();
+  ctx.rect(ox, oy, dw, dh);
+  ctx.rect(rx, ry, rw, rh);
+  ctx.fill("evenodd");
+  ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 1.5;
+  ctx.strokeRect(rx + 0.5, ry + 0.5, rw, rh);
+  ctx.restore();
+}
+/* 布局应用（纯 CSS，拖拽热路径零像素重渲染）：
+   高度=base_height（候选框 mock 即真实尺寸，所见即所得）、
+   间距/水平微调→左右 margin、垂直微调→translateY、透明度→opacity */
+function ovApplyLayout() {
+  const wrapEl = $("#ov-imgwrap"), cfg = SKIN.overlay || {};
+  const row = $("#ov-row"), mock = $("#ov-candmock");
+  if (!OV.img) { wrapEl.style.display = "none"; return; }
+  wrapEl.style.display = "";
+  wrapEl.style.opacity = Math.max(0.05, (cfg.opacity ?? 100) / 100);
+  // DOM 序：右贴=[候选框, 图]；左贴=[图, 候选框]。
+  // 间距语义与 dll 逐位对齐：offset_x 恒「向右为正」——
+  // 右贴视觉间距 = gap + offset_x（margin 落左侧）；左贴 = gap − offset_x（落右侧）
+  if (cfg.side === "left") { row.appendChild(wrapEl); row.appendChild(mock); }
+  else { row.appendChild(mock); row.appendChild(wrapEl); }
+  const gx = cfg.offset_x ?? 0;
+  wrapEl.style.marginLeft = "0px";
+  wrapEl.style.marginRight = "0px";
+  if (cfg.side === "left") wrapEl.style.marginRight = ((cfg.gap ?? 8) - gx) + "px";
+  else wrapEl.style.marginLeft = ((cfg.gap ?? 8) + gx) + "px";
+  wrapEl.style.height = (cfg.base_height || 240) + "px";
+  wrapEl.style.transform = "translateY(" + (cfg.offset_y ?? 0) + "px)";
+  row.style.alignItems = cfg.v_align === "top" ? "flex-start" : cfg.v_align === "bottom" ? "flex-end" : "center";
+}
+/* 预览：重渲染像素 + 套布局；拖拽中只走 ovApplyLayout 不重渲。
+   动图时渲染当前帧（ovAnimTick 节拍驱动） */
+function ovPreview() {
+  const cv = $("#ov-preview");
+  const frame = OV.anim ? OV.anim.bitmaps[OV.animPos % OV.anim.bitmaps.length] : null;
+  const ok = OV.img && ovProcess(cv, 560, frame);
+  if (!ok) $("#ov-imgwrap").style.display = "none";
+  ovApplyLayout();
+}
+/* 模拟候选框：按当前皮肤拼一个静态框（横排/竖排、编码内联跟随
+   layout.horizontal / layout.inline_preedit——与真实候选窗同源同状态） */
+function ovMock() {
+  if (!SKIN) return;
+  const c = SKIN.colors, L = SKIN.layout;
+  const cut = h => esc(String(h || "").slice(0, 7));
+  const m = $("#ov-candmock");
+  m.className = "candwin" + (L.horizontal ? " horizontal" : "");
+  // display/flex-direction 由 .candwin(.horizontal) class 提供（横排跟随
+  // 皮肤），内联样式只管皮肤化的颜色/几何——内联写死 flex-direction 会
+  // 压过 class 导致永远竖排（用户实测教训）
+  m.style.cssText = `background:${cut(c.back_color)};border:${(L.border_width ?? 1) > 0 ? (L.border_width ?? 1) + "px solid " + cut(c.border_color) : "none"};border-radius:${L.corner_radius ?? 8}px;padding:${L.margin_y ?? 6}px ${L.margin_x ?? 8}px;gap:${L.candidate_spacing ?? 4}px;box-shadow:0 4px 14px rgba(0,0,0,0.3)`;
+  m.innerHTML =
+    (!L.inline_preedit ? `<div class="preedit-line" style="color:${cut(c.text_color)};background:${cut(c.preedit_back_color)};border-radius:4px">tuja</div>` : "") +
+    `<div class="cand-line" style="background:${cut(c.hilited_candidate_back_color)};border-radius:${L.hilited_corner_radius ?? 6}px;padding:${L.hilite_padding ?? 4}px;color:${cut(c.hilited_candidate_text_color)}"><span class="idx" style="color:${cut(c.hilited_candidate_label_color)}">1.</span>我们 <span class="cmt" style="color:${cut(c.hilited_comment_text_color)}">wǒ men</span></div>` +
+    `<div class="cand-line" style="padding:${L.hilite_padding ?? 4}px 1px;color:${cut(c.candidate_text_color)}"><span class="idx" style="color:${cut(c.label_color)}">2.</span>我 <span class="cmt" style="color:${cut(c.comment_text_color)}">wǒ</span></div>`;
+}
+/* ── 挂件事件绑定（一次） ── */
+$("#ov-pick").onclick = () => $("#ov-file").click();
+$("#ov-file").onchange = ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => ovLoadFromDataUrl(rd.result, f.name, false);
+  rd.onerror = () => msg("图片读取失败", "err");
+  rd.readAsDataURL(f);
+  ev.target.value = "";
+};
+$("#ov-en").onchange = () => {
+  const c = ovEnsureCfg(); c.enabled = $("#ov-en").checked;
+  if (c.enabled && !c.image) msg("启用成功——先「烤成品」写入图片才会显示", "");
+  else msg(c.enabled ? "挂件已启用 ✓（打字即见，≤2.5s）" : "挂件已关闭", "ok");
+  saveSkin().catch(e => msg("保存失败：" + e.message, "err"));
+};
+const ovLayR = (id, key) => {
+  $(id).oninput = () => {
+    const c = ovEnsureCfg(); c[key] = parseFloat($(id).value);
+    $(id + "-v").textContent = $(id).value;
+    ovApplyLayout(); ovSaveDeb();   // 布局参数纯 CSS，不重渲像素
+  };
+};
+ovLayR("#ov-bh", "base_height"); ovLayR("#ov-gap", "gap"); ovLayR("#ov-op", "opacity");
+const ovSel = (id, key) => {
+  $(id).onchange = () => { const c = ovEnsureCfg(); c[key] = $(id).value; ovApplyLayout(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+};
+ovSel("#ov-side", "side"); ovSel("#ov-layer", "layer"); ovSel("#ov-valign", "v_align");
+$("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip").checked; ovPreview(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+/* 预览直接 manipulation：拖图=定位（自动换贴边/改间距/垂直微调），
+   右下手柄或滚轮=改高度；松手/滚轮防抖保存 → skin_ver → DLL 秒级生效 */
+{
+  const wrapEl = $("#ov-imgwrap"), mock = $("#ov-candmock"), row = $("#ov-row");
+  let mode = null, grab = null, corner = "se";
+  wrapEl.addEventListener("pointerdown", e => {
+    if (!OV.img) return;
+    const c = ovEnsureCfg();
+    const hc = e.target.dataset ? e.target.dataset.c : null;
+    if (hc) {
+      mode = "resize"; corner = hc;
+      grab = { y: e.clientY, h: c.base_height || 240 };
+    } else {
+      mode = "move";
+      grab = { x: e.clientX, y: e.clientY };
+      // position:relative 偏移：留在 flex 流里（mock 不跳位），视觉任意跟随
+      start = null;
+      wrapEl.classList.add("ov-dragging");
+      wrapEl.style.position = "relative";
+      wrapEl.style.left = "0px"; wrapEl.style.top = "0px";
+      wrapEl.style.transform = "none";
+    }
+    wrapEl.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  wrapEl.addEventListener("pointermove", e => {
+    if (!mode) return;
+    const c = ovEnsureCfg();
+    if (mode === "move") {
+      wrapEl.style.left = (e.clientX - grab.x) + "px";
+      wrapEl.style.top = (e.clientY - grab.y) + "px";
+    } else {
+      // 四角手柄：下方两角下拉=高、上方两角上拉=高（宽随纵横比自动跟）
+      const pull = (corner === "nw" || corner === "ne") ? (grab.y - e.clientY) : (e.clientY - grab.y);
+      const nh = Math.round(grab.h + pull);
+      c.base_height = Math.min(600, Math.max(60, nh));
+      ovSetR("#ov-bh", c.base_height);
+      wrapEl.style.height = c.base_height + "px";
+    }
+    e.preventDefault();
+  });
+  wrapEl.addEventListener("pointerup", e => {
+    if (!mode) return;
+    const c = ovEnsureCfg();
+    if (mode === "move") {
+      // 松手：按最终几何反推 side/gap/offset_y（相对 row 坐标）。
+      // 拖拽全权接管水平定位：gap=视觉间距、offset_x 归零（防双重叠加）
+      const rr = row.getBoundingClientRect(), mr = mock.getBoundingClientRect(), wr = wrapEl.getBoundingClientRect();
+      const left = wr.left - rr.left, top = wr.top - rr.top, w = wr.width, h = wr.height;
+      const mockL = mr.left - rr.left, mockR = mr.right - rr.left, mockCx = mockL + mr.width / 2;
+      const side = (left + w / 2) < mockCx ? "left" : "right";
+      const visualGap = side === "right" ? left - mockR : mockL - (left + w);
+      c.side = side; $("#ov-side").value = side;
+      c.gap = Math.min(600, Math.max(-400, Math.round(visualGap)));
+      ovSetR("#ov-gap", c.gap);
+      c.offset_x = 0;
+      const alignedTop = c.v_align === "top" ? mr.top - rr.top
+        : c.v_align === "bottom" ? (mr.bottom - rr.top) - h
+        : (mr.top - rr.top) + mr.height / 2 - h / 2;
+      c.offset_y = Math.min(1000, Math.max(-1000, Math.round(top - alignedTop)));
+      ovSetR("#ov-oy", c.offset_y);
+      // 回 flex 常规布局
+      wrapEl.style.position = ""; wrapEl.style.left = ""; wrapEl.style.top = "";
+      ovApplyLayout();
+      ovSaveDeb();
+    } else {
+      ovSaveDeb();
+    }
+    wrapEl.classList.remove("ov-dragging");
+    mode = null;
+  });
+  wrapEl.addEventListener("wheel", e => {
+    if (!OV.img) return;
+    e.preventDefault();
+    const c = ovEnsureCfg();
+    c.base_height = Math.min(600, Math.max(60, (c.base_height || 240) + (e.deltaY < 0 ? 10 : -10)));
+    ovSetR("#ov-bh", c.base_height);
+    wrapEl.style.height = c.base_height + "px";
+    ovSaveDeb();
+  }, { passive: false });
+}
+/* 处理台交互：拖框裁剪 / 取色 */
+{
+  const cv = $("#ov-work");
+  const toSrc = e => {
+    if (!OV.view) return null;
+    const r = cv.getBoundingClientRect();
+    const px = (e.clientX - r.left) * (cv.width / r.width) - OV.view.ox;
+    const py = (e.clientY - r.top) * (cv.height / r.height) - OV.view.oy;
+    return { x: px / OV.view.k, y: py / OV.view.k };
+  };
+  const clampRatio = (x0, y0, x1, y1) => {
+    let w = x1 - x0, h = y1 - y0;
+    if (OV.ratio !== "free") {
+      const [a, b] = OV.ratio === "1" ? [1, 1] : OV.ratio.split(":").map(Number);
+      const ar = a / b;
+      if (Math.abs(w) >= Math.abs(h)) h = Math.sign(h || 1) * Math.abs(w) / ar;
+      else w = Math.sign(w || 1) * Math.abs(h) * ar;
+    }
+    return { x: Math.min(x0, x0 + w), y: Math.min(y0, y0 + h), w: Math.abs(w), h: Math.abs(h) };
+  };
+  cv.addEventListener("pointerdown", e => {
+    if (!OV.img) return;
+    const p = toSrc(e); if (!p) return;
+    if (OV.picking) { // 取背景色（映射回源图取样，考虑裁剪）
+      const c0 = OV.crop;
+      const sxp = Math.round((c0 ? c0.x : 0) + p.x), syp = Math.round((c0 ? c0.y : 0) + p.y);
+      const tmp = document.createElement("canvas");
+      tmp.width = OV.img.naturalWidth; tmp.height = OV.img.naturalHeight;
+      const tc = tmp.getContext("2d", { willReadFrequently: true });
+      tc.drawImage(OV.img, 0, 0);
+      const d = tc.getImageData(sxp, syp, 1, 1).data;
+      OV.key = { r: d[0], g: d[1], b: d[2] };
+      OV.picking = false; cv.style.cursor = "crosshair";
+      msg(`已取背景色 rgb(${d[0]},${d[1]},${d[2]})——调容差看效果`, "ok");
+      ovPreview(); return;
+    }
+    OV.drag = { x0: p.x, y0: p.y };
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove", e => {
+    if (!OV.drag) return;
+    const p = toSrc(e); if (!p) return;
+    OV.crop = clampRatio(OV.drag.x0, OV.drag.y0, p.x, p.y);
+    ovRenderWork();
+    if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); });
+  });
+  cv.addEventListener("pointerup", () => {
+    if (!OV.drag) return;
+    OV.drag = null;
+    if (OV.crop && (OV.crop.w < 4 || OV.crop.h < 4)) OV.crop = null; // 点一下=无框
+    ovRenderWork();
+  });
+}
+$("#ov-ratio").onchange = () => { OV.ratio = $("#ov-ratio").value; };
+$("#ov-crop-apply").onclick = () => {
+  if (!OV.crop) return msg("先在处理台上拖出裁剪框", "err");
+  msg(`裁剪已应用（${Math.round(OV.crop.w)}×${Math.round(OV.crop.h)}）——左侧预览同步`, "ok"); ovPreview();
+};
+$("#ov-crop-reset").onclick = () => { OV.crop = null; ovRenderWork(); ovPreview(); msg("裁剪已还原", "ok"); };
+$("#ov-crop-auto").onclick = () => {
+  if (!OV.img) return msg("先选择图片", "err");
+  const c0 = OV.crop;
+  const sx = c0 ? c0.x : 0, sy = c0 ? c0.y : 0, sw = c0 ? c0.w : OV.img.naturalWidth, sh = c0 ? c0.h : OV.img.naturalHeight;
+  const tmp = document.createElement("canvas");
+  const sc = Math.min(1, 800 / Math.max(sw, sh));
+  tmp.width = Math.max(1, Math.round(sw * sc)); tmp.height = Math.max(1, Math.round(sh * sc));
+  const tc = tmp.getContext("2d", { willReadFrequently: true });
+  tc.drawImage(OV.img, sx, sy, sw, sh, 0, 0, tmp.width, tmp.height);
+  const d = tc.getImageData(0, 0, tmp.width, tmp.height).data;
+  const px = (x, y) => { const i = (y * tmp.width + x) * 4; return [d[i], d[i + 1], d[i + 2]]; };
+  const cs = [px(0, 0), px(tmp.width - 1, 0), px(0, tmp.height - 1), px(tmp.width - 1, tmp.height - 1)];
+  const bg = [0, 1, 2].map(k => cs.reduce((s, c) => s + c[k], 0) / 4);
+  const T = Math.max(24, OV.tol);
+  let x0 = tmp.width, y0 = tmp.height, x1 = -1, y1 = -1;
+  for (let y = 0; y < tmp.height; y++) for (let x = 0; x < tmp.width; x++) {
+    const p = px(x, y);
+    if (Math.max(Math.abs(p[0] - bg[0]), Math.abs(p[1] - bg[1]), Math.abs(p[2] - bg[2])) > T) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  if (x1 < 0) return msg("没找到内容（背景判断失败，试试调容差）", "err");
+  OV.crop = { x: sx + x0 / sc, y: sy + y0 / sc, w: (x1 - x0 + 1) / sc, h: (y1 - y0 + 1) / sc };
+  ovRenderWork(); ovPreview();
+  msg(`已自动裁到内容（${Math.round(OV.crop.w)}×${Math.round(OV.crop.h)}）`, "ok");
+};
+$("#ov-key-pick").onclick = () => {
+  if (!OV.img) return msg("先选择图片", "err");
+  OV.picking = true; $("#ov-work").style.cursor = "cell";
+  msg("取色模式：在处理台上点一下背景处", "");
+};
+$("#ov-key-clear").onclick = () => { OV.key = null; OV.picking = false; $("#ov-work").style.cursor = "crosshair"; ovPreview(); msg("抠图已取消", "ok"); };
+const ovFxR = (id, key) => {
+  $(id).oninput = () => { OV[key] = parseFloat($(id).value); $(id + "-v").textContent = $(id).value; if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); }); };
+};
+ovFxR("#ov-tol", "tol"); ovFxR("#ov-corner", "corner"); ovFxR("#ov-feather", "feather");
+/* 上屏反应段:参数即存即生效(播放参数,无需烤成品) */
+const ovNum = (id, key, cast) => {
+  $(id).onchange = () => {
+    const c = ovEnsureCfg();
+    c[key] = cast($(id).value);
+    ovSaveDeb(); ovPreview();
+  };
+}
+$("#ov-bake").onclick = async () => {
+  if (!OV.img) return msg("先选择图片", "err");
+  const cfg = ovEnsureCfg();
+  cfg.enabled = $("#ov-en").checked;
+  if (OV.anim) {
+    // 动图：存原图 data-URL + 处理参数（dll 逐帧套同一管线播放），
+    // 烤成逐帧 PNG 体积不可行（无压缩编码器），见 overlaywin 路径②
+    if ((OV.dataUrl || "").length > 11_000_000) return msg("动图文件过大（>8MB），请精简后再挂", "err");
+    cfg.image = OV.dataUrl;
+    cfg.proc = {
+      crop: OV.crop ? [Math.round(OV.crop.x), Math.round(OV.crop.y), Math.round(OV.crop.w), Math.round(OV.crop.h)] : null,
+      key: OV.key ? [Math.round(OV.key.r), Math.round(OV.key.g), Math.round(OV.key.b)] : null,
+      tol: OV.tol, corner: OV.corner, feather: OV.feather,
+      src_w: OV.img.naturalWidth, src_h: OV.img.naturalHeight,
+    };
+    try {
+      await saveSkin();
+      $("#ov-fileinfo").textContent = `${OV.name} → 动图 ${OV.anim.bitmaps.length} 帧（原图+参数）`;
+      msg("动图已写入皮肤 ✓ 打字即见逐帧播放（≤2.5s）", "ok");
+    } catch (e) { msg("保存失败：" + e.message, "err"); }
+    return;
+  }
+  // 静态图：烤成品 PNG
+  const maxH = Math.min(1200, Math.max(240, (cfg.base_height || 240) * 2));
+  const cv = document.createElement("canvas");
+  if (!ovProcess(cv, maxH)) return msg("处理失败（裁剪区过小？）", "err");
+  cfg.image = cv.toDataURL("image/png");
+  cfg.proc = null;
+  try {
+    await saveSkin();
+    $("#ov-fileinfo").textContent = `${OV.name} → 成品 ${cv.width}×${cv.height}`;
+    msg("成品已写入皮肤 ✓ 打字即见（≤2.5s）", "ok");
+  } catch (e) { msg("保存失败：" + e.message, "err"); }
+};
+{ // 深/浅底切换（与皮肤页同款）
+  const wrap = $("#ov-wrap"), bd = $("#ov-pv-dark"), bl = $("#ov-pv-light");
+  const apply = light => {
+    wrap.style.background = light ? "#E9E9EE" : "";
+    bd.classList.toggle("on", !light); bl.classList.toggle("on", light);
+  };
+  bd.onclick = () => apply(false); bl.onclick = () => apply(true);
 }
 
 /* ── 用户词 ── */
