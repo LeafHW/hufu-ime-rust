@@ -453,6 +453,13 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       </label>
       <span class="sub" id="ov-fileinfo" style="align-self:center">未选图</span>
       <span id="ov-anim-badge">🎞 动图</span>
+      <div class="field"><label>配置</label>
+        <select id="ov-preset-sel" style="min-width:150px" title="已保存的挂件配置；选择即整套应用（图片、位置、全部参数）"><option value="">— 未保存配置 —</option></select>
+        <button id="ov-preset-save" title="把当前图片与全部参数存为一个配置">保存为配置…</button>
+        <button id="ov-preset-del" title="删除当前选中的配置">删除</button>
+      </div>
+      <div class="checkline"><input type="checkbox" id="ov-linger"><label for="ov-linger">延时消失</label></div>
+      <div class="field" id="ov-linger-row" style="display:none"><label>延迟 <span class="val" id="ov-linger-v"></span> s</label><input type="range" id="ov-linger-ms" min="0.2" max="2" step="0.1"></div>
     </div>
     <div class="skin-grid">
       <div class="skin-preview-wrap" id="ov-wrap">
@@ -480,11 +487,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>间距 <span class="val" id="ov-gap-v"></span></label><input type="range" id="ov-gap" min="-400" max="600" step="2" title="与候选框的间距；负数=重叠（拖图可代替）"></div>
           <div class="field"><label>不透明度 <span class="val" id="ov-op-v"></span></label><input type="range" id="ov-op" min="5" max="100" step="5"></div>
         </div>
-        <div class="row">
-          <div class="checkline"><input type="checkbox" id="ov-linger"><label for="ov-linger">延时消失</label></div>
-          <div class="field" id="ov-linger-row" style="display:none"><label>延迟 <span class="val" id="ov-linger-v"></span> s</label><input type="range" id="ov-linger-ms" min="0.2" max="2" step="0.1"></div>
-          <span class="sub" style="align-self:center">不勾选=候选框一消失挂件立即消失；勾选后按延迟时间收起</span>
-        </div>
         <h3>图片处理 <span class="sub" style="font-weight:400">（处理台上拖框裁剪；抠图先点「取背景色」再点图上背景处）</span></h3>
         <div class="row" style="align-items:flex-start">
           <canvas id="ov-work" width="320" height="280" style="border:1px solid var(--line);border-radius:10px;background:repeating-conic-gradient(#2a2c33 0 25%, #22242a 0 50%) 0 0/16px 16px;cursor:crosshair;flex-shrink:0"></canvas>
@@ -505,13 +507,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
             <div class="field"><label>圆角 <span class="val" id="ov-corner-v"></span></label><input type="range" id="ov-corner" min="0" max="120" step="2"></div>
             <div class="field"><label>边缘羽化 <span class="val" id="ov-feather-v"></span></label><input type="range" id="ov-feather" min="0" max="80" step="2" title="边缘渐隐带宽（按 240px 高折算）；羽化自带圆角效果"></div>
             <div class="checkline"><input type="checkbox" id="ov-flip"><label for="ov-flip">水平翻转（运行时，换贴边用）</label></div>
-          </div>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <div class="field"><label>配置切换</label>
-            <select id="ov-preset-sel" style="min-width:150px" title="已保存的挂件配置；选择即整套应用（图片、位置、全部参数）"><option value="">— 未保存配置 —</option></select>
-            <button id="ov-preset-save" title="把当前图片与全部参数存为一个配置">保存为配置…</button>
-            <button id="ov-preset-del" title="删除当前选中的配置">删除</button>
           </div>
         </div>
       </div>

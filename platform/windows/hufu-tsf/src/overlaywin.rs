@@ -301,7 +301,19 @@ fn decode_worker(cfg: &OverlayCfg, target_h: f32, st: &DecodeState) -> Option<()
     let first = iter.next()?;
     let (sw, sh) = (first.0.width().max(1), first.0.height().max(1));
     let ch = target_h.round().clamp(8.0, 4096.0) as u32;
-    let cw = ((ch as f32) * (sw as f32) / (sh as f32))
+    // 纵横比取「实际参与缩放的内容」：有裁剪时用裁剪区，否则整图——
+    // 用整图比会把竖向裁剪区拉宽(用户实测「打出来变胖、预览正常」，
+    // 预览 JS 是先裁后算比例，两条路径由此对齐)
+    let (aw, ah) = match cfg
+        .proc
+        .as_ref()
+        .and_then(|p| p.crop)
+        .filter(|c| c[2] >= 2 && c[3] >= 2)
+    {
+        Some([_, _, w, h]) => (w, h),
+        None => (sw, sh),
+    };
+    let cw = ((ch as f32) * (aw as f32) / (ah as f32))
         .round()
         .clamp(1.0, 4096.0) as u32;
     st.w.store(cw, Ordering::Release);
