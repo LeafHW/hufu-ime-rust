@@ -1665,8 +1665,10 @@ function ovMock() {
    dll 侧 process_frame 两条路径本就同式。 */
 const ovPersist = () => {
   const cfg = ovEnsureCfg();
-  if (!OV.img || !OV.dataUrl) { cfg.image = ""; cfg.proc = null; }
-  else {
+  // 图片未就绪（页面刚开/切配置/换图的异步加载窗）→ 绝不动 image/proc：
+  // 旧版在此清空 → 加载窗内动任何滑杆=皮肤里的图被抹掉（候选挂件
+  // 「消失/变样」的事故源）。清图只能走显式路径（目前无此入口）
+  if (OV.img && OV.dataUrl) {
     if (OV.dataUrl.length > 11_000_000) { msg("图片文件过大（>8MB），请精简", "err"); return false; }
     cfg.image = OV.dataUrl;
     cfg.proc = {
@@ -1943,12 +1945,14 @@ $("#ov-preset-sel").onchange = async () => {
   const p = (c.presets || []).find(x => x.name === name);
   if (!p) return;
   for (const k of ovPresetKeys) if (k in p) c[k] = p[k];
-  // 处理参数回落 OV 状态并重载图
-  OV.crop = p.proc && p.proc.crop ? { x: p.proc.crop[0], y: p.proc.crop[1], w: p.proc.crop[2], h: p.proc.crop[3] } : null;
-  OV.key = p.proc && p.proc.key ? { r: p.proc.key[0], g: p.proc.key[1], b: p.proc.key[2] } : null;
-  OV.tol = p.proc ? (p.proc.tol ?? 30) : 30; OV.corner = p.proc ? (p.proc.corner ?? 0) : 0; OV.feather = p.proc ? (p.proc.feather ?? 0) : 0;
+  // 处理参数整套回填：SKIN.overlay.proc 也要换成 preset 快照——
+  // 旧版只回填 OV 状态不写 proc，saveSkin 后皮肤里 proc 还是旧图参数，
+  // 新图被旧 crop/key 错误处理（观感=「皮肤变了」的元凶之一）
+  c.proc = p.proc ? JSON.parse(JSON.stringify(p.proc)) : null;
+  OV.crop = c.proc && c.proc.crop ? { x: c.proc.crop[0], y: c.proc.crop[1], w: c.proc.crop[2], h: c.proc.crop[3] } : null;
+  OV.key = c.proc && c.proc.key ? { r: c.proc.key[0], g: c.proc.key[1], b: c.proc.key[2] } : null;
+  OV.tol = c.proc ? (c.proc.tol ?? 30) : 30; OV.corner = c.proc ? (c.proc.corner ?? 0) : 0; OV.feather = c.proc ? (c.proc.feather ?? 0) : 0;
   OV.img = null; OV.anim = null; OV.dataUrl = "";
-  // proc 快照也要带进 preset（ovPresetKeys 之外单存）
   try { await saveSkin(); msg(`已切换到配置「${name}」✓`, "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
   ovBindSkin(); // 载入 image/proc 并回填全部控件（含延时滑杆）
 };
