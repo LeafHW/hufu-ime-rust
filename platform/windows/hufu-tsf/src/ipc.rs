@@ -463,7 +463,10 @@ fn call_on(
                 return None;
             }
             let len = u32::from_le_bytes(head) as usize;
-            if len == 0 || len > (1 << 20) {
+            // 32MB：皮肤 op 携带整份皮肤（挂件动图入皮肤后实测 13MB+，
+            // 12MB 闸会让 op=skin 静默失败→全线回默认皮「迷雾」事故
+            // 2026-10-03）；其余 op 响应远小于此，上限只作防错 sanity
+            if len == 0 || len > (32 << 20) {
                 *file = None;
                 return None;
             }

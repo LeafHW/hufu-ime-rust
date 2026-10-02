@@ -12,10 +12,13 @@ use std::sync::Mutex;
 #[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
 const BUF: usize = 1 << 20;
-/// 响应上限：皮肤 op 会携带贴图挂件成品图（base64 PNG 数百 KB~数 MB）；
-/// 请求侧仍用 BUF（请求都很小），两者分开防互相牵制
+/// 响应上限：皮肤 op 会携带贴图挂件图（动图 GIF 入皮肤后整份皮肤
+/// JSON 实测 13MB+）——12MB 闸会把响应替换成错误对象，DLL 拿错误当
+/// 皮肤渲染=全线回默认皮「迷雾」事故（2026-10-03）。抬到 32MB。
+/// 请求侧仍用 BUF（请求都很小，op=cand 已改 skin_ver 不携大皮肤），
+/// 两者分开防互相牵制
 #[cfg(windows)]
-const RESP_BUF: usize = 12 << 20;
+const RESP_BUF: usize = 32 << 20;
 
 /// 分派一个操作。返回 JSON 响应。
 /// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
