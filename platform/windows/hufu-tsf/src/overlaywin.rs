@@ -752,7 +752,11 @@ unsafe extern "system" fn overlay_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// 播放钟到点:推下一帧并按其时长续钟(仅动画在身时)。
+/// 播放钟到点:按【时间基准】判定是否该走帧(与 tick_playback 同式、
+/// 同一时钟 entry.frame_idx/play_start)——双路驱动谁先到点谁推进 1 帧，
+/// 另一路再看时钟必「未到点」不推。旧实现无脑 +1 帧且不动 play_start，
+/// 与 sync 路叠加=每键多走一帧,打字越密 GIF 越快(用户实测
+/// 「再按键播放就加快」的根因)。
 unsafe fn advance_frame(ov_hwnd: HWND) {
     let key = ov_hwnd.0 as isize;
     let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
@@ -773,12 +777,30 @@ unsafe fn advance_frame(ov_hwnd: HWND) {
         return;
     }
     let Some(ov) = entry.ov.as_mut() else { return };
-    entry.frame_idx = (entry.frame_idx + 1) % n;
-    if ov.push_frame(&dec, entry.frame_idx, &cfg) {
-        let delays = dec.delays.lock().unwrap_or_else(|e| e.into_inner());
-        let d = delays.get(entry.frame_idx).copied().unwrap_or(100).max(10);
-        let _ = SetTimer(ov_hwnd, OVERLAY_TIMER_ID, d, None);
+    let delays = dec.delays.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let mut idx = entry.frame_idx % n;
+    let mut start = entry.play_start;
+    // 到点才走,一拍至多 1 帧(与 tick_playback 逐字同式)
+    if now.duration_since(start).as_millis() as u32 >= delays[idx].max(1) {
+        start += std::time::Duration::from_millis(delays[idx].max(1) as u64);
+        idx = (idx + 1) % n;
+        entry.frame_idx = idx;
+        entry.play_start = start;
+        if !ov.push_frame(&dec, idx, &cfg) {
+            entry.timer_armed = false; // 本钟已随 WM_TIMER 消化,推帧失败别让 sync 以为还有钟
+            return;
+        }
     }
+    // 续钟:按当前帧剩余时长(WM_TIMER 刚触发,本钟必处未 armed 态)
+    let remain = delays[entry.frame_idx % n]
+        .max(1)
+        .saturating_sub(
+            now.duration_since(entry.play_start).as_millis() as u32,
+        )
+        .max(10);
+    let _ = SetTimer(ov_hwnd, OVERLAY_TIMER_ID, remain, None);
+    entry.timer_armed = true;
 }
 
 // ── 挂钩入口(candwin2 调用;全部在候选窗线程执行)──
