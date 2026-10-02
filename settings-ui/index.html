@@ -172,6 +172,9 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   transition: box-shadow .15s; }
 #ov-imgwrap .ov-h::after { content: ""; position: absolute; inset: -5px; } /* 透明命中垫 26×26 */
 #ov-imgwrap.ov-dragging .ov-h, #ov-imgwrap:hover .ov-h { opacity: 1; box-shadow: 0 0 0 3px rgba(255,215,94,.25); }
+/* 拖图时图浮到候选框 mock 之上：横排皮肤 mock 宽、图在其后拖动会被
+   整个盖住（pointer-events 不受影响，但视觉上「图消失」） */
+#ov-imgwrap.ov-dragging { z-index: 5; }
 .ov-h-nw { left: -18px; top: -18px; cursor: nwse-resize; }
 .ov-h-ne { right: -18px; top: -18px; cursor: nesw-resize; }
 .ov-h-sw { left: -18px; bottom: -18px; cursor: nesw-resize; }
@@ -477,7 +480,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <button id="ov-pv-dark" class="on">深色底</button>
           <button id="ov-pv-light">浅色底</button>
         </div>
-        <div class="preview-stage" style="display:flex;align-items:center;justify-content:center;height:auto;min-height:170px;padding:12px 0">
+        <div class="preview-stage" style="display:flex;align-items:center;justify-content:center;height:auto;min-height:360px;padding:12px 0">
           <div id="ov-row" style="display:flex;align-items:center;justify-content:center;width:100%;min-height:120px">
             <span id="ov-imgwrap"><canvas id="ov-preview" width="10" height="10"></canvas><span class="ov-h ov-h-nw" data-c="nw" title="拖动改大小"></span><span class="ov-h ov-h-ne" data-c="ne" title="拖动改大小"></span><span class="ov-h ov-h-sw" data-c="sw" title="拖动改大小"></span><span class="ov-h ov-h-se" data-c="se" title="拖动改大小（滚轮也行）"></span></span>
             <div id="ov-candmock"></div>
@@ -1615,6 +1618,9 @@ function ovApplyLayout() {
   const wrapEl = $("#ov-imgwrap"), cfg = SKIN.overlay || {};
   const row = $("#ov-row"), mock = $("#ov-candmock");
   if (!OV.img) { wrapEl.style.display = "none"; return; }
+  // 【拖图锁 2026-10-03】拖拽进行中不动布局（left/top/transform 归
+  // pointermove 管）——动图 rAF 每帧重入本函数会吃掉拖拽偏移
+  if (OV.draggingLayout) return;
   wrapEl.style.display = "";
   wrapEl.style.opacity = Math.max(0.05, (cfg.opacity ?? 100) / 100);
   // DOM 序：右贴=[候选框, 图]；左贴=[图, 候选框]。
@@ -1740,11 +1746,16 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       mode = "move";
       grab = { x: e.clientX, y: e.clientY };
       // position:relative 偏移：留在 flex 流里（mock 不跳位），视觉任意跟随
-      start = null;
       wrapEl.classList.add("ov-dragging");
       wrapEl.style.position = "relative";
       wrapEl.style.left = "0px"; wrapEl.style.top = "0px";
       wrapEl.style.transform = "none";
+      // 【拖图锁 2026-10-03】动图 rAF（ovAnimTick→ovPreview→ovApplyLayout）
+      // 与拖拽并发：每帧把 left/top/transform 覆写回常規布局值，把拖拽
+      // 偏移吃掉=「只能拖动一点点就拖不动」的真凶（GIF 60fps 下一帧必
+      // 覆写）。拖拽期间置锁，ovApplyLayout 见锁即跳过，pointerup 解锁
+      // 后统一回归布局（拖拽中图永远跟手，松手一次落位）。
+      OV.draggingLayout = true;
     }
     wrapEl.setPointerCapture(e.pointerId);
     e.preventDefault();
@@ -1758,16 +1769,20 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
     } else {
       // 四角手柄：下方两角下拉=高、上方两角上拉=高（宽随纵横比自动跟）
       const pull = (corner === "nw" || corner === "ne") ? (grab.y - e.clientY) : (e.clientY - grab.y);
+      // 【跟手不钳 2026-10-03】拖拽过程显示高不做 clamp——之前实时钳
+      // 60~600，拉过头后图不再跟手=「拖不动」体感（系统滑杆同款）。
+      // 松手（pointerup）才落回 clamp 区间存盘。
       const nh = Math.round(grab.h + pull);
-      c.base_height = Math.min(600, Math.max(60, nh));
-      ovSetR("#ov-bh", c.base_height);
-      wrapEl.style.height = c.base_height + "px";
+      c.base_height = nh;
+      ovSetR("#ov-bh", nh);
+      wrapEl.style.height = nh + "px";
     }
     e.preventDefault();
   });
   wrapEl.addEventListener("pointerup", e => {
     if (!mode) return;
     const c = ovEnsureCfg();
+    OV.draggingLayout = false;   // 先解锁：下面的 ovApplyLayout 要生效
     if (mode === "move") {
       // 松手：按最终几何反推 side/gap/offset_y（相对 row 坐标）。
       // 拖拽全权接管水平定位：gap=视觉间距、offset_x 归零（防双重叠加）
@@ -1789,7 +1804,24 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       ovApplyLayout();
       ovSaveDeb();
     } else {
+      // 【松手落钳】缩放拖拽中不钳（跟手），落手才回 60~600 区间
+      c.base_height = Math.min(600, Math.max(60, Math.round(c.base_height)));
+      ovSetR("#ov-bh", c.base_height);
+      wrapEl.style.height = c.base_height + "px";
+      ovApplyLayout();
       ovSaveDeb();
+    }
+    wrapEl.classList.remove("ov-dragging");
+    mode = null;
+  });
+  // 指针跑出窗口/被系统吞掉：pointercancel 同 pointerup 收尾，防止
+  // draggingLayout 锁死、动图 rAF 永远进不了布局
+  wrapEl.addEventListener("pointercancel", () => {
+    if (!mode) return;
+    OV.draggingLayout = false;
+    if (mode === "move") {
+      wrapEl.style.position = ""; wrapEl.style.left = ""; wrapEl.style.top = "";
+      ovApplyLayout(); ovSaveDeb();
     }
     wrapEl.classList.remove("ov-dragging");
     mode = null;
