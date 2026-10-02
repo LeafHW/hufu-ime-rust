@@ -571,6 +571,9 @@ impl Shared {
             if let Some(v) = ipc::call(&serde_json::json!({"op": "skin"})) {
                 self.delay_show_ms =
                     v.get("delay_show_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                // 【贴图挂件 2026-10-02】皮肤到位 → overlay 子树变了才推进
+                // 代次(2.5s 例行重拉不再触发整段 GIF 重解码)
+                crate::overlaywin::note_skin(&v);
                 self.skin = v;
                 self.skin_stale = false;
                 self.skin_loaded_at = std::time::Instant::now();
@@ -5925,13 +5928,14 @@ fn ui_element_show(
     g.cand_ui_host_draws = false;
     // 【皮肤去重推送 2026-09-11】仅换肤/首推/上次失败时携带 skin
     //（server 端缓存上帧皮肤），其余帧省掉整份 JSON 的 clone+序列化
-    //+管道字节——沉浸宿主逐键帧是无谓的 KB 级重复开销。
+    // +管道字节——沉浸宿主逐键帧是无谓的 KB 级重复开销。
+    // 【大皮肤改造 2026-10-03】挂件动图入皮肤后整份 skin 可达数 MB，
+    // 携带完整 skin 的请求会撞 server 1MB 请求闸（连接被断，server
+    // 代画失效=沉浸宿主「回默认皮肤」事故）——改为恒 null + skin_ver
+    // 版本号（8 字节），server 按版本自取皮肤文件，请求永远百字节级。
     let need_skin = g.srv_skin_ver_pushed != g.skin_ver_last;
-    let skin = if need_skin {
-        g.skin.clone()
-    } else {
-        serde_json::Value::Null
-    };
+    let skin = serde_json::Value::Null;
+    let skin_ver = g.skin_ver_last;
     drop(g);
     // 宿主顶层窗（前台窗——代画显示时宿主必为前台）：交给 server 自守
     //（宿主窗不可见时 server 自收代画窗——开始菜单残留的根治）
@@ -5941,7 +5945,7 @@ fn ui_element_show(
     } else {
         host_hwnd.0 as isize
     };
-    let ok = pipe_cand_push(cands, raw, sel, x, y, &skin, host_hwnd);
+    let ok = pipe_cand_push(cands, raw, sel, x, y, &skin, skin_ver, host_hwnd);
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     if ok {
         if need_skin {
@@ -5953,8 +5957,10 @@ fn ui_element_show(
     }
 }
 
-/// server 代画：pipe 推送候选帧（皮肤仅换肤时携带，server 按皮肤渲染；
-/// 返回是否推送成功——失败时调用方标记下帧重推皮肤）
+/// server 代画：pipe 推送候选帧（皮肤按版本号由 server 自取——挂件动图
+/// 入皮肤后整份 skin 可达数 MB，携带会撞 server 1MB 请求闸断代画链
+/// （沉浸宿主「回默认皮肤」事故，2026-10-03）；返回是否推送成功——
+/// 失败时调用方标记下帧重推皮肤）
 fn pipe_cand_push(
     cands: &[(String, String)],
     raw: &str,
@@ -5962,6 +5968,7 @@ fn pipe_cand_push(
     x: i32,
     y: i32,
     skin: &serde_json::Value,
+    skin_ver: u64,
     host_hwnd: isize,
 ) -> bool {
     let items: Vec<serde_json::Value> = cands
@@ -5976,6 +5983,7 @@ fn pipe_cand_push(
         "x": x,
         "y": y,
         "skin": skin,
+        "skin_ver": skin_ver,
         "host_hwnd": host_hwnd,
     }));
     // 【诊断降噪 2026-09-11】旧实现每帧 diag_note（沉浸宿主逐键帧

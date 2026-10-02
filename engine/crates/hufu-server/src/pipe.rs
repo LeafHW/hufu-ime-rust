@@ -12,6 +12,10 @@ use std::sync::Mutex;
 #[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
 const BUF: usize = 1 << 20;
+/// 响应上限：皮肤 op 会携带贴图挂件成品图（base64 PNG 数百 KB~数 MB）；
+/// 请求侧仍用 BUF（请求都很小），两者分开防互相牵制
+#[cfg(windows)]
+const RESP_BUF: usize = 12 << 20;
 
 /// 分派一个操作。返回 JSON 响应。
 /// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
@@ -463,21 +467,50 @@ pub fn dispatch(
             // 【皮肤缓存 2026-09-11】DLL 侧仅换肤/首推/重推时携带
             // "skin"（逐帧全量推送是 KB 级管道浪费——对齐 tsf.rs 的
             // srv_skin_ver_pushed 去重）；缺省沿用上帧皮肤。
-            static LAST_SKIN: std::sync::Mutex<Option<serde_json::Value>> =
+            // 【大皮肤改造 2026-10-03】挂件动图入皮肤后 skin 可达数 MB，
+            // 携带完整 skin 的 cand 请求会撞下方 1MB 请求闸（连接直接
+            // 断，server 代画链失效=沉浸宿主回默认皮）——DLL 改推
+            // skin_ver（8 字节），server 端按版本自取当前皮肤文件；
+            // 完整 skin 字段保留兼容（小皮肤/旧 DLL 仍可用）。
+            static LAST_SKIN: std::sync::Mutex<Option<(u64, serde_json::Value)>> =
                 std::sync::Mutex::new(None);
-            let skin = match req.get("skin") {
-                Some(v) if !v.is_null() => {
+            let skin = if let Some(v) = req.get("skin") {
+                if !v.is_null() {
                     let v = v.clone();
                     if let Ok(mut c) = LAST_SKIN.lock() {
-                        *c = Some(v.clone());
+                        *c = Some((u64::MAX, v.clone()));
                     }
                     v
+                } else {
+                    // null=「按版本重取」：ver 与缓存一致用缓存，否则读盘
+                    let want_ver = req.get("skin_ver").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let cached = LAST_SKIN
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.clone())
+                        .filter(|(v, _)| *v == want_ver && want_ver != 0);
+                    match cached {
+                        Some((_, v)) => v,
+                        None => {
+                            let id = host.engine.config.appearance.skin.clone();
+                            let p = host.skins_dir().join(format!("{id}.json"));
+                            let v = hufu_skin::Skin::load(&p)
+                                .map(|s| serde_json::to_value(s).unwrap_or_default())
+                                .unwrap_or_default();
+                            if let Ok(mut c) = LAST_SKIN.lock() {
+                                *c = Some((want_ver, v.clone()));
+                            }
+                            v
+                        }
+                    }
                 }
-                _ => LAST_SKIN
+            } else {
+                LAST_SKIN
                     .lock()
                     .ok()
                     .and_then(|c| c.clone())
-                    .unwrap_or(serde_json::Value::Null),
+                    .map(|(_, v)| v)
+                    .unwrap_or(serde_json::Value::Null)
             };
 
             // 【二十九修·首显滑动】组段首帧带滑动起点（None=常规帧）
@@ -811,7 +844,7 @@ mod imp {
                 //(client interprets as disconnect) — write minimal error JSON instead
                 b"{\"error\":\"resp serialize failed\"}".to_vec()
             });
-            if out.len() > BUF {
+            if out.len() > RESP_BUF {
                 out = serde_json::json!({"error": "响应过大"})
                     .to_string()
                     .into_bytes();
