@@ -675,6 +675,23 @@ impl Engine {
         }
     }
 
+    /// 【反查关闭直出 2026-10-03】反查是否真正可用：表已装载，或
+    /// 懒加载路径仍在（scheme 非空=设置页未关；或方案目录自带反查表）。
+    /// scheme 空（「关闭反查」）时 apply_global_assets 已把两者都清空。
+    fn reverse_available(&self) -> bool {
+        self.schema.reverse.is_some() || self.schema.reverse_path.is_some()
+    }
+
+    /// 反查不可用时按引导键直出的符号；disabled_output 空 = 直通不吞。
+    fn disabled_symbol(&self) -> Option<String> {
+        let s = self.config.reverse.disabled_output.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
         // 空名防御：dir.join("") = 码表根目录本身，Schema::load 会把
@@ -1102,12 +1119,20 @@ impl Engine {
         if session.raw.is_empty() {
             // 反查引导（Shift+` 是 ~ 波浪号，不进反查——2026-09-06
             // 用户规格：空态 Shift+`=「~」上屏）
-            if c == self.config.reverse.prefix
-                && self.config.reverse.enabled
-                && !shift
-            {
-                session.mode = InputMode::Reverse;
-                return KeyOutcome::consumed(self.state(session));
+            if c == self.config.reverse.prefix && !shift {
+                if self.config.reverse.enabled && self.reverse_available() {
+                    session.mode = InputMode::Reverse;
+                    return KeyOutcome::consumed(self.state(session));
+                }
+                // 【反查关闭直出 2026-10-03】用户不用拼音反查（设置页
+                // 方案选「（关闭反查）」=scheme 空，或表文件缺失/开关关）
+                // 时空态按引导键不再空进反查模式：直出 disabled_output
+                // 符号（默认「·」间隔号，可配「`」）；配置为空 = 系统
+                // 直通旧行为。反查可用时不受影响。
+                if let Some(sym) = self.disabled_symbol() {
+                    return KeyOutcome::commit(sym, self.state(session));
+                }
+                return KeyOutcome::passthrough();
             }
             // 命令命名空间（Shift+\ = ｜ 符号，不进命令——2026-09-06
             // 符号自查：空态 Shift+\ 误入命令模式导致 ｜ 打不出）
@@ -1158,6 +1183,12 @@ impl Engine {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 return KeyOutcome::consumed(self.state(session));
+            }
+            // 【；候选开关·空态 2026-10-03】纯标点档空态按 ; = 直出「；」。
+            // 必须在 is_alphabet_char 之前——; 在默认编码字母表里，否则
+            // 会被 push 进 raw 走引导语义（候选档）。
+            if c == ';' && !shift && !self.config.input.semicolon_guide {
+                return KeyOutcome::commit("；".to_string(), self.state(session));
             }
             // 编码字符
             if self.config.input.is_alphabet_char(c) && !shift {
@@ -1234,6 +1265,8 @@ impl Engine {
         // 上屏并追加间隔号「·」（用户规格：有候选时按 · 顶屏带 ·；
         // Shift+` 走下方 Shift 标点拦截出「首选~」）。置于其他引导
         // 之前——` 不是编码字符。
+        // 【反查关闭直出 2026-10-03】反查不可用时编码态同语义但改用
+        // disabled_output 符号（默认「·」不变；配 ` 则顶屏带 `）。
         if c == self.config.reverse.prefix && !shift {
             if session.candidates.is_empty() {
                 session.clear();
@@ -1243,8 +1276,33 @@ impl Engine {
                 .selected
                 .min(session.candidates.len().saturating_sub(1));
             let first = session.candidates[idx].commit_text().to_string();
+            let sym = if self.reverse_available() {
+                "·".to_string()
+            } else {
+                self.disabled_symbol().unwrap_or_else(|| "·".into())
+            };
             session.clear();
-            return KeyOutcome::commit(format!("{first}·"), self.state(session));
+            return KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
+        }
+        // 【；候选开关 2026-10-03】双档语义：
+        // - 候选档（semicolon_guide=true，默认）：; 弹「：/；」候选，
+        //   ;+空格=：、;;=；直上、;xx 快符照旧（下方各分支）。
+        // - 纯标点档（false，用户规格「不开这个功能的话按一下就是
+        //   直出『；』并能顶屏」）：; 不再作引导键/编码字符——空态
+        //   直出「；」，有编码态首选顶屏+「；」（含 ; 引导残态清理），
+        //   ; 快符随之不可用。Shift+; 仍出「：」（Shift 形态拦截）。
+        if c == ';' && !shift && !self.config.input.semicolon_guide {
+            if session.candidates.is_empty() {
+                session.clear();
+                return KeyOutcome::commit("；".to_string(), self.state(session));
+            }
+            let first = session
+                .candidates
+                .first()
+                .map(|x| x.commit_text().to_string())
+                .unwrap_or_default();
+            session.clear();
+            return KeyOutcome::commit(format!("{first}；"), self.state(session));
         }
         // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
         // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
@@ -5007,6 +5065,10 @@ mod tests {
             "#hufu-dict v1 name=t\na\t啊\naa\t阿\njd\t就\njd\t到的\njd\t加\n",
         )
         .unwrap();
+        // 【2026-10-03】默认配置 scheme=小鹤双拼但全局表不在测试环境 →
+        // 回退方案目录探测；目录里没有反查表 → 反查不可用（与真实装机
+        // 「关闭反查」同态）。反查相关测试需要可用表：写一个空壳反查表。
+        std::fs::write(dir.join("反查.txt"), "测\tce\n").unwrap();
         let cfg = hufu_config::Config::default();
         let eng = Engine::with_schema_dir(&dir, cfg).unwrap();
         (eng, dir)
@@ -5531,5 +5593,118 @@ mod tests {
         let st4 = eng.state(&s4);
         let texts4: Vec<&str> = st4.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts4, vec!["一点", "的", "𥙫"], "提前上屏段不置顶（码表原序）");
+    }
+
+    // 【反查关闭直出 2026-10-03】设置页方案选「（关闭反查）」（scheme
+    // 空）后按引导键：空态直出 disabled_output（默认「·」，可配「`」）；
+    // 配置空串 = 系统直通；编码态仍顶屏但改用配置符号；反查可用时
+    // 四态行为（反查/··/顶屏/Shift+~）原样不动。
+    #[test]
+    fn reverse_disabled_direct_output() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-revoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 无「反查」文件：schema.reverse/reverse_path 均空 = 反查不可用
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\njd\t就\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.reverse.scheme = String::new(); // 「（关闭反查）」
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        assert!(!eng.reverse_available(), "scheme 空 = 反查不可用");
+
+        // 空态按 ` → 直出「·」（默认），不进反查
+        let mut s = Session::new(true);
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("·"), "关闭反查空态 ` 直出 ·");
+        assert_eq!(s.mode, InputMode::Normal, "不进反查模式");
+
+        // 换配 `：直出半角反引号
+        eng.config.reverse.disabled_output = "`".into();
+        let mut s2 = Session::new(true);
+        let out = eng.process_key(&mut s2, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("`"), "disabled_output=` 直出 `");
+
+        // 配置空串：passthrough（旧行为兜底）
+        eng.config.reverse.disabled_output = String::new();
+        let mut s3 = Session::new(true);
+        let out = eng.process_key(&mut s3, key('`'));
+        assert!(!out.consumed, "disabled_output 空 = 系统直通");
+
+        // 编码态：顶首选 + 配置符号（` 形态）
+        eng.config.reverse.disabled_output = "`".into();
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('j'));
+        eng.process_key(&mut s4, key('d'));
+        let out = eng.process_key(&mut s4, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("就`"), "编码态 ` 顶首选带配置符号");
+
+        // 对照组：反查表在场（方案目录自带 反查.txt + scheme 非空但全局
+        // 文件缺失 → 回退方案目录探测）时空态 ` 仍进反查
+        let dir2 = std::env::temp_dir().join(format!("hufu-eng-revon2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\n").unwrap();
+        std::fs::write(dir2.join("反查.txt"), "西\txi\n").unwrap();
+        let mut eng2 = Engine::with_schema_dir(
+            &dir2,
+            hufu_config::Config::default(), // scheme=小鹤双拼，全局缺失→回退方案目录
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        assert!(eng2.reverse_available(), "方案自带反查表 = 反查可用");
+        let mut s5 = Session::new(true);
+        eng2.process_key(&mut s5, key('`'));
+        assert_eq!(s5.mode, InputMode::Reverse, "反查可用时空态 ` 仍进反查");
+    }
+
+    // 【；候选开关 2026-10-03】用户规格：「按『；』键给一个候选，1选：
+    // 2选；」默认开；关闭后按一下直出「；」并能顶屏（首选+；）。
+    // 候选档行为（: / ;; / ;xx 快符）由既有测试与默认配置保障。
+    #[test]
+    fn semicolon_punct_mode() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-semi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n;j\t；快符\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.input.semicolon_guide = false; // 纯标点档
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // 空态按 ; → 直出「；」
+        let mut s = Session::new(true);
+        let out = eng.process_key(&mut s, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("；"), "纯标点档空态 ; 直出；");
+        assert!(s.is_idle(), "直出后缓冲清空");
+
+        // 有编码态按 ; → 首选顶屏 +「；」
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out = eng.process_key(&mut s2, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("就；"), "编码态 ; 顶首选+；");
+        assert!(s2.raw.is_empty(), "顶屏后缓冲清空");
+
+        // Shift+; 不受档位影响：仍出「：」（编码态=首选+：）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let out = eng.on_char(&mut s3, ';', true);
+        assert_eq!(out.commit.as_deref(), Some("就："), "Shift+; 仍出：");
+
+        // 候选档回归：默认配置下空态 ; 进引导态弹 ：/； 候选
+        let mut cfg2 = hufu_config::Config::default();
+        cfg2.input.semicolon_guide = true;
+        let mut eng2 = Engine::with_schema_dir(&dir, cfg2).unwrap();
+        let mut s4 = Session::new(true);
+        eng2.process_key(&mut s4, key(';'));
+        assert_eq!(s4.raw, ";", "候选档空态 ; 进引导态");
+        let st = eng2.state(&s4);
+        let texts: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["：", "；"], "候选档 1选：2选；");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

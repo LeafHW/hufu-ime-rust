@@ -204,7 +204,12 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>反查方案（数据\拼音反查\ 内的表文件）</label>
         <select id="rev-scheme" style="width:220px"></select></div>
       <div class="field"><label>引导前缀</label><input type="text" maxlength="1" id="r-prefix" style="width:60px"></div>
-      <span class="sub" style="align-self:center">任何方案启用反查时都从这里调用；表中放新 .txt 文件后重开设置页即可选择。</span>
+      <div class="field"><label>关闭反查时按引导键</label><select id="rev-off-out" style="min-width:150px">
+        <option value="·">直出「·」（默认）</option>
+        <option value="`">直出「`」</option>
+        <option value="">交给系统</option>
+      </select></div>
+      <span class="sub" style="align-self:center">任何方案启用反查时都从这里调用；表中放新 .txt 文件后重开设置页即可选择。选「（关闭反查）」后按引导键将直接上屏右侧所选符号。</span>
     </div>
     <h3>拆分显示选择</h3>
     <div class="row">
@@ -242,6 +247,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="i-ascii-p"><label for="i-ascii-p">中文态英文标点</label></div>
       <div class="checkline"><input type="checkbox" id="i-dunhao"><label for="i-dunhao">/=顿时直出，屏蔽码表内/相关内容</label></div>
       <div class="checkline"><input type="checkbox" id="i-bdunhao"><label for="i-bdunhao" title="勾选：空态按 \ 直接上屏「、」；不勾（默认）：打 \ 弹「、」候选，空格确认">\=顿号直出</label></div>
+      <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：按 ; 弹出候选，1选「：」2选「；」，;+空格=：、;;=；直上，;xx 快符可用；不勾：按一下 ; 直接上屏「；」（有编码时首选上屏+「；」），不再作引导键">;=冒号分号候选<span class="sub">（关=直出；）</span></label></div>
       <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
     </div>
     <h3>候选</h3>
@@ -454,7 +460,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <span class="sub" id="ov-fileinfo" style="align-self:center">未选图</span>
       <span id="ov-anim-badge">🎞 动图</span>
       <div class="field"><label>配置</label>
-        <select id="ov-preset-sel" style="min-width:150px" title="已保存的挂件配置；选择即整套应用（图片、位置、全部参数）"><option value="">— 未保存配置 —</option></select>
+        <select id="ov-preset-sel" style="min-width:150px" title="新配置=不关联已存配置（改动只落在当前挂件）；选中已存配置=整套应用它，之后的改动也只影响当前挂件，「保存为配置」才会写回某个配置"><option value="">新配置</option></select>
         <button id="ov-preset-save" title="把当前图片与全部参数存为一个配置">保存为配置…</button>
         <button id="ov-preset-del" title="删除当前选中的配置">删除</button>
       </div>
@@ -597,6 +603,8 @@ function bindInputs() {
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
   B("#i-enter", "input.enter_clear"); B("#i-mixed", "input.mixed_input");
   B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao"); B("#i-bdunhao", "input.backslash_dunhao");
+  // 【；候选开关 2026-10-03】1选：2选；双档——关闭=按一下直出；能顶屏
+  B("#i-semi", "input.semicolon_guide");
   // 【Tab 双模式 2026-09-08】下拉映射 tab_clear（清屏=true / 导航=false），
   // 切换即存。【八十六修】输入页其他项已全部改动即存（防抖），此处的
   // 独立直存保留（即时反馈文案）。
@@ -658,6 +666,13 @@ function bindInputs() {
   $("#c-3rd").oninput = e => { if (e.target.value) CFG.candidates.third_select = e.target.value[0]; autoSave(e.target); };
   $("#r-prefix").value = CFG.reverse.prefix || "`";
   $("#r-prefix").oninput = e => { if (e.target.value) CFG.reverse.prefix = e.target.value[0]; autoSave(e.target); };
+  // 【反查关闭直出 2026-10-03】关闭反查时按引导键直出什么（·/`/交给系统）
+  {
+    const ro = $("#rev-off-out");
+    ro.value = CFG.reverse.disabled_output ?? "·";
+    if (ro.selectedIndex < 0) ro.value = "·";
+    ro.onchange = e => { CFG.reverse.disabled_output = e.target.value; autoSave(e.target); };
+  }
   // 【2026-09-06 大统一】反查/拆分方案下拉（/api/assets 实时列目录）
   const fillSel = (selId, cur, list, phOff) => {
     const el = $(selId); el.innerHTML = "";
@@ -1885,20 +1900,24 @@ const ovNum = (id, key, cast) => {
     ovSaveDeb(); ovPreview();
   };
 }
-/* ── 配置（presets）：整套挂件参数（图+处理+贴法+延时）命名保存/切换 ── */
+/* ── 配置（presets）：整套挂件参数（图+处理+贴法+延时）命名保存/切换 ──
+   语义（2026-10-03 用户拍板）：下拉首项=「新配置」（未选中任何已存配置，
+   当前改动不回写任何 preset）；「保存为配置」永远提示输入名字、
+   新名=新增、同名=覆盖——在配置1基础上改完存成配置2，配置1 原样保留。 */
 const ovPresetKeys = ["enabled", "image", "side", "base_height", "offset_x", "offset_y", "gap", "flip_h", "layer", "opacity", "v_align", "hide_delay_ms"];
 function ovPresetsRefresh(selName) {
   const s = $("#ov-preset-sel");
   const list = (SKIN.overlay && SKIN.overlay.presets) || [];
   const cur = selName !== undefined ? selName : s.value;
-  s.innerHTML = '<option value="">— 未保存配置 —</option>' +
+  s.innerHTML = '<option value="">新配置</option>' +
     list.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
   s.value = list.some(p => p.name === cur) ? cur : "";
 }
 $("#ov-preset-save").onclick = async () => {
   if (!OV.img && !(SKIN.overlay && SKIN.overlay.image)) return msg("先选择图片再保存配置", "err");
   ovPersist();
-  const name = prompt("配置名称：", "");
+  const def = $("#ov-preset-sel").value || "";
+  const name = prompt("保存为配置（新名=新增，同名=覆盖）：", def);
   if (!name || !name.trim()) return;
   const c = ovEnsureCfg();
   c.presets = c.presets || [];
@@ -1906,8 +1925,9 @@ $("#ov-preset-save").onclick = async () => {
   for (const k of ovPresetKeys) snap[k] = c[k];
   if (c.proc) snap.proc = JSON.parse(JSON.stringify(c.proc)); // 处理参数一并快照
   const ex = c.presets.findIndex(p => p.name === snap.name);
+  const overwrote = ex >= 0;
   if (ex >= 0) c.presets[ex] = snap; else c.presets.push(snap);
-  try { await saveSkin(); ovPresetsRefresh(snap.name); msg(`配置「${snap.name}」已保存 ✓`, "ok"); }
+  try { await saveSkin(); ovPresetsRefresh(snap.name); msg(overwrote ? `配置「${snap.name}」已更新 ✓` : `配置「${snap.name}」已保存 ✓`, "ok"); }
   catch (e) { msg("保存失败：" + e.message, "err"); }
 };
 $("#ov-preset-sel").onchange = async () => {

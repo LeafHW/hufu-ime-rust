@@ -147,7 +147,10 @@ pub struct InputSection {
     /// 候选时首选+「、」；false（默认）=打 \ 弹「、」候选（空格
     /// 确认，与 / 命名空间档的首选行为一致）。
     pub backslash_dunhao: bool,
-    /// 无编码时「;」引导标点：;+空格=：、;;=；直上
+    /// 无编码时「;」引导标点——双档（2026-10-03 用户规格补全关闭档）：
+    /// true=弹候选（1选「：」2选「；」；;+空格=：、;;=；直上，含 ;xx 快符）；
+    /// false=纯标点档（空态直出「；」，编码态首选顶屏+「；」，不再作
+    /// 引导键/编码字符，;xx 快符随之不可用）
     pub semicolon_guide: bool,
     /// 数字键参与整句选重
     pub digits_in_sentence: bool,
@@ -249,6 +252,11 @@ pub struct ReverseSection {
     pub prefix: char,
     /// 反查方案名（数据\拼音反查\<名>.txt；空=关；文件缺失回退方案目录旧表）
     pub scheme: String,
+    /// 【反查关闭直出 2026-10-03】反查不可用（scheme 空=设置页「关闭反查」
+    /// 或表文件缺失）时空态按反查引导键的行为：direct_symbol=直出该符号，
+    /// passthrough=交给系统（旧行为）。编码态「首选+符号」顶屏不受影响。
+    /// disabled_symbol=直出什么符号（默认「·」间隔号；可换 `）。
+    pub disabled_output: String,
 }
 
 impl Default for ReverseSection {
@@ -257,6 +265,7 @@ impl Default for ReverseSection {
             enabled: true,
             prefix: '`',
             scheme: "小鹤双拼".into(),
+            disabled_output: "·".into(),
         }
     }
 }
