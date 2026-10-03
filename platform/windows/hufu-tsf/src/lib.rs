@@ -30,6 +30,9 @@ mod ipc;
 // 语言栏品牌按钮（「虎」牌）+ 中/英模式 compartment 同步——Activate
 // 时安装（tsf.rs L312-321 实际调用链），非死代码。
 mod langbar;
+// 候选窗贴图挂件（兄弟窗）：ULW 分层窗贴在候选窗旁，2026-10-02。
+// 只读候选窗最终矩形取位，不碰候选窗锚点/几何代码。
+mod overlaywin;
 mod sound;
 mod tsf;
 

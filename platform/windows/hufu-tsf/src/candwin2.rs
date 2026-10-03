@@ -452,6 +452,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 // 【六十修】看门狗随藏同杀
                 let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
                 unsafe { rawinput_listen(hwnd, false) };
+                // 【贴图挂件 2026-10-02】候选窗收 → 兄弟贴图窗随收
+                crate::overlaywin::hide_for(hwnd);
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             return LRESULT(0);
@@ -510,6 +512,11 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 unsafe { ime_watchdog_tick(hwnd) };
                 return LRESULT(0);
             }
+        }
+        // 【贴图挂件 2026-10-02】候选窗销毁 → 兄弟贴图窗同线程随葬
+        //（不 return：落到底部 DefWindowProcW 走完原生销毁链）
+        0x0082 => unsafe {
+            crate::overlaywin::destroy_for(hwnd);
         }
         _ => {}
     }
@@ -4528,6 +4535,9 @@ impl CandidateWindowV2 {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
             };
+            // 【贴图挂件 2026-10-02】show 定位 SWP 后同步兄弟贴图窗
+            //（overlaywin 只读本窗最终矩形，不碰候选窗几何）
+            crate::overlaywin::sync_for(self.hwnd, skin);
             if sp_ok.is_err() {
                 crate::tsf::trace(&format!(
                     "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
@@ -5516,6 +5526,9 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             }
         }
     }
+    // 【贴图挂件 2026-10-02】tick 内移动/形变 SWP 后同步兄弟贴图窗
+    //（chase/pos_anim 走 move-only SWP 不经 show()，在此补同步）
+    crate::overlaywin::sync_for(hwnd, &skin);
     if anim_done {
         let _ = KillTimer(hwnd, FADE_TIMER_ID);
     }
@@ -5652,6 +5665,18 @@ static CAND_DRAGGED_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// （每进程窗口数有限，残留条目无害）。Vec 而非 HashMap：statics
 /// 里 HashMap::new 非 const，且条目数=窗口数（个位数）线性扫足够。
 static CAND_SHADOW_INSET: std::sync::Mutex<Vec<(isize, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// 【贴图挂件 2026-10-02】兄弟窗取内容盒用：本窗阴影物理内缩量
+///（渲染帧写入，见 show() 内 shadow_m 落档处）。
+pub(crate) fn shadow_inset_for(hwnd: HWND) -> i32 {
+    CAND_SHADOW_INSET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == hwnd.0 as isize)
+        .map(|(_, m)| *m)
+        .unwrap_or(0)
+}
 
 /// 【尺寸动效 2026-09-11】smoothstep 插值：t∈[0,ms] 映射进度
 /// p=3t²-2t³（缓起-加速-缓收，「成长感」明确——ease-out 起步即

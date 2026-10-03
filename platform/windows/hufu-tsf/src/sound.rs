@@ -407,8 +407,8 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
     Some((data?, rate, channels.max(1), bits))
 }
 
-/// 标准 base64 解码（无填充容错）。
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+/// 标准 base64 解码（无填充容错）。overlaywin 贴图挂件同款复用。
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let table = |c: u8| -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),

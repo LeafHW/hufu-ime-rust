@@ -232,18 +232,34 @@ fn main() {
                             .as_secs() as i64,
                     ))
                 };
+                // 【指纹 2026-10-03】(gguf 数, 最新 mtime)——拖入/删除/
+                // 换任意名 gguf 都构成边沿;旧探针只看第一个找到的文件。
                 let gguf_stat = |data_dir: &std::path::Path| -> Option<(u64, i64)> {
                     let model_dir = hufu_engine::Engine::resolve_data_sub(data_dir, "模型");
-                    std::fs::read_dir(&model_dir)
-                        .ok()?
-                        .filter_map(|e| e.ok())
-                        .find(|e| {
-                            e.path()
-                                .extension()
-                                .map(|x| x.eq_ignore_ascii_case("gguf"))
-                                .unwrap_or(false)
-                        })
-                        .and_then(|e| stat_of(&e.path()))
+                    let mut count: u64 = 0;
+                    let mut newest: i64 = 0;
+                    for e in std::fs::read_dir(&model_dir).ok()? {
+                        let e = e.ok()?;
+                        let p = e.path();
+                        if !p
+                            .extension()
+                            .map(|x| x.eq_ignore_ascii_case("gguf"))
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let md = std::fs::metadata(&p).ok()?;
+                        count += 1;
+                        if let Ok(mt) = md.modified() {
+                            if let Ok(d) = mt.duration_since(std::time::UNIX_EPOCH) {
+                                newest = newest.max(d.as_secs() as i64);
+                            }
+                        }
+                    }
+                    if count == 0 {
+                        return None;
+                    }
+                    Some((count, newest))
                 };
                 // 状态机：0=不在 1=首轮见 2=稳定（两轮同参）3=消失
                 // prev 永远同步为本轮快照（cur）。

@@ -307,19 +307,46 @@ impl Host {
                 &cfg.model_path,
             ));
         }
-        // 自动探测：数据根「模型」下任意 .gguf（排除 ngram bin）——
-        // 一级目录布局优先，回退 数据\ 内旧位置
+        // 自动探测：安装根「模型」下任意 .gguf——文件名不限，mtime 新→旧
+        //（与 ngram .bin 探测同款语义：拖入即用），GGUF 魔数校验挡垃圾
+        // 文件。一级目录布局优先，回退 数据\ 内旧位置。
         let model_dir = hufu_engine::Engine::resolve_data_sub(&self.data_dir, "模型");
         if let Ok(rd) = std::fs::read_dir(model_dir) {
-            let mut ggufs: Vec<PathBuf> = rd
+            let mut ggufs: Vec<(std::time::SystemTime, PathBuf)> = rd
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false))
+                .filter_map(|p| {
+                    let mt = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                    Some((mt, p))
+                })
                 .collect();
-            ggufs.sort();
-            candidates.extend(ggufs);
+            ggufs.sort_by(|a, b| b.0.cmp(&a.0));
+            candidates.extend(ggufs.into_iter().map(|(_, p)| p));
         }
-        candidates.into_iter().find(|p| p.exists())
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let mut picked: Option<PathBuf> = None;
+        for p in candidates {
+            if seen.contains(&p) {
+                continue;
+            }
+            seen.push(p.clone());
+            if p.exists() && Self::has_gguf_magic(&p) {
+                picked = Some(p);
+                break;
+            }
+        }
+        picked
+    }
+
+    /// GGUF 魔数校验（前 4 字节 "GGUF"）——解析前的廉价挡门。
+    fn has_gguf_magic(p: &Path) -> bool {
+        use std::io::Read;
+        let mut buf = [0u8; 4];
+        match std::fs::File::open(p) {
+            Ok(mut f) => matches!(f.read_exact(&mut buf), Ok(())) && &buf == b"GGUF",
+            Err(_) => false,
+        }
     }
 
     /// 装配神经重排工作线程（旧线程随发送端 Drop 退出）。
