@@ -719,6 +719,9 @@ unsafe extern "system" fn overlay_wndproc(
             entry.timer_armed = false;
             entry.frame_idx = 0;
             entry.hide_at = None;
+            // 隐藏=播放钟废弃:对表到现在,防下段显现带陈旧 play_start
+            // (欠账帧持续补放=每键都「到点」走帧,播放越打越快)
+            entry.play_start = std::time::Instant::now();
         }
         return LRESULT(0);
     }
@@ -759,6 +762,7 @@ unsafe extern "system" fn overlay_wndproc(
                 entry.shown = false;
                 entry.timer_armed = false;
                 entry.frame_idx = 0;
+                entry.play_start = std::time::Instant::now();
             }
         }
         return LRESULT(0);
@@ -800,6 +804,13 @@ unsafe fn advance_frame(ov_hwnd: HWND) {
     let now = std::time::Instant::now();
     let mut idx = entry.frame_idx % n;
     let mut start = entry.play_start;
+    // 时钟欠账超一整轮→对表丢弃(隐藏期残留 play_start/宿主长卡顿):
+    // 保留欠账会让此后每拍都「到点」,播放率退化成拍率(越按越快)
+    let loop_ms: u64 = delays.iter().map(|d| (*d).max(1) as u64).sum();
+    if now.saturating_duration_since(start).as_millis() as u64 > loop_ms {
+        start = now;
+        entry.play_start = start;
+    }
     // 到点才走,一拍至多 1 帧(与 tick_playback 逐字同式)
     if now.duration_since(start).as_millis() as u32 >= delays[idx].max(1) {
         start += std::time::Duration::from_millis(delays[idx].max(1) as u64);
@@ -876,6 +887,10 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
                 entry.shown = false;
                 entry.timer_armed = false;
                 entry.hide_at = None;
+                // 隐藏期残留 play_start 是时钟欠账源(下段显现后每拍都
+                // 「到点」=播放加速)——隐藏即对表到现在
+                entry.play_start = std::time::Instant::now();
+                entry.frame_idx = 0;
             }
         } else {
             entry.shown = false;
@@ -1070,6 +1085,14 @@ unsafe fn tick_playback(
     let mut idx = *frame_idx % n;
     let mut start = *play_start;
     let mut advanced = 0usize;
+    // 时钟欠账超一整轮→对表丢弃(与 advance_frame 同款:隐藏期残留
+    // play_start/宿主长卡顿;不丢弃=此后每拍都「到点」走 1 帧,
+    // 播放率退化成拍率=打字越密 GIF 越快,观感「首段正常之后加速」)
+    let loop_ms: u64 = delays.iter().map(|d| (*d).max(1) as u64).sum();
+    if now.saturating_duration_since(start).as_millis() as u64 > loop_ms {
+        start = now;
+        *play_start = start;
+    }
     // 每拍至多推进 1 帧:宿主线程卡顿后逐帧补放,绝不跳帧——跳帧会让
     // 观感帧在卡顿窗口里被整段越过(Code 实测「有时看不到」的真根因)
     while now.duration_since(start).as_millis() as u32 >= delays[idx].max(1) && advanced < 1 {
@@ -1134,6 +1157,9 @@ pub unsafe fn hide_for(cand: HWND) {
         entry.timer_armed = false;
         entry.frame_idx = 0;
         entry.hide_at = None;
+        // 与广播/延时收窗臂同款:隐藏即对表 play_start,防下段显现
+        // 带陈旧时钟欠账持续补放(播放越打越快)
+        entry.play_start = std::time::Instant::now();
     }
 }
 
