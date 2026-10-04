@@ -3418,6 +3418,42 @@ fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
     }
 }
 
+/// 【虎魄首键矮锚归一 2026-11·BUG8 特化删除后首修】trace 实锤（虎魄
+/// PyQt5 ACP）：组段首键瞬间 selection 与组段 END 两条 GetTextExt 都
+/// 返回「默认字体度量」矮锚（实测 14×16，top 正确、bottom=787）；第
+/// 二键起宿主布局追平，返回整行高盒（123px，bottom=894）。候选窗按
+/// 锚.bottom+4 落位 → 首键窗比第二键高约一整行（用户实锤「首键 y 高
+/// 一点、第二键正常；上屏后新编码首键同样偏高」）。修（通用，非特
+/// 化）：采纳前若 est 已知本宿主行高（lh≥8）、矮锚高度 < 50% 行高、
+/// 且 top 与 est 基线同带（|Δtop|<lh，防换行/换控件误拉伸），把
+/// bottom 拉到 top+lh——x/top 本就正确，只补全行高几何，est 播种行
+/// 高/候选窗落位全链吃到真值。正常宿主 caret 高≈行高（≥50%）不触发。
+fn normalize_short_anchor(g: &Shared, r: &mut RECT) {
+    let lh = g.caret_est_line_h;
+    if lh < 8 {
+        return;
+    }
+    // est 无基线哨兵（x=y=0）：est_y 无意义，不同带判定会放行 top<lh
+    // 的矮锚——显式挡一次。
+    if g.caret_est_x == 0 && g.caret_est_y == 0 {
+        return;
+    }
+    let h = r.bottom - r.top;
+    if h <= 0 || h >= lh / 2 {
+        return;
+    }
+    if (r.top - g.caret_est_y).abs() >= lh {
+        return;
+    }
+    r.bottom = r.top + lh;
+    if crate::tsf::trace_on() {
+        trace(&format!(
+            "qc: 矮锚归一 h={}→行高{} rect=({},{},{},{})",
+            h, lh, r.left, r.top, r.right, r.bottom
+        ));
+    }
+}
+
 /// 焦点视图窗类名（宿主编辑内核判定用：Scintilla 系锚语义特判）。
 /// 【死锁修复 2026-09-30】勿走 focus_view_hwnd——其内 TL shared.lock()
 /// 在 query_caret（edit session 持锁中）调用=同线程二次上锁自锁
@@ -3611,6 +3647,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             } else {
                 r
             };
+            // 【虎魄首键矮锚归一】（见 normalize_short_anchor 注释）——
+            // seg1 selection 采纳前统一补全矮锚行高。
+            let mut r = r;
+            normalize_short_anchor(g, &mut r);
             // 【八十八修·播种几何门 2026-09-25】WPS 表格双轮 trace 实锤
             //（18:36 与 18:43 两轮，40 次 d≈700-1180px 大跳瞬落）：组段
             // 建立瞬间 selection GetTextExt 偶发返回文档原点带（EXCEL7
@@ -3797,6 +3837,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             }
             _ => 0,
         };
+    }
+    // 【虎魄首键矮锚归一】组段 END 链成功值同样先归一（虎魄首段帧
+    // 返回 14×16 矮盒，与 selection 链同源同病）。
+    if let Some(ref mut r) = last_ok {
+        normalize_short_anchor(g, r);
     }
     let Some(mut rect) = last_ok else {
         g.qc_probe_steady = 0; // 单查失败可能是布局未收敛——回双查
