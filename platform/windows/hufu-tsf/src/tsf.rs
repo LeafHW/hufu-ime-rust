@@ -369,9 +369,6 @@ pub struct Shared {
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
     /// 异步重排换序后主动刷新候选窗）
     pub cand_sig_last: String,
-    /// 【三十四修】跟打器 est 无基线的建基线探测帧标记（GetTextExt
-    /// 双查循环里消费：true=只查一次即返回）。
-    pub hupo_single_probe: bool,
     /// 【二十五修·自适应单查】连续「双查同值」帧计数——≥3 转单查
     ///（省一半宿主布局回调）；烂锚/失败清零回双查。
     pub qc_probe_steady: u32,
@@ -414,45 +411,13 @@ pub struct Shared {
     pub caret_est_cal_x: i32,
     pub seg_key_index: i32,
     pub cur_raw_len: usize,
-    /// 【四十六修·虎魄段首锚+段内步进】虎魄 GetTextExt 只回「当前跟
-    /// 打段首」（顶部固定行左缘，像素 diff 实锤：打字推进在段内右移
-    /// 而查询值钉死段首=用户「跟一下没多久就远」的根因）。段内锚=
-    /// 段首 + 编码数 × 字母宽（hupo_unit_w，虎码编码与微软拼音组合
-    /// 区同字体，初始 38px）。上屏后新段首真值差 → 动态校准 unit_w
-    /// （hupo_cal_x/hupo_cal_raw 为上屏时快照）。
-    pub hupo_seg_start_x: i32,
-    pub hupo_seg_y: i32,
-    pub hupo_seg_h: i32,
-    pub hupo_seg_started: bool,
-    /// 【五十五修·段内轻推】键宽自校准（0=未校准，段内钉段首）：
-    /// 段间跳变量（新段首 x−上段首 x）=上屏字符真实渲染宽（真值，
-    /// 字体变了自动适应）；中文等宽排版字母≈半字宽 → 键宽=跳量×0.5
-    /// （排版常识系数，非像素魔法数）。hupo_last_seg_x 为校准用的
-    /// 上一段首 x。
-    pub hupo_key_w: f32,
-    pub hupo_last_seg_x: i32,
-    /// 【三十六修·死旗标清理】hupo_last_jump（只写不读，封顶语义由
-    /// hupo_line_span 承担）、hupo_reseg / hupo_reseg_armed /
-    /// hupo_seg_raw0 / hupo_long_mode / hupo_prev_raw 五组删除——
-    /// 五十六~五十八修注释描述的「重查重立段/行首 raw 基点/整句长流
-    /// 模式/顶屏消耗补偿」机制在代码中从未实现（旗标只写零读或恒
-    /// false，长注释是档案）。行宽/行距推断的真值字段（hupo_line_
-    /// span/line_dy）为活代码保留。归档详见 git 历史（三十六修交接单，2026-09）。
-    /// 【五十七修补·行宽真值】换行回退量=打字区一行总宽（立段
-    /// dx<-200 记录 |dx|）。整句流一行内轻推放开到行宽-余量（候选
-    /// 窗右缘留白 250），逐字流保持跳量 cap（防段末超前）。0=未测得，
-    /// 用跳量保守。
-    pub hupo_line_span: i32,
-    /// 【五十八修补·行距真值】立段间 dy（50..300）=换行行距；溢出推断
-    /// 的 y 步进。0=未测得（用行框高兜底）。
-    pub hupo_line_dy: i32,
-    pub hupo_last_seg_y: i32,
-    /// 【六十五修补·键序采纳基点】上次真值采纳（前进/换行/顶死/立段）
-    /// 时的 seg_key_index——键序轻推 dkeys=seg_key_index-adopt_key（单调，
-    /// 顶屏消耗不断档）。
-    /// 【七十三修·光标直跟】本帧 selection 真值（虎魄自绘光标线，宽
-    /// 2px 竖框）——帧末作锚（用户定稿：光标不动窗不动，动了平移过
-    /// 去）。None=本帧无真值，锚落段模型兜底。
+    /// 【特化删除 2026-11·BUG8 前置实验】跟打器（虎魄/晴/pain/名单）
+    /// 专属定位链已全量删除：hupo_seg_* 段模型字段、hupo_key_w 键宽
+    /// 自校准、hupo_last_seg_x、hupo_line_span/dy 行宽行距真值、
+    /// hupo_last_seg_y、hupo_cursor_truth 光标直跟、hupo_adopt_key 键序
+    /// 基点、hupo_had_commit 句内顶屏标记。所有宿主统一走标准链：
+    /// seg1 selection 优先 → 组段 END 折叠 GetTextExt → 连续性过滤 →
+    /// 极端锚拦截 → est 兜底。历史实现见 git（43修→74修链，整体移除）。
     /// 【七十七修·统一重做】直通数字尾巴：只在 TestDown 空闲数字放行时
     /// 记（宿主自上屏、engine 看不到的数字），随下一空态键 digit_tail
     /// 发往 server 做「后缀补齐」（不覆盖 engine tail——递键宿主 QQ
@@ -465,13 +430,6 @@ pub struct Shared {
     /// 七十七修：Op::DeleteBack 执行结果回传（TSF 扩选成功与否），
     /// dispatch 层据此决定走 TSF 提交还是键盘层注入。
     pub delete_back_ok: bool,
-    pub hupo_cursor_truth: Option<RECT>,
-    pub hupo_adopt_key: i32,
-    /// 【五十九修·句内顶屏标记】真上屏（text 非空）置位。raw==1 立段
-    /// 保护：句内顶屏后剩余 raw==1 不重新立段（selection 组段框恒=
-    /// 句首行，立段=跳回句首）。raw 空帧（组段结束）与 start_preedit_on
-    ///（新句）复位。
-    pub hupo_had_commit: bool,
     /// 【行尾检测】最近一帧 caret 逼近前台窗口右缘（软换行边界）：
     /// 下一键的引擎请求带上（提前上屏确认 2 键→1 键，组段缩短更勤，
     /// 跨行滞留窗口随之更小）。无 caret/窗口查询失败时保持 false。
@@ -564,7 +522,6 @@ impl Shared {
             tm_sink_cookie: 0,
             lang_sink_cookie: 0,
             cand_sig_last: String::new(),
-            hupo_single_probe: false,
             qc_probe_steady: 0,
             seg1_wide_suppress: 0,
             caret_recheck_due: false,
@@ -577,22 +534,10 @@ impl Shared {
             caret_est_cal_raw: 0,
             caret_est_cal_x: 0,
             seg_key_index: 0,
-            hupo_seg_start_x: 0,
-            hupo_seg_y: 0,
-            hupo_seg_h: 16,
-            hupo_seg_started: false,
-            hupo_key_w: 0.0,
-            hupo_last_seg_x: 0,
-            hupo_line_span: 0,
-            hupo_line_dy: 0,
-            hupo_last_seg_y: 0,
             digit_tail: String::new(),
             last_digit_vk: 0,
             last_digit_at: None,
             delete_back_ok: false,
-            hupo_cursor_truth: None,
-            hupo_adopt_key: 0,
-            hupo_had_commit: false,
             cur_raw_len: 0,
             line_end: false,
             last_key_ctx: None,
@@ -2727,13 +2672,9 @@ impl EditSession_Impl {
                 // 键 d=2-19=-17 → est 跳 -188px（窗被拽出屏）。
                 g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
                 g.composition = Some(comp);
-                // 【四十四修】虎魄 qie 首键优先 selection 真实位（即时），
-                // 失败落 query_caret（43 修补显重试链）
-                if exe_is_hupo_qie() {
-                    hupo_qie_step(&mut g, &ctx, ec);
-                } else {
-                    query_caret(&mut g, &ctx, ec);
-                }
+                // 【特化删除 2026-11】虎魄 qie 首键分支已删——统一
+                // query_caret 标准链。
+                query_caret(&mut g, &ctx, ec);
                 Ok(())
             }
             Op::SetPreedit(text) => {
@@ -2774,8 +2715,8 @@ impl EditSession_Impl {
                 // ①SetSelection 推选区到编码尾——宿主随之移动插入符
                 //（Chromium 系实测有效：Typora 键 u→r 锚 184→195 前进；
                 // Win11 记事本插入符也只按 selection 画）。
-                // ②查锚：虎魄/打包/UWP 壳走系统插入符（其 GetTextExt
-                // 恒定/常态失败；①已推 caret 到编码尾）；其余走
+                // ②查锚：打包/UWP 壳走系统插入符（其 GetTextExt
+                // 常态失败；①已推 caret 到编码尾）；其余走
                 // GetTextExt 编码尾。失败回落系统插入符，再失败保留
                 // 旧锚并武装 60ms 重查（Chromium 布局跨帧竞态自愈：
                 // SetText 后同帧双查也等不到，60ms 后必得新位置）。
@@ -2783,40 +2724,12 @@ impl EditSession_Impl {
                 // 估算链输入：当前编码长（失败帧推算用）。
                 g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
                 g.seg_key_index += 1;
-                // 【四十三修·最终：虎魄 v1.5.2 对照实锤】v1.5.2 二进制
-                // 实测（11/12 键有候选/0 跳/全窗内）：其段首 GetTextExt
-                // 同样首次失败，但 35ms 补显帧重跑 SetPreedit→query_caret
-                // （+36ms Qt 布局收敛）成功立锚。1.5.3+ 的 L1694 分支
-                // （fallback→est_step）把补显帧的 query_caret 截胡——
-                // est 无基线早退=零查询零重试=锚永远立不起来（「首段
-                // 无候选、上屏一次才有」根因）。虎魄 qie 恢复 v1.5.2
-                // 语义：无锚→query_caret（补显重试链通）。
-                // 【四十四修·段内 selection 跟手】用户主诉「候选还是
-                // 有点不跟手」——43 修恒定锚钉段首，段内光标前进后
-                // 候选逐键落后（4 键段末落后 ~60-90px）。反查链实测
-                // （43 修后）：selection 插入点查询（空 range 的
-                // GetTextExt）在虎魄上可用且即时（不进 Qt 组段布局锁，
-                // 反查每帧 35ms 补显连续调用无卡顿）。故段内每键改为：
-                // selection 查询真实插入位+连续性过滤采纳；失败/烂值
-                // 保持当前锚（恒定兜底不变）。全真实步进、零估算——
-                // 不回到 est 链（43 修定案它在这宿主是负资产）。
-                if exe_is_hupo_qie() {
-                    hupo_qie_step(&mut g, &ctx, ec);
-                } else if exe_is_hupo() || host_is_packaged() || focus_is_uwp_shell() {
-                    if let Some(mut r) = gui_caret_fallback() {
-                        hupo_clamp(&mut r);
+                // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴pain est
+                // 豁免）分支已删——统一标准链：打包/UWP 壳走系统插入
+                // 符，其余（含全部跟打器）query_caret。
+                if host_is_packaged() || focus_is_uwp_shell() {
+                    if let Some(r) = gui_caret_fallback() {
                         g.caret = Some(r);
-                    } else if exe_is_hupo() {
-                        // 【三十四修·跟打器段内零查询】自绘 caret 宿主
-                        // fallback 结构性 None——旧版跌进 query_caret：
-                        // 全线程快照 + GetTextExt 双查（布局锁 30-60ms/
-                        // 次），v1.5.2 特意为该宿主豁免的零查询被「逐键
-                        // 跟随」推翻 = 跟打器 61ms/键 的主源（trace 实锤
-                        // DoEditSession enter→qc: raw 间隔 58ms）。恢复
-                        // 豁免：est 有基线→纯内存步进（0ms）；无基线
-                        // （段首/点击后）→本帧保留旧锚，基线由 query_caret
-                        // 段首单查建立（见其 hupo 分支）。
-                        est_step(&mut g);
                     } else {
                         query_caret(&mut g, &ctx, ec);
                     }
@@ -2976,23 +2889,8 @@ impl EditSession_Impl {
                 // 上屏文本宽度直接加进步进位置（0.6 全角/0.41 半角×行
                 // 高）；新段编码从 0 起数。est 不算绝对位置只算步进——
                 // 每键一个 +N 矩形，与记事本真实查询的数据流同形。
-                // 【四十六修·虎魄上屏复位段标志】真上屏（非空 text；
-                // 每键 pipe back 的 commit='' 空串不算——47 补 2）后
-                // 复位 hupo_seg_started：下一段首键（raw==1）重新立
-                // 段（selection 已收敛到新段首）。48 修起段内不再算
-                // 术步进，校准快照字段已删。
-                // 【五十九修·顶屏上屏不复位】47 补 2 的复位对逐字流
-                //（SP 上屏→raw 空→新段首键立段）正确；但整句流顶屏
-                // 上屏（text 非空、raw 仍有剩余）也触发复位——段内
-                // 分支整体跳过（轻推/补偿链冻结），且顶屏后剩余
-                // raw==1 帧走立段分支，selection 组段框恒=句首行→
-                // 跳回句首（用户实测「换了行跳一下又跳回去」的真正
-                // 病根，此前 56/57/58 修全在与它打架）。改为：复位只
-                // 由 raw 空帧做（组段真正结束），顶屏上屏仅记
-                // hupo_had_commit（raw==1 立段保护：句内不重新立段）。
-                if !text.is_empty() {
-                    g.hupo_had_commit = true;
-                }
+                // 【特化删除 2026-11】hupo_had_commit 句内顶屏标记
+                //（虎魄 qie 段模型专用）已随特化链删除。
                 // 【三十四修·段间键宽自校准】单 CJK 字上屏 → 记待采样旗：
                 // 下一段首键锚点 − 本段 sticky 落点 = 真实全角字宽（观察
                 // 量，零估算），半之即半角键宽。多字/整句上屏不采样。
@@ -3278,27 +3176,12 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.composition = Some(comp);
     // 新段：首键重新真实锚定（raw 同步，防旧段 last_raw 污染 est）
-    // 【六十九修·平移连续】上屏后的段重开=同句延续：seg_key_index 续
-    // 打不归 1（hupo_adopt_key 同步对齐，dkeys 从 0 起步），斜率 w /
-    // y 锁全保留——候选窗平移不间断。此前归 1 后 saturating_sub(旧
-    // adopt) 恒 0，轻推死区=N 键——高频上屏下每段头卡一截=「平移没
-    // 之前流畅」。真新句（句内无上屏）才真重置——顺修新句同款死区
-    //（旧 adopt 残留 → 轻推死到追上为止）。
-    if g.hupo_had_commit {
-        g.hupo_adopt_key = g.seg_key_index;
-    } else {
-        g.seg_key_index = 1;
-        g.hupo_adopt_key = 0;
-    }
+    // 【特化删除 2026-11】hupo_had_commit/adopt_key 平移连续链（虎魄
+    // qie 段模型专用）已删——统一 seg_key_index 归 1（标准链段首
+    // selection 优先自会真实锚定）。
+    g.seg_key_index = 1;
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
-    // 【五十九修】新句：复位句内上屏标记（新句首键立段合法）
-    g.hupo_had_commit = false;
-    // 【四十四修】虎魄 qie 首键优先 selection 真实位（同 DoEditSession）
-    if exe_is_hupo_qie() {
-        hupo_qie_step(&mut g, ctx, ec);
-    } else {
-        query_caret(&mut g, ctx, ec);
-    }
+    query_caret(&mut g, ctx, ec);
     Ok(())
 }
 
@@ -3376,32 +3259,6 @@ fn selection_range(ctx: &ITfContext, ec: u32) -> Result<ITfRange> {
     r.ok_or_else(|| Error::from(HRESULT(-2147467259)))
 }
 
-/// 【虎魄跟打器横向滚动钳制 2026-09-12】监控实锤（08:04 时段）：跟打器
-/// 打字区=单行横向滚动，GetTextExt 返回**文档坐标**（行首+累计文本宽，
-/// 一路右涨）——候选窗锚点 X 冲出主窗右边界 420px 在桌面飘（2269>
-/// 1849）；上屏全宽一步进 +316px 大跳。真实屏幕 caret 因文本左滚保持
-/// 在可视区内。修：锚点 X 钳到宿主窗内（右缘 -60 钉住，左缘 +20 兜
-/// 底）——横向滚动模式 caret 视觉上贴打字区右侧，钳制即近似真实位
-/// 置；Y 监控正常不动。仅虎魄跟打器（单行打字区语义），其余宿主不受
-/// 影响。
-fn hupo_clamp(rect: &mut RECT) {
-    if !exe_is_hupo() {
-        return;
-    }
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return;
-    }
-    let mut wr = RECT::default();
-    if unsafe { GetWindowRect(fg, &mut wr) }.is_err() || wr.right <= wr.left {
-        return;
-    }
-    let capped = rect.left.min(wr.right - 60).max(wr.left + 20);
-    let d = capped - rect.left;
-    rect.left = capped;
-    rect.right += d;
-}
-
 /// 【增量估算步进 2026-09-12 十二次修正】单源锚：每键 x += (raw 增量)
 /// ×0.41×行高；行内累计超行宽（前台窗宽-160）折行：y+=行高、x 回行
 /// 首。上屏宽度由 Commit/C&R 直接累加（0.6 全角/0.41 半角）。成功查询
@@ -3444,18 +3301,11 @@ fn est_step(g: &mut Shared) {
     if !fg.0.is_null() {
         let mut wr = RECT::default();
         if unsafe { GetWindowRect(fg, &mut wr) }.is_ok() && wr.right > wr.left {
-            let hupo = exe_is_hupo();
-            // 【虎魄校准 2026-09-12 二修】跟打器打字区实际是**多行软换行**
-            //（监控实锤 Y 702→757→835；用户实测「换行了候选还在上一行」
-            // ——首版误判单行横向滚动禁了折行，Y 滞留上一行）。折行恢复，
-            // 虎魄专属两校准：①换行基点 ind=24（监控实测新行行首≈主窗左
-            // 缘+14，旧魔数 90 偏 115px）；②折行步长 1.42×lh（竖线 caret
-            // 高 55 vs 真实行距 78 实测）。X 出窗仍由 hupo_clamp 兜底
-            //（跟打器 GetTextExt 返回文档坐标，成功查询会重置 wrap=0，
-            // 折行由 est 帧间或换行后的真实帧触发）。
+            // 【特化删除 2026-11】虎魄专属折行校准（ind=24/1.42×lh/
+            // Y 轴钉底）已删——全宿主统一通用折行参数。
             let line_w = (wr.right - wr.left - 160).max(240);
-            let ind = if hupo { 24 } else { 90 };
-            let lh_w = if hupo { (lh as f32 * 1.42) as i32 } else { lh };
+            let ind = 90;
+            let lh_w = lh;
             let mut wrapped = false;
             while g.caret_est_wrap > line_w {
                 g.caret_est_wrap -= line_w;
@@ -3471,27 +3321,8 @@ fn est_step(g: &mut Shared) {
                     bottom: g.caret_est_y + lh,
                 };
             }
-            // 【三十四修·Y 轴钳制】跟打器打字区满屏后自动滚动（视口不
-            // 动、内容滚），est 无真实帧校准（自绘 caret 拿不到）→ y 跨
-            // 段累计漂移（实测 200s 打字 y=29676 飞出屏幕）。折行累计
-            // 的 y 超宿主窗底=视口早已滚过——钉在打字区可视底带（窗底
-            // -行高），候选窗留在打字区附近不飞屏。
-            if hupo && g.caret_est_y > wr.bottom - lh {
-                g.caret_est_y = wr.bottom - lh;
-                if g.caret_est_y < wr.top {
-                    g.caret_est_y = wr.top;
-                }
-                est = RECT {
-                    left: g.caret_est_x,
-                    top: g.caret_est_y,
-                    right: g.caret_est_x + 2,
-                    bottom: g.caret_est_y + lh,
-                };
-            }
         }
     }
-    // 【虎魄钳制】est 矩形出窗（文档坐标累计宽）时钳回宿主窗内右带。
-    hupo_clamp(&mut est);
     g.caret = Some(est);
     trace(&format!(
         "qc: est=({},{}) step={} raw={}",
@@ -3525,267 +3356,6 @@ fn selection_caret_rect(ctx: &ITfContext, ec: u32) -> Option<RECT> {
         }
     }
     None
-}
-
-/// 【四十九修·虎魄段内跟随=组段包围盒右缘】历史考古定案：8-31
-/// cadb6d5 用户认可的跟随=END 锚逐键查询；9-08 起虎魄（新 Qt 桥）
-/// 拒绝 END 折叠点查询（43 修实测 qc: GetTextExt 失败）+布局锁卡
-/// 5.1s。48 修实测 selection（空 range）恒定不前进。最后未试的真
-/// 值源：**组段完整 range（不折叠）的 GetTextExt**——返回整个编码
-/// 串的包围盒，编码每加一键 right 右移=编码末端真实位置（Qt 布局
-/// 算的，零字号依赖）。用法：段内每键先跳过同帧旧值，60ms 补显帧
-///（布局收敛，即时返回不卡——43 修补显链实证）查包围盒，right 连
-/// 续前进则采纳 x=right-14（候选窗左缘贴编码尾），y/行高钉段首
-///（用户认可「文字下面」位置）。
-fn hupo_qie_step(g: &mut Shared, ctx: &ITfContext, ec: u32) {
-    // 【六十一修·raw 空帧零副作用】顶屏 pipe back 是 commit='字'
-    // raw='' 同帧——59 修在 raw==0 复位 had_commit 会把顶屏保护洗
-    // 掉。真句末判据=start_preedit_on（开新组段）；顶屏不重建组段。
-    if g.cur_raw_len == 0 {
-        return;
-    }
-    if g.cur_raw_len == 1 {
-        // 【六十二修·句内 raw==1 不 return】hc=true（句内顶屏后剩余）
-        // 落入下方句内真值跟踪——return 会使位置永不变（61 版死锁）。
-        if !g.hupo_had_commit {
-            // 新句首键（start_preedit_on 已复位 hc）：强制重立段
-            g.hupo_seg_started = false;
-            // 段首键：selection 立段。
-            // 【五十二修·矮框不立段】版本行为档案实锤：顶屏自动上屏后的
-            // 新段首 selection 常返回矮框（16px 光标框，bottom 比整行框
-            // 高 124px）——立段 seg_h=16 → 锚 bottom 上抬 → 候选窗逐段
-            // 上移（用户「打第二个编码就往上面移」的病根）。整行框任何
-            // 输入场景都远大于 60px、矮框远小于它，以此分类：矮帧不立段
-            // （arm 60ms 重查，布局收敛帧拿到整行框再立，位置语义不变）。
-            if let Some(mut r) = selection_caret_rect(ctx, ec) {
-                let h = r.bottom - r.top;
-                if h >= 60 {
-                    if !g.hupo_seg_started {
-                        // 【五十五修·键宽自校准】段间跳变量=上屏字符真实渲染
-                        // 宽（同行跳 40..320px 才校准——换行回退/大跳不算）。
-                        // 中文等宽排版字母≈半字宽 → 键宽=跳量×0.5。纯真值
-                        // 派生，字体变化自动适应（零像素魔法数）。
-                        if g.hupo_last_seg_x > 0 {
-                            let dx = r.left - g.hupo_last_seg_x;
-                            if (40..320).contains(&dx) {
-                                g.hupo_key_w = (dx as f32) * 0.5;
-                            }
-                            // 【五十八修补·立段记行宽】换行回退量=一行总宽
-                            //（溢出推断的 cap 真值）。
-                            if dx < -200 {
-                                g.hupo_line_span = -dx;
-                            }
-                        }
-                        // 【五十八修补·立段记行距】dy 50..300=换行行距真值
-                        //（溢出推断的 y 步进，比行框高更准）。
-                        if g.hupo_last_seg_y > 0 {
-                            let dyl = r.top - g.hupo_last_seg_y;
-                            if dyl > 50 && dyl < 300 {
-                                g.hupo_line_dy = dyl;
-                            }
-                        }
-                        g.hupo_last_seg_y = r.top;
-                        g.hupo_last_seg_x = r.left;
-                        g.hupo_seg_start_x = r.left;
-                        g.hupo_seg_y = r.top;
-                        g.hupo_seg_h = h.max(16);
-                        g.hupo_seg_started = true;
-                        // 【三十六修】此处原五十七/五十八修的 行首 raw 基点/
-                        // reseg_armed/长流模式/顶屏补偿 四组旗标写点已删
-                        //（机制从未实现，见 Shared 字段区归档注释）。
-                        // 【六十五修补】键序采纳基点=当前键序
-                        g.hupo_adopt_key = g.seg_key_index;
-                    }
-                    hupo_clamp(&mut r);
-                    g.caret = Some(r);
-                    if r.left == g.hupo_seg_start_x && r.top == g.hupo_seg_y {
-                        arm_caret_recheck_timer();
-                    }
-                } else {
-                    // 【五十三修·矮框速显】矮框（顶屏上屏后新段首布局未收
-                    // 敛）的 x/top 是真值、只有高度矮。已立过段（已知行高）
-                    // → 真值 x/y + 已知行高立即显示（不 arm 重查——位置已
-                    // 正确，多一帧重查只会拖慢平移动效）；未立过段（首段）
-                    // → arm 60ms 重查等整行框。两 case 都不走 query_caret
-                    //（START 折叠查询返回的行框 y 比 selection 立段高 ~54px
-                    // =「抽风上移一下又回来/刚开打偏上」的病根，五十三修禁）。
-                    if g.hupo_seg_started && g.hupo_seg_h >= 60 {
-                        let mut rr = RECT {
-                            left: r.left,
-                            top: r.top,
-                            right: r.left + 14,
-                            bottom: r.top + g.hupo_seg_h,
-                        };
-                        hupo_clamp(&mut rr);
-                        g.caret = Some(rr);
-                    } else {
-                        arm_caret_recheck_timer();
-                    }
-                }
-            }
-            // 虎魄 qie 一律不走 query_caret（START 值 991 与 selection 立段
-            // 1045 差一行的框，采纳即偏上）。无锚期由 suppress→35ms 补显
-            // →本函数重查 selection 接管。
-            return;
-        }
-    }
-    // 【五十三修·段内零查询零重查】+【五十五修·段内轻推】锚=段首+
-    // (raw-1)×键宽：虎魄不给段内光标数据（实测全部查询姿势恒定/拒
-    // 绝），但键宽可从段间真值自校准（上屏字宽×0.5）——段内候选随
-    // 编码逐键右移贴光标（纯计算零查询，不拖动效节奏）。未校准期
-    //（首段/换行后）钉段首（保守）。
-    // 【五十六修·重查帧重立段（三十六修归档：未实现）】换行时刻的
-    // 立段竞态自愈通道只存在于注释：hupo_reseg 旗标在 CARET_TIMER 有
-    // 置位、段内分支从无消费——「重查 selection+守卫重立段」整链缺失
-    //（「新行和上一行末来回跳」的自愈实际未生效）。旗标已删；58/60 修
-    // 的长流纯推断模型（下方）承担换行跟随。
-    // 【五十八修·整句长流纯推断】整句流（raw 涨超 6 键）中 selection
-    // 组段框恒=句首行（虎魄组段 range 在句首不动）——56/57 的重查重
-    // 立段会跳回句首（用户实测「还是跳回去」）；顶死武装在 raw 恒涨
-    // 时每键 arm 一帧重查=动效变慢。整句长流切换纯推断模型：零查询
-    // 零重查零 arm——换行靠 x 溢出推断（行宽/行高全真值校准，行高
-    // 初值=立段行框高，SP 流换行时自然校准）。
-    // 【六十修·长流判定改句内累计键数】raw>6 判定被顶屏消耗压垮——
-    // 真实整句流 raw 在 1-5 徘徊（每 2-4 键被顶屏上屏消耗），长流模
-    // 式永远不进 → 轻推钉死一字宽、无换行机制（用户实测「换行没跟
-    // 随」）。改用 seg_key_index（句内累计键序号：每键递增、顶屏不
-    // 减、start_preedit_on 新句重置）>6 判定——逐字流每句 4 键不受
-    // 影响，整句流句内 7 键起进纯推断模式（溢出换行立即跟随）。
-    // 【六十二~六十五修·句内每帧真值跟踪统一模型】数据链（90 秒真实
-    // 监控×3 + 多行自测，逐轮实证）：
-    // - 61 版死锁：key_w 只在立段校准（句首 dx=0 校不了）→ 轻推恒 0
-    //   → 位置永不变 → 永无跳量（诊断帧 seg/nud/span 全程钉死）。
-    // - 虎魄句内 selection 偶给真值（跟打进度处 1931/2115/2207 实测）
-    //   ——前进采纳（单调锁）+ key_w 自举（dx/keys，20..90 域内才收）。
-    // - 62 版 y 漂移：前进采纳带 y 跟（dy<60 逐帧累计 +317px）→ 63
-    //   y 锁：同行前进只写 x，y 不动。
-    // - 63 版换行飘移：溢出兜底 y+=line_dy 是纯推断——虎魄打字区滚
-    //   动后新行 y 回网格上方而非 +dy，推断 y 无限递增=「越飘越多」
-    //   （用户多行实测）→ 六十五：推断零 y 写入；y 只由真值改——
-    //   换行采纳（下移 dy 40..300=正常换行；上移 |dy|≤行距×3 且已有
-    //   行距真值=滚动换行）与新句首立段。
-    // - 顶死（轻推≥行宽-250）：x 回行首、基点重置，y 不动等下一帧
-    //   换行真值。
-    if !g.hupo_seg_started {
-        return;
-    }
-    // 【六十五修补·键序轻推】raw 轻推被顶屏回落打断（消耗帧 keys 归
-    // 零+补偿欠账=x 回退，自测 k24 后 -1000px 实锤）。seg_key_index
-    // 每键+1、顶屏不减——x=采纳点+(键序差)×w，斜率 w 由「采纳对采纳」
-    // 自举（dx/键数差，域内才收）。顶屏补偿链删除（键序模型天然覆盖
-    // 上屏前进——上屏的字也是打过的键）。
-    // 每帧真值跟踪（单调前进锁，GetTextExt 即时返回不卡——43 修实证）
-    if let Some(r) = selection_caret_rect(ctx, ec) {
-        // 【七十三修·光标直跟】真值帧：光标线直存（帧末作锚），采纳
-        // 分支照跑（段模型字段维护=无真值帧的兜底基线）。
-        g.hupo_cursor_truth = Some(r);
-        let h = r.bottom - r.top;
-        if h >= 60 {
-            let dx = r.left - g.hupo_seg_start_x;
-            let dy = r.top - g.hupo_seg_y;
-            if dx > 40 && dx < 800 && dy.abs() < 60 {
-                // 同行前进真值：采 x + 斜率自举；y 锁（63）
-                let dkeys = g.seg_key_index.saturating_sub(g.hupo_adopt_key);
-                if dkeys >= 2 {
-                    let w = dx as f32 / dkeys as f32;
-                    if (15.0..60.0).contains(&w) {
-                        g.hupo_key_w = w;
-                    }
-                    trace(&format!(
-                        "qie: 采纳前进 dx={} dkeys={} w={:.1} →({},{})",
-                        dx, dkeys, w, r.left, g.hupo_seg_y
-                    ));
-                }
-                g.hupo_seg_start_x = r.left;
-                g.hupo_adopt_key = g.seg_key_index;
-                g.hupo_last_seg_x = r.left;
-            } else if dx < -200 && dy > 40 && dy < 300 {
-                // 换行真值（下移）：新行首 + 记行宽/行距
-                g.hupo_line_span = -dx;
-                g.hupo_line_dy = dy;
-                trace(&format!(
-                    "qie: 采纳换行 span={} dy={} →({},{})",
-                    -dx, dy, r.left, r.top
-                ));
-                g.hupo_seg_start_x = r.left;
-                g.hupo_seg_y = r.top;
-                g.hupo_adopt_key = g.seg_key_index;
-                g.hupo_last_seg_x = r.left;
-                g.hupo_last_seg_y = r.top;
-            } else if dx < -200
-                && g.hupo_line_dy > 0
-                && dy <= -(g.hupo_line_dy / 3)
-                && dy > -(g.hupo_line_dy * 3)
-            {
-                // 【六十五】滚动换行真值（上移 行距/3..行距×3）：采真值 x+y。
-                // 【七十一修·近零带排除】原条件 dy∈(-3×行距, 0) 会误收
-                // 虎魄渲染中间态（换行帧 x 已回行首、y 未更新——实测
-                // dx=-322 dy=-8 被采，y 钉在旧值-8，后续完整换行真值因
-                // dx 条件不再满足而卡死，y 在对错值间震荡=换行后候选
-                // 跳动根因）。真实滚动换行 |dy| 至少 1/3 行距可感——近
-                // 零带（|dy|<行距/3）拒绝采纳，等下一帧完整真值（正常
-                // 换行分支 dx<-200+dy 40..300 接住）。
-                g.hupo_line_span = -dx;
-                trace(&format!(
-                    "qie: 采纳滚动换行 dy={} →({},{})",
-                    dy, r.left, r.top
-                ));
-                g.hupo_seg_start_x = r.left;
-                g.hupo_seg_y = r.top;
-                g.hupo_adopt_key = g.seg_key_index;
-                g.hupo_last_seg_x = r.left;
-                g.hupo_last_seg_y = r.top;
-            }
-        }
-    }
-    // 键序轻推 + 顶死（x-only；y 等真值——六十五）
-    let dkeys = g.seg_key_index.saturating_sub(g.hupo_adopt_key);
-    let mut nudge = (dkeys as f32 * g.hupo_key_w).round() as i32;
-    let cap = if g.hupo_line_span > 250 {
-        g.hupo_line_span - 250
-    } else {
-        i32::MAX / 4
-    };
-    if cap != i32::MAX / 4 && cap > 0 && nudge >= cap {
-        g.hupo_adopt_key = g.seg_key_index;
-        nudge = 0;
-        trace("qie: 顶死回行首（y 等真值）");
-    }
-    let x = g.hupo_seg_start_x + nudge.min(if cap == i32::MAX / 4 { nudge } else { cap });
-    let mut rr = RECT {
-        left: x,
-        top: g.hupo_seg_y,
-        right: x + 14,
-        bottom: g.hupo_seg_y + g.hupo_seg_h,
-    };
-    // 【七十三修·光标直跟】用户定稿：候选就在自绘光标下面，光标不
-    // 动窗不动，光标动了再平移过去。实测 selection 真值=虎魄自绘光
-    // 标线（宽 2px 竖框：x 随打字逐键前进、y 精确跟换行与打字区滚
-    // 动）——真值即锚，直接用；上方推进模型（轻推/前进锁/换行判
-    // 别）降级为无真值帧的兜底（rr 保持段模型计算值）。
-    if let Some(r) = g.hupo_cursor_truth.take() {
-        rr = RECT {
-            left: r.left,
-            top: r.top,
-            right: r.right,
-            bottom: r.bottom,
-        };
-    }
-    hupo_clamp(&mut rr);
-    g.caret = Some(rr);
-    trace(&format!(
-        "qie: 帧 raw={} segKey={} hc={} 段=({},{}) dk={} w={:.1} cap={} 锚=({},{})",
-        g.cur_raw_len,
-        g.seg_key_index,
-        g.hupo_had_commit,
-        g.hupo_seg_start_x,
-        g.hupo_seg_y,
-        dkeys,
-        g.hupo_key_w,
-        cap,
-        rr.left,
-        rr.top
-    ));
 }
 
 /// 【三十四修·chase 实验通道】追赶式跟随开关：C:\ProgramData\HuFu\diag\chase
@@ -3879,73 +3449,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     let prev_caret = g.caret;
     let prev_line_end = g.line_end;
     g.caret = None;
-    // 【虎魄跟打器 2026-09-12】其 GetTextExt 返回恒定值（上屏后窗不
-    // 跳），改查系统插入符（GUITHREADINFO，零 TSF 回调不进布局锁）
-    // ——上屏后插入符在上屏文字尾，恰好是「上屏动一次」要的位置。
-    // 【四十三修·虎魄回归 v1.5.2 行为】用户实锤：1.5.2 及更早虎魄完全
-    // 正常（无偏上/无超窗/无首两键缺候选），1.5.3+ 的 est 估算链在
-    // 虎魄（PyQt5 自绘 PromptCanvas 打字区，无系统 caret、GetTextExt
-    // 恒定值）上全是负资产：恒定值污染 est 基线（偏上/没跟随）、est
-    // 累计出窗（超窗）、probe 段首两键 suppress（首两键无候选）。
-    // v1.5.2 模式=「锚组段起点 + 段内零查询零估算」：段首键查一次
-    // （虎魄 GetTextExt 恒定值恰好=段起点，歪打正着），段内候选钉住
-    // 不动，上屏后新段再查一次（「上屏动一次」）。晴/pain 的 est 链
-    // 现状良好（用户只夸晴），分家保留。
-    if exe_is_hupo() {
-        if exe_is_hupo_qie() {
-            // 【七十三修·光标直跟】虎魄无系统插入符（31 线程实测全无
-            // caret，GUITHREADINFO 恒 None）。真值=selection 光标线
-            //（自绘光标，宽 2px 竖框：x 逐键前进、y 跟换行与滚动）
-            // 每帧直查直写；失败落段模型重建（七十一修补3 兜底，
-            // 不碰 GetTextExt 恒定值）。
-            if let Some(mut r2) = selection_caret_rect(ctx, ec) {
-                hupo_clamp(&mut r2);
-                g.caret = Some(r2);
-                return;
-            }
-            if let Some(mut r) = gui_caret_fallback() {
-                hupo_clamp(&mut r);
-                g.caret = Some(r);
-                return;
-            }
-            // 兜底：段模型重建（零查询零宿主值）
-            let mut r = RECT {
-                left: g.hupo_seg_start_x,
-                top: g.hupo_seg_y,
-                right: g.hupo_seg_start_x + 14,
-                bottom: g.hupo_seg_y + g.hupo_seg_h.max(20),
-            };
-            hupo_clamp(&mut r);
-            g.caret = Some(r);
-            return;
-        } else {
-            // 晴/pain：保持现状（fallback → est → probe 链）
-            if let Some(mut r) = gui_caret_fallback() {
-                hupo_clamp(&mut r);
-                g.caret = Some(r);
-                return;
-            }
-            // 【三十四修·段内零查询】fallback 结构性 None（自绘 caret）时
-            // 不再跌进标准链（GetTextExt 布局锁 30-60ms）。est 有基线→纯
-            // 内存步进；无基线（段首）→标准链**单查**建一次基线。
-            // 【三十八修补·虎魄步宽校准】三十八修的 unit_w 采样在标准链
-            // 重校点——旧条件 est 有基线即 return，虎魄段首建过基线后
-            // 永远不再进标准链 → unit_w 恒 0，est_step 恒用 0.41×行高
-            //（虎魄 caret 高 140 → 57px/键，乱飞没修掉，用户实锤"还是
-            // 一样"）。改：步宽未校准时（unit_w<=0.5），段内前两键各走
-            // 一次单查（probe）——第一键建基线，第二键与第一键的位移差
-            // =干净步宽样本（同段真实位置，无上屏估算污染）；此后段内
-            // 全程零查询。跟打器每段头最多 2×30-60ms（段首节奏间隙内）。
-            if g.caret_est_line_h > 0
-                && !(g.caret_est_x == 0 && g.caret_est_y == 0)
-                && !(g.caret_est_unit_w <= 0.5 && g.seg_key_index <= 2)
-            {
-                est_step(g);
-                return;
-            }
-            g.hupo_single_probe = true; // 本次允许单查（GetTextExt 循环里消费）
-        }
-    }
+    // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴 pain est 豁免链）
+    // 入口分派已删——全部宿主统一走下方标准链。
     // 【单源锚·连续性过滤 2026-09-12 十三次修正】不再在入口拦查询
     //（曾因差一错误第二键未被拦——用户实锤「第二个编码跳一下」）。
     // 改为：段内第 2 键起，成功矩形必须「步进合理」才采纳——同行
@@ -4009,7 +3514,6 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // seg1 整体跳过 selection 优先直接落标准链（43 修虎魄 qie 同款
     // 决策）；查询失败仍有系统插入符/est/60ms 重查兜底。
     if g.seg_key_index == 1
-        && !exe_is_hupo_qie()
         && !focus_view_class().is_some_and(|c| c.contains("Scintilla"))
     {
         if let Some(r) = selection_caret_rect(ctx, ec) {
@@ -4228,16 +3732,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【锚=编码尾 2026-09-12 定版】逐键跟随：SetSelection 已把选区推
     // 到段末，collapse END 量的就是编码尾（Chromium 按 selection 返回
     // ——实测键 u→r 锚 184→195 前进；EDIT 型返回 END 折叠点同义）。
-    // 【四十三修补·虎魄锚 START】v1.5.2 虎魄=锚组段起点
-    //（Collapse START），查询恒成功；1.5.3+ 全局改 END 后 Qt 桥对
-    // END 折叠点直接拒绝（qc: GetTextExt 失败→suppress→首键无候选，
-    // 用户实锤 1.5.2 无此症状）。虎魄 qie 复刻 v1.5.2 用 START——
-    // 段内恒定模式下 START≈END 语义（段首一查钉住）。
-    let anchor = if exe_is_hupo_qie() {
-        TF_ANCHOR_START
-    } else {
-        TF_ANCHOR_END
-    };
+    // 【特化删除 2026-11】虎魄 START 锚分支已删——全宿主统一 END。
+    let anchor = TF_ANCHOR_END;
     if unsafe { caret.Collapse(ec, anchor) }.is_err() {
         trace("qc: Collapse 失败");
         return;
@@ -4254,16 +3750,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 查询常返回旧布局（前一位置），第二次才反映新光标。锚点在旧/新
     // 之间交替正是候选窗「中间→下面→中间」跳动的病根。连查两次取
     // 末次非退化结果，迫使懒布局在本次渲染前完成。
-    // 【三十四修·单查】跟打器 est 无基线的建基线探测帧只查一次
-    // （布局锁下每次 30-60ms，双查无谓翻倍；基线允许粗糙——est 步进
-    // 与 hupo_clamp 会消化）。
     // 【二十五修·自适应单查】双查的第二查为懒布局宿主强制收敛；布局
     // 已稳的宿主两查恒同值=白付一次宿主布局回调（WPS Qt 布局锁下
     // 10-30ms/次，逐键 ×2 是全键延迟大头）。连续 3 帧双查同值 →
     // 转单查；单查被判烂锚/失败 → 清计数回双查。
-    let probes: u32 = if std::mem::take(&mut g.hupo_single_probe) {
-        1
-    } else if g.qc_probe_steady >= 3 {
+    // 【特化删除 2026-11】跟打器 single-probe 建基线帧标记已删——
+    // 只剩自适应单查（qc_probe_steady≥3）一条路。
+    let probes: u32 = if g.qc_probe_steady >= 3 {
         1
     } else {
         2
@@ -4357,12 +3850,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             // 帧重查：60ms 后布局完成，重查成功→真实校准（双向滑动+
             // 2px 死区+动态时长可平滑消化拉回，不似旧瞬移时代会抖）。
             // 重查失败→est_step 幂等（d=0 位置不变），无害。
-            // 【三十四修】跟打器豁免：重查=再来一次布局锁 GetTextExt
-            //（30-60ms），est+hupo_clamp 已够——豁免即恢复 v1.5.2 该
-            // 宿主「段内零查询」的性能决策。
-            if !exe_is_hupo() {
-                arm_caret_recheck_timer();
-            }
+            // 【特化删除 2026-11】跟打器豁免已删——全宿主统一武装。
+            arm_caret_recheck_timer();
             return;
         }
         g.caret = prev_caret;
@@ -4371,13 +3860,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 可能失败（渲染进程异步布局，同帧双查也等不到——Typora 第三
         // 键实录）：武装 60ms 重查定时器，到点强制 update_ui 重跑本键
         // SetPreedit（CARET_TIMER 已置 caret_force），跨帧拿到新锚。
-        // 【三十四修】跟打器豁免同上。
-        // 【四十三修补】虎魄例外：43 修模式=段首一查+段内零查询，段首
-        // 失败必须能重查（一次性 60ms 非性能负担；段内不进标准链，
-        // timer 链不会在段内反复触发）。晴/pain 维持豁免。
-        if !exe_is_hupo() || exe_is_hupo_qie() {
-            arm_caret_recheck_timer();
-        }
+        // 【特化删除 2026-11】跟打器豁免已删——全宿主统一武装。
+        arm_caret_recheck_timer();
         trace("qc: GetTextExt 失败，武装 60ms 跨帧重查");
         return;
     };
@@ -4416,8 +3900,9 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         // 非跟打器阈 -300 把真实帧拦死，est 永不重校=死锁错位。真实帧
         // 是事实、est 是猜测：非跟打器阈放宽到 -1500（拦真疯狂值
         // 错窗口级），QQ 类删除/重排场景 dx∈[-1500,0] 的真实帧一律
-        // 放行重校。跟打器维持 -3000（文档坐标特性）。
-        let lo = if exe_is_hupo() { -3000 } else { -1500 };
+        // 放行重校。【特化删除 2026-11】跟打器 -3000 特例已删——
+        // 全宿主统一 -1500。
+        let lo = -1500;
         if dx > 800 || dx < lo || dy < -300 {
             // 【九十二修·归属仲裁 2026-09-25】九十一修的活插入符仲裁在
             // 本宿主从未触发（live=[] 结构性缺失，九十修插桩实锤）。改
@@ -4449,10 +3934,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         }
     }
     // 成功查询=增量估算重校点：步进位置对齐真实矩形。
-    // 【虎魄钳制】跟打器 GetTextExt 返回文档坐标（横向滚动累计宽，
-    // 监控实测一路涨出主窗右缘 420px）——钳到宿主窗内右带后再对齐
-    // est 基线（est 从钳位点起步，est 矩形天然在窗内）。
-    hupo_clamp(&mut rect);
+    // 【特化删除 2026-11】虎魄文档坐标钳制（hupo_clamp）已删。
     // 【Scintilla 折叠点宽盒·suppress 2026-09-30 三轮】seg1 跳过
     // selection 后实测：组段 END 折叠点查询在组段刚建瞬间返回的仍是
     // **上次提交处的旧布局盒**（实测 (299,182,339,202) y/x=上一行「玉
@@ -4811,7 +4293,10 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 122ms（138ms 首键延迟的实锤主耗）。折中：抑制 35ms（≈1
         // 帧布局稳定下限）+ 一次性定时器到点主动补显——总延迟
         // ~55ms 且不跳。
-        let first_frame_unstable = host_async_layout()
+        // 【特化删除 2026-11】host_async_layout（跟打器探测器）已删
+        // ——首帧 35ms 抑制整体失效（false 短路），标准链保留结构
+        // 备将来复用。
+        let first_frame_unstable = false
             && !raw.is_empty()
             && raw.len() <= 1
             && g.raw_changed_at
@@ -4848,15 +4333,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             // 【上屏跟随】懒布局宿主上屏帧 caret 常是旧行框——布置 60ms
             // 重查（见 caret_recheck_due 注释）。锚组段起点宿主不需要：
             // CommitAndRepreet 新组段 StartPreedit 会话自会查首帧锚点。
-            // 【三十四修】跟打器豁免：重查会话=布局锁 GetTextExt 再来
-            // 一次（30-60ms）；上屏宽度已由 Op::Commit 的 est 累加消化。
             // 【三十四修·死代码清理】host_follow_caret() 恒 true（用户
-            // 拍板全宿主跟随光标后函数退化），内联删除；跟打器豁免
-            // 由 exe_is_hupo() 承担。
-            if !exe_is_hupo() {
-                g.caret_recheck_due = true;
-                arm_caret_recheck_timer();
-            }
+            // 拍板全宿主跟随光标后函数退化），内联删除。
+            // 【特化删除 2026-11】跟打器豁免（exe_is_hupo）已删——
+            // 全宿主统一武装 60ms 重查。
+            g.caret_recheck_due = true;
+            arm_caret_recheck_timer();
             Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
             Some(Op::StartPreedit(preedit.to_string()))
@@ -5437,13 +4919,8 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         // 【反查首帧锚点 2026-09-11】无组段帧 caret 恒 None——退
         // 系统插入符（GUITHREADINFO hCaret）：反查提示窗直接落在
         // 真实输入位置，打出首字母后组段锚点接管（位置滑动过渡）。
-        // 【五十修】虎魄 qie 不走此兜底（Qt 光标线会把窗拽到文字行
-        // 内=「往上移」，同 first_show_of_seg 分支根因）。
-        let caret = if exe_is_hupo_qie() {
-            caret
-        } else {
-            caret.or_else(gui_caret_fallback)
-        };
+        // 【特化删除 2026-11】虎魄 qie 直通分支已删——统一兜底。
+        let caret = caret.or_else(gui_caret_fallback);
         // 【四十三修·整框垃圾锚拦截 2026-09-22】Excel 实测（探针+trace
         // 实锤）：首显又快又准（+4ms、锚=所点格窄框），~195ms 后一帧
         // 喂进 (750,531,2334,553)——1584px 宽的公式栏编辑条整框（Excel
@@ -7311,73 +6788,14 @@ fn poll_tick() {
     let _ = update_ui(shared, String::new(), state);
 }
 
-/// 跟打器类宿主：文本布局懒/异步——组段首帧 GetTextExt 常返回旧行框
-/// （首键候选窗偏高一行、第二键跳正，实测 y 序列 1092→1175 / 1166→1286）。
-/// 此类宿主启用「首帧 220ms 稳定期抑制 + 260ms 轮询补显」；同步布局
-/// 宿主（记事本等）首帧 rect 本就正确，不受影响。
-fn host_async_layout() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.contains("跟打"))
-            .unwrap_or(false)
-    })
-}
-
-/// 【三十四修·死代码清理】host_follow_caret() 已删：恒 true（用户拍板
-/// 全宿主跟随光标后函数退化，唯一调用点已内联）；跟打器豁免由
-/// exe_is_hupo() 承担。分化历史见 git（v1.5.2 时代虎魄锚组段起点）。
-
-/// 【虎魄跟打器判定 2026-09-12】真打字宿主名（此前 TigerClaw 判定
-/// 是错靶——那是虎魄的组件进程）。其 GetTextExt 返回恒定值（窗钉
-/// 死首键处），且布局锁下逐键 GetTextExt 卡秒级——走系统插入符。
-/// 【跟打器家族 2026-09-12 扩】用户三跟打器并存：虎魄、晴跟打、
-/// Pain 跟打器（trace 实锤进程 Pain打器.exe，est 超前死锁同款）
-/// ——同属「打字区多行软换行 + GetTextExt 步进可靠 + est 会超前
-/// 死锁」类宿主，钳制/折行校准/dx 放宽全家统一。匹配不区分大小写。
-/// 【跟打器名单文件 2026-09-12】以后新增跟打器免改码免重发：
-/// C:\ProgramData\HuFu\diag\typing-trainers.txt 一行一个关键词
-/// （进程名包含即命中，# 开头为注释），加完重开该应用生效。
-/// 每进程启动读一次（OnceLock 缓存）。
-pub(crate) fn exe_is_hupo() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let name = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        let nl = name.to_lowercase();
-        if nl.contains("虎魄") || nl.contains("晴") || nl.contains("pain") {
-            return true;
-        }
-        if let Ok(s) = std::fs::read_to_string(r"C:\ProgramData\HuFu\diag\typing-trainers.txt") {
-            return s.lines().any(|kw| {
-                let k = kw.trim().to_lowercase();
-                !k.is_empty() && !k.starts_with('#') && nl.contains(&k)
-            });
-        }
-        false
-    })
-}
-
-/// 【四十三修·虎魄分家】虎魄严格判定：est 估算链（步宽校准/折行/
-/// probe）只服务晴/pain（GetTextExt 步进可靠的宿主）；虎魄
-/// （PyQt5 自绘 PromptCanvas，GetTextExt 恒定值+无系统 caret）
-/// 回归 v1.5.2 的「锚组段起点+段内恒定零查询」模式。外部名单
-///（typing-trainers.txt）的新跟打器默认走 est 链（晴模式），名字
-/// 含"虎魄"才走恒定模式。
-fn exe_is_hupo_qie() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .map(|n| n.to_lowercase().contains("虎魄"))
-            .unwrap_or(false)
-    })
-}
+/// 【特化删除 2026-11·BUG8 前置实验】跟打器宿主探测器全家已删：
+/// - host_async_layout（进程名含「跟打」→ 首帧 35ms 抑制）
+/// - exe_is_hupo（虎魄/晴/pain + typing-trainers.txt 外部名单）
+/// - exe_is_hupo_qie（虎魄严格判定 → qie 段模型链）
+/// - host_follow_caret（三十四修已删的死代码，此处一并归档）
+/// 所有宿主统一走标准锚定链（seg1 selection 优先 → 组段 END 折叠
+/// GetTextExt → 连续性过滤 → 极端锚拦截 → est 兜底）。实验性删除，
+/// 历史实现见 git（43修→74修 链）。
 
 fn scopeguard_release() -> PollGuard {
     PollGuard
