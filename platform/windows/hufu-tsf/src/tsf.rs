@@ -3400,7 +3400,8 @@ pub(crate) fn is_cjk_fullwidth(c: char) -> bool {
 fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
     g.caret_est_x = r.left;
     g.caret_est_y = r.top;
-    g.caret_est_line_h = (r.bottom - r.top).max(8);
+    // 【行高防毒化·虎魄二修】矮锚（16px）不得把已学真行高降级覆盖。
+    update_est_line_h(g, r);
     g.caret_est_wrap = 0;
     g.caret_est_last_raw = g.cur_raw_len as i32;
     // 校准采样点=本锚：下一键标准链成功查询时 Δraw=1 出干净键宽样本。
@@ -3428,29 +3429,88 @@ fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
 /// 且 top 与 est 基线同带（|Δtop|<lh，防换行/换控件误拉伸），把
 /// bottom 拉到 top+lh——x/top 本就正确，只补全行高几何，est 播种行
 /// 高/候选窗落位全链吃到真值。正常宿主 caret 高≈行高（≥50%）不触发。
+// （一修版本已由下方二修版本取代——见 normalize_short_anchor 二修。）
+
+/// 【矮锚归一·进程级行高记忆】est_line_h 会被矮锚毒化（seed/采纳把
+/// 16px 写进行高）或冷启动为 0——记忆一份本进程学到的「真行高」作
+/// 兜底。只在确认 ≥18（真实行高量级，矮锚 16 不写入）时更新。
+static SHORT_ANCHOR_MEM_LH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 【虎魄首键矮锚归一·二修 2026-11·BUG8】trace 实锤（虎魄 PyQt5 ACP）：
+/// 组段首键瞬间 selection 与组段 END 两条 GetTextExt 都返回「默认字
+/// 体度量」矮锚（实测 14×16：高度 16、宽度 14/字符），top/left 正确；
+/// 第二键起宿主布局追平，返回整行高窄锚（2×123）。两个症状：
+/// ①候选按锚.bottom+4 落位 → 首键窗比第二键高约一行（「y 高一点」）；
+/// ②锚右缘=left+14，真实插入点=left+0.41×行高（ASCII 半宽）→ 首键
+/// 候选偏左约 1/3 字宽（「第一键偏左，第二键正常」——一修只补了高
+/// 度，x 没补，用户实测复现）。
+/// 一修的三处漏网（本修）：a) est=(x,0) 半哨兵（垃圾 seed 只清 y 不清
+/// x）绕过 (0,0) 判定 → 带宽校验拦死归一；b) 冷启动/重启后 est_line_h
+/// 还没学到（=0），矮锚直进 seed → 行高被毒化成 16，后续 h<lh/2 恒
+/// 假 → 永不归一（用户「高度问题出现得比刚刚少了但还有」）；c) x 从
+/// 未归一。
+/// 修（通用，非特化）：锚同时满足 h<lh/2 且 h≤18（默认字体度量签名；
+/// 正常宿主插入符高≈行高，lh 本身就是该宿主锚高学出来的，自洽不触
+/// 发）→ ①bottom=top+lh；②right=left+raw_len×0.41×lh（右缘=真实插
+/// 入点，est_step 同款步宽启发式）。行高 lh=max(est_line_h, 进程记忆)
+/// 取 ≥18 者；带宽校验仅 est_y≠0 时生效（y=0=无基线/半哨兵，放行）。
+/// 归一成功同步更新记忆。正常宿主零影响：h≥lh/2 或 h>18 直接返回。
 fn normalize_short_anchor(g: &Shared, r: &mut RECT) {
-    let lh = g.caret_est_line_h;
-    if lh < 8 {
-        return;
-    }
-    // est 无基线哨兵（x=y=0）：est_y 无意义，不同带判定会放行 top<lh
-    // 的矮锚——显式挡一次。
-    if g.caret_est_x == 0 && g.caret_est_y == 0 {
-        return;
-    }
+    use std::sync::atomic::Ordering;
     let h = r.bottom - r.top;
-    if h <= 0 || h >= lh / 2 {
+    if h <= 0 {
         return;
     }
-    if (r.top - g.caret_est_y).abs() >= lh {
+    let lh_est = g.caret_est_line_h;
+    let lh_mem = SHORT_ANCHOR_MEM_LH.load(Ordering::Relaxed);
+    let lh = if lh_est >= lh_mem { lh_est } else { lh_mem };
+    if lh < 18 {
+        return; // 无行高知识（冷启动首段）：不敢拉，等 key2 全高锚建行高
+    }
+    if h >= lh / 2 || h > 18 {
+        return; // 非默认字体度量签名（正常锚或整行盒）
+    }
+    // 带宽校验：est_y 有效（≠0）时要求同带，防换行/换控件帧误拉伸；
+    // est_y==0（无基线/半哨兵）放行——首段帧本无参照。
+    if g.caret_est_y != 0 && (r.top - g.caret_est_y).abs() >= lh {
         return;
     }
     r.bottom = r.top + lh;
+    // 宽度归一：矮锚宽=默认字体字宽（14/字符），真实插入点=
+    // left + 字符数×0.41×行高（est_step 同款 ASCII 步宽启发式，
+    /// 虎魄实测 0.41×123≈50 vs 真值 48，误差 2px 级）。
+    let n = (g.cur_raw_len.max(1)) as i32;
+    let new_right = r.left + ((0.41 * lh as f32) as i32) * n;
+    if new_right > r.right && r.right - r.left >= 8 {
+        // 仅对「文本度量盒」形锚拉宽（宽≥8；2px 折叠竖线锚不动）
+        r.right = new_right;
+    }
+    SHORT_ANCHOR_MEM_LH.store(lh, Ordering::Relaxed);
     if crate::tsf::trace_on() {
         trace(&format!(
-            "qc: 矮锚归一 h={}→行高{} rect=({},{},{},{})",
-            h, lh, r.left, r.top, r.right, r.bottom
+            "qc: 矮锚归一 h={} w={}→行高{} rect=({},{},{},{})",
+            h,
+            r.right - r.left,
+            lh,
+            r.left,
+            r.top,
+            r.right,
+            r.bottom
         ));
+    }
+}
+
+/// 【行高防毒化】seed/采纳把锚高写进 est_line_h——矮锚（h<18）不得
+/// 把已学到的真行高（≥18）降级覆盖（否则 h<lh/2 恒假=归一永久失效，
+/// 一修 b 漏网根因）。真实小字号宿主（行高真 <18）不受影响：旧值
+/// 本来就 <18，照常更新。
+fn update_est_line_h(g: &mut Shared, r: &RECT) {
+    let h_new = (r.bottom - r.top).max(8);
+    if h_new >= 18 || g.caret_est_line_h < 18 {
+        g.caret_est_line_h = h_new;
+        if h_new >= 18 && h_new > SHORT_ANCHOR_MEM_LH.load(std::sync::atomic::Ordering::Relaxed) {
+            SHORT_ANCHOR_MEM_LH.store(h_new, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -4082,7 +4142,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
     g.caret_est_last_raw = g.cur_raw_len as i32;
-    g.caret_est_line_h = (rect.bottom - rect.top).max(8);
+    // 【行高防毒化·虎魄二修】采纳重校同 seed：矮锚不降级真行高。
+    update_est_line_h(g, &rect);
     g.caret = Some(rect);
     // 【三十六次修正】查询时间戳：click 黏性的解除要求「本段内新查过」
     //（防止置位帧的上一段旧查询值 near-自吞黏性）。
