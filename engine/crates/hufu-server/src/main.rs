@@ -1249,15 +1249,71 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({"ok": true, "path": dir}))
         }
         ("POST", "/api/export_schema") => {
-            // body {name?}：缺省=当前方案。导出用户调整合并后的完整码表
-            //（虎爪码表导出同格式）到 数据\码表导出\<方案名> <时间戳>.txt。
+            // body {name?, format?, remember?, lines_only?}：name 缺省=
+            // 当前方案；format 缺省/空=记忆格式或虎整句 `码 词 词`（字节
+            // 级兼容旧导出）。可选 native/rime/duoduo/qq。remember=false
+            // 时不记忆（默认记忆——settings 下拉选过即按方案记忆，托盘/
+            // 语言栏「导出码表」取记忆格式）。lines_only=true（settings
+            // 下拉 onchange 即时记忆用）：只记忆格式不真导出不弹窗。
+            // 导出用户调整合并后的完整码表到
+            // 数据\码表导出\<方案名>\<方案名> <时间戳>.txt。
             let name = req
                 .json()
                 .get("name")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            match host.export_schema(if name.is_empty() { None } else { Some(&name) }) {
+            let mut format = req
+                .json()
+                .get("format")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let remember = req
+                .json()
+                .get("remember")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            let lines_only = req
+                .json()
+                .get("lines_only")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            // 【导出格式记忆 2026-11】format 为空时取该方案记忆格式
+            let target_name = if name.is_empty() {
+                host.engine.config.schema.current.clone()
+            } else {
+                name.clone()
+            };
+            if format.is_empty() {
+                if let Some(mem) = host
+                    .engine
+                    .config
+                    .schema
+                    .export_formats
+                    .get(&target_name)
+                {
+                    format = mem.clone();
+                }
+            } else if remember {
+                // 显式给格式 → 记忆到该方案（托盘导出下次直接用）
+                host.engine
+                    .config
+                    .schema
+                    .export_formats
+                    .insert(target_name.clone(), format.clone());
+                let cfg_path = host.data_dir.join("config.json");
+                let _ = host.engine.config.save(&cfg_path);
+            }
+            if lines_only {
+                return Response::json(&serde_json::json!({
+                    "ok": true, "remembered": format, "name": target_name
+                }));
+            }
+            match host.export_schema(
+                if name.is_empty() { None } else { Some(&name) },
+                &format,
+            ) {
                 Ok((path, n)) => {
                     // 导出即达：文件管理器打开导出子文件夹（码表导出\<方案名>\）
                     if let Some(dir) = std::path::Path::new(&path).parent() {

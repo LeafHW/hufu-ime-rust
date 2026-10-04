@@ -22,6 +22,7 @@ pub struct Config {
     pub sound: SoundSection,
     pub opencc: OpenCcSection,
     pub user: UserSection,
+    pub keymap: KeymapSection,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             sound: SoundSection::default(),
             opencc: OpenCcSection::default(),
             user: UserSection::default(),
+            keymap: KeymapSection::default(),
         }
     }
 }
@@ -60,6 +62,16 @@ pub struct GeneralSection {
     pub caps_action: CapsAction,
     /// 最近方案对（Ctrl+M 来回切换）
     pub switch_recent_schema: bool,
+    /// 【Esc 双行为 2026-11】false（默认）= 现行为（空态透传/有候选清屏）；
+    /// true = 空态按 Esc 撤回上次上屏（back 回删，连按撤更早，8 条
+    /// 上屏历史栈，与 {重复上屏} 同源）。有候选/有编码时 Esc 仍清屏。
+    pub esc_undo: bool,
+    /// 【重复上屏包括符号 2026-11】上屏历史栈记账口径：false（默认，
+    /// 2026-10-30 三修口径）= 剥尾随非字母后含字母才记——纯符号/数字
+    /// 上屏不当回放源、标点顶字「中，」只记「中」；true = 任何非空
+    /// 上屏整段原样入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc
+    /// 撤回都可作用于任意上一次上屏内容（旧版行为）。
+    pub repeat_include_symbols: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,6 +95,11 @@ impl Default for GeneralSection {
             // 影响（序列化值优先于默认）。
             caps_action: CapsAction::Switch,
             switch_recent_schema: true,
+            // 【Esc 双行为 2026-11】默认关：现行为不变（空态 Esc 透传）。
+            esc_undo: false,
+            // 【重复上屏包括符号 2026-11】默认关：维持 2026-10-30 三修
+            // 口径（只记文字），老用户升级手感不变。
+            repeat_include_symbols: false,
         }
     }
 }
@@ -96,6 +113,11 @@ pub struct SchemaSection {
     pub current: String,
     /// 最近方案对
     pub recent_pair: Option<(String, String)>,
+    /// 【导出格式记忆 2026-11】方案名 → 导出格式（settings 下拉选过
+    /// 即记忆；托盘/语言栏「导出码表」按当前方案取记忆格式，缺省
+    /// Sentence 兼容旧行为）。键为方案目录名，值为 ExportFormat 名
+    /// （sentence/native/rime/duoduo/qq——server 侧解析）。
+    pub export_formats: std::collections::HashMap<String, String>,
 }
 
 impl Default for SchemaSection {
@@ -106,6 +128,7 @@ impl Default for SchemaSection {
             // 老用户 config.json 里显式保存不受影响）
             current: "虎整句".into(),
             recent_pair: None,
+            export_formats: std::collections::HashMap::new(),
         }
     }
 }
@@ -242,6 +265,27 @@ impl Default for CandidatesSection {
             delay_comment_ms: 0,
         }
     }
+}
+
+/// 【全键盘按键映射 2026-11】任意键 → 功能（设置页「按键」图形化编辑，
+/// 用户规格：新窗口全键盘图、点击设功能、恢复默认按钮）。
+/// 键名与 server parse_key 一致：单字符原样（"[" / "a" / "4"…）、功能键
+/// 小写全名（capslock/tab/space/enter/backspace/escape/shift/up/down/
+/// left/right/pageup/pagedown/home/end/delete/f1..f12）。
+/// 值为功能 id：select1..select10（第 N 选重，1 起）/ repeat（重复上屏）/
+/// undo（撤回上次上屏）/ clear（清屏）/ pageup / pagedown（翻页）/
+/// switch（切中英）/ top（顶屏高亮候选）/ text:字串（直接上屏该文本，
+/// 如 `[`→text:？）。空表 = 现行为（升级不改老用户手感）。
+/// 【两态映射 2026-11】map = 有候选/编码态；map_idle = 无候选空态。
+/// 空态查键：map_idle 优先、缺省回落 map（老配置单表行为不变——用户
+/// 规格「无候选默认跟有候选一样，也可以不同，如无候选直出！有候选
+/// 直出？」）。仅空态有意义的映射只写 map_idle（有候选时走默认）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KeymapSection {
+    pub map: std::collections::HashMap<String, String>,
+    /// 无候选/空态映射（缺省回落 map 同键）。
+    pub map_idle: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -663,6 +707,27 @@ mod tests {
         assert_eq!(cfg2.input.mixed_input, false);
         // 旧 config.json 无 sentence 节/无新键 → 取默认 0（不限制）
         assert_eq!(cfg2.sentence.weights.high_freq_limit, 0);
+        // 【重复上屏包括符号 2026-11】默认关：旧配置无此键 → 只记文字
+        // 口径（2026-10-30 三修行为），老用户升级手感不变
+        assert_eq!(cfg2.general.repeat_include_symbols, false);
+    }
+
+    /// 【重复上屏包括符号 2026-11】开关序列化往返 + 旧配置缺键取默认关。
+    #[test]
+    fn repeat_include_symbols_roundtrip_and_legacy() {
+        let dir = std::env::temp_dir().join(format!("hufu-cfg-ris-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::default();
+        cfg.general.repeat_include_symbols = true;
+        cfg.save(&p).unwrap();
+        let cfg2 = Config::load(&p).unwrap();
+        assert!(cfg2.general.repeat_include_symbols);
+        // 旧配置：general 节无此键 → 默认关
+        let legacy = "{\"general\": {\"shift_switch\": true}}\n";
+        let cfg3: Config = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg3.general.repeat_include_symbols, false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -676,6 +741,29 @@ mod tests {
         cfg.save(&p).unwrap();
         let cfg2 = Config::load(&p).unwrap();
         assert_eq!(cfg, cfg2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【两态映射 2026-11】map_idle 序列化往返 + 旧配置（单 map 字段）
+    /// 加载默认空 map_idle（向后兼容：老用户升级后空态回落 map 同键，
+    /// 行为与升级前完全一致）。
+    #[test]
+    fn keymap_idle_roundtrip_and_legacy() {
+        let dir = std::env::temp_dir().join(format!("hufu-cfg-ki-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::default();
+        cfg.keymap.map.insert("[".into(), "text:？".into());
+        cfg.keymap.map_idle.insert("[".into(), "text:！".into());
+        cfg.save(&p).unwrap();
+        let cfg2 = Config::load(&p).unwrap();
+        assert_eq!(cfg2.keymap.map["["], "text:？");
+        assert_eq!(cfg2.keymap.map_idle["["], "text:！");
+        // 旧配置：只有 map 节（无 map_idle 键）→ 空 map_idle
+        let legacy = "{\"keymap\": {\"map\": {\"[\": \"text:？\"}}}\n";
+        let cfg3: Config = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg3.keymap.map["["], "text:？");
+        assert!(cfg3.keymap.map_idle.is_empty(), "旧配置 map_idle 空（回落 map）");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

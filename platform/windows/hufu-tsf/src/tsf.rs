@@ -36,6 +36,26 @@ thread_local! {
 pub fn tl_shared() -> Option<SharedRef> {
     TL_SHARED.with(|s| s.borrow().clone())
 }
+/// 【全键盘按键映射 2026-11】VK 路由白名单查询：键名是否被用户映射
+/// （G_SHARED 主线程 Shared 的 keymap 快照）。vk_to_name 的条件路由
+/// 用（home/end/delete/F 区）——映射过才递引擎，未映射 None=直通。
+/// 【左右 Shift 分开 2026-11】shift 查精确名（shiftleft/shiftright）
+/// 外加通用名 "shift" 兜底（老配置两侧同效）。
+fn keymap_has(name: &str) -> bool {
+    let g = G_SHARED.get().map(|g| g.0.lock().unwrap_or_else(|e| e.into_inner()));
+    match g {
+        Some(g) => {
+            g.keymap.contains_key(name)
+                || g.keymap_idle.contains_key(name)
+                || (name == "shift"
+                    && (g.keymap.contains_key("shiftleft")
+                        || g.keymap.contains_key("shiftright")
+                        || g.keymap_idle.contains_key("shiftleft")
+                        || g.keymap_idle.contains_key("shiftright")))
+        }
+        None => false,
+    }
+}
 // 【当前 update_ui 的 Shared·二十六修】update_ui 入口登记（线程局部），
 // tl_cand_show 经此取「本渲染写 last_show 的那把锁」登记进 TL_SHARED。
 thread_local! {
@@ -257,6 +277,11 @@ pub struct Shared {
     /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
     /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
     pub shift_pending: bool,
+    /// 【左右 Shift 分开 2026-11】pending 时刻探测的物理侧别键名
+    ///（"shiftleft"/"shiftright"；探测不到=通用 "shift"）。TestUp
+    /// 派发用——此时键已抬起 GetKeyState 读不到，靠 TestDown 记的
+    /// 这份。引擎查表精确名→通用名兜底，"shift" 恒有效。
+    pub shift_pending_side: &'static str,
     /// 【Shift 状态跟踪 2026-09-06】TestDown/KeyDown 见 0x10 置 true、
     /// keyup 置 false。32 位应用 KeyDown 时刻 GetKeyState(VK_SHIFT)
     /// 偶发读不到按下（Shift+6 出不了 ……——引擎收到 shift=false 数字
@@ -463,6 +488,24 @@ pub struct Shared {
     /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
     /// 第 N 项再暂留收场）。
     pub rank_flash: Option<usize>,
+    /// 【Esc 双行为 2026-11】引擎 esc_undo_ready（开关开 && 空态 &&
+    /// 上屏历史非空）缓存：TestDown 空态 escape 预判 TRUE（KeyDown
+    /// 才会来，撤回键才能到引擎）；不就绪时 FALSE=透传应用。state
+    /// JSON 每帧同步（chinese 同源模式）。
+    pub esc_undo_ready: bool,
+    /// 【全键盘按键映射 2026-11】引擎 state.keymap 快照（用户键→功能）。
+    /// 用途：① F 区/翻页等 VK 的路由白名单——映射过才发给引擎，未映射
+    /// 保持旧版直通（升级零差异）；② TestDown 空态预判放行「空态也
+    /// 生效」的功能（repeat/undo/text:*/switch）。
+    pub keymap: std::collections::HashMap<String, String>,
+    /// 【两态映射 2026-11】空态专用映射快照（state.keymap_idle）：
+    /// TestDown 空态预判查这张表（缺省回落 keymap 同键）。
+    pub keymap_idle: std::collections::HashMap<String, String>,
+    /// 【Esc 撤回光标范围 2026-11】当前焦点是否「有光标（可编辑）」
+    /// 探测结果缓存：Some(ok)=已探测（GetSelection 成功=有光标），
+    /// None=未探测/已失效（焦点切换即失效）。空态 Esc 撤回预判的
+    /// 第二道门：无光标（非编辑焦点）→ 不吞 Esc（正常 Esc 功能）。
+    pub esc_caret_ok: Option<bool>,
 }
 
 impl Shared {
@@ -499,6 +542,7 @@ impl Shared {
             chinese: true,
             composing: false,
             shift_pending: false,
+            shift_pending_side: "shift",
             shift_down: false,
             aux_active: false,
             suppress_pending: false,
@@ -554,6 +598,10 @@ impl Shared {
             last_key_ctx: None,
             last_show: None,
             rank_flash: None,
+            esc_undo_ready: false,
+            keymap: std::collections::HashMap::new(),
+            keymap_idle: std::collections::HashMap::new(),
+            esc_caret_ok: None,
         }
     }
 
@@ -967,7 +1015,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         // 诊断：按键是否进入键盘钩（搜索框等特殊宿主排查）
         keys_log(&format!(
@@ -975,27 +1023,27 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
             wparam.0,
             std::time::SystemTime::now()
         ));
-        Ok(self.dispatch(wparam.0, true, false))
+        Ok(self.dispatch(wparam.0, true, false, lparam.0 as usize))
     }
 
     fn OnTestKeyUp(
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         keys_log(&format!("testup vk={:#x}", wparam.0));
-        Ok(self.dispatch(wparam.0, true, true))
+        Ok(self.dispatch(wparam.0, true, true, lparam.0 as usize))
     }
 
     fn OnKeyDown(
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
-        let r = self.dispatch(wparam.0, false, false);
+        let r = self.dispatch(wparam.0, false, false, lparam.0 as usize);
         keys_log(&format!(
             "key vk={:#x} eat={} perr={} t={:?}",
             wparam.0,
@@ -1006,11 +1054,16 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         Ok(r)
     }
 
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(
+        &self,
+        _pic: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<BOOL> {
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
         keys_log(&format!("keyup vk={:#x}", wparam.0));
-        Ok(self.dispatch(wparam.0, false, true))
+        Ok(self.dispatch(wparam.0, false, true, lparam.0 as usize))
     }
 
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
@@ -1260,6 +1313,11 @@ fn handle_set_focus(
         g.focus_epoch += 1;
         // 【四十一修】键路由上下文随代际失效（切窗/切标签后新键重记）。
         g.last_key_ctx = None;
+        // 【Esc 撤回光标范围 2026-11】光标探测缓存随焦点失效——新
+        // 焦点的可编辑性未知，下次空态 Esc 重新探测（esc_caret_ok
+        // 注记）。焦点回调里只清缓存不探测（绝不在此起 edit
+        // session，见下方 Chromium 死锁注记）。
+        g.esc_caret_ok = None;
         (g.composing, g.preedit_last.clone())
     };
     // 【焦点风暴去抖 2026-09-08】QQ 实测 40ms 内连发 8 次
@@ -1662,7 +1720,14 @@ impl HuFuTs_Impl {
     ///   TestDown 清除（组合保护）、TestUp 仍存活才发 server 切换。
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
-    fn dispatch(&self, wparam: usize, test_only: bool, up: bool) -> BOOL {
+    fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
+        // 【小键盘 Enter 2026-11】lparam 含 KF_EXTENDED 位（bit 24）：
+        // 扩展键（方向键群/Ins/Del/NumEnter）置位。Enter 本体 VK 0x0D
+        // 不置、小键盘 Enter 置——区分两身份：小键盘 Enter 仅在映射过
+        // numenter 时递引擎，未映射直通（零差异）；主排 Enter 照旧
+        // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
+        // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
+        let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
         // 【加词/加权小窗直通 2026-09-12 十二修】小窗打开期间，主线程
         // 的 dispatch **无条件直通**——五版门带前台比对（fg==小窗才
         // 挡），实测存在缝隙：attach 脱离后前台闪回宿主窗/cuas 把词
@@ -1684,7 +1749,14 @@ impl HuFuTs_Impl {
         // space 仍按住。修「Ctrl 先抬、Space 后抬切不了中英」：该序下
         // space up 到达时 GetKeyState(VK_CONTROL) 已松，旧判定按「此刻
         // 无 Ctrl」直通不切——但组合确实发生过，应切。
-        let (name0, sh0, ct0, al0) = match vk_to_name(wparam, false) {
+        let (name0, sh0, ct0, al0) = match if num_enter && keymap_has("numenter") {
+            // 【小键盘 Enter 2026-11】扩展位 Enter 且映射过 numenter：
+            // 发精确名（vk_to_name 0x0D 的 "enter" 是主排身份）。
+            // 未映射走下方 vk_to_name → "enter"（与旧版同口径零差异）。
+            Some(("numenter".to_string(), false, false, false))
+        } else {
+            vk_to_name(wparam, false)
+        } {
             Some((n, sh, ct, al)) => (Some(n), sh, ct, al),
             None => (None, false, false, false),
         };
@@ -1700,11 +1772,33 @@ impl HuFuTs_Impl {
             _ => false,
         };
         // ── Shift 单击判定（Test 层闭环）──
+        // 【Shift 可映射 2026-11】shift 在用户 keymap（map/map_idle）
+        // 里映射过时：pending/up 单击时机判定照旧，但单击语义由引擎
+        // run_keymap 定（selectN/直出等）；映射空态无意义时引擎回落
+        // 内建切换。keymap 查询无需 DLL 侧特判——server 收键名后引擎
+        // keymap 分支接管。down 仍不吞（物理 Shift 应用照常处理）。
+        // 【左右 Shift 分开 2026-11】TSF 键事件 wparam 是通用 VK_SHIFT
+        //（0x10，不分左右），单击判定与派发保持通用键名 "shift"；具体
+        // 左右由 KeyDown 真实事件时 GetKeyState(VK_LSHIFT/VK_RSHIFT)
+        // 探测（见 fire 分支）——探测到哪侧就发哪侧精确键名，引擎查
+        // 精确名→通用名兜底。TestUp 时刻键已抬起 GetKeyState 读不到，
+        // 但 TestDown 已记下侧别（shift_pending_side）供此刻用。
         if wparam == 0x10 {
             if !up {
                 // TestDown/KeyDown：只记 pending，不吞（物理 Shift 由应用照常处理）
+                // 【左右分开 2026-11】探测物理侧别（LSHIFT=0xA0/RSHIFT=0xA1
+                // 各自独立按键；两者都按=左优先，组合场景反正 pending 会被
+                // 其他键 down 清掉，不影响）。TestDown 时键仍按着，读得到。
+                let side = if unsafe { GetKeyState(0xA0) } < 0 {
+                    "shiftleft"
+                } else if unsafe { GetKeyState(0xA1) } < 0 {
+                    "shiftright"
+                } else {
+                    "shift"
+                };
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 g.shift_pending = true;
+                g.shift_pending_side = side;
                 g.shift_down = true;
                 return BOOL(0);
             }
@@ -1713,16 +1807,22 @@ impl HuFuTs_Impl {
             // Test 阶段直发若不回填，g.chinese 停留旧值：英文态下字母
             // TestDown 预判错报 TRUE → 宿主不产字、IME 也不产 → 字符
             // 消失（跟打器「英文打不进」实测）。返回 BOOL(0) 不吞 keyup。
-            let fire = {
+            // 【Shift 可映射 2026-11】映射过 shift 时同通道直发——引擎
+            // process_key 的 keymap 分支接管（run_keymap None 回落内建
+            // 切换，行为无缝）。【左右分开 2026-11】发 pending 时刻记的
+            // 精确侧别键名（引擎精确名→通用名兜底，两侧都没映射时
+            // "shiftleft"/"shiftright" 在 parse_key 也各有映射到对应
+            // KeyCode，内建切换同样走通）。
+            let (fire, side) = {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let f = g.shift_pending;
                 g.shift_pending = false;
                 g.shift_down = false;
-                f
+                (f, g.shift_pending_side)
             };
             if fire {
                 if let Some((consumed, commit, _back, state, _sound, _vol)) =
-                    ipc::key_request("shift", false, false, false, false, None)
+                    ipc::key_request(side, false, false, false, false, None)
                 {
                     if consumed {
                         let zh = state
@@ -1741,6 +1841,9 @@ impl HuFuTs_Impl {
                             if !commit.is_empty() {
                                 g.shift_now_hide = true;
                             }
+                            // 【Shift 可映射 2026-11】映射功能生效时
+                            // chinese 可能没变（selectN/直出等）——上面
+                            // 的 != 门已处理；commit 非空即收窗同口径。
                         }
                         // 【切英文上屏编码 2026-09-14】引擎侧有编码时按
                         // Shift=上屏编码字母+切英文（commit 带回字母）。
@@ -1787,6 +1890,9 @@ impl HuFuTs_Impl {
             // 宿主的 up 双发由 modekey_down_seen 一次性标记挡（见下）。
             // 【八十五修】armed（组合成形）的 up 同走此通道（抬序无关）。
         }
+        // 【Shift 可映射 2026-11】映射过 shift 时上面通道即已生效
+        //（key_request name=shift → 引擎 keymap 分支；run_keymap None
+        // 回落内建单击切换，等价旧链路）。
         // ── 模式键直发 + 去重 ──
         // 按下事件（TestDown 或 KeyDown）直发；松开仅限「down 未直发过」
         // 的跟打器形态。同键 80ms 去重挡 test+down 成对宿主的双发；up
@@ -1828,8 +1934,13 @@ impl HuFuTs_Impl {
                 let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 (g.chinese, g.composing, g.shift_down)
             };
-            let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
-                return BOOL(0);
+            let (name, shift, ctrl, alt) = if num_enter && keymap_has("numenter") {
+                ("numenter".to_string(), false, false, false)
+            } else {
+                match vk_to_name(wparam, hint) {
+                    Some(v) => v,
+                    None => return BOOL(0),
+                }
             };
             let _ = alt;
             // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
@@ -1852,6 +1963,35 @@ impl HuFuTs_Impl {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .aux_active;
+            // 【Esc 双行为 2026-11】空态 Esc 撤回就绪标记（引擎 state
+            // 同步缓存）：就绪时空态 escape 预判 TRUE。
+            let g_esc_undo = self
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .esc_undo_ready;
+            // 【全键盘按键映射 2026-11】键名→映射功能（空态预判放行
+            // 表用；None=未映射或仅编码态生效）。
+            // 【两态映射 2026-11】空态查 map_idle（缺省回落 map）。
+            // 【左右 Shift 分开 2026-11】TSF 键事件名仍为通用 "shift"
+            //（VK 0x10 不分侧）——单击派发侧别在 fire 分支定，这里
+            // 预判 "shift" 名查表（精确名未配时通用名兜底命中同效）。
+            let g_keymap_act = |n: &str| -> Option<String> {
+                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                let generic = if n == "shift" { Some("shift") } else { None };
+                let a = g
+                    .keymap_idle
+                    .get(n)
+                    .or_else(|| generic.and_then(|s| g.keymap_idle.get(s)))
+                    .or_else(|| g.keymap.get(n))
+                    .or_else(|| generic.and_then(|s| g.keymap.get(s)))?;
+                let a = a.as_str();
+                let idle_ok = a == "undo"
+                    || a == "switch"
+                    || a.starts_with("repeat")
+                    || a.starts_with("text:");
+                if idle_ok { Some(a.to_string()) } else { None }
+            };
             let will = chinese
                 && match name.as_str() {
                     // 编码中：可打印键与控制键都可能被吞
@@ -1904,6 +2044,20 @@ impl HuFuTs_Impl {
                     // 字、反查态悬空（WPS 实测：窗口残留+后续编码不进
                     // 反查）。有组段的反查（打字中）走 composing 分支。
                     "backspace" => g_aux,
+                    // 【Esc 双行为 2026-11】空态 escape：esc_undo 就绪
+                    //（开关开 && 上屏历史非空）时引擎要撤回（consumed +
+                    // 回删），须预判 TRUE 否则宿主吃掉 Esc、KeyDown 不来、
+                    // 撤回键到不了引擎。不就绪时维持透传（现行为）。
+                    // 【光标范围 2026-11】第二道门：焦点无光标（非编辑
+                    // 焦点）不吞——正常 Esc 功能（用户规格：撤回只在
+                    // 有光标的编辑焦点生效）。
+                    "escape" => g_esc_undo && esc_caret_available(&self.shared),
+                    // 【全键盘按键映射 2026-11】空态也生效的映射功能
+                    //（repeat/undo/text:*/switch）：映射过即预吞，
+                    // 否则宿主先吃、KeyDown 不来。仅编码态生效的
+                    //（selectN/top/clear/pageup/pagedown）空态不吞
+                    //（引擎 run_keymap 回退原行为）。
+                    n if g_keymap_act(n).is_some() => true,
                     // 空闲：编码字母/分号/引号会起段
                     "space" | "enter" | "escape" | "tab" => false,
                     _ => false,
@@ -1970,8 +2124,13 @@ impl HuFuTs_Impl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .shift_down;
-        let Some((name, shift, ctrl, alt)) = vk_to_name(wparam, hint) else {
-            return BOOL(0);
+        let (name, shift, ctrl, alt) = if num_enter && keymap_has("numenter") {
+            ("numenter".to_string(), false, false, false)
+        } else {
+            match vk_to_name(wparam, hint) {
+                Some(v) => v,
+                None => return BOOL(0),
+            }
         };
         let (name, m_shift, m_ctrl, m_alt) = match name.as_str() {
             "shift" | "ctrl" | "alt" => (name, false, false, false),
@@ -2046,6 +2205,53 @@ impl HuFuTs_Impl {
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
         ));
+        // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
+        // escape 预判用）：任何键响应 state 都可能翻转它（上屏后
+        // 非空、撤光后空），就地下钻同步。
+        {
+            let eur = state
+                .get("esc_undo_ready")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.esc_undo_ready != eur {
+                trace(&format!("esc_undo_ready 同步: {eur}"));
+            }
+            g.esc_undo_ready = eur;
+            // 【全键盘按键映射 2026-11】同帧同步 keymap 快照：F 区键
+            // 路由白名单 + TestDown 空态预判放行表。
+            let km: std::collections::HashMap<String, String> = state
+                .get("keymap")
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str().map(|s| (k.clone(), s.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if g.keymap != km {
+                trace(&format!("keymap 同步: {} 项", km.len()));
+            }
+            g.keymap = km;
+            // 【两态映射 2026-11】空态专用表同帧同步。
+            let kmi: std::collections::HashMap<String, String> = state
+                .get("keymap_idle")
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str().map(|s| (k.clone(), s.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if g.keymap_idle != kmi {
+                trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
+            }
+            g.keymap_idle = kmi;
+        }
         // 【回车立即收窗 2026-10-09】回车与 Shift 上屏同款：无论「回车
         // 清屏」勾否（清屏=清组段 / 未勾=编码字母上屏），候选一律立即
         // 消失，不走渐隐——用户口径「跟 Shift 一样的效果」。
@@ -2148,6 +2354,10 @@ impl HuFuTs_Impl {
                     g
                 };
                 drop(tsf_ok);
+                // 【Esc 撤回光标范围 2026-11】回删前提=焦点有光标——
+                // TestDown 探测已过门才到这（esc_caret_ok=Some(true)）；
+                // 防御性再核：无光标不回删（Op::DeleteBack 内
+                // GetSelection 失败也会 Err，双保险）。
                 let _ = run_session(&self.shared, Op::DeleteBack(back as u32), None);
                 let deleted = {
                     let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -2286,6 +2496,42 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             0x28 => "down".to_string(),
             0x21 => "pageup".to_string(),
             0x22 => "pagedown".to_string(),
+            // 【全键盘按键映射 2026-11】Home/End/Delete：仅当用户在
+            // 按键映射页映射过才返回名字（引擎 run_keymap 处理）；
+            // 未映射 → None 直通，升级零差异。F1-F12 同理（VK 0x70-
+            // 0x7B）。
+            0x24 => {
+                let km = keymap_has("home");
+                if km { "home".to_string() } else { return None }
+            }
+            0x23 => {
+                let km = keymap_has("end");
+                if km { "end".to_string() } else { return None }
+            }
+            0x2E => {
+                let km = keymap_has("delete");
+                if km { "delete".to_string() } else { return None }
+            }
+            0x70..=0x7B => {
+                let n = vk - 0x6F;
+                let name = format!("f{n}");
+                if keymap_has(&name) { name } else { return None }
+            }
+            // 【小键盘映射 2026-11】VK 0x60-0x69（NumLock 开启的小键盘
+            // 数字）与 0x6A-0x6F（*/-+/.//Enter——NumLock 无关）：仅当
+            // 用户映射过才递引擎（num5 等），未映射 None=直通，升级零
+            // 差异。与主排数字（VK 0x30-0x39 → Char('5')）身份分开——
+            // 主排数字是选重键，小键盘独立映射。数字锁定关闭的 0x60-
+            // 0x69 是方向/Home/End 群（VK 0x23/0x24/…），不走本分支。
+            0x60..=0x69 => {
+                let name = format!("num{}", vk as u8 - 0x60);
+                if keymap_has(&name) { name } else { return None }
+            }
+            0x6A => { if keymap_has("nummul") { "nummul".to_string() } else { return None } }
+            0x6B => { if keymap_has("numadd") { "numadd".to_string() } else { return None } }
+            0x6D => { if keymap_has("numsub") { "numsub".to_string() } else { return None } }
+            0x6E => { if keymap_has("numdot") { "numdot".to_string() } else { return None } }
+            0x6F => { if keymap_has("numdiv") { "numdiv".to_string() } else { return None } }
             // 【八十四修·Shift+字母传大写】字母键按 shift 实态保大小写：
             // 旧口径一律 |32 转小写（引擎只知道 shift=true），而引擎的
             // 大写通道（混输缓冲、大写直上屏）都认大写字符——小写+shift
@@ -2353,6 +2599,11 @@ enum Op {
     /// 不建组段不动文本，只跑 query_caret（无组段分支走 selection
     /// 插入点）——提示窗锚=实时光标而非 sticky 旧位。
     QueryAnchor,
+    /// 【Esc 撤回光标范围 2026-11】光标可用性探测：GetSelection 成功
+    /// = 焦点有光标（可编辑）；失败（TF_E_NOSELECTION / 无上下文）
+    /// = 无光标。结果写 shared.esc_caret_ok（Some(bool)），空态 Esc
+    /// 撤回预判的第二道门。只读不动文本。
+    QueryCaret,
 }
 
 #[implement(ITfEditSession)]
@@ -2427,6 +2678,15 @@ impl EditSession_Impl {
             Op::QueryAnchor => {
                 // 【三十一修】只查锚不动文本（无组段帧：反查提示窗）
                 query_caret(&mut g, &ctx, ec);
+                Ok(())
+            }
+            Op::QueryCaret => {
+                // 【Esc 撤回光标范围 2026-11】GetSelection 成功=焦点有
+                // 光标（可编辑，Esc 撤回可用）；失败=无光标（空态 Esc
+                // 不吞=正常 Esc 功能）。结果落 esc_caret_ok 缓存。
+                let ok = selection_range(&ctx, ec).is_ok();
+                trace(&format!("esc caret probe: GetSelection ok={ok}"));
+                g.esc_caret_ok = Some(ok);
                 Ok(())
             }
             Op::StartPreedit(text) => {
@@ -5719,8 +5979,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
 /// 焦点回调专用：只请求同步档 edit session，被拒即失败（不排队异步）。
 /// 异步 session 的回调需要宿主 UI 线程泵消息，Chromium 系应用在焦点
 /// 切换期持内部锁 → 排队即死锁（VSCode 点击候选框冻结事故）。
-fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {
-    let (client_id, epoch) = {
+fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<()> {    let (client_id, epoch) = {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【线程局部 2026-09-12】tid 优先本线程（小窗线程的编辑会话
         // 必须用本线程 client id——进程级的属于主线程）。
@@ -5755,6 +6014,43 @@ fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<
             }
         }
     }
+}
+
+/// 【Esc 撤回光标范围 2026-11】当前焦点是否「有光标（可编辑）」：
+/// 空态 Esc 撤回预判的第二道门（首道=引擎 esc_undo_ready：开关开
+/// 且上屏历史非空）。用户规格：焦点无光标（非编辑焦点，如按钮/
+/// 列表/桌面）→ 空态 Esc 不吞 = 正常 Esc 功能；有光标且有可撤
+/// 内容 → 撤回；有光标无可撤内容 → 透传（引擎侧 did=false 已有）。
+///
+/// 实现：GetSelection 探测（编辑会话内，selection_range 失败=
+/// TF_E_NOSELECTION 类 = 无光标）。结果缓存 esc_caret_ok，焦点切
+/// 换（OnSetFocus 代际 +1 处）失效重探。键路径同步档（0x6）探测
+/// 已验证安全（QueryAnchor/delete_back 同款）；探测只在 esc_undo
+/// 就绪且缓存缺失时空态 Esc 键上发生一次，非每键。
+fn esc_caret_available(shared: &SharedRef) -> bool {
+    // 快路径：缓存命中直接用（有/无都缓存——非编辑焦点连按 Esc 不
+    // 重复探测）。
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ok) = g.esc_caret_ok {
+            return ok;
+        }
+    }
+    // 无焦点上下文 = 无光标（非编辑焦点通常连 ITfContext 都没有）
+    let Some(ctx) = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .focus_context()
+    else {
+        return false;
+    };
+    // 同步档探测：受理即回调内联执行（DoEditSession 写 esc_caret_ok）
+    let _ = run_session(shared, Op::QueryCaret, Some(ctx));
+    shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .esc_caret_ok
+        .unwrap_or(false)
 }
 
 /// 沉浸式宿主候选显示（双通道）：

@@ -46,6 +46,9 @@ pub struct Session {
     pub early_suspended: bool,
     /// 本次按键内联产生的上屏文本（顶屏/唯一上屏/提前上屏增量），由 take_or_state 消费
     pub pending_commit: Option<String>,
+    /// 【{撤回} 2026-11】随 pending_commit 走的回删字符数（顶屏内联
+    /// 通道；普通路径 back 由 KeyOutcome 直带）。take_or_state 消费。
+    pub pending_back: Option<u8>,
     /// 跨句文章尾巴（最近上屏文本的尾部，整句提交后保留，焦点切换时清空）。
     /// 神经重排在句首（committed_text 为空）时以它作语境，
     /// 避免空上下文下 Qwen 乱序（实测空 ctx 时 拖乿心 反超 的窒闷）。
@@ -80,6 +83,7 @@ impl Session {
             early_resid_armed: false,
             early_suspended: false,
             pending_commit: None,
+            pending_back: None,
             tail_context: String::new(),
             line_end_hint: false,
             rerank_applied_key: String::new(),
@@ -98,6 +102,7 @@ impl Session {
         self.early_resid_armed = false;
         self.early_suspended = false;
         self.pending_commit = None;
+        self.pending_back = None;
     }
 
     pub fn is_idle(&self) -> bool {

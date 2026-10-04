@@ -312,9 +312,15 @@ fn uppercase_composing_commits_raw_then_upper() {
 }
 
 /// 【八十四修】反查模式大写归一：反查缓冲收到小写（表全小写）。
+/// 【` 引导门控 2026-11】setup 的虎码方案无反查表 → 反查不可用；
+/// 本测须真进反查态——直写反查表文件 + 指认 reverse_path（懒加载
+/// 路径在即 reverse_available 为真，首键触发装载）。
 #[test]
 fn uppercase_in_reverse_mode_lowercased() {
     let (mut engine, mut session, _dir) = setup();
+    let rev = engine.schema.dir.join("反查.txt");
+    std::fs::write(&rev, "您\tni\n").unwrap();
+    engine.schema.reverse_path = Some(rev);
     engine.config.reverse.enabled = true;
     engine.config.reverse.prefix = '`';
     engine.process_key(&mut session, key('`')); // 进反查

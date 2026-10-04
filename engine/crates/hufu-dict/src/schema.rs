@@ -28,6 +28,10 @@ pub struct Schema {
     pub reverse: Option<ReverseTable>,
     /// 反查表源文件（未装载时记录，装载后置 None）
     pub reverse_path: Option<PathBuf>,
+    /// 【` 引导超集码表 2026-11】独立超集副表（文件名含 超集/超字集，
+    /// 码全带 ` 前缀如 `aaaa）。` 加入编码字母表时 ` 起段编码查此表；
+    /// 无副表（Arc 空表）时 ` 维持原行为。见 Schema::load 装载段。
+    pub super_dict: std::sync::Arc<Dict>,
     /// 用户调整（置顶/添加/删除日志）
     pub adjust: UserAdjust,
     /// 用户词库
@@ -40,6 +44,22 @@ fn file_stem_lower(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default()
+}
+
+/// 【超集副表内容识别 2026-11 用户拍板】文件**内容**是否为 ` 前缀码
+/// 表（超集单字表）：非空、解析成功、且**全部**条目的编码都以 `
+/// 开头。文件名无关（用户文件可叫任何名字）；混合表（部分 ` 部分
+/// 普通）保守按普通主码表处理。琉璃超集格式 `字\t\`code`（词前
+/// TSV）经 parse_auto 解析后 code="`code"，天然命中。
+fn is_backtick_table(path: &Path) -> bool {
+    let Ok(lines) = parse::read_lines(path) else {
+        return false;
+    };
+    let t = parse::parse_auto(&lines);
+    if t.rows.is_empty() {
+        return false;
+    }
+    t.rows.iter().all(|e| e.code.starts_with('`'))
 }
 
 impl Schema {
@@ -60,6 +80,7 @@ impl Schema {
             split: None,
             reverse: None,
             reverse_path: None,
+            super_dict: std::sync::Arc::new(Dict::new("super")),
             adjust: UserAdjust::default(),
             user_dict: UserDict::default(),
             encoder_rules: Vec::new(),
@@ -67,6 +88,9 @@ impl Schema {
 
         let mut rime_dicts: Vec<PathBuf> = Vec::new();
         let mut big_tables: Vec<PathBuf> = Vec::new();
+        // 【` 引导超集码表 2026-11】独立副表：**内容**识别（非空且
+        // 全部行编码带 ` 前缀——文件名任意），见装载段与 is_backtick_table。
+        let mut super_tables: Vec<PathBuf> = Vec::new();
         // 用户码表/用户词类文件（多多/QQ五笔语义=个人用户词）。命名只作
         // 初筛，是否晋升主码表见下方 BIG_USER_TABLE_AS_MAIN。
         let mut user_tables: Vec<PathBuf> = Vec::new();
@@ -154,8 +178,18 @@ impl Schema {
                     // 【性能】懒加载：只记路径（见 reverse 字段注释）
                     schema.reverse_path = Some(path.clone());
                 } else {
-                    // 其余 txt：可能是主码表（多多/QQ五笔/虎整句）
-                    big_tables.push(path.clone());
+                    // 其余 txt：内容分拣——` 前缀码全量副表（超集单字，
+                    // 文件名任意）vs 主码表候选（多多/QQ五笔/虎整句）。
+                    // 【2026-11 用户拍板】超集表按**内容**识别：非空且
+                    // **全部**行的编码都以 ` 开头（如 `aaaa）。不再看
+                    // 文件名（超集/超字集）——用户文件叫什么名无关。
+                    // 1.2MB 副表若混进主表竞选会抢主码表位，这里就地
+                    // 分流到 super_tables（独立装载，` 域直查）。
+                    if is_backtick_table(&path) {
+                        super_tables.push(path.clone());
+                    } else {
+                        big_tables.push(path.clone());
+                    }
                 }
             }
         }
@@ -263,6 +297,24 @@ impl Schema {
             schema.dict = std::sync::Arc::new(Dict::from_entries(name.clone(), table.rows));
         }
 
+        // 【` 引导超集码表 2026-11】超集副表装载：内容识别（全部行编码
+        // ` 前缀——文件名任意）。词前 TSV（`字\t\`code`）解析后并入独立
+        // super_dict；多个副表按文件名序合并。此表码全带 ` 前缀——与
+        // 主码表（无 ` 编码）天然分域，引擎 ` 编码态直查此表。
+        if !super_tables.is_empty() {
+            super_tables.sort();
+            let mut rows: Vec<DictEntry> = Vec::new();
+            for p in &super_tables {
+                let lines = parse::read_lines(p)?;
+                let t = parse::parse_auto(&lines);
+                rows.extend(t.rows);
+            }
+            schema.super_dict = std::sync::Arc::new(Dict::from_entries(
+                format!("{name}-超集"),
+                rows,
+            ));
+        }
+
         // 【文件整合 2026-09-06】调整统一回放收尾：码表内嵌（作者）→
         // 旧用户词.txt 调整行（历史）→ 用户调整.txt（新主文件，用户
         // 最新操作在后覆盖前面的语义）。
@@ -328,72 +380,47 @@ impl Schema {
     /// 某编码的最终候选：用户词 + 调整回放 + 系统候选。
     pub fn candidates(&self, code: &str) -> Vec<DictEntry> {
         let base: Vec<DictEntry> = self.dict.lookup(code).into_iter().cloned().collect();
-        let out = self.adjust.apply(code, &base);
-        // 用户词插到置顶之后、系统词之前；带选重位标记（stem="pN"，
-        // /jc 加词第三框指定「第 N 选」）的用户词按绝对位次插入最终
-        // 列表：N 超出现有候选数 → 排最后；否则插到第 N 位，原第 N
-        // 位及以后统一后移一位（2026-09-06 用户需求）。
+        // 【` 引导超集码表 2026-11】` 前缀编码查超集副表（独立域，
+        // 与主码表无码冲突；无副表=空 Dict 查不到，零开销短路）。
+        // 超集表内的序 = 文件行序（rank_cmp 权重相同时按 seq），用户
+        // 调整/用户词不作用于此域（` 域无 /jc 加词——raw 含 ` 时
+        // 引擎 on_space 直接查表上屏）。
+        if code.starts_with('`') && !self.super_dict.is_empty() {
+            return self.super_dict.lookup(code).into_iter().cloned().collect();
+        }
+        // 【时序回放 2026-11 用户拍板】{置顶}/{添加}pN/{删除} 逐条按
+        // 日志时序在演化列表上执行（adjust.apply）——删除会让先前
+        // 插入的 pN 用户词连同后续词前移（删 2 选后 p5 变 4 选）。
+        // pN 用户词不再走旧的「合并后绝对位次插入」路径。
+        let mut out = self.adjust.apply(code, &base);
+        // 无选重位的用户词（会话调频 learn / 无 pN 的 /jc 加词 /
+        // 多多小用户表）仍并入：v1 语义——插到置顶块之后、系统词之前。
         let mut user_entries: Vec<DictEntry> = Vec::new();
         self.user_dict.merge_into(code, &self.dict, &mut user_entries);
-        let mut pinned_users: Vec<DictEntry> = Vec::new();
-        let mut placed: Vec<(usize, DictEntry)> = Vec::new();
         for ue in user_entries {
-            let pos = ue
-                .stem
-                .as_deref()
-                .and_then(|s| s.strip_prefix('p'))
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|n| *n >= 1);
-            match pos {
-                Some(n) => placed.push((n, ue)),
-                None => pinned_users.push(ue),
-            }
-        }
-        let mut merged: Vec<DictEntry> = Vec::new();
-        let pinned: Vec<DictEntry> = out.iter().filter(|e| e.pinned).cloned().collect();
-        merged.extend(pinned);
-        for ue in pinned_users {
-            // 【删词对用户词生效 2026-09-06】adjust.apply 只过滤码表
-            // base；用户词（/jc 加的）在删除态也须隐藏（Ctrl+Shift+数字）
+            // 【删词对用户词生效 2026-09-06】删除态的用户词隐藏
             if self.adjust.removed(&ue.code, &ue.text) {
                 continue;
             }
-            if !merged.iter().any(|e| e.text == ue.text) {
-                merged.push(ue);
-            }
-        }
-        for e in out {
-            if e.pinned {
+            // 【时序回放去重】{添加}(pN) 词已由 adjust.apply 就位——
+            // user_dict 里同词的行不再重复并入（按 text 查重，码表
+            // 域同码下 text 唯一是既定不变量）。无 pN 的 {添加} 词行
+            // 同样在 adjust.apply 追加过（末尾），这里也不再并入——
+            // 会话调频 learn 才走到下方插入（v1：置顶块后、系统词前）。
+            if self.adjust.added(&ue.code, &ue.text) {
                 continue;
             }
-            if !merged.iter().any(|x| x.text == e.text) {
-                merged.push(e);
+            // 【调频置顶 v1 语义】learn 的用户词顶替码表同词位、排到
+            // 置顶块之后系统词之前（学习=提频，位置前移）；码表原位
+            // 的同词移除（旧实现按 text 查重跳过会把学过的词钉死在
+            // 码表原位——keymap 学习后就/到的/加 的 2 选错成 到的）。
+            if let Some(hit) = out.iter().position(|e| e.text == ue.text && !e.pinned) {
+                out.remove(hit);
             }
+            let pos = out.iter().position(|e| !e.pinned).unwrap_or(out.len());
+            out.insert(pos, ue);
         }
-        // 选重位用户词：按位次从大到小插入（先大后小，位次小的
-        // 后插不受先插者下标位移影响）
-        placed.sort_by(|a, b| b.0.cmp(&a.0));
-        for (n, ue) in placed {
-            // 删除态先判（动 merged 之前——否则会误删码表同词后又不插）
-            if self.adjust.removed(&ue.code, &ue.text) {
-                continue;
-            }
-            // 【选重位顶替码表同词 2026-09-10】/jc 显式指定第 N 选的
-            // 用户词若与码表同 text 词撞车（码表行里本来就有该词，常见
-            // 于空格多词格式的行尾词），旧逻辑按 text 查重直接跳过插入
-            // ——用户词被码表原位屏蔽，实测「/jc ae 二 候选2 加完仍在
-            // 最后」。选重位是明确意图：移除码表位的同词，把用户词放
-            // 到第 N 位。置顶（pinned）语义更强，仍然赢。
-            if let Some(hit) = merged.iter().position(|x| x.text == ue.text) {
-                if merged[hit].pinned {
-                    continue;
-                }
-                merged.remove(hit);
-            }
-            let idx = (n - 1).min(merged.len());
-            merged.insert(idx, ue);
-        }
-        merged
+        out
     }
 
     /// 词的最优码（反查注释 / 造词）。
@@ -532,9 +559,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // 【/jc 选重位】用户词带 stem="pN"（加词窗第三框「第 N 选」）按
-    // 绝对位次插入最终候选：N 超出候选数 → 排最后；否则插第 N 位、
-    // 原第 N 位起后移。
+    // 【/jc 选重位 2026-09-06 → 时序回放 2026-11】用户词带 stem="pN"
+    // （加词窗第三框「第 N 选」）经 {添加}…pN 行回放：插入位次以操作
+    // 时刻列表度量（超出 → 排最后）。
     #[test]
     fn user_word_placement() {
         let tmp = std::env::temp_dir().join(format!("hufu-test-place-{}", std::process::id()));
@@ -545,7 +572,8 @@ mod tests {
             "码表.txt",
             "a 甲 乙 丙 丁 戊 己\n",
         );
-        // 用户词：pos=3（插第 3 位）、pos=9（超出 → 最后）、无 pos（默认置顶）
+        // 用户词：pN 词行升格 {添加}pN（时序回放插位）；无 pN 的行
+        // 仍走 user_dict 并入路径（v1：最前）
         write(
             &tmp,
             "用户词.txt",
@@ -556,15 +584,15 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "子".to_string(), // 无 pos：置顶（v1 行为）
+                "子".to_string(), // 无 pN：插到最前（v1 行为）
                 "甲".to_string(),
-                "酉".to_string(), // 第 3 选
                 "乙".to_string(),
+                "酉".to_string(), // p3 = 第 3 位（该时刻列表度量）
                 "丙".to_string(),
                 "丁".to_string(),
                 "戊".to_string(),
                 "己".to_string(),
-                "戌".to_string(), // pos=9 超出（8 个）→ 最后
+                "戌".to_string(), // p9 超出 → 最后
             ],
             "选重位插入: {texts:?}"
         );
@@ -589,11 +617,11 @@ mod tests {
             ["闲".to_string(), "二".to_string(), "那样".to_string()],
             "选重位顶替码表同词: {texts:?}"
         );
-        // 删除态：先判 removed 再动码表位（否则误删码表词后又不插）
+        // 删除态：{删除} 后词彻底离场（码表原位也不在）
         let mut s2 = Schema::load(&tmp).unwrap();
         s2.adjust.remove("ae", "二");
         let texts2: Vec<String> = s2.candidates("ae").iter().map(|e| e.text.clone()).collect();
-        assert_eq!(texts2, ["闲".to_string(), "那样".to_string()], "删除态恢复码表原序: {texts2:?}");
+        assert_eq!(texts2, ["闲".to_string(), "那样".to_string()], "删除态: {texts2:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -639,6 +667,54 @@ mod tests {
         assert_eq!(s.user_dict.entries.len(), 2, "个人用户词（含表内同词）并入用户词库");
         let texts: Vec<String> = s.candidates("zzt").iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts, ["自造词".to_string()], "用户词可出字: {texts:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【用户实测场景 2026-11 修复·时序回放】ae 的操作序列（用户调整.txt
+    // 回放）：{添加}ae 测试 p5 → {置顶}ae 乛 → {删除}ae 那样 →
+    // {添加}ae ipad mini p6。码表：ae 行 = 闲 那样 乛 の …。
+    // 用户拍板语义（2026-11）：**按操作时序回放**——删除「那样」后，
+    // 它后面的所有词（含先前插入的 p5「测试」）前移一位 → 测试变
+    // 4 选；ipad mini p6 在删除后的列表第 6 位；「ipad mini」含空格
+    // 完整保留。
+    #[test]
+    fn user_adjust_rank_and_space_word_regression() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-rankfix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 码表：ae 前几名 闲 那样 乛 の 爱 安 按 岸 暗（qq/ww 补行撑
+        // 体量——big_tables 最大者胜选主表，码表.txt 必须大于
+        // 用户调整.txt 才能当主表）
+        write(
+            &tmp,
+            "码表.txt",
+            "ae 闲 那样 乛 の 爱 安 按 岸 暗\nqq 悉 蟋 惜 熄 硒 矽 硅 锡 膝 夕\nww 巫 诬 屋 污 乌 钨 呜 坞 吴 悟\n",
+        );
+        write(
+            &tmp,
+            "用户调整.txt",
+            "{添加}ae\t测试\tp5\n{置顶}ae\t乛\n{删除}ae\t那样\n{添加}ae\tipad mini\tp6\n",
+        );
+        let s = Schema::load(&tmp).unwrap();
+        let texts: Vec<String> = s.candidates("ae").iter().map(|e| e.text.clone()).collect();
+        // 期望序（时序回放，2026-11 用户拍板）：
+        // 0 乛(置顶) 1 闲 2 の 3 测试(删2选后前移) 4 爱 5 ipad mini(p6) 6 安 7 按 8 岸 9 暗
+        assert_eq!(
+            texts,
+            [
+                "乛".to_string(),
+                "闲".to_string(),
+                "の".to_string(),
+                "测试".to_string(),
+                "爱".to_string(),
+                "ipad mini".to_string(),
+                "安".to_string(),
+                "按".to_string(),
+                "岸".to_string(),
+                "暗".to_string(),
+            ],
+            "时序回放：删 2 选后 p5 前移 4 选: {texts:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -412,18 +412,31 @@ pub fn dispatch(
         }
         // 语言栏右键「导出码表」：导出当前方案（用户调整合并快照）并
         // explorer 打开导出子文件夹（码表导出\<方案名>\）。
-        "export_schema" => match host.export_schema(None) {
-            Ok((path, n)) => {
-                let dir = std::path::Path::new(&path)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default();
-                if dir.is_dir() {
-                    crate::platform::open_path(&dir);
+        // 【导出格式记忆 2026-11】取当前方案的记忆格式（settings 导出
+        // 下拉选过即记忆；无记忆 = Sentence 兼容旧行为）。
+        "export_schema" => {
+            let cur = host.engine.config.schema.current.clone();
+            let fmt = host
+                .engine
+                .config
+                .schema
+                .export_formats
+                .get(&cur)
+                .cloned()
+                .unwrap_or_default();
+            match host.export_schema(None, &fmt) {
+                Ok((path, n)) => {
+                    let dir = std::path::Path::new(&path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default();
+                    if dir.is_dir() {
+                        crate::platform::open_path(&dir);
+                    }
+                    serde_json::json!({"ok": true, "path": path, "lines": n})
                 }
-                serde_json::json!({"ok": true, "path": path, "lines": n})
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
             }
-            Err(e) => serde_json::json!({"ok": false, "error": e}),
         },
         // 语言栏菜单音效开关：读态 / 切换（落盘，热生效）
         "sound_state" => serde_json::json!({

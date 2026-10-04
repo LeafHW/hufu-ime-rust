@@ -16,7 +16,7 @@ use std::path::Path;
 pub enum AdjustOp {
     /// 置顶：把 `码→词` 移到候选首位（重复置顶按时间累积，最新在前）
     Pin,
-    /// 添加：把词条加入该码候选（不存在则新增）
+    /// 添加：把词条加入该码候选（不存在则新增；可选 pN 选重位）
     Add,
     /// 删除：把词条从该码候选中隐藏
     Remove,
@@ -24,13 +24,25 @@ pub enum AdjustOp {
     Weight,
 }
 
+/// 一条调整日志（保持文件时序——回放语义的基础）。
+#[derive(Debug, Clone)]
+struct AdjustEntry {
+    op: AdjustOp,
+    code: String,
+    word: String,
+    /// 【时序回放 2026-11 用户拍板】{添加} 第三列 pN 选重位（1 基）。
+    /// 插入位次以**该操作时刻**的列表度量；其后的 {删除} 会让它连同
+    /// 后面所有词一起前移（用户实测：删除 2 选后 p5 词应变 4 选）。
+    pos: Option<usize>,
+}
+
 /// 回放后的调整状态。
 #[derive(Debug, Default, Clone)]
 pub struct UserAdjust {
-    /// 置顶日志（时间序）
-    pins: Vec<(String, String)>,
-    adds: Vec<(String, String)>,
-    removes: HashSet<(String, String)>,
+    /// 全部操作日志（文件时序：内嵌 → 旧用户词 → 用户调整）。
+    log: Vec<AdjustEntry>,
+    /// 当前删除态集合（回放派生：{添加}/{置顶}/{加权} 隐含取消删除）
+    removes: std::collections::HashSet<(String, String)>,
     /// 加权：码→词 → 权重（{加权}行第三列；缺省 1000）
     pub weights: HashMap<(String, String), f64>,
 }
@@ -55,13 +67,20 @@ impl UserAdjust {
             } else {
                 continue;
             };
-            // 【虎爪内嵌兼容 2026-09-06】列分隔宽容：TAB 或空白均可；
-            // 超过两列时多余列忽略（虎爪码表第三列常为日期
-            // 2026-09-04 / 20260904 之类——只取 码+词）。
-            let parts: Vec<&str> = rest
-                .split(|c| c == '\t' || c == ' ' || c == '\u{3000}')
-                .filter(|s| !s.is_empty())
-                .collect();
+            // 【列分隔 2026-11 修复】含 TAB 的行严格按 TAB 分割——词可
+            // 含空格（{添加}ae\tipad mini\tp6 的「ipad mini」曾是空格
+            // 分割丢尾成幽灵「ipad」）。无 TAB 行（旧虎爪内嵌行）保持
+            // 空白宽容分割。
+            let parts: Vec<&str> = if rest.contains('\t') {
+                rest.split('\t')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                rest.split(|c| c == ' ' || c == '\u{3000}')
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
             if parts.len() < 2 {
                 continue;
             }
@@ -70,29 +89,40 @@ impl UserAdjust {
             if code.is_empty() || word.is_empty() {
                 continue;
             }
+            // 【时序回放 2026-11】pN 选重位只对 {添加} 有意义（第三列
+            // 以 p 开头+数字）；其他标记的第三列（日期等）忽略。
+            let pos = if op == AdjustOp::Add {
+                parts
+                    .get(2)
+                    .and_then(|s| s.strip_prefix('p'))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|n| *n >= 1)
+            } else {
+                None
+            };
             match op {
-                AdjustOp::Pin => {
-                    adj.pins.push((code, word));
-                }
-                AdjustOp::Add => {
-                    adj.adds.push((code.clone(), word.clone()));
-                    // 添加隐含取消删除（明确想要它）
-                    adj.removes.remove(&(code, word));
+                AdjustOp::Pin | AdjustOp::Add | AdjustOp::Weight => {
+                    // 添加/置顶/加权隐含取消删除（明确想要它）；日志
+                    // 保持原样追加（时序回放语义不能因状态折叠丢失）
+                    adj.removes.remove(&(code.clone(), word.clone()));
+                    if op == AdjustOp::Weight {
+                        let w = parts
+                            .get(2)
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .unwrap_or(1000.0);
+                        adj.weights.insert((code.clone(), word.clone()), w);
+                    }
                 }
                 AdjustOp::Remove => {
-                    adj.removes.insert((code, word));
-                }
-                AdjustOp::Weight => {
-                    // 第三列=权重（{加权}code\t词\t3000；缺省 1000）
-                    let w = parts
-                        .get(2)
-                        .and_then(|s| s.trim().parse::<f64>().ok())
-                        .unwrap_or(1000.0);
-                    adj.weights.insert((code.clone(), word.clone()), w);
-                    // 加权隐含取消删除（明确想要它）
-                    adj.removes.remove(&(code, word));
+                    adj.removes.insert((code.clone(), word.clone()));
                 }
             }
+            adj.log.push(AdjustEntry {
+                op,
+                code,
+                word,
+                pos,
+            });
         }
         adj
     }
@@ -104,34 +134,58 @@ impl UserAdjust {
     /// 序列化为追加日志文本（可回放）。
     pub fn to_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for (code, word) in &self.pins {
-            out.push(format!("{{置顶}}{code}\t{word}"));
-        }
-        for (code, word) in &self.adds {
-            out.push(format!("{{添加}}{code}\t{word}"));
-        }
-        for (code, word) in &self.removes {
-            out.push(format!("{{删除}}{code}\t{word}"));
+        for e in &self.log {
+            let mark = match e.op {
+                AdjustOp::Pin => "{置顶}",
+                AdjustOp::Add => "{添加}",
+                AdjustOp::Remove => "{删除}",
+                AdjustOp::Weight => "{加权}",
+            };
+            let mut l = format!("{mark}{}\t{}", e.code, e.word);
+            if let Some(p) = e.pos {
+                l.push_str(&format!("\tp{p}"));
+            }
+            out.push(l);
         }
         out
     }
 
     pub fn pin(&mut self, code: &str, word: &str) {
-        self.pins.retain(|(c, w)| !(c == code && w == word));
-        self.pins.push((code.to_string(), word.to_string()));
+        self.log.retain(|e| !(e.code == code && e.word == word));
+        self.log.push(AdjustEntry {
+            op: AdjustOp::Pin,
+            code: code.to_string(),
+            word: word.to_string(),
+            pos: None,
+        });
         // 置顶隐含取消删除
         self.removes.remove(&(code.to_string(), word.to_string()));
     }
 
     pub fn add(&mut self, code: &str, word: &str) {
-        self.adds.retain(|(c, w)| !(c == code && w == word));
-        self.adds.push((code.to_string(), word.to_string()));
+        self.add_at(code, word, None);
+    }
+
+    /// 带选重位加词（/jc 第三框 pN）。
+    pub fn add_at(&mut self, code: &str, word: &str, pos: Option<usize>) {
+        self.log.retain(|e| !(e.code == code && e.word == word));
+        self.log.push(AdjustEntry {
+            op: AdjustOp::Add,
+            code: code.to_string(),
+            word: word.to_string(),
+            pos,
+        });
         self.removes.remove(&(code.to_string(), word.to_string()));
     }
 
     pub fn remove(&mut self, code: &str, word: &str) {
-        self.pins.retain(|(c, w)| !(c == code && w == word));
-        self.adds.retain(|(c, w)| !(c == code && w == word));
+        self.log.retain(|e| !(e.code == code && e.word == word));
+        self.log.push(AdjustEntry {
+            op: AdjustOp::Remove,
+            code: code.to_string(),
+            word: word.to_string(),
+            pos: None,
+        });
         self.removes.insert((code.to_string(), word.to_string()));
     }
 
@@ -139,6 +193,24 @@ impl UserAdjust {
     /// 过滤码表 base，用户词在 schema.candidates 单独合并）。
     pub fn removed(&self, code: &str, word: &str) -> bool {
         self.removes.contains(&(code.to_string(), word.to_string()))
+    }
+
+    /// 该 码→词 是否有 {添加} 日志（schema 层去重：adjust.apply 已
+    /// 就位/追加过，user_dict 同词词行不再二次并入）。
+    pub fn added(&self, code: &str, word: &str) -> bool {
+        self.log
+            .iter()
+            .any(|e| e.op == AdjustOp::Add && e.code == code && e.word == word)
+    }
+
+    /// 全部 {添加} 日志的 (码, 词)（整句词图注入用——pN 词不再入
+    /// user_dict，同步管道从这里取）。
+    pub fn added_words(&self) -> Vec<(String, String)> {
+        self.log
+            .iter()
+            .filter(|e| e.op == AdjustOp::Add)
+            .map(|e| (e.code.clone(), e.word.clone()))
+            .collect()
     }
 
     /// 【格式统一 2026-09-06】用户数据统一落 `用户调整.txt`：
@@ -181,56 +253,93 @@ impl UserAdjust {
                 adj_lines.push(l.clone());
             } else if t.starts_with('#') || t.is_empty() {
                 // 头注释/空行跳过
+            } else if l.contains('\t') && l.split('\t').count() >= 3 {
+                let f: Vec<&str> = l.split('\t').map(|s| s.trim()).collect();
+                // 【时序回放 2026-11】旧 用户词.txt 的 pN 词行（码\t词
+                // [\tweight]\tpN）升格为 {添加} 调整日志（时序回放插位）；
+                // 不再走 user_dict 合并路径（那里已无 pN 插位语义）。
+                let pn = [f.get(2), f.get(3)]
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s.starts_with('p') && s.len() > 1);
+                if let Some(pn) = pn {
+                    adj_lines.push(format!("{{添加}}{}\t{}\t{}", f[0], f[1], pn));
+                } else {
+                    // 旧 TSV 词行（码\t词\tweight）原样词行
+                    word_lines.push(l.clone());
+                }
             } else {
-                // 旧 TSV 词行（码\t词\tweight[\tpN]）原样词行
+                // 旧 TSV 词行（码\t词\tweight）原样词行
                 word_lines.push(l.clone());
             }
         }
         (word_lines, adj_lines)
     }
 
-    /// 应用到字典候选列表：返回调整后的条目序列。
+    /// 应用到字典候选列表：**时序回放**（2026-11 用户拍板）。逐条按
+    /// 日志顺序在演化的列表上执行：
+    /// - {置顶}：该词（码表内则原条目标 pinned，自造则新条目）移到最前；
+    /// - {添加}pN：以**该时刻列表**度量插第 N 位（超出→末尾）；无 pN
+    ///   → 已在列表则只提权重语义（不动位），否则末尾追加；
+    /// - {删除}：移除该词——**其后所有词（含先前插入的 pN 用户词）
+    ///   统一前移一位**（用户实测：删 2 选后 p5 词变 4 选）；
+    /// - {加权}：不动位（权重由 user_dict.weights 消费）。
+    /// 同码同词的重复日志行已被写入端去重（append 清旧行），回放端
+    /// 对重复行天然幂等（重演同一词）。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
-        let mut out: Vec<DictEntry> = Vec::new();
-        // 1) 置顶（最新在前；命中码表的条目也标记 pinned）。
-        //    【回放语义 2026-09-06】置顶之后又删除的（日志后操作=删除，
-        //    虎爪码表内嵌置顶 + 用户文件删除的覆盖场景）不显示——
-        //    removes 赢，与实时 pin()/remove() 的联动语义对齐。
-        let pinned: Vec<&(String, String)> = self
-            .pins
-            .iter()
-            .filter(|(c, _)| c == code)
-            .collect();
-        for (c, w) in pinned.iter().rev() {
-            if self.removes.contains(&((*c).clone(), ((*w).clone()))) {
+        let mut out: Vec<DictEntry> = base.to_vec();
+        for e in &self.log {
+            if e.code != code {
                 continue;
             }
-            if let Some(mut e) = base.iter().find(|e| e.code == *c && e.text == *w).cloned() {
-                e.pinned = true;
-                out.push(e);
-            } else {
-                let mut e = DictEntry::new(c.clone(), w.clone(), u32::MAX);
-                e.pinned = true;
-                out.push(e);
-            }
-        }
-        // 2) 原始候选（跳过已置顶与已删除）
-        for e in base {
-            if self.removes.contains(&(e.code.clone(), e.text.clone())) {
-                continue;
-            }
-            if pinned.iter().any(|(c, w)| *c == e.code && *w == e.text) {
-                continue;
-            }
-            out.push(e.clone());
-        }
-        // 3) 添加（不存在时追加到尾部）
-        for (c, w) in &self.adds {
-            if c != code || self.removes.contains(&(c.clone(), w.clone())) {
-                continue;
-            }
-            if !out.iter().any(|e| e.code == *c && e.text == *w) {
-                out.push(DictEntry::new(c.clone(), w.clone(), u32::MAX - 1));
+            match e.op {
+                AdjustOp::Pin => {
+                    if let Some(hit) = out.iter().position(|x| x.text == e.word) {
+                        let mut entry = out.remove(hit);
+                        entry.pinned = true;
+                        out.insert(0, entry);
+                    } else {
+                        let mut entry = DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX);
+                        entry.pinned = true;
+                        out.insert(0, entry);
+                    }
+                }
+                AdjustOp::Add => {
+                    if let Some(hit) = out.iter().position(|x| x.text == e.word) {
+                        if let Some(n) = e.pos {
+                            // 显式选重位重排：移到第 N 位（1 基；超出→
+                            // 末尾）。置顶语义更强，置顶词不动。
+                            let entry = out.remove(hit);
+                            if !entry.pinned {
+                                let idx = (n - 1).min(out.len());
+                                out.insert(idx, entry);
+                            } else {
+                                out.insert(hit.min(out.len()), entry);
+                            }
+                        }
+                        // 无 pN 的重复添加：已在列表，不动
+                    } else if let Some(n) = e.pos {
+                        let idx = (n - 1).min(out.len());
+                        out.insert(
+                            idx,
+                            DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX - 1),
+                        );
+                    } else {
+                        // 无 pN 加词：追加到末尾（v1 语义；schema 层词行
+                        // 去重后不再二次并入）
+                        out.push(DictEntry::new(
+                            e.code.clone(),
+                            e.word.clone(),
+                            u32::MAX - 1,
+                        ));
+                    }
+                }
+                AdjustOp::Remove => {
+                    out.retain(|x| x.text != e.word);
+                }
+                AdjustOp::Weight => {
+                    // 权重经 user_dict.weights 消费（merge_into），位次不动
+                }
             }
         }
         out
@@ -393,6 +502,46 @@ mod tests {
         assert_eq!(texts, ["叉", "来", "氨", "哎呦"]);
     }
 
+    // 【时序回放 2026-11 用户拍板】用户实测 ae 序列：{添加}p5 → {置顶}
+    // → {删除}2选词 → {添加}p6。期望：删除后 p5 词前移成 4 选，p6 词
+    // 在第 6 位（原实现删除先全做完、pN 绝对位插入 → p5 钉死 5 选）。
+    #[test]
+    fn sequential_replay_delete_shifts_placed_words() {
+        let lines: Vec<String> = vec![
+            "{添加}ae\t测试\tp5".into(),
+            "{置顶}ae\t乛".into(),
+            "{删除}ae\t那样".into(),
+            "{添加}ae\tipad mini\tp6".into(),
+        ];
+        // 基表：闲 那样 乛 の 爱 安 按 岸 暗
+        let base: Vec<DictEntry> = ["闲", "那样", "乛", "の", "爱", "安", "按", "岸", "暗"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DictEntry::new("ae", *t, i as u32))
+            .collect();
+        let adj = UserAdjust::parse(&lines);
+        let out = adj.apply("ae", &base);
+        let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "乛", "闲", "の", "测试", "爱", "ipad mini", "安", "按", "岸", "暗"
+            ],
+            "时序回放：删 2 选后 p5 前移 4 选: {texts:?}"
+        );
+
+        // 无删除干扰的纯选重位：p5 恒第 5 位
+        let lines2: Vec<String> = vec!["{添加}ae\t测试\tp5".into()];
+        let adj2 = UserAdjust::parse(&lines2);
+        let out2 = adj2.apply("ae", &base);
+        let texts2: Vec<&str> = out2.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts2,
+            ["闲", "那样", "乛", "の", "测试", "爱", "安", "按", "岸", "暗"],
+            "纯 p5 位次: {texts2:?}"
+        );
+    }
+
     #[test]
     fn user_dict_weighting() {
         let mut ud = UserDict::default();
@@ -443,9 +592,13 @@ mod tests {
         let lines: Vec<String> = vec![
             "{置顶}a 叉 2026-09-04".into(),
             "{添加}a 哎呦 20260904".into(),
-            "{删除}a\u{3000}氨\t2026/09/05".into(),
+            // 【2026-11 修复】混合分隔（TAB+全角空格）按 TAB 分割：
+            // 码 a、词「氨」（全角空格在 TAB 列内——第三列日期丢弃）
+            "{删除}a\t氨\t2026/09/05".into(),
             // 裸日志（原生 TAB）不受影响
             "{置顶}ab\t你好".into(),
+            // 【词含空格 2026-11】TAB 行词列的空格必须保留（ipad mini）
+            "{添加}ae\tipad mini\tp6".into(),
         ];
         let adj = UserAdjust::parse(&lines);
         let out = adj.apply("a", &base());
@@ -453,5 +606,7 @@ mod tests {
         assert_eq!(texts, ["叉", "来", "哎呦"]); // 氨被删、哎呦添加
         let out2 = adj.apply("ab", &[]);
         assert_eq!(out2[0].text, "你好");
+        let out3 = adj.apply("ae", &[]);
+        assert_eq!(out3[0].text, "ipad mini", "TAB 行词含空格完整保留");
     }
 }

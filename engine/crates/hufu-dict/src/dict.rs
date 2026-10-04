@@ -24,7 +24,16 @@ impl Trie {
         }
     }
 
+    /// 【空表防崩 2026-11】零节点（未初始化）时前缀必然查不到——
+    /// 与「有根但无子节点」同语义返回空，杜绝 nodes[0] 越界。
+    fn ensure_root(&mut self) {
+        if self.nodes.is_empty() {
+            self.nodes.push(TrieNode::default());
+        }
+    }
+
     pub fn insert(&mut self, code: &str, entry_idx: u32) {
+        self.ensure_root();
         let mut cur = 0usize;
         for ch in code.chars() {
             let next = self.nodes[cur].children.get(&ch).copied();
@@ -44,6 +53,10 @@ impl Trie {
 
     /// 精确命中该编码的条目下标。
     pub fn exact(&self, code: &str) -> &[u32] {
+        // 【空表防崩 2026-11】零节点空 Trie 无命中（nodes[0] 会越界）
+        if self.nodes.is_empty() {
+            return &[];
+        }
         let mut cur = 0usize;
         for ch in code.chars() {
             match self.nodes[cur].children.get(&ch).copied() {
@@ -55,8 +68,12 @@ impl Trie {
     }
 
     /// 收集以 `prefix` 为前缀的所有编码（`(编码, 条目下标)`，编码短者优先）。
-    /// `limit` 限制返回条数，防止 `a` 这类短前缀爆炸。
+    /// `limit` 限制返回条量，防止 `a` 这类短前缀爆炸。
     pub fn completions(&self, prefix: &str, limit: usize) -> Vec<(String, u32)> {
+        // 【空表防崩 2026-11】零节点空 Trie 直接空结果（nodes[0] 会越界）
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
         let mut cur = 0usize;
         for ch in prefix.chars() {
             match self.nodes[cur].children.get(&ch).copied() {
@@ -89,6 +106,10 @@ impl Trie {
     /// 编码长度降序（长码优先，供整句解码枚举切分）。
     pub fn prefix_matches(&self, raw: &str) -> Vec<(usize, Vec<u32>)> {
         let mut result: Vec<(usize, Vec<u32>)> = Vec::new();
+        // 【空表防崩 2026-11】零节点空 Trie 直接空结果（nodes[0] 会越界）
+        if self.nodes.is_empty() {
+            return result;
+        }
         let mut cur = 0usize;
         let mut len = 0usize;
         let mut chars = raw.chars();
@@ -134,6 +155,10 @@ impl Dict {
     pub fn new(name: impl Into<String>) -> Self {
         Dict {
             name: name.into(),
+            // 【空表防崩 2026-11】Trie::default 是零节点（无根），
+            // completions 走 nodes[0] 会越界 panic；空码表（如目录里
+            // 只有超集副表、无主码表）也必须能安全前缀查询。
+            trie: Trie::new(),
             ..Default::default()
         }
     }

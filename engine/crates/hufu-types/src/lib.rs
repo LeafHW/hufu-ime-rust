@@ -32,6 +32,11 @@ pub enum KeyCode {
     AltRight,
     Meta,
     F(u8),
+    /// 【小键盘映射 2026-11】数字锁定开启时的小键盘键（VK 0x60-0x6F）：
+    /// Numpad('5') = 小键盘 5、Numpad('+') = 小键盘 +。与主排数字
+    /// Char('5') 身份分开——主排数字是选重键，小键盘独立映射键名
+    /// num5（DLL 仅在用户映射过时才递引擎，未映射直通零差异）。
+    Numpad(char),
 }
 
 impl KeyCode {
@@ -220,6 +225,22 @@ pub struct SessionState {
     /// 候选窗是否显示序号（candidates.show_index）
     #[serde(default = "default_true")]
     pub show_index: bool,
+    /// 【Esc 双行为 2026-11】Esc 撤回就绪（esc_undo 开 && 空态 &&
+    /// 上屏历史非空）：DLL TestDown 空态 escape 预判吞键用（不就绪
+    /// 时 FALSE=透传给应用）。引擎 state() 填。
+    #[serde(default)]
+    pub esc_undo_ready: bool,
+    /// 【全键盘按键映射 2026-11】用户键→功能表快照（config.keymap.map）。
+    /// DLL 缓存后：① F 区键仅在映射过的前提下路由进引擎（未映射 F 键
+    /// 行为与旧版逐字节一致——直通）；② TestDown 空态预判对「空态也
+    /// 生效」的功能（repeat/undo/text/switch）放行。
+    #[serde(default)]
+    pub keymap: std::collections::HashMap<String, String>,
+    /// 【两态映射 2026-11】空态专用映射表（config.keymap.map_idle）。
+    /// DLL TestDown 空态预判用：空态生效判定 = map_idle[key]（缺省
+    /// 回落 map[key]）∈ 空态可用功能集。
+    #[serde(default)]
+    pub keymap_idle: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

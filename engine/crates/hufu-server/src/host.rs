@@ -604,10 +604,16 @@ impl Host {
         }
     }
 
-    /// 导出码表（虎爪码表导出语义）：name 缺省=当前方案。当前方案用
-    /// 运行态（含本会话调频）；其它方案从磁盘重载（含其用户调整/用户词）。
-    /// 输出 数据\码表导出\<方案名> <yyyyMMdd-HHmm>.txt，返回 (路径, 行数)。
-    pub fn export_schema(&self, name: Option<&str>) -> Result<(String, usize), String> {
+    /// 导出码表：name 缺省=当前方案，format 缺省=虎整句（字节级兼容旧
+    /// 导出）。当前方案用运行态（含本会话调频）；其它方案从磁盘重载
+    ///（含其用户调整/用户词）。输出 数据\码表导出\<方案名> <yyyyMMdd-HHmm>.txt，
+    /// 返回 (路径, 行数)。
+    pub fn export_schema(
+        &self,
+        name: Option<&str>,
+        format: &str,
+    ) -> Result<(String, usize), String> {
+        let fmt = export_util::ExportFormat::parse(format);
         let current = self.engine.config.schema.current.clone();
         let target = name
             .filter(|n| !n.is_empty())
@@ -624,11 +630,11 @@ impl Host {
             }
             let schema = hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
             let out = self.export_out_path(&target);
-            let n = export_util::export_one(&schema, &out)?;
+            let n = export_util::export_one(&schema, &out, fmt)?;
             return Ok((out.to_string_lossy().into_owned(), n));
         }
         let out = self.export_out_path(&target);
-        let n = export_util::export_one(&self.engine.schema, &out)?;
+        let n = export_util::export_one(&self.engine.schema, &out, fmt)?;
         Ok((out.to_string_lossy().into_owned(), n))
     }
 
@@ -656,6 +662,23 @@ impl Host {
         ))
     }
 
+    /// 【重复上屏包括符号 2026-11】上屏历史栈记账收口（process_key /
+    /// select_candidate 同源）：开关关（默认）= 2026-10-30 三修口径——
+    /// 剥尾随非字母（标点/空白）后含至少一个字母才记，纯符号/数字
+    /// 上屏不入栈、标点顶字「中，」只记「中」；开关开 = 任何非空上屏
+    /// 整段原样入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc 撤回
+    /// 可作用于任意上一次上屏内容（用户在「输入与候选」页勾选）。
+    fn record_commit_history(&mut self, c: &str) {
+        if self.engine.config.general.repeat_include_symbols {
+            self.engine.push_commit_history(c);
+        } else {
+            let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
+            if text_part.chars().any(|ch| ch.is_alphabetic()) {
+                self.engine.push_commit_history(text_part);
+            }
+        }
+    }
+
     /// 按键 → (结果, 状态快照)。
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
         // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
@@ -679,7 +702,9 @@ impl Host {
                 // 【{重复上屏} 数据源】每次真实上屏更新进程级 last_commit
                 //（engine 侧 {重复上屏} 展开时读）。功能词指令（{加词}/
                 // {隐藏候选}——DLL 拦截不上屏）不算上屏内容、不进语境尾巴。
-                if c != "{加词}" && c != "{隐藏候选}" {
+                // 【{撤回} 2026-11】{撤回} 是回删指令不输出文本，同样
+                // 不进历史栈/尾巴（engine 侧已弹栈消耗）。
+                if c != "{加词}" && c != "{隐藏候选}" && c != "{撤回}" {
                     // 【重复上屏只记文字 2026-10-30 三修】回放源只记
                     // 「文字部分」：①纯符号/数字/西文标点上屏不当回放源
                     //（打了「会……」后 {重复上屏} 要回放「会」而不是
@@ -690,10 +715,11 @@ impl Host {
                     // 字符（标点/空白），剩余含至少一个字母才记
                     //（is_alphabetic：汉字/西文）；「第3条」这类混排
                     // 剥掉尾标点后整体记。
-                    let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
-                    if text_part.chars().any(|ch| ch.is_alphabetic()) {
-                        self.engine.last_commit = text_part.to_string();
-                    }
+                    // 【上屏历史栈 2026-11】{重复上屏}/{重复上屏N}/Esc 撤回
+                    // 共用 8 条历史栈（最新在前），与 last_commit 同源更新。
+                    // 【重复上屏包括符号 2026-11】记账口径收口到
+                    // record_commit_history（开关开=整段原样入栈）。
+                    self.record_commit_history(c);
                     self.session.tail_context.push_str(c);
                     let n = self.session.tail_context.chars().count();
                     if n > 32 {
@@ -724,13 +750,12 @@ impl Host {
     pub fn select_candidate(&mut self, index: usize) -> serde_json::Value {
         let outcome = self.engine.select_candidate(&mut self.session, index);
         if let Some(c) = outcome.commit.as_deref() {
-            if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" {
+            if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" && c != "{撤回}" {
                 // 【重复上屏只记文字 2026-10-30 三修】与 process_key 同源：
                 // 剥尾随标点后含字母才记；纯符号/数字上屏不覆盖回放源。
-                let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
-                if text_part.chars().any(|ch| ch.is_alphabetic()) {
-                    self.engine.last_commit = text_part.to_string();
-                }
+                // 【重复上屏包括符号 2026-11】记账口径收口到 record_commit_history
+                //（开关开=整段原样入栈，与 process_key 一致）。
+                self.record_commit_history(c);
                 self.session.tail_context.push_str(c);
                 let n = self.session.tail_context.chars().count();
                 if n > 32 {
@@ -814,6 +839,8 @@ impl Host {
 }
 
 /// 前端按键描述 → KeyInput：{"key":"a"|"space"|...,"shift":bool,...}
+/// 【全键盘按键映射 2026-11】新增 F 区键名（f1..f12）：映射功能（如
+/// F1=undo）从设置页/DLL 发来时不再落进 Char 回退。
 pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
     let s = v.get("key")?.as_str()?;
     let key = match s {
@@ -838,6 +865,37 @@ pub fn parse_key(v: &serde_json::Value) -> Option<KeyInput> {
         "ctrlright" => KeyCode::CtrlRight,
         "alt" | "altleft" => KeyCode::AltLeft,
         "altright" => KeyCode::AltRight,
+        "f1" => KeyCode::F(1),
+        "f2" => KeyCode::F(2),
+        "f3" => KeyCode::F(3),
+        "f4" => KeyCode::F(4),
+        "f5" => KeyCode::F(5),
+        "f6" => KeyCode::F(6),
+        "f7" => KeyCode::F(7),
+        "f8" => KeyCode::F(8),
+        "f9" => KeyCode::F(9),
+        "f10" => KeyCode::F(10),
+        "f11" => KeyCode::F(11),
+        "f12" => KeyCode::F(12),
+        // 【小键盘映射 2026-11】num0-9 / numadd / numsub / nummul /
+        // numdiv / numdot / numenter（VK 0x60-0x6F 对应）。DLL 数字
+        // 锁定态递这些名；与主排数字 Char('5') 身份分开。
+        "num0" => KeyCode::Numpad('0'),
+        "num1" => KeyCode::Numpad('1'),
+        "num2" => KeyCode::Numpad('2'),
+        "num3" => KeyCode::Numpad('3'),
+        "num4" => KeyCode::Numpad('4'),
+        "num5" => KeyCode::Numpad('5'),
+        "num6" => KeyCode::Numpad('6'),
+        "num7" => KeyCode::Numpad('7'),
+        "num8" => KeyCode::Numpad('8'),
+        "num9" => KeyCode::Numpad('9'),
+        "numadd" => KeyCode::Numpad('+'),
+        "numsub" => KeyCode::Numpad('-'),
+        "nummul" => KeyCode::Numpad('*'),
+        "numdiv" => KeyCode::Numpad('/'),
+        "numdot" => KeyCode::Numpad('.'),
+        "numenter" => KeyCode::Numpad('\r'),
         _ => {
             let c = s.chars().next()?;
             KeyCode::Char(c)
@@ -880,24 +938,58 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod export_util {
     use hufu_dict::Schema;
 
+    /// 导出格式（settings「导入导出」下拉，与 hufu-dict parse 模块对齐）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ExportFormat {
+        /// 虎整句 `码 词1 词2`（默认——字节级兼容旧导出，SpaceCodeWords
+        /// 解析器可直接再导入）
+        Sentence,
+        /// HuFu 原生 TSV：`#hufu-dict v1` 头 + `码\t词\t[权重]`
+        Native,
+        /// Rime dict.yaml：`---` yaml 头 + `词\t码\t权重` 表体
+        Rime,
+        /// 多多：`---config@` 头 + `词\t码`，置顶标 `#固`
+        Duoduo,
+        /// QQ五笔：无头 `词\t码`
+        Qq,
+    }
+
+    impl ExportFormat {
+        /// 请求参数解析：缺省/未知一律回 Sentence（兼容旧调用方）。
+        pub fn parse(s: &str) -> Self {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "native" | "hufu" => Self::Native,
+                "rime" | "yaml" | "dict.yaml" => Self::Rime,
+                "duoduo" | "dd" => Self::Duoduo,
+                "qq" => Self::Qq,
+                _ => Self::Sentence,
+            }
+        }
+    }
+
     /// 单方案导出：全部编码按当前生效序（码表 + 用户调整回放 + 用户词
-    /// + 运行调频）聚合为 `码 词1 词2 …` 行（虎爪码表导出同格式，HuFu
-    /// 的 SpaceCodeWords 解析器可直接再导入）。补充语料不进导出（用户
-    /// 拍板：导出语义只有「用户调整 + 原始码表」合一）。
-    pub fn export_one(schema: &Schema, out_path: &std::path::Path) -> Result<usize, String> {
+    /// + 运行调频）聚合。用户置顶/调频/加词的结果直接体现为「格式本身
+    /// 的表达」：置顶→多多 `#固` / Rime 大权重 / Native 大权重；隐藏→
+    /// 条目不出现（各格式均无隐藏语法）；调频/加词→按生效序写入词条序。
+    /// 补充语料不进导出（用户拍板：导出语义只有「用户调整 + 原始码表」合一）。
+    pub fn export_one(
+        schema: &Schema,
+        out_path: &std::path::Path,
+        fmt: ExportFormat,
+    ) -> Result<usize, String> {
         // 1) 编码全集：码表条目 ∪ 用户词条目（/jc 加词的码可能不在码表）
         let mut codes: Vec<String> = schema.dict.entries.iter().map(|e| e.code.clone()).collect();
         codes.extend(schema.user_dict.entries.iter().map(|e| e.code.clone()));
         codes.sort();
         codes.dedup();
 
-        // 2) 逐码取当前生效序
-        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        // 2) 逐码取当前生效序（含 pinned 标记——多多 #固 / 权重置顶用）
+        let mut rows: Vec<(String, Vec<(String, bool)>)> = Vec::new();
         for code in &codes {
-            let texts: Vec<String> = schema
+            let texts: Vec<(String, bool)> = schema
                 .candidates(code)
                 .iter()
-                .map(|e| e.text.clone())
+                .map(|e| (e.text.clone(), e.pinned))
                 .collect();
             if !texts.is_empty() {
                 rows.push((code.clone(), texts));
@@ -917,16 +1009,281 @@ mod export_util {
             }
         });
 
-        // 5) 落盘（GB18030，CRLF）
-        let lines: Vec<String> = rows
-            .iter()
-            .map(|(c, texts)| format!("{c} {}", texts.join(" ")))
-            .collect();
+        // 4) 按格式渲染行
+        let lines = render(&rows, fmt);
+
+        // 5) 落盘（UTF-8 带 BOM，CRLF）
         if let Some(parent) = out_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         hufu_dict::parse::write_lines_gb18030(out_path, &lines)
             .map_err(|e| format!("写文件失败: {e}"))?;
         Ok(rows.len())
+    }
+
+    /// 各格式渲染：rows 已是「生效序」——置顶在最前、隐藏不在场、调频/
+    /// 加词按用户序。格式差异只在外壳（头/列序/置顶语法）。
+    fn render(rows: &[(String, Vec<(String, bool)>)], fmt: ExportFormat) -> Vec<String> {
+        match fmt {
+            ExportFormat::Sentence => rows
+                .iter()
+                .map(|(c, texts)| {
+                    let words: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+                    format!("{c} {}", words.join(" "))
+                })
+                .collect(),
+            ExportFormat::Native => {
+                let mut out = vec!["#hufu-dict v1 name=export".to_string()];
+                for (c, texts) in rows {
+                    for (t, pinned) in texts {
+                        // 置顶语义：权重 u32::MAX——rank_cmp 权重降序置顶
+                        let w = if *pinned {
+                            u32::MAX.to_string()
+                        } else {
+                            "1".to_string()
+                        };
+                        out.push(format!("{c}\t{t}\t{w}"));
+                    }
+                }
+                out
+            }
+            ExportFormat::Rime => {
+                let mut out = vec![
+                    "---".to_string(),
+                    "name: export".to_string(),
+                    "sort: by_weight".to_string(),
+                    "...".to_string(),
+                ];
+                for (c, texts) in rows {
+                    for (i, (t, pinned)) in texts.iter().enumerate() {
+                        // 【Rime 置顶→权重】Rime 无 #固 语法：置顶给大权重；
+                        // 非置顶按序给递减权重（行序即候选序，回导后
+                        // by_weight 排序还原生效序）
+                        let w = if *pinned {
+                            1_000_000_000u64
+                        } else {
+                            (1_000_000u64).saturating_sub(i as u64)
+                        };
+                        out.push(format!("{t}\t{c}\t{w}"));
+                    }
+                }
+                out
+            }
+            ExportFormat::Duoduo => {
+                // 【2026-11 用户拍板·纯序导出】导出的码表只有顺序语义：
+                // `词\t码`，不加 #固 等任何附加标记——导入方按行序即得
+                // 调整后的顺序。置顶/选重位的结果已全部体现在行序里。
+                let mut out = vec!["---config@码表分类=主码-系统码表".to_string()];
+                for (c, texts) in rows {
+                    for (t, _pinned) in texts {
+                        out.push(format!("{t}\t{c}"));
+                    }
+                }
+                out
+            }
+            ExportFormat::Qq => rows
+                .iter()
+                .flat_map(|(c, texts)| texts.iter().map(move |(t, _)| format!("{t}\t{c}")))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hufu_dict::Schema;
+
+        /// 测试基目录：crate 的 target/ 下（系统临时目录在部分环境下
+        /// 拒绝访问——本次实测 PermissionDenied）。
+        fn test_base(tag: &str) -> std::path::PathBuf {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("export-tests")
+                .join(format!(
+                    "{tag}-{}-{:x}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            // with_extension 会吃掉 tag 里的「.」，无妨——只求唯一
+            let _ = &mut p;
+            p
+        }
+
+        /// 主表必须明显大于用户调整.txt（后者也参加「最大文件=主码表」
+        /// 竞选，历史行为；小 fixture 会被抢位）。
+        fn mk_schema_dir() -> Schema {
+            let tmp = test_base("schema");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(
+                tmp.join("main.txt"),
+                "#hufu-dict v1 name=t\na\t来\na\t那个\njd\t就\nb\t不\nx\t下\nh\t好\n",
+            )
+            .unwrap();
+            std::fs::write(
+                tmp.join("用户调整.txt"),
+                "{置顶}a\t那个\n{删除}a\t来\n{添加}a\t哎呦\n",
+            )
+            .unwrap();
+            let s = Schema::load(&tmp).unwrap();
+            let _ = std::fs::remove_dir_all(&tmp);
+            s
+        }
+
+        /// 生效序断言（各格式统一）：candidates() 顺序 = 那个(置顶)、
+        /// 哎呦(添加)；「来」隐藏不出现。
+        fn assert_effective_order(rows: &[(String, Vec<(String, bool)>)]) {
+            let a: Vec<&str> = rows
+                .iter()
+                .find(|(c, _)| c == "a")
+                .map(|(_, ts)| ts.iter().map(|(t, _)| t.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(a, ["那个", "哎呦"], "置顶在最前、隐藏不在场、添加并入: {a:?}");
+        }
+
+        fn out_path() -> std::path::PathBuf {
+            test_base("out").with_extension("txt")
+        }
+
+        #[test]
+        fn sentence_format_roundtrip() {
+            let s = mk_schema_dir();
+            let out = out_path();
+            let n = export_one(&s, &out, ExportFormat::Sentence).unwrap();
+            assert_eq!(n, 5);
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(
+                hufu_dict::parse::sniff_format(&lines),
+                hufu_dict::parse::TableFormat::SpaceCodeWords
+            );
+            let t = hufu_dict::parse::parse_auto(&lines);
+            let dict = hufu_dict::Dict::from_entries("rt".to_string(), t.rows);
+            assert_eq!(
+                dict.lookup("a").iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+                ["那个", "哎呦"]
+            );
+        }
+
+        #[test]
+        fn native_format_roundtrip() {
+            let s = mk_schema_dir();
+            let out = out_path();
+            let n = export_one(&s, &out, ExportFormat::Native).unwrap();
+            assert_eq!(n, 5);
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(
+                hufu_dict::parse::sniff_format(&lines),
+                hufu_dict::parse::TableFormat::Native
+            );
+            let t = hufu_dict::parse::parse_auto(&lines);
+            assert_eq!(t.meta.name, "export");
+            let dict = hufu_dict::Dict::from_entries("rt".to_string(), t.rows);
+            // 置顶「那个」权重 u32::MAX → 排序后仍第一
+            assert_eq!(
+                dict.lookup("a").iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+                ["那个", "哎呦"]
+            );
+        }
+
+        #[test]
+        fn rime_format_roundtrip() {
+            let s = mk_schema_dir();
+            let out = out_path();
+            let n = export_one(&s, &out, ExportFormat::Rime).unwrap();
+            assert_eq!(n, 5);
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(
+                hufu_dict::parse::sniff_format(&lines),
+                hufu_dict::parse::TableFormat::RimeYaml
+            );
+            let t = hufu_dict::parse::parse_auto(&lines);
+            assert_eq!(t.meta.name, "export");
+            let dict = hufu_dict::Dict::from_entries("rt".to_string(), t.rows);
+            assert_eq!(
+                dict.lookup("a").iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+                ["那个", "哎呦"]
+            );
+        }
+
+        #[test]
+        fn duoduo_format_roundtrip() {
+            let s = mk_schema_dir();
+            let out = out_path();
+            let n = export_one(&s, &out, ExportFormat::Duoduo).unwrap();
+            assert_eq!(n, 5);
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(
+                hufu_dict::parse::sniff_format(&lines),
+                hufu_dict::parse::TableFormat::Duoduo
+            );
+            // 【2026-11 用户拍板】纯序导出：不得出现 #固 等附加标记
+            assert!(
+                !lines.iter().any(|l| l.contains("#固")),
+                "多多导出不得带 #固: {lines:?}"
+            );
+            let t = hufu_dict::parse::parse_auto(&lines);
+            assert!(t.rows.iter().all(|e| !e.pinned), "纯序导出无置顶标记");
+            // 行序即优先级（词前格式）：那个、哎呦
+            assert_eq!(t.rows[0].text, "那个");
+            assert_eq!(t.rows[1].text, "哎呦");
+        }
+
+        #[test]
+        fn qq_format_roundtrip() {
+            let s = mk_schema_dir();
+            let out = out_path();
+            let n = export_one(&s, &out, ExportFormat::Qq).unwrap();
+            assert_eq!(n, 5);
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            assert_eq!(
+                hufu_dict::parse::sniff_format(&lines),
+                hufu_dict::parse::TableFormat::WordFirstTsv
+            );
+            let t = hufu_dict::parse::parse_auto(&lines);
+            assert_eq!(t.rows[0].text, "那个");
+            assert_eq!(t.rows[1].text, "哎呦");
+        }
+
+        #[test]
+        fn format_parse_latin_aliases() {
+            assert_eq!(ExportFormat::parse(""), ExportFormat::Sentence);
+            assert_eq!(ExportFormat::parse("sentence"), ExportFormat::Sentence);
+            assert_eq!(ExportFormat::parse("NATIVE"), ExportFormat::Native);
+            assert_eq!(ExportFormat::parse("hufu"), ExportFormat::Native);
+            assert_eq!(ExportFormat::parse("rime"), ExportFormat::Rime);
+            assert_eq!(ExportFormat::parse("dict.yaml"), ExportFormat::Rime);
+            assert_eq!(ExportFormat::parse("duoduo"), ExportFormat::Duoduo);
+            assert_eq!(ExportFormat::parse("qq"), ExportFormat::Qq);
+            assert_eq!(ExportFormat::parse("乱码"), ExportFormat::Sentence);
+        }
+
+        #[test]
+        fn hidden_and_pin_reflected_in_rows() {
+            let s = mk_schema_dir();
+            let mut codes: Vec<String> =
+                s.dict.entries.iter().map(|e| e.code.clone()).collect();
+            codes.extend(s.user_dict.entries.iter().map(|e| e.code.clone()));
+            codes.sort();
+            codes.dedup();
+            let mut rows: Vec<(String, Vec<(String, bool)>)> = Vec::new();
+            for code in &codes {
+                let texts: Vec<(String, bool)> = s
+                    .candidates(code)
+                    .iter()
+                    .map(|e| (e.text.clone(), e.pinned))
+                    .collect();
+                if !texts.is_empty() {
+                    rows.push((code.clone(), texts));
+                }
+            }
+            assert_effective_order(&rows);
+        }
     }
 }

@@ -110,19 +110,37 @@ footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
 }
 .schema-item .opendir:hover { border-color: var(--acc); color: var(--acc); }
 .schema-item .opendir + .tag { margin-left: 0; }
-/* ── 用户词 ── */
+/* 导出格式下拉：紧贴导出按钮，切换方案行内不动布局 */
+.schema-item .exp-fmt {
+  font-size: 13px; background: var(--bg2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 6px; cursor: pointer; color: var(--fg2);
+}
+.schema-item .exp-fmt:hover { border-color: var(--acc); }
+.schema-item .exp-fmt + .exp-dict { margin-left: 0; }
+/* ── 表格（用户词页已移除 2026-11，样式保留备用） ── */
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 /* ── 皮肤编辑 ── */
 .skin-grid { display: flex; gap: 30px; align-items: flex-start; flex-wrap: wrap; }
+/* 【实时框常驻 2026-11】sticky 配套：参数列统一类名（原内联
+   flex:1;min-width:330px）；flex-wrap 换行（窄窗）后两列各占一行，
+   sticky 预览随列顶平移不悬空。 */
+.skin-params { flex: 1; min-width: 330px; }
 .color-grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 8px 26px; }
 .color-item { display: flex; align-items: center; gap: 10px; font-size: 13.5px; }
 .color-item label { flex: 1; color: var(--fg2); }
 .color-item input[type=number] { width: 64px; min-width: 64px; padding: 4px 6px; }
 .skin-preview-wrap {
   flex: none; padding: 30px; border-radius: var(--radius);
-  position: relative; overflow: hidden;
+  /* 【实时框常驻 2026-11】皮肤/挂件两页参数列很长（颜色角色 19 项、
+     图片处理等），高缩放比例下滚动到靠下的参数时预览框被卷出视口
+     ——「调参数看不到实时框」。position: sticky + top 让预览框在
+     主滚动区里钉在视口顶部：右边参数列怎么滚，左边实时框始终可见
+     （滚动到本区块底部后自然让位）。sticky 亦为定位元素，内部
+     #livebg 的 absolute 定位不受影响。 */
+  position: sticky; top: 8px; align-self: flex-start;
+  overflow: hidden;
   /* 实时透明：背景只留彩色光斑（衬托半透明/玻璃材质的实际通透感），
      不再用斜纹格子——预览即真实叠加效果 */
   background:
@@ -190,7 +208,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="sentence">整句模型</a>
   <a data-tab="skin">皮肤</a>
   <a data-tab="overlay">候选挂件</a>
-  <a data-tab="user">用户词</a>
   <a data-tab="data">导入导出</a>
   <div class="spacer"></div>
   <div class="hint" style="padding:0 12px 6px" id="engine-info"></div>
@@ -218,6 +235,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       </select></div>
       <span class="sub" style="align-self:center">任何方案启用反查时都从这里调用；表中放新 .txt 文件后重开设置页即可选择。选「（关闭反查）」后按引导键将直接上屏右侧所选符号。</span>
     </div>
+    <div class="sub" style="margin-top:2px">【` 引导打特殊字】要把 `` ` `` 用作特殊字引导（起段编码），需把 `` ` `` 加入「输入与候选 → 编码字母表」并关闭反查（上方方案选「（关闭反查）」）；反查启用时 `` ` `` 始终是反查引导键。`` ` `` 起段时查方案里的超集副表（按内容自动识别：全部编码以 `` ` `` 开头的 .txt，文件名任意，无需任何提示或设置）。</div>
     <h3>拆分显示选择</h3>
     <div class="row">
       <div class="field"><label>拆分方案（数据\拆分\ 内的表文件）</label>
@@ -237,6 +255,10 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>Caps 行为</label>
         <select id="g-caps"><option value="clear">清屏</option><option value="switch">切英文</option><option value="none">无操作</option></select></div>
       <div class="checkline"><input type="checkbox" id="g-recent"><label for="g-recent">Ctrl+M 切换最近方案</label></div>
+      <div class="checkline"><input type="checkbox" id="g-esc-undo"><label for="g-esc-undo" title="开启后的范围规则：① 编码中按 Esc = 清屏（不变）；② 空态 + 焦点有光标（编辑框）+ 有可撤内容 = 撤回上次上屏（回删，连按撤更早，最多 8 条）；③ 空态无光标（按钮/列表等非编辑焦点）或无可撤内容 = 正常 Esc 功能（透传应用）。关闭（默认）= 空态透传">Esc 撤回上次上屏<span class="sub">（空态+有光标生效，连按撤更早）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="g-rep-sym"><label for="g-rep-sym" title="关闭（默认）：{重复上屏}/{重复上屏N}/Esc 撤回只记中英文词组（纯符号、数字、标点上屏不入历史，标点顶字只记文字部分）；开启：任何上屏内容都入历史，可重复上屏任意上一次上屏的东西">重复上屏包括符号<span class="sub">（默认关=只回放中英文词组）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="g-af"><label for="g-af">选词自动调频</label></div>
+      <div class="checkline"><input type="checkbox" id="g-la"><label for="g-la">记录调整日志</label></div>
     </div>
     <h3>输入</h3>
     <div class="row">
@@ -267,6 +289,10 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分<span class="sub">（整句状态不可用）</span></label></div>
       <div class="field"><label>候选延时（毫秒）</label><input type="number" data-path="candidates.delay_show_ms" min="0" max="2000"></div>
+    </div>
+    <div class="row">
+      <button id="km-open" style="padding:6px 16px">⌨ 自定义按键（全键盘 · 两态映射）</button>
+      <span class="sub" style="align-self:center">全键盘图形化编辑：任意键（含 Caps/Tab/空格/Shift/F 区）设「有候选时 / 无候选时」两套功能（如 [ 有候选直出？、无候选直出！）。支持冲突检测与一键恢复默认。改完全局生效（含整句模式），重启保留。</span>
     </div>
     <h3>标点与外观</h3>
     <div class="row">
@@ -390,7 +416,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="preview-stage"><div id="candwin-preview"></div></div>
         <div class="material-note" id="material-note"></div>
       </div>
-      <div style="flex:1;min-width:330px">
+      <div class="skin-params">
         <h3>材质</h3>
         <div class="row">
           <div class="field"><label>窗口底色</label><input type="color" id="mat-bgc" title="窗底色"></div>
@@ -488,7 +514,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         </div>
         <div class="material-note" id="ov-note">直接拖图定位（跨过候选框自动换贴边）、四角金色手柄或滚轮改大小——松手即存即生效。</div>
       </div>
-      <div style="flex:1;min-width:330px">
+      <div class="skin-params">
         <h3>贴法（改动即存）</h3>
         <div class="row">
           <div class="field"><label>贴边</label><select id="ov-side" style="min-width:120px"><option value="right">候选框右侧</option><option value="left">候选框左侧</option></select></div>
@@ -523,30 +549,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           </div>
         </div>
       </div>
-    </div>
-  </section>
-
-  <!-- ════ 用户词 ════ -->
-  <section id="tab-user">
-    <h2>用户词<span class="en">User words</span></h2>
-    <div class="sub">当前方案的用户词库；调整日志（置顶/调频/删词）在方案目录内追加保存。</div>
-    <div class="row">
-      <div class="field"><label>编码</label><input type="text" id="uw-code" style="width:130px"></div>
-      <div class="field"><label>词</label><input type="text" id="uw-text" style="width:130px"></div>
-      <button id="uw-add" class="primary">添加</button>
-      <div class="checkline"><input type="checkbox" id="u-af"><label for="u-af">选词自动调频</label></div>
-      <div class="checkline"><input type="checkbox" id="u-la"><label for="u-la">记录调整日志</label></div>
-    </div>
-    <table><thead><tr><th style="width:160px">编码</th><th>词</th><th style="width:210px">操作</th></tr></thead>
-    <tbody id="uw-list"></tbody></table>
-    <div class="row" style="margin-top:14px">
-      <div class="sub" style="margin:0">任意候选调整（不必是用户词）：输入码与词，置顶=候选首位、隐藏=软删（Ctrl+Delete / Ctrl+Shift+数字 也可在打字时操作）。</div>
-    </div>
-    <div class="row">
-      <div class="field"><label>编码</label><input type="text" id="adj-code" style="width:130px"></div>
-      <div class="field"><label>词</label><input type="text" id="adj-text" style="width:130px"></div>
-      <button id="adj-pin" class="primary">置顶</button>
-      <button id="adj-hide">隐藏</button>
     </div>
   </section>
 
@@ -605,6 +607,11 @@ function bindInputs() {
   const B = (id, path, conv) => { const el = $(id); el.checked = !!getP(CFG, path); el.onchange = () => { setP(CFG, path, conv ? conv(el) : el.checked); autoSave(el); }; };
   B("#g-shift", "general.shift_switch"); B("#g-ctrl", "general.ctrl_space_switch");
   B("#g-recent", "general.switch_recent_schema");
+  // 【Esc 双行为 2026-11】空态 Esc 撤回上次上屏（默认关）
+  B("#g-esc-undo", "general.esc_undo");
+  // 【重复上屏包括符号 2026-11】默认关=历史栈只记中英文词组；
+  // 开=任何上屏内容入栈（含标点/符号），重复上屏可回放任意上次上屏。
+  B("#g-rep-sym", "general.repeat_include_symbols");
   $("#g-caps").value = { Clear: "clear", Switch: "switch", None: "none" }[CFG.general.caps_action] || "clear";
   $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; autoSave(e.target); };
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
@@ -638,12 +645,16 @@ function bindInputs() {
     const en = document.querySelector('input[data-path="sentence.early_need"]');
     if (en) en.addEventListener("input", earlyLbl);
   }
-  B("#u-af", "user.auto_frequency"); B("#u-la", "user.log_adjust");
+  /* 用户词页已移除 2026-11：两开关迁至本页 #g-af/#g-la（config.user.* 路径不变） */
+  B("#g-af", "user.auto_frequency"); B("#g-la", "user.log_adjust");
   B("#snd-en", "sound.enabled");
   $("#snd-vol").value = CFG.sound?.volume ?? 50;
   $("#snd-vol-v").textContent = (CFG.sound?.volume ?? 50) + "%";
   $("#snd-vol").oninput = e => { CFG.sound = CFG.sound || { enabled: false, volume: 50 }; CFG.sound.volume = +e.target.value; $("#snd-vol-v").textContent = e.target.value + "%"; autoSave(e.target); };
   $("#snd-test").onclick = () => new Audio("/api/sound?tag=key").play().catch(() => msg("试听失败", "err"));
+  // 【自定义按键·图形化编辑 2026-11】全键盘两态映射编辑窗口
+  const kmBtn = $("#km-open");
+  if (kmBtn) kmBtn.onclick = openKeymapEditor;
   // OpenCC 繁简 / emoji
   B("#oc-en", "opencc.enabled"); B("#oc-emoji", "opencc.emoji");
   $("#oc-dir").value = CFG.opencc?.to_traditional === false ? "t2s" : "s2t";
@@ -917,24 +928,46 @@ async function loadSchemas() {
   ]);
   const names = list.schemas || [];
   const r = { schemas: names, current_schema: st.current_schema, sentence_active: st.sentence_active };
+  /* 【导出格式记忆 2026-11】每方案记住上次选择的导出格式：从
+     /api/config 的 schema.export_formats 取（POST /api/export_schema
+     显式带 format 时后端自动记忆）。托盘/语言栏「导出码表」用同
+     一记忆——两处导出格式一致。 */
+  let expFormats = {};
+  try { const cfgAll = await api("GET", "/api/config"); expFormats = (cfgAll.schema && cfgAll.schema.export_formats) || {}; } catch (_) {}
   const box = $("#schema-list"); box.innerHTML = "";
   names.sort((a, b) => a.localeCompare(b, "zh")).forEach(n => {
+    const memFmt = expFormats[n] || "sentence";
     const d = document.createElement("div");
     d.className = "schema-item" + (n === r.current_schema ? " on" : "");
     d.innerHTML = `<span>${esc(n)}</span>${n.includes("整句") ? '<span class="tag">整句</span>' : ""}` +
       `<button class="opendir" title="在资源管理器中打开此方案的码表文件夹">📂 打开文件夹</button>` +
-      `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频）合并进原始码表，导出为一张新码表（码表导出\\<方案>\\）">📤 导出码表</button>` +
+      `<select class="exp-fmt" title="导出格式（每个方案记住上次的选择；托盘右键导出也用此格式）">` +
+      `<option value="sentence"${memFmt === "sentence" ? " selected" : ""}>虎整句格式</option><option value="native"${memFmt === "native" ? " selected" : ""}>HuFu 原生</option>` +
+      `<option value="rime"${memFmt === "rime" ? " selected" : ""}>Rime dict.yaml</option><option value="duoduo"${memFmt === "duoduo" ? " selected" : ""}>多多</option>` +
+      `<option value="qq"${memFmt === "qq" ? " selected" : ""}>QQ五笔</option></select>` +
+      `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频）合并进原始码表，按左侧所选格式导出一张新码表（码表导出\\<方案>\\）；托盘右键「导出码表」也用此格式">📤 导出码表</button>` +
       `${n === r.current_schema ? '<span class="tag">当前</span>' : ""}`;
     d.querySelector(".opendir").onclick = async ev => {
       ev.stopPropagation();
       try { await api("POST", "/api/open_schema_dir", { name: n }); msg(`已打开 ${n} 的文件夹`, "ok"); }
       catch (e) { msg(e.message, "err"); }
     };
+    d.querySelector(".exp-fmt").onclick = ev => ev.stopPropagation();
+    d.querySelector(".exp-fmt").onchange = ev => {
+      ev.stopPropagation();
+      /* 【导出格式记忆 2026-11】选完即时持久化（lines_only：不真导出
+         不弹窗），托盘/语言栏「导出码表」取同一记忆 */
+      api("POST", "/api/export_schema", { name: n, format: ev.target.value, lines_only: true })
+        .then(() => msg(`已记住「${n}」的导出格式`, "ok")).catch(() => {});
+      ev.target.blur();
+    };
     d.querySelector(".exp-dict").onclick = async ev => {
       ev.stopPropagation();
+      const fmt = d.querySelector(".exp-fmt").value || "sentence";
       try {
-        const r2 = await api("POST", "/api/export_schema", { name: n });
-        msg(`已导出 ${r2.lines} 行 → ${r2.path}`, "ok");
+        const r2 = await api("POST", "/api/export_schema", { name: n, format: fmt });
+        const fmtName = { sentence: "虎整句", native: "HuFu 原生", rime: "Rime", duoduo: "多多", qq: "QQ五笔" }[fmt] || fmt;
+        msg(`已按「${fmtName}」格式导出 ${r2.lines} 行 → ${r2.path}`, "ok");
       } catch (e) { msg(e.message, "err"); }
     };
     d.onclick = async () => {
@@ -2005,35 +2038,11 @@ $("#ov-preset-del").onclick = async () => {
   bd.onclick = () => apply(false); bl.onclick = () => apply(true);
 }
 
-/* ── 用户词 ── */
-$("#uw-list").addEventListener("click", async ev => {
-  const b = ev.target.closest("button[data-act]"); if (!b) return;
-  const { act, code, text } = b.dataset;
-  try {
-    if (act === "del") await api("POST", "/api/user_word/remove", { code, text });
-    else await api("POST", `/api/candidate/${act}`, { code, text });
-    await loadUserWords(); msg(act === "del" ? "已删除" : act === "pin" ? "已置顶" : "已隐藏", "ok");
-  } catch (e) { msg(e.message, "err"); }
-});
-
-async function loadUserWords() {
-  const r = await api("GET", "/api/user_words");
-  $("#uw-list").innerHTML = (r.words || []).map(w => `<tr><td>${esc(w.code)}</td><td>${esc(w.text)}</td><td>
-    <button data-act="pin" data-code="${esc(w.code)}" data-text="${esc(w.text)}">置顶</button>
-    <button data-act="hide" data-code="${esc(w.code)}" data-text="${esc(w.text)}">隐藏</button>
-    <button class="danger" data-act="del" data-code="${esc(w.code)}" data-text="${esc(w.text)}">删除</button>
-  </td></tr>`).join("") || '<tr><td colspan="3" class="hint">暂无用户词</td></tr>';
-}
-
-/* 任意候选调整 */
-async function adjCall(op) {
-  const code = $("#adj-code").value.trim(), text = $("#adj-text").value.trim();
-  if (!code || !text) { msg("编码与词不能为空", "err"); return; }
-  try { await api("POST", `/api/candidate/${op}`, { code, text }); msg(op === "pin" ? "已置顶" : "已隐藏", "ok"); }
-  catch (e) { msg(e.message, "err"); }
-}
-$("#adj-pin").onclick = () => adjCall("pin");
-$("#adj-hide").onclick = () => adjCall("hide");
+/* ── 用户词页已移除 2026-11 ──
+   （表格/加词/任意候选调整等控件与 JS 全部删除；选词自动调频、
+   记录调整日志两开关迁「输入与候选·通用」#g-af/#g-la，config.user.*
+   路径不变。加词/置顶/隐藏/删词仍可打字时 Ctrl+Shift+数字、
+   Ctrl+Delete、/jc 加词操作；API /api/user_words 等后端保留不动。） */
 
 /* ── 初始化 ── */
 document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
@@ -2111,13 +2120,6 @@ $("#weasel-export").onclick = () => {
   msg("已生成 weasel patch（复制到 weasel.custom.yaml 使用）", "ok");
 };
 
-$("#uw-add").onclick = async () => {
-  const code = $("#uw-code").value.trim(), text = $("#uw-text").value.trim();
-  if (!code || !text) return msg("编码与词均不能为空", "err");
-  try { await api("POST", "/api/user_word/add", { code, text }); $("#uw-code").value = ""; $("#uw-text").value = ""; await loadUserWords(); msg("用户词已添加 ✓", "ok"); }
-  catch (e) { msg(e.message, "err"); }
-};
-
 $("#exp-dl").onclick = () => {
   const blob = new Blob([JSON.stringify(CFG, null, 2)], { type: "application/json" });
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "hufu-config.json"; a.click();
@@ -2152,9 +2154,257 @@ async function init() {
     applyPlatform();
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
-    await loadUserWords();
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
+}
+
+/* ── 【自定义按键·两态映射 2026-11】全键盘图形化编辑窗口 ──
+   window.open + document.write 自包含单文件（同源可 fetch /api/config）。
+   单页全键盘（含 F 区/Tab/Caps/Shift/空格/回车/方向/翻页/Home/End/
+   Delete；Ctrl/Alt/Win 仅展示不可映射；Esc 固定行为键同样不可映射）→
+   点击按键 → 弹窗配两态：
+   ①有候选时（config.keymap.map）②无候选时（config.keymap.map_idle，
+   缺省「跟随有候选」）。功能：第1-10选重/重复上屏×4/撤回/清屏/上下
+   翻页/切中英/顶屏/文字直出。冲突检测（编码字母表/翻页键/次选三选/
+   重复分配/左右 Shift 已映射提示）。「恢复默认按键」= 两表清空。
+   左右 Shift 独立键名 shiftleft/shiftright（通用 "shift" 兜底两侧同效）。
+   保存时清除老配置里的 "escape" 残留映射（Esc 不可映射 2026-11）。
+    【小键盘分页 2026-11】小键盘独立第二页（主键盘/小键盘页签），
+    键帽用 Num 0-9 / Num + - * / / Num . / Num回车 易认写法。
+   （旧版「选重键页」已删——功能键页完全覆盖其能力。） */
+function openKeymapEditor() {
+  const w = window.open("", "hufu-keymap", "width=1100,height=820");
+  if (!w) { msg("按键编辑窗口被浏览器拦截，请允许弹窗", "err"); return; }
+  fetch("/api/config").then(r => r.json()).then(cfg => {
+    /* ── 公共数据 ── */
+    const km = Object.assign({}, cfg.keymap && cfg.keymap.map || {});
+    const kmi = Object.assign({}, cfg.keymap && cfg.keymap.map_idle || {});
+    const second = cfg.candidates.second_select || ";";
+    const third = cfg.candidates.third_select || "'";
+    const paging = cfg.candidates.paging_keys || "-=";
+    const alphabet = cfg.input.alphabet || "";
+    /* 功能 id → 显示名（引擎 run_keymap 同口径） */
+    const FUNCS = [
+      ["", "（清除映射——恢复该键默认行为）"],
+      ...Array.from({ length: 10 }, (_, i) => [`select${i + 1}`, `第 ${i + 1} 选重键${i === 0 ? "（首选）" : ""}`]),
+      ["repeat", "重复上屏（最近 1 条）"], ["repeat2", "重复上屏（倒数第 2 条）"], ["repeat3", "重复上屏（倒数第 3 条）"], ["repeat4", "重复上屏（倒数第 4 条）"],
+      ["undo", "撤回上次上屏（回删）"], ["clear", "清屏（清编码与候选）"],
+      ["pageup", "候选上一页"], ["pagedown", "候选下一页"],
+      ["switch", "切换中英文"], ["top", "顶屏（上屏当前高亮候选）"],
+      ["text:？", "直出「？」"], ["text:、", "直出「、」"], ["text:·", "直出「·」"],
+    ];
+    const IDLE_FUNCS = [
+      ["__same__", "（跟随有候选时的设置）"],
+      ["", "（清除——无候选时走默认行为）"],
+      ["repeat", "重复上屏（最近 1 条）"], ["repeat2", "重复上屏（倒数第 2 条）"], ["repeat3", "重复上屏（倒数第 3 条）"], ["repeat4", "重复上屏（倒数第 4 条）"],
+      ["undo", "撤回上次上屏（回删）"], ["switch", "切换中英文"],
+      ["text:！", "直出「！」"], ["text:？", "直出「？」"], ["text:、", "直出「、」"], ["text:·", "直出「·」"],
+    ];
+    const funcName = id => { const f = FUNCS.find(x => x[0] === id); return f ? f[1] : id.startsWith("text:") ? `直出「${id.slice(5)}」` : id; };
+    const idleName = id => { if (id === "__same__") return "同有候选"; if (!id) return ""; const f = IDLE_FUNCS.find(x => x[0] === id); return f ? f[1] : id.startsWith("text:") ? `直出「${id.slice(5)}」` : id; };
+
+    /* ── 全键盘两页（主键盘 + 小键盘分页；左右 Shift 各一位） ──
+       【` 与小键盘 2026-11】首行补 `（1 左边：键名 "`"，反查引导/
+       超集编码字符，仍可映射）。【小键盘分页 2026-11】小键盘移到
+       第二页（上方「主键盘 / 小键盘」切换），键帽用易认写法：
+       Num 0-9 / Num + / Num - / Num * / Num / / Num . / Num回车
+       （键名 num0-9/numadd/numsub/nummul/numdiv/numdot/numenter，
+       与主排数字身份分开，主排数字是选重键）；NumLock 只展示
+       不可映射，物理跨格（+ 两格、Enter 两格、0 两格）用灰空位。 */
+    const rowsMain = [["Esc","`","1","2","3","4","5","6","7","8","9","0","-","=","Backspace"],
+      ["Tab","q","w","e","r","t","y","u","i","o","p","[","]","\\"],
+      ["Caps","a","s","d","f","g","h","j","k","l",";","'","Enter"],
+      ["LShift","z","x","c","v","b","n","m",",",".","/","RShift"],
+      ["Ctrl","Win","Alt","空格","Alt","Win","Ctrl"],
+      ["↑←↓→","PageUp","PageDown","Home","End","Delete"],
+      ["F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"],
+    ];
+    const rowsNum = [
+      ["NumLock","Num /","Num *","Num -"],
+      ["Num 7","Num 8","Num 9","Num +"],
+      ["Num 4","Num 5","Num 6",""],
+      ["Num 1","Num 2","Num 3","Num回车"],
+      ["Num 0","","Num .",""],
+    ];
+    let pg = "main"; // main | num（分页状态，render 间保持）
+    /* 键帽 → 引擎键名（config.keymap.map 键口径）。Esc 固定行为键
+       （编码中清屏 / 空态撤回），不可映射——与 Ctrl/Win/Alt 同为
+       展示位。【小键盘分页 2026-11】Num 0-9 → num0-9、加減乘除号 →
+       numadd/numsub/nummul/numdiv、Num 点 → numdot、Num 回车 →
+       numenter；NumLock 只展示（决定小键盘发数字还是方向，不可映射）。
+       【Esc 固定行为 2026-11】 */
+    const cap2name = cap => {
+      const map = { "Esc":"", "Backspace":"backspace","Tab":"tab","Caps":"capslock","Enter":"enter",
+        "LShift":"shiftleft", "RShift":"shiftright", "Ctrl":"", "Win":"", "Alt":"",
+        "空格":"space","PageUp":"pageup","PageDown":"pagedown","Home":"home","End":"end","Delete":"delete",
+        "↑←↓→":"",
+        "NumLock":"", "Num /":"numdiv", "Num *":"nummul", "Num -":"numsub", "Num +":"numadd",
+        "Num .":"numdot", "Num回车":"numenter" };
+      if (map.hasOwnProperty(cap)) return map[cap];
+      if (/^Num [0-9]$/.test(cap)) return "num" + cap.slice(4);
+      if (/^F\d{1,2}$/.test(cap)) return cap.toLowerCase();
+      return cap.toLowerCase();
+    };
+
+    const render = () => {
+      /* —— 全键盘功能映射（两页：主键盘 / 小键盘） —— */
+      const key2 = cap => {
+        if (cap === "") return `<div style="min-width:46px;height:46px"></div>`; // 物理跨格占位
+        const name = cap2name(cap);
+        const mapped = name ? km[name] : "";
+        const idled = name ? kmi[name] : "";
+        const badge = mapped ? `<div class="bd2">${funcName(mapped).replace(/（.*）/, "")}</div>` : "";
+        const ibadge = idled ? `<div class="bdi">${idleName(idled).replace(/（.*）/, "").replace("直出", "")}</div>` : "";
+        const cls = mapped || idled ? "k asg" : (name ? "k" : "k dis");
+        return `<div class="${cls}" data-n="${name}" style="min-width:${cap.length > 2 ? 64 : 46}px;height:46px"><div class="lb">${cap}</div>${badge}${ibadge}</div>`;
+      };
+      const rows = pg === "num" ? rowsNum : rowsMain;
+      const kb2 = rows.map(row => `<div class="row2">${row.map(key2).join("")}</div>`).join("");
+      const entries = Object.keys(km).concat(Object.keys(kmi).filter(k => !(k in km))).filter(k => km[k] || kmi[k]);
+      const list2 = entries.length
+        ? entries.map(k => {
+            const a = km[k] ? funcName(km[k]) : "（默认）";
+            const b = kmi[k] === "__same__" || !kmi[k] ? "" : `<span class="idle">无候选：${idleName(kmi[k])}</span>`;
+            return `<div class="li"><code>${k}</code> → ${a}${b ? " ｜ " + b : ""}</div>`;
+          }).join("")
+        : '<div class="li">（空 = 全部按键默认行为）</div>';
+      const conflicts2 = [];
+      const seen2 = {};
+      const both = k => [km[k], kmi[k] === "__same__" || !kmi[k] ? km[k] : kmi[k]];
+      Object.keys(km).concat(Object.keys(kmi)).forEach(k => {
+        if (!km[k] && !kmi[k]) return;
+        const [act] = both(k);
+        if (act && seen2[act] !== undefined) conflicts2.push(`功能「${funcName(act)}」同时绑在「${seen2[act]}」和「${k}」上`);
+        else if (act) seen2[act] = k;
+        const r = (cfg.candidates.custom_select_keys || []).indexOf(k);
+        if (r >= 0) conflicts2.push(`「${k}」同时是第 ${r + 1} 选重键（选重优先）`);
+        if (alphabet.includes(k) && !(km[k] || "").startsWith("text:") && !(kmi[k] || "").startsWith("text:")) conflicts2.push(`「${k}」在编码字母表里——编码延续时该键优先当编码字符（映射只在无延续时生效）`);
+        if (k === second || k === third) conflicts2.push(`「${k}」是次选/三选键（选重优先）`);
+        if (paging.includes(k)) conflicts2.push(`「${k}」是翻页键——功能映射优先，翻页失效`);
+        if (k === "`" && cfg.reverse && cfg.reverse.enabled && (km[k] || kmi[k])) conflicts2.push(`「\`」是反查引导键——反查开启时引导优先（映射仅在反查关闭且 \` 不在编码字母表时空态生效）`);
+        if ((k === "shiftleft" || k === "shiftright") && (km[k] || kmi[k])) conflicts2.push(`「${k === "shiftleft" ? "左 Shift" : "右 Shift"}」已映射：该侧单击不再切换中英（清映射即恢复）`);
+      });
+      const cf2 = conflicts2.length ? `<div class="cf">${conflicts2.map(c => "⚠ " + c).join("<br>")}</div>` : '<div class="cf ok">无冲突</div>';
+
+      w.document.body.innerHTML = `
+        <h2>⌨ 自定义按键</h2>
+        <div class="tip">点击任意按键设置两层效果：<b>有候选时</b>（打字中——映射触发前候选先顶屏，如打 d 候选「中」按 [ = 「中？」）与 <b>无候选时</b>（空态直出，可不同于有候选，如无候选直出「！」）。无候选默认跟随有候选设置。功能在<b>中文输入态、无 Shift/Ctrl/Alt 组合</b>时生效；编码延续中的字母键仍优先当编码。Ctrl/Alt/Win 仅作展示（组合键是应用快捷键，不可映射）；<b>左右 Shift 独立可映射</b>（LShift/RShift 各设各的；某侧映射后该侧单击不再切中英，另一侧不受影响；老配置里写 "shift" 的仍两侧同效）；<b>Esc 不可映射</b>（固定双行为：编码中清屏，空态按「Esc 撤回上次上屏」开关撤回）。<b>反引号键（1 左边）与小键盘全部按键</b>均可映射（小键盘与主排数字身份分开——主排数字是选重键；小键盘在 NumLock 开启形态下生效，NumLock 键本身不可映射）。注意：反引号键常被反查引导或超集编码占用，映射前先确认无冲突（下方冲突检测会提示）。改完「保存并应用」全局生效、重启保留。</div>
+        <div class="pgbar">
+          <button class="pgtab${pg === "main" ? " on" : ""}" data-pg="main">主键盘</button>
+          <button class="pgtab${pg === "num" ? " on" : ""}" data-pg="num">小键盘</button>
+        </div>
+        <div class="kbwrap">${kb2}</div>
+        <div class="panel"><div class="col"><h3>当前功能映射</h3>${list2}</div><div class="col"><h3>冲突检测</h3>${cf2}</div></div>
+        <div class="bar">
+          <button id="km-save" class="pri">保存并应用</button>
+          <button id="km-reset">恢复默认按键（清空全部自定义）</button>
+          <span id="km-msg"></span>
+        </div>`;
+      const style = w.document.createElement("style");
+      style.textContent = `
+        body{font-family:system-ui,"Microsoft YaHei";margin:18px;background:#f6f7fa;color:#222}
+        h2{margin:0 0 8px;font-size:19px} h3{margin:0 0 8px;font-size:14px;color:#555}
+        .tip{font-size:12.5px;color:#666;margin-bottom:12px;max-width:1000px;line-height:1.6}
+        .kbwrap{display:inline-block;background:#dfe3ea;padding:14px;border-radius:10px}
+        .row2{display:flex;gap:5px;margin-bottom:6px;align-items:center}
+        .k{position:relative;background:#fff;border:1px solid #b8bfcc;border-radius:7px;cursor:pointer;display:flex;align-items:flex-end;justify-content:center;padding-bottom:3px;user-select:none;font-size:14px;color:#333}
+        .k:hover{border-color:#4a7dff}
+        .k.asg{background:#e8f0ff;border-color:#4a7dff}
+        .k.dis{background:#e8e8e8;color:#aaa;cursor:default}
+        .lb{pointer-events:none}
+        .bd2{position:absolute;top:2px;left:4px;right:4px;font-size:10.5px;background:#2a9d4a;color:#fff;border-radius:8px;padding:0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+        .bdi{position:absolute;bottom:2px;left:4px;right:4px;font-size:10.5px;background:#e07b2a;color:#fff;border-radius:8px;padding:0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+        .panel{display:flex;gap:24px;margin:12px 0;max-width:1000px}
+        .col{flex:1;font-size:13px}
+        .li{padding:2px 0} code{background:#eef;padding:1px 6px;border-radius:4px}
+        .idle{color:#e07b2a}
+        .cf{font-size:12.5px;color:#a00;line-height:1.7}.cf.ok{color:#2a7}
+        .bar{display:flex;gap:10px;align-items:center}
+        button{padding:7px 18px;border:1px solid #b8bfcc;border-radius:7px;background:#fff;cursor:pointer}
+        button.pri{background:#4a7dff;color:#fff;border-color:#4a7dff}
+        #km-msg{font-size:13px}
+        .fsel{width:280px}
+        .mrow{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+        .mlb{width:88px;font-size:13px;color:#444;text-align:right}
+        .pgbar{display:flex;gap:8px;margin-bottom:10px}
+        .pgtab{padding:6px 22px;border-radius:8px 8px 0 0;border:1px solid #b8bfcc;border-bottom:none;background:#eef0f5}
+        .pgtab.on{background:#dfe3ea;font-weight:700;color:#1a3d8f}`;
+      w.document.head.innerHTML = ""; w.document.head.appendChild(style);
+
+      /* —— 键点击（两态弹窗） —— */
+      w.document.querySelectorAll(".k[data-n]").forEach(el => {
+        el.onclick = () => {
+          const name = el.dataset.n;
+          if (!name) return; // Ctrl/Alt/Win/方向群占位不可映射
+          const cur = km[name] || "";
+          const curI = kmi.hasOwnProperty(name) ? kmi[name] : "__same__";
+          const opts = FUNCS.map(([id, label]) => `<option value="${id.replace(/"/g, "&quot;")}"${id === cur ? " selected" : ""}>${label}</option>`).join("");
+          const optsI = IDLE_FUNCS.map(([id, label]) => `<option value="${id.replace(/"/g, "&quot;")}"${id === curI ? " selected" : ""}>${label}</option>`).join("");
+          const div = w.document.createElement("div");
+          div.style.cssText = "position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center;z-index:9";
+          div.innerHTML = `<div style="background:#fff;border-radius:10px;padding:18px 22px;box-shadow:0 4px 24px rgba(0,0,0,.2)">
+            <div style="font-size:14px;margin-bottom:12px">按键 <code>${name}</code> 触发功能：</div>
+            <div class="mrow"><span class="mlb">有候选时：</span><select class="fsel">${opts}</select></div>
+            <div class="mrow"><span class="mlb">　</span><span style="font-size:12px;color:#888">自定义文字直出 <input type="text" class="ctxt" style="width:110px" placeholder="如 ？ 或 、" value="${cur.startsWith("text:") ? cur.slice(5) : ""}"></span></div>
+            <div style="border-top:1px dashed #ddd;margin:10px 0"></div>
+            <div class="mrow"><span class="mlb">无候选时：</span><select class="fsel selI">${optsI}</select></div>
+            <div class="mrow"><span class="mlb">　</span><span style="font-size:12px;color:#888">自定义文字直出 <input type="text" class="ctxtI" style="width:110px" placeholder="如 ！ 或 、" value="${curI.startsWith("text:") ? curI.slice(5) : ""}"></span></div>
+            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px"><button class="cok pri">确定</button><button class="ccl">取消</button></div>
+          </div>`;
+          w.document.body.appendChild(div);
+          const selEl = div.querySelector("select");
+          const txtEl = div.querySelector(".ctxt");
+          const selEI = div.querySelector(".selI");
+          const txtEI = div.querySelector(".ctxtI");
+          txtEl.oninput = () => { if (txtEl.value) selEl.value = ""; };
+          selEl.onchange = () => { if (selEl.value) txtEl.value = ""; };
+          txtEI.oninput = () => { if (txtEI.value) selEI.value = ""; };
+          selEI.onchange = () => { if (selEI.value) txtEI.value = ""; };
+          div.querySelector(".cok").onclick = () => {
+            const v = txtEl.value ? "text:" + txtEl.value : selEl.value;
+            if (v) km[name] = v; else delete km[name];
+            let vi = selEI.value;
+            if (txtEI.value) vi = "text:" + txtEI.value;
+            if (vi === "__same__") delete kmi[name];
+            else kmi[name] = vi; // ""=无候选走默认（区别于跟随）
+            div.remove(); render();
+          };
+          div.querySelector(".ccl").onclick = () => div.remove();
+        };
+      });
+
+      /* —— 分页切换（主键盘 / 小键盘） —— */
+      w.document.querySelectorAll(".pgtab").forEach(b => {
+        b.onclick = () => { pg = b.dataset.pg; render(); };
+      });
+
+      /* —— 保存 / 恢复默认 —— */
+      w.document.getElementById("km-save").onclick = async () => {
+        cfg.keymap = cfg.keymap || {};
+        cfg.keymap.map = Object.assign({}, km);
+        cfg.keymap.map_idle = Object.assign({}, kmi);
+        /* 【Esc 固定行为 2026-11】Esc 不可映射——老配置里的 escape
+           残留映射一并清掉（引擎已不认这个键名，清掉防误解）。 */
+        delete cfg.keymap.map.escape;
+        delete cfg.keymap.map_idle.escape;
+        try {
+          const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+          if (!r.ok) throw new Error(r.status);
+          w.document.getElementById("km-msg").textContent = "已保存并全局生效 ✓（候选窗内下一键即用新映射）";
+          w.document.getElementById("km-msg").style.color = "#2a7";
+        } catch (e) {
+          w.document.getElementById("km-msg").textContent = "保存失败：" + e.message;
+          w.document.getElementById("km-msg").style.color = "#a00";
+        }
+      };
+      w.document.getElementById("km-reset").onclick = () => {
+        Object.keys(km).forEach(k => delete km[k]);
+        Object.keys(kmi).forEach(k => delete kmi[k]);
+        render();
+      };
+    };
+    render();
+  }).catch(e => msg("按键编辑器加载配置失败：" + e.message, "err"));
 }
 
 /* 【Linux 2026-09-19】引擎自带中英切换仅 Windows 适用——Linux 的英文输入
