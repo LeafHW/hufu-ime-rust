@@ -3721,7 +3721,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             };
             // 【虎魄首键矮锚归一】（见 normalize_short_anchor 注释）——
             // seg1 selection 采纳前统一补全矮锚行高。
+            // 【BUG8 四修·原始左缘留存】归一会平移 left——est 基线与校
+            // 准采样点必须记归一前的原始盒（宿主本帧真实汇报值），显示
+            // 锚（g.caret）才用归一后矩形。否则归一平移量混进采样基准
+            // 被记成键宽（标准链 raw_left 注释同款毒化，373px 实锤）。
             let mut r = r;
+            let r_raw = r;
             normalize_short_anchor(g, &mut r);
             // 【八十八修·播种几何门 2026-09-25】WPS 表格双轮 trace 实锤
             //（18:36 与 18:43 两轮，40 次 d≈700-1180px 大跳瞬落）：组段
@@ -3814,8 +3819,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
                         // 性 GetTextExt 返回的过期值「相对 est 合理」被连续性
                         // 过滤器放行 → 锚点序列倒退=chase 回弹，trace 实锤 963
-                    // →937）。播种后过滤器以真值为参照，过期值被正确拒绝。
-                    seed_est_from_anchor(g, &r, "seg1sel_estok");
+                        // →937）。播种后过滤器以真值为参照，过期值被正确拒绝。
+                        // 【BUG8 四修】播种用原始盒（est=真值系，归一盒只进
+                        // 显示锚）。
+                        seed_est_from_anchor(g, &r_raw, "seg1sel_estok");
                         g.caret = Some(r);
                         return;
                     }
@@ -3832,7 +3839,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     };
                     if near {
                         // 【三十四修·selection 播种 est】同上
-                        seed_est_from_anchor(g, &r, "seg1sel_near");
+                        // 【BUG8 四修】播种用原始盒（同 estok 分支）。
+                        seed_est_from_anchor(g, &r_raw, "seg1sel_near");
                         g.caret = Some(r);
                         return;
                     }
@@ -3912,7 +3920,14 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     }
     // 【虎魄首键矮锚归一】组段 END 链成功值同样先归一（虎魄首段帧
     // 返回 14×16 矮盒，与 selection 链同源同病）。
+    // 【BUG8 四修·原始左缘留存】归一会平移 left（+unit×n）——步宽校准
+    // 采样必须量「原始值→原始值」：归一后的合成位置一旦混进采样基准，
+    // 平移量本身被记成键宽（实测：首锚 1442→归一 1477，下一键 raw=1850，
+    // 被记成"一键 373px"→unit_w=373 毒化，之后每词首锚=真起点+373，
+    // 右飘 300+px，trace 三例实锤）。先留存归一前 left。
+    let mut raw_left: i32 = 0;
     if let Some(ref mut r) = last_ok {
+        raw_left = r.left;
         normalize_short_anchor(g, r);
     }
     let Some(mut rect) = last_ok else {
@@ -4125,22 +4140,52 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【三十八修补】cal_raw=-1=哨兵（上屏 est 前移是估算值，不能当
     // 采样基准——否则首个样本混入 commit 估宽误差，虎魄 lh=140 时
     // 污染 ~70px/字）。哨兵帧只重记采样点不出样本。
+    // 【BUG8 四修·三保险】①基准与分子都改用归一前 raw_left（合成位
+    // 置混进基准=把归一平移量记成键宽，373px 毒化 trace 三例实锤）；
+    // ②样本上限从 400 收紧到 1.25×行高（同向一键位移显著超行高物理
+    // 不可能——惰性布局宿主的过期追赶值 dx=408/441 一类全拒；行高是
+    // 比例量随 DPI 缩放等比=不同缩放同一效果；1.25 系数容紧凑行距
+    // 宿主全角步进）；③仅采相邻键对（draw==1）——跳键对（draw≥2，
+    // 中间帧失败/被拦）的 Δx 可能只是「部分追赶」（trace 实锤：14 键
+    // 长编码布局只追 68px，dxr/draw=9.7px 毒小样本），每键真宽不可
+    // 分解；相邻对 Δx=恰一键推进，无歧义。牺牲：WPS 类「打字中恒失
+    // 败、停顿才成功」的稀疏宿主不再采样——退 0.41×行高启发式（即
+    // 三十八修前的长期行为，无回归）。
+    // 【发布收口】采样热路径——trace_on() 前置。
+    // 【BUG8 四修·滞后追赶值不采】惰性布局宿主过期追赶帧（raw 停留
+    // 旧值、下一帧跳两个键位）连「相邻键对」都会污染：本帧与上采样
+    // 点同 raw（无键增量）时把采样点推到本帧 raw_left 等于把过期值
+    // 记成新键的基线。防守：基线更新无条件（含失败帧后的成功帧），
+    // 但采样只在上点 raw 严格小于本帧 raw（=本帧新鲜）时出——上点
+    // 本身过期的场景由 ②的上限一并兜底。
     {
         let draw = g.cur_raw_len as i32 - g.caret_est_cal_raw;
-        if draw > 0 && g.caret_est_cal_raw >= 0 {
-            let dxr = (rect.left - g.caret_est_cal_x) as f32;
-            if dxr > 0.0 && dxr < 400.0 {
-                let sample = dxr / draw as f32;
-                g.caret_est_unit_w = if g.caret_est_unit_w <= 0.5 {
+        if draw == 1 && g.caret_est_cal_raw >= 0 {
+            let dxr = (raw_left - g.caret_est_cal_x) as f32;
+            let dx_cap = if g.caret_est_line_h >= 8 {
+                g.caret_est_line_h as f32 * 1.25
+            } else {
+                400.0
+            };
+            if dxr > 0.0 && dxr < dx_cap {
+                let sample = dxr;
+                let old = g.caret_est_unit_w;
+                g.caret_est_unit_w = if old <= 0.5 {
                     sample
                 } else {
-                    g.caret_est_unit_w * 0.6 + sample * 0.4
+                    old * 0.6 + sample * 0.4
                 };
+                if crate::tsf::trace_on() {
+                    trace(&format!(
+                        "qc: 步宽采样 raw {}→{} → unit {:.1}",
+                        g.caret_est_cal_x, raw_left, g.caret_est_unit_w
+                    ));
+                }
             }
         }
     }
     g.caret_est_cal_raw = g.cur_raw_len as i32;
-    g.caret_est_cal_x = rect.left;
+    g.caret_est_cal_x = raw_left;
     // 【九十修·观测】标准链成功采纳（重校）点显式打行——原只有前置
     // 的 qc: raw（成功/被拦都打），采纳与拦截无法区分。
     // 【发布收口】trace_on() 前置——每键热路径，format! 不进生产。
@@ -4153,9 +4198,61 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret_est_x = rect.left;
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
-    g.caret_est_last_raw = g.cur_raw_len as i32;
     // 【行高防毒化·虎魄二修】采纳重校同 seed：矮锚不降级真行高。
     update_est_line_h(g, &rect);
+    // 【BUG8 四修·滞后布局步进推进】惰性布局宿主（虎魄跟打器 trace
+    // 实锤）组段内 GetTextExt 长期返回过期位置：14 键长编码全程锚
+    // 冻结在段首（1306），布局每 ~3 键才追赶一个字位（+68）——候选
+    // 窗不跟光标（BUG 8 原始主诉）。物理事实：组段内**只追加**文本
+    //（无删改/点击），LTR 横排下光标 x 必随键数单调右移；本帧成功
+    // 查询若相对上一采纳锚「原地不动/倒退」，则它必是过期值（追加
+    // 不可能不动）。修（通用，非特化）：组段内同线（|Δtop|<行高/2）
+    // 且 raw 键数有增量（draw≥1）时，锚左缘至少推进到
+    // 「上锚 + unit×draw」（unit=校准键宽，未校准退 0.41×行高——
+    // 两者皆随 DPI 等比，不同缩放同一效果）；真实值更新鲜（≥推进位）
+    // 时原样采纳不受影响。换行（跨线）/段首（draw 无基线）/删改
+    //（draw<0）不推进。显示层照常吃到每键 +unit 矩形序列（与记事
+    // 本同形），追赶值因恒落后于推进位被自然忽略——不再回跳。
+    // est 基线（est_x/y）按原始 rect（真值系）写入，只有显示锚吃推
+    // 进量。
+    // 【段首豁免】仅 seg≥2：上屏时编码区收缩（2-3 格 preedit → 1 格
+    // commit），新词真起点本就回退；且 commit 把 last_raw 清 0，段首
+    // draw=1-0=1 是伪增量——若推进，会把词首真锚顶到上一段显示锚
+    //（preedit 键数×格宽，≠commit 字数×格宽）之外数格=右飘。词首
+    // 锚由 seg1 归一（+unit×1=首键真光标）负责，本规则不越权。
+    {
+        let draw = g.cur_raw_len as i32 - g.caret_est_last_raw;
+        g.caret_est_last_raw = g.cur_raw_len as i32;
+        if draw >= 1 && g.seg_key_index >= 2 {
+            let lh = g.caret_est_line_h;
+            if let Some(prev) = prev_caret {
+                let same_line = lh >= 8 && (rect.top - prev.top).abs() < lh / 2;
+                if same_line {
+                    let unit = if g.caret_est_unit_w > 0.5 {
+                        g.caret_est_unit_w
+                    } else if lh >= 8 {
+                        0.41 * lh as f32
+                    } else {
+                        0.0
+                    };
+                    if unit > 0.5 {
+                        let adv = prev.left + (unit * draw as f32) as i32;
+                        if rect.left < adv - 4 {
+                            if crate::tsf::trace_on() {
+                                trace(&format!(
+                                    "qc: 滞后布局推进 {}→{}（draw={} unit={:.1} raw={}",
+                                    rect.left, adv, draw, unit, raw_left
+                                ));
+                            }
+                            let w = rect.right - rect.left;
+                            rect.left = adv;
+                            rect.right = adv + w.max(2);
+                        }
+                    }
+                }
+            }
+        }
+    }
     g.caret = Some(rect);
     // 【三十六次修正】查询时间戳：click 黏性的解除要求「本段内新查过」
     //（防止置位帧的上一段旧查询值 near-自吞黏性）。
