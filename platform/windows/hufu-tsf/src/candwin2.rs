@@ -6015,6 +6015,12 @@ impl CandidateWindowV2 {
             }
         });
 
+        crate::tsf::trace(&format!(
+            "panel: show n={} raw_len={} handled={}",
+            cands.len(),
+            raw.chars().count(),
+            rendered
+        ));
         if rendered {
             if let (Some(pos), Some((w, h))) = (frame_pos, Some(frame_wh)) {
                 unsafe {
