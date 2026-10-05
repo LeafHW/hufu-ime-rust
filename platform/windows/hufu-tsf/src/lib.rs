@@ -11,11 +11,10 @@ mod candwin2;
 // 【特效退役 2026-09-22】commitfx（上屏特效:飘散/落印/像素链/学习引
 // 擎）与 fxprobe（落印诊断）整模块删除——用户拍板「删掉所有特效相
 // 关」。tsf.rs 的触发点/Shared 字段/尾锚实测同步清理。git 可回溯。
-// 【死模块移除 2026-09-13 三十四修】canduielement（ITfCandidateListUIElement
-// 宿主代画协议）整模块删除：HuFuCandElement 全库无构造点——UIElement
-// 代画通道被 server 代画「用户定稿」架空（ui_element_show 无条件 false），
-// tsf.rs 的 cand_ui/cand_ui_id/cand_ui_host_draws 三字段与全部 if 分支
-// 为死分支（cand_ui_active 仍在用已保留）。git 历史可回溯。
+// 【死模块移除 2026-10-06】canduielement（ITfCandidateListUIElement 宿
+// 主代画协议）再度退役：LOL 拒绝代画（pbShow=FALSE 25 轮实锤），游戏
+// 候选定稿走 server 跨进程窗（无边框下像素级可见，E7v6 用户实测）。
+// git 可回溯。
 mod com;
 // i686 windows-gnu 交叉链接补丁：llvm libmingw32 无 _DllEntryPoint@12，
 // 由本模块 stub 提供（转发 DllMainCRTStartup）。x86_64 不编入。

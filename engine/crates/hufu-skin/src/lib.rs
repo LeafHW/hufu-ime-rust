@@ -448,6 +448,10 @@ pub struct OverlayProc {
     /// 圆角/羽化（240px 输出高基准）
     pub corner: u32,
     pub feather: u32,
+    /// 【圆角样式 2026-11】"round"（默认）=圆角（标准圆角矩形 SDF）；
+    /// "star"=四角星（内项取 min 的旧式 SDF，收编的意外效果）。
+    /// 渲染端（设置页 JS / DLL）按此分支；旧皮肤无此键回落圆角。
+    pub cshape: String,
     pub src_w: u32,
     pub src_h: u32,
 }
@@ -460,6 +464,7 @@ impl Default for OverlayProc {
             tol: 30,
             corner: 0,
             feather: 0,
+            cshape: "round".into(),
             src_w: 0,
             src_h: 0,
         }

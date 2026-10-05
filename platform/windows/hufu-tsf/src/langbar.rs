@@ -448,6 +448,10 @@ pub fn install(mgr: &ITfLangBarItemMgr) -> Result<()> {
     }
     r?;
     LANGBAR_ITEM.with(|c| *c.borrow_mut() = Some(item));
+    // 【首挂即预热 2026-11】挂上语言栏就异步拉一次方案清单——进程
+    // 刚激活还没打字时右键也能立刻看到方案（原实现要等 poll 首刷，
+    // 「时有时无」的窗口期之一）。异步线程执行，install 仍零阻塞。
+    std::thread::spawn(|| refresh_schemas_cache_force());
     Ok(())
 }
 
@@ -535,14 +539,27 @@ const TPM_BOTTOMALIGN: u32 = 0x20;
 static SCHEMAS_CACHE: Mutex<Option<(std::time::Instant, Vec<String>, String)>> = Mutex::new(None);
 
 /// poll 线程/空闲路径刷新缓存（方案清单 5s 节流；音效开关快照同刷）。
+/// 【右键菜单行为统一 2026-11】两处口径修正：
+/// · 「有数据」才算新鲜——空表（拉取失败/服务器未就绪）不封 5s，
+///   退避 1s 重试（原实现空表也盖时间戳，失败后 5s 内右键永远空菜单）；
+/// · 提供 force 变体（菜单选方案后/安装语言栏时）绕过节流立即拉真值。
 pub fn refresh_schemas_cache() {
+    refresh_schemas_cache_inner(false);
+}
+pub fn refresh_schemas_cache_force() {
+    refresh_schemas_cache_inner(true);
+}
+fn refresh_schemas_cache_inner(force: bool) {
     {
         let fresh = {
             let Ok(g) = SCHEMAS_CACHE.lock() else { return };
-            g.as_ref()
-                .is_some_and(|g| g.0.elapsed() < std::time::Duration::from_secs(5))
+            g.as_ref().is_some_and(|g| {
+                // 空表（拉取失败/服务器未就绪）1s 短退避；有数据 5s 节流
+                let ttl = if g.1.is_empty() { 1 } else { 5 };
+                g.0.elapsed() < std::time::Duration::from_secs(ttl)
+            })
         };
-        if fresh {
+        if !force && fresh {
             return;
         }
     }
@@ -565,7 +582,8 @@ pub fn refresh_schemas_cache() {
             *g = Some((std::time::Instant::now(), list, cur));
         }
     } else {
-        // 拉失败也计时刻，防 msctf 之外无脑重试
+        // 拉失败也计时刻：有数据=保旧值静默 5s；空表=1s 短退避后重试
+        //（原实现空表同样封 5s——服务器未就绪的进程右键长时间空菜单）
         if let Ok(mut g) = SCHEMAS_CACHE.lock() {
             let old = g.take();
             *g = old.map(|(_, l, cur)| (std::time::Instant::now(), l, cur));
@@ -580,6 +598,21 @@ pub fn refresh_schemas_cache() {
         // 失效（换音效文件+重开开关也放旧音）。
         if was != on {
             crate::sound::invalidate();
+        }
+    }
+}
+
+/// 【✓ 即时跟随 2026-11】外部得知当前方案变化（菜单选中乐观更新 /
+/// poll 状态帧 current_schema）时直接改缓存 current——右键菜单的 ✓
+/// 不再等下一轮 schemas 拉取（原实现只靠 5s 节流刷新，切完方案再
+/// 右键 ✓ 停在旧方案上，实际却已切换）。
+pub fn set_current_schema_hint(cur: &str) {
+    if cur.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = SCHEMAS_CACHE.lock() {
+        if let Some(entry) = g.as_mut() {
+            entry.2 = cur.to_string();
         }
     }
 }
@@ -770,7 +803,16 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         } else if sel >= 100 {
             let idx = (sel - 100) as usize;
             if let Some(name) = schemas.get(idx) {
-                pipe_async(serde_json::json!({"op": "set_schema", "name": name}));
+                // 【✓ 即时跟随 2026-11】乐观更新缓存 current——原实现选完
+                // 方案后缓存 5s 内还是旧值，紧接着再右键 ✓ 仍停在旧方案
+                //（实际已切换，观感=「勾错了」）。管道落定后再 force 拉
+                // 一次真值兜底（成功=server 权威值；失败=乐观值也在）。
+                set_current_schema_hint(name);
+                let nm = name.clone();
+                std::thread::spawn(move || {
+                    let _ = crate::ipc::call(&serde_json::json!({"op": "set_schema", "name": nm}));
+                    refresh_schemas_cache_force();
+                });
             }
         }
     }

@@ -75,6 +75,10 @@ pub(crate) struct ProcSpec {
     pub tol: u32,
     pub corner: u32,
     pub feather: u32,
+    /// 【四角星 2026-11】圆角样式：false=圆角（标准圆角矩形 SDF）；
+    /// true=四角星（内项取 min 的旧式 SDF——曾为 bug，尖角朝四边中点、
+    /// 腰部内凹，用户实测拉满时效果意外不错，收编为正式样式）。
+    pub star: bool,
 }
 
 pub(crate) struct OverlayCfg {
@@ -181,6 +185,7 @@ fn parse_cfg(skin: &Value) -> Option<Arc<OverlayCfg>> {
             tol: p.get("tol").and_then(|x| x.as_u64()).unwrap_or(30).clamp(2, 200) as u32,
             corner: corner.min(400),
             feather: feather.min(400),
+            star: p.get("cshape").and_then(|x| x.as_str()) == Some("star"),
         })
     });
     Some(Arc::new(OverlayCfg {
@@ -410,6 +415,7 @@ fn process_frame(
     let soft = (tol * 0.35).max(6.0);
     let corner = proc.map(|p| p.corner).unwrap_or(0) as f32 * (ch as f32 / 240.0);
     let feather = proc.map(|p| p.feather).unwrap_or(0) as f32 * (ch as f32 / 240.0);
+    let star = proc.map(|p| p.star).unwrap_or(false);
     let rr = corner.max(feather);
     let half_w = w as f32 / 2.0;
     let half_h = h as f32 / 2.0;
@@ -439,7 +445,17 @@ fn process_frame(
                     let qy = py.abs() - half_h + rr;
                     let qxo = qx.max(0.0);
                     let qyo = qy.max(0.0);
-                    let sd = qx.min(qy).max(0.0) + (qxo * qxo + qyo * qyo).sqrt() - rr;
+                    // 【圆角公式修正 2026-11】内项应为 max(qx,qy).min(0)（标准
+                    // 圆角矩形 SDF，与设置页预览同式）。此前误写成
+                    // min(qx,qy).max(0)——常规半径下四角比预览更瘦、半径拉满
+                    //（rr ≥ 半宽/半高）时对角线区被多出的正项过量裁剪，实机
+                    // 呈四角星而预览呈圆（用户实测报告）。修正后圆角与预览
+                    // 一致；旧式公式保留为 cshape=star（四角星）样式。
+                    let sd = if star {
+                        qx.min(qy).max(0.0) + (qxo * qxo + qyo * qyo).sqrt() - rr
+                    } else {
+                        qx.max(qy).min(0.0) + (qxo * qxo + qyo * qyo).sqrt() - rr
+                    };
                     if corner > 0.0 && sd >= 0.0 {
                         a = 0.0;
                     } else if feather > 0.0 {

@@ -548,6 +548,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
             </div>
             <div class="field"><label>抠图容差 <span class="val" id="ov-tol-v"></span></label><input type="range" id="ov-tol" min="4" max="120" step="2"></div>
             <div class="field"><label>圆角 <span class="val" id="ov-corner-v"></span></label><input type="range" id="ov-corner" min="0" max="120" step="2"></div>
+            <div class="field"><label>圆角样式</label><select id="ov-cshape" style="min-width:110px" title="圆角=常规圆角矩形（拉满成圆/胶囊）；四角星=尖角朝上下左右、四边内凹的星形（圆角值=内凹深度，拉满最星）——源自一次实机与预览不一致的意外效果，收编为正式样式"><option value="round">圆角</option><option value="star">四角星</option></select></div>
             <div class="field"><label>边缘羽化 <span class="val" id="ov-feather-v"></span></label><input type="range" id="ov-feather" min="0" max="80" step="2" title="边缘渐隐带宽（按 240px 高折算）；羽化自带圆角效果"></div>
             <div class="checkline"><input type="checkbox" id="ov-flip"><label for="ov-flip">水平翻转（运行时，换贴边用）</label></div>
           </div>
@@ -1478,6 +1479,7 @@ const OV = {
   ratio: "free",           // free | 1 | 2:3 | 3:4 | 9:16
   key: null, tol: 30,      // 抠图键色 + 容差
   corner: 0, feather: 0,   // 圆角/羽化（240px 高基准，运行时按实际高折算）
+  cshape: "round",         // 圆角样式：round=圆角 | star=四角星（2026-11 收编的意外效果）
   picking: false,          // 「取背景色」一次性取样模式
   drag: null, view: null,  // 处理台拖拽状态 / 源图→画布映射
   raf: 0, animPos: 0, animLast: 0, phase: "idle",
@@ -1498,6 +1500,7 @@ function ovBindSkin() {
   ovSetR("#ov-bh", c.base_height || 240); ovSetR("#ov-gap", c.gap ?? 8);
   ovSetR("#ov-op", c.opacity ?? 100);
   ovSetR("#ov-tol", OV.tol); ovSetR("#ov-corner", OV.corner); ovSetR("#ov-feather", OV.feather);
+  $("#ov-cshape").value = OV.cshape === "star" ? "star" : "round";
   $("#ov-flip").checked = !!c.flip_h;
   // 延时消失回填
   {
@@ -1515,7 +1518,9 @@ function ovBindSkin() {
       if (p.crop && p.crop[2] >= 2) OV.crop = { x: p.crop[0], y: p.crop[1], w: p.crop[2], h: p.crop[3] };
       OV.key = p.key ? { r: p.key[0], g: p.key[1], b: p.key[2] } : null;
       OV.tol = p.tol ?? 30; OV.corner = p.corner ?? 0; OV.feather = p.feather ?? 0;
+      OV.cshape = p.cshape === "star" ? "star" : "round";
       ovSetR("#ov-tol", OV.tol); ovSetR("#ov-corner", OV.corner); ovSetR("#ov-feather", OV.feather);
+      $("#ov-cshape").value = OV.cshape;
       ovLoadFromDataUrl(c.image, "（当前动图+参数）", true);
     } else {
       ovLoadFromDataUrl(c.image, "（当前成品图）", true);
@@ -1615,7 +1620,13 @@ function ovProcess(cv, maxH, srcFrame) {
         const qx = Math.abs(x - halfW + 0.5) - halfW + rr;
         const qy = Math.abs(y - halfH + 0.5) - halfH + rr;
         const qxo = Math.max(qx, 0), qyo = Math.max(qy, 0);
-        const sd = Math.min(Math.max(qx, qy), 0) + Math.sqrt(qxo * qxo + qyo * qyo) - rr;
+        // 【圆角/四角星 2026-11】圆角=标准圆角矩形 SDF（内项 max(qx,qy)
+        // 取负部）；四角星=内项 min(qx,qy) 取正部——DLL 旧 bug 公式，
+        // 半径拉满时尖角朝四边中点、对角内凹成星，实机效果被用户
+        // 拍板收编。两式与 overlaywin.rs process_frame 同式对齐。
+        const sd = OV.cshape === "star"
+          ? Math.max(Math.min(qx, qy), 0) + Math.sqrt(qxo * qxo + qyo * qyo) - rr
+          : Math.min(Math.max(qx, qy), 0) + Math.sqrt(qxo * qxo + qyo * qyo) - rr;
         if (hard > 0 && sd >= 0) { d[i + 3] = 0; continue; }
         if (f > 0) { let t = -sd / f; t = t < 0 ? 0 : t > 1 ? 1 : t; a *= t; }
       }
@@ -1720,6 +1731,7 @@ const ovPersist = () => {
       crop: OV.crop ? [Math.round(OV.crop.x), Math.round(OV.crop.y), Math.round(OV.crop.w), Math.round(OV.crop.h)] : null,
       key: OV.key ? [Math.round(OV.key.r), Math.round(OV.key.g), Math.round(OV.key.b)] : null,
       tol: OV.tol, corner: OV.corner, feather: OV.feather,
+      cshape: OV.cshape === "star" ? "star" : "round",
       src_w: OV.img.naturalWidth, src_h: OV.img.naturalHeight,
     };
   }
@@ -1971,6 +1983,11 @@ const ovFxR = (id, key) => {
   $(id).oninput = () => { OV[key] = parseFloat($(id).value); $(id + "-v").textContent = $(id).value; if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); ovPersist(); }); };
 };
 ovFxR("#ov-tol", "tol"); ovFxR("#ov-corner", "corner"); ovFxR("#ov-feather", "feather");
+/* 【圆角样式 2026-11】圆角↔四角星：切换即重跑像素管线（预览+存盘） */
+$("#ov-cshape").onchange = () => {
+  OV.cshape = $("#ov-cshape").value === "star" ? "star" : "round";
+  ovPreview(); ovPersist();
+};
 /* 上屏反应段:参数即存即生效(播放参数,无需烤成品) */
 const ovNum = (id, key, cast) => {
   $(id).onchange = () => {
@@ -2023,6 +2040,7 @@ $("#ov-preset-sel").onchange = async () => {
   OV.crop = c.proc && c.proc.crop ? { x: c.proc.crop[0], y: c.proc.crop[1], w: c.proc.crop[2], h: c.proc.crop[3] } : null;
   OV.key = c.proc && c.proc.key ? { r: c.proc.key[0], g: c.proc.key[1], b: c.proc.key[2] } : null;
   OV.tol = c.proc ? (c.proc.tol ?? 30) : 30; OV.corner = c.proc ? (c.proc.corner ?? 0) : 0; OV.feather = c.proc ? (c.proc.feather ?? 0) : 0;
+  OV.cshape = c.proc && c.proc.cshape === "star" ? "star" : "round";
   OV.img = null; OV.anim = null; OV.dataUrl = "";
   try { await saveSkin(); msg(`已切换到配置「${name}」✓`, "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
   ovBindSkin(); // 载入 image/proc 并回填全部控件（含延时滑杆）

@@ -698,7 +698,22 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 把「自己」注册为前景按键接收器
         let sink: ITfKeyEventSink = unsafe { self.cast()? };
         unsafe {
-            km.AdviseKeyEventSink(tid, &sink, BOOL(1))?;
+            // 【游戏宿主·E7 定稿 2026-10-06·子类化流派】游戏宿主（全屏
+            // 弹出形态/名单命中）**不挂 TSF 键 sink**——挂载即武装 CUAS
+            // 吞键管线（A2/E6/E6v2 三度实锤，先拆 IME 链也护不住）。
+            // 改为子类化游戏窗口（SetWindowLongPtr 换 WndProc——虎娘反
+            // 汇编实锤同款）：聊天开=WndProc 内吃键喂引擎+PostMessage
+            // 注入上屏（聊天框无明文）；聊天关=原样转交原 proc（技能键
+            // 原生畅通）。子类化在首个焦点事件窗口就绪后装（见
+            // OnSetFocus）。普通宿主照旧挂前景 sink。
+            if raw_fullscreen_host() || game_host_blocklisted() {
+                crate::tsf::trace("activate: 游戏宿主 → 子类化流派（不挂 sink）");
+                GAME_HOST_MODE.with(|c| c.set(true));
+                GAME_CHAT_OPEN.with(|c| c.set(false));
+                game_dissociate_focus();
+            } else {
+                km.AdviseKeyEventSink(tid, &sink, BOOL(1))?;
+            }
             // 文档焦点事件：失焦冲销会话+关候选窗（修「切窗后候选不关/回不来」）
             {
                 let tm_sink: ITfThreadMgrEventSink = self.cast()?;
@@ -772,8 +787,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                     }
                 }
             }
-            // 输入法默认「开+中文」：部分应用读 OPENCLOSE 档位决定是否走 IME，
-            // 不设会表现为「先按一下 Shift 才能打中文」
+            // OPENCLOSE=1：编辑焦点保住「不用先按 Shift 才能打中文」。
             if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
                 if let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) {
                     let v = VARIANT::from(1i32);
@@ -845,6 +859,18 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
         // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
+        // 【E7·反子类化】游戏宿主失活：还原游戏窗原 proc（不对称还原
+        // =窗口销毁时跳转野指针崩溃）
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+            let orig = GAME_ORIG_PROC.swap(0, std::sync::atomic::Ordering::SeqCst);
+            let h = GAME_HWND_USIZE.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if orig != 0 && h != 0 {
+                let hwnd = windows::Win32::Foundation::HWND(h as *mut _);
+                let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, orig as _) };
+                crate::tsf::trace("E7: 失活 → 游戏窗 proc 已还原");
+            }
+        }
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         // 【六十修】引擎侧会话一并清零（与 ime_switch_abort 同款）：
@@ -968,7 +994,8 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
             wparam.0,
             std::time::SystemTime::now()
         ));
-        Ok(self.dispatch(wparam.0, true, false, lparam.0 as usize))
+        let r = self.dispatch(wparam.0, true, false, lparam.0 as usize);
+        Ok(r)
     }
 
     fn OnTestKeyUp(
@@ -988,6 +1015,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         lparam: LPARAM,
     ) -> Result<BOOL> {
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
+        //（游戏宿主不挂本 sink——聊天键流在子类化 WndProc 里，见 E7）
         let r = self.dispatch(wparam.0, false, false, lparam.0 as usize);
         keys_log(&format!(
             "key vk={:#x} eat={} perr={} t={:?}",
@@ -1045,6 +1073,31 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
             DEFERRED_FOCUS
                 .with(|d| *d.borrow_mut() = Some((pdimfocus.cloned(), pdimprevfocus.cloned())));
             return Ok(());
+        }
+        // 【E6·虎娘同款·进场拆链】游戏宿主的键处理不再依赖任何 TSF 文
+        // 档判据（dim 启发式在记分板/加载 overlay 上误判=00:19 实锤死
+        // 因）。焦点窗与 IME 上下文拆链（换窗时 OnSetFocus 重拆），键
+        // 流照达 sink（虎娘实证），聊天态由按键流推断（Enter 开/Esc
+        // 关），聊天内旁观不吞键+擦除注入。
+        if GAME_HOST_MODE.with(|c| c.get()) {
+            game_dissociate_focus();
+            // 【E7·子类化】窗口就绪即换 WndProc（游戏 UI 线程=本线程，
+            // 消息都在本线程派发；原 proc 存原子，直调转交）。
+            if GAME_ORIG_PROC.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                let h = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                if !h.0.is_null() {
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        SetWindowLongPtrW, GWLP_WNDPROC,
+                    };
+                    let new_proc = game_subclass_proc as usize;
+                    let prev = unsafe { SetWindowLongPtrW(h, GWLP_WNDPROC, new_proc as _) };
+                    if prev != 0 {
+                        GAME_ORIG_PROC.store(prev as isize, std::sync::atomic::Ordering::SeqCst);
+                        GAME_HWND_USIZE.store(h.0 as usize, std::sync::atomic::Ordering::SeqCst);
+                        crate::tsf::trace(&format!("E7: 游戏窗子类化完成 hwnd={:p}", h.0));
+                    }
+                }
+            }
         }
         handle_set_focus(&self.shared, pdimfocus, pdimprevfocus)
     }
@@ -1666,6 +1719,8 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
+        // （游戏宿主不挂本 sink——dispatch 仅普通宿主可达；游戏键流在
+        // 子类化 WndProc 的 game_engine_key 里，见 E7。）
         // 【小键盘 Enter 2026-11】lparam 含 KF_EXTENDED 位（bit 24）：
         // 扩展键（方向键群/Ins/Del/NumEnter）置位。Enter 本体 VK 0x0D
         // 不置、小键盘 Enter 置——区分两身份：小键盘 Enter 仅在映射过
@@ -1937,7 +1992,7 @@ impl HuFuTs_Impl {
                     || a.starts_with("text:");
                 if idle_ok { Some(a.to_string()) } else { None }
             };
-            let will = chinese
+            let want = chinese
                 && match name.as_str() {
                     // 编码中：可打印键与控制键都可能被吞
                     _ if composing => true,
@@ -2007,6 +2062,18 @@ impl HuFuTs_Impl {
                     "space" | "enter" | "escape" | "tab" => false,
                     _ => false,
                 };
+            // 【游戏/非编辑焦点直通 2026-10-05】空闲态预吞（字母/分号/
+            // 引号/映射键）加「焦点可编辑」门：LOL 类宿主（全屏
+            // DirectX+ACE）信任 TestDown 吞键结果但不回发 KeyDown——
+            // 预吞=键蒸发（QWER 全灭；2026-10-05 实锤：游戏进程激活/
+            // 管道/焦点事件全正常，在场 30 秒 0 条 dispatch 记录）。
+            // 探测复用 Esc 撤回的 GetSelection 缓存（esc_caret_ok），
+            // 组段中不门控；探测被拒按可编辑兜底=现行为（不漏裸字母）。
+            let gate_ok = composing || caret_editable(&self.shared);
+            if want && !gate_ok {
+                trace("gate: 非编辑焦点 → TestDown 不预吞（直通）");
+            }
+            let will = want && gate_ok;
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
@@ -2128,6 +2195,24 @@ impl HuFuTs_Impl {
                 Some(std::mem::take(&mut g.digit_tail))
             }
         };
+        // 【游戏/非编辑焦点直通 2026-10-05】KeyDown 层同门：CUAS 宿主
+        // KeyDown 必到（空态退格探针实证）——非编辑焦点若照发引擎，
+        // server 会话起组段（raw 累积、composing 翻真），下一键
+        // TestDown 走 composing 分支=又开始吞键，游戏复死。非编辑一律
+        // 不递引擎不吞键。模式键豁免（CapsLock/Ctrl+Space 切换在任何
+        // 焦点可用，含游戏内切英文字母直通这条老逃生通道）；组段中
+        // 豁免（不应出现于非编辑焦点，保守短路）。digit_tail 已在上
+        // 方取走丢弃=陈旧尾巴自清理。
+        if !mode_key {
+            let composing_now = {
+                let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.composing
+            };
+            if !composing_now && !caret_editable(&self.shared) {
+                trace("gate: 非编辑焦点 → KeyDown 不递引擎（直通）");
+                return BOOL(0);
+            }
+        }
         // 【首键延迟分解 2026-09-14】KEY 前/后各记一戳（diag unix ms）
         // ——与 show 帧对齐可分解 注入→引擎→上屏 链各段耗时。
         if g_first_key_probe() {
@@ -4288,6 +4373,17 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         trace("update_ui: 失活熔断——丢弃渲染（切输入法窗口期）");
         return Ok(());
     }
+    // 【E4·游戏内联】游戏宿主：绝不进组段/写会话路径（在 CUAS 文档
+    // 上组段=武装主文档吞键，23:42/23:49 两次实锤不可逆，升降级/卸载
+    // /HIMC 全救不回）。聊天焦点=注入派渲染（候选推 server 跨进程窗+
+    // 上屏 WM_CHAR 投递）；主文档焦点=直接丢弃（聊天外无组段语义，
+    // 焦点残留 commit 也不写主文档）。
+    if GAME_HOST_MODE.with(|c| c.get()) {
+        if GAME_CHAT_OPEN.with(|c| c.get()) {
+            game_inline_ui(&shared, &commit, &state);
+        }
+        return Ok(());
+    }
     // 停顿期轮询武装（幂等；进程内一次）+ 记录本次展示签名
     poll_arm(&shared);
     {
@@ -5702,6 +5798,49 @@ fn esc_caret_available(shared: &SharedRef) -> bool {
         .unwrap_or(false)
 }
 
+/// 【游戏/非编辑焦点直通 2026-10-05】当前焦点是否可编辑（有光标）。
+/// 与 Esc 撤回（esc_caret_available）共用同一探测与缓存
+///（esc_caret_ok：GetSelection，焦点代际失效；Op::QueryCaret 键路径
+/// 同步档已验证安全），仅兜底方向相反：
+/// - 会话被拒/异常（探测后 esc_caret_ok 仍 None）→ 按可编辑处理
+///   （=现行为：键照旧预吞，绝不漏裸字母进真实编辑框），不缓存，
+///   下一键可再试（同步档被拒是快速错误返回，无排队冻结面）；
+/// - 无焦点上下文 → 非编辑（组段本就建不起来，吞键只会蒸发）。
+/// 背景：LOL（全屏 DirectX+ACE）类宿主「信任 TestDown 吞键结果、
+/// 不回发 KeyDown」——空闲态预吞字母=键蒸发，技能键全灭。非编辑
+/// 焦点（游戏/按钮/列表/桌面/RDP 画布）一律直通。安全性不变量：
+/// 凡今天能组段上屏的宿主，首键建组段走的同一 selection_range 必过
+/// → 探测必过；探测过不去的地方=今天也打不出字的地方（同款蒸发），
+/// 修的是本来就不工作的面，不碰正常打字路径。
+fn caret_editable(shared: &SharedRef) -> bool {
+    // 快路径：Esc 探测已跑过（同焦点代际）直接复用。
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ok) = g.esc_caret_ok {
+            return ok;
+        }
+    }
+    // 无焦点上下文 = 无光标（非编辑焦点通常连 ITfContext 都没有）。
+    let Some(ctx) = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .focus_context()
+    else {
+        return false;
+    };
+    // 同步档探测：受理即回调内联执行（DoEditSession 写 esc_caret_ok）。
+    let _ = run_session(shared, Op::QueryCaret, Some(ctx));
+    match shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .esc_caret_ok
+    {
+        Some(ok) => ok,
+        // 探测会话被拒：保守按可编辑（=现行为），不缓存下一键再试。
+        None => true,
+    }
+}
+
 /// 沉浸式宿主候选显示（双通道）：
 /// 首帧 BeginUIElement——pbShow=TRUE 即宿主愿意代画（走 UIElement），
 /// FALSE 则降级 server 代画（pipe 推送候选+坐标，server 开窗绘制，
@@ -5855,6 +5994,226 @@ pub fn host_is_weixin() -> bool {
     })
 }
 
+// ═══════════ E7·游戏子类化流派（虎娘同款） ═══════════
+static GAME_ORIG_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static GAME_HWND_USIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+type GameWndProc = unsafe extern "system" fn(
+    windows::Win32::Foundation::HWND,
+    u32,
+    windows::Win32::Foundation::WPARAM,
+    windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT;
+
+unsafe fn game_call_orig(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wp: windows::Win32::Foundation::WPARAM,
+    lp: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    let p = GAME_ORIG_PROC.load(std::sync::atomic::Ordering::SeqCst);
+    if p == 0 {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    std::mem::transmute::<isize, GameWndProc>(p)(hwnd, msg, wp, lp)
+}
+
+/// 【E7·引擎直连】WndProc 内的键→引擎轮转（不经 TSF sink）。返回
+/// Some(true)=吞（游戏不见）、Some(false)=转交原 proc、None=键无名义
+/// （转交）。
+fn game_engine_key(vk: usize) -> Option<bool> {
+    let shared = G_SHARED.get().map(|g| g.0.clone())?;
+    let (name, shift, ctrl, alt) = vk_to_name(vk, false)?;
+    let line_end = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .line_end;
+    let (consumed, commit, _back, state, _snd, _vol) =
+        crate::ipc::key_request(&name, shift, ctrl, alt, line_end, None)?;
+    if consumed {
+        crate::tsf::trace(&format!("E7: {name} consumed commit={commit:?}"));
+        update_ui(shared, commit, state);
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
+/// 【E7·游戏窗子类化 proc】聊天态机：Enter 开 / Esc·Enter 关；聊天
+/// 开=吃键喂引擎（聊天框无明文），关=原样转交（技能键原生畅通）。
+unsafe extern "system" fn game_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wp: windows::Win32::Foundation::WPARAM,
+    lp: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_SYSKEYUP: u32 = 0x0105;
+    const WM_SYSCHAR: u32 = 0x0106;
+    if !GAME_HOST_MODE.with(|c| c.get()) {
+        return game_call_orig(hwnd, msg, wp, lp);
+    }
+    match msg {
+        WM_CHAR | WM_SYSCHAR => {
+            // 游戏泵 TranslateMessage 先于 Dispatch 生成 WM_CHAR——KEY
+            // DOWN 吞了它也已在队列。真键派生字符携带该 KEYDOWN 的
+            // lParam（扫描码位非 0）；注入字符 lParam=1。只吞匹配的真
+            // 派生字符（聊天框零明文），注入的中文放行。
+            if GAME_CHAT_OPEN.with(|c| c.get())
+                && GAME_LAST_CONSUMED.with(|c| c.get())
+                && lp.0 as usize == GAME_LAST_CONSUMED_LP.with(|c| c.get())
+            {
+                return windows::Win32::Foundation::LRESULT(0);
+            }
+            game_call_orig(hwnd, msg, wp, lp)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let open = GAME_CHAT_OPEN.with(|c| c.get());
+            if !open {
+                if wp.0 == 0x0D {
+                    GAME_CHAT_OPEN.with(|c| c.set(true));
+                    GAME_LAST_CONSUMED.with(|c| c.set(false));
+                    crate::tsf::trace("E7: Enter → 聊天开");
+                }
+                return game_call_orig(hwnd, msg, wp, lp);
+            }
+            match wp.0 {
+                0x1B | 0x0D => {
+                    GAME_CHAT_OPEN.with(|c| c.set(false));
+                    GAME_LAST_CONSUMED.with(|c| c.set(false));
+                    crate::tsf::trace("E7: Esc/Enter → 聊天关");
+                    return game_call_orig(hwnd, msg, wp, lp);
+                }
+                0x10 => {
+                    // Shift 落：不喂引擎（dispatch 正牌逻辑=仅抬键发一次；
+                    // down+up 双发=引擎切两下=白切，01:15 实锤），放行
+                    GAME_LAST_CONSUMED.with(|c| c.set(false));
+                    return game_call_orig(hwnd, msg, wp, lp);
+                }
+                _ => {}
+            }
+            match game_engine_key(wp.0) {
+                Some(true) => {
+                    GAME_LAST_CONSUMED.with(|c| c.set(true));
+                    GAME_LAST_CONSUMED_LP.with(|c| c.set(lp.0 as usize));
+                    windows::Win32::Foundation::LRESULT(0) // 吞：游戏不见此键
+                }
+                _ => {
+                    GAME_LAST_CONSUMED.with(|c| c.set(false));
+                    game_call_orig(hwnd, msg, wp, lp)
+                }
+            }
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let open = GAME_CHAT_OPEN.with(|c| c.get());
+            if open && wp.0 == 0x10 {
+                let _ = game_engine_key(wp.0); // Shift 抬=单击切换判定
+            }
+            game_call_orig(hwnd, msg, wp, lp)
+        }
+        _ => game_call_orig(hwnd, msg, wp, lp),
+    }
+}
+
+// ═══════════ E3c/E4·游戏内联渲染（子类化流派定稿） ═══════════
+
+/// 【游戏内联渲染】游戏聊天态专用：候选推 server（跨进程窗——游戏
+/// 进程内建窗=失焦弹桌面/独占全屏不可见，01:20-01:31 实测），上屏=
+/// WM_CHAR 逐字投递游戏窗（虎娘注入派同款——不在 TSF 上下文做组段）。
+fn game_inline_ui(shared: &SharedRef, commit: &str, state: &serde_json::Value) {
+    let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+    let cands: Vec<(String, String)> = state
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|c| {
+                    (
+                        c.get("text")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        c.get("comment")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // 【E7·注入】子类化流派键被 WndProc 吃掉——聊天框无拼音明文，直
+    // 接注入即可（E5 的退格擦除随旁观模式一并废弃）。
+    if !commit.is_empty() {
+        game_inject_text(commit);
+    }
+    if cands.is_empty() && raw.is_empty() {
+        // 空帧收窗
+        let _ = crate::ipc::call(&serde_json::json!({ "op": "cand_hide" }));
+        return;
+    }
+    // 【E7v6·server 跨进程窗】游戏进程内建窗全面废弃：独占全屏下
+    // 顶层窗=弹桌面（E3b/E7v4）、子窗画不上 NOREDIRECTIONBITMAP 表面
+    // 且扰输入（E7v5）。跨进程 TOPMOST 分层窗在无边框/窗口化下可显
+    //（E5 实锤）；独占全屏=叠加层物理不可见（已知限制，虎娘同境）。
+    let (x, y) = game_cand_pos();
+    ui_element_show(shared, &cands, raw, sel, x, y);
+}
+
+/// 候选固定位：游戏窗屏幕左下（聊天输入区上方）。【E7v6】server 跨
+/// 进程窗用屏幕绝对坐标。
+fn game_cand_pos() -> (i32, i32) {
+    let h = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    if h.0.is_null() {
+        return (60, 300);
+    }
+    let mut r = windows::Win32::Foundation::RECT::default();
+    if !unsafe { GetWindowRect(h, &mut r) }.is_ok() || r.bottom <= r.top {
+        return (60, 300);
+    }
+    (r.left + 60, (r.bottom - 380).max(r.top + 120))
+}
+
+/// 【文本注入】逐 UTF-16 码元 WM_CHAR 投递当前焦点窗（聊天开着=游戏
+/// 主窗）。PostMessage 异步——WndProc 内投递，游戏下一轮消息泵按打
+/// 字序处理，无重入。lParam=1 为注入标记：真键派生 WM_CHAR 的 lParam
+/// 含扫描码位（非 0），子类化 proc 据此区分「注入放行/派生吞」（E7v3）。
+fn game_inject_text(text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
+    let h = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    if h.0.is_null() {
+        return;
+    }
+    let mut buf = [0u16; 2];
+    for ch in text.chars() {
+        for u in ch.encode_utf16(&mut buf) {
+            let _ = unsafe { PostMessageW(h, WM_CHAR, WPARAM(*u as usize), LPARAM(1)) };
+        }
+    }
+    crate::tsf::trace(&format!("E4 注入: {text}"));
+}
+
+/// 【虎娘同款】把当前焦点窗与 IME 上下文拆链（幂等；换窗重拆）。
+/// 虎娘反汇编实锤：ImmAssociateContextEx(hwnd, NULL, 0) 两处调用同参
+/// 数——CUAS 吞键管线从此挂不上窗口（挂载/组段/卸载均无法武装）。
+fn game_dissociate_focus() {
+    use windows::Win32::UI::Input::Ime::{ImmAssociateContextEx, HIMC};
+    let h = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    if h.0.is_null() {
+        return;
+    }
+    let cur = h.0 as usize;
+    if GAME_LAST_HWND.with(|c| c.replace(cur)) == cur {
+        return; // 同窗已拆
+    }
+    let r = unsafe { ImmAssociateContextEx(h, HIMC(std::ptr::null_mut()), 0) };
+    crate::tsf::trace(&format!("E6 拆链: hwnd={cur:#x} ok={}", r.as_bool()));
+}
+
 fn ui_element_show(
     shared: &SharedRef,
     cands: &[(String, String)],
@@ -5989,11 +6348,121 @@ fn ui_element_hide(shared: &SharedRef) {
 
 use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, EnumChildWindows, GUITHREADINFO, GetClassNameW,
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE,
-    IsWindowVisible, KillTimer, RegisterClassW, SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, EnumChildWindows, EnumWindows, GWL_STYLE, GUITHREADINFO,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowLongW,
+    GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE, IsWindowVisible, KillTimer,
+    RegisterClassW, SetTimer, SM_CYSCREEN, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_POPUP,
+};
+
+// ═══════════ 游戏键盘保护·定稿 2026-10-06（子类化流派） ═══════════
+// 消融结论（2026-10-05）：文本无关宿主（游戏）挂前景键 sink 会让 msctf
+// 装 CUAS 键盘接管管线，LOL 对局整键盘被吞（sink 零回调、切走不恢复）。
+// 定稿：全屏弹出宿主/名单命中 → 不挂 sink，子类化游戏窗口（E7，见
+// OnSetFocus/game_subclass_proc）；普通宿主照旧前景挂载。
+
+thread_local! {
+    /// 游戏宿主模式（Activate 期名单/形态命中）：进场拆 IME 链 + 子类
+    /// 化游戏窗（E7），永不挂 TSF 键 sink。
+    static GAME_HOST_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 游戏内聊天态（按键流推断：Enter 开/Esc 关——dim 判据在记分板
+    /// 等 overlay 上误判实锤，废弃）
+    static GAME_CHAT_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 已拆 IME 链的窗口（换窗重拆判据）
+    static GAME_LAST_HWND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 前一个 WM_KEYDOWN 被引擎消费——对应的 WM_CHAR 须吞（游戏泵
+    /// TranslateMessage 先于 Dispatch 生成 WM_CHAR，吞 KEYDOWN 拦不住
+    /// 它，00:57 实锤「d中」「bu;好的」明文泄漏）
+    static GAME_LAST_CONSUMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 被消费键的 lParam（真键派生 WM_CHAR 携带同 lParam 含扫描码位；
+    /// 注入字符 lParam=1 扫描码=0 永不匹配——E7v2 把注入的中文自己
+    /// 也吞了的修正）
+    static GAME_LAST_CONSUMED_LP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+static RAW_FS_HIT: AtomicIsize = AtomicIsize::new(0);
+
+/// 单窗判定：可见 + WS_POPUP（无系统边框——真游戏全屏形态；F11 浏览
+/// 器仍 WS_OVERLAPPED 不中招）+ 覆盖所在显示器 ≥99.5%（最大化普通应
+/// 用被任务栏挡住出局）。
+unsafe fn window_is_raw_fullscreen(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    if !IsWindowVisible(hwnd).as_bool() {
+        return false;
+    }
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if style & WS_POPUP.0 as u32 == 0 {
+        return false;
+    }
+    let mut wr = RECT::default();
+    if !GetWindowRect(hwnd, &mut wr).is_ok() {
+        return false;
+    }
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+        return false;
+    }
+    let maw = (mi.rcMonitor.right - mi.rcMonitor.left) as f64;
+    let mah = (mi.rcMonitor.bottom - mi.rcMonitor.top) as f64;
+    let fw = (wr.right - wr.left) as f64;
+    let fh = (wr.bottom - wr.top) as f64;
+    maw > 0.0 && mah > 0.0 && fw >= maw * 0.995 && fh >= mah * 0.995
+}
+
+unsafe extern "system" fn raw_fs_enum_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    _lp: LPARAM,
+) -> BOOL {
+    let mut pid: u32 = 0;
+    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == std::process::id() && window_is_raw_fullscreen(hwnd) {
+        RAW_FS_HIT.store(1, AtomicOrdering::Relaxed);
+    }
+    BOOL(1)
+}
+
+/// 【A4】本进程存在任一全屏弹出窗（游戏形态）→ true。进程级扫描
+/// （EnumWindows）：游戏主窗可能建在非激活线程，激活时本线程
+/// GetGUIThreadInfo 查不到（21:41 实测漏检根因）。
+fn raw_fullscreen_host() -> bool {
+    unsafe {
+        RAW_FS_HIT.store(0, AtomicOrdering::Relaxed);
+        let _ = EnumWindows(Some(raw_fs_enum_proc), LPARAM(0));
+        RAW_FS_HIT.load(AtomicOrdering::Relaxed) != 0
+    }
+}
+
+/// 【A4·游戏宿主名单】Activate 期窗口形态未就绪（LOL 加载期）且
+/// UnadviseKeyEventSink 拆不掉已装的 CUAS 接管（21:52 实测补卸载无
+/// 效）——唯一安全序 = 首次挂载前就避开。名单 = 内置默认 +
+/// C:\ProgramData\HuFu\game-hosts.txt（每行一个小写进程名，# 注释）。
+fn game_host_blocklisted() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(name) = exe.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower == "league of legends.exe" {
+        return true;
+    }
+    if let Ok(txt) = std::fs::read_to_string(r"C:\ProgramData\HuFu\game-hosts.txt") {
+        for line in txt.lines() {
+            let l = line.trim();
+            if !l.is_empty() && !l.starts_with('#') && l.to_ascii_lowercase() == lower {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// 【反查首帧锚点 2026-09-11】无组段帧（反查/命令模式刚进入：仅 aux
 /// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
@@ -6765,6 +7234,11 @@ fn poll_tick() {
                 return;
             }
             if !mine {
+                // 【语言栏缓存修复 2026-11】空闲进程（近 2s 无键、无组段）
+                // 也要刷方案清单缓存——原实现 refresh 只在「mine」路径执行，
+                // 没打字过的进程右键指示符永远空菜单/旧 ✓。5s 节流在
+                // refresh 内部，空闲进程也只是一轮一个管道 schemas 调用。
+                crate::langbar::refresh_schemas_cache();
                 poll_collapse_stale(&s);
                 return;
             }
@@ -6858,6 +7332,10 @@ fn poll_tick() {
         // 化即置皮肤失效——entrance_anim 等方案相关字段即时跟随
         //（覆盖设置页/langbar 切方案；Ctrl+M 键路径另有即时标记）。
         if let Some(cs) = state.get("current_schema").and_then(|v| v.as_str()) {
+            // 【✓ 即时跟随 2026-11】方案变了顺手把语言栏菜单缓存的
+            // current 同步掉——设置页/Ctrl+M/他进程菜单切的方案，
+            // 本进程右键菜单的 ✓ 一拍内跟上（原要等 5s 节流重拉）。
+            crate::langbar::set_current_schema_hint(cs);
             if !cs.is_empty() && cs != g.last_schema_seen {
                 g.last_schema_seen = cs.to_string();
                 if !g.skin.is_null() {
