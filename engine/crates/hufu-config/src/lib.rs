@@ -19,6 +19,10 @@ pub struct Config {
     pub punct: PunctSection,
     pub clipboard: ClipboardSection,
     pub appearance: AppearanceSection,
+    /// 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道（与经典皮肤系统
+    /// 完全并行：enabled=false 时经典皮肤照常，true 时候选窗走
+    /// panel-skins 渲染）。新节 serde default，旧配置文件零感知。
+    pub panel: PanelSection,
     pub sound: SoundSection,
     pub opencc: OpenCcSection,
     pub user: UserSection,
@@ -37,6 +41,7 @@ impl Default for Config {
             punct: PunctSection::default(),
             clipboard: ClipboardSection::default(),
             appearance: AppearanceSection::default(),
+            panel: PanelSection::default(),
             sound: SoundSection::default(),
             opencc: OpenCcSection::default(),
             user: UserSection::default(),
@@ -592,6 +597,18 @@ impl Default for AppearanceSection {
             anim_speed: 1.0,
         }
     }
+}
+
+/// 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道开关与选择。
+/// 经典皮肤系统（appearance.skin / skins/*.json）完全不读此节；
+/// DLL 面板渲染端与 server panel-skins 通道消费。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PanelSection {
+    /// false（默认）=经典皮肤系统；true=虎娘面板皮肤
+    pub enabled: bool,
+    /// 当前面板皮肤 id（panel-skins/{id}.json）；空=未选
+    pub skin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

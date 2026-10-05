@@ -691,6 +691,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         if !DA_REG.swap(true, std::sync::atomic::Ordering::AcqRel) {
             crate::displayattr::register_provider_category();
         }
+        crate::tsf::trace("activate: enter");
         let tm = ptim
             .cloned()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
@@ -712,7 +713,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                 GAME_CHAT_OPEN.with(|c| c.set(false));
                 game_dissociate_focus();
             } else {
-                km.AdviseKeyEventSink(tid, &sink, BOOL(1))?;
+                match km.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
+                    Ok(_) => crate::tsf::trace("activate: sink advised ok"),
+                    Err(e) => crate::tsf::trace(&format!("activate: advise FAIL 0x{:08X}", e.code().0)),
+                }
             }
             // 文档焦点事件：失焦冲销会话+关候选窗（修「切窗后候选不关/回不来」）
             {

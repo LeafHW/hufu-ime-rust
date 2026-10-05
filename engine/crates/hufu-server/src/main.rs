@@ -919,6 +919,75 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let _ = host.engine.config.save(&host.config_path);
             Response::json(&serde_json::json!({"ok": true, "id": id}))
         }
+        // ── 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道 HTTP 面 ──
+        ("GET", "/api/panel") => {
+            // 当前模式 + 面板皮肤列表（官方内嵌 + 用户目录并列，官方在前）
+            let mut skins = host.official_panel_skins();
+            if let Ok(rd) = std::fs::read_dir(host.panel_skins_dir()) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().map(|x| x == "json").unwrap_or(false) {
+                        let id = p
+                            .file_stem()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if skins.iter().any(|(sid, _)| *sid == id) {
+                            continue;
+                        }
+                        let name = std::fs::read_to_string(&p)
+                            .ok()
+                            .and_then(|t| {
+                                serde_json::from_str::<serde_json::Value>(
+                                    t.trim_start_matches('\u{feff}'),
+                                )
+                                .ok()
+                            })
+                            .and_then(|v| {
+                                v.get("name").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .unwrap_or_else(|| id.clone());
+                        skins.push((id, name));
+                    }
+                }
+            }
+            Response::json(&serde_json::json!({
+                "enabled": host.engine.config.panel.enabled,
+                "skin": host.engine.config.panel.skin,
+                "skins": skins,
+            }))
+        }
+        ("POST", "/api/panel") => {
+            // {enabled?: bool, skin?: id}——模式切换与面板皮肤选择二合一；
+            // 选皮肤即开启面板模式（设置页语义：选了就要看到）
+            let v = req.json();
+            let mut changed = false;
+            if let Some(en) = v.get("enabled").and_then(|x| x.as_bool()) {
+                host.engine.config.panel.enabled = en;
+                changed = true;
+            }
+            if let Some(id) = v.get("skin").and_then(|x| x.as_str()) {
+                let id = id.trim();
+                if id.is_empty() {
+                    return Response::err(400, "缺少 id");
+                }
+                let p = host.panel_skins_dir().join(format!("{id}.json"));
+                if !p.exists() {
+                    return Response::err(404, &format!("面板皮肤 {id} 不存在"));
+                }
+                host.engine.config.panel.skin = id.to_string();
+                host.engine.config.panel.enabled = true;
+                changed = true;
+            }
+            if changed {
+                let _ = host.engine.config.save(&host.config_path);
+            }
+            Response::json(&serde_json::json!({
+                "ok": true,
+                "enabled": host.engine.config.panel.enabled,
+                "skin": host.engine.config.panel.skin,
+            }))
+        }
         ("POST", "/api/preview") => {
             // 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标
             //（浏览器 window.screenX/outerWidth 可得），2.5s 有效期内

@@ -305,10 +305,9 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
         if h != INVALID {
             return Some(std::fs::File::from_raw_handle(h as RawHandle));
         }
-        LAST_PIPE_ERR.store(
-            unsafe { GetLastError() },
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let err = unsafe { GetLastError() };
+        LAST_PIPE_ERR.store(err, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("ipc: connect_pipe fail err={err}");
         // 打不开：server 不在则拉起（首遇给足启动时间）
         if !spawned {
             spawned = true;

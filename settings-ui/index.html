@@ -395,6 +395,15 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <section id="tab-skin">
     <h2>皮肤<span class="en">Skin</span></h2>
     <div class="sub">19 个颜色角色 + 布局 + 材质（半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。毛玻璃已退役（2026-09-11），旧玻璃皮肤自动按纯色渲染。</div>
+    <!-- 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道：与经典皮肤系统并行，
+         用户在两套之间选择；经典皮肤区在面板模式下仅置灰不隐藏（可随时切回） -->
+    <div id="panel-box" style="border:1px solid var(--line,#8884);border-radius:10px;padding:12px 14px;margin:0 0 18px">
+      <div class="row" style="margin-bottom:0">
+        <div class="checkline"><input type="checkbox" id="panel-on"><label for="panel-on" title="开启后候选窗使用虎娘贴图皮肤（独立于上方经典皮肤，两套互不影响）">虎娘贴图皮肤</label></div>
+        <div class="field"><label>贴图皮肤</label><select id="panel-select" style="min-width:200px"></select></div>
+        <span id="panel-hint" class="sub" style="margin:0">开启后：候选窗为整幅立绘气泡板（编码在输入框内联），字号跟随贴图皮肤设定；经典皮肤保持原样随时切回。</span>
+      </div>
+    </div>
     <div class="row" style="margin-bottom:18px">
       <div class="field"><label>皮肤</label><select id="skin-select" style="min-width:200px"></select></div>
       <div class="field"><label>名称</label><input type="text" data-skin="name" style="width:160px"></div>
@@ -1447,6 +1456,33 @@ function preview() {
     };
   });
 }
+// ── 【虎娘面板皮肤 2026-10-06】独立通道：/api/panel GET/POST ──
+async function loadPanel() {
+  try {
+    const r = await api("GET", "/api/panel");
+    const on = $("#panel-on"), sel = $("#panel-select");
+    sel.innerHTML = "";
+    (r.skins || []).forEach(x => { const o = document.createElement("option"); o.value = x.id; o.textContent = x.name; sel.appendChild(o); });
+    sel.value = r.skin || (r.skins && r.skins[0] && r.skins[0].id) || "";
+    on.checked = !!r.enabled;
+    applyPanelMode();
+    sel.onchange = async () => {
+      try { await api("POST", "/api/panel", { skin: sel.value }); msg("贴图皮肤已切换 ✓", "ok"); }
+      catch (e) { msg("切换失败：" + e.message, "err"); }
+      applyPanelMode();
+    };
+    on.onchange = async () => {
+      try { await api("POST", "/api/panel", { enabled: on.checked }); }
+      catch (e) { msg("切换失败：" + e.message, "err"); }
+      applyPanelMode();
+    };
+  } catch (e) { /* 面板通道不可用时静默（旧 server） */ }
+}
+function applyPanelMode() {
+  const on = $("#panel-on").checked;
+  // 经典皮肤区置灰（不隐藏——随时可改回）；输入禁用防误存
+  ["#skin-select", "#skin-save", "#skin-new", "#skin-reset"].forEach(sg => { const el = $(sg); if (el) el.disabled = on; });
+}
 async function loadSkinList(sel) {
   const r = await api("GET", "/api/skins");
   const s = $("#skin-select"); s.innerHTML = "";
@@ -2178,6 +2214,7 @@ async function init() {
     applyPlatform();
     await loadSchemas(); await refreshInfo();
     await loadSkinList(); await loadSkin($("#skin-select").value);
+    loadPanel();
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
 }
