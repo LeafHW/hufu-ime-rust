@@ -4198,61 +4198,18 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret_est_x = rect.left;
     g.caret_est_y = rect.top;
     g.caret_est_wrap = 0;
+    g.caret_est_last_raw = g.cur_raw_len as i32;
     // 【行高防毒化·虎魄二修】采纳重校同 seed：矮锚不降级真行高。
     update_est_line_h(g, &rect);
-    // 【BUG8 四修·滞后布局步进推进】惰性布局宿主（虎魄跟打器 trace
-    // 实锤）组段内 GetTextExt 长期返回过期位置：14 键长编码全程锚
-    // 冻结在段首（1306），布局每 ~3 键才追赶一个字位（+68）——候选
-    // 窗不跟光标（BUG 8 原始主诉）。物理事实：组段内**只追加**文本
-    //（无删改/点击），LTR 横排下光标 x 必随键数单调右移；本帧成功
-    // 查询若相对上一采纳锚「原地不动/倒退」，则它必是过期值（追加
-    // 不可能不动）。修（通用，非特化）：组段内同线（|Δtop|<行高/2）
-    // 且 raw 键数有增量（draw≥1）时，锚左缘至少推进到
-    // 「上锚 + unit×draw」（unit=校准键宽，未校准退 0.41×行高——
-    // 两者皆随 DPI 等比，不同缩放同一效果）；真实值更新鲜（≥推进位）
-    // 时原样采纳不受影响。换行（跨线）/段首（draw 无基线）/删改
-    //（draw<0）不推进。显示层照常吃到每键 +unit 矩形序列（与记事
-    // 本同形），追赶值因恒落后于推进位被自然忽略——不再回跳。
-    // est 基线（est_x/y）按原始 rect（真值系）写入，只有显示锚吃推
-    // 进量。
-    // 【段首豁免】仅 seg≥2：上屏时编码区收缩（2-3 格 preedit → 1 格
-    // commit），新词真起点本就回退；且 commit 把 last_raw 清 0，段首
-    // draw=1-0=1 是伪增量——若推进，会把词首真锚顶到上一段显示锚
-    //（preedit 键数×格宽，≠commit 字数×格宽）之外数格=右飘。词首
-    // 锚由 seg1 归一（+unit×1=首键真光标）负责，本规则不越权。
-    {
-        let draw = g.cur_raw_len as i32 - g.caret_est_last_raw;
-        g.caret_est_last_raw = g.cur_raw_len as i32;
-        if draw >= 1 && g.seg_key_index >= 2 {
-            let lh = g.caret_est_line_h;
-            if let Some(prev) = prev_caret {
-                let same_line = lh >= 8 && (rect.top - prev.top).abs() < lh / 2;
-                if same_line {
-                    let unit = if g.caret_est_unit_w > 0.5 {
-                        g.caret_est_unit_w
-                    } else if lh >= 8 {
-                        0.41 * lh as f32
-                    } else {
-                        0.0
-                    };
-                    if unit > 0.5 {
-                        let adv = prev.left + (unit * draw as f32) as i32;
-                        if rect.left < adv - 4 {
-                            if crate::tsf::trace_on() {
-                                trace(&format!(
-                                    "qc: 滞后布局推进 {}→{}（draw={} unit={:.1} raw={}",
-                                    rect.left, adv, draw, unit, raw_left
-                                ));
-                            }
-                            let w = rect.right - rect.left;
-                            rect.left = adv;
-                            rect.right = adv + w.max(2);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 【BUG8 四修B·推进规则撤除】四修的「滞后布局推进」（组段内锚至
+    // 少推进到 上锚+unit×draw）基于「组段内光标必随键右移」假设——
+    // snap13 trace 实锤该假设在跟打器不成立：整个编码渲染在一个格
+    // 内，组段内真光标恒在 段首+1格（seg2..k 的 raw 恒=start+84 冻结
+    // ——那是真值不是过期布局）；按键推进把显示锚每键顶出 +84 → 候
+    // 选逐键右飘（用户实测「向右移动太多、太飘」）。撤除推进：成功
+    // 帧显示锚=宿主汇报值（组段内恒定=真光标恒定），词首由矮锚归一
+    //（+unit×1=首键真插入点）负责，段间由上屏前移+新词重归一接力。
+    // unit_w 仍按格宽校准（实测 84=一格），供词首归一/est 失败帧兜底。
     g.caret = Some(rect);
     // 【三十六次修正】查询时间戳：click 黏性的解除要求「本段内新查过」
     //（防止置位帧的上一段旧查询值 near-自吞黏性）。
