@@ -3449,12 +3449,21 @@ static SHORT_ANCHOR_MEM_LH: std::sync::atomic::AtomicI32 = std::sync::atomic::At
 /// 还没学到（=0），矮锚直进 seed → 行高被毒化成 16，后续 h<lh/2 恒
 /// 假 → 永不归一（用户「高度问题出现得比刚刚少了但还有」）；c) x 从
 /// 未归一。
-/// 修（通用，非特化）：锚同时满足 h<lh/2 且 h≤18（默认字体度量签名；
-/// 正常宿主插入符高≈行高，lh 本身就是该宿主锚高学出来的，自洽不触
-/// 发）→ ①bottom=top+lh；②right=left+raw_len×0.41×lh（右缘=真实插
-/// 入点，est_step 同款步宽启发式）。行高 lh=max(est_line_h, 进程记忆)
-/// 取 ≥18 者；带宽校验仅 est_y≠0 时生效（y=0=无基线/半哨兵，放行）。
-/// 归一成功同步更新记忆。正常宿主零影响：h≥lh/2 或 h>18 直接返回。
+/// 修（通用，非特化·三修 2026-11）：h<lh/2（纯比例判定，随显示器
+/// DPI 缩放自适配——正常宿主插入符高占行高相当比例，比例与缩放无
+/// 关；默认字体度量矮锚 16/123≈13% 远低于任何正常比例）→
+/// ①bottom=top+lh；②锚平移到真实插入点并整形零宽竖线。二修的教训
+/// （用户实测「还是偏左」）：六处候选定位调用点全部读 r.left（见
+/// `(r.left, r.bottom + 4)` 搜索）——二修只拉 r.right，left 仍是组
+/// 段起点，x 根本没修掉。矮锚几何实锤（trace 三例）：left=组段起点
+/// 真值，宽=过期默认字体度量（14/16px），真实插入点=left+步长×n
+///（第二键折叠锚 left=首键 left+2×48）。平移：left+=步长×n，
+/// right=left+2（与第二键锚同形）。步长优先用同宿主实测校准
+/// unit_w（物理 px 随缩放等比=不同缩放同效果），未校准退 0.41×行高
+/// 启发式（行高亦随缩放）。仅对文本度量盒形锚（宽≥8）平移：零宽
+/// 竖线锚的 left 本就是插入点，只补高度不动 x。行高 lh=max
+/// (est_line_h, 进程记忆) 取≥8；带宽校验仅 est_y≠0 时生效（y=0=无
+/// 基线/半哨兵，放行）。归一成功同步更新记忆。正常宿主零影响。
 fn normalize_short_anchor(g: &Shared, r: &mut RECT) {
     use std::sync::atomic::Ordering;
     let h = r.bottom - r.top;
@@ -3464,38 +3473,41 @@ fn normalize_short_anchor(g: &Shared, r: &mut RECT) {
     let lh_est = g.caret_est_line_h;
     let lh_mem = SHORT_ANCHOR_MEM_LH.load(Ordering::Relaxed);
     let lh = if lh_est >= lh_mem { lh_est } else { lh_mem };
-    if lh < 18 {
-        return; // 无行高知识（冷启动首段）：不敢拉，等 key2 全高锚建行高
+    if lh < 8 {
+        return; // 无行高知识（冷启动首段）：不敢拉，等全高锚建行高
     }
-    if h >= lh / 2 || h > 18 {
-        return; // 非默认字体度量签名（正常锚或整行盒）
+    if h >= lh / 2 {
+        return; // 非矮锚（插入符高占行高相当比例——比例随缩放恒定）
     }
     // 带宽校验：est_y 有效（≠0）时要求同带，防换行/换控件帧误拉伸；
     // est_y==0（无基线/半哨兵）放行——首段帧本无参照。
     if g.caret_est_y != 0 && (r.top - g.caret_est_y).abs() >= lh {
         return;
     }
+    let w = r.right - r.left;
     r.bottom = r.top + lh;
-    // 宽度归一：矮锚宽=默认字体字宽（14/字符），真实插入点=
-    // left + 字符数×0.41×行高（est_step 同款 ASCII 步宽启发式，
-    /// 虎魄实测 0.41×123≈50 vs 真值 48，误差 2px 级）。
-    let n = (g.cur_raw_len.max(1)) as i32;
-    let new_right = r.left + ((0.41 * lh as f32) as i32) * n;
-    if new_right > r.right && r.right - r.left >= 8 {
-        // 仅对「文本度量盒」形锚拉宽（宽≥8；2px 折叠竖线锚不动）
-        r.right = new_right;
+    // x 归一：文本度量盒形矮锚（宽≥8）平移 left 到真实插入点、整形
+    // 零宽竖线（与第二键锚同形）；零宽竖线矮锚的 left 本就是插入点，
+    // 不动。
+    if w >= 8 {
+        let n = (g.cur_raw_len.max(1)) as i32;
+        let unit = if g.caret_est_unit_w > 0.5 {
+            g.caret_est_unit_w
+        } else {
+            0.41 * lh as f32
+        };
+        r.left += (unit * n as f32) as i32;
+        r.right = r.left + 2;
     }
     SHORT_ANCHOR_MEM_LH.store(lh, Ordering::Relaxed);
     if crate::tsf::trace_on() {
         trace(&format!(
-            "qc: 矮锚归一 h={} w={}→行高{} rect=({},{},{},{})",
+            "qc: 矮锚归一 h={} w={}→行高{} 插入点=({},{})",
             h,
-            r.right - r.left,
+            w,
             lh,
             r.left,
-            r.top,
-            r.right,
-            r.bottom
+            r.top
         ));
     }
 }
