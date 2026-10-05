@@ -922,7 +922,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // ── 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道 HTTP 面 ──
         ("GET", "/api/panel") => {
             // 当前模式 + 面板皮肤列表（官方内嵌 + 用户目录并列，官方在前）
-            let mut skins = host.official_panel_skins();
+            // 与 /api/skins 同形：{"id","name"} 对象数组（曾直接序列化
+            // 元组 → [["id","名"],…]——设置页 x.id 取不到，下拉全空）。
+            let mut skins = host
+                .official_panel_skins()
+                .into_iter()
+                .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+                .collect::<Vec<serde_json::Value>>();
             if let Ok(rd) = std::fs::read_dir(host.panel_skins_dir()) {
                 for e in rd.flatten() {
                     let p = e.path();
@@ -932,7 +938,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                             .and_then(|x| x.to_str())
                             .unwrap_or("")
                             .to_string();
-                        if skins.iter().any(|(sid, _)| *sid == id) {
+                        if skins.iter().any(|o| o["id"] == serde_json::json!(id)) {
                             continue;
                         }
                         let name = std::fs::read_to_string(&p)
@@ -947,7 +953,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                                 v.get("name").and_then(|n| n.as_str()).map(String::from)
                             })
                             .unwrap_or_else(|| id.clone());
-                        skins.push((id, name));
+                        skins.push(serde_json::json!({"id": id, "name": name}));
                     }
                 }
             }
