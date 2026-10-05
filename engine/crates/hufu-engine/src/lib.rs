@@ -6843,12 +6843,15 @@ mod tests {
         assert!(o.consumed, "up=pageup 路径通");
 
         // —— 未映射键零差异：空 map 时 j/d/;/2 全照旧 ——
+        // 【默认不学习 2026-11】user.auto_frequency 默认改关后，前面
+        // select2 选「到的」不再调频——jd 保持码表原序 [就,到的,加]，
+        // 数字 2 上屏第 2 候选=「到的」（旧断言「就」是学习开的期值）。
         eng.config.keymap.map.clear();
         let mut s10 = Session::new(true);
         eng.process_key(&mut s10, key('j'));
         eng.process_key(&mut s10, key('d'));
         let o = eng.process_key(&mut s10, key('2'));
-        assert_eq!(o.commit.as_deref(), Some("就"), "空 map 数字选重零差异");
+        assert_eq!(o.commit.as_deref(), Some("到的"), "空 map 数字选重零差异");
 
         // —— 【两态映射 2026-11】map_idle 空态专用 + 缺省回落 ——
         // [ 有候选直出？、空态直出！（两套效果）

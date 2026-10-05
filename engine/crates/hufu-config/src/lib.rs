@@ -635,9 +635,16 @@ impl Default for OpenCcSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSection {
-    /// 选词后自动调频
+    /// 【默认关 2026-11 用户拍板】选词后自动调频（词次 +1 上浮）+
+    /// 用户词热注入整句词图（rank1 段）——静态整句模型唯一的个性化
+    /// 通道。历史默认 true，2026-11 迁「整句模型·用户学习」页时改关
+    ///（用户机器长期实测关闭运行）。主动操作（Ctrl+数字 置顶、
+    /// Ctrl+Shift+数字 / Ctrl+Delete 删词、/jc 加词、/jq 加权）不受
+    /// 此开关影响，永远生效。
     pub auto_frequency: bool,
-    /// 自动记录用户调整日志
+    /// 【默认关 2026-11 用户拍板】选词学习往方案目录 user-adjust.log
+    /// 追加诊断记录（防抖落盘）。与 用户调整.txt（置顶/加词/删词
+    /// 操作记录，参与导出快照）是两回事。历史默认 true。
     pub log_adjust: bool,
     /// 允许 Ctrl+Delete 软删候选
     pub allow_delete_word: bool,
@@ -646,8 +653,8 @@ pub struct UserSection {
 impl Default for UserSection {
     fn default() -> Self {
         UserSection {
-            auto_frequency: true,
-            log_adjust: true,
+            auto_frequency: false,
+            log_adjust: false,
             allow_delete_word: true,
         }
     }
