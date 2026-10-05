@@ -56,7 +56,7 @@ mod imp {
             .unwrap_or_else(|| "(无候选)".into())
     }
 
-    fn main() {
+    pub(crate) fn main() {
         call(&serde_json::json!({"op":"reset"}));
         for ch in "agkadklecbsy".chars() {
             let r = call(&serde_json::json!({"op":"key","key": ch.to_string()}));

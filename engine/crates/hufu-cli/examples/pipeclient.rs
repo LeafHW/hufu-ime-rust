@@ -57,7 +57,7 @@ mod imp {
         }
     }
 
-    fn main() {
+    pub(crate) fn main() {
         call(&serde_json::json!({"op":"ping"}));
         call(&serde_json::json!({"op":"reset"}));
         let k1 = call(&serde_json::json!({"op":"key","key":"u"}));

@@ -44,7 +44,7 @@ mod imp {
         }
     }
 
-    fn main() {
+    pub(crate) fn main() {
         // 读当前皮肤（server 数据目录在运行目录下）
         let dir = std::env::current_dir().expect("取当前目录失败").join("数据").join("皮肤");
         let read_skin = || -> (f64, f64, String) {
