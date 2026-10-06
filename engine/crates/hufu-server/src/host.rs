@@ -665,22 +665,27 @@ impl Host {
     /// 【重复上屏包括符号 2026-11】上屏历史栈记账收口（process_key /
     /// select_candidate 同源）：开关关（默认）= 2026-10-30 三修口径——
     /// 剥尾随非字母（标点/空白）后含至少一个字母才记，纯符号/数字
-    /// 上屏不入栈、标点顶字「中，」只记「中」；开关开 = 任何非空上屏
-    /// 整段入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc 撤回
-    /// 可作用于任意上一次上屏内容（用户在「输入与候选」页勾选）。
-    /// 【顶标并账 2026-10-06】开关开时的补丁：纯符号上屏（上屏「中」
-    /// 后空态补的「，」、标点直出等）若独立入栈会把正文挤出栈首
-    /// （用户实测 {重复上屏}=「，」、{重复上屏2}=「中」）。纯符号且
-    /// 栈顶条含字母/数字 → 并入栈顶（append_commit_history），一次
-    /// 回放整段「中，」；纯符号打头（栈空/栈顶也纯符号）仍独立入栈，
-    /// 「……」这类纯符号段照样可单独回放。
+    /// 上屏不入栈、标点顶字「中，」只记「中」。
+    /// 【用户口径 2026-10-07】开关开 = 文字与尾随符号**拆条入栈**（符号
+    /// 在顶、文字次之）：标点顶字「中……」是一条 commit，记账拆成
+    /// push(「中」)+push(「……」)→ {重复上屏}=「……」、{重复上屏2}=
+    /// 「中」（用户编码 abc 放 {重复上屏}1/2/3 的用法）；空态补的纯
+    /// 符号「，」、纯符号直出也各自一条。Esc 撤回同粒度逐条弹。
+    /// 推翻 2026-10-06 顶标并账（并入栈顶成「中……」单条）——用户
+    /// 实测并账后 1.中…… 2.更早 不符期望。拆分口径 = 尾随非字母数字
+    /// 串全归符号条（与 OFF 支剥尾一致取向；数字算文字，「3.」拆
+    /// 「3」+「.」——符号条独立可回放优先于整段语义）。
     fn record_commit_history(&mut self, c: &str) {
         if self.engine.config.general.repeat_include_symbols {
-            let top = self.engine.commit_history_at(1).map(|s| s.as_str());
-            if Self::symbol_merges_into_top(top, c) {
-                self.engine.append_commit_history(c);
-            } else {
+            let (text, sym) = Self::split_symbol_tail(c);
+            if text.is_empty() {
+                // 纯符号段（空态补标点/直出）：整段一条
                 self.engine.push_commit_history(c);
+            } else {
+                self.engine.push_commit_history(text);
+                if !sym.is_empty() {
+                    self.engine.push_commit_history(sym);
+                }
             }
         } else {
             let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
@@ -690,15 +695,11 @@ impl Host {
         }
     }
 
-    /// 【顶标并账 2026-10-06】纯符号上屏是否并入栈顶：c 无任何字母/
-    /// 数字（is_alphanumeric）且栈顶条含字母/数字。数字算文字（「3.」
-    /// 是有意义整段独立入栈，不并）。纯函数供单测覆盖。
-    fn symbol_merges_into_top(top: Option<&str>, c: &str) -> bool {
-        let symbol_only = !c.chars().any(|ch| ch.is_alphanumeric());
-        let top_texty = top
-            .map(|t| t.chars().any(|ch| ch.is_alphanumeric()))
-            .unwrap_or(false);
-        symbol_only && top_texty
+    /// 【用户口径 2026-10-07】commit 拆 (文字条, 符号条)：尾随非字母
+    /// 数字串剥离为符号条，其余（含内部符号）为文字条。纯函数供单测。
+    fn split_symbol_tail(c: &str) -> (&str, &str) {
+        let text = c.trim_end_matches(|ch: char| !ch.is_alphanumeric());
+        (text, &c[text.len()..])
     }
 
     /// 按键 → (结果, 状态快照)。
@@ -754,7 +755,12 @@ impl Host {
         }
         // 【真机重排模拟】process_key 后派发重排任务（与 pipe 路径同序）
         self.after_ime_op();
-        // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
+        // 【自定义按键·开关绑定 2026-10-07】键控开关（s2t/emoji）翻转
+        // 落盘（重启保留；与设置页开关同一 config 文件）。
+        if self.engine.pending_config_save {
+            self.engine.pending_config_save = false;
+            let _ = self.engine.config.save(&self.config_path);
+        }        // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
         // 上屏的闪帧（旧候选+高亮=选中项）在 outcome.state 里；此处按
         // clear 后会话重建会把候选清成空，闪帧永远到不了 DLL。非闪帧
         //（consumed/passthrough/普通上屏）outcome.state 与重建结果同值
@@ -1115,26 +1121,89 @@ mod export_util {
         use super::*;
         use hufu_dict::Schema;
 
-        /// 【顶标并账 2026-10-06】纯符号并入栈顶的判定矩阵（策略本体在
-        /// record_commit_history；引擎原语 append_commit_history 的行为
-        /// 由 hufu-engine commit_history_append_merges_top 覆盖）。
+        /// 【重复上屏包括符号·用户口径 2026-10-07】开关开时拆条入栈：
+        /// 标点顶字「中……」→ 栈=[……, 中]，{重复上屏}=「……」、
+        /// {重复上屏2}=「中」（顶标并账已废——用户实测并账不符期望）。
         #[test]
-        fn symbol_merge_policy_matrix() {
+        fn repeat_stack_symbol_separate() {
             use crate::host::Host;
-            // 「中」+「，」：正文后的标点 → 并入
-            assert!(Host::symbol_merges_into_top(Some("中"), "，"));
-            // 已并成「中，」后再补「…」：继续并入同一条
-            assert!(Host::symbol_merges_into_top(Some("中，"), "…"));
-            // 西文文字后符号同样并入
-            assert!(Host::symbol_merges_into_top(Some("abc"), "."));
-            // 栈空（纯符号打头）→ 独立入栈
-            assert!(!Host::symbol_merges_into_top(None, "，"));
-            // 栈顶也是纯符号 → 独立（不无限粘连）
-            assert!(!Host::symbol_merges_into_top(Some("……"), "。"));
-            // 数字+标点是整段（含数字=文字性）→ 独立
-            assert!(!Host::symbol_merges_into_top(Some("中"), "3."));
-            // 新上屏含文字 → 正常独立入栈
-            assert!(!Host::symbol_merges_into_top(Some("中"), "再次"));
+            // 拆分矩阵：标点顶字整段 / 空态补纯符号 / 无尾符号 / 纯符号
+            assert_eq!(Host::split_symbol_tail("中……"), ("中", "……"));
+            assert_eq!(Host::split_symbol_tail("中"), ("中", ""));
+            assert_eq!(Host::split_symbol_tail("，"), ("", "，"));
+            assert_eq!(Host::split_symbol_tail("3."), ("3", "."));
+            // 内部符号不拆：只有尾随段才剥离
+            assert_eq!(Host::split_symbol_tail("中，国"), ("中，国", ""));
+            // 入栈序（引擎真实原语）：文字先、符号后（符号在栈顶）
+            let tmp = test_base("t5stack");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("main.txt"), "#hufu-dict v1 name=t\na\t来\n").unwrap();
+            let mut eng = hufu_engine::Engine::with_schema_dir(
+                &tmp,
+                hufu_config::Config::default(),
+            )
+            .unwrap();
+            let _ = std::fs::remove_dir_all(&tmp);
+            let (t, s) = Host::split_symbol_tail("中……");
+            eng.push_commit_history(t);
+            eng.push_commit_history(s);
+            assert_eq!(eng.commit_history_at(1).unwrap(), "……");
+            assert_eq!(eng.commit_history_at(2).unwrap(), "中");
+        }
+
+        /// 【用户口径·端到端 2026-10-07】开关开：标点顶字「中，」一条
+        /// commit，host 记账拆两条（，顶/中次）→ abc 候选 1.，({重复
+        /// 上屏}) 2.中({重复上屏2})——复刻用户场景（d+shift+6=「中……」
+        /// 后 abc 应出 1.…… 2.中 3.更早）。
+        #[test]
+        fn repeat_symbol_split_end_to_end() {
+            use crate::host::Host;
+            use hufu_types::{KeyCode, Modifiers};
+            let root = test_base("t5e2e");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("码表").join("T5")).unwrap();
+            std::fs::create_dir_all(root.join("数据")).unwrap();
+            std::fs::write(
+                root.join("码表").join("T5").join("main.txt"),
+                "#hufu-dict v1 name=t\nd\t中\nabc\t{重复上屏}\nabc\t{重复上屏2}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("数据").join("config.json"),
+                r#"{"schema":{"dir":"码表","current":"T5"},"general":{"repeat_include_symbols":true}}"#,
+            )
+            .unwrap();
+            let mut h = Host::new(&root.join("数据")).unwrap();
+            let k = |c: char| hufu_types::KeyInput {
+                key: KeyCode::Char(c),
+                modifiers: Modifiers::default(),
+                is_press: true,
+            };
+            // d + , = 标点顶字「中，」（一条 commit）
+            h.process_key(k('d'));
+            let r = h.process_key(k(','));
+            assert_eq!(
+                r["outcome"]["commit"].as_str(),
+                Some("中，"),
+                "标点顶字整段一条 commit: {r}"
+            );
+            // abc 候选：1=「，」2=「中」（拆条后符号在顶）——r 取末键响应
+            let mut r = r;
+            for c in "abc".chars() {
+                r = h.process_key(k(c));
+            }
+            let texts: Vec<&str> = r["state"]["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|x| x["text"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(texts.first(), Some(&"，"), "{{重复上屏}}=符号条: {texts:?}");
+            assert!(
+                texts.iter().take(3).any(|t| *t == "中"),
+                "{{重复上屏2}}=文字条: {texts:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         /// 测试基目录：crate 的 target/ 下（系统临时目录在部分环境下

@@ -449,6 +449,9 @@ pub struct Engine {
     ///（raw 清空且无待上屏）时才 reload 用户数据+同步整句注入——
     /// 用户在候选框连续操作期间不被重载打断。
     pub pending_user_reload: bool,
+    /// 【自定义按键·开关绑定 2026-10-07】键控开关（s2t/emoji）翻转
+    /// config 后置位；host 在 process_key 出口读旗落盘（重启保留）。
+    pub pending_config_save: bool,
     /// 【语料前缀挂起 2026-09-09】补充语料词编码变体（排序去重，懒建
     /// +指纹失效）：full 是任一变体真前缀且剩余码 ≤ 挂起余量时压制
     /// 提前上屏——用户显式加权的词（如「蚩奼」sfcbtrq 简码 sfccbtrq
@@ -551,6 +554,7 @@ impl Engine {
             opencc_emoji: None,
             opencc_loaded: false,
             pending_user_reload: false,
+            pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
             learn_log_pending: Vec::new(),
             learn_log_last_flush: std::time::Instant::now(),
@@ -583,6 +587,7 @@ impl Engine {
             opencc_emoji: None,
             opencc_loaded: false,
             pending_user_reload: false,
+            pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
             learn_log_pending: Vec::new(),
             learn_log_last_flush: std::time::Instant::now(),
@@ -974,6 +979,20 @@ impl Engine {
             "switch" => {
                 session.chinese = !session.chinese;
                 session.clear();
+                Some(KeyOutcome::consumed(self.state(session)))
+            }
+            // 【自定义按键·开关绑定 2026-10-07】简繁转换/Emoji 注解候选
+            // 两开关（「输入与候选」页底部原有开关）可绑键：按一下取反
+            // 立即生效、再按还原。不清组段（比 switch 温和——开关切换
+            // 不作废在打编码；当前候选保持旧口径，下一键即按新口径刷
+            // 新）。翻转置 pending_config_save，host 出口落盘重启保留。
+            "s2t" | "emoji" => {
+                if act == "s2t" {
+                    self.config.opencc.enabled = !self.config.opencc.enabled;
+                } else {
+                    self.config.opencc.emoji = !self.config.opencc.emoji;
+                }
+                self.pending_config_save = true;
                 Some(KeyOutcome::consumed(self.state(session)))
             }
             "top" => {
@@ -3771,25 +3790,6 @@ impl Engine {
         self.last_commit = text.to_string();
     }
 
-    /// 【顶标并账 2026-10-06】把追加上屏（纯符号：标点/省略号等）并入
-    /// 栈顶既有条，不独立占位——host「重复上屏包括符号」开关开的记账
-    /// 策略：上屏「中」后再按「，」，栈顶条变「中，」，{重复上屏} 一次
-    /// 回放整段（此前「，」独立入栈把正文挤出栈首——用户实测
-    /// {重复上屏}=「，」、{重复上屏2}=「中」）。栈空时退化为独立入栈。
-    /// 并账后 last_commit 同步为合并文本。
-    pub fn append_commit_history(&mut self, more: &str) {
-        if more.is_empty() {
-            return;
-        }
-        if let Some(front) = self.commit_history.front_mut() {
-            let merged = format!("{front}{more}");
-            self.last_commit = merged.clone();
-            *front = merged;
-        } else {
-            self.push_commit_history(more);
-        }
-    }
-
     /// 【上屏历史栈 2026-11】取历史第 n 条（1 起，1=最新）。越界 None。
     pub fn commit_history_at(&self, n: usize) -> Option<&String> {
         if n == 0 {
@@ -5947,32 +5947,41 @@ mod tests {
         (eng, dir)
     }
 
-    /// 【顶标并账 2026-10-06】append_commit_history 原语 + 配套记账策略
-    /// （策略本体在 hufu-server host.rs record_commit_history）：并入栈
-    /// 顶、栈空退化独立、last_commit 视图同步。
+    /// 【自定义按键·开关绑定 2026-10-07】s2t/emoji 键控翻转：按一下开、
+    /// 再按还原；置 pending_config_save（host 出口落盘）。fixture 走
+    /// manifest target（temp_dir 在部分环境拒绝访问——test_engine 同病）。
     #[test]
-    fn commit_history_append_merges_top() {
-        let (mut eng, dir) = test_engine("hist");
-        eng.push_commit_history("中");
-        eng.append_commit_history("，");
-        assert_eq!(eng.commit_history_at(1).map(|s| s.as_str()), Some("中，"));
-        assert_eq!(eng.last_commit, "中，", "last_commit 视图随并账同步");
-        // 连续符号继续并入同一条（打「中……」＝两键 …）
-        eng.append_commit_history("…");
-        eng.append_commit_history("…");
-        assert_eq!(
-            eng.commit_history_at(1).map(|s| s.as_str()),
-            Some("中，……"),
-            "连续符号并入同一条: {:?}",
-            eng.commit_history.front()
-        );
-        // 栈空退化：独立入栈
-        let (mut eng2, dir2) = test_engine("hist2");
-        eng2.append_commit_history("……");
-        assert_eq!(eng2.commit_history_at(1).map(|s| s.as_str()), Some("……"));
-        assert_eq!(eng2.commit_history.len(), 1);
+    fn keymap_toggle_s2t_emoji() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-km-toggle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\n").unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        eng.config.keymap.map.insert("f2".into(), "s2t".into());
+        eng.config.keymap.map.insert("f3".into(), "emoji".into());
+        let k = |code: KeyCode| KeyInput {
+            key: code,
+            modifiers: Modifiers::default(),
+            is_press: true,
+        };
+        let mut s = Session::new(true);
+        assert!(!eng.config.opencc.enabled, "初始关");
+        let o = eng.process_key(&mut s, k(KeyCode::F(2)));
+        assert!(o.consumed && o.commit.is_none(), "s2t 键翻转 consumed 无上屏");
+        assert!(eng.config.opencc.enabled, "按一下=开");
+        assert!(eng.pending_config_save, "置落盘旗");
+        eng.process_key(&mut s, k(KeyCode::F(2)));
+        assert!(!eng.config.opencc.enabled, "再按=关");
+        eng.process_key(&mut s, k(KeyCode::F(3)));
+        assert!(eng.config.opencc.emoji, "emoji 按一下=开");
+        // 编码态也可翻转（不清组段：候选保留）
+        eng.process_key(&mut s, key('a'));
+        eng.process_key(&mut s, k(KeyCode::F(2)));
+        assert!(eng.config.opencc.enabled, "编码态翻转生效");
+        assert!(!s.candidates.is_empty(), "不清组段——候选保留");
     }
 
     /// 【右键调频菜单 2026-10-06】op_place_candidate：定到第 N 选

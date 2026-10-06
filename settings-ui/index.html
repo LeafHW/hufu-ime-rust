@@ -2226,6 +2226,7 @@ function openKeymapEditor() {
       ["undo", "撤回上次上屏（回删）"], ["clear", "清屏（清编码与候选）"],
       ["pageup", "候选上一页"], ["pagedown", "候选下一页"],
       ["switch", "切换中英文"], ["top", "顶屏（上屏当前高亮候选）"],
+      ["s2t", "简繁转换开关（按一下开↔关）"], ["emoji", "Emoji 注解候选开关（按一下开↔关）"],
       ["text:？", "直出「？」"], ["text:、", "直出「、」"], ["text:·", "直出「·」"],
     ];
     const IDLE_FUNCS = [
@@ -2233,6 +2234,7 @@ function openKeymapEditor() {
       ["", "（清除——无候选时走默认行为）"],
       ["repeat", "重复上屏（最近 1 条）"], ["repeat2", "重复上屏（倒数第 2 条）"], ["repeat3", "重复上屏（倒数第 3 条）"], ["repeat4", "重复上屏（倒数第 4 条）"],
       ["undo", "撤回上次上屏（回删）"], ["switch", "切换中英文"],
+      ["s2t", "简繁转换开关（按一下开↔关）"], ["emoji", "Emoji 注解候选开关（按一下开↔关）"],
       ["text:！", "直出「！」"], ["text:？", "直出「？」"], ["text:、", "直出「、」"], ["text:·", "直出「·」"],
     ];
     const funcName = id => { const f = FUNCS.find(x => x[0] === id); return f ? f[1] : id.startsWith("text:") ? `直出「${id.slice(5)}」` : id; };
