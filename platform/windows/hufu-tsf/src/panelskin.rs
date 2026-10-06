@@ -334,6 +334,11 @@ pub struct PanelFrame {
     pub items: Vec<PanelItem>,
     /// 三片源/目标区间（逻辑 px）：[左帽宽, 中带宽, 右帽宽]
     pub slice_dst: [(f32, f32); 3],
+    /// 三片源区间（设计 px，即图内坐标）：左帽 [0,slice0)、
+    /// 中带 [slice0,slice0+slice1)、右帽 [slice0+slice1,art_w)。
+    /// paint 按 src→dst 各自独立映射；src 必须用源坐标（早期版本
+    /// 误用 dst 宽当 src 宽，s≠1 时帽区只采到图角透明带）。
+    pub slice_src: [(f32, f32); 3],
     pub pos: (i32, i32),
 }
 
@@ -439,9 +444,13 @@ pub fn build_frame(
         first = false;
     }
 
-    // 窗口宽：内容驱动 vs 最小宽（左帽+右帽+min_middle）
+    // 窗口宽：内容驱动 vs 最小宽。最小宽 = 整图缩放宽（中带不被压缩到
+    // 自然宽以下）——蜜桃 n=2 帧（152×75）实测：by_content 分支把中带
+    // 501px 压到 43.8px，气泡板+立绘糊成一团，文字叠在压缩板上，即
+    // 「挤压」观感的根因。虎娘本尊：内容不足时窗停在整图宽×s，中带
+    // 保持自然宽，只在其上拉伸补宽（659 帧实测 501→550 拉伸正常）。
     let right_gap = (look.art_w as f32 - (look.content[0] + look.content[2])) * s;
-    let min_w = (look.slice[0] + look.slice[2]) * s + look.min_middle * s;
+    let min_w = look.art_w as f32 * s;
     let by_content = content_w + right_gap.max(0.0) + look.grow_left * s;
     let w = by_content.max(min_w).min(4000.0);
     let h = look.art_h as f32 * s;
@@ -457,6 +466,8 @@ pub fn build_frame(
     }
 
     let pos = place(w as i32, h as i32, anchor, prev_pos);
+    // 中带目标宽 = 窗宽 − 左帽 − 右帽；w ≥ 全图宽×s（min 分支）时恒 ≥
+    // 自然中带，即中带只会被拉伸、永不被压缩。
     let mid_l = look.slice[0] * s;
     let mid_r = (w - look.slice[2] * s).max(mid_l + 1.0);
     Some(PanelFrame {
@@ -467,6 +478,11 @@ pub fn build_frame(
             (0.0, mid_l),
             (mid_l, mid_r),
             (mid_r, w),
+        ],
+        slice_src: [
+            (0.0, look.slice[0]),
+            (look.slice[0], look.slice[0] + look.slice[1]),
+            (look.slice[0] + look.slice[1], look.art_w as f32),
         ],
         pos,
     })
@@ -580,12 +596,10 @@ pub unsafe fn paint(
         None => return false,
     };
 
-    // 三片映射：左帽固定、中带压缩/拉伸、右帽锚右缘
+    // 三片映射：src=图内设计坐标区间，dst=窗口逻辑 px 区间，各自独立缩放。
+    // 左帽/右帽只平移不缩放（宽×s），中带压缩/拉伸补宽。
     let w = frame.w as f32;
     let h = frame.h as f32;
-    let (lw_l, lw_r) = frame.slice_dst[0];
-    let (mw_l, mw_r) = frame.slice_dst[1];
-    let (rw_l, rw_r) = frame.slice_dst[2];
     let mut draw_slice = |src_l: f32, src_r: f32, dst_l: f32, dst_r: f32| {
         if dst_r - dst_l <= 0.5 || src_r - src_l <= 0.5 {
             return;
@@ -601,10 +615,11 @@ pub unsafe fn paint(
             None,
         );
     };
-    let art_l = *aw as f32;
-    draw_slice(0.0, lw_r - lw_l, lw_l, lw_r);
-    draw_slice(lw_r - lw_l, art_l - (rw_r - rw_l), mw_l, mw_r);
-    draw_slice(art_l - (rw_r - rw_l), art_l, rw_l, rw_r);
+    for i in 0..3 {
+        let (sl, sr) = frame.slice_src[i];
+        let (dl, dr) = frame.slice_dst[i];
+        draw_slice(sl, sr, dl, dr);
+    }
 
     // 右对齐文本行
     for it in &frame.items {
