@@ -3381,9 +3381,17 @@ impl Engine {
 
     /// 置顶当前页第 idx 候选（Ctrl+Shift+N / 设置界面）。持久化到用户调整日志。
     pub fn op_pin_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
-        let page_size = self.config.candidates.page_size.max(1);
-        let start = session.page * page_size;
-        let pick = session.candidates.get(start + idx).cloned();
+        let start = session.page * self.config.candidates.page_size.max(1);
+        self.op_pin_candidate_abs(session, start + idx)
+    }
+
+    /// 【右键菜单·全列表口径 2026-10-06】同 op_pin_candidate，但 idx 为
+    /// 完整候选列表绝对下标。DLL 菜单的词可能被异步重排（rerank 350ms
+    /// 去抖/顶功推位）挪出当前页——页内口径双落空=「第一次点菜单必
+    /// 未生效、重试才成功」（真机 trace 实锤 ×3 词）。菜单意图是
+    /// 「这个词」本身：resolve 全列表按词定位后走本入口。
+    pub fn op_pin_candidate_abs(&mut self, session: &mut Session, abs: usize) -> KeyOutcome {
+        let pick = session.candidates.get(abs).cloned();
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
@@ -3408,9 +3416,13 @@ impl Engine {
 
     /// 按 code+word 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
     pub fn op_hide_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
-        let page_size = self.config.candidates.page_size.max(1);
-        let start = session.page * page_size;
-        let pick = session.candidates.get(start + idx).cloned();
+        let start = session.page * self.config.candidates.page_size.max(1);
+        self.op_hide_candidate_abs(session, start + idx)
+    }
+
+    /// 【右键菜单·全列表口径】同 op_hide_candidate，idx=完整列表绝对下标。
+    pub fn op_hide_candidate_abs(&mut self, session: &mut Session, abs: usize) -> KeyOutcome {
+        let pick = session.candidates.get(abs).cloned();
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
@@ -3434,9 +3446,13 @@ impl Engine {
     /// 覆盖该词既有置顶/删除行（同码同词只留最新操作）。与
     /// op_pin_candidate 同框架：源白名单 + 延迟重载 + 组段保留。
     pub fn op_place_candidate(&mut self, session: &mut Session, idx: usize, pos: usize) -> KeyOutcome {
-        let page_size = self.config.candidates.page_size.max(1);
-        let start = session.page * page_size;
-        let pick = session.candidates.get(start + idx).cloned();
+        let start = session.page * self.config.candidates.page_size.max(1);
+        self.op_place_candidate_abs(session, start + idx, pos)
+    }
+
+    /// 【右键菜单·全列表口径】同 op_place_candidate，idx=完整列表绝对下标。
+    pub fn op_place_candidate_abs(&mut self, session: &mut Session, abs: usize, pos: usize) -> KeyOutcome {
+        let pick = session.candidates.get(abs).cloned();
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
         };
@@ -4702,6 +4718,73 @@ mod tests {
     /// /选重/翻页纯码表语义，整句类算法零介入。本测试用虎整句格式码表
     /// （一简+简词行）+无 decoder 锁定行为快照，防任何算法路径在
     /// sentence.is_none() 时漏出。
+    /// 【T4 加词重复·引擎侧复现 2026-10-06】BUG.txt：顶功连打
+    /// faacnat（第 5 键 n 把 4 码词「身在」顶上屏，余码 at→…）时
+    /// 「出现一堆重复的」；显式选词（faac 空格 + nat 空格）则正常。
+    /// 引擎侧取证：全序列只允许一次「身在」commit、任何帧候选文本
+    /// 不得重复。引擎若清白 → 问题在 DLL 加词窗 TL 层（再上真机 trace）。
+    #[test]
+    fn t4_dinggong_push_no_dup() {
+        let dir = std::env::temp_dir().join(format!("hufu-t4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dict_dir = dir.join("码表").join("虎整句");
+        std::fs::create_dir_all(&dict_dir).unwrap();
+        // faac 双候选（身在/遮天盖地）→ 不唯一不提前上屏；第 5 键才顶
+        std::fs::write(
+            dict_dir.join("码表.txt"),
+            "#hufu-dict v1 name=虎整句测试\n\
+             faac 身在 遮天盖地\n\
+             nat 福 褔\n\
+             a 来\n\
+             t 到\n\
+             na 哪\n\
+             at 在\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.schema.current = "虎整句".into();
+        let mut engine = Engine::new(&dir, config).unwrap();
+
+        // —— 序列 A：连打 faacnat（顶功路径）——
+        let mut s = Session::new(true);
+        let mut commits: Vec<String> = Vec::new();
+        let mut last_texts: Vec<String> = Vec::new();
+        for c in ['f', 'a', 'a', 'c', 'n', 'a', 't'] {
+            let out = engine.process_key(&mut s, key(c));
+            if let Some(t) = &out.commit {
+                commits.push(t.clone());
+            }
+            if let Some(st) = &out.state {
+                last_texts = st.candidates.iter().map(|x| x.text.clone()).collect();
+                // 每帧候选文本集合不得有重复
+                let mut set = std::collections::HashSet::new();
+                for t in &last_texts {
+                    assert!(set.insert(t.as_str()), "候选重复（键={c}）: {t} in {last_texts:?}");
+                }
+            }
+        }
+        eprintln!("A commits={commits:?} 终态候选={last_texts:?} raw={:?}", s.raw);
+        assert_eq!(
+            commits.iter().filter(|t| t.as_str() == "身在").count(),
+            1,
+            "「身在」只 commit 一次（实际 {commits:?}）"
+        );
+
+        // —— 序列 B：显式选词（faac 空格 + nat 空格）对照组 ——
+        let mut s2 = Session::new(true);
+        let mut commits2: Vec<String> = Vec::new();
+        for c in ['f', 'a', 'a', 'c', ' ', 'n', 'a', 't', ' '] {
+            let out = engine.process_key(&mut s2, key(c));
+            if let Some(t) = &out.commit {
+                commits2.push(t.clone());
+            }
+        }
+        eprintln!("B commits={commits2:?}");
+        assert_eq!(commits2, vec!["身在", "福"], "显式选词=两次 commit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn no_model_pure_dict_total_gate() {
         let dir = std::env::temp_dir().join(format!("hufu-nomodel-{}", std::process::id()));
@@ -5791,6 +5874,58 @@ mod tests {
         let snap2 = eng.state(&s);
         let texts2: Vec<&str> = snap2.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts2.last().copied(), Some("到的"), "移到最后=末位: {texts2:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【真机数据复现 2026-10-06】用户实测：菜单「那样」能前移但移不回、
+    /// 单字全都不能移。合成数据测不出的路径用真实方案目录跑（HUFU_TEST_
+    /// SCHEMA=方案目录；测试拷到 temp 不动原数据）。
+    #[test]
+    fn real_schema_menu_place_repro() {
+        let src = std::env::var("HUFU_TEST_SCHEMA").unwrap_or_default();
+        if src.is_empty() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hufu-real-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for e in std::fs::read_dir(&src).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".txt") {
+                let _ = std::fs::copy(e.path(), dir.join(&name));
+            }
+        }
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        let mut s = Session::new(true);
+        for c in "ae".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = |eng: &Engine, s: &Session| -> Vec<String> {
+            eng.state(s).candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        let t0 = snap(&eng, &s);
+        eprintln!("ae 候选({}): {t0:?}", t0.len());
+        let idx_word = t0.iter().position(|t| t == "那样");
+        // 那样前移到 1 再移回 2
+        if let Some(i) = idx_word {
+            eng.op_place_candidate(&mut s, i, 1);
+            let t1 = snap(&eng, &s);
+            eprintln!("那样→p1: {t1:?}");
+            eng.op_place_candidate(&mut s, 0, 2);
+            let t2 = snap(&eng, &s);
+            eprintln!("那样→p2(移回): {t2:?}");
+            let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap_or_default();
+            eprintln!("用户调整.txt:\n{log}");
+        }
+        // 首个单字移到 p3
+        if let Some(i) = t0.iter().position(|t| t.chars().count() == 1) {
+            eng.op_place_candidate(&mut s, i, 3);
+            let t3 = snap(&eng, &s);
+            eprintln!("单字 {}→p3: {t3:?}", t0[i]);
+            let log2 = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap_or_default();
+            eprintln!("用户调整.txt(单字后):\n{log2}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

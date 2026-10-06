@@ -513,7 +513,23 @@ struct OverlayEntry {
 }
 
 impl OverlayWin {
+    /// cand=候选窗句柄：候选窗若是 owned 模式（沉浸宿主——SearchHost/
+    /// UWP 里候选窗挂靠宿主视图窗以避开 DWM cloak），挂件窗**必须同
+    /// owner 挂靠**——普通顶层窗在打包宿主进程里会被 DWM 整体 cloak
+    ///（=挂件在开始菜单/UWP 永远隐身的根因，2026-10-06 实测定案：
+    /// 本机沉浸候选走 DLL owned 窗而非 server 代画）。经典模式
+    /// owner=0 时与旧行为完全一致。
+    unsafe fn create_for(cand: HWND) -> Option<OverlayWin> {
+        unsafe {
+            Self::create_impl(Some(cand))
+        }
+    }
+
     unsafe fn create() -> Option<OverlayWin> {
+        unsafe { Self::create_impl(None) }
+    }
+
+    unsafe fn create_impl(cand: Option<HWND>) -> Option<OverlayWin> {
         if !CLASS_REGISTERED.swap(true, Ordering::AcqRel) {
             let class: Vec<u16> = "HuFuCandOverlay\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -537,6 +553,14 @@ impl OverlayWin {
                 | WS_EX_TOOLWINDOW.0
                 | WS_EX_TRANSPARENT.0,
         );
+        // 挂件 owner=候选窗的 owner（owned 模式）；经典模式=0（顶层窗）
+        let mut owner = HWND(std::ptr::null_mut());
+        if let Some(c) = cand {
+            let op = GetWindowLongPtrW(c, GWLP_HWNDPARENT);
+            if op != 0 {
+                owner = HWND(op as *mut _);
+            }
+        }
         let hwnd = CreateWindowExW(
             ex,
             PCWSTR(class.as_ptr()),
@@ -546,7 +570,7 @@ impl OverlayWin {
             0,
             10,
             10,
-            HWND(std::ptr::null_mut()),
+            owner,
             HMENU(std::ptr::null_mut()),
             HINSTANCE(std::ptr::null_mut()),
             None,
@@ -935,9 +959,10 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
     if entry.disabled {
         return;
     }
-    // 建窗(惰性;失败本轮代次禁用)
+    // 建窗(惰性;失败本轮代次禁用)——带 cand：owned 模式下挂件同 owner
+    // 挂靠（避 DWM cloak；见 create_for 注释）
     if entry.ov.is_none() {
-        match OverlayWin::create() {
+        match OverlayWin::create_for(cand) {
             Some(w) => entry.ov = Some(w),
             None => {
                 entry.disabled = true;

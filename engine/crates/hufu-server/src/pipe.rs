@@ -151,53 +151,65 @@ pub fn dispatch(
                 .unwrap_or(usize::MAX);
             let page_size = host.engine.config.candidates.page_size.max(1);
             let start = host.session.page * page_size;
-            // 解析目标候选（页内）：优先 page_index，词不符则按 text 重找
+            // 解析目标候选：优先页内 page_index，词不符/落空则按 text
+            // 重找。【全列表兜底 2026-10-06】真机 trace 实锤「每个菜单
+            // 动作第一次必『候选不在页』、重试才成功」——词被异步重排
+            //（rerank 350ms 去抖/顶功推位）挪出当前页窗口时页内双落空。
+            // 菜单意图是「这个词」本身：全列表按词定位，返回绝对下标。
             let resolve = |want: usize, text: &str| -> Option<usize> {
-                let get = |i: usize| {
+                let get_page = |i: usize| {
                     host.session
                         .candidates
                         .get(start + i)
                         .map(|c| c.text.as_str())
                 };
-                if let Some(t) = get(want) {
+                if let Some(t) = get_page(want) {
                     if text.is_empty() || t == text {
-                        return Some(want);
+                        return Some(start + want);
                     }
                 }
                 if text.is_empty() {
                     return None;
                 }
-                (0..page_size).find(|&i| get(i) == Some(text))
+                (0..page_size)
+                    .find(|&i| get_page(i) == Some(text))
+                    .map(|i| start + i)
+                    .or_else(|| {
+                        host.session
+                            .candidates
+                            .iter()
+                            .position(|c| c.text == text)
+                    })
             };
-            let idx = match resolve(page_index, text) {
-                Some(i) => i,
+            let abs = match resolve(page_index, text) {
+                Some(a) => a,
                 None => {
                     return serde_json::json!({"ok": false, "why": "候选不在当前页"});
                 }
             };
             let total = host.session.candidates.len();
-            let n_abs = start + idx + 1; // 完整列表 1 基（pN 度量口径）
+            let n_abs = abs + 1; // 完整列表 1 基（pN 度量口径）
             let h: &mut Host = &mut host;
             match action {
                 "front" => {
-                    let _ = h.engine.op_pin_candidate(&mut h.session, idx);
+                    let _ = h.engine.op_pin_candidate_abs(&mut h.session, abs);
                 }
                 "del" => {
-                    let _ = h.engine.op_hide_candidate(&mut h.session, idx);
+                    let _ = h.engine.op_hide_candidate_abs(&mut h.session, abs);
                 }
                 "fwd" => {
                     if n_abs > 1 {
-                        let _ = h.engine.op_place_candidate(&mut h.session, idx, n_abs - 1);
+                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, n_abs - 1);
                     }
                 }
                 "back" => {
                     if n_abs < total {
-                        let _ = h.engine.op_place_candidate(&mut h.session, idx, n_abs + 1);
+                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, n_abs + 1);
                     }
                 }
                 "last" => {
                     if total >= 1 {
-                        let _ = h.engine.op_place_candidate(&mut h.session, idx, total);
+                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, total);
                     }
                 }
                 _ => {
