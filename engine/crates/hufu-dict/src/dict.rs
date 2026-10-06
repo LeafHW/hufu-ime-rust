@@ -187,6 +187,19 @@ impl Dict {
     }
 
     fn rebuild(&mut self) {
+        // 【T4·重复行去重 2026-10-06】码表文件/导入链可能带入同码同词
+        // 重复行（别机实锤：琉璃方案多多导出里 WiFi|wifi 等 6 组词×2
+        // ——候选窗「加词时一堆重复」与导出双行的共同来源；多多系码表
+        // 常把用户表与主表同名词条各导一份）。加载即去重：同 (code,
+        // text) 保首次出现（行序即候选序），后续重复行丢弃；同词异码
+        //（一字多码）不受影响。user_dict 侧本就有同款去重（user.rs
+        // load 的 seen 集），此处补齐主码表不变量。
+        {
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            self.entries
+                .retain(|e| seen.insert((e.code.clone(), e.text.clone())));
+        }
         self.by_code.clear();
         self.trie = Trie::new();
         self.text_to_codes.clear();
@@ -390,6 +403,38 @@ mod tests {
         );
         assert_eq!(d.lookup("jd")[0].text, "什么");
         assert_eq!(d.best_code_of("什么"), Some("jd"));
+    }
+
+    /// 【T4·重复行去重 2026-10-06】同码同词重复行（别机多多导出实锤
+    /// WiFi|wifi ×2 等 6 组）：加载即去重保首现——候选/导出不得双份；
+    /// merge（导入表追加）同口径；同词异码（一字多码）不受影响。
+    #[test]
+    fn duplicate_lines_dedup_on_load() {
+        let entries = vec![
+            mk("wifi", "WiFi", 10.0, 0),
+            mk("a", "来", 9.0, 1),
+            mk("wifi", "WiFi", 10.0, 2), // 重复行（多多用户表+主表各一份）
+            mk("wifi", "WiFi", 20.0, 3), // 重复行（更高权重也一样丢——重复即病态）
+            mk("efwi", "随身WiFi", 5.0, 4),
+        ];
+        let mut d = Dict::from_entries("t", entries);
+        let got: Vec<&str> = d.lookup("wifi").iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(got, ["WiFi"], "同码同词只留一份（首现）");
+        assert_eq!(d.entries.len(), 3, "重复行已剔除");
+
+        // 导入表追加同码同词 → merge 后仍单份
+        let d2 = Dict::from_entries("import", vec![mk("wifi", "WiFi", 99.0, 0), mk("b", "不", 1.0, 1)]);
+        d.merge(&d2);
+        let got2: Vec<&str> = d.lookup("wifi").iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(got2, ["WiFi"], "merge 追加的重复词也被去重");
+
+        // 同词异码（一字多码）保留双码
+        let d3 = Dict::from_entries(
+            "multi",
+            vec![mk("nat", "福", 5.0, 0), mk("fuu", "福", 5.0, 1)],
+        );
+        assert_eq!(d3.lookup("nat")[0].text, "福");
+        assert_eq!(d3.lookup("fuu")[0].text, "福", "同词异码不受去重影响");
     }
 
     #[test]
