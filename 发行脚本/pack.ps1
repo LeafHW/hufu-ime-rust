@@ -1,4 +1,4 @@
-﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
@@ -403,11 +403,32 @@ if (-not $skipTeng -and -not $isAdminPack -and $ElevMark -ne 'elev') {
 }
 $sysIme = "$env:SystemRoot\SystemIME\HuFu"
 $sysBak = $null
+# 【腾位自愈 2026-10-07】上次打包异常退出（throw 路径曾不回滚腾位）会
+# 留下 HuFu 不在、HuFu.packN 孤儿残留的状态——输入法就此消失（本机
+# 7:07 实录：首打包撞上用户打字高峰 3 轮击杀失败 throw→腾位未回滚；
+# 重试轮见 HuFu 不在即视为无需腾位/恢复，残局无人收拾）。开局先治：
+# HuFu 缺席但存在 .packN 孤儿 → 最新的改回 HuFu（输入法立刻复活），
+# 其余孤儿尝试清理（被进程占用的留着无害，重启后可删）。
+if (-not $skipTeng -and -not (Test-Path $sysIme)) {
+    $orphans = Get-ChildItem "$env:SystemRoot\SystemIME" -Directory -Filter 'HuFu.pack*' -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if ($orphans) {
+        Write-Host "  [自愈] SystemIME\HuFu 缺席，回收孤儿 $($orphans[0].Name) → HuFu" -ForegroundColor Yellow
+        Rename-Item $orphans[0].FullName 'HuFu' -Force
+        $orphans | Select-Object -Skip 1 | ForEach-Object {
+            Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue
+        }
+    }
+}
 if (-not $skipTeng -and (Test-Path $sysIme)) {
     $n = 1; while (Test-Path "$env:SystemRoot\SystemIME\HuFu.pack$n") { $n++ }
     $sysBak = "HuFu.pack$n"
     Rename-Item $sysIme $sysBak -Force
 }
+# 【腾位回滚闸 2026-10-07】腾位后到恢复前的任何 throw（3 轮击杀失败/
+# 压缩失败等）都必须先把 SystemIME 改回，否则输入法凭空消失。成功路
+# 径的恢复在 try 块之后（原有逻辑）；catch 里恢复后再抛。
+try {
 Stop-Process -Name ctfmon -Force -EA SilentlyContinue
 Start-Sleep -Seconds 1
 # 【三十四修 2026-09-13】旧版单杀单查被 DLL 守护链击败：杀 server 后
@@ -450,10 +471,21 @@ foreach ($it in $items) {
     }
 }
 $za.Dispose()
+} catch {
+    # 腾位回滚闸：异常先救输入法再抛（throw 路径遗留 .packN 孤儿的
+    # 事故根治；7:07 输入法消失事件的直接原因）
+    if ($sysBak -and (Test-Path "$env:SystemRoot\SystemIME\$sysBak")) {
+        if (Test-Path $sysIme) { Remove-Item $sysIme -Recurse -Force -EA SilentlyContinue }
+        Rename-Item "$env:SystemRoot\SystemIME\$sysBak" 'HuFu' -Force
+        Write-Host "  [回滚] 打包异常——SystemIME 已改回 HuFu（输入法保住）" -ForegroundColor Yellow
+    }
+    throw
+}
 # 恢复 SystemIME + 重挂语言列表 + 启 ctfmon（勿在压缩中途做——mmap 释放后才安全）
 if ($sysBak) {
     if (Test-Path $sysIme) { Remove-Item $sysIme -Recurse -Force -EA SilentlyContinue }
     Rename-Item "$env:SystemRoot\SystemIME\$sysBak" 'HuFu' -Force
+    if (-not (Test-Path "$sysIme\hufu_tsf.dll")) { throw '腾位恢复后 hufu_tsf.dll 仍缺席——SystemIME 状态异常，人工介入' }
 }
 # 【无 UAC 模式】未腾位（SystemIME 全程在位、ctfmon 由系统自动拉起）
 # ——DLL 加载链从未断过，无需重挂语言列表；腾位过才需要。
