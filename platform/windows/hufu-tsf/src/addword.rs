@@ -248,6 +248,18 @@ pub fn in_window_thread() -> bool {
         } == tid
 }
 
+/// 【T4 v3c】加词窗消息：无段提交两段式的回灌入口（起 30ms 定时器）。
+pub const AW_FLUSH_MSG: u32 = 0x8000 + 0x550;
+/// 【T4 v3b】冲刷定时器 id——CUAS 物化边界是宿主泵周期而非编辑会话。
+const AW_FLUSH_TIMER: usize = 0x551;
+
+/// 【T4 v3】活着的加词窗句柄（0=无）——通用查询（RichEdit 化后回灌
+/// PostMessage 已停用）。
+pub fn aw_hwnd() -> isize {
+    let guard = ADDWORD_HWND.lock().unwrap_or_else(|p| p.into_inner());
+    *guard
+}
+
 /// 【词框候选内嵌·标题栏 2026-09-12 八修】小窗线程的候选显示在小窗
 /// 加词窗单例登记（0=无）：open_common 临界区内读写，消息循环
 /// 结束清零。短锁使用，绝不跨消息循环持有。
@@ -412,10 +424,12 @@ fn open_common() {
         };
         let _ = RegisterClassW(&wc);
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        // 【T4 修 2026-10-07】标题必须 NUL 终止——旧代码裸 collect() 无
+        // 终止符，一直靠栈上恰逢 0 侥幸（插入探针挪了栈布局即现乱码尾）。
         let title: Vec<u16> = if is_weight_mode() {
-            "虎符 · 加权".encode_utf16().collect()
+            "虎符 · 加权".encode_utf16().chain([0]).collect()
         } else {
-            "虎符 · 加词".encode_utf16().collect()
+            "虎符 · 加词".encode_utf16().chain([0]).collect()
         };
         let h = outer_h(if is_weight_mode() { 200 } else { 300 });
         let hwnd = CreateWindowExW(
@@ -445,7 +459,9 @@ fn open_common() {
         unsafe extern "system" {
             fn GetCurrentThreadId() -> u32;
         }
-        ADDWORD_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
+        let my_tid = GetCurrentThreadId();
+        ADDWORD_TID.store(my_tid, std::sync::atomic::Ordering::Relaxed);
+        crate::tsf::trace(&format!("aw窗登记 tid={my_tid:x} hwnd={}", hwnd.0 as isize));
         drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
         // 【六修 2026-09-12】AttachThreadInput 抢前台——此前裸调
@@ -616,6 +632,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0,
                 );
                 set_item_font(lbl, true);
+                // 【T4 回滚 2026-10-07 1:08】RichEdit50W 真机闪框+只剩一
+                // 框——连夜回滚到已验证的 v3c（EDIT + CUAS 特判）。
                 let ed = create_child(
                     hwnd,
                     w!("EDIT"),
@@ -775,12 +793,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+        // 【T4 v3c】无段提交两段式的回灌：30ms 定时器跨泵周期后落 pending。
+        m if m == AW_FLUSH_MSG => {
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, AW_FLUSH_TIMER, 30, None)
+            };
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER => {
+            if wp.0 as usize == AW_FLUSH_TIMER {
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, AW_FLUSH_TIMER)
+                };
+                crate::tsf::aw_flush_pending();
+            }
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = (wp.0 as u32 & 0xFFFF) as i32;
             let notif = (wp.0 as u32 >> 16) as u32;
             // EN_UPDATE=0x400：文本每变一次立即刷（0x200 是 EN_KILLFOCUS，
             // 上版误用导致「光标移走才刷新」）
             if (id == ID_CODE || id == ID_POS || id == ID_WORD) && notif == ID_EN_UPDATE {
+                // 【T4 排查 2026-10-06】加词框顶屏重复——EN_UPDATE 时读三框
+                let rd = |i: i32| -> String {
+                    match GetDlgItem(hwnd, i) {
+                        Ok(h) => {
+                            let n = GetWindowTextLengthW(h);
+                            if n <= 0 {
+                                return String::new();
+                            }
+                            let mut b = vec![0u16; n as usize + 1];
+                            let g = GetWindowTextW(h, &mut b);
+                            String::from_utf16_lossy(&b[..g.max(0) as usize])
+                        }
+                        Err(_) => String::new(),
+                    }
+                };
+                crate::tsf::trace(&format!(
+                    "awEU id={id} word={:?} code={:?} pos={:?}",
+                    rd(ID_WORD),
+                    rd(ID_CODE),
+                    rd(ID_POS)
+                ));
                 unsafe { refresh_preview(hwnd) };
             }
             let want = (id == ID_OK || id == ID_CANCEL || id == 1 || id == 2) && notif == 0;
@@ -793,6 +848,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
+            // 【T4 v3】窗毁清 pending（防跨窗残留）
+            let _ = crate::tsf::aw_clear_pending();
             PostQuitMessage(0);
             LRESULT(0)
         }

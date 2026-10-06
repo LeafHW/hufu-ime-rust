@@ -5929,7 +5929,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 【过程态防御】神经重排不得把 partial（未消耗全部 raw 的前缀态）
+    /// 【T4 加词框重复上屏·真码表复现 2026-10-06】用户稳定复现：加词
+    /// 词框（保留 IME）里打 jafm（今天）不空格，继续打第 5 个编码 →
+    /// 「今天」上屏 2 次；第 6/7 键各再上屏 1 次。引擎层逐键打印
+    /// commit，判引擎重发还是 DLL 重插。
+    #[test]
+    fn real_schema_addword_push_dup() {
+        let src = std::env::var("HUFU_TEST_SCHEMA").unwrap_or_default();
+        if src.is_empty() {
+            eprintln!("（跳过：未设 HUFU_TEST_SCHEMA）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hufu-real-pushdup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for e in std::fs::read_dir(&src).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".txt") {
+                let _ = std::fs::copy(e.path(), dir.join(&name));
+            }
+        }
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        let mut s = Session::new(true);
+        for c in "jafm".chars() {
+            let o = eng.process_key(&mut s, key(c));
+            eprintln!("键[{c}] raw={} commit={:?} cands={:?}",
+                s.raw,
+                o.commit,
+                eng.state(&s).candidates.iter().take(4).map(|c| c.text.clone()).collect::<Vec<_>>());
+        }
+        for c in ['x', 'y', 'z', 'q'] {
+            let o = eng.process_key(&mut s, key(c));
+            let st = eng.state(&s);
+            eprintln!("续键[{c}] raw={} committed_text={:?} commit={:?} preedit={:?} cands={:?}",
+                s.raw,
+                s.committed_text,
+                o.commit,
+                st.preedit,
+                st.candidates.iter().take(4).map(|c| c.text.clone()).collect::<Vec<_>>());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// 候选提到完整态之前——真实场景：qlagy 时 Qwen 把 4 键「老鬼」
     /// 提到 5 键「老痒」前霸首（2026-09-04 用户实测）。rerank_request
     /// 必须过滤 partial；缺席于重排序的 partial 在 apply 时自然靠后。
