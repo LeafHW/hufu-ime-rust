@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::PCWSTR;
 
@@ -47,11 +47,26 @@ static OVERLAYS: Mutex<Vec<OverlayEntry>> = Mutex::new(Vec::new());
 pub(crate) const OVERLAY_TIMER_ID: usize = 0x4F56; // "OV"
 /// 延时消失钟 id（hide_delay_ms>0 时挂短钟，到点收窗）
 pub(crate) const OVERLAY_HIDE_TIMER_ID: usize = 0x4F48; // "OH"
+/// 【补拍钟 2026-11】首帧解码未就绪时的 30ms 自查钟：就绪即上屏——
+/// 旧实现「首帧未就绪直接 return、等下一次 sync」=挂件永远慢一拍
+///（导入后要点一两下才出 / 一搜就走的宿主永远赶不上的病根）。
+pub(crate) const OVERLAY_RESYNC_TIMER_ID: usize = 0x4F52; // "OR"
 
 static OVERLAY_SKIN_HASH: AtomicU64 = AtomicU64::new(0);
 
+/// 【预解码缓存 2026-11】皮肤到位即开解（不等首键 sync）：
+/// (img_key, built_for) → 解码态。新进程首段/导入后的首段即显。
+static PREWARM: Mutex<Option<(u64, u32, Arc<DecodeState>)>> = Mutex::new(None);
+
+/// 系统主屏 DPI（预解码目标高估算；真窗口 DPI 不同则 sync 按
+/// built_for 失配重解——多数进程同屏即命中）。
+fn sys_dpi_scale() -> f32 {
+    unsafe { GetDpiForSystem().max(96) as f32 / 96.0 }
+}
+
 /// 皮肤到位:仅当 overlay 子树内容变化才推进代次——皮肤的 2.5s 例行重拉
 /// 不再触发整段 GIF 重解码(首键出图慢+无谓 CPU 的根因)。
+/// 【预解码 2026-11】代次推进时顺手预解码：不等首键 sync 才起跑。
 pub fn note_skin(skin: &Value) {
     let s = skin
         .pointer("/skin/overlay")
@@ -62,6 +77,19 @@ pub fn note_skin(skin: &Value) {
     let prev = OVERLAY_SKIN_HASH.swap(h, Ordering::AcqRel);
     if prev != h {
         OVERLAY_GEN.fetch_add(1, Ordering::Release);
+        if let Some(cfg) = parse_cfg(skin) {
+            let target_h = cfg.base_height * sys_dpi_scale();
+            let key = (cfg.img_key, target_h.round() as u32);
+            let mut pw = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
+            // 同键已在（解码中/已就绪/已失败）不重启——失败随下代次重试
+            let need = !pw
+                .as_ref()
+                .is_some_and(|(k, b, _)| *k == key.0 && *b == key.1);
+            if need {
+                let dec = start_decode(cfg, target_h);
+                *pw = Some((key.0, key.1, dec));
+            }
+        }
     }
 }
 
@@ -510,6 +538,8 @@ struct OverlayEntry {
     last_rect: Option<(i32, i32, i32, i32)>,
     /// 延时消失截止时刻（None=未在延时收窗期）
     hide_at: Option<std::time::Instant>,
+    /// 补拍钟封顶时刻（None=未在补拍期；解码失败 3s 后停臂）
+    retry_until: Option<std::time::Instant>,
 }
 
 impl OverlayWin {
@@ -593,6 +623,7 @@ impl OverlayWin {
         if self.hwnd != 0 {
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_TIMER_ID);
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
+            let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
             let _ = DestroyWindow(HWND(self.hwnd as *mut _));
             self.hwnd = 0;
         }
@@ -753,12 +784,14 @@ unsafe extern "system" fn overlay_wndproc(
             }
             let _ = KillTimer(hwnd, OVERLAY_TIMER_ID);
             let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
+            let _ = KillTimer(hwnd, OVERLAY_RESYNC_TIMER_ID);
             let _ = ShowWindow(hwnd, SW_HIDE);
             entry.shown = false;
             entry.drawn = None;
             entry.timer_armed = false;
             entry.frame_idx = 0;
             entry.hide_at = None;
+            entry.retry_until = None;
             // 隐藏=播放钟废弃:对表到现在,防下段显现带陈旧 play_start
             // (欠账帧持续补放=每键都「到点」走帧,播放越打越快)
             entry.play_start = std::time::Instant::now();
@@ -797,10 +830,12 @@ unsafe extern "system" fn overlay_wndproc(
                     let h = HWND(ov.hwnd as *mut _);
                     let _ = KillTimer(h, OVERLAY_TIMER_ID);
                     let _ = KillTimer(h, OVERLAY_HIDE_TIMER_ID);
+                    let _ = KillTimer(h, OVERLAY_RESYNC_TIMER_ID);
                     let _ = ShowWindow(h, SW_HIDE);
                 }
                 entry.shown = false;
                 entry.timer_armed = false;
+                entry.retry_until = None;
                 entry.frame_idx = 0;
                 entry.play_start = std::time::Instant::now();
             }
@@ -810,6 +845,12 @@ unsafe extern "system" fn overlay_wndproc(
     if msg == 0x0113 && wparam.0 as usize == OVERLAY_TIMER_ID {
         // WM_TIMER:动图下一帧
         advance_frame(hwnd);
+        return LRESULT(0);
+    }
+    if msg == 0x0113 && wparam.0 as usize == OVERLAY_RESYNC_TIMER_ID {
+        // 【补拍钟 2026-11】首帧解码就绪自查：重跑 sync 尾段（含可见
+        // 性门/布局/上屏；仍未就绪会自行重臂，候选窗已藏则被门收掉）。
+        resync_by_ov_hwnd(hwnd);
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -905,28 +946,64 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
                 shown: false,
                 last_rect: None,
                 hide_at: None,
+                retry_until: None,
             });
             list.len() - 1
         }
     };
-    let entry = &mut list[pos];
-    if entry.gen != gen {
-        entry.gen = gen;
-        entry.cfg = parse_cfg(skin);
-        entry.decoded = None;
-        entry.drawn = None;
-        entry.disabled = false;
+    {
+        let entry = &mut list[pos];
+        if entry.gen != gen {
+            entry.gen = gen;
+            entry.cfg = parse_cfg(skin);
+            entry.decoded = None;
+            entry.drawn = None;
+            entry.disabled = false;
+            entry.retry_until = None;
+        }
     }
+    sync_tail_locked(cand, &mut list, pos);
+}
+
+/// 补拍钟处理器入口：按挂件 hwnd 反查条目重跑 sync 尾段（含可见性
+/// 门/布局/上屏/z 序；未就绪会自行重臂补拍钟）。
+unsafe fn resync_by_ov_hwnd(hwnd: HWND) {
+    let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pos) = list
+        .iter()
+        .position(|e| e.ov.as_ref().is_some_and(|o| o.hwnd == hwnd.0 as isize))
+    else {
+        let _ = KillTimer(hwnd, OVERLAY_RESYNC_TIMER_ID);
+        return;
+    };
+    let _ = KillTimer(hwnd, OVERLAY_RESYNC_TIMER_ID);
+    let cand = list[pos].cand;
+    if cand != 0 {
+        let ch = HWND(cand as *mut _);
+        if IsWindow(ch).as_bool() {
+            sync_tail_locked(ch, &mut list, pos);
+        }
+    }
+}
+
+/// sync 尾段（持有 OVERLAYS 锁调用）：候选窗可见性门 → 代次配置应用
+/// → 建窗 → 解码（预解码缓存优先）→ 布局上屏 → 播放节拍 → z 序。
+/// 从 sync_for 与补拍钟两条路进入，单一实现防口径漂移。
+unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize) {
+    let cand_key = cand.0 as isize;
+    let entry = &mut list[pos];
     // 候选窗不可见 → 兄弟窗必藏(自愈所有漏网隐藏路径);
     // 延时消失期(hide_at 有值)例外:挂件原地呼吸,由 hide 钟到点收窗
     if !IsWindowVisible(cand).as_bool() {
         if let Some(ov) = entry.ov.as_ref() {
             if entry.hide_at.is_none() {
                 let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
+                let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
                 let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
                 entry.shown = false;
                 entry.timer_armed = false;
                 entry.hide_at = None;
+                entry.retry_until = None;
                 // 隐藏期残留 play_start 是时钟欠账源(下段显现后每拍都
                 // 「到点」=播放加速)——隐藏即对表到现在
                 entry.play_start = std::time::Instant::now();
@@ -950,10 +1027,12 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
     let Some(cfg) = entry.cfg.clone() else {
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
+            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
             let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
         }
         entry.shown = false;
         entry.timer_armed = false;
+        entry.retry_until = None;
         return;
     };
     if entry.disabled {
@@ -978,7 +1057,21 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         Some(d) => d.built_for.load(Ordering::Acquire) != target_h.round() as u32,
     };
     if need_decode {
-        entry.decoded = Some(start_decode(cfg.clone(), target_h));
+        // 【预解码缓存 2026-11】皮肤到位时已起跑的解码直接采用（首段
+        // 即显——不等首键 sync 才开解）；未命中/失配才现场开解。
+        let prewarmed = {
+            let pw = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
+            pw.as_ref().and_then(|(k, b, d)| {
+                (d.ready_first.load(Ordering::Acquire)
+                    && *k == cfg.img_key
+                    && *b == target_h.round() as u32)
+                    .then(|| d.clone())
+            })
+        };
+        entry.decoded = Some(match prewarmed {
+            Some(d) => d,
+            None => start_decode(cfg.clone(), target_h),
+        });
         entry.drawn = None;
         entry.frame_idx = 0;
         entry.play_start = std::time::Instant::now();
@@ -989,7 +1082,22 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         .as_ref()
         .filter(|d| d.ready_first.load(Ordering::Acquire))
     else {
-        return; // 首帧未就绪:不显窗(避免空窗闪)
+        // 【补拍钟 2026-11】首帧未就绪不再干等下一次 sync（下一段/下
+        // 一键才有机会=「导入后要点一两下才出」「一搜就走赶不上」的
+        // 病根）：30ms 短钟自查，就绪即上屏；3s 封顶防解码失败空转。
+        if let Some(ov) = entry.ov.as_ref() {
+            let oh = HWND(ov.hwnd as *mut _);
+            let now = std::time::Instant::now();
+            let until = *entry
+                .retry_until
+                .get_or_insert(now + std::time::Duration::from_secs(3));
+            if now < until {
+                let _ = SetTimer(oh, OVERLAY_RESYNC_TIMER_ID, 30, None);
+            } else {
+                let _ = KillTimer(oh, OVERLAY_RESYNC_TIMER_ID);
+            }
+        }
+        return;
     };
     let Some(ov) = entry.ov.as_mut() else { return };
     let ov_h = HWND(ov.hwnd as *mut _);
@@ -1049,6 +1157,9 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         entry.last_rect = Some((x, y, cw, ch));
         entry.shown = true;
     }
+    // 上屏成功：补拍钟退役（未臂时 KillTimer 无害）
+    let _ = KillTimer(ov_h, OVERLAY_RESYNC_TIMER_ID);
+    entry.retry_until = None;
     // 动图节拍:时间基准推进,每拍至多 1 帧(宿主线程卡顿后逐帧补放,
     // 绝不跳帧);WM_TIMER 与 sync 双路驱动同一时钟
     tick_playback(
@@ -1192,10 +1303,12 @@ pub unsafe fn hide_for(cand: HWND) {
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
+            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
             let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
         }
         entry.shown = false;
         entry.timer_armed = false;
+        entry.retry_until = None;
         entry.frame_idx = 0;
         entry.hide_at = None;
         // 与广播/延时收窗臂同款:隐藏即对表 play_start,防下段显现
