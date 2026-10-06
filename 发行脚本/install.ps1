@@ -385,10 +385,39 @@ if (-not $NoHKLM) {
 # 新窗口）默认用列表第一项。追加到尾部会让这些宿主落回微软拼音，
 # 用户体验即「开始菜单/UWP 打不了中文」。插入第 0 位后新宿主默认
 # 虎符；已开应用/用户手动切过的选择不受影响（Win+空格随时可切回）。
+#
+# 【吃掉其他输入法·二阶根治 2026-10-06】语言列表是「读改写」：
+# Get-WinUserLanguageList 若瞬时少报（实测：新登录会话 ctfmon 尚未
+# 运行时，第三方 TIP 不被枚举），随后的 Set-WinUserLanguageList -Force
+# 会把没报上来的输入法从列表永久抹掉——10/02 的槽位修复只保住装配
+# 表，这条路没设防（用户实锤：18:00 重装后搜狗/多多/虎娘/虎爪 4 个
+# 输入法从列表消失，手动加回才恢复）。三重防线：
+#   ① ctfmon 未运行时先拉起再读列表（枚举需要 CTF 服务在线；此刻
+#      虎符注册已全部写完，ctfmon 冷启动即见到完整结构，兼当刷新）；
+#   ② 装配表（AssemblyItem 槽位）= 纯注册表事实源，先做快照——
+#      枚举说谎时的地面真值；
+#   ③ Set 后回读校验：快照里有、列表里没有的，一律并回重写一次。
 $tipStr = "0804:$CLSID$PROFILE"
+$ctfStartedEarly = $false
+if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) {
+    Start-Process ctfmon -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $ctfStartedEarly = $true
+}
+$asmChk = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
+$assemblyTips = @()
+if (Test-Path $asmChk) {
+    foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
+            $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
+        }
+    }
+}
 $list = Get-WinUserLanguageList
 $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 if (-not $zh) { $zh = $list[0] }
+$tipsBefore = @($zh.InputMethodTips | Where-Object { $_ -ne $tipStr })
 if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
@@ -397,6 +426,31 @@ if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Remove($tipStr) | Out-Null
     $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
+}
+# ③ 回读校验：列表若丢了别人（枚举少报被固化），用快照并回重写
+$list2 = Get-WinUserLanguageList
+$zh2 = $list2 | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+if (-not $zh2) { $zh2 = $list2[0] }
+$known = @((@($tipsBefore) + @($assemblyTips)) | Select-Object -Unique)
+$dropped = @($known | Where-Object { $zh2.InputMethodTips -notcontains $_ })
+if ($dropped.Count -gt 0) {
+    Write-Host "⚠ 语言列表写入丢失 $($dropped.Count) 个既有输入法（枚举少报），已检出并并回" -ForegroundColor Yellow
+    foreach ($d in $dropped) {
+        if ($zh2.InputMethodTips -notcontains $d) { $zh2.InputMethodTips.Add($d) }
+    }
+    Set-WinUserLanguageList $list2 -Force -WarningAction SilentlyContinue
+    $list3 = Get-WinUserLanguageList
+    $zh3 = $list3 | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+    if (-not $zh3) { $zh3 = $list3[0] }
+    $still = @($known | Where-Object { $zh3.InputMethodTips -notcontains $_ })
+    if ($still.Count -gt 0) {
+        Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回：" -ForegroundColor Red
+        $still | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Host "OK 已并回 $($dropped.Count) 个被丢输入法（防线③生效）"
+    }
+} else {
+    Write-Host "OK 语言列表已写入（既有 $($tipsBefore.Count) 个输入法全数在场校验通过）"
 }
 # 【吃掉其他输入法修复 2026-10-02】装配表（AssemblyItem）槽位原先写死
 # 00000003：装机 ≥4 个键盘类输入法时（如微软拼音+多多+虎爪+…），
@@ -468,7 +522,12 @@ Start-Sleep -Seconds 2
 # Win+空格列表，无需动 shell 组件。
 # 【2026-09-11 虎爪保护二阶】ctfmon 重启本身仍会触发同款校验——升级
 # 安装（$tipAlready）完全跳过刷新；仅首次安装执行。
-if (-not $tipAlready) {
+# 【吃掉输入法·二阶根治 2026-10-06】第 4 段防线①已在本安装内冷启动
+# 过 ctfmon（新登录会话场景）——刷新目的已达成，不再重复杀启（每次
+# 重启都是一次 msctf 一致性校验风险）。
+if ($ctfStartedEarly) {
+    Write-Host 'OK ctfmon 已在本安装内冷启动（语言列表读取前），跳过刷新'
+} elseif (-not $tipAlready) {
     Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
     Start-Process ctfmon -ErrorAction SilentlyContinue

@@ -36,12 +36,43 @@ Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
 # 1) 语言列表移除
+# 【吃掉其他输入法·二阶根治 2026-10-06】本步骤跑在步骤 0 杀掉 ctfmon
+# 之后——Get-WinUserLanguageList 在 CTF 服务缺位时对第三方 TIP 会
+# 少报，随后的 Set 会把别人一起抹掉（实锤：卸载+重装周期吃掉搜狗/
+# 多多/虎娘/虎爪）。卸载语义保持 ctfmon 关闭（防档案重建），不加
+# 「先拉起」防线；改用装配表快照做地面真值 + Set 后回读并回：
 $tipStr = "0804:$CLSID$PROFILE"
+$asmChk = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}'
+$assemblyTips = @()
+if (Test-Path $asmChk) {
+    foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
+            $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
+        }
+    }
+}
 $list = Get-WinUserLanguageList
 foreach ($l in $list) {
     if ($l.InputMethodTips -contains $tipStr) {
+        $keep = @($l.InputMethodTips | Where-Object { $_ -ne $tipStr })
         $l.InputMethodTips.Remove($tipStr) | Out-Null
         Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
+        # 回读校验：列表若丢了别人（枚举少报被固化），用快照并回重写
+        $list2 = Get-WinUserLanguageList
+        $l2 = $list2 | Where-Object { $_.LanguageTag -eq $l.LanguageTag } | Select-Object -First 1
+        if ($l2) {
+            $known = @((@($keep) + @($assemblyTips)) | Select-Object -Unique)
+            $dropped = @($known | Where-Object { $l2.InputMethodTips -notcontains $_ })
+            if ($dropped.Count -gt 0) {
+                Write-Host "⚠ 卸载写入丢失 $($dropped.Count) 个既有输入法（枚举少报），已检出并并回" -ForegroundColor Yellow
+                foreach ($d in $dropped) {
+                    if ($l2.InputMethodTips -notcontains $d) { $l2.InputMethodTips.Add($d) }
+                }
+                Set-WinUserLanguageList $list2 -Force -WarningAction SilentlyContinue
+                Write-Host "OK 已并回 $($dropped.Count) 个被丢输入法（卸载防丢生效）"
+            }
+        }
         break
     }
 }
