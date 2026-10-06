@@ -156,19 +156,23 @@ fn ensure_server() -> bool {
     // 【退避重试 2026-09-11】旧实现 AtomicBool 一次性闸门：首次拉起
     // 失败（安装目录未就绪/杀毒拦截）后本进程永远不再尝试——用户
     // 表现为「打字失效直到重启宿主」。改时间戳退避：失败 30s 后放行
-    // 重试；成功后置 u64::MAX（进程内不再拉）。
+    // 重试。
+    // 【成功≠存活 2026-10-06】成功后钉死 u64::MAX 是今晚「打不了字」
+    // 8 分钟事故的根因：CreateProcessW 成功只代表进程创建——多宿主
+    // 并发拉起时单实例败者会秒退（互斥体让路，设计如此），胜者也
+    // 可能随后被杀（打包腾位/任务管理器/崩溃）。DLL 一旦记过「我拉
+    // 起过」就永久封口，之后 pipe=fail 永不再拉——实锤链：杀 server
+    // →多宿主并发拉起→胜者存活→打包再杀胜者→全员 NEXT_TRY=MAX→
+    // 用户打字 pipe=fail perr=2 无人复活。改：成功也只给 5s 短冷却
+    //（最坏每 5s 一次空拉，单实例互斥兜底零副作用），失败维持 30s。
     static NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
-    const OK: u64 = u64::MAX;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let cur = NEXT_TRY_MS.load(Ordering::SeqCst);
-    if cur == OK {
-        return false;
-    }
     if now < cur {
-        return false; // 退避窗口内
+        return false; // 冷却窗口内（成功 5s / 失败 30s）
     }
     if NEXT_TRY_MS
         .compare_exchange(cur, now + 30_000, Ordering::SeqCst, Ordering::SeqCst)
@@ -245,8 +249,9 @@ fn ensure_server() -> bool {
                 CloseHandle(blk.pi[0]);
                 CloseHandle(blk.pi[1]);
             }
-            NEXT_TRY_MS.store(OK, Ordering::SeqCst);
-            crate::tsf::trace("ipc: 已自愈拉起 hufu-server");
+            // 成功只给短冷却（见函数头注释：创建成功≠存活）
+            NEXT_TRY_MS.store(now + 5_000, Ordering::SeqCst);
+            crate::tsf::trace("ipc: 已自愈拉起 hufu-server（5s 后可再试）");
             return true;
         }
     }
