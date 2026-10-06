@@ -374,9 +374,11 @@ fn main() {
 
     // 【码表实时生效 2026-11】方案目录文件变化自动重载（语言栏
     // 「重载码表」菜单已删——改完码表不用再手点，保存即生效）。每
-    // 2s 指纹轮询（文件名+尺寸+mtime；只看 Schema::load 消费的扩展
-    // 名 txt/注释/拆分/dict.yaml，tmp/bak/swp 噪声不进指纹），两轮
-    // 稳定才触发（编辑器分步写/大码表拷贝中途不触发，防半截解析）。
+    // 500ms 指纹轮询（文件名+尺寸+mtime；只看 Schema::load 消费的
+    // 扩展名 txt/注释/拆分/dict.yaml，tmp/bak/swp 噪声不进指纹），
+    // 两轮稳定才触发（编辑器分步写/大码表拷贝中途尺寸持续变化=不
+    // 稳定不触发；极端停顿误载的残表也会在写入完成后下一轮签名再
+    // 变化自愈重载）。端到端延迟 ≈1~1.5s。
     // 分档重载：
     // ①仅 用户调整/用户词 变化 → reload_user_data 轻路径：不清组段
     //   （打字无感）、不重建整句。引擎自身的调整落盘（置顶/删词等）
@@ -445,7 +447,10 @@ fn main() {
                 let mut armed_since: Option<std::time::Instant> = None;
                 let mut first_round = true;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // 【500ms 轮询】方案目录一轮 read_dir+几次 stat 在
+                    // 微秒级——开销可忽略（每秒 2 轮×~6 文件仍远低于
+                    // 千分之一核）。两轮稳定=改动到生效 ≈1~1.5s。
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                     // 当前方案目录（切方案后跟着走；短锁只取两个字符串）
                     let (dir, current) = {
                         let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
