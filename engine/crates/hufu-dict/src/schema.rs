@@ -405,8 +405,9 @@ impl Schema {
             // 【时序回放去重】{添加}(pN) 词已由 adjust.apply 就位——
             // user_dict 里同词的行不再重复并入（按 text 查重，码表
             // 域同码下 text 唯一是既定不变量）。无 pN 的 {添加} 词行
-            // 同样在 adjust.apply 追加过（末尾），这里也不再并入——
-            // 会话调频 learn 才走到下方插入（v1：置顶块后、系统词前）。
+            // 同样在 adjust.apply 落位（置顶块后=留空首选，2026-10-06
+            // 回归修复），这里也不再并入——会话调频 learn 才走到下方
+            // 插入（v1：置顶块后、系统词前）。
             if self.adjust.added(&ue.code, &ue.text) {
                 continue;
             }
@@ -547,15 +548,15 @@ mod tests {
         // 词典不含内嵌死行（1 行 ×3 真词；{} 码查不到任何东西）
         assert_eq!(s.dict.len(), 3, "内嵌调整行不得进词典");
         assert!(s.dict.lookup("{置顶}a").is_empty(), "不得残留花括号死码");
-        // 内嵌回放：氨置顶、那个删除、哎呦添加
+        // 内嵌回放：氨置顶、那个删除、哎呦添加（留空=首选：置顶块后）
         let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
-        assert_eq!(texts, ["氨".to_string(), "来".to_string(), "哎呦".to_string()]);
+        assert_eq!(texts, ["氨".to_string(), "哎呦".to_string(), "来".to_string()]);
 
         // 用户文件覆盖内嵌：用户删掉内嵌置顶的「氨」
         write(&tmp, "用户调整.txt", "{删除}a\t氨\n");
         let s2 = Schema::load(&tmp).unwrap();
         let texts2: Vec<String> = s2.candidates("a").iter().map(|e| e.text.clone()).collect();
-        assert_eq!(texts2, ["来".to_string(), "哎呦".to_string()]);
+        assert_eq!(texts2, ["哎呦".to_string(), "来".to_string()]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -597,6 +598,60 @@ mod tests {
             "选重位插入: {texts:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【留空=首选 2026-10-06 回归修复】/jc 第三框留空（{添加} 无 pN）
+    // 恢复 v1 语义：无置顶词 → 首选；有置顶词 → 紧随置顶块；码表同词
+    // → 顶替到该位。时序回放重构曾误作「末尾追加」＝用户实测
+    // 「选重位不输入默认最后」回归（与加词窗文案「留空=首选」相悖）。
+    #[test]
+    fn user_word_add_no_pn_first_choice() {
+        // 场景 1：无置顶词 → 新词插到最前（首选）
+        let tmp = std::env::temp_dir().join(format!("hufu-test-nopn1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(&tmp, "码表.txt", "a 甲 乙 丙\n");
+        write(&tmp, "用户调整.txt", "{添加}a\t丁\n");
+        let s = Schema::load(&tmp).unwrap();
+        let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts,
+            ["丁".to_string(), "甲".to_string(), "乙".to_string(), "丙".to_string()],
+            "留空加词=首选: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 场景 2：置顶词在场 → 插到置顶块之后（置顶语义更强）。
+        // 注：用户调整.txt 也参加主码表「最大者胜选」（历史行为），
+        // 码表.txt 必须明显大于 用户调整.txt 才能当主表。
+        let tmp2 = std::env::temp_dir().join(format!("hufu-test-nopn2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp2);
+        std::fs::create_dir_all(&tmp2).unwrap();
+        write(&tmp2, "码表.txt", "a 甲 乙 丙\nb 不 不必 不然\nx 下 下午\nh 好 很好 好吧\njd 就是 就算\n");
+        write(&tmp2, "用户调整.txt", "{置顶}a\t乙\n{添加}a\t丁\n");
+        let s2 = Schema::load(&tmp2).unwrap();
+        let texts2: Vec<String> = s2.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts2,
+            ["乙".to_string(), "丁".to_string(), "甲".to_string(), "丙".to_string()],
+            "留空加词让位置顶块: {texts2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp2);
+
+        // 场景 3：码表已有同词 → 顶替到首选位（提频，非「不动」）
+        let tmp3 = std::env::temp_dir().join(format!("hufu-test-nopn3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp3);
+        std::fs::create_dir_all(&tmp3).unwrap();
+        write(&tmp3, "码表.txt", "a 甲 乙 丙\n");
+        write(&tmp3, "用户调整.txt", "{添加}a\t乙\n");
+        let s3 = Schema::load(&tmp3).unwrap();
+        let texts3: Vec<String> = s3.candidates("a").iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts3,
+            ["乙".to_string(), "甲".to_string(), "丙".to_string()],
+            "留空加词顶替码表同词到首选: {texts3:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp3);
     }
 
     // 【选重位顶替码表同词 2026-09-10】码表行里已有同 text 词（空格

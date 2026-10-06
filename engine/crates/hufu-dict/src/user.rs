@@ -280,7 +280,8 @@ impl UserAdjust {
     /// 日志顺序在演化的列表上执行：
     /// - {置顶}：该词（码表内则原条目标 pinned，自造则新条目）移到最前；
     /// - {添加}pN：以**该时刻列表**度量插第 N 位（超出→末尾）；无 pN
-    ///   → 已在列表则只提权重语义（不动位），否则末尾追加；
+    ///   → **首选**（置顶块后、系统词前——v1 语义；2026-10-06 回归修复，
+    ///   重构曾误作末尾追加）；
     /// - {删除}：移除该词——**其后所有词（含先前插入的 pN 用户词）
     ///   统一前移一位**（用户实测：删 2 选后 p5 词变 4 选）；
     /// - {加权}：不动位（权重由 user_dict.weights 消费）。
@@ -305,8 +306,8 @@ impl UserAdjust {
                     }
                 }
                 AdjustOp::Add => {
-                    if let Some(hit) = out.iter().position(|x| x.text == e.word) {
-                        if let Some(n) = e.pos {
+                    if let Some(n) = e.pos {
+                        if let Some(hit) = out.iter().position(|x| x.text == e.word) {
                             // 显式选重位重排：移到第 N 位（1 基；超出→
                             // 末尾）。置顶语义更强，置顶词不动。
                             let entry = out.remove(hit);
@@ -316,22 +317,47 @@ impl UserAdjust {
                             } else {
                                 out.insert(hit.min(out.len()), entry);
                             }
+                        } else {
+                            let idx = (n - 1).min(out.len());
+                            out.insert(
+                                idx,
+                                DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX - 1),
+                            );
                         }
-                        // 无 pN 的重复添加：已在列表，不动
-                    } else if let Some(n) = e.pos {
-                        let idx = (n - 1).min(out.len());
-                        out.insert(
-                            idx,
-                            DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX - 1),
-                        );
                     } else {
-                        // 无 pN 加词：追加到末尾（v1 语义；schema 层词行
-                        // 去重后不再二次并入）
-                        out.push(DictEntry::new(
-                            e.code.clone(),
-                            e.word.clone(),
-                            u32::MAX - 1,
-                        ));
+                        // 【留空=首选 2026-10-06 回归修复】无 pN 的 {添加}
+                        //（/jc 第三框留空）恢复 v1 语义：插到置顶块之后、
+                        // 系统词之前（无置顶词时即首选）。时序回放重构误改
+                        // 成「末尾追加」＝加词窗「留空=首选」文案的反面
+                        //（用户实测「默认最后」回归）。已在列表（含码表
+                        // 同词）：移出重插到该位（顶替/提频）；置顶同词
+                        // 不动（pinned 语义更强，且保持同码 text 唯一）。
+                        // 不置 pinned——后续显式 pN / Ctrl+数字仍可再排。
+                        match out.iter().position(|x| x.text == e.word) {
+                            Some(hit) => {
+                                if !out[hit].pinned {
+                                    out.remove(hit);
+                                    let pos =
+                                        out.iter().position(|x| !x.pinned).unwrap_or(out.len());
+                                    out.insert(
+                                        pos,
+                                        DictEntry::new(
+                                            e.code.clone(),
+                                            e.word.clone(),
+                                            u32::MAX - 1,
+                                        ),
+                                    );
+                                }
+                            }
+                            None => {
+                                let pos =
+                                    out.iter().position(|x| !x.pinned).unwrap_or(out.len());
+                                out.insert(
+                                    pos,
+                                    DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX - 1),
+                                );
+                            }
+                        }
                     }
                 }
                 AdjustOp::Remove => {
@@ -499,7 +525,9 @@ mod tests {
         adj.pin("a", "叉");
         let out = adj.apply("a", &base());
         let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, ["叉", "来", "氨", "哎呦"]);
+        // 【留空=首选 2026-10-06】无 pN {添加} 插到置顶块之后、系统词
+        // 之前（原断言「末尾追加」=回归期行为，已废止）。
+        assert_eq!(texts, ["叉", "哎呦", "来", "氨"]);
     }
 
     // 【时序回放 2026-11 用户拍板】用户实测 ae 序列：{添加}p5 → {置顶}
@@ -603,7 +631,8 @@ mod tests {
         let adj = UserAdjust::parse(&lines);
         let out = adj.apply("a", &base());
         let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, ["叉", "来", "哎呦"]); // 氨被删、哎呦添加
+        // 氨被删；哎呦留空添加=置顶块（叉）后首选（2026-10-06 回归修复）
+        assert_eq!(texts, ["叉", "哎呦", "来"]);
         let out2 = adj.apply("ab", &[]);
         assert_eq!(out2[0].text, "你好");
         let out3 = adj.apply("ae", &[]);
