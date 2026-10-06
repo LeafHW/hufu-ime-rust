@@ -128,6 +128,11 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
         append("加词", 5, false);
         append("删词", 6, false);
+        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+        // 【2026-10-06 用户拍板】解锁固定位从「中键」收进菜单最下
+        //（中键不优雅）；未固定时灰化展示（可发现性）。
+        let pinned_now = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        append("解锁固定位", 7, !pinned_now);
         // 3) owner=自建 0×0 顶层 TOOLWINDOW（langbar QQ 实证路线：
         // 子窗 owner 收不了前台，菜单秒弹秒关）
         let cls: Vec<u16> = "HUFU_C2_MENU\0".encode_utf16().collect();
@@ -180,6 +185,19 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         }
         crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{text}）"));
         // 4) 动作
+        if sel_id == 7 {
+            // 【2026-10-06 用户拍板】菜单尾项=解锁固定位（原中键方案
+            // 退役）：清固定位与拖拽钉住残留——候选窗回光标处跟随。
+            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
+            if pinned.is_some() {
+                *pinned = None;
+                drop(pinned);
+                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                crate::tsf::diag_note("cw2 pin 菜单解除（回跟随光标）");
+            }
+            return;
+        }
         if sel_id == 5 {
             crate::addword::open_prefilled(&text, &raw, &n.to_string());
             return;
@@ -490,18 +508,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             return LRESULT(0);
         }
         0x207 => {
-            // 【中键=解锁 2026-10-06】原右键解锁固定位移到中键：清除固
-            // 定位与拖拽钉住残留——候选窗回到光标处恢复跟随。未固定时
-            // 无操作。
-            crate::tsf::trace("cw2: mdown（中键解锁）");
-            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
-            if pinned.is_some() {
-                *pinned = None;
-                drop(pinned);
-                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                crate::tsf::diag_note("cw2 pin 中键解除（回跟随光标）");
-            }
+            // 【2026-10-06 用户拍板】中键解锁退役（不优雅）——解锁收进
+            // 右键菜单最下项；中键按下恢复吞掉（防穿透误触宿主）。
             return LRESULT(0);
         }
         0x20A => {
@@ -608,7 +616,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             return LRESULT(0);
         }
-        0x205 | 0x208 => return LRESULT(0), // 右/中键抬起吞（0x207 中键按下=解锁已前置处理）
+        0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键按下抬起全吞（解锁在右键菜单内）
         // 【三十六修·死块删除】WM_NCHITTEST（0x84）已在 wndproc 头部
         //（HTCLIENT 强制整窗命中，QQ 按钮消息实测教训）无条件 return，
         // 此臂自那时起不可达——其「余量区 HTTRANSPARENT 穿透」设计与
