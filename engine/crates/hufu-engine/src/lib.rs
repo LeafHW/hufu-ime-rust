@@ -3406,7 +3406,7 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
-    /// 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
+    /// 按 code+word 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
     pub fn op_hide_candidate(&mut self, session: &mut Session, idx: usize) -> KeyOutcome {
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
@@ -3428,6 +3428,31 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
+    /// 【右键调频菜单 2026-10-06】把当前页第 idx 候选定到第 pos 选
+    ///（{添加}code\tword\tpN 语义：向前移/向后移/移到最后）。
+    /// pos 以该码**完整候选列表** 1 基度量（超出→末尾，apply 口径）；
+    /// 覆盖该词既有置顶/删除行（同码同词只留最新操作）。与
+    /// op_pin_candidate 同框架：源白名单 + 延迟重载 + 组段保留。
+    pub fn op_place_candidate(&mut self, session: &mut Session, idx: usize, pos: usize) -> KeyOutcome {
+        let page_size = self.config.candidates.page_size.max(1);
+        let start = session.page * page_size;
+        let pick = session.candidates.get(start + idx).cloned();
+        let Some(cand) = pick else {
+            return KeyOutcome::consumed(self.state(session));
+        };
+        if cand.source != CandidateKind::Dict && cand.source != CandidateKind::UserWord {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        let pos = pos.max(1);
+        self.adjust_place(&cand.code, &cand.text, pos);
+        self.pending_user_reload = true;
+        let keep_raw = session.raw.clone();
+        session.clear();
+        session.raw = keep_raw;
+        self.refresh_candidates(session);
+        KeyOutcome::consumed(self.state(session))
+    }
+
     /// 按 code+word 置顶（内存 + 追加日志）。
     pub fn adjust_pin(&mut self, code: &str, word: &str) {
         self.schema.adjust.pin(code, word);
@@ -3438,6 +3463,13 @@ impl Engine {
     pub fn adjust_hide(&mut self, code: &str, word: &str) {
         self.schema.adjust.remove(code, word);
         self.append_adjust_log("{删除}", code, word, None);
+    }
+
+    /// 【右键调频菜单 2026-10-06】按 code+word 定位到第 pos 选（内存 +
+    /// 追加日志 {添加}pN——同码同词旧行先清=覆盖置顶/删除，最新操作赢）。
+    pub fn adjust_place(&mut self, code: &str, word: &str, pos: usize) {
+        self.schema.adjust.add_at(code, word, Some(pos));
+        self.append_adjust_log("{添加}", code, word, Some(pos));
     }
 
     /// 落调整行到 用户调整.txt（【格式统一 2026-09-06】主文件统一
@@ -5722,6 +5754,44 @@ mod tests {
         assert_eq!(eng2.commit_history.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 【右键调频菜单 2026-10-06】op_place_candidate：定到第 N 选
+    ///（{添加}code\tword\tpN 落 用户调整.txt、组段保留、候选即时换序、
+    /// 覆盖旧置顶行——同码同词只留最新操作）。
+    #[test]
+    fn op_place_candidate_moves_and_logs() {
+        let (mut eng, dir) = test_engine("place");
+        let mut s = Session::new(true);
+        for c in "jd".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        // jd 候选：就/到的/加（main.txt 序）。把第 2 选「到的」定到第 1 选
+        let _ = eng.op_place_candidate(&mut s, 1, 1);
+        let snap = eng.state(&s);
+        let texts: Vec<&str> = snap.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts.first(),
+            Some(&"到的"),
+            "定到第 1 选后首选换序: {texts:?}"
+        );
+        // 组段保留：raw 不丢、还在编码态
+        assert_eq!(s.raw, "jd", "组段保留");
+        // 日志落盘：{添加}jd\t到的\tp1（同码同词旧 {置顶}/{删除} 行清）
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap_or_default();
+        assert!(
+            log.contains("{添加}jd\t到的\tp1"),
+            "日志行 {{添加}}pN 落盘: {log:?}"
+        );
+        // 再移到最后 → 同词旧行被替换（不重复占行）
+        let _ = eng.op_place_candidate(&mut s, 0, 99);
+        let log2 = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap_or_default();
+        assert!(!log2.contains("p1\n") || !log2.contains("{添加}jd\t到的\tp1"), "旧行被清: {log2:?}");
+        assert!(log2.contains("{添加}jd\t到的\tp99"), "新行在: {log2:?}");
+        let snap2 = eng.state(&s);
+        let texts2: Vec<&str> = snap2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts2.last().copied(), Some("到的"), "移到最后=末位: {texts2:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 【过程态防御】神经重排不得把 partial（未消耗全部 raw 的前缀态）

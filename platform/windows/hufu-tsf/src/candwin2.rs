@@ -26,6 +26,242 @@ use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
+// ── 【右键调频菜单 2026-10-06】裸 FFI（TrackPopupMenu + TPM_RETURNCMD
+// 取回选项 id；windows crate 的签名拿不到返回值——langbar 同款直连）──
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "CreatePopupMenu"]
+    fn cand2_CreatePopupMenu() -> isize;
+    #[link_name = "AppendMenuW"]
+    fn cand2_AppendMenuW(m: isize, flags: u32, id: usize, text: *const u16) -> i32;
+    #[link_name = "TrackPopupMenu"]
+    fn cand2_TrackPopupMenu(
+        m: isize,
+        flags: u32,
+        x: i32,
+        y: i32,
+        reserved: u32,
+        hwnd: isize,
+        rect: *const RECT,
+    ) -> i32;
+    #[link_name = "DestroyMenu"]
+    fn cand2_DestroyMenu(m: isize) -> i32;
+    #[link_name = "PostMessageW"]
+    fn cand2_PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+}
+const MF_STRING: u32 = 0x0;
+const MF_GRAYED: u32 = 0x1;
+const MF_SEPARATOR: u32 = 0x800;
+const TPM_RETURNCMD: u32 = 0x100;
+const TPM_RIGHTBUTTON: u32 = 0x2;
+
+/// 【右键调频菜单 2026-10-06】命中矩形缓存：show() 渲染经典皮肤时
+/// 逐候选采集（内容逻辑坐标，与绘制同源），右键按 (dpi, shadow_m)
+/// 换算命中的候选下标。虎娘面板路径（皮肤贴图系统另案）不采集=清空，
+/// 右键退「当前高亮候选」。
+static CAND_HIT: std::sync::Mutex<Vec<(f32, f32, f32, f32)>> = std::sync::Mutex::new(Vec::new());
+/// (dpi_scale, shadow_m, 内容宽, 内容高)——客户端像素→内容逻辑坐标。
+static CAND_HIT_GEO: std::sync::Mutex<Option<(f32, f32, u32, u32)>> = std::sync::Mutex::new(None);
+
+/// 候选窗右键：命中候选 → 六项调频菜单（向前移/向后移/移到最前/
+/// 移到最后/加词/删词）。语义与 Ctrl+数字（置顶）/Ctrl+Shift+数字
+///（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
+/// 动作走同步管道 op=cand_menu（server 写 用户调整.txt 并返回新
+/// state）；重绘用滚轮缩放同款锁外 show——wndproc 里不碰
+/// update_ui/run_session（TSF 编辑会话不得在窗口过程里重入）。
+/// 「加词」带 (词, 编码, 选重位) 预填打开加词窗。
+unsafe fn cand_menu_popup(lparam: LPARAM) {
+    unsafe {
+        // 1) 命中候选（客户端像素 → 内容逻辑坐标）
+        let px = (lparam.0 as u16) as i16 as f32;
+        let py = ((lparam.0 >> 16) as u16) as i16 as f32;
+        let (cands, raw, sel) = match crate::tsf::G_SHARED.get() {
+            Some(gsh) => {
+                let g = gsh.0.lock().unwrap_or_else(|e| e.into_inner());
+                g.last_show.clone().unwrap_or_default()
+            }
+            None => return,
+        };
+        if cands.is_empty() {
+            return;
+        }
+        let hit_idx = if crate::panelskin::enabled() {
+            Some(sel.min(cands.len() - 1))
+        } else {
+            let geo = *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner());
+            let rects = CAND_HIT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            geo.and_then(|(dpi, sm, _, _)| {
+                let (lx, ly) = (px / dpi - sm, py / dpi - sm);
+                rects
+                    .iter()
+                    .position(|(x0, y0, x1, y1)| lx >= *x0 && lx < *x1 && ly >= *y0 && ly < *y1)
+            })
+        };
+        let Some(idx) = hit_idx else {
+            crate::tsf::trace("cw2: rdown 未命中候选——无菜单");
+            return;
+        };
+        let (text, _cmt) = cands.get(idx).cloned().unwrap_or_default();
+        if text.is_empty() {
+            return;
+        }
+        let (n, len) = (idx + 1, cands.len());
+        crate::tsf::trace(&format!("cw2: rdown 命中 #{n}「{text}」菜单弹出"));
+        // 2) 菜单（六项；首尾移动到边界时灰化）
+        let m = cand2_CreatePopupMenu();
+        if m == 0 {
+            return;
+        }
+        let mut append = |label: &str, id: usize, gray: bool| {
+            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
+            cand2_AppendMenuW(
+                m,
+                MF_STRING | if gray { MF_GRAYED } else { 0 },
+                id,
+                w.as_ptr(),
+            );
+        };
+        append("向前移", 1, n <= 1);
+        append("向后移", 2, n >= len);
+        append("移到最前", 3, false);
+        append("移到最后", 4, n >= len);
+        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+        append("加词", 5, false);
+        append("删词", 6, false);
+        // 3) owner=自建 0×0 顶层 TOOLWINDOW（langbar QQ 实证路线：
+        // 子窗 owner 收不了前台，菜单秒弹秒关）
+        let cls: Vec<u16> = "HUFU_C2_MENU\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(def_wndproc),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        let mut cpt = POINT::default();
+        let _ = GetCursorPos(&mut cpt);
+        let nm: Vec<u16> = "HuFu 候选菜单\0".encode_utf16().collect();
+        let owner = match CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0),
+            PCWSTR(cls.as_ptr()),
+            PCWSTR(nm.as_ptr()),
+            WS_POPUP,
+            cpt.x,
+            cpt.y,
+            0,
+            0,
+            HWND(std::ptr::null_mut()),
+            None,
+            None,
+            None,
+        ) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                cand2_DestroyMenu(m);
+                return;
+            }
+        };
+        let _ = SetForegroundWindow(owner);
+        let sel_id = cand2_TrackPopupMenu(
+            m,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cpt.x,
+            cpt.y,
+            0,
+            owner.0 as isize,
+            std::ptr::null(),
+        );
+        // KB135788：菜单系统状态机复位（缺它二次失灵）
+        cand2_PostMessageW(owner.0 as isize, 0x0000, 0, 0);
+        let _ = DestroyWindow(owner);
+        cand2_DestroyMenu(m);
+        if sel_id == 0 {
+            return;
+        }
+        crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{text}）"));
+        // 4) 动作
+        if sel_id == 5 {
+            crate::addword::open_prefilled(&text, &raw, &n.to_string());
+            return;
+        }
+        let action = match sel_id {
+            1 => "fwd",
+            2 => "back",
+            3 => "front",
+            4 => "last",
+            6 => "del",
+            _ => return,
+        };
+        if let Some(r) = crate::ipc::call(&serde_json::json!({
+            "op": "cand_menu", "action": action, "page_index": idx, "text": text
+        })) {
+            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                cand_menu_refresh(&r);
+            } else {
+                crate::tsf::trace("cw2: cand_menu 响应未生效（候选不在页/未知动作）");
+            }
+        }
+    }
+}
+
+/// 菜单动作后按响应 state 即时重绘（滚轮缩放同款：锁内 take 参数、
+/// 锁外 show、放回 newer-wins——不碰 update_ui/run_session）。
+unsafe fn cand_menu_refresh(resp: &Value) {
+    unsafe {
+        let Some(state) = resp.get("state") else { return };
+        let cands: Vec<(String, String)> = state
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|c| {
+                        (
+                            c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            c.get("comment").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw = state
+            .get("raw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if let Some(gsh) = crate::tsf::G_SHARED.get() {
+            let shared = gsh.0.clone();
+            let (mut cand2, _last, skin, caret) = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret)
+            };
+            if let Some(c) = cand2.as_mut() {
+                c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            }
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.last_show = Some((cands, raw, sel));
+            match (g.cand2.take(), cand2) {
+                (None, mine) => g.cand2 = mine,
+                (Some(newer), Some(mut mine)) => {
+                    mine.hide();
+                    g.cand2 = Some(newer);
+                }
+                (Some(newer), None) => g.cand2 = Some(newer),
+            }
+        }
+    }
+}
+
+/// 菜单 owner 宿主窗过程（消息路由由 TrackPopupMenu 模态循环自理）。
+unsafe extern "system" fn def_wndproc(
+    h: HWND,
+    m: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(h, m, w, l) }
+}
+
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
 /// 【排查中】用户实测「正常应用里点击候选框导致应用卡死」——本过程
 /// 记录点击/移动消息到达与时刻，卡死复现后由日志定位卡点。
@@ -243,17 +479,28 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             return LRESULT(0);
         }
         0x204 => {
-            // WM_RBUTTONDOWN：【右键=解锁 2026-09-10 用户拍板】清除固定
-            // 位与拖拽钉住残留——候选窗回到光标处恢复跟随。未固定时
-            // 右键无操作（不再有「右键固定」路径）。
-            crate::tsf::trace("cw2: rdown（右键解锁）");
+            // 【右键=调频菜单 2026-10-06 用户拍板】右键候选=上下文菜单
+            //（向前移/向后移/移到最前/移到最后/加词/删词——与 Ctrl+
+            // 数字/Ctrl+Shift+数字/{加词} 同语义，全部只写「用户调整」）。
+            // 旧「右键=解锁固定位」移到中键（0x207）。未命中候选=无菜单。
+            crate::tsf::trace("cw2: rdown（调频菜单）");
+            if !crate::tsf::addword_tl_thread() {
+                unsafe { cand_menu_popup(lparam) };
+            }
+            return LRESULT(0);
+        }
+        0x207 => {
+            // 【中键=解锁 2026-10-06】原右键解锁固定位移到中键：清除固
+            // 定位与拖拽钉住残留——候选窗回到光标处恢复跟随。未固定时
+            // 无操作。
+            crate::tsf::trace("cw2: mdown（中键解锁）");
             let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
             if pinned.is_some() {
                 *pinned = None;
                 drop(pinned);
                 *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                crate::tsf::diag_note("cw2 pin 右键解除（回跟随光标）");
+                crate::tsf::diag_note("cw2 pin 中键解除（回跟随光标）");
             }
             return LRESULT(0);
         }
@@ -361,7 +608,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             return LRESULT(0);
         }
-        0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键抬起吞
+        0x205 | 0x208 => return LRESULT(0), // 右/中键抬起吞（0x207 中键按下=解锁已前置处理）
         // 【三十六修·死块删除】WM_NCHITTEST（0x84）已在 wndproc 头部
         //（HTCLIENT 强制整窗命中，QQ 按钮消息实测教训）无条件 return，
         // 此臂自那时起不可达——其「余量区 HTTRANSPARENT 穿透」设计与
@@ -1687,6 +1934,10 @@ impl CandidateWindowV2 {
         //（绝不空白）。
         if crate::panelskin::enabled() {
             if self.show_panel(cands, raw, skin, anchor, selected) {
+                // 【右键调频菜单】面板路径不采集命中矩形（皮肤贴图系统
+                // 另案）——清空，右键退「当前高亮候选」。
+                CAND_HIT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 return;
             }
         }
@@ -3228,6 +3479,11 @@ impl CandidateWindowV2 {
                     }
                 };
 
+                // 【右键调频菜单 2026-10-06】逐候选命中矩形（内容逻辑
+                // 坐标，与绘制同源）：横排随格宽推进、竖排整行满宽。
+                // 采集后与 (dpi, shadow_m) 一并落 CAND_HIT*/静态缓存，
+                // 供 wndproc 0x204 客户端像素→逻辑坐标命中换算。
+                let mut hit_rows: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(cands.len().min(10));
                 // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
                 let draw_content = !(stage >= 1 && stage <= 4);
                 if draw_content {
@@ -3361,6 +3617,12 @@ impl CandidateWindowV2 {
                             if !cmt.is_empty() && cw > 0.0 {
                                 draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
                             }
+                            hit_rows.push((
+                                x - if i > 0 { cand_spacing * 0.5 } else { 0.0 },
+                                y0,
+                                x + cell_w + cand_spacing * 0.5,
+                                y0 + row_h,
+                            ));
                             x += cell_w;
                         }
                     } else {
@@ -3368,6 +3630,7 @@ impl CandidateWindowV2 {
                         for (i, (text, _)) in cands.iter().enumerate().take(10) {
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                             let y = y0 + (row_h + cand_spacing) * i as f32;
+                            hit_rows.push((rm_x, y, width - rm_x, y + row_h));
                             if i == sel {
                                 // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
                                 // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
@@ -3477,6 +3740,12 @@ impl CandidateWindowV2 {
                         let _ = ctx.DrawRoundedRectangle(&rr, b, bw, None);
                     }
                 } // draw_content
+                // 【右键调频菜单】命中缓存落档（draw_content=false 的
+                // 阶段帧不清旧值——内容没画也不该命中错位矩形，保持
+                // 上一完整帧即可；面板路径另行清空）。
+                *CAND_HIT.lock().unwrap_or_else(|e| e.into_inner()) = hit_rows;
+                *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((dpi_scale, shadow_m, w, h));
                 // 【拉伸动效】内容裁剪收层（与上方 PushAxisAlignedClip 配对）
                 if chrome_clip_on {
                     ctx.PopAxisAlignedClip();

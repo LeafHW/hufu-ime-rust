@@ -135,6 +135,79 @@ pub fn dispatch(
             }
             r
         }
+        // 【右键调频菜单 2026-10-06】候选窗右键菜单动作（Windows DLL）：
+        // front=置顶（Ctrl+数字同语义）/ del=软删（Ctrl+Shift+数字）/
+        // fwd|back|last={添加}pN 定位。page_index=页内下标（与渲染同序），
+        // text=候选词（渲染→点击间重排漂移校验：不符则按词在当前页内
+        // 重找）。全部只写 用户调整.txt（append_adjust_log 同码同词旧行
+        // 先清=覆盖旧置顶/删除）；响应带刷新后的 state 供 DLL 即时重绘。
+        "cand_menu" => {
+            let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let page_index = req
+                .get("page_index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX);
+            let page_size = host.engine.config.candidates.page_size.max(1);
+            let start = host.session.page * page_size;
+            // 解析目标候选（页内）：优先 page_index，词不符则按 text 重找
+            let resolve = |want: usize, text: &str| -> Option<usize> {
+                let get = |i: usize| {
+                    host.session
+                        .candidates
+                        .get(start + i)
+                        .map(|c| c.text.as_str())
+                };
+                if let Some(t) = get(want) {
+                    if text.is_empty() || t == text {
+                        return Some(want);
+                    }
+                }
+                if text.is_empty() {
+                    return None;
+                }
+                (0..page_size).find(|&i| get(i) == Some(text))
+            };
+            let idx = match resolve(page_index, text) {
+                Some(i) => i,
+                None => {
+                    return serde_json::json!({"ok": false, "why": "候选不在当前页"});
+                }
+            };
+            let total = host.session.candidates.len();
+            let n_abs = start + idx + 1; // 完整列表 1 基（pN 度量口径）
+            let h: &mut Host = &mut host;
+            match action {
+                "front" => {
+                    let _ = h.engine.op_pin_candidate(&mut h.session, idx);
+                }
+                "del" => {
+                    let _ = h.engine.op_hide_candidate(&mut h.session, idx);
+                }
+                "fwd" => {
+                    if n_abs > 1 {
+                        let _ = h.engine.op_place_candidate(&mut h.session, idx, n_abs - 1);
+                    }
+                }
+                "back" => {
+                    if n_abs < total {
+                        let _ = h.engine.op_place_candidate(&mut h.session, idx, n_abs + 1);
+                    }
+                }
+                "last" => {
+                    if total >= 1 {
+                        let _ = h.engine.op_place_candidate(&mut h.session, idx, total);
+                    }
+                }
+                _ => {
+                    return serde_json::json!({"ok": false, "why": "未知动作"});
+                }
+            }
+            let state = serde_json::to_value(host.engine.state(&host.session))
+                .unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({"ok": true, "state": state})
+        }
         // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。
         // 读=全量 JSON；写=全量 JSON（客户端侧做「读-改-写」合并，避免
         // 部分字段缺省被 serde 默认值覆盖——与 Web 设置页同语义）。

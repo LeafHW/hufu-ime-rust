@@ -195,6 +195,24 @@ pub fn open() {
     open_common();
 }
 
+/// 【右键调频菜单 2026-10-06】带预填弹出加词窗：候选窗右键「加词」
+/// 带出 (词, 编码, 选重位)——与 {加词}/、jc 同窗口同提交链路
+///（/api/user_word/add），仅初始值预填。窗口已开时不强填（消费即弃，
+/// 防陈旧预填滞留到下次开窗）。
+pub fn open_prefilled(word: &str, code: &str, pos: &str) {
+    MODE_WEIGHT.store(false, std::sync::atomic::Ordering::Relaxed);
+    *PREFILL.lock().unwrap_or_else(|p| p.into_inner()) = Some((
+        word.to_string(),
+        code.to_string(),
+        pos.to_string(),
+    ));
+    open_common();
+}
+
+/// 右键「加词」预填（词, 编码, 选重位）——开窗线程消费即清。
+static PREFILL: std::sync::Mutex<Option<(String, String, String)>> =
+    std::sync::Mutex::new(None);
+
 /// 弹出加权窗（/jq {加权} 触发；词+权重两框）。
 pub fn open_weight() {
     MODE_WEIGHT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -645,6 +663,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 if i == 0 {
                     first_edit = ed;
+                }
+            }
+            // 【右键调频菜单 2026-10-06】预填三框（词/编码/选重位）：
+            // 消费即清——窗口复用/复开不残留旧值。
+            {
+                let prefill = PREFILL.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some((w, c, p)) = prefill.filter(|_| !is_weight_mode()) {
+                    for (id, t) in [(ID_WORD, w), (ID_CODE, c), (ID_POS, p)] {
+                        if let Ok(h) = GetDlgItem(hwnd, id) {
+                            let v: Vec<u16> =
+                                t.encode_utf16().chain([0]).collect();
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                                h,
+                                PCWSTR(v.as_ptr()),
+                            );
+                        }
+                    }
+                    crate::tsf::trace("addword 预填（右键调频菜单·加词）");
                 }
             }
             if !is_weight_mode() {
