@@ -3587,6 +3587,25 @@ impl Engine {
         self.last_commit = text.to_string();
     }
 
+    /// 【顶标并账 2026-10-06】把追加上屏（纯符号：标点/省略号等）并入
+    /// 栈顶既有条，不独立占位——host「重复上屏包括符号」开关开的记账
+    /// 策略：上屏「中」后再按「，」，栈顶条变「中，」，{重复上屏} 一次
+    /// 回放整段（此前「，」独立入栈把正文挤出栈首——用户实测
+    /// {重复上屏}=「，」、{重复上屏2}=「中」）。栈空时退化为独立入栈。
+    /// 并账后 last_commit 同步为合并文本。
+    pub fn append_commit_history(&mut self, more: &str) {
+        if more.is_empty() {
+            return;
+        }
+        if let Some(front) = self.commit_history.front_mut() {
+            let merged = format!("{front}{more}");
+            self.last_commit = merged.clone();
+            *front = merged;
+        } else {
+            self.push_commit_history(more);
+        }
+    }
+
     /// 【上屏历史栈 2026-11】取历史第 n 条（1 起，1=最新）。越界 None。
     pub fn commit_history_at(&self, n: usize) -> Option<&String> {
         if n == 0 {
@@ -5675,6 +5694,34 @@ mod tests {
         let cfg = hufu_config::Config::default();
         let eng = Engine::with_schema_dir(&dir, cfg).unwrap();
         (eng, dir)
+    }
+
+    /// 【顶标并账 2026-10-06】append_commit_history 原语 + 配套记账策略
+    /// （策略本体在 hufu-server host.rs record_commit_history）：并入栈
+    /// 顶、栈空退化独立、last_commit 视图同步。
+    #[test]
+    fn commit_history_append_merges_top() {
+        let (mut eng, dir) = test_engine("hist");
+        eng.push_commit_history("中");
+        eng.append_commit_history("，");
+        assert_eq!(eng.commit_history_at(1).map(|s| s.as_str()), Some("中，"));
+        assert_eq!(eng.last_commit, "中，", "last_commit 视图随并账同步");
+        // 连续符号继续并入同一条（打「中……」＝两键 …）
+        eng.append_commit_history("…");
+        eng.append_commit_history("…");
+        assert_eq!(
+            eng.commit_history_at(1).map(|s| s.as_str()),
+            Some("中，……"),
+            "连续符号并入同一条: {:?}",
+            eng.commit_history.front()
+        );
+        // 栈空退化：独立入栈
+        let (mut eng2, dir2) = test_engine("hist2");
+        eng2.append_commit_history("……");
+        assert_eq!(eng2.commit_history_at(1).map(|s| s.as_str()), Some("……"));
+        assert_eq!(eng2.commit_history.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// 【过程态防御】神经重排不得把 partial（未消耗全部 raw 的前缀态）

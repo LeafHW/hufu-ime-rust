@@ -688,17 +688,39 @@ impl Host {
     /// select_candidate 同源）：开关关（默认）= 2026-10-30 三修口径——
     /// 剥尾随非字母（标点/空白）后含至少一个字母才记，纯符号/数字
     /// 上屏不入栈、标点顶字「中，」只记「中」；开关开 = 任何非空上屏
-    /// 整段原样入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc 撤回
+    /// 整段入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc 撤回
     /// 可作用于任意上一次上屏内容（用户在「输入与候选」页勾选）。
+    /// 【顶标并账 2026-10-06】开关开时的补丁：纯符号上屏（上屏「中」
+    /// 后空态补的「，」、标点直出等）若独立入栈会把正文挤出栈首
+    /// （用户实测 {重复上屏}=「，」、{重复上屏2}=「中」）。纯符号且
+    /// 栈顶条含字母/数字 → 并入栈顶（append_commit_history），一次
+    /// 回放整段「中，」；纯符号打头（栈空/栈顶也纯符号）仍独立入栈，
+    /// 「……」这类纯符号段照样可单独回放。
     fn record_commit_history(&mut self, c: &str) {
         if self.engine.config.general.repeat_include_symbols {
-            self.engine.push_commit_history(c);
+            let top = self.engine.commit_history_at(1).map(|s| s.as_str());
+            if Self::symbol_merges_into_top(top, c) {
+                self.engine.append_commit_history(c);
+            } else {
+                self.engine.push_commit_history(c);
+            }
         } else {
             let text_part = c.trim_end_matches(|ch: char| !ch.is_alphabetic());
             if text_part.chars().any(|ch| ch.is_alphabetic()) {
                 self.engine.push_commit_history(text_part);
             }
         }
+    }
+
+    /// 【顶标并账 2026-10-06】纯符号上屏是否并入栈顶：c 无任何字母/
+    /// 数字（is_alphanumeric）且栈顶条含字母/数字。数字算文字（「3.」
+    /// 是有意义整段独立入栈，不并）。纯函数供单测覆盖。
+    fn symbol_merges_into_top(top: Option<&str>, c: &str) -> bool {
+        let symbol_only = !c.chars().any(|ch| ch.is_alphanumeric());
+        let top_texty = top
+            .map(|t| t.chars().any(|ch| ch.is_alphanumeric()))
+            .unwrap_or(false);
+        symbol_only && top_texty
     }
 
     /// 按键 → (结果, 状态快照)。
@@ -1151,6 +1173,28 @@ mod export_util {
     mod tests {
         use super::*;
         use hufu_dict::Schema;
+
+        /// 【顶标并账 2026-10-06】纯符号并入栈顶的判定矩阵（策略本体在
+        /// record_commit_history；引擎原语 append_commit_history 的行为
+        /// 由 hufu-engine commit_history_append_merges_top 覆盖）。
+        #[test]
+        fn symbol_merge_policy_matrix() {
+            use crate::host::Host;
+            // 「中」+「，」：正文后的标点 → 并入
+            assert!(Host::symbol_merges_into_top(Some("中"), "，"));
+            // 已并成「中，」后再补「…」：继续并入同一条
+            assert!(Host::symbol_merges_into_top(Some("中，"), "…"));
+            // 西文文字后符号同样并入
+            assert!(Host::symbol_merges_into_top(Some("abc"), "."));
+            // 栈空（纯符号打头）→ 独立入栈
+            assert!(!Host::symbol_merges_into_top(None, "，"));
+            // 栈顶也是纯符号 → 独立（不无限粘连）
+            assert!(!Host::symbol_merges_into_top(Some("……"), "。"));
+            // 数字+标点是整段（含数字=文字性）→ 独立
+            assert!(!Host::symbol_merges_into_top(Some("中"), "3."));
+            // 新上屏含文字 → 正常独立入栈
+            assert!(!Host::symbol_merges_into_top(Some("中"), "再次"));
+        }
 
         /// 测试基目录：crate 的 target/ 下（系统临时目录在部分环境下
         /// 拒绝访问——本次实测 PermissionDenied）。

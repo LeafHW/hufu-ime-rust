@@ -256,7 +256,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <select id="g-caps"><option value="clear">清屏</option><option value="switch">切英文</option><option value="none">无操作</option></select></div>
       <div class="checkline"><input type="checkbox" id="g-recent"><label for="g-recent">Ctrl+M 切换最近方案</label></div>
       <div class="checkline"><input type="checkbox" id="g-esc-undo"><label for="g-esc-undo" title="开启后的范围规则：① 编码中按 Esc = 清屏（不变）；② 空态 + 焦点有光标（编辑框）+ 有可撤内容 = 撤回上次上屏（回删，连按撤更早，最多 8 条）；③ 空态无光标（按钮/列表等非编辑焦点）或无可撤内容 = 正常 Esc 功能（透传应用）。关闭（默认）= 空态透传">Esc 撤回上次上屏<span class="sub">（空态+有光标生效，连按撤更早）</span></label></div>
-      <div class="checkline"><input type="checkbox" id="g-rep-sym"><label for="g-rep-sym" title="关闭（默认）：{重复上屏}/{重复上屏N}/Esc 撤回只记中英文词组（纯符号、数字、标点上屏不入历史，标点顶字只记文字部分）；开启：任何上屏内容都入历史，可重复上屏任意上一次上屏的东西">重复上屏包括符号<span class="sub">（默认关=只回放中英文词组）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="g-rep-sym"><label for="g-rep-sym" title="关闭（默认）：{重复上屏}/{重复上屏N}/Esc 撤回只记中英文词组（纯符号、数字、标点上屏不入历史，标点顶字只记文字部分）；开启：上屏整段入历史——文字后随的标点并入同一条（打「中」再按「，」后 {重复上屏} 一次回放「中，」），纯符号打头仍独立成条可单独回放">重复上屏包括符号<span class="sub">（默认关=只回放中英文词组）</span></label></div>
     </div>
     <h3>输入</h3>
     <div class="row">
