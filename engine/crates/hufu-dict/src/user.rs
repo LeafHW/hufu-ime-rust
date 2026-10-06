@@ -166,6 +166,37 @@ impl UserAdjust {
         self.add_at(code, word, None);
     }
 
+    /// 【右键调频·整序落盘 2026-10-07】把该码当前完整词序写成一整套
+    /// {添加}pN（1..n 逐词绝对位），同码旧 {添加} 行全清。此前「移一
+    /// 位」只写个别 pN——回放时与陈旧行交错（旧 看了看 p2 行把刚移
+    /// 的择顶到末尾=「移一位跳末尾」实锤）；且置顶会清该词 {添加} 行
+    /// → added() 去重失效 → 用户词副本二次并入=「重复字+真词消失」。
+    /// 整套落盘后：回放序=写入序（升位逐词落槽，无交错），每个词都
+    /// 有 {添加} 行（added() 恒真，用户词合并不再重复）。置顶/删除/
+    /// 加权行不动（他词语义保留）。
+    pub fn set_order(&mut self, code: &str, words: &[String]) {
+        self.log
+            .retain(|e| !(e.code == code && e.op == AdjustOp::Add));
+        // 【置顶归一 2026-10-07】整序集内的词位次全由 pN 管理——同码
+        // 的 {置顶} 行一并清（否则内存置顶残留占首选位：加词默认首选
+        // 被顶成 2 选；且置顶词对 pN 重排「不动」会吃掉后续调频）。
+        // 真固定位（Ctrl+数字钉的）不经本路径，不受影响。
+        self.log.retain(|e| {
+            !(e.code == code
+                && e.op == AdjustOp::Pin
+                && words.iter().any(|w| w == &e.word))
+        });
+        for (i, w) in words.iter().enumerate() {
+            self.log.push(AdjustEntry {
+                op: AdjustOp::Add,
+                code: code.to_string(),
+                word: w.clone(),
+                pos: Some(i + 1),
+            });
+            self.removes.remove(&(code.to_string(), w.clone()));
+        }
+    }
+
     /// 带选重位加词（/jc 第三框 pN）。
     pub fn add_at(&mut self, code: &str, word: &str, pos: Option<usize>) {
         self.log.retain(|e| !(e.code == code && e.word == word));
@@ -197,10 +228,16 @@ impl UserAdjust {
 
     /// 该 码→词 是否有 {添加} 日志（schema 层去重：adjust.apply 已
     /// 就位/追加过，user_dict 同词词行不再二次并入）。
+    /// 【置顶同计 2026-10-07】{置顶} 词同样由 apply 就位（置顶块）——
+    /// 不计入时 pin 会替换掉 Add 行 → added()=false → user_dict 旧副
+    /// 本二次并入=「重复字」（真机快照实锤：front 后 [看了看 看了看
+    /// 择]，第二个=用户词副本；合并点的 pinned 查重拦不住它）。
     pub fn added(&self, code: &str, word: &str) -> bool {
-        self.log
-            .iter()
-            .any(|e| e.op == AdjustOp::Add && e.code == code && e.word == word)
+        self.log.iter().any(|e| {
+            e.code == code
+                && e.word == word
+                && matches!(e.op, AdjustOp::Add | AdjustOp::Pin)
+        })
     }
 
     /// 全部 {添加} 日志的 (码, 词)（整句词图注入用——pN 词不再入

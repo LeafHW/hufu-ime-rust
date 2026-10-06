@@ -20,6 +20,23 @@ const BUF: usize = 1 << 20;
 #[cfg(windows)]
 const RESP_BUF: usize = 32 << 20;
 
+/// 【T8 复发排查 2026-10-07】cand_menu 动作全量快照 → server-menu.log
+/// （server 无控制台；trace.log 只归 DLL）。UTF-8 追加。
+fn menu_diag(line: &str) {
+    use std::io::Write;
+    let path = r"C:\ProgramData\HuFu\trace\server-menu.log";
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn raw_req_marker(req: &serde_json::Value) -> String {
+    req.get("raw")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// 分派一个操作。返回 JSON 响应。
 /// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
 /// 反查，不可伪造）——敏感操作（剪贴板读取）的白名单以此为准；None =
@@ -184,40 +201,204 @@ pub fn dispatch(
             let abs = match resolve(page_index, text) {
                 Some(a) => a,
                 None => {
+                    // 【T8 快照 2026-10-07·复发排查】未命中兜底前先落盘
+                    //（实机 cands=3/4 交替=第 4 条来源不明，管道复现不
+                    // 出——实机会话全量快照定位）。
+                    let snap = format!(
+                        "[miss] act={} text={} raw_req={:?} sess.raw={:?} page={} cands=[{}]\n",
+                        action,
+                        text,
+                        raw_req_marker(req),
+                        host.session.raw,
+                        host.session.page,
+                        host.session
+                            .candidates
+                            .iter()
+                            .map(|c| format!("{}|{}", c.text, c.comment))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    menu_diag(&snap);
+                    // 【T8 真根因 2026-10-07】真机复测（DLL trace + 本处
+                    // 快照）：菜单 owner 抢前台 → 宿主失活 → DLL 失活路
+                    // 径的空码查询把 session.candidates 顶掉（候选窗画的
+                    // 还是旧列表）→ 词不在全列表=「候选不在页」，重试碰
+                    // 上会话恢复才成（首点必败的同款）。DLL 动作现携带
+                    // 显示时的 raw：克隆会话按码喂键重建候选（不动全局
+                    // 会话、不响键音、不染尾巴——tail_context 克隆保留，
+                    // 重排语境同源），重建列表上再定位。
+                    let raw_req = req.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut s = host.session.clone();
+                    if !raw_req.is_empty() && (s.raw.is_empty() || s.raw == raw_req) {
+                        // 【T8 叠喂修复 2026-10-07·「变长/重复词」真因】
+                        // raw 已在（==raw_req）时原实现照喂整段 → 会话变
+                        // "uruuru" 6 码 → 候选表变长变怪（重复词观感）→
+                        // 响应渲染错表 → 下一帧真值恢复=复现不了。先清
+                        // 态再按码重建，两条分支同一条确定性路径。
+                        if !s.raw.is_empty() {
+                            s.clear();
+                        }
+                        use hufu_types::{KeyCode, KeyInput, Modifiers};
+                        for ch in raw_req.chars() {
+                            let _ = host.engine.process_key(
+                                &mut s,
+                                KeyInput {
+                                    key: KeyCode::Char(ch),
+                                    modifiers: Modifiers::default(),
+                                    is_press: true,
+                                },
+                            );
+                        }
+                        menu_diag(&format!(
+                            "[scratch] act={} text={} raw_req={:?} rebuilt_n={} list=[{}]\n",
+                            action,
+                            text,
+                            raw_req,
+                            s.candidates.len(),
+                            s.candidates
+                                .iter()
+                                .map(|c| c.text.clone())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ));
+                        if let Some(a) = s.candidates.iter().position(|c| c.text == text) {
+                            // 在重建会话上执行动作（写 用户调整.txt 同源）
+                            let total_s = s.candidates.len();
+                            let act_code_s = s
+                                .candidates
+                                .get(a)
+                                .map(|c| c.code.clone())
+                                .unwrap_or_default();
+                            let h: &mut Host = &mut host;
+                            // 【纯位次 2026-10-07】同主路径：原位重排，
+                            // 重建会话只当「找到词+基准列表」用。
+                            match action {
+                                "front" => {
+                                    let _ = h.engine.op_move_candidate_abs(&mut s, a, 0);
+                                }
+                                "del" => {
+                                    let _ = h.engine.op_drop_candidate_abs(&mut s, a);
+                                }
+                                "fwd" => {
+                                    if a > 0 {
+                                        let _ = h.engine.op_move_candidate_abs(&mut s, a, a - 1);
+                                    }
+                                }
+                                "back" => {
+                                    if a + 1 < total_s {
+                                        let _ = h.engine.op_move_candidate_abs(&mut s, a, a + 1);
+                                    }
+                                }
+                                "last" => {
+                                    if total_s >= 1 {
+                                        let _ =
+                                            h.engine.op_move_candidate_abs(&mut s, a, total_s - 1);
+                                    }
+                                }
+                                _ => {
+                                    return serde_json::json!({"ok": false, "why": "未知动作"});
+                                }
+                            }
+                            // 【整序落盘 2026-10-07】纯排序整套 pN。
+                            if !act_code_s.is_empty() {
+                                let _ = h.engine.adjust_set_order(&s, &act_code_s);
+                            }
+                            // 【显示序回写 2026-10-07】重建列表上的新序
+                            // 拷回**活会话**（raw/页/选保活会话原样——尾
+                            // 巴态不翻转）；返回的 state 即活会话真值，
+                            // 与下一拍轮询同源，不再两副面孔。
+                            host.session.candidates = s.candidates.clone();
+                            let state = host.engine.state(&host.session);
+                            return serde_json::json!({"ok": true, "state": state});
+                        }
+                    }
+                    let ses = &host.session;
+                    let line = format!(
+                        "[cand_menu 未命中] action={} text={} raw_req={:?} session.raw={:?} cands={} head={:?}\n",
+                        action,
+                        text,
+                        raw_req,
+                        ses.raw,
+                        ses.candidates.len(),
+                        ses.candidates
+                            .iter()
+                            .take(3)
+                            .map(|c| c.text.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    let _ = std::fs::write(
+                        r"C:\ProgramData\HuFu\trace\server-menu.log",
+                        std::fs::read_to_string(r"C:\ProgramData\HuFu\trace\server-menu.log")
+                            .unwrap_or_default()
+                            + &line,
+                    );
                     return serde_json::json!({"ok": false, "why": "候选不在当前页"});
                 }
             };
             let total = host.session.candidates.len();
-            let n_abs = abs + 1; // 完整列表 1 基（pN 度量口径）
+            // 【整序口径 2026-10-07】被点词条的码——动作后按它整套落盘
+            //（先取码，原位重排会动列表）。
+            let act_code = host
+                .session
+                .candidates
+                .get(abs)
+                .map(|c| c.code.clone())
+                .unwrap_or_default();
             let h: &mut Host = &mut host;
+            // 【纯位次 2026-10-07】原位移动/删除：不 clear 不重查——
+            // raw/页/选全保（尾巴态不翻转成组段态＝「编码冒出来+框
+            // 挪窝」根除，trace 实锤动作前 raw='' 动作后 raw='uru'）。
             match action {
                 "front" => {
-                    let _ = h.engine.op_pin_candidate_abs(&mut h.session, abs);
+                    let _ = h.engine.op_move_candidate_abs(&mut h.session, abs, 0);
                 }
                 "del" => {
-                    let _ = h.engine.op_hide_candidate_abs(&mut h.session, abs);
+                    let _ = h.engine.op_drop_candidate_abs(&mut h.session, abs);
                 }
                 "fwd" => {
-                    if n_abs > 1 {
-                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, n_abs - 1);
+                    if abs > 0 {
+                        let _ = h.engine.op_move_candidate_abs(&mut h.session, abs, abs - 1);
                     }
                 }
                 "back" => {
-                    if n_abs < total {
-                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, n_abs + 1);
+                    if abs + 1 < total {
+                        let _ = h.engine.op_move_candidate_abs(&mut h.session, abs, abs + 1);
                     }
                 }
                 "last" => {
                     if total >= 1 {
-                        let _ = h.engine.op_place_candidate_abs(&mut h.session, abs, total);
+                        let _ = h.engine.op_move_candidate_abs(&mut h.session, abs, total - 1);
                     }
                 }
                 _ => {
                     return serde_json::json!({"ok": false, "why": "未知动作"});
                 }
             }
+            // 【整序落盘 2026-10-07】纯排序整套 pN（清陈旧 {添加}/{置顶}
+            // 行）——不动会话（原位重排后的列表就是展示真值）。
+            if !act_code.is_empty() {
+                let _ = h.engine.adjust_set_order(&h.session, &act_code);
+            }
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
+            // 【T8 快照 2026-10-07·复发排查】动作后全量落盘（4 条之谜）。
+            {
+                let texts: Vec<String> = host
+                    .session
+                    .candidates
+                    .iter()
+                    .map(|c| format!("{}|{}", c.text, c.comment))
+                    .collect();
+                menu_diag(&format!(
+                    "[done] act={} text={} abs={} total={} after=[{}] raw={:?}\n",
+                    action,
+                    text,
+                    abs,
+                    total,
+                    texts.join(" "),
+                    host.session.raw
+                ));
+            }
             serde_json::json!({"ok": true, "state": state})
         }
         // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。

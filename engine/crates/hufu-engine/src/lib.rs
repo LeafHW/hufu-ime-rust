@@ -3469,6 +3469,47 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
+    /// 【右键菜单·移一位=双向交换 2026-10-07】向前/向后一位的真实语义
+    /// 是「与邻词互换」：两词各写显式 pN（a 到 other+1、b 到 abs+1，
+    /// 1 基）。单写一个 pN 时两词会争同一个坑（用户实测：A 后移生成
+    /// A p2，再 B 后移又写 B p2——同坑双占，一个被挤=「再移就失效」）。
+    /// back=false 向前（abs 与 abs-1 换），back=true 向后（abs 与 abs+1
+    /// 换）；边界（首项向前/末项向后）无邻=无操作。
+    pub fn op_swap_candidate_abs(
+        &mut self,
+        session: &mut Session,
+        abs: usize,
+        back: bool,
+    ) -> KeyOutcome {
+        let pick_a = session.candidates.get(abs).cloned();
+        let Some(a) = pick_a else {
+            return KeyOutcome::consumed(self.state(session));
+        };
+        if a.source != CandidateKind::Dict && a.source != CandidateKind::UserWord {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        let other = if back { abs + 1 } else { abs.saturating_sub(1) };
+        let pick_b = session.candidates.get(other).cloned();
+        let Some(b) = pick_b else {
+            // 边界无邻词（或与 a 同一个）——无操作
+            return KeyOutcome::consumed(self.state(session));
+        };
+        if b.source != CandidateKind::Dict && b.source != CandidateKind::UserWord {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        if !back && abs == 0 {
+            return KeyOutcome::consumed(self.state(session));
+        }
+        self.adjust_place(&a.code, &a.text, other + 1);
+        self.adjust_place(&b.code, &b.text, abs + 1);
+        self.pending_user_reload = true;
+        let keep_raw = session.raw.clone();
+        session.clear();
+        session.raw = keep_raw;
+        self.refresh_candidates(session);
+        KeyOutcome::consumed(self.state(session))
+    }
+
     /// 按 code+word 置顶（内存 + 追加日志）。
     pub fn adjust_pin(&mut self, code: &str, word: &str) {
         self.schema.adjust.pin(code, word);
@@ -3486,6 +3527,101 @@ impl Engine {
     pub fn adjust_place(&mut self, code: &str, word: &str, pos: usize) {
         self.schema.adjust.add_at(code, word, Some(pos));
         self.append_adjust_log("{添加}", code, word, Some(pos));
+    }
+
+    /// 【右键调频·纯位次 2026-10-07】组段/尾巴通吃：**候选表原位重排**
+    ///——不 clear、不重查、raw/页/选全保。此前 op_* 的
+    /// clear+refresh_candidates 会把尾巴态（raw=''，上屏后预测框）重
+    /// 建成组段态（raw='uru'）＝「编码冒出来+框挪窝」的翻转根源
+    ///（trace 实锤：动作前帧 raw='' 动作后帧 raw='uru'）。调整落盘由
+    /// adjust_set_order 整套 pN 完成，本 op 零写入。越界/同位=无操作。
+    pub fn op_move_candidate_abs(
+        &mut self,
+        session: &mut Session,
+        abs: usize,
+        to: usize,
+    ) -> KeyOutcome {
+        let n = session.candidates.len();
+        if abs < n && to < n && abs != to {
+            let e = session.candidates.remove(abs);
+            session.candidates.insert(to, e);
+        }
+        KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 原位删除：可管理词条（Dict/UserWord）写 {删除}；其余仅从当前
+    /// 展示移除（源不可管理，无持久化——重查会回来，与旧行为一致）。
+    pub fn op_drop_candidate_abs(&mut self, session: &mut Session, abs: usize) -> KeyOutcome {
+        if let Some(c) = session.candidates.get(abs) {
+            if matches!(c.source, CandidateKind::Dict | CandidateKind::UserWord) {
+                self.adjust_hide(&c.code, &c.text);
+                self.pending_user_reload = true;
+            }
+        }
+        if abs < session.candidates.len() {
+            session.candidates.remove(abs);
+        }
+        KeyOutcome::consumed(self.state(session))
+    }
+
+    /// 【右键调频·整序落盘 2026-10-07】动作后调：把该码当前完整词序
+    /// 写成一整套 {添加}pN（内存+文件同形），同码旧 {添加}/{置顶}行
+    /// 全清（纯排序，文件不再出现置顶行）。**不动会话**（原位重排后
+    /// 的列表就是展示真值——clear+refresh 会把尾巴态翻转成组段态）。
+    pub fn adjust_set_order(&mut self, session: &Session, code: &str) {
+        // 只整序可管理词条（Dict/UserWord）——符号/整句候选写 pN 会
+        // 落垃圾调整行。
+        let words: Vec<String> = session
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.source, CandidateKind::Dict | CandidateKind::UserWord))
+            .map(|c| c.text.clone())
+            .collect();
+        if words.is_empty() {
+            return;
+        }
+        self.schema.adjust.set_order(code, &words);
+        self.rewrite_order_file(code, &words);
+        self.pending_user_reload = true;
+    }
+
+    /// 整序文件改写：读 用户调整.txt，清同码 {添加} 行，追加整套
+    /// `{添加}code\t词\tpN`（与内存 log 同形，回放等价）。
+    fn rewrite_order_file(&self, code: &str, words: &[String]) {
+        let path = self.schema.dir.join("用户调整.txt");
+        let prefix = format!("{{添加}}{code}\t");
+        let pin_prefix = format!("{{置顶}}{code}\t");
+        let mut kept: Vec<String> = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for l in content.lines() {
+                let t = l.trim_start();
+                // 同码 {添加} 行全清（整套覆盖）；同码且词在整序集内的
+                // {置顶} 行一并清（置顶归一成 pN，内存/文件同步）。
+                if t.starts_with(&prefix) {
+                    continue;
+                }
+                if t.starts_with(&pin_prefix) {
+                    let w = t[pin_prefix.len()..].split('\t').next().unwrap_or("").trim();
+                    if words.iter().any(|x| x == w) {
+                        continue;
+                    }
+                }
+                if !l.trim().is_empty() {
+                    kept.push(l.to_string());
+                }
+            }
+        }
+        let mut out_lines = kept;
+        for (i, w) in words.iter().enumerate() {
+            out_lines.push(format!("{{添加}}{code}\t{w}\tp{}", i + 1));
+        }
+        // 【截断写 2026-10-07】首版误用 append 打开——每动作文件翻倍
+        //（真机文件爆到数百行实锤）。整文件覆盖写。
+        let mut s = out_lines.join("\n");
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        let _ = std::fs::write(&path, s);
     }
 
     /// 落调整行到 用户调整.txt（【格式统一 2026-09-06】主文件统一

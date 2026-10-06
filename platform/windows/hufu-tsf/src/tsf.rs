@@ -1001,9 +1001,13 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         // 兜底，无键宿主零负担。
         poll_arm(&self.shared);
         if !fforeground.as_bool() {
-            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(c) = g.cand2.as_mut() {
-                c.hide_now();
+            // 【右键菜单免死金牌 2026-10-07】菜单 owner 抢前台期间不藏
+            // 候选窗（菜单底下就是它，藏了=「点菜单候选先消失」）。
+            if !crate::candwin2::cand_menu_open() {
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = g.cand2.as_mut() {
+                    c.hide_now();
+                }
             }
         }
         Ok(())
@@ -1310,6 +1314,14 @@ fn handle_set_focus(
             trace("OnSetFocus: 鼠标在候选窗上——交互中，跳过清理");
             return Ok(());
         }
+    }
+    // 【右键菜单免死金牌 2026-10-07】菜单 owner 抢前台触发本回调——
+    // 此刻清引擎会话/收窗=「调频动作必失败+候选消失」（真机快照
+    // session.raw="" cands=0 实锤）。菜单秒级模态，收场后焦点回原
+    // 宿主，一切如常。
+    if crate::candwin2::cand_menu_open() {
+        trace("OnSetFocus: 右键菜单打开中——跳过清理（免死金牌）");
+        return Ok(());
     }
     // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段 SetText 后
     // **即时**（trace 实测 4ms）重发 OnSetFocus——此前走到「旧文档冲销」
@@ -4404,7 +4416,14 @@ fn dbg_tid() -> u32 {
     unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
 }
 
-fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】候选框只画候选，
+    // 编码段不画（编码以内联预编辑在宿主文本里，本就有——框内再画
+    // 一遍是重复显示）。所有自绘窗渲染点统一用 raw_disp（恒空）；
+    // g.last_show 仍存**真 raw**（右键菜单 ipc 的 raw_req 依赖它）。
+    // 此前按会话真相画 raw：组词/上屏/调频帧宽度来回变=「编码冒出
+    // 来+框挪一下」的全部观感来源。
+    let raw_disp = String::new();
     // 【T4 排查 2026-10-06】加词框顶屏重复——update_ui 入口全参（每帧）
     {
         let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
@@ -5149,7 +5168,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
             //（Op::Commit 在渲染前执行）——开窗后此处照画旧候选=残留
             // 窗挂屏（自动复现实锤）。渲染点再验一次。
             if crate::addword::in_window_thread() {
-                tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
+                tl_cand_show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
             } else if crate::addword::is_open() {
                 // 小窗刚开：主线程跳过渲染（旧候选不上屏）
             } else {
@@ -5196,7 +5215,7 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     }
                 }
                 if let Some(c) = g.cand2.as_mut() {
-                    c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
                 }
             }
             g.last_show = Some((cands.clone(), raw.clone(), sel));
@@ -5730,12 +5749,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         }
         if !content_empty {
             if crate::addword::in_window_thread() {
-                tl_cand_show(&cands, &raw, &skin, caret.as_ref(), sel);
+                tl_cand_show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
                 match g.cand2.as_mut() {
-                    Some(c) => c.show(&cands, &raw, &skin, caret.as_ref(), sel),
+                    Some(c) => c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel),
                     None => {}
                 }
             }
@@ -7081,7 +7100,7 @@ fn poll_hwnd_now() -> isize {
 }
 static POLL_TICKS: AtomicIsize = AtomicIsize::new(0);
 
-fn state_sig(state: &serde_json::Value) -> String {
+pub(crate) fn state_sig(state: &serde_json::Value) -> String {
     let texts: Vec<String> = state
         .get("candidates")
         .and_then(|v| v.as_array())
@@ -7105,12 +7124,20 @@ fn state_sig(state: &serde_json::Value) -> String {
         .or_else(|| state.pointer("/state/chinese"))
         .and_then(|v| v.as_bool());
     let aux = state.get("aux").and_then(|v| v.as_str()).unwrap_or("");
+    // 【T8 陈旧帧根治 2026-10-07】raw（编码段）纳入签名：上屏后的尾
+    // 巴预测与再打同码的组词态**候选文本可完全相同**（尾巴=该码全
+    // 表）→ 签名不变 → poll 永不重画 → 陈旧 raw='' 尾巴帧挂在一个
+    // raw='uru' 的组词会话上；调频帧画真相=「编码冒出来+框挪一下」
+    //（trace 实锤：点击前帧宽 342 无码，调频帧 393 带码）。raw 入签
+    // 名后组词首拍即重画，显示恒等于会话真相，调频帧无从翻脸。
+    let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         texts.join("\u{1}"),
         sel,
         zh.map(|b| b as u8).unwrap_or(2),
-        aux
+        aux,
+        raw
     )
 }
 
@@ -7177,7 +7204,7 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-fn poll_arm(shared: &SharedRef) {
+pub(crate) fn poll_arm(shared: &SharedRef) {
     // 【四十六修】每线程一窗（多标签宿主各自服务）；已武装即幂等返回
     if poll_hwnd_now() != 0 {
         return;
@@ -7390,6 +7417,12 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【右键调频·单写者 2026-10-07】免死金牌期内（含收场 1200ms 宽限）
+    // poll 整拍跳过：调频帧是唯一渲染者。此前 poll 在宽限内带着重查
+    // 的光标锚+编码段再画一帧（=「编码又出现/框又动」的第二写者）。
+    if crate::candwin2::cand_menu_open() {
+        return;
+    }
     // 【加词小窗独占渲染 2026-09-12】小窗打开期间，主线程（本 poll）
     // 跳过——cand2/D2D 上下文是进程级单例，小窗线程的 dispatch 渲染
     // 与主线程 poll 渲染交错会污染 D2D/DWrite 状态（用户实测词框候选
@@ -7628,6 +7661,9 @@ fn poll_tick() {
                 // 入场/尺寸动画 armed 后一步不跑（实锤 tick取
                 // last_some=false）。先放回再按线程取窗。
                 if let Some((cands, raw2, sel)) = last {
+                    // 【框内永不画编码】同渲染铁律：显示恒空编码，真值
+                    // 留在 last_show。
+                    let raw2_disp = String::new();
                     if crate::addword::in_window_thread() {
                         let anchor_rect = anchor.and_then(|a| {
                             let x = a.get("x").and_then(|v| v.as_i64())? as i32;
@@ -7640,7 +7676,7 @@ fn poll_tick() {
                             })
                         });
                         let caret2 = anchor_rect.or(caret);
-                        tl_cand_show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                        tl_cand_show(&cands, &raw2_disp, &skin, caret2.as_ref(), sel);
                         g.last_show = Some((cands, raw2, sel));
                     } else if let Some(c) = g.cand2.as_mut() {
                         let anchor_rect = anchor.and_then(|a| {
@@ -7654,7 +7690,7 @@ fn poll_tick() {
                             })
                         });
                         let caret2 = anchor_rect.or(caret);
-                        c.show(&cands, &raw2, &skin, caret2.as_ref(), sel);
+                        c.show(&cands, &raw2_disp, &skin, caret2.as_ref(), sel);
                         g.last_show = Some((cands, raw2, sel));
                     } else {
                         // 无可用窗：放回，别丢动画数据

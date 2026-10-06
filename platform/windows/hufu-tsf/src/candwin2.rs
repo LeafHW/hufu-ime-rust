@@ -63,6 +63,26 @@ static CAND_HIT: std::sync::Mutex<Vec<(f32, f32, f32, f32)>> = std::sync::Mutex:
 /// (dpi_scale, shadow_m, 内容宽, 内容高)——客户端像素→内容逻辑坐标。
 static CAND_HIT_GEO: std::sync::Mutex<Option<(f32, f32, u32, u32)>> = std::sync::Mutex::new(None);
 
+/// 【右键菜单免死金牌 2026-10-07·二修】菜单 owner 抢前台会触发宿主
+/// 失活/文档焦点切换——六十修清场把引擎会话清零（真机快照
+/// session.raw="" cands=0）+候选窗 hide_now=「点调频候选消失、动作
+/// 必失败」的根因。菜单期间+**收场后 400ms 宽限**置位（一修只在菜
+/// 单期置位：菜单关闭瞬间的焦点回流事件在撤牌后被正常处理，照旧
+/// 清场收窗=「一点就没」——回流串必须一并吞掉）。
+static CAND_MENU_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn menu_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 右键菜单是否打开中/宽限期内（焦点清理豁免判据）。
+pub fn cand_menu_open() -> bool {
+    menu_now_ms() < CAND_MENU_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 候选窗右键：命中候选 → 六项调频菜单（向前移/向后移/移到最前/
 /// 移到最后/加词/删词）。语义与 Ctrl+数字（置顶）/Ctrl+Shift+数字
 ///（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
@@ -95,6 +115,23 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
                 rects
                     .iter()
                     .position(|(x0, y0, x1, y1)| lx >= *x0 && lx < *x1 && ly >= *y0 && ly < *y1)
+                    // 【右键宽容命中 2026-10-07】用户实测「非要点到字上
+                    // 才出菜单」——横排格窄、格间距/编码区/边缘空白点
+                    // 全落空。未直落任何格时取切比雪夫中心距最近的候选：
+                    // 点在词的大区域附近就命中，点哪儿都给菜单。
+                    .or_else(|| {
+                        rects
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                let da = ((lx - (a.0 + a.2) / 2.0).abs())
+                                    .max((ly - (a.1 + a.3) / 2.0).abs());
+                                let db = ((lx - (b.0 + b.2) / 2.0).abs())
+                                    .max((ly - (b.1 + b.3) / 2.0).abs());
+                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|(i, _)| i)
+                    })
             })
         };
         let Some(idx) = hit_idx else {
@@ -129,8 +166,9 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         append("加词", 5, false);
         append("删词", 6, false);
         cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-        // 【2026-10-06 用户拍板】解锁固定位从「中键」收进菜单最下
-        //（中键不优雅）；未固定时灰化展示（可发现性）。
+        // 【2026-10-07 用户拍板·恢复】此项保留（误删教训：用户要的是
+        //「用户调整文件里不出现 {置顶} 行=纯排序」，不是砍交互入口；
+        // 文件侧已由 set_order 归一保证）。未固定时灰化展示。
         let pinned_now = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         append("解锁固定位", 7, !pinned_now);
         // 3) owner=自建 0×0 顶层 TOOLWINDOW（langbar QQ 实证路线：
@@ -167,6 +205,11 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             }
         };
         let _ = SetForegroundWindow(owner);
+        // 免死金牌开牌：菜单期长效（10s 上限，实际由收场撤）
+        CAND_MENU_UNTIL_MS.store(
+            menu_now_ms() + 10_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let sel_id = cand2_TrackPopupMenu(
             m,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -175,6 +218,14 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             0,
             owner.0 as isize,
             std::ptr::null(),
+        );
+        // 【免死金牌·宽限撤牌 2026-10-07·三修】菜单收场后焦点回流
+        // 事件串（回宿主的 OnSetFocus/docmgr 切换）仍在队列里——立即
+        // 撤牌=回流被正常处理=清场收窗「一点就没」。宽限 1200ms 整口
+        // 吞掉回流串+用户连点节奏；动作只落数据+武装轮询，不受影响。
+        CAND_MENU_UNTIL_MS.store(
+            menu_now_ms() + 1_200,
+            std::sync::atomic::Ordering::Relaxed,
         );
         // KB135788：菜单系统状态机复位（缺它二次失灵）
         cand2_PostMessageW(owner.0 as isize, 0x0000, 0, 0);
@@ -211,7 +262,10 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             _ => return,
         };
         if let Some(r) = crate::ipc::call(&serde_json::json!({
-            "op": "cand_menu", "action": action, "page_index": idx, "text": text
+            "op": "cand_menu", "action": action, "page_index": idx, "text": text,
+            // 【T8 2026-10-07】携带显示时的 raw——菜单抢前台→宿主失活→空码
+            // 查询顶掉会话候选时，server 按码重建列表兜底定位。
+            "raw": raw
         })) {
             if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 cand_menu_refresh(&r);
@@ -247,17 +301,35 @@ unsafe fn cand_menu_refresh(resp: &Value) {
             .unwrap_or("")
             .to_string();
         let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // 【T8 复发排查 2026-10-07】重绘参数留痕（编码是否此时混入）
+        crate::tsf::trace(&format!(
+            "cw2: menu_refresh cands={} raw={raw:?} sel={sel}",
+            cands.len()
+        ));
         if let Some(gsh) = crate::tsf::G_SHARED.get() {
             let shared = gsh.0.clone();
-            let (mut cand2, _last, skin, caret) = {
+            // 【T8 终局三 2026-10-07·3:4x】立即显示+零漂移+不打架：
+            // ①手动同参重绘（打字帧同款：cands+raw+皮肤+光标锚）——
+            //   不走 update_ui 的组段/光标重查（实测每次重查锚点向左
+            //   漂=「每调一次框挪一点」）；
+            // ②同步 cand_sig_last=本帧签名——110ms 后停顿轮询看到
+            //   「无变化」直接跳过（此前打架/飘/重复帧的根源=签名没
+            //   同步，轮询再画一遍）。
+            let (mut cand2, skin, caret) = {
                 let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret)
+                g.last_show = Some((cands.clone(), raw.clone(), sel));
+                g.cand_sig_last = crate::tsf::state_sig(state);
+                (g.cand2.take(), g.skin.clone(), g.caret)
             };
             if let Some(c) = cand2.as_mut() {
-                c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】调频帧
+                // 与打字帧同一渲染铁律：只画候选，编码恒不画（宽度恒
+                // 定=框无从挪动；两帧同长相=无翻脸可言）。真 raw 仍写
+                // last_show（后续 ipc 用）。
+                c.show(&cands, "", &skin, caret.as_ref(), sel);
+                c.snap_anims();
             }
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.last_show = Some((cands, raw, sel));
             match (g.cand2.take(), cand2) {
                 (None, mine) => g.cand2 = mine,
                 (Some(newer), Some(mut mine)) => {
@@ -1778,6 +1850,22 @@ impl CandidateWindowV2 {
             }
         }
 
+        // 【右键命中·alpha 地板 2026-10-07】ULW 层叠窗 alpha=0 的像素鼠标
+        // 点击直接穿透——右键只在画了字的不透明像素上收得到（用户实测
+        // 「非要点到字上」）。全窗 alpha 抬到 ≥1：视觉零差异（1/255），
+        // 每像素可命中——「最近候选宽容命中」才有机会收到消息。放在
+        // 空帧拦截之后（地板会弄瞎全透明扫描）。预乘色保持 0（A=1 纯净）。
+        if self.ulw_bits != 0 {
+            let dst = self.ulw_bits as *mut u8;
+            let n = (w as usize) * (h as usize);
+            for i in 0..n {
+                let a = dst.add(i * 4 + 3);
+                if *a == 0 {
+                    *a = 1;
+                }
+            }
+        }
+
         // 4) ULW 上屏（premultiplied AC_SRC_ALPHA；尺寸=窗口尺寸）
         let blend = BLENDFUNCTION {
             BlendOp: 0, // AC_SRC_OVER
@@ -1924,15 +2012,45 @@ impl CandidateWindowV2 {
         r
     }
 
+    /// 【右键调频帧专用 2026-10-07·三修】只瞬跳**位置**；**尺寸动画
+    /// 照常跑**。二修把尺寸动画也掐了——尺寸终态由动画 tick 负责应用
+    ///（连带重渲染圆角位图），掐掉=删词后窗不缩（空白块）+旧位图拉
+    /// 伸（直角）。位置无渲染耦合，瞬跳安全（「框不挪窝」的本意）。
+    pub fn snap_anims(&mut self) {
+        if let Some((_, (tx, ty), _, _, _)) = self.pos_anim {
+            self.pos_anim = None;
+            self.live_pos.set((tx, ty));
+            let (w, h) = self.live_size.get();
+            let _ = unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    tx,
+                    ty,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+            };
+        }
+    }
+
     pub fn show(
         &mut self,
         cands: &[(String, String)],
-        raw: &str,
+        _raw_req: &str,
         skin: &Value,
         anchor: Option<&RECT>,
         selected: usize,
     ) {
-        // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
+        // 【T8 用户铁律·框内永不画编码 2026-10-07 终局二】show() 咽喉
+        // 一刀：显示用 raw 恒空——**所有车道**（打字/上屏/调频刷新/
+        // 动画 tick 复渲染/皮肤重绘/焦点重显）必经此处，无路可绕。
+        // 此前只堵了 update_ui 和调频刷新两条道，动画 tick 拿真 raw
+        // 重画=删词收缩动画全程带码且画完滞留（trace 实锤 ir=true 帧
+        // raw='uru'）。编码段只活在宿主内联预编辑里；宽度恒与编码无
+        // 关=框无从因码挪动。
+        let raw = "";        // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
         // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
         // 「上一段落点」已变「本段落点」，起点≡终点，追赶永不臂=全程直
         // 出（用户实测）。函数头先抢救上一帧的 sticky。
@@ -4042,9 +4160,32 @@ impl CandidateWindowV2 {
                             let mut out = None;
                             unsafe {
                                 if GetGUIThreadInfo(0, &mut gi) != 0 && !gi.hwnd_focus.0.is_null() {
-                                    let mut fr = RECT::default();
-                                    if GetWindowRect(gi.hwnd_focus, &mut fr).is_ok() {
-                                        let w = fr.right - fr.left;
+                                    // 【T8 自我对齐死循环 2026-10-07 终局】右键
+                                    // 菜单抢焦点期间，焦点窗=**本候选窗自身**
+                                    //（HuFuCandWin2，宽 395≤400 被「小编辑框」
+                                    // 判据命中）→ 框左对齐到自己的左边 → 每点
+                                    // 一次菜单自我对齐一次=「调一下左移 31px
+                                    // 再调再移」的反馈循环（trace 实锤：
+                                    // 小编辑框左对齐 x=580 光标x=611，且逐次
+                                    // 580→549→518）。自家窗（候选窗/右键菜单
+                                    // 宿主窗）一律不算编辑框。
+                                    let self_focus = gi.hwnd_focus.0 == self.hwnd.0;
+                                    let mut cls: [u16; 32] = [0; 32];
+                                    let cls_len =
+                                        GetClassNameW(gi.hwnd_focus, &mut cls);
+                                    let focus_cls = if cls_len > 0 {
+                                        String::from_utf16_lossy(
+                                            &cls[..cls.iter().position(|&c| c == 0).unwrap_or(32)],
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+                                    let own_family = focus_cls.contains("HuFuCand")
+                                        || focus_cls.contains("HUFU_C2_MENU");
+                                    if !self_focus && !own_family {
+                                        let mut fr = RECT::default();
+                                        if GetWindowRect(gi.hwnd_focus, &mut fr).is_ok() {
+                                            let w = fr.right - fr.left;
                                         // 【勘误·同修】锚右缘=编码整段文本延伸
                                         //（GetTextExt 全段矩形），小框里天然横向
                                         // 溢出（桌面重命名框 84px、编码 60px+
@@ -4056,9 +4197,10 @@ impl CandidateWindowV2 {
                                         if w > 0 && w <= 400 && v_overlap {
                                             out = Some(fr.left);
                                         }
+                                        }
                                     }
                                 }
-                            }
+                             }
                             out
                         };
                         let x_base = small_edit_x.unwrap_or(caret_x);
