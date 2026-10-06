@@ -1,4 +1,4 @@
-param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
@@ -657,6 +657,29 @@ if (-not $svAll) {
 } # end if (-not $NoModel)
 
 $report | Out-File "$LOGD\pack-$stamp-OK.txt" -Encoding UTF8
+
+# 【2026-10-06 打包后复活 live server】无 UAC 模式的前提就是调用方把
+# server 杀净了（上面 382 行门禁），而 DLL 侧守护并不可靠（实测
+# pipe=fail perr=2 只报错不拉活——本机用户「打不了字」事故：打包杀
+# server 后无人复活，打字全断直到人工拉起）。打包链杀了谁就该负责
+# 拉回谁：收尾时从 live 安装重启 server。管理员模式自带 ctfmon/守护
+# 复活链，不经此路径。
+if ($skipTeng) {
+    $liveSrv = Get-ChildItem 'D:\HUFU' -Directory -Filter 'HuFu虎符输入法-v*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($liveSrv -and (Test-Path (Join-Path $liveSrv.FullName 'hufu-server.exe'))) {
+        try {
+            Start-Process -FilePath (Join-Path $liveSrv.FullName 'hufu-server.exe') -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+            if (Get-Process hufu-server -ErrorAction SilentlyContinue) {
+                Write-Host '★ 已重启 live hufu-server（停服腾位的善后）' -ForegroundColor Cyan
+            } else {
+                Write-Host '⚠ live server 重启失败——请手动启动或重新登录' -ForegroundColor Yellow
+            }
+        } catch { Write-Host "⚠ 重启 live server 异常: $_" -ForegroundColor Yellow }
+    }
+}
+
 Write-Host ''
 Write-Host "★ 打包完成（核验全绿）: $zip" -ForegroundColor Cyan
 Write-Host '  报告见 日志\；发布后（用户验证过）把 zip 复制进 基线包\ 作为下一版基线'
