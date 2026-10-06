@@ -54,6 +54,18 @@ pub(crate) const OVERLAY_RESYNC_TIMER_ID: usize = 0x4F52; // "OR"
 
 static OVERLAY_SKIN_HASH: AtomicU64 = AtomicU64::new(0);
 
+/// 沙盒取证（diag 目录授过全应用包写权限；AppContainer 宿主 trace
+/// 写不进去）：关键分支一次性落 notes-<pid>.txt，只作诊断不进热路径。
+fn note_once(key: &'static str, msg: &str) {
+    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.contains(&key) {
+        g.push(key);
+        drop(g);
+        crate::tsf::diag_note(msg);
+    }
+}
+
 /// 【预解码缓存 2026-11】皮肤到位即开解（不等首键 sync）：
 /// (img_key, built_for) → 解码态。新进程首段/导入后的首段即显。
 static PREWARM: Mutex<Option<(u64, u32, Arc<DecodeState>)>> = Mutex::new(None);
@@ -560,6 +572,7 @@ impl OverlayWin {
     }
 
     unsafe fn create_impl(cand: Option<HWND>) -> Option<OverlayWin> {
+        let mut reg_err = 0u32;
         if !CLASS_REGISTERED.swap(true, Ordering::AcqRel) {
             let class: Vec<u16> = "HuFuCandOverlay\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -571,18 +584,10 @@ impl OverlayWin {
                 ..Default::default()
             };
             let _atom = RegisterClassW(&wc);
+            if _atom == 0 {
+                reg_err = GetLastError().0;
+            }
         }
-        let class: Vec<u16> = "HuFuCandOverlay\0".encode_utf16().collect();
-        // TRANSPARENT+LAYERED = 全窗鼠标穿透;TOPMOST|NOACTIVATE|TOOLWINDOW
-        // 与候选窗同款。类名含 "HuFuCand" → 切输入法时 hide_all_cand_windows
-        // 扫尸自动波及本窗(wndproc 处理 WM_APP_HIDE_CAND 自收)。
-        let ex = WINDOW_EX_STYLE(
-            WS_EX_LAYERED.0
-                | WS_EX_TOPMOST.0
-                | WS_EX_NOACTIVATE.0
-                | WS_EX_TOOLWINDOW.0
-                | WS_EX_TRANSPARENT.0,
-        );
         // 挂件 owner=候选窗的 owner（owned 模式）；经典模式=0（顶层窗）
         let mut owner = HWND(std::ptr::null_mut());
         if let Some(c) = cand {
@@ -591,24 +596,94 @@ impl OverlayWin {
                 owner = HWND(op as *mut _);
             }
         }
-        let hwnd = CreateWindowExW(
-            ex,
-            PCWSTR(class.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE(WS_POPUP.0),
-            0,
-            0,
-            10,
-            10,
-            owner,
-            HMENU(std::ptr::null_mut()),
-            HINSTANCE(std::ptr::null_mut()),
-            None,
-        )
-        .unwrap_or_default();
+        let class: Vec<u16> = "HuFuCandOverlay\0".encode_utf16().collect();
+        // TRANSPARENT+LAYERED = 全窗鼠标穿透;TOPMOST|NOACTIVATE|TOOLWINDOW
+        // 与候选窗同款。类名含 "HuFuCand" → 切输入法时 hide_all_cand_windows
+        // 扫尸自动波及本窗(wndproc 处理 WM_APP_HIDE_CAND 自收)。
+        // 【沙盒建窗 2026-11】Microsoft Store 实测 CreateWindowExW 0x5 拒
+        //（候选窗同款参数可活——差异元素排查中）：先按全量参数建，失败
+        // 依次减 ex 元素/去 owner 阶梯重试，首个成功者即沙盒可活形态。
+        let full_ex = WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
+        // 【沙盒建窗 2026-11】Microsoft Store 实测三连拒：创建带宿主视图
+        // owner=0x5、事后 attach owner=静默失败、无主顶层=DWM cloak。但
+        // 候选窗自己（同线程亲窗）当 owner 从未被拒——owned-to-cand 同样
+        // 把挂件挂进候选窗的 owner 链（overlay→cand→宿主视图），借道逃
+        // cloak（实测 A/B/A 亮度对比=渲染成功）。阶梯：rung1=原宿主视图
+        // owner（常规宿主/SearchHost 与 2026-10-06 行为零变化）；拒了才
+        // rung2=cand 自身（Store 类沙盒）；再拒做 ex 降级与无主兜底。
+        let cand_owner = owner;
+        let cand_self = cand.map(|c| c).unwrap_or(HWND(std::ptr::null_mut()));
+        let mut hwnd = HWND(std::ptr::null_mut());
+        let mut used_ex = 0u32;
+        let mut used_owner = HWND(std::ptr::null_mut());
+        let ladder: [(u32, HWND); 7] = [
+            (full_ex, cand_owner),
+            (full_ex, cand_self),
+            (full_ex & !WS_EX_LAYERED.0, cand_self),
+            (full_ex & !WS_EX_TOPMOST.0, cand_self),
+            (full_ex & !WS_EX_NOACTIVATE.0, cand_self),
+            (full_ex & !WS_EX_TOOLWINDOW.0, cand_self),
+            (full_ex, HWND(std::ptr::null_mut())),
+        ];
+        let mut errs = String::new();
+        let mut hit_rung = 0usize;
+        for (i, (ex_bits, o)) in ladder.iter().enumerate() {
+            // rung1 的 owner=0 合法（无主顶层=常规宿主原行为）；仅 cand_self
+            // 源无效时跳过 cand 系档（i=2..5；i=6=有意无主兜底不跳）
+            if i >= 2 && i <= 5 && o.0.is_null() {
+                continue;
+            }
+            match CreateWindowExW(
+                WINDOW_EX_STYLE(*ex_bits),
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0),
+                0,
+                0,
+                10,
+                10,
+                *o,
+                HMENU(std::ptr::null_mut()),
+                HINSTANCE(std::ptr::null_mut()),
+                None,
+            ) {
+                Ok(h) if !h.0.is_null() => {
+                    hwnd = h;
+                    used_ex = *ex_bits;
+                    used_owner = *o;
+                    hit_rung = i + 1;
+                    if !errs.is_empty() {
+                        crate::tsf::diag_note(&format!(
+                            "ov: 阶梯第 {hit_rung} 档建成 ex=0x{ex_bits:X} owner=0x{:X}",
+                            o.0 as usize
+                        ));
+                    }
+                    break;
+                }
+                r => {
+                    let code = r.err().map(|e| e.code().0).unwrap_or(0);
+                    errs.push_str(&format!("0x{code:X};"));
+                }
+            }
+        }
         if hwnd.0.is_null() {
+            crate::tsf::diag_note(&format!(
+                "ov: 建窗全档被拒 errs={errs} reg_err=0x{reg_err:X} owner=0x{:X}",
+                owner.0 as usize
+            ));
             return None;
         }
+        // 沙盒缺失的穿透元素建后补挂（失败仅损失穿透，HTTRANSPARENT 兜底）
+        unsafe {
+            let want = used_ex | WS_EX_TRANSPARENT.0;
+            if want != used_ex {
+                let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                if cur != want {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as isize);
+                }
+            }
+        }
+        let _ = used_owner;
         Some(OverlayWin {
             hwnd: hwnd.0 as isize,
             dc: 0,
@@ -853,6 +928,12 @@ unsafe extern "system" fn overlay_wndproc(
         resync_by_ov_hwnd(hwnd);
         return LRESULT(0);
     }
+    if msg == 0x0084 {
+        // WM_NCHITTEST→HTTRANSPARENT：穿透兜底（沙盒建窗期带
+        // WS_EX_TRANSPARENT 被 0x5 拒、建后补挂也可能被拒时，
+        // 鼠标事件转发给下方窗口；同线程候选窗区域等效穿透）
+        return LRESULT(-1); // HTTRANSPARENT
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -928,6 +1009,7 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         return;
     }
     let gen = OVERLAY_GEN.load(Ordering::Acquire);
+    note_once("sync-enter", &format!("ov: sync_for 进入 gen={gen}"));
     let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let pos = match list.iter().position(|e| e.cand == cand_key) {
         Some(p) => p,
@@ -960,6 +1042,14 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
             entry.drawn = None;
             entry.disabled = false;
             entry.retry_until = None;
+            note_once(
+                "cfg-parse",
+                &format!(
+                    "ov: 代次解析 cfg={}（None=皮肤未载/无 overlay 节）skin_null={}",
+                    entry.cfg.is_some(),
+                    skin.is_null()
+                ),
+            );
         }
     }
     sync_tail_locked(cand, &mut list, pos);
@@ -1046,6 +1136,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
             None => {
                 entry.disabled = true;
                 crate::tsf::trace("ov: 兄弟窗创建失败,本代次禁用");
+                note_once("create-fail", "ov: 兄弟窗创建失败（沙盒建窗被拒?）→本代次禁用");
                 return;
             }
         }
@@ -1092,6 +1183,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
                 .retry_until
                 .get_or_insert(now + std::time::Duration::from_secs(3));
             if now < until {
+                note_once("not-ready", "ov: 首帧未就绪→补拍钟自查");
                 let _ = SetTimer(oh, OVERLAY_RESYNC_TIMER_ID, 30, None);
             } else {
                 let _ = KillTimer(oh, OVERLAY_RESYNC_TIMER_ID);
@@ -1160,6 +1252,13 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
     // 上屏成功：补拍钟退役（未臂时 KillTimer 无害）
     let _ = KillTimer(ov_h, OVERLAY_RESYNC_TIMER_ID);
     entry.retry_until = None;
+    note_once(
+        "shown",
+        &format!("ov: 上屏 {cw}x{ch} at ({x},{y}) cand_visible={}", {
+            let v = IsWindowVisible(cand).as_bool();
+            v
+        }),
+    );
     // 动图节拍:时间基准推进,每拍至多 1 帧(宿主线程卡顿后逐帧补放,
     // 绝不跳帧);WM_TIMER 与 sync 双路驱动同一时钟
     tick_playback(
