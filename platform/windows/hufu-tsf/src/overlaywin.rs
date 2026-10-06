@@ -679,7 +679,8 @@ impl OverlayWin {
             if want != used_ex {
                 let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
                 if cur != want {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as isize);
+                    // `as _`：x64=isize/i686=i32（windows-rs 按目标定型）
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as _);
                 }
             }
         }
