@@ -571,9 +571,10 @@ pub fn dispatch(
             let current = host.engine.config.schema.current.clone();
             serde_json::json!({"schemas": names, "current": current})
         }
-        // 【2026-09-05】语言栏右键「重载码表」：当前方案原样重载（改
-        // 码表/补充语料/符号表后免重启 server 生效）。与 set_schema 同
-        // 源逻辑，name=当前方案名。
+        // 【2026-09-05·2026-11 演进】原语言栏右键「重载码表」入口已删
+        //（Windows 改码表监视线程自动重载，见 main.rs）；本 op 保留：
+        // Linux fcitx5 托盘「重载码表」与紧急手动通道。当前方案原样
+        // 重载，与 set_schema 同源逻辑，name=当前方案名。
         "reload_schema" => {
             let name = host.engine.config.schema.current.clone();
             let ok = host.engine.switch_schema(&name).is_ok();

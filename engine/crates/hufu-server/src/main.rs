@@ -372,6 +372,176 @@ fn main() {
             });
     }
 
+    // 【码表实时生效 2026-11】方案目录文件变化自动重载（语言栏
+    // 「重载码表」菜单已删——改完码表不用再手点，保存即生效）。每
+    // 2s 指纹轮询（文件名+尺寸+mtime；只看 Schema::load 消费的扩展
+    // 名 txt/注释/拆分/dict.yaml，tmp/bak/swp 噪声不进指纹），两轮
+    // 稳定才触发（编辑器分步写/大码表拷贝中途不触发，防半截解析）。
+    // 分档重载：
+    // ①仅 用户调整/用户词 变化 → reload_user_data 轻路径：不清组段
+    //   （打字无感）、不重建整句。引擎自身的调整落盘（置顶/删词等）
+    //   也走此档——内存态与文件已同步，回读幂等，仅一次冗余解析；
+    // ②其余（主码表/符号表/补充语料/反查表…）→ 与旧菜单同源全量：
+    //   switch_schema(当前) + session.clear + reload_sentence_bg(true,
+    //   true)。打字保护：组段未闭合（!is_idle）时等空档再动（60s 强制
+    //   兜底），避免清掉在打的输入串。
+    // 解析失败（文件写错/编码坏）保持旧码表不动（Schema::load 失败
+    // 在替换前返回），指纹照常前移防重试风暴；切方案换目录时基线随
+    // 之重置（切方案本身已装载，不双触发）。
+    {
+        let shared_w = shared.clone();
+        let data_dir_w = data_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("hufu-schema-watch".into())
+            .spawn(move || {
+                // 指纹：(文件键 stem|ext, 尺寸, mtime秒) 有序表
+                let fingerprint = |dir: &std::path::Path| -> Option<Vec<(String, u64, i64)>> {
+                    let mut v: Vec<(String, u64, i64)> = Vec::new();
+                    for e in std::fs::read_dir(dir)
+                        .ok()?
+                        .into_iter()
+                        .flatten()
+                    {
+                        let p = e.path();
+                        if !p.is_file() {
+                            continue;
+                        }
+                        let ext = p
+                            .extension()
+                            .map(|x| x.to_string_lossy().to_lowercase())
+                            .unwrap_or_default();
+                        let stem = p
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        // 只收 Schema::load 消费的扩展名；yaml 仅
+                        // <名>.dict.yaml（Rime 词典），其余 yaml 噪声跳过
+                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let consumed = match ext.as_str() {
+                            "txt" | "注释" | "拆分" => true,
+                            "yaml" => name.ends_with(".dict.yaml"),
+                            _ => false,
+                        };
+                        if !consumed {
+                            continue;
+                        }
+                        let Ok(md) = std::fs::metadata(&p) else {
+                            continue;
+                        };
+                        let mtime = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        v.push((format!("{stem}|{ext}"), md.len(), mtime));
+                    }
+                    v.sort();
+                    Some(v)
+                };
+                let mut base: Vec<(String, u64, i64)> = Vec::new();
+                let mut prev: Vec<(String, u64, i64)> = Vec::new();
+                let mut base_dir = std::path::PathBuf::new();
+                let mut armed_since: Option<std::time::Instant> = None;
+                let mut first_round = true;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // 当前方案目录（切方案后跟着走；短锁只取两个字符串）
+                    let (dir, current) = {
+                        let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            hufu_engine::Engine::resolve_data_sub(
+                                &data_dir_w,
+                                &h.engine.config.schema.dir,
+                            )
+                            .join(&h.engine.config.schema.current),
+                            h.engine.config.schema.current.clone(),
+                        )
+                    };
+                    let Some(cur) = fingerprint(&dir) else {
+                        continue; // 方案目录不在/不可读：静默等下一轮
+                    };
+                    // 首轮 or 目录切换：换基线不触发（切方案路径已装载）
+                    if first_round || dir != base_dir {
+                        first_round = false;
+                        base_dir = dir;
+                        base = cur.clone();
+                        prev = cur;
+                        armed_since = None;
+                        continue;
+                    }
+                    if cur == base {
+                        prev = cur;
+                        armed_since = None;
+                        continue; // 无变化（回落=编辑中途放弃）
+                    }
+                    if cur != prev {
+                        // 还在变（编辑器分步写/拷贝中）：等稳定
+                        prev = cur;
+                        armed_since = None;
+                        continue;
+                    }
+                    // 稳定的变化：cur != base && cur == prev → 分档重载
+                    let changed: Vec<String> = cur
+                        .iter()
+                        .filter(|(n, sz, mt)| {
+                            !base
+                                .iter()
+                                .any(|(bn, bs, bm)| bn == n && bs == sz && bm == mt)
+                        })
+                        .map(|(n, _, _)| n.clone())
+                        .collect();
+                    let user_only = changed
+                        .iter()
+                        .all(|n| n == "用户调整|txt" || n == "用户词|txt");
+                    if user_only {
+                        let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                        h.engine.reload_user_data();
+                        eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
+                    } else {
+                        // 打字保护：组段未闭合等空档（60s 强制兜底）
+                        let mut defer = false;
+                        {
+                            let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                            defer = !h.session.is_idle();
+                        }
+                        if defer {
+                            let elapsed_ok = armed_since
+                                .map(|t| t.elapsed().as_secs() < 60)
+                                .unwrap_or(true);
+                            if armed_since.is_none() {
+                                armed_since = Some(std::time::Instant::now());
+                            }
+                            if elapsed_ok {
+                                continue; // 下一轮再看（组段通常秒级闭合）
+                            }
+                            eprintln!("码表监视：组段迟迟未闭合，60s 到点强制全量重载");
+                        }
+                        let ok = {
+                            let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                            let r = h.engine.switch_schema(&current);
+                            if r.is_ok() {
+                                h.session.clear();
+                            }
+                            r.is_ok()
+                        };
+                        if ok {
+                            eprintln!(
+                                "码表监视：方案「{current}」目录变化（{:?}），全量重载完成",
+                                changed
+                            );
+                            reload_sentence_bg(true, true);
+                        } else {
+                            eprintln!("码表监视：全量重载失败（文件写错/编码坏），保持旧码表");
+                        }
+                    }
+                    base = cur;
+                    prev = base.clone();
+                    armed_since = None;
+                }
+            });
+    }
+
     // Windows 托盘（双击开设置页 / 右键退出）
     #[cfg(windows)]
     {

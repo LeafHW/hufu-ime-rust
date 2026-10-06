@@ -653,9 +653,10 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         if !schemas.is_empty() {
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
         }
-        // 【2026-09-05】重载码表：改码表/补充语料后免重启即生效。
-        let wrel: Vec<u16> = "重载码表".encode_utf16().chain([0]).collect();
-        AppendMenuW(m, MF_STRING, 2, wrel.as_ptr());
+        // 【实时生效 2026-11】「重载码表」菜单已删：server 侧码表监视
+        // 线程每 2s 指纹轮询方案目录，改动稳定后自动重载（轻/全量分
+        // 档）——改完码表保存即生效，无需手点。管道 op reload_schema
+        // 仍保留（Linux fcitx5 托盘在用）。
         // 打开当前方案码表目录（资源管理器）
         let wdir: Vec<u16> = "打开方案文件夹".encode_utf16().chain([0]).collect();
         AppendMenuW(m, MF_STRING, 3, wdir.as_ptr());
@@ -787,9 +788,6 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         // 菜单动作全部异步管道（msctf 回调里零阻塞）
         if sel == 1 {
             pipe_async(serde_json::json!({"op": "settings"}));
-        } else if sel == 2 {
-            // 重载码表（当前方案原样重载；server 侧清会话+重建整句）
-            pipe_async(serde_json::json!({"op": "reload_schema"}));
         } else if sel == 3 {
             // 打开当前方案码表目录（server 侧 explorer）
             pipe_async(serde_json::json!({"op": "open_schema_dir"}));
