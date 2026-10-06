@@ -711,7 +711,18 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             // 注入上屏（聊天框无明文）；聊天关=原样转交原 proc（技能键
             // 原生畅通）。子类化在首个焦点事件窗口就绪后装（见
             // OnSetFocus）。普通宿主照旧挂前景 sink。
-            if raw_fullscreen_host() || game_host_blocklisted() {
+            // 【T6/T7 修复 2026-10-06】外壳宿主豁免：Win11 的 explorer/
+            // 任务栏/搜索常驻「全屏透明输入层/满屏 CoreWindow」——形状
+            // 探测在 explorer.exe 实锤误判（trace「游戏宿主→子类化流派
+            // （不挂 sink）」×3，此后键零派发=开始菜单/重命名/资源
+            // 管理器搜索全灭）。shell 进程有真实编辑焦点（搜索框/重命
+            // 名框），永不走子类化流派。
+            let fs_or_list = raw_fullscreen_host() || game_host_blocklisted();
+            let shell_exempt = shell_host_never_game();
+            if fs_or_list && shell_exempt {
+                crate::tsf::trace("activate: 外壳宿主豁免——形状/名单命中但 shell 进程挂正常 sink");
+            }
+            if fs_or_list && !shell_exempt {
                 crate::tsf::trace("activate: 游戏宿主 → 子类化流派（不挂 sink）");
                 GAME_HOST_MODE.with(|c| c.set(true));
                 GAME_CHAT_OPEN.with(|c| c.set(false));
@@ -6444,6 +6455,35 @@ fn raw_fullscreen_host() -> bool {
         let _ = EnumWindows(Some(raw_fs_enum_proc), LPARAM(0));
         RAW_FS_HIT.load(AtomicOrdering::Relaxed) != 0
     }
+}
+
+/// 【T6/T7 修复 2026-10-06】外壳宿主永不算游戏宿主：Win11 的 explorer/
+/// 任务栏/搜索/开始菜单常驻满屏透明输入层（CoreWindow/XAML 输入岛），
+/// raw_fullscreen_host 的形状探测在 explorer.exe 实锤误判三次（trace
+/// 三条「游戏宿主→子类化流派」，键 sink 未挂→键零派发：开始菜单/
+/// 重命名/资源管理器搜索全灭）。这些进程有真实编辑焦点语义，必须
+/// 走正常 TSF 键 sink。名单小写比对 current_exe 文件名。
+fn shell_host_never_game() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(name) = exe.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "explorer.exe"
+            | "searchhost.exe"
+            | "startmenuexperiencehost.exe"
+            | "shellexperiencehost.exe"
+            | "applicationframehost.exe"
+            | "systemsettings.exe"
+            | "textinputhost.exe"
+            | "ctfmon.exe"
+            | "sihost.exe"
+            | "dwm.exe"
+    )
 }
 
 /// 【A4·游戏宿主名单】Activate 期窗口形态未就绪（LOL 加载期）且
