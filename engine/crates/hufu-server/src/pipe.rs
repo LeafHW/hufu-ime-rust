@@ -20,23 +20,6 @@ const BUF: usize = 1 << 20;
 #[cfg(windows)]
 const RESP_BUF: usize = 32 << 20;
 
-/// 【T8 复发排查 2026-10-07】cand_menu 动作全量快照 → server-menu.log
-/// （server 无控制台；trace.log 只归 DLL）。UTF-8 追加。
-fn menu_diag(line: &str) {
-    use std::io::Write;
-    let path = r"C:\ProgramData\HuFu\trace\server-menu.log";
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn raw_req_marker(req: &serde_json::Value) -> String {
-    req.get("raw")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// 分派一个操作。返回 JSON 响应。
 /// `client_exe`：管道对端进程映像名（服务端经 GetNamedPipeClientProcessId
 /// 反查，不可伪造）——敏感操作（剪贴板读取）的白名单以此为准；None =
@@ -201,25 +184,7 @@ pub fn dispatch(
             let abs = match resolve(page_index, text) {
                 Some(a) => a,
                 None => {
-                    // 【T8 快照 2026-10-07·复发排查】未命中兜底前先落盘
-                    //（实机 cands=3/4 交替=第 4 条来源不明，管道复现不
-                    // 出——实机会话全量快照定位）。
-                    let snap = format!(
-                        "[miss] act={} text={} raw_req={:?} sess.raw={:?} page={} cands=[{}]\n",
-                        action,
-                        text,
-                        raw_req_marker(req),
-                        host.session.raw,
-                        host.session.page,
-                        host.session
-                            .candidates
-                            .iter()
-                            .map(|c| format!("{}|{}", c.text, c.comment))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                    menu_diag(&snap);
-                    // 【T8 真根因 2026-10-07】真机复测（DLL trace + 本处
+                    // 【T8 真根因 2026-10-07】真机复测（DLL trace + 实机
                     // 快照）：菜单 owner 抢前台 → 宿主失活 → DLL 失活路
                     // 径的空码查询把 session.candidates 顶掉（候选窗画的
                     // 还是旧列表）→ 词不在全列表=「候选不在页」，重试碰
@@ -249,18 +214,6 @@ pub fn dispatch(
                                 },
                             );
                         }
-                        menu_diag(&format!(
-                            "[scratch] act={} text={} raw_req={:?} rebuilt_n={} list=[{}]\n",
-                            action,
-                            text,
-                            raw_req,
-                            s.candidates.len(),
-                            s.candidates
-                                .iter()
-                                .map(|c| c.text.clone())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        ));
                         if let Some(a) = s.candidates.iter().position(|c| c.text == text) {
                             // 在重建会话上执行动作（写 用户调整.txt 同源）
                             let total_s = s.candidates.len();
@@ -312,26 +265,6 @@ pub fn dispatch(
                             return serde_json::json!({"ok": true, "state": state});
                         }
                     }
-                    let ses = &host.session;
-                    let line = format!(
-                        "[cand_menu 未命中] action={} text={} raw_req={:?} session.raw={:?} cands={} head={:?}\n",
-                        action,
-                        text,
-                        raw_req,
-                        ses.raw,
-                        ses.candidates.len(),
-                        ses.candidates
-                            .iter()
-                            .take(3)
-                            .map(|c| c.text.as_str())
-                            .collect::<Vec<_>>()
-                    );
-                    let _ = std::fs::write(
-                        r"C:\ProgramData\HuFu\trace\server-menu.log",
-                        std::fs::read_to_string(r"C:\ProgramData\HuFu\trace\server-menu.log")
-                            .unwrap_or_default()
-                            + &line,
-                    );
                     return serde_json::json!({"ok": false, "why": "候选不在当前页"});
                 }
             };
@@ -381,24 +314,6 @@ pub fn dispatch(
             }
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
-            // 【T8 快照 2026-10-07·复发排查】动作后全量落盘（4 条之谜）。
-            {
-                let texts: Vec<String> = host
-                    .session
-                    .candidates
-                    .iter()
-                    .map(|c| format!("{}|{}", c.text, c.comment))
-                    .collect();
-                menu_diag(&format!(
-                    "[done] act={} text={} abs={} total={} after=[{}] raw={:?}\n",
-                    action,
-                    text,
-                    abs,
-                    total,
-                    texts.join(" "),
-                    host.session.raw
-                ));
-            }
             serde_json::json!({"ok": true, "state": state})
         }
         // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。

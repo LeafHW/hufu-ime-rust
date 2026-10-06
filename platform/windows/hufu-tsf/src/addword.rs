@@ -513,7 +513,6 @@ fn open_common() {
         }
         let my_tid = GetCurrentThreadId();
         ADDWORD_TID.store(my_tid, std::sync::atomic::Ordering::Relaxed);
-        crate::tsf::trace(&format!("aw窗登记 tid={my_tid:x} hwnd={}", hwnd.0 as isize));
         drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
         // 【六修 2026-09-12】AttachThreadInput 抢前台——此前裸调
@@ -974,7 +973,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // EN_UPDATE=0x400：文本每变一次立即刷（0x200 是 EN_KILLFOCUS，
             // 上版误用导致「光标移走才刷新」）
             if (id == ID_CODE || id == ID_POS || id == ID_WORD) && notif == ID_EN_UPDATE {
-                // 【T4 排查 2026-10-06】加词框顶屏重复——EN_UPDATE 时读三框
                 let rd = |i: i32| -> String {
                     match GetDlgItem(hwnd, i) {
                         Ok(h) => {
@@ -990,9 +988,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 };
                 let (wv, cv, pv) = (rd(ID_WORD), rd(ID_CODE), rd(ID_POS));
-                crate::tsf::trace(&format!(
-                    "awEU id={id} word={wv:?} code={cv:?} pos={pv:?}"
-                ));
                 // 【RichEdit 数字过滤 2026-10-07】RichEdit 不认
                 // ES_NUMBER——选重位/加权权重框在 EN_UPDATE 剔除非
                 // 数字（写回后光标置尾）。

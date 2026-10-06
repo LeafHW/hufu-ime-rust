@@ -2759,11 +2759,6 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::StartPreedit(text) => {
-                // 【T4 排查】建段
-                crate::tsf::trace(&format!(
-                    "StP#in tid={:x} text={text:?}",
-                    crate::tsf::dbg_tid()
-                ));
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
                 // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
                 let cc: ITfContextComposition = ctx.cast()?;
@@ -2807,12 +2802,6 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::SetPreedit(text) => {
-                // 【T4 排查】逐键组段更新
-                crate::tsf::trace(&format!(
-                    "SP#in tid={:x} text={text:?} comp={}",
-                    crate::tsf::dbg_tid(),
-                    g.composition.is_some()
-                ));
                 // 【组段漂移自愈 2026-09-09】选区已离段（用户点了别处，
                 // 宿主未按契约终止组段）——弃旧段在当前光标处重组段，
                 // 否则本键的预编辑写进旧位置（「首键不在光标处」）。
@@ -3065,12 +3054,6 @@ impl EditSession_Impl {
                 Ok(())
             }
             Op::CommitAndRepreedit(commit_text, preedit) => {
-                // 【T4 排查 2026-10-06】加词框顶屏重复——逐帧记录 C&R 全参
-                crate::tsf::trace(&format!(
-                    "C&R#in tid={:x} commit={commit_text:?} preedit={preedit:?} comp={}",
-                    crate::tsf::dbg_tid(),
-                    g.composition.is_some()
-                ));
                 // 【功能词拦截 2026-09-06b】提前上屏路径（pending 收口+
                 // 新编码并存）也会带出 {加权}/{加词}——不落文档：弹窗，
                 // 剩余 preedit 继续组句（与 Op::Commit 拦截同语义）。
@@ -3136,12 +3119,6 @@ impl EditSession_Impl {
                         crate::displayattr::unmark_range(ec, &ctx, &range);
                         range.SetText(ec, 0, &wstr).is_ok()
                     };
-                    // 【T4 排查】C&R 提交段 SetText 结果
-                    crate::tsf::trace(&format!(
-                        "C&R#set ok={set_ok} drifted_earlier={} text_len={}",
-                        composition_drifted(&g, &ctx, ec),
-                        wstr.len()
-                    ));
                     if set_ok {
                         // 【增量估算 2026-09-12 十一次修正】不再做上屏
                         // 瞬间重校（真实/估算两套位置交替=抖动与远跳的
@@ -4424,15 +4401,6 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
     // 此前按会话真相画 raw：组词/上屏/调频帧宽度来回变=「编码冒出
     // 来+框挪一下」的全部观感来源。
     let raw_disp = String::new();
-    // 【T4 排查 2026-10-06】加词框顶屏重复——update_ui 入口全参（每帧）
-    {
-        let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
-        let pre = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
-        crate::tsf::trace(&format!(
-            "uIU#in tid={:x} commit={commit:?} raw={raw:?} preedit={pre:?}",
-            crate::tsf::dbg_tid()
-        ));
-    }
     // 【Shared 同源登记·二十六修】本帧渲染（含 tl_cand_show 写
     // last_show）用的锁登记线程局部——fade/expand tick 的 TL 分支取
     // tl_shared() 与本帧同源，动画数据不再读错实例。
@@ -4696,9 +4664,6 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         // 示组合内文本）——索性零组段：提交直插（Op::Insert），无组段
         // 可漂移/可终止，整类算术 bug 连根拔。候选窗照常走 state 渲染。
         let aw_box = crate::addword::in_window_thread();
-        if aw_box {
-            crate::tsf::trace("uIU#aw 命中零组段通道");
-        }
         // 【T4 v5 定案 2026-10-07】C&R「提交后重开组段」=通用重复源；
         // 无活段的直插在两种框（EDIT 与 RichEdit，真机分别实锤）都
         // 延迟+逐键重放。统一律：
@@ -5829,7 +5794,6 @@ pub fn aw_flush_pending() {
         (g.aw_pending.take(), g.aw_tail.is_some())
     };
     if let Some(t) = text {
-        trace(&format!("awFlush 落 {t:?}"));
         let _ = run_session(&shared, Op::Commit(t), None);
         // 尾候选藏窗（同上屏帧收尾，见 update_ui T4 收尾注释）
         tl_cand_hide();
@@ -5859,7 +5823,6 @@ pub fn aw_flush_tail() {
         g.aw_tail.take()
     };
     if let Some(x) = tail {
-        trace(&format!("awFlush 尾 {x:?}"));
         let _ = run_session(&shared, Op::StartPreedit(x), None);
     }
 }
