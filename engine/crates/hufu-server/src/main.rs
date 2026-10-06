@@ -16,6 +16,7 @@ mod candwin;
 mod clipboard;
 mod host;
 mod http;
+mod overlay;
 mod pipe;
 mod platform;
 #[cfg(windows)]

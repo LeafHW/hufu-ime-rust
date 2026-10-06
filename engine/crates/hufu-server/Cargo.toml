@@ -24,3 +24,6 @@ hufu-skin = { path = "../hufu-skin" }
 hufu-rerank = { path = "../hufu-rerank" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 【T7b·server 代画挂件】沉浸宿主（UWP/开始菜单）候选窗挂件的解码/
+# 逐帧处理管线（GIF/APNG/WebP）——与 DLL hufu-tsf 同版本同特性集。
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }

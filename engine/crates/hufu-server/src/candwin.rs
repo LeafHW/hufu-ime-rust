@@ -918,9 +918,18 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
                         return 0;
                     }
                 };
-            *frame_lock() = Some(*frame);
             let x = (wparam >> 32) as i32;
             let y = (wparam as u32) as i32;
+            // 【T7b·server 代画挂件】候选窗上屏前同步挂件（本拍 frame 仍
+            // 存活；FRAME 缓存存储挪到分支末尾）。内容矩形=锚点(x,y)+去
+            // 投影边距的内容尺寸。
+            {
+                let cw = w_out - 2 * shadow_m;
+                let chh = h_out - 2 * shadow_m;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::overlay::sync(hwnd, &frame.skin, (x, y, x + cw, y + chh), scale);
+                }));
+            }
             // 内容锚点 (x,y) → 窗口原点 = (x-m, y-m)（投影边距外扩）
             let wx = x - shadow_m;
             let wy = y - shadow_m;
@@ -980,12 +989,19 @@ fn wnd_proc_inner(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize 
                 let _ = DeleteObject(dib);
             }
             let _ = DeleteDC(hdc);
+            // FRAME 缓存存储（原在分支头部；T7b 挂件需本拍 frame.skin，
+            // 挪到末尾——同线程同拍，读取方无时序差异）
+            *frame_lock() = Some(*frame);
             0
         },
         WM_APP_HIDE => unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
             *frame_lock() = None;
             RAISED.store(false, std::sync::atomic::Ordering::SeqCst);
+            // 挂件同拍收/延时收（hide_delay_ms 语义与 DLL 侧一致）
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::overlay::hide(hwnd);
+            }));
             0
         },
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
