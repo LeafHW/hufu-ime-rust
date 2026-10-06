@@ -188,11 +188,12 @@ pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub client_id: u32,
     pub composition: Option<ITfComposition>,
-    /// 【T4 v3 2026-10-07·加词框无段提交两段式】词框（裸 EDIT/CUAS）
-    /// 里无活组段的直插会被 CUAS 无限延迟且逐键重放（真机：空格的
-    /// 「和」不落、后续每键 +和）。无段提交帧先把文本挂此槽，本会话
-    /// 只建空段；PostMessage 回灌的下一会话在活段上落字。
+    /// 【T4 v3 2026-10-07】无段提交的待转正文本（两段式第一拍）。
     pub aw_pending: Option<String>,
+    /// 【T4 v5 2026-10-07】推屏帧（提交+剩余编码）的尾巴——C&R 的重开
+    /// 半步是重复源不能用了；尾巴段由 30ms 定时器跨泵周期后补建
+    ///（RichEdit 下内联显示剩余编码）。
+    pub aw_tail: Option<String>,
     /// 【六十修·熔断】Deactivate 后= true 直到下一次 Activate：期间
     /// 一切渲染入口（update_ui/轮询/焦点回放/迟到的引擎应答）一律
     /// 早退——切走后迟到的「上屏暂留帧」曾把刚藏掉的候选窗复活
@@ -478,6 +479,7 @@ impl Shared {
             client_id: 0,
             composition: None,
             aw_pending: None,
+            aw_tail: None,
             cand2: None,
             cand2_dead: false,
             ime_dead: false,
@@ -4458,6 +4460,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
     // 收场钟（trace 实锤：bu; 后 Op::Commit 落地，尾部 OWNED 分支又
     // show 一次，收场钟被合法击杀，窗口残留到 2 秒宿主资格窗过期）。
     // 置位后尾部两条 cand2 渲染 lanes 跳过。
+    // 【选重暂留独立开关 2026-11】闪帧被开关免掉（anim/anim_flash 关）
+    // 的选重帧同置位——尾部 show 会把旧候选复燃上屏（残留到停顿轮询
+    // 才收），一并跳过：置位语义=「选重帧已处理（渲染或收窗）」。
     let mut flash_frame_rendered = false;
     // 派生要做的组段操作（不持锁调用 run_session——其回调会再拿锁）
     let (op, has_ctx, suppress_win) = {
@@ -4537,37 +4542,43 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                 // 免掉（闪帧本质=高亮滑动确认动效）——立即收窗，与
                 // 「关闭动效=一切瞬跳」口径一致。anim 由 server 注入
                 // 皮肤顶层（candwin2 show 同源读法）。
+                // 【选重暂留独立开关 2026-11】闪帧/暂留单独可关：
+                // anim_flash=false（anim 仍开）只免选重暂留，其余动效
+                // 照常——与 anim 同源注入、同门（anim && anim_flash）。
                 let anim_on = g
                     .skin
                     .pointer("/skin/anim")
                     .or_else(|| g.skin.get("anim"))
                     .and_then(|x| x.as_bool())
                     .unwrap_or(true);
-                let flash: Vec<(String, String)> = if anim_on {
-                    state
-                        .get("candidates")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .map(|c| {
-                                    (
-                                        c.get("text")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        c.get("comment")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                if !flash.is_empty() {
+                let anim_flash_on = g
+                    .skin
+                    .pointer("/skin/anim_flash")
+                    .or_else(|| g.skin.get("anim_flash"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
+                let flash_ok = anim_on && anim_flash_on;
+                let flash: Vec<(String, String)> = state
+                    .get("candidates")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|c| {
+                                (
+                                    c.get("text")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    c.get("comment")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !flash.is_empty() && flash_ok {
                     let sel_flash =
                         state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let skin_f = g.skin.clone();
@@ -4589,8 +4600,9 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                     // 【选重闪帧·锁路径兜底 2026-10-09】引擎 state 为空
                     //（uru+3=锁+提前上屏）但键是数字且已上屏——用上一显示
                     // 帧的候选列表自建闪帧：高亮滑到第 N 项再暂留收场。
-                    // 【动效总开关 2026-10-30】anim=false 免闪帧（同上）。
-                    let prior = if anim_on {
+                    // 【动效总开关 2026-10-30】anim=false 免闪帧（同上）；
+                    // 【选重暂留独立开关 2026-11】anim_flash 同门。
+                    let prior = if flash_ok {
                         g.last_show.clone().filter(|v| !v.0.is_empty())
                     } else {
                         None
@@ -4606,7 +4618,21 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
                         }
                         g.last_show = Some((lc, String::new(), sel_flash));
                     } else if let Some(c) = g.cand2.as_mut() {
+                        // 选重帧但闪帧被开关免掉：立即收窗 + 尾部渲染
+                        // lanes 跳过（防旧候选复燃，见下分支注）。
                         c.hide();
+                        flash_frame_rendered = true;
+                    }
+                } else if !flash.is_empty() {
+                    // 【选重暂留独立开关 2026-11】state 带回选重闪帧但
+                    // 被开关免掉（总开关 anim 或独立开关 anim_flash）：
+                    // 立即收窗，并置位 flash_frame_rendered 跳过尾部渲染
+                    // lanes——否则尾部 c.show 会把旧候选重新推上屏（收场
+                    // 钟未装、残留到停顿轮询才收=「关了还暂留」的病根；
+                    // 二十六修同款防线，此前仅闪帧已渲染时置位）。
+                    if let Some(c) = g.cand2.as_mut() {
+                        c.hide();
+                        flash_frame_rendered = true;
                     }
                 } else if let Some(c) = g.cand2.as_mut() {
                     c.hide();
@@ -4654,12 +4680,30 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         if aw_box {
             crate::tsf::trace("uIU#aw 命中零组段通道");
         }
-        // 【T4 v3c（回滚自 RichEdit 尝试 2026-10-07 1:08）】词框（裸
-        // EDIT/CUAS）只物化「跨泵周期活组段」的写入；无段直插会被延迟
-        // +逐键重放。有活段→Op::Commit 落字；无活段（顶屏后紧接空格）
-        // →挂 aw_pending + 段以提交文本出生 + 定时器回灌跨泵周期落字。
+        // 【T4 v5 定案 2026-10-07】C&R「提交后重开组段」=通用重复源；
+        // 无活段的直插在两种框（EDIT 与 RichEdit，真机分别实锤）都
+        // 延迟+逐键重放。统一律：
+        // ·推屏帧（有活段）→Op::Commit 只提交不重开；剩余编码尾巴挂
+        //   aw_tail，跨泵周期后补建段（RichEdit 内联显码）。
+        // ·无段提交帧→挂 aw_pending、段以提交文本出生、定时器跨泵周
+        //   期冲刷转正；随后如还有尾巴再隔一周期补建（链式两拍）。
+        // ·下键自然 StP/SP（RichEdit 内联显码）。
         let op = if aw_box && !commit.is_empty() {
             if g.composition.is_some() {
+                if !preedit.is_empty() {
+                    g.aw_tail = Some(preedit.to_string());
+                    let aw_h = crate::addword::aw_hwnd();
+                    if aw_h != 0 {
+                        let _ = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                windows::Win32::Foundation::HWND(aw_h as *mut _),
+                                crate::addword::AW_FLUSH_MSG,
+                                None,
+                                None,
+                            )
+                        };
+                    }
+                }
                 Some(Op::Commit(commit.clone()))
             } else {
                 g.aw_pending = Some(commit.clone());
@@ -4728,6 +4772,12 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
         let pre_v = state.get("preedit").and_then(|v| v.as_str()).unwrap_or("");
         if crate::addword::in_window_thread() && raw_v.is_empty() && pre_v.is_empty() {
             tl_cand_hide();
+        }
+        // 【词框实时编码 2026-10-07】EDIT 回退模式：编码尾巴显示在词行
+        // 标签（框内不显组段文本=CUAS F1 定律）。RichEdit 模式框内内联
+        // 显示，标签不重复。
+        if crate::addword::in_window_thread() && !crate::addword::aw_rich() {
+            crate::addword::aw_live_code(raw_v);
         }
     }
 
@@ -5750,12 +5800,14 @@ fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Res
 /// 被按异步排队，Chromium 异步会话只授只读锁 → StartComposition 0x80040201
 /// （TS_E_SYNCHRONOUS）打字不上屏、无组段无锚点。0x6 在非按键场景被拒
 /// （0x80040209）时再退 0xA 纯异步（读态操作/冲销尽力而为）。
-/// 【T4 v3c】加词窗回灌（定时器触发，跨泵周期后在活段上落 pending）。
+/// 【T4 v5】加词窗回灌（定时器触发，跨泵周期后）：
+/// 第一拍：无段提交的 pending 在活段上转正；若还有尾巴 → 发第二拍。
+/// 第二拍（aw_flush_tail）：补建尾巴段（推屏帧的剩余编码，内联显示）。
 pub fn aw_flush_pending() {
     let Some(shared) = tl_shared() else { return };
-    let text = {
+    let (text, has_tail) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.aw_pending.take()
+        (g.aw_pending.take(), g.aw_tail.is_some())
     };
     if let Some(t) = text {
         trace(&format!("awFlush 落 {t:?}"));
@@ -5763,13 +5815,42 @@ pub fn aw_flush_pending() {
         // 尾候选藏窗（同上屏帧收尾，见 update_ui T4 收尾注释）
         tl_cand_hide();
     }
+    if has_tail {
+        // 链式第二拍：提交转正后再隔一周期建尾巴段（避免同会话内
+        // 提交+建段踩 C&R 同款雷）。
+        let aw_h = crate::addword::aw_hwnd();
+        if aw_h != 0 {
+            let _ = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    windows::Win32::Foundation::HWND(aw_h as *mut _),
+                    crate::addword::AW_TAIL_MSG,
+                    None,
+                    None,
+                )
+            };
+        }
+    }
 }
 
-/// 【T4 v3】窗毁清 pending（防跨窗残留）。
+/// 【T4 v5】第二拍：补建尾巴段（推屏帧的剩余编码——RichEdit 内联）。
+pub fn aw_flush_tail() {
+    let Some(shared) = tl_shared() else { return };
+    let tail = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.aw_tail.take()
+    };
+    if let Some(x) = tail {
+        trace(&format!("awFlush 尾 {x:?}"));
+        let _ = run_session(&shared, Op::StartPreedit(x), None);
+    }
+}
+
+/// 【T4 v3】窗毁清 pending/tail（防跨窗残留）。
 pub fn aw_clear_pending() {
     if let Some(shared) = tl_shared() {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.aw_pending = None;
+        g.aw_tail = None;
     }
 }
 

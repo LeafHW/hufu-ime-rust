@@ -248,10 +248,62 @@ pub fn in_window_thread() -> bool {
         } == tid
 }
 
-/// 【T4 v3c】加词窗消息：无段提交两段式的回灌入口（起 30ms 定时器）。
+/// 【T4 v5】加词窗消息：回灌链两拍——AW_FLUSH=无段提交转正（起 30ms
+/// 定时器）；AW_TAIL=补建尾巴段（再起 30ms）。
 pub const AW_FLUSH_MSG: u32 = 0x8000 + 0x550;
+pub const AW_TAIL_MSG: u32 = 0x8000 + 0x552;
 /// 【T4 v3b】冲刷定时器 id——CUAS 物化边界是宿主泵周期而非编辑会话。
 const AW_FLUSH_TIMER: usize = 0x551;
+const AW_TAIL_TIMER: usize = 0x553;
+/// 【词框实时编码 2026-10-07】词行标签控件 id（编码尾巴显示位——
+/// EDIT 回退模式下用；RichEdit 模式编码内联显示在框内）。
+pub const AW_LIVE_LABEL: i32 = 110;
+/// 【RichEdit 2026-10-07】词框是否为 RichEdit（TSF 原生）——true 时
+/// tsf.rs 走标准组段路径（编码内联显示/上屏即时）；false（创建失败
+/// 回退 EDIT）走 v3c CUAS 特判路径。
+static AW_RICH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 词框是否 RichEdit 模式。
+pub fn aw_rich() -> bool {
+    AW_RICH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 【词框实时编码】把打字中的编码尾巴写到词行标签（raw 空则还原）。
+/// STATIC 不发 EN_UPDATE，无回流。
+pub fn aw_live_code(raw: &str) {
+    let h = aw_hwnd();
+    if h == 0 {
+        return;
+    }
+    let base = if is_weight_mode() {
+        "词（要加权的字或词）"
+    } else {
+        "词（要打出的内容）"
+    };
+    let owned;
+    let text: &str = if raw.is_empty() {
+        base
+    } else {
+        // 编码尾巴只显 ASCII 原始码
+        let ascii: String = raw.chars().filter(|c| c.is_ascii()).collect();
+        if ascii.is_empty() {
+            return;
+        }
+        owned = format!("{base} · 编码 {ascii}");
+        &owned
+    };
+    let v: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    unsafe {
+        if let Ok(lbl) =
+            GetDlgItem(windows::Win32::Foundation::HWND(h as *mut _), AW_LIVE_LABEL)
+        {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                lbl,
+                PCWSTR(v.as_ptr()),
+            );
+        }
+    }
+}
 
 /// 【T4 v3】活着的加词窗句柄（0=无）——通用查询（RichEdit 化后回灌
 /// PostMessage 已停用）。
@@ -505,6 +557,38 @@ fn open_common() {
         }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // 【RichEdit Tab 2026-10-07】词框 RichEdit 的 DLGC 应答吞
+            // Tab——IsDialogMessage 拿不到导航权。词框内 Tab/Shift+Tab
+            // 手动导航三框环（词→编码→选重→词）。
+            if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+                && msg.wParam.0 as u16 == 0x09 /* VK_TAB */
+            {
+                let foc = unsafe {
+                    windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
+                };
+                let order = [ID_WORD, ID_CODE, ID_POS];
+                let cur = order.iter().position(|i| {
+                    matches!(
+                        unsafe { GetDlgItem(hwnd, *i) },
+                        Ok(h) if h == foc
+                    )
+                });
+                if let Some(c) = cur {
+                    #[link(name = "user32")]
+                    unsafe extern "system" {
+                        fn GetKeyState(vkey: i32) -> i16;
+                    }
+                    let shift = (unsafe { GetKeyState(0x10) } as u16 & 0x8000) != 0;
+                    let n = order.len();
+                    let next = if shift { (c + n - 1) % n } else { (c + 1) % n };
+                    if let Ok(h) = GetDlgItem(hwnd, order[next]) {
+                        let _ = unsafe {
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h)
+                        };
+                        continue;
+                    }
+                }
+            }
             if !IsDialogMessageW(hwnd, &mut msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -616,9 +700,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     ),
                 ]
             };
+            // 【T4 根治·词框 RichEdit v2 2026-10-07】词框用 RichEdit50W
+            //（TSF 原生通道：编码内联显示、上屏即时、无 CUAS 延迟/重放
+            // 全套怪癖）。msftedit.dll 先显式载入；创建失败回退 EDIT +
+            // v3c 特判路径（AW_RICH=false），双保险。每个子件建窗结果
+            // 全量留痕（上轮闪框排查零证据，这轮必须带证据迭代）。
+            {
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn LoadLibraryW(name: *const u16) -> isize;
+                }
+                let mn: Vec<u16> = "msftedit.dll\0".encode_utf16().collect();
+                let ok = unsafe { LoadLibraryW(mn.as_ptr()) } != 0;
+                crate::tsf::trace(&format!("awRich msftedit 载入={ok}"));
+            }
             for (i, (label, id, extra)) in rows.iter().enumerate() {
                 let y = 14 + i as i32 * 62;
                 let lbl_txt = mk(label);
+                // 【词框实时编码 2026-10-07】词行标签给 id：EDIT 回退模式
+                // 下把编码尾巴显示在标签上（RichEdit 模式框内内联显示）。
                 let lbl = create_child(
                     hwnd,
                     w!("STATIC"),
@@ -629,14 +729,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     y,
                     330,
                     24,
-                    0,
+                    if *id == ID_WORD { AW_LIVE_LABEL } else { 0 },
                 );
                 set_item_font(lbl, true);
-                // 【T4 回滚 2026-10-07 1:08】RichEdit50W 真机闪框+只剩一
-                // 框——连夜回滚到已验证的 v3c（EDIT + CUAS 特判）。
-                let ed = create_child(
+                // 【三框统一 RichEdit 2026-10-07】外观/行为一致；词框
+                // TSF 原生通道。RichEdit 不认 ES_NUMBER——选重位/权重
+                // 框数字过滤改在 EN_UPDATE 里做。创建失败回退 EDIT。
+                let mut ed = create_child(
                     hwnd,
-                    w!("EDIT"),
+                    w!("RICHEDIT50W"),
                     w!(""),
                     WS_EX_CLIENTEDGE,
                     *extra,
@@ -646,6 +747,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     33,
                     *id,
                 );
+                if *id == ID_WORD {
+                    crate::tsf::trace(&format!(
+                        "awRich 词框建 {2} hwnd=0x{0:x} err={1}",
+                        ed.0 as usize,
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        if ed.0.is_null() { "失败" } else { "成功" }
+                    ));
+                    if ed.0.is_null() {
+                        ed = create_child(
+                            hwnd,
+                            w!("EDIT"),
+                            w!(""),
+                            WS_EX_CLIENTEDGE,
+                            *extra,
+                            PV_X,
+                            y + 26,
+                            EDIT_W,
+                            33,
+                            *id,
+                        );
+                        AW_RICH.store(false, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        AW_RICH.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if ed.0.is_null() {
+                    // 编码/选重位框 RichEdit 建失败——回退 EDIT（保数字
+                    // 框 ES_NUMBER 生效；词框才是 RichEdit 关键路径）
+                    ed = create_child(
+                        hwnd,
+                        w!("EDIT"),
+                        w!(""),
+                        WS_EX_CLIENTEDGE,
+                        *extra,
+                        PV_X,
+                        y + 26,
+                        EDIT_W,
+                        33,
+                        *id,
+                    );
+                }
                 set_item_font(ed, false);
                 // 【EDIT 免 IME·分字段 2026-09-10】只有编码框（打什么出
                 // 它，纯字母）与选重位/权重框（纯数字）断开输入上下文——
@@ -793,21 +934,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        // 【T4 v3c】无段提交两段式的回灌：30ms 定时器跨泵周期后落 pending。
-        m if m == AW_FLUSH_MSG => {
+        // 【T4 v5】回灌链：第一拍（AW_FLUSH→30ms→pending 转正）、
+        // 第二拍（AW_TAIL→30ms→补建尾巴段）。
+        m if m == AW_FLUSH_MSG || m == AW_TAIL_MSG => {
+            let tail = m == AW_TAIL_MSG;
             let _ = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, AW_FLUSH_TIMER, 30, None)
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    hwnd,
+                    if tail { AW_TAIL_TIMER } else { AW_FLUSH_TIMER },
+                    30,
+                    None,
+                )
             };
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER => {
-            if wp.0 as usize == AW_FLUSH_TIMER {
+            let id = wp.0 as usize;
+            if id == AW_FLUSH_TIMER {
                 let _ = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, AW_FLUSH_TIMER)
                 };
                 crate::tsf::aw_flush_pending();
+                LRESULT(0)
+            } else if id == AW_TAIL_TIMER {
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, AW_TAIL_TIMER)
+                };
+                crate::tsf::aw_flush_tail();
+                LRESULT(0)
+            } else {
+                // 【RichEdit 2026-10-07】其余定时器必须还給 DefWindowProc
+                // ——RichEdit 内部靠定时器（光标闪烁/布局），全吞=闪框。
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
-            LRESULT(0)
         }
         WM_COMMAND => {
             let id = (wp.0 as u32 & 0xFFFF) as i32;
@@ -830,12 +989,53 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         Err(_) => String::new(),
                     }
                 };
+                let (wv, cv, pv) = (rd(ID_WORD), rd(ID_CODE), rd(ID_POS));
                 crate::tsf::trace(&format!(
-                    "awEU id={id} word={:?} code={:?} pos={:?}",
-                    rd(ID_WORD),
-                    rd(ID_CODE),
-                    rd(ID_POS)
+                    "awEU id={id} word={wv:?} code={cv:?} pos={pv:?}"
                 ));
+                // 【RichEdit 数字过滤 2026-10-07】RichEdit 不认
+                // ES_NUMBER——选重位/加权权重框在 EN_UPDATE 剔除非
+                // 数字（写回后光标置尾）。
+                if id == ID_POS || (id == ID_CODE && is_weight_mode()) {
+                    let src = if id == ID_POS { &pv } else { &cv };
+                    let filtered: String =
+                        src.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if filtered != *src {
+                        if let Ok(h) = GetDlgItem(hwnd, id) {
+                            let v: Vec<u16> =
+                                filtered.encode_utf16().chain([0]).collect();
+                            let _ =
+                                windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                                    h,
+                                    PCWSTR(v.as_ptr()),
+                                );
+                            let n = filtered.encode_utf16().count() as i32;
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                                h,
+                                0x00B1, /* EM_SETSEL */
+                                WPARAM(n as usize),
+                                LPARAM(n as isize),
+                            );
+                            return LRESULT(0);
+                        }
+                    }
+                }
+                // 【RichEdit 死循环掐断 2026-10-07】RichEdit 对邻近子窗
+                // 扰动（预览区销毁/重建 STATIC）会重发 EN_UPDATE——每
+                // 2-3ms 一环。三框文本没变就不重刷预览。
+                static LAST_TXT: std::sync::Mutex<(String, String, String)> =
+                    std::sync::Mutex::new((
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ));
+                {
+                    let mut last = LAST_TXT.lock().unwrap_or_else(|p| p.into_inner());
+                    if *last == (wv.clone(), cv.clone(), pv.clone()) {
+                        return LRESULT(0);
+                    }
+                    *last = (wv, cv, pv);
+                }
                 unsafe { refresh_preview(hwnd) };
             }
             let want = (id == ID_OK || id == ID_CANCEL || id == 1 || id == 2) && notif == 0;
@@ -848,7 +1048,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
-            // 【T4 v3】窗毁清 pending（防跨窗残留）
+            // 【T4 v3】窗毁清 pending/tail（防跨窗残留）
             let _ = crate::tsf::aw_clear_pending();
             PostQuitMessage(0);
             LRESULT(0)

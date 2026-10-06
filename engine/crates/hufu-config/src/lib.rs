@@ -582,6 +582,11 @@ pub struct AppearanceSection {
     pub anim: bool,
     /// 【动效速度 2026-09-11】整体速度倍率（1.0=默认速度；0~2，0=瞬跳）
     pub anim_speed: f32,
+    /// 【选重暂留开关 2026-11】数字选重上屏的确认暂留独立开关：
+    /// 候选窗高亮滑向选中项 + ~0.15s 短停留后收场。false=选重上屏
+    /// 立即收窗，其余动效（平移/尺寸/高亮滑动）不受影响。总开关
+    /// anim=false 时此项无效（随总开关一并关）。
+    pub anim_flash: bool,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
 }
@@ -595,6 +600,7 @@ impl Default for AppearanceSection {
             status_capsule: true,
             anim: true,
             anim_speed: 1.0,
+            anim_flash: true,
         }
     }
 }

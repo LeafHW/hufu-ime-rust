@@ -319,6 +319,10 @@ pub fn dispatch(
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
             let anim = host.engine.config.appearance.anim;
             let anim_speed = host.engine.config.appearance.anim_speed;
+            // 【选重暂留开关 2026-11】独立于总开关：数字选重上屏的确认
+            // 暂留（高亮滑向选中项+~0.15s 收场）。DLL 闪帧门同源读法
+            //（/skin/anim_flash 或顶层，缺省 true）。
+            let anim_flash = host.engine.config.appearance.anim_flash;
             // 【二十四修·动效大瘦身 2026-10-09】入场/退场/上屏停留全线
             // 退役（用户拍板只留平移/尺寸/高亮滑动）——DLL 侧不再消费
             // entrance_anim/commit_hold，注入一并移除。
@@ -330,6 +334,7 @@ pub fn dispatch(
                         // 注入移除（DLL 消费端已删）。
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("anim_flash".into(), serde_json::json!(anim_flash));
                         // 【虎娘对齐·首显滑动 2026-09-18 二修】显式 opt-in
                         // 门控：非整句方案才允许组段首显滑动。不用
                         // sentence_active()——无模型包里 sentence.is_none()
@@ -350,6 +355,7 @@ pub fn dispatch(
                     if let Some(o) = sv.as_object_mut() {
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("anim_flash".into(), serde_json::json!(anim_flash));
                         o.insert(
                             "first_show_slide".into(),
                             serde_json::json!(!host.engine.config.schema.current.contains("整句")),

@@ -415,6 +415,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <h3>动效</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：尺寸过渡、跟光标滑动、高亮滑动；关闭=一切瞬跳">候选窗动效</label></div>
+      <div class="checkline"><input type="checkbox" id="g-animfl"><label for="g-animfl" title="数字选重上屏后的确认暂留：高亮滑向选中项并停留约 0.15 秒再收窗；关闭=选重上屏立即收窗，其余动效不受影响（需先开「候选窗动效」）">选重暂留</label></div>
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
       <!-- 【特效退役 2026-09-22】上屏特效下拉+落印字号控件移除 -->
     </div>
@@ -1099,12 +1100,16 @@ function bindSkin() {
   }
   // 【动效全局开关+速度 2026-09-11】皮肤页控件，真源=全局配置
   // appearance.anim / appearance.anim_speed（DLL 经 skin op 注入读取）
+  // 【选重暂留独立开关 2026-11】appearance.anim_flash：数字选重上屏的
+  // 确认暂留单独可关（其余动效保留）；总开关关时随总开关失效（置灰）。
   {
-    const an = $("#g-anim"), sp = $("#g-animsp");
+    const an = $("#g-anim"), fl = $("#g-animfl"), sp = $("#g-animsp");
     const syncAnim = () => {
       an.checked = CFG.appearance?.anim !== false;
+      fl.checked = CFG.appearance?.anim_flash !== false;
       sp.value = Math.round((CFG.appearance?.anim_speed ?? 1) * 100);
       sp.disabled = !an.checked;
+      fl.disabled = !an.checked;
       $("#g-animsp-v").textContent = sp.value + "%";
     };
     an.oninput = () => {
@@ -1113,6 +1118,12 @@ function bindSkin() {
       syncAnim();
     };
     an.onchange = saveConfig;
+    fl.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.anim_flash = fl.checked;
+      syncAnim();
+    };
+    fl.onchange = saveConfig;
     sp.oninput = () => {
       CFG.appearance = CFG.appearance || {};
       CFG.appearance.anim_speed = sp.value / 100;
