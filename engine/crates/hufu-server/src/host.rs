@@ -100,27 +100,6 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
     ),
 ];
 
-/// 【虎娘面板皮肤 2026-10-06】官方面板皮肤（Tigirl ssf 转换产物，
-/// 立绘 base64 内嵌）。独立通道：与 OFFICIAL_SKINS 的经典皮肤互不读写。
-const OFFICIAL_PANEL_SKINS: &[(&str, &str)] = &[
-    (
-        "tigirl-mitao.json",
-        include_str!("../official-panel-skins/tigirl-mitao.json"),
-    ),
-    (
-        "tigirl-yuanqi.json",
-        include_str!("../official-panel-skins/tigirl-yuanqi.json"),
-    ),
-    (
-        "tigirl-xionggui.json",
-        include_str!("../official-panel-skins/tigirl-xionggui.json"),
-    ),
-    (
-        "tigirl-naiyou.json",
-        include_str!("../official-panel-skins/tigirl-naiyou.json"),
-    ),
-];
-
 pub struct Host {
     pub engine: Engine,
     pub session: Session,
@@ -175,7 +154,6 @@ impl Host {
             preview_anchor: None,
         };
         host.install_official_skins();
-        host.install_official_panel_skins();
         mark("skins", &t0);
         host.setup_rerank();
         mark("rerank", &t0);
@@ -854,43 +832,6 @@ impl Host {
     /// 皮肤目录。
     pub fn skins_dir(&self) -> PathBuf {
         self.data_dir.join("皮肤")
-    }
-
-    /// 【虎娘面板皮肤 2026-10-06】面板皮肤目录（独立于经典皮肤目录）
-    pub fn panel_skins_dir(&self) -> PathBuf {
-        self.data_dir.join("面板皮肤")
-    }
-
-    /// 官方面板皮肤列表（id, name）——读内嵌件头部字段，不落盘。
-    pub fn official_panel_skins(&self) -> Vec<(String, String)> {
-        OFFICIAL_PANEL_SKINS
-            .iter()
-            .map(|(file, body)| {
-                let id = file.trim_end_matches(".json").to_string();
-                let name = serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("name").and_then(|n| n.as_str()).map(String::from)
-                    })
-                    .unwrap_or_else(|| id.clone());
-                (id, name)
-            })
-            .collect()
-    }
-
-    /// 官方面板皮肤自愈落盘：缺失才写，存在不动（面板皮肤用户
-    /// 目前不提供编辑面，整文件即出厂态）。
-    fn install_official_panel_skins(&mut self) {
-        let dir = self.panel_skins_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        for (file, body) in OFFICIAL_PANEL_SKINS {
-            let p = dir.join(file);
-            if !p.exists() {
-                if let Err(e) = std::fs::write(&p, body) {
-                    eprintln!("官方面板皮肤 {file} 落盘失败: {e}");
-                }
-            }
-        }
     }
 
     pub fn list_skins(&self) -> Vec<(String, String)> {

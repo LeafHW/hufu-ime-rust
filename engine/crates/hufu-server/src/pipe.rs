@@ -378,34 +378,6 @@ pub fn dispatch(
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
-        // 【虎娘面板皮肤 2026-10-06】独立贴图皮肤通道：panel.enabled
-        // 时返回面板皮肤 JSON 全文（含 base64 立绘）。经典 skin op 与
-        // 皮肤文件零改动；响应 ~1.5MB/皮肤，32MB 闸内。
-        "panel_skin" => {
-            let (penabled, pskin) = {
-                let p = &host.engine.config.panel;
-                (p.enabled, p.skin.clone())
-            };
-            if !penabled || pskin.is_empty() {
-                serde_json::json!({ "enabled": false })
-            } else {
-                let p = host.panel_skins_dir().join(format!("{pskin}.json"));
-                match std::fs::read_to_string(&p) {
-                    Ok(text) => {
-                        // 容忍 BOM（与 Skin::load 同口径）
-                        let text = text.trim_start_matches('\u{feff}');
-                        match serde_json::from_str::<serde_json::Value>(text) {
-                            Ok(v) => serde_json::json!({ "enabled": true, "skin": v }),
-                            Err(e) => {
-                                eprintln!("面板皮肤 {pskin} 解析失败: {e}");
-                                serde_json::json!({ "enabled": false })
-                            }
-                        }
-                    }
-                    Err(_) => serde_json::json!({ "enabled": false }),
-                }
-            }
-        }
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
             let p = host.skins_dir().join(format!("{id}.json"));

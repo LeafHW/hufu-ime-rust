@@ -95,7 +95,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         // 1) 命中候选（客户端像素 → 内容逻辑坐标）
         let px = (lparam.0 as u16) as i16 as f32;
         let py = ((lparam.0 >> 16) as u16) as i16 as f32;
-        let (cands, raw, sel) = match crate::tsf::G_SHARED.get() {
+        let (cands, raw, _sel) = match crate::tsf::G_SHARED.get() {
             Some(gsh) => {
                 let g = gsh.0.lock().unwrap_or_else(|e| e.into_inner());
                 g.last_show.clone().unwrap_or_default()
@@ -105,9 +105,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         if cands.is_empty() {
             return;
         }
-        let hit_idx = if crate::panelskin::enabled() {
-            Some(sel.min(cands.len() - 1))
-        } else {
+        let hit_idx = {
             let geo = *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner());
             let rects = CAND_HIT.lock().unwrap_or_else(|e| e.into_inner()).clone();
             geo.and_then(|(dpi, sm, _, _)| {
@@ -601,12 +599,6 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // fade_tick_shared 已分流、此处漏）。TL 线程直接忽略字号
             // 滚轮（词框字号由皮肤统一管理）。
             if crate::tsf::addword_tl_thread() {
-                return LRESULT(0);
-            }
-            // 【虎娘面板皮肤 2026-10-06】面板模式滚轮不动经典皮肤文件
-            //（skin_font_delta 写的是 appearance.skin 的 font_point——
-            // 面板模式下那不是当前生效皮肤，误写=用户经典皮肤被静改）。
-            if crate::panelskin::enabled() {
                 return LRESULT(0);
             }
             let delta: i32 = if ((wparam.0 >> 16) as i16) > 0 { 1 } else { -1 };
@@ -1168,9 +1160,6 @@ pub struct CandidateWindowV2 {
     /// （展开后保持到组段结束）。抑制期空注释参与布局——列宽自然收起，
     /// 渲染路径零改动；兼防连打期长注释的窗宽抖动。
     pub(crate) comments_expanded: bool,
-    /// 【虎娘面板皮肤 2026-10-06】面板立绘位图缓存（键不符自动重建）。
-    /// 经典路径不读写，行为零影响。
-    pub(crate) panel_bm: Option<(u64, windows::Win32::Graphics::Direct2D::ID2D1Bitmap1)>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -1421,7 +1410,6 @@ impl CandidateWindowV2 {
                 shadow_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                panel_bm: None,
                 hl_anim: std::cell::Cell::new(None),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
@@ -1597,7 +1585,6 @@ impl CandidateWindowV2 {
                 shadow_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
-                panel_bm: None,
                 hl_anim: std::cell::Cell::new(None),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
@@ -2050,23 +2037,11 @@ impl CandidateWindowV2 {
         // 重画=删词收缩动画全程带码且画完滞留（trace 实锤 ir=true 帧
         // raw='uru'）。编码段只活在宿主内联预编辑里；宽度恒与编码无
         // 关=框无从因码挪动。
-        let raw = "";        // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
+        let raw = "";
+        // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
         // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
         // 「上一段落点」已变「本段落点」，起点≡终点，追赶永不臂=全程直
         // 出（用户实测）。函数头先抢救上一帧的 sticky。
-        // 【虎娘面板皮肤 2026-10-06】独立渲染通道总闸：面板模式开启且
-        // 数据就绪 → 整帧走 panelskin 自治路径（测量/绘制/呈现/落位），
-        // 经典皮肤代码零改动。面板未就绪或本帧渲染失败 → 回落经典路径
-        //（绝不空白）。
-        if crate::panelskin::enabled() {
-            if self.show_panel(cands, raw, skin, anchor, selected) {
-                // 【右键调频菜单】面板路径不采集命中矩形（皮肤贴图系统
-                // 另案）——清空，右键退「当前高亮候选」。
-                CAND_HIT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                return;
-            }
-        }
         let sticky_prev = self.sticky_pos;
         // 【四十三修·咽喉宽度门 2026-09-22】Excel 实测（探针+trace 实锤，
         // 2026-09-22 复测确认 update_ui 层门不够）：焦点抖动路径
@@ -6247,215 +6222,3 @@ pub(crate) fn pos_anim_step(
     (l(from.0, to.0), l(from.1, to.1))
 }
 
-// ── 【虎娘面板皮肤 2026-10-06】独立渲染通道 ──────────────────────────
-// 面板模式整帧路径：测量 → 定位 → 绘制（三片立绘 + 右对齐行）→ 呈现。
-// 与经典路径互斥（show() 头部总闸分流）；任何一步失败返回 false 回落。
-
-impl CandidateWindowV2 {
-    pub(crate) fn show_panel(
-        &mut self,
-        cands: &[(String, String)],
-        raw: &str,
-        skin: &Value,
-        anchor: Option<&RECT>,
-        selected: usize,
-    ) -> bool {
-        let dpi_scale = unsafe {
-            windows::Win32::UI::HiDpi::GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0
-        };
-        let dpi_scale = std::env::var("HUFU_FAKE_DPI")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v >= 96.0 && *v <= 480.0)
-            .map(|v| v / 96.0)
-            .unwrap_or(dpi_scale);
-
-        // 文本格式：复用经典 tf_cache（键=字体+字号；面板序号恒无）。
-        // 编码行为沿用经典皮肤 inline_preedit（false=编码画进窗内行首）。
-        let draw_code = !skin
-            .pointer("/skin/layout/inline_preedit")
-            .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
-            .and_then(|x| x.as_bool())
-            .unwrap_or(true);
-
-        let Some(dwrite) = self.dwrite.clone() else { return false };
-
-        // 面板就绪态下完成测量+绘制（锁内，经典 show 同样持共享锁渲染）
-        let mut rendered = false;
-        let mut frame_pos = None;
-        let mut frame_wh = (0u32, 0u32);
-        crate::panelskin::with_active(|look, art| {
-            // 字号键缓存两格式
-            let fp = look.font_point;
-            let key = (look.font_face.clone(), fp, 0.0f32);
-            let hit = self
-                .tf_cache
-                .as_ref()
-                .map(|(k, _)| *k == key)
-                .unwrap_or(false);
-            if !hit {
-                let (tf, tf_small) =
-                    unsafe { crate::panelskin::make_formats(&dwrite, look) };
-                self.tf_cache = Some((key, (tf.clone(), tf_small.clone(), None)));
-            }
-            let (tf, tf_small, _) = match &self.tf_cache {
-                Some((k, v)) if k.0 == look.font_face && k.1 == fp => v.clone(),
-                _ => return,
-            };
-
-            let Some(frame) = crate::panelskin::build_frame(
-                look, &dwrite, &tf, &tf_small, cands, raw, selected, anchor,
-                draw_code, crate::panelskin::last_pos_pub(),
-            ) else {
-                return;
-            };
-            let w_px = (frame.w as f32 * dpi_scale) as u32;
-            let h_px = (frame.h as f32 * dpi_scale) as u32;
-            frame_wh = (w_px, h_px);
-            frame_pos = Some(frame.pos);
-
-            if !self.ensure_swapchain(w_px, h_px) {
-                return;
-            }
-            let Some(ctx) = &self.ctx else { return };
-            let mut target_bm: Option<ID2D1Bitmap1> = None;
-            unsafe {
-                // 目标：ULW=常驻离屏位图；DComp=当前后台缓冲
-                if self.ulw {
-                    match &self.offscreen {
-                        Some(off) => ctx.SetTarget(off),
-                        None => return,
-                    }
-                } else {
-                    let chain = match &self.swapchain {
-                        Some(c) => c.clone(),
-                        None => return,
-                    };
-                    let bb_index = match chain.cast::<IDXGISwapChain3>() {
-                        Ok(c3) => c3.GetCurrentBackBufferIndex(),
-                        Err(_) => 0,
-                    };
-                    let surface: IDXGISurface = match chain.GetBuffer(bb_index) {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                    let bp = D2D1_BITMAP_PROPERTIES1 {
-                        pixelFormat: D2D1_PIXEL_FORMAT {
-                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                        },
-                        dpiX: 96.0,
-                        dpiY: 96.0,
-                        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET
-                            | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                        colorContext: std::mem::ManuallyDrop::new(None),
-                    };
-                    match ctx.CreateBitmapFromDxgiSurface(&surface, Some(&bp)) {
-                        Ok(b) => {
-                            ctx.SetTarget(&b);
-                            target_bm = Some(b);
-                        }
-                        Err(_) => return,
-                    }
-                }
-                ctx.BeginDraw();
-                ctx.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                    M11: dpi_scale,
-                    M12: 0.0,
-                    M21: 0.0,
-                    M22: dpi_scale,
-                    M31: 0.0,
-                    M32: 0.0,
-                });
-                let mut bm = self.panel_bm.take();
-                let ok = crate::panelskin::paint(ctx, &frame, &tf, &tf_small, art, &mut bm);
-                self.panel_bm = bm;
-                let _ = ctx.EndDraw(None, None);
-                // 【离屏取证 2026-10-06】readback 模式（pad-dump）：目标位图
-                // 内容区拷到 CPU 位图供 BMP 落盘——last_pixels/last_size 同
-                // 经典路径字段。
-                if ok && self.readback {
-                    let src: Option<ID2D1Bitmap1> = if self.ulw {
-                        self.offscreen.clone()
-                    } else {
-                        target_bm.clone()
-                    };
-                    if let Some(src_bm) = src {
-                        if let Ok(cpu) = ctx.CreateBitmap(
-                            D2D_SIZE_U { width: w_px, height: h_px },
-                            None,
-                            0,
-                            &D2D1_BITMAP_PROPERTIES1 {
-                                pixelFormat: D2D1_PIXEL_FORMAT {
-                                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                                },
-                                dpiX: 96.0,
-                                dpiY: 96.0,
-                                bitmapOptions: D2D1_BITMAP_OPTIONS(D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0),
-                                colorContext: std::mem::ManuallyDrop::new(None),
-                            },
-                        ) {
-                            if let Ok(src0) = src_bm.cast::<ID2D1Bitmap>() {
-                                if cpu.CopyFromBitmap(
-                                    None,
-                                    Some(&src0),
-                                    Some(&D2D_RECT_U { left: 0, top: 0, right: w_px, bottom: h_px }),
-                                )
-                                .is_ok()
-                                {
-                                    if let Ok(mapped) = cpu.Map(D2D1_MAP_OPTIONS_READ) {
-                                        let mut data = vec![0u8; (w_px * h_px * 4) as usize];
-                                        let pitch = mapped.pitch as usize;
-                                        for row in 0..h_px as usize {
-                                            let sp = mapped.bits.add(row * pitch) as *const u8;
-                                            data[row * (w_px as usize) * 4..(row + 1) * (w_px as usize) * 4]
-                                                .copy_from_slice(std::slice::from_raw_parts(sp, (w_px * 4) as usize));
-                                        }
-                                        let _ = cpu.Unmap();
-                                        self.last_pixels = Some(data);
-                                        self.last_size = (w_px, h_px);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                ctx.SetTarget(None);
-                if !ok {
-                    return;
-                }
-                if self.ulw {
-                    self.present_ulw(w_px as i32, h_px as i32);
-                } else if let Some(chain) = &self.swapchain {
-                    let _ = chain.Present(1, DXGI_PRESENT(0));
-                }
-                rendered = true;
-            }
-        });
-
-        crate::tsf::trace(&format!(
-            "panel: show n={} raw_len={} handled={}",
-            cands.len(),
-            raw.chars().count(),
-            rendered
-        ));
-        if rendered {
-            if let (Some(pos), Some((w, h))) = (frame_pos, Some(frame_wh)) {
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        HWND_TOPMOST,
-                        pos.0,
-                        pos.1,
-                        w as i32,
-                        h as i32,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
-                }
-                crate::panelskin::note_pos(pos);
-            }
-        }
-        rendered
-    }
-}

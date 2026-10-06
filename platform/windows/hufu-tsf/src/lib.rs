@@ -31,7 +31,6 @@ mod ipc;
 mod langbar;
 // 候选窗贴图挂件（兄弟窗）：ULW 分层窗贴在候选窗旁，2026-10-02。
 // 只读候选窗最终矩形取位，不碰候选窗锚点/几何代码。
-mod panelskin;
 mod overlaywin;
 mod sound;
 mod tsf;
@@ -138,9 +137,6 @@ extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
 /// （%TEMP%\hufu-pad.bmp）供视觉/数值检查内边距。返回 1=成功。
 #[no_mangle]
 extern "system" fn hufu_test_pad_dump() -> i32 {
-    // 【虎娘面板皮肤 2026-10-06】取证路径同样支持面板模式：先保鲜面板
-    // 数据——config.panel.enabled 时 show() 头部走 show_panel 渲染。
-    crate::panelskin::ensure_loaded();
     let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
         eprintln!("pad-dump: skin op 失败");
         return 0;

@@ -559,10 +559,6 @@ impl Shared {
     }
 
     fn load_skin(&mut self) {
-        // 【虎娘面板皮肤 2026-10-06】独立通道按同节奏保鲜——面板模式
-        // 的就绪判定全靠它（漏挂=面板缓存永远空、enabled() 恒 false、
-        // 永远走经典路径——QQ 实测「勾了贴图皮肤没变」的根因）。
-        crate::panelskin::ensure_loaded();
         // 皮肤过期四通道：①首次 ②raw 空（断段）③拉取后超 2.5s
         // ④server 皮肤版本变化（poll 比对 skin_ver，强制绕过时限——
         // 【打字中热更新】③是关键：旧逻辑只在 raw 空时置 stale，打字
