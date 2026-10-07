@@ -527,7 +527,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <div class="field"><label>垂直对齐</label><select id="ov-valign" style="min-width:110px"><option value="center">居中</option><option value="top">顶对齐</option><option value="bottom">底对齐</option></select></div>
         </div>
         <div class="row">
-          <div class="field"><label>高度 <span class="val" id="ov-bh-v"></span></label><input type="range" id="ov-bh" min="60" max="600" step="5" title="挂件显示高度（逻辑像素，随系统 DPI 缩放）；预览里也可直接拖手柄/滚轮调"></div>
+          <div class="field"><label>高度 <span class="val" id="ov-bh-v"></span></label><input type="range" id="ov-bh" min="24" max="600" step="5" title="挂件显示高度（逻辑像素，随系统 DPI 缩放）；预览里也可直接拖手柄/滚轮调"></div>
           <div class="field"><label>间距 <span class="val" id="ov-gap-v"></span></label><input type="range" id="ov-gap" min="-400" max="600" step="2" title="与候选框的间距；负数=重叠（拖图可代替）"></div>
           <div class="field"><label>不透明度 <span class="val" id="ov-op-v"></span></label><input type="range" id="ov-op" min="5" max="100" step="5"></div>
         </div>
@@ -1829,8 +1829,8 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       ovApplyLayout();
       ovSaveDeb();
     } else {
-      // 【松手落钳】缩放拖拽中不钳（跟手），落手才回 60~600 区间
-      c.base_height = Math.min(600, Math.max(60, Math.round(c.base_height)));
+      // 【松手落钳】缩放拖拽中不钳（跟手），落手才回 24~600 区间（原 60 下限系 UI 钳，引擎地板 16——2026-10-07 用户要更小，降为 24 与拖拽地板一致）
+      c.base_height = Math.min(600, Math.max(24, Math.round(c.base_height)));
       ovSetR("#ov-bh", c.base_height);
       wrapEl.style.height = c.base_height + "px";
       ovApplyLayout();
@@ -1908,7 +1908,7 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
     if (!OV.img) return;
     e.preventDefault();
     const c = ovEnsureCfg();
-    c.base_height = Math.min(600, Math.max(60, (c.base_height || 240) + (e.deltaY < 0 ? 10 : -10)));
+    c.base_height = Math.min(600, Math.max(24, (c.base_height || 240) + (e.deltaY < 0 ? 10 : -10)));
     ovSetR("#ov-bh", c.base_height);
     wrapEl.style.height = c.base_height + "px";
     ovSaveDeb();
