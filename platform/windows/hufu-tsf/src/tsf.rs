@@ -3645,6 +3645,20 @@ fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
 /// 兜底。只在确认 ≥18（真实行高量级，矮锚 16 不写入）时更新。
 static SHORT_ANCHOR_MEM_LH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// 【QQ 首键滞后·进程级键宽记忆 2026-10-08】est 基线是线程级（焦点
+/// 清理/新聊天线程会归零），但同进程的键宽（字体度量）稳定——每次
+/// 校准采样后记忆 unit（×16 定点），供无基线冷启动的滞后检测用
+///（仿 SHORT_ANCHOR_MEM_LH 先例）。跨宿主进程各自独立，无串扰。
+static EST_UNIT_MEM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn est_unit_mem_update(u: f32) {
+    if u >= 5.0 && u <= 80.0 {
+        EST_UNIT_MEM.store((u * 16.0) as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+fn est_unit_mem() -> f32 {
+    EST_UNIT_MEM.load(std::sync::atomic::Ordering::Relaxed) as f32 / 16.0
+}
+
 /// 【虎魄首键矮锚归一·二修 2026-11·BUG8】trace 实锤（虎魄 PyQt5 ACP）：
 /// 组段首键瞬间 selection 与组段 END 两条 GetTextExt 都返回「默认字
 /// 体度量」矮锚（实测 14×16：高度 16、宽度 14/字符），top/left 正确；
@@ -4032,35 +4046,56 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 偏左一格+次键右窜」——QQ 抖动观感的 x 分量同源；
                         // 记事本同步布局 lag≈0 无此症状。签名：同带（|dy|≤
                         // 半行）且恰落后「预期插入点」（est+Δraw×unit，
-                        // est_step 同款步进数）0.4-2.6 键宽。命中：est_step
-                        // 推进到预期位作锚（Scintilla-B est 延续同款）+60ms
-                        // 重查自愈，不回播 est（防倒退毒化——三十四修播种的
-                        // 逆向病）；重查/第二键真值照常采纳滑正。跟打器类
-                        // 「整段一格」宿主 seg1 同签名时 est=段首+1格 也是真
-                        // 值（BUG8 四修B 实测），偶偏由重查滑正，无新增风险
-                        // 面。折行假警报（步进跨行）退回原样采纳（seed 重校
-                        // est）。上限 4 次防停顿期 60ms 重查空转。
+                        // est_step 同款步进数）0.4-2.6 键宽。
+                        // 【锚基准二修 2026-10-08】QQ 单键实测 trace：陈旧锚
+                        // =空闲布局段起点（精确），est 链基准被历史采纳值污
+                        // 染（实测 +12px）→ est+Δraw 作锚冲过头 15px，+55ms
+                        // poll 采纳真锚倒滑 17px=「一蹦一蹦」。锚改陈旧锚+
+                        // cur_raw_len×unit；est 链重置到（段起点,0 键）再
+                        // est_step——校准采样对同步归零（段起点=0 键状态，
+                        // seed_est_from_anchor 的「锚含 cur_raw_len 键」语
+                        // 义不符，直接播种会把下键 unit 采样翻倍），下键真
+                        // 键给出干净 unit 样本。+60ms 重查自愈照旧；折行假
+                        // 警报（步进跨行）退回原样采纳。上限 4 次防空转。
                         let unit = g.caret_est_unit_w;
                         let lh = g.caret_est_line_h.max(8);
-                        let d_est = g.cur_raw_len as i32 - g.caret_est_last_raw;
+                        // 【反查首帧误触修 2026-10-08】组段不存在（反查/
+                        // 命令/退格空段的 aux 帧）时 cur_raw_len 是上一段
+                        // 残留——d_est 数学全错：滞後签名会凭空命中（残留=1
+                        // 时 lag 恰≈1 键），把反查提示窗锚点右推一键宽、est
+                        // 被空推一步毒化下段。必须本段组段存在（SetText 已
+                        // 跑过）才允许检测。
+                        let d_est = if g.composition.is_some() {
+                            g.cur_raw_len as i32 - g.caret_est_last_raw
+                        } else {
+                            0
+                        };
                         let expected_x = g.caret_est_x as f32 + d_est as f32 * unit;
                         let lag = expected_x - r.left as f32;
-                        if g.caret_est_y != 0
+                        if g.composition.is_some()
+                            && g.caret_est_y != 0
                             && unit > 4.0
                             && g.seg1_stale_retry < 4
                             && (r.top - g.caret_est_y).abs() <= lh / 2
                             && lag >= unit * 0.4
                             && lag <= unit * 2.6
                         {
+                            // 基准重置：est=（真段起点, 0 键），校准采样对归零
+                            g.caret_est_x = r_raw.left;
+                            g.caret_est_last_raw = 0;
+                            g.caret_est_cal_x = r_raw.left;
+                            g.caret_est_cal_raw = 0;
+                            g.caret_est_wrap = 0;
                             est_step(g);
-                            if (g.caret_est_y - r.top).abs() <= lh / 2 {
+                            if (g.caret_est_y - r_raw.top).abs() <= lh / 2 {
                                 g.seg1_stale_retry += 1;
                                 arm_caret_recheck_timer();
                                 if crate::tsf::trace_on() {
                                     trace(&format!(
-                                        "qc: seg1 selection 滞后一拍 lag={:.1}≈{:.1}键 → est 延续锚 ({},{}) +60ms 重查",
+                                        "qc: seg1 selection 滞后一拍 lag={:.1}≈{:.1}键 → 锚=段起点+{}键宽 ({},{}) +60ms 重查",
                                         lag,
                                         lag / unit,
+                                        g.cur_raw_len,
                                         g.caret_est_x,
                                         g.caret_est_y
                                     ));
@@ -4099,6 +4134,54 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         Some(p) => (r.left - p.left).abs() <= 100 && (r.top - p.top).abs() <= 60,
                         None => true,
                     };
+                    // 【QQ 首键滞后·冷启动层 2026-10-08】est 无基线（焦点
+                    // 清理/新线程）时上面的 near 会把 QQ 陈旧锚（=段起点，
+                    // 在 prev 后方 0.4-2.6 键宽）原样采纳=「首键偏左」冷启
+                    // 动形态。用进程级键宽记忆做同款滞后签名：r 恰在 prev
+                    // 后方该量级且同带（折行的跨行 Δtop 由行高记忆挡掉）
+                    // → 锚=段起点+cur_raw_len×记忆宽，est 按真锚语义播种
+                    //（锚含 cur_raw_len 键，seed 语义此处成立），校准采样
+                    // 对随 seed 建立，下键真锚即出干净样本。真值宿主（记
+                    // 事本等）r 必在 prev 前方 ≥1 真键宽，不在带内不触发。
+                    if g.composition.is_some() {
+                        if let Some(p) = prev_caret {
+                            let u_mem = est_unit_mem();
+                            let mem_lh = SHORT_ANCHOR_MEM_LH
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .max(24);
+                            let dx = r.left - p.left;
+                            let dy_lag = (r.top - p.top).abs() as f32;
+                            if u_mem >= 5.0
+                                && g.seg1_stale_retry < 4
+                                && dx <= (-(u_mem * 0.4)) as i32
+                                && dx >= (-(u_mem * 2.6)) as i32
+                                && dy_lag <= mem_lh as f32 / 2.0
+                            {
+                                let adv =
+                                    (g.cur_raw_len as f32 * u_mem).round() as i32;
+                                let ar = RECT {
+                                    left: r_raw.left + adv,
+                                    top: r_raw.top,
+                                    right: r_raw.left + adv + 2,
+                                    bottom: r_raw.bottom,
+                                };
+                                g.seg1_stale_retry += 1;
+                                arm_caret_recheck_timer();
+                                if crate::tsf::trace_on() {
+                                    trace(&format!(
+                                        "qc: seg1 selection 冷启动滞后 dx={dx}≈{:.1}键(记忆宽{u_mem:.1}) → 锚=段起点+{}键宽 ({},{}) +60ms 重查",
+                                        dx as f32 / u_mem,
+                                        g.cur_raw_len,
+                                        ar.left,
+                                        ar.top
+                                    ));
+                                }
+                                seed_est_from_anchor(g, &ar, "seg1sel_coldlag");
+                                g.caret = Some(ar);
+                                return;
+                            }
+                        }
+                    }
                     if near {
                         // 【三十四修·selection 播种 est】同上
                         // 【BUG8 四修】播种用原始盒（同 estok 分支）。
@@ -4438,6 +4521,8 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                 } else {
                     old * 0.6 + sample * 0.4
                 };
+                // 【QQ 首键滞后·进程级记忆】见 EST_UNIT_MEM 注释。
+                est_unit_mem_update(g.caret_est_unit_w);
                 if crate::tsf::trace_on() {
                     trace(&format!(
                         "qc: 步宽采样 raw {}→{} → unit {:.1}",
@@ -4539,7 +4624,15 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
     // g.last_show 仍存**真 raw**（右键菜单 ipc 的 raw_req 依赖它）。
     // 此前按会话真相画 raw：组词/上屏/调频帧宽度来回变=「编码冒出
     // 来+框挪一下」的全部观感来源。
-    let raw_disp = String::new();
+    // 【反查提示回归修 2026-10-08】T8 把住在编码行里的模式提示
+    // 「·〔反查〕/〔命令〕」一并杀掉——提示从不内联（内联的是拼音），
+    // 反查态框内无任何指示、裸按 ` 时 cands=0+空行=空窗。例外放行：
+    // aux 非空帧 raw_disp=提示串（编码仍不画，不违 T8 本意）。
+    let raw_disp = state
+        .get("aux")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     // 【Shared 同源登记·二十六修】本帧渲染（含 tl_cand_show 写
     // last_show）用的锁登记线程局部——fade/expand tick 的 TL 分支取
     // tl_shared() 与本帧同源，动画数据不再读错实例。
@@ -5506,6 +5599,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                     } else {
                         (old * 0.5 + sample * 0.5).clamp(2.0, 120.0)
                     };
+                    // 【QQ 首键滞后·进程级记忆】见 EST_UNIT_MEM 注释。
+                    est_unit_mem_update(g.caret_est_unit_w);
                     if trace_on() {
                         trace(&format!(
                             "段间键宽校准: dx={dx} sample={sample:.2} unit {old:.2}→{:.2}",
@@ -7364,7 +7459,17 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .is_empty();
-                    if !raw_empty {
+                    // 【QQ 首键滞后·重查门修 2026-10-08】QQ 组段期引擎态
+                    // raw 可为空（显示层合成遮蔽，trace 实锤 872ms 重查被
+                    // 静默跳过、自愈全凭 140ms poll 碰巧）——候选非空（组
+                    // 段活跃）时也放行重查；上屏跟随（raw 空+候选空=闲时）
+                    // 语义不变。
+                    let cands_empty = state
+                        .get("candidates")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true);
+                    if !raw_empty || !cands_empty {
                         // 【小窗期间主线程跳过 2026-09-12 十一修】补显
                         // timer 走主线程——小窗打开时词框线程在渲染，
                         // 主线程此刻 update_ui 会用旧 session 状态画
