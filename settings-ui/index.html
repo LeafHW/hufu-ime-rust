@@ -1543,8 +1543,13 @@ function ovBindSkin() {
   }
   ovMock(); ovPreview();
 }
-/* 载入 data-URL：统一走「解码→动图探测→首帧/帧序列」 */
-function ovLoadFromDataUrl(url, label, baked) {
+/* 载入 data-URL：统一走「解码→动图探测→首帧/帧序列」
+   【载入即存 2026-10-07】onReady：首帧就绪后的回调——导入路径把
+   ovPersist 挪到这里。旧版 onchange 里同步调 ovPersist，但解码是
+   异步的：此刻 OV.img 还是旧值（空白态=null）→ 守卫跳过写图 →
+   存盘的皮肤没有图（用户实录「空白态导入不生效，随便点个按钮才
+   好」——后来点的滑杆/按钮触发了带图的 ovPersist 才补上）。 */
+function ovLoadFromDataUrl(url, label, baked, onReady) {
   const img = new Image();
   img.onload = async () => {
     OV.img = img; OV.name = label; OV.basedOnBaked = !!baked; OV.dataUrl = url;
@@ -1578,6 +1583,7 @@ function ovLoadFromDataUrl(url, label, baked) {
     $("#ov-fileinfo").textContent = `${label} ${img.naturalWidth}×${img.naturalHeight}` + (anim ? `（动图 ${anim.bitmaps.length} 帧）` : "");
     const badge = $("#ov-anim-badge"); if (badge) badge.style.display = anim ? "inline" : "none";
     ovRenderWork();  ovPreview();
+    if (onReady) onReady();
     if (anim) ovAnimTick(0);
   };
   img.src = url;
@@ -1758,7 +1764,10 @@ $("#ov-pick").onclick = () => $("#ov-file").click();
 $("#ov-file").onchange = ev => {
   const f = ev.target.files[0]; if (!f) return;
   const rd = new FileReader();
-  rd.onload = () => { ovLoadFromDataUrl(rd.result, f.name, false); if (ovPersist()) msg(`已载入并生效 ✓ ${f.name}`, "ok"); };
+  // 【载入即存 2026-10-07】持久化挪进解码完成回调——旧版在这里同步
+  // ovPersist，OV.img 还是 null（异步未完）→ 图没进皮肤（见
+  // ovLoadFromDataUrl 注释）
+  rd.onload = () => ovLoadFromDataUrl(rd.result, f.name, false, () => { if (ovPersist()) msg(`已载入并生效 ✓ ${f.name}`, "ok"); });
   rd.onerror = () => msg("图片读取失败", "err");
   rd.readAsDataURL(f);
   ev.target.value = "";
@@ -1952,7 +1961,9 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       OV.key = { r: d[0], g: d[1], b: d[2] };
       OV.picking = false; cv.style.cursor = "crosshair";
       msg(`已取背景色 rgb(${d[0]},${d[1]},${d[2]})——调容差看效果`, "ok");
-      ovPreview(); return;
+      /* 【载入即存同族 2026-10-07】取色后立即持久化——旧版只刷预览不
+         存盘，键色要等下次任何 ovPersist 动作（拖容差滑杆等）才落皮肤 */
+      ovPreview(); ovPersist(); return;
     }
     OV.drag = { x0: p.x, y0: p.y };
     try { cv.setPointerCapture(e.pointerId); } catch (_) {}

@@ -67,8 +67,9 @@ fn note_once(key: &'static str, msg: &str) {
 }
 
 /// 【预解码缓存 2026-11】皮肤到位即开解（不等首键 sync）：
-/// (img_key, built_for) → 解码态。新进程首段/导入后的首段即显。
-static PREWARM: Mutex<Option<(u64, u32, Arc<DecodeState>)>> = Mutex::new(None);
+/// (img_key, built_for, proc_key) → 解码态。新进程首段/导入后的首段即显。
+/// 【处理指纹 2026-10-07】键加 proc_key——纯改处理参数也要重解。
+static PREWARM: Mutex<Option<(u64, u32, u64, Arc<DecodeState>)>> = Mutex::new(None);
 
 /// 系统主屏 DPI（预解码目标高估算；真窗口 DPI 不同则 sync 按
 /// built_for 失配重解——多数进程同屏即命中）。
@@ -91,15 +92,15 @@ pub fn note_skin(skin: &Value) {
         OVERLAY_GEN.fetch_add(1, Ordering::Release);
         if let Some(cfg) = parse_cfg(skin) {
             let target_h = cfg.base_height * sys_dpi_scale();
-            let key = (cfg.img_key, target_h.round() as u32);
+            let key = (cfg.img_key, target_h.round() as u32, cfg.proc_key);
             let mut pw = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
             // 同键已在（解码中/已就绪/已失败）不重启——失败随下代次重试
             let need = !pw
                 .as_ref()
-                .is_some_and(|(k, b, _)| *k == key.0 && *b == key.1);
+                .is_some_and(|(k, b, pk, _)| *k == key.0 && *b == key.1 && *pk == key.2);
             if need {
                 let dec = start_decode(cfg, target_h);
-                *pw = Some((key.0, key.1, dec));
+                *pw = Some((key.0, key.1, key.2, dec));
             }
         }
     }
@@ -132,6 +133,12 @@ pub(crate) struct OverlayCfg {
     /// ULW SourceConstantAlpha（0-255）
     pub alpha: u8,
     pub v_align: VAlign,
+    /// 【处理指纹 2026-10-07】影响「处理完的帧」的全部参数（crop/键色/
+    /// 容差/圆角/羽化/四角星/翻转）的指纹——解码缓存存的是成品帧，
+    /// 缓存键必须含它：纯改处理参数（滑杆）时代次推进但 img/高度没变，
+    /// 旧键不变=复用旧参数成品帧（用户实录「改圆角/羽化要拖一下高度
+    /// 才生效」的根因）。image 字节由 img_key 表达，不重复入指纹。
+    pub proc_key: u64,
     pub image: Vec<u8>,
     pub img_key: u64,
     /// 动图处理参数；None=静态烤成品路径
@@ -228,17 +235,52 @@ fn parse_cfg(skin: &Value) -> Option<Arc<OverlayCfg>> {
             star: p.get("cshape").and_then(|x| x.as_str()) == Some("star"),
         })
     });
+    // 【处理指纹 2026-10-07】crop/键色/容差/圆角/羽化/四角星/翻转 的字节
+    // 序指纹（影响成品帧的全部参数；image 由 img_key 表达不重复入内）
+    let proc_key = {
+        let mut buf: Vec<u8> = Vec::with_capacity(48);
+        match &proc {
+            None => buf.push(0),
+            Some(p) => {
+                buf.push(1);
+                match p.crop {
+                    None => buf.push(0),
+                    Some(c) => {
+                        buf.push(1);
+                        for x in c {
+                            buf.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                }
+                match p.key {
+                    None => buf.push(0),
+                    Some(k) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&k);
+                    }
+                }
+                buf.extend_from_slice(&p.tol.to_le_bytes());
+                buf.extend_from_slice(&p.corner.to_le_bytes());
+                buf.extend_from_slice(&p.feather.to_le_bytes());
+                buf.push(p.star as u8);
+            }
+        }
+        buf.push(v.get("flip_h").and_then(|x| x.as_bool()).unwrap_or(false) as u8);
+        fnv64(&buf)
+    };
+    let flip_h = v.get("flip_h").and_then(|x| x.as_bool()).unwrap_or(false);
     Some(Arc::new(OverlayCfg {
         side_left: v.get("side").and_then(|x| x.as_str()) == Some("left"),
         base_height,
         offset_x: jf_i32(v, "offset_x", 0, -4000, 4000),
         offset_y: jf_i32(v, "offset_y", 0, -4000, 4000),
         gap: jf_i32(v, "gap", 8, -400, 2000),
-        flip_h: v.get("flip_h").and_then(|x| x.as_bool()).unwrap_or(false),
+        flip_h,
         above: v.get("layer").and_then(|x| x.as_str()) == Some("above"),
         alpha,
         v_align,
         img_key: fnv64(&bytes),
+        proc_key,
         image: bytes,
         proc,
         hide_delay_ms: v
@@ -269,6 +311,10 @@ struct DecodeState {
     h: AtomicU32,
     /// 解码时用的目标高度(base_height×DPI);变了要重解码
     built_for: AtomicU32,
+    /// 【处理指纹 2026-10-07】解码时用的处理参数指纹(proc_key);变了要
+    /// 重解码——成品帧缓存着按旧圆角/羽化处理过的像素,纯参数改动必须
+    /// 让缓存失配(用户实录「改圆角/羽化要拖一下高度才生效」的根因)
+    proc_key: AtomicU64,
     /// 处理完的 BGRA 预乘帧(尺寸 w×h,未翻转)
     frames: Mutex<Vec<Vec<u8>>>,
     /// 每帧时长 ms(钳 20-1000;静态帧空)
@@ -283,6 +329,7 @@ fn start_decode(cfg: Arc<OverlayCfg>, target_h: f32) -> Arc<DecodeState> {
         w: AtomicU32::new(0),
         h: AtomicU32::new(0),
         built_for: AtomicU32::new(target_h.round() as u32),
+        proc_key: AtomicU64::new(cfg.proc_key),
         frames: Mutex::new(Vec::new()),
         delays: Mutex::new(Vec::new()),
         animated: AtomicBool::new(false),
@@ -1142,21 +1189,27 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
             }
         }
     }
-    // 目标显示高度(DPI/高度参数变了 → 重解码重处理)
+    // 目标显示高度/处理参数(DPI/高度/圆角/羽化等变了 → 重解码重处理)
     let target_h = cfg.base_height * dpi_scale(cand);
     let need_decode = match entry.decoded.as_ref() {
         None => true,
-        Some(d) => d.built_for.load(Ordering::Acquire) != target_h.round() as u32,
+        Some(d) => {
+            d.built_for.load(Ordering::Acquire) != target_h.round() as u32
+                || d.proc_key.load(Ordering::Acquire) != cfg.proc_key
+        }
     };
     if need_decode {
         // 【预解码缓存 2026-11】皮肤到位时已起跑的解码直接采用（首段
         // 即显——不等首键 sync 才开解）；未命中/失配才现场开解。
+        // 【处理指纹 2026-10-07】命中条件加 proc_key——纯参数改动不复用
+        // 旧参数的成品帧。
         let prewarmed = {
             let pw = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
-            pw.as_ref().and_then(|(k, b, d)| {
+            pw.as_ref().and_then(|(k, b, pk, d)| {
                 (d.ready_first.load(Ordering::Acquire)
                     && *k == cfg.img_key
-                    && *b == target_h.round() as u32)
+                    && *b == target_h.round() as u32
+                    && *pk == cfg.proc_key)
                     .then(|| d.clone())
             })
         };
