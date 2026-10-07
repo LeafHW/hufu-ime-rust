@@ -1083,6 +1083,38 @@ fn text_w(s: &str, em: i32) -> i32 {
         .sum()
 }
 
+/// 【词宽实测 2026-11】GetTextExtentPoint32W 按实际字体测显示宽。
+/// text_w 估算（CJK=1em/ASCII≈0.56em）对加粗+下划线的新词字体普遍
+/// 偏窄（宽 ASCII W/M≈0.7-0.8em、无独立粗体字重时 GDI 合成粗体还有
+/// 右侧 overhang），STATIC 按估算宽硬裁=「预览新词吞最后一个字」
+///（用户实锤；纯显示层——预览与提交同读框、落库数据完整）。主候选
+/// 窗是 DirectWrite 实测宽，本窗是全仓唯一用估算宽的候选式渲染，
+/// 改 GDI 实测对齐。测量失败（DC/字体异常）兜底回估算。
+unsafe fn measure_w(s: &str, font_usize: usize) -> Option<i32> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetTextExtentPoint32W, HGDIOBJ, ReleaseDC, SelectObject,
+    };
+    if s.is_empty() {
+        return Some(0);
+    }
+    let hdc = GetDC(None);
+    if hdc.is_invalid() {
+        return None;
+    }
+    let old = SelectObject(hdc, HGDIOBJ(font_usize as *mut core::ffi::c_void));
+    let txt = utf16z(s);
+    let mut sz = SIZE::default();
+    let ok = GetTextExtentPoint32W(hdc, &txt[..txt.len() - 1], &mut sz);
+    SelectObject(hdc, old);
+    ReleaseDC(None, hdc);
+    if ok.as_bool() {
+        Some(sz.cx)
+    } else {
+        None
+    }
+}
+
 /// 预览一行候选项：序号(label 色) + 词(text 色) 流式排列换行。
 /// 返回排版后的下一行 y。new_idx=加入后行中新词下标（高亮块）。
 unsafe fn draw_items(
@@ -1112,15 +1144,31 @@ unsafe fn draw_items(
         .as_ref()
         .map(|s| s.cand_spacing)
         .unwrap_or(6);
+    // 【词宽实测 2026-11】三字体取锁一次；测量用与渲染同一字体
+    //（新词=加粗+下划线），失败回估算。
+    let (label_font, main_font, new_font) = {
+        let l = FONT_LABEL.lock().unwrap_or_else(|p| p.into_inner());
+        let m = FONT_MAIN.lock().unwrap_or_else(|p| p.into_inner());
+        let n = FONT_NEW.lock().unwrap_or_else(|p| p.into_inner());
+        (*l, *m, *n)
+    };
+    let mw = |s: &str, f: Option<usize>, em: i32| -> i32 {
+        match f {
+            Some(h) => unsafe { measure_w(s, h) }.unwrap_or_else(|| text_w(s, em)),
+            None => text_w(s, em),
+        }
+    };
     // 行首标签（「现有：」/「加入后：」）
     let head_txt = utf16z(head);
-    let head_w = text_w(head, lem) + 4;
+    let head_w = mw(head, label_font, lem) + 4;
+    // 【SS_NOPREFIX=0x80】词含 & 时 STATIC 默认把它当加速键前缀吞掉
+    //（"R&B"→"RB"、尾随 & 直接消失）——预览 STATIC 一律加。
     let h = create_child(
         hwnd,
         w!("STATIC"),
         PCWSTR(head_txt.as_ptr()),
         WINDOW_EX_STYLE(0),
-        0,
+        0x80,
         PV_X,
         y0,
         head_w + 2,
@@ -1138,14 +1186,14 @@ unsafe fn draw_items(
     let right = PV_X + PV_W;
     for (i, t) in texts.iter().enumerate() {
         let label = format!("{}.", i + 1);
-        let lw = text_w(&label, lem) + 2;
-        let tw = text_w(t, em) + 2;
+        let is_new = new_idx == Some(i);
+        let lw = mw(&label, label_font, lem) + 2;
+        let tw = mw(t, if is_new { new_font } else { main_font }, em) + 2;
         let need = lw + tw + spacing;
         if x + need > right {
             x = PV_X + 14; // 续行缩进
             y += line_h;
         }
-        let is_new = new_idx == Some(i);
         let base = if is_new { ID_AFT_NEW } else { id_base };
         // 序号（新词行用高亮 id 段着色）
         let lbl_txt = utf16z(&label);
@@ -1154,7 +1202,7 @@ unsafe fn draw_items(
             w!("STATIC"),
             PCWSTR(lbl_txt.as_ptr()),
             WINDOW_EX_STYLE(0),
-            0,
+            0x80,
             x,
             y + (line_h - lem - 4),
             lw,
@@ -1166,14 +1214,14 @@ unsafe fn draw_items(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(hl.0 as isize);
-        // 词（新词用加粗+下划线字体）
+        // 词（新词用加粗+下划线字体；宽=实测，不再按估算硬裁吞尾字）
         let w_txt = utf16z(t);
         let wd = create_child(
             hwnd,
             w!("STATIC"),
             PCWSTR(w_txt.as_ptr()),
             WINDOW_EX_STYLE(0),
-            0,
+            0x80,
             x + lw,
             y + (line_h - em - 6) / 2,
             tw,
@@ -1242,12 +1290,14 @@ unsafe fn refresh_preview(hwnd: HWND) {
             .map(|s| s.font_pt)
             .unwrap_or(16);
         let t = utf16z(&msg);
+        // 【SS_NOPREFIX 2026-11】msg 含用户词（& 直通不吞）；宽=PV_W 通栏，
+        // 长词由 STATIC 自身裁剪（表头提示语，与候选行不同路）。
         let h = create_child(
             hwnd,
             w!("STATIC"),
             PCWSTR(t.as_ptr()),
             WINDOW_EX_STYLE(0),
-            0,
+            0x80,
             PV_X,
             156,
             PV_W,

@@ -1052,6 +1052,15 @@ pub struct CandidateWindowV2 {
     pub(crate) hl_prev: std::cell::Cell<Option<(Vec<(String, String)>, usize)>>,
     /// 高亮滑动时长 ms（皮肤 hl_ms × anim_speed）。
     pub(crate) hl_ms: u32,
+    /// 【hl 帧率封顶 2026-11】上一次高亮滑动帧渲染时刻——与
+    /// size_anim_last_render 同款门（morph_frame_interval_ms：间隔
+    /// 小于屏幕刷新帧距则跳过本帧渲染）。五十九修只封了 size 分支：
+    /// 非整句高速选重（b;b;b;…）驱动的是 hl_anim，每循环两次起臂
+    /// （键间隔 < hl_ms=80ms → 全程在身）× winmm 双路 ~200fps 整帧
+    /// 复渲染无封顶 → 慢宿主 UI 线程键事件排队滞后 ∝ 按键数，停手
+    /// 后排水=「候选和文字还在自己动」（用户实锤）。封顶后 60Hz 屏
+    /// 80ms 滑动 ≈5 帧可见性不变。
+    pub(crate) hl_anim_last_render: std::cell::Cell<std::time::Instant>,
     /// 【动效 tick 重渲染标记】动画 tick（FADE_TIMER）驱动的 show()
     /// 复渲染——不算用户键入帧：不重记高亮基准、不重置注释倒计时、
     /// 不重臂尺寸/位置动效。
@@ -1153,6 +1162,16 @@ pub struct CandidateWindowV2 {
     /// 隐藏时归零（新会话按首个内容重新定基准）。余量区域由
     /// WM_NCHITTEST 返回 HTTRANSPARENT 穿透鼠标。
     live_size: std::cell::Cell<(i32, i32)>,
+    /// 【上翻底边钉锚 2026-11】本帧布局是否上翻模式（下方空间不足、
+    /// 候选翻到光标上方：y=锚行−窗高−4，锚定边=**底边**；QQ 聊天
+    /// 输入条贴屏底是常态）。锚帧刷新，SWP/tick 复渲帧沿用——形变
+    /// 期间底边恒钉终态底边（见主 SWP 处注释），根除「增高帧底边先
+    /// 下探光标行再收回」的回弹抖动（QQ 连续重选 Y 抖动实锤）。
+    pub(crate) above_flip_last: std::cell::Cell<bool>,
+    /// 与 sticky_pos 同帧记录的候选本体高（物理 px，y 锁分解用）：
+    /// 上翻模式 y=锚行−h−4，h 变化是合法布局变化（候选数增减），
+    /// 不该混进总 dy 被锯齿锁当噪声攒着——分解见 y 锁块注释。
+    pub(crate) sticky_h: std::cell::Cell<i32>,
     /// 当前内容实际尺寸（逻辑 px，用于命中测试区分内容区/透明余量）
     pub(crate) content_size: std::cell::Cell<(i32, i32)>,
     /// 【注释展开延时】本组段注释是否已展开：首显（hidden→visible）重置，
@@ -1397,6 +1416,8 @@ impl CandidateWindowV2 {
                 ulw_last_nonempty: false,
                 readback: false,
                 sticky_pos: None,
+                above_flip_last: std::cell::Cell::new(false),
+                sticky_h: std::cell::Cell::new(0),
                 sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
@@ -1411,6 +1432,7 @@ impl CandidateWindowV2 {
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
+                hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
                 hl_ms: 100,
@@ -1572,6 +1594,8 @@ impl CandidateWindowV2 {
                 ulw_last_nonempty: false,
                 readback: false,
                 sticky_pos: None,
+                above_flip_last: std::cell::Cell::new(false),
+                sticky_h: std::cell::Cell::new(0),
                 sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
@@ -1586,6 +1610,7 @@ impl CandidateWindowV2 {
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
+                hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
                 hl_ms: 100,
@@ -2270,9 +2295,13 @@ impl CandidateWindowV2 {
         // 收场钟 150ms 不变：滑动先播完，留一拍确认再收；皮肤 hl_ms
         // 可调，0=瞬跳）。
         self.hl_ms = (layout_f(skin, "hl_ms", 80.0).clamp(0.0, 600.0) * anim_spd) as u32;
-        // 【二十五修·注释提速 2026-10-09】默认 400→200：注释列晚半拍
-        // 展开=「候选慢半拍」观感主源之一（皮肤显式配置不受影响）。
-        let cmt_delay = layout_f(skin, "comment_delay_ms", 200.0).clamp(0.0, 5000.0) as u32;
+        // 【注释常显 2026-11 用户拍板】默认 0：注释列首帧即全展开——
+        // 候选窗出现即最终形态，不再「停手 200ms 后展宽」二次形变
+        //（二十五修自认的「候选慢半拍」观感主源；QQ 形变期 Y 抖动的
+        // 触发面之一同源收敛）。连打期间窗口宽度随注释列常驻略宽，
+        // 视觉稳定性反而更好（无展开/收起切换）。皮肤显式配置
+        // comment_delay_ms>0 仍可回到「停手后展开」档。
+        let cmt_delay = layout_f(skin, "comment_delay_ms", 0.0).clamp(0.0, 5000.0) as u32;
         if !was_visible {
             // 新组段首显：注释展开态重置（0=常显直接展开）
             self.comments_expanded = cmt_delay == 0;
@@ -4203,10 +4232,16 @@ impl CandidateWindowV2 {
                         } else {
                             (r.bottom + 4, r.top)
                         };
-                        let y = if below + hpx <= vy + vh {
-                            below
-                        } else {
+                        // 【上翻底边钉锚 2026-11】先判模式再算 y：上翻
+                        //（下方放不下）锚定边=底边（y=锚行−h−4），本帧
+                        // 模式记入 above_flip_last（y 锁分解 + 主 SWP
+                        // 形变钉锚两处消费；tick 复渲帧锚缺失时沿用）。
+                        let flipped_now = !(below + hpx <= vy + vh);
+                        self.above_flip_last.set(flipped_now);
+                        let y = if flipped_now {
                             (above_base - hpx - 4).max(vy)
+                        } else {
+                            below
                         };
                         // 【五十一修·y 稳定锁复刻 v1.5.2】老版本行为档
                         // 案实测（同 harness）：v1.5.0/1.5.2 段内 T 恒定
@@ -4260,9 +4295,27 @@ impl CandidateWindowV2 {
                                 fresh = false;
                             }
                         }
-                        let dy_lock = y - match self.sticky_pos {
+                        // 【上翻 y 锁分解 2026-11】上翻模式 y=锚行−h−4：
+                        // 总 dy 混入高度变化（连续重选/候选数增减每步
+                        // ±一行 ≈30px），被下方这套锯齿锁当 −14~−24px
+                        // 噪声攒住不放行、攒到门槛再整体放=Y 底边先陷
+                        // 进光标行、滞后跳回（QQ「候选最左没定下来」
+                        /// 抖动实锤）。分解：锁的对象改为**锚行**——
+                        /// d锚=dy总+Δh（sticky_h 与 sticky_pos 同帧记录）；
+                        /// 锚行不动+h 变化 ⇒ d锚=0 ⇒ 钉住时也按新 h
+                        /// 重算 y（y=oy+prev_h−h：锚行恒定、窗沿锚行
+                        /// 即时生长，零滞后零跳变）。下方模式 y=below
+                        /// 与 h 无关，原语义不变。跨模式帧（下→上）d锚
+                        /// 必 ≥ 行高+8+旧窗高 >26px 恒放行，重建分支
+                        /// 不会拿 below 旧值误算。
+                        let prev_h = self.sticky_h.get();
+                        let dy_lock = (y - match self.sticky_pos {
                             Some((_, oy)) => oy,
                             None => y,
+                        }) + if flipped_now {
+                            hpx - prev_h
+                        } else {
+                            0
                         };
                         if fresh {
                             self.ylock_last_dir.set(0);
@@ -4287,7 +4340,14 @@ impl CandidateWindowV2 {
                             self.ylock_acc.set(acc_now);
                         }
                         let y = match self.sticky_pos {
-                            Some((_, oy)) if !allow => oy,
+                            Some((_, oy)) if !allow => {
+                                if flipped_now {
+                                    // 锚行钉住、高度直通（见上方分解注释）
+                                    oy + prev_h - hpx
+                                } else {
+                                    oy
+                                }
+                            }
                             _ => y,
                         };
                         // 【删棘轮 2026-09-12 十六次修正】poll 真实帧的
@@ -4457,6 +4517,9 @@ impl CandidateWindowV2 {
             let x = x.clamp(vx, (vx + vw - wpx0).max(vx));
             let y = y.clamp(vy, (vy + vh - hpx0).max(vy));
             self.sticky_pos = Some((x, y));
+            // 【上翻 y 锁分解 2026-11】同帧记录本体高（下一帧 d锚=dy总
+            // +Δh 分解用；与 sticky_pos 同一赋值点保证成对一致）。
+            self.sticky_h.set(hpx0);
             // 【四十八修】记录本帧粘位归属的焦点窗（沿用判据，见字段注释）
             {
                 #[repr(C)]
@@ -4877,6 +4940,23 @@ impl CandidateWindowV2 {
                         }
                         None => (tx, ty),
                     }
+                };
+                // 【上翻底边钉锚 2026-11】上翻模式锚定边=底边（QQ 屏底
+                // 聊天输入条：候选恒翻到光标上方）。形变期间窗高插值
+                ///（apply.1）与 y 滑坡（pos_anim/chase）两路异步叠加：
+                /// 底边=py+apply.1 先下探进光标行再收回=肉眼可见的
+                /// 回弹（用户实锤：连续数字重选，窗高每步 ±一行，
+                /// 「候选最左没定下来的感觉」）。形变期改「底边恒钉
+                /// 终态底边」：py=ty+h_out−apply.1——增高帧（零位移轴
+                /// apply≡目标）py 直落 ty 无滑坡；收矮帧 py 随缓动
+                /// 同步上移；底边全程恒定、窗只贴着锚行生长。x 轴照
+                /// 常滑坡；非形变帧 apply≡目标 ⇒ py=ty 纯等式零差异；
+                /// 下方模式（顶边锚定）不受影响。tick 复渲帧（锚缺失）
+                /// 沿用 above_flip_last + 本公式，两端一致。
+                let py = if self.above_flip_last.get() && self.size_anim.is_some() {
+                    (ty + h_out as i32) - apply.1
+                } else {
+                    py
                 };
                 // 【四十一修·主 SWP 观测（三十六修删）】原条件
                 // `|tx-x|>10`：tx ≡ x − m_off（阴影边距，3678 处推导），
@@ -5737,7 +5817,20 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             //（首 tick anim_done=true 即收钟）。注释「同款」自此属实。
             if c.hl_anim.get().is_some() {
                 anim_done = false;
-                if c.is_visible() {
+                // 【hl 帧率封顶 2026-11】与 size 分支同款门（见字段注释）
+                // ——跳帧只延后插值采样，完成清臂在渲染内，至多多等一帧。
+                let render_ok = {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(c.hl_anim_last_render.get()).as_millis()
+                        >= morph_frame_interval_ms(hwnd)
+                    {
+                        c.hl_anim_last_render.set(now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if c.is_visible() && render_ok {
                     c.internal_rerender = true;
                     let _ = c.show(&cands, &raw, &skin, None, sel);
                     c.internal_rerender = false;
@@ -5933,7 +6026,22 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 帧（FADE_TIMER 驱动；完成在渲染内自清 → anim_done 收 timer）。
         if c.hl_anim.get().is_some() {
             anim_done = false;
-            if c.is_visible() {
+            // 【hl 帧率封顶 2026-11】与 size 分支同款门（见字段注释）：
+            // 高速选重序列里 hl_anim 全程在身，winmm 双路 ~200fps 整帧
+            // 复渲染无封顶=宿主 UI 线程渲染洪峰（键事件排队滞后、停手
+            // 后排水自动）。封顶后至多屏刷率帧，80ms 滑动 60Hz ≈5 帧。
+            let render_ok = {
+                let now = std::time::Instant::now();
+                if now.duration_since(c.hl_anim_last_render.get()).as_millis()
+                    >= morph_frame_interval_ms(hwnd)
+                {
+                    c.hl_anim_last_render.set(now);
+                    true
+                } else {
+                    false
+                }
+            };
+            if c.is_visible() && render_ok {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;

@@ -186,8 +186,11 @@ fn parse_cfg(skin: &Value) -> Option<Arc<OverlayCfg>> {
         return None;
     }
     let png = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    // 【JPEG 入白名单 2026-11】FFD8FF 魔数（与 server 侧 overlay.rs 同款；
+    // image crate 已加 jpeg 特性，静态走下方最终 else 的 load_from_memory）。
     let ok = bytes[0..8] == png
         || &bytes[0..3] == b"GIF"
+        || (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
         || (&bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
     if !ok {
         return None;

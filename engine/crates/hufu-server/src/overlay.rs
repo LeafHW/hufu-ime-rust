@@ -252,8 +252,12 @@ fn parse_cfg(skin: &Value) -> Option<Arc<OverlayCfg>> {
         return None;
     }
     let png = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    // 【JPEG 入白名单 2026-11】FFD8FF 魔数（设置页 accept=image/* 一直
+    // 能选 JPG 且皮肤里存的是完好的 base64——此前在此被静默拒收，
+    // 「已载入并生效」但挂件永不出现）。image crate 已加 jpeg 特性。
     let ok = bytes[0..8] == png
         || &bytes[0..3] == b"GIF"
+        || (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
         || (&bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
     if !ok {
         return None;
@@ -386,23 +390,30 @@ fn decode_worker(st: &Arc<DecodeState>, cfg: &OverlayCfg, target_h_px: u32) -> O
             }
         }
     } else {
-        let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&bytes)).ok()?;
-        if dec.is_apng().unwrap_or(false) {
-            animated = true;
-            let frames = dec.apng().ok()?.into_frames();
-            for f in frames {
-                match f {
-                    Ok(f) => {
-                        let (img, ms) = frame_pair(f);
-                        emit_frame(st, cfg, idx, &img, ms, cw, ch, true);
-                        idx += 1;
+        // 【非 GIF 分发重构 2026-11】PNG/APNG 走专用解码器；其余格式
+        //（静态 WEBP、JPEG——魔数门已放行）load_from_memory 静态兜底。
+        // 旧版对非 GIF 一律先 PngDecoder::new(...).ok()?：非 PNG 字节
+        // 在此整函数退出，下方「WEBP 兜底」块不可达=静态 WEBP 在代画
+        // 路径一直是死的；JPEG 只加特性不改这里会死在同一处。
+        match image::codecs::png::PngDecoder::new(std::io::Cursor::new(&bytes)) {
+            Ok(dec) if dec.is_apng().unwrap_or(false) => {
+                animated = true;
+                let frames = dec.apng().ok()?.into_frames();
+                for f in frames {
+                    match f {
+                        Ok(f) => {
+                            let (img, ms) = frame_pair(f);
+                            emit_frame(st, cfg, idx, &img, ms, cw, ch, true);
+                            idx += 1;
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
             }
-        } else {
-            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            emit_frame(st, cfg, 0, &img, 0, cw, ch, false);
+            _ => {
+                let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+                emit_frame(st, cfg, 0, &img, 0, cw, ch, false);
+            }
         }
     }
     if !animated && st.frames.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
@@ -1114,6 +1125,48 @@ mod tests {
         // 未 enabled → None
         let skin2: Value = serde_json::json!({"overlay": {"image": "x"}});
         assert!(parse_cfg(&skin2).is_none(), "未启用");
+    }
+
+    #[test]
+    fn magic_gate_jpeg_webp_bmp() {
+        // 【JPEG 入白名单 2026-11】FFD8FF 头须过门（用户反馈挂件不能用
+        // JPG）；静态 WEBP 头须过门；未启用的魔数（BMP=42 4D）仍拒收。
+        let b64_of = |raw: &[u8]| -> String {
+            const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            let (mut acc, mut nbits) = (0u32, 0u32);
+            for &b in raw {
+                acc = (acc << 8) | b as u32;
+                nbits += 8;
+                while nbits >= 6 {
+                    nbits -= 6;
+                    out.push(T[((acc >> nbits) & 0x3F) as usize] as char);
+                }
+            }
+            if nbits > 0 {
+                acc <<= 6 - nbits;
+                out.push(T[(acc & 0x3F) as usize] as char);
+            }
+            out
+        };
+        let mk_skin = |bytes: &[u8]| {
+            serde_json::json!({
+                "overlay": {"enabled": true, "image": format!("data:image/jpeg;base64,{}", b64_of(bytes))}
+            })
+        };
+        // JPEG：SOI+APP0 骨架补零到 32B（过 payload≥32 字符与字节≥12 两道门）
+        let mut jpeg = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F'];
+        jpeg.resize(32, 0);
+        let c = parse_cfg(&mk_skin(&jpeg)).expect("JPEG 魔数应过门");
+        assert_eq!(c.image.len(), jpeg.len());
+        // 静态 WEBP：RIFF+size+WEBP 骨架补零
+        let mut webp = vec![b'R', b'I', b'F', b'F', 0, 0, 0, 0, b'W', b'E', b'B', b'P'];
+        webp.resize(32, 0);
+        assert!(parse_cfg(&mk_skin(&webp)).is_some(), "WEBP 魔数应过门");
+        // BMP（42 4D…）不在白名单 → 拒收
+        let mut bmp = vec![0x42u8, 0x4D];
+        bmp.resize(32, 0);
+        assert!(parse_cfg(&mk_skin(&bmp)).is_none(), "非白名单魔数仍拒收");
     }
 
     #[test]

@@ -230,6 +230,17 @@ pub struct SessionState {
     /// 时 FALSE=透传给应用）。引擎 state() 填。
     #[serde(default)]
     pub esc_undo_ready: bool,
+    /// 【Ctrl+M/Space 预判门控 2026-11】config.general 两开关的服务端
+    /// 镜像：DLL TestDown 对 Ctrl+M/Ctrl+Space 的预吞以开关为准——
+    /// 未启用不预吞。否则信任 TestDown 的宿主（PS 等 CUAS 桥接应用）
+    /// 在「TestDown TRUE + 引擎放行」组合下直接丢键=「别的软件的
+    /// Ctrl+M 快捷键用不了」（用户实锤；键蒸发同型：八十四修大写
+    /// 字母）。引擎 state() 填；DLL update_ui 同步（键/poll 响应
+    /// 都经此，~110ms 内收敛）。
+    #[serde(default)]
+    pub switch_recent_schema: bool,
+    #[serde(default)]
+    pub ctrl_space_switch: bool,
     /// 【全键盘按键映射 2026-11】用户键→功能表快照（config.keymap.map）。
     /// DLL 缓存后：① F 区键仅在映射过的前提下路由进引擎（未映射 F 键
     /// 行为与旧版逐字节一致——直通）；② TestDown 空态预判对「空态也

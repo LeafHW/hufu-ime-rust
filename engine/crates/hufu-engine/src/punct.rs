@@ -40,6 +40,15 @@ pub fn to_full_width_punct(c: char) -> Option<String> {
         '-' => "-".into(),
         '+' => "+".into(),
         '=' => "=".into(),
+        // 【/无引导直出 2026-11】/ 无引导（slash_dunhao 关且码表无 / 前缀
+        // 词条）时空态按 / 原先落到 passthrough——DLL TestDown 对单字符
+        // 预吞 TRUE，信任 TestDown 的宿主（WPS/Word 等 CUAS）不再自产
+        // WM_CHAR → 键蒸发「按了没反应」（用户实锤；与八十四修大写
+        // 字母蒸发同病根）。入表自映=consumed+commit 走 TSF 插入通道，
+        // 全宿主统一；编码态与 { } | ~ 同语义（有候选顶字+符号）。
+        // 有引导（has_continuation_prefix）与 slash_dunhao 档在各自
+        // 早退分支，不受此行影响。
+        '/' => "/".into(),
         _ => return None,
     };
     Some(s)
@@ -72,5 +81,24 @@ impl PairState {
     pub fn reset(&mut self) {
         self.single_open = false;
         self.double_open = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 【/无引导直出 2026-11 回归】/ 必须在 half_shape 表内自映——
+    /// 空态中文按 / 走 consumed+commit（TSF 插入通道），否则信任
+    /// TestDown 的宿主键蒸发（用户实锤「按了没反应」）。
+    #[test]
+    fn slash_maps_to_self() {
+        assert_eq!(to_full_width_punct('/').as_deref(), Some("/"));
+        // 半角保持组仍在（编码态顶字语义依赖）
+        assert_eq!(to_full_width_punct('=').as_deref(), Some("="));
+        assert_eq!(to_full_width_punct('{').as_deref(), Some("{"));
+        // 未入表字符仍 None（引擎回落其他分支）
+        assert_eq!(to_full_width_punct('a'), None);
+        assert_eq!(to_full_width_punct('、'), None);
     }
 }

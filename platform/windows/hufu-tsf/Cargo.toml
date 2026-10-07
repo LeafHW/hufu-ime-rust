@@ -41,5 +41,6 @@ windows = { version = "0.58", features = [
 windows-core = "0.58"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 贴图挂件解码：png(含APNG)/gif(动图)/webp(静态)，纯 Rust，i686-gnu 可过
-image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+# 贴图挂件解码：png(含APNG)/gif(动图)/webp(静态)/jpeg(静态 JPG——
+# 2026-11 用户反馈挂件不能用 JPG；zune-jpeg 纯 Rust，i686-gnu 可过)
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }

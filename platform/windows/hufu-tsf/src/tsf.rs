@@ -280,6 +280,13 @@ pub struct Shared {
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
     pub chinese: bool,
     pub composing: bool,
+    /// 【Ctrl+M/Space 预判门控 2026-11】config.general 两开关的服务端
+    /// 镜像（update_ui 从 state 同步，键/poll 响应都经此）：TestDown
+    /// 对 Ctrl+M（switch_recent_schema）/Ctrl+Space（ctrl_space_switch）
+    /// 的预吞以开关为准——未启用不预吞，信任 TestDown 的宿主（CUAS）
+    /// 不再丢应用快捷键（用户实锤「别的软件 Ctrl+M 用不了」）。
+    pub switch_recent_schema: bool,
+    pub ctrl_space_switch: bool,
     /// Shift 单击判定：keydown 置位；期间任何其他键 keydown 视为组合
     /// （打大写/快捷键）清除；keyup 时仍置位才发给 server 切换中英。
     pub shift_pending: bool,
@@ -516,6 +523,10 @@ impl Shared {
             caret: None,
             chinese: true,
             composing: false,
+            // 【Ctrl+M/Space 预判门控 2026-11】默认 false=不预吞（保守
+            // 方向：应用快捷键优先；首个 state 到达即校正）。
+            switch_recent_schema: false,
+            ctrl_space_switch: false,
             shift_pending: false,
             shift_pending_side: "shift",
             shift_chord_armed: false,
@@ -732,9 +743,12 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             // 管理器搜索全灭）。shell 进程有真实编辑焦点（搜索框/重命
             // 名框），永不走子类化流派。
             let fs_or_list = raw_fullscreen_host() || game_host_blocklisted();
-            let shell_exempt = shell_host_never_game();
+            // 【通讯宿主豁免 2026-11】微信/qq 等有真实编辑焦点的通讯类
+            // 进程永不算游戏宿主（视频通话/全屏看图/截图遮罩形态窗是
+            // 误判源，见 comm_host_never_game 注释）。
+            let shell_exempt = shell_host_never_game() || comm_host_never_game();
             if fs_or_list && shell_exempt {
-                crate::tsf::trace("activate: 外壳宿主豁免——形状/名单命中但 shell 进程挂正常 sink");
+                crate::tsf::trace("activate: 外壳/通讯宿主豁免——形状/名单命中但正常挂 sink");
             }
             if fs_or_list && !shell_exempt {
                 crate::tsf::trace("activate: 游戏宿主 → 子类化流派（不挂 sink）");
@@ -742,6 +756,14 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                 GAME_CHAT_OPEN.with(|c| c.set(false));
                 game_dissociate_focus();
             } else {
+                // 【流派残留自愈 2026-11】上次 Activate 曾误判进游戏流派
+                //（全屏形状瞬态误报）、本次判为正常宿主：流派副作用
+                //（子类化/拆链/模式位）对称还原——否则 thread_local 标志
+                // 卡死，本进程从此打不了字（见 game_host_restore 注释）。
+                if GAME_HOST_MODE.with(|c| c.get()) {
+                    crate::tsf::trace("activate: 游戏流派残留 → 对称还原（上次误判自愈）");
+                    game_host_restore();
+                }
                 match km.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
                     Ok(_) => crate::tsf::trace("activate: sink advised ok"),
                     Err(e) => crate::tsf::trace(&format!("activate: advise FAIL 0x{:08X}", e.code().0)),
@@ -892,18 +914,12 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
         // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
-        // 【E7·反子类化】游戏宿主失活：还原游戏窗原 proc（不对称还原
-        // =窗口销毁时跳转野指针崩溃）
-        {
-            use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
-            let orig = GAME_ORIG_PROC.swap(0, std::sync::atomic::Ordering::SeqCst);
-            let h = GAME_HWND_USIZE.swap(0, std::sync::atomic::Ordering::SeqCst);
-            if orig != 0 && h != 0 {
-                let hwnd = windows::Win32::Foundation::HWND(h as *mut _);
-                let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, orig as _) };
-                crate::tsf::trace("E7: 失活 → 游戏窗 proc 已还原");
-            }
-        }
+        // 【E7·反子类化 2026-11 对称化】游戏宿主失活：流派整体对称还原
+        //（子类化 WndProc + 已拆链窗恢复默认 IMC + 三标志清零——旧版只
+        // 还原 proc 不还原 HIMC/不复位 GAME_HOST_MODE，标志跨失活残留=
+        // 误判一次从此打不了字的病根，见 game_host_restore 注释）。
+        // 正常宿主路径下该函数为幂等空操作。
+        game_host_restore();
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         // 【六十修】引擎侧会话一并清零（与 ime_switch_abort 同款）：
@@ -2004,8 +2020,26 @@ impl HuFuTs_Impl {
             let _ = alt;
             // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
             // 由引擎定夺（未启用时引擎不吞，KeyDown 返回直通）。
+            // 【预判门控 2026-11】预吞以 config.general 两开关的服务端
+            // 镜像为准（update_ui 同步）：未启用不预吞——此前无条件
+            // BOOL(1)，信任 TestDown 的宿主（PS 等 CUAS 桥接）在
+            // 「TestDown TRUE + 引擎放行」组合下直接丢键=「别的软件
+            // Ctrl+M 快捷键用不了」（用户实锤；键蒸发同型：八十四修
+            // 大写字母、keys-5008 数字）。开关开时保持预吞（引擎
+            // KeyDown 定夺）。
             if ctrl && !shift && !alt && (name == "m" || name == "space") {
-                return BOOL(1);
+                let eat = {
+                    let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if name == "m" {
+                        g.switch_recent_schema
+                    } else {
+                        g.ctrl_space_switch
+                    }
+                };
+                if eat {
+                    return BOOL(1);
+                }
+                return BOOL(0);
             }
             if ctrl {
                 // 【候选调频/删词 2026-09-06】Ctrl+数字（含 Shift 形态）在
@@ -6439,6 +6473,46 @@ fn game_dissociate_focus() {
     crate::tsf::trace(&format!("E6 拆链: hwnd={cur:#x} ok={}", r.as_bool()));
 }
 
+/// 【游戏流派对称还原 2026-11】GAME_HOST_MODE 生命周期补全。此前的
+/// 实现只在 Deactivate 还原子类化 WndProc，三个缺口：①GAME_HOST_MODE
+/// 是 thread_local 且全仓只置 true 从不复位——Activate 期一次形状误判
+/// （微信视频通话/全屏看图/截图遮罩=满屏 WS_POPUP 恰逢激活）后，
+/// 即使再 Activate 判回正常宿主，update_ui 仍永远走游戏分支、绝不进
+/// 组段/写会话路径；②每次焦点变化继续对焦点窗拆 IME 链
+///（ImmAssociateContextEx(hwnd,NULL)），不可自愈；③标志跨 Deactivate
+/// 残留。综合表现=「该应用从此打不了字，只有重装键盘/重启进程能救」
+///（微信偶发打不了字，用户实锤）。本函数对称还原三件套：WndProc、
+/// 已拆链窗的默认 IME 上下文（IACE_DEFAULT 官方语义=恢复窗口默认
+/// 关联）、三标志清零。幂等：全部 swap/replace-0，正常宿主调用为
+/// 空操作。
+fn game_host_restore() {
+    // ① 子类化 WndProc 还原（与旧 Deactivate 的 E7 块同款，swap 幂等）
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+        let orig = GAME_ORIG_PROC.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let h = GAME_HWND_USIZE.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if orig != 0 && h != 0 {
+            let hwnd = windows::Win32::Foundation::HWND(h as *mut _);
+            let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, orig as _) };
+            crate::tsf::trace("E7: 流派还原 → 游戏窗 proc 已还原");
+        }
+    }
+    // ② 拆链窗恢复默认 IME 上下文（窗口已销毁则调用无害失败）
+    let last = GAME_LAST_HWND.with(|c| c.replace(0));
+    if last != 0 {
+        use windows::Win32::UI::Input::Ime::{ImmAssociateContextEx, HIMC, IACE_DEFAULT};
+        let hwnd = windows::Win32::Foundation::HWND(last as *mut _);
+        let r = unsafe { ImmAssociateContextEx(hwnd, HIMC(std::ptr::null_mut()), IACE_DEFAULT) };
+        crate::tsf::trace(&format!(
+            "E6: 流派还原 → 恢复默认 IMC hwnd={last:#x} ok={}",
+            r.as_bool()
+        ));
+    }
+    // ③ 三标志清零
+    GAME_HOST_MODE.with(|c| c.set(false));
+    GAME_CHAT_OPEN.with(|c| c.set(false));
+}
+
 fn ui_element_show(
     shared: &SharedRef,
     cands: &[(String, String)],
@@ -6693,6 +6767,26 @@ fn shell_host_never_game() -> bool {
             | "ctfmon.exe"
             | "sihost.exe"
             | "dwm.exe"
+    )
+}
+
+/// 【通讯宿主永不算游戏 2026-11】微信/qq 有真实 TSF 编辑焦点（聊天
+/// 输入框），但常驻「满屏 WS_POPUP」形态窗：视频通话、图片/视频查
+/// 看器、Alt+A 截图遮罩——raw_fullscreen_host 的形状探测在 Activate
+/// 恰逢其场时把整个进程判成游戏宿主=微信「偶发打不了字」的实锤病根
+///（误判一次，GAME_HOST_MODE 永不复位，见 game_host_restore 注释；
+/// explorer 同族事故 ccf28ca 的下一个受害者）。名单小写比对。
+fn comm_host_never_game() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(name) = exe.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "weixin.exe" | "wechat.exe" | "wechatappex.exe" | "qq.exe"
     )
 }
 
@@ -7615,6 +7709,16 @@ fn poll_tick() {
                 }
             }
         }
+        // 【Ctrl+M/Space 预判门控 2026-11】同步两开关镜像（TestDown
+        // 预吞门用；键/poll 响应都经 update_ui，改设置后 ~110ms 收敛）
+        g.switch_recent_schema = state
+            .get("switch_recent_schema")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        g.ctrl_space_switch = state
+            .get("ctrl_space_switch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if raw_empty {
             g.cand_sig_last = String::new();
             g.suppress_pending = false;

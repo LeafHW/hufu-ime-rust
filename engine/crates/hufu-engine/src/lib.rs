@@ -4792,6 +4792,10 @@ impl Engine {
                 && session.raw.is_empty()
                 && session.mode == InputMode::Normal
                 && !self.commit_history.is_empty(),
+            // 【Ctrl+M/Space 预判门控 2026-11】两开关镜像下发（DLL
+            // TestDown 预吞门用；见 SessionState 字段注释）。
+            switch_recent_schema: self.config.general.switch_recent_schema,
+            ctrl_space_switch: self.config.general.ctrl_space_switch,
             keymap: self.config.keymap.map.clone(),
             keymap_idle: self.config.keymap.map_idle.clone(),
         }
