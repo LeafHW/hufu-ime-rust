@@ -411,6 +411,13 @@ $tipStr = "0804:$CLSID$PROFILE"
 #   ③ 恢复三重：并回 Set 重试×3（间隔 2s）→ 仍缺 = 装配表槽位注册表
 #      直写（无校验必成）→ 最终以装配表注册表为事实源核验 + 全链写
 #      install.log 留证。
+# 【四阶补强 2026-10-07 午】上午实锤再升级：Set 会把少报固化进**两个**
+# 真 存 储 ——装配表(HKCU CTF SortOrder) + 列表真存储(HKCU Control
+# Panel International User Profile 的 0804:* 值)。直写兜底只修装配表
+# 不够，列表真存储也会被冷 Set 掏空 → 四阶：
+#   ②+ 稳定等待升级：不止「计数不变」，还要求枚举追平装配表（冷会话
+#      枚举少报时继续等，上限 30s）；
+#   ③+ 直写兜底双库：装配表槽位 + 列表真存储 0804:* 值一起直写还原。
 $ctfStartedEarly = $false
 if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) {
     Start-Process ctfmon -ErrorAction SilentlyContinue
@@ -433,22 +440,40 @@ if (Test-Path $asmBase) {
         }
     }
 }
-# ② 等枚举稳定（CTF 冷启动期列表在增长；稳定=连续两次计数不变）
+# 列表真存储快照（User Profile 的 0804:* 值名——四阶直写还原的原料）
+$upTips = @()
+try {
+    $upKey = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
+    if ($upKey) {
+        $upTips = @((Get-Item $upKey.PSPath).Property | Where-Object { $_ -like '0804:*' -and $_ -ne $tipStr })
+    }
+} catch { }
+# ② 等枚举稳定且追平装配表（冷会话枚举少报=继续等；上限 30s）
 $list = Get-WinUserLanguageList
 $zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 $prevCount = if ($zhProbe) { @($zhProbe.InputMethodTips).Count } else { 0 }
-$deadline = (Get-Date).AddSeconds(15)
+$asmTarget = [Math]::Max(@($assemblyTips).Count, @($upTips).Count)
+$deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 3
     $list = Get-WinUserLanguageList
     $zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-    $c = if ($zhProbe) { @($zhProbe.InputMethodTips).Count } else { 0 }
-    if ($c -eq $prevCount) { break }
+    $c = if ($zhProbe) { @($zhProbe.InputMethodTips | Where-Object { $_ -ne $tipStr }).Count } else { 0 }
+    if ($c -ge $asmTarget -and $c -eq $prevCount) { break }
+    if ($c -eq $prevCount -and $c -ge $asmTarget) { break }
     $prevCount = $c
 }
 $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 if (-not $zh) { $zh = $list[0] }
 $tipsBefore = @($zh.InputMethodTips | Where-Object { $_ -ne $tipStr })
+# 冷会话防御：枚举仍没追平装配表 → 把装配表真相预先并进列表对象再动刀
+#（第一次 Set 就带上全家，不给「固化少报」机会）
+if (@($tipsBefore).Count -lt @($assemblyTips).Count) {
+    foreach ($t in $assemblyTips) {
+        if ($tipsBefore -notcontains $t) { $zh.InputMethodTips.Add($t); $tipsBefore += $t }
+    }
+}
 if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
@@ -506,6 +531,22 @@ if ($still.Count -gt 0) {
     }
     $still = @($known | Where-Object { (Get-AsmOthers) -notcontains $_ })
 }
+# 【四阶·列表真存储直写 2026-10-07 午】冷 Set 会把少报固化进 User
+# Profile 的 0804:* 值（列表第一真存储）——装配表直写只修了 TSF 缓存。
+# 此处对照快照把缺的 0804:* 值直写回去（含我们在装前快照到的全部），
+# 无校验必成；写完广播一次列表变更让 TSF 重读。
+try {
+    $upKey2 = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
+    if ($upKey2) {
+        $have = @((Get-Item $upKey2.PSPath).Property | Where-Object { $_ -like '0804:*' })
+        $missUp = @((@($known) + @($upTips)) | Select-Object -Unique | Where-Object { $have -notcontains $_ })
+        foreach ($mv in $missUp) {
+            New-ItemProperty -Path $upKey2.PSPath -Name $mv -Value '' -PropertyType String -Force | Out-Null
+            Write-Host "  [直写恢复] 列表真存储 ← $mv" -ForegroundColor Yellow
+        }
+    }
+} catch { }
 # 【防吃·日志 2026-10-07】全链留证（下次再有事故有据可查）
 try {
     $logLine = "[{0}] install 防吃链: 快照槽={1} 动刀前列表={2} 已知={3} 最终装配表={4} 仍缺=[{5}] ctfmon预热={6}" -f `

@@ -30,22 +30,15 @@ if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
 
 $inst = Split-Path -Parent $MyInvocation.MyCommand.Path   # 安装目录（脚本所在处）
 
-# 0) 【顺序关键】先杀 ctfmon/server 再清注册（防档案重建）
-Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
-
-# 1) 语言列表移除
-# 【吃掉其他输入法·二阶根治 2026-10-06】本步骤跑在步骤 0 杀掉 ctfmon
-# 之后——Get-WinUserLanguageList 在 CTF 服务缺位时对第三方 TIP 会
-# 少报，随后的 Set 会把别人一起抹掉（实锤：卸载+重装周期吃掉搜狗/
-# 多多/虎娘/虎爪）。卸载语义保持 ctfmon 关闭（防档案重建），不加
-# 「先拉起」防线；改用装配表快照做地面真值 + Set 后回读并回：
+# 1) 语言列表移除【顺序修正 2026-10-07】本步骤必须在「杀 ctfmon」之前！
+# 旧序（0杀服务→1动列表）实锤事故：ctfmon 一死会话即冷，Get 少报——
+# 连我们自己的 TIP 都不报 → 手术整个静默跳过 → 注册表全清但列表留下
+# 虎符幽灵（卸载后 Win+空格 还有一个死虎符，要手删）。列表动刀只在
+# ctfmon 活着时做；「防档案重建」的杀服务只服务后面的注册表清理步骤。
 $tipStr = "0804:$CLSID$PROFILE"
 # 【防吃·三阶强化 2026-10-07】与 install.ps1 同款（今晨 install 侧实锤
 # 事故：Set -Force 同步重建 用户列表+装配表 两处，枚举少报即固化删除，
-# 单次 Set 并回对未解析 TIP 会静默丢弃）。卸载语义保持 ctfmon 关闭
-#（防档案重建），故恢复以装配表注册表直写为终极兜底：
+# 单次 Set 并回对未解析 TIP 会静默丢弃）：
 #   ① 快照升级：整槽属性袋（直写恢复原料）
 #   ② 移除后回读校验：事实源=装配表注册表（枚举说谎不受影响）
 #   ③ 并回 Set 一次 → 仍缺 = 槽位注册表直写（无校验必成）+ 日志留证
@@ -128,6 +121,32 @@ foreach ($l in $list) {
         break
     }
 }
+
+# 1b) 【幽灵清扫 2026-10-07】列表手术可能整个跳过（Get 少报连我们都
+# 不报——今晨实锤：卸载完列表/装配表还留死虎符）。此处以注册表为事实
+# 源做终验：我们的 TIP 若仍在 列表真存储 或 装配表槽位 → 直接删值/删键，
+# 无校验必成。并写日志（无论手术走没走，卸载必留一行证据）。
+try {
+    $upKey = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
+    if ($upKey -and (Get-Item $upKey.PSPath).Property -contains $tipStr) {
+        Remove-ItemProperty -Path $upKey.PSPath -Name $tipStr -Force -ErrorAction SilentlyContinue
+        Write-Host "  [幽灵清扫] 列表真存储残留已删" -ForegroundColor Yellow
+    }
+} catch { }
+Get-ChildItem $asmChk -ErrorAction SilentlyContinue | Where-Object {
+    (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID
+} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+try {
+    $logLine = "[{0}] uninstall 完成: 快照槽={1} 装配表末态={2} 我们残留=0" -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, @(Get-AsmTips).Count
+    Add-Content -Path (Join-Path $inst 'install.log') -Value $logLine -Encoding UTF8
+} catch { }
+
+# 0-moved) 【防档案重建】列表动刀完毕，现在才杀服务（供下面注册表清理）
+Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
 # 2) msctf 原生档案注销（机器级；仅在完整卸载（管理员）时做——
 #    每用户卸载（-NoHKLM 或普通权限）不动 msctf 档案：它注册时
