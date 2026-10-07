@@ -288,6 +288,15 @@ pub struct Shared {
     /// 派发用——此时键已抬起 GetKeyState 读不到，靠 TestDown 记的
     /// 这份。引擎查表精确名→通用名兜底，"shift" 恒有效。
     pub shift_pending_side: &'static str,
+    /// 【Ctrl/Alt+Shift 抬序布防 2026-10-07】Shift 落下时 Ctrl/Alt/Win
+    /// 仍按住（系统切输入法手势 Ctrl+Shift/Alt+Shift：Ctrl 先落 → 切到
+    /// 虎符 → Ctrl 先抬（其 keyup 直通不清 pending）→ Shift 后抬被当
+    /// 「单击 Shift」误切中英——用户实录「Ctrl+Shift 切过来是英文态」）。
+    /// 布防后该 Shift 的 up 不触发单击切换；每次 Shift down 重估（不
+    /// |=，陈旧布防不残留）。反序（Shift↓ 之后才 Ctrl↓）由「其他键
+    /// down 清 pending」既有防线天然覆盖。游戏路径同款（GAME_SHIFT_
+    /// CHORD 线程局部）。
+    pub shift_chord_armed: bool,
     /// 【Shift 状态跟踪 2026-09-06】TestDown/KeyDown 见 0x10 置 true、
     /// keyup 置 false。32 位应用 KeyDown 时刻 GetKeyState(VK_SHIFT)
     /// 偶发读不到按下（Shift+6 出不了 ……——引擎收到 shift=false 数字
@@ -509,6 +518,7 @@ impl Shared {
             composing: false,
             shift_pending: false,
             shift_pending_side: "shift",
+            shift_chord_armed: false,
             shift_down: false,
             aux_active: false,
             suppress_pending: false,
@@ -1835,6 +1845,17 @@ impl HuFuTs_Impl {
                 g.shift_pending = true;
                 g.shift_pending_side = side;
                 g.shift_down = true;
+                // 【Ctrl/Alt+Shift 抬序布防 2026-10-07】落下此刻 Ctrl/Alt/
+                // Win 仍按 = 系统切输入法手势（Ctrl+Shift/Alt+Shift），
+                // 布防：本 Shift 的 up 不当「单击切中英」（该序里 up 时刻
+                // Ctrl 已抬，GetKeyState 查不到，只能落下时布防）。每次
+                // Shift down 重估，陈旧布防不残留。
+                g.shift_chord_armed = unsafe {
+                    GetKeyState(0x11) < 0
+                        || GetKeyState(0x12) < 0
+                        || GetKeyState(0x5B) < 0
+                        || GetKeyState(0x5C) < 0
+                };
                 return BOOL(0);
             }
             // TestUp/KeyUp：pending 存活 = 单击切换。直接发 server 并回填
@@ -1850,8 +1871,11 @@ impl HuFuTs_Impl {
             // KeyCode，内建切换同样走通）。
             let (fire, side) = {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                let f = g.shift_pending;
+                // 【抬序布防消费】Ctrl/Alt+Shift 手势的 Shift up 不触发
+                // 单击切换（fire=pending 且未布防）
+                let f = g.shift_pending && !g.shift_chord_armed;
                 g.shift_pending = false;
+                g.shift_chord_armed = false;
                 g.shift_down = false;
                 (f, g.shift_pending_side)
             };
@@ -6274,7 +6298,18 @@ unsafe extern "system" fn game_subclass_proc(
                 }
                 0x10 => {
                     // Shift 落：不喂引擎（dispatch 正牌逻辑=仅抬键发一次；
-                    // down+up 双发=引擎切两下=白切，01:15 实锤），放行
+                    // down+up 双发=引擎切两下=白切，01:15 实锤），放行。
+                    // 【抬序布防 2026-10-07】此刻 Ctrl/Alt/Win 按住=系统切
+                    // 输入法手势（Ctrl+Shift/Alt+Shift），本 Shift 的 up
+                    // 不再发引擎切中英（同 dispatch 侧 shift_chord_armed）。
+                    GAME_SHIFT_CHORD.with(|c| {
+                        c.set(unsafe {
+                            GetKeyState(0x11) < 0
+                                || GetKeyState(0x12) < 0
+                                || GetKeyState(0x5B) < 0
+                                || GetKeyState(0x5C) < 0
+                        })
+                    });
                     GAME_LAST_CONSUMED.with(|c| c.set(false));
                     return game_call_orig(hwnd, msg, wp, lp);
                 }
@@ -6295,7 +6330,12 @@ unsafe extern "system" fn game_subclass_proc(
         WM_KEYUP | WM_SYSKEYUP => {
             let open = GAME_CHAT_OPEN.with(|c| c.get());
             if open && wp.0 == 0x10 {
-                let _ = game_engine_key(wp.0); // Shift 抬=单击切换判定
+                // 【抬序布防消费】布防中的 Shift up 不发引擎（Ctrl+Shift 切
+                // 输入法手势误触发单击切换——同 dispatch 侧修复）
+                let chord = GAME_SHIFT_CHORD.with(|c| c.replace(false));
+                if !chord {
+                    let _ = game_engine_key(wp.0); // Shift 抬=单击切换判定
+                }
             }
             game_call_orig(hwnd, msg, wp, lp)
         }
@@ -6566,6 +6606,10 @@ thread_local! {
     /// 注入字符 lParam=1 扫描码=0 永不匹配——E7v2 把注入的中文自己
     /// 也吞了的修正）
     static GAME_LAST_CONSUMED_LP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 【Ctrl/Alt+Shift 抬序布防 2026-10-07】Shift 落下时 Ctrl/Alt/Win
+    /// 仍按（系统切输入法手势）→ 该 Shift 的 up 不发引擎切中英
+    ///（dispatch 侧 Shared.shift_chord_armed 的游戏路径同款）。
+    static GAME_SHIFT_CHORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 static RAW_FS_HIT: AtomicIsize = AtomicIsize::new(0);
