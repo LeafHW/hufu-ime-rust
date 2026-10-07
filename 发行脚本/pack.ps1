@@ -403,6 +403,10 @@ if (-not $skipTeng -and -not $isAdminPack -and $ElevMark -ne 'elev') {
 }
 $sysIme = "$env:SystemRoot\SystemIME\HuFu"
 $sysBak = $null
+# 【腾位前 DLL 在位快照】还原后校验的地面真值——卸载后的空壳目录
+#（DLL 被占用改 .old1 清不掉、目录留存）腾位前就无 DLL，还原后同样
+# 无 DLL 是忠实现状不是事故（9:0x 卸载态打包误 throw 实录）。
+$sysHadDll = Test-Path "$sysIme\hufu_tsf.dll"
 # 【腾位自愈 2026-10-07】上次打包异常退出（throw 路径曾不回滚腾位）会
 # 留下 HuFu 不在、HuFu.packN 孤儿残留的状态——输入法就此消失（本机
 # 7:07 实录：首打包撞上用户打字高峰 3 轮击杀失败 throw→腾位未回滚；
@@ -485,7 +489,7 @@ $za.Dispose()
 if ($sysBak) {
     if (Test-Path $sysIme) { Remove-Item $sysIme -Recurse -Force -EA SilentlyContinue }
     Rename-Item "$env:SystemRoot\SystemIME\$sysBak" 'HuFu' -Force
-    if (-not (Test-Path "$sysIme\hufu_tsf.dll")) { throw '腾位恢复后 hufu_tsf.dll 仍缺席——SystemIME 状态异常，人工介入' }
+    if ($sysHadDll -and -not (Test-Path "$sysIme\hufu_tsf.dll")) { throw '腾位恢复后 hufu_tsf.dll 仍缺席——SystemIME 状态异常，人工介入' }
 }
 # 【无 UAC 模式】未腾位（SystemIME 全程在位、ctfmon 由系统自动拉起）
 # ——DLL 加载链从未断过，无需重挂语言列表；腾位过才需要。
