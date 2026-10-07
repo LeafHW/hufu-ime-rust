@@ -2871,6 +2871,12 @@ impl EditSession_Impl {
                 trace("SP: StartComposition ok");
                 // 新段：首键重新真实锚定
                 g.seg_key_index = 1;
+                // 【QQ 首键滞后·新段 est 基数重置 2026-10-08】est_x 在段
+                // 起点（上屏已前移/Esc 光标回段起点），本段 0 键——若不
+                // 归零，旧段遗留 last_raw>0 使新段首键 d_est=0 → lag=0
+                // → 滞后签名永不触发，QQ 冷启动后被钉死在段起点（trace
+                // 实锤 seg1sel est=(421,759)=rect.left 连环 lag=0）。
+                g.caret_est_last_raw = 0;
                 let crange: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 unsafe { crange.SetText(ec, 0, &wstr)? };
@@ -3393,6 +3399,9 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     // qie 段模型专用）已删——统一 seg_key_index 归 1（标准链段首
     // selection 优先自会真实锚定）。
     g.seg_key_index = 1;
+    // 【QQ 首键滞后·新段 est 基数重置 2026-10-08】同 SP 主路径：段首
+    // est_last_raw 归零，否则旧段遗留值使 d_est=0、滞后签名失效。
+    g.caret_est_last_raw = 0;
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
     query_caret(&mut g, ctx, ec);
     Ok(())
