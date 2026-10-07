@@ -410,6 +410,9 @@ pub struct Shared {
     /// 连击计数——上限 4 次防打字停顿期 60ms 重查空转；标准链成功帧
     /// 清零（同 seg1_wide_suppress 生命周期）。
     pub seg1_stale_retry: u32,
+    /// 【QQ 首键滞后·猜测锚贯穿 2026-10-08】(猜测锚x, 段起点x)——
+    /// seg1 滞后签名命中后置位，标准链采纳点消费（见 query_caret）。
+    pub seg1_stale_guess: Option<(i32, i32)>,
     /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
     /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
     /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
@@ -565,6 +568,7 @@ impl Shared {
             qc_probe_steady: 0,
             seg1_wide_suppress: 0,
             seg1_stale_retry: 0,
+            seg1_stale_guess: None,
             caret_recheck_due: false,
             caret_est_x: 0,
             caret_est_y: 0,
@@ -3774,6 +3778,11 @@ fn focus_view_class() -> Option<String> {
 }
 
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
+    // 【QQ 首键滞后·猜测锚贯穿 2026-10-08】每帧清零：seg1 滞后签名命中
+    // 时记录（猜测锚x, 段起点x）后不直接采纳、落入标准链跑组段末探
+    // 针——探针真值被正常采纳（零蹦跳）；仍滞后则在采纳点用猜测锚覆
+    // 盖（见采纳重校处）。
+    g.seg1_stale_guess = None;
     // 【旧锚点快照 2026-09-11】旧实现开头即 g.caret=None，末尾失败
     // 分支却注释「保留旧 caret」——实际锚点已丢（候选窗闪回兜底位）。
     // 先快照，失败时真恢复。
@@ -4072,6 +4081,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         };
                         let expected_x = g.caret_est_x as f32 + d_est as f32 * unit;
                         let lag = expected_x - r.left as f32;
+                        let mut lag_fallthrough = false;
                         if g.composition.is_some()
                             && g.caret_est_y != 0
                             && unit > 4.0
@@ -4092,7 +4102,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                                 arm_caret_recheck_timer();
                                 if crate::tsf::trace_on() {
                                     trace(&format!(
-                                        "qc: seg1 selection 滞后一拍 lag={:.1}≈{:.1}键 → 锚=段起点+{}键宽 ({},{}) +60ms 重查",
+                                        "qc: seg1 selection 滞后一拍 lag={:.1}≈{:.1}键 → 猜测锚=段起点+{}键宽 ({},{}) 贯穿探针",
                                         lag,
                                         lag / unit,
                                         g.cur_raw_len,
@@ -4100,28 +4110,35 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                                         g.caret_est_y
                                     ));
                                 }
-                                g.caret = Some(RECT {
-                                    left: g.caret_est_x,
-                                    top: g.caret_est_y,
-                                    right: g.caret_est_x + 2,
-                                    bottom: g.caret_est_y + lh,
-                                });
-                                return;
+                                // 【猜测锚贯穿 2026-10-08】不在此采纳——记
+                                // （猜测锚, 段起点）落入下方标准链跑组段末
+                                // 探针：探针真值被正常采纳（零蹦跳，且采样
+                                // 块用的 cal=(0,段起点) 恰好出干净键宽样
+                                // 本）；探针仍滞后（本帧布局整体未追平）则
+                                // 在采纳点用猜测锚覆盖（见采纳重校处）。
+                                g.seg1_stale_guess = Some((g.caret_est_x, r_raw.left));
+                                lag_fallthrough = true;
                             }
                             // 折行假警报：est 步进跨行——退回原样采纳
                             //（下方 seed 会把 est 重校回本帧盒）。
                         }
-                        // 【三十四修·selection 播种 est】采纳时同步播种 est 基
-                        // 线（原只设 g.caret，est 还停在上屏估宽值——估宽 0.6×
-                        // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
-                        // 性 GetTextExt 返回的过期值「相对 est 合理」被连续性
-                        // 过滤器放行 → 锚点序列倒退=chase 回弹，trace 实锤 963
-                        // →937）。播种后过滤器以真值为参照，过期值被正确拒绝。
-                        // 【BUG8 四修】播种用原始盒（est=真值系，归一盒只进
-                        // 显示锚）。
-                        seed_est_from_anchor(g, &r_raw, "seg1sel_estok");
-                        g.caret = Some(r);
-                        return;
+                        if !lag_fallthrough {
+                            seed_est_from_anchor(g, &r_raw, "seg1sel_estok");
+                            // 【seg1 selection 播种校准对修正 2026-10-08】
+                            // 陈旧锚=0 键位置，seed 的 cal=(cur_raw_len, x)
+                            // 语义错位——次键采样跨两键=unit 系统性 2 倍毒
+                            //（QQ trace 实锤 24.7 vs 真实 12.7，历史 unit
+                            // 偏大即此源）。seg1 selection 播种一律 cal=
+                            // (0, 段起点)：次键 draw=2 跳过采样（不毒），
+                            // 键3+ 从标准链自身的重置点出干净样本。真值宿
+                            // 主（记事本）r 本含 cur_raw_len 键，同样只损
+                            // 失一次采样机会、无污染。
+                            g.caret_est_cal_raw = 0;
+                            g.caret_est_cal_x = r_raw.left;
+                            g.caret = Some(r);
+                            return;
+                        }
+                        // lag_fallthrough：滞后帧贯穿，落入下方标准链（组段末探针）
                     }
                 } else {
                     // 【四十二修·无基线段首防摇摆】est 无基线时段首 selection
@@ -4186,6 +4203,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 【三十四修·selection 播种 est】同上
                         // 【BUG8 四修】播种用原始盒（同 estok 分支）。
                         seed_est_from_anchor(g, &r_raw, "seg1sel_near");
+                        // 【seg1 selection 播种校准对修正 2026-10-08】同
+                        // estok 分支：陈旧锚=0 键位置，cal 对归 (0, 段起点)
+                        // 防 2 倍 unit 毒（次键 draw=2 跳过采样）。
+                        g.caret_est_cal_raw = 0;
+                        g.caret_est_cal_x = r_raw.left;
                         g.caret = Some(r);
                         return;
                     }
@@ -4506,7 +4528,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 本身过期的场景由 ②的上限一并兜底。
     {
         let draw = g.cur_raw_len as i32 - g.caret_est_cal_raw;
-        if draw == 1 && g.caret_est_cal_raw >= 0 {
+        // 【QQ 首键滞后·防脏采样 2026-10-08】猜测锚帧：仅当采纳值≈猜
+        // 测锚（真插入点，样本=真键宽×raw 干净）才允许采样；仍落后的
+        // 部分追赶值（段起点+ε，ε 非整键宽）会出脏样本毒 unit。
+        let guess_near = match g.seg1_stale_guess {
+            Some((gx, _)) => {
+                (raw_left as f32 - gx as f32).abs() <= g.caret_est_unit_w.max(4.0) * 0.6
+            }
+            None => true,
+        };
+        if draw == 1 && g.caret_est_cal_raw >= 0 && guess_near {
             let dxr = (raw_left - g.caret_est_cal_x) as f32;
             let dx_cap = if g.caret_est_line_h >= 8 {
                 g.caret_est_line_h as f32 * 1.25
@@ -4549,6 +4580,37 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     g.caret_est_last_raw = g.cur_raw_len as i32;
     // 【行高防毒化·虎魄二修】采纳重校同 seed：矮锚不降级真行高。
     update_est_line_h(g, &rect);
+    // 【QQ 首键滞后·猜测锚裁决 2026-10-08】滞后签名命中帧贯穿到此处：
+    // 探针采纳值仍≈段起点（±0.3 键内=本帧布局整体未追平，返回的还是
+    // 旧值系）→ 用猜测锚（段起点+已键入宽）覆盖，est/校准对同步对齐
+    //（+60ms 重查真锚时 draw=1 出干净键宽样本）；探针已给出段起点以
+    // 外的新值（哪怕只追平一半）→ 信探针（已正常采纳+干净采样），零
+    // 蹦跳，猜测锚丢弃。判据用「≈段起点」而非「落后猜测锚」：猜测锚
+    // 本身带 unit 误差，真值也可能落后它半键——只有「探针返回的还是
+    // 段起点」才证明布局没追平。
+    if let Some((gx, sx)) = g.seg1_stale_guess.take() {
+        let u = g.caret_est_unit_w.max(4.0);
+        if (rect.left - sx).abs() as f32 <= u * 0.3 {
+            let lh2 = g.caret_est_line_h.max(8);
+            g.caret = Some(RECT {
+                left: gx,
+                top: rect.top,
+                right: gx + 2,
+                bottom: rect.top + lh2,
+            });
+            g.caret_est_x = gx;
+            g.caret_est_wrap = 0;
+            g.caret_est_last_raw = g.cur_raw_len as i32;
+            g.caret_est_cal_x = sx;
+            g.caret_est_cal_raw = 0;
+            if crate::tsf::trace_on() {
+                trace(&format!(
+                    "qc: 滞后探针未追平 采纳=({},{}) → 覆盖为猜测锚 ({},{})",
+                    rect.left, rect.top, gx, rect.top
+                ));
+            }
+        }
+    }
     // 【BUG8 四修B·推进规则撤除】四修的「滞后布局推进」（组段内锚至
     // 少推进到 上锚+unit×draw）基于「组段内光标必随键右移」假设——
     // snap13 trace 实锤该假设在跟打器不成立：整个编码渲染在一个格
