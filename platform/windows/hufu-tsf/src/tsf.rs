@@ -4126,6 +4126,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                                 // 本）；探针仍滞后（本帧布局整体未追平）则
                                 // 在采纳点用猜测锚覆盖（见采纳重校处）。
                                 g.seg1_stale_guess = Some((g.caret_est_x, r_raw.left));
+                                // 【三修·fire 即写猜测锚】并发读者（管道线
+                                // update_ui）与标准链任何中途失败路径都应
+                                // 见猜测值而非空/陈旧——裁决块未追平时再
+                                // 重申一次。
+                                g.caret = Some(RECT {
+                                    left: g.caret_est_x,
+                                    top: g.caret_est_y,
+                                    right: g.caret_est_x + 2,
+                                    bottom: g.caret_est_y + lh,
+                                });
                                 lag_fallthrough = true;
                             }
                             // 折行假警报：est 步进跨行——退回原样采纳
@@ -4217,6 +4227,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 防 2 倍 unit 毒（次键 draw=2 跳过采样）。
                         g.caret_est_cal_raw = 0;
                         g.caret_est_cal_x = r_raw.left;
+                        // 【QQ 冷启动滞后·near 采纳挂重查 2026-10-08】无基
+                        // 线帧无从判滞后（QQ 首键此处采到的常是陈旧锚，
+                        // trace 实锤 est=(0,0) 冷启动连环 near 采纳=窗口钉
+                        // 死旧位置）。+60ms 重查：真锚到达即滑正（一次小
+                        // 滑，好过钉死）；同步宿主重查同值=无感。
+                        arm_caret_recheck_timer();
                         g.caret = Some(r);
                         return;
                     }
@@ -4597,6 +4613,12 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 蹦跳，猜测锚丢弃。判据用「≈段起点」而非「落后猜测锚」：猜测锚
     // 本身带 unit 误差，真值也可能落后它半键——只有「探针返回的还是
     // 段起点」才证明布局没追平。
+    // 【QQ 首键滞后·猜测帧跳过常规写 2026-10-08 三修】此前裁决块插在
+    // 常规写之前，常规写无条件把 g.caret 刷回陈旧值=覆盖永远失效
+    //（trace 实锤：覆盖为猜测锚 (1241) 后 2ms show[入] 锚=1231）。猜
+    // 测帧的 caret 由裁决块统一定值（未追平=猜测锚/追平=真锚），常规
+    // 写跳过。flag 必须在裁决块 .take() 消耗前捕获。
+    let seg1_guess_frame = g.seg1_stale_guess.is_some();
     if let Some((gx, sx)) = g.seg1_stale_guess.take() {
         let u = g.caret_est_unit_w.max(4.0);
         if (rect.left - sx).abs() as f32 <= u * 0.3 {
@@ -4618,6 +4640,16 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     rect.left, rect.top, gx, rect.top
                 ));
             }
+        } else {
+            // 探针已追平（真值）：显式写真值（本帧下方 4632 常规写因
+            // 猜测帧跳过，由这里接手）。
+            g.caret = Some(rect);
+            if crate::tsf::trace_on() {
+                trace(&format!(
+                    "qc: 滞后探针已追平 真锚=({},{}) 采纳（猜测锚废弃）",
+                    rect.left, rect.top
+                ));
+            }
         }
     }
     // 【BUG8 四修B·推进规则撤除】四修的「滞后布局推进」（组段内锚至
@@ -4629,7 +4661,10 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 帧显示锚=宿主汇报值（组段内恒定=真光标恒定），词首由矮锚归一
     //（+unit×1=首键真插入点）负责，段间由上屏前移+新词重归一接力。
     // unit_w 仍按格宽校准（实测 84=一格），供词首归一/est 失败帧兜底。
-    g.caret = Some(rect);
+    // 【QQ 首键滞后·猜测帧跳过常规写（flag 见上方裁决块前捕获）】
+    if !seg1_guess_frame {
+        g.caret = Some(rect);
+    }
     // 【三十六次修正】查询时间戳：click 黏性的解除要求「本段内新查过」
     //（防止置位帧的上一段旧查询值 near-自吞黏性）。
     // 【行尾检测】caret 右缘距前台窗口右缘 < 56px（≈2-3 个全角字 +
