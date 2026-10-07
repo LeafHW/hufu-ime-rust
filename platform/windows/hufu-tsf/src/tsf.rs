@@ -410,6 +410,11 @@ pub struct Shared {
     /// 连击计数——上限 4 次防打字停顿期 60ms 重查空转；标准链成功帧
     /// 清零（同 seg1_wide_suppress 生命周期）。
     pub seg1_stale_retry: u32,
+    /// 【QQ 首键滞后·宿主指纹 2026-10-08】进程内首次 fire 即置位、永不
+    /// 清除——「本宿主段首 selection 锚=pre-insertion（滞后一键）」的
+    /// 证据。跳位/冷启动等 est 参照失效场景据此仍可前移（见跳位滞后）。
+    /// 同步宿主（记事本/WPS）从未 fire，恒 false，行为不变。
+    pub seg1_lag_host: bool,
     /// 【QQ 首键滞后·猜测锚贯穿 2026-10-08】(猜测锚x, 段起点x)——
     /// seg1 滞后签名命中后置位，标准链采纳点消费（见 query_caret）。
     pub seg1_stale_guess: Option<(i32, i32)>,
@@ -568,6 +573,7 @@ impl Shared {
             qc_probe_steady: 0,
             seg1_wide_suppress: 0,
             seg1_stale_retry: 0,
+            seg1_lag_host: false,
             seg1_stale_guess: None,
             caret_recheck_due: false,
             caret_est_x: 0,
@@ -3619,6 +3625,47 @@ pub(crate) fn is_cjk_fullwidth(c: char) -> bool {
 /// GetTextExt 返回的过期位置相对落后 est 仅几 px 被连续性过滤器放行，
 /// 锚点序列倒退（trace 实锤 963→937=chase 回弹）。播种后：过期值相对真
 /// 值倒退超阈被拒，est 步进从真值出发前推；下一键标准链重校自然接管。
+/// 【QQ 段首滞后·指纹前移 2026-10-08】指纹宿主（本进程 fire 过一次=
+/// 已证实「段首 selection=pre-insertion 滞后一键」）的段首锚统一前移
+/// cur_raw_len 键宽并挂 +60ms 重查——覆盖 est 失参照的全部路径（旧布
+/// 局拦截/est_ok 出带/无基线 near/无基线 far）。同步宿主（记事本/
+/// WPS）指纹恒 false，恒返回 false 行为不变。返回 true=已采纳猜测锚。
+fn seg1_jump_guess(g: &mut Shared, r_raw: &RECT, via: &str) -> bool {
+    if !g.composition.is_some() || !g.seg1_lag_host || g.cur_raw_len < 1 {
+        return false;
+    }
+    let unit = if g.caret_est_unit_w > 4.0 {
+        g.caret_est_unit_w
+    } else {
+        est_unit_mem()
+    };
+    if unit <= 4.0 {
+        return false;
+    }
+    let adv = (g.cur_raw_len as f32 * unit).round() as i32;
+    let gx = r_raw.left + adv;
+    let guess_rect = RECT {
+        left: gx,
+        top: r_raw.top,
+        right: gx + 2,
+        bottom: r_raw.top + (r_raw.bottom - r_raw.top).max(8),
+    };
+    seed_est_from_anchor(g, &guess_rect, via);
+    // 猜测锚含 cur_raw_len 键、段起点=0 键：校准对归 (0, 段起点) 防
+    // 键宽样本翻倍（同 seg1 selection 播种校准对修正）。
+    g.caret_est_cal_raw = 0;
+    g.caret_est_cal_x = r_raw.left;
+    arm_caret_recheck_timer();
+    if crate::tsf::trace_on() {
+        trace(&format!(
+            "qc: 段首指纹前移({via}) → 锚=段起点+{}键宽 ({},{}) +60ms 重查",
+            g.cur_raw_len, gx, r_raw.top
+        ));
+    }
+    g.caret = Some(guess_rect);
+    true
+}
+
 fn seed_est_from_anchor(g: &mut Shared, r: &RECT, via: &str) {
     g.caret_est_x = r.left;
     g.caret_est_y = r.top;
@@ -4050,6 +4097,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     let dx = r.left - g.caret_est_x;
                     let dy = r.top - g.caret_est_y;
                     if dx.abs() > 80 || dy.abs() > 60 {
+                        // 【QQ 跳位滞后·拦截路径指纹门 2026-10-08】大跳
+                        //（换聊天窗/点击移位/Esc 多键）使 est 失参照，原样
+                        // 拦落标准链=裸采纳陈旧锚（trace 实锤 dx=-99 跳位
+                        // 帧裸采纳 → 窗偏左 ~1 键宽）。指纹宿主前移+重查。
+                        if seg1_jump_guess(g, &r_raw, "seg1sel_jumpdx") {
+                            return;
+                        }
                         trace(&format!(
                             "qc: seg1 selection 旧布局拦截 dx={} dy={}（走标准链）",
                             dx, dy
@@ -4108,6 +4162,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             est_step(g);
                             if (g.caret_est_y - r_raw.top).abs() <= lh / 2 {
                                 g.seg1_stale_retry += 1;
+                                g.seg1_lag_host = true;
                                 arm_caret_recheck_timer();
                                 if crate::tsf::trace_on() {
                                     trace(&format!(
@@ -4142,6 +4197,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             //（下方 seed 会把 est 重校回本帧盒）。
                         }
                         if !lag_fallthrough {
+                            // 【QQ 跳位滞后·est_ok 路径指纹门 2026-10-08】
+                            // lag 出带只说明 est 停在旧位判不了，不说明锚新
+                            // 鲜——指纹宿主前移 raw 键宽+挂重查（见
+                            // seg1_jump_guess）。
+                            if seg1_jump_guess(g, &r_raw, "seg1sel_jump") {
+                                return;
+                            }
                             seed_est_from_anchor(g, &r_raw, "seg1sel_estok");
                             // 【seg1 selection 播种校准对修正 2026-10-08】
                             // 陈旧锚=0 键位置，seed 的 cal=(cur_raw_len, x)
@@ -4219,6 +4281,13 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         }
                     }
                     if near {
+                        // 【QQ 冷启动滞后·near 路径指纹门 2026-10-08】无基
+                        // 线帧无从判滞后——指纹宿主前移（见 seg1_jump_guess，
+                        // unit 用进程记忆兜底）；同步宿主 near 采纳+重查兜
+                        // 底不变。
+                        if seg1_jump_guess(g, &r_raw, "seg1sel_coldfp") {
+                            return;
+                        }
                         // 【三十四修·selection 播种 est】同上
                         // 【BUG8 四修】播种用原始盒（同 estok 分支）。
                         seed_est_from_anchor(g, &r_raw, "seg1sel_near");
@@ -4234,6 +4303,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 滑，好过钉死）；同步宿主重查同值=无感。
                         arm_caret_recheck_timer();
                         g.caret = Some(r);
+                        return;
+                    }
+                    // 【QQ 冷启动滞后·far 路径指纹门 2026-10-08】无基线远距
+                    //（跳位后首键且 est 恰被清）同样前移（见 seg1_jump_guess）。
+                    if seg1_jump_guess(g, &r_raw, "seg1sel_coldfar") {
                         return;
                     }
                     trace("qc: seg1 selection 摇摆拦截（无基线，走标准链）");

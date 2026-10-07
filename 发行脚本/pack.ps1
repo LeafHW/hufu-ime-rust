@@ -1,4 +1,4 @@
-﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
@@ -441,9 +441,13 @@ Start-Sleep -Seconds 1
 # 假异常。改循环击杀 3 轮（每轮杀完 800ms 复查），SystemIME 已改名
 # 隔断的进程中 DLL 拉活有限；3 轮后仍活才是真异常。
 $killRounds = 0
-while ($killRounds -lt 3) {
+# 【2026-10-08 轮数加宽】3×800ms 在「用户正用输入法打字」（任一
+# DLL 宿主守护周期拉活 server，如 DSH Desktop/QQ）时不够宽——腾位
+# 后改名已断新宿主，仅存量宿主周期拉活，8 轮×700ms 覆盖最慢守护
+# 周期（实锤 06:41 打包死于用户打字期 3 轮耗尽）。
+while ($killRounds -lt 8) {
     Get-Process hufu-server -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
-    Start-Sleep -Milliseconds 800
+    Start-Sleep -Milliseconds 700
     if (-not (Get-Process hufu-server -EA SilentlyContinue)) { break }
     Stop-Process -Name ctfmon -Force -EA SilentlyContinue
     $killRounds++
