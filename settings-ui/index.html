@@ -1791,57 +1791,20 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
   window.__ovSyncLinger = syncLinger;
 }
 /* 预览直接 manipulation：拖图=定位（自动换贴边/改间距/垂直微调），
-   右下手柄或滚轮=改高度；松手/滚轮防抖保存 → skin_ver → DLL 秒级生效 */
+   右下手柄或滚轮=改高度；松手/滚轮防抖保存 → skin_ver → DLL 秒级生效
+   【粘滞根治 2026-10-07】旧版三病：①move/up 只挂 wrapEl——捕获丢失/
+   元素重建/越窗松手时 pointerup 永远收不到，mode 粘住：鼠标一回窗就
+   继续跟（用户实录「点一下就一直跟着鼠标」）；②不查 e.buttons——真
+   松手事件被吞后 pointermove 仍被当拖拽处理（越窗外松手时浏览器收
+   不到 up，捕获却还握着，回窗后 buttons=0 的 move 照跑）；③粘住期间
+   再点一下直接换 mode 开新拖拽，旧状态（含塌缩的高度）不清。修：
+   move/up/cancel 全挂 window + buttons==0 自愈收尾 + 新 pointerdown
+   先收上一次 + 拖拽中 24px 地板（仍不设 60~600 钳——跟手原则不变）。 */
 {
   const wrapEl = $("#ov-imgwrap"), mock = $("#ov-candmock"), row = $("#ov-row");
-  let mode = null, grab = null, corner = "se";
-  wrapEl.addEventListener("pointerdown", e => {
-    if (!OV.img) return;
-    const c = ovEnsureCfg();
-    // ::after 命中垫上的点击 target=垫的宿主手柄 span；closest 兜底
-    const hcEl = e.target.closest ? e.target.closest(".ov-h") : null;
-    const hc = hcEl ? hcEl.dataset.c : (e.target.dataset ? e.target.dataset.c : null);
-    if (hc) {
-      mode = "resize"; corner = hc;
-      grab = { y: e.clientY, h: c.base_height || 240 };
-    } else {
-      mode = "move";
-      grab = { x: e.clientX, y: e.clientY };
-      // position:relative 偏移：留在 flex 流里（mock 不跳位），视觉任意跟随
-      wrapEl.classList.add("ov-dragging");
-      wrapEl.style.position = "relative";
-      wrapEl.style.left = "0px"; wrapEl.style.top = "0px";
-      wrapEl.style.transform = "none";
-      // 【拖图锁 2026-10-03】动图 rAF（ovAnimTick→ovPreview→ovApplyLayout）
-      // 与拖拽并发：每帧把 left/top/transform 覆写回常規布局值，把拖拽
-      // 偏移吃掉=「只能拖动一点点就拖不动」的真凶（GIF 60fps 下一帧必
-      // 覆写）。拖拽期间置锁，ovApplyLayout 见锁即跳过，pointerup 解锁
-      // 后统一回归布局（拖拽中图永远跟手，松手一次落位）。
-      OV.draggingLayout = true;
-    }
-    wrapEl.setPointerCapture(e.pointerId);
-    e.preventDefault();
-  });
-  wrapEl.addEventListener("pointermove", e => {
-    if (!mode) return;
-    const c = ovEnsureCfg();
-    if (mode === "move") {
-      wrapEl.style.left = (e.clientX - grab.x) + "px";
-      wrapEl.style.top = (e.clientY - grab.y) + "px";
-    } else {
-      // 四角手柄：下方两角下拉=高、上方两角上拉=高（宽随纵横比自动跟）
-      const pull = (corner === "nw" || corner === "ne") ? (grab.y - e.clientY) : (e.clientY - grab.y);
-      // 【跟手不钳 2026-10-03】拖拽过程显示高不做 clamp——之前实时钳
-      // 60~600，拉过头后图不再跟手=「拖不动」体感（系统滑杆同款）。
-      // 松手（pointerup）才落回 clamp 区间存盘。
-      const nh = Math.round(grab.h + pull);
-      c.base_height = nh;
-      ovSetR("#ov-bh", nh);
-      wrapEl.style.height = nh + "px";
-    }
-    e.preventDefault();
-  });
-  wrapEl.addEventListener("pointerup", e => {
+  let mode = null, grab = null, corner = "se", capId = null;
+  // 统一收尾（move 按最终几何反推 side/gap/offset_y；resize 落钳存盘）
+  const finishDrag = () => {
     if (!mode) return;
     const c = ovEnsureCfg();
     OV.draggingLayout = false;   // 先解锁：下面的 ovApplyLayout 要生效
@@ -1874,19 +1837,72 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       ovSaveDeb();
     }
     wrapEl.classList.remove("ov-dragging");
-    mode = null;
-  });
-  // 指针跑出窗口/被系统吞掉：pointercancel 同 pointerup 收尾，防止
-  // draggingLayout 锁死、动图 rAF 永远进不了布局
-  wrapEl.addEventListener("pointercancel", () => {
-    if (!mode) return;
-    OV.draggingLayout = false;
-    if (mode === "move") {
-      wrapEl.style.position = ""; wrapEl.style.left = ""; wrapEl.style.top = "";
-      ovApplyLayout(); ovSaveDeb();
+    mode = null; grab = null; corner = "se";
+  };
+  wrapEl.addEventListener("pointerdown", e => {
+    if (!OV.img) return;
+    // 【粘滞自愈】上次拖拽的 up 被吞（越窗松手等）→ 先按当前状态收尾，
+    // 不让旧 mode/塌缩高度漏进新一次交互
+    if (mode) finishDrag();
+    const c = ovEnsureCfg();
+    // ::after 命中垫上的点击 target=垫的宿主手柄 span；closest 兜底
+    const hcEl = e.target.closest ? e.target.closest(".ov-h") : null;
+    const hc = hcEl ? hcEl.dataset.c : (e.target.dataset ? e.target.dataset.c : null);
+    if (hc) {
+      mode = "resize"; corner = hc;
+      grab = { y: e.clientY, h: c.base_height || 240 };
+    } else {
+      mode = "move";
+      grab = { x: e.clientX, y: e.clientY };
+      // position:relative 偏移：留在 flex 流里（mock 不跳位），视觉任意跟随
+      wrapEl.classList.add("ov-dragging");
+      wrapEl.style.position = "relative";
+      wrapEl.style.left = "0px"; wrapEl.style.top = "0px";
+      wrapEl.style.transform = "none";
+      // 【拖图锁 2026-10-03】动图 rAF（ovAnimTick→ovPreview→ovApplyLayout）
+      // 与拖拽并发：每帧把 left/top/transform 覆写回常規布局值，把拖拽
+      // 偏移吃掉=「只能拖动一点点就拖不动」的真凶（GIF 60fps 下一帧必
+      // 覆写）。拖拽期间置锁，ovApplyLayout 见锁即跳过，pointerup 解锁
+      // 后统一回归布局（拖拽中图永远跟手，松手一次落位）。
+      OV.draggingLayout = true;
     }
-    wrapEl.classList.remove("ov-dragging");
-    mode = null;
+    capId = e.pointerId;
+    try { wrapEl.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  // 【窗口级兜底 2026-10-07】move/up/cancel 挂 window：捕获丢失/元素
+  // 重建/越窗松手都不再丢事件；buttons==0（真松手被吞）自愈收尾。
+  window.addEventListener("pointermove", e => {
+    if (!mode) return;
+    if (e.buttons === 0) { finishDrag(); return; }
+    const c = ovEnsureCfg();
+    if (mode === "move") {
+      wrapEl.style.left = (e.clientX - grab.x) + "px";
+      wrapEl.style.top = (e.clientY - grab.y) + "px";
+    } else {
+      // 四角手柄：下方两角下拉=高、上方两角上拉=高（宽随纵横比自动跟）
+      const pull = (corner === "nw" || corner === "ne") ? (grab.y - e.clientY) : (e.clientY - grab.y);
+      // 【跟手不钳 2026-10-03】拖拽过程显示高不做 60~600 clamp——拉过头
+      // 后图不再跟手=「拖不动」体感。仅设 24px 地板防塌缩（滑过中线把
+      // 高度拉成负值/零——「滑过中间会缩小」的真凶）；松手落钳存盘。
+      const nh = Math.max(24, Math.round(grab.h + pull));
+      c.base_height = nh;
+      ovSetR("#ov-bh", nh);
+      wrapEl.style.height = nh + "px";
+    }
+    e.preventDefault();
+  });
+  window.addEventListener("pointerup", () => {
+    if (!mode) return;
+    try { if (capId !== null) wrapEl.releasePointerCapture(capId); } catch (_) {}
+    capId = null;
+    finishDrag();
+  });
+  window.addEventListener("pointercancel", () => {
+    if (!mode) return;
+    try { if (capId !== null) wrapEl.releasePointerCapture(capId); } catch (_) {}
+    capId = null;
+    finishDrag();
   });
   wrapEl.addEventListener("wheel", e => {
     if (!OV.img) return;
@@ -1935,22 +1951,27 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
       ovPreview(); return;
     }
     OV.drag = { x0: p.x, y0: p.y };
-    cv.setPointerCapture(e.pointerId);
+    try { cv.setPointerCapture(e.pointerId); } catch (_) {}
   });
-  cv.addEventListener("pointermove", e => {
-    if (!OV.drag) return;
-    const p = toSrc(e); if (!p) return;
-    OV.crop = clampRatio(OV.drag.x0, OV.drag.y0, p.x, p.y);
-    ovRenderWork();
-    if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); ovPersist(); });
-  });
-  cv.addEventListener("pointerup", () => {
+  // 【粘滞根治 2026-10-07】与实时框四角同修：move/up/cancel 挂 window、
+  // buttons==0 自愈——up 在窗外松/被吞时裁剪框不再永远跟鼠标。
+  const finishCrop = () => {
     if (!OV.drag) return;
     OV.drag = null;
     if (OV.crop && (OV.crop.w < 4 || OV.crop.h < 4)) OV.crop = null; // 点一下=无框
     ovRenderWork();
     ovPersist();
+  };
+  window.addEventListener("pointermove", e => {
+    if (!OV.drag) return;
+    if (e.buttons === 0) { finishCrop(); return; }
+    const p = toSrc(e); if (!p) return;
+    OV.crop = clampRatio(OV.drag.x0, OV.drag.y0, p.x, p.y);
+    ovRenderWork();
+    if (!OV.raf) OV.raf = requestAnimationFrame(() => { OV.raf = 0; ovPreview(); ovPersist(); });
   });
+  window.addEventListener("pointerup", finishCrop);
+  window.addEventListener("pointercancel", finishCrop);
 }
 $("#ov-ratio").onchange = () => { OV.ratio = $("#ov-ratio").value; };
 $("#ov-crop-apply").onclick = () => {
