@@ -42,15 +42,38 @@ Start-Sleep -Seconds 1
 # 多多/虎娘/虎爪）。卸载语义保持 ctfmon 关闭（防档案重建），不加
 # 「先拉起」防线；改用装配表快照做地面真值 + Set 后回读并回：
 $tipStr = "0804:$CLSID$PROFILE"
+# 【防吃·三阶强化 2026-10-07】与 install.ps1 同款（今晨 install 侧实锤
+# 事故：Set -Force 同步重建 用户列表+装配表 两处，枚举少报即固化删除，
+# 单次 Set 并回对未解析 TIP 会静默丢弃）。卸载语义保持 ctfmon 关闭
+#（防档案重建），故恢复以装配表注册表直写为终极兜底：
+#   ① 快照升级：整槽属性袋（直写恢复原料）
+#   ② 移除后回读校验：事实源=装配表注册表（枚举说谎不受影响）
+#   ③ 并回 Set 一次 → 仍缺 = 槽位注册表直写（无校验必成）+ 日志留证
 $asmChk = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}'
 $assemblyTips = @()
+$assemblySlots = @()
 if (Test-Path $asmChk) {
     foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
         $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
         if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
             $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
+            $bag = @{}
+            foreach ($pn in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' })) {
+                $bag[$pn] = $p.$pn
+            }
+            $assemblySlots += @{ slot = $k.PSChildName; CLSID = $p.CLSID; Profile = $p.Profile; bag = $bag }
         }
     }
+}
+function Get-AsmTips {
+    $r = @()
+    if (Test-Path $asmChk) {
+        foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
+            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+            if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) { $r += "0804:$($p.CLSID)$($p.Profile)" }
+        }
+    }
+    ,@($r | Select-Object -Unique)
 }
 $list = Get-WinUserLanguageList
 foreach ($l in $list) {
@@ -58,19 +81,48 @@ foreach ($l in $list) {
         $keep = @($l.InputMethodTips | Where-Object { $_ -ne $tipStr })
         $l.InputMethodTips.Remove($tipStr) | Out-Null
         Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
-        # 回读校验：列表若丢了别人（枚举少报被固化），用快照并回重写
-        $list2 = Get-WinUserLanguageList
-        $l2 = $list2 | Where-Object { $_.LanguageTag -eq $l.LanguageTag } | Select-Object -First 1
-        if ($l2) {
-            $known = @((@($keep) + @($assemblyTips)) | Select-Object -Unique)
-            $dropped = @($known | Where-Object { $l2.InputMethodTips -notcontains $_ })
-            if ($dropped.Count -gt 0) {
-                Write-Host "⚠ 卸载写入丢失 $($dropped.Count) 个既有输入法（枚举少报），已检出并并回" -ForegroundColor Yellow
-                foreach ($d in $dropped) {
-                    if ($l2.InputMethodTips -notcontains $d) { $l2.InputMethodTips.Add($d) }
-                }
+        # 回读校验（事实源=装配表注册表）：移除虎符时若把别人也固化删除了
+        $dropped = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
+        if ($dropped.Count -gt 0) {
+            Write-Host "⚠ 卸载写入丢失 $($dropped.Count) 个既有输入法——并回中" -ForegroundColor Yellow
+            $list2 = Get-WinUserLanguageList
+            $l2 = $list2 | Where-Object { $_.LanguageTag -eq $l.LanguageTag } | Select-Object -First 1
+            if ($l2) {
+                foreach ($d in $dropped) { if ($l2.InputMethodTips -notcontains $d) { $l2.InputMethodTips.Add($d) } }
                 Set-WinUserLanguageList $list2 -Force -WarningAction SilentlyContinue
-                Write-Host "OK 已并回 $($dropped.Count) 个被丢输入法（卸载防丢生效）"
+            }
+            # 终极兜底：槽位注册表直写（ctfmon 已停、Set 可能解析不了 TIP）
+            $stillAfter = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
+            if ($stillAfter.Count -gt 0) {
+                $maxSlot = -1
+                foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
+                    $n = 0
+                    if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot) { $maxSlot = $n }
+                }
+                foreach ($t in $stillAfter) {
+                    $src = $assemblySlots | Where-Object { "0804:$($_.CLSID)$($_.Profile)" -eq $t } | Select-Object -First 1
+                    if ($src) {
+                        $maxSlot++
+                        $newKey = "$asmChk\$('{0:D8}' -f $maxSlot)"
+                        New-Item -Path $newKey -Force | Out-Null
+                        foreach ($pn in $src.bag.Keys) {
+                            Set-ItemProperty -Path $newKey -Name $pn -Value $src.bag[$pn] -Type String
+                        }
+                        Write-Host "  [直写恢复] 槽 $('{0:D8}' -f $maxSlot) ← $t" -ForegroundColor Yellow
+                    }
+                }
+            }
+            $finalMiss = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
+            try {
+                $logLine = "[{0}] uninstall 防吃链: 快照槽={1} 丢失={2} 最终仍缺=[{3}]" -f `
+                    (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, $dropped.Count, ($finalMiss -join ',')
+                Add-Content -Path (Join-Path $inst 'install.log') -Value $logLine -Encoding UTF8
+            } catch { }
+            if ($finalMiss.Count -gt 0) {
+                Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回（详见 install.log）：" -ForegroundColor Red
+                $finalMiss | ForEach-Object { Write-Host "    $_" }
+            } else {
+                Write-Host "OK 已恢复全部被丢输入法（卸载防丢生效）"
             }
         }
         break

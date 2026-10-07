@@ -398,23 +398,54 @@ if (-not $NoHKLM) {
 #      枚举说谎时的地面真值；
 #   ③ Set 后回读校验：快照里有、列表里没有的，一律并回重写一次。
 $tipStr = "0804:$CLSID$PROFILE"
+# 【防吃·三阶强化 2026-10-07】今晨实锤事故根因链（重启后立即安装被吃
+# 4 个输入法，连装配表槽位都被清）：
+#   Get-WinUserLanguageList 在 CTF 未热透时少报 → Set -Force 把「少报
+#   的列表」同步固化进 用户列表+装配表 两处 → 旧防线③用同一个会静默
+#   丢弃未解析 TIP 的 Set 只并回一次、无注册表核验、无日志。
+# 强化：
+#   ① 快照升级：整槽属性袋（CLSID/Profile/KeyboardLayout…）——注册表
+#      直写恢复的原料；
+#   ② 动刀前等枚举稳定：列表槽位数 3s 间隔连续两次不再增长（上限
+#      15s，ctfmon 冷启动要时间）；
+#   ③ 恢复三重：并回 Set 重试×3（间隔 2s）→ 仍缺 = 装配表槽位注册表
+#      直写（无校验必成）→ 最终以装配表注册表为事实源核验 + 全链写
+#      install.log 留证。
 $ctfStartedEarly = $false
 if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) {
     Start-Process ctfmon -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     $ctfStartedEarly = $true
 }
-$asmChk = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
+$asmBase = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
 $assemblyTips = @()
-if (Test-Path $asmChk) {
-    foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
+$assemblySlots = @()   # 槽位整袋快照（直写恢复原料）
+if (Test-Path $asmBase) {
+    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
         $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
         if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
             $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
+            $bag = @{}
+            foreach ($pn in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' })) {
+                $bag[$pn] = $p.$pn
+            }
+            $assemblySlots += @{ slot = $k.PSChildName; CLSID = $p.CLSID; Profile = $p.Profile; bag = $bag }
         }
     }
 }
+# ② 等枚举稳定（CTF 冷启动期列表在增长；稳定=连续两次计数不变）
 $list = Get-WinUserLanguageList
+$zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+$prevCount = if ($zhProbe) { @($zhProbe.InputMethodTips).Count } else { 0 }
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    $list = Get-WinUserLanguageList
+    $zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+    $c = if ($zhProbe) { @($zhProbe.InputMethodTips).Count } else { 0 }
+    if ($c -eq $prevCount) { break }
+    $prevCount = $c
+}
 $zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
 if (-not $zh) { $zh = $list[0] }
 $tipsBefore = @($zh.InputMethodTips | Where-Object { $_ -ne $tipStr })
@@ -427,30 +458,65 @@ if ($zh.InputMethodTips -notcontains $tipStr) {
     $zh.InputMethodTips.Insert(0, $tipStr)
     Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
 }
-# ③ 回读校验：列表若丢了别人（枚举少报被固化），用快照并回重写
-$list2 = Get-WinUserLanguageList
-$zh2 = $list2 | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-if (-not $zh2) { $zh2 = $list2[0] }
+# ③ 恢复三重（事实源=装配表注册表，枚举说谎不受影响）
+function Get-AsmOthers {
+    $r = @()
+    if (Test-Path $asmBase) {
+        foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
+            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+            if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) { $r += "0804:$($p.CLSID)$($p.Profile)" }
+        }
+    }
+    ,@($r | Select-Object -Unique)
+}
 $known = @((@($tipsBefore) + @($assemblyTips)) | Select-Object -Unique)
-$dropped = @($known | Where-Object { $zh2.InputMethodTips -notcontains $_ })
-if ($dropped.Count -gt 0) {
-    Write-Host "⚠ 语言列表写入丢失 $($dropped.Count) 个既有输入法（枚举少报），已检出并并回" -ForegroundColor Yellow
-    foreach ($d in $dropped) {
-        if ($zh2.InputMethodTips -notcontains $d) { $zh2.InputMethodTips.Add($d) }
+$attempt = 0
+while ($attempt -lt 3) {
+    $asmNow = Get-AsmOthers
+    $dropped = @($known | Where-Object { $asmNow -notcontains $_ })
+    if ($dropped.Count -eq 0) { break }
+    $attempt++
+    Write-Host "⚠ 装配表丢失 $($dropped.Count) 个既有输入法（第 $attempt 次检出）——并回重写中" -ForegroundColor Yellow
+    $lx = Get-WinUserLanguageList
+    $zx = $lx | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
+    if (-not $zx) { $zx = $lx[0] }
+    foreach ($d in $dropped) { if ($zx.InputMethodTips -notcontains $d) { $zx.InputMethodTips.Add($d) } }
+    Set-WinUserLanguageList $lx -Force -WarningAction SilentlyContinue
+    Start-Sleep -Seconds 2
+}
+$still = @($known | Where-Object { (Get-AsmOthers) -notcontains $_ })
+if ($still.Count -gt 0) {
+    # 终极兜底：装配表槽位注册表直写（快照整袋属性，无校验必成）
+    $maxSlot2 = -1
+    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
+        $n = 0
+        if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot2) { $maxSlot2 = $n }
     }
-    Set-WinUserLanguageList $list2 -Force -WarningAction SilentlyContinue
-    $list3 = Get-WinUserLanguageList
-    $zh3 = $list3 | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-    if (-not $zh3) { $zh3 = $list3[0] }
-    $still = @($known | Where-Object { $zh3.InputMethodTips -notcontains $_ })
-    if ($still.Count -gt 0) {
-        Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回：" -ForegroundColor Red
-        $still | ForEach-Object { Write-Host "    $_" }
-    } else {
-        Write-Host "OK 已并回 $($dropped.Count) 个被丢输入法（防线③生效）"
+    foreach ($t in $still) {
+        $src = $assemblySlots | Where-Object { "0804:$($_.CLSID)$($_.Profile)" -eq $t } | Select-Object -First 1
+        if ($src) {
+            $maxSlot2++
+            $newKey = "$asmBase\$('{0:D8}' -f $maxSlot2)"
+            New-Item -Path $newKey -Force | Out-Null
+            foreach ($pn in $src.bag.Keys) {
+                Set-ItemProperty -Path $newKey -Name $pn -Value $src.bag[$pn] -Type String
+            }
+            Write-Host "  [直写恢复] 槽 $('{0:D8}' -f $maxSlot2) ← $t" -ForegroundColor Yellow
+        }
     }
+    $still = @($known | Where-Object { (Get-AsmOthers) -notcontains $_ })
+}
+# 【防吃·日志 2026-10-07】全链留证（下次再有事故有据可查）
+try {
+    $logLine = "[{0}] install 防吃链: 快照槽={1} 动刀前列表={2} 已知={3} 最终装配表={4} 仍缺=[{5}] ctfmon预热={6}" -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, @($tipsBefore).Count, @($known).Count, @(Get-AsmOthers).Count, ($still -join ','), $ctfStartedEarly
+    Add-Content -Path (Join-Path $PSScriptRoot 'install.log') -Value $logLine -Encoding UTF8
+} catch { }
+if ($still.Count -gt 0) {
+    Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回（详见 install.log）：" -ForegroundColor Red
+    $still | ForEach-Object { Write-Host "    $_" }
 } else {
-    Write-Host "OK 语言列表已写入（既有 $($tipsBefore.Count) 个输入法全数在场校验通过）"
+    Write-Host "OK 语言列表已写入（既有输入法全数在场：快照 $(@($assemblySlots).Count) 槽，最终 0 缺失）"
 }
 # 【吃掉其他输入法修复 2026-10-02】装配表（AssemblyItem）槽位原先写死
 # 00000003：装机 ≥4 个键盘类输入法时（如微软拼音+多多+虎爪+…），
