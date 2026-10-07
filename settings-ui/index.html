@@ -257,6 +257,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="g-recent"><label for="g-recent">Ctrl+M 切换最近方案</label></div>
       <div class="checkline"><input type="checkbox" id="g-esc-undo"><label for="g-esc-undo" title="开启后的范围规则：① 编码中按 Esc = 清屏（不变）；② 空态 + 焦点有光标（编辑框）+ 有可撤内容 = 撤回上次上屏（回删，连按撤更早，最多 8 条）；③ 空态无光标（按钮/列表等非编辑焦点）或无可撤内容 = 正常 Esc 功能（透传应用）。关闭（默认）= 空态透传">Esc 撤回上次上屏<span class="sub">（空态+有光标生效，连按撤更早）</span></label></div>
       <div class="checkline"><input type="checkbox" id="g-rep-sym"><label for="g-rep-sym" title="关闭（默认）：{重复上屏}/{重复上屏N}/Esc 撤回只记中英文词组（纯符号、数字、标点上屏不入历史，标点顶字只记文字部分）；开启：上屏整段入历史——文字后随的标点并入同一条（打「中」再按「，」后 {重复上屏} 一次回放「中，」），纯符号打头仍独立成条可单独回放">重复上屏包括符号<span class="sub">（默认关=只回放中英文词组）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="g-en-commit"><label for="g-en-commit" title="开启（默认）：有编码/候选时切到英文（Shift 单击、Caps、Ctrl+空格、自定义按键的切换功能）→ 已输入的编码字母原样上屏再切，不丢字；关闭：丢弃编码直接切。语言栏左键点击始终清空（点击时输入焦点已不在应用，无上屏通道）">切换英文时，保留已输入编码并上屏<span class="sub">（默认开：切英文前把编码字母上屏）</span></label></div>
     </div>
     <h3>输入</h3>
     <div class="row">
@@ -618,6 +619,9 @@ function bindInputs() {
   // 【重复上屏包括符号 2026-11】默认关=历史栈只记中英文词组；
   // 开=任何上屏内容入栈（含标点/符号），重复上屏可回放任意上次上屏。
   B("#g-rep-sym", "general.repeat_include_symbols");
+  // 【切英文上屏编码 2026-10-07】默认开：有编码时切英文→编码字母
+  // 上屏再切（Shift/Caps/Ctrl+空格/自定义 switch 全路径同口径）。
+  B("#g-en-commit", "general.commit_raw_on_en_switch");
   $("#g-caps").value = { Clear: "clear", Switch: "switch", None: "none" }[CFG.general.caps_action] || "clear";
   $("#g-caps").onchange = e => { CFG.general.caps_action = { clear: "Clear", switch: "Switch", none: "None" }[e.target.value]; autoSave(e.target); };
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");

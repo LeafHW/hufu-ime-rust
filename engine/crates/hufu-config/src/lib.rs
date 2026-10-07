@@ -72,6 +72,12 @@ pub struct GeneralSection {
     /// 上屏整段原样入栈（含标点/符号），{重复上屏}/{重复上屏N}/Esc
     /// 撤回都可作用于任意上一次上屏内容（旧版行为）。
     pub repeat_include_symbols: bool,
+    /// 【切英文上屏编码 2026-10-07】切换中→英时对已输入编码的处置：
+    /// true（默认）= 有编码时把编码字母原样上屏再切（不丢字）；
+    /// false = 丢弃编码直接切。覆盖全部按键切换路径：Shift 单击/
+    /// Caps(Switch)/Ctrl+空格/自定义按键 switch。语言栏左键仍清空
+    ///（焦点外全局开关，无上屏通道）。
+    pub commit_raw_on_en_switch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,6 +106,10 @@ impl Default for GeneralSection {
             // 【重复上屏包括符号 2026-11】默认关：维持 2026-10-30 三修
             // 口径（只记文字），老用户升级手感不变。
             repeat_include_symbols: false,
+            // 【切英文上屏编码 2026-10-07】默认开：Shift 切英文上屏编码
+            // 是 2026-09-14 既有行为，本开关把它推广到全部切换路径并
+            // 提供关闭出口——默认与既有手感一致。
+            commit_raw_on_en_switch: true,
         }
     }
 }

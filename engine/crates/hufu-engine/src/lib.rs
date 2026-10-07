@@ -978,6 +978,16 @@ impl Engine {
             }
             "switch" => {
                 session.chinese = !session.chinese;
+                // 【切英文上屏编码 2026-10-07】同 Caps/Shift/Ctrl+空格
+                // 口径：切英方向有编码且开关开 → 编码字母上屏。
+                if !session.chinese
+                    && self.config.general.commit_raw_on_en_switch
+                    && !session.raw.is_empty()
+                {
+                    let raw = std::mem::take(&mut session.raw);
+                    session.clear();
+                    return Some(KeyOutcome::commit(raw, self.state(session)));
+                }
                 session.clear();
                 Some(KeyOutcome::consumed(self.state(session)))
             }
@@ -1144,6 +1154,15 @@ impl Engine {
             if let Some(c) = key.key.as_char() {
                 if c == ' ' && self.config.general.ctrl_space_switch {
                     session.chinese = !session.chinese;
+                    // 【切英文上屏编码 2026-10-07】同 Caps/Shift 口径
+                    if !session.chinese
+                        && self.config.general.commit_raw_on_en_switch
+                        && !session.raw.is_empty()
+                    {
+                        let raw = std::mem::take(&mut session.raw);
+                        session.clear();
+                        return KeyOutcome::commit(raw, self.state(session));
+                    }
                     session.clear();
                     return KeyOutcome::consumed(self.state(session));
                 }
@@ -1226,6 +1245,20 @@ impl Engine {
                     return o;
                 }
             }
+        } else if !session.chinese {
+            // 【英文态切换键回切 2026-10-07】英文态仅放行「切换中英」
+            //（switch）映射：绑定的切换键必须能切回来（switch_en_commit
+            // 测试实锤——原先英文态映射全灭，绑 switch 的键切过去就回
+            // 不来，只能 Shift/Caps/Ctrl+空格）。其余映射维持中文态限定
+            //（英文态字母/按键直通是输入法本职）。英文态 raw 必空=恒
+            // 空态口径，查 map_idle（缺省回落 map）。
+            if let Some(act) = self.keymap_lookup(&key.key, &m, true) {
+                if act == "switch" {
+                    if let Some(o) = self.run_keymap(session, &act) {
+                        return o;
+                    }
+                }
+            }
         }
 
         // Caps
@@ -1239,6 +1272,17 @@ impl Engine {
                 }
                 hufu_config::CapsAction::Switch => {
                     session.chinese = !session.chinese;
+                    // 【切英文上屏编码 2026-10-07】中→英且有编码：
+                    // commit_raw_on_en_switch 开 → 编码字母上屏（与
+                    // Shift 单击同口径）；关 → 原行为（清空丢弃）。
+                    if !session.chinese
+                        && self.config.general.commit_raw_on_en_switch
+                        && !session.raw.is_empty()
+                    {
+                        let raw = std::mem::take(&mut session.raw);
+                        session.clear();
+                        return KeyOutcome::commit(raw, self.state(session));
+                    }
                     session.clear();
                     return KeyOutcome::consumed(self.state(session));
                 }
@@ -1251,6 +1295,9 @@ impl Engine {
         //（用户拍板 2026-09-14：切英文语境下编码不该丢——原行为组段
         // 挂着且不切换，用户观感「按 Shift 没反应」）。commit 走原始
         // raw（字母原样），引擎侧不动用户词。
+        // 【切英文上屏编码 2026-10-07】上屏行为收进 commit_raw_on_en_switch
+        //（默认开=09-14 既有手感）：关=丢弃编码只切（与其余切换路径
+        // 同口径）。
         // 【Shift 可映射 2026-11】用户映射过 shift 键时上方 keymap 分支
         // 已接管（裸 Shift=非组合形态允许触发）；run_keymap None（映射
         // 空态无意义，如空态 selectN）自动回落到这里——映射开关与
@@ -1269,7 +1316,10 @@ impl Engine {
             session.candidates.clear();
             session.chinese = false;
             session.pair.reset();
-            return KeyOutcome::commit(raw, self.state(session));
+            if self.config.general.commit_raw_on_en_switch {
+                return KeyOutcome::commit(raw, self.state(session));
+            }
+            return KeyOutcome::consumed(self.state(session));
         }
 
         match key.key {
@@ -5982,6 +6032,91 @@ mod tests {
         eng.process_key(&mut s, k(KeyCode::F(2)));
         assert!(eng.config.opencc.enabled, "编码态翻转生效");
         assert!(!s.candidates.is_empty(), "不清组段——候选保留");
+    }
+
+    /// 【切英文上屏编码 2026-10-07】commit_raw_on_en_switch（默认开）：
+    /// 有编码时切英文（Shift 单击 / Caps Switch / Ctrl+空格 / keymap
+    /// switch）→ 编码字母原样上屏；关 → 丢弃编码只切。英→中方向
+    /// raw 必空不受影响。fixture 走 manifest target（temp_dir 环境病）。
+    #[test]
+    fn switch_en_commit_raw_all_paths() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-en-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\naa\t阿\n").unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let k = |code: KeyCode| KeyInput {
+            key: code,
+            modifiers: Modifiers::default(),
+            is_press: true,
+        };
+        assert!(eng.config.general.commit_raw_on_en_switch, "默认开");
+        assert!(matches!(eng.config.general.caps_action, hufu_config::CapsAction::Switch));
+
+        // —— 开（默认）：四路径全上屏编码 ——
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::ShiftLeft));
+        assert_eq!(o.commit.as_deref(), Some("a"), "Shift 单击切英上屏编码");
+        assert!(!s.chinese && s.raw.is_empty(), "已切英且编码清空");
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::CapsLock));
+        assert_eq!(o.commit.as_deref(), Some("a"), "Caps 切英上屏编码");
+        assert!(!s.chinese && s.raw.is_empty());
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let mut m = Modifiers::default();
+        m.ctrl = true;
+        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true });
+        assert_eq!(o.commit.as_deref(), Some("a"), "Ctrl+空格切英上屏编码");
+        assert!(!s.chinese && s.raw.is_empty());
+
+        eng.config.keymap.map.insert("f4".into(), "switch".into());
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::F(4)));
+        assert_eq!(o.commit.as_deref(), Some("a"), "keymap switch 切英上屏编码");
+        assert!(!s.chinese && s.raw.is_empty());
+        // 英→中方向：raw 必空，纯切换无上屏
+        let o = eng.process_key(&mut s, k(KeyCode::F(4)));
+        assert!(o.consumed && o.commit.is_none(), "切回中文无上屏");
+        assert!(s.chinese);
+        eng.config.keymap.map.remove("f4");
+
+        // —— 关：四路径全丢弃只切 ——
+        eng.config.general.commit_raw_on_en_switch = false;
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::ShiftLeft));
+        assert!(o.consumed && o.commit.is_none(), "关：Shift 丢码只切");
+        assert!(!s.chinese && s.raw.is_empty());
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::CapsLock));
+        assert!(o.consumed && o.commit.is_none(), "关：Caps 丢码只切");
+        assert!(!s.chinese && s.raw.is_empty());
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let mut m = Modifiers::default();
+        m.ctrl = true;
+        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true });
+        assert!(o.consumed && o.commit.is_none(), "关：Ctrl+空格丢码只切");
+        assert!(!s.chinese && s.raw.is_empty());
+
+        eng.config.keymap.map.insert("f4".into(), "switch".into());
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, k(KeyCode::F(4)));
+        assert!(o.consumed && o.commit.is_none(), "关：keymap switch 丢码只切");
+        assert!(!s.chinese && s.raw.is_empty());
     }
 
     /// 【右键调频菜单 2026-10-06】op_place_candidate：定到第 N 选
