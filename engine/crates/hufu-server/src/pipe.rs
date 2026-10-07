@@ -383,6 +383,29 @@ pub fn dispatch(
             let p = host.skins_dir().join(format!("{id}.json"));
             let show_index = host.engine.config.candidates.show_index;
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            // 【皮肤指纹 2026-11】挂件大图皮肤 JSON 可达 11MB——DLL 每
+            // 2.5s 例行重拉在打字线程全量解析（40-80ms 停顿，QQ 抖动
+            // 观感的放大器，违「首键要快」）。响应内容=皮肤文件+注入
+            // 字段，指纹全覆盖：id/文件 mtime/长度 + show_index/
+            // delay_show_ms/anim/anim_speed/anim_flash/方案名（first_
+            // show_slide 注入源）。DLL 带 have_fp 命中 → {"same":true}
+            // 微载荷，跳过解析与 note_skin 全串重哈希。保存/重置/切换/
+            // 手改文件/改配置全部改变指纹，无一漏网。
+            let meta = std::fs::metadata(&p).ok();
+            let fp = format!(
+                "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}",
+                meta.as_ref().and_then(|m| m.modified().ok()),
+                meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                host.engine.config.appearance.anim,
+                host.engine.config.appearance.anim_speed,
+                host.engine.config.appearance.anim_flash,
+                host.engine.config.schema.current,
+            );
+            if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
+                if !h.is_empty() && h == fp {
+                    return serde_json::json!({"same": true, "fp": fp});
+                }
+            }
             // 【动效全局开关+速度 2026-09-11】注入皮肤对象顶层（DLL 读
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
             let anim = host.engine.config.appearance.anim;
@@ -414,7 +437,7 @@ pub fn dispatch(
                             serde_json::json!(!host.engine.config.schema.current.contains("整句")),
                         );
                     }
-                    serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms})
+                    serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms, "fp": fp})
                 }
                 Err(e) => {
                     eprintln!("皮肤 {id} 加载失败，候选窗回默认: {e}");
@@ -432,7 +455,8 @@ pub fn dispatch(
                     serde_json::json!({
                         "skin": sv,
                         "show_index": show_index,
-                        "delay_show_ms": delay_show_ms
+                        "delay_show_ms": delay_show_ms,
+                        "fp": fp
                     })
                 }
             }

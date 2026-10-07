@@ -1761,13 +1761,47 @@ const ovPersist = () => {
   return true;
 };
 $("#ov-pick").onclick = () => $("#ov-file").click();
+/* 【超大静态图自动降采样 2026-11】烤成品退役（c312fdc）后皮肤存原图
+   data-URL，>11M 字符（≈8.25MB 文件）被 ovPersist 拒收——但预览正常
+   显示、错误提示一闪而过，用户实录「已载入却不生效」（大图用户专属、
+   小图无感=「有的人又没问题」的挂件 PNG 失效根源）。烤成品时代客户
+   端把图降到显示尺寸再存、任何大小都能挂——本函数恢复该容错：静态
+   图超限时画布重采样长边逐档（4096→…→1024）重编码 PNG，落回限额内
+   自动替换 OV.img/dataUrl（挂件显示高 ≤2048×DPI 物理像素，4096 长边
+   绰绰有余，观感零损）。动图（APNG/GIF）客户端无法保帧重编码，维持
+   显式拒收提示。压缩后仍超（极端噪声图）才回原提示。 */
+const ovShrinkOversize = async () => {
+  if (!OV.img || OV.anim) return true;
+  if ((OV.dataUrl || "").length <= 11_000_000) return true;
+  let url = OV.dataUrl;
+  for (const cap of [4096, 3072, 2048, 1536, 1024]) {
+    const long = Math.max(OV.img.naturalWidth, OV.img.naturalHeight);
+    if (long <= cap) break;
+    const k = cap / long;
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(OV.img.naturalWidth * k));
+    cv.height = Math.max(1, Math.round(OV.img.naturalHeight * k));
+    cv.getContext("2d").drawImage(OV.img, 0, 0, cv.width, cv.height);
+    url = cv.toDataURL("image/png");
+    if (url.length <= 11_000_000) break;
+  }
+  if (url.length > 11_000_000) { msg("图片过大且压缩后仍超 8MB（噪声图/异常位深），请用画图/PS 另存后再挂", "err"); return false; }
+  const img2 = new Image();
+  await new Promise(res => { img2.onload = res; img2.onerror = res; img2.src = url; });
+  if (!img2.naturalWidth) { msg("图片压缩失败，请精简后再挂", "err"); return false; }
+  OV.img = img2; OV.dataUrl = url;
+  const fi = $("#ov-fileinfo");
+  if (fi) fi.textContent = `${img2.naturalWidth}×${img2.naturalHeight}（超大已自动压缩）`;
+  msg(`图片过大已自动压缩至 ${img2.naturalWidth}×${img2.naturalHeight} ✓`, "ok");
+  return true;
+};
 $("#ov-file").onchange = ev => {
   const f = ev.target.files[0]; if (!f) return;
   const rd = new FileReader();
   // 【载入即存 2026-10-07】持久化挪进解码完成回调——旧版在这里同步
   // ovPersist，OV.img 还是 null（异步未完）→ 图没进皮肤（见
   // ovLoadFromDataUrl 注释）
-  rd.onload = () => ovLoadFromDataUrl(rd.result, f.name, false, () => { if (ovPersist()) msg(`已载入并生效 ✓ ${f.name}`, "ok"); });
+  rd.onload = () => ovLoadFromDataUrl(rd.result, f.name, false, async () => { if (await ovShrinkOversize() && ovPersist()) msg(`已载入并生效 ✓ ${f.name}`, "ok"); });
   rd.onerror = () => msg("图片读取失败", "err");
   rd.readAsDataURL(f);
   ev.target.value = "";

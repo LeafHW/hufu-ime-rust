@@ -228,6 +228,11 @@ pub struct Shared {
     pub focus_epoch: u64,
     /// 皮肤上次拉取时刻（2.5s 自动过期：打字中改皮肤也能热生效）
     pub skin_loaded_at: std::time::Instant,
+    /// 【皮肤指纹 2026-11】上次完整拉取的服务端内容指纹（文件 mtime/
+    /// 长度+注入字段）。2.5s 例行重拉带上 have_fp——命中 same 则微载
+    /// 荷续期，挂件大图皮肤（JSON 可达 11MB）不再每 2.5s 在打字线程
+    /// 全量解析+note_skin 重哈希（QQ 抖动放大器，违「首键要快」）。
+    pub skin_fp: String,
     /// 【皮肤版本 2026-09-08】server 每次保存皮肤 +1；poll 比对不一致
     /// 即强制重拉（绕 2.5s 缓存）——设置页连续调参时实机预览即时
     /// 生效（用户实测「反应慢」根因：连续拖动内缓存未过期，弹的
@@ -400,6 +405,11 @@ pub struct Shared {
     /// 2 帧、第 3 帧中心化采纳（防慢打场景候选永不出）。窄盒/seg2 帧
     /// 清零。字段放 Shared（段间要复位）。
     pub seg1_wide_suppress: u32,
+    /// 【QQ 首键锚滞后一拍 2026-11】seg1 selection 滞后签名命中（锚=
+    /// 段起点、落后预期插入点 0.4-2.6 键宽）走 est 延续锚+60ms 重查的
+    /// 连击计数——上限 4 次防打字停顿期 60ms 重查空转；标准链成功帧
+    /// 清零（同 seg1_wide_suppress 生命周期）。
+    pub seg1_stale_retry: u32,
     /// 【上屏跟随重查】CommitAndRepreedit（自动上屏+继续组句）后置位：
     /// 懒布局宿主（跟打器类）上屏帧 GetTextExt 常返回旧行框（组段跨
     /// 软换行时候选框滞留上一行）。60ms 布局稳定后由 CARET_TIMER 强制
@@ -509,6 +519,7 @@ impl Shared {
             skin_stale: true,
             focus_epoch: 0,
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
+            skin_fp: String::new(),
             skin_ver_last: 0,
             skin_repaint: false,
             srv_skin_ver_pushed: u64::MAX,
@@ -553,6 +564,7 @@ impl Shared {
             cand_sig_last: String::new(),
             qc_probe_steady: 0,
             seg1_wide_suppress: 0,
+            seg1_stale_retry: 0,
             caret_recheck_due: false,
             caret_est_x: 0,
             caret_est_y: 0,
@@ -590,12 +602,31 @@ impl Shared {
             self.skin_stale = true;
         }
         if self.skin.is_null() || self.skin_stale {
-            if let Some(v) = ipc::call(&serde_json::json!({"op": "skin"})) {
+            // 【皮肤指纹 2026-11】已持有皮肤时带 have_fp——server 内容
+            // 未变回 {"same":true} 微载荷：零解析零重哈希直接续期（大
+            // 挂件皮肤 11MB×每 2.5s 的打字线程停顿由此消除）。首拉/
+            // 变更照走全量。
+            let mut req = serde_json::json!({"op": "skin"});
+            if !self.skin.is_null() && !self.skin_fp.is_empty() {
+                req["have_fp"] = serde_json::json!(self.skin_fp);
+            }
+            if let Some(v) = ipc::call(&req) {
+                if v.get("same").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    // 内容未变：皮肤/overlay/注入字段全部沿用，仅续期
+                    self.skin_stale = false;
+                    self.skin_loaded_at = std::time::Instant::now();
+                    return;
+                }
                 self.delay_show_ms =
                     v.get("delay_show_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                 // 【贴图挂件 2026-10-02】皮肤到位 → overlay 子树变了才推进
                 // 代次(2.5s 例行重拉不再触发整段 GIF 重解码)
                 crate::overlaywin::note_skin(&v);
+                self.skin_fp = v
+                    .get("fp")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 self.skin = v;
                 self.skin_stale = false;
                 self.skin_loaded_at = std::time::Instant::now();
@@ -3992,6 +4023,59 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             dx, dy
                         ));
                     } else {
+                        // 【QQ 首键锚滞后一拍 2026-11】QQ 等异步布局宿主组段
+                        // 首键的 selection 查询常报**插入前**位置（段起点）：
+                        // selection 虽已被 set_selection_at_end 推到段尾，宿主
+                        // 异步布局未追平（真实插入点=段起点+raw×键宽）。
+                        // 像素实锤（QQ 用户截图）：首键候选钉在编码左端
+                        //（=锚=段起点），第二键 END 查询追平真实光标=「首键
+                        // 偏左一格+次键右窜」——QQ 抖动观感的 x 分量同源；
+                        // 记事本同步布局 lag≈0 无此症状。签名：同带（|dy|≤
+                        // 半行）且恰落后「预期插入点」（est+Δraw×unit，
+                        // est_step 同款步进数）0.4-2.6 键宽。命中：est_step
+                        // 推进到预期位作锚（Scintilla-B est 延续同款）+60ms
+                        // 重查自愈，不回播 est（防倒退毒化——三十四修播种的
+                        // 逆向病）；重查/第二键真值照常采纳滑正。跟打器类
+                        // 「整段一格」宿主 seg1 同签名时 est=段首+1格 也是真
+                        // 值（BUG8 四修B 实测），偶偏由重查滑正，无新增风险
+                        // 面。折行假警报（步进跨行）退回原样采纳（seed 重校
+                        // est）。上限 4 次防停顿期 60ms 重查空转。
+                        let unit = g.caret_est_unit_w;
+                        let lh = g.caret_est_line_h.max(8);
+                        let d_est = g.cur_raw_len as i32 - g.caret_est_last_raw;
+                        let expected_x = g.caret_est_x as f32 + d_est as f32 * unit;
+                        let lag = expected_x - r.left as f32;
+                        if g.caret_est_y != 0
+                            && unit > 4.0
+                            && g.seg1_stale_retry < 4
+                            && (r.top - g.caret_est_y).abs() <= lh / 2
+                            && lag >= unit * 0.4
+                            && lag <= unit * 2.6
+                        {
+                            est_step(g);
+                            if (g.caret_est_y - r.top).abs() <= lh / 2 {
+                                g.seg1_stale_retry += 1;
+                                arm_caret_recheck_timer();
+                                if crate::tsf::trace_on() {
+                                    trace(&format!(
+                                        "qc: seg1 selection 滞后一拍 lag={:.1}≈{:.1}键 → est 延续锚 ({},{}) +60ms 重查",
+                                        lag,
+                                        lag / unit,
+                                        g.caret_est_x,
+                                        g.caret_est_y
+                                    ));
+                                }
+                                g.caret = Some(RECT {
+                                    left: g.caret_est_x,
+                                    top: g.caret_est_y,
+                                    right: g.caret_est_x + 2,
+                                    bottom: g.caret_est_y + lh,
+                                });
+                                return;
+                            }
+                            // 折行假警报：est 步进跨行——退回原样采纳
+                            //（下方 seed 会把 est 重校回本帧盒）。
+                        }
                         // 【三十四修·selection 播种 est】采纳时同步播种 est 基
                         // 线（原只设 g.caret，est 还停在上屏估宽值——估宽 0.6×
                         // 行高系统性小于真实字宽，est 落后真值 → 下一键 WPS 惰
@@ -4285,6 +4369,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         rect.right = cx;
     }
     g.seg1_wide_suppress = 0;
+    g.seg1_stale_retry = 0;
     // 【九十二修·无基线归属验证 2026-09-25】八十九修的活插入符交叉
     // 验证在本宿主结构性失效（Qt 自绘光标，系统插入符恒缺失——九十
     // 修插桩实锤 seg1sel 39 帧 live=[] 全空，该门一次未触发），标准
