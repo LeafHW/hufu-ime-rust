@@ -3630,7 +3630,12 @@ pub(crate) fn is_cjk_fullwidth(c: char) -> bool {
 /// cur_raw_len 键宽并挂 +60ms 重查——覆盖 est 失参照的全部路径（旧布
 /// 局拦截/est_ok 出带/无基线 near/无基线 far）。同步宿主（记事本/
 /// WPS）指纹恒 false，恒返回 false 行为不变。返回 true=已采纳猜测锚。
-fn seg1_jump_guess(g: &mut Shared, r_raw: &RECT, via: &str) -> bool {
+/// 【虎魄矮锚高度修 2026-10-08】guess_rect 几何必须取**归一后**矩形
+/// （r_norm）：矮锚宿主（虎魄 14×16 默认度量锚）的 r_raw 高度=16px，
+/// 按它落位候选窗首键抬高约一整行（trace 实锤 seed rect bottom=1118
+/// vs 行高 124 应为 1226）——x 仍按 r_raw.left+raw×unit（与矮锚归一
+/// 同式），top/bottom 用 r_norm（矮锚归一已补整行高）。
+fn seg1_jump_guess(g: &mut Shared, r_raw: &RECT, r_norm: &RECT, via: &str) -> bool {
     if !g.composition.is_some() || !g.seg1_lag_host || g.cur_raw_len < 1 {
         return false;
     }
@@ -3644,11 +3649,12 @@ fn seg1_jump_guess(g: &mut Shared, r_raw: &RECT, via: &str) -> bool {
     }
     let adv = (g.cur_raw_len as f32 * unit).round() as i32;
     let gx = r_raw.left + adv;
+    let gh = (r_norm.bottom - r_norm.top).max(r_raw.bottom - r_raw.top).max(8);
     let guess_rect = RECT {
         left: gx,
-        top: r_raw.top,
+        top: r_norm.top,
         right: gx + 2,
-        bottom: r_raw.top + (r_raw.bottom - r_raw.top).max(8),
+        bottom: r_norm.top + gh,
     };
     seed_est_from_anchor(g, &guess_rect, via);
     // 猜测锚含 cur_raw_len 键、段起点=0 键：校准对归 (0, 段起点) 防
@@ -4101,7 +4107,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         //（换聊天窗/点击移位/Esc 多键）使 est 失参照，原样
                         // 拦落标准链=裸采纳陈旧锚（trace 实锤 dx=-99 跳位
                         // 帧裸采纳 → 窗偏左 ~1 键宽）。指纹宿主前移+重查。
-                        if seg1_jump_guess(g, &r_raw, "seg1sel_jumpdx") {
+                        if seg1_jump_guess(g, &r_raw, &r, "seg1sel_jumpdx") {
                             return;
                         }
                         trace(&format!(
@@ -4201,7 +4207,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             // lag 出带只说明 est 停在旧位判不了，不说明锚新
                             // 鲜——指纹宿主前移 raw 键宽+挂重查（见
                             // seg1_jump_guess）。
-                            if seg1_jump_guess(g, &r_raw, "seg1sel_jump") {
+                            if seg1_jump_guess(g, &r_raw, &r, "seg1sel_jump") {
                                 return;
                             }
                             seed_est_from_anchor(g, &r_raw, "seg1sel_estok");
@@ -4285,7 +4291,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                         // 线帧无从判滞后——指纹宿主前移（见 seg1_jump_guess，
                         // unit 用进程记忆兜底）；同步宿主 near 采纳+重查兜
                         // 底不变。
-                        if seg1_jump_guess(g, &r_raw, "seg1sel_coldfp") {
+                        if seg1_jump_guess(g, &r_raw, &r, "seg1sel_coldfp") {
                             return;
                         }
                         // 【三十四修·selection 播种 est】同上
@@ -4307,7 +4313,7 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                     }
                     // 【QQ 冷启动滞后·far 路径指纹门 2026-10-08】无基线远距
                     //（跳位后首键且 est 恰被清）同样前移（见 seg1_jump_guess）。
-                    if seg1_jump_guess(g, &r_raw, "seg1sel_coldfar") {
+                    if seg1_jump_guess(g, &r_raw, &r, "seg1sel_coldfar") {
                         return;
                     }
                     trace("qc: seg1 selection 摇摆拦截（无基线，走标准链）");
