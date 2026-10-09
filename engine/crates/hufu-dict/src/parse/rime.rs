@@ -164,7 +164,9 @@ pub fn parse(lines: &[String]) -> RawTable {
             }
         }
         let t = t.trim();
-        if t.is_empty() || t.starts_with('#') {
+        // 【# 可作词条 2026-10-09】带 Tab 的 # 行是数据（与 symbols 同款
+        // 规则）；纯 # 注释行无 Tab。
+        if t.is_empty() || (t.starts_with('#') && !t.contains('\t')) {
             continue;
         }
         let parts: Vec<&str> = t.split('\t').collect();

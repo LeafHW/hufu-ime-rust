@@ -556,11 +556,27 @@ fn main() {
         use std::sync::mpsc;
         let (quit_tx, quit_rx) = mpsc::channel::<()>();
         let (open_tx, open_rx) = mpsc::channel::<()>();
-        tray::spawn(quit_tx, open_tx, Some(shared.clone()));
+        let (focus_tx, focus_rx) = mpsc::channel::<()>();
+        tray::spawn(quit_tx, open_tx, focus_tx, Some(shared.clone()));
         let url = format!("http://{addr}/");
+        // 【设置窗聚焦 2026-10-10】Ctrl+Shift+H：只把已开的设置窗弹到
+        // 最前（最小化恢复/被盖置顶），不开新窗。
+        std::thread::spawn(move || {
+            while focus_rx.recv().is_ok() {
+                unsafe {
+                    crate::sys_win::raise_settings_window();
+                }
+            }
+        });
         std::thread::spawn(move || {
             // 常驻循环：每次托盘信号都开窗口（旧版一次性线程导致第二次进不去）
             while open_rx.recv().is_ok() {
+                // 【设置窗唯一性 2026-10-10】已开（枚举得到标题窗）先弹到
+                // 最前——Ctrl+Alt+H 一直按不再一直弹新窗（用户实锤）；
+                // 没找到才走开窗路径。
+                if unsafe { crate::sys_win::raise_settings_window() } {
+                    continue;
+                }
                 // 独立应用窗口（Chromium --app 模式）：有自己的任务栏图标、无地址栏，
                 // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
                 // Edge → Chrome → 默认浏览器三级回退（没装 Edge 的机器用 Chrome
@@ -1494,6 +1510,83 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => Response::err(500, &format!("切换失败: {e}")),
             }
         }
+        // 【全部设置一文件 2026-10-10】导出=config 全量 + 皮肤目录全部
+        // 皮肤 JSON（用户自定义/调过的都在内）。用户规格：设置页只留
+        // 「导出 config.json / 导入 config.json」两个动作，升版本一个
+        // 文件带走全部设置（含皮肤与自定义按键）。
+        ("GET", "/api/settings_export") => {
+            let mut skins = serde_json::Map::new();
+            for (id, _name) in host.list_skins() {
+                let p = host.skins_dir().join(format!("{id}.json"));
+                // 皮肤文件内容原样收编（Skin 结构透传序列化——保留未知
+                // 字段由 Skin 自身 serde 决定；读不动的跳过不拖垮导出）
+                if let Ok(txt) = std::fs::read_to_string(&p) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        skins.insert(id, v);
+                    }
+                }
+            }
+            Response::json(&serde_json::json!({
+                "hufu_settings_bundle": 1,
+                "exported_at": hufu_engine::dynamic::date_string_iso(),
+                "config": host.engine.config,
+                "skins": skins,
+            }))
+        }
+        ("POST", "/api/settings_import") => {
+            // body = /api/settings_export 的产物。语义=「叠加到默认值」：
+            // config 走 serde 反序列化，缺失字段自动取默认（新版新增项
+            // 落默认）、未知字段忽略（老版没有的新物件不炸）——正是
+            // 「新增功能按默认值来」的实现。皮肤逐张校验后落盘（id 只
+            // 许 [A-Za-z0-9_-]，防路径注入），再整体应用配置。
+            let v = req.json();
+            if v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) != Some(1) {
+                return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）");
+            }
+            let Some(cfg_v) = v.get("config") else {
+                return Response::err(400, "设置文件缺 config 节");
+            };
+            let cfg: hufu_config::Config = match serde_json::from_value(cfg_v.clone()) {
+                Ok(c) => c,
+                Err(e) => return Response::err(400, &format!("config 节无效: {e}")),
+            };
+            let mut skins_applied = 0usize;
+            if let Some(skins) = v.get("skins").and_then(|x| x.as_object()) {
+                let dir = host.skins_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                for (id, sv) in skins {
+                    if id.is_empty()
+                        || !id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        continue; // 非法 id 跳过
+                    }
+                    // 结构校验（Skin serde 通过才落盘——坏皮肤不写入）
+                    if serde_json::from_value::<hufu_skin::Skin>(sv.clone()).is_err() {
+                        continue;
+                    }
+                    let p = dir.join(format!("{id}.json"));
+                    if let Ok(txt) = serde_json::to_string(sv) {
+                        if std::fs::write(&p, txt).is_ok() {
+                            skins_applied += 1;
+                        }
+                    }
+                }
+            }
+            match host.apply_config(cfg) {
+                Ok((need_sentence, teardown)) => {
+                    if need_sentence {
+                        reload_sentence_bg(teardown, true);
+                    }
+                    Response::json(&serde_json::json!({
+                        "ok": true,
+                        "skins_applied": skins_applied,
+                    }))
+                }
+                Err(e) => Response::err(500, &format!("应用失败: {e}")),
+            }
+        }
         ("POST", "/api/open_schema_dir") => {
             // body {name?}：缺省=当前方案。打开方案码表目录的资源管理器窗口。
             let name = req
@@ -1754,7 +1847,6 @@ mod sys_win {
     }
 
     /// 设置窗口的 `--window-size` / `--window-position` 参数（DIP 空间）。
-    ///
     /// 【尺寸定稿】固定 900×800 DIP（用户定稿：按工作区占比缩 DIP 会让
     /// 高缩放下窗口变小、内容挤在一起——实寸恒定的代价不划算，放弃）。
     /// 尺寸 clamp 到 DIP 工作区（小屏不溢出），工作区 DIP 中心居中
@@ -1774,6 +1866,62 @@ mod sys_win {
             format!("--window-size={w},{h}"),
             format!("--window-position={x},{y}"),
         )
+    }
+
+    // ── 【设置窗唯一性 2026-10-10】已开设置窗的发现与前置 ──
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(lpenumfunc: isize, lparam: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, lpstring: *mut u16, cchmax: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, ncmdshow: i32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn keybd_event(bvk: u8, bscan: u8, dwflags: u32, dwextrainfo: usize);
+    }
+
+    /// 找到设置窗（--app 窗口标题=页面 <title>「虎符 HuFu · 设置」，
+    /// 专属 Profile 实例不会与其他窗口撞标题）并弹到最前。返回是否
+    /// 找到并前置——调用方（Ctrl+Alt+H/托盘）据此决定要不要开新窗
+    ///（用户规格：唯一性——一直按不再一直弹出）。
+    pub unsafe fn raise_settings_window() -> bool {
+        // EnumWindows 回调只收 HWND；结果放 thread-local 风格静态原子
+        //（回调在同线程执行，窗口枚举期间独占）。
+        static FOUND: std::sync::atomic::AtomicIsize =
+            std::sync::atomic::AtomicIsize::new(0);
+        FOUND.store(0, std::sync::atomic::Ordering::SeqCst);
+        unsafe extern "system" fn cb(hwnd: isize, _lparam: isize) -> i32 {
+            if IsWindowVisible(hwnd) == 0 {
+                return 1; // 继续枚举
+            }
+            let mut buf = [0u16; 64];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n <= 0 {
+                return 1;
+            }
+            let title = String::from_utf16_lossy(&buf[..n as usize]);
+            if title.contains("虎符") && title.contains("设置") {
+                FOUND.store(hwnd, std::sync::atomic::Ordering::SeqCst);
+                return 0; // 找到即停
+            }
+            1
+        }
+        EnumWindows(cb as isize, 0);
+        let hwnd = FOUND.load(std::sync::atomic::Ordering::SeqCst);
+        if hwnd == 0 {
+            return false;
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, 9); // SW_RESTORE
+        }
+        // 【前台锁定绕行】后台进程直接 SetForegroundWindow 常被系统
+        // 降级为任务栏闪烁：合成一记 Alt 按抬（经典手法）解锁前台权，
+        // 再置顶。keybd_event 与真实输入同管线，对应用无副作用。
+        const KEYEVENTF_KEYUP: u32 = 0x2;
+        keybd_event(0x12, 0, 0, 0); // VK_MENU down
+        let _ = SetForegroundWindow(hwnd);
+        keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0); // VK_MENU up
+        true
     }
 }
 

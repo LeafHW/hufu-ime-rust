@@ -62,7 +62,10 @@ fn parse_symbol_lines(lines: &[String]) -> HashMap<String, Vec<SymbolEntry>> {
     let mut map: HashMap<String, Vec<SymbolEntry>> = HashMap::new();
     for line in lines {
         let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
+        // 【# 可作符号 2026-10-09】用户实锤「# 无法快符输出」：行 `#\t;3`
+        // 被 # 注释规则整行吞掉。带 Tab 的 # 行是数据（第一列=符号 #），
+        // 无 Tab 的 # 行才是注释。
+        if t.is_empty() || (t.starts_with('#') && !t.contains('\t')) {
             continue;
         }
         let parts: Vec<&str> = t.split('\t').map(|p| p.trim()).collect();
@@ -117,5 +120,20 @@ mod tests {
         let m = SymbolTables::parse_slash(&lines);
         assert_eq!(m.get("/tm").unwrap()[0].text, "™");
         assert_eq!(m.get("/dui").unwrap()[0].weight, 50.0);
+    }
+
+    // 【# 可作符号 2026-10-09】`#\t;3` 是数据行不是注释（用户实锤
+    // 「# 无法快符输出」）；无 Tab 的 # 行仍是注释。
+    #[test]
+    fn hash_symbol_data_line() {
+        let lines: Vec<String> = vec![
+            "# 快符注释行".into(),
+            "#\t;3".into(),
+            "×\t;4".into(),
+        ];
+        let m = SymbolTables::parse_quick(&lines);
+        assert_eq!(m.get(";3").unwrap()[0].text, "#", "# 快符行不被注释吞掉");
+        assert_eq!(m.get(";4").unwrap()[0].text, "×");
+        assert!(m.values().flatten().all(|e| e.text != "快符注释行"));
     }
 }

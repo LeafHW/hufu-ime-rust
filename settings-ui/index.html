@@ -563,19 +563,13 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 导入导出 ════ -->
   <section id="tab-data">
     <h2>导入导出<span class="en">Data</span></h2>
-    <div class="sub">全部设置即一个 JSON；码表转换用命令行 hufu-cli convert。</div>
+    <div class="sub">一个 JSON 带走<b>全部设置</b>：配置项、皮肤（含你调过/自定义的）、自定义按键（键位映射、Shift+符号/字母）全部在内。升版本 / 换机器时导入即还原；新版本新增的设置项自动按默认值补齐，导不进的老物件自动忽略。</div>
     <div class="row">
       <button id="exp-dl" class="primary">导出 config.json</button>
-      <button id="exp-all">导出用户数据快照</button>
-      <label class="checkline" style="gap:12px">导入：
-        <input type="file" id="imp-file" accept=".json" style="display:none">
-        <button id="imp-btn">选择文件…</button>
-      </label>
+      <input type="file" id="imp-file" accept=".json" style="display:none">
+      <button id="imp-btn">导入 config.json…</button>
     </div>
-    <div class="sub">用户数据快照 = 配置 + 当前方案的用户词.txt + 用户调整.txt（文件名带日期-时间戳）。</div>
-    <h3>原始配置</h3>
-    <textarea class="wide" id="cfg-raw" style="min-height:300px"></textarea>
-    <div class="row" style="margin-top:10px"><button id="cfg-apply">应用上方 JSON</button></div>
+    <div class="sub" id="data-msg">导出时选保存位置；导入时选之前导出的文件，应用后立即生效。</div>
   </section>
 </main>
 
@@ -680,16 +674,63 @@ function bindInputs() {
     CFG.clipboard.whitelist = e.target.value.split(/[,，;；\n]/).map(s => s.trim()).filter(Boolean);
     autoSave(e.target);
   };
-  $("#exp-all").onclick = async () => {
+  /* 【全部设置一文件 2026-10-10】导出=config 全量+皮肤目录全部皮肤
+     （含自定义）——服务端 /api/settings_export 打包，浏览器存盘对话框
+     选位置。导入=文件选择器 → POST /api/settings_import：配置缺失字
+     段自动按默认值补齐（新版新增项）、未知字段忽略（老物件），皮肤
+     逐张校验落盘。旧「用户数据快照/原始配置 textarea」按用户拍板移除。 */
+  $("#exp-dl").onclick = async () => {
     try {
-      const r = await api("GET", "/api/export");
-      const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `hufu-data-${r.stamp || Date.now()}.json`;
-      a.click();
-      msg("快照已导出", "ok");
-    } catch (e) { msg(e.message, "err"); }
+      const r = await fetch("/api/settings_export");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const blob = await r.blob();
+      const d = new Date();
+      const p2 = n => String(n).padStart(2, "0");
+      const name = `hufu-config-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.json`;
+      /* 【导出必弹「另存为」2026-10-10】用户实锤：download 属性只有浏览器
+         开了「下载前询问保存位置」才弹框，默认直接进下载夹——不符合
+         「导出时选位置」的规格。设置窗是 Chromium（Edge/Chrome），走
+         File System Access API 的原生保存对话框（必弹、可选位置/改文件
+         名）；用户取消=AbortError 不当错误。非 Chromium 兜底回 download。 */
+      if (window.showSaveFilePicker) {
+        const h = await window.showSaveFilePicker({
+          suggestedName: name,
+          types: [{ description: "虎符设置文件", accept: { "application/json": [".json"] } }],
+        });
+        const ws = await h.createWritable();
+        await ws.write(blob);
+        await ws.close();
+        msg("已导出全部设置（含皮肤与按键）✓", "ok");
+      } else {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        msg("已导出（本浏览器不支持选位置，存在默认下载处）", "ok");
+      }
+    } catch (e) {
+      if (e && (e.name === "AbortError" || e.name === "NotAllowedError")) { msg("已取消导出", ""); return; }
+      msg("导出失败：" + e.message, "err");
+    }
+  };
+  $("#imp-btn").onclick = () => $("#imp-file").click();
+  $("#imp-file").onchange = async e => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      let v;
+      try { v = JSON.parse(txt); } catch (er) { throw new Error("JSON 解析失败：" + er.message); }
+      if (v.hufu_settings_bundle !== 1) throw new Error("不是虎符设置文件（缺少 hufu_settings_bundle 标记）");
+      if (!v.config) throw new Error("文件里没有 config 节");
+      const r = await fetch("/api/settings_import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(v) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+      msg(`导入成功：皮肤 ${j.skins_applied ?? 0} 张，配置已应用，正在刷新页面…`, "ok");
+      setTimeout(() => location.reload(), 1200);
+    } catch (er) { msg("导入失败：" + er.message, "err"); }
   };
   $("#c-2nd").value = CFG.candidates.second_select || "";
   $("#c-2nd").oninput = e => { if (e.target.value) CFG.candidates.second_select = e.target.value[0]; autoSave(e.target); };
@@ -957,7 +998,9 @@ async function loadSchemas() {
       `<select class="exp-fmt" title="导出格式（每个方案记住上次的选择；托盘右键导出也用此格式）">` +
       `<option value="sentence"${memFmt === "sentence" ? " selected" : ""}>虎整句格式</option><option value="native"${memFmt === "native" ? " selected" : ""}>HuFu 原生</option>` +
       `<option value="rime"${memFmt === "rime" ? " selected" : ""}>Rime dict.yaml</option><option value="duoduo"${memFmt === "duoduo" ? " selected" : ""}>多多</option>` +
-      `<option value="qq"${memFmt === "qq" ? " selected" : ""}>QQ五笔</option></select>` +
+      `<option value="qq"${memFmt === "qq" ? " selected" : ""}>QQ五笔</option>` +
+      /* 【机器人专用 2026-10-09】多多反过来：码\t词 两列（用户需求） */
+      `<option value="robot"${memFmt === "robot" ? " selected" : ""}>机器人专用</option></select>` +
       `<button class="opendir exp-dict" title="把用户调整（置顶/隐藏/加词/调频）合并进原始码表，按左侧所选格式导出一张新码表（码表导出\\<方案>\\）；托盘右键「导出码表」也用此格式">📤 导出码表</button>` +
       `${n === r.current_schema ? '<span class="tag">当前</span>' : ""}`;
     d.querySelector(".opendir").onclick = async ev => {
@@ -979,7 +1022,7 @@ async function loadSchemas() {
       const fmt = d.querySelector(".exp-fmt").value || "sentence";
       try {
         const r2 = await api("POST", "/api/export_schema", { name: n, format: fmt });
-        const fmtName = { sentence: "虎整句", native: "HuFu 原生", rime: "Rime", duoduo: "多多", qq: "QQ五笔" }[fmt] || fmt;
+        const fmtName = { sentence: "虎整句", native: "HuFu 原生", rime: "Rime", duoduo: "多多", qq: "QQ五笔", robot: "机器人专用" }[fmt] || fmt;
         msg(`已按「${fmtName}」格式导出 ${r2.lines} 行 → ${r2.path}`, "ok");
       } catch (e) { msg(e.message, "err"); }
     };
@@ -2263,36 +2306,13 @@ $("#weasel-export").onclick = () => {
   msg("已生成 weasel patch（复制到 weasel.custom.yaml 使用）", "ok");
 };
 
-$("#exp-dl").onclick = () => {
-  const blob = new Blob([JSON.stringify(CFG, null, 2)], { type: "application/json" });
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "hufu-config.json"; a.click();
-};
-$("#imp-btn").onclick = () => $("#imp-file").click();
-$("#imp-file").onchange = async ev => {
-  /* 【修复标签 2026-09-11】导入校验：文件导入先结构校验（12 节齐全、
-     类型对），非法弹 alert 不应用（后端整体替换，缺节会回出厂值） */
-  const f = ev.target.files[0]; if (!f) return;
-  let c;
-  try { c = JSON.parse(await f.text()); }
-  catch (e) { alert("导入失败：JSON 解析错误 " + e.message); return; }
-  const err = validateConfig(c);
-  if (err) { alert("导入已取消：" + err); return; }
-  CFG = c; await $("#btn-save").click();
-};
-$("#cfg-apply").onclick = async () => {
-  /* 【修复标签 2026-09-11】导入校验：文本框应用同文件导入——先校验后应用 */
-  let c;
-  try { c = JSON.parse($("#cfg-raw").value); }
-  catch (e) { alert("JSON 无效：" + e.message); return; }
-  const err = validateConfig(c);
-  if (err) { alert("未应用：" + err); return; }
-  CFG = c; await $("#btn-save").click();
-};
+/* 【全部设置一文件 2026-10-10】exp-dl/imp-btn/imp-file 的绑定在
+   bindInputs 内统一处理（服务端打包导出+校验导入）；旧纯 config
+   下载、快照导出与「原始配置」文本框路径按用户拍板移除。 */
 
 async function init() {
   try {
     CFG = await api("GET", "/api/config");
-    $("#cfg-raw").value = JSON.stringify(CFG, null, 2);
     bindInputs(); buildSliders();
     applyPlatform();
     await loadSchemas(); await refreshInfo();
@@ -2318,6 +2338,16 @@ async function init() {
     【小键盘分页 2026-11】小键盘独立第二页（主键盘/小键盘页签），
     键帽用 Num 0-9 / Num + - * / / Num . / Num回车 易认写法。
    （旧版「选重键页」已删——功能键页完全覆盖其能力。） */
+/* 【Shift+字母档位记忆 2026-10-10】ssStore 必须在页面顶层：编辑窗 render()
+   每次保存后都会重跑，放里面会被反复重建清零（用户实锤「开关没有记忆」）。
+   localStorage 可用则跨会话记住；被浏览器禁用时降级页内记忆——顶层常量
+   在整个设置页生命周期内活着（跨渲染、跨编辑窗关开）。 */
+const ssStore = {
+  mem: {},
+  get(k) { try { return localStorage.getItem(k); } catch (_) { return (k in this.mem) ? this.mem[k] : null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (_) { this.mem[k] = v; } },
+};
+
 function openKeymapEditor() {
   const w = window.open("", "hufu-keymap", "width=1100,height=820");
   if (!w) { msg("按键编辑窗口被浏览器拦截，请允许弹窗", "err"); return; }
@@ -2375,15 +2405,21 @@ function openKeymapEditor() {
       ["Num 0","","Num .",""],
     ];
     /* 【Shift+符号页 2026-10-09】主键盘区（数字/字母/符号，无功能键）：
-       字母全灰不可改；数字与符号可点——点击显示 Shift+该键当前打出
-       什么，可直接换成任意串（如 Shift+7 → ×）。键位即基础字符。 */
+       数字/符号/字母均可点——点击显示 Shift+该键当前打出什么，可直接
+       换成任意串（如 Shift+7 → ×）。键位即基础字符。
+       【Shift+字母区 2026-10-09】字母也可自定义，但语义与符号不同：
+       只在有候选（打字中）时生效=候选顶屏+串；空态/无候选=正常大写
+       字母（用户规格「只在有候选时生效」）。存储键形为大写（A-Z，
+       与引擎 TSF 实传大写口径一致）。 */
     const rowsShift = [
       ["`","1","2","3","4","5","6","7","8","9","0","-","="],
       ["q","w","e","r","t","y","u","i","o","p","[","]","\\"],
       ["a","s","d","f","g","h","j","k","l",";","'"],
       ["z","x","c","v","b","n","m",",",".","/"],
     ];
-    const ssEditable = c => /[`0-9\-=[\];',./\\]/.test(c) && !/[a-z]/.test(c);
+    const ssEditable = c => /[`0-9\-=[\];',./\\a-z]/.test(c);
+    /* 字母键在 shift_symbols 里以大写存储（引擎口径） */
+    const ssKey = c => /[a-z]/.test(c) ? c.toUpperCase() : c;
     let ss = Object.assign({}, cfg.keymap && cfg.keymap.shift_symbols || {});
     let pg = "main"; // main | num | shiftsym（分页状态，render 间保持）
     /* 键帽 → 引擎键名（config.keymap.map 键口径）。Esc 固定行为键
@@ -2421,7 +2457,8 @@ function openKeymapEditor() {
       const kb2 = pg === "shiftsym"
         ? rows.map(row => `<div class="row2">${row.map(cap => {
             const editable = ssEditable(cap);
-            const custom = ss[cap];
+            /* 【Shift+字母区 2026-10-09】字母以大写键查自定义（存储口径） */
+            const custom = ss[ssKey(cap)];
             const badge = custom ? `<div class="bd2" style="background:#7a4adf">↳ ${esc(custom).slice(0, 6)}</div>` : "";
             const cls = editable ? (custom ? "k asg" : "k") : "k dis";
             const disp = cap.length > 1 ? esc(cap) : (editable ? `<b>⇧+</b>${esc(cap)}` : esc(cap));
@@ -2456,7 +2493,7 @@ function openKeymapEditor() {
 
       w.document.body.innerHTML = `
         <h2>⌨ 自定义按键</h2>
-        <div class="tip">「主键盘 / 小键盘」页：点击任意按键设置两层效果：<b>有候选时</b>（打字中——映射触发前候选先顶屏，如打 d 候选「中」按 [ = 「中？」）与 <b>无候选时</b>（空态直出，可不同于有候选，如无候选直出「！」）。无候选默认跟随有候选设置。功能在<b>中文输入态、无 Shift/Ctrl/Alt 组合</b>时生效；编码延续中的字母键仍优先当编码。Ctrl/Alt/Win 仅作展示（组合键是应用快捷键，不可映射）；<b>左右 Shift 独立可映射</b>（LShift/RShift 各设各的；某侧映射后该侧单击不再切中英，另一侧不受影响；老配置里写 "shift" 的仍两侧同效）；<b>Esc 不可映射</b>（固定双行为：编码中清屏，空态按「Esc 撤回上次上屏」开关撤回）。<b>反引号键（1 左边）与小键盘全部按键</b>均可映射（小键盘与主排数字身份分开——主排数字是选重键；小键盘在 NumLock 开启形态下生效，NumLock 键本身不可映射）。注意：反引号键常被反查引导或超集编码占用，映射前先确认无冲突（下方冲突检测会提示）。改完「保存并应用」全局生效、重启保留。「Shift+符号修改」页：单独自定义 Shift+数字/符号的输出（点击键→看当前输出→输入替换→保存即生效）。</div>
+        <div class="tip">「主键盘 / 小键盘」页：点击任意按键设置两层效果：<b>有候选时</b>（打字中——映射触发前候选先顶屏，如打 d 候选「中」按 [ = 「中？」）与 <b>无候选时</b>（空态直出，可不同于有候选，如无候选直出「！」）。无候选默认跟随有候选设置。功能在<b>中文输入态、无 Shift/Ctrl/Alt 组合</b>时生效；编码延续中的字母键仍优先当编码。Ctrl/Alt/Win 仅作展示（组合键是应用快捷键，不可映射）；<b>左右 Shift 独立可映射</b>（LShift/RShift 各设各的；某侧映射后该侧单击不再切中英，另一侧不受影响；老配置里写 "shift" 的仍两侧同效）；<b>Esc 不可映射</b>（固定双行为：编码中清屏，空态按「Esc 撤回上次上屏」开关撤回）。<b>反引号键（1 左边）与小键盘全部按键</b>均可映射（小键盘与主排数字身份分开——主排数字是选重键；小键盘在 NumLock 开启形态下生效，NumLock 键本身不可映射）。注意：反引号键常被反查引导或超集编码占用，映射前先确认无冲突（下方冲突检测会提示）。改完「保存并应用」全局生效、重启保留。「Shift+符号修改」页：单独自定义 Shift+数字/符号/字母的输出（点击键→看当前输出→输入替换→选生效范围→保存即生效；字母可选「只在有候选时」或「都生效」）。</div>
         <div class="pgbar">
           <button class="pgtab${pg === "main" ? " on" : ""}" data-pg="main">主键盘</button>
           <button class="pgtab${pg === "num" ? " on" : ""}" data-pg="num">小键盘</button>
@@ -2469,7 +2506,7 @@ function openKeymapEditor() {
         </div>
         <div class="kbwrap">${kb2}</div>
         ${pg === "shiftsym" ? `
-        <div class="tip" style="margin-top:10px">点亮的数字/符号键 = 可改：点击后显示 <b>Shift+该键现在打出什么</b>（内置默认或你已改的），输入替换内容保存即生效。打字时按 <b>Shift+该键</b>：有候选先上屏候选再出你换的串（顶屏语义），空态直接出串。字母区灰色不可改（Shift+字母=大写）。${Object.keys(ss).length ? "已自定义：" + Object.keys(ss).map(k => `Shift+${esc(k)}→${esc(ss[k])}`).join("、") : ""}</div>` : `
+        <div class="tip" style="margin-top:10px">点亮的数字/符号键 = 可改：点击后显示 <b>Shift+该键现在打出什么</b>（内置默认或你已改的），输入替换内容保存即生效。打字时按 <b>Shift+该键</b>：有候选先上屏候选再出你换的串（顶屏语义），空态直接出串。<b>字母键同样可点</b>——弹窗里有二选一开关：「只在有候选时」（默认，空态=正常大写字母）或「都生效」（空态直接出串）；开关选择会被记住，作为下次点开其他字母的默认。${Object.keys(ss).length ? "已自定义：" + Object.keys(ss).map(k => `Shift+${esc(k)}→${esc(ss[k])}${(cfg.keymap.shift_letters_always || []).includes(k) ? "（都生效）" : ""}`).join("、") : ""}</div>` : `
         <div class="panel"><div class="col"><h3>当前功能映射</h3>${list2}</div><div class="col"><h3>冲突检测</h3>${cf2}</div></div>`}`;
       const style = w.document.createElement("style");
       style.textContent = `
@@ -2548,15 +2585,33 @@ function openKeymapEditor() {
       /* —— Shift+符号键点击（查当前输出 → 换串 → 保存） —— */
       w.document.querySelectorAll(".k[data-ss]:not([data-ss=''])").forEach(el => {
         el.onclick = async () => {
+          /* 【静默死键根治 2026-10-10】用户实锤「所有按键点了没反应」：
+             此前 handler 内任何异常都无声吞掉（async 未捕获=无弹窗无提示）。
+             全程 try/catch，出错就明示。 */
+          try {
           const base = el.dataset.ss;
+          /* 【Shift+字母区 2026-10-09】存储/查询键形：字母=大写（A-Z） */
+          const skey = ssKey(base);
           let cur = "", builtin = "";
           try { const r = await api("GET", "/api/shift_symbol?base=" + encodeURIComponent(base)); builtin = r.builtin || ""; cur = r.custom || ""; } catch (_) {}
+          const isLetter = /[a-z]/.test(base);
+          /* 【Shift+字母双态开关 2026-10-10】二选一生效范围：都生效（空态
+             直出串）vs 只在有候选时。预填：该字母已存映射→它的已存档位；
+             新字母→上次选择的档位（localStorage 记住；禁存储时降级页内记忆）。 */
+          const lastMode = ssStore.get("hufuSSLetterMode");
+          /* 预填=上次保存的档位，全局粘住（用户实锤：R 设了都生效，点开
+             任何其他字母也应默认都生效；不按各字母已存档位分歧预填） */
+          let mode = lastMode === "always" ? "always" : "compose";
           const div = w.document.createElement("div");
           div.style.cssText = "position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center;z-index:9";
-          div.innerHTML = `<div style="background:#fff;border-radius:10px;padding:18px 22px;box-shadow:0 4px 24px rgba(0,0,0,.2);min-width:360px">
+          div.innerHTML = `<div style="background:#fff;border-radius:10px;padding:18px 22px;box-shadow:0 4px 24px rgba(0,0,0,.2);min-width:400px">
             <div style="font-size:14px;margin-bottom:12px">按键 <code>Shift+${esc(base)}</code>${builtin ? ` 现在打出：<b>${esc(cur || builtin)}</b>${cur ? `（内置默认是 ${esc(builtin)}）` : "（内置默认）"}` : ""}</div>
             <div class="mrow"><span class="mlb" style="width:110px">替换为（可留空）：</span><input type="text" class="ssnew" style="width:180px;padding:6px 10px;border:1px solid #b8bfcc;border-radius:7px" placeholder="要打出的内容，如 ×" value="${esc(cur)}"></div>
-            <div style="font-size:12px;color:#888;margin:6px 0 0 118px">有候选时=候选上屏+此串；空态=直接出此串</div>
+            ${isLetter ? `<div class="mrow" style="margin-top:10px"><span class="mlb" style="width:110px">生效范围：</span>
+              <label style="margin-right:14px;font-size:13px"><input type="radio" name="ssmode" value="compose"${mode === "compose" ? " checked" : ""}> 只在有候选时</label>
+              <label style="font-size:13px"><input type="radio" name="ssmode" value="always"${mode === "always" ? " checked" : ""}> 都生效（空态也出串）</label></div>
+            <div style="font-size:12px;color:#888;margin:6px 0 0 118px">只在有候选时=空态/无候选按 Shift+字母出正常大写字母；都生效=空态直接出此串。选择会被记住，作为下次点开其他字母的默认。</div>`
+            : `<div style="font-size:12px;color:#888;margin:6px 0 0 118px">有候选时=候选上屏+此串；空态=直接出此串</div>`}
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
               <button class="ssok pri">保存</button>
               ${cur ? '<button class="ssdel">恢复内置</button>' : ""}
@@ -2568,10 +2623,16 @@ function openKeymapEditor() {
           inp.focus();
           const save = async () => {
             const v = inp.value;
+            const chosenMode = isLetter ? ((div.querySelector("input[name=ssmode]:checked") || {}).value || "compose") : null;
+            if (isLetter) ssStore.set("hufuSSLetterMode", chosenMode); // 记住，供下一个字母默认
             cfg.keymap = cfg.keymap || {};
             cfg.keymap.shift_symbols = cfg.keymap.shift_symbols || {};
-            if (v) { cfg.keymap.shift_symbols[base] = v; ss[base] = v; }
-            else { delete cfg.keymap.shift_symbols[base]; delete ss[base]; }
+            if (v) { cfg.keymap.shift_symbols[skey] = v; ss[skey] = v; }
+            else { delete cfg.keymap.shift_symbols[skey]; delete ss[skey]; }
+            /* 档位落 config：HashSet 序列化为数组——重整该字母的档位，
+               其余字母保持原样 */
+            cfg.keymap.shift_letters_always = (cfg.keymap.shift_letters_always || []).filter(k => k !== skey);
+            if (v && isLetter && chosenMode === "always") cfg.keymap.shift_letters_always.push(skey);
             try {
               const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
               if (!r.ok) throw new Error(r.status);
@@ -2582,8 +2643,29 @@ function openKeymapEditor() {
           const del = div.querySelector(".ssdel");
           if (del) del.onclick = () => { inp.value = ""; save(); };
           div.querySelector(".ccl").onclick = () => div.remove();
+          } catch (e) {
+            /* 出错必须可见：弹在编辑窗里（w 可用时）否则主窗 */
+            try { w.alert("Shift+符号设置出错：" + (e && (e.message || e))); }
+            catch (_) { try { alert("Shift+符号设置出错：" + (e && (e.message || e))); } catch (_2) {} }
+          }
         };
       });
+
+      /* 【编辑窗自愈 2026-10-10】用户实锤「Shift+符号修改所有按键点了没反应」：
+         根因=旧「自定义按键」编辑窗在设置页关闭后残留——它的事件处理器
+         活在设置页的 JS 上下文里，上下文销毁后整页按键变成静默死键（无
+         报错无反应）。注入编辑窗自己的守护脚本：opener 消失 1 秒内整窗
+         自愈——直接跳转成全新设置页（可继续编辑）。 */
+      try {
+        if (w.__hufuSelfheal !== window) {
+          /* 按来源布防：编辑窗若曾自愈成设置页、又被新设置页重开，这里
+             换上引用新 opener 的守护（旧守护触发后已自清，不会叠加误抢） */
+          w.__hufuSelfheal = window;
+          const sh = w.document.createElement("script");
+          sh.textContent = "(function(){var o=window.opener,org='" + location.origin + "',t=setInterval(function(){if(!o||o.closed){clearInterval(t);try{location.replace(org+'/');}catch(e){}}},1000);})();";
+          w.document.body.appendChild(sh);
+        }
+      } catch (_) {}
 
       /* —— 分页切换（主键盘 / 小键盘 / Shift+符号） —— */
       w.document.querySelectorAll(".pgtab").forEach(b => {

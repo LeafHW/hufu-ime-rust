@@ -708,6 +708,14 @@ impl Engine {
         }
     }
 
+    /// 【引导键连动 2026-10-09】反查态内引导键输出的符号——与设置页
+    /// 「关闭反查时按引导键」选项连动（用户需求）：选项配「`」则反查
+    /// 内（二次直出/有候选顶屏）也出「`」；配「·」或未配出「·」（间隔
+    /// 号老语义兜底——反查态内总得有个输出，不能像空态那样直通）。
+    fn reverse_exit_symbol(&self) -> String {
+        self.disabled_symbol().unwrap_or_else(|| "·".to_string())
+    }
+
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
         // 空名防御：dir.join("") = 码表根目录本身，Schema::load 会把
@@ -1486,7 +1494,14 @@ impl Engine {
             // shift+/ 被顿号分支先吃）。有编码态不受影响。
             // 【Shift+符号自定义 2026-10-09】用户自定义串优先于内置
             // 映射（空态=串本身直出）。
-            if shift && session.raw.is_empty() {
+            // 【Shift+字母·双态开关 2026-10-10】字母区映射（键形 A-Z）
+            // 默认只在有候选（组段中）生效——空态=正常大写字母；该
+            // 字母在 shift_letters_always 集合（对话框「都生效」档）
+            // 时空态也直出串。
+            if shift
+                && session.raw.is_empty()
+                && (!c.is_ascii_alphabetic() || self.shift_letter_always(c))
+            {
                 if let Some(rep) = self
                     .config
                     .keymap
@@ -1623,11 +1638,11 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         // 【` 顶屏 2026-09-06】编码态按 `（反查引导键）= 顶当前首选
-        // 上屏并追加间隔号「·」（用户规格：有候选时按 · 顶屏带 ·；
+        // 上屏并追加引导键符号（用户规格：有候选时按 · 顶屏带 ·；
         // Shift+` 走下方 Shift 标点拦截出「首选~」）。
         // 【功能词标点顶字 2026-11】置于其他引导之前——` 不是编码字符。
-        // 【反查关闭直出 2026-10-03】反查不可用时编码态同语义但改用
-        // disabled_output 符号（默认「·」不变；配 ` 则顶屏带 `）。
+        // 【引导键连动 2026-10-10】追加符号统一跟随「关闭反查时按引导键」
+        // 选项（配 ` 出 `；未配/配 · 出 ·）——反查可用与否不再分叉。
         // 顶屏首选是功能词（{重复上屏}/{撤回} 等）时同样解析——
         // z1={重复上屏} 的方案打 z 再按 ` = 「上次内容·」。
         // 【` 引导打特殊字 2026-11】` 已加入编码字母表且反查关闭时，
@@ -1648,11 +1663,11 @@ impl Engine {
             let (first, back) = self.resolve_commit_pair(
                 &session.candidates[idx].commit_text().to_string(),
             );
-            let sym = if self.reverse_available() {
-                "·".to_string()
-            } else {
-                self.disabled_symbol().unwrap_or_else(|| "·".into())
-            };
+            // 【引导键连动 2026-10-10】编码态同样连动「关闭反查时按引导键」
+            // 选项——用户实锤：配了 ` 反查开着时编码态按 ` 仍出 ·（旧代码
+            // 反查可用硬编码 ·，选项只在反查关闭时生效）。统一：配什么出
+            // 什么，未配/配 · 兜底 ·，反查可用与否不再分叉。
+            let sym = self.reverse_exit_symbol();
             session.clear();
             let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
             o.back = back;
@@ -1780,7 +1795,15 @@ impl Engine {
         //（提交首选后输出标点）。
         // 【Shift+符号自定义 2026-10-09】自定义串优先；顶屏语义与内置
         // 一致（首选/功能词上屏后接自定义串）。
-        if shift {
+        // 【Shift+字母·双态开关 2026-10-10】字母映射（键形 A-Z）默认
+        // 要求有候选才拦截顶屏——无候选时走下方 mixed_input/大写直上
+        // 屏老链路；「都生效」档（shift_letters_always 集合）无候选也
+        // 顶屏出串。符号键（Shift+7 等）维持无候选也直出语义，零回归。
+        if shift
+            && (!c.is_ascii_alphabetic()
+                || !session.candidates.is_empty()
+                || self.shift_letter_always(c))
+        {
             if let Some(rep) = self
                 .config
                 .keymap
@@ -2021,9 +2044,16 @@ impl Engine {
         let has_upper = session.raw.chars().any(|x| x.is_ascii_uppercase());
 
         // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
+        // 【可延码不直出 2026-10-09】码表存在更长延续码（如 symbols 的
+        // ;m→;mn→;mnng）时不再秒上屏——用户实锤：;m 唯一命中即直出，
+        // 压死了 ;mn ;mng ;mnng（「打不了」）。改为有更长延续=候选窗
+        // 等待延伸（要 · 按空格/1 照选），叶子码才唯一直出——快符 ;x
+        // 单键叶子，老直出行为零回归（has_longer_continuation 不含
+        // 自身，与 has_continuation 的自身包含语义区分）。
         if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\'))
             && len >= 2
             && session.candidates.len() == 1
+            && !self.has_longer_continuation(&session.raw)
         {
             self.commit_first_inline(session);
             return;
@@ -2507,6 +2537,29 @@ impl Engine {
             }
         }
         self.select_candidate_ex(session, idx, true, no_learn)
+    }
+
+    /// 【可延码判定 2026-10-09】raw 之后是否还有严格更长的编码（不含
+    /// raw 自身——has_continuation 的 completions 会把自身词条收进来，
+    /// 对任何存在码恒真，区分不了叶子码与可延伸码）。快符/符号「唯一
+    /// 候选直出」（;x）与「可延等待」（;m→;mn→;mnng）的分界。
+    fn has_longer_continuation(&self, raw: &str) -> bool {
+        if self.schema.dict.has_longer(raw) {
+            return true;
+        }
+        if raw.starts_with('`') && !self.schema.super_dict.is_empty()
+            && self.schema.super_dict.has_longer(raw)
+        {
+            return true;
+        }
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\') {
+            let map = self.schema.symbols.merge_code_map();
+            let raw_len = raw.chars().count();
+            return map
+                .keys()
+                .any(|k| k.chars().count() > raw_len && k.starts_with(raw));
+        }
+        false
     }
 
     /// raw 是否还有编码延续（前缀树或符号表）。
@@ -3501,10 +3554,12 @@ impl Engine {
             }
             // 【按两下 ` = 间隔号 2026-09-06】反查态再按 `（第二下）
             // 直接上屏「·」退出反查（虎爪语义；原先空吞）
+            // 【引导键连动 2026-10-09】输出符号跟随「关闭反查时按引导键」
+            // 选项（配 ` 出 `，配 · 出 ·，未配兜底 ·）。
             if c == self.config.reverse.prefix {
                 session.mode = InputMode::Normal;
                 session.clear();
-                return KeyOutcome::commit("·", self.state(session));
+                return KeyOutcome::commit(self.reverse_exit_symbol(), self.state(session));
             }
             if c == ' ' {
                 return KeyOutcome::consumed(self.state(session));
@@ -3547,6 +3602,25 @@ impl Engine {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 KeyOutcome::consumed(self.state(session))
+            }
+            // 【引导键连动 2026-10-09】有候选时按引导键 = 首选顶屏 +
+            // 连动符号（用户规格：「关闭反查时按引导键」配什么出什么，
+            // 配 ` 按一下直出 ` 并顶屏）；此前落 catch-all 清缓冲——
+            // 有候选时引导键白按。
+            _ if c == self.config.reverse.prefix && !session.candidates.is_empty() => {
+                let sym = self.reverse_exit_symbol();
+                let (first, back) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .first()
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.mode = InputMode::Normal;
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
+                o.back = back;
+                o
             }
             // 数字选重 / 翻页（与普通模式一致；反查候选多时翻页查看）
             _ if c.is_ascii_digit() && c != '0' => {
@@ -5003,10 +5077,36 @@ impl Engine {
         format!("{}{}", base, disp_c)
     }
 
+    /// 【Shift+字母·双态开关 2026-10-10】该字母是否「都生效」档
+    ///（shift_letters_always 集合）：空态直出串+组段无候选也顶屏。
+    /// 缺省=「只在有候选时生效」（v1.7.5 行为）。
+    fn shift_letter_always(&self, c: char) -> bool {
+        c.is_ascii_alphabetic()
+            && self
+                .config
+                .keymap
+                .shift_letters_always
+                .contains(&c.to_ascii_uppercase().to_string())
+    }
+
     /// 【Shift+符号预览 2026-10-09】设置页「Shift+符号」页签点键即问：
     /// 该键的内置输出（US shift 形态→标点映射，空上下文近似）与
-    /// 自定义覆盖串。None 内置=该键不是 Shift 符号键（字母等）。
+    /// 自定义覆盖串。None 内置=该键不是 Shift 符号键。
+    /// 【Shift+字母 2026-10-09】字母键也可查：内置=大写字母本身；
+    /// 自定义键形为大写（A-Z——引擎按 TSF 实传大写查 shift_symbols）。
+    /// 【双态开关 2026-10-10】字母映射默认只在有候选（组段中）生效；
+    /// 「都生效」档（shift_letters_always）空态/无候选也出串。
     pub fn shift_symbol_preview(&self, base: char) -> Option<(String, Option<String>)> {
+        if base.is_ascii_alphabetic() {
+            let up = base.to_ascii_uppercase();
+            let custom = self
+                .config
+                .keymap
+                .shift_symbols
+                .get(&up.to_string())
+                .cloned();
+            return Some((up.to_string(), custom));
+        }
         let builtin = shift_form(base).and_then(|sf| {
             let mut scratch = crate::session::Session::new(true);
             self.punct_output(&mut scratch, sf).map(|(t, _)| t)
@@ -6052,6 +6152,177 @@ mod tests {
         let out = eng.process_key(&mut s, key('`'));
         assert_eq!(out.commit.unwrap(), "就·", "编码态 ` 顶首选带 ·");
         assert!(s.raw.is_empty(), "顶屏后清缓冲");
+    }
+
+    // 【引导键连动 2026-10-09】反查态引导键输出跟随设置页「关闭反查时
+    // 按引导键」选项：配 ` → 空态二次直出 `、有候选按一下=首选顶屏+`；
+    // 配 · → 出 ·。此前反查内硬编码 · 不连动。
+    #[test]
+    fn reverse_guide_symbol_linkage() {
+        let (mut eng, dir) = test_engine("revlink");
+        eng.config.reverse.disabled_output = "`".to_string();
+        // 空态二次 `：直出 ` 退出反查
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('`'));
+        assert_eq!(s.mode, InputMode::Reverse, "单击进反查");
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("`"), "配 ` 双击直出 `");
+        assert_eq!(s.mode, InputMode::Normal, "退出反查");
+        // 反查有候选（ce=测）按 ` → 顶首选 + `
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('`'));
+        eng.process_key(&mut s2, key('c'));
+        eng.process_key(&mut s2, key('e'));
+        assert!(!s2.candidates.is_empty(), "ce 有候选");
+        let out = eng.process_key(&mut s2, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("测`"), "有候选顶屏+连动符号");
+        assert_eq!(s2.mode, InputMode::Normal, "退出反查");
+        // 配回 ·：同路径出 ·
+        eng.config.reverse.disabled_output = "·".to_string();
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('`'));
+        let out = eng.process_key(&mut s3, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("·"), "配 · 双击出 ·");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【引导键连动·编码态 2026-10-10】反查开着（表在场）+ 选项配 `：
+    // 编码态按 ` = 首选顶屏 + `——此前该分支 reverse_available 硬编码
+    // ·（选项只作用于反查关闭场景），用户实锤「有候选的时候按出来还是 ·」。
+    #[test]
+    fn reverse_guide_symbol_linkage_compose() {
+        let (mut eng, dir) = test_engine("revlink2"); // 反查.txt 在场=反查可用
+        eng.config.reverse.disabled_output = "`".to_string();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(
+            out.commit.as_deref(),
+            Some("就`"),
+            "反查可用+配 `：编码态顶屏+`: {:?}",
+            out.commit
+        );
+        // 默认（未配）零回归：仍 ·
+        let (mut eng2, dir2) = test_engine("revlink3");
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('j'));
+        eng2.process_key(&mut s2, key('d'));
+        let out2 = eng2.process_key(&mut s2, key('`'));
+        assert_eq!(out2.commit.as_deref(), Some("就·"), "默认仍 ·");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    // 【可延码不直出 2026-10-09】symbols 类码表 ;m ;mn ;mng ;mnng 共存：
+    // ;m 唯一命中不再秒上屏（此前压死了 ;mn…「打不了」），候选窗等待
+    // 延伸；无延续的 ;x 唯一命中仍直出（快符老语义零回归）。
+    #[test]
+    fn semicolon_continuation_no_autocommit() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-semicont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\n;m\t·\n;mn\t—\n;mng\t——\n;mnng\t……\n;x\t@\n",
+        )
+        .unwrap();
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        // ;m：唯一候选 · 但有延续（;mn…）→ 不直出，等待延伸
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key(';'));
+        eng.process_key(&mut s, key('m'));
+        assert_eq!(s.raw, ";m", ";m 不秒上屏（有延续等待）: raw={}", s.raw);
+        assert!(!s.candidates.is_empty(), ";m 候选在场");
+        // 空格可出 ·（首选照选）
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.as_deref(), Some("·"), "空格选 ·");
+        // 延伸链 ;mn（等待）→ ;mnn（无候选但有 ;mnng 延续=仍等待）
+        // → ;mnng 末级唯一直出。注：;mng 是独立叶子码（——），不在
+        // ;mnng 的延伸链上（;mnng=;m n n g）。
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key(';'));
+        eng.process_key(&mut s2, key('m'));
+        let out = eng.process_key(&mut s2, key('n'));
+        assert_eq!(s2.raw, ";mn", ";mn 仍等待");
+        assert!(out.commit.is_none(), ";mn 不上屏");
+        let out = eng.process_key(&mut s2, key('n'));
+        assert_eq!(s2.raw, ";mnn", ";mnn 无候选仍等待（有 ;mnng 延续）");
+        assert!(out.commit.is_none(), ";mnn 不上屏");
+        let out = eng.process_key(&mut s2, key('g'));
+        assert_eq!(out.commit.as_deref(), Some("……"), ";mnng 末级叶子唯一直出");
+        // 对照：;mng 是叶子码（无更长延续）→ 唯一直出 ——
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key(';'));
+        eng.process_key(&mut s4, key('m'));
+        eng.process_key(&mut s4, key('n'));
+        let out = eng.process_key(&mut s4, key('g'));
+        assert_eq!(out.commit.as_deref(), Some("——"), ";mng 叶子唯一直出");
+        // 无延续快符 ;x：唯一命中仍直出（零回归）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key(';'));
+        let out = eng.process_key(&mut s3, key('x'));
+        assert_eq!(out.commit.as_deref(), Some("@"), ";x 无延续仍直出");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【Shift+字母·只组段生效 2026-10-09】Shift+符号页字母区（键形 A-Z）：
+    // 有候选时 Shift+字母=首选顶屏+自定义值；空态=正常大写（不映射）。
+    #[test]
+    fn shift_letter_mapping_compose_only() {
+        let (mut eng, dir) = test_engine("ssletter");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("A".into(), "×".into());
+        // 空态 Shift+A → 正常大写 A（不映射）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("A"), "空态 Shift+A=大写 A: {:?}", o.commit);
+        // 组段有候选（jd=就…）→ 顶首选就 + ×
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('j'));
+        eng.process_key(&mut s1, key('d'));
+        let o = eng.on_char(&mut s1, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("就×"), "有候选 Shift+A=首选+×: {:?}", o.commit);
+        assert!(s1.raw.is_empty(), "顶屏清缓冲");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【Shift+字母·双态开关 2026-10-10】「都生效」档（shift_letters_
+    // always 集合）：空态直出串、组段无候选也顶屏出串；默认档零回归
+    //（上测试覆盖）。用户规格：对话框二选一开关，记住选择。
+    #[test]
+    fn shift_letter_always_mode() {
+        let (mut eng, dir) = test_engine("ssletter2");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("A".into(), "×".into());
+        eng.config
+            .keymap
+            .shift_letters_always
+            .insert("A".into());
+        // 空态 Shift+A → 直出 ×（不再上屏大写 A）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("×"), "都生效档：空态直出串: {:?}", o.commit);
+        // 组段有候选 → 首选就 + ×
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('j'));
+        eng.process_key(&mut s1, key('d'));
+        let o = eng.on_char(&mut s1, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("就×"), "都生效档：有候选顶屏+串");
+        // 组段无候选（打了个空码再按）→ 也出串（顶空+×）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('z'));
+        eng.process_key(&mut s2, key('q'));
+        let o = eng.on_char(&mut s2, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("×"), "都生效档：无候选也出串: {:?}", o.commit);
+        // 大小写口径：集合存大写，查表用小写输入也命中（引擎内归一）
+        assert!(eng.shift_letter_always('a'), "小写查询归一命中");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // 【反查退格 2026-09-06】进反查后（raw 空）按退格=退出反查而非漏键。

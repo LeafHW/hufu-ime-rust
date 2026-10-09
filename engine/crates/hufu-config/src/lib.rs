@@ -301,6 +301,12 @@ pub struct KeymapSection {
     /// 语义输出（有候选=高亮候选+串；空态=串本身），覆盖内置 US shift
     /// 形态→标点映射（Shift+1 默认「！」）。空表=内置行为。
     pub shift_symbols: std::collections::HashMap<String, String>,
+    /// 【Shift+字母双态开关 2026-10-10】在集合里的大写字母（"A".."Z"）
+    /// =「都生效」档：空态 Shift+该字母=直出自定义串（不再上屏大写
+    /// 字母）、组段无候选也顶屏出串。缺省（不在集合）=「只在有候选
+    /// 时生效」（v1.7.5 行为，升级零差异）。设置页对话框预填该字母
+    /// 已存档位，并记住上次选择供下一个字母默认。
+    pub shift_letters_always: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

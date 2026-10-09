@@ -451,6 +451,11 @@ const SCHEMA_MAX: usize = 40;
 /// static mut 是数据竞争 UB（窗口期毫秒级）——改 OnceLock 原子安置。
 static OPEN_SETTINGS: std::sync::OnceLock<Sender<()>> = std::sync::OnceLock::new();
 
+/// 【设置窗唯一性·聚焦信号 2026-10-10】Ctrl+Shift+H 全局热键：只把已
+/// 打开的设置窗弹到最前（最小化恢复/被盖置顶），不开新窗。与
+/// OPEN_SETTINGS（Ctrl+Alt+H/托盘——存在则聚焦、不存在才开）分开。
+static FOCUS_SETTINGS: std::sync::OnceLock<Sender<()>> = std::sync::OnceLock::new();
+
 /// 外部（管道 op "settings"：语言栏「中」按钮点击）请求打开设置页
 pub fn open_settings() {
     if let Some(tx) = OPEN_SETTINGS.get() {
@@ -510,9 +515,15 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                 0
             }
             WM_HOTKEY => {
-                // Ctrl+Alt+H → 设置页（与托盘双击同通道）
+                // Ctrl+Alt+H → 设置页（存在则聚焦，不存在才开新窗）
                 if wparam == 0x4846 {
                     if let Some(tx) = OPEN_SETTINGS.get() {
+                        let _ = tx.send(());
+                    }
+                }
+                // Ctrl+Shift+H → 只聚焦已开的设置窗（不开新窗）
+                if wparam == 0x4847 {
+                    if let Some(tx) = FOCUS_SETTINGS.get() {
                         let _ = tx.send(());
                     }
                 }
@@ -663,13 +674,16 @@ fn nid_of(hwnd: isize) -> (NOTIFYICONDATAW, isize) {
 
 /// 在独立线程跑托盘消息循环。返回 (ask_quit 标志引用, 设置页请求接收端)。
 /// 传入 `quit_tx`：托盘退出时发 () 通知主循环退出。
+/// `focus_tx`【2026-10-10】：Ctrl+Shift+H 聚焦已开设置窗的信号通道。
 pub fn spawn(
     quit_tx: Sender<()>,
     open_tx: Sender<()>,
+    focus_tx: Sender<()>,
     shared: Option<std::sync::Arc<std::sync::Mutex<crate::host::Host>>>,
 ) {
     std::thread::spawn(move || unsafe {
         let _ = OPEN_SETTINGS.set(open_tx);
+        let _ = FOCUS_SETTINGS.set(focus_tx);
         if let Some(sh) = &shared {
             let _ = SHARED.set(sh.clone());
         }
@@ -724,6 +738,7 @@ pub fn spawn(
         // 自我提升；热键让设置入口与托盘可见性彻底解耦）。
         const MOD_ALT: u32 = 0x1;
         const MOD_CONTROL: u32 = 0x2;
+        const MOD_SHIFT: u32 = 0x4;
         const HOTKEY_ID_SETTINGS: i32 = 0x4846; // "HF"
         let hk = RegisterHotKey(
             hwnd,
@@ -732,6 +747,17 @@ pub fn spawn(
             0x48, /*'H'*/
         );
         let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
+        // 【设置窗聚焦热键 2026-10-10】Ctrl+Shift+H：已开的设置窗被
+        // 最小化/被盖住时弹到最前（用户规格）。与 Ctrl+Alt+H 分开：
+        // 本键只聚焦不开新窗；注册失败不致命。
+        const HOTKEY_ID_FOCUS: i32 = 0x4847; // "HG"
+        let hk2 = RegisterHotKey(
+            hwnd,
+            HOTKEY_ID_FOCUS,
+            MOD_CONTROL | MOD_SHIFT,
+            0x48, /*'H'*/
+        );
+        let _ = hk2;
                     // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
                     // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
                     // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。

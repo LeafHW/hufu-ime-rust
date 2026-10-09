@@ -993,6 +993,10 @@ mod export_util {
         Duoduo,
         /// QQ五笔：无头 `词\t码`
         Qq,
+        /// 机器人专用：无头 `码\t词`——「多多格式反过来的样子」
+        ///（2026-10-09 用户需求：词前/码前列序对调，纯两列无头无标记，
+        /// 供聊天机器人词库等机器消费方直接读取）
+        Robot,
     }
 
     impl ExportFormat {
@@ -1003,6 +1007,7 @@ mod export_util {
                 "rime" | "yaml" | "dict.yaml" => Self::Rime,
                 "duoduo" | "dd" => Self::Duoduo,
                 "qq" => Self::Qq,
+                "robot" | "jiqiren" | "机器人" | "机器人专用" => Self::Robot,
                 _ => Self::Sentence,
             }
         }
@@ -1125,6 +1130,12 @@ mod export_util {
             ExportFormat::Qq => rows
                 .iter()
                 .flat_map(|(c, texts)| texts.iter().map(move |(t, _)| format!("{t}\t{c}")))
+                .collect(),
+            // 机器人专用：`码\t词`（多多列序对调；纯两列无头无标记——
+            // 行序即生效序，与多多导出同一「纯序」拍板语义）
+            ExportFormat::Robot => rows
+                .iter()
+                .flat_map(|(c, texts)| texts.iter().map(move |(t, _)| format!("{c}\t{t}")))
                 .collect(),
         }
     }
@@ -1387,7 +1398,24 @@ mod export_util {
             assert_eq!(ExportFormat::parse("dict.yaml"), ExportFormat::Rime);
             assert_eq!(ExportFormat::parse("duoduo"), ExportFormat::Duoduo);
             assert_eq!(ExportFormat::parse("qq"), ExportFormat::Qq);
+            // 【机器人专用 2026-10-09】多多反过来（码\t词）
+            assert_eq!(ExportFormat::parse("robot"), ExportFormat::Robot);
+            assert_eq!(ExportFormat::parse("机器人专用"), ExportFormat::Robot);
             assert_eq!(ExportFormat::parse("乱码"), ExportFormat::Sentence);
+        }
+
+        #[test]
+        fn robot_format_renders_code_first() {
+            // 机器人专用 = 多多列序对调：`码\t词` 纯两列无头无标记
+            let rows = vec![(
+                "jhgk".to_string(),
+                vec![("就".to_string(), false), ("成就".to_string(), false)],
+            )];
+            let lines = render(&rows, ExportFormat::Robot);
+            assert_eq!(lines, vec!["jhgk\t就".to_string(), "jhgk\t成就".to_string()]);
+            // 对照：多多=词\t码（列序相反）
+            let dd = render(&rows, ExportFormat::Duoduo);
+            assert_eq!(dd[1..], vec!["就\tjhgk".to_string(), "成就\tjhgk".to_string()]);
         }
 
         #[test]

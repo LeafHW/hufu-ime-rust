@@ -102,6 +102,36 @@ impl Trie {
         out
     }
 
+    /// 【可延码判定 2026-10-09】prefix 之下是否还有严格更长的编码
+    ///（后代节点带词条）。completions 会把 prefix 自身词条也收进来，
+    /// 区分不了「叶子码」（;x → 唯一直出）与「可延伸码」（;m→;mn→
+    /// ;mnng → 等待延伸）——快符/符号唯一候选直出与可延等待的分界
+    /// 需要本方法（不含自身，只看孩子链）。
+    pub fn has_longer(&self, prefix: &str) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let mut cur = 0usize;
+        for ch in prefix.chars() {
+            match self.nodes[cur].children.get(&ch).copied() {
+                Some(n) => cur = n as usize,
+                None => return false,
+            }
+        }
+        let mut stack: Vec<usize> = Vec::new();
+        if let Some(nr) = self.nodes.get(cur) {
+            stack.extend(nr.children.values().map(|c| *c as usize));
+        }
+        while let Some(n) = stack.pop() {
+            let Some(nr) = self.nodes.get(n) else { continue };
+            if !nr.entries.is_empty() {
+                return true;
+            }
+            stack.extend(nr.children.values().map(|c| *c as usize));
+        }
+        false
+    }
+
     /// 从 `raw` 开头做最长匹配枚举：返回所有「raw 的前缀编码 → 条目」，
     /// 编码长度降序（长码优先，供整句解码枚举切分）。
     pub fn prefix_matches(&self, raw: &str) -> Vec<(usize, Vec<u32>)> {
@@ -240,6 +270,11 @@ impl Dict {
             .into_iter()
             .filter_map(|(_, idx)| self.entries.get(idx as usize))
             .collect()
+    }
+
+    /// 【可延码判定 2026-10-09】同 Trie::has_longer（严格更长编码存在）。
+    pub fn has_longer(&self, prefix: &str) -> bool {
+        self.trie.has_longer(prefix)
     }
 
     /// 整句解码用：raw 前缀的编码匹配（长码优先）。

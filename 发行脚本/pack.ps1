@@ -258,12 +258,34 @@ if ($liveMa -and (Test-Path $liveMa)) {
     }
 }
 
+# 【2026-10-10 用户拍板】出厂码表瘦身（镜像/回退两模式都执行；只动
+# 打包源，真机数据不碰）：①出厂不带「虎码单简」；②「五笔」=空壳方案
+# （只留必看说明，用户自己的五笔码表自己放进目录）；③数据\字体 目录
+# 废弃（字体双击装系统后到设置页选）。
+if (Test-Path "$SRC\码表\虎码单简") {
+    Remove-Item "$SRC\码表\虎码单简" -Recurse -Force
+    Write-Host '  [剔] 出厂方案: 虎码单简'
+}
+if (Test-Path "$SRC\码表\五笔") {
+    Get-ChildItem "$SRC\码表\五笔" -File | Where-Object { $_.Name -ne '必看！功能模块说明.txt' } | ForEach-Object {
+        Remove-Item $_.FullName -Force
+        Write-Host "  [剔] 五笔出厂瘦身: $($_.Name)"
+    }
+}
+if (Test-Path "$SRC\数据\字体") {
+    Remove-Item "$SRC\数据\字体" -Recurse -Force
+    Write-Host '  [剔] 数据\字体（废弃目录）'
+}
+
 # 每个方案文件夹必须有功能两件套（必看说明+快符——{} 功能词载体）
 # 【2026-09-07】核验移出镜像块：真机回退模式（沿用打包源）同样核验
 $maDirs = Get-ChildItem "$SRC\码表" -Directory
 foreach ($d in $maDirs) {
     [void](Check (Test-Path "$($d.FullName)\必看！功能模块说明.txt") "码表\$($d.Name)\必看！功能模块说明.txt")
-    [void](Check (Test-Path "$($d.FullName)\快符.txt") "码表\$($d.Name)\快符.txt")
+    # 【2026-10-10】五笔=空壳方案（只带说明），不要求快符
+    if ($d.Name -ne '五笔') {
+        [void](Check (Test-Path "$($d.FullName)\快符.txt") "码表\$($d.Name)\快符.txt")
+    }
 }
 [void](Check (Test-Path "$SRC\码表\虎整句\补充语料.txt") '虎整句\补充语料.txt（整句提权词表）')
 if ($liveMa -and (Test-Path $liveMa)) { Write-Host "  [OK] 真机码表已镜像（$($maDirs.Count) 个方案）" }
