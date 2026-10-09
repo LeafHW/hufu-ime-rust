@@ -256,6 +256,10 @@ pub fn dispatch(
                             if !act_code_s.is_empty() {
                                 let _ = h.engine.adjust_set_order(&s, &act_code_s);
                             }
+                            // 【占位符变号·显示同步 2026-10-09】落盘词表
+                            // 已改号，重建会话的候选文本同步成新号再拷回
+                            // 活会话（否则窗口仍显 ③，重开才见 ④）。
+                            let _ = h.engine.sync_placeholder_texts(&mut s);
                             // 【显示序回写 2026-10-07】重建列表上的新序
                             // 拷回**活会话**（raw/页/选保活会话原样——尾
                             // 巴态不翻转）；返回的 state 即活会话真值，
@@ -312,6 +316,9 @@ pub fn dispatch(
             if !act_code.is_empty() {
                 let _ = h.engine.adjust_set_order(&h.session, &act_code);
             }
+            // 【占位符变号·显示同步 2026-10-09】同上：落盘已改号，活会话
+            // 文本同步（raw/页/选不动，窗口立即显示 ④）。
+            let _ = h.engine.sync_placeholder_texts(&mut h.session);
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
             serde_json::json!({"ok": true, "state": state})
@@ -532,6 +539,19 @@ pub fn dispatch(
             host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
+        }
+        // 【占位符记忆 2026-10-09】加词框「占位符」勾选态读写。沙箱宿主
+        //（NTQQ 渲染进程）写不了 HKCU——记忆改由 server 落
+        // 数据\addword-ph.json，DLL 对话框构建回读/勾选即写都走管道。
+        "aw_ph_get" => serde_json::json!({"on": host.addword_ph}),
+        "aw_ph_set" => {
+            let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            host.addword_ph = on;
+            let _ = std::fs::write(
+                host.data_dir.join("addword-ph.json"),
+                serde_json::json!({"on": on}).to_string(),
+            );
+            serde_json::json!({"ok": true, "on": on})
         }
         // compartment 对账用【设值】而非切换：全局 compartment 变化
         // 时多个后台进程会各自收到 OnChange——若各自 toggle 会把共享

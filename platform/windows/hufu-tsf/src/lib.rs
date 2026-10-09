@@ -137,11 +137,26 @@ extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
 /// （%TEMP%\hufu-pad.bmp）供视觉/数值检查内边距。返回 1=成功。
 #[no_mangle]
 extern "system" fn hufu_test_pad_dump() -> i32 {
-    let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
-        eprintln!("pad-dump: skin op 失败");
-        return 0;
+    // 【皮肤直读 2026-10-08】HUFU_PAD_SKIN=<json 路径> 时不走管道（开发
+    // 沙箱禁命名管道），直接从文件读皮肤——字体/布局像素取证用。
+    let mut skin = match std::env::var("HUFU_PAD_SKIN")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| {
+            // 容忍 UTF-8 BOM（PowerShell Set-Content -Encoding UTF8 写带 BOM）
+            serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}'))
+                .ok()
+        })
+    {
+        Some(v) => v,
+        None => {
+            let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+                eprintln!("pad-dump: skin op 失败");
+                return 0;
+            };
+            resp.get("skin").cloned().unwrap_or(serde_json::Value::Null)
+        }
     };
-    let mut skin = resp.get("skin").cloned().unwrap_or(serde_json::Value::Null);
     // 候选数可用 HUFU_PAD_N 控制（默认 5；10=验证第 10 序号显示 0）
     let n = std::env::var("HUFU_PAD_N")
         .ok()

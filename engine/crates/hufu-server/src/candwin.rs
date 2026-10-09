@@ -485,7 +485,11 @@ fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
                 0,
                 0,
                 0,
-                0x86, /*DEFAULT_CHARSET*/
+                1, // DEFAULT_CHARSET=1。曾误传 0x86(=GB2312)——文件夹字体
+                // （Plangothic/文津宋体）未声明 936 代码页，GDI 映射器因
+                // 字符集不符甩给宋体（GetTextFaceW 实测），代画候选窗里
+                // 所有文件夹字体变成同一个宋体（用户「除霞鹜外都长
+                // 一样」实锤）。
                 0,
                 0,
                 4, /*ANTIALIASED*/

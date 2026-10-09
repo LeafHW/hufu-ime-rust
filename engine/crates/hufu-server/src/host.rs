@@ -116,6 +116,11 @@ pub struct Host {
     /// 有效期内 state 携带——DLL 预览候选窗弹在设置窗中心而非
     /// 陈旧光标处（用户实测「弹在屏幕中间位置不对」的修复）。
     pub preview_anchor: Option<((i64, i64), std::time::Instant)>,
+    /// 【占位符记忆改道 2026-10-09】加词框「占位符」勾选态。原先落
+    /// HKCU\Software\HuFu\addword_ph——NTQQ 渲染进程跑在低完整性沙箱，
+    /// 写 HKCU 静默失败（用户实测勾了不记）。改由 server（用户态、
+    /// 无沙箱）持久化到 数据\addword-ph.json，DLL 经管道读写。
+    pub addword_ph: bool,
 }
 
 impl Host {
@@ -152,6 +157,14 @@ impl Host {
             rerank_tx: None,
             skin_ver: 0,
             preview_anchor: None,
+            addword_ph: data_dir
+                .join("addword-ph.json")
+                .exists()
+                .then(|| std::fs::read_to_string(data_dir.join("addword-ph.json")).ok())
+                .flatten()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("on").and_then(|x| x.as_bool()))
+                .unwrap_or(false),
         };
         host.install_official_skins();
         mark("skins", &t0);

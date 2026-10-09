@@ -296,6 +296,11 @@ pub struct KeymapSection {
     pub map: std::collections::HashMap<String, String>,
     /// 无候选/空态映射（缺省回落 map 同键）。
     pub map_idle: std::collections::HashMap<String, String>,
+    /// 【Shift+符号自定义 2026-10-09】键=主键盘基础字符（数字 1-0 与
+    /// -=[]\;',./`），值=用户自定义输出串。中文态按 Shift+该键时顶屏
+    /// 语义输出（有候选=高亮候选+串；空态=串本身），覆盖内置 US shift
+    /// 形态→标点映射（Shift+1 默认「！」）。空表=内置行为。
+    pub shift_symbols: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

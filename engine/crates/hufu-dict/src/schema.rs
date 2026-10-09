@@ -437,6 +437,111 @@ impl Schema {
                     .map(|e| e.code.clone())
             })
     }
+
+    /// 【加词自动编码 2026-10-08】词的编码提示（加词框编码框预填）：
+    /// 词典/用户词已有 → best_code_of；新词 → 通用形码组词规则生成
+    ///（与 Rime encoder 常用公式同形，092K 等表自带的就是这三条）：
+    /// 2 字=AaAbBaBb、3 字=AaBaCaCb、4~10 字=AaBaCaZa（Z=末字）。
+    /// 每字取最短 ≥2 码（组词用全码位，一简 1 码不参组词），只有
+    /// 1 码的字退回 1 码尽力拼。仅供预填，用户可改。
+    pub fn word_code_hint(&self, word: &str) -> Option<String> {
+        if let Some(c) = self.best_code_of(word) {
+            return Some(c);
+        }
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < 2 || chars.len() > 10 {
+            return None;
+        }
+        let per: Vec<String> = chars
+            .iter()
+            .map(|c| {
+                let s = c.to_string();
+                self.dict
+                    .best_code_with_min_len(&s, 2)
+                    .map(|c| c.to_string())
+                    .or_else(|| self.dict.best_code_of(&s).map(|c| c.to_string()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let take2 = |i: usize| -> String { per[i].chars().take(2).collect() };
+        let take1 = |i: usize| -> String { per[i].chars().take(1).collect() };
+        let joined = match chars.len() {
+            2 => format!("{}{}", take2(0), take2(1)),
+            3 => format!("{}{}{}", take1(0), take1(1), take2(2)),
+            _ => {
+                let last = chars.len() - 1;
+                format!("{}{}{}{}", take1(0), take1(1), take1(2), take2(last))
+            }
+        };
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    /// 【码长截断 2026-10-09】按方案 max_code_length 截断的编码提示
+    ///（4 定方案曾生成 dhrtf 5 码没法打——用户实锤）。已收录词原码
+    /// 直出；生成码超长时逐级收：①末字贡献缩到 1 码（四字词
+    /// AaBaCaZb=dhrt）；②仍超长（5 字以上长词）取前 max-1 字首码+
+    /// 末字首码。
+    pub fn word_code_hint_capped(&self, word: &str, max: usize) -> Option<String> {
+        let raw = self.word_code_hint(word)?;
+        if max < 2 {
+            return Some(raw);
+        }
+        let raw_len = raw.chars().count();
+        if raw_len <= max {
+            return Some(raw);
+        }
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < 2 {
+            return Some(raw);
+        }
+        let per: Vec<String> = chars
+            .iter()
+            .map(|c| {
+                let s = c.to_string();
+                self.dict
+                    .best_code_with_min_len(&s, 2)
+                    .map(|c| c.to_string())
+                    .or_else(|| self.dict.best_code_of(&s).map(|c| c.to_string()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let first = |i: usize| -> char { per[i].chars().next().unwrap_or('a') };
+        // ① 末字缩 1 码（2 字词本来就是 4 码位不动）
+        let mut out: String = String::new();
+        match chars.len() {
+            2 => {
+                out.push(first(0));
+                out.push(
+                    per[0]
+                        .chars()
+                        .nth(1)
+                        .unwrap_or_else(|| per[1].chars().next().unwrap_or('a')),
+                );
+                out.push(first(1));
+                out.push(per[1].chars().nth(1).unwrap_or('a'));
+            }
+            _ => {
+                for i in 0..chars.len() - 1 {
+                    out.push(first(i));
+                }
+                out.push(first(chars.len() - 1));
+            }
+        }
+        // ② 仍超长：前 max-1 字首码 + 末字首码
+        if out.chars().count() > max {
+            out = (0..max.saturating_sub(1))
+                .filter_map(|i| chars.get(i).map(|_| first(i)))
+                .collect::<String>()
+                + &first(chars.len() - 1).to_string();
+        }
+        if out.is_empty() {
+            Some(raw)
+        } else {
+            Some(out)
+        }
+    }
 }
 
 #[cfg(test)]

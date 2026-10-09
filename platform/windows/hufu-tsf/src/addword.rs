@@ -18,20 +18,58 @@ use windows::core::*;
 const ID_WORD: i32 = 101;
 const ID_CODE: i32 = 102;
 const ID_POS: i32 = 103;
+/// 【占位符 2026-10-08】加词框「占位符补位」勾选框（选重位超出
+/// 现有候选数时用带圈数字 ③④… 补空位，词恰落第 N 位）。
+const ID_PH: i32 = 104;
 const ID_OK: i32 = 1001;
 const ID_CANCEL: i32 = 1002;
 
 // 预览动态项 id 段（CTLCOLOR 按段分色；GWLP_USERDATA 存文字 COLORREF）
 const ID_CUR_BASE: i32 = 2000; // 现有项
 const ID_AFT_BASE: i32 = 2200; // 加入后普通项
+const ID_AFT_PH: i32 = 2400; // 加入后占位项（③④… 用标签色压暗）
 const ID_AFT_NEW: i32 = 2600; // 加入后新词高亮项
 const ID_EN_UPDATE: u32 = 0x400; // EN_UPDATE（0x200 是 EN_KILLFOCUS！）
 
 const CLASS: PCWSTR = w!("HuFuAddWord");
-const WIN_W: i32 = 396;
-const PV_X: i32 = 16;
-const PV_W: i32 = 364; // 预览排版宽（候选流）
-const EDIT_W: i32 = 284; // 输入框宽（收窄，不再通栏）
+// 【整体加大 20% 2026-10-08】原布局 396/16/364/284 按 1.2 倍放大
+//（用户反馈加词框偏小，对齐虎爪弹窗观感）——原值注释在侧便于对照。
+const WIN_W: i32 = 475; // 396
+const PV_X: i32 = 19; // 16
+const PV_W: i32 = 437; // 364 预览排版宽（候选流）
+const EDIT_W: i32 = 341; // 284 输入框宽（收窄，不再通栏）
+/// 行几何（同批 1.2 倍）：首行 y、行距、标签高、编辑框下沉/高。
+const ROW_Y0: i32 = 17; // 14
+const ROW_PITCH: i32 = 74; // 62
+const LBL_W: i32 = 396; // 330
+const LBL_H: i32 = 29; // 24
+const EDIT_DY: i32 = 31; // 26
+const EDIT_H: i32 = 40; // 33
+/// 三行编辑框之后的占位符勾选行 y（ROW_Y0+3*ROW_PITCH+EDIT_DY+EDIT_H
+/// 之上留 6px）与预览表头/预览起始 y。
+const PH_ROW_Y: i32 = 242;
+const PV_TITLE_Y: i32 = 276; // 原 202
+const PV_START_Y: i32 = 306; // 原 228
+/// 按钮几何（1.2 倍）。
+const BTN_OK_X: i32 = 259; // 216
+const BTN_CANCEL_X: i32 = 373; // 311
+const BTN_W: i32 = 98; // 82
+const BTN_H: i32 = 41; // 34
+
+/// 带圈数字（占位符）：1-20 → ①…⑳（U+2460+），21-35 → ㉑…㉟，
+/// 36-50 → ㊱…㊿；越界 None（选重位超 50 不补位）。
+fn circled_num(n: usize) -> Option<String> {
+    let c = if (1..=20).contains(&n) {
+        char::from_u32(0x2460 + n as u32 - 1)
+    } else if (21..=35).contains(&n) {
+        char::from_u32(0x3251 + n as u32 - 21)
+    } else if (36..=50).contains(&n) {
+        char::from_u32(0x32B1 + n as u32 - 36)
+    } else {
+        None
+    };
+    c.map(|ch| ch.to_string())
+}
 
 /// 皮肤数据（首次弹窗拉取；失败回退深色系）
 struct Skin {
@@ -85,6 +123,128 @@ fn lighten(c: u32, k: f32) -> u32 {
     b << 16 | g << 8 | r
 }
 
+// ── 【占位符记忆 2026-10-09】勾选态首选走 server 管道（server 落
+// 数据\addword-ph.json），HKCU 只作管道不通时的兜底——NTQQ 渲染进程
+// 跑在低完整性沙箱里写 HKCU 静默失败（用户实测「QQ 里勾了不记」的
+// 根因），而管道在沙箱宿主里打字本就必通。回读同款双路。──
+fn ph_remember(on: bool) {
+    if crate::ipc::call(&serde_json::json!({"op": "aw_ph_set", "on": on})).is_some() {
+        return;
+    }
+    ph_remember_hkcu(on);
+}
+
+fn ph_remember_hkcu(on: bool) {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            key: isize,
+            subkey: *const u16,
+            reserved: u32,
+            class: *const u16,
+            options: u32,
+            desired: u32,
+            sa: *const core::ffi::c_void,
+            result: *mut isize,
+            dispos: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            key: isize,
+            name: *const u16,
+            reserved: u32,
+            vtype: u32,
+            data: *const u8,
+            cb: u32,
+        ) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
+    }
+    unsafe {
+        let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
+        let name: Vec<u16> = "addword_ph".encode_utf16().chain([0]).collect();
+        let mut hkey: isize = 0;
+        if RegCreateKeyExW(
+            -2147483647i64 as isize, /* HKEY_CURRENT_USER */
+            sub.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            0x2002, /* KEY_SET_VALUE */
+            std::ptr::null(),
+            &mut hkey,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            let v: u32 = if on { 1 } else { 0 };
+            RegSetValueExW(
+                hkey,
+                name.as_ptr(),
+                0,
+                4, /* REG_DWORD */
+                &v as *const u32 as *const u8,
+                4,
+            );
+            RegCloseKey(hkey);
+        }
+    }
+}
+
+fn ph_recall() -> bool {
+    if let Some(r) = crate::ipc::call(&serde_json::json!({"op": "aw_ph_get"})) {
+        return r.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+    }
+    ph_recall_hkcu()
+}
+
+fn ph_recall_hkcu() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: isize,
+            subkey: *const u16,
+            reserved: u32,
+            desired: u32,
+            result: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: isize,
+            name: *const u16,
+            reserved: *mut u32,
+            vtype: *mut u32,
+            data: *mut u8,
+            cb: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
+    }
+    unsafe {
+        let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
+        let name: Vec<u16> = "addword_ph".encode_utf16().chain([0]).collect();
+        let mut hkey: isize = 0;
+        if RegOpenKeyExW(
+            -2147483647i64 as isize, /* HKEY_CURRENT_USER */
+            sub.as_ptr(),
+            0,
+            0x2001, /* KEY_QUERY_VALUE */
+            &mut hkey,
+        ) != 0
+        {
+            return false;
+        }
+        let mut v: u32 = 0;
+        let mut cb: u32 = 4;
+        let ok = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut v as *mut u32 as *mut u8,
+            &mut cb,
+        ) == 0
+            && v == 1;
+        RegCloseKey(hkey);
+        ok
+    }
+}
+
 /// 拉皮肤配色+字体（弹窗线程调用一次；失败回退深色+微软雅黑）。
 fn load_skin() {
     let mut g = SKIN.lock().unwrap_or_else(|p| p.into_inner());
@@ -127,9 +287,10 @@ fn load_skin() {
             .or_else(|| get_color("comment_text_color"))
             .unwrap_or(0xB5_A6_8A),
         font_face: utf16z(&face),
-        // 字号比皮肤候选窗大两档（弹窗阅读距离远；用户两轮要求加大）
-        font_pt: (font_pt + 6).max(17),
-        label_pt: (label_pt + 5).max(13),
+        // 字号比皮肤候选窗大两档再 ×1.2（弹窗阅读距离远；用户两轮
+        // 要求加大，2026-10-08 随窗口整体放大 20%）
+        font_pt: (((font_pt + 6) as f32 * 1.2).round() as i32).max(20),
+        label_pt: (((label_pt + 5) as f32 * 1.2).round() as i32).max(16),
         cand_spacing: cand_spacing.max(2),
     };
     unsafe {
@@ -347,6 +508,7 @@ fn open_common() {
             }
         }
         // 【三十六修·B1 残余竞态收口】tid 登记从这里（线程起手）移到
+        crate::tsf::trace("addword: 打开 v3（自动编码跟踪+占位符提示+20%放大）");
         // 下方窗口登记临界区内：连按 /jc 两线程同过前置检查时，双线程
         // 都在此 store tid → 后 store 者覆盖真窗口线程的 tid（悬挂），
         // in_window_thread() 对真小窗线程失真 → 直通门误判（词框打
@@ -483,7 +645,7 @@ fn open_common() {
         } else {
             "虎符 · 加词".encode_utf16().chain([0]).collect()
         };
-        let h = outer_h(if is_weight_mode() { 200 } else { 300 });
+        let h = outer_h(if is_weight_mode() { 240 } else { 360 }); // 200/300×1.2
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
             CLASS,
@@ -565,7 +727,9 @@ fn open_common() {
                 let foc = unsafe {
                     windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
                 };
-                let order = [ID_WORD, ID_CODE, ID_POS];
+                // 【编码/选重位对换 2026-10-08】Tab 环与行序同步：
+                // 词→选重位→编码→词（注释「词→编码→选重」同步更正）
+                let order = [ID_WORD, ID_POS, ID_CODE];
                 let cur = order.iter().position(|i| {
                     matches!(
                         unsafe { GetDlgItem(hwnd, *i) },
@@ -647,6 +811,19 @@ unsafe fn create_child(
 /// 【词框聚焦 2026-09-12】小窗首个 EDIT（词框）句柄——WM_ACTIVATE
 /// 激活时聚焦用（isize 规避 HWND 跨静态的 Sync 问题）。
 static FIRST_EDIT: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+/// 【编码自动跟踪 2026-10-08】编码框当前内容是否系自动填写（true=词框
+/// 每变都重算覆盖；用户手改过即 false，清空编码框回到 true）。
+static CODE_AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 我们自己 SetWindowTextW(ID_CODE) 触发的 EN_UPDATE 回声标记（不算
+/// 用户手改）。
+static SET_CODE_ECHO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 【回声风暴修复 2026-10-08 v3】最后一条**程序化写入**编码框的值。
+/// RichEdit 对邻近子窗扰动（预览销毁/重建 STATIC）会重发 EN_UPDATE——
+/// 回声旗标只够挡第一条，风暴重发的文本==最后写入值：据此识别，不算
+/// 用户手改（否则 CODE_AUTO 被误关 → 打第 2 个字起自动编码停摆，
+/// 用户实测「中→dg 有了，再打 心 还是 DG」的根因）。
+static CODE_LAST_SET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+use std::sync::atomic::Ordering;
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -689,14 +866,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     ),
                 ]
             } else {
+                // 【编码/选重位对换 2026-10-08】行序改为 词→选重位→编码
+                //（用户流程拍板：打词→选重位→少数情况才改编码，配合
+                // 编码框自动反查预填）。id 不变（ID_CODE/ID_POS），仅
+                // 行位与 Tab 序对换。
                 vec![
                     ("词（要打出的内容）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
-                    ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
                     (
                         "选重位（第几选，留空=首选）",
                         ID_POS,
                         WS_TABSTOP.0 | 0x80u32 | 0x2000u32,
                     ),
+                    ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
                 ]
             };
             // 【T4 根治·词框 RichEdit v2 2026-10-07】词框用 RichEdit50W
@@ -714,7 +895,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 crate::tsf::trace(&format!("awRich msftedit 载入={ok}"));
             }
             for (i, (label, id, extra)) in rows.iter().enumerate() {
-                let y = 14 + i as i32 * 62;
+                let y = ROW_Y0 + i as i32 * ROW_PITCH;
                 let lbl_txt = mk(label);
                 // 【词框实时编码 2026-10-07】词行标签给 id：EDIT 回退模式
                 // 下把编码尾巴显示在标签上（RichEdit 模式框内内联显示）。
@@ -726,8 +907,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0,
                     PV_X,
                     y,
-                    330,
-                    24,
+                    LBL_W,
+                    LBL_H,
                     if *id == ID_WORD { AW_LIVE_LABEL } else { 0 },
                 );
                 set_item_font(lbl, true);
@@ -741,9 +922,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WS_EX_CLIENTEDGE,
                     *extra,
                     PV_X,
-                    y + 26,
+                    y + EDIT_DY,
                     EDIT_W,
-                    33,
+                    EDIT_H,
                     *id,
                 );
                 if *id == ID_WORD {
@@ -761,9 +942,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             WS_EX_CLIENTEDGE,
                             *extra,
                             PV_X,
-                            y + 26,
+                            y + EDIT_DY,
                             EDIT_W,
-                            33,
+                            EDIT_H,
                             *id,
                         );
                         AW_RICH.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -771,7 +952,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         AW_RICH.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else if ed.0.is_null() {
-                    // 编码/选重位框 RichEdit 建失败——回退 EDIT（保数字
+                    // 选重位/编码框 RichEdit 建失败——回退 EDIT（保数字
                     // 框 ES_NUMBER 生效；词框才是 RichEdit 关键路径）
                     ed = create_child(
                         hwnd,
@@ -780,9 +961,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         WS_EX_CLIENTEDGE,
                         *extra,
                         PV_X,
-                        y + 26,
+                        y + EDIT_DY,
                         EDIT_W,
-                        33,
+                        EDIT_H,
                         *id,
                     );
                 }
@@ -825,10 +1006,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // 【右键调频菜单 2026-10-06】预填三框（词/编码/选重位）：
             // 消费即清——窗口复用/复开不残留旧值。
+            // 【v4·开窗重置自动态 2026-10-09】配合去掉「空值重新武装」：
+            // 每次开窗 CODE_AUTO 回 true（上次会话手改编码不再拖累本次
+            // 自动反查）；预填写编码触发的 EN_UPDATE 随即置 false（调用
+            // 方给的编码视为手改——次序保证此语义不变）。
+            CODE_AUTO.store(true, std::sync::atomic::Ordering::Relaxed);
+            SET_CODE_ECHO.store(false, std::sync::atomic::Ordering::Relaxed);
+            *CODE_LAST_SET.lock().unwrap_or_else(|p| p.into_inner()) = None;
             {
                 let prefill = PREFILL.lock().unwrap_or_else(|p| p.into_inner()).take();
                 if let Some((w, c, p)) = prefill.filter(|_| !is_weight_mode()) {
-                    for (id, t) in [(ID_WORD, w), (ID_CODE, c), (ID_POS, p)] {
+                    // 【预填次序 2026-10-08】先编码/选重位后词：编码预填
+                    // 触发的 EN_UPDATE 会把 CODE_AUTO 置 false（调用方给
+                    // 的编码视为手改），词框后填即不会再触发自动反查覆盖。
+                    for (id, t) in [(ID_CODE, c), (ID_POS, p), (ID_WORD, w)] {
                         if let Ok(h) = GetDlgItem(hwnd, id) {
                             let v: Vec<u16> =
                                 t.encode_utf16().chain([0]).collect();
@@ -842,6 +1033,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             if !is_weight_mode() {
+                // 【占位符勾选 2026-10-08】选重位超出该码现有候选数时，
+                // 用带圈数字 ③④… 补空位使词恰落第 N 位（用户例：d 码
+                // 现有「中 哪个」，加「是」选 4 位 → 中 哪个 ③ 是）。
+                let ph_txt = mk("占位符（选重位超出时用 ③ ④ … 补齐空位）");
+                let chb = create_child(
+                    hwnd,
+                    w!("BUTTON"),
+                    PCWSTR(ph_txt.as_ptr()),
+                    WINDOW_EX_STYLE(0),
+                    WS_TABSTOP.0 | 0x3u32, // BS_AUTOCHECKBOX=0x3！曾误传
+                    // 0x2=BS_CHECKBOX（手动状态型：点击不自动打勾）——
+                    // 「点不动」四轮反馈的绝对根因：BN_CLICKED 每击必
+                    // 发，但盒子视觉恒空、BM_GETCHECK 恒 0，勾选逻辑
+                    // 从未真正生效过
+                    PV_X,
+                    PH_ROW_Y,
+                    LBL_W,
+                    LBL_H,
+                    ID_PH,
+                );
+                set_item_font(chb, true);
+                // 【占位符记忆 2026-10-09】回读上次勾选态（BM_SETCHECK
+                // 0x00F1）——开过就一直开，关过就一直关。
+                if ph_recall() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                        chb,
+                        0x00F1, /* BM_SETCHECK */
+                        WPARAM(1),
+                        LPARAM(0),
+                    );
+                }
                 let t1 = mk("该编码候选（实时，第 N 选参考）：");
                 let pt = create_child(
                     hwnd,
@@ -850,9 +1072,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WINDOW_EX_STYLE(0),
                     0,
                     PV_X,
-                    202,
-                    340,
-                    22,
+                    PV_TITLE_Y,
+                    408, // 340×1.2
+                    26,  // 22×1.2
                     0,
                 );
                 set_item_font(pt, true);
@@ -865,10 +1087,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     PCWSTR(btxt.as_ptr()),
                     WINDOW_EX_STYLE(0),
                     WS_TABSTOP.0,
-                    if id == ID_OK { 216 } else { 311 },
-                    260,
-                    82,
-                    34,
+                    if id == ID_OK { BTN_OK_X } else { BTN_CANCEL_X },
+                    PH_ROW_Y + 70, // 初始位（refresh_preview 钉底重排）
+                    BTN_W,
+                    BTN_H,
                     id,
                 );
                 set_item_font(btn, false);
@@ -909,6 +1131,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // 单条 `>= ID_CUR_BASE` 即覆盖两个普通段）
             let fg: u32 = if cid >= ID_AFT_NEW {
                 NEW_RED
+            } else if cid >= ID_AFT_PH {
+                // 【占位符 2026-10-08】占位项 ③④…：标签色压暗（区别
+                // 于真候选；序号+词同段同色）
+                c.label
             } else if cid >= ID_CUR_BASE {
                 c.text
             } else {
@@ -970,6 +1196,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COMMAND => {
             let id = (wp.0 as u32 & 0xFFFF) as i32;
             let notif = (wp.0 as u32 >> 16) as u32;
+            // 【Tab 到编码框光标置尾 2026-10-09】EN_SETFOCUS(0x0100) 时
+            // EM_SETSEL(尾,尾)：Tab 进编码框光标落在自动编码之后——
+            // 不满意直接退格改，不用先按 End/点框尾（用户规格）。
+            // 鼠标点击入框时本消息先行、点击定位随后覆盖，互不干扰。
+            if id == ID_CODE && notif == 0x0100 {
+                if let Ok(h) = GetDlgItem(hwnd, ID_CODE) {
+                    let n = unsafe { GetWindowTextLengthW(h) };
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                        h,
+                        0x00B1, /* EM_SETSEL */
+                        WPARAM(n as usize),
+                        LPARAM(n as isize),
+                    );
+                }
+                return LRESULT(0);
+            }
             // EN_UPDATE=0x400：文本每变一次立即刷（0x200 是 EN_KILLFOCUS，
             // 上版误用导致「光标移走才刷新」）
             if (id == ID_CODE || id == ID_POS || id == ID_WORD) && notif == ID_EN_UPDATE {
@@ -988,6 +1230,110 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 };
                 let (wv, cv, pv) = (rd(ID_WORD), rd(ID_CODE), rd(ID_POS));
+                // 【程序化写编码框的回声 2026-10-08】SET_CODE_ECHO 事件
+                // （我们自己 SetWindowTextW 触发）不算用户手改，编码保
+                // 持自动态，直接刷预览。
+                if id == ID_CODE && SET_CODE_ECHO.swap(false, Ordering::Relaxed) {
+                    unsafe { refresh_preview(hwnd) };
+                    return LRESULT(0);
+                }
+                if id == ID_CODE {
+                    // 【空格泄漏防御 2026-10-09】真机取证：/jc 上屏空格会经
+                    // 词框 TIP sink 双投——开窗 1 秒后编码框出现「 」，
+                    // ≠CODE_LAST_SET 被误判手改 → CODE_AUTO=false → 自动
+                    // 编码死（旧版靠「空值重新武装」硬撑，连带删空回填
+                    // bug）。编码框合法内容无空格：纯空白=泄漏，清空且
+                    // 不算手改。
+                    if !cv.is_empty() && cv.trim().is_empty() {
+                        if let Ok(h) = GetDlgItem(hwnd, ID_CODE) {
+                            SET_CODE_ECHO.store(true, Ordering::Relaxed);
+                            *CODE_LAST_SET
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) = Some(String::new());
+                            let _ =
+                                windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                                    h,
+                                    PCWSTR([0u16].as_ptr()),
+                                );
+                            return LRESULT(0);
+                        }
+                    }
+                    // 用户手改编码 → 停止自动跟踪（清空编码框即恢复）。
+                    // 【v3】文本==最后程序化写入值 = 预览销毁扰动重发的
+                    // 回声（旗标已被第一条消费），不算手改。
+                    // 【v5·空值不算手改 2026-10-09】真机取证：开窗首个
+                    // EN_UPDATE 常为空文本（控件创建/回声），对照
+                    // CODE_LAST_SET=None 必不等 → 误判手改 → 自动编码
+                    // 开窗即死（旧版靠「空值重新武装」续命，连带删空
+                    // 回填 bug）。空编码框不构成任何「改」——永不置
+                    // false；非空且≠最后程序化值才是手改。
+                    let storm_echo = cv.trim().is_empty() || {
+                        let last = CODE_LAST_SET.lock().unwrap_or_else(|p| p.into_inner());
+                        last.as_deref() == Some(cv.trim())
+                    };
+                    if !storm_echo {
+                        CODE_AUTO.store(false, Ordering::Relaxed);
+                    }
+                }
+                // 【自动填写编码·实时跟踪 2026-10-08 v2】词框每变一次
+                // （加字/减字/清空）都按当前词重算编码：自动态（编码框
+                // 空、或内容系自动填的）持续覆盖更新；用户手改过编码则
+                // 不再覆盖，清空编码框即恢复自动。首版「只填一次」不符
+                // 合打字节奏（用户反馈：打第 2 个字、回删 1 个字编码都
+                // 不更新）。
+                // 【v4·空值不再重新武装 2026-10-09】用户实锤：手删编码
+                // 删到空的一瞬间自动编码又回来了（RichEdit 风暴重发的
+                // 词框 EN_UPDATE 带「编码已空」命中 `|| cv.is_empty()`
+                // 重新武装 → 立即回填，只能 Ctrl+A 重打）。去掉空值
+                // 重新武装：手改（含删空）后自动永久停（重开窗重置，
+                // 见创建处）。
+                if !is_weight_mode() && id == ID_WORD {
+                    let auto = CODE_AUTO.load(Ordering::Relaxed);
+                    let wtrim = wv.trim().to_string();
+                    if auto {
+                        if wtrim.is_empty() {
+                            // 词清空 → 自动态下编码框同步清空（回声事件刷预览）
+                            if !cv.is_empty() {
+                                if let Ok(h) = GetDlgItem(hwnd, ID_CODE) {
+                                    SET_CODE_ECHO.store(true, Ordering::Relaxed);
+                                    *CODE_LAST_SET
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner()) = Some(String::new());
+                                    let _ =
+                                        windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                                            h,
+                                            PCWSTR([0u16].as_ptr()),
+                                        );
+                                    return LRESULT(0);
+                                }
+                            }
+                        } else if let Some(hint) = word_code(&wtrim) {
+                            if hint != cv.trim() {
+                                if let Ok(h) = GetDlgItem(hwnd, ID_CODE) {
+                                    let v: Vec<u16> =
+                                        hint.encode_utf16().chain([0]).collect();
+                                    SET_CODE_ECHO.store(true, Ordering::Relaxed);
+                                    CODE_AUTO.store(true, Ordering::Relaxed);
+                                    *CODE_LAST_SET
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner()) = Some(hint.clone());
+                                    crate::tsf::trace(&format!(
+                                        "addword: 自动编码 「{wtrim}」→ {hint}"
+                                    ));
+                                    let _ =
+                                        windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                                            h,
+                                            PCWSTR(v.as_ptr()),
+                                        );
+                                    // 触发的 ID_CODE 回声事件会带新编码刷预览。
+                                    return LRESULT(0);
+                                }
+                            }
+                        }
+                        // hint 查不到（如生僻内容）→ 保留现值，落到下面
+                        // 统一预览刷新。
+                    }
+                }
                 // 【RichEdit 数字过滤 2026-10-07】RichEdit 不认
                 // ES_NUMBER——选重位/加权权重框在 EN_UPDATE 剔除非
                 // 数字（写回后光标置尾）。
@@ -1032,6 +1378,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     *last = (wv, cv, pv);
                 }
                 unsafe { refresh_preview(hwnd) };
+            }
+            // 【占位符勾选 2026-10-08】勾/去勾即时重排预览（BN_CLICKED=0）
+            if id == ID_PH && notif == 0 {
+                let checked = match GetDlgItem(hwnd, ID_PH) {
+                    Ok(h) => {
+                        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            h,
+                            0x00F0, /* BM_GETCHECK */
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .0 as i32
+                            == 1
+                    }
+                    Err(_) => false,
+                };
+                crate::tsf::trace(&format!("addword: 占位符勾选事件 checked={checked}"));
+                // 【占位符记忆 2026-10-09】用户定调：这次开了下次进来还
+                // 开着，关了下下次也保持关——写 HKCU\Software\HuFu\
+                // addword_ph（REG_DWORD），对话框构建时回读。REG 支路
+                // 失败静默（记忆是锦上添花，不能阻塞勾选主流程）。
+                ph_remember(checked);
+                unsafe { refresh_preview(hwnd) };
+                return LRESULT(0);
             }
             let want = (id == ID_OK || id == ID_CANCEL || id == 1 || id == 2) && notif == 0;
             if want {
@@ -1117,6 +1487,8 @@ unsafe fn measure_w(s: &str, font_usize: usize) -> Option<i32> {
 
 /// 预览一行候选项：序号(label 色) + 词(text 色) 流式排列换行。
 /// 返回排版后的下一行 y。new_idx=加入后行中新词下标（高亮块）。
+/// 【占位符 2026-10-08】ph_start..ph_end 段为占位项（③④…），用
+/// ID_AFT_PH 段（标签色）压暗显示。
 unsafe fn draw_items(
     hwnd: HWND,
     y0: i32,
@@ -1125,6 +1497,8 @@ unsafe fn draw_items(
     new_idx: Option<usize>,
     id_base: i32,
     line_h: i32,
+    ph_start: usize,
+    ph_end: usize,
 ) -> i32 {
     let em = SKIN
         .lock()
@@ -1191,10 +1565,16 @@ unsafe fn draw_items(
         let tw = mw(t, if is_new { new_font } else { main_font }, em) + 2;
         let need = lw + tw + spacing;
         if x + need > right {
-            x = PV_X + 14; // 续行缩进
+            x = PV_X + 17; // 续行缩进（14×1.2）
             y += line_h;
         }
-        let base = if is_new { ID_AFT_NEW } else { id_base };
+        let base = if is_new {
+            ID_AFT_NEW
+        } else if i >= ph_start && i < ph_end {
+            ID_AFT_PH
+        } else {
+            id_base
+        };
         // 序号（新词行用高亮 id 段着色）
         let lbl_txt = utf16z(&label);
         let hl = create_child(
@@ -1299,7 +1679,7 @@ unsafe fn refresh_preview(hwnd: HWND) {
             WINDOW_EX_STYLE(0),
             0x80,
             PV_X,
-            156,
+            187, // 156×1.2（加权两行底 162 下留白）
             PV_W,
             em + 10,
             0,
@@ -1315,16 +1695,31 @@ unsafe fn refresh_preview(hwnd: HWND) {
     let code = read_box(ID_CODE).trim().to_string();
     let word = read_box(ID_WORD).trim().to_string();
     let pos: usize = read_box(ID_POS).trim().parse().unwrap_or(0);
+    // 【占位符 2026-10-08】勾选态（BM_GETCHECK；加权模式无此框恒 false）
+    let ph_on = match GetDlgItem(hwnd, ID_PH) {
+        Ok(h) => {
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                h,
+                0x00F0, /* BM_GETCHECK */
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .0 as i32
+                == 1 /* BST_CHECKED */
+        }
+        Err(_) => false,
+    };
 
     let line_h = SKIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .map(|s| s.font_pt + 14)
-        .unwrap_or(34);
+        .map(|s| s.font_pt + 17)
+        .unwrap_or(41);
 
     clear_items();
-    let mut y = 228;
+    let mut y = PV_START_Y;
+    let mut old_len_for_hint = 0usize;
     if code.is_empty() {
         // 占位提示
         let t = utf16z("（输入编码后显示该码候选）");
@@ -1354,17 +1749,64 @@ unsafe fn refresh_preview(hwnd: HWND) {
                 } else {
                     texts.clone()
                 };
-                y = draw_items(hwnd, y, "现有：", &cur, None, ID_CUR_BASE, line_h);
+                y = draw_items(hwnd, y, "现有：", &cur, None, ID_CUR_BASE, line_h, 0, 0);
                 if !word.is_empty() {
-                    // 与 server add / Schema 插入同规则模拟
+                    // 与 server add / Schema 插入同规则模拟。
+                    // 【占位符补位 2026-10-08】勾选且 pos-1 超出现有数
+                    // 时，用带圈数字 ③④… 补满空位使词恰落第 N 位（用户
+                    // 例：d 码现有「中 哪个」+加「是」选 4 位 →
+                    // 中 哪个 ③ 是；选 5 位 → 中 哪个 ③ ④ 是）。占位段
+                    // 传给 draw_items 用标签色压暗（ID_AFT_PH 段）。
                     let mut sim: Vec<String> =
                         texts.iter().filter(|t| **t != word).cloned().collect();
+                    let old_len = sim.len();
+                    old_len_for_hint = old_len;
+                    let mut ph_end = old_len;
+                    if ph_on && pos >= 1 && pos - 1 > old_len && pos <= 50 {
+                        for p in old_len..pos - 1 {
+                            if let Some(c) = circled_num(p + 1) {
+                                sim.push(c);
+                            }
+                        }
+                        ph_end = sim.len();
+                    }
+                    // 【占位符位加词=替换 2026-10-09】第 pos 位现有候选
+                    // 恰是占位词（带圈数字）→ 原位替换（server
+                    // /api/user_word/add 同规则：先 {删除}占位词再
+                    // {添加}pN，其余候选不动）；非占位位照旧插入后移。
+                    // 【判定口径·用户拍板 2026-10-09】纯形态判定，与
+                    // server 同规则：带圈数字即占位符，码表来源同样
+                    // 替换（占位符码表方案导入即用）。
                     let idx = if pos >= 1 {
-                        (pos - 1).min(sim.len())
+                        (pos as usize - 1).min(sim.len())
                     } else {
                         0
                     };
-                    sim.insert(idx, word.clone());
+                    let is_ph = sim
+                        .get(idx)
+                        .map(|t| {
+                            t.chars().count() == 1
+                                && t.chars()
+                                    .next()
+                                    .map(|c| {
+                                        let u = c as u32;
+                                        (0x2460..=0x2473).contains(&u)
+                                            || (0x3251..=0x325F).contains(&u)
+                                    })
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if is_ph {
+                        sim[idx] = word.clone();
+                    } else {
+                        sim.insert(idx, word.clone());
+                    }
+                    // 【预演取证 2026-10-09】用户报「词跑第2位、占位符在
+                    // 第4位」——纸面推演全部正确，落此痕下次实测直接对账。
+                    crate::tsf::trace(&format!(
+                        "addword 预演: ph={ph_on} pos={pos} old_len={old_len} idx={idx} → {}",
+                        sim.join("·")
+                    ));
                     // 「现有」与「加入后」隔开一行距，视觉分组
                     y = draw_items(
                         hwnd,
@@ -1374,6 +1816,8 @@ unsafe fn refresh_preview(hwnd: HWND) {
                         Some(idx),
                         ID_AFT_BASE,
                         line_h,
+                        old_len,
+                        ph_end,
                     );
                 }
             }
@@ -1401,10 +1845,42 @@ unsafe fn refresh_preview(hwnd: HWND) {
         }
     }
 
+    // 【占位符勾选反馈 2026-10-08 v2】勾选后无论预览内容是否变化都补
+    // 一行状态说明（勾选必可见反馈——空码/空词/候选已够时预览不变，
+    // 用户以为「点不动」的根因）。放预览区末尾，任何状态都画。
+    if ph_on {
+        let hint = if pos == 0 {
+            "☑ 占位符已开：填选重位 N（N 超出现有候选数+1）后预览即补 ③ ④ …"
+        } else if pos >= 1 && pos - 1 <= old_len_for_hint {
+            "☑ 占位符已开：现有候选已够排到该位，本次不补位"
+        } else {
+            "☑ 占位符已开：第 ③ 位起已按带圈数字补齐空位"
+        };
+        let t = utf16z(hint);
+        let h = create_child(
+            hwnd,
+            w!("STATIC"),
+            PCWSTR(t.as_ptr()),
+            WINDOW_EX_STYLE(0),
+            0,
+            PV_X,
+            y + 6,
+            PV_W,
+            line_h,
+            0,
+        );
+        set_item_font(h, true);
+        ITEMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(h.0 as isize);
+        y += line_h + 6;
+    }
+
     // 自适应：按钮钉底、窗口随高
-    let btn_y = y + 10;
-    let client_h = btn_y + 30 + 14;
-    for (id, dx) in [(ID_OK, 216), (ID_CANCEL, 311)] {
+    let btn_y = y + 12;
+    let client_h = btn_y + BTN_H + 17;
+    for (id, dx) in [(ID_OK, BTN_OK_X), (ID_CANCEL, BTN_CANCEL_X)] {
         if let Ok(ch) = GetDlgItem(hwnd, id) {
             let _ = SetWindowPos(
                 ch,
@@ -1462,6 +1938,38 @@ fn code_preview(code: &str) -> Option<Vec<String>> {
     })
 }
 
+/// GET /api/word_code?text=词 → 编码提示（词典反查最优码，新词按通用
+/// 组词规则生成）。【加词自动填码 2026-10-08】词框变动且编码框空时预填。
+fn word_code(text: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let enc: String = text
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let req = format!(
+        "GET /api/word_code?text={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    );
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", 4390)).ok()?;
+    // 读超时同 code_preview：预填路径在词框 EN_UPDATE 每键触发。
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    s.write_all(req.as_bytes()).ok()?;
+    let mut resp = String::new();
+    let _ = s.read_to_string(&mut resp);
+    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b)?;
+    let v: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
+    v.get("code")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_string())
+}
+
 /// 读输入框 → POST server 加词。
 unsafe fn submit(hwnd: HWND) {
     let read_edit = |id: i32| -> Option<String> {
@@ -1507,6 +2015,39 @@ unsafe fn submit(hwnd: HWND) {
     let code = code.trim().to_string();
     if word.is_empty() || code.is_empty() {
         return;
+    }
+    // 【占位符补位提交 2026-10-08】勾选且 pos-1 超出现有候选数时，
+    // 先按序提交带圈数字占位词条（③@p3、④@p4…——server {添加}pN
+    // 时序回放逐条落位），词最后落在恰好的第 N 位。与预览同规则。
+    let ph_on = match GetDlgItem(hwnd, ID_PH) {
+        Ok(h) => {
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                h,
+                0x00F0, /* BM_GETCHECK */
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .0 as i32
+                == 1
+        }
+        Err(_) => false,
+    };
+    if ph_on && pos_num >= 2 {
+        let existing = code_preview(&code)
+            .map(|texts| texts.iter().filter(|t| **t != word).count())
+            .unwrap_or(0);
+        if pos_num as usize - 1 > existing && pos_num <= 50 {
+            for p in existing..pos_num as usize - 1 {
+                if let Some(c) = circled_num(p + 1) {
+                    if !post_add(&code, &c, p as i64 + 1) {
+                        crate::tsf::trace(&format!(
+                            "addword 占位符 POST 失败: {code} -> {c} @{}",
+                            p + 1
+                        ));
+                    }
+                }
+            }
+        }
     }
     if post_add(&code, &word, pos_num) {
         crate::tsf::trace(&format!("addword ok: {code} -> {word} @{pos_num}"));

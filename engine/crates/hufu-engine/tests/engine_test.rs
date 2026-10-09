@@ -426,7 +426,11 @@ fn freq1500_priority_within_four_codes() {
     let cands = out.state.unwrap().candidates;
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(texts, vec!["写组", "的", "一"], "≤4 码纯频序: {texts:?}");
-    // wxyzx（5 码 >4）：同样原序——高权重「词组长码」在先
+    // wxyzx（5 码 >4）：同样原序——高权重「词组长码」在先。
+    // 【延长码精确命中 2026-10-08】auto_push 开着时第 5 键会直接上屏
+    // 精确命中的 5 码词条（见 extended_exact_code_commit）——本用例
+    // 锁的是 >4 码候选排序，观测前关掉顶屏。
+    engine.config.input.auto_push = false;
     engine.process_key(&mut session, key('y'));
     engine.process_key(&mut session, key('z'));
     let out5 = engine.process_key(&mut session, key('x'));
@@ -481,4 +485,124 @@ fn freq1500_singles_never_reorder_words_sink() {
     let cands = type_raw(&mut engine, "wx");
     let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(texts, vec!["象", "彻底", "𧰼"], "权重序: {texts:?}");
+}
+
+/// 【延长码精确命中 2026-10-08】092K 用户需求：max_code_length=4 且
+/// 「超最大码长自动上屏」「满最大码长唯一自动上屏」双开时——
+/// · iygg（恰好 4 码、全表唯一）→ 测试一下 满码唯一自动上屏；
+/// · kkkk（10+ 候选，首选 嘻嘻哈哈）+ 第 5 键 f：哆哆嗦嗦 另有 5 码
+///   延长词条 kkkkf → 直接上屏 哆哆嗦嗦（不是顶屏 kkkk 首选 嘻嘻哈哈）；
+/// · 无精确命中的第 5 键（tuja+t）→ 原 顶屏行为不变（顶首选、第 5 键
+///   为新起点）。
+#[test]
+fn extended_exact_code_commit() {
+    let dir = std::env::temp_dir().join(format!("hufu-ext-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dict_dir = dir.join("码表").join("虎码单字");
+    std::fs::create_dir_all(&dict_dir).unwrap();
+    std::fs::write(
+        dict_dir.join("tiger.dict.yaml"),
+        "---\nname: tiger\nsort: by_weight\n...\n\
+         测试一下\tiygg\t900\n\
+         嘻嘻哈哈\tkkkk\t900\n\
+         吃吃喝喝\tkkkk\t800\n\
+         哆哆嗦嗦\tkkkk\t700\n\
+         哆哆嗦嗦\tkkkkf\t950\n\
+         我们\ttuja\t500\n",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.schema.current = "虎码单字".into();
+    config.input.auto_push = true;
+    config.input.auto_select_unique = true;
+    let mut engine = Engine::new(&dir, config).unwrap();
+
+    // iygg：第 4 键满码唯一 → 自动上屏「测试一下」
+    let mut session = Session::new(true);
+    engine.process_key(&mut session, key('i'));
+    engine.process_key(&mut session, key('y'));
+    engine.process_key(&mut session, key('g'));
+    let out = engine.process_key(&mut session, key('g'));
+    assert_eq!(out.commit.as_deref(), Some("测试一下"), "iygg 满码唯一自动上屏");
+    assert!(out.state.unwrap().is_idle(), "上屏后缓冲清空");
+
+    // kkkk：多候选，第 4 键不上屏
+    let mut session = Session::new(true);
+    for c in ['k', 'k', 'k'] {
+        engine.process_key(&mut session, key(c));
+    }
+    let out4 = engine.process_key(&mut session, key('k'));
+    assert_eq!(out4.commit, None, "kkkk 多候选不自动上屏");
+    assert!(out4.state.unwrap().candidates.len() >= 3, "kkkk 需多候选场景");
+    // 第 5 键 f：延长码 kkkkf 精确命中 → 直接上屏「哆哆嗦嗦」
+    let out5 = engine.process_key(&mut session, key('f'));
+    assert_eq!(
+        out5.commit.as_deref(),
+        Some("哆哆嗦嗦"),
+        "kkkkf 延长码精确命中（不得顶屏 kkkk 首选「嘻嘻哈哈」）"
+    );
+    assert!(out5.state.unwrap().is_idle(), "延长码上屏后缓冲清空");
+
+    // 回归：第 5 键无精确命中（kkkkz 无词条）→ 仍走原顶屏（顶 kkkk
+    // 首选、第 5 键成为新起点）。tuja 类唯一 4 码在本配置下第 4 键
+    // 已被满码唯一收走，不能用作顶屏回归样本。
+    let mut session = Session::new(true);
+    for c in ['k', 'k', 'k', 'k'] {
+        engine.process_key(&mut session, key(c));
+    }
+    let out = engine.process_key(&mut session, key('z'));
+    assert_eq!(out.commit.as_deref(), Some("嘻嘻哈哈"), "无精确命中：原顶屏行为");
+    assert_eq!(out.state.unwrap().raw, "z", "普通顶屏：第 5 键成为新起点");
+}
+
+/// 【；去特化 2026-10-08】方案没有任何 ; 开头编码/快符数据时（092K
+/// 类码表），引导开关开着 ; 也不是引导键——空态直出「；」、不进 raw
+/// 不弹 ：/； 候选；编码态仍当次选选重键（开关不影响选重）。有 ; 数据
+/// 的方案（setup 默认快符 ;a/;b/;f）引导照旧，由 quick_symbol /
+/// punct_fullwidth 等既有用例锁定。
+#[test]
+fn semicolon_plain_key_without_semicolon_data() {
+    let dir = std::env::temp_dir().join(format!("hufu-semi-plain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dict_dir = dir.join("码表").join("虎码单字");
+    std::fs::create_dir_all(&dict_dir).unwrap();
+    // 注意：无 快符.txt、无 ; 开头词条——纯 092K 形状
+    std::fs::write(
+        dict_dir.join("tiger.dict.yaml"),
+        "---\nname: tiger\nsort: by_weight\n...\n\
+         我\tt\t900\n\
+         你\tt\t450\n\
+         来\ta\t800\n",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.schema.current = "虎码单字".into();
+    // semicolon_guide 保持默认 true——去特化后无数据也不再引导
+    let mut engine = Engine::new(&dir, config).unwrap();
+    let mut session = Session::new(true);
+
+    // 空态按 ; → 直出「；」，不弹候选不进 raw
+    let out = engine.process_key(&mut session, key(';'));
+    assert_eq!(out.commit.as_deref(), Some("；"), "无 ; 数据：空态 ; 直出全角分号");
+    assert!(out.state.unwrap().is_idle());
+
+    // 编码态：t 候选 [我,你]，; = 次选选重 → 上屏「你」（选重肌肉记忆不变）
+    engine.process_key(&mut session, key('t'));
+    let out = engine.process_key(&mut session, key(';'));
+    assert_eq!(out.commit.as_deref(), Some("你"), "编码态 ; 仍是次选键");
+    assert_eq!(out.state.unwrap().raw, "", "选重上屏后缓冲清空");
+
+    // 次选上屏后的空态再按 ; → 仍直出「；」
+    let out = engine.process_key(&mut session, key(';'));
+    assert_eq!(out.commit.as_deref(), Some("；"));
+
+    // 对照：同开关下写入 ; 快符数据并重载 → 引导恢复（;a 快符直上）
+    std::fs::write(dict_dir.join("快符.txt"), "！\t;a\n").unwrap();
+    engine.schema = hufu_dict::Schema::load(&dict_dir).unwrap();
+    let mut session = Session::new(true);
+    engine.process_key(&mut session, key(';'));
+    let st = engine.state(&session);
+    assert_eq!(st.raw, ";", "有快符数据：; 进 raw 引导");
+    let out = engine.process_key(&mut session, key('a'));
+    assert_eq!(out.commit.as_deref(), Some("！"), "有快符数据：;a 快符唯一直上");
 }

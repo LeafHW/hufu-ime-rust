@@ -1582,7 +1582,7 @@ impl CandidateWindowV2 {
                 dcomp: None,
                 target: None,
                 visual: None,
-                dwrite: Some(dwrite),
+                dwrite: Some(dwrite.clone()),
                 dxgi: Some(dxgi_dev.clone()),
                 ulw: true,
                 offscreen: None,
@@ -2570,7 +2570,9 @@ impl CandidateWindowV2 {
                 }
             };
             let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
-            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）
+            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）。
+            // 【字体文件夹退役 2026-10-09】私有字体集整链删除（用户定调：
+            // 只用系统已装字体，霞鹜优先/雅黑兜底），族名走系统集解析。
             let mk_tf = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
                 let mut b: Vec<u16> = fam.encode_utf16().collect();
                 b.push(0);
@@ -2592,6 +2594,26 @@ impl CandidateWindowV2 {
             // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
             let label_pt = layout_f(skin, "label_font_point", 0.0);
             let tf_key = (font_face.clone(), font_pt, label_pt);
+            // 【字体切换取证 2026-10-08】trace 开启且键变化时记录：皮肤
+            // 送来的 font_face、tf 缓存命中——真实应用内分支视角（逐帧
+            // 渲染，只在变化时落一条防刷屏）。
+            {
+                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32)>> =
+                    std::sync::Mutex::new(None);
+                let mut lt = LAST_FT.lock().unwrap_or_else(|p| p.into_inner());
+                if lt.as_ref() != Some(&tf_key) {
+                    *lt = Some(tf_key.clone());
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "cw2 font: face=「{font_face}」 pt={font_pt} cache_hit={}",
+                            tf_cache_in
+                                .as_ref()
+                                .map(|(k, _)| *k == tf_key)
+                                .unwrap_or(false),
+                        ));
+                    }
+                }
+            }
             let tf_hit = tf_cache_in
                 .as_ref()
                 .map(|(k, _)| *k == tf_key)
@@ -2602,9 +2624,22 @@ impl CandidateWindowV2 {
                 tf_small = v.1.clone();
                 tf_label = v.2.clone();
             } else {
-                tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
-                tf_small =
-                    mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+                // 【雅黑兜底取证 2026-10-09】mk_tf(族名)=None 意味着系统集
+                // 拿不到该族 → 渲染雅黑——用户看到的「跟雅黑一样」若走
+                // 此路，落痕为证。
+                let mk_probe = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
+                    let r = mk_tf(fam, em);
+                    if r.is_none() && crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "cw2 mk_tf: 「{fam}」两集皆失败 → 雅黑兜底"
+                        ));
+                    }
+                    r
+                };
+                tf = mk_probe(&font_face, em)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em));
+                tf_small = mk_probe(&font_face, em * 0.78)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
                 // 文本垂直居中（高亮胶囊上下留白对称的关键）
                 for t in [&tf, &tf_small] {
                     if let Some(t) = t {

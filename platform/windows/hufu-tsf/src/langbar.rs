@@ -920,7 +920,8 @@ fn make_glyph_icon(ch: &str) -> isize {
             0,
             0,
             0,
-            0x86, // DEFAULT_CHARSET
+            1, // DEFAULT_CHARSET（曾误传 0x86=GB2312，注释标错——雅黑
+               // 声明了 936 所以碰巧没炸，正确值应为 1）
             0,
             0,
             4, // ANTIALIASED_QUALITY（灰度 coverage）

@@ -1484,7 +1484,18 @@ impl Engine {
             // 标点映射：shift+,→<→《、shift+'→"→“（智能配对）、shift+/
             // →?→？、shift+1→!→！。放在 '/' 符号命名空间之前（否则
             // shift+/ 被顿号分支先吃）。有编码态不受影响。
+            // 【Shift+符号自定义 2026-10-09】用户自定义串优先于内置
+            // 映射（空态=串本身直出）。
             if shift && session.raw.is_empty() {
+                if let Some(rep) = self
+                    .config
+                    .keymap
+                    .shift_symbols
+                    .get(&c.to_string())
+                    .cloned()
+                {
+                    return KeyOutcome::commit(rep, self.state(session));
+                }
                 if let Some(sf) = shift_form(c) {
                     if let Some((text, back)) = self.punct_output(session, sf) {
                         let mut o = KeyOutcome::commit(text, self.state(session));
@@ -1529,7 +1540,10 @@ impl Engine {
             // 【同日修正·用户规格】有候选时 ; 仍当选重键（次选）——空态
             // 才直出；编码态见下方「首选顶屏+；」前的选重分流。空态本就
             // 无候选可选，此分支不涉及选重。
-            if c == ';' && !shift && !self.config.input.semicolon_guide {
+            // 【；去特化 2026-10-08】判定从「仅看开关」改数据驱动：方案
+            // 无 ; 开头编码/快符数据时（092K 类），开着引导开关 ; 也不是
+            // 引导键——空态同样直出「；」，不弹 ：/； 候选。
+            if c == ';' && !shift && !self.semicolon_guide_active() {
                 return KeyOutcome::commit("；".to_string(), self.state(session));
             }
             // 【自定义选重键 2026-11】空态按自定义选重键：选重键语义是
@@ -1653,7 +1667,9 @@ impl Engine {
         //   ——开关只管引导语义，不得影响选重肌肉记忆），仅在无候选
         //   可选时才「首选顶屏+；」（含 ; 引导残态清理）。; 快符随之
         //   不可用。Shift+; 仍出「：」（Shift 形态拦截）。
-        if c == ';' && !shift && !self.config.input.semicolon_guide {
+        // 【；去特化 2026-10-08】本分支 =「; 不引导」统一落点：除开关
+        // 关闭外，方案无 ; 数据（092K 类）同样落此——; 就是普通符号键。
+        if c == ';' && !shift && !self.semicolon_guide_active() {
             if session.candidates.is_empty() {
                 session.clear();
                 return KeyOutcome::commit("；".to_string(), self.state(session));
@@ -1685,16 +1701,36 @@ impl Engine {
         }
         // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
         // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
-        if c == ';' && !shift && session.raw == ";" && self.config.input.semicolon_guide {
+        // 【;引导窗选重 2026-10-09】有候选且 ; 是选重键（次选/三选/
+        // 自定义）→ 按普通候选窗规则选重（用户实锤：raw=";" 时 ;;直上
+        // 抢在选重前，{撤回} 永远选不到）。经典快符窗 [：,；] 下 ;;
+        // 二选「；」与原直上结果同为「；」，无回归；; 非选重键或无
+        // 候选才走直上。
+        if c == ';' && !shift && session.raw == ";" && self.semicolon_guide_active() {
+            if !session.candidates.is_empty()
+                && (c == self.config.candidates.second_select
+                    || c == self.config.candidates.third_select
+                    || self.custom_select_rank(c).is_some())
+            {
+                return self.on_rank_key(session, c);
+            }
             session.clear();
             return KeyOutcome::commit("；".to_string(), self.state(session));
         }
         // 其他字符：有快符/符号延续（;x…）则继续组快符，
         // 无延续才打断「;」引导清缓冲重入（空格留给首选上屏）
+        // 【;引导窗选重 2026-10-09】候选在场时选重键（数字/次选/三选/
+        // 自定义）不当「非延续字符」清屏重打——引导窗与普通候选窗同
+        // 规则（用户实锤：数字 1/2 选不了 {重复上屏}/{撤回}）。
         if session.raw == ";"
-            && self.config.input.semicolon_guide
+            && self.semicolon_guide_active()
             && c != ' '
             && !self.has_continuation_prefix(&format!(";{c}"))
+            && !(!session.candidates.is_empty()
+                && (c.is_ascii_digit()
+                    || c == self.config.candidates.second_select
+                    || c == self.config.candidates.third_select
+                    || self.custom_select_rank(c).is_some()))
         {
             session.clear();
             return self.on_char(session, c, shift);
@@ -1742,7 +1778,28 @@ impl Engine {
         // 「中《」而非「中，」。置于选重/翻页/数字选重之前：Shift+1 是
         // 「！」不是数字选重、Shift+; 不是二选键。语义同编码态标点顶字
         //（提交首选后输出标点）。
+        // 【Shift+符号自定义 2026-10-09】自定义串优先；顶屏语义与内置
+        // 一致（首选/功能词上屏后接自定义串）。
         if shift {
+            if let Some(rep) = self
+                .config
+                .keymap
+                .shift_symbols
+                .get(&c.to_string())
+                .cloned()
+            {
+                let (first, fback) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .first()
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{rep}"), self.state(session));
+                o.back = fback;
+                return o;
+            }
             if let Some(sf) = shift_form(c) {
                 if let Some((text, back)) = self.punct_output(session, sf) {
                     // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
@@ -1762,6 +1819,26 @@ impl Engine {
             }
         }
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
+        // 【空码清屏·符号数字同治 2026-10-09】空码态（无候选无延续）
+        // 继续打编码字符由 after_append 的 auto_clear_empty 清屏重打，
+        // 但其余键各走各的老路径：数字→on_rank_key 无候选=吞键原地不动
+        //（用户实锤 fdqw+2 没反应）、选重键同样被吞、符号直接上屏。
+        // 用户定稿规格：**空码态按数字/符号 = 连带空码一起清空，该键
+        // 本身吞掉不上屏不透传**（与空格清空码同语义；要打这个键就
+        // 再按一次，那时是空态正常输出）。仅 auto_clear_empty 开时生
+        // 效；编码字符与空格不在此列（各自原路径）。
+        // 【整句豁免三开关 2026-10-09】整句流空码交解码器/退格处理，
+        // 此分支同 auto_clear_empty 主体一样不对整句生效。
+        if !session.raw.is_empty()
+            && session.candidates.is_empty()
+            && !self.has_continuation(&session.raw)
+            && !self.sentence_active()
+            && self.config.input.auto_clear_empty
+            && (c.is_ascii_digit() || c.is_ascii_punctuation())
+        {
+            session.clear();
+            return KeyOutcome::consumed(self.state(session));
+        }
         // 选重键（不构成编码延续时才作为选重）
         // 【自定义选重键 2026-11】自定义键同门：编码延续优先。
         if !extends {
@@ -1885,7 +1962,7 @@ impl Engine {
 
     /// 标点输出（全角/半角/引号配对/数字后点半角化）。
     /// 返回 (文本, 提交前回删数)——back>0 用于「1.」再按 . 替换为「。」。
-    fn punct_output(&mut self, session: &mut Session, c: char) -> Option<(String, u8)> {
+    fn punct_output(&self, session: &mut Session, c: char) -> Option<(String, u8)> {
         if !c.is_ascii_punctuation() {
             return None;
         }
@@ -1952,8 +2029,18 @@ impl Engine {
             return;
         }
 
-        // 满码唯一上屏
+        // 整句方案：超过最大码长后由整句解码器接管（不顶屏、不清屏）；
+        // 整句模式下死路同样不顶屏——编码留在缓冲区交给解码器组句
+        // 【整句豁免三开关 2026-10-09 用户拍板】超最大码长自动上屏/
+        // 满最大码长唯一自动上屏/空码自动清屏都只对非整句生效——
+        // 整句流里这三个自动化打断组句（满码唯一半路顶掉首选、空码
+        // 清屏把断供前缀丢给兜底）。sentence_mode 统一在此算，满码
+        // 唯一分支也要用。
+        let sentence_mode = self.sentence_active();
+
+        // 满码唯一上屏（整句豁免：不顶，候选照常展示交用户继续）
         if len == max_len
+            && !sentence_mode
             && self.config.input.auto_select_unique
             && session.candidates.len() == 1
         {
@@ -1961,9 +2048,6 @@ impl Engine {
             return;
         }
 
-        // 整句方案：超过最大码长后由整句解码器接管（不顶屏、不清屏）；
-        // 整句模式下死路同样不顶屏——编码留在缓冲区交给解码器组句
-        let sentence_mode = self.sentence_active();
         let sentence_takeover = sentence_mode && len > max_len;
 
         // 顶屏：仅超长顶屏（第 max+1 键，即最大码长 4 时的第 5 键）。
@@ -1976,6 +2060,40 @@ impl Engine {
         let over_length = len > max_len;
         if over_length && !sentence_mode && self.config.input.auto_push && !has_upper
         {
+            // 【延长码精确命中 2026-10-08】092K 类顶功码表词条码长可超
+            // max_code_length（如 哆哆嗦嗦=kkkkf）：第 max+1 键后 raw
+            // 整体恰为表内词条时——唯一则直接上屏该词（用户打第 5 键
+            // 就是用延长码消重码，顶屏会打出前 max 码首选「嘻嘻哈哈」，
+            // 虎爪/虎娘同款）；多候选则不顶屏、保留延长码候选供选重。
+            // 精确判定看候选 code 字段（candidates 为精确码域，code==raw
+            // 才算命中；` 超集副表 5 码词条同口径适用）。
+            let exact_hits: Vec<Candidate> = session
+                .candidates
+                .iter()
+                .filter(|c| c.code == session.raw)
+                .cloned()
+                .collect();
+            if exact_hits.len() == 1 {
+                let first = exact_hits.into_iter().next().unwrap();
+                if !first.text.starts_with('{') {
+                    self.learn(&first);
+                }
+                // 与 commit_first_inline 同口径：功能词 pair/动态解析
+                let (mut text, back, _) = self.resolve_dyn_pair(&first.commit_text().to_string());
+                if text.starts_with('{') {
+                    text = self.resolve_dynamic(&text);
+                }
+                session.clear();
+                session.pending_commit = Some(text);
+                session.pending_back = Some(back);
+                return;
+            }
+            if !exact_hits.is_empty() {
+                // 多候选延长码：不顶屏（顶了就丢掉用户正要选的延长
+                // 候选），保留候选交选重键/空格。第 max+2 键若仍无更
+                // 长精确码再按原顶屏走（prev_first 那时是延长码首选）。
+                return;
+            }
             if let Some(first) = prev_first {
                 // 提交追加前 raw 的首选，新 raw 从刚输入的字符重新开始
                 // 【功能词不学习】与 commit_first_inline 同口径：{撤回}/
@@ -2426,6 +2544,26 @@ impl Engine {
             return map.keys().any(|k| k.starts_with(s) || k == s);
         }
         false
+    }
+
+    /// 【；去特化 2026-10-08】; 是否作引导键改数据驱动：快符表或主码表
+    /// 存在 ; 开头编码（快符 ;x / 码表 ;…）才引导；没有则 ; 是普通
+    /// 符号键——空态直出「；」、编码态走选重/标点顶字原链路，不弹
+    /// ：/； 候选、不进 raw。设置页 semicolon_guide=false（纯标点档）
+    /// 恒不引导，原语义整体保留：判定从「仅看开关」变「开关 && 有数据」。
+    /// 【码表 ; 码优先 2026-10-09】用户把 {重复上屏}/{撤回} 写进码表
+    /// ; 码（QQ五笔 092K.dict.yaml）却发现两层都不通：开关关=; 钉死
+    /// 普通符号键；开关开=raw=";" 候选窗硬编码 [：,；]、码表词条永不可
+    /// 达。定案：**码表里明写的 ; 码=用户显式意图，无条件引导**（开关
+    /// 不再是总闸）；开关只管内置 ：/； 快捷候选与快符表——纯快符方案
+    ///（码表无 ; 码）开关关仍是「直出；」老语义不变。
+    fn dict_has_semicolon_codes(&self) -> bool {
+        !self.schema.dict.completions(";", 1).is_empty()
+    }
+
+    fn semicolon_guide_active(&self) -> bool {
+        (self.config.input.semicolon_guide && self.has_continuation_prefix(";"))
+            || self.dict_has_semicolon_codes()
     }
 
     /// 内联提交首选（顶屏 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
@@ -3480,7 +3618,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】置顶挤位后 ③→④ 跟号
+        self.reorder_epilogue(session)
     }
 
     /// 按 code+word 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
@@ -3506,7 +3645,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】删词塌位后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 【右键调频菜单 2026-10-06】把当前页第 idx 候选定到第 pos 选
@@ -3535,7 +3675,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】定到 N 位后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 【右键菜单·移一位=双向交换 2026-10-07】向前/向后一位的真实语义
@@ -3576,13 +3717,86 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】互换后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 按 code+word 置顶（内存 + 追加日志）。
     pub fn adjust_pin(&mut self, code: &str, word: &str) {
         self.schema.adjust.pin(code, word);
         self.append_adjust_log("{置顶}", code, word, None);
+    }
+
+    /// 【占位符变号 2026-10-09】带圈数字字符 → 数值（①-⑳ U+2460+，
+    /// ㉑-㉟ U+3251+）。非带圈数字返回 None。
+    fn circled_val(c: char) -> Option<u32> {
+        let u = c as u32;
+        match u {
+            0x2460..=0x2473 => Some(u - 0x2460 + 1), // ①-⑳
+            0x3251..=0x325F => Some(u - 0x3251 + 21), // ㉑-㉟
+            _ => None,
+        }
+    }
+
+    /// 【占位符变号 2026-10-09】位次（1 基）→ 带圈数字字符（1-20 →
+    /// ①…⑳，21-35 → ㉑…㉟；超界 None——加词框占位符上限即 35）。
+    fn circled_char(pos: usize) -> Option<char> {
+        if (1..=20).contains(&pos) {
+            char::from_u32(0x2460 + pos as u32 - 1)
+        } else if (21..=35).contains(&pos) {
+            char::from_u32(0x3251 + pos as u32 - 21)
+        } else {
+            None
+        }
+    }
+
+    /// 【占位符变号 2026-10-09】调频重排后，把「位次 ≠ 自身数字」的
+    /// 占位词条改号：③被挤到第 4 位 → 删 ③ 加 ④@p4（用户规格：占位
+    /// 符因调频产生变动时数字跟着候选位走）。幂等（号码正确的不动）；
+    /// 有改动返回 true（调用方再 refresh 一次以显示新号）。
+    fn renumber_placeholders(&mut self, session: &mut Session) -> bool {
+        // 先收集错位项（借用期内不能改 adjust）。
+        // 【判定口径·用户拍板 2026-10-09】纯形态判定：带圈数字即占位
+        // 符，码表（Dict）来源同样跟号——占位符码表方案导入即用。
+        let mut wrong: Vec<(String, String, usize)> = Vec::new(); // (code, 旧词, 新位)
+        for (i, cand) in session.candidates.iter().enumerate() {
+            if cand.source != CandidateKind::Dict && cand.source != CandidateKind::UserWord {
+                continue;
+            }
+            if cand.text.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(cand.text.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        wrong.push((cand.code.clone(), cand.text.clone(), i + 1));
+                    }
+                }
+            }
+        }
+        if wrong.is_empty() {
+            return false;
+        }
+        for (code, old, pos) in wrong {
+            let Some(newc) = Self::circled_char(pos) else { continue };
+            let new_word = newc.to_string();
+            // 删旧号（含旧 pN 行）+ 加新号到当前位
+            self.schema.adjust.remove(&code, &old);
+            self.append_adjust_log("{删除}", &code, &old, None);
+            self.schema.adjust.add_at(&code, &new_word, Some(pos));
+            self.append_adjust_log("{添加}", &code, &new_word, Some(pos));
+        }
+        self.pending_user_reload = true;
+        true
+    }
+
+    /// 调频 op 收尾公共段：重排后先补占位符变号（有变 → 再刷新一次），
+    /// 保证返回给 DLL 的 state 里 ③ 已是 ④。
+    fn reorder_epilogue(&mut self, session: &mut Session) -> KeyOutcome {
+        if self.renumber_placeholders(session) {
+            let keep_raw = session.raw.clone();
+            session.clear();
+            session.raw = keep_raw;
+            self.refresh_candidates(session);
+        }
+        KeyOutcome::consumed(self.state(session))
     }
 
     /// 按 code+word 软删（内存 + 追加日志）。
@@ -3640,7 +3854,7 @@ impl Engine {
     pub fn adjust_set_order(&mut self, session: &Session, code: &str) {
         // 只整序可管理词条（Dict/UserWord）——符号/整句候选写 pN 会
         // 落垃圾调整行。
-        let words: Vec<String> = session
+        let mut words: Vec<String> = session
             .candidates
             .iter()
             .filter(|c| matches!(c.source, CandidateKind::Dict | CandidateKind::UserWord))
@@ -3649,24 +3863,101 @@ impl Engine {
         if words.is_empty() {
             return;
         }
+        // 【占位符变号 2026-10-09】整序时带圈数字占位词跟号：移位后
+        // ③ 落在第 4 位 → 整序行写成 ④@p4（同码 {添加} 行整套覆盖，
+        // 旧 ③ 行自动清除）。
+        // 【判定口径·用户拍板 2026-10-09】纯形态判定：码表（Dict）带
+        // 圈词同样跟号——占位符码表方案导入即用，不区分来源。
+        for (i, w) in words.iter_mut().enumerate() {
+            if w.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(w.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        if let Some(newc) = Self::circled_char(i + 1) {
+                            *w = newc.to_string();
+                        }
+                    }
+                }
+            }
+        }
         self.schema.adjust.set_order(code, &words);
         self.rewrite_order_file(code, &words);
         self.pending_user_reload = true;
     }
 
-    /// 整序文件改写：读 用户调整.txt，清同码 {添加} 行，追加整套
-    /// `{添加}code\t词\tpN`（与内存 log 同形，回放等价）。
+    /// 【占位符位加词=替换 2026-10-09】编码 code 当前有效候选第 pos 位
+    /// （1 基）是占位词（带圈数字）时返回其文本——加词到该位应先删它
+    ///（用户规格：占位符位加词=原位替换，不整体挪位）。临时会话按码
+    /// 重建候选，不动全局会话。
+    /// 【判定口径·用户拍板 2026-10-09】**纯形态判定，不看来源**：该位
+    /// 是单个带圈数字（①-㉟）即占位符——码表（Dict）里带的占位符方案
+    /// 导入即用、与用户调整层占位符同规则（替换/跟号），不做区分
+    ///（曾试改「只认 UserWord 源」，用户否决：已有占位符的码表会乱）。
+    pub fn placeholder_at_pos(&mut self, code: &str, pos: usize) -> Option<String> {
+        if pos == 0 || code.is_empty() {
+            return None;
+        }
+        let mut s = Session::new(true);
+        for ch in code.chars() {
+            self.process_key(
+                &mut s,
+                KeyInput {
+                    key: KeyCode::Char(ch),
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+        }
+        let c = s.candidates.get(pos - 1)?;
+        if c.text.chars().count() == 1 {
+            Self::circled_val(c.text.chars().next()?)
+                .map(|_| c.text.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 【占位符变号·显示同步 2026-10-09】整序落盘后，把**活会话候选**里
+    /// 的带圈占位词文本同步成新号。adjust 层已由 adjust_set_order 改好；
+    /// 右键移位走「原位重排不重建」路径（防尾巴态翻转），不能
+    /// clear+refresh——这里只改显示文本，raw/页/选全不动，DLL 立即
+    /// 看到变号（用户实锤：③→④要重开候选才出现=显示没同步）。
+    /// 返回改了几条。
+    pub fn sync_placeholder_texts(&self, session: &mut Session) -> usize {
+        let mut n = 0;
+        for (i, c) in session.candidates.iter_mut().enumerate() {
+            if c.text.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(c.text.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        if let Some(nc) = Self::circled_char(i + 1) {
+                            c.text = nc.to_string();
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// 整序文件改写：读 用户调整.txt，清同码 {添加}/{整序} 行，写
+    /// `{整序}code` 标记 + 整套 `{添加}code\t词\tpN`（与内存 log 同形，
+    /// 回放等价——标记行使回放清空基础列表重建，快照即完整清单）。
     fn rewrite_order_file(&self, code: &str, words: &[String]) {
         let path = self.schema.dir.join("用户调整.txt");
         let prefix = format!("{{添加}}{code}\t");
         let pin_prefix = format!("{{置顶}}{code}\t");
+        let set_prefix = format!("{{整序}}{code}");
         let mut kept: Vec<String> = Vec::new();
         if let Ok(content) = std::fs::read_to_string(&path) {
             for l in content.lines() {
                 let t = l.trim_start();
                 // 同码 {添加} 行全清（整套覆盖）；同码且词在整序集内的
-                // {置顶} 行一并清（置顶归一成 pN，内存/文件同步）。
+                // {置顶} 行一并清（置顶归一成 pN，内存/文件同步）；
+                // 旧 {整序} 标记行也清（整套覆盖换新标记）。
                 if t.starts_with(&prefix) {
+                    continue;
+                }
+                if t.starts_with(&set_prefix) {
                     continue;
                 }
                 if t.starts_with(&pin_prefix) {
@@ -3681,6 +3972,7 @@ impl Engine {
             }
         }
         let mut out_lines = kept;
+        out_lines.push(set_prefix.clone());
         for (i, w) in words.iter().enumerate() {
             out_lines.push(format!("{{添加}}{code}\t{w}\tp{}", i + 1));
         }
@@ -4196,14 +4488,28 @@ impl Engine {
         }
 
         // 「;」引导标点候选：;+空格=：、;;=；直上
-        if self.config.input.semicolon_guide
+        // 【；去特化 2026-10-08】raw==";" 只在 semicolon_guide_active
+        //（开关开 && 有 ; 数据）时空态才进得来；此处再加同门防御——
+        // 老会话/方案热切等残态下不弹无源候选。
+        // 【码表 ; 码词条优先 2026-10-09】码表 ; 码词条（如 QQ五笔
+        // {重复上屏}/{撤回}）排最前——;+空格即首选功能；内置 ：/；
+        // 开关开时追加其后（开关关=纯码表词条，无 ：/；）。原实现硬
+        // 替换 [：,；] 导致码表词条永不可达（用户实锤）。
+        if self.semicolon_guide_active()
             && session.mode == InputMode::Normal
             && session.raw == ";"
         {
-            session.candidates = vec![
-                Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol),
-                Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol),
-            ];
+            let mut cands: Vec<Candidate> = self
+                .schema
+                .candidates(";")
+                .iter()
+                .map(|e| self.entry_to_candidate(e))
+                .collect();
+            if self.config.input.semicolon_guide || cands.is_empty() {
+                cands.push(Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol));
+                cands.push(Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol));
+            }
+            session.candidates = cands;
             return;
         }
 
@@ -4695,6 +5001,23 @@ impl Engine {
             char::from_digit(disp as u32, 10).unwrap()
         };
         format!("{}{}", base, disp_c)
+    }
+
+    /// 【Shift+符号预览 2026-10-09】设置页「Shift+符号」页签点键即问：
+    /// 该键的内置输出（US shift 形态→标点映射，空上下文近似）与
+    /// 自定义覆盖串。None 内置=该键不是 Shift 符号键（字母等）。
+    pub fn shift_symbol_preview(&self, base: char) -> Option<(String, Option<String>)> {
+        let builtin = shift_form(base).and_then(|sf| {
+            let mut scratch = crate::session::Session::new(true);
+            self.punct_output(&mut scratch, sf).map(|(t, _)| t)
+        })?;
+        let custom = self
+            .config
+            .keymap
+            .shift_symbols
+            .get(&base.to_string())
+            .cloned();
+        Some((builtin, custom))
     }
 
     pub fn state(&self, session: &Session) -> SessionState {
@@ -7065,6 +7388,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 【Shift+符号自定义 & 占位符变号 2026-10-09】
+    /// 1) keymap.shift_symbols 覆盖内置映射：Shift+7 空态直出「×」、
+    ///    编码态=首选「啊」+「×」；未自定义键（Shift+1）维持内置「！」。
+    /// 2) 调频后带圈占位词跟号：jd 码 [就,到的,加]，占位 ③@p3 →
+    ///    [就,到的,③,加]；「加」定到第 3 位 → ③ 落第 4 位自动变 ④。
+    #[test]
+    fn shift_symbol_custom_and_placeholder_renumber() {
+        let (mut eng, dir) = test_engine("ss_ph");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("7".into(), "×".into());
+        // 空态 Shift+7 → ×（覆盖内置 & → ＆…实际内置走标点表）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, '7', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("×"),
+            "空态自定义 Shift+7 直出×: {:?}",
+            o.commit
+        );
+        // 编码态：a → 候选「啊」，Shift+7 → 「啊×」
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('a'));
+        let o = eng.on_char(&mut s1, '7', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("啊×"),
+            "编码态=首选+自定义串: {:?}",
+            o.commit
+        );
+        // 未自定义：Shift+1 空态仍「！」
+        let mut s2 = Session::new(true);
+        let o = eng.on_char(&mut s2, '1', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("！"),
+            "未自定义键维持内置: {:?}",
+            o.commit
+        );
+
+        // 占位符变号
+        eng.adjust_place("jd", "③", 3);
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "③", "加"], "占位后: {texts:?}");
+        // 「加」定到第 3 位 → ③ 被挤到第 4 位应变 ④
+        let _ = eng.op_place_candidate_abs(&mut s, 3, 3);
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "加", "④"], "调频后 ③→④: {texts:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【占位符变号·显示同步 2026-10-09】右键移位（纯位次重排）路径：
+    /// op_move+adjust_set_order 落盘已改号，但会话候选文本不动（防
+    /// 尾巴态翻转不重建）——sync_placeholder_texts 只改文本，raw/页/
+    /// 选全不动，DLL 立即看到 ④（用户实锤：不同步=要重开候选才变号）。
+    #[test]
+    fn placeholder_renumber_sync_display() {
+        let (mut eng, dir) = test_engine("ss_sync");
+        eng.adjust_place("jd", "③", 3);
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 右键「向前移一位」等价：③(idx2) 与 加(idx3) 互换 → 加到 3 位
+        let _ = eng.op_move_candidate_abs(&mut s, 3, 2);
+        eng.adjust_set_order(&s, "jd");
+        // 会话文本此刻仍是 ③（落盘词表已是 ④）——同步后立即变
+        let before: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(before, vec!["就", "到的", "加", "③"], "同步前显示仍旧号");
+        let n = eng.sync_placeholder_texts(&mut s);
+        assert_eq!(n, 1, "改了一条");
+        let after: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(after, vec!["就", "到的", "加", "④"], "同步后立即显示 ④");
+        // raw/页不动的保证：仍处于组段态
+        assert_eq!(s.raw, "jd", "不重建：raw 保留");
+        // 回放口径：重查也应是 ④（调整层由 set_order 改好）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let texts: Vec<&str> = s2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "加", "④"], "重开候选同为 ④: {texts:?}");
+        // 【占位符位加词=替换 2026-10-09】加词助手的探测口径：占位位返
+        // 回词文本、非占位位 None（server 据此先写 {删除} 再 {添加}pN）
+        assert_eq!(eng.placeholder_at_pos("jd", 4).as_deref(), Some("④"));
+        assert_eq!(eng.placeholder_at_pos("jd", 1), None, "非占位位不加删行");
+        assert_eq!(eng.placeholder_at_pos("jd", 99), None, "越界位不加删行");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 整句方案码表域短码「前4000单字置顶」（二十三修 2026-10-09 用户
     /// 拍板）：独立段（无锁、raw≤4、无提前上屏前缀）时，表内单字整体
     /// 置顶（stable——同码单字组保码表原序），词/表外生僻保原序排后；
@@ -7210,10 +7625,176 @@ mod tests {
         assert_eq!(s5.mode, InputMode::Reverse, "反查可用时空态 ` 仍进反查");
     }
 
+    // 【空码清屏·符号数字同治 2026-10-09 用户定稿】fdqw 空码态按
+    // 数字/符号 = 连带空码一起清空、该键本身吞掉（不上屏不透传）；
+    // 编码字符照旧清屏重打（对照组）；开关关维持老行为。
+    #[test]
+    fn dead_code_symbol_digit_clear() {
+        let (mut eng, _dir) = test_engine("dead-sym");
+        eng.config.input.auto_clear_empty = true;
+
+        // fdqw 空码（fixture 无 f 起始编码，不满 max 保留在缓冲）
+        let mut s = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert_eq!(s.raw, "fdqw");
+        assert!(s.candidates.is_empty(), "fdqw 是空码");
+
+        // 数字：清空码 + 吞键（不上屏不透传）
+        let out2 = eng.process_key(&mut s, key('2'));
+        assert_eq!(out2.commit, None, "数字不上屏");
+        assert!(out2.consumed, "数字被吞（不透传给应用）");
+        assert!(s.raw.is_empty(), "空码被连带清掉");
+
+        // 符号：同样清空码 + 吞键（用户定稿：符号不要上屏）
+        let mut s3 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s3, key(ch));
+        }
+        let out3 = eng.process_key(&mut s3, key(','));
+        assert_eq!(out3.commit, None, "符号不上屏");
+        assert!(out3.consumed, "符号被吞");
+        assert!(s3.raw.is_empty());
+
+        // 对照：编码字符照旧清屏重打、新键为新起点
+        let mut s4 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s4, key(ch));
+        }
+        eng.process_key(&mut s4, key('a'));
+        assert_eq!(s4.raw, "a", "第 5 键为新起点（原 auto_clear 行为）");
+        assert!(!s4.candidates.is_empty(), "a 有候选（啊）");
+
+        // 开关关：空码态数字维持老行为（吞键、缓冲不动）——不越权
+        let (mut eng2, _dir2) = test_engine("dead-sym-off");
+        eng2.config.input.auto_clear_empty = false;
+        let mut s5 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng2.process_key(&mut s5, key(ch));
+        }
+        let out5 = eng2.process_key(&mut s5, key('2'));
+        assert_eq!(out5.commit, None);
+        assert_eq!(s5.raw, "fdqw", "开关关：空码缓冲不动（用户自管）");
+    }
+
+    // 【整句豁免三开关 2026-10-09 用户拍板】超最大码长自动上屏/满最大
+    // 码长唯一自动上屏/空码自动清屏（含空码态符号数字同治分支）都只
+    // 对非整句生效——整句流里三个自动化打断组句。对照断言：非整句同
+    // 数据下三个行为照常。
+    #[test]
+    fn sentence_exempts_three_auto_switches() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-整句三豁免-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句三豁免\naaaa\t唯\n",
+        )
+        .unwrap();
+
+        // 整句引擎（MockDec 有命中——真实整句流常态）
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        cfg.input.auto_push = true;
+        cfg.input.auto_select_unique = true;
+        cfg.input.auto_clear_empty = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "方案名带整句+auto_enable");
+
+        // ① 满码唯一：aaaa 第 4 键不上屏，缓冲保留
+        let mut s = Session::new(true);
+        let mut last = None;
+        for c in ['a', 'a', 'a', 'a'] {
+            last = Some(eng.process_key(&mut s, key(c)));
+        }
+        let out4 = last.unwrap();
+        assert_eq!(out4.commit, None, "整句：满码唯一不上屏");
+        assert_eq!(s.raw, "aaaa", "整句：缓冲保留");
+
+        // ② 超长顶屏：第 5 键（死路 z）不顶屏不清屏，raw 原样保留
+        //（非整句同数据会 commit 唯 + raw=z 新起点——见对照组）
+        let out5 = eng.process_key(&mut s, key('z'));
+        assert_eq!(out5.commit, None, "整句：超长不顶屏");
+        assert_eq!(s.raw, "aaaaz", "整句：缓冲保留（不清屏不重起）");
+
+        // ③ 空码清屏（含符号数字同治）：MockDecEmpty 才能造整句空码
+        let mut eng2 = Engine::with_schema_dir(&dir, {
+            let mut c = hufu_config::Config::default();
+            c.sentence.enabled = true;
+            c.sentence.auto_enable = true;
+            c.input.auto_clear_empty = true;
+            c
+        })
+        .unwrap();
+        eng2.set_sentence_decoder(Some(Arc::new(MockDecEmpty)));
+        let mut s2 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng2.process_key(&mut s2, key(c));
+        }
+        assert_eq!(s2.raw, "fdqw");
+        assert!(s2.candidates.is_empty(), "整句空码（解码器无命中）");
+        let outd = eng2.process_key(&mut s2, key('2'));
+        assert_eq!(outd.commit, None);
+        // 数字在整句流走选重锁语义（追加为锁后缀，pre-existing）——
+        // 豁免的断言点是空码没被 auto_clear_empty 清掉（fdqw 前缀保留）。
+        assert!(
+            s2.raw.starts_with("fdqw"),
+            "整句：空码不被数字连带清掉（raw={}）",
+            s2.raw
+        );
+        let mut s3 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng2.process_key(&mut s3, key(c));
+        }
+        let outs = eng2.process_key(&mut s3, key(','));
+        // 符号走标点顶字空码分支（清屏+全角上屏）——该路径非三开关
+        // 管辖，整句下保持原行为。
+        assert_eq!(outs.commit.as_deref(), Some("，"));
+        assert!(s3.raw.is_empty(), "标点顶字空码分支不受豁免影响");
+
+        // 对照组（非整句）：三行为全部照常
+        let mut eng3 = Engine::with_schema_dir(&dir, {
+            let mut c = hufu_config::Config::default();
+            c.input.auto_push = true;
+            c.input.auto_select_unique = true;
+            c.input.auto_clear_empty = true;
+            c
+        })
+        .unwrap();
+        assert!(!eng3.sentence_active());
+        // 满码唯一
+        let mut c1 = Session::new(true);
+        for c in ['a', 'a', 'a', 'a'] {
+            eng3.process_key(&mut c1, key(c));
+        }
+        assert_eq!(c1.raw, "", "非整句：满码唯一上屏后清缓冲");
+        // 超长顶屏（关掉满码唯一单看顶屏）
+        eng3.config.input.auto_select_unique = false;
+        let mut c2 = Session::new(true);
+        for c in ['a', 'a', 'a', 'a', 'z'] {
+            eng3.process_key(&mut c2, key(c));
+        }
+        assert_eq!(c2.raw, "z", "非整句：超长顶屏=前码上屏+新键新起点");
+        // 空码数字同治
+        let mut c3 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng3.process_key(&mut c3, key(c));
+        }
+        eng3.process_key(&mut c3, key('2'));
+        assert!(c3.raw.is_empty(), "非整句：空码被数字连带清掉");
+    }
+
     // 【；候选开关 2026-10-03】用户规格：「按『；』键给一个候选，1选：
     // 2选；」默认开；关闭后「按一下直出『；』并能顶屏」+同日修正「就算
     // 不开也不能影响选重」——有候选时 ; 照常当选重键（次选），无候选
     // 才直出/顶屏。候选档行为（: / ;; / ;xx 快符）由既有测试保障。
+    // 【夹具调整 2026-10-09】原夹具把 ;j 写进 main.txt——按「码表 ;
+    // 码优先」新口径那属于码表明写 ; 码（无条件引导），纯标点档夹具
+    // 改为 ; 编码只存在于 快符.txt（快符-only 方案，开关关=直出；老
+    // 语义不变）。码表 ; 码行为见 semicolon_dict_codes。
     #[test]
     fn semicolon_punct_mode() {
         let dir = std::env::temp_dir().join(format!("hufu-eng-semi-{}", std::process::id()));
@@ -7221,9 +7802,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("main.txt"),
-            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n;j\t；快符\n",
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n",
         )
         .unwrap();
+        std::fs::write(dir.join("快符.txt"), "；快符\t;j\n").unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.input.semicolon_guide = false; // 纯标点档
         let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
@@ -7270,6 +7852,93 @@ mod tests {
         let st = eng2.state(&s4);
         let texts: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["：", "；"], "候选档 1选：2选；");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【码表 ; 码优先 2026-10-09】用户把 {重复上屏}/{撤回} 写进码表 ;
+    // 码（QQ五笔 092K.dict.yaml，词 TAB 码两列；此处原生 code TAB word
+    // 同构）：**码表明写 ; 码=用户显式意图，无条件引导**——开关关也
+    // 生效（用户实锤「关了引导还不生效」）；词条排最前，开关开时内置
+    // ：/； 追加其后，;;=；直上。
+    #[test]
+    fn semicolon_dict_codes() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-semidict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\n;\t{重复上屏}\n;\t{撤回}\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.input.semicolon_guide = false; // 用户当前状态：开关关
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // 垫底：{重复上屏}/{撤回} 的显示与解析都依赖上屏历史——真机由
+        // host 收口 push_commit_history（DLL 提交后 server 调用），测试
+        // 直接调同款方法垫一条。
+        eng.push_commit_history("啊");
+
+        // 空态按 ; → 引导态（不再直出；），候选=码表词条、无 ：/；
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key(';'));
+        assert_eq!(s.raw, ";", "码表有 ; 码：开关关也进引导态");
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["{重复上屏}", "{撤回}"],
+            "开关关：纯码表词条，无内置 ：/；"
+        );
+        let st = eng.state(&s);
+        let shown: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(shown, vec!["啊", "↩撤回"], "显示层：重复上屏显上次内容/撤回显提示");
+
+        // 空格 → 首选 {重复上屏} 解析为上次上屏内容「啊」
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.as_deref(), Some("啊"), "空格提交 {{重复上屏}}=上次内容");
+        assert!(s.raw.is_empty(), "提交后缓冲清空");
+
+        // ;; → ; 是默认次选：二选 {撤回}=回删上次内容（用户实锤此路径
+        // 曾被 ;;直上 抢占）；历史只剩垫底「啊」→ back=1、无新文本。
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key(';'));
+        let out = eng.process_key(&mut s2, key(';'));
+        assert_eq!(out.commit.as_deref(), Some(""), ";;=二选{{撤回}}=空文本");
+        assert_eq!(out.back, 1, "{{撤回}} 回删 1 字（垫底的啊）");
+        assert!(s2.raw.is_empty());
+        // 撤回已消耗历史：再按 ; 窗口仍可引导，但 {重复上屏}/{撤回}
+        // 显示层无对象隐藏——行为归显示层，session 候选不变，此处不赘。
+
+        // 数字选重：1={重复上屏}=上次内容、2={撤回}=回删（用户实锤
+        // 曾被引导清理分支当非延续字符清屏重打）。
+        eng.push_commit_history("好");
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key(';'));
+        let out1 = eng.process_key(&mut s4, key('1'));
+        assert_eq!(out1.commit.as_deref(), Some("好"), "数字1 选 {{重复上屏}}");
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key(';'));
+        let out2 = eng.process_key(&mut s5, key('2'));
+        assert_eq!(out2.commit.as_deref(), Some(""), "数字2 选 {{撤回}}");
+        assert_eq!(out2.back, 1, "{{撤回}} 回删 1 字（好）");
+
+        // 开关开：码表词条在前，内置 ：/； 追加其后（断言在 session 层
+        //——显示层会把无历史功能词隐藏，与开关无关）
+        let mut cfg2 = hufu_config::Config::default();
+        cfg2.input.semicolon_guide = true;
+        let mut eng2 = Engine::with_schema_dir(&dir, cfg2).unwrap();
+        let mut s3 = Session::new(true);
+        eng2.process_key(&mut s3, key(';'));
+        let texts3: Vec<&str> = s3.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts3,
+            vec!["{重复上屏}", "{撤回}", "：", "；"],
+            "开关开：词条在前 ：/； 追加"
+        );
+
+        // 老语义不回退：码表无 ; 码 + 快符-only + 开关关 → 直出；
+        //（semicolon_punct_mode 改造后夹具已覆盖）
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

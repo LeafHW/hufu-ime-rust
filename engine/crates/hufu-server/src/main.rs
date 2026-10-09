@@ -14,6 +14,7 @@
 mod candwin;
 #[cfg(windows)]
 mod clipboard;
+mod fontinfo;
 mod host;
 mod http;
 mod overlay;
@@ -147,6 +148,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // 【字体文件夹退役 2026-10-09】私用字体装载删除——用户定调下拉只列
+    // 系统已装字体（霞鹜优先/雅黑兜底），数据\字体 文件夹不再使用。
     {
         // 【性能插桩】main 侧总戳（与 host.rs 的 Host::new 打点配套）
         // 【轮转 2026-09-11】启动追加了无上限增长——超 4MB 翻转 .old
@@ -1199,6 +1202,75 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .collect();
             Response::json(&serde_json::json!({"texts": texts}))
         }
+        ("GET", "/api/word_code") => {
+            // 【加词自动填码 2026-10-08】?text=词 → 编码提示：词典反查
+            // 最优码，新词按通用组词规则生成（虎爪/虎娘同款体验：只打
+            // 词+选重位，少数情况改编码）。词框变动且编码框空时预填。
+            // 【码长截断 2026-10-09】按方案 max_code_length 截断（4 定
+            // 方案 4 字词曾生成 dhrtf 5 码没法打——用户实锤）。
+            let text = req.query.get("text").cloned().unwrap_or_default();
+            let max = host.engine.config.input.max_code_length.max(2) as usize;
+            let code = host.engine.schema.word_code_hint_capped(&text, max);
+            Response::json(&serde_json::json!({"code": code}))
+        }
+        ("GET", "/api/fonts") => {
+            // 【字体下拉改系统字体 2026-10-09】用户定调：下拉=电脑里装了
+            // 什么就列什么（GDI 枚举 charset=936 简中族），不再维护
+            // 数据\字体 文件夹（文件夹字体在真实候选窗里从未生效过，
+            // 整条链路已删）。另带「默认字体」推荐：族名带「霞鹜」优先
+            // （用户各机霞鹜版本名不完全一致，只按关键字匹配），没有
+            // 霞鹜回微软雅黑——设置页空选/重置时自动落到它。
+            let mut families: Vec<String> = fontinfo::gdi_list_families_gb();
+            let default = families
+                .iter()
+                .find(|f| f.contains("霞鹜"))
+                .cloned()
+                .or_else(|| families.iter().find(|f| *f == "微软雅黑").cloned())
+                .unwrap_or_default();
+            families.sort_by(|a, b| {
+                let ka = a.contains("霞鹜") || a == "微软雅黑";
+                let kb = b.contains("霞鹜") || b == "微软雅黑";
+                kb.cmp(&ka).then_with(|| a.cmp(b))
+            });
+            let items: Vec<serde_json::Value> = families
+                .into_iter()
+                .map(|fam| serde_json::json!({"family": fam, "source": "system"}))
+                .collect();
+            Response::json(&serde_json::json!({"fonts": items, "default": default}))
+        }
+        ("GET", "/api/font_preview") => {
+            // 【字体样张 2026-10-09】?family=族名 → GDI 渲染样张 BMP。
+            // 设置页选中即看真实字形——遍黑体/宋体/雅黑肉眼难辨的字重
+            // 微差与衬线差异，一张图说清（渲染前 ensure_private_gdi_fonts
+            // 已在启动时装载，文件夹字体族名直出）。
+            let family = req.query.get("family").cloned().unwrap_or_default();
+            if family.is_empty() {
+                return Response::err(400, "family 缺失");
+            }
+            match fontinfo::render_font_preview_bmp(&family, "永国专虎符 Aa01") {
+                Some(bmp) => Response {
+                    status: 200,
+                    content_type: "image/bmp",
+                    body: bmp,
+                },
+                None => Response::err(500, "样张渲染失败"),
+            }
+        }
+        // 【Shift+符号预览 2026-10-09】?base=1 → 内置输出/自定义覆盖。
+        // 自定义按键页「Shift+符号」页签点键即问即显。
+        ("GET", "/api/shift_symbol") => {
+            let base = req.query.get("base").cloned().unwrap_or_default();
+            let r = base
+                .chars()
+                .next()
+                .and_then(|c| host.engine.shift_symbol_preview(c));
+            Response::json(&match r {
+                Some((builtin, custom)) => {
+                    serde_json::json!({"builtin": builtin, "custom": custom})
+                }
+                None => serde_json::json!({"builtin": null, "custom": null}),
+            })
+        }
         ("POST", "/api/user_word/add") => {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim();
@@ -1217,6 +1289,19 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 被旧删除行屏蔽的问题）后追加。
             let file = host.engine.schema.dir.join("用户调整.txt");
             rewrite_keep_lines(&file, code, text);
+            // 【占位符位加词=替换 2026-10-09】第 pos 位现有候选恰是占位
+            // 词（③④…）→ 先删它再添加——原位替换、其余候选不动
+            //（用户规格：d=「中 哪个 ③ ④ ⑤ …」加「都」@p4 →
+            // 「中 哪个 ③ 都 ⑤ …」，而不是整体挪位）。{删除}行写在
+            // {添加} 前，回放同效。
+            let del_line = if pos >= 1 {
+                host.engine
+                    .placeholder_at_pos(code, pos as usize)
+                    .filter(|ph| ph != text)
+                    .map(|ph| format!("{{删除}}{code}\t{ph}\n"))
+            } else {
+                None
+            };
             let line = if pos >= 1 {
                 format!("{{添加}}{code}\t{text}\tp{pos}\n")
             } else {
@@ -1231,6 +1316,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Ok(f) => f,
                 Err(e) => return Response::err(500, &format!("写入失败: {e}")),
             };
+            if let Some(dl) = del_line {
+                if let Err(e) = f.write_all(dl.as_bytes()) {
+                    return Response::err(500, &format!("写入失败: {e}"));
+                }
+            }
             if let Err(e) = f.write_all(line.as_bytes()) {
                 return Response::err(500, &format!("写入失败: {e}"));
             }

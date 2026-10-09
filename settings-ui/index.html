@@ -264,7 +264,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>编码字母表</label><input type="text" data-path="input.alphabet" style="width:230px"><span class="hint">默认 27 码元</span></div>
       <div class="field"><label>最大码长</label><input type="number" data-path="input.max_code_length" min="1" max="10"></div>
       <div class="checkline"><input type="checkbox" id="i-push"><label for="i-push">超最大码长自动上屏</label></div>
-      <div class="checkline"><input type="checkbox" id="i-uniq"><label for="i-uniq">满四码唯一自动上屏</label></div>
+      <div class="checkline"><input type="checkbox" id="i-uniq"><label for="i-uniq">满最大码长唯一自动上屏</label></div>
       <div class="checkline"><input type="checkbox" id="i-clear"><label for="i-clear" title="第「最大码长+1」键仍无解才清，且只清前面的码、该键本身保留为新输入（如最大码长 4：满 4 码的空码留在缓冲，打第 5 键时清前 4 码，第 5 键不清）">空码自动清屏<span class="sub">（满码+1 才清，保末键）</span></label></div>
       <div class="checkline"><input type="checkbox" id="i-enter"><label for="i-enter">回车清屏</label></div>
       <div class="field"><label>Tab 键</label><select id="i-tabmode" style="min-width:150px">
@@ -275,7 +275,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="i-ascii-p"><label for="i-ascii-p">中文态英文标点</label></div>
       <div class="checkline"><input type="checkbox" id="i-dunhao"><label for="i-dunhao">/=顿时直出，屏蔽码表内/相关内容</label></div>
       <div class="checkline"><input type="checkbox" id="i-bdunhao"><label for="i-bdunhao" title="勾选：空态按 \ 直接上屏「、」；不勾（默认）：打 \ 弹「、」候选，空格确认">\=顿号直出</label></div>
-      <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：按 ; 弹出候选，1选「：」2选「；」，;+空格=：、;;=；直上，;xx 快符可用；不勾：无候选时按 ; 直接上屏「；」（有编码且无候选时首选上屏+「；」），; 仍可当选重键，不再作引导键">;=冒号分号候选<span class="sub">（关=直出；不影响选重）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：方案里有 ; 开头的编码或快符（如 ;a）时，按 ; 引导——弹 ：/； 候选，;+空格=：、;;=；直上、;xx 快符；方案里没有 ; 数据时按 ; 就是普通符号键（直出「；」）。不勾：; 恒直出「；」（有编码且无候选时首选上屏+「；」），; 仍可当选重键">;=引导快符（按方案数据自动）<span class="sub">（无 ; 编码=普通符号键）</span></label></div>
       <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
     </div>
     <h3>候选</h3>
@@ -442,7 +442,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="row">
           <div class="checkline"><input type="checkbox" id="l-horiz"><label for="l-horiz">横排候选</label></div>
           <div class="checkline"><input type="checkbox" id="l-inline"><label for="l-inline">编码内联到应用</label></div>
-          <div class="field"><label>候选字体</label><input type="text" id="ap-font" style="width:170px" placeholder="留空=系统默认"></div>
+          <div class="field"><label>候选字体</label><select id="ap-font" style="width:190px" title="本机已安装的简体中文字体列表；清空=自动（名字带「霞鹜」优先，否则微软雅黑）"></select></div>
+          <div class="field" style="flex:1;min-width:300px"><label>字形预览</label><img id="ap-font-prev" alt="字体样张" style="max-height:64px;border:1px solid var(--border,#ccc);border-radius:6px;background:#fff;display:none" title="该字体真实渲染的样张（GDI，与候选窗同源字体表）"></div>
           <div class="field"><label>字号</label><input type="number" id="ap-size" min="10" max="60" step="0.5"></div>
           <div class="field"><label>圆角 <span class="val" id="l-radius-v"></span></label><input type="range" id="l-radius" min="0" max="40"></div>
           <div class="field"><label>高亮圆角 <span class="val" id="l-hr-v"></span></label><input type="range" id="l-hr" min="0" max="40"></div>
@@ -1276,6 +1277,43 @@ function bindSkin() {
     try { await saveSkin(); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
   };
   af.onchange = () => { SKIN.layout.font_face = af.value.trim(); saveSkinNow(); };
+  // 【字体样张 2026-10-09】选中即看该字体真实字形（server GDI 渲染，
+  // 与候选窗同源）——遍黑体/宋体/雅黑的字重与衬线差异一图可辨，
+  // 不用打字来回试。清空值隐藏样张。
+  {
+    const prev = $("#ap-font-prev");
+    const showPrev = () => {
+      const f = af.value.trim();
+      if (!f) { prev.style.display = "none"; return; }
+      prev.src = `/api/font_preview?family=${encodeURIComponent(f)}&t=${Date.now()}`;
+      prev.style.display = "inline-block";
+    };
+    af.addEventListener("change", showPrev);
+    setTimeout(showPrev, 300); // 初始值样张（rebuild 异步完成后）
+  }
+  // 【字体下拉 2026-10-09】下拉=本机已安装的简中字体（/api/fonts 枚举
+  // 系统 GDI 表，文件夹字体链路已退役）。清空=自动（霞鹜优先/雅黑
+  // 兜底——server 下发 default，各机霞鹜版本名不同按「霞鹜」关键字
+  // 匹配）。皮肤当前值不在列表时补显（手动改过 json 的老值不丢）。
+  {
+    const rebuild = async () => {
+      let all = [], dflt = "";
+      try { const r = await api("GET", "/api/fonts"); all = r.fonts || []; dflt = r.default || ""; } catch (_) {}
+      const fams = [...new Set(all.map(f => f.family))];
+      let cur = (SKIN.layout.font_face || "").trim();
+      // 当前值为空/旧文件夹字体（系统已不认）→ 落到推荐默认
+      if (!cur || !fams.includes(cur)) {
+        const d = dflt && fams.includes(dflt) ? dflt : fams.find(f => f.includes("霞鹜")) || "微软雅黑";
+        if (d) { SKIN.layout.font_face = d; cur = d; saveSkinQuiet(); }
+      }
+      const opts = [`<option value="">（自动：霞鹜优先，回退雅黑）</option>`]
+        .concat(fams.map(f => `<option value="${esc(f)}">${esc(f)}</option>`));
+      if (cur && !fams.includes(cur)) opts.push(`<option value="${esc(cur)}">${esc(cur)}（当前·手动）</option>`);
+      af.innerHTML = opts.join("");
+      af.value = cur;
+    };
+    rebuild();
+  }
   // 【序号字级联动 2026-09-08】字号变化时若联动开启，序号字级按原比例
   // 一起变（与滚轮缩放行为一致）；皮肤页只改字号不联动会导致序号
   // 字号失衡（用户实测「候选不好看」）。
@@ -2271,7 +2309,10 @@ async function init() {
    ①有候选时（config.keymap.map）②无候选时（config.keymap.map_idle，
    缺省「跟随有候选」）。功能：第1-10选重/重复上屏×4/撤回/清屏/上下
    翻页/切中英/顶屏/文字直出。冲突检测（编码字母表/翻页键/次选三选/
-   重复分配/左右 Shift 已映射提示）。「恢复默认按键」= 两表清空。
+   重复分配/左右 Shift 已映射提示）。「恢复默认按键（仅当前分页）」=
+   只清当前分页（主键盘键帽 / num* 小键盘键 / shift_symbols 全部），
+   清完立即应用（【2026-10-09】原「两表清空」一次性全清三页、对
+   Shift+符号页还不生效，按用户反馈重做；按钮也从页脚移到页首）。
    左右 Shift 独立键名 shiftleft/shiftright（通用 "shift" 兜底两侧同效）。
    保存时清除老配置里的 "escape" 残留映射（Esc 不可映射 2026-11）。
     【小键盘分页 2026-11】小键盘独立第二页（主键盘/小键盘页签），
@@ -2333,7 +2374,18 @@ function openKeymapEditor() {
       ["Num 1","Num 2","Num 3","Num回车"],
       ["Num 0","","Num .",""],
     ];
-    let pg = "main"; // main | num（分页状态，render 间保持）
+    /* 【Shift+符号页 2026-10-09】主键盘区（数字/字母/符号，无功能键）：
+       字母全灰不可改；数字与符号可点——点击显示 Shift+该键当前打出
+       什么，可直接换成任意串（如 Shift+7 → ×）。键位即基础字符。 */
+    const rowsShift = [
+      ["`","1","2","3","4","5","6","7","8","9","0","-","="],
+      ["q","w","e","r","t","y","u","i","o","p","[","]","\\"],
+      ["a","s","d","f","g","h","j","k","l",";","'"],
+      ["z","x","c","v","b","n","m",",",".","/"],
+    ];
+    const ssEditable = c => /[`0-9\-=[\];',./\\]/.test(c) && !/[a-z]/.test(c);
+    let ss = Object.assign({}, cfg.keymap && cfg.keymap.shift_symbols || {});
+    let pg = "main"; // main | num | shiftsym（分页状态，render 间保持）
     /* 键帽 → 引擎键名（config.keymap.map 键口径）。Esc 固定行为键
        （编码中清屏 / 空态撤回），不可映射——与 Ctrl/Win/Alt 同为
        展示位。【小键盘分页 2026-11】Num 0-9 → num0-9、加減乘除号 →
@@ -2365,8 +2417,17 @@ function openKeymapEditor() {
         const cls = mapped || idled ? "k asg" : (name ? "k" : "k dis");
         return `<div class="${cls}" data-n="${name}" style="min-width:${cap.length > 2 ? 64 : 46}px;height:46px"><div class="lb">${cap}</div>${badge}${ibadge}</div>`;
       };
-      const rows = pg === "num" ? rowsNum : rowsMain;
-      const kb2 = rows.map(row => `<div class="row2">${row.map(key2).join("")}</div>`).join("");
+      const rows = pg === "num" ? rowsNum : (pg === "shiftsym" ? rowsShift : rowsMain);
+      const kb2 = pg === "shiftsym"
+        ? rows.map(row => `<div class="row2">${row.map(cap => {
+            const editable = ssEditable(cap);
+            const custom = ss[cap];
+            const badge = custom ? `<div class="bd2" style="background:#7a4adf">↳ ${esc(custom).slice(0, 6)}</div>` : "";
+            const cls = editable ? (custom ? "k asg" : "k") : "k dis";
+            const disp = cap.length > 1 ? esc(cap) : (editable ? `<b>⇧+</b>${esc(cap)}` : esc(cap));
+            return `<div class="${cls}" data-ss="${editable ? esc(cap) : ""}" style="min-width:52px;height:52px;justify-content:center;align-items:center;font-size:15px"><div class="lb">${disp}</div>${badge}</div>`;
+          }).join("")}</div>`).join("")
+        : rows.map(row => `<div class="row2">${row.map(key2).join("")}</div>`).join("");
       const entries = Object.keys(km).concat(Object.keys(kmi).filter(k => !(k in km))).filter(k => km[k] || kmi[k]);
       const list2 = entries.length
         ? entries.map(k => {
@@ -2395,18 +2456,21 @@ function openKeymapEditor() {
 
       w.document.body.innerHTML = `
         <h2>⌨ 自定义按键</h2>
-        <div class="tip">点击任意按键设置两层效果：<b>有候选时</b>（打字中——映射触发前候选先顶屏，如打 d 候选「中」按 [ = 「中？」）与 <b>无候选时</b>（空态直出，可不同于有候选，如无候选直出「！」）。无候选默认跟随有候选设置。功能在<b>中文输入态、无 Shift/Ctrl/Alt 组合</b>时生效；编码延续中的字母键仍优先当编码。Ctrl/Alt/Win 仅作展示（组合键是应用快捷键，不可映射）；<b>左右 Shift 独立可映射</b>（LShift/RShift 各设各的；某侧映射后该侧单击不再切中英，另一侧不受影响；老配置里写 "shift" 的仍两侧同效）；<b>Esc 不可映射</b>（固定双行为：编码中清屏，空态按「Esc 撤回上次上屏」开关撤回）。<b>反引号键（1 左边）与小键盘全部按键</b>均可映射（小键盘与主排数字身份分开——主排数字是选重键；小键盘在 NumLock 开启形态下生效，NumLock 键本身不可映射）。注意：反引号键常被反查引导或超集编码占用，映射前先确认无冲突（下方冲突检测会提示）。改完「保存并应用」全局生效、重启保留。</div>
+        <div class="tip">「主键盘 / 小键盘」页：点击任意按键设置两层效果：<b>有候选时</b>（打字中——映射触发前候选先顶屏，如打 d 候选「中」按 [ = 「中？」）与 <b>无候选时</b>（空态直出，可不同于有候选，如无候选直出「！」）。无候选默认跟随有候选设置。功能在<b>中文输入态、无 Shift/Ctrl/Alt 组合</b>时生效；编码延续中的字母键仍优先当编码。Ctrl/Alt/Win 仅作展示（组合键是应用快捷键，不可映射）；<b>左右 Shift 独立可映射</b>（LShift/RShift 各设各的；某侧映射后该侧单击不再切中英，另一侧不受影响；老配置里写 "shift" 的仍两侧同效）；<b>Esc 不可映射</b>（固定双行为：编码中清屏，空态按「Esc 撤回上次上屏」开关撤回）。<b>反引号键（1 左边）与小键盘全部按键</b>均可映射（小键盘与主排数字身份分开——主排数字是选重键；小键盘在 NumLock 开启形态下生效，NumLock 键本身不可映射）。注意：反引号键常被反查引导或超集编码占用，映射前先确认无冲突（下方冲突检测会提示）。改完「保存并应用」全局生效、重启保留。「Shift+符号修改」页：单独自定义 Shift+数字/符号的输出（点击键→看当前输出→输入替换→保存即生效）。</div>
         <div class="pgbar">
           <button class="pgtab${pg === "main" ? " on" : ""}" data-pg="main">主键盘</button>
           <button class="pgtab${pg === "num" ? " on" : ""}" data-pg="num">小键盘</button>
+          <button class="pgtab${pg === "shiftsym" ? " on" : ""}" data-pg="shiftsym">Shift+符号修改</button>
+        </div>
+        <div class="bar topbar">
+          <button id="km-save" class="pri">保存并应用</button>
+          <button id="km-reset">恢复默认按键（仅当前分页）</button>
+          <span id="km-msg"></span>
         </div>
         <div class="kbwrap">${kb2}</div>
-        <div class="panel"><div class="col"><h3>当前功能映射</h3>${list2}</div><div class="col"><h3>冲突检测</h3>${cf2}</div></div>
-        <div class="bar">
-          <button id="km-save" class="pri">保存并应用</button>
-          <button id="km-reset">恢复默认按键（清空全部自定义）</button>
-          <span id="km-msg"></span>
-        </div>`;
+        ${pg === "shiftsym" ? `
+        <div class="tip" style="margin-top:10px">点亮的数字/符号键 = 可改：点击后显示 <b>Shift+该键现在打出什么</b>（内置默认或你已改的），输入替换内容保存即生效。打字时按 <b>Shift+该键</b>：有候选先上屏候选再出你换的串（顶屏语义），空态直接出串。字母区灰色不可改（Shift+字母=大写）。${Object.keys(ss).length ? "已自定义：" + Object.keys(ss).map(k => `Shift+${esc(k)}→${esc(ss[k])}`).join("、") : ""}</div>` : `
+        <div class="panel"><div class="col"><h3>当前功能映射</h3>${list2}</div><div class="col"><h3>冲突检测</h3>${cf2}</div></div>`}`;
       const style = w.document.createElement("style");
       style.textContent = `
         body{font-family:system-ui,"Microsoft YaHei";margin:18px;background:#f6f7fa;color:#222}
@@ -2427,6 +2491,7 @@ function openKeymapEditor() {
         .idle{color:#e07b2a}
         .cf{font-size:12.5px;color:#a00;line-height:1.7}.cf.ok{color:#2a7}
         .bar{display:flex;gap:10px;align-items:center}
+        .topbar{margin:0 0 12px}
         button{padding:7px 18px;border:1px solid #b8bfcc;border-radius:7px;background:#fff;cursor:pointer}
         button.pri{background:#4a7dff;color:#fff;border-color:#4a7dff}
         #km-msg{font-size:13px}
@@ -2480,12 +2545,56 @@ function openKeymapEditor() {
         };
       });
 
-      /* —— 分页切换（主键盘 / 小键盘） —— */
+      /* —— Shift+符号键点击（查当前输出 → 换串 → 保存） —— */
+      w.document.querySelectorAll(".k[data-ss]:not([data-ss=''])").forEach(el => {
+        el.onclick = async () => {
+          const base = el.dataset.ss;
+          let cur = "", builtin = "";
+          try { const r = await api("GET", "/api/shift_symbol?base=" + encodeURIComponent(base)); builtin = r.builtin || ""; cur = r.custom || ""; } catch (_) {}
+          const div = w.document.createElement("div");
+          div.style.cssText = "position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center;z-index:9";
+          div.innerHTML = `<div style="background:#fff;border-radius:10px;padding:18px 22px;box-shadow:0 4px 24px rgba(0,0,0,.2);min-width:360px">
+            <div style="font-size:14px;margin-bottom:12px">按键 <code>Shift+${esc(base)}</code>${builtin ? ` 现在打出：<b>${esc(cur || builtin)}</b>${cur ? `（内置默认是 ${esc(builtin)}）` : "（内置默认）"}` : ""}</div>
+            <div class="mrow"><span class="mlb" style="width:110px">替换为（可留空）：</span><input type="text" class="ssnew" style="width:180px;padding:6px 10px;border:1px solid #b8bfcc;border-radius:7px" placeholder="要打出的内容，如 ×" value="${esc(cur)}"></div>
+            <div style="font-size:12px;color:#888;margin:6px 0 0 118px">有候选时=候选上屏+此串；空态=直接出此串</div>
+            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+              <button class="ssok pri">保存</button>
+              ${cur ? '<button class="ssdel">恢复内置</button>' : ""}
+              <button class="ccl">取消</button>
+            </div>
+          </div>`;
+          w.document.body.appendChild(div);
+          const inp = div.querySelector(".ssnew");
+          inp.focus();
+          const save = async () => {
+            const v = inp.value;
+            cfg.keymap = cfg.keymap || {};
+            cfg.keymap.shift_symbols = cfg.keymap.shift_symbols || {};
+            if (v) { cfg.keymap.shift_symbols[base] = v; ss[base] = v; }
+            else { delete cfg.keymap.shift_symbols[base]; delete ss[base]; }
+            try {
+              const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+              if (!r.ok) throw new Error(r.status);
+            } catch (e) { msg("Shift+符号保存失败：" + e.message, "err"); }
+            div.remove(); render();
+          };
+          div.querySelector(".ssok").onclick = save;
+          const del = div.querySelector(".ssdel");
+          if (del) del.onclick = () => { inp.value = ""; save(); };
+          div.querySelector(".ccl").onclick = () => div.remove();
+        };
+      });
+
+      /* —— 分页切换（主键盘 / 小键盘 / Shift+符号） —— */
       w.document.querySelectorAll(".pgtab").forEach(b => {
         b.onclick = () => { pg = b.dataset.pg; render(); };
       });
 
       /* —— 保存 / 恢复默认 —— */
+      /* 【恢复=仅当前分页 2026-10-09】用户反馈：一键全清三个分页太猛，
+         且对 Shift+符号页不生效。改为按当前分页清（主键盘页只清主键盘
+         键帽、小键盘页只清 num* 键、Shift+符号页清全部 shift_symbols），
+         清完立即 POST 应用（不再要求再点保存）。 */
       w.document.getElementById("km-save").onclick = async () => {
         cfg.keymap = cfg.keymap || {};
         cfg.keymap.map = Object.assign({}, km);
@@ -2504,10 +2613,39 @@ function openKeymapEditor() {
           w.document.getElementById("km-msg").style.color = "#a00";
         }
       };
-      w.document.getElementById("km-reset").onclick = () => {
-        Object.keys(km).forEach(k => delete km[k]);
-        Object.keys(kmi).forEach(k => delete kmi[k]);
-        render();
+      w.document.getElementById("km-reset").onclick = async () => {
+        const pageName = pg === "num" ? "小键盘" : (pg === "shiftsym" ? "Shift+符号修改" : "主键盘");
+        if (pg === "shiftsym") {
+          const n = Object.keys(ss).length;
+          if (!n) { const m = w.document.getElementById("km-msg"); m.textContent = "本页已是默认（无自定义）"; m.style.color = "#888"; return; }
+          if (!w.confirm(`恢复「${pageName}」分页默认？该页 ${n} 项自定义将被清除并立即应用。`)) return;
+          cfg.keymap = cfg.keymap || {};
+          cfg.keymap.shift_symbols = {};
+          Object.keys(ss).forEach(k => delete ss[k]);
+        } else {
+          const caps = (pg === "num" ? rowsNum : rowsMain).flat();
+          const names = caps.map(cap2name).filter(Boolean);
+          const n = names.filter(k => km[k] || kmi[k]).length;
+          if (!n) { const m = w.document.getElementById("km-msg"); m.textContent = "本页已是默认（无自定义）"; m.style.color = "#888"; return; }
+          if (!w.confirm(`恢复「${pageName}」分页默认？该页 ${n} 个键的自定义将被清除并立即应用（其他分页按当前编辑内容一并保存）。`)) return;
+          names.forEach(k => { delete km[k]; delete kmi[k]; });
+          cfg.keymap = cfg.keymap || {};
+          cfg.keymap.map = Object.assign({}, km);
+          cfg.keymap.map_idle = Object.assign({}, kmi);
+          delete cfg.keymap.map.escape;
+          delete cfg.keymap.map_idle.escape;
+        }
+        const m = () => w.document.getElementById("km-msg");
+        try {
+          const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+          if (!r.ok) throw new Error(r.status);
+          render();
+          m().textContent = `已恢复「${pageName}」默认并应用 ✓`;
+          m().style.color = "#2a7";
+        } catch (e) {
+          m().textContent = "恢复失败：" + e.message;
+          m().style.color = "#a00";
+        }
       };
     };
     render();
