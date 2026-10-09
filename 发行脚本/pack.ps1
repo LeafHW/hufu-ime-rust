@@ -46,9 +46,12 @@ $repoInst = 'E:\DSH-KF\hufu\platform\windows\install'
 if (Test-Path "$repoInst\install.ps1") {
     foreach ($s in @('install.ps1','uninstall.ps1')) {
         if (Test-Path "$repoInst\$s") {
-            $rv = [IO.File]::ReadAllText("$repoInst\$s", [Text.Encoding]::UTF8)
-            $sv = [IO.File]::ReadAllText("$SRC\$s", [Text.Encoding]::UTF8)
-            if ($rv -cne $sv) {
+            # 【BOM 事故修复 2026-10-09】字节级比较（SHA256）：文本比较会把
+            # BOM 差异解码掉判「相同」→跳过拷贝→打包源保留无 BOM 旧件，
+            # PS5.1 中文乱码。BOM/字节任何差异都必须触发同步。
+            $rh = if (Test-Path "$SRC\$s") { (Get-FileHash "$SRC\$s" -Algorithm SHA256).Hash } else { $null }
+            $sh = (Get-FileHash "$repoInst\$s" -Algorithm SHA256).Hash
+            if ($rh -ne $sh) {
                 Copy-Item "$repoInst\$s" "$SRC\$s" -Force
                 Write-Host "  [同步] $s ← 仓内 platform\windows\install（单一事实源）" -ForegroundColor Cyan
             }

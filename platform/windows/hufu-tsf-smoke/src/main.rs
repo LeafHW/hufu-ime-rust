@@ -38,6 +38,28 @@ fn main() {
         }
         return;
     }
+    // 提权启用模式：hufu-tsf-smoke.exe enable —— 安装器专用，
+    // ITfInputProcessorProfiles::EnableLanguageProfile 把虎符永久加入
+    // 用户语言列表。这是设置页「添加输入法」同款的 CTF 原生路径：
+    // 只启用自己的 profile，物理上碰不到其他输入法的任何条目
+    //（2026-10-09 结构根治：替代安装器里的 Set-WinUserLanguageList
+    // 整表重写——该重写曾反复把别人机器上的其他输入法固化删除）。
+    if args.get(1).map(|s| s.as_str()) == Some("enable") {
+        unsafe {
+            let _ = OleInitialize(None);
+            let profiles: ITfInputProcessorProfiles =
+                CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+                    .expect("msctf profiles 不可用");
+            match profiles.EnableLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, BOOL(1)) {
+                Ok(()) => println!("OK 虎符已加入语言列表（EnableLanguageProfile）"),
+                Err(e) => {
+                    println!("EnableLanguageProfile 失败：{e:?}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        return;
+    }
     // 提权注册模式：hufu-tsf-smoke.exe reg [图标路径] —— 安装器专用，
     // 只做 msctf 注册（RegisterProfile 带图标 + 分类 + 激活）。须管理员；
     // 图标路径默认 DLL 自身（内嵌虎符资源）。

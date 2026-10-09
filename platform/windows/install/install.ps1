@@ -380,111 +380,41 @@ if (-not $NoHKLM) {
         $null = Invoke-SmokeReg $icon
 }
 
-# ── 4) 语言列表（虎符插第 0 位=默认输入法）+ 切换器装配 ──
-# 输入法按应用各自记忆选择：新开宿主（开始菜单搜索框、UWP 应用、
-# 新窗口）默认用列表第一项。追加到尾部会让这些宿主落回微软拼音，
-# 用户体验即「开始菜单/UWP 打不了中文」。插入第 0 位后新宿主默认
-# 虎符；已开应用/用户手动切过的选择不受影响（Win+空格随时可切回）。
-#
-# 【吃掉其他输入法·二阶根治 2026-10-06】语言列表是「读改写」：
-# Get-WinUserLanguageList 若瞬时少报（实测：新登录会话 ctfmon 尚未
-# 运行时，第三方 TIP 不被枚举），随后的 Set-WinUserLanguageList -Force
-# 会把没报上来的输入法从列表永久抹掉——10/02 的槽位修复只保住装配
-# 表，这条路没设防（用户实锤：18:00 重装后搜狗/多多/虎娘/虎爪 4 个
-# 输入法从列表消失，手动加回才恢复）。三重防线：
-#   ① ctfmon 未运行时先拉起再读列表（枚举需要 CTF 服务在线；此刻
-#      虎符注册已全部写完，ctfmon 冷启动即见到完整结构，兼当刷新）；
-#   ② 装配表（AssemblyItem 槽位）= 纯注册表事实源，先做快照——
-#      枚举说谎时的地面真值；
-#   ③ Set 后回读校验：快照里有、列表里没有的，一律并回重写一次。
+# ── 4) 语言列表——【结构根治 2026-10-09：CTF 原生 API，对齐虎爪】──
+# 【对齐虎爪 2026-10-09】虎爪（同为 TSF 输入法）安装卸载零事故的根
+# 因：全程只做 regsvr32/TSF 原生注册，从不重写语言列表。虎符此前为
+# 「装完自动进列表+默认首选」用了 Get/Set-WinUserLanguageList 整表
+# 读改写——重写会把「读时没枚举到的输入法」固化删除（他机实锤：装
+# 完别人的输入法被吞）。四层补救防线只救得回「快照看见过的」，救不
+# 了快照本身没看见的——修多少次都会复发。
+# 当晚再实锤：绕过 API 直接写注册表两个真存储（列表真存储 0804:* 值
+# + 切换器装配表槽位）也不行——msctf 一致性校验只认走
+# EnableLanguageProfile 激活过的成员条目，裸写条目数分钟内被整根拔
+# 除（18:53 实测：注册完好、列表条目被清）。
+# 根治：语言列表成员资格一律走 CTF 原生 API——smoke 新增 enable 命
+# 令调 ITfInputProcessorProfiles::EnableLanguageProfile（设置页「添
+# 加输入法」同款路径）。API 契约只启用自己的 profile，物理上碰不到
+# 其他输入法；也不再需要知道机器装了什么输入法、装了多少个。
+# 默认输入法不受影响：由 Set-WinDefaultInputMethodOverride 显式指定
+# （下段），与列表位置无关。
+# 注册表真存储在本段只读不写：装前快照/装后回读核验他人条目零变化
+# 并写 install.log 留证。
 $tipStr = "0804:$CLSID$PROFILE"
-# 【防吃·三阶强化 2026-10-07】今晨实锤事故根因链（重启后立即安装被吃
-# 4 个输入法，连装配表槽位都被清）：
-#   Get-WinUserLanguageList 在 CTF 未热透时少报 → Set -Force 把「少报
-#   的列表」同步固化进 用户列表+装配表 两处 → 旧防线③用同一个会静默
-#   丢弃未解析 TIP 的 Set 只并回一次、无注册表核验、无日志。
-# 强化：
-#   ① 快照升级：整槽属性袋（CLSID/Profile/KeyboardLayout…）——注册表
-#      直写恢复的原料；
-#   ② 动刀前等枚举稳定：列表槽位数 3s 间隔连续两次不再增长（上限
-#      15s，ctfmon 冷启动要时间）；
-#   ③ 恢复三重：并回 Set 重试×3（间隔 2s）→ 仍缺 = 装配表槽位注册表
-#      直写（无校验必成）→ 最终以装配表注册表为事实源核验 + 全链写
-#      install.log 留证。
-# 【四阶补强 2026-10-07 午】上午实锤再升级：Set 会把少报固化进**两个**
-# 真 存 储 ——装配表(HKCU CTF SortOrder) + 列表真存储(HKCU Control
-# Panel International User Profile 的 0804:* 值)。直写兜底只修装配表
-# 不够，列表真存储也会被冷 Set 掏空 → 四阶：
-#   ②+ 稳定等待升级：不止「计数不变」，还要求枚举追平装配表（冷会话
-#      枚举少报时继续等，上限 30s）；
-#   ③+ 直写兜底双库：装配表槽位 + 列表真存储 0804:* 值一起直写还原。
-$ctfStartedEarly = $false
-if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) {
-    Start-Process ctfmon -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    $ctfStartedEarly = $true
-}
 $asmBase = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
-$assemblyTips = @()
-$assemblySlots = @()   # 槽位整袋快照（直写恢复原料）
-if (Test-Path $asmBase) {
-    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
-        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-        if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
-            $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
-            $bag = @{}
-            foreach ($pn in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' })) {
-                $bag[$pn] = $p.$pn
+$upRoot = 'HKCU:\Control Panel\International\User Profile'
+# 快照：仅用于末态核验与日志留证——绝不作为任何重写的原料
+function Get-HuFuUpOthers {
+    $r = @()
+    try {
+        foreach ($lk in Get-ChildItem $upRoot -ErrorAction SilentlyContinue) {
+            foreach ($n in (Get-Item $lk.PSPath -ErrorAction SilentlyContinue).Property) {
+                if ($n -like '0804:*' -and $n -ne $tipStr) { $r += $n }
             }
-            $assemblySlots += @{ slot = $k.PSChildName; CLSID = $p.CLSID; Profile = $p.Profile; bag = $bag }
         }
-    }
+    } catch { }
+    ,@($r | Select-Object -Unique)
 }
-# 列表真存储快照（User Profile 的 0804:* 值名——四阶直写还原的原料）
-$upTips = @()
-try {
-    $upKey = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
-    if ($upKey) {
-        $upTips = @((Get-Item $upKey.PSPath).Property | Where-Object { $_ -like '0804:*' -and $_ -ne $tipStr })
-    }
-} catch { }
-# ② 等枚举稳定且追平装配表（冷会话枚举少报=继续等；上限 30s）
-$list = Get-WinUserLanguageList
-$zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-$prevCount = if ($zhProbe) { @($zhProbe.InputMethodTips).Count } else { 0 }
-$asmTarget = [Math]::Max(@($assemblyTips).Count, @($upTips).Count)
-$deadline = (Get-Date).AddSeconds(30)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 3
-    $list = Get-WinUserLanguageList
-    $zhProbe = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-    $c = if ($zhProbe) { @($zhProbe.InputMethodTips | Where-Object { $_ -ne $tipStr }).Count } else { 0 }
-    if ($c -ge $asmTarget -and $c -eq $prevCount) { break }
-    if ($c -eq $prevCount -and $c -ge $asmTarget) { break }
-    $prevCount = $c
-}
-$zh = $list | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-if (-not $zh) { $zh = $list[0] }
-$tipsBefore = @($zh.InputMethodTips | Where-Object { $_ -ne $tipStr })
-# 冷会话防御：枚举仍没追平装配表 → 把装配表真相预先并进列表对象再动刀
-#（第一次 Set 就带上全家，不给「固化少报」机会）
-if (@($tipsBefore).Count -lt @($assemblyTips).Count) {
-    foreach ($t in $assemblyTips) {
-        if ($tipsBefore -notcontains $t) { $zh.InputMethodTips.Add($t); $tipsBefore += $t }
-    }
-}
-if ($zh.InputMethodTips -notcontains $tipStr) {
-    $zh.InputMethodTips.Insert(0, $tipStr)
-    Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
-} elseif ($zh.InputMethodTips[0] -ne $tipStr) {
-    # 已安装但不在首位（升级/用户调整过）：调到首位，保证新宿主默认虎符
-    $zh.InputMethodTips.Remove($tipStr) | Out-Null
-    $zh.InputMethodTips.Insert(0, $tipStr)
-    Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
-}
-# ③ 恢复三重（事实源=装配表注册表，枚举说谎不受影响）
-function Get-AsmOthers {
+function Get-HuFuAsmOthers {
     $r = @()
     if (Test-Path $asmBase) {
         foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
@@ -494,99 +424,65 @@ function Get-AsmOthers {
     }
     ,@($r | Select-Object -Unique)
 }
-$known = @((@($tipsBefore) + @($assemblyTips)) | Select-Object -Unique)
-$attempt = 0
-while ($attempt -lt 3) {
-    $asmNow = Get-AsmOthers
-    $dropped = @($known | Where-Object { $asmNow -notcontains $_ })
-    if ($dropped.Count -eq 0) { break }
-    $attempt++
-    Write-Host "⚠ 装配表丢失 $($dropped.Count) 个既有输入法（第 $attempt 次检出）——并回重写中" -ForegroundColor Yellow
-    $lx = Get-WinUserLanguageList
-    $zx = $lx | Where-Object { $_.LanguageTag -like 'zh*' } | Select-Object -First 1
-    if (-not $zx) { $zx = $lx[0] }
-    foreach ($d in $dropped) { if ($zx.InputMethodTips -notcontains $d) { $zx.InputMethodTips.Add($d) } }
-    Set-WinUserLanguageList $lx -Force -WarningAction SilentlyContinue
+$upBefore = Get-HuFuUpOthers
+$asmBefore = Get-HuFuAsmOthers
+# ① 加入语言列表：调 CTF 原生 API（smoke enable → EnableLanguageProfile）
+# ——只启用自己的 profile，物理上碰不到其他输入法的任何条目。失败不
+# 裸写注册表兜底（裸写条目会被 msctf 一致性校验判非法清除，18:53 实
+# 锤）；失败=注册已就绪，提示手动到设置页添加一次（虎爪同款流程）。
+$smokeExe = Join-Path $inst 'hufu-tsf-smoke.exe'
+$enableOk = $false
+$enableLog = Join-Path $PSScriptRoot 'install.log'
+if (Test-Path $smokeExe) {
+    $tmpOut = Join-Path $env:TEMP 'hufu-enable-out.txt'
+    $p = Start-Process $smokeExe -ArgumentList 'enable' -WindowStyle Hidden -PassThru -RedirectStandardOutput $tmpOut
+    $null = $p.WaitForExit(60000)
+    Start-Sleep -Milliseconds 500
+    $det = ''
+    try { $det = (Get-Content $tmpOut -Encoding UTF8 -Raw -ErrorAction SilentlyContinue) } catch { }
+    # PS5.1 重定向模式下 ExitCode 可能读空——以进程退出+成功输出为准
+    if (($det -match 'OK 虎符已加入语言列表') -or (($p.HasExited) -and ($p.ExitCode -eq 0) -and $det -and ($det -notmatch '失败'))) {
+        $enableOk = $true
+        Write-Host 'OK 已加入语言列表（CTF 原生 EnableLanguageProfile：他人条目零触碰）'
+    } else {
+        try { Add-Content -Path $enableLog -Value ("[{0}] install enable 失败: exit={1} {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $p.ExitCode, $det) -Encoding UTF8 } catch { }
+        Write-Host '⚠ 自动加入语言列表失败——请到 设置→时间和语言→语言→中文→选项 手动添加一次「HuFu 虎符输入法」（注册已就绪，添加一次即永久）' -ForegroundColor Yellow
+    }
+} else {
+    Write-Host '⚠ 缺 hufu-tsf-smoke.exe——请到 设置→时间和语言→语言→中文→选项 手动添加一次「HuFu 虎符输入法」' -ForegroundColor Yellow
+}
+# ② ctfmon 若未运行则冷启动（CTF 从注册表真存储重建视图；本变量供
+# 第 6 段刷新逻辑判断复用）
+$ctfStartedEarly = $false
+if (-not (Get-Process ctfmon -ErrorAction SilentlyContinue)) {
+    Start-Process ctfmon -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
+    $ctfStartedEarly = $true
 }
-$still = @($known | Where-Object { (Get-AsmOthers) -notcontains $_ })
-if ($still.Count -gt 0) {
-    # 终极兜底：装配表槽位注册表直写（快照整袋属性，无校验必成）
-    $maxSlot2 = -1
-    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
-        $n = 0
-        if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot2) { $maxSlot2 = $n }
-    }
-    foreach ($t in $still) {
-        $src = $assemblySlots | Where-Object { "0804:$($_.CLSID)$($_.Profile)" -eq $t } | Select-Object -First 1
-        if ($src) {
-            $maxSlot2++
-            $newKey = "$asmBase\$('{0:D8}' -f $maxSlot2)"
-            New-Item -Path $newKey -Force | Out-Null
-            foreach ($pn in $src.bag.Keys) {
-                Set-ItemProperty -Path $newKey -Name $pn -Value $src.bag[$pn] -Type String
-            }
-            Write-Host "  [直写恢复] 槽 $('{0:D8}' -f $maxSlot2) ← $t" -ForegroundColor Yellow
-        }
-    }
-    $still = @($known | Where-Object { (Get-AsmOthers) -notcontains $_ })
-}
-# 【四阶·列表真存储直写 2026-10-07 午】冷 Set 会把少报固化进 User
-# Profile 的 0804:* 值（列表第一真存储）——装配表直写只修了 TSF 缓存。
-# 此处对照快照把缺的 0804:* 值直写回去（含我们在装前快照到的全部），
-# 无校验必成；写完广播一次列表变更让 TSF 重读。
+# ③ 末态核验（注册表对注册表回读，不涉及枚举——枚举说不说谎都不影
+# 响结论）+ 日志留证
+$upAfter = Get-HuFuUpOthers
+$asmAfter = Get-HuFuAsmOthers
+$othersTotal = @((@($upBefore) + @($asmBefore)) | Select-Object -Unique)
+$gone = @($othersTotal | Where-Object { ($upAfter -notcontains $_) -and ($asmAfter -notcontains $_) })
+$meIn = $false
+Start-Sleep -Milliseconds 800   # CTF 落注册表为异步，稍候再读
 try {
-    $upKey2 = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
-    if ($upKey2) {
-        $have = @((Get-Item $upKey2.PSPath).Property | Where-Object { $_ -like '0804:*' })
-        $missUp = @((@($known) + @($upTips)) | Select-Object -Unique | Where-Object { $have -notcontains $_ })
-        foreach ($mv in $missUp) {
-            New-ItemProperty -Path $upKey2.PSPath -Name $mv -Value '' -PropertyType String -Force | Out-Null
-            Write-Host "  [直写恢复] 列表真存储 ← $mv" -ForegroundColor Yellow
-        }
+    foreach ($lk in (Get-ChildItem $upRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'zh*' })) {
+        if ((Get-Item $lk.PSPath -ErrorAction SilentlyContinue).Property -contains $tipStr) { $meIn = $true }
     }
 } catch { }
-# 【防吃·日志 2026-10-07】全链留证（下次再有事故有据可查）
 try {
-    $logLine = "[{0}] install 防吃链: 快照槽={1} 动刀前列表={2} 已知={3} 最终装配表={4} 仍缺=[{5}] ctfmon预热={6}" -f `
-        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, @($tipsBefore).Count, @($known).Count, @(Get-AsmOthers).Count, ($still -join ','), $ctfStartedEarly
+    $logLine = "[{0}] install CTF原生启用: enable={1} 他人快照={2}（真存储{3}+装配表{4}） 末态他人={5} 我们在场={6} 丢失=[{7}] ctfmon预热={8}" -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $enableOk, @($othersTotal).Count, @($upBefore).Count, @($asmBefore).Count, @((@($upAfter) + @($asmAfter)) | Select-Object -Unique).Count, $meIn, ($gone -join ','), $ctfStartedEarly
     Add-Content -Path (Join-Path $PSScriptRoot 'install.log') -Value $logLine -Encoding UTF8
 } catch { }
-if ($still.Count -gt 0) {
-    Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回（详见 install.log）：" -ForegroundColor Red
-    $still | ForEach-Object { Write-Host "    $_" }
+if ($gone.Count -gt 0) {
+    # 原生启用按 API 契约只动自己的 profile；此告警只为极端并发修改留证
+    Write-Host "⚠ 核验发现既有条目变化（原生启用下不应发生，详见 install.log）：$($gone -join ', ')" -ForegroundColor Yellow
 } else {
-    Write-Host "OK 语言列表已写入（既有输入法全数在场：快照 $(@($assemblySlots).Count) 槽，最终 0 缺失）"
+    Write-Host "OK 语言列表处理完成（他人快照 $(@($othersTotal).Count) 条全数在场，0 缺失）"
 }
-# 【吃掉其他输入法修复 2026-10-02】装配表（AssemblyItem）槽位原先写死
-# 00000003：装机 ≥4 个键盘类输入法时（如微软拼音+多多+虎爪+…），
-# ActivateProfile 触发的 +1 位移后 3 号槽常是别人（多多）的条目——
-# 写死槽=覆盖他人 → 那个输入法从装配表消失，「安装吃掉多多」的根因。
-# 改为扫描：优先复用虎符自己的旧槽（升级场景），否则找第一个空槽/
-# 追加新槽；绝不写任何已被其他 CLSID 占用的槽位。
-$asmBase = "HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}"
-$mySlot = $null
-$freeSlot = $null
-$maxSlot = -1
-if (Test-Path $asmBase) {
-    foreach ($k in Get-ChildItem $asmBase -ErrorAction SilentlyContinue) {
-        $cl = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).CLSID
-        $n = 0
-                        if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot) { $maxSlot = $n }
-        if ($cl -eq $CLSID) { $mySlot = $k.PSChildName }
-        elseif ($null -eq $freeSlot) {
-            $pf = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).Profile
-            if (-not $pf) { $freeSlot = $k.PSChildName }   # 无 Profile 的空壳槽
-        }
-    }
-}
-$slot = if ($mySlot) { $mySlot } elseif ($freeSlot) { $freeSlot } else { '{0:D8}' -f ($maxSlot + 1) }
-$asm = "$asmBase\$slot"
-New-Item -Path $asm -Force | Out-Null
-Set-ItemProperty -Path $asm -Name 'CLSID' -Value $CLSID -Type String
-Set-ItemProperty -Path $asm -Name 'KeyboardLayout' -Value '0' -Type String
-Set-ItemProperty -Path $asm -Name 'Profile' -Value $PROFILE -Type String
 # 【默认首选输入法 2026-09-16】显式设默认输入法覆盖=虎符（用户实锤：
 # 仅靠列表首位，重启后默认输入法可能不是虎符）。覆盖优先于列表序，
 # 重启/新会话/新宿主一律默认虎符；用户手动 Win+空格 切换不受影响。
