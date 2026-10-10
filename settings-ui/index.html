@@ -10,7 +10,18 @@
   --fg: #e8e8ea; --fg2: #9a9aa2; --acc: #ffd75e; --acc2: #4f8cff;
   --ok: #5ecb7d; --err: #ff6b6b; --radius: 12px;
   font-size: 15px;
+  color-scheme: dark;
 }
+/* 【深浅色主题 2026-10-11】浅色档：只覆写色板变量（页面全部取色
+   走 var()，零组件级改动）。--acc 换深琥珀（黄字在白底不可读）；
+   footer 的硬编码深色底在此覆写。color-scheme 同步让原生控件
+   （select 下拉/滚动条）跟随。 */
+html[data-theme="light"] {
+  --bg: #f2f3f6; --bg2: #fafbfc; --bg3: #e8eaf0; --line: #d3d7e0;
+  --fg: #23252b; --fg2: #6c707a; --acc: #b8860b; --acc2: #2f6fe4;
+  color-scheme: light;
+}
+html[data-theme="light"] footer { background: rgba(248,249,251,.94); }
 * { box-sizing: border-box; margin: 0; }
 body {
   background: var(--bg); color: var(--fg);
@@ -31,6 +42,11 @@ nav a {
 nav a:hover { color: var(--fg); background: var(--bg3); }
 nav a.on { color: var(--fg); background: var(--bg3); box-shadow: inset 3px 0 0 var(--acc); }
 nav .spacer { flex: 1; }
+/* 【深浅色主题 2026-10-11】导航栏底部主题区 */
+.theme-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px 4px; }
+.theme-row button { flex: 1; padding: 6px 8px; font-size: 13px; }
+.th-sys { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--fg2); cursor: pointer; white-space: nowrap; }
+.th-sys input { accent-color: var(--acc2); }
 /* ── 主区 ── */
 main { flex: 1; overflow-y: auto; padding: 26px 34px 90px; }
 section { display: none; max-width: 880px; }
@@ -210,6 +226,12 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="overlay">候选挂件</a>
   <a data-tab="data">导入导出</a>
   <div class="spacer"></div>
+  <!-- 【深浅色主题 2026-10-11】导航栏底部：切换按钮（记住选择）+
+       跟随系统开关（系统切深浅页即时跟） -->
+  <div class="theme-row">
+    <button id="th-toggle" type="button">🌙 深色</button>
+    <label class="th-sys" for="th-sys"><input type="checkbox" id="th-sys">跟随系统</label>
+  </div>
   <div class="hint" style="padding:0 12px 6px" id="engine-info"></div>
 </nav>
 
@@ -277,6 +299,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="i-bdunhao"><label for="i-bdunhao" title="勾选：空态按 \ 直接上屏「、」；不勾（默认）：打 \ 弹「、」候选，空格确认">\=顿号直出</label></div>
       <div class="checkline"><input type="checkbox" id="i-semi"><label for="i-semi" title="勾选（默认）：方案里有 ; 开头的编码或快符（如 ;a）时，按 ; 引导——弹 ：/； 候选，;+空格=：、;;=；直上、;xx 快符；方案里没有 ; 数据时按 ; 就是普通符号键（直出「；」）。不勾：; 恒直出「；」（有编码且无候选时首选上屏+「；」），; 仍可当选重键">;=引导快符（按方案数据自动）<span class="sub">（无 ; 编码=普通符号键）</span></label></div>
       <div class="field"><label>编码伪装前缀</label><input type="text" data-path="input.code_disguise" style="width:100px"></div>
+      <div class="checkline"><input type="checkbox" id="i-wild"><label for="i-wild" title="编码中的通配字符=任意单码位，只匹配等长编码：打 d\x = 码表内全部 3 码（第 1 码 d、第 3 码 x）词条；\dx\ = 4 码第 2/3 位 dx；d\ = 全部 2 码 d 开头。候选=全部命中词条，注释位显示各自的完整编码；翻页/选重照常，任何自动上屏/清屏在此编码下不触发（搜索语义）。通配字符不能是编码字母表字符或反查引导键">编码通配符<span class="sub">（打码时通配字符=任意一码，候选显示完整编码）</span></label></div>
+      <div class="field"><label>通配字符</label><input type="text" maxlength="2" id="i-wild-ch" style="width:60px"><span class="hint" id="i-wild-hint">默认 \</span></div>
     </div>
     <h3>候选</h3>
     <div class="row">
@@ -622,6 +646,28 @@ function bindInputs() {
   B("#i-push", "input.auto_push"); B("#i-uniq", "input.auto_select_unique"); B("#i-clear", "input.auto_clear_empty");
   B("#i-enter", "input.enter_clear"); B("#i-mixed", "input.mixed_input");
   B("#i-ascii-p", "input.ascii_punct"); B("#i-dunhao", "input.slash_dunhao"); B("#i-bdunhao", "input.backslash_dunhao");
+  // 【编码通配符 2026-10-11】开关+通配字符。字符侧校验：单字符、
+  // 不在编码字母表、不与反查引导键/次选三选/翻页键冲突（引擎侧
+  // 字母表/反查冲突=按关闭处理；这里提前拦截并提示）。
+  B("#i-wild", "input.wildcard_enabled");
+  {
+    const wi = $("#i-wild-ch");
+    const hint = $("#i-wild-hint");
+    const showHint = t => { hint.textContent = t; };
+    wi.value = CFG.input.wildcard_char ?? "\\";
+    wi.onchange = () => {
+      const ch = wi.value.trim();
+      const alphabet = CFG.input.alphabet || "";
+      const revPfx = (CFG.reverse && CFG.reverse.prefix) || "`";
+      if (ch.length !== 1) { showHint("⚠ 需单个字符（已还原）"); wi.value = CFG.input.wildcard_char ?? "\\"; return; }
+      if (alphabet.includes(ch)) { showHint("⚠ 该字符在编码字母表内，不可作通配符（已还原）"); wi.value = CFG.input.wildcard_char ?? "\\"; return; }
+      if (ch === revPfx) { showHint("⚠ 与反查引导键冲突，不可作通配符（已还原）"); wi.value = CFG.input.wildcard_char ?? "\\"; return; }
+      CFG.input.wildcard_char = ch;
+      showHint(ch === "\\" ? "默认 \\" : `当前：${ch}`);
+      autoSave(wi);
+    };
+    showHint((CFG.input.wildcard_char ?? "\\") === "\\" ? "默认 \\" : `当前：${CFG.input.wildcard_char ?? "\\"}`);
+  }
   // 【；候选开关 2026-10-03】1选：2选；双档——关闭=按一下直出；能顶屏
   B("#i-semi", "input.semicolon_guide");
   // 【Tab 双模式 2026-09-08】下拉映射 tab_clear（清屏=true / 导航=false），
@@ -2312,6 +2358,7 @@ $("#weasel-export").onclick = () => {
 
 async function init() {
   try {
+    initTheme();
     CFG = await api("GET", "/api/config");
     bindInputs(); buildSliders();
     applyPlatform();
@@ -2319,6 +2366,41 @@ async function init() {
     await loadSkinList(); await loadSkin($("#skin-select").value);
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
+}
+
+/* ── 【深浅色主题 2026-10-11】设置页自身主题（与输入法候选窗皮肤无关，
+   皮肤在「皮肤」页单独配）。导航栏底部：切换按钮（localStorage 记住，
+   默认深色）+「跟随系统」开关（系统深浅切换即时跟；手动按按钮=自动
+   退出跟随，显式选择优先）。localStorage 不可用时降级：本次会话内
+   记忆（不跨开合）。── */
+const themeStore = {
+  mem: {},
+  get(k) { try { return localStorage.getItem(k); } catch (_) { return (k in this.mem) ? this.mem[k] : null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (_) { this.mem[k] = v; } },
+};
+function initTheme() {
+  const KEY = "hufu-theme", KEYSYS = "hufu-theme-sys";
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  const apply = () => {
+    const sys = themeStore.get(KEYSYS) === "1";
+    const dark = sys ? mq.matches : (themeStore.get(KEY) ?? "dark") === "dark";
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    const b = document.getElementById("th-toggle");
+    if (b) b.textContent = dark ? "🌙 深色" : "☀️ 浅色";
+    const s = document.getElementById("th-sys");
+    if (s) s.checked = sys;
+  };
+  const b = document.getElementById("th-toggle");
+  if (b) b.onclick = () => {
+    const dark = document.documentElement.dataset.theme !== "light";
+    themeStore.set(KEY, dark ? "light" : "dark");
+    themeStore.set(KEYSYS, "0"); // 手动切换=退出跟随系统
+    apply();
+  };
+  const s = document.getElementById("th-sys");
+  if (s) s.onchange = e => { themeStore.set(KEYSYS, e.target.checked ? "1" : "0"); apply(); };
+  mq.addEventListener?.("change", () => { if (themeStore.get(KEYSYS) === "1") apply(); });
+  apply();
 }
 
 /* ── 【自定义按键·两态映射 2026-11】全键盘图形化编辑窗口 ──

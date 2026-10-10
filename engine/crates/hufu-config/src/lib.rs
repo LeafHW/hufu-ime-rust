@@ -187,6 +187,20 @@ pub struct InputSection {
     pub semicolon_guide: bool,
     /// 数字键参与整句选重
     pub digits_in_sentence: bool,
+    /// 【编码通配符】开启后，编码中的通配字符=任意单码位：打 d\x =
+    /// 码表内全部 3 码（第 1 码 d、第 3 码 x）词条；\dx\ = 4 码第
+    /// 2/3 位 dx。候选=等长匹配的全部词条（注释位显示完整编码），
+    /// 不触发任何自动上屏/清屏（搜索语义）。默认关。
+    pub wildcard_enabled: bool,
+    /// 【编码通配符】通配字符（单字符，默认 '\'）。不能与编码字母表
+    /// 字符冲突（冲突=引擎按关闭处理）；反查引导键优先于通配符。
+    #[serde(default = "default_wildcard_char")]
+    pub wildcard_char: char,
+}
+
+/// 通配符默认字符：\。
+fn default_wildcard_char() -> char {
+    '\\'
 }
 
 impl Default for InputSection {
@@ -215,6 +229,9 @@ impl Default for InputSection {
             backslash_dunhao: false,
             semicolon_guide: true,
             digits_in_sentence: true,
+            // 【编码通配符】默认关 + 默认字符 \
+            wildcard_enabled: false,
+            wildcard_char: '\\',
         }
     }
 }

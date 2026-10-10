@@ -163,6 +163,62 @@ impl Trie {
         result.sort_by(|a, b| b.0.cmp(&a.0));
         result
     }
+
+    /// 【编码通配符】pattern 内 `wild` 字符 = 任意单码位；只匹配与
+    /// pattern **等长**的编码（d\x = 全部 3 码 d?x）。DFS 走前缀树：
+    /// 通配位枚举全部子边、字面位只走对应边，模式耗尽即收（不下探
+    /// 更长编码=等长语义）。返回去重编码集合（字典序稳定）。
+    /// 上限 WILDCARD_CODE_CAP 防病态模式（如单 \）拖垮候选刷新。
+    pub fn wildcard_codes(&self, pattern: &str, wild: char) -> Vec<String> {
+        const WILDCARD_CODE_CAP: usize = 4096;
+        let mut out: Vec<String> = Vec::new();
+        if self.nodes.is_empty() || pattern.is_empty() {
+            return out;
+        }
+        let pats: Vec<char> = pattern.chars().collect();
+        // 栈元素：(节点下标, 已走出的编码前缀)
+        let mut stack: Vec<(usize, String)> = vec![(0usize, String::new())];
+        while let Some((n, prefix)) = stack.pop() {
+            if out.len() >= WILDCARD_CODE_CAP {
+                break;
+            }
+            let depth = prefix.chars().count();
+            if depth == pats.len() {
+                if !self.nodes[n].entries.is_empty() {
+                    out.push(prefix);
+                }
+                continue;
+            }
+            let pc = pats[depth];
+            if let Some(nr) = self.nodes.get(n) {
+                if pc == wild {
+                    // 通配位：枚举全部子边（升序保证结果稳定）
+                    let mut edges: Vec<(char, u32)> =
+                        nr.children.iter().map(|(c, id)| (*c, *id)).collect();
+                    edges.sort_by_key(|(c, _)| *c);
+                    for (ch, id) in edges {
+                        let mut np = prefix.clone();
+                        np.push(ch);
+                        stack.push((id as usize, np));
+                    }
+                } else if let Some(id) = nr.children.get(&pc) {
+                    let mut np = prefix.clone();
+                    np.push(pc);
+                    stack.push((*id as usize, np));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+impl Dict {
+    /// 【编码通配符】等长通配匹配（委托 Trie；见 Trie::wildcard_codes）。
+    pub fn wildcard_codes(&self, pattern: &str, wild: char) -> Vec<String> {
+        self.trie.wildcard_codes(pattern, wild)
+    }
 }
 
 /// 一部已加载的字典。

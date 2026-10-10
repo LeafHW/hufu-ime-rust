@@ -1527,6 +1527,15 @@ impl Engine {
                     }
                 }
             }
+            // 【编码通配符 2026-10-11】空态按通配字符=起一段通配查询
+            //（\dx\ = 4 码第 2/3 位 dx）。优先于 /=\ 顿号两档（该字符
+            // 被用户征用为通配符时，顿号语义让位——要用顿号档就换通
+            // 配字符或关开关）；反查引导键在更上方，优先级更高。
+            if self.wildcard_active() && !shift && c == self.config.input.wildcard_char {
+                session.raw.push(c);
+                self.refresh_candidates(session);
+                return self.take_or_state(session);
+            }
             // 【/=顿时直出 2026-09-06】开启（slash_dunhao）后空态按 /
             // =「、」直接上屏：不进 / 符号命名空间（屏蔽码表内 / 相关
             // 编码）、无候选无二次确认；有候选时 / = 首选上屏+「、」
@@ -1855,6 +1864,15 @@ impl Engine {
                 return self.on_rank_key(session, c);
             }
         }
+        // 【编码通配符 2026-10-11】编码态按通配字符=追加通配位（d 再按
+        // \ = d\ → 全部 2 码 d* 词条）。放在字母表判定之前——通配字符
+        // 不在字母表里，落到标点顶字就错了；shift 实态（Shift+\=｜）
+        // 不受影响。
+        if self.wildcard_active() && !shift && c == self.config.input.wildcard_char {
+            session.raw.push(c);
+            self.refresh_candidates(session);
+            return self.take_or_state(session);
+        }
         // 编码字符（含死路：交给 after_append 处理顶屏/清屏）
         if self.config.input.is_alphabet_char(c) && !shift {
             session.raw.push(c);
@@ -2025,6 +2043,11 @@ impl Engine {
         let len = session.raw.chars().count();
         let max_len = self.config.input.max_code_length;
         let has_upper = session.raw.chars().any(|x| x.is_ascii_uppercase());
+        // 【编码通配符 2026-10-11】raw 含通配字符=搜索语义：一切自动
+        // 上屏/清屏豁免（唯一命中也不顶——用户在翻查词条，不在打词；
+        // 顶了就没法翻页看后面的码了）。翻页/选重/空格上屏照常。
+        let wildcard_mode = self.wildcard_active()
+            && session.raw.contains(self.config.input.wildcard_char);
 
         // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
         // 【可延码不直出 2026-10-09】码表存在更长延续码（如 symbols 的
@@ -2036,6 +2059,7 @@ impl Engine {
         if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\'))
             && len >= 2
             && session.candidates.len() == 1
+            && !wildcard_mode
             && !self.has_longer_continuation(&session.raw)
         {
             self.commit_first_inline(session);
@@ -2063,6 +2087,7 @@ impl Engine {
         // 原行为：满码唯一仍上屏（092K 顶功语义）。
         if !sentence_mode
             && self.config.input.auto_select_unique
+            && !wildcard_mode
             && len >= 2
             && session.candidates.len() == 1
             && (len == max_len || !self.has_longer_continuation(&session.raw))
@@ -2081,7 +2106,7 @@ impl Engine {
         // 处理）。
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&session.raw);
         let over_length = len > max_len;
-        if over_length && !sentence_mode && self.config.input.auto_push && !has_upper
+        if over_length && !sentence_mode && self.config.input.auto_push && !has_upper && !wildcard_mode
         {
             // 【延长码精确命中 2026-10-08】092K 类顶功码表词条码长可超
             // max_code_length（如 哆哆嗦嗦=kkkkf）：第 max+1 键后 raw
@@ -2139,7 +2164,7 @@ impl Engine {
             // 追加前也无候选：空码清屏【码长 max+1 语义 2026-09-11 用户
             // 拍板】清前 max 码、保留刚输入的第 max+1 键为新起点（此前
             // 整缓冲连第 max+1 键一并清掉，新起点也丢）
-            if dead_end && self.config.input.auto_clear_empty {
+            if dead_end && self.config.input.auto_clear_empty && !wildcard_mode {
                 session.clear();
                 session.raw = c.to_string();
                 self.refresh_candidates(session);
@@ -2157,6 +2182,7 @@ impl Engine {
             && !sentence_mode
             && self.config.input.auto_clear_empty
             && !has_upper
+            && !wildcard_mode
             && len > max_len
         {
             session.clear();
@@ -4544,6 +4570,51 @@ impl Engine {
         cands
     }
 
+    /// 【编码通配符】特性可用性：开关开 + 通配字符合法（①不在编码
+    /// 字母表内——在表内说明该字符是正常编码字符，征用会废掉一个
+    /// 码位；②不是反查引导键——无论反查开关状态，同字符一律让位：
+    /// 反查开着它引导反查，反查关着它走 disabled_output 直出，空态
+    /// 语义都有主了，通配不再插一脚）。
+    fn wildcard_active(&self) -> bool {
+        self.config.input.wildcard_enabled
+            && !self
+                .config
+                .input
+                .is_alphabet_char(self.config.input.wildcard_char)
+            && self.config.input.wildcard_char != self.config.reverse.prefix
+    }
+
+    /// 【编码通配符】通配查询候选：等长匹配的全部词条，按码表行序
+    /// 聚合（每个命中码取 schema.candidates——用户调频/置顶/删词等
+    /// 调整照常生效）；注释位 = 该词条的完整编码（搜索语义下编码
+    /// 即要看的主体）；功能词（{重复上屏} 等动态标记）不出结果。
+    fn wildcard_candidates(&self, raw: &str) -> Vec<Candidate> {
+        let wc = self.config.input.wildcard_char;
+        let mut codes = self.schema.dict.wildcard_codes(raw, wc);
+        // 码表行序：按每个码的最小 seq（原始行号）升序聚合
+        codes.sort_by_key(|code| {
+            self.schema
+                .dict
+                .lookup(code)
+                .iter()
+                .map(|e| e.seq)
+                .min()
+                .unwrap_or(u32::MAX)
+        });
+        let mut out: Vec<Candidate> = Vec::new();
+        for code in &codes {
+            for e in self.schema.candidates(code) {
+                if e.text.starts_with('{') {
+                    continue;
+                }
+                let mut c = self.entry_to_candidate(&e);
+                c.comment = code.clone();
+                out.push(c);
+            }
+        }
+        out
+    }
+
     fn refresh_candidates(&mut self, session: &mut Session) {
         session.candidates.clear();
         session.page = 0;
@@ -4586,6 +4657,15 @@ impl Engine {
             return;
         }
 
+        // 【编码通配符 2026-10-11】raw 含通配字符=通配查询：码表内全部
+        // 等长匹配词条，注释位显示完整编码。置于反查/快符之后、超集
+        // 副表与整句接管之前（通配是显式搜索意图，优先级最高；` 超集
+        // 前缀 raw 不会同时含通配字符——通配字符不可能是 `，见
+        // wildcard_active 的冲突判定）。
+        if self.wildcard_active() && session.raw.contains(self.config.input.wildcard_char) {
+            session.candidates = self.wildcard_candidates(&session.raw);
+            return;
+        }
         let parsed = self.parse_locks(&session.raw);
         let raw_len = session.raw.chars().count();
         // 【` 引导超集码表 2026-11】` 起段编码走超集副表独立域：
@@ -6707,6 +6787,72 @@ mod tests {
         let cfg = hufu_config::Config::default();
         let eng = Engine::with_schema_dir(&dir, cfg).unwrap();
         (eng, dir)
+    }
+
+    /// 【编码通配符 2026-10-11】等长匹配 + 注释位显示完整编码 + 自动
+    /// 上屏全豁免 + 字母表/反查键冲突=关闭。
+    #[test]
+    fn wildcard_search_semantics() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-wildcard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\ndwx\t大\ndax\t到\ndbx\t灯\ndyx\t点\ndx\t动\ndd\t等\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 默认关：\ 不进编码缓冲
+        assert!(!eng.wildcard_active(), "默认关闭");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('d'));
+        eng.process_key(&mut s, key('\\'));
+        assert!(!s.raw.contains('\\'), "关闭时 \\ 不入 raw");
+
+        // 开启（默认字符 \）
+        eng.config.input.wildcard_enabled = true;
+        assert!(eng.wildcard_active());
+
+        // d\x = 全部 3 码 d?x：大/到/灯/点（不含 2 码 动/等）
+        let mut s = Session::new(true);
+        for ch in ['d', '\\', 'x'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["大", "到", "灯", "点"], "等长匹配 d?x");
+        let cmts: Vec<&str> = s.candidates.iter().map(|c| c.comment.as_str()).collect();
+        assert_eq!(cmts, vec!["dwx", "dax", "dbx", "dyx"], "注释位=完整编码");
+
+        // d\ = 全部 2 码 d*：动/等（顺序=码表行序）
+        let mut s = Session::new(true);
+        for ch in ['d', '\\'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["动", "等"], "等长匹配 2 码 d?");
+        assert_eq!(s.candidates[0].code, "dx", "候选 code=真实编码（选重/学习用）");
+
+        // 唯一命中也不自动上屏（auto_select_unique 开）：搜索语义
+        eng.config.input.auto_select_unique = true;
+        let mut s = Session::new(true);
+        for ch in ['d', 'a', '\\'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert_eq!(s.candidates.len(), 1, "da? 唯一命中 到");
+        assert_eq!(s.candidates[0].text, "到");
+        assert!(s.raw == "da\\", "唯一命中不顶屏（缓冲保留）");
+
+        // 字母表字符=非法通配符（关闭处理）
+        eng.config.input.wildcard_char = 'a';
+        assert!(!eng.wildcard_active(), "字母表字符冲突=关闭");
+
+        // 反查引导键=非法通配符（默认 `，无论反查开关）
+        eng.config.input.wildcard_char = eng.config.reverse.prefix;
+        assert!(!eng.wildcard_active(), "反查引导键冲突=关闭");
     }
 
     /// 【自定义按键·开关绑定 2026-10-07】s2t/emoji 键控翻转：按一下开、
