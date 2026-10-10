@@ -184,15 +184,6 @@ fn tl_cand_hide() {
 }
 
 /// 线程共享状态（文本服务 / 按键接收 / 编辑会话共用）。
-/// 【静打像素差分锚 2026-11】光标列带位图缓存（256bit/行亮像素位图），
-/// 用于逐帧差分找「正在变化的那一行」=打字行。
-pub struct QtPxCache {
-    pub x0: i32,
-    pub y0: i32,
-    pub w: i32,
-    pub bits: Vec<[u64; 4]>,
-}
-
 pub struct Shared {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub client_id: u32,
@@ -408,22 +399,6 @@ pub struct Shared {
     /// 【二十五修·自适应单查】连续「双查同查」帧计数——≥3 转单查
     ///（省一半宿主布局回调）；烂锚/失败清零回双查。
     pub qc_probe_steady: u32,
-    /// 【静打自校准锚·定版 2026-11】第一性拆解结论（三轮判别实验）：
-    /// 该宿主所有光标信号（GetTextExt 全通道+系统插入符）实为同一个
-    /// 内部矩形 stub=(真光标x, 输入框底-96+行数×129, h)，窗口锚定、
-    /// 不随渲染行走。渲染真身：行底=stub−0.38h−行数×0.33h，两行后被
-    /// 框底钉住=stub₀+0.92h（h=行高）。全部常数用行高比例表达，行高
-    /// 由空文档组段帧的 stub h>40 实测（每段重置免费重学=换尺寸/缩放
-    /// 自适应），行数由 stub 上跳(≈1.2h..2.2h)计数、下跳(>1.2h)即段
-    /// 重置清零并重记 stub₀。预测验证：默认窗 n=0/1/2+ 行底=680/783/
-    /// 783(rel) 与像素实测逐值吻合。
-    pub qt_line_h: Option<i32>,
-    pub qt_lines: u32,
-    pub qt_stub0: Option<i32>,
-    pub qt_prev_stub_y: Option<i32>,
-    /// 【像素差分锚】列带缓存与最近一次实测打字行底（跨帧稳定用）
-    pub qt_px_cache: Option<QtPxCache>,
-    pub qt_line_last: Option<i32>,
     /// 【Scintilla 段首宽盒抑制 2026-09-30】seg1 查询回宽盒时本帧不出
     /// 窗等布局（60ms 重查）的连击计数——组段刚建瞬间该内核一切 TSF
     /// 查询返回上次提交处的旧布局盒（玉玉玉末尾实测），suppress 至多
@@ -596,12 +571,6 @@ impl Shared {
             lang_sink_cookie: 0,
             cand_sig_last: String::new(),
             qc_probe_steady: 0,
-            qt_line_h: None,
-            qt_lines: 0,
-            qt_stub0: None,
-            qt_prev_stub_y: None,
-            qt_px_cache: None,
-            qt_line_last: None,
             seg1_wide_suppress: 0,
             seg1_stale_retry: 0,
             seg1_lag_host: false,
@@ -2241,18 +2210,6 @@ impl HuFuTs_Impl {
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
-        // 【静打差分·按键时间戳 2026-10-11】candwin2 差分探针的锁定门：
-        // 只在真实按键后短窗内锁定变化带——宿主里的闪烁光标/页面动画
-        // 也是周期变化带（用户实锤「飘到跟打区光标」：输入框光标闪烁
-        // 在停手期成为唯一变化带+连续性先验自我强化）。非按键帧一律
-        // 不锁定，面板钉在上次实测行。
-        QT_KEY_MS.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
         // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
         // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
@@ -4813,22 +4770,6 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     };
 }
 
-/// 【静打差分·按键时间戳】见 dispatch 处注释；candwin2 探针读它做锁定门。
-pub(crate) static QT_KEY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 静打差分锁定门：最近 400ms 内有真实按键才允许锁定变化带。
-pub(crate) fn qt_key_recent() -> bool {
-    let last = QT_KEY_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 {
-        return false;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    now.saturating_sub(last) <= 400
-}
-
 /// 空组段接收器。
 /// 【终止回调实装 2026-09-11】此前 OnCompositionTerminated 空实现——
 /// 宿主单方面终止组段后 g.composition 悬挂死句柄，全靠漂移检测 +
@@ -6666,24 +6607,9 @@ pub fn host_is_weixin() -> bool {
     })
 }
 
-/// 【静打锚语义 2026-11】QuietType.exe（静打，Qt 跟打器）组段尾
-/// GetTextExt 矩形 top=真实行顶（与 selection/est 两源同顶）而 bottom
-/// 为 +80px 级垃圾延伸（实测锚=(1286,1191,1287,1271) vs 真行盒
-/// (1148,1191,1162,1207)，行高 16）——按 bottom+4 落点恒低约一行
-///（用户实锤「候选框位置靠下，相差差不多一行」）。修法=显示层锚
-/// 归一钳制（candwin2 show，四十四修缓存之前——垃圾高度不入
-/// last_line_h）。只认精确进程名；微信（另一 Qt 病：整体低一行）、
-/// 虎魄（caret 真 140px 高）等其他 Qt 宿主各有语义不受影响。
-pub fn host_is_quiettype() -> bool {
-    static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *Q.get_or_init(|| {
-        let exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_default();
-        exe.to_lowercase() == "quiettype.exe"
-    })
-}
+// 【静打特调全清 2026-10-11】host_is_quiettype()（含 v13-v22 各代特判的
+// 最后残留）随用户拍板整链删除—— QuietType.exe 不再有任何按进程名的
+// 特化路径，与所有宿主同走通用锚链。历史教训见任务单 R27-R38。
 
 // ═══════════ E7·游戏子类化流派（虎娘同款） ═══════════
 static GAME_ORIG_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -7268,9 +7194,6 @@ fn game_host_blocklisted() -> bool {
 /// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
 /// 的系统插入符（hCaret/rcCaret 客户区坐标→屏幕）。这是不依赖组段的
 /// 唯一光标来源——query_caret 需要组段（GetTextExt），首帧查不出。
-/// 【静打锚 2026-11】pub(crate)：静打 GetTextExt 的 y 恒垃圾（行进
-/// 实验实锤），但该宿主组段存活期系统插入符忠实跟行（三次采样稳定
-/// 且落在真身行内）——candwin2 静打分支直接采它作锚。
 pub(crate) fn gui_caret_fallback() -> Option<RECT> {
     unsafe {
         let fg = GetForegroundWindow();
