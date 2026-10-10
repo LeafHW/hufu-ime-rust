@@ -4934,6 +4934,19 @@ impl CandidateWindowV2 {
                                 "cw2: 大跳瞬落 d={d} ({lx},{ly})→({tx},{ty})"
                             ));
                         }
+                    } else if crate::tsf::host_is_quiettype() && d >= 3 {
+                        // 【静打禁滑 2026-10-11】用户实锤「一打就往上面跑」：
+                        // 静打输入框上屏/换行后打字行常移位（重组/回卷），
+                        // 面板从旧位滑行 190px+ 到新行=肉眼全程「往上跑」。
+                        // 静打一律瞬移落位（标准 IME 行为），其它宿主的
+                        // 滑动手感不动。
+                        self.live_pos.set((tx, ty));
+                        self.pos_anim = None;
+                        if crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!(
+                                "cw2: 静打瞬移 d={d} ({lx},{ly})→({tx},{ty})"
+                            ));
+                        }
                     } else if d >= 3 {
                         // 【统一节奏 2026-09-12 十次修正】小步进（3-6px）也
                         // 滑动——记事本流畅的本质=每键恒一次滑动节奏一致；
@@ -4988,6 +5001,7 @@ impl CandidateWindowV2 {
                     // 100% 档 vis=false）——冒烟进程内禁用（视觉时序特
                     // 性本就无法在冒烟里断言，实机由 trace 首显臂门覆盖）。
                     if first_show_slide
+                        && !crate::tsf::host_is_quiettype()
                         && std::env::var("HUFU_TSF_SMOKE").as_deref() != Ok("1")
                     {
                         if let Some(unit) = first_show_unit {
