@@ -6602,6 +6602,25 @@ pub fn host_is_weixin() -> bool {
     })
 }
 
+/// 【静打锚语义 2026-11】QuietType.exe（静打，Qt 跟打器）组段尾
+/// GetTextExt 矩形 top=真实行顶（与 selection/est 两源同顶）而 bottom
+/// 为 +80px 级垃圾延伸（实测锚=(1286,1191,1287,1271) vs 真行盒
+/// (1148,1191,1162,1207)，行高 16）——按 bottom+4 落点恒低约一行
+///（用户实锤「候选框位置靠下，相差差不多一行」）。修法=显示层锚
+/// 归一钳制（candwin2 show，四十四修缓存之前——垃圾高度不入
+/// last_line_h）。只认精确进程名；微信（另一 Qt 病：整体低一行）、
+/// 虎魄（caret 真 140px 高）等其他 Qt 宿主各有语义不受影响。
+pub fn host_is_quiettype() -> bool {
+    static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        exe.to_lowercase() == "quiettype.exe"
+    })
+}
+
 // ═══════════ E7·游戏子类化流派（虎娘同款） ═══════════
 static GAME_ORIG_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static GAME_HWND_USIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

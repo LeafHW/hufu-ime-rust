@@ -2094,6 +2094,45 @@ impl CandidateWindowV2 {
         } else {
             anchor
         };
+        // 【静打锚语义 2026-11 用户实锤】QuietType.exe（静打，Qt 跟打器）
+        // 组段尾 GetTextExt 矩形 top=真实行顶（与 selection/est 两源同
+        // 顶对齐）而 bottom 为 +80px 级垃圾延伸（实测锚=(1286,1191,
+        // 1287,1271) vs 真行盒 (1148,1191,1162,1207)，行高 16）——按
+        // bottom+4 落点恒低约一行（「候选框位置靠下，相差差不多一
+        // 行」）。钳制：高度 > max(2×缓存行高, 28)（无缓存 >40）→
+        // bottom=top+缓存行高（缺省 16）。置于四十四修缓存之前——
+        // 垃圾高度永不入 last_line_h；selection 2px 退化锚随后经四十
+        // 四修补齐到同一行高，两源落点归一。below/above 两条落点公式
+        // 无需感知（钳后 bottom 即真行底）。只认精确进程名；微信/虎魄
+        // 等其他 Qt 宿主各有专属锚语义不受影响。
+        let qt_rect: RECT;
+        let anchor = if crate::tsf::host_is_quiettype() {
+            match anchor {
+                Some(a) => {
+                    let h = a.bottom - a.top;
+                    let lh = self.last_line_h.filter(|h| *h >= 8);
+                    let bad = match lh {
+                        Some(l) => h > (l * 2).max(28),
+                        None => h > 40,
+                    };
+                    if bad {
+                        let lh_eff = lh.unwrap_or(16);
+                        if crate::tsf::trace_on() {
+                            crate::tsf::trace(&format!(
+                                "cw2: 静打锚钳制 高{h}→{lh_eff}（组段尾 GetTextExt 垃圾 bottom）"
+                            ));
+                        }
+                        qt_rect = RECT { bottom: a.top + lh_eff, ..*a };
+                        Some(&qt_rect)
+                    } else {
+                        Some(a)
+                    }
+                }
+                None => None,
+            }
+        } else {
+            anchor
+        };
         // 【四十四修·退化锚行高补齐 2026-09-22】微信4.0 实锤（用户
         // 实打 trace）：同一插入点交替上报两种锚矩形——16px 全高
         //（正常，(1142,1174,1156,1190)）与 1px 退化（GetTextExt 抽
