@@ -5475,24 +5475,45 @@ impl CandidateWindowV2 {
                                     start = -1;
                                 }
                             }
-                            // 【连续性先验 2026-10-11】用户实锤「发文区打字
-                            // 时候选框飘到跟打区」：旧先验=变化带中心距
-                            // stub_y ≤250px 才参选——stub 是窗口锚定垃圾
-                            // （恒在跟打区一带），发文区打字行距它几百
-                            // 像素直接出局→回退垃圾锚=飘走。改两级先验：
-                            // ①有上次实测行→贴它（连续性=打字行不会瞬移，
-                            // 与 stub 无关）；②无历史才用 stub_y 且**不限
-                            // 距离**（多带时取最近，单带时远也认）。
-                            let prior_y = QT_LAST_LINE
-                                .with(|l| l.borrow().map(|(lb, _)| lb))
-                                .unwrap_or(stub_y);
+                            // 【沉淀带排除·选带铁律 2026-10-11】用户实锤
+                            // 「时不时飘到上方」：上屏瞬间提交的字词沉淀到
+                            // 打字行**上方**（输入框上方的已打区/文章区回
+                            // 显），沉淀带常比新键入的码字带宽得多 → 抢走
+                            // 锁定=面板上飘再弹回（trace 实锤：输入行 1082
+                            // 锁定良好，上屏后首键被 850 沉淀带劫走）。
+                            // 铁律：打字只会原行或下移——候选带中凡有
+                            // 「中心 ≥ 上次实测行−40」的合格带，取距实测
+                            // 行最近者（上方沉淀带出局）；全带都高于它
+                            // （点击跳上方新区/滚动重排）取**最底带**（打
+                            // 字行恒为最低变化行，沉淀带必在其上）。冷启
+                            // 动无历史：直接取最底带（顶部统计行天然出
+                            // 局）。stub y 不再参与先验。
+                            let prior: Option<i32> =
+                                QT_LAST_LINE.with(|l| l.borrow().map(|(lb, _)| lb));
                             let mut best: Option<(i32, i32, i32)> = None;
-                            for b in bands {
-                                let center = y0 + (b.0 + b.1) / 2;
-                                let dist = (center - prior_y).abs();
-                                match best {
-                                    Some((bd, _, _)) if bd <= dist => {}
-                                    _ => best = Some((dist, b.0, b.1)),
+                            if let Some(p) = prior {
+                                for b in &bands {
+                                    let center = y0 + (b.0 + b.1) / 2;
+                                    if center < p - 40 {
+                                        continue;
+                                    }
+                                    let dist = (center - p).abs();
+                                    match best {
+                                        Some((bd, _, _)) if bd <= dist => {}
+                                        _ => best = Some((dist, b.0, b.1)),
+                                    }
+                                }
+                            }
+                            if best.is_none() {
+                                // 无合格带（冷启动无历史/全部高于实测行−40
+                                // =点击跳上方/滚动重排）——取最底带（打字
+                                // 行恒为最低变化行，沉淀/统计带必在其上）
+                                for b in &bands {
+                                    let bottom = y0 + b.1;
+                                    match best {
+                                        Some((_, _, bb)) if bb >= bottom => {}
+                                        _ => best = Some((0, b.0, b.1)),
+                                    }
                                 }
                             }
                             if let Some((_, b0, b1)) = best {
