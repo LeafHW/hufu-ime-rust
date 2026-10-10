@@ -1295,6 +1295,16 @@ fn read_diag_stage() -> u32 {
 /// 真毛玻璃。零抓屏、零模糊算法。染色=GradientColor(0xAABBGGRR)。
 /// 【二十四修·死码清理】capture_screen_rgba（自绘毛玻璃抓屏）随毛玻璃
 /// 整链退役删除——全仓库零调用。
+// 【静打差分探针状态】模块级共享（外层防崩包装与内层实现同源）：
+// 缓存=上一帧（x0,y0,w,words,flat位图,面板矩形）；QT_LAST_LINE=
+// 最近一次实测打字行底（无变化带帧沿用）。
+thread_local! {
+    static QT_CACHE: std::cell::RefCell<Option<(i32, i32, i32, usize, Vec<u64>, RECT)>> =
+        const { std::cell::RefCell::new(None) };
+    static QT_LAST_LINE: std::cell::RefCell<Option<i32>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl CandidateWindowV2 {
     /// 【WPS 抑制放宽探针 2026-09-12】有历史位置即可先按旧位显示
     /// （tsf.rs 首帧抑制判定用——WPS 每键重组段的即时出候选）。
@@ -5253,7 +5263,37 @@ impl CandidateWindowV2 {
     /// 正在打的组段行。剔除自家面板矩形（当前 hwnd 矩形+上一帧缓存
     /// 矩形）防 BitBlt 自命中（面板非分层窗实锤）。返回 (行底, 光标x)。
     fn qt_pixel_line(&self, stub_x: Option<i32>, stub_y: Option<i32>) -> Option<(i32, i32)> {
-        use std::cell::RefCell;
+        let stub_x = stub_x?;
+        let stub_y = stub_y?;
+        // 【防崩铁律 2026-10-11】v12/v13 实锤用户端「一按键就闪退」：
+        // 窗口固定宽带最宽上千像素，行位图却仍是 256bit 定长数组 →
+        // 越界 panic 直接带走宿主进程。两重根治：①位图改动态宽度
+        //（flat Vec<u64>，words=(w+63)/64）+ 宽度钳制 2048；②整个探针
+        // 包 catch_unwind——任何 panic 一律回退 None（定位辅助永远不许
+        // 弄死宿主），panic 后清基线下帧重学。
+        let probe_result: Option<Option<(i32, i32)>> = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| {
+                Self::qt_pixel_line_inner(stub_x, stub_y, self.hwnd)
+            }),
+        )
+        .ok();
+        match probe_result {
+            Some(r) => r,
+            None => {
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace("cw2: 静打差分探针 panic 已拦截");
+                }
+                QT_CACHE.with(|c| *c.borrow_mut() = None);
+                None
+            }
+        }
+    }
+
+    fn qt_pixel_line_inner(
+        stub_x: i32,
+        stub_y: i32,
+        own_hwnd: windows::Win32::Foundation::HWND,
+    ) -> Option<(i32, i32)> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::{
             BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
@@ -5261,12 +5301,6 @@ impl CandidateWindowV2 {
             HGDIOBJ, SRCCOPY,
         };
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect as Gwr;
-        thread_local! {
-            static QT_CACHE: RefCell<Option<(i32, i32, i32, Vec<[u64; 4]>, RECT)>> = const { RefCell::new(None) };
-            static QT_LAST_LINE: RefCell<Option<i32>> = const { RefCell::new(None) };
-        }
-        let stub_x = stub_x?;
-        let stub_y = stub_y?;
         unsafe {
             let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
             if fg.is_invalid() {
@@ -5278,21 +5312,25 @@ impl CandidateWindowV2 {
             }
             // 面板自身矩形（当前）——扫描剔除区
             let mut own = RECT::default();
-            let have_own = IsWindow(self.hwnd).as_bool() && Gwr(self.hwnd, &mut own).is_ok();
+            let have_own = IsWindow(own_hwnd).as_bool() && Gwr(own_hwnd, &mut own).is_ok();
             // 【带不跟光标 2026-11】v11 实锤：列带若以 stub_x 锚定，光标
             // 每键右移 → 缓存矩形帧帧失配 → 差分永远在基线帧上空转（探
-            // 针从未生效）。改窗口固定宽带（左右各留 8%），纵向只扫
+            // 针从未生效）。改窗口固定宽带（左右各留 1/12），纵向只扫
             // stub_y±300（打字行唯一可能区）——矩形只在窗口移动/改尺寸
-            // 时变化，缓存跨键稳定，差分才成立。
+            // 时变化，缓存跨键稳定，差分才成立。宽度钳 2048 防极端。
             let x0 = wr.left + (wr.right - wr.left) / 12;
             let x1 = wr.right - (wr.right - wr.left) / 12;
             let y0 = (stub_y - 300).max(wr.top + 4);
             let y1 = (stub_y + 300).min(wr.bottom - 4);
-            let w = x1 - x0;
+            let mut w = x1 - x0;
+            if w > 2048 {
+                w = 2048;
+            }
             let h = y1 - y0;
             if w < 40 || h < 60 {
                 return None;
             }
+            let words = (w as usize + 63) / 64;
             let null_hwnd = HWND(std::ptr::null_mut());
             let hdc = GetDC(null_hwnd);
             if hdc.is_invalid() {
@@ -5320,31 +5358,29 @@ impl CandidateWindowV2 {
             }
             let old = SelectObject(mem, HGDIOBJ(hbm.0));
             let _ = BitBlt(mem, 0, 0, w, h, hdc, x0, y0, SRCCOPY);
-            // 每行 256bit 亮像素位图（面板矩形行置空）
-            let mut cur: Vec<[u64; 4]> = Vec::with_capacity(h as usize);
+            // 每行动态宽位图（flat Vec<u64>，words 字/行；面板矩形行置空）
+            let mut cur: Vec<u64> = vec![0u64; (h as usize) * words];
             for row in 0..h {
                 let sy = y0 + row;
                 let in_own = have_own
                     && sy >= own.top
                     && sy < own.bottom
                     && own.right > x0
-                    && own.left < x1;
+                    && own.left < x0 + w;
                 if in_own {
-                    cur.push([0u64; 4]);
                     continue;
                 }
                 let line = bits.add(row as usize * (w as usize * 4)) as *const u32;
-                let mut rowbits = [0u64; 4];
+                let base = row as usize * words;
                 for col in 0..w {
                     let px = *line.add(col as usize);
                     let r = (px & 0xFF) as i32;
                     let gg = ((px >> 8) & 0xFF) as i32;
                     let b = ((px >> 16) & 0xFF) as i32;
                     if (r * 299 + gg * 587 + b * 114) / 1000 > 140 {
-                        rowbits[col as usize / 64] |= 1u64 << (col as usize % 64);
+                        cur[base + (col as usize / 64)] |= 1u64 << (col as usize % 64);
                     }
                 }
-                cur.push(rowbits);
             }
             let _ = SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(hbm.0));
@@ -5352,30 +5388,31 @@ impl CandidateWindowV2 {
             ReleaseDC(null_hwnd, hdc);
             // 差分（上一帧的面板矩形行同样剔除）
             let mut result: Option<(i32, i32)> = None;
-            let mut cache_out: Option<(i32, i32, i32, Vec<[u64; 4]>, RECT)> = None;
+            let mut cache_out: Option<(i32, i32, i32, usize, Vec<u64>, RECT)> = None;
             let prev_taken = QT_CACHE.with(|c| c.borrow_mut().take());
             match prev_taken {
-                Some((px0, py0, pw, pbits, pown)) => {
-                    if px0 == x0 && py0 == y0 && pw == w && pbits.len() == cur.len() {
-                        let mut changed: Vec<bool> = Vec::with_capacity(cur.len());
-                        for r in 0..cur.len() {
+                Some((px0, py0, pw, pwords, pbits, pown)) => {
+                    if px0 == x0 && py0 == y0 && pw == w && pwords == words {
+                        let mut changed: Vec<bool> = Vec::with_capacity(h as usize);
+                        for r in 0..h as usize {
                             let sy = y0 + r as i32;
                             let excluded = (have_own
                                 && sy >= own.top
                                 && sy < own.bottom
                                 && own.right > x0
-                                && own.left < x1)
+                                && own.left < x0 + w)
                                 || (sy >= pown.top
                                     && sy < pown.bottom
                                     && pown.right > x0
-                                    && pown.left < x1);
+                                    && pown.left < x0 + w);
                             if excluded {
                                 changed.push(false);
                                 continue;
                             }
+                            let base = r * words;
                             let mut pc = 0u32;
-                            for k in 0..4 {
-                                pc += (pbits[r][k] ^ cur[r][k]).count_ones();
+                            for k in 0..words {
+                                pc += (pbits[base + k] ^ cur[base + k]).count_ones();
                             }
                             changed.push(pc >= 4);
                         }
@@ -5416,28 +5453,28 @@ impl CandidateWindowV2 {
                                 result =
                                     QT_LAST_LINE.with(|l| *l.borrow()).map(|lb| (lb, stub_x));
                             }
-                        }
-                        // >70% 行变化（滚动/清空/换主题）：重置基线，沿用旧值
-                        cache_out = Some((x0, y0, w, cur, own));
-                        if result.is_none() {
-                            result = QT_LAST_LINE.with(|l| *l.borrow()).map(|lb| (lb, stub_x));
-                        }
-                        if crate::tsf::trace_on() {
+                        } else if crate::tsf::trace_on() {
+                            // 真重置（>70% 行变化=滚动/清空/换主题）才记
                             crate::tsf::trace(&format!(
                                 "cw2: 静打差分重置（{total}/{} 行变化）",
                                 changed.len()
                             ));
                         }
+                        // 本帧作下一帧的基线；无结果时沿用上次实测位置
+                        cache_out = Some((x0, y0, w, words, cur, own));
+                        if result.is_none() {
+                            result = QT_LAST_LINE.with(|l| *l.borrow()).map(|lb| (lb, stub_x));
+                        }
                     } else {
                         // 窗口移动/改尺寸：基线作废重记（旧位置跨尺寸不可
                         // 信——回退 tsf 公式锚，本帧重学基线）
-                        cache_out = Some((x0, y0, w, cur, own));
+                        cache_out = Some((x0, y0, w, words, cur, own));
                         result = None;
                     }
                 }
                 None => {
                     // 首帧基线（跨尺寸/跨会话旧值不可信 → 公式锚）
-                    cache_out = Some((x0, y0, w, cur, own));
+                    cache_out = Some((x0, y0, w, words, cur, own));
                     result = None;
                 }
             }
