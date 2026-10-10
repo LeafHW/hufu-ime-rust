@@ -999,6 +999,18 @@ impl Engine {
                 session.clear();
                 Some(KeyOutcome::consumed(self.state(session)))
             }
+            // 【英文态大小写 2026-11】encase：翻转英文态大小写标记
+            //（en_caps 开 → 英文态小写字母上屏为大写）。**只在英文态
+            // 生效**：中文态返回 None 走该键原行为（用户规格，与
+            // CapsAction::EnCase 的中文态透传口径一致）。英文态天然
+            // 空态，map/map_idle 都只经英文态白名单进来。
+            "encase" => {
+                if session.chinese {
+                    return None;
+                }
+                session.en_caps = !session.en_caps;
+                Some(KeyOutcome::consumed(self.state(session)))
+            }
             // 【自定义按键·开关绑定 2026-10-07】简繁转换/Emoji 注解候选
             // 两开关（「输入与候选」页底部原有开关）可绑键：按一下取反
             // 立即生效、再按还原。不清组段（比 switch 温和——开关切换
@@ -1260,8 +1272,10 @@ impl Engine {
             // 不来，只能 Shift/Caps/Ctrl+空格）。其余映射维持中文态限定
             //（英文态字母/按键直通是输入法本职）。英文态 raw 必空=恒
             // 空态口径，查 map_idle（缺省回落 map）。
+            // 【英文态大小写 2026-11】encase（英文态切换大小写）同为
+            // 英文态合法功能——绑定的键要能在英文态翻转大小写。
             if let Some(act) = self.keymap_lookup(&key.key, &m, true) {
-                if act == "switch" {
+                if act == "switch" || act == "encase" {
                     if let Some(o) = self.run_keymap(session, &act) {
                         return o;
                     }
@@ -1295,6 +1309,17 @@ impl Engine {
                     return KeyOutcome::consumed(self.state(session));
                 }
                 hufu_config::CapsAction::None => {}
+                // 【英文态大小写 2026-11】英文态：翻转 IME 层大小写
+                //（en_caps 开 → 后续小写字母上屏为大写；不动系统
+                // CapsLock）。中文态：不生效，透传系统 CapsLock 原行为
+                //（「只在英文状态下生效」——中文态按 Caps 不清屏不切
+                // 英文不出任何 IME 动作）。
+                hufu_config::CapsAction::EnCase => {
+                    if !session.chinese {
+                        session.en_caps = !session.en_caps;
+                        return KeyOutcome::consumed(self.state(session));
+                    }
+                }
             }
             return KeyOutcome::passthrough();
         }
@@ -1437,6 +1462,13 @@ impl Engine {
 
     fn on_char(&mut self, session: &mut Session, c: char, shift: bool) -> KeyOutcome {
         if !session.chinese {
+            // 【英文态大小写 2026-11】en_caps 开：裸小写字母以大写形态
+            // 上屏（IME 层转换，不动系统 CapsLock）。Shift 实态字符
+            //（已大写）原样直通；数字/符号不受影响。
+            if session.en_caps && !shift && c.is_ascii_lowercase() {
+                let up = c.to_ascii_uppercase().to_string();
+                return KeyOutcome::commit(up, self.state(session));
+            }
             return KeyOutcome::passthrough();
         }
 
@@ -1750,42 +1782,17 @@ impl Engine {
             session.clear();
             return self.on_char(session, c, shift);
         }
-        // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
-        // 翻不动时直接顶屏（首选+符号形态上屏，编码态标点顶字同款语义）。
-        // Shift 形态（—— / +）与基键同方向。须在 Shift 标点拦截之前。
+        // 【翻页键纯翻页 2026-09-06 → 2026-11 用户改判】-（——）/ =（+）
+        // 候选在场时恒翻页。2026-09-06 版「翻不动时顶字（首选+符号
+        // 形态上屏）」按 2026-11 用户反馈撤销：ae 几十候选翻到末页再
+        // 按翻页键会直接上屏「=+第二页首选」——有候选时翻页键不能
+        // 因为翻不动就自动上屏。现行为与「其余配置翻页键」同口径：
+        // on_page 纯翻页（末页循环回首页，单页吞键原地不动）。要打
+        // -/= 本身：清屏（Esc）后空态直出。Shift 形态（—— / +）同
+        // 基键方向翻页。须在 Shift 标点拦截之前。
         if (c == '-' || c == '=') && !session.candidates.is_empty() {
-            let (dir, sym) = if c == '-' {
-                if shift {
-                    (-1, "——".to_string())
-                } else {
-                    (-1, "-".to_string())
-                }
-            } else if shift {
-                (1, "+".to_string())
-            } else {
-                (1, "=".to_string())
-            };
-            let page_size = self.config.candidates.page_size.max(1);
-            let pages = (session.candidates.len() + page_size - 1) / page_size;
-            let can = if dir < 0 {
-                session.page > 0
-            } else {
-                session.page + 1 < pages
-            };
-            if can {
-                return self.on_page(session, dir);
-            }
-            // 不可翻：顶字（当前页首选——翻页后顶的是所在页首字）
-            let ps = page_size as usize;
-            let idx = (session.page as usize * ps).min(session.candidates.len().saturating_sub(1));
-            // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
-            // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+符号。
-            let (first, back) =
-                self.resolve_commit_pair(&session.candidates[idx].commit_text().to_string());
-            session.clear();
-            let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
-            o.back = back;
-            return o;
+            let dir = if c == '-' { -1 } else { 1 };
+            return self.on_page(session, dir);
         }
         // 【Shift 标点 2026-09-06】有编码态同空态（a18f89c 的空态修复漏了
         // 这条路径）：TSF 传基础键+shift=true，Shift+标点/数字先转 US 键盘
@@ -2069,10 +2076,20 @@ impl Engine {
         let sentence_mode = self.sentence_active();
 
         // 满码唯一上屏（整句豁免：不顶，候选照常展示交用户继续）
-        if len == max_len
-            && !sentence_mode
+        // 【叶子码唯一直出 2026-11 用户实锤】满最大码长唯一自动上屏
+        // 开时，不到最大码长的**叶子码**（唯一候选且码表无更长延续，
+        // 如 symbols 的 zai=AI / zko=！”）同样直出——虎爪/虎娘同款：
+        // 打 zai 第三键即出 AI，不必凑满 4 码。与快符 ; 域「可延码
+        // 不直出」同一分界（has_longer_continuation）：有更长码就等
+        // 延伸（用户还可以继续打），叶子才直出。len>=2 与 ; 域口径
+        // 一致（单键叶子不直出，防个别表单键全叶造成逐键上屏）。
+        // 延长码场景（len==max 且存在 >max 词条）由上方老分支保留
+        // 原行为：满码唯一仍上屏（092K 顶功语义）。
+        if !sentence_mode
             && self.config.input.auto_select_unique
+            && len >= 2
             && session.candidates.len() == 1
+            && (len == max_len || !self.has_longer_continuation(&session.raw))
         {
             self.commit_first_inline(session);
             return;
@@ -3541,6 +3558,12 @@ impl Engine {
             ((cur + 1) as usize) % pages
         };
         session.page = next;
+        // 【翻页跟随高亮 2026-11 用户实锤】翻页后空格/选重基准 = 当前
+        // 页首位：旧实现 selected 不随页走（恒 0 或旧值），翻到第 2 页
+        // 按空格仍上屏第 1 页首选（ae 案例翻页后空格出「闲」）。高亮
+        // 移到所在页首条——select_first（空格）与 ↑↓ 起点同步跟随。
+        session.selected =
+            (next * page_size).min(session.candidates.len().saturating_sub(1));
         KeyOutcome::consumed(self.state(session))
     }
 
@@ -5204,6 +5227,7 @@ impl Engine {
             },
             mode: session.mode,
             chinese: session.chinese,
+            en_caps: session.en_caps,
             full_shape: self.config.punct.full_shape,
             ascii_punct: self.config.input.ascii_punct,
             reverse_mode: session.mode == InputMode::Reverse,
@@ -5693,9 +5717,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
-    // 翻不动时直接顶屏（首选+符号形态）。一页装满（pages=1）时按 -
-    // 或 = 都不可翻 → 顶字；多页时 = 翻下页、- 翻上页；翻页后顶字。
+    // 【翻页键纯翻页 2026-11 用户改判】-（——）/ =（+）候选在场时恒翻页：
+    // 2026-09-06 版「翻不动时顶字」按用户实锤撤销（ae 案例翻到末页再按
+    // 翻页键直接上屏「=+末页首选」）。新规格：单页吞键原地不动；多页
+    // 末页循环回首页；任何情况不上屏。Shift 形态（—— / +）同基键方向。
+    // 【翻页跟随 2026-11】翻页后空格/数字基准 = 当前页首位（旧实现
+    // selected 不随页走，翻页后空格仍上屏第 1 页首选）。
     #[test]
     fn page_or_commit_keys() {
         let (mut eng, _dir) = test_engine("pok");
@@ -5703,27 +5730,22 @@ mod tests {
         let mut s = Session::new(true);
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
-        // 按 -：无上页 → 顶字「就-」
+        // 按 -：单页 → 吞键不动，不上屏
         let out = eng.process_key(&mut s, key('-'));
-        assert_eq!(out.commit.unwrap(), "就-", "一页满时 - 顶字");
-        assert!(s.raw.is_empty());
-        // 按 =：无下页 → 顶字「就=」
-        let mut s2 = Session::new(true);
-        eng.process_key(&mut s2, key('j'));
-        eng.process_key(&mut s2, key('d'));
-        let out2 = eng.process_key(&mut s2, key('='));
-        assert_eq!(out2.commit.unwrap(), "就=", "一页满时 = 顶字");
-
-        // Shift 形态顶字：—— / +
-        let mut s3 = Session::new(true);
-        eng.process_key(&mut s3, key('j'));
-        eng.process_key(&mut s3, key('d'));
-        let out3 = eng.process_key(&mut s3, {
+        assert!(out.commit.is_none(), "单页 - 不上屏（旧顶字已废）");
+        assert_eq!(s.raw, "jd", "编码保持");
+        assert_eq!(s.page, 0, "页码不动");
+        // 按 =：同样吞键
+        let out2 = eng.process_key(&mut s, key('='));
+        assert!(out2.commit.is_none(), "单页 = 不上屏（旧顶字已废）");
+        assert_eq!(s.raw, "jd", "编码保持");
+        // Shift 形态同向翻页，不上屏
+        let out3 = eng.process_key(&mut s, {
             let mut k = key('-');
             k.modifiers.shift = true;
             k
         });
-        assert_eq!(out3.commit.unwrap(), "就——", "Shift+- 顶字 ——");
+        assert!(out3.commit.is_none(), "Shift+- 同向翻页不上屏");
 
         // 多页场景：临时把 page_size 调 2（jd 3 候选 → 2 页）
         let mut s4 = Session::new(true);
@@ -5733,10 +5755,10 @@ mod tests {
         let out4 = eng.process_key(&mut s4, key('='));
         assert!(out4.commit.is_none(), "= 有下页时翻页不上屏");
         assert_eq!(s4.page, 1, "翻到第 2 页");
-        // 到末页再按 = → 顶字（末页页首「加」——纯码表原序
-        // jd = [就,到的,加]，page_size 2 时末页只剩 加）
+        // 到末页再按 = → 循环回首页，不上屏（旧「末页顶字」已废）
         let out5 = eng.process_key(&mut s4, key('='));
-        assert_eq!(out5.commit.unwrap(), "加=", "末页再 = 顶字");
+        assert!(out5.commit.is_none(), "末页再 = 循环回首页不上屏");
+        assert_eq!(s4.page, 0, "循环回第 1 页");
         // - 回翻：第 2 页按 - 回第 1 页
         let mut s5 = Session::new(true);
         eng.process_key(&mut s5, key('j'));
@@ -5745,6 +5767,154 @@ mod tests {
         let out6 = eng.process_key(&mut s5, key('-'));
         assert!(out6.commit.is_none(), "- 有上页时翻页不上屏");
         assert_eq!(s5.page, 0, "翻回第 1 页");
+
+        // 【翻页跟随 2026-11】翻到第 2 页后：空格上屏**当前页首位**
+        //（jd page_size 2 → 第 2 页 [加]）——旧实现 selected 恒 0 会
+        // 上屏第 1 页首选「就」。
+        let mut s6 = Session::new(true);
+        eng.process_key(&mut s6, key('j'));
+        eng.process_key(&mut s6, key('d'));
+        eng.process_key(&mut s6, key('='));
+        assert_eq!(s6.page, 1, "第 2 页就位");
+        let out7 = eng.process_key(&mut s6, key(' '));
+        assert_eq!(out7.commit.unwrap(), "加", "翻页后空格=当前页首位");
+        // 数字选重同基准：第 2 页按 1 = 加（页内第 1 项）
+        let mut s7 = Session::new(true);
+        eng.process_key(&mut s7, key('j'));
+        eng.process_key(&mut s7, key('d'));
+        eng.process_key(&mut s7, key('='));
+        let out8 = eng.process_key(&mut s7, key('1'));
+        assert_eq!(out8.commit.unwrap(), "加", "翻页后数字 1=当前页第 1 项");
+        // 未翻页时数字仍按整列表绝对位次（10 内直达：候选只开 3 个
+        // 也能按 3 选到第 3 项——用户满意的既有设定不动）
+        let mut s8 = Session::new(true);
+        eng.process_key(&mut s8, key('j'));
+        eng.process_key(&mut s8, key('d'));
+        let out9 = eng.process_key(&mut s8, key('3'));
+        assert_eq!(out9.commit.unwrap(), "加", "未翻页数字 3=列表第 3 项");
+    }
+
+    // 【叶子码唯一直出 2026-11】auto_select_unique 开时，不到最大码长
+    // 的叶子码（唯一候选+无更长延续）直出——虎爪/虎娘同款（用户实锤
+    // symbols 的 zai=AI / zko=！” 打三码不出）。夹具：a=啊（有更长
+    // aa → 可延不直出）、aa=阿（叶子 → 直出）、jd 3 候选（不唯一 →
+    // 等选重）。
+    #[test]
+    fn leaf_unique_auto_commit() {
+        let (mut eng, _dir) = test_engine("leafu");
+        // 真机用户勾选「满最大码长唯一自动上屏」后的行为（默认关）
+        eng.config.input.auto_select_unique = true;
+        // a：可延（aa 存在）→ 不直出，候选等待
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('a'));
+        assert!(s.raw == "a", "可延码保持编码");
+        // aa：唯一叶子 → 直出「阿」
+        let o2 = eng.process_key(&mut s, key('a'));
+        assert_eq!(o2.commit.as_deref(), Some("阿"), "叶子码唯一直出");
+        assert!(s.raw.is_empty(), "直出后清空");
+        // jd：3 候选不唯一 → 不直出
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        assert!(s2.raw == "jd", "多候选不直出");
+        assert_eq!(s2.candidates.len(), 3);
+        // 开关关：叶子唯一也不直出（原行为）
+        eng.config.input.auto_select_unique = false;
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('a'));
+        let o4 = eng.process_key(&mut s3, key('a'));
+        assert!(o4.commit.is_none(), "开关关叶子不直出");
+        assert_eq!(s3.raw, "aa");
+    }
+
+    // 【英文态大小写 2026-11】CapsAction::EnCase：英文态 Caps 翻转
+    // en_caps（小写字母上屏为大写），中文态不生效透传；encase 功能
+    // 可绑键（英文态白名单生效，中文态走原行为）。
+    #[test]
+    fn encase_english_caps() {
+        let (mut eng, _dir) = test_engine("encase");
+        eng.config.general.caps_action = hufu_config::CapsAction::EnCase;
+        let mut s = Session::new(true);
+        // 中文态按 Caps：不生效 → 透传（consumed=false）
+        let o = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(!o.consumed, "中文态 EnCase 不生效（透传系统 Caps）");
+        assert!(s.chinese, "中文态不切换");
+        // 切到英文态：Caps → 翻转 en_caps（吞键）
+        s.chinese = false;
+        let o2 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o2.consumed, "英文态 Caps 吞键");
+        assert!(s.en_caps, "en_caps 开");
+        // 小写字母上屏大写
+        let o3 = eng.process_key(&mut s, key('a'));
+        assert_eq!(o3.commit.as_deref(), Some("A"), "en_caps 小写转大写");
+        // 大写字母（Shift 实态）原样直通
+        let mut k_up = key('A');
+        k_up.modifiers.shift = true;
+        let o4 = eng.process_key(&mut s, k_up);
+        assert!(o4.commit.is_none() && !o4.consumed, "Shift 实态大写直通");
+        // 再按 Caps：翻回
+        let o5 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o5.consumed && !s.en_caps, "再按翻回小写");
+        let o6 = eng.process_key(&mut s, key('a'));
+        assert!(!o6.consumed, "小写态字母直通");
+        // en_caps 关时数字/符号不受影响（直通）——'1' 直通
+        let o7 = eng.process_key(&mut s, key('1'));
+        assert!(!o7.consumed, "数字直通");
+    }
+
+    // 【encase 绑键 2026-11】map_idle 绑 capslock→encase：英文态生效
+    //（白名单放行）；中文态 run_keymap 返回 None 走原行为。
+    #[test]
+    fn encase_keymap_binding() {
+        let (mut eng, _dir) = test_engine("encasekm");
+        eng.config
+            .keymap
+            .map_idle
+            .insert("capslock".to_string(), "encase".to_string());
+        let mut s = Session::new(false); // 英文态
+        let o = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o.consumed && s.en_caps, "英文态绑键 encase 生效");
+        // 中文态：encase 返回 None → 原行为（caps_action=Switch 默认
+        // → 切英文——验证没被 encase 截胡）
+        let mut s2 = Session::new(true);
+        let o2 = eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(!s2.chinese, "中文态 encase 不截胡（走 caps 原行为切英）");
+        assert!(!s2.en_caps, "中文态不翻 en_caps");
     }
 
     // 【锁态重锁与回显还原 2026-09-06】用户词插入使显示序≠码表序：
@@ -7363,15 +7533,18 @@ mod tests {
         assert_eq!(o.back, "次键前文".chars().count() as u8, "次选越界标顶 back=前条");
         assert!(!o.commit.as_deref().unwrap_or("").contains("{撤回}"), "次选键不得字面上屏");
 
-        // —— 路径3：翻页键 -/= 不可翻顶字 ——
+        // —— 路径3：翻页键 -/=（2026-11 用户改判：纯翻页不再顶字）——
+        // wd 唯一候选一页装满，按 = 不再回删+上屏（旧顶字路径已删），
+        // 编码原样保持——撤回口径不涉及。
         eng.push_commit_history("翻页前文");
         let mut s3 = Session::new(true);
         for c in "wd".chars() {
             eng.process_key(&mut s3, key(c));
         }
         let o = eng.process_key(&mut s3, key('='));
-        assert_eq!(o.commit.as_deref(), Some("="), "wd+= = 回删+=");
-        assert_eq!(o.back, "翻页前文".chars().count() as u8, "翻页键顶字 back=前条");
+        assert!(o.commit.is_none(), "wd+= 不再顶字（纯翻页规格）");
+        assert_eq!(o.back, 0, "不顶字即无回删");
+        assert_eq!(s3.raw, "wd", "编码保持");
 
         // —— 路径4：` 顶屏 ——
         eng.push_commit_history("反查前文");

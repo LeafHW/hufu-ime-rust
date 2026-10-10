@@ -284,6 +284,9 @@ pub struct Shared {
     pub caret: Option<RECT>,
     /// 缓存引擎态：中文模式 / 编码中（TestKeyDown 本地预判用，免双发引擎）
     pub chinese: bool,
+    /// 【英文态大小写 2026-11】engine state.en_caps 每帧缓存（语言栏
+    /// 英↔A 牌面用；值同 langbar::EN_CAPS）。
+    pub en_caps: bool,
     pub composing: bool,
     /// 【Ctrl+M/Space 预判门控 2026-11】config.general 两开关的服务端
     /// 镜像（update_ui 从 state 同步，键/poll 响应都经此）：TestDown
@@ -541,6 +544,7 @@ impl Shared {
             srv_raw_empty_since: None,
             caret: None,
             chinese: true,
+            en_caps: false,
             composing: false,
             // 【Ctrl+M/Space 预判门控 2026-11】默认 false=不预吞（保守
             // 方向：应用快捷键优先；首个 state 到达即校正）。
@@ -1342,19 +1346,32 @@ pub(crate) fn ime_switch_abort(shared: &SharedRef) {
 /// （0=无待同步 1=中文 2=英文）——Shared 含 COM 原始指针不可跨
 /// 线程移动，经此原子中转；下一次 dispatch（UI 线程）懒应用。
 static CHINESE_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 【英文态大小写 2026-11】同上中转 focus 帧的 en_caps
+///（0=无待同步 1=关 2=开）。
+static EN_CAPS_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// 懒应用待同步的中英态（dispatch 入口调用，UI 线程安全）。
 fn apply_chinese_sync(shared: &SharedRef) {
     let v = CHINESE_SYNC.swap(0, std::sync::atomic::Ordering::AcqRel);
-    if v == 0 {
-        return;
+    if v != 0 {
+        let zh = v == 1;
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.chinese != zh {
+            g.chinese = zh;
+            crate::langbar::set_mode(zh);
+            trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
+        }
     }
-    let zh = v == 1;
-    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if g.chinese != zh {
-        g.chinese = zh;
-        crate::langbar::set_mode(zh);
-        trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
+    // 【英文态大小写 2026-11】焦点帧 en_caps 对齐（跨进程切走后在
+    // 别处开了大小写，回来牌面要跟上）。
+    let e = EN_CAPS_SYNC.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if e != 0 {
+        let on = e == 2;
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.en_caps != on {
+            g.en_caps = on;
+            crate::langbar::set_en_caps(on);
+        }
     }
 }
 
@@ -1539,6 +1556,12 @@ fn handle_set_focus(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             CHINESE_SYNC.store(if zh { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+            // 【英文态大小写 2026-11】焦点帧顺带对齐 en_caps。
+            let ecap = resp
+                .pointer("/state/en_caps")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            EN_CAPS_SYNC.store(if ecap { 2 } else { 1 }, std::sync::atomic::Ordering::Release);
         }
     });
     trace("foc: C spawn完");
@@ -5194,6 +5217,16 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             g2.chinese = zh;
             // 语言栏「中/A」：Shift 切换也走这里回填图标/文字
             crate::langbar::set_mode(zh);
+        }
+        // 【英文态大小写 2026-11】en_caps 每帧同步（值变才重画牌面
+        // 英↔A；切换器在本会话外改配置不影响——state 是唯一权威）。
+        let ecap = state
+            .get("en_caps")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if g2.en_caps != ecap {
+            g2.en_caps = ecap;
+            crate::langbar::set_en_caps(ecap);
         }
         g2.composing = !state
             .get("raw")

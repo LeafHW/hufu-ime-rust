@@ -212,6 +212,10 @@ pub struct SessionState {
     pub mode: InputMode,
     /// 中英状态（用于托盘/状态胶囊显示）
     pub chinese: bool,
+    /// 【英文态大小写 2026-11】英文态 Caps 大小写标记（chinese=false
+    /// 且 en_caps=true → DLL 状态胶囊/语言栏显示大写 A 提示）
+    #[serde(default)]
+    pub en_caps: bool,
     /// 全角
     pub full_shape: bool,
     /// 中文态使用英文标点
