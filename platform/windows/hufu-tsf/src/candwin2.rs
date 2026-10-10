@@ -1297,11 +1297,17 @@ fn read_diag_stage() -> u32 {
 /// 整链退役删除——全仓库零调用。
 // 【静打差分探针状态】模块级共享（外层防崩包装与内层实现同源）：
 // 缓存=上一帧（x0,y0,w,words,flat位图,面板矩形）；QT_LAST_LINE=
-// 最近一次实测打字行底（无变化带帧沿用）。
+// 最近一次实测打字行底（无变化带帧沿用）。QT_ABOVE_CAND=上带两帧
+// 确认缓存（拒绝沉淀带劫锁，见选带块）；QT_COLD_SINCE=冷启动持隐
+// 起点（首次差分锁定前不显示，见 show 锚决策）。
 thread_local! {
     static QT_CACHE: std::cell::RefCell<Option<(i32, i32, i32, usize, Vec<u64>, RECT)>> =
         const { std::cell::RefCell::new(None) };
     static QT_LAST_LINE: std::cell::RefCell<Option<(i32, i32)>> =
+        const { std::cell::RefCell::new(None) };
+    static QT_ABOVE_CAND: std::cell::RefCell<Option<(std::time::Instant, (i32, i32))>> =
+        const { std::cell::RefCell::new(None) };
+    static QT_COLD_SINCE: std::cell::RefCell<Option<std::time::Instant>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2130,6 +2136,31 @@ impl CandidateWindowV2 {
                     Some(&qt_rect)
                 }
                 None => {
+                    // 【冷启动持隐 2026-10-11 复诊】用户实锤首组段「弹低
+                    // 一行再蹦上来」：从未锁定（QT_LAST_LINE 空）时按 stub
+                    // 显示=恒低约一行（本窗 stub bottom 1073 vs 真行底
+                    // 973，差 100px），差分首锁（首键后 ~190ms）瞬移修正
+                    // =肉眼可见闪跳。改：冷态且窗未显示→持隐等首锁（短
+                    // 显示延迟优于错位闪跳）；600ms 未锁（探针失效场景）
+                    // 放弃等待回落旧行为，不至于永不显示。
+                    let never_locked = QT_LAST_LINE.with(|l| l.borrow().is_none());
+                    if never_locked {
+                        let hidden = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+                        if hidden {
+                            let within = QT_COLD_SINCE.with(|s| {
+                                let mut st = s.borrow_mut();
+                                let started = *st.get_or_insert(std::time::Instant::now());
+                                started.elapsed()
+                                    < std::time::Duration::from_millis(600)
+                            });
+                            if within {
+                                if crate::tsf::trace_on() {
+                                    crate::tsf::trace("cw2: 静打冷启动持隐（等差分首锁）");
+                                }
+                                return;
+                            }
+                        }
+                    }
                     // 【飘走修复 2026-10-11】首帧/异常兜底不再回退 stub 垃
                     // 圾锚（恒指跟打区）——沿用上次实测行，按窗口位移平移。
                     match left_x.and_then(|lx| {
@@ -5497,11 +5528,21 @@ impl CandidateWindowV2 {
                             // 锁定良好，上屏后首键被 850 沉淀带劫走）。
                             // 铁律：打字只会原行或下移——候选带中凡有
                             // 「中心 ≥ 上次实测行−40」的合格带，取距实测
-                            // 行最近者（上方沉淀带出局）；全带都高于它
-                            // （点击跳上方新区/滚动重排）取**最底带**（打
-                            // 字行恒为最低变化行，沉淀带必在其上）。冷启
-                            // 动无历史：直接取最底带（顶部统计行天然出
-                            // 局）。stub y 不再参与先验。
+                            // 行最近者（上方沉淀带出局）；冷启动无历史直接
+                            // 取最底带（顶部统计行天然出局）。stub y 不再
+                            // 参与先验。
+                            // 【上带两帧确认 2026-10-11 复诊】R36 残留
+                            // 「新组段首键锁上带」实测高频（用户 40 秒实
+                            // 打三实锤：; 顶字上屏后/基线过期帧里沉淀带成
+                            // 唯一带，全带高于实测行，旧「无合格带取最底
+                            // 带」逃生口放行沉淀带 → 面板上窜 181-206px、
+                            // QT_LAST_LINE 被污染、次键才修正）。改判：有
+                            // 历史时全带高于实测行 ≠ 立即取最底带——上带
+                            // 须**连续两帧命中**（1.5s 内，行区间重叠）才
+                            // 准入锁：真·行进/点击跳上方时打字与光标闪烁
+                            // 会持续改同一行=帧帧复现；沉淀渲染一帧即静，
+                            // 下帧起不再差分。单帧上带=沉淀嫌疑，拒锁、
+                            // 沿用上次实测行（外层按窗口位移平移）。
                             let prior: Option<i32> =
                                 QT_LAST_LINE.with(|l| l.borrow().map(|(lb, _)| lb));
                             let mut best: Option<(i32, i32, i32)> = None;
@@ -5517,34 +5558,74 @@ impl CandidateWindowV2 {
                                         _ => best = Some((dist, b.0, b.1)),
                                     }
                                 }
+                                if best.is_some() {
+                                    // 合格带锁定=正常打字行——上带嫌疑缓存作废
+                                    QT_ABOVE_CAND.with(|c| *c.borrow_mut() = None);
+                                }
                             }
                             if best.is_none() {
-                                // 无合格带（冷启动无历史/全部高于实测行−40
-                                // =点击跳上方/滚动重排）——取最底带（打字
-                                // 行恒为最低变化行，沉淀/统计带必在其上）
+                                let mut bottom: Option<(i32, i32)> = None;
                                 for b in &bands {
-                                    let bottom = y0 + b.1;
-                                    match best {
-                                        Some((_, _, bb)) if bb >= bottom => {}
-                                        _ => best = Some((0, b.0, b.1)),
+                                    match bottom {
+                                        Some((_, bb)) if bb >= b.1 => {}
+                                        _ => bottom = Some(*b),
                                     }
+                                }
+                                if prior.is_none() {
+                                    // 冷启动无历史：直接取最底带
+                                    if let Some((b0, b1)) = bottom {
+                                        best = Some((0, b0, b1));
+                                    }
+                                } else if let Some((b0, b1)) = bottom {
+                                    let persisted = QT_ABOVE_CAND.with(|c| {
+                                        let now = std::time::Instant::now();
+                                        let mut st = c.borrow_mut();
+                                        let prev = *st;
+                                        *st = Some((now, (b0, b1)));
+                                        prev.is_some_and(|(t, (c0, c1))| {
+                                            now.duration_since(t)
+                                                < std::time::Duration::from_millis(1500)
+                                                && !(b1 < c0 - 2 || b0 > c1 + 2)
+                                        })
+                                    });
+                                    if persisted {
+                                        if crate::tsf::trace_on() {
+                                            crate::tsf::trace(&format!(
+                                                "cw2: 静打上带两帧确认 y底={}(行进/跳区，准入)",
+                                                y0 + b1 + 1
+                                            ));
+                                        }
+                                        best = Some((0, b0, b1));
+                                    } else if crate::tsf::trace_on() {
+                                        crate::tsf::trace(&format!(
+                                            "cw2: 静打上带拒锁 y底={}(沉淀嫌疑单帧，贴上次实测行)",
+                                            y0 + b1 + 1
+                                        ));
+                                    }
+                                } else {
+                                    QT_ABOVE_CAND.with(|c| *c.borrow_mut() = None);
                                 }
                             }
                             if let Some((_, b0, b1)) = best {
                                 let lb = y0 + b1 + 1;
                                 QT_LAST_LINE.with(|l| *l.borrow_mut() = Some((lb, wr.top)));
+                                QT_COLD_SINCE.with(|s| *s.borrow_mut() = None);
                                 result = Some((lb, stub_x));
                             } else {
                                 // 无变化带：沿用上次实测位置
                                 result =
                                     QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb + wr.top - wt, stub_x)));
                             }
-                        } else if crate::tsf::trace_on() {
-                            // 真重置（>70% 行变化=滚动/清空/换主题）才记
-                            crate::tsf::trace(&format!(
-                                "cw2: 静打差分重置（{total}/{} 行变化）",
-                                changed.len()
-                            ));
+                        } else {
+                            // 真重置（>70% 行变化=滚动/清空/换主题）——行空
+                            // 间整体作废，上带嫌疑缓存一并清
+                            QT_ABOVE_CAND.with(|c| *c.borrow_mut() = None);
+                            if crate::tsf::trace_on() {
+                                crate::tsf::trace(&format!(
+                                    "cw2: 静打差分重置（{total}/{} 行变化）",
+                                    changed.len()
+                                ));
+                            }
                         }
                         // 本帧作下一帧的基线；无结果时沿用上次实测位置
                         cache_out = Some((x0, y0, w, words, cur, own));
@@ -5556,6 +5637,8 @@ impl CandidateWindowV2 {
                         // 实测行（按窗口位移平移——【飘走修复 2026-10-11】
                         // 旧行为回退 stub 垃圾锚=恒在跟打区，用户实锤「发
                         // 文区打字飘到跟打区」的主要来源），下帧差分重锁。
+                        // 行坐标空间已变，上带嫌疑缓存作废。
+                        QT_ABOVE_CAND.with(|c| *c.borrow_mut() = None);
                         cache_out = Some((x0, y0, w, words, cur, own));
                         result =
                             QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb + wr.top - wt, stub_x)));
@@ -5563,6 +5646,7 @@ impl CandidateWindowV2 {
                 }
                 None => {
                     // 首帧基线：无历史才回退标准锚（冷启动一次性）
+                    QT_ABOVE_CAND.with(|c| *c.borrow_mut() = None);
                     cache_out = Some((x0, y0, w, words, cur, own));
                     result = None;
                 }
