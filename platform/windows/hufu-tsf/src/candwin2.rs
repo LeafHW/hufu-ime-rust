@@ -1301,7 +1301,7 @@ fn read_diag_stage() -> u32 {
 thread_local! {
     static QT_CACHE: std::cell::RefCell<Option<(i32, i32, i32, usize, Vec<u64>, RECT)>> =
         const { std::cell::RefCell::new(None) };
-    static QT_LAST_LINE: std::cell::RefCell<Option<i32>> =
+    static QT_LAST_LINE: std::cell::RefCell<Option<(i32, i32)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2129,7 +2129,42 @@ impl CandidateWindowV2 {
                     }
                     Some(&qt_rect)
                 }
-                None => anchor,
+                None => {
+                    // 【飘走修复 2026-10-11】首帧/异常兜底不再回退 stub 垃
+                    // 圾锚（恒指跟打区）——沿用上次实测行，按窗口位移平移。
+                    match left_x.and_then(|lx| {
+                        QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb, wt, lx)))
+                    }) {
+                        Some((lb, wt, lx)) => {
+                            let mut lb2 = lb;
+                            unsafe {
+                                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                                let mut wr2 = RECT::default();
+                                if !fg.is_invalid()
+                                    && windows::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                                        fg, &mut wr2,
+                                    )
+                                    .is_ok()
+                                {
+                                    lb2 = lb + wr2.top - wt;
+                                }
+                            }
+                            qt_rect = RECT {
+                                left: lx,
+                                top: lb2 - 80,
+                                right: lx + 2,
+                                bottom: lb2,
+                            };
+                            if crate::tsf::trace_on() {
+                                crate::tsf::trace(&format!(
+                                    "cw2: 静打差分兜底 y底={lb2}（沿用实测）"
+                                ));
+                            }
+                            Some(&qt_rect)
+                        }
+                        None => anchor,
+                    }
+                }
             }
         } else {
             anchor
@@ -5433,25 +5468,34 @@ impl CandidateWindowV2 {
                                     start = -1;
                                 }
                             }
+                            // 【连续性先验 2026-10-11】用户实锤「发文区打字
+                            // 时候选框飘到跟打区」：旧先验=变化带中心距
+                            // stub_y ≤250px 才参选——stub 是窗口锚定垃圾
+                            // （恒在跟打区一带），发文区打字行距它几百
+                            // 像素直接出局→回退垃圾锚=飘走。改两级先验：
+                            // ①有上次实测行→贴它（连续性=打字行不会瞬移，
+                            // 与 stub 无关）；②无历史才用 stub_y 且**不限
+                            // 距离**（多带时取最近，单带时远也认）。
+                            let prior_y = QT_LAST_LINE
+                                .with(|l| l.borrow().map(|(lb, _)| lb))
+                                .unwrap_or(stub_y);
                             let mut best: Option<(i32, i32, i32)> = None;
                             for b in bands {
                                 let center = y0 + (b.0 + b.1) / 2;
-                                let dist = (center - stub_y).abs();
-                                if dist <= 250 {
-                                    match best {
-                                        Some((bd, _, _)) if bd <= dist => {}
-                                        _ => best = Some((dist, b.0, b.1)),
-                                    }
+                                let dist = (center - prior_y).abs();
+                                match best {
+                                    Some((bd, _, _)) if bd <= dist => {}
+                                    _ => best = Some((dist, b.0, b.1)),
                                 }
                             }
                             if let Some((_, b0, b1)) = best {
                                 let lb = y0 + b1 + 1;
-                                QT_LAST_LINE.with(|l| *l.borrow_mut() = Some(lb));
+                                QT_LAST_LINE.with(|l| *l.borrow_mut() = Some((lb, wr.top)));
                                 result = Some((lb, stub_x));
                             } else {
                                 // 无变化带：沿用上次实测位置
                                 result =
-                                    QT_LAST_LINE.with(|l| *l.borrow()).map(|lb| (lb, stub_x));
+                                    QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb + wr.top - wt, stub_x)));
                             }
                         } else if crate::tsf::trace_on() {
                             // 真重置（>70% 行变化=滚动/清空/换主题）才记
@@ -5463,17 +5507,20 @@ impl CandidateWindowV2 {
                         // 本帧作下一帧的基线；无结果时沿用上次实测位置
                         cache_out = Some((x0, y0, w, words, cur, own));
                         if result.is_none() {
-                            result = QT_LAST_LINE.with(|l| *l.borrow()).map(|lb| (lb, stub_x));
+                            result = QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb + wr.top - wt, stub_x)));
                         }
                     } else {
-                        // 窗口移动/改尺寸：基线作废重记（旧位置跨尺寸不可
-                        // 信——回退 tsf 公式锚，本帧重学基线）
+                        // 窗口移动/改尺寸：位图基线作废重记；位置沿用上次
+                        // 实测行（按窗口位移平移——【飘走修复 2026-10-11】
+                        // 旧行为回退 stub 垃圾锚=恒在跟打区，用户实锤「发
+                        // 文区打字飘到跟打区」的主要来源），下帧差分重锁。
                         cache_out = Some((x0, y0, w, words, cur, own));
-                        result = None;
+                        result =
+                            QT_LAST_LINE.with(|l| l.borrow().map(|(lb, wt)| (lb + wr.top - wt, stub_x)));
                     }
                 }
                 None => {
-                    // 首帧基线（跨尺寸/跨会话旧值不可信 → 公式锚）
+                    // 首帧基线：无历史才回退标准锚（冷启动一次性）
                     cache_out = Some((x0, y0, w, words, cur, own));
                     result = None;
                 }
