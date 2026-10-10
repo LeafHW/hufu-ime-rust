@@ -19,11 +19,6 @@ pub struct EarlyHistory {
 pub struct Session {
     /// 中/英状态
     pub chinese: bool,
-    /// 【英文态大小写 2026-11】英文态 Caps 大小写标记（CapsAction::
-    /// EnCase / encase 功能翻转；开 = 英文态小写字母上屏为大写。
-    /// IME 层实现不动系统 CapsLock；clear() 不复位——与 chinese 同为
-    /// 会话级状态，跨组段保持）
-    pub en_caps: bool,
     /// 原始编码缓冲（活的未提交部分；提前上屏后仅剩剩余码）
     pub raw: String,
     /// 当前候选页
@@ -76,7 +71,6 @@ impl Session {
     pub fn new(chinese: bool) -> Self {
         Session {
             chinese,
-            en_caps: false,
             raw: String::new(),
             page: 0,
             selected: 0,

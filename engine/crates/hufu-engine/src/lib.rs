@@ -999,18 +999,6 @@ impl Engine {
                 session.clear();
                 Some(KeyOutcome::consumed(self.state(session)))
             }
-            // 【英文态大小写 2026-11】encase：翻转英文态大小写标记
-            //（en_caps 开 → 英文态小写字母上屏为大写）。**只在英文态
-            // 生效**：中文态返回 None 走该键原行为（用户规格，与
-            // CapsAction::EnCase 的中文态透传口径一致）。英文态天然
-            // 空态，map/map_idle 都只经英文态白名单进来。
-            "encase" => {
-                if session.chinese {
-                    return None;
-                }
-                session.en_caps = !session.en_caps;
-                Some(KeyOutcome::consumed(self.state(session)))
-            }
             // 【自定义按键·开关绑定 2026-10-07】简繁转换/Emoji 注解候选
             // 两开关（「输入与候选」页底部原有开关）可绑键：按一下取反
             // 立即生效、再按还原。不清组段（比 switch 温和——开关切换
@@ -1272,10 +1260,8 @@ impl Engine {
             // 不来，只能 Shift/Caps/Ctrl+空格）。其余映射维持中文态限定
             //（英文态字母/按键直通是输入法本职）。英文态 raw 必空=恒
             // 空态口径，查 map_idle（缺省回落 map）。
-            // 【英文态大小写 2026-11】encase（英文态切换大小写）同为
-            // 英文态合法功能——绑定的键要能在英文态翻转大小写。
             if let Some(act) = self.keymap_lookup(&key.key, &m, true) {
-                if act == "switch" || act == "encase" {
+                if act == "switch" {
                     if let Some(o) = self.run_keymap(session, &act) {
                         return o;
                     }
@@ -1284,7 +1270,15 @@ impl Engine {
         }
 
         // Caps
+        // 【英文态 Caps 恒系统默认 2026-11 用户拍板】英文态按 Caps 一律
+        // 透传——系统原生大小写锁定（键盘灯/系统提示原生生效），输入法
+        // 不接管（原 caps_action=Switch 会吃掉 Caps 切回中文，英文态
+        // 想大写只能靠 Shift）。caps_action 只管中文态；绑了 switch 的
+        // 自定义键不受影响（上方英文态白名单先查，显式绑定优先）。
         if key.key == KeyCode::CapsLock {
+            if !session.chinese {
+                return KeyOutcome::passthrough();
+            }
             match self.config.general.caps_action {
                 hufu_config::CapsAction::Clear => {
                     if !session.raw.is_empty() {
@@ -1309,17 +1303,6 @@ impl Engine {
                     return KeyOutcome::consumed(self.state(session));
                 }
                 hufu_config::CapsAction::None => {}
-                // 【英文态大小写 2026-11】英文态：翻转 IME 层大小写
-                //（en_caps 开 → 后续小写字母上屏为大写；不动系统
-                // CapsLock）。中文态：不生效，透传系统 CapsLock 原行为
-                //（「只在英文状态下生效」——中文态按 Caps 不清屏不切
-                // 英文不出任何 IME 动作）。
-                hufu_config::CapsAction::EnCase => {
-                    if !session.chinese {
-                        session.en_caps = !session.en_caps;
-                        return KeyOutcome::consumed(self.state(session));
-                    }
-                }
             }
             return KeyOutcome::passthrough();
         }
@@ -1462,13 +1445,6 @@ impl Engine {
 
     fn on_char(&mut self, session: &mut Session, c: char, shift: bool) -> KeyOutcome {
         if !session.chinese {
-            // 【英文态大小写 2026-11】en_caps 开：裸小写字母以大写形态
-            // 上屏（IME 层转换，不动系统 CapsLock）。Shift 实态字符
-            //（已大写）原样直通；数字/符号不受影响。
-            if session.en_caps && !shift && c.is_ascii_lowercase() {
-                let up = c.to_ascii_uppercase().to_string();
-                return KeyOutcome::commit(up, self.state(session));
-            }
             return KeyOutcome::passthrough();
         }
 
@@ -5227,7 +5203,6 @@ impl Engine {
             },
             mode: session.mode,
             chinese: session.chinese,
-            en_caps: session.en_caps,
             full_shape: self.config.punct.full_shape,
             ascii_punct: self.config.input.ascii_punct,
             reverse_mode: session.mode == InputMode::Reverse,
@@ -5827,83 +5802,36 @@ mod tests {
         assert_eq!(s3.raw, "aa");
     }
 
-    // 【英文态大小写 2026-11】CapsAction::EnCase：英文态 Caps 翻转
-    // en_caps（小写字母上屏为大写），中文态不生效透传；encase 功能
-    // 可绑键（英文态白名单生效，中文态走原行为）。
+    // 【英文态 Caps 恒系统默认 2026-11 用户拍板】英文态按 Caps 一律
+    // 透传（系统原生大小写锁定），caps_action 只管中文态——无论配的
+    // 是 Clear/Switch/None，英文态都不接管（原 Switch 会吃掉 Caps 切
+    // 回中文，英文态要大写只能 Shift）。绑 switch 的自定义键不受影响
+    //（英文态白名单先查，显式绑定优先）。
     #[test]
-    fn encase_english_caps() {
-        let (mut eng, _dir) = test_engine("encase");
-        eng.config.general.caps_action = hufu_config::CapsAction::EnCase;
-        let mut s = Session::new(true);
-        // 中文态按 Caps：不生效 → 透传（consumed=false）
-        let o = eng.process_key(
-            &mut s,
-            KeyInput {
-                key: KeyCode::CapsLock,
-                modifiers: Modifiers::default(),
-                is_press: true,
-            },
-        );
-        assert!(!o.consumed, "中文态 EnCase 不生效（透传系统 Caps）");
-        assert!(s.chinese, "中文态不切换");
-        // 切到英文态：Caps → 翻转 en_caps（吞键）
-        s.chinese = false;
-        let o2 = eng.process_key(
-            &mut s,
-            KeyInput {
-                key: KeyCode::CapsLock,
-                modifiers: Modifiers::default(),
-                is_press: true,
-            },
-        );
-        assert!(o2.consumed, "英文态 Caps 吞键");
-        assert!(s.en_caps, "en_caps 开");
-        // 小写字母上屏大写
-        let o3 = eng.process_key(&mut s, key('a'));
-        assert_eq!(o3.commit.as_deref(), Some("A"), "en_caps 小写转大写");
-        // 大写字母（Shift 实态）原样直通
-        let mut k_up = key('A');
-        k_up.modifiers.shift = true;
-        let o4 = eng.process_key(&mut s, k_up);
-        assert!(o4.commit.is_none() && !o4.consumed, "Shift 实态大写直通");
-        // 再按 Caps：翻回
-        let o5 = eng.process_key(
-            &mut s,
-            KeyInput {
-                key: KeyCode::CapsLock,
-                modifiers: Modifiers::default(),
-                is_press: true,
-            },
-        );
-        assert!(o5.consumed && !s.en_caps, "再按翻回小写");
-        let o6 = eng.process_key(&mut s, key('a'));
-        assert!(!o6.consumed, "小写态字母直通");
-        // en_caps 关时数字/符号不受影响（直通）——'1' 直通
-        let o7 = eng.process_key(&mut s, key('1'));
-        assert!(!o7.consumed, "数字直通");
-    }
-
-    // 【encase 绑键 2026-11】map_idle 绑 capslock→encase：英文态生效
-    //（白名单放行）；中文态 run_keymap 返回 None 走原行为。
-    #[test]
-    fn encase_keymap_binding() {
-        let (mut eng, _dir) = test_engine("encasekm");
-        eng.config
-            .keymap
-            .map_idle
-            .insert("capslock".to_string(), "encase".to_string());
-        let mut s = Session::new(false); // 英文态
-        let o = eng.process_key(
-            &mut s,
-            KeyInput {
-                key: KeyCode::CapsLock,
-                modifiers: Modifiers::default(),
-                is_press: true,
-            },
-        );
-        assert!(o.consumed && s.en_caps, "英文态绑键 encase 生效");
-        // 中文态：encase 返回 None → 原行为（caps_action=Switch 默认
-        // → 切英文——验证没被 encase 截胡）
+    fn caps_english_passthrough() {
+        let (mut eng, _dir) = test_engine("capsen");
+        // 三种 caps_action 下英文态都透传
+        for action in [
+            hufu_config::CapsAction::Clear,
+            hufu_config::CapsAction::Switch,
+            hufu_config::CapsAction::None,
+        ] {
+            eng.config.general.caps_action = action;
+            let mut s = Session::new(false); // 英文态
+            let o = eng.process_key(
+                &mut s,
+                KeyInput {
+                    key: KeyCode::CapsLock,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            assert!(!o.consumed, "{action:?} 英文态 Caps 透传");
+            assert!(!s.chinese, "{action:?} 英文态不切回中文");
+            assert!(s.raw.is_empty(), "英文态 raw 保持空");
+        }
+        // 中文态照旧：Switch（默认）→ 切英文；Clear 无编码 → 透传
+        eng.config.general.caps_action = hufu_config::CapsAction::Switch;
         let mut s2 = Session::new(true);
         let o2 = eng.process_key(
             &mut s2,
@@ -5913,8 +5841,24 @@ mod tests {
                 is_press: true,
             },
         );
-        assert!(!s2.chinese, "中文态 encase 不截胡（走 caps 原行为切英）");
-        assert!(!s2.en_caps, "中文态不翻 en_caps");
+        assert!(o2.consumed && !s2.chinese, "中文态 Switch 照旧切英文");
+        // 英文态绑 capslock→switch（自定义键）：白名单显式绑定仍生效
+        //（不受「英文态 Caps 透传」影响——那是未绑定时 caps_action 的
+        // 兜底路径）
+        eng.config
+            .keymap
+            .map_idle
+            .insert("capslock".to_string(), "switch".to_string());
+        let mut s3 = Session::new(false);
+        let o3 = eng.process_key(
+            &mut s3,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o3.consumed && s3.chinese, "英文态显式绑 switch 仍可切回中文");
     }
 
     // 【锁态重锁与回显还原 2026-09-06】用户词插入使显示序≠码表序：

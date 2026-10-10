@@ -86,10 +86,6 @@ pub enum CapsAction {
     #[default]
     Switch,
     None,
-    /// 【英文态大小写 2026-11】英文态按 Caps = 翻转 IME 层大小写
-    ///（小写字母上屏为大写，不动系统 CapsLock）；中文态不生效
-    ///（透传系统 CapsLock 原行为）。
-    EnCase,
 }
 
 impl Default for GeneralSection {

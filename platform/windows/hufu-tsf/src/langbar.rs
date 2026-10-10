@@ -46,10 +46,6 @@ const TF_LBI_STYLE_BTN_MENU: u32 = 0x8;
 
 // ── 进程全局模式态（tsf.rs 每帧同步；点击切换也走这里）──
 static CHINESE: AtomicBool = AtomicBool::new(true);
-// 【英文态大小写 2026-11】英文态 Caps 大小写标记（engine session.
-// en_caps 每帧同步）：图标 英→A 视觉反馈（IME 层大小写不动系统
-// CapsLock，无键盘灯可看，牌面是唯一提示位）。
-static EN_CAPS: AtomicBool = AtomicBool::new(false);
 // 本线程的更新 sink（weasel 同款：项单 sink、AdviseSink 换人、
 // 通知严格回到挂它的线程）。【2026-09-11 弃全局名单】全局 Vec 让
 // 线程 A 的 defer 窗去调线程 B 挂的 sink = 跨套间裸调（msctf 代理
@@ -67,25 +63,6 @@ static NEXT_COOKIE: AtomicU32 = AtomicU32::new(0x4846_0001);
 /// 读取当前中英态（msctf 拉 GetText/GetIcon 时用）
 fn is_chinese() -> bool {
     CHINESE.load(Ordering::Relaxed)
-}
-
-/// 【英文态大小写 2026-11】翻转英文态大小写标记并重画牌面（英↔A）。
-/// 值变化才排队 defer 通知（同 set_mode 的按键上下文安全口径——
-/// msctf 副作用全部延迟到消息泵空闲执行）。
-pub fn set_en_caps(on: bool) {
-    let old = EN_CAPS.swap(on, Ordering::Relaxed);
-    if old == on {
-        return;
-    }
-    let hwnd = DEFER_HWND_T.with(|c| c.get());
-    log_diag(&format!("set_en_caps {old}->{on}（排队 hwnd={hwnd:#x}）"));
-    if hwnd != 0 {
-        unsafe {
-            PostMessageW(hwnd, WM_APP_DEFER, 0, 0);
-        }
-    } else {
-        notify_sink_this_thread();
-    }
 }
 
 /// 更新模式（sink 通知 + 线程 compartment 推送）。返回是否有变化。
@@ -913,15 +890,7 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
         // 像素：句柄值不变=像素不重画（OnUpdate/compartment 全无效，weasel
         // 同困）。每次现画新句柄 → 缓存必 miss → 强制重读。泄漏量级：
         // 每次模式切换一枚 32px 图标（~5KB），日切换百次≈0.5MB，可接受。
-        // 【英文态大小写 2026-11】英文 + en_caps → 牌面「A」（大写态
-        // 可见反馈；中文恒「中」）。
-        let glyph = if is_chinese() {
-            "中"
-        } else if EN_CAPS.load(Ordering::Relaxed) {
-            "A"
-        } else {
-            "英"
-        };
+        let glyph = if is_chinese() { "中" } else { "英" };
         Ok(HICON(make_glyph_icon(glyph) as *mut _))
     }
 
