@@ -5336,6 +5336,13 @@ impl CandidateWindowV2 {
             HGDIOBJ, SRCCOPY,
         };
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect as Gwr;
+        // 【按键门 2026-10-11】用户实锤「停手期飘到跟打区光标」：输入框
+        // 闪烁光标/页面动画也是周期变化带，停手后成为唯一带+连续性先
+        // 验自我强化=面板飘走。只在真实按键后 400ms 内锁定；门外的帧
+        // 直接沿用上次实测行（外层兜底），连 BitBlt 都省。
+        if !crate::tsf::qt_key_recent() {
+            return None;
+        }
         unsafe {
             let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
             if fg.is_invalid() {

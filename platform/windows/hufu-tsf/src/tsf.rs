@@ -2241,6 +2241,18 @@ impl HuFuTs_Impl {
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
+        // 【静打差分·按键时间戳 2026-10-11】candwin2 差分探针的锁定门：
+        // 只在真实按键后短窗内锁定变化带——宿主里的闪烁光标/页面动画
+        // 也是周期变化带（用户实锤「飘到跟打区光标」：输入框光标闪烁
+        // 在停手期成为唯一变化带+连续性先验自我强化）。非按键帧一律
+        // 不锁定，面板钉在上次实测行。
+        QT_KEY_MS.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
         // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
         // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
@@ -4799,6 +4811,22 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             }
         }
     };
+}
+
+/// 【静打差分·按键时间戳】见 dispatch 处注释；candwin2 探针读它做锁定门。
+pub(crate) static QT_KEY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 静打差分锁定门：最近 400ms 内有真实按键才允许锁定变化带。
+pub(crate) fn qt_key_recent() -> bool {
+    let last = QT_KEY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last) <= 400
 }
 
 /// 空组段接收器。
