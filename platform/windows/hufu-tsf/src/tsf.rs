@@ -7829,6 +7829,48 @@ pub(crate) fn host_may_show() -> bool {
         if pid == std::process::id() {
             return true;
         }
+        // 【WebView2 宿主放行 2026-11】Tauri/Electron(WebView2) 应用
+        //（爱跟打/花笺等，用户实锤「能打字不显候选」）：TSF DLL 载在
+        // msedgewebview2.exe 子进程，而顶层前台窗属于宿主主进程
+        //（爱跟打.exe）——前台 pid 恒不等=候选窗被本门拦死（键照吃、
+        // 文字照上，仅不显窗）。键盘焦点真值=GetGUIThreadInfo(0).
+        // hwndFocus：焦点窗在本进程=本进程就是活跃输入宿主，放行。
+        // 失焦残留收窗语义不变——焦点移走后 hwndFocus 归属即变，
+        // 照拦（双候选窗修复的前提不破）。
+        #[repr(C)]
+        struct GTI4 {
+            cb: u32,
+            flags: u32,
+            hwnd_active: windows::Win32::Foundation::HWND,
+            hwnd_focus: windows::Win32::Foundation::HWND,
+            hwnd_capture: windows::Win32::Foundation::HWND,
+            hwnd_menu_owner: windows::Win32::Foundation::HWND,
+            hwnd_move_size: windows::Win32::Foundation::HWND,
+            hwnd_caret: windows::Win32::Foundation::HWND,
+            rc_caret: windows::Win32::Foundation::RECT,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetGUIThreadInfo(tid: u32, gi: *mut GTI4) -> i32;
+        }
+        let mut gi4 = GTI4 {
+            cb: std::mem::size_of::<GTI4>() as u32,
+            flags: 0,
+            hwnd_active: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_focus: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_capture: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_menu_owner: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_move_size: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_caret: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            rc_caret: windows::Win32::Foundation::RECT::default(),
+        };
+        if GetGUIThreadInfo(0, &mut gi4) != 0 && !gi4.hwnd_focus.0.is_null() {
+            let mut fpid = 0u32;
+            GetWindowThreadProcessId(gi4.hwnd_focus, Some(&mut fpid));
+            if fpid == std::process::id() {
+                return true;
+            }
+        }
         if host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
             return true;
         }

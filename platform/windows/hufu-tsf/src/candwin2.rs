@@ -1003,6 +1003,10 @@ pub struct CandidateWindowV2 {
     /// y=bottom+4 逐键荡秋千——入口处用本缓存把退化锚 bottom 补齐
     /// 到正常行高，两种形状算出同一落点。
     last_line_h: Option<i32>,
+    /// 【静打锚作废·二修】静打 GetTextExt 的 y 恒垃圾（行进实验实锤），
+    /// 锚整体作废走兜底定位——但 x 忠实跟随插入点：锚作废前留档其
+    /// left，兜底定位分支用它让候选框横轴跟手（纵轴稳定贴输入区）。
+    qt_caret_x: Option<i32>,
     /// 【三十四修·死字段删除】last_raw_len（grew 判定随单调锁 8707fc4
     /// 退役后只写不读，3 处写点全删）——「正向打字」过滤现由 est 与
     /// 位置动效的 2px 死区承担。
@@ -1421,6 +1425,7 @@ impl CandidateWindowV2 {
                 sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
+                qt_caret_x: None,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -1599,6 +1604,7 @@ impl CandidateWindowV2 {
                 sticky_focus_h: std::cell::Cell::new(0),
                 sticky_drag: false,
                 last_line_h: None,
+                qt_caret_x: None,
                 last_pixels: None,
                 last_dy: None,
                 last_size: (0, 0),
@@ -2094,42 +2100,25 @@ impl CandidateWindowV2 {
         } else {
             anchor
         };
-        // 【静打锚语义 2026-11 用户实锤】QuietType.exe（静打，Qt 跟打器）
-        // 组段尾 GetTextExt 矩形 top=真实行顶（与 selection/est 两源同
-        // 顶对齐）而 bottom 为 +80px 级垃圾延伸（实测锚=(1286,1191,
-        // 1287,1271) vs 真行盒 (1148,1191,1162,1207)，行高 16）——按
-        // bottom+4 落点恒低约一行（「候选框位置靠下，相差差不多一
-        // 行」）。钳制：高度 > max(2×缓存行高, 28)（无缓存 >40）→
-        // bottom=top+缓存行高（缺省 16）。置于四十四修缓存之前——
-        // 垃圾高度永不入 last_line_h；selection 2px 退化锚随后经四十
-        // 四修补齐到同一行高，两源落点归一。below/above 两条落点公式
-        // 无需感知（钳后 bottom 即真行底）。只认精确进程名；微信/虎魄
-        // 等其他 Qt 宿主各有专属锚语义不受影响。
-        let qt_rect: RECT;
+        // 【静打锚作废·二修 2026-11】行进实验实锤（差分像素 vs trace）：
+        // 静打 GetTextExt 的 y 是**恒定垃圾**——第一行真身 856..912、
+        // 第二行 1033..1112，锚 top 恒 1154 不随行进（窗口布局变了才
+        // 变）；且其真实行高 56~79px（大字号跟打排版），est 链 16px 的
+        // 「行高」也整条是错。首修的 bottom 钳制（按 16px 行高）只能把
+        // 落点钉在锚常数附近，行进了照样错位，用户复测「没修好」。
+        // 任何对垃圾锚的变换都救不了 → 整体作废走兜底定位（焦点窗内
+        // 下部稳定落位），**x 保留锚的 left**（实验证明 x 忠实跟随插
+        // 入点）——横轴跟手、纵轴稳定贴输入区，不打扰上方文章。兜底
+        // 分支见 qt_caret_x 应用点。est/四十四修链条不触（锚已 None，
+        // 垃圾行高也不入缓存）。
         let anchor = if crate::tsf::host_is_quiettype() {
-            match anchor {
-                Some(a) => {
-                    let h = a.bottom - a.top;
-                    let lh = self.last_line_h.filter(|h| *h >= 8);
-                    let bad = match lh {
-                        Some(l) => h > (l * 2).max(28),
-                        None => h > 40,
-                    };
-                    if bad {
-                        let lh_eff = lh.unwrap_or(16);
-                        if crate::tsf::trace_on() {
-                            crate::tsf::trace(&format!(
-                                "cw2: 静打锚钳制 高{h}→{lh_eff}（组段尾 GetTextExt 垃圾 bottom）"
-                            ));
-                        }
-                        qt_rect = RECT { bottom: a.top + lh_eff, ..*a };
-                        Some(&qt_rect)
-                    } else {
-                        Some(a)
-                    }
-                }
-                None => None,
+            if let Some(a) = anchor {
+                self.qt_caret_x = Some(a.left);
             }
+            if crate::tsf::trace_on() {
+                crate::tsf::trace("cw2: 静打锚作废（y 恒垃圾）→ 兜底定位 + x 跟插入点");
+            }
+            None
         } else {
             anchor
         };
@@ -4594,6 +4583,14 @@ impl CandidateWindowV2 {
             // 的 m_phys0 = 靠屏边候选被推进一个阴影带的回归根源）。
             let wpx0 = (width * dpi_scale) as i32;
             let hpx0 = (height * dpi_scale) as i32;
+            // 【静打锚作废·二修】兜底定位只给了「焦点窗内左下」的安全
+            // y——x 换成留档的真实插入点 x（行进实验证明锚 x 忠实跟手），
+            // 横轴跟着打字走、纵轴稳定贴输入区，不打扰上方文章。
+            let x = if crate::tsf::host_is_quiettype() {
+                self.qt_caret_x.unwrap_or(x)
+            } else {
+                x
+            };
             let x = x.clamp(vx, (vx + vw - wpx0).max(vx));
             let y = y.clamp(vy, (vy + vh - hpx0).max(vy));
             self.sticky_pos = Some((x, y));
