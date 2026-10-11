@@ -248,6 +248,19 @@ impl Schema {
             }
         }
 
+        // 【特殊文件不并入·yaml 路 2026-10-12】与下方 big_tables.retain 同
+        // 一张排除清单：快符/常用符号/一简符号/补充语料/用户调整/用户词
+        // 有各自的专槽（上方 stem 分发已消费）。用户实锤：快符.yaml（符
+        // 号\t编码 反序裸行，无 rime 头）被 ext 分发同时推进 rime_dicts，
+        // parse_auto 按正序 tsv 解析成「编码 `.` → 词 `zd`」混进主码表——
+        // `.` 进数据字符表成为编码引导符，数字后按 `.` 弹出 `zd` 候选
+        // （BUG④ 实际根因；txt 路早有 retain，yaml 路漏了）。
+        rime_dicts.retain(|p| {
+            !matches!(
+                file_stem_lower(p).as_str(),
+                "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
+            )
+        });
         // 主码表选择（Rime dict.yaml 优先）：
         //   1) 预解析全部 dict.yaml，取「未被其他表导入」的表为候选
         //   2) 候选中优先聚合表（自身声明了 import_tables），其次与目录同名，再次最大
@@ -658,7 +671,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // 【自由组合 2026-10-10】用户拍板：txt 与 yaml 自由组合、不二选一、
+    // 【特殊文件不并入·yaml 路 2026-10-12】快符.yaml（符号\t编码 反序裸
+    // 行，无 rime 头）必须只进快符槽，不得再被 ext=yaml 分发进主码表
+    // （旧状：parse_auto 按正序 tsv 解析成 编码`.`→词`zd`，`.` 混入
+    // 编码字符表——数字后按 `.` 弹 `zd` 候选，BUG④ 真根）。
+    #[test]
+    fn quick_symbol_yaml_never_pollutes_main_dict() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-qsy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(
+            &tmp,
+            "main.txt",
+            "#hufu-dict v1 name=t\nh\t后\nma\t码\n",
+        );
+        // 用户实锤文件同款：符号\t编码 反序（含 `.` 与功能段）
+        write(
+            &tmp,
+            "快符.yaml",
+            "~\tzb\n.\tzd\n．\tzd\n:\tzf\n;\tzf\n。\tzj\n{加词}\tzjc\n",
+        );
+        let s = Schema::load(&tmp).unwrap();
+        // 1) 快符槽正确装载（反序语义：打 zd 出 `.`）
+        assert!(
+            s.symbols.quick.get("zd").is_some_and(|v| v[0].text == "."),
+            "快符槽装载 zd→. : {:?}",
+            s.symbols.quick.get("zd")
+        );
+        // 2) 主码表不得混入快符反序行（`zd` 不是词、`.` 不是编码）
+        assert!(
+            s.dict.lookup(".").is_empty(),
+            "`.` 不得成为编码: {:?}",
+            s.dict.lookup(".")
+        );
+        assert!(
+            s.dict.lookup("z").iter().all(|e| e.text != "zd"),
+            "主表不得有词 `zd`: {:?}",
+            s.dict.lookup("z")
+        );
+        assert_eq!(s.dict.len(), 2, "主表只有 main.txt 两行");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
     // 不受文件名影响——①多个 yaml 全装（不再只装评分最高者）；②多个
     // txt 全装（无 yaml 时不再按体量只装最大一张）；③非 *.dict.yaml
     // 命名的 yaml 按内容识别照样装载；④解析不出词条的杂 yaml 出局。
