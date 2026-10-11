@@ -2278,6 +2278,42 @@ impl Engine {
                 },
             };
             let base_now = self.parse_locks(&session.raw).base;
+            // 【R26 补全·整句翻页后页基准 2026-10-11 用户实锤】整句态
+            // 数字/选重此前恒取 schema.candidates(chunk)[disp_rank-1]——
+            // 码表**绝对名次**：ae 翻到第 2 页按数字 1，上屏的还是码表
+            // 第 1 位（第 1 页首选）；选重键（;/'）同病。凌晨的「翻页后
+            // =当前页」只修了非整句路径（select_candidate_ex），本分支
+            // 漏网。定稿口径：**page=0 维持整句锁式老语义不动**（数字=
+            // 码表名次：jd2 写锁续打、用户词无锁位直上——既有测试钉死
+            // 的打法规程）；**page>0 = 翻查态**，数字/选重一律按候选框
+            // 显示序取当前页第 N 项直接上屏（与非整句路径同口径，所见
+            // 即所得），页内越界（末页只剩 3 项按 7）=死键原地不动。
+            // 多段流翻页同理——显示的是完整组句候选，选显示项即所得。
+            if session.page > 0 && !session.candidates.is_empty() {
+                let ps_ = self.config.candidates.page_size.max(1) as usize;
+                let abs_idx = session.page * ps_ + (disp_rank - 1);
+                return match session.candidates.get(abs_idx) {
+                    Some(cand) => {
+                        self.sound_hint = Some("select");
+                        // 【{撤回} 2026-11】功能词选中走 pair 解析。
+                        let (mut text, back, _) =
+                            self.resolve_dyn_pair(&cand.commit_text().to_string());
+                        if text.starts_with('{') {
+                            text = self.resolve_dynamic(&text);
+                        }
+                        session.selected =
+                            abs_idx.min(session.candidates.len().saturating_sub(1));
+                        let mut st = self.state(session);
+                        session.clear();
+                        st.raw = String::new();
+                        st.preedit = String::new();
+                        let mut o = KeyOutcome::commit(text, st);
+                        o.back = back;
+                        o
+                    }
+                    None => KeyOutcome::consumed(self.state(session)),
+                };
+            }
             // 【目标块=解码切分尾段 2026-09-06】虎爪语义：数字/选重键锁
             // 「正在输入的尾段」——uru3ae 按 3 给尾段 ae 选。解码用含锁
             // 原 raw（锁约束使已锁段固定：uru3|ae），word_ends 终点是
@@ -6976,6 +7012,75 @@ mod tests {
         assert!(s3.candidates.is_empty(), "死码无候选");
         let out3 = eng.process_key(&mut s3, sk('d'));
         assert!(out3.commit.is_none(), "无候选不走大写顶屏臂");
+    }
+
+    /// 【R26 补全·整句翻页后页基准 2026-10-11】整句态翻页后数字/选重
+    /// =候选框当前页显示序直选（此前恒码表绝对名次——ae 翻页按 1 永远
+    /// 上第 1 页首选）；page=0 锁式老语义不动（既有测试覆盖）。fixture
+    /// 走 manifest target（temp_dir 环境病），整句构造法同
+    /// user_word_rank_select_commits。
+    #[test]
+    fn sentence_paged_rank_follows_display() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-整句page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // jd 5 词（abcdefghi 备用），page_size 调 3 → 2 页
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句测试\njd\t就\njd\t到的\njd\t加\njd\t新\njd\t行\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        cfg.candidates.page_size = 3;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "整句模式生效");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 显示序 = 解码合并排序 [就,加,新,行,锁1+jd,到的] = 6 项
+        assert_eq!(s.candidates.len(), 6, "6 候选（解码+码表5）2 页");
+        // page=0：数字 2 = 码表第 2 名「到的」锁式（raw=jd2 不上屏）——
+        // 老语义钉死
+        let mut s0 = Session::new(true);
+        eng.process_key(&mut s0, key('j'));
+        eng.process_key(&mut s0, key('d'));
+        let out0 = eng.process_key(&mut s0, key('2'));
+        assert!(out0.commit.is_none(), "page0 数字=锁式不上屏");
+        assert_eq!(s0.raw, "jd2", "page0 码表名次写锁");
+        // 翻到第 2 页（显示 [加,新,行]）：数字 1 = 加、2 = 新（显示序）
+        eng.process_key(&mut s, key('='));
+        assert_eq!(s.page, 1, "第 2 页就位");
+        // 显示序（解码合并排序）= [就,加,新,行,锁1+jd,到的]——第 2 页
+        // = [行,锁1+jd,到的]：数字 1=行、2=锁1+jd、越界按 4=死键
+        let out = eng.process_key(&mut s, key('1'));
+        assert_eq!(out.commit.as_deref(), Some("行"), "翻页后数字 1=当前页首项");
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        eng.process_key(&mut s2, key('='));
+        let out2 = eng.process_key(&mut s2, key('2'));
+        assert_eq!(out2.commit.as_deref(), Some("锁1+jd"), "翻页后数字 2=当前页次项");
+        // 页内越界（第 2 页 3 项按 4）=死键
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        eng.process_key(&mut s3, key('='));
+        let out3 = eng.process_key(&mut s3, key('4'));
+        assert!(out3.commit.is_none(), "页内越界=死键");
+        assert_eq!(s3.raw, "jd", "死键不动组段");
+        // 空格仍是当前页首项（既有行为）
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('j'));
+        eng.process_key(&mut s4, key('d'));
+        eng.process_key(&mut s4, key('='));
+        let out4 = eng.process_key(&mut s4, key(' '));
+        assert_eq!(out4.commit.as_deref(), Some("行"), "翻页后空格=当前页首项");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 【切英文上屏编码 2026-10-07】commit_raw_on_en_switch（默认开）：
