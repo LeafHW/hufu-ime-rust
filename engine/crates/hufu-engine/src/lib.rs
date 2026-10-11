@@ -1806,10 +1806,11 @@ impl Engine {
                 .get(&c.to_string())
                 .cloned()
             {
+                // 【顶字页基准 2026-10-11】顶 selected（翻页/高亮跟随）。
                 let (first, fback) = self.resolve_commit_pair(
                     &session
                         .candidates
-                        .first()
+                        .get(self.top_commit_base(session))
                         .map(|x| x.commit_text().to_string())
                         .unwrap_or_default(),
                 );
@@ -1822,10 +1823,12 @@ impl Engine {
                 if let Some((text, back)) = self.punct_output(session, sf) {
                     // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
                     // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+标点。
+                    // 【顶字页基准 2026-10-11】顶 selected（翻页后 Shift+- =
+                    // 当前页首项——，用户实锤）。
                     let (first, fback) = self.resolve_commit_pair(
                         &session
                             .candidates
-                            .first()
+                            .get(self.top_commit_base(session))
                             .map(|x| x.commit_text().to_string())
                             .unwrap_or_default(),
                     );
@@ -1844,10 +1847,11 @@ impl Engine {
             // mixed_input/大写直上屏老链路，「都生效」档无候选也照旧。
             if c.is_ascii_alphabetic() && !session.candidates.is_empty() {
                 let upper = c.to_ascii_uppercase();
+                // 【顶字页基准 2026-10-11】大写顶屏同顶 selected。
                 let (first, fback) = self.resolve_commit_pair(
                     &session
                         .candidates
-                        .first()
+                        .get(self.top_commit_base(session))
                         .map(|x| x.commit_text().to_string())
                         .unwrap_or_default(),
                 );
@@ -1989,8 +1993,12 @@ impl Engine {
                 // {撤回} 等）时解析后顶屏——z1={重复上屏} 打 z 再按任意
                 // 标点（，。、；等）= 「上次内容+该标点」。
                 // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+标点。
+                // 【顶字页基准 2026-10-11】顶 selected（翻页后标点顶字=
+                // 当前页首项+标点，与空格同基准）。
                 let (first, fback) = self.resolve_commit_pair(
-                    &session.candidates[0].commit_text().to_string(),
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
                 );
                 session.clear();
                 let mut o = KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
@@ -2607,8 +2615,12 @@ impl Engine {
         let start_ = session.page * page_size_;
         if start_ + idx >= session.candidates.len() && !session.candidates.is_empty() {
             if let Some((punct, back)) = self.punct_output(session, c) {
-                let (first, fback) =
-                    self.resolve_commit_pair(&session.candidates[0].commit_text().to_string());
+                // 【顶字页基准 2026-10-11】标顶同顶 selected。
+                let (first, fback) = self.resolve_commit_pair(
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
+                );
                 session.clear();
                 let mut o = KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
                 o.back = back.max(fback);
@@ -3418,6 +3430,14 @@ impl Engine {
     }
 
     /// 空格首选 / 空码处理（↑↓ 移动过则上屏高亮项）。
+    /// 【顶字页基准 2026-10-11 用户实锤】标点顶字 / Shift 形态顶屏与
+    /// 空格同基准——顶 `session.selected`（翻页跟随/↑↓ 高亮后的当前
+    /// 项）：翻页后 Shift+- 出「当前页首项——」而非第 1 页首选；
+    /// ↑↓ 移高亮后顶字=高亮项+标点（与空格手感一致）。
+    fn top_commit_base(&self, session: &Session) -> usize {
+        session.selected.min(session.candidates.len().saturating_sub(1))
+    }
+
     fn select_first(&mut self, session: &mut Session) -> KeyOutcome {
         if !session.candidates.is_empty() {
             let idx = session
@@ -4888,6 +4908,13 @@ impl Engine {
                     if !phrase.is_empty() || !rest.is_empty() {
                         // session.candidates 已含（码表 normal + early 前缀
                         // 态 + 生僻沉底）——phrase 真词压最前，其余原序补后
+                        // 【截断只约束解码产物 2026-10-11 用户实锤】原
+                        // merged.truncate(20) 连**码表精确词条**一并截——
+                        // ae 码表一行 55 词只剩 20（「ae 的候选不止 20 个」）。
+                        // 改为：真词短语组 ≤10、弱切分补位 ≤10（解码器
+                        // 产物的合理边界），码表词条全量保留（分页照常）。
+                        phrase.truncate(10);
+                        rest.truncate(10);
                         let mut merged = phrase;
                         for existing in session.candidates.drain(..) {
                             if !merged.iter().any(|m| m.text == existing.text) {
@@ -4913,7 +4940,6 @@ impl Engine {
                                 }
                             }
                         }
-                        merged.truncate(20);
                         session.candidates = merged;
                         self.apply_rerank(session);
                     }
@@ -5900,6 +5926,25 @@ mod tests {
         let out6 = eng.process_key(&mut s5, key('-'));
         assert!(out6.commit.is_none(), "- 有上页时翻页不上屏");
         assert_eq!(s5.page, 0, "翻回第 1 页");
+
+        // 【顶字页基准 2026-10-11】翻页后标点顶字/Shift+-/= 顶的都是
+        // 当前页首项（selected 跟随翻页），不再是第 1 页首选
+        let mut s9 = Session::new(true);
+        eng.process_key(&mut s9, key('j'));
+        eng.process_key(&mut s9, key('d'));
+        eng.process_key(&mut s9, key('='));
+        let out9 = eng.process_key(&mut s9, key(','));
+        assert_eq!(out9.commit.as_deref(), Some("加，"), "翻页后标点顶字=当前页首项+标点");
+        let mut s10 = Session::new(true);
+        eng.process_key(&mut s10, key('j'));
+        eng.process_key(&mut s10, key('d'));
+        eng.process_key(&mut s10, key('='));
+        let out10 = eng.process_key(&mut s10, {
+            let mut k = key('-');
+            k.modifiers.shift = true;
+            k
+        });
+        assert_eq!(out10.commit.as_deref(), Some("加——"), "翻页后 Shift+- =当前页首项——");
 
         // 【翻页跟随 2026-11】翻到第 2 页后：空格上屏**当前页首位**
         //（jd page_size 2 → 第 2 页 [加]）——旧实现 selected 恒 0 会
@@ -7080,6 +7125,47 @@ mod tests {
         eng.process_key(&mut s4, key('='));
         let out4 = eng.process_key(&mut s4, key(' '));
         assert_eq!(out4.commit.as_deref(), Some("行"), "翻页后空格=当前页首项");
+        // 【顶字页基准 2026-10-11】整句态翻页后标点顶字同样=当前页首项
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('j'));
+        eng.process_key(&mut s5, key('d'));
+        eng.process_key(&mut s5, key('='));
+        let out5 = eng.process_key(&mut s5, key(','));
+        assert_eq!(out5.commit.as_deref(), Some("行，"), "整句翻页后标点顶字=当前页首项+标点");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【整句合并不截码表 2026-10-11 用户实锤】ae 码表一行 55 词，
+    /// merged.truncate(20) 连码表精确词条一并截——只剩 20。修后：
+    /// 解码产物（真词短语 ≤10 + 弱切分补位 ≤10）受限，码表全量保留。
+    #[test]
+    fn sentence_merge_keeps_full_dict() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-整句full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 25 个同码词条
+        let words = "就到的加新行星明今天日月水火山石田力人口手心言车马金衣";
+        let mut body = String::from("#hufu-dict v1 name=整句测试\n");
+        for w in words.chars() {
+            body.push_str(&format!("jd\t{w}\n"));
+        }
+        std::fs::write(dir.join("main.txt"), body).unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "整句模式生效");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        assert!(
+            s.candidates.len() >= 25,
+            "码表 25 词全量在列（实际 {}，旧 truncate(20) 会截到 20）",
+            s.candidates.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
