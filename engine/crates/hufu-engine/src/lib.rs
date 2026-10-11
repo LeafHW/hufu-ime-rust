@@ -4073,6 +4073,24 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
+    /// 【按住Ctrl调频·对调 2026-11】原位交换两个候选（abs_i/abs_j 为
+    /// 完整列表绝对下标）：**候选表原位 swap**——不 clear、不重查、
+    /// raw/页/选全保（与 op_move_candidate_abs 同「纯位次」口径，尾巴
+    /// 态不翻转）。本 op 零写入（落盘由调用方 adjust_set_order 整套
+    /// pN 完成，同右键菜单管线）。越界/同位=无操作。
+    pub fn op_swap_positions_abs(
+        &mut self,
+        session: &mut Session,
+        abs_i: usize,
+        abs_j: usize,
+    ) -> KeyOutcome {
+        let n = session.candidates.len();
+        if abs_i < n && abs_j < n && abs_i != abs_j {
+            session.candidates.swap(abs_i, abs_j);
+        }
+        KeyOutcome::consumed(self.state(session))
+    }
+
     /// 原位删除：可管理词条（Dict/UserWord）写 {删除}；其余仅从当前
     /// 展示移除（源不可管理，无持久化——重查会回来，与旧行为一致）。
     pub fn op_drop_candidate_abs(&mut self, session: &mut Session, abs: usize) -> KeyOutcome {
@@ -6533,6 +6551,46 @@ mod tests {
         let restored = eng.schema.dict.lookup("jd");
         let rt: Vec<&str> = restored.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(rt, ["就", "到的", "加"], "原始码表不受污染");
+    }
+
+    // 【按住Ctrl调频·对调 2026-11】op_swap_positions_abs：原位交换两候选
+    //（raw/页/选不动——尾巴态不翻转），配 adjust_set_order 整序落盘后
+    // reload 仍保持交换序；越界/同位无操作。
+    #[test]
+    fn swap_positions_inplace_and_persist() {
+        let (mut eng, dir) = test_engine("freqswap");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts0: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts0, vec!["就", "到的", "加"], "初始序");
+        // 原位交换 0/2：raw/selected 原样
+        s.selected = 0;
+        let _ = eng.op_swap_positions_abs(&mut s, 0, 2);
+        let texts1: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts1, vec!["加", "到的", "就"], "0↔2 原位交换");
+        assert_eq!(s.raw, "jd", "raw 保留（尾巴态不翻转）");
+        assert_eq!(s.selected, 0, "选中位保留");
+        // 越界/同位：无操作
+        let _ = eng.op_swap_positions_abs(&mut s, 0, 9);
+        let _ = eng.op_swap_positions_abs(&mut s, 1, 1);
+        let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts2, texts1, "越界/同位无操作");
+        // 整序落盘（对调管线同右键菜单：swap → set_order → 占位符同步）
+        eng.adjust_set_order(&s, "jd");
+        let _ = eng.sync_placeholder_texts(&mut s);
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}jd"), "整序标记: {log}");
+        assert!(log.contains("{添加}jd\t加\tp1"), "加 到 p1: {log}");
+        assert!(log.contains("{添加}jd\t就\tp3"), "就 到 p3: {log}");
+        // reload 后交换序保持（延迟重载语义：候选框消失才真 reload——
+        // 这里直接 reload_user_data 模拟收场）
+        eng.reload_user_data();
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let texts3: Vec<String> = s2.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts3, vec!["加", "到的", "就"], "reload 后交换序保持: {texts3:?}");
     }
 
     // 【格式统一 2026-09-06】用户调整.txt（新主文件）= {标记} 统一格式；

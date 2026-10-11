@@ -328,6 +328,77 @@ pub fn dispatch(
                 .unwrap_or_else(|_| serde_json::json!({}));
             serde_json::json!({"ok": true, "state": state})
         }
+        // 【按住Ctrl调频·对调 2026-11】候选窗模态调频的交换动作（Windows
+        // DLL）：i/j=页内下标（与渲染同序），text_i/text_j=词文本（异步
+        // 重排漂移校验：页内不符则按词全列表重找）。**原位重排**（纯位次
+        // 口径：不 clear 不重查，raw/页/选全保——尾巴态不翻转），落盘走
+        // adjust_set_order 整套 pN（两词同码一次、异码各一次），与右键
+        // 菜单同管线。响应带刷新后的 state 供 DLL 即时重绘（+对调动效）。
+        "cand_swap" => {
+            let page_size = host.engine.config.candidates.page_size.max(1);
+            let start = host.session.page * page_size;
+            let get_page = |i: usize| {
+                host.session
+                    .candidates
+                    .get(start + i)
+                    .map(|c| c.text.as_str())
+            };
+            // 页内下标优先（词校验），漂移则按词页内重找→全列表兜底。
+            let resolve = |want: usize, text: &str| -> Option<usize> {
+                if let Some(t) = get_page(want) {
+                    if text.is_empty() || t == text {
+                        return Some(start + want);
+                    }
+                }
+                if text.is_empty() {
+                    return None;
+                }
+                (0..page_size)
+                    .find(|&i| get_page(i) == Some(text))
+                    .map(|i| start + i)
+                    .or_else(|| {
+                        host.session
+                            .candidates
+                            .iter()
+                            .position(|c| c.text == text)
+                    })
+            };
+            let i = req.get("i").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let j = req.get("j").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let ti = req.get("text_i").and_then(|v| v.as_str()).unwrap_or("");
+            let tj = req.get("text_j").and_then(|v| v.as_str()).unwrap_or("");
+            let (Some(pi), Some(pj)) = (i, j) else {
+                return serde_json::json!({"ok": false, "why": "参数无效"});
+            };
+            // 页内渲染序对调才有意义：跨页/越界拒绝（模态只显示当前页）。
+            if pi >= page_size || pj >= page_size || pi == pj {
+                return serde_json::json!({"ok": false, "why": "下标无效"});
+            }
+            let (Some(a), Some(b)) = (resolve(pi, ti), resolve(pj, tj)) else {
+                return serde_json::json!({"ok": false, "why": "候选不在当前页"});
+            };
+            let total = host.session.candidates.len();
+            if a >= total || b >= total || a == b {
+                return serde_json::json!({"ok": false, "why": "候选不在当前页"});
+            }
+            // 先取两词的码（原位交换会动列表），同码只整序一次。
+            let code_a = host.session.candidates[a].code.clone();
+            let code_b = host.session.candidates[b].code.clone();
+            let h: &mut Host = &mut host;
+            let _ = h.engine.op_swap_positions_abs(&mut h.session, a, b);
+            if !code_a.is_empty() {
+                let _ = h.engine.adjust_set_order(&h.session, &code_a);
+            }
+            if !code_b.is_empty() && code_b != code_a {
+                let _ = h.engine.adjust_set_order(&h.session, &code_b);
+            }
+            // 【占位符变号·显示同步】落盘已改号，活会话文本同步（同右键
+            // 菜单：窗口立即显示 ④，raw/页/选不动）。
+            let _ = h.engine.sync_placeholder_texts(&mut h.session);
+            let state = serde_json::to_value(host.engine.state(&host.session))
+                .unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({"ok": true, "state": state})
+        }
         // 配置读取/写入（fcitx5 设置页用；Windows 前端不使用本 op）。
         // 读=全量 JSON；写=全量 JSON（客户端侧做「读-改-写」合并，避免
         // 部分字段缺省被 serde 默认值覆盖——与 Web 设置页同语义）。
@@ -1418,5 +1489,92 @@ mod candidate_tests {
                 .unwrap()
                 .len()
         );
+    }
+
+    // 【按住Ctrl调频·对调 2026-11】cand_swap op：页内下标+词校验 →
+    // 原位交换（raw/页/选保活）+ 整序落盘；漂移按词重找；同位/越界/
+    // 不在页拒绝。
+    #[test]
+    fn cand_swap_op_inplace_and_drift() {
+        let root = std::env::temp_dir().join(format!("hufu-cand-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\na\t甲\na\t乙\na\t丙\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        let host = Mutex::new(h);
+        let key = json!({"op":"key","key":"a"});
+        let r = dispatch(&host, &key, None);
+        assert_eq!(
+            r["state"]["candidates"][0]["text"],
+            json!("甲"),
+            "首选拍板: {r}"
+        );
+        // 1↔3（页内 0/2）：原位交换，raw/selected 保活
+        {
+            let mut g = host.lock().unwrap();
+            g.session.selected = 1;
+        }
+        let sw = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"甲","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(sw["ok"], json!(true), "对调成功: {sw}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "乙", "甲"], "原位交换: {texts:?}");
+        {
+            let g = host.lock().unwrap();
+            assert_eq!(g.session.raw, "a", "raw 保活（尾巴态不翻转）");
+            assert_eq!(g.session.selected, 1, "选中位保活");
+        }
+        assert_eq!(sw["state"]["candidates"][0]["text"], json!("丙"));
+        // 落盘：整序标记 + 整套 pN（用户调整.txt 落方案目录）
+        let log = std::fs::read_to_string(root.join("码表/T/用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}a"), "整序标记: {log}");
+        assert!(log.contains("{添加}a\t丙\tp1"), "丙 p1: {log}");
+        assert!(log.contains("{添加}a\t甲\tp3"), "甲 p3: {log}");
+        // 漂移：异步重排把词挪位（模拟 0/1 互换）——旧下标+正确词文本
+        // 仍按词解析成功
+        {
+            host.lock().unwrap().session.candidates.swap(0, 1);
+        }
+        let sw2 = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"甲","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(sw2["ok"], json!(true), "漂移按词重找: {sw2}");
+        let texts2: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        // 漂移后按词对调：手动 swap(0,1) 后列表 [乙,丙,甲]——甲(位2)↔丙(位1)
+        // → [乙,甲,丙]（词本位交换，与旧下标无关）
+        assert_eq!(texts2, ["乙", "甲", "丙"], "漂移后对调: {texts2:?}");
+        // 同位 / 越界 / 词不在页 → ok:false
+        let same = dispatch(&host, &json!({"op":"cand_swap","i":1,"j":1}), None);
+        assert_eq!(same["ok"], json!(false), "同位拒绝");
+        let oob = dispatch(&host, &json!({"op":"cand_swap","i":0,"j":9}), None);
+        assert_eq!(oob["ok"], json!(false), "页外拒绝");
+        let miss = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"不存在","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(miss["ok"], json!(false), "词不在列表拒绝");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
