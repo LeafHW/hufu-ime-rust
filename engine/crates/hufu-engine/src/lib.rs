@@ -1773,9 +1773,12 @@ impl Engine {
         // 按翻页键会直接上屏「=+第二页首选」——有候选时翻页键不能
         // 因为翻不动就自动上屏。现行为与「其余配置翻页键」同口径：
         // on_page 纯翻页（末页循环回首页，单页吞键原地不动）。要打
-        // -/= 本身：清屏（Esc）后空态直出。Shift 形态（—— / +）同
-        // 基键方向翻页。须在 Shift 标点拦截之前。
-        if (c == '-' || c == '=') && !session.candidates.is_empty() {
+        // -/= 本身：清屏（Esc）后空态直出。
+        // 【Shift 形态=顶屏 2026-10-11 用户反馈】Shift+-/= 不再同基键
+        // 翻页——落到下方 Shift 标点顶字链（Shift+= 出「首选＋＋」、
+        // Shift+- 出「首选＿」，自定义 Shift+符号串优先）：翻页键纯翻页
+        // 化把这条老手感一并杀了，本条还给它。纯 -/= 翻页零变化。
+        if (c == '-' || c == '=') && !shift && !session.candidates.is_empty() {
             let dir = if c == '-' { -1 } else { 1 };
             return self.on_page(session, dir);
         }
@@ -5794,13 +5797,31 @@ mod tests {
         let out2 = eng.process_key(&mut s, key('='));
         assert!(out2.commit.is_none(), "单页 = 不上屏（旧顶字已废）");
         assert_eq!(s.raw, "jd", "编码保持");
-        // Shift 形态同向翻页，不上屏
-        let out3 = eng.process_key(&mut s, {
+        // 【Shift+-/= =顶屏 2026-10-11 用户反馈】翻页键纯翻页化把
+        // Shift 形态的老手感（首选+符号顶字）一并杀了——还给它：
+        // Shift+- 顶「就——」（_ 全角映射）、Shift+= 顶「就+」
+        //（+ 在虎爪半角组，半角原样），纯 -/= 翻页零变化（上方断言
+        // 覆盖）。自定义 Shift+符号串优先（shift_symbols）。
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let out3 = eng.process_key(&mut s3, {
             let mut k = key('-');
             k.modifiers.shift = true;
             k
         });
-        assert!(out3.commit.is_none(), "Shift+- 同向翻页不上屏");
+        assert_eq!(out3.commit.as_deref(), Some("就——"), "Shift+- 顶屏 首选+——");
+        assert!(s3.raw.is_empty(), "顶屏后清屏");
+        let mut s3b = Session::new(true);
+        eng.process_key(&mut s3b, key('j'));
+        eng.process_key(&mut s3b, key('d'));
+        let out3b = eng.process_key(&mut s3b, {
+            let mut k = key('=');
+            k.modifiers.shift = true;
+            k
+        });
+        assert_eq!(out3b.commit.as_deref(), Some("就+"), "Shift+= 顶屏 首选+（半角组）");
+        // 无候选时 Shift+-/= 不顶不翻——空态符号链照旧（不在此测映射细节）
 
         // 多页场景：临时把 page_size 调 2（jd 3 候选 → 2 页）
         let mut s4 = Session::new(true);

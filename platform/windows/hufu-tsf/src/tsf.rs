@@ -5292,6 +5292,14 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
     } else {
         raw
     };
+    // 【内联关闭回归修 2026-10-11 用户反馈】T8 头部把 raw_disp 钉死成
+    // aux-only（编码只活在宿主预编辑里）——但 inline_preedit=false
+    //（设置页「编码内联到应用」关）时 tsf 侧 preedit 恒空、宿主里没有
+    // 编码，候选框编码行是唯一展示位。上方 raw（L5257 段）本就带完整
+    // 内联/show_code 语义（内联关 → raw_state 拼合），此处按内联状态
+    // 放行给 show 链：内联开=照旧 T8 的 aux-only，内联关=富 raw。
+    // candwin2::show 咽喉层同款判定双保险（皮肤同源读法）。
+    let raw_disp = if !inline_on { raw.clone() } else { raw_disp };
     trace(&format!(
         "cands={} raw='{}' cand2={} dead={}",
         cands.len(),

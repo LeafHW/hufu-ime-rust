@@ -2069,7 +2069,24 @@ impl CandidateWindowV2 {
         // 真 raw 的旧车道）照旧恒空，T8 防线不破。trace 实锤此前提示
         // 串到达 show 门口即被本行丢弃（注入层 raw='·〔反查〕' 而
         // show[入] raw=''）。
-        let raw = if _raw_req.contains('〔') { _raw_req } else { "" };
+        // 【内联关闭回归修 2026-10-11 用户反馈】皮肤 layout.inline_preedit
+        // =false（设置页「编码内联到应用」关）时编码不进宿主文本流
+        //（tsf.rs 侧 preedit 恒空），候选框编码行是编码**唯一**展示位
+        // ——本咽喉若再吞 raw，编码就哪都不显示（用户实锤）。放行条
+        // 件加 !inline_on：内联开着=框内照旧恒空（T8 铁律不破），关着
+        // =真 raw 透传给编码行。皮肤读法与 anim 同源（顶层或 /skin 包
+        // 皮两种形态都认，缺省=true 内联）。
+        let inline_on = skin
+            .pointer("/skin/layout/inline_preedit")
+            .or_else(|| skin.pointer("/layout/inline_preedit"))
+            .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let raw = if _raw_req.contains('〔') || !inline_on {
+            _raw_req
+        } else {
+            ""
+        };
         // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
         // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
         // 「上一段落点」已变「本段落点」，起点≡终点，追赶永不臂=全程直
