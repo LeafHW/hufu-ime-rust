@@ -600,6 +600,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 数字/Ctrl+Shift+数字/{加词} 同语义，全部只写「用户调整」）。
             // 旧「右键=解锁固定位」移到中键（0x207）。未命中候选=无菜单。
             crate::tsf::trace("cw2: rdown（调频菜单）");
+            // 【组段复活·菜单开时武装 2026-10-12】菜单 owner 抢前台瞬间
+            // 宿主就杀组段（虚线立刻没了——用户规格「不退出编码状态」）。
+            // 此刻即武装交互收场标记：poll（≤140ms，模态循环也泵定时
+            // 器）马上复活组段——菜单开着虚线也回来；收场 note 再武装
+            // 一次兜底（幂等：活组段重发同文本=空操作）。
+            crate::tsf::cand_interact_note();
             if !crate::tsf::addword_tl_thread() {
                 unsafe { cand_menu_popup(lparam) };
             }

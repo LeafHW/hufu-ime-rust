@@ -1783,9 +1783,13 @@ fn handle_set_focus(
 // 【Caps 补偿抑制窗·全局原子 2026-10-12 二次】延时复检线程不能带
 // Shared（内含 COM 裸指针非 Send）——抑制窗从 Shared 挪到进程级原子
 // 钟（unix ms）：键入口检查与即时/延时两路 arm 同一口钟。
-static CAPS_FIXUP_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-// 延时复检线程单飞闸（两键 150ms 内连击防双翻：先到独占，后到弃权）
+static CAPS_FIXUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CAPS_FIXUP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// 延时复检代数：每次真实 Caps 击键 +1——在飞复检线程收尾比对，跑期
+// 又有新击键则延长观察（旧单飞直接弃权=快击漏修，用户实锤常亮）。
+/// 合成 Caps 翻转键的 dwExtraInfo 魔法标记（"HUFU"）——键入口只吞
+/// 带标记的合成事件，真实用户快击永不被时间窗误吞（用户实锤）。
+const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
 
 fn caps_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1793,12 +1797,15 @@ fn caps_now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-fn caps_fixup_arm() {
-    CAPS_FIXUP_UNTIL_MS.store(caps_now_ms() + 400, std::sync::atomic::Ordering::Relaxed);
-}
-fn caps_fixup_active() -> bool {
-    let until = CAPS_FIXUP_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
-    until != 0 && caps_now_ms() < until
+/// 合成一对 Caps 翻转（带魔法标记；查后翻语义由调用方保证）。
+fn caps_synth_flip() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
+    };
+    unsafe {
+        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), CAPS_FIXUP_MAGIC);
+        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, CAPS_FIXUP_MAGIC);
+    }
 }
 
 // ── 【候选窗焦点矫正 2026-10-12】──────────────────────────────
@@ -2140,12 +2147,19 @@ impl HuFuTs_Impl {
         // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
         // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
         let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
-        // 【Caps 系统态补偿·吞合成键 2026-10-12】补偿窗口内的 CapsLock
-        // 事件全是自家 keybd_event 合成（翻回系统 OFF 位）——直通，
-        // 绝不递引擎（否则补偿键被当用户键再消费一次=模式连翻）。
-        if wparam == 0x14 && caps_fixup_active() {
-            crate::tsf::trace("caps: 补偿窗口内合成键 → 直通不递引擎");
-            return BOOL(0);
+        // 【Caps 系统态补偿·吞合成键 2026-10-12 三次】只吞自家 keybd_event
+        // 合成的翻转键（dwExtraInfo="HUFU" 魔法标记）——直通不递引擎
+        // （否则补偿键被当用户键再消费一次=模式连翻）。真实用户键不带
+        // 标记，永不被吞（旧 400ms 时间窗会误吞窗内真实快击——用户实
+        // 锤「快速打编码加 caps 有时选重不生效」）。
+        if wparam == 0x14 {
+            let extra = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
+            }.0 as usize;
+            if extra == CAPS_FIXUP_MAGIC {
+                crate::tsf::trace("caps: 合成翻转键（HUFU 标记）→ 直通不递引擎");
+                return BOOL(0);
+            }
         }
         // 【交互收场自愈·执行半 2026-10-12】候选窗点击/右键菜单收场后
         // 的第一键：焦点 NULL 自愈（BUG① 上屏失效的键路死支）+ 锚点
@@ -2708,33 +2722,43 @@ impl HuFuTs_Impl {
         // 件态与灯必须分离）；无自定义绑定走正常路径（锁大写/切英文
         // 的灯随物理翻转显示——锁大写亮灯恰是状态可见）。
         if name == "capslock" && consumed && keymap_has("capslock") {
-            // 即时：系统位已翻 ON → 合成一对翻回 OFF。
+            // 即时：系统位已翻 ON → 合成一对翻回 OFF（带魔法标记）。
             unsafe {
                 if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
                     crate::tsf::trace("caps: 系统大写位被翻转(即时) → 合成补偿键翻回 OFF");
-                    caps_fixup_arm();
-                    keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), 0);
-                    keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, 0);
+                    caps_synth_flip();
                 }
             }
-            // 延时复检：晚到的物理翻转/LED 未跟随兜底。无 Shared 捕获
-            //（COM 指针非 Send），纯原子钟+合成键——线程 Send 安全；
-            // 查后翻、幂等（已 OFF 不动）；单飞闸防连击双翻。
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                if CAPS_FIXUP_BUSY.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    return; // 已有一班复检在飞
-                }
-                unsafe {
-                    if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
-                        crate::tsf::trace("caps: 延时复检仍 ON → 补翻 OFF（LED 跟随）");
-                        caps_fixup_arm();
-                        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), 0);
-                        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, 0);
+            // 延时复检：晚到的物理翻转/LED 未跟随兜底。查后翻、幂等
+            //（已 OFF 不动）；代数循环——跑期间又有新击键则延长观察
+            //（单飞弃权=快击漏修，用户实锤「连按几次仍有概率常亮」）。
+            CAPS_FIXUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !CAPS_FIXUP_BUSY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                std::thread::spawn(|| {
+                    loop {
+                        let gen_at_start =
+                            CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed);
+                        for _ in 0..4 {
+                            std::thread::sleep(std::time::Duration::from_millis(120));
+                            unsafe {
+                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
+                                    crate::tsf::trace("caps: 延时复检仍 ON → 补翻 OFF（LED 跟随）");
+                                    caps_synth_flip();
+                                    // 本观察窗只翻一次：合成键状态传播有竞
+                                    // 态窗，连续两翻会净翻回 ON。
+                                    break;
+                                }
+                            }
+                        }
+                        if CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed)
+                            == gen_at_start
+                        {
+                            break; // 观察期内无新击键——收工
+                        }
                     }
-                }
-                CAPS_FIXUP_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+                    CAPS_FIXUP_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
         }
         // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
         // escape 预判用）：任何键响应 state 都可能翻转它（上屏后
@@ -3792,7 +3816,40 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) {
     }
     let got = &buf[..fetched as usize];
     if got != want.as_slice() {
-        trace("orphan: 插入点左侧与旧预编辑不符——放弃回收（防误删）");
+        // 【右侧收编 2026-10-12 二次】VSCode/Chromium 取消组段常把光标
+        // 挪到段首——孤儿字母在插入点【右侧】（trace 实锤「不符→放弃
+        // →复活重写=多一个带虚线的d」）。同款校验式回收：ShiftEnd 扩
+        // 选 n 字、GetText 一致才清，绝不误删。
+        let Ok(mut range2) = selection_range(ctx, ec) else {
+            trace("orphan: 插入点左侧不符且无法重建选区——放弃回收");
+            return;
+        };
+        let mut total2 = 0i32;
+        for _ in 0..want.len() {
+            let mut moved = 0i32;
+            if unsafe { range2.ShiftEnd(ec, 1, &mut moved, std::ptr::null_mut()) }.is_err()
+                || moved == 0
+            {
+                break;
+            }
+            total2 += moved;
+        }
+        if total2 == 0 {
+            trace("orphan: 左右两侧均无孤儿文本——放弃回收（防误删）");
+            return;
+        }
+        let mut buf2 = vec![0u16; total2 as usize + 1];
+        let mut fetched2 = 0u32;
+        if unsafe { range2.GetText(ec, 0, &mut buf2, &mut fetched2) }.is_err() {
+            return;
+        }
+        if &buf2[..fetched2 as usize] != want.as_slice() {
+            trace("orphan: 右侧也与旧预编辑不符——放弃回收（防误删）");
+            return;
+        }
+        let empty: Vec<u16> = Vec::new();
+        let ok = unsafe { range2.SetText(ec, 0, &empty) }.is_ok();
+        trace(&format!("orphan: 右侧回收 {} 个字母 ok={}", total2, ok));
         return;
     }
     let empty: Vec<u16> = Vec::new();
@@ -8395,6 +8452,20 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【交互收场自愈·poll 路 2026-10-12】dispatch 键入口的自愈在键路已
+    // 死（候选窗左键把 TSF 焦点抖成 NULL——IME sink 不再收键）时永远等
+    // 不到第一键（BUG① 左键路径用户实锤：空格/选重全无反应只剩字母）。
+    // poll 窗与 dispatch 同线程（窗口线程亲和）——每拍顺手执行挂起的
+    // 自愈：焦点复活+锚点补探不再依赖键路（≤140ms 到达，人手速之外）。
+    // 【菜单期也跑 2026-10-12 二次】菜单 owner 抢前台瞬间宿主杀组段
+    //（虚线立刻没了）——菜单模态循环也泵定时器，此刻即复活（焦点归
+    // 位自带菜单闸不抢）；渲染独占保护不受影响（本块不渲染）。
+    {
+        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
+        if let Some(s) = sp {
+            cand_interact_recover_pending(&s);
+        }
+    }
     // 【候选窗焦点矫正·记忆 2026-10-12】每拍记忆前台宿主编辑窗（本
     // 输入法窗口不记）——交互收场 SetFocus 归位用。只读 GUIThreadInfo
     // +类名，无锁无管道，零扰动。
@@ -8413,17 +8484,6 @@ fn poll_tick() {
     // 本 poll 自然恢复。
     if crate::addword::is_open() && !crate::addword::in_window_thread() {
         return;
-    }
-    // 【交互收场自愈·poll 路 2026-10-12】dispatch 键入口的自愈在键路已
-    // 死（候选窗左键把 TSF 焦点抖成 NULL——IME sink 不再收键）时永远等
-    // 不到第一键（BUG① 左键路径用户实锤：空格/选重全无反应只剩字母）。
-    // poll 窗与 dispatch 同线程（窗口线程亲和）——每拍顺手执行挂起的
-    // 自愈：焦点复活+锚点补探不再依赖键路（≤140ms 到达，人手速之外）。
-    {
-        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
-        if let Some(s) = sp {
-            cand_interact_recover_pending(&s);
-        }
     }
     // 【首键延迟优化·候选窗预热 2026-09-14】首键 110ms 实测大头=
     // 候选窗冷创建（DComp 设备+DWrite 系统字体集首次加载；引擎
