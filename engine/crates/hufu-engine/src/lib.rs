@@ -5285,6 +5285,99 @@ impl Engine {
         Some((builtin, custom))
     }
 
+    fn display_candidate(&self, c: &Candidate) -> Option<Candidate> {
+        let mut c = c.clone();
+        if c.text.starts_with('{') && c.text.ends_with('}') && c.text.len() > 2 {
+            let tag = &c.text[1..c.text.len() - 1];
+            if tag == "重复上屏" {
+                if self.last_commit.is_empty() {
+                    return None;
+                }
+                c.text = self.last_commit.clone();
+            } else if let Some(digits) = tag.strip_prefix("重复上屏") {
+                // 【上屏历史栈 2026-11】{重复上屏N}（N≥2）显示
+                // 倒数第 N 条历史；不足时不显示该候选。
+                if !digits.is_empty() && digits.chars().all(|d| d.is_ascii_digit()) {
+                    if let Ok(n) = digits.parse::<usize>() {
+                        if n >= 2 {
+                            match self.commit_history_at(n) {
+                                Some(t) => c.text = t.clone(),
+                                None => return None,
+                            }
+                        }
+                    }
+                }
+            } else if tag == "加词" {
+                c.text = "＋加词".into();
+            } else if tag == "加权" {
+                c.text = "＊加权".into();
+            } else if tag == "隐藏候选" {
+                c.text = "－隐藏候选".into();
+            } else if tag == "撤回" {
+                // 【{撤回} 2026-11】功能提示；无历史时隐藏（无
+                // 可撤对象，显示空操作候选无意义）。
+                if self.commit_history.is_empty() {
+                    return None;
+                }
+                c.text = "↩撤回".into();
+            } else if let Some(v) = dynamic::expand(tag) {
+                c.text = v;
+            }
+        }
+        Some(c)
+    }
+
+    /// Read-only projection of actual pages, never confirmation animation frames.
+    pub fn candidate_menu(&self, session: &Session) -> Option<hufu_types::CandidateMenu> {
+        if session.raw.is_empty() || session.candidates.is_empty() {
+            return None;
+        }
+        let size = self.config.candidates.page_size.max(1);
+        if session.selected >= session.candidates.len()
+            || session.page >= session.candidates.len().div_ceil(size)
+        {
+            return None;
+        }
+        // on_page retains the navigation cursor. The original window highlights
+        // the first item when that cursor is outside the current page.
+        let selected_abs = if session.selected / size == session.page {
+            session.selected
+        } else {
+            session.page * size
+        };
+        let mut menu = hufu_types::CandidateMenu {
+            texts: Vec::new(),
+            pages: Vec::new(),
+            selected: 0,
+            page: session.page as u32,
+        };
+        let mut bytes = 0usize;
+        for (page, chunk) in session.candidates.chunks(size).enumerate() {
+            menu.pages.push(menu.texts.len() as u32);
+            for (offset, c) in chunk.iter().enumerate() {
+                let selected = page * size + offset == selected_abs;
+                match self.display_candidate(c) {
+                    Some(c) if !c.text.is_empty() => {
+                        // Conservative JSON escaping bound; final wire envelope is also bounded.
+                        bytes = bytes.saturating_add(c.text.len().saturating_mul(6) + 16);
+                        if bytes > (1 << 20) - 4096 {
+                            return None;
+                        }
+                        if selected {
+                            menu.selected = menu.texts.len() as u32;
+                        }
+                        menu.texts.push(c.text);
+                    }
+                    _ if selected => return None,
+                    _ => {}
+                }
+            }
+            if menu.pages.last().copied() == Some(menu.texts.len() as u32) {
+                return None;
+            }
+        }
+        Some(menu)
+    }
     pub fn state(&self, session: &Session) -> SessionState {
         let page_size = self.config.candidates.page_size.max(1);
         let pages = (session.candidates.len() + page_size - 1) / page_size;
@@ -5302,50 +5395,14 @@ impl Engine {
         // 没上过屏则不显示该候选）；{加词}/{隐藏候选} 显示功能提示。
         // 只改显示层（session.candidates 原样）——选中提交走
         // resolve_dynamic，与显示一致。
-        let shown: Vec<Candidate> = session.candidates[start..end]
-            .iter()
-            .filter_map(|c| {
-                let mut c = c.clone();
-                if c.text.starts_with('{') && c.text.ends_with('}') && c.text.len() > 2 {
-                    let tag = &c.text[1..c.text.len() - 1];
-                    if tag == "重复上屏" {
-                        if self.last_commit.is_empty() {
-                            return None;
-                        }
-                        c.text = self.last_commit.clone();
-                    } else if let Some(digits) = tag.strip_prefix("重复上屏") {
-                        // 【上屏历史栈 2026-11】{重复上屏N}（N≥2）显示
-                        // 倒数第 N 条历史；不足时不显示该候选。
-                        if !digits.is_empty() && digits.chars().all(|d| d.is_ascii_digit()) {
-                            if let Ok(n) = digits.parse::<usize>() {
-                                if n >= 2 {
-                                    match self.commit_history_at(n) {
-                                        Some(t) => c.text = t.clone(),
-                                        None => return None,
-                                    }
-                                }
-                            }
-                        }
-                    } else if tag == "加词" {
-                        c.text = "＋加词".into();
-                    } else if tag == "加权" {
-                        c.text = "＊加权".into();
-                    } else if tag == "隐藏候选" {
-                        c.text = "－隐藏候选".into();
-                    } else if tag == "撤回" {
-                        // 【{撤回} 2026-11】功能提示；无历史时隐藏（无
-                        // 可撤对象，显示空操作候选无意义）。
-                        if self.commit_history.is_empty() {
-                            return None;
-                        }
-                        c.text = "↩撤回".into();
-                    } else if let Some(v) = dynamic::expand(tag) {
-                        c.text = v;
-                    }
-                }
-                Some(c)
-            })
-            .collect();
+        let shown: Vec<Candidate> = session.candidates[start..end].iter()
+            .filter_map(|c| self.display_candidate(c)).collect();
+        let selected = session.selected.checked_sub(start)
+            .filter(|_| session.selected < end)
+            .and_then(|i| self.display_candidate(&session.candidates[start + i]).map(|_| {
+                session.candidates[start..start+i].iter()
+                    .filter(|c| self.display_candidate(c).is_some()).count()
+            })).unwrap_or(0);
         SessionState {
             raw: raw_disp,
             preedit,
@@ -5353,11 +5410,7 @@ impl Engine {
             page: session.page,
             page_count: pages,
             // 高亮（页内下标）：↑↓ 已同步页码，越界兜底 0
-            selected: if session.selected >= start && session.selected < end {
-                session.selected - start
-            } else {
-                0
-            },
+            selected,
             aux: match session.mode {
                 // 【2026-09-05】反查提示精简为「〔反查〕」——TSF 端把它与
                 // raw 拼接成编码行「〔反查〕 ni」，全程提示反查态。
@@ -5395,6 +5448,64 @@ mod tests {
     use super::*;
     use hufu_types::Modifiers;
 
+    #[test]
+    fn candidate_menu_real_pages_and_display() {
+        let (mut e, _dir) = test_engine("candidate-menu");
+        e.config.candidates.page_size = 2;
+        let mut s = Session::new(true);
+        s.raw = "abc".into();
+        s.candidates = ["甲", "乙", "𠀀é", "末"]
+            .iter()
+            .map(|t| Candidate::new(*t, "a", CandidateKind::Sentence))
+            .collect();
+        for mode in [InputMode::Normal, InputMode::Reverse, InputMode::Command] {
+            s.mode = mode;
+            for selected in 0..4 {
+                s.selected = selected;
+                s.page = selected / 2;
+                let menu = e.candidate_menu(&s).unwrap();
+                assert_eq!(menu.pages, vec![0, 2]);
+                assert_eq!(menu.selected, selected as u32);
+                assert_eq!(menu.page, s.page as u32);
+                let state = e.state(&s);
+                assert_eq!(
+                    state
+                        .candidates
+                        .iter()
+                        .map(|c| c.text.clone())
+                        .collect::<Vec<_>>(),
+                    menu.texts[s.page * 2..s.page * 2 + 2]
+                );
+                assert_eq!(state.selected, selected % 2);
+            }
+        }
+        s.page = 0;
+        s.selected = 1;
+        s.candidates[0].text = "{重复上屏}".into();
+        let menu = e.candidate_menu(&s).unwrap();
+        assert_eq!(menu.pages, vec![0, 1]);
+        assert_eq!(menu.selected, 0);
+        assert_eq!(e.state(&s).selected, 0);
+        s.selected = 0;
+        assert!(e.candidate_menu(&s).is_none());
+        s.selected = 2;
+        s.page = 1;
+        s.candidates[1].text = "{重复上屏2}".into();
+        assert!(e.candidate_menu(&s).is_none()); // hidden whole first page
+        s.candidates[0].text = "{日期}".into();
+        let a = e.candidate_menu(&s).unwrap();
+        let b = e.candidate_menu(&s).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a.texts[0],
+            e.display_candidate(&s.candidates[0]).unwrap().text
+        );
+        s.raw.clear();
+        assert!(e.candidate_menu(&s).is_none());
+        s.raw = "a".into();
+        s.candidates[0].text = "x".repeat(1 << 20);
+        assert!(e.candidate_menu(&s).is_none());
+    }
     fn key(c: char) -> KeyInput {
         KeyInput {
             key: KeyCode::Char(c),

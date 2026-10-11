@@ -523,13 +523,15 @@ pub fn key_request(
         body.extend_from_slice(b",\"digit_tail\":");
         serde_json::to_writer(&mut body, t).ok()?;
     }
+    body.extend_from_slice(b",\"candidate_ui\":");
+    serde_json::to_writer(&mut body, &crate::candidate_ui::request()).ok()?;
     body.extend_from_slice(b"}");
     let mut frame: Vec<u8> = Vec::with_capacity(body.len() + 4);
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(&body);
     // 键通道（与后台物理分离）+ 完整超时（server 正常 <3ms；上限保留
     // 给极端恢复场景）
-    let mut resp = call_on(&PIPE_KEY, &frame, 2000, 1000)?;
+    let mut resp = match call_on(&PIPE_KEY, &frame, 2000, 1000) { Some(r)=>r, None=>{crate::candidate_ui::reset();return None;} };
     // 【热路径】state 用 take 移交所有权——旧版 .cloned() 每键深拷
     // 整棵 state 子树（候选数组/编码串全在里面）
     let state = resp
@@ -564,7 +566,7 @@ pub fn key_request(
 /// 轮询用：拉当前会话态（不产生按键副作用）。供候选窗停顿期刷新
 /// （异步重排到达后主动换序，用户不必按键即可看到新首选）。
 pub fn state_request() -> Option<Value> {
-    let resp = call(&serde_json::json!({"op": "state"}))?;
+    let resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()})) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
     resp.get("state").cloned()
 }
 

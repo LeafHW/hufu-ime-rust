@@ -952,6 +952,7 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
     }
 
     fn Deactivate(&self) -> Result<()> {
+        crate::candidate_ui::reset();
         // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
         // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
@@ -1064,6 +1065,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         // 兜底，无键宿主零负担。
         poll_arm(&self.shared);
         if !fforeground.as_bool() {
+            crate::candidate_ui::reset();
             // 【右键菜单免死金牌 2026-10-07】菜单 owner 抢前台期间不藏
             // 候选窗（菜单底下就是它，藏了=「点菜单候选先消失」）。
             if !crate::candwin2::cand_menu_open() {
@@ -1082,6 +1084,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        crate::candidate_ui::prepare(_pic);
         // 诊断：按键是否进入键盘钩（搜索框等特殊宿主排查）
         keys_log(&format!(
             "test vk={:#x} t={:?}",
@@ -1098,6 +1101,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        crate::candidate_ui::prepare(_pic);
         keys_log(&format!("testup vk={:#x}", wparam.0));
         Ok(self.dispatch(wparam.0, true, true, lparam.0 as usize))
     }
@@ -1108,6 +1112,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        crate::candidate_ui::prepare(_pic);
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
         //（游戏宿主不挂本 sink——聊天键流在子类化 WndProc 里，见 E7）
         let r = self.dispatch(wparam.0, false, false, lparam.0 as usize);
@@ -1127,6 +1132,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        crate::candidate_ui::prepare(_pic);
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
         keys_log(&format!("keyup vk={:#x}", wparam.0));
@@ -1197,10 +1203,12 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
     }
 
     fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        crate::candidate_ui::reset();
         Ok(())
     }
 
     fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        crate::candidate_ui::reset();
         Ok(())
     }
 }
@@ -1272,6 +1280,7 @@ impl windows::Win32::UI::TextServices::ITfActiveLanguageProfileNotifySink_Impl
 /// 引擎会话清零（fire-and-forget，与焦点清理同款不阻塞回调）。
 /// 【六十修】pub(crate)：候选窗看门狗（Win+Space 事件盲区兜底）复用。
 pub(crate) fn ime_switch_abort(shared: &SharedRef) {
+    crate::candidate_ui::reset();
     // 1) 文档侧：组段文本置空并结束（当前焦点 ctx）
     let ctx = shared
         .lock()
@@ -1362,6 +1371,7 @@ fn handle_set_focus(
     pdimfocus: Option<&ITfDocumentMgr>,
     pdimprevfocus: Option<&ITfDocumentMgr>,
 ) -> Result<()> {
+    crate::candidate_ui::reset();
     // pdimfocus：冲销目标兜底用（Excel 第三次声明 prev=NULL，四修
     // 实锤 prev_ctx=None 绕过冲销分支直通清理杀组段——焦点 ctx 即
     // 组段所在文档，用它跑保组段判定）。
@@ -4808,6 +4818,7 @@ fn dbg_tid() -> u32 {
 }
 
 pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
+    crate::candidate_ui::publish(&state);
     // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】候选框只画候选，
     // 编码段不画（编码以内联预编辑在宿主文本里，本就有——框内再画
     // 一遍是重复显示）。所有自绘窗渲染点统一用 raw_disp（恒空）；
@@ -6462,10 +6473,10 @@ fn caret_editable(shared: &SharedRef) -> bool {
     }
 }
 
-/// 沉浸式宿主候选显示（双通道）：
-/// 首帧 BeginUIElement——pbShow=TRUE 即宿主愿意代画（走 UIElement），
-/// FALSE 则降级 server 代画（pipe 推送候选+坐标，server 开窗绘制，
-/// 其普通桌面进程窗口不受容器隐身限制）。后续帧按通道更新。
+/// Original candidate rendering uses D2D or the server-owned window.
+/// The independent candidate_ui publisher exposes host-readable candidates.
+/// BeginUIElement's FALSE means the host may draw; it never stops notifications
+/// or hides the original window in this deliberately dual-window first version.
 /// 宿主是否打包应用（UWP/XAML Island）：exe 位于 WindowsApps 或
 /// SystemApps（SearchHost/Store/设置 等）。此类宿主里 DComp 直通窗
 /// 被 DWM cloak → 走 candwin3 普通分层窗（考古复活的 v1 路线）。
@@ -7611,12 +7622,12 @@ pub(crate) fn state_sig(state: &serde_json::Value) -> String {
     // 名后组词首拍即重画，显示恒等于会话真相，调频帧无从翻脸。
     let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         texts.join("\u{1}"),
         sel,
         zh.map(|b| b as u8).unwrap_or(2),
         aux,
-        raw
+        raw, state["page"], state["page_count"], state["candidate_ui"]["version"]
     )
 }
 
@@ -8277,5 +8288,25 @@ impl Drop for PollGuard {
     fn drop(&mut self) {
         // 【四十六修】线程局部版（见 poll_tick 注释）
         POLL_IN_TICK_TL.with(|f| f.set(false));
+    }
+}
+
+/// Enumerate the owning TSF thread's actual windows; works for agile getters too.
+pub(crate) fn candidate_window_visible(thread: u32) -> bool {
+    unsafe extern "system" fn visit(hwnd: HWND, value: LPARAM) -> BOOL {
+        let mut name=[0u16;64];
+        let n=windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd,&mut name);
+        if String::from_utf16_lossy(&name[..n.max(0) as usize]) == "HuFuCandWin2"
+            && windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            *(value.0 as *mut bool)=true;
+        }
+        BOOL(1)
+    }
+    let mut local=false;
+    unsafe {
+        let _=windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows(thread,Some(visit),LPARAM(&mut local as *mut bool as isize));
+        local || windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null()).ok()
+            .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
     }
 }

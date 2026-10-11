@@ -30,6 +30,7 @@ pub fn dispatch(
     client_exe: Option<&str>,
 ) -> serde_json::Value {
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
+    if matches!(req["op"].as_str(), Some("focus" | "reset")) { host.candidate_export.owner.clear(); }
     match req.get("op").and_then(|o| o.as_str()).unwrap_or("") {
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
         "key" => match parse_key(req) {
@@ -97,7 +98,11 @@ pub fn dispatch(
                         }
                     }
                 }
+                let owner = req.pointer("/candidate_ui/context").and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && s.len() <= 128).unwrap_or("").to_owned();
                 let mut r = host.process_key(k);
+                host.candidate_export.owner = owner;
+                export_candidates(&mut host, req, &mut r["state"]);
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
                 // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）
                 if host.engine.config.schema.current != schema_before {
@@ -355,6 +360,7 @@ pub fn dispatch(
             }
             let mut state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
+            export_candidates(&mut host, req, &mut state);
             // 【皮肤版本】DLL poll 比对后强制重拉（连续调参即时生效）
             state["skin_ver"] = serde_json::json!(host.skin_ver);
             // 【方案变更兜底 2026-09-11】state 常带当前方案名：DLL poll
@@ -1273,3 +1279,139 @@ mod unix_imp {
 
 #[cfg(not(windows))]
 pub use unix_imp::run as run_pipe;
+
+fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde_json::Value) {
+    if req
+        .pointer("/candidate_ui/protocol")
+        .and_then(|v| v.as_u64())
+        != Some(1)
+    {
+        return;
+    }
+    let context = req
+        .pointer("/candidate_ui/context")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let menu = if !context.is_empty() && context == host.candidate_export.owner {
+        host.engine.candidate_menu(&host.session)
+    } else {
+        None
+    };
+    state["candidate_ui"] = host.candidate_export.response(req, menu);
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn candidate_dispatch_animation_pages_query_and_cost() {
+        let root =
+            std::env::temp_dir().join(format!("hufu-candidate-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\na\t甲\na\t乙\na\t丙\na\t𠀀\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":2}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.candidates.page_size = 2;
+        let host = Mutex::new(h);
+        let request = |key: &str| json!({"op":"key","key":key,"candidate_ui":{"protocol":1,"context":"field-a"}});
+        let a = dispatch(&host, &request("a"), None);
+        assert_eq!(a["state"]["candidate_ui"]["menu"]["pages"], json!([0, 2]));
+        let query = json!({"op":"state","candidate_ui":{"protocol":1,"context":"field-a",
+            "instance":a["state"]["candidate_ui"]["instance"],"version":a["state"]["candidate_ui"]["version"]}});
+        let before = format!("{:?}", host.lock().unwrap().session);
+        let q = dispatch(&host, &query, None);
+        assert!(q["state"]["candidate_ui"].get("menu").is_none());
+        assert_eq!(format!("{:?}", host.lock().unwrap().session), before);
+        let foreign = dispatch(
+            &host,
+            &json!({"op":"state","candidate_ui":{"protocol":1,"context":"field-b"}}),
+            None,
+        );
+        assert!(foreign["state"]["candidate_ui"]["menu"].is_null());
+        assert!(dispatch(&host, &json!({"op":"state"}), None)["state"]
+            .get("candidate_ui")
+            .is_none());
+        let p = dispatch(&host, &request("pagedown"), None);
+        assert_eq!(p["state"]["candidate_ui"]["menu"]["page"], 1);
+        let commit = dispatch(&host, &request("2"), None);
+        assert!(commit["outcome"]["commit"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        assert!(
+            commit["state"]["candidate_ui"]["menu"].is_null(),
+            "confirmation frame must never be selectable"
+        );
+        // Residual input and asynchronous ranking use the live session, never outcome.state.
+        {
+            let mut h = host.lock().unwrap();
+            h.session.raw = "residual".into();
+            h.session.page = 1;
+            h.session.selected = 3;
+            h.session.candidates = ["甲", "乙", "丙", "丁"]
+                .iter()
+                .map(|s| hufu_types::Candidate::new(*s, "r", hufu_types::CandidateKind::Sentence))
+                .collect();
+        }
+        let r = dispatch(&host, &query, None);
+        assert_eq!(r["state"]["candidate_ui"]["menu"]["page"], 1);
+        {
+            host.lock().unwrap().session.candidates.swap(2, 3);
+        }
+        let reordered = dispatch(&host, &query, None);
+        assert_ne!(
+            r["state"]["candidate_ui"]["version"],
+            reordered["state"]["candidate_ui"]["version"]
+        );
+        {
+            host.lock().unwrap().session.candidates[0].text = "x".repeat(1 << 20);
+        }
+        assert!(dispatch(&host, &query, None)["state"]["candidate_ui"]["menu"].is_null());
+        dispatch(&host, &json!({"op":"reset"}), None);
+        assert!(dispatch(&host, &query, None)["state"]["candidate_ui"]["menu"].is_null());
+        // Frozen tiny dictionary; this measures isolated dispatch, not model/UI latency.
+        let mut samples = [Vec::<u128>::new(), Vec::new()];
+        for trial in 0..200 {
+            for enabled in 0..2 {
+                host.lock().unwrap().session.clear();
+                let req = if enabled == 1 {
+                    request("a")
+                } else {
+                    json!({"op":"key","key":"a"})
+                };
+                let t = std::time::Instant::now();
+                let response = dispatch(&host, &req, None);
+                let bytes = serde_json::to_vec(&response).unwrap().len();
+                if trial >= 20 {
+                    samples[enabled].push(t.elapsed().as_nanos());
+                }
+                if trial == 199 {
+                    println!("candidate benchmark enabled={enabled} response_bytes={bytes}");
+                }
+            }
+        }
+        for (i, s) in samples.iter_mut().enumerate() {
+            s.sort();
+            println!(
+                "candidate dispatch enabled={i} p50_ns={} p95_ns={}",
+                s[s.len() / 2],
+                s[s.len() * 95 / 100]
+            );
+        }
+        println!(
+            "candidate unchanged extension bytes={}",
+            serde_json::to_vec(&q["state"]["candidate_ui"])
+                .unwrap()
+                .len()
+        );
+    }
+}

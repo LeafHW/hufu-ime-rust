@@ -101,6 +101,7 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
 ];
 
 pub struct Host {
+    pub candidate_export: crate::candidate_export::Export,
     pub engine: Engine,
     pub session: Session,
     pub data_dir: PathBuf,
@@ -150,6 +151,7 @@ impl Host {
         let engine = Engine::new(data_dir, config)?;
         mark("engine(含词典)", &t0);
         let mut host = Host {
+            candidate_export: Default::default(),
             engine,
             session: Session::new(true),
             data_dir: data_dir.to_path_buf(),
@@ -717,6 +719,8 @@ impl Host {
 
     /// 按键 → (结果, 状态快照)。
     pub fn process_key(&mut self, key: KeyInput) -> serde_json::Value {
+        // Only an opted-in pipe key can subsequently claim this session.
+        self.candidate_export.owner.clear();
         // 通知重排 gemm：前台有按键，15ms 内让键（BelowNormal 池 + 让键双保险）
         hufu_rerank::note_foreground();
         // 【真机重排模拟 2026-09-05】HTTP /api/key 此前不派发也不应用

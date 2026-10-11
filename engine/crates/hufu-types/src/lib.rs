@@ -274,3 +274,12 @@ impl SessionState {
         self.raw.is_empty() && self.preedit.is_empty() && self.candidates.is_empty()
     }
 }
+
+/// Version-1 read-only candidate projection; page starts are absolute indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateMenu {
+    pub texts: Vec<String>,
+    pub pages: Vec<u32>,
+    pub selected: u32,
+    pub page: u32,
+}
