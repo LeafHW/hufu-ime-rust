@@ -380,6 +380,15 @@ pub struct Shared {
     pub space_ctrl_armed: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
+    /// 最近一次上屏文本（幻影选区识别用）
+    pub last_commit_text: String,
+    /// 【孤儿嫌疑标记 2026-10-12】只在 OnCompositionTerminated（宿主
+    /// 单方面杀段）时记录被杀文本——孤儿字母只在杀段后可能残留文档；
+    /// 正常上屏（组段活着走 SetText+End）绝不该清。此前孤儿清理按
+    /// preedit_last 非空即清：上屏「哪个」后 preedit_last 仍持旧值，
+    /// 下一键开组段时把**刚上屏的真文本**当孤儿删掉=吞字（用户实锤
+    /// d; d; 后「哪个」变「哪」）。清理路径只认本标记，取用即清。
+    pub orphan_suspect: Option<String>,
     /// 【三十四修·死字段删除】compose_at（Excel 保组段 80ms 时窗，六修
     /// 整体移除后只剩 3 处写入零读取）已删——现行判据是 CommitFocusRevoke
     /// 的选区验证（session 内）+ focus_revoke_kept 回传短路。
@@ -585,6 +594,8 @@ impl Shared {
             modekey_down_seen: None,
             space_ctrl_armed: false,
             preedit_last: String::new(),
+            last_commit_text: String::new(),
+            orphan_suspect: None,
             focus_revoke_kept: false,
             tm_sink_cookie: 0,
             lang_sink_cookie: 0,
@@ -1479,18 +1490,35 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
         //     原位回来）；活组段=幂等重写。用户规格「点击不该退出
         //     编码状态」：≤140ms 复活，肉眼近乎无感。
         if same_thread {
-            let (composing, preedit) = {
+            let (composing, preedit, comp_alive) = {
                 let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                (g.composing, g.preedit_last.clone())
+                (g.composing, g.preedit_last.clone(), g.composition.is_some())
             };
-            if composing && !preedit.is_empty() {
+            // 【活组段不复活 2026-10-12 十一次】免激活菜单后组段恒活
+            //——重发只会叠开第二组段。复活仅限句柄已死时。
+            if composing && !preedit.is_empty() && !comp_alive {
                 trace("cand_interact: 组段复活（重发预编辑·仅同步档）");
                 // 【仅同步档 2026-10-12 三次】VSCode 崩溃实锤（0xC0000409
                 // 两发同偏移）：菜单期同步会话被拒(0x8000FFFF)后降级异
                 // 步排队——过期会话 1.2s 后在宿主拆家状态执行=闪退。复活
                 // /补探绝不排队异步：被拒即在交互窗内重试（下一拍），
                 // 窗口过期自然放弃。异步恢复会话=时间炸弹，全线禁用。
-                if run_session_sync_only(&shared, Op::SetPreedit(preedit), ctx.clone()).is_err() {
+                // 【幽灵文档检测 2026-10-12 六次】会话「受理成功」≠写进
+                // 真文档：菜单模态/收场风暴期 Notepad3 的文本仓对范围操
+                // 作全程 0 字（全文空、Shift 双向 0 动=写蒸发）。以「会
+                // 话跑完组段仍死」为准——交互窗内重试，安定后必成。
+                let ghost_or_err = match run_session_sync_only(
+                    &shared,
+                    Op::ResurrectPreedit(preedit),
+                    ctx.clone(),
+                ) {
+                    Err(_) => true,
+                    Ok(()) => {
+                        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.composition.is_none()
+                    }
+                };
+                if ghost_or_err {
                     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                     if g.cand_interact_until
                         .is_some_and(|t| std::time::Instant::now() < t)
@@ -2186,6 +2214,28 @@ impl HuFuTs_Impl {
             if extra == CAPS_FIXUP_MAGIC {
                 crate::tsf::trace("caps: 合成翻转键（HUFU 标记）→ 直通不递引擎");
                 return BOOL(0);
+            }
+        }
+        // 【自绘免激活菜单键路 2026-10-12】菜单无焦点（NOACTIVATE），
+        // 键盘经宿主 TSF 到本 sink。宿主（CUAS）TestDown 吃掉后仍派
+        // KeyDown——TestDown 阶段只报「吃」零副作用（选择/关窗只能
+        // 在 KeyDown 执行一次）；KeyDown 全功能路由；收场后 200ms 吞
+        // 窗兜住二次到达的导航键（down 与 up 都吞：enter 二次到达会
+        // 触发引擎「回车=编码上屏」，自动测试实锤）。
+        if crate::candwin2::cand_menu_open() {
+            if !up && test_only && crate::candwin2::menu_nav_key(wparam as u32) {
+                return BOOL(1);
+            }
+            if !up && !test_only {
+                if crate::candwin2::menu_key(wparam as u32) {
+                    return BOOL(1);
+                }
+                if crate::candwin2::menu_swallow_key(wparam as u32) {
+                    return BOOL(1);
+                }
+            }
+            if up && crate::candwin2::menu_swallow_up(wparam as u32) {
+                return BOOL(1);
             }
         }
         // 【交互收场自愈·执行半 2026-10-12】候选窗点击/右键菜单收场后
@@ -3194,6 +3244,11 @@ enum Op {
     /// = 无光标。结果写 shared.esc_caret_ok（Some(bool)），空态 Esc
     /// 撤回预判的第二道门。只读不动文本。
     QueryCaret,
+    /// 【组段复活·recover 专用 2026-10-12 十次】与 SetPreedit 的死句柄
+    /// 路同语义但**Ghost 不写**：读不到文档（裂脑档）时盲开组段=复制
+    /// 字母（Notepad3 只写不读仓实锤）——报错重试到安定/窗口过期。键
+    /// 路的 SetPreedit 不走本 op（用户键绝不能丢）。
+    ResurrectPreedit(String),
 }
 
 #[implement(ITfEditSession)]
@@ -3297,23 +3352,39 @@ impl EditSession_Impl {
                 g.esc_caret_ok = Some(ok);
                 Ok(())
             }
+            Op::ResurrectPreedit(text) => {
+                // 【recover 专用复活 2026-10-12 十次】Ghost=读不到文档
+                //（Notepad3 只写不读仓）→ 盲写=复制字母，拒绝并重试；
+                // 可读（NotFound=自清/Cleared=清掉）才重组段。
+                // 【嫌疑标记化 2026-10-12】只清杀段挂的嫌疑文本。
+                let suspect = g.orphan_suspect.take().unwrap_or_default();
+                drop(g);
+                match clear_orphan_preedit(&ctx, ec, &suspect) {
+                    OrphanResult::Ghost => {
+                        trace("ResurrectPreedit: 裂脑档——拒绝盲写，待重试");
+                        Err(Error::from(HRESULT(-2147467259)))
+                    }
+                    other => {
+                        let _ = other;
+                        trace("ResurrectPreedit: 文档可读——孤儿已处理，重组段");
+                        start_preedit_on(&ctx, &self.shared, ec, &text)
+                    }
+                }
+            }
             Op::StartPreedit(text) => {
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
                 // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
-                // 【孤儿回收·StartPreedit 路 2026-10-12 二次】菜单/点击杀组段
-                // 清空句柄后，下一键重建走的是本 op 而非 SetPreedit——同样
-                // 必须先回收孤儿字母（trace 实锤：调频→退格→空格=「ae来」）。
-                // 仅交互收场窗内（≤800ms）才查：常规首键时 preedit_last 是上
-                // 一会话残留，可能与正文同形——绝不误删。
+                // 【孤儿回收·嫌疑标记化 2026-10-12 三次】只清杀段挂的
+                // 嫌疑文本——正常上屏后 preedit_last 与正文同形，按它清
+                // =吞字（用户实锤 d; d; 后「哪个」→「哪」）。
                 {
-                    let interact = g
-                        .cand_interact_until
-                        .is_some_and(|t| std::time::Instant::now() < t);
-                    if interact && !g.preedit_last.is_empty() {
-                        let old_preedit = g.preedit_last.clone();
-                        trace("StartPreedit: 交互窗内孤儿回收（防字母跟随上屏）");
+                    let suspect = g.orphan_suspect.clone();
+                    if let Some(old_preedit) = suspect.filter(|s| !s.is_empty()) {
+                        trace("StartPreedit: 嫌疑孤儿回收（杀段挂标）");
+                        let _ = g.orphan_suspect.take();
                         drop(g);
-                        clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        // 键路不阻塞：清尽力、写无条件（同 SetPreedit 路）。
+                        let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
                         // 重新拿锁继续标准流程
                         g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                     }
@@ -3322,6 +3393,21 @@ impl EditSession_Impl {
                 trace("SP: cast ok");
                 let range: ITfRange = selection_range(&ctx, ec)?;
                 trace("SP: GetSelection ok");
+                // 【幻影选区塌缩 2026-10-12】Chromium 系（QQ/VSCode）在
+                // 上屏后把选区留在「已上屏词末字」上（1 字宽）——本键
+                // SetText 会替换掉该字=吞字（用户实锤 d;d;「哪个哪个」→
+                // 「哪哪个」；SP探针 读="个个"=选区盖着「个」）。塌缩它。
+                // 【死锁修】末字从已持有的 g 读出传入，助手内不再拿锁。
+                let phantom_tail = g
+                    .last_commit_text
+                    .chars()
+                    .last()
+                    .map(|c| c.to_string());
+                if phantom_tail.is_some()
+                    && collapse_phantom_selection(phantom_tail, &ctx, ec, &range)
+                {
+                    trace("SP: 幻影选区（上屏末字残留）——塌缩到光标");
+                }
                 let sink: ITfCompositionSink = CompSinkObj {
                     shared: self.shared.clone(),
                 }
@@ -3381,13 +3467,22 @@ impl EditSession_Impl {
                     Some(c) => c,
                     // 【组段复活·None 路 2026-10-12】宿主终止回调已把
                     // 句柄清空（点击候选窗/菜单抢焦点的标准时序）——
-                    // composing 仍在（会话未清）且本键带文本：孤儿回收
-                    // 后原位重组段（poll 复活与次键自愈同一出口）。
-                    None if g.composing && !text.is_empty() => {
+                    // 本键带文本即复活：孤儿回收后原位重组段（poll 复活
+                    // 与次键自愈同一出口）。【四次·去 composing 依赖】
+                    // 菜单收场后 composing 旗也会被各路清理置假（自动
+                    // 测试实锤：退格路 SetPreedit 静默落 E_FAIL=字母
+                    // 残留主因）——句柄死+有文本就复活，旗不可信。
+                    None if !text.is_empty() => {
                         trace("SetPreedit: 组段句柄已被终止清空——孤儿回收后重组段");
-                        let old_preedit = g.preedit_last.clone();
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
                         drop(g);
-                        clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        // 【读可用宿主尽力清 2026-10-12 十次】Notepad3 类
+                        // 仓只写不读（GetText 恒空）——Ghost 也是常态，
+                        // 绝不能阻塞用户键：清尽力（Chromium 系能清），
+                        // 写无条件。【嫌疑标记化】无标记=正常上屏后=不清。
+                        if !old_preedit.is_empty() {
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        }
                         return start_preedit_on(&ctx, &self.shared, ec, &text);
                     }
                     None => return Err(Error::from(HRESULT(-2147467259))),
@@ -3398,15 +3493,18 @@ impl EditSession_Impl {
                     // 自愈：组段已被应用/焦点切换单方面终止（SetText 失败）——
                     // 弃死句柄，在当前上下文全新 StartComposition
                     // （此前表现为「有候选但中文永远上不了屏」）。
-                    // 【孤儿字母回收 2026-10-12】死组段的旧预编辑字母已
-                    // 残留插入点左侧——重开前先回收（校验一致才删），否
-                    // 则「字母跟着新文本一起上」。
+                    // 【孤儿字母回收·嫌疑标记化 2026-10-12】只清杀段挂的
+                    // 嫌疑文本（EndComposition 自愈路组段刚死，preedit_last
+                    // 与正文同形是常态——按它清=吞字）。
                     trace("SetPreedit: 死组段，自愈重开");
                     let _ = unsafe { comp.EndComposition(ec) };
                     g.composition = None;
-                    let old_preedit = g.preedit_last.clone();
+                    let old_preedit = g.orphan_suspect.take().unwrap_or_default();
                     drop(g);
-                    clear_orphan_preedit(&ctx, ec, &old_preedit);
+                    // 同 None 路：清尽力、写无条件（键路不阻塞）。
+                    if !old_preedit.is_empty() {
+                        let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                    }
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
                 // 【组段下划线·CUAS】编码更新后重打属性（SetText 会
@@ -3567,31 +3665,52 @@ impl EditSession_Impl {
                         let _ = unsafe { comp.EndComposition(ec) };
                         // 提交后选区放到已提交文本之后
                         let _ = set_selection_at_end(&ctx, ec, &range);
+                        // 【幻影选区识别数据 2026-10-12】Chromium 会把选
+                        // 区推回「末字 1 字宽」——下一键塌缩识别用。
+                        g.last_commit_text = text.clone();
                     } else {
                         trace("Commit: 死组段 SetText 失败——自愈直插保字");
                         let _ = unsafe { comp.EndComposition(ec) };
-                        // 【孤儿字母回收 2026-10-12】死组段的旧预编辑字母
-                        // 已残留插入点左侧——直插词前先回收（校验一致才
-                        // 删），否则「编码字母+词一起上屏」（BUG① 右键路
-                        // 径用户实锤）。
-                        let old_preedit = g.preedit_last.clone();
-                        clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        // 【孤儿字母回收·嫌疑标记化 2026-10-12】只清杀段
+                        // 挂的嫌疑文本（正常上屏后 preedit_last 与正文同
+                        // 形——按它清=吞字，用户实锤 d; d; 「哪个」→「哪」）。
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
+                        if !old_preedit.is_empty() {
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        }
                         if !text.is_empty() {
                             if let Ok(r2) = selection_range(&ctx, ec) {
                                 let _ = unsafe { r2.SetText(ec, 0, &wstr) };
                                 let _ = set_selection_at_end(&ctx, ec, &r2);
                             }
                         }
+                        g.last_commit_text = text.clone();
                     }
                 } else if !text.is_empty() {
                     // 无活动组段的直接提交（如开头标点「，」）：
                     // 在当前选区（插入点）处插入文本，等价于 StartPreedit 的定位流程但不开组段
+                    // 【孤儿回收·嫌疑标记化 2026-10-12 八次】只清杀段挂的
+                    // 嫌疑文本。原「死句柄+preedit_last 非空即清」在正常
+                    // 上屏后同样成立（上屏清句柄、preedit_last 留旧词）=
+                    // 下一键把刚上屏的词当孤儿删掉（吞字）。杀段挂标是唯
+                    // 一可信的孤儿信号。
+                    if g.composition.is_none() {
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
+                        if !old_preedit.is_empty() {
+                            drop(g);
+                            // Ghost 时也照插（写会落真文档，上屏字不能丢）；
+                            // 孤儿等下一拍 recover 安定后补清。
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                            g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
                     let range = selection_range(&ctx, ec)?;
                     let wstr: Vec<u16> = text.encode_utf16().collect();
                     unsafe {
                         range.SetText(ec, 0, &wstr)?;
                     }
                     let _ = set_selection_at_end(&ctx, ec, &range);
+                    g.last_commit_text = text.clone();
                 }
                 g.composition = None;
                 // 【增量估算 2026-09-12 十一次修正·记事本同款数据流】
@@ -3856,13 +3975,88 @@ impl EditSession_Impl {
 /// 编码字母跟着上）。回收：ShiftStart 扩选 n 个字符、GetText 校验与旧
 /// 预编辑一致才清空（宿主已自清/用户已改动时放弃——绝不误删用户文
 /// 本）；哑宿主（扩选 0 动）保持旧行为不回归。
-fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) {
+/// 孤儿回收结果。【Ghost=裂脑档 2026-10-12 八次】菜单模态/收场风暴期
+/// Notepad3 实测「读全空、写落真文档」——此刻绝不能盲写组段（复制
+/// 字母的根因）；上层收到 Ghost 必须放弃写入并重试到安定。
+enum OrphanResult {
+    /// 孤儿已删（左或右侧命中并清除）
+    Cleared,
+    /// 文档可读但没有匹配孤儿（宿主自清/用户改过——正常态）
+    NotFound,
+    /// 文档不可读（左右扩选全 0=裂脑档）——禁止盲写
+    Ghost,
+}
+
+/// 【ACP 路 2026-10-12 九次】校验 range 当前范围的文本与期望一致
+///（fetched 钳制到缓冲长——拆家态宿主乱填不越界切片）。
+fn orphan_text_matches(range: &ITfRange, ec: u32, want: &[u16]) -> bool {
+    let mut buf = vec![0u16; want.len() + 1];
+    let mut fetched = 0u32;
+    if unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) }.is_err() {
+        return false;
+    }
+    let fetched = (fetched as usize).min(buf.len());
+    let ok = &buf[..fetched] == want;
+    trace(&format!(
+        "orphan: 校验实际={:?} 期望={:?} 匹配={ok}",
+        String::from_utf16_lossy(&buf[..fetched]),
+        String::from_utf16_lossy(want)
+    ));
+    ok
+}
+
+/// 校验通过后的删除（SetText 空串）。
+fn orphan_delete(range: &ITfRange, ec: u32, side: &str) -> OrphanResult {
+    let empty: Vec<u16> = Vec::new();
+    let ok = unsafe { range.SetText(ec, 0, &empty) }.is_ok();
+    trace(&format!("orphan: {side}侧 ACP 回收 ok={ok}"));
+    if ok {
+        OrphanResult::Cleared
+    } else {
+        OrphanResult::NotFound
+    }
+}
+
+fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) -> OrphanResult {
     let want: Vec<u16> = old_preedit.encode_utf16().collect();
     if want.is_empty() {
-        return;
+        return OrphanResult::NotFound;
     }
+    let Ok(range) = selection_range(ctx, ec) else {
+        trace("orphan: selection_range 失败——放弃回收");
+        return OrphanResult::NotFound;
+    };
+    // 【ACP 面 2026-10-12 九次】Scintilla 系（Notepad3）的 range.Shift
+    // 常态失效（自动测试实锤「左移0 右移0」，与菜单无关）——ITfRangeACP
+    // 的 GetExtent/SetExtent 是唯一可扩展面；ACP 失败再回落 Shift
+    //（Chromium 系 Shift 可用）。
+    if let Ok(acp) = range.cast::<ITfRangeACP>() {
+        let (mut anchor, mut cch) = (0i32, 0i32);
+        if unsafe { acp.GetExtent(&mut anchor, &mut cch) }.is_ok() {
+            let n = want.len() as i32;
+            // 左侧 [anchor-n, n)：光标在段尾的常规孤儿位。
+            if anchor >= n
+                && unsafe { acp.SetExtent(anchor - n, n) }.is_ok()
+                && orphan_text_matches(&range, ec, &want)
+            {
+                return orphan_delete(&range, ec, "左");
+            }
+            // 右侧 [anchor, n)：杀段后光标落在段首（Notepad3/Chromium
+            // 实锤「左侧扩选 0 字」）——孤儿在插入点右侧。
+            if unsafe { acp.SetExtent(anchor, n) }.is_ok()
+                && orphan_text_matches(&range, ec, &want)
+            {
+                return orphan_delete(&range, ec, "右");
+            }
+            trace("orphan: ACP 双侧无匹配孤儿（自清或已改动）");
+            return OrphanResult::NotFound;
+        }
+        trace("orphan: ACP GetExtent 失败——回落 Shift 路");
+    }
+    // —— Shift 回落路（原实现）——
     let Ok(mut range) = selection_range(ctx, ec) else {
-        return;
+        trace("orphan: 右侧检查无法重建选区——放弃回收");
+        return OrphanResult::NotFound;
     };
     let mut total = 0i32;
     for _ in 0..want.len() {
@@ -3875,60 +4069,78 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) {
         total += moved;
     }
     if total == 0 {
-        return;
+        // 【左侧 0 字→转右侧 2026-10-12 四次】Notepad3/Chromium 杀段后
+        // 光标落在段首（自动测试实锤「左侧扩选 0 字」连环 4 次=孤儿全
+        // 在右侧）——左侧 0 字不再短路，无条件试右侧收编。
+        trace("orphan: 左侧扩选 0 字（光标在段首？）→ 转查右侧");
+    } else {
+        // 校验：扩出来的文本与旧预编辑一致才删（宿主已自清/字母被用户改
+        // 过——宁残留不错删）。fetched 钳制到缓冲长（拆家态宿主可能乱填
+        // ——越界切片 panic 跨 COM=abort=闪退 0xC0000409 实锤防线）。
+        let mut buf = vec![0u16; total as usize + 1];
+        let mut fetched = 0u32;
+        let hr = unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) };
+        let fetched = (fetched as usize).min(buf.len()) as u32;
+        if hr.is_err() {
+            return OrphanResult::NotFound;
+        }
+        let got = &buf[..fetched as usize];
+        trace(&format!(
+            "orphan: 左侧实际={:?} 期望={:?}",
+            String::from_utf16_lossy(got),
+            old_preedit
+        ));
+        if got == want.as_slice() {
+            let empty: Vec<u16> = Vec::new();
+            let ok = unsafe { range.SetText(ec, 0, &empty) }.is_ok();
+            trace(&format!("orphan: 回收 {} 个字母 ok={}", total, ok));
+            return OrphanResult::Cleared;
+        }
     }
-    // 校验：扩出来的文本与旧预编辑一致才删（宿主已自清/字母被用户改过
-    // ——宁残留不错删）。fetched 钳制到缓冲长（拆家态宿主可能乱填——
-    // 越界切片 panic 跨 COM=abort=闪退 0xC0000409 实锤防线）。
-    let mut buf = vec![0u16; total as usize + 1];
-    let mut fetched = 0u32;
-    let hr = unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) };
-    let fetched = (fetched as usize).min(buf.len()) as u32;
-    if hr.is_err() {
-        return;
+    // 【右侧收编 2026-10-12 二次】杀段后光标在段首——孤儿字母在插入点
+    // 【右侧】。同款校验式回收：ShiftEnd 扩选 n 字、GetText 一致才清，
+    // 绝不误删。
+    let Ok(mut range2) = selection_range(ctx, ec) else {
+        trace("orphan: 右侧检查无法重建选区——放弃回收");
+        return OrphanResult::NotFound;
+    };
+    let mut total2 = 0i32;
+    for _ in 0..want.len() {
+        let mut moved = 0i32;
+        if unsafe { range2.ShiftEnd(ec, 1, &mut moved, std::ptr::null_mut()) }.is_err()
+            || moved == 0
+        {
+            break;
+        }
+        total2 += moved;
     }
-    let got = &buf[..fetched as usize];
-    if got != want.as_slice() {
-        // 【右侧收编 2026-10-12 二次】VSCode/Chromium 取消组段常把光标
-        // 挪到段首——孤儿字母在插入点【右侧】（trace 实锤「不符→放弃
-        // →复活重写=多一个带虚线的d」）。同款校验式回收：ShiftEnd 扩
-        // 选 n 字、GetText 一致才清，绝不误删。
-        let Ok(mut range2) = selection_range(ctx, ec) else {
-            trace("orphan: 插入点左侧不符且无法重建选区——放弃回收");
-            return;
-        };
-        let mut total2 = 0i32;
-        for _ in 0..want.len() {
-            let mut moved = 0i32;
-            if unsafe { range2.ShiftEnd(ec, 1, &mut moved, std::ptr::null_mut()) }.is_err()
-                || moved == 0
-            {
-                break;
-            }
-            total2 += moved;
-        }
-        if total2 == 0 {
-            trace("orphan: 左右两侧均无孤儿文本——放弃回收（防误删）");
-            return;
-        }
-        let mut buf2 = vec![0u16; total2 as usize + 1];
-        let mut fetched2 = 0u32;
-        if unsafe { range2.GetText(ec, 0, &mut buf2, &mut fetched2) }.is_err() {
-            return;
-        }
-        let fetched2 = (fetched2 as usize).min(buf2.len()) as u32;
-        if &buf2[..fetched2 as usize] != want.as_slice() {
-            trace("orphan: 右侧也与旧预编辑不符——放弃回收（防误删）");
-            return;
-        }
-        let empty: Vec<u16> = Vec::new();
-        let ok = unsafe { range2.SetText(ec, 0, &empty) }.is_ok();
-        trace(&format!("orphan: 右侧回收 {} 个字母 ok={}", total2, ok));
-        return;
+    if total2 == 0 {
+        // 【裂脑档检测 2026-10-12 八次】左右双向都扩不动一个字=文档
+        // 不可读（非空文档的正常选区至少单向能扩）。此刻写会落进真
+        // 文档而读不到旧孤儿——复制字母实锤路径。上报 Ghost：上层
+        // 拒绝盲写、重试到安定。
+        trace("orphan: 裂脑档（左右双向扩 0 字）——禁止盲写，待安定重试");
+        return OrphanResult::Ghost;
+    }
+    let mut buf2 = vec![0u16; total2 as usize + 1];
+    let mut fetched2 = 0u32;
+    if unsafe { range2.GetText(ec, 0, &mut buf2, &mut fetched2) }.is_err() {
+        return OrphanResult::NotFound;
+    }
+    let fetched2 = (fetched2 as usize).min(buf2.len()) as u32;
+    trace(&format!(
+        "orphan: 右侧实际={:?} 期望={:?}",
+        String::from_utf16_lossy(&buf2[..fetched2 as usize]),
+        old_preedit
+    ));
+    if &buf2[..fetched2 as usize] != want.as_slice() {
+        trace("orphan: 右侧也与旧预编辑不符——放弃回收（防误删）");
+        return OrphanResult::NotFound;
     }
     let empty: Vec<u16> = Vec::new();
-    let ok = unsafe { range.SetText(ec, 0, &empty) }.is_ok();
-    trace(&format!("orphan: 回收 {} 个字母 ok={}", total, ok));
+    let ok = unsafe { range2.SetText(ec, 0, &empty) }.is_ok();
+    trace(&format!("orphan: 右侧回收 {} 个字母 ok={}", total2, ok));
+    OrphanResult::Cleared
 }
 
 /// 【弃段清文本 2026-09-11】结束组段前先清空段内文本，再
@@ -3952,6 +4164,15 @@ fn end_comp_clear(ec: u32, comp: &ITfComposition) {
 fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -> Result<()> {
     let cc: ITfContextComposition = ctx.cast()?;
     let range: ITfRange = selection_range(ctx, ec)?;
+    // 【幻影选区塌缩 2026-10-12】同 SP 主路径（自愈/重开/复活路一样
+    // 会吞掉 Chromium 残留的上屏末字）。此刻未持 g——短暂拿锁读末字。
+    let phantom_tail = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_commit_text.chars().last().map(|c| c.to_string())
+    };
+    if phantom_tail.is_some() && collapse_phantom_selection(phantom_tail, ctx, ec, &range) {
+        trace("SP自愈: 幻影选区——塌缩到光标");
+    }
     let sink: ITfCompositionSink = CompSinkObj {
         shared: shared.clone(),
     }
@@ -3977,6 +4198,54 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
     query_caret(&mut g, ctx, ec);
     Ok(())
+}
+
+/// 【幻影选区塌缩 2026-10-12】Chromium 系宿主（QQ/VSCode——凡文档可
+/// 读者皆中招；Notepad3 只写不读、读必空=天然免疫）在本 IME 上屏后把
+/// TSF 选区留在「已上屏词的最后一个字」上（恰 1 字宽）——下一键开组
+/// 段 StartComposition+SetText 会把该字替换掉=吞字（用户实锤 d;d; 连打
+/// 「哪个哪个」变「哪哪个」，SP探针 读="个个"=选区盖着「个」实锤）。
+/// 判定签名：选区非折叠 + 恰 1 字 + 等于刚上屏文本的末字 → 原地塌缩
+/// 到末尾并把塌缩选区推回宿主（光标回上屏后的正确位置）。真实用户
+/// 选中等长同字的塌缩是非破坏性的（不删字，只是改插入点）。
+/// 【死锁修 2026-10-12】不在此拿锁——SP 主路径调用点已持 g，二次
+/// lock 同一线程=互斥锁死（任何程序打字未响应的根因）。末字由调用
+/// 方读出传入。
+fn collapse_phantom_selection(
+    tail: Option<String>,
+    ctx: &ITfContext,
+    ec: u32,
+    range: &ITfRange,
+) -> bool {
+    let Some(tail) = tail else { return false };
+    // 读选区内容（上限 4 单元——幻影恒 1 字；读到更长=真选区不动）
+    let mut buf = [0u16; 4];
+    let mut fetched = 0u32;
+    if unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) }.is_err() || fetched == 0 {
+        return false; // 折叠选区（正常态）或读失败（Notepad3）——不动
+    }
+    let got = String::from_utf16_lossy(&buf[..(fetched as usize).min(buf.len())]);
+    if got.chars().count() != 1 || got != tail {
+        return false; // 非幻影签名（真选区/别的残留）——按原样走（标准替换行为）
+    }
+    // 原地塌缩 + 推回宿主
+    if unsafe { range.Collapse(ec, TF_ANCHOR_END) }.is_err() {
+        return false;
+    }
+    let r: ITfRange = match unsafe { range.Clone() } {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut sel = [TF_SELECTION {
+        range: core::mem::ManuallyDrop::new(Some(r)),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: BOOL(0),
+        },
+    }];
+    let hr = unsafe { ctx.SetSelection(ec, &sel) };
+    unsafe { core::mem::ManuallyDrop::drop(&mut sel[0].range) };
+    hr.is_ok()
 }
 
 /// 把选区放到指定范围末尾（折叠），保证后续插入点跟随。
@@ -5366,6 +5635,13 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
         if let Ok(mut g) = self.shared.try_lock() {
             if g.composition.is_some() {
                 trace("OnCompositionTerminated: 宿主终止组段——清悬挂句柄");
+                // 【孤儿嫌疑挂标 2026-10-12】杀段时组段文本可能被宿主
+                // 留在文档里（孤儿字母）。挂嫌疑标记（被杀文本）——
+                // 后续键路的孤儿清理只认它，正常上屏永不清（吞字修）。
+                let killed = g.preedit_last.clone();
+                if !killed.is_empty() {
+                    g.orphan_suspect = Some(killed);
+                }
                 g.composition = None;
                 // 注：Chromium 系宿主在按下候选窗时杀组段+blur 编辑器
                 //（caret 消失）——曾试过合成点击焦点自愈，实测反噬

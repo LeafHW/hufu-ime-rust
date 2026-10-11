@@ -26,34 +26,8 @@ use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
-// ── 【右键调频菜单 2026-10-06】裸 FFI（TrackPopupMenu + TPM_RETURNCMD
-// 取回选项 id；windows crate 的签名拿不到返回值——langbar 同款直连）──
-#[link(name = "user32")]
-unsafe extern "system" {
-    #[link_name = "CreatePopupMenu"]
-    fn cand2_CreatePopupMenu() -> isize;
-    #[link_name = "AppendMenuW"]
-    fn cand2_AppendMenuW(m: isize, flags: u32, id: usize, text: *const u16) -> i32;
-    #[link_name = "TrackPopupMenu"]
-    fn cand2_TrackPopupMenu(
-        m: isize,
-        flags: u32,
-        x: i32,
-        y: i32,
-        reserved: u32,
-        hwnd: isize,
-        rect: *const RECT,
-    ) -> i32;
-    #[link_name = "DestroyMenu"]
-    fn cand2_DestroyMenu(m: isize) -> i32;
-    #[link_name = "PostMessageW"]
-    fn cand2_PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
-}
-const MF_STRING: u32 = 0x0;
-const MF_GRAYED: u32 = 0x1;
-const MF_SEPARATOR: u32 = 0x800;
-const TPM_RETURNCMD: u32 = 0x100;
-const TPM_RIGHTBUTTON: u32 = 0x2;
+// （旧 TrackPopupMenu 裸 FFI 块已随免激活自绘菜单退役删除——菜单不再
+// 用系统弹出菜单，全程 WS_EX_NOACTIVATE 自绘窗+SetCapture 消息驱动。）
 
 /// 【右键调频菜单 2026-10-06】命中矩形缓存：show() 渲染经典皮肤时
 /// 逐候选采集（内容逻辑坐标，与绘制同源），右键按 (dpi, shadow_m)
@@ -83,13 +57,367 @@ pub fn cand_menu_open() -> bool {
     menu_now_ms() < CAND_MENU_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 候选窗右键：命中候选 → 六项调频菜单（向前移/向后移/移到最前/
-/// 移到最后/加词/删词）。语义与 Ctrl+数字（置顶）/Ctrl+Shift+数字
-///（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
-/// 动作走同步管道 op=cand_menu（server 写 用户调整.txt 并返回新
-/// state）；重绘用滚轮缩放同款锁外 show——wndproc 里不碰
-/// update_ui/run_session（TSF 编辑会话不得在窗口过程里重入）。
-/// 「加词」带 (词, 编码, 选重位) 预填打开加词窗。
+// ── 【自绘免激活菜单 2026-10-12·虎娘路线】──
+// SetForegroundWindow(owner)+TrackPopupMenu 会把宿主前台夺到菜单 owner
+// 上 → CUAS 杀组段 → 孤儿字母/虚线消失/候选飘左上角/闪退链全由此起
+//（Notepad3 自动测试实锤：rdown 后 2ms 即 OnCompositionTerminated）。
+// 自绘 popup：WS_EX_NOACTIVATE|TOPMOST|LAYERED，SetCapture 消息驱动，
+// 全程不碰前台/焦点 → 组段永活（虚线在、锚点在、无孤儿）。键盘经
+// TSF dispatch → menu_key() 路由（菜单无焦点收不到键）。
+
+struct MenuItem {
+    label: String,
+    id: i32,
+    enabled: bool,
+}
+
+struct MenuCtx {
+    /// 菜单窗句柄（HWND 的 raw 值——静态跨线程存 isize，用时还原）
+    hwnd: isize,
+    items: Vec<MenuItem>,
+    /// 开菜单那一下右键的抬起事件要吞掉（捕获已转菜单窗，UP 直达本
+    /// 窗——不吞=菜单弹开即被自己的 UP 关掉，自动测试实锤）。
+    swallow_rup: bool,
+    /// 每项（含分隔位）的 top 像素坐标（客户区）
+    tops: Vec<i32>,
+    /// 项高（分隔位=sep_h）
+    heights: Vec<i32>,
+    hover: i32,
+    w: i32,
+    h: i32,
+    // 动作上下文（命中候选）
+    text: String,
+    raw: String,
+    idx: usize,
+    n: usize,
+}
+
+static MENU_STATE: std::sync::Mutex<Option<MenuCtx>> = std::sync::Mutex::new(None);
+static MENU_FONT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// 【导航键抬起吞窗 2026-10-12】ENTER/Esc 的 down 已被 menu_key 吃掉，
+/// 紧随的 up 若放行会进引擎（enter up 触发「回车=编码上屏」——自动
+/// 测试实锤 commit="ae"）。收场后 200ms 内吞一次导航键抬起（同键
+/// down→up 间隔 <100ms，用户随后的真实键不受影响）。
+static MENU_SWALLOW_UP_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 菜单收场后是否吞本键的抬起（dispatch 对 up 键查询）。
+pub fn menu_swallow_up(vk: u32) -> bool {
+    matches!(vk, 0x1B | 0x26 | 0x28 | 0x0D)
+        && menu_now_ms()
+            < MENU_SWALLOW_UP_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 导航键判定（Esc/上/下/Enter）——TestDown 询问阶段用（零副作用）。
+pub fn menu_nav_key(vk: u32) -> bool {
+    matches!(vk, 0x1B | 0x26 | 0x28 | 0x0D)
+}
+
+/// 收场吞窗对 down 同样生效：宿主在 TestDown 吃掉后仍派 KeyDown
+///（Notepad3/CUAS 实测：ENTER TestDown 阶段执行了选择，KeyDown 阶段
+/// 二次到达→无菜单放行→引擎「回车=编码上屏」）。200ms 内同集键吞。
+pub fn menu_swallow_key(vk: u32) -> bool {
+    menu_nav_key(vk)
+        && menu_now_ms()
+            < MENU_SWALLOW_UP_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 菜单键盘路由（dispatch 在菜单开期间调用，仅 keydown）：
+/// true=已处理（吞键）。Esc 关、上下移、Enter 选；其余键关菜单放行
+///（打字关菜单=正常键照走引擎）。修饰键不关（右键时用户常按着 Ctrl）。
+pub fn menu_key(vk: u32) -> bool {
+    if matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5) {
+        return true; // 修饰键：吞（不递引擎也不关菜单）
+    }
+    let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = st.as_mut() else {
+        crate::tsf::trace(&format!("cw2: menu_key vk={vk:#x} 无菜单"));
+        return false;
+    };
+    crate::tsf::trace(&format!("cw2: menu_key vk={vk:#x} hover={}", ctx.hover));
+    match vk {
+        0x1B => {
+            // Esc：关菜单（取消）
+            drop(st);
+            menu_finish(0);
+            true
+        }
+        0x26 | 0x28 => {
+            // 上/下：hover 在可选项间移动（跳过分隔位）
+            let dir = if vk == 0x26 { -1 } else { 1 };
+            let mut i = ctx.hover;
+            for _ in 0..ctx.items.len() as i32 + 2 {
+                i += dir;
+                if i < 0 || i >= ctx.items.len() as i32 {
+                    continue;
+                }
+                if ctx.items[i as usize].enabled {
+                    ctx.hover = i;
+                    break;
+                }
+            }
+            let hwnd = HWND(ctx.hwnd as *mut _);
+            drop(st);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            true
+        }
+        0x0D => {
+            // Enter：激活 hover
+            let (id, ok) = {
+                let ctx = st.as_ref().unwrap();
+                let i = ctx.hover;
+                if i >= 0 && i < ctx.items.len() as i32 && ctx.items[i as usize].enabled {
+                    (ctx.items[i as usize].id, true)
+                } else {
+                    (0, false)
+                }
+            };
+            drop(st);
+            if ok {
+                menu_finish(id);
+            }
+            true
+        }
+        _ => {
+            // 其余键：关菜单（取消）放行
+            false
+        }
+    }
+}
+
+/// 菜单收场：销毁窗+撤金牌宽限+（sel>0 时）执行动作。菜单 wndproc 与
+/// menu_key 两路都汇聚于此（同线程，MENU_STATE.take 保证只执行一次）。
+fn menu_finish(sel_id: i32) {
+    let ctx = MENU_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(ctx) = ctx else { return };
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = DestroyWindow(HWND(ctx.hwnd as *mut _));
+    }
+    // 吞窗开牌：紧随本收场的导航键抬起（ENTER 选定后的 up）不进引擎。
+    MENU_SWALLOW_UP_UNTIL.store(
+        menu_now_ms() + 200,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // 免死金牌宽限撤牌（同旧 TrackPopupMenu 收场：回流串一并吞掉——
+    // 无焦点抢夺后回流应无，防御性保留）。
+    CAND_MENU_UNTIL_MS.store(
+        menu_now_ms() + 1_200,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    crate::tsf::cand_interact_note();
+    if sel_id > 0 {
+        crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{}）", ctx.text));
+        unsafe { cand_menu_action(sel_id, &ctx.text, &ctx.raw, ctx.idx, ctx.n) };
+    }
+}
+
+/// 菜单动作执行（旧 cand_menu_popup 尾段原样迁移：解锁/加词/调频四动
+/// 作 + 响应重绘）。调用方保证菜单窗已销毁（无消息嵌套）。
+unsafe fn cand_menu_action(sel_id: i32, text: &str, raw: &str, idx: usize, n: usize) {
+    unsafe {
+        if sel_id == 7 {
+            // 【2026-10-06 用户拍板】菜单尾项=解锁固定位：清固定位与拖拽
+            // 钉住残留——候选窗回光标处跟随。
+            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
+            if pinned.is_some() {
+                *pinned = None;
+                drop(pinned);
+                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                crate::tsf::diag_note("cw2 pin 菜单解除（回跟随光标）");
+            }
+            return;
+        }
+        if sel_id == 5 {
+            crate::addword::open_prefilled(text, raw, &n.to_string());
+            return;
+        }
+        let action = match sel_id {
+            1 => "fwd",
+            2 => "back",
+            3 => "front",
+            4 => "last",
+            6 => "del",
+            _ => return,
+        };
+        if let Some(r) = crate::ipc::call(&serde_json::json!({
+            "op": "cand_menu", "action": action, "page_index": idx, "text": text,
+            "raw": raw
+        })) {
+            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                cand_menu_refresh(&r);
+            } else {
+                crate::tsf::trace("cw2: cand_menu 响应未生效（候选不在页/未知动作）");
+            }
+        }
+    }
+}
+
+/// 自绘菜单窗过程：捕获期内全部鼠标消息到本窗（模态感），窗外按下/
+/// 捕获被夺/Esc（menu_key 路）即收场。
+unsafe extern "system" fn menu_wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match m {
+            0x0021 => LRESULT(3), // WM_MOUSEACTIVATE → MA_NOACTIVATE（不激活不点击穿透）
+            0x0200 => {
+                // WM_MOUSEMOVE：hover 跟随
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ctx) = st.as_mut() {
+                    let mut hit = -1i32;
+                    for (i, (top, hgt)) in ctx.tops.iter().zip(ctx.heights.iter()).enumerate() {
+                        if y >= *top && y < top + hgt && ctx.items[i].id > 0 {
+                            hit = i as i32;
+                            break;
+                        }
+                    }
+                    if hit != ctx.hover {
+                        ctx.hover = hit;
+                        drop(st);
+                        let _ = InvalidateRect(h, None, true);
+                    }
+                }
+                LRESULT(0)
+            }
+            0x0201 => {
+                // WM_LBUTTONDOWN：窗外=取消（捕获让窗外点击也到本窗）
+                let x = ((l.0 as u16) as u16) as i32;
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let outside = {
+                    let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_ref()
+                        .map(|c| x < 0 || y < 0 || x >= c.w || y >= c.h)
+                        .unwrap_or(true)
+                };
+                if outside {
+                    menu_finish(0);
+                }
+                LRESULT(0)
+            }
+            0x0202 => {
+                // WM_LBUTTONUP：命中可选项=执行；否则取消
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let sel = {
+                    let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_ref()
+                        .and_then(|c| {
+                            c.tops
+                                .iter()
+                                .zip(c.heights.iter())
+                                .enumerate()
+                                .find(|(i, (top, hgt))| {
+                                    y >= **top && y < **top + **hgt && c.items[*i].enabled
+                                })
+                                .map(|(i, _)| c.items[i].id)
+                        })
+                        .unwrap_or(0)
+                };
+                menu_finish(sel);
+                LRESULT(0)
+            }
+            0x0205 => {
+                // WM_RBUTTONUP：开菜单的右键 UP（swallow_rup）吞掉；
+                // 之后的右键=取消。
+                let swallow = {
+                    let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_mut().map(|c| std::mem::take(&mut c.swallow_rup)).unwrap_or(false)
+                };
+                if !swallow {
+                    menu_finish(0);
+                }
+                LRESULT(0)
+            }
+            0x0215 => {
+                // WM_CAPTURECHANGED：捕获被夺（Alt-Tab 等）——取消收场
+                menu_finish(0);
+                LRESULT(0)
+            }
+            0x000F => {
+                // WM_PAINT：白底+hover 高亮+灰项+分隔线+边框
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(h, &mut ps);
+                let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ctx) = st.as_ref() {
+                    let rc = RECT { left: 0, top: 0, right: ctx.w, bottom: ctx.h };
+                    let bg = CreateSolidBrush(COLORREF(0x00FF_FF_FF));
+                    let _ = FillRect(hdc, &rc, bg);
+                    let _ = DeleteObject(HGDIOBJ(bg.0));
+                    let mut font = MENU_FONT.lock().unwrap_or_else(|e| e.into_inner());
+                    if *font == 0 {
+                        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(h) as f32 / 96.0;
+                        let fh = -(12.0 * scale).round() as i32;
+                        let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+                        let f = CreateFontW(
+                            fh, 0, 0, 0, 400, 0, 0, 0,
+                            1,  // DEFAULT_CHARSET
+                            0, 0,
+                            4,  // ANTIALIASED_QUALITY
+                            0,
+                            PCWSTR(face.as_ptr()),
+                        );
+                        *font = f.0 as usize;
+                    }
+                    let old = SelectObject(hdc, HGDIOBJ(*font as *mut _));
+                    let _ = SetBkMode(hdc, TRANSPARENT);
+                    for (i, item) in ctx.items.iter().enumerate() {
+                        let top = ctx.tops[i];
+                        let hgt = ctx.heights[i];
+                        if item.id == 0 {
+                            // 分隔线
+                            let ln = CreateSolidBrush(COLORREF(0x00E0_E0_E0));
+                            let r = RECT { left: 8, top: top + hgt / 2, right: ctx.w - 8, bottom: top + hgt / 2 + 1 };
+                            let _ = FillRect(hdc, &r, ln);
+                            let _ = DeleteObject(HGDIOBJ(ln.0));
+                            continue;
+                        }
+                        let hover = ctx.hover == i as i32 && item.enabled;
+                        if hover {
+                            let hl = CreateSolidBrush(COLORREF(0x00D7_78_00)); // RGB(0,120,215)
+                            let r = RECT { left: 1, top, right: ctx.w - 1, bottom: top + hgt };
+                            let _ = FillRect(hdc, &r, hl);
+                            let _ = DeleteObject(HGDIOBJ(hl.0));
+                        }
+                        let color = if !item.enabled {
+                            COLORREF(0x00A0_A0_A0)
+                        } else if hover {
+                            COLORREF(0x00FF_FF_FF)
+                        } else {
+                            COLORREF(0x00_00_00_00)
+                        };
+                        let old_c = SetTextColor(hdc, color);
+                        let mut w: Vec<u16> = item.label.encode_utf16().collect();
+                        let mut tr = RECT { left: 16, top, right: ctx.w - 8, bottom: top + hgt };
+                        let _ = DrawTextW(
+                            hdc,
+                            &mut w,
+                            &mut tr as *mut RECT as *mut _,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
+                        let _ = SetTextColor(hdc, old_c);
+                    }
+                    let _ = SelectObject(hdc, old);
+                }
+                let _ = EndPaint(h, &ps);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(h, m, w, l),
+        }
+    }
+}
+
+/// 候选窗右键：命中候选 → 自绘免激活菜单（向前移/向后移/移到最前/
+/// 移到最后/加词/删词/解锁固定位）。语义与 Ctrl+数字（置顶）/
+/// Ctrl+Shift+数字（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
+/// 动作走同步管道 op=cand_menu（server 写 用户调整.txt 并返回新 state）；
+/// 重绘用滚轮缩放同款锁外 show——wndproc 里不碰 update_ui/run_session
+///（TSF 编辑会话不得在窗口过程里重入）。菜单本体在独立 popup 窗
+///（本函数立即返回，生命周期由 menu_wndproc/menu_finish 管理）。
 unsafe fn cand_menu_popup(lparam: LPARAM) {
     unsafe {
         // 1) 命中候选（客户端像素 → 内容逻辑坐标）
@@ -121,7 +449,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
                         rects
                             .iter()
                             .enumerate()
-                            .min_by(|(_, a), (_, b)| {
+                            .min_by(|(_, a, ), (_, b)| {
                                 let da = ((lx - (a.0 + a.2) / 2.0).abs())
                                     .max((ly - (a.1 + a.3) / 2.0).abs());
                                 let db = ((lx - (b.0 + b.2) / 2.0).abs())
@@ -141,40 +469,36 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             return;
         }
         let (n, len) = (idx + 1, cands.len());
-        crate::tsf::trace(&format!("cw2: rdown 命中 #{n}「{text}」菜单弹出"));
-        // 2) 菜单（六项；首尾移动到边界时灰化）
-        let m = cand2_CreatePopupMenu();
-        if m == 0 {
-            return;
+        crate::tsf::trace(&format!("cw2: rdown 命中 #{n}「{text}」菜单弹出（免激活）"));
+        // 已有菜单开着：先收（连点右键换候选）
+        if MENU_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            menu_finish(0);
         }
-        let mut append = |label: &str, id: usize, gray: bool| {
-            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            cand2_AppendMenuW(
-                m,
-                MF_STRING | if gray { MF_GRAYED } else { 0 },
-                id,
-                w.as_ptr(),
-            );
-        };
-        append("向前移", 1, n <= 1);
-        append("向后移", 2, n >= len);
-        append("移到最前", 3, false);
-        append("移到最后", 4, n >= len);
-        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-        append("加词", 5, false);
-        append("删词", 6, false);
-        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-        // 【2026-10-07 用户拍板·恢复】此项保留（误删教训：用户要的是
-        //「用户调整文件里不出现 {置顶} 行=纯排序」，不是砍交互入口；
-        // 文件侧已由 set_order 归一保证）。未固定时灰化展示。
+        // 2) 菜单项（与旧 TrackPopupMenu 版完全同构）
         let pinned_now = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        append("解锁固定位", 7, !pinned_now);
-        // 3) owner=自建 0×0 顶层 TOOLWINDOW（langbar QQ 实证路线：
-        // 子窗 owner 收不了前台，菜单秒弹秒关）
+        let mut items: Vec<MenuItem> = vec![
+            MenuItem { label: "向前移".into(), id: 1, enabled: n > 1 },
+            MenuItem { label: "向后移".into(), id: 2, enabled: n < len },
+            MenuItem { label: "移到最前".into(), id: 3, enabled: true },
+            MenuItem { label: "移到最后".into(), id: 4, enabled: n < len },
+            MenuItem { label: "".into(), id: 0, enabled: false },
+            MenuItem { label: "加词".into(), id: 5, enabled: true },
+            MenuItem { label: "删词".into(), id: 6, enabled: true },
+            MenuItem { label: "".into(), id: 0, enabled: false },
+            MenuItem { label: "解锁固定位".into(), id: 7, enabled: pinned_now },
+        ];
+        // 3) 免激活 popup 窗（类名沿用 HUFU_C2_MENU：焦点豁免检查/自动
+        // 测试探窗兼容）。不注册焦点、不 SetForegroundWindow——宿主前
+        // 台不动=组段不死的全部秘密。
         let cls: Vec<u16> = "HUFU_C2_MENU\0".encode_utf16().collect();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(def_wndproc),
+            lpfnWndProc: Some(menu_wndproc),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
             lpszClassName: PCWSTR(cls.as_ptr()),
             ..Default::default()
         };
@@ -182,99 +506,118 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         let mut cpt = POINT::default();
         let _ = GetCursorPos(&mut cpt);
         let nm: Vec<u16> = "HuFu 候选菜单\0".encode_utf16().collect();
-        let owner = match CreateWindowExW(
-            WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0),
+        let hwnd = match CreateWindowExW(
+            WINDOW_EX_STYLE(
+                WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0,
+            ),
             PCWSTR(cls.as_ptr()),
             PCWSTR(nm.as_ptr()),
             WS_POPUP,
             cpt.x,
             cpt.y,
-            0,
-            0,
+            10,
+            10,
             HWND(std::ptr::null_mut()),
             None,
             None,
             None,
         ) {
             Ok(h) if !h.is_invalid() => h,
-            _ => {
-                cand2_DestroyMenu(m);
-                return;
-            }
+            _ => return,
         };
-        let _ = SetForegroundWindow(owner);
-        // 免死金牌开牌：菜单期长效（10s 上限，实际由收场撤）
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        // 4) 尺寸：DPI 缩放 + 文本测量
+        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0;
+        let item_h = (26.0 * scale).round() as i32;
+        let sep_h = (7.0 * scale).round() as i32;
+        let v_pad = (3.0 * scale).round() as i32;
+        let h_pad = (16.0 * scale).round() as i32;
+        let mut font = MENU_FONT.lock().unwrap_or_else(|e| e.into_inner());
+        if *font == 0 {
+            let fh = -(12.0 * scale).round() as i32;
+            let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+            let f = CreateFontW(
+                fh, 0, 0, 0, 400, 0, 0, 0,
+                1,  // DEFAULT_CHARSET
+                0, 0,
+                4,  // ANTIALIASED_QUALITY
+                0,
+                PCWSTR(face.as_ptr()),
+            );
+            *font = f.0 as usize;
+        }
+        let hdc = GetDC(hwnd);
+        let old = SelectObject(hdc, HGDIOBJ(*font as *mut _));
+        let mut text_w = 60i32;
+        for it in &items {
+            if it.id == 0 {
+                continue;
+            }
+            let w: Vec<u16> = it.label.encode_utf16().collect();
+            let mut sz = SIZE::default();
+            if GetTextExtentPoint32W(hdc, &w, &mut sz).as_bool() {
+                text_w = text_w.max(sz.cx);
+            }
+        }
+        let _ = SelectObject(hdc, old);
+        let _ = ReleaseDC(hwnd, hdc);
+        let menu_w = text_w + h_pad * 2;
+        let mut tops = Vec::new();
+        let mut heights = Vec::new();
+        let mut y = v_pad;
+        for it in &items {
+            let hgt = if it.id == 0 { sep_h } else { item_h };
+            tops.push(y);
+            heights.push(hgt);
+            y += hgt;
+        }
+        let menu_h = y + v_pad;
+        // 工作区边界钳制
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let x = cpt.x.min(wa.right - menu_w).max(wa.left);
+        let y_pos = cpt.y.min(wa.bottom - menu_h).max(wa.top);
+        // SWP_NOACTIVATE 铁律：缺它 SetWindowPos 会激活菜单窗（前台+
+        // 焦点全夺→宿主杀组段——诊断实锤 fg/win32focus 都变成菜单窗）。
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y_pos,
+            menu_w,
+            menu_h,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        // 5) 显示（不激活）+ 捕获（模态感：窗外点击到本窗）
+        //    绝不 SetForegroundWindow——那正是杀组段的元凶。
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetCapture(hwnd);
+        // 首个 hover：默认第一可选项（键盘 Enter 直选）
+        let first_ok = items.iter().position(|i| i.enabled).map(|i| i as i32).unwrap_or(-1);
+        *MENU_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(MenuCtx {
+            hwnd: hwnd.0 as isize,
+            swallow_rup: true,
+            items,
+            tops,
+            heights,
+            hover: first_ok,
+            w: menu_w,
+            h: menu_h,
+            text,
+            raw,
+            idx,
+            n,
+        });
+        // 免死金牌开牌：菜单期长效（无焦点抢夺后理论上无触发，防御保留）
         CAND_MENU_UNTIL_MS.store(
             menu_now_ms() + 10_000,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let sel_id = cand2_TrackPopupMenu(
-            m,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cpt.x,
-            cpt.y,
-            0,
-            owner.0 as isize,
-            std::ptr::null(),
-        );
-        // 【免死金牌·宽限撤牌 2026-10-07·三修】菜单收场后焦点回流
-        // 事件串（回宿主的 OnSetFocus/docmgr 切换）仍在队列里——立即
-        // 撤牌=回流被正常处理=清场收窗「一点就没」。宽限 1200ms 整口
-        // 吞掉回流串+用户连点节奏；动作只落数据+武装轮询，不受影响。
-        CAND_MENU_UNTIL_MS.store(
-            menu_now_ms() + 1_200,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        // KB135788：菜单系统状态机复位（缺它二次失灵）
-        cand2_PostMessageW(owner.0 as isize, 0x0000, 0, 0);
-        let _ = DestroyWindow(owner);
-        cand2_DestroyMenu(m);
-        // 【交互收场自愈 2026-10-12】菜单收场（无论是否选了动作）：置
-        // 交互宽限+挂起标记——回流焦点串清不掉活组段，下一键做焦点
-        // 自愈+锚点补探（BUG③：调频后候选飘/同根 BUG①）。
-        crate::tsf::cand_interact_note();
-        if sel_id == 0 {
-            return;
-        }
-        crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{text}）"));
-        // 4) 动作
-        if sel_id == 7 {
-            // 【2026-10-06 用户拍板】菜单尾项=解锁固定位（原中键方案
-            // 退役）：清固定位与拖拽钉住残留——候选窗回光标处跟随。
-            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
-            if pinned.is_some() {
-                *pinned = None;
-                drop(pinned);
-                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                crate::tsf::diag_note("cw2 pin 菜单解除（回跟随光标）");
-            }
-            return;
-        }
-        if sel_id == 5 {
-            crate::addword::open_prefilled(&text, &raw, &n.to_string());
-            return;
-        }
-        let action = match sel_id {
-            1 => "fwd",
-            2 => "back",
-            3 => "front",
-            4 => "last",
-            6 => "del",
-            _ => return,
-        };
-        if let Some(r) = crate::ipc::call(&serde_json::json!({
-            "op": "cand_menu", "action": action, "page_index": idx, "text": text,
-            // 【T8 2026-10-07】携带显示时的 raw——菜单抢前台→宿主失活→空码
-            // 查询顶掉会话候选时，server 按码重建列表兜底定位。
-            "raw": raw
-        })) {
-            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                cand_menu_refresh(&r);
-            } else {
-                crate::tsf::trace("cw2: cand_menu 响应未生效（候选不在页/未知动作）");
-            }
-        }
     }
 }
 
@@ -351,16 +694,6 @@ unsafe fn cand_menu_refresh(resp: &Value) {
             }
         }
     }
-}
-
-/// 菜单 owner 宿主窗过程（消息路由由 TrackPopupMenu 模态循环自理）。
-unsafe extern "system" fn def_wndproc(
-    h: HWND,
-    m: u32,
-    w: WPARAM,
-    l: LPARAM,
-) -> LRESULT {
-    unsafe { DefWindowProcW(h, m, w, l) }
 }
 
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
