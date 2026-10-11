@@ -14,6 +14,7 @@
 mod candwin;
 #[cfg(windows)]
 mod clipboard;
+mod candidate_export;
 mod host;
 mod http;
 mod overlay;

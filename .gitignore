@@ -33,3 +33,6 @@ assets/码表/user-adjust.log
 platform/windows/deploy-88/_probe/
 
 发行脚本/hanzi_db.csv
+
+# Local bridge builds, test captures and machine-specific registration records
+/evidence/

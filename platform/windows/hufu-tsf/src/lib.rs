@@ -11,14 +11,11 @@ mod candwin2;
 // 【特效退役 2026-09-22】commitfx（上屏特效:飘散/落印/像素链/学习引
 // 擎）与 fxprobe（落印诊断）整模块删除——用户拍板「删掉所有特效相
 // 关」。tsf.rs 的触发点/Shared 字段/尾锚实测同步清理。git 可回溯。
-// 【死模块移除 2026-10-06】canduielement（ITfCandidateListUIElement 宿
-// 主代画协议）再度退役：LOL 拒绝代画（pbShow=FALSE 25 轮实锤），游戏
-// 候选定稿走 server 跨进程窗（无边框下像素级可见，E7v6 用户实测）。
-// git 可回溯。
+mod candidate_ui;
 mod com;
 // i686 windows-gnu 交叉链接补丁：llvm libmingw32 无 _DllEntryPoint@12，
 // 由本模块 stub 提供（转发 DllMainCRTStartup）。x86_64 不编入。
-#[cfg(all(target_arch = "x86", target_env = "gnu"))]
+#[cfg(all(target_arch = "x86", target_env = "gnu", feature = "llvm-mingw-entry", not(test)))]
 mod dll_entry_x86;
 // 【下划线回归·类别注册补课 2026-10-09】displayattr 修复回归：首轮
 // 失败根因=没注册 GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER 类别，msctf
