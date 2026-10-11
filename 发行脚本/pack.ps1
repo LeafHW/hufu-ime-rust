@@ -1,4 +1,4 @@
-param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
