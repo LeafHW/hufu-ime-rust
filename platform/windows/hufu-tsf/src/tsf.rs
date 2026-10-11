@@ -1456,9 +1456,15 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
     }
     // 1.5) 【候选窗焦点矫正 2026-10-12】Win32 焦点落在候选窗/菜单
     //     owner（点击/菜单收场回落）→ 同线程 SetFocus 回记忆的宿主
-    //     编辑窗。未归位（用户已真切换/无新鲜记忆）→ false，跳过
-    //     组段复活防串台。
-    let host_focus_ok = win32_host_focus_restore();
+    //     编辑窗（菜单打开时内部自弃——不打扰模态菜单）。
+    //     【复活解耦 2026-10-12 二次】复活只看「前台仍在本线程」（菜
+    //     单 owner/候选窗都在本线程=交互期恒真）——旧实现把复活挂在
+    //     焦点归位结果上，菜单打开闸把复活连带挡死（用户实锤「右键
+    //     虚线就没了」：菜单期复活从未跑过）。
+    let same_thread = foreground_is_this_thread();
+    if same_thread {
+        let _ = win32_host_focus_restore();
+    }
     // 2) 锚点补探（QueryCaret：有组段走组段末探针，无组段走 selection
     //    插入点——同一会话两条路都有）。
     let ctx = shared
@@ -1472,7 +1478,7 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
         //     编辑：死/空句柄路=孤儿回收+全新 StartComposition（虚线
         //     原位回来）；活组段=幂等重写。用户规格「点击不该退出
         //     编码状态」：≤140ms 复活，肉眼近乎无感。
-        if host_focus_ok {
+        if same_thread {
             let (composing, preedit) = {
                 let g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 (g.composing, g.preedit_last.clone())
@@ -1886,9 +1892,22 @@ pub fn win32_host_focus_remember() {
     }
     HOST_FOCUS_MEM.with(|m| m.set((fw.0 as usize, caps_now_ms())));
 }
-/// 交互收场（poll 路）：焦点落在本输入法窗口上 → SetFocus 回记忆的
-/// 宿主编辑窗。返回 true=焦点已归位（宿主持有或刚归位）；false=无需
-/// /无法归位（用户已真切换 → 调用方跳过组段复活防串台）。
+/// 前台线程是否仍是本线程（用户没真切换到别的应用——菜单 owner/
+/// 候选窗都在本线程，交互期前台恒为本线程）。
+pub fn foreground_is_this_thread() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_tid = if fg.0.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(fg, None) }
+    };
+    fg_tid != 0 && fg_tid == unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+/// 交互收场（poll 路）：焦点落在本输入法窗口上且菜单已收 → SetFocus
+/// 回记忆的宿主编辑窗（菜单模态中绝不抢——会把开着的菜单打掉）。
 pub fn win32_host_focus_restore() -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -1901,21 +1920,9 @@ pub fn win32_host_focus_restore() -> bool {
     if fw.0.is_null() {
         return false; // 无焦点信息，不动作
     }
-    // 前台须是本线程的宿主（他进程前台=用户已真切换——不抢、不复活）。
-    {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId,
-        };
-        let fg = unsafe { GetForegroundWindow() };
-        let fg_tid = if fg.0.is_null() {
-            0
-        } else {
-            unsafe { GetWindowThreadProcessId(fg, None) }
-        };
-        if fg_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
-            return false;
-        }
+    // 前台须是本线程的宿主（他进程前台=用户已真切换——不抢）。
+    if !foreground_is_this_thread() {
+        return false;
     }
     if !is_hufu_steal_window(fw) {
         return true; // 焦点已不在本输入法窗口（宿主持有）——视为归位
@@ -3247,6 +3254,24 @@ impl EditSession_Impl {
             Op::StartPreedit(text) => {
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
                 // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
+                // 【孤儿回收·StartPreedit 路 2026-10-12 二次】菜单/点击杀组段
+                // 清空句柄后，下一键重建走的是本 op 而非 SetPreedit——同样
+                // 必须先回收孤儿字母（trace 实锤：调频→退格→空格=「ae来」）。
+                // 仅交互收场窗内（≤800ms）才查：常规首键时 preedit_last 是上
+                // 一会话残留，可能与正文同形——绝不误删。
+                {
+                    let interact = g
+                        .cand_interact_until
+                        .is_some_and(|t| std::time::Instant::now() < t);
+                    if interact && !g.preedit_last.is_empty() {
+                        let old_preedit = g.preedit_last.clone();
+                        trace("StartPreedit: 交互窗内孤儿回收（防字母跟随上屏）");
+                        drop(g);
+                        clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        // 重新拿锁继续标准流程
+                        g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    }
+                }
                 let cc: ITfContextComposition = ctx.cast()?;
                 trace("SP: cast ok");
                 let range: ITfRange = selection_range(&ctx, ec)?;

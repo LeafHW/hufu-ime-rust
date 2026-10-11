@@ -1289,6 +1289,17 @@ impl Engine {
                 session.caps_lock = false;
                 return KeyOutcome::passthrough();
             }
+            // 【显式绑定全态优先 2026-10-12】capslock 在 map/map_idle 任
+            // 一表有绑定 → 内建 caps_action 全态让位：有候选路径已在
+            // 上方 keymap 命中（select2 等照常）；空态 select 无候选=
+            // 静默消费（用户实锤「没编码按 caps 变大写锁定」——绑定
+            // 即功能键，锁大写不是用户要的兜底）。英文态白名单/透传
+            // 分支不受影响（在其之后）。
+            if self.config.keymap.map.contains_key("capslock")
+                || self.config.keymap.map_idle.contains_key("capslock")
+            {
+                return KeyOutcome::consumed(self.state(session));
+            }
             match self.config.general.caps_action {
                 hufu_config::CapsAction::Clear => {
                     if !session.raw.is_empty() {
@@ -9071,6 +9082,29 @@ mod tests {
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
         assert!(o.commit.is_none(), "空态无映射 capslock 走内建（不吞映射路径）");
+        // 【显式绑定全态优先 2026-10-12】空态 + capslock 有绑定（map 或
+        // map_idle）→ 内建 caps_action 让位：静默消费，绝不进锁大写
+        // （用户实锤「没编码按 caps 变大写锁定」）。
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        eng.config.keymap.map.insert("capslock".into(), "select2".into());
+        let mut s_bound = Session::new(true);
+        let o = eng.process_key(
+            &mut s_bound,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed, "空态绑定 capslock 消费（功能键语义）");
+        assert!(o.commit.is_none(), "空态无候选：select 静默");
+        assert!(!s_bound.caps_lock, "空态绑定 capslock 绝不进锁大写");
+        eng.config.keymap.map.remove("capslock");
+        eng.config.keymap.map_idle.insert("capslock".into(), "select2".into());
+        let mut s_idle_bound = Session::new(true);
+        let o = eng.process_key(
+            &mut s_idle_bound,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && !s_idle_bound.caps_lock, "map_idle 绑定同款让位");
+        eng.config.keymap.map_idle.remove("capslock");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
 
         // —— select4 越界（仅 3 候选）：select_candidate_ex 死键 consumed，
         //    不崩不字面上屏 ——
