@@ -448,6 +448,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
     // 消息路径（非 TSF 焦点回调），无死锁面。
     match msg {
+        0x21 => {
+            // WM_MOUSEACTIVATE → MA_NOACTIVATE(3)：显式挡激活链。
+            // 【候选窗焦点矫正 2026-10-12】WS_EX_NOACTIVATE 只挡"前台
+            // 激活"，同前台线程的点击仍可能把 Win32 焦点转给本窗
+            // （trace 实录 hwndFocus=HuFuCandWin2 → 宿主失焦杀组段+
+            // 锚链误判窗外垃圾=候选飘）。显式返回 MA_NOACTIVATE：不
+            // 激活、鼠标消息照发（点击/拖拽不受影响）。
+            return LRESULT(3);
+        }
         0x201 => {
             // WM_LBUTTONDOWN：记录按下起点（死区内不拖）并捕获鼠标
             crate::tsf::trace("cw2: ldown 到达");

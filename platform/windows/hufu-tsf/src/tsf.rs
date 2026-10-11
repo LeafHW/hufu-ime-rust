@@ -1454,6 +1454,11 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
             }
         }
     }
+    // 1.5) 【候选窗焦点矫正 2026-10-12】Win32 焦点落在候选窗/菜单
+    //     owner（点击/菜单收场回落）→ 同线程 SetFocus 回记忆的宿主
+    //     编辑窗。未归位（用户已真切换/无新鲜记忆）→ false，跳过
+    //     组段复活防串台。
+    let host_focus_ok = win32_host_focus_restore();
     // 2) 锚点补探（QueryCaret：有组段走组段末探针，无组段走 selection
     //    插入点——同一会话两条路都有）。
     let ctx = shared
@@ -1461,6 +1466,22 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
         .unwrap_or_else(|e| e.into_inner())
         .key_context();
     if let Some(ctx) = ctx {
+        // 2.5) 【组段复活 2026-10-12】宿主在按下候选窗/菜单抢焦点时
+        //     单方面杀组段（OnCompositionTerminated 只清句柄不清
+        //     composing/preedit_last——会话与编码仍活）。重发当前预
+        //     编辑：死/空句柄路=孤儿回收+全新 StartComposition（虚线
+        //     原位回来）；活组段=幂等重写。用户规格「点击不该退出
+        //     编码状态」：≤140ms 复活，肉眼近乎无感。
+        if host_focus_ok {
+            let (composing, preedit) = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (g.composing, g.preedit_last.clone())
+            };
+            if composing && !preedit.is_empty() {
+                trace("cand_interact: 组段复活（重发预编辑）");
+                let _ = run_session(&shared, Op::SetPreedit(preedit), Some(ctx.clone()));
+            }
+        }
         let _ = run_session(&shared, Op::QueryCaret, Some(ctx));
     }
 }
@@ -1778,6 +1799,142 @@ fn caps_fixup_arm() {
 fn caps_fixup_active() -> bool {
     let until = CAPS_FIXUP_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
     until != 0 && caps_now_ms() < until
+}
+
+// ── 【候选窗焦点矫正 2026-10-12】──────────────────────────────
+// 事实（trace 1791748399 Notepad3 实录）：左键点候选窗后
+// GetGUIThreadInfo(0).hwndFocus = HuFuCandWin2 —— Win32 焦点落在
+// 候选窗上（NOACTIVATE 只挡前台激活，挡不住同前台线程的焦点转移；
+// 右键菜单 owner SetForegroundWindow + TrackPopupMenu 模态收场后
+// 焦点同样回落到本线程顶层的候选窗）。三联后果同源：
+// ① 宿主编辑窗失焦 → CUAS 杀组段（预编辑虚线消失=「退出编码态」）；
+// ② 锚链拿候选窗当「焦点窗」→ 真光标矩形被判窗外垃圾拒收 → 落
+//   标准链陈旧锚 → 候选窗大跳（飘/下移）；
+// ③ 键路由进候选窗（IME sink 收不到键=左键死支）。
+// 矫正四招（不变量：候选窗永远不该持有 Win32 焦点）：
+//   cand2_wndproc 显式 MA_NOACTIVATE；锚链窗外拦截豁免本输入法窗；
+//   poll 每拍记忆宿主编辑窗；交互收场 SetFocus 归位+组段复活。
+thread_local! {
+    /// (宿主编辑窗 hwnd, 记忆时刻 unix ms)——poll 线程局部（每宿主
+    /// 线程各自记忆各自的编辑窗，跨线程 SetFocus 本就不合法）。
+    static HOST_FOCUS_MEM: std::cell::Cell<(usize, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+/// 取窗口类名（失败空串）。
+fn hwnd_class(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut cn = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut cn) };
+    let len = cn
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(n.max(0) as usize)
+        .min(31);
+    String::from_utf16_lossy(&cn[..len])
+}
+/// 焦点矫正对象：候选窗本体 + 右键菜单 owner（交互回落的两类）。
+fn is_hufu_steal_window(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    matches!(hwnd_class(hwnd).as_str(), "HuFuCandWin2" | "HUFU_C2_MENU")
+}
+/// 本输入法全家窗口（含加词窗/轮询窗——均非宿主几何参照）。
+fn is_hufu_family_window(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    matches!(
+        hwnd_class(hwnd).as_str(),
+        "HuFuCandWin2" | "HUFU_C2_MENU" | "HuFuAddWord" | "HuFuPollWnd"
+    )
+}
+/// 前台线程焦点窗（GUIThreadInfo(0)，失败 NULL）。
+fn fg_focus_hwnd() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
+    let mut gi = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(0, &mut gi) }.is_ok() {
+        gi.hwndFocus
+    } else {
+        HWND(std::ptr::null_mut())
+    }
+}
+/// poll 每拍：前台焦点在本输入法窗口之外 → 记忆该宿主编辑窗。
+/// 仅当前台线程=本线程才记（他进程前台时抢记会把别家窗口错存进
+/// 本线程记忆——跨线程 SetFocus 本就不合法，还挤掉真宿主）。
+pub fn win32_host_focus_remember() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return;
+    }
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg, None) };
+    if fg_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+        return; // 别的进程在前台——本线程 poll 不记
+    }
+    let fw = fg_focus_hwnd();
+    if fw.0.is_null() || is_hufu_family_window(fw) {
+        return;
+    }
+    HOST_FOCUS_MEM.with(|m| m.set((fw.0 as usize, caps_now_ms())));
+}
+/// 交互收场（poll 路）：焦点落在本输入法窗口上 → SetFocus 回记忆的
+/// 宿主编辑窗。返回 true=焦点已归位（宿主持有或刚归位）；false=无需
+/// /无法归位（用户已真切换 → 调用方跳过组段复活防串台）。
+pub fn win32_host_focus_restore() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    // 菜单模态中绝不抢（会把开着的菜单打掉）。
+    if crate::candwin2::cand_menu_open() {
+        return false;
+    }
+    let fw = fg_focus_hwnd();
+    if fw.0.is_null() {
+        return false; // 无焦点信息，不动作
+    }
+    // 前台须是本线程的宿主（他进程前台=用户已真切换——不抢、不复活）。
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        let fg = unsafe { GetForegroundWindow() };
+        let fg_tid = if fg.0.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(fg, None) }
+        };
+        if fg_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+            return false;
+        }
+    }
+    if !is_hufu_steal_window(fw) {
+        return true; // 焦点已不在本输入法窗口（宿主持有）——视为归位
+    }
+    let (hwnd, ms) = HOST_FOCUS_MEM.with(|m| m.get());
+    if hwnd == 0 || caps_now_ms().saturating_sub(ms) > 30_000 {
+        return false; // 无新鲜记忆（>30s）——不盲抢
+    }
+    let target = HWND(hwnd as *mut _);
+    if !unsafe { IsWindow(target) }.as_bool() {
+        return false;
+    }
+    // SetFocus 仅对调用线程自己的窗口合法（跨线程静默失败）。
+    let tgt_tid = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            target,
+            None,
+        )
+    };
+    if tgt_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+        return false;
+    }
+    trace("cand_interact: Win32 焦点落在候选窗 → SetFocus 回宿主编辑窗");
+    unsafe { SetFocus(target) };
+    let after = fg_focus_hwnd();
+    !after.0.is_null() && !is_hufu_steal_window(after)
 }
 
 /// 轨迹日志（诊断 UI 线程卡死）：追加到 %TEMP%\hufu-tsf-trace.log。
@@ -2546,7 +2703,11 @@ impl HuFuTs_Impl {
         // 键翻转才落地=漏修）。150ms 后复检一次：仍 ON 再合成一对翻
         // 回（查后翻，幂等——已 OFF 则不动，不会误翻 ON）；翻转同时
         // 系统会重发 HID LED 报告，键盘灯跟着回灭。
-        if name == "capslock" && consumed {
+        // 【自定义门槛 2026-10-12 三次·用户拍板】补偿只在 capslock 有
+        // 全键自定义绑定时生效（此场景 Caps=功能键，灯亮是误导——软
+        // 件态与灯必须分离）；无自定义绑定走正常路径（锁大写/切英文
+        // 的灯随物理翻转显示——锁大写亮灯恰是状态可见）。
+        if name == "capslock" && consumed && keymap_has("capslock") {
             // 即时：系统位已翻 ON → 合成一对翻回 OFF。
             unsafe {
                 if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
@@ -3121,10 +3282,21 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, &text);
                 }
-                let comp = g
-                    .composition
-                    .clone()
-                    .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
+                let comp = match g.composition.clone() {
+                    Some(c) => c,
+                    // 【组段复活·None 路 2026-10-12】宿主终止回调已把
+                    // 句柄清空（点击候选窗/菜单抢焦点的标准时序）——
+                    // composing 仍在（会话未清）且本键带文本：孤儿回收
+                    // 后原位重组段（poll 复活与次键自愈同一出口）。
+                    None if g.composing && !text.is_empty() => {
+                        trace("SetPreedit: 组段句柄已被终止清空——孤儿回收后重组段");
+                        let old_preedit = g.preedit_last.clone();
+                        drop(g);
+                        clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        return start_preedit_on(&ctx, &self.shared, ec, &text);
+                    }
+                    None => return Err(Error::from(HRESULT(-2147467259))),
+                };
                 let range: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 if unsafe { range.SetText(ec, 0, &wstr) }.is_err() {
@@ -4336,21 +4508,31 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             if GetGUIThreadInfo(tid0, &mut gi).is_ok()
                                 && !gi.hwndFocus.0.is_null()
                             {
-                                let mut fr = RECT::default();
-                                if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
-                                    && fr.right > fr.left
-                                {
-                                    let inside = r.left >= fr.left - 8
-                                        && r.left <= fr.right + 8
-                                        && r.top >= fr.top - 8
-                                        && r.bottom <= fr.bottom + 8;
-                                    if !inside {
-                                        trace(&format!(
+                                if is_hufu_family_window(gi.hwndFocus) {
+                                    // 【候选窗焦点矫正 2026-10-12】"焦点
+                                    // 窗"是本输入法候选窗（点击/菜单收场
+                                    // 的焦点回落）——不是宿主几何参照，
+                                    // 窗外拦截豁免：真光标矩形照常采纳
+                                    // （此前被误拒 → 落标准链陈旧锚 →
+                                    // 候选窗大跳=「飘/下移」）。
+                                    trace("qc: seg1 selection 焦点窗=本输入法窗口——窗外拦截豁免");
+                                } else {
+                                    let mut fr = RECT::default();
+                                    if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
+                                        && fr.right > fr.left
+                                    {
+                                        let inside = r.left >= fr.left - 8
+                                            && r.left <= fr.right + 8
+                                            && r.top >= fr.top - 8
+                                            && r.bottom <= fr.bottom + 8;
+                                        if !inside {
+                                            trace(&format!(
                                             "qc: seg1 selection 焦点窗外垃圾拦截 rect=({},{},{},{}) 焦点窗=({},{},{},{})——弃用落标准链",
                                             r.left, r.top, r.right, r.bottom,
                                             fr.left, fr.top, fr.right, fr.bottom
                                         ));
-                                        block = true;
+                                            block = true;
+                                        }
                                     }
                                 }
                             }
@@ -8213,6 +8395,10 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【候选窗焦点矫正·记忆 2026-10-12】每拍记忆前台宿主编辑窗（本
+    // 输入法窗口不记）——交互收场 SetFocus 归位用。只读 GUIThreadInfo
+    // +类名，无锁无管道，零扰动。
+    win32_host_focus_remember();
     // 【右键调频·单写者 2026-10-07】免死金牌期内（含收场 1200ms 宽限）
     // poll 整拍跳过：调频帧是唯一渲染者。此前 poll 在宽限内带着重查
     // 的光标锚+编码段再画一帧（=「编码又出现/框又动」的第二写者）。
