@@ -1289,20 +1289,17 @@ impl Engine {
                 session.caps_lock = false;
                 return KeyOutcome::passthrough();
             }
-            // 【空态绑定才让位 2026-10-12 二次·用户拍板】capslock 只在
-            // map_idle（空态表）显式绑定时，空态才让内建 caps_action 让
-            // 位=静默消费（绑定即功能键）；仅 map（编码态）绑定、或
-            // map_idle 为空串（设置 UI「清除」写的是 ""——用户实锤
-            // 「按了没反应」）时空态照走默认（锁大写等）。有候选路径
-            // 已在上方 keymap 命中（select2 等照常，不受本门影响）。
-            if self
-                .config
-                .keymap
-                .map_idle
-                .get("capslock")
-                .is_some_and(|v| !v.is_empty())
-            {
-                return KeyOutcome::consumed(self.state(session));
+            // 【空态解析链判定 2026-10-12 三次·用户三轮拍板】空态 caps
+            // 的归属=空态解析链（map_idle→map 回落，同 keymap_lookup
+            // idle 全链）：解析出非空功能=该键空态被绑定拥有——select
+            // 空态无意义=静默消费（「跟随有候选」（缺省回落 map 的
+            // select）与显式绑 select 同形）；空串（UI「清除」）或全链
+            // 无绑定=走默认 caps_action（锁大写等）。有候选路径已在
+            // 上方 keymap 命中（select2 等照常，不受本门影响）。
+            if let Some(act) = self.keymap_lookup(&key.key, &key.modifiers, true) {
+                if !act.is_empty() {
+                    return KeyOutcome::consumed(self.state(session));
+                }
             }
             match self.config.general.caps_action {
                 hufu_config::CapsAction::Clear => {
@@ -5504,6 +5501,7 @@ impl Engine {
             ctrl_space_switch: self.config.general.ctrl_space_switch,
             keymap: self.config.keymap.map.clone(),
             keymap_idle: self.config.keymap.map_idle.clone(),
+            caps_lock: session.caps_lock,
         }
     }
 }
@@ -9086,37 +9084,38 @@ mod tests {
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
         assert!(o.commit.is_none(), "空态无映射 capslock 走内建（不吞映射路径）");
-        // 【空态绑定才让位 2026-10-12 二次·用户拍板】capslock 仅绑 map
-        //（编码态）时空态照走默认 caps_action（Caps=锁大写生效）；绑
-        // map_idle（空态表）时空态让位=静默消费不锁大写。
+        // 【空态解析链判定 2026-10-12 三次】三种配置形态：
+        // 跟随（map_idle 缺键回落 map 的 select）=空态静默；
+        // 清除（map_idle 空串短路回落链）=空态走默认（Caps 锁大写）；
+        // 显式绑 map_idle=select2 同跟随（静默）。
         eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        // —— 形态一：跟随（map=select2、map_idle 无键）——
         eng.config.keymap.map.insert("capslock".into(), "select2".into());
-        let mut s_bound = Session::new(true);
+        let mut s_follow = Session::new(true);
         let o = eng.process_key(
-            &mut s_bound,
+            &mut s_follow,
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
-        assert!(o.consumed, "单表(map)绑定空态走默认（Caps 消费）");
-        assert!(s_bound.caps_lock, "单表绑定空态照进锁大写（用户拍板）");
-        eng.config.keymap.map.remove("capslock");
-        eng.config.keymap.map_idle.insert("capslock".into(), "select2".into());
-        let mut s_idle_bound = Session::new(true);
-        let o = eng.process_key(
-            &mut s_idle_bound,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
-        );
-        assert!(o.consumed && o.commit.is_none(), "空态表绑定：静默消费");
-        assert!(!s_idle_bound.caps_lock, "空态表绑定绝不进锁大写");
-        // 【清除=空串 2026-10-12 三次】设置 UI「清除」写 ""——空串=
-        // 未绑定：空态照走默认（Caps 锁大写），绝非「没反应」。
+        assert!(o.consumed && o.commit.is_none(), "跟随：空态静默消费");
+        assert!(!s_follow.caps_lock, "跟随：绝不进锁大写");
+        // —— 形态二：清除（map_idle 空串短路）——
         eng.config.keymap.map_idle.insert("capslock".into(), String::new());
         let mut s_cleared = Session::new(true);
         let o = eng.process_key(
             &mut s_cleared,
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
-        assert!(o.consumed && s_cleared.caps_lock, "空串=清除：空态照走默认锁大写");
+        assert!(o.consumed && s_cleared.caps_lock, "清除=空串：空态照走默认锁大写");
+        eng.config.keymap.map_idle.insert("capslock".into(), "select2".into());
+        let mut s_idle_bound = Session::new(true);
+        let o = eng.process_key(
+            &mut s_idle_bound,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && o.commit.is_none(), "显式空态绑定：静默消费");
+        assert!(!s_idle_bound.caps_lock, "显式空态绑定绝不进锁大写");
         eng.config.keymap.map_idle.remove("capslock");
+        eng.config.keymap.map.remove("capslock");
         eng.config.general.caps_action = hufu_config::CapsAction::Caps;
 
         // —— select4 越界（仅 3 候选）：select_candidate_ex 死键 consumed，

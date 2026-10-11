@@ -2748,7 +2748,15 @@ impl HuFuTs_Impl {
         // 全键自定义绑定时生效（此场景 Caps=功能键，灯亮是误导——软
         // 件态与灯必须分离）；无自定义绑定走正常路径（锁大写/切英文
         // 的灯随物理翻转显示——锁大写亮灯恰是状态可见）。
-        if name == "capslock" && consumed && keymap_has("capslock") {
+        // 【锁大写豁免 2026-10-12 四次】空态 caps 走默认进锁大写时
+        //（state.caps_lock=true，用户实锤「能打大写但灯不亮」）：灯
+        // 亮=状态可见，此刻绝不补偿。解锁那一下 caps_lock 已回 false
+        // → 物理位本就翻 OFF，天然不触发。
+        let caps_locked_now = state
+            .get("caps_lock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if name == "capslock" && consumed && keymap_has("capslock") && !caps_locked_now {
             // 即时：系统位已翻 ON → 合成一对翻回 OFF（带魔法标记）。
             unsafe {
                 if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
@@ -3205,11 +3213,29 @@ struct EditSession {
     /// 写进槽位；同步档（0x6 回调内联）受理后即可读真实结果。
     /// None = 调用方不关心（焦点冲销等一次性路径）。
     result_slot: Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
+    /// 【陈旧闸 2026-10-12】请求出生时刻：Chromium 系对同步请求也可能
+    /// 回 TS_S_ASYNC 偷换排队——回调执行可能晚于宿主状态巨变（菜单
+    /// 收场焦点风暴），此刻写组段/清孤儿=闪退（0xC0000409 实锤）。
+    /// 写类 op 执行时超龄（>800ms）直接 no-op。键流会话恒内联执行
+    /// （出生≈执行），永不触闸。
+    born: std::time::Instant,
 }
 
 impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         trace("DoEditSession enter");
+        // 【陈旧闸 2026-10-12】被宿主偷换排队的写类会话：执行时距出生
+        // 已 >800ms=宿主状态早已巨变（菜单收场/焦点风暴），写组段/清
+        // 孤儿在此刻执行=闪退实锤。直接 no-op（读类照跑无害）。
+        if self.born.elapsed() > std::time::Duration::from_millis(800)
+            && matches!(self.op, Op::SetPreedit(_) | Op::StartPreedit(_))
+        {
+            trace(&format!(
+                "DoEditSession: 会话陈旧 {}ms → 丢弃（防过期写）",
+                self.born.elapsed().as_millis()
+            ));
+            return Ok(());
+        }
         // 【重入死锁防护 2026-09-09】标记本线程进入 edit session：
         // 期间宿主回调链内触发的 OnSetFocus 延迟（见 OnSetFocus 处），
         // 出口回放（此刻 shared 锁空闲、焦点状态已稳定）。
@@ -3852,10 +3878,12 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) {
         return;
     }
     // 校验：扩出来的文本与旧预编辑一致才删（宿主已自清/字母被用户改过
-    // ——宁残留不错删）。
+    // ——宁残留不错删）。fetched 钳制到缓冲长（拆家态宿主可能乱填——
+    // 越界切片 panic 跨 COM=abort=闪退 0xC0000409 实锤防线）。
     let mut buf = vec![0u16; total as usize + 1];
     let mut fetched = 0u32;
     let hr = unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) };
+    let fetched = (fetched as usize).min(buf.len()) as u32;
     if hr.is_err() {
         return;
     }
@@ -3888,6 +3916,7 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) {
         if unsafe { range2.GetText(ec, 0, &mut buf2, &mut fetched2) }.is_err() {
             return;
         }
+        let fetched2 = (fetched2 as usize).min(buf2.len()) as u32;
         if &buf2[..fetched2 as usize] != want.as_slice() {
             trace("orphan: 右侧也与旧预编辑不符——放弃回收（防误删）");
             return;
@@ -6846,6 +6875,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         ctx_override: Some(target.clone()),
         epoch,
         result_slot: Some(slot.clone()),
+        born: std::time::Instant::now(),
     }
     .into();
     unsafe {
@@ -6912,11 +6942,21 @@ fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<
         ctx_override: Some(ctx.clone()),
         epoch,
         result_slot: None,
+        born: std::time::Instant::now(),
     }
     .into();
     unsafe {
         match ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(0x6)) {
-            Ok(_) => {
+            Ok(h) => {
+                // 【TS_S_ASYNC=排队 2026-10-12】Chromium 系（VSCode 菜单
+                // 模态期）对同步请求也会回 TS_S_ASYNC(0x40300)——受理
+                // 即排队、回调延后到宿主自便=过期会话时间炸弹（闪退实
+                // 锤）。恢复类会话一律当拒处理（重试逻辑接手），执行期
+                // 陈旧闸兜底已排队的。
+                if h.0 as u32 == 0x00040300 {
+                    trace("sync_only: 受理被偷换成 TS_S_ASYNC（已排队）→ 按拒处理");
+                    return Err(Error::from(HRESULT(0x00040300u32 as i32)));
+                }
                 trace("focus-commit: 同步档受理");
                 Ok(())
             }

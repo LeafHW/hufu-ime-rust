@@ -252,6 +252,12 @@ pub struct SessionState {
     /// 回落 map[key]）∈ 空态可用功能集。
     #[serde(default)]
     pub keymap_idle: std::collections::HashMap<String, String>,
+    /// 【Caps 灯语义 2026-10-12】引擎会话是否处于锁大写（caps_lock）。
+    /// DLL 补偿门用：进锁大写=状态可见，物理灯该亮（不补偿）；功能
+    /// 键语义（选重等，caps_lock 不变 false）=灯与输入态无关，翻回
+    /// 灭。引擎 state() 填。
+    #[serde(default)]
+    pub caps_lock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
