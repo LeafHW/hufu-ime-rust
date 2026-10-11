@@ -59,6 +59,76 @@ fn attach_console_for_dev(force: bool, dev_attach: bool) {
     }
 }
 
+/// 【重排防死机·进程级写死 2026-10-12】见 main() 调用点注释（作者令：
+/// 亲和性半核掩码 + BelowNormal，长期有效）。零依赖直声明（与
+/// attach_console_for_dev 同风格）。结果落 diag\anti-freeze.log 一行
+/// （取证生命线——出事时先看这两项是否真的生效）。
+#[cfg(windows)]
+fn anti_freeze_guards(data_dir: &std::path::Path) {
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetPriorityClass(h: isize, cls: u32) -> i32;
+        fn GetProcessAffinityMask(h: isize, pmask: *mut usize, smask: *mut usize) -> i32;
+        fn SetProcessAffinityMask(h: isize, mask: usize) -> i32;
+    }
+    unsafe {
+        let h = GetCurrentProcess();
+        let mut sys_mask: usize = 0;
+        let mut proc_mask: usize = 0;
+        let mut mask_line = String::new();
+        let mut prio_line = String::new();
+        // 1) 亲和性：系统可用逻辑核的最低半数（16 线程 → 0xFF；64 位
+        //    usize 上限 64 核，更高核数机器只锁低 32 位——防死机目的
+        //    是封顶振幅，锁 32 核已远超推理需要）。取「系统掩码里置
+        //    位的低半数位」尊重异常拓扑（跳核分配）。
+        if GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask) != 0 && sys_mask > 1 {
+            let total = sys_mask.count_ones();
+            let half = (total / 2).max(1).min(63) as u32;
+            let mut mask: usize = 0;
+            let mut left = half;
+            let mut bit = 0u32;
+            while left > 0 && bit < 64 {
+                if (sys_mask >> bit) & 1 == 1 {
+                    mask |= 1usize << bit;
+                    left -= 1;
+                }
+                bit += 1;
+            }
+            if SetProcessAffinityMask(h, mask) != 0 {
+                mask_line = format!("affinity ok mask=0x{mask:X} ({half}/{total} cores)");
+            } else {
+                mask_line = format!("affinity FAIL mask=0x{mask:X} (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+        } else {
+            mask_line = "affinity SKIP (query fail)".into();
+        }
+        // 2) 优先级 BelowNormal：全进程默认级（现有/新建线程继承；
+        //    打分专用池另有每线程再降 + EcoQoS）。
+        if SetPriorityClass(h, BELOW_NORMAL_PRIORITY_CLASS) != 0 {
+            prio_line = "priority ok BelowNormal".into();
+        } else {
+            prio_line = format!("priority FAIL (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        let diag = hufu_engine::diag_dir(data_dir);
+        let _ = std::fs::create_dir_all(&diag);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(diag.join("anti-freeze.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                writeln!(f, "[{ts}] pid={} {mask_line}; {prio_line}", std::process::id())
+            });
+        eprintln!("anti-freeze: {mask_line}; {prio_line}");
+    }
+}
+
 /// 默认数据目录。
 /// - Windows：exe 同目录下的「数据」（安装布局 %LOCALAPPDATA%\HuFu\数据）。
 ///   不用相对路径 hufu-data——CWD 不可控（开机自启/explorer 中转启动时
@@ -142,6 +212,20 @@ fn main() {
     // 缩放渲染（candwin.rs render_frame），与 candwin2 同款语义。
     #[cfg(windows)]
     sys_win::declare_per_monitor_dpi();
+    // 【重排防死机·写死 2026-10-12 作者令】2026-10-11~12 取证：逐键
+    // 全核 AVX 爆发引发「深省电→爆频」电源管理震荡，AMD APU 平台
+    // 状态机在转换处整机挂死（SoC 级、看门狗复位）。两条进程级铁律
+    // （详见 E:\DSH-KF\虎符重排打包强制规范.md，对所有重排引擎版本
+    // 长期有效；此前由外部 hufu-guard.ps1 临时兜底，现写死进本体）：
+    // 1) 亲和性锁最低半数逻辑核（16 线程机=掩码 0xFF/255）——重排
+    //    脉冲振幅封顶一半；native llama.cpp 线程池（FFI 无线程数
+    //    参数）同样被进程亲和性兜住。
+    // 2) 进程优先级 BelowNormal——推理让位前台（新线程继承进程级，
+    //    native 线程一并降级；纯 Rust 池另有每线程 BelowNormal+
+    //    EcoQoS，见 hufu-rerank/model.rs）。
+    // 失败（权限/容器）不阻断启动——仅记录，守护脚本/用户可补。
+    #[cfg(windows)]
+    anti_freeze_guards(&data_dir);
     let host = match Host::new(&data_dir) {
         Ok(h) => h,
         Err(e) => {

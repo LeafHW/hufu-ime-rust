@@ -504,6 +504,26 @@ pub struct Shared {
     /// None=未探测/已失效（焦点切换即失效）。空态 Esc 撤回预判的
     /// 第二道门：无光标（非编辑焦点）→ 不吞 Esc（正常 Esc 功能）。
     pub esc_caret_ok: Option<bool>,
+    /// 【Caps 系统态补偿 2026-10-12】engine 消费 CapsLock（选重/锁大写
+    /// 档）后若系统大小写锁定仍被翻转（部分宿主吞键仍翻转/键盘驱动
+    /// 层翻转），合成一次 CapsLock 击键把系统态翻回 OFF，并在此窗口
+    /// 内忽略自家 sink 收到的合成事件（否则补偿键又当一次用户键）。
+    /// 加词编码框大写字母（用户实测 BUG②）的根治点。
+    pub caps_fixup_until: Option<std::time::Instant>,
+    /// 【候选窗交互宽限 2026-10-12】候选窗鼠标交互（点击/右键菜单）
+    /// 结束后的短宽限窗：期间到达的焦点事件若组段活着按交互连带
+    /// 处理（不清组段/不藏窗）——防交互期间宿主抖出的延迟焦点事件
+    /// 在鼠标离开/菜单收场后才到，绕过 is_mouse_over/cand_menu_open
+    /// 守卫把活组段清掉（用户实测：点中候选框后空格/选重上屏失效）。
+    pub cand_interact_until: Option<std::time::Instant>,
+    /// 【交互收场自愈·挂起标记 2026-10-12】wndproc（点击/菜单收场）
+    /// 只置标记；下一次 dispatch 键入口执行焦点自愈+锚点补探
+    ///（cand_interact_recover_pending——wndproc 不跑 TSF 会话铁律）。
+    pub cand_interact_pending: bool,
+    /// 【交互后焦点自愈 2026-10-12】最近一次非空 TSF 焦点 DocumentMgr：
+    /// 候选窗点击把宿主焦点抖成 NULL 时（键不再路由到 IME=上屏失效），
+    /// 交互收场检测 GetFocus 失败即 SetFocus 回该文档（键路复活）。
+    pub focus_doc_last: Option<ITfDocumentMgr>,
 }
 
 impl Shared {
@@ -598,6 +618,10 @@ impl Shared {
             keymap: std::collections::HashMap::new(),
             keymap_idle: std::collections::HashMap::new(),
             esc_caret_ok: None,
+            caps_fixup_until: None,
+            cand_interact_until: None,
+            cand_interact_pending: false,
+            focus_doc_last: None,
         }
     }
 
@@ -1366,6 +1390,83 @@ fn apply_chinese_sync(shared: &SharedRef) {
     }
 }
 
+/// 【候选窗交互收场自愈 2026-10-12·标记半】candwin2 在点击抬起（死区
+/// 点击未拖拽）与右键调频菜单收场时调用（均在 wndproc——**只做标记**，
+/// 绝不在此跑 TSF 会话/焦点操作：菜单重绘铁律「TSF 编辑会话不得在窗口
+/// 过程里重入」同源约束）。
+/// 1) 交互宽限窗：handle_set_focus 对其后短窗内的迟到焦点事件按抖动
+///    保组段（is_mouse_over/cand_menu_open 只覆盖交互进行中，尾巴
+///    事件落在窗外——BUG①「点中候选框后空格/选重上屏失效」的清理
+///    路径正由此绕过守卫执行）。
+/// 2) 交互修复挂起标记：下一次 dispatch（键入口，安全上下文）执行
+///    cand_interact_recover_pending 的焦点自愈+锚点补探。
+pub fn cand_interact_note() {
+    let Some(shared) = tl_shared().or_else(|| G_SHARED.get().map(|g| g.0.clone())) else {
+        return;
+    };
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand_interact_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
+    g.cand_interact_pending = true;
+}
+
+/// 【候选窗交互收场自愈 2026-10-12·执行半】dispatch 入口调用（键入口
+/// 安全上下文，非 wndproc）：交互（点击候选框/右键调频菜单）后第一键
+/// 到达时，若组段活着——
+/// 1) 焦点自愈：交互把 TSF 焦点抖成 NULL（GetFocus 失败）时键根本不
+///    会进 dispatch（IME sink 不再收键）……能进 dispatch 说明键路在，
+///    此处防御性复查：焦点为 NULL 且有最近焦点文档 → SetFocus 复活
+///    （BUG①：空格/选重上屏失效的键路死支）。
+/// 2) 锚点补探：一次 QueryCaret 刷新 g.caret/est（BUG③：调频+退格后
+///    候选飘——菜单期间锚陈旧、刷新帧拿旧锚定位）。
+pub fn cand_interact_recover_pending(shared: &SharedRef) {
+    let pending = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.cand_interact_pending {
+            return;
+        }
+        g.cand_interact_pending = false;
+        g.composing
+    };
+    if !pending {
+        return; // 无组段：无键路/组段锚可救（正常态）
+    }
+    if in_edit_session() {
+        return; // 会话重入期：不补（下一键还有机会——标记已清，防御放弃）
+    }
+    // 1) 焦点自愈：GetFocus 失败 = NULL → SetFocus 回最近焦点文档。
+    let tm = thread_tm().or_else(|| {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thread_mgr
+            .clone()
+    });
+    if let Some(tm) = tm {
+        let cur = unsafe { tm.GetFocus().ok() };
+        if cur.is_none() {
+            let doc = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .focus_doc_last
+                .clone();
+            if let Some(doc) = doc {
+                trace("cand_interact: TSF 焦点为 NULL → SetFocus 回最近文档（键路自愈）");
+                let _ = unsafe { tm.SetFocus(&doc) };
+            }
+        }
+    }
+    // 2) 锚点补探（QueryCaret：有组段走组段末探针，无组段走 selection
+    //    插入点——同一会话两条路都有）。
+    let ctx = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .key_context();
+    if let Some(ctx) = ctx {
+        let _ = run_session(&shared, Op::QueryCaret, Some(ctx));
+    }
+}
+
 fn handle_set_focus(
     shared: &SharedRef,
     pdimfocus: Option<&ITfDocumentMgr>,
@@ -1394,6 +1495,30 @@ fn handle_set_focus(
     if crate::candwin2::cand_menu_open() {
         trace("OnSetFocus: 右键菜单打开中——跳过清理（免死金牌）");
         return Ok(());
+    }
+    // 【候选窗交互宽限 2026-10-12】点击/右键菜单收场后短窗内的焦点
+    // 事件仍可能是交互连带的迟到尾巴（鼠标已离开/菜单已关，上面两
+    // 守卫不覆盖）。组段活着=用户还在打字，交互刚结束绝无真切换——
+    // 按抖动处理保组段；无组段时照常走清理（无组段可杀，幂等）。
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.composing
+            && !g.preedit_last.is_empty()
+            && g.cand_interact_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            trace("OnSetFocus: 候选窗交互宽限内（组段活）——按抖动保组段跳过");
+            return Ok(());
+        }
+    }
+    // 【交互后焦点自愈·记录 2026-10-12】非空焦点文档留档：候选窗点击
+    // 把 TSF 焦点抖成 NULL 时（键不再路由=上屏失效），交互收场检测
+    // 后 SetFocus 回这个文档复活键路。
+    if let Some(f) = pdimfocus {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .focus_doc_last = Some(f.clone());
     }
     // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段 SetText 后
     // **即时**（trace 实测 4ms）重发 OnSetFocus——此前走到「旧文档冲销」
@@ -1839,6 +1964,24 @@ impl HuFuTs_Impl {
         // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
         // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
         let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
+        // 【Caps 系统态补偿·吞合成键 2026-10-12】补偿窗口内的 CapsLock
+        // 事件全是自家 keybd_event 合成（翻回系统 OFF 位）——直通，
+        // 绝不递引擎（否则补偿键被当用户键再消费一次=模式连翻）。
+        if wparam == 0x14
+            && self
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .caps_fixup_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            crate::tsf::trace("caps: 补偿窗口内合成键 → 直通不递引擎");
+            return BOOL(0);
+        }
+        // 【交互收场自愈·执行半 2026-10-12】候选窗点击/右键菜单收场后
+        // 的第一键：焦点 NULL 自愈（BUG① 上屏失效的键路死支）+ 锚点
+        // 补探（BUG③ 调频后候选飘）。键入口安全上下文（非 wndproc）。
+        cand_interact_recover_pending(&self.shared);
         // 【加词/加权小窗直通 2026-09-12 十二修】小窗打开期间，主线程
         // 的 dispatch **无条件直通**——五版门带前台比对（fg==小窗才
         // 挡），实测存在缝隙：attach 脱离后前台闪回宿主窗/cuas 把词
@@ -2378,6 +2521,27 @@ impl HuFuTs_Impl {
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
         ));
+        // 【Caps 系统态补偿 2026-10-12】引擎消费了 CapsLock（选重映射/
+        // 锁大写档/清屏/切英文）后，部分宿主仍翻转系统大小写锁定位
+        //（TSF 吞键不影响其翻转；实测 BUG②：Caps 选重一次后加词编码
+        // 框手输全大写）。系统位被翻 ON 即合成一对 CapsLock 击键翻回
+        // OFF——IME 全权接管中文态 Caps，系统位必须保持与 IME 态一致。
+        // 注：模式键在 TestDown/KeyDown 任一阶段直发（80ms 去重保证
+        // 一次击键只发一次），补偿跟无论哪个阶段的那一次。
+        if name == "capslock" && consumed {
+            unsafe {
+                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
+                    crate::tsf::trace("caps: 系统大写位被翻转 → 合成补偿键翻回 OFF");
+                    {
+                        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.caps_fixup_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+                    }
+                    keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), 0);
+                    keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, 0);
+                }
+            }
+        }
         // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
         // escape 预判用）：任何键响应 state 都可能翻转它（上屏后
         // 非空、撤光后空），就地下钻同步。

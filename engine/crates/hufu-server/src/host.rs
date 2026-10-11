@@ -437,6 +437,16 @@ impl Host {
                 const IDLE_UNLOAD_MIN: u64 = 30;
                 let mut idle_secs: u64 = 0;
                 let mut loaded = native.is_some() || model.is_some();
+                // 【空闲首击热身 2026-10-12】最近一次打分时刻（ms）——
+                // >120s 空闲后首击先热身再正式请求（电源态轻推，防死机
+                // 取证见下）。启动时引擎已空跑预热，初值=启动时刻。
+                let now_ms = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                };
+                let mut last_score_ms: u64 = now_ms();
                 let ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
                                           model: &mut Option<hufu_rerank::Reranker>| {
                     if native.is_none() && model.is_none() {
@@ -500,6 +510,41 @@ impl Host {
                     if cur.cands.len() < 2 {
                         continue;
                     }
+                    // 【空闲首击热身 2026-10-12 作者令】>120s 无打分后首击
+                    // 先小负载轻推电源态再跑正式请求——逐键全核 AVX 爆发
+                    // 引发「深省电→爆频」电源管理震荡，AMD APU 平台状态
+                    // 机在转换处整机挂死（SoC 级取证，详见 E:\DSH-KF\虎符
+                    // 重排打包强制规范.md）。native 侧 FFI 无线程数参数：
+                    // 单候选小打分（线程池轻载起步）；Rust 侧 warmup() =
+                    // 2 线程迷你前向（warmup_pool）。热身毫秒数落
+                    // rerank.log（电源震荡取证生命线）。
+                    const IDLE_WARMUP_SECS: u64 = 120;
+                    if loaded && now_ms().saturating_sub(last_score_ms) > IDLE_WARMUP_SECS * 1000 {
+                        let t_w = std::time::Instant::now();
+                        if let Some(ns) = &native {
+                            let _ = ns.score("。", &["预热".to_string()]);
+                        } else if let Some(r) = &model {
+                            r.warmup();
+                        }
+                        let w_ms = t_w.elapsed().as_millis();
+                        let _ = std::fs::create_dir_all(&diag_dir);
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(diag_dir.join("rerank.log"))
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                f.write_all(
+                                    format!(
+                                        "[{}] warmup {w_ms}ms (idle>{}s)\n",
+                                        now_ms() / 1000,
+                                        IDLE_WARMUP_SECS
+                                    )
+                                    .as_bytes(),
+                                )
+                            });
+                    }
+                    last_score_ms = now_ms();
                     // 打分（native 优先；native 缺席时纯 Rust 懒加载兜底）
                     let t_score = std::time::Instant::now();
                     let scores: Option<Vec<f64>> = if let Some(ns) = &native {

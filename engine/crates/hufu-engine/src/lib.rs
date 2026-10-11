@@ -986,6 +986,10 @@ impl Engine {
             }
             "switch" => {
                 session.chinese = !session.chinese;
+                // 【切英文态清锁大写 2026-10-12】caps_lock 只在中文态有
+                // 义——经自定义键切英（或锁大写态切英回中）一律复位，
+                // 回中文从干净态开始。
+                session.caps_lock = false;
                 // 【切英文上屏编码 2026-10-07】同 Caps/Shift/Ctrl+空格
                 // 口径：切英方向有编码且开关开 → 编码字母上屏。
                 if !session.chinese
@@ -1162,6 +1166,8 @@ impl Engine {
             if let Some(c) = key.key.as_char() {
                 if c == ' ' && self.config.general.ctrl_space_switch {
                     session.chinese = !session.chinese;
+                    // 【切英文态清锁大写 2026-10-12】同自定义 switch 口径。
+                    session.caps_lock = false;
                     // 【切英文上屏编码 2026-10-07】同 Caps/Shift 口径
                     if !session.chinese
                         && self.config.general.commit_raw_on_en_switch
@@ -1277,6 +1283,10 @@ impl Engine {
         // 自定义键不受影响（上方英文态白名单先查，显式绑定优先）。
         if key.key == KeyCode::CapsLock {
             if !session.chinese {
+                // 【切英文态清锁 2026-10-12】英文态不认 caps_lock（英文
+                // 态 Caps 恒透传系统原生锁定）；从锁大写态经 Shift/
+                // Ctrl+空格/自定义键切去英文时，回中文从干净态开始。
+                session.caps_lock = false;
                 return KeyOutcome::passthrough();
             }
             match self.config.general.caps_action {
@@ -1288,6 +1298,8 @@ impl Engine {
                 }
                 hufu_config::CapsAction::Switch => {
                     session.chinese = !session.chinese;
+                    // 【切英文态清锁大写 2026-10-12】同自定义 switch 口径。
+                    session.caps_lock = false;
                     // 【切英文上屏编码 2026-10-07】中→英且有编码：
                     // commit_raw_on_en_switch 开 → 编码字母上屏（与
                     // Shift 单击同口径）；关 → 原行为（清空丢弃）。
@@ -1303,6 +1315,28 @@ impl Engine {
                     return KeyOutcome::consumed(self.state(session));
                 }
                 hufu_config::CapsAction::None => {}
+                // 【中文态 Caps 锁大写 2026-10-12】按一下锁定大写：
+                // 此后字母以大写英文直出（on_char 空态 caps_lock 拦截，
+                // 不进编码）；再按一下解除并恢复中文录入。锁大写期间
+                // raw 恒空（进入时已清、字母不进编码）。
+                hufu_config::CapsAction::Caps => {
+                    session.caps_lock = !session.caps_lock;
+                    if session.caps_lock {
+                        if self.config.general.commit_raw_on_en_switch
+                            && !session.raw.is_empty()
+                        {
+                            let raw = std::mem::take(&mut session.raw);
+                            session.clear();
+                            session.caps_lock = true;
+                            return KeyOutcome::commit(raw, self.state(session));
+                        }
+                        session.clear();
+                        session.caps_lock = true;
+                    } else {
+                        session.clear();
+                    }
+                    return KeyOutcome::consumed(self.state(session));
+                }
             }
             return KeyOutcome::passthrough();
         }
@@ -1325,12 +1359,15 @@ impl Engine {
         {
             if session.raw.is_empty() {
                 session.chinese = !session.chinese;
+                // 【切英文态清锁大写 2026-10-12】同其余切换路径口径。
+                session.caps_lock = false;
                 session.pair.reset();
                 return KeyOutcome::consumed(self.state(session));
             }
             let raw = std::mem::take(&mut session.raw);
             session.candidates.clear();
             session.chinese = false;
+            session.caps_lock = false;
             session.pair.reset();
             if self.config.general.commit_raw_on_en_switch {
                 return KeyOutcome::commit(raw, self.state(session));
@@ -1583,6 +1620,38 @@ impl Engine {
             // 编码字符/标点路径（默认 ;/' 进字母表或出标点）。自定义
             // 键若在编码字母表里照常进编码；非字母表字符落到标点/
             // 透传——与次选/三选空态行为同构，无需特判。此处不拦截。
+            // 【七十八修·pending dot】数字后按 . 延迟上屏：第一下不落
+            // 屏，进组段显示（raw="."，像编码的下划线预编辑）；再按
+            // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
+            // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
+            // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
+            // 依赖回删）。逗号（,）全角直出（二十五修）。
+            // 【2026-10-12 提前到编码字母表之前】快符表/码表有 `.` 开头
+            // 编码（快符.yaml 的 .zd 类）时 `.` 会进编码字母表——若
+            // 字母表分支在前，数字后按 `.` 被当引导符吞进 raw 出
+            // 「.zd」快符（用户实测）。数字态句号规则是输入法固有
+            // 特性（第一下 . 第二下 。），优先级高于任何方案的 `.` 编码。
+            if c == '.'
+                && !shift
+                && session
+                    .tail_context
+                    .chars()
+                    .last()
+                    .map(|t| t.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                session.raw = ".".into();
+                self.refresh_candidates(session);
+                return KeyOutcome::consumed(self.state(session));
+            }
+            // 【中文态 Caps 锁大写 2026-10-12】锁大写期间字母以大写
+            // 英文直出（不进编码、不组段）；数字/标点不受 Caps 影响
+            // （照旧走下方常规路径）。Shift 形态同样出大写（锁大写
+            // 语境下 Shift+字母 出小写反直觉，一律大写）。
+            if session.caps_lock && c.is_ascii_alphabetic() {
+                session.tail_context.push(c.to_ascii_uppercase());
+                return KeyOutcome::commit(c.to_ascii_uppercase().to_string(), self.state(session));
+            }
             // 编码字符
             if self.config.input.is_alphabet_char(c) && !shift {
                 session.raw.push(c);
@@ -1610,25 +1679,6 @@ impl Engine {
             if c.is_ascii_digit() {
                 session.tail_context.push(c);
                 return KeyOutcome::passthrough();
-            }
-            // 【七十八修·pending dot】数字后按 . 延迟上屏：第一下不落
-            // 屏，进组段显示（raw="."，像编码的下划线预编辑）；再按
-            // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
-            // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
-            // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
-            // 依赖回删）。逗号（,）全角直出（二十五修）。
-            if c == '.'
-                && !shift
-                && session
-                    .tail_context
-                    .chars()
-                    .last()
-                    .map(|t| t.is_ascii_digit())
-                    .unwrap_or(false)
-            {
-                session.raw = ".".into();
-                self.refresh_candidates(session);
-                return KeyOutcome::consumed(self.state(session));
             }
             // 标点
             if let Some((text, back)) = self.punct_output(session, c) {
@@ -7300,7 +7350,10 @@ mod tests {
             is_press: true,
         };
         assert!(eng.config.general.commit_raw_on_en_switch, "默认开");
-        assert!(matches!(eng.config.general.caps_action, hufu_config::CapsAction::Switch));
+        // 【2026-10-12】Caps 默认=锁定大写（CapsAction::Caps）；本测的
+        // Caps 路径走显式 Switch（切英语义的老开关仍有效）。
+        assert!(matches!(eng.config.general.caps_action, hufu_config::CapsAction::Caps));
+        eng.config.general.caps_action = hufu_config::CapsAction::Switch;
 
         // —— 开（默认）：四路径全上屏编码 ——
         let mut s = Session::new(true);
@@ -7740,6 +7793,128 @@ mod tests {
     }
 
     // calc_command/word_making_encoder 随 \ 命令模式下线（2026-09-06）。
+
+    // 【中文态 Caps 锁大写 2026-10-12 用户令】caps_action=Caps：按一下
+    // 锁定大写（字母以大写英文直出、不进编码），再按一下解除回中文。
+    #[test]
+    fn caps_lock_toggle() {
+        let (mut eng, _dir) = test_engine("capsw");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        let mut s = Session::new(true);
+        // 第一按：进锁大写（consumed，无上屏）
+        let o0 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o0.consumed && o0.commit.is_none(), "第一按进锁大写");
+        assert!(s.caps_lock, "会话 caps_lock 置位");
+        // 锁大写期间：字母大写直出（不进编码）
+        let oa = eng.process_key(&mut s, key('a'));
+        assert_eq!(oa.commit.as_deref(), Some("A"), "锁大写字母直出大写");
+        assert!(s.raw.is_empty(), "不进编码");
+        let ob = eng.process_key(&mut s, key('b'));
+        assert_eq!(ob.commit.as_deref(), Some("B"), "连续字母都大写");
+        // 第二按：解除回中文
+        let o1 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o1.consumed, "第二按 consumed");
+        assert!(!s.caps_lock, "caps_lock 复位");
+        // 解除后：字母回正常编码路径
+        eng.process_key(&mut s, key('h'));
+        assert_eq!(s.raw, "h", "解除后字母进编码");
+        // 数字/标点不受锁大写影响：锁上后数字照旧直通记尾
+        let mut s2 = Session::new(true);
+        eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        let od = eng.process_key(&mut s2, key('1'));
+        assert!(od.commit.is_none() && !od.consumed, "锁大写数字照旧直通");
+    }
+
+    // 锁大写进入时有编码：commit_raw_on_en_switch 开（默认）→ 编码字母
+    // 上屏再锁（与 Shift 切英同口径）；关 → 丢弃。
+    #[test]
+    fn caps_lock_raw_flush() {
+        let (mut eng, _dir) = test_engine("capsr");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        eng.config.general.commit_raw_on_en_switch = true;
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('h'));
+        assert!(!s.raw.is_empty());
+        let o = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(s.caps_lock, "置位");
+        assert!(o.commit.is_some(), "编码上屏（不丢字）: {:?}", o.commit);
+        assert!(s.raw.is_empty(), "raw 清空");
+        // 关开关：丢弃直接锁
+        eng.config.general.commit_raw_on_en_switch = false;
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('h'));
+        let o2 = eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(s2.caps_lock && o2.commit.is_none(), "丢弃直锁");
+    }
+
+    // 【快符 .zd 类 2026-10-12 BUG④】`.` 在方案编码字母表里（快符表
+    // .zd/.zj 等）：数字后按 `.` 仍走 pending-dot（第一下 . 第二下 。），
+    // 不被字母表分支吞成「.」引导快符。
+    #[test]
+    fn pending_dot_beats_alphabet_dot() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-pda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nh\t后\nma\t码\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        // 快符.yaml 同款：`.` 进编码字母表（引导快符码）
+        cfg.input.alphabet = format!(".{}", cfg.input.alphabet);
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+        // 数字后 `.` → pending（不落屏、不进快符编码）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('1'));
+        let o1 = eng.process_key(&mut s, key('.'));
+        assert!(o1.consumed && o1.commit.is_none(), "第一下 pending: {o1:?}");
+        assert_eq!(s.raw, ".", "组段是 pending 点（非 .zd 快符码）");
+        // 第二下 → 「。」
+        let o2 = eng.process_key(&mut s, key('.'));
+        assert_eq!(o2.commit.as_deref(), Some("。"), "第二下「。」: {:?}", o2.commit);
+        // 非数字尾：`.` 照旧进编码（引导语义不变）
+        let mut s2 = Session::new(true);
+        let o3 = eng.process_key(&mut s2, key('.'));
+        assert!(o3.consumed && o3.commit.is_none(), "空态 . 照旧进编码");
+        assert_eq!(s2.raw, ".", "空态 . 为编码首字符");
+    }
 
     #[test]
     fn pending_dot_after_digit() {

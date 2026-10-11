@@ -36,37 +36,107 @@ pub fn foreground_within(within_ms: u64) -> bool {
     now.saturating_sub(last) < within_ms
 }
 
-/// 重排专用线程池：≤6 线程 + Windows BelowNormal 优先级。
-/// 不抢全局池：打分永远让位于前台（管道解码在 normal 优先级），CPU 封顶 ~37%。
+/// 【重排防死机·物理核口径 2026-10-12】线程上限规范按「机器逻辑核心
+/// 数的一半」——available_parallelism 受进程亲和性影响（亲和性已锁
+/// 半核时它返回的就是半数值，再折半会过杀），GetSystemInfo 恒返回
+/// 物理拓扑全部逻辑核。
+#[cfg(windows)]
+fn machine_logical_cores() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    unsafe {
+        // SYSTEM_INFO 含匿名联合无 Default——零初始化（dwNumberOfProcessors
+        // 必被 GetSystemInfo 全量覆写）。
+        let mut si: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut si);
+        si.dwNumberOfProcessors as usize
+    }
+}
+#[cfg(not(windows))]
+fn machine_logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+}
+
+/// 【重排防死机·线程铁律 2026-10-12】见 E:\DSH-KF\虎符重排打包强制规范.md：
+/// 推理线程数 ≤ 机器逻辑核一半（16 线程机 ≤8；此处再叠 6 线程内存带宽
+/// 封顶——实测 14 线程抢内存带宽把下一键解码从 ~30ms 拖到 150-170ms，
+/// 6 线程停顿期 ~500ms 内仍可完成）。线程统一 BelowNormal + EcoQoS
+///（执行速度节流：让推理线程保持深省电档，不拉 SoC 电源态——防死机
+/// 的电源管理侧半边；亲和性/进程优先级在 hufu-server main 写死）。
+#[cfg(windows)]
+unsafe fn thread_anti_freeze_setup() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, SetThreadPriority,
+        ThreadPowerThrottling, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+    };
+    // THREAD_PRIORITY_BELOW_NORMAL = -1
+    SetThreadPriority(GetCurrentThread(), -1);
+    // EcoQoS：Version=1, Control/State=EXECUTION_SPEED（进节流档）
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    SetThreadInformation(
+        GetCurrentThread(),
+        ThreadPowerThrottling,
+        &state as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+    );
+}
+
+/// 重排专用线程池：线程数铁律见上（≤物理半核 ∩ ≤6，下限 2）+ Windows
+/// BelowNormal/EcoQoS。不抢全局池：打分永远让位于前台（管道解码在
+/// normal 优先级）。
 fn rerank_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(4)
-            // 6 线程封顶：实测 16 核机 14 线程推理会抢内存带宽，慢速打字
-            // （>350ms/键触发重排）时下一键解码从 ~30ms 拖到 150-170ms——
-            // CPU 优先级（BelowNormal）让核但不让内存带宽/L3。6 线程推理
-            // 稍慢（停顿期 ~500ms 内仍可完成）而打字跟手。
-            .min(6)
-            .max(2);
+        // 半核铁律：机器逻辑核一半（下限 2）∩ 6（内存带宽封顶）。
+        // 16 线程机 = min(8, 6) = 6（与旧值一致，带宽实测口径）；
+        // 8 线程机 = 4；32 线程机 = 6。
+        let half = (machine_logical_cores() / 2).max(2);
+        let n = half.min(6);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .thread_name(|i| format!("hufu-rerank-{i}"))
             .start_handler(|_i| {
                 #[cfg(windows)]
                 unsafe {
-                    // THREAD_PRIORITY_BELOW_NORMAL = -1
-                    windows_sys::Win32::System::Threading::SetThreadPriority(
-                        windows_sys::Win32::System::Threading::GetCurrentThread(),
-                        -1,
-                    );
+                    thread_anti_freeze_setup();
                 }
             })
             .build()
             .expect("rerank pool")
     })
 }
+
+/// 【空闲首击热身·迷你池 2026-10-12】>120s 空闲后首击先用它跑 2 线程
+/// 迷你前向（forward_warmup）——逐键全核爆发引发「深省电→爆频」电源
+/// 管理震荡（AMD APU 平台状态机转换处整机挂死取证），轻推电源态再上
+/// 正式请求。线程同款 BelowNormal+EcoQoS。常驻懒建（热身秒级间隔可
+/// 复用；空转 2 线程零成本）。
+fn warmup_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("hufu-warmup-{i}"))
+            .start_handler(|_i| {
+                #[cfg(windows)]
+                unsafe {
+                    thread_anti_freeze_setup();
+                }
+            })
+            .build()
+            .expect("warmup pool")
+    })
+}
+
+/// 热身期标志：matmul_w 的池指向开关（见其注释）。forward_warmup 进出
+/// 置/复位；打分与热身在 host 重排线程串行，无竞态。
+static WARMUP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct Cfg {
     pub hidden: usize,
@@ -155,8 +225,17 @@ impl Qwen3 {
         let prof2 = std::env::var("GGUF_PROF").is_ok();
         let t_deq = std::time::Instant::now();
         let deq_us = std::sync::atomic::AtomicU64::new(0);
-        // 专用池内并行（BelowNormal 优先级 + 打字让键），不与前台争核
-        rerank_pool().install(|| {
+        // 专用池内并行（BelowNormal/EcoQoS + 打字让键），不与前台争核。
+        // 【池指向 2026-10-12】热身期（WARMUP_ACTIVE，见 forward_warmup）
+        // 指到 2 线程迷你池——mini 前向保持 2 线程；正常路径恒走全局
+        // 专用池。打分与热身在 host 重排线程上串行（同线程先热身后打
+        // 分），标志位无竞态面。
+        let pool = if WARMUP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            warmup_pool()
+        } else {
+            rerank_pool()
+        };
+        pool.install(|| {
             (0..n)
                 .into_par_iter()
                 .step_by(tile)
@@ -260,8 +339,10 @@ impl Qwen3 {
         }
     }
 
-    /// 全序列一次前向；need 为需打分的位置（预测下一 token），返回对应 logits 行
-    pub fn forward_scored_logits(&self, ids: &[u32], need: &[usize]) -> Vec<Vec<f32>> {
+    /// 全序列一次前向到末层归一（embedding→层栈→output_norm）。打分与
+    /// 热身共用主体（forward_scored_logits 再接 logits；forward_warmup
+    /// 到此为止——词表矩阵是最大单块，热身无需）。
+    fn forward_hidden(&self, ids: &[u32]) -> Vec<f32> {
         let c = &self.cfg;
         let l = ids.len();
         let hidden = c.hidden;
@@ -371,6 +452,28 @@ impl Qwen3 {
                 normed.push(a * b);
             }
         }
+        normed
+    }
+
+    /// 【空闲首击热身 2026-10-12】2 token 迷你前向（warmup_pool 2 线程，
+    /// 跳过词表 logits）：把全部层权重读一遍/AVX 通路/电源态轻推到位，
+    /// 正式请求随后不再从深省电直爆全核。>120s 空闲后首击前由 host.rs
+    /// 调（Reranker::warmup）。
+    pub fn forward_warmup(&self) {
+        // token id 1 恒存在（<vocab 最小规模）；2 token 覆盖因果掩码/rope
+        // 的非平凡路径（1 token 退化情形不值得信任）。
+        WARMUP_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        warmup_pool().install(|| {
+            let _ = self.forward_hidden(&[1u32, 1]);
+        });
+        WARMUP_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 全序列一次前向；need 为需打分的位置（预测下一 token），返回对应 logits 行
+    pub fn forward_scored_logits(&self, ids: &[u32], need: &[usize]) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let hidden = c.hidden;
+        let normed = self.forward_hidden(ids);
 
         // 只算 need 位置的 logits：h_sel(t,hidden) × embedᵀ
         let t = need.len();

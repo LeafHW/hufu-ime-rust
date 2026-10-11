@@ -83,9 +83,13 @@ pub struct GeneralSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CapsAction {
     Clear,
-    #[default]
     Switch,
     None,
+    /// 【中文态 Caps 锁大写 2026-10-12】按一下 CapsLock 锁定大写：此后
+    /// 字母全部以大写英文直出（不进编码）；再按一下解除并恢复中文
+    /// 录入。仅中文态生效（英文态 Caps 恒透传系统，见引擎 Caps 段）。
+    #[default]
+    Caps,
 }
 
 impl Default for GeneralSection {
@@ -96,10 +100,11 @@ impl Default for GeneralSection {
             follow_system_lang: true,
             shift_switch: true,
             ctrl_space_switch: true,
-            // 【2026-10-09 默认回正】Caps 默认=切英文（用户定稿；此前
-            // 误设 Clear）。老用户 config.json 里已显式写Clear 的不受
+            // 【2026-10-12 默认改锁大写】用户定稿：中文态 Caps=按一下锁定
+            // 大写英文直出、再按一下解除回中文（CapsAction::Caps）。
+            // 老用户 config.json 里已显式写 Clear/Switch/None 的不受
             // 影响（序列化值优先于默认）。
-            caps_action: CapsAction::Switch,
+            caps_action: CapsAction::Caps,
             switch_recent_schema: true,
             // 【Esc 双行为 2026-11】默认关：现行为不变（空态 Esc 透传）。
             esc_undo: false,

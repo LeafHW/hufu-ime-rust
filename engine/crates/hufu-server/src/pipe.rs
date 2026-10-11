@@ -542,6 +542,8 @@ pub fn dispatch(
         "toggle_lang" => {
             host.session.clear();
             host.session.chinese = !host.session.chinese;
+            // 【切英文态清锁大写 2026-10-12】语言栏切换同口径复位。
+            host.session.caps_lock = false;
             host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
@@ -570,6 +572,9 @@ pub fn dispatch(
                 .unwrap_or(host.session.chinese);
             host.session.clear();
             host.session.chinese = zh;
+            // 【锁大写复位 2026-10-12】compartment 幂等设值时锁大写一并
+            // 复位（跨进程对账口径：语言态是全局单值，锁大写不入牌面）。
+            host.session.caps_lock = false;
             host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})

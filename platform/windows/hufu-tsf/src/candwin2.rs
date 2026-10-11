@@ -229,6 +229,10 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         cand2_PostMessageW(owner.0 as isize, 0x0000, 0, 0);
         let _ = DestroyWindow(owner);
         cand2_DestroyMenu(m);
+        // 【交互收场自愈 2026-10-12】菜单收场（无论是否选了动作）：置
+        // 交互宽限+挂起标记——回流焦点串清不掉活组段，下一键做焦点
+        // 自愈+锚点补探（BUG③：调频后候选飘/同根 BUG①）。
+        crate::tsf::cand_interact_note();
         if sel_id == 0 {
             return;
         }
@@ -570,6 +574,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     crate::tsf::diag_note(&format!("cw2 pin 拖动即固定 ({},{})", wr.left, wr.top));
                 } else {
                     crate::tsf::trace("cw2: lup 未拖动（死区内）");
+                    // 【交互收场自愈 2026-10-12】死区纯单击（用户「不慎
+                    // 点中候选框」）：置交互宽限+挂起标记，下一键入口做
+                    // 焦点自愈+锚点补探（BUG①：点击后空格/选重上屏失效；
+                    // BUG③ 同根光标丢失）。拖动分支不调——拖动即固定语
+                    // 义下窗口位置本就脱离光标。
+                    crate::tsf::cand_interact_note();
                 }
             }
             *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;

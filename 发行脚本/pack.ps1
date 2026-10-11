@@ -1,4 +1,4 @@
-﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
@@ -138,7 +138,10 @@ $env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\platform\windows\target-slim'
 $tsfDir = 'E:\DSH-KF\hufu\platform\windows'
 $builds = @(
     @{ dir = $tsfDir; args = @('--release', '--target', 'x86_64-pc-windows-gnu', '-p', 'hufu-tsf') },
-    @{ dir = $tsfDir; args = @('--release', '--target', 'i686-pc-windows-gnu', '-p', 'hufu-tsf') },
+    # 【2026-10-12】i686 必须带 llvm-mingw-entry：本地 llvm-mingw 工具链
+    # 无 gcc 链接器，DllEntryPoint 用 feature 内 stub；上游 3070da9 起
+    # 该 stub 已 feature 化——漏带 = 链接失败/入口缺失。
+    @{ dir = $tsfDir; args = @('--release', '--target', 'i686-pc-windows-gnu', '-p', 'hufu-tsf', '--features', 'llvm-mingw-entry') },
     @{ dir = $tsfDir; args = @('--release', '-p', 'hufu-tsf-smoke') }
 )
 foreach ($b in $builds) {
