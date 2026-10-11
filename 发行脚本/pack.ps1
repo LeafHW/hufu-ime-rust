@@ -18,6 +18,9 @@ param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
 # 用法：powershell -ExecutionPolicy Bypass -File pack.ps1 [-Version 1.4.2]
 $ErrorActionPreference = 'Stop'
 $REL  = 'E:\DSH-KF\hufu-发行'
+# 【2026-10-12】scriptblock 调用（IEX/[scriptblock]::Create）下 $PSScriptRoot
+# 为空（PS5.1 无 BOM 脚本不能 -File 直跑的替代通道）——显式回退到本脚本目录。
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'E:\DSH-KF\hufu\发行脚本' }
 $SRC  = "$REL\打包源"
 $BASE = "$REL\基线包"
 $LOGD = "$REL\日志"
@@ -217,7 +220,7 @@ if ($liveMa -and (Test-Path $liveMa)) {
     # 频表；hanzi_db.csv 在本脚本同目录）：三表每次打包重筛（幂等防回潮）。
     {
         $freq = New-Object 'System.Collections.Generic.HashSet[string]'
-        $csv = Join-Path $PSScriptRoot 'hanzi_db.csv'
+        $csv = Join-Path $ScriptDir 'hanzi_db.csv'
         # 【2026-09-11 回退】字频表是打包依赖（曾在大清理中被当杂项误删致打包
         # 中止）——本地缺失时自动回退 语料\ 副本并复原，双处皆无才报错。
         if (-not (Test-Path $csv)) {
@@ -676,7 +679,7 @@ if ($NoModel) {
 #    即无模型版，本段跳过——曾经在此发生 $szip==$zip 自删事故）──
 if (-not $NoModel) {
 $szipName = "HuFu虎符输入法-v$Version-无模型.zip"
-$szip = Join-Path $PSScriptRoot $szipName
+$szip = Join-Path $ScriptDir $szipName
 $sall = $true
 if (Test-Path $szip) { Remove-Item $szip -Force }
 Copy-Item $zip $szip -Force
