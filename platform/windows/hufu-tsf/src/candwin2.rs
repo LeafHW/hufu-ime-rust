@@ -320,11 +320,20 @@ unsafe fn cand_menu_refresh(resp: &Value) {
                 (g.cand2.take(), g.skin.clone(), g.caret)
             };
             if let Some(c) = cand2.as_mut() {
-                // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】调频帧
+                // 【T8 用户铁律·框内不画编码 2026-10-07 终局】调频帧
                 // 与打字帧同一渲染铁律：只画候选，编码恒不画（宽度恒
                 // 定=框无从挪动；两帧同长相=无翻脸可言）。真 raw 仍写
                 // last_show（后续 ipc 用）。
-                c.show(&cands, "", &skin, caret.as_ref(), sel);
+                // 【内联关闭放行 2026-10-11 用户实锤】调频刷新帧编码行
+                // 同过 inline_preedit 开关——关着显示真实编码（此前硬
+                // 编码空串=「打字帧有编码、调频帧没了」的翻脸来源）。
+                let inline_on = skin
+                    .pointer("/skin/layout/inline_preedit")
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let raw_disp = if !inline_on { raw.clone() } else { String::new() };
+                c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
                 c.snap_anims();
             }
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());

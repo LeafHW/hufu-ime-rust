@@ -8202,9 +8202,18 @@ fn poll_tick() {
                 // 入场/尺寸动画 armed 后一步不跑（实锤 tick取
                 // last_some=false）。先放回再按线程取窗。
                 if let Some((cands, raw2, sel)) = last {
-                    // 【框内永不画编码】同渲染铁律：显示恒空编码，真值
-                    // 留在 last_show。
-                    let raw2_disp = String::new();
+                    // 【框内不画编码·内联关闭放行 2026-10-11 用户实锤】
+                    // 同 T8/内联回归修口径：皮肤重拉重绘帧的编码行也过
+                    // inline_preedit 开关——开着恒空（真值留在 last_show），
+                    // 关着显示真实编码。此前硬编码空串：设置页一改皮肤/
+                    // 开关触发重拉，重绘帧编码行直接空（有的场合显示有
+                    // 的不显示的种子）。
+                    let inline_on = skin
+                        .pointer("/skin/layout/inline_preedit")
+                        .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let raw2_disp = if !inline_on { raw2.clone() } else { String::new() };
                     if crate::addword::in_window_thread() {
                         let anchor_rect = anchor.and_then(|a| {
                             let x = a.get("x").and_then(|v| v.as_i64())? as i32;
