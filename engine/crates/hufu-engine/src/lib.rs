@@ -1291,11 +1291,17 @@ impl Engine {
             }
             // 【空态绑定才让位 2026-10-12 二次·用户拍板】capslock 只在
             // map_idle（空态表）显式绑定时，空态才让内建 caps_action 让
-            // 位=静默消费（绑定即功能键）；仅 map（编码态）绑定时空态
-            // 照走默认（锁大写等）——用户两轮实锤：双表绑=空态要无反
-            // 应；单表绑=空态要大写锁定。有候选路径已在上方 keymap 命
-            // 中（select2 等照常，不受本门影响）。
-            if self.config.keymap.map_idle.contains_key("capslock") {
+            // 位=静默消费（绑定即功能键）；仅 map（编码态）绑定、或
+            // map_idle 为空串（设置 UI「清除」写的是 ""——用户实锤
+            // 「按了没反应」）时空态照走默认（锁大写等）。有候选路径
+            // 已在上方 keymap 命中（select2 等照常，不受本门影响）。
+            if self
+                .config
+                .keymap
+                .map_idle
+                .get("capslock")
+                .is_some_and(|v| !v.is_empty())
+            {
                 return KeyOutcome::consumed(self.state(session));
             }
             match self.config.general.caps_action {
@@ -9101,6 +9107,15 @@ mod tests {
         );
         assert!(o.consumed && o.commit.is_none(), "空态表绑定：静默消费");
         assert!(!s_idle_bound.caps_lock, "空态表绑定绝不进锁大写");
+        // 【清除=空串 2026-10-12 三次】设置 UI「清除」写 ""——空串=
+        // 未绑定：空态照走默认（Caps 锁大写），绝非「没反应」。
+        eng.config.keymap.map_idle.insert("capslock".into(), String::new());
+        let mut s_cleared = Session::new(true);
+        let o = eng.process_key(
+            &mut s_cleared,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && s_cleared.caps_lock, "空串=清除：空态照走默认锁大写");
         eng.config.keymap.map_idle.remove("capslock");
         eng.config.general.caps_action = hufu_config::CapsAction::Caps;
 

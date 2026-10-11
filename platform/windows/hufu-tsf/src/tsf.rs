@@ -1484,11 +1484,31 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
                 (g.composing, g.preedit_last.clone())
             };
             if composing && !preedit.is_empty() {
-                trace("cand_interact: 组段复活（重发预编辑）");
-                let _ = run_session(&shared, Op::SetPreedit(preedit), Some(ctx.clone()));
+                trace("cand_interact: 组段复活（重发预编辑·仅同步档）");
+                // 【仅同步档 2026-10-12 三次】VSCode 崩溃实锤（0xC0000409
+                // 两发同偏移）：菜单期同步会话被拒(0x8000FFFF)后降级异
+                // 步排队——过期会话 1.2s 后在宿主拆家状态执行=闪退。复活
+                // /补探绝不排队异步：被拒即在交互窗内重试（下一拍），
+                // 窗口过期自然放弃。异步恢复会话=时间炸弹，全线禁用。
+                if run_session_sync_only(&shared, Op::SetPreedit(preedit), ctx.clone()).is_err() {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.cand_interact_until
+                        .is_some_and(|t| std::time::Instant::now() < t)
+                    {
+                        g.cand_interact_pending = true; // 交互窗内重试
+                    }
+                }
             }
         }
-        let _ = run_session(&shared, Op::QueryCaret, Some(ctx));
+        // 锚点补探同样仅同步档（理由同上：异步过期会话=闪退炸弹）。
+        if run_session_sync_only(&shared, Op::QueryCaret, ctx).is_err() {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.cand_interact_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+            {
+                g.cand_interact_pending = true;
+            }
+        }
     }
 }
 
