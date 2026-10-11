@@ -1835,6 +1835,27 @@ impl Engine {
                     return o;
                 }
             }
+            // 【Shift+未自定义字母=大写顶屏 2026-10-11 用户需求】有候选时
+            // Shift+字母（该键在「Shift+符号修改」里没有自定义串）=首选
+            // 顶屏+大写字母随行（jd 出候选后 Shift+D →「就D」）——与
+            // 「大写直上屏」同款不丢键语义，但顶的是首选不是编码裸串。
+            // 优先级：自定义串（上方 rep 臂）> 本臂大写顶屏。无候选不
+            // 进本臂（外层门 + 显式判空双保险）——空态/无候选走下方
+            // mixed_input/大写直上屏老链路，「都生效」档无候选也照旧。
+            if c.is_ascii_alphabetic() && !session.candidates.is_empty() {
+                let upper = c.to_ascii_uppercase();
+                let (first, fback) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .first()
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{upper}"), self.state(session));
+                o.back = fback;
+                return o;
+            }
         }
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
         // 【空码清屏·符号数字同治 2026-10-09】空码态（无候选无延续）
@@ -6911,6 +6932,50 @@ mod tests {
         eng.process_key(&mut s, k(KeyCode::F(2)));
         assert!(eng.config.opencc.enabled, "编码态翻转生效");
         assert!(!s.candidates.is_empty(), "不清组段——候选保留");
+    }
+
+    /// 【Shift+未自定义字母=大写顶屏 2026-10-11】有候选时 Shift+字母
+    /// （无自定义串）→ 首选顶屏+大写字母随行；自定义「Shift+符号」
+    /// 串优先；无候选不走此臂（老链路不动）。fixture 走 manifest
+    /// target（temp_dir 环境病）。
+    #[test]
+    fn shift_letter_uppercase_top_commit() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-shift-upper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\n").unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sk = |c: char| {
+            let mut k = key(c);
+            k.modifiers.shift = true;
+            k
+        };
+        // 未自定义：jd 候选在场，Shift+D → 就D
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        assert!(!s.candidates.is_empty(), "候选在场");
+        let out = eng.process_key(&mut s, sk('d'));
+        assert_eq!(out.commit.as_deref(), Some("就D"), "未自定义字母=首选+大写");
+        assert!(s.raw.is_empty(), "顶屏后清屏");
+        // 自定义串优先：Shift+D → 就Xy
+        eng.config.keymap.shift_symbols.insert("d".into(), "Xy".into());
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out2 = eng.process_key(&mut s2, sk('d'));
+        assert_eq!(out2.commit.as_deref(), Some("就Xy"), "自定义串优先");
+        // 无候选（打了死码 zq）：Shift+D 不走大写顶屏（引擎无上屏，
+        // 大写交给系统链路）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('z'));
+        eng.process_key(&mut s3, key('q'));
+        assert!(s3.candidates.is_empty(), "死码无候选");
+        let out3 = eng.process_key(&mut s3, sk('d'));
+        assert!(out3.commit.is_none(), "无候选不走大写顶屏臂");
     }
 
     /// 【切英文上屏编码 2026-10-07】commit_raw_on_en_switch（默认开）：
