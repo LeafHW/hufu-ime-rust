@@ -334,6 +334,10 @@ $cfgChk = Get-Content "$SRC\数据\config.json" -Raw -Encoding UTF8 | ConvertFro
 # 用户拍板注释）——出厂 config 若显式写值必须与代码默认一致，防旧值回流。
 [void](Check ($cfgChk.user.auto_frequency -eq $false) 'config 出厂哨兵: user.auto_frequency=false')
 [void](Check ($cfgChk.user.log_adjust -eq $false) 'config 出厂哨兵: user.log_adjust=false')
+# 【Caps 出厂哨兵 2026-10-12】caps_action 出厂=锁定大写（CapsAction::Caps，
+# 用户定稿）——出厂 config 若显式写值必须与代码默认一致；曾带旧值 Switch
+# 出包把默认盖回跟随（config 序列化值优先于代码默认）。
+[void](Check ($cfgChk.general.caps_action -eq 'Caps') 'config 出厂哨兵: general.caps_action=Caps（锁定大写）')
 # 【皮肤出厂哨兵 2026-10-02b】默认皮肤 hilite_on 必须为 true（用户
 # 拍板：高亮默认开）。曾随 config 同路泄漏——live 验证「关」效果时
 # 设置页写回 chenwu/moyan 皮肤，真机镜像又带回包。
