@@ -367,10 +367,22 @@ pub struct Shared {
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
-    /// 【三十六修】模式键 down 已直发的一次性标记（vk）：对应 up 到达
-    /// 即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不翻回）；
-    /// 跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行切中英。
-    pub modekey_down_seen: Option<usize>,
+    /// 【三十六修】模式键 down 已直发的一次性标记（vk+时刻）：对应 up
+    /// 到达即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不
+    /// 翻回）；跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行
+    /// 切中英。【八十六修】加时刻：down 已发而 up 未到期间，同键第二
+    /// 个 down（TestDown+KeyDown 慢对 / 键自动重复）= 同一物理按压，
+    /// 一律吞——不再依赖 80ms 窗（慢宿主成对事件可远超 80ms）。
+    /// 陈旧保护：>1s 视为宿主丢 up，按新按压处理。
+    pub modekey_down_seen: Option<(usize, std::time::Instant)>,
+    /// 【八十六修·成对宿主 up 双发】同键最近一个 up（vk+时刻）。
+    /// TestUp+KeyUp 成对宿主（Notepad3 实测 trace：TestDown 直发 →
+    /// TestUp 消费 down_seen → KeyUp @+122ms 落在 80ms 窗外 → 二次
+    /// 直发 = 引擎翻转两次净零：大写锁死切不回 / Ctrl+Space 切换不
+    /// 动；只投一个 up 的宿主（浏览器类）无此形态——「不同软件有差
+    /// 异」的根源）。同键 250ms 内第二个 up 一律吞；真实再按必先有
+    /// 新 down（down_seen 路径正常放行），窗长不吞真击。
+    pub modekey_up_last: Option<(usize, std::time::Instant)>,
     /// 【八十五修·Ctrl+Space 抬序无关】space+ctrl 组合已成形标记：
     /// Ctrl 按住期间 space 落下、或 Ctrl 抬起/落下时 space 仍按住 →
     /// 置位；space 抬起时消费（无论此刻 Ctrl 是否已抬）。修「Ctrl
@@ -608,6 +620,7 @@ impl Shared {
             stale_raw_until: None,
             modekey_last: None,
             modekey_down_seen: None,
+            modekey_up_last: None,
             space_ctrl_armed: false,
             preedit_last: String::new(),
             last_commit_text: String::new(),
@@ -2461,6 +2474,62 @@ pub fn keys_log(line: &str) {
     }
 }
 
+/// 【八十六修】模式键事件准入判定（纯逻辑，单测可测）。
+/// 返回 true=放行直发 server，false=吞（同键同按压的成对/重复事件）。
+///
+/// 宿主投递形态（keys-17436 / Notepad3 trace 1791834528862 实测）：
+/// - 全四件 TestDown/KeyDown/TestUp/KeyUp（Notepad3 类）：TestDown 发
+///   → KeyDown 吞（down_seen 挂起）→ TestUp 吞（消费 down_seen + 记
+///   up_last）→ KeyUp 吞（up 去重）——一次物理按压恰好一发。
+/// - test/testup 成对、down 全无（跟打器类）：TestUp 放行（down_seen
+///   恒 None）。
+/// - key/keyup 成对：KeyDown 发 → KeyUp 吞（was_seen）。
+/// - 键自动重复（按住）：down_seen 挂起期间重复 down 全吞（模式键不
+///   应连发——旧 80ms 窗挡不住 >80ms 的重复）。
+/// 真实第二次按压必有 up 在中间（清 down_seen / 记 up_last），事件
+/// 驱动去重、不依赖击键时长。
+fn modekey_admit(g: &mut Shared, vk: usize, up: bool) -> bool {
+    if up {
+        let was_seen = matches!(&g.modekey_down_seen, Some((v, _)) if *v == vk);
+        if was_seen {
+            g.modekey_down_seen = None;
+            // 【八十五修】组合已由 down 消费——armed 同时终结（防后续
+            // 迟到的第二个 up 借旧组合再触发）。
+            g.space_ctrl_armed = false;
+        }
+        // 【八十六修】同键 up 去重：第一个 up（无论 TestUp/KeyUp）已
+        // 处理过本按压，250ms 内同键第二个 up = 成对宿主的另一路投递
+        // → 吞（见字段注释的实测链）。
+        let dup_up =
+            matches!(&g.modekey_up_last, Some((v, t)) if *v == vk && t.elapsed().as_millis() < 250);
+        g.modekey_up_last = Some((vk, std::time::Instant::now()));
+        if was_seen || dup_up {
+            return false;
+        }
+        // 【八十五修】armed 通道放行即消费（同上防双发：慢宿主
+        // testup/keyup 相隔可 >80ms，dup 挡不住）。
+        if vk == 0x20 && g.space_ctrl_armed {
+            g.space_ctrl_armed = false;
+        }
+    } else {
+        // 【八十六修】down 侧成对防线：本键 down 已直发且 up 未到 →
+        // 第二个 down = 同一物理按压（TestDown+KeyDown 慢对 / 自动重
+        // 复），吞。陈旧保护 >1s（宿主真丢 up 时不当永久卡死）。
+        if let Some((v, t)) = g.modekey_down_seen {
+            if v == vk && t.elapsed().as_secs() < 1 {
+                return false;
+            }
+        }
+        g.modekey_down_seen = Some((vk, std::time::Instant::now()));
+    }
+    // 遗留 80ms 同键窗（belt-and-suspenders：乱序/重排流兜底）。
+    if matches!(&g.modekey_last, Some((v, t)) if *v == vk && t.elapsed().as_millis() < 80) {
+        return false;
+    }
+    g.modekey_last = Some((vk, std::time::Instant::now()));
+    true
+}
+
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     ///
@@ -2709,34 +2778,15 @@ impl HuFuTs_Impl {
         // 回落内建单击切换，等价旧链路）。
         // ── 模式键直发 + 去重 ──
         // 按下事件（TestDown 或 KeyDown）直发；松开仅限「down 未直发过」
-        // 的跟打器形态。同键 80ms 去重挡 test+down 成对宿主的双发；up
-        // 一旦因 down 已发被吞即清标记——按住 Ctrl+Space 再久也不会
-        // 被迟到的 keyup 翻回（CapsLock「按住 >80ms 翻回」同源教训）。
+        // 的跟打器形态。去重全部事件驱动（八十六修，modekey_admit）：
+        // 同一物理按压不论宿主投 2/3/4 件、不论击键时长，恰好一发。
         if mode_key {
-            {
+            let admit = {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                if up {
-                    if g.modekey_down_seen == Some(wparam) {
-                        g.modekey_down_seen = None;
-                        // 【八十五修】组合已由 down 消费——armed 同时终结
-                        //（防后续迟到的第二个 up 借旧组合再触发）。
-                        g.space_ctrl_armed = false;
-                        return BOOL(0);
-                    }
-                    // 【八十五修】armed 通道放行即消费（同上防双发：慢
-                    // 宿主 testup/keyup 相隔可 >80ms，dup 挡不住）。
-                    if wparam == 0x20 && g.space_ctrl_armed {
-                        g.space_ctrl_armed = false;
-                    }
-                } else {
-                    g.modekey_down_seen = Some(wparam);
-                }
-                let dup = matches!(&g.modekey_last, Some((vk, t))
-                    if *vk == wparam && t.elapsed().as_millis() < 80);
-                if dup {
-                    return BOOL(0);
-                }
-                g.modekey_last = Some((wparam, std::time::Instant::now()));
+                modekey_admit(&mut g, wparam, up)
+            };
+            if !admit {
+                return BOOL(0);
             }
             // fallthrough：走通用路径发 server + 完整响应处理
         }
@@ -9555,5 +9605,95 @@ pub(crate) fn candidate_window_visible(thread: u32) -> bool {
         local || windows::Win32::UI::WindowsAndMessaging::FindWindowW(
             windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null()).ok()
             .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
+    }
+}
+
+#[cfg(test)]
+mod modekey_tests {
+    use super::{modekey_admit, Shared};
+
+    const CAPS: usize = 0x14;
+    /// 模拟一次「慢击」的完整四事件序列（Notepad3 形态）：
+    /// TestDown / KeyDown / TestUp / KeyUp。返回 (发火次数, 各事件准入)。
+    fn full_press(g: &mut Shared, age_out: bool) -> (u32, [bool; 4]) {
+        if age_out {
+            // 把上一击的 80ms 遗留窗拨过期（模拟真实击键间隔，免睡眠）
+            g.modekey_last = None;
+        }
+        let a = modekey_admit(g, CAPS, false); // TestDown
+        let b = modekey_admit(g, CAPS, false); // KeyDown
+        let c = modekey_admit(g, CAPS, true); // TestUp
+        let d = modekey_admit(g, CAPS, true); // KeyUp
+        (a as u32 + b as u32 + c as u32 + d as u32, [a, b, c, d])
+    }
+
+    /// 【BUG②回归·Notepad3 全四件形态】一次物理按压恰好一发：
+    /// TestDown 发 → KeyDown 吞 → TestUp 吞 → **KeyUp 必须吞**
+    ///（修复前 KeyUp 落 80ms 窗外二次直发=引擎翻转两次净零=大写锁死）。
+    #[test]
+    fn full_four_host_exactly_one_fire() {
+        let mut g = Shared::new();
+        let (fires, ev) = full_press(&mut g, false);
+        assert_eq!(ev, [true, false, false, false], "事件准入序列错误");
+        assert_eq!(fires, 1, "一次物理按压必须恰好一发");
+    }
+
+    /// 连续两次完整按压（事件驱动去重，不依赖时长）：各一发。
+    #[test]
+    fn two_presses_each_one_fire() {
+        let mut g = Shared::new();
+        let (f1, _) = full_press(&mut g, false);
+        let (f2, _) = full_press(&mut g, true); // 拨过期模拟真实间隔
+        assert_eq!((f1, f2), (1, 1), "每次按压应各恰好一发");
+    }
+
+    /// 跟打器形态（test/testup 成对、down 全无）：TestUp 放行。
+    #[test]
+    fn testup_only_host_admits() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, true), "down 全无时 TestUp 必须放行");
+        // 同键第二个 up（若该宿主也投 KeyUp）仍吞
+        assert!(!modekey_admit(&mut g, CAPS, true));
+    }
+
+    /// key/keyup 成对宿主：KeyDown 发、KeyUp 吞。
+    #[test]
+    fn key_keyup_host_single_fire() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, false));
+        assert!(!modekey_admit(&mut g, CAPS, true));
+    }
+
+    /// 键自动重复（按住 Caps 不放）：首 down 发、重复 down 全吞
+    ///（模式键不得连发——旧 80ms 窗挡不住 >80ms 的重复）。
+    #[test]
+    fn auto_repeat_swallowed() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, false));
+        for _ in 0..3 {
+            // 拨过期 80ms 窗，只靠 down_seen 挂起防线挡
+            g.modekey_last = None;
+            assert!(!modekey_admit(&mut g, CAPS, false), "重复 down 必须吞");
+        }
+    }
+
+    /// down_seen 陈旧保护：宿主真丢 up（>1s）后新按压不得永久卡死。
+    #[test]
+    fn stale_down_seen_expires() {
+        let mut g = Shared::new();
+        g.modekey_down_seen =
+            Some((CAPS, std::time::Instant::now() - std::time::Duration::from_secs(2)));
+        g.modekey_last = None;
+        assert!(modekey_admit(&mut g, CAPS, false), "陈旧挂起标记不得吞新按压");
+    }
+
+    /// Ctrl+Space armed：up 放行即消费 armed（八十五修语义保持）。
+    #[test]
+    fn ctrl_space_armed_consumed_on_up() {
+        let mut g = Shared::new();
+        g.space_ctrl_armed = true;
+        g.modekey_last = None; // 免 80ms 窗干扰
+        assert!(modekey_admit(&mut g, 0x20, true), "armed up 应放行");
+        assert!(!g.space_ctrl_armed, "armed 必须在放行时消费");
     }
 }

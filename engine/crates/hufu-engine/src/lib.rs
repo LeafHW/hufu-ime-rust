@@ -4332,6 +4332,17 @@ impl Engine {
         if cfg.to_traditional {
             if let Some(t) = &self.opencc {
                 for cand in session.candidates.iter_mut() {
+                    // 【功能词豁免 2026-11】{繁简}/{撤回}/{加词} 等功能词
+                    // 不做简→繁转换：转换后 tag 变形（{繁简}→{繁簡}），
+                    // 提交解析 tag=="繁简" 判否 → 繁体态下开关再也切不回
+                    //（用户实锤：{繁简} 写进主码表，打编码上屏成 {繁簡}
+                    // 字面）。花括号命名空间归功能词语法，普通词不受影响。
+                    if cand.text.starts_with('{')
+                        && cand.text.ends_with('}')
+                        && cand.text.len() > 2
+                    {
+                        continue;
+                    }
                     let conv = t.convert(&cand.text);
                     if conv != cand.text {
                         cand.text = conv;
@@ -8226,6 +8237,215 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains('👑')), "emoji 变体: {texts:?}");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【功能词豁免 opencc 2026-11】繁体输出中（enabled+to_traditional），
+    /// 码表里的 {繁简} 功能词候选不得被简→繁转换：转换后 tag 变形
+    ///（{繁简}→{繁簡}）→ 提交解析 tag=="繁简" 判否 → 上屏字面 {繁簡}、
+    /// 开关再也切不回（用户实锤：{繁简} 放主码表，繁体态打编码失效）。
+    /// 夹具的 ST 表故意带 繁简→繁簡 映射——若豁缺，本测试必红。
+    #[test]
+    fn opencc_func_word_exempt() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-ocfw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nh\t后\nfj\t{繁简}\n",
+        )
+        .unwrap();
+        // ST 表带 繁简→繁簡：证明豁免是主动挡下，而非表里没有
+        std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "繁简\t繁簡\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 普通词照常转繁（既有行为不回归）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('h'));
+        let snap = eng.state(&s);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.contains(&"後".to_string()), "普通词繁体: {texts:?}");
+
+        // 功能词候选保持 {繁简} 原样（非 {繁簡}）——查 session 原始
+        // 候选（state() 视图已套 display_candidate 显示变换）
+        let mut f = Session::new(true);
+        eng.process_key(&mut f, key('f'));
+        eng.process_key(&mut f, key('j'));
+        let texts: Vec<String> = f.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.iter().any(|t| t == "{繁简}"),
+            "功能词豁免简繁转换: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "{繁簡}"),
+            "不得出现繁化功能词: {texts:?}"
+        );
+        // 显示层实时目标照常（豁缺时 tag 判否、显示退回 {繁簡} 字面）
+        let snap = eng.state(&f);
+        assert!(
+            snap.candidates.iter().any(|c| c.text == "⇄转简"),
+            "繁体态显示「⇄转简」: {:?}",
+            snap.candidates
+        );
+
+        // 繁体态提交 {繁简}：开关照样翻转（空提交，不上屏字面）
+        let before = eng.config.opencc.enabled;
+        let o = eng.process_key(&mut f, key(' '));
+        assert!(
+            eng.config.opencc.enabled != before,
+            "繁体态 {{繁简}} 提交翻转开关"
+        );
+        assert!(eng.pending_config_save, "翻转置落盘旗");
+        assert!(
+            o.commit.as_deref() != Some("{繁簡}") && o.commit.as_deref() != Some("{繁简}"),
+            "功能词空提交不上屏字面: {:?}",
+            o.commit
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【功能词豁免 opencc·五笔 ; 引导域 2026-11】用户实锤：五笔码表
+    /// （QQ五笔 092K.dict.yaml，rime 词TAB码 格式）把 {繁简} 挂 ;tx，
+    /// 繁体态打 ;tx 依旧切不回——主码表修复（opencc_func_word_exempt）
+    /// 用的是 codeTABword 的 main.txt + 字母码；本测试复刻用户的
+    /// yaml 词表 + ; 引导码 + second_select=';' 形态，钉死 ; 域同样
+    /// 豁免 + 提交翻转。
+    #[test]
+    fn opencc_func_word_wubi_semicolon() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-ocwb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        // 复刻 092K.dict.yaml 头部与行格式（词 TAB 码 [TAB 权重]）
+        std::fs::write(
+            schema.join("092K.dict.yaml"),
+            "---\nname: export\nsort: by_weight\n...\n{繁简}\t;tx\n{重复上屏}\t;\t1000000\n；\t;;\t1000000\n好\tvb\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "繁简\t繁簡\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "好\t好\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        cfg.candidates.second_select = ';';
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 判别探针：普通码 vb=好（yaml 表是否加载成功）
+        let mut p = Session::new(true);
+        eng.process_key(&mut p, key('v'));
+        eng.process_key(&mut p, key('b'));
+        let pv: Vec<String> = p.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            pv.contains(&"好".to_string()),
+            "yaml 词表加载判别: vb 候选={pv:?}（空=yaml 未被装载）"
+        );
+        // 判别探针2：; 单键是否进引导态
+        let mut q = Session::new(true);
+        eng.process_key(&mut q, key(';'));
+        assert_ne!(
+            q.raw, "",
+            "; 未进组段（引导未触发）；q.candidates={:?}",
+            q.candidates
+        );
+
+        // ;tx → ; 域唯一候选「至少两码」自动顶屏（auto_select_pattern
+        // ^;\w+）：{繁简} 不落候选窗、末键 x 直接自动提交——断言结局：
+        // 开关翻转 + 空提交（不上屏字面 {繁簡}/{繁简}）。
+        let mut f = Session::new(true);
+        let mut commits: Vec<String> = Vec::new();
+        for k in [';', 't', 'x'] {
+            let o = eng.process_key(&mut f, key(k));
+            if let Some(c) = o.commit {
+                commits.push(c);
+            }
+        }
+        let texts: Vec<String> = f.candidates.iter().map(|c| c.text.clone()).collect();
+        let literal: Vec<&String> = commits.iter().filter(|c| !c.is_empty()).collect();
+        assert!(
+            literal.is_empty(),
+            "; 域 {{繁简}} 空提交不上屏字面: commits={commits:?} raw={:?} cands={texts:?}",
+            f.raw
+        );
+        assert!(
+            eng.config.opencc.enabled != true,
+            "; 域 {{繁简}} 自动顶屏后开关须翻转（繁→简）: enabled={} commits={commits:?}",
+            eng.config.opencc.enabled
+        );
+        assert!(eng.pending_config_save, "翻转置落盘旗");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【生产复现 2026-11】直接用 D:\HUFU 部署目录（五笔 092K.dict.yaml
+    /// + 全量转换词典）跑 ;tx：用户实测 04:04-04:08 四次
+    /// commit="{繁簡}"（字面繁体上屏、开关不翻转）。本测试只读生产
+    /// 数据，定位真实转换点；目录不存在则跳过（CI 无 D 盘）。
+    #[test]
+    fn opencc_func_word_prod_repro() {
+        let data = Path::new("D:\\HUFU\\HuFu虎符输入法-v1.8.0-无模型\\数据");
+        let cfg_path = data.join("config.json");
+        if !cfg_path.exists() {
+            eprintln!("skip: 生产目录不存在");
+            return;
+        }
+        let mut cfg = hufu_config::Config::load(&cfg_path).unwrap();
+        cfg.schema.current = "五笔".to_string();
+        // 简体态启动（复刻 live server 04:02:36 启动态）
+        let mut eng = Engine::new(data, cfg).unwrap();
+
+        // 【惰性加载时序复刻】live server 04:02:36 以 opencc=false 启动，
+        // 04:0x 用户第一次 ;tx 才翻转 ON（惰性加载转换表）→ 第二次 ;tx
+        // 失败。本地此前测试启动即 enabled=true——时序不同。复刻：
+        let mut f0 = Session::new(true);
+        for k in [';', 't', 'x'] {
+            eng.process_key(&mut f0, key(k));
+        }
+        assert!(
+            eng.config.opencc.enabled,
+            "第一次 ;tx 须翻转为繁体态（live 实测 ✓）"
+        );
+        // 繁体态第二次 ;tx（live 在此吐出字面 {繁簡}）
+        let mut f = Session::new(true);
+        let mut commits: Vec<String> = Vec::new();
+        for k in [';', 't', 'x'] {
+            let o = eng.process_key(&mut f, key(k));
+            if let Some(c) = o.commit {
+                commits.push(c);
+            }
+        }
+        eprintln!("prod-repro commits={commits:?} raw={:?} cands={:?}", f.raw,
+            f.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
+        let literal: Vec<&String> = commits.iter().filter(|c| !c.is_empty()).collect();
+        assert!(
+            literal.is_empty(),
+            "生产复现：{{繁简}} 不得上屏字面: commits={commits:?}"
+        );
+        assert!(
+            !eng.config.opencc.enabled,
+            "生产复现：开关须翻转为关: enabled={}",
+            eng.config.opencc.enabled
+        );
     }
 
     /// 【功能词标点顶字 2026-11】z1={重复上屏} 的方案，打 z 再按标点 =
