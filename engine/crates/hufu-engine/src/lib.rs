@@ -5566,6 +5566,10 @@ impl Engine {
             keymap: self.config.keymap.map.clone(),
             keymap_idle: self.config.keymap.map_idle.clone(),
             caps_lock: session.caps_lock,
+            // 【调频按住键可配 2026-11】两值透传（解析在 DLL：它才知道
+            // 宿主 exe 名）。
+            freq_hold: self.config.candidates.freq_hold.clone(),
+            freq_hold_apps: self.config.candidates.freq_hold_apps.clone(),
         }
     }
 }
@@ -8395,6 +8399,30 @@ mod tests {
         assert!(eng.pending_config_save, "翻转置落盘旗");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【调频按住键可配 2026-11】配置向后兼容 + state 透传：
+    /// 旧 config.json（无 freq_hold 字段）解析 = "ctrl"（原行为零变化）；
+    /// 自定义全局/按应用覆盖原样透传给 DLL（解析在 DLL——它才知道宿主
+    /// exe 名）。动因：QQ 等应用的 Ctrl+数字是注册热键，TSF 吃键拦
+    /// 不住，按应用换按住键。
+    #[test]
+    fn freq_hold_config_compat_and_mirror() {
+        let sec: hufu_config::CandidatesSection = serde_json::from_str("{}").unwrap();
+        assert_eq!(sec.freq_hold, "ctrl");
+        assert!(sec.freq_hold_apps.is_empty());
+        let sec: hufu_config::CandidatesSection = serde_json::from_str(
+            r#"{"freq_hold":"alt","freq_hold_apps":{"qq.exe":"off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(sec.freq_hold, "alt");
+        assert_eq!(sec.freq_hold_apps["qq.exe"], "off");
+        // state() 透传（引擎不解析，值原样给 DLL）
+        let (e, _dir) = test_engine("freq-hold-mirror");
+        let st = e.state(&Session::new(true));
+        assert_eq!(st.freq_hold, "ctrl");
+        assert!(st.freq_hold_apps.is_empty());
+        let _ = std::fs::remove_dir_all(_dir);
     }
 
     /// 【生产复现 2026-11】直接用 D:\HUFU 部署目录（五笔 092K.dict.yaml

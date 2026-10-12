@@ -275,6 +275,25 @@ pub struct CandidatesSection {
     pub delay_show_ms: u32,
     /// 延时展开注释与拆分（毫秒）
     pub delay_comment_ms: u32,
+    /// 【调频按住键可配 2026-11】有候选时按住进「调频模态」的修饰键：
+    /// "ctrl"（默认，原行为）/ "alt" / "off"（关闭模态）。动因：QQ 等
+    /// 应用的 Ctrl+数字是注册热键/框架原生处理，TSF 层吃键拦不住
+    ///（用户实锤：调频生效同时 QQ 快捷键也触发且不可关）——换按住
+    /// 键是唯一出路。Alt+数字在聊天类应用普遍空闲。DLL 按宿主进程
+    /// 名解析（freq_hold_apps 覆盖 → 本值兜底）。
+    #[serde(default = "CandidatesSection::default_freq_hold")]
+    pub freq_hold: String,
+    /// 【按应用覆盖】exe 文件名（小写，如 "qq.exe"）→ "ctrl"/"alt"/
+    /// "off"。缺省回落 freq_hold。DLL 侧按宿主进程名匹配（引擎只
+    /// 透传不解析——它不知道 exe）。
+    #[serde(default)]
+    pub freq_hold_apps: std::collections::HashMap<String, String>,
+}
+
+impl CandidatesSection {
+    fn default_freq_hold() -> String {
+        "ctrl".into()
+    }
 }
 
 impl Default for CandidatesSection {
@@ -295,6 +314,8 @@ impl Default for CandidatesSection {
             split_scheme: "虎码".into(),
             delay_show_ms: 0,
             delay_comment_ms: 0,
+            freq_hold: "ctrl".into(),
+            freq_hold_apps: std::collections::HashMap::new(),
         }
     }
 }

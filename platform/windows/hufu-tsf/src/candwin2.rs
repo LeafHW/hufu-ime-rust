@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+    GetAsyncKeyState, ReleaseCapture, SetCapture,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
@@ -7205,8 +7205,20 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     g.freq_ctrl_physical,
                 )
             };
+            // 【调频按住键可配 2026-11】物理按住键探解析态的键
+            //（ctrl 模式 VK_CONTROL / alt 模式 VK_MENU；见 tsf.rs
+            // freq_hold_vk）。
+            let hold_vk = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                match g.freq_hold_mode.as_str() {
+                    "alt" => 0x12usize,
+                    "ctrl" => 0x11usize,
+                    _ => 0usize,
+                }
+            };
             let ctrl_gone = ctrl_physical
-                && unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } == 0;
+                && hold_vk != 0
+                && unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } == 0;
             if !c.is_visible() || (ctrl_gone && fv_age > 350) {
                 if crate::tsf::trace_on() {
                     crate::tsf::trace("cw2: 调频tick兜底退出（Ctrl物理松开/窗隐）");

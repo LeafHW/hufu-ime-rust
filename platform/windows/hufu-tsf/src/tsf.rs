@@ -519,10 +519,21 @@ pub struct Shared {
     /// 模态内数字 TestDown 直执行后的同 vk 去重（80ms——Test 与
     /// KeyDown 双到达防双发；auto-repeat 33ms 保留）。
     pub freq_last_digit: Option<(usize, std::time::Instant)>,
-    /// 进入时刻 Ctrl 是否**物理**按住（GetAsyncKeyState）：真宿主=真
-    /// →tick 轮询 GetAsyncKeyState 兜底退出有效；跟打器类纯 Test 注入
-    /// 宿主=假 → 物理轮询不可作为退出依据（交 TestUp/下一键层处理）。
+    /// 进入时刻按住键是否**物理**按住（GetAsyncKeyState 探解析键，
+    /// ctrl/alt 模式各探各的）：真宿主=真 →tick 轮询 GetAsyncKeyState
+    /// 兜底退出有效；跟打器类纯 Test 注入宿主=假 → 物理轮询不可作为
+    /// 退出依据（交 TestUp/下一键层处理）。
     pub freq_ctrl_physical: bool,
+    /// 【调频按住键可配 2026-11】state.candidates.freq_hold 镜像
+    ///（"ctrl" 默认/"alt"/"off"）+ 按应用覆盖表 + 本进程解析结果
+    ///（freq_hold_mode：apps[host_exe] 命中 → freq_hold 兜底 → 非法
+    /// 值回落 "ctrl"）。update_ui 同帧刷新；模态入口/守卫/兜底轮询
+    /// 全按解析键。动因：QQ 等应用的 Ctrl+数字是注册热键/框架原生
+    /// 处理，TSF 吃键拦不住（调频生效同时应用快捷键也触发）——按
+    /// 应用换按住键（Alt+数字聊天类普遍空闲）是唯一出路。
+    pub freq_hold: String,
+    pub freq_hold_apps: std::collections::HashMap<String, String>,
+    pub freq_hold_mode: String,
     /// 【Esc 双行为 2026-11】引擎 esc_undo_ready（开关开 && 空态 &&
     /// 上屏历史非空）缓存：TestDown 空态 escape 预判 TRUE（KeyDown
     /// 才会来，撤回键才能到引擎）；不就绪时 FALSE=透传应用。state
@@ -659,6 +670,9 @@ impl Shared {
             freq_pick_text: String::new(),
             freq_last_digit: None,
             freq_ctrl_physical: false,
+            freq_hold: "ctrl".into(),
+            freq_hold_apps: std::collections::HashMap::new(),
+            freq_hold_mode: "ctrl".into(),
             esc_undo_ready: false,
             keymap: std::collections::HashMap::new(),
             keymap_idle: std::collections::HashMap::new(),
@@ -1466,7 +1480,13 @@ pub fn cand_interact_note() {
 // · 同号再按 = 取消拾起；
 // · 按住 Ctrl 再按住 Shift → 删词子模式（提示行「✕ 删词…」+ 红强调），
 //   按数字删除该词（红闪塌缩动效，持久化）；Shift 松开回到调频；
-// · 松开 Ctrl → 模态结束（提示行收起，配色淡回）。
+// · 松开按住键 → 模态结束（提示行收起，配色淡回）。
+// 【按住键可配 2026-11】铁律不变，按住的**键**可配：默认 Ctrl，
+// config.candidates.freq_hold="alt" 换 Alt，"off" 停用；freq_hold_apps
+// 按应用覆盖（键=小写 exe 名，如 "qq.exe"）。动因：QQ 等应用的
+// Ctrl+数字是注册热键/框架原生处理，TSF 层吃键拦不住（调频生效同时
+// 快捷键也触发，用户实锤且 QQ 侧不可关不可改）——按应用换按住键是
+// 唯一出路。
 //
 // 键路设计：
 // · 进入/退出/子模式切换在 Ctrl/Shift 的 Down/Up **任一层**处理
@@ -1480,21 +1500,70 @@ pub fn cand_interact_note() {
 //   → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
 // ─────────────────────────────────────────────────────────────────
 
-/// 模态进入（Ctrl 落下时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
+/// 【调频按住键可配 2026-11】宿主进程 exe 名（小写；进程内缓存，
+/// current_exe 失败回空串=永不命中覆盖表）。current_exe 在 DLL 里
+/// 返回**宿主**进程路径（本 DLL 无独立 exe）。
+fn host_exe_lower() -> &'static str {
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()))
+            .unwrap_or_default()
+    })
+}
+
+/// 解析本进程的调频按住键模式：apps[host_exe] 命中优先、global 兜底；
+/// 值仅认 "alt"/"off"，其余（空/拼写错/未知）一律 "ctrl"（=旧版行为，
+/// 配置手误不致功能消失）。
+fn resolve_freq_hold(
+    global: &str,
+    apps: &std::collections::HashMap<String, String>,
+    host_exe: &str,
+) -> String {
+    let raw = apps
+        .get(host_exe)
+        .map(String::as_str)
+        .unwrap_or(global)
+        .to_ascii_lowercase();
+    if raw == "alt" || raw == "off" {
+        raw
+    } else {
+        "ctrl".into()
+    }
+}
+
+/// 模式 → 按住键 VK（ctrl=0x11 / alt=0x12 / off 及其他=0=停用）。
+fn freq_hold_vk(mode: &str) -> usize {
+    match mode {
+        "ctrl" => 0x11,
+        "alt" => 0x12,
+        _ => 0,
+    }
+}
+
+/// 模态进入（按住键落下时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
 /// 置共享旗标 + 推送窗口视图（提示行入场/序号强调淡入 + 行高 size_anim）。
 /// 已激活时幂等返回 true（不重入）。
 /// 【和弦入口 2026-11】Ctrl 落下时 Shift 已按住（旧版 Ctrl+Shift+数字
 /// 的肌肉记忆=两键齐按）不再拒绝——直接进**删词子模式**（Shift 松开
 /// 回调频）。60修切换热键对模态中的 ctrl+shift 已豁免（freq_on 门），
 /// 此路安全；系统级 Ctrl+Shift 切输入法若开着则键被系统吃掉，到不了
-/// 这里（lang sink 会收窗兜底）。Alt/Win 按住仍拒绝（AltGr/Win 组合
-/// 非调频语义）。
-fn freq_enter(shared: &SharedRef) -> bool {
+/// 这里（lang sink 会收窗兜底）。
+/// 【按住键可配】hold_vk=解析出的按住键（0x11 Ctrl / 0x12 Alt）；
+/// 守卫对称化：Win 按住恒拒（Win 组合非调频语义）；另一修饰键按住
+/// 也拒——ctrl 模式拒 Alt（现行为）、alt 模式拒 Ctrl（AltGr 在
+/// Windows 上合成 Ctrl+Alt 形态，alt 模式收 Ctrl = AltGr 组合误入）。
+fn freq_enter(shared: &SharedRef, hold_vk: usize) -> bool {
     unsafe {
-        let alt = GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0;
         let win = GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000 != 0
             || GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000 != 0;
-        if alt || win {
+        let other = if hold_vk == 0x12 {
+            GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0
+        } else {
+            GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0
+        };
+        if win || other {
             return false;
         }
     }
@@ -1503,7 +1572,7 @@ fn freq_enter(shared: &SharedRef) -> bool {
     }
     // 物理按住标记（tick 兜底轮询的资格证——纯 Test 注入宿主无物理态）
     // + 和弦判定（Shift 同按 → 直接删词子模式）
-    let ctrl_physical = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } != 0;
+    let ctrl_physical = unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } != 0;
     let shift_held = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 } != 0;
     let ok = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1528,7 +1597,8 @@ fn freq_enter(shared: &SharedRef) -> bool {
     };
     if ok {
         trace(&format!(
-            "freq: 按住Ctrl → 进入{}模态",
+            "freq: 按住{} → 进入{}模态",
+            if hold_vk == 0x12 { "Alt" } else { "Ctrl" },
             if shift_held { "删词" } else { "调频" }
         ));
         freq_view_apply(shared);
@@ -1536,7 +1606,7 @@ fn freq_enter(shared: &SharedRef) -> bool {
     ok
 }
 
-/// 模态退出（Ctrl 抬起 / tick 兜底 / 数字时窗已隐）：清旗标 + 推送
+/// 模态退出（按住键抬起 / tick 兜底 / 数字时窗已隐）：清旗标 + 推送
 /// 视图（提示行收起 + 配色淡回 + 行高 size_anim 收拢）。
 fn freq_exit(shared: &SharedRef) {
     let had = {
@@ -1549,7 +1619,7 @@ fn freq_exit(shared: &SharedRef) {
         h
     };
     if had {
-        trace("freq: 松开Ctrl → 退出调频模态");
+        trace("freq: 松开按住键 → 退出调频模态");
         freq_view_apply(shared);
     }
 }
@@ -3235,6 +3305,37 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
             }
             g.keymap_idle = kmi;
+            // 【调频按住键可配 2026-11】同帧镜像两值 + 按宿主 exe 解析
+            //（模式决定模态入口键；旧引擎 state 无此字段 → unwrap_or
+            // "ctrl" = 旧版行为，前向兼容）。解析结果变了才 trace（每
+            // 键一拍，不刷屏）。
+            let fh = state
+                .get("freq_hold")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ctrl")
+                .to_string();
+            let fha: std::collections::HashMap<String, String> = state
+                .get("freq_hold_apps")
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str().map(|s| (k.clone(), s.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mode = resolve_freq_hold(&fh, &fha, host_exe_lower());
+            if g.freq_hold_mode != mode {
+                trace(&format!(
+                    "freq_hold 解析: {mode}（global={fh} host={} apps={} 项）",
+                    host_exe_lower(),
+                    fha.len()
+                ));
+            }
+            g.freq_hold = fh;
+            g.freq_hold_apps = fha;
+            g.freq_hold_mode = mode;
         }
         // 【回车立即收窗 2026-10-09】回车与 Shift 上屏同款：无论「回车
         // 清屏」勾否（清屏=清组段 / 未勾=编码字母上屏），候选一律立即
@@ -3365,9 +3466,10 @@ impl HuFuTs_Impl {
 
     /// 【按住Ctrl调频 2026-11】模态键路分派（dispatch 咽喉调用；模块
     /// 注释见 freq_enter 前）：
-    /// · Ctrl（0x11）落下 → 进入模态（不满足条件回落原路径）；抬起 →
-    ///   退出模态。均直通宿主（BOOL(0)）——Ctrl 是纯修饰键，宿主侧
-    ///   语义（快捷键组合基座）不变；
+    /// · 按住键（解析态：ctrl 0x11 / alt 0x12，off=整体停用返回
+    ///   None）落下 → 进入模态（不满足条件回落原路径）；抬起 → 退出
+    ///   模态。均直通宿主（BOOL(0)）——修饰键是纯修饰，宿主侧语义
+    ///   （快捷键组合基座）不变；
     /// · 模态中 Shift（0x10）落下/抬起 → 删词子模式开/关（清拾起），
     ///   并拦截 Shift 单击判定通道（模态中的 Shift 不是中英切换）；
     /// · 模态中主排数字（0x30-0x39）落下 → Test 层直执行（拾起/对调/
@@ -3375,9 +3477,20 @@ impl HuFuTs_Impl {
     ///   自产数字；抬起直通。
     /// 返回 None = 非模态键/模态未激活，走原路径。
     fn freq_modal_key(&self, wparam: usize, up: bool) -> Option<BOOL> {
-        if wparam == 0x11 {
+        // 【调频按住键可配 2026-11】入口键按本进程解析态：off = 模态
+        // 停用（数字回落引擎旧 ctrl+digit 路径/直通——QQ 场景配 off
+        // 即回退到与无模态完全一致的行为）。
+        let mode = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.freq_hold_mode.clone()
+        };
+        let hold_vk = freq_hold_vk(&mode);
+        if hold_vk == 0 {
+            return None;
+        }
+        if wparam == hold_vk {
             if !up {
-                if freq_enter(&self.shared) {
+                if freq_enter(&self.shared, hold_vk) {
                     return Some(BOOL(0));
                 }
                 return None;
@@ -3400,12 +3513,12 @@ impl HuFuTs_Impl {
         if !active {
             return None;
         }
-        // 【僵尸模态防线】模态中任何**非 Ctrl** 键到达而物理 Ctrl 已松
-        //（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。仅对物
-        // 理进入的模态有效（纯 Test 注入宿主的松开语义在 TestUp 层）。
-        if wparam != 0x11
+        // 【僵尸模态防线】模态中任何**非按住键**的键到达而物理按住键
+        // 已松（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。仅
+        // 对物理进入的模态有效（纯 Test 注入宿主的松开语义在 TestUp 层）。
+        if wparam != hold_vk
             && ctrl_physical
-            && unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } == 0
+            && unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } == 0
         {
             freq_exit(&self.shared);
             return None;
@@ -9695,5 +9808,53 @@ mod modekey_tests {
         g.modekey_last = None; // 免 80ms 窗干扰
         assert!(modekey_admit(&mut g, 0x20, true), "armed up 应放行");
         assert!(!g.space_ctrl_armed, "armed 必须在放行时消费");
+    }
+}
+
+#[cfg(test)]
+mod freq_hold_tests {
+    use super::*;
+
+    /// 解析兜底链：apps 命中 → global → 非法值一律 ctrl（旧版行为）。
+    #[test]
+    fn resolve_falls_back_to_ctrl() {
+        let apps = std::collections::HashMap::new();
+        assert_eq!(resolve_freq_hold("", &apps, "qq.exe"), "ctrl");
+        assert_eq!(resolve_freq_hold("bogus", &apps, "qq.exe"), "ctrl");
+        // 大小写归一（值侧）
+        assert_eq!(resolve_freq_hold("ALT", &apps, "qq.exe"), "alt");
+        assert_eq!(resolve_freq_hold("ctrl", &apps, "qq.exe"), "ctrl");
+        assert_eq!(resolve_freq_hold("alt", &apps, "any.exe"), "alt");
+        assert_eq!(resolve_freq_hold("off", &apps, "any.exe"), "off");
+    }
+
+    /// 按应用覆盖：命中小写 exe 名生效；未命中回落 global；命中但值
+    /// 非法回落 ctrl（不回落 global——显式覆盖写错按最保守处理）。
+    #[test]
+    fn resolve_app_override() {
+        let mut apps = std::collections::HashMap::new();
+        apps.insert("qq.exe".to_string(), "alt".to_string());
+        apps.insert("bad.exe".to_string(), "nope".to_string());
+        assert_eq!(resolve_freq_hold("ctrl", &apps, "qq.exe"), "alt");
+        assert_eq!(resolve_freq_hold("alt", &apps, "notepad3.exe"), "alt");
+        assert_eq!(resolve_freq_hold("alt", &apps, "bad.exe"), "ctrl");
+    }
+
+    /// 模式 → 按住键 VK 映射（off/未知=0=停用）。
+    #[test]
+    fn hold_vk_map() {
+        assert_eq!(freq_hold_vk("ctrl"), 0x11);
+        assert_eq!(freq_hold_vk("alt"), 0x12);
+        assert_eq!(freq_hold_vk("off"), 0);
+        assert_eq!(freq_hold_vk(""), 0);
+        assert_eq!(freq_hold_vk("wrong"), 0);
+    }
+
+    /// Shared 初始态 = ctrl（无 state 镜像前=旧版行为）。
+    #[test]
+    fn shared_defaults_ctrl() {
+        let g = Shared::new();
+        assert_eq!(g.freq_hold_mode, "ctrl");
+        assert_eq!(freq_hold_vk(&g.freq_hold_mode), 0x11);
     }
 }

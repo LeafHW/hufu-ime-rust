@@ -258,6 +258,19 @@ pub struct SessionState {
     /// 灭。引擎 state() 填。
     #[serde(default)]
     pub caps_lock: bool,
+    /// 【调频按住键可配 2026-11】config.candidates.freq_hold 镜像
+    ///（"ctrl" 默认/"alt"/"off"）。DLL update_ui 同帧缓存后决定模态
+    /// 入口键（Ctrl 或 Alt 或关闭）。引擎只透传。
+    #[serde(default = "default_freq_hold")]
+    pub freq_hold: String,
+    /// 【按应用覆盖】exe（小写）→ "ctrl"/"alt"/"off"；DLL 按宿主
+    /// 进程名解析，缺省回落 freq_hold。
+    #[serde(default)]
+    pub freq_hold_apps: std::collections::HashMap<String, String>,
+}
+
+fn default_freq_hold() -> String {
+    "ctrl".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
