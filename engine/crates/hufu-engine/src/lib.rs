@@ -2143,14 +2143,20 @@ impl Engine {
         let wildcard_mode = self.wildcard_active()
             && session.raw.contains(self.config.input.wildcard_char);
 
-        // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
+        // 快符 / 符号 / z引导符号域：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
         // 【可延码不直出 2026-10-09】码表存在更长延续码（如 symbols 的
         // ;m→;mn→;mnng）时不再秒上屏——用户实锤：;m 唯一命中即直出，
         // 压死了 ;mn ;mng ;mnng（「打不了」）。改为有更长延续=候选窗
         // 等待延伸（要 · 按空格/1 照选），叶子码才唯一直出——快符 ;x
         // 单键叶子，老直出行为零回归（has_longer_continuation 不含
         // 自身，与 has_continuation 的自身包含语义区分）。
-        if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\'))
+        // 【z 引导符号域 2026-11·虎爪同款】码表 z 只出现在码首时
+        //（Dict.z_symbol_domain，虎爪 RebuildShortSymbolMeta 同判定），
+        // z 前缀码=符号域，域内唯一叶子同款直出——092K 的 zai=AI
+        // 三键即出、不必凑满 4 码；z 作普通编码字母的表（靓仔类）
+        // 域判否，z 码回主码域语义（不满码长不直出——uvo=睡 同理）。
+        let z_domain = session.raw.starts_with('z') && self.schema.dict.z_symbol_domain;
+        if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\') || z_domain)
             && len >= 2
             && session.candidates.len() == 1
             && !wildcard_mode
@@ -2170,13 +2176,12 @@ impl Engine {
         let sentence_mode = self.sentence_active();
 
         // 满码唯一上屏（整句豁免：不顶，候选照常展示交用户继续）
-        // 【叶子码唯一直出 2026-11 用户实锤】满最大码长唯一自动上屏
-        // 开时，不到最大码长的**叶子码**（唯一候选且码表无更长延续，
-        // 如 symbols 的 zai=AI / zko=！”）同样直出——虎爪/虎娘同款：
-        // 打 zai 第三键即出 AI，不必凑满 4 码。与快符 ; 域「可延码
-        // 不直出」同一分界（has_longer_continuation）：有更长码就等
-        // 延伸（用户还可以继续打），叶子才直出。len>=2 与 ; 域口径
-        // 一致（单键叶子不直出，防个别表单键全叶造成逐键上屏）。
+        // 【叶子直出收域 2026-11 用户实锤】v1.7.6「叶子码唯一直出」
+        // 原泛化到全码表——靓仔方案 uvo=睡（3 码叶子、唯一）不满
+        // 最大码长 4 也被顶屏，与虎爪/虎娘行为相悖（用户实锤：同
+        // 设置下虎爪不顶）。虎爪口径（InputMethodEngine.cs：主域
+        // 唯一终码仅在码长==max 时上屏）：主码域只看 len==max_len；
+        // 不满码长的唯一叶子交上方符号域分支（; / \ z 引导域）。
         // 延长码场景（len==max 且存在 >max 词条）由上方老分支保留
         // 原行为：满码唯一仍上屏（092K 顶功语义）。
         if !sentence_mode
@@ -2184,7 +2189,7 @@ impl Engine {
             && !wildcard_mode
             && len >= 2
             && session.candidates.len() == 1
-            && (len == max_len || !self.has_longer_continuation(&session.raw))
+            && len == max_len
         {
             self.commit_first_inline(session);
             return;
@@ -2705,7 +2710,11 @@ impl Engine {
         {
             return true;
         }
-        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\') {
+        // 【z 引导符号域 2026-11】z 域 raw 的更长码还可能在符号表
+        //（快符 zjc/zfj 等默认就住那儿）——与 ; / \ 域同查。
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
             let map = self.schema.symbols.merge_code_map();
             let raw_len = raw.chars().count();
             return map
@@ -2727,7 +2736,11 @@ impl Engine {
         {
             return true;
         }
-        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\') {
+        // 【z 引导符号域 2026-11】同 has_longer_continuation：z 域 raw
+        // 的延续也看符号表。
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(raw));
         }
@@ -2745,7 +2758,10 @@ impl Engine {
         {
             return true;
         }
-        if s.starts_with(';') || s.starts_with('/') || s.starts_with('\\') {
+        // 【z 引导符号域 2026-11】同上：z 域前缀也看符号表。
+        if s.starts_with(';') || s.starts_with('/') || s.starts_with('\\')
+            || (s.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(s) || k == s);
         }
@@ -4404,9 +4420,19 @@ impl Engine {
     /// 该条消耗掉——之后的 {重复上屏} 回放的是更早一条，被删文字不再
     /// 可回放。历史空/超长条装不下时跳过弹更早（连续 {撤回} 撤到底）。
     /// 其他功能词与 resolve_dynamic 同口径。
+    /// 【{繁简} 2026-11】功能词提交解析：翻转「简繁转换」开关
+    ///（config.opencc.enabled——与自定义键 s2t 绑定同一开关，同一
+    /// 落盘管线 pending_config_save）。打一次切繁体、再打切回简体；
+    /// 空提交（无文本无回删，纯开关动作）。用户把 {繁简} 写进码表/
+    /// 快符即可（默认快符 zfj）。
     fn resolve_dyn_pair(&mut self, text: &str) -> (String, u8, bool) {
         if text.starts_with('{') && text.ends_with('}') && text.len() >= 3 {
             let tag = &text[1..text.len() - 1];
+            if tag == "繁简" {
+                self.config.opencc.enabled = !self.config.opencc.enabled;
+                self.pending_config_save = true;
+                return (String::new(), 0, false);
+            }
             if tag == "撤回" {
                 while let Some(front) = self.commit_history.front().cloned() {
                     let cnt = front.chars().count();
@@ -5400,6 +5426,15 @@ impl Engine {
                     return None;
                 }
                 c.text = "↩撤回".into();
+            } else if tag == "繁简" {
+                // 【{繁简} 2026-11】实时显示切换目标：简体输出中 →
+                // 「⇄转繁」，繁体输出中 → 「⇄转简」（按了才知道去哪，
+                // 与 {日期} 族「显示实时值」同口径）。
+                c.text = if self.config.opencc.enabled {
+                    "⇄转简".into()
+                } else {
+                    "⇄转繁".into()
+                };
             } else if let Some(v) = dynamic::expand(tag) {
                 c.text = v;
             }
@@ -6164,37 +6199,117 @@ mod tests {
         assert_eq!(out9.commit.unwrap(), "加", "未翻页数字 3=列表第 3 项");
     }
 
-    // 【叶子码唯一直出 2026-11】auto_select_unique 开时，不到最大码长
-    // 的叶子码（唯一候选+无更长延续）直出——虎爪/虎娘同款（用户实锤
-    // symbols 的 zai=AI / zko=！” 打三码不出）。夹具：a=啊（有更长
-    // aa → 可延不直出）、aa=阿（叶子 → 直出）、jd 3 候选（不唯一 →
-    // 等选重）。
+    // 【叶子直出收域 2026-11 用户实锤·虎爪同款】v1.7.6 泛化叶子直出
+    // 收窄：主码域唯一只在**满最大码长**上屏（靓仔 uvo=睡 3 码不满 4
+    // 不顶，虎爪/虎娘同设置同款）；z 引导符号域（码表 z 只在码首，
+    // Dict.z_symbol_domain——虎爪 RebuildShortSymbolMeta 同判定）内
+    // 唯一叶子随时直出（092K zai=AI 三键即出），且不受
+    // auto_select_unique 门控（域语义，与 ; / \ 快符域一致）。
     #[test]
-    fn leaf_unique_auto_commit() {
-        let (mut eng, _dir) = test_engine("leafu");
-        // 真机用户勾选「满最大码长唯一自动上屏」后的行为（默认关）
+    fn leaf_unique_auto_commit_domain_scoped() {
+        // ── 夹具一：靓仔类——z 作普通编码字母（uvz 码内含 z）→ 域判否 ──
+        let dir1 = std::env::temp_dir().join(format!(
+            "hufu-eng-leaf1-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir1);
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nuvz\t制\nuvo\t睡\naabb\t满码\n",
+        )
+        .unwrap();
+        let (mut eng, _d) = {
+            let eng =
+                Engine::with_schema_dir(&dir1, hufu_config::Config::default()).unwrap();
+            (eng, dir1.clone())
+        };
+        assert!(!eng.schema.dict.z_symbol_domain, "码内含 z → 域判否");
         eng.config.input.auto_select_unique = true;
-        // a：可延（aa 存在）→ 不直出，候选等待
+        // uvo：3 码唯一叶子、不满最大码长 4 → 不直出（候选等待空格）
         let mut s = Session::new(true);
-        eng.process_key(&mut s, key('a'));
-        assert!(s.raw == "a", "可延码保持编码");
-        // aa：唯一叶子 → 直出「阿」
-        let o2 = eng.process_key(&mut s, key('a'));
-        assert_eq!(o2.commit.as_deref(), Some("阿"), "叶子码唯一直出");
-        assert!(s.raw.is_empty(), "直出后清空");
-        // jd：3 候选不唯一 → 不直出
+        for ch in ['u', 'v', 'o'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert!(s.raw == "uvo", "主域叶子不满码长不直出（虎爪同款）");
+        assert_eq!(s.candidates.len(), 1);
+        assert_eq!(s.candidates[0].text, "睡");
+        // aabb：4 码唯一满码长 → 直出（满码唯一原语义）
         let mut s2 = Session::new(true);
-        eng.process_key(&mut s2, key('j'));
-        eng.process_key(&mut s2, key('d'));
-        assert!(s2.raw == "jd", "多候选不直出");
-        assert_eq!(s2.candidates.len(), 3);
-        // 开关关：叶子唯一也不直出（原行为）
+        for ch in ['a', 'a', 'b', 'b'] {
+            eng.process_key(&mut s2, key(ch));
+        }
+        assert!(s2.raw.is_empty(), "满码唯一直出");
+        // 开关关：满码唯一也不直出（原行为）
         eng.config.input.auto_select_unique = false;
         let mut s3 = Session::new(true);
-        eng.process_key(&mut s3, key('a'));
-        let o4 = eng.process_key(&mut s3, key('a'));
-        assert!(o4.commit.is_none(), "开关关叶子不直出");
-        assert_eq!(s3.raw, "aa");
+        for ch in ['a', 'a', 'b', 'b'] {
+            eng.process_key(&mut s3, key(ch));
+        }
+        assert!(s3.raw == "aabb", "开关关满码不直出");
+
+        // ── 夹具二：092K 类——z 只在码首 → z 域开，域内叶子直出 ──
+        let dir2 = std::env::temp_dir().join(format!(
+            "hufu-eng-leaf2-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nai\t爱\nzai\tAI\nzko\t！”\n",
+        )
+        .unwrap();
+        // 快符带 {繁简}（/fj 同发行包默认位）
+        std::fs::write(dir2.join("快符.txt"), "{繁简}\t/fj\n").unwrap();
+        let mut eng2 =
+            Engine::with_schema_dir(&dir2, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+        assert!(eng2.schema.dict.z_symbol_domain, "z 只在码首 → 域判是");
+        eng2.config.input.auto_select_unique = true;
+        // 主域 ai：2 码唯一叶子不满 4 → 不直出
+        let mut t1 = Session::new(true);
+        eng2.process_key(&mut t1, key('a'));
+        eng2.process_key(&mut t1, key('i'));
+        assert!(t1.raw == "ai", "z 域开但主域叶子照旧不直出");
+        // zai：z 域唯一叶子 3 码 → 直出「AI」
+        let mut t2 = Session::new(true);
+        for ch in ['z', 'a', 'i'] {
+            eng2.process_key(&mut t2, key(ch));
+        }
+        assert!(t2.raw.is_empty(), "z 域叶子直出");
+        // 开关关也直出（域语义不受 auto_select_unique 门控）
+        eng2.config.input.auto_select_unique = false;
+        let mut t3 = Session::new(true);
+        for ch in ['z', 'k', 'o'] {
+            eng2.process_key(&mut t3, key(ch));
+        }
+        assert!(t3.raw.is_empty(), "z 域直出不受开关门控");
+
+        // ── {繁简} 功能词：/fj 提交翻转 opencc 开关（打一次切繁、再打切简）──
+        //（dir2 上面已删——重建夹具再起引擎）
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nai\t爱\nzai\tAI\nzko\t！”\n",
+        )
+        .unwrap();
+        std::fs::write(dir2.join("快符.txt"), "{繁简}\t/fj\n").unwrap();
+        let mut eng3 = Engine::with_schema_dir(&dir2, hufu_config::Config::default()).unwrap();
+        let before = eng3.config.opencc.enabled;
+        let mut f1 = Session::new(true);
+        for ch in ['/', 'f', 'j'] {
+            eng3.process_key(&mut f1, key(ch));
+        }
+        assert!(eng3.config.opencc.enabled != before, "{{繁简}} 提交翻转开关");
+        assert!(eng3.pending_config_save, "翻转置落盘旗");
+        let mut f2 = Session::new(true);
+        for ch in ['/', 'f', 'j'] {
+            eng3.process_key(&mut f2, key(ch));
+        }
+        assert_eq!(eng3.config.opencc.enabled, before, "再打切回");
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     // 【英文态 Caps 恒系统默认 2026-11 用户拍板】英文态按 Caps 一律
@@ -7753,7 +7868,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("码表.txt"),
-            "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n/sj {时分} {时间}\n",
+            "a 啊\nkz 锁\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n/sj {时分} {时间}\n",
         )
         .unwrap();
         let mut eng = Engine::with_schema_dir(&dir, {
@@ -8131,7 +8246,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("main.txt"),
-            "#hufu-dict v1 name=t\na\t啊\nz\t{重复上屏}\nzh2\t{重复上屏2}\nzh3\t{重复上屏3}\nch\t{撤回}\n",
+            // 【kz 行 2026-11】码内含 z → z 域判否——本测试关注功能词语义
+            //（非 z 域直出），夹具保持「z 码不满码长不上屏」的旧节奏。
+            "#hufu-dict v1 name=t\na\t啊\nkz\t锁\nz\t{重复上屏}\nzh2\t{重复上屏2}\nzh3\t{重复上屏3}\nch\t{撤回}\n",
         )
         .unwrap();
         std::fs::write(dir.join("反查.txt"), "测\tce\n").unwrap();

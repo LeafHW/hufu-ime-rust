@@ -235,6 +235,12 @@ pub struct Dict {
     /// （a8=来、u3=的）。true 时引擎把 raw 里的数字当编码而非
     /// 「选重第 N」。rebuild 时扫描缓存。
     pub digit_coded: bool,
+    /// 【z 引导符号域 2026-11·虎爪同款】全表所有 'z' 只出现在码首
+    ///（非 z 开头的码不含 z），且存在普通字母码（非 z 开头）——
+    /// 则 z 前缀码 = 符号引导域：域内唯一叶子提前直出（092K 的
+    /// zai=AI 三键即出）。z 作普通编码字母的表（靓仔类，码内含
+    /// z 4879 处）自动判否。rebuild 时扫描缓存。
+    pub z_symbol_domain: bool,
 }
 
 impl Dict {
@@ -290,6 +296,36 @@ impl Dict {
         self.trie = Trie::new();
         self.text_to_codes.clear();
         self.digit_coded = false;
+        // 【z 引导符号域 2026-11·虎爪同款】判定口径与 TigerClaw
+        // RebuildShortSymbolMeta 一致：非 z 开头的码若含 z（含 ;/ 等
+        // 引导头）→ z 是普通编码字母 → 域关；z 开头的码内部再含 z
+        //（zizh/zoqz 类）不算。存在普通字母码（非 z 开头）保证表
+        // 有正常主域（虎爪 headSet.Contains("a") 的同义放宽）。
+        self.z_symbol_domain = false;
+        {
+            let mut has_normal = false;
+            let mut z_inner = false;
+            for e in &self.entries {
+                let mut cs = e.code.chars();
+                match cs.next() {
+                    Some('z') => {}
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        has_normal = true;
+                        if cs.any(|x| x == 'z') {
+                            z_inner = true;
+                            break;
+                        }
+                    }
+                    _ => {
+                        if e.code.contains('z') {
+                            z_inner = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.z_symbol_domain = has_normal && !z_inner;
+        }
         let mut order: Vec<u32> = (0..self.entries.len() as u32).collect();
         order.sort_by(|&i, &j| crate::entry::rank_cmp(&self.entries[i as usize], &self.entries[j as usize]));
         for idx in order {
