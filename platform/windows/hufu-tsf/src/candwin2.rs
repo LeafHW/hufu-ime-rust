@@ -7205,20 +7205,22 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     g.freq_ctrl_physical,
                 )
             };
-            // 【调频按住键可配 2026-11】物理按住键探解析态的键
-            //（ctrl 模式 VK_CONTROL / alt 模式 VK_MENU；见 tsf.rs
-            // freq_hold_vk）。
-            let hold_vk = {
+            // 【按住键可录·十三修】物理兜底轮询按两组合 VK 集：两组合
+            // 都物理散尽（GetAsyncKeyState 逐键）才判松手（删词组合散
+            // 了但调频组合仍按 = 回调频，tick 不多管——那归键路重估；
+            // 这里只兜「宿主吞了全部成员 KeyUp」的悬死形态）。
+            let (fk, dk) = {
                 let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                match g.freq_hold_mode.as_str() {
-                    "alt" => 0x12usize,
-                    "ctrl" => 0x11usize,
-                    _ => 0usize,
-                }
+                (g.freq_key.clone(), g.del_key.clone())
             };
-            let ctrl_gone = ctrl_physical
-                && hold_vk != 0
-                && unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } == 0;
+            let any_held = |keys: &[usize]| {
+                !keys.is_empty()
+                    && keys
+                        .iter()
+                        .any(|&vk| unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 } != 0)
+            };
+            let ctrl_gone =
+                ctrl_physical && !any_held(&fk) && !any_held(&dk);
             if !c.is_visible() || (ctrl_gone && fv_age > 350) {
                 if crate::tsf::trace_on() {
                     crate::tsf::trace("cw2: 调频tick兜底退出（Ctrl物理松开/窗隐）");

@@ -78,6 +78,12 @@ pub struct GeneralSection {
     /// Caps(Switch)/Ctrl+空格/自定义按键 switch。语言栏左键仍清空
     ///（焦点外全局开关，无上屏通道）。
     pub commit_raw_on_en_switch: bool,
+    /// 【导出码表快捷键 2026-11】组合键语法（如 "ctrl+alt+e"；支持
+    /// 裸修饰键如 "capslock"）。空（默认）= 关闭。命中即按当前方案
+    /// 的记忆格式导出码表并打开导出目录——与托盘/语言栏「导出码表」
+    /// 同一路径。设置页「录制」按钮写入；DLL 侧匹配执行。
+    #[serde(default)]
+    pub export_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -115,6 +121,9 @@ impl Default for GeneralSection {
             // 是 2026-09-14 既有行为，本开关把它推广到全部切换路径并
             // 提供关闭出口——默认与既有手感一致。
             commit_raw_on_en_switch: true,
+            // 【导出码表快捷键 2026-11】默认关：不抢占任何键；用户在
+            // 设置页录制后生效。
+            export_key: String::new(),
         }
     }
 }
@@ -275,24 +284,28 @@ pub struct CandidatesSection {
     pub delay_show_ms: u32,
     /// 延时展开注释与拆分（毫秒）
     pub delay_comment_ms: u32,
-    /// 【调频按住键可配 2026-11】有候选时按住进「调频模态」的修饰键：
-    /// "ctrl"（默认，原行为）/ "alt" / "off"（关闭模态）。动因：QQ 等
-    /// 应用的 Ctrl+数字是注册热键/框架原生处理，TSF 层吃键拦不住
-    ///（用户实锤：调频生效同时 QQ 快捷键也触发且不可关）——换按住
-    /// 键是唯一出路。Alt+数字在聊天类应用普遍空闲。DLL 按宿主进程
-    /// 名解析（freq_hold_apps 覆盖 → 本值兜底）。
-    #[serde(default = "CandidatesSection::default_freq_hold")]
-    pub freq_hold: String,
-    /// 【按应用覆盖】exe 文件名（小写，如 "qq.exe"）→ "ctrl"/"alt"/
-    /// "off"。缺省回落 freq_hold。DLL 侧按宿主进程名匹配（引擎只
-    /// 透传不解析——它不知道 exe）。
-    #[serde(default)]
-    pub freq_hold_apps: std::collections::HashMap<String, String>,
+    /// 【按住键可录 2026-11】有候选时按住进「调频模态」的键/组合：
+    /// "ctrl"（默认，原行为）；组合语法 "ctrl+shift" / "alt+d" /
+    /// "capslock"（裸功能键可录，设置页「录制」按钮写入）；空 = 停用
+    /// 模态。键名与按键映射页同词汇（ctrl/alt/shift/win/capslock/
+    /// space/enter/tab/f1-f12/字母/数字/符号单字符）。DLL 解析执行
+    ///（引擎只透传）。
+    #[serde(default = "CandidatesSection::default_freq_key")]
+    pub freq_key: String,
+    /// 【删词按住键可录 2026-11】按住进「删词模态」的键/组合：
+    /// "ctrl+shift"（默认 = 原 Ctrl 按住 + Shift 删词和弦行为）。
+    /// 与 freq_key 独立：单独按住本键即可直接进删词，不必先按调频键。
+    /// 两组合同时完整按住时删词优先。空 = 停用。
+    #[serde(default = "CandidatesSection::default_delete_key")]
+    pub delete_key: String,
 }
 
 impl CandidatesSection {
-    fn default_freq_hold() -> String {
+    fn default_freq_key() -> String {
         "ctrl".into()
+    }
+    fn default_delete_key() -> String {
+        "ctrl+shift".into()
     }
 }
 
@@ -314,8 +327,8 @@ impl Default for CandidatesSection {
             split_scheme: "虎码".into(),
             delay_show_ms: 0,
             delay_comment_ms: 0,
-            freq_hold: "ctrl".into(),
-            freq_hold_apps: std::collections::HashMap::new(),
+            freq_key: "ctrl".into(),
+            delete_key: "ctrl+shift".into(),
         }
     }
 }

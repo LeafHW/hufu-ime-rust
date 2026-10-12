@@ -519,21 +519,26 @@ pub struct Shared {
     /// 模态内数字 TestDown 直执行后的同 vk 去重（80ms——Test 与
     /// KeyDown 双到达防双发；auto-repeat 33ms 保留）。
     pub freq_last_digit: Option<(usize, std::time::Instant)>,
-    /// 进入时刻按住键是否**物理**按住（GetAsyncKeyState 探解析键，
-    /// ctrl/alt 模式各探各的）：真宿主=真 →tick 轮询 GetAsyncKeyState
-    /// 兜底退出有效；跟打器类纯 Test 注入宿主=假 → 物理轮询不可作为
-    /// 退出依据（交 TestUp/下一键层处理）。
+    /// 进入时刻按住组合是否**物理**按住（GetAsyncKeyState 探组合键
+    /// 集）：真宿主=真 →tick 轮询兜底退出有效；跟打器类纯 Test 注入
+    /// 宿主=假 → 物理轮询不可作为退出依据（交 TestUp/下一键层处理）。
     pub freq_ctrl_physical: bool,
-    /// 【调频按住键可配 2026-11】state.candidates.freq_hold 镜像
-    ///（"ctrl" 默认/"alt"/"off"）+ 按应用覆盖表 + 本进程解析结果
-    ///（freq_hold_mode：apps[host_exe] 命中 → freq_hold 兜底 → 非法
-    /// 值回落 "ctrl"）。update_ui 同帧刷新；模态入口/守卫/兜底轮询
-    /// 全按解析键。动因：QQ 等应用的 Ctrl+数字是注册热键/框架原生
-    /// 处理，TSF 吃键拦不住（调频生效同时应用快捷键也触发）——按
-    /// 应用换按住键（Alt+数字聊天类普遍空闲）是唯一出路。
-    pub freq_hold: String,
-    pub freq_hold_apps: std::collections::HashMap<String, String>,
-    pub freq_hold_mode: String,
+    /// 【按住键可录 2026-11】三组合（VK 集，空=停用）+ 原始串（trace
+    /// 用）：freq_key=调频模态按住键（默认 [Ctrl]）；del_key=删词模
+    /// 态按住键（默认 [Ctrl,Shift]=原和弦行为，与 freq_key 独立、同
+    /// 按时删词优先）；export_key=导出码表快捷键（默认空=关，命中即
+    /// 管道 export_schema——与托盘「导出码表」同路径）。update_ui 同
+    /// 帧解析 state 三串缓存。进入=组合成员按下且其余成员皆按（完整
+    /// 即入）；成员抬起=重估（两组合都散了才退出，删词优先维持）。
+    /// 裸修饰键（Ctrl/Alt/Shift/Caps）可录——按住语义的天然载体。
+    pub freq_key: Vec<usize>,
+    pub del_key: Vec<usize>,
+    pub export_key: Vec<usize>,
+    pub freq_key_raw: String,
+    pub del_key_raw: String,
+    pub export_key_raw: String,
+    /// export_key 命中后的同组合去重（Test+KeyDown 双到达防双发）。
+    pub export_last: Option<(usize, std::time::Instant)>,
     /// 【Esc 双行为 2026-11】引擎 esc_undo_ready（开关开 && 空态 &&
     /// 上屏历史非空）缓存：TestDown 空态 escape 预判 TRUE（KeyDown
     /// 才会来，撤回键才能到引擎）；不就绪时 FALSE=透传应用。state
@@ -670,9 +675,13 @@ impl Shared {
             freq_pick_text: String::new(),
             freq_last_digit: None,
             freq_ctrl_physical: false,
-            freq_hold: "ctrl".into(),
-            freq_hold_apps: std::collections::HashMap::new(),
-            freq_hold_mode: "ctrl".into(),
+            freq_key: vec![0x11],
+            del_key: vec![0x11, 0x10],
+            export_key: Vec::new(),
+            freq_key_raw: "ctrl".into(),
+            del_key_raw: "ctrl+shift".into(),
+            export_key_raw: String::new(),
+            export_last: None,
             esc_undo_ready: false,
             keymap: std::collections::HashMap::new(),
             keymap_idle: std::collections::HashMap::new(),
@@ -1481,99 +1490,164 @@ pub fn cand_interact_note() {
 // · 按住 Ctrl 再按住 Shift → 删词子模式（提示行「✕ 删词…」+ 红强调），
 //   按数字删除该词（红闪塌缩动效，持久化）；Shift 松开回到调频；
 // · 松开按住键 → 模态结束（提示行收起，配色淡回）。
-// 【按住键可配 2026-11】铁律不变，按住的**键**可配：默认 Ctrl，
-// config.candidates.freq_hold="alt" 换 Alt，"off" 停用；freq_hold_apps
-// 按应用覆盖（键=小写 exe 名，如 "qq.exe"）。动因：QQ 等应用的
-// Ctrl+数字是注册热键/框架原生处理，TSF 层吃键拦不住（调频生效同时
-// 快捷键也触发，用户实锤且 QQ 侧不可关不可改）——按应用换按住键是
-// 唯一出路。
+// 【按住键可录·十三修 2026-11】铁律不变（按住进入，松开退出），按住
+// 的**键/组合**用户可录：candidates.freq_key（默认 "ctrl"）/
+// candidates.delete_key（默认 "ctrl+shift"=原和弦行为）+ general.
+// export_key（导出码表快捷键，空=关）。组合=成员 VK 集：进入=成员
+// 落下且其余成员皆按（完整即入，删词组合优先）；成员抬起=重估（两
+// 组合都散了才退出）。裸修饰键（Ctrl/Alt/Shift/Caps）可录。设置页
+// 「录制」按钮写入。
 //
 // 键路设计：
-// · 进入/退出/子模式切换在 Ctrl/Shift 的 Down/Up **任一层**处理
+// · 进入/退出/子模式切换在成员键的 Down/Up **任一层**处理
 //  （Test+KeyDown 双到达靠 freq_active 幂等去重）；
 // · 数字动作在 **Test 层直执行**（80ms 同 vk 去重挡 KeyDown 二次到达）
 //  ——跟打器类宿主只送 Test 事件（Shift 单击 Test 层闭环同型先例），
 //   返回 BOOL(1) 防宿主自产数字；
 // · 引擎侧旧 ctrl+digit 路径保留（Linux fcitx5 客户端在用）；本模态
 //   拦在前面，无 ctrl 事件的宿主自然回落旧路；
-// · 动效 tick 侧兜底：Ctrl 物理松开（GetAsyncKeyState）或窗口隐没
-//   → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
+// · 动效 tick 侧兜底：活动组合物理散尽（GetAsyncKeyState）或窗口
+//   隐没 → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
 // ─────────────────────────────────────────────────────────────────
 
-/// 【调频按住键可配 2026-11】宿主进程 exe 名（小写；进程内缓存，
-/// current_exe 失败回空串=永不命中覆盖表）。current_exe 在 DLL 里
-/// 返回**宿主**进程路径（本 DLL 无独立 exe）。
-fn host_exe_lower() -> &'static str {
-    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    EXE.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()))
-            .unwrap_or_default()
+/// 键名 → VK（组合键解析用）。词汇与按键映射页（vk_to_name）同源 +
+/// 修饰键；未知键名 → None（调用方决定停用）。
+fn keyname_to_vk(name: &str) -> Option<usize> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        // 修饰键（组合基座；ctrl/alt/shift 用通用 VK——TSF 键事件
+        // 不分左右修饰，精确侧仅 shift 支持）
+        "ctrl" | "control" => 0x11,
+        "alt" | "menu" => 0x12,
+        "shift" => 0x10,
+        "shiftleft" => 0xA0,
+        "shiftright" => 0xA1,
+        "win" | "lwin" => 0x5B,
+        "rwin" => 0x5C,
+        // 功能键全名（与 vk_to_name 对齐）
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "backspace" => 0x08,
+        "tab" => 0x09,
+        "capslock" => 0x14,
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "home" => 0x24,
+        "end" => 0x23,
+        "delete" => 0x2E,
+        "insert" => 0x2D,
+        // 符号单字符（与 vk_to_name OEM 段对齐）
+        ";" => 0xBA,
+        "=" => 0xBB,
+        "," => 0xBC,
+        "-" => 0xBD,
+        "." => 0xBE,
+        "/" => 0xBF,
+        "`" => 0xC0,
+        "[" => 0xDB,
+        "\\" => 0xDC,
+        "]" => 0xDD,
+        "'" => 0xDE,
+        _ => {
+            // f1-f12
+            if let Some(rest) = n.strip_prefix('f') {
+                if let Ok(k) = rest.parse::<u32>() {
+                    if (1..=12).contains(&k) {
+                        return Some(0x6F + k as usize);
+                    }
+                }
+            }
+            // 单字母/单数字
+            let mut cs = n.chars();
+            if let (Some(c), None) = (cs.next(), cs.next()) {
+                let u = c.to_ascii_uppercase() as usize;
+                if (0x41..=0x5A).contains(&u) || (0x30..=0x39).contains(&u) {
+                    return Some(u);
+                }
+            }
+            return None;
+        }
     })
 }
 
-/// 解析本进程的调频按住键模式：apps[host_exe] 命中优先、global 兜底；
-/// 值仅认 "alt"/"off"，其余（空/拼写错/未知）一律 "ctrl"（=旧版行为，
-/// 配置手误不致功能消失）。
-fn resolve_freq_hold(
-    global: &str,
-    apps: &std::collections::HashMap<String, String>,
-    host_exe: &str,
-) -> String {
-    let raw = apps
-        .get(host_exe)
-        .map(String::as_str)
-        .unwrap_or(global)
-        .to_ascii_lowercase();
-    if raw == "alt" || raw == "off" {
-        raw
-    } else {
-        "ctrl".into()
+/// 组合串 → VK 集（去重、序保持、≤4 键）。空串 = 空集（停用）。
+/// 任一键名无法识别 → 空集（配置手误=停用该组合，不猜）。
+fn parse_key_combo(s: &str) -> Vec<usize> {
+    if s.trim().is_empty() {
+        return Vec::new();
     }
-}
-
-/// 模式 → 按住键 VK（ctrl=0x11 / alt=0x12 / off 及其他=0=停用）。
-fn freq_hold_vk(mode: &str) -> usize {
-    match mode {
-        "ctrl" => 0x11,
-        "alt" => 0x12,
-        _ => 0,
-    }
-}
-
-/// 模态进入（按住键落下时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
-/// 置共享旗标 + 推送窗口视图（提示行入场/序号强调淡入 + 行高 size_anim）。
-/// 已激活时幂等返回 true（不重入）。
-/// 【和弦入口 2026-11】Ctrl 落下时 Shift 已按住（旧版 Ctrl+Shift+数字
-/// 的肌肉记忆=两键齐按）不再拒绝——直接进**删词子模式**（Shift 松开
-/// 回调频）。60修切换热键对模态中的 ctrl+shift 已豁免（freq_on 门），
-/// 此路安全；系统级 Ctrl+Shift 切输入法若开着则键被系统吃掉，到不了
-/// 这里（lang sink 会收窗兜底）。
-/// 【按住键可配】hold_vk=解析出的按住键（0x11 Ctrl / 0x12 Alt）；
-/// 守卫对称化：Win 按住恒拒（Win 组合非调频语义）；另一修饰键按住
-/// 也拒——ctrl 模式拒 Alt（现行为）、alt 模式拒 Ctrl（AltGr 在
-/// Windows 上合成 Ctrl+Alt 形态，alt 模式收 Ctrl = AltGr 组合误入）。
-fn freq_enter(shared: &SharedRef, hold_vk: usize) -> bool {
-    unsafe {
-        let win = GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000 != 0
-            || GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000 != 0;
-        let other = if hold_vk == 0x12 {
-            GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0
-        } else {
-            GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0
-        };
-        if win || other {
-            return false;
+    let mut out: Vec<usize> = Vec::new();
+    for tok in s.split('+') {
+        match keyname_to_vk(tok) {
+            Some(vk) => {
+                if !out.contains(&vk) {
+                    out.push(vk);
+                }
+            }
+            None => {
+                trace(&format!("keycombo: 无法识别的键名 {tok:?}（组合 {s:?} 停用）"));
+                return Vec::new();
+            }
         }
     }
+    if out.len() > 4 {
+        trace(&format!("keycombo: 组合 {s:?} 超过 4 键，停用"));
+        return Vec::new();
+    }
+    out
+}
+
+/// 组合此刻是否**全按住**（GetKeyState 逐键；空集恒 false）。
+fn combo_held(keys: &[usize]) -> bool {
+    !keys.is_empty() && keys.iter().all(|&vk| unsafe { GetKeyState(vk as i32) } < 0)
+}
+
+/// 除刚落下的 vk 外其余成员全按住（vk=组合完成键的入口判定）。
+fn combo_held_except(keys: &[usize], vk: usize) -> bool {
+    keys.contains(&vk)
+        && keys
+            .iter()
+            .all(|&k| k == vk || unsafe { GetKeyState(k as i32) } < 0)
+}
+
+/// 杂修饰键守卫：ctrl/alt/shift/win 里不在任一组合成员集仍被按住的
+///（组合外修饰=别的意图——AltGr 形态/系统组合，误入模态会吃掉宿主
+/// 快捷键基座）。
+fn stray_modifier_held(freq: &[usize], del: &[usize]) -> bool {
+    for (vk, nm) in [(0x11usize, "ctrl"), (0x12, "alt"), (0x10, "shift"), (0x5B, "win")] {
+        if freq.contains(&vk) || del.contains(&vk) {
+            continue;
+        }
+        if unsafe { GetKeyState(vk as i32) } < 0 {
+            trace(&format!("freq: 杂修饰键 {nm} 按住 → 拒入模态"));
+            return true;
+        }
+    }
+    false
+}
+
+/// 模态进入（组合完成时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
+/// 置共享旗标 + 推送窗口视图（提示行入场/序号强调淡入 + 行高 size_anim）。
+/// 已激活时幂等返回 true（不重入）。
+/// keys=完成的组合（物理按住探测用）；delete=true 进删词模态。
+/// 【和弦语义·十三修】默认组合（freq=ctrl、del=ctrl+shift）下：Ctrl
+/// 落下（freq 完成）→ 调频；再按 Shift（del 完成、删词优先）→ 删词；
+/// Shift 先松 → 回调频（freq 仍完整）；Ctrl 松 → 退出——与旧版「按
+/// 住 Ctrl + Shift 删词子模式」逐键同手感。两组合独立可录：单按住
+/// del 组合（如 "alt"）直接进删词，不必先按调频键。
+/// 杂修饰守卫在调用方（stray_modifier_held，需两组合成员集）。
+fn freq_enter(shared: &SharedRef, keys: &[usize], delete: bool) -> bool {
     if crate::candwin2::cand_menu_open() {
         return false;
     }
     // 物理按住标记（tick 兜底轮询的资格证——纯 Test 注入宿主无物理态）
-    // + 和弦判定（Shift 同按 → 直接删词子模式）
-    let ctrl_physical = unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } != 0;
-    let shift_held = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 } != 0;
+    let physical = keys
+        .iter()
+        .all(|&vk| unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 } != 0);
     let ok = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.freq_active {
@@ -1589,17 +1663,16 @@ fn freq_enter(shared: &SharedRef, hold_vk: usize) -> bool {
             return false;
         }
         g.freq_active = true;
-        g.freq_delete = shift_held;
+        g.freq_delete = delete;
         g.freq_pick = None;
         g.freq_pick_text.clear();
-        g.freq_ctrl_physical = ctrl_physical;
+        g.freq_ctrl_physical = physical;
         true
     };
     if ok {
         trace(&format!(
-            "freq: 按住{} → 进入{}模态",
-            if hold_vk == 0x12 { "Alt" } else { "Ctrl" },
-            if shift_held { "删词" } else { "调频" }
+            "freq: 组合完成 → 进入{}模态",
+            if delete { "删词" } else { "调频" }
         ));
         freq_view_apply(shared);
     }
@@ -2678,6 +2751,11 @@ impl HuFuTs_Impl {
         if let Some(b) = self.freq_modal_key(wparam, up) {
             return b;
         }
+        // 【导出码表快捷键·十三修】组合命中即导出（任意应用状态；空
+        // 组合=未配置恒 None 零开销）。
+        if let Some(b) = self.export_key_check(wparam, up) {
+            return b;
+        }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
         apply_chinese_sync(&self.shared);
@@ -3305,37 +3383,40 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
             }
             g.keymap_idle = kmi;
-            // 【调频按住键可配 2026-11】同帧镜像两值 + 按宿主 exe 解析
-            //（模式决定模态入口键；旧引擎 state 无此字段 → unwrap_or
-            // "ctrl" = 旧版行为，前向兼容）。解析结果变了才 trace（每
-            // 键一拍，不刷屏）。
+            // 【按住键可录·十三修】同帧解析三组合（freq/delete/export）
+            // 为 VK 集缓存；旧引擎 state 无字段 → unwrap_or 默认串 =
+            // 旧版行为，前向兼容。组合变了才 trace（每键一拍不刷屏）。
             let fh = state
-                .get("freq_hold")
+                .get("freq_key")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ctrl")
                 .to_string();
-            let fha: std::collections::HashMap<String, String> = state
-                .get("freq_hold_apps")
-                .and_then(|v| v.as_object())
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| {
-                            v.as_str().map(|s| (k.clone(), s.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mode = resolve_freq_hold(&fh, &fha, host_exe_lower());
-            if g.freq_hold_mode != mode {
+            let dh = state
+                .get("delete_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ctrl+shift")
+                .to_string();
+            let ek = state
+                .get("export_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (fk, dk, xk) = (
+                parse_key_combo(&fh),
+                parse_key_combo(&dh),
+                parse_key_combo(&ek),
+            );
+            if g.freq_key != fk || g.del_key != dk || g.export_key != xk {
                 trace(&format!(
-                    "freq_hold 解析: {mode}（global={fh} host={} apps={} 项）",
-                    host_exe_lower(),
-                    fha.len()
+                    "keycombo 同步: freq={fh:?}→{fk:?} del={dh:?}→{dk:?} export={ek:?}→{xk:?}"
                 ));
             }
-            g.freq_hold = fh;
-            g.freq_hold_apps = fha;
-            g.freq_hold_mode = mode;
+            g.freq_key = fk;
+            g.del_key = dk;
+            g.export_key = xk;
+            g.freq_key_raw = fh;
+            g.del_key_raw = dh;
+            g.export_key_raw = ek;
         }
         // 【回车立即收窗 2026-10-09】回车与 Shift 上屏同款：无论「回车
         // 清屏」勾否（清屏=清组段 / 未勾=编码字母上屏），候选一律立即
@@ -3464,76 +3545,60 @@ impl HuFuTs_Impl {
         BOOL(1)
     }
 
-    /// 【按住Ctrl调频 2026-11】模态键路分派（dispatch 咽喉调用；模块
+    /// 【按住键可录·十三修】模态键路分派（dispatch 咽喉调用；模块
     /// 注释见 freq_enter 前）：
-    /// · 按住键（解析态：ctrl 0x11 / alt 0x12，off=整体停用返回
-    ///   None）落下 → 进入模态（不满足条件回落原路径）；抬起 → 退出
-    ///   模态。均直通宿主（BOOL(0)）——修饰键是纯修饰，宿主侧语义
-    ///   （快捷键组合基座）不变；
-    /// · 模态中 Shift（0x10）落下/抬起 → 删词子模式开/关（清拾起），
-    ///   并拦截 Shift 单击判定通道（模态中的 Shift 不是中英切换）；
+    /// · 组合成员落下：组合完整（其余成员皆按）→ 入模态（删词组合
+    ///   优先）；不完整 → 回落原路径。成员抬起 → 重估（del 组合全按
+    ///   =删词 / freq 组合全按 =调频 / 都散 =退出）。修饰键成员一律
+    ///   直通宿主 BOOL(0)（纯修饰，宿主快捷键基座语义不变）；
     /// · 模态中主排数字（0x30-0x39）落下 → Test 层直执行（拾起/对调/
     ///   删除；80ms 同 vk 去重挡 KeyDown 二次到达），BOOL(1) 防宿主
     ///   自产数字；抬起直通。
-    /// 返回 None = 非模态键/模态未激活，走原路径。
+    /// 返回 None = 非成员/模态未激活，走原路径。
     fn freq_modal_key(&self, wparam: usize, up: bool) -> Option<BOOL> {
-        // 【调频按住键可配 2026-11】入口键按本进程解析态：off = 模态
-        // 停用（数字回落引擎旧 ctrl+digit 路径/直通——QQ 场景配 off
-        // 即回退到与无模态完全一致的行为）。
-        let mode = {
+        let (fk, dk, active, physical) = {
             let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.freq_hold_mode.clone()
+            (
+                g.freq_key.clone(),
+                g.del_key.clone(),
+                g.freq_active,
+                g.freq_ctrl_physical,
+            )
         };
-        let hold_vk = freq_hold_vk(&mode);
-        if hold_vk == 0 {
-            return None;
-        }
-        if wparam == hold_vk {
-            if !up {
-                if freq_enter(&self.shared, hold_vk) {
-                    return Some(BOOL(0));
+        let member = |vk: usize| fk.contains(&vk) || dk.contains(&vk);
+        if up {
+            if active && member(wparam) {
+                // 成员抬起 → 重估：删词优先，两组合都散才退出。事件键
+                // 的按态**不读 GetKeyState**（TestUp 时刻状态同步不保
+                // 险）——含它的组合必不完整，不含它的组合不受本事件影响。
+                let del_held = !dk.contains(&wparam) && combo_held(&dk);
+                let freq_held = !fk.contains(&wparam) && combo_held(&fk);
+                if del_held {
+                    freq_set_delete(&self.shared, true);
+                } else if freq_held {
+                    freq_set_delete(&self.shared, false);
+                } else {
+                    freq_exit(&self.shared);
                 }
-                return None;
+                return Some(BOOL(0));
             }
-            let was = self
-                .shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .freq_active;
-            if was {
-                freq_exit(&self.shared);
+            // 数字抬起：直通吞掉（不走旧路径 composing 分支）
+            if active && (0x30..=0x39).contains(&wparam) {
                 return Some(BOOL(0));
             }
             return None;
         }
-        let (active, ctrl_physical) = {
-            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            (g.freq_active, g.freq_ctrl_physical)
-        };
-        if !active {
-            return None;
-        }
-        // 【僵尸模态防线】模态中任何**非按住键**的键到达而物理按住键
-        // 已松（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。仅
-        // 对物理进入的模态有效（纯 Test 注入宿主的松开语义在 TestUp 层）。
-        if wparam != hold_vk
-            && ctrl_physical
-            && unsafe { GetAsyncKeyState(hold_vk as i32) as u16 & 0x8000 } == 0
-        {
-            freq_exit(&self.shared);
-            return None;
-        }
-        match wparam {
-            0x10 => {
-                freq_set_delete(&self.shared, !up);
-                Some(BOOL(0))
+        // ── down ──
+        if active {
+            // 【僵尸模态防线】模态中任何**非成员**键到达而两组合物理
+            // 全散（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。
+            // 仅对物理进入的模态有效（纯 Test 注入宿主松开语义在 TestUp）。
+            if !member(wparam) && physical && !combo_held(&fk) && !combo_held(&dk) {
+                freq_exit(&self.shared);
+                return None;
             }
-            0x30..=0x39 => {
-                if up {
-                    // 数字抬起：直通吞掉（不走旧路径 composing 分支）
-                    return Some(BOOL(0));
-                }
-                // '0'=第 10 候选（rank_key_index 同口径）
+            // 数字：Test 层直执行（拾起/对调/删除）
+            if (0x30..=0x39).contains(&wparam) {
                 let idx = if wparam == 0x30 {
                     9
                 } else {
@@ -3551,10 +3616,79 @@ impl HuFuTs_Impl {
                 if !dup {
                     freq_digit(&self.shared, idx);
                 }
-                Some(BOOL(1))
+                return Some(BOOL(1));
             }
-            _ => None,
+            // 成员 down（模态中按下另一组合键，如调频态按 Shift）→
+            // 重估子模式（和弦：删词组合完整 → 删词）。事件键按态不读
+            // GetKeyState（TestDown 时刻同步不保险）：含它=其余皆按即
+            // 完整，不含它=照常逐键查。
+            if member(wparam) {
+                let del_held = if dk.contains(&wparam) {
+                    combo_held_except(&dk, wparam)
+                } else {
+                    combo_held(&dk)
+                };
+                if del_held {
+                    freq_set_delete(&self.shared, true);
+                } else {
+                    freq_set_delete(&self.shared, false);
+                }
+                return Some(BOOL(0));
+            }
+            return None;
         }
+        // ── down 且模态未激活：入口判定（组合成员落下 + 组合完整）。
+        if member(wparam) {
+            let del_complete = dk.contains(&wparam) && combo_held_except(&dk, wparam);
+            let freq_complete = fk.contains(&wparam) && combo_held_except(&fk, wparam);
+            if del_complete || freq_complete {
+                if stray_modifier_held(&fk, &dk) {
+                    return None;
+                }
+                let keys = if del_complete { &dk } else { &fk };
+                if freq_enter(&self.shared, keys, del_complete) {
+                    return Some(BOOL(0));
+                }
+                return None; // 无候选/菜单开 → 回落原路径
+            }
+            // 成员但组合不完整（如默认下 Shift 先于 Ctrl 落下）→ 原路径
+            //（Shift 单击切中英等既有语义不受扰）。
+        }
+        None
+    }
+
+    /// 【导出码表快捷键·十三修】组合命中（任意应用状态，不要求候选
+    /// 在窗）：Test 层直执行 + 80ms 同组合去重，BOOL(1) 吃键防宿主
+    /// 自产字符；抬起直通。命中即管道 export_schema（与托盘「导出
+    /// 码表」同路径：当前方案 + 记忆格式 + 打开导出目录）。
+    fn export_key_check(&self, wparam: usize, up: bool) -> Option<BOOL> {
+        if up {
+            return None;
+        }
+        let ek = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.export_key.is_empty() {
+                return None;
+            }
+            g.export_key.clone()
+        };
+        if !ek.contains(&wparam) || !combo_held_except(&ek, wparam) {
+            return None;
+        }
+        let dup = {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let d = matches!(&g.export_last, Some((vk, t))
+                if *vk == wparam && t.elapsed().as_millis() < 80);
+            if !d {
+                g.export_last = Some((wparam, std::time::Instant::now()));
+            }
+            d
+        };
+        if !dup {
+            trace("export: 快捷键命中 → 导出当前方案码表");
+            let _ = crate::ipc::call(&serde_json::json!({ "op": "export_schema" }));
+        }
+        Some(BOOL(1))
     }
 
     /// 【七十六修·键盘层回删+注入】宿主 TSF ShiftStart 静默不动（WinForms/
@@ -9812,49 +9946,63 @@ mod modekey_tests {
 }
 
 #[cfg(test)]
-mod freq_hold_tests {
+mod keycombo_tests {
     use super::*;
 
-    /// 解析兜底链：apps 命中 → global → 非法值一律 ctrl（旧版行为）。
+    /// 键名 → VK 基础映射（修饰键/功能键/F 区/字母数字/符号）。
     #[test]
-    fn resolve_falls_back_to_ctrl() {
-        let apps = std::collections::HashMap::new();
-        assert_eq!(resolve_freq_hold("", &apps, "qq.exe"), "ctrl");
-        assert_eq!(resolve_freq_hold("bogus", &apps, "qq.exe"), "ctrl");
-        // 大小写归一（值侧）
-        assert_eq!(resolve_freq_hold("ALT", &apps, "qq.exe"), "alt");
-        assert_eq!(resolve_freq_hold("ctrl", &apps, "qq.exe"), "ctrl");
-        assert_eq!(resolve_freq_hold("alt", &apps, "any.exe"), "alt");
-        assert_eq!(resolve_freq_hold("off", &apps, "any.exe"), "off");
+    fn keyname_map() {
+        assert_eq!(keyname_to_vk("ctrl"), Some(0x11));
+        assert_eq!(keyname_to_vk("Control"), Some(0x11));
+        assert_eq!(keyname_to_vk("alt"), Some(0x12));
+        assert_eq!(keyname_to_vk("shift"), Some(0x10));
+        assert_eq!(keyname_to_vk("shiftleft"), Some(0xA0));
+        assert_eq!(keyname_to_vk("capslock"), Some(0x14));
+        assert_eq!(keyname_to_vk("f5"), Some(0x74));
+        assert_eq!(keyname_to_vk("E"), Some(0x45));
+        assert_eq!(keyname_to_vk("7"), Some(0x37));
+        assert_eq!(keyname_to_vk(";"), Some(0xBA));
+        assert_eq!(keyname_to_vk("space"), Some(0x20));
+        assert_eq!(keyname_to_vk("nope"), None);
+        assert_eq!(keyname_to_vk("f13"), None);
+        assert_eq!(keyname_to_vk("ab"), None); // 多字符非功能键
     }
 
-    /// 按应用覆盖：命中小写 exe 名生效；未命中回落 global；命中但值
-    /// 非法回落 ctrl（不回落 global——显式覆盖写错按最保守处理）。
+    /// 组合解析：默认值精确复刻旧版（freq=[Ctrl]、del=[Ctrl,Shift]）。
     #[test]
-    fn resolve_app_override() {
-        let mut apps = std::collections::HashMap::new();
-        apps.insert("qq.exe".to_string(), "alt".to_string());
-        apps.insert("bad.exe".to_string(), "nope".to_string());
-        assert_eq!(resolve_freq_hold("ctrl", &apps, "qq.exe"), "alt");
-        assert_eq!(resolve_freq_hold("alt", &apps, "notepad3.exe"), "alt");
-        assert_eq!(resolve_freq_hold("alt", &apps, "bad.exe"), "ctrl");
+    fn combo_parse_defaults_and_syntax() {
+        assert_eq!(parse_key_combo("ctrl"), vec![0x11]);
+        assert_eq!(parse_key_combo("ctrl+shift"), vec![0x11, 0x10]);
+        assert_eq!(parse_key_combo("Ctrl+Alt+E"), vec![0x11, 0x12, 0x45]);
+        assert_eq!(parse_key_combo("capslock"), vec![0x14]);
+        assert_eq!(parse_key_combo("ctrl+ctrl"), vec![0x11]); // 去重
+        assert!(parse_key_combo("").is_empty()); // 空=停用
+        assert!(parse_key_combo("  ").is_empty());
+        assert!(parse_key_combo("ctrl+zzz").is_empty()); // 未知键名=停用
+        assert!(parse_key_combo("a+b+c+d+e").is_empty()); // >4 键停用
     }
 
-    /// 模式 → 按住键 VK 映射（off/未知=0=停用）。
+    /// Shared 初始态 = 默认组合（无 state 镜像前=旧版行为）。
     #[test]
-    fn hold_vk_map() {
-        assert_eq!(freq_hold_vk("ctrl"), 0x11);
-        assert_eq!(freq_hold_vk("alt"), 0x12);
-        assert_eq!(freq_hold_vk("off"), 0);
-        assert_eq!(freq_hold_vk(""), 0);
-        assert_eq!(freq_hold_vk("wrong"), 0);
-    }
-
-    /// Shared 初始态 = ctrl（无 state 镜像前=旧版行为）。
-    #[test]
-    fn shared_defaults_ctrl() {
+    fn shared_defaults_combos() {
         let g = Shared::new();
-        assert_eq!(g.freq_hold_mode, "ctrl");
-        assert_eq!(freq_hold_vk(&g.freq_hold_mode), 0x11);
+        assert_eq!(g.freq_key, vec![0x11]);
+        assert_eq!(g.del_key, vec![0x11, 0x10]);
+        assert!(g.export_key.is_empty());
+    }
+
+    /// combo_held_except 语义：完成键免查、其余必按。
+    ///（单测环境无真实键盘——GetKeyState 恒非按，断言只验「事件键
+    /// 免查」之外的假阴性路径与成员资格判定。）
+    #[test]
+    fn combo_membership_semantics() {
+        let dk = parse_key_combo("ctrl+shift");
+        // 完成键成员资格
+        assert!(dk.contains(&0x10) && dk.contains(&0x11));
+        // 非成员组合 complete-except 恒 false
+        assert!(!combo_held_except(&dk, 0x41));
+        // 空组合恒 false
+        assert!(!combo_held(&[]));
+        assert!(!combo_held_except(&[], 0x11));
     }
 }

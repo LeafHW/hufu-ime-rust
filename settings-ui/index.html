@@ -317,6 +317,20 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="km-open" style="padding:6px 16px">⌨ 自定义按键（全键盘 · 两态映射）</button>
       <span class="sub" style="align-self:center">全键盘图形化编辑：任意键（含 Caps/Tab/空格/Shift/F 区）设「有候选时 / 无候选时」两套功能（如 [ 有候选直出？、无候选直出！）。支持冲突检测与一键恢复默认。改完全局生效（含整句模式），重启保留。</span>
     </div>
+    <!-- 【按住键可录·十三修】调频/删词按住键 + 导出码表快捷键：录制式录入 -->
+    <div class="row" style="flex-wrap:wrap;align-items:center;gap:6px 16px">
+      <div class="field"><label>调频按住键</label>
+        <input type="text" id="hk-freq" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
+        <button id="hk-freq-rec" style="padding:4px 12px">录制</button></div>
+      <div class="field"><label>删词按住键</label>
+        <input type="text" id="hk-del" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
+        <button id="hk-del-rec" style="padding:4px 12px">录制</button></div>
+      <div class="field"><label>导出码表快捷键</label>
+        <input type="text" id="hk-exp" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default" placeholder="未设置">
+        <button id="hk-exp-rec" style="padding:4px 12px">录制</button></div>
+      <button id="hk-reset" style="padding:4px 12px;align-self:flex-end">恢复默认</button>
+    </div>
+    <div class="sub">有候选时按住「调频键」再按数字调频、按住「删词键」再按数字删词（两键独立，同按删词优先）。点「录制」后：按住修饰键再按普通键＝组合键；单按一个键（Ctrl / Alt / Shift / Caps…）再松开＝录入该键本身；Esc 取消。「导出码表快捷键」任意时刻可按＝按当前方案的记忆格式导出并打开目录（与托盘同路径），留空＝不启用。</div>
     <h3>标点与外观</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="p-full"><label for="p-full">全角标点</label></div>
@@ -710,6 +724,85 @@ function bindInputs() {
   // 【自定义按键·图形化编辑 2026-11】全键盘两态映射编辑窗口
   const kmBtn = $("#km-open");
   if (kmBtn) kmBtn.onclick = openKeymapEditor;
+  /* ── 【按住键可录·十三修】调频/删词按住键 + 导出码表快捷键录制器 ──
+     录制语义：按住修饰键(Ctrl/Alt/Shift/Win)再按普通键＝组合键；
+     单按**一个**键（裸 Ctrl/Alt/Shift/Caps/任意键）再松开＝录入该键
+     本身；按了多个修饰键又全松开（没按普通键）＝提示重录；Esc 取消。
+     录完写 CFG → autoSave（防抖整表回传，与页面其它控件同通道）。 */
+  const HK_PATHS = [
+    ["#hk-freq", "#hk-freq-rec", "candidates.freq_key", "ctrl"],
+    ["#hk-del", "#hk-del-rec", "candidates.delete_key", "ctrl+shift"],
+    ["#hk-exp", "#hk-exp-rec", "general.export_key", ""],
+  ];
+  const HK_DISP = { ctrl: "Ctrl", alt: "Alt", shift: "Shift", win: "Win", capslock: "Caps", space: "空格", enter: "回车", tab: "Tab", backspace: "退格", escape: "Esc", delete: "Del", insert: "Ins", pageup: "PgUp", pagedown: "PgDn", home: "Home", end: "End", left: "←", up: "↑", right: "→", down: "↓" };
+  const hkDisp = s => !s ? "未设置" : s.split("+").map(t => t.length === 1 ? t.toUpperCase() : (HK_DISP[t] || t)).join("+");
+  function hkShow() {
+    for (const [inp, , path, dflt] of HK_PATHS)
+      $(inp).value = hkDisp(getP(CFG, path) || dflt);
+  }
+  const HK_MODS = { Control: "ctrl", Alt: "alt", Shift: "shift", Meta: "win" };
+  const HK_NAMES = { " ": "space", Enter: "enter", Backspace: "backspace", Tab: "tab", CapsLock: "capslock", ArrowLeft: "left", ArrowUp: "up", ArrowRight: "right", ArrowDown: "down", PageUp: "pageup", PageDown: "pagedown", Home: "home", End: "end", Delete: "delete", Insert: "insert" };
+  function hkEventName(e) {
+    if (HK_MODS[e.key]) return { mod: HK_MODS[e.key] };
+    if (e.key === "Escape") return { cancel: true };
+    if (e.key.length === 1) return { key: e.key.toLowerCase() };
+    if (/^F([1-9]|1[0-2])$/.test(e.key)) return { key: e.key.toLowerCase() };
+    const n = HK_NAMES[e.key];
+    return n ? { key: n } : { ignore: true };
+  }
+  let hkRec = null; /* {path, input, btn, mods:Set, everMods:Set, sawNonMod} */
+  function hkFinish(combo) {
+    const r = hkRec; hkRec = null;
+    window.removeEventListener("keydown", hkKD, true);
+    window.removeEventListener("keyup", hkKU, true);
+    window.removeEventListener("blur", hkCancel, true);
+    r.btn.textContent = "录制";
+    if (combo) {
+      setP(CFG, r.path, combo.join("+"));
+      autoSave(r.input);
+      msg(`已录入：${hkDisp(combo.join("+"))}`, "ok");
+    } else {
+      msg("已取消录制", "");
+    }
+    hkShow();
+  }
+  function hkKD(e) {
+    e.preventDefault(); e.stopPropagation();
+    if (!hkRec) return;
+    const n = hkEventName(e);
+    if (n.cancel) return hkFinish(null);
+    if (n.ignore) return;
+    if (n.mod) { hkRec.mods.add(n.mod); hkRec.everMods.add(n.mod); return; }
+    if (n.key) { hkRec.sawNonMod = true; hkFinish([...hkRec.mods, n.key]); }
+  }
+  function hkKU(e) {
+    e.preventDefault(); e.stopPropagation();
+    if (!hkRec) return;
+    const n = hkEventName(e);
+    if (!n || !n.mod) return;
+    hkRec.mods.delete(n.mod);
+    if (!hkRec.sawNonMod && hkRec.mods.size === 0 && hkRec.everMods.size === 1)
+      hkFinish([n.mod]); /* 单按一键再松开＝录入该键本身（含裸修饰键/Caps） */
+  }
+  function hkCancel() { if (hkRec) hkFinish(null); }
+  function hkStart(path, inputSel, btnSel) {
+    if (hkRec) hkFinish(null);
+    hkRec = { path, input: $(inputSel), btn: $(btnSel), mods: new Set(), everMods: new Set(), sawNonMod: false };
+    hkRec.btn.textContent = "按要录入的键…（Esc 取消）";
+    window.addEventListener("keydown", hkKD, true);
+    window.addEventListener("keyup", hkKU, true);
+    window.addEventListener("blur", hkCancel, true);
+  }
+  for (const [inp, btn, path] of HK_PATHS) $(btn).onclick = () => hkStart(path, inp, btn);
+  $("#hk-reset").onclick = () => {
+    setP(CFG, "candidates.freq_key", "ctrl");
+    setP(CFG, "candidates.delete_key", "ctrl+shift");
+    setP(CFG, "general.export_key", "");
+    autoSave($("#hk-reset"));
+    hkShow();
+    msg("已恢复默认（Ctrl / Ctrl+Shift / 未设置）", "ok");
+  };
+  hkShow();
   // OpenCC 繁简 / emoji
   B("#oc-en", "opencc.enabled"); B("#oc-emoji", "opencc.emoji");
   $("#oc-dir").value = CFG.opencc?.to_traditional === false ? "t2s" : "s2t";
