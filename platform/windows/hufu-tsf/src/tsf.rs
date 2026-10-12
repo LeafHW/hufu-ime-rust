@@ -495,6 +495,22 @@ pub struct Shared {
     /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
     /// 第 N 项再暂留收场）。
     pub rank_flash: Option<usize>,
+    /// 【按住Ctrl调频 2026-11】模态逻辑态（渲染态在窗口 freq view）：
+    /// freq_active=按住 Ctrl 已入模态；freq_delete=+Shift 删词子模式；
+    /// freq_pick/freq_pick_text=拾起的页内下标与词（第二次数字=对调）。
+    /// 进入=Ctrl KeyDown/TestKeyDown（无 Shift/Alt/Win + 候选在窗）；
+    /// 退出=Ctrl KeyUp（铁律：按住进入，松开退出）。
+    pub freq_active: bool,
+    pub freq_delete: bool,
+    pub freq_pick: Option<usize>,
+    pub freq_pick_text: String,
+    /// 模态内数字 TestDown 直执行后的同 vk 去重（80ms——Test 与
+    /// KeyDown 双到达防双发；auto-repeat 33ms 保留）。
+    pub freq_last_digit: Option<(usize, std::time::Instant)>,
+    /// 进入时刻 Ctrl 是否**物理**按住（GetAsyncKeyState）：真宿主=真
+    /// →tick 轮询 GetAsyncKeyState 兜底退出有效；跟打器类纯 Test 注入
+    /// 宿主=假 → 物理轮询不可作为退出依据（交 TestUp/下一键层处理）。
+    pub freq_ctrl_physical: bool,
     /// 【Esc 双行为 2026-11】引擎 esc_undo_ready（开关开 && 空态 &&
     /// 上屏历史非空）缓存：TestDown 空态 escape 预判 TRUE（KeyDown
     /// 才会来，撤回键才能到引擎）；不就绪时 FALSE=透传应用。state
@@ -624,6 +640,12 @@ impl Shared {
             last_key_ctx: None,
             last_show: None,
             rank_flash: None,
+            freq_active: false,
+            freq_delete: false,
+            freq_pick: None,
+            freq_pick_text: String::new(),
+            freq_last_digit: None,
+            freq_ctrl_physical: false,
             esc_undo_ready: false,
             keymap: std::collections::HashMap::new(),
             keymap_idle: std::collections::HashMap::new(),
@@ -1417,6 +1439,252 @@ pub fn cand_interact_note() {
     g.cand_interact_until =
         Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
     g.cand_interact_pending = true;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 【按住Ctrl调频 2026-11】候选模态调频/删词（Windows TSF 侧）
+//
+// 交互规格（用户定稿，铁律「按住进入，松开退出」）：
+// · 有候选时**按住** Ctrl → 候选框出提示行「⇄ 调频：按数字选词…」
+//   + 序号强调色（琥珀）；
+// · 按住状态下按数字 → 对应候选被「拾起」（拾起环脉冲 + 提示行更新）；
+// · 再按另一数字 → 两候选对调（横排滑动/竖排双格强调，持久化落
+//   用户调整.txt），拾起跟随被调词（可链式继续调）；
+// · 同号再按 = 取消拾起；
+// · 按住 Ctrl 再按住 Shift → 删词子模式（提示行「✕ 删词…」+ 红强调），
+//   按数字删除该词（红闪塌缩动效，持久化）；Shift 松开回到调频；
+// · 松开 Ctrl → 模态结束（提示行收起，配色淡回）。
+//
+// 键路设计：
+// · 进入/退出/子模式切换在 Ctrl/Shift 的 Down/Up **任一层**处理
+//  （Test+KeyDown 双到达靠 freq_active 幂等去重）；
+// · 数字动作在 **Test 层直执行**（80ms 同 vk 去重挡 KeyDown 二次到达）
+//  ——跟打器类宿主只送 Test 事件（Shift 单击 Test 层闭环同型先例），
+//   返回 BOOL(1) 防宿主自产数字；
+// · 引擎侧旧 ctrl+digit 路径保留（Linux fcitx5 客户端在用）；本模态
+//   拦在前面，无 ctrl 事件的宿主自然回落旧路；
+// · 动效 tick 侧兜底：Ctrl 物理松开（GetAsyncKeyState）或窗口隐没
+//   → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
+// ─────────────────────────────────────────────────────────────────
+
+/// 模态进入（Ctrl 落下时刻调用）：无 Shift/Alt/Win 按住 + 右键菜单未开
+/// + 候选窗可见且有候选 → 置共享旗标 + 推送窗口视图（提示行入场/序号
+/// 强调淡入 + 行高 size_anim）。已激活时幂等返回 true（不重入）。
+fn freq_enter(shared: &SharedRef) -> bool {
+    unsafe {
+        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+        let win = GetKeyState(VK_LWIN.0 as i32) < 0 || GetKeyState(VK_RWIN.0 as i32) < 0;
+        if shift || alt || win {
+            return false;
+        }
+    }
+    if crate::candwin2::cand_menu_open() {
+        return false;
+    }
+    // 物理按住标记（tick 兜底轮询的资格证——纯 Test 注入宿主无物理态）
+    let ctrl_physical = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } != 0;
+    let ok = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.freq_active {
+            return true; // 已激活（Test/KeyDown 二次到达）——幂等
+        }
+        let visible = g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false);
+        let has_cands = g
+            .last_show
+            .as_ref()
+            .map(|(c, _, _)| !c.is_empty())
+            .unwrap_or(false);
+        if !visible || !has_cands {
+            return false;
+        }
+        g.freq_active = true;
+        g.freq_delete = false;
+        g.freq_pick = None;
+        g.freq_pick_text.clear();
+        g.freq_ctrl_physical = ctrl_physical;
+        true
+    };
+    if ok {
+        trace("freq: 按住Ctrl → 进入调频模态");
+        freq_view_apply(shared);
+    }
+    ok
+}
+
+/// 模态退出（Ctrl 抬起 / tick 兜底 / 数字时窗已隐）：清旗标 + 推送
+/// 视图（提示行收起 + 配色淡回 + 行高 size_anim 收拢）。
+fn freq_exit(shared: &SharedRef) {
+    let had = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let h = g.freq_active;
+        g.freq_active = false;
+        g.freq_delete = false;
+        g.freq_pick = None;
+        g.freq_pick_text.clear();
+        h
+    };
+    if had {
+        trace("freq: 松开Ctrl → 退出调频模态");
+        freq_view_apply(shared);
+    }
+}
+
+/// 删词子模式切换（模态中 Shift 落下/抬起）：清拾起（拾起语义不跨
+/// 子模式），推送视图（琥珀↔红强调切换）。
+fn freq_set_delete(shared: &SharedRef, on: bool) {
+    let changed = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.freq_active && g.freq_delete != on;
+        if c {
+            g.freq_delete = on;
+            g.freq_pick = None;
+            g.freq_pick_text.clear();
+        }
+        c
+    };
+    if changed {
+        trace(&format!("freq: 删词子模式 = {on}"));
+        freq_view_apply(shared);
+    }
+}
+
+/// 共享逻辑态 → 窗口渲染态 + 手动同参 show（cand_menu_refresh 同款
+/// take/show/put-back 骨架；show 全参数走让 size_anim 收放提示行）。
+fn freq_view_apply(shared: &SharedRef) {
+    let (active, del, pick, pick_text, last, skin, caret) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            g.freq_active,
+            g.freq_delete,
+            g.freq_pick,
+            g.freq_pick_text.clone(),
+            g.last_show.clone(),
+            g.skin.clone(),
+            g.caret,
+        )
+    };
+    let mut cand2 = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    if let Some(c) = cand2.as_mut() {
+        c.set_freq_view(active, del, pick, &pick_text);
+        if let Some((cands, raw, sel)) = last {
+            // 渲染口径与打字帧一致：inline 开=真编码不画（模态期编码行
+            // 由提示行占用——T8 铁律不破）
+            let inline_on = skin
+                .pointer("/skin/layout/inline_preedit")
+                .or_else(|| skin.pointer("/layout/inline_preedit"))
+                .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let raw_disp: String = if !inline_on { raw } else { String::new() };
+            c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+        }
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    match (g.cand2.take(), cand2) {
+        (None, mine) => g.cand2 = mine,
+        (Some(newer), Some(mut mine)) => {
+            mine.hide();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+    }
+}
+
+/// 数字动作（模态中主排数字，Test 层调用）：
+/// 删词模式 → cand_menu del（红闪塌缩 + 持久化）；调频模式 → 拾起/
+/// 对调（cand_swap 滑动 + 持久化）/同号取消。对调后拾起跟随被调词
+/// （链式调整）。窗已隐（组段收尾）→ 直接退出模态。
+fn freq_digit(shared: &SharedRef, idx: usize) {
+    let (active, del, pick, pick_text, page, raw) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            g.freq_active,
+            g.freq_delete,
+            g.freq_pick,
+            g.freq_pick_text.clone(),
+            g.last_show.clone(),
+            g.last_show.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default(),
+        )
+    };
+    if !active {
+        return;
+    }
+    let visible = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false)
+    };
+    if !visible {
+        freq_exit(shared);
+        return;
+    }
+    let Some((page, _raw, _sel)) = page else {
+        return;
+    };
+    if idx >= page.len().min(10) {
+        return; // 越界（页内没那么多候选）：无视，模态保持
+    }
+    let text_j = page[idx].0.clone();
+    if del {
+        let old_page = page.clone();
+        trace(&format!("freq: 删词 [{idx}]「{text_j}」"));
+        if let Some(r) = crate::ipc::call(&serde_json::json!({
+            "op": "cand_menu", "action": "del", "page_index": idx, "text": text_j, "raw": raw
+        })) {
+            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                unsafe { crate::candwin2::freq_result_refresh(&r, None, Some((idx, &old_page))); }
+            } else {
+                trace("freq: 删词未生效（候选不在页）");
+            }
+        }
+        return;
+    }
+    match pick {
+        None => {
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.freq_pick = Some(idx);
+                g.freq_pick_text = text_j.clone();
+            }
+            trace(&format!("freq: 拾起 [{idx}]「{text_j}」"));
+            freq_view_apply(shared);
+        }
+        Some(p) if p == idx => {
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.freq_pick = None;
+                g.freq_pick_text.clear();
+            }
+            trace("freq: 同号取消拾起");
+            freq_view_apply(shared);
+        }
+        Some(p) => {
+            let text_i = if pick_text.is_empty() {
+                page.get(p).map(|(t, _)| t.clone()).unwrap_or_default()
+            } else {
+                pick_text
+            };
+            trace(&format!("freq: 对调 [{p}]「{text_i}」↔ [{idx}]「{text_j}」"));
+            if let Some(r) = crate::ipc::call(&serde_json::json!({
+                "op": "cand_swap", "i": p, "j": idx, "text_i": text_i, "text_j": text_j
+            })) {
+                if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // 拾起跟随被调词（现落于目标槽位 idx——链式继续调）
+                    {
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.freq_pick = Some(idx);
+                        g.freq_pick_text = text_i;
+                    }
+                    unsafe { crate::candwin2::freq_result_refresh(&r, Some((p, idx)), None); }
+                } else {
+                    trace("freq: 对调未生效（候选不在页）");
+                }
+            }
+        }
+    }
 }
 
 /// 【候选窗交互收场自愈 2026-10-12·执行半】dispatch 入口调用（键入口
@@ -2253,6 +2521,13 @@ impl HuFuTs_Impl {
         if crate::addword::is_open() && !crate::addword::in_window_thread() {
             return BOOL(0);
         }
+        // 【按住Ctrl调频 2026-11】模态键路（模块注释见 freq_enter 前）：
+        // Ctrl 落下→进入 / 抬起→退出（铁律：按住进入，松开退出）；
+        // 模态中 Shift 落下/抬起→删词子模式；模态中主排数字 Test 层直
+        // 执行（80ms 同 vk 去重挡 KeyDown 二次到达）→拾起/对调/删除。
+        if let Some(b) = self.freq_modal_key(wparam, up) {
+            return b;
+        }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
         apply_chinese_sync(&self.shared);
@@ -2642,8 +2917,16 @@ impl HuFuTs_Impl {
                     wparam == 0x20
                 ));
             }
+            // 【按住Ctrl调频 2026-11】模态中的 Ctrl+Shift 是**删词子模式
+            // 手势**，不再当切换热键冲销（系统真切换由四十五修 lang
+            // sink 收窗兜底；热键改键用户——虎符用户常态——的模态删词
+            // 不受误杀）。Win+Space 不豁免：Win 与调频无交集。
+            let freq_on = {
+                let g = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                g.freq_active
+            };
             let is_switch_hotkey = (win && (wparam == 0x20 || wparam == 0x0))
-                || (ctrl && shift && (wparam == 0x10 || wparam == 0x11));
+                || (ctrl && shift && (wparam == 0x10 || wparam == 0x11) && !freq_on);
             if is_switch_hotkey {
                 let (in_use, has_win) = {
                     let g = self.shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -3017,6 +3300,87 @@ impl HuFuTs_Impl {
             }
         }
         BOOL(1)
+    }
+
+    /// 【按住Ctrl调频 2026-11】模态键路分派（dispatch 咽喉调用；模块
+    /// 注释见 freq_enter 前）：
+    /// · Ctrl（0x11）落下 → 进入模态（不满足条件回落原路径）；抬起 →
+    ///   退出模态。均直通宿主（BOOL(0)）——Ctrl 是纯修饰键，宿主侧
+    ///   语义（快捷键组合基座）不变；
+    /// · 模态中 Shift（0x10）落下/抬起 → 删词子模式开/关（清拾起），
+    ///   并拦截 Shift 单击判定通道（模态中的 Shift 不是中英切换）；
+    /// · 模态中主排数字（0x30-0x39）落下 → Test 层直执行（拾起/对调/
+    ///   删除；80ms 同 vk 去重挡 KeyDown 二次到达），BOOL(1) 防宿主
+    ///   自产数字；抬起直通。
+    /// 返回 None = 非模态键/模态未激活，走原路径。
+    fn freq_modal_key(&self, wparam: usize, up: bool) -> Option<BOOL> {
+        if wparam == 0x11 {
+            if !up {
+                if freq_enter(&self.shared) {
+                    return Some(BOOL(0));
+                }
+                return None;
+            }
+            let was = self
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .freq_active;
+            if was {
+                freq_exit(&self.shared);
+                return Some(BOOL(0));
+            }
+            return None;
+        }
+        let (active, ctrl_physical) = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (g.freq_active, g.freq_ctrl_physical)
+        };
+        if !active {
+            return None;
+        }
+        // 【僵尸模态防线】模态中任何**非 Ctrl** 键到达而物理 Ctrl 已松
+        //（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。仅对物
+        // 理进入的模态有效（纯 Test 注入宿主的松开语义在 TestUp 层）。
+        if wparam != 0x11
+            && ctrl_physical
+            && unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } == 0
+        {
+            freq_exit(&self.shared);
+            return None;
+        }
+        match wparam {
+            0x10 => {
+                freq_set_delete(&self.shared, !up);
+                Some(BOOL(0))
+            }
+            0x30..=0x39 => {
+                if up {
+                    // 数字抬起：直通吞掉（不走旧路径 composing 分支）
+                    return Some(BOOL(0));
+                }
+                // '0'=第 10 候选（rank_key_index 同口径）
+                let idx = if wparam == 0x30 {
+                    9
+                } else {
+                    (wparam - 0x31) as usize
+                };
+                let dup = {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let d = matches!(&g.freq_last_digit, Some((vk, t))
+                        if *vk == wparam && t.elapsed().as_millis() < 80);
+                    if !d {
+                        g.freq_last_digit = Some((wparam, std::time::Instant::now()));
+                    }
+                    d
+                };
+                if !dup {
+                    freq_digit(&self.shared, idx);
+                }
+                Some(BOOL(1))
+            }
+            _ => None,
+        }
     }
 
     /// 【七十六修·键盘层回删+注入】宿主 TSF ShiftStart 静默不动（WinForms/

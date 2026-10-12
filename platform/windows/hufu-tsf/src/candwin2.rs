@@ -19,7 +19,9 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
 use windows_core::PCWSTR;
@@ -696,6 +698,109 @@ unsafe fn cand_menu_refresh(resp: &Value) {
     }
 }
 
+/// 【按住Ctrl调频 2026-11】调频/删词动作后的重绘（cand_menu_refresh
+/// 同款三步：last_show/cand_sig_last 同步 + 手动同参 show + 归还
+/// cand2），三点差异：
+/// ① 不 snap_anims——尺寸可能变化（删词少一行），走 size_anim 拉伸；
+/// ② swap=Some((i,j)) 臂对调滑动（横排 x 插值/竖排双格强调底），
+///   del=Some((i,旧列表)) 臂删除塌缩（动效期 show 渲染旧列表）；
+///   时长按动效速度滑条缩放（0=瞬跳不臂）；
+/// ③ 窗口已在模态（set_freq_view 先行）——show 自动带提示行/强调色。
+pub(crate) unsafe fn freq_result_refresh(
+    state: &Value,
+    swap: Option<(usize, usize)>,
+    del_old: Option<(usize, &[(String, String)])>,
+) {
+    unsafe {
+        let Some(state) = state.get("state") else {
+            return;
+        };
+        let cands: Vec<(String, String)> = state
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|c| {
+                        (
+                            c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            c.get("comment").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw = state
+            .get("raw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        crate::tsf::trace(&format!(
+            "cw2: freq_refresh cands={} raw={raw:?} sel={sel} swap={swap:?} del={}",
+            cands.len(),
+            del_old.is_some()
+        ));
+        if let Some(gsh) = crate::tsf::G_SHARED.get() {
+            let shared = gsh.0.clone();
+            let (mut cand2, skin, caret, fv) = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                // 新序写 last_show（110ms 轮询签名同步防打架——与
+                // cand_menu_refresh 同款铁律）；动效旧序只活在窗口侧。
+                g.last_show = Some((cands.clone(), raw.clone(), sel));
+                g.cand_sig_last = crate::tsf::state_sig(state);
+                (
+                    g.cand2.take(),
+                    g.skin.clone(),
+                    g.caret,
+                    (
+                        g.freq_active,
+                        g.freq_delete,
+                        g.freq_pick,
+                        g.freq_pick_text.clone(),
+                    ),
+                )
+            };
+            if let Some(c) = cand2.as_mut() {
+                // 先同步模态视图（拾起环跟到新槽位/提示行换词），再臂
+                // 动效、show——单次渲染出全效果
+                c.set_freq_view(fv.0, fv.1, fv.2, &fv.3);
+                let spd = c.anim_spd.get().max(0.0);
+                let now = std::time::Instant::now();
+                if spd > 0.01 {
+                    if let Some((i, j)) = swap {
+                        let dur = (170.0 / spd) as u32;
+                        c.freq_swap.set(Some((i, j, now, dur.max(40))));
+                    }
+                    if let Some((i, old)) = del_old {
+                        let dur = (160.0 / spd) as u32;
+                        *c.freq_del.borrow_mut() = Some((i, old.to_vec(), now, dur.max(40)));
+                    }
+                }
+                // 模态帧渲染口径与打字帧一致：inline 开=真编码不画
+                //（提示行占编码位，模态由 freq view 提供）。
+                let inline_on = skin
+                    .pointer("/skin/layout/inline_preedit")
+                    .or_else(|| skin.pointer("/layout/inline_preedit"))
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let raw_disp = if !inline_on { raw.clone() } else { String::new() };
+                c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+                anim_tick_arm(c.hwnd);
+            }
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match (g.cand2.take(), cand2) {
+                (None, mine) => g.cand2 = mine,
+                (Some(newer), Some(mut mine)) => {
+                    mine.hide();
+                    g.cand2 = Some(newer);
+                }
+                (Some(newer), None) => g.cand2 = Some(newer),
+            }
+        }
+    }
+}
+
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
 /// 【排查中】用户实测「正常应用里点击候选框导致应用卡死」——本过程
 /// 记录点击/移动消息到达与时刻，卡死复现后由日志定位卡点。
@@ -1319,6 +1424,123 @@ pub(crate) fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
 
 // ── 窗口本体 ──
 
+/// 【按住Ctrl调频 2026-11】候选窗模态渲染态（窗口侧快照，RefCell 存储
+/// ——pick_text 携带 String）：
+/// del=删词子模式（Ctrl+Shift 同按）、pick=拾起的页内下标、pick_text=
+/// 拾起词文本（提示行文案）、t0=进入时刻、pick_at=拾起时刻（脉冲基准）。
+#[derive(Clone, PartialEq)]
+pub(crate) struct FreqView {
+    pub(crate) del: bool,
+    pub(crate) pick: Option<usize>,
+    pub(crate) pick_text: String,
+    pub(crate) t0: std::time::Instant,
+    pub(crate) pick_at: Option<std::time::Instant>,
+}
+
+/// 【按住Ctrl调频 2026-11】模态提示行文案（占编码行位置渲染；模态期
+/// 引擎编码恒不画——T8 铁律不破，提示是模式文案非编码）。序号显示与
+/// 候选标签同口径（1 基 i+1）。
+pub(crate) fn freq_hint_text(fv: &FreqView) -> String {
+    if fv.del {
+        "✕ 删词：按数字删除候选，松开 Ctrl 结束".to_string()
+    } else {
+        match fv.pick {
+            Some(i) => {
+                format!("⇄ 已选 {}「{}」→ 按目标数字对调（同号取消）", i + 1, fv.pick_text)
+            }
+            None => "⇄ 调频：按数字选词，再按数字对调（松开 Ctrl 结束）".to_string(),
+        }
+    }
+}
+
+/// 【按住Ctrl调频·拾起环】拾起候选的强调描边：外扩 (1-pulse)·3px 的
+/// 圆角环由外向内收拢（150ms 脉冲）+ 低透强调底衬。非模态调用无效果
+///（brush=None）。
+unsafe fn freq_pick_ring(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    brush: Option<&ID2D1SolidColorBrush>,
+    pulse: f32,
+    radius: f32,
+) {
+    if let Some(b) = brush {
+        let out = (1.0 - pulse.clamp(0.0, 1.0)) * 3.0;
+        // 低透底衬
+        if let Ok(ub) = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.85,
+                b: 0.5,
+                a: 0.10,
+            },
+            None,
+        ) {
+            let rr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                radiusX: radius * 0.7,
+                radiusY: radius * 0.7,
+            };
+            ctx.FillRoundedRectangle(&rr, &ub);
+        }
+        // 收拢描边环
+        let rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: rect.left - out,
+                top: rect.top - out,
+                right: rect.right + out,
+                bottom: rect.bottom + out,
+            },
+            radiusX: radius + out,
+            radiusY: radius + out,
+        };
+        ctx.DrawRoundedRectangle(&rr, b, 1.8, None);
+    }
+}
+
+/// 【按住Ctrl调频·对调指示】交换双格的强调底衬（交换进行中 1-k 淡出
+/// ——横排滑动/竖排内容互换都由此给出「这两格在动」的读数）。
+unsafe fn freq_swap_tint(
+    ctx: &ID2D1DeviceContext,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    brush: Option<&ID2D1SolidColorBrush>,
+    k: f32,
+) {
+    let _ = brush;
+    let a = (1.0 - k.clamp(0.0, 1.0)) * 0.16;
+    if a <= 0.01 {
+        return;
+    }
+    if let Ok(b) = ctx.CreateSolidColorBrush(
+        &D2D1_COLOR_F {
+            r: 1.0,
+            g: 0.78,
+            b: 0.35,
+            a,
+        },
+        None,
+    ) {
+        let rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
+            radiusX: 5.0,
+            radiusY: 5.0,
+        };
+        ctx.FillRoundedRectangle(&rr, &b);
+    }
+}
+
 pub struct CandidateWindowV2 {
     pub(crate) hwnd: HWND,
     ctx: Option<ID2D1DeviceContext>,
@@ -1546,6 +1768,19 @@ pub struct CandidateWindowV2 {
     /// （展开后保持到组段结束）。抑制期空注释参与布局——列宽自然收起，
     /// 渲染路径零改动；兼防连打期长注释的窗宽抖动。
     pub(crate) comments_expanded: bool,
+    /// 【按住Ctrl调频 2026-11】模态渲染态：Some=调频/删词模态中（提示行
+    /// 占编码行、序号强调色、拾起环在渲染层生效）；None=普通态。
+    pub(crate) freq: std::cell::RefCell<Option<FreqView>>,
+    /// 【按住Ctrl调频】模态配色淡变窗：(目标态, 起始时刻)——进入/退出/
+    /// 子模式切换时重启；渲染层按进度插值强调色（琥珀/红）透明度。
+    pub(crate) freq_fade: std::cell::Cell<Option<(bool, std::time::Instant)>>,
+    /// 【按住Ctrl调频·对调动效】(页内 i, 页内 j, 起始, 时长 ms)：交换后
+    /// 两词从旧槽位滑到新槽位（横排 x / 竖排 y 插值），完成自清。
+    pub(crate) freq_swap: std::cell::Cell<Option<(usize, usize, std::time::Instant, u32)>>,
+    /// 【按住Ctrl调频·删除动效】(页内下标, 旧列表快照, 起始, 时长 ms)：
+    /// 动效期渲染旧列表——被删词红闪+塌缩、后续词滑移补位；完成落真
+    /// 列表自清（show 咽喉处置换）。
+    pub(crate) freq_del: std::cell::RefCell<Option<(usize, Vec<(String, String)>, std::time::Instant, u32)>>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -1828,6 +2063,10 @@ impl CandidateWindowV2 {
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
                 comments_expanded: true,
+                freq: std::cell::RefCell::new(None),
+                freq_fade: std::cell::Cell::new(None),
+                freq_swap: std::cell::Cell::new(None),
+                freq_del: std::cell::RefCell::new(None),
             })
         }
     }
@@ -2006,6 +2245,10 @@ impl CandidateWindowV2 {
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
                 comments_expanded: true,
+                freq: std::cell::RefCell::new(None),
+                freq_fade: std::cell::Cell::new(None),
+                freq_swap: std::cell::Cell::new(None),
+                freq_del: std::cell::RefCell::new(None),
             })
         }
     }
@@ -2392,6 +2635,68 @@ impl CandidateWindowV2 {
         r
     }
 
+    /// 【按住Ctrl调频 2026-11】TSF 层推送模态逻辑态 → 窗口渲染态快照 +
+    /// 淡变/脉冲起臂。active=模态开关、del=删词子模式、pick/pick_text=
+    /// 拾起的页内下标与词。进/退/子模式切换重启配色淡变窗；拾起变化只
+    /// 起脉冲（不闪配色）。任何变化重臂动效 tick（淡变 120ms / 脉冲
+    /// 150ms 内需要逐帧重绘）。
+    pub fn set_freq_view(&mut self, active: bool, del: bool, pick: Option<usize>, pick_text: &str) {
+        let prev = self.freq.borrow().clone();
+        let now = std::time::Instant::now();
+        let next = if active {
+            let t0 = prev.as_ref().map(|p| p.t0).unwrap_or(now);
+            let pick_changed = prev.as_ref().map(|p| p.pick) != Some(pick);
+            Some(FreqView {
+                del,
+                pick,
+                pick_text: pick_text.to_string(),
+                t0,
+                pick_at: pick_changed.then_some(now),
+            })
+        } else {
+            None
+        };
+        let mode_changed = prev.as_ref().map(|p| p.del) != next.as_ref().map(|p| p.del)
+            || prev.is_some() != next.is_some();
+        let changed = prev != next;
+        if mode_changed {
+            self.freq_fade.set(Some((active, now)));
+        }
+        if changed || mode_changed {
+            // 退场配色淡变 + 行收起/展开（size_anim）+ 拾起脉冲都需要 tick
+            anim_tick_arm(self.hwnd);
+        }
+        *self.freq.borrow_mut() = next;
+    }
+
+    /// 【按住Ctrl调频】模态动效是否在途（tick 保活判据）：淡变窗、对调
+    /// 滑动、删除塌缩、拾起脉冲任一未完即 true。
+    pub(crate) fn freq_anim_busy(&self) -> bool {
+        if let Some((_, t0)) = self.freq_fade.get() {
+            if t0.elapsed().as_millis() < 140 {
+                return true;
+            }
+        }
+        if let Some((_, _, t0, dur)) = self.freq_swap.get() {
+            if t0.elapsed().as_millis() < dur as u128 {
+                return true;
+            }
+        }
+        if let Some((_, _, t0, dur)) = self.freq_del.borrow().as_ref() {
+            if t0.elapsed().as_millis() < *dur as u128 {
+                return true;
+            }
+        }
+        if let Some(fv) = self.freq.borrow().as_ref() {
+            if let Some(pa) = fv.pick_at {
+                if pa.elapsed().as_millis() < 160 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 【右键调频帧专用 2026-10-07·三修】只瞬跳**位置**；**尺寸动画
     /// 照常跑**。二修把尺寸动画也掐了——尺寸终态由动画 tick 负责应用
     ///（连带重渲染圆角位图），掐掉=删词后窗不缩（空白块）+旧位图拉
@@ -2453,6 +2758,53 @@ impl CandidateWindowV2 {
             _raw_req
         } else {
             ""
+        };
+        // 【按住Ctrl调频 2026-11】模态渲染态注入：
+        // 1) 提示行占编码行（模态期引擎编码恒不画，T8 铁律不破——提示
+        //    是模式文案非编码；宽度测量/布局照常走编码行通道）；
+        // 2) 删除动效期内渲染旧列表（被删词红闪+塌缩，完成自动落真
+        //    列表——show 是所有渲染车道咽喉，在此置换=全车道一致）。
+        let freq_view = self.freq.borrow().clone();
+        let freq_fade = self.freq_fade.get();
+        // 模态配色进度（0=普通色 1=强调色）：进入向 1、退出向 0，ease-out
+        let freq_a = match freq_fade {
+            Some((to_active, t0)) => {
+                let dur = 120u32;
+                let e = (t0.elapsed().as_millis() as f32 / dur as f32).min(1.0);
+                let lin = if to_active { e } else { 1.0 - e };
+                1.0 - (1.0 - lin) * (1.0 - lin)
+            }
+            None => {
+                if freq_view.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        };
+        let cands_del_owned: Vec<(String, String)>;
+        let cands: &[(String, String)] = {
+            let mut del = self.freq_del.borrow_mut();
+            match del.as_ref() {
+                Some((_, old, t0, dur)) if t0.elapsed().as_millis() < *dur as u128 => {
+                    cands_del_owned = old.clone();
+                    &cands_del_owned
+                }
+                _ => {
+                    if del.is_some() {
+                        *del = None;
+                    }
+                    cands
+                }
+            }
+        };
+        // 提示行（模态中）替换编码行内容；raw 此后即提示文案。
+        let freq_hint_owned: String;
+        let raw: &str = if let Some(fv) = &freq_view {
+            freq_hint_owned = freq_hint_text(fv);
+            &freq_hint_owned
+        } else {
+            raw
         };
         // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
         // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
@@ -3070,7 +3422,9 @@ impl CandidateWindowV2 {
             // 值 + 「.」字形尾部侧空 + 汉字墨盒头部侧空，视觉 ≈6-8px
             // 偏松——收紧为紧贴值）。
             let n_show = cands.len().min(10);
-            if show_index && n_show > 0 {
+            // 【按住Ctrl调频 2026-11】模态中强制显示序号（皮肤关序号时
+            // 调频/删词无从指位——数字键语义必须有可见编号）。
+            if (show_index || freq_view.is_some()) && n_show > 0 {
                 let wmax = measure(&tf_label, &fmt_label(n_show));
                 label_w = label_w.max(wmax + hsp);
             }
@@ -3085,7 +3439,7 @@ impl CandidateWindowV2 {
                     measure(&tf_small, c.as_str())
                 };
                 // 本格序号宽（label_format 格式化实测 + hsp 紧贴间距）：横排正文紧跟序号
-                let iw = if show_index && i < 10 {
+                let iw = if (show_index || freq_view.is_some()) && i < 10 {
                     measure(&tf_label, &fmt_label(i + 1)).max(10.0) + hsp
                 } else {
                     0.0
@@ -3177,7 +3531,7 @@ impl CandidateWindowV2 {
                 // 受限」——虎码横排候选少时窄窗更精致，min_width(150)
                 // 让窗窄不下去；weasel 语义此处不适用，恢复纯自适应。
                 let mut w = rm_x * 2.0 + hilite_pad * 2.0;
-                if raw_w > 0.0 {
+                if raw_w > 0.0 && freq_view.is_none() {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
                 }
                 for (_i, (tw, cw, iw)) in cand_ws.iter().enumerate() {
@@ -3276,7 +3630,11 @@ impl CandidateWindowV2 {
         let cmt_disp = geo.0;
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
-        let code_row = if raw.is_empty() || horizontal {
+        // 【按住Ctrl调频 2026-11】模态提示行恒占独立行（横排也是——
+        // 提示文案较长，与候选同行会把候选推得很远）。
+        let code_row = if freq_view.is_some() {
+            1.0
+        } else if raw.is_empty() || horizontal {
             0.0
         } else {
             1.0
@@ -4044,10 +4402,74 @@ impl CandidateWindowV2 {
                 // 采集后与 (dpi, shadow_m) 一并落 CAND_HIT*/静态缓存，
                 // 供 wndproc 0x204 客户端像素→逻辑坐标命中换算。
                 let mut hit_rows: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(cands.len().min(10));
+                // 【按住Ctrl调频 2026-11】模态渲染（画刷/动效因子在此统
+                // 一制备，编码行提示与候选行共用）：引擎高亮胶囊让位——
+                // 选中概念换成「拾起」环（模态是重排态，旧高亮位已无
+                // 「将上屏」语义）；序号换强调色（琥珀=调频/红=删词，
+                // freq_a 淡变插值）。
+                let sel = if freq_view.is_some() {
+                    usize::MAX
+                } else {
+                    selected.min(cands.len().saturating_sub(1))
+                };
+                let freq_fv = freq_view.as_ref();
+                let (b_freq_txt, b_freq_lbl, pick_pulse, swap_pair, swap_k, del_idx, del_k) =
+                    if let Some(fv) = freq_fv {
+                        let (r, g, b) = if fv.del {
+                            (1.0f32, 0.36, 0.36) // 删词红
+                        } else {
+                            (1.0f32, 0.72, 0.26) // 调频琥珀
+                        };
+                        let bt = ctx
+                            .CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a: freq_a }, None)
+                            .ok();
+                        let bl = ctx
+                            .CreateSolidColorBrush(
+                                &D2D1_COLOR_F { r, g, b, a: freq_a * 0.9 },
+                                None,
+                            )
+                            .ok();
+                        // 拾起脉冲进度（0→1；完成即恒 1）
+                        let pulse = fv
+                            .pick_at
+                            .map(|pa| (pa.elapsed().as_millis() as f32 / 150.0).min(1.0))
+                            .unwrap_or(1.0);
+                        // 对调动效：ease-out 进度（0=旧槽位 1=新槽位）
+                        let (sp, k) = match self.freq_swap.get() {
+                            Some((a, b, t0, dur)) if t0.elapsed().as_millis() < dur as u128 => {
+                                let e = (t0.elapsed().as_millis() as f32 / dur.max(1) as f32)
+                                    .min(1.0);
+                                (Some((a, b)), 1.0 - (1.0 - e) * (1.0 - e))
+                            }
+                            Some(_) => {
+                                self.freq_swap.set(None);
+                                (None, 1.0)
+                            }
+                            None => (None, 1.0),
+                        };
+                        // 删除塌缩进度（0=全宽 1=收尽）
+                        let (di, dk) = {
+                            let d = self.freq_del.borrow();
+                            match d.as_ref() {
+                                Some((i, _, t0, dur))
+                                    if t0.elapsed().as_millis() < *dur as u128 =>
+                                {
+                                    let e = (t0.elapsed().as_millis() as f32 / (*dur).max(1) as f32)
+                                        .min(1.0);
+                                    (Some(*i), e)
+                                }
+                                _ => (None, 0.0),
+                            }
+                        };
+                        (bt, bl, pulse, sp, k, di, dk)
+                    } else {
+                        (None, None, 1.0, None, 1.0, None, 0.0)
+                    };
                 // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
                 let draw_content = !(stage >= 1 && stage <= 4);
                 if draw_content {
                     // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
+                    // 【按住Ctrl调频 2026-11】模态期此行即提示行——强调色。
                     if !raw.is_empty() {
                         // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
                         if let Some(bg) = &b_preedit_bg {
@@ -4063,6 +4485,8 @@ impl CandidateWindowV2 {
                             };
                             ctx.FillRoundedRectangle(&rr, bg);
                         }
+                        let b_hint: &Option<ID2D1SolidColorBrush> =
+                            if freq_fv.is_some() { &b_freq_txt } else { &b_raw };
                         draw(
                             &ctx,
                             &tf,
@@ -4071,7 +4495,7 @@ impl CandidateWindowV2 {
                             rm_y + dy,
                             width - rm_x * 2.0,
                             row_h,
-                            &b_raw,
+                            b_hint,
                         );
                     }
                     // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
@@ -4093,19 +4517,71 @@ impl CandidateWindowV2 {
                     };
 
                     // 候选行
-                    let sel = selected.min(cands.len().saturating_sub(1));
                     if horizontal {
                         // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
                         // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
-                        let mut x =
-                            rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
+                        // 【按住Ctrl调频 2026-11】模态提示独立成行（raw_w 不
+                        // 推候选右移）；槽位 x 预计算——对调动效需槽位起点
+                        // 插值、删除塌缩需按 (1-k) 收缩推进。
+                        let n_draw = cands.len().min(10);
+                        let raw_off =
+                            if raw_w > 0.0 && freq_view.is_none() { raw_w + 10.0 } else { 0.0 };
+                        let cell_w_of = |i: usize| -> f32 {
+                            let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                            iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 }
+                        };
+                        let scale_of = |i: usize| -> f32 {
+                            if Some(i) == del_idx { 1.0 - del_k } else { 1.0 }
+                        };
+                        // 现序槽位（删除塌缩推进）
+                        let mut xs: Vec<f32> = Vec::with_capacity(n_draw);
+                        {
+                            let mut x = rm_x + hilite_pad + raw_off;
+                            for i in 0..n_draw {
+                                if i > 0 {
+                                    x += cand_spacing;
+                                }
+                                xs.push(x);
+                                x += cell_w_of(i) * scale_of(i);
+                            }
+                        }
+                        // 旧序槽位（对调前：两格宽度互换重排——起点精确）
+                        let xs_old: Vec<f32> = match swap_pair {
+                            Some((a, b)) if a < n_draw && b < n_draw => {
+                                let mut v: Vec<f32> = Vec::with_capacity(n_draw);
+                                let mut x = rm_x + hilite_pad + raw_off;
+                                for i in 0..n_draw {
+                                    if i > 0 {
+                                        x += cand_spacing;
+                                    }
+                                    v.push(x);
+                                    let wsrc = if i == a {
+                                        b
+                                    } else if i == b {
+                                        a
+                                    } else {
+                                        i
+                                    };
+                                    x += cell_w_of(wsrc);
+                                }
+                                v
+                            }
+                            _ => Vec::new(),
+                        };
                         let y = y0;
-                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        for i in 0..n_draw {
+                            let (text, _) = &cands[i];
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                             let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
                             let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
-                            if i > 0 {
-                                x += cand_spacing;
+                            // 对调动效：从旧槽位滑到新槽位（ease-out）
+                            let mut x = xs[i];
+                            if let Some((a, b)) = swap_pair {
+                                if i == a && b < xs_old.len() {
+                                    x = xs_old[b] + (xs[i] - xs_old[b]) * swap_k;
+                                } else if i == b && a < xs_old.len() {
+                                    x = xs_old[a] + (xs[i] - xs_old[a]) * swap_k;
+                                }
                             }
                             if i == sel {
                                 if let Some(b) = &b_hi {
@@ -4153,13 +4629,62 @@ impl CandidateWindowV2 {
                                     }
                                 }
                             }
+                            // 【按住Ctrl调频】模态：序号换强调色；删除词
+                            // 濒死淡出（红 + alpha 随塌缩衰减）
+                            let dying = Some(i) == del_idx;
+                            let b_die: Option<ID2D1SolidColorBrush> = if dying {
+                                ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.42,
+                                        b: 0.42,
+                                        a: (1.0 - del_k).clamp(0.0, 1.0),
+                                    },
+                                    None,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
                             let (bt, bl, bc) = if i == sel {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
                             };
+                            let bl_use: &Option<ID2D1SolidColorBrush> = if dying {
+                                &b_die
+                            } else if freq_fv.is_some() {
+                                &b_freq_lbl
+                            } else {
+                                bl
+                            };
+                            // 删除红闪（塌缩前段峰值）
+                            if dying && del_k < 1.0 {
+                                let flash = (1.0 - del_k) * (1.0 - (del_k * 2.2).min(1.0));
+                                if let Ok(rb) = ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.3,
+                                        b: 0.3,
+                                        a: 0.32 * flash,
+                                    },
+                                    None,
+                                ) {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: x,
+                                            top: y,
+                                            right: x + cell_w * (1.0 - del_k),
+                                            bottom: y + row_h,
+                                        },
+                                        radiusX: 4.0,
+                                        radiusY: 4.0,
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, &rb);
+                                }
+                            }
                             let mut cx = x;
-                            if show_index {
+                            if show_index || freq_fv.is_some() {
                                 draw(
                                     &ctx,
                                     &tf_label,
@@ -4168,7 +4693,7 @@ impl CandidateWindowV2 {
                                     y + dy,
                                     iw,
                                     row_h,
-                                    bl,
+                                    bl_use,
                                 );
                                 cx += iw;
                             }
@@ -4177,19 +4702,50 @@ impl CandidateWindowV2 {
                             if !cmt.is_empty() && cw > 0.0 {
                                 draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
                             }
+                            // 【按住Ctrl调频·拾起环】拾起候选描边脉冲（外扩
+                            // 3px→贴格），内衬低透强调底
+                            if let Some(fv) = freq_fv {
+                                if fv.pick == Some(i) {
+                                    let rr = D2D_RECT_F {
+                                        left: x,
+                                        top: y,
+                                        right: x + cell_w,
+                                        bottom: y + row_h,
+                                    };
+                                    freq_pick_ring(
+                                        &ctx, rr, b_freq_txt.as_ref(), pick_pulse, radius,
+                                    );
+                                }
+                                // 对调双格强调底（横排滑动中同步插值透明度）
+                                if let Some((a, b)) = swap_pair {
+                                    if i == a || i == b {
+                                        freq_swap_tint(&ctx, x, y, cell_w, row_h, b_freq_txt.as_ref(), swap_k);
+                                    }
+                                }
+                            }
                             hit_rows.push((
-                                x - if i > 0 { cand_spacing * 0.5 } else { 0.0 },
+                                xs[i] - if i > 0 { cand_spacing * 0.5 } else { 0.0 },
                                 y0,
-                                x + cell_w + cand_spacing * 0.5,
+                                xs[i] + cell_w + cand_spacing * 0.5,
                                 y0 + row_h,
                             ));
-                            x += cell_w;
                         }
                     } else {
                         // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
-                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        // 【按住Ctrl调频 2026-11】删除塌缩：被删行行槽按
+                        // (1-k) 收缩，后续行上移补位（与横排同读数）。
+                        let n_draw_v = cands.len().min(10);
+                        let mut y_run = y0;
+                        for i in 0..n_draw_v {
+                            let (text, _) = &cands[i];
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                            let y = y0 + (row_h + cand_spacing) * i as f32;
+                            let row_scale = if Some(i) == del_idx {
+                                1.0 - del_k
+                            } else {
+                                1.0
+                            };
+                            let y = y_run;
+                            let row_h_eff = row_h * row_scale;
                             hit_rows.push((rm_x, y, width - rm_x, y + row_h));
                             if i == sel {
                                 // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
@@ -4241,12 +4797,60 @@ impl CandidateWindowV2 {
                                     }
                                 }
                             }
+                            // 【按住Ctrl调频】模态：序号强调色；删除词濒死淡出
+                            let dying = Some(i) == del_idx;
+                            let b_die: Option<ID2D1SolidColorBrush> = if dying {
+                                ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.42,
+                                        b: 0.42,
+                                        a: (1.0 - del_k).clamp(0.0, 1.0),
+                                    },
+                                    None,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
                             let (bt, bl, bc) = if i == sel {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
                             };
-                            if show_index {
+                            let bl_use: &Option<ID2D1SolidColorBrush> = if dying {
+                                &b_die
+                            } else if freq_fv.is_some() {
+                                &b_freq_lbl
+                            } else {
+                                bl
+                            };
+                            // 删除红闪
+                            if dying && del_k < 1.0 {
+                                let flash = (1.0 - del_k) * (1.0 - (del_k * 2.2).min(1.0));
+                                if let Ok(rb) = ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.3,
+                                        b: 0.3,
+                                        a: 0.32 * flash,
+                                    },
+                                    None,
+                                ) {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: rm_x,
+                                            top: y,
+                                            right: width - rm_x,
+                                            bottom: y + row_h_eff,
+                                        },
+                                        radiusX: 4.0,
+                                        radiusY: 4.0,
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, &rb);
+                                }
+                            }
+                            if show_index || freq_fv.is_some() {
                                 draw(
                                     &ctx,
                                     &tf_label,
@@ -4255,7 +4859,7 @@ impl CandidateWindowV2 {
                                     y + dy,
                                     label_w,
                                     row_h,
-                                    bl,
+                                    bl_use,
                                 );
                             }
                             draw(
@@ -4280,6 +4884,36 @@ impl CandidateWindowV2 {
                                     bc,
                                 );
                             }
+                            // 【按住Ctrl调频】拾起环 + 对调双格强调底
+                            if let Some(fv) = freq_fv {
+                                if fv.pick == Some(i) {
+                                    let rr = D2D_RECT_F {
+                                        left: rm_x,
+                                        top: y,
+                                        right: width - rm_x,
+                                        bottom: y + row_h_eff,
+                                    };
+                                    freq_pick_ring(&ctx, rr, b_freq_txt.as_ref(), pick_pulse, radius);
+                                }
+                                if let Some((a, b)) = swap_pair {
+                                    if i == a || i == b {
+                                        freq_swap_tint(
+                                            &ctx,
+                                            rm_x,
+                                            y,
+                                            width - rm_x * 2.0,
+                                            row_h_eff,
+                                            b_freq_txt.as_ref(),
+                                            swap_k,
+                                        );
+                                    }
+                                }
+                            }
+                            y_run += row_h_eff + if i + 1 < n_draw_v {
+                                cand_spacing
+                            } else {
+                                0.0
+                            };
                         }
                     }
 
@@ -6475,6 +7109,79 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
+            }
+        }
+        // 【按住Ctrl调频 2026-11·tick 保活与安全兜底】
+        // ① 模态动效在途（淡变/对调滑动/删除塌缩/拾起脉冲）：帧率门控
+        //    复渲染 + 保活 tick（同 hl_anim 模式：完成在渲染内自清）；
+        // ② 兜底退出：模态正常由 tsf dispatch 的 Ctrl KeyUp 退出，但
+        //    KeyUp 可能被宿主吞——tick 侧 GetAsyncKeyState 轮询 Ctrl
+        //    物理态（350ms 宽限防误杀）+ 窗口隐没即退。物理轮询仅对
+        //    「物理进入」的模态有效（freq_ctrl_physical——纯 Test 注入
+        //    宿主无物理态，退出交 TestUp/下一键层）；模态静止期也保活
+        //    tick（轮询本身就是 tick 存在的理由）。
+        //    退出动作在**本闭包持有的 c** 上就地完成（不能走 tsf 的
+        //    freq_exit helper——那会重取 cand2 与本闭包打架）。
+        let freq_modal = c.freq.borrow().is_some();
+        let freq_busy = c.freq_anim_busy();
+        if freq_modal || freq_busy {
+            let (fv_age, ctrl_physical) = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    c.freq
+                        .borrow()
+                        .as_ref()
+                        .map(|fv| fv.t0.elapsed().as_millis())
+                        .unwrap_or(0),
+                    g.freq_ctrl_physical,
+                )
+            };
+            let ctrl_gone = ctrl_physical
+                && unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } == 0;
+            if !c.is_visible() || (ctrl_gone && fv_age > 350) {
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace("cw2: 调频tick兜底退出（Ctrl物理松开/窗隐）");
+                }
+                // 窗口视图就地复位（清共享旗标交 tsf 侧轮询/下一键处理；
+                // 此处不触碰 g.cand2——正在本闭包手里）
+                {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.freq_active = false;
+                    g.freq_delete = false;
+                    g.freq_pick = None;
+                    g.freq_pick_text.clear();
+                }
+                c.set_freq_view(false, false, None, "");
+                c.freq_swap.set(None);
+                *c.freq_del.borrow_mut() = None;
+                if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                }
+                // 退场淡变+行收起仍需 tick
+                anim_done = false;
+            } else if freq_busy {
+                anim_done = false;
+                let render_ok = {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(c.size_anim_last_render.get()).as_millis()
+                        >= morph_frame_interval_ms(hwnd)
+                    {
+                        c.size_anim_last_render.set(now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if c.is_visible() && render_ok {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                }
+            } else if freq_modal && ctrl_physical {
+                // 模态静止 + 物理进入：保活 tick（Ctrl 兜底轮询在身）
+                anim_done = false;
             }
         }
     }
