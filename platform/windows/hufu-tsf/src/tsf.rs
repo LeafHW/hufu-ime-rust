@@ -1467,15 +1467,21 @@ pub fn cand_interact_note() {
 //   → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
 // ─────────────────────────────────────────────────────────────────
 
-/// 模态进入（Ctrl 落下时刻调用）：无 Shift/Alt/Win 按住 + 右键菜单未开
-/// + 候选窗可见且有候选 → 置共享旗标 + 推送窗口视图（提示行入场/序号
-/// 强调淡入 + 行高 size_anim）。已激活时幂等返回 true（不重入）。
+/// 模态进入（Ctrl 落下时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
+/// 置共享旗标 + 推送窗口视图（提示行入场/序号强调淡入 + 行高 size_anim）。
+/// 已激活时幂等返回 true（不重入）。
+/// 【和弦入口 2026-11】Ctrl 落下时 Shift 已按住（旧版 Ctrl+Shift+数字
+/// 的肌肉记忆=两键齐按）不再拒绝——直接进**删词子模式**（Shift 松开
+/// 回调频）。60修切换热键对模态中的 ctrl+shift 已豁免（freq_on 门），
+/// 此路安全；系统级 Ctrl+Shift 切输入法若开着则键被系统吃掉，到不了
+/// 这里（lang sink 会收窗兜底）。Alt/Win 按住仍拒绝（AltGr/Win 组合
+/// 非调频语义）。
 fn freq_enter(shared: &SharedRef) -> bool {
     unsafe {
-        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
-        let win = GetKeyState(VK_LWIN.0 as i32) < 0 || GetKeyState(VK_RWIN.0 as i32) < 0;
-        if shift || alt || win {
+        let alt = GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0;
+        let win = GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000 != 0
+            || GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000 != 0;
+        if alt || win {
             return false;
         }
     }
@@ -1483,7 +1489,9 @@ fn freq_enter(shared: &SharedRef) -> bool {
         return false;
     }
     // 物理按住标记（tick 兜底轮询的资格证——纯 Test 注入宿主无物理态）
+    // + 和弦判定（Shift 同按 → 直接删词子模式）
     let ctrl_physical = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 } != 0;
+    let shift_held = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 } != 0;
     let ok = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.freq_active {
@@ -1499,14 +1507,17 @@ fn freq_enter(shared: &SharedRef) -> bool {
             return false;
         }
         g.freq_active = true;
-        g.freq_delete = false;
+        g.freq_delete = shift_held;
         g.freq_pick = None;
         g.freq_pick_text.clear();
         g.freq_ctrl_physical = ctrl_physical;
         true
     };
     if ok {
-        trace("freq: 按住Ctrl → 进入调频模态");
+        trace(&format!(
+            "freq: 按住Ctrl → 进入{}模态",
+            if shift_held { "删词" } else { "调频" }
+        ));
         freq_view_apply(shared);
     }
     ok

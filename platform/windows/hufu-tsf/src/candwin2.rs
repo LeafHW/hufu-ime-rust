@@ -1453,6 +1453,61 @@ pub(crate) fn freq_hint_text(fv: &FreqView) -> String {
     }
 }
 
+/// 【按住Ctrl调频·竖排定宽 2026-11】紧凑版提示：竖排定宽皮肤
+///（layout.width>0）不随提示行加宽，全量文案装不下时降级到紧凑版。
+fn freq_hint_compact(fv: &FreqView) -> String {
+    if fv.del {
+        "✕ 删词：按数字删除".to_string()
+    } else {
+        match fv.pick {
+            Some(i) => format!("⇄ 已选 {}「{}」→ 数字对调", i + 1, fv.pick_text),
+            None => "⇄ 调频：数字选词→对调".to_string(),
+        }
+    }
+}
+
+/// 【按住Ctrl调频·提示行自适应 2026-11】按可用宽选文案：全量 → 紧凑
+/// → 紧凑版尾部 … 截断（单行不换行不裁切——竖排定宽皮肤提示「只显
+/// 示一部分」的根治）。测量与 show 主测量同口径（CreateTextLayout
+/// 实宽；tf 缺失退紧凑版不截断）。
+fn freq_hint_fit(
+    dwrite: &Option<IDWriteFactory>,
+    tf: &Option<IDWriteTextFormat>,
+    fv: &FreqView,
+    max_w: f32,
+) -> String {
+    let full = freq_hint_text(fv);
+    let compact = freq_hint_compact(fv);
+    let w = |s: &str| -> Option<f32> {
+        let (d, fmt) = (dwrite.as_ref()?, tf.as_ref()?);
+        let ws: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let l = d.CreateTextLayout(&ws, fmt, 4096.0, 100.0).ok()?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            l.GetMetrics(&mut m).ok()?;
+            Some(m.width.ceil())
+        }
+    };
+    if w(&full).map_or(true, |x| x <= max_w) {
+        return full;
+    }
+    if w(&compact).map_or(true, |x| x <= max_w) {
+        return compact;
+    }
+    let mut out = compact;
+    loop {
+        if out.is_empty() {
+            return String::new();
+        }
+        out.pop();
+        let mut t = out.clone();
+        t.push('…');
+        if w(&t).map_or(true, |x| x <= max_w) {
+            return t;
+        }
+    }
+}
+
 /// 【按住Ctrl调频·拾起环】拾起候选的强调描边：外扩 (1-pulse)·3px 的
 /// 圆角环由外向内收拢（150ms 脉冲）+ 低透强调底衬。非模态调用无效果
 ///（brush=None）。
@@ -4485,12 +4540,26 @@ impl CandidateWindowV2 {
                             };
                             ctx.FillRoundedRectangle(&rr, bg);
                         }
+                        // 【按住Ctrl调频·提示行自适应】全量→紧凑→…截断
+                        //（竖排定宽皮肤单行装不下全量文案的根治）
+                        let hint_fit;
+                        let raw_draw: &str = if let Some(fv) = freq_fv {
+                            hint_fit = freq_hint_fit(
+                                &self.dwrite,
+                                &tf,
+                                fv,
+                                (width - rm_x * 2.0).max(20.0),
+                            );
+                            hint_fit.as_str()
+                        } else {
+                            raw.as_str()
+                        };
                         let b_hint: &Option<ID2D1SolidColorBrush> =
                             if freq_fv.is_some() { &b_freq_txt } else { &b_raw };
                         draw(
                             &ctx,
                             &tf,
-                            raw.as_str(),
+                            raw_draw,
                             rm_x,
                             rm_y + dy,
                             width - rm_x * 2.0,
