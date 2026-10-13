@@ -2298,6 +2298,16 @@ const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
 static CAPS_PAIR_INJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static CAPS_PAIR_SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static CAPS_PAIR_INJ_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 【避让真键流 2026-10-13】最近一个真实键事件（dispatch 顶层盖戳，合成
+/// 键不盖）。补偿对只在与真键流保持距离时注入——EmEditor/WPS 实锤
+/// （trace 455/463/487/491 千四波）：caps 选重后 ~180ms 内用户真 d 在
+/// 宿主键管线里蒸发（sink 零记录），下一 caps 落空组段→锁定大写→D
+/// 连环；注入键（自动化复现）同窗无恙=宿主对物理键流的键状态机被
+/// 交错的合成对搅乱。合成对退到输入静默后（≥250ms 无真键）再进，
+/// 永不与真键同流；静默由延时复检每拍重试，用户任意停顿即补上。
+static CAPS_QUIET_LAST_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 真键静默窗（ms）：距最近真键不足此值不注入补偿对。
+const CAPS_PAIR_QUIET_MS: u64 = 250;
 /// 在飞对子最宽存活（ms）——超时按丢失结算（见上）。
 const CAPS_PAIR_STALE_MS: u64 = 1500;
 
@@ -2326,9 +2336,11 @@ fn caps_pairs_settled(now_ms: u64) -> bool {
     false
 }
 
-/// 结算守卫下的安全注入：系统大写位 ON 且无在飞对子才合成一对。
-/// 返回 true=已注入；false=未注入（位已 OFF / 在飞未落地）。
-/// 即时路（消费现场）与延时复检路共用——不变量唯一：最多一对在飞。
+/// 结算守卫下的安全注入：系统大写位 ON、无在飞对子、且真键流静默
+/// （≥CAPS_PAIR_QUIET_MS 无真实键事件）才合成一对。返回 true=已注入；
+/// false=未注入（位 OFF / 在飞未落地 / 真键流未静默）。
+/// 即时路（消费现场）与延时复检路共用——不变量唯一：最多一对在飞，
+/// 且永不与真键同流交错（EmEditor/WPS 真 d 蒸发根因，见字段注释）。
 fn caps_synth_flip_if_on(now_ms: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     unsafe {
@@ -2339,10 +2351,20 @@ fn caps_synth_flip_if_on(now_ms: u64) -> bool {
     if !caps_pairs_settled(now_ms) {
         return false; // 在飞对子未落地：此刻读到的 ON 是滞后假象，等复检
     }
+    let last_key = CAPS_QUIET_LAST_KEY.load(Relaxed);
+    if !caps_quiet_ok(now_ms, last_key) {
+        return false; // 真键流未静默：退避，复检下拍再试
+    }
     caps_synth_flip();
     CAPS_PAIR_INJ.fetch_add(1, Relaxed);
     CAPS_PAIR_INJ_AT.store(now_ms, Relaxed);
     true
+}
+
+/// 真键流静默判定（纯逻辑，单测覆盖）：从未见过真键（0）恒静默；
+/// 距最近真键 ≥QUIET_MS 才静默。
+fn caps_quiet_ok(now_ms: u64, last_key_ms: u64) -> bool {
+    last_key_ms == 0 || now_ms.saturating_sub(last_key_ms) >= CAPS_PAIR_QUIET_MS
 }
 
 /// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_flip_if_on
@@ -3174,6 +3196,9 @@ impl HuFuTs_Impl {
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
+        // 【避让真键流 2026-10-13】真实键事件盖戳（合成键在上方魔法
+        // 检查已提前返回，不会盖）：补偿对凭此判定真键流静默窗。
+        CAPS_QUIET_LAST_KEY.store(caps_now_ms(), std::sync::atomic::Ordering::Relaxed);
         // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
         // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
         // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
@@ -9993,6 +10018,16 @@ mod caps_settle_tests {
         // 未超时不动。
         reset(2, 0, 1_000_000);
         assert!(!caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS - 1));
+    }
+
+    #[test]
+    fn quiet_window_gates_injection() {
+        // 避让真键流：距最近真键不足 250ms 恒不注入（EmEditor/WPS 真 d
+        // 蒸发窗），静默后放行；从未见真键恒放行。
+        assert!(!caps_quiet_ok(1_000_250, 1_000_100), "150ms 未静默必须挡");
+        assert!(caps_quiet_ok(1_000_250, 1_000_000), "恰 250ms 静默放行");
+        assert!(caps_quiet_ok(1_000_900, 1_000_000), "静默后放行");
+        assert!(caps_quiet_ok(9, 0), "无真键记录恒放行");
     }
 }
 
