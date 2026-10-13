@@ -2407,6 +2407,14 @@ fn caps_ll_dump_reject() {
 }
 /// 泵线程私有消息：执行 F24 虚键注入。
 const CAPS_WM_VIRT: u32 = 0x8000 + 0x31; // WM_APP+0x31
+/// 【WPS extra 丢失·闩锁认领 2026-10-13】实测 WPS（CUAS/AIMM 混合宿
+/// 主）把注入键的 dwExtraInfo 在其键路由中**丢弃**——F24 对到站恒
+/// extra=0x0（8 次拦截↔8 对到站 1:1 配对，1-7ms），魔法标记识别在
+/// WPS 永远失败=「有候选按 caps 没反应」的最终根因。EmEditor 则 extra
+/// 完整存活。改闩锁计数认领：注入前 +2（down+up 各认领一次），到站
+/// 认领时 -1；魔法标记保留做零成本双保险。宿主只吃 down 丢 up 会积
+/// 压 → 钳位 8 清零（非时间窗，纯计数）。
+static CAPS_VIRT_PENDING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// UI 线程视角刷新快照（须持 Shared 锁调用；回调永不调此）。
 fn caps_snap_refresh(g: &Shared) {
@@ -2470,6 +2478,12 @@ fn caps_virt_send() {
         },
     };
     let arr = [mk(false), mk(true)];
+    // 闩锁记账：down+up 各一票（WPS 丢 extra，认领全靠它；魔法标记
+    // 仅 EmEditor 类宿主存活）。积压异常（宿主半途丢事件）钳位清零。
+    if CAPS_VIRT_PENDING.load(std::sync::atomic::Ordering::SeqCst) > 8 {
+        CAPS_VIRT_PENDING.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+    CAPS_VIRT_PENDING.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
     unsafe {
         SendInput(&arr, std::mem::size_of::<INPUT>() as i32);
     }
@@ -3054,10 +3068,19 @@ impl HuFuTs_Impl {
             let extra = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
             }.0 as usize;
-            if extra == CAPS_VIRT_MAGIC {
+            // 认领：魔法标记（EmEditor 类 extra 存活的宿主）或闩锁余票
+            //（WPS 路由丢 extra，注入前已记账）。两认领同减——账目平衡。
+            let pending = CAPS_VIRT_PENDING.load(std::sync::atomic::Ordering::SeqCst);
+            if extra == CAPS_VIRT_MAGIC || pending > 0 {
+                if pending > 0 {
+                    CAPS_VIRT_PENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 wparam = 0x14;
                 if crate::tsf::trace_on() {
-                    crate::tsf::trace("caps: F24 虚键到站 → 改姓 capslock（系统位未动）");
+                    crate::tsf::trace(&format!(
+                        "caps: F24 虚键到站 → 改姓 capslock（系统位未动；认领={}）",
+                        if extra == CAPS_VIRT_MAGIC { "标记" } else { "闩锁" }
+                    ));
                 }
             }
         }
