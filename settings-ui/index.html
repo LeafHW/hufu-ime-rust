@@ -330,7 +330,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <button id="hk-exp-rec" style="padding:4px 12px">录制</button></div>
       <button id="hk-reset" style="padding:4px 12px;align-self:flex-end">恢复默认</button>
     </div>
-    <div class="sub">有候选时按住「调频键」再按数字调频、按住「删词键」再按数字删词（两键独立，同按删词优先）。点「录制」后：按住修饰键再按普通键＝组合键；单按一个键（Ctrl / Alt / Shift / Caps…）再松开＝录入该键本身；Esc 取消。「导出码表快捷键」任意时刻可按＝按当前方案的记忆格式导出并打开目录（与托盘同路径），留空＝不启用。</div>
+    <div class="sub">有候选时按住「调频键」再按数字调频、按住「删词键」再按数字删词（两键独立，同按删词优先）。点「录制」后：按住修饰键再按普通键＝组合键；**全按修饰键再全松开＝录入该修饰组合**（如按住 Ctrl+Shift 松开即录成组合键；单按一键松开＝录入该键本身）；Esc 取消。「导出码表快捷键」任意时刻可按＝按当前方案的记忆格式导出并打开目录（与托盘同路径），留空＝不启用。</div>
     <h3>标点与外观</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="p-full"><label for="p-full">全角标点</label></div>
@@ -781,8 +781,11 @@ function bindInputs() {
     const n = hkEventName(e);
     if (!n || !n.mod) return;
     hkRec.mods.delete(n.mod);
-    if (!hkRec.sawNonMod && hkRec.mods.size === 0 && hkRec.everMods.size === 1)
-      hkFinish([n.mod]); /* 单按一键再松开＝录入该键本身（含裸修饰键/Caps） */
+    /* 修饰键全松开且没按过普通键＝录入所按修饰组合：单键=裸键
+       （Ctrl/Alt/Shift/Caps），多键=纯修饰组合（Ctrl+Shift 这类——
+       没有普通键收尾，松开即成）。 */
+    if (!hkRec.sawNonMod && hkRec.mods.size === 0 && hkRec.everMods.size >= 1)
+      hkFinish([...hkRec.everMods]);
   }
   function hkCancel() { if (hkRec) hkFinish(null); }
   function hkStart(path, inputSel, btnSel) {
