@@ -2269,13 +2269,9 @@ fn handle_set_focus(
     Ok(())
 }
 
-// 【Caps 补偿抑制窗·全局原子 2026-10-12 二次】延时复检线程不能带
-// Shared（内含 COM 裸指针非 Send）——抑制窗从 Shared 挪到进程级原子
-// 钟（unix ms）：键入口检查与即时/延时两路 arm 同一口钟。
-static CAPS_FIXUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CAPS_FIXUP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-// 延时复检代数：每次真实 Caps 击键 +1——在飞复检线程收尾比对，跑期
-// 又有新击键则延长观察（旧单飞直接弃权=快击漏修，用户实锤常亮）。
+// 【Caps 补偿·全局原子 2026-10-12 二次 → 十六修 2026-10-13】复检线程
+// 已随打字路径注入一并移除；留存的是结算计数（进程级原子钟，unix
+// ms）与魔法标记。GEN/BUSY 随复检线程下岗。
 /// 合成 Caps 翻转键的 dwExtraInfo 魔法标记（"HUFU"）——键入口只吞
 /// 带标记的合成事件，真实用户快击永不被时间窗误吞（用户实锤）。
 const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
@@ -2298,16 +2294,13 @@ const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
 static CAPS_PAIR_INJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static CAPS_PAIR_SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static CAPS_PAIR_INJ_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 【避让真键流 2026-10-13】最近一个真实键事件（dispatch 顶层盖戳，合成
-/// 键不盖）。补偿对只在与真键流保持距离时注入——EmEditor/WPS 实锤
-/// （trace 455/463/487/491 千四波）：caps 选重后 ~180ms 内用户真 d 在
-/// 宿主键管线里蒸发（sink 零记录），下一 caps 落空组段→锁定大写→D
-/// 连环；注入键（自动化复现）同窗无恙=宿主对物理键流的键状态机被
-/// 交错的合成对搅乱。合成对退到输入静默后（≥250ms 无真键）再进，
-/// 永不与真键同流；静默由延时复检每拍重试，用户任意停顿即补上。
-static CAPS_QUIET_LAST_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 真键静默窗（ms）：距最近真键不足此值不注入补偿对。
-const CAPS_PAIR_QUIET_MS: u64 = 250;
+/// 【十六修·翻转沿状态机 2026-10-13】上一拍引擎 caps_lock 快照（-1=
+/// 未见/0=off/1=on）。合成补偿对只在锁大写进出翻转沿且物理位不一致
+/// 时注入一次；打字路径（选重/功能 caps）零注入——WPS/EmEditor 的
+/// 物理键监听层会被与真键交错的合成对搅乱，把下一个物理字母在 TSF
+/// 之前截走（直插大写/蒸发→D 连环，用户对照实锤；QQ/记事本无此
+/// 监听不受害）。
+static CAPS_PREV_LOCK: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 /// 在飞对子最宽存活（ms）——超时按丢失结算（见上）。
 const CAPS_PAIR_STALE_MS: u64 = 1500;
 
@@ -2336,24 +2329,23 @@ fn caps_pairs_settled(now_ms: u64) -> bool {
     false
 }
 
-/// 结算守卫下的安全注入：系统大写位 ON、无在飞对子、且真键流静默
-/// （≥CAPS_PAIR_QUIET_MS 无真实键事件）才合成一对。返回 true=已注入；
-/// false=未注入（位 OFF / 在飞未落地 / 真键流未静默）。
-/// 即时路（消费现场）与延时复检路共用——不变量唯一：最多一对在飞，
-/// 且永不与真键同流交错（EmEditor/WPS 真 d 蒸发根因，见字段注释）。
-fn caps_synth_flip_if_on(now_ms: u64) -> bool {
+/// 结算守卫下的定向对齐：物理大写位与期望态不一致、且无在飞对子时，
+/// 合成一对把位翻到位（灯=状态可见）。返回 true=已注入。
+/// 【十六修】仅锁大写翻转沿调用——打字路径零注入（选重/功能 caps
+/// 不再补偿：合成对与物理键流交错正是 WPS/EmEditor 真 d 被截走的
+/// 根因，用户对照实锤）。
+fn caps_synth_align(now_ms: u64, desired_on: bool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    unsafe {
-        if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
-            return false;
-        }
+    // 【急停开关】旗标文件存在 = 合成对彻底关闭（诊断对照用，热生效）。
+    if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-pair").exists() {
+        return false;
+    }
+    let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
+    if bit_on == desired_on {
+        return false; // 已对齐，无事可做
     }
     if !caps_pairs_settled(now_ms) {
-        return false; // 在飞对子未落地：此刻读到的 ON 是滞后假象，等复检
-    }
-    let last_key = CAPS_QUIET_LAST_KEY.load(Relaxed);
-    if !caps_quiet_ok(now_ms, last_key) {
-        return false; // 真键流未静默：退避，复检下拍再试
+        return false; // 在飞对子未落地：防叠加注入（翻当前态，叠加净翻错向）
     }
     caps_synth_flip();
     CAPS_PAIR_INJ.fetch_add(1, Relaxed);
@@ -2361,14 +2353,8 @@ fn caps_synth_flip_if_on(now_ms: u64) -> bool {
     true
 }
 
-/// 真键流静默判定（纯逻辑，单测覆盖）：从未见过真键（0）恒静默；
-/// 距最近真键 ≥QUIET_MS 才静默。
-fn caps_quiet_ok(now_ms: u64, last_key_ms: u64) -> bool {
-    last_key_ms == 0 || now_ms.saturating_sub(last_key_ms) >= CAPS_PAIR_QUIET_MS
-}
-
-/// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_flip_if_on
-/// 结算守卫——翻转是「翻当前态」，叠加注入会净翻错向）。
+/// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_align 结算
+/// 守卫——翻转是「翻当前态」，叠加注入会净翻错向）。
 fn caps_synth_flip() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
@@ -2767,6 +2753,26 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
+        // 【全事件打点 2026-10-13 诊断】caps 键路诊断盲区：Test 层事件与
+        // 抬键事件此前零打点（「dispatch vk=」只在完整层），EmEditor/WPS
+        // 的 caps 四件套形态、抬键时序、自动重复全部不可见——d 蒸发与
+        // caps 空态翻锁之争无法裁决。caps 相关键（0x14 模式键 + 字母）
+        // 每个事件一行：test/full × down/up + extra_info（合成标记）。
+        // 诊断期专用；结案后移除。
+        if wparam == 0x14 || (0x41..=0x5A).contains(&wparam) {
+            let extra = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
+            }.0 as usize;
+            if extra != CAPS_FIXUP_MAGIC {
+                crate::tsf::trace(&format!(
+                    "ev: vk=0x{:X} {} {} extra=0x{:X}",
+                    wparam,
+                    if test_only { "test" } else { "full" },
+                    if up { "up" } else { "down" },
+                    extra
+                ));
+            }
+        }
         // （游戏宿主不挂本 sink——dispatch 仅普通宿主可达；游戏键流在
         // 子类化 WndProc 的 game_engine_key 里，见 E7。）
         // 【小键盘 Enter 2026-11】lparam 含 KF_EXTENDED 位（bit 24）：
@@ -3196,9 +3202,6 @@ impl HuFuTs_Impl {
             return BOOL(will as i32);
         }
         trace(&format!("dispatch vk=0x{wparam:X}"));
-        // 【避让真键流 2026-10-13】真实键事件盖戳（合成键在上方魔法
-        // 检查已提前返回，不会盖）：补偿对凭此判定真键流静默窗。
-        CAPS_QUIET_LAST_KEY.store(caps_now_ms(), std::sync::atomic::Ordering::Relaxed);
         // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
         // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
         // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
@@ -3365,92 +3368,43 @@ impl HuFuTs_Impl {
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
         ));
-        // 【Caps 系统态补偿 2026-10-12】引擎消费了 CapsLock（选重映射/
-        // 锁大写档/清屏/切英文）后，部分宿主仍翻转系统大小写锁定位
-        //（TSF 吞键不影响其翻转；实测 BUG②：Caps 选重一次后加词编码
-        // 框手输全大写）。系统位被翻 ON 即合成一对 CapsLock 击键翻回
-        // OFF——IME 全权接管中文态 Caps，系统位必须保持与 IME 态一致。
-        // 注：模式键在 TestDown/KeyDown 任一阶段直发（80ms 去重保证
-        // 一次击键只发一次），补偿跟无论哪个阶段的那一次。
-        // 【延时复检 2026-10-12 二次】用户实锤：Caps 作自定义选重键时
-        // 软件态已回 OFF（加词编码小写✓）但键盘 Caps 灯常亮——补偿
-        // 击键后物理翻转可能「晚到」（TestDown 相读 OFF 跳过、随后真
-        // 键翻转才落地=漏修）。150ms 后复检一次：仍 ON 再合成一对翻
-        // 回（查后翻，幂等——已 OFF 则不动，不会误翻 ON）；翻转同时
-        // 系统会重发 HID LED 报告，键盘灯跟着回灭。
-        // 【自定义门槛 2026-10-12 三次·用户拍板】补偿只在 capslock 有
-        // 全键自定义绑定时生效（此场景 Caps=功能键，灯亮是误导——软
-        // 件态与灯必须分离）；无自定义绑定走正常路径（锁大写/切英文
-        // 的灯随物理翻转显示——锁大写亮灯恰是状态可见）。
-        // 【锁大写豁免 2026-10-12 四次】空态 caps 走默认进锁大写时
-        //（state.caps_lock=true，用户实锤「能打大写但灯不亮」）：灯
-        // 亮=状态可见，此刻绝不补偿。解锁那一下 caps_lock 已回 false
-        // → 物理位本就翻 OFF，天然不触发。
+        // 【Caps 系统态补偿 2026-10-12 → 十六修 2026-10-13】引擎消费了
+        // CapsLock 后部分宿主仍翻转系统大小写位（TSF 吞键不影响其翻
+        // 转；实测：Caps 选重一次后加词编码框手输全大写）。历代修法沿
+        // 革：一次（即时补偿）→ 二次（延时复检）→ 十四修（结算制防
+        // 叠加）→ 十五修（静默窗避让，因竞态被否）。十六修实锤定论：
+        // 【十六修·打字路径零注入 2026-10-13】补偿对注入从打字路径彻底
+        // 移除（旧即时路+延时复检线程全数下岗）：对照实锤——旗标关闭
+        // 补偿后用户物理连打零大写泄漏，开启必炸。根因=合成 Caps 对
+        // 与物理键流交错，WPS/EmEditor 的物理键监听层（状态栏指示/键
+        // 方案）记账被搅乱后把下一个物理字母在 TSF 之前截走（直插/
+        // 蒸发），位 ON 时直插即大写 D；d 没进编码又让下一 caps 落空
+        // 组段→锁大写→D 连环。QQ/记事本无此监听=永不受害；注入键带
+        // INJECTED 标志走异路=自动化复现打不中（只有物理键触发）。
+        // 补偿唯一保留时刻=锁大写翻转沿（用户刻意按下的模式切换边界，
+        // 非连打中途；进锁大写的极端竞态直插大写 D 与模式输出等价无
+        // 感）：PREV_LOCK 检测翻转，物理位与引擎态不一致时经结算守卫
+        // 补一对对齐（灯=状态可见）。选重/功能 caps 一律零注入——物
+        // 理位翻转留痕属驱动层行为，软件不可拦。
         let caps_locked_now = state
             .get("caps_lock")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if name == "capslock" && consumed && keymap_has("capslock") && !caps_locked_now {
-            // 即时：结算守卫下安全注入（在飞未落地=让位复检——此刻读
-            // 到的 ON 是滞后假象，叠加注入正是旧竞态大写位卡 ON 的根）。
-            {
-                let now = caps_now_ms();
-                if (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0 {
-                    if caps_synth_flip_if_on(now) {
-                        crate::tsf::trace("caps: 系统大写位被翻转(即时·结算) → 合成补偿键翻回 OFF");
-                    } else {
-                        crate::tsf::trace("caps: 位 ON 但有在飞补偿对 → 让位延时复检");
-                    }
+        if name == "capslock" && consumed {
+            let prev = CAPS_PREV_LOCK.swap(
+                caps_locked_now as i8,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // 首拍（-1）只建档不动作；此后只在翻转沿检查对齐。
+            if prev >= 0 && prev != caps_locked_now as i8 {
+                let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
+                if bit_on != caps_locked_now && caps_synth_align(caps_now_ms(), caps_locked_now)
+                {
+                    let dir = if caps_locked_now { "ON" } else { "OFF" };
+                    crate::tsf::trace(&format!(
+                        "caps: 锁大写翻转沿物理位不一致 → 补一对对齐 {dir}（灯=状态可见）"
+                    ));
                 }
-            }
-            // 延时复检：晚到的物理翻转/LED 未跟随兜底。**结算制**（见
-            // caps_synth_flip_if_on 注释）：只在全部补偿对落地（INJ==
-            // SEEN）后读位，ON 且 60ms 后复核仍 ON 才补——滞后的假 ON
-            // 落地前不动手，真卡 ON（灯常亮）照修不误。代数循环——跑
-            // 期又有新击键则延长观察（单飞弃权=快击漏修，用户实锤）。
-            CAPS_FIXUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if !CAPS_FIXUP_BUSY.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                std::thread::spawn(|| {
-                    loop {
-                        let gen_at_start =
-                            CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed);
-                        for _ in 0..5 {
-                            std::thread::sleep(std::time::Duration::from_millis(120));
-                            let now = caps_now_ms();
-                            if !caps_pairs_settled(now) {
-                                continue; // 在飞未落地：本拍只等不动手
-                            }
-                            unsafe {
-                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
-                                    continue;
-                                }
-                            }
-                            // 双读确认：60ms 后仍 ON 才动手（消瞬时抖动）。
-                            std::thread::sleep(std::time::Duration::from_millis(60));
-                            let now2 = caps_now_ms();
-                            if !caps_pairs_settled(now2) {
-                                continue;
-                            }
-                            unsafe {
-                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
-                                    continue;
-                                }
-                            }
-                            if caps_synth_flip_if_on(now2) {
-                                crate::tsf::trace("caps: 延时复检确认卡 ON（已结算）→ 补翻 OFF（LED 跟随）");
-                                // 本观察窗只翻一次：合成键状态传播有竞
-                                // 态窗，连续两翻会净翻回 ON。
-                                break;
-                            }
-                        }
-                        if CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed)
-                            == gen_at_start
-                        {
-                            break; // 观察期内无新击键——收工
-                        }
-                    }
-                    CAPS_FIXUP_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
-                });
             }
         }
         // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
@@ -10018,16 +9972,6 @@ mod caps_settle_tests {
         // 未超时不动。
         reset(2, 0, 1_000_000);
         assert!(!caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS - 1));
-    }
-
-    #[test]
-    fn quiet_window_gates_injection() {
-        // 避让真键流：距最近真键不足 250ms 恒不注入（EmEditor/WPS 真 d
-        // 蒸发窗），静默后放行；从未见真键恒放行。
-        assert!(!caps_quiet_ok(1_000_250, 1_000_100), "150ms 未静默必须挡");
-        assert!(caps_quiet_ok(1_000_250, 1_000_000), "恰 250ms 静默放行");
-        assert!(caps_quiet_ok(1_000_900, 1_000_000), "静默后放行");
-        assert!(caps_quiet_ok(9, 0), "无真键记录恒放行");
     }
 }
 
