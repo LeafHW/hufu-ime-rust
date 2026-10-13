@@ -2353,8 +2353,166 @@ fn caps_synth_align(now_ms: u64, desired_on: bool) -> bool {
     true
 }
 
+// ═══ 十七修·Caps 物理拦截（LL 钩子·灯根治）2026-10-13 ═══
+// 物理_caps 在驱动层翻转系统大写位+灯，TSF 吞键拦不住（十次~十六修
+// 定案：合成对补偿与真键流交错会毒死 WPS/EmEditor 的物理键记账，把
+// 下一个真字母在 TSF 之前截走）。根治=让翻转**根本不发生**：
+// WH_KEYBOARD_LL 拦下「组段在身」的物理 Caps down/up——系统位/灯不
+// 动；同拍 SendInput 一对带 "HUFV" 标记的 F24 虚键（无翻转语义、无
+// 字符翻译）走正常输入路，dispatch 入口改姓 capslock，引擎照常选重。
+// 空组段一律放行真键：锁定大写进出/英文态/其他输入法/游戏全走物理
+// 路径，灯天然=状态，零补偿零注入。守卫：焦点进程=本进程（全局钩
+// 子只管自家）、急停旗标 caps-no-hook。
+const CAPS_VIRT_VK: u16 = 0x87; // VK_F24：无主使用、无字符翻译
+const CAPS_VIRT_MAGIC: usize = 0x4855_4656; // dwExtraInfo 标记 "HUFV"
+static CAPS_LL_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CAPS_LL_PUMP_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 本按压已拦 down → 配对物理 up 与按住重复 down 一并拦（防孤儿
+/// up/重复 down 扰宿主记账或漏成第二次引擎事件）。
+static CAPS_LL_BLOCKED_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 拦截门（纯逻辑，单测覆盖）：组段在身且 caps 有映射才虚拟化。
+fn caps_hook_gate(composition_active: bool, caps_mapped: bool) -> bool {
+    composition_active && caps_mapped
+}
+
+/// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate。
+fn caps_hook_should_virtualize() -> bool {
+    if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists() {
+        return false; // 急停：全部放行物理键
+    }
+    // 焦点在本进程才管（LL 钩子全局回调，别家按键不碰）。
+    let fh = fg_focus_hwnd();
+    if fh.0.is_null() {
+        return false;
+    }
+    let mut pid: u32 = 0;
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fh, Some(&mut pid));
+    }
+    if pid != std::process::id() {
+        return false;
+    }
+    let Some(g) = G_SHARED.get() else { return false };
+    let g = g.0.lock().unwrap_or_else(|e| e.into_inner());
+    let comp = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
+    let mapped = g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
+    caps_hook_gate(comp, mapped)
+}
+
+/// 注入 F24 虚键对（down+up，HUFV 标记）。
+fn caps_virt_send() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    let mk = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(CAPS_VIRT_VK),
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                time: 0,
+                dwExtraInfo: CAPS_VIRT_MAGIC,
+            },
+        },
+    };
+    let arr = [mk(false), mk(true)];
+    unsafe {
+        SendInput(&arr, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// LL 键盘钩子回调：非 caps 键零开销直通；物理 caps 过门则拦+虚键。
+unsafe extern "system" fn caps_ll_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    };
+    if code < 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if kb.vkCode == 0x14 && (kb.flags & LLKHF_INJECTED).0 == 0 {
+        let is_down = wparam.0 == 0x0100 || wparam.0 == 0x0104; // (SYS)KEYDOWN
+        let is_up = wparam.0 == 0x0101 || wparam.0 == 0x0105; // (SYS)KEYUP
+        if is_down {
+            if CAPS_LL_BLOCKED_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                return LRESULT(1); // 本按压按住重复：一并吞（不二次选重）
+            }
+            if caps_hook_should_virtualize() {
+                CAPS_LL_BLOCKED_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::tsf::trace("capsll: 拦物理Caps(组段在身) → F24虚键（系统位/灯不动）");
+                caps_virt_send();
+                return LRESULT(1);
+            }
+        } else if is_up {
+            if CAPS_LL_BLOCKED_DOWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return LRESULT(1); // 配对 up 同拦（宿主只见完整虚键故事）
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// 安装（幂等）：cap 有映射即装。泵线程装钩子并 GetMessage 循环——
+/// LL 回调在本线程执行；系统级其余键开销=一次函数调用。
+fn caps_hook_install() {
+    if CAPS_LL_PUMP_ALIVE
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        unsafe {
+            use windows::Win32::System::LibraryLoader::{
+                GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowsHookExW, WH_KEYBOARD_LL,
+            };
+            // 用回调自身地址取本 DLL 模块句柄（FROM_ADDRESS 语义）。
+            let mut hmod = windows::Win32::Foundation::HMODULE(std::ptr::null_mut());
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                windows::core::PCWSTR(caps_ll_proc as usize as *const u16),
+                &mut hmod,
+            );
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(caps_ll_proc), hmod, 0) {
+                Ok(h) => {
+                    CAPS_LL_HOOK.store(h.0 as usize, std::sync::atomic::Ordering::SeqCst);
+                    crate::tsf::trace("capsll: LL 钩子就位（cap 映射在身）");
+                }
+                Err(_) => {
+                    crate::tsf::trace("capsll: SetWindowsHookExW 失败 → 灯方案降级（物理放行）");
+                    CAPS_LL_PUMP_ALIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+            // 泵消息——LL 回调在本线程消息循环里被调起。
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            while windows::Win32::UI::WindowsAndMessaging::GetMessageW(
+                &mut msg,
+                None,
+                0,
+                0,
+            )
+            .as_bool()
+            {
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                let _ = windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
 /// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_align 结算
-/// 守卫——翻转是「翻当前态」，叠加注入会净翻错向）。
+/// 守卫——翻转是「翻当前态」，叠加注入会净翻错向）。【十七修后仅
+/// 锁大写翻转沿对齐在用；选重路径零注入。】
 fn caps_synth_flip() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
@@ -2764,12 +2922,25 @@ impl HuFuTs_Impl {
                 windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
             }.0 as usize;
             if extra != CAPS_FIXUP_MAGIC {
+                let bit = if wparam == 0x14 {
+                    format!(
+                        " capsbit={}",
+                        if (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0 {
+                            "ON"
+                        } else {
+                            "off"
+                        }
+                    )
+                } else {
+                    String::new()
+                };
                 crate::tsf::trace(&format!(
-                    "ev: vk=0x{:X} {} {} extra=0x{:X}",
+                    "ev: vk=0x{:X} {} {} extra=0x{:X}{}",
                     wparam,
                     if test_only { "test" } else { "full" },
                     if up { "up" } else { "down" },
-                    extra
+                    extra,
+                    bit
                 ));
             }
         }
@@ -2782,6 +2953,23 @@ impl HuFuTs_Impl {
         // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
         // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
         let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
+        // 【十七修·F24 虚键重映射 2026-10-13】物理 Caps 已被 LL 钩子整
+        // 个拦下（组段在身时——系统大写位/灯根本未动），钩子同拍注入
+        // 带 "HUFV" 标记的 F24 虚键对走正常 TSF 路。到站改姓 capslock：
+        // 下游（模式键去重/引擎/状态机）与真 caps 完全同路，而系统位
+        // 永不被它触碰（F24 无翻转语义）。
+        let mut wparam = wparam;
+        if wparam == CAPS_VIRT_VK as usize {
+            let extra = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
+            }.0 as usize;
+            if extra == CAPS_VIRT_MAGIC {
+                wparam = 0x14;
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace("caps: F24 虚键到站 → 改姓 capslock（系统位未动）");
+                }
+            }
+        }
         // 【Caps 系统态补偿·吞合成键 2026-10-12 三次】只吞自家 keybd_event
         // 合成的翻转键（dwExtraInfo="HUFU" 魔法标记）——直通不递引擎
         // （否则补偿键被当用户键再消费一次=模式连翻）。真实用户键不带
@@ -3437,6 +3625,11 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap 同步: {} 项", km.len()));
             }
             g.keymap = km;
+            // 【十七修】caps 有映射（组段态会消费它）→ 进程装 LL 钩子
+            //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
+            if g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock") {
+                caps_hook_install();
+            }
             // 【两态映射 2026-11】空态专用表同帧同步。
             let kmi: std::collections::HashMap<String, String> = state
                 .get("keymap_idle")
@@ -9972,6 +10165,16 @@ mod caps_settle_tests {
         // 未超时不动。
         reset(2, 0, 1_000_000);
         assert!(!caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS - 1));
+    }
+
+    #[test]
+    fn hook_gate_only_with_composition_and_mapping() {
+        // 十七修拦截门：仅「组段在身 且 caps 有映射」虚拟化物理键；
+        // 空组段（锁定大写/英文态）一律放行真键——灯=状态天然成立。
+        assert!(caps_hook_gate(true, true), "组段+映射 → 拦");
+        assert!(!caps_hook_gate(false, true), "空组段放行（锁大写走物理路）");
+        assert!(!caps_hook_gate(true, false), "caps 未映射放行（默认行为）");
+        assert!(!caps_hook_gate(false, false), "双无放行");
     }
 }
 
