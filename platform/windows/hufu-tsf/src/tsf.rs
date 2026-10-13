@@ -1392,6 +1392,9 @@ pub(crate) fn ime_switch_abort(shared: &SharedRef) {
     g.composition = None;
     g.composing = false;
     g.raw_last.clear();
+    // 【十七修】组段已亡——钩子零锁快照同步翻 false（防下一次 caps
+    // 被误虚拟化落进空组段）。
+    caps_snap_refresh(&g);
     g.preedit_last.clear();
     g.stale_raw.clear();
     g.stale_raw_until = None;
@@ -2370,13 +2373,33 @@ static CAPS_LL_PUMP_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// 本按压已拦 down → 配对物理 up 与按住重复 down 一并拦（防孤儿
 /// up/重复 down 扰宿主记账或漏成第二次引擎事件）。
 static CAPS_LL_BLOCKED_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 【回调零锁 2026-10-13】钩子回调绝不能碰 Shared 互斥锁（UI 线程持锁
+/// 做引擎管道调用时回调一阻塞=全系统输入管线卡顿——用户实锤 EmEditor
+/// 「反应速度变得很慢」）。组段在身/caps有映射 由 UI 线程在引擎响应
+/// 同步点写这两个原子快照，回调只读原子。
+static CAPS_SNAP_COMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPS_SNAP_MAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 泵线程 id（回调里 PostThreadMessage 转交注入——**绝不**在 LL 回调
+/// 内直接 SendInput（输入注入自嵌套=系统输入队列串行化，禁手）。
+static CAPS_PUMP_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 泵线程私有消息：执行 F24 虚键注入。
+const CAPS_WM_VIRT: u32 = 0x8000 + 0x31; // WM_APP+0x31
+
+/// UI 线程视角刷新快照（须持 Shared 锁调用；回调永不调此）。
+fn caps_snap_refresh(g: &Shared) {
+    let comp = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
+    let mapped = g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
+    CAPS_SNAP_COMP.store(comp, std::sync::atomic::Ordering::Release);
+    CAPS_SNAP_MAPPED.store(mapped, std::sync::atomic::Ordering::Release);
+}
 
 /// 拦截门（纯逻辑，单测覆盖）：组段在身且 caps 有映射才虚拟化。
 fn caps_hook_gate(composition_active: bool, caps_mapped: bool) -> bool {
     composition_active && caps_mapped
 }
 
-/// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate。
+/// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate（原子快照，
+/// 零锁零阻塞——回调全系统键路，微秒级必须）。
 fn caps_hook_should_virtualize() -> bool {
     if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists() {
         return false; // 急停：全部放行物理键
@@ -2393,11 +2416,10 @@ fn caps_hook_should_virtualize() -> bool {
     if pid != std::process::id() {
         return false;
     }
-    let Some(g) = G_SHARED.get() else { return false };
-    let g = g.0.lock().unwrap_or_else(|e| e.into_inner());
-    let comp = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
-    let mapped = g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
-    caps_hook_gate(comp, mapped)
+    caps_hook_gate(
+        CAPS_SNAP_COMP.load(std::sync::atomic::Ordering::Acquire),
+        CAPS_SNAP_MAPPED.load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 /// 注入 F24 虚键对（down+up，HUFV 标记）。
@@ -2446,8 +2468,20 @@ unsafe extern "system" fn caps_ll_proc(
             }
             if caps_hook_should_virtualize() {
                 CAPS_LL_BLOCKED_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-                crate::tsf::trace("capsll: 拦物理Caps(组段在身) → F24虚键（系统位/灯不动）");
-                caps_virt_send();
+                crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 投递虚键注入（系统位/灯不动）");
+                // 转交泵线程异步注入——LL 回调内 SendInput 是禁手
+                //（输入注入自嵌套）。
+                let tid = CAPS_PUMP_TID.load(std::sync::atomic::Ordering::SeqCst);
+                if tid != 0 {
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                            tid,
+                            CAPS_WM_VIRT,
+                            windows::Win32::Foundation::WPARAM(0),
+                            windows::Win32::Foundation::LPARAM(0),
+                        );
+                    }
+                }
                 return LRESULT(1);
             }
         } else if is_up {
@@ -2469,12 +2503,12 @@ fn caps_hook_install() {
     }
     std::thread::spawn(|| {
         unsafe {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            CAPS_PUMP_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::SeqCst);
             use windows::Win32::System::LibraryLoader::{
                 GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             };
-            use windows::Win32::UI::WindowsAndMessaging::{
-                SetWindowsHookExW, WH_KEYBOARD_LL,
-            };
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL};
             // 用回调自身地址取本 DLL 模块句柄（FROM_ADDRESS 语义）。
             let mut hmod = windows::Win32::Foundation::HMODULE(std::ptr::null_mut());
             let _ = GetModuleHandleExW(
@@ -2493,7 +2527,8 @@ fn caps_hook_install() {
                     return;
                 }
             }
-            // 泵消息——LL 回调在本线程消息循环里被调起。
+            // 泵消息——LL 回调在本线程消息循环里被调起；虚键注入也从
+            // 这里出（回调只投递，不在回调内 SendInput）。
             let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
             while windows::Win32::UI::WindowsAndMessaging::GetMessageW(
                 &mut msg,
@@ -2503,6 +2538,10 @@ fn caps_hook_install() {
             )
             .as_bool()
             {
+                if msg.message == CAPS_WM_VIRT {
+                    caps_virt_send();
+                    continue; // 线程消息：不翻译不派发
+                }
                 let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
                 let _ = windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
             }
@@ -3625,7 +3664,11 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap 同步: {} 项", km.len()));
             }
             g.keymap = km;
-            // 【十七修】caps 有映射（组段态会消费它）→ 进程装 LL 钩子
+            // 【十七修·零锁快照】钩子回调只读原子（回调禁锁 Shared——
+            // UI 线程持锁做管道调用时回调一卡=全系统键路卡顿，用户实
+            // 锤）。每次引擎响应都在此刷新快照：组段在身 + caps 有映射。
+            caps_snap_refresh(&g);
+            // caps 有映射（组段态会消费它）→ 进程装 LL 钩子
             //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
             if g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock") {
                 caps_hook_install();
