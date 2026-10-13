@@ -1,4 +1,4 @@
-; ============================================================================
+﻿; ============================================================================
 ; HuFu 虎符输入法 · 单 exe 安装包（Inno Setup 6）
 ; ----------------------------------------------------------------------------
 ; 架构铁律（与 install.ps1 双阶段一一对齐，勿"标准化"改动）：
@@ -59,6 +59,9 @@ UninstallDisplayIcon={app}\图标.ico
 Uninstallable=yes
 Compression=lzma2/max
 SolidCompression=yes
+; 【清场加固 2026-10-14】每次安装自动留全量日志 %TEMP%\Setup Log*.txt
+; （排查"拒绝访问/重试跳过中止"类文件占用弹窗的定案证据）
+SetupLogging=yes
 WizardStyle=modern
 ; 不用 Restart Manager 硬关用户程序（weasel/CorvusSKK 共识）；腾位自管
 CloseApplications=no
@@ -328,21 +331,154 @@ begin
   Result := (PageID = wpSelectDir) and UpgradeMode and (not SelectDirMode);
 end;
 
-// ============================ 杀 server（内联，零文件依赖） ============================
+// ============================ 进程清理（原生 COM，零子进程）============================
+// 【2026-10-14 去 PowerShell 化】火绒等安全软件对"安装器启动 powershell.exe"有
+// 行为告警（用户实测两次弹窗）。杀 server 与清场全部改为 Inno 内嵌 WMI COM
+// 直杀（WbemScripting），不再产生任何子进程 → 该类告警从根上消失。
+// 引擎（install.ps1 血律脚本）仍是 PowerShell——那是唯一残余的一次提权 PS。
+
+function WmiConnect(): Variant;
+var
+  Locator: Variant;
+begin
+  Locator := CreateOleObject('WbemScripting.SWbemLocator');
+  Result := Locator.ConnectServer('.', 'root\CIMV2');
+end;
+
+// 循环杀 hufu-server（TSF 会重生它，循环兜住重生窗口期）
 function KillServerInline(): Boolean;
 var
-  Code: Integer;
+  Svc, Q: Variant;
+  I, Round, Alive, Total: Integer;
 begin
-  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' +
-    'for($i=0;$i -lt 12;$i++){ $p=Get-Process hufu-server -ErrorAction SilentlyContinue;' +
-    'if(-not $p){ break }; $p | Stop-Process -Force -ErrorAction SilentlyContinue;' +
-    'Start-Sleep -Milliseconds 700 }; ' +
-    'exit [int]([bool](Get-Process hufu-server -ErrorAction SilentlyContinue))"',
-    '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Result := (Code = 0);
-  if not Result then
-    LogLine('警告：hufu-server 未能杀净（继续，安装引擎会再处理）');
+  Result := True;
+  Alive := 0;
+  try
+    Svc := WmiConnect();
+    for Round := 1 to 12 do begin
+      Q := Svc.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name = ''hufu-server.exe''');
+      Total := Q.Count;
+      if Total = 0 then break;
+      for I := 0 to Total - 1 do begin
+        try
+          Q.ItemIndex(I).Terminate();
+        except
+          // 枚举漂移/杀不动（提权）：下一轮兜
+        end;
+      end;
+      Sleep(700);
+    end;
+    Q := Svc.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name = ''hufu-server.exe''');
+    Alive := Q.Count;
+  except
+    LogLine('警告：WMI 杀 server 异常（继续，安装引擎会再处理）');
+    exit;
+  end;
+  if Alive > 0 then begin
+    Result := False;
+    LogLine('警告：hufu-server 未能杀净 ' + IntToStr(Alive) +
+      ' 个（多为管理员程序触发的提权重生，改名腾位不受影响，重启自愈）');
+  end;
+end;
+
+// ============================ 安装目录清场（原生 COM，零子进程）============================
+// 点下"安装/卸载"即刻：杀光一切会锁文件的进程——
+//   · 任何可执行文件路径在目标目录下的进程（server/smoke/未来新增助手，一网打尽）
+//   · 命令行引用目标目录的 cmd/powershell/wscript 控制台（卸载.bat、设置.bat、
+//     采集脚本等遗留窗口）
+//   · 候选窗/托盘/皮肤动效窗/设置后端——全部由 server 进程持有，随 server 死亡
+//     （设置页是浏览器标签，杀浏览器会误伤用户其他标签，不杀；server 死即页面失效）
+// 安全阀：排除安装/卸载器自身（否则卸载时 unins000 会自杀）；
+//         目录前缀带 \ 终界（D:\HUFU 不误伤 D:\HUFU2）。
+// 安装：SweepInstallDirProcesses(WizardDirValue, False)——残留的卸载向导也杀；
+// 卸载：SweepInstallDirProcesses(AppDir, True)——保护运行中的 unins000.exe。
+function SweepInstallDirProcesses(const DirName: String; KeepSelf: Boolean): Boolean;
+var
+  Svc, Q, Obj: Variant;
+  I, Killed, Left, Left2, Total: Integer;
+  InstDir, Pfx, SelfExe, Ep, Cm, Nm, Report: String;
+  PathHit, ConsoleHit: Boolean;
+begin
+  InstDir := DirName;
+  if InstDir = '' then begin
+    LogLine('清场：目录为空，跳过');
+    Result := True;
+    exit;
+  end;
+  Pfx := UpperCase(InstDir) + '\';
+  // {srcexe} 仅安装语境有效：卸载语境展开会抛异常（2026-10-14 卸载实测崩溃点）。
+  // 护栏：卸载时置空（不匹配任何进程；unins000 自身由 KeepSelf 参数保护）。
+  try
+    SelfExe := UpperCase(ExpandConstant('{srcexe}'));
+  except
+    SelfExe := '';
+  end;
+  Killed := 0;
+  Left := 0;
+  Left2 := 0;
+  try
+    Svc := WmiConnect();
+    Q := Svc.ExecQuery('SELECT Name, ExecutablePath, CommandLine FROM Win32_Process');
+    Total := Q.Count;
+    for I := 0 to Total - 1 do begin
+      try
+        Obj := Q.ItemIndex(I);
+        Nm := Obj.Name;
+        Nm := UpperCase(Nm);
+        Ep := '';
+        if not VarIsEmpty(Obj.ExecutablePath) then Ep := Obj.ExecutablePath;
+        Cm := '';
+        if not VarIsEmpty(Obj.CommandLine) then Cm := Obj.CommandLine;
+        Ep := UpperCase(Ep);
+        PathHit := ((Pos(Pfx, Ep) = 1) or (Ep = UpperCase(InstDir))) and (Ep <> '') and (Ep <> SelfExe);
+        if PathHit and KeepSelf and (Ep = Pfx + 'UNINS000.EXE') then PathHit := False;
+        ConsoleHit := (Cm <> '') and (Pos('|' + Nm + '|',
+          '|CMD.EXE|POWERSHELL.EXE|PWSH.EXE|CONHOST.EXE|WSCRIPT.EXE|CSCRIPT.EXE|') > 0) and
+          (Pos(UpperCase(InstDir), UpperCase(Cm)) > 0);
+        if PathHit or ConsoleHit then begin
+          Obj.Terminate();
+          Killed := Killed + 1;
+        end;
+      except
+        // 枚举漂移（进程恰好消亡）或杀不动（提权）：跳过该项继续
+      end;
+    end;
+    if Killed > 0 then Sleep(600);
+    // 复点：路径可见残留（真失败）
+    Q := Svc.ExecQuery('SELECT ExecutablePath FROM Win32_Process');
+    Total := Q.Count;
+    for I := 0 to Total - 1 do begin
+      try
+        Obj := Q.ItemIndex(I);
+        Ep := '';
+        if not VarIsEmpty(Obj.ExecutablePath) then begin
+          Ep := Obj.ExecutablePath;
+          Ep := UpperCase(Ep);
+        end;
+        if (Ep <> '') and ((Pos(Pfx, Ep) = 1) or (Ep = UpperCase(InstDir))) and (Ep <> SelfExe) then
+          Left := Left + 1;
+      except
+      end;
+    end;
+    // 名字兜底点验：提权残留（路径不可见）——如实记账
+    Q := Svc.ExecQuery('SELECT Name FROM Win32_Process WHERE Name = ''hufu-server.exe'' OR Name = ''hufu-tsf-smoke.exe'' OR Name = ''unins000.exe''');
+    Left2 := Q.Count;
+  except
+    LogLine('警告：WMI 清场异常（继续，改名腾位兜底）');
+    Result := True;
+    exit;
+  end;
+  Report := 'KILLED=' + IntToStr(Killed) + ' LEFT2=' + IntToStr(Left2);
+  Result := (Left = 0);
+  if Result then begin
+    if Left2 > 0 then
+      LogLine('清场：路径进程清净（' + Report + '）；检测到提权残留进程（如管理员任务管理器'
+        + '触发的 server 重生），普通权限无法终止——不影响安装（改名腾位绕开锁），重启自愈')
+    else
+      LogLine('清场：目标目录进程已清净（' + Report + '）');
+  end else
+    LogLine('提示：目标目录仍有 ' + IntToStr(Left) + ' 个进程未死（' + Report +
+      '）——多为 server 重生竞速，改名腾位已绕开文件锁；若弹占用提示点重试即可');
 end;
 
 // ============================ PE 腾位 ============================
@@ -416,7 +552,10 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  // 【清场 2026-10-14 用户指令】确认安装的第一时间：杀 server（含 TSF 重生兜底循环）
+  // → 清场一切安装目录进程（smoke/unins000/bat 控制台/任何 {app} 进程）
   KillServerInline();
+  SweepInstallDirProcesses(WizardDirValue, False);
   // S4（审计）：野残留=死 HKCU TIP 键。先清掉，install.ps1 的 $tipAlready
   // 才会判"全新安装"→走首装路径（含 ctfmon 刷新），装完即可切换输入法。
   if WildRemnant then begin
@@ -526,6 +665,9 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   DirNow: String;
+  SR: TFindRec;
+  Remnants: TArrayOfString;
+  N, I: Integer;
 begin
   if CurStep = ssPostInstall then begin
     // 1) 数据文件：差异备份 → 拷入（不进卸载日志）；升级时码表/皮肤整目录
@@ -568,6 +710,27 @@ begin
       StartServerViaExplorer();
     end;
 
+    // 5b) 【2026-10-14 补账】升级腾位残件当场清：引擎已把 server 切到新
+    //     PE，.oldN 此刻已解锁——能删的当场删光，不等重启/下次安装。
+    //     仍被占用的（罕见：旧 DLL 镜像还在某进程里）留给 postboot/
+    //     下次安装/卸载三重兜底。先收集再删（边枚举边删会跳项）。
+    N := 0;
+    SetArrayLength(Remnants, 0);
+    if FindFirst(WizardDirValue + '\*.old*', SR) then begin
+      repeat
+        SetArrayLength(Remnants, N + 1);
+        Remnants[N] := SR.Name;
+        N := N + 1;
+      until not FindNext(SR);
+      FindClose(SR);
+    end;
+    if N > 0 then begin
+      for I := 0 to N - 1 do
+        if not DeleteFile(WizardDirValue + '\' + Remnants[I]) then
+          LogLine('腾位残件仍占用：' + Remnants[I] + '（postboot 重启后清）');
+      LogLine('升级腾位清理：发现 ' + IntToStr(N) + ' 个 .old*，已尝试删除');
+    end;
+
     // 6) 升级换了目录（/SELECTDIR 高级用法）的提示
     if UpgradeMode and (PrevDir <> '') and (PrevDir <> WizardDirValue) and
        (not WizardSilent()) then
@@ -607,8 +770,34 @@ var
   Code: Integer;
   AppDir: String;
   ElevatedOk: Boolean;
+  SR: TFindRec;
+  Remnants: TArrayOfString;
+  N, I: Integer;
 begin
   AppDir := ExpandConstant('{app}');
+
+  if CurUninstallStep = usPostUninstall then begin
+    // 【2026-10-14 补账】腾位改名产生的 .oldN 不在卸载器台账内
+    // （unins000.dat 只记安装原名，改过名=账外文件）——卸载收尾主动清账：
+    // 先收集再删（边枚举边删会跳项）；删不动的（罕见：残进程仍占 .oldN
+    // 镜像）由 UninstallNeedRestart 的重启提示兜底。
+    N := 0;
+    SetArrayLength(Remnants, 0);
+    if FindFirst(AppDir + '\*.old*', SR) then begin
+      repeat
+        SetArrayLength(Remnants, N + 1);
+        Remnants[N] := SR.Name;
+        N := N + 1;
+      until not FindNext(SR);
+      FindClose(SR);
+    end;
+    for I := 0 to N - 1 do
+      if not DeleteFile(AppDir + '\' + Remnants[I]) then
+        LogLine('残占未删：' + Remnants[I] + '（重启后自清或手动删）');
+    if N > 0 then
+      LogLine('腾位残账清理：发现 ' + IntToStr(N) + ' 个 .old*，已尝试删除');
+    exit;
+  end;
 
   if CurUninstallStep = usUninstall then begin
     // 程序文件尚在（Inno 随后才删白名单）——引擎脚本此刻可用
@@ -640,8 +829,10 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\RunOnce',
       'HuFuPostBoot');
 
-    // 1) 杀 server（uninstall.ps1 也会杀；先杀减一次复活窗口）
+    // 1) 杀 server（uninstall.ps1 也会杀；先杀减一次复活窗口）+ 清场安装目录进程
+    //    （卸载时残留的设置.bat 窗口/smoke 等也会锁文件；保护 unins000 自身）
     KillServerInline();
+    SweepInstallDirProcesses(AppDir, True);
 
     // 2) 提权一次跑引擎尾巴：[原版 uninstall.ps1] + PFRO 挂删 SystemIME
     //    残留 + HKLM 清净校验（tools 内部以管理员运行 uninstall.ps1，
