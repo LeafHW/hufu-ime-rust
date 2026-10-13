@@ -2382,29 +2382,6 @@ static CAPS_SNAP_MAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// 泵线程 id（回调里 PostThreadMessage 转交注入——**绝不**在 LL 回调
 /// 内直接 SendInput（输入注入自嵌套=系统输入队列串行化，禁手）。
 static CAPS_PUMP_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// 【拒绝原因打点】回调零 I/O：物理 caps 被放行时只写原子原因码，
-/// 由 UI 线程 dispatch 侧（真 caps 到站处）落盘。0=无/已消费。
-static CAPS_LL_LAST_REJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// 原因码。1 组段不在身 2 caps 未映射 3 焦点进程非本进程 4 急停旗标
-/// 5 未知（门过但未拦——理论不可达）。
-const CAPS_LL_REJ_LABEL: [&str; 6] = [
-    "无",
-    "组段不在身",
-    "caps未映射",
-    "焦点进程非本进程",
-    "急停旗标",
-    "未知",
-];
-/// UI 线程侧读因+落盘（仅真 caps 到站时调用；trace_on 由调用方管）。
-fn caps_ll_dump_reject() {
-    let r = CAPS_LL_LAST_REJECT.swap(0, std::sync::atomic::Ordering::SeqCst);
-    if r != 0 && (r as usize) < CAPS_LL_REJ_LABEL.len() {
-        crate::tsf::trace(&format!(
-            "capsll: 物理caps放行 原因={}（真键到站）",
-            CAPS_LL_REJ_LABEL[r as usize]
-        ));
-    }
-}
 /// 泵线程私有消息：执行 F24 虚键注入。
 const CAPS_WM_VIRT: u32 = 0x8000 + 0x31; // WM_APP+0x31
 /// 【WPS extra 丢失·闩锁认领 2026-10-13】实测 WPS（CUAS/AIMM 混合宿
@@ -2430,16 +2407,14 @@ fn caps_hook_gate(composition_active: bool, caps_mapped: bool) -> bool {
 }
 
 /// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate（原子快照，
-/// 零锁零阻塞——回调全系统键路，微秒级必须）。拒绝时写原因码原子。
+/// 零锁零阻塞——回调全系统键路，微秒级必须）。
 fn caps_hook_should_virtualize() -> bool {
     if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists() {
-        CAPS_LL_LAST_REJECT.store(4, std::sync::atomic::Ordering::SeqCst);
         return false; // 急停：全部放行物理键
     }
     // 焦点在本进程才管（LL 钩子全局回调，别家按键不碰）。
     let fh = fg_focus_hwnd();
     if fh.0.is_null() {
-        CAPS_LL_LAST_REJECT.store(3, std::sync::atomic::Ordering::SeqCst);
         return false;
     }
     let mut pid: u32 = 0;
@@ -2447,17 +2422,12 @@ fn caps_hook_should_virtualize() -> bool {
         windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fh, Some(&mut pid));
     }
     if pid != std::process::id() {
-        CAPS_LL_LAST_REJECT.store(3, std::sync::atomic::Ordering::SeqCst);
         return false;
     }
-    let comp = CAPS_SNAP_COMP.load(std::sync::atomic::Ordering::Acquire);
-    let mapped = CAPS_SNAP_MAPPED.load(std::sync::atomic::Ordering::Acquire);
-    if !caps_hook_gate(comp, mapped) {
-        let why = if !mapped { 2 } else { 1 };
-        CAPS_LL_LAST_REJECT.store(why, std::sync::atomic::Ordering::SeqCst);
-        return false;
-    }
-    true
+    caps_hook_gate(
+        CAPS_SNAP_COMP.load(std::sync::atomic::Ordering::Acquire),
+        CAPS_SNAP_MAPPED.load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 /// 注入 F24 虚键对（down+up，HUFV 标记）。
@@ -3007,48 +2977,6 @@ impl HuFuTs_Impl {
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
-        // 【全事件打点 2026-10-13 诊断】caps 键路诊断盲区：Test 层事件与
-        // 抬键事件此前零打点（「dispatch vk=」只在完整层），EmEditor/WPS
-        // 的 caps 四件套形态、抬键时序、自动重复全部不可见——d 蒸发与
-        // caps 空态翻锁之争无法裁决。caps 相关键（0x14 模式键 + 字母）
-        // 每个事件一行：test/full × down/up + extra_info（合成标记）。
-        // 诊断期专用；结案后移除。
-        if wparam == 0x14
-            || (0x41..=0x5A).contains(&wparam)
-            || (0x13..=0x2F).contains(&wparam)
-            || (0x87..=0x91).contains(&wparam)
-        {
-            let extra = unsafe {
-                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
-            }.0 as usize;
-            if extra != CAPS_FIXUP_MAGIC {
-                let bit = if wparam == 0x14 {
-                    format!(
-                        " capsbit={}",
-                        if (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0 {
-                            "ON"
-                        } else {
-                            "off"
-                        }
-                    )
-                } else {
-                    String::new()
-                };
-                crate::tsf::trace(&format!(
-                    "ev: vk=0x{:X} {} {} extra=0x{:X}{}",
-                    wparam,
-                    if test_only { "test" } else { "full" },
-                    if up { "up" } else { "down" },
-                    extra,
-                    bit
-                ));
-                // 【十七修·拒绝原因】真 caps down 到站=钩子放行了它——
-                // 落盘当时的放行原因（回调零 I/O，原子转交）。
-                if wparam == 0x14 && !up {
-                    caps_ll_dump_reject();
-                }
-            }
-        }
         // （游戏宿主不挂本 sink——dispatch 仅普通宿主可达；游戏键流在
         // 子类化 WndProc 的 game_engine_key 里，见 E7。）
         // 【小键盘 Enter 2026-11】lparam 含 KF_EXTENDED 位（bit 24）：
