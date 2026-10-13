@@ -2999,7 +2999,11 @@ impl HuFuTs_Impl {
         // caps 空态翻锁之争无法裁决。caps 相关键（0x14 模式键 + 字母）
         // 每个事件一行：test/full × down/up + extra_info（合成标记）。
         // 诊断期专用；结案后移除。
-        if wparam == 0x14 || (0x41..=0x5A).contains(&wparam) {
+        if wparam == 0x14
+            || (0x41..=0x5A).contains(&wparam)
+            || (0x13..=0x2F).contains(&wparam)
+            || (0x87..=0x91).contains(&wparam)
+        {
             let extra = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
             }.0 as usize;
@@ -3712,15 +3716,6 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap 同步: {} 项", km.len()));
             }
             g.keymap = km;
-            // 【十七修·零锁快照】钩子回调只读原子（回调禁锁 Shared——
-            // UI 线程持锁做管道调用时回调一卡=全系统键路卡顿，用户实
-            // 锤）。每次引擎响应都在此刷新快照：组段在身 + caps 有映射。
-            caps_snap_refresh(&g);
-            // caps 有映射（组段态会消费它）→ 进程装 LL 钩子
-            //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
-            if g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock") {
-                caps_hook_install();
-            }
             // 【两态映射 2026-11】空态专用表同帧同步。
             let kmi: std::collections::HashMap<String, String> = state
                 .get("keymap_idle")
@@ -3737,6 +3732,24 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
             }
             g.keymap_idle = kmi;
+            // 【十七修·零锁快照 v2】从**本拍 state** 直读——旧版读 g.raw_last
+            // 镜像恒滞后一拍（首字母组段的 caps 被放行=EmEditor 灯翻第一
+            // 次的根；WPS 空组段被拦=F24 又不被转发=按键死的根）。raw
+            // 非空=组段在身（提交/撤光后引擎回 raw=""）。keymap 两表解析
+            // 完才动快照（kmi 在此可见）。
+            let raw_cur = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+            CAPS_SNAP_COMP.store(
+                !raw_cur.is_empty(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let caps_mapped =
+                g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
+            CAPS_SNAP_MAPPED.store(caps_mapped, std::sync::atomic::Ordering::Release);
+            // caps 有映射（组段态会消费它）→ 进程装 LL 钩子
+            //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
+            if caps_mapped {
+                caps_hook_install();
+            }
             // 【按住键可录·十三修】同帧解析三组合（freq/delete/export）
             // 为 VK 集缓存；旧引擎 state 无字段 → unwrap_or 默认串 =
             // 旧版行为，前向兼容。组合变了才 trace（每键一拍不刷屏）。
