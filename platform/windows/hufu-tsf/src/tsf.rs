@@ -2482,9 +2482,11 @@ unsafe extern "system" fn caps_ll_proc(
             }
             if caps_hook_should_virtualize() {
                 CAPS_LL_BLOCKED_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-                crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 投递虚键注入（系统位/灯不动）");
                 // 转交泵线程异步注入——LL 回调内 SendInput 是禁手
-                //（输入注入自嵌套）。
+                //（输入注入自嵌套）；**打点也只许在泵侧做**——trace()
+                // 内含文件互斥+磁盘写，UI 线程持锁刷日志时回调一阻塞就
+                // 撞 LowLevelHooksTimeout（微软文档：回调超时系统静默
+                // 摘钩，全系统键路），拦截打点挪到泵的 CAPS_WM_VIRT 处。
                 let tid = CAPS_PUMP_TID.load(std::sync::atomic::Ordering::SeqCst);
                 if tid != 0 {
                     unsafe {
@@ -2553,6 +2555,9 @@ fn caps_hook_install() {
             .as_bool()
             {
                 if msg.message == CAPS_WM_VIRT {
+                    // 拦截打点在泵侧落盘（回调内禁 I/O——文件互斥+磁盘写
+                    // 会阻塞全系统键路，见 LowLevelHooksTimeout 摘钩）。
+                    crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 泵侧注入虚键（系统位/灯不动）");
                     caps_virt_send();
                     continue; // 线程消息：不翻译不派发
                 }
