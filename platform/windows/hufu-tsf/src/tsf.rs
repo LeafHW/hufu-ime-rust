@@ -3082,6 +3082,25 @@ impl HuFuTs_Impl {
                         if extra == CAPS_VIRT_MAGIC { "标记" } else { "闩锁" }
                     ));
                 }
+            } else {
+                // 【WPS 三事件拆包 2026-10-13】WPS 把一对注入拆成
+                // test-down/full-down/test-up **三事件**，闩锁两票在
+                // 前两件耗尽——末尾 test-up 无票认领、保持 F24 身份
+                // 溜走 → caps 抬键簿记永不清（modekey_down_seen 挂起
+                // 只认 caps 抬键）→ 下一轮真 caps 被当重复按下吞
+                //（隔轮死键）；组段积压 d → 再下轮选中积压编码三选
+                //（「确实」变「太大/石灰石」）。替它完成簿记：清 caps
+                // 挂起 + 记 up_last（真 up 迟到也被 250ms 去重挡）。
+                {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(g.modekey_down_seen, Some((v, _)) if v == 0x14) {
+                        g.modekey_down_seen = None;
+                    }
+                    g.modekey_up_last = Some((0x14, std::time::Instant::now()));
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace("caps: F24 尾事件无票（WPS拆三件）→ 代行 caps 抬键簿记");
+                    }
+                }
             }
         }
         // 【Caps 系统态补偿·吞合成键 2026-10-12 三次】只吞自家 keybd_event
