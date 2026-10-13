@@ -2280,13 +2280,73 @@ static CAPS_FIXUP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// 带标记的合成事件，真实用户快击永不被时间窗误吞（用户实锤）。
 const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
 
+// ── 【补偿结算制 2026-10-13】大写位卡 ON 根治 ──────────────────────
+// 旧「查后翻」竞态（EmEditor/WPS 实锤 trace 1791911730457 窗）：补偿
+// 对注入输入队列后，系统大写位要等宿主消息循环消化那对键才翻转——
+// 按键预处理重的宿主（WPS/EmEditor）消化慢，150ms 延时复检线程读到
+// 滞后旧态「仍 ON」→ 再补一对 → 多对补偿净翻转 = 大写位卡 ON → 后
+// 续字母被宿主按大写形态送出（D 泄漏）→ 组段空 → caps 落空组段变
+// 模式键 → 锁定大写奇偶乱（「再按也切不回」）。Notepad3 类轻宿主毫
+// 秒级消化 → 复检恒读 OFF 无事——「不同软件行为不一」的根源。
+// 修法：**任一时刻最多一对在飞**。注入计数（INJ）在 caps_synth_flip
+// 里 +1；消化计数（SEEN）在键入口魔法标记 down 直通时 +1。只有
+// INJ==SEEN（全部落地）才允许注入下一对——在飞未落地时读到的 ON
+// 是滞后假象，等下一拍；真卡 ON（灯常亮）等落地后复检照修不误。
+// 陈旧保护：在飞超 1.5s 视为丢失（宿主没回送魔法 down——AppContainer
+// 键路改道等），SEEN 对齐 INJ 解除武装，防复检永久瘫痪（灯常亮漏修
+// 回归）。
+static CAPS_PAIR_INJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CAPS_PAIR_SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CAPS_PAIR_INJ_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 在飞对子最宽存活（ms）——超时按丢失结算（见上）。
+const CAPS_PAIR_STALE_MS: u64 = 1500;
+
 fn caps_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-/// 合成一对 Caps 翻转（带魔法标记；查后翻语义由调用方保证）。
+
+/// 在飞补偿对是否已全部落地（含超时丢失对齐——纯判定，单测覆盖）。
+fn caps_pairs_settled(now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let inj = CAPS_PAIR_INJ.load(Relaxed);
+    let seen = CAPS_PAIR_SEEN.load(Relaxed);
+    if inj == seen {
+        return true;
+    }
+    // 在飞超时：宿主没回送魔法 down（键路改道/标记被剥）——按丢失
+    // 结算，对齐计数解除武装（宁可多等一拍，不可永久瘫痪）。
+    let inj_at = CAPS_PAIR_INJ_AT.load(Relaxed);
+    if inj_at != 0 && now_ms.saturating_sub(inj_at) > CAPS_PAIR_STALE_MS {
+        CAPS_PAIR_SEEN.store(inj, Relaxed);
+        return true;
+    }
+    false
+}
+
+/// 结算守卫下的安全注入：系统大写位 ON 且无在飞对子才合成一对。
+/// 返回 true=已注入；false=未注入（位已 OFF / 在飞未落地）。
+/// 即时路（消费现场）与延时复检路共用——不变量唯一：最多一对在飞。
+fn caps_synth_flip_if_on(now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    unsafe {
+        if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
+            return false;
+        }
+    }
+    if !caps_pairs_settled(now_ms) {
+        return false; // 在飞对子未落地：此刻读到的 ON 是滞后假象，等复检
+    }
+    caps_synth_flip();
+    CAPS_PAIR_INJ.fetch_add(1, Relaxed);
+    CAPS_PAIR_INJ_AT.store(now_ms, Relaxed);
+    true
+}
+
+/// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_flip_if_on
+/// 结算守卫——翻转是「翻当前态」，叠加注入会净翻错向）。
 fn caps_synth_flip() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
@@ -2296,6 +2356,7 @@ fn caps_synth_flip() {
         keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, CAPS_FIXUP_MAGIC);
     }
 }
+
 
 // ── 【候选窗焦点矫正 2026-10-12】──────────────────────────────
 // 事实（trace 1791748399 Notepad3 实录）：左键点候选窗后
@@ -2703,6 +2764,12 @@ impl HuFuTs_Impl {
                 windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
             }.0 as usize;
             if extra == CAPS_FIXUP_MAGIC {
+                // 【补偿结算制 2026-10-13】在飞对子的 down 已被宿主消化
+                // （+1 落地计数；up 不计——一对只算一次）。复检凭
+                // INJ==SEEN 判定「全部落地」，杜绝旧竞态里的叠加注入。
+                if !up {
+                    CAPS_PAIR_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 crate::tsf::trace("caps: 合成翻转键（HUFU 标记）→ 直通不递引擎");
                 return BOOL(0);
             }
@@ -3299,32 +3366,56 @@ impl HuFuTs_Impl {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if name == "capslock" && consumed && keymap_has("capslock") && !caps_locked_now {
-            // 即时：系统位已翻 ON → 合成一对翻回 OFF（带魔法标记）。
-            unsafe {
-                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
-                    crate::tsf::trace("caps: 系统大写位被翻转(即时) → 合成补偿键翻回 OFF");
-                    caps_synth_flip();
+            // 即时：结算守卫下安全注入（在飞未落地=让位复检——此刻读
+            // 到的 ON 是滞后假象，叠加注入正是旧竞态大写位卡 ON 的根）。
+            {
+                let now = caps_now_ms();
+                if (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0 {
+                    if caps_synth_flip_if_on(now) {
+                        crate::tsf::trace("caps: 系统大写位被翻转(即时·结算) → 合成补偿键翻回 OFF");
+                    } else {
+                        crate::tsf::trace("caps: 位 ON 但有在飞补偿对 → 让位延时复检");
+                    }
                 }
             }
-            // 延时复检：晚到的物理翻转/LED 未跟随兜底。查后翻、幂等
-            //（已 OFF 不动）；代数循环——跑期间又有新击键则延长观察
-            //（单飞弃权=快击漏修，用户实锤「连按几次仍有概率常亮」）。
+            // 延时复检：晚到的物理翻转/LED 未跟随兜底。**结算制**（见
+            // caps_synth_flip_if_on 注释）：只在全部补偿对落地（INJ==
+            // SEEN）后读位，ON 且 60ms 后复核仍 ON 才补——滞后的假 ON
+            // 落地前不动手，真卡 ON（灯常亮）照修不误。代数循环——跑
+            // 期又有新击键则延长观察（单飞弃权=快击漏修，用户实锤）。
             CAPS_FIXUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !CAPS_FIXUP_BUSY.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 std::thread::spawn(|| {
                     loop {
                         let gen_at_start =
                             CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed);
-                        for _ in 0..4 {
+                        for _ in 0..5 {
                             std::thread::sleep(std::time::Duration::from_millis(120));
+                            let now = caps_now_ms();
+                            if !caps_pairs_settled(now) {
+                                continue; // 在飞未落地：本拍只等不动手
+                            }
                             unsafe {
-                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
-                                    crate::tsf::trace("caps: 延时复检仍 ON → 补翻 OFF（LED 跟随）");
-                                    caps_synth_flip();
-                                    // 本观察窗只翻一次：合成键状态传播有竞
-                                    // 态窗，连续两翻会净翻回 ON。
-                                    break;
+                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
+                                    continue;
                                 }
+                            }
+                            // 双读确认：60ms 后仍 ON 才动手（消瞬时抖动）。
+                            std::thread::sleep(std::time::Duration::from_millis(60));
+                            let now2 = caps_now_ms();
+                            if !caps_pairs_settled(now2) {
+                                continue;
+                            }
+                            unsafe {
+                                if (GetKeyState(VK_CAPITAL.0 as i32) & 1) == 0 {
+                                    continue;
+                                }
+                            }
+                            if caps_synth_flip_if_on(now2) {
+                                crate::tsf::trace("caps: 延时复检确认卡 ON（已结算）→ 补翻 OFF（LED 跟随）");
+                                // 本观察窗只翻一次：合成键状态传播有竞
+                                // 态窗，连续两翻会净翻回 ON。
+                                break;
                             }
                         }
                         if CAPS_FIXUP_GEN.load(std::sync::atomic::Ordering::Relaxed)
@@ -9852,6 +9943,56 @@ pub(crate) fn candidate_window_visible(thread: u32) -> bool {
         local || windows::Win32::UI::WindowsAndMessaging::FindWindowW(
             windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null()).ok()
             .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
+    }
+}
+
+#[cfg(test)]
+mod caps_settle_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// 结算制核心判定：注入/落地计数与超时丢失对齐（纯逻辑，不碰键盘）。
+    /// 每测例先把三口钟拨到已知态（单测串行，无并发互扰）。
+    fn reset(inj: i64, seen: i64, inj_at: u64) {
+        CAPS_PAIR_INJ.store(inj, Relaxed);
+        CAPS_PAIR_SEEN.store(seen, Relaxed);
+        CAPS_PAIR_INJ_AT.store(inj_at, Relaxed);
+    }
+
+    #[test]
+    fn settled_when_balanced() {
+        reset(0, 0, 0);
+        assert!(caps_pairs_settled(1_000_000));
+        reset(3, 3, 999_000);
+        assert!(caps_pairs_settled(1_000_000));
+    }
+
+    #[test]
+    fn inflight_blocks_until_seen_or_stale() {
+        // 注入 1、落地 0：在飞 → 不结算（此刻读到的 ON 是滞后假象，
+        // 旧竞态里复检就是在这里叠加注入导致大写位卡 ON）。
+        reset(1, 0, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + 100));
+        // 落地追平 → 结算。
+        CAPS_PAIR_SEEN.store(1, Relaxed);
+        assert!(caps_pairs_settled(1_000_000 + 120));
+        // 多对在飞同理。
+        reset(3, 1, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + 200));
+        CAPS_PAIR_SEEN.store(3, Relaxed);
+        assert!(caps_pairs_settled(1_000_000 + 220));
+    }
+
+    #[test]
+    fn stale_inflight_aligned_as_lost() {
+        // 在飞超 1.5s：宿主没回送魔法 down（键路改道/标记被剥）——按丢
+        // 失结算并自动对齐（防复检永久瘫痪=灯常亮漏修回归）。
+        reset(2, 0, 1_000_000);
+        assert!(caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS + 1));
+        assert_eq!(CAPS_PAIR_SEEN.load(Relaxed), 2, "超时应把 SEEN 对齐到 INJ");
+        // 未超时不动。
+        reset(2, 0, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS - 1));
     }
 }
 
