@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ; HuFu 虎符输入法 · 单 exe 安装包（Inno Setup 6）
 ; ----------------------------------------------------------------------------
 ; 架构铁律（与 install.ps1 双阶段一一对齐，勿"标准化"改动）：
@@ -100,6 +100,9 @@ Source: "staging\hufu-tsf-smoke.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\TigerClaw.Sentence.Native.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
+#ifdef RUST_ENGINE
+Source: "staging\hufu-setup-engine.exe"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "staging\hufu-setup-tools.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-postboot.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ; zip 时代 卸载.bat 由构建替换为指向安装器体系的 stub（GBK）；exe 体系不
@@ -622,7 +625,22 @@ var
   Extra: String;
 begin
   Extra := '';
-  if NoHKLMMode then Extra := ' -NoHKLM';
+  if NoHKLMMode then Extra := ' --no-hklm';
+#ifdef RUST_ENGINE
+  // Rust 引擎轨：零 PowerShell 子进程。引擎自身把进度写 setup-engine.log
+  //（--log 参数），退出码语义与 PS 轨一致（0=成功；1=致命；提权失败仅告警
+  // 不置败——install.ps1 L344/352 同款语义）。
+  Exec(WizardDirValue + '\hufu-setup-engine.exe',
+    'install' + Extra + ' --log "' + WizardDirValue + '\setup-engine.log"',
+    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+  EngineExitCode := Code;
+  Result := (Code = 0);
+  if not Result then begin
+    LogLine('hufu-setup-engine 退出码 ' + IntToStr(Code));
+    SuppressibleMsgBox(Format(ExpandConstant('{cm:EngineFailed}'), [IntToStr(Code),
+      WizardDirValue + '\setup-engine.log']), mbError, MB_OK, IDOK);
+  end;
+#else
   // 血律 M1（审计发现）：install.ps1 成功路径无结尾 exit，$LASTEXITCODE
   // 是最后一次原生调用的遗留码（install.ps1 L339-344 明文警告过的反模式）。
   // 改用 $? 判定；install.ps1 自身显式 exit N 时会直接终结本进程=透传 N。
@@ -640,16 +658,22 @@ begin
     SuppressibleMsgBox(Format(ExpandConstant('{cm:EngineFailed}'), [IntToStr(Code),
       WizardDirValue + '\setup-engine.log']), mbError, MB_OK, IDOK);
   end;
+#endif
 end;
 
 function ServerAlive(): Boolean;
 var
   Code: Integer;
 begin
+#ifdef RUST_ENGINE
+  Exec(WizardDirValue + '\hufu-setup-engine.exe', 'server-alive',
+    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+#else
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' +
     'exit [int](-not (Get-Process hufu-server -ErrorAction SilentlyContinue))"',
     '', SW_HIDE, ewWaitUntilTerminated, Code);
+#endif
   Result := (Code = 0);
 end;
 
@@ -698,10 +722,16 @@ begin
       LogLine('警告：HKCU InstallDir=' + DirNow + ' 与安装目录不一致（注册可能异常）');
 
     // 4) RunOnce：重启后清 .oldN + 自检（幂等，无事则秒退）
+#ifdef RUST_ENGINE
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\RunOnce',
+      'HuFuPostBoot',
+      '"' + WizardDirValue + '\hufu-setup-engine.exe" postboot');
+#else
     RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\RunOnce',
       'HuFuPostBoot',
       'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
       WizardDirValue + '\hufu-postboot.ps1"');
+#endif
 
     // 5) server 存活核验（install.ps1 已启动；未活则经 explorer 拉起）
     Sleep(3000);
@@ -815,6 +845,10 @@ begin
 
     // 0a) 修实证债务 R16：清默认输入法覆盖（必须先于语言列表减法）
     //    S2（审计）：只清"指向虎符"的覆盖，他人输入法的默认设置不碰
+#ifdef RUST_ENGINE
+    Exec(AppDir + '\hufu-setup-engine.exe', 'clear-override',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, Code);
+#else
     Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' +
       '$v=(Get-ItemProperty ''HKCU:\Control Panel\International\User Profile''' +
@@ -823,6 +857,7 @@ begin
       '''HKCU:\Control Panel\International\User Profile''' +
       ' -Name InputMethodOverride -ErrorAction SilentlyContinue }; exit 0"',
       '', SW_HIDE, ewWaitUntilTerminated, Code);
+#endif
     LogLine('InputMethodOverride 清除完成（仅虎符值）');
 
     // 0b) S3（审计）：清掉 RunOnce 尾巴，防重启后引用已删除的脚本
@@ -835,8 +870,24 @@ begin
     SweepInstallDirProcesses(AppDir, True);
 
     // 2) 提权一次跑引擎尾巴：[原版 uninstall.ps1] + PFRO 挂删 SystemIME
-    //    残留 + HKLM 清净校验（tools 内部以管理员运行 uninstall.ps1，
+    //    残留 + HKLM 清净校验（Rust 轨=hufu-setup-engine uninstall 自带
+    //    全部三件；PS 轨=tools 内部以管理员运行 uninstall.ps1，
     //    它检测到已是管理员即不再二次自提权）
+#ifdef RUST_ENGINE
+    ElevatedOk := ShellExec('runas',
+      AppDir + '\hufu-setup-engine.exe',
+      'uninstall --log "' + AppDir + '\setup-engine.log"',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, Code);
+    if (not ElevatedOk) or (Code = 1223) then begin
+      // UAC 被拒 → 回退每用户清理（--no-hklm 语义；机器级残留留待重装覆盖）
+      LogLine('提权被拒，回退每用户卸载（HKLM/SystemIME 残留将保留）');
+      Exec(AppDir + '\hufu-setup-engine.exe',
+        'uninstall --no-hklm --log "' + AppDir + '\setup-engine.log"',
+        AppDir, SW_HIDE, ewWaitUntilTerminated, Code);
+    end else if Code <> 0 then
+      LogLine('引擎卸载尾 退出码 ' + IntToStr(Code) +
+        '（4=HKLM 残留，详见 setup-engine.log）');
+#else
     ElevatedOk := ShellExec('runas',
       ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + AppDir +
@@ -852,14 +903,22 @@ begin
     end else if Code <> 0 then
       LogLine('ElevatedUninstallTail 退出码 ' + IntToStr(Code) +
         '（4=HKLM 残留，详见 setup-tools.log）');
+#endif
 
     // 3) 彻底删数据（仅当用户明确选择 /PURGEDATA 或界面勾选）
     if PurgeDataFlag then begin
+#ifdef RUST_ENGINE
+      Exec(AppDir + '\hufu-setup-engine.exe',
+        'purge-data --log "' + AppDir + '\setup-engine.log"',
+        AppDir, SW_HIDE, ewWaitUntilTerminated, Code);
+      LogLine('PurgeData 完成');
+#else
       Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
         '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + AppDir +
         '\hufu-setup-tools.ps1" -PurgeData -InstDir "' + AppDir + '"',
         AppDir, SW_HIDE, ewWaitUntilTerminated, Code);
       LogLine('PurgeData 完成');
+#endif
     end;
   end;
 end;

@@ -1,0 +1,27 @@
+[package]
+name = "hufu-setup-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HuFu 安装/卸载引擎（install.ps1/uninstall.ps1 血律的 Rust 编译版，行为逐条等价）"
+
+[[bin]]
+name = "hufu-setup-engine"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
+] }
+windows-core = "0.58"
+winreg = "0.55"

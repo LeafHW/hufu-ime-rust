@@ -16,6 +16,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$PkgSource = 'E:\DSH-KF\hufu-发行\打包源',
     [string]$DistDir = 'E:\DSH-KF\hufu-发行',
+    # 引擎轨（2026-10-14）：ps1=血律 PowerShell（回滚轨，默认）；rust=hufu-setup-engine
+    # 编译版接管 install/uninstall/postboot/purge（安装全程零 PowerShell 子进程）
+    [ValidateSet('ps1', 'rust')][string]$Engine = 'ps1',
     [switch]$SkipCompile
 )
 
@@ -66,6 +69,27 @@ Copy-Item $readmeSetup.FullName "$staging\使用说明.txt" -Force
 Copy-Item (Join-Path $helper '卸载-stub.bat') "$staging\卸载.bat" -Force
 Copy-Item (Join-Path $helper 'hufu-setup-tools.ps1') $staging -Force
 Copy-Item (Join-Path $helper 'hufu-postboot.ps1') $staging -Force
+
+# ── Rust 引擎轨（-Engine rust）：编译 hufu-setup-engine 并入包 ──────────────
+# 血律 PS 三件仍随包（回滚轨 + zip 线共用；iss 按 RUST_ENGINE 宏选路）。
+if ($Engine -eq 'rust') {
+    $cargoRoot = Join-Path $setupRoot '..'   # platform\windows（cargo workspace）
+    # cargo 把编译进度写 stderr；本脚本 EAP=Stop 下 2>&1 会把首行 ErrorRecord
+    # 升级成终止错误——围绕调用临时降为 Continue（真失败由 $LASTEXITCODE 判）。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo build -p hufu-setup-engine --release --quiet --manifest-path (Join-Path $cargoRoot 'Cargo.toml') 2>&1 | Tee-Object -Variable cargoOut | Out-Null
+    $cargoExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($cargoExit -ne 0) {
+        $cargoOut | Select-Object -Last 30 | Write-Host
+        Fail("cargo 构建 hufu-setup-engine 失败（退出码 $cargoExit）")
+    }
+    $engineBuilt = Join-Path $cargoRoot 'target\release\hufu-setup-engine.exe'
+    if (-not (Test-Path $engineBuilt)) { Fail('cargo 报告成功但未找到 target\release\hufu-setup-engine.exe') }
+    Copy-Item $engineBuilt $staging -Force
+    Ok(("Rust 引擎已入包：hufu-setup-engine.exe（{0:N0} KB）" -f ((Get-Item $engineBuilt).Length/1KB)))
+}
 
 # ── 图标体系（2026-10-13 用户定稿：全套换虎符头图标，白底已抠透明）──
 # 1) 安装/卸载器 + {app}\图标.ico ← icons\虎符.ico（多尺寸 256/64/48/32/16）
@@ -152,7 +176,9 @@ Ok("staging 完成：$($dataFiles.Count) 个数据文件，共 ${stagedMB}MB（�
 # ── 4) 编译 ───────────────────────────────────────────────────────────────
 if ($SkipCompile) { Ok('SkipCompile：staging 与 inc 已生成，未编译'); exit 0 }
 
-& $iscc "/DSetupVersion=$Version" "/DDistDir=$DistDir" (Join-Path $setupRoot 'hufu-setup.iss') | Tee-Object -Variable isccOut
+$isccArgs = @("/DSetupVersion=$Version", "/DDistDir=$DistDir")
+if ($Engine -eq 'rust') { $isccArgs += '/DRUST_ENGINE=1' }
+& $iscc @isccArgs (Join-Path $setupRoot 'hufu-setup.iss') | Tee-Object -Variable isccOut
 if ($LASTEXITCODE -ne 0) { Fail("iscc 编译失败（退出码 $LASTEXITCODE）") }
 
 $outExe = Join-Path $DistDir ("HuFuSetup-{0}.exe" -f $Version)
