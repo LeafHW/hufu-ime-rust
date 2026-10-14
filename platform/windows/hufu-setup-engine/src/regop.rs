@@ -65,6 +65,15 @@ pub fn get_str(root: &str, path: &str, name: &str) -> Option<String> {
     k.get_value::<String, _>(vname(name)).ok()
 }
 
+/// 读 REG_DWORD；键/值不存在或类型不符 → None。
+/// （语言列表真存储 `International\User Profile\<lang>` 下「值名=tip 串、
+/// 数值=位次」即用此读——【2026-10-15 装完即默认】新增。）
+pub fn get_dword(root: &str, path: &str, name: &str) -> Option<u32> {
+    let hk = root_key(root)?;
+    let k = hk.open_subkey(path).ok()?;
+    k.get_value::<u32, _>(vname(name)).ok()
+}
+
 /// 键是否存在（Test-Path 语义；path 为空 = hive 自身，winreg 返回自身句柄 → true）。
 pub fn key_exists(root: &str, path: &str) -> bool {
     let hk = match root_key(root) {

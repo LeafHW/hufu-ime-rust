@@ -604,6 +604,62 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
     } else {
         out.line("· 默认输入法覆盖写入失败（不影响列表首位默认）");
     }
+
+    // 【装完即默认 2026-10-15·用户拍板】语言列表真存储入列+置首。
+    // 真存储记账规则（本机解剖实证）：HKCU\...\International\User Profile
+    // \<zh-Hans-*> 下「值名=tip 串（0804:{CLSID}{PROFILE}）、数值=位次
+    // REG_DWORD」。此前仅靠 CTF 原生 EnableLanguageProfile（只启 profile，
+    // 不保证入列/位次）+默认覆盖，实测存在 CTF 视图滞后不入列的机器
+    // （2026-10-15 本机：启用 OK 而列表无虎符、新窗口默认不是虎符）。
+    // 此处按真存储规则直接写：虎符入列并置第 1 位，他人条目按原相对
+    // 序整体后移一位（内容零触碰）；与上方默认覆盖双保险=装完默认输入
+    // 法即虎符（列表首位=无覆盖时的兜底默认，两者同指虎符）。Set-
+    // WinUserLanguageList 落盘的就是同一些值（同日本机手工路径实证），
+    // 直写合法性同源；仅处理首个含 0804: 条目的 zh* 语言键（单语言用户
+    // 主场景，多语言用户其首语言即默认来源）。
+    {
+        let up_root = r"Control Panel\International\User Profile";
+        for lk in regop::enum_subkeys("HKCU", up_root) {
+            if !starts_with_ci(&lk, "zh") {
+                continue;
+            }
+            let key = format!(r"{}\{}", up_root, lk);
+            let mut items: Vec<(String, u32)> = Vec::new();
+            let mut has_tip = false;
+            for n in regop::enum_value_names("HKCU", &key) {
+                if !starts_with_ci(&n, "0804:") {
+                    continue;
+                }
+                let v = regop::get_dword("HKCU", &key, &n).unwrap_or(0);
+                if eq_ci(&n, &tip) {
+                    has_tip = true;
+                } else {
+                    items.push((n, v));
+                }
+            }
+            if items.is_empty() && !has_tip {
+                continue; // 无输入法条目的 zh* 键（非语言列表主键）——跳过
+            }
+            items.sort_by_key(|(_, v)| *v);
+            let mut ok_all = regop::set_dword("HKCU", &key, &tip, 1);
+            for (i, (n, _)) in items.iter().enumerate() {
+                if !regop::set_dword("HKCU", &key, n, (i + 2) as u32) {
+                    ok_all = false;
+                }
+            }
+            if ok_all {
+                out.line(&format!(
+                    "OK 默认输入法=虎符：语言列表第 1 位（{}，共 {} 项，他人位序保留）",
+                    lk,
+                    items.len() + 1
+                ));
+            } else {
+                out.line("· 语言列表置首写入部分失败（默认覆盖已兜底，详见 install.log）");
+                out.install_log("install 列表置首: set_dword 部分失败");
+            }
+            break;
+        }
+    }
     // install.ps1 L493
     out.line("OK 语言列表 + 切换器装配已写入");
 
