@@ -318,19 +318,27 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <span class="sub" style="align-self:center">全键盘图形化编辑：任意键（含 Caps/Tab/空格/Shift/F 区）设「有候选时 / 无候选时」两套功能（如 [ 有候选直出？、无候选直出！）。支持冲突检测与一键恢复默认。改完全局生效（含整句模式），重启保留。</span>
     </div>
     <!-- 【按住键可录·十三修】调频/删词按住键 + 导出码表快捷键：录制式录入 -->
+    <!-- 【按住键可停 2026-10-14】调频/删词加启用开关（默认开；关=写空串，
+         DLL 组合空集恒不触发=真停用）——部分用户用不上又只能改键不能取消 -->
     <div class="row" style="flex-wrap:wrap;align-items:center;gap:6px 16px">
       <div class="field"><label>调频按住键</label>
-        <input type="text" id="hk-freq" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
-        <button id="hk-freq-rec" style="padding:4px 12px">录制</button></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="text" id="hk-freq" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
+          <button id="hk-freq-rec" style="padding:4px 12px">录制</button>
+          <span class="checkline"><input type="checkbox" id="hk-freq-on"><label for="hk-freq-on">启用</label></span>
+        </div></div>
       <div class="field"><label>删词按住键</label>
-        <input type="text" id="hk-del" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
-        <button id="hk-del-rec" style="padding:4px 12px">录制</button></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="text" id="hk-del" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default">
+          <button id="hk-del-rec" style="padding:4px 12px">录制</button>
+          <span class="checkline"><input type="checkbox" id="hk-del-on"><label for="hk-del-on">启用</label></span>
+        </div></div>
       <div class="field"><label>导出码表快捷键</label>
         <input type="text" id="hk-exp" readonly style="width:100px;background:var(--bg,#2a2a30);cursor:default" placeholder="未设置">
         <button id="hk-exp-rec" style="padding:4px 12px">录制</button></div>
       <button id="hk-reset" style="padding:4px 12px;align-self:flex-end">恢复默认</button>
     </div>
-    <div class="sub">有候选时按住「调频键」再按数字调频、按住「删词键」再按数字删词（两键独立，同按删词优先）。点「录制」后：按住修饰键再按普通键＝组合键；**全按修饰键再全松开＝录入该修饰组合**（如按住 Ctrl+Shift 松开即录成组合键；单按一键松开＝录入该键本身）；Esc 取消。「导出码表快捷键」任意时刻可按＝按当前方案的记忆格式导出并打开目录（与托盘同路径），留空＝不启用。</div>
+    <div class="sub">有候选时按住「调频键」再按数字调频、按住「删词键」再按数字删词（两键独立，同按删词优先）；不需要该功能时去掉「启用」勾选即彻底关闭（无需把键改到别处）。点「录制」后：按住修饰键再按普通键＝组合键；**全按修饰键再全松开＝录入该修饰组合**（如按住 Ctrl+Shift 松开即录成组合键；单按一键松开＝录入该键本身）；Esc 取消。「导出码表快捷键」任意时刻可按＝按当前方案的记忆格式导出并打开目录（与托盘同路径），留空＝不启用。</div>
     <h3>标点与外观</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="p-full"><label for="p-full">全角标点</label></div>
@@ -736,9 +744,30 @@ function bindInputs() {
   ];
   const HK_DISP = { ctrl: "Ctrl", alt: "Alt", shift: "Shift", win: "Win", capslock: "Caps", space: "空格", enter: "回车", tab: "Tab", backspace: "退格", escape: "Esc", delete: "Del", insert: "Ins", pageup: "PgUp", pagedown: "PgDn", home: "Home", end: "End", left: "←", up: "↑", right: "→", down: "↓" };
   const hkDisp = s => !s ? "未设置" : s.split("+").map(t => t.length === 1 ? t.toUpperCase() : (HK_DISP[t] || t)).join("+");
+  /* 【按住键可停 2026-10-14】调频/删词启用开关：停用=配置写空串
+     （DLL 侧组合空集恒不触发=真停用）；重开=回上次键值（无则默认）。
+     开关只作用于这两个模态键；导出快捷键维持"未设置=不启用"原语义。 */
+  const HK_SWITCHES = [
+    ["#hk-freq-on", "#hk-freq", "#hk-freq-rec", "candidates.freq_key", "ctrl"],
+    ["#hk-del-on", "#hk-del", "#hk-del-rec", "candidates.delete_key", "ctrl+shift"],
+  ];
+  const hkLast = {};
+  function hkVal(path, dflt) { const v = getP(CFG, path); return v === undefined || v === null ? dflt : v; }
+  function hkSyncUI() {
+    for (const [cb, inp, btn, path, dflt] of HK_SWITCHES) {
+      const on = !!hkVal(path, dflt);
+      $(cb).checked = on;
+      $(btn).disabled = !on;
+      $(inp).style.opacity = on ? "" : "0.45";
+    }
+  }
   function hkShow() {
-    for (const [inp, , path, dflt] of HK_PATHS)
-      $(inp).value = hkDisp(getP(CFG, path) || dflt);
+    for (const [inp, , path, dflt] of HK_PATHS) {
+      const v = getP(CFG, path);
+      const shown = v === undefined || v === null ? dflt : v;
+      $(inp).value = shown ? hkDisp(shown) : "未设置";
+    }
+    hkSyncUI();
   }
   const HK_MODS = { Control: "ctrl", Alt: "alt", Shift: "shift", Meta: "win" };
   const HK_NAMES = { " ": "space", Enter: "enter", Backspace: "backspace", Tab: "tab", CapsLock: "capslock", ArrowLeft: "left", ArrowUp: "up", ArrowRight: "right", ArrowDown: "down", PageUp: "pageup", PageDown: "pagedown", Home: "home", End: "end", Delete: "delete", Insert: "insert" };
@@ -759,6 +788,7 @@ function bindInputs() {
     r.btn.textContent = "录制";
     if (combo) {
       setP(CFG, r.path, combo.join("+"));
+      hkLast[r.path] = combo.join("+"); /* 记住本次键值，供开关重开时恢复 */
       autoSave(r.input);
       msg(`已录入：${hkDisp(combo.join("+"))}`, "ok");
     } else {
@@ -797,13 +827,33 @@ function bindInputs() {
     window.addEventListener("blur", hkCancel, true);
   }
   for (const [inp, btn, path] of HK_PATHS) $(btn).onclick = () => hkStart(path, inp, btn);
+  /* 【按住键可停 2026-10-14】开关接线：关=写空串真停用；开=回上次键值
+    （本会话录过用 hkLast，否则配置现值，再退默认），录制器随开关启停。 */
+  for (const [cb, inp, btn, path, dflt] of HK_SWITCHES) {
+    const cur = hkVal(path, dflt);
+    if (cur) hkLast[path] = cur;
+    $(cb).onchange = () => {
+      if ($(cb).checked) {
+        const restore = hkLast[path] || hkVal(path, dflt) || dflt;
+        setP(CFG, path, restore);
+        msg(`已启用（${hkDisp(restore)}），可点「录制」换键`, "ok");
+      } else {
+        setP(CFG, path, "");
+        msg("已停用：该按住键功能不再触发", "");
+      }
+      autoSave($(cb));
+      hkShow();
+    };
+  }
   $("#hk-reset").onclick = () => {
     setP(CFG, "candidates.freq_key", "ctrl");
     setP(CFG, "candidates.delete_key", "ctrl+shift");
     setP(CFG, "general.export_key", "");
+    hkLast["candidates.freq_key"] = "ctrl";
+    hkLast["candidates.delete_key"] = "ctrl+shift";
     autoSave($("#hk-reset"));
     hkShow();
-    msg("已恢复默认（Ctrl / Ctrl+Shift / 未设置）", "ok");
+    msg("已恢复默认（Ctrl / Ctrl+Shift / 未设置，均启用）", "ok");
   };
   hkShow();
   // OpenCC 繁简 / emoji
