@@ -458,30 +458,16 @@ if ($liveSkin -and (Test-Path $liveSkin)) {
 # 又必要，报错让人工处理）。
 $isAdminPack = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$skipTeng = $false
-if (-not $isAdminPack) {
-    if (Get-Process hufu-server -EA SilentlyContinue) {
-        throw '非管理员且 hufu-server 未杀净（无 UAC 腾位不可行）——先停 server 再打包'
-    }
-    $skipTeng = $true
-    Write-Host '  [无 UAC 模式] server 已死——跳过腾位直接压缩（不触碰 SystemIME/语言列表）' -ForegroundColor Yellow
-}
-if (-not $skipTeng -and -not $isAdminPack -and $ElevMark -ne 'elev') {
-    Write-Host '需要管理员（腾位 SystemIME 断 DLL 守护链），请求提权重跑…'
-    # 【2026-09-11 -Wait 悬死修复】Start-Process -Wait 在非交互后台宿主里
-    # 对 RunAs 提权子进程偶发永不返回（子进程已退出甚至从未创建，句柄不
-    # signal——本日两次一小时悬死实录）。改 PassThru + 存活性轮询，15 分
-    # 钟超时兜底；完成与否以最终 zip 产物为准，不依赖此处等待。
-    $ep = Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Version $Version elev $(if ($NoModel) {'-NoModel'})" -PassThru
-    $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalMinutes -lt 15) {
-        $alive = $true
-        try { $alive = -not $ep.HasExited } catch { $alive = [bool](Get-Process -Id $ep.Id -ErrorAction SilentlyContinue) }
-        if (-not $alive) { break }
-        Start-Sleep -Seconds 2
-    }
-    exit
-}
+# 【腾位退役 2026-10-15】压缩对象=打包源（E:），与运行中的 server
+#（D:\HuFu）/ctfmon 零文件冲突——09-12 注释早已实证「腾位的唯一目的
+# 是杀得净 server」，而停服要求本身是「server 从打包源跑」老布局的
+# 化石。腾位/停服只剩纯风险：本环境 UAC 弹不出+提权子进程 -Wait 悬死
+#（09-11 实录一小时两级），09-07 还实测腾位把真机输入法打失效过。
+# 永久免腾位：任何模式（管理员与否、server 死活）一律直接压缩。
+# 瘦身构建覆盖的是 engine\target-slim 产物——与运行位 D:\HuFu 不同
+# 文件，无占用冲突；唯一残留约束见 catch 后的自愈注释。
+$skipTeng = $true
+Write-Host '  [免腾位] 直接压缩（不停服/不碰 SystemIME/不碰语言列表/零提权）' -ForegroundColor Yellow
 $sysIme = "$env:SystemRoot\SystemIME\HuFu"
 $sysBak = $null
 # 【腾位前 DLL 在位快照】还原后校验的地面真值——卸载后的空壳目录
@@ -514,6 +500,10 @@ if (-not $skipTeng -and (Test-Path $sysIme)) {
 # 压缩失败等）都必须先把 SystemIME 改回，否则输入法凭空消失。成功路
 # 径的恢复在 try 块之后（原有逻辑）；catch 里恢复后再抛。
 try {
+# 【腾位退役 2026-10-15】以下杀启/击杀段仅腾位模式需要——$skipTeng 恒
+# true 永不执行，保留作历史档案。压缩本体从 $tmpZip 起，与运行中的
+# server/ctfmon 零文件冲突。
+if (-not $skipTeng) {
 Stop-Process -Name ctfmon -Force -EA SilentlyContinue
 Start-Sleep -Seconds 1
 # 【三十四修 2026-09-13】旧版单杀单查被 DLL 守护链击败：杀 server 后
@@ -535,6 +525,7 @@ while ($killRounds -lt 8) {
 }
 if (Get-Process hufu-server -EA SilentlyContinue) { throw "腾位后 server 仍未退出（$killRounds 轮击杀后仍复活，真异常）" }
 Write-Host "  [OK] server 已停（$killRounds 轮内）"
+}
 $tmpZip = "$REL\.tmp-$zipName"
 if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
 $items = Get-ChildItem $SRC | Where-Object { $_.Name -notmatch '\.old' -and $_.Name -ne 'install.log' -and -not ($NoModel -and $_.Name -eq '模型') }
