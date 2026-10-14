@@ -184,22 +184,68 @@ Remove-Item "$SRC\install.log" -Force -EA SilentlyContinue
 # 【2026-09-06b】安装目录随版本号升级（v1.4.6→v1.4.7→…）——动态跟随
 # D:\HUFU 下最新的 HuFu虎符输入法-v* 目录。
 # 【一级目录布局 2026-09-05】码表/模型已从 数据\ 提升到安装根。
+# 【个人码表覆盖 2026-10-15 用户拍板】「个人自用」「虎整句」两夹是用户
+# 本人在用的私人码表（可能有最新改动）——每次打包必须取本机在跑的最
+# 新版；其余方案夹（五笔/虎码单字/虎码字词等）一律沿用打包源现有镜像
+# 作默认值。本机在跑的三级定位：①正式安装目录（D:\HUFU\HuFu虎符输入
+# 法-v*\码表，取版本最高）→ ②开发部署（D:\HuFu\码表）→ ③最近一次
+# 卸载前备份（E:\DSH-KF\hufu-发行\用户数据备份-*卸载前\码表）。三级
+# 全无才沿用打包源现有两夹镜像（他机打包回退）。
 $liveMa = Get-ChildItem 'D:\HUFU' -Directory -Filter 'HuFu虎符输入法-v*' -EA SilentlyContinue |
     Sort-Object { try { [version]($_.Name -replace '^.*-v','') } catch { [version]'0.0' } } -Descending |
     Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName '码表' }
+$personalSrc = $null
+$personalVia = ''
+foreach($cand in @(
+    @{ p = $liveMa;                                             tag = "安装目录 $liveMa" },
+    @{ p = 'D:\HuFu\码表';                                      tag = '开发部署 D:\HuFu\码表' },
+    @{ p = (Get-ChildItem 'E:\DSH-KF\hufu-发行' -Directory -Filter '用户数据备份-*卸载前' -EA SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName '码表' });
+                                                                tag = '最近卸载前备份' }
+)) {
+    if ($cand.p -and (Test-Path (Join-Path $cand.p '个人自用')) -and (Test-Path (Join-Path $cand.p '虎整句'))) {
+        $personalSrc = $cand.p; $personalVia = $cand.tag; break
+    }
+}
+if ($personalSrc) {
+    foreach($d in @('个人自用','虎整句')){
+        Remove-Item "$SRC\码表\$d" -Recurse -Force -EA SilentlyContinue
+        Copy-Item (Join-Path $personalSrc $d) "$SRC\码表\$d" -Recurse -Force
+    }
+    Get-ChildItem "$SRC\码表\个人自用","$SRC\码表\虎整句" -Recurse -Include '用户调整.txt','adj-audit.log','user-adjust.log' -File -EA SilentlyContinue | ForEach-Object {
+        Remove-Item $_.FullName -Force
+        Write-Host "  [剔] 个人数据: $($_.FullName.Substring($SRC.Length+1))"
+    }
+    Write-Host "  [个人码表] 个人自用/虎整句 ← $personalVia" -ForegroundColor Cyan
+    # 快速对账显示：两夹最新文件时间（供打包人肉眼确认新旧）
+    Get-ChildItem "$SRC\码表\个人自用","$SRC\码表\虎整句" -File -Recurse |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object {
+            Write-Host "    最新文件: $($_.Directory.Name)\$($_.Name) @ $($_.LastWriteTime)" -ForegroundColor Cyan }
+} else {
+    Write-Host '  [警告] 未找到本机在跑的 个人自用/虎整句（三级定位全无）——沿用打包源现有镜像' -ForegroundColor Yellow
+}
 if (-not $liveMa -or -not (Test-Path $liveMa)) {
     # 【2026-09-07 回退】真机未安装（已卸载/他机打包）：沿用打包源现有
     # 码表镜像（上次镜像+瘦身成果），不中断打包。
     if (Test-Path "$SRC\码表") {
-        Write-Host '  [跳过] 真机未安装——沿用打包源现有码表镜像' -ForegroundColor Yellow
+        Write-Host '  [跳过] 真机未安装——整目录镜像跳过（个人两夹已单独处理）' -ForegroundColor Yellow
     } else {
         [void](Check $false '真机码表目录不存在（D:\HUFU\HuFu虎符输入法-v*\码表）')
         throw '真机码表目录缺失且打包源无镜像，无法打包'
     }
 }
 if ($liveMa -and (Test-Path $liveMa)) {
-    if (Test-Path "$SRC\码表") { Remove-Item "$SRC\码表" -Recurse -Force }
-    Copy-Item $liveMa "$SRC\码表" -Recurse -Force
+    # 【2026-10-15 收窄】真机整目录镜像只作「其余方案夹」的同步源——
+    # 个人自用/虎整句已在上面单独覆盖（整目录镜像后重拷一遍防被盖）。
+    if (Test-Path "$SRC\码表") {
+        foreach($d in @('个人自用','虎整句')) {
+            Remove-Item "$SRC\码表\$d" -Recurse -Force -EA SilentlyContinue
+        }
+    }
+    Copy-Item "$liveMa\*" "$SRC\码表" -Recurse -Force -EA SilentlyContinue
+    foreach($d in @('个人自用','虎整句')) {
+        if ($personalSrc) { Copy-Item (Join-Path $personalSrc $d) "$SRC\码表\$d" -Recurse -Force }
+    }
     Get-ChildItem "$SRC\码表" -Recurse -Include '用户调整.txt','adj-audit.log','user-adjust.log' -File -EA SilentlyContinue | ForEach-Object {
         Remove-Item $_.FullName -Force
         Write-Host "  [剔] 个人数据: $($_.FullName.Substring($SRC.Length+1))"
