@@ -7061,8 +7061,24 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             arm_caret_recheck_timer();
             Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
+            // 【T4 竞态补防 2026-10-14】aw：自然键建段=回灌链已无意义
+            //（尾巴字母已内联进 raw/preedit）——旧尾巴若仍挂起，60ms 后
+            // 的补拍会 StartPreedit 出第二个段落在活段后面=多一份字母。
+            // 快打 jafmjafm 真机实锤：今天jafmj（多 j）；现场用户快打
+            // 放大到 ja×3 回放。挂起即弃，自然键接管。
+            if aw_box {
+                g.aw_tail = None;
+                g.aw_pending = None;
+            }
             Some(Op::StartPreedit(preedit.to_string()))
         } else {
+            // 【T4 竞态补防 2026-10-14】aw：pending 转正前段已被自然键
+            // 继续输入（出生文本+新键）——Op::Commit 是整段 SetText 替换
+            //，拿旧 pending 提交会把长出来的字母裁掉。旧文本作废，段内
+            // 容交给自然 SP，用户下一提交键整段上屏。
+            if aw_box {
+                g.aw_pending = None;
+            }
             Some(Op::SetPreedit(preedit.to_string()))
         };
         (op, true, suppress)
@@ -8160,6 +8176,13 @@ pub fn aw_flush_tail() {
     let Some(shared) = tl_shared() else { return };
     let tail = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【T4 竞态补防 2026-10-14】段已活=自然键抢跑了回灌（快打键间隔
+        // <60ms 时必发生），尾巴字母早已内联——再补建就是第二个段=多
+        // 一份字母（今天jafmj 实锤）。弃拍。
+        if g.composition.is_some() {
+            g.aw_tail = None;
+            return;
+        }
         g.aw_tail.take()
     };
     if let Some(x) = tail {
