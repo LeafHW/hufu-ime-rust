@@ -612,50 +612,116 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
     // 不保证入列/位次）+默认覆盖，实测存在 CTF 视图滞后不入列的机器
     // （2026-10-15 本机：启用 OK 而列表无虎符、新窗口默认不是虎符）。
     // 此处按真存储规则直接写：虎符入列并置第 1 位，他人条目按原相对
-    // 序整体后移一位（内容零触碰）；与上方默认覆盖双保险=装完默认输入
-    // 法即虎符（列表首位=无覆盖时的兜底默认，两者同指虎符）。Set-
-    // WinUserLanguageList 落盘的就是同一些值（同日本机手工路径实证），
-    // 直写合法性同源；仅处理首个含 0804: 条目的 zh* 语言键（单语言用户
-    // 主场景，多语言用户其首语言即默认来源）。
+    // 序整体后移一位；与上方默认覆盖双保险=装完默认输入法即虎符。
+    //
+    // 【不准吃别的输入法·血律（承 b4867c6 三阶根治）】历史事故根因=
+    // Set-WinUserLanguageList -Force 整表重建遇 CTF 冷启动枚举少报→少报
+    // 条目被固化删除。本块结构上吃不了：逐值直写位次 DWORD，从不调用
+    // delete_value、从不整表重建，未枚举到的条目原值原样留在盘上。仍按
+    // 血律补全三阶防线：①动刀前等枚举稳定（连续两次同集才动，上限
+    // 10s）②快照全体 0804: 条目③末态核验（两读取并集 ⊇ 快照；晚到
+    // 者收编续排不删）+ install.log 全链留证。
     {
         let up_root = r"Control Panel\International\User Profile";
+        let zh_dword_items = |key: &str| -> Vec<(String, u32)> {
+            let mut v: Vec<(String, u32)> = Vec::new();
+            for n in regop::enum_value_names("HKCU", key) {
+                if starts_with_ci(&n, "0804:") {
+                    let pos = regop::get_dword("HKCU", key, &n).unwrap_or(0);
+                    v.push((n, pos));
+                }
+            }
+            v.sort();
+            v
+        };
         for lk in regop::enum_subkeys("HKCU", up_root) {
             if !starts_with_ci(&lk, "zh") {
                 continue;
             }
             let key = format!(r"{}\{}", up_root, lk);
-            let mut items: Vec<(String, u32)> = Vec::new();
-            let mut has_tip = false;
-            for n in regop::enum_value_names("HKCU", &key) {
-                if !starts_with_ci(&n, "0804:") {
-                    continue;
+            // ① 枚举稳定等待（少报期动刀=位次错乱之源；同集连续两次才继续）
+            let mut snap = zh_dword_items(&key);
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_secs(1));
+                let now = zh_dword_items(&key);
+                if now == snap {
+                    break;
                 }
-                let v = regop::get_dword("HKCU", &key, &n).unwrap_or(0);
-                if eq_ci(&n, &tip) {
-                    has_tip = true;
-                } else {
-                    items.push((n, v));
-                }
+                snap = now;
             }
-            if items.is_empty() && !has_tip {
+            let others: Vec<String> = snap
+                .iter()
+                .filter(|(n, _)| !eq_ci(n, &tip))
+                .map(|(n, _)| n.clone())
+                .collect();
+            if others.is_empty() && !snap.iter().any(|(n, _)| eq_ci(n, &tip)) {
                 continue; // 无输入法条目的 zh* 键（非语言列表主键）——跳过
             }
-            items.sort_by_key(|(_, v)| *v);
-            let mut ok_all = regop::set_dword("HKCU", &key, &tip, 1);
-            for (i, (n, _)) in items.iter().enumerate() {
-                if !regop::set_dword("HKCU", &key, n, (i + 2) as u32) {
+            // ② 快照留证（动刀前全体条目）
+            out.install_log(&format!(
+                "install 列表置首快照: {} 条目 [{}]",
+                snap.len(),
+                snap.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",")
+            ));
+            // 写：虎符=1，他人按原相对序 2,3,…（只写数字，从不删值）
+            let mut ordered: Vec<String> = vec![tip.clone()];
+            let mut by_pos = snap
+                .iter()
+                .filter(|(n, _)| !eq_ci(n, &tip))
+                .cloned()
+                .collect::<Vec<(String, u32)>>();
+            by_pos.sort_by_key(|(_, v)| *v);
+            for (n, _) in &by_pos {
+                ordered.push(n.clone());
+            }
+            let mut ok_all = true;
+            for (i, n) in ordered.iter().enumerate() {
+                if !regop::set_dword("HKCU", &key, n, (i + 1) as u32) {
                     ok_all = false;
                 }
             }
-            if ok_all {
+            // ③ 末态核验：两读并集 ⊇ 快照（晚到者收编续排，任何情况下不删）
+            std::thread::sleep(Duration::from_millis(800));
+            let mut final_set = zh_dword_items(&key);
+            std::thread::sleep(Duration::from_millis(800));
+            for x in zh_dword_items(&key) {
+                if !final_set.contains(&x) {
+                    final_set.push(x);
+                }
+            }
+            final_set.sort();
+            let lost: Vec<String> = snap
+                .iter()
+                .map(|(n, _)| n.clone())
+                .filter(|n| !final_set.iter().any(|(f, _)| eq_ci(f, n)))
+                .collect();
+            let late: Vec<String> = final_set
+                .iter()
+                .map(|(n, _)| n.clone())
+                .filter(|n| !snap.iter().any(|(s, _)| eq_ci(s, n)))
+                .collect();
+            for (i, n) in late.iter().enumerate() {
+                // 晚到者=枚举少报期未见的既有条目：续排在末尾（绝不删）
+                let _ = regop::set_dword("HKCU", &key, n, (ordered.len() + i + 1) as u32);
+            }
+            out.install_log(&format!(
+                "install 列表置首核验: 快照={} 末态={} 丢失=[{}] 晚到=[{}]（本块零删除：丢失恒应为空）",
+                snap.len(),
+                final_set.len(),
+                lost.join(","),
+                late.join(",")
+            ));
+            if !lost.is_empty() {
+                out.line("⚠ 语言列表核验异常（详见 install.log）——本块零删除，条目不可能经此丢失；请反馈");
+                out.install_log("install 列表置首: 丢失非空=枚举异常，需人工复核（非本块删除）");
+            } else if ok_all {
                 out.line(&format!(
-                    "OK 默认输入法=虎符：语言列表第 1 位（{}，共 {} 项，他人位序保留）",
+                    "OK 默认输入法=虎符：语言列表第 1 位（{}，快照 {} 条全数在场零缺失）",
                     lk,
-                    items.len() + 1
+                    snap.len()
                 ));
             } else {
                 out.line("· 语言列表置首写入部分失败（默认覆盖已兜底，详见 install.log）");
-                out.install_log("install 列表置首: set_dword 部分失败");
             }
             break;
         }
