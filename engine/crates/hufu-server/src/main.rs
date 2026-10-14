@@ -1599,6 +1599,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 皮肤 JSON（用户自定义/调过的都在内）。用户规格：设置页只留
         // 「导出 config.json / 导入 config.json」两个动作，升版本一个
         // 文件带走全部设置（含皮肤与自定义按键）。
+        // 【导出瘦身 2026-10-14】挂件图等大内嵌资产按内容入池去重
+        //（bundle 2）：同一张动图在 皮肤.overlay.image 与每个预设槽
+        // 里各存一份 base64——现场实例 1.6MB 动图 ×5 份 = 11.2MB 导出；
+        // 现导出把 ≥1KB 的 data: 字符串换成 asset: 引用、原图只在顶层
+        // assets 池存一份，导入再解回内联（皮肤文件落盘格式不变）。
         ("GET", "/api/settings_export") => {
             let mut skins = serde_json::Map::new();
             for (id, _name) in host.list_skins() {
@@ -1611,12 +1616,19 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                 }
             }
-            Response::json(&serde_json::json!({
-                "hufu_settings_bundle": 1,
+            let mut bundle = serde_json::json!({
+                "hufu_settings_bundle": 2,
                 "exported_at": hufu_engine::dynamic::date_string_iso(),
                 "config": host.engine.config,
                 "skins": skins,
-            }))
+            });
+            let pool = settings_assets_split(&mut bundle);
+            if !pool.is_empty() {
+                if let Some(obj) = bundle.as_object_mut() {
+                    obj.insert("assets".into(), serde_json::Value::Object(pool));
+                }
+            }
+            Response::json(&bundle)
         }
         ("POST", "/api/settings_import") => {
             // body = /api/settings_export 的产物。语义=「叠加到默认值」：
@@ -1624,9 +1636,25 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 落默认）、未知字段忽略（老版没有的新物件不炸）——正是
             // 「新增功能按默认值来」的实现。皮肤逐张校验后落盘（id 只
             // 许 [A-Za-z0-9_-]，防路径注入），再整体应用配置。
-            let v = req.json();
-            if v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) != Some(1) {
-                return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）");
+            // bundle 1=老格式（图内联）；2=资产池引用（导入前解回内联）。
+            let mut v = req.json();
+            match v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) {
+                Some(1) | Some(2) => {}
+                _ => {
+                    return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）")
+                }
+            }
+            if v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) == Some(2) {
+                let pool = v
+                    .get("assets")
+                    .and_then(|x| x.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(skins) = v.get_mut("skins").and_then(|x| x.as_object_mut()) {
+                    for (_id, sv) in skins.iter_mut() {
+                        settings_assets_merge(sv, &pool);
+                    }
+                }
             }
             let Some(cfg_v) = v.get("config") else {
                 return Response::err(400, "设置文件缺 config 节");
@@ -2042,3 +2070,139 @@ mod sys_unix {
         false
     }
 }
+
+// ── 设置导出资产池【导出瘦身 2026-10-14】─────────────────────────────
+// 挂件图（overlay.image 与每个预设槽的 image）在皮肤 JSON 里各存一份
+// base64：现场实测同一张 1.6MB 动图 ×5 份 = 11.2MB 导出。导出把
+// ≥1KB 的 data: 字符串换成 asset:img-<hash>-<len> 引用、原图只在顶层
+// assets 池存一份；导入解回内联（皮肤文件落盘格式不变，运行时零影响）。
+// 纯函数、递归遍历任意嵌套（未来其他大内嵌字段自动受益）。
+mod settings_assets {
+    use serde_json::Value;
+
+    /// 引用键：内容哈希 + 长度（防碰撞双保险）。DefaultHasher::new()
+    /// 固定键、进程间确定——键只需在同一份导出文件内自洽即可。
+    fn asset_key(data_uri: &str) -> String {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(data_uri.as_bytes());
+        format!("asset:img-{:016x}-{}", h.finish(), data_uri.len())
+    }
+
+    /// 递归把 v 里 ≥1KB 的 data: 字符串替换为 asset: 引用，原图收入池
+    ///（同图只存一份）。返回池（可能为空）。
+    pub fn split(v: &mut Value) -> serde_json::Map<String, Value> {
+        let mut pool = serde_json::Map::new();
+        fn walk(v: &mut Value, pool: &mut serde_json::Map<String, Value>) {
+            match v {
+                Value::String(s) => {
+                    if s.starts_with("data:") && s.len() >= 1024 && !s.starts_with("asset:") {
+                        let key = asset_key(s);
+                        pool.entry(key.clone())
+                            .or_insert_with(|| Value::String(s.clone()));
+                        *s = key;
+                    }
+                }
+                Value::Object(m) => {
+                    for (_k, vv) in m.iter_mut() {
+                        walk(vv, pool);
+                    }
+                }
+                Value::Array(a) => {
+                    for vv in a.iter_mut() {
+                        walk(vv, pool);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(v, &mut pool);
+        pool
+    }
+
+    /// 递归把 asset: 引用解回池里的原图；池里没有的引用置空串（文件
+    /// 残缺时不炸、皮肤其余部分照常——image="" 是合法态）。
+    pub fn merge(v: &mut Value, pool: &serde_json::Map<String, Value>) {
+        match v {
+            Value::String(s) => {
+                if s.starts_with("asset:") {
+                    *s = pool
+                        .get(s.as_str())
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            Value::Object(m) => {
+                for (_k, vv) in m.iter_mut() {
+                    merge(vv, pool);
+                }
+            }
+            Value::Array(a) => {
+                for vv in a.iter_mut() {
+                    merge(vv, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 真实结构的缩样：皮肤.overlay.image + presets 槽各一份同图。
+        #[test]
+        fn split_dedupes_and_merge_restores() {
+            let img = format!("data:image/gif;base64,{}", "A".repeat(2048));
+            let orig = serde_json::json!({
+                "overlay": {
+                    "image": img,
+                    "enabled": true,
+                    "presets": [
+                        { "image": img, "base_height": 60 },
+                        { "image": img, "base_height": 45 },
+                    ],
+                },
+                "colors": { "bg": "#fff" },
+            });
+            let mut v = orig.clone();
+            let pool = split(&mut v);
+            // 3 份同图 → 池 1 条、3 处引用同键
+            assert_eq!(pool.len(), 1, "同图只入池一份");
+            let key = pool.keys().next().unwrap().clone();
+            assert_eq!(v["overlay"]["image"].as_str().unwrap(), key);
+            assert_eq!(v["overlay"]["presets"][0]["image"].as_str().unwrap(), key);
+            assert_eq!(v["overlay"]["presets"][1]["image"].as_str().unwrap(), key);
+            // 体积坍缩：3 份图变 1 份 + 3 个短键
+            let before = orig.to_string().len();
+            let after =
+                v.to_string().len() + pool.values().map(|x| x.to_string().len()).sum::<usize>();
+            assert!(after * 2 < before, "至少省一半: {after} vs {before}");
+            // 解回 = 逐字节等价（round-trip 无损）
+            let mut back = v.clone();
+            merge(&mut back, &pool);
+            assert_eq!(back, orig, "merge 后与原 JSON 等价");
+        }
+
+        #[test]
+        fn small_and_non_data_untouched() {
+            let mut v = serde_json::json!({
+                "a": "data:image/png;base64,SHORT",
+                "b": "普通文本 data: 前缀不在开头",
+                "c": 42,
+            });
+            let pool = split(&mut v);
+            assert!(pool.is_empty(), "小图/非 data: 不进池");
+            assert_eq!(v["a"].as_str().unwrap(), "data:image/png;base64,SHORT");
+        }
+
+        #[test]
+        fn missing_ref_blanks_not_panics() {
+            let mut v = serde_json::json!({ "overlay": { "image": "asset:img-deadbeef-9" } });
+            merge(&mut v, &serde_json::Map::new());
+            assert_eq!(v["overlay"]["image"].as_str().unwrap(), "");
+        }
+    }
+}
+use settings_assets::{merge as settings_assets_merge, split as settings_assets_split};
