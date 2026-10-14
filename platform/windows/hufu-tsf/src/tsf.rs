@@ -5770,6 +5770,9 @@ fn focus_view_class() -> Option<String> {
 /// 略）切了「使用旧版控制台」——该模式 conhost 的 GetTextExt 返回垃圾
 ///（实测锚在首行横幅，光标实际在下面第 4 行）。进程级缓存一次：该设
 /// 置只对新开控制台生效，变更本来就要重开窗口（=新进程）。
+/// 【2026-10-15 门控拆除】ForceV2 不再决定通道选择（管理员 V2 cmd 实锤
+/// 同样出垃圾锚，见 query 链注释）——保留函数作诊断参考。
+#[allow(dead_code)]
 fn console_legacy_mode() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| {
@@ -6048,28 +6051,45 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 可退回系统原始锚）。新版 conhost（ForceV2=1）GetTextExt 实测正
     // 确——落标准链零改动。仅 ConsoleWindowClass 门控。
     if focus_view_class().as_deref() == Some("ConsoleWindowClass") {
-        if let Some(rect) = console_caret_rect() {
+        // 【分通道取证 2026-10-15】三通道各自落 rect（含失败），一次打字
+        // 即可定位谁在给垃圾锚。direct 通道原先无痕。
+        let r_direct = console_caret_rect();
+        trace(&format!(
+            "qc/console 通道取证: direct={}",
+            r_direct
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_direct {
             seed_est_from_anchor(g, &rect, "console");
             g.caret = Some(rect);
             return;
         }
-        if console_legacy_mode() {
-            // MSAA 真光标（X/Y 全跟，含逐列右移）
-            if let Some(rect) = console_msaa_caret_rect() {
-                seed_est_from_anchor(g, &rect, "console-msaa");
-                g.caret = Some(rect);
-                return;
-            }
-            // 【server AttachConsole 通道 2026-10-15】进程内双通道+MSAA
-            // 皆死后借 server（外部进程）AttachConsole 到本控制台客户
-            // 端读真光标。节流 80ms（打字帧率下避免连发）。
-            if let Some(rect) = console_caret_rect_via_server() {
-                seed_est_from_anchor(g, &rect, "console-srv");
-                g.caret = Some(rect);
-                return;
-            }
-            trace("qc/console: 旧版模式无真光标 → 标准链（不钉位）");
+        let r_msaa = console_msaa_caret_rect();
+        trace(&format!(
+            "qc/console 通道取证: msaa={}",
+            r_msaa
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_msaa {
+            seed_est_from_anchor(g, &rect, "console-msaa");
+            g.caret = Some(rect);
+            return;
         }
+        let r_srv = console_caret_rect_via_server();
+        trace(&format!(
+            "qc/console 通道取证: srv={}",
+            r_srv
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_srv {
+            seed_est_from_anchor(g, &rect, "console-srv");
+            g.caret = Some(rect);
+            return;
+        }
+        trace("qc/console: 三通道皆无真光标 → 标准链（不钉位）");
     }
     // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴 pain est 豁免链）
     // 入口分派已删——全部宿主统一走下方标准链。
