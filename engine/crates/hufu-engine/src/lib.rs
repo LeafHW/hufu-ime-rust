@@ -1155,7 +1155,26 @@ impl Engine {
                     return out;
                 }
             }
-            // Esc / Backspace / 组合键：取消 pending（清组段、点丢弃）
+            // 【悬点不吞 Ctrl+空格 2026-10-14】现场实锤（管道复现）：数字后
+            // 按 . 进悬点，再 Ctrl+空格 → 本分支把组合键一律当「取消悬点」
+            // 吃掉不切换（用户：敲两下才切成英文）。悬点是延迟显示、从未
+            // 落屏——按组合键离开 = 先落半角 . 再走组合键本职（与上方
+            // 可打印键 flush 并点同口径，用户敲过这个点不能吞）。
+            if m.ctrl && !m.alt {
+                if let Some(c) = key.key.as_char() {
+                    if c == ' ' && self.config.general.ctrl_space_switch {
+                        session.raw.clear();
+                        let mut out = self.process_key_inner(session, key);
+                        out.commit = Some(match out.commit.take() {
+                            Some(t) => format!(".{t}"),
+                            None => ".".to_string(),
+                        });
+                        out.consumed = true;
+                        return out;
+                    }
+                }
+            }
+            // Esc / Backspace / 其余组合键：取消 pending（清组段、点丢弃）
             if key.key == KeyCode::Escape || key.key == KeyCode::Backspace || m.ctrl || m.alt {
                 session.raw.clear();
                 return KeyOutcome::consumed(self.state(session));

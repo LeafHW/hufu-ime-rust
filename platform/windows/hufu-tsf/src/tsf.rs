@@ -1445,19 +1445,49 @@ pub(crate) fn ime_switch_abort(shared: &SharedRef) {
 /// （0=无待同步 1=中文 2=英文）——Shared 含 COM 原始指针不可跨
 /// 线程移动，经此原子中转；下一次 dispatch（UI 线程）懒应用。
 static CHINESE_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 【急切同步+防陈旧 2026-10-14】worker 发 focus 前对 MODE_SEQ 的快照。
+/// 应用时对不上 = 期间已有更新的引擎态落盘（如恰好 Ctrl+空格切换），
+/// 本份 focus 回执陈旧 → 作废（旧行为会拿它覆盖刚切换的新态=切窗后
+/// 牌面显示反了的现场反馈根源之一）。
+static SYNC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 中英态落盘序号：每次把引擎回执的 chinese 应用到 g.chinese 时递增。
+static MODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn note_mode_applied() {
+    MODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// 懒应用待同步的中英态（dispatch 入口调用，UI 线程安全）。
 fn apply_chinese_sync(shared: &SharedRef) {
     let v = CHINESE_SYNC.swap(0, std::sync::atomic::Ordering::AcqRel);
     if v != 0 {
+        if SYNC_SEQ.load(std::sync::atomic::Ordering::Acquire)
+            != MODE_SEQ.load(std::sync::atomic::Ordering::Acquire)
+        {
+            trace("焦点同步: 回执陈旧（期间有更新中英态落盘）→ 作废");
+            return;
+        }
         let zh = v == 1;
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.chinese != zh {
             g.chinese = zh;
             crate::langbar::set_mode(zh);
+            note_mode_applied();
             trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
         }
     }
+}
+
+/// 【急切同步 2026-10-14】defer 窗（UI 线程）收到 focus 回执后的立即
+/// 应用入口。旧行为只把回执存进 CHINESE_SYNC 等下一次按键才应用——
+/// 切窗后用户看一眼牌面（还没打字）显示的仍是旧态（现场反馈：EmEditor
+/// ↔cmd 切换后中英显示不准）。现 worker 存好回执即 PostMessage 到
+/// langbar defer 窗（首激活线程的消息泵必然在转），此处同线程取
+/// G_SHARED 应用（Shared 非 Send，G_SHARED 访问持 Mutex 安全）。
+pub fn defer_apply_chinese_sync() {
+    let Some(shared) = G_SHARED.get().map(|g| g.0.clone()) else {
+        return;
+    };
+    apply_chinese_sync(&shared);
 }
 
 /// 【候选窗交互收场自愈 2026-10-12·标记半】candwin2 在点击抬起（死区
@@ -2178,12 +2208,19 @@ fn handle_set_focus(
     // 线程 → worker 经 CHINESE_SYNC 原子中转，下一次 dispatch
     // （UI 线程）懒应用（焦点到首键间隔数百 ms，管道 ms 级）。
     std::thread::spawn(|| {
+        // 【急切同步+防陈旧 2026-10-14】先快照落盘序号再发 focus：回执
+        // 到手时若序号已前进（期间用户切换了中英），这份回执就是陈旧
+        // 值，应用侧作废。存好即 PostMessage defer 窗立即应用（不等下
+        // 一键——切窗后牌面要马上对）。
+        let seq0 = MODE_SEQ.load(std::sync::atomic::Ordering::Acquire);
         if let Some(resp) = ipc::call(&serde_json::json!({ "op": "focus" })) {
             let zh = resp
                 .pointer("/state/chinese")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             CHINESE_SYNC.store(if zh { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+            SYNC_SEQ.store(seq0, std::sync::atomic::Ordering::Release);
+            crate::langbar::post_mode_sync();
         }
     });
     trace("foc: C spawn完");
@@ -3214,6 +3251,7 @@ impl HuFuTs_Impl {
                             if g.chinese != zh {
                                 g.chinese = zh;
                                 crate::langbar::set_mode(zh);
+                                note_mode_applied();
                             }
                             // 【Shift 上屏立即收窗 2026-09-16】带 commit=
                             // 上屏编码：空帧分支改走 hide_now（无 hold
@@ -3835,6 +3873,7 @@ impl HuFuTs_Impl {
                 if g.chinese != zh {
                     g.chinese = zh;
                     crate::langbar::set_mode(zh);
+                    note_mode_applied();
                     trace(&format!("自愈: 本地中英态回填 chinese={zh}"));
                 }
             }
@@ -7066,6 +7105,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             g2.chinese = zh;
             // 语言栏「中/A」：Shift 切换也走这里回填图标/文字
             crate::langbar::set_mode(zh);
+            note_mode_applied();
         }
         g2.composing = !state
             .get("raw")

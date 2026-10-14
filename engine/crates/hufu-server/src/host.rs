@@ -689,18 +689,22 @@ impl Host {
                 return Err(format!("方案目录不存在: {target}"));
             }
             let schema = hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
-            let out = self.export_out_path(&target);
+            let out = self.export_out_path(&target, fmt);
             let n = export_util::export_one(&schema, &out, fmt)?;
             return Ok((out.to_string_lossy().into_owned(), n));
         }
-        let out = self.export_out_path(&target);
+        let out = self.export_out_path(&target, fmt);
         let n = export_util::export_one(&self.engine.schema, &out, fmt)?;
         Ok((out.to_string_lossy().into_owned(), n))
     }
 
     /// 导出文件路径：<安装根>\码表导出\<方案名>\<方案名> <yyyyMMdd-HHmm>.txt
     ///（一级目录布局：与 码表/模型 平级；每码表一个子文件夹）。
-    fn export_out_path(&self, name: &str) -> PathBuf {
+    /// 【Rime 真身扩展名 2026-10-14】现场反馈：选「Rime dict.yaml」导出的
+    /// 文件其实是 .txt——内容是 Rime 而扩展名恒 txt，放进 Rime 方案目录
+    /// 认不出来。扩展名随格式：Rime → .dict.yaml（虎符自家 *.dict.yaml
+    /// 嗅探同样认），其余维持 .txt 不变。
+    fn export_out_path(&self, name: &str, fmt: export_util::ExportFormat) -> PathBuf {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -711,13 +715,17 @@ impl Host {
         let rem = secs % 86400;
         let (y, mo, da) = civil_from_days(days as i64);
         let (h, mi) = (rem / 3600, (rem % 3600) / 60);
+        let ext = match fmt {
+            export_util::ExportFormat::Rime => "dict.yaml",
+            _ => "txt",
+        };
         let root = self
             .data_dir
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.data_dir.clone());
         root.join("码表导出").join(name).join(format!(
-            "{name} {:04}{:02}{:02}-{:02}{:02}.txt",
+            "{name} {:04}{:02}{:02}-{:02}{:02}.{ext}",
             y, mo, da, h, mi
         ))
     }

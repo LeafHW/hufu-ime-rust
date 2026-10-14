@@ -5,7 +5,7 @@
 //! - 右键 → 管道 op "settings" 打开设置页（与托盘双击同通道）
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
@@ -119,8 +119,29 @@ pub fn set_mode_opt(zh: bool, force: bool) -> bool {
 thread_local! {
     static DEFER_HWND_T: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
+/// 【急切同步 2026-10-14】defer 窗 HWND 的进程级镜像：焦点 worker 线程
+/// （非 UI 线程，读不了 thread_local）PostMessage 用。HWND 只是句柄值，
+/// 跨线程读数值安全；PostMessage 本身线程安全。
+static DEFER_HWND_G: AtomicIsize = AtomicIsize::new(0);
 static PENDING_ZH: AtomicBool = AtomicBool::new(true);
 const WM_APP_DEFER: u32 = 0x8002;
+/// 【急切同步】焦点回执已存 CHINESE_SYNC，请 UI 线程立即应用（不再等
+/// 下一键——切窗后牌面即时对准；现场反馈 EmEditor↔cmd 切换后中英
+/// 状态显示不准的修复通道）。
+const WM_APP_MODE_SYNC: u32 = 0x8003;
+
+/// 焦点 worker 存好回执后调用（任意线程）：向 defer 窗投递立即应用。
+/// 窗未建（进程从未 Activate，理论不可达——worker 本就源自焦点回调）
+/// 则静默跳过，回落旧行为（下一键懒应用）。
+pub fn post_mode_sync() {
+    let h = DEFER_HWND_G.load(Ordering::Acquire);
+    if h != 0 {
+        // 用本文件既有的裸 FFI PostMessageW（L560 形态：isize 句柄）
+        unsafe {
+            let _ = PostMessageW(h, WM_APP_MODE_SYNC, 0, 0);
+        }
+    }
+}
 
 unsafe extern "system" fn defer_wnd_proc(
     h: windows::Win32::Foundation::HWND,
@@ -128,6 +149,12 @@ unsafe extern "system" fn defer_wnd_proc(
     _w: windows::Win32::Foundation::WPARAM,
     _l: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    if m == WM_APP_MODE_SYNC {
+        // 本线程即首激活 UI 线程（defer 窗创建者）——与 G_SHARED 同锚，
+        // 此处取 Shared 应用中英态 + set_mode（compartment 推送留本套间）
+        crate::tsf::defer_apply_chinese_sync();
+        return windows::Win32::Foundation::LRESULT(0);
+    }
     if m == WM_APP_DEFER {
         let zh = PENDING_ZH.load(Ordering::Relaxed);
         log_diag(&format!("defer 推 zh={zh}"));
@@ -168,6 +195,7 @@ unsafe fn ensure_defer_window() {
             None,
         ) {
             DEFER_HWND_T.with(|c| c.set(w.0 as isize));
+            DEFER_HWND_G.store(w.0 as isize, Ordering::Release);
         }
     }
 }
