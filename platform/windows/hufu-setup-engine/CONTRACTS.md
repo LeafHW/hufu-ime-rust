@@ -109,3 +109,30 @@ pub fn run_purge_data(out: &mut crate::common::Out) -> i32;  // 恒 0
 ## 版本指纹
 - windows = 0.58（对齐 hufu-tsf-smoke），winreg = 0.55。
 - workspace = E:\DSH-KF\hufu\platform\windows（我们 crate=hufu-setup-engine，已挂 members）。
+
+## 【2026-10-14 断流修复】引擎线对血律的三处有据偏离（ps1 冻结不改）
+
+背景：2026-10-13 现场（1.8.0→1.8.1 升级，三份取证日志）实锤"升级替换"致死链——
+文件落地断流（BackupDiff 中途死）→ 提权段**先腾位后才发现源缺失** → SystemIME 活路径
+被改名为 .oldN 而新件未落 → 注册表指向空路径 → 当次会话靠内存旧 DLL 假活 →
+重启后输入法全灭。修复只挂失败分支，成功路径逐字节不变（真机回归已验）：
+
+1. **copy_dll_with_old_fallback 事务化**（install.rs）：源预检（缺源不碰目标）
+   + 腾位后复制失败立即回滚还原活名；返回 bool，x64 段失败=提权段 return 1
+   （ps1 同为 throw）；x86 段新增一行失败播报（ps1 原为完全静默）。
+2. **父层硬失败**（install.rs 提权两分支）：提权子进程跑过且失败 + SystemIME
+   活件缺失 = 注册表将悬空 → `✗` 两行 + return 1，绝不"安装完成"。
+   （UAC 被拒=提权未运行过，HKCU COM 已回落安装目录路径、状态自洽——保持旧告警语义。）
+3. **heal_missing_live_dll 自愈**（common.rs，install 提权段拷贝前 + postboot 清理前）：
+   活 DLL 缺失而 .oldN 孤本在 → 还原最小编号可还原者（改名失败试下一编号）。
+   健康机器零动作零日志。postboot 侧为尽力保险（默认 ACL 下无写权限则静默跳过），
+   主救援=重跑安装器时的提权段自愈（真机 B2 实测：故障机一次安装=自愈+升级）。
+
+配套（iss，两轨共享）：PrepareToInstall→[Files] 后 RunBackupDiff → 注册环节前
+CheckCriticalPEs() 终检 PEFiles 清单；缺件 raise 中止（未做任何注册，原输入法保持原样）。
+
+真机验收（2026-10-14，D:\HuFu rust 轨健康机上四轮）：
+A 回归=成功路径零变化（无自愈/回滚行，enable 行同款）；B3=腾位后复制必败→回滚保活件+
+告警继续；B2=注入故障态（活件改 .oldN）→ 一次安装自愈+升级；B4=postboot 健康态零动作恒 0。
+✗ 硬失败分支：活件被进程映射时管理员亦不可删（腾位机制的存在理由），无法真机注入；
+由组件级验证（rollback/return 1/⚠ 各自实测）+ 代码审查覆盖。

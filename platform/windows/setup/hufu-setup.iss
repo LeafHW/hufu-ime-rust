@@ -552,6 +552,45 @@ begin
   end;
 end;
 
+// 【2026-10-14 断流终检】PEFiles 清单逐一在位校验。2026-10-13 现场实锤：
+// BackupDiff 中途断流后（源 DLL 未落地）安装照常进入注册环节，SystemIME
+// 活路径被腾位成空，重启后输入法即死。缺任何一件 = 文件落地断流 → 当场
+// 中止（raise → Inno 错误框），不带病注册；此时未写任何注册表，原输入法
+// 保持原样可用，重跑安装即恢复。正常升级全件在位，本检查零影响。
+procedure CheckCriticalPEs();
+var
+  Names: TArrayOfString;
+  One: String;
+  I, J, P: Integer;
+  Missing: String;
+begin
+  One := PEFiles;
+  SetArrayLength(Names, 0);
+  I := 1;
+  while I <= Length(One) do begin
+    P := Pos(',', Copy(One, I, MaxInt));
+    if P = 0 then begin
+      SetArrayLength(Names, GetArrayLength(Names) + 1);
+      Names[GetArrayLength(Names) - 1] := Trim(Copy(One, I, MaxInt));
+      break;
+    end else begin
+      SetArrayLength(Names, GetArrayLength(Names) + 1);
+      Names[GetArrayLength(Names) - 1] := Trim(Copy(One, I, P - 1));
+      I := I + P;
+    end;
+  end;
+  Missing := '';
+  for J := 0 to GetArrayLength(Names) - 1 do
+    if (Names[J] <> '') and (not FileExists(WizardDirValue + '\' + Names[J])) then
+      Missing := Missing + Names[J] + ' ';
+  if Missing <> '' then begin
+    LogLine('终检失败：关键文件未落地：' + Missing + '——中止安装（不注册，防悬空）');
+    raise Exception.Create('安装文件未完整落地：' + Missing + #13#10 +
+      '文件拷贝环节中断（磁盘空间/杀软拦截？）。尚未做任何系统注册，' + #13#10 +
+      '当前输入法保持原样；请重新运行本安装程序。');
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
@@ -701,6 +740,10 @@ begin
       RunBackupDiff()
     else
       LogLine('无数据清单（空数据包），跳过数据拷贝');
+
+    // 1b) 【2026-10-14 断流终检】注册环节前关键 PE 必须全部在位（见
+    //     CheckCriticalPEs 注释）；缺件中止，不带病注册
+    CheckCriticalPEs();
 
     // 2) 系统注册：零修改复用 install.ps1（内部自带 UAC 提权段 +
     //    语言列表 enable + 默认输入法覆盖 + 自启 + 降权启动 server）

@@ -47,6 +47,40 @@ pub fn sysdll_x86() -> PathBuf {
     sysdir_x86().join("hufu_tsf32.dll")
 }
 
+/// 【2026-10-14 断流自愈】活 DLL 缺失而同目录存在 .oldN 腾位孤本 → 还原最小编号者。
+/// 健康态（活件在）零动作零日志。用于两处：
+/// a) install 提权段拷贝前：历史断流机器先恢复旧版活体，再按正常语义升级替换；
+/// b) postboot 清理 .old* 前：先还原再清，防止把唯一孤本当垃圾删掉
+///   （2026-10-13 现场机 SystemIME 只剩 .old1 一颗孤本，幸而权限不足才没被清掉）。
+pub fn heal_missing_live_dll(out: &mut Out, live: &Path) -> bool {
+    if live.exists() {
+        return false;
+    }
+    let base = live
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if base.is_empty() {
+        return false;
+    }
+    for n in 1..=99u32 {
+        let cand = live.with_file_name(format!("{}.old{}", base, n));
+        if cand.exists() {
+            if std::fs::rename(&cand, live).is_ok() {
+                out.line(&format!(
+                    "自愈：活 DLL 缺失，已从 {} 还原 {}",
+                    cand.display(),
+                    live.display()
+                ));
+                return true;
+            }
+            // 该编号腾位件改名失败（异常占用等）——试下一编号，不放弃
+            continue;
+        }
+    }
+    false
+}
+
 pub fn temp_dir() -> PathBuf {
     std::env::var_os("TEMP")
         .map(PathBuf::from)

@@ -2,7 +2,7 @@
 //! 契约：恒静默恒 0（hufu-postboot.ps1 薄壳语义；main.rs 同款强制 0），
 //! 所有异常吞掉，绝不非零退出。
 
-use crate::common::{install_dir, Out};
+use crate::common::{heal_missing_live_dll, install_dir, sysdll_x64, sysdll_x86, Out};
 use crate::uninstall::{remove_file_forced, remove_forced, sys_bases};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,6 +11,13 @@ pub fn run_postboot(out: &mut Out) -> i32 {
     // tools.ps1 L512-516：-InstDir 缺失分支在引擎形态不可达（InstDir=exe 所在
     // 目录恒有值），不触发；按契约仍恒 0。
     let inst = install_dir();
+
+    // 【2026-10-14 断流自愈·兜底】先还原再清理：SystemIME 活 DLL 缺失而 .oldN 孤本
+    // 在 → 还原（下方清理段会删 *.old*，不先还原就会把唯一孤本当垃圾清掉——
+    // 2026-10-13 现场机全靠权限不足才侥幸保住孤本）。健康机器两条件皆不满足，
+    // 零动作零日志。此步超出 tools.ps1 血律语义（引擎线加固），恒不影响退出码。
+    heal_missing_live_dll(out, &sysdll_x64());
+    heal_missing_live_dll(out, &sysdll_x86());
 
     // tools.ps1 L517-530：安装目录 *.old* 文件 5 轮 × 1s 重试删
     //（每轮枚举→删→数剩余，剩 0 早停）

@@ -74,19 +74,41 @@ fn with_old_suffix(p: &Path, n: u32) -> PathBuf {
 
 // install.ps1 L88-98 / L112-119：DLL 拷贝（目标被宿主进程加载锁定 → 改名 .oldN 腾位再拷；
 // Windows 允许改名已加载 DLL，旧副本留 .oldN 随系统清理）。x64 段播报腾位文案，x86 段无文案。
-fn copy_dll_with_old_fallback(out: &mut Out, src: &Path, dst: &Path, announce: bool) {
+// 【2026-10-14 断流修复·事务化】2026-10-13 现场实锤（1.8.0→1.8.1 升级三份取证日志）：
+// 旧实现源文件缺失时仍先腾位目标再复制——SystemIME 活路径被改名为 .old1 而新件未落，
+// 注册表指向空路径，重启后输入法即死。现改两点（仅失败分支，成功路径逐字节不变）：
+// ① 源缺失 → 不碰目标，直接判失败；② 腾位后复制失败 → 立即回滚还原活名。
+fn copy_dll_with_old_fallback(out: &mut Out, src: &Path, dst: &Path, announce: bool) -> bool {
+    if !src.exists() {
+        out.line(&format!(
+            "SystemIME DLL 源缺失：{}（升级文件落地断流？）",
+            src.display()
+        ));
+        return false;
+    }
     if std::fs::copy(src, dst).is_ok() {
-        return;
+        return true;
     }
     let mut n: u32 = 1;
     while with_old_suffix(dst, n).exists() {
         n += 1;
     }
-    let _ = std::fs::rename(dst, with_old_suffix(dst, n));
-    let _ = std::fs::copy(src, dst); // 再失败由调用方 Test-Path 兜底（L99/L221 前置检查）
+    let old = with_old_suffix(dst, n);
+    if std::fs::rename(dst, &old).is_err() {
+        return false; // 腾位失败（目标未受破坏，交调用方按旧语义判定）
+    }
+    if std::fs::copy(src, dst).is_err() {
+        let _ = std::fs::rename(&old, dst); // 回滚：绝不留空活路径
+        out.line(&format!(
+            "SystemIME DLL 拷贝失败，已回滚腾位：{}",
+            dst.display()
+        ));
+        return false;
+    }
     if announce {
         out.line(&format!("（旧 DLL 被占用，已腾位为 .old{}）", n));
     }
+    true
 }
 
 /// 递归清 readonly 属性（PS $_.Attributes='Normal' 语义；连根目录一起清，
@@ -395,7 +417,17 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
             let self_exe = std::env::current_exe().unwrap_or_default();
             match procop::spawn_wait_hidden(&self_exe, "install-elevated", 600_000) {
                 SpawnResult::Exit(0) => {}
-                _ => out.line("⚠ 提权阶段报告失败（msctf 登记可能未完成）"),
+                _ => {
+                    out.line("⚠ 提权阶段报告失败（msctf 登记可能未完成）");
+                    // 【2026-10-14 断流修复·硬失败】提权跑过且失败 + SystemIME 活件缺失
+                    // = HKCU COM（Install-UserConfig 已写为 SystemIME 路径）将指向空文件，
+                    // 重启后输入法必死（2026-10-13 现场实锤）。此态绝不静默装完。
+                    if !common::sysdll_x64().exists() {
+                        out.line("✗ SystemIME 活 DLL 缺失，注册表将指向空路径——安装已中止。");
+                        out.line("  请重新运行本安装器完成机器级注册（UAC 弹窗请点「是」）。");
+                        return 1;
+                    }
+                }
             }
         } else if in_admin_group {
             // install.ps1 L345-356：可提权 → 弹 UAC 跑子命令，捕获退出码（不中断主流程），
@@ -407,9 +439,18 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
             match procop::spawn_runas_wait(&self_exe, "install-elevated", 600_000) {
                 SpawnResult::Exit(0) => {}
                 SpawnResult::Exit(c) => {
-                    out.line(&format!("⚠ 提权阶段退出码 {}（msctf 登记可能未完成）", c))
+                    out.line(&format!("⚠ 提权阶段退出码 {}（msctf 登记可能未完成）", c));
+                    // 【2026-10-14 断流修复·硬失败】同 is_admin 分支：提权跑过且失败 +
+                    // SystemIME 活件缺失 = 注册表悬空，重启后输入法必死——绝不静默装完。
+                    if !common::sysdll_x64().exists() {
+                        out.line("✗ SystemIME 活 DLL 缺失，注册表将指向空路径——安装已中止。");
+                        out.line("  请重新运行本安装器完成机器级注册（UAC 弹窗请点「是」）。");
+                        return 1;
+                    }
                 }
-                // UAC 被拒/超时：PS 里 $evProc 为 null，退出码插值为空串——同款渲染
+                // UAC 被拒/超时：PS 里 $evProc 为 null，退出码插值为空串——同款渲染。
+                // （提权未运行过：活件要么完好要么本就缺失而 HKCU COM 已回落安装目录
+                //  路径——两种态都自洽，保持旧语义仅告警。）
                 _ => out.line("⚠ 提权阶段退出码 （msctf 登记可能未完成）"),
             }
             if elog.exists() {
@@ -664,10 +705,15 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
     out.line("—— 提权阶段：SystemIME 副本（打包进程可读）——");
     let _ = std::fs::create_dir_all(&sysdir);
 
+    // 【2026-10-14 断流自愈】历史断流机器（活 DLL 曾被腾位且新件未落，注册表指向
+    // 空路径）：先从 .oldN 孤本还原旧版活体，再走下方正常拷贝完成升级。健康机器零动作。
+    common::heal_missing_live_dll(out, &sysdll);
+    common::heal_missing_live_dll(out, &common::sysdll_x86());
+
     // install.ps1 L88-102：拷贝 x64 DLL（被宿主进程加载锁住 → .oldN 腾位 fallback）+ ACL
-    copy_dll_with_old_fallback(out, &dll, &sysdll, true);
+    let copy_ok = copy_dll_with_old_fallback(out, &dll, &sysdll, true);
     // install.ps1 L99：拷贝失败 → throw（终止提权阶段，退出码 1；文案照 throw 消息）
-    if !sysdll.exists() {
+    if !copy_ok || !sysdll.exists() {
         out.line(&format!("SystemIME DLL 拷贝失败：{}", sysdll_s));
         return 1;
     }
@@ -684,7 +730,11 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
         let dir32 = common::sysdir_x86();
         let _ = std::fs::create_dir_all(&dir32);
         let sysdll32 = common::sysdll_x86();
-        copy_dll_with_old_fallback(out, &dll32, &sysdll32, false); // 此段腾位无播报（ps1 无 Write-Host）
+        // 【2026-10-14 断流修复】x86 副本失败此前完全静默（ps1 无检查无文案）；
+        // 现事务化 + 一行播报（仅失败分支）。主输入法（x64）不受影响。
+        if !copy_dll_with_old_fallback(out, &dll32, &sysdll32, false) {
+            out.line("· 32 位 SystemIME 副本未就位（跟打器等 32 位宿主暂不可用；主输入法不受影响）");
+        }
         let _ = acl::grant_all_app_packages(&dir32, true);
         let _ = acl::grant_all_app_packages(&sysdll32, false);
         let wow = format!(r"SOFTWARE\Classes\WOW6432Node\CLSID\{}", CLSID);
