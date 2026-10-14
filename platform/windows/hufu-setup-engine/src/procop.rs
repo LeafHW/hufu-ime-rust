@@ -272,7 +272,11 @@ pub fn spawn_runas_wait(exe: &Path, args: &str, timeout_ms: u32) -> SpawnResult 
             } else {
                 PCWSTR::from_raw(params.as_ptr())
             },
-            nShow: 1, // SW_SHOWNORMAL 字面量（免引 WindowsAndMessaging feature）
+            // SW_HIDE(0)：引擎是 console 子系统二进制，SHOWNORMAL 会让提权
+            // 子进程顶出一个可见控制台（火绒测试中观察到的"终端闪现"）。
+            // UAC 弹窗在 secure desktop 由 consent.exe 负责，与 nShow 无关。
+            // 提权段输出走 --log/默认 elevated 日志文件，隐藏不丢任何东西。
+            nShow: 0,
             ..Default::default()
         };
         if ShellExecuteExW(&mut sei).is_err() {
