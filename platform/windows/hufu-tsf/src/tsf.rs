@@ -1466,7 +1466,36 @@ fn apply_chinese_sync(shared: &SharedRef) {
             trace("焦点同步: 回执陈旧（期间有更新中英态落盘）→ 作废");
             return;
         }
-        let zh = v == 1;
+        let mut zh = v == 1;
+        // 【每应用模式对账 2026-10-15】引擎是全局单值，系统（ctfmon）
+        // 按**应用**记输入模式并在焦点进入时写进本线程 compartment
+        // ——两套记忆并存 = 现场实锤的牌面/实际分裂四步舞（EmEditor↔
+        // QQ：A 切英后进 B，牌显 B 的旧中态、Shift 一按把全局引擎翻
+        // 成中，回 A 牌显英实际打中文）。对账：焦点进入时**应用记忆
+        // 为准**（对齐系统 IME 行为——用户在 A 是英文、B 是中文的心智
+        // 由系统记忆承载），compartment 与引擎不一致就幂等 set_lang
+        // 设引擎（同时清残留 raw/锁大写——「切软件后变大写」同根）。
+        // 切换方向照旧：本应用内 Shift → 引擎翻转 → set_mode 推回
+        // compartment（系统记忆同步更新）——闭环后三源（引擎/本应用
+        // 记忆/牌面）恒收敛，旧「纯观察者」立场退役（那正是分裂源）。
+        // 读不到 compartment（宿主无 TSF 记忆）→ 引擎原值直落，零行为
+        // 变化。管道失败保守不动（下一切换再对）。
+        if let Some(cz) = crate::langbar::read_thread_conversion_chinese() {
+            if cz != zh {
+                if let Some(resp) =
+                    ipc::call(&serde_json::json!({ "op": "set_lang", "chinese": cz }))
+                {
+                    let applied = resp
+                        .pointer("/state/chinese")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(cz);
+                    trace(&format!(
+                        "焦点同步: 每应用对账 引擎={zh} 应用记忆={cz} → set_lang 后={applied}"
+                    ));
+                    zh = applied;
+                }
+            }
+        }
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if g.chinese != zh {
             g.chinese = zh;
@@ -5727,6 +5756,159 @@ fn focus_view_class() -> Option<String> {
     None
 }
 
+/// 【旧版 conhost 锚 2026-10-15】经典控制台（ConsoleWindowClass）锚点
+/// 直读：conhost 的 GetTextExt 在旧版控制台模式（ForceV2=0 / Win10 老
+/// 宿主）返回垃圾——实测锚在窗口首行（横幅行 y≈40），光标实际在下面
+/// 第 4 行（y≈110+），候选离光标数百 px（现场反馈「cmd 里候选离光标
+/// 比较远 X 轴」的复现根源：本机切旧版控制台模式 + 逐行像素对照实
+/// 锤；新版 conhost/Windows Terminal 的 GetTextExt 正常，不受影响）。
+/// DLL 载在 conhost 进程内——先试直读控制台光标缓冲格位+字体格度换
+/// 算像素锚；句柄在 conhost 内不可得（它自己是服务端不是客户端，
+/// GetStdHandle/CONOUT$ 双通道实测皆拒）→ 旧版模式锚=客户区左下，
+/// 新版落回标准链（实测正确）。
+/// 【旧版控制台判定 2026-10-15】HKCU\Console\ForceV2==0 = 用户（或组策
+/// 略）切了「使用旧版控制台」——该模式 conhost 的 GetTextExt 返回垃圾
+///（实测锚在首行横幅，光标实际在下面第 4 行）。进程级缓存一次：该设
+/// 置只对新开控制台生效，变更本来就要重开窗口（=新进程）。
+fn console_legacy_mode() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Registry::{
+            RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+            REG_VALUE_TYPE,
+        };
+        let sub: Vec<u16> = "Console\0".encode_utf16().collect();
+        let name: Vec<u16> = "ForceV2\0".encode_utf16().collect();
+        unsafe {
+            let mut hk = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(sub.as_ptr()),
+                0,
+                KEY_READ,
+                &mut hk,
+            )
+            .is_err()
+            {
+                return false; // 无键 = 默认新版
+            }
+            let mut v: u32 = 0;
+            let mut sz: u32 = 4;
+            let mut ty = REG_VALUE_TYPE(0);
+            let ok = RegQueryValueExW(
+                hk,
+                PCWSTR(name.as_ptr()),
+                None,
+                Some(&mut ty),
+                Some(&mut v as *mut u32 as *mut u8),
+                Some(&mut sz),
+            )
+            .is_ok();
+            // 句柄不关：进程级一次查询、conhost 生命周期一个 key 句柄
+            //（RegCloseKey 在 Wdk feature，为一次 close 引入 WDK 不值）
+            ok && ty == REG_DWORD && v == 0
+        }
+    })
+}
+
+/// 【console 直读锚 2026-10-15】进程内读控制台光标缓冲格位（最佳情
+/// 形——句柄可得时新旧模式同真）。见上方总注释。
+fn console_caret_rect() -> Option<RECT> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetConsoleWindow, GetCurrentConsoleFont, GetStdHandle,
+        CONSOLE_FONT_INFO, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        // 【失败缓存】句柄双通道死后不再每帧重试（CreateFile 失败也是
+        // 系统调用开销）——进程级一次定局。
+        static API_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if API_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        // 通道1：进程标准输出句柄（conhost 内多半没有——试探即知）
+        let h = match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => HANDLE::default(),
+        };
+        // 通道2：conhost 是控制台服务端不是客户端——标准句柄大概率无，
+        // 直开 CONOUT$ 设备（打开走 condrv 路由，进程内未必放行，试探）
+        let h = if !h.is_invalid() {
+            h
+        } else {
+            use windows::Win32::Foundation::GENERIC_READ;
+            use windows::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            };
+            let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+            match CreateFileW(
+                windows::core::PCWSTR(name.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            ) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => {
+                    trace("qc/console: GetStdHandle/CONOUT$ 均无句柄 → 左下回退/标准链");
+                    API_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(h, &mut info).is_err() {
+            trace("qc/console: GetConsoleScreenBufferInfo 失败 → 标准链");
+            return None;
+        }
+        let mut cfi = CONSOLE_FONT_INFO::default();
+        if GetCurrentConsoleFont(h, false, &mut cfi).is_err() {
+            trace("qc/console: GetCurrentConsoleFont 失败 → 标准链");
+            return None;
+        }
+        let hwnd = GetConsoleWindow();
+        if hwnd.0.is_null() {
+            trace("qc/console: GetConsoleWindow 空 → 标准链");
+            return None;
+        }
+        let mut org = POINT { x: 0, y: 0 };
+        if !ClientToScreen(hwnd, &mut org).as_bool() {
+            trace("qc/console: ClientToScreen 失败 → 标准链");
+            return None;
+        }
+        // 缓冲坐标 → 视口内行列（滚动回滚时 srWindow 是可见窗）
+        let vx = (info.dwCursorPosition.X - info.srWindow.Left) as i32;
+        let vy = (info.dwCursorPosition.Y - info.srWindow.Top) as i32;
+        let cell_w = cfi.dwFontSize.X.max(4) as i32;
+        let cell_h = cfi.dwFontSize.Y.max(4) as i32;
+        if vx < 0 || vy < 0 || vx > 500 || vy > 200 {
+            trace(&format!(
+                "qc/console: 光标视口位异常 ({vx},{vy}) → 标准链"
+            ));
+            return None;
+        }
+        let left = org.x + vx * cell_w;
+        let top = org.y + vy * cell_h;
+        let rect = RECT {
+            left,
+            top,
+            right: left + cell_w,
+            bottom: top + cell_h,
+        };
+        trace(&format!(
+            "qc/console: 光标格=({},{}) 视口=({},{}) 格度=({},{}) → rect=({},{},{},{})",
+            info.dwCursorPosition.X, info.dwCursorPosition.Y, vx, vy, cell_w, cell_h,
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
+        Some(rect)
+    }
+}
+
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【QQ 首键滞后·猜测锚贯穿 2026-10-08】每帧清零：seg1 滞后签名命中
     // 时记录（猜测锚x, 段起点x）后不直接采纳、落入标准链跑组段末探
@@ -5739,6 +5921,39 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     let prev_caret = g.caret;
     let prev_line_end = g.line_end;
     g.caret = None;
+    // 【旧版 conhost 锚 2026-10-15】经典控制台走直读锚（见函数头注释
+    // ——旧版模式 GetTextExt 垃圾）；直读失败（句柄不可得——conhost 是
+    // 服务端，进程内双通道均死，实测 GetStdHandle/CONOUT$ 皆拒）且是
+    // 旧版控制台（HKCU\Console ForceV2=0，实测该模式 GetTextExt 锚在
+    // 窗口首行=横幅行而光标在第 4 行）→ 锚=控制台客户区左下（老
+    // Console IME 候选位，用户视线/提示行所在，绝不追垃圾锚去首行）。
+    // 新版 conhost（ForceV2=1）GetTextExt 实测正确——落标准链零改动。
+    // 仅 ConsoleWindowClass 门控：WT（CASCADIA）/普通宿主零开销零改动。
+    if focus_view_class().as_deref() == Some("ConsoleWindowClass") {
+        if let Some(rect) = console_caret_rect() {
+            seed_est_from_anchor(g, &rect, "console");
+            g.caret = Some(rect);
+            return;
+        }
+        if console_legacy_mode() {
+            if let Some(fr) = focus_window_rect() {
+                let left = fr.left + 12;
+                let top = fr.bottom - 44;
+                let rect = RECT {
+                    left,
+                    top,
+                    right: left + 12,
+                    bottom: top + 20,
+                };
+                trace(&format!(
+                    "qc/console: 旧版模式左下锚 rect=({},{},{},{}) 窗=({},{},{},{})",
+                    rect.left, rect.top, rect.right, rect.bottom, fr.left, fr.top, fr.right, fr.bottom
+                ));
+                g.caret = Some(rect);
+                return;
+            }
+        }
+    }
     // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴 pain est 豁免链）
     // 入口分派已删——全部宿主统一走下方标准链。
     // 【单源锚·连续性过滤 2026-09-12 十三次修正】不再在入口拦查询

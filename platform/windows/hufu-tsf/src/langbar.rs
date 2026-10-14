@@ -302,6 +302,20 @@ unsafe fn cm_compartment(cm: &ITfCompartmentMgr, guid: *const GUID) -> Result<IT
     unsafe { cm.GetCompartment(guid) }
 }
 
+/// 【每应用模式对账 2026-10-15】读本线程 compartment 的 CONVERSION 值
+/// （NATIVE 位）——系统焦点切换时 ctfmon 会把「该应用记忆的输入模式」
+/// 写进来。返回 Some(中文?) ；读不到（无 compartment/空值）None。
+/// 严格 UI 线程调（COMP_THREAD 线程局部 + STA 代理不越线程铁律）。
+pub fn read_thread_conversion_chinese() -> Option<bool> {
+    let src = COMP_THREAD.with(|c| c.borrow().clone())?;
+    unsafe {
+        let comp = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION).ok()?;
+        let v = comp.GetValue().ok()?;
+        let n = var_i32(&v)?;
+        Some((n & TF_CONVERSIONMODE_NATIVE as i32) != 0)
+    }
+}
+
 /// 读 VARIANT 当 i32（VT_I4 = 3；偏移 8 = vt+3 保留字后）
 unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
     unsafe {
@@ -364,11 +378,12 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         } else {
             TF_CONVERSIONMODE_ALPHANUMERIC as i32
         };
-        // 【v4/v5：纯观察者】compartment 不是权威——引擎才是。
-        // 系统焦点切换会把「每应用记忆的输入模式」写进 compartment
-        // （陈旧值），追它等于跟系统记忆打架；且 msctf 回调里做任何
-        // 阻塞调用（管道）都会弄坏 msctf 连接（语言栏项死亡真因）。
-        // 这里只读线程侧记一笔诊断日志，引擎状态由按键响应同步。
+        // 【每应用对账后·定位变更 2026-10-15】OnChange（msctf 回调）仍
+        // 纯观察——回调里做任何阻塞调用（管道）都会弄坏 msctf 连接
+        //（语言栏项死亡真因）。但「应用记忆为准」的对账已上移到焦点
+        // 回执应用点（tsf.rs apply_chinese_sync，defer 窗 UI 线程安全上
+        // 下文）：焦点进入读 compartment（系统刚写入的该应用记忆）→
+        // 与引擎不一致则 set_lang 幂等设引擎。本 sink 只留诊断日志。
         let src = COMP_THREAD.with(|c| c.borrow().clone());
         let mut actual: Option<i32> = None;
         if let Some(cm) = src {

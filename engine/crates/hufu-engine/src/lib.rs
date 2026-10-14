@@ -1588,7 +1588,7 @@ impl Engine {
                     return KeyOutcome::commit(rep, self.state(session));
                 }
                 if let Some(sf) = shift_form(c) {
-                    if let Some((text, back)) = self.punct_output(session, sf) {
+                    if let Some((text, back)) = self.punct_output(session, sf, "") {
                         let mut o = KeyOutcome::commit(text, self.state(session));
                         o.back = back;
                         return o;
@@ -1712,7 +1712,7 @@ impl Engine {
                 return KeyOutcome::passthrough();
             }
             // 标点
-            if let Some((text, back)) = self.punct_output(session, c) {
+            if let Some((text, back)) = self.punct_output(session, c, "") {
                 let mut o = KeyOutcome::commit(text, self.state(session));
                 o.back = back;
                 return o;
@@ -1901,7 +1901,14 @@ impl Engine {
                 return o;
             }
             if let Some(sf) = shift_form(c) {
-                if let Some((text, back)) = self.punct_output(session, sf) {
+                // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+                // punct_output 头注释）——数字规则不得越过被顶词。
+                let pushed = session
+                    .candidates
+                    .get(self.top_commit_base(session))
+                    .map(|x| x.commit_text().to_string())
+                    .unwrap_or_default();
+                if let Some((text, back)) = self.punct_output(session, sf, &pushed) {
                     // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
                     // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+标点。
                     // 【顶字页基准 2026-10-11】顶 selected（翻页后 Shift+- =
@@ -2068,7 +2075,15 @@ impl Engine {
         // 【功能词标点顶字 2026-11】顶屏首选是功能词（{重复上屏}/
         // {撤回} 等）时解析后顶屏——z1={重复上屏} 打 z 再按任意
         // 标点（，。、；等）= 「上次内容+该标点」。
-        if let Some((punct, back)) = self.punct_output(session, c) {
+        // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+        // punct_output 头注释）——数字规则不得越过被顶词。
+        {
+            let pushed = session
+                .candidates
+                .get(self.top_commit_base(session))
+                .map(|x| x.commit_text().to_string())
+                .unwrap_or_default();
+            if let Some((punct, back)) = self.punct_output(session, c, &pushed) {
             if !session.candidates.is_empty() {
                 // 【功能词标点顶字 2026-11】顶屏首选是功能词（{重复上屏}/
                 // {撤回} 等）时解析后顶屏——z1={重复上屏} 打 z 再按任意
@@ -2090,6 +2105,7 @@ impl Engine {
             let mut o = KeyOutcome::commit(punct, self.state(session));
             o.back = back;
             return o;
+            }
         }
         if c.is_ascii_alphanumeric() {
             return KeyOutcome::consumed(self.state(session));
@@ -2099,7 +2115,11 @@ impl Engine {
 
     /// 标点输出（全角/半角/引号配对/数字后点半角化）。
     /// 返回 (文本, 提交前回删数)——back>0 用于「1.」再按 . 替换为「。」。
-    fn punct_output(&self, session: &mut Session, c: char) -> Option<(String, u8)> {
+    /// pushed=标点顶字时先于标点落屏的被顶词（""=无顶字）。数字后半角
+    /// 化的判据是**最终上屏流里紧邻 . 的前一字符**：顶字时=被顶词末字
+    ///（「4天。」紧邻的是「天」——顶字词先落屏，数字规则不得越过被顶
+    /// 词去咬旧尾巴，现场实锤「4天.」）；无顶字=跨句尾巴末字（1.5 原判据）。
+    fn punct_output(&self, session: &mut Session, c: char, pushed: &str) -> Option<(String, u8)> {
         if !c.is_ascii_punctuation() {
             return None;
         }
@@ -2121,7 +2141,12 @@ impl Engine {
         // 【二十五修·逗号回归全角 2026-10-09】数字后 , 不再半角化——
         // 用户定稿「数字后打逗号就是要正常的全角，这个特性只有句号
         // 有」。半角智能仅保留 . 路径；, 一律走全角映射（英文态除外）。
-        let tail_last = session.tail_context.chars().last();
+        // 【数字后顶字句号 2026-10-15】tail 判据先看被顶词末字（见
+        // 函数头注释）——「4天。」的句号紧邻「天」，出全角「。」。
+        let tail_last = pushed
+            .chars()
+            .last()
+            .or_else(|| session.tail_context.chars().last());
         if c == '.' {
             if tail_last == Some('.') {
                 // 上一键刚直通半角点：本键语义为中文句号，回删替换
@@ -2700,7 +2725,12 @@ impl Engine {
         let page_size_ = self.config.candidates.page_size.max(1);
         let start_ = session.page * page_size_;
         if start_ + idx >= session.candidates.len() && !session.candidates.is_empty() {
-            if let Some((punct, back)) = self.punct_output(session, c) {
+            // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+            // punct_output 头注释）——数字规则不得越过被顶词。
+            let pushed = session.candidates[self.top_commit_base(session)]
+                .commit_text()
+                .to_string();
+            if let Some((punct, back)) = self.punct_output(session, c, &pushed) {
                 // 【顶字页基准 2026-10-11】标顶同顶 selected。
                 let (first, fback) = self.resolve_commit_pair(
                     &session.candidates[self.top_commit_base(session)]
@@ -5410,7 +5440,7 @@ impl Engine {
         }
         let builtin = shift_form(base).and_then(|sf| {
             let mut scratch = crate::session::Session::new(true);
-            self.punct_output(&mut scratch, sf).map(|(t, _)| t)
+            self.punct_output(&mut scratch, sf, "").map(|(t, _)| t)
         })?;
         let custom = self
             .config
@@ -8215,6 +8245,62 @@ mod tests {
         eng.process_key(&mut s6, key(' ')); // 上屏「后」
         let o8 = eng.process_key(&mut s6, key('.'));
         assert_eq!(o8.commit.as_deref(), Some("。"), "非数字尾巴照常全角: {:?}", o8.commit);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digit_then_word_push_full_stop() {
+        // 【数字后顶字句号 2026-10-15】「4天。」：数字直通后打字，句号
+        // 顶字上屏——判据看被顶词末字（天），不是旧尾巴里的数字（4）。
+        // 现场实锤「4天.」半角化。候选本身以 ASCII 数字结尾时仍半角
+        //（iPhone15. 与 1.5 同理：紧邻 . 的前一字符是数字）。
+        let dir = std::env::temp_dir().join(format!("hufu-eng-dwp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nma\t码\nsb\tiPhone15\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&schema, hufu_config::Config::default()).unwrap();
+
+        // 4 + 码候选 + . → 「码。」（全角，不咬数字尾巴）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('4'));
+        eng.process_key(&mut s, key('m'));
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, key('.'));
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("码。"),
+            "数字后顶字句号=全角: {:?}",
+            o.commit
+        );
+        assert_eq!(o.back, 0, "无回删");
+
+        // 4 + sb 候选（末字符是数字 5）+ . → 「iPhone15.」（半角——
+        // 紧邻 . 的前一字符就是数字，1.5 同判据）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('4'));
+        eng.process_key(&mut s2, key('s'));
+        eng.process_key(&mut s2, key('b'));
+        let o2 = eng.process_key(&mut s2, key('.'));
+        assert_eq!(
+            o2.commit.as_deref(),
+            Some("iPhone15."),
+            "候选尾数字仍半角: {:?}",
+            o2.commit
+        );
+
+        // 对照：数字尾巴无候选 + . → pending-dot 原行为不变（上面
+        // pending_dot_after_digit 已覆盖，这里验证尾巴确为数字）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('7'));
+        let o3 = eng.process_key(&mut s3, key('.'));
+        assert!(o3.consumed && o3.commit.is_none(), "数字尾 pending 不回归");
+        assert_eq!(s3.raw, ".", "pending 组段");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
