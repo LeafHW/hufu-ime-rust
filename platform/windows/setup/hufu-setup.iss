@@ -585,7 +585,9 @@ begin
       Missing := Missing + Names[J] + ' ';
   if Missing <> '' then begin
     LogLine('终检失败：关键文件未落地：' + Missing + '——中止安装（不注册，防悬空）');
-    raise Exception.Create('安装文件未完整落地：' + Missing + #13#10 +
+    // Inno Pascal 无 raise Exception（Delphi 语法）——用脚本引擎的
+    // RaiseException（卸载段 L884 同款）：CurStepChanged 里抛出即错误框+中止
+    RaiseException('安装文件未完整落地：' + Missing + #13#10 +
       '文件拷贝环节中断（磁盘空间/杀软拦截？）。尚未做任何系统注册，' + #13#10 +
       '当前输入法保持原样；请重新运行本安装程序。');
   end;
