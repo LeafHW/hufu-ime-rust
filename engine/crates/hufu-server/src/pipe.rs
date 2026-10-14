@@ -650,6 +650,23 @@ pub fn dispatch(
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
+        // 【旧版控制台真光标 2026-10-15】DLL 载在 conhost 进程内（它是
+        // 服务端不是客户端——GetStdHandle/CONOUT$ 实测皆拒，MSAA 的
+        // OBJID_CARET 也不实现 accLocation）。借本进程 AttachConsole
+        // 到该控制台的**客户端**进程（= conhost 的父进程，Toolhelp 查）
+        // 当客户端读光标格位+字体格度，换算屏幕像素 rect 返回。DLL 拿
+        // rect 作候选锚——旧版模式候选贴真光标（X/Y 全跟）。Attach 是
+        // 进程级状态：全局串行 + 用毕 FreeConsole 还原。
+        "console_caret" => {
+            let pid = req.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            match console_caret_rect_via_attach(pid) {
+                Some([l, t, r, b]) => serde_json::json!({ "rect": [l, t, r, b] }),
+                None => {
+                    let err = console_caret_last_err();
+                    serde_json::json!({ "rect": null, "err": err })
+                }
+            }
+        }
         // 语言栏「中/英」右键菜单数据：码表清单 + 当前方案。
         // 【死锁教训】dispatch 已持 host 锁——绝不能经 tray::
         // schema_snapshot 二次锁同一把 Mutex（曾死锁管道线程拖死全机
@@ -1355,6 +1372,138 @@ mod unix_imp {
 
 #[cfg(not(windows))]
 pub use unix_imp::run as run_pipe;
+
+/// 【旧版控制台真光标 2026-10-15】conhost_pid = DLL（在 conhost 内）自报
+/// 进程号。conhost 的父进程 = 该控制台的客户端（cmd 等）→ AttachConsole
+/// 挂上 → GetConsoleScreenBufferInfo 光标格 + GetCurrentConsoleFont 格度
+/// + GetConsoleWindow/ClientToScreen 换算屏幕像素。用毕 FreeConsole。
+/// 进程级全局串行（Attach 是进程状态）。失败任一步 → None（DLL 落标准
+/// 链，不钉位）。客户端父进程可能已退（conhost 收尾期）→ Toolhelp 查
+/// 不到 → None。
+#[cfg(windows)]
+static LAST_CARET_ERR: Mutex<Option<&'static str>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn console_caret_rect_via_attach(conhost_pid: u32) -> Option<[i32; 4]> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, GetConsoleWindow,
+        GetCurrentConsoleFont, GetStdHandle, CONSOLE_FONT_INFO, CONSOLE_SCREEN_BUFFER_INFO,
+        STD_OUTPUT_HANDLE,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+
+    static ATTACH_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ATTACH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let note = |s: &'static str| -> Option<[i32; 4]> {
+        *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        None
+    };
+
+    // conhost → 父进程（= 控制台客户端）
+    let parent = unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return note("snapshot_fail"),
+        };
+        let mut pe = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        if Process32FirstW(snap, &mut pe).is_ok() {
+            loop {
+                if pe.th32ProcessID == conhost_pid {
+                    found = Some(pe.th32ParentProcessID);
+                    break;
+                }
+                if Process32NextW(snap, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        match found {
+            Some(p) => p,
+            None => return note("parent_not_found"),
+        }
+    };
+
+    unsafe {
+        // 挂载（本 server 是 GUI 子系统无控制台；万一被拉起时带了——
+        // 先 Free 再 Attach，用毕也 Free，状态归零）
+        if AttachConsole(parent).is_err() {
+            let _ = FreeConsole();
+            if AttachConsole(parent).is_err() {
+                return note("attach_fail");
+            }
+        }
+        let result = (|| -> Option<(u16, String, [i32; 4])> {
+            let h = match GetStdHandle(STD_OUTPUT_HANDLE) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => return None,
+            };
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            if GetConsoleScreenBufferInfo(h, &mut info).is_err() {
+                return None;
+            }
+            let mut cfi = CONSOLE_FONT_INFO::default();
+            if GetCurrentConsoleFont(h, false, &mut cfi).is_err() {
+                return None;
+            }
+            let hwnd = GetConsoleWindow();
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut cr = RECT::default();
+            if GetClientRect(hwnd, &mut cr).is_err() {
+                return None;
+            }
+            let mut org = POINT { x: 0, y: 0 };
+            if !ClientToScreen(hwnd, &mut org).as_bool() {
+                return None;
+            }
+            let vx = (info.dwCursorPosition.X - info.srWindow.Left) as i32;
+            let vy = (info.dwCursorPosition.Y - info.srWindow.Top) as i32;
+            if vx < 0 || vy < 0 {
+                return None;
+            }
+            let cw = cfi.dwFontSize.X.max(4) as i32;
+            let chh = cfi.dwFontSize.Y.max(4) as i32;
+            let left = org.x + vx * cw;
+            let top = org.y + vy * chh;
+            Some((parent as u16, format!("cell=({vx},{vy})"), [left, top, left + cw, top + chh]))
+        })();
+        let _ = FreeConsole();
+        match result {
+            Some((_p, cell, rect)) => {
+                *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = cell; // 细节诊断保留位
+                Some(rect)
+            }
+            None => note("read_fail"),
+        }
+    }
+}
+
+/// console_caret 失败原因（诊断回传给 DLL）。
+#[cfg(windows)]
+fn console_caret_last_err() -> &'static str {
+    LAST_CARET_ERR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or("unknown")
+}
+
+#[cfg(not(windows))]
+fn console_caret_rect_via_attach(_conhost_pid: u32) -> Option<[i32; 4]> {
+    None
+}
 
 fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde_json::Value) {
     if req

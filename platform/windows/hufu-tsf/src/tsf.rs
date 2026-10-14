@@ -5812,10 +5812,127 @@ fn console_legacy_mode() -> bool {
     })
 }
 
+/// 【MSAA 光标锚 2026-10-15】旧版控制台拿真光标的正规通道：读屏软件
+/// （NVDA/JAWS）定位经典控制台光标就是走它——控制台窗口线程响应
+/// WM_GETOBJECT(OBJID_CARET) 返回 IAccessible，accLocation 给出光标
+/// 的**屏幕像素** rect。进程内句柄双通道（GetStdHandle/CONOUT$）在
+/// conhost 里是死的（它是服务端不是客户端），但 MSAA 是跨线程窗口
+/// 消息——conhost 自己的窗口自己答，畅通。X/Y 全跟真光标（含打字
+/// 逐列右移）。失败/出界回 None（落左下兜底）。
+fn console_msaa_caret_rect() -> Option<RECT> {
+    use windows::core::{Interface, VARIANT};
+    use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+    unsafe {
+        // 焦点窗=控制台窗（调用方已验类名 ConsoleWindowClass）
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(0, &mut gi).is_err() || gi.hwndFocus.0.is_null() {
+            return None;
+        }
+        let hwnd = gi.hwndFocus;
+        // OBJID_CARET = 0xFFFFFFF8
+        let mut punk: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = AccessibleObjectFromWindow(
+            hwnd,
+            0xFFFF_FFF8,
+            &IAccessible::IID,
+            &mut punk as *mut *mut _ as *mut *mut core::ffi::c_void,
+        );
+        if hr.is_err() || punk.is_null() {
+            trace(&format!("qc/console-msaa: 取 IAccessible 失败 hr={hr:?}"));
+            return None;
+        }
+        let acc: IAccessible = std::mem::transmute(punk);
+        let (mut l, mut t, mut w, mut h) = (0i32, 0i32, 0i32, 0i32);
+        // 子参数=CHILDID_SELF（VT_I4 0）——VARIANT::default() 是
+        // VT_EMPTY，IAccessible 按规范拒之（实测「失败」的根源在此，
+        // 非接口不支持）。
+        let child = VARIANT::from(0i32);
+        if acc
+            .accLocation(&mut l, &mut t, &mut w, &mut h, &child)
+            .is_err()
+            || w <= 0
+            || h <= 0
+        {
+            trace("qc/console-msaa: accLocation 失败/空 → 标准链");
+            return None;
+        }
+        // 合理性：锚须落在控制台窗口（含边距）内——防陈旧/垃圾值
+        if let Some(fr) = focus_window_rect() {
+            if l < fr.left - 64 || l > fr.right || t < fr.top - 64 || t > fr.bottom {
+                trace(&format!(
+                    "qc/console-msaa: rect=({l},{t},{w},{h}) 出窗界({},{},{},{}) → 弃",
+                    fr.left, fr.top, fr.right, fr.bottom
+                ));
+                return None;
+            }
+        }
+        trace(&format!("qc/console-msaa: 光标 rect=({l},{t},{w},{h})"));
+        Some(RECT {
+            left: l,
+            top: t,
+            right: l + w,
+            bottom: t + h,
+        })
+    }
+}
+
+/// 【server 通道真光标 2026-10-15】DLL 载在 conhost 内（服务端），进程
+/// 内读光标双通道死、MSAA 不给坐标——借 server（外部进程）AttachConsole
+/// 到本控制台的客户端（conhost 父进程）读光标格+字体格度换算像素 rect。
+/// 后台通道 150ms 预算；80ms 节流。失败 None → 标准链（不钉位）。
+fn console_caret_rect_via_server() -> Option<RECT> {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *g {
+            if t.elapsed().as_millis() < 80 {
+                return None; // 节流窗内（上一轮刚问过/失败过）
+            }
+        }
+        *g = Some(std::time::Instant::now());
+    }
+    let resp = match ipc::call(&serde_json::json!({
+        "op": "console_caret",
+        "pid": std::process::id(),
+    })) {
+        Some(r) => r,
+        None => {
+            trace("qc/console-srv: pipe 无响应");
+            return None;
+        }
+    };
+    let r = match resp.get("rect").and_then(|v| v.as_array()) {
+        Some(a) if a.len() == 4 => a,
+        _ => {
+            let err = resp.get("err").and_then(|v| v.as_str()).unwrap_or("?");
+            trace(&format!("qc/console-srv: 服务端失败 err={err}"));
+            return None;
+        }
+    };
+    let v: Vec<i32> = r.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect();
+    if v.len() != 4 || v[2] <= v[0] || v[3] <= v[1] {
+        trace("qc/console-srv: rect 数据畸形");
+        return None;
+    }
+    trace(&format!(
+        "qc/console-srv: 光标 rect=({},{},{},{})",
+        v[0], v[1], v[2], v[3]
+    ));
+    Some(RECT {
+        left: v[0],
+        top: v[1],
+        right: v[2],
+        bottom: v[3],
+    })
+}
+
 /// 【console 直读锚 2026-10-15】进程内读控制台光标缓冲格位（最佳情
 /// 形——句柄可得时新旧模式同真）。见上方总注释。
-fn console_caret_rect() -> Option<RECT> {
-    use windows::Win32::Foundation::POINT;
+fn console_caret_rect() -> Option<RECT> {    use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Console::{
         GetConsoleScreenBufferInfo, GetConsoleWindow, GetCurrentConsoleFont, GetStdHandle,
@@ -5925,10 +6042,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // ——旧版模式 GetTextExt 垃圾）；直读失败（句柄不可得——conhost 是
     // 服务端，进程内双通道均死，实测 GetStdHandle/CONOUT$ 皆拒）且是
     // 旧版控制台（HKCU\Console ForceV2=0，实测该模式 GetTextExt 锚在
-    // 窗口首行=横幅行而光标在第 4 行）→ 锚=控制台客户区左下（老
-    // Console IME 候选位，用户视线/提示行所在，绝不追垃圾锚去首行）。
-    // 新版 conhost（ForceV2=1）GetTextExt 实测正确——落标准链零改动。
-    // 仅 ConsoleWindowClass 门控：WT（CASCADIA）/普通宿主零开销零改动。
+    // 窗口首行=横幅行而光标在第 4 行）→ MSAA 无障碍通道取真光标
+    //（OBJID_CARET+CHILDID_SELF，读屏软件同款；X/Y 全跟）。取不到就
+    // 落标准链（【左下固定已取消 2026-10-15】用户拍板：不许钉位——宁
+    // 可退回系统原始锚）。新版 conhost（ForceV2=1）GetTextExt 实测正
+    // 确——落标准链零改动。仅 ConsoleWindowClass 门控。
     if focus_view_class().as_deref() == Some("ConsoleWindowClass") {
         if let Some(rect) = console_caret_rect() {
             seed_est_from_anchor(g, &rect, "console");
@@ -5936,22 +6054,21 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
             return;
         }
         if console_legacy_mode() {
-            if let Some(fr) = focus_window_rect() {
-                let left = fr.left + 12;
-                let top = fr.bottom - 44;
-                let rect = RECT {
-                    left,
-                    top,
-                    right: left + 12,
-                    bottom: top + 20,
-                };
-                trace(&format!(
-                    "qc/console: 旧版模式左下锚 rect=({},{},{},{}) 窗=({},{},{},{})",
-                    rect.left, rect.top, rect.right, rect.bottom, fr.left, fr.top, fr.right, fr.bottom
-                ));
+            // MSAA 真光标（X/Y 全跟，含逐列右移）
+            if let Some(rect) = console_msaa_caret_rect() {
+                seed_est_from_anchor(g, &rect, "console-msaa");
                 g.caret = Some(rect);
                 return;
             }
+            // 【server AttachConsole 通道 2026-10-15】进程内双通道+MSAA
+            // 皆死后借 server（外部进程）AttachConsole 到本控制台客户
+            // 端读真光标。节流 80ms（打字帧率下避免连发）。
+            if let Some(rect) = console_caret_rect_via_server() {
+                seed_est_from_anchor(g, &rect, "console-srv");
+                g.caret = Some(rect);
+                return;
+            }
+            trace("qc/console: 旧版模式无真光标 → 标准链（不钉位）");
         }
     }
     // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴 pain est 豁免链）
