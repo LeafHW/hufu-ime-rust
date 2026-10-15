@@ -1933,12 +1933,13 @@ async function loadSsfSkin(id) {
       + (m.preview ? "" : '　<span class="sub">（无预览图，仍可正常使用）</span>')
       + (warns ? '<div class="sub" style="margin-top:6px">' + warns + "</div>" : "");
     const img = $("#ssf-preview-img"), none = $("#ssf-preview-none");
-    if (m.preview) {
-      img.src = "/api/skin/preview?kind=ssf&id=" + encodeURIComponent(id) + "&t=" + Date.now();
-      img.style.display = "";
-      none.style.display = "none";
-    } else { img.style.display = "none"; none.style.display = ""; }
-    $("#ssf-material-note").textContent = "预览图为皮肤自带整图；实际候选窗按九宫格拉伸、文字实时排版。";
+    // 【独立皮肤预览·真渲染 2026-10-16】素材区不再放宣传整图（大得
+    // 离谱、无预览字——用户实锤）。直接渲染真实候选窗位图（DLL 按
+    // 当前皮肤+设置真画，含候选词），所见即打字所得。
+    img.src = "/api/skin/ssf-render?t=" + Date.now();
+    img.style.display = "";
+    none.style.display = "none";
+    $("#ssf-material-note").textContent = "真实候选窗（当前皮肤+显示设置实时渲染）；出图约 2-3 秒，改动后自动刷新。";
   }
   // 【独立皮肤设置 2026-10-16】拉 per-skin 覆盖填表单（颜色控件吃
   // #RRGGBB；覆盖值优先，否则显示皮肤原值做基准）。
@@ -1987,7 +1988,9 @@ async function ssfSettingsSaveNow(quiet) {
     const t = new Date().toTimeString().slice(0, 8);
     $("#ssfv-note").textContent = `已生效 ${t}`;
     // 【mock 即时跟随 2026-10-16】字号/字体/颜色/横竖排/序号一变，
-    // 皮肤子分页预览 + 挂件页实时框的「真实候选窗」同步重排
+    // 皮肤子分页素材预览 + 挂件页实时框的「真实候选窗」同步重排
+    const pi = $("#ssf-preview-img");
+    if (pi && pi.style.display !== "none") pi.src = "/api/skin/ssf-render?t=" + Date.now();
     if (SKIN_CURRENT_KIND === "ssf") {
       refreshSsfMock($("#candwin-preview")).catch(() => {});
       refreshSsfMock($("#ov-candmock"), () => ovPreview()).catch(() => {});
