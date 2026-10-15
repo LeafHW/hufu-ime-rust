@@ -1203,6 +1203,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                     // 【六十修】看门狗随藏同杀
                     let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                    // 【SSF】帧钟随藏同杀
+                    let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
                     unsafe { rawinput_listen(hwnd, false) };
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
@@ -1248,6 +1250,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                 // 【六十修】看门狗随藏同杀
                 let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                // 【SSF】帧钟随藏同杀
+                let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
                 unsafe { rawinput_listen(hwnd, false) };
                 // 【贴图挂件 2026-10-02】候选窗收 → 兄弟贴图窗随收
                 crate::overlaywin::hide_for(hwnd);
@@ -1307,6 +1311,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 易主即冲销+收窗（见 ime_watchdog_tick 注释）。
             if id == IME_WATCHDOG_TIMER_ID {
                 unsafe { ime_watchdog_tick(hwnd) };
+                return LRESULT(0);
+            }
+            // 【SSF M4】APNG 帧推进（0x4945）：变间隔常驻钟，与
+            // FADE_TIMER（几何动效）完全独立。
+            if id == crate::ssfwin::SSF_TIMER_ID {
+                unsafe { ssf_frame_tick(hwnd) };
                 return LRESULT(0);
             }
         }
@@ -1420,6 +1430,171 @@ pub(crate) fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
         .or_else(|| v.get("layout").and_then(|l| l.get(key)))
         .and_then(|x| x.as_f64())
         .unwrap_or(default as f64) as f32
+}
+
+// ══════════ 【SSF M2/M3/M4】.ssf 位图皮肤运行态与投影 ══════════
+// 设计：`.refs/_dll接入方案.md`（模块=platform/windows/hufu-tsf/src/
+// ssfwin.rs，虎娘逐行移植）。接入三原则：
+// ① JSON 矢量路径零改动——所有分叉 `ssf.is_some()` 套壳【回归红线】；
+// ② 等比折算制——ssf 画布量 ×scale（=用户字号÷皮肤字号）进现有
+//   96-DPI 逻辑域，动效/SWP/裁剪/NCHITTEST 下游全部无感；
+// ③ 皮肤错误绝不弄坏输入——任何失败静默回退矢量渲染。
+
+/// .ssf 运行态（窗口级，跨帧）：解码帧流（进程缓存 Arc）+ 帧钟 + 每窗
+/// D2D 设备位图缓存（帧号没变零重建）+ 换装键。
+pub(crate) struct SsfRuntime {
+    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
+    pub(crate) clock: crate::ssfwin::SsfFrameClock,
+    pub(crate) device: Option<crate::ssfwin::SsfDeviceBitmap>,
+    /// 键 =（fp, 变体图名）：变体切换 / server 侧重解包（fp 变）→
+    /// 帧钟重播 + 设备位图置空（虎娘 rendererDirty_ 同款）。
+    pub(crate) key: (String, String),
+}
+
+/// 测量/渲染帧快照（spec 随帧 clone，重 mutable 状态留 self.ssf）。
+pub(crate) struct SsfFrame {
+    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
+    pub(crate) layout: crate::ssfwin::SsfVariantLayout,
+    pub(crate) scale: f32,
+}
+
+/// 把 ssf display/变体折算进现有 layout/colors/material 键（注入
+/// `/skin/...` 包装层——layout_f/color_f 优先查包装层，顶层旧值自然
+/// 被盖过，两种入参形态都成立）。下游读皮代码零改动【回归红线】。
+/// 边距对称化说明：引擎每轴只有单一边距值，取 (left+right)/2 /
+/// (top+bottom)/2——宽度/高度总量精确，轴内不对称以中值近似（实测
+/// 真皮 pinyin/zhongwen_marge 左右相等，无损）。
+pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
+    fn put(
+        map: &mut serde_json::Map<String, Value>,
+        section: &str,
+        key: &str,
+        val: Value,
+    ) {
+        map.entry(section.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .map(|m| m.insert(key.to_string(), val));
+    }
+    let mut v = skin.clone();
+    let d = &f.spec.display;
+    let s = f.scale;
+    let hex = |c: [u8; 4]| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
+    let lay = &f.layout;
+    let mx = ((lay.code.left.max(lay.candidates.left).max(0) as f32
+        + lay.code.right.max(lay.candidates.right).max(0) as f32)
+        * 0.5) * s;
+    let my = ((lay.code.top.max(lay.candidates.top).max(0) as f32
+        + lay.code.bottom.max(lay.candidates.bottom).max(0) as f32)
+        * 0.5) * s;
+    // 确保 /skin 包装层存在（顶层直挂形态注入后同样优先命中）
+    let is_skin_obj = v.get("skin").map(|x| x.is_object()).unwrap_or(false);
+    if !is_skin_obj {
+        if let Some(map) = v.as_object_mut() {
+            map.insert("skin".into(), Value::Object(serde_json::Map::new()));
+        }
+    }
+    let Some(obj) = v.get_mut("skin").and_then(|x| x.as_object_mut()) else {
+        return v; // skin 字段被占为非对象（畸形数据）：放弃投影，走矢量
+    };
+    // 字体/间距（画布 ×scale；ssf 缺省 0——不叠引擎默认档）
+    if !d.font_ch.is_empty() {
+        put(obj, "layout", "font_face", Value::String(d.font_ch.clone()));
+    }
+    put(obj, "layout", "line_spacing", serde_json::json!(d.line_spacing * s));
+    put(obj, "layout", "candidate_spacing", serde_json::json!(d.candidate_spacing * s));
+    put(obj, "layout", "margin_x", serde_json::json!(mx));
+    put(obj, "layout", "margin_y", serde_json::json!(my));
+    // 圆角/阴影/边框：位图自带（投影/圆角已烧进图里，程序化再叠=双重）
+    put(obj, "layout", "hilite_padding", serde_json::json!(0.0));
+    put(obj, "layout", "corner_radius", serde_json::json!(0.0));
+    put(obj, "layout", "shadow_radius", serde_json::json!(0.0));
+    put(obj, "layout", "border_width", serde_json::json!(0.0));
+    // 高亮：ssf 的高亮表达=first_color 文字色（虎娘口径），胶囊与
+    // 程序化底透明化（hilite_on=false 会连文字色一起退化成普通色，
+    // 不能用）；编码行底不画（皮肤自带）。
+    put(obj, "colors", "hilited_candidate_back_color", serde_json::json!("#00000000"));
+    put(obj, "material", "hilite_alpha", serde_json::json!(0.0));
+    put(obj, "material", "border_alpha", serde_json::json!(0.0));
+    put(obj, "colors", "preedit_back_color", serde_json::json!("#00000000"));
+    put(obj, "colors", "back_color", serde_json::json!("#00000000"));
+    put(obj, "colors", "candidate_text_color", serde_json::json!(hex(d.text_color)));
+    put(obj, "colors", "label_color", serde_json::json!(hex(d.text_color)));
+    put(obj, "colors", "comment_text_color", serde_json::json!(hex(d.annotation_color)));
+    put(obj, "colors", "hilited_candidate_text_color", serde_json::json!(hex(d.first_color)));
+    put(obj, "colors", "hilited_candidate_label_color", serde_json::json!(hex(d.first_color)));
+    put(obj, "colors", "hilited_comment_text_color", serde_json::json!(hex(d.annotation_color)));
+    v
+}
+
+impl CandidateWindowV2 {
+    /// .ssf 形态检测 → 解析 → 变体选择 → 取图（进程缓存）→ 运行态更新。
+    /// 非 ssf / 不可用 / 载图失败：清运行态返回 None，本帧回退 JSON
+    /// 矢量渲染（降级矩阵 §4.6——皮肤错误绝不弄坏输入）。
+    pub(crate) fn ssf_prepare(
+        &mut self,
+        skin: &Value,
+        vertical: bool,
+        has_code: bool,
+        has_candidates: bool,
+    ) -> Option<SsfFrame> {
+        if !crate::ssfwin::is_ssf(skin) {
+            let had = self.ssf.borrow().is_some();
+            if had {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID);
+                }
+            }
+            *self.ssf.borrow_mut() = None; // 切回 JSON：释放（进程解码缓存留 LRU）
+            return None;
+        }
+        let spec = crate::ssfwin::SsfSkinSpec::parse(skin)?;
+        let layout = spec.choose(vertical, has_code, has_candidates)?.clone();
+        let bitmap = match crate::ssfwin::load_bitmap(&spec.cache_dir, &spec.fp, &layout.image) {
+            Ok(b) => b,
+            Err(e) => {
+                // 同因去重：坏皮每键都会失败，只记一次
+                static LAST_ERR: std::sync::Mutex<(String, String)> =
+                    std::sync::Mutex::new((String::new(), String::new()));
+                let fp_key = skin
+                    .pointer("/skin/fp")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let mut le = LAST_ERR.lock().unwrap_or_else(|p| p.into_inner());
+                if *le != (fp_key.clone(), e.clone()) {
+                    *le = (fp_key, e.clone());
+                    crate::tsf::trace(&format!("ssf: 载图失败回退矢量：{e}"));
+                }
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
+        // 等比折算制：scale = 用户字号 ÷ 画布字号（作者画布制，全部
+        // 几何 ×scale 进 96 逻辑域——DWrite 直接按用户字号建字形）
+        let user_pt = layout_f(skin, "font_point", 16.0);
+        let scale = (user_pt / spec.display.font_size.clamp(3.0, 200.0)).clamp(0.02, 8.0);
+        let key = (spec.fp.clone(), layout.image.clone());
+        let mut rt = self.ssf.borrow_mut();
+        let reuse = matches!(rt.as_ref(), Some(r) if r.key == key);
+        if !reuse {
+            *rt = Some(SsfRuntime {
+                spec: spec.clone(),
+                bitmap: bitmap.clone(),
+                clock: crate::ssfwin::SsfFrameClock::new(),
+                device: None,
+                key,
+            });
+        }
+        Some(SsfFrame {
+            spec,
+            bitmap,
+            layout,
+            scale,
+        })
+    }
 }
 
 // ── 窗口本体 ──
@@ -1836,6 +2011,9 @@ pub struct CandidateWindowV2 {
     /// 动效期渲染旧列表——被删词红闪+塌缩、后续词滑移补位；完成落真
     /// 列表自清（show 咽喉处置换）。
     pub(crate) freq_del: std::cell::RefCell<Option<(usize, Vec<(String, String)>, std::time::Instant, u32)>>,
+    /// 【SSF M2/M3/M4】.ssf 位图皮肤运行态（None=JSON 矢量皮肤——所有
+    /// 分叉以 `ssf.is_some()` 套壳，JSON 路径零改动【回归红线】）。
+    pub(crate) ssf: std::cell::RefCell<Option<SsfRuntime>>,
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -2122,6 +2300,7 @@ impl CandidateWindowV2 {
                 freq_fade: std::cell::Cell::new(None),
                 freq_swap: std::cell::Cell::new(None),
                 freq_del: std::cell::RefCell::new(None),
+                ssf: std::cell::RefCell::new(None),
             })
         }
     }
@@ -2304,6 +2483,7 @@ impl CandidateWindowV2 {
                 freq_fade: std::cell::Cell::new(None),
                 freq_swap: std::cell::Cell::new(None),
                 freq_del: std::cell::RefCell::new(None),
+                ssf: std::cell::RefCell::new(None),
             })
         }
     }
@@ -3179,6 +3359,32 @@ impl CandidateWindowV2 {
             }
         }
 
+        // ──【SSF M2/M3】.ssf 位图皮肤：形态检测 + 运行态 + 参数投影 ──
+        // 检测/解析/取图/换装键失效链见 .refs/_dll接入方案.md §1/§6；
+        // 投影=把 ssf display/变体折算进现有 layout/colors 键——下游
+        // layout_f/color_f 全部无感（JSON 路径零改动【回归红线】）。
+        // 放这里：font/margin/spacing 读取（下一行起）之前、raw/cands/
+        // freq_view 可见性已定之后。
+        let horizontal_early = skin
+            .pointer("/skin/layout/horizontal")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("horizontal")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let ssf = self.ssf_prepare(
+            skin,
+            !horizontal_early,
+            !raw.is_empty() || freq_view.is_some(),
+            !cands.is_empty(),
+        );
+        let skin_proj: Value;
+        let skin: &Value = match &ssf {
+            Some(f) => {
+                skin_proj = ssf_project_skin(skin, f);
+                &skin_proj
+            }
+            None => skin,
+        };
+
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
@@ -3328,9 +3534,16 @@ impl CandidateWindowV2 {
         // 一「边距」滑杆（同写两字段），新口径下恒 mx=my=gap。
         // 行槽高 row_h=max(line_h, em+2hp)：胶囊需要时撑高，胶囊与
         // 文字在槽内居中——胶囊四边到窗恒= gap（weasel margin 语义）。
-        let gap = (margin_x + margin_y) / 2.0;
-        let rm_x = gap;
-        let rm_y = gap;
+        let (rm_x, rm_y) = match &ssf {
+            // 【SSF】投影已把 marge 折进 margin_x/y——引擎的 (mx+my)/2
+            // 对称坍缩会把左右/上下内边距拉平均（真皮左右常≫上下，
+            // 坍缩=竖排行距暴涨），按原值分轴用
+            Some(_) => (margin_x, margin_y),
+            None => {
+                let gap = (margin_x + margin_y) / 2.0;
+                (gap, gap)
+            }
+        };
         let pill_h = em + hilite_pad * 2.0;
         let row_h = line_h.max(pill_h);
 
@@ -3704,6 +3917,26 @@ impl CandidateWindowV2 {
             // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
             let rows = cands.len().min(10) as f32 + code_row;
             rm_y * 2.0 + row_h * rows + cand_spacing * (rows - 1.0).max(0.0)
+        };
+        // ──【SSF M2】画布硬底（九宫格不退化的最小窗）──
+        // w ≥ max(图宽, 水平刀口和+1)×scale；h ≥ max(图高, 垂直刀口和
+        // +1)×scale 且恒 ≥ 图高×scale（真皮肤横排「高恒=图高」、虎娘大
+        // 图在内容超出时中段拉伸）。见 _dll接入方案.md §2.2。注释列右
+        // 缘随新宽平移（保持右对齐）。
+        let (width, cmt_x) = match &ssf {
+            Some(f) => {
+                let lw = f.layout.min_width(f.bitmap.width) * f.scale;
+                let w2 = width.max(lw).min(w_cap); // 超屏封顶仍守（防大图出屏）
+                let dx = w2 - width;
+                (w2, cmt_x + dx)
+            }
+            None => (width, cmt_x),
+        };
+        let height = match &ssf {
+            Some(f) => height
+                .max(f.layout.min_height(f.bitmap.height) * f.scale)
+                .max(f.bitmap.height as f32 * f.scale),
+            None => height,
         };
 
         let w = width as u32;
@@ -4284,7 +4517,41 @@ impl CandidateWindowV2 {
                         b: back.b,
                         a: if stage == 1 { 0.0 } else { master },
                     };
-                    if bg_c.a > 0.004 {
+                    // ──【SSF M2/M3】九宫格位图背景（替换矢量底）──
+                    // dst=chw/chh：动效帧吃 chrome_override 插值尺寸——
+                    // 每帧重切九宫格=「皮肤被拉长」（虎娘 drawSkinBackground
+                    // 同构）；稳态=目标尺寸。刀口 ×scale（源=画布原像素，
+                    // dst=96 逻辑域）。设备位图帧号缓存=帧不变零上传。
+                    // 建位图失败→本帧透明底（文字照画，保底出窗）。
+                    if let Some(f) = &ssf {
+                        let mut rt = self.ssf.borrow_mut();
+                        if let Some(r) = rt.as_mut() {
+                            let SsfRuntime { bitmap, clock, device, .. } = r;
+                            let (idx, _rem) = clock.current(bitmap);
+                            if let Ok(bmp) =
+                                unsafe { crate::ssfwin::device_bitmap(&ctx, bitmap, idx, device) }
+                            {
+                                unsafe {
+                                    crate::ssfwin::draw_nineslice(
+                                        &ctx,
+                                        bmp,
+                                        bitmap.width,
+                                        bitmap.height,
+                                        chw,
+                                        chh,
+                                        f.layout.horizontal.tile,
+                                        (f.layout.horizontal.before as f32 * f.scale).round() as i32,
+                                        (f.layout.horizontal.after as f32 * f.scale).round() as i32,
+                                        f.layout.vertical.tile,
+                                        (f.layout.vertical.before as f32 * f.scale).round() as i32,
+                                        (f.layout.vertical.after as f32 * f.scale).round() as i32,
+                                        dpi_scale,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if bg_c.a > 0.004 && ssf.is_none() {
                         if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
@@ -4715,7 +4982,11 @@ impl CandidateWindowV2 {
                             } else {
                                 None
                             };
-                            let (bt, bl, bc) = if i == sel {
+                            let (bt, bl, bc) = if i == sel
+                                // 【SSF】虎娘口径：第 1 候选恒 first_color
+                                //（不随 sel 走；非调频模态才生效）
+                                || (ssf.is_some() && freq_fv.is_none() && i == 0)
+                            {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
@@ -4882,7 +5153,11 @@ impl CandidateWindowV2 {
                             } else {
                                 None
                             };
-                            let (bt, bl, bc) = if i == sel {
+                            let (bt, bl, bc) = if i == sel
+                                // 【SSF】虎娘口径：第 1 候选恒 first_color
+                                //（不随 sel 走；非调频模态才生效）
+                                || (ssf.is_some() && freq_fv.is_none() && i == 0)
+                            {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
@@ -6191,6 +6466,30 @@ impl CandidateWindowV2 {
                 // 物理层裸输入监听停用（函数保留，热键层不再订阅）。
                 // unsafe { rawinput_listen(self.hwnd, true) };
             }
+            // ──【SSF M4】APNG 帧钟：变间隔常驻窗钟（虎娘 timer4 同款；
+            // 绝不挂 anim_boost——winmm 400ms 自杀截止与循环播放冲突，
+            // 也不占 FADE_TIMER——那是几何动效钟）。静态图/非 ssf 即杀。
+            // 重臂在 show 尾=每帧按「距下帧剩余」变间隔设置（虎娘
+            // SetTimer 重置间隔语义）；隐藏由藏窗路径显式杀。
+            {
+                let arm = self
+                    .ssf
+                    .borrow()
+                    .as_ref()
+                    .filter(|rt| rt.bitmap.is_animated())
+                    .map(|rt| {
+                        let (_, rem) = rt.clock.current(&rt.bitmap);
+                        rem.max(20)
+                    });
+                match arm {
+                    Some(ms) => {
+                        let _ = SetTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID, ms, None);
+                    }
+                    None => {
+                        let _ = KillTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID);
+                    }
+                }
+            }
             // 【毛玻璃退役 2026-09-11】glass RGN/DWM 圆角/NC 链整块删除；
             // 仅保留残留清理（曾开过毛玻璃的窗恢复全窗区域+方角）。
             if self.rgn_last.get() != 0 {
@@ -6794,6 +7093,77 @@ unsafe fn ime_watchdog_tick(hwnd: HWND) {
 
 /// 步进（整帧复渲染外壳）→ 位置插值步进（只 SWP 不重绘——内容按
 /// 目标布局早已在缓冲）→ 高亮滑动复渲染 → 放回。全部结束 KillTimer。
+/// 【SSF M4】APNG 帧推进 tick（WM_TIMER / SSF_TIMER_ID=0x4945）。
+/// 与 anim_boost（winmm 400ms 自杀截止）和 FADE_TIMER（几何动效钟）
+/// 完全独立：只管「帧号变了 → 整帧重绘（show 内渲染段消费新帧号并
+/// 在尾部重臂变间隔钟）」。帧号没变（几何动效在跑或距下帧未到）只
+/// 重臂不重绘——设备位图帧号缓存零上传。仿 fade_tick_shared 的
+/// take/put-back + cand2_busy，锁外渲染；TL 线程词框一期不接（贴图
+/// 窗 overlaywin 自带动画钟），返回不动。
+unsafe fn ssf_frame_tick(hwnd: HWND) {
+    if crate::tsf::addword_tl_thread() {
+        return;
+    }
+    let Some(shared) = tick_shared_for_hwnd(hwnd) else {
+        return;
+    };
+    let (mut cand2, last, skin, caret) = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2_busy = true;
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+    };
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+        let act = c.ssf.borrow().as_ref().and_then(|rt| {
+            if !rt.bitmap.is_animated() {
+                return None;
+            }
+            let last_frame = rt.device.as_ref().map(|d| d.frame_idx);
+            let (idx, rem) = rt.clock.current(&rt.bitmap);
+            Some((idx, rem, last_frame))
+        });
+        match act {
+            None => {
+                // 静态图/已降级：钟没有存在意义
+                let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+            }
+            Some((idx, rem, last_frame)) => {
+                if Some(idx) == last_frame {
+                    // 帧未推进：只重臂（几何动效由 FADE_TIMER 自行整帧重绘）
+                    let _ = SetTimer(hwnd, crate::ssfwin::SSF_TIMER_ID, rem.max(20), None);
+                } else if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                    // show 尾部已按新帧的「距下帧剩余」重臂变间隔钟
+                } else {
+                    let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+                }
+            }
+        }
+    } else {
+        let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2_busy = false;
+    // 组段已在持有期间收尾 → 代为隐藏（与 fade_tick_shared 同款）
+    let pending_hide = std::mem::take(&mut g.pending_cand_hide);
+    match (g.cand2.take(), cand2) {
+        (None, Some(mut mine)) => {
+            if pending_hide {
+                mine.hide_now();
+            } else {
+                g.cand2 = Some(mine);
+            }
+        }
+        (Some(newer), Some(mut mine)) => {
+            mine.hide_now();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+        (None, None) => {}
+    }
+}
+
 unsafe fn fade_tick_shared(hwnd: HWND) {
     // 【动画 tick 线程感知 2026-09-12 十七修】残留窗最终根因：小窗
     // 线程 TL 候选的动画 tick 走到这里 → take g.cand2（主线程窗）

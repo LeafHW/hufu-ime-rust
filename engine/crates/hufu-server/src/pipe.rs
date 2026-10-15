@@ -464,9 +464,52 @@ pub fn dispatch(
         }
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
-            let p = host.skins_dir().join(format!("{id}.json"));
             let show_index = host.engine.config.candidates.show_index;
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            // 【SSF 皮肤 2026-12】kind=ssf → 位图皮肤：只传 cache_dir 路径
+            // + 指纹（11MB 挂件教训：绝不内嵌大图字节），DLL 按需读盘。
+            // anim 系列注入字段与 JSON 皮肤同形状（皮肤对象顶层）；
+            // 颜色已转 "#RRGGBBAA"（DLL color_f 序）。解包失败 → 落到
+            // 下方默认 JSON 皮路径（与 JSON 皮肤加载失败同款回退——
+            // 坏皮绝不弄坏输入）。
+            if host.engine.config.appearance.skin_kind == "ssf" {
+                if let Ok((sv_src, src_fp)) = crate::ssf::skin_payload(&host.data_dir, &id) {
+                    let anim = host.engine.config.appearance.anim;
+                    let anim_speed = host.engine.config.appearance.anim_speed;
+                    let anim_flash = host.engine.config.appearance.anim_flash;
+                    // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
+                    // 字段全部参与——DLL have_fp 命中即 {"same":true} 微载荷。
+                    let fp = format!(
+                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}",
+                        host.engine.config.schema.current
+                    );
+                    if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
+                        if !h.is_empty() && h == fp {
+                            return serde_json::json!({"same": true, "fp": fp});
+                        }
+                    }
+                    let mut sv = sv_src;
+                    if let Some(o) = sv.as_object_mut() {
+                        o.insert("anim".into(), serde_json::json!(anim));
+                        o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("anim_flash".into(), serde_json::json!(anim_flash));
+                        o.insert(
+                            "first_show_slide".into(),
+                            serde_json::json!(
+                                !host.engine.config.schema.current.contains("整句")
+                            ),
+                        );
+                    }
+                    return serde_json::json!({
+                        "skin": sv,
+                        "show_index": show_index,
+                        "delay_show_ms": delay_show_ms,
+                        "fp": fp
+                    });
+                }
+                eprintln!("ssf 皮肤 {id} 加载失败，候选窗回默认 JSON 皮肤");
+            }
+            let p = host.skins_dir().join(format!("{id}.json"));
             // 【皮肤指纹 2026-11】挂件大图皮肤 JSON 可达 11MB——DLL 每
             // 2.5s 例行重拉在打字线程全量解析（40-80ms 停顿，QQ 抖动
             // 观感的放大器，违「首键要快」）。响应内容=皮肤文件+注入

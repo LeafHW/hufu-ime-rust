@@ -21,6 +21,7 @@ mod http;
 mod overlay;
 mod pipe;
 mod platform;
+mod ssf;
 #[cfg(windows)]
 mod tray;
 
@@ -978,15 +979,33 @@ fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
     }
 }
 
+/// 预览图 Content-Type（按扩展名；未知回 octet-stream 让浏览器下载判定）。
+fn image_content_type(p: &std::path::Path) -> &'static str {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
-    // 【浏览器源加固 2026-09-11】所有副作用端点（POST）拒绝跨源网页：
+    // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
+    // DELETE /api/skin）拒绝跨源网页：
     // 浏览器跨源 POST 必带 Origin 头且值非本站（页面 JS 无法伪造）；
     // 本机原生调用方（设置页同源 fetch、托盘、管道 DLL）要么同源
     // 要么无 Origin。恶意网页 fetch no-cors POST 直达 127.0.0.1:4390
     // 杀 server（/api/shutdown 无鉴权审计项）由此封死；Host 白名单
     // 同时防 DNS rebinding（外域域名解析到 127.0.0.1 的请求 Host
     // 不是本机名）。
-    if req.method == "POST" {
+    if req.method == "POST" || req.method == "DELETE" {
         if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
             let local = origin.starts_with("http://127.0.0.1:")
                 || origin.starts_with("http://localhost:")
@@ -1145,14 +1164,66 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
         }
         ("GET", "/api/skins") => {
-            let list: Vec<serde_json::Value> = host
+            // 【SSF 双类型皮肤 2026-12】JSON 皮肤 + .ssf 皮肤合并列表：
+            // 每项带 kind 徽标；ssf 项带 author / 解析错误 / 预览可用性 /
+            // warnings。旧字段（skins[].id/name、current）形状不变——老
+            // UI 无感（回归红线）。ssf 项解析失败也列出（error 带原因），
+            // name 回退文件名。
+            let cur = host.engine.config.appearance.skin.clone();
+            let cur_kind = host.engine.config.appearance.skin_kind.clone();
+            let mut list: Vec<serde_json::Value> = host
                 .list_skins()
                 .into_iter()
-                .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+                .map(|(id, name)| {
+                    serde_json::json!({"id": id, "kind": "json", "name": name})
+                })
                 .collect();
+            for e in host.list_ssf_skins() {
+                let mut it = serde_json::json!({
+                    "id": e.id,
+                    "kind": "ssf",
+                    "name": e.name,
+                    "author": e.author,
+                });
+                if let Some(err) = &e.error {
+                    it["error"] = serde_json::json!(err);
+                }
+                if e.error.is_none() && e.preview {
+                    it["preview"] = serde_json::json!(true);
+                }
+                if !e.warnings.is_empty() {
+                    it["warnings"] = serde_json::json!(e.warnings);
+                }
+                list.push(it);
+            }
+            // 【列表标注】当前 ssf 皮肤源文件已删（会话中缓存降级渲染）：
+            // 文件枚举已见不到它，补一条带 error 的标注项让设置页可见现状。
+            if cur_kind == "ssf"
+                && !list
+                    .iter()
+                    .any(|x| x["kind"] == "ssf" && x["id"].as_str() == Some(cur.as_str()))
+            {
+                let name = host
+                    .ssf_bundle(&cur)
+                    .map(|b| {
+                        if b.def.name.is_empty() {
+                            cur.clone()
+                        } else {
+                            b.def.name
+                        }
+                    })
+                    .unwrap_or_else(|_| cur.clone());
+                list.push(serde_json::json!({
+                    "id": cur,
+                    "kind": "ssf",
+                    "name": name,
+                    "error": "源 .ssf 文件已删除（当前会话使用缓存渲染）",
+                }));
+            }
             Response::json(&serde_json::json!({
                 "skins": list,
-                "current": host.engine.config.appearance.skin,
+                "current": cur,
+                "current_kind": cur_kind,
             }))
         }
         ("GET", "/api/skin") => {
@@ -1182,8 +1253,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         ("POST", "/api/skin/select") => {
             // 仅切换当前皮肤：不写皮肤文件（POST /api/skin 是「保存」语义，
             // 误发 {id:...} 会把目标皮肤覆盖成全默认——曾经的静默毁档事故）
-            let id = req
-                .json()
+            // 【SSF 扩展 2026-12】body {id, kind:"json"|"ssf"}；kind 缺省
+            // =json（老 UI 无感）。kind=ssf 先校验能解包成功才切换（坏皮
+            // 绝不上位）；写 appearance.skin + skin_kind。
+            let v = req.json();
+            let id = v
                 .get("id")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
@@ -1191,13 +1265,42 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if id.is_empty() {
                 return Response::err(400, "缺少 id");
             }
-            let p = host.skins_dir().join(format!("{id}.json"));
-            if !p.exists() {
-                return Response::err(404, &format!("皮肤 {id} 不存在"));
+            let kind = v
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("json")
+                .to_string();
+            let prev_kind = host.engine.config.appearance.skin_kind.clone();
+            if kind == "ssf" {
+                let p = host.ssf_skins_dir().join(format!("{id}.ssf"));
+                if !p.exists() {
+                    return Response::err(404, &format!("皮肤 {id} 不存在"));
+                }
+                // 坏 .ssf（损坏/超预算/不支持的容器）→ 400 带原因，不切换
+                if let Err(e) = host.ssf_bundle(&id) {
+                    return Response::err(400, &format!("皮肤不可用: {e}"));
+                }
+                host.engine.config.appearance.skin = id.clone();
+                host.engine.config.appearance.skin_kind = "ssf".into();
+                let _ = host.engine.config.save(&host.config_path);
+                // 皮肤版本 +1：DLL poll 立即强制重拉（不靠 2.5s 过期）
+                host.skin_ver += 1;
+                Response::json(&serde_json::json!({"ok": true, "id": id, "kind": "ssf"}))
+            } else {
+                let p = host.skins_dir().join(format!("{id}.json"));
+                if !p.exists() {
+                    return Response::err(404, &format!("皮肤 {id} 不存在"));
+                }
+                host.engine.config.appearance.skin = id.clone();
+                host.engine.config.appearance.skin_kind = "json".into();
+                let _ = host.engine.config.save(&host.config_path);
+                // json→json 与旧行为一致（不 bump，靠 DLL 2.5s 过期+指纹
+                // 变化重拉）；仅形态切换（ssf→json）时强制重拉。
+                if prev_kind != "json" {
+                    host.skin_ver += 1;
+                }
+                Response::json(&serde_json::json!({"ok": true, "id": id}))
             }
-            host.engine.config.appearance.skin = id.clone();
-            let _ = host.engine.config.save(&host.config_path);
-            Response::json(&serde_json::json!({"ok": true, "id": id}))
         }
         ("POST", "/api/preview") => {
             // 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标
@@ -1244,6 +1347,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match skin.save(&p) {
                 Ok(()) => {
                     host.engine.config.appearance.skin = skin.id.clone();
+                    // 【SSF 扩展 2026-12】保存的必是 JSON 皮肤——形态字段
+                    // 同步归位（此前若停在 ssf 形态，保存 JSON 会留下悬空
+                    // kind=ssf 指向不存在的 .ssf）。
+                    host.engine.config.appearance.skin_kind = "json".into();
                     let _ = host.engine.config.save(&host.config_path);
                     // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
                     // 2.5s 缓存）——设置页调参实机预览即时生效
@@ -1260,6 +1367,73 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match hufu_skin::Skin::from_weasel_colors(id, v.get("colors").unwrap_or(&v)) {
                 Some(skin) => Response::json(&serde_json::to_value(&skin).unwrap()),
                 None => Response::err(400, "导入失败"),
+            }
+        }
+        // 【SSF 皮肤 2026-12】导入 .ssf：body=原始 .ssf 字节
+        //（Content-Type: application/octet-stream；极简 HTTP 不校验 CT，
+        // 按字节流收）。?name=xxx.ssf 可选，缺省用皮肤内 skin_name 消毒。
+        // 存 皮肤\{name}.ssf → 解包建缓存 → {ok, id, warnings}；不自动
+        // 切换（UI 需要时另调 /api/skin/select）。
+        ("POST", "/api/skin/import_ssf") => {
+            let qname = req.query.get("name").map(|s| s.as_str());
+            match ssf::import_ssf(&host.data_dir, &req.body, qname) {
+                Ok((id, warnings)) => Response::json(&serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "warnings": warnings,
+                })),
+                Err(e) => Response::err(400, &e),
+            }
+        }
+        // 【SSF 皮肤 2026-12】预览图：manifest.preview 指向的缓存文件字节。
+        // 仅 kind=ssf（JSON 参数化皮肤无预览图概念）；无预览/缺失 → 404。
+        ("GET", "/api/skin/preview") => {
+            let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("ssf");
+            if kind != "ssf" {
+                return Response::err(400, "仅 ssf 皮肤支持预览图");
+            }
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::preview_file(&host.data_dir, &id) {
+                Some(p) => match std::fs::read(&p) {
+                    Ok(b) => Response {
+                        status: 200,
+                        content_type: image_content_type(&p),
+                        body: b,
+                    },
+                    Err(_) => Response::err(404, "预览图读取失败"),
+                },
+                None => Response::err(404, "该皮肤无预览图"),
+            }
+        }
+        // 【SSF 皮肤 2026-12】删除 .ssf 源文件 + 缓存目录（.ssf 用户自
+        // 管理、可删除；JSON 皮肤保持现状不动——无此删除通道）。删的是
+        // 当前皮肤时回退默认 JSON 皮肤。
+        ("DELETE", "/api/skin") => {
+            let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("json");
+            if kind != "ssf" {
+                return Response::err(400, "JSON 皮肤不支持删除（仅 .ssf）");
+            }
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::remove_ssf(&host.data_dir, &id) {
+                Ok(()) => {
+                    if host.engine.config.appearance.skin == id
+                        && host.engine.config.appearance.skin_kind == "ssf"
+                    {
+                        let fallback = hufu_config::AppearanceSection::default().skin;
+                        host.engine.config.appearance.skin = fallback;
+                        host.engine.config.appearance.skin_kind = "json".into();
+                        let _ = host.engine.config.save(&host.config_path);
+                        host.skin_ver += 1; // 强制 DLL 立即重拉回默认皮
+                    }
+                    Response::json(&serde_json::json!({"ok": true}))
+                }
+                Err(e) => Response::err(500, &e),
             }
         }
         ("POST", "/api/sentence_test") => {

@@ -30,6 +30,7 @@ mod langbar;
 // 只读候选窗最终矩形取位，不碰候选窗锚点/几何代码。
 mod overlaywin;
 mod sound;
+mod ssfwin;
 mod tsf;
 
 use windows_core::*;

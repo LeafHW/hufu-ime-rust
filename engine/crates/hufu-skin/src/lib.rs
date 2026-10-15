@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
+/// 【SSF M1】.ssf（搜狗/虎娘皮肤）三代容器 + skin.ini 解析。
+/// 详见 `ssf` 模块文档与《虎符SSF皮肤系统设计方案》。
+pub mod ssf;
+
 /// RGBA 颜色（serde 兼容 0xAABBGGRR 整数与 #RRGGBBAA 字符串）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Color(#[serde(with = "color_serde")] pub [u8; 4]); // r, g, b, a

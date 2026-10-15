@@ -24,6 +24,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
 thiserror = "2"
+# 【SSF 皮肤 M1】容器解析三件套：AES-256-CBC（搜狗 Skin-v3）、
+# zlib/deflate（v3 内层 + 明文 ZIP）、sha2（server 指纹）。全部纯 Rust，
+# 只进 hufu-skin/hufu-server（x64），i686-gnu DLL 不依赖。
+aes = "0.8"
+cbc = "0.1"
+flate2 = "1"
+sha2 = "0.10"
 
 [profile.release]
 lto = "fat"

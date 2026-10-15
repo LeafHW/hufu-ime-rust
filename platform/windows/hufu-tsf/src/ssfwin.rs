@@ -1,0 +1,1215 @@
+//! ssfwin —— .ssf 位图皮肤运行时（DLL 侧，自包含模块）。
+//!
+//! 职责（对照 tigirl 语义逐行移植，引用格式 `虎娘:文件:行号`）：
+//! - **资源加载**：从 server 解包缓存目录（`皮肤缓存\{id}\`）按「归一小写相对
+//!   名」读图 → image crate 解码（静态 PNG/GIF/WebP/JPEG + APNG/GIF 动图，
+//!   解码骨架复用 overlaywin.rs:328-433 的已验证口径）→ 统一为逐帧全画布
+//!   **premultiplied BGRA** 帧流（预乘换算同 overlaywin.rs:557-561）。
+//! - **进程级缓存**：key=(cache_dir, 图片名)、值校验 fp 指纹，变化即失效重建
+//!   （虎娘「路径+大小+mtime+刷新戳」的指纹化简版），LRU 上限 8 条（虎娘 2 条，
+//!   DLL 侧多窗口共用放宽）。超预算/解码失败一律 Err，上层降级回 JSON 矢量
+//!   皮肤，绝不让皮肤错误弄坏输入（设计方案 §4.6 降级矩阵）。
+//! - **九宫格切片与绘制**：`slice_axis` 逐行移植虎娘 sliceAxis（SsfSkin.cpp:
+//!   80-89），`draw_nineslice` 叉乘 ≤9 块 DrawBitmap + 目标四边 DPI snap 到
+//!   物理像素防接缝（CandidateRendererSkin.cpp:70-84）。
+//! - **APNG 帧时钟**：`frame_at` 移植虎娘 animationFrame（SsfAnimation.cpp:
+//!   46-50）——每帧最小 20ms、plays 播完停末帧、按 elapsed 环形取帧。
+//! - **设备位图缓存**：帧号/尺寸没变不重建（虎娘 skinBitmapFrame_ 机制，
+//!   CandidateRendererSkin.cpp:62-69）。
+//! - **皮肤 JSON 描述**：`SsfSkinSpec` 解析 `{skin:{kind:"ssf",cache_dir,fp,
+//!   display,layouts}}`（双形态口径同 candwin2.rs:1399-1423 的 color_f/
+//!   layout_f——`/skin/...` 包装层或顶层直挂都认）。
+//!
+//! 渲染管线接入点（candwin2.rs:4280 背景分支替换 FillRoundedRectangle）、
+//! APNG 常驻时钟（SSF_TIMER_ID，不挂 anim_boost——400ms 自杀截止与循环播放
+//! 冲突）等集成细节见 `E:\DSH-KF\.refs\_dll接入方案.md`。
+//!
+//! 安全预算（照虎娘全套，超限 Err）：
+//! | 项                       | 上限                          |
+//! |--------------------------|-------------------------------|
+//! | 单图边长                 | ≤8192×8192                    |
+//! | 每帧像素                 | ≤16,000,000                   |
+//! | 帧数                     | ≤256                          |
+//! | 全图解码内存（帧流总量） | ≤64MB                         |
+//! | 单文件输入               | ≤16MiB（虎娘 4MiB，虎符放宽） |
+//! PNG CRC/截断由 png 解码器校验，失败即 Err。
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use serde_json::Value;
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct2D::Common::*;
+use windows::Win32::Graphics::Direct2D::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+// ── 安全预算常量 ──
+
+/// 单图边长上限（虎娘口径：≤8192×8192）。
+const MAX_DIM: u32 = 8192;
+/// 单帧像素上限（虎娘口径 ≤16M 像素/帧）。
+const MAX_PIXELS: u64 = 16_000_000;
+/// 帧数上限（虎娘口径 ≤256 帧）。
+const MAX_FRAMES: usize = 256;
+/// 全图解码内存预算：帧流总量 ≤64MB（虎娘口径，跨帧共享）。
+const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+/// 单文件输入上限（虎娘 4MiB 运行时上限，设计方案 §1.1 放宽到 16MiB）。
+const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// 解码缓存条目上限（LRU；虎娘 ≤2 条，DLL 侧多窗口共用放宽到 8）。
+const CACHE_LIMIT: usize = 8;
+/// 动图每帧延迟下限（虎娘口径：最小 20ms）。
+const MIN_FRAME_DELAY_MS: u32 = 20;
+
+/// .ssf 皮肤 APNG 帧推进常驻定时器 id（wndproc WM_TIMER 消费；独立于
+/// FADE_TIMER_ID/anim_boost——后者 400ms 自杀截止与循环播放冲突，见
+/// candwin2.rs:6478-6566 注释与 _dll接入方案.md §4）。0x4945='IE'。
+pub const SSF_TIMER_ID: usize = 0x4945;
+
+// ============================================================================
+// SsfBitmap：解码后的位图帧流
+// ============================================================================
+
+/// 一张皮肤图的解码产物：逐帧全画布 premultiplied BGRA（u8×4）。
+/// 静态图=单帧、delay 0；动图帧数与 delays_ms 一一对应。
+/// 帧内存总量受 64MB 预算约束（解码时强制）。
+pub struct SsfBitmap {
+    pub width: u32,
+    pub height: u32,
+    /// 播放次数：0=无限循环（APNG acTL num_plays / GIF Netscape loop）。
+    pub plays: u32,
+    /// 每帧 `width*height*4` 字节，BGRA 预乘、逐像素行主序。
+    pub frames: Vec<Vec<u8>>,
+    /// 每帧时长 ms（已钳 ≥20；静态图恒 0）。
+    pub delays_ms: Vec<u32>,
+}
+
+impl SsfBitmap {
+    pub fn is_animated(&self) -> bool {
+        self.frames.len() > 1 && self.delays_ms.iter().any(|&d| d > 0)
+    }
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// RGBA 直排 → premultiplied BGRA（同 overlaywin.rs:557-561 的换算式：
+/// `(c*a+127)/255`，四舍五入近真，通道顺序 R,G,B,A → B,G,R,A）。
+fn rgba_to_premul_bgra(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    // n 取契约值与实参的较小者：解码器产物尺寸异常时不越界（防御，
+    // 正常路径 w*h*4 == rgba.len()）。
+    let n = ((w as usize) * (h as usize)).min(rgba.len() / 4);
+    let mut out = vec![0u8; n * 4];
+    for i in 0..n {
+        let s = i * 4;
+        let a = rgba[s + 3] as u32;
+        out[s] = ((rgba[s + 2] as u32 * a + 127) / 255) as u8;
+        out[s + 1] = ((rgba[s + 1] as u32 * a + 127) / 255) as u8;
+        out[s + 2] = ((rgba[s] as u32 * a + 127) / 255) as u8;
+        out[s + 3] = a as u8;
+    }
+    out
+}
+
+/// 动图帧 → (RgbaImage, 延迟 ms)（同 overlaywin.rs:435-439 的 frame_pair，
+/// 除法改为四舍五入——虎娘 delayMs 同款 `(num*1000+den/2)/den` 取整）。
+fn frame_pair(f: image::Frame) -> (image::RgbaImage, u32) {
+    let (num, den) = f.delay().numer_denom_ms();
+    let ms = if den == 0 { 100 } else { (num + den / 2) / den };
+    (f.into_buffer(), ms.max(1))
+}
+
+/// 解码一张皮肤图（内存字节 → SsfBitmap）。
+///
+/// 解码骨架对齐 overlaywin.rs:353-433（已验证的 DLL 侧口径）：GIF 走
+/// GifDecoder（image crate 内部完成 dispose/blend 合成，产物为全画布帧，
+/// image-0.25.10 gif.rs:380-422）；PNG 先探 APNG（is_apng），动图走
+/// apng() 帧流（mix_next_frame 已合成全画布，png.rs:525-553），静态与其
+/// 余格式（WebP/JPEG）走 load_from_memory 单帧。plays 取自 LoopCount
+/// （APNG=acTL num_plays / GIF=Netscape loop，Infinite→0）。
+fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
+    use image::AnimationDecoder;
+
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let is_gif = data.len() > 3 && &data[0..3] == b"GIF";
+    let is_png = data.len() >= 8 && data[0..8] == PNG_MAGIC;
+
+    // plays 提取：LoopCount::Infinite→0（无限循环，虎娘 plays=0 语义）。
+    let plays_of = |lc: image::metadata::LoopCount| match lc {
+        image::metadata::LoopCount::Infinite => 0u32,
+        image::metadata::LoopCount::Finite(n) => n.get(),
+    };
+
+    let animated;
+    let plays;
+    let iter: Box<dyn Iterator<Item = (image::RgbaImage, u32)>> = if is_gif {
+        let dec = image::codecs::gif::GifDecoder::new(Cursor::new(data))
+            .map_err(|e| format!("GIF 解码失败: {e}"))?;
+        plays = plays_of(dec.loop_count());
+        animated = true;
+        Box::new(
+            dec.into_frames()
+                .filter_map(|f| f.ok())
+                .map(frame_pair),
+        )
+    } else if is_png {
+        let dec = image::codecs::png::PngDecoder::new(Cursor::new(data))
+            .map_err(|e| format!("PNG 解码失败: {e}"))?;
+        if dec.is_apng().unwrap_or(false) {
+            let apng = dec
+                .apng()
+                .map_err(|e| format!("APNG 打开失败: {e}"))?;
+            plays = plays_of(apng.loop_count());
+            animated = true;
+            Box::new(
+                apng.into_frames()
+                    .filter_map(|f| f.ok())
+                    .map(frame_pair),
+            )
+        } else {
+            plays = 0;
+            animated = false;
+            let img = image::load_from_memory(data)
+                .map_err(|e| format!("静态图解码失败: {e}"))?
+                .to_rgba8();
+            Box::new(std::iter::once((img, 0u32)))
+        }
+    } else {
+        // WebP/JPEG（及其余 image crate 可吃格式）：静态单帧
+        plays = 0;
+        animated = false;
+        let img = image::load_from_memory(data)
+            .map_err(|e| format!("静态图解码失败: {e}"))?
+            .to_rgba8();
+        Box::new(std::iter::once((img, 0u32)))
+    };
+
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut delays_ms: Vec<u32> = Vec::new();
+    let mut dims @ (w0, h0) = (0u32, 0u32);
+    for (img, ms) in iter {
+        if frames.is_empty() {
+            let (w, h) = (img.width(), img.height());
+            if w == 0 || h == 0 {
+                return Err("图片尺寸为 0".to_string());
+            }
+            if w > MAX_DIM || h > MAX_DIM {
+                return Err(format!("图片超限 {w}×{h}（>8192×8192）"));
+            }
+            if w as u64 * h as u64 > MAX_PIXELS {
+                return Err(format!("单帧像素超限 {w}×{h}（>16M）"));
+            }
+            dims = (w, h);
+        } else if (img.width(), img.height()) != dims {
+            // image 的 APNG/GIF 合成保证全画布帧；不一致=解码器异常，拒收
+            return Err(format!(
+                "帧尺寸不一致 {}×{}（首帧 {w0}×{h0}）",
+                img.width(),
+                img.height()
+            ));
+        }
+        if frames.len() >= MAX_FRAMES {
+            return Err(format!("帧数超限（>{MAX_FRAMES}）"));
+        }
+        let per_frame = dims.0 as u64 * dims.1 as u64 * 4;
+        if (frames.len() as u64 + 1) * per_frame > MAX_DECODE_BYTES {
+            return Err("解码内存超 64MB 预算".to_string());
+        }
+        // 帧延迟：静态 0；动图钳 [20ms, 60s]（虎娘下限 20ms；上限防手改
+        // 皮肤写 0x7FFFFFFF 把帧钟拖死）
+        let delay = if animated {
+            ms.clamp(MIN_FRAME_DELAY_MS, 60_000)
+        } else {
+            0
+        };
+        frames.push(rgba_to_premul_bgra(dims.0, dims.1, img.as_raw()));
+        delays_ms.push(delay);
+    }
+    if frames.is_empty() {
+        return Err("没有可解码帧".to_string());
+    }
+    Ok(SsfBitmap {
+        width: dims.0,
+        height: dims.1,
+        plays,
+        frames,
+        delays_ms,
+    })
+}
+
+// ============================================================================
+// 进程级解码缓存：(cache_dir, 归一图名) → (fp, Arc<SsfBitmap>)，LRU≤8
+// ============================================================================
+
+struct CacheEntry {
+    /// 皮肤指纹（源 .ssf 的 size+mtime+sha256，server 下发）。命中时校验，
+    /// 变化即失效重建——虎娘「刷新戳进缓存 key」的等价实现（同尺寸同
+    /// mtime 重存也能换装）。
+    fp: String,
+    bitmap: Arc<SsfBitmap>,
+    last_used: u64,
+}
+
+// HashMap::new 非 const fn（工具链限制），静态里装 Option 惰性建表
+//（同 candwin2 MENU_FONT 静态模式）。
+static BITMAP_CACHE: Mutex<Option<HashMap<(PathBuf, String), CacheEntry>>> = Mutex::new(None);
+static CACHE_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// 持锁访问缓存表（首访问建表）。
+fn with_cache<R>(f: impl FnOnce(&mut HashMap<(PathBuf, String), CacheEntry>) -> R) -> R {
+    let mut g = BITMAP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+fn cache_tick() -> u64 {
+    CACHE_TICK.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 图片名归一：小写相对名 + DLL 侧二次消毒（server 解包落盘已消毒一遍，
+/// 这里是第二道防线——设计方案 §六.11：写盘白名单之外读盘也要验）。
+/// 拒绝：空/超长(>128)/路径分隔符/盘符/通配符/控制字符/`..`。
+fn normalize_image_name(name: &str) -> Result<String, String> {
+    let n = name.trim().to_lowercase();
+    if n.is_empty() || n.len() > 128 {
+        return Err(format!("图片名不合法: {name:?}"));
+    }
+    if n.contains("..")
+        || n.chars()
+            .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control())
+    {
+        return Err(format!("图片名不合法: {name:?}"));
+    }
+    Ok(n)
+}
+
+/// 加载（并缓存）一张皮肤图。失败一律 Err(String)——上层降级回 JSON 矢量
+/// 皮肤或跳过该 Scheme 变体（降级矩阵见设计方案 §4.6）。
+pub fn load_bitmap(cache_dir: &Path, fp: &str, image: &str) -> Result<Arc<SsfBitmap>, String> {
+    let name = normalize_image_name(image)?;
+    let key = (cache_dir.to_path_buf(), name.clone());
+    // ① 快路径：命中且 fp 未变
+    {
+        let hit = with_cache(|cache| {
+            if let Some(e) = cache.get_mut(&key) {
+                if e.fp == fp {
+                    e.last_used = cache_tick();
+                    return Some(e.bitmap.clone());
+                }
+                // fp 变化 → 失效（虎娘皮肤刷新戳同款语义）
+                cache.remove(&key);
+            }
+            None
+        });
+        if let Some(bmp) = hit {
+            return Ok(bmp);
+        }
+    }
+    // ② 解码（锁外读盘+解码，不阻塞其它窗口取图）
+    let path = cache_dir.join(&name);
+    let data =
+        std::fs::read(&path).map_err(|e| format!("读图失败 {}: {e}", path.display()))?;
+    if data.len() > MAX_INPUT_BYTES {
+        return Err(format!("文件超限 {} bytes（>16MiB）", data.len()));
+    }
+    let bmp = Arc::new(decode_bitmap(&data)?);
+    // ③ 回锁插入 + LRU 收缩（期间他线程先插同 key 则覆盖，二者等价：
+    // 同 path 同 fp 的解码结果确定性一致）
+    with_cache(|cache| {
+        cache.insert(
+            key,
+            CacheEntry {
+                fp: fp.to_string(),
+                bitmap: bmp.clone(),
+                last_used: cache_tick(),
+            },
+        );
+        while cache.len() > CACHE_LIMIT {
+            let victim = cache
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    cache.remove(&k);
+                }
+                None => break,
+            }
+        }
+    });
+    Ok(bmp)
+}
+
+// ============================================================================
+// 九宫格切片（逐行移植虎娘 SsfSkin.cpp:80-89 sliceAxis）
+// ============================================================================
+
+/// 一轴切片：源区间 [source, source+source_length) → 目标区间
+/// [destination, destination+destination_length)。全 f32。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsfAxisSlice {
+    pub source: f32,
+    pub source_length: f32,
+    pub destination: f32,
+    pub destination_length: f32,
+}
+
+/// 单轴九宫格切片（虎娘 sliceAxis 语义逐行移植）：
+/// - 源 0 / 目标非有限或 ≤0 → 空切片（整轴不画）；
+/// - 刀口和 ≥ 源宽 → 按 `(源宽-1)/刀口和` 比例收缩刀口（真机立绘压扁
+///   根因：别整图硬缩）；
+/// - 目标 < 刀口和 → 再等比收缩目标侧刀口（`destination/(before+after)`）；
+/// - tile=true（mode 1 平铺）且 中段源宽>0 且 `可用宽/中段 ≤64` → 逐块
+///   平铺（≤64 块绘制预算）；否则中段整体拉伸；
+/// - 首尾块 source_length/destination_length ≤0 的丢弃（add 谓词）。
+pub fn slice_axis(source: u32, destination: f32, tile: bool, before: i32, after: i32) -> Vec<SsfAxisSlice> {
+    let mut out = Vec::new();
+    if source == 0 || !destination.is_finite() || destination <= 0.0 {
+        return out;
+    }
+    let size = source as f32;
+    let mut before = before.max(0) as f32;
+    let mut after = after.max(0) as f32;
+    // 刀口和 ≥ 源宽：按比例收缩（留 1px 中段）
+    if before + after >= size {
+        let factor = (size - 1.0) / (before + after).max(1.0);
+        before *= factor;
+        after *= factor;
+    }
+    // 目标小于刀口和：目标侧刀口等比收缩（源刀口不变——边段被压缩绘制）
+    let factor = if before + after > destination {
+        destination / (before + after)
+    } else {
+        1.0
+    };
+    let left = before * factor;
+    let right = after * factor;
+    let add = |s: f32, n: f32, d: f32, len: f32, out: &mut Vec<SsfAxisSlice>| {
+        if n > 0.0 && len > 0.0 {
+            out.push(SsfAxisSlice {
+                source: s,
+                source_length: n,
+                destination: d,
+                destination_length: len,
+            });
+        }
+    };
+    add(0.0, before, 0.0, left, &mut out);
+    let middle = size - before - after;
+    let available = (destination - left - right).max(0.0);
+    if tile && middle > 0.0 && available / middle <= 64.0 {
+        // 平铺：中段按原尺寸逐块铺满可用宽（≤64 块）
+        let mut d = 0.0f32;
+        while d < available {
+            let n = middle.min(available - d);
+            if n <= 0.0 {
+                break;
+            }
+            add(before, n, left + d, n, &mut out);
+            d += n;
+        }
+    } else {
+        add(before, middle, left, available, &mut out);
+    }
+    add(size - after, after, destination - right, right, &mut out);
+    out
+}
+
+/// 九宫格绘制（虎娘 drawSkinBackground 逐行移植，CandidateRendererSkin.cpp:
+/// 70-84）：两轴 slice_axis 叉乘 ≤9 块（平铺模式更多，仍受 64 块/轴预算）
+/// DrawBitmap。
+///
+/// **目标四边按 DPI snap 到物理像素**：`round(v*dpi/96)*96/dpi`。虎娘注释
+/// 原话教训：相邻切片必须共享物理像素边缘，分数边缘在透明背景上各自
+/// 混合 → 接缝/半透明素材压暗。相邻块 destination 边缘天然相等（切片
+/// 逐块累加），snap 后仍共享。
+///
+/// 坐标系：dst_w/dst_h 与 FillRoundedRectangle 同一逻辑坐标系（调用方
+/// 已 SetTransform(dpi 缩放)）；`dpi` 参数仅用于 snap 折算（传窗口
+/// dpi_scale，如 150%→1.5）。
+///
+/// 线性插值（LINEAR）与虎娘一致：拉伸段抗锯齿，角块 1:1 时无重采样损耗。
+pub unsafe fn draw_nineslice(
+    ctx: &ID2D1DeviceContext,
+    bitmap: &ID2D1Bitmap,
+    src_w: u32,
+    src_h: u32,
+    dst_w: f32,
+    dst_h: f32,
+    tile_h: bool,
+    before_h: i32,
+    after_h: i32,
+    tile_v: bool,
+    before_v: i32,
+    after_v: i32,
+    dpi: f32,
+) {
+    let hslices = slice_axis(src_w, dst_w, tile_h, before_h, after_h);
+    let vslices = slice_axis(src_h, dst_h, tile_v, before_v, after_v);
+    let snap = |v: f32| -> f32 {
+        if dpi > 0.0 && dpi.is_finite() {
+            (v * dpi / 96.0).round() * 96.0 / dpi
+        } else {
+            v
+        }
+    };
+    for y in &vslices {
+        for x in &hslices {
+            let dst = D2D_RECT_F {
+                left: snap(x.destination),
+                top: snap(y.destination),
+                right: snap(x.destination + x.destination_length),
+                bottom: snap(y.destination + y.destination_length),
+            };
+            if dst.right <= dst.left || dst.bottom <= dst.top {
+                continue;
+            }
+            let src = D2D_RECT_F {
+                left: x.source,
+                top: y.source,
+                right: x.source + x.source_length,
+                bottom: y.source + y.source_length,
+            };
+            let _ = ctx.DrawBitmap(
+                bitmap,
+                Some(&dst as *const D2D_RECT_F),
+                1.0,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                Some(&src as *const D2D_RECT_F),
+                None,
+            );
+        }
+    }
+}
+
+// ============================================================================
+// APNG 帧时钟（逐行移植虎娘 SsfAnimation.cpp:46-50 animationFrame）
+// ============================================================================
+
+/// 按已播放时长取当前帧。返回 (帧号, 距下帧剩余 ms)。
+/// - 单帧/静态 → (0, 0)；
+/// - 每帧延迟最小按 20ms 计（delays_ms 解码时已钳，此处双保险）；
+/// - plays>0 且 `elapsed/总时长 ≥ plays` → 停在最后一帧 (len-1, 0)；
+/// - 否则按 elapsed 环形取帧，remaining=当前帧剩余展示时长。
+pub fn frame_at(bmp: &SsfBitmap, elapsed_ms: u64) -> (usize, u32) {
+    let delays = &bmp.delays_ms;
+    if delays.len() < 2 || bmp.frames.len() < 2 {
+        return (0, 0);
+    }
+    let eff: Vec<u64> = delays.iter().map(|&d| d.max(MIN_FRAME_DELAY_MS) as u64).collect();
+    let duration: u64 = eff.iter().sum();
+    if duration == 0 {
+        return (0, 0);
+    }
+    if bmp.plays > 0 && elapsed_ms / duration >= bmp.plays as u64 {
+        return (delays.len() - 1, 0);
+    }
+    let mut within = elapsed_ms % duration;
+    for (i, &d) in eff.iter().enumerate() {
+        if within < d {
+            return (i, (d - within) as u32);
+        }
+        within -= d;
+    }
+    (0, 0)
+}
+
+/// APNG 帧钟：每窗一份，皮肤换装/代次重建时 restart()（虎娘 skinStarted_
+/// 对位物）。
+pub struct SsfFrameClock {
+    start: Instant,
+}
+
+impl Default for SsfFrameClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SsfFrameClock {
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+    /// 重置时间基准（换装/重解码后调用，动画从头播）。
+    pub fn restart(&mut self) {
+        self.start = Instant::now();
+    }
+    pub fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    /// 当前 (帧号, 距下帧剩余 ms)。
+    pub fn current(&self, bmp: &SsfBitmap) -> (usize, u32) {
+        frame_at(bmp, self.elapsed_ms())
+    }
+}
+
+// ============================================================================
+// 设备位图缓存（每窗口一份；虎娘 skinBitmapFrame_ 机制）
+// ============================================================================
+
+/// 每窗口级 D2D 位图缓存：帧号+尺寸没变直接复用（重建=CreateBitmap 整图
+/// 上传，动图帧率下必须靠这个平摊成本）。dims 参与比对：换图（尺寸变）
+/// 但帧号恰相同（都从 0 起）时防串用旧位图——虎娘在 `image != skinImage_`
+/// 时 Reset（CandidateRendererSkin.cpp:15-16），虎符以尺寸代差近似同判。
+pub struct SsfDeviceBitmap {
+    pub d2d_bitmap: ID2D1Bitmap,
+    pub frame_idx: usize,
+    dims: (u32, u32),
+}
+
+/// 取当前帧的 D2D 位图（B8G8R8A8_UNORM + PREMULTIPLIED，dpi=96——缩放由
+/// 调用方 SetTransform 承担，位图自身按像素 1:1）。帧号越界钳到末帧
+/// （防御：fp 切换瞬间帧流长度可能先于调用方更新）。
+pub unsafe fn device_bitmap<'a>(
+    ctx: &ID2D1DeviceContext,
+    bmp: &SsfBitmap,
+    frame_idx: usize,
+    cache: &'a mut Option<SsfDeviceBitmap>,
+) -> windows_core::Result<&'a ID2D1Bitmap> {
+    let idx = frame_idx.min(bmp.frames.len().saturating_sub(1));
+    // 命中判定先做（共享借用立即结束，不与后续可变借用打架）
+    let hit = cache
+        .as_ref()
+        .map(|c| c.frame_idx == idx && c.dims == (bmp.width, bmp.height))
+        .unwrap_or(false);
+    if hit {
+        return Ok(&cache.as_ref().unwrap().d2d_bitmap);
+    }
+    let Some(frame) = bmp.frames.get(idx) else {
+        return Err(windows_core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+    };
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    };
+    let size = D2D_SIZE_U {
+        width: bmp.width,
+        height: bmp.height,
+    };
+    // ID2D1DeviceContext::CreateBitmap（扩展版，D2D1_BITMAP_PROPERTIES1）：
+    // 直接从 BGRA 预乘内存建图（虎娘 CreateBitmap(SizeU, data, stride,
+    // PBGRA,96,96) 同款）
+    let b1: ID2D1Bitmap1 = ctx.CreateBitmap(
+        size,
+        Some(frame.as_ptr() as *const core::ffi::c_void),
+        bmp.width * 4,
+        &props,
+    )?;
+    let b: ID2D1Bitmap = b1.cast()?;
+    *cache = Some(SsfDeviceBitmap {
+        d2d_bitmap: b,
+        frame_idx: idx,
+        dims: (bmp.width, bmp.height),
+    });
+    Ok(&cache.as_ref().unwrap().d2d_bitmap)
+}
+
+// ============================================================================
+// 皮肤 JSON 描述解析（SsfSkinSpec）
+// ============================================================================
+
+/// 皮肤色读取：`#RRGGBB`（缺省 alpha=0xFF 不透明）或 `#RRGGBBAA`（A 在
+/// 末尾）——与 candwin2.rs:1386-1396 parse_hex 完全同口径（server 契约：
+/// skin.ini 的 0xBBGGRR 在下发前已转成 #RRGGBBAA）。坏值/非 ASCII 返回
+/// None，由调用方落默认色（降级不失败）。
+pub fn parse_hex_rgba(s: &str) -> Option<[u8; 4]> {
+    let s = s.trim_start_matches('#');
+    // 非 ASCII 颜色串按字节切片会切进 UTF-8 字符中间 panic（渲染线程
+    // panic=宿主崩）——先校验（同 candwin2.rs:1388-1393 的防护）
+    if !s.is_ascii() || (s.len() != 8 && s.len() != 6) {
+        return None;
+    }
+    let b = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    Some([b(0)?, b(2)?, b(4)?, if s.len() == 8 { b(6)? } else { 0xFF }])
+}
+
+/// [R,G,B,A] → D2D 颜色（供渲染分支直接取用）。
+pub fn rgba_to_color_f(c: [u8; 4]) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: c[0] as f32 / 255.0,
+        g: c[1] as f32 / 255.0,
+        b: c[2] as f32 / 255.0,
+        a: c[3] as f32 / 255.0,
+    }
+}
+
+/// 双形态读取（candwin2.rs:1399-1423 的 color_f/layout_f 口径）：优先
+/// `/skin/...` 包装层（server 管道下发形态），回退顶层直挂（本地 JSON/
+/// 测试钩子形态）。`"/skin/display/font_size"` 与 `"display/font_size"`
+/// 等价。
+fn skin_get<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    v.pointer(path).or_else(|| {
+        let stripped = path.strip_prefix("/skin/").unwrap_or(path);
+        let mut cur = v;
+        for seg in stripped.split('/').filter(|s| !s.is_empty()) {
+            cur = cur.get(seg)?;
+        }
+        Some(cur)
+    })
+}
+
+fn get_f32(v: &Value, path: &str, default: f32) -> f32 {
+    skin_get(v, path).and_then(|x| x.as_f64()).unwrap_or(default as f64) as f32
+}
+
+fn get_i32(v: &Value, path: &str, default: i32) -> i32 {
+    // JSON 数值可能是 270 或 270.0，统一走 f64 再取整
+    skin_get(v, path)
+        .and_then(|x| x.as_f64())
+        .map(|x| x as i32)
+        .unwrap_or(default)
+        .clamp(0, 8191)
+}
+
+fn get_bool(v: &Value, path: &str, default: bool) -> bool {
+    skin_get(v, path).and_then(|x| x.as_bool()).unwrap_or(default)
+}
+
+fn get_color(v: &Value, path: &str, default: &str) -> [u8; 4] {
+    skin_get(v, path)
+        .and_then(|x| x.as_str())
+        .and_then(parse_hex_rgba)
+        .or_else(|| parse_hex_rgba(default))
+        .unwrap_or([32, 32, 34, 255])
+}
+
+fn get_str(v: &Value, path: &str) -> Option<String> {
+    skin_get(v, path).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// 一轴刀口：tile=平铺（skin.ini layout mode 1）否则拉伸；before/after=
+/// 固定边宽（画布单位）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsfStretch {
+    pub tile: bool,
+    pub before: i32,
+    pub after: i32,
+}
+
+impl Default for SsfStretch {
+    fn default() -> Self {
+        // mode 0=拉伸、刀口 0：整幅拉伸（真皮肤罕见、兜底形态）
+        Self {
+            tile: false,
+            before: 0,
+            after: 0,
+        }
+    }
+}
+
+/// 文字内边距（画布单位；skin.ini marge 顺序 top,bottom,left,right——
+/// 虎娘 Insets{n0,n1,n2,n3} 与社区交叉验证一致）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SsfInsets {
+    pub top: i32,
+    pub bottom: i32,
+    pub left: i32,
+    pub right: i32,
+}
+
+/// 布局变体：H1/V1=单窗横/竖，H2/V2 分体（Code=编码区图、Candidates=
+/// 候选区图）。虎符单窗渲染，分体变体作回退资源用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SsfVariant {
+    Horizontal,
+    Vertical,
+    HorizontalCode,
+    HorizontalCandidates,
+    VerticalCode,
+    VerticalCandidates,
+}
+
+/// 一个布局变体的完整描述。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SsfVariantLayout {
+    /// 背景图文件名（归一小写相对名，落于 cache_dir 下）。
+    pub image: String,
+    /// 水平轴刀口（layout_horizontal）。
+    pub horizontal: SsfStretch,
+    /// 垂直轴刀口（layout_vertical）。
+    pub vertical: SsfStretch,
+    /// 编码行内边距（pinyin_marge）。
+    pub code: SsfInsets,
+    /// 候选区内边距（zhongwen_marge）。
+    pub candidates: SsfInsets,
+}
+
+impl SsfVariantLayout {
+    /// 最小宽（画布域）：max(图宽, 水平刀口和+1)——虎娘 layoutSkin 公式
+    /// （CandidateRendererSkin.cpp:58-60）。九宫格不退化的硬底。
+    pub fn min_width(&self, img_w: u32) -> f32 {
+        (img_w.max(
+            self.horizontal.before.max(0) as u32 + self.horizontal.after.max(0) as u32 + 1,
+        )) as f32
+    }
+    /// 最小高（画布域）：max(图高, 垂直刀口和+1)。
+    pub fn min_height(&self, img_h: u32) -> f32 {
+        (img_h.max(
+            self.vertical.before.max(0) as u32 + self.vertical.after.max(0) as u32 + 1,
+        )) as f32
+    }
+}
+
+/// [Display] 节：字号/字体/四色/三间距（画布单位）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SsfDisplay {
+    /// 作者画布字号（虎娘大图皮肤=200，真搜狗皮肤=16~18）。用户字号÷此值
+    /// =全局等比缩放系数 scale。
+    pub font_size: f32,
+    pub font_ch: String,
+    pub font_en: String,
+    /// 编码行色（pinyin_color）。[R,G,B,A]
+    pub code_color: [u8; 4],
+    /// 第一候选文字色（zhongwen_first_color；.ssf 皮肤的高亮表达=颜色，
+    /// 不画胶囊）。
+    pub first_color: [u8; 4],
+    /// 候选文字色（zhongwen_color）。
+    pub text_color: [u8; 4],
+    /// 注释色（comphint_color）。
+    pub annotation_color: [u8; 4],
+    pub candidate_spacing: f32,
+    pub line_spacing: f32,
+    pub character_spacing: f32,
+}
+
+/// .ssf 皮肤描述（DLL 收到的皮肤 JSON 中 `kind:"ssf"` 形态）。
+#[derive(Clone, Debug)]
+pub struct SsfSkinSpec {
+    /// 解包缓存目录（绝对路径：`数据目录\皮肤缓存\{id}`）。
+    pub cache_dir: PathBuf,
+    /// 源 .ssf 指纹（size+mtime+sha256）——解码缓存失效判据。
+    pub fp: String,
+    pub display: SsfDisplay,
+    /// 只含存在的变体（key=变体）。
+    pub layouts: HashMap<SsfVariant, SsfVariantLayout>,
+}
+
+/// 皮肤形态检测：`/skin/kind` 或顶层 `kind` == "ssf"（双形态口径，参照
+/// candwin2.rs:1399-1410；现有 JSON 皮肤顶层无 kind 键、material.kind 在
+/// /skin/material/kind 下，不会被误判）。
+pub fn is_ssf(v: &Value) -> bool {
+    skin_get(v, "/skin/kind").and_then(|x| x.as_str()) == Some("ssf")
+}
+
+impl SsfSkinSpec {
+    /// 解析 .ssf 皮肤描述。None=不是 ssf 形态或不可用（cache_dir/fp 缺失、
+    /// layouts 全缺）——调用方回退现有 JSON 矢量渲染（降级矩阵 §4.6）。
+    /// 坏字段一律落默认值（虎娘「尽力加载」铁律），不因单字段失败。
+    pub fn parse(v: &Value) -> Option<Self> {
+        if !is_ssf(v) {
+            return None;
+        }
+        let cache_dir = get_str(v, "/skin/cache_dir")?;
+        let fp = get_str(v, "/skin/fp")?;
+        // 布局变体：layouts 只含存在变体（horizontal/vertical/
+        // horizontal_code/horizontal_candidates/vertical_code/vertical_candidates）
+        let mut layouts = HashMap::new();
+        if let Some(obj) = skin_get(v, "/skin/layouts").and_then(|x| x.as_object()) {
+            for (key, lv) in obj {
+                let variant = match key.as_str() {
+                    "horizontal" => Some(SsfVariant::Horizontal),
+                    "vertical" => Some(SsfVariant::Vertical),
+                    "horizontal_code" => Some(SsfVariant::HorizontalCode),
+                    "horizontal_candidates" => Some(SsfVariant::HorizontalCandidates),
+                    "vertical_code" => Some(SsfVariant::VerticalCode),
+                    "vertical_candidates" => Some(SsfVariant::VerticalCandidates),
+                    _ => None,
+                };
+                let Some(variant) = variant else {
+                    continue;
+                };
+                let Some(image) = get_str(lv, "/image") else {
+                    continue; // 无背景图的变体跳过（虎娘：pic 缺失跳过该 Scheme）
+                };
+                let stretch = |axis: &str| SsfStretch {
+                    tile: get_bool(lv, &format!("/{axis}/tile"), false),
+                    before: get_i32(lv, &format!("/{axis}/before"), 0),
+                    after: get_i32(lv, &format!("/{axis}/after"), 0),
+                };
+                let insets = |name: &str| SsfInsets {
+                    top: get_i32(lv, &format!("/{name}/top"), 0),
+                    bottom: get_i32(lv, &format!("/{name}/bottom"), 0),
+                    left: get_i32(lv, &format!("/{name}/left"), 0),
+                    right: get_i32(lv, &format!("/{name}/right"), 0),
+                };
+                layouts.insert(
+                    variant,
+                    SsfVariantLayout {
+                        image,
+                        horizontal: stretch("horizontal"),
+                        vertical: stretch("vertical"),
+                        code: insets("code"),
+                        candidates: insets("candidates"),
+                    },
+                );
+            }
+        }
+        if layouts.is_empty() {
+            // Scheme 全缺：该皮肤不可用，整体回退（虎娘 "SSF has no
+            // supported candidate background"）
+            return None;
+        }
+        let display = SsfDisplay {
+            // 虎娘口径：font_size ∈ [3,200]，真皮肤缺省 16（1x 尺度）
+            font_size: get_f32(v, "/skin/display/font_size", 16.0).clamp(3.0, 200.0),
+            font_ch: get_str(v, "/skin/display/font_ch").unwrap_or_default(),
+            font_en: get_str(v, "/skin/display/font_en").unwrap_or_default(),
+            code_color: get_color(v, "/skin/display/code_color", "#202022FF"),
+            first_color: get_color(v, "/skin/display/first_color", "#202022FF"),
+            text_color: get_color(v, "/skin/display/text_color", "#202022FF"),
+            annotation_color: get_color(v, "/skin/display/annotation_color", "#808090FF"),
+            candidate_spacing: get_f32(v, "/skin/display/candidate_spacing", 0.0),
+            line_spacing: get_f32(v, "/skin/display/line_spacing", 0.0),
+            character_spacing: get_f32(v, "/skin/display/character_spacing", 0.0),
+        };
+        Some(Self {
+            cache_dir: PathBuf::from(cache_dir),
+            fp,
+            display,
+            layouts,
+        })
+    }
+
+    /// 变体选择（虎娘 Definition::choose 移植 + 第 5 级回退，SsfSkin.cpp:
+    /// 42-45）：请求变体 → 同向单窗 → 同向分体(Candidates) → 反向横竖
+    /// 单窗 → **反向分体(Candidates)**，逐级回退保证任何皮肤都能出窗。
+    /// 末级场景：竖排窗皮肤只带 horizontal_candidates 也能出窗（M1
+    /// hufu-skin 侧同口径）。
+    ///
+    /// - 无候选（纯编码窗）→ Code 变体；无编码（纯候选窗）→ Candidates
+    ///   变体；两者都有 → 单窗变体（虎符常态）。
+    pub fn choose(&self, vertical: bool, has_code: bool, has_candidates: bool) -> Option<&SsfVariantLayout> {
+        let requested = if !has_candidates {
+            if vertical {
+                SsfVariant::VerticalCode
+            } else {
+                SsfVariant::HorizontalCode
+            }
+        } else if !has_code {
+            if vertical {
+                SsfVariant::VerticalCandidates
+            } else {
+                SsfVariant::HorizontalCandidates
+            }
+        } else if vertical {
+            SsfVariant::Vertical
+        } else {
+            SsfVariant::Horizontal
+        };
+        let chain = [
+            requested,
+            if vertical {
+                SsfVariant::Vertical
+            } else {
+                SsfVariant::Horizontal
+            },
+            if vertical {
+                SsfVariant::VerticalCandidates
+            } else {
+                SsfVariant::HorizontalCandidates
+            },
+            if vertical {
+                SsfVariant::Horizontal
+            } else {
+                SsfVariant::Vertical
+            },
+            // 【第 5 级 2026-12 审查补】反朝向分体（Candidates）——
+            // 虎娘 4 级链在此返回 None → 整皮回退；补齐后单变体皮肤
+            // （尤其只有 *_candidates 的分体皮）任何朝向都能出窗
+            if vertical {
+                SsfVariant::HorizontalCandidates
+            } else {
+                SsfVariant::VerticalCandidates
+            },
+        ];
+        chain.iter().find_map(|var| self.layouts.get(var))
+    }
+
+    /// 变体背景图完整路径（cache_dir\{image}；image 已在 parse 时保真，
+    /// 读取前仍经 load_bitmap 的 normalize 二次消毒）。
+    pub fn image_path(&self, layout: &SsfVariantLayout) -> PathBuf {
+        self.cache_dir.join(&layout.image)
+    }
+}
+
+// ============================================================================
+// 测试（纯数据/算法路径，不触 COM；宿主目标 cargo test 可跑）
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_axis_stretch_three_cuts() {
+        // 常规九宫格：源 100、目标 200、刀口 20/20 → 3 块（角原样、中段拉伸）
+        let s = slice_axis(100, 200.0, false, 20, 20);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], SsfAxisSlice { source: 0.0, source_length: 20.0, destination: 0.0, destination_length: 20.0 });
+        assert_eq!(s[1], SsfAxisSlice { source: 20.0, source_length: 60.0, destination: 20.0, destination_length: 160.0 });
+        assert_eq!(s[2], SsfAxisSlice { source: 80.0, source_length: 20.0, destination: 180.0, destination_length: 20.0 });
+    }
+
+    #[test]
+    fn slice_axis_cuts_shrink_to_source() {
+        // 刀口和 120 ≥ 源宽 100 → 按 (100-1)/120 收缩 → ≈49.5/49.5，
+        // 中段 1px；目标同宽时三块近似原样
+        let s = slice_axis(100, 100.0, false, 60, 60);
+        assert_eq!(s.len(), 3);
+        let b = 60.0f32 * (99.0 / 120.0);
+        assert!((s[0].source_length - b).abs() < 0.01);
+        assert!((s[1].source_length - 1.0).abs() < 0.01);
+        assert!((s[2].source - (100.0 - b)).abs() < 0.01);
+    }
+
+    #[test]
+    fn slice_axis_destination_below_cuts() {
+        // 目标 40 < 刀口和 60 → 目标侧刀口等比收缩到 20/20，可用宽 0
+        // → 中段丢弃，仅剩两角（压缩绘制）
+        let s = slice_axis(100, 40.0, false, 30, 30);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].destination_length, 20.0);
+        assert_eq!(s[1].destination, 20.0);
+        // 源刀口不缩：仍取源 [0,30) 与 [70,100)
+        assert_eq!(s[0].source_length, 30.0);
+        assert_eq!(s[1].source, 70.0);
+    }
+
+    #[test]
+    fn slice_axis_tile_budget() {
+        // 平铺：源 100、刀口 10/10、中段 80；目标 340 → 可用 320=4×80
+        // → 4 平铺块 + 2 角 = 6 块
+        let s = slice_axis(100, 340.0, true, 10, 10);
+        assert_eq!(s.len(), 6);
+        // 平铺块目标长=源长（1:1）
+        assert_eq!(s[1].destination_length, s[1].source_length);
+        // 超 64 块预算（可用/中段 >64）回退整段拉伸
+        let far = slice_axis(100, 6000.0, true, 10, 10);
+        assert_eq!(far.len(), 3);
+    }
+
+    #[test]
+    fn slice_axis_degenerate() {
+        assert!(slice_axis(0, 100.0, false, 10, 10).is_empty());
+        assert!(slice_axis(100, 0.0, false, 10, 10).is_empty());
+        assert!(slice_axis(100, f32::NAN, false, 10, 10).is_empty());
+        // 负刀口按 0 收（整幅拉伸）
+        assert_eq!(slice_axis(100, 100.0, false, -5, -5).len(), 1);
+    }
+
+    #[test]
+    fn frame_at_semantics() {
+        let bmp = SsfBitmap {
+            width: 1,
+            height: 1,
+            plays: 0,
+            frames: vec![vec![0; 4], vec![0; 4]],
+            delays_ms: vec![20, 30],
+        };
+        // 环形：总 50ms
+        assert_eq!(frame_at(&bmp, 0), (0, 20));
+        assert_eq!(frame_at(&bmp, 19), (0, 1));
+        assert_eq!(frame_at(&bmp, 20), (1, 30));
+        assert_eq!(frame_at(&bmp, 49), (1, 1));
+        assert_eq!(frame_at(&bmp, 50), (0, 20)); // 回绕
+        // 单帧 → 静态
+        let single = SsfBitmap {
+            width: 1,
+            height: 1,
+            plays: 0,
+            frames: vec![vec![0; 4]],
+            delays_ms: vec![0],
+        };
+        assert_eq!(frame_at(&single, 999_999), (0, 0));
+        // plays=1：elapsed ≥ 一轮时长即播完停末帧（虎娘 elapsed/duration>=plays）
+        let once = SsfBitmap { plays: 1, ..bmp };
+        assert_eq!(frame_at(&once, 49), (1, 1)); // 第一轮内（末帧余 1ms）
+        assert_eq!(frame_at(&once, 50), (1, 0)); // 恰播完一轮 → 停末帧
+        assert_eq!(frame_at(&once, 500), (1, 0)); // elapsed/50=10 ≥ 1
+        // 低于 20ms 的延迟按 20 计（双保险）
+        let tiny = SsfBitmap {
+            width: 1,
+            height: 1,
+            plays: 0,
+            frames: vec![vec![0; 4], vec![0; 4], vec![0; 4]],
+            delays_ms: vec![1, 1, 1],
+        };
+        assert_eq!(frame_at(&tiny, 0), (0, 20));
+        assert_eq!(frame_at(&tiny, 20), (1, 20));
+        assert_eq!(frame_at(&tiny, 60), (0, 20));
+    }
+
+    #[test]
+    fn frame_clock_current() {
+        let bmp = SsfBitmap {
+            width: 1,
+            height: 1,
+            plays: 0,
+            frames: vec![vec![0; 4], vec![0; 4]],
+            delays_ms: vec![50, 50],
+        };
+        let clock = SsfFrameClock::new();
+        let (idx, rem) = clock.current(&bmp);
+        assert_eq!(idx, 0);
+        assert!(rem <= 50 && rem > 0);
+    }
+
+    #[test]
+    fn hex_colors() {
+        assert_eq!(parse_hex_rgba("#3B5179FF"), Some([0x3B, 0x51, 0x79, 0xFF]));
+        assert_eq!(parse_hex_rgba("#3B5179"), Some([0x3B, 0x51, 0x79, 0xFF]));
+        assert_eq!(parse_hex_rgba(""), None);
+        assert_eq!(parse_hex_rgba("#12345"), None);
+        assert_eq!(parse_hex_rgba("#红色背景"), None);
+    }
+
+    #[test]
+    fn spec_parse_and_choose() {
+        // 任务书示例形状（包装形态）
+        let v: Value = serde_json::json!({
+            "skin": {
+                "kind": "ssf",
+                "cache_dir": "C:\\皮肤缓存\\蓝鲸雪语",
+                "fp": "a1b2c3-1098622",
+                "display": {
+                    "font_size": 200.0,
+                    "font_ch": "微软雅黑", "font_en": "Segoe UI",
+                    "code_color": "#FF7B513B", "first_color": "#FF2653A8",
+                    "text_color": "#FF334462", "annotation_color": "#FF687B92",
+                    "candidate_spacing": 120.0, "line_spacing": 24.0,
+                    "character_spacing": 0.0
+                },
+                "layouts": {
+                    "horizontal": {
+                        "image": "Panel.PNG",
+                        "horizontal": {"tile": false, "before": 270, "after": 271},
+                        "vertical": {"tile": false, "before": 812, "after": 211},
+                        "code": {"top": 770, "bottom": 32, "left": 250, "right": 320},
+                        "candidates": {"top": 32, "bottom": 165, "left": 250, "right": 320}
+                    }
+                }
+            }
+        });
+        assert!(is_ssf(&v));
+        let spec = SsfSkinSpec::parse(&v).expect("parse");
+        assert_eq!(spec.fp, "a1b2c3-1098622");
+        assert_eq!(spec.display.font_size, 200.0);
+        assert_eq!(spec.display.code_color, [0xFF, 0x7B, 0x51, 0x3B]);
+        assert_eq!(spec.display.first_color, [0xFF, 0x26, 0x53, 0xA8]);
+        assert_eq!(spec.layouts.len(), 1);
+        let h = spec.layouts.get(&SsfVariant::Horizontal).unwrap();
+        assert_eq!(h.image, "Panel.PNG");
+        assert_eq!(h.horizontal, SsfStretch { tile: false, before: 270, after: 271 });
+        assert_eq!(h.vertical.before, 812);
+        assert_eq!(h.candidates.top, 32);
+        assert_eq!(h.code.left, 250);
+        // 只有 horizontal：任意请求都回退到它
+        for &(vert, code, cand) in &[(false, true, true), (true, true, true), (true, false, false), (false, true, false)] {
+            let chosen = spec.choose(vert, code, cand).expect("fallback");
+            assert_eq!(chosen.image, "Panel.PNG");
+        }
+        // min 宽高（图 1536×1024）
+        assert_eq!(h.min_width(1536), 1536.0);
+        assert_eq!(h.min_height(1024), 1024.0);
+        // 非空 fp/cache_dir 传递
+        assert!(spec.image_path(h).ends_with("Panel.PNG"));
+
+        // 顶层直挂形态（双形态口径）
+        let top: Value = serde_json::json!({
+            "kind": "ssf",
+            "cache_dir": "X:\\d",
+            "fp": "f",
+            "layouts": {"vertical": {"image": "v.png"}}
+        });
+        assert!(is_ssf(&top));
+        let spec2 = SsfSkinSpec::parse(&top).expect("parse2");
+        assert!(spec2.layouts.contains_key(&SsfVariant::Vertical));
+        // 现有 JSON 皮肤不误判
+        let legacy: Value = serde_json::json!({"skin": {"colors": {}, "material": {"kind": "solid"}}});
+        assert!(!is_ssf(&legacy));
+        assert!(SsfSkinSpec::parse(&legacy).is_none());
+        // layouts 全缺 → None
+        let empty: Value = serde_json::json!({"kind": "ssf", "cache_dir": "X:\\d", "fp": "f"});
+        assert!(SsfSkinSpec::parse(&empty).is_none());
+    }
+
+    #[test]
+    fn choose_fifth_level_reverse_candidates() {
+        // 【第 5 级回退】竖排窗 + 皮肤只带 horizontal_candidates → 仍能出窗
+        //（4 级链在此返回 None → 整皮回退 JSON，审查补齐）
+        let v: Value = serde_json::json!({
+            "kind": "ssf", "cache_dir": "X:\\d", "fp": "f",
+            "layouts": {"horizontal_candidates": {"image": "hc.png"}}
+        });
+        let spec = SsfSkinSpec::parse(&v).expect("parse");
+        let chosen = spec.choose(true, true, true).expect("第 5 级命中");
+        assert_eq!(chosen.image, "hc.png");
+        // 横排窗 + 只带 vertical_candidates → 反向同理
+        let v2: Value = serde_json::json!({
+            "kind": "ssf", "cache_dir": "X:\\d", "fp": "f",
+            "layouts": {"vertical_candidates": {"image": "vc.png"}}
+        });
+        let spec2 = SsfSkinSpec::parse(&v2).expect("parse2");
+        assert_eq!(spec2.choose(false, true, true).map(|l| l.image.as_str()),
+                   Some("vc.png"));
+        // 回退顺序仍优先同向：同向 Candidates 在场时不落第 5 级
+        let v3: Value = serde_json::json!({
+            "kind": "ssf", "cache_dir": "X:\\d", "fp": "f",
+            "layouts": {
+                "vertical_candidates": {"image": "vc.png"},
+                "horizontal_candidates": {"image": "hc.png"}
+            }
+        });
+        let spec3 = SsfSkinSpec::parse(&v3).expect("parse3");
+        assert_eq!(spec3.choose(true, true, true).map(|l| l.image.as_str()),
+                   Some("vc.png"));
+    }
+
+    #[test]
+    fn decode_static_png_premul() {
+        // 2×1 PNG：红不透明 + 半透明蓝 → 预乘 BGRA 校验
+        let img = image::RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 128])
+            }
+        });
+        let mut buf = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let bmp = decode_bitmap(buf.get_ref()).expect("decode");
+        assert_eq!((bmp.width, bmp.height), (2, 1));
+        assert_eq!(bmp.frames.len(), 1);
+        assert_eq!(bmp.delays_ms, vec![0]);
+        assert!(!bmp.is_animated());
+        let px = &bmp.frames[0];
+        // 红（不透明）：BGRA = (0,0,255,255)
+        assert_eq!(&px[0..4], &[0, 0, 255, 255]);
+        // 蓝 50%：B'=255*128/127→(255*128+127)/255=128；B=128,G=0,R=0,A=128
+        assert_eq!(&px[4..8], &[128, 0, 0, 128]);
+    }
+
+    #[test]
+    fn name_normalization() {
+        assert!(normalize_image_name("Panel.PNG").is_ok());
+        assert_eq!(normalize_image_name("Panel.PNG").unwrap(), "panel.png");
+        assert!(normalize_image_name("../evil.png").is_err());
+        assert!(normalize_image_name("a/b.png").is_err());
+        assert!(normalize_image_name("a\\b.png").is_err());
+        assert!(normalize_image_name("").is_err());
+        let long = "x".repeat(129);
+        assert!(normalize_image_name(&long).is_err());
+    }
+}

@@ -170,6 +170,11 @@ impl Host {
         };
         host.install_official_skins();
         mark("skins", &t0);
+        // 【SSF 皮肤 2026-12】.ssf 完全用户自管理：不做内置/自装（法律
+        // 红线：绝不内置搜狗皮肤）。仅启动自愈：config 指向的 ssf 皮肤
+        // 源文件已删 → 回退默认 JSON 皮肤（设计稿降级矩阵「下次重载时
+        // 走第一条」；坏配置绝不能让候选窗无皮可用）。
+        host.heal_ssf_skin_config();
         host.setup_rerank();
         mark("rerank", &t0);
         // 注意：整句模型不在此时同步加载——由 main.rs 的后台线程
@@ -908,6 +913,46 @@ impl Host {
     /// 皮肤目录。
     pub fn skins_dir(&self) -> PathBuf {
         self.data_dir.join("皮肤")
+    }
+
+    /// 【SSF 皮肤 2026-12】.ssf 皮肤目录：与现有 *.json 同目录混居
+    /// （list 时按扩展名分类），缓存落 `数据\皮肤缓存\{stem}\`。
+    pub fn ssf_skins_dir(&self) -> PathBuf {
+        crate::ssf::ssf_skins_dir(&self.data_dir)
+    }
+
+    /// .ssf 皮肤枚举（含解析错误信息；坏皮不 panic、照常列出）。
+    pub fn list_ssf_skins(&self) -> Vec<crate::ssf::SsfSkinEntry> {
+        crate::ssf::list_ssf(&self.data_dir)
+    }
+
+    /// 解包 .ssf 到缓存目录（导入/切换校验/管道取用共用的底层）。
+    pub fn unbundle_ssf(&self, path: &Path) -> Result<crate::ssf::SsfBundle, String> {
+        crate::ssf::unbundle(&self.data_dir, path)
+    }
+
+    /// 取可用 .ssf 皮肤包（缓存优先；源缺失时降级用缓存）。
+    pub fn ssf_bundle(&self, id: &str) -> Result<crate::ssf::SsfBundle, String> {
+        crate::ssf::bundle_for(&self.data_dir, id)
+    }
+
+    /// 【SSF 启动自愈】config 指向 ssf 皮肤但源文件已删 → 回退默认
+    /// JSON 皮肤并落盘（列表标注由 GET /api/skins 补条目完成——此处
+    /// 回退后 current 即指向真实存在的默认皮，无悬空引用）。
+    fn heal_ssf_skin_config(&mut self) {
+        if self.engine.config.appearance.skin_kind != "ssf" {
+            return;
+        }
+        let id = self.engine.config.appearance.skin.clone();
+        let p = self.ssf_skins_dir().join(format!("{id}.ssf"));
+        if p.exists() {
+            return;
+        }
+        let fallback = hufu_config::AppearanceSection::default().skin;
+        eprintln!("ssf 皮肤 {id} 的源文件已删除，回退默认 JSON 皮肤 {fallback}");
+        self.engine.config.appearance.skin = fallback;
+        self.engine.config.appearance.skin_kind = "json".into();
+        let _ = self.engine.config.save(&self.config_path);
     }
 
     pub fn list_skins(&self) -> Vec<(String, String)> {

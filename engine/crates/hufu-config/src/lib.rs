@@ -661,6 +661,15 @@ pub struct AppearanceSection {
     pub anim_flash: bool,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
+    /// 【SSF 皮肤 2026-12】当前皮肤类型："json"（参数化 JSON 皮肤）或
+    /// "ssf"（位图 .ssf 皮肤）。老配置缺省="json"——回归红线：老配置
+    /// 无感，现有 JSON 皮肤路径零改动。
+    #[serde(default = "default_skin_kind")]
+    pub skin_kind: String,
+}
+
+fn default_skin_kind() -> String {
+    "json".into()
 }
 
 impl Default for AppearanceSection {
@@ -673,6 +682,7 @@ impl Default for AppearanceSection {
             anim: true,
             anim_speed: 1.0,
             anim_flash: true,
+            skin_kind: default_skin_kind(),
         }
     }
 }
