@@ -14,3 +14,5 @@ thiserror = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true, features = ["alloc", "block-padding"] }
 flate2 = { workspace = true }
+# 【QPYS】QQ 皮肤内层 OLE 复合文档读取。
+cfb = { workspace = true }

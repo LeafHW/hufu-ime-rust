@@ -226,6 +226,21 @@ fn used_images_ok(cache_dir: &Path, def: &hufu_skin::ssf::SsfDefinition) -> bool
 
 // ── 核心：解包与缓存 ─────────────────────────────────────────────
 
+/// 【QPYS 2026-10-16】id → 源文件：同名 .ssf 优先，回退 .qpys（QQ 皮肤
+/// 与 .ssf 同目录混居共用整条解包/缓存/渲染链——`hufu_skin::ssf::parse`
+/// 按 SYPQ magic 自动分派）。
+fn source_for(data_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
+    let ssf = ssf_skins_dir(data_dir).join(format!("{id}.ssf"));
+    if ssf.is_file() {
+        return Some(ssf);
+    }
+    let qpys = ssf_skins_dir(data_dir).join(format!("{id}.qpys"));
+    if qpys.is_file() {
+        return Some(qpys);
+    }
+    None
+}
+
 /// 取皮肤（缓存优先）。源未变且 manifest+used_images 齐 → 直接用缓存；
 /// 源变了 → 重解包；源文件缺失但缓存完整 → 降级用缓存（设计稿降级
 /// 矩阵「运行中被删→缓存继续用」；启动期回退由 host.heal_ssf_skin_config
@@ -234,7 +249,21 @@ pub fn bundle_for(data_dir: &Path, id: &str) -> Result<SsfBundle, String> {
     if !valid_id(id) {
         return Err(format!("皮肤 id 非法: {id:?}"));
     }
-    let src = ssf_skins_dir(data_dir).join(format!("{id}.ssf"));
+    let Some(src) = source_for(data_dir, id) else {
+        // 源缺失：缓存降级（无 source 校验——能凑合渲染就行）
+        let cache_dir = ssf_cache_root(data_dir).join(id);
+        if let Some(man) = read_manifest(&cache_dir) {
+            if used_images_ok(&cache_dir, &man.definition) {
+                return Ok(SsfBundle {
+                    id: id.to_string(),
+                    cache_dir,
+                    def: man.definition,
+                    fp: man.fp,
+                });
+            }
+        }
+        return Err(format!("皮肤文件不存在: {id}"));
+    };
     let cache_dir = ssf_cache_root(data_dir).join(id);
     match std::fs::metadata(&src) {
         Ok(m) => {
@@ -369,8 +398,8 @@ fn unbundle_bytes(
 
 // ── 枚举 / 导入 / 预览 / 删除 ────────────────────────────────────
 
-/// 枚举 皮肤\*.ssf（≤256，字母序）。每个文件尝试取可用包：缓存命中
-/// 即便宜；首次/过期会解包建缓存。解析失败也列出（error 带原因）。
+/// 枚举 皮肤\*.ssf + *.qpys（≤256，字母序）。每个文件尝试取可用包：
+/// 缓存命中即便宜；首次/过期会解包建缓存。解析失败也列出（error 带原因）。
 pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
     let dir = ssf_skins_dir(data_dir);
     let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -380,13 +409,36 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
             .filter(|p| {
                 p.is_file()
                     && p.extension()
-                        .map(|x| x.eq_ignore_ascii_case("ssf"))
+                        .map(|x| {
+                            // 【QPYS】QQ 皮肤与 .ssf 同链混居（同名 .ssf 优先）
+                            x.eq_ignore_ascii_case("ssf") || x.eq_ignore_ascii_case("qpys")
+                        })
                         .unwrap_or(false)
             })
             .collect(),
         Err(_) => Vec::new(),
     };
-    paths.sort();
+    let mut by_stem: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
+    for p in paths {
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let is_ssf = p
+            .extension()
+            .map(|x| x.eq_ignore_ascii_case("ssf"))
+            .unwrap_or(false);
+        // 同名 .ssf 覆盖 .qpys（字母序 qpys 在前会反杀——按类型显式优先）
+        match by_stem.get(&stem) {
+            Some(prev) if !is_ssf => {}
+            _ => {
+                by_stem.insert(stem, p);
+            }
+        }
+    }
+    let paths: Vec<PathBuf> = by_stem.into_values().collect();
     let mut out = Vec::new();
     for p in paths.into_iter().take(MAX_SSF_LISTED) {
         let id = p
@@ -421,9 +473,9 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
     out
 }
 
-/// 导入 .ssf：bytes 原样落 `皮肤\{name}.ssf`（name 消毒：?name= 优先、
-/// 否则皮肤内 skin_name、再否则「导入皮肤」），随后解包建缓存。
-/// 坏文件绝不落盘（先解后写）。返回 (id, warnings)。
+/// 导入独立皮肤（.ssf / .qpys）：bytes 原样落 `皮肤\{name}.{ext}`（name
+/// 消毒：?name= 优先、否则皮肤内 skin_name、再否则「导入皮肤」），随后
+/// 解包建缓存。坏文件绝不落盘（先解后写）。返回 (id, warnings)。
 pub fn import_ssf(
     data_dir: &Path,
     bytes: &[u8],
@@ -440,11 +492,22 @@ pub fn import_ssf(
     }
     // 先解（不落盘）：坏 .ssf / 不支持的容器直接报错，不进皮肤目录
     let (_files, def) = hufu_skin::ssf::parse(bytes).map_err(|e| format!("{e}"))?;
+    // 【QPYS】按字节判型定落盘扩展名（SYPQ → .qpys）
+    let ext = if hufu_skin::ssf::qpys::is_qpys(bytes) {
+        "qpys"
+    } else {
+        "ssf"
+    };
     let stem = match qname.map(str::trim).filter(|s| !s.is_empty()) {
         Some(n) => {
             // 去伪路径成分 + 去扩展名（浏览器文件名可能带路径/大小写后缀）
             let leaf = n.rsplit(['\\', '/']).next().unwrap_or(n);
-            sanitize_stem(leaf.trim_end_matches(".ssf").trim_end_matches(".SSF"))
+            sanitize_stem(
+                leaf.trim_end_matches(".qpys")
+                    .trim_end_matches(".QPYS")
+                    .trim_end_matches(".ssf")
+                    .trim_end_matches(".SSF"),
+            )
         }
         None => {
             if def.name.trim().is_empty() {
@@ -454,7 +517,7 @@ pub fn import_ssf(
             }
         }
     };
-    let fname = format!("{stem}.ssf");
+    let fname = format!("{stem}.{ext}");
     let dir = ssf_skins_dir(data_dir);
     let _ = std::fs::create_dir_all(&dir);
     // 上限校验（同名覆盖不算新增）
@@ -464,14 +527,17 @@ pub fn import_ssf(
                 .filter(|e| {
                     e.path()
                         .extension()
-                        .map(|x| x.eq_ignore_ascii_case("ssf"))
+                        .map(|x| {
+                            // 【QPYS】两种独立皮肤扩展名合计
+                            x.eq_ignore_ascii_case("ssf") || x.eq_ignore_ascii_case("qpys")
+                        })
                         .unwrap_or(false)
                 })
                 .count()
         })
         .unwrap_or(0);
     if count >= MAX_SSF_LISTED && !dir.join(&fname).exists() {
-        return Err(format!("皮肤目录 .ssf 已达上限 {MAX_SSF_LISTED}"));
+        return Err(format!("皮肤目录独立皮肤已达上限 {MAX_SSF_LISTED}"));
     }
     let p = dir.join(&fname);
     // 新导入是显式用户动作：清负缓存，强制真解一遍
@@ -591,16 +657,15 @@ fn urlenc(s: &str) -> String {
     out
 }
 
-/// 删除 .ssf 源文件 + 缓存目录（.ssf 用户自管理可删除；JSON 皮肤不走
-/// 此通道——恢复出厂语义只对官方 JSON 皮肤）。
+/// 删除 .ssf/.qpys 源文件 + 缓存目录（独立皮肤用户自管理可删除；JSON
+/// 皮肤不走此通道——恢复出厂语义只对官方 JSON 皮肤）。
 pub fn remove_ssf(data_dir: &Path, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err(format!("皮肤 id 非法: {id:?}"));
     }
-    let src = ssf_skins_dir(data_dir).join(format!("{id}.ssf"));
-    if !src.exists() {
+    let Some(src) = source_for(data_dir, id) else {
         return Err(format!("皮肤 {id} 不存在"));
-    }
+    };
     fail_clear(&src);
     std::fs::remove_file(&src).map_err(|e| format!("删除失败: {e}"))?;
     let _ = std::fs::remove_dir_all(ssf_cache_root(data_dir).join(id));

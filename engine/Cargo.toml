@@ -32,6 +32,9 @@ aes = "0.8"
 cbc = "0.1"
 flate2 = "1"
 sha2 = "0.10"
+# 【QPYS 2026-10-16】QQ输入法 .qpys 皮肤内层是 OLE 复合文档（FSPQ 偏移
+# 0x114 起），标准 CFB 目录树直出「文件名→流」。仅 hufu-skin（server 链）。
+cfb = "0.10"
 
 [profile.release]
 lto = "fat"

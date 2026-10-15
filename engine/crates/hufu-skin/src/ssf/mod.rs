@@ -17,6 +17,7 @@
 pub mod container;
 pub mod ini;
 pub mod model;
+pub mod qpys;
 
 #[cfg(test)]
 mod tests;
@@ -47,8 +48,12 @@ pub enum SsfError {
     Message(String),
 }
 
-/// 一站式：字节 → (条目表, 皮肤定义)。
+/// 一站式：字节 → (条目表, 皮肤定义)。按 magic 自动分派：
+/// `SYPQ` → QQ 皮肤（.qpys）；其余 → 搜狗系 .ssf 容器。
 pub fn parse(bytes: &[u8]) -> Result<(Files, SsfDefinition), SsfError> {
+    if qpys::is_qpys(bytes) {
+        return qpys::parse(bytes);
+    }
     let files = decode_archive(bytes)?;
     let definition = parse_definition(&files)?;
     Ok((files, definition))

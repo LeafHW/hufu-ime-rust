@@ -44,6 +44,10 @@ impl Files {
         }
         Ok(())
     }
+    /// 【QPYS】由既有映射构造（QQ 皮肤 OLE 流表 → 条目表；名字已归一）。
+    pub(crate) fn from_map(map: std::collections::BTreeMap<String, Vec<u8>>) -> Files {
+        Files(map)
+    }
 }
 
 fn err<T>(text: impl Into<String>) -> Result<T, SsfError> {
