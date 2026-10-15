@@ -449,6 +449,12 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="skin-save" class="primary">保存皮肤</button>
       <button id="skin-new">新建</button>
       <button id="skin-reset" title="把当前皮肤的颜色、布局、材质全部恢复为出厂默认（保留皮肤 ID/名称）">恢复默认值</button>
+      <!-- 【SSF M5 2026-12】.ssf 位图皮肤导入：文件由用户自备（本输入法
+           不附带任何皮肤文件——合规红线），导入即复制到皮肤目录并解包缓存 -->
+      <label class="checkline" style="gap:12px">
+        <input type="file" id="ssf-file" accept=".ssf" style="display:none">
+        <button id="ssf-import" title="导入搜狗 .ssf 皮肤文件（文件自备）：复制到皮肤目录、解析并生成预览；兼容三代 .ssf 容器">导入 .ssf 皮肤…</button>
+      </label>
     </div>
     <h3>动效</h3>
     <div class="row">
@@ -457,7 +463,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
       <!-- 【特效退役 2026-09-22】上屏特效下拉+落印字号控件移除 -->
     </div>
-    <div class="skin-grid">
+    <div class="skin-grid" id="skin-json-grid">
       <div class="skin-preview-wrap">
         <div class="preview-tools">
           <button id="livebg-btn" title="把真实屏幕作为预览背景，实时透视透明效果">真实屏幕背景</button>
@@ -520,6 +526,33 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <div class="color-grid" id="color-grid"></div>
       </div>
     </div>
+    <!-- 【SSF M5 2026-12】.ssf 位图皮肤信息面板：选中 ssf 皮肤时替换
+         JSON 编辑器视图（颜色/布局/材质/挂件全由皮肤文件决定） -->
+    <div id="ssf-info" style="display:none">
+      <div class="skin-grid" style="grid-template-columns:minmax(280px,480px) 1fr;align-items:start">
+        <div class="skin-preview-wrap" id="ssf-wrap">
+          <div class="preview-tools">
+            <button id="ssf-pv-dark" class="on" title="预览区用深色背景">深色底</button>
+            <button id="ssf-pv-light" title="预览区用浅色背景">浅色底</button>
+          </div>
+          <div class="preview-stage" style="height:auto;min-height:220px;display:flex;align-items:center;justify-content:center;padding:12px 0">
+            <img id="ssf-preview-img" alt="皮肤预览图" style="max-width:100%;max-height:280px;object-fit:contain;display:none">
+            <span class="sub" id="ssf-preview-none" style="display:none">该皮肤无预览图</span>
+          </div>
+          <div class="material-note" id="ssf-material-note"></div>
+        </div>
+        <div>
+          <h3 style="margin-top:0">位图皮肤 <span class="en">.ssf</span></h3>
+          <div class="sub" id="ssf-desc"></div>
+          <div id="ssf-status" style="margin-top:10px"></div>
+          <div class="row" style="margin-top:14px">
+            <button id="ssf-del" class="danger" title="删除 .ssf 源文件与解析缓存；删除当前使用中的皮肤会自动回退默认皮肤">删除此皮肤…</button>
+          </div>
+          <div class="sub" style="margin-top:10px;opacity:.75">背景九宫格、颜色、布局由皮肤文件决定；「候选窗动效」总开关与速度倍率仍然生效（含伸缩拉长动效）。.ssf 文件由你自备导入，本输入法不附带任何皮肤。</div>
+        </div>
+      </div>
+    </div>
+    <div id="weasel-block">
     <h3>weasel / squirrel 配色互导</h3>
     <div class="row" style="align-items:flex-start">
       <div class="field" style="flex:1">
@@ -530,6 +563,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         <button id="weasel-import">导入为皮肤</button>
         <button id="weasel-export">导出当前配色</button>
       </div>
+    </div>
     </div>
   </section>
 
@@ -1738,12 +1772,117 @@ function preview() {
     };
   });
 }
+/* 【SSF M5 2026-12】.ssf 位图皮肤：列表项元数据（id → 项）。服务器
+   /api/skins 每项带 kind；json 项无附加字段（老形状不变）。 */
+let SSF_META = {};
+const skinSelKind = () => { const o = $("#skin-select").selectedOptions[0]; return o ? (o.dataset.kind || "json") : "json"; };
 async function loadSkinList(sel) {
   const r = await api("GET", "/api/skins");
   const s = $("#skin-select"); s.innerHTML = "";
-  r.skins.forEach(x => { const o = document.createElement("option"); o.value = x.id; o.textContent = x.name; s.appendChild(o); });
+  SSF_META = {};
+  r.skins.forEach(x => {
+    const o = document.createElement("option");
+    o.value = x.id;
+    o.dataset.kind = x.kind || "json";
+    o.textContent = x.kind === "ssf"
+      ? ((x.name || x.id) + (x.error ? "（.ssf · 不可用）" : "（.ssf）"))
+      : x.name;
+    if (x.kind === "ssf") SSF_META[x.id] = x;
+    s.appendChild(o);
+  });
   if (sel || r.current) s.value = sel || r.current;
-  s.onchange = () => loadSkin(s.value);
+  s.onchange = () => reloadSkinTab();
+}
+/* 按当前选中项类型分流：json → JSON 编辑器；ssf → 位图信息面板。
+   init/导入/删除后统一走这里，杜绝「ssf 皮挂着 json 编辑器」错态。 */
+async function reloadSkinTab() {
+  if (skinSelKind() === "ssf") return loadSsfSkin($("#skin-select").value);
+  showJsonSkinUi();
+  return loadSkin($("#skin-select").value);
+}
+/* json 视图还原（从 ssf 面板切回时） */
+function showJsonSkinUi() {
+  $("#ssf-info").style.display = "none";
+  $("#skin-json-grid").style.display = "";
+  $("#weasel-block").style.display = "";
+  $("#skin-save").disabled = $("#skin-new").disabled = $("#skin-reset").disabled = false;
+  $$('[data-skin="name"],[data-skin="id"]').forEach(el => el.disabled = false);
+}
+/* ssf 视图：隐藏 JSON 编辑器/互导，禁用 json 编辑控件（防误存覆盖），
+   填信息面板 + 预览图；选中即切换（select 带 kind，服务器先验可解包
+   才切换——坏皮绝不上位）。 */
+async function loadSsfSkin(id) {
+  $("#skin-json-grid").style.display = "none";
+  $("#weasel-block").style.display = "none";
+  $("#ssf-info").style.display = "";
+  $("#skin-save").disabled = $("#skin-new").disabled = $("#skin-reset").disabled = true;
+  $$('[data-skin="name"],[data-skin="id"]').forEach(el => el.disabled = true);
+  const m = SSF_META[id] || { id, kind: "ssf", name: id };
+  $("#ssf-desc").textContent = "「" + (m.name || id) + "」" + (m.author ? "　作者：" + m.author : "");
+  const st = $("#ssf-status");
+  if (m.error) {
+    st.innerHTML = '<span style="color:var(--err)">✗ ' + esc(m.error) + "</span>";
+    $("#ssf-preview-img").style.display = "none";
+    $("#ssf-preview-none").style.display = "";
+    $("#ssf-material-note").textContent = "";
+  } else {
+    const warns = (m.warnings || []).map(w => "· " + esc(w)).join("<br>");
+    st.innerHTML = '<span style="color:var(--ok)">✓ 可用</span>'
+      + (m.preview ? "" : '　<span class="sub">（无预览图，仍可正常使用）</span>')
+      + (warns ? '<div class="sub" style="margin-top:6px">' + warns + "</div>" : "");
+    const img = $("#ssf-preview-img"), none = $("#ssf-preview-none");
+    if (m.preview) {
+      img.src = "/api/skin/preview?kind=ssf&id=" + encodeURIComponent(id) + "&t=" + Date.now();
+      img.style.display = "";
+      none.style.display = "none";
+    } else { img.style.display = "none"; none.style.display = ""; }
+    $("#ssf-material-note").textContent = "预览图为皮肤自带整图；实际候选窗按九宫格拉伸、文字实时排版。";
+  }
+  try { await api("POST", "/api/skin/select", { id, kind: "ssf" }); }
+  catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
+  msg("已启用 .ssf 位图皮肤：" + (m.name || id), "ok");
+}
+/* 导入 .ssf：二进制直传（octet-stream，服务器端解析校验+落盘+缓存）；
+   文件名兜底 name（皮肤名仍以解析结果为准）。成功即刷新列表并选中。 */
+$("#ssf-import").onclick = () => $("#ssf-file").click();
+$("#ssf-file").onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = ""; // 同名重导也可触发
+  if (!f) return;
+  try {
+    const buf = await f.arrayBuffer();
+    const r = await fetch("/api/skin/import_ssf?name=" + encodeURIComponent(f.name),
+      { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: buf });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.status);
+    const w = (j.warnings || []).length ? "（提示：" + j.warnings.join("；") + "）" : "";
+    msg("已导入 .ssf 皮肤：" + (j.id || "") + w, "ok");
+    await loadSkinList(j.id);
+    await reloadSkinTab();
+  } catch (err) { msg("导入失败：" + err.message, "err"); }
+};
+/* 删除 .ssf（仅 ssf 有此通道；删当前使用中的 → 服务器回退默认皮） */
+$("#ssf-del").onclick = async () => {
+  const id = $("#skin-select").value;
+  const m = SSF_META[id] || {};
+  if (!confirm("删除 .ssf 皮肤「" + (m.name || id) + "」？\n将同时删除源文件与解析缓存；正在使用中会自动回退默认皮肤。")) return;
+  try {
+    await api("DELETE", "/api/skin?kind=ssf&id=" + encodeURIComponent(id));
+    msg("已删除", "ok");
+    await loadSkinList();
+    await reloadSkinTab();
+  } catch (e) { msg("删除失败：" + e.message, "err"); }
+};
+/* ssf 预览深/浅底（与 json 预览同款交互） */
+{
+  const wrap = $("#ssf-wrap"), bd = $("#ssf-pv-dark"), bl = $("#ssf-pv-light");
+  const apply = light => {
+    wrap.style.background = light ? "#E9E9EE" : "";
+    bd.classList.toggle("on", !light);
+    bl.classList.toggle("on", light);
+  };
+  bd.onclick = () => apply(false);
+  bl.onclick = () => apply(true);
 }
 async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
@@ -2437,6 +2576,13 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
   $("#btn-save").style.display = a.dataset.tab === "sentence" ? "" : "none";
 });
 $("#btn-save").style.display = "none"; // 初始页（方案）非整句模型——八十六修
+/* 【深链直达 2026-12】#tab名（如 #skin）直达皮肤页：托盘菜单/文档/
+   自动化冒烟可直跳，不必先点导航。放在 init() 前——点击处理器已绑好。 */
+{
+  const h = location.hash.slice(1);
+  const a = h && document.querySelector(`nav a[data-tab="${CSS.escape(h)}"]`);
+  if (a) a.click();
+}
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
 /* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
 document.addEventListener("visibilitychange", () => {
@@ -2512,7 +2658,7 @@ async function init() {
     bindInputs(); buildSliders();
     applyPlatform();
     await loadSchemas(); await refreshInfo();
-    await loadSkinList(); await loadSkin($("#skin-select").value);
+    await loadSkinList(); await reloadSkinTab();
     msg("就绪");
   } catch (e) { msg("初始化失败：" + e.message, "err"); }
 }
