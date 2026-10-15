@@ -426,6 +426,14 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
     }
     eprintln!("skin-dump: pre-hide");
+    // 【不可见自证 2026-10-16】readback 模式窗口应全程未显示（SWP/
+    // present 已跳过）——若此处 visible=1 说明仍有显示路径漏网。
+    {
+        let vis = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(w.hwnd)
+        };
+        eprintln!("skin-dump: visible={} (期望 0)", vis.0);
+    }
     let prog = |tag: &str| {
         let _ = std::fs::write(
             "E:\\DSH-KF\\.tmp-test\\dump-progress.txt",

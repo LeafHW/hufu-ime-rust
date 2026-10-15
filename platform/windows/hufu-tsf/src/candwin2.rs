@@ -5706,7 +5706,13 @@ impl CandidateWindowV2 {
                     }
                 }
 
-                if self.ulw {
+                // 【dump 不可见 2026-10-16】readback（渲染转储）模式跳过
+                // 上屏：回读像素已在上方取得；窗口全程未显示，ULW 对
+                // 隐藏窗本就会失败、Present 纯浪费垂直同步等待（转储
+                // 提速的一环）。
+                if self.readback {
+                    // 不 present
+                } else if self.ulw {
                     // 【ULW 呈现】离屏位图 → CPU_READ 拷贝 → DIB →
                     // UpdateLayeredWindow（沙盒安全：纯 GDI 上屏）。
                     // 【变窄直角根除 2026-09-12】present 尺寸必须与
@@ -6511,7 +6517,16 @@ impl CandidateWindowV2 {
             // 「切焦首显动效顿顿」（全宿主共有的观感）。SWP 之后把
             // t0 重锚到当下，滑动从实际可见帧起播满全程。
             let mut entrance_armed = false;
-            let sp_ok = if !dragging {
+            // 【dump 不可见 2026-10-16】readback（渲染转储）模式：回读
+            // 像素在渲染段内已取得，SWP 显示/present 上屏对转储是纯
+            // 副作用——此前窗口在屏上闪现 ~120ms（用户实锤「切换时前
+            // 台闪一下」）。转储全程不显示窗口（渲染到离屏目标与窗口
+            // 可见性无关），也不挂看门狗/挂件同步。
+            let sp_ok = if self.readback {
+                // 转储进程即退，live_* 状态无人消费——纯跳过（窗口保持
+                // 隐藏，不 SWP、不显示）
+                Ok(())
+            } else if !dragging {
                 // 【零位移·收窄轴向例外 2026-09-11】变宽轴向：窗口一步
                 // 到位=目标（每键仅一次 SWP，壳在稳定窗口内长大——用户
                 // 实锤变宽无直角）；收窄轴向：窗口必须跟缓动走——否则
@@ -6869,8 +6884,11 @@ impl CandidateWindowV2 {
                 )
             };
             // 【贴图挂件 2026-10-02】show 定位 SWP 后同步兄弟贴图窗
-            //（overlaywin 只读本窗最终矩形，不碰候选窗几何）
-            crate::overlaywin::sync_for(self.hwnd, skin);
+            //（overlaywin 只读本窗最终矩形，不碰候选窗几何）。
+            //（readback/转储：不同步——转储皮肤剥了 overlay，且进程即退）
+            if !self.readback {
+                crate::overlaywin::sync_for(self.hwnd, skin);
+            }
             if sp_ok.is_err() {
                 crate::tsf::trace(&format!(
                     "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
