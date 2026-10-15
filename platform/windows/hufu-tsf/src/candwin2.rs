@@ -1507,8 +1507,23 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
         return v; // skin 字段被占为非对象（畸形数据）：放弃投影，走矢量
     };
     // 字体/间距（画布 ×scale；ssf 缺省 0——不叠引擎默认档）
-    if !d.font_ch.is_empty() {
-        put(obj, "layout", "font_face", Value::String(d.font_ch.clone()));
+    // 【独立皮肤设置 2026-10-16】字体用户覆盖优先：payload layout.
+    // font_face（server 注入 overrides）> 皮肤 display.font_ch。
+    {
+        let ff_override = skin
+            .pointer("/skin/layout/font_face")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("font_face")))
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match ff_override {
+            Some(ff) => put(obj, "layout", "font_face", Value::String(ff)),
+            None => {
+                if !d.font_ch.is_empty() {
+                    put(obj, "layout", "font_face", Value::String(d.font_ch.clone()));
+                }
+            }
+        }
     }
     put(obj, "layout", "line_spacing", serde_json::json!(d.line_spacing * s));
     put(obj, "layout", "candidate_spacing", serde_json::json!(d.candidate_spacing * s));

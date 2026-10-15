@@ -138,6 +138,15 @@ table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 th { color: var(--fg2); font-size: 12.5px; font-weight: 500; }
 /* ── 皮肤编辑 ── */
+/* 【独立皮肤分页 2026-10-16】皮肤页内子分页条（矢量/独立） */
+.sub-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 0; }
+.sub-tabs button {
+  background: none; border: none; color: var(--fg2); font-size: 14px;
+  padding: 8px 16px; cursor: pointer; border-radius: 8px 8px 0 0;
+  border-bottom: 2px solid transparent; transition: .15s;
+}
+.sub-tabs button:hover { color: var(--fg); }
+.sub-tabs button.on { color: var(--acc); border-bottom-color: var(--acc); font-weight: 600; }
 .skin-grid { display: flex; gap: 30px; align-items: flex-start; flex-wrap: wrap; }
 /* 【实时框常驻 2026-11】sticky 配套：参数列统一类名（原内联
    flex:1;min-width:330px）；flex-wrap 换行（窄窗）后两列各占一行，
@@ -441,7 +450,16 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 皮肤 ════ -->
   <section id="tab-skin">
     <h2>皮肤<span class="en">Skin</span></h2>
-    <div class="sub">19 个颜色角色 + 布局 + 材质（半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。毛玻璃已退役（2026-09-11），旧玻璃皮肤自动按纯色渲染。</div>
+    <div class="sub">矢量皮肤：19 个颜色角色 + 布局 + 材质（半透明 / 纯色），预览实时渲染；兼容 weasel 配色互导。独立皮肤：.ssf 位图皮肤（搜狗皮肤文件自备导入），按皮肤设计布局渲染，可微调字号/字体/横竖排/序号/文字颜色。</div>
+    <!-- 【独立皮肤分页 2026-10-16】皮肤页内子分页：矢量皮肤（JSON，
+         原有编辑器全套）与独立皮肤（.ssf 位图，独立列表+微调设置）。
+         两类皮肤形态差异大（编辑器 vs 文件决定布局），分页杜绝混挂
+         错态；动效区共用（SSF 也吃总开关/速度）。 -->
+    <div class="sub-tabs" style="margin-bottom:16px">
+      <button id="skin-sub-vector-btn" class="on">矢量皮肤</button>
+      <button id="skin-sub-ssf-btn">独立皮肤（.ssf）</button>
+    </div>
+    <div id="skin-sub-vector">
     <div class="row" style="margin-bottom:18px">
       <div class="field"><label>皮肤</label><select id="skin-select" style="min-width:200px"></select></div>
       <div class="field"><label>名称</label><input type="text" data-skin="name" style="width:160px"></div>
@@ -449,12 +467,18 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="skin-save" class="primary">保存皮肤</button>
       <button id="skin-new">新建</button>
       <button id="skin-reset" title="把当前皮肤的颜色、布局、材质全部恢复为出厂默认（保留皮肤 ID/名称）">恢复默认值</button>
+    </div>
+    </div>
+    <div id="skin-sub-ssf" style="display:none">
+    <div class="row" style="margin-bottom:18px">
+      <div class="field"><label>皮肤</label><select id="ssf-select" style="min-width:200px"></select></div>
       <!-- 【SSF M5 2026-12】.ssf 位图皮肤导入：文件由用户自备（本输入法
            不附带任何皮肤文件——合规红线），导入即复制到皮肤目录并解包缓存 -->
       <label class="checkline" style="gap:12px">
         <input type="file" id="ssf-file" accept=".ssf" style="display:none">
         <button id="ssf-import" title="导入搜狗 .ssf 皮肤文件（文件自备）：复制到皮肤目录、解析并生成预览；兼容三代 .ssf 容器">导入 .ssf 皮肤…</button>
       </label>
+    </div>
     </div>
     <h3>动效</h3>
     <div class="row">
@@ -545,10 +569,35 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
           <h3 style="margin-top:0">位图皮肤 <span class="en">.ssf</span></h3>
           <div class="sub" id="ssf-desc"></div>
           <div id="ssf-status" style="margin-top:10px"></div>
+          <!-- 【独立皮肤设置 2026-10-16】per-skin 微调（存皮肤缓存目录
+               overrides.json，服务器 merge 进载荷）：字号/字体/横竖排/
+               序号/四色覆盖。空值/未勾=跟随皮肤原值；颜色 picker 只给
+               RGB，覆盖时 alpha 固定不透明。 -->
+          <div id="ssf-settings" style="margin-top:16px">
+            <h3>显示设置</h3>
+            <div class="row">
+              <div class="field"><label>字号</label><input type="number" id="ssfv-fontpt" min="10" max="36" step="1" style="width:90px" title="候选文字字号（pt）。候选窗上滚轮放大/缩小也是改这个值，10~36"></div>
+              <div class="field"><label>字体</label><input type="text" id="ssfv-fontface" placeholder="跟随皮肤" style="width:170px" title="覆盖皮肤自带字体（如：Microsoft YaHei UI）；留空=用皮肤字体"></div>
+              <div class="checkline"><input type="checkbox" id="ssfv-horiz"><label for="ssfv-horiz" title="候选横排一行铺开；不勾=竖排（皮肤设计的主流形态）">横排</label></div>
+              <div class="checkline"><input type="checkbox" id="ssfv-index"><label for="ssfv-index" title="候选词前显示序号；不勾=跟随全局设置">显示序号</label></div>
+            </div>
+            <h3>文字颜色</h3>
+            <div class="row">
+              <div class="field"><label>编码</label><input type="color" id="ssfv-code" title="编码行文字色（覆盖皮肤原色）"></div>
+              <div class="field"><label>首选</label><input type="color" id="ssfv-first" title="第一候选文字色（皮肤的高亮表达）"></div>
+              <div class="field"><label>候选</label><input type="color" id="ssfv-text" title="候选文字色"></div>
+              <div class="field"><label>注释</label><input type="color" id="ssfv-anno" title="注释/拼音色"></div>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <button id="ssfv-save" class="primary">应用设置</button>
+              <button id="ssfv-reset" title="字号/字体/横竖排/序号/颜色全部还原为皮肤原值">还原皮肤原值</button>
+              <span class="sub" id="ssfv-note" style="align-self:center"></span>
+            </div>
+          </div>
           <div class="row" style="margin-top:14px">
             <button id="ssf-del" class="danger" title="删除 .ssf 源文件与解析缓存；删除当前使用中的皮肤会自动回退默认皮肤">删除此皮肤…</button>
           </div>
-          <div class="sub" style="margin-top:10px;opacity:.75">背景九宫格、颜色、布局由皮肤文件决定；「候选窗动效」总开关与速度倍率仍然生效（含伸缩拉长动效）。.ssf 文件由你自备导入，本输入法不附带任何皮肤。</div>
+          <div class="sub" style="margin-top:10px;opacity:.75">背景九宫格、布局由皮肤文件决定；「候选窗动效」总开关与速度倍率仍然生效（含伸缩拉长动效）。.ssf 文件由你自备导入，本输入法不附带任何皮肤。</div>
         </div>
       </div>
     </div>
@@ -1775,10 +1824,26 @@ function preview() {
 /* 【SSF M5 2026-12】.ssf 位图皮肤：列表项元数据（id → 项）。服务器
    /api/skins 每项带 kind；json 项无附加字段（老形状不变）。 */
 let SSF_META = {};
-const skinSelKind = () => { const o = $("#skin-select").selectedOptions[0]; return o ? (o.dataset.kind || "json") : "json"; };
+/* 【独立皮肤分页 2026-10-16】当前子分页：vector=JSON 编辑器、ssf=位图
+   皮肤专属列表+设置。列表分家（#skin-select 只列 json、#ssf-select
+   只列 ssf），杜绝「ssf 皮挂 json 编辑器」错态；当前皮肤是 ssf 时
+   默认落在独立分页。 */
+let skinSub = "vector";
+function setSkinSub(mode) {
+  skinSub = mode;
+  $("#skin-sub-vector-btn").classList.toggle("on", mode === "vector");
+  $("#skin-sub-ssf-btn").classList.toggle("on", mode === "ssf");
+  $("#skin-sub-vector").style.display = mode === "vector" ? "" : "none";
+  $("#skin-sub-ssf").style.display = mode === "ssf" ? "" : "none";
+  if (mode === "ssf") reloadSkinTab(); else showJsonSkinUi();
+}
+$("#skin-sub-vector-btn").onclick = () => setSkinSub("vector");
+$("#skin-sub-ssf-btn").onclick = () => setSkinSub("ssf");
+const skinSelKind = () => "json"; // 老判定退役：分页后 #skin-select 恒 json
 async function loadSkinList(sel) {
   const r = await api("GET", "/api/skins");
   const s = $("#skin-select"); s.innerHTML = "";
+  const s2 = $("#ssf-select"); s2.innerHTML = "";
   SSF_META = {};
   r.skins.forEach(x => {
     const o = document.createElement("option");
@@ -1787,16 +1852,26 @@ async function loadSkinList(sel) {
     o.textContent = x.kind === "ssf"
       ? ((x.name || x.id) + (x.error ? "（.ssf · 不可用）" : "（.ssf）"))
       : x.name;
-    if (x.kind === "ssf") SSF_META[x.id] = x;
-    s.appendChild(o);
+    if (x.kind === "ssf") {
+      SSF_META[x.id] = x;
+      s2.appendChild(o);
+    } else {
+      s.appendChild(o);
+    }
   });
-  if (sel || r.current) s.value = sel || r.current;
+  if (r.current) {
+    const cur = r.skins.find(x => x.id === r.current);
+    if (cur && cur.kind === "ssf") { s2.value = r.current; setSkinSub("ssf"); }
+    else { s.value = r.current; }
+  }
+  if (sel) { s.value = sel; s2.value = sel; }
   s.onchange = () => reloadSkinTab();
+  s2.onchange = () => reloadSkinTab();
 }
-/* 按当前选中项类型分流：json → JSON 编辑器；ssf → 位图信息面板。
-   init/导入/删除后统一走这里，杜绝「ssf 皮挂着 json 编辑器」错态。 */
+/* 按当前子分页分流：vector → JSON 编辑器；ssf → 位图面板+设置。
+   init/导入/删除后统一走这里。 */
 async function reloadSkinTab() {
-  if (skinSelKind() === "ssf") return loadSsfSkin($("#skin-select").value);
+  if (skinSub === "ssf") return loadSsfSkin($("#ssf-select").value || "");
   showJsonSkinUi();
   return loadSkin($("#skin-select").value);
 }
@@ -1809,9 +1884,10 @@ function showJsonSkinUi() {
   $$('[data-skin="name"],[data-skin="id"]').forEach(el => el.disabled = false);
 }
 /* ssf 视图：隐藏 JSON 编辑器/互导，禁用 json 编辑控件（防误存覆盖），
-   填信息面板 + 预览图；选中即切换（select 带 kind，服务器先验可解包
-   才切换——坏皮绝不上位）。 */
+   填信息面板 + 预览图 + 显示设置表单；选中即切换（select 带 kind，
+   服务器先验可解包才切换——坏皮绝不上位）。 */
 async function loadSsfSkin(id) {
+  if (!id) return;
   $("#skin-json-grid").style.display = "none";
   $("#weasel-block").style.display = "none";
   $("#ssf-info").style.display = "";
@@ -1838,10 +1914,65 @@ async function loadSsfSkin(id) {
     } else { img.style.display = "none"; none.style.display = ""; }
     $("#ssf-material-note").textContent = "预览图为皮肤自带整图；实际候选窗按九宫格拉伸、文字实时排版。";
   }
+  // 【独立皮肤设置 2026-10-16】拉 per-skin 覆盖填表单（颜色控件吃
+  // #RRGGBB；覆盖值优先，否则显示皮肤原值做基准）。
+  let ov = {}, base = {};
+  try {
+    const r = await api("GET", "/api/skin/ssf-settings?id=" + encodeURIComponent(id));
+    ov = r.overrides || {}; base = r.base || {};
+  } catch (e) { /* 设置接口失败不挡皮肤显示 */ }
+  const rgb8 = hx => hx && hx.length >= 7 ? hx.slice(0, 7) : "#000000";
+  $("#ssfv-fontpt").value = ov.font_pt ?? 16;
+  $("#ssfv-fontface").value = ov.font_face || "";
+  $("#ssfv-fontface").placeholder = base.font_face ? "皮肤字体：" + base.font_face : "跟随皮肤";
+  $("#ssfv-horiz").checked = !!ov.horizontal;
+  $("#ssfv-index").checked = ov.show_index === true;
+  $("#ssfv-code").value = rgb8(ov.code_color || base.code_color);
+  $("#ssfv-first").value = rgb8(ov.first_color || base.first_color);
+  $("#ssfv-text").value = rgb8(ov.text_color || base.text_color);
+  $("#ssfv-anno").value = rgb8(ov.annotation_color || base.annotation_color);
+  $("#ssfv-note").textContent = "";
   try { await api("POST", "/api/skin/select", { id, kind: "ssf" }); }
   catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
   msg("已启用 .ssf 位图皮肤：" + (m.name || id), "ok");
 }
+/* 应用独立皮肤设置：收集表单 → overrides（颜色拼 #RRGGBBFF 不透明）。
+   横竖排/序号三态：勾=覆盖；不勾=null 跟随（横竖排 null=竖排默认，
+   序号 null=跟随全局——UI 上不区分「覆盖 false」与「跟随」，从简）。 */
+$("#ssfv-save").onclick = async () => {
+  const id = $("#ssf-select").value;
+  if (!id) return;
+  const pt = parseFloat($("#ssfv-fontpt").value);
+  const ov = {
+    font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
+    font_face: $("#ssfv-fontface").value.trim() || null,
+    horizontal: $("#ssfv-horiz").checked ? true : null,
+    show_index: $("#ssfv-index").checked ? true : null,
+    code_color: $("#ssfv-code").value.toUpperCase() + "FF",
+    first_color: $("#ssfv-first").value.toUpperCase() + "FF",
+    text_color: $("#ssfv-text").value.toUpperCase() + "FF",
+    annotation_color: $("#ssfv-anno").value.toUpperCase() + "FF",
+  };
+  try {
+    await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
+    $("#ssfv-note").textContent = "已应用，打字下一帧生效";
+    msg("独立皮肤设置已应用", "ok");
+  } catch (e) { msg("应用失败：" + e.message, "err"); }
+};
+/* 还原皮肤原值：全 null overrides（皮肤文件值全权生效） */
+$("#ssfv-reset").onclick = async () => {
+  const id = $("#ssf-select").value;
+  if (!id) return;
+  if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？")) return;
+  const ov = { font_pt: null, font_face: null, horizontal: null, show_index: null,
+    code_color: null, first_color: null, text_color: null, annotation_color: null };
+  try {
+    await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
+    await loadSsfSkin(id);
+    $("#ssfv-note").textContent = "已还原皮肤原值";
+    msg("已还原", "ok");
+  } catch (e) { msg("还原失败：" + e.message, "err"); }
+};
 /* 导入 .ssf：二进制直传（octet-stream，服务器端解析校验+落盘+缓存）；
    文件名兜底 name（皮肤名仍以解析结果为准）。成功即刷新列表并选中。 */
 $("#ssf-import").onclick = () => $("#ssf-file").click();
@@ -1858,12 +1989,13 @@ $("#ssf-file").onchange = async e => {
     const w = (j.warnings || []).length ? "（提示：" + j.warnings.join("；") + "）" : "";
     msg("已导入 .ssf 皮肤：" + (j.id || "") + w, "ok");
     await loadSkinList(j.id);
+    setSkinSub("ssf");
     await reloadSkinTab();
   } catch (err) { msg("导入失败：" + err.message, "err"); }
 };
 /* 删除 .ssf（仅 ssf 有此通道；删当前使用中的 → 服务器回退默认皮） */
 $("#ssf-del").onclick = async () => {
-  const id = $("#skin-select").value;
+  const id = $("#ssf-select").value;
   const m = SSF_META[id] || {};
   if (!confirm("删除 .ssf 皮肤「" + (m.name || id) + "」？\n将同时删除源文件与解析缓存；正在使用中会自动回退默认皮肤。")) return;
   try {

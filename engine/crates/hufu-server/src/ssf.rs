@@ -533,6 +533,56 @@ pub fn remove_ssf(data_dir: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── 用户覆盖设置（独立皮肤分页 2026-10-16）─────────────────────────
+//
+// .ssf 皮肤的颜色/布局/刀口全由皮肤文件决定，但用户层要能微调：字号
+//（滚轮/设置页）、字体、横竖排、序号、四色覆盖。设置 per-skin 存缓存
+// 目录 overrides.json——与皮肤同生命周期（删皮肤即删设置），不污染
+// 全局 config。全部 Option：None=跟随皮肤/全局默认。
+
+/// 独立皮肤的用户覆盖设置。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct SsfOverrides {
+    /// 候选字号 pt（滚轮/设置页调）。None=16 默认。
+    pub font_pt: Option<f32>,
+    /// 字体族覆盖。None=皮肤 display.font_ch。
+    pub font_face: Option<String>,
+    /// 横排=true。None=竖排（虎娘 layoutMode 6 默认语义）。
+    pub horizontal: Option<bool>,
+    /// 序号开关覆盖。None=全局 candidates.show_index。
+    pub show_index: Option<bool>,
+    /// 四色覆盖（"#RRGGBBAA"）。None=皮肤原色。
+    pub code_color: Option<String>,
+    pub first_color: Option<String>,
+    pub text_color: Option<String>,
+    pub annotation_color: Option<String>,
+}
+
+const OVERRIDES_FILE: &str = "overrides.json";
+
+impl SsfOverrides {
+    /// 读皮肤覆盖设置（无文件/坏 JSON=全默认——设置坏不弄坏皮肤）。
+    pub fn load(cache_dir: &Path) -> Self {
+        let p = cache_dir.join(OVERRIDES_FILE);
+        match std::fs::read_to_string(&p) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self, cache_dir: &Path) -> Result<(), String> {
+        let p = cache_dir.join(OVERRIDES_FILE);
+        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&p, s).map_err(|e| format!("写入失败: {e}"))
+    }
+
+    /// 覆盖参与源指纹（改设置=DLL 皮肤指纹失效重拉——与皮肤文件变同口径）。
+    fn fp_tag(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
 // ── 管道载荷 ─────────────────────────────────────────────────────
 
 /// 构造 pipe skin op 下发的 ssf 皮肤对象（不含 anim 注入字段——pipe 侧
@@ -551,19 +601,43 @@ pub fn remove_ssf(data_dir: &Path, id: &str) -> Result<(), String> {
 pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, String), String> {
     let b = bundle_for(data_dir, id)?;
     let d = &b.def;
+    // 【独立皮肤设置 2026-10-16】用户覆盖 merge 进载荷：display 四色、
+    // layout 注入 font_point/font_face/horizontal/show_index——DLL 侧
+    // 读取路径（layout_f / horizontal_early / show_index）与 JSON 皮肤
+    // 同键，零新消费代码。None 字段不注入（皮肤原值/默认值生效）。
+    let ov = SsfOverrides::load(&b.cache_dir);
+    let code_color = ov.code_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.code_color));
+    let first_color = ov.first_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.first_color));
+    let text_color = ov.text_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.text_color));
+    let annotation_color = ov.annotation_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.annotation_color));
     let display = serde_json::json!({
         "font_size": d.display.font_size,
         "font_ch": d.display.font_ch,
         "font_en": d.display.font_en,
-        "code_color": argb_to_rgba_hex(d.display.code_color),
-        "first_color": argb_to_rgba_hex(d.display.first_color),
-        "text_color": argb_to_rgba_hex(d.display.text_color),
-        "annotation_color": argb_to_rgba_hex(d.display.annotation_color),
+        "code_color": code_color,
+        "first_color": first_color,
+        "text_color": text_color,
+        "annotation_color": annotation_color,
         "candidate_spacing": d.display.candidate_spacing,
         "line_spacing": d.display.line_spacing,
         "character_spacing": d.display.character_spacing,
     });
-    let sv = serde_json::json!({
+    let mut layout = serde_json::Map::new();
+    if let Some(pt) = ov.font_pt {
+        layout.insert("font_point".into(), serde_json::json!(pt));
+    }
+    if let Some(ff) = &ov.font_face {
+        if !ff.is_empty() {
+            layout.insert("font_face".into(), serde_json::json!(ff));
+        }
+    }
+    if let Some(h) = ov.horizontal {
+        layout.insert("horizontal".into(), serde_json::json!(h));
+    }
+    if let Some(si) = ov.show_index {
+        layout.insert("show_index".into(), serde_json::json!(si));
+    }
+    let mut sv = serde_json::json!({
         "kind": "ssf",
         "name": d.name,
         "author": d.author,
@@ -572,7 +646,12 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
         "display": display,
         "layouts": layout_variants(&d.schemes),
     });
-    Ok((sv, b.fp))
+    if !layout.is_empty() {
+        sv["layout"] = serde_json::Value::Object(layout);
+    }
+    // 覆盖参与指纹：设置变=DLL 重拉重布局（滚轮字号立即生效的链路基础）
+    let fp = format!("{}|{}", b.fp, ov.fp_tag());
+    Ok((sv, fp))
 }
 
 /// layouts 只放存在变体；键=变体名（DLL 按排版逐级回退自己选）。
@@ -735,7 +814,10 @@ mod tests {
             sv["display"]["first_color"].as_str().unwrap().starts_with('#'),
             "first_color 已转 #RRGGBBAA"
         );
-        assert_eq!(sv["fp"], fp);
+        // 【独立皮肤设置 2026-10-16】返回指纹=源指纹+overrides 串（设置
+        // 变=DLL 重拉）；载荷 fp 仍=纯源指纹（位图缓存键——设置变不重
+        // 解码位图）。断言改为前缀包含关系。
+        assert!(fp.starts_with(&format!("{}|", sv["fp"].as_str().unwrap())), "返回指纹含载荷 fp 前缀: {fp}");
         assert!(sv["cache_dir"].as_str().unwrap().contains("皮肤缓存"));
         assert!(
             sv["layouts"]["horizontal"].is_object(),

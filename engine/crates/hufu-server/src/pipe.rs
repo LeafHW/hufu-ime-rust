@@ -464,7 +464,15 @@ pub fn dispatch(
         }
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
-            let show_index = host.engine.config.candidates.show_index;
+            // 【独立皮肤设置 2026-10-16】SSF 时序号开关可被 per-skin 覆盖
+            //（载荷 layout.show_index 同步注入——DLL 双路可读）。
+            let show_index = if host.engine.config.appearance.skin_kind == "ssf" {
+                crate::ssf::SsfOverrides::load(&crate::ssf::ssf_cache_root(&host.data_dir).join(&id))
+                    .show_index
+                    .unwrap_or(host.engine.config.candidates.show_index)
+            } else {
+                host.engine.config.candidates.show_index
+            };
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
             // 【SSF 皮肤 2026-12】kind=ssf → 位图皮肤：只传 cache_dir 路径
             // + 指纹（11MB 挂件教训：绝不内嵌大图字节），DLL 按需读盘。
@@ -604,6 +612,26 @@ pub fn dispatch(
         "skin_font_delta" => {
             let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
             let id = host.engine.config.appearance.skin.clone();
+            // 【SSF 滚轮字号 2026-10-16】独立皮肤无 .json 皮肤文件——旧
+            // 路径 load 失败直接吞掉滚轮。SSF 分支：per-skin overrides
+            // 的 font_pt ±1（基准=现值或 16），写回+指纹推进（skin_ver
+            // +载荷 fp 含 overrides → DLL 下次重拉拿到新字号）。
+            if host.engine.config.appearance.skin_kind == "ssf" {
+                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+                let mut ov = crate::ssf::SsfOverrides::load(&cache_dir);
+                let np = ((ov.font_pt.unwrap_or(16.0) as i32) + delta).clamp(10, 36);
+                ov.font_pt = Some(np as f32);
+                return match ov.save(&cache_dir) {
+                    Ok(()) => {
+                        host.skin_ver += 1;
+                        serde_json::json!({"font_point": np})
+                    }
+                    Err(e) => {
+                        eprintln!("ssf 皮肤 {id} 字号保存失败: {e}");
+                        serde_json::json!({"err": e.to_string()})
+                    }
+                };
+            }
             let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {

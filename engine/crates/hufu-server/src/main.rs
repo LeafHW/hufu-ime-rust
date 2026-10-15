@@ -1302,6 +1302,60 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Response::json(&serde_json::json!({"ok": true, "id": id}))
             }
         }
+        // 【独立皮肤设置 2026-10-16】.ssf 皮肤的 per-skin 用户覆盖读写
+        //（设置页·独立皮肤分页）。GET ?id= 返回 overrides + 皮肤原值
+        //（UI 显示占位/还原基准）；POST {id, overrides} 写盘 + skin_ver
+        // 推进（DLL 立即重拉生效）。
+        ("GET", "/api/skin/ssf-settings") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            if !cache_dir.exists() {
+                return Response::err(404, &format!("皮肤 {id} 缓存不存在"));
+            }
+            let ov = crate::ssf::SsfOverrides::load(&cache_dir);
+            // 皮肤原值（还原基准）：bundle 里 display
+            let base = match host.ssf_bundle(&id) {
+                Ok(b) => serde_json::json!({
+                    "font_pt": 16.0,
+                    "font_face": b.def.display.font_ch,
+                    "code_color": crate::ssf::argb_to_rgba_hex(b.def.display.code_color),
+                    "first_color": crate::ssf::argb_to_rgba_hex(b.def.display.first_color),
+                    "text_color": crate::ssf::argb_to_rgba_hex(b.def.display.text_color),
+                    "annotation_color": crate::ssf::argb_to_rgba_hex(b.def.display.annotation_color),
+                }),
+                Err(_) => serde_json::json!({}),
+            };
+            Response::json(&serde_json::json!({"id": id, "overrides": ov, "base": base}))
+        }
+        ("POST", "/api/skin/ssf-settings") => {
+            let v = req.json();
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let Some(ovv) = v.get("overrides") else {
+                return Response::err(400, "缺少 overrides");
+            };
+            let ov: crate::ssf::SsfOverrides =
+                match serde_json::from_value(ovv.clone()) {
+                    Ok(o) => o,
+                    Err(e) => return Response::err(400, &format!("overrides 非法: {e}")),
+                };
+            let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            if !cache_dir.exists() {
+                return Response::err(404, &format!("皮肤 {id} 缓存不存在"));
+            }
+            match ov.save(&cache_dir) {
+                Ok(()) => {
+                    host.skin_ver += 1;
+                    Response::json(&serde_json::json!({"ok": true}))
+                }
+                Err(e) => Response::err(500, &e),
+            }
+        }
         ("POST", "/api/preview") => {
             // 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标
             //（浏览器 window.screenX/outerWidth 可得），2.5s 有效期内
