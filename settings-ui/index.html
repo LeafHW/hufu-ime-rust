@@ -1736,18 +1736,15 @@ function bindSkin() {
   }
 }
 function preview() {
-  // 【SSF 预览 2026-10-16】独立皮肤模式下预览底=皮肤自带整图，挂件
-  // 预览照常叠在外层——此前恒画矢量 DOM，用户实锤「挂件实时框里不是
-  // 独立皮肤的样子」。
+  // 【SSF 预览 2026-10-16】独立皮肤模式下预览底=「真实候选窗」mock
+  //（九宫格背景+预览字，与打字渲染同构——用户拍板：要真实候选，不要
+  // 宣传整图）。挂件预览照常叠在外层。
   if (SKIN_CURRENT_KIND === "ssf") {
     const w = $("#candwin-preview");
-    const id = $("#ssf-select").value || "";
-    const m = SSF_META[id] || {};
     w.className = "preview-wrap";
     w.style.cssText = "position:relative;z-index:1;border:none;padding:0;background:transparent";
-    w.innerHTML = m.preview
-      ? `<img src="/api/skin/preview?kind=ssf&id=${encodeURIComponent(id)}&t=${Date.now()}" style="display:block;max-width:100%" alt="皮肤预览">`
-      : `<div class="sub" style="padding:18px">独立皮肤「${esc(m.name || id)}」（无预览图，实际候选窗实时渲染）</div>`;
+    w.innerHTML = "";
+    refreshSsfMock(w);
     return;
   }
   const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
@@ -1886,8 +1883,9 @@ async function loadSkinList(sel) {
     } else {
       s2.value = r.current;
       // 【SSF 后台皮肤】后台载上次矢量皮肤（外观页数据/mock 兜底），
-      // 不 select（静默版）
-      const lj = ssfLastJsonSkin();
+      // 不 select（静默版）。回退链：记忆 → 矢量列表第一项（localStorage
+      // 不可用/首次使用时 SKIN 恒 null，ovMock 矢量分支全哑）。
+      const lj = ssfLastJsonSkin() || (s.options.length ? s.options[0].value : "");
       if (lj) loadSkinSilent(lj);
     }
     if (SKIN_CURRENT_KIND === "ssf") setSkinSub("ssf");
@@ -1988,6 +1986,12 @@ async function ssfSettingsSaveNow(quiet) {
     await api("POST", "/api/skin/ssf-settings", { id, overrides: collectSsfOverrides() });
     const t = new Date().toTimeString().slice(0, 8);
     $("#ssfv-note").textContent = `已生效 ${t}`;
+    // 【mock 即时跟随 2026-10-16】字号/字体/颜色/横竖排/序号一变，
+    // 皮肤子分页预览 + 挂件页实时框的「真实候选窗」同步重排
+    if (SKIN_CURRENT_KIND === "ssf") {
+      refreshSsfMock($("#candwin-preview")).catch(() => {});
+      refreshSsfMock($("#ov-candmock"), () => ovPreview()).catch(() => {});
+    }
   } catch (e) {
     $("#ssfv-note").textContent = "";
     msg("独立皮肤设置保存失败：" + e.message, "err");
@@ -2067,6 +2071,82 @@ $("#ssfv-enable").addEventListener("change", async () => {
 /* localStorage 安全读（设置页宿主可能禁 localStorage——直读抛异常） */
 function ssfLastJsonSkin() {
   try { return localStorage.getItem("ssfLastJsonSkin") || ""; } catch (_) { return ""; }
+}
+/* 【SSF 真实候选窗 mock 2026-10-16】九宫格背景（CSS border-image 与
+   DLL 同刀口语义）+ 预览文字（display 四色/字号/间距，面板实值即时
+   应用）——与打字时真实渲染同构。数据按 id|朝向 缓存，字号/颜色/字体
+   改动不重拉（本地重排），皮肤子分页与挂件页实时框共用。 */
+let SSF_MOCK = null;
+async function ssfMockData(id) {
+  const horiz = $("#ssfv-horiz").checked ? "1" : "0";
+  const key = id + "|" + horiz;
+  if (SSF_MOCK && SSF_MOCK.key === key) return SSF_MOCK.data;
+  const data = await api("GET", "/api/skin/ssf-mock?id=" + encodeURIComponent(id) + "&horizontal=" + horiz);
+  SSF_MOCK = { key, data };
+  return data;
+}
+function ssfMockDom(m) {
+  // 面板实值（即改即预览）：字号/字体/序号/四色
+  const pt = parseFloat($("#ssfv-fontpt").value) || m.font_pt || 16;
+  const ffSel = $("#ssfv-fontface").value || (SSF_FONT_LIST && SSF_FONT_LIST.dflt) || m.display.font_ch || "";
+  const font = ffSel ? `font-family:'${ffSel.replace(/'/g, "")}';` : "";
+  const col = k => (m.display[k] || "#333333").slice(0, 7);
+  const showIdx = $("#ssfv-index").checked || CFG.candidates.show_index !== false;
+  const s = pt / (m.display.font_size || 17);
+  const cb = m.cut_h || [0, 0], cv = m.cut_v || [0, 0];
+  const ic = m.insets_code || [0, 0, 0, 0], icd = m.insets_cand || [0, 0, 0, 0];
+  const px = v => Math.max(0, Math.round(v * s)) + "px";
+  const rep = t => (t ? "repeat" : "stretch");
+  const el = document.createElement("div");
+  el.style.cssText =
+    `${font}font-size:${pt}px;` +
+    `border-style:solid;` +
+    `border-image-source:url(${m.img_url});` +
+    `border-image-slice:${cv[0]} ${cb[1]} ${cv[1]} ${cb[0]} fill;` +
+    `border-image-repeat:${rep(m.tile_v)} ${rep(m.tile_h)};` +
+    `border-width:${px(cv[0])} ${px(cb[1])} ${px(cv[1])} ${px(cb[0])};` +
+    `padding:${px(ic[1])} ${px(icd[2])} ${px(icd[1])} ${px(icd[3])};` +
+    `width:max-content;display:inline-flex;flex-direction:column;gap:${px(m.display.candidate_spacing || 0)};` +
+    `line-height:1.35;`;
+  const idx = i => (showIdx ? `<span style="color:${col("text_color")}">${i}.</span> ` : "");
+  if (m.horizontal) {
+    // 横排：编码 + 候选一行铺开（字距 spacing）
+    const ls = px(m.display.character_spacing || 0);
+    el.innerHTML =
+      `<div style="color:${col("code_color")};letter-spacing:${ls};padding-bottom:${px(m.display.line_spacing || 0)}">tuja</div>` +
+      `<div style="display:flex;gap:${px(m.display.candidate_spacing || 0)};letter-spacing:${ls}">` +
+      `<span style="color:${col("first_color")}">${idx(1)}我们 <span style="color:${col("annotation_color")};font-size:${Math.round(pt * 0.82)}px">wǒ men</span></span>` +
+      `<span style="color:${col("text_color")}">${idx(2)}我</span>` +
+      `<span style="color:${col("text_color")}">${idx(3)}War</span>` +
+      `<span style="color:${col("text_color")}">${idx(4)}我军</span></div>`;
+  } else {
+    // 竖排：编码行 + 候选逐行（首选字色区分，注释色淡）
+    el.innerHTML =
+      `<div style="color:${col("code_color")};padding:0 ${px(ic[2])} ${px(m.display.line_spacing || 0)} ${px(ic[3])}">tuja</div>` +
+      [1, 2, 3, 4].map(i =>
+        `<div style="color:${i === 1 ? col("first_color") : col("text_color")};padding:0 ${px(icd[2])} 0 ${px(icd[3])}">${idx(i)}${["我们", "我", "War", "我军"][i - 1]}` +
+        (i === 1 ? ` <span style="color:${col("annotation_color")};font-size:${Math.round(pt * 0.82)}px">wǒ men</span>` : "") + `</div>`
+      ).join("");
+  }
+  return el;
+}
+/* 【SSF 真实候选窗 mock 2026-10-16·终版】直接用 DLL 真渲染位图
+   （/api/skin/ssf-render：server spawn 生产 DLL 的 dump 导出，连
+   server 拉当前皮肤+设置真渲染——九宫格/字体/四色/横竖排/序号所见
+   即打字所得）。~2-3s 出图，即改即存后刷新。挂件页实时框同源。 */
+async function refreshSsfMock(host, onReady) {
+  const id = $("#ssf-select").value || "";
+  if (!id) return;
+  host.className = "";
+  host.style.cssText = "";
+  host.innerHTML =
+    `<img src="/api/skin/ssf-render?t=${Date.now()}" ` +
+    `style="display:block;max-width:min(100%,420px);image-rendering:auto" alt="真实候选窗">`;
+  const img = host.querySelector("img");
+  img.addEventListener("load", () => { if (onReady) onReady(); });
+  img.addEventListener("error", () => {
+    host.innerHTML = `<div style="padding:16px 22px;border-radius:8px;background:#2a2c33;color:#99a">真实渲染失败（未找到 DLL 或渲染超时）</div>`;
+  });
 }
 /* 【SSF 字体下拉 2026-10-16】与矢量皮肤 ap-font 同数据源（/api/fonts
    本机简中字体+default 霞鹜/雅黑）。cur=override 值（空=自动项）；
@@ -2200,9 +2280,15 @@ const ovEnsureCfg = () => {
    条——不丢改动），挂件取 SSF_OV_CACHE.overlay。 */
 function collectSsfOverrides() {
   const pt = parseFloat($("#ssfv-fontpt").value);
+  // 【字体·自动解析 2026-10-16】"（自动）"在收集时解析为具体字体
+  //（/api/fonts default=矢量皮肤同款霞鹜优先链）——payload 恒带具体
+  // 字族，DLL 无空值回退歧义。用户实锤「明明自动、明明装了霞鹜，
+  // 渲染还是雅黑」：此前 null → 皮肤 font_ch（空）→ DLL 默认雅黑。
+  let ff = $("#ssfv-fontface").value.trim();
+  if (!ff && SSF_FONT_LIST && SSF_FONT_LIST.dflt) ff = SSF_FONT_LIST.dflt;
   return {
     font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
-    font_face: $("#ssfv-fontface").value.trim() || null,
+    font_face: ff || null,
     horizontal: $("#ssfv-horiz").checked ? true : null,
     show_index: $("#ssfv-index").checked ? true : null,
     code_color: $("#ssfv-code").value.toUpperCase() + "FF",
@@ -2448,26 +2534,17 @@ function ovPreview() {
 /* 模拟候选框：按当前皮肤拼一个静态框（横排/竖排、编码内联跟随
    layout.horizontal / layout.inline_preedit——与真实候选窗同源同状态） */
 function ovMock() {
-  if (!SKIN) return;
   const m = $("#ov-candmock");
-  // 【SSF 实时框 2026-10-16】独立皮肤模式下 mock 底=皮肤预览整图
-  //（真实样子）；图异步加载后重排挂件定位（ovPreview 读 mock 尺寸）。
-  // 自然尺寸显示（预览整图像素≈真窗 1:1），仅超大图限高兜底——此前
-  // max-height:340 硬缩放，mock 与真窗比例不符=挂件贴边参照失真
-  //（用户实锤「大小位置都不一样」）。
+  // 【SSF 实时框 2026-10-16】独立皮肤模式下 mock=「真实候选窗」（DLL
+  // 真渲染位图——九宫格/字体/四色/横竖排/序号所见即打字所得）。SSF
+  // 分支不依赖 SKIN（矢量皮肤可能未载，旧守卫 if(!SKIN) return 会把
+  // 整个 mock 吞掉=空 div 的真凶）。
   if (SKIN_CURRENT_KIND === "ssf") {
-    const id = $("#ssf-select").value || "";
-    const meta = SSF_META[id] || {};
-    m.className = "";
-    m.style.cssText = "";
-    if (meta.preview) {
-      m.innerHTML = `<img src="/api/skin/preview?kind=ssf&id=${encodeURIComponent(id)}&t=${Date.now()}" style="display:block;max-height:560px;max-width:min(100%,720px)" alt="候选窗">`;
-      m.querySelector("img").addEventListener("load", () => ovPreview());
-    } else {
-      m.innerHTML = `<div style="padding:16px 22px;border-radius:8px;background:#2a2c33;color:#99a">独立皮肤「${esc(meta.name || id)}」（无预览图）</div>`;
-    }
+    m.dataset.mock = "ssf";
+    refreshSsfMock(m, () => ovPreview());
     return;
   }
+  if (!SKIN) return;
   // 【高保真 mock 2026-10-16】矢量分支不再自绘色块——直接克隆皮肤页
   // preview() 的渲染产物（.candwin：透明度模型/阴影/圆角/边框/高亮/
   // 序号/注释全皮肤参数，单一真源）。preview() 尾部联动调本函数，
@@ -2475,12 +2552,14 @@ function ovMock() {
   // 阴影/透明度/圆角全没有」。
   const src = document.querySelector("#candwin-preview .candwin");
   if (src) {
+    m.dataset.mock = "clone";
     m.className = "";
     m.style.cssText = "";
     m.innerHTML = "";
     m.appendChild(src.cloneNode(true));
     return;
   }
+  m.dataset.mock = "fallback";
   const c = SKIN.colors, L = SKIN.layout;
   const cut = h => esc(String(h || "").slice(0, 7));
   m.className = "candwin" + (L.horizontal ? " horizontal" : "");

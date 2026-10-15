@@ -996,6 +996,61 @@ fn image_content_type(p: &std::path::Path) -> &'static str {
     }
 }
 
+/// 【SSF 真渲染 2026-10-16】spawn PowerShell P/Invoke 生产 DLL 的
+/// hufu_test_skin_dump（连本进程拉当前皮肤真渲染）→ BMP。锁外执行
+///（route 顶部提前分发）。
+fn ssf_render_endpoint() -> Response {
+    let dll = ["D:\\HuFu\\hufu_tsf.dll", "C:\\Windows\\SystemIME\\HuFu\\hufu_tsf.dll"]
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .map(|s| s.to_string());
+    let Some(dll) = dll else {
+        return Response::err(404, "未找到 hufu_tsf.dll");
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}.bmp"));
+    // 驱动写成临时 .ps1 执行——-Command 内联的 C# 引号转义在 spawn
+    // 边界极易碎（Add-Type 解析失败）。
+    let ps1 = std::env::temp_dir().join(format!("hufu-ssf-render-drv-{stamp}.ps1"));
+    let body = format!(
+        r#"$env:HUFU_SKIN_DUMP = '{out}'
+$env:HUFU_SKIN_DUMP_V2 = '1'
+$env:HUFU_TSF_SMOKE = '1'
+$cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
+try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
+try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
+Start-Sleep -Milliseconds 900
+"#,
+        out = out.display(),
+        dll = dll,
+    );
+    if std::fs::write(&ps1, &body).is_err() {
+        return Response::err(500, "驱动脚本写入失败");
+    }
+    let ok = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&ps1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&ps1);
+    if !ok || !out.is_file() {
+        return Response::err(500, "渲染失败");
+    }
+    match std::fs::read(&out) {
+        Ok(b) => {
+            let _ = std::fs::remove_file(&out);
+            Response { status: 200, content_type: "image/bmp".into(), body: b }
+        }
+        Err(_) => Response::err(500, "渲染输出读取失败"),
+    }
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
     // DELETE /api/skin）拒绝跨源网页：
@@ -1022,6 +1077,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 return Response::err(403, "非法 Host");
             }
         }
+    }
+    // 【锁序修复 2026-10-16】ssf-render 必须在 Host 锁之前处理：渲染
+    // 子进程里 DLL 经 pipe 拉皮肤需要同一把锁——锁内等子进程=自我死
+    // 锁（PS 退出 0 但 DLL 拉皮肤死等，BMP 永不落盘的根因）。
+    if req.method == "GET" && req.path == "/api/skin/ssf-render" {
+        return ssf_render_endpoint();
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
@@ -1460,6 +1521,45 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     Err(_) => Response::err(404, "预览图读取失败"),
                 },
                 None => Response::err(404, "该皮肤无预览图"),
+            }
+        }
+        // 【SSF 真渲染 2026-10-16】实时框终极方案：spawn PowerShell P/Invoke
+        // 生产 DLL 的 hufu_test_skin_dump（连本进程 HTTP 拉当前皮肤真渲染）
+        // → BMP 回传。UI <img> 直接吃。慢（~2-3s）但所见即打字所得（九宫
+        // 格/字体/颜色/横竖排/序号全真）。锁前处理（见 route 顶部注释）。
+        ("GET", "/api/skin/ssf-render") => ssf_render_endpoint(),
+        // 【SSF mock 元数据 2026-10-16】设置页「真实候选窗」实时框：
+        // 九宫格背景（border-image）+ 预览文字（display 四色/字号/间距
+        // + overrides merge）——与 DLL 渲染同参数。?id=&horizontal=0|1。
+        ("GET", "/api/skin/ssf-mock") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            let horizontal = req.query.get("horizontal").map(|s| s == "1").unwrap_or(false);
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::mock_meta(&host.data_dir, &id, horizontal) {
+                Ok(v) => Response::json(&v),
+                Err(e) => Response::err(404, &e),
+            }
+        }
+        // 【SSF 图片字节 2026-10-16】缓存目录图片（九宫格背景用）。
+        // 白名单=该皮肤 used_images（防路径穿越读任意文件）。
+        ("GET", "/api/skin/ssf-image") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            let f = req.query.get("f").cloned().unwrap_or_default();
+            if id.is_empty() || f.is_empty() {
+                return Response::err(400, "缺少 id/f");
+            }
+            match ssf::image_file(&host.data_dir, &id, &f) {
+                Some(p) => match std::fs::read(&p) {
+                    Ok(b) => Response {
+                        status: 200,
+                        content_type: image_content_type(&p),
+                        body: b,
+                    },
+                    Err(_) => Response::err(404, "图片读取失败"),
+                },
+                None => Response::err(404, "图片不在该皮肤白名单内"),
             }
         }
         // 【SSF 皮肤 2026-12】删除 .ssf 源文件 + 缓存目录（.ssf 用户自

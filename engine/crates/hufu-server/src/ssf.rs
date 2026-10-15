@@ -517,6 +517,80 @@ pub fn preview_file(data_dir: &Path, id: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// 【SSF mock 2026-10-16】图片白名单文件路径（仅该皮肤 used_images 内的
+/// 归一名可读——防 ../ 穿越）。
+pub fn image_file(data_dir: &Path, id: &str, f: &str) -> Option<PathBuf> {
+    if !valid_id(id) {
+        return None;
+    }
+    let b = bundle_for(data_dir, id).ok()?;
+    let ok = b.def.preview == f || b.def.schemes.used_images().iter().any(|x| x == f);
+    if !ok {
+        return None;
+    }
+    let rel = safe_rel_path(f)?;
+    let p = b.cache_dir.join(rel);
+    p.is_file().then_some(p)
+}
+
+/// 【SSF mock 2026-10-16】设置页「真实候选窗」实时框元数据：选定朝向的
+/// 布局（九宫格刀口/文字 insets）+ display（overrides 已 merge，色为
+/// "#RRGGBB"）——UI 用 CSS border-image + 文字行复刻 DLL 渲染。
+pub fn mock_meta(data_dir: &Path, id: &str, horizontal: bool) -> Result<serde_json::Value, String> {
+    let b = bundle_for(data_dir, id)?;
+    let d = &b.def;
+    let ov = SsfOverrides::load(&b.cache_dir);
+    let horizontal = ov.horizontal.unwrap_or(horizontal);
+    let lay = d
+        .schemes
+        .choose(!horizontal, true, true)
+        .or_else(|| d.schemes.choose(!horizontal, false, true))
+        .ok_or_else(|| "皮肤无可用布局".to_string())?;
+    let ins = |i: hufu_skin::ssf::SsfInsets| serde_json::json!([i.left, i.top, i.right, i.bottom]);
+    let v = serde_json::json!({
+        "name": d.name,
+        "horizontal": horizontal,
+        "image": lay.image,
+        "img_url": format!("/api/skin/ssf-image?id={}&f={}", urlenc(id), urlenc(&lay.image)),
+        "cut_h": [lay.horizontal.before, lay.horizontal.after],
+        "cut_v": [lay.vertical.before, lay.vertical.after],
+        "tile_h": lay.horizontal.tile,
+        "tile_v": lay.vertical.tile,
+        "insets_code": ins(lay.code),
+        "insets_cand": ins(lay.candidates),
+        "display": {
+            "font_size": d.display.font_size,
+            "font_ch": d.display.font_ch,
+            "font_en": d.display.font_en,
+            "code_color": ov.code_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.code_color)),
+            "first_color": ov.first_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.first_color)),
+            "text_color": ov.text_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.text_color)),
+            "annotation_color": ov.annotation_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.annotation_color)),
+            "candidate_spacing": d.display.candidate_spacing,
+            "line_spacing": d.display.line_spacing,
+            "character_spacing": d.display.character_spacing,
+        },
+        "font_pt": ov.font_pt.unwrap_or(16.0),
+        "font_face": ov.font_face.clone().unwrap_or_default(),
+        "show_index": ov.show_index,
+    });
+    Ok(v)
+}
+
+/// URL 查询参数编码（id/文件名是中文）。
+fn urlenc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// 删除 .ssf 源文件 + 缓存目录（.ssf 用户自管理可删除；JSON 皮肤不走
 /// 此通道——恢复出厂语义只对官方 JSON 皮肤）。
 pub fn remove_ssf(data_dir: &Path, id: &str) -> Result<(), String> {
