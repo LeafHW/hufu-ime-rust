@@ -1000,10 +1000,25 @@ fn image_content_type(p: &std::path::Path) -> &'static str {
 /// hufu_test_skin_dump（连本进程拉当前皮肤真渲染）→ BMP。锁外执行
 ///（route 顶部提前分发）。
 fn ssf_render_endpoint() -> Response {
-    let dll = ["D:\\HuFu\\hufu_tsf.dll", "C:\\Windows\\SystemIME\\HuFu\\hufu_tsf.dll"]
-        .iter()
-        .find(|p| std::path::Path::new(p).is_file())
-        .map(|s| s.to_string());
+    ssf_render_inner(None)
+}
+
+/// 【SSF 真渲染 2026-10-16】
+/// `query_id`：要渲染的 ssf 皮肤 id（设置页传正在编辑的皮肤；None=
+/// 当前上位）。经 HUFU_SKIN_DUMP_ID → DLL skin_for_render 拉指定皮肤
+/// payload（含其 overrides；顶层 overlay 剥除，实时框只画候选窗本体）。
+fn ssf_render_inner(query_id: Option<&str>) -> Response {
+    // 渲染专用副本优先（hufu_tsf_render.dll 不被 TSF 进程加载，可随时
+    // 替换更新；hufu_tsf.dll 是注册输入法本体，被 explorer/QQ 等全进程
+    // 持有，拷不进去——只做兜底）。
+    let dll = [
+        "D:\\HuFu\\hufu_tsf_render.dll",
+        "D:\\HuFu\\hufu_tsf.dll",
+        "C:\\Windows\\SystemIME\\HuFu\\hufu_tsf.dll",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).is_file())
+    .map(|s| s.to_string());
     let Some(dll) = dll else {
         return Response::err(404, "未找到 hufu_tsf.dll");
     };
@@ -1012,35 +1027,82 @@ fn ssf_render_endpoint() -> Response {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}.bmp"));
-    // 驱动写成临时 .ps1 执行——-Command 内联的 C# 引号转义在 spawn
-    // 边界极易碎（Add-Type 解析失败）。
+    // 【提速 2026-10-16】优先 hufu-render-helper.exe（原生进程直调
+    // dump 导出，亚秒出图）；缺它回退 PowerShell 驱动（Add-Type 编译
+    // 1-2s + dump，总 2-3s——用户实锤「生效慢/要等一下才看到」）。
+    let helper = ["D:\\HuFu\\hufu-render-helper.exe", "C:\\Windows\\SystemIME\\HuFu\\hufu-render-helper.exe"]
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .map(|s| s.to_string());
+    if let Some(helper) = helper {
+        let ok = {
+            let mut cmd = std::process::Command::new(&helper);
+            cmd.arg(&out).arg(&dll);
+            if let Some(id) = query_id {
+                cmd.env("HUFU_SKIN_DUMP_ID", id);
+            }
+            cmd.env("HUFU_SKIN_DUMP_V2", "1")
+                .env("HUFU_TSF_SMOKE", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            cmd.status().map(|s| s.success()).unwrap_or(false)
+        };
+        if ok && out.is_file() {
+            return match std::fs::read(&out) {
+                Ok(b) => {
+                    let _ = std::fs::remove_file(&out);
+                    Response { status: 200, content_type: "image/bmp".into(), body: b }
+                }
+                Err(_) => Response::err(500, "渲染输出读取失败"),
+            };
+        }
+        // helper 失败 → 落到 PS 驱动（降级链）
+    }
     let ps1 = std::env::temp_dir().join(format!("hufu-ssf-render-drv-{stamp}.ps1"));
     let body = format!(
         r#"$env:HUFU_SKIN_DUMP = '{out}'
 $env:HUFU_SKIN_DUMP_V2 = '1'
 $env:HUFU_TSF_SMOKE = '1'
+if ('{rid}' -ne '') {{ $env:HUFU_SKIN_DUMP_ID = '{rid}' }}
 $cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
 try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
 try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
 Start-Sleep -Milliseconds 900
 "#,
         out = out.display(),
+        rid = query_id.unwrap_or(""),
         dll = dll,
     );
-    if std::fs::write(&ps1, &body).is_err() {
+    if std::fs::write(&ps1, {
+        // PS5.1 无 BOM 按 ANSI 读——皮肤 id 是中文（鲸鱼娘），乱码=
+        // skin_for_render 404。带 BOM 写。
+        let mut b = vec![0xEF, 0xBB, 0xBF];
+        b.extend_from_slice(body.as_bytes());
+        b
+    })
+    .is_err()
+    {
         return Response::err(500, "驱动脚本写入失败");
     }
-    let ok = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&ps1)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let _ = std::fs::remove_file(&ps1);
-    if !ok || !out.is_file() {
-        return Response::err(500, "渲染失败");
+    {
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        let _ = std::fs::remove_file(&ps1);
+        if !ok || !out.is_file() {
+            return Response::err(500, "渲染失败");
+        }
     }
     match std::fs::read(&out) {
         Ok(b) => {
@@ -1081,8 +1143,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【锁序修复 2026-10-16】ssf-render 必须在 Host 锁之前处理：渲染
     // 子进程里 DLL 经 pipe 拉皮肤需要同一把锁——锁内等子进程=自我死
     // 锁（PS 退出 0 但 DLL 拉皮肤死等，BMP 永不落盘的根因）。
+    // ?id= 渲染指定 ssf 皮肤（设置页编辑中的那个）。
     if req.method == "GET" && req.path == "/api/skin/ssf-render" {
-        return ssf_render_endpoint();
+        let rid = req.query.get("id").cloned();
+        return ssf_render_inner(rid.as_deref());
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();

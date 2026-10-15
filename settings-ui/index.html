@@ -625,6 +625,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <label class="checkline" style="gap:12px">
         <input type="file" id="ov-file" accept="image/*" style="display:none">
         <button id="ov-pick">选择图片…</button>
+        <button id="ov-clear-img" class="danger" title="移除当前挂件图片（清空贴图数据；启用开关与贴法参数保留）">删除图片</button>
       </label>
       <span class="sub" id="ov-fileinfo" style="align-self:center">未选图</span>
       <span id="ov-anim-badge">🎞 动图</span>
@@ -1934,9 +1935,11 @@ async function loadSsfSkin(id) {
       + (warns ? '<div class="sub" style="margin-top:6px">' + warns + "</div>" : "");
     const img = $("#ssf-preview-img"), none = $("#ssf-preview-none");
     // 【独立皮肤预览·真渲染 2026-10-16】素材区不再放宣传整图（大得
-    // 离谱、无预览字——用户实锤）。直接渲染真实候选窗位图（DLL 按
-    // 当前皮肤+设置真画，含候选词），所见即打字所得。
-    img.src = "/api/skin/ssf-render?t=" + Date.now();
+    // 离谱、无预览字——用户实锤）。渲染「这个皮肤」的候选窗位图
+    //（?id= 指定——矢量模式下浏览独立皮肤页也显示独立皮肤的样子，
+    // 不再显示成当前矢量皮肤——用户实锤）。含其 overrides，所见即
+    // 该皮肤打字所得。
+    img.src = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
     img.style.display = "";
     none.style.display = "none";
     $("#ssf-material-note").textContent = "真实候选窗（当前皮肤+显示设置实时渲染）；出图约 2-3 秒，改动后自动刷新。";
@@ -1990,7 +1993,7 @@ async function ssfSettingsSaveNow(quiet) {
     // 【mock 即时跟随 2026-10-16】字号/字体/颜色/横竖排/序号一变，
     // 皮肤子分页素材预览 + 挂件页实时框的「真实候选窗」同步重排
     const pi = $("#ssf-preview-img");
-    if (pi && pi.style.display !== "none") pi.src = "/api/skin/ssf-render?t=" + Date.now();
+    if (pi && pi.style.display !== "none") pi.src = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
     if (SKIN_CURRENT_KIND === "ssf") {
       refreshSsfMock($("#candwin-preview")).catch(() => {});
       refreshSsfMock($("#ov-candmock"), () => ovPreview()).catch(() => {});
@@ -2049,13 +2052,22 @@ $("#ssfv-enable").addEventListener("change", async () => {
     //（界面所见=实际所用，杜绝「关了但界面还停在独立页」的错觉）。
     const last = ssfLastJsonSkin() || ($("#skin-select").value || "hufu-moyan");
     try {
-      // 【挂件跟随 2026-10-16】SSF 模式下配的挂件回写到矢量皮肤——挂件
-      // 是「用户的挂件」，切换皮肤不能丢（用户实锤「切回矢量挂件又不
-      // 生效了」：首次配置发生在独立模式，矢量 overlay 仍是关的）。
-      if (SSF_OV_CACHE.overlay?.enabled) {
+      // 【挂件跟随·不依赖内存缓存 2026-10-16】回写源=server 端当前
+      // ssf 皮肤的 overlay（主动 GET），SSF_OV_CACHE 只当加速——重新
+      // 打开设置页直接关开关时缓存是空的（loadSsfSkin 没跑过），
+      // 此前直接跳过回写=挂件凭空消失（用户实锤「关掉独立皮肤就
+      // 用不了挂件」）。
+      let ovSrc = SSF_OV_CACHE.overlay;
+      if (!ovSrc?.enabled && ssfId) {
+        try {
+          const r = await api("GET", "/api/skin/ssf-settings?id=" + encodeURIComponent(ssfId));
+          if (r?.overrides?.overlay?.enabled) ovSrc = r.overrides.overlay;
+        } catch (_) {}
+      }
+      if (ovSrc?.enabled) {
         try {
           const s = await api("GET", "/api/skin?id=" + encodeURIComponent(last));
-          s.overlay = JSON.parse(JSON.stringify(SSF_OV_CACHE.overlay));
+          s.overlay = JSON.parse(JSON.stringify(ovSrc));
           await api("POST", "/api/skin", s);
         } catch (_) { /* 回写失败不挡切换 */ }
       }
@@ -2143,7 +2155,7 @@ async function refreshSsfMock(host, onReady) {
   host.className = "";
   host.style.cssText = "";
   host.innerHTML =
-    `<img src="/api/skin/ssf-render?t=${Date.now()}" ` +
+    `<img src="/api/skin/ssf-render?id=${encodeURIComponent(id)}&t=${Date.now()}" ` +
     `style="display:block;max-width:min(100%,420px);image-rendering:auto" alt="真实候选窗">`;
   const img = host.querySelector("img");
   img.addEventListener("load", () => { if (onReady) onReady(); });
@@ -2602,6 +2614,22 @@ const ovPersist = () => {
   return true;
 };
 $("#ov-pick").onclick = () => $("#ov-file").click();
+/* 【删除挂件图 2026-10-16】显式清图入口（此前注释写明「清图只能走
+   显式路径（目前无此入口）」——用户要的按钮）。清 OV 图状态+皮肤
+   overlay 的 image/proc；启用开关与贴法参数保留（换图即恢复）。 */
+$("#ov-clear-img").onclick = () => {
+  if (!confirm("删除当前挂件图片？（贴图数据将被清空；启用开关与贴法参数保留，重新选图即恢复）")) return;
+  OV.img = null; OV.anim = null; OV.dataUrl = ""; OV.crop = null; OV.key = null;
+  const cfg = ovEnsureCfg();
+  cfg.image = null; cfg.proc = null;
+  $("#ov-fileinfo").textContent = "未选图";
+  $("#ov-anim-badge").style.display = "none";
+  const wk = $("#ov-work");
+  if (wk) wk.width = wk.width; // 清处理台画布
+  $("#ov-imgwrap").style.display = "none";
+  ovSave();
+  msg("挂件图片已删除（重新「选择图片…」可再挂）", "ok");
+};
 /* 【超大静态图自动降采样 2026-11】烤成品退役（c312fdc）后皮肤存原图
    data-URL，>11M 字符（≈8.25MB 文件）被 ovPersist 拒收——但预览正常
    显示、错误提示一闪而过，用户实录「已载入却不生效」（大图用户专属、

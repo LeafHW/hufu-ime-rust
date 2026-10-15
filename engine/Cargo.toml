@@ -10,6 +10,7 @@ members = [
     "crates/hufu-server",
     "crates/hufu-cli",
     "crates/hufu-rerank",
+    "crates/hufu-render-helper",
 ]
 # rerank-sidecar 是独立 MSVC 工程（candle 依赖需 dlltool/msvc），不入 GNU 工作区
 exclude = ["rerank-sidecar"]

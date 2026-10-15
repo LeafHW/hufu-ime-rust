@@ -330,7 +330,18 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         eprintln!("skin-dump: 候选窗初始化失败");
         return 0;
     };
-    let Some(mut skin) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+    // 【渲染指定皮肤 2026-10-16】HUFU_SKIN_DUMP_ID=皮肤 id → 经
+    // skin_for_render 拉该皮肤 payload（含其 overrides）——设置页
+    // 渲染「正在编辑的独立皮肤」而不是「当前上位皮肤」（用户实锤：
+    // 矢量模式下进独立皮肤页，实时框显示的是矢量皮肤）。无该变量=
+    // 老行为（op:skin=当前），真实打字进程零改动。
+    let dump_id = std::env::var("HUFU_SKIN_DUMP_ID").unwrap_or_default();
+    let skin_op = if dump_id.is_empty() {
+        serde_json::json!({"op": "skin"})
+    } else {
+        serde_json::json!({"op": "skin_for_render", "id": dump_id})
+    };
+    let Some(mut skin) = crate::ipc::call(&skin_op) else {
         eprintln!("skin-dump: 引擎皮肤拉取失败（server 在线？）");
         return 0;
     };
@@ -425,44 +436,44 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     };
     eprintln!("skin-dump: px={}B", px.len());
     prog("px-ok");
-    // 32bpp → 24bpp（观察用途，砍掉 alpha 通道避免看图器把它当透明蒙版）
+    // 32bpp 原样保留（V4 header + BI_BITFIELDS + alpha mask）——此前
+    // 24bpp 白底合成是测试观察用；现在 BMP 直接进设置页实时框当真窗
+    // 预览，透明区必须透（用户实锤「实时框有白底」）。Chrome/Skia 按
+    // V4 alpha mask 正确解出透明。
     let src_stride = (wq as usize) * 4;
-    let row = (wq as usize) * 3;
-    let pad = (4 - (row % 4)) % 4;
-    let data_sz = ((row + pad) * hq as usize) as u32;
-    let mut bmp: Vec<u8> = Vec::with_capacity(54 + data_sz as usize);
+    let data_sz = (src_stride * hq as usize) as u32;
+    let mut bmp: Vec<u8> = Vec::with_capacity((14 + 108 + data_sz) as usize);
     bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&(54u32 + data_sz).to_le_bytes());
+    bmp.extend_from_slice(&((14u32 + 108 + data_sz) as u32).to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&54u32.to_le_bytes());
-    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&((14u32 + 108) as u32).to_le_bytes());
+    // BITMAPV4HEADER（108B）
+    bmp.extend_from_slice(&108u32.to_le_bytes());
     bmp.extend_from_slice(&(wq as i32).to_le_bytes());
     bmp.extend_from_slice(&(hq as i32).to_le_bytes());
     bmp.extend_from_slice(&1u16.to_le_bytes());
-    bmp.extend_from_slice(&24u16.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
     bmp.extend_from_slice(&data_sz.to_le_bytes());
     bmp.extend_from_slice(&2835u32.to_le_bytes());
     bmp.extend_from_slice(&2835u32.to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
-    // BGRA → BGR，白底合成（alpha<255 处混白，肉眼可判透明度分布）
+    bmp.extend_from_slice(&0x00FF0000u32.to_le_bytes()); // R mask
+    bmp.extend_from_slice(&0x0000FF00u32.to_le_bytes()); // G mask
+    bmp.extend_from_slice(&0x000000FFu32.to_le_bytes()); // B mask
+    bmp.extend_from_slice(&0xFF000000u32.to_le_bytes()); // A mask
+    bmp.extend_from_slice(b"sRGB"); // CSType
+    bmp.extend_from_slice(&[0u8; 36]); // CIEXYZTRIPLE endpoints
+    bmp.extend_from_slice(&[0u8; 12]); // r/g/b gamma
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // intent
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // profile data
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // profile size
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // BGRA 原样（bottom-up），32bpp 天然 4 字节对齐无 pad
     for y in (0..hq as usize).rev() {
         let base = y * src_stride;
-        for x in 0..wq as usize {
-            let i = base + x * 4;
-            let a = px[i + 3] as u32;
-            let mix = |c: u8| -> u8 {
-                let v = (c as u32 * a + 255 * (255 - a)) / 255;
-                v.min(255) as u8
-            };
-            bmp.push(mix(px[i]));
-            bmp.push(mix(px[i + 1]));
-            bmp.push(mix(px[i + 2]));
-        }
-        for _ in 0..pad {
-            bmp.push(0);
-        }
+        bmp.extend_from_slice(&px[base..base + src_stride]);
     }
     let path = std::env::var("HUFU_SKIN_DUMP")
         .ok()

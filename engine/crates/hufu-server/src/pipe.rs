@@ -462,6 +462,28 @@ pub fn dispatch(
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
+        // 【渲染指定皮肤 2026-10-16】设置页实时框用：按 id 返回该 ssf
+        // 皮肤的完整 payload（含其 overrides）——渲染「正在编辑的」皮
+        // 肤而不是「当前上位」皮肤。仅供 dump 驱动进程调用；真实打字
+        // 进程走 "skin"（op 面小、无副作用，不设白名单）。
+        "skin_for_render" => {
+            let id = req.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let resp = if !id.is_empty() {
+                crate::ssf::skin_payload(&host.data_dir, &id)
+                    .ok()
+                    .map(|(mut sv, _)| {
+                        // 实时框只画候选窗本体；挂件由设置页 UI 叠画
+                        //（payload 顶层 overlay 剥掉，防双挂件）。
+                        if let Some(o) = sv.as_object_mut() {
+                            o.remove("overlay");
+                        }
+                        serde_json::json!({"skin": sv})
+                    })
+            } else {
+                None
+            };
+            resp.unwrap_or_else(|| serde_json::json!({"error": "皮肤不可用"}))
+        }
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
             // 【独立皮肤设置 2026-10-16】SSF 时序号开关可被 per-skin 覆盖
