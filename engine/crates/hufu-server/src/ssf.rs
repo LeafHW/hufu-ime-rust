@@ -554,6 +554,10 @@ pub struct SsfOverrides {
     pub horizontal: Option<bool>,
     /// 序号开关覆盖。None=全局 candidates.show_index。
     pub show_index: Option<bool>,
+    /// 【挂件随独立皮肤 2026-10-16】挂件配置快照（矢量皮肤 overlay 节
+    /// 整棵：enabled/image/proc/布局）。None=无挂件。payload 注入顶层
+    /// overlay——DLL parse_cfg 同键读取，零新消费代码。
+    pub overlay: Option<serde_json::Value>,
     /// 四色覆盖（"#RRGGBBAA"）。None=皮肤原色。
     pub code_color: Option<String>,
     pub first_color: Option<String>,
@@ -580,8 +584,30 @@ impl SsfOverrides {
     }
 
     /// 覆盖参与源指纹（改设置=DLL 皮肤指纹失效重拉——与皮肤文件变同口径）。
+    /// overlay 含大图 base64（可达数 MB）——只进长度+哈希，原文不拼
+    ///（指纹串每 2.5s 构造一次，MB 级拼接是纯浪费）。
     fn fp_tag(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        let ov_tag = match &self.overlay {
+            Some(v) => {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in s.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                format!("ov{}:{:016x}", s.len(), h)
+            }
+            None => "ov-".into(),
+        };
+        let mut s = serde_json::to_string(self).unwrap_or_default();
+        // overlay 原文剔除（上面已换哈希标签）
+        if let Some(v) = &self.overlay {
+            let raw = serde_json::to_string(v).unwrap_or_default();
+            if !raw.is_empty() && s.contains(&raw) {
+                s = s.replace(&raw, "");
+            }
+        }
+        format!("{s}|{ov_tag}")
     }
 }
 
@@ -655,6 +681,14 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     });
     if !layout.is_empty() {
         sv["layout"] = serde_json::Value::Object(layout);
+    }
+    // 【挂件随独立皮肤 2026-10-16】overlay 快照注入顶层——DLL parse_cfg
+    //（pointer("/skin/overlay") or 顶层 overlay）同键命中，与矢量皮肤
+    // 完全同链路（sync/帧钟/代次推进零改动）。
+    if let Some(ov) = &ov.overlay {
+        if ov.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false) {
+            sv["overlay"] = ov.clone();
+        }
     }
     // 覆盖参与指纹：设置变=DLL 重拉重布局（滚轮字号立即生效的链路基础）
     let fp = format!("{}|{}", b.fp, ov.fp_tag());

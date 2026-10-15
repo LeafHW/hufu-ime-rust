@@ -620,7 +620,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 挂件（候选窗贴图，兄弟窗）════ -->
   <section id="tab-overlay">
     <h2>候选挂件<span class="en">Buddy</span></h2>
-    <div class="sub">候选窗旁跟随一张立绘/挂件图（兄弟窗实现，全程鼠标穿透，不影响打字）。所有改动（选图、裁剪、抠图、贴法）即存即生效，候选窗下一帧就能看到（≤2.5s）。可把整套参数存成多个配置随时切换。</div>
+    <div class="sub">候选窗旁跟随一张立绘/挂件图（兄弟窗实现，全程鼠标穿透，不影响打字）。所有改动（选图、裁剪、抠图、贴法）即存即生效，候选窗下一帧就能看到（≤2.5s）。可把整套参数存成多个配置随时切换。<span id="ov-mode-note" style="display:none;color:var(--acc)">当前独立皮肤模式：挂件配置保存到独立皮肤（与位图皮肤同屏显示）；切回矢量皮肤时用矢量皮肤自己的挂件。</span></div>
     <div class="row" style="margin-bottom:14px">
       <div class="checkline"><input type="checkbox" id="ov-en"><label for="ov-en">启用挂件</label></div>
       <label class="checkline" style="gap:12px">
@@ -1378,7 +1378,7 @@ function buildColorGrid() {
 }
 function bindSkin() {
   $$("[data-skin]").forEach(el => { el.value = SKIN[el.dataset.skin] ?? ""; el.oninput = () => SKIN[el.dataset.skin] = el.value; });
-  const saveSkinQuiet = async () => { try { await saveSkin(); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
+  const saveSkinQuiet = async () => { try { await ovSave(); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); } };
   // 【纯色模型·用户定稿】不再有材质（kind/tint/暗化/旧透明度全撤）：
   // 窗底=colors.back_color（alpha×整体透明度）、高亮底=自带alpha×高亮
   // 透明度、其余非文字元素=自带alpha×整体透明度；文字 alpha 恒满。
@@ -1596,7 +1596,7 @@ function bindSkin() {
   af.value = SKIN.layout.font_face || "";
   asz.value = SKIN.layout.font_point;
   const saveSkinNow = async () => {
-    try { await saveSkin(); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
+    try { await ovSave(); msg("外观已存入皮肤 ✓", "ok"); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
   };
   af.onchange = () => { SKIN.layout.font_face = af.value.trim(); saveSkinNow(); };
   // 【字体样张 2026-10-09】选中即看该字体真实字形（server GDI 渲染，
@@ -1931,6 +1931,8 @@ async function loadSsfSkin(id) {
     const r = await api("GET", "/api/skin/ssf-settings?id=" + encodeURIComponent(id));
     ov = r.overrides || {}; base = r.base || {};
   } catch (e) { /* 设置接口失败不挡皮肤显示 */ }
+  // 【挂件随独立皮肤】缓存整个 overrides（挂件页 ovSave 全量 merge 用）
+  SSF_OV_CACHE = { ...ov };
   const rgb8 = hx => hx && hx.length >= 7 ? hx.slice(0, 7) : "#000000";
   $("#ssfv-fontpt").value = ov.font_pt ?? 16;
   // 【字体下拉 2026-10-16】与矢量皮肤同款（/api/fonts 本机简中字体表，
@@ -1963,21 +1965,8 @@ async function loadSsfSkin(id) {
 async function ssfSettingsSaveNow(quiet) {
   const id = $("#ssf-select").value;
   if (!id) return;
-  const pt = parseFloat($("#ssfv-fontpt").value);
-  const rc = parseFloat($("#ssfv-round").value) || 0;
-  const ov = {
-    font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
-    font_face: $("#ssfv-fontface").value.trim() || null,
-    round_corner: rc > 0 ? rc : null,
-    horizontal: $("#ssfv-horiz").checked ? true : null,
-    show_index: $("#ssfv-index").checked ? true : null,
-    code_color: $("#ssfv-code").value.toUpperCase() + "FF",
-    first_color: $("#ssfv-first").value.toUpperCase() + "FF",
-    text_color: $("#ssfv-text").value.toUpperCase() + "FF",
-    annotation_color: $("#ssfv-anno").value.toUpperCase() + "FF",
-  };
   try {
-    await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
+    await api("POST", "/api/skin/ssf-settings", { id, overrides: collectSsfOverrides() });
     const t = new Date().toTimeString().slice(0, 8);
     $("#ssfv-note").textContent = `已生效 ${t}`;
   } catch (e) {
@@ -2013,16 +2002,17 @@ $("#ssfv-enable").addEventListener("change", async () => {
   const ssfId = $("#ssf-select").value;
   if (on) {
     if (!ssfId) { msg("没有可用的独立皮肤", "err"); $("#ssfv-enable").checked = false; return; }
-    // 互斥：挂件开着 → 关闭（改当前矢量皮肤并保存）
+    // 【挂件继承 2026-10-16】挂件与独立皮肤可共存：勾上时若矢量皮肤
+    // 的挂件开着，快照整棵 overlay 节进独立皮肤设置（一次继承；此后
+    // 挂件页在独立模式下改的参数写这里，不动矢量皮肤）。
     try {
       const cur = await api("GET", "/api/skin");
-      const ovEn = cur?.skin?.overlay?.enabled ?? cur?.overlay?.enabled;
-      if (ovEn) {
-        const s = cur.skin || cur;
-        if (s.overlay) s.overlay.enabled = false;
-        await api("POST", "/api/skin", s);
-        localStorage.setItem("ssfHadOverlay", "1");
-        msg("已关闭候选挂件（挂件与独立皮肤互斥）；切回矢量皮肤时可重新开启", "ok");
+      const vo = cur?.overlay;
+      if (vo?.enabled && !SSF_OV_CACHE.overlay?.enabled) {
+        SSF_OV_CACHE.overlay = JSON.parse(JSON.stringify(vo));
+        await api("POST", "/api/skin/ssf-settings",
+          { id: ssfId, overrides: collectSsfOverrides() });
+        msg("挂件已随独立皮肤继承（可在「候选挂件」页继续调整）", "ok");
       }
       await api("POST", "/api/skin/select", { id: ssfId, kind: "ssf" });
       SKIN_CURRENT_KIND = "ssf";
@@ -2068,9 +2058,10 @@ $("#ssfv-round").oninput = () => {
 $("#ssfv-reset").onclick = async () => {
   const id = $("#ssf-select").value;
   if (!id) return;
-  if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？")) return;
+  if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？（含挂件配置，字号/字体/横竖排/序号/圆角/颜色一并还原）")) return;
   const ov = { font_pt: null, font_face: null, round_corner: null, horizontal: null, show_index: null,
-    code_color: null, first_color: null, text_color: null, annotation_color: null };
+    code_color: null, first_color: null, text_color: null, annotation_color: null, overlay: null };
+  SSF_OV_CACHE = {};
   try {
     await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
     await loadSsfSkin(id);
@@ -2151,15 +2142,57 @@ const OV = {
   drag: null, view: null,  // 处理台拖拽状态 / 源图→画布映射
   raf: 0, animPos: 0, animLast: 0, phase: "idle",
 };
+/* 【挂件随独立皮肤 2026-10-16】独立皮肤模式下挂件配置双轨：内存态走
+   SSF_OV_CACHE.overlay（loadSsfSkin 拉取存全局），持久化走 ssf-settings
+   端点（payload 注入 DLL 同键消费）——矢量模式照旧走 SKIN.overlay +
+   /api/skin。ovEnsureCfg 是唯一数据入口，改这里读链全通。 */
+let SSF_OV_CACHE = {};
 const ovEnsureCfg = () => {
+  if (SKIN_CURRENT_KIND === "ssf") {
+    if (!SSF_OV_CACHE.overlay) SSF_OV_CACHE.overlay = { enabled: false, image: "", side: "right", base_height: 240, offset_x: 0, offset_y: 0, gap: 8, flip_h: false, layer: "below", opacity: 100, v_align: "center" };
+    return SSF_OV_CACHE.overlay;
+  }
   if (!SKIN.overlay) SKIN.overlay = { enabled: false, image: "", side: "right", base_height: 240, offset_x: 0, offset_y: 0, gap: 8, flip_h: false, layer: "below", opacity: 100, v_align: "center" };
   return SKIN.overlay;
-};let _ovSaveT = null;
-const ovSaveDeb = () => { clearTimeout(_ovSaveT); _ovSaveT = setTimeout(() => { saveSkin().catch(e => msg("皮肤保存失败：" + e.message, "err")); }, 400); };
+};
+/* 收集当前独立皮肤 overrides：显示设置取表单实值（外观页改字体也走这
+   条——不丢改动），挂件取 SSF_OV_CACHE.overlay。 */
+function collectSsfOverrides() {
+  const pt = parseFloat($("#ssfv-fontpt").value);
+  const rc = parseFloat($("#ssfv-round").value) || 0;
+  return {
+    font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
+    font_face: $("#ssfv-fontface").value.trim() || null,
+    round_corner: rc > 0 ? rc : null,
+    horizontal: $("#ssfv-horiz").checked ? true : null,
+    show_index: $("#ssfv-index").checked ? true : null,
+    code_color: $("#ssfv-code").value.toUpperCase() + "FF",
+    first_color: $("#ssfv-first").value.toUpperCase() + "FF",
+    text_color: $("#ssfv-text").value.toUpperCase() + "FF",
+    annotation_color: $("#ssfv-anno").value.toUpperCase() + "FF",
+    overlay: SSF_OV_CACHE.overlay || null,
+  };
+}
+/* 挂件页统一持久化：SSF 模式→写独立皮肤 overrides（全量收集）；矢量
+   模式→老路（保存整个皮肤 JSON）。 */
+const ovSave = async () => {
+  if (SKIN_CURRENT_KIND === "ssf") {
+    const id = $("#ssf-select").value;
+    if (!id) return;
+    try { await api("POST", "/api/skin/ssf-settings", { id, overrides: collectSsfOverrides() }); }
+    catch (e) { msg("挂件保存失败：" + e.message, "err"); }
+    return;
+  }
+  return saveSkin();
+};
+let _ovSaveT = null;
+const ovSaveDeb = () => { clearTimeout(_ovSaveT); _ovSaveT = setTimeout(() => { ovSave().catch(e => msg("皮肤保存失败：" + e.message, "err")); }, 400); };
 const ovSetR = (id, v) => { const el = $(id); if (el) el.value = v; const lab = $(id + "-v"); if (lab) lab.textContent = v; };
 
 function ovBindSkin() {
   const c = ovEnsureCfg();
+  // 【挂件随独立皮肤】SSF 模式提示行开关（配置去向说明）
+  { const n = $("#ov-mode-note"); if (n) n.style.display = SKIN_CURRENT_KIND === "ssf" ? "" : "none"; }
   $("#ov-en").checked = !!c.enabled;
   $("#ov-side").value = c.side === "left" ? "left" : "right";
   $("#ov-layer").value = c.layer === "above" ? "above" : "below";
@@ -2459,18 +2492,13 @@ $("#ov-file").onchange = ev => {
   ev.target.value = "";
 };
 $("#ov-en").onchange = () => {
-  // 【独立皮肤互斥 2026-10-16】挂件挂在矢量皮肤上；当前走独立皮肤
-  //（.ssf）时开启无效果（SSF 载荷无 overlay 节）——拦下并提示先关
-  // 独立皮肤，杜绝「开了没反应」的困惑态。
-  if ($("#ov-en").checked && SKIN_CURRENT_KIND === "ssf") {
-    $("#ov-en").checked = false;
-    msg("候选挂件与独立皮肤互斥：请先到「皮肤 → 独立皮肤」取消「启用独立皮肤」，再开启挂件", "err");
-    return;
-  }
+  // 【挂件随独立皮肤 2026-10-16】互斥拦截退役：SSF 模式下挂件配置写
+  // 独立皮肤 overrides（ovEnsureCfg/ovSave 双轨），载荷注入后 DLL 同
+  // 键消费——挂件与独立皮肤正式共存。
   const c = ovEnsureCfg(); c.enabled = $("#ov-en").checked;
   if (c.enabled && !c.image) msg("启用成功——选择图片后自动生效", "");
   else msg(c.enabled ? "候选挂件已启用 ✓（打字即见，≤2.5s）" : "候选挂件已关闭", "ok");
-  saveSkin().catch(e => msg("保存失败：" + e.message, "err"));
+  ovSave().catch(e => msg("保存失败：" + e.message, "err"));
 };
 const ovLayR = (id, key) => {
   $(id).oninput = () => {
@@ -2481,10 +2509,10 @@ const ovLayR = (id, key) => {
 };
 ovLayR("#ov-bh", "base_height"); ovLayR("#ov-gap", "gap"); ovLayR("#ov-op", "opacity");
 const ovSel = (id, key) => {
-  $(id).onchange = () => { const c = ovEnsureCfg(); c[key] = $(id).value; ovApplyLayout(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+  $(id).onchange = () => { const c = ovEnsureCfg(); c[key] = $(id).value; ovApplyLayout(); ovSave().catch(e => msg("保存失败：" + e.message, "err")); };
 };
 ovSel("#ov-side", "side"); ovSel("#ov-layer", "layer"); ovSel("#ov-valign", "v_align");
-$("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip").checked; ovPreview(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+$("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip").checked; ovPreview(); ovSave().catch(e => msg("保存失败：" + e.message, "err")); };
 /* 延时消失：不勾=0（候选框一收挂件立即收）；勾选 0.2–2s 由滑杆决定 */
 {
   const syncLinger = () => {
@@ -2493,7 +2521,7 @@ $("#ov-flip").onchange = () => { const c = ovEnsureCfg(); c.flip_h = $("#ov-flip
     $("#ov-linger-row").style.display = $("#ov-linger").checked ? "" : "none";
     $("#ov-linger-v").textContent = (c.hide_delay_ms / 1000).toFixed(1);
   };
-  $("#ov-linger").onchange = () => { syncLinger(); saveSkin().catch(e => msg("保存失败：" + e.message, "err")); };
+  $("#ov-linger").onchange = () => { syncLinger(); ovSave().catch(e => msg("保存失败：" + e.message, "err")); };
   $("#ov-linger-ms").oninput = () => { syncLinger(); ovSaveDeb(); };
   window.__ovSyncLinger = syncLinger;
 }
@@ -2764,7 +2792,7 @@ $("#ov-preset-save").onclick = async () => {
   const ex = c.presets.findIndex(p => p.name === snap.name);
   const overwrote = ex >= 0;
   if (ex >= 0) c.presets[ex] = snap; else c.presets.push(snap);
-  try { await saveSkin(); ovPresetsRefresh(snap.name); msg(overwrote ? `配置「${snap.name}」已更新 ✓` : `配置「${snap.name}」已保存 ✓`, "ok"); }
+  try { await ovSave(); ovPresetsRefresh(snap.name); msg(overwrote ? `配置「${snap.name}」已更新 ✓` : `配置「${snap.name}」已保存 ✓`, "ok"); }
   catch (e) { msg("保存失败：" + e.message, "err"); }
 };
 $("#ov-preset-sel").onchange = async () => {
@@ -2783,7 +2811,7 @@ $("#ov-preset-sel").onchange = async () => {
   OV.tol = c.proc ? (c.proc.tol ?? 30) : 30; OV.corner = c.proc ? (c.proc.corner ?? 0) : 0; OV.feather = c.proc ? (c.proc.feather ?? 0) : 0;
   OV.cshape = c.proc && c.proc.cshape === "star" ? "star" : "round";
   OV.img = null; OV.anim = null; OV.dataUrl = "";
-  try { await saveSkin(); msg(`已切换到配置「${name}」✓`, "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
+  try { await ovSave(); msg(`已切换到配置「${name}」✓`, "ok"); } catch (e) { msg("保存失败：" + e.message, "err"); }
   ovBindSkin(); // 载入 image/proc 并回填全部控件（含延时滑杆）
 };
 $("#ov-preset-del").onclick = async () => {
@@ -2791,7 +2819,7 @@ $("#ov-preset-del").onclick = async () => {
   if (!name) return msg("先在下拉里选中要删的配置", "err");
   const c = ovEnsureCfg();
   c.presets = (c.presets || []).filter(p => p.name !== name);
-  try { await saveSkin(); ovPresetsRefresh(); msg(`配置「${name}」已删除`, "ok"); }
+  try { await ovSave(); ovPresetsRefresh(); msg(`配置「${name}」已删除`, "ok"); }
   catch (e) { msg("删除失败：" + e.message, "err"); }
 };
 { // 深/浅底切换（与皮肤页同款）
