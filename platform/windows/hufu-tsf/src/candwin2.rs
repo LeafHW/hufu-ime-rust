@@ -39,6 +39,11 @@ static CAND_HIT: std::sync::Mutex<Vec<(f32, f32, f32, f32)>> = std::sync::Mutex:
 /// (dpi_scale, shadow_m, 内容宽, 内容高)——客户端像素→内容逻辑坐标。
 static CAND_HIT_GEO: std::sync::Mutex<Option<(f32, f32, u32, u32)>> = std::sync::Mutex::new(None);
 
+/// 取证用：最近一帧渲染几何 (dpi_scale, shadow_m, 内容 w, 内容 h)。
+pub(crate) fn cand_hit_geo() -> Option<(f32, f32, u32, u32)> {
+    *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 【右键菜单免死金牌 2026-10-07·二修】菜单 owner 抢前台会触发宿主
 /// 失活/文档焦点切换——六十修清场把引擎会话清零（真机快照
 /// session.raw="" cands=0）+候选窗 hide_now=「点调频候选消失、动作
@@ -1483,12 +1488,14 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
     let s = f.scale;
     let hex = |c: [u8; 4]| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
     let lay = &f.layout;
-    let mx = ((lay.code.left.max(lay.candidates.left).max(0) as f32
-        + lay.code.right.max(lay.candidates.right).max(0) as f32)
-        * 0.5) * s;
-    let my = ((lay.code.top.max(lay.candidates.top).max(0) as f32
-        + lay.code.bottom.max(lay.candidates.bottom).max(0) as f32)
-        * 0.5) * s;
+    // 【SSF insets 投影 2026-10-15】margin_x/y 锚设计框（此前 max(code,cand)
+    // 口径把文字顶到编码区顶——元气虎娘 58.4 vs 设计 2.6 实锤）：
+    // - margin_y = candidates.top×scale（竖排首行锚=设计框顶；JSON 布局
+    //   y0=rm_y 自动对齐）
+    // - margin_x = min(candidates.left, candidates.right)×scale（左右共用
+    //   一键，取 min 保两边不出框；注释列右对齐随之约束）
+    let mx = (lay.candidates.left.max(0).min(lay.candidates.right.max(0)) as f32) * s;
+    let my = (lay.candidates.top.max(0) as f32) * s;
     // 确保 /skin 包装层存在（顶层直挂形态注入后同样优先命中）
     let is_skin_obj = v.get("skin").map(|x| x.is_object()).unwrap_or(false);
     if !is_skin_obj {
@@ -3398,7 +3405,14 @@ impl CandidateWindowV2 {
         let ssf = self.ssf_prepare(
             skin,
             !horizontal_early,
-            !raw.is_empty() || freq_view.is_some(),
+            // 【变体选择修正 2026-10-15】皮肤作者按搜狗「框内恒显编码」
+            // 设计：常规变体（vertical/horizontal）的 insets 才是有效
+            // 布局（候选顶/编码底）；*_candidates 后缀变体普遍退化
+            // （top>bottom 倒置，元气虎娘实锤 730/364）。T8 内联开=raw
+            // 恒空——若据此判 has_code=false 会误入退化变体。语义改为
+            // 「窗有内容（编码或候选任一）即常规变体」，纯编码窗仍走
+            // Code 变体。
+            !raw.is_empty() || !cands.is_empty() || freq_view.is_some(),
             !cands.is_empty(),
         );
         let skin_proj: Value;
@@ -3925,10 +3939,30 @@ impl CandidateWindowV2 {
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
         // 【按住Ctrl调频 2026-11】模态提示行恒占独立行（横排也是——
         // 提示文案较长，与候选同行会把候选推得很远）。
+        // 【SSF insets 布局 2026-10-15】编码行不占候选区顶部槽——按变体
+        // code insets 锚在窗口底部（画在底固定区的功能区条上），
+        // 候选行从 candidates.top×scale 锚起（原 JSON 布局 rm_y 一套
+        // 全部让位；freq 模态提示行维持旧行为占顶行）。
+        let ssf_layout_geo = ssf.as_ref().map(|f| {
+            (
+                f.layout.candidates.top as f32,  // 源px
+                f.layout.code.top as f32,        // 源px
+                f.layout.candidates.left as f32, // 源px
+                f.bitmap.height as f32,          // 源px
+                f.scale,
+                f.layout.vertical.before as f32, // 源px（顶段界）
+                f.layout.vertical.after as f32,  // 源px（底段高）
+            )
+        });
         let code_row = if freq_view.is_some() {
             1.0
         } else if raw.is_empty() || horizontal {
             0.0
+        } else if let Some((_, etop, _, img_h, _, _, va)) = ssf_layout_geo {
+            // 【SSF 编码段位】code.top 在底段（元气虎娘 730 型）→ 编码行
+            // 底锚窗底固定区，不占候选顶槽；顶段/中带（光点与星海/
+            // 小喵风扇 code.top=21 型）→ JSON 原生顶部槽（height/y0 同源）。
+            if etop >= (img_h - va) { 0.0 } else { 1.0 }
         } else {
             1.0
         };
@@ -3958,9 +3992,30 @@ impl CandidateWindowV2 {
             None => (width, cmt_x),
         };
         let height = match &ssf {
-            Some(f) => height
-                .max(f.layout.min_height(f.bitmap.height) * f.scale)
-                .max(f.bitmap.height as f32 * f.scale),
+            Some(f) => {
+                let lh_min = f.layout.min_height(f.bitmap.height) * f.scale;
+                let img_h = f.bitmap.height as f32 * f.scale;
+                // 【SSF 编码块】仅当 code.top 落在底段（≥图高-va）时编码行
+                // 底锚窗底（元气虎娘 730 型）：高度=JSON 布局高−对称底
+                // margin+编码块（(图高-code.top)×scale+2.5）。顶段编码
+                //（光点与星海/小喵风扇 code.top=21 型）走普通高度。
+                let bottom_anchored = f.layout.code.top as f32
+                    >= (f.bitmap.height as f32 - f.layout.vertical.after.max(0) as f32);
+                let code_block = (f.bitmap.height as f32
+                    - f.layout.code.top.max(0) as f32)
+                    * f.scale
+                    + 2.5;
+                let v = if bottom_anchored {
+                    (height - rm_y + code_block).max(lh_min).max(img_h)
+                } else {
+                    height.max(lh_min).max(img_h)
+                };
+                crate::tsf::trace(&format!(
+                    "ssfgeo: 布局h={:.1} 编码块={:.1} 底锚={} 硬底={:.1} → 取{:.1}（横排={}）",
+                    height, code_block, bottom_anchored, lh_min, v, horizontal
+                ));
+                v
+            }
             None => height,
         };
 
@@ -4565,12 +4620,13 @@ impl CandidateWindowV2 {
                                         chw,
                                         chh,
                                         f.layout.horizontal.tile,
-                                        (f.layout.horizontal.before as f32 * f.scale).round() as i32,
-                                        (f.layout.horizontal.after as f32 * f.scale).round() as i32,
+                                        f.layout.horizontal.before,
+                                        f.layout.horizontal.after,
                                         f.layout.vertical.tile,
-                                        (f.layout.vertical.before as f32 * f.scale).round() as i32,
-                                        (f.layout.vertical.after as f32 * f.scale).round() as i32,
+                                        f.layout.vertical.before,
+                                        f.layout.vertical.after,
                                         dpi_scale,
+                                        f.scale,
                                     );
                                 }
                             }
@@ -4817,20 +4873,46 @@ impl CandidateWindowV2 {
                 if draw_content {
                     // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
                     // 【按住Ctrl调频 2026-11】模态期此行即提示行——强调色。
+                    // 【SSF insets 布局】编码行锚窗口底部 code insets 区
+                    //（底固定区功能区条，如元气虎娘底部米色圆角条）：
+                    // y = 内容高 - (图高 - code.top)×scale，x = candidates.left×scale。
                     if !raw.is_empty() {
-                        // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
+                        // 【SSF insets 布局】编码行锚底部 code insets：画在底
+                        // 固定区功能区条上（如元气虎娘米色圆角条）。
+                        // y = 内容高-(图高-code.top)×scale；x = candidates.left×scale。
+                        let (code_x, code_y) = match ssf_layout_geo {
+                            Some((_, etop, cleft, img_h, sc, vb, va)) => {
+                                // 分段 MapY：顶段（etop<vb）线性；底段
+                                //（etop≥img_h-va）底锚；中带按 vb 锚。
+                                let cy = if etop < vb {
+                                    etop * sc
+                                } else if etop >= (img_h - va) {
+                                    height - (img_h - etop) * sc
+                                } else {
+                                    vb * sc
+                                };
+                                crate::tsf::trace(&format!(
+                                    "ssflay: 编码行锚 x={:.1} y={:.1}（height={:.1} etop={:.0} sc={:.3}）raw_len={}",
+                                    cleft * sc, cy, height, etop, sc, raw.len()
+                                ));
+                                (cleft * sc, cy)
+                            }
+                            _ => (rm_x, rm_y + dy),
+                        };
                         if let Some(bg) = &b_preedit_bg {
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: rm_x,
-                                    top: rm_y,
-                                    right: cr(width - rm_x),
-                                    bottom: cb(rm_y + line_h),
-                                },
-                                radiusX: 4.0,
-                                radiusY: 4.0,
-                            };
-                            ctx.FillRoundedRectangle(&rr, bg);
+                            if ssf_layout_geo.is_none() {
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: rm_x,
+                                        top: rm_y,
+                                        right: cr(width - rm_x),
+                                        bottom: cb(rm_y + line_h),
+                                    },
+                                    radiusX: 4.0,
+                                    radiusY: 4.0,
+                                };
+                                ctx.FillRoundedRectangle(&rr, bg);
+                            }
                         }
                         // 【按住Ctrl调频·提示行自适应】全量→紧凑→…截断
                         //（竖排定宽皮肤单行装不下全量文案的根治）
@@ -4852,9 +4934,9 @@ impl CandidateWindowV2 {
                             &ctx,
                             &tf,
                             raw_draw,
-                            rm_x,
-                            rm_y + dy,
-                            width - rm_x * 2.0,
+                            code_x,
+                            code_y,
+                            (width - code_x - rm_x).max(20.0),
                             row_h,
                             b_hint,
                         );
@@ -4864,6 +4946,10 @@ impl CandidateWindowV2 {
                     // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
                     // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
                     // 布置。
+                    // 【SSF insets 布局】竖排候选首行锚=candidates.top×scale
+                    //（皮肤设计框顶）；JSON 皮肤维持 rm_y 语义。
+                    // y0=rm_y：SSF 由投影 margin_y=candidates.top×scale 驱动
+                    //（ssf_project_skin insets 投影 2026-10-15）。
                     let y0 = rm_y + (row_h + cand_spacing) * code_row;
 
                     // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔

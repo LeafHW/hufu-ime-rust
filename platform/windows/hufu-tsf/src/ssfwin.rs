@@ -365,27 +365,44 @@ pub struct SsfAxisSlice {
 ///   平铺（≤64 块绘制预算）；否则中段整体拉伸；
 /// - 首尾块 source_length/destination_length ≤0 的丢弃（add 谓词）。
 pub fn slice_axis(source: u32, destination: f32, tile: bool, before: i32, after: i32) -> Vec<SsfAxisSlice> {
+    slice_axis_scaled(source, destination, tile, before, after, 1.0)
+}
+
+/// 【SSF 双域切片 2026-10-15】`scale`=源像素→目标逻辑px 换算系数
+///（`user_pt/display.font_size`）。源域 before/after 为皮肤原始像素；
+/// 目标域固定段长 = 源段×scale（等比缩放保真），中段吃掉剩余目标宽
+///（拉伸带）。平铺模式每块目标长=源段×scale。修复实锤：此前调用方
+/// 把刀口×scale 后与原始源宽混算 → 窗口画成原图左上角 1:1 局部+周边
+/// 压扁条（四角保真校验 765/765 满分差）。
+pub fn slice_axis_scaled(
+    source: u32,
+    destination: f32,
+    tile: bool,
+    before: i32,
+    after: i32,
+    scale: f32,
+) -> Vec<SsfAxisSlice> {
     let mut out = Vec::new();
-    if source == 0 || !destination.is_finite() || destination <= 0.0 {
+    if source == 0 || !destination.is_finite() || destination <= 0.0 || !(scale > 0.0) {
         return out;
     }
     let size = source as f32;
     let mut before = before.max(0) as f32;
     let mut after = after.max(0) as f32;
-    // 刀口和 ≥ 源宽：按比例收缩（留 1px 中段）
+    // 刀口和 ≥ 源宽：源侧按比例收缩（留 1px 中段）——同旧语义
     if before + after >= size {
         let factor = (size - 1.0) / (before + after).max(1.0);
         before *= factor;
         after *= factor;
     }
-    // 目标小于刀口和：目标侧刀口等比收缩（源刀口不变——边段被压缩绘制）
-    let factor = if before + after > destination {
-        destination / (before + after)
-    } else {
-        1.0
-    };
-    let left = before * factor;
-    let right = after * factor;
+    // 目标域固定段 = 源段 × scale；目标过小再等比收缩（源不变）
+    let mut d_before = before * scale;
+    let mut d_after = after * scale;
+    if d_before + d_after > destination {
+        let factor = destination / (d_before + d_after).max(1e-6);
+        d_before *= factor;
+        d_after *= factor;
+    }
     let add = |s: f32, n: f32, d: f32, len: f32, out: &mut Vec<SsfAxisSlice>| {
         if n > 0.0 && len > 0.0 {
             out.push(SsfAxisSlice {
@@ -396,24 +413,27 @@ pub fn slice_axis(source: u32, destination: f32, tile: bool, before: i32, after:
             });
         }
     };
-    add(0.0, before, 0.0, left, &mut out);
+    // 首段：源 [0,before] → 目标 [0,d_before]（固定区等比缩放）
+    add(0.0, before, 0.0, d_before, &mut out);
     let middle = size - before - after;
-    let available = (destination - left - right).max(0.0);
-    if tile && middle > 0.0 && available / middle <= 64.0 {
-        // 平铺：中段按原尺寸逐块铺满可用宽（≤64 块）
+    let available = (destination - d_before - d_after).max(0.0);
+    if tile && middle > 0.0 && available / (middle * scale) <= 64.0 {
+        // 平铺：中段按 scale 后尺寸逐块铺满可用宽（≤64 块），末块按剩余截短
         let mut d = 0.0f32;
         while d < available {
-            let n = middle.min(available - d);
-            if n <= 0.0 {
+            let len = (middle * scale).min(available - d);
+            if len <= 0.0 {
                 break;
             }
-            add(before, n, left + d, n, &mut out);
-            d += n;
+            add(before, len / scale, d_before + d, len, &mut out);
+            d += len;
         }
     } else {
-        add(before, middle, left, available, &mut out);
+        // 中段整体拉伸：源 [before,before+middle] → 目标剩余空间
+        add(before, middle, d_before, available, &mut out);
     }
-    add(size - after, after, destination - right, right, &mut out);
+    // 尾段：源 [size-after,size] → 目标 [destination-d_after,destination]
+    add(size - after, after, destination - d_after, d_after, &mut out);
     out
 }
 
@@ -445,9 +465,27 @@ pub unsafe fn draw_nineslice(
     before_v: i32,
     after_v: i32,
     dpi: f32,
+    scale: f32,
 ) {
-    let hslices = slice_axis(src_w, dst_w, tile_h, before_h, after_h);
-    let vslices = slice_axis(src_h, dst_h, tile_v, before_v, after_v);
+    let hslices = slice_axis_scaled(src_w, dst_w, tile_h, before_h, after_h, scale);
+    let vslices = slice_axis_scaled(src_h, dst_h, tile_v, before_v, after_v, scale);
+    // 取证：九宫格实际切片（每次渲染一条，排障期）
+    if crate::tsf::trace_on() {
+        let fmt = |s: &[SsfAxisSlice]| {
+            s.iter()
+                .map(|x| format!("{}+{:.0}→{:.1}+{:.1}", x.source, x.source_length, x.destination, x.destination_length))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        crate::tsf::trace(&format!(
+            "ssf9: H({src_w}→{dst_w:.0} 刀{before_h}/{after_h} scale{scale:.3}) [{}]",
+            fmt(&hslices)
+        ));
+        crate::tsf::trace(&format!(
+            "ssf9: V({src_h}→{dst_h:.0} 刀{before_v}/{after_v} scale{scale:.3}) [{}]",
+            fmt(&vslices)
+        ));
+    }
     let snap = |v: f32| -> f32 {
         if dpi > 0.0 && dpi.is_finite() {
             (v * dpi / 96.0).round() * 96.0 / dpi
@@ -958,6 +996,43 @@ mod tests {
         assert_eq!(s[0], SsfAxisSlice { source: 0.0, source_length: 20.0, destination: 0.0, destination_length: 20.0 });
         assert_eq!(s[1], SsfAxisSlice { source: 20.0, source_length: 60.0, destination: 20.0, destination_length: 160.0 });
         assert_eq!(s[2], SsfAxisSlice { source: 80.0, source_length: 20.0, destination: 180.0, destination_length: 20.0 });
+    }
+
+    #[test]
+    fn slice_axis_scaled_fixed_zones_shrink_proportionally() {
+        // 【SSF 双域】scale=0.5：源 100（刀口 20/20），目标 30 → 固定段
+        // 20×0.5=10（源不动），中段源 60 → 目标 30-10-10=10。
+        let s = slice_axis_scaled(100, 30.0, false, 20, 20, 0.5);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], SsfAxisSlice { source: 0.0, source_length: 20.0, destination: 0.0, destination_length: 10.0 });
+        assert_eq!(s[1], SsfAxisSlice { source: 20.0, source_length: 60.0, destination: 10.0, destination_length: 10.0 });
+        assert_eq!(s[2], SsfAxisSlice { source: 80.0, source_length: 20.0, destination: 20.0, destination_length: 10.0 });
+    }
+
+    #[test]
+    fn slice_axis_scaled_yuanqi_geometry() {
+        // 元气虎娘实锤几何：源 1536（刀口 300/1235 → 中带 1px），目标 153，
+        // scale=0.08 → 左固定 24、右固定 98.8、中带目标 30.2。
+        let s = slice_axis_scaled(1536, 153.0, false, 300, 1235, 0.08);
+        assert_eq!(s.len(), 3);
+        assert!((s[0].destination_length - 24.0).abs() < 0.01);
+        assert!((s[0].source_length - 300.0).abs() < 0.01);
+        assert!((s[1].source_length - 1.0).abs() < 0.01);
+        assert!((s[1].destination_length - 30.2).abs() < 0.05);
+        assert!((s[2].destination - 54.2).abs() < 0.05);
+        assert!((s[2].destination_length - 98.8).abs() < 0.01);
+        assert!((s[2].source - 301.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn slice_axis_scaled_tile_step_is_scaled() {
+        // 平铺：中段 60 源像素、scale 0.5 → 每块目标长 30，铺满 90 → 3 块
+        let s = slice_axis_scaled(100, 110.0, true, 20, 20, 0.5);
+        // 首尾 10+10，可用 90，步长 30 → 中段 3 块（source 恒为 before=20）
+        let mids: Vec<_> = s.iter().filter(|x| (x.source - 20.0).abs() < 0.01 && x.source_length > 1.0).collect();
+        assert_eq!(mids.len(), 3);
+        assert!((mids[0].destination_length - 30.0).abs() < 0.01);
+        assert!((mids[0].source_length - 60.0).abs() < 0.01);
     }
 
     #[test]

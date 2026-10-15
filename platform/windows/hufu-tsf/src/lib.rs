@@ -371,12 +371,38 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         }
     }
     eprintln!("skin-dump: anchor=({},{})", anchor.left, anchor.top);
+    // 【验收盲区修】T8 铁律：inline_preedit 默认 true → show 咽喉吞 raw
+    // → 编码行永不画（生产=编码走宿主内联，正确）。但 SSF 皮肤的
+    // code insets（编码框）只有在关内联时才有意义——取证时注入
+    // inline_preedit=false 模拟该用户档，同帧验证编码行锚定。
+    // 双形态强插（顶层 layout / skin.layout——载荷包皮不确定）。
+    let mut skin = skin;
+    let flag = serde_json::Value::Bool(false);
+    if let Some(obj) = skin.as_object_mut() {
+        obj.entry("layout")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+        if let Some(sk) = obj.get_mut("skin").and_then(|s| s.as_object_mut()) {
+            sk.entry("layout")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+        }
+    }
     w.readback = true;
     w.show(&cands, "jd", &skin, Some(&anchor), 0);
     std::thread::sleep(std::time::Duration::from_millis(120));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;
+    // 取证几何：dpi/shadow_m/内容 w×h（readback 帧无动效插值）
+    if let Some(g) = crate::candwin2::cand_hit_geo() {
+        eprintln!(
+            "skin-dump: geo dpi={:.3} shadow_m={} 内容={}x{} 整窗={}x{}",
+            g.0, g.1, g.2, g.3, wq, hq
+        );
+    }
     if hold_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
     }
