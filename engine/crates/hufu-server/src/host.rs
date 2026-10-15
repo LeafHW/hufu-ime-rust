@@ -100,6 +100,26 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
     ),
 ];
 
+/// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
+///（official-ssf/ 随 git 与二进制分发，缺失自愈落盘）——此前「.ssf
+/// 完全用户自管理、绝不内置」的红线针对的是**搜狗官方皮肤**（版权）；
+/// 这三款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘）。
+/// 已存在的不覆盖（用户导入的同名更新优先）。
+const OFFICIAL_SSF: &[(&str, &[u8])] = &[
+    (
+        "虎纹奶油.ssf",
+        include_bytes!("../official-ssf/虎纹奶油.ssf"),
+    ),
+    (
+        "蜜桃虎娘.ssf",
+        include_bytes!("../official-ssf/蜜桃虎娘.ssf"),
+    ),
+    (
+        "鲸鱼娘.ssf",
+        include_bytes!("../official-ssf/鲸鱼娘.ssf"),
+    ),
+];
+
 pub struct Host {
     pub candidate_export: crate::candidate_export::Export,
     pub engine: Engine,
@@ -170,6 +190,10 @@ impl Host {
         };
         host.install_official_skins();
         mark("skins", &t0);
+        // 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘（缺失才写，
+        // 用户同名定制优先——与官方 JSON 皮肤同款语义）。
+        host.install_official_ssf();
+        mark("ssf", &t0);
         // 【SSF 皮肤 2026-12】.ssf 完全用户自管理：不做内置/自装（法律
         // 红线：绝不内置搜狗皮肤）。仅启动自愈：config 指向的 ssf 皮肤
         // 源文件已删 → 回退默认 JSON 皮肤（设计稿降级矩阵「下次重载时
@@ -181,6 +205,23 @@ impl Host {
         // 装载后热挂（见 sentence_load_plan）。启动只载词典（秒级），
         // 管道/设置页即刻可用；装完立即可打字，整句能力稍后自动就位。
         Ok(host)
+    }
+
+    /// 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘到 .ssf 皮肤目录
+    ///（与 *.json 同目录混居）。仅缺失时写入；存在不覆盖（用户定制优
+    /// 先）。默认出厂不开独立皮肤（config 默认 skin_kind=json、
+    /// skin=hufu-moyan，见 hufu-config AppearanceSection::default）。
+    fn install_official_ssf(&mut self) {
+        let dir = self.ssf_skins_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (file, body) in OFFICIAL_SSF {
+            let p = dir.join(file);
+            if !p.exists() {
+                if let Err(e) = std::fs::write(&p, body) {
+                    eprintln!("系统自带 ssf {file} 落盘失败: {e}");
+                }
+            }
+        }
     }
 
     /// 官方皮肤自愈落盘：内嵌皮肤（official-skins/，随 git 与二进制分发）

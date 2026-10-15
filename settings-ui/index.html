@@ -1843,6 +1843,16 @@ let SSF_META = {};
 let skinSub = "vector";
 /* 当前皮肤 kind（loadSkinList 更新；loadSsfSkin 据此设启用开关态） */
 let SKIN_CURRENT_KIND = "json";
+/* 【saveConfig 快照同步 2026-10-16】皮肤切换走 /api/skin/select（不
+   更新 CFG 本地快照）——此后任何 saveConfig（候选窗动效/选重暂留/
+   动效速度等全局控件 onchange）把带着旧皮肤字段的 CFG 快照整包
+   POST /api/config 回去=切走刚选的皮肤（用户实锤「动效一动皮肤就
+   变成别的」）。select 成功后同步快照，杜绝整包回写开倒车。 */
+function syncSkinCfg(id, kind) {
+  CFG.appearance = CFG.appearance || {};
+  CFG.appearance.skin = id;
+  CFG.appearance.skin_kind = kind;
+}
 function setSkinSub(mode) {
   skinSub = mode;
   $("#skin-sub-vector-btn").classList.toggle("on", mode === "vector");
@@ -1876,6 +1886,7 @@ async function loadSkinList(sel) {
   if (r.current) {
     const cur = r.skins.find(x => x.id === r.current);
     SKIN_CURRENT_KIND = cur ? (cur.kind || "json") : "json";
+    syncSkinCfg(r.current, SKIN_CURRENT_KIND); /* CFG 快照跟上真实现状 */
     if (SKIN_CURRENT_KIND === "json") {
       // 【启用开关记忆】当前矢量皮肤 id 记下——独立皮肤关闭开关时恢复它
       //（localStorage 可能被宿主禁用：安全写）
@@ -1921,7 +1932,8 @@ async function loadSsfSkin(id) {
   $("#skin-save").disabled = $("#skin-new").disabled = $("#skin-reset").disabled = true;
   $$('[data-skin="name"],[data-skin="id"]').forEach(el => el.disabled = true);
   const m = SSF_META[id] || { id, kind: "ssf", name: id };
-  $("#ssf-desc").textContent = "「" + (m.name || id) + "」" + (m.author ? "　作者：" + m.author : "");
+  // 【2026-10-16】不再显示作者信息（用户拍板）
+  $("#ssf-desc").textContent = "「" + (m.name || id) + "」";
   const st = $("#ssf-status");
   if (m.error) {
     st.innerHTML = '<span style="color:var(--err)">✗ ' + esc(m.error) + "</span>";
@@ -1958,7 +1970,8 @@ async function loadSsfSkin(id) {
   // 自动=霞鹜优先/雅黑兜底）；override 空时选「自动」。
   await buildSsfFontSelect(ov.font_face || "");
   $("#ssfv-horiz").checked = !!ov.horizontal;
-  $("#ssfv-index").checked = ov.show_index === true;
+  // null（历史遗留「跟随全局」）按全局配置回填；显式 false=不勾
+  $("#ssfv-index").checked = (ov.show_index ?? (CFG.candidates?.show_index !== false)) === true;
   // 【启用开关+即改即生效 2026-10-16】开关态=当前皮肤 kind（勾=ssf 上
   // 位中）。下拉切换仅在开关勾着时真正换皮，否则纯编辑设置。
   $("#ssfv-enable").checked = SKIN_CURRENT_KIND === "ssf";
@@ -1971,6 +1984,7 @@ async function loadSsfSkin(id) {
   if (!m.error && $("#ssfv-enable").checked) {
     try { await api("POST", "/api/skin/select", { id, kind: "ssf" }); }
     catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
+    syncSkinCfg(id, "ssf");
     msg("已启用独立皮肤：" + (m.name || id), "ok");
   }
   // 【SSF 挂件回填】overrides（含挂件快照）就绪后回填挂件页控件/mock
@@ -2042,6 +2056,7 @@ $("#ssfv-enable").addEventListener("change", async () => {
       }
       await api("POST", "/api/skin/select", { id: ssfId, kind: "ssf" });
       SKIN_CURRENT_KIND = "ssf";
+      syncSkinCfg(ssfId, "ssf");
       msg("已启用独立皮肤", "ok");
     } catch (e) { msg("启用失败：" + e.message, "err"); $("#ssfv-enable").checked = false; }
   } else {
@@ -2073,6 +2088,7 @@ $("#ssfv-enable").addEventListener("change", async () => {
       }
       await api("POST", "/api/skin/select", { id: last, kind: "json" });
       SKIN_CURRENT_KIND = "json";
+      syncSkinCfg(last, "json");
       try { localStorage.setItem("ssfLastJsonSkin", last); } catch (_) {}
       msg("已切回矢量皮肤「" + last + "」（独立皮肤设置保留）", "ok");
       setSkinSub("vector");
@@ -2269,7 +2285,7 @@ async function loadSkin(id) {
   SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
   bindSkin(); buildColorGrid(); ovBindSkin(); ovPresetsRefresh();
   // 选中即切换为当前皮肤（select 端点不写皮肤文件，避免覆盖）
-  try { await api("POST", "/api/skin/select", { id }); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
+  try { await api("POST", "/api/skin/select", { id }); syncSkinCfg(id, "json"); } catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); }
   // 双保险重绘：同步一次 + 下一帧再一次（个别浏览器 select 切换后
   // 首次重绘被合并掉——用户报「换皮肤预览不更新、动一下才变」）
   preview();
@@ -2331,7 +2347,10 @@ function collectSsfOverrides() {
     font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
     font_face: ff || null,
     horizontal: $("#ssfv-horiz").checked ? true : null,
-    show_index: $("#ssfv-index").checked ? true : null,
+    // 【两态 2026-10-16】用户实锤「显示序号开关无效」：旧三态 null=跟随
+    // 全局，而全局默认开——不勾永远显示=关不掉。改显式两态（勾=开、
+    // 不勾=关）。
+    show_index: $("#ssfv-index").checked ? true : false,
     code_color: $("#ssfv-code").value.toUpperCase() + "FF",
     first_color: $("#ssfv-first").value.toUpperCase() + "FF",
     text_color: $("#ssfv-text").value.toUpperCase() + "FF",

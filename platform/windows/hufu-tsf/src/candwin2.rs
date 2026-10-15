@@ -1465,6 +1465,53 @@ pub(crate) struct SsfFrame {
     pub(crate) scale: f32,
 }
 
+/// 【霞鹜默认 2026-10-16】空 font_face（官方皮肤全空/SSF 未指定）的
+/// 缺省候选字体：系统装了霞鹜就用（常见版本名精确探测），未装回退
+/// 雅黑——用户拍板「所有自带默认皮肤都要用霞鹜，装了默认、没装回退
+/// 微软雅黑」。进程级探测一次（OnceLock 缓存）。
+static DEFAULT_CAND_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn probe_default_cand_font(dwrite: &IDWriteFactory) -> String {
+    /// 常见霞鹜版本名（中文名在前——FindFamilyName 精确匹配）
+    const CANDS: &[&str] = &[
+        "霞鹜文楷 GB 屏幕阅读版",
+        "霞鹜文楷 GB",
+        "霞鹜文楷",
+        "LXGW WenKai GB Screen",
+        "LXGW WenKai GB",
+        "LXGW WenKai",
+        "LXGW WenKai Lite",
+    ];
+    unsafe {
+        let mut col: Option<IDWriteFontCollection> = None;
+        if dwrite
+            .GetSystemFontCollection(&mut col, false)
+            .is_err()
+        {
+            eprintln!("cw2: 默认字体探测 GetSystemFontCollection 失败 → 雅黑");
+            return "Microsoft YaHei UI".into();
+        }
+        let Some(col) = col else {
+            eprintln!("cw2: 默认字体探测系统集为空 → 雅黑");
+            return "Microsoft YaHei UI".into();
+        };
+        for fam in CANDS {
+            let mut w: Vec<u16> = fam.encode_utf16().collect();
+            w.push(0);
+            let mut idx = 0u32;
+            let mut ex = windows::Win32::Foundation::BOOL::default();
+            if col.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut ex).is_ok()
+                && ex.as_bool()
+            {
+                eprintln!("cw2: 默认字体探测命中「{fam}」");
+                return fam.to_string();
+            }
+        }
+        eprintln!("cw2: 默认字体探测未命中霞鹜 → 雅黑");
+    }
+    "Microsoft YaHei UI".into()
+}
+
 /// 把 ssf display/变体折算进现有 layout/colors/material 键（注入
 /// `/skin/...` 包装层——layout_f/color_f 优先查包装层，顶层旧值自然
 /// 被盖过，两种入参形态都成立）。下游读皮代码零改动【回归红线】。
@@ -1519,14 +1566,31 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
         match ff_override {
             Some(ff) => put(obj, "layout", "font_face", Value::String(ff)),
             None => {
-                if !d.font_ch.is_empty() {
-                    put(obj, "layout", "font_face", Value::String(d.font_ch.clone()));
+                // 【霞鹜默认 2026-10-16】雅黑缺省（搜狗皮肤惯例值=没写
+                // 字体）视为空——走 DLL 空默认「霞鹜优先/雅黑兜底」。
+                let fc = d.font_ch.trim();
+                let is_yh = fc.eq_ignore_ascii_case("microsoft yahei ui") || fc == "微软雅黑";
+                if !fc.is_empty() && !is_yh {
+                    put(obj, "layout", "font_face", Value::String(fc.to_string()));
                 }
             }
         }
     }
     put(obj, "layout", "line_spacing", serde_json::json!(d.line_spacing * s));
     put(obj, "layout", "candidate_spacing", serde_json::json!(d.candidate_spacing * s));
+    // 【show_index 透传 2026-10-16】server 按 overrides 注入的原
+    // layout.show_index（三态：None=不注入跟随全局、false=关）必须透
+    // 传进投影后的 /skin/layout——下面渲染的序号开关读取路径之一；
+    // 不透传则投影重建 layout 时丢键=「显示序号开关无效」。
+    {
+        let si = skin
+            .pointer("/skin/layout/show_index")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("show_index")))
+            .and_then(|x| x.as_bool());
+        if let Some(si) = si {
+            put(obj, "layout", "show_index", serde_json::json!(si));
+        }
+    }
     // 【SSF 圆角 2026-10-16】位图自带形状不受程序化圆角影响，但用户可
     // 要窗口级圆角（设置页 round_corner）——payload layout.corner_radius
     // 覆盖优先，否则 0（下方渲染按 0 跳过裁剪）。
@@ -3469,10 +3533,25 @@ impl CandidateWindowV2 {
                 .collect();
             &cands_suppressed
         };
-        // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
+        // 序号显示：三路读——①管道响应根级 show_index（真窗 op skin 响
+        // 应包装层）；②/skin/show_index（兼容）；③/skin/layout.show_index
+        // 与顶层 layout.show_index（SSF payload 注入——dump 渲染走
+        // skin_for_render 拿 {"skin":sv}，序号键在 sv.layout 里；只读根
+        // 级永远 None→恒 true=「显示序号开关无效」的用户实锤根因）。
+        // 缺省 true。
         let show_index = skin
             .get("show_index")
             .and_then(|x| x.as_bool())
+            .or_else(|| {
+                skin.get("skin")
+                    .and_then(|s| s.get("show_index"))
+                    .and_then(|x| x.as_bool())
+            })
+            .or_else(|| {
+                skin.pointer("/skin/layout/show_index")
+                    .or_else(|| skin.pointer("/layout/show_index"))
+                    .and_then(|x| x.as_bool())
+            })
             .unwrap_or(true);
         // 【毛玻璃退役 2026-09-11】材质 glass/毛玻璃整链已删（kind 值
         // 不再分支，旧 glass 皮肤按 translucent 渲染）；accent 一次性
@@ -3704,7 +3783,18 @@ impl CandidateWindowV2 {
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
                 if f.is_empty() {
-                    "Microsoft YaHei UI".into()
+                    // 【霞鹜默认 2026-10-16】空 font_face（官方皮肤全空/
+                    // SSF 雅黑缺省视为空）不再钉死雅黑：系统装了霞鹜就
+                    // 用，未装回退雅黑——用户拍板「所有自带默认皮肤都
+                    // 要用霞鹜」。常见版本名精确探测，进程一次。已验证：
+                    // 探测路径与显式 override 霞鹜渲染逐像素一致。
+                    if let Some(c) = DEFAULT_CAND_FONT.get() {
+                        c.clone()
+                    } else {
+                        let r = probe_default_cand_font(&dwrite);
+                        let _ = DEFAULT_CAND_FONT.set(r.clone());
+                        r
+                    }
                 } else {
                     f.to_string()
                 }

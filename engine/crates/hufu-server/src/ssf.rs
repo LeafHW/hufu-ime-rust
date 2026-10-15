@@ -710,9 +710,21 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     let first_color = ov.first_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.first_color));
     let text_color = ov.text_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.text_color));
     let annotation_color = ov.annotation_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.annotation_color));
+    // 【霞鹜默认 2026-10-16】皮肤自带 font_ch 是雅黑缺省（搜狗皮肤
+    // common.ini 惯例值=「没写字体」）时视为空——不注入 layout.
+    // font_face，DLL 空默认走「装了霞鹜用霞鹜、没装回退雅黑」（用户
+    // 拍板所有自带默认皮肤用霞鹜）。真要雅黑：设置页字体 override。
+    let font_ch_eff = {
+        let f = d.display.font_ch.trim();
+        if f.is_empty() || f.eq_ignore_ascii_case("microsoft yahei ui") || f == "微软雅黑" {
+            String::new()
+        } else {
+            f.to_string()
+        }
+    };
     let display = serde_json::json!({
         "font_size": d.display.font_size,
-        "font_ch": d.display.font_ch,
+        "font_ch": font_ch_eff,
         "font_en": d.display.font_en,
         "code_color": code_color,
         "first_color": first_color,

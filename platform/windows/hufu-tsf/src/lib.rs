@@ -434,22 +434,12 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         };
         eprintln!("skin-dump: visible={} (期望 0)", vis.0);
     }
-    let prog = |tag: &str| {
-        let _ = std::fs::write(
-            "E:\\DSH-KF\\.tmp-test\\dump-progress.txt",
-            format!("{tag} @ {}\n", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)),
-        );
-    };
-    prog("pre-hide");
     w.hide();
-    prog("post-hide");
     let Some(px) = px else {
         eprintln!("skin-dump: 回读失败");
         return 0;
     };
     eprintln!("skin-dump: px={}B", px.len());
-    prog("px-ok");
     // 32bpp 原样保留（V4 header + BI_BITFIELDS + alpha mask）——此前
     // 24bpp 白底合成是测试观察用；现在 BMP 直接进设置页实时框当真窗
     // 预览，透明区必须透（用户实锤「实时框有白底」）。Chrome/Skia 按
@@ -501,7 +491,6 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         .unwrap_or_else(|| std::env::temp_dir().join("hufu-skin-dump.bmp"));
     match std::fs::write(&path, &bmp) {
         Ok(()) => {
-            prog("bmp-written");
             eprintln!("skin-dump: {wq}x{hq} → {}", path.display());
             1
         }

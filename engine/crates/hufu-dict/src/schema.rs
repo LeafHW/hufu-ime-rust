@@ -1143,4 +1143,49 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// 【五笔用户码表 2026-10-16】用户实锤「0私用」「1符号」读不到：
+    /// sniff_format 首行判向反了（纯拉丁词 / ℃ 区外符号）。端到端：
+    /// 真实五笔方案目录装载，z 符号域 + 词条双向验证。
+    #[test]
+    fn wubi_user_tables_end_to_end() {
+        let dir = std::path::Path::new("D:\\HuFu\\码表\\五笔");
+        if !dir.is_dir() {
+            eprintln!("（无生产目录，跳过）");
+            return;
+        }
+        let s = Schema::load(dir).unwrap();
+        // 1符号.txt（词前，码 z 开头）：zq → ℃/℉/°
+        let got: Vec<&str> = s
+            .dict
+            .lookup("zq")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(
+            got.iter().any(|t| t.contains('℃')),
+            "zq 应出 ℃（符号表判向+合并装载），实得 {got:?}"
+        );
+        // 0私用.txt（词前，首行纯拉丁）：jy → 12345678
+        let got: Vec<&str> = s
+            .dict
+            .lookup("jy")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(
+            got.iter().any(|t| t.contains("12345678")),
+            "jy 应出 12345678（私用表判向），实得 {got:?}"
+        );
+        // 主表仍在（2木滴五笔单简合并未丢）
+        let got: Vec<&str> = s
+            .dict
+            .lookup("a")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(!got.is_empty(), "主码表词条丢失：a 无候选");
+        // z 符号域开（z 引导码可查）
+        assert!(s.dict.z_symbol_domain, "z 符号域应开（z 开头符号码存在）");
+    }
 }
