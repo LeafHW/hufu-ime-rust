@@ -548,8 +548,6 @@ pub struct SsfOverrides {
     pub font_pt: Option<f32>,
     /// 字体族覆盖。None=皮肤 display.font_ch。
     pub font_face: Option<String>,
-    /// 窗口圆角半径 px（位图+文字一起裁圆角）。None=0 保持皮肤原样。
-    pub round_corner: Option<f32>,
     /// 横排=true。None=竖排（虎娘 layoutMode 6 默认语义）。
     pub horizontal: Option<bool>,
     /// 序号开关覆盖。None=全局 candidates.show_index。
@@ -657,11 +655,6 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     if let Some(ff) = &ov.font_face {
         if !ff.is_empty() {
             layout.insert("font_face".into(), serde_json::json!(ff));
-        }
-    }
-    if let Some(rc) = ov.round_corner {
-        if rc > 0.0 {
-            layout.insert("corner_radius".into(), serde_json::json!(rc));
         }
     }
     if let Some(h) = ov.horizontal {
