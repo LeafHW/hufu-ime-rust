@@ -1547,6 +1547,11 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
     put(obj, "layout", "hilite_padding", serde_json::json!(0.0));
     put(obj, "layout", "shadow_radius", serde_json::json!(0.0));
     put(obj, "layout", "border_width", serde_json::json!(0.0));
+    // 【mark 条禁用 2026-10-16】SSF payload 的 layout.mark_text（如"·"）
+    // 会让渲染画「高亮胶囊左缘细竖条」——但 SSF 投影已把 hilite_padding
+    // 压 0，竖条退化成 2px 竖线贴在胶囊左缘；皮肤位图自带高亮表达
+    //（first_color 文字色），程序 mark 条=双重。显式清空禁用。
+    put(obj, "layout", "mark_text", serde_json::json!(""));
     // 高亮：ssf 的高亮表达=first_color 文字色（虎娘口径），胶囊与
     // 程序化底透明化（hilite_on=false 会连文字色一起退化成普通色，
     // 不能用）；编码行底不画（皮肤自带）。

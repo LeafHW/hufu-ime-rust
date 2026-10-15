@@ -404,8 +404,14 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         }
     }
     w.readback = true;
-    w.show(&cands, "jd", &skin, Some(&anchor), 0);
-    std::thread::sleep(std::time::Duration::from_millis(120));
+    // 【诊断 2026-10-16】编码注入 HUFU_SKIN_DUMP_CODE（默认 jd）——
+    // 实时框左缘 1-2px 竖笔画疑为编码字符越窗，空串对照可分离。
+    let dump_code = std::env::var("HUFU_SKIN_DUMP_CODE").unwrap_or_else(|_| "jd".to_string());
+    w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
+    // 【动效完成等待 2026-10-16】入场滑动/伸缩几百 ms——120ms 抓的是
+    // 动效中间帧（外壳仍在插值、内容仍在滑），设置页实时框的左缘竖
+    // 线实为动效中间态残影（真窗动效播完即无）。等 900ms 取稳态帧。
+    std::thread::sleep(std::time::Duration::from_millis(900));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;
@@ -440,15 +446,20 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     // 24bpp 白底合成是测试观察用；现在 BMP 直接进设置页实时框当真窗
     // 预览，透明区必须透（用户实锤「实时框有白底」）。Chrome/Skia 按
     // V4 alpha mask 正确解出透明。
+    // 【V4 长度修正 2026-10-16】BITMAPV4HEADER=124B（108 是 V3/
+    // BITMAPINFOHEADER 的大小）。此前 bV4Size/像素 offset 按 108 写，
+    // 字段却全写了 124B → 解码器从错 16B 的位置读像素流 → 每行尾
+    // 4px 卷绕到下一行行首——用户实锤「边框最右边的线出现在左边」
+    //（raw 像素直落对照实锤：raw x=0-1 透明、BMP 同位有内容）。
     let src_stride = (wq as usize) * 4;
     let data_sz = (src_stride * hq as usize) as u32;
-    let mut bmp: Vec<u8> = Vec::with_capacity((14 + 108 + data_sz) as usize);
+    let mut bmp: Vec<u8> = Vec::with_capacity((14 + 124 + data_sz) as usize);
     bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&((14u32 + 108 + data_sz) as u32).to_le_bytes());
+    bmp.extend_from_slice(&((14u32 + 124 + data_sz) as u32).to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&((14u32 + 108) as u32).to_le_bytes());
-    // BITMAPV4HEADER（108B）
-    bmp.extend_from_slice(&108u32.to_le_bytes());
+    bmp.extend_from_slice(&((14u32 + 124) as u32).to_le_bytes());
+    // BITMAPV4HEADER（124B）
+    bmp.extend_from_slice(&124u32.to_le_bytes());
     bmp.extend_from_slice(&(wq as i32).to_le_bytes());
     bmp.extend_from_slice(&(hq as i32).to_le_bytes());
     bmp.extend_from_slice(&1u16.to_le_bytes());
