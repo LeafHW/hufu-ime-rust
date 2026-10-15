@@ -5721,6 +5721,87 @@ impl CandidateWindowV2 {
                     };
                     self.present_ulw(pw, ph);
                 } else {
+                    // 【SSF 窗口圆角·主链 2026-10-16 修】swapchain Present
+                    // 链没有 CPU 像素步（此前圆角只挂 ULW/测试回读两路，
+                    // dump 走回读=验证通过但生产直角——用户实锤「圆角没
+                    // 用」）。两段法：渲染 EndDraw 后读回整帧 → CPU 四角
+                    // 透明化 → 重建位图整帧铺回 → Present。
+                    if self.ulw_round > 0.5 {
+                        let (Some(ctx), Some(tgt)) = (&self.ctx, bitmap.cast::<ID2D1Bitmap>().ok()) else {
+                            return;
+                        };
+                        let (wq, hq) = (w_out as u32, h_out as u32);
+                        if wq > 0 && hq > 0 {
+                            use windows::Win32::Graphics::Direct2D::{
+                                D2D1_BITMAP_OPTIONS, D2D1_BITMAP_PROPERTIES1,
+                                ID2D1Bitmap,
+                            };
+                            let props = D2D1_BITMAP_PROPERTIES1 {
+                                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                                bitmapOptions: D2D1_BITMAP_OPTIONS(
+                                    D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0,
+                                ),
+                                colorContext: std::mem::ManuallyDrop::new(None),
+                            };
+                            if let Ok(cpu) = ctx.CreateBitmap(
+                                windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: wq, height: hq },
+                                None, 0, &props,
+                            ) {
+                                if cpu.CopyFromBitmap(None, Some(&tgt), Some(&windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U {
+                                    left: 0, top: 0, right: wq, bottom: hq,
+                                })).is_ok() {
+                                    if let Ok(mapped) = cpu.Map(windows::Win32::Graphics::Direct2D::D2D1_MAP_OPTIONS_READ) {
+                                        let row = (wq as usize) * 4;
+                                        let mut data = vec![0u8; row * hq as usize];
+                                        let pitch = mapped.pitch as usize;
+                                        for r in 0..hq as usize {
+                                            let src = mapped.bits.add(r * pitch) as *const u8;
+                                            data[r * row..(r + 1) * row]
+                                                .copy_from_slice(std::slice::from_raw_parts(src, row));
+                                        }
+                                        let _ = cpu.Unmap();
+                                        ssf_round_corners_cpu(data.as_mut_ptr(), wq as usize, hq as usize, self.ulw_round * dpi_scale);
+                                        // 整帧铺回：新建 GPU 位图（data 所有权转移）
+                                        let gprops = D2D1_BITMAP_PROPERTIES1 {
+                                            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                            },
+                                            dpiX: 96.0,
+                                            dpiY: 96.0,
+                                            bitmapOptions: windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS::default(),
+                                            colorContext: std::mem::ManuallyDrop::new(None),
+                                        };
+                                        if let Ok(nb) = ctx.CreateBitmap(
+                                            windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: wq, height: hq },
+                                            Some(data.as_ptr() as *const _),
+                                            row as u32,
+                                            &gprops,
+                                        ) {
+                                            let _ = ctx.BeginDraw();
+                                            let ident = windows::Foundation::Numerics::Matrix3x2 {
+                                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
+                                            };
+                                            ctx.SetTransform(&ident);
+                                            let _ = ctx.DrawBitmap(
+                                                &nb,
+                                                Some(&D2D_RECT_F { left: 0.0, top: 0.0, right: wq as f32, bottom: hq as f32 }),
+                                                1.0,
+                                                windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_LINEAR,
+                                                None, None,
+                                            );
+                                            let _ = ctx.EndDraw(None, None);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let chain = match &self.swapchain {
                         Some(c) => c.clone(),
                         None => return,

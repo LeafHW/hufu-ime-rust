@@ -1737,6 +1737,21 @@ function bindSkin() {
   }
 }
 function preview() {
+  // 【SSF 预览 2026-10-16】独立皮肤模式下预览底=皮肤自带整图（带
+  // 圆角设置），挂件预览照常叠在外层——此前恒画矢量 DOM，用户实锤
+  //「挂件实时框里不是独立皮肤的样子」。
+  if (SKIN_CURRENT_KIND === "ssf") {
+    const w = $("#candwin-preview");
+    const id = $("#ssf-select").value || "";
+    const m = SSF_META[id] || {};
+    const rc = parseFloat($("#ssfv-round").value) || 0;
+    w.className = "preview-wrap";
+    w.style.cssText = "position:relative;z-index:1;border:none;padding:0;background:transparent";
+    w.innerHTML = m.preview
+      ? `<img src="/api/skin/preview?kind=ssf&id=${encodeURIComponent(id)}&t=${Date.now()}" style="display:block;max-width:100%;border-radius:${rc}px" alt="皮肤预览">`
+      : `<div class="sub" style="padding:18px">独立皮肤「${esc(m.name || id)}」（无预览图，实际候选窗实时渲染）</div>`;
+    return;
+  }
   const c = SKIN.colors, L = SKIN.layout, M = SKIN.material;
   const w = $("#candwin-preview");
   w.className = "preview-wrap";
@@ -1867,7 +1882,8 @@ async function loadSkinList(sel) {
     SKIN_CURRENT_KIND = cur ? (cur.kind || "json") : "json";
     if (SKIN_CURRENT_KIND === "json") {
       // 【启用开关记忆】当前矢量皮肤 id 记下——独立皮肤关闭开关时恢复它
-      localStorage.setItem("ssfLastJsonSkin", r.current);
+      //（localStorage 可能被宿主禁用：安全写）
+      try { localStorage.setItem("ssfLastJsonSkin", r.current); } catch (_) {}
       s.value = r.current;
     } else {
       s2.value = r.current;
@@ -1989,6 +2005,7 @@ async function ssfSettingsSaveNow(quiet) {
   $("#ssfv-round").addEventListener("input", () => {
     const v = parseInt($("#ssfv-round").value, 10) || 0;
     $("#ssfv-round-v").textContent = v > 0 ? v + "px" : "关";
+    if (SKIN_CURRENT_KIND === "ssf") preview(); // 预览底图圆角即时跟随
     clearTimeout(roundTimer);
     roundTimer = setTimeout(go, 250);
   });
@@ -2005,32 +2022,48 @@ $("#ssfv-enable").addEventListener("change", async () => {
     // 【挂件继承 2026-10-16】挂件与独立皮肤可共存：勾上时若矢量皮肤
     // 的挂件开着，快照整棵 overlay 节进独立皮肤设置（一次继承；此后
     // 挂件页在独立模式下改的参数写这里，不动矢量皮肤）。
+    // 【修 2026-10-16】读「上次矢量皮肤」要带 ?id=——config 当前可能
+    // 已是 ssf，无 id 的 GET 会读不存在的 .json 回默认皮（继承源错）。
     try {
-      const cur = await api("GET", "/api/skin");
-      const vo = cur?.overlay;
-      if (vo?.enabled && !SSF_OV_CACHE.overlay?.enabled) {
-        SSF_OV_CACHE.overlay = JSON.parse(JSON.stringify(vo));
-        await api("POST", "/api/skin/ssf-settings",
-          { id: ssfId, overrides: collectSsfOverrides() });
-        msg("挂件已随独立皮肤继承（可在「候选挂件」页继续调整）", "ok");
+      const lastJson = ssfLastJsonSkin();
+      if (lastJson) {
+        const cur = await api("GET", "/api/skin?id=" + encodeURIComponent(lastJson));
+        const vo = cur?.overlay;
+        if (vo?.enabled && !SSF_OV_CACHE.overlay?.enabled) {
+          SSF_OV_CACHE.overlay = JSON.parse(JSON.stringify(vo));
+          await api("POST", "/api/skin/ssf-settings",
+            { id: ssfId, overrides: collectSsfOverrides() });
+          msg("挂件已随独立皮肤继承（可在「候选挂件」页继续调整）", "ok");
+        }
       }
       await api("POST", "/api/skin/select", { id: ssfId, kind: "ssf" });
       SKIN_CURRENT_KIND = "ssf";
       msg("已启用独立皮肤", "ok");
     } catch (e) { msg("启用失败：" + e.message, "err"); $("#ssfv-enable").checked = false; }
   } else {
-    const last = localStorage.getItem("ssfLastJsonSkin") || "hufu-moyan";
+    // 【修 2026-10-16】取消勾选=切回矢量皮肤。last 来源三级回退：
+    // localStorage（try/catch——设置页宿主 localStorage 可能抛异常，
+    // 此前异常吞掉整个 handler=切回静默失败，用户实锤「关了还在」）
+    // → 矢量下拉当前值 → hufu-moyan。切回成功顺手跳回矢量子分页
+    //（界面所见=实际所用，杜绝「关了但界面还停在独立页」的错觉）。
+    const last = ssfLastJsonSkin() || ($("#skin-select").value || "hufu-moyan");
     try {
       await api("POST", "/api/skin/select", { id: last, kind: "json" });
       SKIN_CURRENT_KIND = "json";
-      localStorage.setItem("ssfLastJsonSkin", last);
-      msg("已切回矢量皮肤（独立皮肤设置保留）", "ok");
+      try { localStorage.setItem("ssfLastJsonSkin", last); } catch (_) {}
+      msg("已切回矢量皮肤「" + last + "」（独立皮肤设置保留）", "ok");
+      setSkinSub("vector");
+      reloadSkinTab();
     } catch (e) {
       msg("切回失败：" + e.message + "（该皮肤可能已删除）", "err");
       $("#ssfv-enable").checked = true;
     }
   }
 });
+/* localStorage 安全读（设置页宿主可能禁 localStorage——直读抛异常） */
+function ssfLastJsonSkin() {
+  try { return localStorage.getItem("ssfLastJsonSkin") || ""; } catch (_) { return ""; }
+}
 /* 【SSF 字体下拉 2026-10-16】与矢量皮肤 ap-font 同数据源（/api/fonts
    本机简中字体+default 霞鹜/雅黑）。cur=override 值（空=自动项）；
    缓存字体表（切皮肤不重拉）。 */
@@ -2491,11 +2524,30 @@ $("#ov-file").onchange = ev => {
   rd.readAsDataURL(f);
   ev.target.value = "";
 };
-$("#ov-en").onchange = () => {
-  // 【挂件随独立皮肤 2026-10-16】互斥拦截退役：SSF 模式下挂件配置写
-  // 独立皮肤 overrides（ovEnsureCfg/ovSave 双轨），载荷注入后 DLL 同
-  // 键消费——挂件与独立皮肤正式共存。
-  const c = ovEnsureCfg(); c.enabled = $("#ov-en").checked;
+$("#ov-en").onchange = async () => {
+  // 【挂件随独立皮肤 2026-10-16】SSF 模式下配置写独立皮肤 overrides。
+  // 开启时若本皮肤没图而「上次矢量皮肤」的挂件有图 → 自动补继承
+  //（「先启用独立后开挂件」场景——此前拿到空配置，勾了无图不显示，
+  // 用户实锤「不生效」）。
+  const c = ovEnsureCfg();
+  if (SKIN_CURRENT_KIND === "ssf" && $("#ov-en").checked && !c.image) {
+    const lastJson = ssfLastJsonSkin();
+    if (lastJson) {
+      try {
+        const cur = await api("GET", "/api/skin?id=" + encodeURIComponent(lastJson));
+        const vo = cur?.overlay;
+        if (vo?.enabled && vo.image) {
+          Object.assign(c, JSON.parse(JSON.stringify(vo)));
+          $("#ov-en").checked = true;
+          msg("已从矢量皮肤「" + lastJson + "」继承挂件（图与参数一并带过来）", "ok");
+          await ovSave();
+          ovBindSkin();
+          return;
+        }
+      } catch (_) { /* 继承失败不挡手动配置 */ }
+    }
+  }
+  c.enabled = $("#ov-en").checked;
   if (c.enabled && !c.image) msg("启用成功——选择图片后自动生效", "");
   else msg(c.enabled ? "候选挂件已启用 ✓（打字即见，≤2.5s）" : "候选挂件已关闭", "ok");
   ovSave().catch(e => msg("保存失败：" + e.message, "err"));
