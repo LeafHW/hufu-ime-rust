@@ -1885,6 +1885,10 @@ async function loadSkinList(sel) {
       s.value = r.current;
     } else {
       s2.value = r.current;
+      // 【SSF 后台皮肤】后台载上次矢量皮肤（外观页数据/mock 兜底），
+      // 不 select（静默版）
+      const lj = ssfLastJsonSkin();
+      if (lj) loadSkinSilent(lj);
     }
     if (SKIN_CURRENT_KIND === "ssf") setSkinSub("ssf");
   }
@@ -1968,6 +1972,10 @@ async function loadSsfSkin(id) {
     catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
     msg("已启用独立皮肤：" + (m.name || id), "ok");
   }
+  // 【SSF 挂件回填】overrides（含挂件快照）就绪后回填挂件页控件/mock
+  //（SSF_OV_CACHE 此刻才有真值；loadSkinSilent 的 ovBindSkin 可能先跑
+  // 了一次拿的是默认值）
+  try { ovBindSkin(); } catch (_) {}
 }
 /* 【即改即生效 2026-10-16】删除「应用设置」按钮：任一控件变化立即
    写 overrides（server 指纹推进 → DLL 下一帧重拉）。滑条 input 密集
@@ -2135,6 +2143,15 @@ async function loadSkin(id) {
   // 首次重绘被合并掉——用户报「换皮肤预览不更新、动一下才变」）
   preview();
   requestAnimationFrame(() => preview());
+}
+/* 【SSF 后台皮肤 2026-10-16】独立模式后台载「上次矢量皮肤」进 SKIN：
+   只拉数据+回填（外观页/挂件 mock 兜底数据源），绝不 select——loadSkin
+   尾部的 select 会把当前皮肤切回矢量（生产事故隐患）。 */
+async function loadSkinSilent(id) {
+  try {
+    SKIN = await api("GET", "/api/skin?id=" + encodeURIComponent(id));
+    bindSkin(); buildColorGrid(); ovBindSkin(); ovPresetsRefresh();
+  } catch (_) { /* 皮肤不存在/接口失败：保持现状 */ }
 }
 
 /* ════ 挂件（候选窗贴图，兄弟窗）2026-10-02 ════
@@ -2383,7 +2400,11 @@ function ovRenderWork() {
    高度=base_height（候选框 mock 即真实尺寸，所见即所得）、
    间距/水平微调→左右 margin、垂直微调→translateY、透明度→opacity */
 function ovApplyLayout() {
-  const wrapEl = $("#ov-imgwrap"), cfg = SKIN.overlay || {};
+  // 【修复 2026-10-16】SSF 模式下挂件配置在 SSF_OV_CACHE.overlay——此前
+  // 直读 SKIN.overlay（SSF 时为空）→ base_height/gap/偏移恒默认值：
+  // 拖出去弹回、缩不动（松手/任意重排把高度拍回 240）的真凶。统一走
+  // ovEnsureCfg 双轨入口。
+  const wrapEl = $("#ov-imgwrap"), cfg = ovEnsureCfg();
   const row = $("#ov-row"), mock = $("#ov-candmock");
   if (!OV.img) { wrapEl.style.display = "none"; return; }
   // 【拖图锁 2026-10-03】拖拽进行中不动布局（left/top/transform 归
@@ -2818,14 +2839,16 @@ const ovNum = (id, key, cast) => {
 const ovPresetKeys = ["enabled", "image", "side", "base_height", "offset_x", "offset_y", "gap", "flip_h", "layer", "opacity", "v_align", "hide_delay_ms"];
 function ovPresetsRefresh(selName) {
   const s = $("#ov-preset-sel");
-  const list = (SKIN.overlay && SKIN.overlay.presets) || [];
+  // 【SSF 双轨 2026-10-16】presets 挂在当前生效的挂件配置上（ovEnsureCfg）
+  const list = (ovEnsureCfg().presets) || [];
   const cur = selName !== undefined ? selName : s.value;
   s.innerHTML = '<option value="">新配置</option>' +
     list.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
   s.value = list.some(p => p.name === cur) ? cur : "";
 }
 $("#ov-preset-save").onclick = async () => {
-  if (!OV.img && !(SKIN.overlay && SKIN.overlay.image)) return msg("先选择图片再保存配置", "err");
+  const c0 = ovEnsureCfg();
+  if (!OV.img && !(c0.image)) return msg("先选择图片再保存配置", "err");
   ovPersist();
   const def = $("#ov-preset-sel").value || "";
   const name = prompt("保存为配置（新名=新增，同名=覆盖）：", def);
@@ -2888,6 +2911,10 @@ document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
   $$("nav a").forEach(x => x.classList.remove("on")); a.classList.add("on");
   $$("main section").forEach(s => s.classList.remove("on"));
   $("#tab-" + a.dataset.tab).classList.add("on");
+  // 【修 2026-10-16】进挂件页主动 ovBindSkin：SSF 模式下 init 不走
+  // loadSkin → 挂件 mock/控件从未回填（矢量模式靠 loadSkin 尾部调用
+  // 兜住，SSF 时是死的）——切页即渲染（幂等：图已载不重载）。
+  if (a.dataset.tab === "overlay") { try { ovBindSkin(); } catch (_) {} }
   // 【八十六修·全页实时生效】「保存并应用」只在整句模型页显示（权重
   // 调参按用户拍板保留显式保存语义）；其余页全部改动即存（防抖 400ms
   // 自动 saveConfig），与皮肤页同款实时生效——全局按钮在这些页只会
