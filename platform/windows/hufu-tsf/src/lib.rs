@@ -408,10 +408,10 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     // 实时框左缘 1-2px 竖笔画疑为编码字符越窗，空串对照可分离。
     let dump_code = std::env::var("HUFU_SKIN_DUMP_CODE").unwrap_or_else(|_| "jd".to_string());
     w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
-    // 【动效完成等待 2026-10-16】入场滑动/伸缩几百 ms——120ms 抓的是
-    // 动效中间帧（外壳仍在插值、内容仍在滑），设置页实时框的左缘竖
-    // 线实为动效中间态残影（真窗动效播完即无）。等 900ms 取稳态帧。
-    std::thread::sleep(std::time::Duration::from_millis(900));
+    // 【出图提速 2026-10-16】readback 模式下 size_anim/chrome_override
+    // 在 show() 内即被清（首帧=稳态帧，无动效插值）——900ms 长等是
+    // BMP 头错位时期的误判残留。120ms 只留给渲染/回读收尾。
+    std::thread::sleep(std::time::Duration::from_millis(120));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;

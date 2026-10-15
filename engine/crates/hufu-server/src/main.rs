@@ -194,6 +194,9 @@ fn main() {
         eprintln!("数据目录不可创建: {e}");
         std::process::exit(1);
     }
+    // 【渲染缓存 2026-10-16】ssf-render 锁前分发拿不到 Host——数据目录
+    // 存全局供指纹计算（皮肤缓存目录/overrides/config 的 stat）。
+    let _ = DATA_DIR.set(data_dir.clone());
     // 【单实例互斥 2026-09-11】此前靠 4390 端口 bind 冲突兜底，但管道
     // 线程先于 HTTP 启动 → 双实例并存窗口期（双 pipe、双托盘消息窗）。
     // 命名互斥体进程级兜底：已存在即本进程直接退（老实例继续服务）。
@@ -1007,7 +1010,76 @@ fn ssf_render_endpoint() -> Response {
 /// `query_id`：要渲染的 ssf 皮肤 id（设置页传正在编辑的皮肤；None=
 /// 当前上位）。经 HUFU_SKIN_DUMP_ID → DLL skin_for_render 拉指定皮肤
 /// payload（含其 overrides；顶层 overlay 剥除，实时框只画候选窗本体）。
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// 【渲染缓存 2026-10-16】key=皮肤 id（None=当前上位）；value=(指纹,
+/// BMP)。指纹=皮肤缓存目录全部文件 stat + config.json 内容——皮肤/
+/// 设置/上位变化自动失效。命中=零渲染直返（二次访问即时出图）。
+static RENDER_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 渲染指纹：目录内文件 (len, mtime_ms) 序列 + config.json 内容 hash。
+fn render_fingerprint(dir: &std::path::Path, with_config: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if let Ok(md) = std::fs::metadata(&p) {
+            p.to_string_lossy().hash(&mut h);
+            md.len().hash(&mut h);
+            md.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+                .hash(&mut h);
+        }
+    }
+    if with_config {
+        if let Some(root) = DATA_DIR.get() {
+            if let Ok(c) = std::fs::read(root.join("config.json")) {
+                c.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 fn ssf_render_inner(query_id: Option<&str>) -> Response {
+    // 【渲染缓存 2026-10-16】命中直返（皮肤/设置/上位未变时零渲染）。
+    // None（当前上位）→ 读 config 定位皮肤目录 + config 内容进指纹；
+    // 指定 id → 皮肤目录 stat 即指纹（payload 的 overrides 就存那）。
+    let cache_key = query_id.unwrap_or("__current__").to_string();
+    let skin_dir_for_fp: Option<std::path::PathBuf> = if query_id.is_some() {
+        DATA_DIR.get().map(|d| crate::ssf::ssf_cache_root(d).join(query_id.unwrap()))
+    } else {
+        // 当前上位：config.json 的 skin/skin_kind（非 ssf 上位不缓存）
+        DATA_DIR.get().and_then(|d| {
+            std::fs::read(d.join("config.json")).ok().and_then(|b| {
+                serde_json::from_slice::<serde_json::Value>(&b).ok().and_then(|v| {
+                    let kind = v.pointer("/appearance/skin_kind").and_then(|x| x.as_str())?.to_string();
+                    if kind != "ssf" {
+                        return None;
+                    }
+                    let id = v.pointer("/appearance/skin").and_then(|x| x.as_str())?.to_string();
+                    Some(crate::ssf::ssf_cache_root(d).join(id))
+                })
+            })
+        })
+    };
+    if let Some(dir) = skin_dir_for_fp.clone() {
+        let fp = render_fingerprint(&dir, query_id.is_none());
+        if let Some((c_fp, bmp)) = RENDER_CACHE.lock().unwrap().get(&cache_key) {
+            if *c_fp == fp {
+                return Response { status: 200, content_type: "image/bmp".into(), body: bmp.clone() };
+            }
+        }
+    }
     // 渲染专用副本优先（hufu_tsf_render.dll 不被 TSF 进程加载，可随时
     // 替换更新；hufu_tsf.dll 是注册输入法本体，被 explorer/QQ 等全进程
     // 持有，拷不进去——只做兜底）。
@@ -1056,6 +1128,7 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
             return match std::fs::read(&out) {
                 Ok(b) => {
                     let _ = std::fs::remove_file(&out);
+                    store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
                     Response { status: 200, content_type: "image/bmp".into(), body: b }
                 }
                 Err(_) => Response::err(500, "渲染输出读取失败"),
@@ -1072,7 +1145,6 @@ if ('{rid}' -ne '') {{ $env:HUFU_SKIN_DUMP_ID = '{rid}' }}
 $cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
 try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
 try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
-Start-Sleep -Milliseconds 900
 "#,
         out = out.display(),
         rid = query_id.unwrap_or(""),
@@ -1107,9 +1179,26 @@ Start-Sleep -Milliseconds 900
     match std::fs::read(&out) {
         Ok(b) => {
             let _ = std::fs::remove_file(&out);
+            store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
             Response { status: 200, content_type: "image/bmp".into(), body: b }
         }
         Err(_) => Response::err(500, "渲染输出读取失败"),
+    }
+}
+
+/// 渲染成功后入缓存（指纹现算——渲染期间文件变了也能存对版本）。
+fn store_render_cache(
+    skin_dir: &Option<std::path::PathBuf>,
+    with_config: bool,
+    key: &str,
+    bmp: &[u8],
+) {
+    if let Some(dir) = skin_dir {
+        let fp = render_fingerprint(dir, with_config);
+        RENDER_CACHE
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (fp, bmp.to_vec()));
     }
 }
 

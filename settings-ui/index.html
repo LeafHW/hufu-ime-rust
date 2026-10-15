@@ -1938,11 +1938,10 @@ async function loadSsfSkin(id) {
     // 离谱、无预览字——用户实锤）。渲染「这个皮肤」的候选窗位图
     //（?id= 指定——矢量模式下浏览独立皮肤页也显示独立皮肤的样子，
     // 不再显示成当前矢量皮肤——用户实锤）。含其 overrides，所见即
-    // 该皮肤打字所得。
-    img.src = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
-    img.style.display = "";
+    // 该皮肤打字所得。【无感加载】预加载完成后才切 src，旧图保持。
+    setSsfImg(img, "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now(), true);
     none.style.display = "none";
-    $("#ssf-material-note").textContent = "真实候选窗（当前皮肤+显示设置实时渲染）；出图约 2-3 秒，改动后自动刷新。";
+    $("#ssf-material-note").textContent = "真实候选窗（当前皮肤+显示设置实时渲染）；改动后自动刷新。";
   }
   // 【独立皮肤设置 2026-10-16】拉 per-skin 覆盖填表单（颜色控件吃
   // #RRGGBB；覆盖值优先，否则显示皮肤原值做基准）。
@@ -1992,8 +1991,9 @@ async function ssfSettingsSaveNow(quiet) {
     $("#ssfv-note").textContent = `已生效 ${t}`;
     // 【mock 即时跟随 2026-10-16】字号/字体/颜色/横竖排/序号一变，
     // 皮肤子分页素材预览 + 挂件页实时框的「真实候选窗」同步重排
+    //（2026-10-16：素材区改预加载切换，加载期间旧图保持不闪空白）
     const pi = $("#ssf-preview-img");
-    if (pi && pi.style.display !== "none") pi.src = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
+    if (pi && pi.style.display !== "none") setSsfImg(pi, "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now());
     if (SKIN_CURRENT_KIND === "ssf") {
       refreshSsfMock($("#candwin-preview")).catch(() => {});
       refreshSsfMock($("#ov-candmock"), () => ovPreview()).catch(() => {});
@@ -2148,20 +2148,46 @@ function ssfMockDom(m) {
 /* 【SSF 真实候选窗 mock 2026-10-16·终版】直接用 DLL 真渲染位图
    （/api/skin/ssf-render：server spawn 生产 DLL 的 dump 导出，连
    server 拉当前皮肤+设置真渲染——九宫格/字体/四色/横竖排/序号所见
-   即打字所得）。~2-3s 出图，即改即存后刷新。挂件页实时框同源。 */
+   即打字所得）。即改即存后刷新。挂件页实时框同源。
+   【加载无感 2026-10-16】预加载完毕才替换显示（旧图保持到新图就
+   续，不闪占位/空白）；连续触发只认最后一次（过期结果丢弃）。 */
+let SSF_RENDER_SEQ = 0;
 async function refreshSsfMock(host, onReady) {
   const id = $("#ssf-select").value || "";
   if (!id) return;
+  const url = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
+  const seq = ++SSF_RENDER_SEQ;
+  let ok = false;
+  try {
+    await new Promise((res, rej) => {
+      const pre = new Image();
+      pre.onload = res; pre.onerror = rej; pre.src = url;
+    });
+    ok = true;
+  } catch (_) {}
+  if (seq !== SSF_RENDER_SEQ) return; /* 已有更新的请求：丢弃本次 */
+  if (!ok) {
+    host.innerHTML = `<div style="padding:16px 22px;border-radius:8px;background:#2a2c33;color:#99a">真实渲染失败（未找到 DLL 或渲染超时）</div>`;
+    return;
+  }
   host.className = "";
   host.style.cssText = "";
   host.innerHTML =
-    `<img src="/api/skin/ssf-render?id=${encodeURIComponent(id)}&t=${Date.now()}" ` +
+    `<img src="${url}" ` +
     `style="display:block;max-width:min(100%,420px);image-rendering:auto" alt="真实候选窗">`;
-  const img = host.querySelector("img");
-  img.addEventListener("load", () => { if (onReady) onReady(); });
-  img.addEventListener("error", () => {
-    host.innerHTML = `<div style="padding:16px 22px;border-radius:8px;background:#2a2c33;color:#99a">真实渲染失败（未找到 DLL 或渲染超时）</div>`;
-  });
+  host.querySelector("img").addEventListener("load", () => { if (onReady) onReady(); });
+}
+/* 已在文档里的 <img> 换图：预加载完成后才切 src（加载期间保持旧图）。
+   show=true 时连同 display 一并就绪后才显示（src 空着露出 alt 不好看）。 */
+function setSsfImg(img, url, show) {
+  const seq = ++SSF_RENDER_SEQ;
+  const pre = new Image();
+  pre.onload = () => {
+    if (seq !== SSF_RENDER_SEQ) return;
+    img.src = url;
+    if (show) img.style.display = "";
+  };
+  pre.src = url;
 }
 /* 【SSF 字体下拉 2026-10-16】与矢量皮肤 ap-font 同数据源（/api/fonts
    本机简中字体+default 霞鹜/雅黑）。cur=override 值（空=自动项）；

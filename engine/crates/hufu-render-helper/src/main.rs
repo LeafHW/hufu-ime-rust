@@ -28,11 +28,10 @@ fn main() {
             eprintln!("GetProcAddress(hufu_test_skin_dump) failed");
             std::process::exit(1);
         }
-        // dump 生成+落盘在 DLL 内同步完成（含 0ms hold）——900ms 兜底
-        // 等子线程收尾（与 PS 驱动同款节拍）。
+        // dump 生成+落盘在 DLL 内同步完成（含 0ms hold）——返回即
+        // BMP 已写盘，无需再等（早前 900ms 是对 DLL 内部时序的误判）。
         let dump: unsafe extern "system" fn(u32) -> i32 = std::mem::transmute(proc);
         let r = dump(0);
-        std::thread::sleep(std::time::Duration::from_millis(900));
         windows_sys::FreeLibrary(h);
         if r == 0 {
             std::process::exit(2);
