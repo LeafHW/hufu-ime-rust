@@ -1546,12 +1546,27 @@ impl CandidateWindowV2 {
                 unsafe {
                     let _ = KillTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID);
                 }
+                crate::tsf::trace("ssf: 载荷非 ssf 形态 → 切回 JSON 矢量渲染");
             }
             *self.ssf.borrow_mut() = None; // 切回 JSON：释放（进程解码缓存留 LRU）
             return None;
         }
-        let spec = crate::ssfwin::SsfSkinSpec::parse(skin)?;
-        let layout = spec.choose(vertical, has_code, has_candidates)?.clone();
+        let spec = match crate::ssfwin::SsfSkinSpec::parse(skin) {
+            Some(s) => s,
+            None => {
+                crate::tsf::trace("ssf: 载荷解析失败 → 回退矢量（缺 cache_dir/fp？）");
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
+        let layout = match spec.choose(vertical, has_code, has_candidates) {
+            Some(l) => l.clone(),
+            None => {
+                crate::tsf::trace("ssf: 变体选择失败 → 回退矢量");
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
         let bitmap = match crate::ssfwin::load_bitmap(&spec.cache_dir, &spec.fp, &layout.image) {
             Ok(b) => b,
             Err(e) => {
@@ -1580,6 +1595,16 @@ impl CandidateWindowV2 {
         let mut rt = self.ssf.borrow_mut();
         let reuse = matches!(rt.as_ref(), Some(r) if r.key == key);
         if !reuse {
+            // 观测：换装一次一条（键变化才打——每帧静默）
+            crate::tsf::trace(&format!(
+                "ssf: 载入 fp={} 图={} 位图={}x{} 帧={} scale={:.3}",
+                &spec.fp[..spec.fp.len().min(12)],
+                &layout.image,
+                bitmap.width,
+                bitmap.height,
+                bitmap.frames.len(),
+                scale,
+            ));
             *rt = Some(SsfRuntime {
                 spec: spec.clone(),
                 bitmap: bitmap.clone(),

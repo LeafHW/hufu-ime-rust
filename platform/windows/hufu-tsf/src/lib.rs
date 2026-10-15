@@ -317,11 +317,134 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     }
 }
 
+/// 测试钩子：按【当前生产皮肤】渲染候选窗一帧——离屏回读像素写 BMP
+/// + 可选保持显示（hold_ms>0 时窗口停留供实机观察）。皮肤载荷经 ipc
+/// 从 hufu-server 拉当前选中皮肤（SSF/JSON 双形态原样），不改材质不覆
+/// 盖任何字段——与真实打字路径同一条 show() 代码。BMP 落
+/// %TEMP%\hufu-skin-dump.bmp（32bpp BI_RGB，行自底向上）。返回 1=通。
+/// （HUFU_SKIN_DUMP 环境变量可覆盖输出路径。）
+#[no_mangle]
+extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    let Some(mut w) = CandidateWindowV2::new() else {
+        eprintln!("skin-dump: 候选窗初始化失败");
+        return 0;
+    };
+    let Some(skin) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+        eprintln!("skin-dump: 引擎皮肤拉取失败（server 在线？）");
+        return 0;
+    };
+    let cands = vec![
+        ("基础".to_string(), "jichu".to_string()),
+        ("几点".to_string(), "".to_string()),
+        ("记得".to_string(), "少用".to_string()),
+        ("街道".to_string(), "jie dao".to_string()),
+    ];
+    // 锚点：取前台焦点窗口客户区中下——host 门要求锚点落在焦点窗口内
+    // （防跨应用误画的安全门），否则 show 会被 SW_HIDE 拦截。
+    let mut anchor = windows::Win32::Foundation::RECT {
+        left: 420,
+        top: 420,
+        right: 420,
+        bottom: 446,
+    };
+    unsafe {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetForegroundWindow};
+        let fg = GetForegroundWindow();
+        if fg.0 != std::ptr::null_mut() {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            if GetClientRect(fg, &mut rc).is_ok() {
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: (rc.right - rc.left) / 2,
+                    y: (rc.bottom - rc.top) * 2 / 3,
+                };
+                if ClientToScreen(fg, &mut pt).as_bool() {
+                    anchor = windows::Win32::Foundation::RECT {
+                        left: pt.x,
+                        top: pt.y,
+                        right: pt.x,
+                        bottom: pt.y + 26,
+                    };
+                }
+            }
+        }
+    }
+    eprintln!("skin-dump: anchor=({},{})", anchor.left, anchor.top);
+    w.readback = true;
+    w.show(&cands, "jd", &skin, Some(&anchor), 0);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let px = w.last_pixels.take();
+    let (wq, hq) = w.last_size;
+    w.readback = false;
+    if hold_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
+    }
+    w.hide();
+    let Some(px) = px else {
+        eprintln!("skin-dump: 回读失败");
+        return 0;
+    };
+    // 32bpp → 24bpp（观察用途，砍掉 alpha 通道避免看图器把它当透明蒙版）
+    let src_stride = (wq as usize) * 4;
+    let row = (wq as usize) * 3;
+    let pad = (4 - (row % 4)) % 4;
+    let data_sz = ((row + pad) * hq as usize) as u32;
+    let mut bmp: Vec<u8> = Vec::with_capacity(54 + data_sz as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(54u32 + data_sz).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(wq as i32).to_le_bytes());
+    bmp.extend_from_slice(&(hq as i32).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&24u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&data_sz.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    // BGRA → BGR，白底合成（alpha<255 处混白，肉眼可判透明度分布）
+    for y in (0..hq as usize).rev() {
+        let base = y * src_stride;
+        for x in 0..wq as usize {
+            let i = base + x * 4;
+            let a = px[i + 3] as u32;
+            let mix = |c: u8| -> u8 {
+                let v = (c as u32 * a + 255 * (255 - a)) / 255;
+                v.min(255) as u8
+            };
+            bmp.push(mix(px[i]));
+            bmp.push(mix(px[i + 1]));
+            bmp.push(mix(px[i + 2]));
+        }
+        for _ in 0..pad {
+            bmp.push(0);
+        }
+    }
+    let path = std::env::var("HUFU_SKIN_DUMP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hufu-skin-dump.bmp"));
+    match std::fs::write(&path, &bmp) {
+        Ok(()) => {
+            eprintln!("skin-dump: {wq}x{hq} → {}", path.display());
+            1
+        }
+        Err(e) => {
+            eprintln!("skin-dump: 写盘失败 {e}");
+            0
+        }
+    }
+}
+
 /// 测试钩子：驱动候选窗 v2（D3D11+DComp+D2D）完整渲染一帧。
 /// 返回 1 = 管线全通（设备/链/渲染/Present），0 = 初始化或渲染失败。
 #[no_mangle]
-extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
-    use crate::candwin2::CandidateWindowV2;
+extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {    use crate::candwin2::CandidateWindowV2;
     let Some(mut w) = CandidateWindowV2::new() else {
         eprintln!("candwin2: 初始化失败（回退 v1 路径可用）");
         return 0;
