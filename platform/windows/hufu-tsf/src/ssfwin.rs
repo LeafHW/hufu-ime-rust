@@ -487,8 +487,12 @@ pub unsafe fn draw_nineslice(
         ));
     }
     let snap = |v: f32| -> f32 {
+        // 【snap 单位修 2026-10-16】dpi 参数=显示缩放比（1.0/1.25/1.5），
+        // 物理像素= DIP×dpi。旧式 round(v*dpi/96)*96/dpi 是「DPI 原值
+        // （96 基准）」语义——比值传入时把目标边全吸到 96px 网格
+        //（100% 缩放下 143→96、202→192，7/9 块塌缩被吞）。
         if dpi > 0.0 && dpi.is_finite() {
-            (v * dpi / 96.0).round() * 96.0 / dpi
+            (v * dpi).round() / dpi
         } else {
             v
         }
@@ -503,6 +507,13 @@ pub unsafe fn draw_nineslice(
             };
             if dst.right <= dst.left || dst.bottom <= dst.top {
                 continue;
+            }
+            if crate::tsf::trace_on() {
+                let (xs, xl, ys, yl) = (x.source, x.source_length, y.source, y.source_length);
+                crate::tsf::trace(&format!(
+                    "ssf9blk: src(x{xs:.0}+{xl:.0} y{ys:.0}+{yl:.0}) → dst({:.1},{:.1})-({:.1},{:.1})",
+                    dst.left, dst.top, dst.right, dst.bottom
+                ));
             }
             let src = D2D_RECT_F {
                 left: x.source,

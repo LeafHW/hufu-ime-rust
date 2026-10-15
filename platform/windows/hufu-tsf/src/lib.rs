@@ -330,7 +330,7 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         eprintln!("skin-dump: 候选窗初始化失败");
         return 0;
     };
-    let Some(skin) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+    let Some(mut skin) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
         eprintln!("skin-dump: 引擎皮肤拉取失败（server 在线？）");
         return 0;
     };
@@ -375,19 +375,21 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     // → 编码行永不画（生产=编码走宿主内联，正确）。但 SSF 皮肤的
     // code insets（编码框）只有在关内联时才有意义——取证时注入
     // inline_preedit=false 模拟该用户档，同帧验证编码行锚定。
+    // HUFU_SKIN_DUMP=1 注入（V1 编码路径）；=2 不注入（V2 生产主路径）。
     // 双形态强插（顶层 layout / skin.layout——载荷包皮不确定）。
-    let mut skin = skin;
-    let flag = serde_json::Value::Bool(false);
-    if let Some(obj) = skin.as_object_mut() {
-        obj.entry("layout")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
-        if let Some(sk) = obj.get_mut("skin").and_then(|s| s.as_object_mut()) {
-            sk.entry("layout")
+    if std::env::var("HUFU_SKIN_DUMP_V2").is_err() {
+        let flag = serde_json::Value::Bool(false);
+        if let Some(obj) = skin.as_object_mut() {
+            obj.entry("layout")
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
                 .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+            if let Some(sk) = obj.get_mut("skin").and_then(|s| s.as_object_mut()) {
+                sk.entry("layout")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+            }
         }
     }
     w.readback = true;
@@ -406,11 +408,23 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     if hold_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
     }
+    eprintln!("skin-dump: pre-hide");
+    let prog = |tag: &str| {
+        let _ = std::fs::write(
+            "E:\\DSH-KF\\.tmp-test\\dump-progress.txt",
+            format!("{tag} @ {}\n", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)),
+        );
+    };
+    prog("pre-hide");
     w.hide();
+    prog("post-hide");
     let Some(px) = px else {
         eprintln!("skin-dump: 回读失败");
         return 0;
     };
+    eprintln!("skin-dump: px={}B", px.len());
+    prog("px-ok");
     // 32bpp → 24bpp（观察用途，砍掉 alpha 通道避免看图器把它当透明蒙版）
     let src_stride = (wq as usize) * 4;
     let row = (wq as usize) * 3;
@@ -457,6 +471,7 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
         .unwrap_or_else(|| std::env::temp_dir().join("hufu-skin-dump.bmp"));
     match std::fs::write(&path, &bmp) {
         Ok(()) => {
+            prog("bmp-written");
             eprintln!("skin-dump: {wq}x{hq} → {}", path.display());
             1
         }

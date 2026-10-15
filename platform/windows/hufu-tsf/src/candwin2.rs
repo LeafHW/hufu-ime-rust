@@ -3405,14 +3405,12 @@ impl CandidateWindowV2 {
         let ssf = self.ssf_prepare(
             skin,
             !horizontal_early,
-            // 【变体选择修正 2026-10-15】皮肤作者按搜狗「框内恒显编码」
-            // 设计：常规变体（vertical/horizontal）的 insets 才是有效
-            // 布局（候选顶/编码底）；*_candidates 后缀变体普遍退化
-            // （top>bottom 倒置，元气虎娘实锤 730/364）。T8 内联开=raw
-            // 恒空——若据此判 has_code=false 会误入退化变体。语义改为
-            // 「窗有内容（编码或候选任一）即常规变体」，纯编码窗仍走
-            // Code 变体。
-            !raw.is_empty() || !cands.is_empty() || freq_view.is_some(),
+            // 【虎娘变体语义 2026-10-16 逆】layoutMode 6（默认竖排无编码）
+            // → skinPart=2 → VerticalCandidates（V2 zhongwen：候选从
+            // code.top 起——元气虎娘 730 正是底部面板，非退化数据）；
+            // 编码可见（raw 非空=mode 4 语义）→ Vertical（V1 编码+候选）。
+            // 调频模态提示行=类编码 → V1。
+            !raw.is_empty() || freq_view.is_some(),
             !cands.is_empty(),
         );
         let skin_proj: Value;
@@ -3786,6 +3784,24 @@ impl CandidateWindowV2 {
                 };
             let dy;
             let dy_key = (font_face.clone(), font_pt);
+            // 【SSF 虎娘行槽】源域行高测量：虎娘 row=ceil(max(字号,
+            // "中Mg"行高))（layoutSkin L19-20）。此处用当前 tf（用户
+            // 字号）测同一串的行高——线性除回源域（=源字号行高）。
+            // 渲染行槽=源行高×scale（像素域）。
+            let row_user = {
+                let ws: Vec<u16> = "中Mg".encode_utf16().collect();
+                match &tf {
+                    Some(t) => dwrite
+                        .CreateTextLayout(&ws, t, 100000.0, 100000.0)
+                        .ok()
+                        .and_then(|l| {
+                            let mut m = DWRITE_TEXT_METRICS::default();
+                            l.GetMetrics(&mut m).ok().map(|_| m.height)
+                        }),
+                    None => None,
+                }
+                .unwrap_or(font_pt * 96.0 / 72.0 * 1.35)
+            };
             if let Some((k, v)) = &dy_cache_in {
                 if *k == dy_key {
                     dy = *v;
@@ -3930,39 +3946,74 @@ impl CandidateWindowV2 {
                 tf_label,
                 tf_small,
                 cand_ws,
-                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)),
+                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w, row_user)),
             )
         };
-        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w) = geo.1;
+        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w, row_user) = geo.1;
         let cmt_disp = geo.0;
+        // 【SSF 虎娘行槽/文字列锚 2026-10-16】皮肤模式行槽=源行高×scale
+        //（虎娘 row=ceil(max(皮肤字号,"中Mg"行高))，布局在源域、渲染
+        // ×scale；row_user=用户字号现测行高，线性等价）。胶囊已透明化，
+        // pill_h 不参与撑高。文字列 x=candidates.left×scale（虎娘
+        // layoutSkin L43 x=m.left）。竖排行距=line_spacing×scale（虎娘
+        // L48 y+=lineSpacing；candidate_spacing 只横排 gap 用）。
+        let row_h = if ssf.is_some() {
+            row_user.max(1.0)
+        } else {
+            row_h
+        };
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
         // 【按住Ctrl调频 2026-11】模态提示行恒占独立行（横排也是——
         // 提示文案较长，与候选同行会把候选推得很远）。
-        // 【SSF insets 布局 2026-10-15】编码行不占候选区顶部槽——按变体
-        // code insets 锚在窗口底部（画在底固定区的功能区条上），
-        // 候选行从 candidates.top×scale 锚起（原 JSON 布局 rm_y 一套
-        // 全部让位；freq 模态提示行维持旧行为占顶行）。
+        // 【SSF 虎娘同构布局 2026-10-16 逆 CandidateRendererSkin.cpp】
+        // 虎娘 layoutSkin 语义：布局在皮肤源画布域完成（字号=皮肤
+        // font_size、insets/行距=源值），窗口按内容撑大（硬底=图尺寸），
+        // 输出整体 ×scale。V1 合体变体单窗序列：
+        //   y=code.top → 编码行（x=code.left，右垫 code.right）
+        //   y+=row+code.bottom → y+=cand.top → 候选行们
+        //   y+=cand.bottom → height=max(min_height, y)
+        // 渲染锚（像素域）=源坐标×scale。旧「底锚/段位」分支全撤。
         let ssf_layout_geo = ssf.as_ref().map(|f| {
+            let c = &f.layout.candidates;
+            let e = &f.layout.code;
             (
-                f.layout.candidates.top as f32,  // 源px
-                f.layout.code.top as f32,        // 源px
-                f.layout.candidates.left as f32, // 源px
-                f.bitmap.height as f32,          // 源px
+                e.top as f32,        // 编码行 y（源）
+                (e.top.max(0) as f32) + (e.bottom.max(0) as f32), // 编码槽推进量（+row）
+                e.left as f32,       // 编码行 x（源）
+                c.top as f32,        // 候选区相对编码槽底的偏移（源）
+                c.left as f32,       // 候选/编码共用文字列 x（源）
+                (c.left.max(0) as f32) + (c.right.max(0) as f32), // 文字行左右 marge 和（源）
+                f.layout.min_width(f.bitmap.width),
+                f.layout.min_height(f.bitmap.height),
+                f.spec.display.line_spacing, // 源行距（竖排行间）
                 f.scale,
-                f.layout.vertical.before as f32, // 源px（顶段界）
-                f.layout.vertical.after as f32,  // 源px（底段高）
             )
         });
-        let code_row = if freq_view.is_some() {
+        // 【SSF 文字列锚/行距】文字列 x=candidates.left×scale（虎娘
+        // layoutSkin L43 x=m.left）。竖排行距=line_spacing×scale（虎娘
+        // L48 y+=lineSpacing；candidate_spacing 只横排 gap 用）。
+        let (text_x, cand_spacing) = match ssf_layout_geo {
+            Some((_, _, _, _, cleft, _, _, _, lsp, sc)) => {
+                let tx = cleft.max(0.0) * sc;
+                let sp = if horizontal {
+                    cand_spacing
+                } else {
+                    lsp.max(0.0) * sc
+                };
+                (tx, sp)
+            }
+            None => (text_x, cand_spacing),
+        };
+        let code_row = if ssf_layout_geo.is_some() {
+            // 【SSF 虎娘 V1/V2】编码行/调频提示行有自己的源域锚
+            //（code.top），不占 JSON 顶部行槽；height/y0 全部由
+            // ssf_y0_src 源域公式驱动。
+            0.0
+        } else if freq_view.is_some() {
             1.0
         } else if raw.is_empty() || horizontal {
             0.0
-        } else if let Some((_, etop, _, img_h, _, _, va)) = ssf_layout_geo {
-            // 【SSF 编码段位】code.top 在底段（元气虎娘 730 型）→ 编码行
-            // 底锚窗底固定区，不占候选顶槽；顶段/中带（光点与星海/
-            // 小喵风扇 code.top=21 型）→ JSON 原生顶部槽（height/y0 同源）。
-            if etop >= (img_h - va) { 0.0 } else { 1.0 }
         } else {
             1.0
         };
@@ -3977,42 +4028,71 @@ impl CandidateWindowV2 {
             let rows = cands.len().min(10) as f32 + code_row;
             rm_y * 2.0 + row_h * rows + cand_spacing * (rows - 1.0).max(0.0)
         };
-        // ──【SSF M2】画布硬底（九宫格不退化的最小窗）──
-        // w ≥ max(图宽, 水平刀口和+1)×scale；h ≥ max(图高, 垂直刀口和
-        // +1)×scale 且恒 ≥ 图高×scale（真皮肤横排「高恒=图高」、虎娘大
-        // 图在内容超出时中段拉伸）。见 _dll接入方案.md §2.2。注释列右
-        // 缘随新宽平移（保持右对齐）。
+        // ──【SSF 虎娘同构窗口尺寸 2026-10-16】width/height 在源画布域
+        // 按内容撑大（硬底=图尺寸/刀口和），输出 ×scale。内容宽=候选
+        // 各行（含行内注释）与编码行的最大 right（源域）。窗口高按
+        // V1 序列推进：编码槽(row+code.bottom)+候选区(top+n·row+
+        // (n-1)·line_spacing+bottom)。旧「底锚/编码块」分支全撤。
         let (width, cmt_x) = match &ssf {
             Some(f) => {
-                let lw = f.layout.min_width(f.bitmap.width) * f.scale;
-                let w2 = width.max(lw).min(w_cap); // 超屏封顶仍守（防大图出屏）
+                let sc = f.scale;
+                let content_user = {
+                    let mut m = raw_w;
+                    for (tw, cw, iw) in cand_ws.iter() {
+                        m = m.max(iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 });
+                    }
+                    m
+                };
+                let text_right_src = f.layout.candidates.left.max(0) as f32
+                    + content_user / sc
+                    + f.layout.candidates.right.max(0) as f32;
+                let w_src = f
+                    .layout
+                    .min_width(f.bitmap.width)
+                    .max(text_right_src);
+                let w2 = (w_src * sc).min(w_cap); // 超屏封顶仍守（防大图出屏）
                 let dx = w2 - width;
                 (w2, cmt_x + dx)
             }
             None => (width, cmt_x),
         };
+        // ──【SSF 虎娘同构布局参数】源域行槽与候选首行 y（V1/V2 双态，
+        // 与下方 height 公式同源；渲染锚 y0=y0_src×scale）。
+        let ssf_row_src = ssf.as_ref().map(|f| row_user / f.scale);
+        let ssf_y0_src = match (&ssf, ssf_row_src) {
+            (Some(f), Some(rs)) => Some(
+                if !raw.is_empty() || freq_view.is_some() {
+                    f.layout.code.top.max(0) as f32
+                        + rs
+                        + f.layout.code.bottom.max(0) as f32
+                        + f.layout.candidates.top.max(0) as f32
+                } else {
+                    f.layout.candidates.top.max(0) as f32
+                },
+            ),
+            _ => None,
+        };
         let height = match &ssf {
             Some(f) => {
-                let lh_min = f.layout.min_height(f.bitmap.height) * f.scale;
-                let img_h = f.bitmap.height as f32 * f.scale;
-                // 【SSF 编码块】仅当 code.top 落在底段（≥图高-va）时编码行
-                // 底锚窗底（元气虎娘 730 型）：高度=JSON 布局高−对称底
-                // margin+编码块（(图高-code.top)×scale+2.5）。顶段编码
-                //（光点与星海/小喵风扇 code.top=21 型）走普通高度。
-                let bottom_anchored = f.layout.code.top as f32
-                    >= (f.bitmap.height as f32 - f.layout.vertical.after.max(0) as f32);
-                let code_block = (f.bitmap.height as f32
-                    - f.layout.code.top.max(0) as f32)
-                    * f.scale
-                    + 2.5;
-                let v = if bottom_anchored {
-                    (height - rm_y + code_block).max(lh_min).max(img_h)
-                } else {
-                    height.max(lh_min).max(img_h)
-                };
+                let sc = f.scale;
+                let row_src = row_user / sc;
+                let n = cands.len().min(10) as f32;
+                let cand_bottom = f.layout.candidates.bottom.max(0) as f32;
+                let lsp = f.spec.display.line_spacing.max(0.0);
+                let y0_src = ssf_y0_src.unwrap_or(0.0);
+                let y_end = y0_src
+                    + if horizontal {
+                        row_src + cand_bottom
+                    } else {
+                        n * row_src + ((n - 1.0).max(0.0)) * lsp + cand_bottom
+                    };
+                let v = (f.layout.min_height(f.bitmap.height).max(y_end) * sc)
+                    .max(1.0);
                 crate::tsf::trace(&format!(
-                    "ssfgeo: 布局h={:.1} 编码块={:.1} 底锚={} 硬底={:.1} → 取{:.1}（横排={}）",
-                    height, code_block, bottom_anchored, lh_min, v, horizontal
+                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} row_src={:.0} 编码={}）",
+                    y0_src, y_end,
+                    f.layout.min_height(f.bitmap.height), v, horizontal, row_src,
+                    !raw.is_empty()
                 ));
                 v
             }
@@ -4877,25 +4957,16 @@ impl CandidateWindowV2 {
                     //（底固定区功能区条，如元气虎娘底部米色圆角条）：
                     // y = 内容高 - (图高 - code.top)×scale，x = candidates.left×scale。
                     if !raw.is_empty() {
-                        // 【SSF insets 布局】编码行锚底部 code insets：画在底
-                        // 固定区功能区条上（如元气虎娘米色圆角条）。
-                        // y = 内容高-(图高-code.top)×scale；x = candidates.left×scale。
+                        // 【SSF 虎娘 V1 编码锚 2026-10-16】编码行 y=code.top
+                        // ×scale（源坐标线性映射——V1 变体语义，layoutSkin
+                        // L33）；x=code.left×scale。旧「分段 MapY/底锚」撤。
                         let (code_x, code_y) = match ssf_layout_geo {
-                            Some((_, etop, cleft, img_h, sc, vb, va)) => {
-                                // 分段 MapY：顶段（etop<vb）线性；底段
-                                //（etop≥img_h-va）底锚；中带按 vb 锚。
-                                let cy = if etop < vb {
-                                    etop * sc
-                                } else if etop >= (img_h - va) {
-                                    height - (img_h - etop) * sc
-                                } else {
-                                    vb * sc
-                                };
+                            Some((etop, _, eleft, _, _, _, _, _, _, sc)) => {
                                 crate::tsf::trace(&format!(
-                                    "ssflay: 编码行锚 x={:.1} y={:.1}（height={:.1} etop={:.0} sc={:.3}）raw_len={}",
-                                    cleft * sc, cy, height, etop, sc, raw.len()
+                                    "ssflay: 编码行锚 x={:.1} y={:.1}（etop={:.0} sc={:.3}）raw_len={}",
+                                    eleft * sc, etop * sc, etop, sc, raw.len()
                                 ));
-                                (cleft * sc, cy)
+                                (eleft * sc, etop * sc)
                             }
                             _ => (rm_x, rm_y + dy),
                         };
@@ -4946,11 +5017,16 @@ impl CandidateWindowV2 {
                     // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
                     // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
                     // 布置。
-                    // 【SSF insets 布局】竖排候选首行锚=candidates.top×scale
-                    //（皮肤设计框顶）；JSON 皮肤维持 rm_y 语义。
-                    // y0=rm_y：SSF 由投影 margin_y=candidates.top×scale 驱动
-                    //（ssf_project_skin insets 投影 2026-10-15）。
-                    let y0 = rm_y + (row_h + cand_spacing) * code_row;
+                    // 【SSF 虎娘候选锚 2026-10-16】y0=源域候选首行 y×scale
+                    //（V1=code.top+row+code.bottom+cand.top；V2=cand.top，
+                    // 与 height 公式同源 ssf_y0_src）。JSON 皮肤旧语义。
+                    let y0 = match ssf_y0_src {
+                        Some(y0s) => {
+                            let sc = ssf.as_ref().map(|f| f.scale).unwrap_or(1.0);
+                            y0s * sc
+                        }
+                        None => rm_y + (row_h + cand_spacing) * code_row,
+                    };
 
                     // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
                     // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
@@ -5317,24 +5393,43 @@ impl CandidateWindowV2 {
                                     bl_use,
                                 );
                             }
+                            // 文本列宽：SSF=候选词实测宽（注释并串跟随，
+                            // 虎娘行内注释语义）；JSON=到注释列左界。
+                            let tw_i = cand_ws
+                                .get(i)
+                                .map(|(tw, _, _)| *tw)
+                                .unwrap_or(0.0);
+                            let text_col_w = if ssf.is_some() {
+                                tw_i.max(8.0)
+                            } else {
+                                cmt_x - text_x - 4.0
+                            };
                             draw(
                                 &ctx,
                                 &tf,
                                 text,
                                 text_x,
                                 y + dy,
-                                cmt_x - text_x - 4.0,
+                                text_col_w,
                                 row_h,
                                 bt,
                             );
                             if !cmt.is_empty() {
+                                // 【SSF 虎娘行内注释 2026-10-16】注释跟在
+                                // 候选词后（layoutSkin add() 同串拼接语义），
+                                // 非右对齐列。
+                                let (cx, cw) = if ssf.is_some() {
+                                    (text_x + text_col_w + hsp, (width - text_x - text_col_w - hsp - 2.0).max(0.0))
+                                } else {
+                                    (cmt_x, width - cmt_x - rm_x + 4.0)
+                                };
                                 draw(
                                     &ctx,
                                     &tf_small,
                                     cmt,
-                                    cmt_x,
+                                    cx,
                                     y + dy,
-                                    width - cmt_x - rm_x + 4.0,
+                                    cw,
                                     row_h,
                                     bc,
                                 );
