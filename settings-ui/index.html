@@ -577,7 +577,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
             <h3>显示设置</h3>
             <div class="row">
               <div class="field"><label>字号</label><input type="number" id="ssfv-fontpt" min="10" max="36" step="1" style="width:90px" title="候选文字字号（pt）。候选窗上滚轮放大/缩小也是改这个值，10~36"></div>
-              <div class="field"><label>字体</label><input type="text" id="ssfv-fontface" placeholder="跟随皮肤" style="width:170px" title="覆盖皮肤自带字体（如：Microsoft YaHei UI）；留空=用皮肤字体"></div>
+              <div class="field"><label>字体</label><select id="ssfv-fontface" style="width:190px" title="本机已安装的简体中文字体列表；（自动）=霞鹜优先，回退微软雅黑"></select></div>
+              <div class="field"><label>圆角 <span class="val" id="ssfv-round-v"></span></label><input type="range" id="ssfv-round" min="0" max="20" step="1" title="窗口四角圆角半径：把皮肤位图与文字一起裁成圆角；0=保持皮肤原样（方角）"></div>
               <div class="checkline"><input type="checkbox" id="ssfv-horiz"><label for="ssfv-horiz" title="候选横排一行铺开；不勾=竖排（皮肤设计的主流形态）">横排</label></div>
               <div class="checkline"><input type="checkbox" id="ssfv-index"><label for="ssfv-index" title="候选词前显示序号；不勾=跟随全局设置">显示序号</label></div>
             </div>
@@ -1923,8 +1924,12 @@ async function loadSsfSkin(id) {
   } catch (e) { /* 设置接口失败不挡皮肤显示 */ }
   const rgb8 = hx => hx && hx.length >= 7 ? hx.slice(0, 7) : "#000000";
   $("#ssfv-fontpt").value = ov.font_pt ?? 16;
-  $("#ssfv-fontface").value = ov.font_face || "";
-  $("#ssfv-fontface").placeholder = base.font_face ? "皮肤字体：" + base.font_face : "跟随皮肤";
+  // 【字体下拉 2026-10-16】与矢量皮肤同款（/api/fonts 本机简中字体表，
+  // 自动=霞鹜优先/雅黑兜底）；override 空时选「自动」。
+  await buildSsfFontSelect(ov.font_face || "");
+  const rc = ov.round_corner ?? 0;
+  $("#ssfv-round").value = rc;
+  $("#ssfv-round-v").textContent = rc > 0 ? rc + "px" : "关";
   $("#ssfv-horiz").checked = !!ov.horizontal;
   $("#ssfv-index").checked = ov.show_index === true;
   $("#ssfv-code").value = rgb8(ov.code_color || base.code_color);
@@ -1936,6 +1941,29 @@ async function loadSsfSkin(id) {
   catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
   msg("已启用 .ssf 位图皮肤：" + (m.name || id), "ok");
 }
+/* 【SSF 字体下拉 2026-10-16】与矢量皮肤 ap-font 同数据源（/api/fonts
+   本机简中字体+default 霞鹜/雅黑）。cur=override 值（空=自动项）；
+   缓存字体表（切皮肤不重拉）。 */
+let SSF_FONT_LIST = null;
+async function buildSsfFontSelect(cur) {
+  if (!SSF_FONT_LIST) {
+    try { const r = await api("GET", "/api/fonts"); SSF_FONT_LIST = { fams: [...new Set((r.fonts || []).map(f => f.family))], dflt: r.default || "" }; }
+    catch (_) { SSF_FONT_LIST = { fams: [], dflt: "" }; }
+  }
+  const { fams, dflt } = SSF_FONT_LIST;
+  cur = (cur || "").trim();
+  const opts = [`<option value="">（自动：霞鹜优先，回退雅黑）</option>`]
+    .concat(fams.map(f => `<option value="${esc(f)}">${esc(f)}</option>`));
+  if (cur && !fams.includes(cur)) opts.push(`<option value="${esc(cur)}">${esc(cur)}（当前·手动）</option>`);
+  const el = $("#ssfv-fontface");
+  el.innerHTML = opts.join("");
+  el.value = cur;
+}
+/* 圆角滑条数值联动 */
+$("#ssfv-round").oninput = () => {
+  const v = parseInt($("#ssfv-round").value, 10) || 0;
+  $("#ssfv-round-v").textContent = v > 0 ? v + "px" : "关";
+};
 /* 应用独立皮肤设置：收集表单 → overrides（颜色拼 #RRGGBBFF 不透明）。
    横竖排/序号三态：勾=覆盖；不勾=null 跟随（横竖排 null=竖排默认，
    序号 null=跟随全局——UI 上不区分「覆盖 false」与「跟随」，从简）。 */
@@ -1943,9 +1971,11 @@ $("#ssfv-save").onclick = async () => {
   const id = $("#ssf-select").value;
   if (!id) return;
   const pt = parseFloat($("#ssfv-fontpt").value);
+  const rc = parseFloat($("#ssfv-round").value) || 0;
   const ov = {
     font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
     font_face: $("#ssfv-fontface").value.trim() || null,
+    round_corner: rc > 0 ? rc : null,
     horizontal: $("#ssfv-horiz").checked ? true : null,
     show_index: $("#ssfv-index").checked ? true : null,
     code_color: $("#ssfv-code").value.toUpperCase() + "FF",
@@ -1964,7 +1994,7 @@ $("#ssfv-reset").onclick = async () => {
   const id = $("#ssf-select").value;
   if (!id) return;
   if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？")) return;
-  const ov = { font_pt: null, font_face: null, horizontal: null, show_index: null,
+  const ov = { font_pt: null, font_face: null, round_corner: null, horizontal: null, show_index: null,
     code_color: null, first_color: null, text_color: null, annotation_color: null };
   try {
     await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });

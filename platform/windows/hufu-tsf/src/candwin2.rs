@@ -1527,11 +1527,24 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
     }
     put(obj, "layout", "line_spacing", serde_json::json!(d.line_spacing * s));
     put(obj, "layout", "candidate_spacing", serde_json::json!(d.candidate_spacing * s));
+    // 【SSF 圆角 2026-10-16】位图自带形状不受程序化圆角影响，但用户可
+    // 要窗口级圆角（设置页 round_corner）——payload layout.corner_radius
+    // 覆盖优先，否则 0（下方渲染按 0 跳过裁剪）。
+    {
+        let rc_override = skin
+            .pointer("/skin/layout/corner_radius")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("corner_radius")))
+            .and_then(|x| x.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(0.0);
+        put(obj, "layout", "corner_radius", serde_json::json!(rc_override));
+    }
     put(obj, "layout", "margin_x", serde_json::json!(mx));
     put(obj, "layout", "margin_y", serde_json::json!(my));
     // 圆角/阴影/边框：位图自带（投影/圆角已烧进图里，程序化再叠=双重）
+    //（corner_radius 例外：用户 override 时上面已注入，渲染做窗口级
+    // 圆角几何裁剪——位图四角被裁透明）
     put(obj, "layout", "hilite_padding", serde_json::json!(0.0));
-    put(obj, "layout", "corner_radius", serde_json::json!(0.0));
     put(obj, "layout", "shadow_radius", serde_json::json!(0.0));
     put(obj, "layout", "border_width", serde_json::json!(0.0));
     // 高亮：ssf 的高亮表达=first_color 文字色（虎娘口径），胶囊与
@@ -1845,6 +1858,10 @@ pub struct CandidateWindowV2 {
     /// 明帧）。拦截：全透明且上一帧有内容 → 跳过本帧 ULW（屏上
     /// 保留上一好帧），等下一帧真内容再上屏。
     ulw_last_nonempty: bool,
+    /// 【SSF 窗口圆角 2026-10-16】本帧圆角半径（逻辑 px；0=直角）。
+    /// 渲染段记入，present_ulw/测试回读的 CPU 像素步消费（GPU 几何
+    /// mask 在本交换链实测无效，走 CPU 后处理）。
+    ulw_round: f32,
     size: (i32, i32),
     /// 粘性定位：最近一次有效锚点坐标。锚点偶发丢失（GetTextExt 在
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
@@ -2061,6 +2078,51 @@ pub struct CandidateWindowV2 {
     /// 【SSF M2/M3/M4】.ssf 位图皮肤运行态（None=JSON 矢量皮肤——所有
     /// 分叉以 `ssf.is_some()` 套壳，JSON 路径零改动【回归红线】）。
     pub(crate) ssf: std::cell::RefCell<Option<SsfRuntime>>,
+}
+
+/// 【SSF 窗口圆角·CPU 后处理 2026-10-16】对 BGRA 预乘像素缓冲的四角
+/// 做圆角透明化：只扫四角 r×r 区（快），圆外像素清 0、1px 边缘按距离
+/// 软化（抗锯齿）。GPU PushLayer 几何 mask 在本交换链实测不生效，故
+/// 挂在 present_ulw / 测试回读的像素搬运步后。r 为物理 px（调用方已乘
+/// dpi）。w/h=内容区（SSF 无程序阴影，恒为整帧）。
+unsafe fn ssf_round_corners_cpu(dst: *mut u8, w: usize, h: usize, r: f32) {
+    if r < 0.5 || w == 0 || h == 0 {
+        return;
+    }
+    let ri = r.min(w as f32 * 0.5).min(h as f32 * 0.5);
+    let n = ri.ceil() as usize; // 角区边长
+    let row = w * 4;
+    // 四角区原点 + 对应圆心（圆心朝窗内）
+    let corners = [
+        (0usize, 0usize, ri, ri),
+        (w - n, 0, (w as f32 - ri), ri),
+        (0, h - n, ri, (h as f32 - ri)),
+        (w - n, h - n, (w as f32 - ri), (h as f32 - ri)),
+    ];
+    for (x0, y0, ccx, ccy) in corners {
+        for y in y0..(y0 + n).min(h) {
+            for x in x0..(x0 + n).min(w) {
+                let dx = x as f32 + 0.5 - ccx;
+                let dy = y as f32 + 0.5 - ccy;
+                let d = (dx * dx + dy * dy).sqrt() - ri;
+                if d > -0.5 {
+                    let k = (0.5 - d).clamp(0.0, 1.0); // d>=0.5→0（全清）
+                    let p = dst.add(y * row + x * 4);
+                    if k <= 0.0 {
+                        *p = 0;
+                        *p.add(1) = 0;
+                        *p.add(2) = 0;
+                        *p.add(3) = 0;
+                    } else {
+                        *p = (*p as f32 * k) as u8;
+                        *p.add(1) = (*p.add(1) as f32 * k) as u8;
+                        *p.add(2) = (*p.add(2) as f32 * k) as u8;
+                        *p.add(3) = (*p.add(3) as f32 * k) as u8;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -2297,6 +2359,7 @@ impl CandidateWindowV2 {
                 ulw_w: 0,
                 ulw_h: 0,
                 ulw_last_nonempty: false,
+                ulw_round: 0.0,
                 readback: false,
                 sticky_pos: None,
                 above_flip_last: std::cell::Cell::new(false),
@@ -2480,6 +2543,7 @@ impl CandidateWindowV2 {
                 ulw_w: 0,
                 ulw_h: 0,
                 ulw_last_nonempty: false,
+                ulw_round: 0.0,
                 readback: false,
                 sticky_pos: None,
                 above_flip_last: std::cell::Cell::new(false),
@@ -2716,6 +2780,16 @@ impl CandidateWindowV2 {
             let row = (w as usize) * 4;
             for r in 0..(h as usize) {
                 std::ptr::copy_nonoverlapping(src.add(r * pitch), dst.add(r * row), row);
+            }
+            // 【SSF 窗口圆角】四角透明化（半径=本帧渲染段记入的逻辑值
+            // ×dpi 物理 px；JSON 皮肤恒 0 直接过）
+            if self.ulw_round > 0.5 {
+                let geo = CAND_HIT_GEO
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|(dpi, _, _, _)| dpi)
+                    .unwrap_or(1.0);
+                ssf_round_corners_cpu(dst, w as usize, h as usize, self.ulw_round * geo);
             }
         }
         let _ = cpu.Unmap();
@@ -4010,7 +4084,13 @@ impl CandidateWindowV2 {
         // L48 y+=lineSpacing；candidate_spacing 只横排 gap 用）。
         let (text_x, cand_spacing) = match ssf_layout_geo {
             Some((_, _, _, _, cleft, _, _, _, lsp, sc)) => {
-                let tx = cleft.max(0.0) * sc;
+                // 【序号分离 2026-10-16 修】SSF 文字列锚=cleft×sc，但开
+                // 序号时序号列也在同锚（JSON 口径 label 在 text 左侧）→
+                // 序号与文字挤在一起。同 JSON 语义：序号占 cleft×sc 起、
+                // 文字列右移 label_w+hsp（虎娘口径序号是内联文字串，但
+                // 虎符序号=独立列——保持本家样式，只把列分开）。
+                let tx = cleft.max(0.0) * sc
+                    + if show_index { label_w + hsp } else { 0.0 };
                 let sp = if horizontal {
                     cand_spacing
                 } else {
@@ -4051,7 +4131,19 @@ impl CandidateWindowV2 {
         let (width, cmt_x) = match &ssf {
             Some(f) => {
                 let sc = f.scale;
-                let content_user = {
+                // 【横排宽 2026-10-16 修】横排=单行总宽（Σ词+注释+序号+
+                // 间隔，含左端编码），竖排=各行最大 right。此前横排误用
+                // 竖排口径（单行最大）→ 4 词只装下 2 个（后续被截）。
+                let content_user = if horizontal {
+                    let mut m = if raw.is_empty() { 0.0 } else { raw_w + hsp };
+                    for (i, (tw, cw, iw)) in cand_ws.iter().enumerate() {
+                        if i > 0 || !raw.is_empty() {
+                            m += cand_spacing;
+                        }
+                        m += iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 };
+                    }
+                    m
+                } else {
                     let mut m = raw_w;
                     for (tw, cw, iw) in cand_ws.iter() {
                         m = m.max(iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 });
@@ -4326,6 +4418,12 @@ impl CandidateWindowV2 {
                     M31: 0.0,
                     M32: 0.0,
                 });
+                // 【SSF 窗口圆角 2026-10-16】GPU PushLayer(几何 mask) 在本
+                // 交换链上实测不生效（主变换/identity 两种口径 dump 角都
+                // 仍实心）；改为 CPU 后处理：present_ulw / 测试回读的像素
+                // 步对四角做圆角透明化（预乘直清、带 1px 抗锯齿）。这里
+                // 只记录本帧圆角半径供像素步消费。
+                self.ulw_round = if ssf.is_some() { radius } else { 0.0 };
 
                 // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
                 // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
@@ -5397,11 +5495,20 @@ impl CandidateWindowV2 {
                                 }
                             }
                             if show_index || freq_fv.is_some() {
+                                // 【序号分离 2026-10-16】SSF 序号列锚=皮肤
+                                // cleft×sc（与文字列同设计框左界——文字列
+                                // 已右移 label_w+hsp，两列不再挤在一起）。
+                                let lab_x = match ssf_layout_geo {
+                                    Some((_, _, _, _, cleft, _, _, _, _, sc)) => {
+                                        cleft.max(0.0) * sc
+                                    }
+                                    None => rm_x + hilite_pad,
+                                };
                                 draw(
                                     &ctx,
                                     &tf_label,
                                     &fmt_label(i + 1),
-                                    rm_x + hilite_pad,
+                                    lab_x,
                                     y + dy,
                                     label_w,
                                     row_h,
@@ -5567,6 +5674,23 @@ impl CandidateWindowV2 {
                                                 .copy_from_slice(std::slice::from_raw_parts(src, (w_px * 4) as usize));
                                         }
                                         let _ = cpu.Unmap();
+                                        // 【SSF 窗口圆角】测试回读同款后处理
+                                        //（w_px×h_px=整窗含阴影边距；SSF
+                                        // 无程序阴影=内容区即整帧，与
+                                        // present_ulw 同口径）
+                                        if self.ulw_round > 0.5 {
+                                            let geo = CAND_HIT_GEO
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .map(|(dpi, _, _, _)| dpi)
+                                                .unwrap_or(1.0);
+                                            ssf_round_corners_cpu(
+                                                data.as_mut_ptr(),
+                                                w_px as usize,
+                                                h_px as usize,
+                                                self.ulw_round * geo,
+                                            );
+                                        }
                                         self.last_pixels = Some(data);
                                         self.last_dy = Some(dy);
                                         self.last_size = (w_px, h_px);
