@@ -471,6 +471,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     </div>
     <div id="skin-sub-ssf" style="display:none">
     <div class="row" style="margin-bottom:18px">
+      <div class="checkline"><input type="checkbox" id="ssfv-enable"><label for="ssfv-enable" title="勾选=当前独立皮肤上位（打字即用位图皮肤）；不勾=走矢量皮肤（设置仍保留，随时切回）">启用独立皮肤</label></div>
       <div class="field"><label>皮肤</label><select id="ssf-select" style="min-width:200px"></select></div>
       <!-- 【SSF M5 2026-12】.ssf 位图皮肤导入：文件由用户自备（本输入法
            不附带任何皮肤文件——合规红线），导入即复制到皮肤目录并解包缓存 -->
@@ -590,7 +591,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
               <div class="field"><label>注释</label><input type="color" id="ssfv-anno" title="注释/拼音色"></div>
             </div>
             <div class="row" style="margin-top:6px">
-              <button id="ssfv-save" class="primary">应用设置</button>
               <button id="ssfv-reset" title="字号/字体/横竖排/序号/颜色全部还原为皮肤原值">还原皮肤原值</button>
               <span class="sub" id="ssfv-note" style="align-self:center"></span>
             </div>
@@ -1830,6 +1830,8 @@ let SSF_META = {};
    只列 ssf），杜绝「ssf 皮挂 json 编辑器」错态；当前皮肤是 ssf 时
    默认落在独立分页。 */
 let skinSub = "vector";
+/* 当前皮肤 kind（loadSkinList 更新；loadSsfSkin 据此设启用开关态） */
+let SKIN_CURRENT_KIND = "json";
 function setSkinSub(mode) {
   skinSub = mode;
   $("#skin-sub-vector-btn").classList.toggle("on", mode === "vector");
@@ -1862,8 +1864,15 @@ async function loadSkinList(sel) {
   });
   if (r.current) {
     const cur = r.skins.find(x => x.id === r.current);
-    if (cur && cur.kind === "ssf") { s2.value = r.current; setSkinSub("ssf"); }
-    else { s.value = r.current; }
+    SKIN_CURRENT_KIND = cur ? (cur.kind || "json") : "json";
+    if (SKIN_CURRENT_KIND === "json") {
+      // 【启用开关记忆】当前矢量皮肤 id 记下——独立皮肤关闭开关时恢复它
+      localStorage.setItem("ssfLastJsonSkin", r.current);
+      s.value = r.current;
+    } else {
+      s2.value = r.current;
+    }
+    if (SKIN_CURRENT_KIND === "ssf") setSkinSub("ssf");
   }
   if (sel) { s.value = sel; s2.value = sel; }
   s.onchange = () => reloadSkinTab();
@@ -1932,15 +1941,106 @@ async function loadSsfSkin(id) {
   $("#ssfv-round-v").textContent = rc > 0 ? rc + "px" : "关";
   $("#ssfv-horiz").checked = !!ov.horizontal;
   $("#ssfv-index").checked = ov.show_index === true;
+  // 【启用开关+即改即生效 2026-10-16】开关态=当前皮肤 kind（勾=ssf 上
+  // 位中）。下拉切换仅在开关勾着时真正换皮，否则纯编辑设置。
+  $("#ssfv-enable").checked = SKIN_CURRENT_KIND === "ssf";
   $("#ssfv-code").value = rgb8(ov.code_color || base.code_color);
   $("#ssfv-first").value = rgb8(ov.first_color || base.first_color);
   $("#ssfv-text").value = rgb8(ov.text_color || base.text_color);
   $("#ssfv-anno").value = rgb8(ov.annotation_color || base.annotation_color);
   $("#ssfv-note").textContent = "";
-  try { await api("POST", "/api/skin/select", { id, kind: "ssf" }); }
-  catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
-  msg("已启用 .ssf 位图皮肤：" + (m.name || id), "ok");
+  // 启用开关勾着（或皮肤可用）才真正上位；没勾=纯编辑设置
+  if (!m.error && $("#ssfv-enable").checked) {
+    try { await api("POST", "/api/skin/select", { id, kind: "ssf" }); }
+    catch (e) { msg("切换当前皮肤失败：" + e.message, "err"); return; }
+    msg("已启用独立皮肤：" + (m.name || id), "ok");
+  }
 }
+/* 【即改即生效 2026-10-16】删除「应用设置」按钮：任一控件变化立即
+   写 overrides（server 指纹推进 → DLL 下一帧重拉）。滑条 input 密集
+   → 节流 250ms；其余控件 change 直发。全部静默（时间戳 note），不打
+   扰。收集逻辑与旧保存按钮同款。 */
+async function ssfSettingsSaveNow(quiet) {
+  const id = $("#ssf-select").value;
+  if (!id) return;
+  const pt = parseFloat($("#ssfv-fontpt").value);
+  const rc = parseFloat($("#ssfv-round").value) || 0;
+  const ov = {
+    font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
+    font_face: $("#ssfv-fontface").value.trim() || null,
+    round_corner: rc > 0 ? rc : null,
+    horizontal: $("#ssfv-horiz").checked ? true : null,
+    show_index: $("#ssfv-index").checked ? true : null,
+    code_color: $("#ssfv-code").value.toUpperCase() + "FF",
+    first_color: $("#ssfv-first").value.toUpperCase() + "FF",
+    text_color: $("#ssfv-text").value.toUpperCase() + "FF",
+    annotation_color: $("#ssfv-anno").value.toUpperCase() + "FF",
+  };
+  try {
+    await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
+    const t = new Date().toTimeString().slice(0, 8);
+    $("#ssfv-note").textContent = `已生效 ${t}`;
+  } catch (e) {
+    $("#ssfv-note").textContent = "";
+    msg("独立皮肤设置保存失败：" + e.message, "err");
+  }
+}
+/* 绑定即改即存（独立分页内所有输入件） */
+{
+  let roundTimer = null;
+  const go = () => ssfSettingsSaveNow();
+  $("#ssfv-fontpt").addEventListener("change", go);
+  $("#ssfv-fontface").addEventListener("change", go);
+  $("#ssfv-horiz").addEventListener("change", go);
+  $("#ssfv-index").addEventListener("change", go);
+  $("#ssfv-code").addEventListener("change", go);
+  $("#ssfv-first").addEventListener("change", go);
+  $("#ssfv-text").addEventListener("change", go);
+  $("#ssfv-anno").addEventListener("change", go);
+  $("#ssfv-round").addEventListener("input", () => {
+    const v = parseInt($("#ssfv-round").value, 10) || 0;
+    $("#ssfv-round-v").textContent = v > 0 ? v + "px" : "关";
+    clearTimeout(roundTimer);
+    roundTimer = setTimeout(go, 250);
+  });
+  $("#ssfv-round").addEventListener("change", go);
+}
+/* 【启用开关 2026-10-16】勾=关挂件（互斥）后 select ssf；不勾=恢复上次
+   矢量皮肤（localStorage 记忆，无记忆=hufu-moyan）。挂件关闭是改当前
+   矢量皮肤的 overlay.enabled——切换前当前还是 json，直接改存。 */
+$("#ssfv-enable").addEventListener("change", async () => {
+  const on = $("#ssfv-enable").checked;
+  const ssfId = $("#ssf-select").value;
+  if (on) {
+    if (!ssfId) { msg("没有可用的独立皮肤", "err"); $("#ssfv-enable").checked = false; return; }
+    // 互斥：挂件开着 → 关闭（改当前矢量皮肤并保存）
+    try {
+      const cur = await api("GET", "/api/skin");
+      const ovEn = cur?.skin?.overlay?.enabled ?? cur?.overlay?.enabled;
+      if (ovEn) {
+        const s = cur.skin || cur;
+        if (s.overlay) s.overlay.enabled = false;
+        await api("POST", "/api/skin", s);
+        localStorage.setItem("ssfHadOverlay", "1");
+        msg("已关闭候选挂件（挂件与独立皮肤互斥）；切回矢量皮肤时可重新开启", "ok");
+      }
+      await api("POST", "/api/skin/select", { id: ssfId, kind: "ssf" });
+      SKIN_CURRENT_KIND = "ssf";
+      msg("已启用独立皮肤", "ok");
+    } catch (e) { msg("启用失败：" + e.message, "err"); $("#ssfv-enable").checked = false; }
+  } else {
+    const last = localStorage.getItem("ssfLastJsonSkin") || "hufu-moyan";
+    try {
+      await api("POST", "/api/skin/select", { id: last, kind: "json" });
+      SKIN_CURRENT_KIND = "json";
+      localStorage.setItem("ssfLastJsonSkin", last);
+      msg("已切回矢量皮肤（独立皮肤设置保留）", "ok");
+    } catch (e) {
+      msg("切回失败：" + e.message + "（该皮肤可能已删除）", "err");
+      $("#ssfv-enable").checked = true;
+    }
+  }
+});
 /* 【SSF 字体下拉 2026-10-16】与矢量皮肤 ap-font 同数据源（/api/fonts
    本机简中字体+default 霞鹜/雅黑）。cur=override 值（空=自动项）；
    缓存字体表（切皮肤不重拉）。 */
@@ -1963,31 +2063,6 @@ async function buildSsfFontSelect(cur) {
 $("#ssfv-round").oninput = () => {
   const v = parseInt($("#ssfv-round").value, 10) || 0;
   $("#ssfv-round-v").textContent = v > 0 ? v + "px" : "关";
-};
-/* 应用独立皮肤设置：收集表单 → overrides（颜色拼 #RRGGBBFF 不透明）。
-   横竖排/序号三态：勾=覆盖；不勾=null 跟随（横竖排 null=竖排默认，
-   序号 null=跟随全局——UI 上不区分「覆盖 false」与「跟随」，从简）。 */
-$("#ssfv-save").onclick = async () => {
-  const id = $("#ssf-select").value;
-  if (!id) return;
-  const pt = parseFloat($("#ssfv-fontpt").value);
-  const rc = parseFloat($("#ssfv-round").value) || 0;
-  const ov = {
-    font_pt: isFinite(pt) ? Math.min(36, Math.max(10, pt)) : null,
-    font_face: $("#ssfv-fontface").value.trim() || null,
-    round_corner: rc > 0 ? rc : null,
-    horizontal: $("#ssfv-horiz").checked ? true : null,
-    show_index: $("#ssfv-index").checked ? true : null,
-    code_color: $("#ssfv-code").value.toUpperCase() + "FF",
-    first_color: $("#ssfv-first").value.toUpperCase() + "FF",
-    text_color: $("#ssfv-text").value.toUpperCase() + "FF",
-    annotation_color: $("#ssfv-anno").value.toUpperCase() + "FF",
-  };
-  try {
-    await api("POST", "/api/skin/ssf-settings", { id, overrides: ov });
-    $("#ssfv-note").textContent = "已应用，打字下一帧生效";
-    msg("独立皮肤设置已应用", "ok");
-  } catch (e) { msg("应用失败：" + e.message, "err"); }
 };
 /* 还原皮肤原值：全 null overrides（皮肤文件值全权生效） */
 $("#ssfv-reset").onclick = async () => {
@@ -2384,6 +2459,14 @@ $("#ov-file").onchange = ev => {
   ev.target.value = "";
 };
 $("#ov-en").onchange = () => {
+  // 【独立皮肤互斥 2026-10-16】挂件挂在矢量皮肤上；当前走独立皮肤
+  //（.ssf）时开启无效果（SSF 载荷无 overlay 节）——拦下并提示先关
+  // 独立皮肤，杜绝「开了没反应」的困惑态。
+  if ($("#ov-en").checked && SKIN_CURRENT_KIND === "ssf") {
+    $("#ov-en").checked = false;
+    msg("候选挂件与独立皮肤互斥：请先到「皮肤 → 独立皮肤」取消「启用独立皮肤」，再开启挂件", "err");
+    return;
+  }
   const c = ovEnsureCfg(); c.enabled = $("#ov-en").checked;
   if (c.enabled && !c.image) msg("启用成功——选择图片后自动生效", "");
   else msg(c.enabled ? "候选挂件已启用 ✓（打字即见，≤2.5s）" : "候选挂件已关闭", "ok");
