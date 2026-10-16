@@ -2166,13 +2166,16 @@ function ssfMockDom(m) {
    server 拉当前皮肤+设置真渲染——九宫格/字体/四色/横竖排/序号所见
    即打字所得）。即改即存后刷新。挂件页实时框同源。
    【加载无感 2026-10-16】预加载完毕才替换显示（旧图保持到新图就
-   续，不闪占位/空白）；连续触发只认最后一次（过期结果丢弃）。 */
-let SSF_RENDER_SEQ = 0;
+   续，不闪占位/空白）；连续触发只认最后一次（过期序号挂各自预览
+   元素 _rsq，见函数内注释）。 */
 async function refreshSsfMock(host, onReady) {
   const id = $("#ssf-select").value || "";
   if (!id) return;
   const url = "/api/skin/ssf-render?id=" + encodeURIComponent(id) + "&t=" + Date.now();
-  const seq = ++SSF_RENDER_SEQ;
+  /* 【互踩修复 2026-10-16】过期序号挂到各预览位元素（host._rsq）——
+     原先全局一个，保存设置时 setSsfImg+两处 refreshSsfMock 三连刷互
+     相顶号，只有最后一个出图（「横排开关实时框不显示」真根因）。 */
+  const seq = (host._rsq = (host._rsq || 0) + 1);
   let ok = false;
   try {
     await new Promise((res, rej) => {
@@ -2181,7 +2184,7 @@ async function refreshSsfMock(host, onReady) {
     });
     ok = true;
   } catch (_) {}
-  if (seq !== SSF_RENDER_SEQ) return; /* 已有更新的请求：丢弃本次 */
+  if (seq !== host._rsq) return; /* 该预览位已有更新的请求：丢弃本次 */
   if (!ok) {
     host.innerHTML = `<div style="padding:16px 22px;border-radius:8px;background:#2a2c33;color:#99a">真实渲染失败（未找到 DLL 或渲染超时）</div>`;
     return;
@@ -2196,10 +2199,13 @@ async function refreshSsfMock(host, onReady) {
 /* 已在文档里的 <img> 换图：预加载完成后才切 src（加载期间保持旧图）。
    show=true 时连同 display 一并就绪后才显示（src 空着露出 alt 不好看）。 */
 function setSsfImg(img, url, show) {
-  const seq = ++SSF_RENDER_SEQ;
+  /* 【互踩修复 2026-10-16】同 refreshSsfMock：过期序号挂 img 元素自身，
+     与其他预览位的刷新互不顶号（原全局序号导致保存设置时素材区图
+     被后发的 refreshSsfMock 顶掉、永不更新）。 */
+  const seq = (img._rsq = (img._rsq || 0) + 1);
   const pre = new Image();
   pre.onload = () => {
-    if (seq !== SSF_RENDER_SEQ) return;
+    if (seq !== img._rsq) return;
     img.src = url;
     if (show) img.style.display = "";
   };
