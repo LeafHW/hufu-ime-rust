@@ -2118,6 +2118,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 里各存一份 base64——现场实例 1.6MB 动图 ×5 份 = 11.2MB 导出；
         // 现导出把 ≥1KB 的 data: 字符串换成 asset: 引用、原图只在顶层
         // assets 池存一份，导入再解回内联（皮肤文件落盘格式不变）。
+        // 【独立皮肤随行 2026-10-16】bundle 3：用户自弄的 .ssf（系统
+        // 自带四款排除——随安装分发）base64 收进 ssf_skins；全部独立
+        // 皮肤的 overrides（字体/横排/四色/挂件快照）收进 ssf_settings
+        //——官方皮肤上的用户微调也带（皮肤文件不带但设置无损）。
         ("GET", "/api/settings_export") => {
             let mut skins = serde_json::Map::new();
             for (id, _name) in host.list_skins() {
@@ -2130,11 +2134,39 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                 }
             }
+            let mut ssf_skins = serde_json::Map::new();
+            let mut ssf_settings = serde_json::Map::new();
+            for e in host.list_ssf_skins() {
+                if e.error.is_some() {
+                    continue; // 坏皮不带（导入也过不了校验）
+                }
+                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&e.id);
+                // 设置：overrides.json 原样（结构 SsfOverrides serde 校验
+                // 由导入端做；这里透传——未来加字段不炸旧导出/导出端）
+                if let Ok(t) = std::fs::read_to_string(cache_dir.join("overrides.json")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        ssf_settings.insert(e.id.clone(), v);
+                    }
+                }
+                // 文件：系统自带排除（随安装分发；导出只带用户自弄的）
+                let file = format!("{}.ssf", e.id);
+                if crate::host::is_official_ssf(&file) {
+                    continue;
+                }
+                let p = host.ssf_skins_dir().join(&file);
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Ok(b64) = b64::encode(&bytes) {
+                        ssf_skins.insert(e.id.clone(), serde_json::json!({ "ssf": b64 }));
+                    }
+                }
+            }
             let mut bundle = serde_json::json!({
-                "hufu_settings_bundle": 2,
+                "hufu_settings_bundle": 3,
                 "exported_at": hufu_engine::dynamic::date_string_iso(),
                 "config": host.engine.config,
                 "skins": skins,
+                "ssf_skins": ssf_skins,
+                "ssf_settings": ssf_settings,
             });
             let pool = settings_assets_split(&mut bundle);
             if !pool.is_empty() {
@@ -2150,15 +2182,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 落默认）、未知字段忽略（老版没有的新物件不炸）——正是
             // 「新增功能按默认值来」的实现。皮肤逐张校验后落盘（id 只
             // 许 [A-Za-z0-9_-]，防路径注入），再整体应用配置。
-            // bundle 1=老格式（图内联）；2=资产池引用（导入前解回内联）。
+            // bundle 1=老格式（图内联）；2=资产池引用（导入前解回内联）；
+            // 3=+独立皮肤（用户自弄 .ssf 落盘 + 全部 overrides 恢复）。
             let mut v = req.json();
-            match v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) {
-                Some(1) | Some(2) => {}
+            let bundle_ver = v.get("hufu_settings_bundle").and_then(|x| x.as_i64());
+            match bundle_ver {
+                Some(1) | Some(2) | Some(3) => {}
                 _ => {
                     return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）")
                 }
             }
-            if v.get("hufu_settings_bundle").and_then(|x| x.as_i64()) == Some(2) {
+            if bundle_ver == Some(2) || bundle_ver == Some(3) {
                 let pool = v
                     .get("assets")
                     .and_then(|x| x.as_object())
@@ -2201,6 +2235,58 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                 }
             }
+            // 【独立皮肤随行 2026-10-16】bundle 3：先落用户自弄的 .ssf
+            //（逐张 parse 校验——坏文件绝不落盘，与 import_ssf 同款红
+            // 线；同名覆盖=恢复用户快照语义），再对「导出里出现的全部
+            // ssf 皮肤」（含系统自带——官方皮肤导入端自愈/已在，只补
+            // 设置）建缓存并写 overrides.json（SsfOverrides 结构校验，
+            // 坏设置跳过不拖垮整包）。
+            let mut ssf_skins_applied = 0usize;
+            let mut ssf_settings_applied = 0usize;
+            if bundle_ver == Some(3) {
+                let dir = host.ssf_skins_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if let Some(m) = v.get("ssf_skins").and_then(|x| x.as_object()) {
+                    for (id, ent) in m {
+                        if !crate::ssf::valid_id(id) {
+                            continue; // 非法 id 跳过（路径注入防线）
+                        }
+                        let Some(b64) = ent.get("ssf").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
+                        let Ok(bytes) = b64::decode(b64) else {
+                            continue;
+                        };
+                        // 解析校验（坏皮/超预算不落盘）
+                        if hufu_skin::ssf::parse(&bytes).is_err() {
+                            continue;
+                        }
+                        if std::fs::write(dir.join(format!("{id}.ssf")), &bytes).is_ok() {
+                            ssf_skins_applied += 1;
+                        }
+                    }
+                }
+                if let Some(m) = v.get("ssf_settings").and_then(|x| x.as_object()) {
+                    for (id, ov) in m {
+                        if !crate::ssf::valid_id(id) {
+                            continue;
+                        }
+                        // 结构校验（SsfOverrides serde；坏值跳过）
+                        if serde_json::from_value::<crate::ssf::SsfOverrides>(ov.clone()).is_err() {
+                            continue;
+                        }
+                        // 缓存就绪（缺则解包建目录——含刚落盘的用户皮肤
+                        // 与官方自带；失败跳过该皮肤设置）
+                        if let Ok(b) = crate::ssf::bundle_for(&host.data_dir, id) {
+                            let ov_text = serde_json::to_string(ov).unwrap_or_default();
+                            if std::fs::write(b.cache_dir.join("overrides.json"), ov_text).is_ok()
+                            {
+                                ssf_settings_applied += 1;
+                            }
+                        }
+                    }
+                }
+            }
             match host.apply_config(cfg) {
                 Ok((need_sentence, teardown)) => {
                     if need_sentence {
@@ -2209,6 +2295,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     Response::json(&serde_json::json!({
                         "ok": true,
                         "skins_applied": skins_applied,
+                        "ssf_skins_applied": ssf_skins_applied,
+                        "ssf_settings_applied": ssf_settings_applied,
                     }))
                 }
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
@@ -2582,6 +2670,92 @@ mod sys_unix {
         }
         std::mem::forget(f);
         false
+    }
+}
+
+// ── 设置导出 base64【独立皮肤随行 2026-10-16】────────────────────────
+// .ssf 是二进制（1-3MB），进 JSON 得文本编码。标准字母表+padding 手写
+// （零依赖；engine 无 base64 crate，为此引依赖不值）。编解码对称、
+// 拒绝非法字符（导入文件可能是用户手改过的）。
+mod b64 {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(data: &[u8]) -> Result<String, ()> {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(TBL[(n >> 18) as usize & 63] as char);
+            out.push(TBL[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
+        }
+        Ok(out)
+    }
+
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(Vec::new());
+        }
+        if s.len() % 4 != 0 {
+            return Err(());
+        }
+        let bytes = s.as_bytes();
+        // 每 4 字符 → 3 字节；末组 padding 只许 =（0/1/2 个且只居末尾）
+        let mut out = Vec::with_capacity(s.len() / 4 * 3);
+        for (ci, chunk) in bytes.chunks(4).enumerate() {
+            let last = ci == bytes.len() / 4 - 1;
+            let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+            if pad > 0 && !last {
+                return Err(()); // = 只许出现在最后一组
+            }
+            if pad > 2 || chunk[..4 - pad].iter().any(|&c| c == b'=') {
+                return Err(()); // _= _=_ 等中间带 = 非法
+            }
+            let mut n: u32 = 0;
+            for &c in &chunk[..4 - pad] {
+                n = (n << 6) | val(c).ok_or(())?;
+            }
+            n <<= pad * 6;
+            out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8][..3 - pad]);
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn roundtrip() {
+            for len in 0..64 {
+                let data: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37).wrapping_add(len as u8)).collect();
+                let e = encode(&data).unwrap();
+                assert_eq!(decode(&e).unwrap(), data, "len={len}");
+            }
+            // RFC 4648 向量
+            assert_eq!(encode(b"").unwrap(), "");
+            assert_eq!(encode(b"f").unwrap(), "Zg==");
+            assert_eq!(encode(b"fo").unwrap(), "Zm8=");
+            assert_eq!(encode(b"foo").unwrap(), "Zm9v");
+            assert_eq!(decode("Zm9v").unwrap(), b"foo");
+            // 非法输入拒绝
+            assert!(decode("A").is_err());
+            assert!(decode("====").is_err());
+            assert!(decode("AB!C").is_err());
+        }
     }
 }
 

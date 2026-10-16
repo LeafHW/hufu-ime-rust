@@ -103,8 +103,8 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
 /// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
 ///（official-ssf/ 随 git 与二进制分发，缺失自愈落盘）——此前「.ssf
 /// 完全用户自管理、绝不内置」的红线针对的是**搜狗官方皮肤**（版权）；
-/// 这三款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘）。
-/// 已存在的不覆盖（用户导入的同名更新优先）。
+/// 这几款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘/秋风
+/// 知我意）。已存在的不覆盖（用户导入的同名更新优先）。
 const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     (
         "虎纹奶油.ssf",
@@ -118,7 +118,17 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
         "鲸鱼娘.ssf",
         include_bytes!("../official-ssf/鲸鱼娘.ssf"),
     ),
+    (
+        "秋风知我意.ssf",
+        include_bytes!("../official-ssf/秋风知我意.ssf"),
+    ),
 ];
+
+/// 【导出随行 2026-10-16】该 .ssf 文件名是否系统自带（导出时排除——
+/// 官方皮肤随安装分发，设置快照里只带用户自弄的）。
+pub fn is_official_ssf(file: &str) -> bool {
+    OFFICIAL_SSF.iter().any(|(f, _)| *f == file)
+}
 
 pub struct Host {
     pub candidate_export: crate::candidate_export::Export,

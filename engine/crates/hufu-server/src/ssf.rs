@@ -145,7 +145,7 @@ fn is_reserved_name(s: &str) -> bool {
     false
 }
 
-fn valid_id(id: &str) -> bool {
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && sanitize_stem(id) == id
 }
 
