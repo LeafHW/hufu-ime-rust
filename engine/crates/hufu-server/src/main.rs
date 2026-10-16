@@ -197,6 +197,9 @@ fn main() {
     // 【渲染缓存 2026-10-16】ssf-render 锁前分发拿不到 Host——数据目录
     // 存全局供指纹计算（皮肤缓存目录/overrides/config 的 stat）。
     let _ = DATA_DIR.set(data_dir.clone());
+    // 【渲染预热 2026-10-16】启动即后台预热全部 ssf 皮肤渲染缓存（见
+    // warm_render_cache_throttled 注释）——设置页首次打开列表就能秒切。
+    std::thread::spawn(warm_render_cache_throttled);
     // 【单实例互斥 2026-09-11】此前靠 4390 端口 bind 冲突兜底，但管道
     // 线程先于 HTTP 启动 → 双实例并存窗口期（双 pipe、双托盘消息窗）。
     // 命名互斥体进程级兜底：已存在即本进程直接退（老实例继续服务）。
@@ -1006,6 +1009,31 @@ fn ssf_render_endpoint() -> Response {
     ssf_render_inner(None)
 }
 
+/// 【渲染预热 2026-10-16】30s 节流的后台预热：对全部 ssf 皮肤各渲一次
+/// 填热 RENDER_CACHE（串行——渲染子进程经 pipe 拉皮肤，并发会互相等
+/// 锁白抢 CPU）。已热的指纹命中直跳（40ms 内一个）。
+static RENDER_WARM_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warm_render_cache_throttled() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = RENDER_WARM_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 30 {
+        return;
+    }
+    RENDER_WARM_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    let Some(dir) = DATA_DIR.get() else { return };
+    for e in crate::ssf::list_ssf(dir) {
+        if e.error.is_some() {
+            continue; // 坏皮不预热（渲染也会失败）
+        }
+        let id = e.id;
+        let _ = ssf_render_inner(Some(&id));
+    }
+}
+
 /// 【SSF 真渲染 2026-10-16】
 /// `query_id`：要渲染的 ssf 皮肤 id（设置页传正在编辑的皮肤；None=
 /// 当前上位）。经 HUFU_SKIN_DUMP_ID → DLL skin_for_render 拉指定皮肤
@@ -1434,6 +1462,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     "error": "源 .ssf 文件已删除（当前会话使用缓存渲染）",
                 }));
             }
+            // 【渲染预热 2026-10-16】用户实锤「切皮肤/导入时实时框显示
+            // 慢」——冷渲 ~570ms（spawn+DLL init+渲染），缓存命中 ~40ms。
+            // 列表端点返回后后台串行预热全部 ssf 皮肤渲染缓存（30s 节
+            // 流）：设置页切到哪个都是热缓存秒出。失败静默（预热尽力）。
+            std::thread::spawn(warm_render_cache_throttled);
             Response::json(&serde_json::json!({
                 "skins": list,
                 "current": cur,

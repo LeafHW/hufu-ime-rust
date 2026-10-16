@@ -410,8 +410,11 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
     // 【出图提速 2026-10-16】readback 模式下 size_anim/chrome_override
     // 在 show() 内即被清（首帧=稳态帧，无动效插值）——900ms 长等是
-    // BMP 头错位时期的误判残留。120ms 只留给渲染/回读收尾。
-    std::thread::sleep(std::time::Duration::from_millis(120));
+    // BMP 头错位时期的误判残留。
+    // 【二压 2026-10-16】实证 show() 返回前 last_pixels 已同步填好
+    //（readback 回读在 present 分支之前）——120ms 纯属保险冗余。
+    // 15ms 只留极小余量（切换/导入实时框首显 571→~460ms 的组成项）。
+    std::thread::sleep(std::time::Duration::from_millis(15));
     let px = w.last_pixels.take();
     let (wq, hq) = w.last_size;
     w.readback = false;
