@@ -226,19 +226,15 @@ fn used_images_ok(cache_dir: &Path, def: &hufu_skin::ssf::SsfDefinition) -> bool
 
 // ── 核心：解包与缓存 ─────────────────────────────────────────────
 
-/// 【QPYS 2026-10-16】id → 源文件：同名 .ssf 优先，回退 .qpys（QQ 皮肤
-/// 与 .ssf 同目录混居共用整条解包/缓存/渲染链——`hufu_skin::ssf::parse`
-/// 按 SYPQ magic 自动分派）。
+/// id → 源文件。
+/// 【QPYS 留档 2026-10-16】QQ 皮肤支持已按用户要求摘除——.qpys 分支
+/// 留档注释；重启时恢复：list 过滤、heal/select 存在性、import 判型
+/// 三处 + hufu_skin::ssf::parse 嗅探（git log「QQ输入法皮肤」找全）。
 fn source_for(data_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
     let ssf = ssf_skins_dir(data_dir).join(format!("{id}.ssf"));
-    if ssf.is_file() {
-        return Some(ssf);
-    }
-    let qpys = ssf_skins_dir(data_dir).join(format!("{id}.qpys"));
-    if qpys.is_file() {
-        return Some(qpys);
-    }
-    None
+    // let qpys = ssf_skins_dir(data_dir).join(format!("{id}.qpys"));
+    // if qpys.is_file() { return Some(qpys); }
+    ssf.is_file().then_some(ssf)
 }
 
 /// 取皮肤（缓存优先）。源未变且 manifest+used_images 齐 → 直接用缓存；
@@ -398,8 +394,9 @@ fn unbundle_bytes(
 
 // ── 枚举 / 导入 / 预览 / 删除 ────────────────────────────────────
 
-/// 枚举 皮肤\*.ssf + *.qpys（≤256，字母序）。每个文件尝试取可用包：
-/// 缓存命中即便宜；首次/过期会解包建缓存。解析失败也列出（error 带原因）。
+/// 枚举 皮肤\*.ssf（≤256，字母序）。每个文件尝试取可用包：缓存命中
+/// 即便宜；首次/过期会解包建缓存。解析失败也列出（error 带原因）。
+/// 【QPYS 留档】.qpys 已摘除（x.eq_ignore_ascii_case("qpys") 分支留档）。
 pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
     let dir = ssf_skins_dir(data_dir);
     let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -409,36 +406,13 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
             .filter(|p| {
                 p.is_file()
                     && p.extension()
-                        .map(|x| {
-                            // 【QPYS】QQ 皮肤与 .ssf 同链混居（同名 .ssf 优先）
-                            x.eq_ignore_ascii_case("ssf") || x.eq_ignore_ascii_case("qpys")
-                        })
+                        .map(|x| x.eq_ignore_ascii_case("ssf"))
                         .unwrap_or(false)
             })
             .collect(),
         Err(_) => Vec::new(),
     };
-    let mut by_stem: std::collections::BTreeMap<String, PathBuf> =
-        std::collections::BTreeMap::new();
-    for p in paths {
-        let stem = p
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let is_ssf = p
-            .extension()
-            .map(|x| x.eq_ignore_ascii_case("ssf"))
-            .unwrap_or(false);
-        // 同名 .ssf 覆盖 .qpys（字母序 qpys 在前会反杀——按类型显式优先）
-        match by_stem.get(&stem) {
-            Some(prev) if !is_ssf => {}
-            _ => {
-                by_stem.insert(stem, p);
-            }
-        }
-    }
-    let paths: Vec<PathBuf> = by_stem.into_values().collect();
+    paths.sort();
     let mut out = Vec::new();
     for p in paths.into_iter().take(MAX_SSF_LISTED) {
         let id = p
@@ -492,12 +466,8 @@ pub fn import_ssf(
     }
     // 先解（不落盘）：坏 .ssf / 不支持的容器直接报错，不进皮肤目录
     let (_files, def) = hufu_skin::ssf::parse(bytes).map_err(|e| format!("{e}"))?;
-    // 【QPYS】按字节判型定落盘扩展名（SYPQ → .qpys）
-    let ext = if hufu_skin::ssf::qpys::is_qpys(bytes) {
-        "qpys"
-    } else {
-        "ssf"
-    };
+    // 【QPYS 留档】QQ 判型已摘除：let ext = if is_qpys(bytes) {"qpys"} else {"ssf"};
+    let ext = "ssf";
     let stem = match qname.map(str::trim).filter(|s| !s.is_empty()) {
         Some(n) => {
             // 去伪路径成分 + 去扩展名（浏览器文件名可能带路径/大小写后缀）
@@ -527,17 +497,14 @@ pub fn import_ssf(
                 .filter(|e| {
                     e.path()
                         .extension()
-                        .map(|x| {
-                            // 【QPYS】两种独立皮肤扩展名合计
-                            x.eq_ignore_ascii_case("ssf") || x.eq_ignore_ascii_case("qpys")
-                        })
+                        .map(|x| x.eq_ignore_ascii_case("ssf"))
                         .unwrap_or(false)
                 })
                 .count()
         })
         .unwrap_or(0);
     if count >= MAX_SSF_LISTED && !dir.join(&fname).exists() {
-        return Err(format!("皮肤目录独立皮肤已达上限 {MAX_SSF_LISTED}"));
+        return Err(format!("皮肤目录 .ssf 已达上限 {MAX_SSF_LISTED}"));
     }
     let p = dir.join(&fname);
     // 新导入是显式用户动作：清负缓存，强制真解一遍

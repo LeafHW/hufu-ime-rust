@@ -1486,11 +1486,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .to_string();
             let prev_kind = host.engine.config.appearance.skin_kind.clone();
             if kind == "ssf" {
-                // 【QPYS】.qpys 与 .ssf 同链（存在性查两种扩展名）
-                let exists = ["ssf", "qpys"].iter().any(|ext| {
-                    host.ssf_skins_dir().join(format!("{id}.{ext}")).is_file()
-                });
-                if !exists {
+                let p = host.ssf_skins_dir().join(format!("{id}.ssf"));
+                if !p.exists() {
                     return Response::err(404, &format!("皮肤 {id} 不存在"));
                 }
                 // 坏 .ssf（损坏/超预算/不支持的容器）→ 400 带原因，不切换

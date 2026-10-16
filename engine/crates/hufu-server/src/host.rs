@@ -985,11 +985,8 @@ impl Host {
             return;
         }
         let id = self.engine.config.appearance.skin.clone();
-        // 【QPYS】.qpys 与 .ssf 同链——两者任一在即算源存在
-        let exists = ["ssf", "qpys"]
-            .iter()
-            .any(|ext| self.ssf_skins_dir().join(format!("{id}.{ext}")).is_file());
-        if exists {
+        let p = self.ssf_skins_dir().join(format!("{id}.ssf"));
+        if p.exists() {
             return;
         }
         let fallback = hufu_config::AppearanceSection::default().skin;

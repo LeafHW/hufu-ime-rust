@@ -17,6 +17,7 @@
 pub mod container;
 pub mod ini;
 pub mod model;
+#[allow(dead_code)] // 【QPYS 留档】运行时已摘除（见 parse 注释），模块留档待重启
 pub mod qpys;
 
 #[cfg(test)]
@@ -48,12 +49,13 @@ pub enum SsfError {
     Message(String),
 }
 
-/// 一站式：字节 → (条目表, 皮肤定义)。按 magic 自动分派：
-/// `SYPQ` → QQ 皮肤（.qpys）；其余 → 搜狗系 .ssf 容器。
+/// 一站式：字节 → (条目表, 皮肤定义)。
+///
+/// 【QPYS 留档 2026-10-16】QQ 皮肤（.qpys）解析模块 [`qpys`] 已实现并
+/// 验证（三皮肤渲染/导入/预览全通），但用户试用后拍板「支持不太
+/// 好，先去掉」——运行时分派摘除，模块+测试留档（cfb 依赖保留），
+/// 未来重启只需恢复此处嗅探 + server 三处扩展名（git log 找本 commit）。
 pub fn parse(bytes: &[u8]) -> Result<(Files, SsfDefinition), SsfError> {
-    if qpys::is_qpys(bytes) {
-        return qpys::parse(bytes);
-    }
     let files = decode_archive(bytes)?;
     let definition = parse_definition(&files)?;
     Ok((files, definition))
