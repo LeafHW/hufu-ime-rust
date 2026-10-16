@@ -1335,6 +1335,27 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 平台标识（设置页据此隐藏平台无关项：Linux 不用引擎自带中英切换）
             "os": std::env::consts::OS,
         })),
+        ("GET", "/api/about") => {
+            // 【关于页 2026-10-16 用户需求】版本号读 exe 同目录
+            // version.txt（安装包唯一版本源，pack 时写入）；开发目录
+            // 无此文件 → 回退 crate 版本并标「开发版」。目录信息一并
+            // 给（设置页只读展示，方便报障时定位安装/数据位置）。
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_default();
+            let version = std::fs::read_to_string(exe_dir.join("version.txt"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}（开发版）", env!("CARGO_PKG_VERSION")));
+            Response::json(&serde_json::json!({
+                "version": version,
+                "github": "https://github.com/LeafHW/hufu-ime-rust",
+                "exe_dir": exe_dir.to_string_lossy(),
+                "data_dir": host.data_dir.to_string_lossy(),
+            }))
+        }
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表
@@ -1899,6 +1920,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !(0..=99).contains(&pos) {
                 return Response::err(400, "选重位须在 1-99");
             }
+            // 【个人存储表防泄漏 2026-10-16】隐私词（任意码）拒绝前台
+            // 加词：{添加} 落 用户调整.txt 会随导出带走（同词不同码也是
+            // 泄漏）。唯一修改通道=直接编辑 个人存储表.txt。
+            if host.engine.schema.personal_has_text(text) {
+                return Response::err(
+                    400,
+                    "「个人存储表」里的词不进用户调整（会随导出泄漏）——请直接编辑方案目录的 个人存储表.txt",
+                );
+            }
             // 【格式统一 2026-09-06】统一 用户调整.txt：{添加}码\t词[\tpN]。
             // 同码同词旧行全清（含 {删除}——加词=明确想要它，修复加词
             // 被旧删除行屏蔽的问题）后追加。
@@ -1963,6 +1993,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
             if !(1..=1_000_000_000).contains(&weight) {
                 return Response::err(400, "权重须为正整数");
+            }
+            // 【个人存储表防泄漏 2026-10-16】隐私词不进补充语料明文
+            //（同加词口径——/jq 也是前台通道，个人存储表不归它管）。
+            if host.engine.schema.personal_has_text(&text) {
+                return Response::err(
+                    400,
+                    "「个人存储表」里的词不受前台加权——请直接编辑方案目录的 个人存储表.txt",
+                );
             }
             let file = host.engine.schema.dir.join("补充语料.txt");
             rewrite_supplement_lines(&file, &text);

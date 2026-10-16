@@ -234,6 +234,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="skin">皮肤</a>
   <a data-tab="overlay">候选挂件</a>
   <a data-tab="data">导入导出</a>
+  <a data-tab="about">关于</a>
   <div class="spacer"></div>
   <!-- 【深浅色主题 2026-10-11】导航栏底部：切换按钮（记住选择）+
        跟随系统开关（系统切深浅页即时跟） -->
@@ -372,7 +373,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
         </select></div>
       <div class="checkline"><input type="checkbox" id="oc-emoji"><label for="oc-emoji">Emoji 注解候选</label></div>
     </div>
-    <div class="sub">开启简→繁后打简出繁：候选与上屏文本直接转为繁体，候选顺序不变（无简繁之分的字保持原样原位）。Emoji 注解候选追加在尾部（😊 标记）。数据\转换词典\ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
+    <div class="sub">开启简→繁后打简出繁：候选与上屏文本直接转为繁体，候选顺序不变（无简繁之分的字保持原样原位）。「Emoji 注解候选」独立生效：不勾「启用 OpenCC 转换」也能用，勾了的词各自成条候选（例如 手机 → 📱 / 📲 各占一选，😊 标记）。数据\转换词典\ 放 OpenCC txt 对照表（STPhrases/STCharacters/TS…/emoji）。</div>
 
     <h3>剪贴板上屏</h3>
     <div class="row">
@@ -424,6 +425,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="s-la"><label for="s-la" title="开启=每次选词学习往方案目录 user-adjust.log 追加诊断记录（时间戳/编码/词/来源，防抖落盘），供排查「为什么这个词排前面了」。默认关。与 用户调整.txt（置顶/加词/删词的操作记录，参与导出快照）是两回事">记录学习日志<span class="sub">（user-adjust.log 诊断用；默认关）</span></label></div>
     </div>
     <div class="sub">加词（/jc）、加权（/jq）、Ctrl+数字 置顶、Ctrl+Shift+数字 删词与导出快照均为主动操作，不受上面两个开关影响。</div>
+    <div class="sub" style="margin-top:6px">🔒 个人存储表：每个方案文件夹里各有一份 <b>个人存储表.txt</b>（自带用法说明的空模板；数据目录根下的同名文件也认，全局生效）。每行「编码〈Tab〉词」，放手机号/证件号/住址等隐私词条——照常打得出、上屏，但<b>不参与</b>前台调频/置顶/删词/加词/学习日志，<b>绝不进「导出码表」</b>，<b>也绝不会进安装包</b>（打包只带空模板）；增删改只在该文件里直接编辑，保存后切一次方案或重启输入法生效。</div>
     <h3>神经重排</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="s-rr"><label for="s-rr" title="打字停顿时用 Qwen 小模型对整句候选重排序（需 gguf 模型文件）">停顿重排</label></div>
@@ -581,6 +583,19 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
               <div class="field"><label>字体</label><select id="ssfv-fontface" style="width:190px" title="本机已安装的简体中文字体列表；（自动）=霞鹜优先，回退微软雅黑"></select></div>
               <div class="checkline"><input type="checkbox" id="ssfv-horiz"><label for="ssfv-horiz" title="候选横排一行铺开；不勾=竖排（皮肤设计的主流形态）">横排</label></div>
               <div class="checkline"><input type="checkbox" id="ssfv-index"><label for="ssfv-index" title="候选词前显示序号；不勾=跟随全局设置">显示序号</label></div>
+              <!-- 【候选高度 2026-10-16 用户需求·语义澄清】独立皮肤专属：
+                   候选窗与光标行的垂直距离（不是皮肤内部候选区偏移——首版
+                   理解偏了，已改挂窗口定位层）。正=离光标更远（窗整体下移；
+                   贴屏底自动翻上方时=再上移），负=贴近光标（可压进光标行）。
+                   【滑条+数字框 2026-10-16 用户拍板】双向联动：拖动节流
+                   250ms 即存即生效；数字框可精确输入。
+                   【范围 ±30 2026-10-16 用户拍板】从 ±300 收窄。 -->
+              <div class="field"><label>候选高度</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="range" id="ssfv-candys" min="-30" max="30" step="1" style="width:120px" title="拖动实时调整候选窗与光标的垂直距离：右（正）=离光标更远，左（负）=贴近光标（±30）">
+                  <input type="number" id="ssfv-candy" min="-30" max="30" step="1" style="width:72px" placeholder="0" title="候选窗与光标行的垂直距离（像素，-30~30）：正值=离光标更远（窗整体下移；屏幕下方不够自动翻上方时则再上移），负值=贴近光标；空/0=默认间距。仅独立皮肤生效">
+                </div>
+              </div>
             </div>
             <h3>文字颜色</h3>
             <div class="row">
@@ -700,6 +715,33 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="imp-btn">导入 config.json…</button>
     </div>
     <div class="sub" id="data-msg">导出时选保存位置；导入时选之前导出的文件，应用后立即生效。</div>
+  </section>
+
+  <!-- ════ 关于 2026-10-16 用户需求：版本号/GitHub/本机信息/致谢 ════ -->
+  <section id="tab-about">
+    <h2>关于<span class="en">About</span></h2>
+    <div class="row" style="align-items:baseline;gap:16px;flex-wrap:wrap">
+      <div style="font-size:32px;font-weight:700;letter-spacing:2px">虎<span style="color:var(--acc)">符</span> HuFu</div>
+      <span class="pill" id="ab-version" style="font-size:15px">版本检测中…</span>
+    </div>
+    <div class="row" style="margin-top:12px;align-items:center">
+      <a id="ab-github" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noreferrer" style="color:var(--acc)">https://github.com/LeafHW/hufu-ime-rust</a>
+      <button id="ab-copy" title="复制仓库地址（发给别人/报障时附上）">复制地址</button>
+    </div>
+    <div class="sub">Rust 引擎 + TSF 接入的 Windows 形码输入法。版本发布与问题反馈都在上面的仓库。</div>
+    <h3>本机信息</h3>
+    <div class="field"><label>安装目录（码表/皮肤缓存在此）</label><input class="wide" id="ab-exe" readonly></div>
+    <div class="field"><label>数据目录（config.json/转换词典/音效在此）</label><input class="wide" id="ab-data" readonly></div>
+    <div class="sub">版本号来自安装目录 version.txt（随安装包写入）；「（开发版）」= 未走正式打包流程的本地构建。</div>
+    <h3>开源致谢</h3>
+    <div class="sub" style="line-height:2">
+      <!-- 【官网更新 2026-10-16 用户需求】虎码官网改 tiger-code.com；
+           【更名 2026-10-17 用户拍板】夜莺（Nightingale）官网措辞统一「夜莺」。 -->
+      码表与输入法资源来自：虎码输入法官网（<a href="https://www.tiger-code.com/" target="_blank" rel="noreferrer" style="color:var(--acc)">www.tiger-code.com</a>）；<br>
+      夜莺输入法官网（<a href="https://loswater.github.io/Nightingale/" target="_blank" rel="noreferrer" style="color:var(--acc)">loswater.github.io/Nightingale</a>）；<br>
+      虎爪输入法 TigerClaw（<a href="https://github.com/lvyww/tigerclaw" target="_blank" rel="noreferrer" style="color:var(--acc)">github.com/lvyww/tigerclaw</a>，GPL-3.0）；<br>
+      默认候选字体：霞鹜文楷 LXGW WenKai。
+    </div>
   </section>
 </main>
 
@@ -1925,6 +1967,18 @@ function showJsonSkinUi() {
    填信息面板 + 预览图 + 显示设置表单；选中即切换（select 带 kind，
    服务器先验可解包才切换——坏皮绝不上位）。 */
 async function loadSsfSkin(id) {
+  // 【空选择回退 2026-10-16】当前上位皮肤是矢量时，下拉无选中值——
+  // 老逻辑此处直接 return，「位图皮肤 .ssf」面板（显示设置/候选高度/
+  // 文字颜色/删除）整个不出现，子页只剩启用开关+导入按钮（用户实锤
+  // 「高度选项找不到」）。回退：自动选列表第一张展示；一张都没有才
+  // return（导入入口仍在页首）。
+  if (!id) {
+    const s2 = $("#ssf-select");
+    if (s2.options.length) {
+      id = s2.options[0].value;
+      s2.value = id;
+    }
+  }
   if (!id) return;
   $("#skin-json-grid").style.display = "none";
   $("#weasel-block").style.display = "none";
@@ -1972,6 +2026,10 @@ async function loadSsfSkin(id) {
   $("#ssfv-horiz").checked = !!ov.horizontal;
   // null（历史遗留「跟随全局」）按全局配置回填；显式 false=不勾
   $("#ssfv-index").checked = (ov.show_index ?? (CFG.candidates?.show_index !== false)) === true;
+  // 【候选高度 2026-10-16】语义=候选窗与光标行的垂直距离（空框=默认
+  // 间距 None）；滑条与框同步（0 ↔ 空）
+  $("#ssfv-candy").value = ov.cand_y ?? "";
+  $("#ssfv-candys").value = ov.cand_y ?? 0;
   // 【启用开关+即改即生效 2026-10-16】开关态=当前皮肤 kind（勾=ssf 上
   // 位中）。下拉切换仅在开关勾着时真正换皮，否则纯编辑设置。
   $("#ssfv-enable").checked = SKIN_CURRENT_KIND === "ssf";
@@ -2028,6 +2086,24 @@ async function ssfSettingsSaveNow(quiet) {
   $("#ssfv-first").addEventListener("change", go);
   $("#ssfv-text").addEventListener("change", go);
   $("#ssfv-anno").addEventListener("change", go);
+  // 【候选高度·滑条+数字框 2026-10-16】双向联动：拖动 input 事件
+  // 节流 250ms 即存即生效（预览同步刷新，与页内其他滑条同口径）；
+  // 数字框 change 直发并回夹到 ±30（范围收窄 2026-10-16 用户拍板）。
+  // 滑条 0 与空框同语义（=默认间距，collect 把 0 收敛为 null 不存档）。
+  {
+    const sl = $("#ssfv-candys"), nb = $("#ssfv-candy");
+    let dragT = null;
+    sl.addEventListener("input", () => {
+      nb.value = sl.value;
+      if (dragT) clearTimeout(dragT);
+      dragT = setTimeout(() => ssfSettingsSaveNow(), 250);
+    });
+    nb.addEventListener("change", () => {
+      const v = parseFloat(nb.value);
+      sl.value = isFinite(v) ? Math.max(-30, Math.min(30, v)) : 0;
+      go();
+    });
+  }
 }
 /* 【启用开关 2026-10-16】勾=关挂件（互斥）后 select ssf；不勾=恢复上次
    矢量皮肤（localStorage 记忆，无记忆=hufu-moyan）。挂件关闭是改当前
@@ -2233,8 +2309,8 @@ async function buildSsfFontSelect(cur) {
 $("#ssfv-reset").onclick = async () => {
   const id = $("#ssf-select").value;
   if (!id) return;
-  if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？（含挂件配置，字号/字体/横竖排/序号/颜色一并还原）")) return;
-  const ov = { font_pt: null, font_face: null, horizontal: null, show_index: null,
+  if (!confirm("还原「" + (SSF_META[id]?.name || id) + "」的全部设置为皮肤原值？（含挂件配置，字号/字体/横竖排/序号/候选高度/颜色一并还原）")) return;
+  const ov = { font_pt: null, font_face: null, horizontal: null, show_index: null, cand_y: null,
     code_color: null, first_color: null, text_color: null, annotation_color: null, overlay: null };
   SSF_OV_CACHE = {};
   try {
@@ -2357,6 +2433,12 @@ function collectSsfOverrides() {
     // 全局，而全局默认开——不勾永远显示=关不掉。改显式两态（勾=开、
     // 不勾=关）。
     show_index: $("#ssfv-index").checked ? true : false,
+    // 【候选高度 2026-10-16】空/0/非法=null（默认间距）；否则钳 ±30
+    //（范围收窄 2026-10-16 用户拍板）
+    cand_y: (() => {
+      const y = parseFloat($("#ssfv-candy").value);
+      return isFinite(y) && y !== 0 ? Math.min(30, Math.max(-30, y)) : null;
+    })(),
     code_color: $("#ssfv-code").value.toUpperCase() + "FF",
     first_color: $("#ssfv-first").value.toUpperCase() + "FF",
     text_color: $("#ssfv-text").value.toUpperCase() + "FF",
@@ -3120,6 +3202,20 @@ $("#btn-save").style.display = "none"; // 初始页（方案）非整句模型�
   if (a) a.click();
 }
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
+/* 【关于页 2026-10-16】版本/目录回填（/api/about：version.txt=安装包
+   唯一版本源；开发目录无此文件 → crate 版本标「开发版」）。静态页，
+   启动即拉一次即可。 */
+{
+  const GH = "https://github.com/LeafHW/hufu-ime-rust";
+  api("GET", "/api/about").then(a => {
+    $("#ab-version").textContent = "v" + (a.version || "未知");
+    if (a.exe_dir) $("#ab-exe").value = a.exe_dir;
+    if (a.data_dir) $("#ab-data").value = a.data_dir;
+  }).catch(() => { $("#ab-version").textContent = "版本未知"; });
+  const cp = $("#ab-copy");
+  if (cp) cp.onclick = () => (navigator.clipboard ? navigator.clipboard.writeText(GH) : Promise.reject())
+    .then(() => msg("仓库地址已复制", "ok"), () => msg("复制失败——手动选中文本复制", "err"));
+}
 /* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) api("GET", "/api/config").then(c => { CFG = c; }).catch(() => {});
@@ -3334,6 +3430,8 @@ function openKeymapEditor() {
     /* 字母键在 shift_symbols 里以大写存储（引擎口径） */
     const ssKey = c => /[a-z]/.test(c) ? c.toUpperCase() : c;
     let ss = Object.assign({}, cfg.keymap && cfg.keymap.shift_symbols || {});
+    /* 【Alt+修改 下线 2026-10-17 用户拍板】altsym 分页整体删除（与太多
+       软件快捷键冲突）。 */
     let pg = "main"; // main | num | shiftsym（分页状态，render 间保持）
     /* 键帽 → 引擎键名（config.keymap.map 键口径）。Esc 固定行为键
        （编码中清屏 / 空态撤回），不可映射——与 Ctrl/Win/Alt 同为
@@ -3370,8 +3468,9 @@ function openKeymapEditor() {
       const kb2 = pg === "shiftsym"
         ? rows.map(row => `<div class="row2">${row.map(cap => {
             const editable = ssEditable(cap);
+            const store = ss;
             /* 【Shift+字母区 2026-10-09】字母以大写键查自定义（存储口径） */
-            const custom = ss[ssKey(cap)];
+            const custom = store[ssKey(cap)];
             const badge = custom ? `<div class="bd2" style="background:#7a4adf">↳ ${esc(custom).slice(0, 6)}</div>` : "";
             const cls = editable ? (custom ? "k asg" : "k") : "k dis";
             const disp = cap.length > 1 ? esc(cap) : (editable ? `<b>⇧+</b>${esc(cap)}` : esc(cap));
@@ -3563,6 +3662,9 @@ function openKeymapEditor() {
           }
         };
       });
+
+      /* 【Alt+修改 下线 2026-10-17 用户拍板】键点击处理块随分页整体删除
+         （Alt+编码与太多软件快捷键冲突，功能放弃）。 */
 
       /* 【编辑窗自愈 2026-10-10】用户实锤「Shift+符号修改所有按键点了没反应」：
          根因=旧「自定义按键」编辑窗在设置页关闭后残留——它的事件处理器

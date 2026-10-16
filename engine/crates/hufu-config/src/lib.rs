@@ -363,6 +363,9 @@ pub struct KeymapSection {
     /// 时生效」（v1.7.5 行为，升级零差异）。设置页对话框预填该字母
     /// 已存档位，并记住上次选择供下一个字母默认。
     pub shift_letters_always: std::collections::HashSet<String>,
+    // 【Alt+修改 下线 2026-10-17 用户拍板】alt_symbols/alt_letters_always
+    // 字段已删（Alt+编码与太多软件快捷键冲突）。老配置文件里的残留键
+    // 由 serde 忽略，无害。
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

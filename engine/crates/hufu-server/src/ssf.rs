@@ -658,6 +658,11 @@ pub struct SsfOverrides {
     pub horizontal: Option<bool>,
     /// 序号开关覆盖。None=全局 candidates.show_index。
     pub show_index: Option<bool>,
+    /// 【候选高度 2026-10-16】候选区纵向偏移（屏幕像素，正=下移/负=上移，
+    /// 仅独立皮肤）。透明皮肤元素的编码行与候选行视觉间距由皮肤位图
+    /// 决定，此值整体挪动候选区起点补视觉缝隙。None=0（皮肤原布局）。
+    /// DLL 侧换算：布局源域偏移 = 像素/缩放比，钳 ±500 后叠加。
+    pub cand_y: Option<f32>,
     /// 【挂件随独立皮肤 2026-10-16】挂件配置快照（矢量皮肤 overlay 节
     /// 整棵：enabled/image/proc/布局）。None=无挂件。payload 注入顶层
     /// overlay——DLL parse_cfg 同键读取，零新消费代码。
@@ -780,6 +785,11 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     }
     if let Some(si) = ov.show_index {
         layout.insert("show_index".into(), serde_json::json!(si));
+    }
+    // 【候选高度 2026-10-16】像素值原样下发（布局源域换算在 DLL——
+    // 那里有 scale），layout.cand_y 与 font_point 等同通道。
+    if let Some(y) = ov.cand_y {
+        layout.insert("cand_y".into(), serde_json::json!(y));
     }
     let mut sv = serde_json::json!({
         "kind": "ssf",

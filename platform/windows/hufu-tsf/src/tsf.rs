@@ -552,6 +552,8 @@ pub struct Shared {
     /// 【两态映射 2026-11】空态专用映射快照（state.keymap_idle）：
     /// TestDown 空态预判查这张表（缺省回落 keymap 同键）。
     pub keymap_idle: std::collections::HashMap<String, String>,
+    // 【Alt+修改 下线 2026-10-17 用户拍板】alt_symbols/alt_always/当场执行
+    // 标记等全套已删——Alt+编码与太多软件的快捷键冲突，功能放弃。
     /// 【Esc 撤回光标范围 2026-11】当前焦点是否「有光标（可编辑）」
     /// 探测结果缓存：Some(ok)=已探测（GetSelection 成功=有光标），
     /// None=未探测/已失效（焦点切换即失效）。空态 Esc 撤回预判的
@@ -1690,6 +1692,21 @@ fn stray_modifier_held(freq: &[usize], del: &[usize]) -> bool {
         }
     }
     false
+}
+
+/// 【八十五修·布防原语】Ctrl 抬起（或任意消费 ctrl 事件的路径）时
+/// space 仍按住 → 布防 space_ctrl_armed：此后到的 space up 即使
+/// GetKeyState 已无 Ctrl 也算「Ctrl+Space 组合曾成形」。
+/// 【调频模态堵洞 2026-10-16 用户反馈】freq_modal_key 消费 ctrl 事件
+///（模态进入/退出/重估的提前返回）时主分派的布防分支被跳过——
+/// 「按住 Ctrl 有候选 → 模态激活 → 先松 Ctrl 后松 Space」序在
+/// TestUp-only 宿主（跟打器类，space down 不可见）切不了中英
+///（armed 没布上、ct0 已松）。两路共用本原语。
+fn ctrl_up_arm_space(shared: &SharedRef, space_held: bool) {
+    if space_held {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.space_ctrl_armed = true;
+    }
 }
 
 /// 模态进入（组合完成时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
@@ -3313,11 +3330,10 @@ impl HuFuTs_Impl {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 g.space_ctrl_armed = armed;
             } else if wparam == 0x11 {
+                // 【八十五修】ctrl 事件时 space 仍按住 → 布防（原语化，
+                // 与 freq_modal_key 消费路径共用——见 ctrl_up_arm_space）。
                 let space_held = unsafe { GetKeyState(VK_SPACE.0 as i32) < 0 };
-                if space_held {
-                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                    g.space_ctrl_armed = true;
-                }
+                ctrl_up_arm_space(&self.shared, space_held);
             }
             if !up {
                 // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
@@ -3370,6 +3386,7 @@ impl HuFuTs_Impl {
                     None => return BOOL(0),
                 }
             };
+            // 【Alt+修改 下线 2026-10-17】预判分支已删——Alt 组合全放行。
             let _ = alt;
             // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
             // 由引擎定夺（未启用时引擎不吞，KeyDown 返回直通）。
@@ -3394,6 +3411,9 @@ impl HuFuTs_Impl {
                 }
                 return BOOL(0);
             }
+            // 【Alt+修改 下线 2026-10-17】Alt+键预判分支整体删除（用户
+            // 拍板：与太多软件快捷键冲突）。Alt 组合回到全放行（宿主
+            // 菜单/快捷键原生语义）。
             if ctrl {
                 // 【候选调频/删词 2026-09-06】Ctrl+数字（含 Shift 形态）在
                 // 编码态由引擎处理（置顶/删除），预吞；空态放行（应用
@@ -3774,6 +3794,8 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
             }
             g.keymap_idle = kmi;
+            // 【Alt+修改 下线 2026-10-17】alt_symbols/alt_always 同步块与
+            // LL 钩子快照刷新已随功能整体删除。
             // 【十七修·零锁快照 v2】从**本拍 state** 直读——旧版读 g.raw_last
             // 镜像恒滞后一拍（首字母组段的 caps 被放行=EmEditor 灯翻第一
             // 次的根；WPS 空组段被拦=F24 又不被转发=按键死的根）。raw
@@ -3981,6 +4003,15 @@ impl HuFuTs_Impl {
                 // 成员抬起 → 重估：删词优先，两组合都散才退出。事件键
                 // 的按态**不读 GetKeyState**（TestUp 时刻状态同步不保
                 // 险）——含它的组合必不完整，不含它的组合不受本事件影响。
+                // 【调频模态堵洞 2026-10-16】ctrl 抬起被本分支消费 →
+                // 主分派的 Ctrl+Space 布防（3315 区）跑不到——此处补
+                // 布防：space 仍按住则 armed=true，后到的 space up 照样
+                // 走模式键通道切中英（默认 freq=ctrl 下「有候选按住
+                // Ctrl → 先松 Ctrl 后松 Space」切换失败的病灶）。
+                if wparam == 0x11 {
+                    let space_held = unsafe { GetKeyState(VK_SPACE.0 as i32) < 0 };
+                    ctrl_up_arm_space(&self.shared, space_held);
+                }
                 let del_held = !dk.contains(&wparam) && combo_held(&dk);
                 let freq_held = !fk.contains(&wparam) && combo_held(&fk);
                 if del_held {
@@ -10674,7 +10705,7 @@ mod caps_settle_tests {
 
 #[cfg(test)]
 mod modekey_tests {
-    use super::{modekey_admit, Shared};
+    use super::{ctrl_up_arm_space, modekey_admit, Shared, SharedRef};
 
     const CAPS: usize = 0x14;
     /// 模拟一次「慢击」的完整四事件序列（Notepad3 形态）：
@@ -10759,6 +10790,25 @@ mod modekey_tests {
         g.modekey_last = None; // 免 80ms 窗干扰
         assert!(modekey_admit(&mut g, 0x20, true), "armed up 应放行");
         assert!(!g.space_ctrl_armed, "armed 必须在放行时消费");
+    }
+
+    /// 【调频模态堵洞 2026-10-16】ctrl 抬起被 freq_modal_key 消费时，
+    /// 布防原语必须照样生效：space 按住 → armed=true（此后到的 space
+    /// up 算 Ctrl+Space 成形）；space 未按住 → 不布防。
+    #[test]
+    fn ctrl_up_arm_space_primitive() {
+        let gg: SharedRef = std::sync::Arc::new(std::sync::Mutex::new(Shared::new()));
+        ctrl_up_arm_space(&gg, true);
+        assert!(
+            gg.lock().unwrap_or_else(|e| e.into_inner()).space_ctrl_armed,
+            "space 按住时 ctrl up 必须布防"
+        );
+        let gg2: SharedRef = std::sync::Arc::new(std::sync::Mutex::new(Shared::new()));
+        ctrl_up_arm_space(&gg2, false);
+        assert!(
+            !gg2.lock().unwrap_or_else(|e| e.into_inner()).space_ctrl_armed,
+            "space 未按住不布防"
+        );
     }
 }
 

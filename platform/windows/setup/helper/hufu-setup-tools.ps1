@@ -251,6 +251,33 @@ function Invoke-BackupDiffCmd {
         return 2
     }
 
+    # 【码表区铁闸 2026-10-17 用户实锤→同日修正】用户码表区（码表\）绝不
+    # 复活：只要目标目录露出任何「装过且有用户财产」的磁盘实况——码表\
+    # 有内容、数据\ 在场——码表\ 全域零写入、零补缺、零复活（用户删掉
+    # 的方案/文件绝不由安装器复活；卸载重装/注册表失忆也拦得住——磁盘
+    # 实况是唯一可靠信号，注册表判定不可依赖）。此前全新模式全量清单把
+    # 用户已删方案整目录「补缺」回来、虎整句码表被顶回旧版，真机实锤。
+    # 【同日第二锤·卸载器信号剔除】初版曾把 unins000.exe 在场也当「占用」
+    # 信号——但 Inno 安装器在每次安装开头（[Run]/本脚本执行之前）就会生
+    # 成它，真新装机到场必带 → 新装机也被判「老用户」→ 码表全零写入、
+    # 装完目录里连码表都没有（用户卸载+删目录+重装实锤）。该信号对场景
+    # 无增量价值（删码表留安装的场景由 数据\ 在场兜底），永久剔除：
+    # 占用判定只认 码表\非空 与 数据\在场 两条。全新机器（两项全无）
+    # 照常全量落盘。此闸高于一切清单选择（含 iss 侧升级/全新判定）。
+    $dictRoot = Join-Path $DstRoot '码表'
+    $dictOccupied = (Test-Path -LiteralPath $dictRoot) -and (@(Get-ChildItem -LiteralPath $dictRoot -Force -ErrorAction SilentlyContinue).Count -gt 0)
+    $userZone = $dictOccupied -or (Test-Path -LiteralPath (Join-Path $DstRoot '数据'))
+    if ($userZone) {
+        $beforeN = @($lines).Count
+        $lines = @($lines | Where-Object {
+            $l = ([string]$_).Trim()
+            if ($l.StartsWith('!')) { $l = $l.Substring(1).Trim() }
+            (($l -replace '/', '\') -notlike '码表\*')
+        })
+        Write-ToolLog ("BackupDiff: 用户码表区在场（码表\非空/数据\在场 之一）——码表\ 全域冻结，剔除清单 " +
+            ($beforeN - @($lines).Count) + " 项（零写入/零补缺/零复活）") '='
+    }
+
     foreach ($raw in @($lines)) {
         $line = ([string]$raw).Trim()
         if (-not $line -or $line.StartsWith('#')) { continue }

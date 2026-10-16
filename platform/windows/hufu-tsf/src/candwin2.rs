@@ -64,6 +64,27 @@ pub fn cand_menu_open() -> bool {
     menu_now_ms() < CAND_MENU_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 【右键菜单 z 序保护 2026-10-16】右键候选菜单窗存活期间，候选窗/
+/// 挂件窗的 SetWindowPos 不得再断言 HWND_TOPMOST：SSF 独立皮肤的
+/// APNG 帧钟每帧走 show() → 尾部 SetWindowPos(HWND_TOPMOST)，把同为
+/// topmost 带的菜单窗（后建本在上）压回皮肤位图之下——用户实锤
+/// 「开独立皮肤右键候选，菜单被皮肤挡住」；矢量/JSON 皮肤无帧钟
+/// 不复现，正是差异根源。返回 SWP_NOZORDER（hWndInsertAfter 随之
+/// 被系统忽略——位置/尺寸照常，z 序不动）；菜单收场
+///（menu_finish 销毁窗）后自动恢复顶置断言。锁只在菜单窗
+/// 存活期多一次无竞争快查，动画帧热路径可忽略。
+pub(crate) fn swp_z_guard() -> SET_WINDOW_POS_FLAGS {
+    if MENU_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        SWP_NOZORDER
+    } else {
+        SET_WINDOW_POS_FLAGS(0)
+    }
+}
+
 // ── 【自绘免激活菜单 2026-10-12·虎娘路线】──
 // SetForegroundWindow(owner)+TrackPopupMenu 会把宿主前台夺到菜单 owner
 // 上 → CUAS 杀组段 → 孤儿字母/虚线消失/候选飘左上角/闪退链全由此起
@@ -972,7 +993,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         y,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             }
@@ -4262,16 +4283,21 @@ impl CandidateWindowV2 {
         // 与下方 height 公式同源；渲染锚 y0=y0_src×scale）。
         let ssf_row_src = ssf.as_ref().map(|f| row_user / f.scale);
         let ssf_y0_src = match (&ssf, ssf_row_src) {
-            (Some(f), Some(rs)) => Some(
-                if !raw.is_empty() || freq_view.is_some() {
-                    f.layout.code.top.max(0) as f32
-                        + rs
-                        + f.layout.code.bottom.max(0) as f32
-                        + f.layout.candidates.top.max(0) as f32
-                } else {
-                    f.layout.candidates.top.max(0) as f32
-                },
-            ),
+            (Some(f), Some(rs)) => {
+                // 【候选高度·语义更正 2026-10-16 用户澄清】cand_y 不再作
+                // 皮肤内部候选区偏移（本轮改挂：候选窗与光标行的垂直
+                // 距离，见 show() 锚点落点 cy）。此处还原皮肤原布局。
+                Some(
+                    if !raw.is_empty() || freq_view.is_some() {
+                        f.layout.code.top.max(0) as f32
+                            + rs
+                            + f.layout.code.bottom.max(0) as f32
+                            + f.layout.candidates.top.max(0) as f32
+                    } else {
+                        f.layout.candidates.top.max(0) as f32
+                    },
+                )
+            }
             _ => None,
         };
         let height = match &ssf {
@@ -5082,7 +5108,14 @@ impl CandidateWindowV2 {
                             tf,
                             &rect,
                             brush,
-                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            // 【彩色 emoji 2026-10-17 用户实锤】候选里的 emoji
+                            // 之前渲染成单色符号（上屏到应用里却是彩色表情）：
+                            // D2D 默认走字形单色描边，必须显式开
+                            // ENABLE_COLOR_FONT 才渲染 COLR 彩色字形
+                            //（Segoe UI Emoji）；DirectWrite 系统字体回退
+                            // 自会把 emoji 码点指到该字体，此处只差这面旗。
+                            // 普通中文/ASCII 字体无彩色表，零影响零成本。
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
                     }
@@ -6161,11 +6194,20 @@ impl CandidateWindowV2 {
                         // right 语义正常不动。1px 退化锚与 16px selection 锚
                         // top 恒同 → 两源落点自然归一，四十四修的荡秋千
                         // 修复语义保留（补齐块只改 bottom，此处不再读）。
+                        // 【候选高度=与光标距离 2026-10-16 用户澄清】语义
+                        // 更正：不是皮肤内部候选区偏移，而是**整个候选窗
+                        // 与光标行的垂直距离**。layout.cand_y（仅独立皮肤
+                        // 载荷携带此键；JSON 矢量缺省 0=零回归【回归红线】）
+                        // 以物理像素直接加在光标行 gap 上：正=离光标更远
+                        //（下方模式窗下移；贴屏底上翻模式窗再上移），负=
+                        // 贴近光标（可压进光标行）。钳 ±500 防呆；常数对
+                        // y 稳定锁/锚行分解的全部 delta 消去，零干扰。
+                        let cy = layout_f(skin, "cand_y", 0.0).clamp(-500.0, 500.0) as i32;
                         let (below, above_base) = if crate::tsf::host_is_weixin() {
                             let lh = self.last_line_h.filter(|h| *h >= 8).unwrap_or(16);
-                            (r.top + 4, r.top - lh)
+                            (r.top + 4 + cy, r.top - lh)
                         } else {
-                            (r.bottom + 4, r.top)
+                            (r.bottom + 4 + cy, r.top)
                         };
                         // 【上翻底边钉锚 2026-11】先判模式再算 y：上翻
                         //（下方放不下）锚定边=底边（y=锚行−h−4），本帧
@@ -6174,7 +6216,7 @@ impl CandidateWindowV2 {
                         let flipped_now = !(below + hpx <= vy + vh);
                         self.above_flip_last.set(flipped_now);
                         let y = if flipped_now {
-                            (above_base - hpx - 4).max(vy)
+                            (above_base - hpx - 4 - cy).max(vy)
                         } else {
                             below
                         };
@@ -6344,7 +6386,11 @@ impl CandidateWindowV2 {
                             if crate::tsf::trace_on() {
                                 crate::tsf::trace("cw2: 粘位跨编辑框作废 → 焦点编辑框正下方");
                             }
-                            self.focus_edit_below((height * dpi_scale) as i32)
+                            // 【候选高度=与光标距离 2026-10-16】兜底落点同
+                            // 步吃 cy（独立皮肤专属键，矢量缺省 0）。
+                            let cy =
+                                layout_f(skin, "cand_y", 0.0).clamp(-500.0, 500.0) as i32;
+                            self.focus_edit_below((height * dpi_scale) as i32, cy)
                         }
                         // 从未有过真实锚点且本帧也取不到：先记诊断；若无
                         // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
@@ -6937,6 +6983,8 @@ impl CandidateWindowV2 {
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
+                // 【右键菜单 z 序保护 2026-10-16】菜单窗存活期不再抢
+                // HWND_TOPMOST（SSF 帧钟每帧 show 会把菜单压到皮肤下）。
                 let swp_r = SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
@@ -6944,7 +6992,7 @@ impl CandidateWindowV2 {
                     py,
                     apply.0,
                     apply.1,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | swp_z_guard(),
                 );
                 // 【三十二修·首显时钟重锚】滑动从「窗口实际可见」起播满
                 // 全程（臂帧→SWP 之间隔着渲染+Present 同步等待，见上）。
@@ -6970,7 +7018,7 @@ impl CandidateWindowV2 {
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | swp_z_guard(),
                 )
             };
             // 【贴图挂件 2026-10-02】show 定位 SWP 后同步兄弟贴图窗
@@ -7092,7 +7140,7 @@ impl CandidateWindowV2 {
 
     /// 【四十八修】当前焦点编辑框正下方的落位（跨编辑框粘位作废后的
     /// 兜底；h=候选物理高）。查询失败返回 None 退原「焦点窗口内左下」。
-    fn focus_edit_below(&self, h: i32) -> (i32, i32) {
+    fn focus_edit_below(&self, h: i32, cy: i32) -> (i32, i32) {
         #[repr(C)]
         struct GTI4 {
             cb: u32,
@@ -7134,11 +7182,13 @@ impl CandidateWindowV2 {
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let x = fr.left.clamp(vx, (vx + vw - 200).max(vx));
-            let below = fr.bottom + 4;
+            // 【候选高度=与光标距离 2026-10-16】cy 同主锚点口径：正=更
+            // 远（下方下移/上方上移），负=贴近。
+            let below = fr.bottom + 4 + cy;
             let y = if below + h <= vy + vh {
                 below
             } else {
-                (fr.top - h - 4).max(vy)
+                (fr.top - h - 4 - cy).max(vy)
             };
             (x, y)
         }
@@ -7798,7 +7848,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             tgt.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 } else {
@@ -7823,7 +7873,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             np.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }
@@ -7849,7 +7899,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             cur.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }
@@ -7966,7 +8016,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         tgt.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             } else {
@@ -7999,7 +8049,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         np.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             }
@@ -8037,7 +8087,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         t.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
                 } else {
@@ -8058,7 +8108,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             cur.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }

@@ -32,6 +32,15 @@ pub struct Schema {
     /// 码全带 ` 前缀如 `aaaa）。` 加入编码字母表时 ` 起段编码查此表；
     /// 无副表（Arc 空表）时 ` 维持原行为。见 Schema::load 装载段。
     pub super_dict: std::sync::Arc<Dict>,
+    /// 【个人存储表 2026-10-16 用户需求】隐私码表（个人存储表.txt）：
+    /// 存个人信息（手机/身份证/地址等），**只随码表域候选出现**——
+    /// 不进导出合并列、不受前台调频/置顶/删词/{添加}影响、不进
+    /// user-adjust.log、不喂整句模型（独立 Dict，解码器无感知）。
+    /// 唯一修改通道=用户直接编辑文件（方案目录 个人存储表.txt，
+    /// 格式任意：码\t词 / 词\t码 / hufu-dict v1 头均可，parse_auto
+    /// 自动分拣）。与「用户调整」的本质区别：用户调整参与导出快照
+    /// 与前台调频增删，个人存储表两样都不沾。
+    pub personal: std::sync::Arc<Dict>,
     /// 用户调整（置顶/添加/删除日志）
     pub adjust: UserAdjust,
     /// 用户词库
@@ -89,6 +98,33 @@ fn merge_import_closure(
 }
 
 impl Schema {
+    /// 【个人存储表·数据目录 2026-10-16 用户实锤】用户把 个人存储表.txt
+    /// 放在**数据目录根**（D:\HuFu\数据\——全局语义：所有方案共用），
+    /// 此前装载只扫方案目录（码表\<方案>\）=「好像不生效」的病根。
+    /// 引擎在 Schema::load 后对数据目录根的两个名字（个人存储表/个人
+    /// 存储，txt/yaml 皆认）调本方法并入 personal 专槽；方案目录同名
+    /// 文件（按方案独立）仍同认，两处并存则合并（全局文件在后=追加）。
+    /// 格式同方案目录版（parse_auto：码\t词/词\t码/rime/v1）。
+    pub fn merge_personal_file(&mut self, path: &Path) {
+        if !path.is_file() {
+            return;
+        }
+        let lines = match parse::read_lines(path) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let t = parse::parse_auto(&lines);
+        if t.rows.is_empty() {
+            return;
+        }
+        let mut rows: Vec<DictEntry> = self.personal.entries.iter().cloned().collect();
+        rows.extend(t.rows);
+        self.personal = std::sync::Arc::new(Dict::from_entries(
+            "个人存储-全局".to_string(),
+            rows,
+        ));
+    }
+
     /// 加载方案目录。
     pub fn load(dir: &Path) -> std::io::Result<Schema> {
         let name = dir
@@ -107,6 +143,7 @@ impl Schema {
             reverse: None,
             reverse_path: None,
             super_dict: std::sync::Arc::new(Dict::new("super")),
+            personal: std::sync::Arc::new(Dict::new("personal")),
             adjust: UserAdjust::default(),
             user_dict: UserDict::default(),
             encoder_rules: Vec::new(),
@@ -117,6 +154,10 @@ impl Schema {
         // 【` 引导超集码表 2026-11】独立副表：**内容**识别（非空且
         // 全部行编码带 ` 前缀——文件名任意），见装载段与 is_backtick_table。
         let mut super_tables: Vec<PathBuf> = Vec::new();
+        // 【个人存储表 2026-10-16】隐私码表专槽（stem=个人存储表/个人
+        // 存储，txt/yaml 皆认）。装载段并入 schema.personal——绝不进
+        // 主码表/用户词/导出/前台调整（见 personal 字段注释）。
+        let mut personal_tables: Vec<PathBuf> = Vec::new();
         // 用户码表/用户词类文件（多多/QQ五笔语义=个人用户词）。命名只作
         // 初筛，是否晋升主码表见下方 BIG_USER_TABLE_AS_MAIN。
         let mut user_tables: Vec<PathBuf> = Vec::new();
@@ -177,6 +218,13 @@ impl Schema {
                         word_adj_lines = adj_lines;
                     }
                 }
+                // 【个人存储表 2026-10-16】隐私码表：只收路径，装载段
+                // 并入 personal 专槽（不进主码表/用户词——见 personal
+                // 字段注释）。「个人存储」短名同认：防用户少写「表」字
+                // 时文件被误当主码表并入（隐私语义要认得准）。
+                "个人存储表" | "个人存储" => {
+                    personal_tables.push(path.clone());
+                }
                 _ => {}
             }
             if stem.contains("拼音") && ext == "注释" {
@@ -209,6 +257,10 @@ impl Schema {
                 } else if stem.contains("反查") {
                     // 【性能】懒加载：只记路径（见 reverse 字段注释）
                     schema.reverse_path = Some(path.clone());
+                } else if stem == "个人存储表" || stem == "个人存储" {
+                    // 【个人存储表 2026-10-16】match 分支已收专槽；
+                    // 此处拦截防 is_backtick_table 重复解析 + 误入
+                    // big_tables（retain 段兜底双保险）。
                 } else {
                     // 其余 txt：内容分拣——` 前缀码全量副表（超集单字，
                     // 文件名任意）vs 主码表候选（多多/QQ五笔/虎整句）。
@@ -259,6 +311,7 @@ impl Schema {
             !matches!(
                 file_stem_lower(p).as_str(),
                 "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
+                    | "个人存储表" | "个人存储"
             )
         });
         // 主码表选择（Rime dict.yaml 优先）：
@@ -344,6 +397,7 @@ impl Schema {
             !matches!(
                 file_stem_lower(p).as_str(),
                 "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
+                    | "个人存储表" | "个人存储"
             )
         });
         big_tables.sort();
@@ -390,6 +444,25 @@ impl Schema {
             }
             schema.super_dict = std::sync::Arc::new(Dict::from_entries(
                 format!("{name}-超集"),
+                rows,
+            ));
+        }
+
+        // 【个人存储表 2026-10-16】专槽装载：与主码表完全隔离（独立
+        // Dict），多个文件按文件名序合并。格式任意（parse_auto 分拣
+        // 码\t词 / 词\t码 / rime / hufu-dict v1）。词条只经
+        // Schema::candidates 追加进码表域候选——其余一切通道（主码表
+        // 合并/用户词/整句解码/导出/前台调整）均不可见。
+        if !personal_tables.is_empty() {
+            personal_tables.sort();
+            let mut rows: Vec<DictEntry> = Vec::new();
+            for p in &personal_tables {
+                let lines = parse::read_lines(p)?;
+                let t = parse::parse_auto(&lines);
+                rows.extend(t.rows);
+            }
+            schema.personal = std::sync::Arc::new(Dict::from_entries(
+                format!("{name}-个人存储"),
                 rows,
             ));
         }
@@ -499,7 +572,44 @@ impl Schema {
             let pos = out.iter().position(|e| !e.pinned).unwrap_or(out.len());
             out.insert(pos, ue);
         }
+        // 【个人存储表 2026-10-16】隐私词条追加在候选列表**最末**：
+        // 主码表/置顶块/用户词的原序原位一概不动（隐私词条是「顺带
+        // 出现的私人候选」，不参与任何排序竞争）。同码同词与前面
+        // 列表撞车时跳过（主码表优先——防 {添加} 写出重复词条双占位）。
+        // 追加在 adjust.apply / user_dict 之后：置顶/删除/加权等一切
+        // 调整回放对它无效（前台调不动的实现基础）。
+        if !self.personal.is_empty() {
+            for e in self.personal.lookup(code) {
+                if out.iter().any(|x| x.text == e.text) {
+                    continue;
+                }
+                out.push(e.clone());
+            }
+        }
         out
+    }
+
+    /// 【个人存储表 2026-10-16】(码, 词) 是否来自个人存储表——引擎侧
+    /// 打 Personal 源标记（候选保护）与导出过滤的共用判据。个人表
+    /// 通常极小（几十条），查询零负担。
+    pub fn personal_contains(&self, code: &str, text: &str) -> bool {
+        if self.personal.is_empty() {
+            return false;
+        }
+        self.personal
+            .lookup(code)
+            .iter()
+            .any(|e| e.text == text)
+    }
+
+    /// 【个人存储表 2026-10-16】词文本是否在个人存储表（任意码）——
+    /// 加词/加权入口防泄漏判据：隐私词换个码 {添加} 进 用户调整.txt
+    /// 同样是泄漏（导出带走），同词拦截；补充语料（/jq）同口径。
+    pub fn personal_has_text(&self, text: &str) -> bool {
+        if self.personal.is_empty() {
+            return false;
+        }
+        self.personal.entries.iter().any(|e| e.text == text)
     }
 
     /// 词的最优码（反查注释 / 造词）。
@@ -1152,6 +1262,12 @@ mod tests {
         let dir = std::path::Path::new("D:\\HuFu\\码表\\五笔");
         if !dir.is_dir() {
             eprintln!("（无生产目录，跳过）");
+            return;
+        }
+        // 【环境容错 2026-10-17】测试依赖生产数据文件（用户可自行增删，
+        // 实锤：目录在但 1符号.txt 被清）——判向样张不在即跳过，不算回归。
+        if !dir.join("1符号.txt").is_file() {
+            eprintln!("（1符号.txt 不在（用户已清理），跳过判向样张验证）");
             return;
         }
         let s = Schema::load(dir).unwrap();

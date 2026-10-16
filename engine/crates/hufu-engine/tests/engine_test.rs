@@ -2,7 +2,7 @@
 
 use hufu_config::Config;
 use hufu_engine::{Engine, SentenceDecoder, SentenceHit, Session};
-use hufu_types::{Candidate, KeyInput};
+use hufu_types::KeyInput;
 use std::sync::Arc;
 
 fn setup() -> (Engine, Session, std::path::PathBuf) {
@@ -238,7 +238,7 @@ fn reverse_lookup_mode() {
     std::fs::write(dir.join("Bime_小鹤双拼反查.txt"), "我\two\n的\tde\n").unwrap();
     engine.schema = hufu_dict::Schema::load(&dir).unwrap();
     engine.process_key(&mut session, key('`'));
-    let out = engine.process_key(&mut session, key('d'));
+    engine.process_key(&mut session, key('d'));
     engine.process_key(&mut session, key('e'));
     let st = engine.state(&session);
     assert_eq!(st.raw, "de");

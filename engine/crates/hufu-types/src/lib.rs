@@ -94,6 +94,12 @@ pub enum CandidateKind {
     English,
     History,
     Calculator,
+    /// 【个人存储表 2026-10-16】个人存储表词条（隐私码表）：可正常
+    /// 选中上屏，但**不可前台管理**——置顶/删词/定序/对调白名单
+    /// （Dict|UserWord）天然排除它；learn 调频与 user-adjust.log 也
+    /// 跳过（隐私不落盘）；导出过滤按它剔除。唯一修改通道=用户直接
+    /// 编辑 个人存储表.txt。
+    Personal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

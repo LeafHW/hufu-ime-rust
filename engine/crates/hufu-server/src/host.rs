@@ -98,6 +98,20 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
         "hufu-yuebai.json",
         include_str!("../official-skins/hufu-yuebai.json"),
     ),
+    // 【夜莺/夜桜两款收编 2026-10-16 用户拍板】yeying-yuexia（夜莺·月下文羽）
+    // + yozakura-yingyue（夜桜·樱月幻梦）内嵌官方化——动图挂件是皮肤
+    // 设计内容（樱花 APNG，来自作者导出包，勿清空）。升级语义（用户
+    // 原话）：换 exe 后新增皮肤自动到手（install_official_skins 缺失
+    // 自愈）；已有文件哪怕用户改过数值也**绝不覆盖**（只入新的，存量
+    // 不碰——id 不变量自愈除外，id 本应=文件名 stem）。
+    (
+        "yeying-yuexia.json",
+        include_str!("../official-skins/yeying-yuexia.json"),
+    ),
+    (
+        "yozakura-yingyue.json",
+        include_str!("../official-skins/yozakura-yingyue.json"),
+    ),
 ];
 
 /// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
@@ -204,6 +218,13 @@ impl Host {
         // 用户同名定制优先——与官方 JSON 皮肤同款语义）。
         host.install_official_ssf();
         mark("ssf", &t0);
+        // 【个人存储表模板自愈 2026-10-17 老户升级补齐】升级安装对码表
+        // 目录零写入（iss 数据铁律：不覆盖/不补缺/不复活已删——用户财
+        // 产保护），1.8.6 新增的方案目录 个人存储表.txt 模板老户拿不到；
+        // 与官方皮肤同款语义：server 启动逐方案目录补缺（仅缺失才写，
+        // 存在不覆盖——用户已填内容永不动）。
+        host.install_personal_templates();
+        mark("pstpl", &t0);
         // 【SSF 皮肤 2026-12】.ssf 完全用户自管理：不做内置/自装（法律
         // 红线：绝不内置搜狗皮肤）。仅启动自愈：config 指向的 ssf 皮肤
         // 源文件已删 → 回退默认 JSON 皮肤（设计稿降级矩阵「下次重载时
@@ -230,6 +251,48 @@ impl Host {
                 if let Err(e) = std::fs::write(&p, body) {
                     eprintln!("系统自带 ssf {file} 落盘失败: {e}");
                 }
+            }
+        }
+    }
+
+    /// 【个人存储表模板自愈 2026-10-17】每个方案目录缺 个人存储表.txt
+    /// 时写入注释模板（UTF-8 BOM + CRLF + 结尾换行——末行无换行会让直
+    /// 接追加的词条粘进注释静默失效）。仅补缺，绝不覆盖。模板文本与
+    /// pack.ps1 1e 段 $pstTpl **两处同步维护**（改一处须同步另一处）。
+    fn install_personal_templates(&mut self) {
+        const PST_TEMPLATE: &str = concat!(
+            "# 个人存储表（隐私词库）\r\n",
+            "#\r\n",
+            "# 作用：放只给你自己用的词，比如手机号、证件号、住址、各种账号。\r\n",
+            "#   这里的词平时照常打得出、能上屏，但不会出现在导出的码表里，\r\n",
+            "#   也不会进设置页面，不参与调频和词库调整。\r\n",
+            "#   换句话说：只有直接编辑这个文件才能改动它，别处都看不见。\r\n",
+            "#\r\n",
+            "# 格式：一行一条 = 编码 + Tab键 + 词。例如（去掉行首 # 即生效）：\r\n",
+            "#   sjh〔按一下Tab键〕13800880088\r\n",
+            "#   zjz〔按一下Tab键〕某某省某某市某某区\r\n",
+            "#\r\n",
+            "# 用法：用记事本打开本文件，照上面格式添加词条并保存，\r\n",
+            "#   保存后一两秒即可打出（正在打字时会等这串打完再生效）。\r\n",
+            "#   词条会追加在候选的末尾，用数字键选它上屏。\r\n",
+            "#\r\n",
+            "# 提示：升级输入法不会改动这个文件；本文件与方案同名目录绑定，\r\n",
+            "#   换方案请编辑对应方案文件夹里的这一份。\r\n",
+        );
+        let schemas = self.engine.schemas.clone();
+        let dict_root = hufu_engine::Engine::resolve_data_sub(
+            &self.data_dir,
+            &self.engine.config.schema.dir,
+        );
+        for name in schemas {
+            let p = dict_root.join(&name).join("个人存储表.txt");
+            if p.exists() {
+                continue;
+            }
+            let mut body: Vec<u8> = b"\xEF\xBB\xBF".to_vec();
+            body.extend_from_slice(PST_TEMPLATE.as_bytes());
+            if let Err(e) = std::fs::write(&p, &body) {
+                eprintln!("个人存储表模板写入失败 {}: {e}", p.display());
             }
         }
     }
@@ -1182,12 +1245,17 @@ mod export_util {
         codes.sort();
         codes.dedup();
 
-        // 2) 逐码取当前生效序（含 pinned 标记——多多 #固 / 权重置顶用）
+        // 2) 逐码取当前生效序（含 pinned 标记——多多 #固 / 权重置顶用）。
+        // 【个人存储表不导出 2026-10-16】隐私词条（手机/身份证/住址）
+        // 绝不进导出文件：candidates() 会把个人存储表词条追加在末尾，
+        // 此处按 personal_contains 整条剔除；personal 专码（码表/用户词
+        // 都没有的码）天然不在 codes 全集里，双保险。
         let mut rows: Vec<(String, Vec<(String, bool)>)> = Vec::new();
         for code in &codes {
             let texts: Vec<(String, bool)> = schema
                 .candidates(code)
                 .iter()
+                .filter(|e| !schema.personal_contains(code, &e.text))
                 .map(|e| (e.text.clone(), e.pinned))
                 .collect();
             if !texts.is_empty() {
@@ -1435,6 +1503,40 @@ mod export_util {
 
         fn out_path() -> std::path::PathBuf {
             test_base("out").with_extension("txt")
+        }
+
+        /// 【个人存储表不导出 2026-10-16】隐私词条候选可见（同码混排
+        /// 追加在末尾）、导出剔除：同码个人词出局码表词照出；个人专码
+        /// 整码不在导出编码全集。
+        #[test]
+        fn personal_table_never_exported() {
+            let tmp = test_base("personal");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(
+                &tmp.join("main.txt"),
+                "#hufu-dict v1 name=t\nsj\t数据\njd\t就\n",
+            )
+            .unwrap();
+            std::fs::write(&tmp.join("个人存储表.txt"), "sj\t13800880088\nmy\t张三丰\n").unwrap();
+            let s = Schema::load(&tmp).unwrap();
+            // 候选在场：同码混排（个人词追加在末尾，不抢码表词位）
+            let cs = s.candidates("sj");
+            let sj: Vec<&str> = cs.iter().map(|e| e.text.as_str()).collect();
+            assert_eq!(sj, ["数据", "13800880088"], "个人词追加在候选末尾");
+            assert!(s.personal_contains("sj", "13800880088"), "(码,词) 判据");
+            assert!(s.personal_has_text("张三丰"), "任意码判据");
+            assert!(s.personal.lookup("my").iter().any(|e| e.text == "张三丰"), "个人专码可打出");
+            // 导出全剔除
+            let out = out_path();
+            export_one(&s, &out, ExportFormat::Sentence).unwrap();
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            let joined = lines.join("\n");
+            assert!(!joined.contains("13800880088"), "同码个人词不导出");
+            assert!(!joined.contains("张三丰"), "个人专码整码不导出");
+            assert!(!joined.contains("\nmy ") && !joined.starts_with("my "), "个人码不出行");
+            assert!(joined.contains("数据"), "码表词照常导出");
+            let _ = std::fs::remove_dir_all(&tmp);
         }
 
         #[test]

@@ -129,6 +129,8 @@ const WM_APP_DEFER: u32 = 0x8002;
 /// 下一键——切窗后牌面即时对准；现场反馈 EmEditor↔cmd 切换后中英
 /// 状态显示不准的修复通道）。
 const WM_APP_MODE_SYNC: u32 = 0x8003;
+// 【Alt+修改 下线 2026-10-17】WM_APP_ALTEXEC 转交臂与 defer_hwnd()
+// 读取口已随功能整体删除。
 
 /// 焦点 worker 存好回执后调用（任意线程）：向 defer 窗投递立即应用。
 /// 窗未建（进程从未 Activate，理论不可达——worker 本就源自焦点回调）
