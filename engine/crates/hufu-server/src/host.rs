@@ -176,10 +176,51 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// 【导出随行 2026-10-16】该 .ssf 文件名是否系统自带（导出时排除——
-/// 官方皮肤随安装分发，设置快照里只带用户自弄的）。
-pub fn is_official_ssf(file: &str) -> bool {
-    OFFICIAL_SSF.iter().any(|(f, _)| *f == file)
+/// 【导出瘦身 2026-10-18】serde_json Value 深比较，数字按数值比——
+/// 皮肤经设置页保存路径重序列化会把 `6.0` 写成 `6`，而 Number(6)≠
+/// Number(6.0)（u64 vs f64 变体），原生 == 恒不等（实测夜桜 repo
+/// 36 个数字里 5 个整型 token，disk 副本 33 个）。皮肤域只有小整数
+/// 与小数（字号/颜色/边距），f64 归一比较无损。
+fn json_value_num_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => {
+            match (x.as_f64(), y.as_f64()) {
+                (Some(p), Some(q)) => p == q,
+                _ => x == y,
+            }
+        }
+        (serde_json::Value::Object(m), serde_json::Value::Object(n)) => {
+            m.len() == n.len()
+                && m.iter()
+                    .all(|(k, v)| n.get(k).map(|w| json_value_num_eq(v, w)).unwrap_or(false))
+        }
+        (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| json_value_num_eq(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+/// 【导出瘦身 2026-10-18】磁盘上的官方 JSON 皮肤与内嵌版**语义**相同
+///（数字归一的深比较，见 json_value_num_eq）？相同=纯冗余（exe 内嵌
+/// 自愈，导出它白占体积——夜桜/夜莺两张大图皮内联 8.5MB 就是 15MB
+/// 导出的主犯）；用户改过（配色/挂件，如湖光）= 真用户数据，照常
+/// 导出。导出侧专用，自愈逻辑不看这个。
+pub fn official_skin_unchanged(file: &str, disk: &serde_json::Value) -> bool {
+    OFFICIAL_SKINS.iter().any(|(f, body)| {
+        *f == file
+            && serde_json::from_str::<serde_json::Value>(body)
+                .map(|v| json_value_num_eq(&v, disk))
+                .unwrap_or(false)
+    })
+}
+
+/// 【导出瘦身 2026-10-18】同上，.ssf 版：官方名且字节未改才排除。
+///（用户导入过同名更新版=内容不同=会随导出带走的。）
+pub fn official_ssf_unchanged(file: &str, disk: &[u8]) -> bool {
+    OFFICIAL_SSF
+        .iter()
+        .any(|(f, body)| *f == file && *body == disk)
 }
 
 pub struct Host {

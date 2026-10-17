@@ -2168,6 +2168,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 // 字段由 Skin 自身 serde 决定；读不动的跳过不拖垮导出）
                 if let Ok(txt) = std::fs::read_to_string(&p) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        // 【导出瘦身 2026-10-18】官方皮肤与内嵌版语义
+                        // 相同 → 纯冗余（exe 内嵌自愈；夜桜/夜莺两张
+                        // 大图皮内联 8.5MB，是「导出 15MB」的主犯）。
+                        // 用户改过（配色/挂件，如湖光）= 真用户数据，
+                        // 照常带。语义比较（Value 深等）——磁盘皮经
+                        // 设置页保存路径重序列化，字节比对恒不等。
+                        if crate::host::official_skin_unchanged(&format!("{id}.json"), &v) {
+                            continue;
+                        }
                         skins.insert(id, v);
                     }
                 }
@@ -2186,13 +2195,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         ssf_settings.insert(e.id.clone(), v);
                     }
                 }
-                // 文件：系统自带排除（随安装分发；导出只带用户自弄的）
+                // 文件：系统自带排除（随安装分发；导出只带用户自弄的）。
+                // 【导出瘦身 2026-10-18】从「官方名即排除」收紧为「官方
+                // 名且字节未改」——用户导入过同名更新版 = 内容不同 =
+                // 会随导出带走（不然迁移丢皮）。
                 let file = format!("{}.ssf", e.id);
-                if crate::host::is_official_ssf(&file) {
-                    continue;
-                }
                 let p = host.ssf_skins_dir().join(&file);
                 if let Ok(bytes) = std::fs::read(&p) {
+                    if crate::host::official_ssf_unchanged(&file, &bytes) {
+                        continue;
+                    }
                     if let Ok(b64) = b64::encode(&bytes) {
                         ssf_skins.insert(e.id.clone(), serde_json::json!({ "ssf": b64 }));
                     }
