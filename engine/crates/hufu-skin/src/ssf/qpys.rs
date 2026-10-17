@@ -536,9 +536,16 @@ mod tests {
     use super::*;
 
     /// 三个真实 QQ 皮肤端到端：解容器→定义全链（含 XML 映射）。
+    /// 【夹具缺位跳过 2026-10-18】样本目录是机器本地夹具（桌面文件夹，
+    /// 可被清理）——目录不在时安静跳过而不是 panic（本机清理后
+    /// `cargo test --workspace` 被这颗哑弹炸过一次）；目录在时断言全保。
     #[test]
     fn real_qpys_skins_end_to_end() {
         let dir = std::path::Path::new(r"C:\Users\Leafyin\Desktop\新建文件夹 (2)");
+        if !dir.is_dir() {
+            eprintln!("skip: 本机夹具目录不存在（{}）", dir.display());
+            return;
+        }
         let mut checked = 0;
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
             let path = entry.path();

@@ -961,10 +961,22 @@ impl Engine {
             // selectN → 以对应数字键名走 on_rank_key 全链路（整句锁/
             // 闪帧/调频/越界标顶回退全部同构；No 越界→fallback 数字
             // 语义）。非编码态不吞（CapsLock 空态=切英文等内建语义）。
+            // 【引导域快符保护 2026-10-18 用户实锤】z 绑 4 选后，;
+            // 引导态（raw=";"）按 z 被 selectN 截走 → 快符 ;z=· 打不出
+            //（别的键没绑 selectN 一切正常）。定案：raw 处于引导域
+            //（; / \ ` 前缀、z 符号域）且按键续写后仍是有效编码前缀
+            //（has_continuation_prefix）时，selectN 让位给正常输入——
+            // 与内建选重键「编码延续优先」（on_char 的 !extends 门）
+            // 同一哲学：引导序列中途，输入是主流程，选重是副流程。
             a if a.starts_with("select") && a.len() >= 7 => {
                 let n = a[6..].parse::<usize>().ok()?;
                 if !(1..=10).contains(&n) || !composing {
                     return None;
+                }
+                if let Some(c) = orig_key {
+                    if self.keymap_guide_continuation(session, c) {
+                        return None;
+                    }
                 }
                 let digit = if n == 10 { '0' } else { char::from_digit(n as u32, 10)? };
                 Some(self.on_rank_key_ex(session, digit, orig_key))
@@ -2805,6 +2817,28 @@ impl Engine {
                 o.back = fback;
                 return o;
             }
+            // 【字母越界顶屏转码 2026-10-18 用户需求·与 / 键越界同族】
+            // 字母键绑 selectN 越界、且该字母自身是编码起点（狂练：
+            // z={重复上屏}/{撤回}）时不再死键：顶屏当前页首选（页基准
+            // top_commit_base，功能词走 pair 解析——{重复上屏} 展开上次
+            // 上屏、{撤回}=空提交+回删）+ 该字母重开新编码段，候选窗
+            // 即出该字母的候选（「按 z 的同时顶屏并显示是要重复上屏
+            // 还是撤回」）。不调频（越界不是选重偏好，与标点/数字标顶
+            // 同口径）。字母非编码起点维持死键防误触（2026-11「字母类
+            // 键保持死键」口径的精准放开——只放编码起点字母）。
+            if key_char.is_ascii_lowercase() && self.letter_starts_code(key_char) {
+                let (first, fback) = self.resolve_commit_pair(
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
+                );
+                session.clear();
+                session.raw = key_char.to_string();
+                self.refresh_candidates(session);
+                let mut o = KeyOutcome::commit(first, self.state(session));
+                o.back = o.back.max(fback);
+                return o;
+            }
         }
         self.select_candidate_ex(session, idx, true, no_learn)
     }
@@ -2898,6 +2932,33 @@ impl Engine {
     fn semicolon_guide_active(&self) -> bool {
         (self.config.input.semicolon_guide && self.has_continuation_prefix(";"))
             || self.dict_has_semicolon_codes()
+    }
+
+    /// 【引导域快符保护 2026-10-18】raw 是否处于引导域（; / \ ` 前缀或
+    /// z 符号域——Dict.z_symbol_domain 判定），且按键 c 续写后仍是有效
+    /// 编码前缀（快符 ;z=· 类）。keymap selectN 在此让位给正常输入：
+    /// 引导序列里的字母是编码不是选重（见 run_keymap selectN 分支）。
+    /// 只拦「确实构成延续」的键——不构成延续的键照旧走 selectN（越界
+    /// 转码/死键由 on_rank_key_ex 越界分支处理）。
+    fn keymap_guide_continuation(&self, session: &Session, c: char) -> bool {
+        let raw = session.raw.as_str();
+        if raw.is_empty() {
+            return false;
+        }
+        let guide = raw.starts_with(';')
+            || raw.starts_with('/')
+            || raw.starts_with('\\')
+            || raw.starts_with('`')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain);
+        guide && self.has_continuation_prefix(&format!("{raw}{c}"))
+    }
+
+    /// 【字母越界顶屏转码 2026-10-18】字母是否为编码起点（空态按下该
+    /// 字母会进组段：有自身候选或存在更长延续）。狂练 z={重复上屏}/
+    /// {撤回} = 是；无码字母 = 否（selectN 越界维持死键防误触）。
+    fn letter_starts_code(&self, c: char) -> bool {
+        let s = c.to_string();
+        !self.schema.candidates(&s).is_empty() || self.has_continuation(&s)
     }
 
     /// 内联提交首选（顶屏 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
@@ -10354,6 +10415,92 @@ mod tests {
             Some("就/"),
             "slash_dunhao 关：越界=首选+/（punct 自映）"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【z 键 4 选两景 2026-10-18 用户需求】狂练方案 z={重复上屏}/{撤回}：
+    /// ①引导域快符保护——z 绑 4 选后 ; 引导态按 z 仍打得出 ;z=·（引导域
+    /// 编码延续优先于 selectN，与内建选重键「编码延续优先」同哲学）；
+    /// ②越界转码——码表词候选不足 4 个时按 z=顶屏首选+z 重开编码段
+    ///（候选窗即出 {重复上屏}/{撤回}——「按 z 的同时顶屏并显示是要
+    /// 重复上屏还是撤回」），接选 {撤回} 走回删；
+    /// ③非码字母越界维持死键（防误触口径不放开）；
+    /// ④界内照常第 4 选；
+    /// ⑤z 符号域内再按 z=越界转码（顶 {重复上屏} 展开+z 菜单再来）。
+    #[test]
+    fn keymap_select_z_overrun_refeed_and_guide() {
+        // temp_dir 在本机拒绝访问（test_engine 同病）——走 manifest target。
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-zovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\nab\t一\nab\t二\nab\t三\nab\t四\nz\t{重复上屏}\nz\t{撤回}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("快符.txt"), "·\t;z\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.keymap.map.insert("z".into(), "select4".into());
+        cfg.keymap.map.insert("q".into(), "select4".into());
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // ① ;z=· 快符不被 select4 截走
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key(';'));
+        assert_eq!(s1.raw, ";", "; 进引导态");
+        let o1 = eng.process_key(&mut s1, key('z'));
+        assert_eq!(o1.commit.as_deref(), Some("·"), "引导域 ;z=· 照常直出");
+
+        // ② jd=[就,到的,加] 仅 3 候选 → z 越界=顶屏「就」+z 重开编码段
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        assert_eq!(s2.candidates.len(), 3, "jd 三候选（越界前提）");
+        let o2 = eng.process_key(&mut s2, key('z'));
+        assert_eq!(o2.commit.as_deref(), Some("就"), "越界=首选顶屏");
+        assert_eq!(s2.raw, "z", "z 重开新编码段");
+        let texts: Vec<&str> = s2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["{重复上屏}", "{撤回}"],
+            "候选窗即出 z 菜单（重复上屏/撤回）"
+        );
+        // 接选 {撤回}：回删上次上屏（历史栈）
+        eng.push_commit_history("的");
+        let o2b = eng.process_key(&mut s2, key('2'));
+        assert!(
+            o2b.commit.as_deref().unwrap_or("").is_empty(),
+            "「撤回」功能词=空提交"
+        );
+        assert_eq!(o2b.back, 1, "「撤回」回删 1 字");
+
+        // ③ q 无码：越界维持死键（consumed、不上屏、组段不动）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let o3 = eng.process_key(&mut s3, key('q'));
+        assert!(o3.commit.is_none(), "非码字母越界=死键不上屏");
+        assert_eq!(s3.raw, "jd", "死键组段不动");
+
+        // ④ 界内照常第 4 选
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('a'));
+        eng.process_key(&mut s4, key('b'));
+        let o4 = eng.process_key(&mut s4, key('z'));
+        assert_eq!(o4.commit.as_deref(), Some("四"), "4 候选在界=z 选第 4");
+
+        // ⑤ z 符号域内再按 z：zz 非延续 → select4 越界 → 顶 {重复上屏}
+        // 展开（last_commit）+ z 菜单再来
+        eng.push_commit_history("样张");
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('z'));
+        assert_eq!(s5.raw, "z", "空态 z 进符号域");
+        let o5 = eng.process_key(&mut s5, key('z'));
+        assert_eq!(o5.commit.as_deref(), Some("样张"), "「重复上屏」展开上次上屏");
+        assert_eq!(s5.raw, "z", "z 菜单再来（连按=重复+复选）");
 
         let _ = std::fs::remove_dir_all(dir);
     }

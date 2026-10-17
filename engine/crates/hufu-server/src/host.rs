@@ -119,6 +119,12 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
 /// 完全用户自管理、绝不内置」的红线针对的是**搜狗官方皮肤**（版权）；
 /// 这几款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘/秋风
 /// 知我意）。已存在的不覆盖（用户导入的同名更新优先）。
+/// 【虎娘新传全家桶 2026-10-18】虎娘（tigirl）官方目录 12 款中尚未
+/// 进虎符的 8 款一并内置（元气/雨竹听风/雪夜铃兰/霓虹电玩/桂月团圆/
+/// 柚光汽水/幽焰小恶魔/虎兄贵-健身——font140 校准 + 生产 PNG 版）；
+/// 旧名 3 款（虎纹奶油/蜜桃虎娘/鲸鱼娘）与虎娘新版同为当期产物
+///（仅 skin_name 命名差异），保留旧名不动用户已选引用。虎娘的
+/// 小喵风扇（搜狗商店皮肤）与 smile/默认（测试件）不随包。
 const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     (
         "虎纹奶油.ssf",
@@ -135,6 +141,38 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     (
         "秋风知我意.ssf",
         include_bytes!("../official-ssf/秋风知我意.ssf"),
+    ),
+    (
+        "虎娘-元气.ssf",
+        include_bytes!("../official-ssf/虎娘-元气.ssf"),
+    ),
+    (
+        "虎娘-雨竹听风.ssf",
+        include_bytes!("../official-ssf/虎娘-雨竹听风.ssf"),
+    ),
+    (
+        "虎娘-雪夜铃兰.ssf",
+        include_bytes!("../official-ssf/虎娘-雪夜铃兰.ssf"),
+    ),
+    (
+        "虎娘-霓虹电玩.ssf",
+        include_bytes!("../official-ssf/虎娘-霓虹电玩.ssf"),
+    ),
+    (
+        "虎娘-桂月团圆.ssf",
+        include_bytes!("../official-ssf/虎娘-桂月团圆.ssf"),
+    ),
+    (
+        "虎娘-柚光汽水.ssf",
+        include_bytes!("../official-ssf/虎娘-柚光汽水.ssf"),
+    ),
+    (
+        "虎娘-幽焰小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-幽焰小恶魔.ssf"),
+    ),
+    (
+        "虎兄贵-健身.ssf",
+        include_bytes!("../official-ssf/虎兄贵-健身.ssf"),
     ),
 ];
 

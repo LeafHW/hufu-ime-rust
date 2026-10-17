@@ -855,6 +855,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             crate::displayattr::register_provider_category();
         }
         crate::tsf::trace("activate: enter");
+        // 【键对劈开防线·2026-10-17】激活即播种：Ctrl+Shift 切换手势
+        // 期间 Shift down 可能已被旧世代记账、up 落在别家 TIP——首键
+        // 前先对齐物理真值。
+        sync_shift_latch(&self.shared);
         let tm = ptim
             .cloned()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
@@ -1049,6 +1053,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
         // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
+        // 【键对劈开防线·2026-10-17】失活即复位（键 sink 即将摘除，
+        // 悬挂 down 等不到 up；重激活路径在 Activate 侧另行播种）。
+        sync_shift_latch(&self.shared);
         // 【E7·反子类化 2026-11 对称化】游戏宿主失活：流派整体对称还原
         //（子类化 WndProc + 已拆链窗恢复默认 IMC + 三标志清零——旧版只
         // 还原 proc 不还原 HIMC/不复位 GAME_HOST_MODE，标志跨失活残留=
@@ -2054,11 +2061,47 @@ pub fn cand_interact_recover_pending(shared: &SharedRef) {
     }
 }
 
+/// 【键对劈开防线·2026-10-17】瞬态 Shift 闩锁对齐物理真值。
+///
+/// 病根（茧跟打自动发送实测，LL 键盘日志毫秒级实锤）：抢焦点型软件
+/// 会在用户物理 Shift 的按下与抬起**之间**切换窗口焦点（跟打器打完
+/// 一段自动发成绩：22:04:00.528 Shift↓@茧跟打 → .714 焦点抢去 QQ →
+/// .811 Shift↑ 落进 QQ 线程）——本侧 sink 记了 down、up 永不到达 →
+/// g.shift_down 永真 → vk_to_name 双保险（GetKeyState<0 ‖ 本位，
+/// 见其 4228 注释）把回窗后所有键判成上档 →「Shift 锁死/切窗回来
+/// 大写」，直到用户再物理点一次 Shift 才复位。
+///
+/// 修法：焦点边界（文档焦点事件 / TIP 激活 / 失活）把闩锁重播种为
+/// GetAsyncKeyState 物理真值——异步态全局准确（无 GetKeyState 逐线
+/// 程、32 位失真路径，与 1573 动效兜底同源），跨焦点边界的修饰键对
+/// 本就无语义：仍按着=true（回窗首击照判上档，不丢功能），已松开
+/// =false（劈开的悬挂 down 就此复位）。持久态（锁大写/中英模式/
+/// caps 对齐）一概不碰；焦点世代内的 down/up 配对记账照旧（3251/
+/// 3283）。shift_pending/space_ctrl_armed 等已有自愈链路的瞬态不
+/// 在此清（防线收敛到实锤病根，避免误伤五十五修宽限窗内的单击
+/// Shift 切换）。
+fn sync_shift_latch(shared: &SharedRef) {
+    let down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 } != 0;
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if g.shift_down != down {
+        trace(&format!(
+            "shift latch 重播种: {} → {}（键对劈开防线）",
+            g.shift_down, down
+        ));
+        g.shift_down = down;
+    }
+}
+
 fn handle_set_focus(
     shared: &SharedRef,
     pdimfocus: Option<&ITfDocumentMgr>,
     pdimprevfocus: Option<&ITfDocumentMgr>,
 ) -> Result<()> {
+    // 【键对劈开防线·2026-10-17】置于全部守卫/去抖之前：130ms 级的
+    // 抢焦点往返（去回循环）恰好落在 200ms 风暴去抖窗内，守卫之后
+    // 就漏了。任何文档焦点事件（含去抖跳过、交互守卫短路路径）都
+    // 先把闩锁对齐物理真值。
+    sync_shift_latch(shared);
     crate::candidate_ui::reset();
     // pdimfocus：冲销目标兜底用（Excel 第三次声明 prev=NULL，四修
     // 实锤 prev_ctx=None 绕过冲销分支直通清理杀组段——焦点 ctx 即

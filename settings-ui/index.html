@@ -1043,8 +1043,21 @@ function bindInputs() {
       const txt = await f.text();
       let v;
       try { v = JSON.parse(txt); } catch (er) { throw new Error("JSON 解析失败：" + er.message); }
-      // bundle 1=老格式（图内联）；2=资产池引用（大图入池去重，导入时服务端解回）
-      if (v.hufu_settings_bundle !== 1 && v.hufu_settings_bundle !== 2) throw new Error("不是虎符设置文件（缺少 hufu_settings_bundle 标记）");
+      // bundle 1=老格式（图内联）；2=资产池引用（大图入池去重，导入时服务端解回）；
+      // 3=+独立 .ssf 皮肤落盘与 overrides 恢复。改版本号时须与服务端
+      // /api/settings_import 的 match 白名单同步（engine/crates/hufu-server/src/main.rs）。
+      // 【老版裸 config 兼容 2026-10-18】无 hufu_settings_bundle 标记的文件=
+      // R22 时代「导出config.json」的裸 Config JSON——原样包一层 {config:…}
+      // 交服务端判定（Config 结构校验在服务端 serde，缺失字段补默认、
+      // 未知字段忽略）；标记存在但版本不识别才报错。
+      if (![1, 2, 3].includes(v.hufu_settings_bundle)) {
+        if (v.hufu_settings_bundle === undefined) {
+          if (v.config !== undefined) { v = { config: v.config }; }
+          else { v = { config: v }; }
+        } else {
+          throw new Error("不是虎符设置文件（hufu_settings_bundle 标记缺失或版本不识别：" + v.hufu_settings_bundle + "）");
+        }
+      }
       if (!v.config) throw new Error("文件里没有 config 节");
       const r = await fetch("/api/settings_import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(v) });
       const j = await r.json().catch(() => ({}));

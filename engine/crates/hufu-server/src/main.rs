@@ -2226,6 +2226,21 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let bundle_ver = v.get("hufu_settings_bundle").and_then(|x| x.as_i64());
             match bundle_ver {
                 Some(1) | Some(2) | Some(3) => {}
+                // 【老版裸 config 兼容 2026-10-18】无标记=「导出config.json」
+                //（R22 时代）的裸 Config JSON 或「config 节但无标记」手改件：
+                // 整体当 config-only 导入（皮肤等节不存在自然跳过——
+                // 「叠加到默认值」语义只动配置）。结构由下方 Config serde
+                // 校验兜底（缺失补默认、未知忽略——老版本导出的字段漂移
+                // 不炸）。标记存在但值不识别=真不是虎符设置文件。
+                None => {
+                    if !v.get("config").is_some() {
+                        let cfg_only = v.clone();
+                        v = serde_json::Value::Object(serde_json::Map::new());
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("config".into(), cfg_only);
+                        }
+                    }
+                }
                 _ => {
                     return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）")
                 }

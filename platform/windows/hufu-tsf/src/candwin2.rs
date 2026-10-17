@@ -1473,6 +1473,9 @@ pub(crate) struct SsfRuntime {
     pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
     pub(crate) clock: crate::ssfwin::SsfFrameClock,
     pub(crate) device: Option<crate::ssfwin::SsfDeviceBitmap>,
+    /// 【SSF 缩小高清化 2026-10-18】Profile E 预过滤 LRU（帧×尺寸，
+    /// 16MB/8 条——虎娘 skinRasters_ 同款）。
+    pub(crate) rasters: crate::ssfwin::SsfRasterCache,
     /// 键 =（fp, 变体图名）：变体切换 / server 侧重解包（fp 变）→
     /// 帧钟重播 + 设备位图置空（虎娘 rendererDirty_ 同款）。
     pub(crate) key: (String, String),
@@ -1735,6 +1738,9 @@ impl CandidateWindowV2 {
                 bitmap: bitmap.clone(),
                 clock: crate::ssfwin::SsfFrameClock::new(),
                 device: None,
+                // 【SSF 缩小高清化 2026-10-18】Profile E 预过滤 LRU（换装
+                // 重建=新皮肤新缓存；键未变时沿用旧缓存，DPI 切换复用）
+                rasters: crate::ssfwin::SsfRasterCache::new(),
                 key,
             });
         }
@@ -4920,11 +4926,15 @@ impl CandidateWindowV2 {
                     if let Some(f) = &ssf {
                         let mut rt = self.ssf.borrow_mut();
                         if let Some(r) = rt.as_mut() {
-                            let SsfRuntime { bitmap, clock, device, .. } = r;
+                            let SsfRuntime { bitmap, clock, device, rasters, .. } = r;
                             let (idx, _rem) = clock.current(bitmap);
-                            if let Ok(bmp) =
-                                unsafe { crate::ssfwin::device_bitmap(&ctx, bitmap, idx, device) }
-                            {
+                            // 【SSF 缩小高清化 2026-10-18】phys_scale=
+                            // 源画布 px→屏幕物理 px 总系数（等比 scale ×
+                            // dpi）——Profile E 预过滤的降采样比。
+                            let phys_scale = f.scale * dpi_scale;
+                            if let Ok(bmp) = unsafe {
+                                crate::ssfwin::device_bitmap(&ctx, bitmap, idx, phys_scale, device, rasters)
+                            } {
                                 unsafe {
                                     crate::ssfwin::draw_nineslice(
                                         &ctx,

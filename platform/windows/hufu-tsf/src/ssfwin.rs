@@ -610,20 +610,227 @@ pub struct SsfDeviceBitmap {
     dims: (u32, u32),
 }
 
-/// 取当前帧的 D2D 位图（B8G8R8A8_UNORM + PREMULTIPLIED，dpi=96——缩放由
-/// 调用方 SetTransform 承担，位图自身按像素 1:1）。帧号越界钳到末帧
-/// （防御：fp 切换瞬间帧流长度可能先于调用方更新）。
+// ============================================================================
+// 【SSF 缩小高清化·Profile E 2026-10-18】虎娘 SkinRasterFilter 移植
+// ============================================================================
+//
+// 病根：大图皮肤（1536×1024 画布）在日常字号下被大幅缩小（5:1 上下），
+// D2D DrawBitmap 的 LINEAR 采样只看 4 邻域 texel——细节被平均成糊，皮肤
+// 「缩小后不清晰」。虎娘解法（native/tsf/SkinRasterFilter.h + Candidate
+// RendererSkin.cpp:68-122「Profile E」，desktop sampling review 定稿）：
+//
+// ① 预过滤：按「物理目标 × 1.5」用高品质重采样核（核宽随缩小比加宽）
+//    先把原图缩到中间尺寸（不超过原图=不放大），D2D 末段只做 ≤1.5:1
+//    的轻采样——细节保留（ oversample 1.5 = Profile E 实测参数）；
+// ② 预乘钳制：三次核会在半透明边缘过冲，重建后每通道 ≤ alpha 再交给 D2D
+//   （虎娘注释：Filtering premultiplied color and alpha together avoids
+//    dark/color fringes——重采样全程在预乘域做）；
+// ③ 锐化一次（缓存 miss 时）：3×3 [1,2,1]⊗[1,2,1]/16 反锐化掩模，
+//    amount=0.30、threshold=1.0，只碰不透明区（alpha≥250——自制 PNG
+//    实心区常见 253/254，半透明剪影/光晕不动），直 RGB 域算细节再回预乘；
+// ④ 位图 DPI=96×预过滤宽/原图宽：九宫格 source 矩形（画布坐标）无需
+//    改动——D2D 设备上下文 DrawBitmap 的 source 以位图 DIP 计，DPI 自动
+//    折算（虎娘「Bitmap DPI keeps source rectangles in authored coords」）。
+//
+// CPU 预过滤结果进 LRU（8 条/16MB，虎娘同款预算）——静态皮肤每档 DPI
+// 只算一次；APNG 逐帧同路径。任何失败静默回退原图 1:1（保底出窗）。
+
+/// Profile E 过采样系数（虎娘 skinRasterOversample=1.5f 同值）。
+const SSF_RASTER_OVERSAMPLE: f32 = 1.5;
+/// 预过滤 LRU：条数与字节预算（虎娘 budget=16MB/entries=8 同款）。
+const SSF_RASTER_BUDGET: usize = 16 * 1024 * 1024;
+const SSF_RASTER_ENTRIES: usize = 8;
+
+/// 一条 CPU 侧预过滤帧（BGRA 预乘）。
+struct SsfRaster {
+    frame: usize,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// 每窗口（SsfRuntime）一份的预过滤 LRU 缓存。
+pub struct SsfRasterCache {
+    entries: Vec<SsfRaster>,
+    bytes: usize,
+}
+
+impl Default for SsfRasterCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SsfRasterCache {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+        }
+    }
+    /// 命中则移到尾（LRU）并返回 true。
+    fn touch(&mut self, frame: usize, w: u32, h: u32) -> bool {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|r| r.frame == frame && r.width == w && r.height == h)
+        {
+            let r = self.entries.remove(pos);
+            self.entries.push(r);
+            true
+        } else {
+            false
+        }
+    }
+    /// 取条目像素（要求先 touch 命中；两段式避开跨分支借用统一）。
+    fn pixels_of(&self, frame: usize, w: u32, h: u32) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|r| r.frame == frame && r.width == w && r.height == h)
+            .map(|r| r.pixels.as_slice())
+    }
+    fn insert(&mut self, frame: usize, w: u32, h: u32, pixels: Vec<u8>) {
+        let bytes = pixels.len();
+        while !self.entries.is_empty()
+            && (self.bytes + bytes > SSF_RASTER_BUDGET || self.entries.len() >= SSF_RASTER_ENTRIES)
+        {
+            let front = self.entries.remove(0);
+            self.bytes -= front.pixels.len();
+        }
+        self.bytes += bytes;
+        self.entries.push(SsfRaster {
+            frame,
+            width: w,
+            height: h,
+            pixels,
+        });
+    }
+}
+
+/// 【Profile E ③】反锐化掩模（虎娘 sharpenSkinRaster 逐行移植，BGRA 字节
+/// 版）。pixels=BGRA 预乘；只改不透明区（9 邻域 alpha 全 ≥250），半透明
+/// 边缘原样。宽高 <3 直接返回。
+fn sharpen_skin_raster(pixels: &mut [u8], width: u32, height: u32) {
+    let (w, h) = (width as usize, height as usize);
+    if w < 3 || h < 3 || pixels.len() < w * h * 4 {
+        return;
+    }
+    const AMOUNT: f32 = 0.30;
+    const THRESHOLD: f32 = 1.0;
+    const KERNEL: [f32; 3] = [1.0, 2.0, 1.0]; // ⊗ 自身 /16
+    let orig = pixels.to_vec();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let idx = (y * w + x) * 4;
+            let mut opaque = true;
+            let mut blur = [0f32; 3];
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let row = (y as i32 + dy) as usize;
+                    let col = (x as i32 + dx) as usize;
+                    let p = (row * w + col) * 4;
+                    let a = orig[p + 3];
+                    // 自制 PNG 实心区常见 alpha 253/254：计入不透明；
+                    // 半透明剪影与光晕整块跳过（虎娘同款护栏）。
+                    if a < 250 {
+                        opaque = false;
+                    }
+                    let weight = KERNEL[(dy + 1) as usize] * KERNEL[(dx + 1) as usize] / 16.0;
+                    let inv = 255.0 / (a as f32).max(1.0);
+                    blur[0] += orig[p] as f32 * inv * weight;
+                    blur[1] += orig[p + 1] as f32 * inv * weight;
+                    blur[2] += orig[p + 2] as f32 * inv * weight;
+                }
+            }
+            if !opaque {
+                continue;
+            }
+            let alpha = orig[idx + 3] as f32;
+            let inv = 255.0 / alpha.max(1.0);
+            for c in 0..3 {
+                let o = orig[idx + c] as f32 * inv;
+                let detail = o - blur[c];
+                let value = o + if detail.abs() > THRESHOLD {
+                    AMOUNT * detail
+                } else {
+                    0.0
+                };
+                let premul = (value * alpha / 255.0).round().clamp(0.0, alpha);
+                pixels[idx + c] = premul as u8;
+            }
+        }
+    }
+}
+
+/// 【Profile E ①+②】BGRA 预乘帧 → 高品质缩小（核宽随比率加宽的 Lanczos3）
+/// + 预乘钳制 + 锐化。返回 (宽, 高, 像素)；任何失败返回 None（回退 1:1）。
+fn prefilter_frame(
+    frame: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if frame.len() < (src_w as usize) * (src_h as usize) * 4 || dst_w == 0 || dst_h == 0 {
+        return None;
+    }
+    // BGRA → RGBA（image crate 原生序）
+    let mut rgba = frame.to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let img = image::RgbaImage::from_raw(src_w, src_h, rgba)?;
+    // 缩小在预乘域进行（alpha 与色一起滤波——虎娘：避免不可见 RGB
+    // 渗出的暗边/彩边）。Lanczos3=核宽随缩小比加宽的高品质重采样核
+    //（WIC HighQualityCubic 的 image crate 对应物）。
+    let small = image::imageops::resize(&img, dst_w, dst_h, image::imageops::FilterType::Lanczos3);
+    let mut out = small.into_raw();
+    for px in out.chunks_exact_mut(4) {
+        px.swap(0, 2); // RGBA → BGRA
+        let a = px[3] as u16;
+        // 三次核过冲钳制：预乘域每通道 ≤ alpha
+        for c in 0..3 {
+            if px[c] as u16 > a {
+                px[c] = a as u8;
+            }
+        }
+    }
+    sharpen_skin_raster(&mut out, dst_w, dst_h);
+    Some((dst_w, dst_h, out))
+}
+
+/// 取当前帧的 D2D 位图（B8G8R8A8_UNORM + PREMULTIPLIED）。帧号越界钳到
+/// 末帧（防御：fp 切换瞬间帧流长度可能先于调用方更新）。
+///
+/// 【Profile E】`phys_scale`=源画布像素→屏幕物理像素 的总缩放系数
+///（= 皮肤等比 scale × dpi_scale）。phys_scale×1.5 ≥ 1（放大/轻缩）时
+/// 位图 1:1 dpi=96（老路径，源像素直传——小倍率重采样无收益）；显著
+/// 缩小时先按 `ceil(src×min(1, phys_scale×1.5))` 预过滤（LRU 缓存），
+/// 位图 dpi=96×预过滤宽/源宽——draw_nineslice 的画布坐标 source 矩阵
+/// 无需任何改动。
 pub unsafe fn device_bitmap<'a>(
     ctx: &ID2D1DeviceContext,
     bmp: &SsfBitmap,
     frame_idx: usize,
+    phys_scale: f32,
     cache: &'a mut Option<SsfDeviceBitmap>,
+    rasters: &'a mut SsfRasterCache,
 ) -> windows_core::Result<&'a ID2D1Bitmap> {
     let idx = frame_idx.min(bmp.frames.len().saturating_sub(1));
+    // Profile E 目标尺寸（物理 ×1.5，封顶原图=不放大；虎娘 extent 同式）
+    let factor = if phys_scale.is_finite() && phys_scale > 0.0 {
+        (phys_scale * SSF_RASTER_OVERSAMPLE).min(1.0)
+    } else {
+        1.0
+    };
+    let pre_w = ((bmp.width as f32 * factor).ceil() as u32)
+        .clamp(1, bmp.width.max(1));
+    let pre_h = ((bmp.height as f32 * factor).ceil() as u32)
+        .clamp(1, bmp.height.max(1));
     // 命中判定先做（共享借用立即结束，不与后续可变借用打架）
     let hit = cache
         .as_ref()
-        .map(|c| c.frame_idx == idx && c.dims == (bmp.width, bmp.height))
+        .map(|c| c.frame_idx == idx && c.dims == (pre_w, pre_h))
         .unwrap_or(false);
     if hit {
         return Ok(&cache.as_ref().unwrap().d2d_bitmap);
@@ -631,34 +838,70 @@ pub unsafe fn device_bitmap<'a>(
     let Some(frame) = bmp.frames.get(idx) else {
         return Err(windows_core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
     };
+    // 【Profile E】显著缩小时走预过滤路径（LRU 两段式：先确保缓存就绪
+    // 再单次借用）；预过滤失败静默回退源像素 1:1（保底出窗，防每帧
+    // 重试风暴——dims 记实际进径）。
+    let mut use_pre = false;
+    if (pre_w, pre_h) != (bmp.width, bmp.height) {
+        if !rasters.touch(idx, pre_w, pre_h) {
+            if let Some((w, h, pixels)) =
+                prefilter_frame(frame, bmp.width, bmp.height, pre_w, pre_h)
+            {
+                rasters.insert(idx, w, h, pixels);
+            }
+            use_pre = rasters.touch(idx, pre_w, pre_h);
+        } else {
+            use_pre = true;
+        }
+    }
+    let (bw, bh) = if use_pre { (pre_w, pre_h) } else { (bmp.width, bmp.height) };
+    let (dpi_x, dpi_y) = if use_pre {
+        (
+            96.0 * pre_w as f32 / bmp.width.max(1) as f32,
+            96.0 * pre_h as f32 / bmp.height.max(1) as f32,
+        )
+    } else {
+        (96.0, 96.0)
+    };
+    let src_pixels: &[u8] = if use_pre {
+        rasters
+            .pixels_of(idx, pre_w, pre_h)
+            .filter(|p| p.len() >= (pre_w as usize) * (pre_h as usize) * 4)
+            .unwrap_or(frame)
+    } else {
+        frame
+    };
     let props = D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT {
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
             alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
         },
-        dpiX: 96.0,
-        dpiY: 96.0,
+        // 位图 DPI=源画布坐标 → 预过滤像素的自动折算（虎娘
+        // CandidateRendererSkin.cpp:116-119 同款；draw_nineslice 的
+        // source 矩形恒为画布坐标，两处调用零改动）。
+        dpiX: dpi_x,
+        dpiY: dpi_y,
         bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
         colorContext: std::mem::ManuallyDrop::new(None),
     };
     let size = D2D_SIZE_U {
-        width: bmp.width,
-        height: bmp.height,
+        width: bw.max(1),
+        height: bh.max(1),
     };
     // ID2D1DeviceContext::CreateBitmap（扩展版，D2D1_BITMAP_PROPERTIES1）：
     // 直接从 BGRA 预乘内存建图（虎娘 CreateBitmap(SizeU, data, stride,
-    // PBGRA,96,96) 同款）
+    // PBGRA,…) 同款；DPI 见 Profile E 注释）
     let b1: ID2D1Bitmap1 = ctx.CreateBitmap(
         size,
-        Some(frame.as_ptr() as *const core::ffi::c_void),
-        bmp.width * 4,
+        Some(src_pixels.as_ptr() as *const core::ffi::c_void),
+        bw.max(1) * 4,
         &props,
     )?;
     let b: ID2D1Bitmap = b1.cast()?;
     *cache = Some(SsfDeviceBitmap {
         d2d_bitmap: b,
         frame_idx: idx,
-        dims: (bmp.width, bmp.height),
+        dims: (pre_w, pre_h),
     });
     Ok(&cache.as_ref().unwrap().d2d_bitmap)
 }
@@ -1297,5 +1540,115 @@ mod tests {
         assert!(normalize_image_name("").is_err());
         let long = "x".repeat(129);
         assert!(normalize_image_name(&long).is_err());
+    }
+
+    // ──【SSF 缩小高清化·Profile E 2026-10-18】（虎娘 skin_raster_filter_
+    //    test.cpp 同款语义）──
+
+    /// 纯色图锐化不动（detail=0，threshold 内零增益）。
+    #[test]
+    fn skin_raster_sharpen_uniform_unchanged() {
+        let mut px = [64u8, 128, 192, 255].repeat(9 * 9);
+        let before = px.clone();
+        sharpen_skin_raster(&mut px, 9, 9);
+        assert_eq!(px, before, "flat raster must pass through unchanged");
+    }
+
+    /// 中心亮斑锐化后对比度增大（反锐化掩模把 detail 加回）。
+    #[test]
+    fn skin_raster_sharpen_amplifies_detail() {
+        let mut px = [100u8, 100, 100, 255].repeat(9 * 9);
+        let c = (4 * 9 + 4) * 4; // 中心像素
+        px[c] = 180;
+        px[c + 1] = 180;
+        px[c + 2] = 180;
+        sharpen_skin_raster(&mut px, 9, 9);
+        assert!(px[c] > 180, "bright center gets sharper (>{})", px[c]);
+        // 邻域被反向压暗（detail 负 → 减）
+        let n = (4 * 9 + 3) * 4;
+        assert!(px[n] < 100, "neighbor dips below flat ({})", px[n]);
+    }
+
+    /// 小图（<3 宽/高）不处理；极端棋盘不越界不炸（钳制在预乘域内）。
+    #[test]
+    fn skin_raster_sharpen_tiny_and_checker_safe() {
+        let mut tiny = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let before = tiny.clone();
+        sharpen_skin_raster(&mut tiny, 1, 2);
+        assert_eq!(tiny, before, "tiny raster unchanged");
+        let mut checker = Vec::with_capacity(8 * 8 * 4);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (x + y) % 2 == 0 { 255u8 } else { 0 };
+                checker.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        sharpen_skin_raster(&mut checker, 8, 8);
+        for px in checker.chunks_exact(4) {
+            assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]);
+        }
+    }
+
+    /// 半透明区（alpha<250）完全不碰——剪影/光晕保护。
+    #[test]
+    fn skin_raster_sharpen_skips_translucent() {
+        let mut px = Vec::with_capacity(5 * 5 * 4);
+        for y in 0..5 {
+            for x in 0..5 {
+                let v: u8 = if x == 2 && y == 2 { 200 } else { 50 };
+                // 预乘：alpha=100，色=v*100/255
+                let prem = (v as u16 * 100 / 255) as u8;
+                px.extend_from_slice(&[prem, prem, prem, 100]);
+            }
+        }
+        let before = px.clone();
+        sharpen_skin_raster(&mut px, 5, 5);
+        assert_eq!(px, before, "translucent regions untouched");
+    }
+
+    /// 预过滤：目标尺寸正确、预乘钳制（通道≤alpha）、输出不透明像素
+    /// 有锐化对比（比纯缩放更「硬」的边缘）。
+    #[test]
+    fn skin_raster_prefilter_downscale() {
+        // 16×16 棋盘 → 4×4
+        let mut src = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16 {
+            for x in 0..16 {
+                let v: u8 = if (x / 4 + y / 4) % 2 == 0 { 240 } else { 10 };
+                src.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let (w, h, out) = prefilter_frame(&src, 16, 16, 4, 4).expect("prefilter");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(out.len(), 4 * 4 * 4);
+        for px in out.chunks_exact(4) {
+            assert!(px[3] > 0);
+            assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3], "premultiplied clamp");
+        }
+        // 4×4 采样 4×4 块：等值映射后应保留高低两位的对比（非全平均糊）
+        let vals: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        let max = *vals.iter().max().unwrap();
+        let min = *vals.iter().min().unwrap();
+        assert!(max - min > 100, "contrast retained: min={min} max={max}");
+        // 坏输入 → None（调用方回退 1:1）
+        assert!(prefilter_frame(&src[..10], 16, 16, 4, 4).is_none());
+        assert!(prefilter_frame(&src, 16, 16, 0, 4).is_none());
+    }
+
+    /// LRU：命中重排、预算驱逐、插入后可取。
+    #[test]
+    fn skin_raster_cache_lru() {
+        let mut cache = SsfRasterCache::new();
+        cache.insert(0, 2, 2, vec![9u8; 16]);
+        assert!(cache.touch(0, 2, 2));
+        assert_eq!(cache.pixels_of(0, 2, 2).unwrap(), &[9u8; 16]);
+        assert!(!cache.touch(0, 3, 3), "miss on size mismatch");
+        assert!(!cache.touch(1, 2, 2), "miss on frame mismatch");
+        // 8 条预算：插满后最老条被驱逐
+        for i in 1..=8 {
+            cache.insert(i, 2, 2, vec![i as u8; 16]);
+        }
+        assert!(!cache.touch(0, 2, 2), "oldest evicted");
+        assert!(cache.touch(8, 2, 2), "newest present");
     }
 }
