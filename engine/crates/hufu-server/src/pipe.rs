@@ -462,6 +462,38 @@ pub fn dispatch(
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
+        // 【UWP/开始菜单取图 2026-10-18】AppContainer 宿主（开始菜单搜索、
+        // 设置、商店应用等）沙箱拒读数据目录——实测管道连通（act-*.txt
+        // pipe=ok）而磁盘读图被拒 → 独立皮肤载图失败回退矢量皮。本 op
+        // 供 DLL load_bitmap 读盘失败时经管道取图（b64，与 sound op 同
+        // 形）。id/图名双重消毒（与 DLL normalize_image_name 同规），
+        // 服务端只按自身数据根拼路径——不信任客户端路径。
+        "ssf_image" => {
+            let id = req.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let image = req.get("image").and_then(|x| x.as_str()).unwrap_or("");
+            let ok_name = |s: &str| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && !s.contains("..")
+                    && !s.chars().any(|c| {
+                        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                            || c.is_control()
+                    })
+            };
+            if !ok_name(id) || !ok_name(image) {
+                return serde_json::json!({"error": "id/图名不合法"});
+            }
+            let p = crate::ssf::ssf_cache_root(&host.data_dir)
+                .join(id)
+                .join(image.to_lowercase());
+            match std::fs::read(&p) {
+                Ok(bytes) => match crate::b64::encode(&bytes) {
+                    Ok(b) => serde_json::json!({"ok": true, "b64": b}),
+                    Err(_) => serde_json::json!({"error": "b64 编码失败"}),
+                },
+                Err(e) => serde_json::json!({"error": format!("读图失败 {}: {e}", p.display())}),
+            }
+        }
         // 【渲染指定皮肤 2026-10-16】设置页实时框用：按 id 返回该 ssf
         // 皮肤的完整 payload（含其 overrides）——渲染「正在编辑的」皮
         // 肤而不是「当前上位」皮肤。仅供 dump 驱动进程调用；真实打字

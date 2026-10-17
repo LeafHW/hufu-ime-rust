@@ -268,6 +268,31 @@ fn cache_tick() -> u64 {
     CACHE_TICK.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 【UWP/开始菜单 2026-10-18】AppContainer 宿主读盘被拒时的兜底取图：
+/// 经管道向 server 请求（op ssf_image → b64 → 内存解码，sound op 同形）。
+/// id = cache_dir 末段；图名已经 normalize_image_name 消毒（server 侧
+/// 再消毒一遍——双重防线）。仅读盘失败才走这条路：普通应用零开销。
+fn fetch_image_via_pipe(cache_dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let id = cache_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("cache_dir 无末段: {}", cache_dir.display()))?;
+    let resp = crate::ipc::call(&serde_json::json!({
+        "op": "ssf_image",
+        "id": id,
+        "image": name,
+    }))
+    .ok_or("管道无响应（server 未起/超时）")?;
+    if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
+        return Err(format!("server: {e}"));
+    }
+    let b64 = resp
+        .get("b64")
+        .and_then(|v| v.as_str())
+        .ok_or("响应缺 b64 字段")?;
+    crate::sound::base64_decode(b64).ok_or_else(|| "b64 解码失败".to_string())
+}
+
 /// 图片名归一：小写相对名 + DLL 侧二次消毒（server 解包落盘已消毒一遍，
 /// 这里是第二道防线——设计方案 §六.11：写盘白名单之外读盘也要验）。
 /// 拒绝：空/超长(>128)/路径分隔符/盘符/通配符/控制字符/`..`。
@@ -309,8 +334,19 @@ pub fn load_bitmap(cache_dir: &Path, fp: &str, image: &str) -> Result<Arc<SsfBit
     }
     // ② 解码（锁外读盘+解码，不阻塞其它窗口取图）
     let path = cache_dir.join(&name);
-    let data =
-        std::fs::read(&path).map_err(|e| format!("读图失败 {}: {e}", path.display()))?;
+    // 【UWP/开始菜单 2026-10-18】AppContainer 宿主（开始菜单搜索/设置/
+    // 商店应用）拒读数据目录——实测管道连通而磁盘读图被拒（act-*.txt
+    // pipe=ok）→ 读盘失败时经管道向 server 取图（sound op 同形：b64
+    // 过管道、内存解码零落盘）。普通应用读盘成功，零管道流量。
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(fs_err) => match fetch_image_via_pipe(cache_dir, &name) {
+            Ok(d) => d,
+            Err(pipe_err) => {
+                return Err(format!("读图失败 {}: {fs_err}；管道取图亦败: {pipe_err}", path.display()))
+            }
+        },
+    };
     if data.len() > MAX_INPUT_BYTES {
         return Err(format!("文件超限 {} bytes（>16MiB）", data.len()));
     }
