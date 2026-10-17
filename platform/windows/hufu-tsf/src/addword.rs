@@ -71,7 +71,7 @@ fn circled_num(n: usize) -> Option<String> {
     c.map(|ch| ch.to_string())
 }
 
-/// 皮肤数据（首次弹窗拉取；失败回退深色系）
+/// 皮肤数据（每次弹窗拉取，指纹没变走 same:true 微载荷；失败回退深色系）
 struct Skin {
     bg: u32,
     text: u32,
@@ -83,6 +83,10 @@ struct Skin {
     font_pt: i32,
     label_pt: i32,
     cand_spacing: i32,
+    /// 【加词窗跟皮肤 2026-10-18·B】服务端皮肤指纹（op:"skin" 顶层
+    /// fp）——下次弹窗 have_fp 命中即免重建；变了=换皮/改色/改字号，
+    /// 字体刷子全套重建（弹窗线程每弹必拉，换皮即时生效）。
+    fp: String,
 }
 static SKIN: std::sync::Mutex<Option<Skin>> = std::sync::Mutex::new(None);
 static BG_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
@@ -121,6 +125,82 @@ fn lighten(c: u32, k: f32) -> u32 {
     let g = ch((c >> 8) & 0xFF);
     let b = ch((c >> 16) & 0xFF);
     b << 16 | g << 8 | r
+}
+
+/// 相对亮度（0..1，REC.709 权重）。COLORREF 布局（低字节=R）。
+fn lum(c: u32) -> f32 {
+    let r = (c & 0xFF) as f32 / 255.0;
+    let g = ((c >> 8) & 0xFF) as f32 / 255.0;
+    let b = ((c >> 16) & 0xFF) as f32 / 255.0;
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// 【加词窗跟皮肤 2026-10-18·A】SSF 面板不透明区平均色（COLORREF）。
+/// 帧=BGRA 预乘；只统计 alpha≥128 的像素（装饰皮大片透明边不算），
+/// 不透明覆盖 <2% 视为无效（整图几乎全透明，回退默认色）。
+fn avg_opaque_rgb(b: &crate::ssfwin::SsfBitmap) -> Option<u32> {
+    let frame = b.frames.first()?;
+    let px = (b.width as usize) * (b.height as usize);
+    if px == 0 || frame.len() < px * 4 {
+        return None;
+    }
+    let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for p in frame.chunks_exact(4) {
+        if p[3] >= 128 {
+            sr += p[2] as u64; // R
+            sg += p[1] as u64; // G
+            sb += p[0] as u64; // B
+            n += 1;
+        }
+    }
+    if n == 0 || n * 50 < px as u64 {
+        return None;
+    }
+    let r = (sr / n) as u32;
+    let g = (sg / n) as u32;
+    let bch = (sb / n) as u32;
+    Some(bch << 16 | g << 8 | r)
+}
+
+/// 【加词窗跟皮肤 2026-10-18·A】SSF 皮肤的加词窗配色：底=候选窗面板
+/// 图平均色，文字/标签=display 正文色/注解色（#RRGGBBAA 前 6 位）。
+/// 解不出（载荷缺节/图读不了/几乎全透明）返回 None 走默认回退。
+fn ssf_panel_colors(sk: &serde_json::Value) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let cd = sk.pointer("/cache_dir").and_then(|x| x.as_str());
+    let fp = sk.pointer("/fp").and_then(|x| x.as_str());
+    // 加词窗是竖排观感：优先竖排候选面板，其次任一变体
+    let img = [
+        "vertical_candidates",
+        "vertical",
+        "vertical_code",
+        "horizontal",
+        "horizontal_candidates",
+        "horizontal_code",
+    ]
+    .iter()
+    .find_map(|k| {
+        sk.pointer(&format!("/layouts/{k}/image"))
+            .and_then(|x| x.as_str())
+    });
+    let back = match (cd, fp, img) {
+        (Some(cd), Some(fp), Some(img)) => crate::ssfwin::load_bitmap(
+            std::path::Path::new(cd),
+            fp,
+            img,
+        )
+        .ok()
+        .and_then(|b| avg_opaque_rgb(&b)),
+        _ => None,
+    };
+    let text = sk
+        .pointer("/display/text_color")
+        .and_then(|x| x.as_str())
+        .and_then(parse_hex);
+    let label = sk
+        .pointer("/display/annotation_color")
+        .and_then(|x| x.as_str())
+        .and_then(parse_hex);
+    (back, text, label)
 }
 
 // ── 【占位符记忆 2026-10-09】勾选态首选走 server 管道（server 落
@@ -245,15 +325,39 @@ fn ph_recall_hkcu() -> bool {
     }
 }
 
-/// 拉皮肤配色+字体（弹窗线程调用一次；失败回退深色+微软雅黑）。
+/// 拉皮肤配色+字体（弹窗线程每次弹窗调用）。
+/// 【加词窗跟皮肤 2026-10-18·B】原实现 `if g.is_some() { return }` 一次
+/// 性缓存——换皮后老进程里加词窗永远是旧配色（用户实锤「背景色有时
+/// 候不一样」的来源之二）。改为指纹制：带 have_fp 微载荷轮询，指纹没变
+/// 零重建（一次管道往返，ms 级），变了=字体/刷子/Skin 全套重建。
+/// IPC 失败：已有缓存沿用（比打回默认色好），首次失败才走默认深色系。
 fn load_skin() {
     let mut g = SKIN.lock().unwrap_or_else(|p| p.into_inner());
-    if g.is_some() {
-        return;
+    let mut req = serde_json::json!({"op": "skin"});
+    if let Some(fp) = g.as_ref().map(|s| s.fp.as_str()) {
+        if !fp.is_empty() {
+            req["have_fp"] = serde_json::json!(fp);
+        }
     }
-    let sk = crate::ipc::call(&serde_json::json!({"op": "skin"}))
-        .and_then(|v| v.get("skin").cloned())
-        .unwrap_or(serde_json::Value::Null);
+    let resp = crate::ipc::call(&req);
+    let sk = match resp.as_ref() {
+        Some(v) => {
+            if v.get("same").and_then(|x| x.as_bool()) == Some(true) && g.is_some() {
+                return; // 指纹未变：字体刷子全沿用
+            }
+            v.get("skin").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        None => {
+            if g.is_some() {
+                return; // server 重启瞬间等：沿用缓存
+            }
+            serde_json::Value::Null
+        }
+    };
+    let fp = resp
+        .as_ref()
+        .and_then(|v| v.get("fp").and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_default();
     let get_color = |k: &str| -> Option<u32> {
         sk.pointer(&format!("/colors/{k}"))
             .and_then(|x| x.as_str())
@@ -276,22 +380,49 @@ fn load_skin() {
         .pointer("/layout/candidate_spacing")
         .and_then(|x| x.as_f64())
         .unwrap_or(6.0) as i32;
+    // 【加词窗跟皮肤 2026-10-18·A】SSF 皮肤载荷没有 /colors 节（候选窗
+    // 画在皮肤图上）——加词窗原实现一律回退固定灰绿（用户实锤「背景
+    // 色有时候不一样」的来源之一）。改为：背景取皮肤候选窗面板图的
+    // 不透明区平均色（与候选窗观感同源），文字/标签取皮肤 display
+    // 四色里的正文色/注解色。
+    let ssf_mode = sk.pointer("/kind").and_then(|x| x.as_str()) == Some("ssf");
+    let (back, text, label) = if ssf_mode {
+        ssf_panel_colors(&sk)
+    } else {
+        (
+            get_color("back_color"),
+            get_color("text_color").or_else(|| get_color("candidate_text_color")),
+            get_color("label_color").or_else(|| get_color("comment_text_color")),
+        )
+    };
+    let bg = lighten(back.unwrap_or(0x22_2E_16_u32), 0.20);
+    let mut text_c = text.unwrap_or(0xEC_E2_D7_u32);
+    let mut label_c = label.unwrap_or(0xB5_A6_8A);
+    // ssf 面板平均色与皮肤文字色的对比度护栏：亮度差过小（花皮平均值
+    // 发灰等）时按底色翻纯黑/纯白，保证弹窗永远可读。JSON 皮肤的
+    // colors 是作者手定的完整配色，不越权改。
+    if ssf_mode && back.is_some() {
+        let lb = lum(bg);
+        if (lb - lum(text_c)).abs() < 0.22 {
+            text_c = if lb > 0.5 { 0x1A_1A_1A } else { 0xF2_F2_F2 };
+        }
+        if (lb - lum(label_c)).abs() < 0.15 {
+            label_c = if lb > 0.5 { 0x3A_3A_3A } else { 0xC8_C8_C8 };
+        }
+    }
     let s = Skin {
         // 窗口底色提亮 20%：候选窗小面积用原底色可以，整窗大面积
         // 直接用会死黑（用户反馈），向白混一档。
-        bg: lighten(get_color("back_color").unwrap_or(0x22_2E_16_u32), 0.20),
-        text: get_color("text_color")
-            .or_else(|| get_color("candidate_text_color"))
-            .unwrap_or(0xEC_E2_D7_u32),
-        label: get_color("label_color")
-            .or_else(|| get_color("comment_text_color"))
-            .unwrap_or(0xB5_A6_8A),
+        bg,
+        text: text_c,
+        label: label_c,
         font_face: utf16z(&face),
         // 字号比皮肤候选窗大两档再 ×1.2（弹窗阅读距离远；用户两轮
         // 要求加大，2026-10-08 随窗口整体放大 20%）
         font_pt: (((font_pt + 6) as f32 * 1.2).round() as i32).max(20),
         label_pt: (((label_pt + 5) as f32 * 1.2).round() as i32).max(16),
         cand_spacing: cand_spacing.max(2),
+        fp,
     };
     unsafe {
         let face_ptr = PCWSTR(s.font_face.as_ptr());
@@ -2097,4 +2228,65 @@ fn http_post_json(path: &str, body: &str) -> bool {
     let mut resp = String::new();
     let _ = s.read_to_string(&mut resp);
     resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bmp(w: u32, h: u32, frames: Vec<Vec<u8>>) -> crate::ssfwin::SsfBitmap {
+        crate::ssfwin::SsfBitmap {
+            width: w,
+            height: h,
+            plays: 0,
+            delays_ms: vec![0; frames.len()],
+            frames,
+        }
+    }
+
+    /// 全不透明均色 → 平均色即原色（COLORREF 布局：b<<16|g<<8|r）。
+    #[test]
+    fn avg_opaque_uniform() {
+        let b = bmp(4, 4, vec![[10u8, 20, 30, 255].repeat(16)]); // B,G,R,A
+        assert_eq!(avg_opaque_rgb(&b), Some(10 << 16 | 20 << 8 | 30));
+    }
+
+    /// 半透明像素不计入；覆盖 <2%（50 分之一）→ None 回退默认。
+    #[test]
+    fn avg_opaque_coverage_gate() {
+        // 100 像素，仅 1 个不透明（1%）→ None
+        let mut px = [0u8, 0, 0, 0].repeat(100);
+        px[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        let b = bmp(100, 1, vec![px]);
+        assert_eq!(avg_opaque_rgb(&b), None);
+        // alpha 127/128 门槛：127 不算，128 算
+        let mut px2 = [0u8, 0, 0, 127].repeat(8);
+        px2[0..4].copy_from_slice(&[200, 100, 50, 128]); // B=200,G=100,R=50
+        let b2 = bmp(8, 1, vec![px2]);
+        assert_eq!(avg_opaque_rgb(&b2), Some(200 << 16 | 100 << 8 | 50));
+    }
+
+    /// 亮度：白=1、黑=0、中灰≈0.5 量级正确。
+    #[test]
+    fn luminance_bounds() {
+        assert!((lum(0x00_FF_FF_FF) - 1.0).abs() < 1e-6);
+        assert!(lum(0) < 1e-6);
+        assert!((lum(0x00_80_80_80) - 0.5).abs() < 0.01);
+    }
+
+    /// ssf 载荷配色：display 四色解析 + 面板图缺失（无 cache_dir 节）
+    /// 时 back=None 走默认，text/label 仍解出。
+    #[test]
+    fn ssf_panel_colors_payload_paths() {
+        let sk = serde_json::json!({
+            "kind": "ssf",
+            "display": {"text_color": "#F0E6D2FF", "annotation_color": "#A0A0A0FF"},
+            "layouts": {"vertical_candidates": {"image": "panel.png"}}
+            // 无 cache_dir/fp → 面板路径跳过
+        });
+        let (back, text, label) = ssf_panel_colors(&sk);
+        assert!(back.is_none());
+        assert_eq!(text, Some(0xD2 << 16 | 0xE6 << 8 | 0xF0)); // #F0E6D2
+        assert_eq!(label, Some(0xA0 << 16 | 0xA0 << 8 | 0xA0));
+    }
 }
