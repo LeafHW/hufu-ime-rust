@@ -589,11 +589,11 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
                    贴屏底自动翻上方时=再上移），负=贴近光标（可压进光标行）。
                    【滑条+数字框 2026-10-16 用户拍板】双向联动：拖动节流
                    250ms 即存即生效；数字框可精确输入。
-                   【范围 ±30 2026-10-16 用户拍板】从 ±300 收窄。 -->
+                   【范围 ±100 2026-10-18 用户拍板】从 ±30 放宽。 -->
               <div class="field"><label>候选高度</label>
                 <div style="display:flex;gap:8px;align-items:center">
-                  <input type="range" id="ssfv-candys" min="-30" max="30" step="1" style="width:120px" title="拖动实时调整候选窗与光标的垂直距离：右（正）=离光标更远，左（负）=贴近光标（±30）">
-                  <input type="number" id="ssfv-candy" min="-30" max="30" step="1" style="width:72px" placeholder="0" title="候选窗与光标行的垂直距离（像素，-30~30）：正值=离光标更远（窗整体下移；屏幕下方不够自动翻上方时则再上移），负值=贴近光标；空/0=默认间距。仅独立皮肤生效">
+                  <input type="range" id="ssfv-candys" min="-100" max="100" step="1" style="width:120px" title="拖动实时调整候选窗与光标的垂直距离：右（正）=离光标更远，左（负）=贴近光标（±100）">
+                  <input type="number" id="ssfv-candy" min="-100" max="100" step="1" style="width:72px" placeholder="0" title="候选窗与光标行的垂直距离（像素，-100~100）：正值=离光标更远（窗整体下移；屏幕下方不够自动翻上方时则再上移），负值=贴近光标；空/0=默认间距。仅独立皮肤生效">
                 </div>
               </div>
             </div>
@@ -2101,7 +2101,7 @@ async function ssfSettingsSaveNow(quiet) {
   $("#ssfv-anno").addEventListener("change", go);
   // 【候选高度·滑条+数字框 2026-10-16】双向联动：拖动 input 事件
   // 节流 250ms 即存即生效（预览同步刷新，与页内其他滑条同口径）；
-  // 数字框 change 直发并回夹到 ±30（范围收窄 2026-10-16 用户拍板）。
+  // 数字框 change 直发并回夹到 ±100（范围放宽 2026-10-18 用户拍板）。
   // 滑条 0 与空框同语义（=默认间距，collect 把 0 收敛为 null 不存档）。
   {
     const sl = $("#ssfv-candys"), nb = $("#ssfv-candy");
@@ -2113,7 +2113,7 @@ async function ssfSettingsSaveNow(quiet) {
     });
     nb.addEventListener("change", () => {
       const v = parseFloat(nb.value);
-      sl.value = isFinite(v) ? Math.max(-30, Math.min(30, v)) : 0;
+      sl.value = isFinite(v) ? Math.max(-100, Math.min(100, v)) : 0;
       go();
     });
   }
@@ -2446,11 +2446,11 @@ function collectSsfOverrides() {
     // 全局，而全局默认开——不勾永远显示=关不掉。改显式两态（勾=开、
     // 不勾=关）。
     show_index: $("#ssfv-index").checked ? true : false,
-    // 【候选高度 2026-10-16】空/0/非法=null（默认间距）；否则钳 ±30
-    //（范围收窄 2026-10-16 用户拍板）
+    // 【候选高度 2026-10-16】空/0/非法=null（默认间距）；否则钳 ±100
+    //（范围放宽 ±100 2026-10-18 用户拍板）
     cand_y: (() => {
       const y = parseFloat($("#ssfv-candy").value);
-      return isFinite(y) && y !== 0 ? Math.min(30, Math.max(-30, y)) : null;
+      return isFinite(y) && y !== 0 ? Math.min(100, Math.max(-100, y)) : null;
     })(),
     code_color: $("#ssfv-code").value.toUpperCase() + "FF",
     first_color: $("#ssfv-first").value.toUpperCase() + "FF",
