@@ -98,20 +98,13 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
         "hufu-yuebai.json",
         include_str!("../official-skins/hufu-yuebai.json"),
     ),
-    // 【夜莺/夜桜两款收编 2026-10-16 用户拍板】yeying-yuexia（夜莺·月下文羽）
-    // + yozakura-yingyue（夜桜·樱月幻梦）内嵌官方化——动图挂件是皮肤
-    // 设计内容（樱花 APNG，来自作者导出包，勿清空）。升级语义（用户
-    // 原话）：换 exe 后新增皮肤自动到手（install_official_skins 缺失
-    // 自愈）；已有文件哪怕用户改过数值也**绝不覆盖**（只入新的，存量
-    // 不碰——id 不变量自愈除外，id 本应=文件名 stem）。
-    (
-        "yeying-yuexia.json",
-        include_str!("../official-skins/yeying-yuexia.json"),
-    ),
-    (
-        "yozakura-yingyue.json",
-        include_str!("../official-skins/yozakura-yingyue.json"),
-    ),
+    // 【夜莺/夜桜退役 2026-10-18 用户拍板】yeying-yuexia（夜莺·月下文羽）
+    // + yozakura-yingyue（夜桜·樱月幻梦）2026-10-16 曾收编官方化——但
+    // 两张动图挂件皮各内联 3.6-4.9MB（exe +8.5MB），用户实测嫌大退役：
+    // 从内嵌表与 official-skins/ 移除（fcitx5 主题产物 platform/linux/
+    // themes/ 同步清）。磁盘上如仍有旧副本（历史自愈产物）不再是官方件，
+    // 升级不覆盖也不清——用户手删即净（export 侧本就按「与内嵌相同才
+    // 排除」工作，内嵌没了自然全量带/或删了就没有）。
 ];
 
 /// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
@@ -169,6 +162,18 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     (
         "虎娘-幽焰小恶魔.ssf",
         include_bytes!("../official-ssf/虎娘-幽焰小恶魔.ssf"),
+    ),
+    // 【绯绒/莓糖收编 2026-10-18 用户拍板】用户自弄的两张小恶魔随包
+    // 官方化（原先装在用户皮肤目录，export 恒带 7.4MB base64——内置
+    // 后 export 排除、迁移零负担）。退役的夜莺/夜桜矢量皮见上方
+    // OFFICIAL_SKINS 注释（同步瘦身：exe 净 -2.9MB）。
+    (
+        "虎娘-绯绒小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-绯绒小恶魔.ssf"),
+    ),
+    (
+        "虎娘-莓糖小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-莓糖小恶魔.ssf"),
     ),
     (
         "虎兄贵-健身.ssf",
