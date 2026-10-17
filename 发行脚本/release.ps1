@@ -41,6 +41,22 @@ function Verify([string]$tag) {
 if ($VerifyOnly) { Verify '仅校验'; exit 0 }
 
 # ── 1) zip 线（pack.ps1 红线不改，原样调用） ──
+Write-Host '—— [0/2] 同步更新日志（仓内主副本 → 打包源）——' -ForegroundColor Cyan
+# 【防漂移 2026-10-18】更新日志唯一事实源在仓内（发行脚本\更新日志.txt，
+# git 跟踪）；打包前自动覆盖打包源副本——此前日志只活在打包源、无 git
+# 记账，v1.8.7 曾整版漏写随包发行。
+$changelog = 'E:\DSH-KF\hufu\发行脚本\更新日志.txt'
+if (Test-Path $changelog) {
+    Copy-Item $changelog 'E:\DSH-KF\hufu-发行\打包源\更新日志.txt' -Force
+    $first = (Get-Content $changelog -TotalCount 1 -Encoding UTF8)
+    Write-Host "  已同步，当前最新条目：$first"
+    if ($first -notmatch [regex]::Escape($Version)) {
+        Write-Host "  [警告] 日志顶部条目不含本版本 $Version——是否忘了写更新日志？" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host '  [警告] 仓内无更新日志主副本，沿用打包源现有版' -ForegroundColor Yellow
+}
+
 Write-Host '—— [1/2] zip 发行线（pack.ps1）——' -ForegroundColor Cyan
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pack -Version $Version -NoModel
 if ($LASTEXITCODE -ne 0) { Write-Host '✗ zip 线失败，发行中止' -ForegroundColor Red; exit 1 }
