@@ -16,11 +16,30 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$PkgSource = 'E:\DSH-KF\hufu-发行\打包源',
     [string]$DistDir = 'E:\DSH-KF\hufu-发行',
-    # 引擎轨（2026-10-14）：ps1=血律 PowerShell（回滚轨，默认）；rust=hufu-setup-engine
-    # 编译版接管 install/uninstall/postboot/purge（安装全程零 PowerShell 子进程）
-    [ValidateSet('ps1', 'rust')][string]$Engine = 'ps1',
+    # 引擎轨（2026-10-14）：ps1=血律 PowerShell（回滚轨）；rust=hufu-setup-engine
+    # 编译版接管 install/uninstall/postboot/purge（安装全程零 PowerShell 子进程）。
+    # 【轨护栏 2026-10-18】不再给默认值——v1.8.7 事故（漏参出 PS 轨、
+    # 用户装时弹蓝色 PowerShell 窗）的根因就是"默认=回滚轨"这颗雷。
+    # 发行必须显式 -Engine rust（见 发行脚本\发行铁律.md）；-Engine ps1
+    # 仅回滚场景，选了会打大红警告。不带参数直接 Fail。
+    [ValidateSet('', 'ps1', 'rust')][string]$Engine = '',
     [switch]$SkipCompile
 )
+
+# ── 0a) 轨护栏：宁可不构建，不可默默走错轨 ──
+if ($Engine -eq '') {
+    Write-Host '✗ 未指定引擎轨。' -ForegroundColor Red
+    Write-Host '  公开发行（2026-10-14 起，v1.8.3 实锤）： -Engine rust   ← 安装全程零 PowerShell' -ForegroundColor Yellow
+    Write-Host '  回滚/排障才用：                             -Engine ps1    ← 安装会弹 PowerShell 窗' -ForegroundColor Yellow
+    Write-Host '  依据：setup\交付报告.md 发布指纹表 + 发行脚本\发行铁律.md（不是任何参数默认值）' -ForegroundColor Gray
+    exit 1
+}
+if ($Engine -eq 'ps1') {
+    Write-Host '═══════════════════════════════════════════════════════════════' -ForegroundColor Red
+    Write-Host ' 警告：ps1 = 回滚轨（1.8.2 已存档）。公开发行必须 -Engine rust！' -ForegroundColor Red
+    Write-Host ' 本轨安装时会弹蓝色 PowerShell 窗（v1.8.7 事故实锤）。' -ForegroundColor Red
+    Write-Host '═══════════════════════════════════════════════════════════════' -ForegroundColor Red
+}
 
 $ErrorActionPreference = 'Stop'
 $setupRoot = $PSScriptRoot
