@@ -1294,6 +1294,9 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
     }
     // 位置/尺寸/显示
     if entry.last_rect != Some((x, y, cw, ch)) || !entry.shown {
+        // 【右键菜单 z 序保护 2026-10-16】菜单窗存活期不抢 TOPMOST
+        //（同 candwin2::swp_z_guard——挂件帧钟若在菜单开时重落位，同样
+        // 会把菜单压到挂件位图下）。
         let _ = SetWindowPos(
             ov_h,
             HWND_TOPMOST,
@@ -1301,7 +1304,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
             y,
             cw,
             ch,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | crate::candwin2::swp_z_guard(),
         );
         entry.last_rect = Some((x, y, cw, ch));
         entry.shown = true;

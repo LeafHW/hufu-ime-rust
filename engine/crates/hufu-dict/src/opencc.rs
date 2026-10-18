@@ -1,7 +1,8 @@
 //! OpenCC 文本转换表（txt 对照：`源\t目标1 目标2…`）。
 //!
 //! 词组表优先、单字表兜底的贪心最长匹配（Rime simplifier 语义）。
-//! 多目标取首个；无命中原样返回。
+//! convert 多目标取首个；无命中原样返回。单字全变体另见
+//! [`OpenCc::char_variants`]（一简多繁候选展开用）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,6 +13,11 @@ pub struct OpenCc {
     phrases: HashMap<String, String>,
     /// 单字
     chars: HashMap<String, String>,
+    /// 【一简多繁 2026-10-17 用户需求】单字全变体（表序保留）：简体发
+    /// 在繁体有 髮（头发）/發（发财）等多字形，此前加载只留首个、其余
+    /// 全丢——单字候选无法全显。词组转换仍用 chars（取首个）+ phrases
+    /// 消歧（头发→頭髮），不受此表影响。
+    char_variants: HashMap<String, Vec<String>>,
 }
 
 impl OpenCc {
@@ -50,6 +56,18 @@ impl OpenCc {
                     if src.chars().count() > 1 {
                         t.phrases.insert(src.to_string(), first.to_string());
                     } else {
+                        // 【一简多繁 2026-10-17】非整目标模式（转换表）单字
+                        // 行保留全部目标（表序）；emoji 整目标模式不适用
+                        //（目标含空格是语义，不拆）。
+                        if !full_dst {
+                            let vs: Vec<String> = dsts
+                                .split_whitespace()
+                                .map(|s| s.to_string())
+                                .collect();
+                            if !vs.is_empty() {
+                                t.char_variants.insert(src.to_string(), vs);
+                            }
+                        }
                         t.chars.insert(src.to_string(), first.to_string());
                     }
                 }
@@ -95,6 +113,12 @@ impl OpenCc {
             i += 1;
         }
         out
+    }
+
+    /// 单字全变体（表序，`发\t發 髮` → [發, 髮]）。无条目 None；
+    /// 单目标也返回（长度 1，调用方自行判断要不要展开）。
+    pub fn char_variants(&self, ch: &str) -> Option<&[String]> {
+        self.char_variants.get(ch).map(|v| v.as_slice())
     }
 
     /// 表目录存在则按用途加载。
@@ -155,6 +179,37 @@ mod tests {
         assert_eq!(t.convert("一丝不挂"), "一絲不掛", "词组优先");
         assert_eq!(t.convert("后来"), "後來".replace('來', "来"), "单字转换：后→後，来无映射保持");
         assert_eq!(t.convert("皇后"), "皇后", "皇后词组不转后");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 【一简多繁 2026-10-17】单字全变体保留：`发\t發 髮` 两个都要在
+    /// （此前加载即丢、单字候选永远只见首个）。convert 行为不变（首
+    /// 个）——词组消歧（头发→頭髮）不受影响。
+    #[test]
+    fn char_variants_multi_traditional() {
+        let tmp = std::env::temp_dir().join(format!("hufu-opencc-mv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(&tmp, "ch.txt", "发\t發 髮\n后\t後 后\n头\t頭\n财\t財\n钱\t錢\n");
+        write(&tmp, "ph.txt", "头发\t頭髮\n发财\t發財\n");
+        let t = OpenCc::load(&[tmp.join("ph.txt"), tmp.join("ch.txt")]);
+        // 全变体（表序，含表内原字——「后」在繁体 皇后 亦用）
+        assert_eq!(
+            t.char_variants("发"),
+            Some(&["發".to_string(), "髮".to_string()][..])
+        );
+        assert_eq!(
+            t.char_variants("后"),
+            Some(&["後".to_string(), "后".to_string()][..])
+        );
+        // 单目标：长度 1
+        assert_eq!(t.char_variants("钱"), Some(&["錢".to_string()][..]));
+        // 无条目
+        assert_eq!(t.char_variants("虎"), None);
+        // convert 语义不变：首个 + 词组消歧
+        assert_eq!(t.convert("发"), "發");
+        assert_eq!(t.convert("头发"), "頭髮");
+        assert_eq!(t.convert("发财"), "發財");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

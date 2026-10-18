@@ -30,118 +30,42 @@ if (-not $isAdmin -and -not $NoHKLM -and $inAdminGroup) {
 
 $inst = Split-Path -Parent $MyInvocation.MyCommand.Path   # 安装目录（脚本所在处）
 
-# 1) 语言列表移除【顺序修正 2026-10-07】本步骤必须在「杀 ctfmon」之前！
-# 旧序（0杀服务→1动列表）实锤事故：ctfmon 一死会话即冷，Get 少报——
-# 连我们自己的 TIP 都不报 → 手术整个静默跳过 → 注册表全清但列表留下
-# 虎符幽灵（卸载后 Win+空格 还有一个死虎符，要手删）。列表动刀只在
-# ctfmon 活着时做；「防档案重建」的杀服务只服务后面的注册表清理步骤。
+# 1) 语言列表移除——【结构根治 2026-10-09：纯减法，对齐虎爪】
+# 与 install 同理：不再 Get/Set-WinUserLanguageList（整表重写会把
+# 「读时没枚举到的输入法」固化删除=吞别人输入法）。语言列表真存储
+# =注册表两处（列表真存储「0804:{...}」值 + 切换器装配表槽位）。
+# 卸载=各删自己那一条，物理上碰不到别人；也不需要 ctfmon 在线配合。
 $tipStr = "0804:$CLSID$PROFILE"
-# 【防吃·三阶强化 2026-10-07】与 install.ps1 同款（今晨 install 侧实锤
-# 事故：Set -Force 同步重建 用户列表+装配表 两处，枚举少报即固化删除，
-# 单次 Set 并回对未解析 TIP 会静默丢弃）：
-#   ① 快照升级：整槽属性袋（直写恢复原料）
-#   ② 移除后回读校验：事实源=装配表注册表（枚举说谎不受影响）
-#   ③ 并回 Set 一次 → 仍缺 = 槽位注册表直写（无校验必成）+ 日志留证
 $asmChk = 'HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem\0x00000804\{34745C63-B2F0-4784-8B67-5E12C8701A31}'
-$assemblyTips = @()
-$assemblySlots = @()
-if (Test-Path $asmChk) {
-    foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
-        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-        if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) {
-            $assemblyTips += "0804:$($p.CLSID)$($p.Profile)"
-            $bag = @{}
-            foreach ($pn in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' })) {
-                $bag[$pn] = $p.$pn
-            }
-            $assemblySlots += @{ slot = $k.PSChildName; CLSID = $p.CLSID; Profile = $p.Profile; bag = $bag }
-        }
-    }
-}
-function Get-AsmTips {
-    $r = @()
-    if (Test-Path $asmChk) {
-        foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
-            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-            if ($p.CLSID -and $p.Profile -and $p.CLSID -ne $CLSID) { $r += "0804:$($p.CLSID)$($p.Profile)" }
-        }
-    }
-    ,@($r | Select-Object -Unique)
-}
-$list = Get-WinUserLanguageList
-foreach ($l in $list) {
-    if ($l.InputMethodTips -contains $tipStr) {
-        $keep = @($l.InputMethodTips | Where-Object { $_ -ne $tipStr })
-        $l.InputMethodTips.Remove($tipStr) | Out-Null
-        Set-WinUserLanguageList $list -Force -WarningAction SilentlyContinue
-        # 回读校验（事实源=装配表注册表）：移除虎符时若把别人也固化删除了
-        $dropped = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
-        if ($dropped.Count -gt 0) {
-            Write-Host "⚠ 卸载写入丢失 $($dropped.Count) 个既有输入法——并回中" -ForegroundColor Yellow
-            $list2 = Get-WinUserLanguageList
-            $l2 = $list2 | Where-Object { $_.LanguageTag -eq $l.LanguageTag } | Select-Object -First 1
-            if ($l2) {
-                foreach ($d in $dropped) { if ($l2.InputMethodTips -notcontains $d) { $l2.InputMethodTips.Add($d) } }
-                Set-WinUserLanguageList $list2 -Force -WarningAction SilentlyContinue
-            }
-            # 终极兜底：槽位注册表直写（ctfmon 已停、Set 可能解析不了 TIP）
-            $stillAfter = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
-            if ($stillAfter.Count -gt 0) {
-                $maxSlot = -1
-                foreach ($k in Get-ChildItem $asmChk -ErrorAction SilentlyContinue) {
-                    $n = 0
-                    if ([int]::TryParse($k.PSChildName, [ref]$n) -and $n -gt $maxSlot) { $maxSlot = $n }
-                }
-                foreach ($t in $stillAfter) {
-                    $src = $assemblySlots | Where-Object { "0804:$($_.CLSID)$($_.Profile)" -eq $t } | Select-Object -First 1
-                    if ($src) {
-                        $maxSlot++
-                        $newKey = "$asmChk\$('{0:D8}' -f $maxSlot)"
-                        New-Item -Path $newKey -Force | Out-Null
-                        foreach ($pn in $src.bag.Keys) {
-                            Set-ItemProperty -Path $newKey -Name $pn -Value $src.bag[$pn] -Type String
-                        }
-                        Write-Host "  [直写恢复] 槽 $('{0:D8}' -f $maxSlot) ← $t" -ForegroundColor Yellow
-                    }
-                }
-            }
-            $finalMiss = @($assemblyTips | Where-Object { (Get-AsmTips) -notcontains $_ })
-            try {
-                $logLine = "[{0}] uninstall 防吃链: 快照槽={1} 丢失={2} 最终仍缺=[{3}]" -f `
-                    (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, $dropped.Count, ($finalMiss -join ',')
-                Add-Content -Path (Join-Path $inst 'install.log') -Value $logLine -Encoding UTF8
-            } catch { }
-            if ($finalMiss.Count -gt 0) {
-                Write-Host "✗ 以下输入法仍未能恢复，请手动在 设置→语言 加回（详见 install.log）：" -ForegroundColor Red
-                $finalMiss | ForEach-Object { Write-Host "    $_" }
-            } else {
-                Write-Host "OK 已恢复全部被丢输入法（卸载防丢生效）"
-            }
-        }
-        break
-    }
-}
-
-# 1b) 【幽灵清扫 2026-10-07】列表手术可能整个跳过（Get 少报连我们都
-# 不报——今晨实锤：卸载完列表/装配表还留死虎符）。此处以注册表为事实
-# 源做终验：我们的 TIP 若仍在 列表真存储 或 装配表槽位 → 直接删值/删键，
-# 无校验必成。并写日志（无论手术走没走，卸载必留一行证据）。
+# ① 列表真存储：删自己的值（幂等：无值=跳过）
 try {
-    $upKey = (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -like 'zh*' } | Select-Object -First 1)
-    if ($upKey -and (Get-Item $upKey.PSPath).Property -contains $tipStr) {
-        Remove-ItemProperty -Path $upKey.PSPath -Name $tipStr -Force -ErrorAction SilentlyContinue
-        Write-Host "  [幽灵清扫] 列表真存储残留已删" -ForegroundColor Yellow
+    foreach ($lk in (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'zh*' })) {
+        if ((Get-Item $lk.PSPath).Property -contains $tipStr) {
+            Remove-ItemProperty -Path $lk.PSPath -Name $tipStr -Force -ErrorAction SilentlyContinue
+            Write-Host 'OK 列表真存储 -虎符（纯减法：他人条目零触碰）'
+        }
     }
 } catch { }
+# ② 切换器装配表：删自己的槽（按 CLSID 认领，绝不误删他人槽位）
+$slotsGone = 0
 Get-ChildItem $asmChk -ErrorAction SilentlyContinue | Where-Object {
     (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID
-} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+} | ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue; $slotsGone++ }
+# ③ 末态回读核验 + 日志（事实源=注册表；我们的残留必须为 0）
+$leftUp = 0
 try {
-    $logLine = "[{0}] uninstall 完成: 快照槽={1} 装配表末态={2} 我们残留=0" -f `
-        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), @($assemblySlots).Count, @(Get-AsmTips).Count
+    foreach ($lk in (Get-ChildItem 'HKCU:\Control Panel\International\User Profile' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'zh*' })) {
+        if ((Get-Item $lk.PSPath).Property -contains $tipStr) { $leftUp++ }
+    }
+} catch { }
+$leftAsm = @(Get-ChildItem $asmChk -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).CLSID -eq $CLSID })
+try {
+    $logLine = "[{0}] uninstall 减法移除: 删槽={1} 残留（真存储={2}，装配表={3}）——应全为 0" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $slotsGone, $leftUp, @($leftAsm).Count
     Add-Content -Path (Join-Path $inst 'install.log') -Value $logLine -Encoding UTF8
 } catch { }
+if ($leftUp -gt 0 -or @($leftAsm).Count -gt 0) {
+    Write-Host "⚠ 虎符条目残留（真存储 $leftUp / 装配表 $(@($leftAsm).Count)），详见 install.log" -ForegroundColor Yellow
+}
 
 # 0-moved) 【防档案重建】列表动刀完毕，现在才杀服务（供下面注册表清理）
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

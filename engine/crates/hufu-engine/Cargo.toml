@@ -9,4 +9,5 @@ hufu-types = { path = "../hufu-types" }
 hufu-dict = { path = "../hufu-dict" }
 hufu-config = { path = "../hufu-config" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 

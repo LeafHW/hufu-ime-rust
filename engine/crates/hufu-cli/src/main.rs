@@ -880,6 +880,19 @@ fn cmd_repl(dir: &str) {
         if line == "q" {
             break;
         }
+        // 【编码通配符 2026-10-11】REPL 调试指令：:wild 翻转开关、
+        // :wc <字符> 设通配字符。
+        if line == ":wild" {
+            engine.config.input.wildcard_enabled = !engine.config.input.wildcard_enabled;
+            println!("wildcard_enabled = {}", engine.config.input.wildcard_enabled);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(":wc ") {
+            let ch = rest.chars().next().unwrap_or('\\');
+            engine.config.input.wildcard_char = ch;
+            println!("wildcard_char = {ch:?}");
+            continue;
+        }
         let keys: Vec<KeyInput> = if line == "SP" {
             vec![KeyInput::char_key(' ')]
         } else if line == "BS" {

@@ -98,7 +98,135 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
         "hufu-yuebai.json",
         include_str!("../official-skins/hufu-yuebai.json"),
     ),
+    // 【夜莺/夜桜退役 2026-10-18 用户拍板】yeying-yuexia（夜莺·月下文羽）
+    // + yozakura-yingyue（夜桜·樱月幻梦）2026-10-16 曾收编官方化——但
+    // 两张动图挂件皮各内联 3.6-4.9MB（exe +8.5MB），用户实测嫌大退役：
+    // 从内嵌表与 official-skins/ 移除（fcitx5 主题产物 platform/linux/
+    // themes/ 同步清）。磁盘上如仍有旧副本（历史自愈产物）不再是官方件，
+    // 升级不覆盖也不清——用户手删即净（export 侧本就按「与内嵌相同才
+    // 排除」工作，内嵌没了自然全量带/或删了就没有）。
 ];
+
+/// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
+///（official-ssf/ 随 git 与二进制分发，缺失自愈落盘）——此前「.ssf
+/// 完全用户自管理、绝不内置」的红线针对的是**搜狗官方皮肤**（版权）；
+/// 这几款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘/秋风
+/// 知我意）。已存在的不覆盖（用户导入的同名更新优先）。
+/// 【虎娘新传全家桶 2026-10-18】虎娘（tigirl）官方目录 12 款中尚未
+/// 进虎符的 8 款一并内置（元气/雨竹听风/雪夜铃兰/霓虹电玩/桂月团圆/
+/// 柚光汽水/幽焰小恶魔/虎兄贵-健身——font140 校准 + 生产 PNG 版）；
+/// 旧名 3 款（虎纹奶油/蜜桃虎娘/鲸鱼娘）与虎娘新版同为当期产物
+///（仅 skin_name 命名差异），保留旧名不动用户已选引用。虎娘的
+/// 小喵风扇（搜狗商店皮肤）与 smile/默认（测试件）不随包。
+const OFFICIAL_SSF: &[(&str, &[u8])] = &[
+    (
+        "虎纹奶油.ssf",
+        include_bytes!("../official-ssf/虎纹奶油.ssf"),
+    ),
+    (
+        "蜜桃虎娘.ssf",
+        include_bytes!("../official-ssf/蜜桃虎娘.ssf"),
+    ),
+    (
+        "鲸鱼娘.ssf",
+        include_bytes!("../official-ssf/鲸鱼娘.ssf"),
+    ),
+    (
+        "秋风知我意.ssf",
+        include_bytes!("../official-ssf/秋风知我意.ssf"),
+    ),
+    (
+        "虎娘-元气.ssf",
+        include_bytes!("../official-ssf/虎娘-元气.ssf"),
+    ),
+    (
+        "虎娘-雨竹听风.ssf",
+        include_bytes!("../official-ssf/虎娘-雨竹听风.ssf"),
+    ),
+    (
+        "虎娘-雪夜铃兰.ssf",
+        include_bytes!("../official-ssf/虎娘-雪夜铃兰.ssf"),
+    ),
+    (
+        "虎娘-霓虹电玩.ssf",
+        include_bytes!("../official-ssf/虎娘-霓虹电玩.ssf"),
+    ),
+    (
+        "虎娘-桂月团圆.ssf",
+        include_bytes!("../official-ssf/虎娘-桂月团圆.ssf"),
+    ),
+    (
+        "虎娘-柚光汽水.ssf",
+        include_bytes!("../official-ssf/虎娘-柚光汽水.ssf"),
+    ),
+    (
+        "虎娘-幽焰小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-幽焰小恶魔.ssf"),
+    ),
+    // 【绯绒/莓糖收编 2026-10-18 用户拍板】用户自弄的两张小恶魔随包
+    // 官方化（原先装在用户皮肤目录，export 恒带 7.4MB base64——内置
+    // 后 export 排除、迁移零负担）。退役的夜莺/夜桜矢量皮见上方
+    // OFFICIAL_SKINS 注释（同步瘦身：exe 净 -2.9MB）。
+    (
+        "虎娘-绯绒小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-绯绒小恶魔.ssf"),
+    ),
+    (
+        "虎娘-莓糖小恶魔.ssf",
+        include_bytes!("../official-ssf/虎娘-莓糖小恶魔.ssf"),
+    ),
+    (
+        "虎兄贵-健身.ssf",
+        include_bytes!("../official-ssf/虎兄贵-健身.ssf"),
+    ),
+];
+
+/// 【导出瘦身 2026-10-18】serde_json Value 深比较，数字按数值比——
+/// 皮肤经设置页保存路径重序列化会把 `6.0` 写成 `6`，而 Number(6)≠
+/// Number(6.0)（u64 vs f64 变体），原生 == 恒不等（实测夜桜 repo
+/// 36 个数字里 5 个整型 token，disk 副本 33 个）。皮肤域只有小整数
+/// 与小数（字号/颜色/边距），f64 归一比较无损。
+fn json_value_num_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => {
+            match (x.as_f64(), y.as_f64()) {
+                (Some(p), Some(q)) => p == q,
+                _ => x == y,
+            }
+        }
+        (serde_json::Value::Object(m), serde_json::Value::Object(n)) => {
+            m.len() == n.len()
+                && m.iter()
+                    .all(|(k, v)| n.get(k).map(|w| json_value_num_eq(v, w)).unwrap_or(false))
+        }
+        (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| json_value_num_eq(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+/// 【导出瘦身 2026-10-18】磁盘上的官方 JSON 皮肤与内嵌版**语义**相同
+///（数字归一的深比较，见 json_value_num_eq）？相同=纯冗余（exe 内嵌
+/// 自愈，导出它白占体积——夜桜/夜莺两张大图皮内联 8.5MB 就是 15MB
+/// 导出的主犯）；用户改过（配色/挂件，如湖光）= 真用户数据，照常
+/// 导出。导出侧专用，自愈逻辑不看这个。
+pub fn official_skin_unchanged(file: &str, disk: &serde_json::Value) -> bool {
+    OFFICIAL_SKINS.iter().any(|(f, body)| {
+        *f == file
+            && serde_json::from_str::<serde_json::Value>(body)
+                .map(|v| json_value_num_eq(&v, disk))
+                .unwrap_or(false)
+    })
+}
+
+/// 【导出瘦身 2026-10-18】同上，.ssf 版：官方名且字节未改才排除。
+///（用户导入过同名更新版=内容不同=会随导出带走的。）
+pub fn official_ssf_unchanged(file: &str, disk: &[u8]) -> bool {
+    OFFICIAL_SSF
+        .iter()
+        .any(|(f, body)| *f == file && *body == disk)
+}
 
 pub struct Host {
     pub candidate_export: crate::candidate_export::Export,
@@ -117,6 +245,11 @@ pub struct Host {
     /// 有效期内 state 携带——DLL 预览候选窗弹在设置窗中心而非
     /// 陈旧光标处（用户实测「弹在屏幕中间位置不对」的修复）。
     pub preview_anchor: Option<((i64, i64), std::time::Instant)>,
+    /// 【占位符记忆改道 2026-10-09】加词框「占位符」勾选态。原先落
+    /// HKCU\Software\HuFu\addword_ph——NTQQ 渲染进程跑在低完整性沙箱，
+    /// 写 HKCU 静默失败（用户实测勾了不记）。改由 server（用户态、
+    /// 无沙箱）持久化到 数据\addword-ph.json，DLL 经管道读写。
+    pub addword_ph: bool,
 }
 
 impl Host {
@@ -154,15 +287,98 @@ impl Host {
             rerank_tx: None,
             skin_ver: 0,
             preview_anchor: None,
+            addword_ph: data_dir
+                .join("addword-ph.json")
+                .exists()
+                .then(|| std::fs::read_to_string(data_dir.join("addword-ph.json")).ok())
+                .flatten()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("on").and_then(|x| x.as_bool()))
+                .unwrap_or(false),
         };
         host.install_official_skins();
         mark("skins", &t0);
+        // 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘（缺失才写，
+        // 用户同名定制优先——与官方 JSON 皮肤同款语义）。
+        host.install_official_ssf();
+        mark("ssf", &t0);
+        // 【个人存储表模板自愈 2026-10-17 老户升级补齐】升级安装对码表
+        // 目录零写入（iss 数据铁律：不覆盖/不补缺/不复活已删——用户财
+        // 产保护），1.8.6 新增的方案目录 个人存储表.txt 模板老户拿不到；
+        // 与官方皮肤同款语义：server 启动逐方案目录补缺（仅缺失才写，
+        // 存在不覆盖——用户已填内容永不动）。
+        host.install_personal_templates();
+        mark("pstpl", &t0);
+        // 【SSF 皮肤 2026-12】.ssf 完全用户自管理：不做内置/自装（法律
+        // 红线：绝不内置搜狗皮肤）。仅启动自愈：config 指向的 ssf 皮肤
+        // 源文件已删 → 回退默认 JSON 皮肤（设计稿降级矩阵「下次重载时
+        // 走第一条」；坏配置绝不能让候选窗无皮可用）。
+        host.heal_ssf_skin_config();
         host.setup_rerank();
         mark("rerank", &t0);
         // 注意：整句模型不在此时同步加载——由 main.rs 的后台线程
         // 装载后热挂（见 sentence_load_plan）。启动只载词典（秒级），
         // 管道/设置页即刻可用；装完立即可打字，整句能力稍后自动就位。
         Ok(host)
+    }
+
+    /// 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘到 .ssf 皮肤目录
+    ///（与 *.json 同目录混居）。仅缺失时写入；存在不覆盖（用户定制优
+    /// 先）。默认出厂不开独立皮肤（config 默认 skin_kind=json、
+    /// skin=hufu-moyan，见 hufu-config AppearanceSection::default）。
+    fn install_official_ssf(&mut self) {
+        let dir = self.ssf_skins_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (file, body) in OFFICIAL_SSF {
+            let p = dir.join(file);
+            if !p.exists() {
+                if let Err(e) = std::fs::write(&p, body) {
+                    eprintln!("系统自带 ssf {file} 落盘失败: {e}");
+                }
+            }
+        }
+    }
+
+    /// 【个人存储表模板自愈 2026-10-17】每个方案目录缺 个人存储表.txt
+    /// 时写入注释模板（UTF-8 BOM + CRLF + 结尾换行——末行无换行会让直
+    /// 接追加的词条粘进注释静默失效）。仅补缺，绝不覆盖。模板文本与
+    /// pack.ps1 1e 段 $pstTpl **两处同步维护**（改一处须同步另一处）。
+    fn install_personal_templates(&mut self) {
+        const PST_TEMPLATE: &str = concat!(
+            "# 个人存储表（隐私词库）\r\n",
+            "#\r\n",
+            "# 作用：放只给你自己用的词，比如手机号、证件号、住址、各种账号。\r\n",
+            "#   这里的词平时照常打得出、能上屏，但不会出现在导出的码表里，\r\n",
+            "#   也不会进设置页面，不参与调频和词库调整。\r\n",
+            "#   换句话说：只有直接编辑这个文件才能改动它，别处都看不见。\r\n",
+            "#\r\n",
+            "# 格式：一行一条 = 编码 + Tab键 + 词。例如（去掉行首 # 即生效）：\r\n",
+            "#   sjh〔按一下Tab键〕13800880088\r\n",
+            "#   zjz〔按一下Tab键〕某某省某某市某某区\r\n",
+            "#\r\n",
+            "# 用法：用记事本打开本文件，照上面格式添加词条并保存，\r\n",
+            "#   保存后一两秒即可打出（正在打字时会等这串打完再生效）。\r\n",
+            "#   词条会追加在候选的末尾，用数字键选它上屏。\r\n",
+            "#\r\n",
+            "# 提示：升级输入法不会改动这个文件；本文件与方案同名目录绑定，\r\n",
+            "#   换方案请编辑对应方案文件夹里的这一份。\r\n",
+        );
+        let schemas = self.engine.schemas.clone();
+        let dict_root = hufu_engine::Engine::resolve_data_sub(
+            &self.data_dir,
+            &self.engine.config.schema.dir,
+        );
+        for name in schemas {
+            let p = dict_root.join(&name).join("个人存储表.txt");
+            if p.exists() {
+                continue;
+            }
+            let mut body: Vec<u8> = b"\xEF\xBB\xBF".to_vec();
+            body.extend_from_slice(PST_TEMPLATE.as_bytes());
+            if let Err(e) = std::fs::write(&p, &body) {
+                eprintln!("个人存储表模板写入失败 {}: {e}", p.display());
+            }
+        }
     }
 
     /// 官方皮肤自愈落盘：内嵌皮肤（official-skins/，随 git 与二进制分发）
@@ -424,6 +640,16 @@ impl Host {
                 const IDLE_UNLOAD_MIN: u64 = 30;
                 let mut idle_secs: u64 = 0;
                 let mut loaded = native.is_some() || model.is_some();
+                // 【空闲首击热身 2026-10-12】最近一次打分时刻（ms）——
+                // >120s 空闲后首击先热身再正式请求（电源态轻推，防死机
+                // 取证见下）。启动时引擎已空跑预热，初值=启动时刻。
+                let now_ms = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                };
+                let mut last_score_ms: u64 = now_ms();
                 let ensure_engines = |native: &mut Option<hufu_rerank::native::NativeScorer>,
                                           model: &mut Option<hufu_rerank::Reranker>| {
                     if native.is_none() && model.is_none() {
@@ -487,6 +713,41 @@ impl Host {
                     if cur.cands.len() < 2 {
                         continue;
                     }
+                    // 【空闲首击热身 2026-10-12 作者令】>120s 无打分后首击
+                    // 先小负载轻推电源态再跑正式请求——逐键全核 AVX 爆发
+                    // 引发「深省电→爆频」电源管理震荡，AMD APU 平台状态
+                    // 机在转换处整机挂死（SoC 级取证，详见 E:\DSH-KF\虎符
+                    // 重排打包强制规范.md）。native 侧 FFI 无线程数参数：
+                    // 单候选小打分（线程池轻载起步）；Rust 侧 warmup() =
+                    // 2 线程迷你前向（warmup_pool）。热身毫秒数落
+                    // rerank.log（电源震荡取证生命线）。
+                    const IDLE_WARMUP_SECS: u64 = 120;
+                    if loaded && now_ms().saturating_sub(last_score_ms) > IDLE_WARMUP_SECS * 1000 {
+                        let t_w = std::time::Instant::now();
+                        if let Some(ns) = &native {
+                            let _ = ns.score("。", &["预热".to_string()]);
+                        } else if let Some(r) = &model {
+                            r.warmup();
+                        }
+                        let w_ms = t_w.elapsed().as_millis();
+                        let _ = std::fs::create_dir_all(&diag_dir);
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(diag_dir.join("rerank.log"))
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                f.write_all(
+                                    format!(
+                                        "[{}] warmup {w_ms}ms (idle>{}s)\n",
+                                        now_ms() / 1000,
+                                        IDLE_WARMUP_SECS
+                                    )
+                                    .as_bytes(),
+                                )
+                            });
+                    }
+                    last_score_ms = now_ms();
                     // 打分（native 优先；native 缺席时纯 Rust 懒加载兜底）
                     let t_score = std::time::Instant::now();
                     let scores: Option<Vec<f64>> = if let Some(ns) = &native {
@@ -631,18 +892,22 @@ impl Host {
                 return Err(format!("方案目录不存在: {target}"));
             }
             let schema = hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
-            let out = self.export_out_path(&target);
+            let out = self.export_out_path(&target, fmt);
             let n = export_util::export_one(&schema, &out, fmt)?;
             return Ok((out.to_string_lossy().into_owned(), n));
         }
-        let out = self.export_out_path(&target);
+        let out = self.export_out_path(&target, fmt);
         let n = export_util::export_one(&self.engine.schema, &out, fmt)?;
         Ok((out.to_string_lossy().into_owned(), n))
     }
 
     /// 导出文件路径：<安装根>\码表导出\<方案名>\<方案名> <yyyyMMdd-HHmm>.txt
     ///（一级目录布局：与 码表/模型 平级；每码表一个子文件夹）。
-    fn export_out_path(&self, name: &str) -> PathBuf {
+    /// 【Rime 真身扩展名 2026-10-14】现场反馈：选「Rime dict.yaml」导出的
+    /// 文件其实是 .txt——内容是 Rime 而扩展名恒 txt，放进 Rime 方案目录
+    /// 认不出来。扩展名随格式：Rime → .dict.yaml（虎符自家 *.dict.yaml
+    /// 嗅探同样认），其余维持 .txt 不变。
+    fn export_out_path(&self, name: &str, fmt: export_util::ExportFormat) -> PathBuf {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -653,13 +918,17 @@ impl Host {
         let rem = secs % 86400;
         let (y, mo, da) = civil_from_days(days as i64);
         let (h, mi) = (rem / 3600, (rem % 3600) / 60);
+        let ext = match fmt {
+            export_util::ExportFormat::Rime => "dict.yaml",
+            _ => "txt",
+        };
         let root = self
             .data_dir
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.data_dir.clone());
         root.join("码表导出").join(name).join(format!(
-            "{name} {:04}{:02}{:02}-{:02}{:02}.txt",
+            "{name} {:04}{:02}{:02}-{:02}{:02}.{ext}",
             y, mo, da, h, mi
         ))
     }
@@ -844,6 +1113,41 @@ impl Host {
         self.data_dir.join("皮肤")
     }
 
+    /// 【SSF 皮肤 2026-12】.ssf 皮肤目录：与现有 *.json 同目录混居
+    /// （list 时按扩展名分类），缓存落 `数据\皮肤缓存\{stem}\`。
+    pub fn ssf_skins_dir(&self) -> PathBuf {
+        crate::ssf::ssf_skins_dir(&self.data_dir)
+    }
+
+    /// .ssf 皮肤枚举（含解析错误信息；坏皮不 panic、照常列出）。
+    pub fn list_ssf_skins(&self) -> Vec<crate::ssf::SsfSkinEntry> {
+        crate::ssf::list_ssf(&self.data_dir)
+    }
+
+    /// 取可用 .ssf 皮肤包（缓存优先；源缺失时降级用缓存）。
+    pub fn ssf_bundle(&self, id: &str) -> Result<crate::ssf::SsfBundle, String> {
+        crate::ssf::bundle_for(&self.data_dir, id)
+    }
+
+    /// 【SSF 启动自愈】config 指向 ssf 皮肤但源文件已删 → 回退默认
+    /// JSON 皮肤并落盘（列表标注由 GET /api/skins 补条目完成——此处
+    /// 回退后 current 即指向真实存在的默认皮，无悬空引用）。
+    fn heal_ssf_skin_config(&mut self) {
+        if self.engine.config.appearance.skin_kind != "ssf" {
+            return;
+        }
+        let id = self.engine.config.appearance.skin.clone();
+        let p = self.ssf_skins_dir().join(format!("{id}.ssf"));
+        if p.exists() {
+            return;
+        }
+        let fallback = hufu_config::AppearanceSection::default().skin;
+        eprintln!("ssf 皮肤 {id} 的源文件已删除，回退默认 JSON 皮肤 {fallback}");
+        self.engine.config.appearance.skin = fallback;
+        self.engine.config.appearance.skin_kind = "json".into();
+        let _ = self.engine.config.save(&self.config_path);
+    }
+
     pub fn list_skins(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(self.skins_dir()) {
@@ -984,6 +1288,10 @@ mod export_util {
         Duoduo,
         /// QQ五笔：无头 `词\t码`
         Qq,
+        /// 机器人专用：无头 `码\t词`——「多多格式反过来的样子」
+        ///（2026-10-09 用户需求：词前/码前列序对调，纯两列无头无标记，
+        /// 供聊天机器人词库等机器消费方直接读取）
+        Robot,
     }
 
     impl ExportFormat {
@@ -994,6 +1302,7 @@ mod export_util {
                 "rime" | "yaml" | "dict.yaml" => Self::Rime,
                 "duoduo" | "dd" => Self::Duoduo,
                 "qq" => Self::Qq,
+                "robot" | "jiqiren" | "机器人" | "机器人专用" => Self::Robot,
                 _ => Self::Sentence,
             }
         }
@@ -1015,12 +1324,17 @@ mod export_util {
         codes.sort();
         codes.dedup();
 
-        // 2) 逐码取当前生效序（含 pinned 标记——多多 #固 / 权重置顶用）
+        // 2) 逐码取当前生效序（含 pinned 标记——多多 #固 / 权重置顶用）。
+        // 【个人存储表不导出 2026-10-16】隐私词条（手机/身份证/住址）
+        // 绝不进导出文件：candidates() 会把个人存储表词条追加在末尾，
+        // 此处按 personal_contains 整条剔除；personal 专码（码表/用户词
+        // 都没有的码）天然不在 codes 全集里，双保险。
         let mut rows: Vec<(String, Vec<(String, bool)>)> = Vec::new();
         for code in &codes {
             let texts: Vec<(String, bool)> = schema
                 .candidates(code)
                 .iter()
+                .filter(|e| !schema.personal_contains(code, &e.text))
                 .map(|e| (e.text.clone(), e.pinned))
                 .collect();
             if !texts.is_empty() {
@@ -1116,6 +1430,12 @@ mod export_util {
             ExportFormat::Qq => rows
                 .iter()
                 .flat_map(|(c, texts)| texts.iter().map(move |(t, _)| format!("{t}\t{c}")))
+                .collect(),
+            // 机器人专用：`码\t词`（多多列序对调；纯两列无头无标记——
+            // 行序即生效序，与多多导出同一「纯序」拍板语义）
+            ExportFormat::Robot => rows
+                .iter()
+                .flat_map(|(c, texts)| texts.iter().map(move |(t, _)| format!("{c}\t{t}")))
                 .collect(),
         }
     }
@@ -1264,6 +1584,40 @@ mod export_util {
             test_base("out").with_extension("txt")
         }
 
+        /// 【个人存储表不导出 2026-10-16】隐私词条候选可见（同码混排
+        /// 追加在末尾）、导出剔除：同码个人词出局码表词照出；个人专码
+        /// 整码不在导出编码全集。
+        #[test]
+        fn personal_table_never_exported() {
+            let tmp = test_base("personal");
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(
+                &tmp.join("main.txt"),
+                "#hufu-dict v1 name=t\nsj\t数据\njd\t就\n",
+            )
+            .unwrap();
+            std::fs::write(&tmp.join("个人存储表.txt"), "sj\t13800880088\nmy\t张三丰\n").unwrap();
+            let s = Schema::load(&tmp).unwrap();
+            // 候选在场：同码混排（个人词追加在末尾，不抢码表词位）
+            let cs = s.candidates("sj");
+            let sj: Vec<&str> = cs.iter().map(|e| e.text.as_str()).collect();
+            assert_eq!(sj, ["数据", "13800880088"], "个人词追加在候选末尾");
+            assert!(s.personal_contains("sj", "13800880088"), "(码,词) 判据");
+            assert!(s.personal_has_text("张三丰"), "任意码判据");
+            assert!(s.personal.lookup("my").iter().any(|e| e.text == "张三丰"), "个人专码可打出");
+            // 导出全剔除
+            let out = out_path();
+            export_one(&s, &out, ExportFormat::Sentence).unwrap();
+            let lines = hufu_dict::parse::read_lines(&out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            let joined = lines.join("\n");
+            assert!(!joined.contains("13800880088"), "同码个人词不导出");
+            assert!(!joined.contains("张三丰"), "个人专码整码不导出");
+            assert!(!joined.contains("\nmy ") && !joined.starts_with("my "), "个人码不出行");
+            assert!(joined.contains("数据"), "码表词照常导出");
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
         #[test]
         fn sentence_format_roundtrip() {
             let s = mk_schema_dir();
@@ -1378,7 +1732,24 @@ mod export_util {
             assert_eq!(ExportFormat::parse("dict.yaml"), ExportFormat::Rime);
             assert_eq!(ExportFormat::parse("duoduo"), ExportFormat::Duoduo);
             assert_eq!(ExportFormat::parse("qq"), ExportFormat::Qq);
+            // 【机器人专用 2026-10-09】多多反过来（码\t词）
+            assert_eq!(ExportFormat::parse("robot"), ExportFormat::Robot);
+            assert_eq!(ExportFormat::parse("机器人专用"), ExportFormat::Robot);
             assert_eq!(ExportFormat::parse("乱码"), ExportFormat::Sentence);
+        }
+
+        #[test]
+        fn robot_format_renders_code_first() {
+            // 机器人专用 = 多多列序对调：`码\t词` 纯两列无头无标记
+            let rows = vec![(
+                "jhgk".to_string(),
+                vec![("就".to_string(), false), ("成就".to_string(), false)],
+            )];
+            let lines = render(&rows, ExportFormat::Robot);
+            assert_eq!(lines, vec!["jhgk\t就".to_string(), "jhgk\t成就".to_string()]);
+            // 对照：多多=词\t码（列序相反）
+            let dd = render(&rows, ExportFormat::Duoduo);
+            assert_eq!(dd[1..], vec!["就\tjhgk".to_string(), "成就\tjhgk".to_string()]);
         }
 
         #[test]

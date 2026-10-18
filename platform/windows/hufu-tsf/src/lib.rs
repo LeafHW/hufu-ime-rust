@@ -30,6 +30,7 @@ mod langbar;
 // 只读候选窗最终矩形取位，不碰候选窗锚点/几何代码。
 mod overlaywin;
 mod sound;
+mod ssfwin;
 mod tsf;
 
 use windows_core::*;
@@ -134,11 +135,26 @@ extern "system" fn hufu_test_key_burst(n: u32) -> i32 {
 /// （%TEMP%\hufu-pad.bmp）供视觉/数值检查内边距。返回 1=成功。
 #[no_mangle]
 extern "system" fn hufu_test_pad_dump() -> i32 {
-    let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
-        eprintln!("pad-dump: skin op 失败");
-        return 0;
+    // 【皮肤直读 2026-10-08】HUFU_PAD_SKIN=<json 路径> 时不走管道（开发
+    // 沙箱禁命名管道），直接从文件读皮肤——字体/布局像素取证用。
+    let mut skin = match std::env::var("HUFU_PAD_SKIN")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| {
+            // 容忍 UTF-8 BOM（PowerShell Set-Content -Encoding UTF8 写带 BOM）
+            serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}'))
+                .ok()
+        })
+    {
+        Some(v) => v,
+        None => {
+            let Some(resp) = crate::ipc::call(&serde_json::json!({"op": "skin"})) else {
+                eprintln!("pad-dump: skin op 失败");
+                return 0;
+            };
+            resp.get("skin").cloned().unwrap_or(serde_json::Value::Null)
+        }
     };
-    let mut skin = resp.get("skin").cloned().unwrap_or(serde_json::Value::Null);
     // 候选数可用 HUFU_PAD_N 控制（默认 5；10=验证第 10 序号显示 0）
     let n = std::env::var("HUFU_PAD_N")
         .ok()
@@ -301,11 +317,197 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     }
 }
 
+/// 测试钩子：按【当前生产皮肤】渲染候选窗一帧——离屏回读像素写 BMP
+/// + 可选保持显示（hold_ms>0 时窗口停留供实机观察）。皮肤载荷经 ipc
+/// 从 hufu-server 拉当前选中皮肤（SSF/JSON 双形态原样），不改材质不覆
+/// 盖任何字段——与真实打字路径同一条 show() 代码。BMP 落
+/// %TEMP%\hufu-skin-dump.bmp（32bpp BI_RGB，行自底向上）。返回 1=通。
+/// （HUFU_SKIN_DUMP 环境变量可覆盖输出路径。）
+#[no_mangle]
+extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    let Some(mut w) = CandidateWindowV2::new() else {
+        eprintln!("skin-dump: 候选窗初始化失败");
+        return 0;
+    };
+    // 【渲染指定皮肤 2026-10-16】HUFU_SKIN_DUMP_ID=皮肤 id → 经
+    // skin_for_render 拉该皮肤 payload（含其 overrides）——设置页
+    // 渲染「正在编辑的独立皮肤」而不是「当前上位皮肤」（用户实锤：
+    // 矢量模式下进独立皮肤页，实时框显示的是矢量皮肤）。无该变量=
+    // 老行为（op:skin=当前），真实打字进程零改动。
+    let dump_id = std::env::var("HUFU_SKIN_DUMP_ID").unwrap_or_default();
+    let skin_op = if dump_id.is_empty() {
+        serde_json::json!({"op": "skin"})
+    } else {
+        serde_json::json!({"op": "skin_for_render", "id": dump_id})
+    };
+    let Some(mut skin) = crate::ipc::call(&skin_op) else {
+        eprintln!("skin-dump: 引擎皮肤拉取失败（server 在线？）");
+        return 0;
+    };
+    let cands = vec![
+        ("基础".to_string(), "jichu".to_string()),
+        ("几点".to_string(), "".to_string()),
+        ("记得".to_string(), "少用".to_string()),
+        ("街道".to_string(), "jie dao".to_string()),
+    ];
+    // 锚点：取前台焦点窗口客户区中下——host 门要求锚点落在焦点窗口内
+    // （防跨应用误画的安全门），否则 show 会被 SW_HIDE 拦截。
+    let mut anchor = windows::Win32::Foundation::RECT {
+        left: 420,
+        top: 420,
+        right: 420,
+        bottom: 446,
+    };
+    unsafe {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetForegroundWindow};
+        let fg = GetForegroundWindow();
+        if fg.0 != std::ptr::null_mut() {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            if GetClientRect(fg, &mut rc).is_ok() {
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: (rc.right - rc.left) / 2,
+                    y: (rc.bottom - rc.top) * 2 / 3,
+                };
+                if ClientToScreen(fg, &mut pt).as_bool() {
+                    anchor = windows::Win32::Foundation::RECT {
+                        left: pt.x,
+                        top: pt.y,
+                        right: pt.x,
+                        bottom: pt.y + 26,
+                    };
+                }
+            }
+        }
+    }
+    eprintln!("skin-dump: anchor=({},{})", anchor.left, anchor.top);
+    // 【验收盲区修】T8 铁律：inline_preedit 默认 true → show 咽喉吞 raw
+    // → 编码行永不画（生产=编码走宿主内联，正确）。但 SSF 皮肤的
+    // code insets（编码框）只有在关内联时才有意义——取证时注入
+    // inline_preedit=false 模拟该用户档，同帧验证编码行锚定。
+    // HUFU_SKIN_DUMP=1 注入（V1 编码路径）；=2 不注入（V2 生产主路径）。
+    // 双形态强插（顶层 layout / skin.layout——载荷包皮不确定）。
+    if std::env::var("HUFU_SKIN_DUMP_V2").is_err() {
+        let flag = serde_json::Value::Bool(false);
+        if let Some(obj) = skin.as_object_mut() {
+            obj.entry("layout")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+            if let Some(sk) = obj.get_mut("skin").and_then(|s| s.as_object_mut()) {
+                sk.entry("layout")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .and_then(|l| l.insert("inline_preedit".into(), flag.clone()));
+            }
+        }
+    }
+    w.readback = true;
+    // 【诊断 2026-10-16】编码注入 HUFU_SKIN_DUMP_CODE（默认 jd）——
+    // 实时框左缘 1-2px 竖笔画疑为编码字符越窗，空串对照可分离。
+    let dump_code = std::env::var("HUFU_SKIN_DUMP_CODE").unwrap_or_else(|_| "jd".to_string());
+    w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
+    // 【出图提速 2026-10-16】readback 模式下 size_anim/chrome_override
+    // 在 show() 内即被清（首帧=稳态帧，无动效插值）——900ms 长等是
+    // BMP 头错位时期的误判残留。
+    // 【二压 2026-10-16】实证 show() 返回前 last_pixels 已同步填好
+    //（readback 回读在 present 分支之前）——120ms 纯属保险冗余。
+    // 15ms 只留极小余量（切换/导入实时框首显 571→~460ms 的组成项）。
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let px = w.last_pixels.take();
+    let (wq, hq) = w.last_size;
+    w.readback = false;
+    // 取证几何：dpi/shadow_m/内容 w×h（readback 帧无动效插值）
+    if let Some(g) = crate::candwin2::cand_hit_geo() {
+        eprintln!(
+            "skin-dump: geo dpi={:.3} shadow_m={} 内容={}x{} 整窗={}x{}",
+            g.0, g.1, g.2, g.3, wq, hq
+        );
+    }
+    if hold_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
+    }
+    eprintln!("skin-dump: pre-hide");
+    // 【不可见自证 2026-10-16】readback 模式窗口应全程未显示（SWP/
+    // present 已跳过）——若此处 visible=1 说明仍有显示路径漏网。
+    {
+        let vis = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(w.hwnd)
+        };
+        eprintln!("skin-dump: visible={} (期望 0)", vis.0);
+    }
+    w.hide();
+    let Some(px) = px else {
+        eprintln!("skin-dump: 回读失败");
+        return 0;
+    };
+    eprintln!("skin-dump: px={}B", px.len());
+    // 32bpp 原样保留（V4 header + BI_BITFIELDS + alpha mask）——此前
+    // 24bpp 白底合成是测试观察用；现在 BMP 直接进设置页实时框当真窗
+    // 预览，透明区必须透（用户实锤「实时框有白底」）。Chrome/Skia 按
+    // V4 alpha mask 正确解出透明。
+    // 【V4 长度修正 2026-10-16】BITMAPV4HEADER=124B（108 是 V3/
+    // BITMAPINFOHEADER 的大小）。此前 bV4Size/像素 offset 按 108 写，
+    // 字段却全写了 124B → 解码器从错 16B 的位置读像素流 → 每行尾
+    // 4px 卷绕到下一行行首——用户实锤「边框最右边的线出现在左边」
+    //（raw 像素直落对照实锤：raw x=0-1 透明、BMP 同位有内容）。
+    let src_stride = (wq as usize) * 4;
+    let data_sz = (src_stride * hq as usize) as u32;
+    let mut bmp: Vec<u8> = Vec::with_capacity((14 + 124 + data_sz) as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((14u32 + 124 + data_sz) as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&((14u32 + 124) as u32).to_le_bytes());
+    // BITMAPV4HEADER（124B）
+    bmp.extend_from_slice(&124u32.to_le_bytes());
+    bmp.extend_from_slice(&(wq as i32).to_le_bytes());
+    bmp.extend_from_slice(&(hq as i32).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+    bmp.extend_from_slice(&data_sz.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0x00FF0000u32.to_le_bytes()); // R mask
+    bmp.extend_from_slice(&0x0000FF00u32.to_le_bytes()); // G mask
+    bmp.extend_from_slice(&0x000000FFu32.to_le_bytes()); // B mask
+    bmp.extend_from_slice(&0xFF000000u32.to_le_bytes()); // A mask
+    bmp.extend_from_slice(b"sRGB"); // CSType
+    bmp.extend_from_slice(&[0u8; 36]); // CIEXYZTRIPLE endpoints
+    bmp.extend_from_slice(&[0u8; 12]); // r/g/b gamma
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // intent
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // profile data
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // profile size
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // BGRA 原样（bottom-up），32bpp 天然 4 字节对齐无 pad
+    for y in (0..hq as usize).rev() {
+        let base = y * src_stride;
+        bmp.extend_from_slice(&px[base..base + src_stride]);
+    }
+    let path = std::env::var("HUFU_SKIN_DUMP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hufu-skin-dump.bmp"));
+    match std::fs::write(&path, &bmp) {
+        Ok(()) => {
+            eprintln!("skin-dump: {wq}x{hq} → {}", path.display());
+            1
+        }
+        Err(e) => {
+            eprintln!("skin-dump: 写盘失败 {e}");
+            0
+        }
+    }
+}
+
 /// 测试钩子：驱动候选窗 v2（D3D11+DComp+D2D）完整渲染一帧。
 /// 返回 1 = 管线全通（设备/链/渲染/Present），0 = 初始化或渲染失败。
 #[no_mangle]
-extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {
-    use crate::candwin2::CandidateWindowV2;
+extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {    use crate::candwin2::CandidateWindowV2;
     let Some(mut w) = CandidateWindowV2::new() else {
         eprintln!("candwin2: 初始化失败（回退 v1 路径可用）");
         return 0;

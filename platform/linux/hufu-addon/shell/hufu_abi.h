@@ -35,6 +35,10 @@ typedef struct hufu_host {
                    const char *const *candidate_commit_texts,
                    int32_t candidate_count, int32_t candidate_selected,
                    const char *aux_utf8, int32_t chinese);
+    /* 引擎提交「{加词}」时调用：宿主弹加词入口（可为 NULL）。 */
+    void (*addword)(void *user);
+    /* 引擎提交「{加权}」时调用：宿主弹加权入口（可为 NULL）。 */
+    void (*weight)(void *user);
 } hufu_host;
 
 /* hufu_client_key 返回值位掩码。 */
@@ -91,6 +95,46 @@ int32_t hufu_client_reload_schema(hufu_client *client);
 /* 「打开方案文件夹」：请引擎打开当前方案码表目录：
  * 1=成功，0=失败（引擎不在线、方案目录不存在）。 */
 int32_t hufu_client_open_schema_dir(hufu_client *client);
+
+/* 方案清单：首行当前方案，其余每行一个方案名（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）；失败为空串。 */
+const char *hufu_client_schemas(hufu_client *client);
+
+/* 切换方案：1=成功。 */
+int32_t hufu_client_set_schema(hufu_client *client, const char *name);
+
+/* 候选菜单动作（状态菜单「候选管理」）：
+ * action ∈ front（置顶）/del（删除）/fwd（前移）/back（后移）/last（置底）；
+ * text=当前候选词（防异步重排漂移），page_index=页内下标。
+ * 1=成功并刷新候选面板，0=失败/引擎不在线。 */
+int32_t hufu_client_cand_menu(hufu_client *client, const char *action,
+                              const char *text, int32_t page_index);
+
+/* 候选对调：i/j 为页内下标，text_i/text_j 为对应候选词；1=成功。 */
+int32_t hufu_client_cand_swap(hufu_client *client, int32_t i, int32_t j,
+                              const char *text_i, const char *text_j);
+
+/* 「打开设置页」：请 server 用 xdg-open 打开 Web 设置页：
+ * 1=成功，0=失败（引擎不在线）。 */
+int32_t hufu_client_settings(hufu_client *client);
+
+/* 「导出码表」：导出当前方案并打开导出目录；成功返回导出文件路径
+ * （NUL 结尾，指向客户端内部缓冲，**下次对同一客户端调用本函数前有效**），
+ * 失败/引擎不在线返回空串（非 NULL）。 */
+const char *hufu_client_export_schema(hufu_client *client);
+
+/* 原生加词：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）。参数同 Web POST /api/user_word/add。 */
+const char *hufu_client_aw_add(hufu_client *client, const char *code,
+                               const char *text, int32_t pos);
+
+/* 打开当前方案个人存储表（隐私词库）：1=成功，0=失败/文件不存在。 */
+int32_t hufu_client_open_personal(hufu_client *client);
+
+/* 原生加权：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）。参数同 Web POST /api/user_word/weight。 */
+const char *hufu_client_aw_weight(hufu_client *client, const char *text,
+                                  int32_t weight);
 
 /* 「按键音效」开关：引擎侧取反并落盘（热生效）：1=开，0=关，
  * -1=未知（引擎不在线或回包异常）——宿主据此保持原勾选态。 */

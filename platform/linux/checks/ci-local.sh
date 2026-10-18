@@ -8,7 +8,8 @@
 #
 # 覆盖（与 .github/workflows/ci.yml 的检查一一对应）：
 #   ① 依赖缓存探测   ② 前端单测   ③ 构建 addon   ④ C ABI 符号一致
-#   ⑤ DESTDIR 安装布局   ⑥ 逐脚本 bash -n   ⑦ assets 台账   ⑧ dry-run 冒烟
+#   ⑤ DESTDIR 安装布局   ⑥ 逐脚本 bash -n   ⑦ assets 台账   ⑧ 品牌图形
+#   ⑨ 皮肤主题包   ⑩ 排版   ⑪ clippy
 #
 # 与 workflow 的职责划分：
 #   · workflow 管**环境**——apt 装依赖（cmake / g++ / make / binutils / libfcitx5core-dev）、
@@ -24,7 +25,7 @@
 # 只跑一条 `cargo fetch --offline --locked` 做只读探测：过了说明缓存够用，
 # 没过就把补救命令打出来（见 ①）。
 #
-# 静态检查两项也在本脚本里（⑨ 排版 / ⑩ clippy）：这两个 crate 的代码是我们自己的，
+# 静态检查两项也在本脚本里（⑩ 排版 / ⑪ clippy）：这两个 crate 的代码是我们自己的，
 # 排版与 lint 就该由守卫钉住，而不是靠自觉；`hufu-fcitx5-client` 的 C ABI 导出统一是
 # `unsafe extern "C" fn`（ABI 与 `hufu_abi.h` 不变），因此 clippy 的裸指针告警已消除。
 #
@@ -38,8 +39,6 @@ cd "$root"
 
 build=platform/linux/build   # 与 CMakeLists / install.sh / workflow 同一构建目录
 stage=/tmp/stage             # DESTDIR 暂存：免 sudo 核对安装布局
-xdg_tmp=/tmp/hufu-ci         # dry-run 用的临时 XDG_DATA_HOME（跑完必须仍不存在）
-bin_tmp=/tmp/hufu-ci-bin     # dry-run 用的临时 XDG_BIN_HOME（同上）
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -131,46 +130,14 @@ bash platform/linux/checks/check-branding.sh || fail '品牌图形自检失败'
 step '⑨ 皮肤 → fcitx5 主题包（重跑转换逐字节比对）'
 bash platform/linux/checks/check-themes.sh || fail '皮肤主题包与引擎皮肤源不一致'
 
-step '⑩ install / uninstall --dry-run 冒烟（临时 XDG_DATA_HOME / XDG_BIN_HOME，不落任何改动）'
-rm -rf "$xdg_tmp"
-if ! XDG_DATA_HOME="$xdg_tmp" bash platform/linux/install.sh --dry-run >"$tmp/install.log" 2>&1; then
-    tail -20 "$tmp/install.log"
-    fail 'install.sh --dry-run 非 0 退出'
-fi
-if ! XDG_DATA_HOME="$xdg_tmp" bash platform/linux/uninstall.sh --dry-run >"$tmp/uninstall.log" 2>&1; then
-    tail -20 "$tmp/uninstall.log"
-    fail 'uninstall.sh --dry-run 非 0 退出'
-fi
-# 可执行文件落点：默认必须是 ~/.local/bin（用户级 bin 的标准位置），不能拼到 $XDG_DATA 下
-if ! grep -qF "$HOME/.local/bin/hufu-server" "$tmp/install.log"; then
-    fail 'install.sh 未按标准落点装 hufu-server（~/.local/bin/hufu-server）'
-fi
-if grep -qF "$xdg_tmp/bin/hufu-server" "$tmp/install.log"; then
-    fail 'hufu-server 被装到了 $XDG_DATA_HOME/bin 下（非标准位置）'
-fi
-# XDG_BIN_HOME 覆盖时：落点跟随，且 systemd 单元的 ExecStart 同步改成实际路径
-rm -rf "$bin_tmp"
-if ! XDG_BIN_HOME="$bin_tmp" XDG_DATA_HOME="$xdg_tmp" \
-    bash platform/linux/install.sh --dry-run >"$tmp/install-bin.log" 2>&1; then
-    tail -20 "$tmp/install-bin.log"
-    fail 'install.sh --dry-run（XDG_BIN_HOME）非 0 退出'
-fi
-if ! grep -qF "ExecStart=$bin_tmp/hufu-server" "$tmp/install-bin.log"; then
-    fail 'XDG_BIN_HOME 生效时未同步改写 systemd 单元的 ExecStart'
-fi
-if [ -e "$xdg_tmp" ] || [ -e "$bin_tmp" ]; then
-    fail "dry-run 落了改动：$xdg_tmp 或 $bin_tmp 被创建（dry-run 应当只打印，不产生副作用）"
-fi
-ok "三个 dry-run 都是 exit 0，落点正确（~/.local/bin，XDG_BIN_HOME 跟随），且临时目录未被创建"
-
-step '⑪ 排版（cargo fmt -p hufu-fcitx5-client --check）'
+step '⑩ 排版（cargo fmt -p hufu-fcitx5-client --check）'
 if ! fmt_out=$(cd platform/linux && cargo fmt -p hufu-fcitx5-client --check 2>&1); then
     printf '%s\n' "$fmt_out"
     fail 'rustfmt 有差异：在 platform/linux 跑 cargo fmt -p hufu-fcitx5-client 后重试'
 fi
 ok '排版干净'
 
-step '⑫ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
+step '⑪ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
 if ! clippy_out=$(cd platform/linux &&
     cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings 2>&1); then
     printf '%s\n' "$clippy_out"

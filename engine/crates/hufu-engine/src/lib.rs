@@ -445,6 +445,9 @@ pub struct Engine {
     opencc: Option<hufu_dict::OpenCc>,
     opencc_emoji: Option<hufu_dict::OpenCc>,
     opencc_loaded: bool,
+    /// 【emoji 独立生效 2026-10-16】emoji 表懒加载独立旗——emoji 注解
+    /// 与繁简转换解耦后，单开 emoji 不再连带加载 ST/TS 表（反之亦然）。
+    opencc_emoji_loaded: bool,
     /// 【延迟重载 2026-09-06】候选框内调频/删词后置位；候选框消失
     ///（raw 清空且无待上屏）时才 reload 用户数据+同步整句注入——
     /// 用户在候选框连续操作期间不被重载打断。
@@ -528,7 +531,15 @@ impl Engine {
         };
         let dict_root = Engine::resolve_data_sub(data_dir, &config.schema.dir);
         let current = dict_root.join(&config.schema.current);
-        let schema = Schema::load(&current)?;
+        let mut schema = Schema::load(&current)?;
+        // 【个人存储表·数据目录 2026-10-16 用户实锤】数据目录根的
+        // 个人存储表.txt（全局语义）并入 personal 专槽——用户放 数据\
+        // 不生效的修复；方案目录同名文件仍同认（见 merge_personal_file）。
+        for stem in ["个人存储表", "个人存储"] {
+            for ext in ["txt", "yaml"] {
+                schema.merge_personal_file(&data_dir.join(format!("{stem}.{ext}")));
+            }
+        }
         mark("schema_load");
         let mut schemas = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dict_root) {
@@ -553,6 +564,7 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
+            opencc_emoji_loaded: false,
             pending_user_reload: false,
             pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
@@ -586,6 +598,7 @@ impl Engine {
             opencc: None,
             opencc_emoji: None,
             opencc_loaded: false,
+            opencc_emoji_loaded: false,
             pending_user_reload: false,
             pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
@@ -708,6 +721,14 @@ impl Engine {
         }
     }
 
+    /// 【引导键连动 2026-10-09】反查态内引导键输出的符号——与设置页
+    /// 「关闭反查时按引导键」选项连动（用户需求）：选项配「`」则反查
+    /// 内（二次直出/有候选顶屏）也出「`」；配「·」或未配出「·」（间隔
+    /// 号老语义兜底——反查态内总得有个输出，不能像空态那样直通）。
+    fn reverse_exit_symbol(&self) -> String {
+        self.disabled_symbol().unwrap_or_else(|| "·".to_string())
+    }
+
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
         // 空名防御：dir.join("") = 码表根目录本身，Schema::load 会把
@@ -721,7 +742,14 @@ impl Engine {
         }
         let old = self.config.schema.current.clone();
         let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
-        let schema = Schema::load(&dir)?;
+        let mut schema = Schema::load(&dir)?;
+        // 【个人存储表·数据目录 2026-10-16】切方案同口径并入数据目录根
+        // 的全局个人存储表（改文件后切一次方案即热生效，不必重启 server）。
+        for stem in ["个人存储表", "个人存储"] {
+            for ext in ["txt", "yaml"] {
+                schema.merge_personal_file(&self.data_dir.join(format!("{stem}.{ext}")));
+            }
+        }
         self.schema = schema;
         // 【三十六修】会话学习按 (code,text) 登记，码义随方案变——
         // 切方案即作废，防跨方案错配回放。
@@ -918,20 +946,40 @@ impl Engine {
     /// 空态限制：选重/翻页/清屏/顶屏只在编码态或候选在场时有意义，
     /// 空态按键交还内建分支（如 CapsLock 切英文）；repeat/undo 空态
     /// 可用（历史栈自持就绪态）。
-    fn run_keymap(&mut self, session: &mut Session, act: &str) -> Option<KeyOutcome> {
+    /// 【orig_key 2026-10-16】映射的物理键字符（非字符键 None）——
+    /// selectN 越界标顶按**原键**出标点/数字（/ 绑 4 选候选不足 →
+    /// 「首选+、」而非「首选+4」），见 on_rank_key_ex。
+    fn run_keymap(
+        &mut self,
+        session: &mut Session,
+        act: &str,
+        orig_key: Option<char>,
+    ) -> Option<KeyOutcome> {
         let composing =
             !session.raw.is_empty() || !session.candidates.is_empty();
         match act {
             // selectN → 以对应数字键名走 on_rank_key 全链路（整句锁/
             // 闪帧/调频/越界标顶回退全部同构；No 越界→fallback 数字
             // 语义）。非编码态不吞（CapsLock 空态=切英文等内建语义）。
+            // 【引导域快符保护 2026-10-18 用户实锤】z 绑 4 选后，;
+            // 引导态（raw=";"）按 z 被 selectN 截走 → 快符 ;z=· 打不出
+            //（别的键没绑 selectN 一切正常）。定案：raw 处于引导域
+            //（; / \ ` 前缀、z 符号域）且按键续写后仍是有效编码前缀
+            //（has_continuation_prefix）时，selectN 让位给正常输入——
+            // 与内建选重键「编码延续优先」（on_char 的 !extends 门）
+            // 同一哲学：引导序列中途，输入是主流程，选重是副流程。
             a if a.starts_with("select") && a.len() >= 7 => {
                 let n = a[6..].parse::<usize>().ok()?;
                 if !(1..=10).contains(&n) || !composing {
                     return None;
                 }
+                if let Some(c) = orig_key {
+                    if self.keymap_guide_continuation(session, c) {
+                        return None;
+                    }
+                }
                 let digit = if n == 10 { '0' } else { char::from_digit(n as u32, 10)? };
-                Some(self.on_rank_key(session, digit))
+                Some(self.on_rank_key_ex(session, digit, orig_key))
             }
             a if a == "repeat" || (a.starts_with("repeat") && a.len() > 6) => {
                 // 复用 {重复上屏} 历史栈：repeat/repeatN（N≥2 = 倒数
@@ -978,6 +1026,10 @@ impl Engine {
             }
             "switch" => {
                 session.chinese = !session.chinese;
+                // 【切英文态清锁大写 2026-10-12】caps_lock 只在中文态有
+                // 义——经自定义键切英（或锁大写态切英回中）一律复位，
+                // 回中文从干净态开始。
+                session.caps_lock = false;
                 // 【切英文上屏编码 2026-10-07】同 Caps/Shift/Ctrl+空格
                 // 口径：切英方向有编码且开关开 → 编码字母上屏。
                 if !session.chinese
@@ -1143,7 +1195,26 @@ impl Engine {
                     return out;
                 }
             }
-            // Esc / Backspace / 组合键：取消 pending（清组段、点丢弃）
+            // 【悬点不吞 Ctrl+空格 2026-10-14】现场实锤（管道复现）：数字后
+            // 按 . 进悬点，再 Ctrl+空格 → 本分支把组合键一律当「取消悬点」
+            // 吃掉不切换（用户：敲两下才切成英文）。悬点是延迟显示、从未
+            // 落屏——按组合键离开 = 先落半角 . 再走组合键本职（与上方
+            // 可打印键 flush 并点同口径，用户敲过这个点不能吞）。
+            if m.ctrl && !m.alt {
+                if let Some(c) = key.key.as_char() {
+                    if c == ' ' && self.config.general.ctrl_space_switch {
+                        session.raw.clear();
+                        let mut out = self.process_key_inner(session, key);
+                        out.commit = Some(match out.commit.take() {
+                            Some(t) => format!(".{t}"),
+                            None => ".".to_string(),
+                        });
+                        out.consumed = true;
+                        return out;
+                    }
+                }
+            }
+            // Esc / Backspace / 其余组合键：取消 pending（清组段、点丢弃）
             if key.key == KeyCode::Escape || key.key == KeyCode::Backspace || m.ctrl || m.alt {
                 session.raw.clear();
                 return KeyOutcome::consumed(self.state(session));
@@ -1154,6 +1225,8 @@ impl Engine {
             if let Some(c) = key.key.as_char() {
                 if c == ' ' && self.config.general.ctrl_space_switch {
                     session.chinese = !session.chinese;
+                    // 【切英文态清锁大写 2026-10-12】同自定义 switch 口径。
+                    session.caps_lock = false;
                     // 【切英文上屏编码 2026-10-07】同 Caps/Shift 口径
                     if !session.chinese
                         && self.config.general.commit_raw_on_en_switch
@@ -1222,6 +1295,8 @@ impl Engine {
             }
             return KeyOutcome::passthrough();
         }
+        // 【Alt+修改 下线 2026-10-17 用户拍板】Alt 拦截块整体删除（与
+        // 太多软件的菜单/快捷键冲突，功能放弃）。Alt 组合一律直通。
         if m.alt || m.meta {
             return KeyOutcome::passthrough();
         }
@@ -1241,7 +1316,13 @@ impl Engine {
         if session.chinese && session.mode == InputMode::Normal {
             let idle = session.raw.is_empty() && session.candidates.is_empty();
             if let Some(act) = self.keymap_lookup(&key.key, &m, idle) {
-                if let Some(o) = self.run_keymap(session, &act) {
+                // 【orig_key 2026-10-16】映射的物理字符键随行（selectN
+                // 越界标顶用原键出标点/数字）。
+                let orig_key = match &key.key {
+                    KeyCode::Char(c) => Some(*c),
+                    _ => None,
+                };
+                if let Some(o) = self.run_keymap(session, &act, orig_key) {
                     return o;
                 }
             }
@@ -1254,7 +1335,7 @@ impl Engine {
             // 空态口径，查 map_idle（缺省回落 map）。
             if let Some(act) = self.keymap_lookup(&key.key, &m, true) {
                 if act == "switch" {
-                    if let Some(o) = self.run_keymap(session, &act) {
+                    if let Some(o) = self.run_keymap(session, &act, None) {
                         return o;
                     }
                 }
@@ -1262,7 +1343,31 @@ impl Engine {
         }
 
         // Caps
+        // 【英文态 Caps 恒系统默认 2026-11 用户拍板】英文态按 Caps 一律
+        // 透传——系统原生大小写锁定（键盘灯/系统提示原生生效），输入法
+        // 不接管（原 caps_action=Switch 会吃掉 Caps 切回中文，英文态
+        // 想大写只能靠 Shift）。caps_action 只管中文态；绑了 switch 的
+        // 自定义键不受影响（上方英文态白名单先查，显式绑定优先）。
         if key.key == KeyCode::CapsLock {
+            if !session.chinese {
+                // 【切英文态清锁 2026-10-12】英文态不认 caps_lock（英文
+                // 态 Caps 恒透传系统原生锁定）；从锁大写态经 Shift/
+                // Ctrl+空格/自定义键切去英文时，回中文从干净态开始。
+                session.caps_lock = false;
+                return KeyOutcome::passthrough();
+            }
+            // 【空态解析链判定 2026-10-12 三次·用户三轮拍板】空态 caps
+            // 的归属=空态解析链（map_idle→map 回落，同 keymap_lookup
+            // idle 全链）：解析出非空功能=该键空态被绑定拥有——select
+            // 空态无意义=静默消费（「跟随有候选」（缺省回落 map 的
+            // select）与显式绑 select 同形）；空串（UI「清除」）或全链
+            // 无绑定=走默认 caps_action（锁大写等）。有候选路径已在
+            // 上方 keymap 命中（select2 等照常，不受本门影响）。
+            if let Some(act) = self.keymap_lookup(&key.key, &key.modifiers, true) {
+                if !act.is_empty() {
+                    return KeyOutcome::consumed(self.state(session));
+                }
+            }
             match self.config.general.caps_action {
                 hufu_config::CapsAction::Clear => {
                     if !session.raw.is_empty() {
@@ -1272,6 +1377,8 @@ impl Engine {
                 }
                 hufu_config::CapsAction::Switch => {
                     session.chinese = !session.chinese;
+                    // 【切英文态清锁大写 2026-10-12】同自定义 switch 口径。
+                    session.caps_lock = false;
                     // 【切英文上屏编码 2026-10-07】中→英且有编码：
                     // commit_raw_on_en_switch 开 → 编码字母上屏（与
                     // Shift 单击同口径）；关 → 原行为（清空丢弃）。
@@ -1287,6 +1394,28 @@ impl Engine {
                     return KeyOutcome::consumed(self.state(session));
                 }
                 hufu_config::CapsAction::None => {}
+                // 【中文态 Caps 锁大写 2026-10-12】按一下锁定大写：
+                // 此后字母以大写英文直出（on_char 空态 caps_lock 拦截，
+                // 不进编码）；再按一下解除并恢复中文录入。锁大写期间
+                // raw 恒空（进入时已清、字母不进编码）。
+                hufu_config::CapsAction::Caps => {
+                    session.caps_lock = !session.caps_lock;
+                    if session.caps_lock {
+                        if self.config.general.commit_raw_on_en_switch
+                            && !session.raw.is_empty()
+                        {
+                            let raw = std::mem::take(&mut session.raw);
+                            session.clear();
+                            session.caps_lock = true;
+                            return KeyOutcome::commit(raw, self.state(session));
+                        }
+                        session.clear();
+                        session.caps_lock = true;
+                    } else {
+                        session.clear();
+                    }
+                    return KeyOutcome::consumed(self.state(session));
+                }
             }
             return KeyOutcome::passthrough();
         }
@@ -1309,12 +1438,15 @@ impl Engine {
         {
             if session.raw.is_empty() {
                 session.chinese = !session.chinese;
+                // 【切英文态清锁大写 2026-10-12】同其余切换路径口径。
+                session.caps_lock = false;
                 session.pair.reset();
                 return KeyOutcome::consumed(self.state(session));
             }
             let raw = std::mem::take(&mut session.raw);
             session.candidates.clear();
             session.chinese = false;
+            session.caps_lock = false;
             session.pair.reset();
             if self.config.general.commit_raw_on_en_switch {
                 return KeyOutcome::commit(raw, self.state(session));
@@ -1484,14 +1616,41 @@ impl Engine {
             // 标点映射：shift+,→<→《、shift+'→"→“（智能配对）、shift+/
             // →?→？、shift+1→!→！。放在 '/' 符号命名空间之前（否则
             // shift+/ 被顿号分支先吃）。有编码态不受影响。
-            if shift && session.raw.is_empty() {
+            // 【Shift+符号自定义 2026-10-09】用户自定义串优先于内置
+            // 映射（空态=串本身直出）。
+            // 【Shift+字母·双态开关 2026-10-10】字母区映射（键形 A-Z）
+            // 默认只在有候选（组段中）生效——空态=正常大写字母；该
+            // 字母在 shift_letters_always 集合（对话框「都生效」档）
+            // 时空态也直出串。
+            if shift
+                && session.raw.is_empty()
+                && (!c.is_ascii_alphabetic() || self.shift_letter_always(c))
+            {
+                if let Some(rep) = self
+                    .config
+                    .keymap
+                    .shift_symbols
+                    .get(&c.to_string())
+                    .cloned()
+                {
+                    return KeyOutcome::commit(rep, self.state(session));
+                }
                 if let Some(sf) = shift_form(c) {
-                    if let Some((text, back)) = self.punct_output(session, sf) {
+                    if let Some((text, back)) = self.punct_output(session, sf, "") {
                         let mut o = KeyOutcome::commit(text, self.state(session));
                         o.back = back;
                         return o;
                     }
                 }
+            }
+            // 【编码通配符 2026-10-11】空态按通配字符=起一段通配查询
+            //（\dx\ = 4 码第 2/3 位 dx）。优先于 /=\ 顿号两档（该字符
+            // 被用户征用为通配符时，顿号语义让位——要用顿号档就换通
+            // 配字符或关开关）；反查引导键在更上方，优先级更高。
+            if self.wildcard_active() && !shift && c == self.config.input.wildcard_char {
+                session.raw.push(c);
+                self.refresh_candidates(session);
+                return self.take_or_state(session);
             }
             // 【/=顿时直出 2026-09-06】开启（slash_dunhao）后空态按 /
             // =「、」直接上屏：不进 / 符号命名空间（屏蔽码表内 / 相关
@@ -1529,7 +1688,10 @@ impl Engine {
             // 【同日修正·用户规格】有候选时 ; 仍当选重键（次选）——空态
             // 才直出；编码态见下方「首选顶屏+；」前的选重分流。空态本就
             // 无候选可选，此分支不涉及选重。
-            if c == ';' && !shift && !self.config.input.semicolon_guide {
+            // 【；去特化 2026-10-08】判定从「仅看开关」改数据驱动：方案
+            // 无 ; 开头编码/快符数据时（092K 类），开着引导开关 ; 也不是
+            // 引导键——空态同样直出「；」，不弹 ：/； 候选。
+            if c == ';' && !shift && !self.semicolon_guide_active() {
                 return KeyOutcome::commit("；".to_string(), self.state(session));
             }
             // 【自定义选重键 2026-11】空态按自定义选重键：选重键语义是
@@ -1537,6 +1699,38 @@ impl Engine {
             // 编码字符/标点路径（默认 ;/' 进字母表或出标点）。自定义
             // 键若在编码字母表里照常进编码；非字母表字符落到标点/
             // 透传——与次选/三选空态行为同构，无需特判。此处不拦截。
+            // 【七十八修·pending dot】数字后按 . 延迟上屏：第一下不落
+            // 屏，进组段显示（raw="."，像编码的下划线预编辑）；再按
+            // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
+            // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
+            // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
+            // 依赖回删）。逗号（,）全角直出（二十五修）。
+            // 【2026-10-12 提前到编码字母表之前】快符表/码表有 `.` 开头
+            // 编码（快符.yaml 的 .zd 类）时 `.` 会进编码字母表——若
+            // 字母表分支在前，数字后按 `.` 被当引导符吞进 raw 出
+            // 「.zd」快符（用户实测）。数字态句号规则是输入法固有
+            // 特性（第一下 . 第二下 。），优先级高于任何方案的 `.` 编码。
+            if c == '.'
+                && !shift
+                && session
+                    .tail_context
+                    .chars()
+                    .last()
+                    .map(|t| t.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                session.raw = ".".into();
+                self.refresh_candidates(session);
+                return KeyOutcome::consumed(self.state(session));
+            }
+            // 【中文态 Caps 锁大写 2026-10-12】锁大写期间字母以大写
+            // 英文直出（不进编码、不组段）；数字/标点不受 Caps 影响
+            // （照旧走下方常规路径）。Shift 形态同样出大写（锁大写
+            // 语境下 Shift+字母 出小写反直觉，一律大写）。
+            if session.caps_lock && c.is_ascii_alphabetic() {
+                session.tail_context.push(c.to_ascii_uppercase());
+                return KeyOutcome::commit(c.to_ascii_uppercase().to_string(), self.state(session));
+            }
             // 编码字符
             if self.config.input.is_alphabet_char(c) && !shift {
                 session.raw.push(c);
@@ -1565,27 +1759,8 @@ impl Engine {
                 session.tail_context.push(c);
                 return KeyOutcome::passthrough();
             }
-            // 【七十八修·pending dot】数字后按 . 延迟上屏：第一下不落
-            // 屏，进组段显示（raw="."，像编码的下划线预编辑）；再按
-            // 一次 . 直接出「。」（无需回删——从未上屏）；打其他键则
-            // 半角 . 先落屏再处理该键（flush 逻辑见 process_key_inner
-            // 开头）。VSCode 类宿主对注入退格的忽略随之失效化（不再
-            // 依赖回删）。逗号（,）全角直出（二十五修）。
-            if c == '.'
-                && !shift
-                && session
-                    .tail_context
-                    .chars()
-                    .last()
-                    .map(|t| t.is_ascii_digit())
-                    .unwrap_or(false)
-            {
-                session.raw = ".".into();
-                self.refresh_candidates(session);
-                return KeyOutcome::consumed(self.state(session));
-            }
             // 标点
-            if let Some((text, back)) = self.punct_output(session, c) {
+            if let Some((text, back)) = self.punct_output(session, c, "") {
                 let mut o = KeyOutcome::commit(text, self.state(session));
                 o.back = back;
                 return o;
@@ -1609,11 +1784,11 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         // 【` 顶屏 2026-09-06】编码态按 `（反查引导键）= 顶当前首选
-        // 上屏并追加间隔号「·」（用户规格：有候选时按 · 顶屏带 ·；
+        // 上屏并追加引导键符号（用户规格：有候选时按 · 顶屏带 ·；
         // Shift+` 走下方 Shift 标点拦截出「首选~」）。
         // 【功能词标点顶字 2026-11】置于其他引导之前——` 不是编码字符。
-        // 【反查关闭直出 2026-10-03】反查不可用时编码态同语义但改用
-        // disabled_output 符号（默认「·」不变；配 ` 则顶屏带 `）。
+        // 【引导键连动 2026-10-10】追加符号统一跟随「关闭反查时按引导键」
+        // 选项（配 ` 出 `；未配/配 · 出 ·）——反查可用与否不再分叉。
         // 顶屏首选是功能词（{重复上屏}/{撤回} 等）时同样解析——
         // z1={重复上屏} 的方案打 z 再按 ` = 「上次内容·」。
         // 【` 引导打特殊字 2026-11】` 已加入编码字母表且反查关闭时，
@@ -1634,11 +1809,11 @@ impl Engine {
             let (first, back) = self.resolve_commit_pair(
                 &session.candidates[idx].commit_text().to_string(),
             );
-            let sym = if self.reverse_available() {
-                "·".to_string()
-            } else {
-                self.disabled_symbol().unwrap_or_else(|| "·".into())
-            };
+            // 【引导键连动 2026-10-10】编码态同样连动「关闭反查时按引导键」
+            // 选项——用户实锤：配了 ` 反查开着时编码态按 ` 仍出 ·（旧代码
+            // 反查可用硬编码 ·，选项只在反查关闭时生效）。统一：配什么出
+            // 什么，未配/配 · 兜底 ·，反查可用与否不再分叉。
+            let sym = self.reverse_exit_symbol();
             session.clear();
             let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
             o.back = back;
@@ -1653,7 +1828,9 @@ impl Engine {
         //   ——开关只管引导语义，不得影响选重肌肉记忆），仅在无候选
         //   可选时才「首选顶屏+；」（含 ; 引导残态清理）。; 快符随之
         //   不可用。Shift+; 仍出「：」（Shift 形态拦截）。
-        if c == ';' && !shift && !self.config.input.semicolon_guide {
+        // 【；去特化 2026-10-08】本分支 =「; 不引导」统一落点：除开关
+        // 关闭外，方案无 ; 数据（092K 类）同样落此——; 就是普通符号键。
+        if c == ';' && !shift && !self.semicolon_guide_active() {
             if session.candidates.is_empty() {
                 session.clear();
                 return KeyOutcome::commit("；".to_string(), self.state(session));
@@ -1685,56 +1862,54 @@ impl Engine {
         }
         // 「;;」→；直接上屏（; 引导标点）。Shift+; 例外：那是「：」，
         // 落到下面 Shift 形态拦截段处理（或 ; 引导清缓冲后空态输出）。
-        if c == ';' && !shift && session.raw == ";" && self.config.input.semicolon_guide {
+        // 【;引导窗选重 2026-10-09】有候选且 ; 是选重键（次选/三选/
+        // 自定义）→ 按普通候选窗规则选重（用户实锤：raw=";" 时 ;;直上
+        // 抢在选重前，{撤回} 永远选不到）。经典快符窗 [：,；] 下 ;;
+        // 二选「；」与原直上结果同为「；」，无回归；; 非选重键或无
+        // 候选才走直上。
+        if c == ';' && !shift && session.raw == ";" && self.semicolon_guide_active() {
+            if !session.candidates.is_empty()
+                && (c == self.config.candidates.second_select
+                    || c == self.config.candidates.third_select
+                    || self.custom_select_rank(c).is_some())
+            {
+                return self.on_rank_key(session, c);
+            }
             session.clear();
             return KeyOutcome::commit("；".to_string(), self.state(session));
         }
         // 其他字符：有快符/符号延续（;x…）则继续组快符，
         // 无延续才打断「;」引导清缓冲重入（空格留给首选上屏）
+        // 【;引导窗选重 2026-10-09】候选在场时选重键（数字/次选/三选/
+        // 自定义）不当「非延续字符」清屏重打——引导窗与普通候选窗同
+        // 规则（用户实锤：数字 1/2 选不了 {重复上屏}/{撤回}）。
         if session.raw == ";"
-            && self.config.input.semicolon_guide
+            && self.semicolon_guide_active()
             && c != ' '
             && !self.has_continuation_prefix(&format!(";{c}"))
+            && !(!session.candidates.is_empty()
+                && (c.is_ascii_digit()
+                    || c == self.config.candidates.second_select
+                    || c == self.config.candidates.third_select
+                    || self.custom_select_rank(c).is_some()))
         {
             session.clear();
             return self.on_char(session, c, shift);
         }
-        // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
-        // 翻不动时直接顶屏（首选+符号形态上屏，编码态标点顶字同款语义）。
-        // Shift 形态（—— / +）与基键同方向。须在 Shift 标点拦截之前。
-        if (c == '-' || c == '=') && !session.candidates.is_empty() {
-            let (dir, sym) = if c == '-' {
-                if shift {
-                    (-1, "——".to_string())
-                } else {
-                    (-1, "-".to_string())
-                }
-            } else if shift {
-                (1, "+".to_string())
-            } else {
-                (1, "=".to_string())
-            };
-            let page_size = self.config.candidates.page_size.max(1);
-            let pages = (session.candidates.len() + page_size - 1) / page_size;
-            let can = if dir < 0 {
-                session.page > 0
-            } else {
-                session.page + 1 < pages
-            };
-            if can {
-                return self.on_page(session, dir);
-            }
-            // 不可翻：顶字（当前页首选——翻页后顶的是所在页首字）
-            let ps = page_size as usize;
-            let idx = (session.page as usize * ps).min(session.candidates.len().saturating_sub(1));
-            // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
-            // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+符号。
-            let (first, back) =
-                self.resolve_commit_pair(&session.candidates[idx].commit_text().to_string());
-            session.clear();
-            let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
-            o.back = back;
-            return o;
+        // 【翻页键纯翻页 2026-09-06 → 2026-11 用户改判】-（——）/ =（+）
+        // 候选在场时恒翻页。2026-09-06 版「翻不动时顶字（首选+符号
+        // 形态上屏）」按 2026-11 用户反馈撤销：ae 几十候选翻到末页再
+        // 按翻页键会直接上屏「=+第二页首选」——有候选时翻页键不能
+        // 因为翻不动就自动上屏。现行为与「其余配置翻页键」同口径：
+        // on_page 纯翻页（末页循环回首页，单页吞键原地不动）。要打
+        // -/= 本身：清屏（Esc）后空态直出。
+        // 【Shift 形态=顶屏 2026-10-11 用户反馈】Shift+-/= 不再同基键
+        // 翻页——落到下方 Shift 标点顶字链（Shift+= 出「首选＋＋」、
+        // Shift+- 出「首选＿」，自定义 Shift+符号串优先）：翻页键纯翻页
+        // 化把这条老手感一并杀了，本条还给它。纯 -/= 翻页零变化。
+        if (c == '-' || c == '=') && !shift && !session.candidates.is_empty() {
+            let dir = if c == '-' { -1 } else { 1 };
+            return self.on_page(session, dir);
         }
         // 【Shift 标点 2026-09-06】有编码态同空态（a18f89c 的空态修复漏了
         // 这条路径）：TSF 传基础键+shift=true，Shift+标点/数字先转 US 键盘
@@ -1742,15 +1917,54 @@ impl Engine {
         // 「中《」而非「中，」。置于选重/翻页/数字选重之前：Shift+1 是
         // 「！」不是数字选重、Shift+; 不是二选键。语义同编码态标点顶字
         //（提交首选后输出标点）。
-        if shift {
+        // 【Shift+符号自定义 2026-10-09】自定义串优先；顶屏语义与内置
+        // 一致（首选/功能词上屏后接自定义串）。
+        // 【Shift+字母·双态开关 2026-10-10】字母映射（键形 A-Z）默认
+        // 要求有候选才拦截顶屏——无候选时走下方 mixed_input/大写直上
+        // 屏老链路；「都生效」档（shift_letters_always 集合）无候选也
+        // 顶屏出串。符号键（Shift+7 等）维持无候选也直出语义，零回归。
+        if shift
+            && (!c.is_ascii_alphabetic()
+                || !session.candidates.is_empty()
+                || self.shift_letter_always(c))
+        {
+            if let Some(rep) = self
+                .config
+                .keymap
+                .shift_symbols
+                .get(&c.to_string())
+                .cloned()
+            {
+                // 【顶字页基准 2026-10-11】顶 selected（翻页/高亮跟随）。
+                let (first, fback) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .get(self.top_commit_base(session))
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{rep}"), self.state(session));
+                o.back = fback;
+                return o;
+            }
             if let Some(sf) = shift_form(c) {
-                if let Some((text, back)) = self.punct_output(session, sf) {
+                // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+                // punct_output 头注释）——数字规则不得越过被顶词。
+                let pushed = session
+                    .candidates
+                    .get(self.top_commit_base(session))
+                    .map(|x| x.commit_text().to_string())
+                    .unwrap_or_default();
+                if let Some((text, back)) = self.punct_output(session, sf, &pushed) {
                     // 【功能词标点顶字 2026-11】顶屏首选是功能词时解析后顶屏。
                     // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+标点。
+                    // 【顶字页基准 2026-10-11】顶 selected（翻页后 Shift+- =
+                    // 当前页首项——，用户实锤）。
                     let (first, fback) = self.resolve_commit_pair(
                         &session
                             .candidates
-                            .first()
+                            .get(self.top_commit_base(session))
                             .map(|x| x.commit_text().to_string())
                             .unwrap_or_default(),
                     );
@@ -1760,8 +1974,50 @@ impl Engine {
                     return o;
                 }
             }
+            // 【Shift+未自定义字母=大写顶屏 2026-10-11 用户需求】有候选时
+            // Shift+字母（该键在「Shift+符号修改」里没有自定义串）=首选
+            // 顶屏+大写字母随行（jd 出候选后 Shift+D →「就D」）——与
+            // 「大写直上屏」同款不丢键语义，但顶的是首选不是编码裸串。
+            // 优先级：自定义串（上方 rep 臂）> 本臂大写顶屏。无候选不
+            // 进本臂（外层门 + 显式判空双保险）——空态/无候选走下方
+            // mixed_input/大写直上屏老链路，「都生效」档无候选也照旧。
+            if c.is_ascii_alphabetic() && !session.candidates.is_empty() {
+                let upper = c.to_ascii_uppercase();
+                // 【顶字页基准 2026-10-11】大写顶屏同顶 selected。
+                let (first, fback) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .get(self.top_commit_base(session))
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{upper}"), self.state(session));
+                o.back = fback;
+                return o;
+            }
         }
         let extends = self.has_continuation_prefix(&format!("{}{c}", session.raw));
+        // 【空码清屏·符号数字同治 2026-10-09】空码态（无候选无延续）
+        // 继续打编码字符由 after_append 的 auto_clear_empty 清屏重打，
+        // 但其余键各走各的老路径：数字→on_rank_key 无候选=吞键原地不动
+        //（用户实锤 fdqw+2 没反应）、选重键同样被吞、符号直接上屏。
+        // 用户定稿规格：**空码态按数字/符号 = 连带空码一起清空，该键
+        // 本身吞掉不上屏不透传**（与空格清空码同语义；要打这个键就
+        // 再按一次，那时是空态正常输出）。仅 auto_clear_empty 开时生
+        // 效；编码字符与空格不在此列（各自原路径）。
+        // 【整句豁免三开关 2026-10-09】整句流空码交解码器/退格处理，
+        // 此分支同 auto_clear_empty 主体一样不对整句生效。
+        if !session.raw.is_empty()
+            && session.candidates.is_empty()
+            && !self.has_continuation(&session.raw)
+            && !self.sentence_active()
+            && self.config.input.auto_clear_empty
+            && (c.is_ascii_digit() || c.is_ascii_punctuation())
+        {
+            session.clear();
+            return KeyOutcome::consumed(self.state(session));
+        }
         // 选重键（不构成编码延续时才作为选重）
         // 【自定义选重键 2026-11】自定义键同门：编码延续优先。
         if !extends {
@@ -1771,6 +2027,15 @@ impl Engine {
             {
                 return self.on_rank_key(session, c);
             }
+        }
+        // 【编码通配符 2026-10-11】编码态按通配字符=追加通配位（d 再按
+        // \ = d\ → 全部 2 码 d* 词条）。放在字母表判定之前——通配字符
+        // 不在字母表里，落到标点顶字就错了；shift 实态（Shift+\=｜）
+        // 不受影响。
+        if self.wildcard_active() && !shift && c == self.config.input.wildcard_char {
+            session.raw.push(c);
+            self.refresh_candidates(session);
+            return self.take_or_state(session);
         }
         // 编码字符（含死路：交给 after_append 处理顶屏/清屏）
         if self.config.input.is_alphabet_char(c) && !shift {
@@ -1858,14 +2123,26 @@ impl Engine {
         // 【功能词标点顶字 2026-11】顶屏首选是功能词（{重复上屏}/
         // {撤回} 等）时解析后顶屏——z1={重复上屏} 打 z 再按任意
         // 标点（，。、；等）= 「上次内容+该标点」。
-        if let Some((punct, back)) = self.punct_output(session, c) {
+        // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+        // punct_output 头注释）——数字规则不得越过被顶词。
+        {
+            let pushed = session
+                .candidates
+                .get(self.top_commit_base(session))
+                .map(|x| x.commit_text().to_string())
+                .unwrap_or_default();
+            if let Some((punct, back)) = self.punct_output(session, c, &pushed) {
             if !session.candidates.is_empty() {
                 // 【功能词标点顶字 2026-11】顶屏首选是功能词（{重复上屏}/
                 // {撤回} 等）时解析后顶屏——z1={重复上屏} 打 z 再按任意
                 // 标点（，。、；等）= 「上次内容+该标点」。
                 // 【{撤回} 2026-11】走 pair 解析：{撤回}=空文本+回删+标点。
+                // 【顶字页基准 2026-10-11】顶 selected（翻页后标点顶字=
+                // 当前页首项+标点，与空格同基准）。
                 let (first, fback) = self.resolve_commit_pair(
-                    &session.candidates[0].commit_text().to_string(),
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
                 );
                 session.clear();
                 let mut o = KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
@@ -1876,6 +2153,7 @@ impl Engine {
             let mut o = KeyOutcome::commit(punct, self.state(session));
             o.back = back;
             return o;
+            }
         }
         if c.is_ascii_alphanumeric() {
             return KeyOutcome::consumed(self.state(session));
@@ -1885,7 +2163,11 @@ impl Engine {
 
     /// 标点输出（全角/半角/引号配对/数字后点半角化）。
     /// 返回 (文本, 提交前回删数)——back>0 用于「1.」再按 . 替换为「。」。
-    fn punct_output(&mut self, session: &mut Session, c: char) -> Option<(String, u8)> {
+    /// pushed=标点顶字时先于标点落屏的被顶词（""=无顶字）。数字后半角
+    /// 化的判据是**最终上屏流里紧邻 . 的前一字符**：顶字时=被顶词末字
+    ///（「4天。」紧邻的是「天」——顶字词先落屏，数字规则不得越过被顶
+    /// 词去咬旧尾巴，现场实锤「4天.」）；无顶字=跨句尾巴末字（1.5 原判据）。
+    fn punct_output(&self, session: &mut Session, c: char, pushed: &str) -> Option<(String, u8)> {
         if !c.is_ascii_punctuation() {
             return None;
         }
@@ -1907,7 +2189,12 @@ impl Engine {
         // 【二十五修·逗号回归全角 2026-10-09】数字后 , 不再半角化——
         // 用户定稿「数字后打逗号就是要正常的全角，这个特性只有句号
         // 有」。半角智能仅保留 . 路径；, 一律走全角映射（英文态除外）。
-        let tail_last = session.tail_context.chars().last();
+        // 【数字后顶字句号 2026-10-15】tail 判据先看被顶词末字（见
+        // 函数头注释）——「4天。」的句号紧邻「天」，出全角「。」。
+        let tail_last = pushed
+            .chars()
+            .last()
+            .or_else(|| session.tail_context.chars().last());
         if c == '.' {
             if tail_last == Some('.') {
                 // 上一键刚直通半角点：本键语义为中文句号，回删替换
@@ -1942,20 +2229,30 @@ impl Engine {
         let len = session.raw.chars().count();
         let max_len = self.config.input.max_code_length;
         let has_upper = session.raw.chars().any(|x| x.is_ascii_uppercase());
+        // 【编码通配符 2026-10-11】raw 含通配字符=搜索语义：一切自动
+        // 上屏/清屏豁免（唯一命中也不顶——用户在翻查词条，不在打词；
+        // 顶了就没法翻页看后面的码了）。翻页/选重/空格上屏照常。
+        let wildcard_mode = self.wildcard_active()
+            && session.raw.contains(self.config.input.wildcard_char);
 
-        // 快符 / 符号：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
-        if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\'))
+        // 快符 / 符号 / z引导符号域：唯一候选立即上屏（auto_select_pattern ^;\w+ 语义，至少两码）
+        // 【可延码不直出 2026-10-09】码表存在更长延续码（如 symbols 的
+        // ;m→;mn→;mnng）时不再秒上屏——用户实锤：;m 唯一命中即直出，
+        // 压死了 ;mn ;mng ;mnng（「打不了」）。改为有更长延续=候选窗
+        // 等待延伸（要 · 按空格/1 照选），叶子码才唯一直出——快符 ;x
+        // 单键叶子，老直出行为零回归（has_longer_continuation 不含
+        // 自身，与 has_continuation 的自身包含语义区分）。
+        // 【z 引导符号域 2026-11·虎爪同款】码表 z 只出现在码首时
+        //（Dict.z_symbol_domain，虎爪 RebuildShortSymbolMeta 同判定），
+        // z 前缀码=符号域，域内唯一叶子同款直出——092K 的 zai=AI
+        // 三键即出、不必凑满 4 码；z 作普通编码字母的表（靓仔类）
+        // 域判否，z 码回主码域语义（不满码长不直出——uvo=睡 同理）。
+        let z_domain = session.raw.starts_with('z') && self.schema.dict.z_symbol_domain;
+        if (session.raw.starts_with(';') || session.raw.starts_with('/') || session.raw.starts_with('\\') || z_domain)
             && len >= 2
             && session.candidates.len() == 1
-        {
-            self.commit_first_inline(session);
-            return;
-        }
-
-        // 满码唯一上屏
-        if len == max_len
-            && self.config.input.auto_select_unique
-            && session.candidates.len() == 1
+            && !wildcard_mode
+            && !self.has_longer_continuation(&session.raw)
         {
             self.commit_first_inline(session);
             return;
@@ -1963,7 +2260,33 @@ impl Engine {
 
         // 整句方案：超过最大码长后由整句解码器接管（不顶屏、不清屏）；
         // 整句模式下死路同样不顶屏——编码留在缓冲区交给解码器组句
+        // 【整句豁免三开关 2026-10-09 用户拍板】超最大码长自动上屏/
+        // 满最大码长唯一自动上屏/空码自动清屏都只对非整句生效——
+        // 整句流里这三个自动化打断组句（满码唯一半路顶掉首选、空码
+        // 清屏把断供前缀丢给兜底）。sentence_mode 统一在此算，满码
+        // 唯一分支也要用。
         let sentence_mode = self.sentence_active();
+
+        // 满码唯一上屏（整句豁免：不顶，候选照常展示交用户继续）
+        // 【叶子直出收域 2026-11 用户实锤】v1.7.6「叶子码唯一直出」
+        // 原泛化到全码表——靓仔方案 uvo=睡（3 码叶子、唯一）不满
+        // 最大码长 4 也被顶屏，与虎爪/虎娘行为相悖（用户实锤：同
+        // 设置下虎爪不顶）。虎爪口径（InputMethodEngine.cs：主域
+        // 唯一终码仅在码长==max 时上屏）：主码域只看 len==max_len；
+        // 不满码长的唯一叶子交上方符号域分支（; / \ z 引导域）。
+        // 延长码场景（len==max 且存在 >max 词条）由上方老分支保留
+        // 原行为：满码唯一仍上屏（092K 顶功语义）。
+        if !sentence_mode
+            && self.config.input.auto_select_unique
+            && !wildcard_mode
+            && len >= 2
+            && session.candidates.len() == 1
+            && len == max_len
+        {
+            self.commit_first_inline(session);
+            return;
+        }
+
         let sentence_takeover = sentence_mode && len > max_len;
 
         // 顶屏：仅超长顶屏（第 max+1 键，即最大码长 4 时的第 5 键）。
@@ -1974,8 +2297,42 @@ impl Engine {
         // 处理）。
         let dead_end = session.candidates.is_empty() && !self.has_continuation(&session.raw);
         let over_length = len > max_len;
-        if over_length && !sentence_mode && self.config.input.auto_push && !has_upper
+        if over_length && !sentence_mode && self.config.input.auto_push && !has_upper && !wildcard_mode
         {
+            // 【延长码精确命中 2026-10-08】092K 类顶功码表词条码长可超
+            // max_code_length（如 哆哆嗦嗦=kkkkf）：第 max+1 键后 raw
+            // 整体恰为表内词条时——唯一则直接上屏该词（用户打第 5 键
+            // 就是用延长码消重码，顶屏会打出前 max 码首选「嘻嘻哈哈」，
+            // 虎爪/虎娘同款）；多候选则不顶屏、保留延长码候选供选重。
+            // 精确判定看候选 code 字段（candidates 为精确码域，code==raw
+            // 才算命中；` 超集副表 5 码词条同口径适用）。
+            let exact_hits: Vec<Candidate> = session
+                .candidates
+                .iter()
+                .filter(|c| c.code == session.raw)
+                .cloned()
+                .collect();
+            if exact_hits.len() == 1 {
+                let first = exact_hits.into_iter().next().unwrap();
+                if !first.text.starts_with('{') {
+                    self.learn(&first);
+                }
+                // 与 commit_first_inline 同口径：功能词 pair/动态解析
+                let (mut text, back, _) = self.resolve_dyn_pair(&first.commit_text().to_string());
+                if text.starts_with('{') {
+                    text = self.resolve_dynamic(&text);
+                }
+                session.clear();
+                session.pending_commit = Some(text);
+                session.pending_back = Some(back);
+                return;
+            }
+            if !exact_hits.is_empty() {
+                // 多候选延长码：不顶屏（顶了就丢掉用户正要选的延长
+                // 候选），保留候选交选重键/空格。第 max+2 键若仍无更
+                // 长精确码再按原顶屏走（prev_first 那时是延长码首选）。
+                return;
+            }
             if let Some(first) = prev_first {
                 // 提交追加前 raw 的首选，新 raw 从刚输入的字符重新开始
                 // 【功能词不学习】与 commit_first_inline 同口径：{撤回}/
@@ -1998,7 +2355,7 @@ impl Engine {
             // 追加前也无候选：空码清屏【码长 max+1 语义 2026-09-11 用户
             // 拍板】清前 max 码、保留刚输入的第 max+1 键为新起点（此前
             // 整缓冲连第 max+1 键一并清掉，新起点也丢）
-            if dead_end && self.config.input.auto_clear_empty {
+            if dead_end && self.config.input.auto_clear_empty && !wildcard_mode {
                 session.clear();
                 session.raw = c.to_string();
                 self.refresh_candidates(session);
@@ -2016,6 +2373,7 @@ impl Engine {
             && !sentence_mode
             && self.config.input.auto_clear_empty
             && !has_upper
+            && !wildcard_mode
             && len > max_len
         {
             session.clear();
@@ -2055,7 +2413,17 @@ impl Engine {
         keys.iter().position(|&k| k == c)
     }
 
+    /// 选重键全链路（数字/次选/三选/自定义选重键）。
     fn on_rank_key(&mut self, session: &mut Session, c: char) -> KeyOutcome {
+        self.on_rank_key_ex(session, c, None)
+    }
+
+    /// 【选重越界标顶·原键字符 2026-10-16】orig=keymap selectN 映射的
+    /// 物理键字符（None=真实按键，原键即 c）。越界标顶的标点/数字
+    /// 判定用**原键**：/ 绑「4选」候选不足时按出「首选+、」（不是
+    /// 「首选+4」——用户需求 / 键顶屏顿号）；真实数字键越界则
+    /// 「首选+该数字」。
+    fn on_rank_key_ex(&mut self, session: &mut Session, c: char, orig: Option<char>) -> KeyOutcome {
         if self.sentence_active()
             && session.mode == InputMode::Normal
             && !session.raw.is_empty()
@@ -2087,6 +2455,42 @@ impl Engine {
                 },
             };
             let base_now = self.parse_locks(&session.raw).base;
+            // 【R26 补全·整句翻页后页基准 2026-10-11 用户实锤】整句态
+            // 数字/选重此前恒取 schema.candidates(chunk)[disp_rank-1]——
+            // 码表**绝对名次**：ae 翻到第 2 页按数字 1，上屏的还是码表
+            // 第 1 位（第 1 页首选）；选重键（;/'）同病。凌晨的「翻页后
+            // =当前页」只修了非整句路径（select_candidate_ex），本分支
+            // 漏网。定稿口径：**page=0 维持整句锁式老语义不动**（数字=
+            // 码表名次：jd2 写锁续打、用户词无锁位直上——既有测试钉死
+            // 的打法规程）；**page>0 = 翻查态**，数字/选重一律按候选框
+            // 显示序取当前页第 N 项直接上屏（与非整句路径同口径，所见
+            // 即所得），页内越界（末页只剩 3 项按 7）=死键原地不动。
+            // 多段流翻页同理——显示的是完整组句候选，选显示项即所得。
+            if session.page > 0 && !session.candidates.is_empty() {
+                let ps_ = self.config.candidates.page_size.max(1) as usize;
+                let abs_idx = session.page * ps_ + (disp_rank - 1);
+                return match session.candidates.get(abs_idx) {
+                    Some(cand) => {
+                        self.sound_hint = Some("select");
+                        // 【{撤回} 2026-11】功能词选中走 pair 解析。
+                        let (mut text, back, _) =
+                            self.resolve_dyn_pair(&cand.commit_text().to_string());
+                        if text.starts_with('{') {
+                            text = self.resolve_dynamic(&text);
+                        }
+                        session.selected =
+                            abs_idx.min(session.candidates.len().saturating_sub(1));
+                        let mut st = self.state(session);
+                        session.clear();
+                        st.raw = String::new();
+                        st.preedit = String::new();
+                        let mut o = KeyOutcome::commit(text, st);
+                        o.back = back;
+                        o
+                    }
+                    None => KeyOutcome::consumed(self.state(session)),
+                };
+            }
             // 【目标块=解码切分尾段 2026-09-06】虎爪语义：数字/选重键锁
             // 「正在输入的尾段」——uru3ae 按 3 给尾段 ae 选。解码用含锁
             // 原 raw（锁约束使已锁段固定：uru3|ae），word_ends 终点是
@@ -2373,22 +2777,97 @@ impl Engine {
         // 【没选重就标顶 2026-11 用户拍板】选重键名次超出候选数（如
         // 候选唯一时按次选键 ；）不再是死键：标点类选重键顶屏首选
         //（首选+标点形态上屏，与编码态标点顶字同语义——「有选重就
-        // 重选上屏，没选重就标顶」）。数字/字母类键保持死键（选重
-        // 语义明确，越界不出字防误触）。功能词首选走 pair 解析
+        // 重选上屏，没选重就标顶」）。字母类键保持死键（选重语义
+        // 明确，越界不出字防误触）。功能词首选走 pair 解析
         //（{撤回}=空文本+回删+标点）。
+        // 【数字越界顶屏 2026-10-16 用户拍板·第五条补充】数字类选重
+        // 键越界也顶屏：「首选+该数字」原样上屏（只有 3 个候选按
+        // 4/5/…/0 = 首选落屏+数字跟出——打「第5条」这类词+数字流
+        // 不再断）。与标点标顶同框架：不调频（越界不是选重偏好）。
         let page_size_ = self.config.candidates.page_size.max(1);
         let start_ = session.page * page_size_;
         if start_ + idx >= session.candidates.len() && !session.candidates.is_empty() {
-            if let Some((punct, back)) = self.punct_output(session, c) {
-                let (first, fback) =
-                    self.resolve_commit_pair(&session.candidates[0].commit_text().to_string());
+            // 【数字后顶字句号 2026-10-15】判据含被顶词末字（见
+            // punct_output 头注释）——数字规则不得越过被顶词。
+            let key_char = orig.unwrap_or(c);
+            let pushed = session.candidates[self.top_commit_base(session)]
+                .commit_text()
+                .to_string();
+            if let Some((punct, back)) = self.punct_output(session, key_char, &pushed) {
+                // 【顶字页基准 2026-10-11】标顶同顶 selected。
+                let (first, fback) = self.resolve_commit_pair(
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
+                );
                 session.clear();
                 let mut o = KeyOutcome::commit(format!("{first}{punct}"), self.state(session));
                 o.back = back.max(fback);
                 return o;
             }
+            if key_char.is_ascii_digit() {
+                let (first, fback) = self.resolve_commit_pair(
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
+                );
+                session.clear();
+                let mut o =
+                    KeyOutcome::commit(format!("{first}{key_char}"), self.state(session));
+                o.back = fback;
+                return o;
+            }
+            // 【字母越界顶屏转码 2026-10-18 用户需求·与 / 键越界同族】
+            // 字母键绑 selectN 越界、且该字母自身是编码起点（狂练：
+            // z={重复上屏}/{撤回}）时不再死键：顶屏当前页首选（页基准
+            // top_commit_base，功能词走 pair 解析——{重复上屏} 展开上次
+            // 上屏、{撤回}=空提交+回删）+ 该字母重开新编码段，候选窗
+            // 即出该字母的候选（「按 z 的同时顶屏并显示是要重复上屏
+            // 还是撤回」）。不调频（越界不是选重偏好，与标点/数字标顶
+            // 同口径）。字母非编码起点维持死键防误触（2026-11「字母类
+            // 键保持死键」口径的精准放开——只放编码起点字母）。
+            if key_char.is_ascii_lowercase() && self.letter_starts_code(key_char) {
+                let (first, fback) = self.resolve_commit_pair(
+                    &session.candidates[self.top_commit_base(session)]
+                        .commit_text()
+                        .to_string(),
+                );
+                session.clear();
+                session.raw = key_char.to_string();
+                self.refresh_candidates(session);
+                let mut o = KeyOutcome::commit(first, self.state(session));
+                o.back = o.back.max(fback);
+                return o;
+            }
         }
         self.select_candidate_ex(session, idx, true, no_learn)
+    }
+
+    /// 【可延码判定 2026-10-09】raw 之后是否还有严格更长的编码（不含
+    /// raw 自身——has_continuation 的 completions 会把自身词条收进来，
+    /// 对任何存在码恒真，区分不了叶子码与可延伸码）。快符/符号「唯一
+    /// 候选直出」（;x）与「可延等待」（;m→;mn→;mnng）的分界。
+    fn has_longer_continuation(&self, raw: &str) -> bool {
+        if self.schema.dict.has_longer(raw) {
+            return true;
+        }
+        if raw.starts_with('`') && !self.schema.super_dict.is_empty()
+            && self.schema.super_dict.has_longer(raw)
+        {
+            return true;
+        }
+        // 【z 引导符号域 2026-11】z 域 raw 的更长码还可能在符号表
+        //（快符 zjc/zfj 等默认就住那儿）——与 ; / \ 域同查。
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
+            let map = self.schema.symbols.merge_code_map();
+            let raw_len = raw.chars().count();
+            return map
+                .keys()
+                .any(|k| k.chars().count() > raw_len && k.starts_with(raw));
+        }
+        false
     }
 
     /// raw 是否还有编码延续（前缀树或符号表）。
@@ -2403,7 +2882,11 @@ impl Engine {
         {
             return true;
         }
-        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\') {
+        // 【z 引导符号域 2026-11】同 has_longer_continuation：z 域 raw
+        // 的延续也看符号表。
+        if raw.starts_with(';') || raw.starts_with('/') || raw.starts_with('\\')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(raw));
         }
@@ -2421,11 +2904,61 @@ impl Engine {
         {
             return true;
         }
-        if s.starts_with(';') || s.starts_with('/') || s.starts_with('\\') {
+        // 【z 引导符号域 2026-11】同上：z 域前缀也看符号表。
+        if s.starts_with(';') || s.starts_with('/') || s.starts_with('\\')
+            || (s.starts_with('z') && self.schema.dict.z_symbol_domain)
+        {
             let map = self.schema.symbols.merge_code_map();
             return map.keys().any(|k| k.starts_with(s) || k == s);
         }
         false
+    }
+
+    /// 【；去特化 2026-10-08】; 是否作引导键改数据驱动：快符表或主码表
+    /// 存在 ; 开头编码（快符 ;x / 码表 ;…）才引导；没有则 ; 是普通
+    /// 符号键——空态直出「；」、编码态走选重/标点顶字原链路，不弹
+    /// ：/； 候选、不进 raw。设置页 semicolon_guide=false（纯标点档）
+    /// 恒不引导，原语义整体保留：判定从「仅看开关」变「开关 && 有数据」。
+    /// 【码表 ; 码优先 2026-10-09】用户把 {重复上屏}/{撤回} 写进码表
+    /// ; 码（QQ五笔 092K.dict.yaml）却发现两层都不通：开关关=; 钉死
+    /// 普通符号键；开关开=raw=";" 候选窗硬编码 [：,；]、码表词条永不可
+    /// 达。定案：**码表里明写的 ; 码=用户显式意图，无条件引导**（开关
+    /// 不再是总闸）；开关只管内置 ：/； 快捷候选与快符表——纯快符方案
+    ///（码表无 ; 码）开关关仍是「直出；」老语义不变。
+    fn dict_has_semicolon_codes(&self) -> bool {
+        !self.schema.dict.completions(";", 1).is_empty()
+    }
+
+    fn semicolon_guide_active(&self) -> bool {
+        (self.config.input.semicolon_guide && self.has_continuation_prefix(";"))
+            || self.dict_has_semicolon_codes()
+    }
+
+    /// 【引导域快符保护 2026-10-18】raw 是否处于引导域（; / \ ` 前缀或
+    /// z 符号域——Dict.z_symbol_domain 判定），且按键 c 续写后仍是有效
+    /// 编码前缀（快符 ;z=· 类）。keymap selectN 在此让位给正常输入：
+    /// 引导序列里的字母是编码不是选重（见 run_keymap selectN 分支）。
+    /// 只拦「确实构成延续」的键——不构成延续的键照旧走 selectN（越界
+    /// 转码/死键由 on_rank_key_ex 越界分支处理）。
+    fn keymap_guide_continuation(&self, session: &Session, c: char) -> bool {
+        let raw = session.raw.as_str();
+        if raw.is_empty() {
+            return false;
+        }
+        let guide = raw.starts_with(';')
+            || raw.starts_with('/')
+            || raw.starts_with('\\')
+            || raw.starts_with('`')
+            || (raw.starts_with('z') && self.schema.dict.z_symbol_domain);
+        guide && self.has_continuation_prefix(&format!("{raw}{c}"))
+    }
+
+    /// 【字母越界顶屏转码 2026-10-18】字母是否为编码起点（空态按下该
+    /// 字母会进组段：有自身候选或存在更长延续）。狂练 z={重复上屏}/
+    /// {撤回} = 是；无码字母 = 否（selectN 越界维持死键防误触）。
+    fn letter_starts_code(&self, c: char) -> bool {
+        let s = c.to_string();
+        !self.schema.candidates(&s).is_empty() || self.has_continuation(&s)
     }
 
     /// 内联提交首选（顶屏 / 唯一上屏）：置 pending_commit，由 take_or_state 消费。
@@ -3148,6 +3681,14 @@ impl Engine {
     }
 
     /// 空格首选 / 空码处理（↑↓ 移动过则上屏高亮项）。
+    /// 【顶字页基准 2026-10-11 用户实锤】标点顶字 / Shift 形态顶屏与
+    /// 空格同基准——顶 `session.selected`（翻页跟随/↑↓ 高亮后的当前
+    /// 项）：翻页后 Shift+- 出「当前页首项——」而非第 1 页首选；
+    /// ↑↓ 移高亮后顶字=高亮项+标点（与空格手感一致）。
+    fn top_commit_base(&self, session: &Session) -> usize {
+        session.selected.min(session.candidates.len().saturating_sub(1))
+    }
+
     fn select_first(&mut self, session: &mut Session) -> KeyOutcome {
         if !session.candidates.is_empty() {
             let idx = session
@@ -3350,6 +3891,12 @@ impl Engine {
             ((cur + 1) as usize) % pages
         };
         session.page = next;
+        // 【翻页跟随高亮 2026-11 用户实锤】翻页后空格/选重基准 = 当前
+        // 页首位：旧实现 selected 不随页走（恒 0 或旧值），翻到第 2 页
+        // 按空格仍上屏第 1 页首选（ae 案例翻页后空格出「闲」）。高亮
+        // 移到所在页首条——select_first（空格）与 ↑↓ 起点同步跟随。
+        session.selected =
+            (next * page_size).min(session.candidates.len().saturating_sub(1));
         KeyOutcome::consumed(self.state(session))
     }
 
@@ -3363,10 +3910,12 @@ impl Engine {
             }
             // 【按两下 ` = 间隔号 2026-09-06】反查态再按 `（第二下）
             // 直接上屏「·」退出反查（虎爪语义；原先空吞）
+            // 【引导键连动 2026-10-09】输出符号跟随「关闭反查时按引导键」
+            // 选项（配 ` 出 `，配 · 出 ·，未配兜底 ·）。
             if c == self.config.reverse.prefix {
                 session.mode = InputMode::Normal;
                 session.clear();
-                return KeyOutcome::commit("·", self.state(session));
+                return KeyOutcome::commit(self.reverse_exit_symbol(), self.state(session));
             }
             if c == ' ' {
                 return KeyOutcome::consumed(self.state(session));
@@ -3409,6 +3958,25 @@ impl Engine {
                 session.raw.push(c);
                 self.refresh_candidates(session);
                 KeyOutcome::consumed(self.state(session))
+            }
+            // 【引导键连动 2026-10-09】有候选时按引导键 = 首选顶屏 +
+            // 连动符号（用户规格：「关闭反查时按引导键」配什么出什么，
+            // 配 ` 按一下直出 ` 并顶屏）；此前落 catch-all 清缓冲——
+            // 有候选时引导键白按。
+            _ if c == self.config.reverse.prefix && !session.candidates.is_empty() => {
+                let sym = self.reverse_exit_symbol();
+                let (first, back) = self.resolve_commit_pair(
+                    &session
+                        .candidates
+                        .first()
+                        .map(|x| x.commit_text().to_string())
+                        .unwrap_or_default(),
+                );
+                session.mode = InputMode::Normal;
+                session.clear();
+                let mut o = KeyOutcome::commit(format!("{first}{sym}"), self.state(session));
+                o.back = back;
+                o
             }
             // 数字选重 / 翻页（与普通模式一致；反查候选多时翻页查看）
             _ if c.is_ascii_digit() && c != '0' => {
@@ -3480,7 +4048,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】置顶挤位后 ③→④ 跟号
+        self.reorder_epilogue(session)
     }
 
     /// 按 code+word 软删当前页第 idx 候选（Ctrl+Shift+数字 / Ctrl+Delete / 设置界面）。
@@ -3506,7 +4075,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】删词塌位后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 【右键调频菜单 2026-10-06】把当前页第 idx 候选定到第 pos 选
@@ -3535,7 +4105,8 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】定到 N 位后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 【右键菜单·移一位=双向交换 2026-10-07】向前/向后一位的真实语义
@@ -3576,13 +4147,86 @@ impl Engine {
         session.clear();
         session.raw = keep_raw;
         self.refresh_candidates(session);
-        KeyOutcome::consumed(self.state(session))
+        // 【占位符变号 2026-10-09】互换后占位符跟号
+        self.reorder_epilogue(session)
     }
 
     /// 按 code+word 置顶（内存 + 追加日志）。
     pub fn adjust_pin(&mut self, code: &str, word: &str) {
         self.schema.adjust.pin(code, word);
         self.append_adjust_log("{置顶}", code, word, None);
+    }
+
+    /// 【占位符变号 2026-10-09】带圈数字字符 → 数值（①-⑳ U+2460+，
+    /// ㉑-㉟ U+3251+）。非带圈数字返回 None。
+    fn circled_val(c: char) -> Option<u32> {
+        let u = c as u32;
+        match u {
+            0x2460..=0x2473 => Some(u - 0x2460 + 1), // ①-⑳
+            0x3251..=0x325F => Some(u - 0x3251 + 21), // ㉑-㉟
+            _ => None,
+        }
+    }
+
+    /// 【占位符变号 2026-10-09】位次（1 基）→ 带圈数字字符（1-20 →
+    /// ①…⑳，21-35 → ㉑…㉟；超界 None——加词框占位符上限即 35）。
+    fn circled_char(pos: usize) -> Option<char> {
+        if (1..=20).contains(&pos) {
+            char::from_u32(0x2460 + pos as u32 - 1)
+        } else if (21..=35).contains(&pos) {
+            char::from_u32(0x3251 + pos as u32 - 21)
+        } else {
+            None
+        }
+    }
+
+    /// 【占位符变号 2026-10-09】调频重排后，把「位次 ≠ 自身数字」的
+    /// 占位词条改号：③被挤到第 4 位 → 删 ③ 加 ④@p4（用户规格：占位
+    /// 符因调频产生变动时数字跟着候选位走）。幂等（号码正确的不动）；
+    /// 有改动返回 true（调用方再 refresh 一次以显示新号）。
+    fn renumber_placeholders(&mut self, session: &mut Session) -> bool {
+        // 先收集错位项（借用期内不能改 adjust）。
+        // 【判定口径·用户拍板 2026-10-09】纯形态判定：带圈数字即占位
+        // 符，码表（Dict）来源同样跟号——占位符码表方案导入即用。
+        let mut wrong: Vec<(String, String, usize)> = Vec::new(); // (code, 旧词, 新位)
+        for (i, cand) in session.candidates.iter().enumerate() {
+            if cand.source != CandidateKind::Dict && cand.source != CandidateKind::UserWord {
+                continue;
+            }
+            if cand.text.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(cand.text.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        wrong.push((cand.code.clone(), cand.text.clone(), i + 1));
+                    }
+                }
+            }
+        }
+        if wrong.is_empty() {
+            return false;
+        }
+        for (code, old, pos) in wrong {
+            let Some(newc) = Self::circled_char(pos) else { continue };
+            let new_word = newc.to_string();
+            // 删旧号（含旧 pN 行）+ 加新号到当前位
+            self.schema.adjust.remove(&code, &old);
+            self.append_adjust_log("{删除}", &code, &old, None);
+            self.schema.adjust.add_at(&code, &new_word, Some(pos));
+            self.append_adjust_log("{添加}", &code, &new_word, Some(pos));
+        }
+        self.pending_user_reload = true;
+        true
+    }
+
+    /// 调频 op 收尾公共段：重排后先补占位符变号（有变 → 再刷新一次），
+    /// 保证返回给 DLL 的 state 里 ③ 已是 ④。
+    fn reorder_epilogue(&mut self, session: &mut Session) -> KeyOutcome {
+        if self.renumber_placeholders(session) {
+            let keep_raw = session.raw.clone();
+            session.clear();
+            session.raw = keep_raw;
+            self.refresh_candidates(session);
+        }
+        KeyOutcome::consumed(self.state(session))
     }
 
     /// 按 code+word 软删（内存 + 追加日志）。
@@ -3618,6 +4262,24 @@ impl Engine {
         KeyOutcome::consumed(self.state(session))
     }
 
+    /// 【按住Ctrl调频·对调 2026-11】原位交换两个候选（abs_i/abs_j 为
+    /// 完整列表绝对下标）：**候选表原位 swap**——不 clear、不重查、
+    /// raw/页/选全保（与 op_move_candidate_abs 同「纯位次」口径，尾巴
+    /// 态不翻转）。本 op 零写入（落盘由调用方 adjust_set_order 整套
+    /// pN 完成，同右键菜单管线）。越界/同位=无操作。
+    pub fn op_swap_positions_abs(
+        &mut self,
+        session: &mut Session,
+        abs_i: usize,
+        abs_j: usize,
+    ) -> KeyOutcome {
+        let n = session.candidates.len();
+        if abs_i < n && abs_j < n && abs_i != abs_j {
+            session.candidates.swap(abs_i, abs_j);
+        }
+        KeyOutcome::consumed(self.state(session))
+    }
+
     /// 原位删除：可管理词条（Dict/UserWord）写 {删除}；其余仅从当前
     /// 展示移除（源不可管理，无持久化——重查会回来，与旧行为一致）。
     pub fn op_drop_candidate_abs(&mut self, session: &mut Session, abs: usize) -> KeyOutcome {
@@ -3640,7 +4302,7 @@ impl Engine {
     pub fn adjust_set_order(&mut self, session: &Session, code: &str) {
         // 只整序可管理词条（Dict/UserWord）——符号/整句候选写 pN 会
         // 落垃圾调整行。
-        let words: Vec<String> = session
+        let mut words: Vec<String> = session
             .candidates
             .iter()
             .filter(|c| matches!(c.source, CandidateKind::Dict | CandidateKind::UserWord))
@@ -3649,24 +4311,101 @@ impl Engine {
         if words.is_empty() {
             return;
         }
+        // 【占位符变号 2026-10-09】整序时带圈数字占位词跟号：移位后
+        // ③ 落在第 4 位 → 整序行写成 ④@p4（同码 {添加} 行整套覆盖，
+        // 旧 ③ 行自动清除）。
+        // 【判定口径·用户拍板 2026-10-09】纯形态判定：码表（Dict）带
+        // 圈词同样跟号——占位符码表方案导入即用，不区分来源。
+        for (i, w) in words.iter_mut().enumerate() {
+            if w.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(w.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        if let Some(newc) = Self::circled_char(i + 1) {
+                            *w = newc.to_string();
+                        }
+                    }
+                }
+            }
+        }
         self.schema.adjust.set_order(code, &words);
         self.rewrite_order_file(code, &words);
         self.pending_user_reload = true;
     }
 
-    /// 整序文件改写：读 用户调整.txt，清同码 {添加} 行，追加整套
-    /// `{添加}code\t词\tpN`（与内存 log 同形，回放等价）。
+    /// 【占位符位加词=替换 2026-10-09】编码 code 当前有效候选第 pos 位
+    /// （1 基）是占位词（带圈数字）时返回其文本——加词到该位应先删它
+    ///（用户规格：占位符位加词=原位替换，不整体挪位）。临时会话按码
+    /// 重建候选，不动全局会话。
+    /// 【判定口径·用户拍板 2026-10-09】**纯形态判定，不看来源**：该位
+    /// 是单个带圈数字（①-㉟）即占位符——码表（Dict）里带的占位符方案
+    /// 导入即用、与用户调整层占位符同规则（替换/跟号），不做区分
+    ///（曾试改「只认 UserWord 源」，用户否决：已有占位符的码表会乱）。
+    pub fn placeholder_at_pos(&mut self, code: &str, pos: usize) -> Option<String> {
+        if pos == 0 || code.is_empty() {
+            return None;
+        }
+        let mut s = Session::new(true);
+        for ch in code.chars() {
+            self.process_key(
+                &mut s,
+                KeyInput {
+                    key: KeyCode::Char(ch),
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+        }
+        let c = s.candidates.get(pos - 1)?;
+        if c.text.chars().count() == 1 {
+            Self::circled_val(c.text.chars().next()?)
+                .map(|_| c.text.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 【占位符变号·显示同步 2026-10-09】整序落盘后，把**活会话候选**里
+    /// 的带圈占位词文本同步成新号。adjust 层已由 adjust_set_order 改好；
+    /// 右键移位走「原位重排不重建」路径（防尾巴态翻转），不能
+    /// clear+refresh——这里只改显示文本，raw/页/选全不动，DLL 立即
+    /// 看到变号（用户实锤：③→④要重开候选才出现=显示没同步）。
+    /// 返回改了几条。
+    pub fn sync_placeholder_texts(&self, session: &mut Session) -> usize {
+        let mut n = 0;
+        for (i, c) in session.candidates.iter_mut().enumerate() {
+            if c.text.chars().count() == 1 {
+                if let Some(v) = Self::circled_val(c.text.chars().next().unwrap()) {
+                    if v != (i + 1) as u32 {
+                        if let Some(nc) = Self::circled_char(i + 1) {
+                            c.text = nc.to_string();
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// 整序文件改写：读 用户调整.txt，清同码 {添加}/{整序} 行，写
+    /// `{整序}code` 标记 + 整套 `{添加}code\t词\tpN`（与内存 log 同形，
+    /// 回放等价——标记行使回放清空基础列表重建，快照即完整清单）。
     fn rewrite_order_file(&self, code: &str, words: &[String]) {
         let path = self.schema.dir.join("用户调整.txt");
         let prefix = format!("{{添加}}{code}\t");
         let pin_prefix = format!("{{置顶}}{code}\t");
+        let set_prefix = format!("{{整序}}{code}");
         let mut kept: Vec<String> = Vec::new();
         if let Ok(content) = std::fs::read_to_string(&path) {
             for l in content.lines() {
                 let t = l.trim_start();
                 // 同码 {添加} 行全清（整套覆盖）；同码且词在整序集内的
-                // {置顶} 行一并清（置顶归一成 pN，内存/文件同步）。
+                // {置顶} 行一并清（置顶归一成 pN，内存/文件同步）；
+                // 旧 {整序} 标记行也清（整套覆盖换新标记）。
                 if t.starts_with(&prefix) {
+                    continue;
+                }
+                if t.starts_with(&set_prefix) {
                     continue;
                 }
                 if t.starts_with(&pin_prefix) {
@@ -3681,6 +4420,7 @@ impl Engine {
             }
         }
         let mut out_lines = kept;
+        out_lines.push(set_prefix.clone());
         for (i, w) in words.iter().enumerate() {
             out_lines.push(format!("{{添加}}{code}\t{w}\tp{}", i + 1));
         }
@@ -3734,13 +4474,21 @@ impl Engine {
         }
     }
 
-    /// OpenCC 滤镜：为前若干候选追加繁体/emoji 变体（Rime simplifier 语义）。
+    /// OpenCC 滤镜：繁简转换 + emoji 注解候选（Rime simplifier 语义）。
+    /// 【emoji 独立生效 2026-10-16 用户需求】繁简转换与 emoji 注解彻底
+    /// 解耦：`opencc.enabled` 只管繁简转换（ST/TS 表），`opencc.emoji`
+    /// 只管 emoji 注解（emoji.txt），各自独立懒加载、独立生效——单开
+    /// emoji 不必再开「启用 OpenCC 转换」。两开关都关时零开销直返。
+    /// 【emoji 一候一个 2026-10-16 用户需求】emoji 变体不再「词+全部
+    /// emoji 挤成一条候选」（旧：2 选「手机 📱 📲 📱」），改为**每个
+    /// emoji 一条独立候选**依次追加（1选「手机」2选「📱」3选「📲」
+    /// 4选「📱」——表内顺序与重复都保留）。
     fn apply_opencc(&mut self, session: &mut Session) {
         let cfg = self.config.opencc.clone();
-        if !cfg.enabled {
+        if !cfg.enabled && !cfg.emoji {
             return;
         }
-        if !self.opencc_loaded {
+        if cfg.enabled && !self.opencc_loaded {
             let dir = self.data_dir.join("转换词典");
             // 本数据集只有台版单字表 STCharacters_Tu（无标准 STCharacters，缺文件自动跳过）
             let t = if cfg.to_traditional {
@@ -3752,36 +4500,87 @@ impl Engine {
                 hufu_dict::OpenCc::load_dir(&dir, &["TSPhrases", "TSCharacters"])
             };
             self.opencc = if t.is_empty() { None } else { Some(t) };
-            let em = hufu_dict::OpenCc::load_dir_full(&dir, &["emoji"]);
-            self.opencc_emoji = if em.is_empty() { None } else { Some(em) };
             self.opencc_loaded = true;
         }
+        if cfg.emoji && !self.opencc_emoji_loaded {
+            let dir = self.data_dir.join("转换词典");
+            let em = hufu_dict::OpenCc::load_dir_full(&dir, &["emoji"]);
+            self.opencc_emoji = if em.is_empty() { None } else { Some(em) };
+            self.opencc_emoji_loaded = true;
+        }
+        // base 在繁简转换**之前**快照（emoji 表是简体键——转换后再查
+        // 会查空），与旧序一致。
         let base: Vec<Candidate> = session.candidates.iter().take(3).cloned().collect();
         // 【2026-09-05 定稿】简→繁=替换式（Rime simplifier 语义，用户拍板）：
         // 直接转换候选文本，显示与上屏都是繁体——「打简出繁」；候选顺序
         // 不动：无简繁之分的字（中/你）保持原样原位（「中」仍是首选
         // 「中」，不会冒出「哪個」压顶；此前「置顶追加变体」被用户否决：
-        // d 键首选变「哪個」）。emoji 仍为追加变体（原本语义）。
-        if cfg.to_traditional {
+        // d 键首选变「哪個」）。
+        // 注：应用门维持旧口径 enabled+to_traditional（t2s 方向只装表
+        // 不应用——历史现状，本次解耦不动它）。
+        if cfg.enabled && cfg.to_traditional {
             if let Some(t) = &self.opencc {
-                for cand in session.candidates.iter_mut() {
-                    let conv = t.convert(&cand.text);
-                    if conv != cand.text {
-                        cand.text = conv;
+                // 【一简多繁 2026-10-17 用户需求】单字候选全变体展开：
+                // 简体「发」在繁体有 髮（头发）/發（发财）等多字形——单
+                // 字候选时表内全部繁体变体按表序逐个成候选（發、髮 都
+                // 显示、都可选）；多字候选仍走单条转换（词组表消歧：
+                // 头发→頭髮、发财→發財，不会串字）。重建而非原地改：
+                // 展开是一变多，iter_mut 装不下。
+                let mut out: Vec<Candidate> = Vec::with_capacity(session.candidates.len() + 4);
+                for cand in session.candidates.iter() {
+                    // 【功能词豁免 2026-11】{繁简}/{撤回}/{加词} 等功能词
+                    // 不做简→繁转换：转换后 tag 变形（{繁简}→{繁簡}），
+                    // 提交解析 tag=="繁简" 判否 → 繁体态下开关再也切不回
+                    //（用户实锤：{繁简} 写进主码表，打编码上屏成 {繁簡}
+                    // 字面）。花括号命名空间归功能词语法，普通词不受影响。
+                    if cand.text.starts_with('{')
+                        && cand.text.ends_with('}')
+                        && cand.text.len() > 2
+                    {
+                        out.push(cand.clone());
+                        continue;
                     }
+                    // 单字且表内多目标 → 逐变体展开（表序；含表内原字，
+                    // 如 后→[後,后]——「后」在繁体 皇后 义仍用，照显）
+                    if cand.text.chars().count() == 1 {
+                        if let Some(vs) = t.char_variants(cand.text.as_str()) {
+                            if vs.len() > 1 {
+                                for v in vs {
+                                    let mut c = cand.clone();
+                                    c.text = v.clone();
+                                    out.push(c);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let mut c = cand.clone();
+                    let conv = t.convert(&c.text);
+                    if conv != c.text {
+                        c.text = conv;
+                    }
+                    out.push(c);
                 }
+                session.candidates = out;
             }
         }
         let mut variants: Vec<Candidate> = Vec::new();
-        for cand in &base {
-            if cfg.emoji {
-                if let Some(em) = &self.opencc_emoji {
+        if cfg.emoji {
+            if let Some(em) = &self.opencc_emoji {
+                for cand in &base {
                     let v = em.convert(&cand.text);
-                    if v != cand.text && v.chars().count() > cand.text.chars().count() {
-                        let mut c = cand.clone();
-                        c.text = v;
-                        c.comment = "😊".into();
-                        variants.push(c);
+                    // 转换产物=「词 + 空格 + emoji 列表」（整目标模式）。
+                    // 剥掉与原词相等的前缀，剩余按空白切分——每个 emoji
+                    // 独立成一条候选（表内重复保留，用户拍板口径）。
+                    // 前缀不等（部分匹配等畸形）按无变体处理，不硬拆。
+                    if v.len() > cand.text.len() && v.starts_with(cand.text.as_str()) {
+                        let rest = &v[cand.text.len()..];
+                        for tok in rest.split_whitespace() {
+                            let mut c = cand.clone();
+                            c.text = tok.to_string();
+                            c.comment = "😊".into();
+                            variants.push(c);
+                        }
                     }
                 }
             }
@@ -3853,9 +4652,30 @@ impl Engine {
     /// 该条消耗掉——之后的 {重复上屏} 回放的是更早一条，被删文字不再
     /// 可回放。历史空/超长条装不下时跳过弹更早（连续 {撤回} 撤到底）。
     /// 其他功能词与 resolve_dynamic 同口径。
+    /// 【{繁简} 2026-11】功能词提交解析：翻转「简繁转换」开关
+    ///（config.opencc.enabled——与自定义键 s2t 绑定同一开关，同一
+    /// 落盘管线 pending_config_save）。打一次切繁体、再打切回简体；
+    /// 空提交（无文本无回删，纯开关动作）。用户把 {繁简} 写进码表/
+    /// 快符即可（默认快符 zfj）。
     fn resolve_dyn_pair(&mut self, text: &str) -> (String, u8, bool) {
         if text.starts_with('{') && text.ends_with('}') && text.len() >= 3 {
             let tag = &text[1..text.len() - 1];
+            if tag == "繁简" {
+                self.config.opencc.enabled = !self.config.opencc.enabled;
+                self.pending_config_save = true;
+                return (String::new(), 0, false);
+            }
+            if tag == "emoji注解" {
+                // 【{emoji注解} 2026-10-17 用户需求】与 {繁简} 同构：翻转
+                // 「emoji 注解候选」开关（config.opencc.emoji——与自定义键
+                // emoji 绑定同一开关，同一落盘管线 pending_config_save）。
+                // 空提交（无文本无回删，纯开关动作）；功能词豁免由花括号
+                // 通用规则覆盖（简→繁不会把 {emoji注解} 变形成 {emoji註解}
+                // 导致开关失效——{繁简} 同款坑，防御已就位）。
+                self.config.opencc.emoji = !self.config.opencc.emoji;
+                self.pending_config_save = true;
+                return (String::new(), 0, false);
+            }
             if tag == "撤回" {
                 while let Some(front) = self.commit_history.front().cloned() {
                     let cnt = front.chars().count();
@@ -3894,8 +4714,13 @@ impl Engine {
         //   存进去纯垃圾条目，还驱动 add_word/merge_into 的 O(N) 线性扫
         //   持续变慢；码表域候选（真实短码）才学。
         // ②超长 code 不学（>16 键的非整句异常条目防御）。
-        let learnable =
-            cand.source != CandidateKind::Sentence && cand.code.chars().count() <= 16;
+        // ③【个人存储表 2026-10-16】Personal 不学：隐私词条（手机号/
+        //   身份证等）不进调频（不可前台调频）、不进 session_learned、
+        //   更不落 user-adjust.log（明文日志=隐私泄漏面；用户拍板
+        //   「不可前台调频、增删」）。
+        let learnable = cand.source != CandidateKind::Sentence
+            && cand.source != CandidateKind::Personal
+            && cand.code.chars().count() <= 16;
         if learnable && self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
             // 【三十六修】同步登记会话学习（reload_user_data 重建后回放，
@@ -3905,7 +4730,10 @@ impl Engine {
                 .entry((cand.code.clone(), cand.text.clone()))
                 .or_insert(0) += 1;
         }
-        if self.config.user.log_adjust {
+        // 【个人存储表 2026-10-16】隐私词条不落 user-adjust.log（与
+        // learnable 同判独立写在此处：log_adjust 记录的是「选了什么」，
+        // Personal 选中也不记——手机号/身份证不进明文日志）。
+        if self.config.user.log_adjust && cand.source != CandidateKind::Personal {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -4179,6 +5007,51 @@ impl Engine {
         cands
     }
 
+    /// 【编码通配符】特性可用性：开关开 + 通配字符合法（①不在编码
+    /// 字母表内——在表内说明该字符是正常编码字符，征用会废掉一个
+    /// 码位；②不是反查引导键——无论反查开关状态，同字符一律让位：
+    /// 反查开着它引导反查，反查关着它走 disabled_output 直出，空态
+    /// 语义都有主了，通配不再插一脚）。
+    fn wildcard_active(&self) -> bool {
+        self.config.input.wildcard_enabled
+            && !self
+                .config
+                .input
+                .is_alphabet_char(self.config.input.wildcard_char)
+            && self.config.input.wildcard_char != self.config.reverse.prefix
+    }
+
+    /// 【编码通配符】通配查询候选：等长匹配的全部词条，按码表行序
+    /// 聚合（每个命中码取 schema.candidates——用户调频/置顶/删词等
+    /// 调整照常生效）；注释位 = 该词条的完整编码（搜索语义下编码
+    /// 即要看的主体）；功能词（{重复上屏} 等动态标记）不出结果。
+    fn wildcard_candidates(&self, raw: &str) -> Vec<Candidate> {
+        let wc = self.config.input.wildcard_char;
+        let mut codes = self.schema.dict.wildcard_codes(raw, wc);
+        // 码表行序：按每个码的最小 seq（原始行号）升序聚合
+        codes.sort_by_key(|code| {
+            self.schema
+                .dict
+                .lookup(code)
+                .iter()
+                .map(|e| e.seq)
+                .min()
+                .unwrap_or(u32::MAX)
+        });
+        let mut out: Vec<Candidate> = Vec::new();
+        for code in &codes {
+            for e in self.schema.candidates(code) {
+                if e.text.starts_with('{') {
+                    continue;
+                }
+                let mut c = self.entry_to_candidate(&e);
+                c.comment = code.clone();
+                out.push(c);
+            }
+        }
+        out
+    }
+
     fn refresh_candidates(&mut self, session: &mut Session) {
         session.candidates.clear();
         session.page = 0;
@@ -4196,17 +5069,40 @@ impl Engine {
         }
 
         // 「;」引导标点候选：;+空格=：、;;=；直上
-        if self.config.input.semicolon_guide
+        // 【；去特化 2026-10-08】raw==";" 只在 semicolon_guide_active
+        //（开关开 && 有 ; 数据）时空态才进得来；此处再加同门防御——
+        // 老会话/方案热切等残态下不弹无源候选。
+        // 【码表 ; 码词条优先 2026-10-09】码表 ; 码词条（如 QQ五笔
+        // {重复上屏}/{撤回}）排最前——;+空格即首选功能；内置 ：/；
+        // 开关开时追加其后（开关关=纯码表词条，无 ：/；）。原实现硬
+        // 替换 [：,；] 导致码表词条永不可达（用户实锤）。
+        if self.semicolon_guide_active()
             && session.mode == InputMode::Normal
             && session.raw == ";"
         {
-            session.candidates = vec![
-                Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol),
-                Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol),
-            ];
+            let mut cands: Vec<Candidate> = self
+                .schema
+                .candidates(";")
+                .iter()
+                .map(|e| self.entry_to_candidate(e))
+                .collect();
+            if self.config.input.semicolon_guide || cands.is_empty() {
+                cands.push(Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol));
+                cands.push(Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol));
+            }
+            session.candidates = cands;
             return;
         }
 
+        // 【编码通配符 2026-10-11】raw 含通配字符=通配查询：码表内全部
+        // 等长匹配词条，注释位显示完整编码。置于反查/快符之后、超集
+        // 副表与整句接管之前（通配是显式搜索意图，优先级最高；` 超集
+        // 前缀 raw 不会同时含通配字符——通配字符不可能是 `，见
+        // wildcard_active 的冲突判定）。
+        if self.wildcard_active() && session.raw.contains(self.config.input.wildcard_char) {
+            session.candidates = self.wildcard_candidates(&session.raw);
+            return;
+        }
         let parsed = self.parse_locks(&session.raw);
         let raw_len = session.raw.chars().count();
         // 【` 引导超集码表 2026-11】` 起段编码走超集副表独立域：
@@ -4369,6 +5265,13 @@ impl Engine {
                     if !phrase.is_empty() || !rest.is_empty() {
                         // session.candidates 已含（码表 normal + early 前缀
                         // 态 + 生僻沉底）——phrase 真词压最前，其余原序补后
+                        // 【截断只约束解码产物 2026-10-11 用户实锤】原
+                        // merged.truncate(20) 连**码表精确词条**一并截——
+                        // ae 码表一行 55 词只剩 20（「ae 的候选不止 20 个」）。
+                        // 改为：真词短语组 ≤10、弱切分补位 ≤10（解码器
+                        // 产物的合理边界），码表词条全量保留（分页照常）。
+                        phrase.truncate(10);
+                        rest.truncate(10);
                         let mut merged = phrase;
                         for existing in session.candidates.drain(..) {
                             if !merged.iter().any(|m| m.text == existing.text) {
@@ -4394,7 +5297,6 @@ impl Engine {
                                 }
                             }
                         }
-                        merged.truncate(20);
                         session.candidates = merged;
                         self.apply_rerank(session);
                     }
@@ -4557,7 +5459,15 @@ impl Engine {
 
     /// DictEntry → Candidate（含注释）。
     fn entry_to_candidate(&self, e: &DictEntry) -> Candidate {
-        let mut c = Candidate::new(e.text.clone(), e.code.clone(), CandidateKind::Dict);
+        // 【个人存储表 2026-10-16】词条来自个人存储表 → 源标 Personal：
+        // 候选保护（置顶/删词/定序/对调白名单排除）、调频不学、
+        // user-adjust.log 不记（隐私不落盘）、导出不带的共用判据。
+        let source = if self.schema.personal_contains(&e.code, &e.text) {
+            CandidateKind::Personal
+        } else {
+            CandidateKind::Dict
+        };
+        let mut c = Candidate::new(e.text.clone(), e.code.clone(), source);
         c.weight = e.weight;
         c.pinned = e.pinned;
         c.commit_override = e.commit_override.clone();
@@ -4697,6 +5607,49 @@ impl Engine {
         format!("{}{}", base, disp_c)
     }
 
+    /// 【Shift+字母·双态开关 2026-10-10】该字母是否「都生效」档
+    ///（shift_letters_always 集合）：空态直出串+组段无候选也顶屏。
+    /// 缺省=「只在有候选时生效」（v1.7.5 行为）。
+    fn shift_letter_always(&self, c: char) -> bool {
+        c.is_ascii_alphabetic()
+            && self
+                .config
+                .keymap
+                .shift_letters_always
+                .contains(&c.to_ascii_uppercase().to_string())
+    }
+
+    /// 【Shift+符号预览 2026-10-09】设置页「Shift+符号」页签点键即问：
+    /// 该键的内置输出（US shift 形态→标点映射，空上下文近似）与
+    /// 自定义覆盖串。None 内置=该键不是 Shift 符号键。
+    /// 【Shift+字母 2026-10-09】字母键也可查：内置=大写字母本身；
+    /// 自定义键形为大写（A-Z——引擎按 TSF 实传大写查 shift_symbols）。
+    /// 【双态开关 2026-10-10】字母映射默认只在有候选（组段中）生效；
+    /// 「都生效」档（shift_letters_always）空态/无候选也出串。
+    pub fn shift_symbol_preview(&self, base: char) -> Option<(String, Option<String>)> {
+        if base.is_ascii_alphabetic() {
+            let up = base.to_ascii_uppercase();
+            let custom = self
+                .config
+                .keymap
+                .shift_symbols
+                .get(&up.to_string())
+                .cloned();
+            return Some((up.to_string(), custom));
+        }
+        let builtin = shift_form(base).and_then(|sf| {
+            let mut scratch = crate::session::Session::new(true);
+            self.punct_output(&mut scratch, sf, "").map(|(t, _)| t)
+        })?;
+        let custom = self
+            .config
+            .keymap
+            .shift_symbols
+            .get(&base.to_string())
+            .cloned();
+        Some((builtin, custom))
+    }
+
     fn display_candidate(&self, c: &Candidate) -> Option<Candidate> {
         let mut c = c.clone();
         if c.text.starts_with('{') && c.text.ends_with('}') && c.text.len() > 2 {
@@ -4732,6 +5685,23 @@ impl Engine {
                     return None;
                 }
                 c.text = "↩撤回".into();
+            } else if tag == "繁简" {
+                // 【{繁简} 2026-11】实时显示切换目标：简体输出中 →
+                // 「⇄转繁」，繁体输出中 → 「⇄转简」（按了才知道去哪，
+                // 与 {日期} 族「显示实时值」同口径）。
+                c.text = if self.config.opencc.enabled {
+                    "⇄转简".into()
+                } else {
+                    "⇄转繁".into()
+                };
+            } else if tag == "emoji注解" {
+                // 【{emoji注解} 2026-10-17】实时显示切换目标（与 {繁简}
+                // 同口径）：注解关着 → 按下去是开；开着 → 按下去是关。
+                c.text = if self.config.opencc.emoji {
+                    "😊关注解".into()
+                } else {
+                    "😊开注解".into()
+                };
             } else if let Some(v) = dynamic::expand(tag) {
                 c.text = v;
             }
@@ -4851,6 +5821,12 @@ impl Engine {
             ctrl_space_switch: self.config.general.ctrl_space_switch,
             keymap: self.config.keymap.map.clone(),
             keymap_idle: self.config.keymap.map_idle.clone(),
+            caps_lock: session.caps_lock,
+            // 【按住键可录 2026-11】三值透传（解析在 DLL：组合匹配 +
+            // 模态入口/导出快捷键执行都在 DLL 键路）。
+            freq_key: self.config.candidates.freq_key.clone(),
+            delete_key: self.config.candidates.delete_key.clone(),
+            export_key: self.config.general.export_key.clone(),
         }
     }
 }
@@ -5381,9 +6357,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    // 【翻页/顶字复用键 2026-09-06】-（——）/ =（+）候选可翻时翻页，
-    // 翻不动时直接顶屏（首选+符号形态）。一页装满（pages=1）时按 -
-    // 或 = 都不可翻 → 顶字；多页时 = 翻下页、- 翻上页；翻页后顶字。
+    // 【翻页键纯翻页 2026-11 用户改判】-（——）/ =（+）候选在场时恒翻页：
+    // 2026-09-06 版「翻不动时顶字」按用户实锤撤销（ae 案例翻到末页再按
+    // 翻页键直接上屏「=+末页首选」）。新规格：单页吞键原地不动；多页
+    // 末页循环回首页；任何情况不上屏。Shift 形态（—— / +）同基键方向。
+    // 【翻页跟随 2026-11】翻页后空格/数字基准 = 当前页首位（旧实现
+    // selected 不随页走，翻页后空格仍上屏第 1 页首选）。
     #[test]
     fn page_or_commit_keys() {
         let (mut eng, _dir) = test_engine("pok");
@@ -5391,18 +6370,20 @@ mod tests {
         let mut s = Session::new(true);
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
-        // 按 -：无上页 → 顶字「就-」
+        // 按 -：单页 → 吞键不动，不上屏
         let out = eng.process_key(&mut s, key('-'));
-        assert_eq!(out.commit.unwrap(), "就-", "一页满时 - 顶字");
-        assert!(s.raw.is_empty());
-        // 按 =：无下页 → 顶字「就=」
-        let mut s2 = Session::new(true);
-        eng.process_key(&mut s2, key('j'));
-        eng.process_key(&mut s2, key('d'));
-        let out2 = eng.process_key(&mut s2, key('='));
-        assert_eq!(out2.commit.unwrap(), "就=", "一页满时 = 顶字");
-
-        // Shift 形态顶字：—— / +
+        assert!(out.commit.is_none(), "单页 - 不上屏（旧顶字已废）");
+        assert_eq!(s.raw, "jd", "编码保持");
+        assert_eq!(s.page, 0, "页码不动");
+        // 按 =：同样吞键
+        let out2 = eng.process_key(&mut s, key('='));
+        assert!(out2.commit.is_none(), "单页 = 不上屏（旧顶字已废）");
+        assert_eq!(s.raw, "jd", "编码保持");
+        // 【Shift+-/= =顶屏 2026-10-11 用户反馈】翻页键纯翻页化把
+        // Shift 形态的老手感（首选+符号顶字）一并杀了——还给它：
+        // Shift+- 顶「就——」（_ 全角映射）、Shift+= 顶「就+」
+        //（+ 在虎爪半角组，半角原样），纯 -/= 翻页零变化（上方断言
+        // 覆盖）。自定义 Shift+符号串优先（shift_symbols）。
         let mut s3 = Session::new(true);
         eng.process_key(&mut s3, key('j'));
         eng.process_key(&mut s3, key('d'));
@@ -5411,7 +6392,18 @@ mod tests {
             k.modifiers.shift = true;
             k
         });
-        assert_eq!(out3.commit.unwrap(), "就——", "Shift+- 顶字 ——");
+        assert_eq!(out3.commit.as_deref(), Some("就——"), "Shift+- 顶屏 首选+——");
+        assert!(s3.raw.is_empty(), "顶屏后清屏");
+        let mut s3b = Session::new(true);
+        eng.process_key(&mut s3b, key('j'));
+        eng.process_key(&mut s3b, key('d'));
+        let out3b = eng.process_key(&mut s3b, {
+            let mut k = key('=');
+            k.modifiers.shift = true;
+            k
+        });
+        assert_eq!(out3b.commit.as_deref(), Some("就+"), "Shift+= 顶屏 首选+（半角组）");
+        // 无候选时 Shift+-/= 不顶不翻——空态符号链照旧（不在此测映射细节）
 
         // 多页场景：临时把 page_size 调 2（jd 3 候选 → 2 页）
         let mut s4 = Session::new(true);
@@ -5421,10 +6413,10 @@ mod tests {
         let out4 = eng.process_key(&mut s4, key('='));
         assert!(out4.commit.is_none(), "= 有下页时翻页不上屏");
         assert_eq!(s4.page, 1, "翻到第 2 页");
-        // 到末页再按 = → 顶字（末页页首「加」——纯码表原序
-        // jd = [就,到的,加]，page_size 2 时末页只剩 加）
+        // 到末页再按 = → 循环回首页，不上屏（旧「末页顶字」已废）
         let out5 = eng.process_key(&mut s4, key('='));
-        assert_eq!(out5.commit.unwrap(), "加=", "末页再 = 顶字");
+        assert!(out5.commit.is_none(), "末页再 = 循环回首页不上屏");
+        assert_eq!(s4.page, 0, "循环回第 1 页");
         // - 回翻：第 2 页按 - 回第 1 页
         let mut s5 = Session::new(true);
         eng.process_key(&mut s5, key('j'));
@@ -5433,6 +6425,222 @@ mod tests {
         let out6 = eng.process_key(&mut s5, key('-'));
         assert!(out6.commit.is_none(), "- 有上页时翻页不上屏");
         assert_eq!(s5.page, 0, "翻回第 1 页");
+
+        // 【顶字页基准 2026-10-11】翻页后标点顶字/Shift+-/= 顶的都是
+        // 当前页首项（selected 跟随翻页），不再是第 1 页首选
+        let mut s9 = Session::new(true);
+        eng.process_key(&mut s9, key('j'));
+        eng.process_key(&mut s9, key('d'));
+        eng.process_key(&mut s9, key('='));
+        let out9 = eng.process_key(&mut s9, key(','));
+        assert_eq!(out9.commit.as_deref(), Some("加，"), "翻页后标点顶字=当前页首项+标点");
+        let mut s10 = Session::new(true);
+        eng.process_key(&mut s10, key('j'));
+        eng.process_key(&mut s10, key('d'));
+        eng.process_key(&mut s10, key('='));
+        let out10 = eng.process_key(&mut s10, {
+            let mut k = key('-');
+            k.modifiers.shift = true;
+            k
+        });
+        assert_eq!(out10.commit.as_deref(), Some("加——"), "翻页后 Shift+- =当前页首项——");
+
+        // 【翻页跟随 2026-11】翻到第 2 页后：空格上屏**当前页首位**
+        //（jd page_size 2 → 第 2 页 [加]）——旧实现 selected 恒 0 会
+        // 上屏第 1 页首选「就」。
+        let mut s6 = Session::new(true);
+        eng.process_key(&mut s6, key('j'));
+        eng.process_key(&mut s6, key('d'));
+        eng.process_key(&mut s6, key('='));
+        assert_eq!(s6.page, 1, "第 2 页就位");
+        let out7 = eng.process_key(&mut s6, key(' '));
+        assert_eq!(out7.commit.unwrap(), "加", "翻页后空格=当前页首位");
+        // 数字选重同基准：第 2 页按 1 = 加（页内第 1 项）
+        let mut s7 = Session::new(true);
+        eng.process_key(&mut s7, key('j'));
+        eng.process_key(&mut s7, key('d'));
+        eng.process_key(&mut s7, key('='));
+        let out8 = eng.process_key(&mut s7, key('1'));
+        assert_eq!(out8.commit.unwrap(), "加", "翻页后数字 1=当前页第 1 项");
+        // 未翻页时数字仍按整列表绝对位次（10 内直达：候选只开 3 个
+        // 也能按 3 选到第 3 项——用户满意的既有设定不动）
+        let mut s8 = Session::new(true);
+        eng.process_key(&mut s8, key('j'));
+        eng.process_key(&mut s8, key('d'));
+        let out9 = eng.process_key(&mut s8, key('3'));
+        assert_eq!(out9.commit.unwrap(), "加", "未翻页数字 3=列表第 3 项");
+    }
+
+    // 【叶子直出收域 2026-11 用户实锤·虎爪同款】v1.7.6 泛化叶子直出
+    // 收窄：主码域唯一只在**满最大码长**上屏（靓仔 uvo=睡 3 码不满 4
+    // 不顶，虎爪/虎娘同设置同款）；z 引导符号域（码表 z 只在码首，
+    // Dict.z_symbol_domain——虎爪 RebuildShortSymbolMeta 同判定）内
+    // 唯一叶子随时直出（092K zai=AI 三键即出），且不受
+    // auto_select_unique 门控（域语义，与 ; / \ 快符域一致）。
+    #[test]
+    fn leaf_unique_auto_commit_domain_scoped() {
+        // ── 夹具一：靓仔类——z 作普通编码字母（uvz 码内含 z）→ 域判否 ──
+        let dir1 = std::env::temp_dir().join(format!(
+            "hufu-eng-leaf1-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir1);
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nuvz\t制\nuvo\t睡\naabb\t满码\n",
+        )
+        .unwrap();
+        let (mut eng, _d) = {
+            let eng =
+                Engine::with_schema_dir(&dir1, hufu_config::Config::default()).unwrap();
+            (eng, dir1.clone())
+        };
+        assert!(!eng.schema.dict.z_symbol_domain, "码内含 z → 域判否");
+        eng.config.input.auto_select_unique = true;
+        // uvo：3 码唯一叶子、不满最大码长 4 → 不直出（候选等待空格）
+        let mut s = Session::new(true);
+        for ch in ['u', 'v', 'o'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert!(s.raw == "uvo", "主域叶子不满码长不直出（虎爪同款）");
+        assert_eq!(s.candidates.len(), 1);
+        assert_eq!(s.candidates[0].text, "睡");
+        // aabb：4 码唯一满码长 → 直出（满码唯一原语义）
+        let mut s2 = Session::new(true);
+        for ch in ['a', 'a', 'b', 'b'] {
+            eng.process_key(&mut s2, key(ch));
+        }
+        assert!(s2.raw.is_empty(), "满码唯一直出");
+        // 开关关：满码唯一也不直出（原行为）
+        eng.config.input.auto_select_unique = false;
+        let mut s3 = Session::new(true);
+        for ch in ['a', 'a', 'b', 'b'] {
+            eng.process_key(&mut s3, key(ch));
+        }
+        assert!(s3.raw == "aabb", "开关关满码不直出");
+
+        // ── 夹具二：092K 类——z 只在码首 → z 域开，域内叶子直出 ──
+        let dir2 = std::env::temp_dir().join(format!(
+            "hufu-eng-leaf2-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nai\t爱\nzai\tAI\nzko\t！”\n",
+        )
+        .unwrap();
+        // 快符带 {繁简}（/fj 同发行包默认位）
+        std::fs::write(dir2.join("快符.txt"), "{繁简}\t/fj\n").unwrap();
+        let mut eng2 =
+            Engine::with_schema_dir(&dir2, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+        assert!(eng2.schema.dict.z_symbol_domain, "z 只在码首 → 域判是");
+        eng2.config.input.auto_select_unique = true;
+        // 主域 ai：2 码唯一叶子不满 4 → 不直出
+        let mut t1 = Session::new(true);
+        eng2.process_key(&mut t1, key('a'));
+        eng2.process_key(&mut t1, key('i'));
+        assert!(t1.raw == "ai", "z 域开但主域叶子照旧不直出");
+        // zai：z 域唯一叶子 3 码 → 直出「AI」
+        let mut t2 = Session::new(true);
+        for ch in ['z', 'a', 'i'] {
+            eng2.process_key(&mut t2, key(ch));
+        }
+        assert!(t2.raw.is_empty(), "z 域叶子直出");
+        // 开关关也直出（域语义不受 auto_select_unique 门控）
+        eng2.config.input.auto_select_unique = false;
+        let mut t3 = Session::new(true);
+        for ch in ['z', 'k', 'o'] {
+            eng2.process_key(&mut t3, key(ch));
+        }
+        assert!(t3.raw.is_empty(), "z 域直出不受开关门控");
+
+        // ── {繁简} 功能词：/fj 提交翻转 opencc 开关（打一次切繁、再打切简）──
+        //（dir2 上面已删——重建夹具再起引擎）
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\nai\t爱\nzai\tAI\nzko\t！”\n",
+        )
+        .unwrap();
+        std::fs::write(dir2.join("快符.txt"), "{繁简}\t/fj\n").unwrap();
+        let mut eng3 = Engine::with_schema_dir(&dir2, hufu_config::Config::default()).unwrap();
+        let before = eng3.config.opencc.enabled;
+        let mut f1 = Session::new(true);
+        for ch in ['/', 'f', 'j'] {
+            eng3.process_key(&mut f1, key(ch));
+        }
+        assert!(eng3.config.opencc.enabled != before, "{{繁简}} 提交翻转开关");
+        assert!(eng3.pending_config_save, "翻转置落盘旗");
+        let mut f2 = Session::new(true);
+        for ch in ['/', 'f', 'j'] {
+            eng3.process_key(&mut f2, key(ch));
+        }
+        assert_eq!(eng3.config.opencc.enabled, before, "再打切回");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // 【英文态 Caps 恒系统默认 2026-11 用户拍板】英文态按 Caps 一律
+    // 透传（系统原生大小写锁定），caps_action 只管中文态——无论配的
+    // 是 Clear/Switch/None，英文态都不接管（原 Switch 会吃掉 Caps 切
+    // 回中文，英文态要大写只能 Shift）。绑 switch 的自定义键不受影响
+    //（英文态白名单先查，显式绑定优先）。
+    #[test]
+    fn caps_english_passthrough() {
+        let (mut eng, _dir) = test_engine("capsen");
+        // 三种 caps_action 下英文态都透传
+        for action in [
+            hufu_config::CapsAction::Clear,
+            hufu_config::CapsAction::Switch,
+            hufu_config::CapsAction::None,
+        ] {
+            eng.config.general.caps_action = action;
+            let mut s = Session::new(false); // 英文态
+            let o = eng.process_key(
+                &mut s,
+                KeyInput {
+                    key: KeyCode::CapsLock,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            assert!(!o.consumed, "{action:?} 英文态 Caps 透传");
+            assert!(!s.chinese, "{action:?} 英文态不切回中文");
+            assert!(s.raw.is_empty(), "英文态 raw 保持空");
+        }
+        // 中文态照旧：Switch（默认）→ 切英文；Clear 无编码 → 透传
+        eng.config.general.caps_action = hufu_config::CapsAction::Switch;
+        let mut s2 = Session::new(true);
+        let o2 = eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o2.consumed && !s2.chinese, "中文态 Switch 照旧切英文");
+        // 英文态绑 capslock→switch（自定义键）：白名单显式绑定仍生效
+        //（不受「英文态 Caps 透传」影响——那是未绑定时 caps_action 的
+        // 兜底路径）
+        eng.config
+            .keymap
+            .map_idle
+            .insert("capslock".to_string(), "switch".to_string());
+        let mut s3 = Session::new(false);
+        let o3 = eng.process_key(
+            &mut s3,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o3.consumed && s3.chinese, "英文态显式绑 switch 仍可切回中文");
     }
 
     // 【锁态重锁与回显还原 2026-09-06】用户词插入使显示序≠码表序：
@@ -5732,6 +6940,46 @@ mod tests {
         assert_eq!(rt, ["就", "到的", "加"], "原始码表不受污染");
     }
 
+    // 【按住Ctrl调频·对调 2026-11】op_swap_positions_abs：原位交换两候选
+    //（raw/页/选不动——尾巴态不翻转），配 adjust_set_order 整序落盘后
+    // reload 仍保持交换序；越界/同位无操作。
+    #[test]
+    fn swap_positions_inplace_and_persist() {
+        let (mut eng, dir) = test_engine("freqswap");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts0: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts0, vec!["就", "到的", "加"], "初始序");
+        // 原位交换 0/2：raw/selected 原样
+        s.selected = 0;
+        let _ = eng.op_swap_positions_abs(&mut s, 0, 2);
+        let texts1: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts1, vec!["加", "到的", "就"], "0↔2 原位交换");
+        assert_eq!(s.raw, "jd", "raw 保留（尾巴态不翻转）");
+        assert_eq!(s.selected, 0, "选中位保留");
+        // 越界/同位：无操作
+        let _ = eng.op_swap_positions_abs(&mut s, 0, 9);
+        let _ = eng.op_swap_positions_abs(&mut s, 1, 1);
+        let texts2: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts2, texts1, "越界/同位无操作");
+        // 整序落盘（对调管线同右键菜单：swap → set_order → 占位符同步）
+        eng.adjust_set_order(&s, "jd");
+        let _ = eng.sync_placeholder_texts(&mut s);
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}jd"), "整序标记: {log}");
+        assert!(log.contains("{添加}jd\t加\tp1"), "加 到 p1: {log}");
+        assert!(log.contains("{添加}jd\t就\tp3"), "就 到 p3: {log}");
+        // reload 后交换序保持（延迟重载语义：候选框消失才真 reload——
+        // 这里直接 reload_user_data 模拟收场）
+        eng.reload_user_data();
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let texts3: Vec<String> = s2.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts3, vec!["加", "到的", "就"], "reload 后交换序保持: {texts3:?}");
+    }
+
     // 【格式统一 2026-09-06】用户调整.txt（新主文件）= {标记} 统一格式；
     // 旧 用户词.txt（TSV 词行+调整行）只读兼容：词行并入、调整行先
     // 回放（新主文件操作在后覆盖旧）。回放序翻转后 pins 最新在前。
@@ -5841,6 +7089,179 @@ mod tests {
         assert_eq!(out.commit.unwrap(), "就·", "编码态 ` 顶首选带 ·");
         assert!(s.raw.is_empty(), "顶屏后清缓冲");
     }
+
+    // 【引导键连动 2026-10-09】反查态引导键输出跟随设置页「关闭反查时
+    // 按引导键」选项：配 ` → 空态二次直出 `、有候选按一下=首选顶屏+`；
+    // 配 · → 出 ·。此前反查内硬编码 · 不连动。
+    #[test]
+    fn reverse_guide_symbol_linkage() {
+        let (mut eng, dir) = test_engine("revlink");
+        eng.config.reverse.disabled_output = "`".to_string();
+        // 空态二次 `：直出 ` 退出反查
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('`'));
+        assert_eq!(s.mode, InputMode::Reverse, "单击进反查");
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("`"), "配 ` 双击直出 `");
+        assert_eq!(s.mode, InputMode::Normal, "退出反查");
+        // 反查有候选（ce=测）按 ` → 顶首选 + `
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('`'));
+        eng.process_key(&mut s2, key('c'));
+        eng.process_key(&mut s2, key('e'));
+        assert!(!s2.candidates.is_empty(), "ce 有候选");
+        let out = eng.process_key(&mut s2, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("测`"), "有候选顶屏+连动符号");
+        assert_eq!(s2.mode, InputMode::Normal, "退出反查");
+        // 配回 ·：同路径出 ·
+        eng.config.reverse.disabled_output = "·".to_string();
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('`'));
+        let out = eng.process_key(&mut s3, key('`'));
+        assert_eq!(out.commit.as_deref(), Some("·"), "配 · 双击出 ·");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【引导键连动·编码态 2026-10-10】反查开着（表在场）+ 选项配 `：
+    // 编码态按 ` = 首选顶屏 + `——此前该分支 reverse_available 硬编码
+    // ·（选项只作用于反查关闭场景），用户实锤「有候选的时候按出来还是 ·」。
+    #[test]
+    fn reverse_guide_symbol_linkage_compose() {
+        let (mut eng, dir) = test_engine("revlink2"); // 反查.txt 在场=反查可用
+        eng.config.reverse.disabled_output = "`".to_string();
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let out = eng.process_key(&mut s, key('`'));
+        assert_eq!(
+            out.commit.as_deref(),
+            Some("就`"),
+            "反查可用+配 `：编码态顶屏+`: {:?}",
+            out.commit
+        );
+        // 默认（未配）零回归：仍 ·
+        let (mut eng2, dir2) = test_engine("revlink3");
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('j'));
+        eng2.process_key(&mut s2, key('d'));
+        let out2 = eng2.process_key(&mut s2, key('`'));
+        assert_eq!(out2.commit.as_deref(), Some("就·"), "默认仍 ·");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    // 【可延码不直出 2026-10-09】symbols 类码表 ;m ;mn ;mng ;mnng 共存：
+    // ;m 唯一命中不再秒上屏（此前压死了 ;mn…「打不了」），候选窗等待
+    // 延伸；无延续的 ;x 唯一命中仍直出（快符老语义零回归）。
+    #[test]
+    fn semicolon_continuation_no_autocommit() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-semicont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\n;m\t·\n;mn\t—\n;mng\t——\n;mnng\t……\n;x\t@\n",
+        )
+        .unwrap();
+        let cfg = hufu_config::Config::default();
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        // ;m：唯一候选 · 但有延续（;mn…）→ 不直出，等待延伸
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key(';'));
+        eng.process_key(&mut s, key('m'));
+        assert_eq!(s.raw, ";m", ";m 不秒上屏（有延续等待）: raw={}", s.raw);
+        assert!(!s.candidates.is_empty(), ";m 候选在场");
+        // 空格可出 ·（首选照选）
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.as_deref(), Some("·"), "空格选 ·");
+        // 延伸链 ;mn（等待）→ ;mnn（无候选但有 ;mnng 延续=仍等待）
+        // → ;mnng 末级唯一直出。注：;mng 是独立叶子码（——），不在
+        // ;mnng 的延伸链上（;mnng=;m n n g）。
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key(';'));
+        eng.process_key(&mut s2, key('m'));
+        let out = eng.process_key(&mut s2, key('n'));
+        assert_eq!(s2.raw, ";mn", ";mn 仍等待");
+        assert!(out.commit.is_none(), ";mn 不上屏");
+        let out = eng.process_key(&mut s2, key('n'));
+        assert_eq!(s2.raw, ";mnn", ";mnn 无候选仍等待（有 ;mnng 延续）");
+        assert!(out.commit.is_none(), ";mnn 不上屏");
+        let out = eng.process_key(&mut s2, key('g'));
+        assert_eq!(out.commit.as_deref(), Some("……"), ";mnng 末级叶子唯一直出");
+        // 对照：;mng 是叶子码（无更长延续）→ 唯一直出 ——
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key(';'));
+        eng.process_key(&mut s4, key('m'));
+        eng.process_key(&mut s4, key('n'));
+        let out = eng.process_key(&mut s4, key('g'));
+        assert_eq!(out.commit.as_deref(), Some("——"), ";mng 叶子唯一直出");
+        // 无延续快符 ;x：唯一命中仍直出（零回归）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key(';'));
+        let out = eng.process_key(&mut s3, key('x'));
+        assert_eq!(out.commit.as_deref(), Some("@"), ";x 无延续仍直出");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【Shift+字母·只组段生效 2026-10-09】Shift+符号页字母区（键形 A-Z）：
+    // 有候选时 Shift+字母=首选顶屏+自定义值；空态=正常大写（不映射）。
+    #[test]
+    fn shift_letter_mapping_compose_only() {
+        let (mut eng, dir) = test_engine("ssletter");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("A".into(), "×".into());
+        // 空态 Shift+A → 正常大写 A（不映射）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("A"), "空态 Shift+A=大写 A: {:?}", o.commit);
+        // 组段有候选（jd=就…）→ 顶首选就 + ×
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('j'));
+        eng.process_key(&mut s1, key('d'));
+        let o = eng.on_char(&mut s1, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("就×"), "有候选 Shift+A=首选+×: {:?}", o.commit);
+        assert!(s1.raw.is_empty(), "顶屏清缓冲");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【Shift+字母·双态开关 2026-10-10】「都生效」档（shift_letters_
+    // always 集合）：空态直出串、组段无候选也顶屏出串；默认档零回归
+    //（上测试覆盖）。用户规格：对话框二选一开关，记住选择。
+    #[test]
+    fn shift_letter_always_mode() {
+        let (mut eng, dir) = test_engine("ssletter2");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("A".into(), "×".into());
+        eng.config
+            .keymap
+            .shift_letters_always
+            .insert("A".into());
+        // 空态 Shift+A → 直出 ×（不再上屏大写 A）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("×"), "都生效档：空态直出串: {:?}", o.commit);
+        // 组段有候选 → 首选就 + ×
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('j'));
+        eng.process_key(&mut s1, key('d'));
+        let o = eng.on_char(&mut s1, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("就×"), "都生效档：有候选顶屏+串");
+        // 组段无候选（打了个空码再按）→ 也出串（顶空+×）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('z'));
+        eng.process_key(&mut s2, key('q'));
+        let o = eng.on_char(&mut s2, 'A', true);
+        assert_eq!(o.commit.as_deref(), Some("×"), "都生效档：无候选也出串: {:?}", o.commit);
+        // 大小写口径：集合存大写，查表用小写输入也命中（引擎内归一）
+        assert!(eng.shift_letter_always('a'), "小写查询归一命中");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【Alt+修改 下线 2026-10-17】alt_symbols_mapping 测试随功能删除。
 
     // 【反查退格 2026-09-06】进反查后（raw 空）按退格=退出反查而非漏键。
     #[test]
@@ -6112,6 +7533,72 @@ mod tests {
         (eng, dir)
     }
 
+    /// 【编码通配符 2026-10-11】等长匹配 + 注释位显示完整编码 + 自动
+    /// 上屏全豁免 + 字母表/反查键冲突=关闭。
+    #[test]
+    fn wildcard_search_semantics() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-wildcard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\ndwx\t大\ndax\t到\ndbx\t灯\ndyx\t点\ndx\t动\ndd\t等\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 默认关：\ 不进编码缓冲
+        assert!(!eng.wildcard_active(), "默认关闭");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('d'));
+        eng.process_key(&mut s, key('\\'));
+        assert!(!s.raw.contains('\\'), "关闭时 \\ 不入 raw");
+
+        // 开启（默认字符 \）
+        eng.config.input.wildcard_enabled = true;
+        assert!(eng.wildcard_active());
+
+        // d\x = 全部 3 码 d?x：大/到/灯/点（不含 2 码 动/等）
+        let mut s = Session::new(true);
+        for ch in ['d', '\\', 'x'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["大", "到", "灯", "点"], "等长匹配 d?x");
+        let cmts: Vec<&str> = s.candidates.iter().map(|c| c.comment.as_str()).collect();
+        assert_eq!(cmts, vec!["dwx", "dax", "dbx", "dyx"], "注释位=完整编码");
+
+        // d\ = 全部 2 码 d*：动/等（顺序=码表行序）
+        let mut s = Session::new(true);
+        for ch in ['d', '\\'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["动", "等"], "等长匹配 2 码 d?");
+        assert_eq!(s.candidates[0].code, "dx", "候选 code=真实编码（选重/学习用）");
+
+        // 唯一命中也不自动上屏（auto_select_unique 开）：搜索语义
+        eng.config.input.auto_select_unique = true;
+        let mut s = Session::new(true);
+        for ch in ['d', 'a', '\\'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert_eq!(s.candidates.len(), 1, "da? 唯一命中 到");
+        assert_eq!(s.candidates[0].text, "到");
+        assert!(s.raw == "da\\", "唯一命中不顶屏（缓冲保留）");
+
+        // 字母表字符=非法通配符（关闭处理）
+        eng.config.input.wildcard_char = 'a';
+        assert!(!eng.wildcard_active(), "字母表字符冲突=关闭");
+
+        // 反查引导键=非法通配符（默认 `，无论反查开关）
+        eng.config.input.wildcard_char = eng.config.reverse.prefix;
+        assert!(!eng.wildcard_active(), "反查引导键冲突=关闭");
+    }
+
     /// 【自定义按键·开关绑定 2026-10-07】s2t/emoji 键控翻转：按一下开、
     /// 再按还原；置 pending_config_save（host 出口落盘）。fixture 走
     /// manifest target（temp_dir 在部分环境拒绝访问——test_engine 同病）。
@@ -6149,6 +7636,160 @@ mod tests {
         assert!(!s.candidates.is_empty(), "不清组段——候选保留");
     }
 
+    /// 【Shift+未自定义字母=大写顶屏 2026-10-11】有候选时 Shift+字母
+    /// （无自定义串）→ 首选顶屏+大写字母随行；自定义「Shift+符号」
+    /// 串优先；无候选不走此臂（老链路不动）。fixture 走 manifest
+    /// target（temp_dir 环境病）。
+    #[test]
+    fn shift_letter_uppercase_top_commit() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-shift-upper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\n").unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sk = |c: char| {
+            let mut k = key(c);
+            k.modifiers.shift = true;
+            k
+        };
+        // 未自定义：jd 候选在场，Shift+D → 就D
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        assert!(!s.candidates.is_empty(), "候选在场");
+        let out = eng.process_key(&mut s, sk('d'));
+        assert_eq!(out.commit.as_deref(), Some("就D"), "未自定义字母=首选+大写");
+        assert!(s.raw.is_empty(), "顶屏后清屏");
+        // 自定义串优先：Shift+D → 就Xy
+        eng.config.keymap.shift_symbols.insert("d".into(), "Xy".into());
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let out2 = eng.process_key(&mut s2, sk('d'));
+        assert_eq!(out2.commit.as_deref(), Some("就Xy"), "自定义串优先");
+        // 无候选（打了死码 zq）：Shift+D 不走大写顶屏（引擎无上屏，
+        // 大写交给系统链路）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('z'));
+        eng.process_key(&mut s3, key('q'));
+        assert!(s3.candidates.is_empty(), "死码无候选");
+        let out3 = eng.process_key(&mut s3, sk('d'));
+        assert!(out3.commit.is_none(), "无候选不走大写顶屏臂");
+    }
+
+    /// 【R26 补全·整句翻页后页基准 2026-10-11】整句态翻页后数字/选重
+    /// =候选框当前页显示序直选（此前恒码表绝对名次——ae 翻页按 1 永远
+    /// 上第 1 页首选）；page=0 锁式老语义不动（既有测试覆盖）。fixture
+    /// 走 manifest target（temp_dir 环境病），整句构造法同
+    /// user_word_rank_select_commits。
+    #[test]
+    fn sentence_paged_rank_follows_display() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-整句page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // jd 5 词（abcdefghi 备用），page_size 调 3 → 2 页
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句测试\njd\t就\njd\t到的\njd\t加\njd\t新\njd\t行\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        cfg.candidates.page_size = 3;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "整句模式生效");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 显示序 = 解码合并排序 [就,加,新,行,锁1+jd,到的] = 6 项
+        assert_eq!(s.candidates.len(), 6, "6 候选（解码+码表5）2 页");
+        // page=0：数字 2 = 码表第 2 名「到的」锁式（raw=jd2 不上屏）——
+        // 老语义钉死
+        let mut s0 = Session::new(true);
+        eng.process_key(&mut s0, key('j'));
+        eng.process_key(&mut s0, key('d'));
+        let out0 = eng.process_key(&mut s0, key('2'));
+        assert!(out0.commit.is_none(), "page0 数字=锁式不上屏");
+        assert_eq!(s0.raw, "jd2", "page0 码表名次写锁");
+        // 翻到第 2 页（显示 [加,新,行]）：数字 1 = 加、2 = 新（显示序）
+        eng.process_key(&mut s, key('='));
+        assert_eq!(s.page, 1, "第 2 页就位");
+        // 显示序（解码合并排序）= [就,加,新,行,锁1+jd,到的]——第 2 页
+        // = [行,锁1+jd,到的]：数字 1=行、2=锁1+jd、越界按 4=死键
+        let out = eng.process_key(&mut s, key('1'));
+        assert_eq!(out.commit.as_deref(), Some("行"), "翻页后数字 1=当前页首项");
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        eng.process_key(&mut s2, key('='));
+        let out2 = eng.process_key(&mut s2, key('2'));
+        assert_eq!(out2.commit.as_deref(), Some("锁1+jd"), "翻页后数字 2=当前页次项");
+        // 页内越界（第 2 页 3 项按 4）=死键
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        eng.process_key(&mut s3, key('='));
+        let out3 = eng.process_key(&mut s3, key('4'));
+        assert!(out3.commit.is_none(), "页内越界=死键");
+        assert_eq!(s3.raw, "jd", "死键不动组段");
+        // 空格仍是当前页首项（既有行为）
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('j'));
+        eng.process_key(&mut s4, key('d'));
+        eng.process_key(&mut s4, key('='));
+        let out4 = eng.process_key(&mut s4, key(' '));
+        assert_eq!(out4.commit.as_deref(), Some("行"), "翻页后空格=当前页首项");
+        // 【顶字页基准 2026-10-11】整句态翻页后标点顶字同样=当前页首项
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('j'));
+        eng.process_key(&mut s5, key('d'));
+        eng.process_key(&mut s5, key('='));
+        let out5 = eng.process_key(&mut s5, key(','));
+        assert_eq!(out5.commit.as_deref(), Some("行，"), "整句翻页后标点顶字=当前页首项+标点");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【整句合并不截码表 2026-10-11 用户实锤】ae 码表一行 55 词，
+    /// merged.truncate(20) 连码表精确词条一并截——只剩 20。修后：
+    /// 解码产物（真词短语 ≤10 + 弱切分补位 ≤10）受限，码表全量保留。
+    #[test]
+    fn sentence_merge_keeps_full_dict() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-整句full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 25 个同码词条
+        let words = "就到的加新行星明今天日月水火山石田力人口手心言车马金衣";
+        let mut body = String::from("#hufu-dict v1 name=整句测试\n");
+        for w in words.chars() {
+            body.push_str(&format!("jd\t{w}\n"));
+        }
+        std::fs::write(dir.join("main.txt"), body).unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "整句模式生效");
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        assert!(
+            s.candidates.len() >= 25,
+            "码表 25 词全量在列（实际 {}，旧 truncate(20) 会截到 20）",
+            s.candidates.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 【切英文上屏编码 2026-10-07】commit_raw_on_en_switch（默认开）：
     /// 有编码时切英文（Shift 单击 / Caps Switch / Ctrl+空格 / keymap
     /// switch）→ 编码字母原样上屏；关 → 丢弃编码只切。英→中方向
@@ -6169,7 +7810,10 @@ mod tests {
             is_press: true,
         };
         assert!(eng.config.general.commit_raw_on_en_switch, "默认开");
-        assert!(matches!(eng.config.general.caps_action, hufu_config::CapsAction::Switch));
+        // 【2026-10-12】Caps 默认=锁定大写（CapsAction::Caps）；本测的
+        // Caps 路径走显式 Switch（切英语义的老开关仍有效）。
+        assert!(matches!(eng.config.general.caps_action, hufu_config::CapsAction::Caps));
+        eng.config.general.caps_action = hufu_config::CapsAction::Switch;
 
         // —— 开（默认）：四路径全上屏编码 ——
         let mut s = Session::new(true);
@@ -6498,7 +8142,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("码表.txt"),
-            "a 啊\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n/sj {时分} {时间}\n",
+            "a 啊\nkz 锁\nz3 {重复上屏}\n/jc {加词}\n/rq {日期} {日期-}\n/sj {时分} {时间}\n",
         )
         .unwrap();
         let mut eng = Engine::with_schema_dir(&dir, {
@@ -6610,6 +8254,128 @@ mod tests {
 
     // calc_command/word_making_encoder 随 \ 命令模式下线（2026-09-06）。
 
+    // 【中文态 Caps 锁大写 2026-10-12 用户令】caps_action=Caps：按一下
+    // 锁定大写（字母以大写英文直出、不进编码），再按一下解除回中文。
+    #[test]
+    fn caps_lock_toggle() {
+        let (mut eng, _dir) = test_engine("capsw");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        let mut s = Session::new(true);
+        // 第一按：进锁大写（consumed，无上屏）
+        let o0 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o0.consumed && o0.commit.is_none(), "第一按进锁大写");
+        assert!(s.caps_lock, "会话 caps_lock 置位");
+        // 锁大写期间：字母大写直出（不进编码）
+        let oa = eng.process_key(&mut s, key('a'));
+        assert_eq!(oa.commit.as_deref(), Some("A"), "锁大写字母直出大写");
+        assert!(s.raw.is_empty(), "不进编码");
+        let ob = eng.process_key(&mut s, key('b'));
+        assert_eq!(ob.commit.as_deref(), Some("B"), "连续字母都大写");
+        // 第二按：解除回中文
+        let o1 = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(o1.consumed, "第二按 consumed");
+        assert!(!s.caps_lock, "caps_lock 复位");
+        // 解除后：字母回正常编码路径
+        eng.process_key(&mut s, key('h'));
+        assert_eq!(s.raw, "h", "解除后字母进编码");
+        // 数字/标点不受锁大写影响：锁上后数字照旧直通记尾
+        let mut s2 = Session::new(true);
+        eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        let od = eng.process_key(&mut s2, key('1'));
+        assert!(od.commit.is_none() && !od.consumed, "锁大写数字照旧直通");
+    }
+
+    // 锁大写进入时有编码：commit_raw_on_en_switch 开（默认）→ 编码字母
+    // 上屏再锁（与 Shift 切英同口径）；关 → 丢弃。
+    #[test]
+    fn caps_lock_raw_flush() {
+        let (mut eng, _dir) = test_engine("capsr");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        eng.config.general.commit_raw_on_en_switch = true;
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('h'));
+        assert!(!s.raw.is_empty());
+        let o = eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(s.caps_lock, "置位");
+        assert!(o.commit.is_some(), "编码上屏（不丢字）: {:?}", o.commit);
+        assert!(s.raw.is_empty(), "raw 清空");
+        // 关开关：丢弃直接锁
+        eng.config.general.commit_raw_on_en_switch = false;
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('h'));
+        let o2 = eng.process_key(
+            &mut s2,
+            KeyInput {
+                key: KeyCode::CapsLock,
+                modifiers: Modifiers::default(),
+                is_press: true,
+            },
+        );
+        assert!(s2.caps_lock && o2.commit.is_none(), "丢弃直锁");
+    }
+
+    // 【快符 .zd 类 2026-10-12 BUG④】`.` 在方案编码字母表里（快符表
+    // .zd/.zj 等）：数字后按 `.` 仍走 pending-dot（第一下 . 第二下 。），
+    // 不被字母表分支吞成「.」引导快符。
+    #[test]
+    fn pending_dot_beats_alphabet_dot() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-pda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nh\t后\nma\t码\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        // 快符.yaml 同款：`.` 进编码字母表（引导快符码）
+        cfg.input.alphabet = format!(".{}", cfg.input.alphabet);
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+        // 数字后 `.` → pending（不落屏、不进快符编码）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('1'));
+        let o1 = eng.process_key(&mut s, key('.'));
+        assert!(o1.consumed && o1.commit.is_none(), "第一下 pending: {o1:?}");
+        assert_eq!(s.raw, ".", "组段是 pending 点（非 .zd 快符码）");
+        // 第二下 → 「。」
+        let o2 = eng.process_key(&mut s, key('.'));
+        assert_eq!(o2.commit.as_deref(), Some("。"), "第二下「。」: {:?}", o2.commit);
+        // 非数字尾：`.` 照旧进编码（引导语义不变）
+        let mut s2 = Session::new(true);
+        let o3 = eng.process_key(&mut s2, key('.'));
+        assert!(o3.consumed && o3.commit.is_none(), "空态 . 照旧进编码");
+        assert_eq!(s2.raw, ".", "空态 . 为编码首字符");
+    }
+
     #[test]
     fn pending_dot_after_digit() {
         // 【七十八修】数字后 . 延迟上屏：第一下组段显示（raw=".")，
@@ -6693,6 +8459,62 @@ mod tests {
     }
 
     #[test]
+    fn digit_then_word_push_full_stop() {
+        // 【数字后顶字句号 2026-10-15】「4天。」：数字直通后打字，句号
+        // 顶字上屏——判据看被顶词末字（天），不是旧尾巴里的数字（4）。
+        // 现场实锤「4天.」半角化。候选本身以 ASCII 数字结尾时仍半角
+        //（iPhone15. 与 1.5 同理：紧邻 . 的前一字符是数字）。
+        let dir = std::env::temp_dir().join(format!("hufu-eng-dwp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nma\t码\nsb\tiPhone15\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&schema, hufu_config::Config::default()).unwrap();
+
+        // 4 + 码候选 + . → 「码。」（全角，不咬数字尾巴）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('4'));
+        eng.process_key(&mut s, key('m'));
+        eng.process_key(&mut s, key('a'));
+        let o = eng.process_key(&mut s, key('.'));
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("码。"),
+            "数字后顶字句号=全角: {:?}",
+            o.commit
+        );
+        assert_eq!(o.back, 0, "无回删");
+
+        // 4 + sb 候选（末字符是数字 5）+ . → 「iPhone15.」（半角——
+        // 紧邻 . 的前一字符就是数字，1.5 同判据）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('4'));
+        eng.process_key(&mut s2, key('s'));
+        eng.process_key(&mut s2, key('b'));
+        let o2 = eng.process_key(&mut s2, key('.'));
+        assert_eq!(
+            o2.commit.as_deref(),
+            Some("iPhone15."),
+            "候选尾数字仍半角: {:?}",
+            o2.commit
+        );
+
+        // 对照：数字尾巴无候选 + . → pending-dot 原行为不变（上面
+        // pending_dot_after_digit 已覆盖，这里验证尾巴确为数字）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('7'));
+        let o3 = eng.process_key(&mut s3, key('.'));
+        assert!(o3.consumed && o3.commit.is_none(), "数字尾 pending 不回归");
+        assert_eq!(s3.raw, ".", "pending 组段");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn opencc_variants() {
         // fixture：ST 词组/单字 + emoji 表
         let dir = std::env::temp_dir().join(format!("hufu-eng-oc-{}", std::process::id()));
@@ -6724,16 +8546,481 @@ mod tests {
         let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
         assert!(texts.contains(&"後來".to_string()), "词组繁体: {texts:?}");
 
-        // emoji 变体
+        // emoji 变体【一候一个 2026-10-16】每个 emoji 独立候选，
+        // 不再「词+emoji 列表」挤一条
         eng.config.opencc.emoji = true;
         eng.opencc_loaded = false; // 重载表
+        eng.opencc_emoji_loaded = false;
         let mut s3 = Session::new(true);
         eng.process_key(&mut s3, key('h'));
         let snap = eng.state(&s3);
         let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
         assert!(texts.iter().any(|t| t.contains('👑')), "emoji 变体: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains('后') && t.contains('👑')),
+            "不再词+emoji 挤一条: {texts:?}"
+        );
+        assert_eq!(texts.iter().filter(|t| t.as_str() == "👑").count(), 1, "每 emoji 一条: {texts:?}");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【emoji 独立生效 2026-10-16 用户需求】单开 emoji 注解（不开
+    /// 「启用 OpenCC 转换」）也必须出 emoji 候选：两开关解耦，候选
+    /// 保持简体原样（1选「手机」），emoji 逐条追加（2选「📱」…）。
+    /// 表内重复 emoji 保留（用户口径：2选📱 3选📲 4选📱）。
+    #[test]
+    fn emoji_standalone_without_opencc_enabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-emo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        // useo=手机（用户「个人自用」码表场景）
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nuseo\t手机\n",
+        )
+        .unwrap();
+        // ST 表在场——若耦合未解干净，单开 emoji 也会误转繁体
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "机\t機\n").unwrap();
+        std::fs::write(
+            dir.join("转换词典").join("emoji.txt"),
+            "手机\t手机 📱 📲 📱\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = false; // 繁简转换关
+        cfg.opencc.emoji = true; // 只开 emoji
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+        let mut s = Session::new(true);
+        for c in "useo".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(
+            texts,
+            vec!["手机".to_string(), "📱".to_string(), "📲".to_string(), "📱".to_string()],
+            "1选简体原词 + 每个 emoji 一条（表内重复保留）: {texts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【功能词豁免 opencc 2026-11】繁体输出中（enabled+to_traditional），
+    /// 码表里的 {繁简} 功能词候选不得被简→繁转换：转换后 tag 变形
+    ///（{繁简}→{繁簡}）→ 提交解析 tag=="繁简" 判否 → 上屏字面 {繁簡}、
+    /// 开关再也切不回（用户实锤：{繁简} 放主码表，繁体态打编码失效）。
+    /// 夹具的 ST 表故意带 繁简→繁簡 映射——若豁缺，本测试必红。
+    #[test]
+    fn opencc_func_word_exempt() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-ocfw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nh\t后\nfj\t{繁简}\n",
+        )
+        .unwrap();
+        // ST 表带 繁简→繁簡：证明豁免是主动挡下，而非表里没有
+        std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "繁简\t繁簡\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 普通词照常转繁（既有行为不回归）
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('h'));
+        let snap = eng.state(&s);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(texts.contains(&"後".to_string()), "普通词繁体: {texts:?}");
+
+        // 功能词候选保持 {繁简} 原样（非 {繁簡}）——查 session 原始
+        // 候选（state() 视图已套 display_candidate 显示变换）
+        let mut f = Session::new(true);
+        eng.process_key(&mut f, key('f'));
+        eng.process_key(&mut f, key('j'));
+        let texts: Vec<String> = f.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.iter().any(|t| t == "{繁简}"),
+            "功能词豁免简繁转换: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "{繁簡}"),
+            "不得出现繁化功能词: {texts:?}"
+        );
+        // 显示层实时目标照常（豁缺时 tag 判否、显示退回 {繁簡} 字面）
+        let snap = eng.state(&f);
+        assert!(
+            snap.candidates.iter().any(|c| c.text == "⇄转简"),
+            "繁体态显示「⇄转简」: {:?}",
+            snap.candidates
+        );
+
+        // 繁体态提交 {繁简}：开关照样翻转（空提交，不上屏字面）
+        let before = eng.config.opencc.enabled;
+        let o = eng.process_key(&mut f, key(' '));
+        assert!(
+            eng.config.opencc.enabled != before,
+            "繁体态 {{繁简}} 提交翻转开关"
+        );
+        assert!(eng.pending_config_save, "翻转置落盘旗");
+        assert!(
+            o.commit.as_deref() != Some("{繁簡}") && o.commit.as_deref() != Some("{繁简}"),
+            "功能词空提交不上屏字面: {:?}",
+            o.commit
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【{emoji注解} 2026-10-17 用户需求】功能词与 {繁简} 同构全链：
+    /// ①提交翻转 opencc.emoji（空提交不上屏字面、置落盘旗）；
+    /// ②实时显示切换目标（关→「😊开注解」/开→「😊关注解」）；
+    /// ③功能词豁免：繁体态不得把 {emoji注解} 变形成 {emoji註解}
+    ///   （注→註，{繁简} 同款坑，花括号通用豁免覆盖）；
+    /// ④两开关并存不互扰：繁简转换开着时 emoji 注解候选照常出
+    ///   （「不要因为繁简转换而导致功能块失效」用户原话钉死）。
+    #[test]
+    fn emoji_annotation_func_word() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-emojifw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nbq\t{emoji注解}\nsj\t手机\n",
+        )
+        .unwrap();
+        // emoji 表：手机 → 📱 📲（一候一个）；ST 表带 注→註：证明豁免
+        // 是主动挡下，而非表里没有
+        std::fs::write(dir.join("转换词典").join("emoji.txt"), "手机\t手机 📱 📲\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "注\t註\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        cfg.opencc.emoji = false;
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // ①繁体态打 bq：候选保持 {emoji注解} 原样（非 {emoji註解}）
+        let mut f = Session::new(true);
+        eng.process_key(&mut f, key('b'));
+        eng.process_key(&mut f, key('q'));
+        let texts: Vec<String> = f.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.iter().any(|t| t == "{emoji注解}"),
+            "功能词豁免繁简转换: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "{emoji註解}"),
+            "不得出现繁化功能词: {texts:?}"
+        );
+        // ②实时显示切换目标：当前关 → 「😊开注解」
+        let snap = eng.state(&f);
+        assert!(
+            snap.candidates.iter().any(|c| c.text == "😊开注解"),
+            "关态显示「😊开注解」: {:?}",
+            snap.candidates
+        );
+        // ③繁体态提交：翻转 emoji 开关、空提交不上屏字面
+        let o = eng.process_key(&mut f, key(' '));
+        assert!(eng.config.opencc.emoji, "提交翻转 opencc.emoji");
+        assert!(eng.pending_config_save, "翻转置落盘旗");
+        assert!(
+            o.commit.as_deref() != Some("{emoji注解}")
+                && o.commit.as_deref() != Some("{emoji註解}"),
+            "功能词空提交不上屏字面: {:?}",
+            o.commit
+        );
+        // ④两开关并存：繁简转换仍开着 + emoji 已开 → 手机 照常出
+        //   emoji 变体候选（一候一个），且 {emoji注解} 还能再关回去
+        assert!(eng.config.opencc.enabled, "繁简开关未被牵连");
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('s'));
+        eng.process_key(&mut s2, key('j'));
+        let snap = eng.state(&s2);
+        let texts: Vec<&str> = snap.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"手机"), "原词在: {texts:?}");
+        assert!(texts.contains(&"📱") && texts.contains(&"📲"), "emoji 变体在: {texts:?}");
+        // 开态显示「😊关注解」；再提交翻回关
+        let mut f2 = Session::new(true);
+        eng.process_key(&mut f2, key('b'));
+        eng.process_key(&mut f2, key('q'));
+        let snap = eng.state(&f2);
+        assert!(
+            snap.candidates.iter().any(|c| c.text == "😊关注解"),
+            "开态显示「😊关注解」: {:?}",
+            snap.candidates
+        );
+        let _ = eng.process_key(&mut f2, key(' '));
+        assert!(!eng.config.opencc.emoji, "再打切回关");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【一简多繁 2026-10-17 用户需求】简体单字在繁体有多字形（发→
+    /// 髮/發）：繁体态单字候选必须**全变体显示**（表序成多条候选、都
+    /// 可选）；词组走词组表消歧（头发→頭髮、发财→發財，不串字）；
+    /// 单映射字（钱→錢）维持单条不变。
+    #[test]
+    fn s2t_single_char_multi_variants() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-s2tmv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        std::fs::write(
+            schema.join("main.txt"),
+            "#hufu-dict v1 name=t\nfa\t发\ntf\t头发\nfc\t发财\nqd\t钱\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("转换词典").join("STCharacters.txt"),
+            "发\t發 髮\n后\t後 后\n头\t頭\n财\t財\n钱\t錢\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("转换词典").join("STPhrases.txt"),
+            "头发\t頭髮\n发财\t發財\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 单字 fa：發、髮 都在候选里（表序：發 在前），简体发不再占位
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('f'));
+        eng.process_key(&mut s, key('a'));
+        let snap = eng.state(&s);
+        let texts: Vec<&str> = snap.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"發") && texts.contains(&"髮"), "全变体都在: {texts:?}");
+        assert!(texts.iter().position(|t| *t == "發") < texts.iter().position(|t| *t == "髮"),
+            "表序：發 在 髮 前: {texts:?}");
+        assert!(!texts.contains(&"发"), "简体原字不再出现: {texts:?}");
+
+        // 词组 tf/fc：词组表消歧，各一条、不串字
+        let mut w = Session::new(true);
+        eng.process_key(&mut w, key('t'));
+        eng.process_key(&mut w, key('f'));
+        let snap = eng.state(&w);
+        let texts: Vec<&str> = snap.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"頭髮"), "头发→頭髮: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.chars().count() == 1 && (*t == "發" || *t == "髮")),
+            "词组不混入单字变体: {texts:?}"
+        );
+        let mut w2 = Session::new(true);
+        eng.process_key(&mut w2, key('f'));
+        eng.process_key(&mut w2, key('c'));
+        let snap = eng.state(&w2);
+        assert!(
+            snap.candidates.iter().any(|c| c.text == "發財"),
+            "发财→發財: {:?}",
+            snap.candidates
+        );
+
+        // 单映射字 qd：錢单条（不展开、也不重复）
+        let mut q = Session::new(true);
+        eng.process_key(&mut q, key('q'));
+        eng.process_key(&mut q, key('d'));
+        let snap = eng.state(&q);
+        let n = snap.candidates.iter().filter(|c| c.text == "錢").count();
+        assert_eq!(n, 1, "单映射维持单条: {:?}", snap.candidates);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【功能词豁免 opencc·五笔 ; 引导域 2026-11】用户实锤：五笔码表
+    /// （QQ五笔 092K.dict.yaml，rime 词TAB码 格式）把 {繁简} 挂 ;tx，
+    /// 繁体态打 ;tx 依旧切不回——主码表修复（opencc_func_word_exempt）
+    /// 用的是 codeTABword 的 main.txt + 字母码；本测试复刻用户的
+    /// yaml 词表 + ; 引导码 + second_select=';' 形态，钉死 ; 域同样
+    /// 豁免 + 提交翻转。
+    #[test]
+    fn opencc_func_word_wubi_semicolon() {
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-ocwb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dir.join("schema");
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::create_dir_all(dir.join("转换词典")).unwrap();
+        // 复刻 092K.dict.yaml 头部与行格式（词 TAB 码 [TAB 权重]）
+        std::fs::write(
+            schema.join("092K.dict.yaml"),
+            "---\nname: export\nsort: by_weight\n...\n{繁简}\t;tx\n{重复上屏}\t;\t1000000\n；\t;;\t1000000\n好\tvb\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "繁简\t繁簡\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "好\t好\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.opencc.enabled = true;
+        cfg.opencc.to_traditional = true;
+        cfg.candidates.second_select = ';';
+        let mut eng = Engine::with_schema_dir(&schema, cfg).unwrap();
+
+        // 判别探针：普通码 vb=好（yaml 表是否加载成功）
+        let mut p = Session::new(true);
+        eng.process_key(&mut p, key('v'));
+        eng.process_key(&mut p, key('b'));
+        let pv: Vec<String> = p.candidates.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            pv.contains(&"好".to_string()),
+            "yaml 词表加载判别: vb 候选={pv:?}（空=yaml 未被装载）"
+        );
+        // 判别探针2：; 单键是否进引导态
+        let mut q = Session::new(true);
+        eng.process_key(&mut q, key(';'));
+        assert_ne!(
+            q.raw, "",
+            "; 未进组段（引导未触发）；q.candidates={:?}",
+            q.candidates
+        );
+
+        // ;tx → ; 域唯一候选「至少两码」自动顶屏（auto_select_pattern
+        // ^;\w+）：{繁简} 不落候选窗、末键 x 直接自动提交——断言结局：
+        // 开关翻转 + 空提交（不上屏字面 {繁簡}/{繁简}）。
+        let mut f = Session::new(true);
+        let mut commits: Vec<String> = Vec::new();
+        for k in [';', 't', 'x'] {
+            let o = eng.process_key(&mut f, key(k));
+            if let Some(c) = o.commit {
+                commits.push(c);
+            }
+        }
+        let texts: Vec<String> = f.candidates.iter().map(|c| c.text.clone()).collect();
+        let literal: Vec<&String> = commits.iter().filter(|c| !c.is_empty()).collect();
+        assert!(
+            literal.is_empty(),
+            "; 域 {{繁简}} 空提交不上屏字面: commits={commits:?} raw={:?} cands={texts:?}",
+            f.raw
+        );
+        assert!(
+            eng.config.opencc.enabled != true,
+            "; 域 {{繁简}} 自动顶屏后开关须翻转（繁→简）: enabled={} commits={commits:?}",
+            eng.config.opencc.enabled
+        );
+        assert!(eng.pending_config_save, "翻转置落盘旗");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【按住键可录 2026-11】配置向后兼容 + state 透传：
+    /// 旧 config.json（无 freq_key/delete_key/export_key 字段）解析 =
+    /// 默认组合（ctrl / ctrl+shift=原和弦行为 / 空=关），零行为变化；
+    /// 自定义值原样透传给 DLL（组合匹配在 DLL）。
+    #[test]
+    fn holdkey_config_compat_and_mirror() {
+        let sec: hufu_config::CandidatesSection = serde_json::from_str("{}").unwrap();
+        assert_eq!(sec.freq_key, "ctrl");
+        assert_eq!(sec.delete_key, "ctrl+shift");
+        let gen: hufu_config::GeneralSection = serde_json::from_str("{}").unwrap();
+        assert_eq!(gen.export_key, "");
+        let sec: hufu_config::CandidatesSection = serde_json::from_str(
+            r#"{"freq_key":"capslock","delete_key":"alt"}"#,
+        )
+        .unwrap();
+        assert_eq!(sec.freq_key, "capslock");
+        assert_eq!(sec.delete_key, "alt");
+        // state() 透传（引擎不解析，值原样给 DLL）
+        let (e, dir) = test_engine("holdkey-mirror");
+        let st = e.state(&Session::new(true));
+        assert_eq!(st.freq_key, "ctrl");
+        assert_eq!(st.delete_key, "ctrl+shift");
+        assert_eq!(st.export_key, "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【生产复现 2026-11】直接用 D:\HUFU 部署目录（五笔 092K.dict.yaml
+    /// + 全量转换词典）跑 ;tx：用户实测 04:04-04:08 四次
+    /// commit="{繁簡}"（字面繁体上屏、开关不翻转）。本测试只读生产
+    /// 数据，定位真实转换点；目录不存在则跳过（CI 无 D 盘）。
+    #[test]
+    fn opencc_func_word_prod_repro() {
+        let data = Path::new("D:\\HUFU\\HuFu虎符输入法-v1.8.0-无模型\\数据");
+        let cfg_path = data.join("config.json");
+        if !cfg_path.exists() {
+            eprintln!("skip: 生产目录不存在");
+            return;
+        }
+        let mut cfg = hufu_config::Config::load(&cfg_path).unwrap();
+        cfg.schema.current = "五笔".to_string();
+        // 简体态启动（复刻 live server 04:02:36 启动态）
+        let mut eng = Engine::new(data, cfg).unwrap();
+
+        // 【惰性加载时序复刻】live server 04:02:36 以 opencc=false 启动，
+        // 04:0x 用户第一次 ;tx 才翻转 ON（惰性加载转换表）→ 第二次 ;tx
+        // 失败。本地此前测试启动即 enabled=true——时序不同。复刻：
+        let mut f0 = Session::new(true);
+        for k in [';', 't', 'x'] {
+            eng.process_key(&mut f0, key(k));
+        }
+        assert!(
+            eng.config.opencc.enabled,
+            "第一次 ;tx 须翻转为繁体态（live 实测 ✓）"
+        );
+        // 繁体态第二次 ;tx（live 在此吐出字面 {繁簡}）
+        let mut f = Session::new(true);
+        let mut commits: Vec<String> = Vec::new();
+        for k in [';', 't', 'x'] {
+            let o = eng.process_key(&mut f, key(k));
+            if let Some(c) = o.commit {
+                commits.push(c);
+            }
+        }
+        eprintln!("prod-repro commits={commits:?} raw={:?} cands={:?}", f.raw,
+            f.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
+        let literal: Vec<&String> = commits.iter().filter(|c| !c.is_empty()).collect();
+        assert!(
+            literal.is_empty(),
+            "生产复现：{{繁简}} 不得上屏字面: commits={commits:?}"
+        );
+        assert!(
+            !eng.config.opencc.enabled,
+            "生产复现：开关须翻转为关: enabled={}",
+            eng.config.opencc.enabled
+        );
     }
 
     /// 【功能词标点顶字 2026-11】z1={重复上屏} 的方案，打 z 再按标点 =
@@ -6754,7 +9041,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("main.txt"),
-            "#hufu-dict v1 name=t\na\t啊\nz\t{重复上屏}\nzh2\t{重复上屏2}\nzh3\t{重复上屏3}\nch\t{撤回}\n",
+            // 【kz 行 2026-11】码内含 z → z 域判否——本测试关注功能词语义
+            //（非 z 域直出），夹具保持「z 码不满码长不上屏」的旧节奏。
+            "#hufu-dict v1 name=t\na\t啊\nkz\t锁\nz\t{重复上屏}\nzh2\t{重复上屏2}\nzh3\t{重复上屏3}\nch\t{撤回}\n",
         )
         .unwrap();
         std::fs::write(dir.join("反查.txt"), "测\tce\n").unwrap();
@@ -6880,15 +9169,18 @@ mod tests {
         assert_eq!(o.back, "次键前文".chars().count() as u8, "次选越界标顶 back=前条");
         assert!(!o.commit.as_deref().unwrap_or("").contains("{撤回}"), "次选键不得字面上屏");
 
-        // —— 路径3：翻页键 -/= 不可翻顶字 ——
+        // —— 路径3：翻页键 -/=（2026-11 用户改判：纯翻页不再顶字）——
+        // wd 唯一候选一页装满，按 = 不再回删+上屏（旧顶字路径已删），
+        // 编码原样保持——撤回口径不涉及。
         eng.push_commit_history("翻页前文");
         let mut s3 = Session::new(true);
         for c in "wd".chars() {
             eng.process_key(&mut s3, key(c));
         }
         let o = eng.process_key(&mut s3, key('='));
-        assert_eq!(o.commit.as_deref(), Some("="), "wd+= = 回删+=");
-        assert_eq!(o.back, "翻页前文".chars().count() as u8, "翻页键顶字 back=前条");
+        assert!(o.commit.is_none(), "wd+= 不再顶字（纯翻页规格）");
+        assert_eq!(o.back, 0, "不顶字即无回删");
+        assert_eq!(s3.raw, "wd", "编码保持");
 
         // —— 路径4：` 顶屏 ——
         eng.push_commit_history("反查前文");
@@ -6953,7 +9245,7 @@ mod tests {
         let o = eng.process_key(&mut s2, key('`'));
         assert!(o.consumed && o.commit.is_none(), "` 进编码组段");
         assert_eq!(s2.raw, "`", "raw=`");
-        let o = eng.process_key(&mut s2, key('a'));
+        let _o = eng.process_key(&mut s2, key('a'));
         let st = eng.state(&s2);
         assert!(
             st.candidates.iter().any(|c| c.text == "特殊字"),
@@ -7014,7 +9306,7 @@ mod tests {
         // 副表已装载（独立域，主表不在场也行）
         assert!(!eng.schema.super_dict.is_empty(), "超集副表已装载");
         // 内容识别判据：副表**只**含 ` 前缀码——「我的超集.txt」名字
-        /// 命中超集字样但内容普通，不得混入 super_dict（zz/zy 无 ` 前缀）
+        // 命中超集字样但内容普通，不得混入 super_dict（zz/zy 无 ` 前缀）
         assert!(
             eng.schema.super_dict.entries.iter().all(|e| e.code.starts_with('`')),
             "副表只收 ` 前缀码（名字含超集的普通表不混入）: {:?}",
@@ -7176,6 +9468,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 【Shift+符号自定义 & 占位符变号 2026-10-09】
+    /// 1) keymap.shift_symbols 覆盖内置映射：Shift+7 空态直出「×」、
+    ///    编码态=首选「啊」+「×」；未自定义键（Shift+1）维持内置「！」。
+    /// 2) 调频后带圈占位词跟号：jd 码 [就,到的,加]，占位 ③@p3 →
+    ///    [就,到的,③,加]；「加」定到第 3 位 → ③ 落第 4 位自动变 ④。
+    #[test]
+    fn shift_symbol_custom_and_placeholder_renumber() {
+        let (mut eng, dir) = test_engine("ss_ph");
+        eng.config
+            .keymap
+            .shift_symbols
+            .insert("7".into(), "×".into());
+        // 空态 Shift+7 → ×（覆盖内置 & → ＆…实际内置走标点表）
+        let mut s0 = Session::new(true);
+        let o = eng.on_char(&mut s0, '7', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("×"),
+            "空态自定义 Shift+7 直出×: {:?}",
+            o.commit
+        );
+        // 编码态：a → 候选「啊」，Shift+7 → 「啊×」
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key('a'));
+        let o = eng.on_char(&mut s1, '7', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("啊×"),
+            "编码态=首选+自定义串: {:?}",
+            o.commit
+        );
+        // 未自定义：Shift+1 空态仍「！」
+        let mut s2 = Session::new(true);
+        let o = eng.on_char(&mut s2, '1', true);
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("！"),
+            "未自定义键维持内置: {:?}",
+            o.commit
+        );
+
+        // 占位符变号
+        eng.adjust_place("jd", "③", 3);
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "③", "加"], "占位后: {texts:?}");
+        // 「加」定到第 3 位 → ③ 被挤到第 4 位应变 ④
+        let _ = eng.op_place_candidate_abs(&mut s, 3, 3);
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "加", "④"], "调频后 ③→④: {texts:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【占位符变号·显示同步 2026-10-09】右键移位（纯位次重排）路径：
+    /// op_move+adjust_set_order 落盘已改号，但会话候选文本不动（防
+    /// 尾巴态翻转不重建）——sync_placeholder_texts 只改文本，raw/页/
+    /// 选全不动，DLL 立即看到 ④（用户实锤：不同步=要重开候选才变号）。
+    #[test]
+    fn placeholder_renumber_sync_display() {
+        let (mut eng, dir) = test_engine("ss_sync");
+        eng.adjust_place("jd", "③", 3);
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        // 右键「向前移一位」等价：③(idx2) 与 加(idx3) 互换 → 加到 3 位
+        let _ = eng.op_move_candidate_abs(&mut s, 3, 2);
+        eng.adjust_set_order(&s, "jd");
+        // 会话文本此刻仍是 ③（落盘词表已是 ④）——同步后立即变
+        let before: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(before, vec!["就", "到的", "加", "③"], "同步前显示仍旧号");
+        let n = eng.sync_placeholder_texts(&mut s);
+        assert_eq!(n, 1, "改了一条");
+        let after: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(after, vec!["就", "到的", "加", "④"], "同步后立即显示 ④");
+        // raw/页不动的保证：仍处于组段态
+        assert_eq!(s.raw, "jd", "不重建：raw 保留");
+        // 回放口径：重查也应是 ④（调整层由 set_order 改好）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let texts: Vec<&str> = s2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["就", "到的", "加", "④"], "重开候选同为 ④: {texts:?}");
+        // 【占位符位加词=替换 2026-10-09】加词助手的探测口径：占位位返
+        // 回词文本、非占位位 None（server 据此先写 {删除} 再 {添加}pN）
+        assert_eq!(eng.placeholder_at_pos("jd", 4).as_deref(), Some("④"));
+        assert_eq!(eng.placeholder_at_pos("jd", 1), None, "非占位位不加删行");
+        assert_eq!(eng.placeholder_at_pos("jd", 99), None, "越界位不加删行");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 整句方案码表域短码「前4000单字置顶」（二十三修 2026-10-09 用户
     /// 拍板）：独立段（无锁、raw≤4、无提前上屏前缀）时，表内单字整体
     /// 置顶（stable——同码单字组保码表原序），词/表外生僻保原序排后；
@@ -7321,10 +9705,176 @@ mod tests {
         assert_eq!(s5.mode, InputMode::Reverse, "反查可用时空态 ` 仍进反查");
     }
 
+    // 【空码清屏·符号数字同治 2026-10-09 用户定稿】fdqw 空码态按
+    // 数字/符号 = 连带空码一起清空、该键本身吞掉（不上屏不透传）；
+    // 编码字符照旧清屏重打（对照组）；开关关维持老行为。
+    #[test]
+    fn dead_code_symbol_digit_clear() {
+        let (mut eng, _dir) = test_engine("dead-sym");
+        eng.config.input.auto_clear_empty = true;
+
+        // fdqw 空码（fixture 无 f 起始编码，不满 max 保留在缓冲）
+        let mut s = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s, key(ch));
+        }
+        assert_eq!(s.raw, "fdqw");
+        assert!(s.candidates.is_empty(), "fdqw 是空码");
+
+        // 数字：清空码 + 吞键（不上屏不透传）
+        let out2 = eng.process_key(&mut s, key('2'));
+        assert_eq!(out2.commit, None, "数字不上屏");
+        assert!(out2.consumed, "数字被吞（不透传给应用）");
+        assert!(s.raw.is_empty(), "空码被连带清掉");
+
+        // 符号：同样清空码 + 吞键（用户定稿：符号不要上屏）
+        let mut s3 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s3, key(ch));
+        }
+        let out3 = eng.process_key(&mut s3, key(','));
+        assert_eq!(out3.commit, None, "符号不上屏");
+        assert!(out3.consumed, "符号被吞");
+        assert!(s3.raw.is_empty());
+
+        // 对照：编码字符照旧清屏重打、新键为新起点
+        let mut s4 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng.process_key(&mut s4, key(ch));
+        }
+        eng.process_key(&mut s4, key('a'));
+        assert_eq!(s4.raw, "a", "第 5 键为新起点（原 auto_clear 行为）");
+        assert!(!s4.candidates.is_empty(), "a 有候选（啊）");
+
+        // 开关关：空码态数字维持老行为（吞键、缓冲不动）——不越权
+        let (mut eng2, _dir2) = test_engine("dead-sym-off");
+        eng2.config.input.auto_clear_empty = false;
+        let mut s5 = Session::new(true);
+        for ch in "fdqw".chars() {
+            eng2.process_key(&mut s5, key(ch));
+        }
+        let out5 = eng2.process_key(&mut s5, key('2'));
+        assert_eq!(out5.commit, None);
+        assert_eq!(s5.raw, "fdqw", "开关关：空码缓冲不动（用户自管）");
+    }
+
+    // 【整句豁免三开关 2026-10-09 用户拍板】超最大码长自动上屏/满最大
+    // 码长唯一自动上屏/空码自动清屏（含空码态符号数字同治分支）都只
+    // 对非整句生效——整句流里三个自动化打断组句。对照断言：非整句同
+    // 数据下三个行为照常。
+    #[test]
+    fn sentence_exempts_three_auto_switches() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-整句三豁免-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=整句三豁免\naaaa\t唯\n",
+        )
+        .unwrap();
+
+        // 整句引擎（MockDec 有命中——真实整句流常态）
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        cfg.input.auto_push = true;
+        cfg.input.auto_select_unique = true;
+        cfg.input.auto_clear_empty = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(Arc::new(MockDec)));
+        assert!(eng.sentence_active(), "方案名带整句+auto_enable");
+
+        // ① 满码唯一：aaaa 第 4 键不上屏，缓冲保留
+        let mut s = Session::new(true);
+        let mut last = None;
+        for c in ['a', 'a', 'a', 'a'] {
+            last = Some(eng.process_key(&mut s, key(c)));
+        }
+        let out4 = last.unwrap();
+        assert_eq!(out4.commit, None, "整句：满码唯一不上屏");
+        assert_eq!(s.raw, "aaaa", "整句：缓冲保留");
+
+        // ② 超长顶屏：第 5 键（死路 z）不顶屏不清屏，raw 原样保留
+        //（非整句同数据会 commit 唯 + raw=z 新起点——见对照组）
+        let out5 = eng.process_key(&mut s, key('z'));
+        assert_eq!(out5.commit, None, "整句：超长不顶屏");
+        assert_eq!(s.raw, "aaaaz", "整句：缓冲保留（不清屏不重起）");
+
+        // ③ 空码清屏（含符号数字同治）：MockDecEmpty 才能造整句空码
+        let mut eng2 = Engine::with_schema_dir(&dir, {
+            let mut c = hufu_config::Config::default();
+            c.sentence.enabled = true;
+            c.sentence.auto_enable = true;
+            c.input.auto_clear_empty = true;
+            c
+        })
+        .unwrap();
+        eng2.set_sentence_decoder(Some(Arc::new(MockDecEmpty)));
+        let mut s2 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng2.process_key(&mut s2, key(c));
+        }
+        assert_eq!(s2.raw, "fdqw");
+        assert!(s2.candidates.is_empty(), "整句空码（解码器无命中）");
+        let outd = eng2.process_key(&mut s2, key('2'));
+        assert_eq!(outd.commit, None);
+        // 数字在整句流走选重锁语义（追加为锁后缀，pre-existing）——
+        // 豁免的断言点是空码没被 auto_clear_empty 清掉（fdqw 前缀保留）。
+        assert!(
+            s2.raw.starts_with("fdqw"),
+            "整句：空码不被数字连带清掉（raw={}）",
+            s2.raw
+        );
+        let mut s3 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng2.process_key(&mut s3, key(c));
+        }
+        let outs = eng2.process_key(&mut s3, key(','));
+        // 符号走标点顶字空码分支（清屏+全角上屏）——该路径非三开关
+        // 管辖，整句下保持原行为。
+        assert_eq!(outs.commit.as_deref(), Some("，"));
+        assert!(s3.raw.is_empty(), "标点顶字空码分支不受豁免影响");
+
+        // 对照组（非整句）：三行为全部照常
+        let mut eng3 = Engine::with_schema_dir(&dir, {
+            let mut c = hufu_config::Config::default();
+            c.input.auto_push = true;
+            c.input.auto_select_unique = true;
+            c.input.auto_clear_empty = true;
+            c
+        })
+        .unwrap();
+        assert!(!eng3.sentence_active());
+        // 满码唯一
+        let mut c1 = Session::new(true);
+        for c in ['a', 'a', 'a', 'a'] {
+            eng3.process_key(&mut c1, key(c));
+        }
+        assert_eq!(c1.raw, "", "非整句：满码唯一上屏后清缓冲");
+        // 超长顶屏（关掉满码唯一单看顶屏）
+        eng3.config.input.auto_select_unique = false;
+        let mut c2 = Session::new(true);
+        for c in ['a', 'a', 'a', 'a', 'z'] {
+            eng3.process_key(&mut c2, key(c));
+        }
+        assert_eq!(c2.raw, "z", "非整句：超长顶屏=前码上屏+新键新起点");
+        // 空码数字同治
+        let mut c3 = Session::new(true);
+        for c in ['f', 'd', 'q', 'w'] {
+            eng3.process_key(&mut c3, key(c));
+        }
+        eng3.process_key(&mut c3, key('2'));
+        assert!(c3.raw.is_empty(), "非整句：空码被数字连带清掉");
+    }
+
     // 【；候选开关 2026-10-03】用户规格：「按『；』键给一个候选，1选：
     // 2选；」默认开；关闭后「按一下直出『；』并能顶屏」+同日修正「就算
     // 不开也不能影响选重」——有候选时 ; 照常当选重键（次选），无候选
     // 才直出/顶屏。候选档行为（: / ;; / ;xx 快符）由既有测试保障。
+    // 【夹具调整 2026-10-09】原夹具把 ;j 写进 main.txt——按「码表 ;
+    // 码优先」新口径那属于码表明写 ; 码（无条件引导），纯标点档夹具
+    // 改为 ; 编码只存在于 快符.txt（快符-only 方案，开关关=直出；老
+    // 语义不变）。码表 ; 码行为见 semicolon_dict_codes。
     #[test]
     fn semicolon_punct_mode() {
         let dir = std::env::temp_dir().join(format!("hufu-eng-semi-{}", std::process::id()));
@@ -7332,9 +9882,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("main.txt"),
-            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n;j\t；快符\n",
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\njd\t到的\n",
         )
         .unwrap();
+        std::fs::write(dir.join("快符.txt"), "；快符\t;j\n").unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.input.semicolon_guide = false; // 纯标点档
         let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
@@ -7384,6 +9935,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // 【码表 ; 码优先 2026-10-09】用户把 {重复上屏}/{撤回} 写进码表 ;
+    // 码（QQ五笔 092K.dict.yaml，词 TAB 码两列；此处原生 code TAB word
+    // 同构）：**码表明写 ; 码=用户显式意图，无条件引导**——开关关也
+    // 生效（用户实锤「关了引导还不生效」）；词条排最前，开关开时内置
+    // ：/； 追加其后，;;=；直上。
+    #[test]
+    fn semicolon_dict_codes() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-semidict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\na\t啊\njd\t就\n;\t{重复上屏}\n;\t{撤回}\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.input.semicolon_guide = false; // 用户当前状态：开关关
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // 垫底：{重复上屏}/{撤回} 的显示与解析都依赖上屏历史——真机由
+        // host 收口 push_commit_history（DLL 提交后 server 调用），测试
+        // 直接调同款方法垫一条。
+        eng.push_commit_history("啊");
+
+        // 空态按 ; → 引导态（不再直出；），候选=码表词条、无 ：/；
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key(';'));
+        assert_eq!(s.raw, ";", "码表有 ; 码：开关关也进引导态");
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["{重复上屏}", "{撤回}"],
+            "开关关：纯码表词条，无内置 ：/；"
+        );
+        let st = eng.state(&s);
+        let shown: Vec<&str> = st.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(shown, vec!["啊", "↩撤回"], "显示层：重复上屏显上次内容/撤回显提示");
+
+        // 空格 → 首选 {重复上屏} 解析为上次上屏内容「啊」
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.as_deref(), Some("啊"), "空格提交 {{重复上屏}}=上次内容");
+        assert!(s.raw.is_empty(), "提交后缓冲清空");
+
+        // ;; → ; 是默认次选：二选 {撤回}=回删上次内容（用户实锤此路径
+        // 曾被 ;;直上 抢占）；历史只剩垫底「啊」→ back=1、无新文本。
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key(';'));
+        let out = eng.process_key(&mut s2, key(';'));
+        assert_eq!(out.commit.as_deref(), Some(""), ";;=二选{{撤回}}=空文本");
+        assert_eq!(out.back, 1, "{{撤回}} 回删 1 字（垫底的啊）");
+        assert!(s2.raw.is_empty());
+        // 撤回已消耗历史：再按 ; 窗口仍可引导，但 {重复上屏}/{撤回}
+        // 显示层无对象隐藏——行为归显示层，session 候选不变，此处不赘。
+
+        // 数字选重：1={重复上屏}=上次内容、2={撤回}=回删（用户实锤
+        // 曾被引导清理分支当非延续字符清屏重打）。
+        eng.push_commit_history("好");
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key(';'));
+        let out1 = eng.process_key(&mut s4, key('1'));
+        assert_eq!(out1.commit.as_deref(), Some("好"), "数字1 选 {{重复上屏}}");
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key(';'));
+        let out2 = eng.process_key(&mut s5, key('2'));
+        assert_eq!(out2.commit.as_deref(), Some(""), "数字2 选 {{撤回}}");
+        assert_eq!(out2.back, 1, "{{撤回}} 回删 1 字（好）");
+
+        // 开关开：码表词条在前，内置 ：/； 追加其后（断言在 session 层
+        //——显示层会把无历史功能词隐藏，与开关无关）
+        let mut cfg2 = hufu_config::Config::default();
+        cfg2.input.semicolon_guide = true;
+        let mut eng2 = Engine::with_schema_dir(&dir, cfg2).unwrap();
+        let mut s3 = Session::new(true);
+        eng2.process_key(&mut s3, key(';'));
+        let texts3: Vec<&str> = s3.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts3,
+            vec!["{重复上屏}", "{撤回}", "：", "；"],
+            "开关开：词条在前 ：/； 追加"
+        );
+
+        // 老语义不回退：码表无 ; 码 + 快符-only + 开关关 → 直出；
+        //（semicolon_punct_mode 改造后夹具已覆盖）
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 【全键盘按键映射 2026-11】config.keymap.map：功能↔任意按键
     ///（「有人用 caps 当 4 选」）。selectN 走 on_rank_key 全链路（含
     /// 越界标顶回退）、repeat/undo 复用历史栈、switch 切中英、
@@ -7394,11 +10032,10 @@ mod tests {
         eng.push_commit_history("重复我");
         eng.push_commit_history("再次");
 
-        // —— capslock → select4：jd 候选就/到的/加（page_size=4，第 4
-        //    越界 → on_rank_key 没选重就标顶回退=首选+无标点？不——
-        //    capslock 映射 select4 越界时 on_rank_key 数字回退，数字 4
-        //    非 punct-capable → select_candidate_ex 死键 consumed。
-        //    用 2 选验证正路径，4 越界验证死键不崩。）——
+        // —— capslock 绑选重：jd 候选就/到的/加（page_size=4）。先绑
+        //    select2 验证正路径；后绑 select4 越界走【数字越界顶屏
+        //    2026-10-16 用户拍板】：capslock 非字符键 → 原键=数字 4 →
+        //    「首选+4」顶屏（原为死键）。——
         eng.config.keymap.map.insert("capslock".into(), "select2".into());
         let mut s = Session::new(true);
         eng.process_key(&mut s, key('j'));
@@ -7416,9 +10053,43 @@ mod tests {
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
         assert!(o.commit.is_none(), "空态无映射 capslock 走内建（不吞映射路径）");
+        // 【空态解析链判定 2026-10-12 三次】三种配置形态：
+        // 跟随（map_idle 缺键回落 map 的 select）=空态静默；
+        // 清除（map_idle 空串短路回落链）=空态走默认（Caps 锁大写）；
+        // 显式绑 map_idle=select2 同跟随（静默）。
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
+        // —— 形态一：跟随（map=select2、map_idle 无键）——
+        eng.config.keymap.map.insert("capslock".into(), "select2".into());
+        let mut s_follow = Session::new(true);
+        let o = eng.process_key(
+            &mut s_follow,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && o.commit.is_none(), "跟随：空态静默消费");
+        assert!(!s_follow.caps_lock, "跟随：绝不进锁大写");
+        // —— 形态二：清除（map_idle 空串短路）——
+        eng.config.keymap.map_idle.insert("capslock".into(), String::new());
+        let mut s_cleared = Session::new(true);
+        let o = eng.process_key(
+            &mut s_cleared,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && s_cleared.caps_lock, "清除=空串：空态照走默认锁大写");
+        eng.config.keymap.map_idle.insert("capslock".into(), "select2".into());
+        let mut s_idle_bound = Session::new(true);
+        let o = eng.process_key(
+            &mut s_idle_bound,
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(o.consumed && o.commit.is_none(), "显式空态绑定：静默消费");
+        assert!(!s_idle_bound.caps_lock, "显式空态绑定绝不进锁大写");
+        eng.config.keymap.map_idle.remove("capslock");
+        eng.config.keymap.map.remove("capslock");
+        eng.config.general.caps_action = hufu_config::CapsAction::Caps;
 
-        // —— select4 越界（仅 3 候选）：select_candidate_ex 死键 consumed，
-        //    不崩不字面上屏 ——
+        // —— select4 越界（仅 3 候选）：【数字越界顶屏 2026-10-16 用户
+        //    拍板·第五条补充】数字类越界不再死键——capslock 非字符键，
+        //    原键=数字 4，「首选+4」上屏 ——
         eng.config.keymap.map.insert("capslock".into(), "select4".into());
         let mut s2 = Session::new(true);
         eng.process_key(&mut s2, key('j'));
@@ -7427,8 +10098,9 @@ mod tests {
             &mut s2,
             KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
         );
-        assert!(o.consumed, "select4 越界死键（consumed）");
-        assert!(o.commit.is_none(), "越界不上屏");
+        assert_eq!(o.commit.as_deref(), Some("就4"), "select4 越界=首选+4 顶屏");
+        assert!(o.consumed, "select4 越界顶屏 consumed");
+        assert!(s2.raw.is_empty(), "越界顶屏后组段清空");
 
         // —— [ → text:？ 直上屏（打 [ 出 ？）——
         eng.config.keymap.map.insert("[".into(), "text:？".into());
@@ -7558,7 +10230,7 @@ mod tests {
         assert_eq!(o.commit.as_deref(), Some("】"), "] 只在空态直出】");
         let mut s11c = Session::new(true);
         eng.process_key(&mut s11c, key('a'));
-        let o = eng.process_key(&mut s11c, key(']'));
+        let _o = eng.process_key(&mut s11c, key(']'));
         // ] 默认路径 = 编码态标点顶字「啊】」（全角映射）——与 map_idle
         // 无关；断言语义：编码态确实没把 ] 当直出映射（值同但路径异，
         // 用 map_idle 专属值区分：改用「】」只出现在空态断言）。
@@ -7688,5 +10360,265 @@ mod tests {
         assert!(!s21.chinese, "小键盘回车切英文");
         eng.config.keymap.map.remove("numenter");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【选重越界标顶·原键 2026-10-16 第五条用户拍板】/ 绑「4选」+
+    /// /=顿号直出：候选不足 4 → 按出「首选+、」（原键 / 的标点语义，
+    /// 不是「首选+4」）；真实数字键越界 → 「首选+该数字」；空态 / →
+    /// 内建顿号档直出「、」；slash_dunhao 关时越界回退「首选+/」
+    ///（punct 表 / 自映，不再是死键）。对照组：数字 2 在界内照常选重。
+    #[test]
+    fn keymap_select_overrun_orig_key_commit() {
+        let (mut eng, dir) = test_engine("ovr");
+        eng.config.input.slash_dunhao = true;
+        eng.config.keymap.map.insert("/".into(), "select4".into());
+
+        // 对照：数字 2 在界内 → 正常选重（到的）
+        let mut s0 = Session::new(true);
+        eng.process_key(&mut s0, key('j'));
+        eng.process_key(&mut s0, key('d'));
+        let o0 = eng.process_key(&mut s0, key('2'));
+        assert_eq!(o0.commit.as_deref(), Some("到的"), "界内数字照常选重");
+
+        // / 绑 4 选，jd=[就,到的,加] 仅 3 候选 → 越界标顶原键：就+、
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('j'));
+        eng.process_key(&mut s, key('d'));
+        let o = eng.process_key(&mut s, key('/'));
+        assert_eq!(
+            o.commit.as_deref(),
+            Some("就、"),
+            "select4 越界=首选+、（原键标点）"
+        );
+        assert!(s.raw.is_empty(), "标顶后组段清空");
+
+        // 真实数字键 4 越界 → 就4（词+数字流不断）
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        let o2 = eng.process_key(&mut s2, key('4'));
+        assert_eq!(o2.commit.as_deref(), Some("就4"), "数字越界=首选+数字");
+
+        // 空态 / → 内建顿号档直出 、（select4 空态无意义回落）
+        let mut s3 = Session::new(true);
+        let o3 = eng.process_key(&mut s3, key('/'));
+        assert_eq!(o3.commit.as_deref(), Some("、"), "空态 /=顿号直出");
+
+        // slash_dunhao 关：越界 → 首选+/（半角自映，同样不是死键）
+        eng.config.input.slash_dunhao = false;
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('j'));
+        eng.process_key(&mut s4, key('d'));
+        let o4 = eng.process_key(&mut s4, key('/'));
+        assert_eq!(
+            o4.commit.as_deref(),
+            Some("就/"),
+            "slash_dunhao 关：越界=首选+/（punct 自映）"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【z 键 4 选两景 2026-10-18 用户需求】狂练方案 z={重复上屏}/{撤回}：
+    /// ①引导域快符保护——z 绑 4 选后 ; 引导态按 z 仍打得出 ;z=·（引导域
+    /// 编码延续优先于 selectN，与内建选重键「编码延续优先」同哲学）；
+    /// ②越界转码——码表词候选不足 4 个时按 z=顶屏首选+z 重开编码段
+    ///（候选窗即出 {重复上屏}/{撤回}——「按 z 的同时顶屏并显示是要
+    /// 重复上屏还是撤回」），接选 {撤回} 走回删；
+    /// ③非码字母越界维持死键（防误触口径不放开）；
+    /// ④界内照常第 4 选；
+    /// ⑤z 符号域内再按 z=越界转码（顶 {重复上屏} 展开+z 菜单再来）。
+    #[test]
+    fn keymap_select_z_overrun_refeed_and_guide() {
+        // temp_dir 在本机拒绝访问（test_engine 同病）——走 manifest target。
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-zovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\nab\t一\nab\t二\nab\t三\nab\t四\nz\t{重复上屏}\nz\t{撤回}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("快符.txt"), "·\t;z\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.keymap.map.insert("z".into(), "select4".into());
+        cfg.keymap.map.insert("q".into(), "select4".into());
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // ① ;z=· 快符不被 select4 截走
+        let mut s1 = Session::new(true);
+        eng.process_key(&mut s1, key(';'));
+        assert_eq!(s1.raw, ";", "; 进引导态");
+        let o1 = eng.process_key(&mut s1, key('z'));
+        assert_eq!(o1.commit.as_deref(), Some("·"), "引导域 ;z=· 照常直出");
+
+        // ② jd=[就,到的,加] 仅 3 候选 → z 越界=顶屏「就」+z 重开编码段
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('j'));
+        eng.process_key(&mut s2, key('d'));
+        assert_eq!(s2.candidates.len(), 3, "jd 三候选（越界前提）");
+        let o2 = eng.process_key(&mut s2, key('z'));
+        assert_eq!(o2.commit.as_deref(), Some("就"), "越界=首选顶屏");
+        assert_eq!(s2.raw, "z", "z 重开新编码段");
+        let texts: Vec<&str> = s2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["{重复上屏}", "{撤回}"],
+            "候选窗即出 z 菜单（重复上屏/撤回）"
+        );
+        // 接选 {撤回}：回删上次上屏（历史栈）
+        eng.push_commit_history("的");
+        let o2b = eng.process_key(&mut s2, key('2'));
+        assert!(
+            o2b.commit.as_deref().unwrap_or("").is_empty(),
+            "「撤回」功能词=空提交"
+        );
+        assert_eq!(o2b.back, 1, "「撤回」回删 1 字");
+
+        // ③ q 无码：越界维持死键（consumed、不上屏、组段不动）
+        let mut s3 = Session::new(true);
+        eng.process_key(&mut s3, key('j'));
+        eng.process_key(&mut s3, key('d'));
+        let o3 = eng.process_key(&mut s3, key('q'));
+        assert!(o3.commit.is_none(), "非码字母越界=死键不上屏");
+        assert_eq!(s3.raw, "jd", "死键组段不动");
+
+        // ④ 界内照常第 4 选
+        let mut s4 = Session::new(true);
+        eng.process_key(&mut s4, key('a'));
+        eng.process_key(&mut s4, key('b'));
+        let o4 = eng.process_key(&mut s4, key('z'));
+        assert_eq!(o4.commit.as_deref(), Some("四"), "4 候选在界=z 选第 4");
+
+        // ⑤ z 符号域内再按 z：zz 非延续 → select4 越界 → 顶 {重复上屏}
+        // 展开（last_commit）+ z 菜单再来
+        eng.push_commit_history("样张");
+        let mut s5 = Session::new(true);
+        eng.process_key(&mut s5, key('z'));
+        assert_eq!(s5.raw, "z", "空态 z 进符号域");
+        let o5 = eng.process_key(&mut s5, key('z'));
+        assert_eq!(o5.commit.as_deref(), Some("样张"), "「重复上屏」展开上次上屏");
+        assert_eq!(s5.raw, "z", "z 菜单再来（连按=重复+复选）");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 【个人存储表 2026-10-16 用户需求】隐私码表引擎语义：候选可打出
+    /// 可上屏；源标 Personal；选中**不调频**（user_dict/会话学习均无，
+    /// 隐私不落 user-adjust.log——log 侧同判独立于 learnable）；置顶/
+    /// 删词/定序/对调全链白名单拒（无写入无重排）。
+    #[test]
+    fn personal_storage_table_engine_semantics() {
+        let dir = std::env::temp_dir().join(format!("hufu-eng-pst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&dir.join("main.txt"), "#hufu-dict v1 name=t\nsjh\t数据\n").unwrap();
+        std::fs::write(&dir.join("个人存储表.txt"), "sjh\t13800880088\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.user.auto_frequency = true;
+        cfg.user.log_adjust = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+
+        // 1) 候选在场 + 源标记 Personal（追加在码表词之后）
+        let mut s = Session::new(true);
+        for c in "sjh".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let snap = eng.state(&s);
+        let texts: Vec<String> = snap.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["数据".to_string(), "13800880088".to_string()], "个人词追加在末尾");
+        assert_eq!(snap.candidates[0].source, CandidateKind::Dict, "码表词源不变");
+        assert_eq!(snap.candidates[1].source, CandidateKind::Personal, "个人词源标 Personal");
+
+        // 2) 选中上屏正常（打得出）
+        let o = eng.process_key(&mut s, key('2'));
+        assert_eq!(o.commit.as_deref(), Some("13800880088"), "个人词可上屏");
+
+        // 3) 不调频不学习：user_dict 与会话学习均无该词
+        assert!(
+            !eng.schema.user_dict.entries.iter().any(|e| e.text == "13800880088"),
+            "个人词不进用户词（不可前台调频）"
+        );
+        assert!(
+            !eng.session_learned.contains_key(&("sjh".to_string(), "13800880088".to_string())),
+            "会话学习也不记"
+        );
+
+        // 4) 前台管理全拒：置顶/删词白名单挡（候选不动、无写入）
+        let mut s2 = Session::new(true);
+        for c in "sjh".chars() {
+            eng.process_key(&mut s2, key(c));
+        }
+        eng.op_pin_candidate_abs(&mut s2, 1);
+        let texts2: Vec<String> = s2.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts2, vec!["数据".to_string(), "13800880088".to_string()], "置顶被拒：候选序不动");
+        assert!(!s2.candidates[1].pinned, "个人词不可置顶");
+        eng.op_hide_candidate_abs(&mut s2, 1);
+        assert_eq!(s2.candidates.len(), 2, "删词被拒：候选仍在");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【个人存储表·数据目录 2026-10-16 用户实锤】用户把 个人存储表.txt
+    /// 放数据目录根（全局语义）——此前只扫方案目录=「好像不生效」的病根
+    /// 修复验证：Engine::new（server 启动路径）读根目录全局文件并入
+    /// personal 专槽；切方案同口径（switch_schema 重复同合并，行为一致）。
+    #[test]
+    fn personal_table_from_data_dir_root() {
+        let root = std::env::temp_dir().join(format!("hufu-eng-pst2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let schema_dir = root.join("码表").join("虎整句");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        std::fs::write(
+            schema_dir.join("main.txt"),
+            "#hufu-dict v1 name=t\nsjh\t数据\n",
+        )
+        .unwrap();
+        // 全局文件：数据目录根（码/词 与 词/码 两种序都认——parse_auto）
+        std::fs::write(&root.join("个人存储表.txt"), "sjh\t421102199405290149\n").unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.schema.current = "虎整句".into();
+        let mut eng = Engine::new(&root, cfg).unwrap();
+
+        // 候选追加在码表词之后（与方案目录版同语义）
+        let mut s = Session::new(true);
+        for c in "sjh".chars() {
+            eng.process_key(&mut s, key(c));
+        }
+        let texts: Vec<String> = s.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(
+            texts,
+            vec!["数据".to_string(), "421102199405290149".to_string()],
+            "数据目录根的个人存储表生效（追加在末尾）"
+        );
+        assert_eq!(s.candidates[1].source, CandidateKind::Personal, "源标 Personal");
+
+        // 可选中上屏
+        let mut s2 = Session::new(true);
+        for c in "sjh".chars() {
+            eng.process_key(&mut s2, key(c));
+        }
+        let o = eng.process_key(&mut s2, key('2'));
+        assert_eq!(o.commit.as_deref(), Some("421102199405290149"), "个人词可上屏");
+
+        // 切方案回来仍生效（switch_schema 同口径合并）
+        let schema2 = root.join("码表").join("方案二");
+        std::fs::create_dir_all(&schema2).unwrap();
+        std::fs::write(schema2.join("main.txt"), "#hufu-dict v1 name=t2\nsjh\t数据二\n").unwrap();
+        eng.switch_schema("方案二").unwrap();
+        let mut s3 = Session::new(true);
+        for c in "sjh".chars() {
+            eng.process_key(&mut s3, key(c));
+        }
+        let texts3: Vec<String> = s3.candidates.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(
+            texts3,
+            vec!["数据二".to_string(), "421102199405290149".to_string()],
+            "切方案后全局个人存储表仍在（全局语义）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

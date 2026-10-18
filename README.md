@@ -36,8 +36,8 @@ fcitx5 -r -d                # 重启 fcitx5
 fcitx5-configtool           # 输入法 → 添加「虎符」
 ```
 
-默认数据**随仓库自带**（`assets/`，模型除外），`--from <目录>`
-可换外部码表源；设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。
+默认数据**随仓库自带**（`assets/`，模型除外）；设置页在应用菜单「虎符设置」
+或 `http://127.0.0.1:4390/`。
 
 安装 / 卸载 / 功能与作者声明见 **[platform/linux/README.md](platform/linux/README.md)**。
 

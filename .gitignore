@@ -1,38 +1,31 @@
-﻿target/
-Cargo.lock.bak
-*.user
-node_modules/
+﻿# 构建产物与缓存
+target*/
+platform/linux/build/
 dist/
+node_modules/
+__pycache__/
+
+# 系统 / 编辑器 / 日志杂项
 .DS_Store
 Thumbs.db
-hufu-data/
+*.log
+*.bak
+*.user
 
-# 平台构建产物
-platform/linux/build/
-platform/linux/target/
-platform/windows/target2/
-platform/windows/target-fix/
-platform/windows/target-verify/
-
-target-slim/
-target159/
-target-build/
-platform/windows/install/install.log
-_tmp
+# 外部 / 临时
+/_external/
+/_tmp/
 
 # docs/corpus 测试集源料（大文件不入仓：cnews 130MB 原始 + 转换 jsonl + 评论 CSV；
 # 成品 test_sentences_50k*.txt 与脚本入仓，源料取回法见 prepare_corpus_50k.py 注释）
-docs/corpus/cnews.train.txt
-docs/corpus/THUCNews_*.jsonl
-docs/corpus/ChnSentiCorp_htl_all.csv
-docs/corpus/waimai_10k.csv
-docs/corpus/online_shopping/
-docs/corpus/__pycache__/
+/docs/corpus/cnews.train.txt
+/docs/corpus/THUCNews_*.jsonl
+/docs/corpus/ChnSentiCorp_htl_all.csv
+/docs/corpus/waimai_10k.csv
+/docs/corpus/online_shopping/
 
-assets/码表/user-adjust.log
+# 其他本地产物
 platform/windows/deploy-88/_probe/
-
 发行脚本/hanzi_db.csv
-
-# Local bridge builds, test captures and machine-specific registration records
+hufu-data/
 /evidence/

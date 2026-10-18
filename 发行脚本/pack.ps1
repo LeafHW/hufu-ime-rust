@@ -18,6 +18,9 @@
 # 用法：powershell -ExecutionPolicy Bypass -File pack.ps1 [-Version 1.4.2]
 $ErrorActionPreference = 'Stop'
 $REL  = 'E:\DSH-KF\hufu-发行'
+# 【2026-10-12】scriptblock 调用（IEX/[scriptblock]::Create）下 $PSScriptRoot
+# 为空（PS5.1 无 BOM 脚本不能 -File 直跑的替代通道）——显式回退到本脚本目录。
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'E:\DSH-KF\hufu\发行脚本' }
 $SRC  = "$REL\打包源"
 $BASE = "$REL\基线包"
 $LOGD = "$REL\日志"
@@ -46,9 +49,12 @@ $repoInst = 'E:\DSH-KF\hufu\platform\windows\install'
 if (Test-Path "$repoInst\install.ps1") {
     foreach ($s in @('install.ps1','uninstall.ps1')) {
         if (Test-Path "$repoInst\$s") {
-            $rv = [IO.File]::ReadAllText("$repoInst\$s", [Text.Encoding]::UTF8)
-            $sv = [IO.File]::ReadAllText("$SRC\$s", [Text.Encoding]::UTF8)
-            if ($rv -cne $sv) {
+            # 【BOM 事故修复 2026-10-09】字节级比较（SHA256）：文本比较会把
+            # BOM 差异解码掉判「相同」→跳过拷贝→打包源保留无 BOM 旧件，
+            # PS5.1 中文乱码。BOM/字节任何差异都必须触发同步。
+            $rh = if (Test-Path "$SRC\$s") { (Get-FileHash "$SRC\$s" -Algorithm SHA256).Hash } else { $null }
+            $sh = (Get-FileHash "$repoInst\$s" -Algorithm SHA256).Hash
+            if ($rh -ne $sh) {
                 Copy-Item "$repoInst\$s" "$SRC\$s" -Force
                 Write-Host "  [同步] $s ← 仓内 platform\windows\install（单一事实源）" -ForegroundColor Cyan
             }
@@ -135,7 +141,10 @@ $env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\platform\windows\target-slim'
 $tsfDir = 'E:\DSH-KF\hufu\platform\windows'
 $builds = @(
     @{ dir = $tsfDir; args = @('--release', '--target', 'x86_64-pc-windows-gnu', '-p', 'hufu-tsf') },
-    @{ dir = $tsfDir; args = @('--release', '--target', 'i686-pc-windows-gnu', '-p', 'hufu-tsf') },
+    # 【2026-10-12】i686 必须带 llvm-mingw-entry：本地 llvm-mingw 工具链
+    # 无 gcc 链接器，DllEntryPoint 用 feature 内 stub；上游 3070da9 起
+    # 该 stub 已 feature 化——漏带 = 链接失败/入口缺失。
+    @{ dir = $tsfDir; args = @('--release', '--target', 'i686-pc-windows-gnu', '-p', 'hufu-tsf', '--features', 'llvm-mingw-entry') },
     @{ dir = $tsfDir; args = @('--release', '-p', 'hufu-tsf-smoke') }
 )
 foreach ($b in $builds) {
@@ -175,22 +184,68 @@ Remove-Item "$SRC\install.log" -Force -EA SilentlyContinue
 # 【2026-09-06b】安装目录随版本号升级（v1.4.6→v1.4.7→…）——动态跟随
 # D:\HUFU 下最新的 HuFu虎符输入法-v* 目录。
 # 【一级目录布局 2026-09-05】码表/模型已从 数据\ 提升到安装根。
+# 【个人码表覆盖 2026-10-15 用户拍板】「个人自用」「虎整句」两夹是用户
+# 本人在用的私人码表（可能有最新改动）——每次打包必须取本机在跑的最
+# 新版；其余方案夹（五笔/虎码单字/虎码字词等）一律沿用打包源现有镜像
+# 作默认值。本机在跑的三级定位：①正式安装目录（D:\HUFU\HuFu虎符输入
+# 法-v*\码表，取版本最高）→ ②开发部署（D:\HuFu\码表）→ ③最近一次
+# 卸载前备份（E:\DSH-KF\hufu-发行\用户数据备份-*卸载前\码表）。三级
+# 全无才沿用打包源现有两夹镜像（他机打包回退）。
 $liveMa = Get-ChildItem 'D:\HUFU' -Directory -Filter 'HuFu虎符输入法-v*' -EA SilentlyContinue |
     Sort-Object { try { [version]($_.Name -replace '^.*-v','') } catch { [version]'0.0' } } -Descending |
     Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName '码表' }
+$personalSrc = $null
+$personalVia = ''
+foreach($cand in @(
+    @{ p = $liveMa;                                             tag = "安装目录 $liveMa" },
+    @{ p = 'D:\HuFu\码表';                                      tag = '开发部署 D:\HuFu\码表' },
+    @{ p = (Get-ChildItem 'E:\DSH-KF\hufu-发行' -Directory -Filter '用户数据备份-*卸载前' -EA SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName '码表' });
+                                                                tag = '最近卸载前备份' }
+)) {
+    if ($cand.p -and (Test-Path (Join-Path $cand.p '个人自用')) -and (Test-Path (Join-Path $cand.p '虎整句'))) {
+        $personalSrc = $cand.p; $personalVia = $cand.tag; break
+    }
+}
+if ($personalSrc) {
+    foreach($d in @('个人自用','虎整句')){
+        Remove-Item "$SRC\码表\$d" -Recurse -Force -EA SilentlyContinue
+        Copy-Item (Join-Path $personalSrc $d) "$SRC\码表\$d" -Recurse -Force
+    }
+    Get-ChildItem "$SRC\码表\个人自用","$SRC\码表\虎整句" -Recurse -Include '用户调整.txt','adj-audit.log','user-adjust.log' -File -EA SilentlyContinue | ForEach-Object {
+        Remove-Item $_.FullName -Force
+        Write-Host "  [剔] 个人数据: $($_.FullName.Substring($SRC.Length+1))"
+    }
+    Write-Host "  [个人码表] 个人自用/虎整句 ← $personalVia" -ForegroundColor Cyan
+    # 快速对账显示：两夹最新文件时间（供打包人肉眼确认新旧）
+    Get-ChildItem "$SRC\码表\个人自用","$SRC\码表\虎整句" -File -Recurse |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object {
+            Write-Host "    最新文件: $($_.Directory.Name)\$($_.Name) @ $($_.LastWriteTime)" -ForegroundColor Cyan }
+} else {
+    Write-Host '  [警告] 未找到本机在跑的 个人自用/虎整句（三级定位全无）——沿用打包源现有镜像' -ForegroundColor Yellow
+}
 if (-not $liveMa -or -not (Test-Path $liveMa)) {
     # 【2026-09-07 回退】真机未安装（已卸载/他机打包）：沿用打包源现有
     # 码表镜像（上次镜像+瘦身成果），不中断打包。
     if (Test-Path "$SRC\码表") {
-        Write-Host '  [跳过] 真机未安装——沿用打包源现有码表镜像' -ForegroundColor Yellow
+        Write-Host '  [跳过] 真机未安装——整目录镜像跳过（个人两夹已单独处理）' -ForegroundColor Yellow
     } else {
         [void](Check $false '真机码表目录不存在（D:\HUFU\HuFu虎符输入法-v*\码表）')
         throw '真机码表目录缺失且打包源无镜像，无法打包'
     }
 }
 if ($liveMa -and (Test-Path $liveMa)) {
-    if (Test-Path "$SRC\码表") { Remove-Item "$SRC\码表" -Recurse -Force }
-    Copy-Item $liveMa "$SRC\码表" -Recurse -Force
+    # 【2026-10-15 收窄】真机整目录镜像只作「其余方案夹」的同步源——
+    # 个人自用/虎整句已在上面单独覆盖（整目录镜像后重拷一遍防被盖）。
+    if (Test-Path "$SRC\码表") {
+        foreach($d in @('个人自用','虎整句')) {
+            Remove-Item "$SRC\码表\$d" -Recurse -Force -EA SilentlyContinue
+        }
+    }
+    Copy-Item "$liveMa\*" "$SRC\码表" -Recurse -Force -EA SilentlyContinue
+    foreach($d in @('个人自用','虎整句')) {
+        if ($personalSrc) { Copy-Item (Join-Path $personalSrc $d) "$SRC\码表\$d" -Recurse -Force }
+    }
     Get-ChildItem "$SRC\码表" -Recurse -Include '用户调整.txt','adj-audit.log','user-adjust.log' -File -EA SilentlyContinue | ForEach-Object {
         Remove-Item $_.FullName -Force
         Write-Host "  [剔] 个人数据: $($_.FullName.Substring($SRC.Length+1))"
@@ -211,7 +266,7 @@ if ($liveMa -and (Test-Path $liveMa)) {
     # 频表；hanzi_db.csv 在本脚本同目录）：三表每次打包重筛（幂等防回潮）。
     {
         $freq = New-Object 'System.Collections.Generic.HashSet[string]'
-        $csv = Join-Path $PSScriptRoot 'hanzi_db.csv'
+        $csv = Join-Path $ScriptDir 'hanzi_db.csv'
         # 【2026-09-11 回退】字频表是打包依赖（曾在大清理中被当杂项误删致打包
         # 中止）——本地缺失时自动回退 语料\ 副本并复原，双处皆无才报错。
         if (-not (Test-Path $csv)) {
@@ -255,12 +310,34 @@ if ($liveMa -and (Test-Path $liveMa)) {
     }
 }
 
+# 【2026-10-10 用户拍板】出厂码表瘦身（镜像/回退两模式都执行；只动
+# 打包源，真机数据不碰）：①出厂不带「虎码单简」；②「五笔」=空壳方案
+# （只留必看说明，用户自己的五笔码表自己放进目录）；③数据\字体 目录
+# 废弃（字体双击装系统后到设置页选）。
+if (Test-Path "$SRC\码表\虎码单简") {
+    Remove-Item "$SRC\码表\虎码单简" -Recurse -Force
+    Write-Host '  [剔] 出厂方案: 虎码单简'
+}
+if (Test-Path "$SRC\码表\五笔") {
+    Get-ChildItem "$SRC\码表\五笔" -File | Where-Object { $_.Name -ne '必看！功能模块说明.txt' } | ForEach-Object {
+        Remove-Item $_.FullName -Force
+        Write-Host "  [剔] 五笔出厂瘦身: $($_.Name)"
+    }
+}
+if (Test-Path "$SRC\数据\字体") {
+    Remove-Item "$SRC\数据\字体" -Recurse -Force
+    Write-Host '  [剔] 数据\字体（废弃目录）'
+}
+
 # 每个方案文件夹必须有功能两件套（必看说明+快符——{} 功能词载体）
 # 【2026-09-07】核验移出镜像块：真机回退模式（沿用打包源）同样核验
 $maDirs = Get-ChildItem "$SRC\码表" -Directory
 foreach ($d in $maDirs) {
     [void](Check (Test-Path "$($d.FullName)\必看！功能模块说明.txt") "码表\$($d.Name)\必看！功能模块说明.txt")
-    [void](Check (Test-Path "$($d.FullName)\快符.txt") "码表\$($d.Name)\快符.txt")
+    # 【2026-10-10】五笔=空壳方案（只带说明），不要求快符
+    if ($d.Name -ne '五笔') {
+        [void](Check (Test-Path "$($d.FullName)\快符.txt") "码表\$($d.Name)\快符.txt")
+    }
 }
 [void](Check (Test-Path "$SRC\码表\虎整句\补充语料.txt") '虎整句\补充语料.txt（整句提权词表）')
 if ($liveMa -and (Test-Path $liveMa)) { Write-Host "  [OK] 真机码表已镜像（$($maDirs.Count) 个方案）" }
@@ -303,6 +380,10 @@ $cfgChk = Get-Content "$SRC\数据\config.json" -Raw -Encoding UTF8 | ConvertFro
 # 用户拍板注释）——出厂 config 若显式写值必须与代码默认一致，防旧值回流。
 [void](Check ($cfgChk.user.auto_frequency -eq $false) 'config 出厂哨兵: user.auto_frequency=false')
 [void](Check ($cfgChk.user.log_adjust -eq $false) 'config 出厂哨兵: user.log_adjust=false')
+# 【Caps 出厂哨兵 2026-10-12】caps_action 出厂=锁定大写（CapsAction::Caps，
+# 用户定稿）——出厂 config 若显式写值必须与代码默认一致；曾带旧值 Switch
+# 出包把默认盖回跟随（config 序列化值优先于代码默认）。
+[void](Check ($cfgChk.general.caps_action -eq 'Caps') 'config 出厂哨兵: general.caps_action=Caps（锁定大写）')
 # 【皮肤出厂哨兵 2026-10-02b】默认皮肤 hilite_on 必须为 true（用户
 # 拍板：高亮默认开）。曾随 config 同路泄漏——live 验证「关」效果时
 # 设置页写回 chenwu/moyan 皮肤，真机镜像又带回包。
@@ -377,30 +458,16 @@ if ($liveSkin -and (Test-Path $liveSkin)) {
 # 又必要，报错让人工处理）。
 $isAdminPack = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$skipTeng = $false
-if (-not $isAdminPack) {
-    if (Get-Process hufu-server -EA SilentlyContinue) {
-        throw '非管理员且 hufu-server 未杀净（无 UAC 腾位不可行）——先停 server 再打包'
-    }
-    $skipTeng = $true
-    Write-Host '  [无 UAC 模式] server 已死——跳过腾位直接压缩（不触碰 SystemIME/语言列表）' -ForegroundColor Yellow
-}
-if (-not $skipTeng -and -not $isAdminPack -and $ElevMark -ne 'elev') {
-    Write-Host '需要管理员（腾位 SystemIME 断 DLL 守护链），请求提权重跑…'
-    # 【2026-09-11 -Wait 悬死修复】Start-Process -Wait 在非交互后台宿主里
-    # 对 RunAs 提权子进程偶发永不返回（子进程已退出甚至从未创建，句柄不
-    # signal——本日两次一小时悬死实录）。改 PassThru + 存活性轮询，15 分
-    # 钟超时兜底；完成与否以最终 zip 产物为准，不依赖此处等待。
-    $ep = Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Version $Version elev $(if ($NoModel) {'-NoModel'})" -PassThru
-    $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalMinutes -lt 15) {
-        $alive = $true
-        try { $alive = -not $ep.HasExited } catch { $alive = [bool](Get-Process -Id $ep.Id -ErrorAction SilentlyContinue) }
-        if (-not $alive) { break }
-        Start-Sleep -Seconds 2
-    }
-    exit
-}
+# 【腾位退役 2026-10-15】压缩对象=打包源（E:），与运行中的 server
+#（D:\HuFu）/ctfmon 零文件冲突——09-12 注释早已实证「腾位的唯一目的
+# 是杀得净 server」，而停服要求本身是「server 从打包源跑」老布局的
+# 化石。腾位/停服只剩纯风险：本环境 UAC 弹不出+提权子进程 -Wait 悬死
+#（09-11 实录一小时两级），09-07 还实测腾位把真机输入法打失效过。
+# 永久免腾位：任何模式（管理员与否、server 死活）一律直接压缩。
+# 瘦身构建覆盖的是 engine\target-slim 产物——与运行位 D:\HuFu 不同
+# 文件，无占用冲突；唯一残留约束见 catch 后的自愈注释。
+$skipTeng = $true
+Write-Host '  [免腾位] 直接压缩（不停服/不碰 SystemIME/不碰语言列表/零提权）' -ForegroundColor Yellow
 $sysIme = "$env:SystemRoot\SystemIME\HuFu"
 $sysBak = $null
 # 【腾位前 DLL 在位快照】还原后校验的地面真值——卸载后的空壳目录
@@ -433,6 +500,10 @@ if (-not $skipTeng -and (Test-Path $sysIme)) {
 # 压缩失败等）都必须先把 SystemIME 改回，否则输入法凭空消失。成功路
 # 径的恢复在 try 块之后（原有逻辑）；catch 里恢复后再抛。
 try {
+# 【腾位退役 2026-10-15】以下杀启/击杀段仅腾位模式需要——$skipTeng 恒
+# true 永不执行，保留作历史档案。压缩本体从 $tmpZip 起，与运行中的
+# server/ctfmon 零文件冲突。
+if (-not $skipTeng) {
 Stop-Process -Name ctfmon -Force -EA SilentlyContinue
 Start-Sleep -Seconds 1
 # 【三十四修 2026-09-13】旧版单杀单查被 DLL 守护链击败：杀 server 后
@@ -454,6 +525,7 @@ while ($killRounds -lt 8) {
 }
 if (Get-Process hufu-server -EA SilentlyContinue) { throw "腾位后 server 仍未退出（$killRounds 轮击杀后仍复活，真异常）" }
 Write-Host "  [OK] server 已停（$killRounds 轮内）"
+}
 $tmpZip = "$REL\.tmp-$zipName"
 if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force }
 $items = Get-ChildItem $SRC | Where-Object { $_.Name -notmatch '\.old' -and $_.Name -ne 'install.log' -and -not ($NoModel -and $_.Name -eq '模型') }
@@ -648,7 +720,7 @@ if ($NoModel) {
 #    即无模型版，本段跳过——曾经在此发生 $szip==$zip 自删事故）──
 if (-not $NoModel) {
 $szipName = "HuFu虎符输入法-v$Version-无模型.zip"
-$szip = Join-Path $PSScriptRoot $szipName
+$szip = Join-Path $ScriptDir $szipName
 $sall = $true
 if (Test-Path $szip) { Remove-Item $szip -Force }
 Copy-Item $zip $szip -Force

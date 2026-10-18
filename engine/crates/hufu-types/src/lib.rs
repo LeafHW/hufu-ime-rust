@@ -94,6 +94,12 @@ pub enum CandidateKind {
     English,
     History,
     Calculator,
+    /// 【个人存储表 2026-10-16】个人存储表词条（隐私码表）：可正常
+    /// 选中上屏，但**不可前台管理**——置顶/删词/定序/对调白名单
+    /// （Dict|UserWord）天然排除它；learn 调频与 user-adjust.log 也
+    /// 跳过（隐私不落盘）；导出过滤按它剔除。唯一修改通道=用户直接
+    /// 编辑 个人存储表.txt。
+    Personal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,6 +258,30 @@ pub struct SessionState {
     /// 回落 map[key]）∈ 空态可用功能集。
     #[serde(default)]
     pub keymap_idle: std::collections::HashMap<String, String>,
+    /// 【Caps 灯语义 2026-10-12】引擎会话是否处于锁大写（caps_lock）。
+    /// DLL 补偿门用：进锁大写=状态可见，物理灯该亮（不补偿）；功能
+    /// 键语义（选重等，caps_lock 不变 false）=灯与输入态无关，翻回
+    /// 灭。引擎 state() 填。
+    #[serde(default)]
+    pub caps_lock: bool,
+    /// 【按住键可录 2026-11】调频模态按住键/组合（"ctrl" 默认）+
+    /// 删词模态按住键/组合（"ctrl+shift" 默认=原和弦行为）+ 导出码表
+    /// 快捷键（空=关）。组合语法 "ctrl+alt+e"；裸修饰键可录。DLL
+    /// update_ui 同帧解析缓存后匹配执行（引擎只透传字符串）。
+    #[serde(default = "default_freq_key")]
+    pub freq_key: String,
+    #[serde(default = "default_delete_key")]
+    pub delete_key: String,
+    #[serde(default)]
+    pub export_key: String,
+}
+
+fn default_freq_key() -> String {
+    "ctrl".into()
+}
+
+fn default_delete_key() -> String {
+    "ctrl+shift".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

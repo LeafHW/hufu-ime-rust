@@ -32,6 +32,15 @@ pub struct Schema {
     /// 码全带 ` 前缀如 `aaaa）。` 加入编码字母表时 ` 起段编码查此表；
     /// 无副表（Arc 空表）时 ` 维持原行为。见 Schema::load 装载段。
     pub super_dict: std::sync::Arc<Dict>,
+    /// 【个人存储表 2026-10-16 用户需求】隐私码表（个人存储表.txt）：
+    /// 存个人信息（手机/身份证/地址等），**只随码表域候选出现**——
+    /// 不进导出合并列、不受前台调频/置顶/删词/{添加}影响、不进
+    /// user-adjust.log、不喂整句模型（独立 Dict，解码器无感知）。
+    /// 唯一修改通道=用户直接编辑文件（方案目录 个人存储表.txt，
+    /// 格式任意：码\t词 / 词\t码 / hufu-dict v1 头均可，parse_auto
+    /// 自动分拣）。与「用户调整」的本质区别：用户调整参与导出快照
+    /// 与前台调频增删，个人存储表两样都不沾。
+    pub personal: std::sync::Arc<Dict>,
     /// 用户调整（置顶/添加/删除日志）
     pub adjust: UserAdjust,
     /// 用户词库
@@ -62,7 +71,60 @@ fn is_backtick_table(path: &Path) -> bool {
     t.rows.iter().all(|e| e.code.starts_with('`'))
 }
 
+/// 【自由组合 2026-10-10】import_tables 闭包合并（BFS，防环）——
+/// 主 yaml 与其余 yaml 各自的导入链共用同一 visited 集合（自由组合
+/// 下一张表可能被多条闭包引用，visited 保证只装一次）。
+fn merge_import_closure(
+    base: &Path,
+    imports: &[String],
+    dict: &mut Dict,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    let mut queue: Vec<String> = imports.to_vec();
+    while let Some(imp) = queue.pop() {
+        if !visited.insert(imp.clone()) {
+            continue;
+        }
+        let imp_path = base.with_file_name(format!("{imp}.dict.yaml"));
+        if let Ok(sub) = parse_file(&imp_path) {
+            for next in sub.meta.imports.clone() {
+                if !visited.contains(&next) {
+                    queue.push(next);
+                }
+            }
+            dict.merge(&Dict::from_entries(imp.clone(), sub.rows));
+        }
+    }
+}
+
 impl Schema {
+    /// 【个人存储表·数据目录 2026-10-16 用户实锤】用户把 个人存储表.txt
+    /// 放在**数据目录根**（D:\HuFu\数据\——全局语义：所有方案共用），
+    /// 此前装载只扫方案目录（码表\<方案>\）=「好像不生效」的病根。
+    /// 引擎在 Schema::load 后对数据目录根的两个名字（个人存储表/个人
+    /// 存储，txt/yaml 皆认）调本方法并入 personal 专槽；方案目录同名
+    /// 文件（按方案独立）仍同认，两处并存则合并（全局文件在后=追加）。
+    /// 格式同方案目录版（parse_auto：码\t词/词\t码/rime/v1）。
+    pub fn merge_personal_file(&mut self, path: &Path) {
+        if !path.is_file() {
+            return;
+        }
+        let lines = match parse::read_lines(path) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let t = parse::parse_auto(&lines);
+        if t.rows.is_empty() {
+            return;
+        }
+        let mut rows: Vec<DictEntry> = self.personal.entries.iter().cloned().collect();
+        rows.extend(t.rows);
+        self.personal = std::sync::Arc::new(Dict::from_entries(
+            "个人存储-全局".to_string(),
+            rows,
+        ));
+    }
+
     /// 加载方案目录。
     pub fn load(dir: &Path) -> std::io::Result<Schema> {
         let name = dir
@@ -81,6 +143,7 @@ impl Schema {
             reverse: None,
             reverse_path: None,
             super_dict: std::sync::Arc::new(Dict::new("super")),
+            personal: std::sync::Arc::new(Dict::new("personal")),
             adjust: UserAdjust::default(),
             user_dict: UserDict::default(),
             encoder_rules: Vec::new(),
@@ -91,6 +154,10 @@ impl Schema {
         // 【` 引导超集码表 2026-11】独立副表：**内容**识别（非空且
         // 全部行编码带 ` 前缀——文件名任意），见装载段与 is_backtick_table。
         let mut super_tables: Vec<PathBuf> = Vec::new();
+        // 【个人存储表 2026-10-16】隐私码表专槽（stem=个人存储表/个人
+        // 存储，txt/yaml 皆认）。装载段并入 schema.personal——绝不进
+        // 主码表/用户词/导出/前台调整（见 personal 字段注释）。
+        let mut personal_tables: Vec<PathBuf> = Vec::new();
         // 用户码表/用户词类文件（多多/QQ五笔语义=个人用户词）。命名只作
         // 初筛，是否晋升主码表见下方 BIG_USER_TABLE_AS_MAIN。
         let mut user_tables: Vec<PathBuf> = Vec::new();
@@ -151,6 +218,13 @@ impl Schema {
                         word_adj_lines = adj_lines;
                     }
                 }
+                // 【个人存储表 2026-10-16】隐私码表：只收路径，装载段
+                // 并入 personal 专槽（不进主码表/用户词——见 personal
+                // 字段注释）。「个人存储」短名同认：防用户少写「表」字
+                // 时文件被误当主码表并入（隐私语义要认得准）。
+                "个人存储表" | "个人存储" => {
+                    personal_tables.push(path.clone());
+                }
                 _ => {}
             }
             if stem.contains("拼音") && ext == "注释" {
@@ -159,7 +233,13 @@ impl Schema {
                 schema.unicode_block = Some(AnnotationTable::load(&path)?);
             } else if ext == "拆分" {
                 schema.split = Some(AnnotationTable::load(&path)?);
-            } else if ext == "yaml" && stem.ends_with(".dict") {
+            } else if ext == "yaml" || ext == "yml" {
+                // 【自由组合 2026-10-10】文件名不再决定装载：任何
+                // yaml/yml 先收候选，下方主表段按**内容**分拣（解析得
+                // 出词条或声明 import_tables 才进词典域；配置/皮肤类
+                // yaml 解析为空自动出局）。原规则 stem.ends_with
+                // (".dict") 会漏掉用户自命名码表 yaml（如 五笔86.yaml
+                // 整文件不可见）——用户实锤「不要因为文件名受影响」。
                 rime_dicts.push(path.clone());
             } else if ext == "txt" {
                 // 【用户码表/用户词 2026-10-02】精确 stem "用户词"/"用户调整"
@@ -177,6 +257,10 @@ impl Schema {
                 } else if stem.contains("反查") {
                     // 【性能】懒加载：只记路径（见 reverse 字段注释）
                     schema.reverse_path = Some(path.clone());
+                } else if stem == "个人存储表" || stem == "个人存储" {
+                    // 【个人存储表 2026-10-16】match 分支已收专槽；
+                    // 此处拦截防 is_backtick_table 重复解析 + 误入
+                    // big_tables（retain 段兜底双保险）。
                 } else {
                     // 其余 txt：内容分拣——` 前缀码全量副表（超集单字，
                     // 文件名任意）vs 主码表候选（多多/QQ五笔/虎整句）。
@@ -201,18 +285,14 @@ impl Schema {
         // 用户词把每键热路径拖慢。体量分级：≥512KB 的"用户码表"事实是
         // 全量码表（QQ五笔86 主表也才 1.2MB），晋升 big_tables 走 Trie/
         // HashMap 索引与正常排序；小文件维持用户词语义不变（/jc 落盘的
-        // 用户词.txt 永远是 KB 级）。注：晋升后仍参加 max_by_key 按最大
-        // 选主表，与目录里真主表并存时大的赢——语义正确（导出即用户
-        // 的完整词库快照）。
+        // 用户词.txt 永远是 KB 级）。
+        // 【自由组合 2026-10-10】删除「yaml 在场不晋升」降级——旧降级
+        // 防的是抢唯一的「主表位」（max 胜出制）；现主码表全量合并无
+        // 位可抢，大体量用户导出与其他表并存装载正是自由组合语义。
         const BIG_USER_TABLE_AS_MAIN: u64 = 512 * 1024;
         let mut duoduo_user: Option<PathBuf> = None;
         for p in user_tables {
-            let mut big = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) >= BIG_USER_TABLE_AS_MAIN;
-            if big && !rime_dicts.is_empty() {
-                // Rime dict.yaml 在场=方案主体明确，用户导出不抢主表位
-                //（虎码等 Rime 方案目录混入多多导出的场景），仍并入用户词。
-                big = false;
-            }
+            let big = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) >= BIG_USER_TABLE_AS_MAIN;
             if big {
                 big_tables.push(p);
             } else {
@@ -220,6 +300,20 @@ impl Schema {
             }
         }
 
+        // 【特殊文件不并入·yaml 路 2026-10-12】与下方 big_tables.retain 同
+        // 一张排除清单：快符/常用符号/一简符号/补充语料/用户调整/用户词
+        // 有各自的专槽（上方 stem 分发已消费）。用户实锤：快符.yaml（符
+        // 号\t编码 反序裸行，无 rime 头）被 ext 分发同时推进 rime_dicts，
+        // parse_auto 按正序 tsv 解析成「编码 `.` → 词 `zd`」混进主码表——
+        // `.` 进数据字符表成为编码引导符，数字后按 `.` 弹出 `zd` 候选
+        // （BUG④ 实际根因；txt 路早有 retain，yaml 路漏了）。
+        rime_dicts.retain(|p| {
+            !matches!(
+                file_stem_lower(p).as_str(),
+                "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
+                    | "个人存储表" | "个人存储"
+            )
+        });
         // 主码表选择（Rime dict.yaml 优先）：
         //   1) 预解析全部 dict.yaml，取「未被其他表导入」的表为候选
         //   2) 候选中优先聚合表（自身声明了 import_tables），其次与目录同名，再次最大
@@ -230,6 +324,11 @@ impl Schema {
                 rime_loaded.push((p.clone(), t));
             }
         }
+        // 【非码表 yaml 出局 2026-10-10】解析不出词条也无 import_tables
+        // 的 yaml（误入的配置/皮肤类文件——任何扩展名的 yaml 现在都进
+        // 候选）不进词典域。按内容识别正是「文件名不影响」的实现：
+        // 数据长什么样决定装不装。
+        rime_loaded.retain(|(_, t)| !t.rows.is_empty() || !t.meta.imports.is_empty());
         let imported_names: std::collections::HashSet<String> = rime_loaded
             .iter()
             .flat_map(|(_, t)| t.meta.imports.iter().cloned())
@@ -248,6 +347,15 @@ impl Schema {
                 let known = (stem == "tiger.dict" || stem == "tigress.dict") as i32 * 2;
                 (agg + nm + known, std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             });
+        // 【主码表自由组合 2026-10-10】用户拍板：txt 与 yaml 自由组合、
+        // 不二选一、不受文件名影响。旧结构两处二选一：①多个 yaml 只有
+        // 评分最高者装载（092K+symbols 修完后 symbols+extra 两 yaml 仍
+        // 只装一个）；②无 yaml 时 txt 按体量 max 只装最大一张。新装载
+        // 序：主 yaml（评分定，供 encoder_rules 与 import 闭包起点）→
+        // 其余 yaml（文件名序，各带自己的 import 闭包）→ big txt（文件
+        // 名序）；Dict::merge 同 (code,word) 去重、先到者胜；visited
+        // 全局共享防同表被两条闭包重复装载。
+        let mut dict: Option<Dict> = None;
         if let Some((main_path, main_table)) = pick_rime {
             schema.encoder_rules = main_table.meta.encoder_rules.clone();
             let main_name = if main_table.meta.name.is_empty() {
@@ -257,44 +365,69 @@ impl Schema {
             } else {
                 main_table.meta.name.clone()
             };
-            let mut dict = Dict::from_entries(main_name.clone(), main_table.rows.clone());
-            // import_tables 闭包（BFS，防环）
             let mut visited: std::collections::HashSet<String> =
-                std::collections::HashSet::from([main_name]);
-            let mut queue: Vec<String> = main_table.meta.imports.clone();
-            while let Some(imp) = queue.pop() {
-                if !visited.insert(imp.clone()) {
-                    continue;
+                std::collections::HashSet::from([main_name.clone()]);
+            let mut d = Dict::from_entries(main_name, main_table.rows.clone());
+            merge_import_closure(main_path, &main_table.meta.imports, &mut d, &mut visited);
+            // 其余 yaml（文件名序）
+            let mut others: Vec<&(PathBuf, parse::RawTable)> = rime_loaded
+                .iter()
+                .filter(|(p, _)| p.as_path() != main_path.as_path())
+                .collect();
+            others.sort_by(|a, b| a.0.cmp(&b.0));
+            for (p, t) in others {
+                let tname = if t.meta.name.is_empty() {
+                    file_stem_lower(p).trim_end_matches(".dict").to_string()
+                } else {
+                    t.meta.name.clone()
+                };
+                if !visited.insert(tname.clone()) {
+                    continue; // 已被某条 import 闭包装载
                 }
-                let imp_path = main_path.with_file_name(format!("{imp}.dict.yaml"));
-                if let Ok(sub) = parse_file(&imp_path) {
-                    for next in sub.meta.imports.clone() {
-                        if !visited.contains(&next) {
-                            queue.push(next);
-                        }
-                    }
-                    dict.merge(&Dict::from_entries(imp.clone(), sub.rows));
-                }
+                d.merge(&Dict::from_entries(tname.clone(), t.rows.clone()));
+                merge_import_closure(p, &t.meta.imports, &mut d, &mut visited);
             }
-            schema.dict = std::sync::Arc::new(dict);
-        } else if let Some(main) = big_tables.iter().max_by_key(|p| {
-            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-        }) {
+            dict = Some(d);
+        }
+        // 【特殊文件不并入】快符/常用符号/一简符号/补充语料/用户调整/
+        // 用户词有各自的专槽（上方 stem 分发已消费）——它们虽会兜
+        // 落进 big_tables（read_dir 遍历不 continue 的历史结构），但
+        // 语义是专表不是主码表，不得重复进词典域。
+        big_tables.retain(|p| {
+            !matches!(
+                file_stem_lower(p).as_str(),
+                "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
+                    | "个人存储表" | "个人存储"
+            )
+        });
+        big_tables.sort();
+        if !big_tables.is_empty() {
+            let d = dict.get_or_insert_with(|| Dict::new(&name));
             // 【虎爪码表内嵌调整 2026-09-06】虎爪导出的码表把学习记录直接
             // 嵌在码表里：`{置顶}码 词 [日期]`、`{添加}…`、`{删除}…`（第三
             // 列常为日期，UserAdjust::parse 宽容忽略）。此前这些行被当普通
-            // 词条（码=「{添加}xx」非法编码，静默成死数据）。现在解析前抽
-            // 走：词典不含死行；抽出的行进统一回放（见加载收尾）。
-            let lines = parse::read_lines(main)?;
-            let is_adjust = |l: &String| {
-                let t = l.trim_start();
-                t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
-            };
-            embedded_adj = lines.iter().filter(|l| is_adjust(l)).cloned().collect();
-            let dict_lines: Vec<String> =
-                lines.into_iter().filter(|l| !is_adjust(&l)).collect();
-            let table = parse::parse_auto(&dict_lines);
-            schema.dict = std::sync::Arc::new(Dict::from_entries(name.clone(), table.rows));
+            // 词条（码=「{添加}xx」非法编码，静默成死数据）。解析前抽走：
+            // 词典不含死行；抽出的行进统一回放（见加载收尾）。多 txt 并
+            // 存时逐个抽取（extend）。
+            for p in &big_tables {
+                let Ok(lines) = parse::read_lines(p) else {
+                    continue;
+                };
+                let is_adjust = |l: &String| {
+                    let t = l.trim_start();
+                    t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
+                };
+                embedded_adj.extend(lines.iter().filter(|l| is_adjust(l)).cloned());
+                let dict_lines: Vec<String> =
+                    lines.into_iter().filter(|l| !is_adjust(&l)).collect();
+                let t = parse::parse_auto(&dict_lines);
+                if !t.rows.is_empty() {
+                    d.merge(&Dict::from_entries(file_stem_lower(p), t.rows));
+                }
+            }
+        }
+        if let Some(d) = dict {
+            schema.dict = std::sync::Arc::new(d);
         }
 
         // 【` 引导超集码表 2026-11】超集副表装载：内容识别（全部行编码
@@ -311,6 +444,25 @@ impl Schema {
             }
             schema.super_dict = std::sync::Arc::new(Dict::from_entries(
                 format!("{name}-超集"),
+                rows,
+            ));
+        }
+
+        // 【个人存储表 2026-10-16】专槽装载：与主码表完全隔离（独立
+        // Dict），多个文件按文件名序合并。格式任意（parse_auto 分拣
+        // 码\t词 / 词\t码 / rime / hufu-dict v1）。词条只经
+        // Schema::candidates 追加进码表域候选——其余一切通道（主码表
+        // 合并/用户词/整句解码/导出/前台调整）均不可见。
+        if !personal_tables.is_empty() {
+            personal_tables.sort();
+            let mut rows: Vec<DictEntry> = Vec::new();
+            for p in &personal_tables {
+                let lines = parse::read_lines(p)?;
+                let t = parse::parse_auto(&lines);
+                rows.extend(t.rows);
+            }
+            schema.personal = std::sync::Arc::new(Dict::from_entries(
+                format!("{name}-个人存储"),
                 rows,
             ));
         }
@@ -378,8 +530,7 @@ impl Schema {
     }
 
     /// 某编码的最终候选：用户词 + 调整回放 + 系统候选。
-    pub fn candidates(&self, code: &str) -> Vec<DictEntry> {
-        let base: Vec<DictEntry> = self.dict.lookup(code).into_iter().cloned().collect();
+    pub fn candidates(&self, code: &str) -> Vec<DictEntry> {        let base: Vec<DictEntry> = self.dict.lookup(code).into_iter().cloned().collect();
         // 【` 引导超集码表 2026-11】` 前缀编码查超集副表（独立域，
         // 与主码表无码冲突；无副表=空 Dict 查不到，零开销短路）。
         // 超集表内的序 = 文件行序（rank_cmp 权重相同时按 seq），用户
@@ -421,7 +572,44 @@ impl Schema {
             let pos = out.iter().position(|e| !e.pinned).unwrap_or(out.len());
             out.insert(pos, ue);
         }
+        // 【个人存储表 2026-10-16】隐私词条追加在候选列表**最末**：
+        // 主码表/置顶块/用户词的原序原位一概不动（隐私词条是「顺带
+        // 出现的私人候选」，不参与任何排序竞争）。同码同词与前面
+        // 列表撞车时跳过（主码表优先——防 {添加} 写出重复词条双占位）。
+        // 追加在 adjust.apply / user_dict 之后：置顶/删除/加权等一切
+        // 调整回放对它无效（前台调不动的实现基础）。
+        if !self.personal.is_empty() {
+            for e in self.personal.lookup(code) {
+                if out.iter().any(|x| x.text == e.text) {
+                    continue;
+                }
+                out.push(e.clone());
+            }
+        }
         out
+    }
+
+    /// 【个人存储表 2026-10-16】(码, 词) 是否来自个人存储表——引擎侧
+    /// 打 Personal 源标记（候选保护）与导出过滤的共用判据。个人表
+    /// 通常极小（几十条），查询零负担。
+    pub fn personal_contains(&self, code: &str, text: &str) -> bool {
+        if self.personal.is_empty() {
+            return false;
+        }
+        self.personal
+            .lookup(code)
+            .iter()
+            .any(|e| e.text == text)
+    }
+
+    /// 【个人存储表 2026-10-16】词文本是否在个人存储表（任意码）——
+    /// 加词/加权入口防泄漏判据：隐私词换个码 {添加} 进 用户调整.txt
+    /// 同样是泄漏（导出带走），同词拦截；补充语料（/jq）同口径。
+    pub fn personal_has_text(&self, text: &str) -> bool {
+        if self.personal.is_empty() {
+            return false;
+        }
+        self.personal.entries.iter().any(|e| e.text == text)
     }
 
     /// 词的最优码（反查注释 / 造词）。
@@ -436,6 +624,111 @@ impl Schema {
                     .find(|e| e.text == text)
                     .map(|e| e.code.clone())
             })
+    }
+
+    /// 【加词自动编码 2026-10-08】词的编码提示（加词框编码框预填）：
+    /// 词典/用户词已有 → best_code_of；新词 → 通用形码组词规则生成
+    ///（与 Rime encoder 常用公式同形，092K 等表自带的就是这三条）：
+    /// 2 字=AaAbBaBb、3 字=AaBaCaCb、4~10 字=AaBaCaZa（Z=末字）。
+    /// 每字取最短 ≥2 码（组词用全码位，一简 1 码不参组词），只有
+    /// 1 码的字退回 1 码尽力拼。仅供预填，用户可改。
+    pub fn word_code_hint(&self, word: &str) -> Option<String> {
+        if let Some(c) = self.best_code_of(word) {
+            return Some(c);
+        }
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < 2 || chars.len() > 10 {
+            return None;
+        }
+        let per: Vec<String> = chars
+            .iter()
+            .map(|c| {
+                let s = c.to_string();
+                self.dict
+                    .best_code_with_min_len(&s, 2)
+                    .map(|c| c.to_string())
+                    .or_else(|| self.dict.best_code_of(&s).map(|c| c.to_string()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let take2 = |i: usize| -> String { per[i].chars().take(2).collect() };
+        let take1 = |i: usize| -> String { per[i].chars().take(1).collect() };
+        let joined = match chars.len() {
+            2 => format!("{}{}", take2(0), take2(1)),
+            3 => format!("{}{}{}", take1(0), take1(1), take2(2)),
+            _ => {
+                let last = chars.len() - 1;
+                format!("{}{}{}{}", take1(0), take1(1), take1(2), take2(last))
+            }
+        };
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
+    /// 【码长截断 2026-10-09】按方案 max_code_length 截断的编码提示
+    ///（4 定方案曾生成 dhrtf 5 码没法打——用户实锤）。已收录词原码
+    /// 直出；生成码超长时逐级收：①末字贡献缩到 1 码（四字词
+    /// AaBaCaZb=dhrt）；②仍超长（5 字以上长词）取前 max-1 字首码+
+    /// 末字首码。
+    pub fn word_code_hint_capped(&self, word: &str, max: usize) -> Option<String> {
+        let raw = self.word_code_hint(word)?;
+        if max < 2 {
+            return Some(raw);
+        }
+        let raw_len = raw.chars().count();
+        if raw_len <= max {
+            return Some(raw);
+        }
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < 2 {
+            return Some(raw);
+        }
+        let per: Vec<String> = chars
+            .iter()
+            .map(|c| {
+                let s = c.to_string();
+                self.dict
+                    .best_code_with_min_len(&s, 2)
+                    .map(|c| c.to_string())
+                    .or_else(|| self.dict.best_code_of(&s).map(|c| c.to_string()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let first = |i: usize| -> char { per[i].chars().next().unwrap_or('a') };
+        // ① 末字缩 1 码（2 字词本来就是 4 码位不动）
+        let mut out: String = String::new();
+        match chars.len() {
+            2 => {
+                out.push(first(0));
+                out.push(
+                    per[0]
+                        .chars()
+                        .nth(1)
+                        .unwrap_or_else(|| per[1].chars().next().unwrap_or('a')),
+                );
+                out.push(first(1));
+                out.push(per[1].chars().nth(1).unwrap_or('a'));
+            }
+            _ => {
+                for i in 0..chars.len() - 1 {
+                    out.push(first(i));
+                }
+                out.push(first(chars.len() - 1));
+            }
+        }
+        // ② 仍超长：前 max-1 字首码 + 末字首码
+        if out.chars().count() > max {
+            out = (0..max.saturating_sub(1))
+                .filter_map(|i| chars.get(i).map(|_| first(i)))
+                .collect::<String>()
+                + &first(chars.len() - 1).to_string();
+        }
+        if out.is_empty() {
+            Some(raw)
+        } else {
+            Some(out)
+        }
     }
 }
 
@@ -469,8 +762,15 @@ mod tests {
         );
 
         let s = Schema::load(&tmp).unwrap();
-        // 主表 3 行（无 import_tables 时不合并 tiger.user）
-        assert_eq!(s.dict.len(), 3);
+        // 【自由组合 2026-10-10】tiger.user.dict.yaml 也并入（用户拍板
+        // 不二选一：旧语义「无 import_tables 不合并 user 表」作废）——
+        // 主表 3 行 + user 表 1 行
+        assert_eq!(s.dict.len(), 4, "tiger + tiger.user 全装");
+        assert_eq!(
+            s.dict.lookup(";q").first().map(|e| e.text.clone()),
+            Some(":\"".into()),
+            "user yaml 词条可查"
+        );
         let cands = s.candidates("u");
         let texts: Vec<String> = cands.iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts, ["底".to_string()]); // 「的」被删除，置顶「底」生效
@@ -479,6 +779,129 @@ mod tests {
         assert_eq!(s.supplement.entries[0].word, "赢麻了");
         assert_eq!(s.split.as_ref().unwrap().get('我'), Some("丿扌戈"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【特殊文件不并入·yaml 路 2026-10-12】快符.yaml（符号\t编码 反序裸
+    // 行，无 rime 头）必须只进快符槽，不得再被 ext=yaml 分发进主码表
+    // （旧状：parse_auto 按正序 tsv 解析成 编码`.`→词`zd`，`.` 混入
+    // 编码字符表——数字后按 `.` 弹 `zd` 候选，BUG④ 真根）。
+    #[test]
+    fn quick_symbol_yaml_never_pollutes_main_dict() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-qsy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write(
+            &tmp,
+            "main.txt",
+            "#hufu-dict v1 name=t\nh\t后\nma\t码\n",
+        );
+        // 用户实锤文件同款：符号\t编码 反序（含 `.` 与功能段）
+        write(
+            &tmp,
+            "快符.yaml",
+            "~\tzb\n.\tzd\n．\tzd\n:\tzf\n;\tzf\n。\tzj\n{加词}\tzjc\n",
+        );
+        let s = Schema::load(&tmp).unwrap();
+        // 1) 快符槽正确装载（反序语义：打 zd 出 `.`）
+        assert!(
+            s.symbols.quick.get("zd").is_some_and(|v| v[0].text == "."),
+            "快符槽装载 zd→. : {:?}",
+            s.symbols.quick.get("zd")
+        );
+        // 2) 主码表不得混入快符反序行（`zd` 不是词、`.` 不是编码）
+        assert!(
+            s.dict.lookup(".").is_empty(),
+            "`.` 不得成为编码: {:?}",
+            s.dict.lookup(".")
+        );
+        assert!(
+            s.dict.lookup("z").iter().all(|e| e.text != "zd"),
+            "主表不得有词 `zd`: {:?}",
+            s.dict.lookup("z")
+        );
+        assert_eq!(s.dict.len(), 2, "主表只有 main.txt 两行");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    // 不受文件名影响——①多个 yaml 全装（不再只装评分最高者）；②多个
+    // txt 全装（无 yaml 时不再按体量只装最大一张）；③非 *.dict.yaml
+    // 命名的 yaml 按内容识别照样装载；④解析不出词条的杂 yaml 出局。
+    #[test]
+    fn free_combination_all_sources_merge() {
+        let dir = std::env::temp_dir().join(format!("hufu-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 两个 yaml：一个规整命名（会被选为主），一个自命名（旧规则
+        // 完全不可见——stem 不以 .dict 结尾）
+        write(
+            &dir,
+            "main.dict.yaml",
+            "---\nname: main\n...\n啊\tkst\n",
+        );
+        write(
+            &dir,
+            "五笔86.yaml",
+            "---\nname: w86\n...\n就\tjhgk\n",
+        );
+        // 两个 txt（无主从，全装——旧规则只装最大的一张）
+        write(&dir, "1.txt", "成\txyz\n");
+        write(&dir, "2.txt", "波\tibo\n");
+        // 杂 yaml（配置类，无词条）：内容出局
+        write(&dir, "settings.yaml", "foo: bar\nbaz: qux\n");
+        let s = Schema::load(&dir).unwrap();
+        assert_eq!(
+            s.dict.lookup("kst").first().map(|e| e.text.clone()),
+            Some("啊".into()),
+            "主 yaml 在"
+        );
+        assert_eq!(
+            s.dict.lookup("jhgk").first().map(|e| e.text.clone()),
+            Some("就".into()),
+            "自命名 yaml 按内容装载"
+        );
+        assert_eq!(
+            s.dict.lookup("xyz").first().map(|e| e.text.clone()),
+            Some("成".into()),
+            "txt 其一在"
+        );
+        assert_eq!(
+            s.dict.lookup("ibo").first().map(|e| e.text.clone()),
+            Some("波".into()),
+            "txt 其二也在（不再二选一）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 【自由组合·导入链 2026-10-10】其余 yaml 各带自己的 import 闭包，
+    // visited 共享——同一张被导入表不重复装载。
+    #[test]
+    fn free_combination_secondary_yaml_imports() {
+        let dir = std::env::temp_dir().join(format!("hufu-free-imp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write(
+            &dir,
+            "main.dict.yaml",
+            "---\nname: main\n...\n啊\tkst\n",
+        );
+        write(
+            &dir,
+            "extra.dict.yaml",
+            "---\nname: extra\nimport_tables: [common]\n...\n就\tjhgk\n",
+        );
+        write(
+            &dir,
+            "common.dict.yaml",
+            "---\nname: common\n...\n们\ttu\n",
+        );
+        let s = Schema::load(&dir).unwrap();
+        for (code, word) in [("kst", "啊"), ("jhgk", "就"), ("tu", "们")] {
+            assert_eq!(
+                s.dict.lookup(code).first().map(|e| e.text.clone()),
+                Some(word.into()),
+                "{code} 可查（自由组合+导入链）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -529,6 +952,60 @@ mod tests {
         let texts: Vec<String> = s.candidates("a").iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts, ["那个", "abc", "来"], "重 pin: {texts:?}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 【多码表同步载入 2026-10-09】dict.yaml 与其余主码表候选 txt 并存：
+    // 两域同时并入同一词典（用户实锤：092K.dict.dz.txt(3.9MB) +
+    // symbols.dict.yaml 同目录只装了 yaml，092K 整表没进内存）。
+    #[test]
+    fn multi_main_tables_merge_with_yaml() {
+        let dir = std::env::temp_dir().join(format!("hufu-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("symbols.dict.yaml"),
+            "---\nname: symbols\n...\n·\t;m\n—\t;mn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("092K.dict.dz.txt"),
+            "---config@码表分类=主码-系统码表\n啊\tkst\n就\tjhgk\n",
+        )
+        .unwrap();
+        let s = Schema::load(&dir).unwrap();
+        assert_eq!(
+            s.dict.lookup(";m").first().map(|e| e.text.clone()),
+            Some("·".into()),
+            "yaml 主表域在"
+        );
+        assert_eq!(
+            s.dict.lookup("kst").first().map(|e| e.text.clone()),
+            Some("啊".into()),
+            "word-first txt 并入（092K 域可查）"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 【多码表同步载入·内嵌调整 2026-10-09】并入路径的 {置顶}/{添加}/
+    // {删除} 行不进词典（抽走进统一回放），与主表分支同款。
+    #[test]
+    fn multi_main_tables_embedded_adjust_extracted() {
+        let dir = std::env::temp_dir().join(format!("hufu-multi-adj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.dict.yaml"), "---\nname: m\n...\n啊\tks\n").unwrap();
+        std::fs::write(
+            dir.join("extra.txt"),
+            "就\tjhgk\n{置顶}jhgk\t就\n",
+        )
+        .unwrap();
+        let s = Schema::load(&dir).unwrap();
+        assert!(s.dict.lookup("jhgk").iter().any(|e| e.text == "就"), "正常词并入");
+        assert!(
+            !s.dict.lookup("{置顶}jhgk").iter().any(|e| e.text == "就"),
+            "内嵌调整行不进词典"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // 【虎爪码表内嵌调整】主码表里的 {置顶}/{添加}/{删除}（带日期列）
@@ -775,5 +1252,56 @@ mod tests {
             "时序回放：删 2 选后 p5 前移 4 选: {texts:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 【五笔用户码表 2026-10-16】用户实锤「0私用」「1符号」读不到：
+    /// sniff_format 首行判向反了（纯拉丁词 / ℃ 区外符号）。端到端：
+    /// 真实五笔方案目录装载，z 符号域 + 词条双向验证。
+    #[test]
+    fn wubi_user_tables_end_to_end() {
+        let dir = std::path::Path::new("D:\\HuFu\\码表\\五笔");
+        if !dir.is_dir() {
+            eprintln!("（无生产目录，跳过）");
+            return;
+        }
+        // 【环境容错 2026-10-17】测试依赖生产数据文件（用户可自行增删，
+        // 实锤：目录在但 1符号.txt 被清）——判向样张不在即跳过，不算回归。
+        if !dir.join("1符号.txt").is_file() {
+            eprintln!("（1符号.txt 不在（用户已清理），跳过判向样张验证）");
+            return;
+        }
+        let s = Schema::load(dir).unwrap();
+        // 1符号.txt（词前，码 z 开头）：zq → ℃/℉/°
+        let got: Vec<&str> = s
+            .dict
+            .lookup("zq")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(
+            got.iter().any(|t| t.contains('℃')),
+            "zq 应出 ℃（符号表判向+合并装载），实得 {got:?}"
+        );
+        // 0私用.txt（词前，首行纯拉丁）：jy → 12345678
+        let got: Vec<&str> = s
+            .dict
+            .lookup("jy")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(
+            got.iter().any(|t| t.contains("12345678")),
+            "jy 应出 12345678（私用表判向），实得 {got:?}"
+        );
+        // 主表仍在（2木滴五笔单简合并未丢）
+        let got: Vec<&str> = s
+            .dict
+            .lookup("a")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(!got.is_empty(), "主码表词条丢失：a 无候选");
+        // z 符号域开（z 引导码可查）
+        assert!(s.dict.z_symbol_domain, "z 符号域应开（z 开头符号码存在）");
     }
 }

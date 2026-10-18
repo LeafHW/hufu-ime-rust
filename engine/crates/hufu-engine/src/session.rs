@@ -65,6 +65,11 @@ pub struct Session {
     ///（下一键）自然重放。缓存新 order 到达的同 key 场景由下一键
     /// 应用（停顿期用户无输入，视觉无损）。
     pub rerank_applied_key: String,
+    /// 【中文态 Caps 锁大写 2026-10-12】CapsAction::Caps：中文态按
+    /// CapsLock 置位——此后字母以大写英文直出（不进编码）；再按一下
+    /// 复位回中文。仅中文态有意义；切英文态时强制清零（英文态 Caps
+    /// 恒透传系统，见引擎 Caps 段）。
+    pub caps_lock: bool,
 }
 
 impl Session {
@@ -87,6 +92,7 @@ impl Session {
             tail_context: String::new(),
             line_end_hint: false,
             rerank_applied_key: String::new(),
+            caps_lock: false,
         }
     }
 

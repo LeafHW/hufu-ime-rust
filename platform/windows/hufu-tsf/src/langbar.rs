@@ -5,7 +5,7 @@
 //! - 右键 → 管道 op "settings" 打开设置页（与托盘双击同通道）
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
@@ -119,8 +119,31 @@ pub fn set_mode_opt(zh: bool, force: bool) -> bool {
 thread_local! {
     static DEFER_HWND_T: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
+/// 【急切同步 2026-10-14】defer 窗 HWND 的进程级镜像：焦点 worker 线程
+/// （非 UI 线程，读不了 thread_local）PostMessage 用。HWND 只是句柄值，
+/// 跨线程读数值安全；PostMessage 本身线程安全。
+static DEFER_HWND_G: AtomicIsize = AtomicIsize::new(0);
 static PENDING_ZH: AtomicBool = AtomicBool::new(true);
 const WM_APP_DEFER: u32 = 0x8002;
+/// 【急切同步】焦点回执已存 CHINESE_SYNC，请 UI 线程立即应用（不再等
+/// 下一键——切窗后牌面即时对准；现场反馈 EmEditor↔cmd 切换后中英
+/// 状态显示不准的修复通道）。
+const WM_APP_MODE_SYNC: u32 = 0x8003;
+// 【Alt+修改 下线 2026-10-17】WM_APP_ALTEXEC 转交臂与 defer_hwnd()
+// 读取口已随功能整体删除。
+
+/// 焦点 worker 存好回执后调用（任意线程）：向 defer 窗投递立即应用。
+/// 窗未建（进程从未 Activate，理论不可达——worker 本就源自焦点回调）
+/// 则静默跳过，回落旧行为（下一键懒应用）。
+pub fn post_mode_sync() {
+    let h = DEFER_HWND_G.load(Ordering::Acquire);
+    if h != 0 {
+        // 用本文件既有的裸 FFI PostMessageW（L560 形态：isize 句柄）
+        unsafe {
+            let _ = PostMessageW(h, WM_APP_MODE_SYNC, 0, 0);
+        }
+    }
+}
 
 unsafe extern "system" fn defer_wnd_proc(
     h: windows::Win32::Foundation::HWND,
@@ -128,6 +151,12 @@ unsafe extern "system" fn defer_wnd_proc(
     _w: windows::Win32::Foundation::WPARAM,
     _l: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    if m == WM_APP_MODE_SYNC {
+        // 本线程即首激活 UI 线程（defer 窗创建者）——与 G_SHARED 同锚，
+        // 此处取 Shared 应用中英态 + set_mode（compartment 推送留本套间）
+        crate::tsf::defer_apply_chinese_sync();
+        return windows::Win32::Foundation::LRESULT(0);
+    }
     if m == WM_APP_DEFER {
         let zh = PENDING_ZH.load(Ordering::Relaxed);
         log_diag(&format!("defer 推 zh={zh}"));
@@ -168,6 +197,7 @@ unsafe fn ensure_defer_window() {
             None,
         ) {
             DEFER_HWND_T.with(|c| c.set(w.0 as isize));
+            DEFER_HWND_G.store(w.0 as isize, Ordering::Release);
         }
     }
 }
@@ -274,6 +304,20 @@ unsafe fn cm_compartment(cm: &ITfCompartmentMgr, guid: *const GUID) -> Result<IT
     unsafe { cm.GetCompartment(guid) }
 }
 
+/// 【每应用模式对账 2026-10-15】读本线程 compartment 的 CONVERSION 值
+/// （NATIVE 位）——系统焦点切换时 ctfmon 会把「该应用记忆的输入模式」
+/// 写进来。返回 Some(中文?) ；读不到（无 compartment/空值）None。
+/// 严格 UI 线程调（COMP_THREAD 线程局部 + STA 代理不越线程铁律）。
+pub fn read_thread_conversion_chinese() -> Option<bool> {
+    let src = COMP_THREAD.with(|c| c.borrow().clone())?;
+    unsafe {
+        let comp = cm_compartment(&src, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION).ok()?;
+        let v = comp.GetValue().ok()?;
+        let n = var_i32(&v)?;
+        Some((n & TF_CONVERSIONMODE_NATIVE as i32) != 0)
+    }
+}
+
 /// 读 VARIANT 当 i32（VT_I4 = 3；偏移 8 = vt+3 保留字后）
 unsafe fn var_i32(v: &VARIANT) -> Option<i32> {
     unsafe {
@@ -336,11 +380,12 @@ impl ITfCompartmentEventSink_Impl for ModeSink_Impl {
         } else {
             TF_CONVERSIONMODE_ALPHANUMERIC as i32
         };
-        // 【v4/v5：纯观察者】compartment 不是权威——引擎才是。
-        // 系统焦点切换会把「每应用记忆的输入模式」写进 compartment
-        // （陈旧值），追它等于跟系统记忆打架；且 msctf 回调里做任何
-        // 阻塞调用（管道）都会弄坏 msctf 连接（语言栏项死亡真因）。
-        // 这里只读线程侧记一笔诊断日志，引擎状态由按键响应同步。
+        // 【每应用对账后·定位变更 2026-10-15】OnChange（msctf 回调）仍
+        // 纯观察——回调里做任何阻塞调用（管道）都会弄坏 msctf 连接
+        //（语言栏项死亡真因）。但「应用记忆为准」的对账已上移到焦点
+        // 回执应用点（tsf.rs apply_chinese_sync，defer 窗 UI 线程安全上
+        // 下文）：焦点进入读 compartment（系统刚写入的该应用记忆）→
+        // 与引擎不一致则 set_lang 幂等设引擎。本 sink 只留诊断日志。
         let src = COMP_THREAD.with(|c| c.borrow().clone());
         let mut actual: Option<i32> = None;
         if let Some(cm) = src {
@@ -920,7 +965,8 @@ fn make_glyph_icon(ch: &str) -> isize {
             0,
             0,
             0,
-            0x86, // DEFAULT_CHARSET
+            1, // DEFAULT_CHARSET（曾误传 0x86=GB2312，注释标错——雅黑
+               // 声明了 936 所以碰巧没炸，正确值应为 1）
             0,
             0,
             4, // ANTIALIASED_QUALITY（灰度 coverage）

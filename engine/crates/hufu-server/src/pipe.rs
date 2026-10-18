@@ -261,6 +261,10 @@ pub fn dispatch(
                             if !act_code_s.is_empty() {
                                 let _ = h.engine.adjust_set_order(&s, &act_code_s);
                             }
+                            // 【占位符变号·显示同步 2026-10-09】落盘词表
+                            // 已改号，重建会话的候选文本同步成新号再拷回
+                            // 活会话（否则窗口仍显 ③，重开才见 ④）。
+                            let _ = h.engine.sync_placeholder_texts(&mut s);
                             // 【显示序回写 2026-10-07】重建列表上的新序
                             // 拷回**活会话**（raw/页/选保活会话原样——尾
                             // 巴态不翻转）；返回的 state 即活会话真值，
@@ -317,6 +321,80 @@ pub fn dispatch(
             if !act_code.is_empty() {
                 let _ = h.engine.adjust_set_order(&h.session, &act_code);
             }
+            // 【占位符变号·显示同步 2026-10-09】同上：落盘已改号，活会话
+            // 文本同步（raw/页/选不动，窗口立即显示 ④）。
+            let _ = h.engine.sync_placeholder_texts(&mut h.session);
+            let state = serde_json::to_value(host.engine.state(&host.session))
+                .unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({"ok": true, "state": state})
+        }
+        // 【按住Ctrl调频·对调 2026-11】候选窗模态调频的交换动作（Windows
+        // DLL）：i/j=页内下标（与渲染同序），text_i/text_j=词文本（异步
+        // 重排漂移校验：页内不符则按词全列表重找）。**原位重排**（纯位次
+        // 口径：不 clear 不重查，raw/页/选全保——尾巴态不翻转），落盘走
+        // adjust_set_order 整套 pN（两词同码一次、异码各一次），与右键
+        // 菜单同管线。响应带刷新后的 state 供 DLL 即时重绘（+对调动效）。
+        "cand_swap" => {
+            let page_size = host.engine.config.candidates.page_size.max(1);
+            let start = host.session.page * page_size;
+            let get_page = |i: usize| {
+                host.session
+                    .candidates
+                    .get(start + i)
+                    .map(|c| c.text.as_str())
+            };
+            // 页内下标优先（词校验），漂移则按词页内重找→全列表兜底。
+            let resolve = |want: usize, text: &str| -> Option<usize> {
+                if let Some(t) = get_page(want) {
+                    if text.is_empty() || t == text {
+                        return Some(start + want);
+                    }
+                }
+                if text.is_empty() {
+                    return None;
+                }
+                (0..page_size)
+                    .find(|&i| get_page(i) == Some(text))
+                    .map(|i| start + i)
+                    .or_else(|| {
+                        host.session
+                            .candidates
+                            .iter()
+                            .position(|c| c.text == text)
+                    })
+            };
+            let i = req.get("i").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let j = req.get("j").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let ti = req.get("text_i").and_then(|v| v.as_str()).unwrap_or("");
+            let tj = req.get("text_j").and_then(|v| v.as_str()).unwrap_or("");
+            let (Some(pi), Some(pj)) = (i, j) else {
+                return serde_json::json!({"ok": false, "why": "参数无效"});
+            };
+            // 页内渲染序对调才有意义：跨页/越界拒绝（模态只显示当前页）。
+            if pi >= page_size || pj >= page_size || pi == pj {
+                return serde_json::json!({"ok": false, "why": "下标无效"});
+            }
+            let (Some(a), Some(b)) = (resolve(pi, ti), resolve(pj, tj)) else {
+                return serde_json::json!({"ok": false, "why": "候选不在当前页"});
+            };
+            let total = host.session.candidates.len();
+            if a >= total || b >= total || a == b {
+                return serde_json::json!({"ok": false, "why": "候选不在当前页"});
+            }
+            // 先取两词的码（原位交换会动列表），同码只整序一次。
+            let code_a = host.session.candidates[a].code.clone();
+            let code_b = host.session.candidates[b].code.clone();
+            let h: &mut Host = &mut host;
+            let _ = h.engine.op_swap_positions_abs(&mut h.session, a, b);
+            if !code_a.is_empty() {
+                let _ = h.engine.adjust_set_order(&h.session, &code_a);
+            }
+            if !code_b.is_empty() && code_b != code_a {
+                let _ = h.engine.adjust_set_order(&h.session, &code_b);
+            }
+            // 【占位符变号·显示同步】落盘已改号，活会话文本同步（同右键
+            // 菜单：窗口立即显示 ④，raw/页/选不动）。
+            let _ = h.engine.sync_placeholder_texts(&mut h.session);
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
             serde_json::json!({"ok": true, "state": state})
@@ -384,11 +462,116 @@ pub fn dispatch(
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
         }
+        // 【UWP/开始菜单取图 2026-10-18】AppContainer 宿主（开始菜单搜索、
+        // 设置、商店应用等）沙箱拒读数据目录——实测管道连通（act-*.txt
+        // pipe=ok）而磁盘读图被拒 → 独立皮肤载图失败回退矢量皮。本 op
+        // 供 DLL load_bitmap 读盘失败时经管道取图（b64，与 sound op 同
+        // 形）。id/图名双重消毒（与 DLL normalize_image_name 同规），
+        // 服务端只按自身数据根拼路径——不信任客户端路径。
+        "ssf_image" => {
+            let id = req.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let image = req.get("image").and_then(|x| x.as_str()).unwrap_or("");
+            let ok_name = |s: &str| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && !s.contains("..")
+                    && !s.chars().any(|c| {
+                        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                            || c.is_control()
+                    })
+            };
+            if !ok_name(id) || !ok_name(image) {
+                return serde_json::json!({"error": "id/图名不合法"});
+            }
+            let p = crate::ssf::ssf_cache_root(&host.data_dir)
+                .join(id)
+                .join(image.to_lowercase());
+            match std::fs::read(&p) {
+                Ok(bytes) => match crate::b64::encode(&bytes) {
+                    Ok(b) => serde_json::json!({"ok": true, "b64": b}),
+                    Err(_) => serde_json::json!({"error": "b64 编码失败"}),
+                },
+                Err(e) => serde_json::json!({"error": format!("读图失败 {}: {e}", p.display())}),
+            }
+        }
+        // 【渲染指定皮肤 2026-10-16】设置页实时框用：按 id 返回该 ssf
+        // 皮肤的完整 payload（含其 overrides）——渲染「正在编辑的」皮
+        // 肤而不是「当前上位」皮肤。仅供 dump 驱动进程调用；真实打字
+        // 进程走 "skin"（op 面小、无副作用，不设白名单）。
+        "skin_for_render" => {
+            let id = req.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let resp = if !id.is_empty() {
+                crate::ssf::skin_payload(&host.data_dir, &id)
+                    .ok()
+                    .map(|(mut sv, _)| {
+                        // 实时框只画候选窗本体；挂件由设置页 UI 叠画
+                        //（payload 顶层 overlay 剥掉，防双挂件）。
+                        if let Some(o) = sv.as_object_mut() {
+                            o.remove("overlay");
+                        }
+                        serde_json::json!({"skin": sv})
+                    })
+            } else {
+                None
+            };
+            resp.unwrap_or_else(|| serde_json::json!({"error": "皮肤不可用"}))
+        }
         "skin" => {
             let id = host.engine.config.appearance.skin.clone();
-            let p = host.skins_dir().join(format!("{id}.json"));
-            let show_index = host.engine.config.candidates.show_index;
+            // 【独立皮肤设置 2026-10-16】SSF 时序号开关可被 per-skin 覆盖
+            //（载荷 layout.show_index 同步注入——DLL 双路可读）。
+            let show_index = if host.engine.config.appearance.skin_kind == "ssf" {
+                crate::ssf::SsfOverrides::load(&crate::ssf::ssf_cache_root(&host.data_dir).join(&id))
+                    .show_index
+                    .unwrap_or(host.engine.config.candidates.show_index)
+            } else {
+                host.engine.config.candidates.show_index
+            };
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            // 【SSF 皮肤 2026-12】kind=ssf → 位图皮肤：只传 cache_dir 路径
+            // + 指纹（11MB 挂件教训：绝不内嵌大图字节），DLL 按需读盘。
+            // anim 系列注入字段与 JSON 皮肤同形状（皮肤对象顶层）；
+            // 颜色已转 "#RRGGBBAA"（DLL color_f 序）。解包失败 → 落到
+            // 下方默认 JSON 皮路径（与 JSON 皮肤加载失败同款回退——
+            // 坏皮绝不弄坏输入）。
+            if host.engine.config.appearance.skin_kind == "ssf" {
+                if let Ok((sv_src, src_fp)) = crate::ssf::skin_payload(&host.data_dir, &id) {
+                    let anim = host.engine.config.appearance.anim;
+                    let anim_speed = host.engine.config.appearance.anim_speed;
+                    let anim_flash = host.engine.config.appearance.anim_flash;
+                    // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
+                    // 字段全部参与——DLL have_fp 命中即 {"same":true} 微载荷。
+                    let fp = format!(
+                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}",
+                        host.engine.config.schema.current
+                    );
+                    if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
+                        if !h.is_empty() && h == fp {
+                            return serde_json::json!({"same": true, "fp": fp});
+                        }
+                    }
+                    let mut sv = sv_src;
+                    if let Some(o) = sv.as_object_mut() {
+                        o.insert("anim".into(), serde_json::json!(anim));
+                        o.insert("anim_speed".into(), serde_json::json!(anim_speed));
+                        o.insert("anim_flash".into(), serde_json::json!(anim_flash));
+                        o.insert(
+                            "first_show_slide".into(),
+                            serde_json::json!(
+                                !host.engine.config.schema.current.contains("整句")
+                            ),
+                        );
+                    }
+                    return serde_json::json!({
+                        "skin": sv,
+                        "show_index": show_index,
+                        "delay_show_ms": delay_show_ms,
+                        "fp": fp
+                    });
+                }
+                eprintln!("ssf 皮肤 {id} 加载失败，候选窗回默认 JSON 皮肤");
+            }
+            let p = host.skins_dir().join(format!("{id}.json"));
             // 【皮肤指纹 2026-11】挂件大图皮肤 JSON 可达 11MB——DLL 每
             // 2.5s 例行重拉在打字线程全量解析（40-80ms 停顿，QQ 抖动
             // 观感的放大器，违「首键要快」）。响应内容=皮肤文件+注入
@@ -483,6 +666,26 @@ pub fn dispatch(
         "skin_font_delta" => {
             let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
             let id = host.engine.config.appearance.skin.clone();
+            // 【SSF 滚轮字号 2026-10-16】独立皮肤无 .json 皮肤文件——旧
+            // 路径 load 失败直接吞掉滚轮。SSF 分支：per-skin overrides
+            // 的 font_pt ±1（基准=现值或 16），写回+指纹推进（skin_ver
+            // +载荷 fp 含 overrides → DLL 下次重拉拿到新字号）。
+            if host.engine.config.appearance.skin_kind == "ssf" {
+                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+                let mut ov = crate::ssf::SsfOverrides::load(&cache_dir);
+                let np = ((ov.font_pt.unwrap_or(16.0) as i32) + delta).clamp(10, 36);
+                ov.font_pt = Some(np as f32);
+                return match ov.save(&cache_dir) {
+                    Ok(()) => {
+                        host.skin_ver += 1;
+                        serde_json::json!({"font_point": np})
+                    }
+                    Err(e) => {
+                        eprintln!("ssf 皮肤 {id} 字号保存失败: {e}");
+                        serde_json::json!({"err": e.to_string()})
+                    }
+                };
+            }
             let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {
@@ -535,9 +738,50 @@ pub fn dispatch(
         "toggle_lang" => {
             host.session.clear();
             host.session.chinese = !host.session.chinese;
+            // 【切英文态清锁大写 2026-10-12】语言栏切换同口径复位。
+            host.session.caps_lock = false;
             host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
+        }
+        // 【占位符记忆 2026-10-09】加词框「占位符」勾选态读写。沙箱宿主
+        //（NTQQ 渲染进程）写不了 HKCU——记忆改由 server 落
+        // 数据\addword-ph.json，DLL 对话框构建回读/勾选即写都走管道。
+        "aw_ph_get" => serde_json::json!({"on": host.addword_ph}),
+        // Linux 原生加词框：与 Web 设置页 POST /api/user_word/add 同一落盘
+        // 逻辑（用户调整.txt + 热重载）。返回 {ok} 或 {ok:false,error}。
+        "aw_add" => {
+            let code = req.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let pos = req.get("pos").and_then(|v| v.as_i64()).unwrap_or(0);
+            match crate::add_user_word(&mut host, code, text, pos) {
+                Ok(()) => serde_json::json!({"ok": true}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            }
+        }
+        // Linux 原生加权框：与 Web POST /api/user_word/weight 同一落盘
+        // 逻辑（补充语料 + 后台整句重载）。返回 {ok} 或 {ok:false,error}。
+        "aw_weight" => {
+            let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let weight = req.get("weight").and_then(|v| v.as_i64()).unwrap_or(1000);
+            match crate::add_user_weight(&mut host, text, weight) {
+                Ok(()) => serde_json::json!({"ok": true}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            }
+        }
+        // Linux 状态菜单「个人存储表…」：交给系统编辑器打开。
+        "open_personal" => match crate::open_personal(&host) {
+            Ok(()) => serde_json::json!({"ok": true}),
+            Err(e) => serde_json::json!({"ok": false, "error": e}),
+        },
+        "aw_ph_set" => {
+            let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            host.addword_ph = on;
+            let _ = std::fs::write(
+                host.data_dir.join("addword-ph.json"),
+                serde_json::json!({"on": on}).to_string(),
+            );
+            serde_json::json!({"ok": true, "on": on})
         }
         // compartment 对账用【设值】而非切换：全局 compartment 变化
         // 时多个后台进程会各自收到 OnChange——若各自 toggle 会把共享
@@ -550,9 +794,29 @@ pub fn dispatch(
                 .unwrap_or(host.session.chinese);
             host.session.clear();
             host.session.chinese = zh;
+            // 【锁大写复位 2026-10-12】compartment 幂等设值时锁大写一并
+            // 复位（跨进程对账口径：语言态是全局单值，锁大写不入牌面）。
+            host.session.caps_lock = false;
             host.session.pair.reset();
             let state = host.engine.state(&host.session);
             serde_json::json!({"state": state})
+        }
+        // 【旧版控制台真光标 2026-10-15】DLL 载在 conhost 进程内（它是
+        // 服务端不是客户端——GetStdHandle/CONOUT$ 实测皆拒，MSAA 的
+        // OBJID_CARET 也不实现 accLocation）。借本进程 AttachConsole
+        // 到该控制台的**客户端**进程（= conhost 的父进程，Toolhelp 查）
+        // 当客户端读光标格位+字体格度，换算屏幕像素 rect 返回。DLL 拿
+        // rect 作候选锚——旧版模式候选贴真光标（X/Y 全跟）。Attach 是
+        // 进程级状态：全局串行 + 用毕 FreeConsole 还原。
+        "console_caret" => {
+            let pid = req.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            match console_caret_rect_via_attach(pid) {
+                Some([l, t, r, b]) => serde_json::json!({ "rect": [l, t, r, b] }),
+                None => {
+                    let err = console_caret_last_err();
+                    serde_json::json!({ "rect": null, "err": err })
+                }
+            }
         }
         // 语言栏「中/英」右键菜单数据：码表清单 + 当前方案。
         // 【死锁教训】dispatch 已持 host 锁——绝不能经 tray::
@@ -1260,6 +1524,145 @@ mod unix_imp {
 #[cfg(not(windows))]
 pub use unix_imp::run as run_pipe;
 
+/// 【旧版控制台真光标 2026-10-15】conhost_pid = DLL（在 conhost 内）自报
+/// 进程号。conhost 的父进程 = 该控制台的客户端（cmd 等）→ AttachConsole
+/// 挂上 → GetConsoleScreenBufferInfo 光标格 + GetCurrentConsoleFont 格度
+/// + GetConsoleWindow/ClientToScreen 换算屏幕像素。用毕 FreeConsole。
+/// 进程级全局串行（Attach 是进程状态）。失败任一步 → None（DLL 落标准
+/// 链，不钉位）。客户端父进程可能已退（conhost 收尾期）→ Toolhelp 查
+/// 不到 → None。
+#[cfg(windows)]
+static LAST_CARET_ERR: Mutex<Option<&'static str>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn console_caret_rect_via_attach(conhost_pid: u32) -> Option<[i32; 4]> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, GetConsoleWindow,
+        GetCurrentConsoleFont, GetStdHandle, CONSOLE_FONT_INFO, CONSOLE_SCREEN_BUFFER_INFO,
+        STD_OUTPUT_HANDLE,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+
+    static ATTACH_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ATTACH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let note = |s: &'static str| -> Option<[i32; 4]> {
+        *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        None
+    };
+
+    // conhost → 父进程（= 控制台客户端）
+    let parent = unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return note("snapshot_fail"),
+        };
+        let mut pe = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        if Process32FirstW(snap, &mut pe).is_ok() {
+            loop {
+                if pe.th32ProcessID == conhost_pid {
+                    found = Some(pe.th32ParentProcessID);
+                    break;
+                }
+                if Process32NextW(snap, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        match found {
+            Some(p) => p,
+            None => return note("parent_not_found"),
+        }
+    };
+
+    unsafe {
+        // 挂载（本 server 是 GUI 子系统无控制台；万一被拉起时带了——
+        // 先 Free 再 Attach，用毕也 Free，状态归零）
+        if AttachConsole(parent).is_err() {
+            let _ = FreeConsole();
+            if AttachConsole(parent).is_err() {
+                return note("attach_fail");
+            }
+        }
+        let result = (|| -> Option<(u16, String, [i32; 4])> {
+            let h = match GetStdHandle(STD_OUTPUT_HANDLE) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => return None,
+            };
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            if GetConsoleScreenBufferInfo(h, &mut info).is_err() {
+                return None;
+            }
+            let mut cfi = CONSOLE_FONT_INFO::default();
+            if GetCurrentConsoleFont(h, false, &mut cfi).is_err() {
+                return None;
+            }
+            let hwnd = GetConsoleWindow();
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut cr = RECT::default();
+            if GetClientRect(hwnd, &mut cr).is_err() {
+                return None;
+            }
+            let mut org = POINT { x: 0, y: 0 };
+            if !ClientToScreen(hwnd, &mut org).as_bool() {
+                return None;
+            }
+            let vx = (info.dwCursorPosition.X - info.srWindow.Left) as i32;
+            let vy = (info.dwCursorPosition.Y - info.srWindow.Top) as i32;
+            if vx < 0 || vy < 0 {
+                return None;
+            }
+            let cw = cfi.dwFontSize.X.max(4) as i32;
+            let chh = cfi.dwFontSize.Y.max(4) as i32;
+            let left = org.x + vx * cw;
+            let top = org.y + vy * chh;
+            Some((parent as u16, format!("cell=({vx},{vy})"), [left, top, left + cw, top + chh]))
+        })();
+        let _ = FreeConsole();
+        match result {
+            Some((_p, cell, rect)) => {
+                *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = cell; // 细节诊断保留位
+                Some(rect)
+            }
+            None => note("read_fail"),
+        }
+    }
+}
+
+/// console_caret 失败原因（诊断回传给 DLL）。
+#[cfg(windows)]
+fn console_caret_last_err() -> &'static str {
+    LAST_CARET_ERR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or("unknown")
+}
+
+#[cfg(not(windows))]
+fn console_caret_rect_via_attach(_conhost_pid: u32) -> Option<[i32; 4]> {
+    None
+}
+
+/// 非 Windows 无控制台光标探测：console_caret 回 rect=null + 原因，
+/// DLL/前端按失败落标准链（不阻塞 Linux 构建）。
+#[cfg(not(windows))]
+fn console_caret_last_err() -> &'static str {
+    "unsupported"
+}
+
 fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde_json::Value) {
     if req
         .pointer("/candidate_ui/protocol")
@@ -1393,5 +1796,202 @@ mod candidate_tests {
                 .unwrap()
                 .len()
         );
+    }
+
+    // 【按住Ctrl调频·对调 2026-11】cand_swap op：页内下标+词校验 →
+    // 原位交换（raw/页/选保活）+ 整序落盘；漂移按词重找；同位/越界/
+    // 不在页拒绝。
+    #[test]
+    fn aw_add_writes_user_adjust_and_rejects_bad_pos() {
+        let root = std::env::temp_dir().join(format!("hufu-aw-add-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(root.join("码表/T/main.txt"), "#hufu-dict v1 name=t\na\t甲\n").unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.candidates.page_size = 5;
+        let host = Mutex::new(h);
+        let ok = dispatch(
+            &host,
+            &json!({"op":"aw_add","code":"a","text":"乙","pos":1}),
+            None,
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        let file = root.join("码表/T/用户调整.txt");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("{添加}a\t乙\tp1"), "{content}");
+        let bad = dispatch(
+            &host,
+            &json!({"op":"aw_add","code":"a","text":"丙","pos":-1}),
+            None,
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["error"].as_str().is_some_and(|e| e.contains("0-99")));
+    }
+
+    #[test]
+    fn aw_weight_writes_supplement_and_rejects_bad_weight() {
+        let root = std::env::temp_dir().join(format!("hufu-aw-weight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(root.join("码表/T/main.txt"), "#hufu-dict v1 name=t\na\t甲\n").unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"}}"#,
+        )
+        .unwrap();
+        let host = Mutex::new(Host::new(&root.join("数据")).unwrap());
+        let ok = dispatch(
+            &host,
+            &json!({"op":"aw_weight","text":"甲","weight":2000}),
+            None,
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        let file = root.join("码表/T/补充语料.txt");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("甲 2000"), "{content}");
+        let bad = dispatch(
+            &host,
+            &json!({"op":"aw_weight","text":"甲","weight":0}),
+            None,
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["error"].as_str().is_some_and(|e| e.contains("正整数")));
+    }
+
+    #[test]
+    fn cand_menu_front_and_del_rewrite_order() {
+        let root = std::env::temp_dir().join(format!("hufu-cand-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\na\t甲\na\t乙\na\t丙\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.candidates.page_size = 5;
+        let host = Mutex::new(h);
+        dispatch(&host, &json!({"op":"key","key":"a"}), None);
+        let front = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"front","text":"丙","page_index":0}),
+            None,
+        );
+        assert_eq!(front["ok"], json!(true), "{front}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "甲", "乙"]);
+        let del = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"del","text":"乙","page_index":0}),
+            None,
+        );
+        assert_eq!(del["ok"], json!(true), "{del}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "甲"]);
+        let log = std::fs::read_to_string(root.join("码表/T/用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}a"), "{log}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cand_swap_op_inplace_and_drift() {
+        let root = std::env::temp_dir().join(format!("hufu-cand-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\na\t甲\na\t乙\na\t丙\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        let host = Mutex::new(h);
+        let key = json!({"op":"key","key":"a"});
+        let r = dispatch(&host, &key, None);
+        assert_eq!(
+            r["state"]["candidates"][0]["text"],
+            json!("甲"),
+            "首选拍板: {r}"
+        );
+        // 1↔3（页内 0/2）：原位交换，raw/selected 保活
+        {
+            let mut g = host.lock().unwrap();
+            g.session.selected = 1;
+        }
+        let sw = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"甲","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(sw["ok"], json!(true), "对调成功: {sw}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "乙", "甲"], "原位交换: {texts:?}");
+        {
+            let g = host.lock().unwrap();
+            assert_eq!(g.session.raw, "a", "raw 保活（尾巴态不翻转）");
+            assert_eq!(g.session.selected, 1, "选中位保活");
+        }
+        assert_eq!(sw["state"]["candidates"][0]["text"], json!("丙"));
+        // 落盘：整序标记 + 整套 pN（用户调整.txt 落方案目录）
+        let log = std::fs::read_to_string(root.join("码表/T/用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}a"), "整序标记: {log}");
+        assert!(log.contains("{添加}a\t丙\tp1"), "丙 p1: {log}");
+        assert!(log.contains("{添加}a\t甲\tp3"), "甲 p3: {log}");
+        // 漂移：异步重排把词挪位（模拟 0/1 互换）——旧下标+正确词文本
+        // 仍按词解析成功
+        {
+            host.lock().unwrap().session.candidates.swap(0, 1);
+        }
+        let sw2 = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"甲","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(sw2["ok"], json!(true), "漂移按词重找: {sw2}");
+        let texts2: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        // 漂移后按词对调：手动 swap(0,1) 后列表 [乙,丙,甲]——甲(位2)↔丙(位1)
+        // → [乙,甲,丙]（词本位交换，与旧下标无关）
+        assert_eq!(texts2, ["乙", "甲", "丙"], "漂移后对调: {texts2:?}");
+        // 同位 / 越界 / 词不在页 → ok:false
+        let same = dispatch(&host, &json!({"op":"cand_swap","i":1,"j":1}), None);
+        assert_eq!(same["ok"], json!(false), "同位拒绝");
+        let oob = dispatch(&host, &json!({"op":"cand_swap","i":0,"j":9}), None);
+        assert_eq!(oob["ok"], json!(false), "页外拒绝");
+        let miss = dispatch(
+            &host,
+            &json!({"op":"cand_swap","i":0,"j":2,"text_i":"不存在","text_j":"丙"}),
+            None,
+        );
+        assert_eq!(miss["ok"], json!(false), "词不在列表拒绝");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -14,7 +14,9 @@ pub fn parse(lines: &[String]) -> RawTable {
     for line in lines {
         let t = line.trim_end();
         let t = t.trim();
-        if t.is_empty() || t.starts_with('#') {
+        // 【# 可作词条 2026-10-09】`#\t码` 行是数据（词=#）不是注释——
+        // 无 Tab 的 # 行才是注释（与 symbols 同款规则）。
+        if t.is_empty() || (t.starts_with('#') && !t.contains('\t')) {
             continue;
         }
         if t.starts_with("---config@") {

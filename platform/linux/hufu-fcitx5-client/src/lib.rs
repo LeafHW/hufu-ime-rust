@@ -67,6 +67,10 @@ pub struct HufuHost {
             c_int,
         ),
     >,
+    /// 引擎提交「{加词}」时调用（Windows 的 /jc 入口；可为 None）。
+    pub addword: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// 引擎提交「{加权}」时调用（Windows 的 /jq 入口；可为 None）。
+    pub weight: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 /// 回调期存活的字符串与指针（仅在 `deliver` 内构建/使用）。
@@ -360,6 +364,8 @@ pub struct HufuClient {
     config: Option<serde_json::Value>,
     /// `hufu_client_config_str` 返回值缓存（C++ 侧同步拷走）
     config_scratch: CString,
+    /// 状态区菜单返回值缓存（如导出路径；C++ 侧同步拷走）
+    menu_scratch: CString,
     /// 字反查索引（宿主首次触发时才装载；`None` = 未初始化或数据不可用）
     char_lookup: Option<CharLookup>,
     /// `hufu_client_char_lookup` 返回值缓存（C++ 侧同步拷走）
@@ -388,6 +394,7 @@ impl HufuClient {
             last_back: 0,
             config: None,
             config_scratch: CString::default(),
+            menu_scratch: CString::default(),
             char_lookup: None,
             char_lookup_row: CString::default(),
             sound_pending: CString::default(),
@@ -488,6 +495,151 @@ impl HufuClient {
         self.call(&serde_json::json!({"op": "open_schema_dir"}))
             .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// 托盘「打开设置页」：请 server 用 xdg-open 打开 Web 设置页
+    /// （`http://127.0.0.1:<port>/`）；1=成功，0=失败（含引擎不在线）。
+    pub fn settings(&mut self) -> bool {
+        self.call(&serde_json::json!({"op": "settings"}))
+            .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// 方案清单（状态菜单「切换方案」）：返回（当前方案，全部方案名排序）。
+    pub fn schemas(&mut self) -> Option<(String, Vec<String>)> {
+        let resp = self.call(&serde_json::json!({"op": "schemas"}))?;
+        let current = resp
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let names = resp
+            .get("schemas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((current, names))
+    }
+
+    /// [`Self::schemas`] 的 C 指针包装：首行当前方案，其余每行一个方案名；
+    /// 失败为空串。C++ 侧按行切分（方案名不含换行）。
+    pub fn schemas_text_ptr(&mut self) -> *const c_char {
+        let text = self
+            .schemas()
+            .map(|(cur, names)| {
+                let mut s = cur;
+                for n in names {
+                    s.push('\n');
+                    s.push_str(&n);
+                }
+                s
+            })
+            .unwrap_or_default();
+        self.menu_scratch = CString::new(text).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
+    /// 切换方案（状态菜单「切换方案」）：服务端换方案 + 清会话 + 落盘；
+    /// 1=成功。成功后调用方应再 `reset` 一次刷新面板。
+    pub fn set_schema(&mut self, name: &str) -> bool {
+        self.call(&serde_json::json!({"op": "set_schema", "name": name}))
+            .map(|v| {
+                v.get("schemas").is_some()
+                    && v.get("current").and_then(|c| c.as_str()) == Some(name)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 托盘「导出码表」：请引擎导出当前方案（含用户调整合并快照）并打开
+    /// 导出目录；返回导出文件路径，失败/引擎不在线返回 `None`。
+    pub fn export_schema(&mut self) -> Option<String> {
+        let resp = self.call(&serde_json::json!({"op": "export_schema"}))?;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        resp.get("path")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string)
+    }
+
+    /// 同 [`Self::export_schema`]，把路径写入 `menu_scratch` 并返回 C 指针
+    /// （失败为空串）。C++ 侧同步拷走。
+    pub fn export_schema_ptr(&mut self) -> *const c_char {
+        let path = self.export_schema().unwrap_or_default();
+        self.menu_scratch = CString::new(path).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
+    /// 原生加词框：写当前方案用户调整（与 Web 设置页同一落盘逻辑）。
+    /// 成功为空；失败返回服务端错误文案（编码为空/个人存储表等）。
+    pub fn aw_add(&mut self, code: &str, text: &str, pos: i64) -> Result<(), String> {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "aw_add",
+            "code": code,
+            "text": text,
+            "pos": pos,
+        })) else {
+            return Err("引擎不在线".into());
+        };
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("加词失败")
+                .to_string())
+        }
+    }
+
+    /// [`Self::aw_add`] 的 C 指针包装：成功为空串，失败为错误文案
+    ///（指向 `menu_scratch`，下次调用前有效）。
+    pub fn aw_add_ptr(&mut self, code: &str, text: &str, pos: i64) -> *const c_char {
+        let msg = self.aw_add(code, text, pos).err().unwrap_or_default();
+        self.menu_scratch = CString::new(msg).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
+    /// 原生加权框：写当前方案补充语料（与 Web POST /api/user_word/weight
+    /// 同一落盘逻辑）。成功为空；失败返回服务端错误文案。
+    pub fn aw_weight(&mut self, text: &str, weight: i64) -> Result<(), String> {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "aw_weight",
+            "text": text,
+            "weight": weight,
+        })) else {
+            return Err("引擎不在线".into());
+        };
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("加权失败")
+                .to_string())
+        }
+    }
+
+    /// 状态菜单「个人存储表…」：请 server 用系统编辑器打开当前方案
+    /// `个人存储表.txt`（隐私词库）；返回是否成功。
+    pub fn open_personal(&mut self) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({"op": "open_personal"})) else {
+            return false;
+        };
+        resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// [`Self::aw_weight`] 的 C 指针包装：成功为空串，失败为错误文案
+    ///（指向 `menu_scratch`，下次调用前有效）。
+    pub fn aw_weight_ptr(&mut self, text: &str, weight: i64) -> *const c_char {
+        let msg = self.aw_weight(text, weight).err().unwrap_or_default();
+        self.menu_scratch = CString::new(msg).unwrap_or_default();
+        self.menu_scratch.as_ptr()
     }
 
     /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
@@ -713,6 +865,54 @@ impl HufuClient {
         self.apply_outcome_response(resp).0
     }
 
+    /// 候选菜单动作（状态菜单「候选管理」）：`action` ∈ front/del/fwd/back/last，
+    /// `text` 是当前选中候选词（防异步重排漂移），`page_index` 是页内下标。
+    /// 成功后把回包 `state` 送达宿主刷新候选面板；返回是否成功。
+    pub fn cand_menu(&mut self, action: &str, text: &str, page_index: usize) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "cand_menu",
+            "action": action,
+            "text": text,
+            "page_index": page_index,
+        })) else {
+            return false;
+        };
+        self.apply_ok_state(resp)
+    }
+
+    /// 候选对调（状态菜单「与下条对调」）：i/j 为页内下标，text_i/text_j
+    /// 供服务端防漂移校验；成功后刷新候选面板。
+    pub fn cand_swap(&mut self, i: usize, j: usize, text_i: &str, text_j: &str) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "cand_swap",
+            "i": i,
+            "j": j,
+            "text_i": text_i,
+            "text_j": text_j,
+        })) else {
+            return false;
+        };
+        self.apply_ok_state(resp)
+    }
+
+    /// `{ok, state}` 回包：成功时把 state 原样送达宿主重绘（候选操作共用）。
+    fn apply_ok_state(&mut self, resp: serde_json::Value) -> bool {
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return false;
+        }
+        if let Some(state) = resp
+            .get("state")
+            .and_then(|v| serde_json::from_value::<SessionState>(v.clone()).ok())
+        {
+            let outcome = KeyOutcome {
+                consumed: true,
+                ..Default::default()
+            };
+            self.deliver(&outcome, &state);
+        }
+        true
+    }
+
     /// `{outcome, state}` 回包 → 回调送达 + `(consumed, back)`。
     /// key/select 共用（协议同构）。
     fn apply_outcome_response(&mut self, resp: serde_json::Value) -> (bool, u8) {
@@ -774,10 +974,18 @@ impl HufuClient {
 
     /// 送达 commit + update 回调（C++ 侧同步拷贝）。
     fn deliver(&mut self, outcome: &KeyOutcome, state: &SessionState) {
-        if let Some(cb) = self.host.commit {
-            if let Some(text) = outcome.commit.as_deref() {
-                // 功能词指令不算上屏内容（与 DLL/pipe 同口径）
-                if !text.is_empty() && text != "{加词}" && text != "{隐藏候选}" {
+        if let Some(text) = outcome.commit.as_deref() {
+            // 功能词指令不算上屏内容（与 DLL/pipe 同口径）
+            if text == "{加词}" {
+                if let Some(addword) = self.host.addword {
+                    unsafe { addword(self.host.user) };
+                }
+            } else if text == "{加权}" {
+                if let Some(weight) = self.host.weight {
+                    unsafe { weight(self.host.user) };
+                }
+            } else if !text.is_empty() && text != "{隐藏候选}" {
+                if let Some(cb) = self.host.commit {
                     if let Ok(cs) = CString::new(text) {
                         unsafe { cb(self.host.user, cs.as_ptr()) };
                     }
@@ -857,6 +1065,8 @@ pub unsafe extern "C" fn hufu_client_new(
             user: std::ptr::null_mut(),
             commit: None,
             update: None,
+            addword: None,
+            weight: None,
         }
     } else {
         unsafe { *host }
@@ -926,6 +1136,72 @@ pub unsafe extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) ->
     }
 }
 
+/// 方案清单：首行当前方案，其余每行一个方案名（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）；失败为空串。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_schemas(c: *mut HufuClient) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.schemas_text_ptr()
+}
+
+/// 切换方案：1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_set_schema(c: *mut HufuClient, name: *const c_char) -> c_int {
+    if c.is_null() || name.is_null() {
+        return 0;
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    if unsafe { &mut *c }.set_schema(&name) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 候选菜单动作：`action` ∈ front/del/fwd/back/last，`text` 为当前候选词，
+/// `page_index` 为页内下标；1=成功，0=失败/引擎不在线。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_cand_menu(
+    c: *mut HufuClient,
+    action: *const c_char,
+    text: *const c_char,
+    page_index: c_int,
+) -> c_int {
+    if c.is_null() || action.is_null() || text.is_null() || page_index < 0 {
+        return 0;
+    }
+    let action = unsafe { CStr::from_ptr(action) }.to_string_lossy();
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    if unsafe { &mut *c }.cand_menu(&action, &text, page_index as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 候选对调：i/j 为页内下标，text_i/text_j 为对应候选词；1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_cand_swap(
+    c: *mut HufuClient,
+    i: c_int,
+    j: c_int,
+    text_i: *const c_char,
+    text_j: *const c_char,
+) -> c_int {
+    if c.is_null() || text_i.is_null() || text_j.is_null() || i < 0 || j < 0 {
+        return 0;
+    }
+    let text_i = unsafe { CStr::from_ptr(text_i) }.to_string_lossy();
+    let text_j = unsafe { CStr::from_ptr(text_j) }.to_string_lossy();
+    if unsafe { &mut *c }.cand_swap(i as usize, j as usize, &text_i, &text_j) {
+        1
+    } else {
+        0
+    }
+}
+
 /// 托盘「重载码表」：当前方案原样重载；1=成功（0=失败/引擎不在线，宿主保持现状）。
 #[no_mangle]
 pub unsafe extern "C" fn hufu_client_reload_schema(c: *mut HufuClient) -> c_int {
@@ -946,6 +1222,74 @@ pub unsafe extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_in
         return 0;
     }
     if unsafe { &mut *c }.open_schema_dir() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 托盘「打开设置页」：请 server 用 xdg-open 打开 Web 设置页；1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_settings(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.settings() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 托盘「导出码表」：成功返回导出文件路径（NUL 结尾，指向客户端内部缓冲，
+/// 下次调用前有效）；失败/引擎不在线返回空串（非 NULL）。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_export_schema(c: *mut HufuClient) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.export_schema_ptr()
+}
+
+/// 原生加词：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）。参数同 Web `POST /api/user_word/add`。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_aw_add(
+    c: *mut HufuClient,
+    code: *const c_char,
+    text: *const c_char,
+    pos: c_int,
+) -> *const c_char {
+    if c.is_null() || code.is_null() || text.is_null() || pos < 0 {
+        return std::ptr::null();
+    }
+    let code = unsafe { CStr::from_ptr(code) }.to_string_lossy();
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    unsafe { &mut *c }.aw_add_ptr(&code, &text, i64::from(pos))
+}
+
+/// 原生加权：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）。参数同 Web `POST /api/user_word/weight`。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_aw_weight(
+    c: *mut HufuClient,
+    text: *const c_char,
+    weight: i32,
+) -> *const c_char {
+    if c.is_null() || text.is_null() || weight <= 0 {
+        return std::ptr::null();
+    }
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    unsafe { &mut *c }.aw_weight_ptr(&text, i64::from(weight))
+}
+
+/// 打开当前方案个人存储表：1=成功，0=失败/文件不存在/引擎不在线。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_open_personal(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.open_personal() {
         1
     } else {
         0
@@ -1206,6 +1550,8 @@ mod tests {
     struct Capture {
         commits: Vec<String>,
         updates: Vec<UpdateRecord>,
+        addwords: usize,
+        weights: usize,
     }
 
     fn cap_mut<'a>(user: *mut c_void) -> &'a mut Capture {
@@ -1217,6 +1563,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         cap_mut(user).commits.push(s);
+    }
+
+    unsafe extern "C" fn on_addword(user: *mut c_void) {
+        cap_mut(user).addwords += 1;
+    }
+
+    unsafe extern "C" fn on_weight(user: *mut c_void) {
+        cap_mut(user).weights += 1;
     }
 
     unsafe extern "C" fn on_update(
@@ -1295,6 +1649,61 @@ mod tests {
         })
     }
 
+    #[test]
+    fn addword_directive_calls_host_callback() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let mut client = HufuClient::new(
+            PathBuf::from("/tmp/hufu-addword-test.sock"),
+            HufuHost {
+                user: cap_ptr as *mut c_void,
+                commit: Some(on_commit),
+                update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
+            },
+        );
+        let resp = serde_json::json!({
+            "outcome": {
+                "consumed": true,
+                "commit": "{加词}",
+                "back": 0,
+                "state": null
+            }
+        });
+        let (_consumed, _back) = client.apply_outcome_response(resp);
+        assert_eq!(cap.addwords, 1);
+        assert!(cap.commits.is_empty());
+    }
+
+    #[test]
+    fn weight_directive_calls_host_callback() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let mut client = HufuClient::new(
+            PathBuf::from("/tmp/hufu-weight-test.sock"),
+            HufuHost {
+                user: cap_ptr as *mut c_void,
+                commit: Some(on_commit),
+                update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
+            },
+        );
+        let resp = serde_json::json!({
+            "outcome": {
+                "consumed": true,
+                "commit": "{加权}",
+                "back": 0,
+                "state": null
+            }
+        });
+        let (_consumed, _back) = client.apply_outcome_response(resp);
+        assert_eq!(cap.weights, 1);
+        assert_eq!(cap.addwords, 0);
+        assert!(cap.commits.is_empty());
+    }
+
     fn client_for(path: PathBuf, cap: *mut Capture) -> HufuClient {
         HufuClient::new(
             path,
@@ -1302,6 +1711,8 @@ mod tests {
                 user: cap as *mut c_void,
                 commit: Some(on_commit),
                 update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
             },
         )
     }
@@ -1613,6 +2024,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_and_export_schema_requests() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("settings-export");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"ok": true}),
+                serde_json::json!({"ok": true, "path": "/home/u/.local/share/hufu/导出/虎整句/虎整句.txt", "lines": 123}),
+                serde_json::json!({"ok": false, "error": "写文件失败"}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.settings(), "打开设置页：ok=true 即成功");
+        assert_eq!(
+            c.export_schema().as_deref(),
+            Some("/home/u/.local/share/hufu/导出/虎整句/虎整句.txt"),
+            "导出成功返回路径"
+        );
+        assert!(c.export_schema().is_none(), "ok=false 按失败处理");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0]["op"], "settings");
+        assert_eq!(reqs[1]["op"], "export_schema");
+        assert_eq!(reqs[2]["op"], "export_schema");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn menu_ops_offline_semantics() {
         let mut cap = Box::new(Capture::default());
         let cap_ptr: *mut Capture = &mut *cap;
@@ -1621,6 +2062,8 @@ mod tests {
         // 引擎不在线：动作类（1/0）回 0，状态类回 -1（未知）——宿主保持现状、不崩。
         assert!(!c.reload_schema());
         assert!(!c.open_schema_dir());
+        assert!(!c.settings());
+        assert!(c.export_schema().is_none());
         assert_eq!(c.sound_toggle(), -1);
         assert_eq!(c.sound_state(), -1);
     }
@@ -1900,6 +2343,8 @@ mod tests {
                 user: std::ptr::null_mut(),
                 commit: None,
                 update: None,
+                addword: None,
+                weight: None,
             },
         )
     }
@@ -1947,6 +2392,57 @@ mod tests {
             "",
             "三份数据都没有的字"
         );
+    }
+
+    /// 加词与方案清单/切换的请求/回包格式（与 daemon op 对齐）。
+    #[test]
+    fn aw_add_and_schema_roundtrip() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("aw-schema");
+        let handle = mock_server(
+            path.clone(),
+            vec![
+                serde_json::json!({"ok": true}),
+                serde_json::json!({"current": "A", "schemas": ["A", "B"]}),
+                serde_json::json!({"current": "B", "schemas": ["A", "B"]}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.aw_add("dgs", "测试", 2).is_ok());
+        let (cur, names) = c.schemas().expect("schemas");
+        assert_eq!(cur, "A");
+        assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+        assert!(c.set_schema("B"));
+        handle.join().unwrap();
+    }
+
+    /// 候选菜单动作：`{ok,state}` 回包要把新候选送达宿主（面板即时刷新）。
+    #[test]
+    fn cand_menu_delivers_state() {
+        use hufu_types::{Candidate, CandidateKind};
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("cand-menu");
+        let state = SessionState {
+            raw: "a".into(),
+            candidates: vec![
+                Candidate::new("中", "a", CandidateKind::Dict),
+                Candidate::new("国", "a", CandidateKind::Dict),
+            ],
+            selected: 1,
+            ..Default::default()
+        };
+        let handle = mock_server(
+            path.clone(),
+            vec![serde_json::json!({"ok": true, "state": state})],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.cand_menu("front", "国", 1));
+        assert_eq!(cap.updates.len(), 1, "cand_menu 应触发一次 update");
+        assert_eq!(cap.updates[0].2, vec!["中".to_string(), "国".to_string()]);
+        assert_eq!(cap.updates[0].4, 1, "高亮下标原样送达");
+        handle.join().unwrap();
     }
 
     /// 缺文件：目录不存在 / 只有拼音注释（码表缺）都要优雅降级，不 panic。

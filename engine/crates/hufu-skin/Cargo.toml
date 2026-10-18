@@ -7,3 +7,12 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 【SSF M1】.ssf 三代容器解析（明文 ZIP / Skin v1 / Skin v3 AES）。
+# 本 crate 仅被 hufu-server 链接（DLL 不链接），无 i686-gnu 约束。
+encoding_rs = { workspace = true }
+thiserror = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true, features = ["alloc", "block-padding"] }
+flate2 = { workspace = true }
+# 【QPYS】QQ 皮肤内层 OLE 复合文档读取。
+cfb = { workspace = true }

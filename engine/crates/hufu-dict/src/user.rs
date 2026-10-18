@@ -22,6 +22,12 @@ pub enum AdjustOp {
     Remove,
     /// 加权：把 `码→词` 提到候选前部（用户词 weight 列）
     Weight,
+    /// 【整序标记 2026-10-09】该码接下来的连续 {添加}pN 行是**完整
+    /// 清单快照**（adjust_set_order 落盘）：回放先清空该码基础列表再
+    /// 逐行重建——快照即全量，码表里未被提及的词条（含原生占位符）
+    /// 不再残留队尾。旧版无标记文件回放语义不变（部分操作叠加）。
+    /// 旧版程序读到 `{整序}码` 行按未知标记静默忽略，可降级。
+    SetOrder,
 }
 
 /// 一条调整日志（保持文件时序——回放语义的基础）。
@@ -47,6 +53,17 @@ pub struct UserAdjust {
     pub weights: HashMap<(String, String), f64>,
 }
 
+/// 单个带圈数字（占位符形态）：①-㉝（U+2460..2473）、㉑-㉟
+///（U+3251..325F）——与引擎 circled_val/circled_char 同口径。
+/// 【判定口径·用户拍板 2026-10-09】纯形态判定，不看来源。
+fn is_circled_word(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(
+        (cs.next(), cs.next()),
+        (Some('\u{2460}'..='\u{2473}' | '\u{3251}'..='\u{325F}'), None)
+    )
+}
+
 impl UserAdjust {
     pub fn parse(lines: &[String]) -> Self {
         let mut adj = UserAdjust::default();
@@ -64,9 +81,25 @@ impl UserAdjust {
                 (AdjustOp::Remove, r)
             } else if let Some(r) = t.strip_prefix("{加权}") {
                 (AdjustOp::Weight, r)
+            } else if let Some(r) = t.strip_prefix("{整序}") {
+                (AdjustOp::SetOrder, r)
             } else {
                 continue;
             };
+            // {整序}码：只需码列（无词列），单列也收
+            if op == AdjustOp::SetOrder {
+                let code = rest.split('\t').next().unwrap_or("").trim().to_string();
+                if code.is_empty() {
+                    continue;
+                }
+                adj.log.push(AdjustEntry {
+                    op,
+                    code,
+                    word: String::new(),
+                    pos: None,
+                });
+                continue;
+            }
             // 【列分隔 2026-11 修复】含 TAB 的行严格按 TAB 分割——词可
             // 含空格（{添加}ae\tipad mini\tp6 的「ipad mini」曾是空格
             // 分割丢尾成幽灵「ipad」）。无 TAB 行（旧虎爪内嵌行）保持
@@ -116,6 +149,9 @@ impl UserAdjust {
                 AdjustOp::Remove => {
                     adj.removes.insert((code.clone(), word.clone()));
                 }
+                AdjustOp::SetOrder => {
+                    // 整序标记不参与删除态集合（无词列）
+                }
             }
             adj.log.push(AdjustEntry {
                 op,
@@ -140,7 +176,12 @@ impl UserAdjust {
                 AdjustOp::Add => "{添加}",
                 AdjustOp::Remove => "{删除}",
                 AdjustOp::Weight => "{加权}",
+                AdjustOp::SetOrder => "{整序}",
             };
+            if e.op == AdjustOp::SetOrder {
+                out.push(format!("{mark}{}", e.code));
+                continue;
+            }
             let mut l = format!("{mark}{}\t{}", e.code, e.word);
             if let Some(p) = e.pos {
                 l.push_str(&format!("\tp{p}"));
@@ -175,8 +216,18 @@ impl UserAdjust {
     /// 有 {添加} 行（added() 恒真，用户词合并不再重复）。置顶/删除/
     /// 加权行不动（他词语义保留）。
     pub fn set_order(&mut self, code: &str, words: &[String]) {
-        self.log
-            .retain(|e| !(e.code == code && e.op == AdjustOp::Add));
+        self.log.retain(|e| {
+            !(e.code == code && (e.op == AdjustOp::Add || e.op == AdjustOp::SetOrder))
+        });
+        // 【整序标记 2026-10-09】先落 {整序}码 行——回放清空基础列表，
+        // 后续 {添加}pN 行=完整清单重建（码表孤儿词条/原生占位符不再
+        // 残留队尾：用户实锤 QQ五笔 pa 三轮「多一个」）。
+        self.log.push(AdjustEntry {
+            op: AdjustOp::SetOrder,
+            code: code.to_string(),
+            word: String::new(),
+            pos: None,
+        });
         // 【置顶归一 2026-10-07】整序集内的词位次全由 pN 管理——同码
         // 的 {置顶} 行一并清（否则内存置顶残留占首选位：加词默认首选
         // 被顶成 2 选；且置顶词对 pN 重排「不动」会吃掉后续调频）。
@@ -286,6 +337,7 @@ impl UserAdjust {
             } else if t.starts_with("{置顶}")
                 || t.starts_with("{删除}")
                 || t.starts_with("{加权}")
+                || t.starts_with("{整序}")
             {
                 adj_lines.push(l.clone());
             } else if t.starts_with('#') || t.is_empty() {
@@ -342,6 +394,12 @@ impl UserAdjust {
                         out.insert(0, entry);
                     }
                 }
+                AdjustOp::SetOrder => {
+                    // 【整序标记 2026-10-09】完整清单快照：清空该码基础
+                    // 列表，后续 {添加}pN 行重建——快照即全量，未被提及
+                    // 的码表词条（含原生占位符）不再残留队尾。
+                    out.clear();
+                }
                 AdjustOp::Add => {
                     if let Some(n) = e.pos {
                         if let Some(hit) = out.iter().position(|x| x.text == e.word) {
@@ -353,6 +411,52 @@ impl UserAdjust {
                                 out.insert(idx, entry);
                             } else {
                                 out.insert(hit.min(out.len()), entry);
+                            }
+                        } else if is_circled_word(&e.word) {
+                            // 【占位符跟号·回放融合 2026-10-09】整序快照
+                            // 会把带圈占位词改号（③→②），旧号词条不在快
+                            // 照集里——按用户拍板的纯形态判定，占位符可互
+                            // 换顶替：找列表中**未被任何 Add/Pin 行认领、
+                            // 也没被 {删除} 行点名**的带圈词条，改号+移位
+                            //（不新增条目）。否则码表原生占位符残留队尾，
+                            // 候选/导出多一个（用户实锤两轮：QQ五笔 pa 原
+                            // ③④，先 ② 顶 ③ 后 ⑤ 顶 ④——初版「该码有
+                            // 删除占位符行就整段关闭」关门太死，⑤ 不敢顶
+                            // ④ 又甩出尾巴；收窄为只豁免被点名删除的号，
+                            // 显式删 ③ 时 ③ 不被复活也不连坐别的圈词）。
+                            let claimed: Vec<&str> = self
+                                .log
+                                .iter()
+                                .filter(|x| {
+                                    x.code == code
+                                        && matches!(x.op, AdjustOp::Add | AdjustOp::Pin)
+                                })
+                                .map(|x| x.word.as_str())
+                                .collect();
+                            let removed: Vec<&str> = self
+                                .log
+                                .iter()
+                                .filter(|x| x.code == code && x.op == AdjustOp::Remove)
+                                .map(|x| x.word.as_str())
+                                .collect();
+                            match out.iter().position(|x| {
+                                is_circled_word(&x.text)
+                                    && !claimed.contains(&x.text.as_str())
+                                    && !removed.contains(&x.text.as_str())
+                            }) {
+                                Some(hit2) => {
+                                    let mut entry = out.remove(hit2);
+                                    entry.text = e.word.clone();
+                                    let idx = (n - 1).min(out.len());
+                                    out.insert(idx, entry);
+                                }
+                                None => {
+                                    let idx = (n - 1).min(out.len());
+                                    out.insert(
+                                        idx,
+                                        DictEntry::new(e.code.clone(), e.word.clone(), u32::MAX - 1),
+                                    );
+                                }
                             }
                         } else {
                             let idx = (n - 1).min(out.len());
@@ -553,6 +657,185 @@ mod tests {
         // 序列化回放等价
         let adj2 = UserAdjust::parse(&adj.to_lines());
         assert_eq!(adj2.apply("a", &base()), out);
+    }
+
+    // 【占位符跟号·回放融合 2026-10-09】用户实锤（QQ五笔 pa）：码表
+    // 原生 [宽,成功,③,④,方式]，整序快照改号后 {添加} 行是
+    // [宽p1,②p2,方式p3,④p4,成功p5,⑥p6]——旧 ③ 不在快照集，老逻辑
+    // 原样残留队尾（候选/导出多一个占位符）。修复：带圈词插入时找
+    // 未认领的带圈词条改号顶替（③→②；⑥ 无可顶替=真新增）。
+    #[test]
+    fn placeholder_renumber_consumes_old_dict_entry() {
+        let lines: Vec<String> = vec![
+            "{添加}pa\t宽\tp1".into(),
+            "{添加}pa\t②\tp2".into(),
+            "{添加}pa\t方式\tp3".into(),
+            "{添加}pa\t④\tp4".into(),
+            "{添加}pa\t成功\tp5".into(),
+            "{添加}pa\t⑥\tp6".into(),
+        ];
+        let base: Vec<DictEntry> = ["宽", "成功", "③", "④", "方式"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DictEntry::new("pa", *t, i as u32))
+            .collect();
+        let adj = UserAdjust::parse(&lines);
+        let out = adj.apply("pa", &base);
+        let texts: Vec<&str> = out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts, ["宽", "②", "方式", "④", "成功", "⑥"],
+            "旧 ③ 被 ② 改号顶替、无残留尾巴: {texts:?}"
+        );
+
+        // 快照只重号不增词（纯改号场景）：③④ 移位改号，不新增
+        let lines2: Vec<String> = vec![
+            "{添加}pa\t宽\tp1".into(),
+            "{添加}pa\t④\tp2".into(),
+            "{添加}pa\t③\tp3".into(),
+            "{添加}pa\t成功\tp4".into(),
+            "{添加}pa\t方式\tp5".into(),
+        ];
+        let adj2 = UserAdjust::parse(&lines2);
+        let out2 = adj2.apply("pa", &base);
+        let texts2: Vec<&str> = out2.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts2, ["宽", "④", "③", "成功", "方式"],
+            "认领集合防误吃：④③ 各自的行都在，互换号不增条目: {texts2:?}"
+        );
+
+        // 序列化回放等价
+        let adj3 = UserAdjust::parse(&adj.to_lines());
+        assert_eq!(adj3.apply("pa", &base), out);
+    }
+
+    // 【整序标记 2026-10-09 根治】三轮实锤同病灶：快照圈词行数 <
+    // 码表原生圈词数时，未认领的原生圈词成孤儿挂尾（②顶③后④残留/
+    // ⑤顶④后④又残/快照1圈词对dict2圈词）。根治：set_order 落
+    // {整序}标记，回放清空基础列表重建——快照即完整清单。
+    #[test]
+    fn full_order_marker_replaces_base_entirely() {
+        let base: Vec<DictEntry> = ["宽", "成功", "③", "④", "方式"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DictEntry::new("pa", *t, i as u32))
+            .collect();
+
+        // 现场三（快照 1 圈词对 dict 2 圈词）：无标记→④孤儿；
+        // 加标记→恰好快照 5 条
+        let lines_no: Vec<String> = vec![
+            "{删除}pa\t①".into(),
+            "{添加}pa\t的\tp1".into(),
+            "{添加}pa\t②\tp2".into(),
+            "{添加}pa\t宽\tp3".into(),
+            "{添加}pa\t方式\tp4".into(),
+            "{添加}pa\t成功\tp5".into(),
+        ];
+        let no_out = UserAdjust::parse(&lines_no).apply("pa", &base);
+        let t_no: Vec<&str> = no_out.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(t_no.len(), 6, "无标记旧语义：④ 孤儿挂尾（病灶复刻）");
+
+        let mut lines_yes = lines_no.clone();
+        lines_yes.insert(1, "{整序}pa".into());
+        let out_yes = UserAdjust::parse(&lines_yes).apply("pa", &base);
+        let t_yes: Vec<&str> = out_yes.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            t_yes, ["的", "②", "宽", "方式", "成功"],
+            "有标记：快照即全量，无孤儿: {t_yes:?}"
+        );
+
+        // 序列化回放等价（{整序}行往返）
+        let adj2 = UserAdjust::parse(&lines_yes);
+        assert_eq!(UserAdjust::parse(&adj2.to_lines()).apply("pa", &base), out_yes);
+
+        // set_order 写入端：内存 log 自带标记 + 整套行
+        let mut adj3 = UserAdjust::default();
+        adj3.set_order("pa", &["的", "②", "宽", "方式", "成功"].map(String::from).to_vec());
+        let lines3 = adj3.to_lines();
+        assert!(lines3[0].starts_with("{整序}pa"), "首行标记: {lines3:?}");
+        assert_eq!(adj3.apply("pa", &base), out_yes, "set_order 内存回放同结果");
+        // 二次整序：旧标记+旧行整套换新，不叠标记
+        adj3.set_order("pa", &["宽", "的"].map(String::from).to_vec());
+        let lines4 = adj3.to_lines();
+        assert_eq!(
+            lines4.iter().filter(|l| l.starts_with("{整序}pa")).count(),
+            1,
+            "标记不叠加: {lines4:?}"
+        );
+        let out4 = adj3.apply("pa", &base);
+        let t4: Vec<&str> = out4.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(t4, ["宽", "的"], "二次整序覆盖: {t4:?}");
+
+        // 标记后续加单行（加词）：在快照清单上追加
+        let mut lines5 = lines_yes.clone();
+        lines5.push("{添加}pa\t新词\tp2".into());
+        let out5 = UserAdjust::parse(&lines5).apply("pa", &base);
+        let t5: Vec<&str> = out5.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(t5, ["的", "新词", "②", "宽", "方式", "成功"], "标记后单加照常插位");
+    }
+
+    // 【占位符跟号·收窄防御 2026-10-09 用户实锤第二轮】初版整段关闭
+    //（该码有删除占位符行即禁顶替）关门太死：用户现场 {删除}③ 在前 +
+    // 新快照 [成功p1..⑤p5]（无 ④ 行）→ ⑤ 不敢顶未被认领的码表原生
+    // ④ → ④ 甩尾巴。收窄：只豁免被 {删除} 点名的号。
+    #[test]
+    fn placeholder_consume_with_delete_row() {
+        let base: Vec<DictEntry> = ["宽", "成功", "③", "④", "方式"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DictEntry::new("pa", *t, i as u32))
+            .collect();
+
+        // 现场一：删除行在前（rewrite 后文件形态）——⑤ 顶掉 ④，
+        // ③ 由删除行自理，共 5 条无尾巴。
+        let lines1: Vec<String> = vec![
+            "{删除}pa\t③".into(),
+            "{添加}pa\t成功\tp1".into(),
+            "{添加}pa\t宽\tp2".into(),
+            "{添加}pa\t泂\tp3".into(),
+            "{添加}pa\t方式\tp4".into(),
+            "{添加}pa\t⑤\tp5".into(),
+        ];
+        let adj1 = UserAdjust::parse(&lines1);
+        let out1 = adj1.apply("pa", &base);
+        let t1: Vec<&str> = out1.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            t1, ["成功", "宽", "泂", "方式", "⑤"],
+            "删除行在前：⑤ 顶 ④、无尾巴: {t1:?}"
+        );
+
+        // 现场二：删除行在后（先快照后删 ③ 的时序）——② 不得吃被
+        // 点名的 ③（它由后面的删除行自理），也不得吃被认领的 ④，
+        // 只能当真新增插入；最终 ③ 删除、六条整。
+        let lines2: Vec<String> = vec![
+            "{添加}pa\t宽\tp1".into(),
+            "{添加}pa\t②\tp2".into(),
+            "{添加}pa\t方式\tp3".into(),
+            "{添加}pa\t④\tp4".into(),
+            "{添加}pa\t成功\tp5".into(),
+            "{添加}pa\t⑥\tp6".into(),
+            "{删除}pa\t③".into(),
+        ];
+        let adj2 = UserAdjust::parse(&lines2);
+        let out2 = adj2.apply("pa", &base);
+        let t2: Vec<&str> = out2.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            t2, ["宽", "②", "方式", "④", "成功", "⑥"],
+            "删除行在后：② 不吃被点名/被认领的圈词、③ 自理: {t2:?}"
+        );
+
+        // 显式删除占位符后加新占位符：不吃被删号（已删不在列表），
+        // 未认领且未点名删除的 ③ 照常被顶替（占位符数量跟调整意图走）。
+        let lines3: Vec<String> = vec![
+            "{删除}pa\t④".into(),
+            "{添加}pa\t⑦\tp7".into(),
+        ];
+        let adj3 = UserAdjust::parse(&lines3);
+        let out3 = adj3.apply("pa", &base);
+        let t3: Vec<&str> = out3.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            t3, ["宽", "成功", "方式", "⑦"],
+            "删 ④ 后加 ⑦：被删号不吃、未认领的 ③ 顶替成 ⑦（p7 超长落尾）: {t3:?}"
+        );
     }
 
     #[test]

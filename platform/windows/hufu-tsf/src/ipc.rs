@@ -73,7 +73,9 @@ impl SpawnBlock {
 /// 自愈：server 不在（管道打不开且无实例等待）时拉起 hufu-server.exe。
 /// 每进程只试一次，防拉起风暴。返回 true=本次调用确实拉起了。
 /// 读 HKCU\Software\HuFu 的 InstallDir（安装器写入的绿色模式安装目录）。
-fn read_installdir() -> Option<String> {
+/// 【公开 2026-10-08】fontinfo 侧（lib.rs find_font_files）解析字体目录
+/// 也用它——SystemIME 副本 DLL 的自身路径不在安装根，必须走注册表。
+pub(crate) fn read_installdir() -> Option<String> {
     use std::ffi::c_void;
     #[link(name = "advapi32")]
     unsafe extern "system" {

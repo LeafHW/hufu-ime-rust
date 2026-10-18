@@ -2,193 +2,206 @@
 # SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# 虎符输入法 · Linux 卸载
-#
-# 用法与选项见 usage()（platform/linux/uninstall.sh --help）。
+# 虎符 Linux 卸载：-s 系统级、-u 用户级、-m 模型；可组合，空参无效。
 set -euo pipefail
 
 usage() {
-    cat <<'EOF'
+    cat <<'USAGE'
 虎符输入法 · Linux 卸载（在仓库根目录执行）
-用法：platform/linux/uninstall.sh [选项]
+用法：platform/linux/uninstall.sh -s|-u|-m [...]
+      platform/linux/uninstall.sh -s -u -m
 
-  --purge       连「模型」一起删（整树删除，事后无需手动清理）
-  --no-system   跳过系统级删除（/usr/lib/fcitx5 等，无需 sudo）
-  --dry-run     只打印将要执行的每一个改动性动作（rm/sudo/systemctl/pkill），
-                不产生任何副作用，退出码 0
+  -s, --system  清理系统级 fcitx5 文件（需要 sudo）
+  -u, --user    清理用户级 addon、服务与数据
+  -m, --model   删除「模型」目录（约 880MB）
   -h, --help    显示本用法
 
-默认**除「模型」外全部删净**：系统级 addon、用户级文件与 systemd 服务、运行期 socket 与
-音效缓存，以及数据目录 `~/.local/share/hufu/` 下除 `模型/` 以外的全部内容（码表、配置、
-用户词与调整日志、皮肤、diag）。模型体积大且由用户手动获取，脚本不擅自删——结束时给出
-「手动删除模型命令」。
-EOF
+至少指定一项，可任意组合：
+  -s            只清系统级
+  -u            只清用户级，保留模型
+  -m            只删模型，其余用户数据保留
+  -s -u         系统级 + 用户级
+  -u -m         用户级 + 模型
+  -s -u -m      全部清理
+短选项可合并，如 -su、-sum、-um。
+空参、-h、--help 均显示本用法。
+USAGE
 }
 
-PURGE=0
-NO_SYSTEM=0
-DRY_RUN=0
-# 仓库根（用于读 assets/MANIFEST）；数据目录与 install.sh 同一默认值。
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-MANIFEST="$ROOT/assets/MANIFEST"
-HUFU_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/hufu"
-
-# 用户级落点：遵守 XDG（与 install.sh 同一套定义）
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
-# 可执行文件不在 $XDG_DATA 下：用户级 bin 的标准落点是 ~/.local/bin（见 install.sh 的说明）
+HUFU_ROOT="$XDG_DATA/hufu"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-for a in "$@"; do
-    case "$a" in
-        --purge) PURGE=1 ;;
-        --no-system) NO_SYSTEM=1 ;;
-        --dry-run) DRY_RUN=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "未知参数: $a（--help 看用法）" >&2; exit 2 ;;
+
+system_addon_dir() {
+    local libdir=''
+    if command -v pkg-config >/dev/null 2>&1; then
+        libdir=$(pkg-config --variable=libdir Fcitx5Core 2>/dev/null || true)
+    fi
+    [[ -n "$libdir" ]] || libdir=/usr/lib
+    printf '%s/fcitx5\n' "$libdir"
+}
+SYSTEM_ADDON_DIR="$(system_addon_dir)"
+SYSTEM_ADDON_DIRS=("$SYSTEM_ADDON_DIR")
+[[ "$SYSTEM_ADDON_DIR" != /usr/lib/fcitx5 ]] && SYSTEM_ADDON_DIRS+=(/usr/lib/fcitx5)
+
+if (($# == 0)); then
+    usage
+    exit 0
+fi
+
+DO_SYSTEM=0
+DO_USER=0
+DO_MODEL=0
+set_flag() {
+    case "$1" in
+        s) DO_SYSTEM=1 ;;
+        u) DO_USER=1 ;;
+        m) DO_MODEL=1 ;;
+    esac
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --system) set_flag s; shift ;;
+        --user) set_flag u; shift ;;
+        --model) set_flag m; shift ;;
+        --help) usage; exit 0 ;;
+        --) shift; break ;;
+        --*) echo "✗ 未知选项: $1（--help 看用法）" >&2; exit 2 ;;
+        -?*)
+            cluster=${1#-}
+            while [[ -n "$cluster" ]]; do
+                ch=${cluster:0:1}
+                cluster=${cluster:1}
+                case "$ch" in
+                    s|u|m) set_flag "$ch" ;;
+                    h) usage; exit 0 ;;
+                    *) echo "✗ 未知选项: -$ch（--help 看用法）" >&2; exit 2 ;;
+                esac
+            done
+            shift ;;
+        *) echo "✗ 不支持位置参数: $1（--help 看用法）" >&2; exit 2 ;;
     esac
 done
+if (($# > 0)); then
+    echo "✗ 不支持位置参数: $1（--help 看用法）" >&2
+    exit 2
+fi
+if ((!DO_SYSTEM && !DO_USER && !DO_MODEL)); then
+    echo '✗ 必须至少指定 -s、-u、-m 之一（--help 看用法）' >&2
+    exit 2
+fi
 
-# 防呆：不要用 sudo 跑整个脚本（用户级清理会落到 /root）
 if [[ "$EUID" -eq 0 ]]; then
     echo '✗ 请勿用 sudo 运行整个脚本（用户级清理会落到 /root）。' >&2
-    echo '  正确用法：./platform/linux/uninstall.sh（系统级删除由脚本内部调 sudo）' >&2
     exit 2
 fi
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 
-# 收尾提示的两色（终端且未设 NO_COLOR 时才上色：管道/日志里不留转义码）
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-    C_ORANGE=$'\033[38;5;208m'; C_GREEN=$'\033[32m'; C_OFF=$'\033[0m'
+if ((DO_USER)); then
+    say '① 停止 hufu-server'
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        systemctl --user disable --now hufu-server.service 2>/dev/null || true
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    rm -f "$XDG_CONFIG/systemd/user/hufu-server.service"
+    pkill -x hufu-server 2>/dev/null || true
+    rm -f "${XDG_RUNTIME_DIR:-/tmp}/hufu-ime.sock" /tmp/hufu-ime.sock 2>/dev/null || true
+    rm -rf "${XDG_RUNTIME_DIR:-/tmp}/hufu-sound" 2>/dev/null || true
+    rm -f "${TMPDIR:-/tmp}/hufu-server-trace.log" 2>/dev/null || true
 else
-    C_ORANGE=''; C_GREEN=''; C_OFF=''
+    say '① 未指定 -u：保留用户服务与运行时'
 fi
-hint() { printf '%s%s%s\n' "$C_ORANGE" "$*" "$C_OFF"; }      # 橙色：中文提示
-show_code() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_OFF"; }  # 绿色：命令
 
-# ── dry-run 支撑 ───────────────────────────────────────────────────────────
-# 约定：每一个改动性动作（rm / sudo / systemctl / pkill）都必须经 run() 落地，
-# 不允许直接调用——漏一处，--dry-run 就少报一次真实副作用。
-# 只读探测（command -v / systemctl show-environment）不走这里。
-run() { # --dry-run 时只回显命令行
-    if [[ "$DRY_RUN" == 1 ]]; then
-        printf '  [dry-run]'; printf ' %q' "$@"; printf '\n'
-        return 0
-    fi
-    "$@"
-}
-ok() { # 结果提示：dry-run 下不能报「已完成」（此刻什么都没做）
-    if [[ "$DRY_RUN" == 1 ]]; then
-        printf '  · [dry-run] 将会：%s\n' "$*"
+if ((DO_SYSTEM)); then
+    system_files=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && system_files+=("$f")
+    done < <(
+        for dir in "${SYSTEM_ADDON_DIRS[@]}"; do
+            [[ -f "$dir/libhufu.so" ]] && printf '%s\n' "$dir/libhufu.so"
+        done
+        for f in /usr/share/fcitx5/addon/hufu.conf \
+                 /usr/share/fcitx5/inputmethod/hufu.conf; do
+            [[ -e "$f" ]] && printf '%s\n' "$f"
+        done
+    )
+    if ((${#system_files[@]})); then
+        say '② 删除系统级 fcitx5 文件（需要 sudo）'
+        command -v sudo >/dev/null 2>&1 || die '需要 sudo 删除系统级文件；可改用 -u'
+        sudo rm -f "${system_files[@]}"
     else
-        printf '  ✓ %s\n' "$*"
-    fi
-}
-finish() { # 收尾提示：dry-run 不报「完成」，避免与真实卸载混淆
-    if [[ "$DRY_RUN" == 1 ]]; then
-        say 'dry-run 结束：以上为将要执行的全部动作，未做任何改动'
-    else
-        say "$1"
-        echo '重启 fcitx5 生效：fcitx5 -r -d'
-    fi
-}
-
-say '① 停止并禁用 hufu-server（systemd user）'
-if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    run systemctl --user disable --now hufu-server.service 2>/dev/null || true
-    run rm -f "$XDG_CONFIG/systemd/user/hufu-server.service"
-    run systemctl --user daemon-reload 2>/dev/null || true
-fi
-# 收尾：手动拉起（非 systemd）的残留引擎进程 + 运行期 socket 文件
-run pkill -x hufu-server 2>/dev/null || true
-run rm -f "${XDG_RUNTIME_DIR:-/tmp}/hufu-ime.sock" /tmp/hufu-ime.sock 2>/dev/null || true
-# 运行期残留：按键音效缓存目录（addon 落的 wav）与引擎诊断日志
-run rm -rf "${XDG_RUNTIME_DIR:-/tmp}/hufu-sound" 2>/dev/null || true
-run rm -f "${TMPDIR:-/tmp}/hufu-server-trace.log" 2>/dev/null || true
-
-if [[ "$NO_SYSTEM" == 1 ]]; then
-    say '② 跳过系统级删除（--no-system）'
-    echo '  之后执行：sudo rm -f /usr/lib/fcitx5/libhufu.so \'
-    echo '      /usr/share/fcitx5/addon/hufu.conf /usr/share/fcitx5/inputmethod/hufu.conf'
-else
-    say '② 删除 fcitx5 addon（需要 sudo）'
-    run sudo rm -f /usr/lib/fcitx5/libhufu.so \
-        /usr/share/fcitx5/addon/hufu.conf \
-        /usr/share/fcitx5/inputmethod/hufu.conf
-fi
-
-say '③ 删除用户级文件'
-run rm -f "$BIN_DIR/hufu-server" \
-    "$XDG_DATA/applications/hufu-settings.desktop" \
-    "$XDG_CONFIG/fcitx5/conf/hufu.conf" \
-    "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg" \
-    "$XDG_DATA/icons/hicolor/48x48/apps/hufu.png" \
-    "$XDG_DATA/icons/hicolor/22x22/apps/hufu.png"
-# 皮肤（fcitx5 主题形式）：只删我们装的 hufu-*（用户自己的主题不动）
-for theme_dir in "$XDG_DATA"/fcitx5/themes/hufu-*; do
-    if [[ -d "$theme_dir" ]]; then
-        run rm -rf "$theme_dir"
-    fi
-done
-run rmdir --ignore-fail-on-non-empty \
-    "$XDG_DATA/fcitx5/themes" "$XDG_DATA/fcitx5" 2>/dev/null || true
-
-# 图标缓存里的残留记录：有工具就重刷一次（没有工具时图标按目录实时解析，无碍）
-if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    run gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
-fi
-# 收空目录：install 建过的这几处若空着就一并收掉（用户本来就有内容时 rmdir 失败，无副作用）
-run rmdir --ignore-fail-on-non-empty \
-    "$XDG_DATA/icons/hicolor/scalable/apps" \
-    "$XDG_DATA/icons/hicolor/48x48/apps" \
-    "$XDG_DATA/icons/hicolor/22x22/apps" \
-    "$XDG_DATA/icons/hicolor/scalable" \
-    "$XDG_DATA/icons/hicolor/48x48" \
-    "$XDG_DATA/icons/hicolor/22x22" \
-    "$XDG_DATA/icons/hicolor" \
-    "$XDG_DATA/icons" \
-    "$XDG_DATA/applications" \
-    "$BIN_DIR" \
-    "$XDG_CONFIG/systemd/user" \
-    "$XDG_CONFIG/systemd" \
-    "$XDG_DATA" \
-    "$XDG_CONFIG" 2>/dev/null || true
-
-# ── 数据目录：默认除「模型」外全删（模型给出手动删除命令）──────────────────
-# 为什么不用台账逐个删：台账只登记 install.sh 装配进去的随包文件，用户词与调整
-# （码表/<方案>/用户调整.txt）、调整日志、config.json、皮肤、diag 都不在里面——
-# 逐个删会留下这些「用起来才有」的残留。默认按「除模型全删」执行，一次清干净。
-# 模型体积大（约 880MB）且由用户手动获取，脚本不擅自删：结束时打印手动删除命令。
-if [[ "$PURGE" == 1 ]]; then
-    say '④ 删除数据目录（--purge：含「模型」整树删除）'
-    if [[ -d "$HUFU_ROOT" ]]; then
-        run rm -rf "$HUFU_ROOT"
-        ok "删除 $HUFU_ROOT（整树）"
-    else
-        echo "  · $HUFU_ROOT 不存在，跳过"
+        say '② 系统级 fcitx5 文件未安装，跳过'
     fi
 else
-    say '④ 删除数据目录（除「模型」外全部删净；模型由你手动删）'
-    if [[ -d "$HUFU_ROOT" ]]; then
-        # 顶层逐项删（-maxdepth 1），只跳过「模型」：码表/数据 整树走，模型留下。
-        while IFS= read -r -d '' entry; do
-            run rm -rf "$entry"
-        done < <(find "$HUFU_ROOT" -mindepth 1 -maxdepth 1 ! -name 模型 -print0)
-        ok "删除 $HUFU_ROOT 下除「模型」以外的全部内容"
-    else
-        echo "  · $HUFU_ROOT 不存在，跳过"
-    fi
+    say '② 未指定 -s：保留系统级文件'
 fi
 
-if [[ "$PURGE" == 1 ]]; then
-    finish '完成 ✔（含模型，已全部删除）'
+if ((DO_USER)); then
+    say '③ 删除用户级 addon'
+    rm -f "$XDG_DATA/fcitx5/addon/hufu.conf" \
+        "$XDG_DATA/fcitx5/inputmethod/hufu.conf" \
+        "$XDG_DATA/fcitx5/lib/libhufu.so"
+    rmdir --ignore-fail-on-non-empty \
+        "$XDG_DATA/fcitx5/addon" \
+        "$XDG_DATA/fcitx5/inputmethod" \
+        "$XDG_DATA/fcitx5/lib" 2>/dev/null || true
+
+    say '④ 删除用户级文件'
+    rm -f "$BIN_DIR/hufu-server" \
+        "$XDG_DATA/applications/hufu-settings.desktop" \
+        "$XDG_CONFIG/fcitx5/conf/hufu.conf" \
+        "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg" \
+        "$XDG_DATA/icons/hicolor/48x48/apps/hufu.png" \
+        "$XDG_DATA/icons/hicolor/22x22/apps/hufu.png"
+    for theme_dir in "$XDG_DATA"/fcitx5/themes/hufu-*; do
+        if [[ -d "$theme_dir" ]]; then
+            rm -rf "$theme_dir"
+        fi
+    done
+    rmdir --ignore-fail-on-non-empty \
+        "$XDG_DATA/fcitx5/themes" "$XDG_DATA/fcitx5" \
+        "$XDG_DATA/icons/hicolor/scalable/apps" \
+        "$XDG_DATA/icons/hicolor/48x48/apps" \
+        "$XDG_DATA/icons/hicolor/22x22/apps" \
+        "$XDG_DATA/icons/hicolor/scalable" \
+        "$XDG_DATA/icons/hicolor/48x48" \
+        "$XDG_DATA/icons/hicolor/22x22" \
+        "$XDG_DATA/icons/hicolor" "$XDG_DATA/icons" \
+        "$XDG_DATA/applications" "$BIN_DIR" 2>/dev/null || true
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
+    fi
 else
-    finish '完成 ✔'
-    if [[ -d "$HUFU_ROOT/模型" ]]; then
-        hint '模型（约 880MB）由你手动获取，卸载脚本不擅自删除；如不再需要：'
-        show_code "手动删除模型命令：rm -rf $HUFU_ROOT/模型"
+    say '③④ 未指定 -u：保留用户级 addon、文件与桌面项'
+fi
+
+if ((DO_USER || DO_MODEL)); then
+    if ((DO_USER && DO_MODEL)); then
+        say '⑤ 删除数据与模型'
+        rm -rf "$HUFU_ROOT"
+    elif ((DO_USER)); then
+        say '⑤ 删除数据（保留模型）'
+        if [[ -d "$HUFU_ROOT" ]]; then
+            find "$HUFU_ROOT" -mindepth 1 -maxdepth 1 ! -name 模型 -exec rm -rf -- {} +
+        fi
+    else
+        say '⑤ 只删除模型'
+        rm -rf "$HUFU_ROOT/模型"
     fi
-    if command -v fcitx5-configtool >/dev/null 2>&1; then
-        hint '输入法列表里若还留着「虎符」条目，在 fcitx5-configtool 里移除即可。'
-    fi
+else
+    say '⑤ 未指定 -u/-m：保留数据与模型'
+fi
+
+say '完成 ✔'
+if ((DO_SYSTEM)); then echo '系统级文件已清理。'; fi
+if ((DO_USER)); then echo '用户级文件与数据已清理。'; fi
+if ((DO_MODEL)); then echo '模型已删除。'; fi
+if ((!DO_MODEL)) && [[ -d "$HUFU_ROOT/模型" ]]; then
+    echo "「模型」未动；如不再需要：platform/linux/uninstall.sh -m"
+fi
+if ((DO_SYSTEM || DO_USER)); then
+    echo '重启 fcitx5 生效：fcitx5 -r -d'
 fi

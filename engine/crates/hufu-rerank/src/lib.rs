@@ -18,6 +18,12 @@ pub struct Reranker {
 }
 
 impl Reranker {
+    /// 【空闲首击热身 2026-10-12】纯 Rust 引擎热身入口（2 线程迷你前向，
+    /// 详见 model.rs forward_warmup）。host.rs 在 >120s 空闲后首击前调。
+    pub fn warmup(&self) {
+        self.m.forward_warmup();
+    }
+
     pub fn load(path: &str) -> Result<Self, String> {
         let m = Qwen3::load(path)?;
         // BPE 从元数据构建。//【三十六修】open 会 read_to_end 整个数据段

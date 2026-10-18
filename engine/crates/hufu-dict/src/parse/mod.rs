@@ -107,6 +107,15 @@ fn contains_cjk(s: &str) -> bool {
 /// 嗅探格式：看前若干有效行。
 pub fn sniff_format(lines: &[String]) -> TableFormat {
     let mut data_checked = false;
+    // 【无头 Tab 方向投票 2026-10-16】方向（词前 vs 码前）不再由首条
+    // 数据行单行裁定：首行可能是纯拉丁词条（0私用.txt 首行
+    // `ceui\tyixx`）或 CJK 区外符号（1符号.txt 首行 `℃\tzq`，℃=
+    // U+2103 不在 contains_cjk 区间）——单行判反整个文件方向颠倒，
+    // 词被当码、码被当词，打不出任何字（用户实锤「0私用 1符号读不
+    // 到」）。改两列 CJK 票数投票（首列票多=词前；次列票多或平票=
+    // 码前，保持旧默认）。
+    let mut first_cjk = 0u32;
+    let mut second_cjk = 0u32;
     for line in lines.iter().take(64) {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
@@ -126,19 +135,23 @@ pub fn sniff_format(lines: &[String]) -> TableFormat {
             return TableFormat::RimeYaml;
         }
         if !data_checked {
-            // 无头格式：依据首条数据行判断
+            // 无头格式：依据首条数据行判断分隔方式；方向延后投票裁定
             if t.contains('\t') {
-                let first = t.split('\t').next().unwrap_or("");
-                return if contains_cjk(first) {
-                    TableFormat::WordFirstTsv
-                } else {
-                    TableFormat::Native
-                };
+                let mut cols = t.split('\t');
+                let first = cols.next().unwrap_or("");
+                let second = cols.next().unwrap_or("");
+                if contains_cjk(first) {
+                    first_cjk += 1;
+                }
+                if contains_cjk(second) {
+                    second_cjk += 1;
+                }
             } else if t.split_whitespace().count() >= 2 {
                 // 【词前格式空格行 2026-09-05】整文件用空格分隔的词前
                 // 格式（如「的 u3」「来 a8」）：首列是汉字 → 词在前码
                 // 在后（多多类变体，无 ---config@ 头）；首列拉丁 → 虎
-                // 整句「码 词1 词2」格式。
+                // 整句「码 词1 词2」格式。空格分隔沿用单行判（虎整句
+                // 主表巨大，首行汉字即可靠；Tab 才走投票）。
                 let first = t.split_whitespace().next().unwrap_or("");
                 return if contains_cjk(first) {
                     TableFormat::WordFirstTsv
@@ -147,7 +160,29 @@ pub fn sniff_format(lines: &[String]) -> TableFormat {
                 };
             }
             data_checked = true;
+        } else if data_checked && t.contains('\t') {
+            // 后续数据行继续投票（前 64 行窗口内）
+            let mut cols = t.split('\t');
+            let first = cols.next().unwrap_or("");
+            let second = cols.next().unwrap_or("");
+            if contains_cjk(first) {
+                first_cjk += 1;
+            }
+            if contains_cjk(second) {
+                second_cjk += 1;
+            }
+            if first_cjk + second_cjk >= 8 {
+                // 票数足够，提前裁定（大表不必扫满 64 行）
+                break;
+            }
         }
+    }
+    if data_checked {
+        return if first_cjk > second_cjk {
+            TableFormat::WordFirstTsv
+        } else {
+            TableFormat::Native
+        };
     }
     TableFormat::Native
 }
@@ -161,6 +196,49 @@ fn is_yaml_kv(t: &str) -> bool {
                 && (v.trim().is_empty() || !v.starts_with('\t'))
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 【无头 Tab 方向投票 2026-10-16】用户实锤：五笔目录「0私用」
+    /// 「1符号」打不出——首行判向反了（纯拉丁词 / ℃ 区外符号）。
+    #[test]
+    fn sniff_vote_direction() {
+        // 0私用.txt：首行词是纯拉丁（ceui），次行 U盘 携 CJK——词前
+        let l = vec![
+            "ceui\tyixx".to_string(),
+            "U盘\tute".to_string(),
+            "12345678\tjy".to_string(),
+            "183006575@qq.com\tqq".to_string(),
+        ];
+        assert_eq!(sniff_format(&l), TableFormat::WordFirstTsv);
+        // 1符号.txt：℃℉°<＝ 均 CJK 区外，「『《 在区间——票数胜出
+        let l = vec![
+            "℃\tzq".to_string(),
+            "℉\tzq".to_string(),
+            "°\tzq".to_string(),
+            "<\tzw".to_string(),
+            "＜\tzw".to_string(),
+            "「\tze".to_string(),
+            "『\tze".to_string(),
+            "《\tzr".to_string(),
+        ];
+        assert_eq!(sniff_format(&l), TableFormat::WordFirstTsv);
+        // 码前（虎整句导出）不受影响：次列 CJK 票多
+        let l: Vec<String> = ["a\t工", "b\t式", "c\t以", "d\t动", "e\t对", "f\t地", "g\t一", "h\t上"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(sniff_format(&l), TableFormat::Native);
+        // 单行词前（词 CJK）依旧可判
+        let l = vec!["的\tu3".to_string()];
+        assert_eq!(sniff_format(&l), TableFormat::WordFirstTsv);
+        // 单行码前（码拉丁、词 CJK）依旧可判
+        let l = vec!["aa\t工作".to_string()];
+        assert_eq!(sniff_format(&l), TableFormat::Native);
     }
 }
 

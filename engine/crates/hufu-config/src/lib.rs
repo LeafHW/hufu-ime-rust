@@ -78,14 +78,24 @@ pub struct GeneralSection {
     /// Caps(Switch)/Ctrl+空格/自定义按键 switch。语言栏左键仍清空
     ///（焦点外全局开关，无上屏通道）。
     pub commit_raw_on_en_switch: bool,
+    /// 【导出码表快捷键 2026-11】组合键语法（如 "ctrl+alt+e"；支持
+    /// 裸修饰键如 "capslock"）。空（默认）= 关闭。命中即按当前方案
+    /// 的记忆格式导出码表并打开导出目录——与托盘/语言栏「导出码表」
+    /// 同一路径。设置页「录制」按钮写入；DLL 侧匹配执行。
+    #[serde(default)]
+    pub export_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CapsAction {
     Clear,
-    #[default]
     Switch,
     None,
+    /// 【中文态 Caps 锁大写 2026-10-12】按一下 CapsLock 锁定大写：此后
+    /// 字母全部以大写英文直出（不进编码）；再按一下解除并恢复中文
+    /// 录入。仅中文态生效（英文态 Caps 恒透传系统，见引擎 Caps 段）。
+    #[default]
+    Caps,
 }
 
 impl Default for GeneralSection {
@@ -96,10 +106,11 @@ impl Default for GeneralSection {
             follow_system_lang: true,
             shift_switch: true,
             ctrl_space_switch: true,
-            // 【2026-10-09 默认回正】Caps 默认=切英文（用户定稿；此前
-            // 误设 Clear）。老用户 config.json 里已显式写Clear 的不受
+            // 【2026-10-12 默认改锁大写】用户定稿：中文态 Caps=按一下锁定
+            // 大写英文直出、再按一下解除回中文（CapsAction::Caps）。
+            // 老用户 config.json 里已显式写 Clear/Switch/None 的不受
             // 影响（序列化值优先于默认）。
-            caps_action: CapsAction::Switch,
+            caps_action: CapsAction::Caps,
             switch_recent_schema: true,
             // 【Esc 双行为 2026-11】默认关：现行为不变（空态 Esc 透传）。
             esc_undo: false,
@@ -110,6 +121,9 @@ impl Default for GeneralSection {
             // 是 2026-09-14 既有行为，本开关把它推广到全部切换路径并
             // 提供关闭出口——默认与既有手感一致。
             commit_raw_on_en_switch: true,
+            // 【导出码表快捷键 2026-11】默认关：不抢占任何键；用户在
+            // 设置页录制后生效。
+            export_key: String::new(),
         }
     }
 }
@@ -187,6 +201,20 @@ pub struct InputSection {
     pub semicolon_guide: bool,
     /// 数字键参与整句选重
     pub digits_in_sentence: bool,
+    /// 【编码通配符】开启后，编码中的通配字符=任意单码位：打 d\x =
+    /// 码表内全部 3 码（第 1 码 d、第 3 码 x）词条；\dx\ = 4 码第
+    /// 2/3 位 dx。候选=等长匹配的全部词条（注释位显示完整编码），
+    /// 不触发任何自动上屏/清屏（搜索语义）。默认关。
+    pub wildcard_enabled: bool,
+    /// 【编码通配符】通配字符（单字符，默认 '\'）。不能与编码字母表
+    /// 字符冲突（冲突=引擎按关闭处理）；反查引导键优先于通配符。
+    #[serde(default = "default_wildcard_char")]
+    pub wildcard_char: char,
+}
+
+/// 通配符默认字符：\。
+fn default_wildcard_char() -> char {
+    '\\'
 }
 
 impl Default for InputSection {
@@ -215,6 +243,9 @@ impl Default for InputSection {
             backslash_dunhao: false,
             semicolon_guide: true,
             digits_in_sentence: true,
+            // 【编码通配符】默认关 + 默认字符 \
+            wildcard_enabled: false,
+            wildcard_char: '\\',
         }
     }
 }
@@ -253,6 +284,29 @@ pub struct CandidatesSection {
     pub delay_show_ms: u32,
     /// 延时展开注释与拆分（毫秒）
     pub delay_comment_ms: u32,
+    /// 【按住键可录 2026-11】有候选时按住进「调频模态」的键/组合：
+    /// "ctrl"（默认，原行为）；组合语法 "ctrl+shift" / "alt+d" /
+    /// "capslock"（裸功能键可录，设置页「录制」按钮写入）；空 = 停用
+    /// 模态。键名与按键映射页同词汇（ctrl/alt/shift/win/capslock/
+    /// space/enter/tab/f1-f12/字母/数字/符号单字符）。DLL 解析执行
+    ///（引擎只透传）。
+    #[serde(default = "CandidatesSection::default_freq_key")]
+    pub freq_key: String,
+    /// 【删词按住键可录 2026-11】按住进「删词模态」的键/组合：
+    /// "ctrl+shift"（默认 = 原 Ctrl 按住 + Shift 删词和弦行为）。
+    /// 与 freq_key 独立：单独按住本键即可直接进删词，不必先按调频键。
+    /// 两组合同时完整按住时删词优先。空 = 停用。
+    #[serde(default = "CandidatesSection::default_delete_key")]
+    pub delete_key: String,
+}
+
+impl CandidatesSection {
+    fn default_freq_key() -> String {
+        "ctrl".into()
+    }
+    fn default_delete_key() -> String {
+        "ctrl+shift".into()
+    }
 }
 
 impl Default for CandidatesSection {
@@ -273,6 +327,8 @@ impl Default for CandidatesSection {
             split_scheme: "虎码".into(),
             delay_show_ms: 0,
             delay_comment_ms: 0,
+            freq_key: "ctrl".into(),
+            delete_key: "ctrl+shift".into(),
         }
     }
 }
@@ -296,6 +352,20 @@ pub struct KeymapSection {
     pub map: std::collections::HashMap<String, String>,
     /// 无候选/空态映射（缺省回落 map 同键）。
     pub map_idle: std::collections::HashMap<String, String>,
+    /// 【Shift+符号自定义 2026-10-09】键=主键盘基础字符（数字 1-0 与
+    /// -=[]\;',./`），值=用户自定义输出串。中文态按 Shift+该键时顶屏
+    /// 语义输出（有候选=高亮候选+串；空态=串本身），覆盖内置 US shift
+    /// 形态→标点映射（Shift+1 默认「！」）。空表=内置行为。
+    pub shift_symbols: std::collections::HashMap<String, String>,
+    /// 【Shift+字母双态开关 2026-10-10】在集合里的大写字母（"A".."Z"）
+    /// =「都生效」档：空态 Shift+该字母=直出自定义串（不再上屏大写
+    /// 字母）、组段无候选也顶屏出串。缺省（不在集合）=「只在有候选
+    /// 时生效」（v1.7.5 行为，升级零差异）。设置页对话框预填该字母
+    /// 已存档位，并记住上次选择供下一个字母默认。
+    pub shift_letters_always: std::collections::HashSet<String>,
+    // 【Alt+修改 下线 2026-10-17 用户拍板】alt_symbols/alt_letters_always
+    // 字段已删（Alt+编码与太多软件快捷键冲突）。老配置文件里的残留键
+    // 由 serde 忽略，无害。
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -594,6 +664,15 @@ pub struct AppearanceSection {
     pub anim_flash: bool,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
+    /// 【SSF 皮肤 2026-12】当前皮肤类型："json"（参数化 JSON 皮肤）或
+    /// "ssf"（位图 .ssf 皮肤）。老配置缺省="json"——回归红线：老配置
+    /// 无感，现有 JSON 皮肤路径零改动。
+    #[serde(default = "default_skin_kind")]
+    pub skin_kind: String,
+}
+
+fn default_skin_kind() -> String {
+    "json".into()
 }
 
 impl Default for AppearanceSection {
@@ -606,6 +685,7 @@ impl Default for AppearanceSection {
             anim: true,
             anim_speed: 1.0,
             anim_flash: true,
+            skin_kind: default_skin_kind(),
         }
     }
 }

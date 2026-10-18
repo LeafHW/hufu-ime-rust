@@ -367,10 +367,22 @@ pub struct Shared {
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
-    /// 【三十六修】模式键 down 已直发的一次性标记（vk）：对应 up 到达
-    /// 即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不翻回）；
-    /// 跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行切中英。
-    pub modekey_down_seen: Option<usize>,
+    /// 【三十六修】模式键 down 已直发的一次性标记（vk+时刻）：对应 up
+    /// 到达即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不
+    /// 翻回）；跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行
+    /// 切中英。【八十六修】加时刻：down 已发而 up 未到期间，同键第二
+    /// 个 down（TestDown+KeyDown 慢对 / 键自动重复）= 同一物理按压，
+    /// 一律吞——不再依赖 80ms 窗（慢宿主成对事件可远超 80ms）。
+    /// 陈旧保护：>1s 视为宿主丢 up，按新按压处理。
+    pub modekey_down_seen: Option<(usize, std::time::Instant)>,
+    /// 【八十六修·成对宿主 up 双发】同键最近一个 up（vk+时刻）。
+    /// TestUp+KeyUp 成对宿主（Notepad3 实测 trace：TestDown 直发 →
+    /// TestUp 消费 down_seen → KeyUp @+122ms 落在 80ms 窗外 → 二次
+    /// 直发 = 引擎翻转两次净零：大写锁死切不回 / Ctrl+Space 切换不
+    /// 动；只投一个 up 的宿主（浏览器类）无此形态——「不同软件有差
+    /// 异」的根源）。同键 250ms 内第二个 up 一律吞；真实再按必先有
+    /// 新 down（down_seen 路径正常放行），窗长不吞真击。
+    pub modekey_up_last: Option<(usize, std::time::Instant)>,
     /// 【八十五修·Ctrl+Space 抬序无关】space+ctrl 组合已成形标记：
     /// Ctrl 按住期间 space 落下、或 Ctrl 抬起/落下时 space 仍按住 →
     /// 置位；space 抬起时消费（无论此刻 Ctrl 是否已抬）。修「Ctrl
@@ -380,6 +392,15 @@ pub struct Shared {
     pub space_ctrl_armed: bool,
     /// 最近一次 preedit（失焦冲销用）
     pub preedit_last: String,
+    /// 最近一次上屏文本（幻影选区识别用）
+    pub last_commit_text: String,
+    /// 【孤儿嫌疑标记 2026-10-12】只在 OnCompositionTerminated（宿主
+    /// 单方面杀段）时记录被杀文本——孤儿字母只在杀段后可能残留文档；
+    /// 正常上屏（组段活着走 SetText+End）绝不该清。此前孤儿清理按
+    /// preedit_last 非空即清：上屏「哪个」后 preedit_last 仍持旧值，
+    /// 下一键开组段时把**刚上屏的真文本**当孤儿删掉=吞字（用户实锤
+    /// d; d; 后「哪个」变「哪」）。清理路径只认本标记，取用即清。
+    pub orphan_suspect: Option<String>,
     /// 【三十四修·死字段删除】compose_at（Excel 保组段 80ms 时窗，六修
     /// 整体移除后只剩 3 处写入零读取）已删——现行判据是 CommitFocusRevoke
     /// 的选区验证（session 内）+ focus_revoke_kept 回传短路。
@@ -396,7 +417,7 @@ pub struct Shared {
     /// 最近一次展示的候选签名（text 序 + selected；停顿期轮询比对，
     /// 异步重排换序后主动刷新候选窗）
     pub cand_sig_last: String,
-    /// 【二十五修·自适应单查】连续「双查同值」帧计数——≥3 转单查
+    /// 【二十五修·自适应单查】连续「双查同查」帧计数——≥3 转单查
     ///（省一半宿主布局回调）；烂锚/失败清零回双查。
     pub qc_probe_steady: u32,
     /// 【Scintilla 段首宽盒抑制 2026-09-30】seg1 查询回宽盒时本帧不出
@@ -486,6 +507,38 @@ pub struct Shared {
     /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
     /// 第 N 项再暂留收场）。
     pub rank_flash: Option<usize>,
+    /// 【按住Ctrl调频 2026-11】模态逻辑态（渲染态在窗口 freq view）：
+    /// freq_active=按住 Ctrl 已入模态；freq_delete=+Shift 删词子模式；
+    /// freq_pick/freq_pick_text=拾起的页内下标与词（第二次数字=对调）。
+    /// 进入=Ctrl KeyDown/TestKeyDown（无 Shift/Alt/Win + 候选在窗）；
+    /// 退出=Ctrl KeyUp（铁律：按住进入，松开退出）。
+    pub freq_active: bool,
+    pub freq_delete: bool,
+    pub freq_pick: Option<usize>,
+    pub freq_pick_text: String,
+    /// 模态内数字 TestDown 直执行后的同 vk 去重（80ms——Test 与
+    /// KeyDown 双到达防双发；auto-repeat 33ms 保留）。
+    pub freq_last_digit: Option<(usize, std::time::Instant)>,
+    /// 进入时刻按住组合是否**物理**按住（GetAsyncKeyState 探组合键
+    /// 集）：真宿主=真 →tick 轮询兜底退出有效；跟打器类纯 Test 注入
+    /// 宿主=假 → 物理轮询不可作为退出依据（交 TestUp/下一键层处理）。
+    pub freq_ctrl_physical: bool,
+    /// 【按住键可录 2026-11】三组合（VK 集，空=停用）+ 原始串（trace
+    /// 用）：freq_key=调频模态按住键（默认 [Ctrl]）；del_key=删词模
+    /// 态按住键（默认 [Ctrl,Shift]=原和弦行为，与 freq_key 独立、同
+    /// 按时删词优先）；export_key=导出码表快捷键（默认空=关，命中即
+    /// 管道 export_schema——与托盘「导出码表」同路径）。update_ui 同
+    /// 帧解析 state 三串缓存。进入=组合成员按下且其余成员皆按（完整
+    /// 即入）；成员抬起=重估（两组合都散了才退出，删词优先维持）。
+    /// 裸修饰键（Ctrl/Alt/Shift/Caps）可录——按住语义的天然载体。
+    pub freq_key: Vec<usize>,
+    pub del_key: Vec<usize>,
+    pub export_key: Vec<usize>,
+    pub freq_key_raw: String,
+    pub del_key_raw: String,
+    pub export_key_raw: String,
+    /// export_key 命中后的同组合去重（Test+KeyDown 双到达防双发）。
+    pub export_last: Option<(usize, std::time::Instant)>,
     /// 【Esc 双行为 2026-11】引擎 esc_undo_ready（开关开 && 空态 &&
     /// 上屏历史非空）缓存：TestDown 空态 escape 预判 TRUE（KeyDown
     /// 才会来，撤回键才能到引擎）；不就绪时 FALSE=透传应用。state
@@ -499,11 +552,32 @@ pub struct Shared {
     /// 【两态映射 2026-11】空态专用映射快照（state.keymap_idle）：
     /// TestDown 空态预判查这张表（缺省回落 keymap 同键）。
     pub keymap_idle: std::collections::HashMap<String, String>,
+    // 【Alt+修改 下线 2026-10-17 用户拍板】alt_symbols/alt_always/当场执行
+    // 标记等全套已删——Alt+编码与太多软件的快捷键冲突，功能放弃。
     /// 【Esc 撤回光标范围 2026-11】当前焦点是否「有光标（可编辑）」
     /// 探测结果缓存：Some(ok)=已探测（GetSelection 成功=有光标），
     /// None=未探测/已失效（焦点切换即失效）。空态 Esc 撤回预判的
     /// 第二道门：无光标（非编辑焦点）→ 不吞 Esc（正常 Esc 功能）。
     pub esc_caret_ok: Option<bool>,
+    /// 【Caps 系统态补偿 2026-10-12】engine 消费 CapsLock（选重/锁大写
+    /// 档）后若系统大小写锁定仍被翻转（部分宿主吞键仍翻转/键盘驱动
+    /// 层翻转），合成一次 CapsLock 击键把系统态翻回 OFF，并在此窗口
+    /// 内忽略自家 sink 收到的合成事件（否则补偿键又当一次用户键）。
+    /// 加词编码框大写字母（用户实测 BUG②）的根治点。
+    /// 【候选窗交互宽限 2026-10-12】候选窗鼠标交互（点击/右键菜单）
+    /// 结束后的短宽限窗：期间到达的焦点事件若组段活着按交互连带
+    /// 处理（不清组段/不藏窗）——防交互期间宿主抖出的延迟焦点事件
+    /// 在鼠标离开/菜单收场后才到，绕过 is_mouse_over/cand_menu_open
+    /// 守卫把活组段清掉（用户实测：点中候选框后空格/选重上屏失效）。
+    pub cand_interact_until: Option<std::time::Instant>,
+    /// 【交互收场自愈·挂起标记 2026-10-12】wndproc（点击/菜单收场）
+    /// 只置标记；下一次 dispatch 键入口执行焦点自愈+锚点补探
+    ///（cand_interact_recover_pending——wndproc 不跑 TSF 会话铁律）。
+    pub cand_interact_pending: bool,
+    /// 【交互后焦点自愈 2026-10-12】最近一次非空 TSF 焦点 DocumentMgr：
+    /// 候选窗点击把宿主焦点抖成 NULL 时（键不再路由到 IME=上屏失效），
+    /// 交互收场检测 GetFocus 失败即 SetFocus 回该文档（键路复活）。
+    pub focus_doc_last: Option<ITfDocumentMgr>,
 }
 
 impl Shared {
@@ -564,8 +638,11 @@ impl Shared {
             stale_raw_until: None,
             modekey_last: None,
             modekey_down_seen: None,
+            modekey_up_last: None,
             space_ctrl_armed: false,
             preedit_last: String::new(),
+            last_commit_text: String::new(),
+            orphan_suspect: None,
             focus_revoke_kept: false,
             tm_sink_cookie: 0,
             lang_sink_cookie: 0,
@@ -594,10 +671,26 @@ impl Shared {
             last_key_ctx: None,
             last_show: None,
             rank_flash: None,
+            freq_active: false,
+            freq_delete: false,
+            freq_pick: None,
+            freq_pick_text: String::new(),
+            freq_last_digit: None,
+            freq_ctrl_physical: false,
+            freq_key: vec![0x11],
+            del_key: vec![0x11, 0x10],
+            export_key: Vec::new(),
+            freq_key_raw: "ctrl".into(),
+            del_key_raw: "ctrl+shift".into(),
+            export_key_raw: String::new(),
+            export_last: None,
             esc_undo_ready: false,
             keymap: std::collections::HashMap::new(),
             keymap_idle: std::collections::HashMap::new(),
             esc_caret_ok: None,
+            cand_interact_until: None,
+            cand_interact_pending: false,
+            focus_doc_last: None,
         }
     }
 
@@ -762,6 +855,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             crate::displayattr::register_provider_category();
         }
         crate::tsf::trace("activate: enter");
+        // 【键对劈开防线·2026-10-17】激活即播种：Ctrl+Shift 切换手势
+        // 期间 Shift down 可能已被旧世代记账、up 落在别家 TIP——首键
+        // 前先对齐物理真值。
+        sync_shift_latch(&self.shared);
         let tm = ptim
             .cloned()
             .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
@@ -956,6 +1053,9 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 【四十五修·诊断】Deactivate 是否被调（切输入法残留窗排查：
         // 组段存续时 TSF 实测不调本方法——语言档案 sink 兜底）
         crate::tsf::trace("Deactivate: 进入（收窗+冲销）");
+        // 【键对劈开防线·2026-10-17】失活即复位（键 sink 即将摘除，
+        // 悬挂 down 等不到 up；重激活路径在 Activate 侧另行播种）。
+        sync_shift_latch(&self.shared);
         // 【E7·反子类化 2026-11 对称化】游戏宿主失活：流派整体对称还原
         //（子类化 WndProc + 已拆链窗恢复默认 IMC + 三标志清零——旧版只
         // 还原 proc 不还原 HIMC/不复位 GAME_HOST_MODE，标志跨失活残留=
@@ -1301,6 +1401,9 @@ pub(crate) fn ime_switch_abort(shared: &SharedRef) {
     g.composition = None;
     g.composing = false;
     g.raw_last.clear();
+    // 【十七修】组段已亡——钩子零锁快照同步翻 false（防下一次 caps
+    // 被误虚拟化落进空组段）。
+    caps_snap_refresh(&g);
     g.preedit_last.clear();
     g.stale_raw.clear();
     g.stale_raw_until = None;
@@ -1351,19 +1454,641 @@ pub(crate) fn ime_switch_abort(shared: &SharedRef) {
 /// （0=无待同步 1=中文 2=英文）——Shared 含 COM 原始指针不可跨
 /// 线程移动，经此原子中转；下一次 dispatch（UI 线程）懒应用。
 static CHINESE_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 【急切同步+防陈旧 2026-10-14】worker 发 focus 前对 MODE_SEQ 的快照。
+/// 应用时对不上 = 期间已有更新的引擎态落盘（如恰好 Ctrl+空格切换），
+/// 本份 focus 回执陈旧 → 作废（旧行为会拿它覆盖刚切换的新态=切窗后
+/// 牌面显示反了的现场反馈根源之一）。
+static SYNC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 中英态落盘序号：每次把引擎回执的 chinese 应用到 g.chinese 时递增。
+static MODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn note_mode_applied() {
+    MODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// 懒应用待同步的中英态（dispatch 入口调用，UI 线程安全）。
 fn apply_chinese_sync(shared: &SharedRef) {
     let v = CHINESE_SYNC.swap(0, std::sync::atomic::Ordering::AcqRel);
-    if v == 0 {
+    if v != 0 {
+        if SYNC_SEQ.load(std::sync::atomic::Ordering::Acquire)
+            != MODE_SEQ.load(std::sync::atomic::Ordering::Acquire)
+        {
+            trace("焦点同步: 回执陈旧（期间有更新中英态落盘）→ 作废");
+            return;
+        }
+        let mut zh = v == 1;
+        // 【每应用模式对账 2026-10-15】引擎是全局单值，系统（ctfmon）
+        // 按**应用**记输入模式并在焦点进入时写进本线程 compartment
+        // ——两套记忆并存 = 现场实锤的牌面/实际分裂四步舞（EmEditor↔
+        // QQ：A 切英后进 B，牌显 B 的旧中态、Shift 一按把全局引擎翻
+        // 成中，回 A 牌显英实际打中文）。对账：焦点进入时**应用记忆
+        // 为准**（对齐系统 IME 行为——用户在 A 是英文、B 是中文的心智
+        // 由系统记忆承载），compartment 与引擎不一致就幂等 set_lang
+        // 设引擎（同时清残留 raw/锁大写——「切软件后变大写」同根）。
+        // 切换方向照旧：本应用内 Shift → 引擎翻转 → set_mode 推回
+        // compartment（系统记忆同步更新）——闭环后三源（引擎/本应用
+        // 记忆/牌面）恒收敛，旧「纯观察者」立场退役（那正是分裂源）。
+        // 读不到 compartment（宿主无 TSF 记忆）→ 引擎原值直落，零行为
+        // 变化。管道失败保守不动（下一切换再对）。
+        if let Some(cz) = crate::langbar::read_thread_conversion_chinese() {
+            if cz != zh {
+                if let Some(resp) =
+                    ipc::call(&serde_json::json!({ "op": "set_lang", "chinese": cz }))
+                {
+                    let applied = resp
+                        .pointer("/state/chinese")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(cz);
+                    trace(&format!(
+                        "焦点同步: 每应用对账 引擎={zh} 应用记忆={cz} → set_lang 后={applied}"
+                    ));
+                    zh = applied;
+                }
+            }
+        }
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.chinese != zh {
+            g.chinese = zh;
+            crate::langbar::set_mode(zh);
+            note_mode_applied();
+            trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
+        }
+    }
+}
+
+/// 【急切同步 2026-10-14】defer 窗（UI 线程）收到 focus 回执后的立即
+/// 应用入口。旧行为只把回执存进 CHINESE_SYNC 等下一次按键才应用——
+/// 切窗后用户看一眼牌面（还没打字）显示的仍是旧态（现场反馈：EmEditor
+/// ↔cmd 切换后中英显示不准）。现 worker 存好回执即 PostMessage 到
+/// langbar defer 窗（首激活线程的消息泵必然在转），此处同线程取
+/// G_SHARED 应用（Shared 非 Send，G_SHARED 访问持 Mutex 安全）。
+pub fn defer_apply_chinese_sync() {
+    let Some(shared) = G_SHARED.get().map(|g| g.0.clone()) else {
+        return;
+    };
+    apply_chinese_sync(&shared);
+}
+
+/// 【候选窗交互收场自愈 2026-10-12·标记半】candwin2 在点击抬起（死区
+/// 点击未拖拽）与右键调频菜单收场时调用（均在 wndproc——**只做标记**，
+/// 绝不在此跑 TSF 会话/焦点操作：菜单重绘铁律「TSF 编辑会话不得在窗口
+/// 过程里重入」同源约束）。
+/// 1) 交互宽限窗：handle_set_focus 对其后短窗内的迟到焦点事件按抖动
+///    保组段（is_mouse_over/cand_menu_open 只覆盖交互进行中，尾巴
+///    事件落在窗外——BUG①「点中候选框后空格/选重上屏失效」的清理
+///    路径正由此绕过守卫执行）。
+/// 2) 交互修复挂起标记：下一次 dispatch（键入口，安全上下文）执行
+///    cand_interact_recover_pending 的焦点自愈+锚点补探。
+pub fn cand_interact_note() {
+    let Some(shared) = tl_shared().or_else(|| G_SHARED.get().map(|g| g.0.clone())) else {
+        return;
+    };
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand_interact_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
+    g.cand_interact_pending = true;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 【按住Ctrl调频 2026-11】候选模态调频/删词（Windows TSF 侧）
+//
+// 交互规格（用户定稿，铁律「按住进入，松开退出」）：
+// · 有候选时**按住** Ctrl → 候选框出提示行「⇄ 调频：按数字选词…」
+//   + 序号强调色（琥珀）；
+// · 按住状态下按数字 → 对应候选被「拾起」（拾起环脉冲 + 提示行更新）；
+// · 再按另一数字 → 两候选对调（横排滑动/竖排双格强调，持久化落
+//   用户调整.txt），拾起跟随被调词（可链式继续调）；
+// · 同号再按 = 取消拾起；
+// · 按住 Ctrl 再按住 Shift → 删词子模式（提示行「✕ 删词…」+ 红强调），
+//   按数字删除该词（红闪塌缩动效，持久化）；Shift 松开回到调频；
+// · 松开按住键 → 模态结束（提示行收起，配色淡回）。
+// 【按住键可录·十三修 2026-11】铁律不变（按住进入，松开退出），按住
+// 的**键/组合**用户可录：candidates.freq_key（默认 "ctrl"）/
+// candidates.delete_key（默认 "ctrl+shift"=原和弦行为）+ general.
+// export_key（导出码表快捷键，空=关）。组合=成员 VK 集：进入=成员
+// 落下且其余成员皆按（完整即入，删词组合优先）；成员抬起=重估（两
+// 组合都散了才退出）。裸修饰键（Ctrl/Alt/Shift/Caps）可录。设置页
+// 「录制」按钮写入。
+//
+// 键路设计：
+// · 进入/退出/子模式切换在成员键的 Down/Up **任一层**处理
+//  （Test+KeyDown 双到达靠 freq_active 幂等去重）；
+// · 数字动作在 **Test 层直执行**（80ms 同 vk 去重挡 KeyDown 二次到达）
+//  ——跟打器类宿主只送 Test 事件（Shift 单击 Test 层闭环同型先例），
+//   返回 BOOL(1) 防宿主自产数字；
+// · 引擎侧旧 ctrl+digit 路径保留（Linux fcitx5 客户端在用）；本模态
+//   拦在前面，无 ctrl 事件的宿主自然回落旧路；
+// · 动效 tick 侧兜底：活动组合物理散尽（GetAsyncKeyState）或窗口
+//   隐没 → 强制退出（fade_tick_shared，防宿主吞 KeyUp 悬死模态）。
+// ─────────────────────────────────────────────────────────────────
+
+/// 键名 → VK（组合键解析用）。词汇与按键映射页（vk_to_name）同源 +
+/// 修饰键；未知键名 → None（调用方决定停用）。
+fn keyname_to_vk(name: &str) -> Option<usize> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        // 修饰键（组合基座；ctrl/alt/shift 用通用 VK——TSF 键事件
+        // 不分左右修饰，精确侧仅 shift 支持）
+        "ctrl" | "control" => 0x11,
+        "alt" | "menu" => 0x12,
+        "shift" => 0x10,
+        "shiftleft" => 0xA0,
+        "shiftright" => 0xA1,
+        "win" | "lwin" => 0x5B,
+        "rwin" => 0x5C,
+        // 功能键全名（与 vk_to_name 对齐）
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "backspace" => 0x08,
+        "tab" => 0x09,
+        "capslock" => 0x14,
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "home" => 0x24,
+        "end" => 0x23,
+        "delete" => 0x2E,
+        "insert" => 0x2D,
+        // 符号单字符（与 vk_to_name OEM 段对齐）
+        ";" => 0xBA,
+        "=" => 0xBB,
+        "," => 0xBC,
+        "-" => 0xBD,
+        "." => 0xBE,
+        "/" => 0xBF,
+        "`" => 0xC0,
+        "[" => 0xDB,
+        "\\" => 0xDC,
+        "]" => 0xDD,
+        "'" => 0xDE,
+        _ => {
+            // f1-f12
+            if let Some(rest) = n.strip_prefix('f') {
+                if let Ok(k) = rest.parse::<u32>() {
+                    if (1..=12).contains(&k) {
+                        return Some(0x6F + k as usize);
+                    }
+                }
+            }
+            // 单字母/单数字
+            let mut cs = n.chars();
+            if let (Some(c), None) = (cs.next(), cs.next()) {
+                let u = c.to_ascii_uppercase() as usize;
+                if (0x41..=0x5A).contains(&u) || (0x30..=0x39).contains(&u) {
+                    return Some(u);
+                }
+            }
+            return None;
+        }
+    })
+}
+
+/// 组合串 → VK 集（去重、序保持、≤4 键）。空串 = 空集（停用）。
+/// 任一键名无法识别 → 空集（配置手误=停用该组合，不猜）。
+fn parse_key_combo(s: &str) -> Vec<usize> {
+    if s.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for tok in s.split('+') {
+        match keyname_to_vk(tok) {
+            Some(vk) => {
+                if !out.contains(&vk) {
+                    out.push(vk);
+                }
+            }
+            None => {
+                trace(&format!("keycombo: 无法识别的键名 {tok:?}（组合 {s:?} 停用）"));
+                return Vec::new();
+            }
+        }
+    }
+    if out.len() > 4 {
+        trace(&format!("keycombo: 组合 {s:?} 超过 4 键，停用"));
+        return Vec::new();
+    }
+    out
+}
+
+/// 组合此刻是否**全按住**（GetKeyState 逐键；空集恒 false）。
+fn combo_held(keys: &[usize]) -> bool {
+    !keys.is_empty() && keys.iter().all(|&vk| unsafe { GetKeyState(vk as i32) } < 0)
+}
+
+/// 除刚落下的 vk 外其余成员全按住（vk=组合完成键的入口判定）。
+fn combo_held_except(keys: &[usize], vk: usize) -> bool {
+    keys.contains(&vk)
+        && keys
+            .iter()
+            .all(|&k| k == vk || unsafe { GetKeyState(k as i32) } < 0)
+}
+
+/// 杂修饰键守卫：ctrl/alt/shift/win 里不在任一组合成员集仍被按住的
+///（组合外修饰=别的意图——AltGr 形态/系统组合，误入模态会吃掉宿主
+/// 快捷键基座）。
+fn stray_modifier_held(freq: &[usize], del: &[usize]) -> bool {
+    for (vk, nm) in [(0x11usize, "ctrl"), (0x12, "alt"), (0x10, "shift"), (0x5B, "win")] {
+        if freq.contains(&vk) || del.contains(&vk) {
+            continue;
+        }
+        if unsafe { GetKeyState(vk as i32) } < 0 {
+            trace(&format!("freq: 杂修饰键 {nm} 按住 → 拒入模态"));
+            return true;
+        }
+    }
+    false
+}
+
+/// 【八十五修·布防原语】Ctrl 抬起（或任意消费 ctrl 事件的路径）时
+/// space 仍按住 → 布防 space_ctrl_armed：此后到的 space up 即使
+/// GetKeyState 已无 Ctrl 也算「Ctrl+Space 组合曾成形」。
+/// 【调频模态堵洞 2026-10-16 用户反馈】freq_modal_key 消费 ctrl 事件
+///（模态进入/退出/重估的提前返回）时主分派的布防分支被跳过——
+/// 「按住 Ctrl 有候选 → 模态激活 → 先松 Ctrl 后松 Space」序在
+/// TestUp-only 宿主（跟打器类，space down 不可见）切不了中英
+///（armed 没布上、ct0 已松）。两路共用本原语。
+fn ctrl_up_arm_space(shared: &SharedRef, space_held: bool) {
+    if space_held {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.space_ctrl_armed = true;
+    }
+}
+
+/// 模态进入（组合完成时刻调用）：右键菜单未开 + 候选窗可见且有候选 →
+/// 置共享旗标 + 推送窗口视图（提示行入场/序号强调淡入 + 行高 size_anim）。
+/// 已激活时幂等返回 true（不重入）。
+/// keys=完成的组合（物理按住探测用）；delete=true 进删词模态。
+/// 【和弦语义·十三修】默认组合（freq=ctrl、del=ctrl+shift）下：Ctrl
+/// 落下（freq 完成）→ 调频；再按 Shift（del 完成、删词优先）→ 删词；
+/// Shift 先松 → 回调频（freq 仍完整）；Ctrl 松 → 退出——与旧版「按
+/// 住 Ctrl + Shift 删词子模式」逐键同手感。两组合独立可录：单按住
+/// del 组合（如 "alt"）直接进删词，不必先按调频键。
+/// 杂修饰守卫在调用方（stray_modifier_held，需两组合成员集）。
+fn freq_enter(shared: &SharedRef, keys: &[usize], delete: bool) -> bool {
+    if crate::candwin2::cand_menu_open() {
+        return false;
+    }
+    // 物理按住标记（tick 兜底轮询的资格证——纯 Test 注入宿主无物理态）
+    let physical = keys
+        .iter()
+        .all(|&vk| unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 } != 0);
+    let ok = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.freq_active {
+            return true; // 已激活（Test/KeyDown 二次到达）——幂等
+        }
+        let visible = g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false);
+        let has_cands = g
+            .last_show
+            .as_ref()
+            .map(|(c, _, _)| !c.is_empty())
+            .unwrap_or(false);
+        if !visible || !has_cands {
+            return false;
+        }
+        g.freq_active = true;
+        g.freq_delete = delete;
+        g.freq_pick = None;
+        g.freq_pick_text.clear();
+        g.freq_ctrl_physical = physical;
+        true
+    };
+    if ok {
+        trace(&format!(
+            "freq: 组合完成 → 进入{}模态",
+            if delete { "删词" } else { "调频" }
+        ));
+        freq_view_apply(shared);
+    }
+    ok
+}
+
+/// 模态退出（按住键抬起 / tick 兜底 / 数字时窗已隐）：清旗标 + 推送
+/// 视图（提示行收起 + 配色淡回 + 行高 size_anim 收拢）。
+fn freq_exit(shared: &SharedRef) {
+    let had = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let h = g.freq_active;
+        g.freq_active = false;
+        g.freq_delete = false;
+        g.freq_pick = None;
+        g.freq_pick_text.clear();
+        h
+    };
+    if had {
+        trace("freq: 松开按住键 → 退出调频模态");
+        freq_view_apply(shared);
+    }
+}
+
+/// 删词子模式切换（模态中 Shift 落下/抬起）：清拾起（拾起语义不跨
+/// 子模式），推送视图（琥珀↔红强调切换）。
+fn freq_set_delete(shared: &SharedRef, on: bool) {
+    let changed = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.freq_active && g.freq_delete != on;
+        if c {
+            g.freq_delete = on;
+            g.freq_pick = None;
+            g.freq_pick_text.clear();
+        }
+        c
+    };
+    if changed {
+        trace(&format!("freq: 删词子模式 = {on}"));
+        freq_view_apply(shared);
+    }
+}
+
+/// 共享逻辑态 → 窗口渲染态 + 手动同参 show（cand_menu_refresh 同款
+/// take/show/put-back 骨架；show 全参数走让 size_anim 收放提示行）。
+fn freq_view_apply(shared: &SharedRef) {
+    let (active, del, pick, pick_text, last, skin, caret) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            g.freq_active,
+            g.freq_delete,
+            g.freq_pick,
+            g.freq_pick_text.clone(),
+            g.last_show.clone(),
+            g.skin.clone(),
+            g.caret,
+        )
+    };
+    let mut cand2 = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    if let Some(c) = cand2.as_mut() {
+        c.set_freq_view(active, del, pick, &pick_text);
+        if let Some((cands, raw, sel)) = last {
+            // 渲染口径与打字帧一致：inline 开=真编码不画（模态期编码行
+            // 由提示行占用——T8 铁律不破）
+            let inline_on = skin
+                .pointer("/skin/layout/inline_preedit")
+                .or_else(|| skin.pointer("/layout/inline_preedit"))
+                .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let raw_disp: String = if !inline_on { raw } else { String::new() };
+            c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+        }
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    match (g.cand2.take(), cand2) {
+        (None, mine) => g.cand2 = mine,
+        (Some(newer), Some(mut mine)) => {
+            mine.hide();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+    }
+}
+
+/// 数字动作（模态中主排数字，Test 层调用）：
+/// 删词模式 → cand_menu del（红闪塌缩 + 持久化）；调频模式 → 拾起/
+/// 对调（cand_swap 滑动 + 持久化）/同号取消。对调后拾起跟随被调词
+/// （链式调整）。窗已隐（组段收尾）→ 直接退出模态。
+fn freq_digit(shared: &SharedRef, idx: usize) {
+    let (active, del, pick, pick_text, page, raw) = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            g.freq_active,
+            g.freq_delete,
+            g.freq_pick,
+            g.freq_pick_text.clone(),
+            g.last_show.clone(),
+            g.last_show.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default(),
+        )
+    };
+    if !active {
         return;
     }
-    let zh = v == 1;
+    let visible = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false)
+    };
+    if !visible {
+        freq_exit(shared);
+        return;
+    }
+    let Some((page, _raw, _sel)) = page else {
+        return;
+    };
+    if idx >= page.len().min(10) {
+        return; // 越界（页内没那么多候选）：无视，模态保持
+    }
+    let text_j = page[idx].0.clone();
+    if del {
+        let old_page = page.clone();
+        trace(&format!("freq: 删词 [{idx}]「{text_j}」"));
+        if let Some(r) = crate::ipc::call(&serde_json::json!({
+            "op": "cand_menu", "action": "del", "page_index": idx, "text": text_j, "raw": raw
+        })) {
+            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                unsafe { crate::candwin2::freq_result_refresh(&r, None, Some((idx, &old_page))); }
+            } else {
+                trace("freq: 删词未生效（候选不在页）");
+            }
+        }
+        return;
+    }
+    match pick {
+        None => {
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.freq_pick = Some(idx);
+                g.freq_pick_text = text_j.clone();
+            }
+            trace(&format!("freq: 拾起 [{idx}]「{text_j}」"));
+            freq_view_apply(shared);
+        }
+        Some(p) if p == idx => {
+            {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                g.freq_pick = None;
+                g.freq_pick_text.clear();
+            }
+            trace("freq: 同号取消拾起");
+            freq_view_apply(shared);
+        }
+        Some(p) => {
+            let text_i = if pick_text.is_empty() {
+                page.get(p).map(|(t, _)| t.clone()).unwrap_or_default()
+            } else {
+                pick_text
+            };
+            trace(&format!("freq: 对调 [{p}]「{text_i}」↔ [{idx}]「{text_j}」"));
+            if let Some(r) = crate::ipc::call(&serde_json::json!({
+                "op": "cand_swap", "i": p, "j": idx, "text_i": text_i, "text_j": text_j
+            })) {
+                if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // 拾起跟随被调词（现落于目标槽位 idx——链式继续调）
+                    {
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.freq_pick = Some(idx);
+                        g.freq_pick_text = text_i;
+                    }
+                    unsafe { crate::candwin2::freq_result_refresh(&r, Some((p, idx)), None); }
+                } else {
+                    trace("freq: 对调未生效（候选不在页）");
+                }
+            }
+        }
+    }
+}
+
+/// 【候选窗交互收场自愈 2026-10-12·执行半】dispatch 入口调用（键入口
+/// 安全上下文，非 wndproc）：交互（点击候选框/右键调频菜单）后第一键
+/// 到达时，若组段活着——
+/// 1) 焦点自愈：交互把 TSF 焦点抖成 NULL（GetFocus 失败）时键根本不
+///    会进 dispatch（IME sink 不再收键）……能进 dispatch 说明键路在，
+///    此处防御性复查：焦点为 NULL 且有最近焦点文档 → SetFocus 复活
+///    （BUG①：空格/选重上屏失效的键路死支）。
+/// 2) 锚点补探：一次 QueryCaret 刷新 g.caret/est（BUG③：调频+退格后
+///    候选飘——菜单期间锚陈旧、刷新帧拿旧锚定位）。
+pub fn cand_interact_recover_pending(shared: &SharedRef) {
+    let pending = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.cand_interact_pending {
+            return;
+        }
+        g.cand_interact_pending = false;
+        g.composing
+    };
+    if !pending {
+        return; // 无组段：无键路/组段锚可救（正常态）
+    }
+    if in_edit_session() {
+        return; // 会话重入期：不补（下一键还有机会——标记已清，防御放弃）
+    }
+    // 1) 焦点自愈：GetFocus 失败 = NULL → SetFocus 回最近焦点文档。
+    let tm = thread_tm().or_else(|| {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thread_mgr
+            .clone()
+    });
+    if let Some(tm) = tm {
+        let cur = unsafe { tm.GetFocus().ok() };
+        if cur.is_none() {
+            let doc = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .focus_doc_last
+                .clone();
+            if let Some(doc) = doc {
+                trace("cand_interact: TSF 焦点为 NULL → SetFocus 回最近文档（键路自愈）");
+                let _ = unsafe { tm.SetFocus(&doc) };
+            }
+        }
+    }
+    // 1.5) 【候选窗焦点矫正 2026-10-12】Win32 焦点落在候选窗/菜单
+    //     owner（点击/菜单收场回落）→ 同线程 SetFocus 回记忆的宿主
+    //     编辑窗（菜单打开时内部自弃——不打扰模态菜单）。
+    //     【复活解耦 2026-10-12 二次】复活只看「前台仍在本线程」（菜
+    //     单 owner/候选窗都在本线程=交互期恒真）——旧实现把复活挂在
+    //     焦点归位结果上，菜单打开闸把复活连带挡死（用户实锤「右键
+    //     虚线就没了」：菜单期复活从未跑过）。
+    let same_thread = foreground_is_this_thread();
+    if same_thread {
+        let _ = win32_host_focus_restore();
+    }
+    // 2) 锚点补探（QueryCaret：有组段走组段末探针，无组段走 selection
+    //    插入点——同一会话两条路都有）。
+    let ctx = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .key_context();
+    if let Some(ctx) = ctx {
+        // 2.5) 【组段复活 2026-10-12】宿主在按下候选窗/菜单抢焦点时
+        //     单方面杀组段（OnCompositionTerminated 只清句柄不清
+        //     composing/preedit_last——会话与编码仍活）。重发当前预
+        //     编辑：死/空句柄路=孤儿回收+全新 StartComposition（虚线
+        //     原位回来）；活组段=幂等重写。用户规格「点击不该退出
+        //     编码状态」：≤140ms 复活，肉眼近乎无感。
+        if same_thread {
+            let (composing, preedit, comp_alive) = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (g.composing, g.preedit_last.clone(), g.composition.is_some())
+            };
+            // 【活组段不复活 2026-10-12 十一次】免激活菜单后组段恒活
+            //——重发只会叠开第二组段。复活仅限句柄已死时。
+            if composing && !preedit.is_empty() && !comp_alive {
+                trace("cand_interact: 组段复活（重发预编辑·仅同步档）");
+                // 【仅同步档 2026-10-12 三次】VSCode 崩溃实锤（0xC0000409
+                // 两发同偏移）：菜单期同步会话被拒(0x8000FFFF)后降级异
+                // 步排队——过期会话 1.2s 后在宿主拆家状态执行=闪退。复活
+                // /补探绝不排队异步：被拒即在交互窗内重试（下一拍），
+                // 窗口过期自然放弃。异步恢复会话=时间炸弹，全线禁用。
+                // 【幽灵文档检测 2026-10-12 六次】会话「受理成功」≠写进
+                // 真文档：菜单模态/收场风暴期 Notepad3 的文本仓对范围操
+                // 作全程 0 字（全文空、Shift 双向 0 动=写蒸发）。以「会
+                // 话跑完组段仍死」为准——交互窗内重试，安定后必成。
+                let ghost_or_err = match run_session_sync_only(
+                    &shared,
+                    Op::ResurrectPreedit(preedit),
+                    ctx.clone(),
+                ) {
+                    Err(_) => true,
+                    Ok(()) => {
+                        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.composition.is_none()
+                    }
+                };
+                if ghost_or_err {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.cand_interact_until
+                        .is_some_and(|t| std::time::Instant::now() < t)
+                    {
+                        g.cand_interact_pending = true; // 交互窗内重试
+                    }
+                }
+            }
+        }
+        // 锚点补探同样仅同步档（理由同上：异步过期会话=闪退炸弹）。
+        if run_session_sync_only(&shared, Op::QueryCaret, ctx).is_err() {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.cand_interact_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+            {
+                g.cand_interact_pending = true;
+            }
+        }
+    }
+}
+
+/// 【键对劈开防线·2026-10-17】瞬态 Shift 闩锁对齐物理真值。
+///
+/// 病根（茧跟打自动发送实测，LL 键盘日志毫秒级实锤）：抢焦点型软件
+/// 会在用户物理 Shift 的按下与抬起**之间**切换窗口焦点（跟打器打完
+/// 一段自动发成绩：22:04:00.528 Shift↓@茧跟打 → .714 焦点抢去 QQ →
+/// .811 Shift↑ 落进 QQ 线程）——本侧 sink 记了 down、up 永不到达 →
+/// g.shift_down 永真 → vk_to_name 双保险（GetKeyState<0 ‖ 本位，
+/// 见其 4228 注释）把回窗后所有键判成上档 →「Shift 锁死/切窗回来
+/// 大写」，直到用户再物理点一次 Shift 才复位。
+///
+/// 修法：焦点边界（文档焦点事件 / TIP 激活 / 失活）把闩锁重播种为
+/// GetAsyncKeyState 物理真值——异步态全局准确（无 GetKeyState 逐线
+/// 程、32 位失真路径，与 1573 动效兜底同源），跨焦点边界的修饰键对
+/// 本就无语义：仍按着=true（回窗首击照判上档，不丢功能），已松开
+/// =false（劈开的悬挂 down 就此复位）。持久态（锁大写/中英模式/
+/// caps 对齐）一概不碰；焦点世代内的 down/up 配对记账照旧（3251/
+/// 3283）。shift_pending/space_ctrl_armed 等已有自愈链路的瞬态不
+/// 在此清（防线收敛到实锤病根，避免误伤五十五修宽限窗内的单击
+/// Shift 切换）。
+fn sync_shift_latch(shared: &SharedRef) {
+    let down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 } != 0;
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if g.chinese != zh {
-        g.chinese = zh;
-        crate::langbar::set_mode(zh);
-        trace(&format!("焦点同步: 本地中英态回填 chinese={zh}"));
+    if g.shift_down != down {
+        trace(&format!(
+            "shift latch 重播种: {} → {}（键对劈开防线）",
+            g.shift_down, down
+        ));
+        g.shift_down = down;
     }
 }
 
@@ -1372,6 +2097,11 @@ fn handle_set_focus(
     pdimfocus: Option<&ITfDocumentMgr>,
     pdimprevfocus: Option<&ITfDocumentMgr>,
 ) -> Result<()> {
+    // 【键对劈开防线·2026-10-17】置于全部守卫/去抖之前：130ms 级的
+    // 抢焦点往返（去回循环）恰好落在 200ms 风暴去抖窗内，守卫之后
+    // 就漏了。任何文档焦点事件（含去抖跳过、交互守卫短路路径）都
+    // 先把闩锁对齐物理真值。
+    sync_shift_latch(shared);
     crate::candidate_ui::reset();
     // pdimfocus：冲销目标兜底用（Excel 第三次声明 prev=NULL，四修
     // 实锤 prev_ctx=None 绕过冲销分支直通清理杀组段——焦点 ctx 即
@@ -1395,6 +2125,30 @@ fn handle_set_focus(
     if crate::candwin2::cand_menu_open() {
         trace("OnSetFocus: 右键菜单打开中——跳过清理（免死金牌）");
         return Ok(());
+    }
+    // 【候选窗交互宽限 2026-10-12】点击/右键菜单收场后短窗内的焦点
+    // 事件仍可能是交互连带的迟到尾巴（鼠标已离开/菜单已关，上面两
+    // 守卫不覆盖）。组段活着=用户还在打字，交互刚结束绝无真切换——
+    // 按抖动处理保组段；无组段时照常走清理（无组段可杀，幂等）。
+    {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if g.composing
+            && !g.preedit_last.is_empty()
+            && g.cand_interact_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            trace("OnSetFocus: 候选窗交互宽限内（组段活）——按抖动保组段跳过");
+            return Ok(());
+        }
+    }
+    // 【交互后焦点自愈·记录 2026-10-12】非空焦点文档留档：候选窗点击
+    // 把 TSF 焦点抖成 NULL 时（键不再路由=上屏失效），交互收场检测
+    // 后 SetFocus 回这个文档复活键路。
+    if let Some(f) = pdimfocus {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .focus_doc_last = Some(f.clone());
     }
     // 【Excel 单元格首键 2026-09-12】Excel cell editor 在组段 SetText 后
     // **即时**（trace 实测 4ms）重发 OnSetFocus——此前走到「旧文档冲销」
@@ -1543,12 +2297,19 @@ fn handle_set_focus(
     // 线程 → worker 经 CHINESE_SYNC 原子中转，下一次 dispatch
     // （UI 线程）懒应用（焦点到首键间隔数百 ms，管道 ms 级）。
     std::thread::spawn(|| {
+        // 【急切同步+防陈旧 2026-10-14】先快照落盘序号再发 focus：回执
+        // 到手时若序号已前进（期间用户切换了中英），这份回执就是陈旧
+        // 值，应用侧作废。存好即 PostMessage defer 窗立即应用（不等下
+        // 一键——切窗后牌面要马上对）。
+        let seq0 = MODE_SEQ.load(std::sync::atomic::Ordering::Acquire);
         if let Some(resp) = ipc::call(&serde_json::json!({ "op": "focus" })) {
             let zh = resp
                 .pointer("/state/chinese")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             CHINESE_SYNC.store(if zh { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+            SYNC_SEQ.store(seq0, std::sync::atomic::Ordering::Release);
+            crate::langbar::post_mode_sync();
         }
     });
     trace("foc: C spawn完");
@@ -1637,6 +2398,453 @@ fn handle_set_focus(
     Ok(())
 }
 
+// 【Caps 补偿·全局原子 2026-10-12 二次 → 十六修 2026-10-13】复检线程
+// 已随打字路径注入一并移除；留存的是结算计数（进程级原子钟，unix
+// ms）与魔法标记。GEN/BUSY 随复检线程下岗。
+/// 合成 Caps 翻转键的 dwExtraInfo 魔法标记（"HUFU"）——键入口只吞
+/// 带标记的合成事件，真实用户快击永不被时间窗误吞（用户实锤）。
+const CAPS_FIXUP_MAGIC: usize = 0x4855_4655;
+
+// ── 【补偿结算制 2026-10-13】大写位卡 ON 根治 ──────────────────────
+// 旧「查后翻」竞态（EmEditor/WPS 实锤 trace 1791911730457 窗）：补偿
+// 对注入输入队列后，系统大写位要等宿主消息循环消化那对键才翻转——
+// 按键预处理重的宿主（WPS/EmEditor）消化慢，150ms 延时复检线程读到
+// 滞后旧态「仍 ON」→ 再补一对 → 多对补偿净翻转 = 大写位卡 ON → 后
+// 续字母被宿主按大写形态送出（D 泄漏）→ 组段空 → caps 落空组段变
+// 模式键 → 锁定大写奇偶乱（「再按也切不回」）。Notepad3 类轻宿主毫
+// 秒级消化 → 复检恒读 OFF 无事——「不同软件行为不一」的根源。
+// 修法：**任一时刻最多一对在飞**。注入计数（INJ）在 caps_synth_flip
+// 里 +1；消化计数（SEEN）在键入口魔法标记 down 直通时 +1。只有
+// INJ==SEEN（全部落地）才允许注入下一对——在飞未落地时读到的 ON
+// 是滞后假象，等下一拍；真卡 ON（灯常亮）等落地后复检照修不误。
+// 陈旧保护：在飞超 1.5s 视为丢失（宿主没回送魔法 down——AppContainer
+// 键路改道等），SEEN 对齐 INJ 解除武装，防复检永久瘫痪（灯常亮漏修
+// 回归）。
+static CAPS_PAIR_INJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CAPS_PAIR_SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CAPS_PAIR_INJ_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 【十六修·翻转沿状态机 2026-10-13】上一拍引擎 caps_lock 快照（-1=
+/// 未见/0=off/1=on）。合成补偿对只在锁大写进出翻转沿且物理位不一致
+/// 时注入一次；打字路径（选重/功能 caps）零注入——WPS/EmEditor 的
+/// 物理键监听层会被与真键交错的合成对搅乱，把下一个物理字母在 TSF
+/// 之前截走（直插大写/蒸发→D 连环，用户对照实锤；QQ/记事本无此
+/// 监听不受害）。
+static CAPS_PREV_LOCK: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// 在飞对子最宽存活（ms）——超时按丢失结算（见上）。
+const CAPS_PAIR_STALE_MS: u64 = 1500;
+
+fn caps_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 在飞补偿对是否已全部落地（含超时丢失对齐——纯判定，单测覆盖）。
+fn caps_pairs_settled(now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let inj = CAPS_PAIR_INJ.load(Relaxed);
+    let seen = CAPS_PAIR_SEEN.load(Relaxed);
+    if inj == seen {
+        return true;
+    }
+    // 在飞超时：宿主没回送魔法 down（键路改道/标记被剥）——按丢失
+    // 结算，对齐计数解除武装（宁可多等一拍，不可永久瘫痪）。
+    let inj_at = CAPS_PAIR_INJ_AT.load(Relaxed);
+    if inj_at != 0 && now_ms.saturating_sub(inj_at) > CAPS_PAIR_STALE_MS {
+        CAPS_PAIR_SEEN.store(inj, Relaxed);
+        return true;
+    }
+    false
+}
+
+/// 结算守卫下的定向对齐：物理大写位与期望态不一致、且无在飞对子时，
+/// 合成一对把位翻到位（灯=状态可见）。返回 true=已注入。
+/// 【十六修】仅锁大写翻转沿调用——打字路径零注入（选重/功能 caps
+/// 不再补偿：合成对与物理键流交错正是 WPS/EmEditor 真 d 被截走的
+/// 根因，用户对照实锤）。
+fn caps_synth_align(now_ms: u64, desired_on: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // 【急停开关】旗标文件存在 = 合成对彻底关闭（诊断对照用，热生效）。
+    if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-pair").exists() {
+        return false;
+    }
+    let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
+    if bit_on == desired_on {
+        return false; // 已对齐，无事可做
+    }
+    if !caps_pairs_settled(now_ms) {
+        return false; // 在飞对子未落地：防叠加注入（翻当前态，叠加净翻错向）
+    }
+    caps_synth_flip();
+    CAPS_PAIR_INJ.fetch_add(1, Relaxed);
+    CAPS_PAIR_INJ_AT.store(now_ms, Relaxed);
+    true
+}
+
+// ═══ 十七修·Caps 物理拦截（LL 钩子·灯根治）2026-10-13 ═══
+// 物理_caps 在驱动层翻转系统大写位+灯，TSF 吞键拦不住（十次~十六修
+// 定案：合成对补偿与真键流交错会毒死 WPS/EmEditor 的物理键记账，把
+// 下一个真字母在 TSF 之前截走）。根治=让翻转**根本不发生**：
+// WH_KEYBOARD_LL 拦下「组段在身」的物理 Caps down/up——系统位/灯不
+// 动；同拍 SendInput 一对带 "HUFV" 标记的 F24 虚键（无翻转语义、无
+// 字符翻译）走正常输入路，dispatch 入口改姓 capslock，引擎照常选重。
+// 空组段一律放行真键：锁定大写进出/英文态/其他输入法/游戏全走物理
+// 路径，灯天然=状态，零补偿零注入。守卫：焦点进程=本进程（全局钩
+// 子只管自家）、急停旗标 caps-no-hook。
+const CAPS_VIRT_VK: u16 = 0x87; // VK_F24：无主使用、无字符翻译
+const CAPS_VIRT_MAGIC: usize = 0x4855_4656; // dwExtraInfo 标记 "HUFV"
+static CAPS_LL_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CAPS_LL_PUMP_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 本按压已拦 down → 配对物理 up 与按住重复 down 一并拦（防孤儿
+/// up/重复 down 扰宿主记账或漏成第二次引擎事件）。
+static CAPS_LL_BLOCKED_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 【回调零锁 2026-10-13】钩子回调绝不能碰 Shared 互斥锁（UI 线程持锁
+/// 做引擎管道调用时回调一阻塞=全系统输入管线卡顿——用户实锤 EmEditor
+/// 「反应速度变得很慢」）。组段在身/caps有映射 由 UI 线程在引擎响应
+/// 同步点写这两个原子快照，回调只读原子。
+static CAPS_SNAP_COMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPS_SNAP_MAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 泵线程 id（回调里 PostThreadMessage 转交注入——**绝不**在 LL 回调
+/// 内直接 SendInput（输入注入自嵌套=系统输入队列串行化，禁手）。
+static CAPS_PUMP_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 泵线程私有消息：执行 F24 虚键注入。
+const CAPS_WM_VIRT: u32 = 0x8000 + 0x31; // WM_APP+0x31
+/// 【WPS extra 丢失·闩锁认领 2026-10-13】实测 WPS（CUAS/AIMM 混合宿
+/// 主）把注入键的 dwExtraInfo 在其键路由中**丢弃**——F24 对到站恒
+/// extra=0x0（8 次拦截↔8 对到站 1:1 配对，1-7ms），魔法标记识别在
+/// WPS 永远失败=「有候选按 caps 没反应」的最终根因。EmEditor 则 extra
+/// 完整存活。改闩锁计数认领：注入前 +2（down+up 各认领一次），到站
+/// 认领时 -1；魔法标记保留做零成本双保险。宿主只吃 down 丢 up 会积
+/// 压 → 钳位 8 清零（非时间窗，纯计数）。
+static CAPS_VIRT_PENDING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// UI 线程视角刷新快照（须持 Shared 锁调用；回调永不调此）。
+fn caps_snap_refresh(g: &Shared) {
+    let comp = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
+    let mapped = g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
+    CAPS_SNAP_COMP.store(comp, std::sync::atomic::Ordering::Release);
+    CAPS_SNAP_MAPPED.store(mapped, std::sync::atomic::Ordering::Release);
+}
+
+/// 拦截门（纯逻辑，单测覆盖）：组段在身且 caps 有映射才虚拟化。
+fn caps_hook_gate(composition_active: bool, caps_mapped: bool) -> bool {
+    composition_active && caps_mapped
+}
+
+/// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate（原子快照，
+/// 零锁零阻塞——回调全系统键路，微秒级必须）。
+fn caps_hook_should_virtualize() -> bool {
+    if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists() {
+        return false; // 急停：全部放行物理键
+    }
+    // 焦点在本进程才管（LL 钩子全局回调，别家按键不碰）。
+    let fh = fg_focus_hwnd();
+    if fh.0.is_null() {
+        return false;
+    }
+    let mut pid: u32 = 0;
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fh, Some(&mut pid));
+    }
+    if pid != std::process::id() {
+        return false;
+    }
+    caps_hook_gate(
+        CAPS_SNAP_COMP.load(std::sync::atomic::Ordering::Acquire),
+        CAPS_SNAP_MAPPED.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// 注入 F24 虚键对（down+up，HUFV 标记）。
+fn caps_virt_send() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    };
+    let mk = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(CAPS_VIRT_VK),
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                time: 0,
+                dwExtraInfo: CAPS_VIRT_MAGIC,
+            },
+        },
+    };
+    let arr = [mk(false), mk(true)];
+    // 闩锁记账：down+up 各一票（WPS 丢 extra，认领全靠它；魔法标记
+    // 仅 EmEditor 类宿主存活）。积压异常（宿主半途丢事件）钳位清零。
+    if CAPS_VIRT_PENDING.load(std::sync::atomic::Ordering::SeqCst) > 8 {
+        CAPS_VIRT_PENDING.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+    CAPS_VIRT_PENDING.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        SendInput(&arr, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// LL 键盘钩子回调：非 caps 键零开销直通；物理 caps 过门则拦+虚键。
+unsafe extern "system" fn caps_ll_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    };
+    if code < 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if kb.vkCode == 0x14 && (kb.flags & LLKHF_INJECTED).0 == 0 {
+        let is_down = wparam.0 == 0x0100 || wparam.0 == 0x0104; // (SYS)KEYDOWN
+        let is_up = wparam.0 == 0x0101 || wparam.0 == 0x0105; // (SYS)KEYUP
+        if is_down {
+            if CAPS_LL_BLOCKED_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                return LRESULT(1); // 本按压按住重复：一并吞（不二次选重）
+            }
+            if caps_hook_should_virtualize() {
+                CAPS_LL_BLOCKED_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+                // 转交泵线程异步注入——LL 回调内 SendInput 是禁手
+                //（输入注入自嵌套）；**打点也只许在泵侧做**——trace()
+                // 内含文件互斥+磁盘写，UI 线程持锁刷日志时回调一阻塞就
+                // 撞 LowLevelHooksTimeout（微软文档：回调超时系统静默
+                // 摘钩，全系统键路），拦截打点挪到泵的 CAPS_WM_VIRT 处。
+                let tid = CAPS_PUMP_TID.load(std::sync::atomic::Ordering::SeqCst);
+                if tid != 0 {
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                            tid,
+                            CAPS_WM_VIRT,
+                            windows::Win32::Foundation::WPARAM(0),
+                            windows::Win32::Foundation::LPARAM(0),
+                        );
+                    }
+                }
+                return LRESULT(1);
+            }
+        } else if is_up {
+            if CAPS_LL_BLOCKED_DOWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return LRESULT(1); // 配对 up 同拦（宿主只见完整虚键故事）
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// 安装（幂等）：cap 有映射即装。泵线程装钩子并 GetMessage 循环——
+/// LL 回调在本线程执行；系统级其余键开销=一次函数调用。
+fn caps_hook_install() {
+    if CAPS_LL_PUMP_ALIVE
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        unsafe {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            CAPS_PUMP_TID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::SeqCst);
+            use windows::Win32::System::LibraryLoader::{
+                GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL};
+            // 用回调自身地址取本 DLL 模块句柄（FROM_ADDRESS 语义）。
+            let mut hmod = windows::Win32::Foundation::HMODULE(std::ptr::null_mut());
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                windows::core::PCWSTR(caps_ll_proc as usize as *const u16),
+                &mut hmod,
+            );
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(caps_ll_proc), hmod, 0) {
+                Ok(h) => {
+                    CAPS_LL_HOOK.store(h.0 as usize, std::sync::atomic::Ordering::SeqCst);
+                    crate::tsf::trace("capsll: LL 钩子就位（cap 映射在身）");
+                }
+                Err(_) => {
+                    crate::tsf::trace("capsll: SetWindowsHookExW 失败 → 灯方案降级（物理放行）");
+                    CAPS_LL_PUMP_ALIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+            // 泵消息——LL 回调在本线程消息循环里被调起；虚键注入也从
+            // 这里出（回调只投递，不在回调内 SendInput）。
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            while windows::Win32::UI::WindowsAndMessaging::GetMessageW(
+                &mut msg,
+                None,
+                0,
+                0,
+            )
+            .as_bool()
+            {
+                if msg.message == CAPS_WM_VIRT {
+                    // 拦截打点在泵侧落盘（回调内禁 I/O——文件互斥+磁盘写
+                    // 会阻塞全系统键路，见 LowLevelHooksTimeout 摘钩）。
+                    crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 泵侧注入虚键（系统位/灯不动）");
+                    caps_virt_send();
+                    continue; // 线程消息：不翻译不派发
+                }
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                let _ = windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
+/// 合成一对 Caps 翻转（带魔法标记；调用方须过 caps_synth_align 结算
+/// 守卫——翻转是「翻当前态」，叠加注入会净翻错向）。【十七修后仅
+/// 锁大写翻转沿对齐在用；选重路径零注入。】
+fn caps_synth_flip() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
+    };
+    unsafe {
+        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), CAPS_FIXUP_MAGIC);
+        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, CAPS_FIXUP_MAGIC);
+    }
+}
+
+
+// ── 【候选窗焦点矫正 2026-10-12】──────────────────────────────
+// 事实（trace 1791748399 Notepad3 实录）：左键点候选窗后
+// GetGUIThreadInfo(0).hwndFocus = HuFuCandWin2 —— Win32 焦点落在
+// 候选窗上（NOACTIVATE 只挡前台激活，挡不住同前台线程的焦点转移；
+// 右键菜单 owner SetForegroundWindow + TrackPopupMenu 模态收场后
+// 焦点同样回落到本线程顶层的候选窗）。三联后果同源：
+// ① 宿主编辑窗失焦 → CUAS 杀组段（预编辑虚线消失=「退出编码态」）；
+// ② 锚链拿候选窗当「焦点窗」→ 真光标矩形被判窗外垃圾拒收 → 落
+//   标准链陈旧锚 → 候选窗大跳（飘/下移）；
+// ③ 键路由进候选窗（IME sink 收不到键=左键死支）。
+// 矫正四招（不变量：候选窗永远不该持有 Win32 焦点）：
+//   cand2_wndproc 显式 MA_NOACTIVATE；锚链窗外拦截豁免本输入法窗；
+//   poll 每拍记忆宿主编辑窗；交互收场 SetFocus 归位+组段复活。
+thread_local! {
+    /// (宿主编辑窗 hwnd, 记忆时刻 unix ms)——poll 线程局部（每宿主
+    /// 线程各自记忆各自的编辑窗，跨线程 SetFocus 本就不合法）。
+    static HOST_FOCUS_MEM: std::cell::Cell<(usize, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+/// 取窗口类名（失败空串）。
+fn hwnd_class(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut cn = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut cn) };
+    let len = cn
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(n.max(0) as usize)
+        .min(31);
+    String::from_utf16_lossy(&cn[..len])
+}
+/// 焦点矫正对象：候选窗本体 + 右键菜单 owner（交互回落的两类）。
+fn is_hufu_steal_window(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    matches!(hwnd_class(hwnd).as_str(), "HuFuCandWin2" | "HUFU_C2_MENU")
+}
+/// 本输入法全家窗口（含加词窗/轮询窗——均非宿主几何参照）。
+fn is_hufu_family_window(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    matches!(
+        hwnd_class(hwnd).as_str(),
+        "HuFuCandWin2" | "HUFU_C2_MENU" | "HuFuAddWord" | "HuFuPollWnd"
+    )
+}
+/// 前台线程焦点窗（GUIThreadInfo(0)，失败 NULL）。
+fn fg_focus_hwnd() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
+    let mut gi = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(0, &mut gi) }.is_ok() {
+        gi.hwndFocus
+    } else {
+        HWND(std::ptr::null_mut())
+    }
+}
+/// poll 每拍：前台焦点在本输入法窗口之外 → 记忆该宿主编辑窗。
+/// 仅当前台线程=本线程才记（他进程前台时抢记会把别家窗口错存进
+/// 本线程记忆——跨线程 SetFocus 本就不合法，还挤掉真宿主）。
+pub fn win32_host_focus_remember() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return;
+    }
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg, None) };
+    if fg_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+        return; // 别的进程在前台——本线程 poll 不记
+    }
+    let fw = fg_focus_hwnd();
+    if fw.0.is_null() || is_hufu_family_window(fw) {
+        return;
+    }
+    HOST_FOCUS_MEM.with(|m| m.set((fw.0 as usize, caps_now_ms())));
+}
+/// 前台线程是否仍是本线程（用户没真切换到别的应用——菜单 owner/
+/// 候选窗都在本线程，交互期前台恒为本线程）。
+pub fn foreground_is_this_thread() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_tid = if fg.0.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(fg, None) }
+    };
+    fg_tid != 0 && fg_tid == unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+/// 交互收场（poll 路）：焦点落在本输入法窗口上且菜单已收 → SetFocus
+/// 回记忆的宿主编辑窗（菜单模态中绝不抢——会把开着的菜单打掉）。
+pub fn win32_host_focus_restore() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    // 菜单模态中绝不抢（会把开着的菜单打掉）。
+    if crate::candwin2::cand_menu_open() {
+        return false;
+    }
+    let fw = fg_focus_hwnd();
+    if fw.0.is_null() {
+        return false; // 无焦点信息，不动作
+    }
+    // 前台须是本线程的宿主（他进程前台=用户已真切换——不抢）。
+    if !foreground_is_this_thread() {
+        return false;
+    }
+    if !is_hufu_steal_window(fw) {
+        return true; // 焦点已不在本输入法窗口（宿主持有）——视为归位
+    }
+    let (hwnd, ms) = HOST_FOCUS_MEM.with(|m| m.get());
+    if hwnd == 0 || caps_now_ms().saturating_sub(ms) > 30_000 {
+        return false; // 无新鲜记忆（>30s）——不盲抢
+    }
+    let target = HWND(hwnd as *mut _);
+    if !unsafe { IsWindow(target) }.as_bool() {
+        return false;
+    }
+    // SetFocus 仅对调用线程自己的窗口合法（跨线程静默失败）。
+    let tgt_tid = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            target,
+            None,
+        )
+    };
+    if tgt_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+        return false;
+    }
+    trace("cand_interact: Win32 焦点落在候选窗 → SetFocus 回宿主编辑窗");
+    unsafe { SetFocus(target) };
+    let after = fg_focus_hwnd();
+    !after.0.is_null() && !is_hufu_steal_window(after)
+}
+
 /// 轨迹日志（诊断 UI 线程卡死）：追加到 %TEMP%\hufu-tsf-trace.log。
 /// 环境变量 HUFU_TRACE=0 可关。多进程各写各行（带进程名）。
 /// 【高速化 2026-09-08】旧版每条 trace 都 env::var + current_exe +
@@ -1719,11 +2927,24 @@ pub fn trace(msg: &str) {
                 let _ = std::fs::rename(&path, path.with_extension("log.old"));
             }
         }
-        std::fs::OpenOptions::new()
+        // 【B 文件兜底 2026-10-13】主日志被占（提权宿主常驻句柄/删除挂
+        // 起态）时自动落 trace-b.log——诊断通道永不被单进程锁死（实测
+        // 任务管理器提权持 trace.log，EmEditor/WPS 全体零 trace）。
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-            .ok()
+            .open(&path)
+        {
+            Ok(f) => Some(f),
+            Err(_) => {
+                let alt = path.with_file_name("trace-b.log");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(alt)
+                    .ok()
+            }
+        }
     };
     if g.is_none() {
         *g = reopen(&mut None);
@@ -1820,6 +3041,62 @@ pub fn keys_log(line: &str) {
     }
 }
 
+/// 【八十六修】模式键事件准入判定（纯逻辑，单测可测）。
+/// 返回 true=放行直发 server，false=吞（同键同按压的成对/重复事件）。
+///
+/// 宿主投递形态（keys-17436 / Notepad3 trace 1791834528862 实测）：
+/// - 全四件 TestDown/KeyDown/TestUp/KeyUp（Notepad3 类）：TestDown 发
+///   → KeyDown 吞（down_seen 挂起）→ TestUp 吞（消费 down_seen + 记
+///   up_last）→ KeyUp 吞（up 去重）——一次物理按压恰好一发。
+/// - test/testup 成对、down 全无（跟打器类）：TestUp 放行（down_seen
+///   恒 None）。
+/// - key/keyup 成对：KeyDown 发 → KeyUp 吞（was_seen）。
+/// - 键自动重复（按住）：down_seen 挂起期间重复 down 全吞（模式键不
+///   应连发——旧 80ms 窗挡不住 >80ms 的重复）。
+/// 真实第二次按压必有 up 在中间（清 down_seen / 记 up_last），事件
+/// 驱动去重、不依赖击键时长。
+fn modekey_admit(g: &mut Shared, vk: usize, up: bool) -> bool {
+    if up {
+        let was_seen = matches!(&g.modekey_down_seen, Some((v, _)) if *v == vk);
+        if was_seen {
+            g.modekey_down_seen = None;
+            // 【八十五修】组合已由 down 消费——armed 同时终结（防后续
+            // 迟到的第二个 up 借旧组合再触发）。
+            g.space_ctrl_armed = false;
+        }
+        // 【八十六修】同键 up 去重：第一个 up（无论 TestUp/KeyUp）已
+        // 处理过本按压，250ms 内同键第二个 up = 成对宿主的另一路投递
+        // → 吞（见字段注释的实测链）。
+        let dup_up =
+            matches!(&g.modekey_up_last, Some((v, t)) if *v == vk && t.elapsed().as_millis() < 250);
+        g.modekey_up_last = Some((vk, std::time::Instant::now()));
+        if was_seen || dup_up {
+            return false;
+        }
+        // 【八十五修】armed 通道放行即消费（同上防双发：慢宿主
+        // testup/keyup 相隔可 >80ms，dup 挡不住）。
+        if vk == 0x20 && g.space_ctrl_armed {
+            g.space_ctrl_armed = false;
+        }
+    } else {
+        // 【八十六修】down 侧成对防线：本键 down 已直发且 up 未到 →
+        // 第二个 down = 同一物理按压（TestDown+KeyDown 慢对 / 自动重
+        // 复），吞。陈旧保护 >1s（宿主真丢 up 时不当永久卡死）。
+        if let Some((v, t)) = g.modekey_down_seen {
+            if v == vk && t.elapsed().as_secs() < 1 {
+                return false;
+            }
+        }
+        g.modekey_down_seen = Some((vk, std::time::Instant::now()));
+    }
+    // 遗留 80ms 同键窗（belt-and-suspenders：乱序/重排流兜底）。
+    if matches!(&g.modekey_last, Some((v, t)) if *v == vk && t.elapsed().as_millis() < 80) {
+        return false;
+    }
+    g.modekey_last = Some((vk, std::time::Instant::now()));
+    true
+}
+
 impl HuFuTs_Impl {
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     ///
@@ -1840,6 +3117,97 @@ impl HuFuTs_Impl {
         // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
         // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
         let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
+        // 【十七修·F24 虚键重映射 2026-10-13】物理 Caps 已被 LL 钩子整
+        // 个拦下（组段在身时——系统大写位/灯根本未动），钩子同拍注入
+        // 带 "HUFV" 标记的 F24 虚键对走正常 TSF 路。到站改姓 capslock：
+        // 下游（模式键去重/引擎/状态机）与真 caps 完全同路，而系统位
+        // 永不被它触碰（F24 无翻转语义）。
+        let mut wparam = wparam;
+        if wparam == CAPS_VIRT_VK as usize {
+            let extra = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
+            }.0 as usize;
+            // 认领：魔法标记（EmEditor 类 extra 存活的宿主）或闩锁余票
+            //（WPS 路由丢 extra，注入前已记账）。两认领同减——账目平衡。
+            let pending = CAPS_VIRT_PENDING.load(std::sync::atomic::Ordering::SeqCst);
+            if extra == CAPS_VIRT_MAGIC || pending > 0 {
+                if pending > 0 {
+                    CAPS_VIRT_PENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                wparam = 0x14;
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace(&format!(
+                        "caps: F24 虚键到站 → 改姓 capslock（系统位未动；认领={}）",
+                        if extra == CAPS_VIRT_MAGIC { "标记" } else { "闩锁" }
+                    ));
+                }
+            } else {
+                // 【WPS 三事件拆包 2026-10-13】WPS 把一对注入拆成
+                // test-down/full-down/test-up **三事件**，闩锁两票在
+                // 前两件耗尽——末尾 test-up 无票认领、保持 F24 身份
+                // 溜走 → caps 抬键簿记永不清（modekey_down_seen 挂起
+                // 只认 caps 抬键）→ 下一轮真 caps 被当重复按下吞
+                //（隔轮死键）；组段积压 d → 再下轮选中积压编码三选
+                //（「确实」变「太大/石灰石」）。替它完成簿记：清 caps
+                // 挂起 + 记 up_last（真 up 迟到也被 250ms 去重挡）。
+                {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(g.modekey_down_seen, Some((v, _)) if v == 0x14) {
+                        g.modekey_down_seen = None;
+                    }
+                    g.modekey_up_last = Some((0x14, std::time::Instant::now()));
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace("caps: F24 尾事件无票（WPS拆三件）→ 代行 caps 抬键簿记");
+                    }
+                }
+            }
+        }
+        // 【Caps 系统态补偿·吞合成键 2026-10-12 三次】只吞自家 keybd_event
+        // 合成的翻转键（dwExtraInfo="HUFU" 魔法标记）——直通不递引擎
+        // （否则补偿键被当用户键再消费一次=模式连翻）。真实用户键不带
+        // 标记，永不被吞（旧 400ms 时间窗会误吞窗内真实快击——用户实
+        // 锤「快速打编码加 caps 有时选重不生效」）。
+        if wparam == 0x14 {
+            let extra = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo()
+            }.0 as usize;
+            if extra == CAPS_FIXUP_MAGIC {
+                // 【补偿结算制 2026-10-13】在飞对子的 down 已被宿主消化
+                // （+1 落地计数；up 不计——一对只算一次）。复检凭
+                // INJ==SEEN 判定「全部落地」，杜绝旧竞态里的叠加注入。
+                if !up {
+                    CAPS_PAIR_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::tsf::trace("caps: 合成翻转键（HUFU 标记）→ 直通不递引擎");
+                return BOOL(0);
+            }
+        }
+        // 【自绘免激活菜单键路 2026-10-12】菜单无焦点（NOACTIVATE），
+        // 键盘经宿主 TSF 到本 sink。宿主（CUAS）TestDown 吃掉后仍派
+        // KeyDown——TestDown 阶段只报「吃」零副作用（选择/关窗只能
+        // 在 KeyDown 执行一次）；KeyDown 全功能路由；收场后 200ms 吞
+        // 窗兜住二次到达的导航键（down 与 up 都吞：enter 二次到达会
+        // 触发引擎「回车=编码上屏」，自动测试实锤）。
+        if crate::candwin2::cand_menu_open() {
+            if !up && test_only && crate::candwin2::menu_nav_key(wparam as u32) {
+                return BOOL(1);
+            }
+            if !up && !test_only {
+                if crate::candwin2::menu_key(wparam as u32) {
+                    return BOOL(1);
+                }
+                if crate::candwin2::menu_swallow_key(wparam as u32) {
+                    return BOOL(1);
+                }
+            }
+            if up && crate::candwin2::menu_swallow_up(wparam as u32) {
+                return BOOL(1);
+            }
+        }
+        // 【交互收场自愈·执行半 2026-10-12】候选窗点击/右键菜单收场后
+        // 的第一键：焦点 NULL 自愈（BUG① 上屏失效的键路死支）+ 锚点
+        // 补探（BUG③ 调频后候选飘）。键入口安全上下文（非 wndproc）。
+        cand_interact_recover_pending(&self.shared);
         // 【加词/加权小窗直通 2026-09-12 十二修】小窗打开期间，主线程
         // 的 dispatch **无条件直通**——五版门带前台比对（fg==小窗才
         // 挡），实测存在缝隙：attach 脱离后前台闪回宿主窗/cuas 把词
@@ -1850,6 +3218,18 @@ impl HuFuTs_Impl {
         // 恢复。小窗线程自己的 dispatch 不受此门影响（键入正常）。
         if crate::addword::is_open() && !crate::addword::in_window_thread() {
             return BOOL(0);
+        }
+        // 【按住Ctrl调频 2026-11】模态键路（模块注释见 freq_enter 前）：
+        // Ctrl 落下→进入 / 抬起→退出（铁律：按住进入，松开退出）；
+        // 模态中 Shift 落下/抬起→删词子模式；模态中主排数字 Test 层直
+        // 执行（80ms 同 vk 去重挡 KeyDown 二次到达）→拾起/对调/删除。
+        if let Some(b) = self.freq_modal_key(wparam, up) {
+            return b;
+        }
+        // 【导出码表快捷键·十三修】组合命中即导出（任意应用状态；空
+        // 组合=未配置恒 None 零开销）。
+        if let Some(b) = self.export_key_check(wparam, up) {
+            return b;
         }
         // 【焦点模式同步 2026-09-11】应用 focus worker 经原子中转回写
         // 的中英态（见 handle_set_focus），在任何本地预判前拉齐缓存。
@@ -1960,6 +3340,7 @@ impl HuFuTs_Impl {
                             if g.chinese != zh {
                                 g.chinese = zh;
                                 crate::langbar::set_mode(zh);
+                                note_mode_applied();
                             }
                             // 【Shift 上屏立即收窗 2026-09-16】带 commit=
                             // 上屏编码：空帧分支改走 hide_now（无 hold
@@ -1992,11 +3373,10 @@ impl HuFuTs_Impl {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 g.space_ctrl_armed = armed;
             } else if wparam == 0x11 {
+                // 【八十五修】ctrl 事件时 space 仍按住 → 布防（原语化，
+                // 与 freq_modal_key 消费路径共用——见 ctrl_up_arm_space）。
                 let space_held = unsafe { GetKeyState(VK_SPACE.0 as i32) < 0 };
-                if space_held {
-                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                    g.space_ctrl_armed = true;
-                }
+                ctrl_up_arm_space(&self.shared, space_held);
             }
             if !up {
                 // 其他键按下：Shift 组合保护（大写/快捷键），取消单击判定
@@ -2021,34 +3401,15 @@ impl HuFuTs_Impl {
         // 回落内建单击切换，等价旧链路）。
         // ── 模式键直发 + 去重 ──
         // 按下事件（TestDown 或 KeyDown）直发；松开仅限「down 未直发过」
-        // 的跟打器形态。同键 80ms 去重挡 test+down 成对宿主的双发；up
-        // 一旦因 down 已发被吞即清标记——按住 Ctrl+Space 再久也不会
-        // 被迟到的 keyup 翻回（CapsLock「按住 >80ms 翻回」同源教训）。
+        // 的跟打器形态。去重全部事件驱动（八十六修，modekey_admit）：
+        // 同一物理按压不论宿主投 2/3/4 件、不论击键时长，恰好一发。
         if mode_key {
-            {
+            let admit = {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                if up {
-                    if g.modekey_down_seen == Some(wparam) {
-                        g.modekey_down_seen = None;
-                        // 【八十五修】组合已由 down 消费——armed 同时终结
-                        //（防后续迟到的第二个 up 借旧组合再触发）。
-                        g.space_ctrl_armed = false;
-                        return BOOL(0);
-                    }
-                    // 【八十五修】armed 通道放行即消费（同上防双发：慢
-                    // 宿主 testup/keyup 相隔可 >80ms，dup 挡不住）。
-                    if wparam == 0x20 && g.space_ctrl_armed {
-                        g.space_ctrl_armed = false;
-                    }
-                } else {
-                    g.modekey_down_seen = Some(wparam);
-                }
-                let dup = matches!(&g.modekey_last, Some((vk, t))
-                    if *vk == wparam && t.elapsed().as_millis() < 80);
-                if dup {
-                    return BOOL(0);
-                }
-                g.modekey_last = Some((wparam, std::time::Instant::now()));
+                modekey_admit(&mut g, wparam, up)
+            };
+            if !admit {
+                return BOOL(0);
             }
             // fallthrough：走通用路径发 server + 完整响应处理
         }
@@ -2068,6 +3429,7 @@ impl HuFuTs_Impl {
                     None => return BOOL(0),
                 }
             };
+            // 【Alt+修改 下线 2026-10-17】预判分支已删——Alt 组合全放行。
             let _ = alt;
             // Ctrl+M 切方案 / Ctrl+Space 切中英：先声明按键，真实处理在 KeyDown
             // 由引擎定夺（未启用时引擎不吞，KeyDown 返回直通）。
@@ -2092,6 +3454,9 @@ impl HuFuTs_Impl {
                 }
                 return BOOL(0);
             }
+            // 【Alt+修改 下线 2026-10-17】Alt+键预判分支整体删除（用户
+            // 拍板：与太多软件快捷键冲突）。Alt 组合回到全放行（宿主
+            // 菜单/快捷键原生语义）。
             if ctrl {
                 // 【候选调频/删词 2026-09-06】Ctrl+数字（含 Shift 形态）在
                 // 编码态由引擎处理（置顶/删除），预吞；空态放行（应用
@@ -2240,8 +3605,16 @@ impl HuFuTs_Impl {
                     wparam == 0x20
                 ));
             }
+            // 【按住Ctrl调频 2026-11】模态中的 Ctrl+Shift 是**删词子模式
+            // 手势**，不再当切换热键冲销（系统真切换由四十五修 lang
+            // sink 收窗兜底；热键改键用户——虎符用户常态——的模态删词
+            // 不受误杀）。Win+Space 不豁免：Win 与调频无交集。
+            let freq_on = {
+                let g = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                g.freq_active
+            };
             let is_switch_hotkey = (win && (wparam == 0x20 || wparam == 0x0))
-                || (ctrl && shift && (wparam == 0x10 || wparam == 0x11));
+                || (ctrl && shift && (wparam == 0x10 || wparam == 0x11) && !freq_on);
             if is_switch_hotkey {
                 let (in_use, has_win) = {
                     let g = self.shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -2379,6 +3752,45 @@ impl HuFuTs_Impl {
             "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
             name, consumed, commit, back, digit_tail
         ));
+        // 【Caps 系统态补偿 2026-10-12 → 十六修 2026-10-13】引擎消费了
+        // CapsLock 后部分宿主仍翻转系统大小写位（TSF 吞键不影响其翻
+        // 转；实测：Caps 选重一次后加词编码框手输全大写）。历代修法沿
+        // 革：一次（即时补偿）→ 二次（延时复检）→ 十四修（结算制防
+        // 叠加）→ 十五修（静默窗避让，因竞态被否）。十六修实锤定论：
+        // 【十六修·打字路径零注入 2026-10-13】补偿对注入从打字路径彻底
+        // 移除（旧即时路+延时复检线程全数下岗）：对照实锤——旗标关闭
+        // 补偿后用户物理连打零大写泄漏，开启必炸。根因=合成 Caps 对
+        // 与物理键流交错，WPS/EmEditor 的物理键监听层（状态栏指示/键
+        // 方案）记账被搅乱后把下一个物理字母在 TSF 之前截走（直插/
+        // 蒸发），位 ON 时直插即大写 D；d 没进编码又让下一 caps 落空
+        // 组段→锁大写→D 连环。QQ/记事本无此监听=永不受害；注入键带
+        // INJECTED 标志走异路=自动化复现打不中（只有物理键触发）。
+        // 补偿唯一保留时刻=锁大写翻转沿（用户刻意按下的模式切换边界，
+        // 非连打中途；进锁大写的极端竞态直插大写 D 与模式输出等价无
+        // 感）：PREV_LOCK 检测翻转，物理位与引擎态不一致时经结算守卫
+        // 补一对对齐（灯=状态可见）。选重/功能 caps 一律零注入——物
+        // 理位翻转留痕属驱动层行为，软件不可拦。
+        let caps_locked_now = state
+            .get("caps_lock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if name == "capslock" && consumed {
+            let prev = CAPS_PREV_LOCK.swap(
+                caps_locked_now as i8,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // 首拍（-1）只建档不动作；此后只在翻转沿检查对齐。
+            if prev >= 0 && prev != caps_locked_now as i8 {
+                let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
+                if bit_on != caps_locked_now && caps_synth_align(caps_now_ms(), caps_locked_now)
+                {
+                    let dir = if caps_locked_now { "ON" } else { "OFF" };
+                    crate::tsf::trace(&format!(
+                        "caps: 锁大写翻转沿物理位不一致 → 补一对对齐 {dir}（灯=状态可见）"
+                    ));
+                }
+            }
+        }
         // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
         // escape 预判用）：任何键响应 state 都可能翻转它（上屏后
         // 非空、撤光后空），就地下钻同步。
@@ -2425,6 +3837,60 @@ impl HuFuTs_Impl {
                 trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
             }
             g.keymap_idle = kmi;
+            // 【Alt+修改 下线 2026-10-17】alt_symbols/alt_always 同步块与
+            // LL 钩子快照刷新已随功能整体删除。
+            // 【十七修·零锁快照 v2】从**本拍 state** 直读——旧版读 g.raw_last
+            // 镜像恒滞后一拍（首字母组段的 caps 被放行=EmEditor 灯翻第一
+            // 次的根；WPS 空组段被拦=F24 又不被转发=按键死的根）。raw
+            // 非空=组段在身（提交/撤光后引擎回 raw=""）。keymap 两表解析
+            // 完才动快照（kmi 在此可见）。
+            let raw_cur = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+            CAPS_SNAP_COMP.store(
+                !raw_cur.is_empty(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let caps_mapped =
+                g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
+            CAPS_SNAP_MAPPED.store(caps_mapped, std::sync::atomic::Ordering::Release);
+            // caps 有映射（组段态会消费它）→ 进程装 LL 钩子
+            //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
+            if caps_mapped {
+                caps_hook_install();
+            }
+            // 【按住键可录·十三修】同帧解析三组合（freq/delete/export）
+            // 为 VK 集缓存；旧引擎 state 无字段 → unwrap_or 默认串 =
+            // 旧版行为，前向兼容。组合变了才 trace（每键一拍不刷屏）。
+            let fh = state
+                .get("freq_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ctrl")
+                .to_string();
+            let dh = state
+                .get("delete_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ctrl+shift")
+                .to_string();
+            let ek = state
+                .get("export_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (fk, dk, xk) = (
+                parse_key_combo(&fh),
+                parse_key_combo(&dh),
+                parse_key_combo(&ek),
+            );
+            if g.freq_key != fk || g.del_key != dk || g.export_key != xk {
+                trace(&format!(
+                    "keycombo 同步: freq={fh:?}→{fk:?} del={dh:?}→{dk:?} export={ek:?}→{xk:?}"
+                ));
+            }
+            g.freq_key = fk;
+            g.del_key = dk;
+            g.export_key = xk;
+            g.freq_key_raw = fh;
+            g.del_key_raw = dh;
+            g.export_key_raw = ek;
         }
         // 【回车立即收窗 2026-10-09】回车与 Shift 上屏同款：无论「回车
         // 清屏」勾否（清屏=清组段 / 未勾=编码字母上屏），候选一律立即
@@ -2501,6 +3967,7 @@ impl HuFuTs_Impl {
                 if g.chinese != zh {
                     g.chinese = zh;
                     crate::langbar::set_mode(zh);
+                    note_mode_applied();
                     trace(&format!("自愈: 本地中英态回填 chinese={zh}"));
                 }
             }
@@ -2551,6 +4018,161 @@ impl HuFuTs_Impl {
             }
         }
         BOOL(1)
+    }
+
+    /// 【按住键可录·十三修】模态键路分派（dispatch 咽喉调用；模块
+    /// 注释见 freq_enter 前）：
+    /// · 组合成员落下：组合完整（其余成员皆按）→ 入模态（删词组合
+    ///   优先）；不完整 → 回落原路径。成员抬起 → 重估（del 组合全按
+    ///   =删词 / freq 组合全按 =调频 / 都散 =退出）。修饰键成员一律
+    ///   直通宿主 BOOL(0)（纯修饰，宿主快捷键基座语义不变）；
+    /// · 模态中主排数字（0x30-0x39）落下 → Test 层直执行（拾起/对调/
+    ///   删除；80ms 同 vk 去重挡 KeyDown 二次到达），BOOL(1) 防宿主
+    ///   自产数字；抬起直通。
+    /// 返回 None = 非成员/模态未激活，走原路径。
+    fn freq_modal_key(&self, wparam: usize, up: bool) -> Option<BOOL> {
+        let (fk, dk, active, physical) = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                g.freq_key.clone(),
+                g.del_key.clone(),
+                g.freq_active,
+                g.freq_ctrl_physical,
+            )
+        };
+        let member = |vk: usize| fk.contains(&vk) || dk.contains(&vk);
+        if up {
+            if active && member(wparam) {
+                // 成员抬起 → 重估：删词优先，两组合都散才退出。事件键
+                // 的按态**不读 GetKeyState**（TestUp 时刻状态同步不保
+                // 险）——含它的组合必不完整，不含它的组合不受本事件影响。
+                // 【调频模态堵洞 2026-10-16】ctrl 抬起被本分支消费 →
+                // 主分派的 Ctrl+Space 布防（3315 区）跑不到——此处补
+                // 布防：space 仍按住则 armed=true，后到的 space up 照样
+                // 走模式键通道切中英（默认 freq=ctrl 下「有候选按住
+                // Ctrl → 先松 Ctrl 后松 Space」切换失败的病灶）。
+                if wparam == 0x11 {
+                    let space_held = unsafe { GetKeyState(VK_SPACE.0 as i32) < 0 };
+                    ctrl_up_arm_space(&self.shared, space_held);
+                }
+                let del_held = !dk.contains(&wparam) && combo_held(&dk);
+                let freq_held = !fk.contains(&wparam) && combo_held(&fk);
+                if del_held {
+                    freq_set_delete(&self.shared, true);
+                } else if freq_held {
+                    freq_set_delete(&self.shared, false);
+                } else {
+                    freq_exit(&self.shared);
+                }
+                return Some(BOOL(0));
+            }
+            // 数字抬起：直通吞掉（不走旧路径 composing 分支）
+            if active && (0x30..=0x39).contains(&wparam) {
+                return Some(BOOL(0));
+            }
+            return None;
+        }
+        // ── down ──
+        if active {
+            // 【僵尸模态防线】模态中任何**非成员**键到达而两组合物理
+            // 全散（KeyUp 被宿主吞掉、模态悬死）：先退出门再放行本键。
+            // 仅对物理进入的模态有效（纯 Test 注入宿主松开语义在 TestUp）。
+            if !member(wparam) && physical && !combo_held(&fk) && !combo_held(&dk) {
+                freq_exit(&self.shared);
+                return None;
+            }
+            // 数字：Test 层直执行（拾起/对调/删除）
+            if (0x30..=0x39).contains(&wparam) {
+                let idx = if wparam == 0x30 {
+                    9
+                } else {
+                    (wparam - 0x31) as usize
+                };
+                let dup = {
+                    let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let d = matches!(&g.freq_last_digit, Some((vk, t))
+                        if *vk == wparam && t.elapsed().as_millis() < 80);
+                    if !d {
+                        g.freq_last_digit = Some((wparam, std::time::Instant::now()));
+                    }
+                    d
+                };
+                if !dup {
+                    freq_digit(&self.shared, idx);
+                }
+                return Some(BOOL(1));
+            }
+            // 成员 down（模态中按下另一组合键，如调频态按 Shift）→
+            // 重估子模式（和弦：删词组合完整 → 删词）。事件键按态不读
+            // GetKeyState（TestDown 时刻同步不保险）：含它=其余皆按即
+            // 完整，不含它=照常逐键查。
+            if member(wparam) {
+                let del_held = if dk.contains(&wparam) {
+                    combo_held_except(&dk, wparam)
+                } else {
+                    combo_held(&dk)
+                };
+                if del_held {
+                    freq_set_delete(&self.shared, true);
+                } else {
+                    freq_set_delete(&self.shared, false);
+                }
+                return Some(BOOL(0));
+            }
+            return None;
+        }
+        // ── down 且模态未激活：入口判定（组合成员落下 + 组合完整）。
+        if member(wparam) {
+            let del_complete = dk.contains(&wparam) && combo_held_except(&dk, wparam);
+            let freq_complete = fk.contains(&wparam) && combo_held_except(&fk, wparam);
+            if del_complete || freq_complete {
+                if stray_modifier_held(&fk, &dk) {
+                    return None;
+                }
+                let keys = if del_complete { &dk } else { &fk };
+                if freq_enter(&self.shared, keys, del_complete) {
+                    return Some(BOOL(0));
+                }
+                return None; // 无候选/菜单开 → 回落原路径
+            }
+            // 成员但组合不完整（如默认下 Shift 先于 Ctrl 落下）→ 原路径
+            //（Shift 单击切中英等既有语义不受扰）。
+        }
+        None
+    }
+
+    /// 【导出码表快捷键·十三修】组合命中（任意应用状态，不要求候选
+    /// 在窗）：Test 层直执行 + 80ms 同组合去重，BOOL(1) 吃键防宿主
+    /// 自产字符；抬起直通。命中即管道 export_schema（与托盘「导出
+    /// 码表」同路径：当前方案 + 记忆格式 + 打开导出目录）。
+    fn export_key_check(&self, wparam: usize, up: bool) -> Option<BOOL> {
+        if up {
+            return None;
+        }
+        let ek = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if g.export_key.is_empty() {
+                return None;
+            }
+            g.export_key.clone()
+        };
+        if !ek.contains(&wparam) || !combo_held_except(&ek, wparam) {
+            return None;
+        }
+        let dup = {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let d = matches!(&g.export_last, Some((vk, t))
+                if *vk == wparam && t.elapsed().as_millis() < 80);
+            if !d {
+                g.export_last = Some((wparam, std::time::Instant::now()));
+            }
+            d
+        };
+        if !dup {
+            trace("export: 快捷键命中 → 导出当前方案码表");
+            let _ = crate::ipc::call(&serde_json::json!({ "op": "export_schema" }));
+        }
+        Some(BOOL(1))
     }
 
     /// 【七十六修·键盘层回删+注入】宿主 TSF ShiftStart 静默不动（WinForms/
@@ -2778,6 +4400,11 @@ enum Op {
     /// = 无光标。结果写 shared.esc_caret_ok（Some(bool)），空态 Esc
     /// 撤回预判的第二道门。只读不动文本。
     QueryCaret,
+    /// 【组段复活·recover 专用 2026-10-12 十次】与 SetPreedit 的死句柄
+    /// 路同语义但**Ghost 不写**：读不到文档（裂脑档）时盲开组段=复制
+    /// 字母（Notepad3 只写不读仓实锤）——报错重试到安定/窗口过期。键
+    /// 路的 SetPreedit 不走本 op（用户键绝不能丢）。
+    ResurrectPreedit(String),
 }
 
 #[implement(ITfEditSession)]
@@ -2797,11 +4424,29 @@ struct EditSession {
     /// 写进槽位；同步档（0x6 回调内联）受理后即可读真实结果。
     /// None = 调用方不关心（焦点冲销等一次性路径）。
     result_slot: Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
+    /// 【陈旧闸 2026-10-12】请求出生时刻：Chromium 系对同步请求也可能
+    /// 回 TS_S_ASYNC 偷换排队——回调执行可能晚于宿主状态巨变（菜单
+    /// 收场焦点风暴），此刻写组段/清孤儿=闪退（0xC0000409 实锤）。
+    /// 写类 op 执行时超龄（>800ms）直接 no-op。键流会话恒内联执行
+    /// （出生≈执行），永不触闸。
+    born: std::time::Instant,
 }
 
 impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         trace("DoEditSession enter");
+        // 【陈旧闸 2026-10-12】被宿主偷换排队的写类会话：执行时距出生
+        // 已 >800ms=宿主状态早已巨变（菜单收场/焦点风暴），写组段/清
+        // 孤儿在此刻执行=闪退实锤。直接 no-op（读类照跑无害）。
+        if self.born.elapsed() > std::time::Duration::from_millis(800)
+            && matches!(self.op, Op::SetPreedit(_) | Op::StartPreedit(_))
+        {
+            trace(&format!(
+                "DoEditSession: 会话陈旧 {}ms → 丢弃（防过期写）",
+                self.born.elapsed().as_millis()
+            ));
+            return Ok(());
+        }
         // 【重入死锁防护 2026-09-09】标记本线程进入 edit session：
         // 期间宿主回调链内触发的 OnSetFocus 延迟（见 OnSetFocus 处），
         // 出口回放（此刻 shared 锁空闲、焦点状态已稳定）。
@@ -2863,13 +4508,62 @@ impl EditSession_Impl {
                 g.esc_caret_ok = Some(ok);
                 Ok(())
             }
+            Op::ResurrectPreedit(text) => {
+                // 【recover 专用复活 2026-10-12 十次】Ghost=读不到文档
+                //（Notepad3 只写不读仓）→ 盲写=复制字母，拒绝并重试；
+                // 可读（NotFound=自清/Cleared=清掉）才重组段。
+                // 【嫌疑标记化 2026-10-12】只清杀段挂的嫌疑文本。
+                let suspect = g.orphan_suspect.take().unwrap_or_default();
+                drop(g);
+                match clear_orphan_preedit(&ctx, ec, &suspect) {
+                    OrphanResult::Ghost => {
+                        trace("ResurrectPreedit: 裂脑档——拒绝盲写，待重试");
+                        Err(Error::from(HRESULT(-2147467259)))
+                    }
+                    other => {
+                        let _ = other;
+                        trace("ResurrectPreedit: 文档可读——孤儿已处理，重组段");
+                        start_preedit_on(&ctx, &self.shared, ec, &text)
+                    }
+                }
+            }
             Op::StartPreedit(text) => {
                 // 标准 IME 流程：选区范围 → StartComposition → 组段内 SetText。
                 // （InsertTextAtSelection 在真实应用上下文会报 TF_E_SYNCHRONOUS）
+                // 【孤儿回收·嫌疑标记化 2026-10-12 三次】只清杀段挂的
+                // 嫌疑文本——正常上屏后 preedit_last 与正文同形，按它清
+                // =吞字（用户实锤 d; d; 后「哪个」→「哪」）。
+                {
+                    let suspect = g.orphan_suspect.clone();
+                    if let Some(old_preedit) = suspect.filter(|s| !s.is_empty()) {
+                        trace("StartPreedit: 嫌疑孤儿回收（杀段挂标）");
+                        let _ = g.orphan_suspect.take();
+                        drop(g);
+                        // 键路不阻塞：清尽力、写无条件（同 SetPreedit 路）。
+                        let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        // 重新拿锁继续标准流程
+                        g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    }
+                }
                 let cc: ITfContextComposition = ctx.cast()?;
                 trace("SP: cast ok");
                 let range: ITfRange = selection_range(&ctx, ec)?;
                 trace("SP: GetSelection ok");
+                // 【幻影选区塌缩 2026-10-12】Chromium 系（QQ/VSCode）在
+                // 上屏后把选区留在「已上屏词末字」上（1 字宽）——本键
+                // SetText 会替换掉该字=吞字（用户实锤 d;d;「哪个哪个」→
+                // 「哪哪个」；SP探针 读="个个"=选区盖着「个」）。塌缩它。
+                // 【死锁修】末字从已持有的 g 读出传入，助手内不再拿锁。
+                let phantom_tail = g
+                    .last_commit_text
+                    .chars()
+                    .last()
+                    .map(|c| c.to_string());
+                if phantom_tail.is_some()
+                    && collapse_phantom_selection(phantom_tail, &ctx, ec, &range)
+                {
+                    trace("SP: 幻影选区（上屏末字残留）——塌缩到光标");
+                }
                 let sink: ITfCompositionSink = CompSinkObj {
                     shared: self.shared.clone(),
                 }
@@ -2925,20 +4619,48 @@ impl EditSession_Impl {
                     drop(g);
                     return start_preedit_on(&ctx, &self.shared, ec, &text);
                 }
-                let comp = g
-                    .composition
-                    .clone()
-                    .ok_or_else(|| Error::from(HRESULT(-2147467259)))?;
+                let comp = match g.composition.clone() {
+                    Some(c) => c,
+                    // 【组段复活·None 路 2026-10-12】宿主终止回调已把
+                    // 句柄清空（点击候选窗/菜单抢焦点的标准时序）——
+                    // 本键带文本即复活：孤儿回收后原位重组段（poll 复活
+                    // 与次键自愈同一出口）。【四次·去 composing 依赖】
+                    // 菜单收场后 composing 旗也会被各路清理置假（自动
+                    // 测试实锤：退格路 SetPreedit 静默落 E_FAIL=字母
+                    // 残留主因）——句柄死+有文本就复活，旗不可信。
+                    None if !text.is_empty() => {
+                        trace("SetPreedit: 组段句柄已被终止清空——孤儿回收后重组段");
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
+                        drop(g);
+                        // 【读可用宿主尽力清 2026-10-12 十次】Notepad3 类
+                        // 仓只写不读（GetText 恒空）——Ghost 也是常态，
+                        // 绝不能阻塞用户键：清尽力（Chromium 系能清），
+                        // 写无条件。【嫌疑标记化】无标记=正常上屏后=不清。
+                        if !old_preedit.is_empty() {
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        }
+                        return start_preedit_on(&ctx, &self.shared, ec, &text);
+                    }
+                    None => return Err(Error::from(HRESULT(-2147467259))),
+                };
                 let range: ITfRange = unsafe { comp.GetRange()? };
                 let wstr: Vec<u16> = text.encode_utf16().collect();
                 if unsafe { range.SetText(ec, 0, &wstr) }.is_err() {
                     // 自愈：组段已被应用/焦点切换单方面终止（SetText 失败）——
                     // 弃死句柄，在当前上下文全新 StartComposition
-                    // （此前表现为「有候选但中文永远上不了屏」）
+                    // （此前表现为「有候选但中文永远上不了屏」）。
+                    // 【孤儿字母回收·嫌疑标记化 2026-10-12】只清杀段挂的
+                    // 嫌疑文本（EndComposition 自愈路组段刚死，preedit_last
+                    // 与正文同形是常态——按它清=吞字）。
                     trace("SetPreedit: 死组段，自愈重开");
                     let _ = unsafe { comp.EndComposition(ec) };
                     g.composition = None;
+                    let old_preedit = g.orphan_suspect.take().unwrap_or_default();
                     drop(g);
+                    // 同 None 路：清尽力、写无条件（键路不阻塞）。
+                    if !old_preedit.is_empty() {
+                        let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                    }
                     return start_preedit_on(&ctx, &self.shared, ec, text);
                 }
                 // 【组段下划线·CUAS】编码更新后重打属性（SetText 会
@@ -3099,25 +4821,52 @@ impl EditSession_Impl {
                         let _ = unsafe { comp.EndComposition(ec) };
                         // 提交后选区放到已提交文本之后
                         let _ = set_selection_at_end(&ctx, ec, &range);
+                        // 【幻影选区识别数据 2026-10-12】Chromium 会把选
+                        // 区推回「末字 1 字宽」——下一键塌缩识别用。
+                        g.last_commit_text = text.clone();
                     } else {
                         trace("Commit: 死组段 SetText 失败——自愈直插保字");
                         let _ = unsafe { comp.EndComposition(ec) };
+                        // 【孤儿字母回收·嫌疑标记化 2026-10-12】只清杀段
+                        // 挂的嫌疑文本（正常上屏后 preedit_last 与正文同
+                        // 形——按它清=吞字，用户实锤 d; d; 「哪个」→「哪」）。
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
+                        if !old_preedit.is_empty() {
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                        }
                         if !text.is_empty() {
                             if let Ok(r2) = selection_range(&ctx, ec) {
                                 let _ = unsafe { r2.SetText(ec, 0, &wstr) };
                                 let _ = set_selection_at_end(&ctx, ec, &r2);
                             }
                         }
+                        g.last_commit_text = text.clone();
                     }
                 } else if !text.is_empty() {
                     // 无活动组段的直接提交（如开头标点「，」）：
                     // 在当前选区（插入点）处插入文本，等价于 StartPreedit 的定位流程但不开组段
+                    // 【孤儿回收·嫌疑标记化 2026-10-12 八次】只清杀段挂的
+                    // 嫌疑文本。原「死句柄+preedit_last 非空即清」在正常
+                    // 上屏后同样成立（上屏清句柄、preedit_last 留旧词）=
+                    // 下一键把刚上屏的词当孤儿删掉（吞字）。杀段挂标是唯
+                    // 一可信的孤儿信号。
+                    if g.composition.is_none() {
+                        let old_preedit = g.orphan_suspect.take().unwrap_or_default();
+                        if !old_preedit.is_empty() {
+                            drop(g);
+                            // Ghost 时也照插（写会落真文档，上屏字不能丢）；
+                            // 孤儿等下一拍 recover 安定后补清。
+                            let _ = clear_orphan_preedit(&ctx, ec, &old_preedit);
+                            g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
                     let range = selection_range(&ctx, ec)?;
                     let wstr: Vec<u16> = text.encode_utf16().collect();
                     unsafe {
                         range.SetText(ec, 0, &wstr)?;
                     }
                     let _ = set_selection_at_end(&ctx, ec, &range);
+                    g.last_commit_text = text.clone();
                 }
                 g.composition = None;
                 // 【增量估算 2026-09-12 十一次修正·记事本同款数据流】
@@ -3375,6 +5124,181 @@ impl EditSession_Impl {
     }
 }
 
+/// 【交互孤儿字母回收 2026-10-12】组段被宿主单方面终止（候选窗点击/右
+/// 键菜单抢焦点——CUAS 随焦点抖动终止组段）时，内联预编辑字母已成孤
+/// 儿文本留在插入点左侧；死组段自愈（Commit 直插/SetPreedit 重开）在其
+/// 上再落新文本=「字母+词一起上屏」（BUG① 右键路径用户实锤：能上屏但
+/// 编码字母跟着上）。回收：ShiftStart 扩选 n 个字符、GetText 校验与旧
+/// 预编辑一致才清空（宿主已自清/用户已改动时放弃——绝不误删用户文
+/// 本）；哑宿主（扩选 0 动）保持旧行为不回归。
+/// 孤儿回收结果。【Ghost=裂脑档 2026-10-12 八次】菜单模态/收场风暴期
+/// Notepad3 实测「读全空、写落真文档」——此刻绝不能盲写组段（复制
+/// 字母的根因）；上层收到 Ghost 必须放弃写入并重试到安定。
+enum OrphanResult {
+    /// 孤儿已删（左或右侧命中并清除）
+    Cleared,
+    /// 文档可读但没有匹配孤儿（宿主自清/用户改过——正常态）
+    NotFound,
+    /// 文档不可读（左右扩选全 0=裂脑档）——禁止盲写
+    Ghost,
+}
+
+/// 【ACP 路 2026-10-12 九次】校验 range 当前范围的文本与期望一致
+///（fetched 钳制到缓冲长——拆家态宿主乱填不越界切片）。
+fn orphan_text_matches(range: &ITfRange, ec: u32, want: &[u16]) -> bool {
+    let mut buf = vec![0u16; want.len() + 1];
+    let mut fetched = 0u32;
+    if unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) }.is_err() {
+        return false;
+    }
+    let fetched = (fetched as usize).min(buf.len());
+    let ok = &buf[..fetched] == want;
+    trace(&format!(
+        "orphan: 校验实际={:?} 期望={:?} 匹配={ok}",
+        String::from_utf16_lossy(&buf[..fetched]),
+        String::from_utf16_lossy(want)
+    ));
+    ok
+}
+
+/// 校验通过后的删除（SetText 空串）。
+fn orphan_delete(range: &ITfRange, ec: u32, side: &str) -> OrphanResult {
+    let empty: Vec<u16> = Vec::new();
+    let ok = unsafe { range.SetText(ec, 0, &empty) }.is_ok();
+    trace(&format!("orphan: {side}侧 ACP 回收 ok={ok}"));
+    if ok {
+        OrphanResult::Cleared
+    } else {
+        OrphanResult::NotFound
+    }
+}
+
+fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) -> OrphanResult {
+    let want: Vec<u16> = old_preedit.encode_utf16().collect();
+    if want.is_empty() {
+        return OrphanResult::NotFound;
+    }
+    let Ok(range) = selection_range(ctx, ec) else {
+        trace("orphan: selection_range 失败——放弃回收");
+        return OrphanResult::NotFound;
+    };
+    // 【ACP 面 2026-10-12 九次】Scintilla 系（Notepad3）的 range.Shift
+    // 常态失效（自动测试实锤「左移0 右移0」，与菜单无关）——ITfRangeACP
+    // 的 GetExtent/SetExtent 是唯一可扩展面；ACP 失败再回落 Shift
+    //（Chromium 系 Shift 可用）。
+    if let Ok(acp) = range.cast::<ITfRangeACP>() {
+        let (mut anchor, mut cch) = (0i32, 0i32);
+        if unsafe { acp.GetExtent(&mut anchor, &mut cch) }.is_ok() {
+            let n = want.len() as i32;
+            // 左侧 [anchor-n, n)：光标在段尾的常规孤儿位。
+            if anchor >= n
+                && unsafe { acp.SetExtent(anchor - n, n) }.is_ok()
+                && orphan_text_matches(&range, ec, &want)
+            {
+                return orphan_delete(&range, ec, "左");
+            }
+            // 右侧 [anchor, n)：杀段后光标落在段首（Notepad3/Chromium
+            // 实锤「左侧扩选 0 字」）——孤儿在插入点右侧。
+            if unsafe { acp.SetExtent(anchor, n) }.is_ok()
+                && orphan_text_matches(&range, ec, &want)
+            {
+                return orphan_delete(&range, ec, "右");
+            }
+            trace("orphan: ACP 双侧无匹配孤儿（自清或已改动）");
+            return OrphanResult::NotFound;
+        }
+        trace("orphan: ACP GetExtent 失败——回落 Shift 路");
+    }
+    // —— Shift 回落路（原实现）——
+    let Ok(mut range) = selection_range(ctx, ec) else {
+        trace("orphan: 右侧检查无法重建选区——放弃回收");
+        return OrphanResult::NotFound;
+    };
+    let mut total = 0i32;
+    for _ in 0..want.len() {
+        let mut moved = 0i32;
+        if unsafe { range.ShiftStart(ec, -1, &mut moved, std::ptr::null_mut()) }.is_err()
+            || moved == 0
+        {
+            break;
+        }
+        total += moved;
+    }
+    if total == 0 {
+        // 【左侧 0 字→转右侧 2026-10-12 四次】Notepad3/Chromium 杀段后
+        // 光标落在段首（自动测试实锤「左侧扩选 0 字」连环 4 次=孤儿全
+        // 在右侧）——左侧 0 字不再短路，无条件试右侧收编。
+        trace("orphan: 左侧扩选 0 字（光标在段首？）→ 转查右侧");
+    } else {
+        // 校验：扩出来的文本与旧预编辑一致才删（宿主已自清/字母被用户改
+        // 过——宁残留不错删）。fetched 钳制到缓冲长（拆家态宿主可能乱填
+        // ——越界切片 panic 跨 COM=abort=闪退 0xC0000409 实锤防线）。
+        let mut buf = vec![0u16; total as usize + 1];
+        let mut fetched = 0u32;
+        let hr = unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) };
+        let fetched = (fetched as usize).min(buf.len()) as u32;
+        if hr.is_err() {
+            return OrphanResult::NotFound;
+        }
+        let got = &buf[..fetched as usize];
+        trace(&format!(
+            "orphan: 左侧实际={:?} 期望={:?}",
+            String::from_utf16_lossy(got),
+            old_preedit
+        ));
+        if got == want.as_slice() {
+            let empty: Vec<u16> = Vec::new();
+            let ok = unsafe { range.SetText(ec, 0, &empty) }.is_ok();
+            trace(&format!("orphan: 回收 {} 个字母 ok={}", total, ok));
+            return OrphanResult::Cleared;
+        }
+    }
+    // 【右侧收编 2026-10-12 二次】杀段后光标在段首——孤儿字母在插入点
+    // 【右侧】。同款校验式回收：ShiftEnd 扩选 n 字、GetText 一致才清，
+    // 绝不误删。
+    let Ok(mut range2) = selection_range(ctx, ec) else {
+        trace("orphan: 右侧检查无法重建选区——放弃回收");
+        return OrphanResult::NotFound;
+    };
+    let mut total2 = 0i32;
+    for _ in 0..want.len() {
+        let mut moved = 0i32;
+        if unsafe { range2.ShiftEnd(ec, 1, &mut moved, std::ptr::null_mut()) }.is_err()
+            || moved == 0
+        {
+            break;
+        }
+        total2 += moved;
+    }
+    if total2 == 0 {
+        // 【裂脑档检测 2026-10-12 八次】左右双向都扩不动一个字=文档
+        // 不可读（非空文档的正常选区至少单向能扩）。此刻写会落进真
+        // 文档而读不到旧孤儿——复制字母实锤路径。上报 Ghost：上层
+        // 拒绝盲写、重试到安定。
+        trace("orphan: 裂脑档（左右双向扩 0 字）——禁止盲写，待安定重试");
+        return OrphanResult::Ghost;
+    }
+    let mut buf2 = vec![0u16; total2 as usize + 1];
+    let mut fetched2 = 0u32;
+    if unsafe { range2.GetText(ec, 0, &mut buf2, &mut fetched2) }.is_err() {
+        return OrphanResult::NotFound;
+    }
+    let fetched2 = (fetched2 as usize).min(buf2.len()) as u32;
+    trace(&format!(
+        "orphan: 右侧实际={:?} 期望={:?}",
+        String::from_utf16_lossy(&buf2[..fetched2 as usize]),
+        old_preedit
+    ));
+    if &buf2[..fetched2 as usize] != want.as_slice() {
+        trace("orphan: 右侧也与旧预编辑不符——放弃回收（防误删）");
+        return OrphanResult::NotFound;
+    }
+    let empty: Vec<u16> = Vec::new();
+    let ok = unsafe { range2.SetText(ec, 0, &empty) }.is_ok();
+    trace(&format!("orphan: 右侧回收 {} 个字母 ok={}", total2, ok));
+    OrphanResult::Cleared
+}
+
 /// 【弃段清文本 2026-09-11】结束组段前先清空段内文本，再
 /// EndComposition。裸 EndComposition 会把组段里的旧预编辑（编码
 /// 字母）残留在文档旧位置——跨进程焦点竞态实测 A 侧 'uj' 残留的
@@ -3396,6 +5320,15 @@ fn end_comp_clear(ec: u32, comp: &ITfComposition) {
 fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -> Result<()> {
     let cc: ITfContextComposition = ctx.cast()?;
     let range: ITfRange = selection_range(ctx, ec)?;
+    // 【幻影选区塌缩 2026-10-12】同 SP 主路径（自愈/重开/复活路一样
+    // 会吞掉 Chromium 残留的上屏末字）。此刻未持 g——短暂拿锁读末字。
+    let phantom_tail = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_commit_text.chars().last().map(|c| c.to_string())
+    };
+    if phantom_tail.is_some() && collapse_phantom_selection(phantom_tail, ctx, ec, &range) {
+        trace("SP自愈: 幻影选区——塌缩到光标");
+    }
     let sink: ITfCompositionSink = CompSinkObj {
         shared: shared.clone(),
     }
@@ -3421,6 +5354,54 @@ fn start_preedit_on(ctx: &ITfContext, shared: &SharedRef, ec: u32, text: &str) -
     g.cur_raw_len = text.chars().filter(|c| c.is_ascii()).count();
     query_caret(&mut g, ctx, ec);
     Ok(())
+}
+
+/// 【幻影选区塌缩 2026-10-12】Chromium 系宿主（QQ/VSCode——凡文档可
+/// 读者皆中招；Notepad3 只写不读、读必空=天然免疫）在本 IME 上屏后把
+/// TSF 选区留在「已上屏词的最后一个字」上（恰 1 字宽）——下一键开组
+/// 段 StartComposition+SetText 会把该字替换掉=吞字（用户实锤 d;d; 连打
+/// 「哪个哪个」变「哪哪个」，SP探针 读="个个"=选区盖着「个」实锤）。
+/// 判定签名：选区非折叠 + 恰 1 字 + 等于刚上屏文本的末字 → 原地塌缩
+/// 到末尾并把塌缩选区推回宿主（光标回上屏后的正确位置）。真实用户
+/// 选中等长同字的塌缩是非破坏性的（不删字，只是改插入点）。
+/// 【死锁修 2026-10-12】不在此拿锁——SP 主路径调用点已持 g，二次
+/// lock 同一线程=互斥锁死（任何程序打字未响应的根因）。末字由调用
+/// 方读出传入。
+fn collapse_phantom_selection(
+    tail: Option<String>,
+    ctx: &ITfContext,
+    ec: u32,
+    range: &ITfRange,
+) -> bool {
+    let Some(tail) = tail else { return false };
+    // 读选区内容（上限 4 单元——幻影恒 1 字；读到更长=真选区不动）
+    let mut buf = [0u16; 4];
+    let mut fetched = 0u32;
+    if unsafe { range.GetText(ec, 0, &mut buf, &mut fetched) }.is_err() || fetched == 0 {
+        return false; // 折叠选区（正常态）或读失败（Notepad3）——不动
+    }
+    let got = String::from_utf16_lossy(&buf[..(fetched as usize).min(buf.len())]);
+    if got.chars().count() != 1 || got != tail {
+        return false; // 非幻影签名（真选区/别的残留）——按原样走（标准替换行为）
+    }
+    // 原地塌缩 + 推回宿主
+    if unsafe { range.Collapse(ec, TF_ANCHOR_END) }.is_err() {
+        return false;
+    }
+    let r: ITfRange = match unsafe { range.Clone() } {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut sel = [TF_SELECTION {
+        range: core::mem::ManuallyDrop::new(Some(r)),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: BOOL(0),
+        },
+    }];
+    let hr = unsafe { ctx.SetSelection(ec, &sel) };
+    unsafe { core::mem::ManuallyDrop::drop(&mut sel[0].range) };
+    hr.is_ok()
 }
 
 /// 把选区放到指定范围末尾（折叠），保证后续插入点跟随。
@@ -3849,6 +5830,279 @@ fn focus_view_class() -> Option<String> {
     None
 }
 
+/// 【旧版 conhost 锚 2026-10-15】经典控制台（ConsoleWindowClass）锚点
+/// 直读：conhost 的 GetTextExt 在旧版控制台模式（ForceV2=0 / Win10 老
+/// 宿主）返回垃圾——实测锚在窗口首行（横幅行 y≈40），光标实际在下面
+/// 第 4 行（y≈110+），候选离光标数百 px（现场反馈「cmd 里候选离光标
+/// 比较远 X 轴」的复现根源：本机切旧版控制台模式 + 逐行像素对照实
+/// 锤；新版 conhost/Windows Terminal 的 GetTextExt 正常，不受影响）。
+/// DLL 载在 conhost 进程内——先试直读控制台光标缓冲格位+字体格度换
+/// 算像素锚；句柄在 conhost 内不可得（它自己是服务端不是客户端，
+/// GetStdHandle/CONOUT$ 双通道实测皆拒）→ 旧版模式锚=客户区左下，
+/// 新版落回标准链（实测正确）。
+/// 【旧版控制台判定 2026-10-15】HKCU\Console\ForceV2==0 = 用户（或组策
+/// 略）切了「使用旧版控制台」——该模式 conhost 的 GetTextExt 返回垃圾
+///（实测锚在首行横幅，光标实际在下面第 4 行）。进程级缓存一次：该设
+/// 置只对新开控制台生效，变更本来就要重开窗口（=新进程）。
+/// 【2026-10-15 门控拆除】ForceV2 不再决定通道选择（管理员 V2 cmd 实锤
+/// 同样出垃圾锚，见 query 链注释）——保留函数作诊断参考。
+#[allow(dead_code)]
+fn console_legacy_mode() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Registry::{
+            RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+            REG_VALUE_TYPE,
+        };
+        let sub: Vec<u16> = "Console\0".encode_utf16().collect();
+        let name: Vec<u16> = "ForceV2\0".encode_utf16().collect();
+        unsafe {
+            let mut hk = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(sub.as_ptr()),
+                0,
+                KEY_READ,
+                &mut hk,
+            )
+            .is_err()
+            {
+                return false; // 无键 = 默认新版
+            }
+            let mut v: u32 = 0;
+            let mut sz: u32 = 4;
+            let mut ty = REG_VALUE_TYPE(0);
+            let ok = RegQueryValueExW(
+                hk,
+                PCWSTR(name.as_ptr()),
+                None,
+                Some(&mut ty),
+                Some(&mut v as *mut u32 as *mut u8),
+                Some(&mut sz),
+            )
+            .is_ok();
+            // 句柄不关：进程级一次查询、conhost 生命周期一个 key 句柄
+            //（RegCloseKey 在 Wdk feature，为一次 close 引入 WDK 不值）
+            ok && ty == REG_DWORD && v == 0
+        }
+    })
+}
+
+/// 【MSAA 光标锚 2026-10-15】旧版控制台拿真光标的正规通道：读屏软件
+/// （NVDA/JAWS）定位经典控制台光标就是走它——控制台窗口线程响应
+/// WM_GETOBJECT(OBJID_CARET) 返回 IAccessible，accLocation 给出光标
+/// 的**屏幕像素** rect。进程内句柄双通道（GetStdHandle/CONOUT$）在
+/// conhost 里是死的（它是服务端不是客户端），但 MSAA 是跨线程窗口
+/// 消息——conhost 自己的窗口自己答，畅通。X/Y 全跟真光标（含打字
+/// 逐列右移）。失败/出界回 None（落左下兜底）。
+fn console_msaa_caret_rect() -> Option<RECT> {
+    use windows::core::{Interface, VARIANT};
+    use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+    unsafe {
+        // 焦点窗=控制台窗（调用方已验类名 ConsoleWindowClass）
+        let mut gi = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(0, &mut gi).is_err() || gi.hwndFocus.0.is_null() {
+            return None;
+        }
+        let hwnd = gi.hwndFocus;
+        // OBJID_CARET = 0xFFFFFFF8
+        let mut punk: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = AccessibleObjectFromWindow(
+            hwnd,
+            0xFFFF_FFF8,
+            &IAccessible::IID,
+            &mut punk as *mut *mut _ as *mut *mut core::ffi::c_void,
+        );
+        if hr.is_err() || punk.is_null() {
+            trace(&format!("qc/console-msaa: 取 IAccessible 失败 hr={hr:?}"));
+            return None;
+        }
+        let acc: IAccessible = std::mem::transmute(punk);
+        let (mut l, mut t, mut w, mut h) = (0i32, 0i32, 0i32, 0i32);
+        // 子参数=CHILDID_SELF（VT_I4 0）——VARIANT::default() 是
+        // VT_EMPTY，IAccessible 按规范拒之（实测「失败」的根源在此，
+        // 非接口不支持）。
+        let child = VARIANT::from(0i32);
+        if acc
+            .accLocation(&mut l, &mut t, &mut w, &mut h, &child)
+            .is_err()
+            || w <= 0
+            || h <= 0
+        {
+            trace("qc/console-msaa: accLocation 失败/空 → 标准链");
+            return None;
+        }
+        // 合理性：锚须落在控制台窗口（含边距）内——防陈旧/垃圾值
+        if let Some(fr) = focus_window_rect() {
+            if l < fr.left - 64 || l > fr.right || t < fr.top - 64 || t > fr.bottom {
+                trace(&format!(
+                    "qc/console-msaa: rect=({l},{t},{w},{h}) 出窗界({},{},{},{}) → 弃",
+                    fr.left, fr.top, fr.right, fr.bottom
+                ));
+                return None;
+            }
+        }
+        trace(&format!("qc/console-msaa: 光标 rect=({l},{t},{w},{h})"));
+        Some(RECT {
+            left: l,
+            top: t,
+            right: l + w,
+            bottom: t + h,
+        })
+    }
+}
+
+/// 【server 通道真光标 2026-10-15】DLL 载在 conhost 内（服务端），进程
+/// 内读光标双通道死、MSAA 不给坐标——借 server（外部进程）AttachConsole
+/// 到本控制台的客户端（conhost 父进程）读光标格+字体格度换算像素 rect。
+/// 后台通道 150ms 预算；80ms 节流。失败 None → 标准链（不钉位）。
+fn console_caret_rect_via_server() -> Option<RECT> {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *g {
+            if t.elapsed().as_millis() < 80 {
+                return None; // 节流窗内（上一轮刚问过/失败过）
+            }
+        }
+        *g = Some(std::time::Instant::now());
+    }
+    let resp = match ipc::call(&serde_json::json!({
+        "op": "console_caret",
+        "pid": std::process::id(),
+    })) {
+        Some(r) => r,
+        None => {
+            trace("qc/console-srv: pipe 无响应");
+            return None;
+        }
+    };
+    let r = match resp.get("rect").and_then(|v| v.as_array()) {
+        Some(a) if a.len() == 4 => a,
+        _ => {
+            let err = resp.get("err").and_then(|v| v.as_str()).unwrap_or("?");
+            trace(&format!("qc/console-srv: 服务端失败 err={err}"));
+            return None;
+        }
+    };
+    let v: Vec<i32> = r.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect();
+    if v.len() != 4 || v[2] <= v[0] || v[3] <= v[1] {
+        trace("qc/console-srv: rect 数据畸形");
+        return None;
+    }
+    trace(&format!(
+        "qc/console-srv: 光标 rect=({},{},{},{})",
+        v[0], v[1], v[2], v[3]
+    ));
+    Some(RECT {
+        left: v[0],
+        top: v[1],
+        right: v[2],
+        bottom: v[3],
+    })
+}
+
+/// 【console 直读锚 2026-10-15】进程内读控制台光标缓冲格位（最佳情
+/// 形——句柄可得时新旧模式同真）。见上方总注释。
+fn console_caret_rect() -> Option<RECT> {    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetConsoleWindow, GetCurrentConsoleFont, GetStdHandle,
+        CONSOLE_FONT_INFO, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        // 【失败缓存】句柄双通道死后不再每帧重试（CreateFile 失败也是
+        // 系统调用开销）——进程级一次定局。
+        static API_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if API_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        // 通道1：进程标准输出句柄（conhost 内多半没有——试探即知）
+        let h = match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => HANDLE::default(),
+        };
+        // 通道2：conhost 是控制台服务端不是客户端——标准句柄大概率无，
+        // 直开 CONOUT$ 设备（打开走 condrv 路由，进程内未必放行，试探）
+        let h = if !h.is_invalid() {
+            h
+        } else {
+            use windows::Win32::Foundation::GENERIC_READ;
+            use windows::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            };
+            let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+            match CreateFileW(
+                windows::core::PCWSTR(name.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            ) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => {
+                    trace("qc/console: GetStdHandle/CONOUT$ 均无句柄 → 左下回退/标准链");
+                    API_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(h, &mut info).is_err() {
+            trace("qc/console: GetConsoleScreenBufferInfo 失败 → 标准链");
+            return None;
+        }
+        let mut cfi = CONSOLE_FONT_INFO::default();
+        if GetCurrentConsoleFont(h, false, &mut cfi).is_err() {
+            trace("qc/console: GetCurrentConsoleFont 失败 → 标准链");
+            return None;
+        }
+        let hwnd = GetConsoleWindow();
+        if hwnd.0.is_null() {
+            trace("qc/console: GetConsoleWindow 空 → 标准链");
+            return None;
+        }
+        let mut org = POINT { x: 0, y: 0 };
+        if !ClientToScreen(hwnd, &mut org).as_bool() {
+            trace("qc/console: ClientToScreen 失败 → 标准链");
+            return None;
+        }
+        // 缓冲坐标 → 视口内行列（滚动回滚时 srWindow 是可见窗）
+        let vx = (info.dwCursorPosition.X - info.srWindow.Left) as i32;
+        let vy = (info.dwCursorPosition.Y - info.srWindow.Top) as i32;
+        let cell_w = cfi.dwFontSize.X.max(4) as i32;
+        let cell_h = cfi.dwFontSize.Y.max(4) as i32;
+        if vx < 0 || vy < 0 || vx > 500 || vy > 200 {
+            trace(&format!(
+                "qc/console: 光标视口位异常 ({vx},{vy}) → 标准链"
+            ));
+            return None;
+        }
+        let left = org.x + vx * cell_w;
+        let top = org.y + vy * cell_h;
+        let rect = RECT {
+            left,
+            top,
+            right: left + cell_w,
+            bottom: top + cell_h,
+        };
+        trace(&format!(
+            "qc/console: 光标格=({},{}) 视口=({},{}) 格度=({},{}) → rect=({},{},{},{})",
+            info.dwCursorPosition.X, info.dwCursorPosition.Y, vx, vy, cell_w, cell_h,
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
+        Some(rect)
+    }
+}
+
 fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     // 【QQ 首键滞后·猜测锚贯穿 2026-10-08】每帧清零：seg1 滞后签名命中
     // 时记录（猜测锚x, 段起点x）后不直接采纳、落入标准链跑组段末探
@@ -3861,6 +6115,56 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
     let prev_caret = g.caret;
     let prev_line_end = g.line_end;
     g.caret = None;
+    // 【旧版 conhost 锚 2026-10-15】经典控制台走直读锚（见函数头注释
+    // ——旧版模式 GetTextExt 垃圾）；直读失败（句柄不可得——conhost 是
+    // 服务端，进程内双通道均死，实测 GetStdHandle/CONOUT$ 皆拒）且是
+    // 旧版控制台（HKCU\Console ForceV2=0，实测该模式 GetTextExt 锚在
+    // 窗口首行=横幅行而光标在第 4 行）→ MSAA 无障碍通道取真光标
+    //（OBJID_CARET+CHILDID_SELF，读屏软件同款；X/Y 全跟）。取不到就
+    // 落标准链（【左下固定已取消 2026-10-15】用户拍板：不许钉位——宁
+    // 可退回系统原始锚）。新版 conhost（ForceV2=1）GetTextExt 实测正
+    // 确——落标准链零改动。仅 ConsoleWindowClass 门控。
+    if focus_view_class().as_deref() == Some("ConsoleWindowClass") {
+        // 【分通道取证 2026-10-15】三通道各自落 rect（含失败），一次打字
+        // 即可定位谁在给垃圾锚。direct 通道原先无痕。
+        let r_direct = console_caret_rect();
+        trace(&format!(
+            "qc/console 通道取证: direct={}",
+            r_direct
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_direct {
+            seed_est_from_anchor(g, &rect, "console");
+            g.caret = Some(rect);
+            return;
+        }
+        let r_msaa = console_msaa_caret_rect();
+        trace(&format!(
+            "qc/console 通道取证: msaa={}",
+            r_msaa
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_msaa {
+            seed_est_from_anchor(g, &rect, "console-msaa");
+            g.caret = Some(rect);
+            return;
+        }
+        let r_srv = console_caret_rect_via_server();
+        trace(&format!(
+            "qc/console 通道取证: srv={}",
+            r_srv
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .unwrap_or_else(|| "无".into())
+        ));
+        if let Some(rect) = r_srv {
+            seed_est_from_anchor(g, &rect, "console-srv");
+            g.caret = Some(rect);
+            return;
+        }
+        trace("qc/console: 三通道皆无真光标 → 标准链（不钉位）");
+    }
     // 【特化删除 2026-11】跟打器（虎魄 qie 段模型/晴 pain est 豁免链）
     // 入口分派已删——全部宿主统一走下方标准链。
     // 【单源锚·连续性过滤 2026-09-12 十三次修正】不再在入口拦查询
@@ -4083,21 +6387,31 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
                             if GetGUIThreadInfo(tid0, &mut gi).is_ok()
                                 && !gi.hwndFocus.0.is_null()
                             {
-                                let mut fr = RECT::default();
-                                if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
-                                    && fr.right > fr.left
-                                {
-                                    let inside = r.left >= fr.left - 8
-                                        && r.left <= fr.right + 8
-                                        && r.top >= fr.top - 8
-                                        && r.bottom <= fr.bottom + 8;
-                                    if !inside {
-                                        trace(&format!(
+                                if is_hufu_family_window(gi.hwndFocus) {
+                                    // 【候选窗焦点矫正 2026-10-12】"焦点
+                                    // 窗"是本输入法候选窗（点击/菜单收场
+                                    // 的焦点回落）——不是宿主几何参照，
+                                    // 窗外拦截豁免：真光标矩形照常采纳
+                                    // （此前被误拒 → 落标准链陈旧锚 →
+                                    // 候选窗大跳=「飘/下移」）。
+                                    trace("qc: seg1 selection 焦点窗=本输入法窗口——窗外拦截豁免");
+                                } else {
+                                    let mut fr = RECT::default();
+                                    if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
+                                        && fr.right > fr.left
+                                    {
+                                        let inside = r.left >= fr.left - 8
+                                            && r.left <= fr.right + 8
+                                            && r.top >= fr.top - 8
+                                            && r.bottom <= fr.bottom + 8;
+                                        if !inside {
+                                            trace(&format!(
                                             "qc: seg1 selection 焦点窗外垃圾拦截 rect=({},{},{},{}) 焦点窗=({},{},{},{})——弃用落标准链",
                                             r.left, r.top, r.right, r.bottom,
                                             fr.left, fr.top, fr.right, fr.bottom
                                         ));
-                                        block = true;
+                                            block = true;
+                                        }
                                     }
                                 }
                             }
@@ -4348,6 +6662,11 @@ fn query_caret(g: &mut Shared, ctx: &ITfContext, ec: u32) {
         return;
     };
     let mut clipped = BOOL(0);
+    // 【静打锚·定版教训 2026-11】v6~v10 在此处加过「stub 换算+早退」
+    // 块——早退跳过标准链后被实锤打断组段 SetText 链（面板窗在、内容
+    // 空、无候选），整条线废弃。静打锚点唯一存活方案=candwin2 show()
+    // 内的像素差分探针（纯定位消费，不碰文本管线）；此处保持全宿主
+    // 统一标准链，零静打特判。
     // 双查取末次：部分应用（如跟打器）文本布局异步——按键后第一次
     // 查询常返回旧布局（前一位置），第二次才反映新光标。锚点在旧/新
     // 之间交替正是候选窗「中间→下面→中间」跳动的病根。连查两次取
@@ -4795,6 +7114,13 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
         if let Ok(mut g) = self.shared.try_lock() {
             if g.composition.is_some() {
                 trace("OnCompositionTerminated: 宿主终止组段——清悬挂句柄");
+                // 【孤儿嫌疑挂标 2026-10-12】杀段时组段文本可能被宿主
+                // 留在文档里（孤儿字母）。挂嫌疑标记（被杀文本）——
+                // 后续键路的孤儿清理只认它，正常上屏永不清（吞字修）。
+                let killed = g.preedit_last.clone();
+                if !killed.is_empty() {
+                    g.orphan_suspect = Some(killed);
+                }
                 g.composition = None;
                 // 注：Chromium 系宿主在按下候选窗时杀组段+blur 编辑器
                 //（caret 消失）——曾试过合成点击焦点自愈，实测反噬
@@ -5161,8 +7487,24 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             arm_caret_recheck_timer();
             Some(Op::CommitAndRepreedit(commit.clone(), preedit.to_string()))
         } else if g.composition.is_none() {
+            // 【T4 竞态补防 2026-10-14】aw：自然键建段=回灌链已无意义
+            //（尾巴字母已内联进 raw/preedit）——旧尾巴若仍挂起，60ms 后
+            // 的补拍会 StartPreedit 出第二个段落在活段后面=多一份字母。
+            // 快打 jafmjafm 真机实锤：今天jafmj（多 j）；现场用户快打
+            // 放大到 ja×3 回放。挂起即弃，自然键接管。
+            if aw_box {
+                g.aw_tail = None;
+                g.aw_pending = None;
+            }
             Some(Op::StartPreedit(preedit.to_string()))
         } else {
+            // 【T4 竞态补防 2026-10-14】aw：pending 转正前段已被自然键
+            // 继续输入（出生文本+新键）——Op::Commit 是整段 SetText 替换
+            //，拿旧 pending 提交会把长出来的字母裁掉。旧文本作废，段内
+            // 容交给自然 SP，用户下一提交键整段上屏。
+            if aw_box {
+                g.aw_pending = None;
+            }
             Some(Op::SetPreedit(preedit.to_string()))
         };
         (op, true, suppress)
@@ -5205,6 +7547,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             g2.chinese = zh;
             // 语言栏「中/A」：Shift 切换也走这里回填图标/文字
             crate::langbar::set_mode(zh);
+            note_mode_applied();
         }
         g2.composing = !state
             .get("raw")
@@ -5299,6 +7642,14 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
     } else {
         raw
     };
+    // 【内联关闭回归修 2026-10-11 用户反馈】T8 头部把 raw_disp 钉死成
+    // aux-only（编码只活在宿主预编辑里）——但 inline_preedit=false
+    //（设置页「编码内联到应用」关）时 tsf 侧 preedit 恒空、宿主里没有
+    // 编码，候选框编码行是唯一展示位。上方 raw（L5257 段）本就带完整
+    // 内联/show_code 语义（内联关 → raw_state 拼合），此处按内联状态
+    // 放行给 show 链：内联开=照旧 T8 的 aux-only，内联关=富 raw。
+    // candwin2::show 咽喉层同款判定双保险（皮肤同源读法）。
+    let raw_disp = if !inline_on { raw.clone() } else { raw_disp };
     trace(&format!(
         "cands={} raw='{}' cand2={} dead={}",
         cands.len(),
@@ -6251,6 +8602,13 @@ pub fn aw_flush_tail() {
     let Some(shared) = tl_shared() else { return };
     let tail = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【T4 竞态补防 2026-10-14】段已活=自然键抢跑了回灌（快打键间隔
+        // <60ms 时必发生），尾巴字母早已内联——再补建就是第二个段=多
+        // 一份字母（今天jafmj 实锤）。弃拍。
+        if g.composition.is_some() {
+            g.aw_tail = None;
+            return;
+        }
         g.aw_tail.take()
     };
     if let Some(x) = tail {
@@ -6296,6 +8654,7 @@ fn run_session(shared: &SharedRef, op: Op, ctx: Option<ITfContext>) -> Result<()
         ctx_override: Some(target.clone()),
         epoch,
         result_slot: Some(slot.clone()),
+        born: std::time::Instant::now(),
     }
     .into();
     unsafe {
@@ -6362,11 +8721,21 @@ fn run_session_sync_only(shared: &SharedRef, op: Op, ctx: ITfContext) -> Result<
         ctx_override: Some(ctx.clone()),
         epoch,
         result_slot: None,
+        born: std::time::Instant::now(),
     }
     .into();
     unsafe {
         match ctx.RequestEditSession(client_id, &session, TF_CONTEXT_EDIT_CONTEXT_FLAGS(0x6)) {
-            Ok(_) => {
+            Ok(h) => {
+                // 【TS_S_ASYNC=排队 2026-10-12】Chromium 系（VSCode 菜单
+                // 模态期）对同步请求也会回 TS_S_ASYNC(0x40300)——受理
+                // 即排队、回调延后到宿主自便=过期会话时间炸弹（闪退实
+                // 锤）。恢复类会话一律当拒处理（重试逻辑接手），执行期
+                // 陈旧闸兜底已排队的。
+                if h.0 as u32 == 0x00040300 {
+                    trace("sync_only: 受理被偷换成 TS_S_ASYNC（已排队）→ 按拒处理");
+                    return Err(Error::from(HRESULT(0x00040300u32 as i32)));
+                }
                 trace("focus-commit: 同步档受理");
                 Ok(())
             }
@@ -6613,6 +8982,10 @@ pub fn host_is_weixin() -> bool {
         l == "weixin.exe" || l == "wechat.exe"
     })
 }
+
+// 【静打特调全清 2026-10-11】host_is_quiettype()（含 v13-v22 各代特判的
+// 最后残留）随用户拍板整链删除—— QuietType.exe 不再有任何按进程名的
+// 特化路径，与所有宿主同走通用锚链。历史教训见任务单 R27-R38。
 
 // ═══════════ E7·游戏子类化流派（虎娘同款） ═══════════
 static GAME_ORIG_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -7197,7 +9570,7 @@ fn game_host_blocklisted() -> bool {
 /// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
 /// 的系统插入符（hCaret/rcCaret 客户区坐标→屏幕）。这是不依赖组段的
 /// 唯一光标来源——query_caret 需要组段（GetTextExt），首帧查不出。
-fn gui_caret_fallback() -> Option<RECT> {
+pub(crate) fn gui_caret_fallback() -> Option<RECT> {
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
@@ -7822,6 +10195,48 @@ pub(crate) fn host_may_show() -> bool {
         if pid == std::process::id() {
             return true;
         }
+        // 【WebView2 宿主放行 2026-11】Tauri/Electron(WebView2) 应用
+        //（爱跟打/花笺等，用户实锤「能打字不显候选」）：TSF DLL 载在
+        // msedgewebview2.exe 子进程，而顶层前台窗属于宿主主进程
+        //（爱跟打.exe）——前台 pid 恒不等=候选窗被本门拦死（键照吃、
+        // 文字照上，仅不显窗）。键盘焦点真值=GetGUIThreadInfo(0).
+        // hwndFocus：焦点窗在本进程=本进程就是活跃输入宿主，放行。
+        // 失焦残留收窗语义不变——焦点移走后 hwndFocus 归属即变，
+        // 照拦（双候选窗修复的前提不破）。
+        #[repr(C)]
+        struct GTI4 {
+            cb: u32,
+            flags: u32,
+            hwnd_active: windows::Win32::Foundation::HWND,
+            hwnd_focus: windows::Win32::Foundation::HWND,
+            hwnd_capture: windows::Win32::Foundation::HWND,
+            hwnd_menu_owner: windows::Win32::Foundation::HWND,
+            hwnd_move_size: windows::Win32::Foundation::HWND,
+            hwnd_caret: windows::Win32::Foundation::HWND,
+            rc_caret: windows::Win32::Foundation::RECT,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetGUIThreadInfo(tid: u32, gi: *mut GTI4) -> i32;
+        }
+        let mut gi4 = GTI4 {
+            cb: std::mem::size_of::<GTI4>() as u32,
+            flags: 0,
+            hwnd_active: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_focus: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_capture: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_menu_owner: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_move_size: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            hwnd_caret: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            rc_caret: windows::Win32::Foundation::RECT::default(),
+        };
+        if GetGUIThreadInfo(0, &mut gi4) != 0 && !gi4.hwnd_focus.0.is_null() {
+            let mut fpid = 0u32;
+            GetWindowThreadProcessId(gi4.hwnd_focus, Some(&mut fpid));
+            if fpid == std::process::id() {
+                return true;
+            }
+        }
         if host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
             return true;
         }
@@ -7901,6 +10316,24 @@ fn poll_tick() {
         return;
     }
     let _guard = scopeguard_release();
+    // 【交互收场自愈·poll 路 2026-10-12】dispatch 键入口的自愈在键路已
+    // 死（候选窗左键把 TSF 焦点抖成 NULL——IME sink 不再收键）时永远等
+    // 不到第一键（BUG① 左键路径用户实锤：空格/选重全无反应只剩字母）。
+    // poll 窗与 dispatch 同线程（窗口线程亲和）——每拍顺手执行挂起的
+    // 自愈：焦点复活+锚点补探不再依赖键路（≤140ms 到达，人手速之外）。
+    // 【菜单期也跑 2026-10-12 二次】菜单 owner 抢前台瞬间宿主杀组段
+    //（虚线立刻没了）——菜单模态循环也泵定时器，此刻即复活（焦点归
+    // 位自带菜单闸不抢）；渲染独占保护不受影响（本块不渲染）。
+    {
+        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
+        if let Some(s) = sp {
+            cand_interact_recover_pending(&s);
+        }
+    }
+    // 【候选窗焦点矫正·记忆 2026-10-12】每拍记忆前台宿主编辑窗（本
+    // 输入法窗口不记）——交互收场 SetFocus 归位用。只读 GUIThreadInfo
+    // +类名，无锁无管道，零扰动。
+    win32_host_focus_remember();
     // 【右键调频·单写者 2026-10-07】免死金牌期内（含收场 1200ms 宽限）
     // poll 整拍跳过：调频帧是唯一渲染者。此前 poll 在宽限内带着重查
     // 的光标锚+编码段再画一帧（=「编码又出现/框又动」的第二写者）。
@@ -8155,9 +10588,18 @@ fn poll_tick() {
                 // 入场/尺寸动画 armed 后一步不跑（实锤 tick取
                 // last_some=false）。先放回再按线程取窗。
                 if let Some((cands, raw2, sel)) = last {
-                    // 【框内永不画编码】同渲染铁律：显示恒空编码，真值
-                    // 留在 last_show。
-                    let raw2_disp = String::new();
+                    // 【框内不画编码·内联关闭放行 2026-10-11 用户实锤】
+                    // 同 T8/内联回归修口径：皮肤重拉重绘帧的编码行也过
+                    // inline_preedit 开关——开着恒空（真值留在 last_show），
+                    // 关着显示真实编码。此前硬编码空串：设置页一改皮肤/
+                    // 开关触发重拉，重绘帧编码行直接空（有的场合显示有
+                    // 的不显示的种子）。
+                    let inline_on = skin
+                        .pointer("/skin/layout/inline_preedit")
+                        .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let raw2_disp = if !inline_on { raw2.clone() } else { String::new() };
                     if crate::addword::in_window_thread() {
                         let anchor_rect = anchor.and_then(|a| {
                             let x = a.get("x").and_then(|v| v.as_i64())? as i32;
@@ -8241,5 +10683,236 @@ pub(crate) fn candidate_window_visible(thread: u32) -> bool {
         local || windows::Win32::UI::WindowsAndMessaging::FindWindowW(
             windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null()).ok()
             .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
+    }
+}
+
+#[cfg(test)]
+mod caps_settle_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// 结算制核心判定：注入/落地计数与超时丢失对齐（纯逻辑，不碰键盘）。
+    /// 每测例先把三口钟拨到已知态（单测串行，无并发互扰）。
+    fn reset(inj: i64, seen: i64, inj_at: u64) {
+        CAPS_PAIR_INJ.store(inj, Relaxed);
+        CAPS_PAIR_SEEN.store(seen, Relaxed);
+        CAPS_PAIR_INJ_AT.store(inj_at, Relaxed);
+    }
+
+    #[test]
+    fn settled_when_balanced() {
+        reset(0, 0, 0);
+        assert!(caps_pairs_settled(1_000_000));
+        reset(3, 3, 999_000);
+        assert!(caps_pairs_settled(1_000_000));
+    }
+
+    #[test]
+    fn inflight_blocks_until_seen_or_stale() {
+        // 注入 1、落地 0：在飞 → 不结算（此刻读到的 ON 是滞后假象，
+        // 旧竞态里复检就是在这里叠加注入导致大写位卡 ON）。
+        reset(1, 0, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + 100));
+        // 落地追平 → 结算。
+        CAPS_PAIR_SEEN.store(1, Relaxed);
+        assert!(caps_pairs_settled(1_000_000 + 120));
+        // 多对在飞同理。
+        reset(3, 1, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + 200));
+        CAPS_PAIR_SEEN.store(3, Relaxed);
+        assert!(caps_pairs_settled(1_000_000 + 220));
+    }
+
+    #[test]
+    fn stale_inflight_aligned_as_lost() {
+        // 在飞超 1.5s：宿主没回送魔法 down（键路改道/标记被剥）——按丢
+        // 失结算并自动对齐（防复检永久瘫痪=灯常亮漏修回归）。
+        reset(2, 0, 1_000_000);
+        assert!(caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS + 1));
+        assert_eq!(CAPS_PAIR_SEEN.load(Relaxed), 2, "超时应把 SEEN 对齐到 INJ");
+        // 未超时不动。
+        reset(2, 0, 1_000_000);
+        assert!(!caps_pairs_settled(1_000_000 + CAPS_PAIR_STALE_MS - 1));
+    }
+
+    #[test]
+    fn hook_gate_only_with_composition_and_mapping() {
+        // 十七修拦截门：仅「组段在身 且 caps 有映射」虚拟化物理键；
+        // 空组段（锁定大写/英文态）一律放行真键——灯=状态天然成立。
+        assert!(caps_hook_gate(true, true), "组段+映射 → 拦");
+        assert!(!caps_hook_gate(false, true), "空组段放行（锁大写走物理路）");
+        assert!(!caps_hook_gate(true, false), "caps 未映射放行（默认行为）");
+        assert!(!caps_hook_gate(false, false), "双无放行");
+    }
+}
+
+#[cfg(test)]
+mod modekey_tests {
+    use super::{ctrl_up_arm_space, modekey_admit, Shared, SharedRef};
+
+    const CAPS: usize = 0x14;
+    /// 模拟一次「慢击」的完整四事件序列（Notepad3 形态）：
+    /// TestDown / KeyDown / TestUp / KeyUp。返回 (发火次数, 各事件准入)。
+    fn full_press(g: &mut Shared, age_out: bool) -> (u32, [bool; 4]) {
+        if age_out {
+            // 把上一击的 80ms 遗留窗拨过期（模拟真实击键间隔，免睡眠）
+            g.modekey_last = None;
+        }
+        let a = modekey_admit(g, CAPS, false); // TestDown
+        let b = modekey_admit(g, CAPS, false); // KeyDown
+        let c = modekey_admit(g, CAPS, true); // TestUp
+        let d = modekey_admit(g, CAPS, true); // KeyUp
+        (a as u32 + b as u32 + c as u32 + d as u32, [a, b, c, d])
+    }
+
+    /// 【BUG②回归·Notepad3 全四件形态】一次物理按压恰好一发：
+    /// TestDown 发 → KeyDown 吞 → TestUp 吞 → **KeyUp 必须吞**
+    ///（修复前 KeyUp 落 80ms 窗外二次直发=引擎翻转两次净零=大写锁死）。
+    #[test]
+    fn full_four_host_exactly_one_fire() {
+        let mut g = Shared::new();
+        let (fires, ev) = full_press(&mut g, false);
+        assert_eq!(ev, [true, false, false, false], "事件准入序列错误");
+        assert_eq!(fires, 1, "一次物理按压必须恰好一发");
+    }
+
+    /// 连续两次完整按压（事件驱动去重，不依赖时长）：各一发。
+    #[test]
+    fn two_presses_each_one_fire() {
+        let mut g = Shared::new();
+        let (f1, _) = full_press(&mut g, false);
+        let (f2, _) = full_press(&mut g, true); // 拨过期模拟真实间隔
+        assert_eq!((f1, f2), (1, 1), "每次按压应各恰好一发");
+    }
+
+    /// 跟打器形态（test/testup 成对、down 全无）：TestUp 放行。
+    #[test]
+    fn testup_only_host_admits() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, true), "down 全无时 TestUp 必须放行");
+        // 同键第二个 up（若该宿主也投 KeyUp）仍吞
+        assert!(!modekey_admit(&mut g, CAPS, true));
+    }
+
+    /// key/keyup 成对宿主：KeyDown 发、KeyUp 吞。
+    #[test]
+    fn key_keyup_host_single_fire() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, false));
+        assert!(!modekey_admit(&mut g, CAPS, true));
+    }
+
+    /// 键自动重复（按住 Caps 不放）：首 down 发、重复 down 全吞
+    ///（模式键不得连发——旧 80ms 窗挡不住 >80ms 的重复）。
+    #[test]
+    fn auto_repeat_swallowed() {
+        let mut g = Shared::new();
+        assert!(modekey_admit(&mut g, CAPS, false));
+        for _ in 0..3 {
+            // 拨过期 80ms 窗，只靠 down_seen 挂起防线挡
+            g.modekey_last = None;
+            assert!(!modekey_admit(&mut g, CAPS, false), "重复 down 必须吞");
+        }
+    }
+
+    /// down_seen 陈旧保护：宿主真丢 up（>1s）后新按压不得永久卡死。
+    #[test]
+    fn stale_down_seen_expires() {
+        let mut g = Shared::new();
+        g.modekey_down_seen =
+            Some((CAPS, std::time::Instant::now() - std::time::Duration::from_secs(2)));
+        g.modekey_last = None;
+        assert!(modekey_admit(&mut g, CAPS, false), "陈旧挂起标记不得吞新按压");
+    }
+
+    /// Ctrl+Space armed：up 放行即消费 armed（八十五修语义保持）。
+    #[test]
+    fn ctrl_space_armed_consumed_on_up() {
+        let mut g = Shared::new();
+        g.space_ctrl_armed = true;
+        g.modekey_last = None; // 免 80ms 窗干扰
+        assert!(modekey_admit(&mut g, 0x20, true), "armed up 应放行");
+        assert!(!g.space_ctrl_armed, "armed 必须在放行时消费");
+    }
+
+    /// 【调频模态堵洞 2026-10-16】ctrl 抬起被 freq_modal_key 消费时，
+    /// 布防原语必须照样生效：space 按住 → armed=true（此后到的 space
+    /// up 算 Ctrl+Space 成形）；space 未按住 → 不布防。
+    #[test]
+    fn ctrl_up_arm_space_primitive() {
+        let gg: SharedRef = std::sync::Arc::new(std::sync::Mutex::new(Shared::new()));
+        ctrl_up_arm_space(&gg, true);
+        assert!(
+            gg.lock().unwrap_or_else(|e| e.into_inner()).space_ctrl_armed,
+            "space 按住时 ctrl up 必须布防"
+        );
+        let gg2: SharedRef = std::sync::Arc::new(std::sync::Mutex::new(Shared::new()));
+        ctrl_up_arm_space(&gg2, false);
+        assert!(
+            !gg2.lock().unwrap_or_else(|e| e.into_inner()).space_ctrl_armed,
+            "space 未按住不布防"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keycombo_tests {
+    use super::*;
+
+    /// 键名 → VK 基础映射（修饰键/功能键/F 区/字母数字/符号）。
+    #[test]
+    fn keyname_map() {
+        assert_eq!(keyname_to_vk("ctrl"), Some(0x11));
+        assert_eq!(keyname_to_vk("Control"), Some(0x11));
+        assert_eq!(keyname_to_vk("alt"), Some(0x12));
+        assert_eq!(keyname_to_vk("shift"), Some(0x10));
+        assert_eq!(keyname_to_vk("shiftleft"), Some(0xA0));
+        assert_eq!(keyname_to_vk("capslock"), Some(0x14));
+        assert_eq!(keyname_to_vk("f5"), Some(0x74));
+        assert_eq!(keyname_to_vk("E"), Some(0x45));
+        assert_eq!(keyname_to_vk("7"), Some(0x37));
+        assert_eq!(keyname_to_vk(";"), Some(0xBA));
+        assert_eq!(keyname_to_vk("space"), Some(0x20));
+        assert_eq!(keyname_to_vk("nope"), None);
+        assert_eq!(keyname_to_vk("f13"), None);
+        assert_eq!(keyname_to_vk("ab"), None); // 多字符非功能键
+    }
+
+    /// 组合解析：默认值精确复刻旧版（freq=[Ctrl]、del=[Ctrl,Shift]）。
+    #[test]
+    fn combo_parse_defaults_and_syntax() {
+        assert_eq!(parse_key_combo("ctrl"), vec![0x11]);
+        assert_eq!(parse_key_combo("ctrl+shift"), vec![0x11, 0x10]);
+        assert_eq!(parse_key_combo("Ctrl+Alt+E"), vec![0x11, 0x12, 0x45]);
+        assert_eq!(parse_key_combo("capslock"), vec![0x14]);
+        assert_eq!(parse_key_combo("ctrl+ctrl"), vec![0x11]); // 去重
+        assert!(parse_key_combo("").is_empty()); // 空=停用
+        assert!(parse_key_combo("  ").is_empty());
+        assert!(parse_key_combo("ctrl+zzz").is_empty()); // 未知键名=停用
+        assert!(parse_key_combo("a+b+c+d+e").is_empty()); // >4 键停用
+    }
+
+    /// Shared 初始态 = 默认组合（无 state 镜像前=旧版行为）。
+    #[test]
+    fn shared_defaults_combos() {
+        let g = Shared::new();
+        assert_eq!(g.freq_key, vec![0x11]);
+        assert_eq!(g.del_key, vec![0x11, 0x10]);
+        assert!(g.export_key.is_empty());
+    }
+
+    /// combo_held_except 语义：完成键免查、其余必按。
+    ///（单测环境无真实键盘——GetKeyState 恒非按，断言只验「事件键
+    /// 免查」之外的假阴性路径与成员资格判定。）
+    #[test]
+    fn combo_membership_semantics() {
+        let dk = parse_key_combo("ctrl+shift");
+        // 完成键成员资格
+        assert!(dk.contains(&0x10) && dk.contains(&0x11));
+        // 非成员组合 complete-except 恒 false
+        assert!(!combo_held_except(&dk, 0x41));
+        // 空组合恒 false
+        assert!(!combo_held(&[]));
+        assert!(!combo_held_except(&[], 0x11));
     }
 }

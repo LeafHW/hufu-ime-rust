@@ -15,11 +15,14 @@ mod candwin;
 #[cfg(windows)]
 mod clipboard;
 mod candidate_export;
+mod fontinfo;
 mod host;
 mod http;
+#[cfg(windows)]
 mod overlay;
 mod pipe;
 mod platform;
+mod ssf;
 #[cfg(windows)]
 mod tray;
 
@@ -55,6 +58,76 @@ fn attach_console_for_dev(force: bool, dev_attach: bool) {
             // 安装窗口出现装载日志会吓到人）。
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
+    }
+}
+
+/// 【重排防死机·进程级写死 2026-10-12】见 main() 调用点注释（作者令：
+/// 亲和性半核掩码 + BelowNormal，长期有效）。零依赖直声明（与
+/// attach_console_for_dev 同风格）。结果落 diag\anti-freeze.log 一行
+/// （取证生命线——出事时先看这两项是否真的生效）。
+#[cfg(windows)]
+fn anti_freeze_guards(data_dir: &std::path::Path) {
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetPriorityClass(h: isize, cls: u32) -> i32;
+        fn GetProcessAffinityMask(h: isize, pmask: *mut usize, smask: *mut usize) -> i32;
+        fn SetProcessAffinityMask(h: isize, mask: usize) -> i32;
+    }
+    unsafe {
+        let h = GetCurrentProcess();
+        let mut sys_mask: usize = 0;
+        let mut proc_mask: usize = 0;
+        let mut mask_line = String::new();
+        let mut prio_line = String::new();
+        // 1) 亲和性：系统可用逻辑核的最低半数（16 线程 → 0xFF；64 位
+        //    usize 上限 64 核，更高核数机器只锁低 32 位——防死机目的
+        //    是封顶振幅，锁 32 核已远超推理需要）。取「系统掩码里置
+        //    位的低半数位」尊重异常拓扑（跳核分配）。
+        if GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask) != 0 && sys_mask > 1 {
+            let total = sys_mask.count_ones();
+            let half = (total / 2).max(1).min(63) as u32;
+            let mut mask: usize = 0;
+            let mut left = half;
+            let mut bit = 0u32;
+            while left > 0 && bit < 64 {
+                if (sys_mask >> bit) & 1 == 1 {
+                    mask |= 1usize << bit;
+                    left -= 1;
+                }
+                bit += 1;
+            }
+            if SetProcessAffinityMask(h, mask) != 0 {
+                mask_line = format!("affinity ok mask=0x{mask:X} ({half}/{total} cores)");
+            } else {
+                mask_line = format!("affinity FAIL mask=0x{mask:X} (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+        } else {
+            mask_line = "affinity SKIP (query fail)".into();
+        }
+        // 2) 优先级 BelowNormal：全进程默认级（现有/新建线程继承；
+        //    打分专用池另有每线程再降 + EcoQoS）。
+        if SetPriorityClass(h, BELOW_NORMAL_PRIORITY_CLASS) != 0 {
+            prio_line = "priority ok BelowNormal".into();
+        } else {
+            prio_line = format!("priority FAIL (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        let diag = hufu_engine::diag_dir(data_dir);
+        let _ = std::fs::create_dir_all(&diag);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(diag.join("anti-freeze.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                writeln!(f, "[{ts}] pid={} {mask_line}; {prio_line}", std::process::id())
+            });
+        eprintln!("anti-freeze: {mask_line}; {prio_line}");
     }
 }
 
@@ -122,6 +195,12 @@ fn main() {
         eprintln!("数据目录不可创建: {e}");
         std::process::exit(1);
     }
+    // 【渲染缓存 2026-10-16】ssf-render 锁前分发拿不到 Host——数据目录
+    // 存全局供指纹计算（皮肤缓存目录/overrides/config 的 stat）。
+    let _ = DATA_DIR.set(data_dir.clone());
+    // 【渲染预热 2026-10-16】启动即后台预热全部 ssf 皮肤渲染缓存（见
+    // warm_render_cache_throttled 注释）——设置页首次打开列表就能秒切。
+    std::thread::spawn(warm_render_cache_throttled);
     // 【单实例互斥 2026-09-11】此前靠 4390 端口 bind 冲突兜底，但管道
     // 线程先于 HTTP 启动 → 双实例并存窗口期（双 pipe、双托盘消息窗）。
     // 命名互斥体进程级兜底：已存在即本进程直接退（老实例继续服务）。
@@ -141,6 +220,20 @@ fn main() {
     // 缩放渲染（candwin.rs render_frame），与 candwin2 同款语义。
     #[cfg(windows)]
     sys_win::declare_per_monitor_dpi();
+    // 【重排防死机·写死 2026-10-12 作者令】2026-10-11~12 取证：逐键
+    // 全核 AVX 爆发引发「深省电→爆频」电源管理震荡，AMD APU 平台
+    // 状态机在转换处整机挂死（SoC 级、看门狗复位）。两条进程级铁律
+    // （详见 E:\DSH-KF\虎符重排打包强制规范.md，对所有重排引擎版本
+    // 长期有效；此前由外部 hufu-guard.ps1 临时兜底，现写死进本体）：
+    // 1) 亲和性锁最低半数逻辑核（16 线程机=掩码 0xFF/255）——重排
+    //    脉冲振幅封顶一半；native llama.cpp 线程池（FFI 无线程数
+    //    参数）同样被进程亲和性兜住。
+    // 2) 进程优先级 BelowNormal——推理让位前台（新线程继承进程级，
+    //    native 线程一并降级；纯 Rust 池另有每线程 BelowNormal+
+    //    EcoQoS，见 hufu-rerank/model.rs）。
+    // 失败（权限/容器）不阻断启动——仅记录，守护脚本/用户可补。
+    #[cfg(windows)]
+    anti_freeze_guards(&data_dir);
     let host = match Host::new(&data_dir) {
         Ok(h) => h,
         Err(e) => {
@@ -148,6 +241,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // 【字体文件夹退役 2026-10-09】私用字体装载删除——用户定调下拉只列
+    // 系统已装字体（霞鹜优先/雅黑兜底），数据\字体 文件夹不再使用。
     {
         // 【性能插桩】main 侧总戳（与 host.rs 的 Host::new 打点配套）
         // 【轮转 2026-09-11】启动追加了无上限增长——超 4MB 翻转 .old
@@ -506,11 +601,10 @@ fn main() {
                         eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
                     } else {
                         // 打字保护：组段未闭合等空档（60s 强制兜底）
-                        let mut defer = false;
-                        {
+                        let defer = {
                             let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                            defer = !h.session.is_idle();
-                        }
+                            !h.session.is_idle()
+                        };
                         if defer {
                             let elapsed_ok = armed_since
                                 .map(|t| t.elapsed().as_secs() < 60)
@@ -554,11 +648,27 @@ fn main() {
         use std::sync::mpsc;
         let (quit_tx, quit_rx) = mpsc::channel::<()>();
         let (open_tx, open_rx) = mpsc::channel::<()>();
-        tray::spawn(quit_tx, open_tx, Some(shared.clone()));
+        let (focus_tx, focus_rx) = mpsc::channel::<()>();
+        tray::spawn(quit_tx, open_tx, focus_tx, Some(shared.clone()));
         let url = format!("http://{addr}/");
+        // 【设置窗聚焦 2026-10-10】Ctrl+Shift+H：只把已开的设置窗弹到
+        // 最前（最小化恢复/被盖置顶），不开新窗。
+        std::thread::spawn(move || {
+            while focus_rx.recv().is_ok() {
+                unsafe {
+                    crate::sys_win::raise_settings_window();
+                }
+            }
+        });
         std::thread::spawn(move || {
             // 常驻循环：每次托盘信号都开窗口（旧版一次性线程导致第二次进不去）
             while open_rx.recv().is_ok() {
+                // 【设置窗唯一性 2026-10-10】已开（枚举得到标题窗）先弹到
+                // 最前——Ctrl+Alt+H 一直按不再一直弹新窗（用户实锤）；
+                // 没找到才走开窗路径。
+                if unsafe { crate::sys_win::raise_settings_window() } {
+                    continue;
+                }
                 // 独立应用窗口（Chromium --app 模式）：有自己的任务栏图标、无地址栏，
                 // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
                 // Edge → Chrome → 默认浏览器三级回退（没装 Edge 的机器用 Chrome
@@ -848,6 +958,107 @@ fn rewrite_supplement_lines(path: &std::path::Path, word: &str) {
     }
 }
 
+/// 加词落盘（Web 设置页与 Linux 原生对话框共用）：写当前方案
+/// `用户调整.txt`，同码同词旧行先清；`pos` 是选重位（0=置顶，1-99=固定
+/// 第 N 候选，现有占位符先删再插）。成功后热重载用户数据。
+pub(crate) fn add_user_word(
+    host: &mut Host,
+    code: &str,
+    text: &str,
+    pos: i64,
+) -> Result<(), String> {
+    let code = code.trim();
+    let text = text.trim();
+    if code.is_empty() || text.is_empty() {
+        return Err("编码与词不能为空".into());
+    }
+    if !(0..=99).contains(&pos) {
+        return Err("选重位须在 0-99".into());
+    }
+    // 隐私词（任意码）拒绝前台加词：{添加} 会随导出带走。
+    if host.engine.schema.personal_has_text(text) {
+        return Err(
+            "「个人存储表」里的词不进用户调整（会随导出泄漏）——请直接编辑方案目录的 个人存储表.txt"
+                .into(),
+        );
+    }
+    let file = host.engine.schema.dir.join("用户调整.txt");
+    rewrite_keep_lines(&file, code, text);
+    // 第 pos 位现有候选恰是占位词（③④…）→ 先删它再添加（原位替换）。
+    let del_line = if pos >= 1 {
+        host.engine
+            .placeholder_at_pos(code, pos as usize)
+            .filter(|ph| ph != text)
+            .map(|ph| format!("{{删除}}{code}\t{ph}\n"))
+    } else {
+        None
+    };
+    let line = if pos >= 1 {
+        format!("{{添加}}{code}\t{text}\tp{pos}\n")
+    } else {
+        format!("{{添加}}{code}\t{text}\n")
+    };
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(|e| format!("写入失败: {e}"))?;
+    if let Some(dl) = del_line {
+        f.write_all(dl.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+    }
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("写入失败: {e}"))?;
+    host.engine.reload_user_data();
+    Ok(())
+}
+
+/// 加权落盘（`/jq` 与 Web `/api/user_word/weight` 共用）：写当前方案
+/// `补充语料.txt` 的 `词 权重`（同词旧行先清），并后台重载整句模型。
+/// 个人存储表里的隐私词拒绝——不得进入补充语料明文/导出。
+pub(crate) fn add_user_weight(host: &mut Host, text: &str, weight: i64) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("词不能为空".into());
+    }
+    if !(1..=1_000_000_000).contains(&weight) {
+        return Err("权重须为正整数".into());
+    }
+    if host.engine.schema.personal_has_text(text) {
+        return Err(
+            "「个人存储表」里的词不受前台加权——请直接编辑方案目录的 个人存储表.txt".into(),
+        );
+    }
+    let file = host.engine.schema.dir.join("补充语料.txt");
+    rewrite_supplement_lines(&file, text);
+    let line = format!("{text} {weight}\n");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(|e| format!("写入失败: {e}"))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("写入失败: {e}"))?;
+    // 补充语料只在模型装载时生效：后台重载，期间旧模型继续服务。
+    if let Some(h) = HOST_HANDLE.get() {
+        spawn_sentence_reload(h.clone(), true);
+    }
+    Ok(())
+}
+
+/// 打开当前方案的个人存储表（隐私词库）。文件由方案目录模板提供；
+/// 不存在时提示先切一次方案（Host 启动会补模板）。
+pub(crate) fn open_personal(host: &Host) -> Result<(), String> {
+    let path = host.engine.schema.dir.join("个人存储表.txt");
+    if !path.is_file() {
+        return Err("个人存储表不存在（切一次方案或重载码表后会生成模板）".into());
+    }
+    platform::open_path(&path);
+    Ok(())
+}
+
 /// 【格式统一 2026-09-06】清 用户调整.txt 中同码同词旧行（四种标记
 /// 行+旧 TSV 词行一起清——写入端只留最新操作，文件不膨胀且回放
 /// 语义与追加日志等价）。
@@ -875,15 +1086,261 @@ fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
     }
 }
 
+/// 预览图 Content-Type（按扩展名；未知回 octet-stream 让浏览器下载判定）。
+fn image_content_type(p: &std::path::Path) -> &'static str {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 【SSF 真渲染 2026-10-16】spawn PowerShell P/Invoke 生产 DLL 的
+/// hufu_test_skin_dump（连本进程拉当前皮肤真渲染）→ BMP。锁外执行
+///（route 顶部提前分发）。
+fn ssf_render_endpoint() -> Response {
+    ssf_render_inner(None)
+}
+
+/// 【渲染预热 2026-10-16】30s 节流的后台预热：对全部 ssf 皮肤各渲一次
+/// 填热 RENDER_CACHE（串行——渲染子进程经 pipe 拉皮肤，并发会互相等
+/// 锁白抢 CPU）。已热的指纹命中直跳（40ms 内一个）。
+static RENDER_WARM_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warm_render_cache_throttled() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = RENDER_WARM_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 30 {
+        return;
+    }
+    RENDER_WARM_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    let Some(dir) = DATA_DIR.get() else { return };
+    for e in crate::ssf::list_ssf(dir) {
+        if e.error.is_some() {
+            continue; // 坏皮不预热（渲染也会失败）
+        }
+        let id = e.id;
+        let _ = ssf_render_inner(Some(&id));
+    }
+}
+
+/// 【SSF 真渲染 2026-10-16】
+/// `query_id`：要渲染的 ssf 皮肤 id（设置页传正在编辑的皮肤；None=
+/// 当前上位）。经 HUFU_SKIN_DUMP_ID → DLL skin_for_render 拉指定皮肤
+/// payload（含其 overrides；顶层 overlay 剥除，实时框只画候选窗本体）。
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// 【渲染缓存 2026-10-16】key=皮肤 id（None=当前上位）；value=(指纹,
+/// BMP)。指纹=皮肤缓存目录全部文件 stat + config.json 内容——皮肤/
+/// 设置/上位变化自动失效。命中=零渲染直返（二次访问即时出图）。
+static RENDER_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 渲染指纹：目录内文件 (len, mtime_ms) 序列 + config.json 内容 hash。
+fn render_fingerprint(dir: &std::path::Path, with_config: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if let Ok(md) = std::fs::metadata(&p) {
+            p.to_string_lossy().hash(&mut h);
+            md.len().hash(&mut h);
+            md.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+                .hash(&mut h);
+        }
+    }
+    if with_config {
+        if let Some(root) = DATA_DIR.get() {
+            if let Ok(c) = std::fs::read(root.join("config.json")) {
+                c.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+fn ssf_render_inner(query_id: Option<&str>) -> Response {
+    // 【渲染缓存 2026-10-16】命中直返（皮肤/设置/上位未变时零渲染）。
+    // None（当前上位）→ 读 config 定位皮肤目录 + config 内容进指纹；
+    // 指定 id → 皮肤目录 stat 即指纹（payload 的 overrides 就存那）。
+    let cache_key = query_id.unwrap_or("__current__").to_string();
+    let skin_dir_for_fp: Option<std::path::PathBuf> = if query_id.is_some() {
+        DATA_DIR.get().map(|d| crate::ssf::ssf_cache_root(d).join(query_id.unwrap()))
+    } else {
+        // 当前上位：config.json 的 skin/skin_kind（非 ssf 上位不缓存）
+        DATA_DIR.get().and_then(|d| {
+            std::fs::read(d.join("config.json")).ok().and_then(|b| {
+                serde_json::from_slice::<serde_json::Value>(&b).ok().and_then(|v| {
+                    let kind = v.pointer("/appearance/skin_kind").and_then(|x| x.as_str())?.to_string();
+                    if kind != "ssf" {
+                        return None;
+                    }
+                    let id = v.pointer("/appearance/skin").and_then(|x| x.as_str())?.to_string();
+                    Some(crate::ssf::ssf_cache_root(d).join(id))
+                })
+            })
+        })
+    };
+    if let Some(dir) = skin_dir_for_fp.clone() {
+        let fp = render_fingerprint(&dir, query_id.is_none());
+        if let Some((c_fp, bmp)) = RENDER_CACHE.lock().unwrap().get(&cache_key) {
+            if *c_fp == fp {
+                return Response { status: 200, content_type: "image/bmp".into(), body: bmp.clone() };
+            }
+        }
+    }
+    // 渲染专用副本优先（hufu_tsf_render.dll 不被 TSF 进程加载，可随时
+    // 替换更新；hufu_tsf.dll 是注册输入法本体，被 explorer/QQ 等全进程
+    // 持有，拷不进去——只做兜底）。
+    let dll = [
+        "D:\\HuFu\\hufu_tsf_render.dll",
+        "D:\\HuFu\\hufu_tsf.dll",
+        "C:\\Windows\\SystemIME\\HuFu\\hufu_tsf.dll",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).is_file())
+    .map(|s| s.to_string());
+    let Some(dll) = dll else {
+        return Response::err(404, "未找到 hufu_tsf.dll");
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}.bmp"));
+    // 【提速 2026-10-16】优先 hufu-render-helper.exe（原生进程直调
+    // dump 导出，亚秒出图）；缺它回退 PowerShell 驱动（Add-Type 编译
+    // 1-2s + dump，总 2-3s——用户实锤「生效慢/要等一下才看到」）。
+    let helper = ["D:\\HuFu\\hufu-render-helper.exe", "C:\\Windows\\SystemIME\\HuFu\\hufu-render-helper.exe"]
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .map(|s| s.to_string());
+    if let Some(helper) = helper {
+        let ok = {
+            let mut cmd = std::process::Command::new(&helper);
+            cmd.arg(&out).arg(&dll);
+            if let Some(id) = query_id {
+                cmd.env("HUFU_SKIN_DUMP_ID", id);
+            }
+            cmd.env("HUFU_SKIN_DUMP_V2", "1")
+                .env("HUFU_TSF_SMOKE", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            cmd.status().map(|s| s.success()).unwrap_or(false)
+        };
+        if ok && out.is_file() {
+            return match std::fs::read(&out) {
+                Ok(b) => {
+                    let _ = std::fs::remove_file(&out);
+                    store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
+                    Response { status: 200, content_type: "image/bmp".into(), body: b }
+                }
+                Err(_) => Response::err(500, "渲染输出读取失败"),
+            };
+        }
+        // helper 失败 → 落到 PS 驱动（降级链）
+    }
+    let ps1 = std::env::temp_dir().join(format!("hufu-ssf-render-drv-{stamp}.ps1"));
+    let body = format!(
+        r#"$env:HUFU_SKIN_DUMP = '{out}'
+$env:HUFU_SKIN_DUMP_V2 = '1'
+$env:HUFU_TSF_SMOKE = '1'
+if ('{rid}' -ne '') {{ $env:HUFU_SKIN_DUMP_ID = '{rid}' }}
+$cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
+try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
+try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
+"#,
+        out = out.display(),
+        rid = query_id.unwrap_or(""),
+        dll = dll,
+    );
+    if std::fs::write(&ps1, {
+        // PS5.1 无 BOM 按 ANSI 读——皮肤 id 是中文（鲸鱼娘），乱码=
+        // skin_for_render 404。带 BOM 写。
+        let mut b = vec![0xEF, 0xBB, 0xBF];
+        b.extend_from_slice(body.as_bytes());
+        b
+    })
+    .is_err()
+    {
+        return Response::err(500, "驱动脚本写入失败");
+    }
+    {
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        let _ = std::fs::remove_file(&ps1);
+        if !ok || !out.is_file() {
+            return Response::err(500, "渲染失败");
+        }
+    }
+    match std::fs::read(&out) {
+        Ok(b) => {
+            let _ = std::fs::remove_file(&out);
+            store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
+            Response { status: 200, content_type: "image/bmp".into(), body: b }
+        }
+        Err(_) => Response::err(500, "渲染输出读取失败"),
+    }
+}
+
+/// 渲染成功后入缓存（指纹现算——渲染期间文件变了也能存对版本）。
+fn store_render_cache(
+    skin_dir: &Option<std::path::PathBuf>,
+    with_config: bool,
+    key: &str,
+    bmp: &[u8],
+) {
+    if let Some(dir) = skin_dir {
+        let fp = render_fingerprint(dir, with_config);
+        RENDER_CACHE
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (fp, bmp.to_vec()));
+    }
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
-    // 【浏览器源加固 2026-09-11】所有副作用端点（POST）拒绝跨源网页：
+    // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
+    // DELETE /api/skin）拒绝跨源网页：
     // 浏览器跨源 POST 必带 Origin 头且值非本站（页面 JS 无法伪造）；
     // 本机原生调用方（设置页同源 fetch、托盘、管道 DLL）要么同源
     // 要么无 Origin。恶意网页 fetch no-cors POST 直达 127.0.0.1:4390
     // 杀 server（/api/shutdown 无鉴权审计项）由此封死；Host 白名单
     // 同时防 DNS rebinding（外域域名解析到 127.0.0.1 的请求 Host
     // 不是本机名）。
-    if req.method == "POST" {
+    if req.method == "POST" || req.method == "DELETE" {
         if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
             let local = origin.starts_with("http://127.0.0.1:")
                 || origin.starts_with("http://localhost:")
@@ -900,6 +1357,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 return Response::err(403, "非法 Host");
             }
         }
+    }
+    // 【锁序修复 2026-10-16】ssf-render 必须在 Host 锁之前处理：渲染
+    // 子进程里 DLL 经 pipe 拉皮肤需要同一把锁——锁内等子进程=自我死
+    // 锁（PS 退出 0 但 DLL 拉皮肤死等，BMP 永不落盘的根因）。
+    // ?id= 渲染指定 ssf 皮肤（设置页编辑中的那个）。
+    if req.method == "GET" && req.path == "/api/skin/ssf-render" {
+        let rid = req.query.get("id").cloned();
+        return ssf_render_inner(rid.as_deref());
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
@@ -971,6 +1436,27 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 平台标识（设置页据此隐藏平台无关项：Linux 不用引擎自带中英切换）
             "os": std::env::consts::OS,
         })),
+        ("GET", "/api/about") => {
+            // 【关于页 2026-10-16 用户需求】版本号读 exe 同目录
+            // version.txt（安装包唯一版本源，pack 时写入）；开发目录
+            // 无此文件 → 回退 crate 版本并标「开发版」。目录信息一并
+            // 给（设置页只读展示，方便报障时定位安装/数据位置）。
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_default();
+            let version = std::fs::read_to_string(exe_dir.join("version.txt"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}（开发版）", env!("CARGO_PKG_VERSION")));
+            Response::json(&serde_json::json!({
+                "version": version,
+                "github": "https://github.com/LeafHW/hufu-ime-rust",
+                "exe_dir": exe_dir.to_string_lossy(),
+                "data_dir": host.data_dir.to_string_lossy(),
+            }))
+        }
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表
@@ -1042,14 +1528,71 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
         }
         ("GET", "/api/skins") => {
-            let list: Vec<serde_json::Value> = host
+            // 【SSF 双类型皮肤 2026-12】JSON 皮肤 + .ssf 皮肤合并列表：
+            // 每项带 kind 徽标；ssf 项带 author / 解析错误 / 预览可用性 /
+            // warnings。旧字段（skins[].id/name、current）形状不变——老
+            // UI 无感（回归红线）。ssf 项解析失败也列出（error 带原因），
+            // name 回退文件名。
+            let cur = host.engine.config.appearance.skin.clone();
+            let cur_kind = host.engine.config.appearance.skin_kind.clone();
+            let mut list: Vec<serde_json::Value> = host
                 .list_skins()
                 .into_iter()
-                .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+                .map(|(id, name)| {
+                    serde_json::json!({"id": id, "kind": "json", "name": name})
+                })
                 .collect();
+            for e in host.list_ssf_skins() {
+                let mut it = serde_json::json!({
+                    "id": e.id,
+                    "kind": "ssf",
+                    "name": e.name,
+                    "author": e.author,
+                });
+                if let Some(err) = &e.error {
+                    it["error"] = serde_json::json!(err);
+                }
+                if e.error.is_none() && e.preview {
+                    it["preview"] = serde_json::json!(true);
+                }
+                if !e.warnings.is_empty() {
+                    it["warnings"] = serde_json::json!(e.warnings);
+                }
+                list.push(it);
+            }
+            // 【列表标注】当前 ssf 皮肤源文件已删（会话中缓存降级渲染）：
+            // 文件枚举已见不到它，补一条带 error 的标注项让设置页可见现状。
+            if cur_kind == "ssf"
+                && !list
+                    .iter()
+                    .any(|x| x["kind"] == "ssf" && x["id"].as_str() == Some(cur.as_str()))
+            {
+                let name = host
+                    .ssf_bundle(&cur)
+                    .map(|b| {
+                        if b.def.name.is_empty() {
+                            cur.clone()
+                        } else {
+                            b.def.name
+                        }
+                    })
+                    .unwrap_or_else(|_| cur.clone());
+                list.push(serde_json::json!({
+                    "id": cur,
+                    "kind": "ssf",
+                    "name": name,
+                    "error": "源 .ssf 文件已删除（当前会话使用缓存渲染）",
+                }));
+            }
+            // 【渲染预热 2026-10-16】用户实锤「切皮肤/导入时实时框显示
+            // 慢」——冷渲 ~570ms（spawn+DLL init+渲染），缓存命中 ~40ms。
+            // 列表端点返回后后台串行预热全部 ssf 皮肤渲染缓存（30s 节
+            // 流）：设置页切到哪个都是热缓存秒出。失败静默（预热尽力）。
+            std::thread::spawn(warm_render_cache_throttled);
             Response::json(&serde_json::json!({
                 "skins": list,
-                "current": host.engine.config.appearance.skin,
+                "current": cur,
+                "current_kind": cur_kind,
             }))
         }
         ("GET", "/api/skin") => {
@@ -1079,8 +1622,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         ("POST", "/api/skin/select") => {
             // 仅切换当前皮肤：不写皮肤文件（POST /api/skin 是「保存」语义，
             // 误发 {id:...} 会把目标皮肤覆盖成全默认——曾经的静默毁档事故）
-            let id = req
-                .json()
+            // 【SSF 扩展 2026-12】body {id, kind:"json"|"ssf"}；kind 缺省
+            // =json（老 UI 无感）。kind=ssf 先校验能解包成功才切换（坏皮
+            // 绝不上位）；写 appearance.skin + skin_kind。
+            let v = req.json();
+            let id = v
                 .get("id")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
@@ -1088,13 +1634,96 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if id.is_empty() {
                 return Response::err(400, "缺少 id");
             }
-            let p = host.skins_dir().join(format!("{id}.json"));
-            if !p.exists() {
-                return Response::err(404, &format!("皮肤 {id} 不存在"));
+            let kind = v
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("json")
+                .to_string();
+            let prev_kind = host.engine.config.appearance.skin_kind.clone();
+            if kind == "ssf" {
+                let p = host.ssf_skins_dir().join(format!("{id}.ssf"));
+                if !p.exists() {
+                    return Response::err(404, &format!("皮肤 {id} 不存在"));
+                }
+                // 坏 .ssf（损坏/超预算/不支持的容器）→ 400 带原因，不切换
+                if let Err(e) = host.ssf_bundle(&id) {
+                    return Response::err(400, &format!("皮肤不可用: {e}"));
+                }
+                host.engine.config.appearance.skin = id.clone();
+                host.engine.config.appearance.skin_kind = "ssf".into();
+                let _ = host.engine.config.save(&host.config_path);
+                // 皮肤版本 +1：DLL poll 立即强制重拉（不靠 2.5s 过期）
+                host.skin_ver += 1;
+                Response::json(&serde_json::json!({"ok": true, "id": id, "kind": "ssf"}))
+            } else {
+                let p = host.skins_dir().join(format!("{id}.json"));
+                if !p.exists() {
+                    return Response::err(404, &format!("皮肤 {id} 不存在"));
+                }
+                host.engine.config.appearance.skin = id.clone();
+                host.engine.config.appearance.skin_kind = "json".into();
+                let _ = host.engine.config.save(&host.config_path);
+                // json→json 与旧行为一致（不 bump，靠 DLL 2.5s 过期+指纹
+                // 变化重拉）；仅形态切换（ssf→json）时强制重拉。
+                if prev_kind != "json" {
+                    host.skin_ver += 1;
+                }
+                Response::json(&serde_json::json!({"ok": true, "id": id}))
             }
-            host.engine.config.appearance.skin = id.clone();
-            let _ = host.engine.config.save(&host.config_path);
-            Response::json(&serde_json::json!({"ok": true, "id": id}))
+        }
+        // 【独立皮肤设置 2026-10-16】.ssf 皮肤的 per-skin 用户覆盖读写
+        //（设置页·独立皮肤分页）。GET ?id= 返回 overrides + 皮肤原值
+        //（UI 显示占位/还原基准）；POST {id, overrides} 写盘 + skin_ver
+        // 推进（DLL 立即重拉生效）。
+        ("GET", "/api/skin/ssf-settings") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            if !cache_dir.exists() {
+                return Response::err(404, &format!("皮肤 {id} 缓存不存在"));
+            }
+            let ov = crate::ssf::SsfOverrides::load(&cache_dir);
+            // 皮肤原值（还原基准）：bundle 里 display
+            let base = match host.ssf_bundle(&id) {
+                Ok(b) => serde_json::json!({
+                    "font_pt": 16.0,
+                    "font_face": b.def.display.font_ch,
+                    "code_color": crate::ssf::argb_to_rgba_hex(b.def.display.code_color),
+                    "first_color": crate::ssf::argb_to_rgba_hex(b.def.display.first_color),
+                    "text_color": crate::ssf::argb_to_rgba_hex(b.def.display.text_color),
+                    "annotation_color": crate::ssf::argb_to_rgba_hex(b.def.display.annotation_color),
+                }),
+                Err(_) => serde_json::json!({}),
+            };
+            Response::json(&serde_json::json!({"id": id, "overrides": ov, "base": base}))
+        }
+        ("POST", "/api/skin/ssf-settings") => {
+            let v = req.json();
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let Some(ovv) = v.get("overrides") else {
+                return Response::err(400, "缺少 overrides");
+            };
+            let ov: crate::ssf::SsfOverrides =
+                match serde_json::from_value(ovv.clone()) {
+                    Ok(o) => o,
+                    Err(e) => return Response::err(400, &format!("overrides 非法: {e}")),
+                };
+            let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            if !cache_dir.exists() {
+                return Response::err(404, &format!("皮肤 {id} 缓存不存在"));
+            }
+            match ov.save(&cache_dir) {
+                Ok(()) => {
+                    host.skin_ver += 1;
+                    Response::json(&serde_json::json!({"ok": true}))
+                }
+                Err(e) => Response::err(500, &e),
+            }
         }
         ("POST", "/api/preview") => {
             // 【实机预览锚点 2026-09-08】设置页报来自己窗口的屏幕坐标
@@ -1141,6 +1770,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match skin.save(&p) {
                 Ok(()) => {
                     host.engine.config.appearance.skin = skin.id.clone();
+                    // 【SSF 扩展 2026-12】保存的必是 JSON 皮肤——形态字段
+                    // 同步归位（此前若停在 ssf 形态，保存 JSON 会留下悬空
+                    // kind=ssf 指向不存在的 .ssf）。
+                    host.engine.config.appearance.skin_kind = "json".into();
                     let _ = host.engine.config.save(&host.config_path);
                     // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
                     // 2.5s 缓存）——设置页调参实机预览即时生效
@@ -1157,6 +1790,112 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match hufu_skin::Skin::from_weasel_colors(id, v.get("colors").unwrap_or(&v)) {
                 Some(skin) => Response::json(&serde_json::to_value(&skin).unwrap()),
                 None => Response::err(400, "导入失败"),
+            }
+        }
+        // 【SSF 皮肤 2026-12】导入 .ssf：body=原始 .ssf 字节
+        //（Content-Type: application/octet-stream；极简 HTTP 不校验 CT，
+        // 按字节流收）。?name=xxx.ssf 可选，缺省用皮肤内 skin_name 消毒。
+        // 存 皮肤\{name}.ssf → 解包建缓存 → {ok, id, warnings}；不自动
+        // 切换（UI 需要时另调 /api/skin/select）。
+        ("POST", "/api/skin/import_ssf") => {
+            let qname = req.query.get("name").map(|s| s.as_str());
+            match ssf::import_ssf(&host.data_dir, &req.body, qname) {
+                Ok((id, warnings)) => Response::json(&serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "warnings": warnings,
+                })),
+                Err(e) => Response::err(400, &e),
+            }
+        }
+        // 【SSF 皮肤 2026-12】预览图：manifest.preview 指向的缓存文件字节。
+        // 仅 kind=ssf（JSON 参数化皮肤无预览图概念）；无预览/缺失 → 404。
+        ("GET", "/api/skin/preview") => {
+            let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("ssf");
+            if kind != "ssf" {
+                return Response::err(400, "仅 ssf 皮肤支持预览图");
+            }
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::preview_file(&host.data_dir, &id) {
+                Some(p) => match std::fs::read(&p) {
+                    Ok(b) => Response {
+                        status: 200,
+                        content_type: image_content_type(&p),
+                        body: b,
+                    },
+                    Err(_) => Response::err(404, "预览图读取失败"),
+                },
+                None => Response::err(404, "该皮肤无预览图"),
+            }
+        }
+        // 【SSF 真渲染 2026-10-16】实时框终极方案：spawn PowerShell P/Invoke
+        // 生产 DLL 的 hufu_test_skin_dump（连本进程 HTTP 拉当前皮肤真渲染）
+        // → BMP 回传。UI <img> 直接吃。慢（~2-3s）但所见即打字所得（九宫
+        // 格/字体/颜色/横竖排/序号全真）。锁前处理（见 route 顶部注释）。
+        ("GET", "/api/skin/ssf-render") => ssf_render_endpoint(),
+        // 【SSF mock 元数据 2026-10-16】设置页「真实候选窗」实时框：
+        // 九宫格背景（border-image）+ 预览文字（display 四色/字号/间距
+        // + overrides merge）——与 DLL 渲染同参数。?id=&horizontal=0|1。
+        ("GET", "/api/skin/ssf-mock") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            let horizontal = req.query.get("horizontal").map(|s| s == "1").unwrap_or(false);
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::mock_meta(&host.data_dir, &id, horizontal) {
+                Ok(v) => Response::json(&v),
+                Err(e) => Response::err(404, &e),
+            }
+        }
+        // 【SSF 图片字节 2026-10-16】缓存目录图片（九宫格背景用）。
+        // 白名单=该皮肤 used_images（防路径穿越读任意文件）。
+        ("GET", "/api/skin/ssf-image") => {
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            let f = req.query.get("f").cloned().unwrap_or_default();
+            if id.is_empty() || f.is_empty() {
+                return Response::err(400, "缺少 id/f");
+            }
+            match ssf::image_file(&host.data_dir, &id, &f) {
+                Some(p) => match std::fs::read(&p) {
+                    Ok(b) => Response {
+                        status: 200,
+                        content_type: image_content_type(&p),
+                        body: b,
+                    },
+                    Err(_) => Response::err(404, "图片读取失败"),
+                },
+                None => Response::err(404, "图片不在该皮肤白名单内"),
+            }
+        }
+        // 【SSF 皮肤 2026-12】删除 .ssf 源文件 + 缓存目录（.ssf 用户自
+        // 管理、可删除；JSON 皮肤保持现状不动——无此删除通道）。删的是
+        // 当前皮肤时回退默认 JSON 皮肤。
+        ("DELETE", "/api/skin") => {
+            let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("json");
+            if kind != "ssf" {
+                return Response::err(400, "JSON 皮肤不支持删除（仅 .ssf）");
+            }
+            let id = req.query.get("id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            match ssf::remove_ssf(&host.data_dir, &id) {
+                Ok(()) => {
+                    if host.engine.config.appearance.skin == id
+                        && host.engine.config.appearance.skin_kind == "ssf"
+                    {
+                        let fallback = hufu_config::AppearanceSection::default().skin;
+                        host.engine.config.appearance.skin = fallback;
+                        host.engine.config.appearance.skin_kind = "json".into();
+                        let _ = host.engine.config.save(&host.config_path);
+                        host.skin_ver += 1; // 强制 DLL 立即重拉回默认皮
+                    }
+                    Response::json(&serde_json::json!({"ok": true}))
+                }
+                Err(e) => Response::err(500, &e),
             }
         }
         ("POST", "/api/sentence_test") => {
@@ -1200,86 +1939,105 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .collect();
             Response::json(&serde_json::json!({"texts": texts}))
         }
+        ("GET", "/api/word_code") => {
+            // 【加词自动填码 2026-10-08】?text=词 → 编码提示：词典反查
+            // 最优码，新词按通用组词规则生成（虎爪/虎娘同款体验：只打
+            // 词+选重位，少数情况改编码）。词框变动且编码框空时预填。
+            // 【码长截断 2026-10-09】按方案 max_code_length 截断（4 定
+            // 方案 4 字词曾生成 dhrtf 5 码没法打——用户实锤）。
+            let text = req.query.get("text").cloned().unwrap_or_default();
+            let max = host.engine.config.input.max_code_length.max(2) as usize;
+            let code = host.engine.schema.word_code_hint_capped(&text, max);
+            Response::json(&serde_json::json!({"code": code}))
+        }
+        ("GET", "/api/fonts") => {
+            // 【字体下拉改系统字体 2026-10-09】用户定调：下拉=电脑里装了
+            // 什么就列什么（GDI 枚举 charset=936 简中族），不再维护
+            // 数据\字体 文件夹（文件夹字体在真实候选窗里从未生效过，
+            // 整条链路已删）。另带「默认字体」推荐：族名带「霞鹜」优先
+            // （用户各机霞鹜版本名不完全一致，只按关键字匹配），没有
+            // 霞鹜回微软雅黑——设置页空选/重置时自动落到它。
+            let mut families: Vec<String> = fontinfo::gdi_list_families_gb();
+            let default = families
+                .iter()
+                .find(|f| f.contains("霞鹜"))
+                .cloned()
+                .or_else(|| families.iter().find(|f| *f == "微软雅黑").cloned())
+                .unwrap_or_default();
+            families.sort_by(|a, b| {
+                let ka = a.contains("霞鹜") || a == "微软雅黑";
+                let kb = b.contains("霞鹜") || b == "微软雅黑";
+                kb.cmp(&ka).then_with(|| a.cmp(b))
+            });
+            let items: Vec<serde_json::Value> = families
+                .into_iter()
+                .map(|fam| serde_json::json!({"family": fam, "source": "system"}))
+                .collect();
+            Response::json(&serde_json::json!({"fonts": items, "default": default}))
+        }
+        ("GET", "/api/font_preview") => {
+            // 【字体样张 2026-10-09】?family=族名 → GDI 渲染样张 BMP。
+            // 设置页选中即看真实字形——遍黑体/宋体/雅黑肉眼难辨的字重
+            // 微差与衬线差异，一张图说清（渲染前 ensure_private_gdi_fonts
+            // 已在启动时装载，文件夹字体族名直出）。
+            let family = req.query.get("family").cloned().unwrap_or_default();
+            if family.is_empty() {
+                return Response::err(400, "family 缺失");
+            }
+            match fontinfo::render_font_preview_bmp(&family, "永国专虎符 Aa01") {
+                Some(bmp) => Response {
+                    status: 200,
+                    content_type: "image/bmp",
+                    body: bmp,
+                },
+                None => Response::err(500, "样张渲染失败"),
+            }
+        }
+        // 【Shift+符号预览 2026-10-09】?base=1 → 内置输出/自定义覆盖。
+        // 自定义按键页「Shift+符号」页签点键即问即显。
+        ("GET", "/api/shift_symbol") => {
+            let base = req.query.get("base").cloned().unwrap_or_default();
+            let r = base
+                .chars()
+                .next()
+                .and_then(|c| host.engine.shift_symbol_preview(c));
+            Response::json(&match r {
+                Some((builtin, custom)) => {
+                    serde_json::json!({"builtin": builtin, "custom": custom})
+                }
+                None => serde_json::json!({"builtin": null, "custom": null}),
+            })
+        }
         ("POST", "/api/user_word/add") => {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim();
-            // 选重位（/jc 第三框「第 N 选」）：≥1 时词固定第 N 候选
-            //（不足 N 个则排最后）；0/缺省=原置顶行为。
             let pos = v.get("pos").and_then(|x| x.as_i64()).unwrap_or(0);
-            if code.is_empty() || text.is_empty() {
-                return Response::err(400, "编码与词不能为空");
+            match add_user_word(&mut host, code, text, pos) {
+                Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                Err(e) => {
+                    let status = if e.starts_with("写入失败") {
+                        500
+                    } else {
+                        400
+                    };
+                    Response::err(status, &e)
+                }
             }
-            if !(0..=99).contains(&pos) {
-                return Response::err(400, "选重位须在 1-99");
-            }
-            // 【格式统一 2026-09-06】统一 用户调整.txt：{添加}码\t词[\tpN]。
-            // 同码同词旧行全清（含 {删除}——加词=明确想要它，修复加词
-            // 被旧删除行屏蔽的问题）后追加。
-            let file = host.engine.schema.dir.join("用户调整.txt");
-            rewrite_keep_lines(&file, code, text);
-            let line = if pos >= 1 {
-                format!("{{添加}}{code}\t{text}\tp{pos}\n")
-            } else {
-                format!("{{添加}}{code}\t{text}\n")
-            };
-            use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file)
-            {
-                Ok(f) => f,
-                Err(e) => return Response::err(500, &format!("写入失败: {e}")),
-            };
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                return Response::err(500, &format!("写入失败: {e}"));
-            }
-            host.engine.reload_user_data();
-            Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/weight") => {
-            // 【/jq→补充语料 2026-09-06 用户拍板】词+权重 → 写当前方案
-            // 的 补充语料.txt：`词 权重`（同词旧行先清）——/jq 的语义
-            // 是「提升整句里这个词的概率」，这正是补充语料的职责
-            //（ngram 词图注入，奖励 = 9+2·ln(权重/1000)，上限 32）。
-            // 补充语料只在模型装载时生效 → 写完后台重载整句引擎
-            //（~2s，期间旧模型继续服务）。不再写 用户调整.txt 的
-            // {加权} 行（旧行回放兼容保留）。
+            // 【/jq→补充语料 2026-09-06】词+权重 → 当前方案 补充语料.txt；
+            // 同词旧行先清，后台重载整句模型。详见 add_user_weight。
             let v = req.json();
-            let text = v
-                .get("text")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
             let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
-            if text.is_empty() {
-                return Response::err(400, "词不能为空");
+            match add_user_weight(&mut host, text, weight) {
+                Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                Err(e) => {
+                    let status = if e.starts_with("写入失败") { 500 } else { 400 };
+                    Response::err(status, &e)
+                }
             }
-            if !(1..=1_000_000_000).contains(&weight) {
-                return Response::err(400, "权重须为正整数");
-            }
-            let file = host.engine.schema.dir.join("补充语料.txt");
-            rewrite_supplement_lines(&file, &text);
-            let line = format!("{text} {weight}\n");
-            use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file)
-            {
-                Ok(f) => f,
-                Err(e) => return Response::err(500, &format!("写入失败: {e}")),
-            };
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                return Response::err(500, &format!("写入失败: {e}"));
-            }
-            // 后台重载整句模型（刷新补充语料快照→重载 ngram→热挂）
-            if let Some(h) = HOST_HANDLE.get() {
-                spawn_sentence_reload(h.clone(), true);
-            }
-            Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/remove") => {
             let v = req.json();
@@ -1405,6 +2163,226 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => Response::err(500, &format!("切换失败: {e}")),
             }
         }
+        // 【全部设置一文件 2026-10-10】导出=config 全量 + 皮肤目录全部
+        // 皮肤 JSON（用户自定义/调过的都在内）。用户规格：设置页只留
+        // 「导出 config.json / 导入 config.json」两个动作，升版本一个
+        // 文件带走全部设置（含皮肤与自定义按键）。
+        // 【导出瘦身 2026-10-14】挂件图等大内嵌资产按内容入池去重
+        //（bundle 2）：同一张动图在 皮肤.overlay.image 与每个预设槽
+        // 里各存一份 base64——现场实例 1.6MB 动图 ×5 份 = 11.2MB 导出；
+        // 现导出把 ≥1KB 的 data: 字符串换成 asset: 引用、原图只在顶层
+        // assets 池存一份，导入再解回内联（皮肤文件落盘格式不变）。
+        // 【独立皮肤随行 2026-10-16】bundle 3：用户自弄的 .ssf（系统
+        // 自带四款排除——随安装分发）base64 收进 ssf_skins；全部独立
+        // 皮肤的 overrides（字体/横排/四色/挂件快照）收进 ssf_settings
+        //——官方皮肤上的用户微调也带（皮肤文件不带但设置无损）。
+        ("GET", "/api/settings_export") => {
+            let mut skins = serde_json::Map::new();
+            for (id, _name) in host.list_skins() {
+                let p = host.skins_dir().join(format!("{id}.json"));
+                // 皮肤文件内容原样收编（Skin 结构透传序列化——保留未知
+                // 字段由 Skin 自身 serde 决定；读不动的跳过不拖垮导出）
+                if let Ok(txt) = std::fs::read_to_string(&p) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        // 【导出瘦身 2026-10-18】官方皮肤与内嵌版语义
+                        // 相同 → 纯冗余（exe 内嵌自愈；夜桜/夜莺两张
+                        // 大图皮内联 8.5MB，是「导出 15MB」的主犯）。
+                        // 用户改过（配色/挂件，如湖光）= 真用户数据，
+                        // 照常带。语义比较（Value 深等）——磁盘皮经
+                        // 设置页保存路径重序列化，字节比对恒不等。
+                        if crate::host::official_skin_unchanged(&format!("{id}.json"), &v) {
+                            continue;
+                        }
+                        skins.insert(id, v);
+                    }
+                }
+            }
+            let mut ssf_skins = serde_json::Map::new();
+            let mut ssf_settings = serde_json::Map::new();
+            for e in host.list_ssf_skins() {
+                if e.error.is_some() {
+                    continue; // 坏皮不带（导入也过不了校验）
+                }
+                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&e.id);
+                // 设置：overrides.json 原样（结构 SsfOverrides serde 校验
+                // 由导入端做；这里透传——未来加字段不炸旧导出/导出端）
+                if let Ok(t) = std::fs::read_to_string(cache_dir.join("overrides.json")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        ssf_settings.insert(e.id.clone(), v);
+                    }
+                }
+                // 文件：系统自带排除（随安装分发；导出只带用户自弄的）。
+                // 【导出瘦身 2026-10-18】从「官方名即排除」收紧为「官方
+                // 名且字节未改」——用户导入过同名更新版 = 内容不同 =
+                // 会随导出带走（不然迁移丢皮）。
+                let file = format!("{}.ssf", e.id);
+                let p = host.ssf_skins_dir().join(&file);
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if crate::host::official_ssf_unchanged(&file, &bytes) {
+                        continue;
+                    }
+                    if let Ok(b64) = b64::encode(&bytes) {
+                        ssf_skins.insert(e.id.clone(), serde_json::json!({ "ssf": b64 }));
+                    }
+                }
+            }
+            let mut bundle = serde_json::json!({
+                "hufu_settings_bundle": 3,
+                "exported_at": hufu_engine::dynamic::date_string_iso(),
+                "config": host.engine.config,
+                "skins": skins,
+                "ssf_skins": ssf_skins,
+                "ssf_settings": ssf_settings,
+            });
+            let pool = settings_assets_split(&mut bundle);
+            if !pool.is_empty() {
+                if let Some(obj) = bundle.as_object_mut() {
+                    obj.insert("assets".into(), serde_json::Value::Object(pool));
+                }
+            }
+            Response::json(&bundle)
+        }
+        ("POST", "/api/settings_import") => {
+            // body = /api/settings_export 的产物。语义=「叠加到默认值」：
+            // config 走 serde 反序列化，缺失字段自动取默认（新版新增项
+            // 落默认）、未知字段忽略（老版没有的新物件不炸）——正是
+            // 「新增功能按默认值来」的实现。皮肤逐张校验后落盘（id 只
+            // 许 [A-Za-z0-9_-]，防路径注入），再整体应用配置。
+            // bundle 1=老格式（图内联）；2=资产池引用（导入前解回内联）；
+            // 3=+独立皮肤（用户自弄 .ssf 落盘 + 全部 overrides 恢复）。
+            let mut v = req.json();
+            let bundle_ver = v.get("hufu_settings_bundle").and_then(|x| x.as_i64());
+            match bundle_ver {
+                Some(1) | Some(2) | Some(3) => {}
+                // 【老版裸 config 兼容 2026-10-18】无标记=「导出config.json」
+                //（R22 时代）的裸 Config JSON 或「config 节但无标记」手改件：
+                // 整体当 config-only 导入（皮肤等节不存在自然跳过——
+                // 「叠加到默认值」语义只动配置）。结构由下方 Config serde
+                // 校验兜底（缺失补默认、未知忽略——老版本导出的字段漂移
+                // 不炸）。标记存在但值不识别=真不是虎符设置文件。
+                None => {
+                    if !v.get("config").is_some() {
+                        let cfg_only = v.clone();
+                        v = serde_json::Value::Object(serde_json::Map::new());
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("config".into(), cfg_only);
+                        }
+                    }
+                }
+                _ => {
+                    return Response::err(400, "不是虎符设置文件（缺少 hufu_settings_bundle 标记）")
+                }
+            }
+            if bundle_ver == Some(2) || bundle_ver == Some(3) {
+                let pool = v
+                    .get("assets")
+                    .and_then(|x| x.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(skins) = v.get_mut("skins").and_then(|x| x.as_object_mut()) {
+                    for (_id, sv) in skins.iter_mut() {
+                        settings_assets_merge(sv, &pool);
+                    }
+                }
+            }
+            let Some(cfg_v) = v.get("config") else {
+                return Response::err(400, "设置文件缺 config 节");
+            };
+            let cfg: hufu_config::Config = match serde_json::from_value(cfg_v.clone()) {
+                Ok(c) => c,
+                Err(e) => return Response::err(400, &format!("config 节无效: {e}")),
+            };
+            let mut skins_applied = 0usize;
+            if let Some(skins) = v.get("skins").and_then(|x| x.as_object()) {
+                let dir = host.skins_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                for (id, sv) in skins {
+                    if id.is_empty()
+                        || !id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        continue; // 非法 id 跳过
+                    }
+                    // 结构校验（Skin serde 通过才落盘——坏皮肤不写入）
+                    if serde_json::from_value::<hufu_skin::Skin>(sv.clone()).is_err() {
+                        continue;
+                    }
+                    let p = dir.join(format!("{id}.json"));
+                    if let Ok(txt) = serde_json::to_string(sv) {
+                        if std::fs::write(&p, txt).is_ok() {
+                            skins_applied += 1;
+                        }
+                    }
+                }
+            }
+            // 【独立皮肤随行 2026-10-16】bundle 3：先落用户自弄的 .ssf
+            //（逐张 parse 校验——坏文件绝不落盘，与 import_ssf 同款红
+            // 线；同名覆盖=恢复用户快照语义），再对「导出里出现的全部
+            // ssf 皮肤」（含系统自带——官方皮肤导入端自愈/已在，只补
+            // 设置）建缓存并写 overrides.json（SsfOverrides 结构校验，
+            // 坏设置跳过不拖垮整包）。
+            let mut ssf_skins_applied = 0usize;
+            let mut ssf_settings_applied = 0usize;
+            if bundle_ver == Some(3) {
+                let dir = host.ssf_skins_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if let Some(m) = v.get("ssf_skins").and_then(|x| x.as_object()) {
+                    for (id, ent) in m {
+                        if !crate::ssf::valid_id(id) {
+                            continue; // 非法 id 跳过（路径注入防线）
+                        }
+                        let Some(b64) = ent.get("ssf").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
+                        let Ok(bytes) = b64::decode(b64) else {
+                            continue;
+                        };
+                        // 解析校验（坏皮/超预算不落盘）
+                        if hufu_skin::ssf::parse(&bytes).is_err() {
+                            continue;
+                        }
+                        if std::fs::write(dir.join(format!("{id}.ssf")), &bytes).is_ok() {
+                            ssf_skins_applied += 1;
+                        }
+                    }
+                }
+                if let Some(m) = v.get("ssf_settings").and_then(|x| x.as_object()) {
+                    for (id, ov) in m {
+                        if !crate::ssf::valid_id(id) {
+                            continue;
+                        }
+                        // 结构校验（SsfOverrides serde；坏值跳过）
+                        if serde_json::from_value::<crate::ssf::SsfOverrides>(ov.clone()).is_err() {
+                            continue;
+                        }
+                        // 缓存就绪（缺则解包建目录——含刚落盘的用户皮肤
+                        // 与官方自带；失败跳过该皮肤设置）
+                        if let Ok(b) = crate::ssf::bundle_for(&host.data_dir, id) {
+                            let ov_text = serde_json::to_string(ov).unwrap_or_default();
+                            if std::fs::write(b.cache_dir.join("overrides.json"), ov_text).is_ok()
+                            {
+                                ssf_settings_applied += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            match host.apply_config(cfg) {
+                Ok((need_sentence, teardown)) => {
+                    if need_sentence {
+                        reload_sentence_bg(teardown, true);
+                    }
+                    Response::json(&serde_json::json!({
+                        "ok": true,
+                        "skins_applied": skins_applied,
+                        "ssf_skins_applied": ssf_skins_applied,
+                        "ssf_settings_applied": ssf_settings_applied,
+                    }))
+                }
+                Err(e) => Response::err(500, &format!("应用失败: {e}")),
+            }
+        }
         ("POST", "/api/open_schema_dir") => {
             // body {name?}：缺省=当前方案。打开方案码表目录的资源管理器窗口。
             let name = req
@@ -1425,6 +2403,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             crate::platform::open_path(&dir);
             Response::json(&serde_json::json!({"ok": true, "path": dir}))
         }
+        ("POST", "/api/open_personal") => match open_personal(&host) {
+            Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+            Err(e) => Response::err(400, &e),
+        },
         ("POST", "/api/export_schema") => {
             // body {name?, format?, remember?, lines_only?}：name 缺省=
             // 当前方案；format 缺省/空=记忆格式或虎整句 `码 词 词`（字节
@@ -1665,7 +2647,6 @@ mod sys_win {
     }
 
     /// 设置窗口的 `--window-size` / `--window-position` 参数（DIP 空间）。
-    ///
     /// 【尺寸定稿】固定 900×800 DIP（用户定稿：按工作区占比缩 DIP 会让
     /// 高缩放下窗口变小、内容挤在一起——实寸恒定的代价不划算，放弃）。
     /// 尺寸 clamp 到 DIP 工作区（小屏不溢出），工作区 DIP 中心居中
@@ -1685,6 +2666,62 @@ mod sys_win {
             format!("--window-size={w},{h}"),
             format!("--window-position={x},{y}"),
         )
+    }
+
+    // ── 【设置窗唯一性 2026-10-10】已开设置窗的发现与前置 ──
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(lpenumfunc: isize, lparam: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, lpstring: *mut u16, cchmax: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, ncmdshow: i32) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn keybd_event(bvk: u8, bscan: u8, dwflags: u32, dwextrainfo: usize);
+    }
+
+    /// 找到设置窗（--app 窗口标题=页面 <title>「虎符 HuFu · 设置」，
+    /// 专属 Profile 实例不会与其他窗口撞标题）并弹到最前。返回是否
+    /// 找到并前置——调用方（Ctrl+Alt+H/托盘）据此决定要不要开新窗
+    ///（用户规格：唯一性——一直按不再一直弹出）。
+    pub unsafe fn raise_settings_window() -> bool {
+        // EnumWindows 回调只收 HWND；结果放 thread-local 风格静态原子
+        //（回调在同线程执行，窗口枚举期间独占）。
+        static FOUND: std::sync::atomic::AtomicIsize =
+            std::sync::atomic::AtomicIsize::new(0);
+        FOUND.store(0, std::sync::atomic::Ordering::SeqCst);
+        unsafe extern "system" fn cb(hwnd: isize, _lparam: isize) -> i32 {
+            if IsWindowVisible(hwnd) == 0 {
+                return 1; // 继续枚举
+            }
+            let mut buf = [0u16; 64];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n <= 0 {
+                return 1;
+            }
+            let title = String::from_utf16_lossy(&buf[..n as usize]);
+            if title.contains("虎符") && title.contains("设置") {
+                FOUND.store(hwnd, std::sync::atomic::Ordering::SeqCst);
+                return 0; // 找到即停
+            }
+            1
+        }
+        EnumWindows(cb as isize, 0);
+        let hwnd = FOUND.load(std::sync::atomic::Ordering::SeqCst);
+        if hwnd == 0 {
+            return false;
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, 9); // SW_RESTORE
+        }
+        // 【前台锁定绕行】后台进程直接 SetForegroundWindow 常被系统
+        // 降级为任务栏闪烁：合成一记 Alt 按抬（经典手法）解锁前台权，
+        // 再置顶。keybd_event 与真实输入同管线，对应用无副作用。
+        const KEYEVENTF_KEYUP: u32 = 0x2;
+        keybd_event(0x12, 0, 0, 0); // VK_MENU down
+        let _ = SetForegroundWindow(hwnd);
+        keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0); // VK_MENU up
+        true
     }
 }
 
@@ -1720,3 +2757,225 @@ mod sys_unix {
         false
     }
 }
+
+// ── 设置导出 base64【独立皮肤随行 2026-10-16】────────────────────────
+// .ssf 是二进制（1-3MB），进 JSON 得文本编码。标准字母表+padding 手写
+// （零依赖；engine 无 base64 crate，为此引依赖不值）。编解码对称、
+// 拒绝非法字符（导入文件可能是用户手改过的）。
+mod b64 {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(data: &[u8]) -> Result<String, ()> {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(TBL[(n >> 18) as usize & 63] as char);
+            out.push(TBL[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
+        }
+        Ok(out)
+    }
+
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(Vec::new());
+        }
+        if s.len() % 4 != 0 {
+            return Err(());
+        }
+        let bytes = s.as_bytes();
+        // 每 4 字符 → 3 字节；末组 padding 只许 =（0/1/2 个且只居末尾）
+        let mut out = Vec::with_capacity(s.len() / 4 * 3);
+        for (ci, chunk) in bytes.chunks(4).enumerate() {
+            let last = ci == bytes.len() / 4 - 1;
+            let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+            if pad > 0 && !last {
+                return Err(()); // = 只许出现在最后一组
+            }
+            if pad > 2 || chunk[..4 - pad].iter().any(|&c| c == b'=') {
+                return Err(()); // _= _=_ 等中间带 = 非法
+            }
+            let mut n: u32 = 0;
+            for &c in &chunk[..4 - pad] {
+                n = (n << 6) | val(c).ok_or(())?;
+            }
+            n <<= pad * 6;
+            out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8][..3 - pad]);
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn roundtrip() {
+            for len in 0..64 {
+                let data: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37).wrapping_add(len as u8)).collect();
+                let e = encode(&data).unwrap();
+                assert_eq!(decode(&e).unwrap(), data, "len={len}");
+            }
+            // RFC 4648 向量
+            assert_eq!(encode(b"").unwrap(), "");
+            assert_eq!(encode(b"f").unwrap(), "Zg==");
+            assert_eq!(encode(b"fo").unwrap(), "Zm8=");
+            assert_eq!(encode(b"foo").unwrap(), "Zm9v");
+            assert_eq!(decode("Zm9v").unwrap(), b"foo");
+            // 非法输入拒绝
+            assert!(decode("A").is_err());
+            assert!(decode("====").is_err());
+            assert!(decode("AB!C").is_err());
+        }
+    }
+}
+
+// ── 设置导出资产池【导出瘦身 2026-10-14】─────────────────────────────
+// 挂件图（overlay.image 与每个预设槽的 image）在皮肤 JSON 里各存一份
+// base64：现场实测同一张 1.6MB 动图 ×5 份 = 11.2MB 导出。导出把
+// ≥1KB 的 data: 字符串换成 asset:img-<hash>-<len> 引用、原图只在顶层
+// assets 池存一份；导入解回内联（皮肤文件落盘格式不变，运行时零影响）。
+// 纯函数、递归遍历任意嵌套（未来其他大内嵌字段自动受益）。
+mod settings_assets {
+    use serde_json::Value;
+
+    /// 引用键：内容哈希 + 长度（防碰撞双保险）。DefaultHasher::new()
+    /// 固定键、进程间确定——键只需在同一份导出文件内自洽即可。
+    fn asset_key(data_uri: &str) -> String {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(data_uri.as_bytes());
+        format!("asset:img-{:016x}-{}", h.finish(), data_uri.len())
+    }
+
+    /// 递归把 v 里 ≥1KB 的 data: 字符串替换为 asset: 引用，原图收入池
+    ///（同图只存一份）。返回池（可能为空）。
+    pub fn split(v: &mut Value) -> serde_json::Map<String, Value> {
+        let mut pool = serde_json::Map::new();
+        fn walk(v: &mut Value, pool: &mut serde_json::Map<String, Value>) {
+            match v {
+                Value::String(s) => {
+                    if s.starts_with("data:") && s.len() >= 1024 && !s.starts_with("asset:") {
+                        let key = asset_key(s);
+                        pool.entry(key.clone())
+                            .or_insert_with(|| Value::String(s.clone()));
+                        *s = key;
+                    }
+                }
+                Value::Object(m) => {
+                    for (_k, vv) in m.iter_mut() {
+                        walk(vv, pool);
+                    }
+                }
+                Value::Array(a) => {
+                    for vv in a.iter_mut() {
+                        walk(vv, pool);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(v, &mut pool);
+        pool
+    }
+
+    /// 递归把 asset: 引用解回池里的原图；池里没有的引用置空串（文件
+    /// 残缺时不炸、皮肤其余部分照常——image="" 是合法态）。
+    pub fn merge(v: &mut Value, pool: &serde_json::Map<String, Value>) {
+        match v {
+            Value::String(s) => {
+                if s.starts_with("asset:") {
+                    *s = pool
+                        .get(s.as_str())
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            Value::Object(m) => {
+                for (_k, vv) in m.iter_mut() {
+                    merge(vv, pool);
+                }
+            }
+            Value::Array(a) => {
+                for vv in a.iter_mut() {
+                    merge(vv, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 真实结构的缩样：皮肤.overlay.image + presets 槽各一份同图。
+        #[test]
+        fn split_dedupes_and_merge_restores() {
+            let img = format!("data:image/gif;base64,{}", "A".repeat(2048));
+            let orig = serde_json::json!({
+                "overlay": {
+                    "image": img,
+                    "enabled": true,
+                    "presets": [
+                        { "image": img, "base_height": 60 },
+                        { "image": img, "base_height": 45 },
+                    ],
+                },
+                "colors": { "bg": "#fff" },
+            });
+            let mut v = orig.clone();
+            let pool = split(&mut v);
+            // 3 份同图 → 池 1 条、3 处引用同键
+            assert_eq!(pool.len(), 1, "同图只入池一份");
+            let key = pool.keys().next().unwrap().clone();
+            assert_eq!(v["overlay"]["image"].as_str().unwrap(), key);
+            assert_eq!(v["overlay"]["presets"][0]["image"].as_str().unwrap(), key);
+            assert_eq!(v["overlay"]["presets"][1]["image"].as_str().unwrap(), key);
+            // 体积坍缩：3 份图变 1 份 + 3 个短键
+            let before = orig.to_string().len();
+            let after =
+                v.to_string().len() + pool.values().map(|x| x.to_string().len()).sum::<usize>();
+            assert!(after * 2 < before, "至少省一半: {after} vs {before}");
+            // 解回 = 逐字节等价（round-trip 无损）
+            let mut back = v.clone();
+            merge(&mut back, &pool);
+            assert_eq!(back, orig, "merge 后与原 JSON 等价");
+        }
+
+        #[test]
+        fn small_and_non_data_untouched() {
+            let mut v = serde_json::json!({
+                "a": "data:image/png;base64,SHORT",
+                "b": "普通文本 data: 前缀不在开头",
+                "c": 42,
+            });
+            let pool = split(&mut v);
+            assert!(pool.is_empty(), "小图/非 data: 不进池");
+            assert_eq!(v["a"].as_str().unwrap(), "data:image/png;base64,SHORT");
+        }
+
+        #[test]
+        fn missing_ref_blanks_not_panics() {
+            let mut v = serde_json::json!({ "overlay": { "image": "asset:img-deadbeef-9" } });
+            merge(&mut v, &serde_json::Map::new());
+            assert_eq!(v["overlay"]["image"].as_str().unwrap(), "");
+        }
+    }
+}
+use settings_assets::{merge as settings_assets_merge, split as settings_assets_split};

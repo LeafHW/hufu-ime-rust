@@ -1,0 +1,14 @@
+[package]
+name = "hufu-render-helper"
+version = "0.1.0"
+edition = "2021"
+
+# 渲染小助手：LoadLibrary 生产 hufu_tsf.dll → hufu_test_skin_dump。
+# 替代 PowerShell+Add-Type 驱动（编译 1-2s 拖慢设置页实时框——用户
+# 实锤「生效慢」）。单文件、零依赖、msvc/gnu 皆可链 gnu DLL（extern
+# "system"=stdcall ABI 对齐）。
+[dependencies]
+
+[[bin]]
+name = "hufu-render-helper"
+path = "src/main.rs"

@@ -19,41 +19,17 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
 use windows_core::PCWSTR;
 
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
-// ── 【右键调频菜单 2026-10-06】裸 FFI（TrackPopupMenu + TPM_RETURNCMD
-// 取回选项 id；windows crate 的签名拿不到返回值——langbar 同款直连）──
-#[link(name = "user32")]
-unsafe extern "system" {
-    #[link_name = "CreatePopupMenu"]
-    fn cand2_CreatePopupMenu() -> isize;
-    #[link_name = "AppendMenuW"]
-    fn cand2_AppendMenuW(m: isize, flags: u32, id: usize, text: *const u16) -> i32;
-    #[link_name = "TrackPopupMenu"]
-    fn cand2_TrackPopupMenu(
-        m: isize,
-        flags: u32,
-        x: i32,
-        y: i32,
-        reserved: u32,
-        hwnd: isize,
-        rect: *const RECT,
-    ) -> i32;
-    #[link_name = "DestroyMenu"]
-    fn cand2_DestroyMenu(m: isize) -> i32;
-    #[link_name = "PostMessageW"]
-    fn cand2_PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
-}
-const MF_STRING: u32 = 0x0;
-const MF_GRAYED: u32 = 0x1;
-const MF_SEPARATOR: u32 = 0x800;
-const TPM_RETURNCMD: u32 = 0x100;
-const TPM_RIGHTBUTTON: u32 = 0x2;
+// （旧 TrackPopupMenu 裸 FFI 块已随免激活自绘菜单退役删除——菜单不再
+// 用系统弹出菜单，全程 WS_EX_NOACTIVATE 自绘窗+SetCapture 消息驱动。）
 
 /// 【右键调频菜单 2026-10-06】命中矩形缓存：show() 渲染经典皮肤时
 /// 逐候选采集（内容逻辑坐标，与绘制同源），右键按 (dpi, shadow_m)
@@ -62,6 +38,11 @@ const TPM_RIGHTBUTTON: u32 = 0x2;
 static CAND_HIT: std::sync::Mutex<Vec<(f32, f32, f32, f32)>> = std::sync::Mutex::new(Vec::new());
 /// (dpi_scale, shadow_m, 内容宽, 内容高)——客户端像素→内容逻辑坐标。
 static CAND_HIT_GEO: std::sync::Mutex<Option<(f32, f32, u32, u32)>> = std::sync::Mutex::new(None);
+
+/// 取证用：最近一帧渲染几何 (dpi_scale, shadow_m, 内容 w, 内容 h)。
+pub(crate) fn cand_hit_geo() -> Option<(f32, f32, u32, u32)> {
+    *CAND_HIT_GEO.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 【右键菜单免死金牌 2026-10-07·二修】菜单 owner 抢前台会触发宿主
 /// 失活/文档焦点切换——六十修清场把引擎会话清零（真机快照
@@ -83,13 +64,388 @@ pub fn cand_menu_open() -> bool {
     menu_now_ms() < CAND_MENU_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 候选窗右键：命中候选 → 六项调频菜单（向前移/向后移/移到最前/
-/// 移到最后/加词/删词）。语义与 Ctrl+数字（置顶）/Ctrl+Shift+数字
-///（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
-/// 动作走同步管道 op=cand_menu（server 写 用户调整.txt 并返回新
-/// state）；重绘用滚轮缩放同款锁外 show——wndproc 里不碰
-/// update_ui/run_session（TSF 编辑会话不得在窗口过程里重入）。
-/// 「加词」带 (词, 编码, 选重位) 预填打开加词窗。
+/// 【右键菜单 z 序保护 2026-10-16】右键候选菜单窗存活期间，候选窗/
+/// 挂件窗的 SetWindowPos 不得再断言 HWND_TOPMOST：SSF 独立皮肤的
+/// APNG 帧钟每帧走 show() → 尾部 SetWindowPos(HWND_TOPMOST)，把同为
+/// topmost 带的菜单窗（后建本在上）压回皮肤位图之下——用户实锤
+/// 「开独立皮肤右键候选，菜单被皮肤挡住」；矢量/JSON 皮肤无帧钟
+/// 不复现，正是差异根源。返回 SWP_NOZORDER（hWndInsertAfter 随之
+/// 被系统忽略——位置/尺寸照常，z 序不动）；菜单收场
+///（menu_finish 销毁窗）后自动恢复顶置断言。锁只在菜单窗
+/// 存活期多一次无竞争快查，动画帧热路径可忽略。
+pub(crate) fn swp_z_guard() -> SET_WINDOW_POS_FLAGS {
+    if MENU_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        SWP_NOZORDER
+    } else {
+        SET_WINDOW_POS_FLAGS(0)
+    }
+}
+
+// ── 【自绘免激活菜单 2026-10-12·虎娘路线】──
+// SetForegroundWindow(owner)+TrackPopupMenu 会把宿主前台夺到菜单 owner
+// 上 → CUAS 杀组段 → 孤儿字母/虚线消失/候选飘左上角/闪退链全由此起
+//（Notepad3 自动测试实锤：rdown 后 2ms 即 OnCompositionTerminated）。
+// 自绘 popup：WS_EX_NOACTIVATE|TOPMOST|LAYERED，SetCapture 消息驱动，
+// 全程不碰前台/焦点 → 组段永活（虚线在、锚点在、无孤儿）。键盘经
+// TSF dispatch → menu_key() 路由（菜单无焦点收不到键）。
+
+struct MenuItem {
+    label: String,
+    id: i32,
+    enabled: bool,
+}
+
+struct MenuCtx {
+    /// 菜单窗句柄（HWND 的 raw 值——静态跨线程存 isize，用时还原）
+    hwnd: isize,
+    items: Vec<MenuItem>,
+    /// 开菜单那一下右键的抬起事件要吞掉（捕获已转菜单窗，UP 直达本
+    /// 窗——不吞=菜单弹开即被自己的 UP 关掉，自动测试实锤）。
+    swallow_rup: bool,
+    /// 每项（含分隔位）的 top 像素坐标（客户区）
+    tops: Vec<i32>,
+    /// 项高（分隔位=sep_h）
+    heights: Vec<i32>,
+    hover: i32,
+    w: i32,
+    h: i32,
+    // 动作上下文（命中候选）
+    text: String,
+    raw: String,
+    idx: usize,
+    n: usize,
+}
+
+static MENU_STATE: std::sync::Mutex<Option<MenuCtx>> = std::sync::Mutex::new(None);
+static MENU_FONT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// 【导航键抬起吞窗 2026-10-12】ENTER/Esc 的 down 已被 menu_key 吃掉，
+/// 紧随的 up 若放行会进引擎（enter up 触发「回车=编码上屏」——自动
+/// 测试实锤 commit="ae"）。收场后 200ms 内吞一次导航键抬起（同键
+/// down→up 间隔 <100ms，用户随后的真实键不受影响）。
+static MENU_SWALLOW_UP_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 菜单收场后是否吞本键的抬起（dispatch 对 up 键查询）。
+pub fn menu_swallow_up(vk: u32) -> bool {
+    matches!(vk, 0x1B | 0x26 | 0x28 | 0x0D)
+        && menu_now_ms()
+            < MENU_SWALLOW_UP_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 导航键判定（Esc/上/下/Enter）——TestDown 询问阶段用（零副作用）。
+pub fn menu_nav_key(vk: u32) -> bool {
+    matches!(vk, 0x1B | 0x26 | 0x28 | 0x0D)
+}
+
+/// 收场吞窗对 down 同样生效：宿主在 TestDown 吃掉后仍派 KeyDown
+///（Notepad3/CUAS 实测：ENTER TestDown 阶段执行了选择，KeyDown 阶段
+/// 二次到达→无菜单放行→引擎「回车=编码上屏」）。200ms 内同集键吞。
+pub fn menu_swallow_key(vk: u32) -> bool {
+    menu_nav_key(vk)
+        && menu_now_ms()
+            < MENU_SWALLOW_UP_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 菜单键盘路由（dispatch 在菜单开期间调用，仅 keydown）：
+/// true=已处理（吞键）。Esc 关、上下移、Enter 选；其余键关菜单放行
+///（打字关菜单=正常键照走引擎）。修饰键不关（右键时用户常按着 Ctrl）。
+pub fn menu_key(vk: u32) -> bool {
+    if matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5) {
+        return true; // 修饰键：吞（不递引擎也不关菜单）
+    }
+    let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = st.as_mut() else {
+        crate::tsf::trace(&format!("cw2: menu_key vk={vk:#x} 无菜单"));
+        return false;
+    };
+    crate::tsf::trace(&format!("cw2: menu_key vk={vk:#x} hover={}", ctx.hover));
+    match vk {
+        0x1B => {
+            // Esc：关菜单（取消）
+            drop(st);
+            menu_finish(0);
+            true
+        }
+        0x26 | 0x28 => {
+            // 上/下：hover 在可选项间移动（跳过分隔位）
+            let dir = if vk == 0x26 { -1 } else { 1 };
+            let mut i = ctx.hover;
+            for _ in 0..ctx.items.len() as i32 + 2 {
+                i += dir;
+                if i < 0 || i >= ctx.items.len() as i32 {
+                    continue;
+                }
+                if ctx.items[i as usize].enabled {
+                    ctx.hover = i;
+                    break;
+                }
+            }
+            let hwnd = HWND(ctx.hwnd as *mut _);
+            drop(st);
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            true
+        }
+        0x0D => {
+            // Enter：激活 hover
+            let (id, ok) = {
+                let ctx = st.as_ref().unwrap();
+                let i = ctx.hover;
+                if i >= 0 && i < ctx.items.len() as i32 && ctx.items[i as usize].enabled {
+                    (ctx.items[i as usize].id, true)
+                } else {
+                    (0, false)
+                }
+            };
+            drop(st);
+            if ok {
+                menu_finish(id);
+            }
+            true
+        }
+        _ => {
+            // 其余键：关菜单（取消）放行
+            false
+        }
+    }
+}
+
+/// 菜单收场：销毁窗+撤金牌宽限+（sel>0 时）执行动作。菜单 wndproc 与
+/// menu_key 两路都汇聚于此（同线程，MENU_STATE.take 保证只执行一次）。
+fn menu_finish(sel_id: i32) {
+    let ctx = MENU_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(ctx) = ctx else { return };
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = DestroyWindow(HWND(ctx.hwnd as *mut _));
+    }
+    // 吞窗开牌：紧随本收场的导航键抬起（ENTER 选定后的 up）不进引擎。
+    MENU_SWALLOW_UP_UNTIL.store(
+        menu_now_ms() + 200,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // 免死金牌宽限撤牌（同旧 TrackPopupMenu 收场：回流串一并吞掉——
+    // 无焦点抢夺后回流应无，防御性保留）。
+    CAND_MENU_UNTIL_MS.store(
+        menu_now_ms() + 1_200,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    crate::tsf::cand_interact_note();
+    if sel_id > 0 {
+        crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{}）", ctx.text));
+        unsafe { cand_menu_action(sel_id, &ctx.text, &ctx.raw, ctx.idx, ctx.n) };
+    }
+}
+
+/// 菜单动作执行（旧 cand_menu_popup 尾段原样迁移：解锁/加词/调频四动
+/// 作 + 响应重绘）。调用方保证菜单窗已销毁（无消息嵌套）。
+unsafe fn cand_menu_action(sel_id: i32, text: &str, raw: &str, idx: usize, n: usize) {
+    unsafe {
+        if sel_id == 7 {
+            // 【2026-10-06 用户拍板】菜单尾项=解锁固定位：清固定位与拖拽
+            // 钉住残留——候选窗回光标处跟随。
+            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
+            if pinned.is_some() {
+                *pinned = None;
+                drop(pinned);
+                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                crate::tsf::diag_note("cw2 pin 菜单解除（回跟随光标）");
+            }
+            return;
+        }
+        if sel_id == 5 {
+            crate::addword::open_prefilled(text, raw, &n.to_string());
+            return;
+        }
+        let action = match sel_id {
+            1 => "fwd",
+            2 => "back",
+            3 => "front",
+            4 => "last",
+            6 => "del",
+            _ => return,
+        };
+        if let Some(r) = crate::ipc::call(&serde_json::json!({
+            "op": "cand_menu", "action": action, "page_index": idx, "text": text,
+            "raw": raw
+        })) {
+            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                cand_menu_refresh(&r);
+            } else {
+                crate::tsf::trace("cw2: cand_menu 响应未生效（候选不在页/未知动作）");
+            }
+        }
+    }
+}
+
+/// 自绘菜单窗过程：捕获期内全部鼠标消息到本窗（模态感），窗外按下/
+/// 捕获被夺/Esc（menu_key 路）即收场。
+unsafe extern "system" fn menu_wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match m {
+            0x0021 => LRESULT(3), // WM_MOUSEACTIVATE → MA_NOACTIVATE（不激活不点击穿透）
+            0x0200 => {
+                // WM_MOUSEMOVE：hover 跟随
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ctx) = st.as_mut() {
+                    let mut hit = -1i32;
+                    for (i, (top, hgt)) in ctx.tops.iter().zip(ctx.heights.iter()).enumerate() {
+                        if y >= *top && y < top + hgt && ctx.items[i].id > 0 {
+                            hit = i as i32;
+                            break;
+                        }
+                    }
+                    if hit != ctx.hover {
+                        ctx.hover = hit;
+                        drop(st);
+                        let _ = InvalidateRect(h, None, true);
+                    }
+                }
+                LRESULT(0)
+            }
+            0x0201 => {
+                // WM_LBUTTONDOWN：窗外=取消（捕获让窗外点击也到本窗）
+                let x = ((l.0 as u16) as u16) as i32;
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let outside = {
+                    let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_ref()
+                        .map(|c| x < 0 || y < 0 || x >= c.w || y >= c.h)
+                        .unwrap_or(true)
+                };
+                if outside {
+                    menu_finish(0);
+                }
+                LRESULT(0)
+            }
+            0x0202 => {
+                // WM_LBUTTONUP：命中可选项=执行；否则取消
+                let y = ((l.0 >> 16) as u16) as i16 as i32;
+                let sel = {
+                    let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_ref()
+                        .and_then(|c| {
+                            c.tops
+                                .iter()
+                                .zip(c.heights.iter())
+                                .enumerate()
+                                .find(|(i, (top, hgt))| {
+                                    y >= **top && y < **top + **hgt && c.items[*i].enabled
+                                })
+                                .map(|(i, _)| c.items[i].id)
+                        })
+                        .unwrap_or(0)
+                };
+                menu_finish(sel);
+                LRESULT(0)
+            }
+            0x0205 => {
+                // WM_RBUTTONUP：开菜单的右键 UP（swallow_rup）吞掉；
+                // 之后的右键=取消。
+                let swallow = {
+                    let mut st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    st.as_mut().map(|c| std::mem::take(&mut c.swallow_rup)).unwrap_or(false)
+                };
+                if !swallow {
+                    menu_finish(0);
+                }
+                LRESULT(0)
+            }
+            0x0215 => {
+                // WM_CAPTURECHANGED：捕获被夺（Alt-Tab 等）——取消收场
+                menu_finish(0);
+                LRESULT(0)
+            }
+            0x000F => {
+                // WM_PAINT：白底+hover 高亮+灰项+分隔线+边框
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(h, &mut ps);
+                let st = MENU_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ctx) = st.as_ref() {
+                    let rc = RECT { left: 0, top: 0, right: ctx.w, bottom: ctx.h };
+                    let bg = CreateSolidBrush(COLORREF(0x00FF_FF_FF));
+                    let _ = FillRect(hdc, &rc, bg);
+                    let _ = DeleteObject(HGDIOBJ(bg.0));
+                    let mut font = MENU_FONT.lock().unwrap_or_else(|e| e.into_inner());
+                    if *font == 0 {
+                        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(h) as f32 / 96.0;
+                        let fh = -(12.0 * scale).round() as i32;
+                        let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+                        let f = CreateFontW(
+                            fh, 0, 0, 0, 400, 0, 0, 0,
+                            1,  // DEFAULT_CHARSET
+                            0, 0,
+                            4,  // ANTIALIASED_QUALITY
+                            0,
+                            PCWSTR(face.as_ptr()),
+                        );
+                        *font = f.0 as usize;
+                    }
+                    let old = SelectObject(hdc, HGDIOBJ(*font as *mut _));
+                    let _ = SetBkMode(hdc, TRANSPARENT);
+                    for (i, item) in ctx.items.iter().enumerate() {
+                        let top = ctx.tops[i];
+                        let hgt = ctx.heights[i];
+                        if item.id == 0 {
+                            // 分隔线
+                            let ln = CreateSolidBrush(COLORREF(0x00E0_E0_E0));
+                            let r = RECT { left: 8, top: top + hgt / 2, right: ctx.w - 8, bottom: top + hgt / 2 + 1 };
+                            let _ = FillRect(hdc, &r, ln);
+                            let _ = DeleteObject(HGDIOBJ(ln.0));
+                            continue;
+                        }
+                        let hover = ctx.hover == i as i32 && item.enabled;
+                        if hover {
+                            let hl = CreateSolidBrush(COLORREF(0x00D7_78_00)); // RGB(0,120,215)
+                            let r = RECT { left: 1, top, right: ctx.w - 1, bottom: top + hgt };
+                            let _ = FillRect(hdc, &r, hl);
+                            let _ = DeleteObject(HGDIOBJ(hl.0));
+                        }
+                        let color = if !item.enabled {
+                            COLORREF(0x00A0_A0_A0)
+                        } else if hover {
+                            COLORREF(0x00FF_FF_FF)
+                        } else {
+                            COLORREF(0x00_00_00_00)
+                        };
+                        let old_c = SetTextColor(hdc, color);
+                        let mut w: Vec<u16> = item.label.encode_utf16().collect();
+                        let mut tr = RECT { left: 16, top, right: ctx.w - 8, bottom: top + hgt };
+                        let _ = DrawTextW(
+                            hdc,
+                            &mut w,
+                            &mut tr as *mut RECT as *mut _,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
+                        let _ = SetTextColor(hdc, old_c);
+                    }
+                    let _ = SelectObject(hdc, old);
+                }
+                let _ = EndPaint(h, &ps);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(h, m, w, l),
+        }
+    }
+}
+
+/// 候选窗右键：命中候选 → 自绘免激活菜单（向前移/向后移/移到最前/
+/// 移到最后/加词/删词/解锁固定位）。语义与 Ctrl+数字（置顶）/
+/// Ctrl+Shift+数字（软删）/{加词}（加词窗）一致，全部只写「用户调整」。
+/// 动作走同步管道 op=cand_menu（server 写 用户调整.txt 并返回新 state）；
+/// 重绘用滚轮缩放同款锁外 show——wndproc 里不碰 update_ui/run_session
+///（TSF 编辑会话不得在窗口过程里重入）。菜单本体在独立 popup 窗
+///（本函数立即返回，生命周期由 menu_wndproc/menu_finish 管理）。
 unsafe fn cand_menu_popup(lparam: LPARAM) {
     unsafe {
         // 1) 命中候选（客户端像素 → 内容逻辑坐标）
@@ -121,7 +477,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
                         rects
                             .iter()
                             .enumerate()
-                            .min_by(|(_, a), (_, b)| {
+                            .min_by(|(_, a, ), (_, b)| {
                                 let da = ((lx - (a.0 + a.2) / 2.0).abs())
                                     .max((ly - (a.1 + a.3) / 2.0).abs());
                                 let db = ((lx - (b.0 + b.2) / 2.0).abs())
@@ -141,40 +497,36 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             return;
         }
         let (n, len) = (idx + 1, cands.len());
-        crate::tsf::trace(&format!("cw2: rdown 命中 #{n}「{text}」菜单弹出"));
-        // 2) 菜单（六项；首尾移动到边界时灰化）
-        let m = cand2_CreatePopupMenu();
-        if m == 0 {
-            return;
+        crate::tsf::trace(&format!("cw2: rdown 命中 #{n}「{text}」菜单弹出（免激活）"));
+        // 已有菜单开着：先收（连点右键换候选）
+        if MENU_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            menu_finish(0);
         }
-        let mut append = |label: &str, id: usize, gray: bool| {
-            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            cand2_AppendMenuW(
-                m,
-                MF_STRING | if gray { MF_GRAYED } else { 0 },
-                id,
-                w.as_ptr(),
-            );
-        };
-        append("向前移", 1, n <= 1);
-        append("向后移", 2, n >= len);
-        append("移到最前", 3, false);
-        append("移到最后", 4, n >= len);
-        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-        append("加词", 5, false);
-        append("删词", 6, false);
-        cand2_AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-        // 【2026-10-07 用户拍板·恢复】此项保留（误删教训：用户要的是
-        //「用户调整文件里不出现 {置顶} 行=纯排序」，不是砍交互入口；
-        // 文件侧已由 set_order 归一保证）。未固定时灰化展示。
+        // 2) 菜单项（与旧 TrackPopupMenu 版完全同构）
         let pinned_now = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        append("解锁固定位", 7, !pinned_now);
-        // 3) owner=自建 0×0 顶层 TOOLWINDOW（langbar QQ 实证路线：
-        // 子窗 owner 收不了前台，菜单秒弹秒关）
+        let mut items: Vec<MenuItem> = vec![
+            MenuItem { label: "向前移".into(), id: 1, enabled: n > 1 },
+            MenuItem { label: "向后移".into(), id: 2, enabled: n < len },
+            MenuItem { label: "移到最前".into(), id: 3, enabled: true },
+            MenuItem { label: "移到最后".into(), id: 4, enabled: n < len },
+            MenuItem { label: "".into(), id: 0, enabled: false },
+            MenuItem { label: "加词".into(), id: 5, enabled: true },
+            MenuItem { label: "删词".into(), id: 6, enabled: true },
+            MenuItem { label: "".into(), id: 0, enabled: false },
+            MenuItem { label: "解锁固定位".into(), id: 7, enabled: pinned_now },
+        ];
+        // 3) 免激活 popup 窗（类名沿用 HUFU_C2_MENU：焦点豁免检查/自动
+        // 测试探窗兼容）。不注册焦点、不 SetForegroundWindow——宿主前
+        // 台不动=组段不死的全部秘密。
         let cls: Vec<u16> = "HUFU_C2_MENU\0".encode_utf16().collect();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(def_wndproc),
+            lpfnWndProc: Some(menu_wndproc),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
             lpszClassName: PCWSTR(cls.as_ptr()),
             ..Default::default()
         };
@@ -182,95 +534,118 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         let mut cpt = POINT::default();
         let _ = GetCursorPos(&mut cpt);
         let nm: Vec<u16> = "HuFu 候选菜单\0".encode_utf16().collect();
-        let owner = match CreateWindowExW(
-            WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0),
+        let hwnd = match CreateWindowExW(
+            WINDOW_EX_STYLE(
+                WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0,
+            ),
             PCWSTR(cls.as_ptr()),
             PCWSTR(nm.as_ptr()),
             WS_POPUP,
             cpt.x,
             cpt.y,
-            0,
-            0,
+            10,
+            10,
             HWND(std::ptr::null_mut()),
             None,
             None,
             None,
         ) {
             Ok(h) if !h.is_invalid() => h,
-            _ => {
-                cand2_DestroyMenu(m);
-                return;
-            }
+            _ => return,
         };
-        let _ = SetForegroundWindow(owner);
-        // 免死金牌开牌：菜单期长效（10s 上限，实际由收场撤）
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        // 4) 尺寸：DPI 缩放 + 文本测量
+        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0;
+        let item_h = (26.0 * scale).round() as i32;
+        let sep_h = (7.0 * scale).round() as i32;
+        let v_pad = (3.0 * scale).round() as i32;
+        let h_pad = (16.0 * scale).round() as i32;
+        let mut font = MENU_FONT.lock().unwrap_or_else(|e| e.into_inner());
+        if *font == 0 {
+            let fh = -(12.0 * scale).round() as i32;
+            let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+            let f = CreateFontW(
+                fh, 0, 0, 0, 400, 0, 0, 0,
+                1,  // DEFAULT_CHARSET
+                0, 0,
+                4,  // ANTIALIASED_QUALITY
+                0,
+                PCWSTR(face.as_ptr()),
+            );
+            *font = f.0 as usize;
+        }
+        let hdc = GetDC(hwnd);
+        let old = SelectObject(hdc, HGDIOBJ(*font as *mut _));
+        let mut text_w = 60i32;
+        for it in &items {
+            if it.id == 0 {
+                continue;
+            }
+            let w: Vec<u16> = it.label.encode_utf16().collect();
+            let mut sz = SIZE::default();
+            if GetTextExtentPoint32W(hdc, &w, &mut sz).as_bool() {
+                text_w = text_w.max(sz.cx);
+            }
+        }
+        let _ = SelectObject(hdc, old);
+        let _ = ReleaseDC(hwnd, hdc);
+        let menu_w = text_w + h_pad * 2;
+        let mut tops = Vec::new();
+        let mut heights = Vec::new();
+        let mut y = v_pad;
+        for it in &items {
+            let hgt = if it.id == 0 { sep_h } else { item_h };
+            tops.push(y);
+            heights.push(hgt);
+            y += hgt;
+        }
+        let menu_h = y + v_pad;
+        // 工作区边界钳制
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let x = cpt.x.min(wa.right - menu_w).max(wa.left);
+        let y_pos = cpt.y.min(wa.bottom - menu_h).max(wa.top);
+        // SWP_NOACTIVATE 铁律：缺它 SetWindowPos 会激活菜单窗（前台+
+        // 焦点全夺→宿主杀组段——诊断实锤 fg/win32focus 都变成菜单窗）。
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y_pos,
+            menu_w,
+            menu_h,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        // 5) 显示（不激活）+ 捕获（模态感：窗外点击到本窗）
+        //    绝不 SetForegroundWindow——那正是杀组段的元凶。
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetCapture(hwnd);
+        // 首个 hover：默认第一可选项（键盘 Enter 直选）
+        let first_ok = items.iter().position(|i| i.enabled).map(|i| i as i32).unwrap_or(-1);
+        *MENU_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(MenuCtx {
+            hwnd: hwnd.0 as isize,
+            swallow_rup: true,
+            items,
+            tops,
+            heights,
+            hover: first_ok,
+            w: menu_w,
+            h: menu_h,
+            text,
+            raw,
+            idx,
+            n,
+        });
+        // 免死金牌开牌：菜单期长效（无焦点抢夺后理论上无触发，防御保留）
         CAND_MENU_UNTIL_MS.store(
             menu_now_ms() + 10_000,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let sel_id = cand2_TrackPopupMenu(
-            m,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cpt.x,
-            cpt.y,
-            0,
-            owner.0 as isize,
-            std::ptr::null(),
-        );
-        // 【免死金牌·宽限撤牌 2026-10-07·三修】菜单收场后焦点回流
-        // 事件串（回宿主的 OnSetFocus/docmgr 切换）仍在队列里——立即
-        // 撤牌=回流被正常处理=清场收窗「一点就没」。宽限 1200ms 整口
-        // 吞掉回流串+用户连点节奏；动作只落数据+武装轮询，不受影响。
-        CAND_MENU_UNTIL_MS.store(
-            menu_now_ms() + 1_200,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        // KB135788：菜单系统状态机复位（缺它二次失灵）
-        cand2_PostMessageW(owner.0 as isize, 0x0000, 0, 0);
-        let _ = DestroyWindow(owner);
-        cand2_DestroyMenu(m);
-        if sel_id == 0 {
-            return;
-        }
-        crate::tsf::trace(&format!("cw2: 菜单 sel={sel_id}（{text}）"));
-        // 4) 动作
-        if sel_id == 7 {
-            // 【2026-10-06 用户拍板】菜单尾项=解锁固定位（原中键方案
-            // 退役）：清固定位与拖拽钉住残留——候选窗回光标处跟随。
-            let mut pinned = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner());
-            if pinned.is_some() {
-                *pinned = None;
-                drop(pinned);
-                *CAND_DROP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *CAND_UNSTICK.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                crate::tsf::diag_note("cw2 pin 菜单解除（回跟随光标）");
-            }
-            return;
-        }
-        if sel_id == 5 {
-            crate::addword::open_prefilled(&text, &raw, &n.to_string());
-            return;
-        }
-        let action = match sel_id {
-            1 => "fwd",
-            2 => "back",
-            3 => "front",
-            4 => "last",
-            6 => "del",
-            _ => return,
-        };
-        if let Some(r) = crate::ipc::call(&serde_json::json!({
-            "op": "cand_menu", "action": action, "page_index": idx, "text": text,
-            // 【T8 2026-10-07】携带显示时的 raw——菜单抢前台→宿主失活→空码
-            // 查询顶掉会话候选时，server 按码重建列表兜底定位。
-            "raw": raw
-        })) {
-            if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                cand_menu_refresh(&r);
-            } else {
-                crate::tsf::trace("cw2: cand_menu 响应未生效（候选不在页/未知动作）");
-            }
-        }
     }
 }
 
@@ -320,11 +695,20 @@ unsafe fn cand_menu_refresh(resp: &Value) {
                 (g.cand2.take(), g.skin.clone(), g.caret)
             };
             if let Some(c) = cand2.as_mut() {
-                // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】调频帧
+                // 【T8 用户铁律·框内不画编码 2026-10-07 终局】调频帧
                 // 与打字帧同一渲染铁律：只画候选，编码恒不画（宽度恒
                 // 定=框无从挪动；两帧同长相=无翻脸可言）。真 raw 仍写
                 // last_show（后续 ipc 用）。
-                c.show(&cands, "", &skin, caret.as_ref(), sel);
+                // 【内联关闭放行 2026-10-11 用户实锤】调频刷新帧编码行
+                // 同过 inline_preedit 开关——关着显示真实编码（此前硬
+                // 编码空串=「打字帧有编码、调频帧没了」的翻脸来源）。
+                let inline_on = skin
+                    .pointer("/skin/layout/inline_preedit")
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let raw_disp = if !inline_on { raw.clone() } else { String::new() };
+                c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
                 c.snap_anims();
             }
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,14 +724,107 @@ unsafe fn cand_menu_refresh(resp: &Value) {
     }
 }
 
-/// 菜单 owner 宿主窗过程（消息路由由 TrackPopupMenu 模态循环自理）。
-unsafe extern "system" fn def_wndproc(
-    h: HWND,
-    m: u32,
-    w: WPARAM,
-    l: LPARAM,
-) -> LRESULT {
-    unsafe { DefWindowProcW(h, m, w, l) }
+/// 【按住Ctrl调频 2026-11】调频/删词动作后的重绘（cand_menu_refresh
+/// 同款三步：last_show/cand_sig_last 同步 + 手动同参 show + 归还
+/// cand2），三点差异：
+/// ① 不 snap_anims——尺寸可能变化（删词少一行），走 size_anim 拉伸；
+/// ② swap=Some((i,j)) 臂对调滑动（横排 x 插值/竖排双格强调底），
+///   del=Some((i,旧列表)) 臂删除塌缩（动效期 show 渲染旧列表）；
+///   时长按动效速度滑条缩放（0=瞬跳不臂）；
+/// ③ 窗口已在模态（set_freq_view 先行）——show 自动带提示行/强调色。
+pub(crate) unsafe fn freq_result_refresh(
+    state: &Value,
+    swap: Option<(usize, usize)>,
+    del_old: Option<(usize, &[(String, String)])>,
+) {
+    unsafe {
+        let Some(state) = state.get("state") else {
+            return;
+        };
+        let cands: Vec<(String, String)> = state
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|c| {
+                        (
+                            c.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            c.get("comment").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw = state
+            .get("raw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        crate::tsf::trace(&format!(
+            "cw2: freq_refresh cands={} raw={raw:?} sel={sel} swap={swap:?} del={}",
+            cands.len(),
+            del_old.is_some()
+        ));
+        if let Some(gsh) = crate::tsf::G_SHARED.get() {
+            let shared = gsh.0.clone();
+            let (mut cand2, skin, caret, fv) = {
+                let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                // 新序写 last_show（110ms 轮询签名同步防打架——与
+                // cand_menu_refresh 同款铁律）；动效旧序只活在窗口侧。
+                g.last_show = Some((cands.clone(), raw.clone(), sel));
+                g.cand_sig_last = crate::tsf::state_sig(state);
+                (
+                    g.cand2.take(),
+                    g.skin.clone(),
+                    g.caret,
+                    (
+                        g.freq_active,
+                        g.freq_delete,
+                        g.freq_pick,
+                        g.freq_pick_text.clone(),
+                    ),
+                )
+            };
+            if let Some(c) = cand2.as_mut() {
+                // 先同步模态视图（拾起环跟到新槽位/提示行换词），再臂
+                // 动效、show——单次渲染出全效果
+                c.set_freq_view(fv.0, fv.1, fv.2, &fv.3);
+                let spd = c.anim_spd.get().max(0.0);
+                let now = std::time::Instant::now();
+                if spd > 0.01 {
+                    if let Some((i, j)) = swap {
+                        let dur = (170.0 / spd) as u32;
+                        c.freq_swap.set(Some((i, j, now, dur.max(40))));
+                    }
+                    if let Some((i, old)) = del_old {
+                        let dur = (160.0 / spd) as u32;
+                        *c.freq_del.borrow_mut() = Some((i, old.to_vec(), now, dur.max(40)));
+                    }
+                }
+                // 模态帧渲染口径与打字帧一致：inline 开=真编码不画
+                //（提示行占编码位，模态由 freq view 提供）。
+                let inline_on = skin
+                    .pointer("/skin/layout/inline_preedit")
+                    .or_else(|| skin.pointer("/layout/inline_preedit"))
+                    .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let raw_disp = if !inline_on { raw.clone() } else { String::new() };
+                c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+                anim_tick_arm(c.hwnd);
+            }
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match (g.cand2.take(), cand2) {
+                (None, mine) => g.cand2 = mine,
+                (Some(newer), Some(mut mine)) => {
+                    mine.hide();
+                    g.cand2 = Some(newer);
+                }
+                (Some(newer), None) => g.cand2 = Some(newer),
+            }
+        }
+    }
 }
 
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
@@ -435,6 +912,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
     // 消息路径（非 TSF 焦点回调），无死锁面。
     match msg {
+        0x21 => {
+            // WM_MOUSEACTIVATE → MA_NOACTIVATE(3)：显式挡激活链。
+            // 【候选窗焦点矫正 2026-10-12】WS_EX_NOACTIVATE 只挡"前台
+            // 激活"，同前台线程的点击仍可能把 Win32 焦点转给本窗
+            // （trace 实录 hwndFocus=HuFuCandWin2 → 宿主失焦杀组段+
+            // 锚链误判窗外垃圾=候选飘）。显式返回 MA_NOACTIVATE：不
+            // 激活、鼠标消息照发（点击/拖拽不受影响）。
+            return LRESULT(3);
+        }
         0x201 => {
             // WM_LBUTTONDOWN：记录按下起点（死区内不拖）并捕获鼠标
             crate::tsf::trace("cw2: ldown 到达");
@@ -507,7 +993,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         y,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             }
@@ -561,6 +1047,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     crate::tsf::diag_note(&format!("cw2 pin 拖动即固定 ({},{})", wr.left, wr.top));
                 } else {
                     crate::tsf::trace("cw2: lup 未拖动（死区内）");
+                    // 【交互收场自愈 2026-10-12】死区纯单击（用户「不慎
+                    // 点中候选框」）：置交互宽限+挂起标记，下一键入口做
+                    // 焦点自愈+锚点补探（BUG①：点击后空格/选重上屏失效；
+                    // BUG③ 同根光标丢失）。拖动分支不调——拖动即固定语
+                    // 义下窗口位置本就脱离光标。
+                    crate::tsf::cand_interact_note();
                 }
             }
             *CAND_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -572,6 +1064,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 数字/Ctrl+Shift+数字/{加词} 同语义，全部只写「用户调整」）。
             // 旧「右键=解锁固定位」移到中键（0x207）。未命中候选=无菜单。
             crate::tsf::trace("cw2: rdown（调频菜单）");
+            // 【组段复活·菜单开时武装 2026-10-12】菜单 owner 抢前台瞬间
+            // 宿主就杀组段（虚线立刻没了——用户规格「不退出编码状态」）。
+            // 此刻即武装交互收场标记：poll（≤140ms，模态循环也泵定时
+            // 器）马上复活组段——菜单开着虚线也回来；收场 note 再武装
+            // 一次兜底（幂等：活组段重发同文本=空操作）。
+            crate::tsf::cand_interact_note();
             if !crate::tsf::addword_tl_thread() {
                 unsafe { cand_menu_popup(lparam) };
             }
@@ -731,6 +1229,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                     // 【六十修】看门狗随藏同杀
                     let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                    // 【SSF】帧钟随藏同杀
+                    let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
                     unsafe { rawinput_listen(hwnd, false) };
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
@@ -776,6 +1276,8 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                 // 【六十修】看门狗随藏同杀
                 let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
+                // 【SSF】帧钟随藏同杀
+                let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
                 unsafe { rawinput_listen(hwnd, false) };
                 // 【贴图挂件 2026-10-02】候选窗收 → 兄弟贴图窗随收
                 crate::overlaywin::hide_for(hwnd);
@@ -835,6 +1337,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 易主即冲销+收窗（见 ime_watchdog_tick 注释）。
             if id == IME_WATCHDOG_TIMER_ID {
                 unsafe { ime_watchdog_tick(hwnd) };
+                return LRESULT(0);
+            }
+            // 【SSF M4】APNG 帧推进（0x4945）：变间隔常驻钟，与
+            // FADE_TIMER（几何动效）完全独立。
+            if id == crate::ssfwin::SSF_TIMER_ID {
+                unsafe { ssf_frame_tick(hwnd) };
                 return LRESULT(0);
             }
         }
@@ -950,7 +1458,474 @@ pub(crate) fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
         .unwrap_or(default as f64) as f32
 }
 
+// ══════════ 【SSF M2/M3/M4】.ssf 位图皮肤运行态与投影 ══════════
+// 设计：`.refs/_dll接入方案.md`（模块=platform/windows/hufu-tsf/src/
+// ssfwin.rs，虎娘逐行移植）。接入三原则：
+// ① JSON 矢量路径零改动——所有分叉 `ssf.is_some()` 套壳【回归红线】；
+// ② 等比折算制——ssf 画布量 ×scale（=用户字号÷皮肤字号）进现有
+//   96-DPI 逻辑域，动效/SWP/裁剪/NCHITTEST 下游全部无感；
+// ③ 皮肤错误绝不弄坏输入——任何失败静默回退矢量渲染。
+
+/// .ssf 运行态（窗口级，跨帧）：解码帧流（进程缓存 Arc）+ 帧钟 + 每窗
+/// D2D 设备位图缓存（帧号没变零重建）+ 换装键。
+pub(crate) struct SsfRuntime {
+    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
+    pub(crate) clock: crate::ssfwin::SsfFrameClock,
+    pub(crate) device: Option<crate::ssfwin::SsfDeviceBitmap>,
+    /// 【SSF 缩小高清化 2026-10-18】Profile E 预过滤 LRU（帧×尺寸，
+    /// 16MB/8 条——虎娘 skinRasters_ 同款）。
+    pub(crate) rasters: crate::ssfwin::SsfRasterCache,
+    /// 键 =（fp, 变体图名）：变体切换 / server 侧重解包（fp 变）→
+    /// 帧钟重播 + 设备位图置空（虎娘 rendererDirty_ 同款）。
+    pub(crate) key: (String, String),
+}
+
+/// 测量/渲染帧快照（spec 随帧 clone，重 mutable 状态留 self.ssf）。
+pub(crate) struct SsfFrame {
+    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
+    pub(crate) layout: crate::ssfwin::SsfVariantLayout,
+    pub(crate) scale: f32,
+}
+
+/// 【霞鹜默认 2026-10-16】空 font_face（官方皮肤全空/SSF 未指定）的
+/// 缺省候选字体：系统装了霞鹜就用（常见版本名精确探测），未装回退
+/// 雅黑——用户拍板「所有自带默认皮肤都要用霞鹜，装了默认、没装回退
+/// 微软雅黑」。进程级探测一次（OnceLock 缓存）。
+static DEFAULT_CAND_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn probe_default_cand_font(dwrite: &IDWriteFactory) -> String {
+    /// 常见霞鹜版本名（中文名在前——FindFamilyName 精确匹配）
+    const CANDS: &[&str] = &[
+        "霞鹜文楷 GB 屏幕阅读版",
+        "霞鹜文楷 GB",
+        "霞鹜文楷",
+        "LXGW WenKai GB Screen",
+        "LXGW WenKai GB",
+        "LXGW WenKai",
+        "LXGW WenKai Lite",
+    ];
+    unsafe {
+        let mut col: Option<IDWriteFontCollection> = None;
+        if dwrite
+            .GetSystemFontCollection(&mut col, false)
+            .is_err()
+        {
+            eprintln!("cw2: 默认字体探测 GetSystemFontCollection 失败 → 雅黑");
+            return "Microsoft YaHei UI".into();
+        }
+        let Some(col) = col else {
+            eprintln!("cw2: 默认字体探测系统集为空 → 雅黑");
+            return "Microsoft YaHei UI".into();
+        };
+        for fam in CANDS {
+            let mut w: Vec<u16> = fam.encode_utf16().collect();
+            w.push(0);
+            let mut idx = 0u32;
+            let mut ex = windows::Win32::Foundation::BOOL::default();
+            if col.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut ex).is_ok()
+                && ex.as_bool()
+            {
+                eprintln!("cw2: 默认字体探测命中「{fam}」");
+                return fam.to_string();
+            }
+        }
+        eprintln!("cw2: 默认字体探测未命中霞鹜 → 雅黑");
+    }
+    "Microsoft YaHei UI".into()
+}
+
+/// 把 ssf display/变体折算进现有 layout/colors/material 键（注入
+/// `/skin/...` 包装层——layout_f/color_f 优先查包装层，顶层旧值自然
+/// 被盖过，两种入参形态都成立）。下游读皮代码零改动【回归红线】。
+/// 边距对称化说明：引擎每轴只有单一边距值，取 (left+right)/2 /
+/// (top+bottom)/2——宽度/高度总量精确，轴内不对称以中值近似（实测
+/// 真皮 pinyin/zhongwen_marge 左右相等，无损）。
+pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
+    fn put(
+        map: &mut serde_json::Map<String, Value>,
+        section: &str,
+        key: &str,
+        val: Value,
+    ) {
+        map.entry(section.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .map(|m| m.insert(key.to_string(), val));
+    }
+    let mut v = skin.clone();
+    let d = &f.spec.display;
+    let s = f.scale;
+    let hex = |c: [u8; 4]| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
+    let lay = &f.layout;
+    // 【SSF insets 投影 2026-10-15】margin_x/y 锚设计框（此前 max(code,cand)
+    // 口径把文字顶到编码区顶——元气虎娘 58.4 vs 设计 2.6 实锤）：
+    // - margin_y = candidates.top×scale（竖排首行锚=设计框顶；JSON 布局
+    //   y0=rm_y 自动对齐）
+    // - margin_x = min(candidates.left, candidates.right)×scale（左右共用
+    //   一键，取 min 保两边不出框；注释列右对齐随之约束）
+    let mx = (lay.candidates.left.max(0).min(lay.candidates.right.max(0)) as f32) * s;
+    let my = (lay.candidates.top.max(0) as f32) * s;
+    // 确保 /skin 包装层存在（顶层直挂形态注入后同样优先命中）
+    let is_skin_obj = v.get("skin").map(|x| x.is_object()).unwrap_or(false);
+    if !is_skin_obj {
+        if let Some(map) = v.as_object_mut() {
+            map.insert("skin".into(), Value::Object(serde_json::Map::new()));
+        }
+    }
+    let Some(obj) = v.get_mut("skin").and_then(|x| x.as_object_mut()) else {
+        return v; // skin 字段被占为非对象（畸形数据）：放弃投影，走矢量
+    };
+    // 字体/间距（画布 ×scale；ssf 缺省 0——不叠引擎默认档）
+    // 【独立皮肤设置 2026-10-16】字体用户覆盖优先：payload layout.
+    // font_face（server 注入 overrides）> 皮肤 display.font_ch。
+    {
+        let ff_override = skin
+            .pointer("/skin/layout/font_face")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("font_face")))
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match ff_override {
+            Some(ff) => put(obj, "layout", "font_face", Value::String(ff)),
+            None => {
+                // 【霞鹜默认 2026-10-16】雅黑缺省（搜狗皮肤惯例值=没写
+                // 字体）视为空——走 DLL 空默认「霞鹜优先/雅黑兜底」。
+                let fc = d.font_ch.trim();
+                let is_yh = fc.eq_ignore_ascii_case("microsoft yahei ui") || fc == "微软雅黑";
+                if !fc.is_empty() && !is_yh {
+                    put(obj, "layout", "font_face", Value::String(fc.to_string()));
+                }
+            }
+        }
+    }
+    put(obj, "layout", "line_spacing", serde_json::json!(d.line_spacing * s));
+    put(obj, "layout", "candidate_spacing", serde_json::json!(d.candidate_spacing * s));
+    // 【show_index 透传 2026-10-16】server 按 overrides 注入的原
+    // layout.show_index（三态：None=不注入跟随全局、false=关）必须透
+    // 传进投影后的 /skin/layout——下面渲染的序号开关读取路径之一；
+    // 不透传则投影重建 layout 时丢键=「显示序号开关无效」。
+    {
+        let si = skin
+            .pointer("/skin/layout/show_index")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("show_index")))
+            .and_then(|x| x.as_bool());
+        if let Some(si) = si {
+            put(obj, "layout", "show_index", serde_json::json!(si));
+        }
+    }
+    // 【SSF 圆角 2026-10-16】位图自带形状不受程序化圆角影响，但用户可
+    // 要窗口级圆角（设置页 round_corner）——payload layout.corner_radius
+    // 覆盖优先，否则 0（下方渲染按 0 跳过裁剪）。
+    {
+        let rc_override = skin
+            .pointer("/skin/layout/corner_radius")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("corner_radius")))
+            .and_then(|x| x.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(0.0);
+        put(obj, "layout", "corner_radius", serde_json::json!(rc_override));
+    }
+    put(obj, "layout", "margin_x", serde_json::json!(mx));
+    put(obj, "layout", "margin_y", serde_json::json!(my));
+    // 圆角/阴影/边框：位图自带（投影/圆角已烧进图里，程序化再叠=双重）
+    //（corner_radius 例外：用户 override 时上面已注入，渲染做窗口级
+    // 圆角几何裁剪——位图四角被裁透明）
+    put(obj, "layout", "hilite_padding", serde_json::json!(0.0));
+    put(obj, "layout", "shadow_radius", serde_json::json!(0.0));
+    put(obj, "layout", "border_width", serde_json::json!(0.0));
+    // 【mark 条禁用 2026-10-16】SSF payload 的 layout.mark_text（如"·"）
+    // 会让渲染画「高亮胶囊左缘细竖条」——但 SSF 投影已把 hilite_padding
+    // 压 0，竖条退化成 2px 竖线贴在胶囊左缘；皮肤位图自带高亮表达
+    //（first_color 文字色），程序 mark 条=双重。显式清空禁用。
+    put(obj, "layout", "mark_text", serde_json::json!(""));
+    // 高亮：ssf 的高亮表达=first_color 文字色（虎娘口径），胶囊与
+    // 程序化底透明化（hilite_on=false 会连文字色一起退化成普通色，
+    // 不能用）；编码行底不画（皮肤自带）。
+    put(obj, "colors", "hilited_candidate_back_color", serde_json::json!("#00000000"));
+    put(obj, "material", "hilite_alpha", serde_json::json!(0.0));
+    put(obj, "material", "border_alpha", serde_json::json!(0.0));
+    put(obj, "colors", "preedit_back_color", serde_json::json!("#00000000"));
+    put(obj, "colors", "back_color", serde_json::json!("#00000000"));
+    put(obj, "colors", "candidate_text_color", serde_json::json!(hex(d.text_color)));
+    put(obj, "colors", "label_color", serde_json::json!(hex(d.text_color)));
+    put(obj, "colors", "comment_text_color", serde_json::json!(hex(d.annotation_color)));
+    put(obj, "colors", "hilited_candidate_text_color", serde_json::json!(hex(d.first_color)));
+    put(obj, "colors", "hilited_candidate_label_color", serde_json::json!(hex(d.first_color)));
+    put(obj, "colors", "hilited_comment_text_color", serde_json::json!(hex(d.annotation_color)));
+    v
+}
+
+impl CandidateWindowV2 {
+    /// .ssf 形态检测 → 解析 → 变体选择 → 取图（进程缓存）→ 运行态更新。
+    /// 非 ssf / 不可用 / 载图失败：清运行态返回 None，本帧回退 JSON
+    /// 矢量渲染（降级矩阵 §4.6——皮肤错误绝不弄坏输入）。
+    pub(crate) fn ssf_prepare(
+        &mut self,
+        skin: &Value,
+        vertical: bool,
+        has_code: bool,
+        has_candidates: bool,
+    ) -> Option<SsfFrame> {
+        if !crate::ssfwin::is_ssf(skin) {
+            let had = self.ssf.borrow().is_some();
+            if had {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID);
+                }
+                crate::tsf::trace("ssf: 载荷非 ssf 形态 → 切回 JSON 矢量渲染");
+            }
+            *self.ssf.borrow_mut() = None; // 切回 JSON：释放（进程解码缓存留 LRU）
+            return None;
+        }
+        let spec = match crate::ssfwin::SsfSkinSpec::parse(skin) {
+            Some(s) => s,
+            None => {
+                crate::tsf::trace("ssf: 载荷解析失败 → 回退矢量（缺 cache_dir/fp？）");
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
+        let layout = match spec.choose(vertical, has_code, has_candidates) {
+            Some(l) => l.clone(),
+            None => {
+                crate::tsf::trace("ssf: 变体选择失败 → 回退矢量");
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
+        let bitmap = match crate::ssfwin::load_bitmap(&spec.cache_dir, &spec.fp, &layout.image) {
+            Ok(b) => b,
+            Err(e) => {
+                // 同因去重：坏皮每键都会失败，只记一次
+                static LAST_ERR: std::sync::Mutex<(String, String)> =
+                    std::sync::Mutex::new((String::new(), String::new()));
+                let fp_key = skin
+                    .pointer("/skin/fp")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let mut le = LAST_ERR.lock().unwrap_or_else(|p| p.into_inner());
+                if *le != (fp_key.clone(), e.clone()) {
+                    *le = (fp_key, e.clone());
+                    crate::tsf::trace(&format!("ssf: 载图失败回退矢量：{e}"));
+                }
+                *self.ssf.borrow_mut() = None;
+                return None;
+            }
+        };
+        // 等比折算制：scale = 用户字号 ÷ 画布字号（作者画布制，全部
+        // 几何 ×scale 进 96 逻辑域——DWrite 直接按用户字号建字形）
+        let user_pt = layout_f(skin, "font_point", 16.0);
+        let scale = (user_pt / spec.display.font_size.clamp(3.0, 200.0)).clamp(0.02, 8.0);
+        let key = (spec.fp.clone(), layout.image.clone());
+        let mut rt = self.ssf.borrow_mut();
+        let reuse = matches!(rt.as_ref(), Some(r) if r.key == key);
+        if !reuse {
+            // 观测：换装一次一条（键变化才打——每帧静默）
+            crate::tsf::trace(&format!(
+                "ssf: 载入 fp={} 图={} 位图={}x{} 帧={} scale={:.3}",
+                &spec.fp[..spec.fp.len().min(12)],
+                &layout.image,
+                bitmap.width,
+                bitmap.height,
+                bitmap.frames.len(),
+                scale,
+            ));
+            *rt = Some(SsfRuntime {
+                spec: spec.clone(),
+                bitmap: bitmap.clone(),
+                clock: crate::ssfwin::SsfFrameClock::new(),
+                device: None,
+                // 【SSF 缩小高清化 2026-10-18】Profile E 预过滤 LRU（换装
+                // 重建=新皮肤新缓存；键未变时沿用旧缓存，DPI 切换复用）
+                rasters: crate::ssfwin::SsfRasterCache::new(),
+                key,
+            });
+        }
+        Some(SsfFrame {
+            spec,
+            bitmap,
+            layout,
+            scale,
+        })
+    }
+}
+
 // ── 窗口本体 ──
+
+/// 【按住Ctrl调频 2026-11】候选窗模态渲染态（窗口侧快照，RefCell 存储
+/// ——pick_text 携带 String）：
+/// del=删词子模式（Ctrl+Shift 同按）、pick=拾起的页内下标、pick_text=
+/// 拾起词文本（提示行文案）、t0=进入时刻、pick_at=拾起时刻（脉冲基准）。
+#[derive(Clone, PartialEq)]
+pub(crate) struct FreqView {
+    pub(crate) del: bool,
+    pub(crate) pick: Option<usize>,
+    pub(crate) pick_text: String,
+    pub(crate) t0: std::time::Instant,
+    pub(crate) pick_at: Option<std::time::Instant>,
+}
+
+/// 【按住Ctrl调频 2026-11】模态提示行文案（占编码行位置渲染；模态期
+/// 引擎编码恒不画——T8 铁律不破，提示是模式文案非编码）。序号显示与
+/// 候选标签同口径（1 基 i+1）。
+pub(crate) fn freq_hint_text(fv: &FreqView) -> String {
+    if fv.del {
+        "✕ 删词：按数字删除候选，松开 Ctrl 结束".to_string()
+    } else {
+        match fv.pick {
+            Some(i) => {
+                format!("⇄ 已选 {}「{}」→ 按目标数字对调（同号取消）", i + 1, fv.pick_text)
+            }
+            None => "⇄ 调频：按数字选词，再按数字对调（松开 Ctrl 结束）".to_string(),
+        }
+    }
+}
+
+/// 【按住Ctrl调频·竖排定宽 2026-11】紧凑版提示：竖排定宽皮肤
+///（layout.width>0）不随提示行加宽，全量文案装不下时降级到紧凑版。
+fn freq_hint_compact(fv: &FreqView) -> String {
+    if fv.del {
+        "✕ 删词：按数字删除".to_string()
+    } else {
+        match fv.pick {
+            Some(i) => format!("⇄ 已选 {}「{}」→ 数字对调", i + 1, fv.pick_text),
+            None => "⇄ 调频：数字选词→对调".to_string(),
+        }
+    }
+}
+
+/// 【按住Ctrl调频·提示行自适应 2026-11】按可用宽选文案：全量 → 紧凑
+/// → 紧凑版尾部 … 截断（单行不换行不裁切——竖排定宽皮肤提示「只显
+/// 示一部分」的根治）。测量与 show 主测量同口径（CreateTextLayout
+/// 实宽；tf 缺失退紧凑版不截断）。
+fn freq_hint_fit(
+    dwrite: &Option<IDWriteFactory>,
+    tf: &Option<IDWriteTextFormat>,
+    fv: &FreqView,
+    max_w: f32,
+) -> String {
+    let full = freq_hint_text(fv);
+    let compact = freq_hint_compact(fv);
+    let w = |s: &str| -> Option<f32> {
+        let (d, fmt) = (dwrite.as_ref()?, tf.as_ref()?);
+        let ws: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let l = d.CreateTextLayout(&ws, fmt, 4096.0, 100.0).ok()?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            l.GetMetrics(&mut m).ok()?;
+            Some(m.width.ceil())
+        }
+    };
+    if w(&full).map_or(true, |x| x <= max_w) {
+        return full;
+    }
+    if w(&compact).map_or(true, |x| x <= max_w) {
+        return compact;
+    }
+    let mut out = compact;
+    loop {
+        if out.is_empty() {
+            return String::new();
+        }
+        out.pop();
+        let mut t = out.clone();
+        t.push('…');
+        if w(&t).map_or(true, |x| x <= max_w) {
+            return t;
+        }
+    }
+}
+
+/// 【按住Ctrl调频·拾起环】拾起候选的强调描边：外扩 (1-pulse)·3px 的
+/// 圆角环由外向内收拢（150ms 脉冲）+ 低透强调底衬。非模态调用无效果
+///（brush=None）。
+unsafe fn freq_pick_ring(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    brush: Option<&ID2D1SolidColorBrush>,
+    pulse: f32,
+    radius: f32,
+) {
+    if let Some(b) = brush {
+        let out = (1.0 - pulse.clamp(0.0, 1.0)) * 3.0;
+        // 低透底衬
+        if let Ok(ub) = ctx.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 0.85,
+                b: 0.5,
+                a: 0.10,
+            },
+            None,
+        ) {
+            let rr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                radiusX: radius * 0.7,
+                radiusY: radius * 0.7,
+            };
+            ctx.FillRoundedRectangle(&rr, &ub);
+        }
+        // 收拢描边环
+        let rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: rect.left - out,
+                top: rect.top - out,
+                right: rect.right + out,
+                bottom: rect.bottom + out,
+            },
+            radiusX: radius + out,
+            radiusY: radius + out,
+        };
+        ctx.DrawRoundedRectangle(&rr, b, 1.8, None);
+    }
+}
+
+/// 【按住Ctrl调频·对调指示】交换双格的强调底衬（交换进行中 1-k 淡出
+/// ——横排滑动/竖排内容互换都由此给出「这两格在动」的读数）。
+unsafe fn freq_swap_tint(
+    ctx: &ID2D1DeviceContext,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    brush: Option<&ID2D1SolidColorBrush>,
+    k: f32,
+) {
+    let _ = brush;
+    let a = (1.0 - k.clamp(0.0, 1.0)) * 0.16;
+    if a <= 0.01 {
+        return;
+    }
+    if let Ok(b) = ctx.CreateSolidColorBrush(
+        &D2D1_COLOR_F {
+            r: 1.0,
+            g: 0.78,
+            b: 0.35,
+            a,
+        },
+        None,
+    ) {
+        let rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
+            radiusX: 5.0,
+            radiusY: 5.0,
+        };
+        ctx.FillRoundedRectangle(&rr, &b);
+    }
+}
 
 pub struct CandidateWindowV2 {
     pub(crate) hwnd: HWND,
@@ -979,6 +1954,10 @@ pub struct CandidateWindowV2 {
     /// 明帧）。拦截：全透明且上一帧有内容 → 跳过本帧 ULW（屏上
     /// 保留上一好帧），等下一帧真内容再上屏。
     ulw_last_nonempty: bool,
+    /// 【SSF 窗口圆角 2026-10-16】本帧圆角半径（逻辑 px；0=直角）。
+    /// 渲染段记入，present_ulw/测试回读的 CPU 像素步消费（GPU 几何
+    /// mask 在本交换链实测无效，走 CPU 后处理）。
+    ulw_round: f32,
     size: (i32, i32),
     /// 粘性定位：最近一次有效锚点坐标。锚点偶发丢失（GetTextExt 在
     /// 异步编辑会话未就绪时失败）时沿用上次位置——绝不能瞬移屏幕中央，
@@ -1179,6 +2158,67 @@ pub struct CandidateWindowV2 {
     /// （展开后保持到组段结束）。抑制期空注释参与布局——列宽自然收起，
     /// 渲染路径零改动；兼防连打期长注释的窗宽抖动。
     pub(crate) comments_expanded: bool,
+    /// 【按住Ctrl调频 2026-11】模态渲染态：Some=调频/删词模态中（提示行
+    /// 占编码行、序号强调色、拾起环在渲染层生效）；None=普通态。
+    pub(crate) freq: std::cell::RefCell<Option<FreqView>>,
+    /// 【按住Ctrl调频】模态配色淡变窗：(目标态, 起始时刻)——进入/退出/
+    /// 子模式切换时重启；渲染层按进度插值强调色（琥珀/红）透明度。
+    pub(crate) freq_fade: std::cell::Cell<Option<(bool, std::time::Instant)>>,
+    /// 【按住Ctrl调频·对调动效】(页内 i, 页内 j, 起始, 时长 ms)：交换后
+    /// 两词从旧槽位滑到新槽位（横排 x / 竖排 y 插值），完成自清。
+    pub(crate) freq_swap: std::cell::Cell<Option<(usize, usize, std::time::Instant, u32)>>,
+    /// 【按住Ctrl调频·删除动效】(页内下标, 旧列表快照, 起始, 时长 ms)：
+    /// 动效期渲染旧列表——被删词红闪+塌缩、后续词滑移补位；完成落真
+    /// 列表自清（show 咽喉处置换）。
+    pub(crate) freq_del: std::cell::RefCell<Option<(usize, Vec<(String, String)>, std::time::Instant, u32)>>,
+    /// 【SSF M2/M3/M4】.ssf 位图皮肤运行态（None=JSON 矢量皮肤——所有
+    /// 分叉以 `ssf.is_some()` 套壳，JSON 路径零改动【回归红线】）。
+    pub(crate) ssf: std::cell::RefCell<Option<SsfRuntime>>,
+}
+
+/// 【SSF 窗口圆角·CPU 后处理 2026-10-16】对 BGRA 预乘像素缓冲的四角
+/// 做圆角透明化：只扫四角 r×r 区（快），圆外像素清 0、1px 边缘按距离
+/// 软化（抗锯齿）。GPU PushLayer 几何 mask 在本交换链实测不生效，故
+/// 挂在 present_ulw / 测试回读的像素搬运步后。r 为物理 px（调用方已乘
+/// dpi）。w/h=内容区（SSF 无程序阴影，恒为整帧）。
+unsafe fn ssf_round_corners_cpu(dst: *mut u8, w: usize, h: usize, r: f32) {
+    if r < 0.5 || w == 0 || h == 0 {
+        return;
+    }
+    let ri = r.min(w as f32 * 0.5).min(h as f32 * 0.5);
+    let n = ri.ceil() as usize; // 角区边长
+    let row = w * 4;
+    // 四角区原点 + 对应圆心（圆心朝窗内）
+    let corners = [
+        (0usize, 0usize, ri, ri),
+        (w - n, 0, (w as f32 - ri), ri),
+        (0, h - n, ri, (h as f32 - ri)),
+        (w - n, h - n, (w as f32 - ri), (h as f32 - ri)),
+    ];
+    for (x0, y0, ccx, ccy) in corners {
+        for y in y0..(y0 + n).min(h) {
+            for x in x0..(x0 + n).min(w) {
+                let dx = x as f32 + 0.5 - ccx;
+                let dy = y as f32 + 0.5 - ccy;
+                let d = (dx * dx + dy * dy).sqrt() - ri;
+                if d > -0.5 {
+                    let k = (0.5 - d).clamp(0.0, 1.0); // d>=0.5→0（全清）
+                    let p = dst.add(y * row + x * 4);
+                    if k <= 0.0 {
+                        *p = 0;
+                        *p.add(1) = 0;
+                        *p.add(2) = 0;
+                        *p.add(3) = 0;
+                    } else {
+                        *p = (*p as f32 * k) as u8;
+                        *p.add(1) = (*p.add(1) as f32 * k) as u8;
+                        *p.add(2) = (*p.add(2) as f32 * k) as u8;
+                        *p.add(3) = (*p.add(3) as f32 * k) as u8;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 【阴影圆角外遮罩】PushLayer：整画布 − 窗口圆角（even-odd 几何组），
@@ -1295,6 +2335,7 @@ fn read_diag_stage() -> u32 {
 /// 真毛玻璃。零抓屏、零模糊算法。染色=GradientColor(0xAABBGGRR)。
 /// 【二十四修·死码清理】capture_screen_rgba（自绘毛玻璃抓屏）随毛玻璃
 /// 整链退役删除——全仓库零调用。
+
 impl CandidateWindowV2 {
     /// 【WPS 抑制放宽探针 2026-09-12】有历史位置即可先按旧位显示
     /// （tsf.rs 首帧抑制判定用——WPS 每键重组段的即时出候选）。
@@ -1414,6 +2455,7 @@ impl CandidateWindowV2 {
                 ulw_w: 0,
                 ulw_h: 0,
                 ulw_last_nonempty: false,
+                ulw_round: 0.0,
                 readback: false,
                 sticky_pos: None,
                 above_flip_last: std::cell::Cell::new(false),
@@ -1460,6 +2502,11 @@ impl CandidateWindowV2 {
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
                 comments_expanded: true,
+                freq: std::cell::RefCell::new(None),
+                freq_fade: std::cell::Cell::new(None),
+                freq_swap: std::cell::Cell::new(None),
+                freq_del: std::cell::RefCell::new(None),
+                ssf: std::cell::RefCell::new(None),
             })
         }
     }
@@ -1582,7 +2629,7 @@ impl CandidateWindowV2 {
                 dcomp: None,
                 target: None,
                 visual: None,
-                dwrite: Some(dwrite),
+                dwrite: Some(dwrite.clone()),
                 dxgi: Some(dxgi_dev.clone()),
                 ulw: true,
                 offscreen: None,
@@ -1592,6 +2639,7 @@ impl CandidateWindowV2 {
                 ulw_w: 0,
                 ulw_h: 0,
                 ulw_last_nonempty: false,
+                ulw_round: 0.0,
                 readback: false,
                 sticky_pos: None,
                 above_flip_last: std::cell::Cell::new(false),
@@ -1638,6 +2686,11 @@ impl CandidateWindowV2 {
                 live_size: std::cell::Cell::new((0, 0)),
                 content_size: std::cell::Cell::new((0, 0)),
                 comments_expanded: true,
+                freq: std::cell::RefCell::new(None),
+                freq_fade: std::cell::Cell::new(None),
+                freq_swap: std::cell::Cell::new(None),
+                freq_del: std::cell::RefCell::new(None),
+                ssf: std::cell::RefCell::new(None),
             })
         }
     }
@@ -1823,6 +2876,16 @@ impl CandidateWindowV2 {
             let row = (w as usize) * 4;
             for r in 0..(h as usize) {
                 std::ptr::copy_nonoverlapping(src.add(r * pitch), dst.add(r * row), row);
+            }
+            // 【SSF 窗口圆角】四角透明化（半径=本帧渲染段记入的逻辑值
+            // ×dpi 物理 px；JSON 皮肤恒 0 直接过）
+            if self.ulw_round > 0.5 {
+                let geo = CAND_HIT_GEO
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|(dpi, _, _, _)| dpi)
+                    .unwrap_or(1.0);
+                ssf_round_corners_cpu(dst, w as usize, h as usize, self.ulw_round * geo);
             }
         }
         let _ = cpu.Unmap();
@@ -2024,6 +3087,68 @@ impl CandidateWindowV2 {
         r
     }
 
+    /// 【按住Ctrl调频 2026-11】TSF 层推送模态逻辑态 → 窗口渲染态快照 +
+    /// 淡变/脉冲起臂。active=模态开关、del=删词子模式、pick/pick_text=
+    /// 拾起的页内下标与词。进/退/子模式切换重启配色淡变窗；拾起变化只
+    /// 起脉冲（不闪配色）。任何变化重臂动效 tick（淡变 120ms / 脉冲
+    /// 150ms 内需要逐帧重绘）。
+    pub fn set_freq_view(&mut self, active: bool, del: bool, pick: Option<usize>, pick_text: &str) {
+        let prev = self.freq.borrow().clone();
+        let now = std::time::Instant::now();
+        let next = if active {
+            let t0 = prev.as_ref().map(|p| p.t0).unwrap_or(now);
+            let pick_changed = prev.as_ref().map(|p| p.pick) != Some(pick);
+            Some(FreqView {
+                del,
+                pick,
+                pick_text: pick_text.to_string(),
+                t0,
+                pick_at: pick_changed.then_some(now),
+            })
+        } else {
+            None
+        };
+        let mode_changed = prev.as_ref().map(|p| p.del) != next.as_ref().map(|p| p.del)
+            || prev.is_some() != next.is_some();
+        let changed = prev != next;
+        if mode_changed {
+            self.freq_fade.set(Some((active, now)));
+        }
+        if changed || mode_changed {
+            // 退场配色淡变 + 行收起/展开（size_anim）+ 拾起脉冲都需要 tick
+            anim_tick_arm(self.hwnd);
+        }
+        *self.freq.borrow_mut() = next;
+    }
+
+    /// 【按住Ctrl调频】模态动效是否在途（tick 保活判据）：淡变窗、对调
+    /// 滑动、删除塌缩、拾起脉冲任一未完即 true。
+    pub(crate) fn freq_anim_busy(&self) -> bool {
+        if let Some((_, t0)) = self.freq_fade.get() {
+            if t0.elapsed().as_millis() < 140 {
+                return true;
+            }
+        }
+        if let Some((_, _, t0, dur)) = self.freq_swap.get() {
+            if t0.elapsed().as_millis() < dur as u128 {
+                return true;
+            }
+        }
+        if let Some((_, _, t0, dur)) = self.freq_del.borrow().as_ref() {
+            if t0.elapsed().as_millis() < *dur as u128 {
+                return true;
+            }
+        }
+        if let Some(fv) = self.freq.borrow().as_ref() {
+            if let Some(pa) = fv.pick_at {
+                if pa.elapsed().as_millis() < 160 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 【右键调频帧专用 2026-10-07·三修】只瞬跳**位置**；**尺寸动画
     /// 照常跑**。二修把尺寸动画也掐了——尺寸终态由动画 tick 负责应用
     ///（连带重渲染圆角位图），掐掉=删词后窗不缩（空白块）+旧位图拉
@@ -2068,7 +3193,71 @@ impl CandidateWindowV2 {
         // 真 raw 的旧车道）照旧恒空，T8 防线不破。trace 实锤此前提示
         // 串到达 show 门口即被本行丢弃（注入层 raw='·〔反查〕' 而
         // show[入] raw=''）。
-        let raw = if _raw_req.contains('〔') { _raw_req } else { "" };
+        // 【内联关闭回归修 2026-10-11 用户反馈】皮肤 layout.inline_preedit
+        // =false（设置页「编码内联到应用」关）时编码不进宿主文本流
+        //（tsf.rs 侧 preedit 恒空），候选框编码行是编码**唯一**展示位
+        // ——本咽喉若再吞 raw，编码就哪都不显示（用户实锤）。放行条
+        // 件加 !inline_on：内联开着=框内照旧恒空（T8 铁律不破），关着
+        // =真 raw 透传给编码行。皮肤读法与 anim 同源（顶层或 /skin 包
+        // 皮两种形态都认，缺省=true 内联）。
+        let inline_on = skin
+            .pointer("/skin/layout/inline_preedit")
+            .or_else(|| skin.pointer("/layout/inline_preedit"))
+            .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let raw = if _raw_req.contains('〔') || !inline_on {
+            _raw_req
+        } else {
+            ""
+        };
+        // 【按住Ctrl调频 2026-11】模态渲染态注入：
+        // 1) 提示行占编码行（模态期引擎编码恒不画，T8 铁律不破——提示
+        //    是模式文案非编码；宽度测量/布局照常走编码行通道）；
+        // 2) 删除动效期内渲染旧列表（被删词红闪+塌缩，完成自动落真
+        //    列表——show 是所有渲染车道咽喉，在此置换=全车道一致）。
+        let freq_view = self.freq.borrow().clone();
+        let freq_fade = self.freq_fade.get();
+        // 模态配色进度（0=普通色 1=强调色）：进入向 1、退出向 0，ease-out
+        let freq_a = match freq_fade {
+            Some((to_active, t0)) => {
+                let dur = 120u32;
+                let e = (t0.elapsed().as_millis() as f32 / dur as f32).min(1.0);
+                let lin = if to_active { e } else { 1.0 - e };
+                1.0 - (1.0 - lin) * (1.0 - lin)
+            }
+            None => {
+                if freq_view.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        };
+        let cands_del_owned: Vec<(String, String)>;
+        let cands: &[(String, String)] = {
+            let mut del = self.freq_del.borrow_mut();
+            match del.as_ref() {
+                Some((_, old, t0, dur)) if t0.elapsed().as_millis() < *dur as u128 => {
+                    cands_del_owned = old.clone();
+                    &cands_del_owned
+                }
+                _ => {
+                    if del.is_some() {
+                        *del = None;
+                    }
+                    cands
+                }
+            }
+        };
+        // 提示行（模态中）替换编码行内容；raw 此后即提示文案。
+        let freq_hint_owned: String;
+        let raw: &str = if let Some(fv) = &freq_view {
+            freq_hint_owned = freq_hint_text(fv);
+            &freq_hint_owned
+        } else {
+            raw
+        };
         // 【三十四修·chase 修正 2】show 前置流程（3525 行钳位段）每帧都会
         // 把 sticky_pos 覆盖成本帧锚点——chase 首显起点若在定位段才读，
         // 「上一段落点」已变「本段落点」，起点≡终点，追赶永不臂=全程直
@@ -2094,6 +3283,10 @@ impl CandidateWindowV2 {
         } else {
             anchor
         };
+        // 【静打特调全清 2026-10-11】用户拍板：删除全部静打专属路径
+        //（v13-v20 像素策略堆、v21 UIA、v22 单规则探针），该宿主与其
+        // 他宿主同走通用锚链（stub 锚照常参与——y 表现交由后续通用机
+        // 制，不再按进程名特判）。
         // 【四十四修·退化锚行高补齐 2026-09-22】微信4.0 实锤（用户
         // 实打 trace）：同一插入点交替上报两种锚矩形——16px 全高
         //（正常，(1142,1174,1156,1190)）与 1px 退化（GetTextExt 抽
@@ -2367,10 +3560,25 @@ impl CandidateWindowV2 {
                 .collect();
             &cands_suppressed
         };
-        // 序号显示：引擎 state 经 pipe skin 响应附带（根级 show_index）
+        // 序号显示：三路读——①管道响应根级 show_index（真窗 op skin 响
+        // 应包装层）；②/skin/show_index（兼容）；③/skin/layout.show_index
+        // 与顶层 layout.show_index（SSF payload 注入——dump 渲染走
+        // skin_for_render 拿 {"skin":sv}，序号键在 sv.layout 里；只读根
+        // 级永远 None→恒 true=「显示序号开关无效」的用户实锤根因）。
+        // 缺省 true。
         let show_index = skin
             .get("show_index")
             .and_then(|x| x.as_bool())
+            .or_else(|| {
+                skin.get("skin")
+                    .and_then(|s| s.get("show_index"))
+                    .and_then(|x| x.as_bool())
+            })
+            .or_else(|| {
+                skin.pointer("/skin/layout/show_index")
+                    .or_else(|| skin.pointer("/layout/show_index"))
+                    .and_then(|x| x.as_bool())
+            })
             .unwrap_or(true);
         // 【毛玻璃退役 2026-09-11】材质 glass/毛玻璃整链已删（kind 值
         // 不再分支，旧 glass 皮肤按 translucent 渲染）；accent 一次性
@@ -2382,6 +3590,37 @@ impl CandidateWindowV2 {
                 self.acrylic_last.set(key);
             }
         }
+
+        // ──【SSF M2/M3】.ssf 位图皮肤：形态检测 + 运行态 + 参数投影 ──
+        // 检测/解析/取图/换装键失效链见 .refs/_dll接入方案.md §1/§6；
+        // 投影=把 ssf display/变体折算进现有 layout/colors 键——下游
+        // layout_f/color_f 全部无感（JSON 路径零改动【回归红线】）。
+        // 放这里：font/margin/spacing 读取（下一行起）之前、raw/cands/
+        // freq_view 可见性已定之后。
+        let horizontal_early = skin
+            .pointer("/skin/layout/horizontal")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("horizontal")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let ssf = self.ssf_prepare(
+            skin,
+            !horizontal_early,
+            // 【虎娘变体语义 2026-10-16 逆】layoutMode 6（默认竖排无编码）
+            // → skinPart=2 → VerticalCandidates（V2 zhongwen：候选从
+            // code.top 起——元气虎娘 730 正是底部面板，非退化数据）；
+            // 编码可见（raw 非空=mode 4 语义）→ Vertical（V1 编码+候选）。
+            // 调频模态提示行=类编码 → V1。
+            !raw.is_empty() || freq_view.is_some(),
+            !cands.is_empty(),
+        );
+        let skin_proj: Value;
+        let skin: &Value = match &ssf {
+            Some(f) => {
+                skin_proj = ssf_project_skin(skin, f);
+                &skin_proj
+            }
+            None => skin,
+        };
 
         let font_pt = layout_f(skin, "font_point", 16.0);
         let radius = layout_f(skin, "corner_radius", 8.0);
@@ -2532,9 +3771,16 @@ impl CandidateWindowV2 {
         // 一「边距」滑杆（同写两字段），新口径下恒 mx=my=gap。
         // 行槽高 row_h=max(line_h, em+2hp)：胶囊需要时撑高，胶囊与
         // 文字在槽内居中——胶囊四边到窗恒= gap（weasel margin 语义）。
-        let gap = (margin_x + margin_y) / 2.0;
-        let rm_x = gap;
-        let rm_y = gap;
+        let (rm_x, rm_y) = match &ssf {
+            // 【SSF】投影已把 marge 折进 margin_x/y——引擎的 (mx+my)/2
+            // 对称坍缩会把左右/上下内边距拉平均（真皮左右常≫上下，
+            // 坍缩=竖排行距暴涨），按原值分轴用
+            Some(_) => (margin_x, margin_y),
+            None => {
+                let gap = (margin_x + margin_y) / 2.0;
+                (gap, gap)
+            }
+        };
         let pill_h = em + hilite_pad * 2.0;
         let row_h = line_h.max(pill_h);
 
@@ -2564,13 +3810,26 @@ impl CandidateWindowV2 {
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
                 if f.is_empty() {
-                    "Microsoft YaHei UI".into()
+                    // 【霞鹜默认 2026-10-16】空 font_face（官方皮肤全空/
+                    // SSF 雅黑缺省视为空）不再钉死雅黑：系统装了霞鹜就
+                    // 用，未装回退雅黑——用户拍板「所有自带默认皮肤都
+                    // 要用霞鹜」。常见版本名精确探测，进程一次。已验证：
+                    // 探测路径与显式 override 霞鹜渲染逐像素一致。
+                    if let Some(c) = DEFAULT_CAND_FONT.get() {
+                        c.clone()
+                    } else {
+                        let r = probe_default_cand_font(&dwrite);
+                        let _ = DEFAULT_CAND_FONT.set(r.clone());
+                        r
+                    }
                 } else {
                     f.to_string()
                 }
             };
             let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
-            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）
+            // 字体族缺失时回退雅黑（防 CreateTextFormat 失败 → 全窗无字）。
+            // 【字体文件夹退役 2026-10-09】私有字体集整链删除（用户定调：
+            // 只用系统已装字体，霞鹜优先/雅黑兜底），族名走系统集解析。
             let mk_tf = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
                 let mut b: Vec<u16> = fam.encode_utf16().collect();
                 b.push(0);
@@ -2592,6 +3851,26 @@ impl CandidateWindowV2 {
             // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
             let label_pt = layout_f(skin, "label_font_point", 0.0);
             let tf_key = (font_face.clone(), font_pt, label_pt);
+            // 【字体切换取证 2026-10-08】trace 开启且键变化时记录：皮肤
+            // 送来的 font_face、tf 缓存命中——真实应用内分支视角（逐帧
+            // 渲染，只在变化时落一条防刷屏）。
+            {
+                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32)>> =
+                    std::sync::Mutex::new(None);
+                let mut lt = LAST_FT.lock().unwrap_or_else(|p| p.into_inner());
+                if lt.as_ref() != Some(&tf_key) {
+                    *lt = Some(tf_key.clone());
+                    if crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "cw2 font: face=「{font_face}」 pt={font_pt} cache_hit={}",
+                            tf_cache_in
+                                .as_ref()
+                                .map(|(k, _)| *k == tf_key)
+                                .unwrap_or(false),
+                        ));
+                    }
+                }
+            }
             let tf_hit = tf_cache_in
                 .as_ref()
                 .map(|(k, _)| *k == tf_key)
@@ -2602,9 +3881,22 @@ impl CandidateWindowV2 {
                 tf_small = v.1.clone();
                 tf_label = v.2.clone();
             } else {
-                tf = mk_tf(&font_face, em).or_else(|| mk_tf("Microsoft YaHei UI", em));
-                tf_small =
-                    mk_tf(&font_face, em * 0.78).or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+                // 【雅黑兜底取证 2026-10-09】mk_tf(族名)=None 意味着系统集
+                // 拿不到该族 → 渲染雅黑——用户看到的「跟雅黑一样」若走
+                // 此路，落痕为证。
+                let mk_probe = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
+                    let r = mk_tf(fam, em);
+                    if r.is_none() && crate::tsf::trace_on() {
+                        crate::tsf::trace(&format!(
+                            "cw2 mk_tf: 「{fam}」两集皆失败 → 雅黑兜底"
+                        ));
+                    }
+                    r
+                };
+                tf = mk_probe(&font_face, em)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em));
+                tf_small = mk_probe(&font_face, em * 0.78)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
                 // 文本垂直居中（高亮胶囊上下留白对称的关键）
                 for t in [&tf, &tf_small] {
                     if let Some(t) = t {
@@ -2646,7 +3938,9 @@ impl CandidateWindowV2 {
             // 值 + 「.」字形尾部侧空 + 汉字墨盒头部侧空，视觉 ≈6-8px
             // 偏松——收紧为紧贴值）。
             let n_show = cands.len().min(10);
-            if show_index && n_show > 0 {
+            // 【按住Ctrl调频 2026-11】模态中强制显示序号（皮肤关序号时
+            // 调频/删词无从指位——数字键语义必须有可见编号）。
+            if (show_index || freq_view.is_some()) && n_show > 0 {
                 let wmax = measure(&tf_label, &fmt_label(n_show));
                 label_w = label_w.max(wmax + hsp);
             }
@@ -2661,7 +3955,7 @@ impl CandidateWindowV2 {
                     measure(&tf_small, c.as_str())
                 };
                 // 本格序号宽（label_format 格式化实测 + hsp 紧贴间距）：横排正文紧跟序号
-                let iw = if show_index && i < 10 {
+                let iw = if (show_index || freq_view.is_some()) && i < 10 {
                     measure(&tf_label, &fmt_label(i + 1)).max(10.0) + hsp
                 } else {
                     0.0
@@ -2701,6 +3995,24 @@ impl CandidateWindowV2 {
                 };
             let dy;
             let dy_key = (font_face.clone(), font_pt);
+            // 【SSF 虎娘行槽】源域行高测量：虎娘 row=ceil(max(字号,
+            // "中Mg"行高))（layoutSkin L19-20）。此处用当前 tf（用户
+            // 字号）测同一串的行高——线性除回源域（=源字号行高）。
+            // 渲染行槽=源行高×scale（像素域）。
+            let row_user = {
+                let ws: Vec<u16> = "中Mg".encode_utf16().collect();
+                match &tf {
+                    Some(t) => dwrite
+                        .CreateTextLayout(&ws, t, 100000.0, 100000.0)
+                        .ok()
+                        .and_then(|l| {
+                            let mut m = DWRITE_TEXT_METRICS::default();
+                            l.GetMetrics(&mut m).ok().map(|_| m.height)
+                        }),
+                    None => None,
+                }
+                .unwrap_or(font_pt * 96.0 / 72.0 * 1.35)
+            };
             if let Some((k, v)) = &dy_cache_in {
                 if *k == dy_key {
                     dy = *v;
@@ -2753,7 +4065,7 @@ impl CandidateWindowV2 {
                 // 受限」——虎码横排候选少时窄窗更精致，min_width(150)
                 // 让窗窄不下去；weasel 语义此处不适用，恢复纯自适应。
                 let mut w = rm_x * 2.0 + hilite_pad * 2.0;
-                if raw_w > 0.0 {
+                if raw_w > 0.0 && freq_view.is_none() {
                     w += raw_w + 10.0; // 编码段（左）+ 编码↔候选间隔
                 }
                 for (_i, (tw, cw, iw)) in cand_ws.iter().enumerate() {
@@ -2845,14 +4157,79 @@ impl CandidateWindowV2 {
                 tf_label,
                 tf_small,
                 cand_ws,
-                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w)),
+                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w, row_user)),
             )
         };
-        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w) = geo.1;
+        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w, row_user) = geo.1;
         let cmt_disp = geo.0;
+        // 【SSF 虎娘行槽/文字列锚 2026-10-16】皮肤模式行槽=源行高×scale
+        //（虎娘 row=ceil(max(皮肤字号,"中Mg"行高))，布局在源域、渲染
+        // ×scale；row_user=用户字号现测行高，线性等价）。胶囊已透明化，
+        // pill_h 不参与撑高。文字列 x=candidates.left×scale（虎娘
+        // layoutSkin L43 x=m.left）。竖排行距=line_spacing×scale（虎娘
+        // L48 y+=lineSpacing；candidate_spacing 只横排 gap 用）。
+        let row_h = if ssf.is_some() {
+            row_user.max(1.0)
+        } else {
+            row_h
+        };
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
-        let code_row = if raw.is_empty() || horizontal {
+        // 【按住Ctrl调频 2026-11】模态提示行恒占独立行（横排也是——
+        // 提示文案较长，与候选同行会把候选推得很远）。
+        // 【SSF 虎娘同构布局 2026-10-16 逆 CandidateRendererSkin.cpp】
+        // 虎娘 layoutSkin 语义：布局在皮肤源画布域完成（字号=皮肤
+        // font_size、insets/行距=源值），窗口按内容撑大（硬底=图尺寸），
+        // 输出整体 ×scale。V1 合体变体单窗序列：
+        //   y=code.top → 编码行（x=code.left，右垫 code.right）
+        //   y+=row+code.bottom → y+=cand.top → 候选行们
+        //   y+=cand.bottom → height=max(min_height, y)
+        // 渲染锚（像素域）=源坐标×scale。旧「底锚/段位」分支全撤。
+        let ssf_layout_geo = ssf.as_ref().map(|f| {
+            let c = &f.layout.candidates;
+            let e = &f.layout.code;
+            (
+                e.top as f32,        // 编码行 y（源）
+                (e.top.max(0) as f32) + (e.bottom.max(0) as f32), // 编码槽推进量（+row）
+                e.left as f32,       // 编码行 x（源）
+                c.top as f32,        // 候选区相对编码槽底的偏移（源）
+                c.left as f32,       // 候选/编码共用文字列 x（源）
+                (c.left.max(0) as f32) + (c.right.max(0) as f32), // 文字行左右 marge 和（源）
+                f.layout.min_width(f.bitmap.width),
+                f.layout.min_height(f.bitmap.height),
+                f.spec.display.line_spacing, // 源行距（竖排行间）
+                f.scale,
+            )
+        });
+        // 【SSF 文字列锚/行距】文字列 x=candidates.left×scale（虎娘
+        // layoutSkin L43 x=m.left）。竖排行距=line_spacing×scale（虎娘
+        // L48 y+=lineSpacing；candidate_spacing 只横排 gap 用）。
+        let (text_x, cand_spacing) = match ssf_layout_geo {
+            Some((_, _, _, _, cleft, _, _, _, lsp, sc)) => {
+                // 【序号分离 2026-10-16 修】SSF 文字列锚=cleft×sc，但开
+                // 序号时序号列也在同锚（JSON 口径 label 在 text 左侧）→
+                // 序号与文字挤在一起。同 JSON 语义：序号占 cleft×sc 起、
+                // 文字列右移 label_w+hsp（虎娘口径序号是内联文字串，但
+                // 虎符序号=独立列——保持本家样式，只把列分开）。
+                let tx = cleft.max(0.0) * sc
+                    + if show_index { label_w + hsp } else { 0.0 };
+                let sp = if horizontal {
+                    cand_spacing
+                } else {
+                    lsp.max(0.0) * sc
+                };
+                (tx, sp)
+            }
+            None => (text_x, cand_spacing),
+        };
+        let code_row = if ssf_layout_geo.is_some() {
+            // 【SSF 虎娘 V1/V2】编码行/调频提示行有自己的源域锚
+            //（code.top），不占 JSON 顶部行槽；height/y0 全部由
+            // ssf_y0_src 源域公式驱动。
+            0.0
+        } else if freq_view.is_some() {
+            1.0
+        } else if raw.is_empty() || horizontal {
             0.0
         } else {
             1.0
@@ -2867,6 +4244,93 @@ impl CandidateWindowV2 {
             // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
             let rows = cands.len().min(10) as f32 + code_row;
             rm_y * 2.0 + row_h * rows + cand_spacing * (rows - 1.0).max(0.0)
+        };
+        // ──【SSF 虎娘同构窗口尺寸 2026-10-16】width/height 在源画布域
+        // 按内容撑大（硬底=图尺寸/刀口和），输出 ×scale。内容宽=候选
+        // 各行（含行内注释）与编码行的最大 right（源域）。窗口高按
+        // V1 序列推进：编码槽(row+code.bottom)+候选区(top+n·row+
+        // (n-1)·line_spacing+bottom)。旧「底锚/编码块」分支全撤。
+        let (width, cmt_x) = match &ssf {
+            Some(f) => {
+                let sc = f.scale;
+                // 【横排宽 2026-10-16 修】横排=单行总宽（Σ词+注释+序号+
+                // 间隔，含左端编码），竖排=各行最大 right。此前横排误用
+                // 竖排口径（单行最大）→ 4 词只装下 2 个（后续被截）。
+                let content_user = if horizontal {
+                    let mut m = if raw.is_empty() { 0.0 } else { raw_w + hsp };
+                    for (i, (tw, cw, iw)) in cand_ws.iter().enumerate() {
+                        if i > 0 || !raw.is_empty() {
+                            m += cand_spacing;
+                        }
+                        m += iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 };
+                    }
+                    m
+                } else {
+                    let mut m = raw_w;
+                    for (tw, cw, iw) in cand_ws.iter() {
+                        m = m.max(iw + tw + if *cw > 0.0 { hsp + cw } else { 0.0 });
+                    }
+                    m
+                };
+                let text_right_src = f.layout.candidates.left.max(0) as f32
+                    + content_user / sc
+                    + f.layout.candidates.right.max(0) as f32;
+                let w_src = f
+                    .layout
+                    .min_width(f.bitmap.width)
+                    .max(text_right_src);
+                let w2 = (w_src * sc).min(w_cap); // 超屏封顶仍守（防大图出屏）
+                let dx = w2 - width;
+                (w2, cmt_x + dx)
+            }
+            None => (width, cmt_x),
+        };
+        // ──【SSF 虎娘同构布局参数】源域行槽与候选首行 y（V1/V2 双态，
+        // 与下方 height 公式同源；渲染锚 y0=y0_src×scale）。
+        let ssf_row_src = ssf.as_ref().map(|f| row_user / f.scale);
+        let ssf_y0_src = match (&ssf, ssf_row_src) {
+            (Some(f), Some(rs)) => {
+                // 【候选高度·语义更正 2026-10-16 用户澄清】cand_y 不再作
+                // 皮肤内部候选区偏移（本轮改挂：候选窗与光标行的垂直
+                // 距离，见 show() 锚点落点 cy）。此处还原皮肤原布局。
+                Some(
+                    if !raw.is_empty() || freq_view.is_some() {
+                        f.layout.code.top.max(0) as f32
+                            + rs
+                            + f.layout.code.bottom.max(0) as f32
+                            + f.layout.candidates.top.max(0) as f32
+                    } else {
+                        f.layout.candidates.top.max(0) as f32
+                    },
+                )
+            }
+            _ => None,
+        };
+        let height = match &ssf {
+            Some(f) => {
+                let sc = f.scale;
+                let row_src = row_user / sc;
+                let n = cands.len().min(10) as f32;
+                let cand_bottom = f.layout.candidates.bottom.max(0) as f32;
+                let lsp = f.spec.display.line_spacing.max(0.0);
+                let y0_src = ssf_y0_src.unwrap_or(0.0);
+                let y_end = y0_src
+                    + if horizontal {
+                        row_src + cand_bottom
+                    } else {
+                        n * row_src + ((n - 1.0).max(0.0)) * lsp + cand_bottom
+                    };
+                let v = (f.layout.min_height(f.bitmap.height).max(y_end) * sc)
+                    .max(1.0);
+                crate::tsf::trace(&format!(
+                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} row_src={:.0} 编码={}）",
+                    y0_src, y_end,
+                    f.layout.min_height(f.bitmap.height), v, horizontal, row_src,
+                    !raw.is_empty()
+                ));
+                v
+            }
+            None => height,
         };
 
         let w = width as u32;
@@ -3081,6 +4545,12 @@ impl CandidateWindowV2 {
                     M31: 0.0,
                     M32: 0.0,
                 });
+                // 【SSF 窗口圆角 2026-10-16】GPU PushLayer(几何 mask) 在本
+                // 交换链上实测不生效（主变换/identity 两种口径 dump 角都
+                // 仍实心）；改为 CPU 后处理：present_ulw / 测试回读的像素
+                // 步对四角做圆角透明化（预乘直清、带 1px 抗锯齿）。这里
+                // 只记录本帧圆角半径供像素步消费。
+                self.ulw_round = if ssf.is_some() { radius } else { 0.0 };
 
                 // 背景：一律清透明后画「圆角」底——四角保持透明，窗口才是真圆角
                 // （旧行 solid 用 Clear 铺满整窗把圆角补成直角）
@@ -3447,7 +4917,46 @@ impl CandidateWindowV2 {
                         b: back.b,
                         a: if stage == 1 { 0.0 } else { master },
                     };
-                    if bg_c.a > 0.004 {
+                    // ──【SSF M2/M3】九宫格位图背景（替换矢量底）──
+                    // dst=chw/chh：动效帧吃 chrome_override 插值尺寸——
+                    // 每帧重切九宫格=「皮肤被拉长」（虎娘 drawSkinBackground
+                    // 同构）；稳态=目标尺寸。刀口 ×scale（源=画布原像素，
+                    // dst=96 逻辑域）。设备位图帧号缓存=帧不变零上传。
+                    // 建位图失败→本帧透明底（文字照画，保底出窗）。
+                    if let Some(f) = &ssf {
+                        let mut rt = self.ssf.borrow_mut();
+                        if let Some(r) = rt.as_mut() {
+                            let SsfRuntime { bitmap, clock, device, rasters, .. } = r;
+                            let (idx, _rem) = clock.current(bitmap);
+                            // 【SSF 缩小高清化 2026-10-18】phys_scale=
+                            // 源画布 px→屏幕物理 px 总系数（等比 scale ×
+                            // dpi）——Profile E 预过滤的降采样比。
+                            let phys_scale = f.scale * dpi_scale;
+                            if let Ok(bmp) = unsafe {
+                                crate::ssfwin::device_bitmap(&ctx, bitmap, idx, phys_scale, device, rasters)
+                            } {
+                                unsafe {
+                                    crate::ssfwin::draw_nineslice(
+                                        &ctx,
+                                        bmp,
+                                        bitmap.width,
+                                        bitmap.height,
+                                        chw,
+                                        chh,
+                                        f.layout.horizontal.tile,
+                                        f.layout.horizontal.before,
+                                        f.layout.horizontal.after,
+                                        f.layout.vertical.tile,
+                                        f.layout.vertical.before,
+                                        f.layout.vertical.after,
+                                        dpi_scale,
+                                        f.scale,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if bg_c.a > 0.004 && ssf.is_none() {
                         if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
@@ -3609,7 +5118,14 @@ impl CandidateWindowV2 {
                             tf,
                             &rect,
                             brush,
-                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            // 【彩色 emoji 2026-10-17 用户实锤】候选里的 emoji
+                            // 之前渲染成单色符号（上屏到应用里却是彩色表情）：
+                            // D2D 默认走字形单色描边，必须显式开
+                            // ENABLE_COLOR_FONT 才渲染 COLR 彩色字形
+                            //（Segoe UI Emoji）；DirectWrite 系统字体回退
+                            // 自会把 emoji 码点指到该字体，此处只差这面旗。
+                            // 普通中文/ASCII 字体无彩色表，零影响零成本。
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
                     }
@@ -3620,34 +5136,131 @@ impl CandidateWindowV2 {
                 // 采集后与 (dpi, shadow_m) 一并落 CAND_HIT*/静态缓存，
                 // 供 wndproc 0x204 客户端像素→逻辑坐标命中换算。
                 let mut hit_rows: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(cands.len().min(10));
+                // 【按住Ctrl调频 2026-11】模态渲染（画刷/动效因子在此统
+                // 一制备，编码行提示与候选行共用）：引擎高亮胶囊让位——
+                // 选中概念换成「拾起」环（模态是重排态，旧高亮位已无
+                // 「将上屏」语义）；序号换强调色（琥珀=调频/红=删词，
+                // freq_a 淡变插值）。
+                let sel = if freq_view.is_some() {
+                    usize::MAX
+                } else {
+                    selected.min(cands.len().saturating_sub(1))
+                };
+                let freq_fv = freq_view.as_ref();
+                let (b_freq_txt, b_freq_lbl, pick_pulse, swap_pair, swap_k, del_idx, del_k) =
+                    if let Some(fv) = freq_fv {
+                        let (r, g, b) = if fv.del {
+                            (1.0f32, 0.36, 0.36) // 删词红
+                        } else {
+                            (1.0f32, 0.72, 0.26) // 调频琥珀
+                        };
+                        let bt = ctx
+                            .CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a: freq_a }, None)
+                            .ok();
+                        let bl = ctx
+                            .CreateSolidColorBrush(
+                                &D2D1_COLOR_F { r, g, b, a: freq_a * 0.9 },
+                                None,
+                            )
+                            .ok();
+                        // 拾起脉冲进度（0→1；完成即恒 1）
+                        let pulse = fv
+                            .pick_at
+                            .map(|pa| (pa.elapsed().as_millis() as f32 / 150.0).min(1.0))
+                            .unwrap_or(1.0);
+                        // 对调动效：ease-out 进度（0=旧槽位 1=新槽位）
+                        let (sp, k) = match self.freq_swap.get() {
+                            Some((a, b, t0, dur)) if t0.elapsed().as_millis() < dur as u128 => {
+                                let e = (t0.elapsed().as_millis() as f32 / dur.max(1) as f32)
+                                    .min(1.0);
+                                (Some((a, b)), 1.0 - (1.0 - e) * (1.0 - e))
+                            }
+                            Some(_) => {
+                                self.freq_swap.set(None);
+                                (None, 1.0)
+                            }
+                            None => (None, 1.0),
+                        };
+                        // 删除塌缩进度（0=全宽 1=收尽）
+                        let (di, dk) = {
+                            let d = self.freq_del.borrow();
+                            match d.as_ref() {
+                                Some((i, _, t0, dur))
+                                    if t0.elapsed().as_millis() < *dur as u128 =>
+                                {
+                                    let e = (t0.elapsed().as_millis() as f32 / (*dur).max(1) as f32)
+                                        .min(1.0);
+                                    (Some(*i), e)
+                                }
+                                _ => (None, 0.0),
+                            }
+                        };
+                        (bt, bl, pulse, sp, k, di, dk)
+                    } else {
+                        (None, None, 1.0, None, 1.0, None, 0.0)
+                    };
                 // 【阶段验证】stage 1-4：跳过内容绘制（编码行/胶囊/文字/边框）
                 let draw_content = !(stage >= 1 && stage <= 4);
                 if draw_content {
                     // 编码行（有内容才画；候选行相应下移一行 + 行距）；dy=光学垂直居中位移
+                    // 【按住Ctrl调频 2026-11】模态期此行即提示行——强调色。
+                    // 【SSF insets 布局】编码行锚窗口底部 code insets 区
+                    //（底固定区功能区条，如元气虎娘底部米色圆角条）：
+                    // y = 内容高 - (图高 - code.top)×scale，x = candidates.left×scale。
                     if !raw.is_empty() {
-                        // 编码区背景（皮肤 preedit_back_color 带透明度时才画）
+                        // 【SSF 虎娘 V1 编码锚 2026-10-16】编码行 y=code.top
+                        // ×scale（源坐标线性映射——V1 变体语义，layoutSkin
+                        // L33）；x=code.left×scale。旧「分段 MapY/底锚」撤。
+                        let (code_x, code_y) = match ssf_layout_geo {
+                            Some((etop, _, eleft, _, _, _, _, _, _, sc)) => {
+                                crate::tsf::trace(&format!(
+                                    "ssflay: 编码行锚 x={:.1} y={:.1}（etop={:.0} sc={:.3}）raw_len={}",
+                                    eleft * sc, etop * sc, etop, sc, raw.len()
+                                ));
+                                (eleft * sc, etop * sc)
+                            }
+                            _ => (rm_x, rm_y + dy),
+                        };
                         if let Some(bg) = &b_preedit_bg {
-                            let rr = D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: rm_x,
-                                    top: rm_y,
-                                    right: cr(width - rm_x),
-                                    bottom: cb(rm_y + line_h),
-                                },
-                                radiusX: 4.0,
-                                radiusY: 4.0,
-                            };
-                            ctx.FillRoundedRectangle(&rr, bg);
+                            if ssf_layout_geo.is_none() {
+                                let rr = D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: rm_x,
+                                        top: rm_y,
+                                        right: cr(width - rm_x),
+                                        bottom: cb(rm_y + line_h),
+                                    },
+                                    radiusX: 4.0,
+                                    radiusY: 4.0,
+                                };
+                                ctx.FillRoundedRectangle(&rr, bg);
+                            }
                         }
+                        // 【按住Ctrl调频·提示行自适应】全量→紧凑→…截断
+                        //（竖排定宽皮肤单行装不下全量文案的根治）
+                        let hint_fit;
+                        let raw_draw: &str = if let Some(fv) = freq_fv {
+                            hint_fit = freq_hint_fit(
+                                &self.dwrite,
+                                &tf,
+                                fv,
+                                (width - rm_x * 2.0).max(20.0),
+                            );
+                            hint_fit.as_str()
+                        } else {
+                            raw.as_str()
+                        };
+                        let b_hint: &Option<ID2D1SolidColorBrush> =
+                            if freq_fv.is_some() { &b_freq_txt } else { &b_raw };
                         draw(
                             &ctx,
                             &tf,
-                            raw.as_str(),
-                            rm_x,
-                            rm_y + dy,
-                            width - rm_x * 2.0,
+                            raw_draw,
+                            code_x,
+                            code_y,
+                            (width - code_x - rm_x).max(20.0),
                             row_h,
-                            &b_raw,
+                            b_hint,
                         );
                     }
                     // 【对齐修正 2026-09-06】dy（文本光学居中）此前平移整行（含
@@ -3655,7 +5268,16 @@ impl CandidateWindowV2 {
                     // 实测「外框与高亮区上下距离不一样」）。现 dy 只作用于文本
                     // draw（行内光学居中），行框/胶囊/窗框几何全部按对称 margin
                     // 布置。
-                    let y0 = rm_y + (row_h + cand_spacing) * code_row;
+                    // 【SSF 虎娘候选锚 2026-10-16】y0=源域候选首行 y×scale
+                    //（V1=code.top+row+code.bottom+cand.top；V2=cand.top，
+                    // 与 height 公式同源 ssf_y0_src）。JSON 皮肤旧语义。
+                    let y0 = match ssf_y0_src {
+                        Some(y0s) => {
+                            let sc = ssf.as_ref().map(|f| f.scale).unwrap_or(1.0);
+                            y0s * sc
+                        }
+                        None => rm_y + (row_h + cand_spacing) * code_row,
+                    };
 
                     // 【口径重构 2026-09-08】胶囊几何只有两个属性：gap（胶囊↔
                     // 窗边，四边同值）与 hilite_pad（胶囊↔文字，四边同值）。
@@ -3669,19 +5291,71 @@ impl CandidateWindowV2 {
                     };
 
                     // 候选行
-                    let sel = selected.min(cands.len().saturating_sub(1));
                     if horizontal {
                         // ── 横排：单行铺开，每格 = 序号+文本(+注释)，高亮为整格胶囊 ──
                         // 编码段在左（同行）：候选起点右移 raw_w+间隔（2026-09-05）
-                        let mut x =
-                            rm_x + hilite_pad + if raw_w > 0.0 { raw_w + 10.0 } else { 0.0 };
+                        // 【按住Ctrl调频 2026-11】模态提示独立成行（raw_w 不
+                        // 推候选右移）；槽位 x 预计算——对调动效需槽位起点
+                        // 插值、删除塌缩需按 (1-k) 收缩推进。
+                        let n_draw = cands.len().min(10);
+                        let raw_off =
+                            if raw_w > 0.0 && freq_view.is_none() { raw_w + 10.0 } else { 0.0 };
+                        let cell_w_of = |i: usize| -> f32 {
+                            let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                            iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 }
+                        };
+                        let scale_of = |i: usize| -> f32 {
+                            if Some(i) == del_idx { 1.0 - del_k } else { 1.0 }
+                        };
+                        // 现序槽位（删除塌缩推进）
+                        let mut xs: Vec<f32> = Vec::with_capacity(n_draw);
+                        {
+                            let mut x = rm_x + hilite_pad + raw_off;
+                            for i in 0..n_draw {
+                                if i > 0 {
+                                    x += cand_spacing;
+                                }
+                                xs.push(x);
+                                x += cell_w_of(i) * scale_of(i);
+                            }
+                        }
+                        // 旧序槽位（对调前：两格宽度互换重排——起点精确）
+                        let xs_old: Vec<f32> = match swap_pair {
+                            Some((a, b)) if a < n_draw && b < n_draw => {
+                                let mut v: Vec<f32> = Vec::with_capacity(n_draw);
+                                let mut x = rm_x + hilite_pad + raw_off;
+                                for i in 0..n_draw {
+                                    if i > 0 {
+                                        x += cand_spacing;
+                                    }
+                                    v.push(x);
+                                    let wsrc = if i == a {
+                                        b
+                                    } else if i == b {
+                                        a
+                                    } else {
+                                        i
+                                    };
+                                    x += cell_w_of(wsrc);
+                                }
+                                v
+                            }
+                            _ => Vec::new(),
+                        };
                         let y = y0;
-                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        for i in 0..n_draw {
+                            let (text, _) = &cands[i];
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                             let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
                             let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
-                            if i > 0 {
-                                x += cand_spacing;
+                            // 对调动效：从旧槽位滑到新槽位（ease-out）
+                            let mut x = xs[i];
+                            if let Some((a, b)) = swap_pair {
+                                if i == a && b < xs_old.len() {
+                                    x = xs_old[b] + (xs[i] - xs_old[b]) * swap_k;
+                                } else if i == b && a < xs_old.len() {
+                                    x = xs_old[a] + (xs[i] - xs_old[a]) * swap_k;
+                                }
                             }
                             if i == sel {
                                 if let Some(b) = &b_hi {
@@ -3729,13 +5403,66 @@ impl CandidateWindowV2 {
                                     }
                                 }
                             }
-                            let (bt, bl, bc) = if i == sel {
+                            // 【按住Ctrl调频】模态：序号换强调色；删除词
+                            // 濒死淡出（红 + alpha 随塌缩衰减）
+                            let dying = Some(i) == del_idx;
+                            let b_die: Option<ID2D1SolidColorBrush> = if dying {
+                                ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.42,
+                                        b: 0.42,
+                                        a: (1.0 - del_k).clamp(0.0, 1.0),
+                                    },
+                                    None,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            let (bt, bl, bc) = if i == sel
+                                // 【SSF】虎娘口径：第 1 候选恒 first_color
+                                //（不随 sel 走；非调频模态才生效）
+                                || (ssf.is_some() && freq_fv.is_none() && i == 0)
+                            {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
                             };
+                            let bl_use: &Option<ID2D1SolidColorBrush> = if dying {
+                                &b_die
+                            } else if freq_fv.is_some() {
+                                &b_freq_lbl
+                            } else {
+                                bl
+                            };
+                            // 删除红闪（塌缩前段峰值）
+                            if dying && del_k < 1.0 {
+                                let flash = (1.0 - del_k) * (1.0 - (del_k * 2.2).min(1.0));
+                                if let Ok(rb) = ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.3,
+                                        b: 0.3,
+                                        a: 0.32 * flash,
+                                    },
+                                    None,
+                                ) {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: x,
+                                            top: y,
+                                            right: x + cell_w * (1.0 - del_k),
+                                            bottom: y + row_h,
+                                        },
+                                        radiusX: 4.0,
+                                        radiusY: 4.0,
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, &rb);
+                                }
+                            }
                             let mut cx = x;
-                            if show_index {
+                            if show_index || freq_fv.is_some() {
                                 draw(
                                     &ctx,
                                     &tf_label,
@@ -3744,7 +5471,7 @@ impl CandidateWindowV2 {
                                     y + dy,
                                     iw,
                                     row_h,
-                                    bl,
+                                    bl_use,
                                 );
                                 cx += iw;
                             }
@@ -3753,19 +5480,50 @@ impl CandidateWindowV2 {
                             if !cmt.is_empty() && cw > 0.0 {
                                 draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
                             }
+                            // 【按住Ctrl调频·拾起环】拾起候选描边脉冲（外扩
+                            // 3px→贴格），内衬低透强调底
+                            if let Some(fv) = freq_fv {
+                                if fv.pick == Some(i) {
+                                    let rr = D2D_RECT_F {
+                                        left: x,
+                                        top: y,
+                                        right: x + cell_w,
+                                        bottom: y + row_h,
+                                    };
+                                    freq_pick_ring(
+                                        &ctx, rr, b_freq_txt.as_ref(), pick_pulse, radius,
+                                    );
+                                }
+                                // 对调双格强调底（横排滑动中同步插值透明度）
+                                if let Some((a, b)) = swap_pair {
+                                    if i == a || i == b {
+                                        freq_swap_tint(&ctx, x, y, cell_w, row_h, b_freq_txt.as_ref(), swap_k);
+                                    }
+                                }
+                            }
                             hit_rows.push((
-                                x - if i > 0 { cand_spacing * 0.5 } else { 0.0 },
+                                xs[i] - if i > 0 { cand_spacing * 0.5 } else { 0.0 },
                                 y0,
-                                x + cell_w + cand_spacing * 0.5,
+                                xs[i] + cell_w + cand_spacing * 0.5,
                                 y0 + row_h,
                             ));
-                            x += cell_w;
                         }
                     } else {
                         // ── 竖排（原布局 + candidate_spacing 行距 + hilite_padding 统一内边距）──
-                        for (i, (text, _)) in cands.iter().enumerate().take(10) {
+                        // 【按住Ctrl调频 2026-11】删除塌缩：被删行行槽按
+                        // (1-k) 收缩，后续行上移补位（与横排同读数）。
+                        let n_draw_v = cands.len().min(10);
+                        let mut y_run = y0;
+                        for i in 0..n_draw_v {
+                            let (text, _) = &cands[i];
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
-                            let y = y0 + (row_h + cand_spacing) * i as f32;
+                            let row_scale = if Some(i) == del_idx {
+                                1.0 - del_k
+                            } else {
+                                1.0
+                            };
+                            let y = y_run;
+                            let row_h_eff = row_h * row_scale;
                             hit_rows.push((rm_x, y, width - rm_x, y + row_h));
                             if i == sel {
                                 // 高亮行（圆角胶囊；↑↓ 移动）：胶囊四边 = gap（口径
@@ -3817,45 +5575,155 @@ impl CandidateWindowV2 {
                                     }
                                 }
                             }
-                            let (bt, bl, bc) = if i == sel {
+                            // 【按住Ctrl调频】模态：序号强调色；删除词濒死淡出
+                            let dying = Some(i) == del_idx;
+                            let b_die: Option<ID2D1SolidColorBrush> = if dying {
+                                ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.42,
+                                        b: 0.42,
+                                        a: (1.0 - del_k).clamp(0.0, 1.0),
+                                    },
+                                    None,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            let (bt, bl, bc) = if i == sel
+                                // 【SSF】虎娘口径：第 1 候选恒 first_color
+                                //（不随 sel 走；非调频模态才生效）
+                                || (ssf.is_some() && freq_fv.is_none() && i == 0)
+                            {
                                 (&b_hi_txt, &b_hi_lbl, &b_hi_cmt)
                             } else {
                                 (&b_text, &b_label, &b_cmt)
                             };
-                            if show_index {
+                            let bl_use: &Option<ID2D1SolidColorBrush> = if dying {
+                                &b_die
+                            } else if freq_fv.is_some() {
+                                &b_freq_lbl
+                            } else {
+                                bl
+                            };
+                            // 删除红闪
+                            if dying && del_k < 1.0 {
+                                let flash = (1.0 - del_k) * (1.0 - (del_k * 2.2).min(1.0));
+                                if let Ok(rb) = ctx.CreateSolidColorBrush(
+                                    &D2D1_COLOR_F {
+                                        r: 1.0,
+                                        g: 0.3,
+                                        b: 0.3,
+                                        a: 0.32 * flash,
+                                    },
+                                    None,
+                                ) {
+                                    let rr = D2D1_ROUNDED_RECT {
+                                        rect: D2D_RECT_F {
+                                            left: rm_x,
+                                            top: y,
+                                            right: width - rm_x,
+                                            bottom: y + row_h_eff,
+                                        },
+                                        radiusX: 4.0,
+                                        radiusY: 4.0,
+                                    };
+                                    ctx.FillRoundedRectangle(&rr, &rb);
+                                }
+                            }
+                            if show_index || freq_fv.is_some() {
+                                // 【序号分离 2026-10-16】SSF 序号列锚=皮肤
+                                // cleft×sc（与文字列同设计框左界——文字列
+                                // 已右移 label_w+hsp，两列不再挤在一起）。
+                                let lab_x = match ssf_layout_geo {
+                                    Some((_, _, _, _, cleft, _, _, _, _, sc)) => {
+                                        cleft.max(0.0) * sc
+                                    }
+                                    None => rm_x + hilite_pad,
+                                };
                                 draw(
                                     &ctx,
                                     &tf_label,
                                     &fmt_label(i + 1),
-                                    rm_x + hilite_pad,
+                                    lab_x,
                                     y + dy,
                                     label_w,
                                     row_h,
-                                    bl,
+                                    bl_use,
                                 );
                             }
+                            // 文本列宽：SSF=候选词实测宽（注释并串跟随，
+                            // 虎娘行内注释语义）；JSON=到注释列左界。
+                            let tw_i = cand_ws
+                                .get(i)
+                                .map(|(tw, _, _)| *tw)
+                                .unwrap_or(0.0);
+                            let text_col_w = if ssf.is_some() {
+                                tw_i.max(8.0)
+                            } else {
+                                cmt_x - text_x - 4.0
+                            };
                             draw(
                                 &ctx,
                                 &tf,
                                 text,
                                 text_x,
                                 y + dy,
-                                cmt_x - text_x - 4.0,
+                                text_col_w,
                                 row_h,
                                 bt,
                             );
                             if !cmt.is_empty() {
+                                // 【SSF 虎娘行内注释 2026-10-16】注释跟在
+                                // 候选词后（layoutSkin add() 同串拼接语义），
+                                // 非右对齐列。
+                                let (cx, cw) = if ssf.is_some() {
+                                    (text_x + text_col_w + hsp, (width - text_x - text_col_w - hsp - 2.0).max(0.0))
+                                } else {
+                                    (cmt_x, width - cmt_x - rm_x + 4.0)
+                                };
                                 draw(
                                     &ctx,
                                     &tf_small,
                                     cmt,
-                                    cmt_x,
+                                    cx,
                                     y + dy,
-                                    width - cmt_x - rm_x + 4.0,
+                                    cw,
                                     row_h,
                                     bc,
                                 );
                             }
+                            // 【按住Ctrl调频】拾起环 + 对调双格强调底
+                            if let Some(fv) = freq_fv {
+                                if fv.pick == Some(i) {
+                                    let rr = D2D_RECT_F {
+                                        left: rm_x,
+                                        top: y,
+                                        right: width - rm_x,
+                                        bottom: y + row_h_eff,
+                                    };
+                                    freq_pick_ring(&ctx, rr, b_freq_txt.as_ref(), pick_pulse, radius);
+                                }
+                                if let Some((a, b)) = swap_pair {
+                                    if i == a || i == b {
+                                        freq_swap_tint(
+                                            &ctx,
+                                            rm_x,
+                                            y,
+                                            width - rm_x * 2.0,
+                                            row_h_eff,
+                                            b_freq_txt.as_ref(),
+                                            swap_k,
+                                        );
+                                    }
+                                }
+                            }
+                            y_run += row_h_eff + if i + 1 < n_draw_v {
+                                cand_spacing
+                            } else {
+                                0.0
+                            };
                         }
                     }
 
@@ -3944,6 +5812,23 @@ impl CandidateWindowV2 {
                                                 .copy_from_slice(std::slice::from_raw_parts(src, (w_px * 4) as usize));
                                         }
                                         let _ = cpu.Unmap();
+                                        // 【SSF 窗口圆角】测试回读同款后处理
+                                        //（w_px×h_px=整窗含阴影边距；SSF
+                                        // 无程序阴影=内容区即整帧，与
+                                        // present_ulw 同口径）
+                                        if self.ulw_round > 0.5 {
+                                            let geo = CAND_HIT_GEO
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .map(|(dpi, _, _, _)| dpi)
+                                                .unwrap_or(1.0);
+                                            ssf_round_corners_cpu(
+                                                data.as_mut_ptr(),
+                                                w_px as usize,
+                                                h_px as usize,
+                                                self.ulw_round * geo,
+                                            );
+                                        }
                                         self.last_pixels = Some(data);
                                         self.last_dy = Some(dy);
                                         self.last_size = (w_px, h_px);
@@ -3954,7 +5839,13 @@ impl CandidateWindowV2 {
                     }
                 }
 
-                if self.ulw {
+                // 【dump 不可见 2026-10-16】readback（渲染转储）模式跳过
+                // 上屏：回读像素已在上方取得；窗口全程未显示，ULW 对
+                // 隐藏窗本就会失败、Present 纯浪费垂直同步等待（转储
+                // 提速的一环）。
+                if self.readback {
+                    // 不 present
+                } else if self.ulw {
                     // 【ULW 呈现】离屏位图 → CPU_READ 拷贝 → DIB →
                     // UpdateLayeredWindow（沙盒安全：纯 GDI 上屏）。
                     // 【变窄直角根除 2026-09-12】present 尺寸必须与
@@ -3974,6 +5865,87 @@ impl CandidateWindowV2 {
                     };
                     self.present_ulw(pw, ph);
                 } else {
+                    // 【SSF 窗口圆角·主链 2026-10-16 修】swapchain Present
+                    // 链没有 CPU 像素步（此前圆角只挂 ULW/测试回读两路，
+                    // dump 走回读=验证通过但生产直角——用户实锤「圆角没
+                    // 用」）。两段法：渲染 EndDraw 后读回整帧 → CPU 四角
+                    // 透明化 → 重建位图整帧铺回 → Present。
+                    if self.ulw_round > 0.5 {
+                        let (Some(ctx), Some(tgt)) = (&self.ctx, bitmap.cast::<ID2D1Bitmap>().ok()) else {
+                            return;
+                        };
+                        let (wq, hq) = (w_out as u32, h_out as u32);
+                        if wq > 0 && hq > 0 {
+                            use windows::Win32::Graphics::Direct2D::{
+                                D2D1_BITMAP_OPTIONS, D2D1_BITMAP_PROPERTIES1,
+                                ID2D1Bitmap,
+                            };
+                            let props = D2D1_BITMAP_PROPERTIES1 {
+                                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                                bitmapOptions: D2D1_BITMAP_OPTIONS(
+                                    D2D1_BITMAP_OPTIONS_CPU_READ.0 | D2D1_BITMAP_OPTIONS_CANNOT_DRAW.0,
+                                ),
+                                colorContext: std::mem::ManuallyDrop::new(None),
+                            };
+                            if let Ok(cpu) = ctx.CreateBitmap(
+                                windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: wq, height: hq },
+                                None, 0, &props,
+                            ) {
+                                if cpu.CopyFromBitmap(None, Some(&tgt), Some(&windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U {
+                                    left: 0, top: 0, right: wq, bottom: hq,
+                                })).is_ok() {
+                                    if let Ok(mapped) = cpu.Map(windows::Win32::Graphics::Direct2D::D2D1_MAP_OPTIONS_READ) {
+                                        let row = (wq as usize) * 4;
+                                        let mut data = vec![0u8; row * hq as usize];
+                                        let pitch = mapped.pitch as usize;
+                                        for r in 0..hq as usize {
+                                            let src = mapped.bits.add(r * pitch) as *const u8;
+                                            data[r * row..(r + 1) * row]
+                                                .copy_from_slice(std::slice::from_raw_parts(src, row));
+                                        }
+                                        let _ = cpu.Unmap();
+                                        ssf_round_corners_cpu(data.as_mut_ptr(), wq as usize, hq as usize, self.ulw_round * dpi_scale);
+                                        // 整帧铺回：新建 GPU 位图（data 所有权转移）
+                                        let gprops = D2D1_BITMAP_PROPERTIES1 {
+                                            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                                                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                            },
+                                            dpiX: 96.0,
+                                            dpiY: 96.0,
+                                            bitmapOptions: windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS::default(),
+                                            colorContext: std::mem::ManuallyDrop::new(None),
+                                        };
+                                        if let Ok(nb) = ctx.CreateBitmap(
+                                            windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width: wq, height: hq },
+                                            Some(data.as_ptr() as *const _),
+                                            row as u32,
+                                            &gprops,
+                                        ) {
+                                            let _ = ctx.BeginDraw();
+                                            let ident = windows::Foundation::Numerics::Matrix3x2 {
+                                                M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0,
+                                            };
+                                            ctx.SetTransform(&ident);
+                                            let _ = ctx.DrawBitmap(
+                                                &nb,
+                                                Some(&D2D_RECT_F { left: 0.0, top: 0.0, right: wq as f32, bottom: hq as f32 }),
+                                                1.0,
+                                                windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_LINEAR,
+                                                None, None,
+                                            );
+                                            let _ = ctx.EndDraw(None, None);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let chain = match &self.swapchain {
                         Some(c) => c.clone(),
                         None => return,
@@ -4232,11 +6204,20 @@ impl CandidateWindowV2 {
                         // right 语义正常不动。1px 退化锚与 16px selection 锚
                         // top 恒同 → 两源落点自然归一，四十四修的荡秋千
                         // 修复语义保留（补齐块只改 bottom，此处不再读）。
+                        // 【候选高度=与光标距离 2026-10-16 用户澄清】语义
+                        // 更正：不是皮肤内部候选区偏移，而是**整个候选窗
+                        // 与光标行的垂直距离**。layout.cand_y（仅独立皮肤
+                        // 载荷携带此键；JSON 矢量缺省 0=零回归【回归红线】）
+                        // 以物理像素直接加在光标行 gap 上：正=离光标更远
+                        //（下方模式窗下移；贴屏底上翻模式窗再上移），负=
+                        // 贴近光标（可压进光标行）。钳 ±500 防呆；常数对
+                        // y 稳定锁/锚行分解的全部 delta 消去，零干扰。
+                        let cy = layout_f(skin, "cand_y", 0.0).clamp(-500.0, 500.0) as i32;
                         let (below, above_base) = if crate::tsf::host_is_weixin() {
                             let lh = self.last_line_h.filter(|h| *h >= 8).unwrap_or(16);
-                            (r.top + 4, r.top - lh)
+                            (r.top + 4 + cy, r.top - lh)
                         } else {
-                            (r.bottom + 4, r.top)
+                            (r.bottom + 4 + cy, r.top)
                         };
                         // 【上翻底边钉锚 2026-11】先判模式再算 y：上翻
                         //（下方放不下）锚定边=底边（y=锚行−h−4），本帧
@@ -4245,7 +6226,7 @@ impl CandidateWindowV2 {
                         let flipped_now = !(below + hpx <= vy + vh);
                         self.above_flip_last.set(flipped_now);
                         let y = if flipped_now {
-                            (above_base - hpx - 4).max(vy)
+                            (above_base - hpx - 4 - cy).max(vy)
                         } else {
                             below
                         };
@@ -4415,7 +6396,11 @@ impl CandidateWindowV2 {
                             if crate::tsf::trace_on() {
                                 crate::tsf::trace("cw2: 粘位跨编辑框作废 → 焦点编辑框正下方");
                             }
-                            self.focus_edit_below((height * dpi_scale) as i32)
+                            // 【候选高度=与光标距离 2026-10-16】兜底落点同
+                            // 步吃 cy（独立皮肤专属键，矢量缺省 0）。
+                            let cy =
+                                layout_f(skin, "cand_y", 0.0).clamp(-500.0, 500.0) as i32;
+                            self.focus_edit_below((height * dpi_scale) as i32, cy)
                         }
                         // 从未有过真实锚点且本帧也取不到：先记诊断；若无
                         // 历史位置则退到「焦点窗口内左下」而非整帧隐藏
@@ -4678,7 +6663,16 @@ impl CandidateWindowV2 {
             // 「切焦首显动效顿顿」（全宿主共有的观感）。SWP 之后把
             // t0 重锚到当下，滑动从实际可见帧起播满全程。
             let mut entrance_armed = false;
-            let sp_ok = if !dragging {
+            // 【dump 不可见 2026-10-16】readback（渲染转储）模式：回读
+            // 像素在渲染段内已取得，SWP 显示/present 上屏对转储是纯
+            // 副作用——此前窗口在屏上闪现 ~120ms（用户实锤「切换时前
+            // 台闪一下」）。转储全程不显示窗口（渲染到离屏目标与窗口
+            // 可见性无关），也不挂看门狗/挂件同步。
+            let sp_ok = if self.readback {
+                // 转储进程即退，live_* 状态无人消费——纯跳过（窗口保持
+                // 隐藏，不 SWP、不显示）
+                Ok(())
+            } else if !dragging {
                 // 【零位移·收窄轴向例外 2026-09-11】变宽轴向：窗口一步
                 // 到位=目标（每键仅一次 SWP，壳在稳定窗口内长大——用户
                 // 实锤变宽无直角）；收窄轴向：窗口必须跟缓动走——否则
@@ -4999,6 +6993,8 @@ impl CandidateWindowV2 {
                 self.live_size.set(apply);
                 self.content_size.set((w_out as i32, h_out as i32));
                 self.live_pos.set((px, py));
+                // 【右键菜单 z 序保护 2026-10-16】菜单窗存活期不再抢
+                // HWND_TOPMOST（SSF 帧钟每帧 show 会把菜单压到皮肤下）。
                 let swp_r = SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
@@ -5006,7 +7002,7 @@ impl CandidateWindowV2 {
                     py,
                     apply.0,
                     apply.1,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | swp_z_guard(),
                 );
                 // 【三十二修·首显时钟重锚】滑动从「窗口实际可见」起播满
                 // 全程（臂帧→SWP 之间隔着渲染+Present 同步等待，见上）。
@@ -5032,12 +7028,15 @@ impl CandidateWindowV2 {
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | swp_z_guard(),
                 )
             };
             // 【贴图挂件 2026-10-02】show 定位 SWP 后同步兄弟贴图窗
-            //（overlaywin 只读本窗最终矩形，不碰候选窗几何）
-            crate::overlaywin::sync_for(self.hwnd, skin);
+            //（overlaywin 只读本窗最终矩形，不碰候选窗几何）。
+            //（readback/转储：不同步——转储皮肤剥了 overlay，且进程即退）
+            if !self.readback {
+                crate::overlaywin::sync_for(self.hwnd, skin);
+            }
             if sp_ok.is_err() {
                 crate::tsf::trace(&format!(
                     "cw2: SetWindowPos({x},{y}) 失败 err={:?} visible={}",
@@ -5063,6 +7062,30 @@ impl CandidateWindowV2 {
                 // 1/13）。切走关窗由看门狗+Activate 扫尸+键路径三层兜底，
                 // 物理层裸输入监听停用（函数保留，热键层不再订阅）。
                 // unsafe { rawinput_listen(self.hwnd, true) };
+            }
+            // ──【SSF M4】APNG 帧钟：变间隔常驻窗钟（虎娘 timer4 同款；
+            // 绝不挂 anim_boost——winmm 400ms 自杀截止与循环播放冲突，
+            // 也不占 FADE_TIMER——那是几何动效钟）。静态图/非 ssf 即杀。
+            // 重臂在 show 尾=每帧按「距下帧剩余」变间隔设置（虎娘
+            // SetTimer 重置间隔语义）；隐藏由藏窗路径显式杀。
+            {
+                let arm = self
+                    .ssf
+                    .borrow()
+                    .as_ref()
+                    .filter(|rt| rt.bitmap.is_animated())
+                    .map(|rt| {
+                        let (_, rem) = rt.clock.current(&rt.bitmap);
+                        rem.max(20)
+                    });
+                match arm {
+                    Some(ms) => {
+                        let _ = SetTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID, ms, None);
+                    }
+                    None => {
+                        let _ = KillTimer(self.hwnd, crate::ssfwin::SSF_TIMER_ID);
+                    }
+                }
             }
             // 【毛玻璃退役 2026-09-11】glass RGN/DWM 圆角/NC 链整块删除；
             // 仅保留残留清理（曾开过毛玻璃的窗恢复全窗区域+方角）。
@@ -5127,7 +7150,7 @@ impl CandidateWindowV2 {
 
     /// 【四十八修】当前焦点编辑框正下方的落位（跨编辑框粘位作废后的
     /// 兜底；h=候选物理高）。查询失败返回 None 退原「焦点窗口内左下」。
-    fn focus_edit_below(&self, h: i32) -> (i32, i32) {
+    fn focus_edit_below(&self, h: i32, cy: i32) -> (i32, i32) {
         #[repr(C)]
         struct GTI4 {
             cb: u32,
@@ -5169,11 +7192,13 @@ impl CandidateWindowV2 {
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let x = fr.left.clamp(vx, (vx + vw - 200).max(vx));
-            let below = fr.bottom + 4;
+            // 【候选高度=与光标距离 2026-10-16】cy 同主锚点口径：正=更
+            // 远（下方下移/上方上移），负=贴近。
+            let below = fr.bottom + 4 + cy;
             let y = if below + h <= vy + vh {
                 below
             } else {
-                (fr.top - h - 4).max(vy)
+                (fr.top - h - 4 - cy).max(vy)
             };
             (x, y)
         }
@@ -5667,6 +7692,77 @@ unsafe fn ime_watchdog_tick(hwnd: HWND) {
 
 /// 步进（整帧复渲染外壳）→ 位置插值步进（只 SWP 不重绘——内容按
 /// 目标布局早已在缓冲）→ 高亮滑动复渲染 → 放回。全部结束 KillTimer。
+/// 【SSF M4】APNG 帧推进 tick（WM_TIMER / SSF_TIMER_ID=0x4945）。
+/// 与 anim_boost（winmm 400ms 自杀截止）和 FADE_TIMER（几何动效钟）
+/// 完全独立：只管「帧号变了 → 整帧重绘（show 内渲染段消费新帧号并
+/// 在尾部重臂变间隔钟）」。帧号没变（几何动效在跑或距下帧未到）只
+/// 重臂不重绘——设备位图帧号缓存零上传。仿 fade_tick_shared 的
+/// take/put-back + cand2_busy，锁外渲染；TL 线程词框一期不接（贴图
+/// 窗 overlaywin 自带动画钟），返回不动。
+unsafe fn ssf_frame_tick(hwnd: HWND) {
+    if crate::tsf::addword_tl_thread() {
+        return;
+    }
+    let Some(shared) = tick_shared_for_hwnd(hwnd) else {
+        return;
+    };
+    let (mut cand2, last, skin, caret) = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2_busy = true;
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+    };
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+        let act = c.ssf.borrow().as_ref().and_then(|rt| {
+            if !rt.bitmap.is_animated() {
+                return None;
+            }
+            let last_frame = rt.device.as_ref().map(|d| d.frame_idx);
+            let (idx, rem) = rt.clock.current(&rt.bitmap);
+            Some((idx, rem, last_frame))
+        });
+        match act {
+            None => {
+                // 静态图/已降级：钟没有存在意义
+                let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+            }
+            Some((idx, rem, last_frame)) => {
+                if Some(idx) == last_frame {
+                    // 帧未推进：只重臂（几何动效由 FADE_TIMER 自行整帧重绘）
+                    let _ = SetTimer(hwnd, crate::ssfwin::SSF_TIMER_ID, rem.max(20), None);
+                } else if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                    // show 尾部已按新帧的「距下帧剩余」重臂变间隔钟
+                } else {
+                    let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+                }
+            }
+        }
+    } else {
+        let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
+    }
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.cand2_busy = false;
+    // 组段已在持有期间收尾 → 代为隐藏（与 fade_tick_shared 同款）
+    let pending_hide = std::mem::take(&mut g.pending_cand_hide);
+    match (g.cand2.take(), cand2) {
+        (None, Some(mut mine)) => {
+            if pending_hide {
+                mine.hide_now();
+            } else {
+                g.cand2 = Some(mine);
+            }
+        }
+        (Some(newer), Some(mut mine)) => {
+            mine.hide_now();
+            g.cand2 = Some(newer);
+        }
+        (Some(newer), None) => g.cand2 = Some(newer),
+        (None, None) => {}
+    }
+}
+
 unsafe fn fade_tick_shared(hwnd: HWND) {
     // 【动画 tick 线程感知 2026-09-12 十七修】残留窗最终根因：小窗
     // 线程 TL 候选的动画 tick 走到这里 → take g.cand2（主线程窗）
@@ -5762,7 +7858,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             tgt.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 } else {
@@ -5787,7 +7883,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             np.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }
@@ -5813,7 +7909,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             cur.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }
@@ -5930,7 +8026,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         tgt.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             } else {
@@ -5963,7 +8059,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         np.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
             }
@@ -6001,7 +8097,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         t.1,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                     );
                 }
                 } else {
@@ -6022,7 +8118,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                             cur.1,
                             0,
                             0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
                         );
                     }
                 }
@@ -6051,6 +8147,93 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
+            }
+        }
+        // 【按住Ctrl调频 2026-11·tick 保活与安全兜底】
+        // ① 模态动效在途（淡变/对调滑动/删除塌缩/拾起脉冲）：帧率门控
+        //    复渲染 + 保活 tick（同 hl_anim 模式：完成在渲染内自清）；
+        // ② 兜底退出：模态正常由 tsf dispatch 的 Ctrl KeyUp 退出，但
+        //    KeyUp 可能被宿主吞——tick 侧 GetAsyncKeyState 轮询 Ctrl
+        //    物理态（350ms 宽限防误杀）+ 窗口隐没即退。物理轮询仅对
+        //    「物理进入」的模态有效（freq_ctrl_physical——纯 Test 注入
+        //    宿主无物理态，退出交 TestUp/下一键层）；模态静止期也保活
+        //    tick（轮询本身就是 tick 存在的理由）。
+        //    退出动作在**本闭包持有的 c** 上就地完成（不能走 tsf 的
+        //    freq_exit helper——那会重取 cand2 与本闭包打架）。
+        let freq_modal = c.freq.borrow().is_some();
+        let freq_busy = c.freq_anim_busy();
+        if freq_modal || freq_busy {
+            let (fv_age, ctrl_physical) = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    c.freq
+                        .borrow()
+                        .as_ref()
+                        .map(|fv| fv.t0.elapsed().as_millis())
+                        .unwrap_or(0),
+                    g.freq_ctrl_physical,
+                )
+            };
+            // 【按住键可录·十三修】物理兜底轮询按两组合 VK 集：两组合
+            // 都物理散尽（GetAsyncKeyState 逐键）才判松手（删词组合散
+            // 了但调频组合仍按 = 回调频，tick 不多管——那归键路重估；
+            // 这里只兜「宿主吞了全部成员 KeyUp」的悬死形态）。
+            let (fk, dk) = {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (g.freq_key.clone(), g.del_key.clone())
+            };
+            let any_held = |keys: &[usize]| {
+                !keys.is_empty()
+                    && keys
+                        .iter()
+                        .any(|&vk| unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 } != 0)
+            };
+            let ctrl_gone =
+                ctrl_physical && !any_held(&fk) && !any_held(&dk);
+            if !c.is_visible() || (ctrl_gone && fv_age > 350) {
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace("cw2: 调频tick兜底退出（Ctrl物理松开/窗隐）");
+                }
+                // 窗口视图就地复位（清共享旗标交 tsf 侧轮询/下一键处理；
+                // 此处不触碰 g.cand2——正在本闭包手里）
+                {
+                    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.freq_active = false;
+                    g.freq_delete = false;
+                    g.freq_pick = None;
+                    g.freq_pick_text.clear();
+                }
+                c.set_freq_view(false, false, None, "");
+                c.freq_swap.set(None);
+                *c.freq_del.borrow_mut() = None;
+                if c.is_visible() {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                }
+                // 退场淡变+行收起仍需 tick
+                anim_done = false;
+            } else if freq_busy {
+                anim_done = false;
+                let render_ok = {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(c.size_anim_last_render.get()).as_millis()
+                        >= morph_frame_interval_ms(hwnd)
+                    {
+                        c.size_anim_last_render.set(now);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if c.is_visible() && render_ok {
+                    c.internal_rerender = true;
+                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    c.internal_rerender = false;
+                }
+            } else if freq_modal && ctrl_physical {
+                // 模态静止 + 物理进入：保活 tick（Ctrl 兜底轮询在身）
+                anim_done = false;
             }
         }
     }

@@ -102,6 +102,36 @@ impl Trie {
         out
     }
 
+    /// 【可延码判定 2026-10-09】prefix 之下是否还有严格更长的编码
+    ///（后代节点带词条）。completions 会把 prefix 自身词条也收进来，
+    /// 区分不了「叶子码」（;x → 唯一直出）与「可延伸码」（;m→;mn→
+    /// ;mnng → 等待延伸）——快符/符号唯一候选直出与可延等待的分界
+    /// 需要本方法（不含自身，只看孩子链）。
+    pub fn has_longer(&self, prefix: &str) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let mut cur = 0usize;
+        for ch in prefix.chars() {
+            match self.nodes[cur].children.get(&ch).copied() {
+                Some(n) => cur = n as usize,
+                None => return false,
+            }
+        }
+        let mut stack: Vec<usize> = Vec::new();
+        if let Some(nr) = self.nodes.get(cur) {
+            stack.extend(nr.children.values().map(|c| *c as usize));
+        }
+        while let Some(n) = stack.pop() {
+            let Some(nr) = self.nodes.get(n) else { continue };
+            if !nr.entries.is_empty() {
+                return true;
+            }
+            stack.extend(nr.children.values().map(|c| *c as usize));
+        }
+        false
+    }
+
     /// 从 `raw` 开头做最长匹配枚举：返回所有「raw 的前缀编码 → 条目」，
     /// 编码长度降序（长码优先，供整句解码枚举切分）。
     pub fn prefix_matches(&self, raw: &str) -> Vec<(usize, Vec<u32>)> {
@@ -133,6 +163,62 @@ impl Trie {
         result.sort_by(|a, b| b.0.cmp(&a.0));
         result
     }
+
+    /// 【编码通配符】pattern 内 `wild` 字符 = 任意单码位；只匹配与
+    /// pattern **等长**的编码（d\x = 全部 3 码 d?x）。DFS 走前缀树：
+    /// 通配位枚举全部子边、字面位只走对应边，模式耗尽即收（不下探
+    /// 更长编码=等长语义）。返回去重编码集合（字典序稳定）。
+    /// 上限 WILDCARD_CODE_CAP 防病态模式（如单 \）拖垮候选刷新。
+    pub fn wildcard_codes(&self, pattern: &str, wild: char) -> Vec<String> {
+        const WILDCARD_CODE_CAP: usize = 4096;
+        let mut out: Vec<String> = Vec::new();
+        if self.nodes.is_empty() || pattern.is_empty() {
+            return out;
+        }
+        let pats: Vec<char> = pattern.chars().collect();
+        // 栈元素：(节点下标, 已走出的编码前缀)
+        let mut stack: Vec<(usize, String)> = vec![(0usize, String::new())];
+        while let Some((n, prefix)) = stack.pop() {
+            if out.len() >= WILDCARD_CODE_CAP {
+                break;
+            }
+            let depth = prefix.chars().count();
+            if depth == pats.len() {
+                if !self.nodes[n].entries.is_empty() {
+                    out.push(prefix);
+                }
+                continue;
+            }
+            let pc = pats[depth];
+            if let Some(nr) = self.nodes.get(n) {
+                if pc == wild {
+                    // 通配位：枚举全部子边（升序保证结果稳定）
+                    let mut edges: Vec<(char, u32)> =
+                        nr.children.iter().map(|(c, id)| (*c, *id)).collect();
+                    edges.sort_by_key(|(c, _)| *c);
+                    for (ch, id) in edges {
+                        let mut np = prefix.clone();
+                        np.push(ch);
+                        stack.push((id as usize, np));
+                    }
+                } else if let Some(id) = nr.children.get(&pc) {
+                    let mut np = prefix.clone();
+                    np.push(pc);
+                    stack.push((*id as usize, np));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+impl Dict {
+    /// 【编码通配符】等长通配匹配（委托 Trie；见 Trie::wildcard_codes）。
+    pub fn wildcard_codes(&self, pattern: &str, wild: char) -> Vec<String> {
+        self.trie.wildcard_codes(pattern, wild)
+    }
 }
 
 /// 一部已加载的字典。
@@ -149,6 +235,12 @@ pub struct Dict {
     /// （a8=来、u3=的）。true 时引擎把 raw 里的数字当编码而非
     /// 「选重第 N」。rebuild 时扫描缓存。
     pub digit_coded: bool,
+    /// 【z 引导符号域 2026-11·虎爪同款】全表所有 'z' 只出现在码首
+    ///（非 z 开头的码不含 z），且存在普通字母码（非 z 开头）——
+    /// 则 z 前缀码 = 符号引导域：域内唯一叶子提前直出（092K 的
+    /// zai=AI 三键即出）。z 作普通编码字母的表（靓仔类，码内含
+    /// z 4879 处）自动判否。rebuild 时扫描缓存。
+    pub z_symbol_domain: bool,
 }
 
 impl Dict {
@@ -204,6 +296,36 @@ impl Dict {
         self.trie = Trie::new();
         self.text_to_codes.clear();
         self.digit_coded = false;
+        // 【z 引导符号域 2026-11·虎爪同款】判定口径与 TigerClaw
+        // RebuildShortSymbolMeta 一致：非 z 开头的码若含 z（含 ;/ 等
+        // 引导头）→ z 是普通编码字母 → 域关；z 开头的码内部再含 z
+        //（zizh/zoqz 类）不算。存在普通字母码（非 z 开头）保证表
+        // 有正常主域（虎爪 headSet.Contains("a") 的同义放宽）。
+        self.z_symbol_domain = false;
+        {
+            let mut has_normal = false;
+            let mut z_inner = false;
+            for e in &self.entries {
+                let mut cs = e.code.chars();
+                match cs.next() {
+                    Some('z') => {}
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        has_normal = true;
+                        if cs.any(|x| x == 'z') {
+                            z_inner = true;
+                            break;
+                        }
+                    }
+                    _ => {
+                        if e.code.contains('z') {
+                            z_inner = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.z_symbol_domain = has_normal && !z_inner;
+        }
         let mut order: Vec<u32> = (0..self.entries.len() as u32).collect();
         order.sort_by(|&i, &j| crate::entry::rank_cmp(&self.entries[i as usize], &self.entries[j as usize]));
         for idx in order {
@@ -240,6 +362,11 @@ impl Dict {
             .into_iter()
             .filter_map(|(_, idx)| self.entries.get(idx as usize))
             .collect()
+    }
+
+    /// 【可延码判定 2026-10-09】同 Trie::has_longer（严格更长编码存在）。
+    pub fn has_longer(&self, prefix: &str) -> bool {
+        self.trie.has_longer(prefix)
     }
 
     /// 整句解码用：raw 前缀的编码匹配（长码优先）。

@@ -24,7 +24,21 @@ hufu-skin = { path = "../hufu-skin" }
 hufu-rerank = { path = "../hufu-rerank" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 【SSF 皮肤 2026-12】源指纹 sha256（fp = "{size}-{sha256 前 16 hex}"；
+# 只在解包时算一次，经 manifest.json 复用——skin op 每次 2.5s 例行
+# 轮询不重复读源文件全量哈希）。
+sha2 = "0.10"
 # 【T7b·server 代画挂件】沉浸宿主（UWP/开始菜单）候选窗挂件的解码/
 # 逐帧处理管线（GIF/APNG/WebP/JPEG）——与 DLL hufu-tsf 同版本同特性集
 #（2026-11 jpeg 入集：用户反馈挂件不能用 JPG）。
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
+# 【旧版控制台真光标 2026-10-15】console_caret op：AttachConsole 到宿主
+# 客户端进程读光标（DLL 载在 conhost 内自读双通道皆死，只能借外部进程）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
