@@ -748,6 +748,17 @@ pub fn dispatch(
         //（NTQQ 渲染进程）写不了 HKCU——记忆改由 server 落
         // 数据\addword-ph.json，DLL 对话框构建回读/勾选即写都走管道。
         "aw_ph_get" => serde_json::json!({"on": host.addword_ph}),
+        // Linux 原生加词框：与 Web 设置页 POST /api/user_word/add 同一落盘
+        // 逻辑（用户调整.txt + 热重载）。返回 {ok} 或 {ok:false,error}。
+        "aw_add" => {
+            let code = req.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let pos = req.get("pos").and_then(|v| v.as_i64()).unwrap_or(0);
+            match crate::add_user_word(&mut host, code, text, pos) {
+                Ok(()) => serde_json::json!({"ok": true}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            }
+        }
         "aw_ph_set" => {
             let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
             host.addword_ph = on;

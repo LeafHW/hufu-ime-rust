@@ -959,6 +959,62 @@ fn rewrite_supplement_lines(path: &std::path::Path, word: &str) {
     }
 }
 
+/// 加词落盘（Web 设置页与 Linux 原生对话框共用）：写当前方案
+/// `用户调整.txt`，同码同词旧行先清；`pos` 是选重位（0=置顶，1-99=固定
+/// 第 N 候选，现有占位符先删再插）。成功后热重载用户数据。
+pub(crate) fn add_user_word(
+    host: &mut Host,
+    code: &str,
+    text: &str,
+    pos: i64,
+) -> Result<(), String> {
+    let code = code.trim();
+    let text = text.trim();
+    if code.is_empty() || text.is_empty() {
+        return Err("编码与词不能为空".into());
+    }
+    if !(0..=99).contains(&pos) {
+        return Err("选重位须在 0-99".into());
+    }
+    // 隐私词（任意码）拒绝前台加词：{添加} 会随导出带走。
+    if host.engine.schema.personal_has_text(text) {
+        return Err(
+            "「个人存储表」里的词不进用户调整（会随导出泄漏）——请直接编辑方案目录的 个人存储表.txt"
+                .into(),
+        );
+    }
+    let file = host.engine.schema.dir.join("用户调整.txt");
+    rewrite_keep_lines(&file, code, text);
+    // 第 pos 位现有候选恰是占位词（③④…）→ 先删它再添加（原位替换）。
+    let del_line = if pos >= 1 {
+        host.engine
+            .placeholder_at_pos(code, pos as usize)
+            .filter(|ph| ph != text)
+            .map(|ph| format!("{{删除}}{code}\t{ph}\n"))
+    } else {
+        None
+    };
+    let line = if pos >= 1 {
+        format!("{{添加}}{code}\t{text}\tp{pos}\n")
+    } else {
+        format!("{{添加}}{code}\t{text}\n")
+    };
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(|e| format!("写入失败: {e}"))?;
+    if let Some(dl) = del_line {
+        f.write_all(dl.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+    }
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("写入失败: {e}"))?;
+    host.engine.reload_user_data();
+    Ok(())
+}
+
 /// 【格式统一 2026-09-06】清 用户调整.txt 中同码同词旧行（四种标记
 /// 行+旧 TSV 词行一起清——写入端只留最新操作，文件不膨胀且回放
 /// 语义与追加日志等价）。
@@ -1912,66 +1968,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let v = req.json();
             let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("").trim();
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim();
-            // 选重位（/jc 第三框「第 N 选」）：≥1 时词固定第 N 候选
-            //（不足 N 个则排最后）；0/缺省=原置顶行为。
             let pos = v.get("pos").and_then(|x| x.as_i64()).unwrap_or(0);
-            if code.is_empty() || text.is_empty() {
-                return Response::err(400, "编码与词不能为空");
-            }
-            if !(0..=99).contains(&pos) {
-                return Response::err(400, "选重位须在 1-99");
-            }
-            // 【个人存储表防泄漏 2026-10-16】隐私词（任意码）拒绝前台
-            // 加词：{添加} 落 用户调整.txt 会随导出带走（同词不同码也是
-            // 泄漏）。唯一修改通道=直接编辑 个人存储表.txt。
-            if host.engine.schema.personal_has_text(text) {
-                return Response::err(
-                    400,
-                    "「个人存储表」里的词不进用户调整（会随导出泄漏）——请直接编辑方案目录的 个人存储表.txt",
-                );
-            }
-            // 【格式统一 2026-09-06】统一 用户调整.txt：{添加}码\t词[\tpN]。
-            // 同码同词旧行全清（含 {删除}——加词=明确想要它，修复加词
-            // 被旧删除行屏蔽的问题）后追加。
-            let file = host.engine.schema.dir.join("用户调整.txt");
-            rewrite_keep_lines(&file, code, text);
-            // 【占位符位加词=替换 2026-10-09】第 pos 位现有候选恰是占位
-            // 词（③④…）→ 先删它再添加——原位替换、其余候选不动
-            //（用户规格：d=「中 哪个 ③ ④ ⑤ …」加「都」@p4 →
-            // 「中 哪个 ③ 都 ⑤ …」，而不是整体挪位）。{删除}行写在
-            // {添加} 前，回放同效。
-            let del_line = if pos >= 1 {
-                host.engine
-                    .placeholder_at_pos(code, pos as usize)
-                    .filter(|ph| ph != text)
-                    .map(|ph| format!("{{删除}}{code}\t{ph}\n"))
-            } else {
-                None
-            };
-            let line = if pos >= 1 {
-                format!("{{添加}}{code}\t{text}\tp{pos}\n")
-            } else {
-                format!("{{添加}}{code}\t{text}\n")
-            };
-            use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file)
-            {
-                Ok(f) => f,
-                Err(e) => return Response::err(500, &format!("写入失败: {e}")),
-            };
-            if let Some(dl) = del_line {
-                if let Err(e) = f.write_all(dl.as_bytes()) {
-                    return Response::err(500, &format!("写入失败: {e}"));
+            match add_user_word(&mut host, code, text, pos) {
+                Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                Err(e) => {
+                    let status = if e.starts_with("写入失败") {
+                        500
+                    } else {
+                        400
+                    };
+                    Response::err(status, &e)
                 }
             }
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                return Response::err(500, &format!("写入失败: {e}"));
-            }
-            host.engine.reload_user_data();
-            Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/weight") => {
             // 【/jq→补充语料 2026-09-06 用户拍板】词+权重 → 写当前方案

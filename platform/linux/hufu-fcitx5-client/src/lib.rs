@@ -521,6 +521,36 @@ impl HufuClient {
         self.menu_scratch.as_ptr()
     }
 
+    /// 原生加词框：写当前方案用户调整（与 Web 设置页同一落盘逻辑）。
+    /// 成功为空；失败返回服务端错误文案（编码为空/个人存储表等）。
+    pub fn aw_add(&mut self, code: &str, text: &str, pos: i64) -> Result<(), String> {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "aw_add",
+            "code": code,
+            "text": text,
+            "pos": pos,
+        })) else {
+            return Err("引擎不在线".into());
+        };
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("加词失败")
+                .to_string())
+        }
+    }
+
+    /// [`Self::aw_add`] 的 C 指针包装：成功为空串，失败为错误文案
+    ///（指向 `menu_scratch`，下次调用前有效）。
+    pub fn aw_add_ptr(&mut self, code: &str, text: &str, pos: i64) -> *const c_char {
+        let msg = self.aw_add(code, text, pos).err().unwrap_or_default();
+        self.menu_scratch = CString::new(msg).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
     /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
     /// （1=开 / 0=关 / -1=未知——引擎不在线或回包异常）。
     ///
@@ -761,13 +791,7 @@ impl HufuClient {
 
     /// 候选对调（状态菜单「与下条对调」）：i/j 为页内下标，text_i/text_j
     /// 供服务端防漂移校验；成功后刷新候选面板。
-    pub fn cand_swap(
-        &mut self,
-        i: usize,
-        j: usize,
-        text_i: &str,
-        text_j: &str,
-    ) -> bool {
+    pub fn cand_swap(&mut self, i: usize, j: usize, text_i: &str, text_j: &str) -> bool {
         let Some(resp) = self.call(&serde_json::json!({
             "op": "cand_swap",
             "i": i,
@@ -1100,6 +1124,23 @@ pub unsafe extern "C" fn hufu_client_export_schema(c: *mut HufuClient) -> *const
         return std::ptr::null();
     }
     unsafe { &mut *c }.export_schema_ptr()
+}
+
+/// 原生加词：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）。参数同 Web `POST /api/user_word/add`。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_aw_add(
+    c: *mut HufuClient,
+    code: *const c_char,
+    text: *const c_char,
+    pos: c_int,
+) -> *const c_char {
+    if c.is_null() || code.is_null() || text.is_null() || pos < 0 {
+        return std::ptr::null();
+    }
+    let code = unsafe { CStr::from_ptr(code) }.to_string_lossy();
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    unsafe { &mut *c }.aw_add_ptr(&code, &text, i64::from(pos))
 }
 
 /// 托盘「按键音效」：引擎侧取反并落盘；返回新态（1=开 / 0=关 / -1=未知）。
@@ -2129,6 +2170,25 @@ mod tests {
             "",
             "三份数据都没有的字"
         );
+    }
+
+    /// 加词请求/回包格式（与 daemon op 对齐）：失败带服务端文案。
+    #[test]
+    fn aw_add_roundtrip() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("aw-add");
+        let handle = mock_server(
+            path.clone(),
+            vec![
+                serde_json::json!({"ok": true}),
+                serde_json::json!({"ok": false, "error": "编码与词不能为空"}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.aw_add("dgs", "测试", 2).is_ok());
+        assert_eq!(c.aw_add("", "", 0), Err("编码与词不能为空".into()));
+        handle.join().unwrap();
     }
 
     /// 候选菜单动作：`{ok,state}` 回包要把新候选送达宿主（面板即时刷新）。

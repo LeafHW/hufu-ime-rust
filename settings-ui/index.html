@@ -255,6 +255,15 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="btn-schema-refresh">刷新列表</button>
       <span class="sub" style="align-self:center">码表文件夹里新建方案目录后点「刷新列表」即可出现（与本地目录实时同步）。</span>
     </div>
+    <h3>加词</h3>
+    <div class="row">
+      <div class="field"><label>编码</label><input id="aw-code" placeholder="如 dgs" style="width:140px"></div>
+      <div class="field"><label>词</label><input id="aw-text" placeholder="要加的词" style="width:180px"></div>
+      <div class="field"><label>选重位</label><input type="number" id="aw-pos" min="0" max="99" value="0" style="width:90px"></div>
+      <button id="aw-add" class="primary">加词</button>
+      <span class="sub" id="aw-msg" style="align-self:center"></span>
+    </div>
+    <div class="sub">写当前方案「用户调整.txt」；0=置顶，1-99=固定第 N 位。个人存储表里的隐私词不在此加（见输入与候选页说明）。</div>
     <h3>拼音反查方案选择</h3>
     <div class="row">
       <div class="field"><label>反查方案（数据\拼音反查\ 内的表文件）</label>
@@ -3215,6 +3224,19 @@ $("#btn-save").style.display = "none"; // 初始页（方案）非整句模型�
   if (a) a.click();
 }
 $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e => msg(e.message, "err"));
+$("#aw-add").onclick = async () => {
+  const code = $("#aw-code").value.trim();
+  const text = $("#aw-text").value.trim();
+  const pos = parseInt($("#aw-pos").value, 10);
+  if (!code || !text) { msg("编码与词不能为空", "err"); return; }
+  if (!Number.isInteger(pos) || pos < 0 || pos > 99) { msg("选重位须在 0-99", "err"); return; }
+  try {
+    await api("POST", "/api/user_word/add", { code, text, pos });
+    $("#aw-msg").textContent = `已加「${text}」（${code}${pos ? " · 第 " + pos + " 位" : " · 置顶"}）`;
+    $("#aw-code").value = ""; $("#aw-text").value = ""; $("#aw-pos").value = "0";
+    msg("加词成功", "ok");
+  } catch (e) { msg(e.message, "err"); }
+};
 /* 【关于页 2026-10-16】版本/目录回填（/api/about：version.txt=安装包
    唯一版本源；开发目录无此文件 → crate 版本标「开发版」）。静态页，
    启动即拉一次即可。 */

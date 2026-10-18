@@ -46,6 +46,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -57,6 +58,8 @@
 // 不必连累其它 addon；类别默认级别为 Info，故现有 Info/Warning 的可见性不变。
 FCITX_DEFINE_LOG_CATEGORY(hufuLog, "hufu");
 #define HUFU_DEBUG() FCITX_LOGC(hufuLog, Debug)
+
+extern char **environ;
 
 namespace {
 
@@ -382,6 +385,82 @@ void spawnSoundPlayer(const std::string &exe, const std::vector<std::string> &ar
     ::waitpid(pid, &status, 0); // 只回收中间层（它立刻退出）
 }
 
+/// 原生对话框执行结果。`spawned=false` 表示找不到命令/无法启动；
+/// `ok=false` 且 `spawned=true` 表示用户取消或对话框报错。
+struct DialogResult {
+    bool spawned = false;
+    bool ok = false;
+    std::string out;
+};
+
+/// 同步跑一个原生对话框并收集 stdout。参数用 argv 数组，不经过 shell
+///（方案名/词条含空格或引号也安全）。对话框打开期间 fcitx5 UI 线程阻塞，
+/// 但焦点在对话框上，关闭后恢复——这是原生模态框可接受的取舍。
+DialogResult runDialog(const std::vector<std::string> &args) {
+    DialogResult result;
+    if (args.empty()) {
+        return result;
+    }
+    int fds[2] = {-1, -1};
+    if (::pipe(fds) != 0) {
+        return result;
+    }
+    posix_spawn_file_actions_t actions;
+    ::posix_spawn_file_actions_init(&actions);
+    ::posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    ::posix_spawn_file_actions_addclose(&actions, fds[0]);
+    ::posix_spawn_file_actions_addclose(&actions, fds[1]);
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (const std::string &a : args) {
+        argv.push_back(const_cast<char *>(a.c_str()));
+    }
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    const int rc = ::posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(),
+                                  environ);
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::close(fds[1]);
+    if (rc != 0) {
+        ::close(fds[0]);
+        return result; // 命令不存在：交给调用方换 kdialog
+    }
+    result.spawned = true;
+    char buf[512];
+    ssize_t n = 0;
+    while ((n = ::read(fds[0], buf, sizeof(buf))) > 0) {
+        result.out.append(buf, static_cast<size_t>(n));
+    }
+    ::close(fds[0]);
+    int status = 0;
+    if (::waitpid(pid, &status, 0) == pid) {
+        result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    return result;
+}
+
+std::string trimDialogText(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                          s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) {
+        ++i;
+    }
+    return s.substr(i);
+}
+
+/// 弹一个原生错误框；命令缺失就静默（只记日志）。
+void showDialogError(const std::string &message) {
+    DialogResult r = runDialog(
+        {"zenity", "--error", "--title=虎符", "--text=" + message});
+    if (!r.spawned) {
+        runDialog({"kdialog", "--title", "虎符", "--error", message});
+    }
+}
+
+/// 音效 wav 的落盘目录：`$XDG_RUNTIME_DIR/hufu-sound`（用户私有运行时目录，首选）；
 /// 音效 wav 的落盘目录：`$XDG_RUNTIME_DIR/hufu-sound`（用户私有运行时目录，首选）；
 /// `XDG_RUNTIME_DIR` 缺失时退回 `$TMPDIR`（与 socket 默认路径同口径），再退回 `/tmp`。
 std::string soundDirPath() {
@@ -1187,6 +1266,11 @@ private:
             [this] { hufu_client_export_schema(engine_); });
         instance_->userInterfaceManager().registerAction("hufu-export-schema",
                                                          exportAction_.get());
+        // 2d) 加词：原生表单 + daemon aw_add，与 Web 设置页同一落盘逻辑。
+        addwordAction_ = std::make_unique<HufuMenuAction>(
+            [] { return std::string("加词…"); }, [this] { showAddWordDialog(); });
+        instance_->userInterfaceManager().registerAction("hufu-addword",
+                                                         addwordAction_.get());
         // 3) 按键音效（默认关）：勾选态取引擎（sound_state），点击是引擎侧取反 + 落盘。
         soundAction_ = std::make_unique<HufuToggleAction>(
             "按键音效", [this] { return soundOn_ == 1; },
@@ -1205,7 +1289,8 @@ private:
         menu_.addAction(openDirAction_.get());
         menu_.addAction(settingsAction_.get());
         menu_.addAction(exportAction_.get());
-        // 2d) 候选管理：对当前高亮候选做置顶/前移/后移/置底/删除/与下条对调。
+        menu_.addAction(addwordAction_.get());
+        // 2f) 候选管理：对当前高亮候选做置顶/前移/后移/置底/删除/与下条对调。
         // 全部走 daemon 既有 cand_menu/cand_swap op；回包带 state，客户端会
         // 同步刷新候选面板。
         const auto addCandAction = [this](const char *id, const char *label,
@@ -1351,6 +1436,71 @@ private:
         if (engine_ == nullptr || hufu_client_open_schema_dir(engine_) != 1) {
             FCITX_LOGC(hufuLog, Warn)
                 << "hufu: 打开方案文件夹失败（hufu-server 在跑吗）";
+        }
+    }
+
+    /// 「加词」原生表单：编码/词/选重位。zenity 缺失时退回 kdialog 逐项输入。
+    /// 落盘由 daemon 的 aw_add 完成（与 Web 设置页同逻辑，含个人存储表拒绝）。
+    void showAddWordDialog() {
+        if (engine_ == nullptr) {
+            return;
+        }
+        std::string code;
+        std::string text;
+        std::string posText;
+        DialogResult forms = runDialog(
+            {"zenity", "--forms", "--title=虎符 · 加词",
+             "--text=写入当前方案的用户调整（0=置顶，1-99=固定第 N 位）",
+             "--separator=|", "--add-entry=编码（如 dgs）", "--add-entry=词",
+             "--add-entry=选重位"});
+        if (forms.spawned) {
+            if (!forms.ok) {
+                return; // 用户取消
+            }
+            const std::string out = trimDialogText(forms.out);
+            const size_t first = out.find('|');
+            const size_t last = out.rfind('|');
+            if (first == std::string::npos || last == first) {
+                return;
+            }
+            code = trimDialogText(out.substr(0, first));
+            text = trimDialogText(out.substr(first + 1, last - first - 1));
+            posText = trimDialogText(out.substr(last + 1));
+        } else {
+            const auto ask = [](const char *prompt) {
+                DialogResult r = runDialog(
+                    {"kdialog", "--title", "虎符 · 加词", "--inputbox", prompt, ""});
+                return (r.spawned && r.ok) ? trimDialogText(r.out)
+                                           : std::string();
+            };
+            code = ask("编码（如 dgs）");
+            if (code.empty()) {
+                return;
+            }
+            text = ask("词");
+            if (text.empty()) {
+                return;
+            }
+            posText = ask("选重位（0=置顶，1-99=固定）");
+        }
+        if (code.empty() || text.empty()) {
+            showDialogError("编码与词不能为空");
+            return;
+        }
+        int32_t pos = 0;
+        if (!posText.empty()) {
+            char *end = nullptr;
+            const long parsed = std::strtol(posText.c_str(), &end, 10);
+            if (end == posText.c_str() || *end != '\0' || parsed < 0 ||
+                parsed > 99) {
+                showDialogError("选重位须在 0-99");
+                return;
+            }
+            pos = static_cast<int32_t>(parsed);
+        }
+        const char *error = hufu_client_aw_add(engine_, code.c_str(), text.c_str(), pos);
+        if (error != nullptr && *error != '\0') {
+            showDialogError(error);
         }
     }
 
@@ -1931,6 +2081,7 @@ private:
     std::unique_ptr<HufuMenuAction> openDirAction_;
     std::unique_ptr<HufuMenuAction> settingsAction_;
     std::unique_ptr<HufuMenuAction> exportAction_;
+    std::unique_ptr<HufuMenuAction> addwordAction_;
     std::unique_ptr<HufuToggleAction> soundAction_;
     std::unique_ptr<HufuMenuAction> statusAction_;
     /// 宿主项开关「候选窗显示预编辑」（不进引擎选项，直接生效的配置项）

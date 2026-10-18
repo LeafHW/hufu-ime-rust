@@ -92,6 +92,11 @@ int32_t hufu_client_reload_schema(hufu_client *client);
  * 1=成功，0=失败（引擎不在线、方案目录不存在）。 */
 int32_t hufu_client_open_schema_dir(hufu_client *client);
 
+/* 方案清单：首行当前方案，其余每行一个方案名（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）；失败为空串。 */
+
+/* 切换方案：1=成功。 */
+
 /* 候选菜单动作（状态菜单「候选管理」）：
  * action ∈ front（置顶）/del（删除）/fwd（前移）/back（后移）/last（置底）；
  * text=当前候选词（防异步重排漂移），page_index=页内下标。
@@ -111,6 +116,11 @@ int32_t hufu_client_settings(hufu_client *client);
  * （NUL 结尾，指向客户端内部缓冲，**下次对同一客户端调用本函数前有效**），
  * 失败/引擎不在线返回空串（非 NULL）。 */
 const char *hufu_client_export_schema(hufu_client *client);
+
+/* 原生加词：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）。参数同 Web POST /api/user_word/add。 */
+const char *hufu_client_aw_add(hufu_client *client, const char *code,
+                               const char *text, int32_t pos);
 
 /* 「按键音效」开关：引擎侧取反并落盘（热生效）：1=开，0=关，
  * -1=未知（引擎不在线或回包异常）——宿主据此保持原勾选态。 */
