@@ -35,6 +35,10 @@ typedef struct hufu_host {
                    const char *const *candidate_commit_texts,
                    int32_t candidate_count, int32_t candidate_selected,
                    const char *aux_utf8, int32_t chinese);
+    /* 引擎提交「{加词}」时调用：宿主弹加词入口（可为 NULL）。 */
+    void (*addword)(void *user);
+    /* 引擎提交「{加权}」时调用：宿主弹加权入口（可为 NULL）。 */
+    void (*weight)(void *user);
 } hufu_host;
 
 /* hufu_client_key 返回值位掩码。 */
@@ -123,6 +127,14 @@ const char *hufu_client_export_schema(hufu_client *client);
  * 缓冲，下次调用前有效）。参数同 Web POST /api/user_word/add。 */
 const char *hufu_client_aw_add(hufu_client *client, const char *code,
                                const char *text, int32_t pos);
+
+/* 打开当前方案个人存储表（隐私词库）：1=成功，0=失败/文件不存在。 */
+int32_t hufu_client_open_personal(hufu_client *client);
+
+/* 原生加权：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+ * 缓冲，下次调用前有效）。参数同 Web POST /api/user_word/weight。 */
+const char *hufu_client_aw_weight(hufu_client *client, const char *text,
+                                  int32_t weight);
 
 /* 「按键音效」开关：引擎侧取反并落盘（热生效）：1=开，0=关，
  * -1=未知（引擎不在线或回包异常）——宿主据此保持原勾选态。 */

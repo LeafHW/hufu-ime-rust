@@ -67,6 +67,10 @@ pub struct HufuHost {
             c_int,
         ),
     >,
+    /// 引擎提交「{加词}」时调用（Windows 的 /jc 入口；可为 None）。
+    pub addword: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// 引擎提交「{加权}」时调用（Windows 的 /jq 入口；可为 None）。
+    pub weight: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 /// 回调期存活的字符串与指针（仅在 `deliver` 内构建/使用）。
@@ -600,6 +604,44 @@ impl HufuClient {
         self.menu_scratch.as_ptr()
     }
 
+    /// 原生加权框：写当前方案补充语料（与 Web POST /api/user_word/weight
+    /// 同一落盘逻辑）。成功为空；失败返回服务端错误文案。
+    pub fn aw_weight(&mut self, text: &str, weight: i64) -> Result<(), String> {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "aw_weight",
+            "text": text,
+            "weight": weight,
+        })) else {
+            return Err("引擎不在线".into());
+        };
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("加权失败")
+                .to_string())
+        }
+    }
+
+    /// 状态菜单「个人存储表…」：请 server 用系统编辑器打开当前方案
+    /// `个人存储表.txt`（隐私词库）；返回是否成功。
+    pub fn open_personal(&mut self) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({"op": "open_personal"})) else {
+            return false;
+        };
+        resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// [`Self::aw_weight`] 的 C 指针包装：成功为空串，失败为错误文案
+    ///（指向 `menu_scratch`，下次调用前有效）。
+    pub fn aw_weight_ptr(&mut self, text: &str, weight: i64) -> *const c_char {
+        let msg = self.aw_weight(text, weight).err().unwrap_or_default();
+        self.menu_scratch = CString::new(msg).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
     /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
     /// （1=开 / 0=关 / -1=未知——引擎不在线或回包异常）。
     ///
@@ -932,10 +974,18 @@ impl HufuClient {
 
     /// 送达 commit + update 回调（C++ 侧同步拷贝）。
     fn deliver(&mut self, outcome: &KeyOutcome, state: &SessionState) {
-        if let Some(cb) = self.host.commit {
-            if let Some(text) = outcome.commit.as_deref() {
-                // 功能词指令不算上屏内容（与 DLL/pipe 同口径）
-                if !text.is_empty() && text != "{加词}" && text != "{隐藏候选}" {
+        if let Some(text) = outcome.commit.as_deref() {
+            // 功能词指令不算上屏内容（与 DLL/pipe 同口径）
+            if text == "{加词}" {
+                if let Some(addword) = self.host.addword {
+                    unsafe { addword(self.host.user) };
+                }
+            } else if text == "{加权}" {
+                if let Some(weight) = self.host.weight {
+                    unsafe { weight(self.host.user) };
+                }
+            } else if !text.is_empty() && text != "{隐藏候选}" {
+                if let Some(cb) = self.host.commit {
                     if let Ok(cs) = CString::new(text) {
                         unsafe { cb(self.host.user, cs.as_ptr()) };
                     }
@@ -1015,6 +1065,8 @@ pub unsafe extern "C" fn hufu_client_new(
             user: std::ptr::null_mut(),
             commit: None,
             update: None,
+            addword: None,
+            weight: None,
         }
     } else {
         unsafe { *host }
@@ -1214,6 +1266,34 @@ pub unsafe extern "C" fn hufu_client_aw_add(
     let code = unsafe { CStr::from_ptr(code) }.to_string_lossy();
     let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
     unsafe { &mut *c }.aw_add_ptr(&code, &text, i64::from(pos))
+}
+
+/// 原生加权：成功返回空串，失败返回错误文案（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）。参数同 Web `POST /api/user_word/weight`。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_aw_weight(
+    c: *mut HufuClient,
+    text: *const c_char,
+    weight: i32,
+) -> *const c_char {
+    if c.is_null() || text.is_null() || weight <= 0 {
+        return std::ptr::null();
+    }
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    unsafe { &mut *c }.aw_weight_ptr(&text, i64::from(weight))
+}
+
+/// 打开当前方案个人存储表：1=成功，0=失败/文件不存在/引擎不在线。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_open_personal(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.open_personal() {
+        1
+    } else {
+        0
+    }
 }
 
 /// 托盘「按键音效」：引擎侧取反并落盘；返回新态（1=开 / 0=关 / -1=未知）。
@@ -1470,6 +1550,8 @@ mod tests {
     struct Capture {
         commits: Vec<String>,
         updates: Vec<UpdateRecord>,
+        addwords: usize,
+        weights: usize,
     }
 
     fn cap_mut<'a>(user: *mut c_void) -> &'a mut Capture {
@@ -1481,6 +1563,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         cap_mut(user).commits.push(s);
+    }
+
+    unsafe extern "C" fn on_addword(user: *mut c_void) {
+        cap_mut(user).addwords += 1;
+    }
+
+    unsafe extern "C" fn on_weight(user: *mut c_void) {
+        cap_mut(user).weights += 1;
     }
 
     unsafe extern "C" fn on_update(
@@ -1559,6 +1649,61 @@ mod tests {
         })
     }
 
+    #[test]
+    fn addword_directive_calls_host_callback() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let mut client = HufuClient::new(
+            PathBuf::from("/tmp/hufu-addword-test.sock"),
+            HufuHost {
+                user: cap_ptr as *mut c_void,
+                commit: Some(on_commit),
+                update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
+            },
+        );
+        let resp = serde_json::json!({
+            "outcome": {
+                "consumed": true,
+                "commit": "{加词}",
+                "back": 0,
+                "state": null
+            }
+        });
+        let (_consumed, _back) = client.apply_outcome_response(resp);
+        assert_eq!(cap.addwords, 1);
+        assert!(cap.commits.is_empty());
+    }
+
+    #[test]
+    fn weight_directive_calls_host_callback() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let mut client = HufuClient::new(
+            PathBuf::from("/tmp/hufu-weight-test.sock"),
+            HufuHost {
+                user: cap_ptr as *mut c_void,
+                commit: Some(on_commit),
+                update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
+            },
+        );
+        let resp = serde_json::json!({
+            "outcome": {
+                "consumed": true,
+                "commit": "{加权}",
+                "back": 0,
+                "state": null
+            }
+        });
+        let (_consumed, _back) = client.apply_outcome_response(resp);
+        assert_eq!(cap.weights, 1);
+        assert_eq!(cap.addwords, 0);
+        assert!(cap.commits.is_empty());
+    }
+
     fn client_for(path: PathBuf, cap: *mut Capture) -> HufuClient {
         HufuClient::new(
             path,
@@ -1566,6 +1711,8 @@ mod tests {
                 user: cap as *mut c_void,
                 commit: Some(on_commit),
                 update: Some(on_update),
+                addword: Some(on_addword),
+                weight: Some(on_weight),
             },
         )
     }
@@ -2196,6 +2343,8 @@ mod tests {
                 user: std::ptr::null_mut(),
                 commit: None,
                 update: None,
+                addword: None,
+                weight: None,
             },
         )
     }

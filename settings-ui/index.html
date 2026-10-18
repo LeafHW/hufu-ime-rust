@@ -264,6 +264,19 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <span class="sub" id="aw-msg" style="align-self:center"></span>
     </div>
     <div class="sub">写当前方案「用户调整.txt」；0=置顶，1-99=固定第 N 位。个人存储表里的隐私词不在此加（见输入与候选页说明）。</div>
+    <h3>加权</h3>
+    <div class="row">
+      <div class="field"><label>词</label><input id="aww-text" placeholder="要加权的词" style="width:180px"></div>
+      <div class="field"><label>权重</label><input type="number" id="aww-weight" min="1" max="1000000000" value="1000" style="width:120px"></div>
+      <button id="aww-add" class="primary">加权</button>
+      <span class="sub" id="aww-msg" style="align-self:center"></span>
+    </div>
+    <div class="sub">写当前方案「补充语料.txt」并后台重载整句模型；默认 1000，越大越优先。个人存储表里的隐私词不在此加权。</div>
+    <h3>个人存储表</h3>
+    <div class="row">
+      <button id="open-personal">打开个人存储表…</button>
+      <span class="sub" id="personal-msg" style="align-self:center">隐私词库按方案存放，直接用系统编辑器增删改；不参与前台调频/置顶/删词/导出。</span>
+    </div>
     <h3>拼音反查方案选择</h3>
     <div class="row">
       <div class="field"><label>反查方案（数据\拼音反查\ 内的表文件）</label>
@@ -3236,6 +3249,26 @@ $("#aw-add").onclick = async () => {
     $("#aw-code").value = ""; $("#aw-text").value = ""; $("#aw-pos").value = "0";
     msg("加词成功", "ok");
   } catch (e) { msg(e.message, "err"); }
+};
+$("#aww-add").onclick = async () => {
+  const text = $("#aww-text").value.trim();
+  const weight = parseInt($("#aww-weight").value, 10);
+  if (!text) { msg("词不能为空", "err"); return; }
+  if (!Number.isInteger(weight) || weight < 1 || weight > 1000000000) {
+    msg("权重须为 1-1000000000 的正整数", "err"); return;
+  }
+  try {
+    await api("POST", "/api/user_word/weight", { text, weight });
+    $("#aww-msg").textContent = `已加权「${text}」（${weight}）`;
+    $("#aww-text").value = "";
+    msg("加权成功", "ok");
+  } catch (e) { msg(e.message, "err"); }
+};
+$("#open-personal").onclick = async () => {
+  try {
+    await api("POST", "/api/open_personal", {});
+    msg("已打开个人存储表", "ok");
+  } catch (e) { msg("打开失败：" + e.message, "err"); }
 };
 /* 【关于页 2026-10-16】版本/目录回填（/api/about：version.txt=安装包
    唯一版本源；开发目录无此文件 → crate 版本标「开发版」）。静态页，

@@ -1015,6 +1015,51 @@ pub(crate) fn add_user_word(
     Ok(())
 }
 
+/// 加权落盘（`/jq` 与 Web `/api/user_word/weight` 共用）：写当前方案
+/// `补充语料.txt` 的 `词 权重`（同词旧行先清），并后台重载整句模型。
+/// 个人存储表里的隐私词拒绝——不得进入补充语料明文/导出。
+pub(crate) fn add_user_weight(host: &mut Host, text: &str, weight: i64) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("词不能为空".into());
+    }
+    if !(1..=1_000_000_000).contains(&weight) {
+        return Err("权重须为正整数".into());
+    }
+    if host.engine.schema.personal_has_text(text) {
+        return Err(
+            "「个人存储表」里的词不受前台加权——请直接编辑方案目录的 个人存储表.txt".into(),
+        );
+    }
+    let file = host.engine.schema.dir.join("补充语料.txt");
+    rewrite_supplement_lines(&file, text);
+    let line = format!("{text} {weight}\n");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(|e| format!("写入失败: {e}"))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("写入失败: {e}"))?;
+    // 补充语料只在模型装载时生效：后台重载，期间旧模型继续服务。
+    if let Some(h) = HOST_HANDLE.get() {
+        spawn_sentence_reload(h.clone(), true);
+    }
+    Ok(())
+}
+
+/// 打开当前方案的个人存储表（隐私词库）。文件由方案目录模板提供；
+/// 不存在时提示先切一次方案（Host 启动会补模板）。
+pub(crate) fn open_personal(host: &Host) -> Result<(), String> {
+    let path = host.engine.schema.dir.join("个人存储表.txt");
+    if !path.is_file() {
+        return Err("个人存储表不存在（切一次方案或重载码表后会生成模板）".into());
+    }
+    platform::open_path(&path);
+    Ok(())
+}
+
 /// 【格式统一 2026-09-06】清 用户调整.txt 中同码同词旧行（四种标记
 /// 行+旧 TSV 词行一起清——写入端只留最新操作，文件不膨胀且回放
 /// 语义与追加日志等价）。
@@ -1982,55 +2027,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
         }
         ("POST", "/api/user_word/weight") => {
-            // 【/jq→补充语料 2026-09-06 用户拍板】词+权重 → 写当前方案
-            // 的 补充语料.txt：`词 权重`（同词旧行先清）——/jq 的语义
-            // 是「提升整句里这个词的概率」，这正是补充语料的职责
-            //（ngram 词图注入，奖励 = 9+2·ln(权重/1000)，上限 32）。
-            // 补充语料只在模型装载时生效 → 写完后台重载整句引擎
-            //（~2s，期间旧模型继续服务）。不再写 用户调整.txt 的
-            // {加权} 行（旧行回放兼容保留）。
+            // 【/jq→补充语料 2026-09-06】词+权重 → 当前方案 补充语料.txt；
+            // 同词旧行先清，后台重载整句模型。详见 add_user_weight。
             let v = req.json();
-            let text = v
-                .get("text")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
             let weight = v.get("weight").and_then(|x| x.as_i64()).unwrap_or(1000);
-            if text.is_empty() {
-                return Response::err(400, "词不能为空");
+            match add_user_weight(&mut host, text, weight) {
+                Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                Err(e) => {
+                    let status = if e.starts_with("写入失败") { 500 } else { 400 };
+                    Response::err(status, &e)
+                }
             }
-            if !(1..=1_000_000_000).contains(&weight) {
-                return Response::err(400, "权重须为正整数");
-            }
-            // 【个人存储表防泄漏 2026-10-16】隐私词不进补充语料明文
-            //（同加词口径——/jq 也是前台通道，个人存储表不归它管）。
-            if host.engine.schema.personal_has_text(&text) {
-                return Response::err(
-                    400,
-                    "「个人存储表」里的词不受前台加权——请直接编辑方案目录的 个人存储表.txt",
-                );
-            }
-            let file = host.engine.schema.dir.join("补充语料.txt");
-            rewrite_supplement_lines(&file, &text);
-            let line = format!("{text} {weight}\n");
-            use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file)
-            {
-                Ok(f) => f,
-                Err(e) => return Response::err(500, &format!("写入失败: {e}")),
-            };
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                return Response::err(500, &format!("写入失败: {e}"));
-            }
-            // 后台重载整句模型（刷新补充语料快照→重载 ngram→热挂）
-            if let Some(h) = HOST_HANDLE.get() {
-                spawn_sentence_reload(h.clone(), true);
-            }
-            Response::json(&serde_json::json!({"ok": true}))
         }
         ("POST", "/api/user_word/remove") => {
             let v = req.json();
@@ -2396,6 +2404,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             crate::platform::open_path(&dir);
             Response::json(&serde_json::json!({"ok": true, "path": dir}))
         }
+        ("POST", "/api/open_personal") => match open_personal(&host) {
+            Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+            Err(e) => Response::err(400, &e),
+        },
         ("POST", "/api/export_schema") => {
             // body {name?, format?, remember?, lines_only?}：name 缺省=
             // 当前方案；format 缺省/空=记忆格式或虎整句 `码 词 词`（字节

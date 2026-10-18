@@ -759,6 +759,21 @@ pub fn dispatch(
                 Err(e) => serde_json::json!({"ok": false, "error": e}),
             }
         }
+        // Linux 原生加权框：与 Web POST /api/user_word/weight 同一落盘
+        // 逻辑（补充语料 + 后台整句重载）。返回 {ok} 或 {ok:false,error}。
+        "aw_weight" => {
+            let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let weight = req.get("weight").and_then(|v| v.as_i64()).unwrap_or(1000);
+            match crate::add_user_weight(&mut host, text, weight) {
+                Ok(()) => serde_json::json!({"ok": true}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            }
+        }
+        // Linux 状态菜单「个人存储表…」：交给系统编辑器打开。
+        "open_personal" => match crate::open_personal(&host) {
+            Ok(()) => serde_json::json!({"ok": true}),
+            Err(e) => serde_json::json!({"ok": false, "error": e}),
+        },
         "aw_ph_set" => {
             let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
             host.addword_ph = on;
@@ -1816,6 +1831,37 @@ mod candidate_tests {
         );
         assert_eq!(bad["ok"], false);
         assert!(bad["error"].as_str().is_some_and(|e| e.contains("0-99")));
+    }
+
+    #[test]
+    fn aw_weight_writes_supplement_and_rejects_bad_weight() {
+        let root = std::env::temp_dir().join(format!("hufu-aw-weight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(root.join("码表/T/main.txt"), "#hufu-dict v1 name=t\na\t甲\n").unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"}}"#,
+        )
+        .unwrap();
+        let host = Mutex::new(Host::new(&root.join("数据")).unwrap());
+        let ok = dispatch(
+            &host,
+            &json!({"op":"aw_weight","text":"甲","weight":2000}),
+            None,
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        let file = root.join("码表/T/补充语料.txt");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("甲 2000"), "{content}");
+        let bad = dispatch(
+            &host,
+            &json!({"op":"aw_weight","text":"甲","weight":0}),
+            None,
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["error"].as_str().is_some_and(|e| e.contains("正整数")));
     }
 
     #[test]
