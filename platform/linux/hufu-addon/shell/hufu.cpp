@@ -1129,6 +1129,18 @@ private:
             [this] { openSchemaDir(); });
         instance_->userInterfaceManager().registerAction("hufu-open-schema-dir",
                                                          openDirAction_.get());
+        // 2b) 打开设置页：server 用 xdg-open 拉起 Web 设置（端口以 server 为准）。
+        settingsAction_ = std::make_unique<HufuMenuAction>(
+            [] { return std::string("打开设置页"); },
+            [this] { hufu_client_settings(engine_); });
+        instance_->userInterfaceManager().registerAction("hufu-settings",
+                                                         settingsAction_.get());
+        // 2c) 导出码表：导出当前方案并打开导出目录（Windows 语言栏同款 op）。
+        exportAction_ = std::make_unique<HufuMenuAction>(
+            [] { return std::string("导出码表"); },
+            [this] { hufu_client_export_schema(engine_); });
+        instance_->userInterfaceManager().registerAction("hufu-export-schema",
+                                                         exportAction_.get());
         // 3) 按键音效（默认关）：勾选态取引擎（sound_state），点击是引擎侧取反 + 落盘。
         soundAction_ = std::make_unique<HufuToggleAction>(
             "按键音效", [this] { return soundOn_ == 1; },
@@ -1145,6 +1157,8 @@ private:
                                                          statusAction_.get());
         menu_.addAction(reloadAction_.get());
         menu_.addAction(openDirAction_.get());
+        menu_.addAction(settingsAction_.get());
+        menu_.addAction(exportAction_.get());
         menu_.addAction(soundAction_.get());
         menu_.addAction(statusAction_.get());
         // 5) 候选窗显示预编辑（宿主项，默认开）：本层直接生效，不打扰引擎；
@@ -1840,6 +1854,8 @@ private:
     fcitx::SimpleAction menuAction_;
     std::unique_ptr<HufuMenuAction> reloadAction_;
     std::unique_ptr<HufuMenuAction> openDirAction_;
+    std::unique_ptr<HufuMenuAction> settingsAction_;
+    std::unique_ptr<HufuMenuAction> exportAction_;
     std::unique_ptr<HufuToggleAction> soundAction_;
     std::unique_ptr<HufuMenuAction> statusAction_;
     /// 宿主项开关「候选窗显示预编辑」（不进引擎选项，直接生效的配置项）

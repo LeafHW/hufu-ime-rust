@@ -92,6 +92,15 @@ int32_t hufu_client_reload_schema(hufu_client *client);
  * 1=成功，0=失败（引擎不在线、方案目录不存在）。 */
 int32_t hufu_client_open_schema_dir(hufu_client *client);
 
+/* 「打开设置页」：请 server 用 xdg-open 打开 Web 设置页：
+ * 1=成功，0=失败（引擎不在线）。 */
+int32_t hufu_client_settings(hufu_client *client);
+
+/* 「导出码表」：导出当前方案并打开导出目录；成功返回导出文件路径
+ * （NUL 结尾，指向客户端内部缓冲，**下次对同一客户端调用本函数前有效**），
+ * 失败/引擎不在线返回空串（非 NULL）。 */
+const char *hufu_client_export_schema(hufu_client *client);
+
 /* 「按键音效」开关：引擎侧取反并落盘（热生效）：1=开，0=关，
  * -1=未知（引擎不在线或回包异常）——宿主据此保持原勾选态。 */
 int32_t hufu_client_sound_toggle(hufu_client *client);

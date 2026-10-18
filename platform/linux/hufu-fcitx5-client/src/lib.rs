@@ -360,6 +360,8 @@ pub struct HufuClient {
     config: Option<serde_json::Value>,
     /// `hufu_client_config_str` 返回值缓存（C++ 侧同步拷走）
     config_scratch: CString,
+    /// 状态区菜单返回值缓存（如导出路径；C++ 侧同步拷走）
+    menu_scratch: CString,
     /// 字反查索引（宿主首次触发时才装载；`None` = 未初始化或数据不可用）
     char_lookup: Option<CharLookup>,
     /// `hufu_client_char_lookup` 返回值缓存（C++ 侧同步拷走）
@@ -388,6 +390,7 @@ impl HufuClient {
             last_back: 0,
             config: None,
             config_scratch: CString::default(),
+            menu_scratch: CString::default(),
             char_lookup: None,
             char_lookup_row: CString::default(),
             sound_pending: CString::default(),
@@ -488,6 +491,34 @@ impl HufuClient {
         self.call(&serde_json::json!({"op": "open_schema_dir"}))
             .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// 托盘「打开设置页」：请 server 用 xdg-open 打开 Web 设置页
+    /// （`http://127.0.0.1:<port>/`）；1=成功，0=失败（含引擎不在线）。
+    pub fn settings(&mut self) -> bool {
+        self.call(&serde_json::json!({"op": "settings"}))
+            .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// 托盘「导出码表」：请引擎导出当前方案（含用户调整合并快照）并打开
+    /// 导出目录；返回导出文件路径，失败/引擎不在线返回 `None`。
+    pub fn export_schema(&mut self) -> Option<String> {
+        let resp = self.call(&serde_json::json!({"op": "export_schema"}))?;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        resp.get("path")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string)
+    }
+
+    /// 同 [`Self::export_schema`]，把路径写入 `menu_scratch` 并返回 C 指针
+    /// （失败为空串）。C++ 侧同步拷走。
+    pub fn export_schema_ptr(&mut self) -> *const c_char {
+        let path = self.export_schema().unwrap_or_default();
+        self.menu_scratch = CString::new(path).unwrap_or_default();
+        self.menu_scratch.as_ptr()
     }
 
     /// 托盘「按键音效」：引擎侧取反并落盘（热生效）；返回**新态**
@@ -950,6 +981,29 @@ pub unsafe extern "C" fn hufu_client_open_schema_dir(c: *mut HufuClient) -> c_in
     } else {
         0
     }
+}
+
+/// 托盘「打开设置页」：请 server 用 xdg-open 打开 Web 设置页；1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_settings(c: *mut HufuClient) -> c_int {
+    if c.is_null() {
+        return 0;
+    }
+    if unsafe { &mut *c }.settings() {
+        1
+    } else {
+        0
+    }
+}
+
+/// 托盘「导出码表」：成功返回导出文件路径（NUL 结尾，指向客户端内部缓冲，
+/// 下次调用前有效）；失败/引擎不在线返回空串（非 NULL）。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_export_schema(c: *mut HufuClient) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.export_schema_ptr()
 }
 
 /// 托盘「按键音效」：引擎侧取反并落盘；返回新态（1=开 / 0=关 / -1=未知）。
@@ -1613,6 +1667,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_and_export_schema_requests() {
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("settings-export");
+        let (handle, captured) = mock_server_capture(
+            path.clone(),
+            vec![
+                serde_json::json!({"ok": true}),
+                serde_json::json!({"ok": true, "path": "/home/u/.local/share/hufu/导出/虎整句/虎整句.txt", "lines": 123}),
+                serde_json::json!({"ok": false, "error": "写文件失败"}),
+            ],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.settings(), "打开设置页：ok=true 即成功");
+        assert_eq!(
+            c.export_schema().as_deref(),
+            Some("/home/u/.local/share/hufu/导出/虎整句/虎整句.txt"),
+            "导出成功返回路径"
+        );
+        assert!(c.export_schema().is_none(), "ok=false 按失败处理");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0]["op"], "settings");
+        assert_eq!(reqs[1]["op"], "export_schema");
+        assert_eq!(reqs[2]["op"], "export_schema");
+        drop(reqs);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn menu_ops_offline_semantics() {
         let mut cap = Box::new(Capture::default());
         let cap_ptr: *mut Capture = &mut *cap;
@@ -1621,6 +1705,8 @@ mod tests {
         // 引擎不在线：动作类（1/0）回 0，状态类回 -1（未知）——宿主保持现状、不崩。
         assert!(!c.reload_schema());
         assert!(!c.open_schema_dir());
+        assert!(!c.settings());
+        assert!(c.export_schema().is_none());
         assert_eq!(c.sound_toggle(), -1);
         assert_eq!(c.sound_state(), -1);
     }
