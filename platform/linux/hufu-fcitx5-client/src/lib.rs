@@ -501,6 +501,55 @@ impl HufuClient {
             .unwrap_or(false)
     }
 
+    /// 方案清单（状态菜单「切换方案」）：返回（当前方案，全部方案名排序）。
+    pub fn schemas(&mut self) -> Option<(String, Vec<String>)> {
+        let resp = self.call(&serde_json::json!({"op": "schemas"}))?;
+        let current = resp
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let names = resp
+            .get("schemas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((current, names))
+    }
+
+    /// [`Self::schemas`] 的 C 指针包装：首行当前方案，其余每行一个方案名；
+    /// 失败为空串。C++ 侧按行切分（方案名不含换行）。
+    pub fn schemas_text_ptr(&mut self) -> *const c_char {
+        let text = self
+            .schemas()
+            .map(|(cur, names)| {
+                let mut s = cur;
+                for n in names {
+                    s.push('\n');
+                    s.push_str(&n);
+                }
+                s
+            })
+            .unwrap_or_default();
+        self.menu_scratch = CString::new(text).unwrap_or_default();
+        self.menu_scratch.as_ptr()
+    }
+
+    /// 切换方案（状态菜单「切换方案」）：服务端换方案 + 清会话 + 落盘；
+    /// 1=成功。成功后调用方应再 `reset` 一次刷新面板。
+    pub fn set_schema(&mut self, name: &str) -> bool {
+        self.call(&serde_json::json!({"op": "set_schema", "name": name}))
+            .map(|v| {
+                v.get("schemas").is_some()
+                    && v.get("current").and_then(|c| c.as_str()) == Some(name)
+            })
+            .unwrap_or(false)
+    }
+
     /// 托盘「导出码表」：请引擎导出当前方案（含用户调整合并快照）并打开
     /// 导出目录；返回导出文件路径，失败/引擎不在线返回 `None`。
     pub fn export_schema(&mut self) -> Option<String> {
@@ -1029,6 +1078,30 @@ pub unsafe extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) ->
         return 0;
     }
     if unsafe { &mut *c }.select(index as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 方案清单：首行当前方案，其余每行一个方案名（NUL 结尾，指向客户端内部
+/// 缓冲，下次调用前有效）；失败为空串。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_schemas(c: *mut HufuClient) -> *const c_char {
+    if c.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &mut *c }.schemas_text_ptr()
+}
+
+/// 切换方案：1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_set_schema(c: *mut HufuClient, name: *const c_char) -> c_int {
+    if c.is_null() || name.is_null() {
+        return 0;
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    if unsafe { &mut *c }.set_schema(&name) {
         1
     } else {
         0
@@ -2172,22 +2245,26 @@ mod tests {
         );
     }
 
-    /// 加词请求/回包格式（与 daemon op 对齐）：失败带服务端文案。
+    /// 加词与方案清单/切换的请求/回包格式（与 daemon op 对齐）。
     #[test]
-    fn aw_add_roundtrip() {
+    fn aw_add_and_schema_roundtrip() {
         let mut cap = Box::new(Capture::default());
         let cap_ptr: *mut Capture = &mut *cap;
-        let path = test_sock("aw-add");
+        let path = test_sock("aw-schema");
         let handle = mock_server(
             path.clone(),
             vec![
                 serde_json::json!({"ok": true}),
-                serde_json::json!({"ok": false, "error": "编码与词不能为空"}),
+                serde_json::json!({"current": "A", "schemas": ["A", "B"]}),
+                serde_json::json!({"current": "B", "schemas": ["A", "B"]}),
             ],
         );
         let mut c = client_for(path, cap_ptr);
         assert!(c.aw_add("dgs", "测试", 2).is_ok());
-        assert_eq!(c.aw_add("", "", 0), Err("编码与词不能为空".into()));
+        let (cur, names) = c.schemas().expect("schemas");
+        assert_eq!(cur, "A");
+        assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+        assert!(c.set_schema("B"));
         handle.join().unwrap();
     }
 

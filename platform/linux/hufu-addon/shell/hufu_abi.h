@@ -94,8 +94,10 @@ int32_t hufu_client_open_schema_dir(hufu_client *client);
 
 /* 方案清单：首行当前方案，其余每行一个方案名（NUL 结尾，指向客户端内部
  * 缓冲，下次调用前有效）；失败为空串。 */
+const char *hufu_client_schemas(hufu_client *client);
 
 /* 切换方案：1=成功。 */
+int32_t hufu_client_set_schema(hufu_client *client, const char *name);
 
 /* 候选菜单动作（状态菜单「候选管理」）：
  * action ∈ front（置顶）/del（删除）/fwd（前移）/back（后移）/last（置底）；
