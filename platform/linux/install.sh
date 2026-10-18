@@ -2,19 +2,24 @@
 # SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# 虎符 Linux 安装：构建 → 装配 assets → 用户级服务 → 系统级 addon。
+# 虎符 Linux 安装：构建 → 装配 assets → 用户运行时 → 系统级或用户级 fcitx5 addon。
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
 虎符输入法 · Linux 安装（在仓库根目录执行）
-用法：platform/linux/install.sh [选项]
+用法：platform/linux/install.sh -s|--system [--no-build]
+      platform/linux/install.sh -u|--user   [--no-build]
 
+  -s, --system  安装系统级 fcitx5 addon（需要 sudo）
+  -u, --user    安装用户级 fcitx5 addon（无需 sudo）
   --no-build    跳过构建（使用已有产物）
-  --no-system   跳过系统级 addon（不调用 sudo）
   -h, --help    显示本用法
 
-安装会同时装配仓库 assets/码表/ 与 assets/数据/；模型需另行获取。
+短选项可合并（如 -sh），但 -s 与 -u 互斥。
+空参、-h、--help 均显示本用法；安装时必须显式指定 -s 或 -u。
+两种方式都会安装用户运行时：码表/数据、hufu-server、systemd user 服务、
+桌面入口、图标与主题。模型不随仓库分发，需另行获取。
 EOF
 }
 
@@ -28,23 +33,86 @@ BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 BUILD_DIR="$ROOT/platform/linux/build"
 SERVER_BIN="$ROOT/engine/target/release/hufu-server"
 ADDON_SO="$BUILD_DIR/libhufu.so"
+ADDON_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf"
+IM_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf"
 
-if [[ "$EUID" -eq 0 ]]; then
-    echo '✗ 请勿用 sudo 运行整个脚本（用户级文件会装到 /root）。' >&2
-    echo '  正确用法：platform/linux/install.sh [--no-build] [--no-system]' >&2
+# 用户级 addon：conf 放 XDG 数据目录，Library 指向同一用户目录下的绝对路径。
+USER_FCITX_DATA="$XDG_DATA/fcitx5"
+USER_ADDON_DIR="$USER_FCITX_DATA/addon"
+USER_IM_DIR="$USER_FCITX_DATA/inputmethod"
+USER_LIB_DIR="$USER_FCITX_DATA/lib"
+
+# 系统级 addon：Debian/Ubuntu 的 libdir 可能带 multiarch。
+system_addon_dir() {
+    local libdir=''
+    if command -v pkg-config >/dev/null 2>&1; then
+        libdir=$(pkg-config --variable=libdir Fcitx5Core 2>/dev/null || true)
+    fi
+    [[ -n "$libdir" ]] || libdir=/usr/lib
+    printf '%s/fcitx5\n' "$libdir"
+}
+SYSTEM_ADDON_DIR="$(system_addon_dir)"
+
+if (($# == 0)); then
+    usage
+    exit 0
+fi
+
+MODE=''
+DO_BUILD=1
+set_mode() {
+    case "$1" in
+        s)
+            if [[ "$MODE" == user ]]; then
+                echo '✗ -s/--system 与 -u/--user 不能同时使用' >&2
+                exit 2
+            fi
+            MODE=system ;;
+        u)
+            if [[ "$MODE" == system ]]; then
+                echo '✗ -s/--system 与 -u/--user 不能同时使用' >&2
+                exit 2
+            fi
+            MODE=user ;;
+    esac
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --system) set_mode s; shift ;;
+        --user) set_mode u; shift ;;
+        --no-build) DO_BUILD=0; shift ;;
+        --help) usage; exit 0 ;;
+        --) shift; break ;;
+        --*) echo "✗ 未知选项: $1（--help 看用法）" >&2; exit 2 ;;
+        -?*)
+            cluster=${1#-}
+            while [[ -n "$cluster" ]]; do
+                ch=${cluster:0:1}
+                cluster=${cluster:1}
+                case "$ch" in
+                    s|u) set_mode "$ch" ;;
+                    h) usage; exit 0 ;;
+                    *) echo "✗ 未知选项: -$ch（--help 看用法）" >&2; exit 2 ;;
+                esac
+            done
+            shift ;;
+        *) echo "✗ 不支持位置参数: $1（--help 看用法）" >&2; exit 2 ;;
+    esac
+done
+if (($# > 0)); then
+    echo "✗ 不支持位置参数: $1（--help 看用法）" >&2
+    exit 2
+fi
+if [[ -z "$MODE" ]]; then
+    echo '✗ 必须指定 -s/--system 或 -u/--user（--help 看用法）' >&2
     exit 2
 fi
 
-DO_BUILD=1
-NO_SYSTEM=0
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --no-build) DO_BUILD=0; shift ;;
-        --no-system) NO_SYSTEM=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "未知参数: $1（--help 看用法）" >&2; exit 2 ;;
-    esac
-done
+if [[ "$EUID" -eq 0 ]]; then
+    echo '✗ 请勿用 sudo 运行整个脚本（用户级文件会装到 /root）。' >&2
+    echo '  正确用法：platform/linux/install.sh -s|--system  或  -u|--user' >&2
+    exit 2
+fi
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
@@ -154,27 +222,32 @@ else
 fi
 [[ ":$PATH:" == *":$BIN_DIR:"* ]] || echo "  · 提示：$BIN_DIR 不在 PATH 中"
 
-if [[ "$NO_SYSTEM" == 1 ]]; then
-    say '⑤ 跳过系统级 addon（--no-system）'
-    echo "  之后执行：sudo install -Dm755 $ADDON_SO /usr/lib/fcitx5/libhufu.so"
-    echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf /usr/share/fcitx5/addon/hufu.conf"
-    echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf /usr/share/fcitx5/inputmethod/hufu.conf"
+if [[ "$MODE" == user ]]; then
+    say '⑤ 安装用户级 fcitx5 addon（无需 sudo）'
+    mkdir -p "$USER_ADDON_DIR" "$USER_IM_DIR" "$USER_LIB_DIR"
+    install -m 755 "$ADDON_SO" "$USER_LIB_DIR/libhufu.so"
+    install -m 644 "$ADDON_CONF_SRC" "$USER_ADDON_DIR/hufu.conf"
+    install -m 644 "$IM_CONF_SRC" "$USER_IM_DIR/hufu.conf"
+    sed -i "s|^Library=.*|Library=$USER_LIB_DIR/libhufu|" \
+        "$USER_ADDON_DIR/hufu.conf"
+    grep -q "^Library=$USER_LIB_DIR/libhufu$" "$USER_ADDON_DIR/hufu.conf" \
+        || die '用户级 hufu.conf 的 Library 写入失败'
+    ok "addon 已装到 $USER_LIB_DIR（无需 sudo）"
 else
-    say '⑤ 安装 fcitx5 addon（需要 sudo）'
-    sudo install -Dm755 "$ADDON_SO" /usr/lib/fcitx5/libhufu.so
-    sudo install -Dm644 "$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf" \
-        /usr/share/fcitx5/addon/hufu.conf
-    sudo install -Dm644 "$ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf" \
-        /usr/share/fcitx5/inputmethod/hufu.conf
+    say '⑤ 安装系统级 fcitx5 addon（需要 sudo）'
+    command -v sudo >/dev/null 2>&1 || die '系统级安装需要 sudo；可改用 -u/--user'
+    sudo install -Dm755 "$ADDON_SO" "$SYSTEM_ADDON_DIR/libhufu.so"
+    sudo install -Dm644 "$ADDON_CONF_SRC" /usr/share/fcitx5/addon/hufu.conf
+    sudo install -Dm644 "$IM_CONF_SRC" /usr/share/fcitx5/inputmethod/hufu.conf
     grep -q '^\[Addon\]' /usr/share/fcitx5/addon/hufu.conf \
         || die '/usr/share/fcitx5/addon/hufu.conf 内容异常'
     grep -q '^\[InputMethod\]' /usr/share/fcitx5/inputmethod/hufu.conf \
         || die '/usr/share/fcitx5/inputmethod/hufu.conf 内容异常'
-    ok 'addon 与两个 conf 已安装'
+    ok "addon 已装到 $SYSTEM_ADDON_DIR"
 fi
 
 say '完成 ✔'
-cat <<'EOF'
+cat <<EOF
 后续：
   1) 重启 fcitx5：    fcitx5 -r -d  # 或以发行版的方式重启
   2) 添加「虎符」：   fcitx5-configtool → 输入法

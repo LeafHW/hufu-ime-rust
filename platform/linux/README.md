@@ -29,10 +29,17 @@
 （Arch `fcitx5`、Fedora `fcitx5-devel`、Debian/Ubuntu `libfcitx5core-dev`）及 fcitx5。
 
 ```sh
-platform/linux/install.sh   # 构建 + 装配码表/数据 + 用户服务 + 系统级 addon
-fcitx5 -r -d                # 重启
-fcitx5-configtool           # 输入法 → 添加「虎符」
+platform/linux/install.sh -s   # 系统级 addon（sudo）+ 用户运行时
+platform/linux/install.sh -u   # 用户级 addon（无需 sudo）
+fcitx5 -r -d                   # 重启
+fcitx5-configtool              # 输入法 → 添加「虎符」
 ```
+
+空参、`-h`、`--help` 显示用法；安装时须显式指定 `-s` 或 `-u`。两种方式都会装配 `assets/码表`、
+`assets/数据`、`hufu-server`、systemd user 服务、桌面入口、图标与主题：
+
+- `-s/--system`：addon 与两个 conf 装到系统目录（需要 sudo）
+- `-u/--user`：addon 与 conf 装到 `~/.local/share/fcitx5/`，`Library=` 指向同目录绝对路径（无需 sudo）
 
 安装脚本会同时装配 `assets/码表/` 与 `assets/数据/`；只跑 `cmake --install` 会缺数据。
 默认落点遵守 XDG：数据 `~/.local/share/hufu/`，服务端 `~/.local/bin/`。
@@ -43,11 +50,18 @@ fcitx5-configtool           # 输入法 → 添加「虎符」
 卸载：
 
 ```sh
-platform/linux/uninstall.sh           # 保留模型
-platform/linux/uninstall.sh --purge   # 连模型一起删
+platform/linux/uninstall.sh -s           # 只清系统级
+platform/linux/uninstall.sh -u           # 只清用户级，保留模型
+platform/linux/uninstall.sh -m           # 只删模型
+platform/linux/uninstall.sh -s -u        # 系统级 + 用户级
+platform/linux/uninstall.sh -u -m        # 用户级 + 模型
+platform/linux/uninstall.sh -s -u -m     # 全部清理
+platform/linux/uninstall.sh -sum         # 同上（短选项可合并）
 ```
 
-其余选项见 `install.sh --help`。
+空参、`-h`、`--help` 显示卸载用法；至少指定 `-s`、`-u`、`-m` 之一。
+
+其余选项见 `uninstall.sh --help`。
 
 ## 作者
 
