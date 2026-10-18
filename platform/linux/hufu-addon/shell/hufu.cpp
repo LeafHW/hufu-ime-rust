@@ -1108,6 +1108,52 @@ private:
         context_ = nullptr;
     }
 
+    /// 候选管理动作（状态菜单）：当前候选快照取最近输入上下文；把
+    /// `context_` 置位再调客户端，让同步回包的 update 落到该面板。
+    void candMenu(const char *action) {
+        if (engine_ == nullptr) {
+            return;
+        }
+        fcitx::InputContext *inputContext = instance_->mostRecentInputContext();
+        HufuUiState *state = uiState(inputContext);
+        if (state == nullptr || !state->snapshot().valid) {
+            return;
+        }
+        HufuUiSnapshot &snap = state->snapshot();
+        if (snap.texts.empty() ||
+            snap.selected < 0 ||
+            static_cast<size_t>(snap.selected) >= snap.texts.size()) {
+            return;
+        }
+        context_ = inputContext;
+        hufu_client_cand_menu(engine_, action,
+                              snap.texts[static_cast<size_t>(snap.selected)].c_str(),
+                              snap.selected);
+        context_ = nullptr;
+    }
+
+    /// 与下一条候选对调（页内下标相邻；无下一条则不动）。
+    void candSwapNext() {
+        if (engine_ == nullptr) {
+            return;
+        }
+        fcitx::InputContext *inputContext = instance_->mostRecentInputContext();
+        HufuUiState *state = uiState(inputContext);
+        if (state == nullptr || !state->snapshot().valid) {
+            return;
+        }
+        HufuUiSnapshot &snap = state->snapshot();
+        const size_t i = static_cast<size_t>(snap.selected);
+        if (snap.selected < 0 || i + 1 >= snap.texts.size()) {
+            return;
+        }
+        context_ = inputContext;
+        hufu_client_cand_swap(engine_, static_cast<int32_t>(i),
+                              static_cast<int32_t>(i + 1), snap.texts[i].c_str(),
+                              snap.texts[i + 1].c_str());
+        context_ = nullptr;
+    }
+
     /// 状态菜单：一个「虎符」子菜单（`SimpleAction` + 自定义 `Action` 项），
     /// 构造时建好，本输入法激活时挂到该输入上下文的状态区。
     /// 引擎侧动作用 daemon 既有 op，本层只做薄封装（协议不动）。
@@ -1159,6 +1205,32 @@ private:
         menu_.addAction(openDirAction_.get());
         menu_.addAction(settingsAction_.get());
         menu_.addAction(exportAction_.get());
+        // 2d) 候选管理：对当前高亮候选做置顶/前移/后移/置底/删除/与下条对调。
+        // 全部走 daemon 既有 cand_menu/cand_swap op；回包带 state，客户端会
+        // 同步刷新候选面板。
+        const auto addCandAction = [this](const char *id, const char *label,
+                                          const char *action) {
+            auto item = std::make_unique<HufuMenuAction>(
+                [label] { return std::string(label); },
+                [this, action] { candMenu(action); });
+            instance_->userInterfaceManager().registerAction(id, item.get());
+            menu_.addAction(item.get());
+            candActions_.push_back(std::move(item));
+        };
+        addCandAction("hufu-cand-front", "候选置顶", "front");
+        addCandAction("hufu-cand-fwd", "候选前移", "fwd");
+        addCandAction("hufu-cand-back", "候选后移", "back");
+        addCandAction("hufu-cand-last", "候选置底", "last");
+        addCandAction("hufu-cand-del", "删除候选", "del");
+        {
+            auto swap = std::make_unique<HufuMenuAction>(
+                [] { return std::string("与下条对调"); },
+                [this] { candSwapNext(); });
+            instance_->userInterfaceManager().registerAction("hufu-cand-swap",
+                                                             swap.get());
+            menu_.addAction(swap.get());
+            candActions_.push_back(std::move(swap));
+        }
         menu_.addAction(soundAction_.get());
         menu_.addAction(statusAction_.get());
         // 5) 候选窗显示预编辑（宿主项，默认开）：本层直接生效，不打扰引擎；
@@ -1850,6 +1922,9 @@ private:
     /// 有编码或候选（更新回调维护；空态保护用：避免无我方内容时碰系统 overlay）
     bool hasComposition_ = false;
     /// 状态区菜单：「虎符」子菜单与各项（见 `setupStatusMenu`）
+    /// 候选管理动作（动态注册，vector 必须在 menu_ 之前声明：逆序析构时
+    /// menu_ 先走，菜单里不留悬垂指针）。
+    std::vector<std::unique_ptr<HufuMenuAction>> candActions_;
     fcitx::Menu menu_;
     fcitx::SimpleAction menuAction_;
     std::unique_ptr<HufuMenuAction> reloadAction_;

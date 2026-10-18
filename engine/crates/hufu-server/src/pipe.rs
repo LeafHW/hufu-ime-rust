@@ -1776,6 +1776,85 @@ mod candidate_tests {
     // 原位交换（raw/页/选保活）+ 整序落盘；漂移按词重找；同位/越界/
     // 不在页拒绝。
     #[test]
+    fn aw_add_writes_user_adjust_and_rejects_bad_pos() {
+        let root = std::env::temp_dir().join(format!("hufu-aw-add-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(root.join("码表/T/main.txt"), "#hufu-dict v1 name=t\na\t甲\n").unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.candidates.page_size = 5;
+        let host = Mutex::new(h);
+        let ok = dispatch(
+            &host,
+            &json!({"op":"aw_add","code":"a","text":"乙","pos":1}),
+            None,
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        let file = root.join("码表/T/用户调整.txt");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("{添加}a\t乙\tp1"), "{content}");
+        let bad = dispatch(
+            &host,
+            &json!({"op":"aw_add","code":"a","text":"丙","pos":-1}),
+            None,
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["error"].as_str().is_some_and(|e| e.contains("0-99")));
+    }
+
+    #[test]
+    fn cand_menu_front_and_del_rewrite_order() {
+        let root = std::env::temp_dir().join(format!("hufu-cand-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\na\t甲\na\t乙\na\t丙\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5}}"#,
+        )
+        .unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.candidates.page_size = 5;
+        let host = Mutex::new(h);
+        dispatch(&host, &json!({"op":"key","key":"a"}), None);
+        let front = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"front","text":"丙","page_index":0}),
+            None,
+        );
+        assert_eq!(front["ok"], json!(true), "{front}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "甲", "乙"]);
+        let del = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"del","text":"乙","page_index":0}),
+            None,
+        );
+        assert_eq!(del["ok"], json!(true), "{del}");
+        let texts: Vec<String> = {
+            let g = host.lock().unwrap();
+            g.session.candidates.iter().map(|c| c.text.clone()).collect()
+        };
+        assert_eq!(texts, ["丙", "甲"]);
+        let log = std::fs::read_to_string(root.join("码表/T/用户调整.txt")).unwrap();
+        assert!(log.contains("{整序}a"), "{log}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cand_swap_op_inplace_and_drift() {
         let root = std::env::temp_dir().join(format!("hufu-cand-swap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

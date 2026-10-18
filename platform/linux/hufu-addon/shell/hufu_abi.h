@@ -92,6 +92,17 @@ int32_t hufu_client_reload_schema(hufu_client *client);
  * 1=成功，0=失败（引擎不在线、方案目录不存在）。 */
 int32_t hufu_client_open_schema_dir(hufu_client *client);
 
+/* 候选菜单动作（状态菜单「候选管理」）：
+ * action ∈ front（置顶）/del（删除）/fwd（前移）/back（后移）/last（置底）；
+ * text=当前候选词（防异步重排漂移），page_index=页内下标。
+ * 1=成功并刷新候选面板，0=失败/引擎不在线。 */
+int32_t hufu_client_cand_menu(hufu_client *client, const char *action,
+                              const char *text, int32_t page_index);
+
+/* 候选对调：i/j 为页内下标，text_i/text_j 为对应候选词；1=成功。 */
+int32_t hufu_client_cand_swap(hufu_client *client, int32_t i, int32_t j,
+                              const char *text_i, const char *text_j);
+
 /* 「打开设置页」：请 server 用 xdg-open 打开 Web 设置页：
  * 1=成功，0=失败（引擎不在线）。 */
 int32_t hufu_client_settings(hufu_client *client);

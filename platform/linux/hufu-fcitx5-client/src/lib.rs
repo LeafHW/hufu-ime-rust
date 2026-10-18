@@ -744,6 +744,60 @@ impl HufuClient {
         self.apply_outcome_response(resp).0
     }
 
+    /// 候选菜单动作（状态菜单「候选管理」）：`action` ∈ front/del/fwd/back/last，
+    /// `text` 是当前选中候选词（防异步重排漂移），`page_index` 是页内下标。
+    /// 成功后把回包 `state` 送达宿主刷新候选面板；返回是否成功。
+    pub fn cand_menu(&mut self, action: &str, text: &str, page_index: usize) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "cand_menu",
+            "action": action,
+            "text": text,
+            "page_index": page_index,
+        })) else {
+            return false;
+        };
+        self.apply_ok_state(resp)
+    }
+
+    /// 候选对调（状态菜单「与下条对调」）：i/j 为页内下标，text_i/text_j
+    /// 供服务端防漂移校验；成功后刷新候选面板。
+    pub fn cand_swap(
+        &mut self,
+        i: usize,
+        j: usize,
+        text_i: &str,
+        text_j: &str,
+    ) -> bool {
+        let Some(resp) = self.call(&serde_json::json!({
+            "op": "cand_swap",
+            "i": i,
+            "j": j,
+            "text_i": text_i,
+            "text_j": text_j,
+        })) else {
+            return false;
+        };
+        self.apply_ok_state(resp)
+    }
+
+    /// `{ok, state}` 回包：成功时把 state 原样送达宿主重绘（候选操作共用）。
+    fn apply_ok_state(&mut self, resp: serde_json::Value) -> bool {
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return false;
+        }
+        if let Some(state) = resp
+            .get("state")
+            .and_then(|v| serde_json::from_value::<SessionState>(v.clone()).ok())
+        {
+            let outcome = KeyOutcome {
+                consumed: true,
+                ..Default::default()
+            };
+            self.deliver(&outcome, &state);
+        }
+        true
+    }
+
     /// `{outcome, state}` 回包 → 回调送达 + `(consumed, back)`。
     /// key/select 共用（协议同构）。
     fn apply_outcome_response(&mut self, resp: serde_json::Value) -> (bool, u8) {
@@ -951,6 +1005,48 @@ pub unsafe extern "C" fn hufu_client_select(c: *mut HufuClient, index: c_int) ->
         return 0;
     }
     if unsafe { &mut *c }.select(index as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 候选菜单动作：`action` ∈ front/del/fwd/back/last，`text` 为当前候选词，
+/// `page_index` 为页内下标；1=成功，0=失败/引擎不在线。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_cand_menu(
+    c: *mut HufuClient,
+    action: *const c_char,
+    text: *const c_char,
+    page_index: c_int,
+) -> c_int {
+    if c.is_null() || action.is_null() || text.is_null() || page_index < 0 {
+        return 0;
+    }
+    let action = unsafe { CStr::from_ptr(action) }.to_string_lossy();
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    if unsafe { &mut *c }.cand_menu(&action, &text, page_index as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 候选对调：i/j 为页内下标，text_i/text_j 为对应候选词；1=成功。
+#[no_mangle]
+pub unsafe extern "C" fn hufu_client_cand_swap(
+    c: *mut HufuClient,
+    i: c_int,
+    j: c_int,
+    text_i: *const c_char,
+    text_j: *const c_char,
+) -> c_int {
+    if c.is_null() || text_i.is_null() || text_j.is_null() || i < 0 || j < 0 {
+        return 0;
+    }
+    let text_i = unsafe { CStr::from_ptr(text_i) }.to_string_lossy();
+    let text_j = unsafe { CStr::from_ptr(text_j) }.to_string_lossy();
+    if unsafe { &mut *c }.cand_swap(i as usize, j as usize, &text_i, &text_j) {
         1
     } else {
         0
@@ -2033,6 +2129,34 @@ mod tests {
             "",
             "三份数据都没有的字"
         );
+    }
+
+    /// 候选菜单动作：`{ok,state}` 回包要把新候选送达宿主（面板即时刷新）。
+    #[test]
+    fn cand_menu_delivers_state() {
+        use hufu_types::{Candidate, CandidateKind};
+        let mut cap = Box::new(Capture::default());
+        let cap_ptr: *mut Capture = &mut *cap;
+        let path = test_sock("cand-menu");
+        let state = SessionState {
+            raw: "a".into(),
+            candidates: vec![
+                Candidate::new("中", "a", CandidateKind::Dict),
+                Candidate::new("国", "a", CandidateKind::Dict),
+            ],
+            selected: 1,
+            ..Default::default()
+        };
+        let handle = mock_server(
+            path.clone(),
+            vec![serde_json::json!({"ok": true, "state": state})],
+        );
+        let mut c = client_for(path, cap_ptr);
+        assert!(c.cand_menu("front", "国", 1));
+        assert_eq!(cap.updates.len(), 1, "cand_menu 应触发一次 update");
+        assert_eq!(cap.updates[0].2, vec!["中".to_string(), "国".to_string()]);
+        assert_eq!(cap.updates[0].4, 1, "高亮下标原样送达");
+        handle.join().unwrap();
     }
 
     /// 缺文件：目录不存在 / 只有拼音注释（码表缺）都要优雅降级，不 panic。
