@@ -4,7 +4,7 @@
 name: ci
 
 # linux 前端（platform/linux/）的**最小集**：能构建、C ABI 不漂移、安装布局对得上、
-# 脚本语法与 assets 台账不退化、install/uninstall 的 --dry-run 不落改动。
+# 脚本语法与 assets 台账不退化。
 # 真机 fcitx5 交互不进 CI（runner 无图形会话）；引擎与 windows/macos 平台不在此。
 #
 # 检查逻辑只有一份：本文件只管「装环境 + 预热依赖缓存」，其余全部调用
@@ -17,7 +17,7 @@ name: ci
 # latest 指向哪个发行版会漂。实际版本以 CI 日志里那步打印的为准；装到过旧版本时
 # configure 阶段直接报错，不会静默降级。
 #
-# 静态检查（排版 / clippy）也在 `ci-local.sh` 里（⑨/⑩），本工作流只负责装环境与
+# 静态检查（排版 / clippy）也在 `ci-local.sh` 里（⑩/⑪），本工作流只负责装环境与
 # 预热依赖缓存——检查逻辑只有一份，本地与 CI 不漂移。
 
 on:
@@ -64,5 +64,5 @@ jobs:
         working-directory: platform/linux
         run: cargo fetch --locked
 
-      - name: 检查（构建 / C ABI 符号 / DESTDIR 布局 / bash -n / 台账 / dry-run 冒烟）
+      - name: 检查（构建 / C ABI 符号 / DESTDIR 布局 / bash -n / 台账）
         run: bash platform/linux/checks/ci-local.sh
