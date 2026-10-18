@@ -27,31 +27,43 @@
 //!    前 Clear（防下划线残留到已提交文本）。
 
 use windows::core::{implement, GUID, Result};
-use windows::Win32::Foundation::{BOOL, E_INVALIDARG, E_POINTER};
+use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, E_POINTER};
 use windows::Win32::UI::TextServices::{
     ITfDisplayAttributeInfo, ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl,
-    IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, TF_ATTR_INPUT, TF_DA_COLOR,
-    TF_DA_LINESTYLE, TF_DISPLAYATTRIBUTE,
+    IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, TF_ATTR_INPUT, TF_CT_COLORREF,
+    TF_DA_COLOR, TF_DA_COLOR_0, TF_DA_LINESTYLE, TF_DISPLAYATTRIBUTE,
 };
 use windows_core::BSTR;
 
 /// 编码态 display attribute GUID（CLSID 尾段 a10→a12 派生，稳定不复用）。
 pub const ATTR_GUID: GUID = GUID::from_u128(0x8f5c2a12_3e77_4b9c_a1d4_9e0b7c2f5a88);
 
-/// 编码态样式：TF_ATTR_INPUT（正在输入/未转换）。文字/背景/线不加色
-/// ——渲染方（CUAS/应用）按 INPUT 语义画下划线（虚线或实线）。
+/// 【组字串染粉 2026-10-18 用户拍板】组段文字+下划线 = hot pink #FF69B4。
+/// COLORREF 排列 0x00BBGGRR：B=0xB4 G=0x69 R=0xFF → 0x00B469FF。
+/// 改色就改这一个常量。注意：显示属性是「建议权」，多数宿主（记事本/
+/// QQ/CUAS/XAML）尊重，少数自绘编辑器无视——那样字色跟应用自己的走。
+const PINK_TEXT: u32 = 0x00B4_69FF;
+
+/// 编码态样式：TF_ATTR_INPUT（正在输入/未转换）+ 粉红文字/粉红下划线。
 fn attr_style() -> TF_DISPLAYATTRIBUTE {
     TF_DISPLAYATTRIBUTE {
-        crText: TF_DA_COLOR::default(),
+        // 【染粉 2026-10-18】此前 default()（不加色，字色跟宿主）。用户
+        // 要组字串一眼可辨——crText/crLine 同填 TF_CT_COLORREF 粉红。
+        crText: TF_DA_COLOR {
+            r#type: TF_CT_COLORREF,
+            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(PINK_TEXT) },
+        },
         crBk: TF_DA_COLOR::default(),
         // 【实线定稿 2026-10-09】实证（像素级）：链路全通（宿主每次
         // 按键都查询 provider、mark 零失败）而 TF_LS_NONE 时 XAML/CUAS
         // 宿主一根线都不画——宿主按 lsStyle 画线，「按 INPUT 语义自画」
-        // 是想当然（首轮 QQ 失效同因）。TF_LS_SOLID+默认线色（宿主用
-        // 文字色）=微拼同款观感。crText/crBk 不动（不改字色/底色）。
+        // 是想当然（首轮 QQ 失效同因）。TF_LS_SOLID=微拼同款观感。
         lsStyle: TF_DA_LINESTYLE(1), // TF_LS_SOLID：实线下划线
         fBoldLine: BOOL::default(),
-        crLine: TF_DA_COLOR::default(),
+        crLine: TF_DA_COLOR {
+            r#type: TF_CT_COLORREF,
+            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(PINK_TEXT) },
+        },
         bAttr: TF_ATTR_INPUT,
     }
 }
