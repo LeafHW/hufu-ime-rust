@@ -247,6 +247,55 @@ fn reverse_lookup_mode() {
     assert_eq!(out.commit.as_deref(), Some("的"));
 }
 
+/// 【反查瘦身 2026-10-18】双拼实表不随包：scheme 命中派生名单且实表
+/// 缺席时挂全拼基表（码列空格分隔音节）装载期派生；实表在场永远
+/// 优先；全拼直载剥空格。覆盖运行中换 scheme 的重评路径。
+#[test]
+fn reverse_derived_from_base() {
+    let (mut engine, _session, _dir) = setup();
+    let rev_dir = engine.data_dir.join("拼音反查");
+    std::fs::create_dir_all(&rev_dir).unwrap();
+    // 默认配置 scheme=小鹤双拼（hufu-config 出厂值）
+    assert_eq!(engine.config.reverse.scheme, "小鹤双拼");
+    // 基表：ni→ni；hao 小鹤 h+ao→hc；xing 小鹤 x+ing→k
+    std::fs::write(rev_dir.join("全拼.txt"), "你\t ni\n你好\t ni hao\n行\t xing\n").unwrap();
+    engine.apply_global_assets();
+    assert!(engine.schema.reverse_path.is_some(), "挂上基表");
+    assert!(engine.schema.reverse_rule.is_some(), "标记派生规则");
+    engine.ensure_reverse();
+    let rt = engine.schema.reverse.as_ref().unwrap();
+    assert_eq!(rt.lookup("ni"), &["你".to_string()]);
+    assert_eq!(rt.lookup("nihc"), &["你好".to_string()]);
+    assert_eq!(rt.code_of("行"), Some("xk"));
+    // 自然码派生：xing = x+ing→y（与小鹤分键位）
+    engine.config.reverse.scheme = "自然码".into();
+    engine.apply_global_assets();
+    engine.ensure_reverse();
+    let rt = engine.schema.reverse.as_ref().unwrap();
+    assert_eq!(rt.code_of("行"), Some("xy"));
+    // 全拼直载：码内空格剥离
+    engine.config.reverse.scheme = "全拼".into();
+    engine.apply_global_assets();
+    assert!(engine.schema.reverse_rule.is_none(), "实表方案不走派生");
+    engine.ensure_reverse();
+    let rt = engine.schema.reverse.as_ref().unwrap();
+    assert_eq!(rt.lookup("nihao"), &["你好".to_string()]);
+    assert_eq!(rt.code_of("你"), Some("ni"));
+    // 实表优先：用户自带 小鹤双拼.txt 盖过派生
+    std::fs::write(rev_dir.join("小鹤双拼.txt"), "你\tnv\n").unwrap();
+    engine.config.reverse.scheme = "小鹤双拼".into();
+    engine.apply_global_assets();
+    assert!(engine.schema.reverse_rule.is_none(), "实表在场不派生");
+    engine.ensure_reverse();
+    let rt = engine.schema.reverse.as_ref().unwrap();
+    assert_eq!(rt.lookup("nv"), &["你".to_string()]);
+    assert_eq!(rt.lookup("nihc").len(), 0);
+    // 清理自带实表 → 恢复派生（运行中删文件后重评）
+    std::fs::remove_file(rev_dir.join("小鹤双拼.txt")).unwrap();
+    engine.apply_global_assets();
+    assert!(engine.schema.reverse_rule.is_some());
+}
+
 #[test]
 fn sentence_mode_after_max_length() {
     let (mut engine, mut session, _dir) = setup();

@@ -107,22 +107,19 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
     // 排除」工作，内嵌没了自然全量带/或删了就没有）。
 ];
 
-/// 【系统自带 ssf 2026-10-16】用户拍板：三款 .ssf 内置为系统自带
+/// 【系统自带 ssf 2026-10-16】用户拍板：.ssf 内置为系统自带
 ///（official-ssf/ 随 git 与二进制分发，缺失自愈落盘）——此前「.ssf
 /// 完全用户自管理、绝不内置」的红线针对的是**搜狗官方皮肤**（版权）；
-/// 这几款是用户自备授权的虎符系皮肤（虎纹奶油/蜜桃虎娘/鲸鱼娘/秋风
-/// 知我意）。已存在的不覆盖（用户导入的同名更新优先）。
-/// 【虎娘新传全家桶 2026-10-18】虎娘（tigirl）官方目录 12 款中尚未
-/// 进虎符的 8 款一并内置（元气/雨竹听风/雪夜铃兰/霓虹电玩/桂月团圆/
-/// 柚光汽水/幽焰小恶魔/虎兄贵-健身——font140 校准 + 生产 PNG 版）；
-/// 旧名 3 款（虎纹奶油/蜜桃虎娘/鲸鱼娘）与虎娘新版同为当期产物
-///（仅 skin_name 命名差异），保留旧名不动用户已选引用。虎娘的
-/// 小喵风扇（搜狗商店皮肤）与 smile/默认（测试件）不随包。
+/// 内置的都是用户自备授权的虎符系皮肤。已存在的不覆盖（用户导入的
+/// 同名更新优先）。鲸鱼娘.ssf 与虎娘新版「蓝鲸雪语」同款、仅
+/// skin_name 命名差异，保留旧名不动用户已选引用。
+/// 【ssf 瘦身 2026-10-18 用户拍板】14→5 款：保留蜜桃虎娘/鲸鱼娘（蓝
+/// 鲸雪语）/雨竹听风/绯绒小恶魔/莓糖小恶魔，其余 9 款（虎纹奶油/秋风
+/// 知我意/元气/雪夜铃兰/霓虹电玩/桂月团圆/柚光汽水/幽焰小恶魔/虎兄
+/// 贵-健身）退出内置，exe 约 -18.3MB。磁盘上的旧副本（历史自愈产物）
+/// 不再是官方件：升级不覆盖也不清，用户手删即净；export 按「与内嵌
+/// 相同才排除」工作，内嵌没了自然全量带（语义同上方夜莺/夜桜退役）。
 const OFFICIAL_SSF: &[(&str, &[u8])] = &[
-    (
-        "虎纹奶油.ssf",
-        include_bytes!("../official-ssf/虎纹奶油.ssf"),
-    ),
     (
         "蜜桃虎娘.ssf",
         include_bytes!("../official-ssf/蜜桃虎娘.ssf"),
@@ -132,36 +129,8 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
         include_bytes!("../official-ssf/鲸鱼娘.ssf"),
     ),
     (
-        "秋风知我意.ssf",
-        include_bytes!("../official-ssf/秋风知我意.ssf"),
-    ),
-    (
-        "虎娘-元气.ssf",
-        include_bytes!("../official-ssf/虎娘-元气.ssf"),
-    ),
-    (
         "虎娘-雨竹听风.ssf",
         include_bytes!("../official-ssf/虎娘-雨竹听风.ssf"),
-    ),
-    (
-        "虎娘-雪夜铃兰.ssf",
-        include_bytes!("../official-ssf/虎娘-雪夜铃兰.ssf"),
-    ),
-    (
-        "虎娘-霓虹电玩.ssf",
-        include_bytes!("../official-ssf/虎娘-霓虹电玩.ssf"),
-    ),
-    (
-        "虎娘-桂月团圆.ssf",
-        include_bytes!("../official-ssf/虎娘-桂月团圆.ssf"),
-    ),
-    (
-        "虎娘-柚光汽水.ssf",
-        include_bytes!("../official-ssf/虎娘-柚光汽水.ssf"),
-    ),
-    (
-        "虎娘-幽焰小恶魔.ssf",
-        include_bytes!("../official-ssf/虎娘-幽焰小恶魔.ssf"),
     ),
     // 【绯绒/莓糖收编 2026-10-18 用户拍板】用户自弄的两张小恶魔随包
     // 官方化（原先装在用户皮肤目录，export 恒带 7.4MB base64——内置
@@ -174,10 +143,6 @@ const OFFICIAL_SSF: &[(&str, &[u8])] = &[
     (
         "虎娘-莓糖小恶魔.ssf",
         include_bytes!("../official-ssf/虎娘-莓糖小恶魔.ssf"),
-    ),
-    (
-        "虎兄贵-健身.ssf",
-        include_bytes!("../official-ssf/虎兄贵-健身.ssf"),
     ),
 ];
 
@@ -298,7 +263,7 @@ impl Host {
         };
         host.install_official_skins();
         mark("skins", &t0);
-        // 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘（缺失才写，
+        // 【系统自带 ssf 2026-10-16】内嵌 .ssf 自愈落盘（缺失才写，
         // 用户同名定制优先——与官方 JSON 皮肤同款语义）。
         host.install_official_ssf();
         mark("ssf", &t0);
@@ -322,7 +287,7 @@ impl Host {
         Ok(host)
     }
 
-    /// 【系统自带 ssf 2026-10-16】三款内嵌 .ssf 自愈落盘到 .ssf 皮肤目录
+    /// 【系统自带 ssf 2026-10-16】内嵌 .ssf 自愈落盘到 .ssf 皮肤目录
     ///（与 *.json 同目录混居）。仅缺失时写入；存在不覆盖（用户定制优
     /// 先）。默认出厂不开独立皮肤（config 默认 skin_kind=json、
     /// skin=hufu-moyan，见 hufu-config AppearanceSection::default）。

@@ -25,6 +25,7 @@ pub mod parse;
 pub mod schema;
 pub mod supplement;
 pub mod symbols;
+pub mod shuangpin;
 pub mod user;
 
 pub use annotation::AnnotationTable;
@@ -32,3 +33,4 @@ pub use dict::Dict;
 pub use entry::DictEntry;
 pub use opencc::OpenCc;
 pub use schema::Schema;
+pub use shuangpin::ShuangpinRule;

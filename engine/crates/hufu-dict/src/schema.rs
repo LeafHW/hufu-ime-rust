@@ -28,6 +28,9 @@ pub struct Schema {
     pub reverse: Option<ReverseTable>,
     /// 反查表源文件（未装载时记录，装载后置 None）
     pub reverse_path: Option<PathBuf>,
+    /// 【反查瘦身 2026-10-18】reverse_path 指向全拼基表时的派生规则
+    /// （自然码/小鹤双拼表不再随包发行，装载期逐音节编码）。
+    pub reverse_rule: Option<crate::ShuangpinRule>,
     /// 【` 引导超集码表 2026-11】独立超集副表（文件名含 超集/超字集，
     /// 码全带 ` 前缀如 `aaaa）。` 加入编码字母表时 ` 起段编码查此表；
     /// 无副表（Arc 空表）时 ` 维持原行为。见 Schema::load 装载段。
@@ -142,6 +145,7 @@ impl Schema {
             split: None,
             reverse: None,
             reverse_path: None,
+            reverse_rule: None,
             super_dict: std::sync::Arc::new(Dict::new("super")),
             personal: std::sync::Arc::new(Dict::new("personal")),
             adjust: UserAdjust::default(),

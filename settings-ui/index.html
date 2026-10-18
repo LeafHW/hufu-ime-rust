@@ -640,7 +640,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <label class="checkline" style="gap:12px">
         <input type="file" id="ov-file" accept="image/*" style="display:none">
         <button id="ov-pick">选择图片…</button>
-        <button id="ov-clear-img" class="danger" title="移除当前挂件图片（清空贴图数据；启用开关与贴法参数保留）">删除图片</button>
+        <button id="ov-clear-img" class="danger" title="移除当前挂件图片（清空贴图数据；启用开关与贴法参数保留；其他皮肤中同一张图的副本一并扫除）">删除图片</button>
       </label>
       <span class="sub" id="ov-fileinfo" style="align-self:center">未选图</span>
       <span id="ov-anim-badge">🎞 动图</span>
@@ -2763,8 +2763,9 @@ $("#ov-pick").onclick = () => $("#ov-file").click();
 /* 【删除挂件图 2026-10-16】显式清图入口（此前注释写明「清图只能走
    显式路径（目前无此入口）」——用户要的按钮）。清 OV 图状态+皮肤
    overlay 的 image/proc；启用开关与贴法参数保留（换图即恢复）。 */
-$("#ov-clear-img").onclick = () => {
-  if (!confirm("删除当前挂件图片？（贴图数据将被清空；启用开关与贴法参数保留，重新选图即恢复）")) return;
+$("#ov-clear-img").onclick = async () => {
+  if (!confirm("删除当前挂件图片？（贴图数据将被清空；启用开关与贴法参数保留，重新选图即恢复。其他皮肤里同一张图的副本也会一并扫除）")) return;
+  const oldUrl = OV.dataUrl; // 清图前留底：跨皮肤清扫按原图内容匹配
   OV.img = null; OV.anim = null; OV.dataUrl = ""; OV.crop = null; OV.key = null;
   const cfg = ovEnsureCfg();
   cfg.image = null; cfg.proc = null;
@@ -2773,8 +2774,19 @@ $("#ov-clear-img").onclick = () => {
   const wk = $("#ov-work");
   if (wk) wk.width = wk.width; // 清处理台画布
   $("#ov-imgwrap").style.display = "none";
-  ovSave();
+  try { await ovSave(); } catch (e) { msg("皮肤保存失败：" + e.message, "err"); }
   msg("挂件图片已删除（重新「选择图片…」可再挂）", "ok");
+  /* 【挂件图跨皮肤清扫 2026-10-18】同一张图常存进多张皮肤（即存管线
+     只写当前皮，各一份 base64），只删当前皮 → 导出/盘上仍带残图
+     （现场 640KB×3 皮 →「已删仍 600KB 导出」）。先存当前皮再按原图
+     内容扫全部皮肤（矢量+SSF overrides），命中的副本就地清除并点名。 */
+  if (oldUrl && oldUrl.length >= 1024) {
+    try {
+      const r = await api("POST", "/api/skin/overlay-purge", { image: oldUrl });
+      const names = [...(r.vector || []), ...(r.ssf || [])].map(x => x.name || x.skin);
+      if (names.length) msg(`已同步扫除其他皮肤中的同一张图（${names.length} 处）：${names.join("、")}`, "ok");
+    } catch (_) { /* 清扫失败不拦删除主流程 */ }
+  }
 };
 /* 【超大静态图自动降采样 2026-11】烤成品退役（c312fdc）后皮肤存原图
    data-URL，>11M 字符（≈8.25MB 文件）被 ovPersist 拒收——但预览正常

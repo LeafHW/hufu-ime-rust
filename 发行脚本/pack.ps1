@@ -262,6 +262,11 @@ if ($liveMa -and (Test-Path $liveMa)) {
     # 已按小鹤蓝本过滤瘦身（82万→36.4万条）。镜像若带回微软表/超重表，
     # 打包时剔除，防回潮。
     Remove-Item "$SRC\数据\拼音反查\微软双拼.txt" -Force -EA SilentlyContinue
+    # 【2026-10-18 反查瘦身 用户拍板】自然码/小鹤双拼表不再随包：装载期
+    # 由全拼基表（音节空格分隔）+ 键位规则派生（hufu-dict shuangpin.rs，
+    # 规则与生产表逐音节互验一致）。镜像/旧包带回实表时剔除防回潮——
+    # 实表在场会盖过派生分支（apply_global_assets 实文件优先）。
+    Remove-Item "$SRC\数据\拼音反查\自然码.txt", "$SRC\数据\拼音反查\小鹤双拼.txt" -Force -EA SilentlyContinue
     # 【2026-09-07 用户拍板】反查表剔除特别生僻单字（不在 Jun Da 9900 字
     # 频表；hanzi_db.csv 在本脚本同目录）：三表每次打包重筛（幂等防回潮）。
     {
@@ -282,7 +287,8 @@ if ($liveMa -and (Test-Path $liveMa)) {
         }
         $sr.Close()
         if ($freq.Count -lt 9000) { throw "pack: 字频白名单异常 $($freq.Count)——中止防误删" }
-        foreach ($t in @('小鹤双拼', '全拼', '自然码')) {
+        # 【2026-10-18 反查瘦身】生僻字过滤只剩全拼基表（双拼表已改规则派生）
+        foreach ($t in @('全拼')) {
             $tbl = "$SRC\数据\拼音反查\$t.txt"
             if (-not (Test-Path $tbl)) { continue }
             $in = New-Object System.IO.StreamReader($tbl, [System.Text.UTF8Encoding]::new($false))
@@ -622,9 +628,10 @@ foreach ($n in @('hufu_tsf.dll','hufu_tsf32.dll','hufu-server.exe','hufu-tsf-smo
     $all = (Check ($arc.Entries.FullName -contains $n) "包内 $n") -and $all
 }
 $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '数据[/\\]config\.json$' })) '包内 数据\config.json') -and $all
-# 【2026-09-07 大统一】全局资源：拼音反查 3 表（小鹤蓝本过滤版）+ 拆分 + 注释 2 表
-$all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\](小鹤双拼|全拼|自然码)\.txt$' }).Count -eq 3) '拼音反查 3 表（小鹤/全拼/自然码，微软已删）') -and $all
-$all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\]微软双拼\.txt$' }).Count -eq 0) '微软双拼已删') -and $all
+# 【2026-10-18 反查瘦身】全局资源：拼音反查只发全拼基表（码列空格
+# 分隔音节）；自然码/小鹤双拼装载期规则派生，实表不得在包内。
+$all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\]全拼\.txt$' }).Count -eq 1) '拼音反查 全拼基表') -and $all
+$all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\](小鹤双拼|自然码|微软双拼)\.txt$' }).Count -eq 0) '双拼实表已删（规则派生）') -and $all
 $all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '码表[/\\](虎字-繁体优先|B定制-常用)' }).Count -eq 0) '两码表方案已删') -and $all
 $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '拆分[/\\]虎码\.拆分$' })) '拆分表 虎码.拆分') -and $all
 $all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '注释[/\\](拼音|unicode)\.注释$' }).Count -eq 2) '注释 2 表（拼音+unicode）') -and $all

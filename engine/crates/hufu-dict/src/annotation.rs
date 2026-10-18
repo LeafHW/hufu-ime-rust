@@ -94,18 +94,66 @@ impl ReverseTable {
                 continue;
             }
             let word = parts[0].trim();
-            let code = parts[1].trim();
+            // 【反查瘦身 2026-10-18】码内空格剥除：全拼基表码列为空格
+            // 分隔音节（`ni men`），直载方案（全拼）查表键是连写串；
+            // 旧格式无空格不受影响（反查码本就不含空格键）。
+            let code = parts[1].trim().replace(' ', "");
             if word.is_empty() || code.is_empty() {
                 continue;
             }
-            t.by_code.entry(code.to_string()).or_default().push(word.to_string());
-            t.word_to_code.entry(word.to_string()).or_insert(code.to_string());
+            t.by_code.entry(code.clone()).or_default().push(word.to_string());
+            t.word_to_code.entry(word.to_string()).or_insert(code);
         }
         t
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
         Ok(Self::parse(&read_lines(path)?))
+    }
+
+    /// 【反查瘦身 2026-10-18】派生装载：全拼基表（码列空格分隔音节）
+    /// 按双拼规则逐音节编码（自然码/小鹤双拼表不再随包发行）。规则
+    /// 无法编码的行跳过——与 gen_shuangpin 生成器 conv 失败即跳同
+    /// 语义（生产数据验证：356,907 行 0 跳过）。
+    pub fn load_derived(path: &Path, rule: &crate::ShuangpinRule) -> std::io::Result<Self> {
+        Ok(Self::parse_derived(&read_lines(path)?, rule))
+    }
+
+    /// 派生装载的解析体（测试可用）。
+    pub fn parse_derived(lines: &[String], rule: &crate::ShuangpinRule) -> Self {
+        let mut t = ReverseTable::default();
+        for line in lines {
+            let l = line.trim_end();
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let word = parts[0].trim();
+            if word.is_empty() {
+                continue;
+            }
+            let mut code = String::new();
+            let mut ok = true;
+            for syl in parts[1].split_whitespace() {
+                match rule.encode(syl) {
+                    Some(c) => code.push_str(&c),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || code.is_empty() {
+                continue;
+            }
+            t.by_code.entry(code.clone()).or_default().push(word.to_string());
+            t.word_to_code.entry(word.to_string()).or_insert(code);
+        }
+        t
     }
 
     /// 反查：由反查码取词列表。
@@ -151,5 +199,34 @@ mod tests {
         let t = ReverseTable::parse(&["的\tde".into(), "了\tle".into(), "我们\twm".into()]);
         assert_eq!(t.lookup("de"), &["的".to_string()]);
         assert_eq!(t.code_of("我们"), Some("wm"));
+    }
+
+    /// 【反查瘦身 2026-10-18】基表码内空格剥离（全拼直载）+ 双拼派生。
+    #[test]
+    fn reverse_derived() {
+        use crate::shuangpin::ShuangpinRule;
+        // 直载：空格分隔音节的基表按连写串入表
+        let qp = ReverseTable::parse(&["你们\t ni men".into(), "西安\t xi an".into()]);
+        assert_eq!(qp.lookup("nimen"), &["你们".to_string()]);
+        assert_eq!(qp.code_of("西安"), Some("xian"));
+        // 小鹤派生：men=m+en→f、zai=z+ai→d、xing=x+ing→k
+        let xh = ReverseTable::parse_derived(
+            &["你们\t ni men".into(), "在\t zai".into(), "行\t xing".into()],
+            &ShuangpinRule::Xiaohe,
+        );
+        assert_eq!(xh.lookup("nimf"), &["你们".to_string()]);
+        assert_eq!(xh.lookup("zd"), &["在".to_string()]);
+        assert_eq!(xh.code_of("行"), Some("xk"));
+        // 自然码派生：zai=z+ai→l、xing=x+ing→y（与小鹤分键位）
+        let zrm = ReverseTable::parse_derived(
+            &["在\t zai".into(), "行\t xing".into()],
+            &ShuangpinRule::Ziranma,
+        );
+        assert_eq!(zrm.lookup("zl"), &["在".to_string()]);
+        assert_eq!(zrm.code_of("行"), Some("xy"));
+        // 同码异词按行序共存（西安 = xi + 零声母 an 原样，先 = x+ian→m）
+        let both = ReverseTable::parse_derived(&["先\t xian".into(), "西安\t xi an".into()], &ShuangpinRule::Xiaohe);
+        assert_eq!(both.lookup("xian"), &["西安".to_string()]);
+        assert_eq!(both.lookup("xm"), &["先".to_string()]);
     }
 }

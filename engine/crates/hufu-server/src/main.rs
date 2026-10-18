@@ -1405,6 +1405,18 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 v
             };
             let reverse = list("拼音反查", "txt");
+            // 【反查瘦身 2026-10-18】自然码/小鹤双拼表不随包发行（装载期
+            // 规则派生）：全拼基表在场即把两个双拼方案补进下拉，设置页
+            // 数据源无感切换；用户自带同名 txt 在场时以实文件为准。
+            let mut reverse = reverse;
+            if host.data_dir.join("拼音反查").join("全拼.txt").exists() {
+                for n in ["自然码", "小鹤双拼"] {
+                    if !reverse.iter().any(|x| x == n) {
+                        reverse.push(n.to_string());
+                    }
+                }
+                reverse.sort();
+            }
             let split = list("拆分", "拆分");
             Response::json(&serde_json::json!({ "reverse": reverse, "split": split }))
         }
@@ -1681,6 +1693,52 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 }
                 Err(e) => Response::err(500, &format!("保存失败: {e}")),
             }
+        }
+        // 【挂件图跨皮肤清扫 2026-10-18 用户拍板】删除挂件图时按原图内容
+        // 扫全部皮肤（矢量 *.json 深层 + SSF overrides.json）：同一张动图
+        // 常在各皮肤各存一份 base64（现场 640KB×3 皮），只删当前皮 →
+        // 导出/盘上仍带残图。命中副本就地置 null（与「删除图片」按钮同
+        // 语义，含兄弟 proc）。调用方先存当前皮再清扫 → 结果只列其余皮。
+        ("POST", "/api/skin/overlay-purge") => {
+            let v = req.json();
+            let img = v.get("image").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if !img.starts_with("data:") || img.len() < 1024 {
+                return Response::err(400, "image 缺失或过小（只清扫 ≥1KB 的贴图 data-URL）");
+            }
+            let mut vector = Vec::new();
+            for (id, name) in host.list_skins() {
+                let p = host.skins_dir().join(format!("{id}.json"));
+                let Ok(txt) = std::fs::read_to_string(&p) else { continue };
+                let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+                let n = overlay_purge::purge_widget_image(&mut val, &img);
+                if n > 0 {
+                    if let Ok(t) = serde_json::to_string_pretty(&val) {
+                        if std::fs::write(&p, t).is_ok() {
+                            vector.push(serde_json::json!({ "skin": id, "name": name, "count": n }));
+                        }
+                    }
+                }
+            }
+            let mut ssf = Vec::new();
+            for e in host.list_ssf_skins() {
+                let p = crate::ssf::ssf_cache_root(&host.data_dir)
+                    .join(&e.id)
+                    .join("overrides.json");
+                let Ok(txt) = std::fs::read_to_string(&p) else { continue };
+                let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+                let n = overlay_purge::purge_widget_image(&mut val, &img);
+                if n > 0 {
+                    if let Ok(t) = serde_json::to_string_pretty(&val) {
+                        if std::fs::write(&p, t).is_ok() {
+                            ssf.push(serde_json::json!({ "skin": e.id, "name": e.name, "count": n }));
+                        }
+                    }
+                }
+            }
+            if !vector.is_empty() || !ssf.is_empty() {
+                host.skin_ver += 1; // DLL poll 发现皮肤版本变化即重拉
+            }
+            Response::json(&serde_json::json!({ "ok": true, "vector": vector, "ssf": ssf }))
         }
         ("POST", "/api/weasel_import") => {
             // body: { "id": "...", "colors": { weasel 字段 } }
@@ -2959,3 +3017,73 @@ mod settings_assets {
     }
 }
 use settings_assets::{merge as settings_assets_merge, split as settings_assets_split};
+
+// ── 挂件图跨皮肤清扫【2026-10-18 用户拍板】─────────────────────────────
+// 「删除图片」只清当前编辑的皮肤；同一张动图往往存进了多张皮肤（即存
+// 管线只写当前皮，各存一份 base64）。残图让导出/皮肤目录背着死重量
+//（现场：640KB 图 ×3 皮 → 「已删仍 600KB 导出」）。本模块按原图内容
+// 字符串递归清扫（overlay.image/预设槽/SSF overrides 深层全覆盖），
+// 命中置 null（与「删除图片」按钮同语义），键名 image 时顺带清兄弟
+// proc（裁剪/抠图参数属图）。纯函数，供 /api/skin/overlay-purge 用。
+mod overlay_purge {
+    use serde_json::Value;
+
+    pub fn purge_widget_image(v: &mut Value, target: &str) -> usize {
+        match v {
+            Value::Object(m) => {
+                let mut hits = 0usize;
+                let keys: Vec<String> = m.keys().cloned().collect();
+                for k in keys {
+                    let Some(vv) = m.get_mut(&k) else { continue };
+                    let hit = matches!(&*vv, Value::String(s) if s.as_str() == target);
+                    if hit {
+                        *vv = Value::Null;
+                        hits += 1;
+                        if k == "image" {
+                            if let Some(p) = m.get_mut("proc") {
+                                *p = Value::Null;
+                            }
+                        }
+                    } else {
+                        hits += purge_widget_image(vv, target);
+                    }
+                }
+                hits
+            }
+            Value::Array(a) => a.iter_mut().map(|x| purge_widget_image(x, target)).sum(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn purge_matches_and_proc_sibling() {
+            let gif = "data:image/gif;base64,AAA";
+            let mut v = json!({
+                "id": "hufu-chenwu",
+                "overlay": { "enabled": false, "image": gif, "proc": { "tol": 30 } },
+                "presets": [
+                    { "name": "a", "overlay": { "image": gif, "proc": { "tol": 9 } } },
+                    { "name": "b", "overlay": { "image": "data:image/png;base64,BBB" } }
+                ]
+            });
+            let n = purge_widget_image(&mut v, gif);
+            assert_eq!(n, 2, "顶层+预设槽两处命中");
+            assert!(v["overlay"]["image"].is_null());
+            assert!(v["overlay"]["proc"].is_null(), "image 命中时兄弟 proc 一并清");
+            assert!(v["presets"][0]["overlay"]["image"].is_null());
+            assert!(v["presets"][0]["overlay"]["proc"].is_null());
+            assert_eq!(
+                v["presets"][1]["overlay"]["image"],
+                json!("data:image/png;base64,BBB"),
+                "不同的图不动"
+            );
+            assert_eq!(v["id"], "hufu-chenwu", "其余字段原样");
+            assert_eq!(v["overlay"]["enabled"], json!(false), "开关保留");
+        }
+    }
+}

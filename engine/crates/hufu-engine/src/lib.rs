@@ -643,12 +643,26 @@ impl Engine {
             if p.exists() {
                 self.schema.reverse = None;
                 self.schema.reverse_path = Some(p);
+                self.schema.reverse_rule = None;
+            } else if let Some(rule) = hufu_dict::ShuangpinRule::from_scheme(&scheme) {
+                // 【反查瘦身 2026-10-18】自然码/小鹤双拼表不随包发行：
+                // scheme 命中派生名单且全局同名 txt 缺席时，改挂全拼
+                // 基表（码列空格分隔音节）+ 装载期逐音节编码。用户自带
+                // 同名 txt 在场永远优先（上一分支，旧包/定制兼容）。
+                let base = self.data_dir.join("拼音反查").join("全拼.txt");
+                if base.exists() {
+                    self.schema.reverse = None;
+                    self.schema.reverse_path = Some(base);
+                    self.schema.reverse_rule = Some(rule);
+                }
+                // 基表也缺失：保持 Schema::load 的方案目录探测（旧包回退）
             }
-            // 全局文件缺失：保持 Schema::load 的方案目录探测（旧包回退）
+            // 全局文件缺失且非派生名单：保持 Schema::load 的方案目录探测（旧包回退）
         } else {
             // scheme 空 = 明确关闭反查
             self.schema.reverse = None;
             self.schema.reverse_path = None;
+            self.schema.reverse_rule = None;
         }
         // 拼音注释（全局优先，回退方案目录探测结果）
         let py = self.data_dir.join("注释").join("拼音.注释");
@@ -690,7 +704,13 @@ impl Engine {
             return;
         };
         let t0 = std::time::Instant::now();
-        match ReverseTable::load(&p) {
+        // 【反查瘦身 2026-10-18】带规则 = reverse_path 指向全拼基表，
+        // 装载期逐音节编码派生（356,907 行毫秒级，0 跳过）。
+        let loaded = match self.schema.reverse_rule {
+            Some(rule) => ReverseTable::load_derived(&p, &rule),
+            None => ReverseTable::load(&p),
+        };
+        match loaded {
             Ok(rt) => {
                 eprintln!(
                     "反查表已装载（懒加载 {:.0}ms）: {}",
