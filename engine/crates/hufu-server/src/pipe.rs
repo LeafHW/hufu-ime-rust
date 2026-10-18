@@ -1630,6 +1630,13 @@ fn console_caret_rect_via_attach(_conhost_pid: u32) -> Option<[i32; 4]> {
     None
 }
 
+/// 非 Windows 无控制台光标探测：console_caret 回 rect=null + 原因，
+/// DLL/前端按失败落标准链（不阻塞 Linux 构建）。
+#[cfg(not(windows))]
+fn console_caret_last_err() -> &'static str {
+    "unsupported"
+}
+
 fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde_json::Value) {
     if req
         .pointer("/candidate_ui/protocol")

@@ -311,6 +311,13 @@ pub fn gdi_list_families_gb() -> Vec<String> {
     }
 }
 
+/// 非 Windows 无 GDI 字体枚举：设置页字体下拉返回空列表（前端仍可用
+/// 浏览器默认字体；不阻塞 Linux 构建）。
+#[cfg(not(windows))]
+pub fn gdi_list_families_gb() -> Vec<String> {
+    Vec::new()
+}
+
 /// 进程内一次性装载（FR_PRIVATE=0x10：进程私有，进程退出自动释放，
 /// 不污染系统字体表）。失败静默跳过（族名解析/渲染自会回退）。
 static GDI_FONTS_ONCE: std::sync::Once = std::sync::Once::new();

@@ -18,6 +18,7 @@ mod candidate_export;
 mod fontinfo;
 mod host;
 mod http;
+#[cfg(windows)]
 mod overlay;
 mod pipe;
 mod platform;
