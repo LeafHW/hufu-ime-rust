@@ -123,12 +123,22 @@ std::string keyNameOf(const fcitx::Key &key) {
     case FcitxKey_Alt_R: return "altright";
     default: break;
     }
-    // 可打印 ASCII：X11 keysym → Unicode → 去 Shift 形态
+    // 可打印 ASCII：X11 keysym → Unicode → 去 Shift 形态。
+    // 【Shift+字母 2026-10-18】字母区按 **A-Z 键形**转发：引擎的自定义
+    // Shift+字母表（shift_symbols / shift_letters_always）与 TSF 同口径，
+    // 都按大写键形查表；符号仍去 Shift 成基准字符（Shift+, → "," + shift，
+    // 由引擎查标点/自定义串）。此前这里一律小写，导致 Linux 上自定义
+    // Shift+字母永远匹配不到。
     uint32_t u = fcitx::Key::keySymToUnicode(key.sym());
     if (u == 0 || u > 0x7f) {
         return {};
     }
-    return std::string(1, unshiftAscii(static_cast<char>(u)));
+    char base = unshiftAscii(static_cast<char>(u));
+    if (base >= 'a' && base <= 'z' &&
+        key.states().test(fcitx::KeyState::Shift)) {
+        base = static_cast<char>(base - 'a' + 'A');
+    }
+    return std::string(1, base);
 }
 
 /// JSON 字符串转义（配置补丁值都是短字符/短串，只处理 `"`、`\` 与控制符）。
@@ -1032,25 +1042,6 @@ public:
             return; // 不归本引擎：透传
         }
         const auto states = key.states();
-        // 【Shift+字母（有编码/候选态）2026-09-19】引擎在编码态对 Shift+字母
-        // 返回「吞键」（Windows 语义：防漏进宿主）；Linux 无引擎英文态，
-        // 产品口径=「首选上屏 + 打字母」：顶字首选 → 清组段 → 字母交回应用。
-        if (states.test(fcitx::KeyState::Shift) && hasComposition_ &&
-            name.size() == 1 && name[0] >= 'a' && name[0] <= 'z') {
-            // 【context_ 必须置位 2026-09-19】focus() 会同步回调 update，
-            // 用它来清候选窗；applyUpdate 在 context_ 为空时直接返回——
-            // 漏置位=上屏后候选窗滞留（用户实测复现）。
-            context_ = inputContext;
-            if (!topCommit_.empty()) {
-                inputContext->commitString(topCommit_);
-            }
-            hufu_client_focus(engine_); // 清引擎组段并同步清 UI
-            inputContext->forwardKey(keyEvent.rawKey(), keyEvent.isRelease(),
-                                     keyEvent.time());
-            context_ = nullptr;
-            keyEvent.filterAndAccept();
-            return;
-        }
         // 行尾提示：周边文本可用时上报（组段逼近右缘的提前上屏放宽用）
         int32_t lineEnd = -1;
         const auto &surrounding = inputContext->surroundingText();
@@ -1583,11 +1574,11 @@ private:
     /// UI 更新回调：**先记快照（宿主侧），再 render**——分两段是为了宿主开关
     ///（「候选窗显示预编辑」）切换后能按最近一次快照立即重放，不必等下一次按键。
     /// 快照记在该输入上下文的属性上（见 `HufuUiSnapshot`）。
-    /// `commitTexts`：候选的实际上屏文本（`显示=>输出` 覆盖时与显示不同），
-    /// 顶字（Shift+字母）用。
+    /// `commitTexts`：候选的实际上屏文本（`显示=>输出` 覆盖时与显示不同）。
+    /// 当前 UI 快照不用它；保留参数与 ABI 一致，供后续候选操作复用。
     void applyUpdate(const char *preedit, const char *raw,
                      const char *const *texts, const char *const *comments,
-                     const char *const *commitTexts, int32_t count,
+                     const char *const * /*commitTexts*/, int32_t count,
                      int32_t selected, const char *aux, int32_t chinese) {
         if (context_ == nullptr) {
             return;
@@ -1605,10 +1596,6 @@ private:
         const bool emptyState = count <= 0 && rawString.empty() &&
                                 preeditString.empty() && auxString.empty();
         hasComposition_ = count > 0 || !rawString.empty();
-        topCommit_ = (count > 0 && commitTexts != nullptr &&
-                      commitTexts[0] != nullptr)
-                         ? commitTexts[0]
-                         : "";
         // 【选重闪帧】数字/; 选重上屏：引擎回「raw 空 + 旧候选 + 高亮」的
         // 确认帧（raw/preedit 已清）。Windows 侧靠 150ms 收场钟清窗；
         // Linux 无皮肤动效，直接清（否则候选窗滞留——用户实测反馈）。
@@ -1621,7 +1608,6 @@ private:
         snapshot.chinese = chinese == 1;
         if (flashFrame) {
             hasComposition_ = false;
-            topCommit_.clear();
         } else {
             snapshot.preedit = preeditString;
             snapshot.selected = selected;
@@ -1847,11 +1833,9 @@ private:
     HufuConfig config_;
     /// 每输入上下文宿主侧 UI 快照的工厂（见 `HufuUiState`；构造时注册）
     fcitx::FactoryFor<HufuUiState> uiStateFactory_;
-    /// 有编码或候选（更新回调维护；Shift+字母「顶字」判定用）
+    /// 有编码或候选（更新回调维护；空态保护用：避免无我方内容时碰系统 overlay）
     bool hasComposition_ = false;
-    /// 首选候选的实际上屏文本（含 `显示=>输出` 覆盖；顶字用）
-    std::string topCommit_;
-    /// 状态区菜单：「虎符」子菜单与四项（见 `setupStatusMenu`）
+    /// 状态区菜单：「虎符」子菜单与各项（见 `setupStatusMenu`）
     fcitx::Menu menu_;
     fcitx::SimpleAction menuAction_;
     std::unique_ptr<HufuMenuAction> reloadAction_;
