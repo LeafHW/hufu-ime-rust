@@ -731,9 +731,6 @@ impl Shared {
                     .unwrap_or("")
                     .to_string();
                 self.skin = v;
-                // 【组字串颜色 2026-10-18】全量载荷才到这（same:true 早退）
-                // ——组字串显示属性色随载荷更新，宿主下一按键取新值。
-                crate::displayattr::note_preedit_color(&self.skin);
                 self.skin_stale = false;
                 self.skin_loaded_at = std::time::Instant::now();
             }

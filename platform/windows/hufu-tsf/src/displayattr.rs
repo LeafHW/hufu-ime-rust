@@ -38,64 +38,21 @@ use windows_core::BSTR;
 /// 编码态 display attribute GUID（CLSID 尾段 a10→a12 派生，稳定不复用）。
 pub const ATTR_GUID: GUID = GUID::from_u128(0x8f5c2a12_3e77_4b9c_a1d4_9e0b7c2f5a88);
 
-/// 【组字串颜色 2026-10-18 实时化】运行时可变：skin 载荷到达时由
-/// note_preedit_color 更新（server 配置 appearance.preedit_color，
-/// 设置页改色 → fp 变 → ≤2.5s 重拉 → 宿主每键重查显示属性 →
-/// **下一按键即新色，无需重启应用**）。0 = 跟随应用（不带色）。
-/// 改默认色只改这里的初始值；正式配置走设置页。
-static PREEDIT_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 【组字串染粉 2026-10-18 用户拍板】组段文字+下划线 = hot pink #FF69B4。
+/// COLORREF 排列 0x00BBGGRR：B=0xB4 G=0x69 R=0xFF → 0x00B469FF。
+/// 改色就改这一个常量。注意：显示属性是「建议权」，多数宿主（记事本/
+/// QQ/CUAS/XAML）尊重，少数自绘编辑器无视——那样字色跟应用自己的走。
+const PINK_TEXT: u32 = 0x00B4_69FF;
 
-/// "#RRGGBB" / "#RRGGBBAA" / "RRGGBB" → COLORREF 0x00BBGGRR（A 忽略
-/// ——文字不做透明）。空/非法/长度不对 → 0（跟随应用）。
-pub fn parse_hex_colorref(s: &str) -> u32 {
-    let h = s.trim().trim_start_matches('#');
-    if h.len() != 6 && h.len() != 8 {
-        return 0;
-    }
-    let hex = |c: u8| -> Option<u32> {
-        match c {
-            b'0'..=b'9' => Some((c - b'0') as u32),
-            b'a'..=b'f' => Some((c - b'a' + 10) as u32),
-            b'A'..=b'F' => Some((c - b'A' + 10) as u32),
-            _ => None,
-        }
-    };
-    let b = h.as_bytes();
-    let mut v = [0u32; 6];
-    for i in 0..6 {
-        v[i] = match hex(b[i]) {
-            Some(x) => x,
-            None => return 0,
-        };
-    }
-    (v[4] << 4 | v[5]) << 16 | (v[2] << 4 | v[3]) << 8 | (v[0] << 4 | v[1]) // 0x00BBGGRR
-}
-
-/// skin 载荷全量到达时调用（tsf.rs load_skin；same:true 微载荷不调
-/// =颜色不变沿用）。字段缺省（老 server/老配置）→ 0 回跟随应用。
-pub fn note_preedit_color(v: &serde_json::Value) {
-    let s = v
-        .pointer("/skin/preedit_color")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    PREEDIT_COLOR.store(parse_hex_colorref(s), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 编码态样式：TF_ATTR_INPUT（正在输入/未转换）+ 组字串色（文字与
-/// 下划线同色；0=跟随应用不加色）。宿主每键重查——原子值变了下一键
-/// 就换色。
+/// 编码态样式：TF_ATTR_INPUT（正在输入/未转换）+ 粉红文字/粉红下划线。
 fn attr_style() -> TF_DISPLAYATTRIBUTE {
-    let c = PREEDIT_COLOR.load(std::sync::atomic::Ordering::Relaxed);
-    let color = if c == 0 {
-        TF_DA_COLOR::default()
-    } else {
-        TF_DA_COLOR {
-            r#type: TF_CT_COLORREF,
-            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(c) },
-        }
-    };
     TF_DISPLAYATTRIBUTE {
-        crText: color,
+        // 【染粉 2026-10-18】此前 default()（不加色，字色跟宿主）。用户
+        // 要组字串一眼可辨——crText/crLine 同填 TF_CT_COLORREF 粉红。
+        crText: TF_DA_COLOR {
+            r#type: TF_CT_COLORREF,
+            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(PINK_TEXT) },
+        },
         crBk: TF_DA_COLOR::default(),
         // 【实线定稿 2026-10-09】实证（像素级）：链路全通（宿主每次
         // 按键都查询 provider、mark 零失败）而 TF_LS_NONE 时 XAML/CUAS
@@ -103,7 +60,10 @@ fn attr_style() -> TF_DISPLAYATTRIBUTE {
         // 是想当然（首轮 QQ 失效同因）。TF_LS_SOLID=微拼同款观感。
         lsStyle: TF_DA_LINESTYLE(1), // TF_LS_SOLID：实线下划线
         fBoldLine: BOOL::default(),
-        crLine: color,
+        crLine: TF_DA_COLOR {
+            r#type: TF_CT_COLORREF,
+            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(PINK_TEXT) },
+        },
         bAttr: TF_ATTR_INPUT,
     }
 }
@@ -330,38 +290,3 @@ pub unsafe fn unmark_range(
 #[allow(unused_imports)]
 use windows::Win32::UI::TextServices::ITfDisplayAttributeProvider as _ProviderIf;
 const _: Option<_ProviderIf> = None;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 【组字串颜色 2026-10-18】hex→COLORREF（0x00BBGGRR）解析矩阵：
-    /// hot pink #FF69B4（R=FF G=69 B=B4）→ 0x00B469FF；非法一律 0
-    /// （跟随应用）。AA 尾容忍但忽略（文字不做透明）。
-    #[test]
-    fn parse_hex_colorref_matrix() {
-        assert_eq!(parse_hex_colorref("#FF69B4"), 0x00B4_69FF, "hot pink 带井号");
-        assert_eq!(parse_hex_colorref("ff69b4"), 0x00B4_69FF, "小写无井号");
-        assert_eq!(parse_hex_colorref("#FF69B4FF"), 0x00B4_69FF, "8 位 AA 忽略");
-        assert_eq!(parse_hex_colorref("#202022"), 0x00_22_20_20, "深灰：B=22 G=20 R=20");
-        assert_eq!(parse_hex_colorref(""), 0, "空=跟随应用");
-        assert_eq!(parse_hex_colorref("#12345"), 0, "长度错");
-        assert_eq!(parse_hex_colorref("#GG69B4"), 0, "非 hex");
-        assert_eq!(parse_hex_colorref(" #FF69B4 "), 0x00B4_69FF, "首尾空白容忍");
-    }
-
-    /// 载荷落地：/skin/preedit_color 缺省（老 server）→ 0；有值 → 生效。
-    #[test]
-    fn note_preedit_color_from_payload() {
-        let mut v = serde_json::json!({"skin": {}});
-        note_preedit_color(&v);
-        assert_eq!(PREEDIT_COLOR.load(std::sync::atomic::Ordering::Relaxed), 0);
-        v["skin"]["preedit_color"] = serde_json::json!("#FF69B4");
-        note_preedit_color(&v);
-        assert_eq!(PREEDIT_COLOR.load(std::sync::atomic::Ordering::Relaxed), 0x00B4_69FF);
-        // 回跟随应用（设置页清空）
-        v["skin"]["preedit_color"] = serde_json::json!("");
-        note_preedit_color(&v);
-        assert_eq!(PREEDIT_COLOR.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-}

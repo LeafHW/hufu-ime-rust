@@ -488,11 +488,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="g-anim"><label for="g-anim" title="候选窗动效总开关：尺寸过渡、跟光标滑动、高亮滑动；关闭=一切瞬跳">候选窗动效</label></div>
       <div class="checkline"><input type="checkbox" id="g-animfl"><label for="g-animfl" title="数字选重上屏后的确认暂留：高亮滑向选中项并停留约 0.15 秒再收窗；关闭=选重上屏立即收窗，其余动效不受影响（需先开「候选窗动效」）">选重暂留</label></div>
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
-      <!-- 【组字串颜色 2026-10-18】应用内组字串（底下带下划线那串）的
-           文字/下划线色。不勾=跟随应用（不带色）；勾选+取色=自定义。
-           改后下一按键即生效（无需重启应用）；少数自绘编辑器可能忽略。 -->
-      <div class="checkline"><input type="checkbox" id="g-preedit-c"><label for="g-preedit-c" title="应用内组字串（输入处底下带下划线的文字）颜色：勾选后用右侧颜色；不勾=跟随应用默认文字色。改后下一按键即生效，无需重启应用（少数自绘编辑器可能不认）">组字串颜色</label></div>
-      <div class="field"><input type="color" id="g-preedit-col" style="width:44px" title="组字串文字与下划线颜色（勾选「组字串颜色」后生效）"></div>
       <!-- 【特效退役 2026-09-22】上屏特效下拉+落印字号控件移除 -->
     </div>
     <div class="skin-grid" id="skin-json-grid">
@@ -1509,31 +1504,6 @@ function bindSkin() {
     };
     sp.onchange = saveConfig;
     syncAnim();
-  }
-  // 【组字串颜色 2026-10-18】appearance.preedit_color："#RRGGBB" 或空
-  //（跟随应用）。经 skin 载荷下发 DLL，改后下一按键即生效——无需
-  // 重启应用（显示属性宿主每键重查）。勾选=自定义色；不勾=清空。
-  {
-    const cb = $("#g-preedit-c"), col = $("#g-preedit-col");
-    const sync = () => {
-      const v = CFG.appearance?.preedit_color || "";
-      const m = /^#([0-9a-fA-F]{6})$/.exec(v);
-      cb.checked = !!m;
-      col.value = m ? m[1] : "#ff69b4";
-      col.disabled = !cb.checked;
-    };
-    cb.oninput = () => {
-      CFG.appearance = CFG.appearance || {};
-      CFG.appearance.preedit_color = cb.checked ? col.value.toUpperCase() : "";
-      sync();
-    };
-    cb.onchange = saveConfig;
-    col.oninput = () => {
-      CFG.appearance = CFG.appearance || {};
-      CFG.appearance.preedit_color = col.value.toUpperCase();
-    };
-    col.onchange = saveConfig;
-    sync();
   }
   // 【特效退役 2026-09-22】上屏特效下拉+落印字号控件整体退役
   // （commit_fx / stamp_font_scale 链路全删）——JS 块删除，HTML 行见下。

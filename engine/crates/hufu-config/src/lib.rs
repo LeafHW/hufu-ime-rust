@@ -662,12 +662,6 @@ pub struct AppearanceSection {
     /// 立即收窗，其余动效（平移/尺寸/高亮滑动）不受影响。总开关
     /// anim=false 时此项无效（随总开关一并关）。
     pub anim_flash: bool,
-    /// 【组字串颜色 2026-10-18】应用内组字串（TSF 显示属性，底下带
-    /// 下划线那串）颜色 "#RRGGBB"；空=跟随应用（不带色，老行为）。
-    /// 随 skin 载荷下发 DLL；宿主每键重查显示属性 → 改色下一按键
-    /// 即生效，无需重启应用/重装 DLL。
-    #[serde(default)]
-    pub preedit_color: String,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
     /// 【SSF 皮肤 2026-12】当前皮肤类型："json"（参数化 JSON 皮肤）或
@@ -691,7 +685,6 @@ impl Default for AppearanceSection {
             anim: true,
             anim_speed: 1.0,
             anim_flash: true,
-            preedit_color: String::new(),
             skin_kind: default_skin_kind(),
         }
     }
