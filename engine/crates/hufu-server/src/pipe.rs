@@ -539,10 +539,14 @@ pub fn dispatch(
                     let anim = host.engine.config.appearance.anim;
                     let anim_speed = host.engine.config.appearance.anim_speed;
                     let anim_flash = host.engine.config.appearance.anim_flash;
+                    // 【组字串颜色 2026-10-18】应用内显示属性色，空=
+                    // 跟随应用。注入+入指纹：改色 → fp 变 → DLL 全量
+                    // 重拉 → 下一按键新色（无需重启应用）。
+                    let preedit_color = host.engine.config.appearance.preedit_color.clone();
                     // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
                     // 字段全部参与——DLL have_fp 命中即 {"same":true} 微载荷。
                     let fp = format!(
-                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}",
+                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{preedit_color}|{}",
                         host.engine.config.schema.current
                     );
                     if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
@@ -555,6 +559,7 @@ pub fn dispatch(
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
                         o.insert("anim_flash".into(), serde_json::json!(anim_flash));
+                        o.insert("preedit_color".into(), serde_json::json!(preedit_color));
                         o.insert(
                             "first_show_slide".into(),
                             serde_json::json!(
@@ -582,12 +587,13 @@ pub fn dispatch(
             // 手改文件/改配置全部改变指纹，无一漏网。
             let meta = std::fs::metadata(&p).ok();
             let fp = format!(
-                "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}",
+                "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}|{}",
                 meta.as_ref().and_then(|m| m.modified().ok()),
                 meta.as_ref().map(|m| m.len()).unwrap_or(0),
                 host.engine.config.appearance.anim,
                 host.engine.config.appearance.anim_speed,
                 host.engine.config.appearance.anim_flash,
+                host.engine.config.appearance.preedit_color,
                 host.engine.config.schema.current,
             );
             if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
@@ -615,6 +621,12 @@ pub fn dispatch(
                         o.insert("anim".into(), serde_json::json!(anim));
                         o.insert("anim_speed".into(), serde_json::json!(anim_speed));
                         o.insert("anim_flash".into(), serde_json::json!(anim_flash));
+                        // 【组字串颜色 2026-10-18】与 ssf 路径同源注入
+                        //（DLL note_preedit_color 读 /skin/preedit_color）。
+                        o.insert(
+                            "preedit_color".into(),
+                            serde_json::json!(host.engine.config.appearance.preedit_color),
+                        );
                         // 【虎娘对齐·首显滑动 2026-09-18 二修】显式 opt-in
                         // 门控：非整句方案才允许组段首显滑动。不用
                         // sentence_active()——无模型包里 sentence.is_none()
