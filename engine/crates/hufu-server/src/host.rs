@@ -1124,11 +1124,6 @@ impl Host {
         crate::ssf::list_ssf(&self.data_dir)
     }
 
-    /// 解包 .ssf 到缓存目录（导入/切换校验/管道取用共用的底层）。
-    pub fn unbundle_ssf(&self, path: &Path) -> Result<crate::ssf::SsfBundle, String> {
-        crate::ssf::unbundle(&self.data_dir, path)
-    }
-
     /// 取可用 .ssf 皮肤包（缓存优先；源缺失时降级用缓存）。
     pub fn ssf_bundle(&self, id: &str) -> Result<crate::ssf::SsfBundle, String> {
         crate::ssf::bundle_for(&self.data_dir, id)

@@ -13,6 +13,8 @@
 //! 多字重族的规范名）优先，回退 ID1；Windows 平台（3）UTF-16BE 优先，
 //! Mac（1）按 latin1 近似兜底。TTC（ttcf）逐子字体各取一族。
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 fn u16be(b: &[u8], i: usize) -> Option<u16> {

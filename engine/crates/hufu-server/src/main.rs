@@ -601,11 +601,10 @@ fn main() {
                         eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
                     } else {
                         // 打字保护：组段未闭合等空档（60s 强制兜底）
-                        let mut defer = false;
-                        {
+                        let defer = {
                             let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                            defer = !h.session.is_idle();
-                        }
+                            !h.session.is_idle()
+                        };
                         if defer {
                             let elapsed_ok = armed_since
                                 .map(|t| t.elapsed().as_secs() < 60)

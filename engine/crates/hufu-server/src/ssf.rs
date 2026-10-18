@@ -48,7 +48,6 @@ pub struct SsfSkinEntry {
     pub preview: bool,
     /// skin.ini 坏字段降级提示（虎娘「尽力加载」口径）。
     pub warnings: Vec<String>,
-    pub fp: String,
 }
 
 /// 缓存清单：definition + 源指纹 + 源文件快照（size/mtime 命中判定）。
@@ -431,7 +430,6 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
                 preview: thumb_source(&b.def).is_some(),
                 warnings: b.def.warnings.clone(),
                 id: b.id,
-                fp: b.fp,
             }),
             Err(e) => out.push(SsfSkinEntry {
                 name: id.clone(),
@@ -440,7 +438,6 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
                 preview: false,
                 warnings: Vec::new(),
                 id,
-                fp: String::new(),
             }),
         }
     }
