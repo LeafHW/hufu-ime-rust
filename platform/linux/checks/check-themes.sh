@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
 
-TOOL="platform/linux/theme/build-themes.py"
+TOOL="platform/linux/themes/build-themes.py"
 SKINS="engine/crates/hufu-server/official-skins"
 THEMES="platform/linux/themes"
 REQUIRED_KEYS=(
@@ -78,10 +78,11 @@ diffout="$(mktemp)"
 trap 'rm -rf "$tmp" "$diffout"' EXIT
 python3 "$TOOL" --out "$tmp" --quiet >/dev/null || fail "转换脚本执行失败：$TOOL"
 # 注意：diff 的输出**不能**落在被比对的目录里（否则它自己就是「多余文件」）
-if ! diff -r "$THEMES" "$tmp" >"$diffout" 2>&1; then
+# themes/ 里还放转换脚本与 README，逐字节比对只针对 hufu-* 产物。
+if ! diff -r --exclude="build-themes.py" --exclude="__pycache__" --exclude="README.md" "$THEMES" "$tmp" >"$diffout" 2>&1; then
     sed 's/^/  /' "$diffout" | head -30
     fail "仓内主题包与重跑结果不一致（改过皮肤或转换脚本？跑 $TOOL 重新生成并提交）"
 fi
-echo "  ✓ 重跑转换与仓内产物逐字节一致（$(find "$THEMES" -type f | wc -l) 个文件）"
+echo "  ✓ 重跑转换与仓内产物逐字节一致（$(find "$THEMES" -mindepth 2 -type f | wc -l) 个文件）"
 
 echo "check-themes: 皮肤→fcitx5 主题包自检通过（${#skins[@]} 套）"

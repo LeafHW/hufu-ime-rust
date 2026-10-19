@@ -1,7 +1,7 @@
 # 虎符 HuFu — 以虎码为核心的跨平台输入法
 
 > 名字取自古代调兵信物「虎符」：以虎码为主码的输入法平台，Windows / Linux / macOS 三端
-> （Windows 真机全通；Linux fcitx5 前端可用；macOS 尚未开始开发）。
+> （Windows 真机全通；Linux fcitx5 通用输入主链可用；macOS 尚未开始开发）。
 > 目标：吸收 **虎爪输入法（TigerClaw）** 与 **Rime（虎码配置）** 的全部能力，
 > 重新实现为「统一引擎 + 多平台前端 + 图形化设置」的产品级输入法。
 
@@ -21,30 +21,30 @@
 
 ## 快速指南
 
-**Windows（免构建）**
+### **Windows（免构建）**
 
-1. 从 [Releases](../../releases) 下载最新 `HuFu-IME-x.y.z.zip`（约 1GB 完整安装包：
-   双位 TSF 组件、码表、ngram 整句模型、Qwen3 重排模型与全部数据）
-2. 解压到任意位置，运行 **`安装.bat`**（自动 UAC 提权，双阶段安装）
-3. 打开新应用，Win+空格 切到「虎符」即可打字；卸载跑 `卸载.bat`
+1. 从 [Releases](../../releases) 下载最新 Windows 安装包（v1.8.x 为
+   `HuFuSetup-*.exe`；旧版为 `HuFu-IME-x.y.z.zip`，以 Release 页为准）
+2. 运行安装程序（自动 UAC 提权，双阶段安装）
+3. 打开新应用，Win+空格 切到「虎符」即可打字
 
-**Linux（fcitx5）**
+Windows 详见 [docs/build.md](docs/build.md)
+
+### **Linux（fcitx5）**
 
 ```sh
-platform/linux/install.sh   # 构建 + 码表装配 + systemd user 服务 + 系统级 addon（中途要 sudo）
-fcitx5 -r -d                # 重启 fcitx5
-fcitx5-configtool           # 输入法 → 添加「虎符」
+platform/linux/install.sh -umt  # 用户级 一键全量安装
+fcitx5 -r -d       # 重启 fcitx5（或以发行版的方式）
+fcitx5-configtool  # 手动添加「虎符」（或以发行版的方式）
 ```
 
-默认数据**随仓库自带**（`assets/`，模型除外）；设置页在应用菜单「虎符设置」
-或 `http://127.0.0.1:4390/`。
+- 默认数据 **随仓库自带**（`assets/`）
+- 模型与主题不随 `-s/-u` 安装，分别用 `-m`、`-t` 显式独立安装
+- 设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`
 
-安装 / 卸载 / 功能与作者声明见 **[platform/linux/README.md](platform/linux/README.md)**。
+Linux 详见 [platform/linux/README.md](platform/linux/README.md)
 
-**macOS**：尚未开始开发。
-
-从源码构建、Windows 系统注册与注意事项详见 [docs/build.md](docs/build.md)；
-当前进度与测试基准详见 [docs/status.md](docs/status.md)。
+### **macOS**（尚未开始开发）
 
 ## 版权声明
 
