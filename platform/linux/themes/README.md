@@ -1,19 +1,19 @@
 <!-- SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com> -->
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 
-# platform/linux/theme — 虎符皮肤 → fcitx5 主题包（转换工具 + 说明）
+# platform/linux/themes — 虎符皮肤 → fcitx5 主题包（转换工具 + 产物）
 
 引擎的 19 套皮肤（`engine/crates/hufu-server/official-skins/*.json`）是给 **Windows 自绘候选窗**
 用的；Linux 的候选窗是 fcitx5 的面板，样式只能来自 **fcitx5 主题**。这里把每套皮肤**离线**
 转成一套 fcitx5 主题包，随包安装到 `~/.local/share/fcitx5/themes/hufu-<id>/`——
 **主题名与皮肤 id、中文名一致**（在引擎设置页选「墨岩」，到 fcitx5 里也选「墨岩（极简黑）」）。
 
-产物落在 **`platform/linux/themes/hufu-<id>/`（纯生成目录：只有产物，不放任何手写文件**，
-校验脚本据此逐字节比对）；由本目录的 `build-themes.py` 生成，**不要手改产物**。改皮肤源或改
-转换脚本后重跑：
+产物落在 **`platform/linux/themes/hufu-<id>/`**，由本目录的 `build-themes.py` 生成；
+`hufu-*` 是纯生成产物，**不要手改**。本目录同时放转换脚本与说明，校验脚本只比对 `hufu-*`。
+改皮肤源或改转换脚本后重跑：
 
 ```sh
-python3 platform/linux/theme/build-themes.py     # 重新生成 19 套主题包
+python3 platform/linux/themes/build-themes.py    # 重新生成 19 套主题包
 bash platform/linux/checks/check-themes.sh       # 自检：重跑转换与仓内产物逐字节比对
 ```
 

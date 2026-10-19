@@ -9,7 +9,7 @@
 # 覆盖（与 .github/workflows/ci.yml 的检查一一对应）：
 #   ① 依赖缓存探测   ② 前端单测   ③ 构建 addon   ④ C ABI 符号一致
 #   ⑤ DESTDIR 安装布局   ⑥ 逐脚本 bash -n   ⑦ assets 台账   ⑧ 品牌图形
-#   ⑨ 皮肤主题包   ⑩ 排版   ⑪ clippy
+#   ⑨ 皮肤主题包   ⑩ 主题安装/卸载   ⑪ 排版   ⑫ clippy
 #
 # 与 workflow 的职责划分：
 #   · workflow 管**环境**——apt 装依赖（cmake / g++ / make / binutils / libfcitx5core-dev）、
@@ -130,14 +130,37 @@ bash platform/linux/checks/check-branding.sh || fail '品牌图形自检失败'
 step '⑨ 皮肤 → fcitx5 主题包（重跑转换逐字节比对）'
 bash platform/linux/checks/check-themes.sh || fail '皮肤主题包与引擎皮肤源不一致'
 
-step '⑩ 排版（cargo fmt -p hufu-fcitx5-client --check）'
+step '⑩ 主题安装/卸载与 -t 独立性（临时 HOME）'
+theme_home="$tmp/theme-home"
+mkdir -p "$theme_home/data" "$theme_home/config"
+want_themes=$(find "$root/platform/linux/themes" -mindepth 1 -maxdepth 1 -type d -name 'hufu-*' | wc -l)
+HOME="$theme_home" XDG_DATA_HOME="$theme_home/data" XDG_CONFIG_HOME="$theme_home/config" \
+    platform/linux/install.sh -t >/dev/null || fail 'install.sh -t 失败'
+got_themes=$(find "$theme_home/data/fcitx5/themes" -mindepth 1 -maxdepth 1 -type d -name 'hufu-*' 2>/dev/null | wc -l)
+[ "$got_themes" -eq "$want_themes" ] || fail "install.sh -t 主题数不符：$got_themes != $want_themes"
+# -u 不应清理主题；用假 systemctl/pkill 避免触碰真实会话
+mkdir -p "$tmp/fake-bin"
+printf '#!/bin/sh\nexit 1\n' >"$tmp/fake-bin/systemctl"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/fake-bin/pkill"
+chmod +x "$tmp/fake-bin/systemctl" "$tmp/fake-bin/pkill"
+PATH="$tmp/fake-bin:$PATH" HOME="$theme_home" XDG_DATA_HOME="$theme_home/data" XDG_CONFIG_HOME="$theme_home/config" \
+    platform/linux/uninstall.sh -u >/dev/null || fail 'uninstall.sh -u 失败'
+left_themes=$(find "$theme_home/data/fcitx5/themes" -mindepth 1 -maxdepth 1 -type d -name 'hufu-*' 2>/dev/null | wc -l || true)
+[ "$left_themes" -eq "$want_themes" ] || fail "uninstall.sh -u 不应删主题：剩 $left_themes != $want_themes"
+HOME="$theme_home" XDG_DATA_HOME="$theme_home/data" XDG_CONFIG_HOME="$theme_home/config" \
+    platform/linux/uninstall.sh -t >/dev/null || fail 'uninstall.sh -t 失败'
+left_themes=$(find "$theme_home/data/fcitx5/themes" -mindepth 1 -maxdepth 1 -type d -name 'hufu-*' 2>/dev/null | wc -l || true)
+[ "$left_themes" -eq 0 ] || fail "uninstall.sh -t 后仍有 $left_themes 套主题"
+ok "主题安装/卸载通过：$want_themes 套"
+
+step '⑪ 排版（cargo fmt -p hufu-fcitx5-client --check）'
 if ! fmt_out=$(cd platform/linux && cargo fmt -p hufu-fcitx5-client --check 2>&1); then
     printf '%s\n' "$fmt_out"
     fail 'rustfmt 有差异：在 platform/linux 跑 cargo fmt -p hufu-fcitx5-client 后重试'
 fi
 ok '排版干净'
 
-step '⑪ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
+step '⑫ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
 if ! clippy_out=$(cd platform/linux &&
     cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings 2>&1); then
     printf '%s\n' "$clippy_out"

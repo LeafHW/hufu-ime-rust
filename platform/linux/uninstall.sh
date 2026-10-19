@@ -2,28 +2,31 @@
 # SPDX-FileCopyrightText: 2026 明雅流风 <crrvx@outlook.com>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# 虎符 Linux 卸载：-s 系统级、-u 用户级、-m 模型；可组合，空参无效。
+# 虎符 Linux 卸载：-s 系统级、-u 用户级、-m 模型、-t 主题；可组合，空参无效。
 set -euo pipefail
 
 usage() {
     cat <<'USAGE'
 虎符输入法 · Linux 卸载（在仓库根目录执行）
-用法：platform/linux/uninstall.sh -s|-u|-m [...]
+用法：platform/linux/uninstall.sh -s|-u|-m|-t [...]
       platform/linux/uninstall.sh -s -u -m
 
   -s, --system  清理系统级 fcitx5 文件（需要 sudo）
-  -u, --user    清理用户级 addon、服务与数据
+  -u, --user    清理用户级 addon、服务与数据（不含主题/模型）
   -m, --model   删除「模型」目录（约 880MB）
+  -t, --theme   清理 fcitx5 主题（独立；-u 不隐含主题清理）
   -h, --help    显示本用法
 
 至少指定一项，可任意组合：
   -s            只清系统级
-  -u            只清用户级，保留模型
+  -u            只清用户级，保留模型与主题
   -m            只删模型，其余用户数据保留
+  -t            只清主题
   -s -u         系统级 + 用户级
   -u -m         用户级 + 模型
+  -s -t         系统级 + 主题
   -s -u -m      全部清理
-短选项可合并，如 -su、-sum、-um。
+短选项可合并，如 -su、-sum、-um、-st、-ut。
 空参、-h、--help 均显示本用法。
 USAGE
 }
@@ -53,11 +56,13 @@ fi
 DO_SYSTEM=0
 DO_USER=0
 DO_MODEL=0
+DO_THEMES=0
 set_flag() {
     case "$1" in
         s) DO_SYSTEM=1 ;;
         u) DO_USER=1 ;;
         m) DO_MODEL=1 ;;
+        t) DO_THEMES=1 ;;
     esac
 }
 while [[ $# -gt 0 ]]; do
@@ -65,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --system) set_flag s; shift ;;
         --user) set_flag u; shift ;;
         --model) set_flag m; shift ;;
+        --theme) set_flag t; shift ;;
         --help) usage; exit 0 ;;
         --) shift; break ;;
         --*) echo "✗ 未知选项: $1（--help 看用法）" >&2; exit 2 ;;
@@ -74,7 +80,7 @@ while [[ $# -gt 0 ]]; do
                 ch=${cluster:0:1}
                 cluster=${cluster:1}
                 case "$ch" in
-                    s|u|m) set_flag "$ch" ;;
+                    s|u|m|t) set_flag "$ch" ;;
                     h) usage; exit 0 ;;
                     *) echo "✗ 未知选项: -$ch（--help 看用法）" >&2; exit 2 ;;
                 esac
@@ -87,8 +93,8 @@ if (($# > 0)); then
     echo "✗ 不支持位置参数: $1（--help 看用法）" >&2
     exit 2
 fi
-if ((!DO_SYSTEM && !DO_USER && !DO_MODEL)); then
-    echo '✗ 必须至少指定 -s、-u、-m 之一（--help 看用法）' >&2
+if ((!DO_SYSTEM && !DO_USER && !DO_MODEL && !DO_THEMES)); then
+    echo '✗ 必须至少指定 -s、-u、-m、-t 之一（--help 看用法）' >&2
     exit 2
 fi
 
@@ -99,6 +105,24 @@ fi
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+remove_themes() {
+    local theme_dir
+    for theme_dir in "$XDG_DATA"/fcitx5/themes/hufu-*; do
+        if [[ -d "$theme_dir" ]]; then
+            rm -rf "$theme_dir"
+        fi
+    done
+    rmdir --ignore-fail-on-non-empty "$XDG_DATA/fcitx5/themes" "$XDG_DATA/fcitx5" 2>/dev/null || true
+}
+
+if ((DO_THEMES && !DO_SYSTEM && !DO_USER && !DO_MODEL)); then
+    say '① 删除 fcitx5 主题'
+    remove_themes
+    say '完成 ✔'
+    echo '重启 fcitx5 生效：fcitx5 -r -d'
+    exit 0
+fi
 
 if ((DO_USER)); then
     say '① 停止 hufu-server'
@@ -156,13 +180,8 @@ if ((DO_USER)); then
         "$XDG_DATA/icons/hicolor/scalable/apps/hufu.svg" \
         "$XDG_DATA/icons/hicolor/48x48/apps/hufu.png" \
         "$XDG_DATA/icons/hicolor/22x22/apps/hufu.png"
-    for theme_dir in "$XDG_DATA"/fcitx5/themes/hufu-*; do
-        if [[ -d "$theme_dir" ]]; then
-            rm -rf "$theme_dir"
-        fi
-    done
     rmdir --ignore-fail-on-non-empty \
-        "$XDG_DATA/fcitx5/themes" "$XDG_DATA/fcitx5" \
+        "$XDG_DATA/fcitx5" \
         "$XDG_DATA/icons/hicolor/scalable/apps" \
         "$XDG_DATA/icons/hicolor/48x48/apps" \
         "$XDG_DATA/icons/hicolor/22x22/apps" \
@@ -195,13 +214,19 @@ else
     say '⑤ 未指定 -u/-m：保留数据与模型'
 fi
 
+if ((DO_THEMES)); then
+    say '⑥ 删除 fcitx5 主题'
+    remove_themes
+fi
+
 say '完成 ✔'
 if ((DO_SYSTEM)); then echo '系统级文件已清理。'; fi
 if ((DO_USER)); then echo '用户级文件与数据已清理。'; fi
 if ((DO_MODEL)); then echo '模型已删除。'; fi
+if ((DO_THEMES)); then echo '主题已清理。'; fi
 if ((!DO_MODEL)) && [[ -d "$HUFU_ROOT/模型" ]]; then
     echo "「模型」未动；如不再需要：platform/linux/uninstall.sh -m"
 fi
-if ((DO_SYSTEM || DO_USER)); then
+if ((DO_SYSTEM || DO_USER || DO_THEMES)); then
     echo '重启 fcitx5 生效：fcitx5 -r -d'
 fi

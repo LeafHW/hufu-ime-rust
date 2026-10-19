@@ -18,7 +18,7 @@
 
 产物必须**可重复**：同一份主源、同一 zlib 实现下逐字节一致（`checks/check-branding.sh` 按
 `hufu.svg` 逐字节、位图逐像素比对——PNG 的压缩字节随 zlib 实现不同，见 `pixel_digest`）。
-PNG 的解码/编码都在本文件内实现，不引第三方依赖（与 `theme/build-themes.py` 同风格）。
+PNG 的解码/编码都在本文件内实现，不引第三方依赖（与 `themes/build-themes.py` 同风格）。
 """
 
 from __future__ import annotations

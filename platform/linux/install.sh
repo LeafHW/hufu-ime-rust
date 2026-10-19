@@ -10,16 +10,18 @@ usage() {
 虎符输入法 · Linux 安装（在仓库根目录执行）
 用法：platform/linux/install.sh -s|--system [--no-build]
       platform/linux/install.sh -u|--user   [--no-build]
+      platform/linux/install.sh -t|--theme
 
   -s, --system  安装系统级 fcitx5 addon（需要 sudo）
   -u, --user    安装用户级 fcitx5 addon（无需 sudo）
+  -t, --theme   安装/更新 fcitx5 主题（独立于 addon；可单用或与 -s/-u 组合）
   --no-build    跳过构建（使用已有产物）
   -h, --help    显示本用法
 
-短选项可合并（如 -sh），但 -s 与 -u 互斥。
-空参、-h、--help 均显示本用法；安装时必须显式指定 -s 或 -u。
-两种方式都会安装用户运行时：码表/数据、hufu-server、systemd user 服务、
-桌面入口、图标与主题。模型不随仓库分发，需另行获取。
+短选项可合并（如 -sh、-st），但 -s 与 -u 互斥。
+空参、-h、--help 均显示本用法；安装须指定 -s/-u，或使用 -t。
+-s/-u 不隐含 -t：主题只在显式给出 -t 时安装。完整安装会装配用户运行时
+（码表/数据、hufu-server、systemd user 服务、桌面入口、图标），模型另行获取。
 EOF
 }
 
@@ -35,6 +37,8 @@ SERVER_BIN="$ROOT/engine/target/release/hufu-server"
 ADDON_SO="$BUILD_DIR/libhufu.so"
 ADDON_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf"
 IM_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf"
+THEMES_DIR="$ROOT/platform/linux/themes"
+THEME_TARGET="$XDG_DATA/fcitx5/themes"
 
 # 用户级 addon：conf 放 XDG 数据目录，Library 指向同一用户目录下的绝对路径。
 USER_FCITX_DATA="$XDG_DATA/fcitx5"
@@ -60,6 +64,7 @@ fi
 
 MODE=''
 DO_BUILD=1
+DO_THEMES=0
 set_mode() {
     case "$1" in
         s)
@@ -80,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --system) set_mode s; shift ;;
         --user) set_mode u; shift ;;
+        --theme) DO_THEMES=1; shift ;;
         --no-build) DO_BUILD=0; shift ;;
         --help) usage; exit 0 ;;
         --) shift; break ;;
@@ -91,6 +97,7 @@ while [[ $# -gt 0 ]]; do
                 cluster=${cluster:1}
                 case "$ch" in
                     s|u) set_mode "$ch" ;;
+                    t) DO_THEMES=1 ;;
                     h) usage; exit 0 ;;
                     *) echo "✗ 未知选项: -$ch（--help 看用法）" >&2; exit 2 ;;
                 esac
@@ -103,14 +110,14 @@ if (($# > 0)); then
     echo "✗ 不支持位置参数: $1（--help 看用法）" >&2
     exit 2
 fi
-if [[ -z "$MODE" ]]; then
-    echo '✗ 必须指定 -s/--system 或 -u/--user（--help 看用法）' >&2
+if [[ -z "$MODE" && "$DO_THEMES" == 0 ]]; then
+    echo '✗ 必须指定 -s/-u，或使用 -t/--theme（--help 看用法）' >&2
     exit 2
 fi
 
 if [[ "$EUID" -eq 0 ]]; then
     echo '✗ 请勿用 sudo 运行整个脚本（用户级文件会装到 /root）。' >&2
-    echo '  正确用法：platform/linux/install.sh -s|--system  或  -u|--user' >&2
+    echo '  正确用法：platform/linux/install.sh -s|--system、-u|--user 或 -t|--theme' >&2
     exit 2
 fi
 
@@ -133,6 +140,26 @@ icon_hint() {
     echo '    kquitapp6 plasmashell && kstart plasmashell'
     echo
 }
+
+install_themes() {
+    compgen -G "$THEMES_DIR/hufu-*" >/dev/null || die "缺少 $THEMES_DIR/hufu-*（主题产物未生成？）"
+    mkdir -p "$THEME_TARGET"
+    for old_theme in "$THEME_TARGET"/hufu-*; do
+        if [[ -d "$old_theme" ]]; then
+            rm -rf "$old_theme"
+        fi
+    done
+    cp -r "$THEMES_DIR"/hufu-* "$THEME_TARGET/"
+    ok "fcitx5 主题已安装到 $THEME_TARGET"
+}
+
+if [[ "$DO_THEMES" == 1 && -z "$MODE" ]]; then
+    say '① 安装 fcitx5 主题'
+    install_themes
+    say '完成 ✔'
+    echo '重启 fcitx5 生效：fcitx5 -r -d'
+    exit 0
+fi
 
 [[ -d "$ASSETS_DIR/码表" ]] || die "缺少 assets/码表（不完整检出？）"
 [[ -d "$ASSETS_DIR/数据" ]] || die "缺少 assets/数据（不完整检出？）"
@@ -202,14 +229,9 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q -t -f "$XDG_DATA/icons/hicolor" 2>/dev/null || true
 fi
 
-if compgen -G "$ROOT/platform/linux/themes/hufu-*" >/dev/null; then
-    mkdir -p "$XDG_DATA/fcitx5/themes"
-    for old_theme in "$XDG_DATA"/fcitx5/themes/hufu-*; do
-        if [[ -d "$old_theme" ]]; then
-            rm -rf "$old_theme"
-        fi
-    done
-    cp -r "$ROOT"/platform/linux/themes/hufu-* "$XDG_DATA/fcitx5/themes/"
+if [[ "$DO_THEMES" == 1 ]]; then
+    say '⑥ 安装 fcitx5 主题'
+    install_themes
 fi
 
 if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then

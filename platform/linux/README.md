@@ -31,12 +31,16 @@
 ```sh
 platform/linux/install.sh -s   # 系统级 addon（sudo）+ 用户运行时
 platform/linux/install.sh -u   # 用户级 addon（无需 sudo）
+platform/linux/install.sh -st  # 系统级 addon + 主题
+platform/linux/install.sh -t   # 安装/更新主题（可单独，也可与 -s/-u 组合）
 fcitx5 -r -d                   # 重启
 fcitx5-configtool              # 输入法 → 添加「虎符」
 ```
 
-空参、`-h`、`--help` 显示用法；安装时须显式指定 `-s` 或 `-u`。两种方式都会装配 `assets/码表`、
-`assets/数据`、`hufu-server`、systemd user 服务、桌面入口、图标与主题：
+空参、`-h`、`--help` 显示用法；安装时须显式指定 `-s` 或 `-u`，或用 `-t` 装主题。
+`-s/-u` **不隐含主题**：完整安装只装配 `assets/码表`、`assets/数据`、`hufu-server`、systemd user 服务、
+桌面入口与图标；主题只在显式给出 `-t/--theme` 时安装。`-t` 可单独使用（不构建、不装 addon），
+也可与 `-s`/`-u` 组合，把 `platform/linux/themes/hufu-*` 装到 `~/.local/share/fcitx5/themes/`：
 
 - `-s/--system`：addon 与两个 conf 装到系统目录（需要 sudo）
 - `-u/--user`：addon 与 conf 装到 `~/.local/share/fcitx5/`，`Library=` 指向同目录绝对路径（无需 sudo）
@@ -51,15 +55,18 @@ fcitx5-configtool              # 输入法 → 添加「虎符」
 
 ```sh
 platform/linux/uninstall.sh -s           # 只清系统级
-platform/linux/uninstall.sh -u           # 只清用户级，保留模型
+platform/linux/uninstall.sh -u           # 只清用户级，保留模型与主题
 platform/linux/uninstall.sh -m           # 只删模型
+platform/linux/uninstall.sh -t           # 只清主题
+platform/linux/uninstall.sh -ut          # 用户级 + 主题
 platform/linux/uninstall.sh -s -u        # 系统级 + 用户级
 platform/linux/uninstall.sh -u -m        # 用户级 + 模型
 platform/linux/uninstall.sh -s -u -m     # 全部清理
+platform/linux/uninstall.sh -s -t        # 系统级 + 主题
 platform/linux/uninstall.sh -sum         # 同上（短选项可合并）
 ```
 
-空参、`-h`、`--help` 显示卸载用法；至少指定 `-s`、`-u`、`-m` 之一。
+空参、`-h`、`--help` 显示卸载用法；至少指定 `-s`、`-u`、`-m`、`-t` 之一。
 
 其余选项见 `uninstall.sh --help`。
 

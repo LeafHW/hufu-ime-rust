@@ -9,10 +9,10 @@
 `~/.local/share/fcitx5/themes/`——用户在哪端选的都是同一套皮肤名。
 
 用法：
-    python3 platform/linux/theme/build-themes.py                 # 生成到 platform/linux/themes
-    python3 platform/linux/theme/build-themes.py --out /tmp/x    # 生成到别处（校验脚本比对用）
+    python3 platform/linux/themes/build-themes.py                # 生成到 platform/linux/themes
+    python3 platform/linux/themes/build-themes.py --out /tmp/x   # 生成到别处（校验脚本比对用）
 
-映射与取舍见 platform/linux/theme/README.md（不做的：模糊/动效/每候选配色/字体）。
+映射与取舍见 platform/linux/themes/README.md（不做的：模糊/动效/每候选配色/字体）。
 产物必须**可重复**：同一份皮肤 JSON 必须逐字节生成同样的文件（校验脚本据此比对）。
 """
 
@@ -219,9 +219,9 @@ def theme_conf(skin: dict) -> str:
 
     # 底/高亮的 alpha 交给位图（面板图带 alpha），颜色键则用 fcitx5 原生 #rrggbbaa。
     return f"""# 虎符皮肤「{sid}」（{name}）→ fcitx5 主题
-# 由 platform/linux/theme/build-themes.py 从 engine/crates/hufu-server/official-skins/{sid}.json 生成，
+# 由 platform/linux/themes/build-themes.py 从 engine/crates/hufu-server/official-skins/{sid}.json 生成，
 # **不要手改**：改皮肤源或改转换脚本后重跑，`checks/check-themes.sh` 会比对。
-# 映射与取舍（模糊/动效/每候选配色/字体不做）见 platform/linux/theme/README.md。
+# 映射与取舍（模糊/动效/每候选配色/字体不做）见 platform/linux/themes/README.md。
 
 [Metadata]
 Name={name}
