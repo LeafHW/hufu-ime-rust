@@ -27,20 +27,24 @@
 
 依赖：Rust 工具链、CMake ≥ 3.20、C++20 编译器、`Fcitx5Core` ≥ 5.1.15
 （Arch `fcitx5`、Fedora `fcitx5-devel`、Debian/Ubuntu `libfcitx5core-dev`）及 fcitx5。
+自动安装模型另需 `curl`/`wget` 与 `7z`（Debian/Ubuntu 为 `p7zip-full`）。
 
 ```sh
 platform/linux/install.sh -s   # 系统级 addon（sudo）+ 用户运行时
 platform/linux/install.sh -u   # 用户级 addon（无需 sudo）
 platform/linux/install.sh -st  # 系统级 addon + 主题
 platform/linux/install.sh -t   # 安装/更新主题（可单独，也可与 -s/-u 组合）
+platform/linux/install.sh -m   # 下载并安装模型（约 880MB）
+platform/linux/install.sh -um  # 用户级 addon + 模型
 fcitx5 -r -d                   # 重启
 fcitx5-configtool              # 输入法 → 添加「虎符」
 ```
 
-空参、`-h`、`--help` 显示用法；安装时须显式指定 `-s` 或 `-u`，或用 `-t` 装主题。
-`-s/-u` **不隐含主题**：完整安装只装配 `assets/码表`、`assets/数据`、`hufu-server`、systemd user 服务、
-桌面入口与图标；主题只在显式给出 `-t/--theme` 时安装。`-t` 可单独使用（不构建、不装 addon），
-也可与 `-s`/`-u` 组合，把 `platform/linux/themes/hufu-*` 装到 `~/.local/share/fcitx5/themes/`：
+空参、`-h`、`--help` 显示用法；安装时须显式指定 `-s` 或 `-u`，或用 `-t`/`-m`。
+`-s/-u` **不隐含 `-t`/`-m`**：完整安装只装配 `assets/码表`、`assets/数据`、`hufu-server`、
+systemd user 服务、桌面入口与图标；主题和模型都只在显式给出对应开关时处理。
+`-t` 可单独使用（不构建、不装 addon），把 `platform/linux/themes/hufu-*` 装到
+`~/.local/share/fcitx5/themes/`；`-m` 也可单独使用，只下载/安装模型。
 
 - `-s/--system`：addon 与两个 conf 装到系统目录（需要 sudo）
 - `-u/--user`：addon 与 conf 装到 `~/.local/share/fcitx5/`，`Library=` 指向同目录绝对路径（无需 sudo）
@@ -48,8 +52,17 @@ fcitx5-configtool              # 输入法 → 添加「虎符」
 安装脚本会同时装配 `assets/码表/` 与 `assets/数据/`；只跑 `cmake --install` 会缺数据。
 默认落点遵守 XDG：数据 `~/.local/share/hufu/`，服务端 `~/.local/bin/`。
 
-整句/重排模型约 880MB，不随仓库分发；安装结束会打印获取地址，下载后把「模型」文件夹
-放进 `~/.local/share/hufu/` 即可（缺模型为纯码表模式）。
+整句/重排模型约 880MB，不随仓库分发；缺模型为纯码表模式：
+
+```sh
+platform/linux/install.sh -m
+```
+
+默认从 GitHub Release 的
+[`default.7z`](https://github.com/LeafHW/hufu-ime-rust/releases/download/%E6%A8%A1%E5%9E%8B/default.7z)
+下载，验证后解压到 `~/.local/share/hufu/模型/`（服务端按 `.bin`/`.gguf` 探测，文件名不限）。已有完整模型时跳过，
+`HUFU_MODEL_FORCE=1` 可强制重装；
+镜像可通过 `HUFU_MODEL_URL` 覆盖。也可手动把「模型」文件夹放进 `~/.local/share/hufu/`。
 
 卸载：
 

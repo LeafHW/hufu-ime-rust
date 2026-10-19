@@ -153,14 +153,33 @@ left_themes=$(find "$theme_home/data/fcitx5/themes" -mindepth 1 -maxdepth 1 -typ
 [ "$left_themes" -eq 0 ] || fail "uninstall.sh -t 后仍有 $left_themes 套主题"
 ok "主题安装/卸载通过：$want_themes 套"
 
-step '⑪ 排版（cargo fmt -p hufu-fcitx5-client --check）'
+step '⑪ 模型下载/安装（-m，临时 7z）'
+sevenzip=$(command -v 7z || command -v 7za || command -v 7zr || true)
+if [[ -n "$sevenzip" ]]; then
+    model_src="$tmp/model-src/模型"
+    mkdir -p "$model_src" "$tmp/model-home" "$tmp/model-home/data" "$tmp/model-home/config"
+    printf 'fake-gguf' >"$model_src/sentence-qwen-q8.gguf"
+    printf 'fake-bin' >"$model_src/mohu-sentence-ngram-v5.bin"
+    ( cd "$tmp/model-src" && "$sevenzip" a -t7z "$tmp/default.7z" 模型 >/dev/null )
+    HOME="$tmp/model-home" XDG_DATA_HOME="$tmp/model-home/data" XDG_CONFIG_HOME="$tmp/model-home/config" \
+        HUFU_MODEL_URL="file://$tmp/default.7z" \
+        platform/linux/install.sh -m >/dev/null || fail 'install.sh -m 失败'
+    [[ -s "$tmp/model-home/data/hufu/模型/sentence-qwen-q8.gguf" &&
+       -s "$tmp/model-home/data/hufu/模型/mohu-sentence-ngram-v5.bin" ]] \
+        || fail 'install.sh -m 后模型文件缺失'
+    ok '模型下载/解压/落点通过'
+else
+    echo '  · 未安装 7z，跳过模型安装检查'
+fi
+
+step '⑫ 排版（cargo fmt -p hufu-fcitx5-client --check）'
 if ! fmt_out=$(cd platform/linux && cargo fmt -p hufu-fcitx5-client --check 2>&1); then
     printf '%s\n' "$fmt_out"
     fail 'rustfmt 有差异：在 platform/linux 跑 cargo fmt -p hufu-fcitx5-client 后重试'
 fi
 ok '排版干净'
 
-step '⑫ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
+step '⑬ 静态检查（cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings）'
 if ! clippy_out=$(cd platform/linux &&
     cargo clippy -p hufu-fcitx5-client --all-targets -- -D warnings 2>&1); then
     printf '%s\n' "$clippy_out"

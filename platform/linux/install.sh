@@ -11,17 +11,20 @@ usage() {
 用法：platform/linux/install.sh -s|--system [--no-build]
       platform/linux/install.sh -u|--user   [--no-build]
       platform/linux/install.sh -t|--theme
+      platform/linux/install.sh -m|--model
 
   -s, --system  安装系统级 fcitx5 addon（需要 sudo）
   -u, --user    安装用户级 fcitx5 addon（无需 sudo）
   -t, --theme   安装/更新 fcitx5 主题（独立于 addon；可单用或与 -s/-u 组合）
+  -m, --model   下载并安装模型到 ~/.local/share/hufu/模型（独立；约 880MB）
   --no-build    跳过构建（使用已有产物）
   -h, --help    显示本用法
 
-短选项可合并（如 -sh、-st），但 -s 与 -u 互斥。
-空参、-h、--help 均显示本用法；安装须指定 -s/-u，或使用 -t。
--s/-u 不隐含 -t：主题只在显式给出 -t 时安装。完整安装会装配用户运行时
-（码表/数据、hufu-server、systemd user 服务、桌面入口、图标），模型另行获取。
+短选项可合并（如 -sh、-stm），但 -s 与 -u 互斥。
+空参、-h、--help 均显示本用法；安装须指定 -s/-u，或使用 -t/-m。
+-s/-u 不隐含 -t/-m：主题只在 -t 时安装，模型只在 -m 时下载。完整安装会装配
+用户运行时（码表/数据、hufu-server、systemd user 服务、桌面入口、图标）。
+模型默认从 GitHub Release 的 default.7z 安装；也可手动放入 ~/.local/share/hufu/模型。
 EOF
 }
 
@@ -39,6 +42,10 @@ ADDON_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf"
 IM_CONF_SRC="$ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf"
 THEMES_DIR="$ROOT/platform/linux/themes"
 THEME_TARGET="$XDG_DATA/fcitx5/themes"
+MODEL_URL="${HUFU_MODEL_URL:-https://github.com/LeafHW/hufu-ime-rust/releases/download/%E6%A8%A1%E5%9E%8B/default.7z}"
+MODEL_DIR="$HUFU_ROOT/模型"
+MODEL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/hufu"
+MODEL_ARCHIVE="$MODEL_CACHE_DIR/default.7z"
 
 # 用户级 addon：conf 放 XDG 数据目录，Library 指向同一用户目录下的绝对路径。
 USER_FCITX_DATA="$XDG_DATA/fcitx5"
@@ -65,6 +72,7 @@ fi
 MODE=''
 DO_BUILD=1
 DO_THEMES=0
+DO_MODEL=0
 set_mode() {
     case "$1" in
         s)
@@ -86,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         --system) set_mode s; shift ;;
         --user) set_mode u; shift ;;
         --theme) DO_THEMES=1; shift ;;
+        --model) DO_MODEL=1; shift ;;
         --no-build) DO_BUILD=0; shift ;;
         --help) usage; exit 0 ;;
         --) shift; break ;;
@@ -98,6 +107,7 @@ while [[ $# -gt 0 ]]; do
                 case "$ch" in
                     s|u) set_mode "$ch" ;;
                     t) DO_THEMES=1 ;;
+                    m) DO_MODEL=1 ;;
                     h) usage; exit 0 ;;
                     *) echo "✗ 未知选项: -$ch（--help 看用法）" >&2; exit 2 ;;
                 esac
@@ -110,14 +120,14 @@ if (($# > 0)); then
     echo "✗ 不支持位置参数: $1（--help 看用法）" >&2
     exit 2
 fi
-if [[ -z "$MODE" && "$DO_THEMES" == 0 ]]; then
-    echo '✗ 必须指定 -s/-u，或使用 -t/--theme（--help 看用法）' >&2
+if [[ -z "$MODE" && "$DO_THEMES" == 0 && "$DO_MODEL" == 0 ]]; then
+    echo '✗ 必须指定 -s/-u，或使用 -t/--theme、-m/--model（--help 看用法）' >&2
     exit 2
 fi
 
 if [[ "$EUID" -eq 0 ]]; then
     echo '✗ 请勿用 sudo 运行整个脚本（用户级文件会装到 /root）。' >&2
-    echo '  正确用法：platform/linux/install.sh -s|--system、-u|--user 或 -t|--theme' >&2
+    echo '  正确用法：platform/linux/install.sh -s|--system、-u|--user、-t|--theme 或 -m|--model' >&2
     exit 2
 fi
 
@@ -127,9 +137,9 @@ ok() { printf '  ✓ %s\n' "$*"; }
 
 model_hint() {
     echo '模型，整句与神经重排，约 880MB：'
-    echo '    不随安装包分发，缺模型为纯码表模式'
-    echo '    https://github.com/LeafHW/hufu-ime-rust/releases/tag/模型'
-    echo "    下载后，把「模型」文件夹直接放进 $HUFU_ROOT/"
+    echo '    不随仓库分发，缺模型为纯码表模式'
+    echo "    自动安装：platform/linux/install.sh -m"
+    echo "    或手动下载后把「模型」文件夹放进 $HUFU_ROOT/"
     echo
 }
 
@@ -153,10 +163,93 @@ install_themes() {
     ok "fcitx5 主题已安装到 $THEME_TARGET"
 }
 
-if [[ "$DO_THEMES" == 1 && -z "$MODE" ]]; then
-    say '① 安装 fcitx5 主题'
-    install_themes
+install_model() {
+    local target="$MODEL_DIR"
+    local downloader extractor tmp archive src
+    if [[ "${HUFU_MODEL_FORCE:-0}" != 1 ]] &&
+       compgen -G "$target/*.bin" >/dev/null &&
+       compgen -G "$target/*.gguf" >/dev/null; then
+        rm -f "$MODEL_ARCHIVE"
+        ok "模型已存在，跳过下载：$target"
+        return
+    fi
+
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+        || die '下载模型需要 curl 或 wget'
+    if command -v curl >/dev/null 2>&1; then
+        downloader=curl
+    else
+        downloader=wget
+    fi
+
+    if command -v 7z >/dev/null 2>&1; then
+        extractor=7z
+    elif command -v 7za >/dev/null 2>&1; then
+        extractor=7za
+    elif command -v 7zr >/dev/null 2>&1; then
+        extractor=7zr
+    else
+        die '解压模型需要 7z/7za/7zr（Debian/Ubuntu 可安装 p7zip-full）'
+    fi
+
+    mkdir -p "$HUFU_ROOT" "$MODEL_CACHE_DIR" || die '无法创建模型目录'
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hufu-model.XXXXXX") || die '无法创建模型临时目录'
+    archive="$MODEL_ARCHIVE"
+    model_cleanup() { rm -rf "$tmp"; }
+
+    say "下载模型（约 880MB）：$MODEL_URL"
+    if [[ "$downloader" == curl ]]; then
+        if [[ "$MODEL_URL" == http* ]]; then
+            curl -fL --retry 3 --connect-timeout 20 -C - -o "$archive" "$MODEL_URL" \
+                || { model_cleanup; die '模型下载失败'; }
+        else
+            curl -fL --retry 3 -o "$archive" "$MODEL_URL" \
+                || { model_cleanup; die '模型下载失败'; }
+        fi
+    else
+        wget -c -O "$archive" "$MODEL_URL" \
+            || { model_cleanup; die '模型下载失败'; }
+    fi
+    [[ -s "$archive" ]] || { model_cleanup; die '下载的模型包为空'; }
+
+    mkdir -p "$tmp/extract"
+    "$extractor" x -y -o"$tmp/extract" "$archive" >/dev/null \
+        || { rm -f "$archive"; model_cleanup; die '模型包解压失败'; }
+
+    if [[ -d "$tmp/extract/模型" ]]; then
+        src="$tmp/extract/模型"
+    else
+        src=$(find "$tmp/extract" -maxdepth 3 -type f \( -name '*.gguf' -o -name '*.bin' \) \
+            -printf '%h\n' | head -n 1)
+        [[ -n "$src" ]] || { model_cleanup; die '模型包中未找到 .gguf/.bin'; }
+    fi
+
+    mkdir -p "$target"
+    cp -a "$src/." "$target/" || { model_cleanup; die "写入模型目录失败：$target"; }
+    compgen -G "$target/*.bin" >/dev/null && compgen -G "$target/*.gguf" >/dev/null \
+        || { model_cleanup; die "模型文件不完整（需至少一个 .bin 与一个 .gguf）：$target"; }
+    rm -f "$archive"
+    model_cleanup
+    ok "模型已安装到 $target"
+}
+
+if [[ -z "$MODE" ]]; then
+    if [[ "$DO_MODEL" == 1 ]]; then
+        say '① 安装模型'
+        install_model
+    fi
+    if [[ "$DO_THEMES" == 1 ]]; then
+        say '② 安装 fcitx5 主题'
+        install_themes
+    fi
     say '完成 ✔'
+    if [[ "$DO_MODEL" == 1 ]]; then
+        if command -v systemctl >/dev/null 2>&1 &&
+           systemctl --user show-environment >/dev/null 2>&1; then
+            systemctl --user try-restart hufu-server.service 2>/dev/null || true
+            echo '已请求重启 hufu-server；服务启动后加载模型。'
+        fi
+    fi
     echo '重启 fcitx5 生效：fcitx5 -r -d'
     exit 0
 fi
@@ -203,7 +296,12 @@ JSON
     ok '生成默认 数据/config.json'
 fi
 
-say '④ 安装用户级文件'
+if [[ "$DO_MODEL" == 1 ]]; then
+    say '④ 安装模型'
+    install_model
+fi
+
+say '⑤ 安装用户级文件'
 mkdir -p "$BIN_DIR" "$XDG_CONFIG/systemd/user" "$XDG_DATA/applications" \
     "$XDG_DATA/icons/hicolor/scalable/apps" \
     "$XDG_DATA/icons/hicolor/48x48/apps" \
@@ -245,7 +343,7 @@ fi
 [[ ":$PATH:" == *":$BIN_DIR:"* ]] || echo "  · 提示：$BIN_DIR 不在 PATH 中"
 
 if [[ "$MODE" == user ]]; then
-    say '⑤ 安装用户级 fcitx5 addon（无需 sudo）'
+    say '⑦ 安装用户级 fcitx5 addon（无需 sudo）'
     mkdir -p "$USER_ADDON_DIR" "$USER_IM_DIR" "$USER_LIB_DIR"
     install -m 755 "$ADDON_SO" "$USER_LIB_DIR/libhufu.so"
     install -m 644 "$ADDON_CONF_SRC" "$USER_ADDON_DIR/hufu.conf"
@@ -256,7 +354,7 @@ if [[ "$MODE" == user ]]; then
         || die '用户级 hufu.conf 的 Library 写入失败'
     ok "addon 已装到 $USER_LIB_DIR（无需 sudo）"
 else
-    say '⑤ 安装系统级 fcitx5 addon（需要 sudo）'
+    say '⑦ 安装系统级 fcitx5 addon（需要 sudo）'
     command -v sudo >/dev/null 2>&1 || die '系统级安装需要 sudo；可改用 -u/--user'
     sudo install -Dm755 "$ADDON_SO" "$SYSTEM_ADDON_DIR/libhufu.so"
     sudo install -Dm644 "$ADDON_CONF_SRC" /usr/share/fcitx5/addon/hufu.conf
@@ -278,5 +376,5 @@ cat <<EOF
 EOF
 
 echo
-model_hint
+[[ "$DO_MODEL" == 1 ]] || model_hint
 icon_hint
