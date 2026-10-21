@@ -1426,8 +1426,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Ok(c) => c,
                 Err(e) => return Response::err(400, &format!("配置无效: {e}")),
             };
+            let appearance_changed = cfg.appearance != host.engine.config.appearance;
             match host.apply_config(cfg) {
                 Ok((need_sentence, teardown)) => {
+                    // 【逐候选字号 2026-10】外观节变化（开关/比例）推进皮肤
+                    // 版本：DLL poll 见版本变化立即重拉载荷，免等 2.5s 轮询。
+                    if appearance_changed {
+                        host.skin_ver += 1;
+                    }
                     if need_sentence {
                         // 【卡死修复】后台重建整句（旧 setup_sentence 持锁
                         // 载 546MB 模型秒级卡全机打字）

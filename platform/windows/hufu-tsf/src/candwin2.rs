@@ -1995,20 +1995,22 @@ pub struct CandidateWindowV2 {
     /// 连续被 DWM cloaked（显示中但不可见）的帧数；打包宿主里
     /// DComp 直通窗可能被整体隐身 → 达阈值切换 v1 传统混合窗
     pub(crate) cloaked_streak: u32,
-    /// 【每帧开销缓存】字体格式三件套按 (face,pt,label_pt) 复用——
-    /// CreateTextFormat 含系统字体匹配（百 µs 级），打字每键一帧
-    /// ×3 个格式是渲染路径大头；皮肤/字号不变时零创建。
+    /// 【每帧开销缓存】字体格式五件套按 (face,pt,label_pt,首选比例,其余
+    /// 比例) 复用——CreateTextFormat 含系统字体匹配（百 µs 级），打字
+    /// 每键一帧 ×N 个格式是渲染路径大头；皮肤/字号/比例不变时零创建。
     pub(crate) tf_cache: Option<(
-        (String, f32, f32),
+        (String, f32, f32, f32, f32),
         (
+            Option<IDWriteTextFormat>,
+            Option<IDWriteTextFormat>,
             Option<IDWriteTextFormat>,
             Option<IDWriteTextFormat>,
             Option<IDWriteTextFormat>,
         ),
     )>,
-    /// 【每帧开销缓存】光学垂直补偿 dy 按 (face,pt) 复用——probe
-    /// 每帧两次 CreateTextLayout+GetOverhangMetrics 可省。
-    pub(crate) dy_cache: Option<((String, f32), f32)>,
+    /// 【每帧开销缓存】光学垂直补偿 (dy_其余, dy_首选) 按 (face,pt,k_first,
+    /// k_rest) 复用——probe 每帧两次 CreateTextLayout+GetOverhangMetrics 可省。
+    pub(crate) dy_cache: Option<((String, f32, f32, f32), (f32, f32))>,
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
     pub(crate) shadow_cache: Option<(
@@ -3623,6 +3625,25 @@ impl CandidateWindowV2 {
         };
 
         let font_pt = layout_f(skin, "font_point", 16.0);
+        // 【逐候选字号 2026-10】首选放大 / 其余缩小（虎娘新版权候选样式）。
+        // 开关与两个比例由 server 经 skin op 注入 payload layout（形态：
+        // /skin/layout/* 或顶层 layout/*，layout_f 两形态都认）；皮肤文件
+        // 不写死比例——跨皮肤、跨 SVG/SSF、跨横竖排统一生效。关闭时
+        // k_first=k_rest=1.0，后续全部退化为逐像素等价的旧行为。
+        let pcf_on = skin
+            .pointer("/skin/layout/per_cand_font")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("per_cand_font")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let (k_first, k_rest) = if pcf_on {
+            (
+                layout_f(skin, "cand_first_scale", 1.0).clamp(0.5, 2.0),
+                layout_f(skin, "cand_rest_scale", 1.0).clamp(0.5, 1.0),
+            )
+        } else {
+            (1.0, 1.0)
+        };
+        let k_of = |i: usize| if i == 0 { k_first } else { k_rest };
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 6.0);
@@ -3785,20 +3806,24 @@ impl CandidateWindowV2 {
         let row_h = line_h.max(pill_h);
 
         // 字体与内容测宽先行（宽度取决于最长候选）
+        // 【逐候选字号 2026-10】缓存键含两个比例（漏字段=拖滑杆字形不刷新，
+        // 与阴影缓存键漏 radius 的旧事故同源）。
         let mut tf_cache_out: Option<(
-            (String, f32, f32),
+            (String, f32, f32, f32, f32),
             (
-                Option<IDWriteTextFormat>,
-                Option<IDWriteTextFormat>,
-                Option<IDWriteTextFormat>,
+                Option<IDWriteTextFormat>, // 正文·其余候选
+                Option<IDWriteTextFormat>, // 正文·首选
+                Option<IDWriteTextFormat>, // 序号（不随比例缩放）
+                Option<IDWriteTextFormat>, // 注释·其余
+                Option<IDWriteTextFormat>, // 注释·首选
             ),
         )> = None;
-        let mut dy_cache_out: Option<((String, f32), f32)> = None;
+        let mut dy_cache_out: Option<((String, f32, f32, f32), (f32, f32))> = None;
         let mut shadow_cache_out: Option<(
             (u32, u32, u32, u32, (i32, i32), u32, u32),
             (ID2D1CommandList, ID2D1Effect),
         )> = None;
-        let (tf, tf_label, tf_small, cand_ws, geo) = unsafe {
+        let (tf, tf_first, tf_label, tf_small, tf_first_small, cand_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
                 None => return,
@@ -3846,23 +3871,25 @@ impl CandidateWindowV2 {
                     .ok()
             };
             let tf;
+            let tf_first;
             let tf_small;
+            let tf_first_small;
             let tf_label;
             // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
             let label_pt = layout_f(skin, "label_font_point", 0.0);
-            let tf_key = (font_face.clone(), font_pt, label_pt);
+            let tf_key = (font_face.clone(), font_pt, label_pt, k_first, k_rest);
             // 【字体切换取证 2026-10-08】trace 开启且键变化时记录：皮肤
             // 送来的 font_face、tf 缓存命中——真实应用内分支视角（逐帧
             // 渲染，只在变化时落一条防刷屏）。
             {
-                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32)>> =
+                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32, f32, f32)>> =
                     std::sync::Mutex::new(None);
                 let mut lt = LAST_FT.lock().unwrap_or_else(|p| p.into_inner());
                 if lt.as_ref() != Some(&tf_key) {
                     *lt = Some(tf_key.clone());
                     if crate::tsf::trace_on() {
                         crate::tsf::trace(&format!(
-                            "cw2 font: face=「{font_face}」 pt={font_pt} cache_hit={}",
+                            "cw2 font: face=「{font_face}」 pt={font_pt} k=({k_first},{k_rest}) cache_hit={}",
                             tf_cache_in
                                 .as_ref()
                                 .map(|(k, _)| *k == tf_key)
@@ -3871,6 +3898,10 @@ impl CandidateWindowV2 {
                     }
                 }
             }
+            // 【逐候选字号 2026-10】正文/注释各两档：其余候选=em×k_rest，
+            // 首选=em×k_first；关闭时两档同值（下面直接复用，零多余创建）。
+            let em_rest = em * k_rest;
+            let em_first = em * k_first;
             let tf_hit = tf_cache_in
                 .as_ref()
                 .map(|(k, _)| *k == tf_key)
@@ -3878,8 +3909,10 @@ impl CandidateWindowV2 {
             if tf_hit {
                 let (_, v) = tf_cache_in.as_ref().unwrap();
                 tf = v.0.clone();
-                tf_small = v.1.clone();
+                tf_first = v.1.clone();
                 tf_label = v.2.clone();
+                tf_small = v.3.clone();
+                tf_first_small = v.4.clone();
             } else {
                 // 【雅黑兜底取证 2026-10-09】mk_tf(族名)=None 意味着系统集
                 // 拿不到该族 → 渲染雅黑——用户看到的「跟雅黑一样」若走
@@ -3893,12 +3926,22 @@ impl CandidateWindowV2 {
                     }
                     r
                 };
-                tf = mk_probe(&font_face, em)
-                    .or_else(|| mk_tf("Microsoft YaHei UI", em));
-                tf_small = mk_probe(&font_face, em * 0.78)
-                    .or_else(|| mk_tf("Microsoft YaHei UI", em * 0.78));
+                tf = mk_probe(&font_face, em_rest)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em_rest));
+                tf_small = mk_probe(&font_face, em_rest * 0.78)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", em_rest * 0.78));
+                let same = (em_first - em_rest).abs() < 0.01;
+                if same {
+                    tf_first = tf.clone();
+                    tf_first_small = tf_small.clone();
+                } else {
+                    tf_first = mk_probe(&font_face, em_first)
+                        .or_else(|| mk_tf("Microsoft YaHei UI", em_first));
+                    tf_first_small = mk_probe(&font_face, em_first * 0.78)
+                        .or_else(|| mk_tf("Microsoft YaHei UI", em_first * 0.78));
+                }
                 // 文本垂直居中（高亮胶囊上下留白对称的关键）
-                for t in [&tf, &tf_small] {
+                for t in [&tf, &tf_first, &tf_small, &tf_first_small] {
                     if let Some(t) = t {
                         let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                     }
@@ -3913,7 +3956,16 @@ impl CandidateWindowV2 {
                 if let Some(t) = &tf_label {
                     let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 }
-                tf_cache_out = Some((tf_key, (tf.clone(), tf_small.clone(), tf_label.clone())));
+                tf_cache_out = Some((
+                    tf_key,
+                    (
+                        tf.clone(),
+                        tf_first.clone(),
+                        tf_label.clone(),
+                        tf_small.clone(),
+                        tf_first_small.clone(),
+                    ),
+                ));
             }
 
             let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
@@ -3948,11 +4000,14 @@ impl CandidateWindowV2 {
             let mut max_cmt = 0.0f32;
             let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
             for (i, (t, c)) in cands.iter().enumerate() {
-                let tw = measure(&tf, t.as_str());
+                // 【逐候选字号 2026-10】首选/其余各用自己的字面宽度
+                let tf_i = if i == 0 { &tf_first } else { &tf };
+                let tfs_i = if i == 0 { &tf_first_small } else { &tf_small };
+                let tw = measure(tf_i, t.as_str());
                 let cw = if c.is_empty() {
                     0.0
                 } else {
-                    measure(&tf_small, c.as_str())
+                    measure(tfs_i, c.as_str())
                 };
                 // 本格序号宽（label_format 格式化实测 + hsp 紧贴间距）：横排正文紧跟序号
                 let iw = if (show_index || freq_view.is_some()) && i < 10 {
@@ -3994,35 +4049,59 @@ impl CandidateWindowV2 {
                     }
                 };
             let dy;
-            let dy_key = (font_face.clone(), font_pt);
+            let mut dy_first;
+            let dy_key = (font_face.clone(), font_pt, k_first, k_rest);
             // 【SSF 虎娘行槽】源域行高测量：虎娘 row=ceil(max(字号,
             // "中Mg"行高))（layoutSkin L19-20）。此处用当前 tf（用户
             // 字号）测同一串的行高——线性除回源域（=源字号行高）。
             // 渲染行槽=源行高×scale（像素域）。
-            let row_user = {
-                let ws: Vec<u16> = "中Mg".encode_utf16().collect();
-                match &tf {
-                    Some(t) => dwrite
-                        .CreateTextLayout(&ws, t, 100000.0, 100000.0)
-                        .ok()
-                        .and_then(|l| {
-                            let mut m = DWRITE_TEXT_METRICS::default();
-                            l.GetMetrics(&mut m).ok().map(|_| m.height)
-                        }),
-                    None => None,
-                }
-                .unwrap_or(font_pt * 96.0 / 72.0 * 1.35)
+            let (row_user, row_user_first) = {
+                let measure_row =
+                    |t: &Option<IDWriteTextFormat>| -> Option<f32> {
+                        let ws: Vec<u16> = "中Mg".encode_utf16().collect();
+                        match t {
+                            Some(t) => dwrite
+                                .CreateTextLayout(&ws, t, 100000.0, 100000.0)
+                                .ok()
+                                .and_then(|l| {
+                                    let mut m = DWRITE_TEXT_METRICS::default();
+                                    l.GetMetrics(&mut m).ok().map(|_| m.height)
+                                }),
+                            None => None,
+                        }
+                    };
+                let base = measure_row(&tf).unwrap_or(font_pt * 96.0 / 72.0 * 1.35);
+                let first = if (k_first - k_rest).abs() < 0.001 {
+                    base
+                } else {
+                    measure_row(&tf_first).unwrap_or(base * k_first / k_rest.max(0.01))
+                };
+                (base, first)
             };
-            if let Some((k, v)) = &dy_cache_in {
-                if *k == dy_key {
-                    dy = *v;
+            if let Some(((kf, k1, k2, _kl), v)) = &dy_cache_in {
+                if *kf == font_face
+                    && (*k1 - k_first).abs() < 0.001
+                    && (*k2 - k_rest).abs() < 0.001
+                {
+                    dy = v.0;
+                    dy_first = v.1;
                 } else {
                     dy = probe_dy(&probe_slack, &tf);
-                    dy_cache_out = Some((dy_key, dy));
+                    dy_first = if (k_first - k_rest).abs() < 0.001 {
+                        dy
+                    } else {
+                        probe_dy(&probe_slack, &tf_first)
+                    };
+                    dy_cache_out = Some((dy_key, (dy, dy_first)));
                 }
             } else {
                 dy = probe_dy(&probe_slack, &tf);
-                dy_cache_out = Some((dy_key, dy));
+                dy_first = if (k_first - k_rest).abs() < 0.001 {
+                    dy
+                } else {
+                    probe_dy(&probe_slack, &tf_first)
+                };
+                dy_cache_out = Some((dy_key, (dy, dy_first)));
             }
             // 注意：编码行定宽策略——
             // 横排：编码与候选同行（左，2026-09-05），宽度参与定宽；
@@ -4154,13 +4233,29 @@ impl CandidateWindowV2 {
             };
             (
                 tf,
+                tf_first,
                 tf_label,
                 tf_small,
+                tf_first_small,
                 cand_ws,
-                (cmt_disp, (width, text_x, cmt_x, cmt_w, dy, raw_w, row_user)),
+                (
+                    cmt_disp,
+                    (
+                        width,
+                        text_x,
+                        cmt_x,
+                        cmt_w,
+                        dy,
+                        dy_first,
+                        raw_w,
+                        row_user,
+                        row_user_first,
+                    ),
+                ),
             )
         };
-        let (v_width, text_x, cmt_x, _cmt_w, dy, raw_w, row_user) = geo.1;
+        let (v_width, text_x, cmt_x, _cmt_w, dy, dy_first, raw_w, row_user, row_user_first) =
+            geo.1;
         let cmt_disp = geo.0;
         // 【SSF 虎娘行槽/文字列锚 2026-10-16】皮肤模式行槽=源行高×scale
         //（虎娘 row=ceil(max(皮肤字号,"中Mg"行高))，布局在源域、渲染
@@ -4173,6 +4268,27 @@ impl CandidateWindowV2 {
         } else {
             row_h
         };
+        // 【逐候选字号 2026-10】逐行槽高：首选/其余各按自己的字号算。
+        // 关闭时全部等于 row_h（与旧行为逐像素一致）。竖排按行推进、
+        // 横排取最大行高（同一行里各档字号在自己的行槽内居中）——
+        // 高度公式与渲染循环共用同一个 row_hs，避免「字大了窗没大」。
+        let row_hs: Vec<f32> = (0..cands.len().min(10))
+            .map(|i| {
+                if ssf.is_some() {
+                    if i == 0 {
+                        row_user_first.max(1.0)
+                    } else {
+                        row_user.max(1.0)
+                    }
+                } else {
+                    let k = k_of(i);
+                    let lh = em * k + layout_f(skin, "line_spacing", 3.0) + 5.0;
+                    let ph = em * k + hilite_pad * 2.0;
+                    lh.max(ph)
+                }
+            })
+            .collect();
+        let row_h_max = row_hs.iter().cloned().fold(row_h, f32::max);
         // 编码行仅在有内容时占一行（show_code=false 且无 aux 时收缩）；
         // 横排编码与候选同行（左），不占独立行（2026-09-05）
         // 【按住Ctrl调频 2026-11】模态提示行恒占独立行（横排也是——
@@ -4239,11 +4355,16 @@ impl CandidateWindowV2 {
         let height = if horizontal {
             // 高度贴合内容：gap×2 + 行槽高×行数 + 编码行后行距（与渲染 y0 一致）
             //【口径重构】line_h→row_h（行槽撑高装胶囊，胶囊四边=gap）
-            rm_y * 2.0 + row_h * (1.0 + code_row) + cand_spacing * code_row
+            //【逐候选字号 2026-10】候选行取全页最大行槽，编码行仍用基准行槽
+            rm_y * 2.0 + row_h * code_row + row_h_max + cand_spacing * code_row
         } else {
             // 行距只计行间（编码行后 1 个 + 候选行间 rows-1 个）——渲染 y0 同步
+            //【逐候选字号 2026-10】逐行槽求和（首选行更高时窗口随之变高）
             let rows = cands.len().min(10) as f32 + code_row;
-            rm_y * 2.0 + row_h * rows + cand_spacing * (rows - 1.0).max(0.0)
+            rm_y * 2.0
+                + row_h * code_row
+                + row_hs.iter().sum::<f32>()
+                + cand_spacing * (rows - 1.0).max(0.0)
         };
         // ──【SSF 虎娘同构窗口尺寸 2026-10-16】width/height 在源画布域
         // 按内容撑大（硬底=图尺寸/刀口和），输出 ×scale。内容宽=候选
@@ -4309,23 +4430,33 @@ impl CandidateWindowV2 {
         let height = match &ssf {
             Some(f) => {
                 let sc = f.scale;
+                // 【逐候选字号 2026-10】行槽分首选/其余两值（源画布域）：
+                // 编码槽仍用基准行（编码行不缩放，间距不动）。
                 let row_src = row_user / sc;
+                let row_src_first = (row_user_first / sc).max(1.0);
+                let row_src_rest = row_src.max(1.0);
                 let n = cands.len().min(10) as f32;
                 let cand_bottom = f.layout.candidates.bottom.max(0) as f32;
                 let lsp = f.spec.display.line_spacing.max(0.0);
                 let y0_src = ssf_y0_src.unwrap_or(0.0);
                 let y_end = y0_src
-                    + if horizontal {
-                        row_src + cand_bottom
+                    + if n <= 0.0 {
+                        cand_bottom
+                    } else if horizontal {
+                        row_src_first.max(row_src_rest) + cand_bottom
                     } else {
-                        n * row_src + ((n - 1.0).max(0.0)) * lsp + cand_bottom
+                        row_src_first
+                            + ((n - 1.0).max(0.0)) * row_src_rest
+                            + ((n - 1.0).max(0.0)) * lsp
+                            + cand_bottom
                     };
                 let v = (f.layout.min_height(f.bitmap.height).max(y_end) * sc)
                     .max(1.0);
                 crate::tsf::trace(&format!(
-                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} row_src={:.0} 编码={}）",
+                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} row_src={:.0}/{:.0} 编码={}）",
                     y0_src, y_end,
-                    f.layout.min_height(f.bitmap.height), v, horizontal, row_src,
+                    f.layout.min_height(f.bitmap.height), v, horizontal,
+                    row_src_first, row_src_rest,
                     !raw.is_empty()
                 ));
                 v
@@ -5285,9 +5416,9 @@ impl CandidateWindowV2 {
                     // em+2hp)）——胶囊在行槽内垂直居中即四边= gap；文字在槽
                     // 内由 DWrite 布局居中。旧版「放不下时溢出/对齐修正」的
                     // 补丁链全部废除。
-                    let pill_v = |y: f32| -> (f32, f32) {
-                        let off = (row_h - pill_h) / 2.0;
-                        (y + off, y + off + pill_h)
+                    let pill_v = |y: f32, rh: f32, ph: f32| -> (f32, f32) {
+                        let off = (rh - ph) / 2.0;
+                        (y + off, y + off + ph)
                     };
 
                     // 候选行
@@ -5348,6 +5479,21 @@ impl CandidateWindowV2 {
                             let cmt: &str = cmt_disp.get(i).map(|s| s.as_str()).unwrap_or("");
                             let (tw, cw, iw) = cand_ws.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
                             let cell_w = iw + tw + if cw > 0.0 { hsp + cw } else { 0.0 };
+                            // 【逐候选字号 2026-10】本格字号/行槽/光学补偿：
+                            // 横排整行共用最大行槽（rh_row），每格在自己的
+                            // 胶囊高度内居中、文字在自己的字形高度内居中。
+                            let k_i = k_of(i);
+                            let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
+                            let ph_i = em * k_i + hilite_pad * 2.0;
+                            let dy_i = if i == 0 { dy_first } else { dy };
+                            let tf_i: &Option<IDWriteTextFormat> =
+                                if i == 0 { &tf_first } else { &tf };
+                            let tfs_i: &Option<IDWriteTextFormat> =
+                                if i == 0 { &tf_first_small } else { &tf_small };
+                            // 横排单行：整行行槽 = 全页最大行槽——下面所有
+                            // row_h 引用自动指向它（文字/胶囊各自居中）。
+                            let row_h = row_h_max;
+                            let _ = rh_i;
                             // 对调动效：从旧槽位滑到新槽位（ease-out）
                             let mut x = xs[i];
                             if let Some((a, b)) = swap_pair {
@@ -5359,7 +5505,7 @@ impl CandidateWindowV2 {
                             }
                             if i == sel {
                                 if let Some(b) = &b_hi {
-                                    let (pt, pb) = pill_v(y);
+                                    let (pt, pb) = pill_v(y, row_h_max, ph_i);
                                     // 【高亮滑动 2026-10-09】目标矩形→与上
                                     // 一帧矩形插值（↑↓/选重闪帧动效）；
                                     // mark 竖条随胶囊左缘走。
@@ -5475,10 +5621,10 @@ impl CandidateWindowV2 {
                                 );
                                 cx += iw;
                             }
-                            draw(&ctx, &tf, text, cx, y + dy, tw + 2.0, row_h, bt);
+                            draw(&ctx, tf_i, text, cx, y + dy_i, tw + 2.0, row_h, bt);
                             cx += tw;
                             if !cmt.is_empty() && cw > 0.0 {
-                                draw(&ctx, &tf_small, cmt, cx + hsp, y + dy, cw + 2.0, row_h, bc);
+                                draw(&ctx, tfs_i, cmt, cx + hsp, y + dy_i, cw + 2.0, row_h, bc);
                             }
                             // 【按住Ctrl调频·拾起环】拾起候选描边脉冲（外扩
                             // 3px→贴格），内衬低透强调底
@@ -5522,6 +5668,17 @@ impl CandidateWindowV2 {
                             } else {
                                 1.0
                             };
+                            // 【逐候选字号 2026-10】本行字号/行槽/光学补偿
+                            //（竖排每行各自行槽——首选行高、其余行矮）。
+                            let k_i = k_of(i);
+                            let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
+                            let ph_i = em * k_i + hilite_pad * 2.0;
+                            let dy_i = if i == 0 { dy_first } else { dy };
+                            let tf_i: &Option<IDWriteTextFormat> =
+                                if i == 0 { &tf_first } else { &tf };
+                            let tfs_i: &Option<IDWriteTextFormat> =
+                                if i == 0 { &tf_first_small } else { &tf_small };
+                            let row_h = rh_i;
                             let y = y_run;
                             let row_h_eff = row_h * row_scale;
                             hit_rows.push((rm_x, y, width - rm_x, y + row_h));
@@ -5530,7 +5687,7 @@ impl CandidateWindowV2 {
                                 // 统一 2026-09-08——不再 ±hilite_pad 外扩，文字列
                                 // 已在胶囊内 gap+hp 起）
                                 if let Some(b) = &b_hi {
-                                    let (pt, pb) = pill_v(y);
+                                    let (pt, pb) = pill_v(y, rh_i, ph_i);
                                     // 【高亮滑动 2026-10-09】竖排：上下滑动
                                     //（左右恒满宽）；mark 竖条随胶囊走。
                                     // 【八修配套 2026-09-18】右缘贴外壳插值
@@ -5666,10 +5823,10 @@ impl CandidateWindowV2 {
                             };
                             draw(
                                 &ctx,
-                                &tf,
+                                tf_i,
                                 text,
                                 text_x,
-                                y + dy,
+                                y + dy_i,
                                 text_col_w,
                                 row_h,
                                 bt,
@@ -5685,10 +5842,10 @@ impl CandidateWindowV2 {
                                 };
                                 draw(
                                     &ctx,
-                                    &tf_small,
+                                    tfs_i,
                                     cmt,
                                     cx,
-                                    y + dy,
+                                    y + dy_i,
                                     cw,
                                     row_h,
                                     bc,

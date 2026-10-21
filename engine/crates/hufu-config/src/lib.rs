@@ -662,6 +662,18 @@ pub struct AppearanceSection {
     /// 立即收窗，其余动效（平移/尺寸/高亮滑动）不受影响。总开关
     /// anim=false 时此项无效（随总开关一并关）。
     pub anim_flash: bool,
+    /// 【逐一候选字号 2026-10】true = 首选候选放大、其余候选缩小；
+    /// false（默认）= 全页同一字号（升级零差异）。基准字号仍是
+    /// `skin.layout.font_point`（本字段只乘比例，不改字号本体）。
+    pub per_cand_font: bool,
+    /// 首选候选字号比例（× 基准字号）。仅 per_cand_font=true 生效。
+    /// 范围 1.00~2.00，设置页 5% 步进。
+    #[serde(default = "default_first_font_scale")]
+    pub first_font_scale: f32,
+    /// 其余候选字号比例（× 基准字号）。仅 per_cand_font=true 生效。
+    /// 范围 0.50~1.00，设置页 5% 步进。
+    #[serde(default = "default_other_font_scale")]
+    pub other_font_scale: f32,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
     /// 【SSF 皮肤 2026-12】当前皮肤类型："json"（参数化 JSON 皮肤）或
@@ -675,6 +687,17 @@ fn default_skin_kind() -> String {
     "json".into()
 }
 
+/// 【逐候选字号 2026-10】首选放大比例默认值（虎娘新版权实测比例见
+/// `docs/`；宽度/边距不动，只放大字形）。
+fn default_first_font_scale() -> f32 {
+    1.20
+}
+
+/// 【逐候选字号 2026-10】其余候选缩小比例默认值。
+fn default_other_font_scale() -> f32 {
+    0.90
+}
+
 impl Default for AppearanceSection {
     fn default() -> Self {
         AppearanceSection {
@@ -685,6 +708,9 @@ impl Default for AppearanceSection {
             anim: true,
             anim_speed: 1.0,
             anim_flash: true,
+            per_cand_font: false,
+            first_font_scale: default_first_font_scale(),
+            other_font_scale: default_other_font_scale(),
             skin_kind: default_skin_kind(),
         }
     }
@@ -830,6 +856,36 @@ mod tests {
         let legacy = "{\"general\": {\"shift_switch\": true}}\n";
         let cfg3: Config = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg3.general.repeat_include_symbols, false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【逐候选字号 2026-10】开关/比例默认值 + 往返 + 旧配置缺键取默认。
+    #[test]
+    fn per_cand_font_defaults_and_roundtrip() {
+        let cfg = Config::default();
+        assert_eq!(cfg.appearance.per_cand_font, false, "默认关（升级零差异）");
+        assert_eq!(cfg.appearance.first_font_scale, 1.20);
+        assert_eq!(cfg.appearance.other_font_scale, 0.90);
+
+        let dir = std::env::temp_dir().join(format!("hufu-cfg-pcf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::default();
+        cfg.appearance.per_cand_font = true;
+        cfg.appearance.first_font_scale = 1.35;
+        cfg.appearance.other_font_scale = 0.85;
+        cfg.save(&p).unwrap();
+        let cfg2 = Config::load(&p).unwrap();
+        assert!(cfg2.appearance.per_cand_font);
+        assert_eq!(cfg2.appearance.first_font_scale, 1.35);
+        assert_eq!(cfg2.appearance.other_font_scale, 0.85);
+
+        // 旧 config.json（appearance 无这三个键）→ 开关关、比例取默认
+        let legacy = r#"{"appearance": {"skin": "hufu-moyan", "font_size": 17.6}}"#;
+        let cfg3: Config = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg3.appearance.per_cand_font, false);
+        assert_eq!(cfg3.appearance.first_font_scale, 1.20);
+        assert_eq!(cfg3.appearance.other_font_scale, 0.90);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

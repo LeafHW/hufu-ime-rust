@@ -490,6 +490,12 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>动效速度 <span class="val" id="g-animsp-v"></span></label><input type="range" id="g-animsp" min="0" max="200" step="5" title="整体速度倍率：100%=默认速度；0%=瞬跳、调大更慢（作用于所有动效时长）"></div>
       <!-- 【特效退役 2026-09-22】上屏特效下拉+落印字号控件移除 -->
     </div>
+    <h3>候选字号</h3>
+    <div class="row">
+      <div class="checkline"><input type="checkbox" id="g-pcf"><label for="g-pcf" title="开：第 1 候选按其比例放大、其余候选按其比例缩小（仿虎娘新版权候选样式）；关：全页同一字号（默认）。比例是「× 当前皮肤字号」的倍数，编码行/序号/加词框不受影响。">首选放大 / 其余缩小</label></div>
+      <div class="field"><label>首选 <span class="val" id="g-pcf1-v"></span></label><input type="range" id="g-pcf1" min="50" max="200" step="5" title="首选候选字号 = 皮肤字号 × 本比例（50%~200%，5% 步进）。虎娘新版权实测为首选 0.90、其余 0.667；默认 1.20/0.90 保留原字号并做出同样的「首选大、其余小」观感。需先勾选左侧开关"></div>
+      <div class="field"><label>其余 <span class="val" id="g-pcf2-v"></span></label><input type="range" id="g-pcf2" min="50" max="100" step="5" title="第 2 个及之后的候选字号 = 皮肤字号 × 本比例（50%~100%，5% 步进）。需先勾选左侧开关"></div>
+    </div>
     <div class="skin-grid" id="skin-json-grid">
       <div class="skin-preview-wrap">
         <div class="preview-tools">
@@ -1224,6 +1230,8 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo; };
 const NUM_CLAMPS = {
   config: { "input.max_code_length": [1, 10], "candidates.page_size": [1, 10], "candidates.delay_show_ms": [0, 2000], "sound.volume": [0, 100], "appearance.anim_speed": [0, 2],
+    /* 【逐候选字号 2026-10】比例钳制与服务端 clamp 同源（首选 0.50~2.00 / 其余 0.50~1.00） */
+    "appearance.first_font_scale": [0.5, 2.0], "appearance.other_font_scale": [0.5, 1.0],
     /* 【八十一修】整句行为参数保存钳制（与 number 框 min/max 同源） */
     "sentence.early_need": [1, 8], "sentence.rerank.top_k": [2, 10], "sentence.rerank.debounce_ms": [50, 2000] },
   layout: {
@@ -1504,6 +1512,40 @@ function bindSkin() {
     };
     sp.onchange = saveConfig;
     syncAnim();
+  }
+  // 【逐候选字号 2026-10】皮肤页控件，真源=全局配置
+  // appearance.per_cand_font / first_font_scale / other_font_scale——
+  // DLL 经 skin op 注入 layout 读取（跨矢量/SSF 皮肤、横竖排通吃）。
+  {
+    const pc = $("#g-pcf"), s1 = $("#g-pcf1"), s2 = $("#g-pcf2");
+    const pct = v => Math.round(v * 100) + "%";
+    const syncPcf = () => {
+      pc.checked = CFG.appearance?.per_cand_font === true;
+      s1.value = Math.round((CFG.appearance?.first_font_scale ?? 1.2) * 100);
+      s2.value = Math.round((CFG.appearance?.other_font_scale ?? 0.9) * 100);
+      s1.disabled = s2.disabled = !pc.checked;
+      $("#g-pcf1-v").textContent = pct(s1.value / 100);
+      $("#g-pcf2-v").textContent = pct(s2.value / 100);
+    };
+    pc.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.per_cand_font = pc.checked;
+      syncPcf();
+    };
+    pc.onchange = saveConfig;
+    s1.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.first_font_scale = s1.value / 100;
+      $("#g-pcf1-v").textContent = pct(s1.value / 100);
+    };
+    s1.onchange = saveConfig;
+    s2.oninput = () => {
+      CFG.appearance = CFG.appearance || {};
+      CFG.appearance.other_font_scale = s2.value / 100;
+      $("#g-pcf2-v").textContent = pct(s2.value / 100);
+    };
+    s2.onchange = saveConfig;
+    syncPcf();
   }
   // 【特效退役 2026-09-22】上屏特效下拉+落印字号控件整体退役
   // （commit_fx / stamp_font_scale 链路全删）——JS 块删除，HTML 行见下。

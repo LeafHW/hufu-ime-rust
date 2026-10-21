@@ -528,6 +528,36 @@ pub fn dispatch(
                 host.engine.config.candidates.show_index
             };
             let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            // 【逐候选字号 2026-10】全局（跨皮肤）候选字号阶梯：开关 + 两个
+            // 比例。注入皮肤对象 layout（DLL 侧 layout_f/双形态读法直接消费，
+            // 与 font_point 同通道）；比例是「×基准字号」的纯倍数，不进皮肤
+            // 文件、不受滚轮 scale_geometry 影响。三项都必须进指纹——漏一项
+            // 就是「改设置拿 same:true 永不生效」。
+            let (pcf_on, pcf_k1, pcf_k2) = {
+                let a = &host.engine.config.appearance;
+                (
+                    a.per_cand_font,
+                    // 首选比例下限放宽到 0.5：虎娘新版权实测「首选=0.90×、
+                    // 其余=0.667×」，要精确复刻就必须允许首选小于 1。
+                    a.first_font_scale.clamp(0.5, 2.0),
+                    a.other_font_scale.clamp(0.5, 1.0),
+                )
+            };
+            let put_cand_font = |sv: &mut serde_json::Value| {
+                let Some(o) = sv.as_object_mut() else {
+                    return;
+                };
+                let lay = o
+                    .entry("layout")
+                    .or_insert_with(|| serde_json::json!({}));
+                let Some(l) = lay.as_object_mut() else {
+                    return;
+                };
+                l.insert("per_cand_font".into(), serde_json::json!(pcf_on));
+                l.insert("cand_first_scale".into(), serde_json::json!(pcf_k1));
+                l.insert("cand_rest_scale".into(), serde_json::json!(pcf_k2));
+            };
+            let pcf_fp = format!("|{pcf_on}|{pcf_k1:.3}|{pcf_k2:.3}");
             // 【SSF 皮肤 2026-12】kind=ssf → 位图皮肤：只传 cache_dir 路径
             // + 指纹（11MB 挂件教训：绝不内嵌大图字节），DLL 按需读盘。
             // anim 系列注入字段与 JSON 皮肤同形状（皮肤对象顶层）；
@@ -542,7 +572,7 @@ pub fn dispatch(
                     // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
                     // 字段全部参与——DLL have_fp 命中即 {"same":true} 微载荷。
                     let fp = format!(
-                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}",
+                        "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}{pcf_fp}",
                         host.engine.config.schema.current
                     );
                     if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
@@ -562,6 +592,7 @@ pub fn dispatch(
                             ),
                         );
                     }
+                    put_cand_font(&mut sv);
                     return serde_json::json!({
                         "skin": sv,
                         "show_index": show_index,
@@ -582,7 +613,7 @@ pub fn dispatch(
             // 手改文件/改配置全部改变指纹，无一漏网。
             let meta = std::fs::metadata(&p).ok();
             let fp = format!(
-                "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}",
+                "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}{pcf_fp}",
                 meta.as_ref().and_then(|m| m.modified().ok()),
                 meta.as_ref().map(|m| m.len()).unwrap_or(0),
                 host.engine.config.appearance.anim,
@@ -626,6 +657,7 @@ pub fn dispatch(
                             serde_json::json!(!host.engine.config.schema.current.contains("整句")),
                         );
                     }
+                    put_cand_font(&mut sv);
                     serde_json::json!({"skin": sv, "show_index": show_index, "delay_show_ms": delay_show_ms, "fp": fp})
                 }
                 Err(e) => {
@@ -641,6 +673,7 @@ pub fn dispatch(
                             serde_json::json!(!host.engine.config.schema.current.contains("整句")),
                         );
                     }
+                    put_cand_font(&mut sv);
                     serde_json::json!({
                         "skin": sv,
                         "show_index": show_index,
