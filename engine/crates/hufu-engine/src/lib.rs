@@ -3874,15 +3874,22 @@ impl Engine {
         session.early_history.clear();
         let len = session.candidates.len();
         let cur = session.selected.min(len - 1);
-        // wrap=true（Tab 选重导航）= 首尾回卷；false（↑↓）= 端点钳制
+        // 【Tab 循环·限本页 2026-10-21 用户拍板】wrap=true 时只在**当前页
+        // 显示出来的候选**里循环：用户设了每页 2 个、该码其实有 3 个候选，
+        // Tab 必须 0↔1 循环、绝不能摸到没显示的第 3 个（越界会让高亮跑到
+        // 屏外/看不见的候选上）。页不变，只在本页内取模。
+        let page_size = self.config.candidates.page_size.max(1);
+        if wrap {
+            // 【Tab 循环·限本页 2026-10-21 用户拍板】只在**当前页显示出来的
+            // 候选**里循环：用户设了每页 2 个、该码其实有 3 个候选，Tab 必须
+            // 0↔1 循环、绝不能摸到没显示的第 3 个（越界会让高亮跑到看不见的
+            // 候选上）。页不变，只在本页内取模。
+            session.selected = tab_wrap_selected(session.page, page_size, len, cur, dir);
+            self.sound_hint = Some("page");
+            return KeyOutcome::consumed(self.state(session));
+        }
         let next = if dir < 0 {
-            if wrap && cur == 0 {
-                len - 1
-            } else {
-                cur.saturating_sub(1)
-            }
-        } else if wrap {
-            (cur + 1) % len
+            cur.saturating_sub(1)
         } else {
             (cur + 1).min(len - 1)
         };
@@ -3890,8 +3897,7 @@ impl Engine {
             return KeyOutcome::consumed(self.state(session));
         }
         session.selected = next;
-        // 跨页跟随高亮
-        let page_size = self.config.candidates.page_size.max(1);
+        // 跨页跟随高亮（page_size 已在上面取过，复用避免重复读配置）
         session.page = next / page_size;
         self.sound_hint = Some("page");
         KeyOutcome::consumed(self.state(session))
@@ -5860,10 +5866,80 @@ impl Engine {
     }
 }
 
+/// 【Tab 限页循环 2026-10-21】wrap（Tab 选重导航）算新 selected：
+/// 只在 page 这一页**显示出来的**候选内循环（page_size 与总长取交集），
+/// 不跨页、不越界到未显示项；len=0 安全返回 0。
+fn tab_wrap_selected(page: usize, page_size: usize, len: usize, cur: usize, dir: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let ps = page_size.max(1);
+    let start = (page * ps).min(len - 1);
+    let visible = ps.min(len - start).max(1);
+    let local = cur.min(len - 1).saturating_sub(start).min(visible - 1);
+    let next_local = if dir < 0 {
+        if local == 0 {
+            visible - 1
+        } else {
+            local - 1
+        }
+    } else {
+        (local + 1) % visible
+    };
+    start + next_local
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hufu_types::Modifiers;
+
+    /// 【Tab 限页循环】每页 2、共 3 个候选：Tab 只在 0↔1 循环，不越界到 2。
+    #[test]
+    fn tab_wrap_stays_within_visible_page() {
+        let (mut e, _dir) = test_engine("tab-wrap-page");
+        e.config.input.tab_clear = false;
+        e.config.candidates.page_size = 2;
+        let mut s = Session::new(true);
+        s.raw = "abc".into();
+        s.candidates = ["甲", "乙", "丙"]
+            .iter()
+            .map(|t| Candidate::new(*t, "a", CandidateKind::Sentence))
+            .collect();
+        s.page = 0;
+        s.selected = 0;
+        let tab = |e: &mut Engine, s: &mut Session| {
+            let _ = e.process_key(
+                s,
+                KeyInput {
+                    key: hufu_types::KeyCode::Tab,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            (s.selected, s.page)
+        };
+        assert_eq!(tab(&mut e, &mut s), (1, 0));
+        assert_eq!(tab(&mut e, &mut s), (0, 0), "第 2 页候选不可达");
+        assert_eq!(tab(&mut e, &mut s), (1, 0));
+        // ↓ 仍可跨页：到 index 2 → page 1；该页只剩 1 个可见项，Tab 原地
+        let down = |e: &mut Engine, s: &mut Session| {
+            let _ = e.process_key(
+                s,
+                KeyInput {
+                    key: hufu_types::KeyCode::Down,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            (s.selected, s.page)
+        };
+        assert_eq!(down(&mut e, &mut s), (2, 1), "↓ 跨页不受影响");
+        assert_eq!(tab(&mut e, &mut s), (2, 1), "该页仅 1 项 → Tab 不越界");
+        // 纯函数边界：不足一页=全量回卷；空列表安全
+        assert_eq!(tab_wrap_selected(0, 5, 3, 2, 1), 0);
+        assert_eq!(tab_wrap_selected(0, 0, 0, 0, 1), 0);
+    }
 
     #[test]
     fn candidate_menu_real_pages_and_display() {
