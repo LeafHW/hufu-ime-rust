@@ -4185,8 +4185,12 @@ impl CandidateWindowV2 {
                 // 标签列 + 最宽候选 +（备注列）+ 高亮胶囊余量
                 // 【口径统一】胶囊四边=gap：文字列从 gap+hp 起、width 含
                 // 两端 hp；胶囊 [gap, width-gap] 不再 ±hp 外扩。
+                // 【左右对称 2026-10-21 用户实锤】原式末尾多一个 +6，竖排
+                // 胶囊右缘=width-rm_x 时右侧比左侧多 6px（首选字看着偏左、
+                // 窗也偏宽）——去掉这 6，窗口宽=内容宽+两端 hp+两端 margin，
+                // 单行胶囊左右各 hp 完全对称。
                 let mut need =
-                    rm_x + hilite_pad + label_w + max_text.max(raw_w) + hilite_pad + rm_x + 6.0;
+                    rm_x + hilite_pad + label_w + max_text.max(raw_w) + hilite_pad + rm_x;
                 if max_cmt > 0.0 {
                     need += 6.0 + max_cmt;
                 }
@@ -5689,6 +5693,21 @@ impl CandidateWindowV2 {
                                 // 已在胶囊内 gap+hp 起）
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y, rh_i, ph_i);
+                                    // 【选中行贴合内容 2026-10-21 用户实锤】竖排
+                                    // 胶囊原来恒满窗宽（[rm_x, width-rm_x]），短候选
+                                    // 右侧多出一大截、首选字看着偏左。改为按本行
+                                    // 实际内容收右缘：无注释行 = 文本列右缘 + hp
+                                    //（左右各 hp 对称）；有注释行仍满宽（注释是
+                                    // 右对齐列，不能切出胶囊外）。
+                                    let tw_row = cand_ws
+                                        .get(i)
+                                        .map(|(tw, _, _)| *tw)
+                                        .unwrap_or(0.0);
+                                    let pill_right = if cmt.is_empty() {
+                                        rm_x + hilite_pad + label_w + tw_row + hilite_pad
+                                    } else {
+                                        chw - rm_x
+                                    };
                                     // 【高亮滑动 2026-10-09】竖排：上下滑动
                                     //（左右恒满宽）；mark 竖条随胶囊走。
                                     // 【八修配套 2026-09-18】右缘贴外壳插值
@@ -5698,7 +5717,7 @@ impl CandidateWindowV2 {
                                     // 胶囊先到」=闪现；贴 chw 即随壳生长/
                                     // 收拢，与拉伸动效同步。
                                     let hr =
-                                        self.hl_slide_rect((rm_x, pt, cr(chw - rm_x), cb(pb)));
+                                        self.hl_slide_rect((rm_x, pt, cr(pill_right), cb(pb)));
                                     let rr = D2D1_ROUNDED_RECT {
                                         rect: D2D_RECT_F {
                                             left: hr.0,
