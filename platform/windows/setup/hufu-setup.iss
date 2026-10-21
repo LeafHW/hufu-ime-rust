@@ -91,6 +91,16 @@ chinesesimplified.PurgeDoneInfo=已按你的选择彻底删除全部用户数据
 chinesesimplified.FinishedRestartLabel=为确保更新的内容生效最好重启一次。
 chinesesimplified.FinishedRestartMessage=为确保更新的内容生效最好重启一次。%n%n要立即重启吗？
 
+[InstallDelete]
+; 【0 PowerShell 2026-10-21】exe 轨不再安装 .ps1；升级自旧版时把历史遗留
+; 的脚本一并清掉（卸载日志里没有它们的账，留着就是死文件）。
+#ifdef RUST_ENGINE
+Type: files; Name: "{app}\install.ps1"
+Type: files; Name: "{app}\uninstall.ps1"
+Type: files; Name: "{app}\hufu-setup-tools.ps1"
+Type: files; Name: "{app}\hufu-postboot.ps1"
+#endif
+
 [Files]
 ; ---------- 程序文件（进卸载日志：卸载时删除） ----------
 Source: "staging\hufu-server.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -98,13 +108,19 @@ Source: "staging\hufu_tsf.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-tsf-smoke.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\TigerClaw.Sentence.Native.dll"; DestDir: "{app}"; Flags: ignoreversion
+; 【0 PowerShell 2026-10-21】Rust 轨不再安装任何 .ps1：安装/卸载/开机清理
+; 全由 hufu-setup-engine 承担（zip 绿色包另有一套脚本，那条线不受影响）。
+#ifndef RUST_ENGINE
 Source: "staging\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 #ifdef RUST_ENGINE
 Source: "staging\hufu-setup-engine.exe"; DestDir: "{app}"; Flags: ignoreversion
 #endif
+#ifndef RUST_ENGINE
 Source: "staging\hufu-setup-tools.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-postboot.ps1"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 ; zip 时代 卸载.bat 由构建替换为指向安装器体系的 stub（GBK）；exe 体系不
 ; 安装 安装.bat（升级时清除目标目录里的遗留，见 PrepareToInstall）
 Source: "staging\卸载.bat"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -643,6 +659,18 @@ begin
   BackupRoot := WizardDirValue + '\升级备份\v' + PrevTag + '-' +
     GetDateTimeString('yyyymmdd', '/', '/') + '-' + GetDateTimeString('hhnn', '/', '/');
 
+#ifdef RUST_ENGINE
+  // 【0 PowerShell 2026-10-21】数据差异备份也走 Rust 引擎（等价实现：
+  // hufu-setup-tools.ps1 -BackupDiff L227-348）——此前是安装流程里唯一
+  // 无条件启动 powershell.exe 的地方（火绒等安全软件会拦/告警）。
+  Exec(WizardDirValue + '\hufu-setup-engine.exe',
+    'backup-diff --manifest "' + ManifestPath + '"' +
+    ' --src "' + ExpandConstant('{tmp}') + '\hufu-pkg"' +
+    ' --dst "' + WizardDirValue + '"' +
+    ' --backup "' + BackupRoot + '"' +
+    ' --log "' + WizardDirValue + '\setup-engine.log"',
+    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+#else
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
     WizardDirValue + '\hufu-setup-tools.ps1" -BackupDiff' +
@@ -651,11 +679,17 @@ begin
     ' -DstRoot "' + WizardDirValue + '"' +
     ' -BackupRoot "' + BackupRoot + '"',
     WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+#endif
   Result := (Code = 0);
   if not Result then begin
     LogLine('BackupDiff 失败，退出码 ' + IntToStr(Code));
+#ifdef RUST_ENGINE
+    SuppressibleMsgBox(Format(ExpandConstant('{cm:DataCopyFailed}'), [IntToStr(Code),
+      WizardDirValue + '\setup-engine.log']), mbError, MB_OK, IDOK);
+#else
     SuppressibleMsgBox(Format(ExpandConstant('{cm:DataCopyFailed}'), [IntToStr(Code),
       WizardDirValue + '\setup-tools.log']), mbError, MB_OK, IDOK);
+#endif
   end;
 end;
 

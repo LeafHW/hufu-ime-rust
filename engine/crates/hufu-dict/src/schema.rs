@@ -633,15 +633,19 @@ impl Schema {
     /// 【加词自动编码 2026-10-08】词的编码提示（加词框编码框预填）：
     /// 词典/用户词已有 → best_code_of；新词 → 通用形码组词规则生成
     ///（与 Rime encoder 常用公式同形，092K 等表自带的就是这三条）：
-    /// 2 字=AaAbBaBb、3 字=AaBaCaCb、4~10 字=AaBaCaZa（Z=末字）。
+    /// 2 字=AaAbBaBb、3 字=AaBaCaCb、4 字及以上=AaBaCaZa（Z=末字）。
     /// 每字取最短 ≥2 码（组词用全码位，一简 1 码不参组词），只有
     /// 1 码的字退回 1 码尽力拼。仅供预填，用户可改。
+    /// 【长词无码修复 2026-10-21】原实现 `chars.len() > 10` 直接返回
+    /// None——超 10 字的词（长成语/短句）加词时编码框永远是空的（用户
+    /// 实锤）。规则本身只看前 3 字+末字，与词长无关，去掉上限即可；
+    /// 超长输入仍有一层兜底上限（64 字）防异常长串反复逐字反查。
     pub fn word_code_hint(&self, word: &str) -> Option<String> {
         if let Some(c) = self.best_code_of(word) {
             return Some(c);
         }
         let chars: Vec<char> = word.chars().collect();
-        if chars.len() < 2 || chars.len() > 10 {
+        if chars.len() < 2 || chars.len() > 64 {
             return None;
         }
         let per: Vec<String> = chars
@@ -1307,5 +1311,36 @@ mod tests {
         assert!(!got.is_empty(), "主码表词条丢失：a 无候选");
         // z 符号域开（z 引导码可查）
         assert!(s.dict.z_symbol_domain, "z 符号域应开（z 开头符号码存在）");
+    }
+
+    /// 【长词无码修复 2026-10-21】超 10 字的词也要生成编码（原实现
+    /// `chars.len() > 10 → None`，加词框编码永远空）。构造 12 字、
+    /// 每字 2 码的码表：提示码非空，且按 4 码上限截断后正好 4 码。
+    #[test]
+    fn word_code_hint_long_word_over_ten_chars() {
+        let tmp = std::env::temp_dir().join(format!("hufu-test-wc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let chars = [
+            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "甲", "乙",
+        ];
+        let mut body = String::from("---\nname: wc\nsort: by_weight\n...\n");
+        for (i, c) in chars.iter().enumerate() {
+            let a = (b'a' + i as u8) as char;
+            let b = (b'a' + ((i + 1) % 12) as u8) as char;
+            body.push_str(&format!("{c}\t{a}{b}\t100\n"));
+        }
+        write(&tmp, "wc.dict.yaml", &body);
+        let s = Schema::load(&tmp).unwrap();
+        let word: String = chars.join("");
+        let code = s.word_code_hint(&word).expect("超 10 字也应生成编码");
+        assert!(!code.is_empty(), "长词编码不得为空");
+        let capped = s
+            .word_code_hint_capped(&word, 4)
+            .expect("长词 4 码上限截断");
+        assert_eq!(capped.chars().count(), 4, "截断后应为 4 码：{capped}");
+        // 2 字/11 字词都仍走同一套规则（回归：短词不受影响）
+        assert!(s.word_code_hint("一二").is_some());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1,8 +1,11 @@
 //! hufu-setup-engine —— install.ps1/uninstall.ps1 血律的 Rust 编译版。
-//! 子命令：install / install-elevated / uninstall / postboot / purge-data
+//! 子命令：install / install-elevated / uninstall / postboot / purge-data /
+//!        backup-diff（数据文件差异备份+拷入：原 hufu-setup-tools.ps1
+//!        -BackupDiff，2026-10-21 为「exe 安装包完全 0 PowerShell」移植）
 //! 公共参数：--log <path>（引擎日志；install-elevated 默认 %TEMP%\hufu-install-elevated.log）
 
 mod acl;
+mod backupdiff;
 mod common;
 mod install;
 mod lnk;
@@ -19,21 +22,32 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("用法: hufu-setup-engine <install|install-elevated|uninstall|postboot|purge-data> [--no-hklm] [--user-only] [--log <path>]");
+        eprintln!("用法: hufu-setup-engine <install|install-elevated|uninstall|postboot|purge-data|backup-diff> [--no-hklm] [--user-only] [--log <path>] [--manifest <f> --src <d> --dst <d> --backup <d>]");
         std::process::exit(1);
     }
     let cmd = args[0].clone();
     let mut no_hklm = false;
     let mut user_only = false;
     let mut log: Option<PathBuf> = None;
+    let mut manifest: Option<String> = None;
+    let mut src_root: Option<String> = None;
+    let mut dst_root: Option<String> = None;
+    let mut backup_root: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--no-hklm" => no_hklm = true,
             "--user-only" => user_only = true,
-            "--log" => {
+            "--log" | "--manifest" | "--src" | "--dst" | "--backup" => {
                 if i + 1 < args.len() {
-                    log = Some(PathBuf::from(&args[i + 1]));
+                    let v = args[i + 1].clone();
+                    match args[i].as_str() {
+                        "--log" => log = Some(PathBuf::from(&v)),
+                        "--manifest" => manifest = Some(v),
+                        "--src" => src_root = Some(v),
+                        "--dst" => dst_root = Some(v),
+                        _ => backup_root = Some(v),
+                    }
                     i += 1;
                 }
             }
@@ -61,6 +75,17 @@ fn main() {
             }
         }
         "purge-data" => purge::run_purge_data(&mut out),
+        // 【0 PowerShell 2026-10-21】iss 里最后一处 PowerShell 子进程
+        //（hufu-setup-tools.ps1 -BackupDiff）的 Rust 等价实现
+        "backup-diff" => backupdiff::run_backup_diff(
+            &mut out,
+            backupdiff::Args {
+                manifest: manifest.as_deref(),
+                src: src_root.as_deref(),
+                dst: dst_root.as_deref(),
+                backup: backup_root.as_deref(),
+            },
+        ),
         // iss 专用微子命令（rust 轨替换 iss 里最后的两处 powershell 探针）
         "server-alive" => {
             if procop::proc_running("hufu-server.exe") {

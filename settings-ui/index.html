@@ -493,8 +493,8 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <h3>候选字号</h3>
     <div class="row">
       <div class="checkline"><input type="checkbox" id="g-pcf"><label for="g-pcf" title="开：第 1 候选按其比例放大、其余候选按其比例缩小（仿虎娘新版权候选样式）；关：全页同一字号（默认）。比例是「× 当前皮肤字号」的倍数，编码行/序号/加词框不受影响。">首选放大 / 其余缩小</label></div>
-      <div class="field"><label>首选 <span class="val" id="g-pcf1-v"></span></label><input type="range" id="g-pcf1" min="50" max="200" step="5" title="首选候选字号 = 皮肤字号 × 本比例（50%~200%，5% 步进）。虎娘新版权实测为首选 0.90、其余 0.667；默认 1.20/0.90 保留原字号并做出同样的「首选大、其余小」观感。需先勾选左侧开关"></div>
-      <div class="field"><label>其余 <span class="val" id="g-pcf2-v"></span></label><input type="range" id="g-pcf2" min="50" max="100" step="5" title="第 2 个及之后的候选字号 = 皮肤字号 × 本比例（50%~100%，5% 步进）。需先勾选左侧开关"></div>
+      <div class="field"><label>首选 <span class="val" id="g-pcf1-v"></span></label><input type="range" id="g-pcf1" min="50" max="200" step="5" title="首选候选字号 = 皮肤字号 × 本比例（50%~200%，5% 步进；默认 100%=首选保持原字号）。需先勾选左侧开关"></div>
+      <div class="field"><label>其余 <span class="val" id="g-pcf2-v"></span></label><input type="range" id="g-pcf2" min="50" max="100" step="5" title="第 2 个及之后的候选字号 = 皮肤字号 × 本比例（50%~100%，5% 步进；默认 70%）。需先勾选左侧开关"></div>
     </div>
     <div class="skin-grid" id="skin-json-grid">
       <div class="skin-preview-wrap">
@@ -1521,8 +1521,8 @@ function bindSkin() {
     const pct = v => Math.round(v * 100) + "%";
     const syncPcf = () => {
       pc.checked = CFG.appearance?.per_cand_font === true;
-      s1.value = Math.round((CFG.appearance?.first_font_scale ?? 1.2) * 100);
-      s2.value = Math.round((CFG.appearance?.other_font_scale ?? 0.9) * 100);
+      s1.value = Math.round((CFG.appearance?.first_font_scale ?? 1.0) * 100);
+      s2.value = Math.round((CFG.appearance?.other_font_scale ?? 0.7) * 100);
       s1.disabled = s2.disabled = !pc.checked;
       $("#g-pcf1-v").textContent = pct(s1.value / 100);
       $("#g-pcf2-v").textContent = pct(s2.value / 100);

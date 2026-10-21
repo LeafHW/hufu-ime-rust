@@ -667,11 +667,11 @@ pub struct AppearanceSection {
     /// `skin.layout.font_point`（本字段只乘比例，不改字号本体）。
     pub per_cand_font: bool,
     /// 首选候选字号比例（× 基准字号）。仅 per_cand_font=true 生效。
-    /// 范围 1.00~2.00，设置页 5% 步进。
+    /// 范围 0.50~2.00，设置页 5% 步进；默认 1.00（首选保持原字号）。
     #[serde(default = "default_first_font_scale")]
     pub first_font_scale: f32,
     /// 其余候选字号比例（× 基准字号）。仅 per_cand_font=true 生效。
-    /// 范围 0.50~1.00，设置页 5% 步进。
+    /// 范围 0.50~1.00，设置页 5% 步进；默认 0.70（其余缩小到七成）。
     #[serde(default = "default_other_font_scale")]
     pub other_font_scale: f32,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
@@ -687,15 +687,15 @@ fn default_skin_kind() -> String {
     "json".into()
 }
 
-/// 【逐候选字号 2026-10】首选放大比例默认值（虎娘新版权实测比例见
-/// `docs/`；宽度/边距不动，只放大字形）。
+/// 【逐候选字号 2026-10】首选放大比例默认值：1.00=首选保持基准字号
+///（用户拍板：开启后只把其余候选缩小，首选不变，视觉上首选自然变大）。
 fn default_first_font_scale() -> f32 {
-    1.20
+    1.00
 }
 
-/// 【逐候选字号 2026-10】其余候选缩小比例默认值。
+/// 【逐候选字号 2026-10】其余候选缩小比例默认值：0.70（用户拍板）。
 fn default_other_font_scale() -> f32 {
-    0.90
+    0.70
 }
 
 impl Default for AppearanceSection {
@@ -864,8 +864,8 @@ mod tests {
     fn per_cand_font_defaults_and_roundtrip() {
         let cfg = Config::default();
         assert_eq!(cfg.appearance.per_cand_font, false, "默认关（升级零差异）");
-        assert_eq!(cfg.appearance.first_font_scale, 1.20);
-        assert_eq!(cfg.appearance.other_font_scale, 0.90);
+        assert_eq!(cfg.appearance.first_font_scale, 1.00);
+        assert_eq!(cfg.appearance.other_font_scale, 0.70);
 
         let dir = std::env::temp_dir().join(format!("hufu-cfg-pcf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -884,8 +884,8 @@ mod tests {
         let legacy = r#"{"appearance": {"skin": "hufu-moyan", "font_size": 17.6}}"#;
         let cfg3: Config = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg3.appearance.per_cand_font, false);
-        assert_eq!(cfg3.appearance.first_font_scale, 1.20);
-        assert_eq!(cfg3.appearance.other_font_scale, 0.90);
+        assert_eq!(cfg3.appearance.first_font_scale, 1.00);
+        assert_eq!(cfg3.appearance.other_font_scale, 0.70);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
