@@ -162,6 +162,53 @@ fn tab_navigate_mode() {
 }
 
 #[test]
+fn tab_navigate_wraps_at_last() {
+    // 【Tab 循环 2026-10-21】选重导航走到末位后再按 Tab 回卷到首选；
+    // ↑↓ 保持端点钳制（↓ 到底顶住不动），两者语义分开。
+    let (mut engine, mut session, _dir) = setup();
+    engine.config.input.tab_clear = false;
+    engine.process_key(&mut session, key('t'));
+    let n = engine.state(&session).candidates.len();
+    assert!(n >= 2, "需多候选场景（t 前缀）");
+    let tab = |e: &mut Engine, s: &mut Session| {
+        e.process_key(
+            s,
+            KeyInput {
+                key: hufu_types::KeyCode::Tab,
+                modifiers: hufu_types::Modifiers::default(),
+                is_press: true,
+            },
+        )
+        .state
+        .unwrap()
+        .selected
+    };
+    // 从 0 连按 n 次：0→1→…→n-1→0（回卷）
+    for i in 1..=n {
+        let want = i % n;
+        assert_eq!(tab(&mut engine, &mut session), want, "第 {i} 次 Tab 应到 {want}");
+    }
+    // ↓ 到底钳制：拨到最后一位后再按 ↓ 不动
+    let down = |e: &mut Engine, s: &mut Session| {
+        e.process_key(
+            s,
+            KeyInput {
+                key: hufu_types::KeyCode::Down,
+                modifiers: hufu_types::Modifiers::default(),
+                is_press: true,
+            },
+        )
+        .state
+        .unwrap()
+        .selected
+    };
+    for _ in 0..n {
+        down(&mut engine, &mut session);
+    }
+    assert_eq!(down(&mut engine, &mut session), n - 1, "↓ 到底不回卷");
+}
+
+#[test]
 fn full_code_push_on_fifth() {
     // 超过最大码长（4）→ 顶屏首选
     let (mut engine, mut session, _dir) = setup();

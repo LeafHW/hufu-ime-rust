@@ -1522,11 +1522,13 @@ impl Engine {
                     // 【Tab 双模式 2026-09-08】关闭清屏 = 选重导航档：
                     // 按一下高亮移到下一候选（同方向键↓），空格上屏
                     //——不是一键选定；不再是翻页（翻页由 -/= 翻页键承担）。
-                    self.on_updown(session, 1)
+                    // 【Tab 循环 2026-10-21 用户拍板】末位再按 Tab 回卷到首选
+                    //（原来走到最后就顶住不动）；↑↓ 保持钳制语义不变。
+                    self.on_updown(session, 1, true)
                 }
             }
-            KeyCode::Up => self.on_updown(session, -1),
-            KeyCode::Down => self.on_updown(session, 1),
+            KeyCode::Up => self.on_updown(session, -1, false),
+            KeyCode::Down => self.on_updown(session, 1, false),
             KeyCode::PageDown => {
                 if session.raw.is_empty() {
                     KeyOutcome::passthrough()
@@ -3859,7 +3861,7 @@ impl Engine {
     }
 
     /// ↑↓ 高亮移动（Rime 悬浮窗选重）：逐候选移动、跨页跟随；浏览即暂停提前上屏。
-    fn on_updown(&mut self, session: &mut Session, dir: i32) -> KeyOutcome {
+    fn on_updown(&mut self, session: &mut Session, dir: i32, wrap: bool) -> KeyOutcome {
         if session.raw.is_empty() {
             return KeyOutcome::passthrough();
         }
@@ -3872,8 +3874,15 @@ impl Engine {
         session.early_history.clear();
         let len = session.candidates.len();
         let cur = session.selected.min(len - 1);
+        // wrap=true（Tab 选重导航）= 首尾回卷；false（↑↓）= 端点钳制
         let next = if dir < 0 {
-            cur.saturating_sub(1)
+            if wrap && cur == 0 {
+                len - 1
+            } else {
+                cur.saturating_sub(1)
+            }
+        } else if wrap {
+            (cur + 1) % len
         } else {
             (cur + 1).min(len - 1)
         };
