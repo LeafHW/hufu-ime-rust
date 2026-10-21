@@ -437,6 +437,15 @@ pub struct SentenceSection {
     /// HUFU_EARLY_DIVERG_GAP 环境变量优先。
     #[serde(default = "default_diverg_gap")]
     pub early_diverg_gap: f64,
+    /// 【句尾严格护栏 2026-10-22】提交时剩余码 <= 本值时，保护圈宽度强制
+    /// 回到 8.0 分（不受 early_diverg_gap 放宽影响）。依据：1 万句诊断中
+    /// 护栏拦对的 38 次 **100% 落在剩余码 <= 9**（句尾 5~9 码，无后续证据
+    /// 可验证），而其余 39000 次拦截全是误杀（提交文本即正确前缀）。故句
+    /// 中可安全放宽 gap、句尾保持原严格度。0 = 关闭该机制（行为同旧版）。
+    /// 1 万句实测（gap=4 + tail=12）：准率 99.720% 与 gap=8 基线逐句相同，
+    /// 提前上屏覆盖 81.03%→85.92%（+4.89pp），残留 4.50→4.42。
+    #[serde(default = "default_diverg_tail")]
+    pub early_diverg_tail: usize,
     /// 【修1·单字分歧护栏 2026-09-28】同码分歧护栏的单字增量扩展：
     /// 单字上屏也过护栏，但只保护「完整态（!partial）候选、距完整态
     /// 子池池首分差 ≤ early_diverg_gap、且在该字位与稳定前缀分歧」的
@@ -465,7 +474,11 @@ fn default_early_need() -> usize {
 }
 
 fn default_diverg_gap() -> f64 {
-    8.0
+    4.0
+}
+
+fn default_diverg_tail() -> usize {
+    12
 }
 
 fn default_true() -> bool {
@@ -496,9 +509,14 @@ impl Default for SentenceSection {
             // 本机实测调校值五方对齐——Default impl 是新装机首启
             // （config.json 不存在）与 tbench 基准的兜底，此前 2 与
             // 产品定版 3 不一致（bench 口径偏差来源之一）。
+            // 【2026-10-22 条件化护栏定版】guard 默认开 + gap 4.0 +
+            // tail 12：句尾严格(8.0)/句中放宽(4.0)。1 万句实测准率与
+            // gap=8 逐句相同（99.720%），覆盖 +4.89pp。旧版 guard 缺省
+            // 关、gap 8.0。
             early_need: 3,
-            early_diverg_guard: false,
-            early_diverg_gap: 8.0,
+            early_diverg_guard: true,
+            early_diverg_gap: 4.0,
+            early_diverg_tail: 12,
             early_diverg_guard1: true,
             early_diverg_guard3: true,
             weights: SentenceWeights::default(),

@@ -27,6 +27,11 @@ fn main() {
             args.get(2).expect("用法: code <方案目录> <句子>"),
             args.get(3).expect("用法: code <方案目录> <句子>"),
         ),
+        "codes" => cmd_codes(
+            args.get(2).expect("用法: codes <方案目录> <语料> <输出tsv>"),
+            args.get(3).expect("用法: codes <方案目录> <语料> <输出tsv>"),
+            args.get(4).expect("用法: codes <方案目录> <语料> <输出tsv>"),
+        ),
         "query" => {
             let mut rest: Vec<String> = args[2..].to_vec();
             let mut show_early = false;
@@ -76,6 +81,7 @@ fn main() {
             println!("  repl    <方案目录>   逐字符模拟输入（q 退出，BS 退格，SP 空格）");
             println!("  bench   <方案目录> <语料> [ngram] 整句质量基准（exact 率 + 逐句解码耗时）");
             println!("  code    <方案目录> <句子>   逐字 best_code_of 展示（bench 同款打法）");
+            println!("  codes   <方案目录> <语料> <out.tsv>  逐句导出 tbench 同款码流（喂给外部 IME 基准）");
             println!("  query   [-e] <方案目录> <ngram> <raw...>  解码候选（分数/名次/切分）");
             println!("  cands   <方案目录> <ngram> <raw...>  逐键 session 候选框（真实 UI 所见）");
         }
@@ -514,6 +520,33 @@ fn cmd_cbench(dir: &str, cases_path: &str, ngram: &str) {
     }
 }
 
+/// 逐句导出 tbench 同款码流（real_code_of 完全一致，含名次锁），
+/// 供外部输入法基准（如虎娘 TSF 宿主）喂同一条键序列。
+fn cmd_codes(dir: &str, corpus: &str, out: &str) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let sents: Vec<String> =
+        std::io::BufReader::new(std::fs::File::open(corpus).expect("语料打开失败"))
+            .lines()
+            .map(|l| l.unwrap().trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+    let mut w = String::new();
+    let mut wrote = 0usize;
+    for s in &sents {
+        let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect();
+        if raw.is_empty() {
+            continue;
+        }
+        w.push_str(s);
+        w.push('\t');
+        w.push_str(&raw);
+        w.push('\n');
+        wrote += 1;
+    }
+    std::fs::write(out, w).expect("写出失败");
+    println!("[codes] {wrote} 句 → {out}");
+}
+
 fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
     let cfg = bench_config();
@@ -620,7 +653,11 @@ fn cmd_tbench(dir: &str, corpus: &str, ngram: &str, lat_out: Option<String>) {
     if no_lock_scan {
         println!("[NOLOCK 无锁扫描] 只测引擎真实候选序（schema.candidates）第一名==本字的码（整句模式覆盖生僻下沉路径）");
     }
+    let gv_log = std::env::var("HUFU_GUARD_LOG").map(|v| v == "1").unwrap_or(false);
     for s in &sents {
+        if gv_log {
+            eprintln!("[SENT] {}", s);
+        }
         let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
         if raw.is_empty() {
             continue;

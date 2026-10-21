@@ -1,5 +1,5 @@
 [workspace]
-members = ["hufu-tsf", "hufu-tsf-smoke", "hufu-setup-engine"]
+members = ["hufu-tsf", "hufu-tsf-smoke", "hufu-setup-engine", "tigirl-tsf-bench"]
 resolver = "2"
 
 [workspace.package]

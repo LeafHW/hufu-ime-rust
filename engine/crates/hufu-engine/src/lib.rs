@@ -3587,6 +3587,22 @@ impl Engine {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(self.config.sentence.early_diverg_gap);
+            // 【句尾严格护栏 定版 2026-10-22】剩余码 <= tail 时保护圈宽度
+            // 回到 8.0（句尾无后续证据可验证，判断容错低）；句中沿用配置
+            // gap（可放宽）。tail 取 config sentence.early_diverg_tail，
+            // HUFU_EARLY_DIVERG_TAIL 环境变量优先（bench A/B 用）。
+            let tail = std::env::var("HUFU_EARLY_DIVERG_TAIL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(self.config.sentence.early_diverg_tail);
+            let diverg_gap = if tail > 0
+                && session.raw.chars().count() <= tail
+                && diverg_gap < 8.0
+            {
+                8.0
+            } else {
+                diverg_gap
+            };
             let leader_conf = cands
                 .iter()
                 .map(|h| h.confidence)
@@ -3665,6 +3681,30 @@ impl Engine {
                 }
                 raw_at < consumed // 分歧起点将被吞掉 → 活候选被毁
             });
+            // [DIAG-GV] 护栏诊断：记录本次判定里"跨度内竞争候选"的最小分差
+            if std::env::var("HUFU_GUARD_LOG").map(|v| v == "1").unwrap_or(false) {
+                let mut min_cg = f64::INFINITY;
+                for h in cands.iter() {
+                    let cg = full_leader_conf - h.confidence;
+                    if cg > diverg_gap { continue; }
+                    if delta.chars().count() < 2 && h.partial { continue; }
+                    let hc: Vec<char> = h.text.chars().collect();
+                    if hc.len() <= stable_chars.len() { continue; }
+                    if hc[..stable_chars.len()] == stable_chars[..] { continue; }
+                    let mut di = committed_n;
+                    while di < stable_chars.len() && hc[di] == stable_chars[di] { di += 1; }
+                    if di >= stable_chars.len() { continue; }
+                    let mut raw_at = committed_raw_len;
+                    for (cc, re) in &h.word_ends {
+                        if *cc <= di && *re > raw_at { raw_at = *re; }
+                    }
+                    if raw_at < consumed && cg < min_cg { min_cg = cg; }
+                }
+                eprintln!("[GV] cg={:.4} gap={:.2} consumed={} rawlen={} contested={} dlen={} delta={} stable={}",
+                    if min_cg.is_finite() { min_cg } else { -1.0 },
+                    diverg_gap, consumed, session.raw.chars().count(),
+                    contested, delta.chars().count(), delta, stable);
+            }
             if contested {
                 if ec_dbg {
                     eprintln!(
