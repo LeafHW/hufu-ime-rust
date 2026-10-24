@@ -162,6 +162,7 @@ fn inc_tail_beam() -> usize {
 }
 /// 每段参与组句的码表词条上限（rank 截断）：虎码同码词呈长尾分布，
 /// rank>8 的系统词极生僻，beam 展开却为每词条付一次 String clone。
+/// 显式选重锁名次>8 时按锁放宽（建段处 take_limit，2026-10-24）。
 const SEG_RANK_LIMIT: usize = 8;
 
 /// beam 内部状态。
@@ -578,10 +579,20 @@ impl SentenceEngine {
                     .iter()
                     .find(|(l, _)| *l as usize == end)
                     .map(|(_, r)| *r);
+                // 【锁名次放宽 take 上限 2026-10-24】显式选重锁到第
+                // 9/10 名（数字 9、0）时，该段词条 take 上限放宽到锁
+                // 名次——否则 SEG_RANK_LIMIT=8 截断后词图里没有第 9/10
+                // 名条目，锁过滤（rank1b != r 全跳）令解码为空，数字
+                // 9/0 成死键（码 c 的 9=自己的、10=手机 选不出，实测）。
+                // 放宽只发生在「锁名次>8」的段：无锁路径零变化。
+                let take_limit = match lock_rank {
+                    Some(r) if r > SEG_RANK_LIMIT => r,
+                    _ => SEG_RANK_LIMIT,
+                };
                 let entries: Vec<(String, usize, bool)> = idxs
                     .iter()
                     .enumerate()
-                    .take(SEG_RANK_LIMIT)
+                    .take(take_limit)
                     .filter_map(|(rank, &idx)| {
                         self.dict.entries.get(idx as usize).and_then(|e| {
                             // 【整句高频字过滤上限】单字 × 非最优码 × 频序 ≤ N
@@ -1346,5 +1357,48 @@ mod tests {
         // N=2：第 2 个字也剔除
         assert!(!hits(&on2, &raw_yi).iter().any(|t| t == "一鑫"));
         assert!(on2.blocked.contains_key(&'一'));
+    }
+
+    /// 【锁名次放宽 take 上限 2026-10-24】显式选重锁到第 9/10 名
+    /// （数字 9、0）时词条 take 上限放宽到锁名次：否则 SEG_RANK_LIMIT=8
+    /// 截断后词图无第 9/10 名条目，锁过滤全跳 → 解码空 → 死键。
+    /// 复现用户实测：整句方案打 c9/c0 打不出（码 c 第 9=自己的、
+    /// 第 10=手机）；修复后 c9/c0 出词，c1..c8 行为不变。
+    #[test]
+    fn lock_rank_beyond_seg_limit_still_resolves() {
+        // 码 e 挂 10 个词（权重递减 → 码表名次 1..10）
+        let mut es = Vec::new();
+        let words = [
+            "地", "自己", "地方", "④", "⑤", "⑥", "看着", "开始", "自己的", "手机",
+        ];
+        for (i, w) in words.iter().enumerate() {
+            es.push(DictEntry {
+                weight: 100.0 - i as f64,
+                ..DictEntry::new("e", *w, i as u32)
+            });
+        }
+        let eng = engine_with_weights(
+            Dict::from_entries("test", es),
+            SentenceWeights::default(),
+        );
+        // 修复前：c9（此处 e9）解码为空 = 死键；修复后有 hits。
+        assert!(
+            !hits(&eng, "e9").is_empty(),
+            "锁第 9 名应可解出: hits={:?}",
+            hits(&eng, "e9")
+        );
+        assert_eq!(hits(&eng, "e9").first().map(String::as_str), Some("自己的"));
+        // '0' 锁第 10 名（parse_rank_locks 语义）
+        assert_eq!(hits(&eng, "e0").first().map(String::as_str), Some("手机"));
+        // 界内锁不变：e1..e8 照常
+        assert_eq!(hits(&eng, "e1").first().map(String::as_str), Some("地"));
+        assert_eq!(hits(&eng, "e8").first().map(String::as_str), Some("开始"));
+        // 无锁时截断语义零变化：长句（>4 键）无锁只取 rank1，
+        // e+dd 组不出第 9 名词（放松只在带锁段发生）
+        assert!(
+            !hits(&eng, "edd").iter().any(|t| t == "自己的"),
+            "无锁段不得因放宽多出低名词: hits={:?}",
+            hits(&eng, "edd")
+        );
     }
 }

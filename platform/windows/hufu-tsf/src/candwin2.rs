@@ -5693,21 +5693,13 @@ impl CandidateWindowV2 {
                                 // 已在胶囊内 gap+hp 起）
                                 if let Some(b) = &b_hi {
                                     let (pt, pb) = pill_v(y, rh_i, ph_i);
-                                    // 【选中行贴合内容 2026-10-21 用户实锤】竖排
-                                    // 胶囊原来恒满窗宽（[rm_x, width-rm_x]），短候选
-                                    // 右侧多出一大截、首选字看着偏左。改为按本行
-                                    // 实际内容收右缘：无注释行 = 文本列右缘 + hp
-                                    //（左右各 hp 对称）；有注释行仍满宽（注释是
-                                    // 右对齐列，不能切出胶囊外）。
-                                    let tw_row = cand_ws
-                                        .get(i)
-                                        .map(|(tw, _, _)| *tw)
-                                        .unwrap_or(0.0);
-                                    let pill_right = if cmt.is_empty() {
-                                        rm_x + hilite_pad + label_w + tw_row + hilite_pad
-                                    } else {
-                                        chw - rm_x
-                                    };
+                                    // 【高亮盖满选位区 2026-10-24 用户实锤】竖排
+                                    // 胶囊恒满宽 [rm_x, chw-rm_x]，与选位/右键命
+                                    // 中区同宽。10-21 的「贴合内容收右缘」在多候
+                                    // 选时让短候选行右侧到窗边空一块（盖不住整个
+                                    // 选位区）；当时真病根=窗宽公式末尾多出的 +6
+                                    //（已修，保留）——贴合段回退。
+                                    let pill_right = chw - rm_x;
                                     // 【高亮滑动 2026-10-09】竖排：上下滑动
                                     //（左右恒满宽）；mark 竖条随胶囊走。
                                     // 【八修配套 2026-09-18】右缘贴外壳插值
