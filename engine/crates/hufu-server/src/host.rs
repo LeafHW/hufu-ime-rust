@@ -1328,12 +1328,24 @@ mod export_util {
         // 4) 按格式渲染行
         let lines = render(&rows, fmt);
 
-        // 5) 落盘（UTF-8 带 BOM，CRLF）
+        // 5) 落盘
         if let Some(parent) = out_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        hufu_dict::parse::write_lines_gb18030(out_path, &lines)
-            .map_err(|e| format!("写文件失败: {e}"))?;
+        if fmt == ExportFormat::Robot {
+            // 【机器人专用 2026-10-26 用户需求】机器消费方按字节直读：
+            // UTF-8 不带 BOM——开头的 EF BB BF 会被部分解析器当成首行
+            // 首码的一部分读成乱码。行尾维持 CRLF（splitlines 类解析器
+            // 通吃）。其余格式维持 UTF-8+BOM（Excel/记事本直开兼容）。
+            let mut text = lines.join("\r\n");
+            text.push_str("\r\n");
+            std::fs::write(out_path, text.as_bytes())
+                .map_err(|e| format!("写文件失败: {e}"))?;
+        } else {
+            // （write_lines_gb18030 名字唬人——实际写 UTF-8 带 BOM + CRLF）
+            hufu_dict::parse::write_lines_gb18030(out_path, &lines)
+                .map_err(|e| format!("写文件失败: {e}"))?;
+        }
         Ok(rows.len())
     }
 
@@ -1720,6 +1732,30 @@ mod export_util {
             // 对照：多多=词\t码（列序相反）
             let dd = render(&rows, ExportFormat::Duoduo);
             assert_eq!(dd[1..], vec!["就\tjhgk".to_string(), "成就\tjhgk".to_string()]);
+        }
+
+        /// 【机器人专用无 BOM 2026-10-26 用户需求】机器消费方按字节直读，
+        /// 导出文件必须 UTF-8 不带 BOM；其余格式维持带 BOM（Excel/记事本
+        /// 直开兼容）。
+        #[test]
+        fn robot_export_utf8_without_bom() {
+            let s = mk_schema_dir();
+            for (fmt, want_bom) in [
+                (ExportFormat::Robot, false),
+                (ExportFormat::Sentence, true),
+                (ExportFormat::Duoduo, true),
+            ] {
+                let p = out_path().with_extension(format!("{fmt:?}.txt"));
+                let n = export_one(&s, &p, fmt).unwrap();
+                assert!(n > 0);
+                let b = std::fs::read(&p).unwrap();
+                assert_eq!(
+                    b.starts_with(&[0xEF, 0xBB, 0xBF]),
+                    want_bom,
+                    "{fmt:?} BOM 头不符预期"
+                );
+                let _ = std::fs::remove_file(&p);
+            }
         }
 
         #[test]
