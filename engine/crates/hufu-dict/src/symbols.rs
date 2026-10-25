@@ -27,6 +27,13 @@ pub struct SymbolTables {
     pub slash: HashMap<String, Vec<SymbolEntry>>,
     /// 一简符号（开启后单字母码直接出符号）
     pub simple: HashMap<String, Vec<SymbolEntry>>,
+    /// 【性能 2026-10-26 审计】merge_code_map 惰性缓存。三表在
+    /// Schema::load 构建期内赋值、装载完成后不可变（热重载=整体新建
+    /// Schema/新 SymbolTables，缓存随实例作废）——原实现每次调用全量
+    /// 重建 HashMap 并克隆全部条目（每条两个 String 分配），引擎热路径
+    ///（; / \ z 域延续判定 + 符号表回退）每键最多 3 次。Clone 携带已建
+    /// 缓存（内容一致，安全）。
+    merged: std::sync::OnceLock<HashMap<String, Vec<SymbolEntry>>>,
 }
 
 impl SymbolTables {
@@ -46,14 +53,17 @@ impl SymbolTables {
     }
 
     /// 合并多个符号文件（`/jm`、`/a` 这类与正码共用命名空间的行也收进来）。
-    pub fn merge_code_map(&self) -> HashMap<String, Vec<SymbolEntry>> {
-        let mut all: HashMap<String, Vec<SymbolEntry>> = HashMap::new();
-        for group in [&self.quick, &self.slash, &self.simple] {
-            for (code, entries) in group {
-                all.entry(code.clone()).or_default().extend(entries.iter().cloned());
+    /// 【性能 2026-10-26 审计】返回缓存引用：首次调用构建，此后零分配。
+    pub fn merge_code_map(&self) -> &HashMap<String, Vec<SymbolEntry>> {
+        self.merged.get_or_init(|| {
+            let mut all: HashMap<String, Vec<SymbolEntry>> = HashMap::new();
+            for group in [&self.quick, &self.slash, &self.simple] {
+                for (code, entries) in group {
+                    all.entry(code.clone()).or_default().extend(entries.iter().cloned());
+                }
             }
-        }
-        all
+            all
+        })
     }
 }
 

@@ -1817,7 +1817,7 @@ mod candidate_tests {
             r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5}}"#,
         )
         .unwrap();
-        let mut h = Host::new(&root.join("数据")).unwrap();
+        let h = Host::new(&root.join("数据")).unwrap();
         let host = Mutex::new(h);
         let key = json!({"op":"key","key":"a"});
         let r = dispatch(&host, &key, None);

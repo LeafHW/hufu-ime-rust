@@ -91,9 +91,6 @@ impl SsfBitmap {
     pub fn is_animated(&self) -> bool {
         self.frames.len() > 1 && self.delays_ms.iter().any(|&d| d > 0)
     }
-    pub fn frame_count(&self) -> usize {
-        self.frames.len()
-    }
 }
 
 /// RGBA 直排 → premultiplied BGRA（同 overlaywin.rs:557-561 的换算式：
@@ -392,15 +389,11 @@ pub struct SsfAxisSlice {
     pub destination_length: f32,
 }
 
-/// 单轴九宫格切片（虎娘 sliceAxis 语义逐行移植）：
-/// - 源 0 / 目标非有限或 ≤0 → 空切片（整轴不画）；
-/// - 刀口和 ≥ 源宽 → 按 `(源宽-1)/刀口和` 比例收缩刀口（真机立绘压扁
-///   根因：别整图硬缩）；
-/// - 目标 < 刀口和 → 再等比收缩目标侧刀口（`destination/(before+after)`）；
-/// - tile=true（mode 1 平铺）且 中段源宽>0 且 `可用宽/中段 ≤64` → 逐块
-///   平铺（≤64 块绘制预算）；否则中段整体拉伸；
-/// - 首尾块 source_length/destination_length ≤0 的丢弃（add 谓词）。
-pub fn slice_axis(source: u32, destination: f32, tile: bool, before: i32, after: i32) -> Vec<SsfAxisSlice> {
+// 【死代码清扫 2026-10-26 审计】scale=1.0 的薄包装仅测试消费——改
+// #[cfg(test)] 保留（lib 目标零死码，九宫格测试组照跑）；算法本体在
+// 下方 slice_axis_scaled（语义注释随本体）。
+#[cfg(test)]
+fn slice_axis(source: u32, destination: f32, tile: bool, before: i32, after: i32) -> Vec<SsfAxisSlice> {
     slice_axis_scaled(source, destination, tile, before, after, 1.0)
 }
 
@@ -619,10 +612,8 @@ impl SsfFrameClock {
             start: Instant::now(),
         }
     }
-    /// 重置时间基准（换装/重解码后调用，动画从头播）。
-    pub fn restart(&mut self) {
-        self.start = Instant::now();
-    }
+    // 【死代码清扫 2026-10-26 审计】restart（换装路径改重建实例，零
+    // 调用）已删。
     pub fn elapsed_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
@@ -961,15 +952,8 @@ pub fn parse_hex_rgba(s: &str) -> Option<[u8; 4]> {
     Some([b(0)?, b(2)?, b(4)?, if s.len() == 8 { b(6)? } else { 0xFF }])
 }
 
-/// [R,G,B,A] → D2D 颜色（供渲染分支直接取用）。
-pub fn rgba_to_color_f(c: [u8; 4]) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: c[0] as f32 / 255.0,
-        g: c[1] as f32 / 255.0,
-        b: c[2] as f32 / 255.0,
-        a: c[3] as f32 / 255.0,
-    }
-}
+// 【死代码清扫 2026-10-26 审计】rgba_to_color_f（渲染分支各有内联
+// 换算，零调用）已删。
 
 /// 双形态读取（candwin2.rs:1399-1423 的 color_f/layout_f 口径）：优先
 /// `/skin/...` 包装层（server 管道下发形态），回退顶层直挂（本地 JSON/
@@ -1263,8 +1247,9 @@ impl SsfSkinSpec {
         chain.iter().find_map(|var| self.layouts.get(var))
     }
 
-    /// 变体背景图完整路径（cache_dir\{image}；image 已在 parse 时保真，
-    /// 读取前仍经 load_bitmap 的 normalize 二次消毒）。
+    // 【死代码清扫 2026-10-26 审计】image_path 仅测试消费——改
+    // #[cfg(test)] 保留（lib 目标零死码）。
+    #[cfg(test)]
     pub fn image_path(&self, layout: &SsfVariantLayout) -> PathBuf {
         self.cache_dir.join(&layout.image)
     }

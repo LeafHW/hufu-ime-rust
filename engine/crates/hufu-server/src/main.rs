@@ -78,8 +78,10 @@ fn anti_freeze_guards(data_dir: &std::path::Path) {
         let h = GetCurrentProcess();
         let mut sys_mask: usize = 0;
         let mut proc_mask: usize = 0;
-        let mut mask_line = String::new();
-        let mut prio_line = String::new();
+        // 【死赋值清扫 2026-10-26 审计】原 String::new() 初值从不被读——
+        // 改延迟初始化（所有分支恰好赋值一次后使用）。
+        let mask_line;
+        let prio_line;
         // 1) 亲和性：系统可用逻辑核的最低半数（16 线程 → 0xFF；64 位
         //    usize 上限 64 核，更高核数机器只锁低 32 位——防死机目的
         //    是封顶振幅，锁 32 核已远超推理需要）。取「系统掩码里置
@@ -600,11 +602,12 @@ fn main() {
                         eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
                     } else {
                         // 打字保护：组段未闭合等空档（60s 强制兜底）
-                        let mut defer = false;
-                        {
+                        // 【死赋值清扫 2026-10-26 审计】原 false 初值从不被
+                        // 读——改表达式直取。
+                        let defer = {
                             let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                            defer = !h.session.is_idle();
-                        }
+                            !h.session.is_idle()
+                        };
                         if defer {
                             let elapsed_ok = armed_since
                                 .map(|t| t.elapsed().as_secs() < 60)
@@ -2750,7 +2753,8 @@ mod sys_win {
             }
             1
         }
-        EnumWindows(cb as isize, 0);
+        // 【lint 2026-10-26】函数项先转函数指针再转整数（直转告警）。
+        EnumWindows(cb as unsafe extern "system" fn(isize, isize) -> i32 as isize, 0);
         let hwnd = FOUND.load(std::sync::atomic::Ordering::SeqCst);
         if hwnd == 0 {
             return false;

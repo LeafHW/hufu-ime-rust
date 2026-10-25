@@ -1081,9 +1081,10 @@ impl Engine {
                 if !composing {
                     return None;
                 }
-                let idx = (session.page
-                    * self.config.candidates.page_size.max(1))
-                    .min(session.candidates.len().saturating_sub(1));
+                // 【顶字页基准 2026-10-26 审计】与空格/标点顶字/Shift 顶屏
+                // 同口径：顶 session.selected（翻页跟随/↑↓ 高亮后的当前项），
+                // 原实现恒取页首项，高亮移走后 top 上屏项与预览不一致。
+                let idx = self.top_commit_base(session);
                 let pick = session.candidates.get(idx).cloned()?;
                 let (mut text, back) = self.resolve_commit_pair(&pick.commit_text().to_string());
                 if text.starts_with('{') {
@@ -3041,7 +3042,7 @@ impl Engine {
         }
         fp.push('\u{1}');
         fp.push_str(&self.schema.dict.entries.len().to_string());
-        let mut guard = self.supp_hold.lock().unwrap();
+        let mut guard = self.supp_hold.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((old_fp, _, pairs)) = guard.as_ref() {
             if *old_fp == fp {
                 return pairs.clone();
@@ -3092,7 +3093,7 @@ impl Engine {
             return false;
         }
         let _ = self.supp_pairs(); // 确保缓存已按当前指纹构建
-        let guard = self.supp_hold.lock().unwrap();
+        let guard = self.supp_hold.lock().unwrap_or_else(|p| p.into_inner());
         let Some((_, codes, _)) = guard.as_ref() else {
             return false;
         };
@@ -3226,9 +3227,17 @@ impl Engine {
         // 线（原硬编码 0.999）。HUFU_EARLY_STRONG_SHARE 可调（bench 探
         // 索用）：线上调→更多提案落入普通通道、按 early_need 多等——
         // 上屏更稀但每次攒字更多。
-        let strong_line = std::env::var("HUFU_EARLY_STRONG_SHARE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
+        // 【性能 2026-10-26 审计】env 读取 OnceLock 化（bench 环境变量进
+        // 程内不变；Windows env::var 是环境块线性扫描+分配，原实现每键
+        // 最多 5-7 次裸调）。config 回落值仍逐键直读（热更新语义不变）。
+        static STRONG_SHARE_ENV: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        let strong_line = STRONG_SHARE_ENV
+            .get_or_init(|| {
+                std::env::var("HUFU_EARLY_STRONG_SHARE")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .clone()
             .unwrap_or(0.999);
         session.early_history.push(EarlyHistory {
             proposal: proposal.clone(),
@@ -3263,13 +3272,24 @@ impl Engine {
         // 【2026-09-06 热更新修复】原 OnceLock 缓存导致设置页切换上屏节奏
         // 预设后引擎仍用旧值（进程内只读一次 config）。改为逐键直读：
         // config 每键访问 + env::var 微秒级，early_commit 每键一次可忽略。
-        let need_k = std::env::var("HUFU_EARLY_NEED")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        // 【性能 2026-10-26 审计】同上：env 一次定型，config 逐键直读。
+        static NEED_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        static STRONG_NEED_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let need_k = NEED_ENV
+            .get_or_init(|| {
+                std::env::var("HUFU_EARLY_NEED")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .clone()
             .unwrap_or(self.config.sentence.early_need);
-        let strong_k = std::env::var("HUFU_EARLY_STRONG_NEED")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        let strong_k = STRONG_NEED_ENV
+            .get_or_init(|| {
+                std::env::var("HUFU_EARLY_STRONG_NEED")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .clone()
             .unwrap_or(need_k);
         let cur_strong = session.early_history.last().map(|e| e.strong).unwrap_or(false);
         // 【六十六修·残码水位线】用户拍板算法：残算编码（live raw）>10
@@ -3312,9 +3332,15 @@ impl Engine {
         //   2 = 最后 2 键提案的公共前缀（折中：比 3 键窗长、比直出稳）
         // 公共前缀是 46% 上屏率天花板的机制根因（逐键提案分歧把每次
         // 上屏削到 ~1 字）。bench 实验开关，默认 0（产品行为不变）。
-        let stable_mode = std::env::var("HUFU_EARLY_STABLE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+        // 【性能 2026-10-26 审计】env OnceLock 化（同上）。
+        static STABLE_ENV: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let stable_mode = STABLE_ENV
+            .get_or_init(|| {
+                std::env::var("HUFU_EARLY_STABLE")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+            .clone()
             .unwrap_or(0);
         let mut stable = match stable_mode {
             1 => session
@@ -3598,17 +3624,29 @@ impl Engine {
         let fix1_on = !fix1_env && self.config.sentence.early_diverg_guard1;
         let min_delta_guard = if fix1_on { 1 } else { 2 };
         if diverg_guard && !line_end && delta.chars().count() >= min_delta_guard {
-            let diverg_gap = std::env::var("HUFU_EARLY_DIVERG_GAP")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
+            // 【性能 2026-10-26 审计】gap/tail 的 env 覆盖 OnceLock 化（bench
+            // 进程内不变），config 回落逐键直读不变。
+            static GAP_ENV: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+            let diverg_gap = GAP_ENV
+                .get_or_init(|| {
+                    std::env::var("HUFU_EARLY_DIVERG_GAP")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                })
+                .clone()
                 .unwrap_or(self.config.sentence.early_diverg_gap);
             // 【句尾严格护栏 定版 2026-10-22】剩余码 <= tail 时保护圈宽度
             // 回到 8.0（句尾无后续证据可验证，判断容错低）；句中沿用配置
             // gap（可放宽）。tail 取 config sentence.early_diverg_tail，
             // HUFU_EARLY_DIVERG_TAIL 环境变量优先（bench A/B 用）。
-            let tail = std::env::var("HUFU_EARLY_DIVERG_TAIL")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            static TAIL_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            let tail = TAIL_ENV
+                .get_or_init(|| {
+                    std::env::var("HUFU_EARLY_DIVERG_TAIL")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .clone()
                 .unwrap_or(self.config.sentence.early_diverg_tail);
             let diverg_gap = if tail > 0
                 && session.raw.chars().count() <= tail
@@ -3697,7 +3735,12 @@ impl Engine {
                 raw_at < consumed // 分歧起点将被吞掉 → 活候选被毁
             });
             // [DIAG-GV] 护栏诊断：记录本次判定里"跨度内竞争候选"的最小分差
-            if std::env::var("HUFU_GUARD_LOG").map(|v| v == "1").unwrap_or(false) {
+            // 【性能 2026-10-26 审计】开关 OnceLock 化——护栏每次判定都跑，
+            // 原实现每键裸查一次环境变量。
+            static GV_LOG_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *GV_LOG_ENV.get_or_init(|| {
+                std::env::var("HUFU_GUARD_LOG").map(|v| v == "1").unwrap_or(false)
+            }) {
                 let mut min_cg = f64::INFINITY;
                 for h in cands.iter() {
                     let cg = full_leader_conf - h.confidence;
@@ -4574,10 +4617,12 @@ impl Engine {
     /// emoji 一条独立候选**依次追加（1选「手机」2选「📱」3选「📲」
     /// 4选「📱」——表内顺序与重复都保留）。
     fn apply_opencc(&mut self, session: &mut Session) {
-        let cfg = self.config.opencc.clone();
-        if !cfg.enabled && !cfg.emoji {
+        // 【性能 2026-10-26 审计】先判开关再 clone——两开关都关（默认态）
+        // 不再白付一次配置结构克隆。
+        if !self.config.opencc.enabled && !self.config.opencc.emoji {
             return;
         }
+        let cfg = self.config.opencc.clone();
         if cfg.enabled && !self.opencc_loaded {
             let dir = self.data_dir.join("转换词典");
             // 本数据集只有台版单字表 STCharacters_Tu（无标准 STCharacters，缺文件自动跳过）
@@ -4912,14 +4957,8 @@ impl Engine {
     }
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
-    fn apply_rerank(&self, session: &mut Session) {        if session.candidates.is_empty() {
-            return;
-        }
-        let cache = match self.rerank_cache.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        if cache.is_empty() {
+    fn apply_rerank(&self, session: &mut Session) {
+        if session.candidates.is_empty() {
             return;
         }
         let key = format!("{}{}", session.committed_raw, session.raw);
@@ -4930,8 +4969,21 @@ impl Engine {
         if session.rerank_applied_key == key {
             return;
         }
-        let Some(order) = cache.get(&key) else {
-            return;
+        // 【锁域收窄 2026-10-26 审计】缓存锁只保 fetch：原实现持锁贯穿
+        // 全函数（含下方 decode_rich 全量 beam，毫秒级）——server 重排
+        // 线程写同一缓存时会被键线程的长解码反向阻塞。order 克隆（几条
+        // 字符串）后立即放锁。
+        let order: Vec<String> = {
+            let Ok(cache) = self.rerank_cache.lock() else {
+                return;
+            };
+            if cache.is_empty() {
+                return;
+            }
+            match cache.get(&key) {
+                Some(o) => o.clone(),
+                None => return,
+            }
         };
         // 缓存命中即标记（同 key 同 order 的重排结果确定——即使本次
         // 无需换序，后续 poll 也不必重做 decode_rich）

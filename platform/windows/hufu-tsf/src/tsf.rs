@@ -1289,7 +1289,7 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
                     use windows::Win32::UI::WindowsAndMessaging::{
                         SetWindowLongPtrW, GWLP_WNDPROC,
                     };
-                    let new_proc = game_subclass_proc as usize;
+                    let new_proc = game_subclass_proc as *const () as usize;
                     let prev = unsafe { SetWindowLongPtrW(h, GWLP_WNDPROC, new_proc as _) };
                     if prev != 0 {
                         GAME_ORIG_PROC.store(prev as isize, std::sync::atomic::Ordering::SeqCst);
@@ -2591,7 +2591,7 @@ unsafe extern "system" fn caps_ll_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::LRESULT;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     };
@@ -2616,7 +2616,9 @@ unsafe extern "system" fn caps_ll_proc(
                 let tid = CAPS_PUMP_TID.load(std::sync::atomic::Ordering::SeqCst);
                 if tid != 0 {
                     unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                        // 【lint 2026-10-26】fire-and-forget：泵线程不在/
+                        // 已退属既定降级路径，显式丢弃返回值。
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
                             tid,
                             CAPS_WM_VIRT,
                             windows::Win32::Foundation::WPARAM(0),
@@ -2655,7 +2657,7 @@ fn caps_hook_install() {
             let mut hmod = windows::Win32::Foundation::HMODULE(std::ptr::null_mut());
             let _ = GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                windows::core::PCWSTR(caps_ll_proc as usize as *const u16),
+                windows::core::PCWSTR(caps_ll_proc as *const () as usize as *const u16),
                 &mut hmod,
             );
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(caps_ll_proc), hmod, 0) {
@@ -2768,7 +2770,6 @@ fn fg_focus_hwnd() -> windows::Win32::Foundation::HWND {
 /// 仅当前台线程=本线程才记（他进程前台时抢记会把别家窗口错存进
 /// 本线程记忆——跨线程 SetFocus 本就不合法，还挤掉真宿主）。
 pub fn win32_host_focus_remember() {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
     };
@@ -2840,7 +2841,7 @@ pub fn win32_host_focus_restore() -> bool {
         return false;
     }
     trace("cand_interact: Win32 焦点落在候选窗 → SetFocus 回宿主编辑窗");
-    unsafe { SetFocus(target) };
+    let _ = unsafe { SetFocus(target) };
     let after = fg_focus_hwnd();
     !after.0.is_null() && !is_hufu_steal_window(after)
 }
@@ -3567,8 +3568,9 @@ impl HuFuTs_Impl {
                     //（selectN/top/clear/pageup/pagedown）空态不吞
                     //（引擎 run_keymap 回退原行为）。
                     n if g_keymap_act(n).is_some() => true,
-                    // 空闲：编码字母/分号/引号会起段
-                    "space" | "enter" | "escape" | "tab" => false,
+                    // 空闲：编码字母/分号/引号会起段（escape 由上方
+                    // 专臂全权处理——此处列它恒不可达，2026-10-26 审计删）
+                    "space" | "enter" | "tab" => false,
                     _ => false,
                 };
             // 【游戏/非编辑焦点直通 2026-10-05】空闲态预吞（字母/分号/
@@ -5210,7 +5212,7 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) -> OrphanR
         trace("orphan: ACP GetExtent 失败——回落 Shift 路");
     }
     // —— Shift 回落路（原实现）——
-    let Ok(mut range) = selection_range(ctx, ec) else {
+    let Ok(range) = selection_range(ctx, ec) else {
         trace("orphan: 右侧检查无法重建选区——放弃回收");
         return OrphanResult::NotFound;
     };
@@ -5256,7 +5258,7 @@ fn clear_orphan_preedit(ctx: &ITfContext, ec: u32, old_preedit: &str) -> OrphanR
     // 【右侧收编 2026-10-12 二次】杀段后光标在段首——孤儿字母在插入点
     // 【右侧】。同款校验式回收：ShiftEnd 扩选 n 字、GetText 一致才清，
     // 绝不误删。
-    let Ok(mut range2) = selection_range(ctx, ec) else {
+    let Ok(range2) = selection_range(ctx, ec) else {
         trace("orphan: 右侧检查无法重建选区——放弃回收");
         return OrphanResult::NotFound;
     };
@@ -7134,11 +7136,7 @@ impl ITfCompositionSink_Impl for CompSinkObj_Impl {
 }
 
 /// 引擎结果 → 组段与候选窗更新。
-/// 【T4 排查】线程 ID（安全包装）
-fn dbg_tid() -> u32 {
-    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
-}
-
+// 【死代码清扫 2026-10-26 审计】dbg_tid（T4 排查残留，零调用）已删。
 pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Value) -> Result<()> {
     crate::candidate_ui::publish(&state);
     // 【T8 用户铁律·框内永不画编码 2026-10-07 终局】候选框只画候选，
@@ -9025,7 +9023,11 @@ fn game_engine_key(vk: usize) -> Option<bool> {
         crate::ipc::key_request(&name, shift, ctrl, alt, line_end, None)?;
     if consumed {
         crate::tsf::trace(&format!("E7: {name} consumed commit={commit:?}"));
-        update_ui(shared, commit, state);
+        // 【吞错清扫 2026-10-26 审计】E7 路径 update_ui 失败原先无声——
+        // 补一笔 trace（失败=聊天态 UI 不刷新，现场排查需要痕迹）。
+        if let Err(e) = update_ui(shared, commit, state) {
+            crate::tsf::trace(&format!("E7: update_ui 失败 {e:?}"));
+        }
         Some(true)
     } else {
         Some(false)
@@ -9402,9 +9404,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, EnumChildWindows, EnumWindows, GWL_STYLE, GUITHREADINFO,
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowLongW,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
     GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE, IsWindowVisible, KillTimer,
-    RegisterClassW, SetTimer, SM_CYSCREEN, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_POPUP,
+    RegisterClassW, SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_POPUP,
 };
 
 // ═══════════ 游戏键盘保护·定稿 2026-10-06（子类化流派） ═══════════

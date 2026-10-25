@@ -855,15 +855,15 @@ fn open_common() {
             if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
                 && msg.wParam.0 as u16 == 0x09 /* VK_TAB */
             {
-                let foc = unsafe {
+                let foc = 
                     windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
-                };
+                ;
                 // 【编码/选重位对换 2026-10-08】Tab 环与行序同步：
                 // 词→选重位→编码→词（注释「词→编码→选重」同步更正）
                 let order = [ID_WORD, ID_POS, ID_CODE];
                 let cur = order.iter().position(|i| {
                     matches!(
-                        unsafe { GetDlgItem(hwnd, *i) },
+                         GetDlgItem(hwnd, *i) ,
                         Ok(h) if h == foc
                     )
                 });
@@ -872,13 +872,13 @@ fn open_common() {
                     unsafe extern "system" {
                         fn GetKeyState(vkey: i32) -> i16;
                     }
-                    let shift = (unsafe { GetKeyState(0x10) } as u16 & 0x8000) != 0;
+                    let shift = ( GetKeyState(0x10)  as u16 & 0x8000) != 0;
                     let n = order.len();
                     let next = if shift { (c + n - 1) % n } else { (c + 1) % n };
                     if let Ok(h) = GetDlgItem(hwnd, order[next]) {
-                        let _ = unsafe {
+                        let _ = 
                             windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h)
-                        };
+                        ;
                         continue;
                     }
                 }

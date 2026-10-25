@@ -62,18 +62,9 @@ fn main() {
             args.get(3).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
             args.get(4).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
         ),
-        // 【真机重排对比 2026-09-05】逐句输出 v2 口径（整句虎规则）码串：
-        // probe 真机 HTTP 逐键模拟用，保证和 tbench 同打法。
-        "codes" => {
-            let dir = args.get(2).expect("用法: codes <方案目录> <语料>");
-            let corpus = args.get(3).expect("用法: codes <方案目录> <语料>");
-            let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
-            let text = std::fs::read_to_string(corpus).expect("语料读取失败");
-            for s in text.lines().filter(|l| !l.trim().is_empty()) {
-                let raw: String = s.chars().map(|c| real_code_of(&schema, c)).collect::<Vec<_>>().concat();
-                println!("{raw}");
-            }
-        }
+        // 【审计 2026-10-26】旧内联 "codes" 臂（stdout 版）已删——上方
+        // cmd_codes（30 行）先匹配恒胜出，此处原为永不可达死代码（用法
+        // 签名还不一致，两代同堂易误导）。
         _ => {
             println!("hufu-cli 命令：");
             println!("  check   <方案目录>   加载方案并输出统计与样例候选");

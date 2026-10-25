@@ -945,7 +945,7 @@ impl Host {
         // 重排，与真实输入链路不一致。补齐：先应用已到达的重排缓存，
         // 派发在 process_key 之后（与 pipe 同序）。
         self.engine.refresh_rerank(&mut self.session);
-        let outcome = self.engine.process_key(&mut self.session, key);
+        let mut outcome = self.engine.process_key(&mut self.session, key);
         // 跨句文章尾巴：上屏文本滚动进 tail_context（截尾 32 字），
         // 供下一句句首的神经重排作真实语境（空 ctx 时 Qwen 会乱序）。
         if outcome.back > 0 {
@@ -994,14 +994,19 @@ impl Host {
         if self.engine.pending_config_save {
             self.engine.pending_config_save = false;
             let _ = self.engine.config.save(&self.config_path);
-        }        // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
+        }
+        // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
         // 上屏的闪帧（旧候选+高亮=选中项）在 outcome.state 里；此处按
         // clear 后会话重建会把候选清成空，闪帧永远到不了 DLL。非闪帧
         //（consumed/passthrough/普通上屏）outcome.state 与重建结果同值
         //（state() 在键处理末尾构建，此后仅动 tail_context，不入状态）。
+        // 【性能 2026-10-26 审计】clone 改 take——outcome 随后整体序列化，
+        // 原实现 state 在响应 JSON 里重复两份（outcome.state + 顶层
+        // state），且多付一次整棵克隆；DLL/bench 只读顶层 state（全仓
+        // 无 outcome.state 消费方），take 后 wire 减半、克隆归零。
         let state = outcome
             .state
-            .clone()
+            .take()
             .unwrap_or_else(|| self.engine.state(&self.session));
         serde_json::json!({ "outcome": outcome, "state": state })
     }
@@ -1010,7 +1015,7 @@ impl Host {
     /// 语义与数字选重一致（学习、无闪帧）；供 Linux fcitx5 前端点击使用，
     /// Windows 前端不走本入口。尾巴记账与 [`Self::process_key`] 同源。
     pub fn select_candidate(&mut self, index: usize) -> serde_json::Value {
-        let outcome = self.engine.select_candidate(&mut self.session, index);
+        let mut outcome = self.engine.select_candidate(&mut self.session, index);
         if let Some(c) = outcome.commit.as_deref() {
             if !c.is_empty() && c != "{加词}" && c != "{隐藏候选}" && c != "{撤回}" {
                 // 【重复上屏只记文字 2026-10-30 三修】与 process_key 同源：
@@ -1028,9 +1033,10 @@ impl Host {
             }
         }
         self.after_ime_op();
+        // 【性能 2026-10-26 审计】同 process_key：clone 改 take。
         let state = outcome
             .state
-            .clone()
+            .take()
             .unwrap_or_else(|| self.engine.state(&self.session));
         serde_json::json!({ "outcome": outcome, "state": state })
     }
@@ -1085,10 +1091,8 @@ impl Host {
         crate::ssf::list_ssf(&self.data_dir)
     }
 
-    /// 解包 .ssf 到缓存目录（导入/切换校验/管道取用共用的底层）。
-    pub fn unbundle_ssf(&self, path: &Path) -> Result<crate::ssf::SsfBundle, String> {
-        crate::ssf::unbundle(&self.data_dir, path)
-    }
+    // 【死代码清扫 2026-10-26 审计】unbundle_ssf 包装已删（编译器证实
+    /// 零调用；调用方直接走 crate::ssf::unbundle / host.ssf_bundle）。
 
     /// 取可用 .ssf 皮肤包（缓存优先；源缺失时降级用缓存）。
     pub fn ssf_bundle(&self, id: &str) -> Result<crate::ssf::SsfBundle, String> {

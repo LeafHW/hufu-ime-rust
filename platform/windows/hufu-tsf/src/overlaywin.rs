@@ -149,7 +149,7 @@ pub(crate) struct OverlayCfg {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum VAlign {
+pub(crate) enum VAlign {
     Center,
     Top,
     Bottom,
@@ -206,7 +206,7 @@ fn parse_cfg(skin: &Value) -> Option<Arc<OverlayCfg>> {
     let base_height = v
         .get("base_height")
         .and_then(|x| x.as_u64())
-        .map(|n| (n.clamp(16, 2048) as f32))
+        .map(|n| n.clamp(16, 2048) as f32)
         .unwrap_or(240.0);
     let v_align = match v.get("v_align").and_then(|x| x.as_str()) {
         Some("top") => VAlign::Top,
@@ -617,9 +617,8 @@ impl OverlayWin {
         }
     }
 
-    unsafe fn create() -> Option<OverlayWin> {
-        unsafe { Self::create_impl(None) }
-    }
+    // 【死代码清扫 2026-10-26 审计】create（无主入口零调用，建窗一律
+    // 走 create_impl ladder）已删。
 
     unsafe fn create_impl(cand: Option<HWND>) -> Option<OverlayWin> {
         let mut reg_err = 0u32;
@@ -676,7 +675,9 @@ impl OverlayWin {
             (full_ex, HWND(std::ptr::null_mut())),
         ];
         let mut errs = String::new();
-        let mut hit_rung = 0usize;
+        // 【死赋值清扫 2026-10-26 审计】初值 0 从不被读——延迟初始化
+        //（读取只发生在循环内赋值后的同轮）。
+        let hit_rung;
         for (i, (ex_bits, o)) in ladder.iter().enumerate() {
             // rung1 的 owner=0 合法（无主顶层=常规宿主原行为）；仅 cand_self
             // 源无效时跳过 cand 系档（i=2..5；i=6=有意无主兜底不跳）

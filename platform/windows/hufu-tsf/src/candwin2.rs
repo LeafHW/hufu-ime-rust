@@ -508,7 +508,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         }
         // 2) 菜单项（与旧 TrackPopupMenu 版完全同构）
         let pinned_now = CAND_PINNED.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        let mut items: Vec<MenuItem> = vec![
+        let items: Vec<MenuItem> = vec![
             MenuItem { label: "向前移".into(), id: 1, enabled: n > 1 },
             MenuItem { label: "向后移".into(), id: 2, enabled: n < len },
             MenuItem { label: "移到最前".into(), id: 3, enabled: true },
@@ -526,7 +526,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(menu_wndproc),
-            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+            hCursor:  LoadCursorW(None, IDC_ARROW) .unwrap_or_default(),
             lpszClassName: PCWSTR(cls.as_ptr()),
             ..Default::default()
         };
@@ -652,7 +652,6 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
 /// 菜单动作后按响应 state 即时重绘（滚轮缩放同款：锁内 take 参数、
 /// 锁外 show、放回 newer-wins——不碰 update_ui/run_session）。
 unsafe fn cand_menu_refresh(resp: &Value) {
-    unsafe {
         let Some(state) = resp.get("state") else { return };
         let cands: Vec<(String, String)> = state
             .get("candidates")
@@ -721,7 +720,6 @@ unsafe fn cand_menu_refresh(resp: &Value) {
                 (Some(newer), None) => g.cand2 = Some(newer),
             }
         }
-    }
 }
 
 /// 【按住Ctrl调频 2026-11】调频/删词动作后的重绘（cand_menu_refresh
@@ -737,7 +735,6 @@ pub(crate) unsafe fn freq_result_refresh(
     swap: Option<(usize, usize)>,
     del_old: Option<(usize, &[(String, String)])>,
 ) {
-    unsafe {
         let Some(state) = state.get("state") else {
             return;
         };
@@ -824,7 +821,6 @@ pub(crate) unsafe fn freq_result_refresh(
                 (Some(newer), None) => g.cand2 = Some(newer),
             }
         }
-    }
 }
 
 /// cand2 窗口过程：DefWindowProc 转发 + 鼠标消息诊断日志。
@@ -1178,7 +1174,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             return LRESULT(0);
         }
-        0x205 | 0x207 | 0x208 => return LRESULT(0), // 右/中键按下抬起全吞（解锁在右键菜单内）
+        // 【lint 2026-10-26 审计】0x207 已在上方专臂（中键菜单）处理，
+        // 此处列出恒不可达——移除该备选，行为不变。
+        0x205 | 0x208 => return LRESULT(0), // 右/中键抬起全吞（中键上方专臂）
         // 【三十六修·死块删除】WM_NCHITTEST（0x84）已在 wndproc 头部
         //（HTCLIENT 强制整窗命中，QQ 按钮消息实测教训）无条件 return，
         // 此臂自那时起不可达——其「余量区 HTTRANSPARENT 穿透」设计与
@@ -1231,7 +1229,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
                     // 【SSF】帧钟随藏同杀
                     let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
-                    unsafe { rawinput_listen(hwnd, false) };
+                     rawinput_listen(hwnd, false) ;
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 return LRESULT(0);
@@ -1278,7 +1276,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let _ = KillTimer(hwnd, IME_WATCHDOG_TIMER_ID);
                 // 【SSF】帧钟随藏同杀
                 let _ = KillTimer(hwnd, crate::ssfwin::SSF_TIMER_ID);
-                unsafe { rawinput_listen(hwnd, false) };
+                 rawinput_listen(hwnd, false) ;
                 // 【贴图挂件 2026-10-02】候选窗收 → 兄弟贴图窗随收
                 crate::overlaywin::hide_for(hwnd);
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1294,7 +1292,6 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         }
         // 【六十修】冲销请求：转投消息泵执行（回调内同步会话会被拒）
         WM_APP_IME_SWITCH => {
-            unsafe {
                 let shared = if crate::tsf::addword_tl_thread() {
                     crate::tsf::tl_shared()
                 } else {
@@ -1304,7 +1301,6 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     crate::tsf::trace("imeswitch: 消息泵执行冲销");
                     crate::tsf::ime_switch_abort(&shared);
                 }
-            }
             return LRESULT(0);
         }
         // 【六十修·三层】Raw Input 全局键流：物理按键不经路由直达。
@@ -1469,7 +1465,9 @@ pub(crate) fn layout_f(v: &Value, key: &str, default: f32) -> f32 {
 /// .ssf 运行态（窗口级，跨帧）：解码帧流（进程缓存 Arc）+ 帧钟 + 每窗
 /// D2D 设备位图缓存（帧号没变零重建）+ 换装键。
 pub(crate) struct SsfRuntime {
-    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    // 【死代码清扫 2026-10-26 审计】spec 字段写不读已删——所有消费方
+    // 以 `SsfRuntime { bitmap, clock, device, rasters, .. }` 解构，
+    // 渲染用的 spec 来自 SsfFrame（每帧随 clone 传递）。
     pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
     pub(crate) clock: crate::ssfwin::SsfFrameClock,
     pub(crate) device: Option<crate::ssfwin::SsfDeviceBitmap>,
@@ -1734,7 +1732,6 @@ impl CandidateWindowV2 {
                 scale,
             ));
             *rt = Some(SsfRuntime {
-                spec: spec.clone(),
                 bitmap: bitmap.clone(),
                 clock: crate::ssfwin::SsfFrameClock::new(),
                 device: None,
@@ -3532,9 +3529,7 @@ impl CandidateWindowV2 {
                         crate::tsf::diag_note("动效: 高亮滑动起臂");
                         self.hl_anim
                             .set(Some((fr, std::time::Instant::now(), self.hl_ms)));
-                        unsafe {
                             anim_tick_arm(self.hwnd);
-                        }
                     }
                 } else {
                     // 同位（常规逐键刷新/闪帧尾段二次渲染）：不动在身滑动
@@ -4048,7 +4043,7 @@ impl CandidateWindowV2 {
                     }
                 };
             let dy;
-            let mut dy_first;
+            let dy_first;
             let dy_key = (font_face.clone(), font_pt, k_first, k_rest);
             // 【SSF 虎娘行槽】源域行高测量：虎娘 row=ceil(max(字号,
             // "中Mg"行高))（layoutSkin L19-20）。此处用当前 tf（用户
@@ -4581,9 +4576,7 @@ impl CandidateWindowV2 {
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
                 crate::tsf::diag_note(&format!("cw2 尺寸起臂: {cur:?}→{target:?} dur={dur}"));
-                unsafe {
                     anim_tick_arm(self.hwnd);
-                }
             } else {
                 self.size_anim = None;
                 self.chrome_override.set(None);
@@ -5068,10 +5061,9 @@ impl CandidateWindowV2 {
                             // 源画布 px→屏幕物理 px 总系数（等比 scale ×
                             // dpi）——Profile E 预过滤的降采样比。
                             let phys_scale = f.scale * dpi_scale;
-                            if let Ok(bmp) = unsafe {
+                            if let Ok(bmp) = 
                                 crate::ssfwin::device_bitmap(&ctx, bitmap, idx, phys_scale, device, rasters)
-                            } {
-                                unsafe {
+                             {
                                     crate::ssfwin::draw_nineslice(
                                         &ctx,
                                         bmp,
@@ -5088,7 +5080,6 @@ impl CandidateWindowV2 {
                                         dpi_scale,
                                         f.scale,
                                     );
-                                }
                             }
                         }
                     }
@@ -6047,7 +6038,6 @@ impl CandidateWindowV2 {
                         if wq > 0 && hq > 0 {
                             use windows::Win32::Graphics::Direct2D::{
                                 D2D1_BITMAP_OPTIONS, D2D1_BITMAP_PROPERTIES1,
-                                ID2D1Bitmap,
                             };
                             let props = D2D1_BITMAP_PROPERTIES1 {
                                 pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
@@ -6309,7 +6299,6 @@ impl CandidateWindowV2 {
                                 rc_caret: RECT::default(),
                             };
                             let mut out = None;
-                            unsafe {
                                 if GetGUIThreadInfo(0, &mut gi) != 0 && !gi.hwnd_focus.0.is_null() {
                                     // 【T8 自我对齐死循环 2026-10-07 终局】右键
                                     // 菜单抢焦点期间，焦点窗=**本候选窗自身**
@@ -6351,7 +6340,6 @@ impl CandidateWindowV2 {
                                         }
                                     }
                                 }
-                             }
                             out
                         };
                         let x_base = small_edit_x.unwrap_or(caret_x);
@@ -6456,14 +6444,14 @@ impl CandidateWindowV2 {
                         // ±一行 ≈30px），被下方这套锯齿锁当 −14~−24px
                         // 噪声攒住不放行、攒到门槛再整体放=Y 底边先陷
                         // 进光标行、滞后跳回（QQ「候选最左没定下来」
-                        /// 抖动实锤）。分解：锁的对象改为**锚行**——
-                        /// d锚=dy总+Δh（sticky_h 与 sticky_pos 同帧记录）；
-                        /// 锚行不动+h 变化 ⇒ d锚=0 ⇒ 钉住时也按新 h
-                        /// 重算 y（y=oy+prev_h−h：锚行恒定、窗沿锚行
-                        /// 即时生长，零滞后零跳变）。下方模式 y=below
-                        /// 与 h 无关，原语义不变。跨模式帧（下→上）d锚
-                        /// 必 ≥ 行高+8+旧窗高 >26px 恒放行，重建分支
-                        /// 不会拿 below 旧值误算。
+                        // 抖动实锤）。分解：锁的对象改为**锚行**——
+                        // d锚=dy总+Δh（sticky_h 与 sticky_pos 同帧记录）；
+                        // 锚行不动+h 变化 ⇒ d锚=0 ⇒ 钉住时也按新 h
+                        // 重算 y（y=oy+prev_h−h：锚行恒定、窗沿锚行
+                        // 即时生长，零滞后零跳变）。下方模式 y=below
+                        // 与 h 无关，原语义不变。跨模式帧（下→上）d锚
+                        // 必 ≥ 行高+8+旧窗高 >26px 恒放行，重建分支
+                        // 不会拿 below 旧值误算。
                         let prev_h = self.sticky_h.get();
                         let dy_lock = (y - match self.sticky_pos {
                             Some((_, oy)) => oy,
@@ -7112,16 +7100,16 @@ impl CandidateWindowV2 {
                 };
                 // 【上翻底边钉锚 2026-11】上翻模式锚定边=底边（QQ 屏底
                 // 聊天输入条：候选恒翻到光标上方）。形变期间窗高插值
-                ///（apply.1）与 y 滑坡（pos_anim/chase）两路异步叠加：
-                /// 底边=py+apply.1 先下探进光标行再收回=肉眼可见的
-                /// 回弹（用户实锤：连续数字重选，窗高每步 ±一行，
-                /// 「候选最左没定下来的感觉」）。形变期改「底边恒钉
-                /// 终态底边」：py=ty+h_out−apply.1——增高帧（零位移轴
-                /// apply≡目标）py 直落 ty 无滑坡；收矮帧 py 随缓动
-                /// 同步上移；底边全程恒定、窗只贴着锚行生长。x 轴照
-                /// 常滑坡；非形变帧 apply≡目标 ⇒ py=ty 纯等式零差异；
-                /// 下方模式（顶边锚定）不受影响。tick 复渲帧（锚缺失）
-                /// 沿用 above_flip_last + 本公式，两端一致。
+                //（apply.1）与 y 滑坡（pos_anim/chase）两路异步叠加：
+                // 底边=py+apply.1 先下探进光标行再收回=肉眼可见的
+                // 回弹（用户实锤：连续数字重选，窗高每步 ±一行，
+                // 「候选最左没定下来的感觉」）。形变期改「底边恒钉
+                // 终态底边」：py=ty+h_out−apply.1——增高帧（零位移轴
+                // apply≡目标）py 直落 ty 无滑坡；收矮帧 py 随缓动
+                // 同步上移；底边全程恒定、窗只贴着锚行生长。x 轴照
+                // 常滑坡；非形变帧 apply≡目标 ⇒ py=ty 纯等式零差异；
+                // 下方模式（顶边锚定）不受影响。tick 复渲帧（锚缺失）
+                // 沿用 above_flip_last + 本公式，两端一致。
                 let py = if self.above_flip_last.get() && self.size_anim.is_some() {
                     (ty + h_out as i32) - apply.1
                 } else {

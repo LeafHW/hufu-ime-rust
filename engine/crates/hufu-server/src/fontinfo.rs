@@ -1,196 +1,14 @@
-//! 【字体族解析 + 私用字体装载 2026-10-08】设置页「候选字体」下拉
-//! 数据源 + 各渲染端（server GDI 预览）私用字体装载。
+//! 【字体族枚举 + 样张预览 2026-10-08】设置页「候选字体」下拉的系统
+//! 字体段（GDI GB2312 族名枚举）与选中即时预览样张（GDI 渲 BMP）。
 //!
-//! 背景：此前「字体」设置是自由文本框——用户把 Plangothic.ttc 放进
-//! 数据\字体\ 后照网上查的族名「遍黑体P1」填进去并不生效：渲染端
-//! （DLL DWrite / server GDI）从未装载过该文件夹里的字体文件，族名
-//! 对不上就静默回退雅黑。本轮改造：字体文件夹成为一等公民——
-//! server 扫描解析真名族名（TTC 多族全列）供下拉选择，并把文件以
-//! AddFontResourceExW(FR_PRIVATE) 装进本进程（GDI 按族名即得）；
-//! DLL 侧各自装载（candwin2 走 DWrite 私有字体集，addword 走 GDI）。
-//!
-//! 解析：最小 sfnt name 表读取（无需外部 crate）——ID16（版式族名，
-//! 多字重族的规范名）优先，回退 ID1；Windows 平台（3）UTF-16BE 优先，
-//! Mac（1）按 latin1 近似兜底。TTC（ttcf）逐子字体各取一族。
+//! 【死代码清扫 2026-10-26 审计】原「私用字体装载 + sfnt 族名解析」链
+//!（ensure_private_gdi_fonts / scan / families / sfnt_family / font_dirs /
+//! gdi_list_families / AddFontResourceExW 装载）在生产二进制零调用——
+//! 文件夹字体的装载与族名解析已在 DLL 侧各自实现（candwin2 走 DWrite
+//! 私有字体集、addword 走 GDI），server 侧只剩「枚举 + 预览」两职。
+//! 整链连同其诊断测试一并删除（编译器 never-used 警告为证）。
 
-use std::path::{Path, PathBuf};
-
-fn u16be(b: &[u8], i: usize) -> Option<u16> {
-    Some(((*b.get(i)? as u16) << 8) | *b.get(i + 1)? as u16)
-}
-
-fn u32be(b: &[u8], i: usize) -> Option<u32> {
-    Some((u16be(b, i)? as u32) << 16 | u16be(b, i + 2)? as u32)
-}
-
-/// name 表记录值：平台 3/0（UTF-16BE）；平台 1（Mac Roman 按 latin1）。
-fn name_string(b: &[u8], base: usize, off: usize, len: usize, platform: u16) -> Option<String> {
-    let s = b.get(base + off..base + off + len)?;
-    if platform == 3 || platform == 0 {
-        let units: Vec<u16> = s
-            .chunks_exact(2)
-            .map(|c| ((c[0] as u16) << 8) | c[1] as u16)
-            .collect();
-        String::from_utf16(&units).ok()
-    } else {
-        Some(s.iter().map(|&c| c as char).collect())
-    }
-}
-
-/// 单个 sfnt 的最优族名：ID16+zh > ID16 > ID1+zh > ID1。
-/// base = sfnt 起始字节偏移（TTC 子字体在文件内；表目录偏移一律
-/// 相对文件头而非子字体头——Plangothic.ttc 实测：glyf 恰在
-/// 子字体目录末尾、DSIG 末尾恰抵下一子字体偏移，按子字体头算则
-/// 全部越位错读）。
-fn sfnt_family(b: &[u8], base: usize) -> Option<String> {
-    let nt = u16be(b, base + 4)? as usize;
-    // 表记录 @base+12：tag(4) checksum(4) offset(4) length(4)——offset
-    // 相对文件头
-    let mut name_at = None;
-    for i in 0..nt {
-        let rec = base + 12 + i * 16;
-        if b.get(rec..rec + 4) == Some(b"name") {
-            name_at = u32be(b, rec + 8).map(|v| v as usize);
-        }
-    }
-    let na = name_at?;
-    let count = u16be(b, na + 2)? as usize;
-    let sto = u16be(b, na + 4)? as usize + na;
-    let mut best: Option<(u8, String)> = None;
-    for i in 0..count {
-        let rec = na + 6 + i * 12;
-        let (Some(plat), Some(_enc), Some(lang), Some(nid), Some(len), Some(off)) = (
-            u16be(b, rec),
-            u16be(b, rec + 2),
-            u16be(b, rec + 4),
-            u16be(b, rec + 6),
-            u16be(b, rec + 8),
-            u16be(b, rec + 10),
-        ) else {
-            continue;
-        };
-        if nid != 16 && nid != 1 {
-            continue;
-        }
-        if !(plat == 3 || plat == 0 || plat == 1) {
-            continue;
-        }
-        // zh-CN=0x0804（简中字体最常见），en=0x0409，其余语言次之
-        let rank = match (nid, lang) {
-            (16, 0x0804) => 0,
-            (16, 0x0409) => 1,
-            (16, _) => 2,
-            (1, 0x0804) => 3,
-            (1, 0x0409) => 4,
-            _ => 5,
-        };
-        if best.as_ref().is_some_and(|(r, _)| *r <= rank) {
-            continue;
-        }
-        if let Some(s) = name_string(b, sto, off as usize, len as usize, plat) {
-            if !s.is_empty() && s.len() < 128 {
-                best = Some((rank, s));
-            }
-        }
-    }
-    best.map(|(_, s)| s)
-}
-
-/// 字体文件字节 → 族名列表（TTF/OTF 一族；TTC 每子字体一族，去重）。
-pub fn families(bytes: &[u8]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if bytes.len() < 12 {
-        return out;
-    }
-    if &bytes[..4] == b"ttcf" {
-        if let Some(n) = u32be(bytes, 8) {
-            for i in 0..n.min(64) as usize {
-                if let Some(off) = u32be(bytes, 12 + i * 4).map(|v| v as usize) {
-                    if bytes.get(off..off + 4).is_some() {
-                        if let Some(f) = sfnt_family(bytes, off) {
-                            if !out.contains(&f) {
-                                out.push(f);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else if let Some(f) = sfnt_family(bytes, 0) {
-        out.push(f);
-    }
-    out
-}
-
-/// 字体目录扫描 → (文件名, 族名) 列表（按文件名+族名稳定排序）。
-/// 坏文件/不可解析跳过；目录不存在返回空。
-pub fn scan(dir: &Path) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    let mut files: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            matches!(
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .as_deref(),
-                Some("ttf") | Some("ttc") | Some("otf")
-            )
-        })
-        .collect();
-    files.sort();
-    for p in files {
-        if let Ok(bytes) = std::fs::read(&p) {
-            for fam in families(&bytes) {
-                let file = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                out.push((file, fam));
-            }
-        }
-    }
-    out
-}
-
-/// 字体目录两处候选（与 Engine::resolve_data_sub 同序：安装根一级
-/// 优先，数据\ 内回退——两处都扫，合并去重）。
-pub fn font_dirs(data_dir: &Path) -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Some(root) = data_dir.parent() {
-        let p = root.join("字体");
-        if p.is_dir() {
-            v.push(p);
-        }
-    }
-    let p = data_dir.join("字体");
-    if p.is_dir() {
-        v.push(p);
-    }
-    v
-}
-
-// ── 私用字体装载（GDI）──
-
-#[cfg(windows)]
-#[link(name = "gdi32")]
-extern "system" {
-    fn AddFontResourceExW(file: *const u16, fl: u32, pdv: *const core::ffi::c_void) -> i32;
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetLastError() -> u32;
-}
-
-// ── GDI 族名枚举探针（找 AddFontResourceExW 装入后 GDI 眼中的真名）──
+// ── GDI 族名枚举（设置页字体下拉的系统字体段）──
 
 #[cfg(windows)]
 #[repr(C)]
@@ -266,26 +84,6 @@ unsafe extern "system" fn enum_font_cb(
     1 // 继续枚举
 }
 
-/// 枚举本进程 GDI 字体表全部族名（装私字体后调用——看 GDI 真名）。
-#[cfg(windows)]
-pub fn gdi_list_families() -> Vec<String> {
-    unsafe {
-        let dc = CreateCompatibleDC(std::ptr::null());
-        if dc.is_null() {
-            return Vec::new();
-        }
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfCharSet = 1; // DEFAULT_CHARSET=全表
-        let mut out: Vec<String> = Vec::new();
-        let lp = &mut out as *mut Vec<String> as isize;
-        let _ = EnumFontFamiliesExW(dc, &lf, Some(enum_font_cb), lp, 0);
-        let _ = DeleteDC(dc);
-        out.sort();
-        out.dedup();
-        out
-    }
-}
-
 /// 枚举**支持简体中文（GB2312=134）**的族名——设置页字体下拉的
 /// 系统字体段（楷体/仿宋/黑体/雅黑/已安装的霞鹜…）。charset 过滤
 /// 天然排除纯拉丁字体与未声明 936 的文件夹字体（不会与文件夹段
@@ -293,15 +91,15 @@ pub fn gdi_list_families() -> Vec<String> {
 #[cfg(windows)]
 pub fn gdi_list_families_gb() -> Vec<String> {
     unsafe {
-        let dc = CreateCompatibleDC(std::ptr::null());
-        if dc.is_null() {
+        let dc = CreateCompatibleDC(0);
+        if dc == 0 {
             return Vec::new();
         }
         let mut lf: LOGFONTW = std::mem::zeroed();
         lf.lfCharSet = 134; // GB2312
         let mut out: Vec<String> = Vec::new();
         let lp = &mut out as *mut Vec<String> as isize;
-        let _ = EnumFontFamiliesExW(dc, &lf, Some(enum_font_cb), lp, 0);
+        let _ = EnumFontFamiliesExW(dc as *mut _, &lf, Some(enum_font_cb), lp, 0);
         let _ = DeleteDC(dc);
         out.sort();
         out.dedup();
@@ -311,59 +109,11 @@ pub fn gdi_list_families_gb() -> Vec<String> {
     }
 }
 
-/// 进程内一次性装载（FR_PRIVATE=0x10：进程私有，进程退出自动释放，
-/// 不污染系统字体表）。失败静默跳过（族名解析/渲染自会回退）。
-static GDI_FONTS_ONCE: std::sync::Once = std::sync::Once::new();
-
-pub fn ensure_private_gdi_fonts(dirs: &[PathBuf]) {
-    GDI_FONTS_ONCE.call_once(|| {
-        for d in dirs {
-            let Ok(rd) = std::fs::read_dir(d) else {
-                continue;
-            };
-            let mut files: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    matches!(
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| e.to_ascii_lowercase())
-                            .as_deref(),
-                        Some("ttf") | Some("ttc") | Some("otf")
-                    )
-                })
-                .collect();
-            files.sort();
-            for p in files {
-                #[cfg(windows)]
-                unsafe {
-                    use std::os::windows::ffi::OsStrExt;
-                    let w: Vec<u16> =
-                        p.as_os_str().encode_wide().chain([0]).collect();
-                    // 32MB 级 TTC（如 Plangothic）装载耗秒级但只此一次
-                    let n = AddFontResourceExW(w.as_ptr(), 0x10, std::ptr::null());
-                    if n == 0 || std::env::var("HUFU_FONT_DEBUG").is_ok() {
-                        eprintln!(
-                            "privgdi: {:?} AddFontResourceExW={} err={}",
-                            p,
-                            n,
-                            GetLastError()
-                        );
-                    }
-                }
-                #[cfg(not(windows))]
-                let _ = p;
-            }
-        }
-    });
-}
-
 // ── 字体预览渲染（GDI，设置页字体下拉即时预览图 2026-10-09）──
 //
 // 「字体有什么区别」眼见为实：选中即渲一张该族名的样张（BMP）。
-// 前提 ensure_private_gdi_fonts 已装载（server 启动即做），文件夹字体
-// 按族名直出；系统字体（雅黑/霞鹜…）族名本来就在 GDI 表里，同路渲染。
+// 族名不匹配时 GDI 静默回退（系统默认体）——与真实候选窗回退行为
+// 一致，预览所见即渲染所得（GetTextFaceW 探针会把回退现形打日志）。
 
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -399,14 +149,16 @@ struct RECT {
 
 #[cfg(windows)]
 #[link(name = "gdi32")]
+// 【lint 2026-10-26 审计】签名与 candwin/tray 的既有声明对齐（isize
+// 句柄风格）——rustc 1.98 跨模块同名 extern 签名不一致会告警。
 extern "system" {
-    fn CreateCompatibleDC(hdc: *const core::ffi::c_void) -> *mut core::ffi::c_void;
-    fn DeleteDC(hdc: *mut core::ffi::c_void) -> i32;
+    fn CreateCompatibleDC(hdc: isize) -> isize;
+    fn DeleteDC(hdc: isize) -> i32;
     fn CreateFontW(
         h: i32,
         w: i32,
         esc: i32,
-        ori: i32,
+        orient: i32,
         weight: i32,
         italic: u32,
         underline: u32,
@@ -415,22 +167,21 @@ extern "system" {
         outprec: u32,
         clipprec: u32,
         quality: u32,
-        pitchfamily: u32,
+        pitch: u32,
         face: *const u16,
-    ) -> *mut core::ffi::c_void;
-    fn SelectObject(hdc: *mut core::ffi::c_void, h: *mut core::ffi::c_void)
-        -> *mut core::ffi::c_void;
-    fn DeleteObject(h: *mut core::ffi::c_void) -> i32;
-    fn SetBkMode(hdc: *mut core::ffi::c_void, mode: i32) -> i32;
-    fn SetTextColor(hdc: *mut core::ffi::c_void, color: u32) -> u32;
+    ) -> isize;
+    fn SelectObject(hdc: isize, o: isize) -> isize;
+    fn DeleteObject(o: isize) -> i32;
+    fn SetBkMode(hdc: isize, mode: i32) -> i32;
+    fn SetTextColor(hdc: isize, color: u32) -> u32;
     fn CreateDIBSection(
-        hdc: *mut core::ffi::c_void,
+        hdc: isize,
         bmi: *const BITMAPINFO,
         usage: u32,
         bits: *mut *mut core::ffi::c_void,
-        hsection: *const core::ffi::c_void,
+        section: isize,
         offset: u32,
-    ) -> *mut core::ffi::c_void;
+    ) -> isize;
     fn GdiFlush() -> i32;
 }
 
@@ -490,20 +241,13 @@ pub fn render_font_preview_bmp(family: &str, sample: &str) -> Option<Vec<u8>> {
             bmiColors: [0],
         };
 
-        let dc = CreateCompatibleDC(std::ptr::null());
-        if dc.is_null() {
+        let dc = CreateCompatibleDC(0);
+        if dc == 0 {
             return None;
         }
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(
-            dc,
-            &bmi,
-            0, // DIB_RGB_COLORS
-            &mut bits,
-            std::ptr::null(),
-            0,
-        );
-        if dib.is_null() {
+        let dib = CreateDIBSection(dc, &bmi, 0, &mut bits, 0, 0);
+        if dib == 0 {
             let _ = DeleteDC(dc);
             return None;
         }
@@ -536,7 +280,7 @@ pub fn render_font_preview_bmp(family: &str, sample: &str) -> Option<Vec<u8>> {
             0,
             face.as_ptr(),
         );
-        if font.is_null() {
+        if font == 0 {
             let _ = SelectObject(dc, old_bmp);
             let _ = DeleteObject(dib);
             let _ = DeleteDC(dc);
@@ -547,7 +291,7 @@ pub fn render_font_preview_bmp(family: &str, sample: &str) -> Option<Vec<u8>> {
         // 映射默认体——GetTextFaceW 读实际选中的族名（装载失败/名字不
         // 对时这里会现原形）。
         let mut face_buf = [0u16; 64];
-        let n = GetTextFaceW(dc, 64, face_buf.as_mut_ptr());
+        let n = GetTextFaceW(dc as *mut _, 64, face_buf.as_mut_ptr());
         let actual_face = String::from_utf16_lossy(&face_buf[..n.max(0) as usize]);
         if actual_face != family {
             eprintln!("fontpreview: 请求「{family}」实际 GDI 映射到「{actual_face}」");
@@ -562,7 +306,13 @@ pub fn render_font_preview_bmp(family: &str, sample: &str) -> Option<Vec<u8>> {
             bottom: H - 6,
         };
         // DT_SINGLELINE|DT_VCENTER|DT_LEFT = 0x25
-        let _ = DrawTextW(dc, txt.as_ptr(), txt.len() as i32, &mut rc as *mut RECT, 0x25);
+        let _ = DrawTextW(
+            dc as *mut _,
+            txt.as_ptr(),
+            txt.len() as i32,
+            &mut rc as *mut RECT,
+            0x25,
+        );
         let _ = GdiFlush();
 
         // 【像素先拷再释放】DIB 内存归 DeleteObject(dib) 管——必须在
@@ -602,38 +352,18 @@ pub fn render_font_preview_bmp(family: &str, sample: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// 【样张自验 2026-10-09】三个族名各渲染一张 BMP 落 tmp-test，
-    /// 供像素比对（宋体/黑体字形必须两两不同；失败即 GDI 静默回退）。
+    /// 【样张自验 2026-10-09】两个系统族名各渲染一张 BMP，供像素比对
+    ///（宋体/黑体字形必须两两不同；失败即 GDI 静默回退）。
+    /// 【死代码清扫 2026-10-26】私字体装载链删除后不再装文件夹字体，
+    /// 只验系统字体段。
     #[test]
     #[cfg(windows)]
     fn preview_bmp_renders() {
-        // 直接用已部署字体文件夹（与生产同源）；不存在则只验系统字体。
-        let mut deployed: Vec<std::path::PathBuf> = [
-            r"D:\HUFU\HuFu虎符输入法-v1.7.3-无模型\字体",
-            r"D:\HUFU\HuFu虎符输入法-v1.7.3-无模型\数据\字体",
-        ]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .collect();
-        if deployed.is_empty() {
-            deployed.push(std::path::PathBuf::from("."));
-        }
-        // ⚠ Once 单次语义：必须一次传全部目录（曾逐目录调用——首次空
-        // 目录吞掉 Once，真目录被跳过，GDI 没装上字体。生产 main.rs
-        // 本就全目录一次调，无此问题）。
-        ensure_private_gdi_fonts(&deployed);
         let out = std::path::PathBuf::from(r"E:\DSH-KF\tmp-test");
         let _ = std::fs::create_dir_all(&out);
-        for (tag, fam) in [
-            ("yahei", "Microsoft YaHei"),
-            ("pianhei", "遍黑体P1"),
-            ("mincho", "文津宋体 第3平面"),
-        ] {
+        for (tag, fam) in [("yahei", "Microsoft YaHei"), ("simhei", "SimHei")] {
             eprintln!("fontpreview-test: {tag} 请求族名「{fam}」");
-            match render_font_preview_bmp(fam, "永国专虎符 Aa01") {
+            match super::render_font_preview_bmp(fam, "永国专虎符 Aa01") {
                 Some(b) => {
                     assert!(b.starts_with(b"BM"), "{fam} 非 BMP");
                     assert!(b.len() > 10_000, "{fam} 样张过小 {}", b.len());
@@ -642,51 +372,5 @@ mod tests {
                 None => panic!("{fam} 渲染失败"),
             }
         }
-    }
-
-    /// 内嵌最小 sfnt（name 表 ID16 zh-CN）验证解析路径。
-    #[test]
-    fn parse_minimal_sfnt() {
-        // name 表：format=0 count=1 stringOffset=18（=6 头+1 条记录 12）
-        let mut name = Vec::new();
-        name.extend_from_slice(&0u16.to_be_bytes());
-        name.extend_from_slice(&1u16.to_be_bytes());
-        name.extend_from_slice(&18u16.to_be_bytes());
-        // 记录：plat=3 enc=1 lang=0x804 id=16 len=4 off=0
-        //（「测试」2 个 UTF-16 码元 = 4 字节）
-        name.extend_from_slice(&3u16.to_be_bytes());
-        name.extend_from_slice(&1u16.to_be_bytes());
-        name.extend_from_slice(&0x0804u16.to_be_bytes());
-        name.extend_from_slice(&16u16.to_be_bytes());
-        name.extend_from_slice(&4u16.to_be_bytes());
-        name.extend_from_slice(&0u16.to_be_bytes());
-        // 「测试」UTF-16BE
-        let s = "测试".encode_utf16().collect::<Vec<_>>();
-        for u in s {
-            name.extend_from_slice(&u.to_be_bytes());
-        }
-        // header: sfntVersion(4) numTables(2) searchRange..(6)
-        let mut b = vec![0u8; 12];
-        b[4..6].copy_from_slice(&1u16.to_be_bytes());
-        // name 表记录（16 字节）：tag(4) checksum(4) offset(4) length(4)——
-        // name 表紧随其后 @28
-        let mut rec = vec![0u8; 16];
-        rec[0..4].copy_from_slice(b"name");
-        rec[8..12].copy_from_slice(&28u32.to_be_bytes());
-        rec[12..16].copy_from_slice(&(name.len() as u32).to_be_bytes());
-        b.extend_from_slice(&rec);
-        b.extend_from_slice(&name);
-        assert_eq!(families(&b), vec!["测试".to_string()]);
-    }
-
-    /// 真机文件冒烟（Plangothic.ttc 存在才跑）：cargo test -p hufu-server
-    /// fontinfo -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn plangothic_real() {
-        let d = PathBuf::from(r"E:\DSH-KF\tmp-test\fontdata\字体");
-        let v = scan(&d);
-        eprintln!("scan = {v:?}");
-        assert!(!v.is_empty(), "Plangothic 未解析出族名");
     }
 }

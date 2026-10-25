@@ -18,7 +18,10 @@
 use crate::common::Out;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// 【lint 2026-10-26】PathBuf 仅测试消费。
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// 参数容器（来自 main.rs 的子命令解析）。
 pub struct Args<'a> {

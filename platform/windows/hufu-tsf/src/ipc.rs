@@ -76,34 +76,35 @@ impl SpawnBlock {
 /// 【公开 2026-10-08】fontinfo 侧（lib.rs find_font_files）解析字体目录
 /// 也用它——SystemIME 副本 DLL 的自身路径不在安装根，必须走注册表。
 pub(crate) fn read_installdir() -> Option<String> {
-    use std::ffi::c_void;
+    // 【lint 2026-10-26 审计】签名与 addword.rs 的既有声明对齐（isize
+    // 句柄风格）——rustc 1.98 跨模块同名 extern 签名不一致会告警。
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn RegOpenKeyExW(
-            hkey: *mut c_void,
-            name: *const u16,
-            opt: u32,
-            access: u32,
-            out: *mut *mut c_void,
+            key: isize,
+            subkey: *const u16,
+            reserved: u32,
+            desired: u32,
+            result: *mut isize,
         ) -> i32;
         fn RegQueryValueExW(
-            hkey: *mut c_void,
+            key: isize,
             name: *const u16,
-            res: *mut u32,
-            typ: *mut u32,
+            reserved: *mut u32,
+            vtype: *mut u32,
             data: *mut u8,
-            size: *mut u32,
+            cb: *mut u32,
         ) -> i32;
-        fn RegCloseKey(hkey: *mut c_void) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
     }
-    const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001usize as *mut c_void;
+    const HKEY_CURRENT_USER: isize = 0x8000_0001usize as isize;
     const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_WOW64_64KEY: u32 = 0x0100;
     const REG_SZ: u32 = 1;
     unsafe {
         let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
         let val: Vec<u16> = "InstallDir".encode_utf16().chain([0]).collect();
-        let mut hk = std::ptr::null_mut::<c_void>();
+        let mut hk: isize = 0;
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             sub.as_ptr(),
