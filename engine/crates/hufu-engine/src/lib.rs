@@ -1853,7 +1853,22 @@ impl Engine {
         // 【；去特化 2026-10-08】本分支 =「; 不引导」统一落点：除开关
         // 关闭外，方案无 ; 数据（092K 类）同样落此——; 就是普通符号键。
         if c == ';' && !shift && !self.semicolon_guide_active() {
+            // 【整句空码豁免 2026-10-25】候选空+整句激活+; 是选重键时
+            // 不清屏直出「；」：空窗常是打码中途态——raw 未超最大码长
+            // 时解码器只按整码出候选、不跨段切分（借来 3 码表打 suw：
+            // su|w 各自成码但 suw 无此码→空窗），清屏会把半截编码整个
+            // 丢掉（实测删快符+借码表 suw; 只出「；」）。与下方数字/
+            // 符号空码分支的 auto_clear_empty 整句豁免同款口径：交
+            // on_rank_key 锁路径（探测码含锁可解出 suw→让我们）；'
+            // 三选键本就无此拦截、同场景走的就是这条路。非整句或 ;
+            // 非选重键维持清屏直出原语义（空码=死码/纯标点档）。
+            let is_select_key = c == self.config.candidates.second_select
+                || c == self.config.candidates.third_select
+                || self.custom_select_rank(c).is_some();
             if session.candidates.is_empty() {
+                if self.sentence_active() && is_select_key {
+                    return self.on_rank_key(session, c);
+                }
                 session.clear();
                 return KeyOutcome::commit("；".to_string(), self.state(session));
             }
@@ -6403,6 +6418,117 @@ mod tests {
         let st = eng.state(&s2);
         assert_eq!(st.candidates[0].text, "锁2+jd");
         assert_eq!(st.raw, "jd2", "分号归一为码表名次后缀");
+    }
+
+    /// 【整句空码豁免 2026-10-25】mock：无锁 raw 不出候选——模拟「raw
+    /// 未超最大码长时解码器只按整码出候选、不跨段切分」的真实行为
+    ///（3 码表打 suw 无此码→空窗），带锁 raw 才出候选。
+    struct LockOnlyDec;
+    impl SentenceDecoder for LockOnlyDec {
+        fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
+            let p = parse_rank_locks(raw);
+            let hits = if p.locks.is_empty() || p.base.is_empty() {
+                Vec::new()
+            } else {
+                let rank = p.locks[0].1;
+                vec![SentenceHit {
+                    text: format!("锁{rank}+{}", p.base),
+                    score: -1.0,
+                    confidence: -1.0,
+                    max_rank: 1,
+                    sum_rank: 1,
+                    exact: true,
+                    word_ends: Vec::new(),
+                    segmented: p.base.clone(),
+                    partial: false,
+                    implicit2: false,
+                }]
+            };
+            std::sync::Arc::new(SentenceDecode {
+                hits,
+                truncated: false,
+                early_hits: Vec::new(),
+                early_truncated: false,
+            })
+        }
+    }
+
+    /// 【整句空码豁免 2026-10-25】现场：借来码表（无 ; 开头码）+删快符
+    /// → semicolon_guide_active=false；整句方案打 suw（su|w 各自成码、
+    /// suw 无此码→候选空窗）再按 ;。修复前：清屏直出「；」丢半截编码；
+    /// 修复后：走锁路径归一为位次后缀 suw2，候选恢复。非整句对照
+    ///（auto_clear_empty 关、raw 停在死码）维持直出「；」原语义。
+    #[test]
+    fn semicolon_empty_cands_sentence_exemption() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-eng-整句semi豁免-{}-{}",
+            std::process::id(),
+            ts
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\nsu\t让\nw\t我\nw\t我们\n",
+        )
+        .unwrap();
+        let mut cfg = hufu_config::Config::default();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = true;
+        let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(LockOnlyDec)));
+
+        let mut s = Session::new(true);
+        eng.process_key(&mut s, key('s'));
+        eng.process_key(&mut s, key('u'));
+        eng.process_key(&mut s, key('w'));
+        assert!(
+            eng.state(&s).candidates.is_empty(),
+            "suw 空窗（无此码、无前缀延续）——触发态"
+        );
+        let out = eng.process_key(&mut s, key(';'));
+        assert!(out.commit.is_none(), "不得丢半截编码直出「；」");
+        assert_eq!(s.raw, "suw2", "; 归一为码表名次后缀（我们=w 第2）");
+        let st = eng.state(&s);
+        assert!(!st.candidates.is_empty(), "锁后候选恢复");
+        let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.commit.unwrap(), "锁2+suw");
+
+        // 非整句对照：auto_clear_empty 关掉让 raw 停在死码 suw（空候选
+        // 无延续），; 维持清屏直出「；」——修复不碰非整句语义。
+        let dir2 = std::env::temp_dir().join(format!(
+            "hufu-eng-semi对照B-{}-{}",
+            std::process::id(),
+            ts
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("main.txt"),
+            "#hufu-dict v1 name=t\nsu\t让\nw\t我\nw\t我们\n",
+        )
+        .unwrap();
+        let mut cfg2 = hufu_config::Config::default();
+        cfg2.sentence.enabled = true;
+        cfg2.sentence.auto_enable = true;
+        cfg2.input.auto_clear_empty = false;
+        let mut eng2 = Engine::with_schema_dir(&dir2, cfg2).unwrap();
+        eng2.set_sentence_decoder(Some(std::sync::Arc::new(LockOnlyDec)));
+        let mut s2 = Session::new(true);
+        eng2.process_key(&mut s2, key('s'));
+        eng2.process_key(&mut s2, key('u'));
+        eng2.process_key(&mut s2, key('w'));
+        assert!(eng2.state(&s2).candidates.is_empty(), "非整句死码空候选");
+        let out = eng2.process_key(&mut s2, key(';'));
+        assert_eq!(out.commit.as_deref(), Some("；"), "非整句空码 ; 直出；不变");
+        assert!(s2.raw.is_empty(), "非整句清屏");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
