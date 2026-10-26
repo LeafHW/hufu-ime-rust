@@ -4353,7 +4353,9 @@ impl Engine {
     /// 调频 op 收尾公共段：重排后先补占位符变号（有变 → 再刷新一次），
     /// 保证返回给 DLL 的 state 里 ③ 已是 ④。
     fn reorder_epilogue(&mut self, session: &mut Session) -> KeyOutcome {
-        if self.renumber_placeholders(session) {
+        // 【通配候选删词 2026-10-26】通配列表横跨多码：占位符按列表位
+        // 跟号会把别的码的 ① 改成 ②（跨码污染）——通配态跳过。
+        if !self.wildcard_session(session) && self.renumber_placeholders(session) {
             let keep_raw = session.raw.clone();
             session.clear();
             session.raw = keep_raw;
@@ -5161,6 +5163,16 @@ impl Engine {
                 .input
                 .is_alphabet_char(self.config.input.wildcard_char)
             && self.config.input.wildcard_char != self.config.reverse.prefix
+    }
+
+    /// 【通配候选删词 2026-10-26】会话是否处于通配查询态（特性可用且
+    /// raw 含通配字符）。通配候选列表**横跨多个编码**——按「列表=单码
+    /// 候选」假设的整组落盘（adjust_set_order 整套 pN / 占位符跟号）
+    /// 在通配态会把跨码词写成单码清单（垃圾行）。cand_menu/cand_swap/
+    /// reorder_epilogue 据此跳过整组落盘；逐 (码,词) 的 {删除}/{置顶}
+    /// 不受影响——通配候选删词/置顶的正路（写真实码，原始码表不动）。
+    pub fn wildcard_session(&self, session: &Session) -> bool {
+        self.wildcard_active() && session.raw.contains(self.config.input.wildcard_char)
     }
 
     /// 【编码通配符】通配查询候选：等长匹配的全部词条，按码表行序
@@ -7920,6 +7932,85 @@ mod tests {
         // 反查引导键=非法通配符（默认 `，无论反查开关）
         eng.config.input.wildcard_char = eng.config.reverse.prefix;
         assert!(!eng.wildcard_active(), "反查引导键冲突=关闭");
+    }
+
+    /// 【通配候选删词 2026-10-26】通配候选可删词（Ctrl+Shift+数字 /
+    /// Ctrl+Delete / 右键删词同管线）：{删除}真实码\t词 落 用户调整.txt
+    ///（原始码表不动），通配列表与该码直查立即隐藏；跨码占位符不跟号、
+    /// 不写 {整序}/{添加} 垃圾行（跨码列表整组落盘=灾难）。
+    #[test]
+    fn wildcard_delete_candidate() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("t-wildcard-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.txt"),
+            "#hufu-dict v1 name=t\ndx\t动\ndd\t等\ndb\t①\n",
+        )
+        .unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
+        eng.config.input.wildcard_enabled = true;
+
+        // d\ → [动, 等, ①]（码表行序，横跨 dx/dd/db 三码）
+        let mut s = Session::new(true);
+        for ch in ['d', '\\'] {
+            eng.process_key(&mut s, key(ch));
+        }
+        let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["动", "等", "①"], "通配候选跨三码");
+
+        // Ctrl+Shift+2 删第 2 位「等」（真实码 dd）
+        eng.process_key(
+            &mut s,
+            KeyInput {
+                key: KeyCode::Char('2'),
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                is_press: true,
+            },
+        );
+        let texts2: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts2, vec!["动", "①"], "删词后通配列表塌位");
+        assert_eq!(s.raw, "d\\", "raw 保留（继续搜索）");
+
+        // 持久化：仅一条 {删除} 真实码行；无 {整序}/{添加}（整组落盘对
+        // 跨码列表=垃圾行；① 也不被跟号改写成 ②）
+        let log = std::fs::read_to_string(dir.join("用户调整.txt")).unwrap();
+        assert!(log.contains("{删除}dd\t等"), "删除日志: {log}");
+        assert!(!log.contains("{整序}"), "无整序垃圾: {log}");
+        assert!(!log.contains("{添加}"), "无 pN/改号垃圾: {log}");
+
+        // 原始码表不动（文件与内存态）；该码直查已隐藏
+        let raw = std::fs::read_to_string(dir.join("main.txt")).unwrap();
+        assert!(raw.contains("dd\t等"), "码表原文不动");
+        let dd: Vec<&str> = eng
+            .schema
+            .dict
+            .lookup("dd")
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(dd, ["等"], "码表内存态不受污染");
+        let mut s2 = Session::new(true);
+        eng.process_key(&mut s2, key('d'));
+        eng.process_key(&mut s2, key('d'));
+        let dd_c: Vec<&str> = s2.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(!dd_c.contains(&"等"), "该码直查隐藏: {dd_c:?}");
+
+        // reload（候选框消失的延迟重载）后回放语义保持
+        eng.reload_user_data();
+        let mut s3 = Session::new(true);
+        for ch in ['d', '\\'] {
+            eng.process_key(&mut s3, key(ch));
+        }
+        let texts3: Vec<&str> = s3.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts3, vec!["动", "①"], "reload 后仍隐藏");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 【自定义按键·开关绑定 2026-10-07】s2t/emoji 键控翻转：按一下开、

@@ -258,13 +258,18 @@ pub fn dispatch(
                                 }
                             }
                             // 【整序落盘 2026-10-07】纯排序整套 pN。
-                            if !act_code_s.is_empty() {
-                                let _ = h.engine.adjust_set_order(&s, &act_code_s);
+                            // 【通配候选删词 2026-10-26】通配查询列表横跨
+                            // 多码：整序会把全列表写成单码 pN 清单（垃圾
+                            // 行）——通配态跳过整序/改号，只留逐词 {删除}。
+                            if !h.engine.wildcard_session(&s) {
+                                if !act_code_s.is_empty() {
+                                    let _ = h.engine.adjust_set_order(&s, &act_code_s);
+                                }
+                                // 【占位符变号·显示同步 2026-10-09】落盘词表
+                                // 已改号，重建会话的候选文本同步成新号再拷回
+                                // 活会话（否则窗口仍显 ③，重开才见 ④）。
+                                let _ = h.engine.sync_placeholder_texts(&mut s);
                             }
-                            // 【占位符变号·显示同步 2026-10-09】落盘词表
-                            // 已改号，重建会话的候选文本同步成新号再拷回
-                            // 活会话（否则窗口仍显 ③，重开才见 ④）。
-                            let _ = h.engine.sync_placeholder_texts(&mut s);
                             // 【显示序回写 2026-10-07】重建列表上的新序
                             // 拷回**活会话**（raw/页/选保活会话原样——尾
                             // 巴态不翻转）；返回的 state 即活会话真值，
@@ -318,12 +323,17 @@ pub fn dispatch(
             }
             // 【整序落盘 2026-10-07】纯排序整套 pN（清陈旧 {添加}/{置顶}
             // 行）——不动会话（原位重排后的列表就是展示真值）。
-            if !act_code.is_empty() {
-                let _ = h.engine.adjust_set_order(&h.session, &act_code);
+            // 【通配候选删词 2026-10-26】通配查询列表横跨多码：整序会把
+            // 全列表写成单码 pN 清单（垃圾行）——通配态跳过整序/改号，
+            // 只留逐词 {删除}/{置顶} 落盘（真实码，原始码表不动）。
+            if !h.engine.wildcard_session(&h.session) {
+                if !act_code.is_empty() {
+                    let _ = h.engine.adjust_set_order(&h.session, &act_code);
+                }
+                // 【占位符变号·显示同步 2026-10-09】同上：落盘已改号，活会话
+                // 文本同步（raw/页/选不动，窗口立即显示 ④）。
+                let _ = h.engine.sync_placeholder_texts(&mut h.session);
             }
-            // 【占位符变号·显示同步 2026-10-09】同上：落盘已改号，活会话
-            // 文本同步（raw/页/选不动，窗口立即显示 ④）。
-            let _ = h.engine.sync_placeholder_texts(&mut h.session);
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
             serde_json::json!({"ok": true, "state": state})
@@ -386,15 +396,19 @@ pub fn dispatch(
             let code_b = host.session.candidates[b].code.clone();
             let h: &mut Host = &mut host;
             let _ = h.engine.op_swap_positions_abs(&mut h.session, a, b);
-            if !code_a.is_empty() {
-                let _ = h.engine.adjust_set_order(&h.session, &code_a);
+            // 【通配候选删词 2026-10-26】通配态跳过整序（同 cand_menu：
+            // 跨码列表不能写单码 pN 清单）——对调仅当次显示生效。
+            if !h.engine.wildcard_session(&h.session) {
+                if !code_a.is_empty() {
+                    let _ = h.engine.adjust_set_order(&h.session, &code_a);
+                }
+                if !code_b.is_empty() && code_b != code_a {
+                    let _ = h.engine.adjust_set_order(&h.session, &code_b);
+                }
+                // 【占位符变号·显示同步】落盘已改号，活会话文本同步（同右键
+                // 菜单：窗口立即显示 ④，raw/页/选不动）。
+                let _ = h.engine.sync_placeholder_texts(&mut h.session);
             }
-            if !code_b.is_empty() && code_b != code_a {
-                let _ = h.engine.adjust_set_order(&h.session, &code_b);
-            }
-            // 【占位符变号·显示同步】落盘已改号，活会话文本同步（同右键
-            // 菜单：窗口立即显示 ④，raw/页/选不动）。
-            let _ = h.engine.sync_placeholder_texts(&mut h.session);
             let state = serde_json::to_value(host.engine.state(&host.session))
                 .unwrap_or_else(|_| serde_json::json!({}));
             serde_json::json!({"ok": true, "state": state})
@@ -1882,6 +1896,60 @@ mod candidate_tests {
             None,
         );
         assert_eq!(miss["ok"], json!(false), "词不在列表拒绝");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 【通配候选删词 2026-10-26】通配查询态 cand_menu del（右键菜单/
+    // 模态删词数字键同管线）：{删除}真实码 落 用户调整.txt、词当场
+    // 离场；跨码整序（{整序}+全套 {添加} pN 清单）不再写出。
+    #[test]
+    fn cand_menu_del_in_wildcard() {
+        let root = std::env::temp_dir().join(format!("hufu-wc-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\ndwx\t大\ndax\t到\ndbx\t灯\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5},"input":{"wildcard_enabled":true}}"#,
+        )
+        .unwrap();
+        let h = Host::new(&root.join("数据")).unwrap();
+        let host = Mutex::new(h);
+        // d\x → 全部 3 码 d?x：大(dwx)/到(dax)/灯(dbx)
+        dispatch(&host, &json!({"op":"key","key":"d"}), None);
+        dispatch(&host, &json!({"op":"key","key":"\\"}), None);
+        let q = dispatch(&host, &json!({"op":"key","key":"x"}), None);
+        let texts: Vec<String> = q["state"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, ["大", "到", "灯"], "通配 d?x 三码候选");
+        // 删第 2 位「到」（真实码 dax）
+        let r = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"del","page_index":1,"text":"到","raw":"d\\x"}),
+            None,
+        );
+        assert_eq!(r["ok"], json!(true), "删词成功: {r}");
+        let texts2: Vec<String> = r["state"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts2, ["大", "灯"], "删词后列表塌位");
+        // 落盘：仅 {删除}dax 一行；无 {整序}/{添加} 跨码垃圾
+        let log = std::fs::read_to_string(root.join("码表/T/用户调整.txt")).unwrap();
+        assert!(log.contains("{删除}dax\t到"), "删除日志: {log}");
+        assert!(!log.contains("{整序}"), "无跨码整序垃圾: {log}");
+        assert!(!log.contains("{添加}"), "无 pN 垃圾: {log}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

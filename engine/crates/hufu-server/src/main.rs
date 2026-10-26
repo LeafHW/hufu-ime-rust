@@ -32,6 +32,10 @@ use std::sync::{Arc, Mutex};
 
 const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 
+/// 【打赏码 2026-10-26】关于页打赏码图片（include_bytes 进 exe 自包含，
+/// 发行线零改动；设置页 <img src="/donate.png"> 取用）。
+const DONATE_PNG: &[u8] = include_bytes!("../../../../settings-ui/donate.png");
+
 /// 开发态接回终端（见文件头注释）。必须在任何 stdout/stderr 输出前调用。
 /// 零依赖直声明（与 pipe/tray 同风格）；std 句柄懒初始化，Attach 成功后
 /// 首次 println 即可写入父控制台。
@@ -1277,6 +1281,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             status: 200,
             content_type: "text/html; charset=utf-8",
             body: INDEX_HTML.as_bytes().to_vec(),
+        },
+        // 【打赏码 2026-10-26】关于页打赏码（exe 内嵌，见 DONATE_PNG）。
+        ("GET", "/donate.png") => Response {
+            status: 200,
+            content_type: "image/png",
+            body: DONATE_PNG.to_vec(),
         },
         ("GET", "/api/state") => {
             let state = host.engine.state(&host.session);
