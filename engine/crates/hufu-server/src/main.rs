@@ -204,12 +204,14 @@ fn main() {
     // 【渲染缓存 2026-10-16】ssf-render 锁前分发拿不到 Host——数据目录
     // 存全局供指纹计算（皮肤缓存目录/overrides/config 的 stat）。
     let _ = DATA_DIR.set(data_dir.clone());
-    // 【渲染预热 2026-10-16】启动即后台预热全部 ssf 皮肤渲染缓存（见
-    // warm_render_cache_throttled 注释）——设置页首次打开列表就能秒切。
-    std::thread::spawn(warm_render_cache_throttled);
     // 【单实例互斥 2026-09-11】此前靠 4390 端口 bind 冲突兜底，但管道
     // 线程先于 HTTP 启动 → 双实例并存窗口期（双 pipe、双托盘消息窗）。
     // 命名互斥体进程级兜底：已存在即本进程直接退（老实例继续服务）。
+    // 【渲染预热风暴修复 2026-10-29】预热线程原挂在此处（互斥体之前）
+    // ——每个被 DLL 自愈/渲染链拉起的临时服务器都会先甩出渲染驱动
+    // powershell 再被互斥体秒退：powershell 独立存活→DLL 再拉下一个
+    // 服务器→每 ~3s 一轮「冷启动+进程创建」无限风暴（用户实锤「后台
+    // 一直有东西在跑」）。预热只允许互斥体胜者（常驻实例）做。
     #[cfg(windows)]
     if sys_win::already_running() {
         eprintln!("hufu-server 已在运行（命名互斥体命中），本实例退出");
@@ -220,6 +222,10 @@ fn main() {
         eprintln!("hufu-server 已在运行（flock 命中），本实例退出");
         std::process::exit(0);
     }
+    // 【渲染预热 2026-10-16】启动即后台预热全部 ssf 皮肤渲染缓存（见
+    // warm_render_cache_throttled 注释）——设置页首次打开列表就能秒切。
+    // 必须在单实例互斥体之后（见上），仅常驻实例预热。
+    std::thread::spawn(warm_render_cache_throttled);
     // 【DPI 感知 2026-09-11】server 代画候选窗此前按 96-DPI 逻辑像素
     // 当物理像素用：进程默认 DPI-unaware，窗口被系统拉伸模糊、坐标
     // 与 DLL（物理像素）错位。声明 Per-Monitor V2 后按窗口实际 DPI
