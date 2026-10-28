@@ -1252,6 +1252,20 @@ fn store_render_cache(
     }
 }
 
+/// 【导出红线 2026-10-29】剥除导出件中的主权/敏感节：①config.sentence
+/// 整节（整句模型参数——与 settings_import 的主权闸构成双向闸，导入导出
+/// 对模型参数零改动）；②config 根下 sync/webdav/password/passphrase 类键
+///（云同步凭据结构性兜底——凭据本只存 数据\同步.json，Config 无此节，
+/// 剥除防未来结构演进/手改件漏进导出）。
+fn strip_export_sensitive(bundle: &mut serde_json::Value) {
+    if let Some(cfg) = bundle.get_mut("config").and_then(|x| x.as_object_mut()) {
+        cfg.remove("sentence");
+        for k in ["sync", "webdav", "password", "passphrase"] {
+            cfg.remove(k);
+        }
+    }
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
     // DELETE /api/skin）拒绝跨源网页：
@@ -2347,6 +2361,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 "ssf_skins": ssf_skins,
                 "ssf_settings": ssf_settings,
             });
+            // 【导出红线 2026-10-29 用户拍板】①整句模型参数（config.
+            // sentence 整节）不进导出——与导入端主权闸（见 settings_import）
+            // 构成双向闸，保证「导入导出对模型参数零改动」（换机/回导老
+            // 配置都不会把新算法参数带回旧值）。②云同步凭据永不进导出
+            //（凭据只存 数据\同步.json，Config 结构本无此节；此处对 config
+            // 根做结构性兜底剥除——sync/webdav/password/passphrase 类键
+            // 一律不带走，防未来手改件/结构演进漏进来）。
+            strip_export_sensitive(&mut bundle);
             let pool = settings_assets_split(&mut bundle);
             if !pool.is_empty() {
                 if let Some(obj) = bundle.as_object_mut() {
@@ -2405,6 +2427,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Ok(c) => c,
                 Err(e) => return Response::err(400, &format!("config 节无效: {e}")),
             };
+            let mut cfg = cfg;
+            // 【模型参数主权 2026-10-29 用户红线】导入永不改动整句模型
+            // 参数：无论导出件新旧（老版本导出的旧参数/手改件），本机
+            // sentence 节原样保留——新算法/新调参不因导入回退。导出端
+            // 已剥 sentence，本闸是双向闸的另一半（老导出件仍带 sentence）。
+            cfg.sentence = host.engine.config.sentence.clone();
             let mut skins_applied = 0usize;
             if let Some(skins) = v.get("skins").and_then(|x| x.as_object()) {
                 let dir = host.skins_dir();
@@ -3091,6 +3119,60 @@ mod settings_assets {
     }
 }
 use settings_assets::{merge as settings_assets_merge, split as settings_assets_split};
+
+#[cfg(test)]
+mod export_import_redline {
+    use super::*;
+
+    /// 导出剥除：sentence（模型参数）与凭据类键不进导出，普通节保留。
+    #[test]
+    fn export_strips_model_params_and_creds() {
+        let mut bundle = serde_json::json!({
+            "hufu_settings_bundle": 3,
+            "config": {
+                "sentence": { "enabled": true, "rerank": { "enabled": true } },
+                "sync": { "pass": "x" },
+                "webdav": { "url": "https://dav.example" },
+                "password": "p", "passphrase": "q",
+                "input": { "tab_clear": true },
+                "candidates": { "page_size": 4 }
+            },
+            "skins": {}
+        });
+        strip_export_sensitive(&mut bundle);
+        let c = &bundle["config"];
+        assert!(c.get("sentence").is_none(), "模型参数整节不进导出");
+        for k in ["sync", "webdav", "password", "passphrase"] {
+            assert!(c.get(k).is_none(), "凭据键 {k} 不进导出");
+        }
+        assert!(c.get("input").is_some() && c.get("candidates").is_some(), "普通设置照常保留");
+    }
+
+    /// round-trip 红线：导出（无 sentence）→ 导入（serde 补默认 → 主权闸
+    /// 覆盖为本机值），模型参数零改动；老版本导出件自带 sentence 同样
+    /// 被主权闸压回本机值。
+    #[test]
+    fn export_then_import_model_params_untouched() {
+        let machine = hufu_config::Config::default();
+        // 新导出件：sentence 已被剥除
+        let mut bundle = serde_json::json!({ "config": serde_json::to_value(&machine).unwrap() });
+        strip_export_sensitive(&mut bundle);
+        assert!(bundle["config"].get("sentence").is_none());
+        let mut cfg: hufu_config::Config =
+            serde_json::from_value(bundle["config"].clone()).unwrap();
+        cfg.sentence = machine.sentence.clone();
+        assert_eq!(cfg.sentence, machine.sentence, "新导出件 round-trip 零改动");
+
+        // 老导出件：仍带旧 sentence 参数
+        let mut stale = serde_json::to_value(&machine).unwrap();
+        stale["sentence"]["early_need"] = serde_json::json!(99);
+        stale["sentence"]["rerank"]["enabled"] = serde_json::json!(!machine.sentence.rerank.enabled);
+        let mut cfg2: hufu_config::Config = serde_json::from_value(stale).unwrap();
+        cfg2.sentence = machine.sentence.clone();
+        assert_eq!(cfg2.sentence, machine.sentence, "老导出件导入后模型参数仍是本机值");
+        assert_ne!(cfg2.sentence.early_need, 99);
+    }
+}
 
 // ── 挂件图跨皮肤清扫【2026-10-18 用户拍板】─────────────────────────────
 // 「删除图片」只清当前编辑的皮肤；同一张动图往往存进了多张皮肤（即存

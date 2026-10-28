@@ -298,6 +298,12 @@ pub struct CandidatesSection {
     /// 两组合同时完整按住时删词优先。空 = 停用。
     #[serde(default = "CandidatesSection::default_delete_key")]
     pub delete_key: String,
+    /// 【同码异字高亮 2026-10-29】同编码且 ≥3 字的候选互标差异字
+    /// （如 jfus 三候选分别标 你/不要/怎么）。默认关；整句方案恒关
+    ///（模型解码无「完全同码」前提——DLL 侧与整句判据叠加）。
+    /// 设置页「输入与候选」开关。
+    #[serde(default)]
+    pub diff_hl: bool,
 }
 
 impl CandidatesSection {
@@ -329,6 +335,7 @@ impl Default for CandidatesSection {
             delay_comment_ms: 0,
             freq_key: "ctrl".into(),
             delete_key: "ctrl+shift".into(),
+            diff_hl: false,
         }
     }
 }

@@ -322,6 +322,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示拼音注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释<span class="sub">（整句状态不可用）</span></label></div>
       <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分<span class="sub">（整句状态不可用）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="c-dhl"><label for="c-dhl" title="同编码且 ≥3 字的候选互标差异字（如 jfus 三个候选分别标出 你/不要/怎么），一眼挑出想要的词；整句方案自动关闭">同码异字高亮<span class="sub">（同码候选互标差异字；默认关）</span></label></div>
       <div class="field"><label>候选延时（毫秒）</label><input type="number" data-path="candidates.delay_show_ms" min="0" max="2000"></div>
     </div>
     <div class="row">
@@ -715,7 +716,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 导入导出 ════ -->
   <section id="tab-data">
     <h2>导入导出<span class="en">Data</span></h2>
-    <div class="sub">一个 JSON 带走<b>全部设置</b>：配置项、皮肤（含你调过/自定义的）、自定义按键（键位映射、Shift+符号/字母）全部在内。升版本 / 换机器时导入即还原；新版本新增的设置项自动按默认值补齐，导不进的老物件自动忽略。</div>
+    <div class="sub">一个 JSON 带走<b>全部设置</b>：配置项、皮肤（含你调过/自定义的）、自定义按键（键位映射、Shift+符号/字母）全部在内。升版本 / 换机器时导入即还原；新版本新增的设置项自动按默认值补齐，导不进的老物件自动忽略。<b>不包含</b>：整句模型参数（导入永不改动本机模型参数，保证新算法升级生效）与云同步账号/密码（只存本机 数据\同步.json，绝不进导出文件）。</div>
     <div class="row">
       <button id="exp-dl" class="primary">导出 config.json</button>
       <input type="file" id="imp-file" accept=".json" style="display:none">
@@ -882,6 +883,7 @@ function bindInputs() {
   // show_index）——输入页不再重复（单一真源）
   B("#c-cmt", "candidates.show_pinyin_comment"); B("#c-ucmt", "candidates.show_unicode_comment");
   B("#c-split", "candidates.show_split");
+  B("#c-dhl", "candidates.diff_hl");
   B("#p-full", "punct.full_shape"); B("#p-pair", "punct.pair_brackets");
   B("#s-en", "sentence.enabled"); B("#s-auto", "sentence.auto_enable"); B("#s-early", "sentence.early_commit");
   B("#s-empty", "sentence.empty_code_auto_commit"); B("#s-rr", "sentence.rerank.enabled");

@@ -454,6 +454,9 @@ pub fn dispatch(
             // 比对后置皮肤失效——覆盖设置页/langbar 等非键路径切方案
             //（entrance_anim 等方案相关皮肤字段即时跟随）。
             state["current_schema"] = serde_json::json!(host.engine.config.schema.current);
+            // 【同码异字高亮开关 2026-10-29】配置门随 state 下发（DLL 与
+            // 整句判据叠加；candidates.diff_hl 默认关）。
+            state["diff_hl"] = serde_json::json!(host.engine.config.candidates.diff_hl);
             // 【实机预览锚点】有效期内携带：DLL 预览窗弹在设置窗中心
             if let Some(((x, y), until)) = host.preview_anchor {
                 if until > std::time::Instant::now() {
