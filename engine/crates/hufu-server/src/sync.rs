@@ -132,6 +132,12 @@ fn persist(st: &SyncSettings) -> std::io::Result<()> {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
+    // 【保存前备份 2026-10-29】同步.json 落盘前把旧版复制为 同步.json.bak
+    //（凭据唯一存放处，误清空/写坏时可一键回滚——今晚真机探针事故实证
+    // 此前无任何护栏：一次畸形请求即可洗掉全部凭据）。
+    if p.is_file() {
+        let _ = std::fs::copy(&p, p.with_extension("json.bak"));
+    }
     std::fs::write(&p, serde_json::to_vec_pretty(st).unwrap_or_default())
 }
 
@@ -200,6 +206,14 @@ pub fn save_settings(
     }
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
+    // 【误清空护栏 2026-10-29】此前已启用（user+pass 齐备）而本次请求会把
+    // pass 以字面空串覆盖（非 __keep__）且 user 也为空 ＝ 疑似事故性整清
+    //（坏客户端/引号丢失的畸形请求——UI 正常路径密钥类永远带 __keep__）。
+    // 拒绝并保留原值；确要重置：删除 数据\同步.json 或改用别的账号覆盖。
+    let was_enabled = !st.user.is_empty() && !st.pass.is_empty();
+    if was_enabled && pass != KEEP && pass.is_empty() && user.trim().is_empty() {
+        return Err("已拒绝：该请求会清空已保存的同步账号（疑似误操作）；如确要重置，请删除 安装目录\\数据\\同步.json 后重新配置".into());
+    }
     st.url = if url.trim().is_empty() {
         DEFAULT_URL.into()
     } else {
@@ -988,6 +1002,42 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write as _};
+
+    /// 【误清空护栏 + 备份 2026-10-29】畸形整清请求（user 空 + pass 字面
+    /// 空串覆盖）必须被拒绝且原凭据保留；正常路径（__keep__/换账号）不受
+    /// 影响；persist 落盘前自动留 同步.json.bak。
+    #[test]
+    fn save_settings_rejects_accidental_wipe_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!("hufu-sync-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = DATA_DIR.set(dir.clone());
+        *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = Some(SyncSettings {
+            url: "https://dav.example/dav/".into(),
+            user: "u@example.com".into(),
+            pass: "secret".into(),
+            ..Default::default()
+        });
+        // 畸形整清：拒绝，原值分毫不动
+        let r = save_settings("", "", "", "", "");
+        assert!(r.is_err(), "整清请求必须被拒绝");
+        let s = SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+        assert_eq!((s.user.as_str(), s.pass.as_str()), ("u@example.com", "secret"));
+        // 正常保存：pass/__keep__ 保留、url 空归默认、持久化 + 备份
+        save_settings("", "u@example.com", KEEP, "", KEEP).unwrap();
+        let s2 = SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+        assert_eq!(s2.url, DEFAULT_URL);
+        assert_eq!(s2.pass, "secret");
+        assert!(dir.join("同步.json").is_file());
+        // 第二次正常保存 → 备份滚动为上一版（首次保存无旧版可备）
+        save_settings("", "u2@example.com", KEEP, "自定义设备", KEEP).unwrap();
+        assert!(dir.join("同步.json.bak").is_file(), "非首版落盘前必须留备份");
+        let bak: SyncSettings = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("同步.json.bak")).unwrap(),
+        ).unwrap();
+        assert_eq!(bak.user, "u@example.com", "备份应保存上一版");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn merge_adjust_union_dedup_local_last() {
