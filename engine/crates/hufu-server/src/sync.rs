@@ -60,6 +60,10 @@ const DEBOUNCE: Duration = Duration::from_secs(8);
 const BACKUP_KEEP: usize = 10;
 /// 「保持已存值」哨兵（UI 留空不覆盖已存密钥/口令）
 const KEEP: &str = "__keep__";
+/// 【默认地址 2026-10-29】服务器地址留空=坚果云官方 WebDAV（UI 地址框
+/// 的 placeholder 一直是它；此前值为空保存会被判「未配置」，用户被迫
+/// 手填一次才生效——现在 save 端同样归一，空=默认）。
+const DEFAULT_URL: &str = "https://dav.jianguoyun.com/dav/";
 
 /// 不同步的 config 键（皮肤挂件/机器本地字段/每机方案选择）。
 /// 排除即不同步也不被远端覆盖（overlay 只写远端携带的键）。
@@ -196,7 +200,11 @@ pub fn save_settings(
     }
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
-    st.url = url.trim().to_string();
+    st.url = if url.trim().is_empty() {
+        DEFAULT_URL.into()
+    } else {
+        url.trim().to_string()
+    };
     st.user = user.trim().to_string();
     if pass != KEEP {
         st.pass = pass.to_string();

@@ -3883,7 +3883,10 @@ async function applyPlatform() {
 async function loadSync() {
   try {
     const st = await api("GET", "/api/sync/status");
-    $("#sy-url").value = st.url || ""; $("#sy-user").value = st.user || ""; $("#sy-device").value = st.device || "";
+    /* 【默认地址修复 2026-10-29】地址栏空=按坚果云官方地址（此前只是
+       placeholder 视觉假象：值为空保存 → 同步判未配置，用户被迫手填
+       一次才生效）。status 无值时直接把默认地址填进框里。 */
+    $("#sy-url").value = st.url || "https://dav.jianguoyun.com/dav/"; $("#sy-user").value = st.user || ""; $("#sy-device").value = st.device || "";
     $("#sy-pass").value = ""; $("#sy-pp").value = ""; $("#sy-pp-change").checked = false;
     $("#sy-pass").placeholder = st.enabled ? "（已保存；留空=不修改）" : "";
     $("#sy-pp").placeholder = st.passphrase_set ? "（已启用加密；勾选「修改/停用口令」后可更改）" : "";
@@ -3896,7 +3899,8 @@ async function loadSync() {
 function syncPayload() {
   const pass = $("#sy-pass").value, pp = $("#sy-pp-change").checked ? $("#sy-pp").value : "__keep__";
   return {
-    url: $("#sy-url").value.trim(), user: $("#sy-user").value.trim(),
+    /* 留空=默认坚果云地址（与 loadSync 缺省一致） */
+    url: $("#sy-url").value.trim() || "https://dav.jianguoyun.com/dav/", user: $("#sy-user").value.trim(),
     pass: pass === "" ? "__keep__" : pass,
     device: $("#sy-device").value.trim(), passphrase: pp
   };
