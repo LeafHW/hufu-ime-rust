@@ -112,6 +112,16 @@ pub struct SentenceEngine {
     /// 身份进入；排序仍由 ngram 主导）。RwLock 热更新：引擎 reload
     /// 用户数据后 set_user_words 同步，无需重建 ngram。码表原序不动。
     user_words: std::sync::RwLock<Vec<(String, String)>>,
+    /// 【两段式分级解码 2026-10-28】即时档开关（HUFU_TWO_STAGE=0 关）：
+    /// miss（缓存无法增量）解码用 `quick_beam` 上限出首候选，提交前
+    /// 引擎经 SentenceDecoder::decode_rich_full 强制全量档兜底（见
+    /// hufu-engine select_first 提交门控）。测试可直改本字段隔离口径。
+    two_stage: bool,
+    /// 即时档束上限（HUFU_QUICK_BEAM 可调，默认 1500）。虎整句方案
+    /// beam_width=200（hufu-config 默认）< 1500 ⇒ 上限恒不绑定，miss
+    /// 与全量档逐位一致；仅在束宽 >1500 的高束方案/长文场景起「即时
+    /// 出候选」作用（quick_bound && truncated 时提交门控重解兜底）。
+    quick_beam: usize,
 }
 
 impl SentenceEngine {
@@ -129,7 +139,10 @@ impl SentenceEngine {
 
 #[derive(Default)]
 struct EngineCache {
-    last: Option<(String, Arc<SentenceDecode>)>,
+    /// (raw, 结果, 全量档等效)：full=结果未被剪枝（增量≡全量，差分
+    /// 测试锁定）⇒ 提交门控 decode_rich_full 直接复用零成本；截断时
+    /// full=false ⇒ 门控强制全量重解。
+    last: Option<(String, Arc<SentenceDecode>, bool)>,
     prefix: Option<(String, Vec<Bucket>)>,
 }
 
@@ -158,6 +171,27 @@ fn inc_tail_beam() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2000)
+    })
+}
+/// 【两段式分级解码 2026-10-28】即时档开关：miss 解码吃 quick 束上限
+/// 出首候选，提交时刻引擎强制全量档（decode_rich_full 门控）。
+/// HUFU_TWO_STAGE=0 关闭 ⇒ miss/提交均与旧版逐位同行为。
+fn two_stage_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HUFU_TWO_STAGE")
+            .map(|s| s != "0")
+            .unwrap_or(true)
+    })
+}
+/// 即时档束上限（HUFU_QUICK_BEAM 可调，默认 1500）。
+fn quick_beam_value() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HUFU_QUICK_BEAM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1500)
     })
 }
 /// 每段参与组句的码表词条上限（rank 截断）：虎码同码词呈长尾分布，
@@ -398,6 +432,8 @@ impl SentenceEngine {
             blocked,
             cache: Mutex::new(EngineCache::default()),
             user_words: std::sync::RwLock::new(Vec::new()),
+            two_stage: two_stage_enabled(),
+            quick_beam: quick_beam_value(),
         }
     }
 
@@ -476,11 +512,13 @@ impl SentenceEngine {
     /// resume=Some((buckets, start_pos)) 时增量：复用前部桶、从 start_pos
     /// 续算（segs 与主循环都只跑尾部）。返回 (结果, 过程桶)——桶供下次
     /// 增量复用；n==0 或超 max_raw_length 时返回 None（不可复用）。
+    #[allow(clippy::type_complexity)]
     fn decode_internal(
         &self,
         raw: &str,
-        resume: Option<(Vec<Bucket>, usize)>,
-    ) -> (SentenceDecode, Option<Vec<Bucket>>) {
+        resume: Option<(Vec<Bucket>, usize, usize)>,
+        quick: bool,
+    ) -> (SentenceDecode, Option<Vec<Bucket>>, bool) {
         // 【数字编码 2026-09-05】数字编码表（a8=来、u3=的）：数字按
         // 码表延续判定——是编码字符则保留（整体或任意后缀是词条，跨
         // 段如 vvb8 的 b8=如），无延续（选重锁转的内部数字）仍做锁；
@@ -510,9 +548,14 @@ impl SentenceEngine {
                     early_truncated: false,
                 },
                 None,
+                false,
             );
         }
-        let start_pos = resume.as_ref().map(|(_, s)| *s).unwrap_or(0);
+        let start_pos = resume.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
+        // 【mass 双计修复 2026-10-28】skip_upto = 保留区末位（split）：
+        // 增量恢复期落点 ≤ split 的展开是旧路径复刻，结构性跳过（见
+        // 主循环内注释）。全量解码 None = 不跳。
+        let skip_upto = resume.as_ref().map(|(_, _, sp)| *sp);
 
         // 每个位置的编码切分预计算：segs[pos] = Vec<Seg>
         // 增量时只需尾部窗内的（前部段不受新键影响）。
@@ -685,10 +728,16 @@ impl SentenceEngine {
         // 不受尾部新键影响），全量时新建并种入 BOS。
         let is_resume = resume.is_some();
         let mut buckets: Vec<Bucket> = match resume {
-            Some((b, _)) => b,
+            Some((b, _, _)) => b,
             None => (0..=n).map(|_| Bucket::new()).collect(),
         };
-        if start_pos == 0 {
+        // 【BOS 种子幂等 2026-10-28】start_pos=0 的增量恢复（split≤4 的
+        // 退化/短前缀 resume）：保留桶[0]里已有 BOS——再 add 一次会
+        // logsumexp(0,0)=ln2 虚增（差分测试实锤：raw=aabbb 的 confidence
+        // 恰差 ln2）。全部路径共享 BOS 祖先 ⇒ 份额不受影响，但绝对
+        // mass 逐次退化 resume 复利漂移，增量≠全量。只在桶空（真全量）
+        // 时种入。
+        if start_pos == 0 && buckets[0].best.is_empty() {
             buckets[0].add(St {
                 prev4: BOS,
                 prev3: BOS,
@@ -737,8 +786,19 @@ impl SentenceEngine {
         };
         // 【增量尾窗束宽】见 inc_tail_beam() 注释：增量重算只算尾部
         // ≤12 键，小束承载尾段组合；全束质量保留在前部复用桶。
+        // 【两段式即时档 2026-10-28】miss（非增量）且 quick 时吃
+        // quick_beam 上限出首候选——提交时刻 decode_rich_full 全量
+        // 兜底。上限只在**严格低于档位束宽**时才实际降档（虎整句
+        // 方案 beam_width=200 < 默认 quick 1500 ⇒ 恒不绑定，miss
+        // 与全量档逐位一致）；返回 quick_bound 供调用方记 full 标记
+        //（quick_bound && truncated 才需要提交门控重解——方案束宽
+        // 200 下的截断两档同样发生，重解无增益，门控零触发）。
+        let mut quick_bound = false;
         let beam = if is_resume {
             beam.min(inc_tail_beam())
+        } else if quick && self.quick_beam < beam {
+            quick_bound = true;
+            self.quick_beam
         } else {
             beam
         };
@@ -759,6 +819,24 @@ impl SentenceEngine {
             for state in buckets[pos].snapshot() {
                 for seg in &segs[pos] {
                     let end = seg.end;
+                    // 【mass 双计修复 2026-10-28】增量恢复期：落点 ≤ split
+                    //（保留区末位）的展开是旧路径的复刻——父桶在保留区
+                    // 未变、raw 前缀一致、分段表同源 ⇒ (text, word_ends)
+                    // 与桶内已有路径全同；桶 mass 已含这些路径，重跑 add
+                    // 会 logsumexp 双计虚增（logsumexp(m,m)=m+ln2，逐键
+                    // 复利），系统性抬高 confidence/early_hits——原注释
+                    // 「Bucket::add 聚合幂等，重复展开无副作用」不成立
+                    //（mass 按聚合、非按路径记账，重投即双计）。结构性
+                    // 跳过：保留区桶本解码内冻结，重算区 (split, n] 照常
+                    // 重建；跨界伸入重算区的展开（end > split）不受影响
+                    // 照常重跑。顺带省掉这些路径的 St 构造与 String
+                    // clone（占 resume 展开工作量约 1/6，INC_DEBUG 实测
+                    // 窗口 ~16 位中 4 位 × 短段全部命中此跳过）。
+                    if let Some(sp) = skip_upto {
+                        if end <= sp {
+                            continue;
+                        }
+                    }
                     let lock = seg.lock_rank;
                     // 多码整句时段跨须 ≥2（含选重后缀字符；Rime 段跨规则，
                     // tiger_sentence.lua L562 同款；虎爪 ExpandRange L385
@@ -1042,12 +1120,13 @@ impl SentenceEngine {
                 early_truncated: early_trunc,
             },
             Some(buckets),
+            quick_bound,
         )
     }
 
     fn decode_cached(&self, raw: &str) -> Arc<SentenceDecode> {
         let mut cache = self.cache.lock().unwrap();
-        if let Some((prev_raw, prev_out)) = cache.last.as_ref() {
+        if let Some((prev_raw, prev_out, _full)) = cache.last.as_ref() {
             if prev_raw == raw {
                 return prev_out.clone();
             }
@@ -1092,18 +1171,22 @@ impl SentenceEngine {
             })
             .unwrap_or(false);
         let resume = if can {
-            cache.prefix.take().map(|(p_raw, mut buckets)| {
+            cache.prefix.take().map(|(_p_raw, mut buckets)| {
                 let old_base_len = buckets.len() - 1;
                 // split=0 时退化为全量（主循环从 BOS 起算），此处不设下限：
                 // 强制 split≥1 会丢弃 pos=0 的段展开，令全部后继桶断源
                 // （13 键候选空 bug 的根因）。
                 let split = old_base_len.saturating_sub(INC_REDO_TAIL);
                 // 再回退一个最大段长（虎码 max_code_length=4）：保留区末尾
-                // pos 的段可能跨界伸入重算区，这些展开必须重跑（Bucket::add
-                // 聚合幂等，重复展开无副作用），否则跨界路径全丢。
-                let start = split.saturating_sub(4);                buckets.truncate(split + 1);
+                // pos 的段跨界伸入重算区的展开必须重跑（end > split 的
+                // 照常 add），否则跨界路径全丢；end ≤ split 的为旧路径
+                // 复刻——decode_internal 内结构性跳过（mass 双计修复
+                // 2026-10-28，取代旧注释「add 聚合幂等重复展开无副作用」
+                // 的错误断言）。
+                let start = split.saturating_sub(4);
+                buckets.truncate(split + 1);
                 buckets.resize_with(new_base_len + 1, Bucket::new);
-                (buckets, start, p_raw)
+                (buckets, start, split)
             })
         } else {
             None
@@ -1119,9 +1202,18 @@ impl SentenceEngine {
             let sp = resume.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
             eprintln!("[cache] raw={raw} start={sp}");
         }
-        let (out, buckets) = self.decode_internal(raw, resume.map(|(b, s, _)| (b, s)));
+        // 【两段式即时档】miss（无法增量）且开启两段式 ⇒ quick 束上限；
+        // resume 不变（尾窗本就 min(inc_tail)）。上限只在严格低于档位
+        // 束宽时实际降档。
+        let quick = self.two_stage && resume.is_none();
+        let (out, buckets, quick_bound) = self.decode_internal(raw, resume, quick);
         let out = Arc::new(out);
-        cache.last = Some((raw.to_string(), out.clone()));
+        // full = 该结果与全量档等效：quick 上限未实际降档时恒真（虎整句
+        // 方案 beam_width=200 < quick 1500，截断两档同样发生、重解无
+        // 增益，门控须零触发）；只有 quick 真降了档且被截断（占用压过
+        // quick 上限）才需要提交门控 decode_rich_full 重解兜底。
+        let full = !(quick_bound && out.truncated);
+        cache.last = Some((raw.to_string(), out.clone(), full));
         if let Some(b) = buckets {
             cache.prefix = Some((raw.to_string(), b));
         } else {
@@ -1135,6 +1227,43 @@ impl SentenceEngine {
         self.decode_cached(raw).hits.iter().map(|h| h.text.clone()).collect()
     }
 
+    /// 【两段式提交档 2026-10-28】全量束解码（不经增量、不吃 quick
+    /// 上限）。引擎在提交时刻（空格顶首选）经 SentenceDecoder::
+    /// decode_rich_full 调用兜底：显示/提前上屏可吃即时档，提交只认
+    /// 全量。结果写入缓存（last+prefix，随后的 refresh 走 cache.last
+    /// 命中拿到全量候选）。
+    /// - 缓存已有同 raw 且未截断（full=true，增量≡全量）的结果 ⇒ 直接
+    ///   复用零成本——虎整句实测桶占用 ≤200，绝大多数提交零重解；
+    /// - 截断结果（full=false）⇒ 全量重解（长文/低束场景的质量兜底）。
+    pub fn decode_full(&self, raw: &str) -> Arc<SentenceDecode> {
+        static GATE_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let gate_dbg = *GATE_DBG.get_or_init(|| std::env::var("HUFU_GATE_DEBUG").is_ok());
+        let mut cache = self.cache.lock().unwrap();
+        if let Some((prev_raw, prev_out, full)) = cache.last.as_ref() {
+            if prev_raw == raw && *full {
+                return prev_out.clone();
+            }
+            if gate_dbg {
+                eprintln!(
+                    "[gate] miss: raw={raw} prev={} full_flag={full} same={}",
+                    prev_raw,
+                    prev_raw == raw
+                );
+            }
+        } else if gate_dbg {
+            eprintln!("[gate] miss: raw={raw} prev=None");
+        }
+        let (out, buckets, _quick_bound) = self.decode_internal(raw, None, false);
+        let out = Arc::new(out);
+        cache.last = Some((raw.to_string(), out.clone(), true));
+        if let Some(b) = buckets {
+            cache.prefix = Some((raw.to_string(), b));
+        } else {
+            cache.prefix = None;
+        }
+        out
+    }
+
     // 【去重 confidence_proposal 2026-09-11】此处原有一份
     // confidence_proposal 方法实现，与 hufu_engine::confidence_proposal
     // 自由函数近似重复（后者多返回份额值，且为全仓库唯一被使用的版本：
@@ -1146,6 +1275,17 @@ impl SentenceEngine {
 impl SentenceDecoder for SentenceEngine {
     fn decode_rich(&self, raw: &str) -> Arc<SentenceDecode> {
         self.decode_cached(raw)
+    }
+
+    /// 【两段式 2026-10-28】提交档入口：两段式开启时返回全量结果
+    /// （引擎提交门控据此刷新候选）；关闭（HUFU_TWO_STAGE=0）返回
+    /// None ⇒ 引擎跳过门控，行为与旧版逐位一致。
+    fn decode_rich_full(&self, raw: &str) -> Option<Arc<SentenceDecode>> {
+        if self.two_stage {
+            Some(self.decode_full(raw))
+        } else {
+            None
+        }
     }
 
     fn rare_hint(&self, ch: char) -> bool {
@@ -1400,5 +1540,94 @@ mod tests {
             "无锁段不得因放宽多出低名词: hits={:?}",
             hits(&eng, "edd")
         );
+    }
+
+    /// 【增量≡全量差分测试 2026-10-28】mass 双计修复的回归锁。
+    /// 增量臂：一个引擎逐键打字（miss→爬坡→情形A 追加→情形B 锁后缀，
+    /// 缓存链自然积累）；对照臂：另一引擎每前缀 decode_full（全量档、
+    /// 无增量、不吃 quick 上限）。两臂逐字段对比：离散字段（文本序/
+    /// 名次/精确位/词边界/分段）全等；score/confidence 是 logsumexp
+    /// 累加、两臂累加顺序不同，允许 ULP 级差异（相对 1e-9）。
+    /// 修复前必红：恢复期保留区旧路径重投 add → logsumexp(m,m)=m+ln2
+    /// 逐键复利，增量臂 confidence 系统性虚高（两臂必须分引擎——
+    /// 同引擎交替解码会互相覆写缓存，复利效应被冲掉，测不出来）。
+    #[test]
+    fn incremental_equals_full_decode() {
+        let mk = || {
+            let mut e = engine(tiny_dict(), 0);
+            // 差分口径 = 全量档对全量档（quick 上限的截断语义不进对比）
+            e.two_stage = false;
+            e
+        };
+        let inc_eng = mk();
+        let ref_eng = mk();
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+        let cmp_hits = |tag: &str, raw: &str, inc: &[SentenceHit], full: &[SentenceHit]| {
+            assert_eq!(
+                inc.len(),
+                full.len(),
+                "{tag} hits 数量不一致 raw={raw}: inc={inc:?} full={full:?}"
+            );
+            for (h1, h2) in inc.iter().zip(full.iter()) {
+                assert_eq!(h1.text, h2.text, "{tag} 文本序不一致 raw={raw}");
+                assert_eq!(h1.max_rank, h2.max_rank, "{tag} max_rank raw={raw} {}", h1.text);
+                assert_eq!(h1.sum_rank, h2.sum_rank, "{tag} sum_rank raw={raw} {}", h1.text);
+                assert_eq!(h1.exact, h2.exact, "{tag} exact raw={raw} {}", h1.text);
+                assert_eq!(
+                    h1.word_ends, h2.word_ends,
+                    "{tag} word_ends raw={raw} {}",
+                    h1.text
+                );
+                assert_eq!(
+                    h1.segmented, h2.segmented,
+                    "{tag} segmented raw={raw} {}",
+                    h1.text
+                );
+                assert_eq!(h1.partial, h2.partial, "{tag} partial raw={raw} {}", h1.text);
+                assert_eq!(
+                    h1.implicit2, h2.implicit2,
+                    "{tag} implicit2 raw={raw} {}",
+                    h1.text
+                );
+                assert!(
+                    close(h1.score, h2.score),
+                    "{tag} score raw={raw} {}: {} vs {}",
+                    h1.text,
+                    h1.score,
+                    h2.score
+                );
+                assert!(
+                    close(h1.confidence, h2.confidence),
+                    "{tag} confidence raw={raw} {}: {} vs {}（mass 双计？）",
+                    h1.text,
+                    h1.confidence,
+                    h2.confidence
+                );
+            }
+        };
+        // 打字链：覆盖 miss（首键）、爬坡退化（split=0）、情形A 追加
+        //（old_base 跨 4 与 8 两侧 → split>0 保留区重投区）、数字锁
+        //（情形B / 中段锁）。链间换串 = 跨句 miss 重开。
+        let chains: [&str; 4] = [
+            "aabbbddddd",   // 常规追加链（10 键，尾段覆盖 split=1 重投）
+            "bbabddddd2",   // 尾部数字锁（情形B）
+            "aab2bbddd",    // 中段锁后继续追加
+            "dddddbbbbaab", // 跨句 miss 后的长链
+        ];
+        for chain in chains {
+            let chars: Vec<char> = chain.chars().collect();
+            for i in 1..=chars.len() {
+                let raw: String = chars[..i].iter().collect();
+                let inc = inc_eng.decode_rich(&raw);
+                let full = ref_eng.decode_full(&raw);
+                cmp_hits("hits", &raw, &inc.hits, &full.hits);
+                cmp_hits("early", &raw, &inc.early_hits, &full.early_hits);
+                assert_eq!(inc.truncated, full.truncated, "truncated raw={raw}");
+                assert_eq!(
+                    inc.early_truncated, full.early_truncated,
+                    "early_truncated raw={raw}"
+                );
+            }
+        }
     }
 }

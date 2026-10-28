@@ -429,6 +429,8 @@ pub fn dispatch(
                             // 与 HTTP /api/config 同源（后台重建，不持锁载模型）
                             crate::reload_sentence_bg(teardown, true);
                         }
+                        // 【云同步 2026-10-28】管道路径的配置变化也触发同步
+                        crate::sync::notify("配置变化");
                         serde_json::json!({"ok": true})
                     }
                     Err(e) => serde_json::json!({"error": format!("应用失败: {e}")}),

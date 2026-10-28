@@ -234,6 +234,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <a data-tab="skin">皮肤</a>
   <a data-tab="overlay">候选挂件</a>
   <a data-tab="data">导入导出</a>
+  <a data-tab="sync">云同步</a>
   <a data-tab="about">关于</a>
   <div class="spacer"></div>
   <!-- 【深浅色主题 2026-10-11】导航栏底部：切换按钮（记住选择）+
@@ -724,6 +725,35 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   </section>
 
   <!-- ════ 关于 2026-10-16 用户需求：版本号/GitHub/本机信息/致谢 ════ -->
+  <!-- ════ 云同步 ════ -->
+  <section id="tab-sync">
+    <h2>云同步<span class="en">Sync · WebDAV</span></h2>
+    <div class="sub">通过 WebDAV 网盘（坚果云等）在多台电脑间同步：各方案「用户调整.txt」（置顶/删词/加词/调频的操作记录）+ 配置设置。<b>不同步</b>：皮肤与挂件、当前方案选择、开机自启、导出快捷键、候选字体。数据只经你自己的网盘（虎符官方不设服务器）；勾选口令后云端只存密文。</div>
+    <div class="row" style="align-items:center;margin-top:2px">
+      <span class="sub">没有账号？<a href="https://www.jianguoyun.com/" target="_blank" rel="noreferrer">坚果云官网注册</a> ｜ <a href="https://www.jianguoyun.com/s/downloads/" target="_blank" rel="noreferrer">客户端下载地址</a><span title="同步功能不依赖客户端，网页注册即可">(同步无需客户端)</span> ｜</span>
+      <button onclick="window.open('/api/sync/tutorial','_blank')" title="打开同步图文教程（安装目录 数据\\ 下的 同步教程.png，找不到则读桌面）">📖 图文教程</button>
+    </div>
+    <div class="row">
+      <div class="field"><label>服务器地址</label><input type="text" id="sy-url" placeholder="https://dav.jianguoyun.com/dav/" style="width:330px"></div>
+      <div class="field"><label>账号</label><input type="text" id="sy-user" placeholder="坚果云注册邮箱" style="width:220px"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>应用密码<span class="sub">（WebDAV 应用密码，非登录密码；坚果云：网页版 → 账户信息 → 安全选项 → 添加应用密码）</span></label><input type="password" id="sy-pass" autocomplete="new-password" style="width:330px"></div>
+      <div class="field"><label>设备名<span class="sub">（留空自动生成；用于区分同步来源）</span></label><input type="text" id="sy-device" placeholder="如 台式机-书房" style="width:220px"></div>
+    </div>
+    <div class="row" style="align-items:flex-end">
+      <div class="field"><label>加密口令<span class="sub">（强烈建议：两台机必须一致；设置后云端只存密文，网盘也看不到内容）</span></label><input type="password" id="sy-pp" autocomplete="new-password" style="width:330px"></div>
+      <div class="checkline" style="margin-bottom:6px"><input type="checkbox" id="sy-pp-change"><label for="sy-pp-change" title="勾选后本次保存才修改/停用口令（停用=口令留空保存）；不勾选保持现状，防止误关加密">修改/停用口令</label></div>
+    </div>
+    <div class="row" style="align-items:center">
+      <button id="sy-save" class="primary">保存</button>
+      <button id="sy-test" title="自动保存当前表单并测试连接">测试连接</button>
+      <button id="sy-now">立即同步</button>
+      <span class="sub" id="sy-status">加载中…</span>
+    </div>
+    <div class="sub" style="margin-top:6px">同步规则：开机约 20 秒首次同步，此后每 5 分钟一轮、改词/改配置后约 8 秒自动触发。一边变了就听那边的；两边都变了——词条按行合并谁也不丢（同词操作后写的生效），配置逐项归并（本机没动的项采纳云端，动了的不被冲回）。自定义方案文件夹（任意名字）都同步，按文件夹名配对——新电脑需先装好同名方案。每次拉取合并前自动备份到 安装目录\同步备份\（保留最近 10 份）。数据只经 WebDAV 你自己的网盘，虎符官方不设服务器。</div>
+  </section>
+
   <section id="tab-about">
     <h2>关于<span class="en">About</span></h2>
     <div class="row" style="align-items:baseline;gap:16px;flex-wrap:wrap">
@@ -3847,6 +3877,55 @@ async function applyPlatform() {
     row.appendChild(hint);
   }
 }
+/* ── 云同步（WebDAV，独立于 config.json 的数据面）── */
+async function loadSync() {
+  try {
+    const st = await api("GET", "/api/sync/status");
+    $("#sy-url").value = st.url || ""; $("#sy-user").value = st.user || ""; $("#sy-device").value = st.device || "";
+    $("#sy-pass").value = ""; $("#sy-pp").value = ""; $("#sy-pp-change").checked = false;
+    $("#sy-pass").placeholder = st.enabled ? "（已保存；留空=不修改）" : "";
+    $("#sy-pp").placeholder = st.passphrase_set ? "（已启用加密；勾选「修改/停用口令」后可更改）" : "";
+    $("#sy-status").textContent = st.enabled
+      ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.passphrase_set ? "" : " ｜ ⚠ 未加密"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
+      : "未配置（填写并保存后启用；每 5 分钟自动同步）";
+  } catch (e) { $("#sy-status").textContent = "状态读取失败：" + e.message; }
+}
+/* 同步表单 → save 载荷（密钥类留空=__keep__ 不改已存值） */
+function syncPayload() {
+  const pass = $("#sy-pass").value, pp = $("#sy-pp-change").checked ? $("#sy-pp").value : "__keep__";
+  return {
+    url: $("#sy-url").value.trim(), user: $("#sy-user").value.trim(),
+    pass: pass === "" ? "__keep__" : pass,
+    device: $("#sy-device").value.trim(), passphrase: pp
+  };
+}
+$("#sy-save").onclick = async () => {
+  try {
+    await api("POST", "/api/sync/save", syncPayload());
+    msg("同步设置已保存，即将开始同步 ✓", "ok");
+  } catch (e) { msg("保存失败：" + e.message, "err"); }
+  setTimeout(loadSync, 1500);
+};
+$("#sy-test").onclick = async () => {
+  msg("测试连接中…");
+  try {
+    // 先把当前表单存起来再测（测试读已保存配置；省一次手动点保存）
+    await api("POST", "/api/sync/save", syncPayload());
+    const r = await api("POST", "/api/sync/test", {});
+    msg(r.ok
+      ? (r.exists ? `连接成功：云端同步包来自「${r.remote_device || "?"}」（${r.schemas ?? "?"} 个方案）` : "连接成功：云端为空（首次同步将创建）")
+      : "测试失败：" + r.msg, r.ok ? "ok" : "err");
+  } catch (e) { msg("测试失败：" + e.message, "err"); }
+  loadSync();
+};
+let syPoll = null;
+$("#sy-now").onclick = async () => {
+  try { await api("POST", "/api/sync/now", {}); msg("已触发同步…", "ok"); } catch (e) { msg("触发失败：" + e.message, "err"); }
+  clearInterval(syPoll); let n = 0;
+  syPoll = setInterval(async () => { await loadSync(); if (($("#sy-status").textContent || "").includes("空闲") || ++n > 20) clearInterval(syPoll); }, 1500);
+  loadSync();
+};
+loadSync();
 init();
 </script>
 </body>

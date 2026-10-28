@@ -100,6 +100,12 @@ pub struct SentenceDecode {
 pub trait SentenceDecoder: Send + Sync {
     /// 富解码：raw（含选重后缀）→ 命中 + 提前上屏置信源。
     fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode>;
+    /// 【两段式提交档 2026-10-28】全量束解码兜底：显示/提前上屏可吃
+    /// 即时档（quick 束上限），提交只认全量。默认 None（解码器未实现
+    /// 两段式——mock/测试桩——⇒ 调用方跳过门控，行为与旧版一致）。
+    fn decode_rich_full(&self, _raw: &str) -> Option<std::sync::Arc<SentenceDecode>> {
+        None
+    }
     /// 字是否生僻（模型字频名次超阈值）——候选框生僻下沉判据。
     /// 默认 false（无模型实现时不下沉）。
     fn rare_hint(&self, _ch: char) -> bool {
@@ -3811,6 +3817,27 @@ impl Engine {
 
     fn select_first(&mut self, session: &mut Session) -> KeyOutcome {
         if !session.candidates.is_empty() {
+            // 【两段式提交门控 2026-10-28】空格顶首选 = 最终落屏，只认
+            // 全量档：整句域且未翻页/未方向键选中时，先经 decode_rich_full
+            // 强制全量（结果入缓存，refresh 走 cache.last 命中拿到全量
+            // 候选）再提交。未截断时门控零成本（缓存直接复用）；截断/
+            // 即时档压束时在此兜底换全量。翻页/方向键选中的非首选保持
+            // 所见即所得——不刷新，避免换序导致提交非所见项。
+            if session.selected == 0
+                && session.page == 0
+                && (!session.committed_raw.is_empty()
+                    || session.raw.chars().count() > self.config.input.max_code_length)
+            {
+                let full_raw = format!("{}{}", session.committed_raw, session.raw);
+                let gated = self
+                    .sentence
+                    .as_ref()
+                    .and_then(|dec| dec.decode_rich_full(&full_raw))
+                    .is_some();
+                if gated {
+                    self.refresh_candidates(session);
+                }
+            }
             let idx = session
                 .selected
                 .min(session.candidates.len().saturating_sub(1));

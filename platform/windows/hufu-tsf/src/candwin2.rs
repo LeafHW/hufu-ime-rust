@@ -1493,6 +1493,233 @@ pub(crate) struct SsfFrame {
 /// 微软雅黑」。进程级探测一次（OnceLock 缓存）。
 static DEFAULT_CAND_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// 【同码长词差异高亮 2026-10-28】第 k 个字符的起始字节偏移。
+fn char_byte_at(s: &str, k: usize) -> Option<usize> {
+    s.char_indices().nth(k).map(|(b, _)| b)
+}
+
+/// 【整句门控 2026-10-28】整句方案候选来自模型解码，「完全同码」前提
+/// 不成立（注释列非码），差异高亮只在非整句方案生效。tsf 侧按
+/// current_schema 含「整句」判定后调 set_diff_hl（与首显滑动门控同一
+/// 判据——sentence_active 在无模型包恒 false 不可用）。
+static DIFF_HL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) fn set_diff_hl(on: bool) {
+    DIFF_HL_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn diff_hl_on() -> bool {
+    DIFF_HL_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 【同码长词差异高亮 v2·逐行配对 2026-10-29】**完全同编码**、字数≥3
+/// 的候选，对每行找「最像的同码伙伴」：两两求公共前后缀 (p,s)，有效
+/// 对须 p+s≥2 且 p+s<min(两行长)（有锚也有差异）；选 **p 最大**、次选
+/// p+s 最大 的对（前缀锚定优先——保住「今天的事情不要说/怎么说」同
+/// 头对），该行高亮 (p, len-s)。组级夹逼模型在「某行首字不同」时
+/// p+s 塌到 1 全组熄灭（用户实锤 你天/今天 不要说/怎么说 三成员组）；
+/// 逐行配对各标各的，互不拖累。无有效对（全同/两两全差）不标。
+/// 「你怎么/他怎么」→(0,1)；「你的事情/他的事情」→(0,1)；
+/// 「今天的事情怎么说/不要说」→(5,7)。前 10 个；2 字词不参与。
+pub(crate) fn diff_mid_ranges(cands: &[(String, String)]) -> Vec<Option<(usize, usize)>> {
+    let n = cands.len().min(10);
+    let mut out = vec![None; cands.len()];
+    for i in 0..n {
+        let li = cands[i].0.chars().count();
+        if li < 3 {
+            continue;
+        }
+        let mut best: Option<(usize, usize)> = None; // (p, s)
+        for j in 0..n {
+            if j == i || cands[j].1 != cands[i].1 {
+                continue;
+            }
+            let lj = cands[j].0.chars().count();
+            if lj < 3 {
+                continue;
+            }
+            let (p, s) = pair_affix(&cands[i].0, &cands[j].0);
+            // 有效=对本行有差异（p+s<li）：长侧多尾字时短侧无效、长侧有效
+            if p + s >= 2 && p + s < li {
+                let take = match best {
+                    None => true,
+                    Some((bp, bs)) => p > bp || (p == bp && p + s > bp + bs),
+                };
+                if take {
+                    best = Some((p, s));
+                }
+            }
+        }
+        if let Some((p, s)) = best {
+            out[i] = (p + s < li).then_some((p, li - s));
+        }
+    }
+    out
+}
+
+/// 两串公共前缀长 p 与公共后缀长 s（从 0 起算纯实测；s 延长以
+/// p+s ≤ 较短串长封顶）。
+fn pair_affix(a: &str, b: &str) -> (usize, usize) {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let minlen = av.len().min(bv.len());
+    let mut p = 0usize;
+    while p < minlen && av[p] == bv[p] {
+        p += 1;
+    }
+    let mut s = 0usize;
+    while s < minlen.saturating_sub(p) && av[av.len() - 1 - s] == bv[bv.len() - 1 - s] {
+        s += 1;
+    }
+    (p, s)
+}
+
+#[cfg(test)]
+mod diff_hl_tests {
+    use super::*;
+
+    #[test]
+    fn groups_and_bounds() {
+        let cands = vec![
+            ("今天的事情怎么说".to_string(), "aa".to_string()),
+            ("今天的事情不要说".to_string(), "aa".to_string()),
+            ("今天的天气很好啊".to_string(), "aa".to_string()),
+            ("小词".to_string(), "aa".to_string()),
+            ("今天的事情要说啊".to_string(), "bb".to_string()), // 编码不同：不入组
+        ];
+        let r = diff_mid_ranges(&cands);
+        // 【v2 逐行配对】1/2 选同头互配（p=5,s=1）→ 紧标「怎么/不要」；
+        // 3 选与谁都不共享中段（p=3,s=0）→ 标 (3,8) 事情很好啊；
+        // 4 字以下/编码不同照旧不参与
+        assert_eq!(r[0], Some((5, 7)), "「怎么」（配 2 选）");
+        assert_eq!(r[1], Some((5, 7)), "「不要」（配 1 选）");
+        assert_eq!(r[2], Some((3, 8)), "「事情很好啊」");
+        assert_eq!(r[3], None, "≤4 字不参与");
+        assert_eq!(r[4], None, "编码不同不入组");
+    }
+
+    #[test]
+    fn three_member_head_and_middle_diff() {
+        // 用户实锤 2026-10-29：三成员组首字不同（你/今）+ 中段不同——
+        // 组级夹逼 p+s=1 全组熄灭。逐行配对：1选配 3选（尾同 s=7）→
+        // 标「你」；2/3 选同头互配（p=5）→ 标「不要/怎么」，互不拖累
+        let cands = vec![
+            ("你天的事情怎么说".to_string(), "jfus".to_string()),
+            ("今天的事情不要说".to_string(), "jfus".to_string()),
+            ("今天的事情怎么说".to_string(), "jfus".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((0, 1)), "标「你」");
+        assert_eq!(r[1], Some((5, 7)), "标「不要」");
+        assert_eq!(r[2], Some((5, 7)), "标「怎么」");
+    }
+
+    #[test]
+    fn three_char_single_diff() {
+        // 3 字词：2 同 1 异 → 标差异字（用户用例 jwt）
+        let cands = vec![
+            ("你怎么".to_string(), "jwt".to_string()),
+            ("他怎么".to_string(), "jwt".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((0, 1)), "标「你」");
+        assert_eq!(r[1], Some((0, 1)), "标「他」");
+    }
+
+    #[test]
+    fn two_char_excluded() {
+        // 2 字词不参与：1 字差异=整词橙，无信息量
+        let cands = vec![
+            ("你好".to_string(), "nh".to_string()),
+            ("他好".to_string(), "nh".to_string()),
+        ];
+        assert_eq!(diff_mid_ranges(&cands)[0], None);
+    }
+
+    #[test]
+    fn four_char_leading_diff() {
+        // 4 字词：3 同 1 异，差异在首位 → 标首字（用户用例）
+        let cands = vec![
+            ("你的事情".to_string(), "jufh".to_string()),
+            ("他的事情".to_string(), "jufh".to_string()),
+            ("我的事情".to_string(), "jufh".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((0, 1)), "标「你」");
+        assert_eq!(r[1], Some((0, 1)), "标「他」");
+        assert_eq!(r[2], Some((0, 1)), "标「我」");
+    }
+
+    #[test]
+    fn four_char_too_few_common_skipped() {
+        // 公共字仅 1（p=0,s=1）→ 噪声，不标
+        let cands = vec![
+            ("一心一意".to_string(), "x".to_string()),
+            ("全心全意".to_string(), "x".to_string()),
+        ];
+        assert_eq!(diff_mid_ranges(&cands)[0], None);
+        assert_eq!(diff_mid_ranges(&cands)[1], None);
+    }
+
+    #[test]
+    fn shared_inner_chars_not_highlighted() {
+        // 组内公共部分「事情」绝不能被染色（回归锁定）
+        let cands = vec![
+            ("今天的事情怎么说".to_string(), "x".to_string()),
+            ("今天的事情不要说".to_string(), "x".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((5, 7)));
+        assert_eq!(r[1], Some((5, 7)));
+    }
+
+    #[test]
+    fn unequal_lengths() {
+        // 长短不一：短侧只标自己的差异，长侧标到自己的差异末
+        let cands = vec![
+            ("今天的事情不说".to_string(), "x".to_string()),
+            ("今天的事情怎么说".to_string(), "x".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((5, 6)), "「不」");
+        assert_eq!(r[1], Some((5, 7)), "「怎么」");
+    }
+
+    #[test]
+    fn extra_trailing_char_only_diff() {
+        // 某成员=另一成员+尾字：短侧无差异、长侧只标多出的尾字
+        let cands = vec![
+            ("今天的事情说说说".to_string(), "x".to_string()),
+            ("今天的事情说说说说".to_string(), "x".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], None, "短侧全部公共");
+        assert_eq!(r[1], Some((8, 9)), "长侧只标多出的「说」");
+    }
+
+    #[test]
+    fn five_char_single_mid() {
+        let cands = vec![
+            ("恭喜发大财".to_string(), "x".to_string()),
+            ("恭喜发小财".to_string(), "x".to_string()),
+        ];
+        let r = diff_mid_ranges(&cands);
+        assert_eq!(r[0], Some((3, 4)), "5 字词中段单字");
+        assert_eq!(r[1], Some((3, 4)));
+    }
+
+    #[test]
+    fn lone_candidate_no_highlight() {
+        let cands = vec![("今天的事情怎么说".to_string(), "aa".to_string())];
+        assert_eq!(diff_mid_ranges(&cands)[0], None, "无伙伴不高亮");
+    }
+
+    #[test]
+    fn byte_at_surrogate_safe() {
+        let s = "今天的事情怎么说";
+        assert_eq!(char_byte_at(s, 3), Some(9), "3 个汉字 ×3 字节后");
+        assert_eq!(char_byte_at(s, 99), None);
+    }
+}
+
 fn probe_default_cand_font(dwrite: &IDWriteFactory) -> String {
     /// 常见霞鹜版本名（中文名在前——FindFamilyName 精确匹配）
     const CANDS: &[&str] = &[
@@ -3638,6 +3865,8 @@ impl CandidateWindowV2 {
         } else {
             (1.0, 1.0)
         };
+        // 【逐候选字号 2026-10】放大钉首选(i==0)/其余缩小。用户拍板
+        // 回退 2026-10-29：放大跟随选中+换槽缓动实测卡顿，全撤。
         let k_of = |i: usize| if i == 0 { k_first } else { k_rest };
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
@@ -3703,8 +3932,13 @@ impl CandidateWindowV2 {
                 .chain(chars[chars.len().saturating_sub(6)..].iter().copied())
                 .collect()
         };
-        let raw_disp_cap = if horizontal { w_cap * 0.7 } else { 260.0 };
-        let cand_disp_cap = if horizontal { w_cap * 0.35 } else { 240.0 };
+        // 【竖排截断按屏宽 2026-10-29】竖排编码行/候选各占整行宽，旧写
+        // 死 260/240px 在长用户词（13 字 × 首选大字号 ≈246px）直接截成
+        // 「···尾部」——用户实锤「光看见贼吃肉，没看见贼挨打」只显尾段。
+        // 改按屏宽比例（编码 0.8×/候选 0.6×w_cap，窗口宽度本就
+        // .min(w_cap) 封顶，显示层截断与之同源不超屏）。
+        let raw_disp_cap = if horizontal { w_cap * 0.7 } else { w_cap * 0.8 };
+        let cand_disp_cap = if horizontal { w_cap * 0.35 } else { w_cap * 0.6 };
         let raw = trunc_tail(raw, raw_disp_cap.max(100.0));
         let cands: Vec<(String, String)> = cands
             .iter()
@@ -3817,7 +4051,14 @@ impl CandidateWindowV2 {
             (u32, u32, u32, u32, (i32, i32), u32, u32),
             (ID2D1CommandList, ID2D1Effect),
         )> = None;
-        let (tf, tf_first, tf_label, tf_small, tf_first_small, cand_ws, geo) = unsafe {
+        // 【同码长词差异高亮】纯函数：字符区间（前 10 候选内分组；
+        // 整句方案按 tsf 侧开关关闭）
+        let diff_rng = if diff_hl_on() {
+            diff_mid_ranges(&cands)
+        } else {
+            Vec::new()
+        };
+        let (tf, tf_first, tf_label, tf_small, tf_first_small, cand_ws, diff_ws, geo) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
                 None => return,
@@ -3962,6 +4203,9 @@ impl CandidateWindowV2 {
                 ));
             }
 
+            // 【放大滑动 v2·回退 2026-10-29】插值字号整体删除（用户拍板：
+            // 卡顿，放大钉回首选）。
+
             let measure = |tf: &Option<IDWriteTextFormat>, s: &str| -> f32 {
                 if s.is_empty() {
                     return 0.0;
@@ -3993,10 +4237,15 @@ impl CandidateWindowV2 {
             let mut max_text = 0.0f32;
             let mut max_cmt = 0.0f32;
             let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
+            let mut diff_ws: Vec<(f32, f32)> = Vec::new();
             for (i, (t, c)) in cands.iter().enumerate() {
-                // 【逐候选字号 2026-10】首选/其余各用自己的字面宽度
-                let tf_i = if i == 0 { &tf_first } else { &tf };
-                let tfs_i = if i == 0 { &tf_first_small } else { &tf_small };
+                // 【逐候选字号 2026-10】首选(i==0)用大字号字面宽度，其余小档
+                let (tf_i, tfs_i): (&Option<IDWriteTextFormat>, &Option<IDWriteTextFormat>) =
+                    if i == 0 {
+                        (&tf_first, &tf_first_small)
+                    } else {
+                        (&tf, &tf_small)
+                    };
                 let tw = measure(tf_i, t.as_str());
                 let cw = if c.is_empty() {
                     0.0
@@ -4014,6 +4263,17 @@ impl CandidateWindowV2 {
                     max_cmt = max_cmt.max(cw);
                 }
                 cand_ws.push((tw, cw, iw));
+                // 【同码差异高亮】前缀/中段实测宽（渲染三段分色用）
+                let dws = match diff_rng.get(i).copied().flatten() {
+                    Some((s, e)) => match (char_byte_at(t, s), char_byte_at(t, e)) {
+                        (Some(bs), Some(be)) => {
+                            (measure(tf_i, &t[..bs]), measure(tf_i, &t[bs..be]))
+                        }
+                        _ => (0.0, 0.0),
+                    },
+                    None => (0.0, 0.0),
+                };
+                diff_ws.push(dws);
             }
             // 光学垂直居中：CJK 墨盒在行盒内整体偏上（行盒含下降部空白，
             // 段落居中只对齐行盒）→ 视觉上下内边距不等（下面多）。
@@ -4238,6 +4498,7 @@ impl CandidateWindowV2 {
                 tf_small,
                 tf_first_small,
                 cand_ws,
+                diff_ws,
                 (
                     cmt_disp,
                     (
@@ -4275,11 +4536,7 @@ impl CandidateWindowV2 {
         let row_hs: Vec<f32> = (0..cands.len().min(10))
             .map(|i| {
                 if ssf.is_some() {
-                    if i == 0 {
-                        row_user_first.max(1.0)
-                    } else {
-                        row_user.max(1.0)
-                    }
+                    (if i == 0 { row_user_first } else { row_user }).max(1.0)
                 } else {
                     let k = k_of(i);
                     let lh = em * k + layout_f(skin, "line_spacing", 3.0) + 5.0;
@@ -5194,6 +5451,17 @@ impl CandidateWindowV2 {
                     &ctx,
                     text_alpha(color_f(skin, "hilited_comment_text_color", "#C9C9C9FF")),
                 );
+                // 【同码长词差异高亮 2026-10-28】中段差异字色：暖橙，
+                // 明暗皮肤底色上都醒目；选中行文字为高亮白时橙仍可辨。
+                let b_diff = mkbrush(
+                    &ctx,
+                    D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 0.55,
+                        b: 0.05,
+                        a: 1.0,
+                    },
+                );
                 // 【高亮开关 2026-10-30】material.hilite_on=false：胶囊画刷
                 // 置 None（整格胶囊/mark 竖条都不画），高亮行文字/序号/
                 // 注释一律改用普通色——「关掉高亮」= 视觉全无高亮。
@@ -5481,11 +5749,16 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
+                            // 【逐候选字号】首选光学补偿走 dy_first
                             let dy_i = if i == 0 { dy_first } else { dy };
-                            let tf_i: &Option<IDWriteTextFormat> =
-                                if i == 0 { &tf_first } else { &tf };
-                            let tfs_i: &Option<IDWriteTextFormat> =
-                                if i == 0 { &tf_first_small } else { &tf_small };
+                            let (tf_i, tfs_i): (
+                                &Option<IDWriteTextFormat>,
+                                &Option<IDWriteTextFormat>,
+                            ) = if i == 0 {
+                                (&tf_first, &tf_first_small)
+                            } else {
+                                (&tf, &tf_small)
+                            };
                             // 横排单行：整行行槽 = 全页最大行槽——下面所有
                             // row_h 引用自动指向它（文字/胶囊各自居中）。
                             let row_h = row_h_max;
@@ -5617,7 +5890,29 @@ impl CandidateWindowV2 {
                                 );
                                 cx += iw;
                             }
-                            draw(&ctx, tf_i, text, cx, y + dy_i, tw + 2.0, row_h, bt);
+                            // 【同码长词差异高亮 2026-10-28】命中候选
+                            // 三段分色：前3/末1 正常色，中间差异段暖橙。
+                            match diff_rng.get(i).copied().flatten()
+                                .zip(diff_ws.get(i).copied())
+                            {
+                                Some(((s, e), (pw, mw))) if pw > 0.0 || mw > 0.0 => {
+                                    let seg = |k: usize| char_byte_at(text, k);
+                                    if let (Some(bs), Some(be)) = (seg(s), seg(e)) {
+                                        draw(&ctx, tf_i, &text[..bs], cx, y + dy_i, pw + 2.0, row_h, bt);
+                                        draw(
+                                            &ctx, tf_i, &text[bs..be], cx + pw, y + dy_i,
+                                            mw + 2.0, row_h, &b_diff,
+                                        );
+                                        draw(
+                                            &ctx, tf_i, &text[be..], cx + pw + mw, y + dy_i,
+                                            (tw + 2.0 - pw - mw).max(2.0), row_h, bt,
+                                        );
+                                    } else {
+                                        draw(&ctx, tf_i, text, cx, y + dy_i, tw + 2.0, row_h, bt);
+                                    }
+                                }
+                                _ => draw(&ctx, tf_i, text, cx, y + dy_i, tw + 2.0, row_h, bt),
+                            }
                             cx += tw;
                             if !cmt.is_empty() && cw > 0.0 {
                                 draw(&ctx, tfs_i, cmt, cx + hsp, y + dy_i, cw + 2.0, row_h, bc);
@@ -5669,11 +5964,16 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
+                            // 【逐候选字号】首选光学补偿走 dy_first
                             let dy_i = if i == 0 { dy_first } else { dy };
-                            let tf_i: &Option<IDWriteTextFormat> =
-                                if i == 0 { &tf_first } else { &tf };
-                            let tfs_i: &Option<IDWriteTextFormat> =
-                                if i == 0 { &tf_first_small } else { &tf_small };
+                            let (tf_i, tfs_i): (
+                                &Option<IDWriteTextFormat>,
+                                &Option<IDWriteTextFormat>,
+                            ) = if i == 0 {
+                                (&tf_first, &tf_first_small)
+                            } else {
+                                (&tf, &tf_small)
+                            };
                             let row_h = rh_i;
                             let y = y_run;
                             let row_h_eff = row_h * row_scale;
@@ -5824,16 +6124,37 @@ impl CandidateWindowV2 {
                             } else {
                                 cmt_x - text_x - 4.0
                             };
-                            draw(
-                                &ctx,
-                                tf_i,
-                                text,
-                                text_x,
-                                y + dy_i,
-                                text_col_w,
-                                row_h,
-                                bt,
-                            );
+                            // 【同码长词差异高亮 2026-10-28】竖排同款三段分色
+                            match diff_rng.get(i).copied().flatten()
+                                .zip(diff_ws.get(i).copied())
+                            {
+                                Some(((s, e), (pw, mw))) if pw > 0.0 || mw > 0.0 => {
+                                    let seg = |k: usize| char_byte_at(text, k);
+                                    if let (Some(bs), Some(be)) = (seg(s), seg(e)) {
+                                        draw(&ctx, tf_i, &text[..bs], text_x, y + dy_i, pw + 2.0, row_h, bt);
+                                        draw(
+                                            &ctx, tf_i, &text[bs..be], text_x + pw, y + dy_i,
+                                            mw + 2.0, row_h, &b_diff,
+                                        );
+                                        draw(
+                                            &ctx, tf_i, &text[be..], text_x + pw + mw, y + dy_i,
+                                            (text_col_w - pw - mw).max(2.0), row_h, bt,
+                                        );
+                                    } else {
+                                        draw(&ctx, tf_i, text, text_x, y + dy_i, text_col_w, row_h, bt);
+                                    }
+                                }
+                                _ => draw(
+                                    &ctx,
+                                    tf_i,
+                                    text,
+                                    text_x,
+                                    y + dy_i,
+                                    text_col_w,
+                                    row_h,
+                                    bt,
+                                ),
+                            }
                             if !cmt.is_empty() {
                                 // 【SSF 虎娘行内注释 2026-10-16】注释跟在
                                 // 候选词后（layoutSkin add() 同串拼接语义），

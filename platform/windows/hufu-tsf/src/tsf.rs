@@ -7634,6 +7634,17 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         })
         .unwrap_or_default();
     let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // 【同码差异高亮门控 2026-10-28】整句方案候选来自模型解码，
+    // 「完全同码」前提不成立 → 关闭差异高亮（判据与首显滑动门控
+    // 同源：current_schema 含「整句」；sentence_active 无模型包恒
+    // false 不可用）。
+    crate::candwin2::set_diff_hl(
+        !state
+            .get("current_schema")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("整句"),
+    );
     // 反查/命令模式刚进入（编码空、候选空）时，aux 作首行提示立即显示
     let raw = if raw.is_empty() && cands.is_empty() && !aux.is_empty() {
         aux.clone()
@@ -9157,6 +9168,14 @@ fn game_inline_ui(shared: &SharedRef, commit: &str, state: &serde_json::Value) {
         })
         .unwrap_or_default();
     let sel = state.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // 【同码差异高亮门控】同上：整句方案关闭（游戏内联路径同源判据）
+    crate::candwin2::set_diff_hl(
+        !state
+            .get("current_schema")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("整句"),
+    );
     // 【E7·注入】子类化流派键被 WndProc 吃掉——聊天框无拼音明文，直
     // 接注入即可（E5 的退格擦除随旁观模式一并废弃）。
     if !commit.is_empty() {

@@ -22,6 +22,7 @@ mod overlay;
 mod pipe;
 mod platform;
 mod ssf;
+mod sync;
 #[cfg(windows)]
 mod tray;
 
@@ -604,6 +605,9 @@ fn main() {
                         let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
                         h.engine.reload_user_data();
                         eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
+                        // 【云同步 2026-10-28】变化通知同步线程（防抖后
+                        // 上传；自写回环无害——内容与上次一致即跳过上传）
+                        sync::notify("码表变化");
                     } else {
                         // 打字保护：组段未闭合等空档（60s 强制兜底）
                         // 【死赋值清扫 2026-10-26 审计】原 false 初值从不被
@@ -648,6 +652,11 @@ fn main() {
                 }
             });
     }
+
+    // 【云同步 2026-10-28】P1 WebDAV 同步线程（独立线程+全超时，绝不错过
+    // 打字路径；详见 sync.rs 模块头）。启动延迟 20s，周期 5min，码表
+    // 变化/手动/设置保存触发。
+    sync::spawn(shared.clone(), data_dir.clone());
 
     // Windows 托盘（双击开设置页 / 右键退出）
     #[cfg(windows)]
@@ -1264,6 +1273,41 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
         }
     }
+    // 【云同步 2026-10-28】/api/sync/* 锁外分发：test 含网络 IO（连接
+    // 8s/读 30s 超时），绝不能持 Host 锁阻塞打字；status/save 只碰同步
+    // 模块自身状态。POST 仍受上方 Origin/Host 校验保护。
+    if req.path.starts_with("/api/sync/") {
+        return match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/api/sync/status") => Response::json(&sync::status_value()),
+            ("POST", "/api/sync/save") => {
+                let v = req.json();
+                let g = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                match sync::save_settings(&g("url"), &g("user"), &g("pass"), &g("device"), &g("passphrase")) {
+                    Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                    Err(e) => Response::err(500, &e),
+                }
+            }
+            ("POST", "/api/sync/test") => Response::json(&sync::test_connection()),
+            ("GET", "/api/sync/tutorial") => match sync::tutorial_image() {
+                Some(b) => Response {
+                    status: 200,
+                    content_type: "image/png".into(),
+                    body: b,
+                },
+                None => Response::err(404, "未找到 同步教程.png（放 安装目录\\数据\\ 或桌面）"),
+            },
+            ("POST", "/api/sync/now") => {
+                sync::notify("手动");
+                Response::json(&serde_json::json!({"ok": true}))
+            }
+            _ => Response::err(404, "not found"),
+        };
+    }
     // 【锁序修复 2026-10-16】ssf-render 必须在 Host 锁之前处理：渲染
     // 子进程里 DLL 经 pipe 拉皮肤需要同一把锁——锁内等子进程=自我死
     // 锁（PS 退出 0 但 DLL 拉皮肤死等，BMP 永不落盘的根因）。
@@ -1452,6 +1496,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         // 载 546MB 模型秒级卡全机打字）
                         reload_sentence_bg(teardown, true);
                     }
+                    // 【云同步 2026-10-28】配置变化触发同步（防抖后上传）
+                    sync::notify("配置变化");
                     Response::json(&serde_json::json!({"ok": true}))
                 }
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
@@ -2434,6 +2480,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     if need_sentence {
                         reload_sentence_bg(teardown, true);
                     }
+                    // 【云同步 2026-10-28】导入的配置也进同步
+                    sync::notify("配置变化");
                     Response::json(&serde_json::json!({
                         "ok": true,
                         "skins_applied": skins_applied,

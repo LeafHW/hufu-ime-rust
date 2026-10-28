@@ -35,6 +35,15 @@ sha2 = "0.10"
 # 【QPYS 2026-10-16】QQ输入法 .qpys 皮肤内层是 OLE 复合文档（FSPQ 偏移
 # 0x114 起），标准 CFB 目录树直出「文件名→流」。仅 hufu-skin（server 链）。
 cfb = "0.10"
+# 【P1 云同步 2026-10-28】WebDAV 同步客户端件（仅 hufu-server）：aes-gcm
+# +pbkdf2=可选口令端到端加密（云端只见密文）；getrandom=盐/nonce。
+# ureq 不入 workspace：Windows/unix 特性不同（见 hufu-server Cargo.toml
+# ——Windows 必须 native-tls/schannel，本仓零 C 工具链红线，rustls/ring
+# 需 gcc 会破坏发行链）。详见 hufu-server\src\sync.rs 模块头。
+aes-gcm = "0.10"
+pbkdf2 = "0.11"
+hmac = "0.12"
+getrandom = "0.2"
 
 [profile.release]
 lto = "fat"

@@ -34,6 +34,13 @@ sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 # 【旧版控制台真光标 2026-10-15】console_caret op：AttachConsole 到宿主
 # 客户端进程读光标（DLL 载在 conhost 内自读双通道皆死，只能借外部进程）。
+# 【P1 云同步 2026-10-28】加密件（详见 src/sync.rs）：纯 Rust，零 C 工具链。
+# pbkdf2 0.11 的 pbkdf2::<PRF> 需要 hmac::Hmac 做 PRF。
+aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+getrandom = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -42,3 +49,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
+# 【云同步 TLS 选型 2026-10-28】Windows 走 native-tls（schannel 纯 Rust
+# 绑定，系统证书库/企业代理兼容）：本仓发行链零 C 工具链（rustc gnu
+# self-contained），rustls/ring 需 gcc.exe 会直接构建失败（实测）。
+# 默认特性全关（gzip 不需要——自家同步包固定 JSON，不请求压缩）。
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(unix)'.dependencies]
+# unix 链（Linux 自带 gcc）：rustls。
+ureq = { version = "2", default-features = false, features = ["tls"] }
