@@ -747,6 +747,10 @@ pub struct SoundSection {
     pub enabled: bool,
     /// 0–100
     pub volume: u8,
+    /// 音效包名（数据\音效\<pack>\{key,select,commit,page}.wav）。
+    /// 空 = 根目录平铺四件（旧模式/自定义）；包缺失或非法名回退根目录。
+    /// 【2026-10-30 音效包】设置页下拉选择，键响应随行包名→DLL 变更即失效缓存。
+    pub pack: String,
 }
 
 impl Default for SoundSection {
@@ -754,6 +758,7 @@ impl Default for SoundSection {
         SoundSection {
             enabled: false,
             volume: 50,
+            pack: String::new(),
         }
     }
 }

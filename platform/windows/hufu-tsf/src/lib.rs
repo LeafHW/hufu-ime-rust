@@ -570,7 +570,7 @@ extern "system" fn hufu_test_candwin2(mode: u32) -> i32 {    use crate::candwin2
 #[no_mangle]
 extern "system" fn hufu_test_sound_burst() -> i32 {
     for i in 0..16u32 {
-        crate::sound::play("key", 70);
+        crate::sound::play("key", 70, "");
         if i % 2 == 0 {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }

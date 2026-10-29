@@ -635,14 +635,24 @@ fn refresh_schemas_cache_inner(force: bool) {
         }
     }
     let snd = crate::ipc::call(&serde_json::json!({"op": "sound_state"}))
-        .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()));
-    if let Some(on) = snd {
+        .and_then(|r| {
+            let enabled = r.get("enabled").and_then(|v| v.as_bool());
+            let pack = r.get("pack").and_then(|v| v.as_str()).map(|s| s.to_string());
+            enabled.map(|e| (e, pack))
+        });
+    if let Some((on, pack)) = snd {
         let was = SND_ON.swap(on, Ordering::Relaxed);
         // 【B6 修复 2026-09-13 三十四修】开关状态翻转时清本进程音效
         // 缓存——invalidate() 原本零调用，wav/开关变更后旧缓存永不
         // 失效（换音效文件+重开开关也放旧音）。
         if was != on {
             crate::sound::invalidate();
+        }
+        // 【音效包 2026-10-30】包名变更兜底失效（键响应随行为主通道；
+        // 此处 5s 快照覆盖 config.json 手改/云同步拉取等不经键响应的
+        // 变更）。set_pack 内部含变更检测与 invalidate。
+        if let Some(p) = pack {
+            crate::sound::set_pack(&p);
         }
     }
 }

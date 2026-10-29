@@ -147,12 +147,28 @@ fn key_pool_tags() -> Vec<String> {
     g.clone().unwrap()
 }
 
+/// 当前音效包名（server 键响应随行；变更即清缓存按新包重取）。
+/// 【音效包 2026-10-30】空串 = 根目录平铺（旧模式）。langbar 5s 快照
+/// 比对兜底（覆盖 config.json 手改/云同步拉取等不经键响应的变更）。
+static CURRENT_PACK: Mutex<String> = Mutex::new(String::new());
+
+/// 包名变更检测：不同→invalidate()+记新值；相同→no-op（零成本）。
+pub fn set_pack(pack: &str) {
+    let mut g = CURRENT_PACK.lock().unwrap_or_else(|p| p.into_inner());
+    if g.as_str() != pack {
+        invalidate();
+        *g = pack.to_string();
+    }
+}
+
 /// 播放 tag 音效（失败静默）。**调度线程 + 8 固定播放工人**：
 /// tag=="key" 走键音新模型：随机 clip + 音量抖动、可被 key_up() 截断
 /// （按下出声松开即停）；其余（select/commit/page）为事件音不受松键影响。
 /// vol = server 每键随行的当前音量（0-100，热生效）——wav 数据可缓存，
 /// 音量永远用最新值，设置页改音量下一键即生效。
-pub fn play(tag: &str, vol: u8) {
+/// pack = server 随行音效包名：变更即失效缓存（设置页换包下一键即新音）。
+pub fn play(tag: &str, vol: u8, pack: &str) {
+    set_pack(pack);
     let is_key = tag == "key";
     let clip = if is_key {
         let tags = key_pool_tags();

@@ -3328,7 +3328,7 @@ impl HuFuTs_Impl {
                 (f, g.shift_pending_side)
             };
             if fire {
-                if let Some((consumed, commit, _back, state, _sound, _vol)) =
+                if let Some((consumed, commit, _back, state, _sound, _vol, _pack)) =
                     ipc::key_request(side, false, false, false, false, None)
                 {
                     if consumed {
@@ -3737,7 +3737,7 @@ impl HuFuTs_Impl {
         if g_first_key_probe() {
             diag_note(&format!("lat: KEY前 name={name} test={test_only}"));
         }
-        let Some((consumed, commit, back, state, sound, sound_vol)) = ipc::key_request(
+        let Some((consumed, commit, back, state, sound, sound_vol, sound_pack)) = ipc::key_request(
             &name,
             m_shift,
             m_ctrl,
@@ -3981,7 +3981,7 @@ impl HuFuTs_Impl {
             // 宿主不产字（「caps 切换后英文打不进」）。切换响应
             // commit 为空、无组段副作用，update_ui 此时只做状态同步。
             if let Some(tag) = sound {
-                crate::sound::play(&tag, sound_vol);
+                crate::sound::play(&tag, sound_vol, &sound_pack);
             }
             // 【七十七修·回删替换两级通道】数字后 1. 再按 . → 删半角
             // 点+提交「。」。先走 TSF 扩选删除（QQ/记事本等正常宿主）；
@@ -4258,7 +4258,7 @@ pub fn test_key(vk: u32) -> i32 {
     let _ = (shift, ctrl, alt);
     let r = ipc::key_request(&name, false, false, false, false, None);
     match r {
-        Some((consumed, _commit, _back, _state, _sound, _vol)) => {
+        Some((consumed, _commit, _back, _state, _sound, _vol, _pack)) => {
             eprintln!("hufu-tsf: test_key '{name}' → consumed={consumed}");
             if consumed { 1 } else { 0 }
         }
@@ -9032,7 +9032,7 @@ fn game_engine_key(vk: usize) -> Option<bool> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .line_end;
-    let (consumed, commit, _back, state, _snd, _vol) =
+    let (consumed, commit, _back, state, _snd, _vol, _pack) =
         crate::ipc::key_request(&name, shift, ctrl, alt, line_end, None)?;
     if consumed {
         crate::tsf::trace(&format!("E7: {name} consumed commit={commit:?}"));

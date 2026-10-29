@@ -1007,6 +1007,60 @@ fn rewrite_keep_lines(path: &std::path::Path, code: &str, text: &str) {
     }
 }
 
+/// 【音效包 2026-10-30】四类事件 tag（pipe op 与 HTTP /api/sound 共用白名单）。
+pub const SOUND_TAGS: [&str; 4] = ["key", "select", "commit", "page"];
+
+/// 包名合法性：不含路径分隔符/..:/控制字符（防目录穿越），长度 ≤64。
+pub fn sound_pack_name_ok(pack: &str) -> bool {
+    !pack.is_empty()
+        && !pack.contains(['\\', '/', ':'])
+        && !pack.contains("..")
+        && pack.chars().all(|c| !c.is_control())
+        && pack.len() <= 64
+}
+
+/// tag → wav 路径：音效包优先（数据\音效\<pack>\<tag>.wav），包缺失/非法
+/// 名回退根目录平铺（数据\音效\<tag>.wav，旧模式/自定义）。tag 须已过白名单。
+pub fn sound_wav_path(data_dir: &std::path::Path, pack: &str, tag: &str) -> std::path::PathBuf {
+    let root = data_dir.join("音效");
+    let pack = pack.trim();
+    if sound_pack_name_ok(pack) {
+        let p = root.join(pack).join(format!("{tag}.wav"));
+        if p.is_file() {
+            return p;
+        }
+    }
+    root.join(format!("{tag}.wav"))
+}
+
+/// 音效包目录列表：数据\音效\ 下四件（key/select/commit/page.wav）齐全的
+/// 子目录才算包（半成品目录不进下拉）。排序稳定。
+pub fn sound_pack_list(data_dir: &std::path::Path) -> Vec<String> {
+    let root = data_dir.join("音效");
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if !sound_pack_name_ok(&name) {
+                continue;
+            }
+            let complete = SOUND_TAGS
+                .iter()
+                .all(|t| e.path().join(format!("{t}.wav")).is_file());
+            if complete {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// 预览图 Content-Type（按扩展名；未知回 octet-stream 让浏览器下载判定）。
 fn image_content_type(p: &std::path::Path) -> &'static str {
     match p
@@ -2231,13 +2285,19 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({"ok": true}))
         }
         ("GET", "/api/sound") => {
-            // 音效预览：?tag=key|select|commit|page → audio/wav
+            // 音效预览：?tag=key|select|commit|page[&pack=包名] → audio/wav
+            // 【音效包 2026-10-30】pack 参数可覆盖当前配置（设置页选中未
+            // 保存即试听该包）；缺省走 config.sound.pack（包优先/回退根目录）
             let tag = req.query.get("tag").cloned().unwrap_or_default();
-            let safe = ["key", "select", "commit", "page"];
+            let safe = crate::SOUND_TAGS;
             if !safe.contains(&tag.as_str()) {
                 return Response::err(400, "未知音效");
             }
-            let p = host.data_dir.join("音效").join(format!("{tag}.wav"));
+            let pack = match req.query.get("pack") {
+                Some(p) => p.trim().to_string(),
+                None => host.engine.config.sound.pack.trim().to_string(),
+            };
+            let p = crate::sound_wav_path(&host.data_dir, &pack, &tag);
             match std::fs::read(&p) {
                 Ok(bytes) => Response {
                     status: 200,
@@ -2246,6 +2306,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 },
                 Err(_) => Response::err(404, "音效文件不存在"),
             }
+        }
+        ("GET", "/api/sound_packs") => {
+            // 音效包清单：{packs: [...], current: "..."}（设置页下拉数据源）
+            Response::json(&serde_json::json!({
+                "packs": crate::sound_pack_list(&host.data_dir),
+                "current": host.engine.config.sound.pack.trim(),
+            }))
         }
         ("GET", "/api/export") => {
             // 全量用户数据快照：配置 + 当前方案用户词 + 调整日志
@@ -3241,5 +3308,68 @@ mod overlay_purge {
             assert_eq!(v["id"], "hufu-chenwu", "其余字段原样");
             assert_eq!(v["overlay"]["enabled"], json!(false), "开关保留");
         }
+    }
+}
+
+#[cfg(test)]
+mod sound_pack_tests {
+    use super::*;
+
+    fn mk_data_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hufu-sndpack-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let snd = dir.join("音效");
+        std::fs::create_dir_all(snd.join("圣熊猫")).unwrap();
+        std::fs::create_dir_all(snd.join("半成品")).unwrap();
+        // 根目录四件（旧模式）
+        for t in SOUND_TAGS {
+            std::fs::write(snd.join(format!("{t}.wav")), [0u8, 1, 2, 3]).unwrap();
+        }
+        // 圣熊猫包四件（内容可区分）
+        for t in SOUND_TAGS {
+            std::fs::write(snd.join("圣熊猫").join(format!("{t}.wav")), [9u8, 9, 9]).unwrap();
+        }
+        // 半成品目录只有 key（不进列表）
+        std::fs::write(snd.join("半成品").join("key.wav"), [7u8, 7]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sound_wav_path_pack_priority_and_fallback() {
+        let dir = mk_data_root("path");
+        // 包命中：读包内文件
+        let p = sound_wav_path(&dir, "圣熊猫", "key");
+        assert!(p.ends_with(r"音效\圣熊猫\key.wav") || p.to_string_lossy().contains("圣熊猫"), "包内优先: {p:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), vec![9u8, 9, 9]);
+        // 包缺失：回退根目录（旧模式兼容）
+        let p = sound_wav_path(&dir, "不存在的包", "key");
+        assert_eq!(std::fs::read(&p).unwrap(), vec![0u8, 1, 2, 3], "包缺失回退根目录");
+        // 非法包名（穿越/分隔符/空）：一律回退根目录
+        for bad in ["..", "a/b", "a\\b", "  ", ""] {
+            let p = sound_wav_path(&dir, bad, "key");
+            assert_eq!(std::fs::read(&p).unwrap(), vec![0u8, 1, 2, 3], "非法包名[{bad}]回退根");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sound_pack_listing_complete_only() {
+        let dir = mk_data_root("list");
+        let list = sound_pack_list(&dir);
+        assert_eq!(list, vec!["圣熊猫".to_string()], "四件齐才算包，半成品/根文件不进: {list:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sound_pack_name_ok_rules() {
+        assert!(sound_pack_name_ok("圣熊猫"));
+        assert!(sound_pack_name_ok("cream-nk_v2"));
+        assert!(!sound_pack_name_ok(""), "空名=根目录模式，不算包");
+        assert!(!sound_pack_name_ok(".."));
+        assert!(!sound_pack_name_ok("a/b"));
+        assert!(!sound_pack_name_ok("a\\b"));
+        assert!(!sound_pack_name_ok("a:b"));
+        assert!(!sound_pack_name_ok("a\nb"), "控制字符拒");
+        assert!(!sound_pack_name_ok(&"x".repeat(65)), "超长拒");
     }
 }

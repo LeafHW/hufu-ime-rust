@@ -491,7 +491,7 @@ fn call_on(
     }
 }
 
-/// 按键请求 → (consumed, commit, back, state, sound, sound_vol)
+/// 按键请求 → (consumed, commit, back, state, sound, sound_vol, sound_pack)
 /// line_end：前端检测到组段逼近窗口右缘（软换行边界）——引擎提前上屏
 /// 确认键数 2→1，组段早一步缩短（见 engine Session::line_end_hint）。
 pub fn key_request(
@@ -501,7 +501,7 @@ pub fn key_request(
     alt: bool,
     line_end: bool,
     digit_tail: Option<&str>,
-) -> Option<(bool, String, u8, Value, Option<String>, u8)> {
+) -> Option<(bool, String, u8, Value, Option<String>, u8, String)> {
     // 【七十七修·digit_tail 补齐】空态键随带 TestDown 记的直通数字
     // 尾巴——server 端做后缀补齐（engine tail 没有这段才追加，递键
     // 宿主 QQ 的 tail 不被覆盖污染）。
@@ -559,7 +559,13 @@ pub fn key_request(
         .get("sound_vol")
         .and_then(|v| v.as_u64())
         .unwrap_or(70) as u8;
-    Some((consumed, commit, back, state, sound, sound_vol))
+    // 【音效包 2026-10-30】包名随行：sound.rs 比对变更即失效缓存
+    let sound_pack = outcome
+        .get("sound_pack")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((consumed, commit, back, state, sound, sound_vol, sound_pack))
 }
 
 // 【三十四修·死代码删除】ping()（零调用）已删。

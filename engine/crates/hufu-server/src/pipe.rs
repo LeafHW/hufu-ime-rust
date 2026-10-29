@@ -121,6 +121,10 @@ pub fn dispatch(
                 // 音量取响应值——设置页改音量无需重启/失效缓存）
                 if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
                     r["outcome"]["sound_vol"] = serde_json::json!(host.engine.config.sound.volume);
+                    // 【音效包 2026-10-30】包名随行：DLL 比对变更即失效
+                    // 缓存并按新包重取（设置页换包下一键立即生效）
+                    r["outcome"]["sound_pack"] =
+                        serde_json::json!(host.engine.config.sound.pack);
                 }
                 r
             }
@@ -137,6 +141,8 @@ pub fn dispatch(
             let mut r = host.select_candidate(index);
             if r.get("outcome").and_then(|o| o.get("sound")).is_some() {
                 r["outcome"]["sound_vol"] = serde_json::json!(host.engine.config.sound.volume);
+                r["outcome"]["sound_pack"] =
+                    serde_json::json!(host.engine.config.sound.pack);
             }
             r
         }
@@ -950,6 +956,8 @@ pub fn dispatch(
         "sound_state" => serde_json::json!({
             "enabled": host.engine.config.sound.enabled,
             "volume": host.engine.config.sound.volume,
+            // 【音效包 2026-10-30】DLL langbar 5s 快照比对包名变更→失效缓存
+            "pack": host.engine.config.sound.pack.trim(),
         }),
         "sound_toggle" => {
             host.engine.config.sound.enabled = !host.engine.config.sound.enabled;
@@ -1049,22 +1057,31 @@ pub fn dispatch(
             serde_json::json!({"ok": true})
         }
         "sound" => {
-            // tag → {data: base64 wav, volume}（文件缺失返回 404 语义 null）
+            // tag → {data: base64 wav, volume, pack}（包优先/回退根目录；
+            // 文件缺失返回 404 语义 null）。【音效包 2026-10-30】
             let tag = req.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-            let safe = ["key", "select", "commit", "page"];
+            let safe = crate::SOUND_TAGS;
             if !safe.contains(&tag) {
                 return serde_json::json!({"error": "未知音效"});
             }
             let vol = host.engine.config.sound.volume;
-            let p = host.data_dir.join("音效").join(format!("{tag}.wav"));
+            let pack = host.engine.config.sound.pack.trim().to_string();
+            let p = crate::sound_wav_path(&host.data_dir, &pack, tag);
             match std::fs::read(&p) {
                 Ok(bytes) => serde_json::json!({
                     "data": base64_encode(&bytes),
                     "volume": vol,
+                    "pack": pack,
                 }),
-                Err(_) => serde_json::json!({"data": null, "volume": vol}),
+                Err(_) => serde_json::json!({"data": null, "volume": vol, "pack": pack}),
             }
         }
+        // 【音效包 2026-10-30】包清单 + 当前选中（设置页下拉数据源；DLL 端
+        // 不用——键响应已随行包名）
+        "sound_packs" => serde_json::json!({
+            "packs": crate::sound_pack_list(&host.data_dir),
+            "current": host.engine.config.sound.pack.trim(),
+        }),
         "clipboard" => {
             // {exe} → {text}：白名单校验 + 读剪贴板（Ctrl+Shift+V 剪贴板上屏）
             let cfg = host.engine.config.clipboard.clone();
