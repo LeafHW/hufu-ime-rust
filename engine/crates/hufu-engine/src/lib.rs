@@ -5237,6 +5237,14 @@ impl Engine {
         session.candidates.clear();
         session.page = 0;
         session.selected = 0;
+        // 【重排×同 key 重建 2026-10-29】清空候选 = 「重排已应用」状态随
+        // 之失效。两段式提交门控（select_first → decode_rich_full）全量
+        // 重解后同 key 重建列表，若保留旧 rerank_applied_key，apply_
+        // rerank 的幂等闸会跳过缓存序重放——空格提交退回 ngram 序
+        //（用户实锤 v1.9.4「重排只在候选生效，空格落盘还是之前的」）。
+        // 轮询路径（refresh_rerank→apply_rerank，无重建）不受影响，
+        // 幂等闸的省 decode_rich 收益保留。
+        session.rerank_applied_key.clear();
         if session.raw.is_empty() {
             return;
         }
@@ -8532,6 +8540,65 @@ mod tests {
         let pos_lg = s.candidates.iter().position(|c| c.text == "老鬼").unwrap();
         assert_eq!(pos_lg, s.candidates.len() - 1, "过程态恒沉底: {:?}", s.candidates.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
         assert!(s.candidates[0].text != "老鬼", "过程态不可居首");
+    }
+
+    /// 【重排×提交门控 2026-10-29】v1.9.4 用户实锤：整句重排只在候选
+    /// 窗生效，空格落盘还是重排前的旧首选。根因 = 两段式提交门控
+    /// （select_first → decode_rich_full 全量重解 → refresh_candidates
+    /// 同 key 重建候选）后，rerank_applied_key 幂等闸挡住缓存序重放。
+    /// 修复 = refresh_candidates 清列表时同步清 applied 标记。本测试
+    /// 复刻全链：同 key 二次重建后重排序必须保持，且空格提交吃重排后
+    /// 的首选。
+    struct GateMock;
+    impl SentenceDecoder for GateMock {
+        fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
+            // ngram 初排序：甲 > 乙 > 丙（甲乙同深度 sum=2，丙 sum=3）
+            let hits = if raw == "javzq" {
+                vec![
+                    SentenceHit { text: "甲".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "乙".into(), score: -5.2, confidence: -5.2, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "丙".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
+                ]
+            } else {
+                Vec::new()
+            };
+            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false })
+        }
+        // 两段式开启：提交门控走 decode_rich_full → Some
+        fn decode_rich_full(&self, raw: &str) -> Option<std::sync::Arc<SentenceDecode>> {
+            Some(self.decode_rich(raw))
+        }
+    }
+
+    #[test]
+    fn rerank_survives_commit_gate_rebuild() {
+        let dir = std::env::temp_dir().join("hufu-eng-gate-rerank");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        eng.set_sentence_decoder(Some(std::sync::Arc::new(GateMock)));
+        eng.config.sentence.auto_enable = false; // 整句域立即可用（不挑方案名）
+        eng.config.sentence.rerank.enabled = true;
+        // Qwen 缓存序：乙 > 甲 > 丙（乙与甲同选重深度，允许居首）
+        {
+            let mut cache = eng.rerank_cache.lock().unwrap();
+            cache.insert("javzq".into(), vec!["乙".into(), "甲".into(), "丙".into()]);
+        }
+        let mut s = Session::new(true);
+        s.raw = "javzq".into(); // 5 键 > max_code_length ⇒ 整句接管
+        eng.refresh_candidates(&mut s);
+        let t1: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(t1, vec!["乙", "甲", "丙"], "首次刷新即应用重排: {t1:?}");
+        assert_eq!(s.rerank_applied_key, "javzq");
+        // 提交门控路径 = 同 key 重建（decode_rich_full 全量重解后
+        // refresh_candidates）：幂等闸不得挡缓存序重放
+        eng.refresh_candidates(&mut s);
+        let t2: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(t2, vec!["乙", "甲", "丙"], "同 key 重建后重排必须保持（v1.9.4 空格落盘旧序根因）: {t2:?}");
+        // 空格提交：落盘必须是重排后的首选「乙」
+        let o = eng.select_first(&mut s);
+        assert_eq!(o.commit.as_deref(), Some("乙"), "空格提交必须吃重排后首选: {:?}", o.commit);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 【2026-09-06 用户规格→2026-09-08 双档】\ 命令模式取消；
