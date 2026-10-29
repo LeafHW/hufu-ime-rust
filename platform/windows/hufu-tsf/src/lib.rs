@@ -171,9 +171,17 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
     let with_cmt = std::env::var("HUFU_PAD_CMT").ok().as_deref() == Some("1");
     // HUFU_PAD_V=1：强制竖排（溢出修复验证用——当前配置横排）
     let force_v = std::env::var("HUFU_PAD_V").ok().as_deref() == Some("1");
-    let words = [
-        "你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有",
-    ];
+    // 【SSF 长词跨行排查 2026-10-30】HUFU_PAD_WORDS 用「|」分隔注入任意
+    // 候选词（竖排长词 wrap 复现；中文词不能用逗号——词内含逗号）。
+    let words_env = std::env::var("HUFU_PAD_WORDS").unwrap_or_default();
+    let words: Vec<&str> = if words_env.is_empty() {
+        vec![
+            "你好", "世界", "吗", "呢", "吧", "的", "了", "是", "在", "有",
+        ]
+    } else {
+        words_env.split('|').collect()
+    };
+    let n = n.min(words.len());
     let cmt_src = [
         "ni hao", "shijie", "shaoyong", "ne", "ba", "de", "le", "shi", "zai", "you",
     ];

@@ -4093,7 +4093,7 @@ impl CandidateWindowV2 {
             let mk_tf = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
                 let mut b: Vec<u16> = fam.encode_utf16().collect();
                 b.push(0);
-                dwrite
+                let t = dwrite
                     .CreateTextFormat(
                         PCWSTR(b.as_ptr()),
                         None,
@@ -4103,7 +4103,22 @@ impl CandidateWindowV2 {
                         em,
                         PCWSTR(locale.as_ptr()),
                     )
-                    .ok()
+                    .ok();
+                // 【候选禁折行 2026-10-30】外部用户反馈 .ssf 皮肤长词
+                // 候选跨行叠到下一行（调小字号才缓解）。根因链：全 DLL
+                // 从未设置 word wrapping——DirectWrite 默认 WRAP，而 D2D
+                // DrawText 默认不裁剪，任何路径把文字 rect 宽算窄，长词
+                // 就折成两行且第二行完整溢出到下一行候选上。本修复为
+                // 结构性保险：所有候选窗文字格式统一 NO_WRAP——此后任何
+                // 上游宽算错最多水平溢出，永不垂直折行（四个渲染路径
+                // JSON/SSF × 横/竖的 rect 宽均为实测宽+2px，正常路径零
+                // 视觉差；已用 pad dump 四档字号逐像素对照验证不变）。
+                // 注意 measure() 也吃同一 tf：layoutWidth=4096 远大于词宽，
+                // NO_WRAP 不影响 GetMetrics().width。
+                if let Some(t) = &t {
+                    let _ = t.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                }
+                t
             };
             let tf;
             let tf_first;
