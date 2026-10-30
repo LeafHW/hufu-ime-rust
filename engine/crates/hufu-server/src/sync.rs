@@ -871,6 +871,19 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
         }
     }
 
+    //【自带皮肤参数同步 2026-10-31】皮肤目录文件面（mtime-LWW 同款，
+    // 哈希比对免空转）。下载落地后 skin_ver 推进——DLL poll 立即重拉。
+    {
+        let (su, pulled) = sync_builtin_skins(&agent, s, &mut mf)?;
+        uploaded += su;
+        if pulled {
+            if let Some(shared) = SHARED.get() {
+                let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
+                h.skin_ver += 1;
+            }
+        }
+    }
+
     // config：三方归并（base=上次收敛快照）。远端项变了且本机没动 →
     // 采纳；本机变了 → 保留；都动 → 本机胜。
     let mut cfg_changed = false;
@@ -1090,7 +1103,7 @@ fn count_files(dir: &Path) -> usize {
 fn empty_manifest() -> Value {
     json!({"v": MF_VERSION, "device": "", "ts": 0,
         "config": Value::Null,
-        "devices": {}, "schemes": {}})
+        "devices": {}, "schemes": {}, "skins": {}})
 }
 
 /// JSON 对象键转义（方案名含 / 或 . 时 pointer 路径安全）。
@@ -1244,6 +1257,172 @@ fn pull_scheme_all(
         total += pull_file(agent, s, &dir, fname, key, rmt)?;
     }
     Ok(total)
+}
+
+// ─────────────── 自带皮肤参数同步【2026-10-31 用户拍板】 ───────────────
+// JSON 自带皮（hufu-*.json，安装包 20 款）的调参写进皮肤文件本体，
+// 该目录不在码表同步面。现把皮肤目录作为独立文件面纳入：manifest
+// 顶层 "skins" 记 {mt,sz,h,key}，mtime-LWW 与方案文件同款仲裁；键空间
+// 用 file_key("builtin-skins", 文件名) 隔离（不与方案名撞键）。
+// 内容哈希比对：哈希相同只对齐 mtime 不传文件——首轮 20 款皮不产生
+// 「内容相同来回空转」流量。只新增/覆盖、不做删除传播（自带皮随安装
+// 包存在，无「删」语义）。.ssf 皮肤文件与其 overrides 仍不同步（对机
+// 没装皮肤文件时同步参数无意义）。
+
+/// 扫描皮肤目录下的自带皮（hufu-*.json；自定义皮不带此前缀，不同步）。
+fn scan_builtin_skins(dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut m = BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let Some(n) = p.file_name().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            if n.starts_with("hufu-") && n.ends_with(".json") {
+                m.insert(n.to_string(), p);
+            }
+        }
+    }
+    m
+}
+
+/// 上传单个皮肤文件（哈希相同时只对齐 manifest.mt，不传内容）。
+fn push_skin_file(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &mut Value,
+    name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("读皮肤「{name}」失败：{e}"))?;
+    if raw.len() as u64 > MAX_FILE {
+        return Err(format!("皮肤「{name}」超限（32 MB）——已中止本轮"));
+    }
+    let mt = file_mtime_ms(path)?;
+    let h = hash_bytes(&raw);
+    let key = file_key("builtin-skins", name);
+    // 哈希未变（只是 mtime 被安装/拷贝刷新）：对齐时刻即可，免传
+    let cur = mf
+        .get("skins")
+        .and_then(|v| v.get(name))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if cur.get("h").and_then(|x| x.as_str()) == Some(h.as_str())
+        && cur.get("sz").and_then(|x| x.as_u64()) == Some(raw.len() as u64)
+    {
+        if let Some(m) = mf["skins"].as_object_mut() {
+            m.insert(name.to_string(), json!({"mt": mt, "sz": raw.len(), "h": h, "key": key}));
+        }
+        return Ok(());
+    }
+    let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
+    match auth_req(
+        agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+        &s.user,
+        &s.pass,
+    )
+    .send_bytes(&raw)
+    {
+        Ok(_) => {}
+        Err(ureq::Error::Status(409, _)) => {
+            mkcol(agent, s)?;
+            auth_req(
+                agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+                &s.user,
+                &s.pass,
+            )
+            .send_bytes(&raw)
+            .map_err(|e| format!("上传皮肤「{name}」失败：{e}"))?;
+        }
+        Err(ureq::Error::Status(401, _)) => {
+            return Err("认证失败：账号或应用密码不对".into());
+        }
+        Err(e) => return Err(format!("上传皮肤「{name}」失败：{e}")),
+    }
+    // 索引直写（洗劫铁律：不 pointer_mut）
+    let wrote = mf
+        .get_mut("skins")
+        .and_then(|v| v.as_object_mut())
+        .map(|m| m.insert(name.to_string(), json!({"mt": mt, "sz": raw.len(), "h": h, "key": key})).is_some() || true)
+        .unwrap_or(false);
+    if !wrote {
+        return Err("同步清单结构损坏（skins）——已中止本轮".into());
+    }
+    Ok(())
+}
+
+/// 自带皮肤面同步。返回 (上传文件数, 是否有下载落地)。
+/// 下载落地后调用方需 bump skin_ver（DLL 立即重拉生效）。
+fn sync_builtin_skins(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &mut Value,
+) -> Result<(usize, bool), String> {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return Ok((0, false));
+    };
+    let dir = data_dir.join("皮肤");
+    let local = scan_builtin_skins(&dir);
+    if !mf.get("skins").is_some_and(|v| v.is_object()) {
+        mf["skins"] = json!({});
+    }
+    let remote: BTreeMap<String, (u64, String, String)> = mf["skins"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        (
+                            v.get("mt").and_then(|x| x.as_u64()).unwrap_or(0),
+                            v.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            v.get("h").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut uploaded = 0usize;
+    let mut pulled = false;
+    for (name, p) in &local {
+        let lmt = file_mtime_ms(p).unwrap_or(0);
+        match remote.get(name) {
+            Some((rmt, key, rh)) if *rmt > lmt => {
+                // 云端新：哈希相同只回拨 mtime 对齐（内容没变免下载）
+                let same = std::fs::read(p)
+                    .map(|b| hash_bytes(&b) == *rh)
+                    .unwrap_or(false);
+                if same {
+                    set_mtime(p, *rmt);
+                } else {
+                    pull_file(agent, s, &dir, name, key, *rmt)?;
+                    pulled = true;
+                }
+            }
+            Some((rmt, _, _)) if lmt > *rmt => {
+                push_skin_file(agent, s, mf, name, p)?;
+                uploaded += 1;
+            }
+            Some(_) => {} // 同刻：不动
+            None => {
+                push_skin_file(agent, s, mf, name, p)?;
+                uploaded += 1;
+            }
+        }
+    }
+    // 云端有、本地无：落地（旧版安装包缺皮时补齐；不做删除方向）
+    for (name, (rmt, key, _)) in &remote {
+        if !local.contains_key(name) {
+            let _ = std::fs::create_dir_all(&dir);
+            pull_file(agent, s, &dir, name, key, *rmt)?;
+            pulled = true;
+        }
+    }
+    Ok((uploaded, pulled))
 }
 
 /// 写盘前备份到 数据\同步备份\ts-<秒>\（整轮备份，保 10 份）。

@@ -1864,6 +1864,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             match host.reset_official_skin(&id) {
                 Some(s) => {
                     let _ = host.engine.config.save(&host.config_path);
+                    //【皮肤参数云同步 2026-10-31】恢复出厂重写文件 → 触发同步
+                    crate::sync::notify("皮肤");
                     Response::json(&serde_json::to_value(&s).unwrap())
                 }
                 None => Response::err(404, &format!("皮肤 {id} 非官方皮肤（无出厂配置）")),
@@ -1887,6 +1889,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
                     // 2.5s 缓存）——设置页调参实机预览即时生效
                     host.skin_ver += 1;
+                    //【皮肤参数云同步 2026-10-31】自带皮调参写盘 → 触发
+                    // 同步轮（notify 无锁，持 host 锁调用安全）
+                    crate::sync::notify("皮肤");
                     Response::json(&serde_json::json!({"ok": true, "id": skin.id}))
                 }
                 Err(e) => Response::err(500, &format!("保存失败: {e}")),
