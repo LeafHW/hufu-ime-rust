@@ -747,6 +747,7 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     let mut uploaded = 0usize;
     let mut downloaded = 0usize;
     let mut deleted_local = 0usize;
+    let mut deleted_remote = 0usize;
     let snap = s.local_snap.clone();
 
     for name in &s.selected {
@@ -814,17 +815,64 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             }
         }
 
+        //【本机删除传播 2026-10-31】云端有、本地无、且上次收敛快照
+        //（local_snap）里有该文件 = 本机在收敛后主动删除（清空用户调整、
+        // 换码表删旧文件等）→ 删除上云：清单就地移除条目，对端下轮走
+        // 「对端删除」分支进回收站。snap 里也没有 = 本机从未有过（新机
+        // 收敛 / 对端新增文件）→ 正常拉取。此前本地缺失一律无条件拉回
+        // ——删除被复活（用户实锤：删用户调整.txt 两分钟内自动回来）。
+        //【防洗劫守卫】若删除会清空整个方案的清单且本轮没有新文件可
+        // 补上传，则不传播（数据目录异常移动/误删全部时防止洗掉对端；
+        // 真要整案清空请走同步管理「删除云端」）。
+        let pending_deletes: Vec<&String> = r_files
+            .iter()
+            .filter(|(fname, _)| {
+                local_files.get(*fname).is_none()
+                    && snap_files.is_some_and(|m| m.contains_key(*fname))
+            })
+            .map(|(fname, _)| fname)
+            .collect();
+        let local_new_count = local_files
+            .keys()
+            .filter(|f| !r_files.contains_key(*f))
+            .count();
+        let skip_all_deletes = !pending_deletes.is_empty()
+            && pending_deletes.len() == r_files.len()
+            && local_new_count == 0;
+        if skip_all_deletes {
+            eprintln!(
+                "云同步：方案 {name} 的 {} 个文件在本机全部消失——疑似目录异常，不自动传播删除（确要清空请在同步管理「删除云端」）",
+                pending_deletes.len()
+            );
+        }
+
         // 仲裁：云端文件（拉新/跳过；条目留在清单里）
         for (fname, rv) in &r_files {
             let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
             let key = rv.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let lp = local_files.get(fname);
+            if lp.is_none() {
+                let is_local_delete = pending_deletes.contains(&fname) && !skip_all_deletes;
+                if is_local_delete {
+                    // 删除上云：清单就地移除（对端下轮回收站）
+                    prog_begin_file(&format!("{name}/{fname}（删除上云）"));
+                    remove_scheme_file_entry(&mut mf, name, fname)?;
+                    prog_done_file(true, 0);
+                    deleted_remote += 1;
+                } else {
+                    prog_begin_file(&format!("{name}/{fname}"));
+                    let n = pull_file(&agent, s, &dir, fname, key, rmt)?;
+                    prog_done_file(false, n as u64);
+                    downloaded += 1;
+                }
+                continue;
+            }
             let lmt = lp
                 .and_then(|p| file_mtime_ms(p).ok())
                 .unwrap_or(0);
-            if lp.is_none() || rmt >= lmt {
+            if rmt >= lmt {
                 // 云端新（或同刻）：下载覆盖（内容相同会跳过写盘）
-                if lp.is_none() || file_hash(lp.unwrap())? != remote_hash_hint(rv) {
+                if file_hash(lp.unwrap())? != remote_hash_hint(rv) {
                     prog_begin_file(&format!("{name}/{fname}"));
                     let n = pull_file(&agent, s, &dir, fname, key, rmt)?;
                     prog_done_file(false, n as u64);
@@ -959,7 +1007,7 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     }
 
     Ok(format!(
-        "↑{uploaded} ↓{downloaded} 删{deleted_local} 方案{} 配置{}",
+        "↑{uploaded} ↓{downloaded} 删{deleted_local} 删云端{deleted_remote} 方案{} 配置{}",
         s.selected.len(),
         if cfg_changed { "有更新" } else { "无变化" }
     ))
@@ -1121,6 +1169,24 @@ fn ensure_scheme_entry(mf: &mut Value, name: &str) {
         if let Some(m) = mf["schemes"].as_object_mut() {
             m.insert(name.to_string(), json!({"by": "", "ts": 0, "files": {}}));
         }
+    }
+}
+
+/// 清单就地移除一个方案文件条目（本机删除上云）。键不存在/结构断链
+/// → Err 中止本轮（洗劫铁律：索引链访问 + 失败即停，不静默）。
+fn remove_scheme_file_entry(mf: &mut Value, scheme: &str, fname: &str) -> Result<(), String> {
+    let removed = mf
+        .get_mut("schemes")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|m| m.get_mut(scheme))
+        .and_then(|e| e.get_mut("files"))
+        .and_then(|v| v.as_object_mut())
+        .map(|files| files.remove(fname).is_some())
+        .unwrap_or(false);
+    if removed {
+        Ok(())
+    } else {
+        Err(format!("同步清单结构损坏（{scheme}/{fname} 删除上云）——已中止本轮"))
     }
 }
 
@@ -1729,6 +1795,30 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(a.len(), 32);
+    }
+
+    /// 本机删除上云：清单条目就地移除；键缺失/结构断链 → Err（失败即停）。
+    #[test]
+    fn remove_scheme_file_entry_works() {
+        let mut mf: Value = serde_json::from_str(
+            r#"{"schemes":{"个人自用":{"by":"a","ts":1,"files":{
+                "用户调整.txt":{"mt":9,"sz":3,"h":"x","key":"k"},
+                "主码表.txt":{"mt":8,"sz":5,"h":"y","key":"j"}}}}}"#,
+        )
+        .unwrap();
+        remove_scheme_file_entry(&mut mf, "个人自用", "用户调整.txt").unwrap();
+        let files = mf
+            .pointer("/schemes/个人自用/files")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.contains_key("主码表.txt"));
+        // 键不存在 → Err（不静默）
+        assert!(remove_scheme_file_entry(&mut mf, "个人自用", "不存在.txt").is_err());
+        // 结构断链 → Err
+        let mut broken = json!({"schemes": {}});
+        assert!(remove_scheme_file_entry(&mut broken, "个人自用", "x.txt").is_err());
     }
 
     /// 消毒：排除键剔除，其余保留（皮肤选择与 schema 纳入同步；模型设置被剔）。
