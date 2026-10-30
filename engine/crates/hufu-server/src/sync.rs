@@ -113,6 +113,54 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static SETTINGS: Mutex<Option<SyncSettings>> = Mutex::new(None);
 static PHASE: Mutex<&'static str> = Mutex::new("idle");
 
+/// 同步进度（供 UI 进度条；文件级，字节级由各传输函数累计）。
+/// active=true 期间 cur/total 单调递增；结束后 active=false 但计数
+/// 保留到下一轮开始——UI 可展示「上一轮 ↑N 个 / X MB」。
+#[derive(Default, Clone, serde::Serialize)]
+struct SyncProgress {
+    active: bool,
+    cur: u32,
+    total: u32,
+    cur_name: String,
+    up_files: u32,
+    down_files: u32,
+    up_bytes: u64,
+    down_bytes: u64,
+}
+static PROGRESS: Mutex<SyncProgress> = Mutex::new(SyncProgress {
+    active: false,
+    cur: 0,
+    total: 0,
+    cur_name: String::new(),
+    up_files: 0,
+    down_files: 0,
+    up_bytes: 0,
+    down_bytes: 0,
+});
+
+/// 进度游标：开始一个文件的传输（cur_name 立即可见，防止长时间无反馈）。
+fn prog_begin_file(name: &str) {
+    let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    p.cur_name = name.to_string();
+}
+
+/// 进度累计：完成一次上传/下载（is_up 区分方向）。
+fn prog_done_file(is_up: bool, bytes: u64) {
+    let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    p.cur += 1;
+    if p.cur > p.total {
+        p.total = p.cur; // 预演低估时兜底，条不至于超界
+    }
+    if is_up {
+        p.up_files += 1;
+        p.up_bytes += bytes;
+    } else {
+        p.down_files += 1;
+        p.down_bytes += bytes;
+    }
+    p.cur_name.clear();
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -195,6 +243,10 @@ pub fn status_value() -> Value {
         .clone()
         .unwrap_or_default();
     let phase = *PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    let prog = PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let configured = !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty();
     json!({
         "enabled": configured && s.enabled,
@@ -205,6 +257,7 @@ pub fn status_value() -> Value {
         "selected": s.selected,
         "last_sync": s.last_sync, "last_error": s.last_error,
         "phase": phase,
+        "progress": prog,
     })
 }
 
@@ -647,7 +700,18 @@ fn run_sync(reason: &'static str) {
         return;
     }
     set_phase("syncing");
+    {
+        // 新一轮：进度归零、激活（total 由 do_sync 预演填充）
+        let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        *p = SyncProgress { active: true, ..Default::default() };
+    }
     let r = do_sync(&s);
+    {
+        let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        p.active = false;
+        p.cur = p.total; // 完成态条拉满（含预演误差）
+        p.cur_name.clear();
+    }
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
     match r {
@@ -696,7 +760,19 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
         if !dir.is_dir() {
             // 本机没装但勾选了：云端有 → 整夹拉取落地
             if let Some(entry) = r_entry {
-                downloaded += pull_scheme_all(&agent, s, &mf, &root, name, &entry)?;
+                let n = entry
+                    .get("files")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                {
+                    let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+                    p.total += n as u32;
+                }
+                prog_begin_file(&format!("{name}（整套下载）"));
+                let got = pull_scheme_all(&agent, s, &mf, &root, name, &entry)?;
+                prog_done_file(false, got as u64);
+                downloaded += 1;
             }
             continue;
         }
@@ -720,6 +796,27 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
         ensure_scheme_entry(&mut mf, name);
         let empty_remote = r_files.is_empty();
 
+        // 预演：本轮该方案可能要传的文件数（mt 级粗判，只增 total
+        // 不影响执行；误差只影响进度条走满的时机，不影响正确性）
+        {
+            let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+            for (fname, rv) in &r_files {
+                let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
+                let lmt = local_files
+                    .get(fname)
+                    .and_then(|q| file_mtime_ms(q).ok())
+                    .unwrap_or(0);
+                if local_files.get(fname).is_none() || rmt > lmt {
+                    p.total += 1;
+                }
+            }
+            for fname in local_files.keys() {
+                if !r_files.contains_key(fname) {
+                    p.total += 1; // 本地多出：上传或对端删，都要动一下
+                }
+            }
+        }
+
         // 仲裁：云端文件（拉新/跳过；条目留在清单里）
         for (fname, rv) in &r_files {
             let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -731,11 +828,17 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             if lp.is_none() || rmt >= lmt {
                 // 云端新（或同刻）：下载覆盖（内容相同会跳过写盘）
                 if lp.is_none() || file_hash(lp.unwrap())? != remote_hash_hint(rv) {
-                    downloaded += pull_file(&agent, s, &mf, &dir, fname, key, rmt)?;
+                    prog_begin_file(&format!("{name}/{fname}"));
+                    let n = pull_file(&agent, s, &mf, &dir, fname, key, rmt)?;
+                    prog_done_file(false, n as u64);
+                    downloaded += 1;
                 }
             } else {
                 // 本地新：上传（push_file 就地更新清单条目）
-                uploaded += push_file(&agent, s, &mut mf, name, fname, lp.unwrap())?;
+                prog_begin_file(&format!("{name}/{fname}"));
+                let n = push_file(&agent, s, &mut mf, name, fname, lp.unwrap())?;
+                prog_done_file(true, n as u64);
+                uploaded += 1;
             }
         }
         // 本地多出的文件（云端清单没有）
@@ -746,13 +849,13 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             let lmt = file_mtime_ms(lp)?;
             let snap_mt = snap_files.and_then(|m| m.get(fname)).copied();
             let is_new = snap_mt.is_none() || lmt > snap_mt.unwrap();
-            if is_new {
-                // 本地新文件（含换码表的新主码表）→ 上传
-                uploaded += push_file(&agent, s, &mut mf, name, fname, lp)?;
-            } else if empty_remote {
-                // 保险闸：云端整个方案清单为空而本地有文件——按「云端
-                // 数据不完整」处理：上传补齐，绝不删除本地。
-                uploaded += push_file(&agent, s, &mut mf, name, fname, lp)?;
+            if is_new || empty_remote {
+                // 本地新文件（含换码表的新主码表；或云端清单不完整时
+                // 的保险闸补传）→ 上传
+                prog_begin_file(&format!("{name}/{fname}"));
+                let n = push_file(&agent, s, &mut mf, name, fname, lp)?;
+                prog_done_file(true, n as u64);
+                uploaded += 1;
             } else {
                 // 云端清单非空而该文件不在其中 = 对端真删了这个文件
                 //（换码表等）→ 回收站后删本地

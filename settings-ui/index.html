@@ -754,6 +754,12 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="sy-now">立即同步</button>
       <span class="sub" id="sy-status">加载中…</span>
     </div>
+    <div id="sy-progress" style="display:none;margin-top:8px">
+      <div class="sub" id="sy-prog-text" style="margin-bottom:3px">同步中…</div>
+      <div style="height:10px;border-radius:5px;background:var(--bd);overflow:hidden">
+        <div id="sy-prog-bar" style="height:100%;width:0%;background:var(--ac,#4a9);transition:width .4s"></div>
+      </div>
+    </div>
     <div class="sub" style="margin-top:6px">同步规则：开机约 20 秒首次同步，此后<b>每 2 分钟</b>一轮、改文件后约 8 秒自动触发。仲裁一律按<b>文件修改时间</b>——最后改的赢：云端新就覆盖本地，本机新就上传。只传有改动的文件；在文件夹里换了码表（删旧换新）也会照实同步到其他电脑（删旧前自动进回收站）。首次同步整个文件夹，之后增量。数据只经 WebDAV 你自己的网盘，虎符官方不设服务器。</div>
 
     <h3 style="margin-top:18px">同步哪些方案<span class="en">Schemes</span></h3>
@@ -3943,9 +3949,46 @@ async function loadSync() {
       : (st.stopped ? "⏸ 同步已停止（云端与本机文件都保留；点「恢复同步」继续）" : "未配置（填写并保存后启用；每 2 分钟自动同步）");
     $("#sy-stop").style.display = st.enabled ? "" : "none";
     $("#sy-resume").style.display = st.stopped ? "" : "none";
+    renderSyncProgress(st);
   } catch (e) { $("#sy-status").textContent = "状态读取失败：" + e.message; }
   loadSchemes(); loadCloud(); loadTrash();
 }
+/* 同步进度条（文件级：active=本轮进行中，idle=展示上一轮成绩） */
+const fmtMB = b => b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : (b / 1024).toFixed(1) + " KB";
+function renderSyncProgress(st) {
+  const box = $("#sy-progress"), bar = $("#sy-prog-bar"), txt = $("#sy-prog-text");
+  const p = st.progress;
+  if (!p) { box.style.display = "none"; return; }
+  const moved = p.up_files + p.down_files;
+  if (p.active) {
+    box.style.display = "";
+    const pct = p.total > 0 ? Math.min(100, Math.round(p.cur * 100 / p.total)) : (moved ? 50 : 3);
+    bar.style.width = pct + "%";
+    txt.textContent = `⟳ 正在同步 ${p.cur}/${p.total || "?"} 个文件${p.cur_name ? " · " + p.cur_name : ""}` +
+      (moved ? `（已 ↑${p.up_files} 个 ${fmtMB(p.up_bytes)} / ↓${p.down_files} 个 ${fmtMB(p.down_bytes)}）` : "");
+  } else if (moved || st.last_sync) {
+    box.style.display = "";
+    bar.style.width = "100%";
+    bar.style.background = "var(--ac,#4a9)";
+    txt.textContent = moved
+      ? `最近一轮：↑ 上传 ${p.up_files} 个（${fmtMB(p.up_bytes)}）｜↓ 下载 ${p.down_files} 个（${fmtMB(p.down_bytes)}）${st.last_error ? " ｜ ⚠ " + st.last_error : " ｜ 无改动即不传输"}`
+      : "最近一轮无文件改动（云端与本地一致）";
+  } else {
+    box.style.display = "none";
+  }
+}
+/* 常驻轻轮询：同步 tab 可见时每 2s 只刷进度（不重载其他区块） */
+setInterval(async () => {
+  const tab = document.getElementById("tab-sync");
+  if (!tab || !tab.classList.contains("on")) return;
+  try {
+    const st = await api("GET", "/api/sync/status");
+    renderSyncProgress(st);
+    $("#sy-status").textContent = st.enabled
+      ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.passphrase_set ? "" : " ｜ ⚠ 未加密"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
+      : (st.stopped ? "⏸ 同步已停止（云端与本机文件都保留；点「恢复同步」继续）" : "未配置");
+  } catch (e) { /* server 重启窗口期静默 */ }
+}, 2000);
 /* 方案勾选列表（本地 ∪ 云端） */
 async function loadSchemes() {
   try {
@@ -3990,11 +4033,14 @@ async function loadCloud() {
     const sch = r.schemes || {};
     for (const [name, e] of Object.entries(sch)) {
       const files = e.files || {};
+      const n = Object.keys(files).length;
+      const state = n === 0 ? '<b style="color:#c60">⏳ 云端清单为空（等本机下一轮同步补传；若一直为空说明本机未勾选此方案或未运行）</b>'
+        : `${n} 个文件`;
       const fl = Object.entries(files).map(([fn, f]) =>
         `<div class="sub" style="padding-left:18px">└ ${fn} ｜ ${fmtKB(f.sz || 0)} ｜ ${f.mt ? new Date(f.mt).toLocaleString() : "?"}</div>`).join("");
       html += `<div style="border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-top:6px">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <b>${name}</b><span class="sub">${Object.keys(files).length} 个文件 ｜ 最后上传：${e.by || "?"} · ${e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}</span>
+          <b>${name}</b><span class="sub">${state} ｜ 最后上传：${e.by || "?"} · ${e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}</span>
           <span style="flex:1"></span>
           <button data-unsync="${name}" title="此方案退出同步（云端与本地都保留不动）">取消同步</button>
           <button data-delcloud="${name}" class="danger" title="删除云端该方案的全部文件（本机文件不动）">删除云端</button>
