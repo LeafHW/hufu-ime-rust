@@ -498,7 +498,8 @@ pub fn delete_cloud(scheme: Option<&str>) -> Result<String, String> {
                         }
                     }
                     prune_manifest(&mut mf, &s);
-                    put_manifest(&agent, &s, &mf)?;
+                    bump_rev(&mut mf);
+                    put_manifest(&agent, &s, &mf, None)?;
                     Ok(format!("云端方案「{name}」已删除（本机文件未动）"))
                 }
                 _ => Ok(format!("云端没有方案「{name}」的同步数据")),
@@ -523,7 +524,8 @@ pub fn delete_cloud(scheme: Option<&str>) -> Result<String, String> {
                     mf["schemes"] = json!({});
                     mf["config"] = Value::Null;
                     prune_manifest(&mut mf, &s);
-                    let _ = put_manifest(&agent, &s, &mf);
+                    bump_rev(&mut mf);
+                    let _ = put_manifest(&agent, &s, &mf, None);
                 }
                 None => {}
             }
@@ -742,6 +744,11 @@ fn run_sync(reason: &'static str) {
 fn do_sync(s: &SyncSettings) -> Result<String, String> {
     let agent = build_agent();
     let mut mf = fetch_manifest(&agent, s)?.unwrap_or_else(empty_manifest);
+    //【并发丢更新防线 2026-10-31】双机同窗开轮：各自 fetch 同版清单，
+    // 后写者整覆写会抹掉先写者的条目增量（文件 blob 还在、清单条目
+    // 丢失）→ 先写者下轮把自己的新文件误判「对端删除」洗进回收站。
+    // 记录本轮基线 rev，写回前 CAS 校验（见 put_manifest）。
+    let base_rev = mf.get("rev").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let root = local_schema_root().ok_or("找不到码表目录")?;
     let mut uploaded = 0usize;
@@ -821,9 +828,12 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
         // 「对端删除」分支进回收站。snap 里也没有 = 本机从未有过（新机
         // 收敛 / 对端新增文件）→ 正常拉取。此前本地缺失一律无条件拉回
         // ——删除被复活（用户实锤：删用户调整.txt 两分钟内自动回来）。
-        //【防洗劫守卫】若删除会清空整个方案的清单且本轮没有新文件可
-        // 补上传，则不传播（数据目录异常移动/误删全部时防止洗掉对端；
-        // 真要整案清空请走同步管理「删除云端」）。
+        //【防洗劫守卫 v2，沙盘 S4 实证】删 ≥2 个文件且本轮没有新文件
+        // 可补上传 → 不自动传播（批量消失更像目录异常/误删，且沙盘实
+        // 测：自动生成的 个人存储表.txt 还在时"删光全部"会漏过「全删
+        // 才拦」的旧守卫把对端洗掉）。单删=用户明确意图照常传播；换
+        // 码表（删旧+添新同轮，local_new_count>0）不受影响；确要整案
+        // 清空请走同步管理「删除云端」。
         let pending_deletes: Vec<&String> = r_files
             .iter()
             .filter(|(fname, _)| {
@@ -837,11 +847,11 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             .filter(|f| !r_files.contains_key(*f))
             .count();
         let skip_all_deletes = !pending_deletes.is_empty()
-            && pending_deletes.len() == r_files.len()
+            && pending_deletes.len() >= 2
             && local_new_count == 0;
         if skip_all_deletes {
             eprintln!(
-                "云同步：方案 {name} 的 {} 个文件在本机全部消失——疑似目录异常，不自动传播删除（确要清空请在同步管理「删除云端」）",
+                "云同步：方案 {name} 的 {} 个文件在本机消失且无新文件——疑似目录异常，本轮不自动传播删除（确要清空请在同步管理「删除云端」）",
                 pending_deletes.len()
             );
         }
@@ -975,7 +985,8 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
 
     // 设备表 + 落盘 manifest
     prune_manifest(&mut mf, s);
-    put_manifest(&agent, s, &mf)?;
+    bump_rev(&mut mf);
+    put_manifest(&agent, s, &mf, Some(base_rev))?;
 
     // 更新本地收敛快照（各勾选方案当前文件 mt 表）
     let mut new_snap: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
@@ -1574,7 +1585,32 @@ fn fetch_manifest(agent: &ureq::Agent, s: &SyncSettings) -> Result<Option<Value>
     }
 }
 
-fn put_manifest(agent: &ureq::Agent, s: &SyncSettings, mf: &Value) -> Result<(), String> {
+/// 清单 rev 单调 +1（旧清单无 rev 视为 0）。
+fn bump_rev(mf: &mut Value) {
+    let r = mf.get("rev").and_then(|v| v.as_u64()).unwrap_or(0);
+    mf["rev"] = json!(r + 1);
+}
+
+/// 写回云端清单。base_rev=Some(x) 时启用 CAS 乐观锁：PUT 前重读云端
+/// 清单，rev 已被别机推进（≠x）= 本轮基于过期版本 → 放弃写回报错，
+/// worker 下轮/下次触发自动重试（本轮已做的本地下载无害——下轮会
+/// 基于最新云端重新仲裁）。None = 管理面板显式操作（用户意图压倒
+/// 并发），无条件写。坚果云不支持 If-Match/ETag 上语义化，应用层
+/// rev 是唯一可控方案。
+fn put_manifest(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &Value,
+    base_rev: Option<u64>,
+) -> Result<(), String> {
+    if let Some(base) = base_rev {
+        if let Some(cur) = fetch_manifest(agent, s)? {
+            let cur_rev = cur.get("rev").and_then(|v| v.as_u64()).unwrap_or(0);
+            if cur_rev != base {
+                return Err("云端清单刚被其他设备更新——本轮放弃，稍后自动重试".into());
+            }
+        }
+    }
     let body = serde_json::to_vec(mf).map_err(|e| e.to_string())?;
     webdav_put_body(agent, s, MF_PATH, &body, "application/json")
 }
@@ -1819,6 +1855,16 @@ mod tests {
         // 结构断链 → Err
         let mut broken = json!({"schemes": {}});
         assert!(remove_scheme_file_entry(&mut broken, "个人自用", "x.txt").is_err());
+    }
+
+    /// rev 单调：无 rev 视为 0 → 1；已有 rev 递增。
+    #[test]
+    fn bump_rev_monotonic() {
+        let mut a = json!({"v": 3});
+        bump_rev(&mut a);
+        assert_eq!(a["rev"], json!(1));
+        bump_rev(&mut a);
+        assert_eq!(a["rev"], json!(2));
     }
 
     /// 消毒：排除键剔除，其余保留（皮肤选择与 schema 纳入同步；模型设置被剔）。
