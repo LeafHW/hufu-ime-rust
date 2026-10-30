@@ -66,14 +66,18 @@ const DEVICE_STALE_SECS: u64 = 30 * 24 * 3600;
 const KEEP: &str = "__keep__";
 const DEFAULT_URL: &str = "https://dav.jianguoyun.com/dav/";
 
-/// 不同步的 config 键（仅保留真正机器本地的字段）。
-/// 【整文件同步 2026-10-30 用户拍板】皮肤选择/当前方案等全部纳入
-/// 同步（此前被剔导致「配置没同步」的观感）；仅剔字体名（装没装
-/// 每机不同）、开机自启（机器属性）、本机录制的导出快捷键。
+/// 不同步的 config 键。
+/// 【2026-10-30 用户拍板】皮肤选择/挂件（skin/skin_kind——挂件配置在
+/// 皮肤文件内，且 .ssf 文件本体本就不在同步面）、整句模型设置
+///（sentence 整节：模型路径/重排参数每机不同，与导出/导入主权闸
+/// 同边界）不同步；其余偏好整文件同步。
 const CONFIG_EXCLUDED: &[&str] = &[
+    "appearance.skin",        // 皮肤选择（含挂件指向）= 每机自选
+    "appearance.skin_kind",   // JSON / .ssf 类别随皮肤选择走
     "appearance.font_family", // 字体装没装每机不同
     "general.autostart",      // 开机自启 = 机器属性
     "general.export_key",     // 本机录制的快捷键
+    "sentence",               // 整句模型设置（模型路径机器相关）
 ];
 
 // ─────────────────────────── 全局状态 ───────────────────────────
@@ -1523,24 +1527,29 @@ mod tests {
         assert_eq!(a.len(), 32);
     }
 
-    /// 消毒：排除键剔除，其余保留（schema/skin 已按 2026-10-30 拍板纳入同步）。
+    /// 消毒：排除键剔除，其余保留（schema 纳入同步；皮肤选择/模型设置被剔）。
     #[test]
     fn config_sanitize_exclusions() {
         let mut cfg = json!({
             "schema": {"current": "A"},
-            "appearance": {"skin": "moyan", "font_family": "宋体"},
+            "appearance": {"skin": "moyan", "skin_kind": "ssf", "font_size": 18},
+            "sentence": {"enabled": true, "ngram_path": "模型/x.bin"},
             "general": {"autostart": true, "export_key": "ctrl+x"},
             "candidates": {"page_size": 4}
         });
         sanitize_config(&mut cfg);
-        // 整文件同步：schema 与皮肤选择保留（同步到其他机器）
+        // 整文件同步：当前方案与其他偏好保留（同步到其他机器）
         assert_eq!(cfg["schema"]["current"], "A");
-        assert_eq!(cfg["appearance"]["skin"], "moyan");
+        assert_eq!(cfg["candidates"]["page_size"], 4);
+        assert_eq!(cfg["appearance"]["font_size"], 18);
+        // 皮肤选择/挂件（每机自选）、整句模型设置（机器相关）被剔除
+        assert!(cfg["appearance"].get("skin").is_none());
+        assert!(cfg["appearance"].get("skin_kind").is_none());
+        assert!(cfg.get("sentence").is_none());
         // 机器本地字段仍被剔除
-        assert!(cfg["appearance"].get("font_family").is_none());
         assert!(cfg["general"].get("autostart").is_none());
         assert!(cfg["general"].get("export_key").is_none());
-        assert_eq!(cfg["candidates"]["page_size"], 4);
+        assert!(cfg["appearance"].get("font_family").is_none());
     }
 
     /// 三方归并：本机没动→采纳远端；本机动了→保留本机。
