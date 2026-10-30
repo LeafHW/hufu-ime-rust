@@ -326,10 +326,10 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <div class="field"><label>翻页键</label><input type="text" data-path="candidates.paging_keys" style="width:90px"></div>
       <div class="field"><label>次选键</label><input type="text" maxlength="1" id="c-2nd" style="width:60px"></div>
       <div class="field"><label>三选键</label><input type="text" maxlength="1" id="c-3rd" style="width:60px"></div>
-      <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt">显示拼音注释<span class="sub">（整句状态不可用）</span></label></div>
-      <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt">显示 unicode 注释<span class="sub">（整句状态不可用）</span></label></div>
-      <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split">显示拆分<span class="sub">（整句状态不可用）</span></label></div>
-      <div class="checkline"><input type="checkbox" id="c-dhl"><label for="c-dhl" title="同编码且 ≥3 字的候选互标差异字（如 jfus 三个候选分别标出 你/不要/怎么），一眼挑出想要的词；整句方案自动关闭">同码异字高亮<span class="sub">（同码候选互标差异字；默认关）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="c-cmt"><label for="c-cmt" title="整句方案下暂不生效（开关保留，切回码表方案即恢复）">显示拼音注释<span class="sub">（整句方案下暂不生效；开关保留）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="c-ucmt"><label for="c-ucmt" title="整句方案下暂不生效（开关保留，切回码表方案即恢复）">显示 unicode 注释<span class="sub">（整句方案下暂不生效；开关保留）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="c-split"><label for="c-split" title="整句方案下暂不生效（开关保留，切回码表方案即恢复）">显示拆分<span class="sub">（整句方案下暂不生效；开关保留）</span></label></div>
+      <div class="checkline"><input type="checkbox" id="c-dhl"><label for="c-dhl" title="同编码且 ≥3 字的候选互标差异字（如 jfus 三个候选分别标出 你/不要/怎么），一眼挑出想要的词；整句方案下暂不生效（开关保留）">同码异字高亮<span class="sub">（同码候选互标差异字；默认关；整句下暂不生效）</span></label></div>
       <div class="field"><label>候选延时（毫秒）</label><input type="number" data-path="candidates.delay_show_ms" min="0" max="2000"></div>
     </div>
     <div class="row">

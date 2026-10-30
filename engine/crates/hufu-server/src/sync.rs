@@ -383,6 +383,13 @@ pub fn save_settings(
     if !st.user.is_empty() && !st.pass.is_empty() && !st.url.is_empty() {
         st.enabled = true;
     }
+    //【重装洗值修复 2026-10-31】保存同步设置 = 本机宣告「以云端为准拉齐
+    // 一次」。清空 config 归并 base（last_config）：否则重装/换机后本机
+    // 是出厂默认值，base 还是旧机器快照 → 默认值≠base 被误判「本地改
+    // 过」→ 回洗云端（实锤案例：diff_hl 勾选被重装机的默认 False 洗掉，
+    // 两台机全变关）。清 base 后归并走 local==base → 云端全量采纳。
+    // 日常只改设备名等再保存也无害：云端即最后收敛共识，采纳无损失。
+    st.last_config = None;
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
     let ready = !st.url.is_empty() && !st.user.is_empty() && !st.pass.is_empty();
     drop(guard);
