@@ -1394,6 +1394,9 @@ function sanitizeSkin(s) {
   }
 }
 const saveConfig = () => { sanitizeConfig(CFG); return api("POST", "/api/config", CFG); };
+/* 【保存进行中标志 2026-10-31】POST 在飞时设置页不自动刷新（见
+   refreshCfgFromServer），防拉回旧值把刚勾的开关显示打回。 */
+let saveCfgInFlight = false;
 const saveSkin = () => { sanitizeSkin(SKIN); return api("POST", "/api/skin", SKIN); };
 
 /* ── 【八十六修·全页实时生效】「保存并应用」按钮只保留在整句模型页
@@ -1404,7 +1407,9 @@ let _cfgSaveTimer = null;
 const saveConfigDebounced = () => {
   if (_cfgSaveTimer) clearTimeout(_cfgSaveTimer);
   _cfgSaveTimer = setTimeout(async () => {
+    _cfgSaveTimer = null; saveCfgInFlight = true;
     try { await saveConfig(); msg("已自动保存并应用 ✓", "ok"); } catch (e) { msg("自动保存失败：" + e.message, "err"); }
+    saveCfgInFlight = false;
   }, 400);
 };
 const autoSave = el => {
@@ -3415,10 +3420,38 @@ $("#btn-schema-refresh").onclick = () => loadSchemas().then(refreshInfo).catch(e
   if (cp) cp.onclick = () => (navigator.clipboard ? navigator.clipboard.writeText(GH) : Promise.reject())
     .then(() => msg("仓库地址已复制", "ok"), () => msg("复制失败——手动选中文本复制", "err"));
 }
-/* 窗口重新聚焦时同步配置快照（托盘切方案后本页不回写旧方案） */
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) api("GET", "/api/config").then(c => { CFG = c; }).catch(() => {});
-});
+/* 【同步自动刷新 2026-10-31】云同步/托盘改配置后，设置页显示自动跟上：
+   ①切回本页立即拉取重绑；②页面可见期间每 5s 轮询，内容有变化才重绑；
+   ③三重防打扰：页面隐藏 / 3 秒内有交互 / 保存防抖或 POST 在飞 → 跳过。
+   重绑=bindInputs 重跑（B() 会按最新 CFG 重置勾选/下拉）+ 数字文本框
+   反填 + 页脚方案名刷新。这同时关掉旧实现的一个洗值窗：过去只更新
+   CFG 变量不刷控件显示，用户随后动任意开关会全量回写 UI 旧值，把
+   云端刚同步来的配置洗回旧状态。 */
+let cfgLastInteract = 0;
+["input", "change"].forEach(ev => document.addEventListener(ev, () => { cfgLastInteract = Date.now(); }, true));
+let cfgRefreshing = false;
+async function refreshCfgFromServer() {
+  if (document.hidden || cfgRefreshing || _cfgSaveTimer || saveCfgInFlight) return;
+  if (Date.now() - cfgLastInteract < 3000) return;
+  cfgRefreshing = true;
+  try {
+    const c = await api("GET", "/api/config");
+    if (JSON.stringify(c) !== JSON.stringify(CFG)) {
+      CFG = c;
+      bindInputs();
+      $$("[data-path]").forEach(el => {
+        const v = getP(CFG, el.dataset.path);
+        if (v !== undefined && el.value != v) el.value = v;
+      });
+      refreshInfo();
+    } else {
+      CFG = c;
+    }
+  } catch (_) {}
+  cfgRefreshing = false;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCfgFromServer(); });
+setInterval(refreshCfgFromServer, 5000);
 
 $("#btn-save").onclick = async () => {
   try {
