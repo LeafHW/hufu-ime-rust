@@ -302,9 +302,15 @@ pub fn schemes_overview() -> Value {
             }
         }
     }
+    // 【云端标记 2026-10-30 用户需求】本地+云端都有的方案也要标 ☁——
+    // 勾选列表按云端清单逐项补 cloud 标记，不只标「本机没有的」。
+    for v in local.iter_mut() {
+        let is_cloud = v["name"].as_str().map(|n| cloud_names.iter().any(|c| c == n)).unwrap_or(false);
+        v["cloud"] = json!(is_cloud);
+    }
     for name in &cloud_names {
         if !local.iter().any(|v| v["name"].as_str() == Some(name.as_str())) {
-            local.push(json!({"name": name, "local": false, "files": 0,
+            local.push(json!({"name": name, "local": false, "files": 0, "cloud": true,
                 "selected": s.selected.iter().any(|x| x == name)}));
         }
     }

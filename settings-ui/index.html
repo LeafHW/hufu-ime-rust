@@ -89,6 +89,13 @@ footer {
 }
 footer .msg { flex: 1; font-size: 13px; color: var(--fg2); }
 footer .msg.ok { color: var(--ok); } footer .msg.err { color: var(--err); }
+/* ── 二级页弹层（同步管理/回收站 2026-10-30）── */
+.sy-dlg { display: none; position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,.38);
+  align-items: center; justify-content: center; padding: 24px; }
+.sy-dlg.open { display: flex; }
+.sy-dlg-card { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px;
+  max-width: 680px; width: 100%; max-height: 82vh; overflow-y: auto; padding: 18px 22px;
+  box-shadow: 0 18px 60px rgba(0,0,0,.5); }
 /* ── 试用台 ── */
 .trial {
   background: linear-gradient(120deg, #2b3a55 0%, #4a3350 30%, #6b4226 55%, #2d5545 80%, #3a2d55 100%);
@@ -757,7 +764,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div id="sy-progress" style="display:none;margin-top:8px">
       <div class="sub" id="sy-prog-text" style="margin-bottom:3px">同步中…</div>
       <div style="height:10px;border-radius:5px;background:var(--bd);overflow:hidden">
-        <div id="sy-prog-bar" style="height:100%;width:0%;background:var(--ac,#4a9);transition:width .4s"></div>
+        <div id="sy-prog-bar" style="height:100%;width:0%;background:var(--acc,#4a9);transition:width .4s"></div>
       </div>
     </div>
     <div class="sub" style="margin-top:6px">同步规则：开机约 20 秒首次同步，此后<b>每 2 分钟</b>一轮、改文件后约 8 秒自动触发。仲裁一律按<b>文件修改时间</b>——最后改的赢：云端新就覆盖本地，本机新就上传。只传有改动的文件；在文件夹里换了码表（删旧换新）也会照实同步到其他电脑（删旧前自动进回收站）。首次同步整个文件夹，之后增量。数据只经 WebDAV 你自己的网盘，虎符官方不设服务器。</div>
@@ -770,25 +777,47 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <span class="sub">勾选变化立即生效：新勾=整套上/下载，取消=该方案退出同步（云端与本地都保留不动）。</span>
     </div>
 
-    <h3 style="margin-top:18px">同步管理<span class="en">Manage</span></h3>
-    <div class="sub" id="sy-mgmt-summary">加载中…</div>
-    <div id="sy-devices" class="row" style="flex-wrap:wrap;gap:8px;margin-top:4px"></div>
-    <div id="sy-cloud" style="margin-top:8px"></div>
-    <div class="row" style="align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
-      <button id="sy-stop" class="danger" title="暂停自动同步（凭据与云端数据都保留，随时恢复）">⏸ 停止同步</button>
-      <button id="sy-resume" style="display:none" class="primary">▶ 恢复同步</button>
-      <button id="sy-logout" class="danger" title="清空本机保存的账号密码并停用同步（云端数据保留，本地文件不动）">退出帐户</button>
-      <button id="sy-delcloud" class="danger" title="删除云端全部同步数据（本机文件一律不动；删除后同步自动停止）">删除云端同步数据</button>
-      <span class="sub">危险操作有确认弹窗。删除云端/退出帐户都不会动本机已同步到本地的文件。</span>
-    </div>
-
-    <h3 style="margin-top:18px">回收站<span class="en">Trash</span></h3>
-    <div class="sub">被同步覆盖或删除的旧文件会先挪进来（每方案保留 20 份、30 天内可还原）。还原的文件视为本机最新修改，随下轮同步上传到其他电脑。</div>
-    <div id="sy-trash" style="margin-top:6px"><span class="sub">加载中…</span></div>
-    <div class="row" style="margin-top:6px">
-      <button id="sy-trash-clear">清空回收站</button>
+    <div class="row" style="margin-top:18px;gap:10px;flex-wrap:wrap">
+      <button id="sy-open-mgmt" class="primary" style="padding:10px 22px">🗂 同步管理<span class="en">Manage</span></button>
+      <button id="sy-open-trash" style="padding:10px 22px">🗑 回收站<span class="en">Trash</span></button>
+      <span class="sub">管理：设备/云端文件清单/删除云端/停止同步；回收站：还原被覆盖或删除的旧文件。</span>
     </div>
   </section>
+
+  <!-- 【二级页 2026-10-30】同步管理 / 回收站：弹层式二级页（遮罩+卡片，
+       Esc/点遮罩关闭），主页面只留入口按钮 -->
+  <div class="sy-dlg" id="sy-dlg-mgmt">
+    <div class="sy-dlg-card">
+      <div class="row" style="align-items:center">
+        <h3 style="margin:0">同步管理<span class="en">Manage</span></h3>
+        <span style="flex:1"></span>
+        <button class="sy-dlg-close">✕ 关闭</button>
+      </div>
+      <div class="sub" id="sy-mgmt-summary">加载中…</div>
+      <div id="sy-devices" class="row" style="flex-wrap:wrap;gap:8px;margin-top:4px"></div>
+      <div id="sy-cloud" style="margin-top:8px"></div>
+      <div class="row" style="align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
+        <button id="sy-stop" class="danger" title="暂停自动同步（凭据与云端数据都保留，随时恢复）">⏸ 停止同步</button>
+        <button id="sy-resume" style="display:none" class="primary">▶ 恢复同步</button>
+        <button id="sy-logout" class="danger" title="清空本机保存的账号密码并停用同步（云端数据保留，本地文件不动）">退出帐户</button>
+        <button id="sy-delcloud" class="danger" title="删除云端全部同步数据（本机文件一律不动；删除后同步自动停止）">删除云端同步数据</button>
+        <span class="sub">危险操作有确认弹窗。删除云端/退出帐户都不会动本机已同步到本地的文件。</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="sy-dlg" id="sy-dlg-trash">
+    <div class="sy-dlg-card">
+      <div class="row" style="align-items:center">
+        <h3 style="margin:0">回收站<span class="en">Trash</span></h3>
+        <span style="flex:1"></span>
+        <button id="sy-trash-clear">清空回收站</button>
+        <button class="sy-dlg-close">✕ 关闭</button>
+      </div>
+      <div class="sub">被同步覆盖或删除的旧文件会先挪进来（每方案保留 20 份、30 天内可还原）。还原的文件视为本机最新修改，随下轮同步上传到其他电脑。</div>
+      <div id="sy-trash" style="margin-top:6px"><span class="sub">加载中…</span></div>
+    </div>
+  </div>
 
   <section id="tab-about">
     <h2>关于<span class="en">About</span></h2>
@@ -829,6 +858,14 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
 
 <footer>
   <span class="msg" id="foot-msg"></span>
+  <!-- 【全局同步进度 2026-10-30 用户需求】缩放不同导致页内进度条滚出视口
+       时，footer 常驻迷你条兜底；完成态显示「同步完毕」文字与计数 -->
+  <span id="foot-sync" style="display:none;align-items:center;gap:8px;min-width:0">
+    <span style="width:110px;height:8px;border-radius:4px;background:var(--bd);overflow:hidden;flex:none">
+      <span id="foot-sync-bar" style="display:block;height:100%;width:0%;background:var(--acc,#4a9);transition:width .4s"></span>
+    </span>
+    <span id="foot-sync-text" class="hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
+  </span>
   <span class="hint" id="foot-schema"></span>
   <button id="btn-reload">放弃更改</button>
   <button id="btn-save" class="primary">保存并应用</button>
@@ -3951,9 +3988,36 @@ async function loadSync() {
     $("#sy-resume").style.display = st.stopped ? "" : "none";
     renderSyncProgress(st);
   } catch (e) { $("#sy-status").textContent = "状态读取失败：" + e.message; }
-  loadSchemes(); loadCloud(); loadTrash();
+  loadSchemes();
+  if ($("#sy-dlg-mgmt").classList.contains("open")) loadCloud();
+  if ($("#sy-dlg-trash").classList.contains("open")) loadTrash();
 }
-/* 同步进度条（文件级：active=本轮进行中，idle=展示上一轮成绩） */
+/* 【二级页 2026-10-30】同步管理/回收站弹层：打开时拉数据，Esc/遮罩/✕ 关闭 */
+function openDlg(id) {
+  const d = document.getElementById(id);
+  d.classList.add("open");
+  if (id === "sy-dlg-mgmt") { loadCloud(); loadSyncStatusOnly(); }
+  if (id === "sy-dlg-trash") loadTrash();
+}
+function closeDlg(d) { d.classList.remove("open"); }
+document.querySelectorAll(".sy-dlg").forEach(d => {
+  d.addEventListener("click", e => { if (e.target === d) closeDlg(d); });
+  d.querySelectorAll(".sy-dlg-close").forEach(b => b.onclick = () => closeDlg(d));
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.querySelectorAll(".sy-dlg.open").forEach(closeDlg);
+});
+$("#sy-open-mgmt").onclick = () => openDlg("sy-dlg-mgmt");
+$("#sy-open-trash").onclick = () => openDlg("sy-dlg-trash");
+/* 弹层打开时同步状态行（停用/恢复按钮可见性） */
+async function loadSyncStatusOnly() {
+  try {
+    const st = await api("GET", "/api/sync/status");
+    $("#sy-stop").style.display = st.enabled ? "" : "none";
+    $("#sy-resume").style.display = st.stopped ? "" : "none";
+  } catch (e) { /* 忽略 */ }
+}
+/* 同步进度条（文件级：active=本轮进行中，idle=完成态成绩单） */
 const fmtMB = b => b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : (b / 1024).toFixed(1) + " KB";
 function renderSyncProgress(st) {
   const box = $("#sy-progress"), bar = $("#sy-prog-bar"), txt = $("#sy-prog-text");
@@ -3964,31 +4028,54 @@ function renderSyncProgress(st) {
     box.style.display = "";
     const pct = p.total > 0 ? Math.min(100, Math.round(p.cur * 100 / p.total)) : (moved ? 50 : 3);
     bar.style.width = pct + "%";
-    txt.textContent = `⟳ 正在同步 ${p.cur}/${p.total || "?"} 个文件${p.cur_name ? " · " + p.cur_name : ""}` +
+    bar.style.background = "var(--acc,#4a9)";
+    txt.textContent = `⟳ 同步中 ${p.cur}/${p.total || "?"}（${pct}%）${p.cur_name ? " · " + p.cur_name : ""}` +
       (moved ? `（已 ↑${p.up_files} 个 ${fmtMB(p.up_bytes)} / ↓${p.down_files} 个 ${fmtMB(p.down_bytes)}）` : "");
   } else if (moved || st.last_sync) {
     box.style.display = "";
     bar.style.width = "100%";
-    bar.style.background = "var(--ac,#4a9)";
+    bar.style.background = "var(--acc,#4a9)";
+    /* 【完成文案 2026-10-30 用户需求】传完明确写「上传完毕/同步完毕」：
+       只有上传=上传完毕；有下载=同步完毕。无改动=同步完毕（无改动）。 */
     txt.textContent = moved
-      ? `最近一轮：↑ 上传 ${p.up_files} 个（${fmtMB(p.up_bytes)}）｜↓ 下载 ${p.down_files} 个（${fmtMB(p.down_bytes)}）${st.last_error ? " ｜ ⚠ " + st.last_error : " ｜ 无改动即不传输"}`
-      : "最近一轮无文件改动（云端与本地一致）";
+      ? (p.down_files > 0
+          ? `✓ 同步完毕（100%）｜↑ 上传 ${p.up_files} 个（${fmtMB(p.up_bytes)}）｜↓ 下载 ${p.down_files} 个（${fmtMB(p.down_bytes)}）`
+          : `✓ 上传完毕（100%）｜↑ 上传 ${p.up_files} 个（${fmtMB(p.up_bytes)}）`) +
+        (st.last_error ? " ｜ ⚠ " + st.last_error : "")
+      : "✓ 同步完毕（100%）｜无文件改动（云端与本地一致）";
   } else {
     box.style.display = "none";
   }
 }
-/* 常驻轻轮询：同步 tab 可见时每 2s 只刷进度（不重载其他区块） */
-setInterval(async () => {
-  const tab = document.getElementById("tab-sync");
-  if (!tab || !tab.classList.contains("on")) return;
-  try {
-    const st = await api("GET", "/api/sync/status");
-    renderSyncProgress(st);
-    $("#sy-status").textContent = st.enabled
-      ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.passphrase_set ? "" : " ｜ ⚠ 未加密"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
-      : (st.stopped ? "⏸ 同步已停止（云端与本机文件都保留；点「恢复同步」继续）" : "未配置");
-  } catch (e) { /* server 重启窗口期静默 */ }
-}, 2000);
+/* 【全局 footer 进度条 2026-10-30 用户需求】缩放不同导致页内条滚出视口时
+   的常驻兜底：同步中走条；完成后显示「同步完毕/上传完毕」文字，60s 无
+   新动静自动隐藏。2s 轮询不限 tab（页内条只在云同步 tab 可见时更新）。 */
+let footSyncLastActive = 0;
+async function pollSyncProgress() {
+  let st = null;
+  try { st = await api("GET", "/api/sync/status"); } catch (e) { return; }
+  const fs = $("#foot-sync");
+  if (!st || !st.progress) { fs.style.display = "none"; return; }
+  const p = st.progress, moved = p.up_files + p.down_files;
+  const tabVisible = document.getElementById("tab-sync").classList.contains("on");
+  if (tabVisible) renderSyncProgress(st);
+  if (p.active) {
+    footSyncLastActive = Date.now();
+    fs.style.display = "inline-flex";
+    const pct = p.total > 0 ? Math.min(100, Math.round(p.cur * 100 / p.total)) : (moved ? 50 : 3);
+    $("#foot-sync-bar").style.width = pct + "%";
+    $("#foot-sync-text").textContent = `⟳ 同步 ${p.cur}/${p.total || "?"}（${pct}%）${p.cur_name ? " · " + p.cur_name : ""}`;
+  } else if (moved && Date.now() - footSyncLastActive < 60000) {
+    fs.style.display = "inline-flex";
+    $("#foot-sync-bar").style.width = "100%";
+    $("#foot-sync-text").textContent = (p.down_files > 0
+      ? `✓ 同步完毕 ｜↑${p.up_files} 个 ${fmtMB(p.up_bytes)} ｜↓${p.down_files} 个 ${fmtMB(p.down_bytes)}`
+      : `✓ 上传完毕 ｜↑${p.up_files} 个 ${fmtMB(p.up_bytes)}`);
+  } else {
+    fs.style.display = "none";
+  }
+}
+setInterval(pollSyncProgress, 2000);
 /* 方案勾选列表（本地 ∪ 云端） */
 async function loadSchemes() {
   try {
@@ -4002,8 +4089,14 @@ async function loadSchemes() {
       const lb = document.createElement("label");
       lb.className = "checkline";
       lb.style.cssText = "border:1px solid var(--bd);border-radius:8px;padding:6px 12px";
+      /* 【云端标记 2026-10-30】云端有的都标 ☁：本地+云端=☁已同步，
+         仅云端=☁整套下载（勾选即下载到本机） */
+      const cloudTag = s.cloud
+        ? (s.local ? ' <b title="云端已有此方案（与本地互相同步）">☁已同步</b>'
+                   : ' <b title="本机未装，云端已有">☁整套下载</b>')
+        : "";
       lb.innerHTML = `<input type="checkbox" data-sy="${s.name}" ${s.selected ? "checked" : ""}>` +
-        ` ${s.name}${s.local ? "" : ' <b title="本机未装，云端已有">☁整套下载</b>'}` +
+        ` ${s.name}${cloudTag}` +
         ` <span class="sub">${s.local ? s.files + " 个文件" : "本机未装"}</span>`;
       box.appendChild(lb);
     });
