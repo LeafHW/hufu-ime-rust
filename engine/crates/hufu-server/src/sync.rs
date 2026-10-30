@@ -1390,13 +1390,32 @@ fn sync_builtin_skins(
     let mut pulled = false;
     for (name, p) in &local {
         let lmt = file_mtime_ms(p).unwrap_or(0);
+        // 读一次内容复用：出厂判定（语义比较）+ 云端哈希比对
+        let bytes = std::fs::read(p).ok();
+        let disk_val = bytes.as_ref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        //【重装原版覆盖防线 2026-10-31】本地皮肤==内嵌出厂版（未调过）
+        // 且云端有记录 → 无条件以云端为准：重装机的原版文件 mtime 天然
+        // 晚于旧机调参后的文件，纯「最后修改的赢」会拿原版洗掉云端调参
+        //（实锤：旧机竖排沉雾险些被重装机横排原版覆盖）。未调过的本地
+        // 版不含用户意图，不参与仲裁。
+        let is_factory = disk_val
+            .as_ref()
+            .map(|v| crate::host::official_skin_unchanged(name, v))
+            .unwrap_or(false);
+        let local_hash = bytes.as_ref().map(|b| hash_bytes(b));
         match remote.get(name) {
+            Some((rmt, key, rh)) if is_factory => {
+                // 云端为准（内容相同只回拨 mtime，免下载）
+                if local_hash.as_deref() == Some(rh.as_str()) {
+                    set_mtime(p, *rmt);
+                } else {
+                    pull_file(agent, s, &dir, name, key, *rmt)?;
+                    pulled = true;
+                }
+            }
             Some((rmt, key, rh)) if *rmt > lmt => {
                 // 云端新：哈希相同只回拨 mtime 对齐（内容没变免下载）
-                let same = std::fs::read(p)
-                    .map(|b| hash_bytes(&b) == *rh)
-                    .unwrap_or(false);
-                if same {
+                if local_hash.as_deref() == Some(rh.as_str()) {
                     set_mtime(p, *rmt);
                 } else {
                     pull_file(agent, s, &dir, name, key, *rmt)?;
