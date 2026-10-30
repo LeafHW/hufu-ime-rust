@@ -738,7 +738,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 云同步 ════ -->
   <section id="tab-sync">
     <h2>云同步<span class="en">Sync · WebDAV</span></h2>
-    <div class="sub">通过 WebDAV 网盘（坚果云等）在多台电脑间同步：勾选方案的<b>整个方案文件夹</b>（主码表、用户调整、快符、拆分表等全部文件）+ 配置设置。新电脑登录后勾选方案即自动整套下载。<b>不同步</b>：皮肤与挂件、当前方案选择、开机自启、导出快捷键、候选字体。数据只经你自己的网盘（虎符官方不设服务器）；勾选口令后云端只存密文。</div>
+    <div class="sub">通过 WebDAV 网盘（坚果云等）在多台电脑间同步：勾选方案的<b>整个方案文件夹</b>（主码表、用户调整、快符、拆分表等全部文件）+ 配置设置（皮肤、候选、按键、当前方案等；仅字体名/开机自启/本机导出快捷键除外）。新电脑登录后勾选方案即自动整套下载。数据只经你自己的网盘（虎符官方不设服务器）。</div>
     <div class="row" style="align-items:center;margin-top:2px">
       <span class="sub">没有账号？<a href="https://www.jianguoyun.com/" target="_blank" rel="noreferrer">坚果云官网注册</a> ｜ <a href="https://www.jianguoyun.com/s/downloads" target="_blank" rel="noreferrer">客户端下载地址</a><span title="同步功能不依赖客户端，网页注册即可">(同步无需客户端)</span> ｜</span>
       <button onclick="window.open('/api/sync/tutorial','_blank')" title="打开同步图文教程（安装目录 数据\\ 下的 同步教程.png，找不到则读桌面）">📖 图文教程</button>
@@ -750,10 +750,6 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
     <div class="row">
       <div class="field"><label>应用密码<span class="sub">（WebDAV 应用密码，非登录密码；坚果云：网页版 → 账户信息 → 安全选项 → 添加应用密码）</span></label><input type="password" id="sy-pass" autocomplete="new-password" style="width:330px"></div>
       <div class="field"><label>设备名<span class="sub">（留空自动生成；用于区分同步来源）</span></label><input type="text" id="sy-device" placeholder="如 台式机-书房" style="width:220px"></div>
-    </div>
-    <div class="row" style="align-items:flex-end">
-      <div class="field"><label>加密口令<span class="sub">（强烈建议：两台机必须一致；设置后云端只存密文，网盘也看不到内容）</span></label><input type="password" id="sy-pp" autocomplete="new-password" style="width:330px"></div>
-      <div class="checkline" style="margin-bottom:6px"><input type="checkbox" id="sy-pp-change"><label for="sy-pp-change" title="勾选后本次保存才修改/停用口令（停用=口令留空保存）；不勾选保持现状，防止误关加密">修改/停用口令</label></div>
     </div>
     <div class="row" style="align-items:center">
       <button id="sy-save" class="primary">保存</button>
@@ -3978,11 +3974,10 @@ async function loadSync() {
   try {
     const st = await api("GET", "/api/sync/status");
     $("#sy-url").value = st.url || "https://dav.jianguoyun.com/dav/"; $("#sy-user").value = st.user || ""; $("#sy-device").value = st.device || "";
-    $("#sy-pass").value = ""; $("#sy-pp").value = ""; $("#sy-pp-change").checked = false;
+    $("#sy-pass").value = "";
     $("#sy-pass").placeholder = st.configured ? "（已保存；留空=不修改）" : "";
-    $("#sy-pp").placeholder = st.passphrase_set ? "（已启用加密；勾选「修改/停用口令」后可更改）" : "";
     $("#sy-status").textContent = st.enabled
-      ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.passphrase_set ? "" : " ｜ ⚠ 未加密"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
+      ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
       : (st.stopped ? "⏸ 同步已停止（云端与本机文件都保留；点「恢复同步」继续）" : "未配置（填写并保存后启用；每 2 分钟自动同步）");
     $("#sy-stop").style.display = st.enabled ? "" : "none";
     $("#sy-resume").style.display = st.stopped ? "" : "none";
@@ -4119,7 +4114,7 @@ async function loadCloud() {
     if (!r.ok) { sum.textContent = r.msg || "未配置账号"; box.innerHTML = ""; devs.innerHTML = ""; return; }
     if (!r.exists) { sum.textContent = "云端还没有同步数据（保存账号并勾选方案后自动上传）。"; box.innerHTML = ""; devs.innerHTML = ""; return; }
     const devArr = Object.entries(r.devices || {});
-    sum.textContent = `云端数据来自「${r.last_device || "?"}」（${new Date(r.last_ts * 1000).toLocaleString()}）｜ ${devArr.length} 台设备参与同步${r.encrypted ? " ｜ 🔒 已加密" : " ｜ ⚠ 未加密"}`;
+    sum.textContent = `云端数据来自「${r.last_device || "?"}」（${new Date(r.last_ts * 1000).toLocaleString()}）｜ ${devArr.length} 台设备参与同步｜ 含输入法配置（设置页的大部分选项）`;
     devs.innerHTML = devArr.map(([n, t]) =>
       `<span class="pill" title="最后活跃">${n} · ${new Date(t * 1000).toLocaleString()}</span>`).join("");
     let html = "";
@@ -4201,13 +4196,13 @@ $("#sy-delcloud").onclick = async () => {
   try { const r = await api("POST", "/api/sync/cloud/delete", {}); msg(r.msg || "已提交删除，稍候刷新查看", "ok"); setTimeout(loadSync, 3000); }
   catch (e) { msg("删除失败：" + e.message, "err"); }
 };
-/* 同步表单 → save 载荷（密钥类留空=__keep__ 不改已存值） */
+/* 同步表单 → save 载荷（密钥留空=__keep__ 不改已存值） */
 function syncPayload() {
-  const pass = $("#sy-pass").value, pp = $("#sy-pp-change").checked ? $("#sy-pp").value : "__keep__";
+  const pass = $("#sy-pass").value;
   return {
     url: $("#sy-url").value.trim() || "https://dav.jianguoyun.com/dav/", user: $("#sy-user").value.trim(),
     pass: pass === "" ? "__keep__" : pass,
-    device: $("#sy-device").value.trim(), passphrase: pp
+    device: $("#sy-device").value.trim()
   };
 }
 $("#sy-save").onclick = async () => {

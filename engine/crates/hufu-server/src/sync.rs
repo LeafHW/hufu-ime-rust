@@ -20,9 +20,9 @@
 //! 触发：启动延迟 20s / 周期 2min / 码表监视器通知（防抖 8s）/ 手动。
 //! 失败静默退避记 last_error——**红线：绝不触碰/阻塞打字路径**。
 //!
-//! 加密（可选口令）：PBKDF2 派生 key（salt 存 manifest.enc），每文件
-//! AES-256-GCM（nonce 存 manifest 文件条目）；manifest 本身明文（只含
-//! 清单不含内容）。两台机口令必须一致。
+//! 【加密口令移除 2026-10-30 用户拍板】v3 早期可选的 AES-GCM 端到端
+//! 加密已整体移除（含 UI），云端存明文——数据只经用户自己的 WebDAV
+//! 网盘，信任边界=网盘账号本身。
 //!
 //! 凭据存放：数据\同步.json（明文，与本机 config.json 同信任级；WebDAV
 //! 用应用密码非登录密码）。
@@ -44,8 +44,6 @@ use crate::host::Host;
 const MF_VERSION: u64 = 3;
 const MF_PATH: &str = "hufu-sync/manifest.json";
 const FILES_DIR: &str = "hufu-sync/files";
-/// 口令派生轮数（PBKDF2-HMAC-SHA256）
-const KDF_ROUNDS: u32 = 300_000;
 /// 单文件上限（码表 MB 级；防异常巨物打爆坚果云配额）
 const MAX_FILE: u64 = 32 * 1024 * 1024;
 /// manifest 上限
@@ -68,11 +66,11 @@ const DEVICE_STALE_SECS: u64 = 30 * 24 * 3600;
 const KEEP: &str = "__keep__";
 const DEFAULT_URL: &str = "https://dav.jianguoyun.com/dav/";
 
-/// 不同步的 config 键（皮肤挂件/机器本地字段/每机方案选择）。
+/// 不同步的 config 键（仅保留真正机器本地的字段）。
+/// 【整文件同步 2026-10-30 用户拍板】皮肤选择/当前方案等全部纳入
+/// 同步（此前被剔导致「配置没同步」的观感）；仅剔字体名（装没装
+/// 每机不同）、开机自启（机器属性）、本机录制的导出快捷键。
 const CONFIG_EXCLUDED: &[&str] = &[
-    "schema",                 // 当前方案/目录 = 每机自己的选择
-    "appearance.skin",
-    "appearance.skin_kind",
     "appearance.font_family", // 字体装没装每机不同
     "general.autostart",      // 开机自启 = 机器属性
     "general.export_key",     // 本机录制的快捷键
@@ -88,8 +86,6 @@ pub struct SyncSettings {
     /// WebDAV 应用密码（明文存本机，同 config.json 信任级）
     pub pass: String,
     pub device: String,
-    /// 加密口令（空 = 文件明文）
-    pub passphrase: String,
     /// 总开关：false=停止同步（凭据保留，云端不动）
     pub enabled: bool,
     /// 勾选参与同步的方案名（码表\ 下的文件夹名）
@@ -253,7 +249,6 @@ pub fn status_value() -> Value {
         "configured": configured,
         "stopped": configured && !s.enabled,
         "url": s.url, "user": s.user, "device": s.device,
-        "passphrase_set": !s.passphrase.is_empty(),
         "selected": s.selected,
         "last_sync": s.last_sync, "last_error": s.last_error,
         "phase": phase,
@@ -348,13 +343,14 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// POST /api/sync/save。pass/passphrase 传 `__keep__` = 保持已存值。
+/// POST /api/sync/save。pass 传 `__keep__` = 保持已存值。
+/// 【加密口令移除 2026-10-30 用户拍板】云端只存明文（数据仍只经
+/// 用户自己的 WebDAV 网盘）；旧档案里的 passphrase 字段自然失效。
 pub fn save_settings(
     url: &str,
     user: &str,
     pass: &str,
     device: &str,
-    passphrase: &str,
 ) -> Result<(), String> {
     if DATA_DIR.get().is_none() {
         return Err("同步模块未初始化".into());
@@ -380,9 +376,6 @@ pub fn save_settings(
     } else {
         device.trim().to_string()
     };
-    if passphrase != KEEP {
-        st.passphrase = passphrase.to_string();
-    }
     // 首次配置成功启用
     if !st.user.is_empty() && !st.pass.is_empty() && !st.url.is_empty() {
         st.enabled = true;
@@ -461,7 +454,6 @@ pub fn cloud_summary() -> Value {
         "last_device": mf.get("device").and_then(|v| v.as_str()).unwrap_or("?"),
         "last_ts": mf.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
         "devices": devices,
-        "encrypted": mf.get("enc").map(|v| !v.is_null()).unwrap_or(false),
         "schemes": mf.get("schemes").cloned().unwrap_or(json!({})),
     })
 }
@@ -546,7 +538,6 @@ pub fn logout() -> Result<String, String> {
     let st = guard.get_or_insert_with(SyncSettings::default);
     st.user = String::new();
     st.pass = String::new();
-    st.passphrase = String::new();
     st.enabled = false;
     st.local_snap.clear();
     st.last_config = None;
@@ -742,16 +733,6 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     let agent = build_agent();
     let mut mf = fetch_manifest(&agent, s)?.unwrap_or_else(empty_manifest);
 
-    // 加密参数：本机有口令 → manifest 必须有 enc.salt（没有=本机首建）
-    if !s.passphrase.is_empty() {
-        if mf.get("enc").and_then(|e| e.get("salt")).is_none() {
-            let mut salt = [0u8; 16];
-            getrandom::getrandom(&mut salt)
-                .map_err(|e| format!("取随机数失败：{e}"))?;
-            mf["enc"] = json!({"salt": hex(&salt)});
-        }
-    }
-
     let root = local_schema_root().ok_or("找不到码表目录")?;
     let mut uploaded = 0usize;
     let mut downloaded = 0usize;
@@ -776,7 +757,7 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                     p.total += n as u32;
                 }
                 prog_begin_file(&format!("{name}（整套下载）"));
-                let got = pull_scheme_all(&agent, s, &mf, &root, name, &entry)?;
+                let got = pull_scheme_all(&agent, s, &root, name, &entry)?;
                 prog_done_file(false, got as u64);
                 downloaded += 1;
             }
@@ -835,7 +816,7 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                 // 云端新（或同刻）：下载覆盖（内容相同会跳过写盘）
                 if lp.is_none() || file_hash(lp.unwrap())? != remote_hash_hint(rv) {
                     prog_begin_file(&format!("{name}/{fname}"));
-                    let n = pull_file(&agent, s, &mf, &dir, fname, key, rmt)?;
+                    let n = pull_file(&agent, s, &dir, fname, key, rmt)?;
                     prog_done_file(false, n as u64);
                     downloaded += 1;
                 }
@@ -1098,7 +1079,7 @@ fn count_files(dir: &Path) -> usize {
 
 fn empty_manifest() -> Value {
     json!({"v": MF_VERSION, "device": "", "ts": 0,
-        "enc": Value::Null, "config": Value::Null,
+        "config": Value::Null,
         "devices": {}, "schemes": {}})
 }
 
@@ -1153,7 +1134,7 @@ fn push_file(
         ));
     }
     let key = file_key(scheme, fname);
-    let body = encrypt_for_cloud(s, mf, &raw)?;
+    let body = raw.clone();
     let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
     match auth_req(
         agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
@@ -1181,13 +1162,12 @@ fn push_file(
     }
     let mt = file_mtime_ms(path)?;
     ensure_scheme_entry(mf, scheme);
-    let nonce = nonce_of(&body);
     //【洗劫事故坑】不能用 pointer_mut 走 files/<名>——键不存在时返回
     // None、条目静默丢失（文件上云、清单没有 → 下轮本地全被判对端删
     // 除）。改为索引访问直写。
     let entry = json!({
         "mt": mt, "sz": raw.len(), "h": hash_bytes(&raw),
-        "key": key, "n": nonce,
+        "key": key,
     });
     let wrote = mf
         .get_mut("schemes")
@@ -1203,11 +1183,10 @@ fn push_file(
     Ok(raw.len())
 }
 
-/// 下载单文件：GET →（口令开启时解密）→ 备份旧版 → 写盘 → mtime 回拨。
+/// 下载单文件：GET → 备份旧版 → 写盘 → mtime 回拨。
 fn pull_file(
     agent: &ureq::Agent,
     s: &SyncSettings,
-    mf: &Value,
     dir: &Path,
     fname: &str,
     key: &str,
@@ -1228,21 +1207,19 @@ fn pull_file(
         }
         Err(e) => return Err(format!("下载「{fname}」失败：{e}")),
     }
-    let raw = decrypt_from_cloud(s, mf, &body)?;
     let dst = dir.join(fname);
     if dst.is_file() {
         backup_file_before_write(&dst);
     }
-    std::fs::write(&dst, &raw).map_err(|e| format!("写入「{fname}」失败：{e}"))?;
+    std::fs::write(&dst, &body).map_err(|e| format!("写入「{fname}」失败：{e}"))?;
     set_mtime(&dst, rmt);
-    Ok(raw.len())
+    Ok(body.len())
 }
 
 /// 整夹拉取（本机未装该方案）：建目录 + 逐文件下载（mtime 回拨）。
 fn pull_scheme_all(
     agent: &ureq::Agent,
     s: &SyncSettings,
-    mf: &Value,
     root: &Path,
     scheme: &str,
     entry: &Value,
@@ -1254,7 +1231,7 @@ fn pull_scheme_all(
     for (fname, rv) in &files {
         let key = rv.get("key").and_then(|v| v.as_str()).unwrap_or("");
         let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
-        total += pull_file(agent, s, mf, &dir, fname, key, rmt)?;
+        total += pull_file(agent, s, &dir, fname, key, rmt)?;
     }
     Ok(total)
 }
@@ -1326,96 +1303,6 @@ fn fetch_manifest(agent: &ureq::Agent, s: &SyncSettings) -> Result<Option<Value>
 fn put_manifest(agent: &ureq::Agent, s: &SyncSettings, mf: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(mf).map_err(|e| e.to_string())?;
     webdav_put_body(agent, s, MF_PATH, &body, "application/json")
-}
-
-// ─────────────────────────── 文件加密 ───────────────────────────
-
-/// 云端文件体 = 原文（无口令）| nonce(12B) + AES-GCM(ct)。
-/// key 由口令 + manifest.enc.salt 派生（同轮多文件复用同一 key——
-/// PBKDF2 300k 轮只算一次，经 KEY_CACHE）。
-fn encrypt_for_cloud(s: &SyncSettings, mf: &Value, raw: &[u8]) -> Result<Vec<u8>, String> {
-    if s.passphrase.is_empty() {
-        return Ok(raw.to_vec());
-    }
-    let key = cloud_key(s, mf)?;
-    let mut nonce = [0u8; 12];
-    getrandom::getrandom(&mut nonce).map_err(|e| format!("取随机数失败：{e}"))?;
-    let ct = aes_ops(&key, &nonce, raw, true).ok_or("加密失败")?;
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&ct);
-    Ok(out)
-}
-
-fn decrypt_from_cloud(s: &SyncSettings, mf: &Value, body: &[u8]) -> Result<Vec<u8>, String> {
-    if s.passphrase.is_empty() {
-        return Ok(body.to_vec());
-    }
-    if body.len() < 12 {
-        return Err("云端文件损坏（过短）".into());
-    }
-    let key = cloud_key(s, mf)?;
-    let (nonce, ct) = body.split_at(12);
-    let n: [u8; 12] = nonce.try_into().unwrap();
-    aes_ops(&key, &n, ct, false).ok_or_else(|| "解密失败：加密口令不匹配（或数据损坏）".into())
-}
-
-/// nonce 提示（加密时记录到 manifest，审计用；解密自含 nonce）。
-fn nonce_of(body: &[u8]) -> String {
-    if body.len() >= 12 {
-        hex(&body[..12])
-    } else {
-        String::new()
-    }
-}
-
-static KEY_CACHE: Mutex<Option<(String, String, [u8; 32])>> = Mutex::new(None);
-
-fn cloud_key(s: &SyncSettings, mf: &Value) -> Result<[u8; 32], String> {
-    let salt = mf
-        .get("enc")
-        .and_then(|e| e.get("salt"))
-        .and_then(|v| v.as_str())
-        .ok_or("加密参数缺失（manifest 无 salt）")?;
-    derive_cached(s, salt)
-}
-
-fn derive_cached(s: &SyncSettings, salt_hex: &str) -> Result<[u8; 32], String> {
-    let mut guard = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((pp, salt, key)) = guard.as_ref() {
-        if *pp == s.passphrase && salt == salt_hex {
-            return Ok(*key);
-        }
-    }
-    let Some(salt) = unhex(salt_hex) else {
-        return Err("加密参数损坏（salt）".into());
-    };
-    let mut k = [0u8; 32];
-    pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(
-        s.passphrase.as_bytes(),
-        &salt,
-        KDF_ROUNDS,
-        &mut k,
-    );
-    *guard = Some((s.passphrase.clone(), salt_hex.to_string(), k));
-    Ok(k)
-}
-
-fn derive_key(pp: &[u8], salt: &[u8], iter: u32) -> [u8; 32] {
-    let mut k = [0u8; 32];
-    pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(pp, salt, iter, &mut k);
-    k
-}
-
-/// AES-256-GCM 加/解密（enc=true 加密）。
-fn aes_ops(key: &[u8; 32], nonce: &[u8], data: &[u8], enc: bool) -> Option<Vec<u8>> {
-    use aes_gcm::aead::{Aead, KeyInit};
-    let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).ok()?;
-    let n = aes_gcm::Nonce::from_slice(nonce);
-    if enc {
-        cipher.encrypt(n, data).ok()
-    } else {
-        cipher.decrypt(n, data).ok()
-    }
 }
 
 // ─────────────────────────── config 归并 ───────────────────────────
@@ -1618,20 +1505,6 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let b = s.as_bytes();
-    let mut v = Vec::with_capacity(b.len() / 2);
-    for i in (0..b.len()).step_by(2) {
-        let hi = (b[i] as char).to_digit(16)?;
-        let lo = (b[i + 1] as char).to_digit(16)?;
-        v.push(((hi << 4) | lo) as u8);
-    }
-    Some(v)
-}
-
 // ─────────────────────────── 测试 ───────────────────────────
 
 #[cfg(test)]
@@ -1650,16 +1523,21 @@ mod tests {
         assert_eq!(a.len(), 32);
     }
 
-    /// 消毒：排除键剔除，其余保留。
+    /// 消毒：排除键剔除，其余保留（schema/skin 已按 2026-10-30 拍板纳入同步）。
     #[test]
     fn config_sanitize_exclusions() {
         let mut cfg = json!({
             "schema": {"current": "A"},
+            "appearance": {"skin": "moyan", "font_family": "宋体"},
             "general": {"autostart": true, "export_key": "ctrl+x"},
             "candidates": {"page_size": 4}
         });
         sanitize_config(&mut cfg);
-        assert!(cfg.get("schema").is_none());
+        // 整文件同步：schema 与皮肤选择保留（同步到其他机器）
+        assert_eq!(cfg["schema"]["current"], "A");
+        assert_eq!(cfg["appearance"]["skin"], "moyan");
+        // 机器本地字段仍被剔除
+        assert!(cfg["appearance"].get("font_family").is_none());
         assert!(cfg["general"].get("autostart").is_none());
         assert!(cfg["general"].get("export_key").is_none());
         assert_eq!(cfg["candidates"]["page_size"], 4);
@@ -1668,9 +1546,9 @@ mod tests {
     /// 三方归并：本机没动→采纳远端；本机动了→保留本机。
     #[test]
     fn three_way_basic() {
-        let full = json!({"a": 1, "b": 2, "skin": "x"});
+        let full = json!({"a": 1, "b": 2, "font_family": "宋体"});
         let mut local_san = full.clone();
-        sanitize_config(&mut local_san); // skin 被剔除
+        sanitize_config(&mut local_san); // font_family 被剔除
         let base = json!({"a": 1, "b": 1});
         let remote = json!({"a": 9, "b": 5});
         let merged = three_way_merge(&full, &local_san, &base, &remote);
@@ -1679,7 +1557,7 @@ mod tests {
         // b 本机动了（2≠1）→ 保留本机
         assert_eq!(merged["b"], 2);
         // 排除键不被远端冲
-        assert_eq!(merged["skin"], "x");
+        assert_eq!(merged["font_family"], "宋体");
     }
 
     /// manifest 键转义：方案名含 / 时 pointer 安全。

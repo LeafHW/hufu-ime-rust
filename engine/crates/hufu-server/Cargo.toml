@@ -34,11 +34,8 @@ sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 # 【旧版控制台真光标 2026-10-15】console_caret op：AttachConsole 到宿主
 # 客户端进程读光标（DLL 载在 conhost 内自读双通道皆死，只能借外部进程）。
-# 【P1 云同步 2026-10-28】加密件（详见 src/sync.rs）：纯 Rust，零 C 工具链。
-# pbkdf2 0.11 的 pbkdf2::<PRF> 需要 hmac::Hmac 做 PRF。
-aes-gcm = { workspace = true }
-pbkdf2 = { workspace = true }
-hmac = { workspace = true }
+# 【P1 云同步 2026-10-28】sha2=文件指纹；getrandom=设备名后缀。
+#（aes-gcm/pbkdf2/hmac 随「加密口令」功能移除 2026-10-30 一并卸载）
 getrandom = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

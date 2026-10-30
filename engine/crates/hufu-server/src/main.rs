@@ -1365,7 +1365,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         .unwrap_or("")
                         .to_string()
                 };
-                match sync::save_settings(&g("url"), &g("user"), &g("pass"), &g("device"), &g("passphrase")) {
+                match sync::save_settings(&g("url"), &g("user"), &g("pass"), &g("device")) {
                     Ok(()) => Response::json(&serde_json::json!({"ok": true})),
                     Err(e) => Response::err(500, &e),
                 }
