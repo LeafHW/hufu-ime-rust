@@ -710,8 +710,17 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             .unwrap_or_default();
         let snap_files = snap.get(name);
 
-        // 仲裁：云端文件
-        let mut new_entry: serde_json::Map<String, Value> = serde_json::Map::new();
+        //【洗劫事故 2026-10-30 根因】旧版两处连环坑：push_file 用
+        // pointer_mut 访问尚不存在的 files/<名> 键 → None 静默丢条目
+        //（文件上云、清单没有）；主循环又用「云端已有条目」重建 new_entry
+        // 整覆写 files → 清单被清空。下一轮把本地文件全判成「对端删的」
+        // 洗进回收站。现改：①清单就地增删（绝不整覆写）；②删除传播加
+        // 保险——云端清单为空而本地有文件时【绝不删本地】（整案清空
+        // 只能由管理页「删除云端」触发，同步层不做整夹清空传播）。
+        ensure_scheme_entry(&mut mf, name);
+        let empty_remote = r_files.is_empty();
+
+        // 仲裁：云端文件（拉新/跳过；条目留在清单里）
         for (fname, rv) in &r_files {
             let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
             let key = rv.get("key").and_then(|v| v.as_str()).unwrap_or("");
@@ -724,16 +733,9 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                 if lp.is_none() || file_hash(lp.unwrap())? != remote_hash_hint(rv) {
                     downloaded += pull_file(&agent, s, &mf, &dir, fname, key, rmt)?;
                 }
-                new_entry.insert(fname.clone(), rv.clone());
             } else {
-                // 本地新：上传 + 更新条目
+                // 本地新：上传（push_file 就地更新清单条目）
                 uploaded += push_file(&agent, s, &mut mf, name, fname, lp.unwrap())?;
-                // push_file 已把新条目写进 mf（见其实现）
-                let upd = mf
-                    .pointer(&format!("/schemes/{}/files/{}", json_escape_key(name), json_escape_key(fname)))
-                    .cloned()
-                    .unwrap_or_else(|| rv.clone());
-                new_entry.insert(fname.clone(), upd);
             }
         }
         // 本地多出的文件（云端清单没有）
@@ -747,23 +749,26 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             if is_new {
                 // 本地新文件（含换码表的新主码表）→ 上传
                 uploaded += push_file(&agent, s, &mut mf, name, fname, lp)?;
+            } else if empty_remote {
+                // 保险闸：云端整个方案清单为空而本地有文件——按「云端
+                // 数据不完整」处理：上传补齐，绝不删除本地。
+                uploaded += push_file(&agent, s, &mut mf, name, fname, lp)?;
             } else {
-                // 相对上次收敛无变化而云端已无 = 对端删的 → 回收站后删
+                // 云端清单非空而该文件不在其中 = 对端真删了这个文件
+                //（换码表等）→ 回收站后删本地
                 trash_file(&dir, fname)?;
                 deleted_local += 1;
             }
         }
-        // 写回该方案的清单（哪怕空——空清单=云端此方案已被清空）
-        ensure_scheme_entry(&mut mf, name);
-        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
-            .unwrap()
-            ["files"] = Value::Object(new_entry);
-        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
-            .unwrap()
-            ["by"] = json!(s.device);
-        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
-            .unwrap()
-            ["ts"] = json!(now_secs());
+        // 元信息就地更新（files 已由 push/pull/仲裁就地维护，不覆写）
+        if let Some(e) = mf
+            .get_mut("schemes")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|m| m.get_mut(name.as_str()))
+        {
+            e["by"] = json!(s.device);
+            e["ts"] = json!(now_secs());
+        }
     }
 
     // config：三方归并（base=上次收敛快照）。远端项变了且本机没动 →
@@ -1068,17 +1073,24 @@ fn push_file(
     let mt = file_mtime_ms(path)?;
     ensure_scheme_entry(mf, scheme);
     let nonce = nonce_of(&body);
-    mf.pointer_mut(&format!(
-        "/schemes/{}/files/{}",
-        json_escape_key(scheme),
-        json_escape_key(fname)
-    ))
-    .map(|e| {
-        *e = json!({
-            "mt": mt, "sz": raw.len(), "h": hash_bytes(&raw),
-            "key": key, "n": nonce,
-        })
+    //【洗劫事故坑】不能用 pointer_mut 走 files/<名>——键不存在时返回
+    // None、条目静默丢失（文件上云、清单没有 → 下轮本地全被判对端删
+    // 除）。改为索引访问直写。
+    let entry = json!({
+        "mt": mt, "sz": raw.len(), "h": hash_bytes(&raw),
+        "key": key, "n": nonce,
     });
+    let wrote = mf
+        .get_mut("schemes")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|m| m.get_mut(scheme))
+        .and_then(|e| e.get_mut("files"))
+        .and_then(|v| v.as_object_mut())
+        .map(|files| files.insert(fname.to_string(), entry).is_some() || true)
+        .unwrap_or(false);
+    if !wrote {
+        return Err(format!("同步清单结构损坏（{scheme}）——已中止本轮"));
+    }
     Ok(raw.len())
 }
 
