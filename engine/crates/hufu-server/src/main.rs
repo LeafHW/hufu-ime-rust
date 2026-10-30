@@ -1379,6 +1379,61 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 sync::notify("手动");
                 Response::json(&serde_json::json!({"ok": true}))
             }
+            //【云同步 v3 2026-10-30】方案勾选/管理面板/回收站
+            ("GET", "/api/sync/schemes") => Response::json(&sync::schemes_overview()),
+            ("POST", "/api/sync/select") => {
+                let v = req.json();
+                let sel: Vec<String> = v
+                    .get("selected")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match sync::save_selection(&sel) {
+                    Ok(()) => Response::json(&serde_json::json!({"ok": true})),
+                    Err(e) => Response::err(500, &e),
+                }
+            }
+            ("POST", "/api/sync/enable") => {
+                let v = req.json();
+                let on = v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                match sync::set_enabled(on) {
+                    Ok(()) => Response::json(&serde_json::json!({"ok": true, "enabled": on})),
+                    Err(e) => Response::err(500, &e),
+                }
+            }
+            ("GET", "/api/sync/cloud") => Response::json(&sync::cloud_summary()),
+            ("GET", "/api/sync/backup") => Response::json(&sync::backup_summary()),
+            ("POST", "/api/sync/cloud/delete") => {
+                let v = req.json();
+                let scheme = v.get("scheme").and_then(|x| x.as_str()).map(String::from);
+                // 网络 IO 较重（逐文件 DELETE），放后台线程执行
+                std::thread::spawn(move || match sync::delete_cloud(scheme.as_deref()) {
+                    Ok(msg) => eprintln!("同步管理：{msg}"),
+                    Err(e) => eprintln!("同步管理删除失败：{e}"),
+                });
+                Response::json(&serde_json::json!({"ok": true, "msg": "正在删除，稍候刷新查看"}))
+            }
+            ("POST", "/api/sync/logout") => match sync::logout() {
+                Ok(msg) => Response::json(&serde_json::json!({"ok": true, "msg": msg})),
+                Err(e) => Response::err(500, &e),
+            },
+            ("GET", "/api/sync/trash") => Response::json(&sync::trash_list()),
+            ("POST", "/api/sync/trash/restore") => {
+                let v = req.json();
+                let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                match sync::trash_restore(&g("scheme"), &g("trash")) {
+                    Ok(msg) => Response::json(&serde_json::json!({"ok": true, "msg": msg})),
+                    Err(e) => Response::err(500, &e),
+                }
+            }
+            ("POST", "/api/sync/trash/clear") => match sync::trash_clear() {
+                Ok(msg) => Response::json(&serde_json::json!({"ok": true, "msg": msg})),
+                Err(e) => Response::err(500, &e),
+            },
             _ => Response::err(404, "not found"),
         };
     }

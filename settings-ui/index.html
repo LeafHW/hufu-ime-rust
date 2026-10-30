@@ -731,7 +731,7 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
   <!-- ════ 云同步 ════ -->
   <section id="tab-sync">
     <h2>云同步<span class="en">Sync · WebDAV</span></h2>
-    <div class="sub">通过 WebDAV 网盘（坚果云等）在多台电脑间同步：各方案「用户调整.txt」（置顶/删词/加词/调频的操作记录）+ 配置设置。<b>不同步</b>：皮肤与挂件、当前方案选择、开机自启、导出快捷键、候选字体。数据只经你自己的网盘（虎符官方不设服务器）；勾选口令后云端只存密文。</div>
+    <div class="sub">通过 WebDAV 网盘（坚果云等）在多台电脑间同步：勾选方案的<b>整个方案文件夹</b>（主码表、用户调整、快符、拆分表等全部文件）+ 配置设置。新电脑登录后勾选方案即自动整套下载。<b>不同步</b>：皮肤与挂件、当前方案选择、开机自启、导出快捷键、候选字体。数据只经你自己的网盘（虎符官方不设服务器）；勾选口令后云端只存密文。</div>
     <div class="row" style="align-items:center;margin-top:2px">
       <span class="sub">没有账号？<a href="https://www.jianguoyun.com/" target="_blank" rel="noreferrer">坚果云官网注册</a> ｜ <a href="https://www.jianguoyun.com/s/downloads" target="_blank" rel="noreferrer">客户端下载地址</a><span title="同步功能不依赖客户端，网页注册即可">(同步无需客户端)</span> ｜</span>
       <button onclick="window.open('/api/sync/tutorial','_blank')" title="打开同步图文教程（安装目录 数据\\ 下的 同步教程.png，找不到则读桌面）">📖 图文教程</button>
@@ -754,7 +754,34 @@ textarea.wide { width: 100%; min-height: 130px; font-family: Consolas, monospace
       <button id="sy-now">立即同步</button>
       <span class="sub" id="sy-status">加载中…</span>
     </div>
-    <div class="sub" style="margin-top:6px">同步规则：开机约 20 秒首次同步，此后每 5 分钟一轮、改词/改配置后约 8 秒自动触发。一边变了就听那边的；两边都变了——词条按行合并谁也不丢（同词操作后写的生效），配置逐项归并（本机没动的项采纳云端，动了的不被冲回）。自定义方案文件夹（任意名字）都同步，按文件夹名配对——新电脑需先装好同名方案。每次拉取合并前自动备份到 安装目录\同步备份\（保留最近 10 份）。数据只经 WebDAV 你自己的网盘，虎符官方不设服务器。</div>
+    <div class="sub" style="margin-top:6px">同步规则：开机约 20 秒首次同步，此后<b>每 2 分钟</b>一轮、改文件后约 8 秒自动触发。仲裁一律按<b>文件修改时间</b>——最后改的赢：云端新就覆盖本地，本机新就上传。只传有改动的文件；在文件夹里换了码表（删旧换新）也会照实同步到其他电脑（删旧前自动进回收站）。首次同步整个文件夹，之后增量。数据只经 WebDAV 你自己的网盘，虎符官方不设服务器。</div>
+
+    <h3 style="margin-top:18px">同步哪些方案<span class="en">Schemes</span></h3>
+    <div class="sub">勾选的方案文件夹整体参与同步（本地 ⇄ 云端）。带 <b>☁</b> 标记=云端已有此方案（本机没装时勾选即整套下载到本地）。</div>
+    <div id="sy-schemes" class="row" style="flex-wrap:wrap;gap:8px;margin-top:6px"><span class="sub">加载中…</span></div>
+    <div class="row" style="margin-top:6px">
+      <button id="sy-sel-save">保存勾选并同步</button>
+      <span class="sub">勾选变化立即生效：新勾=整套上/下载，取消=该方案退出同步（云端与本地都保留不动）。</span>
+    </div>
+
+    <h3 style="margin-top:18px">同步管理<span class="en">Manage</span></h3>
+    <div class="sub" id="sy-mgmt-summary">加载中…</div>
+    <div id="sy-devices" class="row" style="flex-wrap:wrap;gap:8px;margin-top:4px"></div>
+    <div id="sy-cloud" style="margin-top:8px"></div>
+    <div class="row" style="align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
+      <button id="sy-stop" class="danger" title="暂停自动同步（凭据与云端数据都保留，随时恢复）">⏸ 停止同步</button>
+      <button id="sy-resume" style="display:none" class="primary">▶ 恢复同步</button>
+      <button id="sy-logout" class="danger" title="清空本机保存的账号密码并停用同步（云端数据保留，本地文件不动）">退出帐户</button>
+      <button id="sy-delcloud" class="danger" title="删除云端全部同步数据（本机文件一律不动；删除后同步自动停止）">删除云端同步数据</button>
+      <span class="sub">危险操作有确认弹窗。删除云端/退出帐户都不会动本机已同步到本地的文件。</span>
+    </div>
+
+    <h3 style="margin-top:18px">回收站<span class="en">Trash</span></h3>
+    <div class="sub">被同步覆盖或删除的旧文件会先挪进来（每方案保留 20 份、30 天内可还原）。还原的文件视为本机最新修改，随下轮同步上传到其他电脑。</div>
+    <div id="sy-trash" style="margin-top:6px"><span class="sub">加载中…</span></div>
+    <div class="row" style="margin-top:6px">
+      <button id="sy-trash-clear">清空回收站</button>
+    </div>
   </section>
 
   <section id="tab-about">
@@ -3907,23 +3934,138 @@ async function applyPlatform() {
 async function loadSync() {
   try {
     const st = await api("GET", "/api/sync/status");
-    /* 【默认地址修复 2026-10-29】地址栏空=按坚果云官方地址（此前只是
-       placeholder 视觉假象：值为空保存 → 同步判未配置，用户被迫手填
-       一次才生效）。status 无值时直接把默认地址填进框里。 */
     $("#sy-url").value = st.url || "https://dav.jianguoyun.com/dav/"; $("#sy-user").value = st.user || ""; $("#sy-device").value = st.device || "";
     $("#sy-pass").value = ""; $("#sy-pp").value = ""; $("#sy-pp-change").checked = false;
-    $("#sy-pass").placeholder = st.enabled ? "（已保存；留空=不修改）" : "";
+    $("#sy-pass").placeholder = st.configured ? "（已保存；留空=不修改）" : "";
     $("#sy-pp").placeholder = st.passphrase_set ? "（已启用加密；勾选「修改/停用口令」后可更改）" : "";
     $("#sy-status").textContent = st.enabled
       ? `${st.phase === "syncing" ? "⟳ 同步中…" : "空闲"} ｜ 上次同步：${st.last_sync ? new Date(st.last_sync * 1000).toLocaleString() : "从未"}${st.passphrase_set ? "" : " ｜ ⚠ 未加密"}${st.last_error ? " ｜ 上次错误：" + st.last_error : ""}`
-      : "未配置（填写并保存后启用；每 5 分钟自动同步）";
+      : (st.stopped ? "⏸ 同步已停止（云端与本机文件都保留；点「恢复同步」继续）" : "未配置（填写并保存后启用；每 2 分钟自动同步）");
+    $("#sy-stop").style.display = st.enabled ? "" : "none";
+    $("#sy-resume").style.display = st.stopped ? "" : "none";
   } catch (e) { $("#sy-status").textContent = "状态读取失败：" + e.message; }
+  loadSchemes(); loadCloud(); loadTrash();
 }
+/* 方案勾选列表（本地 ∪ 云端） */
+async function loadSchemes() {
+  try {
+    const r = await api("GET", "/api/sync/schemes");
+    const box = $("#sy-schemes"); box.innerHTML = "";
+    if (!r.schemes || !r.schemes.length) {
+      box.innerHTML = '<span class="sub">码表文件夹里还没有方案目录。新建方案文件夹后刷新即可。</span>';
+      return;
+    }
+    r.schemes.sort((a, b) => (b.local - a.local) || a.name.localeCompare(b.name, "zh")).forEach(s => {
+      const lb = document.createElement("label");
+      lb.className = "checkline";
+      lb.style.cssText = "border:1px solid var(--bd);border-radius:8px;padding:6px 12px";
+      lb.innerHTML = `<input type="checkbox" data-sy="${s.name}" ${s.selected ? "checked" : ""}>` +
+        ` ${s.name}${s.local ? "" : ' <b title="本机未装，云端已有">☁整套下载</b>'}` +
+        ` <span class="sub">${s.local ? s.files + " 个文件" : "本机未装"}</span>`;
+      box.appendChild(lb);
+    });
+  } catch (e) { $("#sy-schemes").innerHTML = '<span class="sub">读取失败：' + e.message + "</span>"; }
+}
+$("#sy-sel-save").onclick = async () => {
+  const sel = [...document.querySelectorAll("#sy-schemes input[data-sy]")].filter(x => x.checked).map(x => x.dataset.sy);
+  try {
+    await api("POST", "/api/sync/select", { selected: sel });
+    msg(`已保存勾选（${sel.length} 个方案），开始同步…`, "ok");
+  } catch (e) { msg("保存失败：" + e.message, "err"); }
+  setTimeout(loadSync, 2000);
+};
+/* 云端管理面板 */
+const fmtKB = b => b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : (b / 1024).toFixed(1) + " KB";
+async function loadCloud() {
+  const box = $("#sy-cloud"), devs = $("#sy-devices"), sum = $("#sy-mgmt-summary");
+  try {
+    const r = await api("GET", "/api/sync/cloud");
+    if (!r.ok) { sum.textContent = r.msg || "未配置账号"; box.innerHTML = ""; devs.innerHTML = ""; return; }
+    if (!r.exists) { sum.textContent = "云端还没有同步数据（保存账号并勾选方案后自动上传）。"; box.innerHTML = ""; devs.innerHTML = ""; return; }
+    const devArr = Object.entries(r.devices || {});
+    sum.textContent = `云端数据来自「${r.last_device || "?"}」（${new Date(r.last_ts * 1000).toLocaleString()}）｜ ${devArr.length} 台设备参与同步${r.encrypted ? " ｜ 🔒 已加密" : " ｜ ⚠ 未加密"}`;
+    devs.innerHTML = devArr.map(([n, t]) =>
+      `<span class="pill" title="最后活跃">${n} · ${new Date(t * 1000).toLocaleString()}</span>`).join("");
+    let html = "";
+    const sch = r.schemes || {};
+    for (const [name, e] of Object.entries(sch)) {
+      const files = e.files || {};
+      const fl = Object.entries(files).map(([fn, f]) =>
+        `<div class="sub" style="padding-left:18px">└ ${fn} ｜ ${fmtKB(f.sz || 0)} ｜ ${f.mt ? new Date(f.mt).toLocaleString() : "?"}</div>`).join("");
+      html += `<div style="border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-top:6px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b>${name}</b><span class="sub">${Object.keys(files).length} 个文件 ｜ 最后上传：${e.by || "?"} · ${e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}</span>
+          <span style="flex:1"></span>
+          <button data-unsync="${name}" title="此方案退出同步（云端与本地都保留不动）">取消同步</button>
+          <button data-delcloud="${name}" class="danger" title="删除云端该方案的全部文件（本机文件不动）">删除云端</button>
+        </div>${fl}</div>`;
+    }
+    box.innerHTML = html || '<span class="sub">云端还没有方案数据。</span>';
+    box.querySelectorAll("[data-unsync]").forEach(b => b.onclick = async () => {
+      const name = b.dataset.unsync;
+      const sel = [...document.querySelectorAll("#sy-schemes input[data-sy]")].filter(x => x.checked && x.dataset.sy !== name).map(x => x.dataset.sy);
+      await api("POST", "/api/sync/select", { selected: sel });
+      msg(`「${name}」已退出同步（云端与本地都保留）`, "ok"); loadSync();
+    });
+    box.querySelectorAll("[data-delcloud]").forEach(b => b.onclick = async () => {
+      const name = b.dataset.delcloud;
+      if (!confirm(`确定删除云端方案「${name}」的全部同步文件？\n（本机文件不会动；其他电脑将不再收到此方案的更新）`)) return;
+      const r2 = await api("POST", "/api/sync/cloud/delete", { scheme: name });
+      msg(r2.msg || "已提交删除", "ok"); setTimeout(loadCloud, 2500);
+    });
+  } catch (e) { sum.textContent = "云端信息读取失败：" + e.message; }
+}
+/* 回收站 */
+async function loadTrash() {
+  const box = $("#sy-trash");
+  try {
+    const r = await api("GET", "/api/sync/trash");
+    const sch = r.schemes || {};
+    let html = "";
+    for (const [name, arr] of Object.entries(sch)) {
+      html += `<div style="border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-top:6px">
+        <b>${name}</b>（${arr.length} 份）` +
+        arr.map(f => `<div class="sub" style="padding-left:18px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="flex:1">└ ${f.name} ｜ 存于 ${new Date(f.saved_ms).toLocaleString()} ｜ ${fmtKB(f.size || 0)}</span>
+          <button data-tr="${name}" data-f="${f.trash}">还原</button></div>`).join("") + "</div>";
+    }
+    box.innerHTML = html || '<span class="sub">回收站是空的（被同步覆盖/删除的旧文件会出现在这里）。</span>';
+    box.querySelectorAll("[data-tr]").forEach(b => b.onclick = async () => {
+      try {
+        const r2 = await api("POST", "/api/sync/trash/restore", { scheme: b.dataset.tr, trash: b.dataset.f });
+        msg(r2.msg, "ok"); loadTrash();
+      } catch (e) { msg("还原失败：" + e.message, "err"); }
+    });
+  } catch (e) { box.innerHTML = '<span class="sub">回收站读取失败：' + e.message + "</span>"; }
+}
+$("#sy-trash-clear").onclick = async () => {
+  if (!confirm("确定清空回收站？清空后无法还原。")) return;
+  try { const r = await api("POST", "/api/sync/trash/clear", {}); msg(r.msg, "ok"); loadTrash(); }
+  catch (e) { msg("清空失败：" + e.message, "err"); }
+};
+$("#sy-stop").onclick = async () => {
+  try { await api("POST", "/api/sync/enable", { enabled: false }); msg("同步已停止（云端与本机文件都保留）", "ok"); loadSync(); }
+  catch (e) { msg("操作失败：" + e.message, "err"); }
+};
+$("#sy-resume").onclick = async () => {
+  try { await api("POST", "/api/sync/enable", { enabled: true }); msg("同步已恢复", "ok"); loadSync(); }
+  catch (e) { msg("操作失败：" + e.message, "err"); }
+};
+$("#sy-logout").onclick = async () => {
+  if (!confirm("退出同步帐户？\n（清空本机保存的账号密码并停用同步；云端数据与本机文件都保留）")) return;
+  try { const r = await api("POST", "/api/sync/logout", {}); msg(r.msg, "ok"); loadSync(); }
+  catch (e) { msg("退出失败：" + e.message, "err"); }
+};
+$("#sy-delcloud").onclick = async () => {
+  if (!confirm("确定删除云端【全部】同步数据？\n（本机文件一律不动；删除后同步自动停止）")) return;
+  if (!confirm("再次确认：云端数据删了就没了（本机文件不动）。继续？")) return;
+  try { const r = await api("POST", "/api/sync/cloud/delete", {}); msg(r.msg || "已提交删除，稍候刷新查看", "ok"); setTimeout(loadSync, 3000); }
+  catch (e) { msg("删除失败：" + e.message, "err"); }
+};
 /* 同步表单 → save 载荷（密钥类留空=__keep__ 不改已存值） */
 function syncPayload() {
   const pass = $("#sy-pass").value, pp = $("#sy-pp-change").checked ? $("#sy-pp").value : "__keep__";
   return {
-    /* 留空=默认坚果云地址（与 loadSync 缺省一致） */
     url: $("#sy-url").value.trim() || "https://dav.jianguoyun.com/dav/", user: $("#sy-user").value.trim(),
     pass: pass === "" ? "__keep__" : pass,
     device: $("#sy-device").value.trim(), passphrase: pp
@@ -3939,11 +4081,10 @@ $("#sy-save").onclick = async () => {
 $("#sy-test").onclick = async () => {
   msg("测试连接中…");
   try {
-    // 先把当前表单存起来再测（测试读已保存配置；省一次手动点保存）
     await api("POST", "/api/sync/save", syncPayload());
     const r = await api("POST", "/api/sync/test", {});
     msg(r.ok
-      ? (r.exists ? `连接成功：云端同步包来自「${r.remote_device || "?"}」（${r.schemas ?? "?"} 个方案）` : "连接成功：云端为空（首次同步将创建）")
+      ? (r.exists ? `连接成功：云端数据来自「${r.remote_device || "?"}」（${r.schemas ?? "?"} 个方案）` : "连接成功：云端为空（首次同步将创建）")
       : "测试失败：" + r.msg, r.ok ? "ok" : "err");
   } catch (e) { msg("测试失败：" + e.message, "err"); }
   loadSync();

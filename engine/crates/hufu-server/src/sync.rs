@@ -1,39 +1,36 @@
-//! 【P1 云同步 2026-10-28】WebDAV 后端：多机同步「用户调整.txt（各方案）
-//! + 配置设置（剔皮肤挂件/机器本地字段）」。服务器 = 用户自备 WebDAV
-//! （坚果云等），虎符官方不设服务器、不经手任何用户数据。
+//! 【云同步 v3 2026-10-30 全案重做】WebDAV 后端：多机同步**整个方案文件夹**
+//! （码表\<方案>\ 下全部文件）+ 配置设置。服务器 = 用户自备 WebDAV
+//!（坚果云等），虎符官方不设服务器、不经手任何用户数据。
 //!
-//! 同步算法（一次 run_sync = 先拉后推）：
-//! 1. GET 云端同步包（404=云端为空）；解析（加密包先解密）；
-//! 2. merge_local：远端 → 本机合并（Host 锁内，与用户操作同写纪律）：
-//!    - 用户调整 = 行并集去重（远端行序在前、本机独有行追加在后）——
-//!      同键操作后写的行胜，回放语义（最新覆盖）天然收敛；
-//!    - config = 三方归并（base=上次同步快照 last_config）：远端某项
-//!      变了且本机没动 → 采纳远端；本机变了 → 保留本机（不会被云端
-//!      旧值冲回）；两边都动同一项 → 本机胜 → apply_config；
-//!    - 合并写盘不主动 reload：2Hz 码表监视器 ~1s 自动轻量重载（打字
-//!      无感），config 走 apply_config 自带的后台重建；
-//!    - 每轮首次写盘前自动备份到 数据\同步备份\ts-<秒>\（保留 10 份）；
-//! 3. collect_local 收集本机全量 → build_package → 内容无变化跳过上传
-//!    （data 部分规范哈希比对，坚果云流量友好）→ PUT。
+//! 核心算法【mtime-LWW，用户定案】：
+//! - 一切仲裁按**文件修改时间**：云端新 → 覆盖本地（mtime 回拨防乒乓）；
+//!   本地新 → 8 秒防抖后上传。不猜语义、不做行合并——文件什么样就传
+//!   什么样，最后改的赢。
+//! - 增量：首次整夹上/下，之后逐文件比对 mt，只传有改动的文件。
+//! - 删除传播：本地文件相对上次收敛无改动而云端清单已无 = 对端删的
+//!   → 本地移入回收站后删除；换码表 = 旧删新传，其他机器跟上。
+//! - 回收站：被覆盖/删除的文件先挪 数据\同步回收站\<方案>\，每方案
+//!   留 20 份/30 天，管理页可还原（还原即本地新改动，随同步上传）。
 //!
-//! 触发：启动延迟 20s / 周期 5min / 码表监视器通知（防抖 8s 合并连发，
-//! "手动"不防抖）/ 设置保存。全部在独立线程，网络全超时（连 8s/读 30s），
-//! 失败静默退避记入 last_error——**红线：绝不触碰/阻塞打字路径**。
+//! 云端布局（WebDAV 根相对）：
+//! - hufu-sync/manifest.json —— 清单元数据（设备表/各方案文件表/config）
+//! - hufu-sync/files/<key> —— 文件本体；key = SHA256("方案/文件名")
+//!   前 32 hex（纯 ASCII 路径，规避中文路径兼容问题）
 //!
-//! 加密（可选口令，强烈建议）：PBKDF2-HMAC-SHA256(300k) → AES-256-GCM，
-//! 云端只见密文；口令两台机必须一致。口令为空=明文包（UI 有警示）。
+//! 触发：启动延迟 20s / 周期 2min / 码表监视器通知（防抖 8s）/ 手动。
+//! 失败静默退避记 last_error——**红线：绝不触碰/阻塞打字路径**。
 //!
-//! 已知边界：本机没有的方案**不落盘**远端调整文件——目录里只有一份
-//! 用户调整.txt 会被 Schema::load「最大文件胜选」当成主码表（schema.rs
-//! 有注释实证）；换新机先装方案目录再同步。
+//! 加密（可选口令）：PBKDF2 派生 key（salt 存 manifest.enc），每文件
+//! AES-256-GCM（nonce 存 manifest 文件条目）；manifest 本身明文（只含
+//! 清单不含内容）。两台机口令必须一致。
 //!
-//! 凭据存放：数据\同步.json（明文，与本机 config.json/用户调整同信任
-//! 级；WebDAV 用应用密码非登录密码，泄露面已收窄）。
+//! 凭据存放：数据\同步.json（明文，与本机 config.json 同信任级；WebDAV
+//! 用应用密码非登录密码）。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -42,33 +39,38 @@ use std::time::Duration;
 
 use crate::host::Host;
 
-/// 同步包格式版本（v=1：schemas+config 单包）
-const PKG_VERSION: u64 = 1;
-/// 云端路径（相对 WebDAV 根）
-const PKG_PATH: &str = "hufu-sync/sync.json";
+/// manifest 格式版本（v3=分文件 mtime 档；v1/v2 单包档已废弃，拉到旧包
+/// 会提示升级——避免旧逻辑回写脏数据）
+const MF_VERSION: u64 = 3;
+const MF_PATH: &str = "hufu-sync/manifest.json";
+const FILES_DIR: &str = "hufu-sync/files";
 /// 口令派生轮数（PBKDF2-HMAC-SHA256）
 const KDF_ROUNDS: u32 = 300_000;
-/// 同步包上限（防用户调整异常膨胀打爆坚果云配额）
-const MAX_PKG: usize = 2 * 1024 * 1024;
-/// 周期同步间隔
-const PERIOD: Duration = Duration::from_secs(300);
+/// 单文件上限（码表 MB 级；防异常巨物打爆坚果云配额）
+const MAX_FILE: u64 = 32 * 1024 * 1024;
+/// manifest 上限
+const MAX_MF: usize = 512 * 1024;
+/// 周期同步间隔【2min 2026-10-30 用户定案，原 5min】
+const PERIOD: Duration = Duration::from_secs(120);
 /// 启动延迟（让引擎/模型先就绪）
 const START_DELAY: Duration = Duration::from_secs(20);
 /// 变化通知防抖（合并连发）
 const DEBOUNCE: Duration = Duration::from_secs(8);
-/// 备份保留份数
+/// 回收站：每方案保留份数
+const TRASH_KEEP: usize = 20;
+/// 回收站：保留天数
+const TRASH_DAYS: u64 = 30;
+/// 整轮备份保留份数（数据\同步备份\）
 const BACKUP_KEEP: usize = 10;
+/// 设备表活跃窗口（超时视为离线设备）
+const DEVICE_STALE_SECS: u64 = 30 * 24 * 3600;
 /// 「保持已存值」哨兵（UI 留空不覆盖已存密钥/口令）
 const KEEP: &str = "__keep__";
-/// 【默认地址 2026-10-29】服务器地址留空=坚果云官方 WebDAV（UI 地址框
-/// 的 placeholder 一直是它；此前值为空保存会被判「未配置」，用户被迫
-/// 手填一次才生效——现在 save 端同样归一，空=默认）。
 const DEFAULT_URL: &str = "https://dav.jianguoyun.com/dav/";
 
 /// 不同步的 config 键（皮肤挂件/机器本地字段/每机方案选择）。
-/// 排除即不同步也不被远端覆盖（overlay 只写远端携带的键）。
 const CONFIG_EXCLUDED: &[&str] = &[
-    "schema", // 当前方案/目录 = 每机自己的选择
+    "schema",                 // 当前方案/目录 = 每机自己的选择
     "appearance.skin",
     "appearance.skin_kind",
     "appearance.font_family", // 字体装没装每机不同
@@ -86,17 +88,22 @@ pub struct SyncSettings {
     /// WebDAV 应用密码（明文存本机，同 config.json 信任级）
     pub pass: String,
     pub device: String,
-    /// 加密口令（空 = 明文包）
+    /// 加密口令（空 = 文件明文）
     pub passphrase: String,
-    /// 上次成功同步时刻（epoch 秒）
-    pub last_sync: u64,
-    /// 上次成功同步时的可同步配置快照（三方归并 base；None=首次）
+    /// 总开关：false=停止同步（凭据保留，云端不动）
+    pub enabled: bool,
+    /// 勾选参与同步的方案名（码表\ 下的文件夹名）
+    pub selected: Vec<String>,
+    /// 上次收敛时各勾选方案的文件 mtime 表（毫秒）：方案→文件→mt。
+    /// 「本地有无新改动」= 现文件 mt 是否大于此值（同步写盘会回拨到
+    /// 云端 mt，故同步写盘不会谎报新改动）。
+    pub local_snap: BTreeMap<String, BTreeMap<String, u64>>,
+    /// 上次收敛时可同步配置快照（config 三方归并 base）
     pub last_config: Option<Value>,
-    /// 各方案「用户调整.txt」上次收敛快照（重置检测的 base：
-    /// 有快照而本机空了=本机导出合并过；云端没了=对端导出合并过）
-    #[serde(default)]
-    pub snapshots: std::collections::BTreeMap<String, String>,
+    pub last_sync: u64,
     pub last_error: Option<String>,
+    // 兼容旧档（v1/v2 遗留字段，读入后忽略）
+    pub snapshots: Option<BTreeMap<String, String>>,
 }
 
 static TX: OnceLock<Sender<&'static str>> = OnceLock::new();
@@ -110,6 +117,13 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -132,9 +146,7 @@ fn persist(st: &SyncSettings) -> std::io::Result<()> {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    // 【保存前备份 2026-10-29】同步.json 落盘前把旧版复制为 同步.json.bak
-    //（凭据唯一存放处，误清空/写坏时可一键回滚——今晚真机探针事故实证
-    // 此前无任何护栏：一次畸形请求即可洗掉全部凭据）。
+    // 保存前备份（凭据唯一存放处，写坏可回滚）
     if p.is_file() {
         let _ = std::fs::copy(&p, p.with_extension("json.bak"));
     }
@@ -183,17 +195,95 @@ pub fn status_value() -> Value {
         .clone()
         .unwrap_or_default();
     let phase = *PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    let configured = !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty();
     json!({
-        "enabled": !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty(),
+        "enabled": configured && s.enabled,
+        "configured": configured,
+        "stopped": configured && !s.enabled,
         "url": s.url, "user": s.user, "device": s.device,
         "passphrase_set": !s.passphrase.is_empty(),
+        "selected": s.selected,
         "last_sync": s.last_sync, "last_error": s.last_error,
         "phase": phase,
     })
 }
 
-/// POST /api/sync/save。pass/passphrase 传 `__keep__` = 保持已存值
-/// （UI 密钥框留空防误清）；passphrase 显式空串 = 停用加密。
+/// GET /api/sync/schemes：本机方案清单 + 勾选态 + 云端有无（供勾选 UI）。
+/// 网络只读 manifest，失败时云端部分置空（UI 仍可用本地部分）。
+pub fn schemes_overview() -> Value {
+    let s = SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    let mut local: Vec<Value> = Vec::new();
+    if let Some(root) = local_schema_root() {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let n_files = std::fs::read_dir(&p)
+                    .map(|rd| rd.flatten().filter(|x| x.path().is_file()).count())
+                    .unwrap_or(0);
+                local.push(json!({
+                    "name": name,
+                    "local": true,
+                    "files": n_files,
+                    "selected": s.selected.iter().any(|x| x == name),
+                }));
+            }
+        }
+    }
+    // 云端清单（只读；未配置/网络失败=空数组）
+    let mut cloud_names: Vec<String> = Vec::new();
+    if !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty() {
+        let agent = build_agent();
+        if let Ok(Some(mf)) = fetch_manifest(&agent, &s) {
+            if let Some(m) = mf.get("schemes").and_then(|v| v.as_object()) {
+                cloud_names = m.keys().cloned().collect();
+            }
+        }
+    }
+    for name in &cloud_names {
+        if !local.iter().any(|v| v["name"].as_str() == Some(name.as_str())) {
+            local.push(json!({"name": name, "local": false, "files": 0,
+                "selected": s.selected.iter().any(|x| x == name)}));
+        }
+    }
+    json!({"ok": true, "schemes": local})
+}
+
+/// POST /api/sync/select {selected: [方案名...]}：勾选保存（空=全不选）。
+/// 保存后立即触发同步（新勾方案首拉/首传）。
+pub fn save_selection(selected: &[String]) -> Result<(), String> {
+    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.get_or_insert_with(SyncSettings::default);
+    st.selected = selected.to_vec();
+    persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+    drop(guard);
+    notify("勾选");
+    Ok(())
+}
+
+/// POST /api/sync/enable {enabled}：停止/恢复同步（凭据与云端不动）。
+pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.get_or_insert_with(SyncSettings::default);
+    st.enabled = enabled;
+    persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+    drop(guard);
+    if enabled {
+        notify("恢复");
+    }
+    Ok(())
+}
+
+/// POST /api/sync/save。pass/passphrase 传 `__keep__` = 保持已存值。
 pub fn save_settings(
     url: &str,
     user: &str,
@@ -206,13 +296,10 @@ pub fn save_settings(
     }
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
-    // 【误清空护栏 2026-10-29】此前已启用（user+pass 齐备）而本次请求会把
-    // pass 以字面空串覆盖（非 __keep__）且 user 也为空 ＝ 疑似事故性整清
-    //（坏客户端/引号丢失的畸形请求——UI 正常路径密钥类永远带 __keep__）。
-    // 拒绝并保留原值；确要重置：删除 数据\同步.json 或改用别的账号覆盖。
+    // 误清空护栏（畸形请求防洗凭据）
     let was_enabled = !st.user.is_empty() && !st.pass.is_empty();
     if was_enabled && pass != KEEP && pass.is_empty() && user.trim().is_empty() {
-        return Err("已拒绝：该请求会清空已保存的同步账号（疑似误操作）；如确要重置，请删除 安装目录\\数据\\同步.json 后重新配置".into());
+        return Err("已拒绝：该请求会清空已保存的同步账号（疑似误操作）；如确要重置请用「退出帐户」".into());
     }
     st.url = if url.trim().is_empty() {
         DEFAULT_URL.into()
@@ -231,9 +318,12 @@ pub fn save_settings(
     if passphrase != KEEP {
         st.passphrase = passphrase.to_string();
     }
+    // 首次配置成功启用
+    if !st.user.is_empty() && !st.pass.is_empty() && !st.url.is_empty() {
+        st.enabled = true;
+    }
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
-    let ready =
-        !st.url.is_empty() && !st.user.is_empty() && !st.pass.is_empty();
+    let ready = !st.url.is_empty() && !st.user.is_empty() && !st.pass.is_empty();
     drop(guard);
     if ready {
         notify("设置");
@@ -241,7 +331,7 @@ pub fn save_settings(
     Ok(())
 }
 
-/// POST /api/sync/test（HTTP 线程锁外调用，含网络 IO）。
+/// POST /api/sync/test（网络 IO 在 HTTP 线程锁外调用）。
 pub fn test_connection() -> Value {
     let s = SETTINGS
         .lock()
@@ -252,24 +342,270 @@ pub fn test_connection() -> Value {
         return json!({"ok": false, "msg": "请先填写并保存服务器地址/账号/应用密码"});
     }
     let agent = build_agent();
-    match webdav_get(&agent, &s) {
+    match fetch_manifest(&agent, &s) {
         Ok(None) => json!({"ok": true, "exists": false,
-            "msg": "连接成功：云端还没有同步包（首次同步将创建）"}),
-        Ok(Some(body)) => match parse_package(&body, &s.passphrase) {
-            Ok(pkg) => {
-                let schemas = pkg
-                    .pointer("/data/schemas")
-                    .and_then(|v| v.as_object())
-                    .map(|m| m.len());
-                json!({"ok": true, "exists": true,
-                    "remote_device": pkg.get("device").and_then(|v| v.as_str()).unwrap_or("?"),
-                    "remote_ts": pkg.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
-                    "schemas": schemas})
-            }
-            Err(e) => json!({"ok": false, "msg": e}),
-        },
+            "msg": "连接成功：云端还没有同步数据（首次同步将创建）"}),
+        Ok(Some(mf)) => {
+            let schemes = mf
+                .get("schemes")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            json!({"ok": true, "exists": true,
+                "remote_device": mf.get("device").and_then(|v| v.as_str()).unwrap_or("?"),
+                "remote_ts": mf.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+                "schemes": schemes})
+        }
         Err(e) => json!({"ok": false, "msg": e}),
     }
+}
+
+/// GET /api/sync/cloud：云端概览（设备表/方案→文件清单/大小/mt/上传者）。
+/// 只读，不写任何本地数据。
+pub fn cloud_summary() -> Value {
+    let s = SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    if s.url.trim().is_empty() || s.user.trim().is_empty() || s.pass.is_empty() {
+        return json!({"ok": false, "msg": "尚未配置同步账号"});
+    }
+    let agent = build_agent();
+    let mf = match fetch_manifest(&agent, &s) {
+        Ok(None) => return json!({"ok": true, "exists": false}),
+        Ok(Some(m)) => m,
+        Err(e) => return json!({"ok": false, "msg": e}),
+    };
+    let cutoff = now_secs().saturating_sub(DEVICE_STALE_SECS);
+    let devices: Value = mf
+        .get("devices")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            let mut out = serde_json::Map::new();
+            for (k, ts) in m {
+                if ts.as_u64().unwrap_or(0) > cutoff {
+                    out.insert(k.clone(), ts.clone());
+                }
+            }
+            Value::Object(out)
+        })
+        .unwrap_or(json!({}));
+    json!({
+        "ok": true, "exists": true,
+        "last_device": mf.get("device").and_then(|v| v.as_str()).unwrap_or("?"),
+        "last_ts": mf.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+        "devices": devices,
+        "encrypted": mf.get("enc").map(|v| !v.is_null()).unwrap_or(false),
+        "schemes": mf.get("schemes").cloned().unwrap_or(json!({})),
+    })
+}
+
+/// POST /api/sync/cloud/delete {scheme?}：删云端。带 scheme=只删该方案
+///（files DELETE + manifest 条目移除）；不带=整库删除。**本地文件一律
+/// 不动**；整库删除同时停止同步（防下轮自动回传）。
+pub fn delete_cloud(scheme: Option<&str>) -> Result<String, String> {
+    let s = SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    if s.url.trim().is_empty() || s.user.trim().is_empty() || s.pass.is_empty() {
+        return Err("尚未配置同步账号".into());
+    }
+    let agent = build_agent();
+    match scheme {
+        Some(name) => {
+            let mut mf = match fetch_manifest(&agent, &s)? {
+                Some(m) => m,
+                None => return Ok("云端本来就没有同步数据".into()),
+            };
+            let entry = mf
+                .pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
+                .map(|e| e.take());
+            match entry {
+                Some(Value::Object(files)) => {
+                    for (_, f) in &files {
+                        if let Some(k) = f.get("key").and_then(|v| v.as_str()) {
+                            webdav_file_del(&agent, &s, k)?;
+                        }
+                    }
+                    prune_manifest(&mut mf, &s);
+                    put_manifest(&agent, &s, &mf)?;
+                    Ok(format!("云端方案「{name}」已删除（本机文件未动）"))
+                }
+                _ => Ok(format!("云端没有方案「{name}」的同步数据")),
+            }
+        }
+        None => {
+            // 整库：删 manifest + files 目录重建空目录标志（DELETE 目录在
+            // 坚果云不可靠，改为逐文件删 + manifest 置空）
+            match fetch_manifest(&agent, &s)? {
+                Some(mut mf) => {
+                    if let Some(schemes) = mf.get_mut("schemes").and_then(|v| v.as_object_mut()) {
+                        for (_, entry) in schemes.iter() {
+                            if let Some(files) = entry.get("files").and_then(|v| v.as_object()) {
+                                for (_, f) in files {
+                                    if let Some(k) = f.get("key").and_then(|v| v.as_str()) {
+                                        let _ = webdav_file_del(&agent, &s, k);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    mf["schemes"] = json!({});
+                    mf["config"] = Value::Null;
+                    prune_manifest(&mut mf, &s);
+                    let _ = put_manifest(&agent, &s, &mf);
+                }
+                None => {}
+            }
+            let _ = webdav_del(&agent, &s, MF_PATH);
+            // 停止同步 + 清本地快照（凭据保留，想继续用重新勾选启用）
+            let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+            let st = guard.get_or_insert_with(SyncSettings::default);
+            st.enabled = false;
+            st.local_snap.clear();
+            st.last_config = None;
+            st.last_sync = 0;
+            st.last_error = None;
+            persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+            Ok("云端同步数据已删除，同步已停止（本机文件未动）".into())
+        }
+    }
+}
+
+/// POST /api/sync/logout：退出帐户——清凭据并停用。云端保留。
+pub fn logout() -> Result<String, String> {
+    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.get_or_insert_with(SyncSettings::default);
+    st.user = String::new();
+    st.pass = String::new();
+    st.passphrase = String::new();
+    st.enabled = false;
+    st.local_snap.clear();
+    st.last_config = None;
+    persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+    Ok("已退出同步帐户（云端数据保留；本机文件未动）".into())
+}
+
+/// GET /api/sync/trash：回收站列表（方案→文件名→份数+最近时间）。
+pub fn trash_list() -> Value {
+    let Some(dir) = DATA_DIR.get() else {
+        return json!({"ok": false});
+    };
+    let root = dir.join("同步回收站");
+    let mut schemes = serde_json::Map::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let sd = e.path();
+            if !sd.is_dir() {
+                continue;
+            }
+            let Some(name) = sd.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let mut files: Vec<Value> = std::fs::read_dir(&sd)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|x| x.path().is_file())
+                        .filter_map(|x| {
+                            let fname = x.file_name().into_string().ok()?;
+                            // 格式 <epoch_ms>-<原名>
+                            let orig = fname.split_once('-').map(|(_, r)| r.to_string())?;
+                            let ts: u64 = fname.split('-').next()?.parse().ok()?;
+                            let mt = x
+                                .metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            Some(json!({"trash": fname, "name": orig,
+                                "saved_ms": ts, "size": x.metadata().ok().map(|m| m.len()).unwrap_or(0),
+                                "mt": mt}))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort_by(|a, b| b["saved_ms"].as_u64().cmp(&a["saved_ms"].as_u64()));
+            if !files.is_empty() {
+                schemes.insert(name.to_string(), Value::Array(files));
+            }
+        }
+    }
+    json!({"ok": true, "root": root, "schemes": Value::Object(schemes)})
+}
+
+/// POST /api/sync/trash/restore {scheme, trash}：还原一份回收站文件到
+/// 对应方案目录（mtime=现在 → 视为本地新改动，随下轮同步上传传播）。
+pub fn trash_restore(scheme: &str, trash: &str) -> Result<String, String> {
+    // 路径安全：名字不得含路径分隔
+    if scheme.contains(['/', '\\']) || trash.contains(['/', '\\']) {
+        return Err("非法名称".into());
+    }
+    let Some(dir) = DATA_DIR.get() else {
+        return Err("同步模块未初始化".into());
+    };
+    let src = dir.join("同步回收站").join(scheme).join(trash);
+    if !src.is_file() {
+        return Err("回收站里没有这份文件".into());
+    }
+    let Some(orig) = trash.split_once('-').map(|(_, r)| r) else {
+        return Err("回收站文件名格式不对".into());
+    };
+    let root = local_schema_root().ok_or("找不到码表目录")?;
+    let dst_dir = root.join(scheme);
+    std::fs::create_dir_all(&dst_dir).map_err(|e| format!("建目录失败：{e}"))?;
+    let dst = dst_dir.join(orig);
+    std::fs::copy(&src, &dst).map_err(|e| format!("还原失败：{e}"))?;
+    // mtime=现在：作为本地新改动参与下轮仲裁
+    touch(&dst);
+    notify("回收站还原");
+    Ok(format!("已还原 {scheme}\\{orig}（将作为本机新改动同步）"))
+}
+
+/// POST /api/sync/trash/clear：清空回收站。
+pub fn trash_clear() -> Result<String, String> {
+    let Some(dir) = DATA_DIR.get() else {
+        return Err("同步模块未初始化".into());
+    };
+    let root = dir.join("同步回收站");
+    let n = count_files(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(format!("已清空回收站（{n} 个文件）"))
+}
+
+/// GET /api/sync/backup：本地整轮备份摘要。
+pub fn backup_summary() -> Value {
+    let Some(dir) = DATA_DIR.get() else {
+        return json!({"ok": false});
+    };
+    let bd = dir.join("同步备份");
+    let mut rounds: Vec<String> = std::fs::read_dir(&bd)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    rounds.sort();
+    rounds.reverse();
+    rounds.truncate(BACKUP_KEEP);
+    json!({"ok": true, "path": bd, "rounds": rounds})
+}
+
+/// GET /api/sync/tutorial：图文教程 PNG。
+pub fn tutorial_image() -> Option<Vec<u8>> {
+    let dir = DATA_DIR.get()?.join("同步教程.png");
+    if let Ok(b) = std::fs::read(&dir) {
+        return Some(b);
+    }
+    let desktop = std::env::var("USERPROFILE")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join("Desktop").join("同步教程.png"))?;
+    std::fs::read(desktop).ok()
 }
 
 // ─────────────────────────── 同步线程 ───────────────────────────
@@ -292,33 +628,6 @@ fn worker(rx: Receiver<&'static str>) {
     }
 }
 
-/// 将「本机未装方案」的远端条目并入待上传数据（键已存在则不动——
-/// 装好方案后本地合并结果优先）。云端数据不被未装方案的机器挤掉。
-fn union_carried(local: &mut Value, carried: &Value) {
-    let Some(cm) = carried.as_object() else { return };
-    if cm.is_empty() {
-        return;
-    }
-    if let Some(obj) = local.get_mut("schemas").and_then(|v| v.as_object_mut()) {
-        for (k, v) in cm {
-            obj.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    }
-}
-
-/// GET /api/sync/tutorial：图文教程 PNG（优先 数据\同步教程.png——随
-/// 安装分发；兜底当前用户桌面，方便未放数据目录时也能打开）。
-pub fn tutorial_image() -> Option<Vec<u8>> {
-    let dir = DATA_DIR.get()?.join("同步教程.png");
-    if let Ok(b) = std::fs::read(&dir) {
-        return Some(b);
-    }
-    let desktop = std::env::var("USERPROFILE")
-        .ok()
-        .map(|h| std::path::PathBuf::from(h).join("Desktop").join("同步教程.png"))?;
-    std::fs::read(desktop).ok()
-}
-
 fn run_sync(reason: &'static str) {
     let s = SETTINGS
         .lock()
@@ -326,6 +635,9 @@ fn run_sync(reason: &'static str) {
         .clone()
         .unwrap_or_default();
     if s.url.trim().is_empty() || s.user.trim().is_empty() || s.pass.is_empty() {
+        return;
+    }
+    if !s.enabled {
         return;
     }
     set_phase("syncing");
@@ -348,654 +660,618 @@ fn run_sync(reason: &'static str) {
     set_phase("idle");
 }
 
+/// 一轮同步：拉 manifest → 逐方案逐文件 mtime 仲裁 → config 三方归并
+/// → 回写 manifest（设备活跃 + 文件表 + config）。
 fn do_sync(s: &SyncSettings) -> Result<String, String> {
     let agent = build_agent();
-    // 1. 拉
-    let remote_pkg = match webdav_get(&agent, s)? {
-        Some(b) => Some(parse_package(&b, &s.passphrase)?),
-        None => None,
-    };
-    // 2. 合并进本机（carried=本机未装方案而原样保留的云端条目）
-    let (mut merged, carried) = if let Some(pkg) = &remote_pkg {
-        let data = pkg.get("data").cloned().ok_or("同步包缺 data 字段")?;
-        merge_local(&data)?
-    } else {
-        (false, Value::Object(serde_json::Map::new()))
-    };
-    // 3. 收集本机 → 未装方案的云端条目并回（不丢）→ 无变化跳过上传
-    let mut local = collect_local()?;
-    union_carried(&mut local, &carried);
-    let lh = data_hash(&local);
-    if let Some(pkg) = &remote_pkg {
-        if !merged && data_hash(pkg.get("data").unwrap_or(&Value::Null)) == lh {
-            refresh_merge_base(&local);
-            snapshot_after_sync();
-            return Ok("云端与本机一致，无需上传".into());
+    let mut mf = fetch_manifest(&agent, s)?.unwrap_or_else(empty_manifest);
+
+    // 加密参数：本机有口令 → manifest 必须有 enc.salt（没有=本机首建）
+    if !s.passphrase.is_empty() {
+        if mf.get("enc").and_then(|e| e.get("salt")).is_none() {
+            let mut salt = [0u8; 16];
+            getrandom::getrandom(&mut salt)
+                .map_err(|e| format!("取随机数失败：{e}"))?;
+            mf["enc"] = json!({"salt": hex(&salt)});
         }
     }
-    let n = local
-        .pointer("/schemas")
-        .and_then(|v| v.as_object())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let body = build_package(&local, &s.device, &s.passphrase)?;
-    if body.len() > MAX_PKG {
-        return Err(format!(
-            "同步包 {} KB 超限（2 MB）——用户调整异常膨胀，已中止上传",
-            body.len() / 1024
-        ));
-    }
-    // 4. 推
-    webdav_put(&agent, s, &body)?;
-    refresh_merge_base(&local);
-    snapshot_after_sync();
-    Ok(format!(
-        "已上传 {n} 个方案的用户调整 + 配置（{} B）",
-        body.len()
-    ))
-}
 
-/// 同步收敛后刷新三方归并 base（= 本次收敛后的本机可同步配置快照）。
-fn refresh_merge_base(local: &Value) {
-    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(st) = guard.as_mut() {
-        st.last_config = local.pointer("/config").cloned();
-    }
-}
+    let root = local_schema_root().ok_or("找不到码表目录")?;
+    let mut uploaded = 0usize;
+    let mut downloaded = 0usize;
+    let mut deleted_local = 0usize;
+    let snap = s.local_snap.clone();
 
-/// 同步收敛后记录各方案「用户调整.txt」收敛快照（下轮合并的 base，
-/// 也是重置检测的参照）。只存非空内容。
-fn snapshot_after_sync() {
-    let Some(shared) = SHARED.get() else { return };
-    let h = shared.lock().unwrap_or_else(|p| p.into_inner());
-    let root = schema_root(&h);
-    let mut snap = std::collections::BTreeMap::new();
-    if let Ok(rd) = std::fs::read_dir(&root) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if !p.is_dir() {
-                continue;
+    for name in &s.selected {
+        let dir = root.join(name);
+        let r_entry = mf
+            .pointer(&format!("/schemes/{}", json_escape_key(name)))
+            .cloned();
+        if !dir.is_dir() {
+            // 本机没装但勾选了：云端有 → 整夹拉取落地
+            if let Some(entry) = r_entry {
+                downloaded += pull_scheme_all(&agent, s, &mf, &root, name, &entry)?;
             }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if let Ok(c) = std::fs::read_to_string(p.join("用户调整.txt")) {
-                if !c.trim().is_empty() {
-                    snap.insert(name.to_string(), c);
-                }
-            }
+            continue;
         }
-    }
-    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(st) = guard.as_mut() {
-        st.snapshots = snap;
-        let _ = persist(st);
-    }
-}
-
-// ─────────────────────── 本机收集 / 合并 ───────────────────────
-
-/// 码表根（码表\）：与码表监视器同源解析（resolve_data_sub）。
-fn schema_root(h: &Host) -> PathBuf {
-    let data_dir = DATA_DIR.get().expect("sync 未初始化");
-    hufu_engine::Engine::resolve_data_sub(data_dir, &h.engine.config.schema.dir)
-}
-
-/// Host 锁内收集：各方案 用户调整.txt 全文 + 消毒后的 config。
-fn collect_local() -> Result<Value, String> {
-    let shared = SHARED.get().ok_or("同步模块未初始化")?;
-    let h = shared.lock().unwrap_or_else(|p| p.into_inner());
-    let root = schema_root(&h);
-    let mut schemas = serde_json::Map::new();
-    if let Ok(rd) = std::fs::read_dir(&root) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let adj = p.join("用户调整.txt");
-            if adj.is_file() {
-                if let Ok(c) = std::fs::read_to_string(&adj) {
-                    if !c.trim().is_empty() {
-                        schemas.insert(name.to_string(), Value::String(c));
-                    }
-                }
-            }
-        }
-    }
-    let mut cfg = serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
-    sanitize_config(&mut cfg);
-    Ok(json!({"schemas": Value::Object(schemas), "config": cfg}))
-}
-
-/// Host 锁内合并远端 → 本机（写盘纪律与用户操作一致）。
-/// 返回 (是否有落盘变化, 本机未装方案而需原样透传的远端条目)。
-fn merge_local(remote: &Value) -> Result<(bool, Value), String> {
-    let shared = SHARED.get().ok_or("同步模块未初始化")?;
-    let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
-    let data_dir = DATA_DIR.get().expect("sync 未初始化").clone();
-    let root = schema_root(&h);
-    let mut changed = false;
-    let mut backup: Option<PathBuf> = None;
-    let mut carried = serde_json::Map::new();
-
-    // 用户调整：名字全集 = 远端方案 ∪ 本地方案目录（只写本机已有目录，
-    // 孤儿方案防主码表误选；未装方案的远端条目 carried 透传）。
-    // 重置语义（导出合并/手动清空后开始新记录）：有收敛快照 base 而
-    // 一侧空了 = 该侧重置 → 另一侧只保留 base 之后的新增，不拉回旧记录。
-    if let Some(schemas) = remote.pointer("/schemas").and_then(|v| v.as_object()) {
-        let snapshots = SETTINGS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        // 本地文件表 {名: (mt, path)}
+        let local_files = scan_dir(&dir)?;
+        let r_files = r_entry
             .as_ref()
-            .map(|s| s.snapshots.clone())
+            .and_then(|e| e.get("files"))
+            .and_then(|v| v.as_object())
+            .cloned()
             .unwrap_or_default();
-        let mut names: Vec<String> = schemas.keys().cloned().collect();
-        if let Ok(rd) = std::fs::read_dir(&root) {
-            for e in rd.flatten() {
-                if let Some(n) = e.path().file_name().and_then(|x| x.to_str()) {
-                    if !names.iter().any(|x| x == n) {
-                        names.push(n.to_string());
-                    }
+        let snap_files = snap.get(name);
+
+        // 仲裁：云端文件
+        let mut new_entry: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (fname, rv) in &r_files {
+            let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
+            let key = rv.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let lp = local_files.get(fname);
+            let lmt = lp
+                .and_then(|p| file_mtime_ms(p).ok())
+                .unwrap_or(0);
+            if lp.is_none() || rmt >= lmt {
+                // 云端新（或同刻）：下载覆盖（内容相同会跳过写盘）
+                if lp.is_none() || file_hash(lp.unwrap())? != remote_hash_hint(rv) {
+                    downloaded += pull_file(&agent, s, &mf, &dir, fname, key, rmt)?;
                 }
+                new_entry.insert(fname.clone(), rv.clone());
+            } else {
+                // 本地新：上传 + 更新条目
+                uploaded += push_file(&agent, s, &mut mf, name, fname, lp.unwrap())?;
+                // push_file 已把新条目写进 mf（见其实现）
+                let upd = mf
+                    .pointer(&format!("/schemes/{}/files/{}", json_escape_key(name), json_escape_key(fname)))
+                    .cloned()
+                    .unwrap_or_else(|| rv.clone());
+                new_entry.insert(fname.clone(), upd);
             }
         }
-        for name in names {
-            let dir = root.join(&name);
-            if !dir.is_dir() {
-                // 本机未装该方案：云端条目原样透传保留（防挤掉）
-                if let Some(rv) = schemas.get(&name) {
-                    carried.insert(name.clone(), rv.clone());
-                }
+        // 本地多出的文件（云端清单没有）
+        for (fname, lp) in &local_files {
+            if r_files.contains_key(fname) {
                 continue;
             }
-            let p = dir.join("用户调整.txt");
-            // 读失败=中止本轮（不误判为重置）；不存在=None
-            let lc = match std::fs::read_to_string(&p) {
-                Ok(c) => Some(c),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(format!("读「{name}」用户调整失败：{e}")),
-            };
-            let rc = schemas.get(&name).and_then(|v| v.as_str());
-            let base = snapshots.get(&name).map(|s| s.as_str());
-            // 【三态语义 2026-10-29】None=保持现状（不写盘）；Some(空串)
-            // =明确清空。洗词事故回归锁：云端没有该方案条目且无 base 时
-            // 本机内容必须原样保留（随后 collect 会把它推上云补齐），
-            // 绝不能落成空文件。
-            if let Some(target) = merge_adjust_v2(rc, lc.as_deref(), base) {
-                let current = lc.clone().unwrap_or_default();
-                if target != current {
-                    let bd = ensure_backup(&data_dir, &mut backup);
-                    if p.is_file() {
-                        let _ = std::fs::copy(&p, bd.join(format!("{name}-用户调整.txt")));
-                    }
-                    std::fs::write(&p, target)
-                        .map_err(|e| format!("写入「{name}」用户调整失败：{e}"))?;
-                    changed = true;
-                }
+            let lmt = file_mtime_ms(lp)?;
+            let snap_mt = snap_files.and_then(|m| m.get(fname)).copied();
+            let is_new = snap_mt.is_none() || lmt > snap_mt.unwrap();
+            if is_new {
+                // 本地新文件（含换码表的新主码表）→ 上传
+                uploaded += push_file(&agent, s, &mut mf, name, fname, lp)?;
+            } else {
+                // 相对上次收敛无变化而云端已无 = 对端删的 → 回收站后删
+                trash_file(&dir, fname)?;
+                deleted_local += 1;
             }
         }
+        // 写回该方案的清单（哪怕空——空清单=云端此方案已被清空）
+        ensure_scheme_entry(&mut mf, name);
+        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
+            .unwrap()
+            ["files"] = Value::Object(new_entry);
+        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
+            .unwrap()
+            ["by"] = json!(s.device);
+        mf.pointer_mut(&format!("/schemes/{}", json_escape_key(name)))
+            .unwrap()
+            ["ts"] = json!(now_secs());
     }
 
-    // config：三方归并（base=上次同步快照）。远端变了且本机没动 → 采纳
-    // 远端；本机变了 → 保留本机（修复：远端旧值不得冲回本机新设置）；
-    // 两边都动同一项 → 本机胜。排除字段天然不参与（远端已消毒）。
-    if let Some(rcfg) = remote.get("config") {
+    // config：三方归并（base=上次收敛快照）。远端项变了且本机没动 →
+    // 采纳；本机变了 → 保留；都动 → 本机胜。
+    let mut cfg_changed = false;
+    if let Some(rcfg) = mf.get("config").cloned() {
         if rcfg.is_object() {
+            let Some(shared) = SHARED.get() else {
+                return Err("同步模块未初始化".into());
+            };
+            let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
             let full =
                 serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
             let mut local_san = full.clone();
             sanitize_config(&mut local_san);
-            // base 缺失（首次同步）＝以本机当前态为 base：远端与本机不同
-            // 且本机自同步以来未动的键采纳远端，本机独有改动天然保留。
-            let base = last_config_snapshot().unwrap_or_else(|| local_san.clone());
-            let merged = three_way_merge(&full, &local_san, &base, rcfg);
+            let base = s.last_config.clone().unwrap_or_else(|| local_san.clone());
+            let merged = three_way_merge(&full, &local_san, &base, &rcfg);
             if merged != full {
-                let cfg_path = data_dir.join("config.json");
-                if cfg_path.is_file() {
-                    let bd = ensure_backup(&data_dir, &mut backup);
-                    let _ = std::fs::copy(&cfg_path, bd.join("config.json"));
-                }
+                let data_dir = DATA_DIR.get().expect("sync 未初始化").clone();
+                backup_config(&data_dir);
                 let cfg: hufu_config::Config = serde_json::from_value(merged)
                     .map_err(|e| format!("归并配置无法解析：{e}"))?;
                 let (need_sentence, teardown) = h
                     .apply_config(cfg)
                     .map_err(|e| format!("应用配置失败：{e}"))?;
                 if need_sentence {
-                    // 锁内调用安全：reload_sentence_bg 用 HOST_HANDLE，
-                    // 重锁在其内部线程（与 /api/config 路由同路径）
                     crate::reload_sentence_bg(teardown, true);
                 }
-                changed = true;
+                cfg_changed = true;
             }
         }
     }
-
-    if backup.is_some() {
-        prune_backups(&data_dir);
-    }
-    Ok((changed, Value::Object(carried)))
-}
-
-/// a 的行序中剔除 b 里出现过的行（CRLF 容忍、保序去重、跳过空行）。
-fn diff_lines(a: &str, b: &str) -> String {
-    let bs: std::collections::BTreeSet<&str> =
-        b.lines().map(|x| x.trim_end_matches('\r')).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out: Vec<&str> = Vec::new();
-    for line in a.lines() {
-        let t = line.trim_end_matches('\r');
-        if !t.is_empty() && !bs.contains(t) && seen.insert(t) {
-            out.push(t);
-        }
-    }
-    out.join("\n")
-}
-
-/// 带收敛快照 base 的三态合并（导出合并/清空 = 重置语义）：
-/// - 无 base（该方案首次参与同步）：云端没有 → **保持本机现状**
-///   （本机内容随 collect 上传补齐云端——洗词事故 2026-10-29 的修复：
-///   旧版此处返回 None 被调用方拍平成空串写盘，云端只要缺条目就把
-///   本机有词的文件洗空，再被 collect 推空、恶性循环）；云端有 →
-///   并集；
-/// - 有 base 且本机空了（本机导出合并清空了日志）→ 只留远端新增
-///   （远端 − base），旧记录不再拉回本地；无新增=维持空（本就空，
-///   无写盘必要）；
-/// - 有 base 且云端没了该方案（对端导出合并）→ 只留本机新增；
-///   无新增=明确清空本机旧记录（Some("")）；
-/// - 双方都空 → 维持现状；双方都在 → 并集。
-/// remote/local 传 None=云端没有该方案 / 本地文件缺失或空。
-/// 返回 Some=应写入的内容（空串=明确清空）；**None=保持现状不写盘**。
-fn merge_adjust_v2(remote: Option<&str>, local: Option<&str>, base: Option<&str>) -> Option<String> {
-    let has = |s: Option<&str>| s.is_some_and(|x| !x.trim().is_empty());
-    if !has(base) {
-        return match (has(remote), has(local)) {
-            // 云端没有该方案：保持本机现状（本机内容 collect 时上传补齐）
-            (false, _) => None,
-            (true, false) => Some(remote.unwrap().to_string()),
-            (true, true) => Some(merge_adjust(remote.unwrap(), local.unwrap())),
-        };
-    }
-    match (has(remote), has(local)) {
-        (false, false) => None,
-        (true, false) => {
-            // 本机重置：远端只留 base 之后的新增；无新增=维持空（不写盘）
-            let m = diff_lines(remote.unwrap(), base.unwrap());
-            if m.is_empty() { None } else { Some(m) }
-        }
-        (false, true) => {
-            // 远端重置：本机只留 base 之后的新增；无新增=明确清空旧记录
-            let m = diff_lines(local.unwrap(), base.unwrap());
-            Some(if m.is_empty() { String::new() } else { m })
-        }
-        (true, true) => Some(merge_adjust(remote.unwrap(), local.unwrap())),
-    }
-}
-
-/// 用户调整合并（【语义合并 2026-10-30】恶性洗词修复，替代纯行并集）。
-///
-/// 事故链（真机实锤，码表方案「茉莉」）：A 机加词上传 → B 机文件
-/// 并集后，B 机本地的 `{整序}` 快照组（整序=清空重建、清单外即删，
-/// user.rs set_order）恰好排在跨机加词行**之后** → 回放时快照重建
-/// 把对方加的词挤出候选（词不显示=每 5 分钟洗回）；且 B 机右键删词
-/// 落盘 `{删除}词`+整套快照重写（{删除}/{整序}/{添加}pN 三行）上传
-/// → 并集把同 (码,词) 的 {添加} 与 {删除} **双行共存**，回放「后写
-/// 赢」→ 删除行在后者永远杀词（重新添加也死循环）。
-///
-/// 合并语义改为与回放一致的**键终态**：
-/// - 同 (码,词) 的 {添加}/{删除}/{置顶} 只保留拼接流（远端在前、
-///   本机在后）中**最后出现**的操作行——中间态行全部淘汰。删词
-///   传播（终态=删除）与加词传播（终态=添加）都与单机语义对齐；
-/// - 同码多份 `{整序}` 快照组只保留最后一份（早份重建后必被晚份
-///   覆盖，只留终态）；
-/// - **快照后置**：同码无 pN 的 {添加} 行（跨机单行加词）一律排到
-///   该码最后一份快照组之后——回放序=快照重建后再加词，对方机器
-///   加的词不再被孤儿淘汰（本修复的断根点）；
-/// - {加权} 行按整行去重（同词可多轮调权，保留最后值）；
-/// - 其余行维持旧行为：远端行序在前、本机独有行追加在后。
-fn merge_adjust(remote: &str, local: &str) -> String {
-    /// 行解析：(标记, 码, 词, 有无 pN)。非标记行=(原始行,空,空,false)。
-    fn parse(l: &str) -> (&str, &str, &str, bool) {
-        for tag in ["{添加}", "{删除}", "{置顶}", "{加权}"] {
-            if let Some(rest) = l.strip_prefix(tag) {
-                let mut it = rest.split('\t');
-                let code = it.next().unwrap_or("");
-                let word = it.next().unwrap_or("");
-                let has_pn = it.next().is_some_and(|p| p.starts_with('p'));
-                return (tag, code, word, has_pn);
-            }
-        }
-        if let Some(code) = l.strip_prefix("{整序}") {
-            return ("{整序}", code, "", false);
-        }
-        ("", "", "", false)
-    }
-
-    // 1. 拼接行流（远端在前本机在后），保序、trim \r、跳过空行。
-    //    【键行不去重】{添加}/{删除}/{置顶}/{加权}/{整序} 行保留两侧
-    //    全部出现——local 的「重新添加」行可能与 remote 历史行**字节
-    //    相同**（本案实锤），整行去重会把它吃掉、让墓碑 {删除} 行
-    //    错成终态。键行靠第 2 步终态过滤自然收敛，位置=时序。
-    let mut lines: Vec<&str> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for l in remote.lines().chain(local.lines()) {
-        let l = l.trim_end_matches('\r');
-        if l.trim().is_empty() {
-            continue;
-        }
-        let (tag, code, word, _) = parse(l);
-        let is_key_line = (!code.is_empty() && !word.is_empty())
-            || (tag == "{整序}" && !code.is_empty());
-        if !is_key_line && !seen.insert(l) {
-            continue;
-        }
-        lines.push(l);
-    }
-
-    // 2. 键终态：同 (码,词) 的 {添加}/{删除}/{置顶}/{加权} 只留最后出现者
-    //    （加权多轮调权同键收敛，顺带去重）
-    let mut last_op_at: HashMap<(&str, &str), usize> = HashMap::new();
-    for (i, l) in lines.iter().enumerate() {
-        let (tag, code, word, _) = parse(l);
-        if !code.is_empty() && !word.is_empty() {
-            last_op_at.insert((code, word), i);
-        }
-    }
-    // 3. {整序} 快照：同码只留最后一份
-    let mut last_order_at: HashMap<&str, usize> = HashMap::new();
-    for (i, l) in lines.iter().enumerate() {
-        let (tag, code, _, _) = parse(l);
-        if tag == "{整序}" && !code.is_empty() {
-            last_order_at.insert(code, i);
-        }
-    }
-    // 4. 第一遍输出：淘汰中间态行
-    let kept: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(i, l)| {
-            let (tag, code, word, _) = parse(l);
-            if !code.is_empty() && !word.is_empty() {
-                return last_op_at.get(&(code, word)) == Some(i);
-            }
-            if tag == "{整序}" && !code.is_empty() {
-                return last_order_at.get(code) == Some(i);
-            }
-            true
-        })
-        .map(|(_, l)| *l)
-        .collect();
-
-    // 5. 快照后置：有 {整序} 快照的码，其**全部**无 pN {添加} 行
-    //    （跨机单行加词，可能出现在快照之前——本案实锤形态）一律
-    //    抽出、插到该码最后一行（快照组尾）之后——回放序=快照重建
-    //    后再加词，对方机器加的词不再被孤儿淘汰。
-    let out: Vec<&str>;
+    // 回写 config（消毒后的本机当前值）
     {
-        let snap_codes: HashSet<&str> = last_order_at.keys().copied().collect();
-        // 抽出所有需后置的行（保序）
-        let mut moved: Vec<&str> = Vec::new();
-        let mut shrunk: Vec<&str> = Vec::with_capacity(kept.len());
-        for l in &kept {
-            let (tag, code, _, pn) = parse(l);
-            if tag == "{添加}" && snap_codes.contains(code) && !pn {
-                moved.push(l);
-            } else {
-                shrunk.push(l);
-            }
-        }
-        if !moved.is_empty() {
-            // 每码在 shrunk 中最后出现位置（{整序}/{添加}/{删除}/
-            // {置顶}/{加权} 同码行都算锚点）
-            let mut last_at: HashMap<&str, usize> = HashMap::new();
-            for (i, l) in shrunk.iter().enumerate() {
-                let (tag, code, _, _) = parse(l);
-                if !code.is_empty()
-                    && (tag == "{整序}"
-                        || tag == "{添加}"
-                        || tag == "{删除}"
-                        || tag == "{置顶}"
-                        || tag == "{加权}")
-                {
-                    last_at.insert(code, i);
-                }
-            }
-            // 从后往前插（保前面的索引不漂移）：同码 moved 行按序追加
-            let mut insert_after: HashMap<&str, Vec<&str>> = HashMap::new();
-            for l in moved {
-                let (_, code, _, _) = parse(l);
-                insert_after.entry(code).or_default().push(l);
-            }
-            let mut anchors: Vec<(usize, &str)> =
-                last_at.iter().map(|(c, i)| (*i, *c)).collect();
-            anchors.sort_unstable_by(|a, b| b.0.cmp(&a.0)); // 倒序插
-            for (at, code) in anchors {
-                if let Some(rows) = insert_after.remove(code) {
-                    let mut idx = at + 1;
-                    for r in rows {
-                        shrunk.insert(idx, r);
-                        idx += 1;
-                    }
-                }
-            }
-            out = shrunk;
-        } else {
-            out = kept;
-        }
-    }
-
-    if out.is_empty() {
-        String::new()
-    } else {
-        let mut s = out.join("\n");
-        s.push('\n');
-        s
-    }
-}
-
-/// 每轮首个备份：数据\同步备份\ts-<epoch>\（返回已建目录路径）。
-fn ensure_backup<'a>(data_dir: &Path, slot: &'a mut Option<PathBuf>) -> &'a Path {
-    slot.get_or_insert_with(|| {
-        let d = data_dir.join("同步备份").join(format!("ts-{}", now_secs()));
-        let _ = std::fs::create_dir_all(&d);
-        d
-    })
-}
-
-/// 备份目录按名倒序保留最近 BACKUP_KEEP 份（ts- 前缀等宽，字符串序=时间序）。
-fn prune_backups(data_dir: &Path) {
-    let root = data_dir.join("同步备份");
-    let dirs = match std::fs::read_dir(&root) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let mut names: Vec<String> = dirs
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with("ts-"))
-        .collect();
-    names.sort();
-    let excess = names.len().saturating_sub(BACKUP_KEEP);
-    for n in &names[..excess] {
-        let _ = std::fs::remove_dir_all(root.join(n));
-    }
-}
-
-// ───────────────────────── config 消毒/覆盖 ─────────────────────────
-
-/// 删除 v 中 path 指到的键（"a.b" 两级）。
-fn remove_path(v: &mut Value, path: &str) {
-    let mut segs: Vec<&str> = path.split('.').collect();
-    let Some(last) = segs.pop() else { return };
-    let mut cur = v;
-    for s in &segs {
-        match cur.get_mut(*s) {
-            Some(n) if n.is_object() => cur = n,
-            _ => return,
-        }
-    }
-    if let Some(o) = cur.as_object_mut() {
-        o.remove(last);
-    }
-}
-
-/// 剔除不同步键（上行前调用；overlay 端同表保障下行不受覆盖）。
-fn sanitize_config(v: &mut Value) {
-    for p in CONFIG_EXCLUDED {
-        remove_path(v, p);
-    }
-}
-
-/// 深覆盖：src 只含可同步键 → dst 排除键天然保留；数组/标量整体替换。
-///（仅测试用：合并路径已改走 three_way_merge）
-#[cfg(test)]
-fn overlay(dst: &mut Value, src: &Value) {
-    if let (Some(d), Some(s)) = (dst.as_object_mut(), src.as_object()) {
-        for (k, v) in s {
-            match d.get_mut(k) {
-                Some(slot) if slot.is_object() && v.is_object() => overlay(slot, v),
-                _ => {
-                    d.insert(k.clone(), v.clone());
-                }
-            }
-        }
-    }
-}
-
-// ─────────────────── config 三方归并 ───────────────────
-
-/// 读设置里的上次同步配置快照（三方归并 base）。
-fn last_config_snapshot() -> Option<Value> {
-    SETTINGS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|s| s.last_config.clone())
-}
-
-/// 收集对象的全部叶子路径（"a.b.c" → 值；数组视为叶子整体）。
-fn cfg_leaves(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
-    match v {
-        Value::Object(m) => {
-            for (k, x) in m {
-                cfg_leaves(&format!("{prefix}.{k}"), x, out);
-            }
-        }
-        _ => out.push((prefix.to_string(), v.clone())),
-    }
-}
-
-fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.').try_fold(v, |cur, k| cur.get(k))
-}
-
-fn set_path(v: &mut Value, path: &str, val: Value) {
-    let segs: Vec<&str> = path.split('.').collect();
-    let mut cur = v;
-    for s in &segs[..segs.len() - 1] {
-        if !cur.get(s).is_some_and(|x| x.is_object()) {
-            // 路径缺段（远端来自更新版本的配置）：补空对象再下钻
-            if let Some(o) = cur.as_object_mut() {
-                o.insert((*s).to_string(), Value::Object(Default::default()));
-            }
-        }
-        cur = match cur.get_mut(s) {
-            Some(c) => c,
-            None => return,
+        let Some(shared) = SHARED.get() else {
+            return Err("同步模块未初始化".into());
         };
+        let h = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cfg = serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
+        sanitize_config(&mut cfg);
+        mf["config"] = cfg;
     }
-    if let Some(o) = cur.as_object_mut() {
-        o.insert(segs[segs.len() - 1].to_string(), val);
-    }
-}
 
-/// 三方归并（配置）：full=本机完整配置（未消毒）；local_san=本机消毒快照；
-/// base=上次同步时双方一致的消毒快照；remote=云端消毒快照。
-/// 逐叶子：本机已等于远端→跳过；远端==base（没动）→本机新值保留；
-/// 远端动了且本机没动（==base 或 base 缺该键）→采纳远端；两边都动→本机胜。
-fn three_way_merge(full: &Value, local_san: &Value, base: &Value, remote: &Value) -> Value {
-    let mut out = full.clone();
-    let mut leaves = Vec::new();
-    cfg_leaves("", remote, &mut leaves);
-    for (raw_path, rval) in leaves {
-        let path = raw_path.strip_prefix('.').unwrap_or(&raw_path);
-        let lval = get_path(local_san, path);
-        let bval = get_path(base, path);
-        if Some(&rval) == lval {
-            continue;
-        }
-        if Some(&rval) == bval {
-            continue;
-        }
-        match (lval, bval) {
-            (l, b) if l == b || b.is_none() => set_path(&mut out, path, rval),
-            _ => {}
+    // 设备表 + 落盘 manifest
+    prune_manifest(&mut mf, s);
+    put_manifest(&agent, s, &mf)?;
+
+    // 更新本地收敛快照（各勾选方案当前文件 mt 表）
+    let mut new_snap: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    for name in &s.selected {
+        let dir = root.join(name);
+        if dir.is_dir() {
+            let mut m: BTreeMap<String, u64> = BTreeMap::new();
+            for (fname, p) in scan_dir(&dir)? {
+                if let Ok(mt) = file_mtime_ms(&p) {
+                    m.insert(fname, mt);
+                }
+            }
+            new_snap.insert(name.clone(), m);
         }
     }
-    out
-}
+    let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.get_or_insert_with(SyncSettings::default);
+    st.local_snap = new_snap;
+    let mut cfg = mf.get("config").cloned().unwrap_or(Value::Null);
+    if cfg.is_null() {
+        st.last_config = None;
+    } else {
+        sanitize_config(&mut cfg);
+        st.last_config = Some(cfg);
+    }
+    drop(guard);
+    if let Some(d) = DATA_DIR.get() {
+        prune_backups(d);
+    }
 
-// ─────────────────────────── 同步包 ───────────────────────────
-
-/// data 部分规范哈希（BTreeMap 序确定 → 同内容同哈希）。
-fn data_hash(d: &Value) -> String {
-    hex(&Sha256::digest(
-        &serde_json::to_vec(d).unwrap_or_default(),
+    Ok(format!(
+        "↑{uploaded} ↓{downloaded} 删{deleted_local} 方案{} 配置{}",
+        s.selected.len(),
+        if cfg_changed { "有更新" } else { "无变化" }
     ))
 }
 
-/// 构包：明文（口令空）或 AES-256-GCM 密文。
-fn build_package(data: &Value, device: &str, passphrase: &str) -> Result<Vec<u8>, String> {
-    let mut pkg = json!({"v": PKG_VERSION, "device": device, "ts": now_secs()});
-    if passphrase.is_empty() {
-        pkg["enc"] = Value::Null;
-        pkg["data"] = data.clone();
+// ─────────────────────────── 仲裁辅助 ───────────────────────────
+
+/// 本机码表根（Host 锁内短取）。
+fn local_schema_root() -> Option<PathBuf> {
+    let shared = SHARED.get()?;
+    let h = shared.lock().ok()?;
+    let data_dir = DATA_DIR.get()?;
+    Some(hufu_engine::Engine::resolve_data_sub(
+        data_dir,
+        &h.engine.config.schema.dir,
+    ))
+}
+
+/// 扫描目录：{文件名: 路径}（只一层，跳过子目录——方案目录约定扁平）。
+fn scan_dir(dir: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut out = BTreeMap::new();
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("读目录失败：{e}"))?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            if let Some(n) = p.file_name().and_then(|x| x.to_str()) {
+                out.insert(n.to_string(), p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn file_mtime_ms(p: &Path) -> Result<u64, String> {
+    let md = std::fs::metadata(p).map_err(|e| format!("读文件属性失败：{e}"))?;
+    let t = md.modified().map_err(|e| format!("读修改时间失败：{e}"))?;
+    Ok(t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0))
+}
+
+/// 把文件 mtime 设为现在（还原用）。
+fn touch(p: &Path) {
+    if let Ok(f) = std::fs::File::options().write(true).open(p) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// 把文件 mtime 回拨为云端 mt（同步写盘 ≠ 用户操作，防乒乓）。
+fn set_mtime(p: &Path, ms: u64) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    if let Ok(f) = std::fs::File::options().write(true).open(p) {
+        let _ = f.set_modified(t);
+    }
+}
+
+/// 文件内容的 SHA256（前 32 hex，仲裁时省下载：哈希相同不写盘）。
+fn file_hash(p: &Path) -> Result<String, String> {
+    let b = std::fs::read(p).map_err(|e| format!("读文件失败：{e}"))?;
+    Ok(hash_bytes(&b))
+}
+
+fn hash_bytes(b: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(b);
+    let d = h.finalize();
+    hex(&d[..16]).to_string()
+}
+
+/// 云端文件 key：SHA256("方案/文件名") 前 32 hex（ASCII 路径）。
+fn file_key(scheme: &str, fname: &str) -> String {
+    hash_bytes(format!("{scheme}/{fname}").as_bytes())
+}
+
+/// manifest 文件条目里的哈希提示（有则比对省下载；无则视为不同）。
+fn remote_hash_hint(rv: &Value) -> String {
+    rv.get("h").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+/// 回收站：把方案目录里的文件挪进去（保原名+时间戳前缀）。
+fn trash_file(dir: &Path, fname: &str) -> Result<(), String> {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return Ok(());
+    };
+    let src = dir.join(fname);
+    if !src.is_file() {
+        return Ok(());
+    }
+    let scheme = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("未知方案");
+    let td = data_dir.join("同步回收站").join(scheme);
+    std::fs::create_dir_all(&td).map_err(|e| format!("建回收站目录失败：{e}"))?;
+    let dst = td.join(format!("{}-{fname}", now_ms()));
+    // 同名快还原冲突：直接覆盖旧回收件
+    let _ = std::fs::copy(&src, &dst);
+    std::fs::remove_file(&src).map_err(|e| format!("删除本地文件失败：{e}"))?;
+    prune_trash(&td);
+    Ok(())
+}
+
+/// 回收站瘦身：每方案留 TRASH_KEEP 份、TRASH_DAYS 天。
+fn prune_trash(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut items: Vec<(u64, std::fs::DirEntry)> = rd
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let ts = e
+                .file_name()
+                .into_string()
+                .ok()?
+                .split('-')
+                .next()?
+                .parse()
+                .ok()?;
+            Some((ts, e))
+        })
+        .collect();
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    let cutoff_ms = now_ms().saturating_sub(TRASH_DAYS * 24 * 3600 * 1000);
+    for (i, (ts, e)) in items.into_iter().enumerate() {
+        if i >= TRASH_KEEP || ts < cutoff_ms {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+fn count_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count())
+        .unwrap_or(0)
+}
+
+// ─────────────────────────── 传输层 ───────────────────────────
+
+fn empty_manifest() -> Value {
+    json!({"v": MF_VERSION, "device": "", "ts": 0,
+        "enc": Value::Null, "config": Value::Null,
+        "devices": {}, "schemes": {}})
+}
+
+/// JSON 对象键转义（方案名含 / 或 . 时 pointer 路径安全）。
+fn json_escape_key(k: &str) -> String {
+    // serde_json::pointer 用 ~1 表 /、~0 表 ~
+    k.replace('~', "~0").replace('/', "~1")
+}
+
+fn ensure_scheme_entry(mf: &mut Value, name: &str) {
+    if !mf.get("schemes").is_some_and(|v| v.is_object()) {
+        mf["schemes"] = json!({});
+    }
+    let path = format!("/schemes/{}", json_escape_key(name));
+    if mf.pointer(&path).is_none() {
+        if let Some(m) = mf["schemes"].as_object_mut() {
+            m.insert(name.to_string(), json!({"by": "", "ts": 0, "files": {}}));
+        }
+    }
+}
+
+/// manifest 里设备表刷新本机活跃时刻 + 清超窗设备。
+fn prune_manifest(mf: &mut Value, s: &SyncSettings) {
+    if !mf.get("devices").is_some_and(|v| v.is_object()) {
+        mf["devices"] = json!({});
+    }
+    let cutoff = now_secs().saturating_sub(DEVICE_STALE_SECS);
+    if let Some(m) = mf["devices"].as_object_mut() {
+        m.retain(|_, ts| ts.as_u64().unwrap_or(0) > cutoff);
+        m.insert(s.device.clone(), json!(now_secs()));
+    }
+    mf["device"] = json!(s.device);
+    mf["ts"] = json!(now_secs());
+    mf["v"] = json!(MF_VERSION);
+}
+
+/// 上传单文件：PUT hufu-sync/files/<key>（口令开启时 AES-GCM），
+/// manifest 条目更新（mt/sz/h/key/n）。
+fn push_file(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &mut Value,
+    scheme: &str,
+    fname: &str,
+    path: &Path,
+) -> Result<usize, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("读「{scheme}/{fname}」失败：{e}"))?;
+    if raw.len() as u64 > MAX_FILE {
+        return Err(format!(
+            "「{scheme}/{fname}」 {} MB 超限（32 MB）——已中止",
+            raw.len() / 1024 / 1024
+        ));
+    }
+    let key = file_key(scheme, fname);
+    let body = encrypt_for_cloud(s, mf, &raw)?;
+    let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
+    match auth_req(
+        agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+        &s.user,
+        &s.pass,
+    )
+    .send_bytes(&body)
+    {
+        Ok(_) => {}
+        Err(ureq::Error::Status(409, _)) => {
+            mkcol(agent, s)?;
+            // 重试一次
+            auth_req(
+                agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+                &s.user,
+                &s.pass,
+            )
+            .send_bytes(&body)
+            .map_err(|e| format!("上传「{scheme}/{fname}」失败：{e}"))?;
+        }
+        Err(ureq::Error::Status(401, _)) => {
+            return Err("认证失败：账号或应用密码不对".into());
+        }
+        Err(e) => return Err(format!("上传「{scheme}/{fname}」失败：{e}")),
+    }
+    let mt = file_mtime_ms(path)?;
+    ensure_scheme_entry(mf, scheme);
+    let nonce = nonce_of(&body);
+    mf.pointer_mut(&format!(
+        "/schemes/{}/files/{}",
+        json_escape_key(scheme),
+        json_escape_key(fname)
+    ))
+    .map(|e| {
+        *e = json!({
+            "mt": mt, "sz": raw.len(), "h": hash_bytes(&raw),
+            "key": key, "n": nonce,
+        })
+    });
+    Ok(raw.len())
+}
+
+/// 下载单文件：GET →（口令开启时解密）→ 备份旧版 → 写盘 → mtime 回拨。
+fn pull_file(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &Value,
+    dir: &Path,
+    fname: &str,
+    key: &str,
+    rmt: u64,
+) -> Result<usize, String> {
+    let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
+    let mut body = Vec::new();
+    match auth_req(agent.request("GET", &url), &s.user, &s.pass).call() {
+        Ok(r) => {
+            r.into_reader()
+                .take(MAX_FILE)
+                .read_to_end(&mut body)
+                .map_err(|e| format!("下载「{fname}」失败：{e}"))?;
+        }
+        Err(ureq::Error::Status(404, _)) => return Ok(0), // 清单与文件竞态：跳过
+        Err(ureq::Error::Status(401, _)) => {
+            return Err("认证失败：账号或应用密码不对".into());
+        }
+        Err(e) => return Err(format!("下载「{fname}」失败：{e}")),
+    }
+    let raw = decrypt_from_cloud(s, mf, &body)?;
+    let dst = dir.join(fname);
+    if dst.is_file() {
+        backup_file_before_write(&dst);
+    }
+    std::fs::write(&dst, &raw).map_err(|e| format!("写入「{fname}」失败：{e}"))?;
+    set_mtime(&dst, rmt);
+    Ok(raw.len())
+}
+
+/// 整夹拉取（本机未装该方案）：建目录 + 逐文件下载（mtime 回拨）。
+fn pull_scheme_all(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &Value,
+    root: &Path,
+    scheme: &str,
+    entry: &Value,
+) -> Result<usize, String> {
+    let dir = root.join(scheme);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建方案目录失败：{e}"))?;
+    let files = entry.get("files").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let mut total = 0usize;
+    for (fname, rv) in &files {
+        let key = rv.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let rmt = rv.get("mt").and_then(|v| v.as_u64()).unwrap_or(0);
+        total += pull_file(agent, s, mf, &dir, fname, key, rmt)?;
+    }
+    Ok(total)
+}
+
+/// 写盘前备份到 数据\同步备份\ts-<秒>\（整轮备份，保 10 份）。
+fn backup_file_before_write(src: &Path) {
+    let Some(data_dir) = DATA_DIR.get() else {
+        return;
+    };
+    let scheme = src
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("方案");
+    let bd = data_dir.join("同步备份").join(format!("ts-{}", now_secs()));
+    let _ = std::fs::create_dir_all(&bd);
+    if let Some(name) = src.file_name().and_then(|n| n.to_str()) {
+        let _ = std::fs::copy(src, bd.join(format!("{scheme}-{name}")));
+    }
+}
+
+fn backup_config(data_dir: &Path) {
+    let src = data_dir.join("config.json");
+    if src.is_file() {
+        let bd = data_dir.join("同步备份").join(format!("ts-{}", now_secs()));
+        let _ = std::fs::create_dir_all(&bd);
+        let _ = std::fs::copy(&src, bd.join("config.json"));
+    }
+}
+
+/// 备份目录瘦身（按名倒序保留 BACKUP_KEEP 份）。
+fn prune_backups(data_dir: &Path) {
+    let bd = data_dir.join("同步备份");
+    let mut rounds: Vec<PathBuf> = std::fs::read_dir(&bd)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    rounds.sort();
+    while rounds.len() > BACKUP_KEEP {
+        let p = rounds.remove(0);
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+// ─────────────────────────── manifest 存取 ───────────────────────────
+
+fn fetch_manifest(agent: &ureq::Agent, s: &SyncSettings) -> Result<Option<Value>, String> {
+    match webdav_get_body(agent, s, MF_PATH, MAX_MF as u64) {
+        Ok(None) => Ok(None),
+        Ok(Some(b)) => {
+            let mf: Value =
+                serde_json::from_slice(&b).map_err(|_| "云端清单损坏（非 JSON）".to_string())?;
+            let v = mf.get("v").and_then(|v| v.as_u64()).unwrap_or(0);
+            if v != MF_VERSION {
+                return Err(format!(
+                    "云端同步数据版本 v{v} 不支持（本机只认 v{MF_VERSION}，两台电脑都装最新版虎符即可）"
+                ));
+            }
+            Ok(Some(mf))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn put_manifest(agent: &ureq::Agent, s: &SyncSettings, mf: &Value) -> Result<(), String> {
+    let body = serde_json::to_vec(mf).map_err(|e| e.to_string())?;
+    webdav_put_body(agent, s, MF_PATH, &body, "application/json")
+}
+
+// ─────────────────────────── 文件加密 ───────────────────────────
+
+/// 云端文件体 = 原文（无口令）| nonce(12B) + AES-GCM(ct)。
+/// key 由口令 + manifest.enc.salt 派生（同轮多文件复用同一 key——
+/// PBKDF2 300k 轮只算一次，经 KEY_CACHE）。
+fn encrypt_for_cloud(s: &SyncSettings, mf: &Value, raw: &[u8]) -> Result<Vec<u8>, String> {
+    if s.passphrase.is_empty() {
+        return Ok(raw.to_vec());
+    }
+    let key = cloud_key(s, mf)?;
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|e| format!("取随机数失败：{e}"))?;
+    let ct = aes_ops(&key, &nonce, raw, true).ok_or("加密失败")?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn decrypt_from_cloud(s: &SyncSettings, mf: &Value, body: &[u8]) -> Result<Vec<u8>, String> {
+    if s.passphrase.is_empty() {
+        return Ok(body.to_vec());
+    }
+    if body.len() < 12 {
+        return Err("云端文件损坏（过短）".into());
+    }
+    let key = cloud_key(s, mf)?;
+    let (nonce, ct) = body.split_at(12);
+    let n: [u8; 12] = nonce.try_into().unwrap();
+    aes_ops(&key, &n, ct, false).ok_or_else(|| "解密失败：加密口令不匹配（或数据损坏）".into())
+}
+
+/// nonce 提示（加密时记录到 manifest，审计用；解密自含 nonce）。
+fn nonce_of(body: &[u8]) -> String {
+    if body.len() >= 12 {
+        hex(&body[..12])
     } else {
-        let mut salt = [0u8; 16];
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut salt).map_err(|e| format!("取随机数失败：{e}"))?;
-        getrandom::getrandom(&mut nonce).map_err(|e| format!("取随机数失败：{e}"))?;
-        let key = derive_key(passphrase.as_bytes(), &salt, KDF_ROUNDS);
-        let pt = serde_json::to_vec(data).map_err(|e| e.to_string())?;
-        let ct = aes_ops(&key, &nonce, &pt, true).ok_or("加密失败")?;
-        pkg["enc"] = json!({"salt": hex(&salt), "nonce": hex(&nonce), "iter": KDF_ROUNDS});
-        pkg["data"] = Value::String(hex(&ct));
+        String::new()
     }
-    serde_json::to_vec(&pkg).map_err(|e| e.to_string())
 }
 
-/// 解包：版本校验 + 解密（enc 包把 data 原地替换为解密后的对象）。
-fn parse_package(body: &[u8], passphrase: &str) -> Result<Value, String> {
-    let mut pkg: Value =
-        serde_json::from_slice(body).map_err(|_| "云端同步包损坏（非 JSON）".to_string())?;
-    let v = pkg.get("v").and_then(|v| v.as_u64()).unwrap_or(0);
-    if v != PKG_VERSION {
-        return Err(format!("云端同步包版本 v{v} 不支持（本机只认 v{PKG_VERSION}），请升级虎符"));
-    }
-    let enc = pkg.get("enc").cloned().unwrap_or(Value::Null);
-    if enc.is_null() {
-        return Ok(pkg);
-    }
-    if passphrase.is_empty() {
-        return Err("云端是加密同步包：请先在本机填写同一加密口令".into());
-    }
-    let hex_field = |v: &Value| -> Option<Vec<u8>> { v.as_str().and_then(unhex) };
-    let salt = hex_field(&enc["salt"]).ok_or("加密参数（salt）损坏")?;
-    let nonce = hex_field(&enc["nonce"]).ok_or("加密参数（nonce）损坏")?;
-    let iter = enc["iter"].as_u64().unwrap_or(KDF_ROUNDS as u64) as u32;
-    let ct = hex_field(&pkg["data"]).ok_or("密文损坏")?;
-    let key = derive_key(passphrase.as_bytes(), &salt, iter);
-    let pt = aes_ops(&key, &nonce, &ct, false).ok_or("解密失败：加密口令不匹配（或数据损坏）")?;
-    let data: Value = serde_json::from_slice(&pt).map_err(|_| "解密后数据损坏".to_string())?;
-    pkg["data"] = data;
-    Ok(pkg)
+static KEY_CACHE: Mutex<Option<(String, String, [u8; 32])>> = Mutex::new(None);
+
+fn cloud_key(s: &SyncSettings, mf: &Value) -> Result<[u8; 32], String> {
+    let salt = mf
+        .get("enc")
+        .and_then(|e| e.get("salt"))
+        .and_then(|v| v.as_str())
+        .ok_or("加密参数缺失（manifest 无 salt）")?;
+    derive_cached(s, salt)
 }
 
-// ─────────────────────────── 加密件 ───────────────────────────
+fn derive_cached(s: &SyncSettings, salt_hex: &str) -> Result<[u8; 32], String> {
+    let mut guard = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((pp, salt, key)) = guard.as_ref() {
+        if *pp == s.passphrase && salt == salt_hex {
+            return Ok(*key);
+        }
+    }
+    let Some(salt) = unhex(salt_hex) else {
+        return Err("加密参数损坏（salt）".into());
+    };
+    let mut k = [0u8; 32];
+    pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(
+        s.passphrase.as_bytes(),
+        &salt,
+        KDF_ROUNDS,
+        &mut k,
+    );
+    *guard = Some((s.passphrase.clone(), salt_hex.to_string(), k));
+    Ok(k)
+}
 
 fn derive_key(pp: &[u8], salt: &[u8], iter: u32) -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -1015,9 +1291,75 @@ fn aes_ops(key: &[u8; 32], nonce: &[u8], data: &[u8], enc: bool) -> Option<Vec<u
     }
 }
 
+// ─────────────────────────── config 归并 ───────────────────────────
+
+/// config 消毒：剔除不同步键（就地深删）。
+pub fn sanitize_config(cfg: &mut Value) {
+    for path in CONFIG_EXCLUDED {
+        let mut segs: Vec<&str> = path.split('.').collect();
+        let last = segs.pop().unwrap_or("");
+        // 顶层键直接删；嵌套键走 pointer
+        if segs.is_empty() {
+            if let Some(m) = cfg.as_object_mut() {
+                m.remove(last);
+            }
+        } else if let Some(obj) = cfg.pointer_mut(&segs_to_pointer(&segs)) {
+            if let Some(m) = obj.as_object_mut() {
+                m.remove(last);
+            }
+        }
+    }
+}
+
+fn segs_to_pointer(segs: &[&str]) -> String {
+    if segs.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", segs.join("/"))
+    }
+}
+
+/// 三方归并：full（本机全量）× remote → merged。base=上次同步快照。
+fn three_way_merge(full: &Value, local_san: &Value, base: &Value, remote: &Value) -> Value {
+    let mut out = full.clone();
+    overlay_remote(&mut out, local_san, base, remote);
+    out
+}
+
+/// 递归：远端项变了（≠base）且本机没动（local==base）→ 采纳远端。
+fn overlay_remote(out: &mut Value, local: &Value, base: &Value, remote: &Value) {
+    match (out, local, base, remote) {
+        (Value::Object(o), Value::Object(l), Value::Object(b), Value::Object(r)) => {
+            for (k, rv) in r {
+                let lv = l.get(k);
+                let bv = b.get(k);
+                let same_as_base = lv == bv;
+                if let Some(ov) = o.get_mut(k) {
+                    let both_obj = ov.is_object() && rv.is_object();
+                    if same_as_base && both_obj {
+                        // 本机没动且双方都是对象：递归细粒度采纳
+                        overlay_remote(ov, lv.unwrap_or(&Value::Null), bv.unwrap_or(&Value::Null), rv);
+                    } else if same_as_base {
+                        // 本机没动：整段采纳远端
+                        *ov = rv.clone();
+                    } else if both_obj {
+                        // 本机动了：只在对象层递归（叶子保留本机）
+                        overlay_remote(ov, lv.unwrap_or(&Value::Null), bv.unwrap_or(&Value::Null), rv);
+                    }
+                    // 本机动了且非对象：保留本机（什么都不做）
+                } else if same_as_base {
+                    // 本机没有该键且没动过：采纳远端
+                    o.insert(k.clone(), rv.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ─────────────────────────── WebDAV ───────────────────────────
 
-/// 标准 Base64（编码方向；仅 Authorization 头用，不引依赖）。
+/// 标准 Base64（Authorization 头用）。
 fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -1032,7 +1374,6 @@ fn b64(data: &[u8]) -> String {
     s
 }
 
-/// HTTP Basic 认证头（ureq 无内联助手/特性门无关，标准头最稳）。
 fn auth_req(r: ureq::Request, user: &str, pass: &str) -> ureq::Request {
     let cred = b64(format!("{user}:{pass}").as_bytes());
     r.set("Authorization", &format!("Basic {cred}"))
@@ -1042,16 +1383,11 @@ fn build_agent() -> ureq::Agent {
     let b = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout(Duration::from_secs(30));
-    // 【TLS 坑 2026-10-28】ureq 的 native-tls 特性 ≠ 自动生效：不开
-    // rustls("tls") 特性时默认 connector 是 NoTlsConfig，https 直接报
-    // "no TLS backend is configured"——必须在 AgentBuilder 上显式挂
-    // native_tls connector（ureq 已 re-export，无需直接依赖 native-tls）。
     #[cfg(windows)]
     let b = match ureq::native_tls::TlsConnector::new() {
         Ok(c) => b.tls_connector(std::sync::Arc::new(c)),
-        Err(_) => b, // schannel 初始化失败（几乎不可能）：退化为无 TLS
+        Err(_) => b,
     };
-    // unix 走 rustls("tls" 特性)，是默认 connector，无需配置。
     b.build()
 }
 
@@ -1059,23 +1395,33 @@ fn url_join(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
-/// GET 云端包：Ok(None)=404 云端为空；读体限流（防异常大响应）。
-fn webdav_get(agent: &ureq::Agent, s: &SyncSettings) -> Result<Option<Vec<u8>>, String> {
-    let url = url_join(&s.url, PKG_PATH);
+fn mkcol(agent: &ureq::Agent, s: &SyncSettings) -> Result<(), String> {
+    for d in ["hufu-sync", "hufu-sync/files"] {
+        let col = url_join(&s.url, d);
+        let _ = auth_req(agent.request("MKCOL", &col), &s.user, &s.pass).call();
+    }
+    Ok(())
+}
+
+fn webdav_get_body(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    path: &str,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let url = url_join(&s.url, path);
     match auth_req(agent.request("GET", &url), &s.user, &s.pass).call() {
         Ok(r) => {
             let mut buf = Vec::new();
             r.into_reader()
-                .take((MAX_PKG * 2) as u64)
+                .take(limit * 2)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("下载失败：{e}"))?;
-            if buf.len() > MAX_PKG {
-                return Err(format!("云端同步包超限（{} KB > 2 MB）", buf.len() / 1024));
+            if buf.len() as u64 > limit {
+                return Err(format!("云端资源超限（{} KB）", buf.len() / 1024));
             }
             Ok(Some(buf))
         }
-        // 404=云端为空；409=父集合 hufu-sync/ 不存在（坚果云口径），
-        // 同样视为云端为空——首次 PUT 会先 MKCOL 建目录再传。
         Err(ureq::Error::Status(404, _)) | Err(ureq::Error::Status(409, _)) => Ok(None),
         Err(ureq::Error::Status(401, _)) => {
             Err("认证失败：账号或应用密码不对".into())
@@ -1084,30 +1430,54 @@ fn webdav_get(agent: &ureq::Agent, s: &SyncSettings) -> Result<Option<Vec<u8>>, 
     }
 }
 
-/// PUT 云端包：409（父集合不存在）→ MKCOL 建目录重试一次。
-fn webdav_put(agent: &ureq::Agent, s: &SyncSettings, body: &[u8]) -> Result<(), String> {
+fn webdav_put_body(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    path: &str,
+    body: &[u8],
+    ctype: &str,
+) -> Result<(), String> {
     let put = |u: &str| {
         auth_req(
-            agent
-                .request("PUT", u)
-                .set("Content-Type", "application/json"),
+            agent.request("PUT", u).set("Content-Type", ctype),
             &s.user,
             &s.pass,
         )
         .send_bytes(body)
     };
-    let url = url_join(&s.url, PKG_PATH);
+    let url = url_join(&s.url, path);
     match put(&url) {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(409, _)) => {
-            let col = url_join(&s.url, "hufu-sync");
-            let _ = auth_req(agent.request("MKCOL", &col), &s.user, &s.pass).call();
+            mkcol(agent, s)?;
             put(&url).map(|_| ()).map_err(|e| format!("上传失败：{e}"))
         }
         Err(ureq::Error::Status(401, _)) => {
             Err("认证失败：账号或应用密码不对".into())
         }
         Err(e) => Err(format!("上传失败：{e}")),
+    }
+}
+
+fn webdav_file_del(agent: &ureq::Agent, s: &SyncSettings, key: &str) -> Result<(), String> {
+    let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
+    match auth_req(agent.request("DELETE", &url), &s.user, &s.pass).call() {
+        Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+        Err(ureq::Error::Status(401, _)) => {
+            Err("认证失败：账号或应用密码不对".into())
+        }
+        Err(e) => Err(format!("删除失败：{e}")),
+    }
+}
+
+fn webdav_del(agent: &ureq::Agent, s: &SyncSettings, path: &str) -> Result<(), String> {
+    let url = url_join(&s.url, path);
+    match auth_req(agent.request("DELETE", &url), &s.user, &s.pass).call() {
+        Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+        Err(ureq::Error::Status(401, _)) => {
+            Err("认证失败：账号或应用密码不对".into())
+        }
+        Err(e) => Err(format!("删除失败：{e}")),
     }
 }
 
@@ -1130,7 +1500,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     for i in (0..b.len()).step_by(2) {
         let hi = (b[i] as char).to_digit(16)?;
         let lo = (b[i + 1] as char).to_digit(16)?;
-        v.push((hi * 16 + lo) as u8);
+        v.push(((hi << 4) | lo) as u8);
     }
     Some(v)
 }
@@ -1140,362 +1510,65 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Write as _};
 
-    /// 【误清空护栏 + 备份 2026-10-29】畸形整清请求（user 空 + pass 字面
-    /// 空串覆盖）必须被拒绝且原凭据保留；正常路径（__keep__/换账号）不受
-    /// 影响；persist 落盘前自动留 同步.json.bak。
+    /// 文件 key：稳定、纯 ASCII、同方案不同文件不同 key。
     #[test]
-    fn save_settings_rejects_accidental_wipe_and_backs_up() {
-        let dir = std::env::temp_dir().join(format!("hufu-sync-wipe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = DATA_DIR.set(dir.clone());
-        *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = Some(SyncSettings {
-            url: "https://dav.example/dav/".into(),
-            user: "u@example.com".into(),
-            pass: "secret".into(),
-            ..Default::default()
+    fn file_key_stable_and_ascii() {
+        let a = file_key("茉莉", "主码表.txt");
+        let b = file_key("茉莉", "用户调整.txt");
+        let a2 = file_key("茉莉", "主码表.txt");
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a.len(), 32);
+    }
+
+    /// 消毒：排除键剔除，其余保留。
+    #[test]
+    fn config_sanitize_exclusions() {
+        let mut cfg = json!({
+            "schema": {"current": "A"},
+            "general": {"autostart": true, "export_key": "ctrl+x"},
+            "candidates": {"page_size": 4}
         });
-        // 畸形整清：拒绝，原值分毫不动
-        let r = save_settings("", "", "", "", "");
-        assert!(r.is_err(), "整清请求必须被拒绝");
-        let s = SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
-        assert_eq!((s.user.as_str(), s.pass.as_str()), ("u@example.com", "secret"));
-        // 正常保存：pass/__keep__ 保留、url 空归默认、持久化 + 备份
-        save_settings("", "u@example.com", KEEP, "", KEEP).unwrap();
-        let s2 = SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
-        assert_eq!(s2.url, DEFAULT_URL);
-        assert_eq!(s2.pass, "secret");
-        assert!(dir.join("同步.json").is_file());
-        // 第二次正常保存 → 备份滚动为上一版（首次保存无旧版可备）
-        save_settings("", "u2@example.com", KEEP, "自定义设备", KEEP).unwrap();
-        assert!(dir.join("同步.json.bak").is_file(), "非首版落盘前必须留备份");
-        let bak: SyncSettings = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("同步.json.bak")).unwrap(),
-        ).unwrap();
-        assert_eq!(bak.user, "u@example.com", "备份应保存上一版");
-        let _ = std::fs::remove_dir_all(&dir);
+        sanitize_config(&mut cfg);
+        assert!(cfg.get("schema").is_none());
+        assert!(cfg["general"].get("autostart").is_none());
+        assert!(cfg["general"].get("export_key").is_none());
+        assert_eq!(cfg["candidates"]["page_size"], 4);
     }
 
+    /// 三方归并：本机没动→采纳远端；本机动了→保留本机。
     #[test]
-    fn merge_adjust_union_dedup_local_last() {
-        // 并集去重，远端序在前、本机独有在后
-        let m = merge_adjust("{置顶}a\t一\n{删除}b\t二\n", "{删除}b\t二\n{添加}c\t三\n");
-        assert_eq!(m, "{置顶}a\t一\n{删除}b\t二\n{添加}c\t三\n");
-        // 【键终态 2026-10-30】同键不同操作只留拼接流最后出现者（与
-        // 回放「后写赢」一致——旧行并集保留双行是恶性洗词的帮凶，
-        // 见 merge_adjust 文档注释）；本机删除在后=删除终态传播
-        let m2 = merge_adjust("{添加}a\t一\n", "{删除}a\t一\n");
-        assert_eq!(m2, "{删除}a\t一\n");
-        // 反向：本机添加在后=加词传播（跨机重新加词不再被墓碑杀）
-        let m2b = merge_adjust("{删除}a\t一\n", "{添加}a\t一\n");
-        assert_eq!(m2b, "{添加}a\t一\n");
-        assert_eq!(merge_adjust("", ""), "");
-        assert_eq!(merge_adjust("x\n", "x\n"), "x\n");
-        // 空行剔除 / CRLF 容错
-        let m3 = merge_adjust("\r\n{删除}b\t二\r\n", "\n");
-        assert_eq!(m3, "{删除}b\t二\n");
+    fn three_way_basic() {
+        let full = json!({"a": 1, "b": 2, "skin": "x"});
+        let mut local_san = full.clone();
+        sanitize_config(&mut local_san); // skin 被剔除
+        let base = json!({"a": 1, "b": 1});
+        let remote = json!({"a": 9, "b": 5});
+        let merged = three_way_merge(&full, &local_san, &base, &remote);
+        // a 本机没动（local==base）→ 采纳远端
+        assert_eq!(merged["a"], 9);
+        // b 本机动了（2≠1）→ 保留本机
+        assert_eq!(merged["b"], 2);
+        // 排除键不被远端冲
+        assert_eq!(merged["skin"], "x");
     }
 
-    /// 【恶性洗词 2026-10-30 真机实锤场景回归】码表方案「茉莉」：
-    /// A 机加词 qp 名字（远端）+ B 机右键删词落盘三件套（{删除}+
-    /// {整序}+{添加}qp 锭 p1，本机）+ B 机用户又重新加词（本机尾行）。
-    /// 期望：键终态=最后添加（词活）、墓碑 {删除} 行淘汰、
-    /// 快照只留最后一份、跨机无 pN 加词行后置到快照之后
-    /// （回放=快照重建后再加 → 名字不再被孤儿淘汰）。
+    /// manifest 键转义：方案名含 / 时 pointer 安全。
     #[test]
-    fn merge_adjust_moli_wash_regression() {
-        let remote = "\
-{添加}tjpt\t生日礼物\tp3\n\
-{添加}qp\t名字\n\
-{删除}qp\t名字\n\
-{整序}qp\n\
-{添加}qp\t锭\tp1\n\
-{整序}qp\n\
-{添加}qp\t锭\tp1\n";
-        let local = "{添加}qp\t名字\n";
-        let m = merge_adjust(remote, local);
-        let lines: Vec<&str> = m.lines().collect();
-        // 墓碑淘汰：同键终态=最后的 {添加}，{删除} 行不存在
-        assert!(!lines.contains(&"{删除}qp\t名字"), "墓碑行应被淘汰: {m}");
-        // 快照去重：{整序}qp 只一份
-        assert_eq!(lines.iter().filter(|l| **l == "{整序}qp").count(), 1);
-        // 无 pN 加词行后置：名字行在 {整序}qp 与 {添加}qp 锭 p1 之后
-        let i_snap = lines.iter().position(|l| *l == "{整序}qp").unwrap();
-        let i_ding = lines.iter().position(|l| *l == "{添加}qp\t锭\tp1").unwrap();
-        let i_mz = lines.iter().position(|l| *l == "{添加}qp\t名字").unwrap();
-        assert!(i_snap < i_ding && i_ding < i_mz, "回放序应为 快照→锭p1→名字: {m}");
-        // 词行仍随全局序保留
-        assert_eq!(lines[0], "{添加}tjpt\t生日礼物\tp3");
+    fn pointer_escape_slash() {
+        let mut mf = empty_manifest();
+        ensure_scheme_entry(&mut mf, "a/b");
+        assert!(mf.pointer("/schemes/a~1b").is_some());
     }
 
-    /// 快照后置的另一半：跨机加词行出现在快照**之前**（A 机文件序）
-    /// 也必须被抽到快照之后——这是主凶路径（B 机快照经并集追加在
-    /// 尾部，把 A 机传来的加词行压在前面=回放被孤儿淘汰）。
+    /// 空清单 roundtrip。
     #[test]
-    fn merge_adjust_addword_before_snapshot_moves_after() {
-        let remote = "{添加}qp\t名字\n{添加}nx\t习惯\n";
-        let local = "{整序}qp\n{添加}qp\t锭\tp1\n";
-        let m = merge_adjust(remote, local);
-        let lines: Vec<&str> = m.lines().collect();
-        let i_snap = lines.iter().position(|l| *l == "{整序}qp").unwrap();
-        let i_mz = lines.iter().position(|l| *l == "{添加}qp\t名字").unwrap();
-        assert!(i_snap < i_mz, "快照前的加词行必须后置到快照后: {m}");
-        // 无快照码不受影响
-        assert_eq!(lines.iter().position(|l| *l == "{添加}nx\t习惯").unwrap(), 0);
-    }
-
-    #[test]
-    fn config_sanitize_overlay_exclusion() {
-        let local = json!({
-            "schema": {"current": "A", "dir": "码表"},
-            "general": {"autostart": true, "export_key": "ctrl+alt+e", "shift_switch": true},
-            "appearance": {"skin": "hufu-moyan", "skin_kind": "json", "font_family": "", "font_size": 17.6, "anim": true},
-            "sentence": {"enabled": true}
-        });
-        let mut remote_full = local.clone();
-        sanitize_config(&mut remote_full);
-        assert!(remote_full.get("schema").is_none());
-        assert!(remote_full["appearance"].get("skin").is_none());
-        assert!(remote_full["appearance"].get("skin_kind").is_none());
-        assert!(remote_full["appearance"].get("font_family").is_none());
-        assert!(remote_full["general"].get("autostart").is_none());
-        assert!(remote_full["general"].get("export_key").is_none());
-        assert_eq!(remote_full["general"]["shift_switch"], true);
-        assert_eq!(remote_full["appearance"]["font_size"], 17.6);
-        // overlay：远端键覆盖，本机排除键保留
-        let mut merged = local.clone();
-        overlay(&mut merged, &json!({"general": {"shift_switch": false}, "appearance": {"font_size": 20.0}}));
-        assert_eq!(merged["general"]["shift_switch"], false);
-        assert_eq!(merged["appearance"]["font_size"], 20.0);
-        assert_eq!(merged["appearance"]["skin"], "hufu-moyan");
-        assert_eq!(merged["schema"]["current"], "A");
-    }
-
-    #[test]
-    fn config_three_way_merge_rules() {
-        let full = json!({
-            "general": {"esc_undo": false},
-            "candidates": {"page_size": 5},
-            "appearance": {"skin": "keepme", "anim": true}
-        });
-        let mut san = full.clone();
-        sanitize_config(&mut san);
-        // base = 上次同步双方一致态
-        let base = json!({
-            "general": {"esc_undo": false},
-            "candidates": {"page_size": 5},
-            "appearance": {"anim": true}
-        });
-        // 本机改了 anim=false、page_size=7；远端改了 esc_undo=true（page_size 是 base 旧值）
-        let mut local_full = full.clone();
-        local_full["appearance"]["anim"] = json!(false);
-        local_full["candidates"]["page_size"] = json!(7);
-        let mut local_san = local_full.clone();
-        sanitize_config(&mut local_san);
-        let remote = json!({
-            "general": {"esc_undo": true},
-            "candidates": {"page_size": 5},
-            "appearance": {"anim": true}
-        });
-        let merged = three_way_merge(&local_full, &local_san, &base, &remote);
-        assert_eq!(merged["general"]["esc_undo"], true, "远端变了本机没动→采纳");
-        assert_eq!(merged["candidates"]["page_size"], 7, "本机变了远端没动→保留");
-        assert_eq!(merged["appearance"]["anim"], false, "本机变了→保留");
-        assert_eq!(merged["appearance"]["skin"], "keepme", "排除字段原样");
-
-        // 两边都改同一键 → 本机胜
-        let base2 = json!({"candidates": {"page_size": 5}});
-        let remote2 = json!({"candidates": {"page_size": 9}});
-        let local2 = json!({"candidates": {"page_size": 7}});
-        let m2 = three_way_merge(&local2, &local2, &base2, &remote2);
-        assert_eq!(m2["candidates"]["page_size"], 7, "两边都动→本机胜");
-
-        // 云端旧值不得冲回本机新设置（回归锁：修复前的缺陷场景）
-        // 远端 anim=true==base（远端没动），本机已改 false → 保持 false
-        assert_eq!(merged["appearance"]["anim"], false);
-
-        // 首次同步（base=本机当前态）：远端不同且本机没动 → 全采纳远端
-        let remote3 = json!({"general": {"esc_undo": true}, "candidates": {"page_size": 9}});
-        let m3 = three_way_merge(&full, &san, &san, &remote3);
-        assert_eq!(m3["general"]["esc_undo"], true);
-        assert_eq!(m3["candidates"]["page_size"], 9);
-    }
-
-    #[test]
-    fn union_carried_keeps_remote_only_schemas() {
-        // 本机只有 B（A 未装）；carried 有 A → 并回后 A 保留、B 不动
-        let mut local = json!({"schemas": {"B": "{添加}b\t乙"}, "config": {}});
-        let carried = json!({"A": "{置顶}a\t甲"});
-        union_carried(&mut local, &carried);
-        assert_eq!(local["schemas"]["A"], "{置顶}a\t甲", "未装方案的云端条目必须透传保留");
-        assert_eq!(local["schemas"]["B"], "{添加}b\t乙");
-        // 键已存在（本地装好并已合并）→ 本地结果优先，不被云端旧值覆盖
-        let mut local2 = json!({"schemas": {"A": "本地合并结果"}});
-        union_carried(&mut local2, &carried);
-        assert_eq!(local2["schemas"]["A"], "本地合并结果");
-        // 空 carried 无副作用
-        let mut local3 = json!({"schemas": {}});
-        union_carried(&mut local3, &json!({}));
-        assert!(local3["schemas"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn merge_adjust_v2_reset_semantics() {
-        let base = "{置顶}mj\t明显\n{删除}cu\t错词";
-        let remote_more = "{置顶}mj\t明显\n{删除}cu\t错词\n{添加}xx\t新词";
-        // 首次（无 base）：并集
-        assert_eq!(
-            merge_adjust_v2(Some(remote_more), Some(base), None).unwrap(),
-            merge_adjust(remote_more, base)
-        );
-        // 本机重置（导出合并清空）：只留远端新增，旧记录不拉回
-        assert_eq!(
-            merge_adjust_v2(Some(remote_more), None, Some(base)).unwrap(),
-            "{添加}xx\t新词"
-        );
-        // 本机重置且远端无新增 → 维持空
-        assert_eq!(merge_adjust_v2(Some(base), None, Some(base)), None);
-        // 远端重置（云端没了该方案）：本机只留自己新增
-        assert_eq!(
-            merge_adjust_v2(None, Some(remote_more), Some(base)).unwrap(),
-            "{添加}xx\t新词"
-        );
-        // 双方都清 → 维持空
-        assert_eq!(merge_adjust_v2(None, None, Some(base)), None);
-        // 双方都在 → 并集
-        assert_eq!(
-            merge_adjust_v2(Some(remote_more), Some(base), Some(base)).unwrap(),
-            merge_adjust(remote_more, base)
-        );
-        // 空/空白字符串视为 None
-        assert_eq!(merge_adjust_v2(Some("  \n"), None, Some(base)), None);
-        // 【洗词事故回归锁 2026-10-29】云端没有该方案 + 无 base +
-        // 本机有内容 → 保持现状（None=不写盘），绝不能写空
-        assert_eq!(merge_adjust_v2(None, Some("{添加}kmmr\t只看见贼吃肉"), None), None);
-        // 远端重置且本机无新增 → 明确清空（Some("")，区别于保持现状）
-        assert_eq!(merge_adjust_v2(None, Some(base), Some(base)), Some(String::new()));
-        // diff_lines：保序、CRLF 容忍、去重
-        assert_eq!(diff_lines("a\r\nb\na\nc", "b"), "a\nc");
-    }
-
-    #[test]
-    fn hex_roundtrip() {
-        assert_eq!(hex(&[0x00, 0xff, 0x10]), "00ff10");
-        assert_eq!(unhex("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
-        assert!(unhex("abc").is_none());
-        assert!(unhex("zz").is_none());
-    }
-
-    /// 内存 WebDAV 测试服（GET/PUT/MKCOL/PROPFIND 最小集，Connection: close）。
-    fn mini_webdav() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let store = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
-        let st = store.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let store = st.clone();
-                std::thread::spawn(move || {
-                    let mut stream = stream;
-                    let Ok(reader) = stream.try_clone() else { return };
-                    let mut reader = BufReader::new(reader);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_err() {
-                        return;
-                    }
-                    let mut it = line.split_whitespace();
-                    let method = it.next().unwrap_or("").to_string();
-                    let target = it.next().unwrap_or("/").to_string();
-                    let mut cl = 0usize;
-                    loop {
-                        let mut h = String::new();
-                        if reader.read_line(&mut h).is_err() {
-                            break;
-                        }
-                        if h.trim().is_empty() {
-                            break;
-                        }
-                        if let Some((k, v)) = h.split_once(':') {
-                            if k.trim().eq_ignore_ascii_case("content-length") {
-                                cl = v.trim().parse().unwrap_or(0);
-                            }
-                        }
-                    }
-                    let mut body = vec![0u8; cl];
-                    if cl > 0 && reader.read_exact(&mut body).is_err() {
-                        return;
-                    }
-                    let (code, rb): (&str, Vec<u8>) = match method.as_str() {
-                        "GET" => store
-                            .lock()
-                            .unwrap()
-                            .get(&target)
-                            .map(|b| ("200", b.clone()))
-                            .unwrap_or(("404", vec![])),
-                        "PUT" => {
-                            store.lock().unwrap().insert(target, body);
-                            ("201", vec![])
-                        }
-                        "MKCOL" | "PROPFIND" => ("201", vec![]),
-                        _ => ("405", vec![]),
-                    };
-                    let head = format!(
-                        "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        rb.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&rb);
-                    let _ = stream.flush();
-                });
-            }
-        });
-        (format!("http://{addr}"), store)
-    }
-
-    #[test]
-    fn package_and_webdav_roundtrip() {
-        let (url, store) = mini_webdav();
-        let s = SyncSettings {
-            url,
-            user: "u".into(),
-            pass: "p".into(),
-            device: "T1".into(),
-            passphrase: "sec".into(),
-            ..Default::default()
-        };
-        let agent = build_agent();
-        // 云端为空 → None
-        assert!(webdav_get(&agent, &s).unwrap().is_none());
-        // 加密包上传 → 云端只见密文（store 里搜不到明文）
-        let data = json!({"schemas": {"A": "{置顶}aa\t一\n"}, "config": {"general": {"shift_switch": true}}});
-        let body = build_package(&data, "T1", "sec").unwrap();
-        webdav_put(&agent, &s, &body).unwrap();
-        {
-            let st = store.lock().unwrap();
-            let raw = st
-                .values()
-                .find(|b| !b.is_empty())
-                .expect("云端应有同步包");
-            let raw_s = String::from_utf8_lossy(raw);
-            assert!(!raw_s.contains("{置顶}"), "明文词条不得出现在密文包里");
-            assert!(!raw_s.contains("shift_switch"), "明文配置键不得出现在密文包里");
-        }
-        // 取回 + 正确口令解密 → data 等值
-        let got = webdav_get(&agent, &s).unwrap().unwrap();
-        let pkg = parse_package(&got, "sec").unwrap();
-        assert_eq!(pkg["data"], data);
-        assert_eq!(pkg["device"], "T1");
-        // 错误口令 → 明确报错
-        assert!(parse_package(&got, "wrong").is_err());
-        // 明文包 + 空口令
-        let plain = build_package(&data, "T1", "").unwrap();
-        let pkg2 = parse_package(&plain, "").unwrap();
-        assert_eq!(pkg2["data"], data);
-        // 版本不符拒绝
-        let bad = json!({"v": 99, "data": {}});
-        assert!(parse_package(&serde_json::to_vec(&bad).unwrap(), "").is_err());
+    fn manifest_roundtrip() {
+        let mf = empty_manifest();
+        let s = serde_json::to_string(&mf).unwrap();
+        let back: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(back["v"], MF_VERSION);
     }
 }
