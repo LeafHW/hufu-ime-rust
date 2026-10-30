@@ -259,11 +259,17 @@ pub fn schemes_overview() -> Value {
 }
 
 /// POST /api/sync/select {selected: [方案名...]}：勾选保存（空=全不选）。
-/// 保存后立即触发同步（新勾方案首拉/首传）。
+/// 保存后立即触发同步（新勾方案首拉/首传）。凭据齐备时自动启用
+///（升级旧档：enabled 新字段缺省 false，用户勾选=明确要同步）。
 pub fn save_selection(selected: &[String]) -> Result<(), String> {
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
     st.selected = selected.to_vec();
+    let ready =
+        !st.url.trim().is_empty() && !st.user.trim().is_empty() && !st.pass.is_empty();
+    if ready && !st.selected.is_empty() {
+        st.enabled = true;
+    }
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
     drop(guard);
     notify("勾选");

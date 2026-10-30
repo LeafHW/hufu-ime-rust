@@ -648,6 +648,10 @@ fn main() {
                                 changed
                             );
                             reload_sentence_bg(true, true);
+                            // 【云同步 v3 2026-10-30】换主码表/快符等目录级
+                            // 变化也通知同步（防抖 8s 后增量上传；同步线程
+                            // 自己的写盘经 mtime 回拨不会误触发）
+                            sync::notify("码表变化");
                         } else {
                             eprintln!("码表监视：全量重载失败（文件写错/编码坏），保持旧码表");
                         }
