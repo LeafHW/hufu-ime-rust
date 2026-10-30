@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -635,18 +635,158 @@ fn merge_adjust_v2(remote: Option<&str>, local: Option<&str>, base: Option<&str>
     }
 }
 
-/// 用户调整合并：非空行并集去重，远端行序在前、本机独有行追加在后
-/// （同键不同操作 → 本机行后写=本机胜，符合回放「最新覆盖」语义）。
+/// 用户调整合并（【语义合并 2026-10-30】恶性洗词修复，替代纯行并集）。
+///
+/// 事故链（真机实锤，码表方案「茉莉」）：A 机加词上传 → B 机文件
+/// 并集后，B 机本地的 `{整序}` 快照组（整序=清空重建、清单外即删，
+/// user.rs set_order）恰好排在跨机加词行**之后** → 回放时快照重建
+/// 把对方加的词挤出候选（词不显示=每 5 分钟洗回）；且 B 机右键删词
+/// 落盘 `{删除}词`+整套快照重写（{删除}/{整序}/{添加}pN 三行）上传
+/// → 并集把同 (码,词) 的 {添加} 与 {删除} **双行共存**，回放「后写
+/// 赢」→ 删除行在后者永远杀词（重新添加也死循环）。
+///
+/// 合并语义改为与回放一致的**键终态**：
+/// - 同 (码,词) 的 {添加}/{删除}/{置顶} 只保留拼接流（远端在前、
+///   本机在后）中**最后出现**的操作行——中间态行全部淘汰。删词
+///   传播（终态=删除）与加词传播（终态=添加）都与单机语义对齐；
+/// - 同码多份 `{整序}` 快照组只保留最后一份（早份重建后必被晚份
+///   覆盖，只留终态）；
+/// - **快照后置**：同码无 pN 的 {添加} 行（跨机单行加词）一律排到
+///   该码最后一份快照组之后——回放序=快照重建后再加词，对方机器
+///   加的词不再被孤儿淘汰（本修复的断根点）；
+/// - {加权} 行按整行去重（同词可多轮调权，保留最后值）；
+/// - 其余行维持旧行为：远端行序在前、本机独有行追加在后。
 fn merge_adjust(remote: &str, local: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
+    /// 行解析：(标记, 码, 词, 有无 pN)。非标记行=(原始行,空,空,false)。
+    fn parse(l: &str) -> (&str, &str, &str, bool) {
+        for tag in ["{添加}", "{删除}", "{置顶}", "{加权}"] {
+            if let Some(rest) = l.strip_prefix(tag) {
+                let mut it = rest.split('\t');
+                let code = it.next().unwrap_or("");
+                let word = it.next().unwrap_or("");
+                let has_pn = it.next().is_some_and(|p| p.starts_with('p'));
+                return (tag, code, word, has_pn);
+            }
+        }
+        if let Some(code) = l.strip_prefix("{整序}") {
+            return ("{整序}", code, "", false);
+        }
+        ("", "", "", false)
+    }
+
+    // 1. 拼接行流（远端在前本机在后），保序、trim \r、跳过空行。
+    //    【键行不去重】{添加}/{删除}/{置顶}/{加权}/{整序} 行保留两侧
+    //    全部出现——local 的「重新添加」行可能与 remote 历史行**字节
+    //    相同**（本案实锤），整行去重会把它吃掉、让墓碑 {删除} 行
+    //    错成终态。键行靠第 2 步终态过滤自然收敛，位置=时序。
+    let mut lines: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for l in remote.lines().chain(local.lines()) {
         let l = l.trim_end_matches('\r');
-        if l.trim().is_empty() || !seen.insert(l) {
+        if l.trim().is_empty() {
             continue;
         }
-        out.push(l);
+        let (tag, code, word, _) = parse(l);
+        let is_key_line = (!code.is_empty() && !word.is_empty())
+            || (tag == "{整序}" && !code.is_empty());
+        if !is_key_line && !seen.insert(l) {
+            continue;
+        }
+        lines.push(l);
     }
+
+    // 2. 键终态：同 (码,词) 的 {添加}/{删除}/{置顶}/{加权} 只留最后出现者
+    //    （加权多轮调权同键收敛，顺带去重）
+    let mut last_op_at: HashMap<(&str, &str), usize> = HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let (tag, code, word, _) = parse(l);
+        if !code.is_empty() && !word.is_empty() {
+            last_op_at.insert((code, word), i);
+        }
+    }
+    // 3. {整序} 快照：同码只留最后一份
+    let mut last_order_at: HashMap<&str, usize> = HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let (tag, code, _, _) = parse(l);
+        if tag == "{整序}" && !code.is_empty() {
+            last_order_at.insert(code, i);
+        }
+    }
+    // 4. 第一遍输出：淘汰中间态行
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let (tag, code, word, _) = parse(l);
+            if !code.is_empty() && !word.is_empty() {
+                return last_op_at.get(&(code, word)) == Some(i);
+            }
+            if tag == "{整序}" && !code.is_empty() {
+                return last_order_at.get(code) == Some(i);
+            }
+            true
+        })
+        .map(|(_, l)| *l)
+        .collect();
+
+    // 5. 快照后置：有 {整序} 快照的码，其**全部**无 pN {添加} 行
+    //    （跨机单行加词，可能出现在快照之前——本案实锤形态）一律
+    //    抽出、插到该码最后一行（快照组尾）之后——回放序=快照重建
+    //    后再加词，对方机器加的词不再被孤儿淘汰。
+    let out: Vec<&str>;
+    {
+        let snap_codes: HashSet<&str> = last_order_at.keys().copied().collect();
+        // 抽出所有需后置的行（保序）
+        let mut moved: Vec<&str> = Vec::new();
+        let mut shrunk: Vec<&str> = Vec::with_capacity(kept.len());
+        for l in &kept {
+            let (tag, code, _, pn) = parse(l);
+            if tag == "{添加}" && snap_codes.contains(code) && !pn {
+                moved.push(l);
+            } else {
+                shrunk.push(l);
+            }
+        }
+        if !moved.is_empty() {
+            // 每码在 shrunk 中最后出现位置（{整序}/{添加}/{删除}/
+            // {置顶}/{加权} 同码行都算锚点）
+            let mut last_at: HashMap<&str, usize> = HashMap::new();
+            for (i, l) in shrunk.iter().enumerate() {
+                let (tag, code, _, _) = parse(l);
+                if !code.is_empty()
+                    && (tag == "{整序}"
+                        || tag == "{添加}"
+                        || tag == "{删除}"
+                        || tag == "{置顶}"
+                        || tag == "{加权}")
+                {
+                    last_at.insert(code, i);
+                }
+            }
+            // 从后往前插（保前面的索引不漂移）：同码 moved 行按序追加
+            let mut insert_after: HashMap<&str, Vec<&str>> = HashMap::new();
+            for l in moved {
+                let (_, code, _, _) = parse(l);
+                insert_after.entry(code).or_default().push(l);
+            }
+            let mut anchors: Vec<(usize, &str)> =
+                last_at.iter().map(|(c, i)| (*i, *c)).collect();
+            anchors.sort_unstable_by(|a, b| b.0.cmp(&a.0)); // 倒序插
+            for (at, code) in anchors {
+                if let Some(rows) = insert_after.remove(code) {
+                    let mut idx = at + 1;
+                    for r in rows {
+                        shrunk.insert(idx, r);
+                        idx += 1;
+                    }
+                }
+            }
+            out = shrunk;
+        } else {
+            out = kept;
+        }
+    }
+
     if out.is_empty() {
         String::new()
     } else {
@@ -1044,14 +1184,67 @@ mod tests {
         // 并集去重，远端序在前、本机独有在后
         let m = merge_adjust("{置顶}a\t一\n{删除}b\t二\n", "{删除}b\t二\n{添加}c\t三\n");
         assert_eq!(m, "{置顶}a\t一\n{删除}b\t二\n{添加}c\t三\n");
-        // 同键不同操作：本机行在后=本机胜（回放最新覆盖）
+        // 【键终态 2026-10-30】同键不同操作只留拼接流最后出现者（与
+        // 回放「后写赢」一致——旧行并集保留双行是恶性洗词的帮凶，
+        // 见 merge_adjust 文档注释）；本机删除在后=删除终态传播
         let m2 = merge_adjust("{添加}a\t一\n", "{删除}a\t一\n");
-        assert_eq!(m2, "{添加}a\t一\n{删除}a\t一\n");
+        assert_eq!(m2, "{删除}a\t一\n");
+        // 反向：本机添加在后=加词传播（跨机重新加词不再被墓碑杀）
+        let m2b = merge_adjust("{删除}a\t一\n", "{添加}a\t一\n");
+        assert_eq!(m2b, "{添加}a\t一\n");
         assert_eq!(merge_adjust("", ""), "");
         assert_eq!(merge_adjust("x\n", "x\n"), "x\n");
         // 空行剔除 / CRLF 容错
         let m3 = merge_adjust("\r\n{删除}b\t二\r\n", "\n");
         assert_eq!(m3, "{删除}b\t二\n");
+    }
+
+    /// 【恶性洗词 2026-10-30 真机实锤场景回归】码表方案「茉莉」：
+    /// A 机加词 qp 名字（远端）+ B 机右键删词落盘三件套（{删除}+
+    /// {整序}+{添加}qp 锭 p1，本机）+ B 机用户又重新加词（本机尾行）。
+    /// 期望：键终态=最后添加（词活）、墓碑 {删除} 行淘汰、
+    /// 快照只留最后一份、跨机无 pN 加词行后置到快照之后
+    /// （回放=快照重建后再加 → 名字不再被孤儿淘汰）。
+    #[test]
+    fn merge_adjust_moli_wash_regression() {
+        let remote = "\
+{添加}tjpt\t生日礼物\tp3\n\
+{添加}qp\t名字\n\
+{删除}qp\t名字\n\
+{整序}qp\n\
+{添加}qp\t锭\tp1\n\
+{整序}qp\n\
+{添加}qp\t锭\tp1\n";
+        let local = "{添加}qp\t名字\n";
+        let m = merge_adjust(remote, local);
+        let lines: Vec<&str> = m.lines().collect();
+        // 墓碑淘汰：同键终态=最后的 {添加}，{删除} 行不存在
+        assert!(!lines.contains(&"{删除}qp\t名字"), "墓碑行应被淘汰: {m}");
+        // 快照去重：{整序}qp 只一份
+        assert_eq!(lines.iter().filter(|l| **l == "{整序}qp").count(), 1);
+        // 无 pN 加词行后置：名字行在 {整序}qp 与 {添加}qp 锭 p1 之后
+        let i_snap = lines.iter().position(|l| *l == "{整序}qp").unwrap();
+        let i_ding = lines.iter().position(|l| *l == "{添加}qp\t锭\tp1").unwrap();
+        let i_mz = lines.iter().position(|l| *l == "{添加}qp\t名字").unwrap();
+        assert!(i_snap < i_ding && i_ding < i_mz, "回放序应为 快照→锭p1→名字: {m}");
+        // 词行仍随全局序保留
+        assert_eq!(lines[0], "{添加}tjpt\t生日礼物\tp3");
+    }
+
+    /// 快照后置的另一半：跨机加词行出现在快照**之前**（A 机文件序）
+    /// 也必须被抽到快照之后——这是主凶路径（B 机快照经并集追加在
+    /// 尾部，把 A 机传来的加词行压在前面=回放被孤儿淘汰）。
+    #[test]
+    fn merge_adjust_addword_before_snapshot_moves_after() {
+        let remote = "{添加}qp\t名字\n{添加}nx\t习惯\n";
+        let local = "{整序}qp\n{添加}qp\t锭\tp1\n";
+        let m = merge_adjust(remote, local);
+        let lines: Vec<&str> = m.lines().collect();
+        let i_snap = lines.iter().position(|l| *l == "{整序}qp").unwrap();
+        let i_mz = lines.iter().position(|l| *l == "{添加}qp\t名字").unwrap();
+        assert!(i_snap < i_mz, "快照前的加词行必须后置到快照后: {m}");
+        // 无快照码不受影响
+        assert_eq!(lines.iter().position(|l| *l == "{添加}nx\t习惯").unwrap(), 0);
     }
 
     #[test]
