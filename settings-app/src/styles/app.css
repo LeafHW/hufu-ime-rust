@@ -847,3 +847,6 @@ body.light .about-hero img {
 .donate-text h3{margin:0 0 10px;font-size:18px}
 .donate-text p{margin:0 0 10px;color:var(--muted,#888);font-size:14px;line-height:1.7}
 .donate-note{font-size:13px!important}
+/* 【模型真名 2026-11-01】整句模型页：实际文件名显示 */
+.sentence-path-note{color:var(--muted,#888);font-size:12px}
+.sentence-resolved code.is-active{color:var(--accent,#e7b75c)}

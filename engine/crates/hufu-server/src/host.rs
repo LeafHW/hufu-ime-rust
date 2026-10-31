@@ -470,7 +470,9 @@ impl Host {
     }
 
     /// 模型路径解析：配置值（相对→数据目录）→ 数据目录 models/ 自动探测。
-    fn resolve_rerank_model(&self) -> Option<PathBuf> {
+    /// 【2026-11-01 pub】设置页 /api/sentence/models 显示实际生效的 gguf
+    /// 文件名——用户拖任意名模型进来，页面显示真名而非 config 字面量。
+    pub fn resolve_rerank_model(&self) -> Option<PathBuf> {
         let cfg = &self.engine.config.sentence.rerank;
         if !cfg.enabled {
             return None;

@@ -1744,6 +1744,55 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 })),
             }
         }
+        ("GET", "/api/sentence/models") => {
+            // 【模型真名 2026-11-01】设置页「整句模型」页显示实际装载的
+            // 模型文件名。装载口径：config 路径存在→首选；否则「模型\」
+            // 下全部 .bin 按 mtime 新→旧逐个试读（sentence_load_plan 同款）。
+            // 重排 resolve_rerank_model 已含 GGUF 魔数校验，直接给 picked。
+            // 旧版前端只显示 config 字面量（固定默认名），用户拖任意名
+            // 模型进来页面显示错名字。
+            let cfg_path = hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir,
+                &host.engine.config.sentence.ngram_path,
+            );
+            let model_dir = hufu_engine::Engine::resolve_data_sub(&host.data_dir, "模型");
+            let mut ngram_candidates: Vec<String> = Vec::new();
+            if cfg_path.exists() {
+                ngram_candidates.push(cfg_path.to_string_lossy().into_owned());
+            }
+            let mut bins: Vec<(std::time::SystemTime, std::path::PathBuf)> =
+                std::fs::read_dir(&model_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .map(|x| x.eq_ignore_ascii_case("bin"))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|p| {
+                        let mt = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                        Some((mt, p))
+                    })
+                    .collect();
+            bins.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧，与装载计划同序
+            for (_, p) in bins {
+                let s = p.to_string_lossy().into_owned();
+                if !ngram_candidates.contains(&s) {
+                    ngram_candidates.push(s);
+                }
+            }
+            Response::json(&serde_json::json!({
+                "model_dir": model_dir.to_string_lossy(),
+                "ngram_candidates": ngram_candidates,
+                // 首个候选 = 装载端将试读的第一个（实际生效优先级）
+                "ngram_active": ngram_candidates.first().cloned(),
+                "rerank_model": host
+                    .resolve_rerank_model()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            }))
+        }
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
             // 【2026-09-06】码表目录一级布局：优先安装根\码表，回退 数据\码表

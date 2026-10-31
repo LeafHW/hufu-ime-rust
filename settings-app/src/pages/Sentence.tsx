@@ -380,6 +380,28 @@ export function SentencePage({
   const [testError, setTestError] = useState('');
   const [lastTest, setLastTest] = useState<{ raw: string; n: number } | null>(null);
   const [booted, setBooted] = useState(false);
+  /* 【模型真名 2026-11-01】server /api/sentence/models 真值：实际装载
+     候选（config 命中或「模型\」探测，顺序=装载优先级）+ 重排实际
+     picked gguf（含魔数校验）。页面显示用户真实文件名，不再显示
+     config 固定默认字面量。 */
+  const [models, setModels] = useState<{
+    model_dir: string;
+    ngram_candidates: string[];
+    ngram_active: string | null;
+    rerank_model: string | null;
+  }>({ model_dir: '', ngram_candidates: [], ngram_active: null, rerank_model: null });
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/sentence/models')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: typeof models | null) => {
+        if (alive && d) setModels(d);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [sentence.ngram_path]);
 
   const sentenceRef = useRef(sentence);
   const dirtyRef = useRef(false);
@@ -801,7 +823,17 @@ export function SentencePage({
 
             <div className="sentence-path">
               <span className="sentence-path-label">模型路径</span>
-              <code title={sentence.ngram_path}>{sentence.ngram_path || '（未配置）'}</code>
+              <code title={models.ngram_active || sentence.ngram_path}>
+                {models.ngram_active
+                  ? models.ngram_active.split(/[\\/]/).pop()
+                  : sentence.ngram_path || '（未配置）'}
+              </code>
+              {models.ngram_active && models.ngram_candidates.length > 1 ? (
+                <span className="sentence-path-note">
+                  （多个候选按新→旧试读，当前首选；另有{' '}
+                  {models.ngram_candidates.length - 1} 个）
+                </span>
+              ) : null}
               <button type="button" className="btn outline sm" onClick={openModelDir}>
                 <Icon name="folder" />
                 打开目录
@@ -810,15 +842,22 @@ export function SentencePage({
                 复制
               </button>
             </div>
-            {modelPaths.length > 0 ? (
+            {models.ngram_candidates.length > 0 ? (
               <div className="sentence-resolved">
-                解析候选：
-                {modelPaths.map((p) => (
-                  <code key={p}>{p}</code>
+                实际装载候选（新→旧）：
+                {models.ngram_candidates.map((p, i) => (
+                  <code key={p} className={i === 0 ? 'is-active' : undefined}>
+                    {i === 0 ? '✓ ' : ''}
+                    {p}
+                  </code>
                 ))}
-                <span>（server 按安装根优先、数据目录回退解析）</span>
+                <span>（文件名不限：放入「模型」目录的 .bin 自动按新→旧试读装载）</span>
               </div>
-            ) : null}
+            ) : (
+              <div className="sentence-resolved">
+                模型目录未找到 .bin 文件——把整句模型（任意文件名的 .bin）放入模型目录即自动装载。
+              </div>
+            )}
 
             {!installed ? (
               <div className="sentence-guide">
@@ -1099,7 +1138,11 @@ export function SentencePage({
                 </div>
                 <div className="sentence-rerank-path">
                   <span>重排模型</span>
-                  <code>{sentence.rerank.model_path || '模型/sentence-qwen-*.gguf（自动探测）'}</code>
+                  <code title={models.rerank_model || undefined}>
+                    {models.rerank_model
+                      ? models.rerank_model.split(/[\\/]/).pop()
+                      : '未找到 .gguf（放入「模型」目录任意名 .gguf 即自动装载）'}
+                  </code>
                 </div>
               </div>
             </section>
