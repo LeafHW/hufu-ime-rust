@@ -110,6 +110,14 @@ static SHARED: OnceLock<Arc<Mutex<Host>>> = OnceLock::new();
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// 内存真源（spawn 时从 数据\同步.json 载入；save/persist 同步写回）
 static SETTINGS: Mutex<Option<SyncSettings>> = Mutex::new(None);
+/// schemes_overview 的云端清单缓存 (last_fetch_secs, names)——60s TTL，
+/// 写操作（save/select/删云端/退出）调 invalidate_schemes_cache 主动失效。
+static SCHEMES_CLOUD_CACHE: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
+
+pub(crate) fn invalidate_schemes_cache() {
+    let mut c = SCHEMES_CLOUD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *c = (0, Vec::new());
+}
 static PHASE: Mutex<&'static str> = Mutex::new("idle");
 
 /// 同步进度（供 UI 进度条；文件级，字节级由各传输函数累计）。
@@ -290,15 +298,27 @@ pub fn schemes_overview() -> Value {
             }
         }
     }
-    // 云端清单（只读；未配置/网络失败=空数组）
+    // 云端清单（只读；未配置/网络失败=空数组）。
+    // 【TTL 缓存 2026-11-01】设置页 10s 轮询 bootstrap 每轮都调本函数，
+    // 不缓存=设置页开着每分钟 6 次真实 WebDAV manifest 拉取（坚果云按
+    // 频率限流风险）。清单 60s 内视为新鲜；保存/勾选/删云端时主动失效。
+    let creds_ok = !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty();
     let mut cloud_names: Vec<String> = Vec::new();
-    if !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty() {
-        let agent = build_agent();
-        if let Ok(Some(mf)) = fetch_manifest(&agent, &s) {
-            if let Some(m) = mf.get("schemes").and_then(|v| v.as_object()) {
-                cloud_names = m.keys().cloned().collect();
+    if creds_ok {
+        let mut cache = SCHEMES_CLOUD_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = now_secs();
+        if now.saturating_sub(cache.0) >= 60 {
+            let agent = build_agent();
+            if let Ok(Some(mf)) = fetch_manifest(&agent, &s) {
+                if let Some(m) = mf.get("schemes").and_then(|v| v.as_object()) {
+                    cache.1 = m.keys().cloned().collect();
+                }
             }
+            cache.0 = now;
         }
+        cloud_names = cache.1.clone();
     }
     // 【云端标记 2026-10-30 用户需求】本地+云端都有的方案也要标 ☁——
     // 勾选列表按云端清单逐项补 cloud 标记，不只标「本机没有的」。
@@ -329,6 +349,7 @@ pub fn save_selection(selected: &[String]) -> Result<(), String> {
     }
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
     drop(guard);
+    invalidate_schemes_cache();
     notify("勾选");
     Ok(())
 }
@@ -368,7 +389,19 @@ pub fn save_settings(
     st.url = if url.trim().is_empty() {
         DEFAULT_URL.into()
     } else {
-        url.trim().to_string()
+        // 【URL 校验 2026-11-01】Basic 凭据会被同步线程周期性发往该地址，
+        // 至少要求 http(s):// 前缀 + 非空主机名，防手滑存进非法地址。
+        let u = url.trim();
+        let host = u
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', '?', ':', '#']).next())
+            .unwrap_or("");
+        let scheme_ok = u.starts_with("https://") || u.starts_with("http://");
+        if !scheme_ok || host.is_empty() {
+            return Err("服务器地址必须以 http:// 或 https:// 开头且包含主机名".into());
+        }
+        u.to_string()
     };
     st.user = user.trim().to_string();
     if pass != KEEP {
@@ -393,6 +426,7 @@ pub fn save_settings(
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
     let ready = !st.url.is_empty() && !st.user.is_empty() && !st.pass.is_empty();
     drop(guard);
+    invalidate_schemes_cache();
     if ready {
         notify("设置");
     }
@@ -500,6 +534,7 @@ pub fn delete_cloud(scheme: Option<&str>) -> Result<String, String> {
                     prune_manifest(&mut mf, &s);
                     bump_rev(&mut mf);
                     put_manifest(&agent, &s, &mf, None)?;
+                    invalidate_schemes_cache();
                     Ok(format!("云端方案「{name}」已删除（本机文件未动）"))
                 }
                 _ => Ok(format!("云端没有方案「{name}」的同步数据")),
@@ -539,6 +574,7 @@ pub fn delete_cloud(scheme: Option<&str>) -> Result<String, String> {
             st.last_sync = 0;
             st.last_error = None;
             persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+            invalidate_schemes_cache();
             Ok("云端同步数据已删除，同步已停止（本机文件未动）".into())
         }
     }
@@ -553,7 +589,9 @@ pub fn logout() -> Result<String, String> {
     st.enabled = false;
     st.local_snap.clear();
     st.last_config = None;
+    st.last_error = None;
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+    invalidate_schemes_cache();
     Ok("已退出同步帐户（云端数据保留；本机文件未动）".into())
 }
 
@@ -736,6 +774,7 @@ fn run_sync(reason: &'static str) {
     }
     let _ = persist(st);
     drop(guard);
+    invalidate_schemes_cache();
     set_phase("idle");
 }
 

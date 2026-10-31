@@ -53,7 +53,8 @@ function Ok([string]$msg)   { Write-Host "OK $msg" -ForegroundColor Green }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { Fail("版本号格式应为 x.y.z，收到：$Version") }
 
 $needFromPkg = @(
-    'hufu-server.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-tsf-smoke.exe',
+    'hufu-server.exe','hufu-tsf-smoke.exe','hufu-settings.exe','WebView2Loader.dll',
+    'hufu_tsf.dll','hufu_tsf32.dll',
     'TigerClaw.Sentence.Native.dll','install.ps1','uninstall.ps1','设置.bat',
     '更新日志.txt','图标.ico'
 )

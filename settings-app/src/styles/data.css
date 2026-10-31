@@ -1,0 +1,447 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   数据与备份页（src/pages/Data.tsx）——只在本页导入，类名统一 dt- 前缀，
+   复用 app.css 的 tokens 与 .card / .btn / .badge / .chip / .dot 等基础件。
+   ────────────────────────────────────────────────────────────────────────── */
+
+.dt-layout {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr;
+  gap: 14px;
+  height: calc(100% - 66px);
+  min-height: 0;
+}
+
+/* ── 左：导出 / 导入 ── */
+.dt-main {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  display: flex;
+  flex-direction: column;
+}
+.dt-main::-webkit-scrollbar {
+  display: none;
+}
+.dt-io-card {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.dt-sec {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 15px 18px;
+}
+.dt-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dt-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--gold2);
+  background: var(--gold-soft);
+  border: 1px solid rgba(231, 183, 92, 0.24);
+}
+.dt-ico .icon {
+  width: 16px;
+  height: 16px;
+}
+.dt-sec-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dt-sec-title b {
+  font-size:14.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.dt-sec-title span {
+  font-family: Consolas, monospace;
+  font-size:13px;
+  color: var(--text3);
+}
+.dt-sec-head .badge {
+  margin-left: auto;
+  flex: none;
+}
+.dt-desc {
+  margin: 0;
+  font-size:13px;
+  line-height: 1.75;
+  color: var(--text2);
+}
+.dt-desc b {
+  color: var(--text);
+  font-weight: 600;
+}
+.dt-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.dt-meta {
+  font-size:13px;
+  color: var(--text3);
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.dt-file {
+  display: none;
+}
+.dt-sep {
+  flex: none;
+  height: 1px;
+  background: var(--line);
+  margin: 0 18px;
+}
+
+/* 待确认摘要 */
+.dt-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(231, 183, 92, 0.26);
+  background: var(--gold-soft);
+}
+body.light .dt-pending {
+  border-color: rgba(168, 116, 26, 0.28);
+}
+.dt-pending-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size:13px;
+}
+.dt-pending-head b {
+  font-weight: 600;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dt-pending-head span {
+  font-size:13px;
+  color: var(--text3);
+}
+.dt-pending-head .badge {
+  margin-left: auto;
+  height: 18px;
+  font-size:11px;
+  flex: none;
+}
+.dt-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.dt-chips .chip {
+  height: 22px;
+  font-size:13px;
+  padding: 0 8px;
+}
+.dt-warn {
+  font-size:13px;
+  line-height: 1.65;
+  color: var(--text2);
+}
+
+/* 导入成功 */
+.dt-done {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(99, 192, 141, 0.3);
+  background: rgba(99, 192, 141, 0.08);
+}
+.dt-done-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size:13px;
+  min-width: 0;
+}
+.dt-done-head b {
+  color: var(--green);
+  font-weight: 600;
+}
+body.light .dt-done-head b {
+  color: #2f7d57;
+}
+.dt-done-head span:last-child {
+  font-size:13px;
+  color: var(--text3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dt-done-body {
+  font-size:13px;
+  line-height: 1.65;
+  color: var(--text2);
+}
+
+/* 底部提示 + 状态线 */
+.dt-note {
+  margin: 14px 18px 0;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 11px 12px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 2px solid rgba(231, 183, 92, 0.55);
+  font-size:13px;
+  line-height: 1.65;
+  color: var(--text3);
+}
+.dt-note .icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-top: 1px;
+  color: var(--gold2);
+}
+.dt-status {
+  flex: none;
+  margin-top: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 18px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  font-size:13px;
+  line-height: 1.6;
+  color: var(--text3);
+  border-radius: 0 0 12px 12px;
+}
+.dt-status .dot {
+  margin-top: 4px;
+}
+.dt-status.ok {
+  color: var(--green);
+  background: rgba(99, 192, 141, 0.06);
+}
+.dt-status.err {
+  color: #f0a296;
+  background: rgba(224, 106, 90, 0.08);
+}
+body.light .dt-status.ok {
+  color: var(--green);
+}
+body.light .dt-status.err {
+  color: var(--red);
+}
+
+/* ── 右：本机目录 + 导出边界 ── */
+.dt-side {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.dt-side::-webkit-scrollbar {
+  display: none;
+}
+.dt-dirs {
+  flex: none;
+  padding: 15px 16px 12px;
+  display: flex;
+  flex-direction: column;
+}
+.dt-dir-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.dt-dir {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 0;
+}
+.dt-dir + .dt-dir {
+  border-top: 1px solid var(--line);
+}
+.dt-dir-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--gold2);
+  background: var(--surface2);
+  border: 1px solid var(--line);
+}
+.dt-dir-ico .icon {
+  width: 14px;
+  height: 14px;
+}
+.dt-dir-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dt-dir-name {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size:13.5px;
+  font-weight: 550;
+}
+.dt-dir-name span {
+  font-size:11px;
+  font-weight: 400;
+  color: var(--text3);
+}
+.dt-path {
+  font-family: Consolas, monospace;
+  font-size:13px;
+  line-height: 1.5;
+  color: var(--text3);
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.dt-dir > .btn.sm {
+  height: 25px;
+  padding: 0 8px;
+  font-size:13px;
+  flex: none;
+  margin-top: 1px;
+}
+.dt-dir-acts {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.dt-dir-acts .btn.sm {
+  height: 25px;
+  padding: 0 8px;
+  font-size:13px;
+}
+.dt-dir-acts .btn.sm .icon {
+  width: 12px;
+  height: 12px;
+}
+.dt-dir-note {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  padding: 10px 2px 0;
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  font-size:11px;
+  line-height: 1.65;
+  color: var(--text3);
+}
+.dt-dir-note .icon {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  margin-top: 1px;
+  color: var(--gold2);
+}
+.dt-dir-note code,
+.dt-exclude code {
+  font-family: Consolas, monospace;
+  font-size:11px;
+  color: var(--text2);
+}
+.dt-exclude {
+  flex: none;
+  margin-top: auto;
+  padding: 14px 16px;
+}
+.dt-exclude-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size:13px;
+  font-weight: 550;
+  color: var(--text2);
+  margin-bottom: 8px;
+}
+.dt-exclude-h .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--gold2);
+}
+.dt-exclude-h b {
+  color: var(--gold2);
+  margin-left: 2px;
+}
+.dt-exclude ul {
+  margin: 0;
+  padding-left: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dt-exclude li {
+  font-size:13px;
+  line-height: 1.7;
+  color: var(--text3);
+}
+
+/* ── 窄窗适配 ── */
+@media (max-width: 980px) {
+  .dt-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+  .dt-io-card {
+    min-height: 0;
+  }
+  .dt-side {
+    overflow: visible;
+    margin-bottom: 6px;
+  }
+  .dt-note {
+    margin-top: 12px;
+  }
+}
+
+@media (max-height: 760px) {
+  .dt-layout {
+    height: auto;
+    min-height: calc(100% - 60px);
+  }
+  .dt-sec {
+    padding: 13px 16px;
+  }
+}

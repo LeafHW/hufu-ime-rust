@@ -64,3 +64,44 @@ pub fn create_url_shortcut(lnk_path: &Path, url: &str, icon: &Path) -> bool {
         ok
     }
 }
+
+/// 新版设置壳：exe 型快捷方式（TargetPath=hufu-settings.exe，Arguments=--url /next）。
+pub fn create_app_shortcut(
+    lnk_path: &Path,
+    target: &Path,
+    args: &str,
+    workdir: &Path,
+    icon: &Path,
+) -> bool {
+    unsafe {
+        let mut co_owned = false;
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr == RPC_E_CHANGED_MODE {
+        } else if hr.is_ok() {
+            co_owned = true;
+        } else {
+            return false;
+        }
+        let ok = (|| -> windows::core::Result<()> {
+            let link: IShellLinkW =
+                CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)?;
+            let target_w = wide_path(target);
+            link.SetPath(PCWSTR::from_raw(target_w.as_ptr()))?;
+            let args_w = wide(args);
+            link.SetArguments(PCWSTR::from_raw(args_w.as_ptr()))?;
+            let wd_w = wide_path(workdir);
+            link.SetWorkingDirectory(PCWSTR::from_raw(wd_w.as_ptr()))?;
+            let icon_w = wide_path(icon);
+            link.SetIconLocation(PCWSTR::from_raw(icon_w.as_ptr()), 0)?;
+            let pf = link.cast::<IPersistFile>()?;
+            let lnk_w = wide_path(lnk_path);
+            pf.Save(PCWSTR::from_raw(lnk_w.as_ptr()), false)?;
+            Ok(())
+        })()
+        .is_ok();
+        if co_owned {
+            CoUninitialize();
+        }
+        ok
+    }
+}

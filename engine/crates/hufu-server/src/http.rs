@@ -53,6 +53,8 @@ impl Response {
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        // 【SY-02 2026-11-01】云端删除超时返回 202（Accepted，仍在后台执行）
+        202 => "Accepted",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",

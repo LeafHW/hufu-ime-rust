@@ -1,0 +1,24 @@
+[package]
+name = "hufu-settings"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "HuFu settings window host (Win32 + WebView2, no MSVC / no WinRT)"
+
+[[bin]]
+name = "hufu-settings"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally empty: the host talks to Win32 / COM through hand-written
+# `extern "system"` declarations, so no `windows` crate (and no WinRT import
+# libraries) is pulled in. This is the whole point of the spike.
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

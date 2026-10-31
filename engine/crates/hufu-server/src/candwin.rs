@@ -397,6 +397,22 @@ fn composite_text(
 /// 【DPI 修复 2026-09-11】旧实现把 96-DPI 逻辑像素当物理像素——
 /// 150%/200% 屏候选窗整体偏小、与 candwin2 观感不一致。全部布局
 /// 值统一乘 scale（与 candwin2 的位图×scale 同语义）。
+pub fn render_preview(
+    skin: &serde_json::Value,
+    items: Vec<(String, String)>,
+    raw: &str,
+    selected: usize,
+    scale: f32,
+) -> (i32, i32, Vec<u8>, i32) {
+    let frame = CandFrame {
+        items,
+        raw: raw.to_string(),
+        selected,
+        skin: skin.clone(),
+    };
+    render_frame(&frame, scale)
+}
+
 fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
     let skin = &f.skin;
     let s = scale.max(0.5).min(4.0);
@@ -1295,7 +1311,7 @@ mod shadow_gate_tests {
         let skin = serde_json::json!({
             "skin": { "layout": { "shadow_radius": 0.0 } }
         });
-        let (w, _h, _px, m) = render_frame(&frame_with(skin), 1.0);
+        let (_w, _h, _px, m) = render_frame(&frame_with(skin), 1.0);
         assert_eq!(m, 0, "radius=0 时必须零阴影边距");
     }
 }

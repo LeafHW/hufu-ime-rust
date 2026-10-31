@@ -1,0 +1,382 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   方案页（src/pages/Schemes.tsx）——只在本页导入，类名统一 sch- 前缀，
+   视觉复用 app.css 的 tokens（--surface / --line / --gold-soft / .card / .btn…）。
+   ────────────────────────────────────────────────────────────────────────── */
+
+.sch-layout {
+  display: grid;
+  grid-template-columns: 1.55fr 1fr;
+  gap: 14px;
+  height: calc(100% - 66px);
+  min-height: 0;
+}
+
+/* ── 左：方案列表 ── */
+.sch-list-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+  min-height: 0;
+}
+.sch-head {
+  height: 46px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+.sch-head .search {
+  margin-bottom: 0;
+  flex: 1;
+  max-width: 240px;
+}
+.sch-count {
+  margin-left: auto;
+  font-size:13px;
+  color: var(--text3);
+  white-space: nowrap;
+}
+.sch-count b {
+  color: var(--text2);
+  font-weight: 600;
+}
+.sch-rows {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding: 4px 6px;
+}
+.sch-rows::-webkit-scrollbar {
+  display: none;
+}
+.sch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  margin-bottom: 2px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.sch-row:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+body.light .sch-row:hover {
+  background: rgba(0, 0, 0, 0.035);
+}
+.sch-row.on {
+  background: linear-gradient(90deg, var(--gold-soft), transparent 72%);
+  border-color: rgba(231, 183, 92, 0.24);
+}
+body.light .sch-row.on {
+  border-color: rgba(168, 116, 26, 0.26);
+}
+.sch-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--gold2);
+  background: var(--surface2);
+  border: 1px solid var(--line);
+}
+.sch-row.on .sch-mark {
+  background: rgba(231, 183, 92, 0.1);
+  border-color: rgba(231, 183, 92, 0.34);
+}
+.sch-mark .icon {
+  width: 15px;
+  height: 15px;
+}
+.sch-info {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sch-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size:14.5px;
+  font-weight: 550;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sch-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sch-name .badge {
+  flex: none;
+  height: 18px;
+  font-size:11px;
+  padding: 0 6px;
+}
+.sch-sub {
+  font-size:13px;
+  color: var(--text3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sch-ctl {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+}
+.sch-ctl .btn.sm {
+  height: 26px;
+  padding: 0 8px;
+  font-size:13px;
+}
+.sch-ctl .btn.sm .icon {
+  width: 12px;
+  height: 12px;
+}
+.sch-ctl .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+.sch-ctl .icon-btn .icon {
+  width: 14px;
+  height: 14px;
+}
+.sch-open {
+  color: var(--text2);
+}
+.sch-open:hover {
+  color: var(--gold2);
+}
+.sch-select {
+  height: 26px;
+  border-radius: 7px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text2);
+  font: 10.5px/1 inherit;
+  padding: 0 4px;
+  outline: none;
+  max-width: 108px;
+  cursor: pointer;
+}
+.sch-select:focus {
+  border-color: rgba(231, 183, 92, 0.5);
+}
+.sch-select:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.sch-select.block {
+  max-width: none;
+  width: 100%;
+  height: 30px;
+  font-size:13.5px;
+  padding: 0 6px;
+}
+.sch-empty {
+  padding: 26px 18px;
+  text-align: center;
+  font-size:13px;
+  line-height: 1.8;
+  color: var(--text3);
+}
+
+/* 列表底部状态线：最近一次真实调用的结果（错误红、成功绿、信息灰） */
+.sch-status {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border-top: 1px solid var(--line);
+  font-size:13px;
+  color: var(--text2);
+  min-width: 0;
+}
+.sch-status.ok {
+  color: var(--green);
+  background: rgba(99, 192, 141, 0.07);
+}
+.sch-status.err {
+  color: #f0a296;
+  background: rgba(224, 106, 90, 0.08);
+}
+.sch-status.info {
+  color: var(--text2);
+  background: rgba(231, 183, 92, 0.05);
+}
+body.light .sch-status.ok {
+  color: var(--green);
+}
+body.light .sch-status.err {
+  color: var(--red);
+}
+.sch-status .sch-status-text {
+  flex: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sch-status .sch-status-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, monospace;
+  font-size:13px;
+  color: var(--text3);
+}
+.sch-foot {
+  flex: none;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 13px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 0 0 12px 12px;
+  font-size:13px;
+  color: var(--text3);
+}
+.sch-foot b {
+  color: var(--text2);
+  font-weight: 550;
+}
+.sch-foot-note {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 右：反查 / 拆分 + 说明 ── */
+.sch-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+.sch-cfg {
+  flex: none;
+  padding: 15px 16px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.sch-cfg .card-head {
+  margin-bottom: 1px;
+}
+.sch-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.sch-field .label {
+  font-size:13px;
+  color: var(--text3);
+}
+.sch-duo {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr;
+  gap: 10px;
+}
+.sch-input {
+  height: 30px;
+  text-align: center;
+  font-size:14.5px;
+}
+.sch-cfg-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 1px;
+}
+.sch-note {
+  font-size:13px;
+  line-height: 1.7;
+  color: var(--text3);
+}
+.sch-note code,
+.sch-tip code {
+  font-family: Consolas, monospace;
+  font-size:11px;
+  color: var(--text2);
+}
+.sch-tips {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sch-tips::-webkit-scrollbar {
+  display: none;
+}
+.sch-tip {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size:13px;
+  line-height: 1.65;
+  color: var(--text3);
+}
+.sch-tip .icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-top: 1px;
+  color: var(--gold2);
+}
+
+/* ── 窄窗适配 ── */
+@media (max-width: 980px) {
+  .sch-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+  .sch-list-card {
+    min-height: 360px;
+  }
+  .sch-side {
+    margin-bottom: 6px;
+  }
+  .sch-ctl .btn.sm {
+    padding: 0 6px;
+  }
+  .sch-select {
+    max-width: 92px;
+  }
+}
+
+@media (max-height: 760px) {
+  .sch-layout {
+    height: auto;
+    min-height: calc(100% - 60px);
+  }
+  .sch-rows {
+    max-height: 320px;
+  }
+}

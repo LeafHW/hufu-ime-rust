@@ -456,8 +456,30 @@ static OPEN_SETTINGS: std::sync::OnceLock<Sender<()>> = std::sync::OnceLock::new
 /// OPEN_SETTINGS（Ctrl+Alt+H/托盘——存在则聚焦、不存在才开）分开。
 static FOCUS_SETTINGS: std::sync::OnceLock<Sender<()>> = std::sync::OnceLock::new();
 
-/// 外部（管道 op "settings"：语言栏「中」按钮点击）请求打开设置页
+/// 外部（管道 op "settings"：语言栏「中」按钮点击）请求打开设置页。
+/// 直接在此线程检查已开窗口并拉起新壳，不再依赖主循环的 mpsc 消费线程；
+/// 新壳缺失时才回落到旧的 open 通道（Edge --app）。
 pub fn open_settings() {
+    if unsafe { crate::sys_win::raise_settings_window() } {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let shell = dir.join("hufu-settings.exe");
+            if shell.is_file() {
+                let url = format!(
+                    "http://127.0.0.1:{}/next?shell=1",
+                    crate::platform::http_port()
+                );
+                let mut c = std::process::Command::new(shell);
+                c.arg("--url").arg(url);
+                match c.spawn() {
+                    Ok(_) => return,
+                    Err(_) => {}
+                }
+            }
+        }
+    }
     if let Some(tx) = OPEN_SETTINGS.get() {
         let _ = tx.send(());
     }
@@ -517,25 +539,17 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
             WM_HOTKEY => {
                 // Ctrl+Alt+H → 设置页（存在则聚焦，不存在才开新窗）
                 if wparam == 0x4846 {
-                    if let Some(tx) = OPEN_SETTINGS.get() {
-                        let _ = tx.send(());
-                    }
+                    open_settings();
                 }
                 // Ctrl+Shift+H → 只聚焦已开的设置窗（不开新窗）
                 if wparam == 0x4847 {
-                    if let Some(tx) = FOCUS_SETTINGS.get() {
-                        let _ = tx.send(());
-                    }
+                    crate::sys_win::raise_settings_window();
                 }
                 0
             }
             WM_APP => {
                 match (lparam & 0xFFFF) as u32 {
-                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-                        if let Some(tx) = OPEN_SETTINGS.get() {
-                            let _ = tx.send(());
-                        }
-                    }
+                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => open_settings(),
                     WM_RBUTTONUP => {
                         let hmenu = CreatePopupMenu();
                         // 方案子菜单（当前方案打勾，点击即切）
@@ -585,9 +599,7 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         {
                             switch_schema(&submenu_names[(cmd - IDM_SCHEMA_BASE) as usize]);
                         } else if cmd == IDM_SETTINGS as i32 {
-                            if let Some(tx) = OPEN_SETTINGS.get() {
-                                let _ = tx.send(());
-                            }
+                            open_settings();
                         } else if cmd == IDM_QUIT as i32 {
                             ASK_QUIT.store(true, Ordering::SeqCst);
                             PostQuitMessage(0);

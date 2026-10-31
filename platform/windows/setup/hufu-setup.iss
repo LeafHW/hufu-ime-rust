@@ -1,4 +1,4 @@
-; ============================================================================
+﻿; ============================================================================
 ; HuFu 虎符输入法 · 单 exe 安装包（Inno Setup 6）
 ; ----------------------------------------------------------------------------
 ; 架构铁律（与 install.ps1 双阶段一一对齐，勿"标准化"改动）：
@@ -104,6 +104,8 @@ Type: files; Name: "{app}\hufu-postboot.ps1"
 [Files]
 ; ---------- 程序文件（进卸载日志：卸载时删除） ----------
 Source: "staging\hufu-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "staging\hufu-settings.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "staging\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-tsf-smoke.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -301,6 +303,8 @@ begin
 end;
 
 // ============================ 事件：初始化 ============================
+
+
 function InitializeSetup(): Boolean;
 var
   M: Longword;

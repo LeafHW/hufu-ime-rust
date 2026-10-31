@@ -499,7 +499,9 @@ try {
     $sm = [Environment]::GetFolderPath('Programs')
     $ws = New-Object -ComObject WScript.Shell
     $lnk = $ws.CreateShortcut((Join-Path $sm 'HuFu 虎符输入法设置.lnk'))
-    $lnk.TargetPath = 'http://127.0.0.1:4390/'
+    $lnk.TargetPath = (Join-Path $inst 'hufu-settings.exe')
+    $lnk.Arguments = '--url "http://127.0.0.1:4390/next?shell=1"'
+    $lnk.WorkingDirectory = $inst
     $lnk.IconLocation = $icon
     $lnk.Save()
     Write-Host 'OK 开机自启 + 开始菜单快捷方式「HuFu 虎符输入法设置」'

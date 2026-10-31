@@ -1,0 +1,3 @@
+node_modules/
+# dist 需要提交：hufu-server 的 build.rs 会把它嵌进 exe 供 /next 使用。
+*.tsbuildinfo

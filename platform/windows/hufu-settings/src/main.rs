@@ -1,0 +1,1351 @@
+//! Minimal WebView2 window host for x86_64-pc-windows-gnu.
+//!
+//! Design constraints (proven by this spike):
+//!   * no MSVC toolchain / no import libraries for WebView2Loader
+//!   * no `windows` crate >= 0.61, no WinRT (`api-ms-win-core-winrt-*`)
+//!   * WebView2Loader.dll is loaded with LoadLibraryW + GetProcAddress
+//!   * all COM interfaces are hand-written #[repr(C)] vtables, accessed by
+//!     vtable slot index (verified against WebView2.h 1.0.4314.35 / the
+//!     webview2-com-sys 0.38.2 bindings).
+//!
+//! The host creates a top-level window titled "虎符设置", creates a WebView2
+//! environment + controller for it, navigates to the configured URL, logs the
+//! navigation result (plus a DOM probe via ExecuteScript) to a log file, and
+//! exits cleanly on WM_CLOSE.
+
+#![windows_subsystem = "windows"]
+#![allow(non_snake_case, non_camel_case_types)]
+
+mod win32;
+
+use std::ffi::c_void;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
+
+use win32::*;
+
+#[repr(C)]
+struct MONITORINFO {
+    cbSize: u32,
+    rcMonitor: RECT,
+    rcWork: RECT,
+    dwFlags: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn MonitorFromWindow(hwnd: HWND, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MONITORINFO) -> i32;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateSolidBrush(color: u32) -> isize;
+}
+
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// COM basics
+// ---------------------------------------------------------------------------
+
+type HRESULT = i32;
+
+const S_OK: HRESULT = 0;
+const E_NOINTERFACE: HRESULT = 0x8000_4002u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
+
+/// Win32 GUID memory layout (little-endian data1/2/3, raw data4).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GUID {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+const IID_IUNKNOWN: GUID = GUID {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+
+// 4e8a3389-c9d8-4bd2-b6b5-124fee6cc14d
+const IID_ENV_HANDLER: GUID = GUID {
+    data1: 0x4e8a_3389,
+    data2: 0xc9d8,
+    data3: 0x4bd2,
+    data4: [0xb6, 0xb5, 0x12, 0x4f, 0xee, 0x6c, 0xc1, 0x4d],
+};
+
+// 6c4819f3-c9b7-4260-8127-c9f5bde7f68c
+const IID_CONTROLLER_HANDLER: GUID = GUID {
+    data1: 0x6c48_19f3,
+    data2: 0xc9b7,
+    data3: 0x4260,
+    data4: [0x81, 0x27, 0xc9, 0xf5, 0xbd, 0xe7, 0xf6, 0x8c],
+};
+
+// d33a35bf-1c49-4f98-93ab-006e0533fe1c
+const IID_NAV_HANDLER: GUID = GUID {
+    data1: 0xd33a_35bf,
+    data2: 0x1c49,
+    data3: 0x4f98,
+    data4: [0x93, 0xab, 0x00, 0x6e, 0x05, 0x33, 0xfe, 0x1c],
+};
+
+// 49511172-cc67-4bca-9923-137112f4c4cc
+const IID_SCRIPT_HANDLER: GUID = GUID {
+    data1: 0x4951_1172,
+    data2: 0xcc67,
+    data3: 0x4bca,
+    data4: [0x99, 0x23, 0x13, 0x71, 0x12, 0xf4, 0xc4, 0xcc],
+};
+
+// 57213f19-00e6-49fa-8e07-898ea01ecbd2
+const IID_MSG_HANDLER: GUID = GUID {
+    data1: 0x5721_3f19,
+    data2: 0x00e6,
+    data3: 0x49fa,
+    data4: [0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2],
+};
+
+/// Read function pointer `index` out of the object's vtable.
+unsafe fn com_fn<T>(this: *mut c_void, index: usize) -> T {
+    let vtbl = *(this as *mut *const *const c_void);
+    let fp = *vtbl.add(index);
+    std::mem::transmute_copy(&fp)
+}
+
+unsafe fn com_add_ref(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = com_fn(this, 1);
+    f(this)
+}
+
+#[allow(dead_code)]
+unsafe fn com_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = com_fn(this, 2);
+    f(this)
+}
+
+// ICoreWebView2Environment: IUnknown(0..2), CreateCoreWebView2Controller(3),
+// CreateWebResourceResponse(4), get_BrowserVersionString(5).
+unsafe fn env_create_controller(
+    env: *mut c_void,
+    hwnd: HWND,
+    handler: *mut c_void,
+) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, HWND, *mut c_void) -> HRESULT = com_fn(env, 3);
+    f(env, hwnd, handler)
+}
+
+unsafe fn env_browser_version(env: *mut c_void) -> Option<String> {
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT = com_fn(env, 5);
+    let mut p: *mut u16 = null_mut();
+    let hr = f(env, &mut p);
+    if hr >= 0 && !p.is_null() {
+        let s = from_wide_ptr(p);
+        CoTaskMemFree(p as *mut c_void);
+        Some(s)
+    } else {
+        None
+    }
+}
+
+// ICoreWebView2Controller vtable order (verified):
+//   3 get_IsVisible, 4 put_IsVisible, 5 get_Bounds, 6 put_Bounds,
+//   7/8 ZoomFactor, 9/10 add/remove ZoomFactorChanged, 11 SetBoundsAndZoomFactor,
+//   12 MoveFocus, 13/14 MoveFocusRequested, 15/16 GotFocus, 17/18 LostFocus,
+//   19/20 AcceleratorKeyPressed, 21/22 ParentWindow,
+//   23 NotifyParentWindowPositionChanged, 24 Close, 25 get_CoreWebView2
+unsafe fn controller_put_is_visible(controller: *mut c_void, visible: i32) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT = com_fn(controller, 4);
+    f(controller, visible)
+}
+
+unsafe fn controller_put_bounds(controller: *mut c_void, bounds: RECT) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, RECT) -> HRESULT = com_fn(controller, 6);
+    f(controller, bounds)
+}
+
+unsafe fn controller_close(controller: *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = com_fn(controller, 24);
+    f(controller)
+}
+
+unsafe fn controller_get_core_webview2(
+    controller: *mut c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+        com_fn(controller, 25);
+    f(controller, out)
+}
+
+// ICoreWebView2 vtable order (verified against WebView2.h 1.0.4314.35):
+//   3 Settings, 4 Source, 5 Navigate, 6 NavigateToString,
+//   7/8 NavigationStarting, 9/10 ContentLoading, 11/12 SourceChanged,
+//   13/14 HistoryChanged, 15/16 NavigationCompleted, ...
+//   27/28 Add/RemoveScriptToExecuteOnDocumentCreated, 29 ExecuteScript
+unsafe fn wv_navigate(webview: *mut c_void, uri: *const u16) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT = com_fn(webview, 5);
+    f(webview, uri)
+}
+
+/// [P0-2a 2026-11-01] NavigateToString（vtable 6）：导航失败/启动超时兜底
+/// 错误页（内嵌 HTML，不依赖 server 在线）。
+unsafe fn wv_navigate_to_string(webview: *mut c_void, html: *const u16) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT = com_fn(webview, 6);
+    f(webview, html)
+}
+
+unsafe fn wv_add_navigation_completed(
+    webview: *mut c_void,
+    handler: *mut c_void,
+    token: *mut i64,
+) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i64) -> HRESULT =
+        com_fn(webview, 15);
+    f(webview, handler, token)
+}
+
+unsafe fn wv_execute_script(
+    webview: *mut c_void,
+    script: *const u16,
+    handler: *mut c_void,
+) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16, *mut c_void) -> HRESULT =
+        com_fn(webview, 29);
+    f(webview, script, handler)
+}
+
+// ICoreWebView2: 33 PostWebMessageAsString, 34 add_WebMessageReceived.
+unsafe fn wv_add_web_message_received(
+    webview: *mut c_void,
+    handler: *mut c_void,
+    token: *mut i64,
+) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i64) -> HRESULT =
+        com_fn(webview, 34);
+    f(webview, handler, token)
+}
+
+unsafe fn wv_post_message_string(webview: *mut c_void, msg: *const u16) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT = com_fn(webview, 33);
+    f(webview, msg)
+}
+
+// ICoreWebView2WebMessageReceivedEventArgs: 3 Source, 4 get_WebMessageAsJson,
+// 5 TryGetWebMessageAsString.
+unsafe fn msg_args_try_string(args: *mut c_void) -> Option<String> {
+    if args.is_null() {
+        return None;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT = com_fn(args, 5);
+    let mut p: *mut u16 = null_mut();
+    let hr = f(args, &mut p);
+    if hr >= 0 && !p.is_null() {
+        let s = from_wide_ptr(p);
+        CoTaskMemFree(p as *mut c_void);
+        Some(s)
+    } else {
+        None
+    }
+}
+
+unsafe fn snap_window(hwnd: HWND, zone: &str) {
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if mon == 0 {
+        return;
+    }
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon, &mut info) == 0 {
+        return;
+    }
+    let wa = info.rcWork;
+    let ww = (wa.right - wa.left).max(320);
+    let wh = (wa.bottom - wa.top).max(240);
+    let (x, y, w, h) = match zone {
+        "left" => (wa.left, wa.top, ww / 2, wh),
+        "right" => (wa.left + ww / 2, wa.top, ww - ww / 2, wh),
+        "tl" => (wa.left, wa.top, ww / 2, wh / 2),
+        "tr" => (wa.left + ww / 2, wa.top, ww - ww / 2, wh / 2),
+        "bl" => (wa.left, wa.top + wh / 2, ww / 2, wh - wh / 2),
+        "br" => (wa.left + ww / 2, wa.top + wh / 2, ww - ww / 2, wh - wh / 2),
+        _ => return,
+    };
+    let _ = ShowWindow(hwnd, SW_RESTORE);
+    let _ = SetWindowPos(
+        hwnd,
+        0,
+        x,
+        y,
+        w,
+        h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
+unsafe fn handle_window_message(app: *mut App, msg: &str) {
+    let hwnd = (*app).hwnd;
+    (*app).log(&format!("web message: {msg}"));
+    match msg {
+        "win:minimize" => {
+            ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        "win:maximize" => {
+            if IsZoomed(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+            }
+        }
+        "win:close" => {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        "win:ready" => {
+            KillTimer(hwnd, 2);
+            // [P0-2b] React 已就绪：解除启动超时看护
+            KillTimer(hwnd, 3);
+            (*app).shown = true;
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
+            (*app).log("window shown after React ready");
+        }
+        "win:drag" => {
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
+        }
+        other if other.starts_with("win:snap-") => {
+            snap_window(hwnd, &other["win:snap-".len()..]);
+        }
+        _ => {}
+    }
+}
+
+unsafe fn sync_maximized_state(app: *mut App) {
+    if (*app).webview.is_null() {
+        return;
+    }
+    let state = if IsZoomed((*app).hwnd) != 0 {
+        "win:maximized"
+    } else {
+        "win:restored"
+    };
+    let w = wide(state);
+    let _ = wv_post_message_string((*app).webview, w.as_ptr());
+}
+
+// ICoreWebView2NavigationCompletedEventArgs: 3 get_IsSuccess,
+// 4 get_WebErrorStatus, 5 get_NavigationId.
+unsafe fn nav_args_is_success(args: *mut c_void, out: *mut i32) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT = com_fn(args, 3);
+    f(args, out)
+}
+
+/// [P0-2a] 导航失败的 WebErrorStatus（ICoreWebView2WebErrorStatus 枚举值），
+/// 用于错误页/日志指认原因（1=连接被拒，2=超时，3=主机名解析失败…）。
+unsafe fn nav_args_web_error_status(args: *mut c_void, out: *mut i32) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT = com_fn(args, 4);
+    f(args, out)
+}
+
+// ---------------------------------------------------------------------------
+// Hand-written COM callback handlers
+// ---------------------------------------------------------------------------
+
+const KIND_ENV: u32 = 1;
+const KIND_CONTROLLER: u32 = 2;
+const KIND_NAV: u32 = 3;
+const KIND_SCRIPT: u32 = 4;
+const KIND_MSG: u32 = 5;
+
+#[repr(C)]
+struct Handler {
+    vtbl: *const HandlerVtbl,
+    refs: u32,
+    kind: u32,
+    iid: GUID,
+    app: *mut App,
+}
+
+#[repr(C)]
+struct HandlerVtbl {
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    // Deliberately typed with `usize` for the second argument:
+    //  * env/controller/script handlers receive an HRESULT there,
+    //  * navigation-completed handlers receive the ICoreWebView2* sender there.
+    // On the Windows ABI both travel in the same 64-bit argument slot, and the
+    // HRESULT case is narrowed back with `as i32` below. Using `HRESULT` would
+    // truncate the sender pointer on a navigation callback.
+    invoke: unsafe extern "system" fn(*mut c_void, usize, *mut c_void) -> HRESULT,
+}
+
+static HANDLER_VTBL: HandlerVtbl = HandlerVtbl {
+    query_interface: handler_qi,
+    add_ref: handler_add_ref,
+    release: handler_release,
+    invoke: handler_invoke,
+};
+
+fn handler_new(kind: u32, iid: GUID, app: *mut App) -> *mut c_void {
+    let h = Box::new(Handler {
+        vtbl: &HANDLER_VTBL,
+        refs: 1,
+        kind,
+        iid,
+        app,
+    });
+    Box::into_raw(h) as *mut c_void
+}
+
+unsafe extern "system" fn handler_qi(
+    this: *mut c_void,
+    iid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if this.is_null() || iid.is_null() || ppv.is_null() {
+        return E_POINTER;
+    }
+    let h = &*(this as *const Handler);
+    if *iid == IID_IUNKNOWN || *iid == h.iid {
+        *ppv = this;
+        handler_add_ref(this);
+        S_OK
+    } else {
+        *ppv = null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn handler_add_ref(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let h = &mut *(this as *mut Handler);
+    h.refs = h.refs.saturating_add(1);
+    h.refs
+}
+
+/// The runtime owns its own reference; the host deliberately never frees a
+/// handler (a handful of small allocations per process, which keeps lifetime
+/// handling trivial for a spike). We still decrement for honest bookkeeping.
+unsafe extern "system" fn handler_release(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let h = &mut *(this as *mut Handler);
+    if h.refs > 0 {
+        h.refs -= 1;
+    }
+    h.refs
+}
+
+unsafe extern "system" fn handler_invoke(
+    this: *mut c_void,
+    p1: usize,
+    p2: *mut c_void,
+) -> HRESULT {
+    if this.is_null() {
+        return E_POINTER;
+    }
+    let h = &*(this as *const Handler);
+    let app = h.app;
+    if app.is_null() {
+        return S_OK;
+    }
+
+    match h.kind {
+        KIND_ENV => {
+            let hr = p1 as i32;
+            if hr < 0 || p2.is_null() {
+                fail_close(
+                    app,
+                    &format!("CreateCoreWebView2Environment failed hr=0x{:08X}", hr as u32),
+                );
+                return S_OK;
+            }
+            (*app).env = p2;
+            com_add_ref(p2);
+            let version = env_browser_version(p2).unwrap_or_else(|| "<unknown>".to_string());
+            (*app).log(&format!(
+                "environment created; WebView2 runtime version = {version}"
+            ));
+
+            let controller_handler = handler_new(KIND_CONTROLLER, IID_CONTROLLER_HANDLER, app);
+            let hr2 = env_create_controller(p2, (*app).hwnd, controller_handler);
+            (*app).log(&format!(
+                "CreateCoreWebView2Controller -> hr=0x{:08X}",
+                hr2 as u32
+            ));
+            if hr2 < 0 {
+                fail_close(app, "CreateCoreWebView2Controller call failed");
+            }
+        }
+        KIND_CONTROLLER => {
+            let hr = p1 as i32;
+            if hr < 0 || p2.is_null() {
+                fail_close(
+                    app,
+                    &format!("controller creation failed hr=0x{:08X}", hr as u32),
+                );
+                return S_OK;
+            }
+            (*app).controller = p2;
+            com_add_ref(p2);
+            (*app).log("controller created");
+
+            let hr_vis = controller_put_is_visible(p2, 1);
+            (*app).log(&format!("put_IsVisible(TRUE) -> hr=0x{:08X}", hr_vis as u32));
+            resize_webview(app);
+
+            let mut webview: *mut c_void = null_mut();
+            let hr_wv = controller_get_core_webview2(p2, &mut webview);
+            if hr_wv < 0 || webview.is_null() {
+                fail_close(
+                    app,
+                    &format!("get_CoreWebView2 failed hr=0x{:08X}", hr_wv as u32),
+                );
+                return S_OK;
+            }
+            com_add_ref(webview);
+            (*app).webview = webview;
+            (*app).log("ICoreWebView2 acquired");
+
+            let msg_handler = handler_new(KIND_MSG, IID_MSG_HANDLER, app);
+            let mut msg_token: i64 = 0;
+            let hr_msg = wv_add_web_message_received(webview, msg_handler, &mut msg_token);
+            (*app).log(&format!(
+                "add_WebMessageReceived -> hr=0x{:08X} token={msg_token}",
+                hr_msg as u32
+            ));
+
+            let nav_handler = handler_new(KIND_NAV, IID_NAV_HANDLER, app);
+            let mut token: i64 = 0;
+            let hr_ev = wv_add_navigation_completed(webview, nav_handler, &mut token);
+            (*app).log(&format!(
+                "add_NavigationCompleted -> hr=0x{:08X} token={token}",
+                hr_ev as u32
+            ));
+
+            let hr_nav = wv_navigate(webview, (*app).url.as_ptr());
+            (*app).log(&format!(
+                "Navigate({}) -> hr=0x{:08X}",
+                (*app).url_text,
+                hr_nav as u32
+            ));
+            if hr_nav < 0 {
+                fail_close(app, "Navigate call failed");
+            }
+        }
+        KIND_NAV => {
+            // p1 = sender ICoreWebView2*, p2 = ICoreWebView2NavigationCompletedEventArgs*
+            let args = p2;
+            let mut success: i32 = 0;
+            let hr_ok = if args.is_null() {
+                -1
+            } else {
+                nav_args_is_success(args, &mut success)
+            };
+            (*app).log(&format!(
+                "NavigationCompleted: is_success={success} (args hr=0x{:08X})",
+                hr_ok as u32
+            ));
+            // [P0-2a] 错误页自身的导航不算业务结果
+            let was_error_nav = (*app).error_nav_pending;
+            (*app).error_nav_pending = false;
+            if was_error_nav {
+                if success == 0 {
+                    // 错误页都渲染失败（极小概率）：消息框兜底后退出
+                    fail_close(app, "错误页渲染失败（WebView2 状态异常）");
+                }
+                return S_OK;
+            }
+            if success != 0 {
+                (*app).nav_ok = true;
+                // [P0-2a] 重试成功：退出错误态，恢复正常显示路径
+                if (*app).error_mode {
+                    (*app).error_mode = false;
+                    (*app).log("retry navigation succeeded; leaving error mode");
+                }
+                (*app).log("SPIKE_READY navigation succeeded");
+                // Let the page paint one frame while hidden, then reveal.
+                SetTimer((*app).hwnd, 2, 1500, null());
+            } else {
+                // [P0-2a 2026-11-01] 导航失败（server 未起/端口被占/防火墙）：
+                // 旧版这里什么都不做——窗口永不显示、进程静默挂起（验收
+                // P0-2/D-1）。现在显示内嵌错误页（含目标地址与重试按钮）。
+                let mut web_err: i32 = 0;
+                if !args.is_null() {
+                    let _ = nav_args_web_error_status(args, &mut web_err);
+                }
+                show_error_page(
+                    app,
+                    "无法打开虎符设置页",
+                    &format!(
+                        "hufu-server 可能未启动或端口被占用。\n导航失败（WebErrorStatus={web_err}）。\n\n点「重试」重新连接；也可关闭后从托盘/开始菜单重新打开。"
+                    ),
+                );
+                return S_OK;
+            }
+
+            // Prove that the document is really there, not just that a window
+            // exists: ask the page for its title / readyState / text snippet.
+            if !(*app).webview.is_null() && !(*app).error_mode {
+                let script_handler = handler_new(KIND_SCRIPT, IID_SCRIPT_HANDLER, app);
+                let js = wide(
+                    "JSON.stringify({title:document.title,ready:document.readyState,\
+                     url:location.href,text:((document.body&&document.body.innerText)||'').slice(0,160)})",
+                );
+                let hr_js = wv_execute_script((*app).webview, js.as_ptr(), script_handler);
+                (*app).log(&format!(
+                    "ExecuteScript(DOM evidence) -> hr=0x{:08X}",
+                    hr_js as u32
+                ));
+            }
+        }
+        KIND_SCRIPT => {
+            let hr = p1 as i32;
+            if hr < 0 {
+                (*app).log(&format!(
+                    "ExecuteScript completed with error hr=0x{:08X}",
+                    hr as u32
+                ));
+            } else {
+                let result = from_wide_ptr(p2 as *const u16);
+                let short: String = result.chars().take(600).collect();
+                (*app).log(&format!("DOM evidence: {short}"));
+            }
+        }
+        KIND_MSG => {
+            if let Some(msg) = msg_args_try_string(p2) {
+                handle_window_message(app, &msg);
+            }
+        }
+        _ => {}
+    }
+
+    S_OK
+}
+
+// ---------------------------------------------------------------------------
+// App state / logging
+// ---------------------------------------------------------------------------
+
+struct App {
+    hwnd: HWND,
+    log_path: PathBuf,
+    url: Vec<u16>,
+    url_text: String,
+    user_data: Vec<u16>,
+    env: *mut c_void,
+    controller: *mut c_void,
+    webview: *mut c_void,
+    nav_ok: bool,
+    failed: bool,
+    /// [P0-2a/b] 窗口是否已对用户可见（win:ready / 首帧 timer / 错误页）。
+    shown: bool,
+    /// [P0-2a] 当前停在错误页（跳过 DOM 探测脚本；重试成功后复位）。
+    error_mode: bool,
+    /// [P0-2a] 本次 NavigationCompleted 属于错误页自身的导航。
+    error_nav_pending: bool,
+}
+
+impl App {
+    fn log(&self, msg: &str) {
+        log_line(&self.log_path, msg);
+    }
+}
+
+fn log_line(path: &Path, msg: &str) {
+    let mut st = SYSTEMTIME::default();
+    unsafe { GetLocalTime(&mut st) };
+    let line = format!(
+        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] {}\r\n",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds,
+        msg
+    );
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+unsafe fn fail_close(app: *mut App, msg: &str) {
+    (*app).failed = true;
+    (*app).log(&format!("FATAL: {msg}"));
+    // [P0-2a 2026-11-01] 失败也要让用户看见（旧版静默退出、无任何提示）：
+    // 此时通常还没有 WebView 可用，用系统消息框兜底。模态消息循环内
+    // WebView2 的回调照常分发（标准 Win32 模式）。
+    let text = wide(&format!(
+        "虎符设置窗口启动失败：\n\n{msg}\n\n请确认 hufu-server.exe 正在运行，\n或重新打开设置窗口重试。"
+    ));
+    let caption = wide("虎符设置");
+    MessageBoxW((*app).hwnd, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+    PostMessageW((*app).hwnd, WM_CLOSE, 0, 0);
+}
+
+/// HTML 转义（错误页 detail 含 url/错误码等外部字符串，最小转义 & < >）。
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// [P0-2a/b 2026-11-01] 统一失败兜底：WebView 在场 → NavigateToString 内嵌
+/// 错误页（深色风格、重试/关闭按钮）并立即显示窗口；WebView 不在场 →
+/// 系统消息框后关闭。此前导航失败/启动超时窗口永不显示、进程静默挂起
+///（验收 P0-2/D-1）。
+unsafe fn show_error_page(app: *mut App, headline: &str, detail: &str) {
+    (*app).shown = true;
+    (*app).error_mode = true;
+    KillTimer((*app).hwnd, 2);
+    KillTimer((*app).hwnd, 3);
+    (*app).log(&format!("ERROR PAGE: {headline} | {detail}"));
+    if (*app).webview.is_null() {
+        let text = wide(&format!("{headline}\n\n{detail}\n\n目标地址：{}", (*app).url_text));
+        let caption = wide("虎符设置");
+        MessageBoxW(
+            (*app).hwnd,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+        PostMessageW((*app).hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    // 目标地址嵌成 JS 字符串字面量（format!("{:?}") 的转义对 JS 同构），
+    // 重试按钮 location.href 直跳；关闭按钮走既有 win:close 消息链。
+    let url_js = format!("{:?}", (*app).url_text);
+    let html = format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>虎符设置 · 连接失败</title>
+<style>
+html,body{{margin:0;height:100%;background:#171413;color:#e8e0d2;
+font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}}
+.wrap{{height:100%;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:16px;padding:32px;text-align:center;box-sizing:border-box}}
+h1{{font-size:20px;margin:0;font-weight:600}}
+p{{font-size:13px;line-height:1.8;color:#b7ac99;margin:0;white-space:pre-wrap;max-width:560px}}
+code{{color:#d9c48a;word-break:break-all}}
+.btns{{display:flex;gap:12px}}
+button{{min-width:112px;padding:9px 18px;font-size:14px;border-radius:8px;
+border:1px solid #574a33;background:#2a241c;color:#e8d9b0;cursor:pointer}}
+button:hover{{background:#3a3123}}
+</style></head><body><div class="wrap">
+<h1>{headline}</h1>
+<p>{detail}</p>
+<p><code>{url}</code></p>
+<div class="btns">
+<button id="retry">重试</button>
+<button id="close">关闭</button>
+</div></div>
+<script>
+var TARGET={url_js};
+document.getElementById('retry').onclick=function(){{location.href=TARGET}};
+document.getElementById('close').onclick=function(){{
+  if(window.chrome&&window.chrome.webview){{window.chrome.webview.postMessage('win:close')}}
+  else{{window.close()}}
+}};
+</script></body></html>"#,
+        headline = escape_html(headline),
+        detail = escape_html(detail),
+        url = escape_html(&(*app).url_text),
+        url_js = url_js,
+    );
+    (*app).error_nav_pending = true;
+    let w = wide(&html);
+    let hr = wv_navigate_to_string((*app).webview, w.as_ptr());
+    (*app).log(&format!("NavigateToString(error page) -> hr=0x{:08X}", hr as u32));
+    ShowWindow((*app).hwnd, SW_SHOW);
+    let _ = UpdateWindow((*app).hwnd);
+    let _ = SetForegroundWindow((*app).hwnd);
+}
+
+unsafe fn app_ptr(hwnd: HWND) -> *mut App {
+    GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App
+}
+
+unsafe fn resize_webview(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    let a = &*app;
+    if a.controller.is_null() {
+        return;
+    }
+    let mut rc = RECT::default();
+    if GetClientRect(a.hwnd, &mut rc) != 0 && rc.width() > 0 && rc.height() > 0 {
+        let hr = controller_put_bounds(a.controller, rc);
+        if hr < 0 {
+            a.log(&format!(
+                "put_Bounds({}x{}) -> hr=0x{:08X}",
+                rc.width(),
+                rc.height(),
+                hr as u32
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window procedure
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_SIZE => {
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                resize_webview(app);
+                sync_maximized_state(app);
+            }
+            0
+        }
+        WM_TIMER => {
+            if wparam == 2 {
+                KillTimer(hwnd, 2);
+                // [P0-2b] 首帧揭示完成：解除启动超时看护
+                KillTimer(hwnd, 3);
+                ShowWindow(hwnd, SW_SHOW);
+                UpdateWindow(hwnd);
+                let app = app_ptr(hwnd);
+                if !app.is_null() {
+                    (*app).shown = true;
+                    (*app).log("window shown after navigation/paint");
+                }
+            } else if wparam == 3 {
+                // [P0-2b 2026-11-01] 启动超时看护（10s）：窗口仍不可见 =
+                // 环境创建挂起/导航永不完成（server 挂死、防火墙黑洞）。
+                // 走与导航失败相同的兜底（错误页/消息框），不再静默挂起。
+                KillTimer(hwnd, 3);
+                let app = app_ptr(hwnd);
+                if !app.is_null() && !(*app).shown && !(*app).failed {
+                    (*app).log("startup watchdog fired (10s without visible window)");
+                    show_error_page(
+                        app,
+                        "虎符设置页启动超时",
+                        "10 秒内未能加载设置页。\nhufu-server 可能未响应或网络策略拦截了本地连接。\n\n点「重试」重新连接。",
+                    );
+                }
+            } else {
+                KillTimer(hwnd, 1);
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                (*app).log(&format!(
+                    "WM_DPICHANGED dpi={}",
+                    (wparam & 0xffff) as u32
+                ));
+            }
+            // lParam is a RECT* with the suggested window rect for the new DPI.
+            let r = lparam as *const RECT;
+            if !r.is_null() {
+                let r = &*r;
+                let _ = SetWindowPos(
+                    hwnd,
+                    0,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            0
+        }
+        WM_CLOSE => {
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                let a = &*app;
+                a.log("WM_CLOSE received; closing WebView2 controller");
+                if !a.controller.is_null() {
+                    let hr = controller_close(a.controller);
+                    a.log(&format!("controller Close -> hr=0x{:08X}", hr as u32));
+                }
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebView2Loader.dll discovery
+// ---------------------------------------------------------------------------
+
+type CreateEnvFn = unsafe extern "system" fn(
+    browser_executable_folder: *const u16,
+    user_data_folder: *const u16,
+    environment_options: *mut c_void,
+    environment_created_handler: *mut c_void,
+) -> HRESULT;
+
+unsafe fn load_webview2(exe_dir: &Path, log_path: &Path) -> Result<CreateEnvFn, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("WEBVIEW2_LOADER") {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.push(exe_dir.join("WebView2Loader.dll"));
+
+    let mut dir = Some(exe_dir.to_path_buf());
+    for _ in 0..6 {
+        let Some(d) = dir else { break };
+        candidates.push(d.join("WebView2Loader.dll"));
+        candidates.push(d.join("vendor").join("WebView2Loader.dll"));
+        dir = d.parent().map(Path::to_path_buf);
+    }
+
+    for path in &candidates {
+        if !path.is_file() {
+            continue;
+        }
+        let wide_path = wide_os(path);
+        let module = LoadLibraryW(wide_path.as_ptr());
+        if module == 0 {
+            log_line(
+                log_path,
+                &format!(
+                    "LoadLibraryW({}) failed; GetLastError={}",
+                    path.display(),
+                    GetLastError()
+                ),
+            );
+            continue;
+        }
+        let symbol = b"CreateCoreWebView2EnvironmentWithOptions\0";
+        let proc = GetProcAddress(module, symbol.as_ptr());
+        if proc.is_null() {
+            log_line(
+                log_path,
+                &format!(
+                    "GetProcAddress in {} failed; GetLastError={}",
+                    path.display(),
+                    GetLastError()
+                ),
+            );
+            continue;
+        }
+        log_line(
+            log_path,
+            &format!("WebView2Loader loaded from {}", path.display()),
+        );
+        return Ok(std::mem::transmute(proc));
+    }
+
+    // Last chance: let Windows search the normal DLL search path (the exe
+    // directory is searched first for LoadLibraryW anyway).
+    let module = LoadLibraryW(wide("WebView2Loader.dll").as_ptr());
+    if module != 0 {
+        let symbol = b"CreateCoreWebView2EnvironmentWithOptions\0";
+        let proc = GetProcAddress(module, symbol.as_ptr());
+        if !proc.is_null() {
+            log_line(
+                log_path,
+                "WebView2Loader loaded through the default DLL search path",
+            );
+            return Ok(std::mem::transmute(proc));
+        }
+    }
+
+    Err(format!(
+        "WebView2Loader.dll was not found / does not export \
+         CreateCoreWebView2EnvironmentWithOptions (GetLastError={})",
+        GetLastError()
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn wide_os(p: &Path) -> Vec<u16> {
+    p.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+unsafe fn from_wide_ptr(p: *const u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while len < 8192 && *p.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+}
+
+fn exe_dir() -> PathBuf {
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(0, buf.as_mut_ptr(), buf.len() as u32) };
+    let path = String::from_utf16_lossy(&buf[..n as usize]);
+    PathBuf::from(path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+struct CliArgs {
+    url: String,
+    user_data: PathBuf,
+    log: PathBuf,
+    auto_close_secs: Option<u32>,
+    dpi: Option<u32>,
+}
+
+fn parse_args(exe_dir: &Path) -> CliArgs {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exe_dir.to_path_buf());
+    let user_data = base.join("HuFu").join("WebView2");
+    let mut args = CliArgs {
+        url: "http://127.0.0.1:4390/next?shell=1".to_string(),
+        log: user_data.join("hufu-settings.log"),
+        user_data,
+        auto_close_secs: None,
+        dpi: None,
+    };
+    let argv: Vec<String> = std::env::args().collect();
+    let mut i = 1usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--url" if i + 1 < argv.len() => {
+                args.url = argv[i + 1].clone();
+                i += 2;
+            }
+            "--user-data" if i + 1 < argv.len() => {
+                args.user_data = PathBuf::from(&argv[i + 1]);
+                i += 2;
+            }
+            "--log" if i + 1 < argv.len() => {
+                args.log = PathBuf::from(&argv[i + 1]);
+                i += 2;
+            }
+            "--auto-close" if i + 1 < argv.len() => {
+                args.auto_close_secs = argv[i + 1].parse().ok();
+                i += 2;
+            }
+            "--dpi" if i + 1 < argv.len() => {
+                args.dpi = argv[i + 1].parse::<u32>().ok().filter(|d| (72..=480).contains(d));
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    if !args.user_data.is_absolute() {
+        args.user_data = exe_dir.join(&args.user_data);
+    }
+    if !args.log.is_absolute() {
+        args.log = exe_dir.join(&args.log);
+    }
+    args
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn main() -> std::process::ExitCode {
+    let code = unsafe { real_main() };
+    std::process::ExitCode::from(code as u8)
+}
+
+unsafe fn real_main() -> i32 {
+    let exe_dir = exe_dir();
+    let args = parse_args(&exe_dir);
+
+    if let Some(parent) = args.log.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let user_data = absolutize(&args.user_data);
+    if let Err(err) = fs::create_dir_all(&user_data) {
+        log_line(
+            &args.log,
+            &format!("failed to create user data dir {}: {err}", user_data.display()),
+        );
+        return 2;
+    }
+
+    log_line(
+        &args.log,
+        &format!(
+            "=== hufu-settings start (pid {}) ===",
+            std::process::id()
+        ),
+    );
+    log_line(
+        &args.log,
+        &format!("exe dir: {}", exe_dir.display()),
+    );
+    log_line(
+        &args.log,
+        &format!("user data dir: {}", user_data.display()),
+    );
+    log_line(&args.log, &format!("target URL: {}", args.url));
+
+    // [P0-2c 2026-11-01] 单实例互斥：命名互斥体占名，二次启动（连按
+    // Ctrl+Alt+H / 托盘连点）激活已有窗口后直接退出——旧版会在首窗
+    // 1.5s 隐身期内再 spawn 隐形进程（验收 D-2/P0-2）。互斥体先于窗口
+    // 创建持有（句柄进程存续期间不关，退出由内核回收）；另一实例可能
+    // 尚未建窗（FindWindowW 扑空）也无妨——它随后要么正常显示、要么
+    // 自己走错误兜底。
+    {
+        let mutex_name = wide("Local\\Hufu-HufuSettings-SingleInstance");
+        let hmutex = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
+        if hmutex != 0 && GetLastError() == ERROR_ALREADY_EXISTS {
+            let cls = wide("HufuSettingsWnd");
+            let existing = FindWindowW(cls.as_ptr(), null());
+            if existing != 0 {
+                if IsIconic(existing) != 0 {
+                    let _ = ShowWindow(existing, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(existing);
+                log_line(
+                    &args.log,
+                    "another instance already running; raised its window and exiting",
+                );
+            } else {
+                log_line(
+                    &args.log,
+                    "another instance already running (window not found yet); exiting",
+                );
+            }
+            return 0;
+        }
+    }
+
+    // Per-Monitor V2: the window is sized in DIPs and WebView2 follows the
+    // monitor scale. `--dpi` is a dev-only override for high-DPI screenshots.
+    let dpi_mode = set_process_dpi_awareness();
+    log_line(&args.log, &format!("dpi awareness: {dpi_mode}"));
+    let dpi = args.dpi.unwrap_or_else(system_dpi);
+    if args.dpi.is_some() {
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            format!("--force-device-scale-factor={:.4}", dpi as f64 / 96.0),
+        );
+    }
+    let scale = dpi as f64 / 96.0;
+    let mut win_w = (1280.0 * scale).round() as i32;
+    let mut win_h = (800.0 * scale).round() as i32;
+    let wa = work_area().unwrap_or(RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    });
+    let wa_w = wa.width().max(320);
+    let wa_h = wa.height().max(240);
+    let min_w = 720.min(wa_w);
+    let min_h = 480.min(wa_h);
+    win_w = win_w.clamp(min_w, wa_w);
+    win_h = win_h.clamp(min_h, wa_h);
+    let win_x = wa.left + (wa_w - win_w) / 2;
+    let win_y = wa.top + (wa_h - win_h) / 2;
+    log_line(
+        &args.log,
+        &format!(
+            "dpi={dpi} scale={:.3} window={}x{} at {},{} workarea={}x{}",
+            scale, win_w, win_h, win_x, win_y, wa_w, wa_h
+        ),
+    );
+
+    let hr_co = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
+    log_line(
+        &args.log,
+        &format!("CoInitializeEx(APARTMENTTHREADED) -> hr=0x{:08X}", hr_co as u32),
+    );
+
+    let create_env = match load_webview2(&exe_dir, &args.log) {
+        Ok(f) => f,
+        Err(err) => {
+            log_line(&args.log, &format!("FATAL: {err}"));
+            // [P0-2a] WebView2 运行时/装载器缺失也要让用户看见（旧版静默退）
+            let text = wide(&format!(
+                "无法加载 WebView2 运行时：\n\n{err}\n\n请安装「Evergreen WebView2 运行时」后重试。"
+            ));
+            let caption = wide("虎符设置");
+            MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+            return 2;
+        }
+    };
+
+    let hinstance = GetModuleHandleW(null());
+    let bg_brush = CreateSolidBrush(0x00171413);
+    let class_name = wide("HufuSettingsWnd");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: 0,
+        lpfnWndProc: wndproc,
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: 0,
+        hCursor: 0,
+        hbrBackground: bg_brush,
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+        hIconSm: 0,
+    };
+    let atom = RegisterClassExW(&wc);
+    if atom == 0 {
+        let err = GetLastError();
+        if err != 1410 {
+            // 1410 = ERROR_CLASS_ALREADY_EXISTS
+            log_line(
+                &args.log,
+                &format!("RegisterClassExW failed; GetLastError={err}"),
+            );
+            return 2;
+        }
+    }
+
+    let title = wide("虎符设置");
+    let hwnd = CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN,
+        win_x,
+        win_y,
+        win_w,
+        win_h,
+        0,
+        0,
+        hinstance,
+        null_mut(),
+    );
+    if hwnd == 0 {
+        log_line(
+            &args.log,
+            &format!("CreateWindowExW failed; GetLastError={}", GetLastError()),
+        );
+        return 2;
+    }
+
+    let app = Box::into_raw(Box::new(App {
+        hwnd,
+        log_path: args.log.clone(),
+        url: wide(&args.url),
+        url_text: args.url.clone(),
+        user_data: wide_os(&user_data),
+        env: null_mut(),
+        controller: null_mut(),
+        webview: null_mut(),
+        nav_ok: false,
+        failed: false,
+        shown: false,
+        error_mode: false,
+        error_nav_pending: false,
+    }));
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+
+    // Keep the window hidden until the React shell has navigated/rendered.
+    // Showing it immediately is what produced the big blank block before the
+    // UI appeared (white before, black after the dark-brush fix).
+    set_dark_titlebar(hwnd);
+    (*app).log("window created (hidden until NavigationCompleted); title=\"虎符设置\"");
+
+    if let Some(secs) = args.auto_close_secs {
+        SetTimer(hwnd, 1, secs.saturating_mul(1000), null());
+        (*app).log(&format!("auto-close timer armed for {secs}s"));
+    }
+
+    let env_handler = handler_new(KIND_ENV, IID_ENV_HANDLER, app);
+    let hr_env = create_env(
+        null(),
+        (*app).user_data.as_ptr(),
+        null_mut(),
+        env_handler,
+    );
+    (*app).log(&format!(
+        "CreateCoreWebView2EnvironmentWithOptions -> hr=0x{:08X}",
+        hr_env as u32
+    ));
+    // [P0-2b 2026-11-01] 启动超时看护：10s 内窗口未显示（env 挂起/导航
+    // 永不完成）即走错误兜底。win:ready / 首帧 timer 揭示时解除。
+    SetTimer(hwnd, 3, 10_000, null());
+    (*app).log("startup watchdog armed (10s)");
+    if hr_env < 0 {
+        // [P0-2a] 环境 async 创建失败同样有 UI（旧版静默退出）
+        (*app).failed = true;
+        let text = wide(&format!(
+            "无法创建 WebView2 环境（hr=0x{:08X}）。\n\n请确认已安装 WebView2 运行时后重试。",
+            hr_env as u32
+        ));
+        let caption = wide("虎符设置");
+        MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+        DestroyWindow(hwnd);
+    }
+
+    let mut msg: MSG = std::mem::zeroed();
+    loop {
+        let ret = GetMessageW(&mut msg, 0, 0, 0);
+        if ret == 0 {
+            break;
+        }
+        if ret == -1 {
+            (*app).log("GetMessageW returned -1");
+            (*app).failed = true;
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    (*app).log(&format!(
+        "message loop exited; nav_ok={} failed={}",
+        (*app).nav_ok, (*app).failed
+    ));
+
+    CoUninitialize();
+
+    if (*app).failed {
+        2
+    } else {
+        0
+    }
+}
+
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}

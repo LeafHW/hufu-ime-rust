@@ -392,6 +392,12 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
         out.line(&format!("✗ 缺少 {}，请完整解压安装包后重试", exe_s));
         return 1;
     }
+    let shell_exe = inst.join("hufu-settings.exe");
+    let webview_loader = inst.join("WebView2Loader.dll");
+    if !shell_exe.exists() || !webview_loader.exists() {
+        out.line("✗ 缺少 hufu-settings.exe / WebView2Loader.dll，请使用新版安装包");
+        return 1;
+    }
     out.line("OK 文件就位（原地运行，不占用 C 盘额外空间）");
 
     // install.ps1 L325-332：-UserOnly 分支——只写当前用户 HKCU IME 配置后退出
@@ -741,9 +747,11 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
         let appdata = std::env::var_os("APPDATA")?;
         let sm = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs");
         let lnk_path = sm.join("HuFu 虎符输入法设置.lnk");
-        Some(lnk::create_url_shortcut(
+        Some(lnk::create_app_shortcut(
             &lnk_path,
-            "http://127.0.0.1:4390/",
+            &inst.join("hufu-settings.exe"),
+            "--url \"http://127.0.0.1:4390/next?shell=1\"",
+            &inst,
             &icon,
         ))
     })()

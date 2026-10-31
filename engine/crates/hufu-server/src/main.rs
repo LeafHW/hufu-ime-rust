@@ -37,6 +37,11 @@ const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 /// 发行线零改动；设置页 <img src="/donate.png"> 取用）。
 const DONATE_PNG: &[u8] = include_bytes!("../../../../settings-ui/donate.png");
 
+// 【新设置页 2026-10-31】构建期把 `settings-app/dist` 嵌进 exe；`/next`
+// 与 `/assets/*` 由 `next_static` 直接服务，老 `/` 不受影响。
+include!(concat!(env!("OUT_DIR"), "/next_assets.rs"));
+
+
 /// 开发态接回终端（见文件头注释）。必须在任何 stdout/stderr 输出前调用。
 /// 零依赖直声明（与 pipe/tray 同风格）；std 句柄懒初始化，Attach 成功后
 /// 首次 println 即可写入父控制台。
@@ -676,7 +681,7 @@ fn main() {
         let (open_tx, open_rx) = mpsc::channel::<()>();
         let (focus_tx, focus_rx) = mpsc::channel::<()>();
         tray::spawn(quit_tx, open_tx, focus_tx, Some(shared.clone()));
-        let url = format!("http://{addr}/");
+        let url = format!("http://{addr}/next?shell=1");
         // 【设置窗聚焦 2026-10-10】Ctrl+Shift+H：只把已开的设置窗弹到
         // 最前（最小化恢复/被盖置顶），不开新窗。
         std::thread::spawn(move || {
@@ -694,6 +699,32 @@ fn main() {
                 // 没找到才走开窗路径。
                 if unsafe { crate::sys_win::raise_settings_window() } {
                     continue;
+                }
+                // 【新设置壳 2026-10-31】优先启动同目录的 hufu-settings.exe
+                // （Win32+WebView2，默认/next）。没有壳时再回落 Edge --app。
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                if let Some(shell) = exe_dir
+                    .map(|d| d.join("hufu-settings.exe"))
+                    .filter(|p| p.is_file())
+                {
+                    let mut c = std::process::Command::new(shell);
+                    c.arg("--url").arg(url.clone());
+                    match c.spawn() {
+                        Ok(child) => {
+                            // 【P0-2d 2026-11-01】spawn 成功≠窗口会显示：壳自身
+                            // 现有导航失败兜底/启动超时/单实例互斥（验收 D-1）。
+                            // 这里只记 pid 供排查，不做 2s 复检回落 Edge——
+                            // 复检窗口期（壳 1.5s 隐身期）必然误判，会与壳
+                            // 自己的错误页/互斥机制打架（双窗口）。
+                            eprintln!("设置壳已启动 pid={}（{}）", child.id(), url);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("设置壳启动失败（{e}），回落浏览器窗口");
+                        }
+                    }
                 }
                 // 独立应用窗口（Chromium --app 模式）：有自己的任务栏图标、无地址栏，
                 // 观感等同原生窗口。CreateProcess 不查 App Paths，须用完整路径；
@@ -1324,6 +1355,70 @@ fn strip_export_sensitive(bundle: &mut serde_json::Value) {
     }
 }
 
+/// 【C-1 2026-11-01】UI 构建指纹：内嵌 /next index.html 的 sha256 前
+/// 16 hex，随 /api/about 返回（ui_build 字段）。对 exe 内嵌内容计算而
+/// 非磁盘 dist——指纹恒等于本进程实际服务的那份 /next；「dist ↔ exe」
+/// 是否漂移由比对现场 dist 的同口径 sha256 检出（验收报告 C-1：此前
+/// 只能人工逐字节比对）。进程内只算一次（OnceLock）。dist 未内嵌
+///（NEXT_INDEX 空）时返回空串。
+fn ui_build_fp() -> &'static str {
+    static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FP.get_or_init(|| {
+        if NEXT_INDEX.is_empty() {
+            return String::new();
+        }
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(NEXT_INDEX.as_bytes());
+        h.finalize()
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
+}
+
+fn next_static(path: &str) -> Option<Response> {
+    if path == "/next" || path == "/next/" {
+        if NEXT_INDEX.is_empty() {
+            return None;
+        }
+        return Some(Response {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: NEXT_INDEX.as_bytes().to_vec(),
+        });
+    }
+    NEXT_ASSETS
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map(|(_, body, content_type)| Response {
+            status: 200,
+            content_type: *content_type,
+            body: body.to_vec(),
+        })
+}
+
+/// 【检查更新 2026-11-01】语义化版本比较：a 是否严格大于 b（"1.9.10" > "1.9.9"）。
+/// 任一段解析失败按 0 处理；长度不齐缺段按 0。
+fn newer_than(a: &str, b: &str) -> bool {
+    let seg = |s: &str| -> Vec<u32> {
+        s.split('.')
+            .map(|p| p.trim().parse::<u32>().unwrap_or(0))
+            .collect()
+    };
+    let (sa, sb) = (seg(a), seg(b));
+    let n = sa.len().max(sb.len());
+    for i in 0..n {
+        let x = sa.get(i).copied().unwrap_or(0);
+        let y = sb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
     // DELETE /api/skin）拒绝跨源网页：
@@ -1349,6 +1444,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !local_host {
                 return Response::err(403, "非法 Host");
             }
+        }
+    }
+    // 【新设置页 2026-10-31】静态资源先于 Host 锁分发；GET only。
+    if req.method == "GET" {
+        if let Some(resp) = next_static(req.path.as_str()) {
+            return resp;
         }
     }
     // 【云同步 2026-10-28】/api/sync/* 锁外分发：test 含网络 IO（连接
@@ -1412,14 +1513,37 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             ("GET", "/api/sync/cloud") => Response::json(&sync::cloud_summary()),
             ("GET", "/api/sync/backup") => Response::json(&sync::backup_summary()),
             ("POST", "/api/sync/cloud/delete") => {
+                // 【SY-02 2026-11-01】删除改为同步等待（30s 超时）：旧版
+                // 丢后台线程立即返回 200，前端 toast「已删除」后刷新拿到的
+                // 仍是删除前清单（谎报成功）。/api/sync/* 本就锁外分发
+                //（每连接一线程），阻塞等待不影响打字路径。
                 let v = req.json();
                 let scheme = v.get("scheme").and_then(|x| x.as_str()).map(String::from);
-                // 网络 IO 较重（逐文件 DELETE），放后台线程执行
-                std::thread::spawn(move || match sync::delete_cloud(scheme.as_deref()) {
-                    Ok(msg) => eprintln!("同步管理：{msg}"),
-                    Err(e) => eprintln!("同步管理删除失败：{e}"),
+                let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                std::thread::spawn(move || {
+                    let r = sync::delete_cloud(scheme.as_deref());
+                    let _ = tx.send(r);
                 });
-                Response::json(&serde_json::json!({"ok": true, "msg": "正在删除，稍候刷新查看"}))
+                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                    Ok(Ok(msg)) => {
+                        eprintln!("同步管理：{msg}");
+                        Response::json(&serde_json::json!({"ok": true, "msg": msg}))
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("同步管理删除失败：{e}");
+                        Response::err(500, &e)
+                    }
+                    Err(_) => {
+                        // 超时：后台线程继续跑（结果丢弃，完成与否以下次
+                        // 面板刷新为准）；202 + pending 让前端如实提示。
+                        eprintln!("同步管理：云端删除超 30s 未完成，仍在后台执行");
+                        Response::json(&serde_json::json!({
+                            "ok": true, "pending": true,
+                            "msg": "删除仍在进行（超 30s），稍候刷新查看"
+                        }))
+                        .with_status(202)
+                    }
+                }
             }
             ("POST", "/api/sync/logout") => match sync::logout() {
                 Ok(msg) => Response::json(&serde_json::json!({"ok": true, "msg": msg})),
@@ -1544,7 +1668,81 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 "github": "https://github.com/LeafHW/hufu-ime-rust",
                 "exe_dir": exe_dir.to_string_lossy(),
                 "data_dir": host.data_dir.to_string_lossy(),
+                // 【C-1】内嵌新版设置页 index.html 指纹（sha256 前 16 hex）
+                "ui_build": ui_build_fp(),
             }))
+        }
+        ("GET", "/api/update/check") => {
+            // 【关于页检查更新 2026-11-01 用户需求】真实检查：请求 GitHub
+            // releases/latest 拿最新 tag，与本机版本（version.txt 同源）比对。
+            // 失败返回 ok:false + error（前端如实展示），不装样子。
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_default();
+            let current = std::fs::read_to_string(exe_dir.join("version.txt"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}（开发版）", env!("CARGO_PKG_VERSION")));
+            // 【云同步同款 TLS 挂法】ureq2 native-tls 需显式 tls_connector
+            // （sync.rs build_agent 同款；裸 AgentBuilder 报 no TLS backend）
+            let mut agent_b = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(8))
+                .timeout_connect(std::time::Duration::from_secs(5));
+            #[cfg(windows)]
+            {
+                if let Ok(c) = ureq::native_tls::TlsConnector::new() {
+                    agent_b = agent_b.tls_connector(std::sync::Arc::new(c));
+                }
+            }
+            let resp = agent_b
+                .build()
+                .get("https://api.github.com/repos/LeafHW/hufu-ime-rust/releases/latest")
+                .set("User-Agent", "hufu-ime-update-check")
+                .set("Accept", "application/vnd.github+json")
+                .call();
+            match resp {
+                Ok(r) => match r.into_string().ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+                    Some(v) => {
+                        let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+                        let page = v
+                            .get("html_url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("https://github.com/LeafHW/hufu-ime-rust/releases/latest");
+                        let latest = tag.trim_start_matches('v');
+                        // 【直接下载 2026-11-01】从 assets 里挑 .exe 安装包直链，
+                        // 前端「直接下载安装包」用；无 exe 资产时回退 page_url（进网页）。
+                        let download_url = v
+                            .get("assets")
+                            .and_then(|a| a.as_array())
+                            .and_then(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.get("browser_download_url"))
+                                    .filter_map(|u| u.as_str())
+                                    .find(|u| u.to_ascii_lowercase().ends_with(".exe"))
+                            })
+                            .map(|s| s.to_string());
+                        // 当前版本串可能带「（开发版）」后缀，取首段空白前的纯版本
+                        let cur_ver = current.split_whitespace().next().unwrap_or("");
+                        let has = newer_than(latest, cur_ver);
+                        Response::json(&serde_json::json!({
+                            "ok": true,
+                            "current": current,
+                            "latest": latest,
+                            "has_update": has,
+                            "page_url": page,
+                            "download_url": download_url,
+                        }))
+                    }
+                    None => Response::json(&serde_json::json!({
+                        "ok": false, "current": current, "error": "响应解析失败：GitHub 返回内容无法解析",
+                    })),
+                },
+                Err(e) => Response::json(&serde_json::json!({
+                    "ok": false, "current": current, "error": format!("网络请求失败：{e}"),
+                })),
+            }
         }
         ("GET", "/api/schemas") => {
             // 方案列表 = 码表目录的子目录名（实时列目录）。
@@ -1721,8 +1919,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     Response::json(&serde_json::to_value(&s).unwrap())
                 }
                 Err(e) => {
-                    // 皮肤 JSON 有错时明确指认（此前静默回默认皮，用户只见「不生效」）
-                    eprintln!("皮肤 {id} 加载失败（回退默认）: {e}");
+                    // 【A-2 2026-11-01】带 id 请求失败（文件缺失/损坏）一律
+                    // 404：旧版回 Skin::default()（id=hufu-default=官方「迷
+                    // 雾」皮），前端不校验 id 就回存 POST 会覆盖官方皮肤
+                    //（验收实测 ?id=__nope__ → 返回迷雾）。不带 id（=当前
+                    // 皮肤）保持旧回退默认，旧调用方兼容。
+                    let had_id = req.query.contains_key("id");
+                    eprintln!("皮肤 {id} 加载失败: {e}");
+                    if had_id {
+                        return Response::err(404, &format!("皮肤 {id} 不存在或已损坏: {e}"));
+                    }
+                    eprintln!("（未带 id，回退默认皮肤）");
                     let s = hufu_skin::Skin::default();
                     Response::json(&serde_json::to_value(&s).unwrap())
                 }
@@ -1873,6 +2080,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/skin") => {
             let v = req.json();
+            // 【P0-1 后端半 2026-11-01】请求体可选字段 select（缺省=true
+            // 旧兼容）：select=false 只保存皮肤文件，不再「设为当前」
+            // （旧版无条件 appearance.skin=skin.id + skin_kind=json，
+            // 保存任意皮=顺带切皮/改形态，验收 A-4/P0-1）。皮肤文件的
+            // 写盘、skin_ver 推进、云同步通知照旧——保存当前皮调参仍
+            // 即时生效。serde 不拒绝未知字段，Skin 结构无感。
+            let select = v
+                .get("select")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
             let skin: hufu_skin::Skin = match serde_json::from_value(v) {
                 Ok(s) => s,
                 Err(e) => return Response::err(400, &format!("皮肤无效: {e}")),
@@ -1880,19 +2097,23 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let p = host.skins_dir().join(format!("{}.json", skin.id));
             match skin.save(&p) {
                 Ok(()) => {
-                    host.engine.config.appearance.skin = skin.id.clone();
-                    // 【SSF 扩展 2026-12】保存的必是 JSON 皮肤——形态字段
-                    // 同步归位（此前若停在 ssf 形态，保存 JSON 会留下悬空
-                    // kind=ssf 指向不存在的 .ssf）。
-                    host.engine.config.appearance.skin_kind = "json".into();
-                    let _ = host.engine.config.save(&host.config_path);
+                    if select {
+                        host.engine.config.appearance.skin = skin.id.clone();
+                        // 【SSF 扩展 2026-12】保存的必是 JSON 皮肤——形态字段
+                        // 同步归位（此前若停在 ssf 形态，保存 JSON 会留下悬空
+                        // kind=ssf 指向不存在的 .ssf）。
+                        host.engine.config.appearance.skin_kind = "json".into();
+                        let _ = host.engine.config.save(&host.config_path);
+                    }
                     // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
                     // 2.5s 缓存）——设置页调参实机预览即时生效
                     host.skin_ver += 1;
                     //【皮肤参数云同步 2026-10-31】自带皮调参写盘 → 触发
                     // 同步轮（notify 无锁，持 host 锁调用安全）
                     crate::sync::notify("皮肤");
-                    Response::json(&serde_json::json!({"ok": true, "id": skin.id}))
+                    Response::json(&serde_json::json!({
+                        "ok": true, "id": skin.id, "selected": select
+                    }))
                 }
                 Err(e) => Response::err(500, &format!("保存失败: {e}")),
             }
@@ -1996,6 +2217,112 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // → BMP 回传。UI <img> 直接吃。慢（~2-3s）但所见即打字所得（九宫
         // 格/字体/颜色/横竖排/序号全真）。锁前处理（见 route 顶部注释）。
         ("GET", "/api/skin/ssf-render") => ssf_render_endpoint(),
+        // 【JSON 皮肤真机候选帧 2026-10-31】用 server 的 candwin.rs 同一套
+        // 渲染公式（皮肤 JSON + GDI 文字 + 预乘 BGRA），输出 PNG 给设置页
+        // 做「真机预览」；SSF 皮肤仍走 /api/skin/ssf-render。
+        ("GET", "/api/skin/preview_frame") => {
+            let id = req
+                .query
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| host.engine.config.appearance.skin.clone());
+            if id.is_empty() {
+                return Response::err(400, "缺少 id");
+            }
+            let path = host.skins_dir().join(format!("{id}.json"));
+            let raw = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return Response::err(404, &format!("皮肤 {id} 不是 JSON 皮肤")),
+            };
+            let skin: serde_json::Value = match serde_json::from_slice(&raw) {
+                Ok(v) => v,
+                Err(e) => return Response::err(400, &format!("皮肤无效: {e}")),
+            };
+            let mut skin = skin;
+            if req.query.get("horizontal").map(|v| v == "1").unwrap_or(false) {
+                if let Some(layout) = skin.get_mut("layout").and_then(|v| v.as_object_mut()) {
+                    layout.insert("horizontal".to_string(), serde_json::Value::Bool(true));
+                }
+            }
+            if req.query.get("opaque").map(|v| v == "1").unwrap_or(false) {
+                if let Some(mat) = skin.get_mut("material").and_then(|v| v.as_object_mut()) {
+                    mat.insert("master_alpha".to_string(), serde_json::json!(1.0));
+                    mat.insert("hilite_alpha".to_string(), serde_json::json!(1.0));
+                }
+            }
+            let scale = req
+                .query
+                .get("scale")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.5, 3.0);
+            let raw_text = req
+                .query
+                .get("raw")
+                .cloned()
+                .unwrap_or_else(|| "tuja".to_string());
+            let items: Vec<(String, String)> = req
+                .query
+                .get("items")
+                .map(|s| {
+                    s.split('\n')
+                        .filter(|line| !line.is_empty())
+                        .take(8)
+                        .map(|line| {
+                            let mut parts = line.splitn(2, '|');
+                            let text = parts.next().unwrap_or("").to_string();
+                            let comment = parts.next().unwrap_or("").to_string();
+                            (text, comment)
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        ("我们".to_string(), "wo men".to_string()),
+                        ("我".to_string(), "wo".to_string()),
+                        ("我车".to_string(), "wo che".to_string()),
+                        ("War".to_string(), String::new()),
+                        ("晚".to_string(), "wan".to_string()),
+                    ]
+                });
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::candwin::render_preview(&skin, items, &raw_text, 0, scale)
+            }));
+            let (w, h, bgra, _margin) = match rendered {
+                Ok(v) => v,
+                Err(_) => return Response::err(500, "真机渲染失败"),
+            };
+            let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for px in bgra.chunks_exact(4) {
+                let b = px[0] as u32;
+                let g = px[1] as u32;
+                let r = px[2] as u32;
+                let a = px[3] as u32;
+                let (r, g, b) = if a == 0 {
+                    (0, 0, 0)
+                } else {
+                    ((r * 255 / a).min(255), (g * 255 / a).min(255), (b * 255 / a).min(255))
+                };
+                rgba.extend_from_slice(&[r as u8, g as u8, b as u8, a as u8]);
+            }
+            let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, rgba) else {
+                return Response::err(500, "真机渲染尺寸无效");
+            };
+            let mut out = Vec::new();
+            let encoder = image::codecs::png::PngEncoder::new(&mut out);
+            if image::ImageEncoder::write_image(
+                encoder,
+                img.as_raw(),
+                w as u32,
+                h as u32,
+                image::ExtendedColorType::Rgba8,
+            )
+            .is_err()
+            {
+                return Response::err(500, "PNG 编码失败");
+            }
+            Response { status: 200, content_type: "image/png".into(), body: out }
+        }
         // 【SSF mock 元数据 2026-10-16】设置页「真实候选窗」实时框：
         // 九宫格背景（border-image）+ 预览文字（display 四色/字号/间距
         // + overrides merge）——与 DLL 渲染同参数。?id=&horizontal=0|1。
@@ -2657,8 +2984,66 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
             }
         }
+        ("POST", "/api/open_dir") => {
+            // body {kind: "data"|"exe"|"schema"|"model"}：只允许受控目录，
+            // 不接受任意路径。设置页「数据与备份」的真实打开按钮。
+            // 【E-1 2026-11-01】补 kind=model：整句模型目录（ngram_path 父
+            // 目录，不存在回退 数据\模型）——给设置页一个合法通道，替代
+            // 此前把绝对路径塞进 open_schema_dir 的穿越用法。
+            let kind = req
+                .json()
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let dir = match kind.as_str() {
+                "data" => Some(host.data_dir.clone()),
+                "exe" => exe_dir,
+                "schema" => Some(hufu_engine::Engine::resolve_data_sub(
+                    &host.data_dir,
+                    &host.engine.config.schema.dir,
+                )),
+                "model" => {
+                    let f = hufu_engine::Engine::resolve_data_sub(
+                        &host.data_dir,
+                        &host.engine.config.sentence.ngram_path,
+                    );
+                    f.parent()
+                        .filter(|p| p.is_dir())
+                        .map(|p| p.to_path_buf())
+                        .or_else(|| {
+                            let d = hufu_engine::Engine::resolve_data_sub(
+                                &host.data_dir,
+                                "模型",
+                            );
+                            d.is_dir().then_some(d)
+                        })
+                }
+                _ => {
+                    // 非法 kind 与「目录不存在」分开报：model 分支找不到
+                    // 目录返回 None 时，不得误报成 kind 不合法。
+                    return Response::err(400, "kind 只能是 data / exe / schema / model");
+                }
+            };
+            match dir {
+                Some(dir) if dir.is_dir() => {
+                    crate::platform::open_path(&dir);
+                    Response::json(&serde_json::json!({"ok": true, "path": dir}))
+                }
+                // 含 model 分支目录缺失（None/不存在）→ 404，让前端走
+                // 剪贴板兜底而非当成参数错误。
+                _ => Response::err(404, "目录不存在"),
+            }
+        }
         ("POST", "/api/open_schema_dir") => {
             // body {name?}：缺省=当前方案。打开方案码表目录的资源管理器窗口。
+            // 【E-1 2026-11-01】name 只当方案名用：拒绝路径分隔符/盘符/
+            // 「..」（Rust Path::join 遇绝对路径会丢弃基路径——旧版可拿
+            // 来打开任意目录，前端 Sentence 页曾借此传模型目录绝对路径；
+            // 模型目录请改走 /api/open_dir {kind:"model"}）。
             let name = req
                 .json()
                 .get("name")
@@ -2666,11 +3051,31 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&host.engine.config.schema.current)
                 .to_string();
-            let dir = hufu_engine::Engine::resolve_data_sub(
+            if name.contains('/')
+                || name.contains('\\')
+                || name.contains(':')
+                || std::path::Path::new(&name)
+                    .components()
+                    .any(|c| matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    ))
+            {
+                return Response::err(400, "name 必须是方案名（不允许路径分隔符/绝对路径/..）");
+            }
+            let base = hufu_engine::Engine::resolve_data_sub(
                 &host.data_dir,
                 &host.engine.config.schema.dir,
-            )
-            .join(&name);
+            );
+            let dir = base.join(&name);
+            // 双保险：规范化后必须仍在码表基目录内（junction/符号链接跟随
+            // 后也越不出去）。
+            let (cbase, cdir) = (base.canonicalize().ok(), dir.canonicalize().ok());
+            if let (Some(cb), Some(cd)) = (cbase, cdir) {
+                if !cd.starts_with(&cb) {
+                    return Response::err(400, "拒绝越出码表目录的请求");
+                }
+            }
             if !dir.is_dir() {
                 return Response::err(404, &format!("方案目录不存在: {name}"));
             }
@@ -2943,6 +3348,7 @@ mod sys_win {
     unsafe extern "system" {
         fn EnumWindows(lpenumfunc: isize, lparam: isize) -> i32;
         fn GetWindowTextW(hwnd: isize, lpstring: *mut u16, cchmax: i32) -> i32;
+        fn GetClassNameW(hwnd: isize, lpclassname: *mut u16, cchmax: i32) -> i32;
         fn IsWindowVisible(hwnd: isize) -> i32;
         fn IsIconic(hwnd: isize) -> i32;
         fn ShowWindow(hwnd: isize, ncmdshow: i32) -> i32;
@@ -2970,6 +3376,17 @@ mod sys_win {
                 return 1;
             }
             let title = String::from_utf16_lossy(&buf[..n as usize]);
+            // 只认新壳的窗口类，避免把标题里带「虎符/设置」的浏览器/聊天窗口
+            // 当成设置窗（2026-10-31 实测 DSH 会话标题会命中）。
+            let mut cbuf = [0u16; 64];
+            let cn = GetClassNameW(hwnd, cbuf.as_mut_ptr(), cbuf.len() as i32);
+            if cn <= 0 {
+                return 1;
+            }
+            let class = String::from_utf16_lossy(&cbuf[..cn as usize]);
+            if class != "HufuSettingsWnd" {
+                return 1;
+            }
             if title.contains("虎符") && title.contains("设置") {
                 FOUND.store(hwnd, std::sync::atomic::Ordering::SeqCst);
                 return 0; // 找到即停
@@ -3435,5 +3852,94 @@ mod sound_pack_tests {
         assert!(!sound_pack_name_ok("a:b"));
         assert!(!sound_pack_name_ok("a\nb"), "控制字符拒");
         assert!(!sound_pack_name_ok(&"x".repeat(65)), "超长拒");
+    }
+}
+
+#[cfg(test)]
+mod next_ui_tests {
+    use super::*;
+
+    #[test]
+    fn next_ui_assets_are_embedded() {
+        let index = next_static("/next").expect("NEXT_INDEX missing: build settings-app/dist first");
+        let html = String::from_utf8_lossy(&index.body);
+        assert!(html.contains("/assets/"), "index should reference /assets: {html}");
+
+        let js = NEXT_ASSETS
+            .iter()
+            .find(|(p, _, _)| p.ends_with(".js"))
+            .expect("no embedded .js asset");
+        let asset = next_static(js.0).expect("embedded js route");
+        assert_eq!(asset.content_type, "application/javascript; charset=utf-8");
+        assert!(!asset.body.is_empty());
+
+        assert!(next_static("/hufu-icon-q-256.png").is_some());
+        assert!(next_static("/assets/does-not-exist.js").is_none());
+    }
+
+    #[test]
+    fn next_ui_http_smoke() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Grab a free loopback port, then hand it to the real HTTP loop.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let handler = Arc::new(|req: &http::Request| -> http::Response {
+            if req.method == "GET" {
+                if let Some(resp) = next_static(&req.path) {
+                    return resp;
+                }
+            }
+            http::Response::err(404, "not found")
+        });
+        let server_addr = addr.clone();
+        std::thread::spawn(move || {
+            let _ = http::serve(&server_addr, handler);
+        });
+
+        let mut stream = None;
+        for _ in 0..40 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut stream = stream.expect("test HTTP server did not start");
+
+        let js_path = NEXT_ASSETS
+            .iter()
+            .find(|(p, _, _)| p.ends_with(".js"))
+            .expect("embedded js")
+            .0;
+        for (path, expect_type) in [("/next", "text/html"), (js_path, "application/javascript")] {
+            // HTTP/1.1 needs real CRLF; build the request as bytes.
+            let crlf = [13u8, 10u8];
+            let mut request = format!("GET {path} HTTP/1.1").into_bytes();
+            request.extend_from_slice(&crlf);
+            request.extend_from_slice(b"Host: 127.0.0.1");
+            request.extend_from_slice(&crlf);
+            request.extend_from_slice(b"Connection: close");
+            request.extend_from_slice(&crlf);
+            request.extend_from_slice(&crlf);
+            stream.write_all(&request).expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).expect("read response");
+            let text = String::from_utf8_lossy(&raw);
+            assert!(text.starts_with("HTTP/1.1 200"), "{path}: {text}");
+            assert!(text.to_ascii_lowercase().contains(expect_type), "{path}: {text}");
+            if path == "/next" {
+                assert!(text.contains("/assets/"), "index body should reference assets");
+            }
+            // Reconnect for the next request (Connection: close).
+            if path != js_path {
+                stream = TcpStream::connect(&addr).expect("reconnect");
+            }
+        }
     }
 }

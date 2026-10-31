@@ -1,0 +1,477 @@
+/* ── 输入页（InputPage）───────────────────────────────────────────────
+   只新增页面级类名，不改 app.css；颜色/圆角/阴影全部复用 app.css tokens。 */
+
+.ip-dirty {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(231, 183, 92, 0.3);
+  background: var(--gold-soft);
+  color: var(--gold2);
+  font-size:13px;
+  line-height: 1.5;
+}
+.ip-dirty .dot {
+  width: 5px;
+  height: 5px;
+}
+.ip-dirty .btn {
+  margin-left: auto;
+}
+
+.ip-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 14px;
+}
+
+.ip-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr);
+  gap: 14px;
+  align-items: start;
+  margin-top: 14px;
+  min-width: 0;
+  padding-bottom: 20px;
+}
+.ip-col {
+  display: contents;
+}
+
+.ip-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.ip-tab {
+  height: 36px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text3);
+  font: 500 13.5px inherit;
+  cursor: pointer;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
+}
+.ip-tab:hover { color: var(--text); background: rgba(255,255,255,.03); }
+.ip-tab.on {
+  color: var(--gold2);
+  border-bottom-color: var(--gold);
+  background: linear-gradient(180deg, rgba(231,183,92,.06), transparent);
+}
+.ip-grid[data-tab="switch"] .ip-card:not([data-cat="switch"]),
+.ip-grid[data-tab="input"] .ip-card:not([data-cat="input"]),
+.ip-grid[data-tab="candidates"] .ip-card:not([data-cat="candidates"]),
+.ip-grid[data-tab="sound"] .ip-card:not([data-cat="sound"]),
+.ip-grid[data-tab="advanced"] .ip-card:not([data-cat="advanced"]) {
+  display: none;
+}
+.ip-grid[data-tab="switch"] .ip-card[data-cat="switch"],
+.ip-grid[data-tab="input"] .ip-card[data-cat="input"] {
+  grid-column: 1 / -1;
+}
+
+.ip-card {
+  padding: 15px 17px 13px;
+  min-width: 0;
+}
+.ip-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 21px;
+  margin-bottom: 9px;
+}
+.ip-card-title {
+  font-size:14.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.ip-card-head .badge {
+  margin-left: auto;
+  height: 18px;
+  font-size:11px;
+}
+.ip-card-sub {
+  font-size:13px;
+  color: var(--text3);
+  line-height: 1.6;
+  margin: -3px 0 10px;
+}
+
+.ip-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 38px;
+  padding: 6px 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.ip-row:first-child {
+  border-top: 0;
+}
+.ip-row-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ip-label {
+  font-size:13.5px;
+  color: var(--text);
+  line-height: 1.35;
+}
+.ip-hint {
+  font-size:13px;
+  color: var(--text3);
+  line-height: 1.55;
+}
+.ip-hint b {
+  font-weight: 500;
+  color: var(--text2);
+}
+.ip-control {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ip-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px 12px;
+  align-items: start;
+}
+.ip-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  margin-top: 4px;
+}
+.ip-field.wide {
+  grid-column: 1 / -1;
+}
+.ip-field.wide > .ip-input:not(.num):not(.char) {
+  max-width: 560px;
+}
+.ip-cols {
+  max-width: 660px;
+}
+
+.ip-input,
+.ip-select {
+  height: 31px;
+  width: 100%;
+  min-width: 0;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg) 74%, #000 26%);
+  color: var(--text);
+  padding: 0 9px;
+  font: 12px/1 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  outline: none;
+}
+.ip-input:focus,
+.ip-select:focus {
+  border-color: rgba(231, 183, 92, 0.55);
+  box-shadow: 0 0 0 2px rgba(231, 183, 92, 0.1);
+}
+.ip-input:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ip-input.num {
+  width: 92px;
+  font-variant-numeric: tabular-nums;
+}
+.ip-input.char {
+  width: 76px;
+  text-align: center;
+}
+.ip-input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.ip-input[type='number']::-webkit-inner-spin-button,
+.ip-input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.ip-select {
+  appearance: none;
+  padding-right: 26px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%2377746d'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  cursor: pointer;
+}
+
+.ip-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  flex-wrap: nowrap;
+}
+.ip-seg.caps {
+  flex-wrap: wrap;
+  max-width: 268px;
+  justify-content: flex-end;
+}
+.ip-seg button {
+  height: 25px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text3);
+  font-size:13px;
+  line-height: 1;
+  font-family: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ip-seg.caps button {
+  padding: 0 7px;
+  font-size:13px;
+}
+.ip-seg button:hover {
+  color: var(--text2);
+}
+.ip-seg button.on {
+  background: var(--surface2);
+  color: var(--text);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset;
+}
+
+.ip-warn {
+  margin-top: 9px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid rgba(224, 106, 90, 0.24);
+  background: rgba(224, 106, 90, 0.08);
+  color: var(--red);
+  font-size:13px;
+  line-height: 1.55;
+}
+.ip-warn-top {
+  margin-top: 10px;
+  font-size:13px;
+}
+
+.ip-audio {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.ip-audio button {
+  height: 25px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  color: var(--text2);
+  font-size:13px;
+  line-height: 1;
+  font-family: inherit;
+  cursor: pointer;
+}
+.ip-audio button:hover {
+  border-color: rgba(231, 183, 92, 0.45);
+  color: var(--gold2);
+}
+
+.ip-recorders {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 8px 0 2px;
+}
+.ip-recorder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 6px 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.ip-recorder:first-child { border-top: 0; }
+.ip-recorder > span {
+  min-width: 132px;
+  font-size: 13px;
+  color: var(--text2);
+}
+.ip-recorder .btn { margin-left: auto; flex: none; }
+.ip-recorder .ip-code { min-width: 92px; text-align: center; }
+
+.ip-note {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+  font-size:13px;
+  color: var(--text3);
+  line-height: 1.65;
+}
+.ip-note b {
+  color: var(--text2);
+  font-weight: 500;
+}
+
+.ip-kv {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 5px 10px;
+  font-size:13px;
+  line-height: 1.5;
+}
+.ip-kv span {
+  color: var(--text3);
+}
+.ip-kv b {
+  color: var(--text2);
+  font-weight: 500;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ip-link-btn {
+  align-self: flex-start;
+  margin-top: 10px;
+  text-decoration: none;
+  color: var(--text2);
+}
+.ip-link-btn:hover {
+  color: var(--text);
+  border-color: rgba(231,183,92,.45);
+  background: var(--surface2);
+}
+.ip-link-btn .icon:last-child { width: 12px; height: 12px; color: var(--text3); }
+
+.ip-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 11px;
+  color: var(--gold2);
+  font-size:13px;
+  text-decoration: none;
+}
+.ip-link:hover {
+  text-decoration: underline;
+}
+.ip-link .icon {
+  width: 12px;
+  height: 12px;
+}
+.ip-code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size:13px;
+  color: var(--text2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.ip-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 14px;
+  padding: 10px 2px 12px;
+  border-top: 1px solid var(--line);
+  font-size:13px;
+  color: var(--text3);
+}
+.ip-foot > span {
+  margin-right: auto;
+  line-height: 1.5;
+}
+.ip-foot .ip-foot-warn {
+  color: var(--red);
+}
+
+body.light .ip-input,
+body.light .ip-select {
+  background: #fffdf7;
+  border-color: #d8cfbc;
+}
+body.light .ip-input:focus,
+body.light .ip-select:focus {
+  border-color: rgba(168, 116, 26, 0.55);
+}
+body.light .ip-seg {
+  background: var(--bg);
+}
+body.light .ip-seg button.on {
+  background: var(--surface);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+}
+body.light .ip-audio button {
+  background: var(--surface);
+}
+body.light .ip-code {
+  background: #fffdf7;
+  border-color: #d8cfbc;
+}
+
+@media (max-width: 1100px) {
+  .ip-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ip-tabs {
+    gap: 0;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+  }
+  .ip-tab {
+    flex: none;
+    padding: 0 11px;
+  }
+}
+
+@media (max-width: 700px) {
+  .ip-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ip-row {
+    flex-wrap: wrap;
+  }
+  .ip-control {
+    margin-left: auto;
+  }
+  .ip-input.num {
+    width: 100px;
+  }
+  .ip-card {
+    padding: 13px 14px 11px;
+  }
+}
+
+@media (max-height: 760px) {
+  .ip-summary {
+    margin-top: 10px;
+  }
+  .ip-grid {
+    margin-top: 10px;
+    gap: 11px;
+  }
+}
