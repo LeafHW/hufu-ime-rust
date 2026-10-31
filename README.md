@@ -44,7 +44,7 @@ fcitx5-configtool  # 手动添加「虎符」（或以发行版的方式）
 
 Linux 详见 [platform/linux/README.md](platform/linux/README.md)
 
-### **macOS**（尚未开始开发）
+### **macOS**（开发中，预计11月20日前后上线）
 
 ## 版权声明
 
