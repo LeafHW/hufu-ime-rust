@@ -3,6 +3,7 @@ import { loadBootstrap } from './api';
 import { PAGE_TITLE, Sidebar, TitleBar } from './components/Shell';
 import { Toast } from './components/ui';
 import { AboutPage } from './pages/AboutPage';
+import { DonatePage } from './pages/DonatePage';
 import { Overview } from './pages/Overview';
 import { SkinStudio } from './pages/SkinStudio';
 import { Sync } from './pages/Sync';
@@ -16,7 +17,7 @@ import { fallbackBootstrap, type Bootstrap, type Route, type ThemeMode } from '.
 import { getDirtyPages, subscribeDirty } from './dirtyGuard';
 import './styles/app.css';
 
-const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'buddy', 'sentence', 'data', 'sync', 'about'];
+const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
 
 function readRoute(): Route {
   const h = (location.hash || '').replace('#', '').replace(/^\//, '').split('/')[0];
@@ -73,7 +74,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.body.dataset.screen = route === 'about' ? 'other' : route;
+    document.body.dataset.screen = route === 'about' || route === 'donate' ? 'other' : route;
     document.title = `${PAGE_TITLE[route]} · 虎符设置`;
   }, [route]);
 
@@ -210,6 +211,7 @@ export default function App() {
           </section>
           <section className="screen" id="s-other">
             {route === 'about' ? <AboutPage about={data.about} /> : null}
+            {route === 'donate' ? <DonatePage /> : null}
           </section>
         </main>
       </div>

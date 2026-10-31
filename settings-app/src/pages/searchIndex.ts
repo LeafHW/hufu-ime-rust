@@ -85,4 +85,5 @@ export const SEARCH_ITEMS: SearchItem[] = [
   { title: '数据导出 / 导入', desc: '导出 JSON、导入恢复全部配置', route: 'data', group: '数据', icon: 'db', keys: '数据 导出 导入 json 备份 恢复 配置' },
   { title: '数据 / 安装 / 码表目录', desc: '打开本机数据、安装、码表目录', route: 'data', group: '数据', icon: 'folder', keys: '数据 目录 安装 码表 打开 路径 文件夹' },
   { title: '关于与更新', desc: '版本、安装目录、开源仓库', route: 'about', group: '关于', icon: 'info', keys: '关于 版本 更新 github 仓库 目录 升级' },
+  { title: '打赏支持', desc: '扫码打赏，支持作者继续开发', route: 'donate', group: '关于', icon: 'heart', keys: '打赏 支持 捐赠 赞赏 二维码 咖啡' },
 ];

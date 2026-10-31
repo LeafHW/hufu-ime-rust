@@ -8,7 +8,8 @@ export type Route =
   | 'sentence'
   | 'data'
   | 'sync'
-  | 'about';
+  | 'about'
+  | 'donate';
 
 export type ThemeMode = 'system' | 'dark' | 'light';
 

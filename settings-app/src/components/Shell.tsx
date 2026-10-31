@@ -14,6 +14,7 @@ export const PAGE_TITLE: Record<Route, string> = {
   data: '数据与备份',
   sync: '云同步',
   about: '关于',
+  donate: '打赏支持',
 };
 
 const GROUPS: { label: string; items: { key: Route; label: string; icon: string }[] }[] = [
@@ -43,7 +44,10 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
   },
   {
     label: '其他',
-    items: [{ key: 'about', label: '关于', icon: 'info' }],
+    items: [
+      { key: 'about', label: '关于', icon: 'info' },
+      { key: 'donate', label: '打赏支持', icon: 'heart' },
+    ],
   },
 ];
 

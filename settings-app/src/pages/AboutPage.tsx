@@ -63,11 +63,6 @@ export function AboutPage({ about }: { about: About }) {
           </div>
         </div>
       </div>
-      <div className="about-donate card">
-        <div className="label">打赏支持</div>
-        <p className="donate-hint">扫码打赏，支持作者继续开发</p>
-        <img src="/donate.png" alt="打赏码" loading="lazy" />
-      </div>
       <div className="about-grid">
         <div className="card about-card">
           <div className="label">安装目录</div>

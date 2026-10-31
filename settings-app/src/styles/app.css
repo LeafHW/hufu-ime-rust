@@ -840,7 +840,10 @@ body.light .about-hero img {
 .update-note.ok{color:var(--ok,#3aaf5c)}
 .update-note.has-update{color:var(--accent,#2f7bd9);font-weight:600}
 .update-note.err{color:var(--danger,#d24a3e)}
-/* 【打赏码 2026-11-01】关于页打赏卡片（v1.9.3 起的惯例回归） */
-.about-donate{margin-top:14px;display:flex;flex-direction:column;align-items:center;padding:22px 28px;gap:6px}
-.about-donate img{width:220px;height:auto;border-radius:8px;margin-top:6px}
-.donate-hint{margin:0;color:var(--muted,#888);font-size:13px}
+/* 【打赏页 2026-11-01】独立导航页（关于下方，v1.9.3 打赏惯例回归） */
+.donate-page{margin-top:14px;display:flex;gap:32px;align-items:center;justify-content:center;padding:36px 40px;flex-wrap:wrap}
+.donate-qr img{width:260px;height:auto;border-radius:10px;display:block}
+.donate-text{max-width:340px}
+.donate-text h3{margin:0 0 10px;font-size:18px}
+.donate-text p{margin:0 0 10px;color:var(--muted,#888);font-size:14px;line-height:1.7}
+.donate-note{font-size:13px!important}
