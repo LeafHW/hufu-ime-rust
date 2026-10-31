@@ -840,3 +840,7 @@ body.light .about-hero img {
 .update-note.ok{color:var(--ok,#3aaf5c)}
 .update-note.has-update{color:var(--accent,#2f7bd9);font-weight:600}
 .update-note.err{color:var(--danger,#d24a3e)}
+/* 【打赏码 2026-11-01】关于页打赏卡片（v1.9.3 起的惯例回归） */
+.about-donate{margin-top:14px;display:flex;flex-direction:column;align-items:center;padding:22px 28px;gap:6px}
+.about-donate img{width:220px;height:auto;border-radius:8px;margin-top:6px}
+.donate-hint{margin:0;color:var(--muted,#888);font-size:13px}
