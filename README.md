@@ -1,7 +1,7 @@
 # 虎符 HuFu — 以虎码为核心的跨平台输入法
 
 > 名字取自古代调兵信物「虎符」：以虎码为主码的输入法平台，Windows / Linux / macOS 三端
-> （Windows 真机全通；Linux fcitx5 通用输入主链可用；macOS 尚未开始开发）。
+> （Windows 真机全通；Linux fcitx5 通用输入主链可用；macOS开发中）。
 > 目标：吸收 **虎爪输入法（TigerClaw）** 与 **Rime（虎码配置）** 的全部能力，
 > 重新实现为「统一引擎 + 多平台前端 + 图形化设置」的产品级输入法。
 
