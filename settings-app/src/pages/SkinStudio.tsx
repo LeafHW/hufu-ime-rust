@@ -822,11 +822,19 @@ export function SkinStudio({
                   keys: [
                     ['hilited_candidate_back_color', '高亮底'],
                     ['hilited_candidate_text_color', '高亮文字'],
-                    ['hilited_candidate_label_color', '高亮序号·候选行'],
+                    ['hilited_candidate_label_color', '高亮序号'],
                     ['hilited_text_color', '编码高亮'],
-                    ['hilited_label_color', '高亮序号·编码行'],
                     ['hilited_comment_text_color', '高亮注释'],
                     ['hilited_back_color', '高亮背景'],
+                  ] as const,
+                },
+                {
+                  title: '文字区 · 普通候选文字',
+                  keys: [
+                    ['text_color', '编码'],
+                    ['candidate_text_color', '候选文字'],
+                    ['label_color', '序号'],
+                    ['comment_text_color', '注释'],
                   ] as const,
                 },
                 {
@@ -839,15 +847,6 @@ export function SkinStudio({
                     ['preedit_back_color', '编码底'],
                     ['capsule_back_color', '状态胶囊底'],
                     ['capsule_text_color', '状态胶囊字'],
-                  ] as const,
-                },
-                {
-                  title: '文字区 · 普通候选文字',
-                  keys: [
-                    ['text_color', '编码'],
-                    ['candidate_text_color', '候选文字'],
-                    ['label_color', '序号'],
-                    ['comment_text_color', '注释'],
                   ] as const,
                 },
               ]).map(({ title, keys }) => (

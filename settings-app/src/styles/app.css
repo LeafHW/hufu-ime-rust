@@ -360,7 +360,7 @@
   .stage-colors{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--line);padding:8px 12px 10px;background:var(--surface)}
   .stage-colors .sc-group{margin-bottom:6px}
   .stage-colors .sc-group:last-child{margin-bottom:0}
-  .stage-colors .sc-h{display:flex;align-items:center;font-size:12px;font-weight:600;color:var(--text2);margin:2px 0 6px}
+  .stage-colors .sc-h{display:flex;align-items:center;font-size:14px;font-weight:700;color:var(--gold2);margin:4px 0 7px}
   .stage-colors .sc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px 12px}
   .stage-colors .sc-item{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;color:var(--text2)}
   .stage-colors .sc-item .lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
