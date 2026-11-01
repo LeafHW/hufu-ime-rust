@@ -837,7 +837,6 @@ export function SkinStudio({
                     <div className="sc-item" key={key} title={`skin.colors.${key}`}>
                       <ColorSwatch value={cur} label={COLOR_LABELS[key] || key} onChange={(v) => patchColors(key, v)} />
                       <span className="lab">{COLOR_LABELS[key] || key}</span>
-                      <span className="val">{cur.slice(0, 7)}</span>
                     </div>
                   );
                 })}

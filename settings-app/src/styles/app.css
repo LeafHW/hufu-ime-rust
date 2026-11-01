@@ -362,7 +362,6 @@
   .stage-colors .sc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px 12px}
   .stage-colors .sc-item{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;color:var(--text2)}
   .stage-colors .sc-item .lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .stage-colors .sc-item .val{margin-left:auto;color:var(--text3);font-size:11px}
   .stage:before{
     content:"";position:absolute;width:540px;height:540px;left:-10%;top:-18%;border-radius:50%;
     background:radial-gradient(circle,rgba(255,206,130,.28),transparent 64%);filter:blur(28px);
