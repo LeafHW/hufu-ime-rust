@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Bootstrap, Skin, SkinMeta } from '../types';
+import { fallbackSkin } from '../types';
 import { deleteSsfSkin, loadSkin, loadFonts, loadSsfSettings, saveSsfSettings, resetSkin, saveSkin, selectSkin as selectSkinApi } from '../api';
 import type { SsfOverrides } from '../api';
 import { useDirtyGuard } from '../dirtyGuard';
@@ -999,6 +1000,50 @@ export function SkinStudio({
                   label="阴影"
                 />
               </div>
+            </div>
+
+            {/* 【颜色补全 2026-11-01】自有皮肤此前只有窗底色/高亮色两个
+                取色器，其余颜色字段（边框/候选文字/注释/序号/编码色等）
+                无 UI 可调。此处按 COLOR_LABELS 全量补齐；窗底色与高亮底
+                已在上方「材质」区（带透明度联动），不重复列出。 */}
+            <div className="insp-sec">
+              <div className="insp-sec-h">
+                <Icon name="chev-down" className="icon chev" />
+                颜色
+                <Badge>全部可调</Badge>
+              </div>
+              {([
+                'border_color',
+                'candidate_back_color',
+                'preedit_back_color',
+                'text_color',
+                'hilited_text_color',
+                'candidate_text_color',
+                'hilited_candidate_text_color',
+                'label_color',
+                'hilited_label_color',
+                'hilited_candidate_label_color',
+                'comment_text_color',
+                'hilited_comment_text_color',
+                'hilited_back_color',
+                'shadow_color',
+                'capsule_back_color',
+                'capsule_text_color',
+              ] as const).map((key) => {
+                const cur =
+                  (skin?.colors?.[key] as string | undefined) ||
+                  (fallbackSkin.colors as unknown as Record<string, string>)[key] ||
+                  '#00000000';
+                return (
+                  <div className="row-line" key={key}>
+                    <span className="lab" title={`skin.colors.${key}`}>{COLOR_LABELS[key] || key}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <ColorSwatch value={cur} label={COLOR_LABELS[key] || key} onChange={(v) => patchColors(key, v)} />
+                      <span className="val">{cur.slice(0, 9)}</span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
             <div className="insp-sec">

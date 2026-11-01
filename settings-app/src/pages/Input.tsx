@@ -385,6 +385,28 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [recorder, setRecorder] = useState<keyof InputDraft['readOnly'] | null>(null);
   const [recordPreview, setRecordPreview] = useState('');
+  /* 【组合键开关 2026-11-01】调频/删词/导出功能开关：关=写空串（引擎
+     parse_key_combo 空集恒 false=停用），重开恢复上次值（ref 记忆）。 */
+  const lastCombo = useRef<Record<string, string>>({});
+  useEffect(() => {
+    for (const k of ['freq_key', 'delete_key', 'export_key'] as const) {
+      const v = draft.readOnly[k];
+      if (v) lastCombo.current[k] = v;
+    }
+    // 仅挂载时播种记忆（draft 引用不稳定，不进依赖）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const toggleCombo = (key: 'freq_key' | 'delete_key' | 'export_key', on: boolean | string) => {
+    if (on) {
+      const fallback = key === 'freq_key' ? 'ctrl' : key === 'delete_key' ? 'ctrl+shift' : '';
+      const v = lastCombo.current[key] || fallback;
+      setDraft((p) => ({ ...p, readOnly: { ...p.readOnly, [key]: v } }));
+    } else {
+      const cur = draft.readOnly[key];
+      if (cur) lastCombo.current[key] = cur;
+      setDraft((p) => ({ ...p, readOnly: { ...p.readOnly, [key]: '' } }));
+    }
+  };
   const [tab, setTab] = useState<InputTab>(tabFromHash);
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(saved), [draft, saved]);
@@ -599,6 +621,19 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
       setRecordPreview('');
       notify(value ? `已录制：${value}（保存后生效）` : '已清空该组合键');
     };
+    /* 【单键可录 2026-11-01】旧逻辑 bug：录单修饰键（如只按 Alt）时，
+       keydown 起 450ms 计时，用户正常速度松开 → keyup 后按「当前按住
+       集」（已空）录成空串=停用——单键永远设不上，只有组合能录成。
+       修法：本会话按过的键记入 history，keyup 收尾时录「按过并集」
+       （按过即录）：单击 Alt → 'alt'；Ctrl+Shift 按下再全松 →
+       'ctrl+shift'；普通键立即录不变。 */
+    const history = new Set<string>();
+    const recordMods = (e: KeyboardEvent) => {
+      if (e.ctrlKey) history.add('ctrl');
+      if (e.altKey) history.add('alt');
+      if (e.shiftKey) history.add('shift');
+      if (e.metaKey) history.add('win');
+    };
     const scheduleModifier = (e: KeyboardEvent) => {
       const value = mods(e).join('+');
       setRecordPreview(value);
@@ -621,6 +656,7 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
       }
       const raw = e.key;
       if (['Control', 'Shift', 'Alt', 'Meta', 'OS'].includes(raw)) {
+        recordMods(e);
         scheduleModifier(e);
         return;
       }
@@ -630,8 +666,10 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (['Control', 'Shift', 'Alt', 'Meta', 'OS'].includes(e.key)) {
+        /* 【单键可录 2026-11-01】收尾值取「本会话按过并集」而非当前
+           按住集——松开最后一个键时按住集已空，旧行为会录成空串。 */
         window.clearTimeout(timer);
-        timer = window.setTimeout(() => finish(mods(e).join('+')), 300);
+        timer = window.setTimeout(() => finish([...history].join('+')), 300);
       }
     };
     window.addEventListener('keydown', onKeyDown, true);
@@ -1213,23 +1251,29 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
               ] as const).map(([key, label]) => (
                 <div className="ip-recorder" key={key}>
                   <span>{label}</span>
-                  <code className="ip-code">{draft.readOnly[key] || (key === 'export_key' ? '未设置' : '停用')}</code>
+                  <code className="ip-code">{draft.readOnly[key] || '已停用'}</code>
                   <button
                     type="button"
                     className={`btn sm${recorder === key ? ' goldline' : ''}`}
+                    disabled={!draft.readOnly[key] && !lastCombo.current[key]}
                     onClick={() => {
                       setRecordPreview('');
                       setRecorder(recorder === key ? null : key);
                     }}
                   >
-                    {recorder === key ? (recordPreview ? `录制中 ${recordPreview}` : '按下组合键…') : '录制'}
+                    {recorder === key ? (recordPreview ? `录制中 ${recordPreview}` : '按下任意键…') : '录制'}
                   </button>
+                  <Switch
+                    on={!!draft.readOnly[key]}
+                    onChange={(v) => toggleCombo(key, v)}
+                    title={draft.readOnly[key] ? '点击停用该功能' : '点击启用（恢复上次键位）'}
+                  />
                 </div>
               ))}
             </div>
             <div className="ip-note">
-              示例：调频可只按 Ctrl；删词可录 Ctrl+Shift；导出可录 Ctrl+Alt+E。录制后点「保存并应用」才写入 config。
-              Esc 取消，Backspace 清空。
+              单键或组合都可以：单击 Alt 录成单键「alt」，按住 Ctrl+Shift 再松开录成「ctrl+shift」，普通键（如 Tab）单击即录。
+              开关关闭 = 该功能停用（键位保留，重开即恢复）。录制后点「保存并应用」才写入 config；Esc 取消，Backspace 清空。
             </div>
           </Card>
         </div>
