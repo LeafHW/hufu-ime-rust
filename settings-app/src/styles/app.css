@@ -347,9 +347,11 @@
   .seg .sg{height:24px;padding:0 8px;display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text3);border-radius:5px}
   .seg .sg.on{background:var(--surface2);color:var(--text)}
   .stage-toolbar .spacer{flex:1}
-  /* 【皮肤列表分页签 2026-11-01】列表卡内页签（复用 seg 形态）贴搜索框下 */
+  /* 【皮肤列表分页签 2026-11-01】列表卡内页签（复用 seg 形态）贴搜索框下；
+     选中页签金底深字高亮（同候选首选配色），一眼可见当前组。 */
   .skin-list .seg{margin:2px 0 6px}
   .skin-list .seg .sg{flex:1;justify-content:center}
+  .skin-list .seg .sg.on{background:var(--gold2);color:#1A1408;font-weight:700}
   .tool{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--text2);height:26px;padding:0 7px;border-radius:6px}
   .tool .icon{width:13px;height:13px}
   .stage{
