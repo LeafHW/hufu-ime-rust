@@ -812,35 +812,63 @@ export function SkinStudio({
           </div>
 
           {/* 【颜色区下置 2026-11-01】色板网格放预览正下方（预览已砍到
-              44% 高）：4 列网格排整齐，取代右侧参数面板里的竖排长列表。
-              项集合与 insp 旧「颜色」区一致（窗底色/高亮底在「材质」区）。 */}
+              44% 高），按功能分三区：高亮 / 候选框 / 文字。项集合与 insp
+              旧「颜色」区一致（窗底色/高亮底原在「材质」区，现统一收编）。 */}
           {!isSsf ? (
             <div className="stage-colors">
-              <div className="sc-h">颜色 · 点击色块修改（保存后生效）</div>
-              <div className="sc-grid">
-                {([
-                  'back_color', 'hilited_candidate_back_color',
-                  'border_color', 'candidate_back_color',
-                  'preedit_back_color', 'text_color',
-                  'hilited_text_color', 'candidate_text_color',
-                  'hilited_candidate_text_color', 'label_color',
-                  'hilited_label_color', 'hilited_candidate_label_color',
-                  'comment_text_color', 'hilited_comment_text_color',
-                  'shadow_color', 'capsule_back_color', 'capsule_text_color',
-                  'hilited_back_color',
-                ] as const).map((key) => {
-                  const cur =
-                    (skin?.colors?.[key] as string | undefined) ||
-                    (fallbackSkin.colors as unknown as Record<string, string>)[key] ||
-                    '#00000000';
-                  return (
-                    <div className="sc-item" key={key} title={`skin.colors.${key}`}>
-                      <ColorSwatch value={cur} label={COLOR_LABELS[key] || key} onChange={(v) => patchColors(key, v)} />
-                      <span className="lab">{COLOR_LABELS[key] || key}</span>
-                    </div>
-                  );
-                })}
-              </div>
+              {([
+                {
+                  title: '高亮区 · 选中项底色与文字',
+                  keys: [
+                    ['hilited_candidate_back_color', '高亮底'],
+                    ['hilited_candidate_text_color', '高亮文字'],
+                    ['hilited_candidate_label_color', '高亮序号·候选行'],
+                    ['hilited_text_color', '编码高亮'],
+                    ['hilited_label_color', '高亮序号·编码行'],
+                    ['hilited_comment_text_color', '高亮注释'],
+                    ['hilited_back_color', '高亮背景'],
+                  ] as const,
+                },
+                {
+                  title: '候选框区 · 窗体与底色',
+                  keys: [
+                    ['back_color', '窗底色'],
+                    ['border_color', '边框'],
+                    ['shadow_color', '阴影'],
+                    ['candidate_back_color', '候选底'],
+                    ['preedit_back_color', '编码底'],
+                    ['capsule_back_color', '状态胶囊底'],
+                    ['capsule_text_color', '状态胶囊字'],
+                  ] as const,
+                },
+                {
+                  title: '文字区 · 普通候选文字',
+                  keys: [
+                    ['text_color', '编码'],
+                    ['candidate_text_color', '候选文字'],
+                    ['label_color', '序号'],
+                    ['comment_text_color', '注释'],
+                  ] as const,
+                },
+              ]).map(({ title, keys }) => (
+                <div className="sc-group" key={title}>
+                  <div className="sc-h">{title}</div>
+                  <div className="sc-grid">
+                    {keys.map(([key, label]) => {
+                      const cur =
+                        (skin?.colors?.[key] as string | undefined) ||
+                        (fallbackSkin.colors as unknown as Record<string, string>)[key] ||
+                        '#00000000';
+                      return (
+                        <div className="sc-item" key={key} title={`skin.colors.${key}`}>
+                          <ColorSwatch value={cur} label={label} onChange={(v) => patchColors(key, v)} />
+                          <span className="lab">{label}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
             </div>
           ) : null}
 
