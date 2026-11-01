@@ -385,14 +385,34 @@ export function SkinStudio({
     setSaving(true);
     try {
       const fresh = await loadSkin(id); // A-2：校验返回 id 与请求一致
+      /* 【颜色白名单修复 2026-11-01】旧白名单只合并 back_color 与
+         hilited_candidate_back_color 两键（材质区两个取色器时代）；
+         色板全量上 UI 后其余颜色项改动在保存时被静默丢弃（POST 落盘
+         旧值、界面却转已保存）——假设置。现按色板 14 项全列合并。 */
+      const COLOR_KEYS = [
+        'back_color',
+        'border_color',
+        'shadow_color',
+        'candidate_back_color',
+        'preedit_back_color',
+        'text_color',
+        'candidate_text_color',
+        'label_color',
+        'comment_text_color',
+        'hilited_text_color',
+        'hilited_comment_text_color',
+        'hilited_candidate_back_color',
+        'hilited_candidate_text_color',
+        'hilited_candidate_label_color',
+      ] as const;
+      const colors: Record<string, string> = { ...(fresh.colors || {}) };
+      for (const k of COLOR_KEYS) {
+        const v = (skin.colors as Record<string, string> | undefined)?.[k];
+        if (v != null) colors[k] = v;
+      }
       const merged: Skin = {
         ...fresh,
-        colors: {
-          ...fresh.colors,
-          back_color: skin.colors?.back_color ?? fresh.colors?.back_color,
-          hilited_candidate_back_color:
-            skin.colors?.hilited_candidate_back_color ?? fresh.colors?.hilited_candidate_back_color,
-        },
+        colors: colors as typeof fresh.colors,
         material: {
           ...fresh.material,
           master_alpha: skin.material.master_alpha ?? fresh.material.master_alpha,
@@ -859,7 +879,7 @@ export function SkinStudio({
                     ['hilited_candidate_label_color', '高亮序号'],
                     ['hilited_text_color', '编码高亮'],
                     ['hilited_comment_text_color', '高亮注释'],
-                    ['hilited_back_color', '高亮背景'],
+                    /* hilited_back_color 全链零消费，撤出（假设置清除 2026-11-01） */
                   ] as const,
                 },
                 {
@@ -874,13 +894,15 @@ export function SkinStudio({
                 {
                   title: '候选框区 · 窗体与底色',
                   keys: [
+                    /* 【假设置清除 2026-11-01】hilited_back_color 与
+                       capsule_back/text_color 在 DLL+server 全链零消费
+                       （「状态胶囊」概念引擎不存在，胶囊=高亮候选底块，
+                       由高亮底负责），设置后永不生效——撤出 UI。 */
                     ['back_color', '窗底色'],
                     ['border_color', '边框'],
                     ['shadow_color', '阴影'],
                     ['candidate_back_color', '候选底'],
                     ['preedit_back_color', '编码底'],
-                    ['capsule_back_color', '状态胶囊底'],
-                    ['capsule_text_color', '状态胶囊字'],
                   ] as const,
                 },
               ]).map(({ title, keys }) => (
