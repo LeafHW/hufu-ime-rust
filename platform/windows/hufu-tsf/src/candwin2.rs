@@ -3406,6 +3406,13 @@ impl CandidateWindowV2 {
         anchor: Option<&RECT>,
         selected: usize,
     ) {
+        // 【2026-11 UI-less 接管】宿主声明自绘（pbShow=FALSE 且非"假自绘"游戏）
+        // → 不再弹自家候选窗，避免双层候选/错位。所有车道都经 show()，
+        // 此门一刀覆盖打字/上屏/调频/动画 tick/皮肤重绘全部路径。
+        if crate::candidate_ui::host_draws() {
+            self.hide();
+            return;
+        }
         // 【T8 用户铁律·框内永不画编码 2026-10-07 终局二】show() 咽喉
         // 一刀：显示用 raw 恒空——**所有车道**（打字/上屏/调频刷新/
         // 动画 tick 复渲染/皮肤重绘/焦点重显）必经此处，无路可绕。

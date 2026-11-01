@@ -154,7 +154,59 @@ pub(crate) fn read_installdir() -> Option<String> {
     }
 }
 
+/// 【2026-11 安全阀】当前进程是否提权（TokenElevation）。
+/// 提权宿主里拉起 server = 高完整性级别常驻进程，普通权限杀不掉——
+/// 用户反馈「退出游戏也没用、必须重启电脑」的直接来源之一。
+fn process_is_elevated() -> bool {
+    #[repr(C)]
+    struct TokenElevation {
+        token_is_elevated: u32,
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION_CLASS: i32 = 20;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut t: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 {
+            return false;
+        }
+        let mut te = TokenElevation {
+            token_is_elevated: 0,
+        };
+        let mut ret = 0u32;
+        let ok = GetTokenInformation(
+            t,
+            TOKEN_ELEVATION_CLASS,
+            &mut te as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(t);
+        ok != 0 && te.token_is_elevated != 0
+    }
+}
+
 fn ensure_server() -> bool {
+    // 【2026-11 安全阀】提权宿主不拉起 server（详见 process_is_elevated）：
+    // 宁可在提权进程里打字失败，也不留一个普通权限杀不掉的常驻 server。
+    if process_is_elevated() {
+        crate::tsf::trace("ipc: 提权宿主 → 不拉起 server（防高 IL 常驻进程）");
+        return false;
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     // 【退避重试 2026-09-11】旧实现 AtomicBool 一次性闸门：首次拉起
     // 失败（安装目录未就绪/杀毒拦截）后本进程永远不再尝试——用户
@@ -574,6 +626,13 @@ pub fn key_request(
 /// （异步重排到达后主动换序，用户不必按键即可看到新首选）。
 pub fn state_request() -> Option<Value> {
     let resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()})) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
+    // 【2026-11 UI-less 异步刷新】轮询响应里带回了最新候选页（含后台重排/
+    // 云候选到达后的结果）。这里无条件 publish 一次：宿主自绘（UI-less）
+    // 时我们的候选窗被隐藏，渲染路径不一定走到 update_ui，靠这一行保证
+    // 宿主看到的候选页始终是最新的（≈140ms 一拍；菜单未变则内部零动作）。
+    if let Some(state) = resp.get("state") {
+        crate::candidate_ui::publish(state);
+    }
     resp.get("state").cloned()
 }
 

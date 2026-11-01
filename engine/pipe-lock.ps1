@@ -1,5 +1,17 @@
 ﻿# 整句「写入编码选重」真码表验证 v2（动态期望 + HTTP 切方案）
 $enc = [System.Text.Encoding]::UTF8
+# [P0 白屏修复 2026-11-02] 端口自探测：4390 被系统保留/占用时 server 会退到
+# 17890+（本机实测 17890），写死 4390 会连不上。候选序列与
+# hufu-settings/src/main.rs 的 resolve_url 保持一致（/api/about 命中即用）。
+$hufuBase = $null
+foreach ($p in 4390, 17890, 17891, 17892, 17893, 17894, 27890) {
+  try {
+    $about = Invoke-RestMethod "http://127.0.0.1:$p/api/about" -TimeoutSec 1
+    if ($about -and ($about.version -or $about.github)) { $hufuBase = "http://127.0.0.1:$p"; break }
+  } catch { }
+}
+if (-not $hufuBase) { throw 'hufu-server 未响应（4390/17890-17894/27890 均无 /api/about）' }
+Write-Host "server: $hufuBase"
 function PipeCall([string]$json) {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'hufu-ime', [System.IO.Pipes.PipeDirection]::InOut)
   $pipe.Connect(3000)
@@ -21,11 +33,11 @@ function Check([string]$name, [bool]$cond, [string]$detail) {
 }
 
 # 确保在 虎整句
-$cfg = (Invoke-RestMethod http://127.0.0.1:4390/api/config)
+$cfg = (Invoke-RestMethod "$($hufuBase)/api/config")
 if ($cfg.schema.current -ne '虎整句') {
   $cfg.schema.current = '虎整句'
   $body = $cfg | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4390/api/config -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
+  Invoke-RestMethod -Method Post -Uri "$($hufuBase)/api/config" -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
   Start-Sleep -Milliseconds 500
 }
 
@@ -92,10 +104,10 @@ Check 'tujatuja 总上屏≥3字' ($null -ne $r.outcome.commit -and $total.Lengt
 
 # ── 5) 非整句回归：HTTP 切 虎码单字 → 数字选重立即上屏 → 切回
 [void](PipeCall '{"op":"reset"}')
-$cfg = (Invoke-RestMethod http://127.0.0.1:4390/api/config)
+$cfg = (Invoke-RestMethod "$($hufuBase)/api/config")
 $cfg.schema.current = '虎码单字'
 $body = $cfg | ConvertTo-Json -Depth 10
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4390/api/config -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$($hufuBase)/api/config" -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
 Start-Sleep -Milliseconds 600
 TypeCh @('j','d')
 $disp2 = @($script:last.state.candidates | ForEach-Object { $_.text })
@@ -103,10 +115,10 @@ TypeCh @('2')
 $r = $script:last
 Check "非整句 jd+2 立即上屏($($disp2[1]))" ($r.outcome.commit -eq $disp2[1]) "commit=$($r.outcome.commit)"
 # 切回 虎整句
-$cfg = (Invoke-RestMethod http://127.0.0.1:4390/api/config)
+$cfg = (Invoke-RestMethod "$($hufuBase)/api/config")
 $cfg.schema.current = '虎整句'
 $body = $cfg | ConvertTo-Json -Depth 10
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:4390/api/config -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$($hufuBase)/api/config" -Body $body -ContentType 'application/json; charset=utf-8' | Out-Null
 
 Write-Host ""
 Write-Host "结果: $pass PASS / $fail FAIL"

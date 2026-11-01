@@ -285,8 +285,27 @@ fn main() {
     // 【/jq→补充语料 2026-09-06】weight API 运行时触发整句模型重载
     // 需要 'static 句柄——全局登记。
     let _ = HOST_HANDLE.set(shared.clone());
-    let addr = format!("127.0.0.1:{port}");
-    platform::set_http_port(port);
+    // 【2026-11 端口被系统保留的修复】Windows 的 Hyper-V/WSL 动态端口保留
+    // 会把 4390 圈进去（用户实测排除段 4324-4423 命中 4390），bind 报
+    // WSAEACCES(10013)。旧实现 HTTP 失败即 exit(1) → 管道线程随进程一起死，
+    // 输入法整个打不了字（重装/重启后必现，见 21:04 事故）。
+    // 现在先探测可用端口再 serve；候选端口都在保留段之外。
+    let mut chosen_port = port;
+    for cand in [port, 17890, 17891, 17892, 17893, 17894, 27890] {
+        match std::net::TcpListener::bind(("127.0.0.1", cand)) {
+            Ok(l) => {
+                drop(l);
+                chosen_port = cand;
+                break;
+            }
+            Err(e) => eprintln!("HTTP 候选端口 {cand} 不可用: {e}"),
+        }
+    }
+    if chosen_port != port {
+        eprintln!("HTTP 端口 {port} 不可用（系统保留/占用），改用 {chosen_port}");
+    }
+    let addr = format!("127.0.0.1:{chosen_port}");
+    platform::set_http_port(chosen_port);
 
     // 前端 IPC 独立线程（Windows 命名管道 `\\.\pipe\hufu-ime`，Unix
     // `$XDG_RUNTIME_DIR/hufu-ime.sock`）——非 Windows 此前未启动 unix 分支。
@@ -804,8 +823,12 @@ fn main() {
         move |req: &Request| -> Response { route(&shared, req) }
     };
     if let Err(e) = http::serve(&addr, Arc::new(handler)) {
-        eprintln!("HTTP 服务失败: {e}");
-        std::process::exit(1);
+        // 【2026-11】不退出：管道（打字）不依赖 HTTP，设置页连不上只是开不了
+        // 设置窗口；exit 会让 DLL 连不上管道 → 整个输入法打不了字。
+        eprintln!("HTTP 服务失败: {e}（继续提供输入法管道服务；设置界面不可用）");
+        loop {
+            std::thread::park();
+        }
     }
 }
 

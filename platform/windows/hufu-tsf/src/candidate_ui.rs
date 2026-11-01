@@ -193,6 +193,8 @@ fn end(a: Option<Active>) {
     }
 }
 pub fn reset() {
+    // 【2026-11-02】UI 元素被回收时一并复位宿主自绘标记，否则残留 true 会继续吞自家候选。
+    HOST_DRAWS.with(|c| c.set(false));
     let a = BRIDGE.with(|b| {
         let mut b = b.borrow_mut();
         b.generation += 1;
@@ -379,6 +381,16 @@ fn publish_inner(state: &Value) {
             let mut show = BOOL(1);
             let mut id = 0;
             if unsafe { mgr.BeginUIElement(&obj, &mut show, &mut id) }.is_ok() {
+                // pbShow=FALSE：宿主声明自己画候选（UI-less 接管）
+                let host_draws = !show.as_bool();
+                let prev = HOST_DRAWS.with(|c| c.replace(host_draws));
+                if prev != host_draws {
+                    crate::tsf::trace(if host_draws {
+                        "ui: 宿主自绘候选（pbShow=FALSE）→ 不再弹自家候选窗"
+                    } else {
+                        "ui: 宿主交回自绘（pbShow=TRUE）→ 恢复自家候选窗"
+                    });
+                }
                 let mut pending = Some(Active {
                     mgr: mgr.clone(),
                     id,
@@ -398,11 +410,51 @@ fn publish_inner(state: &Value) {
     }
 }
 fn clear_menu() {
+    HOST_DRAWS.with(|c| c.set(false));
     let a = BRIDGE.with(|b| {
         let mut b = b.borrow_mut();
         b.active.take()
     });
     end(a);
+}
+
+// 【2026-11 UI-less 接管】宿主在 BeginUIElement 里回 pbShow=FALSE =
+// "应用自己画候选"。为 TRUE 时我们照旧自绘；为 FALSE 时不再弹自家候选窗，
+// 避免双层候选/错位（水杉 PR 的同一处修正）。
+// 例外：CS2/Dota2/三角洲会回 FALSE 但只替"内置白名单输入法名"画候选，
+// 对虎符不画——这些进程继续由我们自绘（等游戏兼容名称做出来再放开）。
+thread_local! { static HOST_DRAWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn fake_draw_host() -> bool {
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
+    if n == 0 {
+        return false;
+    }
+    let path = String::from_utf16_lossy(&buf[..n]);
+    let exe = std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        exe.as_str(),
+        "cs2.exe" | "dota2.exe" | "deltaforce.exe" | "deltaforceclient.exe"
+    )
+}
+
+/// 当前宿主是否自己画候选（已应用"声称自绘但其实不画"的例外）。
+/// 【2026-11-02 加词/加权窗回归】加词小窗线程的候选画在它自己身上
+///（tl_cand_show），与主文档宿主无关——主宿主声明自绘时若连它一起
+/// 吞掉，词框就只剩编码没有候选（表现为"加词框打不了字"）。
+pub fn host_draws() -> bool {
+    if crate::addword::in_window_thread() {
+        return false;
+    }
+    if std::env::var("HUFU_FORCE_HOST_DRAW").ok().as_deref() == Some("1") {
+        return true;
+    }
+    HOST_DRAWS.with(|c| c.get()) && !fake_draw_host()
 }
 
 fn target(ctx: Option<&ITfContext>) -> Option<(Option<ITfDocumentMgr>, ITfUIElementMgr)> {

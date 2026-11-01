@@ -1,5 +1,17 @@
 ﻿# 第二轮：设置生效性端到端
 $ErrorActionPreference = 'Stop'
+# [P0 白屏修复 2026-11-02] 端口自探测：4390 被系统保留/占用时 server 会退到
+# 17890+（本机实测 17890），写死 4390 会连不上/404。候选序列与
+# hufu-settings/src/main.rs 的 resolve_url 保持一致（/api/about 命中即用）。
+$hufuBase = $null
+foreach ($p in 4390, 17890, 17891, 17892, 17893, 17894, 27890) {
+  try {
+    $about = Invoke-RestMethod "http://127.0.0.1:$p/api/about" -TimeoutSec 1
+    if ($about -and ($about.version -or $about.github)) { $hufuBase = "http://127.0.0.1:$p"; break }
+  } catch { }
+}
+if (-not $hufuBase) { throw 'hufu-server 未响应（4390/17890-17894/27890 均无 /api/about）' }
+Write-Host "server: $hufuBase"
 function Send-Hufu([object]$obj) {
   $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'hufu-ime', [System.IO.Pipes.PipeDirection]::InOut)
   $pipe.Connect(3000)
@@ -21,34 +33,34 @@ function Check([string]$name, [bool]$ok, [string]$detail) {
 }
 
 # ── 1. 皮肤改色 → pipe skin op 反映 ──
-$skin = Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -TimeoutSec 5
+$skin = Invoke-RestMethod "$($hufuBase)/api/skin" -TimeoutSec 5
 $origBack = $skin.colors.back_color
 $skin.colors.back_color = '#112233FF'
 $b = [System.Text.Encoding]::UTF8.GetBytes(($skin | ConvertTo-Json -Depth 10))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/skin" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 $sk = Send-Hufu @{ op = 'skin' }
 Check '皮肤改色热反映' ($sk.skin.colors.back_color -eq '#112233FF') "got $($sk.skin.colors.back_color)"
 $skin.colors.back_color = $origBack
 $b = [System.Text.Encoding]::UTF8.GetBytes(($skin | ConvertTo-Json -Depth 10))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/skin" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 
 # ── 2. 横排开关 → skin op 反映 ──
-$skin = Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -TimeoutSec 5
+$skin = Invoke-RestMethod "$($hufuBase)/api/skin" -TimeoutSec 5
 $skin.layout.horizontal = $true
 $b = [System.Text.Encoding]::UTF8.GetBytes(($skin | ConvertTo-Json -Depth 10))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/skin" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 $sk = Send-Hufu @{ op = 'skin' }
 Check '横排开关热反映' ($sk.skin.layout.horizontal -eq $true) "got $($sk.skin.layout.horizontal)"
 $skin.layout.horizontal = $false
 $b = [System.Text.Encoding]::UTF8.GetBytes(($skin | ConvertTo-Json -Depth 10))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/skin' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/skin" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 
 # ── 3. show_index / delay_show_ms → skin op 附带 ──
-$cfg = Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -TimeoutSec 5
+$cfg = Invoke-RestMethod "$($hufuBase)/api/config" -TimeoutSec 5
 $cfg.candidates.show_index = $false
 $cfg.candidates.delay_show_ms = 250
 $b = [System.Text.Encoding]::UTF8.GetBytes(($cfg | ConvertTo-Json -Depth 12))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/config" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 $sk = Send-Hufu @{ op = 'skin' }
 Check 'show_index 附带' ($sk.show_index -eq $false) "got $($sk.show_index)"
 Check 'delay_show_ms 附带' ($sk.delay_show_ms -eq 250) "got $($sk.delay_show_ms)"
@@ -56,7 +68,7 @@ Check 'delay_show_ms 附带' ($sk.delay_show_ms -eq 250) "got $($sk.delay_show_m
 $cfg.candidates.show_index = $true
 $cfg.candidates.delay_show_ms = 0
 $b = [System.Text.Encoding]::UTF8.GetBytes(($cfg | ConvertTo-Json -Depth 12))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/config" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 
 # ── 4. 音效：立体声 KeyNormal 经 base64 下发 ──
 $snd = Send-Hufu @{ op = 'sound'; tag = 'key' }
@@ -66,10 +78,10 @@ $snd2 = Send-Hufu @{ op = 'sound'; tag = 'commit' }
 Check '音效 commit=KeySpace' ([System.Convert]::FromBase64String($snd2.data).Length -gt 28000) ''
 
 # ── 5. log_adjust → user-adjust.log ──
-$cfg = Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -TimeoutSec 5
+$cfg = Invoke-RestMethod "$($hufuBase)/api/config" -TimeoutSec 5
 $cfg.user.log_adjust = $true
 $b = [System.Text.Encoding]::UTF8.GetBytes(($cfg | ConvertTo-Json -Depth 12))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/config" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 $logPath = 'E:\DSH-KF\hufu\hufu-data\user-adjust.log'
 if (Test-Path $logPath) { Remove-Item $logPath -Force }
 $null = Send-Hufu @{ op = 'reset' }
@@ -80,7 +92,7 @@ $logged = (Test-Path $logPath) -and ((Get-Content $logPath -Encoding UTF8 | Meas
 Check 'log_adjust 用户调整日志' $logged "log exists=$(Test-Path $logPath)"
 $cfg.user.log_adjust = $false
 $b = [System.Text.Encoding]::UTF8.GetBytes(($cfg | ConvertTo-Json -Depth 12))
-Invoke-RestMethod 'http://127.0.0.1:4390/api/config' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
+Invoke-RestMethod "$($hufuBase)/api/config" -Method Post -Body $b -ContentType 'application/json; charset=utf-8' | Out-Null
 
 Write-Host "── 结果: $pass PASS / $fail FAIL ──"
 exit 0

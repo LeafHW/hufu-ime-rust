@@ -611,6 +611,10 @@ static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
 fn open_common() {
     std::thread::spawn(|| unsafe {
+        // 【2026-11-02 加词窗回归】先给本线程打"虎符自建 UI 线程"标记：下面
+        // 自激活的 TIP 会走 Activate，必须跳过"无文档焦点 → 延迟挂载"的宿主
+        // 准入制（自激活在建窗之前，GetFocus 恒 Err，词框会因此收不到任何键）。
+        crate::tsf::mark_ime_ui_thread();
         // 【B1 修复 2026-09-13 三十四修】单例复查提前到线程起手（store
         // tid 与 TIP 自激活**之前**）：旧序 = store tid → 全套自激活 →
         // 临界区才发现窗口已在 → return——连按 /jc 每次 (a) B 线程
@@ -2036,6 +2040,32 @@ unsafe fn refresh_preview(hwnd: HWND) {
     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
 }
 
+/// 【2026-11-02 端口回退】server 的 HTTP 端口不恒是 4390：Windows 的
+/// Hyper-V/WSL 动态端口保留会把 4390 圈进保留段（用户实机排除段
+/// 4324-4423），server 侧已改为按 [4390, 17890…17894, 27890] 探测后
+/// 服务（见 hufu-server main.rs 「端口被系统保留的修复」）。加词框三条
+/// HTTP（候选预览 / 自动填码 / 提交）原先裸写 4390，server 一换端口就
+/// 整条失效：词框没有预览、没有自动编码、点「添加」毫无反应。
+/// 这里按 server 同款候选顺序探测一次并缓存（只缓存成功值，server 后起
+/// 时下次调用仍会重试）。
+fn http_port() -> u16 {
+    use std::sync::OnceLock;
+    static PORT: OnceLock<u16> = OnceLock::new();
+    if let Some(p) = PORT.get() {
+        return *p;
+    }
+    const CANDS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
+    for p in CANDS {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok()
+        {
+            let _ = PORT.set(p);
+            return p;
+        }
+    }
+    4390
+}
+
 /// GET /api/code_preview?code=xxx → 候选文本列表。
 fn code_preview(code: &str) -> Option<Vec<String>> {
     use std::io::{Read, Write};
@@ -2052,7 +2082,7 @@ fn code_preview(code: &str) -> Option<Vec<String>> {
     let req = format!(
         "GET /api/code_preview?code={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     );
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", 4390)).ok()?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", http_port())).ok()?;
     // 【读超时 2026-09-11】与 http_post_json 同款：实时预览路径在
     // EN_UPDATE 每键触发，server 卡住会冻结加词窗 UI。
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
@@ -2086,7 +2116,7 @@ fn word_code(text: &str) -> Option<String> {
     let req = format!(
         "GET /api/word_code?text={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     );
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", 4390)).ok()?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", http_port())).ok()?;
     // 读超时同 code_preview：预填路径在词框 EN_UPDATE 每键触发。
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
@@ -2196,7 +2226,7 @@ fn post_weight(word: &str, weight: i64) -> bool {
     http_post_json("/api/user_word/weight", &body)
 }
 
-/// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/add。（同上 JSON 安全）
+/// 裸 HTTP POST 127.0.0.1:<server 端口> /api/user_word/add。（同上 JSON 安全）
 fn post_add(code: &str, word: &str, pos: i64) -> bool {
     let body = serde_json::json!({"code": code, "text": word, "pos": pos}).to_string();
     http_post_json("/api/user_word/add", &body)
@@ -2210,7 +2240,7 @@ fn http_post_json(path: &str, body: &str) -> bool {
         body.len(),
         body
     );
-    let mut s = match std::net::TcpStream::connect(("127.0.0.1", 4390)) {
+    let mut s = match std::net::TcpStream::connect(("127.0.0.1", http_port())) {
         Ok(s) => s,
         Err(e) => {
             crate::tsf::trace(&format!("addword tcp connect err: {e}"));

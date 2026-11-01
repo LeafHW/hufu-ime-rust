@@ -20,10 +20,12 @@ mod win32;
 
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
 
 use win32::*;
 
@@ -1018,8 +1020,31 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+// ---------------------------------------------------------------------------
+// 设置页 URL 端口探测（[P0 白屏修复 2026-11-02]）
+// ---------------------------------------------------------------------------
+// 背景：开始菜单快捷方式曾写死 `--url http://127.0.0.1:4390/next?shell=1`。
+// 4390 被系统保留（Hyper-V/WinNAT 排除端口段等）时 hufu-server 会退到
+// 17890+（本机实测 17890），双击快捷方式 = Navigate 到没人监听的端口 = 白屏；
+// 托盘入口用 server 实际端口所以正常。
+//
+// 口径：候选端口按序探测「GET /api/about」，响应体含 `hufu-ime-rust` 或
+// `"version"` 才认定是虎符 server，首个命中即最终端口。单端口 300ms
+// 连接/读写超时，总预算 1.5s（正常情况首个候选几毫秒命中）。探测在创建窗口
+// 之前完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
+const DEFAULT_PORT: u16 = 4390;
+const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
+const PROBE_PORT_TIMEOUT: Duration = Duration::from_millis(300);
+const PROBE_TOTAL_BUDGET: Duration = Duration::from_millis(1500);
+
+fn default_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/next?shell=1")
+}
+
 struct CliArgs {
     url: String,
+    /// `--url` 是否显式给出（显式且可连通时尊重用户；否则回退端口探测）
+    url_explicit: bool,
     user_data: PathBuf,
     log: PathBuf,
     auto_close_secs: Option<u32>,
@@ -1032,7 +1057,8 @@ fn parse_args(exe_dir: &Path) -> CliArgs {
         .unwrap_or_else(|| exe_dir.to_path_buf());
     let user_data = base.join("HuFu").join("WebView2");
     let mut args = CliArgs {
-        url: "http://127.0.0.1:4390/next?shell=1".to_string(),
+        url: default_url(DEFAULT_PORT),
+        url_explicit: false,
         log: user_data.join("hufu-settings.log"),
         user_data,
         auto_close_secs: None,
@@ -1044,6 +1070,7 @@ fn parse_args(exe_dir: &Path) -> CliArgs {
         match argv[i].as_str() {
             "--url" if i + 1 < argv.len() => {
                 args.url = argv[i + 1].clone();
+                args.url_explicit = true;
                 i += 2;
             }
             "--user-data" if i + 1 < argv.len() => {
@@ -1074,6 +1101,178 @@ fn parse_args(exe_dir: &Path) -> CliArgs {
     args
 }
 
+/// 从 `http://host:port/path?query` 里抠出 (host, port)；无 authority 返回
+/// None。不引 url crate——本机探测只需要这一种形态。
+fn split_http_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => Some((host.to_string(), port.parse().ok()?)),
+        Some(_) => None,
+        None => Some((authority.to_string(), 80)),
+    }
+}
+
+/// 单端口探测结论。
+enum ProbeHit {
+    /// /api/about 响应体命中虎符特征：确认是目标 server。
+    Hufu,
+    /// TCP 连上了，但 300ms 内一个字节都没回来（server 忙/accept 排队）。
+    /// 不算命中，但在总预算内值得重试一次——本机实测 server 偶发 >1s 响应。
+    TcpOnly,
+    /// 连上了、也回了 HTTP，但不是虎符（别家服务占着端口）。
+    OtherHttp,
+    /// 连不上：端口没人监听 / 被系统拒。
+    Dead,
+}
+
+/// 探测 host:port 是否是虎符 server：HTTP/1.0 + `GET /api/about`，读完响应
+/// 体后判定（含 `hufu-ime-rust` 或 `"version"`）。
+fn probe_hufu_http(host: &str, port: u16, timeout: Duration) -> ProbeHit {
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return ProbeHit::Dead;
+    };
+    let Some(addr) = addrs.next() else {
+        return ProbeHit::Dead;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return ProbeHit::Dead;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let req = format!("GET /api/about HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return ProbeHit::Dead;
+    }
+    let mut resp = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&chunk[..n]);
+                if resp.len() >= 64 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if resp.is_empty() {
+        return ProbeHit::TcpOnly;
+    }
+    let text = String::from_utf8_lossy(&resp);
+    if !text.starts_with("HTTP/") {
+        return ProbeHit::OtherHttp; // 端口有人监听但说的不是 HTTP
+    }
+    if text.contains("hufu-ime-rust") || text.contains("\"version\"") {
+        ProbeHit::Hufu
+    } else {
+        ProbeHit::OtherHttp
+    }
+}
+
+/// 本次单端口探测可用的超时：不超过 300ms，也不超过 1.5s 总预算。
+fn probe_slice(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        None
+    } else {
+        Some(left.min(PROBE_PORT_TIMEOUT))
+    }
+}
+
+/// 决定最终设置页 URL：
+///   * `--url` 显式给出且可连通（TCP 连得上）→ 尊重它：托盘/脚本按 server
+///     实际端口传参走这条；
+///   * 否则按 PROBE_PORTS 探测首个虎符 server，命中即用该端口；
+///   * 「连上但 300ms 无响应」的端口在剩余预算内各重试一次（瞬时慢不误杀）；
+///   * 全程未命中 → 保持解析出来的 URL 不动，失败原因写进 hufu-settings.log。
+fn resolve_url(args: &mut CliArgs) {
+    let deadline = Instant::now() + PROBE_TOTAL_BUDGET;
+    if args.url_explicit {
+        let explicit = args.url.clone();
+        let explicit_hit = split_http_host_port(&explicit)
+            .and_then(|(host, port)| probe_slice(deadline).map(|t| probe_hufu_http(&host, port, t)));
+        match explicit_hit {
+            Some(ProbeHit::Dead) | None => log_line(
+                &args.log,
+                &format!("explicit --url unreachable: {explicit}；回退候选端口探测"),
+            ),
+            Some(hit) => {
+                let note = if matches!(hit, ProbeHit::Hufu) {
+                    ""
+                } else {
+                    "（非虎符特征/暂无响应，按用户指定保留）"
+                };
+                log_line(
+                    &args.log,
+                    &format!("explicit --url reachable{note}；尊重：{explicit}"),
+                );
+                return;
+            }
+        }
+    }
+    let mut tried: Vec<String> = Vec::new();
+    let mut slow: Vec<u16> = Vec::new();
+    let mut hit_port: Option<u16> = None;
+    for port in PROBE_PORTS {
+        let Some(timeout) = probe_slice(deadline) else {
+            tried.push("总预算耗尽".to_string());
+            break;
+        };
+        match probe_hufu_http("127.0.0.1", port, timeout) {
+            ProbeHit::Hufu => {
+                hit_port = Some(port);
+                break;
+            }
+            ProbeHit::TcpOnly => {
+                tried.push(format!("{port}=连上但无响应"));
+                slow.push(port);
+            }
+            ProbeHit::OtherHttp => tried.push(format!("{port}=别家 HTTP")),
+            ProbeHit::Dead => tried.push(format!("{port}=无监听")),
+        }
+    }
+    // 首轮没命中：给「连上但超时」的端口一次重试（server 偶发慢于 300ms）
+    if hit_port.is_none() {
+        for port in slow {
+            let Some(timeout) = probe_slice(deadline) else {
+                break;
+            };
+            if matches!(probe_hufu_http("127.0.0.1", port, timeout), ProbeHit::Hufu) {
+                hit_port = Some(port);
+                break;
+            }
+        }
+    }
+    if let Some(port) = hit_port {
+        args.url = default_url(port);
+        log_line(
+            &args.log,
+            &format!(
+                "port probe hit hufu server 127.0.0.1:{port}；target URL 改用：{}",
+                args.url
+            ),
+        );
+        return;
+    }
+    log_line(
+        &args.log,
+        &format!(
+            "port probe missed [{}]；保持原 URL（双击快捷方式可能白屏）：{}",
+            tried.join(", "),
+            args.url
+        ),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1085,7 +1284,7 @@ fn main() -> std::process::ExitCode {
 
 unsafe fn real_main() -> i32 {
     let exe_dir = exe_dir();
-    let args = parse_args(&exe_dir);
+    let mut args = parse_args(&exe_dir);
 
     if let Some(parent) = args.log.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1114,6 +1313,9 @@ unsafe fn real_main() -> i32 {
         &args.log,
         &format!("user data dir: {}", user_data.display()),
     );
+    // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
+    // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
+    resolve_url(&mut args);
     log_line(&args.log, &format!("target URL: {}", args.url));
 
     // [P0-2c 2026-11-01] 单实例互斥：命名互斥体占名，二次启动（连按

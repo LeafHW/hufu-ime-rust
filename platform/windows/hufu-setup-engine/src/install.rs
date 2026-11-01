@@ -742,7 +742,11 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
         "HuFu",
         &format!("\"{}\"", exe_s),
     );
-    // L498-504：WScript.Shell URL 快捷方式 → %APPDATA%\…\Programs（GetFolderPath('Programs')）
+    // L498-504：exe 型快捷方式 → %APPDATA%\…\Programs（GetFolderPath('Programs')）
+    // [P0 白屏修复 2026-11-02] 不再写死 `--url http://127.0.0.1:4390/…`：
+    // 4390 被系统保留/占用时 server 会退到 17890+（本机实测 17890），写死
+    // 旧端口 = 双击快捷方式白屏。无参数 → hufu-settings 自己按候选端口探测
+    //（main.rs resolve_url，托盘入口同样走实际端口）。
     let lnk_ok = (|| -> Option<bool> {
         let appdata = std::env::var_os("APPDATA")?;
         let sm = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs");
@@ -750,7 +754,7 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
         Some(lnk::create_app_shortcut(
             &lnk_path,
             &inst.join("hufu-settings.exe"),
-            "--url \"http://127.0.0.1:4390/next?shell=1\"",
+            "",
             &inst,
             &icon,
         ))

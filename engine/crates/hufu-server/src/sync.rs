@@ -254,12 +254,20 @@ pub fn status_value() -> Value {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // 【2026-11 用户体验】从未保存过服务器地址时，设置页不要空着——
+    // 直接把坚果云 WebDAV 地址填给前端（保存时后端同样会落到 DEFAULT_URL）。
+    // configured 仍按"真的存过 url"判断，避免把空配置误判成已配置。
+    let display_url = if s.url.trim().is_empty() {
+        DEFAULT_URL.to_string()
+    } else {
+        s.url.clone()
+    };
     let configured = !s.url.trim().is_empty() && !s.user.trim().is_empty() && !s.pass.is_empty();
     json!({
         "enabled": configured && s.enabled,
         "configured": configured,
         "stopped": configured && !s.enabled,
-        "url": s.url, "user": s.user, "device": s.device,
+        "url": display_url, "user": s.user, "device": s.device,
         "selected": s.selected,
         "last_sync": s.last_sync, "last_error": s.last_error,
         "phase": phase,

@@ -885,14 +885,62 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
             // 进程永不算游戏宿主（视频通话/全屏看图/截图遮罩形态窗是
             // 误判源，见 comm_host_never_game 注释）。
             let shell_exempt = shell_host_never_game() || comm_host_never_game();
+            // 【2026-11 游戏安全阀·用户口径】"就算打不了字，也必须能切别的输入法"。
+            // 命中游戏特征（形态/名单/反作弊/游戏输入栈）时默认**完全惰性**：
+            //   · 不挂键 sink —— 挂了就武装 CUAS 吞键管线，整进程键盘死且拆不掉；
+            //   · 不拆 IME 链 —— ImmAssociateContextEx(hwnd,NULL,0) 拆完，微软拼音等
+            //     其他输入法也接不上该窗口（用户"切不了输入法"的直接来源）；
+            //   · 不子类化。
+            // 游戏内打字降级为显式 opt-in：建旗标 C:\ProgramData\HuFu\game-takeover。
+            let takeover = game_takeover_enabled();
+            // 用户白名单优先：列进 not-game.txt 的进程永不按游戏处理。
+            let user_exempt = not_game_listed();
+            // 【硬/软两级判定 2026-11 用户拍板 B 方案】
+            //   硬否决（全屏弹出窗/名单/反作弊）→ 永不接管；
+            //   软否决（游戏输入栈模块 + 当前无文本焦点）→ 先惰性，等真出现
+            //   可编辑焦点再补挂（补挂时还要求进程内没有全屏窗口）。
+            // 效果：误判的正常软件点进输入框会自动恢复中文；全屏游戏永远不碰。
+            // 【2026-11-02 加词/加权窗回归修复】本线程若是虎符自建的加词/
+            // 加权小窗线程，一律按"正常宿主"直挂键 sink：它的 Activate 抢在
+            // 建窗之前（GetFocus 必 Err），且该 EDIT 的焦点不经 msctf 所以
+            // OnSetFocus 不会来补挂——套上准入制等于把词框键盘整条掐断。
+            let ime_ui = IME_UI_THREAD.with(|c| c.get());
+            let no_doc_focus = tm.GetFocus().is_err();
+            let hard_game = !ime_ui && !shell_exempt && !user_exempt && game_hard_veto();
+            let soft_game =
+                !ime_ui && !shell_exempt && !user_exempt && !hard_game && game_soft_veto(&tm);
+            let game_like = hard_game || soft_game;
             if fs_or_list && shell_exempt {
                 crate::tsf::trace("activate: 外壳/通讯宿主豁免——形状/名单命中但正常挂 sink");
             }
-            if fs_or_list && !shell_exempt {
-                crate::tsf::trace("activate: 游戏宿主 → 子类化流派（不挂 sink）");
+            if game_like && takeover {
+                crate::tsf::trace("activate: 游戏宿主 → 子类化流派（opt-in，不挂 sink）");
                 GAME_HOST_MODE.with(|c| c.set(true));
                 GAME_CHAT_OPEN.with(|c| c.set(false));
                 game_dissociate_focus();
+                SINK_ADVISED.with(|c| c.set(false));
+                DEFER_ADVISE.with(|c| c.set(false));
+                DEFER_SOFT.with(|c| c.set(false));
+            } else if hard_game {
+                crate::tsf::trace("activate: 硬否决(class=hard) → 完全惰性（不挂 sink/不拆链/不子类化）");
+                // 上次若进过旧流派，对称还原（子类化/拆链/模式位）。
+                if GAME_HOST_MODE.with(|c| c.get()) {
+                    crate::tsf::trace("activate: 游戏流派残留 → 对称还原（安全阀）");
+                    game_host_restore();
+                }
+                SINK_ADVISED.with(|c| c.set(false));
+                DEFER_ADVISE.with(|c| c.set(false));
+                DEFER_SOFT.with(|c| c.set(false));
+            } else if soft_game {
+                crate::tsf::trace(
+                    "activate: 软否决(class=soft) → 先惰性，等可编辑焦点补挂（全屏不补）",
+                );
+                if GAME_HOST_MODE.with(|c| c.get()) {
+                    game_host_restore();
+                }
+                SINK_ADVISED.with(|c| c.set(false));
+                DEFER_ADVISE.with(|c| c.set(true));
+                DEFER_SOFT.with(|c| c.set(true));
             } else {
                 // 【流派残留自愈 2026-11】上次 Activate 曾误判进游戏流派
                 //（全屏形状瞬态误报）、本次判为正常宿主：流派副作用
@@ -902,9 +950,28 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                     crate::tsf::trace("activate: 游戏流派残留 → 对称还原（上次误判自愈）");
                     game_host_restore();
                 }
-                match km.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
-                    Ok(_) => crate::tsf::trace("activate: sink advised ok"),
-                    Err(e) => crate::tsf::trace(&format!("activate: advise FAIL 0x{:08X}", e.code().0)),
+                // 【2026-11 准入制】没有可编辑文档焦点 = 当前没有能输入的场合
+                //（游戏/启动器/全屏画面/刚激活的非文本窗口）→ **不挂键盘**，
+                // 改成等真正出现文档焦点（OnSetFocus）时再补挂。
+                // 这是"任何情况下都不影响切输入法"的结构性保证：没挂就不武装 CUAS。
+                // 外壳/通讯豁免宿主（explorer/微信/QQ）有真实编辑焦点，照旧立即挂。
+                // 加词/加权小窗线程（ime_ui）不受此门约束：它天生无文档焦点，
+                // 且等不到 OnSetFocus，延迟=永久不挂。
+                if no_doc_focus && !shell_exempt && !ime_ui {
+                    crate::tsf::trace("activate: 无文档焦点 → 延迟挂载（不挂 sink，等文本焦点）");
+                    SINK_ADVISED.with(|c| c.set(false));
+                    DEFER_ADVISE.with(|c| c.set(true));
+                    DEFER_SOFT.with(|c| c.set(false));
+                } else {
+                    DEFER_ADVISE.with(|c| c.set(false));
+                    DEFER_SOFT.with(|c| c.set(false));
+                    match km.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
+                        Ok(_) => {
+                            SINK_ADVISED.with(|c| c.set(true));
+                            crate::tsf::trace("activate: sink advised ok");
+                        }
+                        Err(e) => crate::tsf::trace(&format!("activate: advise FAIL 0x{:08X}", e.code().0)),
+                    }
                 }
             }
             // 文档焦点事件：失焦冲销会话+关候选窗（修「切窗后候选不关/回不来」）
@@ -1062,6 +1129,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 误判一次从此打不了字的病根，见 game_host_restore 注释）。
         // 正常宿主路径下该函数为幂等空操作。
         game_host_restore();
+        // 【2026-11 安全阀】失活即清"已挂/延迟"标记（下次 Activate 重新判定）。
+        SINK_ADVISED.with(|c| c.set(false));
+        DEFER_ADVISE.with(|c| c.set(false));
+        DEFER_SOFT.with(|c| c.set(false));
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         // 【六十修】引擎侧会话一并清零（与 ime_switch_abort 同款）：
@@ -1274,13 +1345,51 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
                 .with(|d| *d.borrow_mut() = Some((pdimfocus.cloned(), pdimprevfocus.cloned())));
             return Ok(());
         }
+        // 【2026-11 准入制·补挂】Activate 时因"无文档焦点"没挂 sink；
+        // 现在出现了真正的文档焦点（用户点进了输入框）→ 补挂。
+        // 游戏画像（反作弊/全屏/游戏输入栈）仍然否决——宁可那个进程里打不了字。
+        if !SINK_ADVISED.with(|c| c.get()) && DEFER_ADVISE.with(|c| c.get()) && pdimfocus.is_some() {
+            let soft = DEFER_SOFT.with(|c| c.get());
+            // 【第三道保险】硬画像复检：全屏窗口再次出现/反作弊/名单命中 → 不补挂。
+            // （软判定进程只有在"窗口化 + 真可编辑"时才允许虎符接手）
+            if game_hard_veto() {
+                crate::tsf::trace("focus: 延迟补挂被硬画像/全屏保险拦下（保持惰性）");
+            } else if soft && !caret_evidence(&self.shared) {
+                crate::tsf::trace("focus: 软判定无编辑证据 → 保持惰性（等下次焦点）");
+            } else if let (Some(tm), tid) = (thread_tm(), thread_tid()) {
+                if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
+                    let sink: ITfKeyEventSink = unsafe { self.cast()? };
+                    match unsafe { km.AdviseKeyEventSink(tid, &sink, BOOL(1)) } {
+                        Ok(_) => {
+                            SINK_ADVISED.with(|c| c.set(true));
+                            DEFER_ADVISE.with(|c| c.set(false));
+                            DEFER_SOFT.with(|c| c.set(false));
+                            crate::tsf::trace(if soft {
+                                "focus: 软判定补挂成功（已验可编辑）→ sink advised ok"
+                            } else {
+                                "focus: 延迟挂载 → sink advised ok"
+                            });
+                        }
+                        Err(e) => crate::tsf::trace(&format!(
+                            "focus: 延迟挂载失败 0x{:08X}（等下次焦点重试）",
+                            e.code().0
+                        )),
+                    }
+                }
+            }
+        }
         // 【E6·虎娘同款·进场拆链】游戏宿主的键处理不再依赖任何 TSF 文
         // 档判据（dim 启发式在记分板/加载 overlay 上误判=00:19 实锤死
         // 因）。焦点窗与 IME 上下文拆链（换窗时 OnSetFocus 重拆），键
         // 流照达 sink（虎娘实证），聊天态由按键流推断（Enter 开/Esc
         // 关），聊天内旁观不吞键+擦除注入。
         if GAME_HOST_MODE.with(|c| c.get()) {
-            game_dissociate_focus();
+            // 【2026-11 安全阀】默认不再拆 IME 链——ImmAssociateContextEx(hwnd,NULL,0)
+            // 会把该窗口和**所有**输入法的关联一起切断，用户切到微软拼音也接不上
+            // （"切不了别的输入法"的直接来源）。仅显式 opt-in 的游戏内接管才拆。
+            if game_takeover_enabled() {
+                game_dissociate_focus();
+            }
             // 【E7·子类化】窗口就绪即换 WndProc（游戏 UI 线程=本线程，
             // 消息都在本线程派发；原 proc 存原子，直调转交）。
             if GAME_ORIG_PROC.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -2518,9 +2627,28 @@ const CAPS_WM_VIRT: u32 = 0x8000 + 0x31; // WM_APP+0x31
 /// 认领时 -1；魔法标记保留做零成本双保险。宿主只吃 down 丢 up 会积
 /// 压 → 钳位 8 清零（非时间窗，纯计数）。
 static CAPS_VIRT_PENDING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 【2026-11 安全阀】急停旗标缓存（文件 C:\ProgramData\HuFu\caps-no-hook 由
+/// UI 线程 1s 节流刷新到本原子；LL 回调只读原子，绝不做文件 IO）。
+static CAPS_KILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPS_KILL_CHECK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// UI 线程视角刷新快照（须持 Shared 锁调用；回调永不调此）。
 fn caps_snap_refresh(g: &Shared) {
+    // 【2026-11 安全阀】急停旗标 1s 节流刷新：**绝不放进 LL 回调**——回调里做
+    // 文件 IO 会阻塞全系统键路（撞 LowLevelHooksTimeout，系统静默摘钩）。
+    {
+        use std::sync::atomic::Ordering;
+        // 【2026-11-02 复审】墙钟换成进程内单调时钟：校时/休眠唤醒回拨后
+        // saturating_sub 会一直是 0，刷新被永久跳过（急停旗标失效）。
+        let now_ms = raw_fs_cache_now_ms();
+        if now_ms.saturating_sub(CAPS_KILL_CHECK_MS.load(Ordering::Relaxed)) >= 1000 {
+            CAPS_KILL_CHECK_MS.store(now_ms, Ordering::Relaxed);
+            CAPS_KILL.store(
+                std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists(),
+                Ordering::Release,
+            );
+        }
+    }
     let comp = g.composition.is_some() || g.composing || !g.raw_last.is_empty();
     let mapped = g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
     CAPS_SNAP_COMP.store(comp, std::sync::atomic::Ordering::Release);
@@ -2535,7 +2663,9 @@ fn caps_hook_gate(composition_active: bool, caps_mapped: bool) -> bool {
 /// 拦截门（现场版）：急停旗标 + 焦点进程=本进程 + gate（原子快照，
 /// 零锁零阻塞——回调全系统键路，微秒级必须）。
 fn caps_hook_should_virtualize() -> bool {
-    if std::path::Path::new(r"C:\ProgramData\HuFu\caps-no-hook").exists() {
+    // 【2026-11 安全阀】只读缓存原子（文件检查已挪到 UI 线程 1s 节流刷新）——
+    // LL 回调坐在全系统键路上，任何文件 IO/锁都可能把整机输入拖死。
+    if CAPS_KILL.load(std::sync::atomic::Ordering::Acquire) {
         return false; // 急停：全部放行物理键
     }
     // 焦点在本进程才管（LL 钩子全局回调，别家按键不碰）。
@@ -3854,9 +3984,10 @@ impl HuFuTs_Impl {
             let caps_mapped =
                 g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
             CAPS_SNAP_MAPPED.store(caps_mapped, std::sync::atomic::Ordering::Release);
-            // caps 有映射（组段态会消费它）→ 进程装 LL 钩子
-            //（幂等；组段在身的物理 caps 从此虚拟化，系统位/灯不动）。
-            if caps_mapped {
+            // 【2026-11 安全阀】只在"本进程真的进入过中文组段"后才装全局 LL 钩子：
+            // 全局键盘钩子装进游戏/视频等从不组段的进程 = 整机键路风险，也是反作弊
+            // 最敏感的行为。caps 只在组段态消费，组段首键之后才装不影响虚拟化。
+            if caps_mapped && !raw_cur.is_empty() {
                 caps_hook_install();
             }
             // 【按住键可录·十三修】同帧解析三组合（freq/delete/export）
@@ -8841,6 +8972,27 @@ fn caret_editable(shared: &SharedRef) -> bool {
     }
 }
 
+/// 【2026-11 软判定补挂·证据】与 caret_editable 同一探测，但**失败方向相反**：
+/// 只认"确实拿到可编辑光标"（fail-closed）。软判定的进程（像游戏/游戏输入栈）
+/// 要被虎符接手，必须有正面证据——探测被拒/无光标一律当没证据、继续惰性。
+fn caret_evidence(shared: &SharedRef) -> bool {
+    let ctx = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .focus_context();
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    let _ = run_session(shared, Op::QueryCaret, Some(ctx));
+    matches!(
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .esc_caret_ok,
+        Some(true)
+    )
+}
+
 /// Original candidate rendering uses D2D or the server-owned window.
 /// The independent candidate_ui publisher exposes host-readable candidates.
 /// BeginUIElement's FALSE means the host may draw; it never stops notifications
@@ -9420,7 +9572,7 @@ fn ui_element_hide(shared: &SharedRef) {
 // 内常开（空编码 tick 直接短路，开销可忽略）。
 // ═══════════════════════════════════════════════════════════════════
 
-use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering as AtomicOrdering};
 
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -9439,8 +9591,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // OnSetFocus/game_subclass_proc）；普通宿主照旧前景挂载。
 
 thread_local! {
+    /// 【2026-11-02 加词/加权窗回归】本线程是虎符自建的加词/加权小窗线程
+    ///（addword.rs 里自激活 TIP 的那条线程）。它不是任何应用宿主：
+    ///   · 自激活抢在 CreateWindow 之前，此刻线程无窗口 → GetFocus 必 Err；
+    ///   · 该 EDIT 的焦点不经 msctf（见 addword.rs「四修」注释：焦点驱动的
+    ///     懒激活对该 EDIT 不发生），OnSetFocus 永远等不到补挂。
+    /// 于是「无文档焦点 → 延迟挂载」的宿主准入制一旦套到它身上，词框
+    /// 一个键都进不来（用户实锤：加词框打不了字/极卡）。UI 线程一律直挂。
+    static IME_UI_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 【2026-11 游戏安全阀】本线程是否已挂 TSF 键 sink（延迟/条件挂载用）。
+    /// 一旦挂载就不摘（CUAS 武装后 Unadvise 摘不掉，见 game-host.md）。
+    static SINK_ADVISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 【2026-11 准入制】Activate 时没有文档焦点 → 暂不挂 sink，等
+    /// OnSetFocus 出现真正的文档焦点再补挂（见 Activate 注释）。
+    static DEFER_ADVISE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 【2026-11 软判定】本次延迟来自"游戏输入栈 + 无文本焦点"的软否决：
+    /// 补挂前必须拿到可编辑证据（GetSelection 成功），且进程内无全屏窗口。
+    static DEFER_SOFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 游戏宿主模式（Activate 期名单/形态命中）：进场拆 IME 链 + 子类
     /// 化游戏窗（E7），永不挂 TSF 键 sink。
+    /// 【2026-11 安全阀】改为 opt-in（见 game_takeover_enabled）——默认命中
+    /// 游戏形态时走"完全惰性"，不拆链也不子类化：拆链会让别的输入法也接不上。
     static GAME_HOST_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 游戏内聊天态（按键流推断：Enter 开/Esc 关——dim 判据在记分板
     /// 等 overlay 上误判实锤，废弃）
@@ -9462,6 +9633,27 @@ thread_local! {
 }
 
 static RAW_FS_HIT: AtomicIsize = AtomicIsize::new(0);
+
+/// 【2026-11-02 节流】raw_fullscreen_host 结果的 500ms 进程级缓存。
+/// 该函数走 EnumWindows 遍历全系统窗口，而它挂在 OnSetFocus 的延迟补挂
+/// 路径（DEFER_ADVISE 态）上，每次焦点事件都会调一次——焦点抖动（Alt+Tab、
+/// 切输入法、点候选框）时是可见卡顿源。缓存键不需要区分进程：本函数只看
+/// 「当前进程」的窗口，进程内缓存即可。
+/// 时间戳存 `now_ms + 1`（0 = 尚未缓存），bool 存结果；写序 = 先值后时间戳
+/// （Release），读序 = 先时间戳（Acquire）后值，因此读到新鲜时间戳必然读到
+/// 配套结果。全部是原子量，多线程下无数据竞争（并发未命中只会多扫一次）。
+static RAW_FS_CACHE_STAMP: AtomicU64 = AtomicU64::new(0); // now_ms + 1；0 = 未缓存
+static RAW_FS_CACHE_VAL: AtomicBool = AtomicBool::new(false);
+const RAW_FS_CACHE_TTL_MS: u64 = 500;
+
+/// 单调毫秒时钟：origin 取首次调用时刻，只做差值比较。
+fn raw_fs_cache_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
 
 /// 单窗判定：可见 + WS_POPUP（无系统边框——真游戏全屏形态；F11 浏览
 /// 器仍 WS_OVERLAPPED 不中招）+ 覆盖所在显示器 ≥99.5%（最大化普通应
@@ -9508,12 +9700,24 @@ unsafe extern "system" fn raw_fs_enum_proc(
 /// 【A4】本进程存在任一全屏弹出窗（游戏形态）→ true。进程级扫描
 /// （EnumWindows）：游戏主窗可能建在非激活线程，激活时本线程
 /// GetGUIThreadInfo 查不到（21:41 实测漏检根因）。
+/// 【2026-11-02 节流】结果缓存 500ms：本函数在 OnSetFocus 延迟补挂路径上
+/// 随焦点事件反复调用，全系统 EnumWindows 在焦点抖动时会卡顿；500ms 内
+/// 直接复用上次结果。补挂前的判定窗口远小于 500ms，游戏形态也不会在
+/// 半秒内翻转，误判风险可忽略。
 fn raw_fullscreen_host() -> bool {
-    unsafe {
+    let now = raw_fs_cache_now_ms();
+    let stamp = RAW_FS_CACHE_STAMP.load(AtomicOrdering::Acquire);
+    if stamp != 0 && now.wrapping_sub(stamp - 1) < RAW_FS_CACHE_TTL_MS {
+        return RAW_FS_CACHE_VAL.load(AtomicOrdering::Relaxed);
+    }
+    let hit = unsafe {
         RAW_FS_HIT.store(0, AtomicOrdering::Relaxed);
         let _ = EnumWindows(Some(raw_fs_enum_proc), LPARAM(0));
         RAW_FS_HIT.load(AtomicOrdering::Relaxed) != 0
-    }
+    };
+    RAW_FS_CACHE_VAL.store(hit, AtomicOrdering::Relaxed);
+    RAW_FS_CACHE_STAMP.store(now.saturating_add(1), AtomicOrdering::Release);
+    hit
 }
 
 /// 【T6/T7 修复 2026-10-06】外壳宿主永不算游戏宿主：Win11 的 explorer/
@@ -9591,7 +9795,135 @@ fn game_host_blocklisted() -> bool {
     false
 }
 
-/// 【反查首帧锚点 2026-09-11】无组段帧（反查/命令模式刚进入：仅 aux
+// ═══════════ 【2026-11 游戏安全阀】"打不了字也要能切输入法" ═══════════
+// 用户口径：游戏里虎符打不了字可以接受，但**必须能切到别的输入法**。
+// 两条会毁掉这条底线的机制都来自"接管"：
+//   ① 挂 TSF 键 sink → CUAS 武装吞键管线（该进程整键盘死，切输入法也不恢复）；
+//   ② ImmAssociateContextEx(hwnd,NULL,0) 拆链 → 该窗口任何输入法都接不上。
+// 因此默认策略改为：命中游戏特征就**完全惰性**（不挂/不拆/不子类化），
+// 把"游戏内打字"降级为显式 opt-in（旗标文件 C:\ProgramData\HuFu\game-takeover）。
+
+/// 【2026-11-02】标记"本线程是虎符自建的加词/加权小窗线程"——由
+/// addword::open_common 在自激活 TIP 之前调用，Activate 据此跳过全部
+/// 宿主/游戏/准入判据，无条件挂键 sink（词框键路的唯一入口）。
+pub fn mark_ime_ui_thread() {
+    IME_UI_THREAD.with(|c| c.set(true));
+}
+
+/// 游戏内接管开关（默认关）：存在旗标文件才走旧的子类化流派。
+/// 例外：已知适配过的 `league of legends.exe` 保持旧流派，避免回退现有能力。
+fn game_takeover_enabled() -> bool {
+    if std::path::Path::new(r"C:\ProgramData\HuFu\game-takeover").exists() {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        })
+        .map(|n| n == "league of legends.exe")
+        .unwrap_or(false)
+}
+
+/// 进程内是否已加载指定 DLL（GetModuleHandleW 只查已加载模块，零成本）。
+fn module_loaded(name: &str) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(lpmodulename: *const u16) -> isize;
+    }
+    let mut w: Vec<u16> = name.encode_utf16().collect();
+    w.push(0);
+    unsafe { GetModuleHandleW(w.as_ptr()) != 0 }
+}
+
+/// 反作弊模块：命中即永不接管（反作弊对全局钩子/子类化最敏感，且拦了就难恢复）。
+fn has_anticheat_module() -> bool {
+    const NAMES: &[&str] = &[
+        "ace-anticheat.dll",
+        "ace-game.dll",
+        "ace-base.dll",
+        "aceservice.dll",
+        "tenprotect64.dll",
+        "tenprotect.dll",
+        "tp3helper.dll",
+        "tgphelper.dll",
+        "easyanticheat.dll",
+        "eac_client.dll",
+        "beclient.dll",
+        "battleye.dll",
+        "xigncode3.dll",
+        "xigncode.dll",
+        "nprotect.dll",
+        "gameguard.dll",
+        "mhyprot2.dll",
+        "sguard64.dll",
+        "sguarded.dll",
+        "anticheat.dll",
+    ];
+    NAMES.iter().any(|n| module_loaded(n))
+}
+
+/// 游戏输入/老图形栈模块：DirectInput/XInput/老 D3D——正常办公、浏览器、
+/// 通讯进程不会装这些（d3d11/dxgi 故意不列，避免误伤 Electron/Office）。
+fn has_game_input_module() -> bool {
+    const NAMES: &[&str] = &[
+        "dinput8.dll",
+        "dinput.dll",
+        "xinput1_4.dll",
+        "xinput1_3.dll",
+        "xinput9_1_0.dll",
+        "d3d8.dll",
+        "d3d9.dll",
+        "ddraw.dll",
+        "d3d12.dll",
+        "vulkan-1.dll",
+    ];
+    NAMES.iter().any(|n| module_loaded(n))
+}
+
+/// 【2026-11】用户白名单：C:\ProgramData\HuFu\not-game.txt（每行一个进程名，# 注释）。
+/// 命中即"绝不按游戏处理"——误判了某个日常软件（播放器/模拟器/工具）时，
+/// 把它的 exe 名写进这个文件即可恢复虎符接管，不必打开全局游戏接管。
+fn not_game_listed() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(name) = exe.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    if let Ok(txt) = std::fs::read_to_string(r"C:\ProgramData\HuFu\not-game.txt") {
+        for line in txt.lines() {
+            let l = line.trim();
+            if !l.is_empty() && !l.starts_with('#') && l.to_ascii_lowercase() == lower {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 硬否决：全屏弹出窗 / 进程名名单 / 反作弊模块 / 调试强制 —— 永不接管。
+/// 挂键 sink 就会被 CUAS 武装吞键管线且摘不掉，宁可该进程里虎符不出字。
+fn game_hard_veto() -> bool {
+    if std::env::var("HUFU_FORCE_GAME").ok().as_deref() == Some("1") {
+        return true;
+    }
+    has_anticheat_module() || raw_fullscreen_host() || game_host_blocklisted()
+}
+
+/// 软否决：加载了游戏输入栈模块（DirectInput/XInput/老 D3D）且当前没有文本焦点。
+/// 不永久否决——先不接管，等真出现可编辑焦点（且进程内无全屏窗口）再补挂，
+/// 避免"误判的正常软件被锁在英文"。HUFU_FORCE_SOFT=1 为验收钩子。
+fn game_soft_veto(tm: &windows::Win32::UI::TextServices::ITfThreadMgr) -> bool {
+    if std::env::var("HUFU_FORCE_SOFT").ok().as_deref() == Some("1") {
+        return true;
+    }
+    !game_hard_veto() && has_game_input_module() && unsafe { tm.GetFocus() }.is_err()
+}
+
+
 /// 提示、应用文本流里什么都没有）的插入点兜底：前台线程 GUITHREADINFO
 /// 的系统插入符（hCaret/rcCaret 客户区坐标→屏幕）。这是不依赖组段的
 /// 唯一光标来源——query_caret 需要组段（GetTextExt），首帧查不出。
@@ -10353,6 +10685,21 @@ fn poll_tick() {
         let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
         if let Some(s) = sp {
             cand_interact_recover_pending(&s);
+        }
+    }
+    // 【2026-11-02 复审】caps 急停旗标（caps-no-hook）原先只在 ime_switch_abort
+    // 里刷新，钩子装上后没有周期调用者 → 急停文件建了也不生效。这里挂到
+    // 已有的 poll 节拍（约 110ms，内部还有 1s 节流），文件 IO 仍不在 LL 回调里。
+    // 延迟挂载兜底：Activate 时无文档焦点 → 等 OnSetFocus；宿主有可编辑焦点
+    // 却不发焦点事件（或焦点不经 msctf）就永远挂不上 ⇒ 该进程完全打不出中文。
+    // poll 每拍复查：一旦 TSM 报出文档焦点，就按与 OnSetFocus 相同的判据补挂。
+    {
+        let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
+        if let Some(shared) = sp {
+            {
+                let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                caps_snap_refresh(&g);
+            }
         }
     }
     // 【候选窗焦点矫正·记忆 2026-10-12】每拍记忆前台宿主编辑窗（本
