@@ -28,6 +28,13 @@ export function setDirtyPage(key: string, dirty: boolean, label = key) {
   }
 }
 
+/** 放弃修改时清空脏表（否则常驻挂载的页面脏标记永不消失，之后每次切页/关窗都弹确认）。 */
+export function resetDirty(key?: string) {
+  if (key === undefined) dirtyMap.clear();
+  else dirtyMap.delete(key);
+  emit();
+}
+
 export function getDirtyPages(): DirtyEntry[] {
   return Array.from(dirtyMap.entries(), ([key, label]) => ({ key, label }));
 }

@@ -4,6 +4,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import '../styles/data.css';
 
+import { fetchWithTimeout } from '../api';
 /* ────────────────────────────────────────────────────────────────────────────
  * 数据与备份页（真实读写）——接口全部对照旧设置页 settings-ui/index.html：
  *   GET  /api/settings_export   打包 bundle v3（config + 皮肤 + .ssf + overrides），
@@ -96,7 +97,7 @@ function httpError(body: unknown, url: string, status: number): string {
 }
 
 async function postJson<T>(url: string, payload: unknown): Promise<T> {
-  const r = await fetch(url, {
+  const r = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

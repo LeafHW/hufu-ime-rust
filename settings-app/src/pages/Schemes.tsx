@@ -5,6 +5,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import '../styles/schemes.css';
 
+import { fetchWithTimeout } from '../api';
 /* ────────────────────────────────────────────────────────────────────────────
  * 方案页（真实读写）——数据源全部来自 hufu-server：
  *   GET  /api/schemas          码表目录下的方案名（实时列目录）
@@ -77,6 +78,26 @@ interface OpenDirResponse {
 
 type Status = { tone: 'ok' | 'err' | 'info'; text: string; path?: string };
 
+/** 缺 input.alphabet 时的兜底字母表（与 Input 页默认 27 码元一致）。 */
+const DEFAULT_ALPHABET = ";'zyxwvutsrqponmlkjihgfedcba";
+
+/** 反查引导前缀的语义校验（长度之外），返回 null = 合法。
+ *  引擎把前缀当反查触发符：前缀若落在当前方案的编码字母表里，所有以该
+ *  字母开头的音节都会先被反查吃掉——「整类编码打不出来」。`/`（音节分隔）、
+ *  `;`（结束符）和空白同理由引擎词法层先消费，后果一致，必须在写盘前拦下。 */
+function prefixRejectReason(prefix: string, cfg: RawConfig | null): string | null {
+  if (!prefix) return '反查引导前缀不能为空';
+  const input = (cfg?.input ?? {}) as { alphabet?: unknown };
+  const alphabet =
+    typeof input.alphabet === 'string' && input.alphabet ? input.alphabet : DEFAULT_ALPHABET;
+  const hijack = '该字符会被反查劫持，导致整类编码打不出来';
+  if (alphabet.includes(prefix)) return `引导前缀「${prefix}」是编码字母表里的字符：${hijack}`;
+  if (prefix === '/' || prefix === ';' || /\s/.test(prefix)) {
+    return `引导前缀「${prefix}」是分隔/空白字符：${hijack}`;
+  }
+  return null;
+}
+
 /** 旧页 /api/export_schema 的六种格式（顺序与旧页下拉一致）。 */
 const FORMATS = [
   { id: 'sentence', label: '虎整句', full: '虎整句格式' },
@@ -130,14 +151,14 @@ function httpError(body: unknown, url: string, status: number): string {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url, { cache: 'no-store' });
+  const r = await fetchWithTimeout(url, { cache: 'no-store' });
   const body = await readBody(r);
   if (!r.ok) throw new Error(httpError(body, url, r.status));
   return body as T;
 }
 
 async function postJson<T>(url: string, payload: unknown): Promise<T> {
-  const r = await fetch(url, {
+  const r = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -349,6 +370,14 @@ export function SchemesPage({ data, notify }: { data: Bootstrap; notify: (msg: s
       /* 落盘前重取最新整份配置：本页可能停留很久，期间别的页/别的窗口
          可能改过皮肤、按键等——用旧快照写回会把它们洗掉；只补本页两节。 */
       const base = await getJson<RawConfig>('/api/config');
+      /* 语义校验用刚取到的最新 config（页面快照可能停留很久，别的页刚改过
+         字母表）。必须在 POST 之前拒掉：一旦写进 config.json，引擎下一键就
+         整类编码失效，用户只看到「打不出来」却不知道是前缀惹的。 */
+      const badPrefix = prefixRejectReason(form.prefix, base);
+      if (badPrefix) {
+        fail(badPrefix);
+        return;
+      }
       const next: RawConfig = {
         ...base,
         reverse: {

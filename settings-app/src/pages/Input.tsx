@@ -5,6 +5,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
 import '../styles/input.css';
 
+import { fetchWithTimeout } from '../api';
 /**
  * 输入页 —— 对应旧 settings-ui「输入与候选」页。
  *
@@ -189,6 +190,28 @@ function normalize(cfg: Config): InputDraft {
   };
 }
 
+/**
+ * 按字段合并：用户动过的字段保留 draft，没动过的字段跟随服务端。
+ *
+ * base 是「上一次与服务端对齐的草稿」（saved），prev 是当前草稿，server 是新
+ * 快照。用于忽略窗结束后补同步、以及保存前对齐 fresh 配置：这样外部改动
+ * （例如另一处把 OpenCC 切了）不会被旧草稿写回，正在编辑的输入框也不会被打断。
+ */
+function mergeUntouched(prev: InputDraft, base: InputDraft, server: InputDraft): InputDraft {
+  const out = {} as InputDraft;
+  (Object.keys(server) as (keyof InputDraft)[]).forEach((section) => {
+    const p = prev[section] as unknown as Dict;
+    const b = base[section] as unknown as Dict;
+    const s = server[section] as unknown as Dict;
+    const merged: Dict = {};
+    for (const k of Object.keys(s)) merged[k] = p[k] !== b[k] ? p[k] : s[k];
+    /* 防御：server 里缺失但草稿里存在的键原样保留（后端裁剪/字段新增时不丢输入）。 */
+    for (const k of Object.keys(p)) if (!(k in merged)) merged[k] = p[k];
+    (out as unknown as Dict)[section] = merged;
+  });
+  return out;
+}
+
 function validate(d: InputDraft, reversePrefix: string): string | null {
   const alphabet = d.input.alphabet;
   const letters = chars(alphabet);
@@ -233,7 +256,7 @@ function parseList(v: string): string[] {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url, { cache: 'no-store' });
+  const r = await fetchWithTimeout(url, { cache: 'no-store' });
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   return (await r.json()) as T;
 }
@@ -243,7 +266,7 @@ async function getConfig(): Promise<Config> {
 }
 
 async function postConfig(cfg: unknown): Promise<void> {
-  const r = await fetch('/api/config', {
+  const r = await fetchWithTimeout('/api/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
@@ -382,6 +405,13 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
   const [splitSchemes, setSplitSchemes] = useState<string[]>([]);
   const dirtyRef = useRef(false);
   const ignorePropsUntil = useRef(0);
+  /* 【忽略窗漏同步修复 2026-11】刚保存后 15s 内会忽略可能仍在途的旧 Bootstrap
+     快照，避免刚保存的值被上一轮 GET 的旧值覆盖。但旧实现是「直接 return」：
+     这一次 props 变化被彻底丢掉，而 propKey 此时已经变了、之后可能再也不会变
+     ——外部改动（真实事故：保存后 15s 内按 s2t 键切了 OpenCC）就永远补不进
+     draft，下一次保存会把它写回旧值。这里把被忽略的 propKey 记账，窗口结束后
+     的下一次 props 变化（或保存前的 fresh GET）再做一次合并同步。 */
+  const pendingPropKey = useRef<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [recorder, setRecorder] = useState<keyof InputDraft['readOnly'] | null>(null);
   const [recordPreview, setRecordPreview] = useState('');
@@ -440,10 +470,24 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
 
   /* App 每 10s 刷新 Bootstrap；未改动时跟随，改动中不覆盖用户编辑。 */
   useEffect(() => {
-    if (!data.online || dirtyRef.current) return;
-    /* 刚保存完的 15s 内忽略可能仍在途的旧 Bootstrap 轮询，避免刚保存的值
-       被上一轮 GET 的旧快照覆盖。 */
-    if (Date.now() < ignorePropsUntil.current) return;
+    if (!data.online) return;
+    if (Date.now() < ignorePropsUntil.current) {
+      /* 忽略窗内不能把这个 propKey 扔掉：它已经变化且不会再变，丢掉就永远补
+         不回来。先记账，窗口结束后的下一次 props 变化做合并同步。 */
+      pendingPropKey.current = propKey;
+      return;
+    }
+    if (pendingPropKey.current !== null) {
+      /* 窗口已过且有积压的外部改动：把服务端值合进 draft 一次，然后清账。
+         用户已经改过的字段（draft ≠ saved）保持原样，只有没动过的字段跟随
+         服务端，所以即便正在编辑也不会被打断。 */
+      pendingPropKey.current = null;
+      const next = normalize(data.config);
+      setDraft((prev) => mergeUntouched(prev, saved, next));
+      setSaved(next);
+      return;
+    }
+    if (dirtyRef.current) return;
     const next = normalize(data.config);
     setDraft(next);
     setSaved(next);
@@ -489,45 +533,52 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
     setSaving(true);
     try {
       const fresh = await getConfig();
+      /* 【保存前对齐 2026-11】忽略窗里积压的外部改动可能还没机会补进 draft
+         （窗口结束后如果没有任何新的 props 变化，上面的补同步不会触发）。
+         这里用刚取回的 fresh 做同一套合并：用户改过的字段以 draft 为准，没动
+         过的字段取服务端最新值 —— 既不改写外部改动，也不覆盖本页编辑。
+         合并成功后再清 pendingPropKey，失败时保留账继续等下一轮补同步。 */
+      const merged = mergeUntouched(draft, saved, normalize(fresh));
       const base: Dict = { ...(fresh as unknown as Dict) };
-      base.general = Object.assign({}, asDict(fresh.general), draft.general);
-      base.input = Object.assign({}, asDict(fresh.input), draft.input, {
-        max_code_length: clampInt(draft.input.max_code_length, 1, 10),
+      base.general = Object.assign({}, asDict(fresh.general), merged.general);
+      base.input = Object.assign({}, asDict(fresh.input), merged.input, {
+        max_code_length: clampInt(merged.input.max_code_length, 1, 10),
       });
-      base.candidates = Object.assign({}, asDict(fresh.candidates), draft.candidates, {
-        page_size: clampInt(draft.candidates.page_size, 1, 10),
-        delay_show_ms: clampInt(draft.candidates.delay_show_ms, 0, 2000),
-        delay_comment_ms: clampInt(draft.candidates.delay_comment_ms, 0, 2000),
-        freq_key: draft.readOnly.freq_key,
-        delete_key: draft.readOnly.delete_key,
+      base.candidates = Object.assign({}, asDict(fresh.candidates), merged.candidates, {
+        page_size: clampInt(merged.candidates.page_size, 1, 10),
+        delay_show_ms: clampInt(merged.candidates.delay_show_ms, 0, 2000),
+        delay_comment_ms: clampInt(merged.candidates.delay_comment_ms, 0, 2000),
+        freq_key: merged.readOnly.freq_key,
+        delete_key: merged.readOnly.delete_key,
       });
-      base.general = Object.assign({}, asDict(fresh.general), draft.general, {
-        export_key: draft.readOnly.export_key,
+      base.general = Object.assign({}, asDict(fresh.general), merged.general, {
+        export_key: merged.readOnly.export_key,
       });
-      base.punct = Object.assign({}, asDict(fresh.punct), draft.punct);
-      base.sound = Object.assign({}, asDict(fresh.sound), draft.sound, {
-        volume: clampInt(draft.sound.volume, 0, 100),
+      base.punct = Object.assign({}, asDict(fresh.punct), merged.punct);
+      base.sound = Object.assign({}, asDict(fresh.sound), merged.sound, {
+        volume: clampInt(merged.sound.volume, 0, 100),
       });
-      base.opencc = Object.assign({}, asDict(fresh.opencc), draft.opencc);
+      base.opencc = Object.assign({}, asDict(fresh.opencc), merged.opencc);
       base.clipboard = Object.assign({}, asDict(fresh.clipboard), {
-        enabled: draft.clipboard.enabled,
-        whitelist: parseList(draft.clipboard.whitelist),
+        enabled: merged.clipboard.enabled,
+        whitelist: parseList(merged.clipboard.whitelist),
       });
       await postConfig(base);
 
       const applied: InputDraft = {
-        ...draft,
-        input: { ...draft.input, max_code_length: clampInt(draft.input.max_code_length, 1, 10) },
+        ...merged,
+        input: { ...merged.input, max_code_length: clampInt(merged.input.max_code_length, 1, 10) },
         candidates: {
-          ...draft.candidates,
-          page_size: clampInt(draft.candidates.page_size, 1, 10),
-          delay_show_ms: clampInt(draft.candidates.delay_show_ms, 0, 2000),
-          delay_comment_ms: clampInt(draft.candidates.delay_comment_ms, 0, 2000),
+          ...merged.candidates,
+          page_size: clampInt(merged.candidates.page_size, 1, 10),
+          delay_show_ms: clampInt(merged.candidates.delay_show_ms, 0, 2000),
+          delay_comment_ms: clampInt(merged.candidates.delay_comment_ms, 0, 2000),
         },
-        sound: { ...draft.sound, volume: clampInt(draft.sound.volume, 0, 100) },
+        sound: { ...merged.sound, volume: clampInt(merged.sound.volume, 0, 100) },
       };
       setDraft(applied);
       setSaved(applied);
+      pendingPropKey.current = null;
       ignorePropsUntil.current = Date.now() + 15000;
       notify(
         `输入设置已保存并应用 · 码长 ${applied.input.max_code_length} · 每页 ${applied.candidates.page_size} 个候选`,
@@ -1255,7 +1306,7 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
                   <button
                     type="button"
                     className={`btn sm${recorder === key ? ' goldline' : ''}`}
-                    disabled={!draft.readOnly[key] && !lastCombo.current[key]}
+                    disabled={recorder !== null && recorder !== key}
                     onClick={() => {
                       setRecordPreview('');
                       setRecorder(recorder === key ? null : key);

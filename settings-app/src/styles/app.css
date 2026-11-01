@@ -464,22 +464,101 @@
     background:#f7dfad;transform:rotate(45deg);box-shadow:0 0 8px rgba(231,183,92,.8)}
   .seam:before{top:18px}.seam:after{bottom:18px}
   .sync-face{display:flex;align-items:center;justify-content:center;border-radius:50%;isolation:isolate}
+  /* 【合符动效 2026-11】分符（未连接）：两半分开、无辉光、圈环静止；
+     合符（已连接）：两半合拢 → 辉光浮现 → 圈环起转 → 常亮呼吸。 */
   .sync-tally{width:58px;height:100px;display:block;position:relative;z-index:2;
+    filter:none;transition:filter .5s ease}
+  .sync-tally .tally-half{transform-box:fill-box;transform-origin:50% 50%;
+    transition:transform .62s cubic-bezier(.22,1,.36,1)}
+  .sync-tally .tally-seam{transition:opacity .26s ease}
+  .sync-face.is-split .tally-left{transform:translateX(-9px) rotate(-1.4deg)}
+  .sync-face.is-split .tally-right{transform:translateX(9px) rotate(1.4deg)}
+  .sync-face.is-split .tally-seam{opacity:0}
+  .sync-face.is-split:before{border-color:rgba(231,183,92,.10);box-shadow:none}
+  .sync-face.is-merging .sync-tally{animation:tallyJoin .62s cubic-bezier(.22,1.4,.36,1)}
+  @keyframes tallyJoin{0%{transform:scale(.965)}58%{transform:scale(1.035)}100%{transform:scale(1)}}
+
+  .sync-halo{position:absolute;inset:2px;border-radius:50%;z-index:0;opacity:0;
+    background:radial-gradient(circle at 50% 45%,rgba(231,183,92,.34),rgba(231,183,92,.08) 44%,transparent 66%);
+    filter:blur(6px);transition:opacity .5s ease}
+  .sync-ring{position:absolute;inset:-3px;border-radius:50%;z-index:1;pointer-events:none;opacity:.16;
+    border:1px solid rgba(231,183,92,.22);border-top-color:rgba(243,200,119,.92);border-right-color:rgba(231,183,92,.40);
+    transition:opacity .5s ease}
+  .sync-face:after{content:"";position:absolute;inset:-9px;border-radius:50%;z-index:0;pointer-events:none;opacity:0;
+    border:1px solid rgba(231,183,92,.22);transition:opacity .4s ease}
+  .sync-flash{position:absolute;inset:-18px;border-radius:50%;z-index:0;pointer-events:none;opacity:0;
+    background:radial-gradient(circle,rgba(255,236,183,.55),rgba(231,183,92,.18) 42%,transparent 62%)}
+
+  /* 辉光浮现（一次性）：合拢之后亮起来 */
+  .sync-face.is-glow .sync-halo{opacity:1;animation:syncHaloGlow 1.05s ease-out}
+  .sync-face.is-glow .sync-flash{animation:syncFlash 1.1s ease-out}
+  .sync-face.is-glow .sync-ring{opacity:.85}
+  .sync-face.is-glow .sync-tally{filter:drop-shadow(0 10px 22px rgba(0,0,0,.42)) drop-shadow(0 0 13px rgba(231,183,92,.42))}
+  /* 合符终态：辉光呼吸 + 圈环常转 + 轻微浮动 */
+  .sync-face.is-joined .sync-halo{opacity:1;animation:syncHalo 4.2s ease-in-out infinite}
+  .sync-face.is-joined .sync-ring{opacity:1;animation:syncSpin 8s linear infinite}
+  .sync-face.is-joined:after{opacity:1;animation:syncPulse 3.4s ease-out infinite}
+  .sync-face.is-joined .sync-tally{
     filter:drop-shadow(0 10px 22px rgba(0,0,0,.42)) drop-shadow(0 0 13px rgba(231,183,92,.42));
     animation:syncFloat 5.2s ease-in-out infinite}
-  .sync-halo{position:absolute;inset:2px;border-radius:50%;z-index:0;
-    background:radial-gradient(circle at 50% 45%,rgba(231,183,92,.34),rgba(231,183,92,.08) 44%,transparent 66%);
-    filter:blur(6px);animation:syncHalo 4.2s ease-in-out infinite}
-  .sync-ring{position:absolute;inset:-3px;border-radius:50%;z-index:1;pointer-events:none;
-    border:1px solid rgba(231,183,92,.22);border-top-color:rgba(243,200,119,.92);border-right-color:rgba(231,183,92,.40);
-    animation:syncSpin 8s linear infinite}
-  .sync-face:after{content:"";position:absolute;inset:-9px;border-radius:50%;z-index:0;pointer-events:none;
-    border:1px solid rgba(231,183,92,.22);animation:syncPulse 3.4s ease-out infinite}
   @keyframes syncFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
   @keyframes syncHalo{0%,100%{opacity:.65;transform:scale(.96)}50%{opacity:1;transform:scale(1.04)}}
+  @keyframes syncHaloGlow{0%{opacity:0;transform:scale(.86)}45%{opacity:1;transform:scale(1.06)}100%{opacity:.9;transform:scale(1)}}
+  @keyframes syncFlash{0%{opacity:0;transform:scale(.7)}30%{opacity:1}100%{opacity:0;transform:scale(1.22)}}
   @keyframes syncSpin{to{transform:rotate(360deg)}}
   @keyframes syncPulse{0%{transform:scale(.92);opacity:.55}80%,100%{transform:scale(1.12);opacity:0}}
-  @media (prefers-reduced-motion:reduce){.sync-tally,.sync-halo,.sync-ring,.sync-face:after{animation:none}}
+
+  /* 已配置但连接/同步异常：辉光转琥珀、圈环停转（"看起来在连其实没连上"不可接受） */
+  .sync-face.is-trouble .sync-halo{
+    background:radial-gradient(circle at 50% 45%,rgba(214,150,90,.34),rgba(214,150,90,.08) 44%,transparent 66%)}
+  .sync-face.is-trouble .sync-ring{border-top-color:rgba(226,160,110,.90);animation:none}
+  .sync-face.is-trouble.is-joined .sync-halo{animation:syncHalo 6.5s ease-in-out infinite}
+  /* 离线（服务未起）：整体压暗停转 */
+  .sync-face.is-offline{opacity:.5}
+  .sync-face.is-offline .sync-ring{animation:none}
+  .sync-face.is-offline.is-joined .sync-halo{animation:none;opacity:.5}
+
+  /* ── 分符/合符 文字动效（与图标同频：合=从两侧合拢，分=从中间裂开） ── */
+  .hero-copy .tally-label{position:relative;height:19px;line-height:19px;display:block;width:max-content;max-width:100%}
+  .tally-label .lab{display:inline-flex;align-items:baseline;white-space:nowrap}
+  .tally-label .lab.old{position:absolute;left:0;top:0;pointer-events:none}
+  .tally-label .core{display:inline-flex;font-weight:650;color:var(--text2);transition:color .4s ease}
+  .tally-label .suffix{display:inline-block;color:var(--text3)}
+  .tally-label .ch{display:inline-block;will-change:transform,opacity}
+  .tally-label[data-joined='true'] .core{color:var(--gold2)}
+
+  .tally-label .lab.new.dir-join .ch{animation:tallyChIn .5s cubic-bezier(.2,1.25,.36,1) both}
+  .tally-label .lab.new.dir-join .ch:nth-child(1){--fx:-18px;--fr:-8deg;animation-delay:.10s}
+  .tally-label .lab.new.dir-join .ch:nth-child(2){--fx:18px;--fr:8deg;animation-delay:.17s}
+  .tally-label .lab.new.dir-split .ch{animation:tallyChIn .44s cubic-bezier(.2,1.2,.36,1) both}
+  .tally-label .lab.new.dir-split .ch:nth-child(1){--fx:12px;--fr:5deg;animation-delay:.02s}
+  .tally-label .lab.new.dir-split .ch:nth-child(2){--fx:-12px;--fr:-5deg;animation-delay:.07s}
+  .tally-label .lab.new .suffix{animation:tallySuffixIn .42s ease-out .24s both}
+
+  .tally-label .lab.old .ch{animation:tallyChOut .22s ease-in both}
+  .tally-label .lab.old.dir-join .ch:nth-child(1){--ox:10px}
+  .tally-label .lab.old.dir-join .ch:nth-child(2){--ox:-10px}
+  .tally-label .lab.old.dir-split .ch:nth-child(1){--ox:-14px;--ofr:-8deg}
+  .tally-label .lab.old.dir-split .ch:nth-child(2){--ox:14px;--ofr:8deg}
+  .tally-label .lab.old .suffix{animation:tallySuffixOut .18s ease-in both}
+
+  /* 辉光阶段：字面扫过一道金色高光，和虎符的辉光同拍 */
+  .tally-label.is-glow .core{
+    background:linear-gradient(100deg,#e7b75c 18%,#fff6d8 42%,#f0c978 64%,#e7b75c 86%);
+    background-size:220% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+    animation:tallyGold .95s ease-out both}
+
+  @keyframes tallyChIn{from{opacity:0;transform:translateX(var(--fx,0)) rotate(var(--fr,0deg)) scale(.9)}to{opacity:1;transform:none}}
+  @keyframes tallyChOut{to{opacity:0;transform:translateX(var(--ox,0)) rotate(var(--ofr,0deg)) scale(.88)}}
+  @keyframes tallySuffixIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+  @keyframes tallySuffixOut{to{opacity:0;transform:translateY(-4px)}}
+  @keyframes tallyGold{from{background-position:180% 0}to{background-position:0 0}}
+
+  @media (prefers-reduced-motion:reduce){
+    .sync-tally,.sync-halo,.sync-ring,.sync-face:after,.sync-flash{animation:none!important;transition:none!important}
+    .sync-tally .tally-half,.sync-tally .tally-seam{transition:none!important}
+    .tally-label .lab,.tally-label .ch,.tally-label .suffix{animation:none!important}
+  }
 
   .hero-copy{display:flex;flex-direction:column;gap:6px;min-width:0}
   .hero-copy .k{font-size:13px;color:var(--text3);letter-spacing:.08em}

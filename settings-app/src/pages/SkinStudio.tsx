@@ -104,6 +104,13 @@ export function SkinStudio({
   const [ssfOv, setSsfOv] = useState<Partial<SsfOverrides>>({});
   const [ssfBase, setSsfBase] = useState<Record<string, unknown>>({});
   const ssfDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /* 最新选中皮肤 id（ref）：500ms 防抖窗口内可能已换皮，而 fire 闭包里捕到的
+     selectedId 是发起时的旧值——写盘前必须和它比对，防止旧皮参数写到新皮上。 */
+  const selectedIdRef = useRef(selectedId);
+  /* 自动保存失败标记：失败后 dirty 仍为 true，saving 由 true→false 又会触发
+     effect，于是每 0.6s 重试一次（无限狂打 server + 狂弹 toast）。置位后暂停
+     自动重试，等用户再次改动（编辑操作里清除）才继续。 */
+  const saveFailedRef = useRef(false);
   const [dirty, setDirty] = useState(false);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -130,6 +137,10 @@ export function SkinStudio({
     dirtyRef.current = dirty;
   }, [dirty]);
 
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
   /* 字体表：挂载拉一次（/api/fonts）。失败静默（下拉退化为手动输入）。 */
   useEffect(() => {
     let alive = true;
@@ -154,7 +165,9 @@ export function SkinStudio({
     setOriginal(data.skin);
     setAb(false);
     setDirty(false);
-    setHorizontal(data.skin?.layout?.horizontal === true);
+    /* 只在有 JSON 皮肤快照时同步方向：ssf 皮 data.skin 恒为 null，方向挂在
+       overrides 上（见下方 ssf-settings effect），这里若照写会把横排冲成竖排。 */
+    if (data.skin) setHorizontal(data.skin.layout?.horizontal === true);
   }, [data.skins.current, data.skin?.id, data.skin?.name]);
 
   const jsonSkins = useMemo(() => {
@@ -190,6 +203,10 @@ export function SkinStudio({
         if (!alive) return;
         setSsfOv(r.overrides || {});
         setSsfBase(r.base || {});
+        /* 横排是 overrides 的成员（server ssf.rs:782-784 会注入 layout.horizontal）：
+           只回填颜色/字号会让「已存横排」的皮肤一直显示成竖排，开关点一下又只是
+           再写一次 true——永远关不掉。ssf 皮没有 data.skin 可参考，方向只能从这拿。 */
+        setHorizontal(r.overrides?.horizontal === true);
       })
       .catch(() => {
         if (alive) {
@@ -202,6 +219,19 @@ export function SkinStudio({
     };
   }, [isSsf, selectedId]);
 
+  /* 换皮即丢弃待发的 SSF 参数写（防「换皮串写」）：在 500ms 防抖窗口里切皮肤，
+     旧皮的最后一笔 overrides 会被 POST 到刚选中的新皮上（新皮凭空多出上一张
+     皮的颜色/字号）。selectedId 一变就 clearTimeout 并置空，定时器不再有意义。 */
+  useEffect(
+    () => () => {
+      if (ssfDebounce.current) {
+        clearTimeout(ssfDebounce.current);
+        ssfDebounce.current = null;
+      }
+    },
+    [selectedId],
+  );
+
   /* SSF 参数写：本地乐观 + 防抖 500ms POST（server 写盘即 bump skin_ver，
      DLL 立即重拉生效）。 */
   const patchSsf = (patch: Partial<SsfOverrides>, immediate = false) => {
@@ -211,6 +241,10 @@ export function SkinStudio({
     if (!id) return;
     const fire = () => {
       ssfDebounce.current = null;
+      /* 换皮串写第二道防线：真正发请求前再核对一次「当前选中仍是发起时那张皮」。
+         clearTimeout 只挡得住 effect 之后才切皮的情况，immediate 路径与竞态
+         仍可能带着旧 id 出发——不等就整体丢弃，宁可不写也不写错皮。 */
+      if (selectedIdRef.current !== id) return;
       setSsfOv((cur) => {
         void saveSsfSettings(id, cur as SsfOverrides)
           .then(() => setPreviewVer((v) => v + 1))
@@ -279,10 +313,14 @@ export function SkinStudio({
     setListTab(meta.kind === 'ssf' ? 'ssf' : 'json');
     setRealFailed(false);
     setPreviewVer((v) => v + 1);
-    setHorizontal(meta.kind === 'json' ? data.skin?.layout?.horizontal === true : false);
     setAb(false);
     setDirty(false);
+    /* 换皮=换一份要保存的内容：清掉上一张皮的保存失败标记，
+       否则新皮一进来自动保存就处于暂停态，怎么改都存不下去。 */
+    saveFailedRef.current = false;
     if (meta.kind === 'ssf') {
+      /* 方向先复位，真值等 ssf-settings 的 overrides 回来再定。 */
+      setHorizontal(false);
       setSkin(null);
       setOriginal(null);
       return;
@@ -292,6 +330,9 @@ export function SkinStudio({
       const next = await loadSkin(meta.id);
       setSkin(next);
       setOriginal(next);
+      /* 方向要取「刚载入的这张皮」：data.skin 是当前已生效的皮，
+         选中别款时两者不是同一份，照 data.skin 取会把别款的方向抄过来。 */
+      setHorizontal(next.layout?.horizontal === true);
     } catch (e) {
       notify(`读取皮肤失败：${(e as Error).message}`);
     } finally {
@@ -368,16 +409,21 @@ export function SkinStudio({
     }, 400);
   };
 
+  /* 三个 patch* 都是「用户主动编辑」：顺手清掉保存失败标记，恢复自动保存
+     （失败退避只该拦住无人操作的空转重试，不该让用户改完还存不下去）。 */
   const patchLayout = (key: string, value: number | string) => {
     setSkin((s) => (s ? { ...s, layout: { ...s.layout, [key]: value } } : s));
+    saveFailedRef.current = false;
     setDirty(true);
   };
   const patchMaterial = (key: string, value: number | boolean) => {
     setSkin((s) => (s ? { ...s, material: { ...s.material, [key]: value } } : s));
+    saveFailedRef.current = false;
     setDirty(true);
   };
   const patchColors = (key: string, value: string) => {
     setSkin((s) => (s ? { ...s, colors: { ...s.colors, [key]: value } } : s));
+    saveFailedRef.current = false;
     setDirty(true);
   };
 
@@ -440,21 +486,29 @@ export function SkinStudio({
       setAb(false);
       setDirty(false);
       setRealFailed(false);
+      saveFailedRef.current = false;
       setPreviewVer((v) => v + 1);
       notify(`已保存皮肤「${shortName(merged.name)}」`);
     } catch (e) {
-      notify(`保存失败：${(e as Error).message}`);
+      /* 置失败标记：不拦住的话 saving 由 true→false 又会触发自动保存 effect，
+         dirty 仍是 true → 每 0.6s 重试一次，无限刷 server 也无限弹 toast。
+         置位后自动重试暂停，toast 只出现这一次；用户下次改动时清除（见 patch*）。 */
+      saveFailedRef.current = true;
+      notify(`保存失败：${(e as Error).message}（已暂停自动重试，改动后会自动再试）`);
     } finally {
       setSaving(false);
     }
   };
 
   /* 自动保存（对齐旧版"改动即存"习惯）：dirty 且非 A/B 对比时
-     防抖 600ms 调 onSave；拖动中 skin 连续变化不断重置计时，停手即存。 */
+     防抖 600ms 调 onSave；拖动中 skin 连续变化不断重置计时，停手即存。
+     保存失败后 saveFailedRef 被置位，这里直接不再排期——否则每次 saving
+     回落都会重新排一次 600ms 定时器，形成 0.6s 一次的死循环重试。 */
   const onSaveRef = useRef(onSave);
   onSaveRef.current = onSave;
   useEffect(() => {
     if (!dirty || !skin || saving || ab) return;
+    if (saveFailedRef.current) return;
     const t = setTimeout(() => void onSaveRef.current(), 600);
     return () => clearTimeout(t);
   }, [dirty, skin, saving, ab]);
@@ -470,6 +524,7 @@ export function SkinStudio({
       setOriginal(s);
       setAb(false);
       setDirty(false);
+      saveFailedRef.current = false;
       setHorizontal(s.layout?.horizontal === true);
       setPreviewVer((v) => v + 1);
       notify(`「${shortName(s.name)}」已恢复出厂`);
@@ -496,6 +551,7 @@ export function SkinStudio({
         setSkin(next.skin);
         setOriginal(next.skin);
         setDirty(false);
+        saveFailedRef.current = false;
         setHorizontal(next.skin?.layout?.horizontal === true);
       }
     } catch (e) {
@@ -580,6 +636,7 @@ export function SkinStudio({
       setOriginal(clone);
       setDirty(false);
       setHorizontal(clone.layout?.horizontal === true);
+      saveFailedRef.current = false;
       await refresh();
       notify(`已创建「${clone.name}」`);
     } catch (e) {

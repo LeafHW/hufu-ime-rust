@@ -276,6 +276,55 @@ async function postConfig(cfg: Config): Promise<void> {
   if (!r.ok) throw new Error(body.error || `保存失败（${r.status}）`);
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
+/* 【草稿先应用再组句 2026-11-02】POST /api/config 只把整句模型重载丢给后台
+   线程（hufu-server/src/main.rs:1897-1900、848-1001），紧接着的
+   /api/sentence_test（main.rs:2460-2475）拿到的仍是旧 decoder——试验结果对应
+   用户修改之前的权重，会误导调参。服务端没有暴露 reload 完成标志（weight 类
+   变更期间旧模型继续服务，/api/state 的 sentence_active 全程为 true），所以
+   只能按下面三段兜底：
+   ① 轮询 /api/config 直到落盘配置与本页草稿一致（确认 POST 真正生效）；
+   ② 若 sentence_active 出现 false（切方案/拆旧模型）就等它回到 true；
+   ③ 再留一个装载安全窗（后台 mmap 装载 + 补充语料自动机重建，热缓存下远
+      小于该值），之后才允许调用 /api/sentence_test。
+   返回 false 只在 ① 超时；此时调用方仍可测试，但会显式提示可能仍是旧权重。 */
+const SENTENCE_RELOAD_WAIT_MS = 8000;
+const SENTENCE_RELOAD_ACTIVE_WAIT_MS = 3000;
+const SENTENCE_RELOAD_SETTLE_MS = 500;
+
+async function waitSentenceReload(draft: SentenceCfg): Promise<boolean> {
+  const sig = JSON.stringify(normalizeSentence(draft));
+  const deadline = Date.now() + SENTENCE_RELOAD_WAIT_MS;
+  let persisted = false;
+  while (Date.now() < deadline) {
+    try {
+      const cfg = await fetchConfig();
+      persisted = JSON.stringify(normalizeSentence(cfg.sentence)) === sig;
+    } catch {
+      /* 读不到配置：下一轮再试 */
+    }
+    if (persisted) break;
+    await sleep(150);
+  }
+  if (!persisted) return false;
+  /* 拆旧模型后 sentence_active 会短暂为 false：等重新激活再进安全窗，
+     避免把「模型未就绪」当成「已生效」。 */
+  const activeDeadline = Math.min(deadline, Date.now() + SENTENCE_RELOAD_ACTIVE_WAIT_MS);
+  while (Date.now() < activeDeadline) {
+    let active = true;
+    try {
+      active = Boolean((await fetchState()).sentence_active);
+    } catch {
+      /* 读不到状态：保持等待 */
+    }
+    if (active) break;
+    await sleep(150);
+  }
+  await sleep(SENTENCE_RELOAD_SETTLE_MS);
+  return true;
+}
+
 function joinModelPath(base: string, rel: string): string {
   return `${base.replace(/[\\/]+$/, '')}\\${rel.replace(/^[\\/]+/, '').replace(/\//g, '\\')}`;
 }
@@ -647,14 +696,21 @@ export function SentencePage({
       notifyRef.current('请输入编码后再试验');
       return;
     }
-    if (dirtyRef.current) {
-      const ok = await applyDraft(true);
-      if (!ok) return;
-    }
     setTesting(true);
     setTestError('');
     setTestOut(null);
     try {
+      if (dirtyRef.current) {
+        /* 有草稿：先「保存并应用」，再等后台模型重载落地才测试——否则
+           /api/sentence_test 用的是旧 decoder，结果对应旧权重、误导调参。 */
+        const draft = sentenceRef.current;
+        const applied = await applyDraft(true);
+        if (!applied) return;
+        const settled = await waitSentenceReload(draft);
+        if (!settled) {
+          notifyRef.current('参数已保存，但模型重载未在时限内确认；本次试验可能仍用旧权重');
+        }
+      }
       const r = await fetch('/api/sentence_test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1151,7 +1207,7 @@ export function SentencePage({
               <div className="card-head">
                 <div>
                   <div className="card-title">试验区</div>
-                  <div className="sentence-card-sub">有未应用草稿时先保存，再调用真实 POST /api/sentence_test。</div>
+                  <div className="sentence-card-sub">有未应用草稿时先保存并等模型重载完成，再调用真实 POST /api/sentence_test。</div>
                 </div>
                 <Badge tone={testing ? 'gold' : 'gray'}>{testing ? '组句中' : '真实接口'}</Badge>
               </div>

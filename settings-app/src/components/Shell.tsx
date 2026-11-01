@@ -51,7 +51,41 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
   },
 ];
 
-export function TitleBar({ title, onClose }: { title: string; onClose?: () => void }) {
+/**
+ * 关窗统一入口（P0）：壳内走 WebView2 postMessage('win:close')，浏览器预览
+ * 退回 window.close()。App 的未保存守卫确认后调用这里，保证不会绕过脏状态检查。
+ */
+export function requestWindowClose() {
+  const webview = (
+    window as unknown as {
+      chrome?: { webview?: { postMessage?: (msg: string) => void } };
+    }
+  ).chrome?.webview;
+  if (
+    typeof document !== 'undefined' &&
+    document.body.classList.contains('webview') &&
+    webview?.postMessage
+  ) {
+    webview.postMessage('win:close');
+    return;
+  }
+  try {
+    window.close();
+  } catch {
+    /* 浏览器预览下可能被浏览器拒绝，忽略 */
+  }
+}
+
+export function TitleBar({
+  title,
+  onClose,
+  onRequestClose,
+}: {
+  title: string;
+  onClose?: () => void;
+  /** 由 App 注入的未保存守卫：有脏数据时先弹确认，不直接发 win:close。 */
+  onRequestClose?: () => void;
+}) {
   const [maximized, setMaximized] = useState(false);
   const [snapOpen, setSnapOpen] = useState(false);
 
@@ -201,6 +235,11 @@ export function TitleBar({ title, onClose }: { title: string; onClose?: () => vo
           aria-label="关闭"
           title="关闭"
           onClick={() => {
+            /* 优先交给 App 的关窗守卫（P0）：脏数据时弹确认，而不是直接关。 */
+            if (onRequestClose) {
+              onRequestClose();
+              return;
+            }
             if (inShell()) postWindow('close');
             else onClose?.();
           }}

@@ -11,8 +11,35 @@ import {
   type SyncStatus,
 } from './types';
 
+/* 统一请求超时。设置页所有请求都打本机 hufu-server：端口被占/引擎卡死时
+   fetch 会无限期挂着，UI 就一直「保存中…」、按钮永久 disabled（只能刷新
+   页面）。15s 足够本机磁盘写盘，超时给明确文案而不是静默挂住。 */
+const REQ_TIMEOUT_MS = 15000;
+
+/** fetch 的可超时包装：AbortController + setTimeout，调用方签名不变。
+ *  只有「我们自己 abort 过」才报超时——其它网络错误（server 未启动等）
+ *  仍原样抛出，避免把连接失败误报成超时。 */
+export async function fetchWithTimeout(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = REQ_TIMEOUT_MS,
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } catch (e) {
+    if (ctrl.signal.aborted) {
+      throw new Error(`请求超时：${url}（${Math.round(timeoutMs / 1000)}s 无响应）`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url, { cache: 'no-store' });
+  const r = await fetchWithTimeout(url, { cache: 'no-store' });
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   return (await r.json()) as T;
 }
@@ -27,7 +54,7 @@ async function readErrBody(r: Response): Promise<{ error?: string; msg?: string 
 }
 
 async function postJson<T>(url: string, payload: unknown): Promise<T> {
-  const r = await fetch(url, {
+  const r = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -103,7 +130,7 @@ export async function saveSkin(
   opts?: { select?: boolean },
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
   const select = opts?.select ?? false;
-  const r = await fetch('/api/skin', {
+  const r = await fetchWithTimeout('/api/skin', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...skin, select }),
@@ -134,13 +161,13 @@ export async function resetSkin(id: string): Promise<Skin> {
 
 /** 删除 .ssf 皮肤（源文件 + 缓存目录）；删的是当前皮肤时后端回退默认。 */
 export async function deleteSsfSkin(id: string): Promise<void> {
-  const r = await fetch(`/api/skin?kind=ssf&id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const r = await fetchWithTimeout(`/api/skin?kind=ssf&id=${encodeURIComponent(id)}`, { method: 'DELETE' });
   const body = await readErrBody(r);
   if (!r.ok) throw new Error(body.error || `删除失败（${r.status}）`);
 }
 
 export async function syncNow(): Promise<void> {
-  const r = await fetch('/api/sync/now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  const r = await fetchWithTimeout('/api/sync/now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   if (!r.ok) throw new Error(`立即同步失败（${r.status}）`);
 }
 
@@ -148,7 +175,7 @@ export async function syncNow(): Promise<void> {
  *  server 实际返回 [{family, source}] 对象数组；TS 标 string[] 曾致
  *  React #31（对象渲染进 <option>）整页白屏。此处统一映射成 family。 */
 export async function loadFonts(): Promise<{ fonts: string[]; default: string }> {
-  const r = await fetch('/api/fonts', { cache: 'no-store' });
+  const r = await fetchWithTimeout('/api/fonts', { cache: 'no-store' });
   const body = await readErrBody(r);
   if (!r.ok) throw new Error(body.error || `字体列表失败（${r.status}）`);
   const raw = (body as { fonts?: Array<string | { family: string; source?: string }> }).fonts || [];
@@ -179,7 +206,7 @@ export interface SsfSettingsResp {
 }
 
 export async function loadSsfSettings(id: string): Promise<SsfSettingsResp> {
-  const r = await fetch(`/api/skin/ssf-settings?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
+  const r = await fetchWithTimeout(`/api/skin/ssf-settings?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
   const body = await readErrBody(r);
   if (!r.ok) throw new Error(body.error || `读取皮肤参数失败（${r.status}）`);
   return body as SsfSettingsResp;

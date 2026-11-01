@@ -4,6 +4,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import '../styles/keymap.css';
 
+import { fetchWithTimeout } from '../api';
 /**
  * 键位编辑器 —— 对应旧 settings-ui「自定义按键（全键盘 · 两态映射）」窗口。
  *
@@ -57,7 +58,7 @@ function normalizeKeymap(cfg: Config): KeymapDraft {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url, { cache: 'no-store' });
+  const r = await fetchWithTimeout(url, { cache: 'no-store' });
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   return (await r.json()) as T;
 }
@@ -67,7 +68,7 @@ async function getConfig(): Promise<Config> {
 }
 
 async function postConfig(cfg: unknown): Promise<void> {
-  const r = await fetch('/api/config', {
+  const r = await fetchWithTimeout('/api/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
@@ -444,12 +445,14 @@ function KeyDialog({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
+        /* 保存中不许关：关掉就会连刚填的值一起丢，失败后还得重打 */
+        if (saving) return;
         onCancel();
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onCancel]);
+  }, [onCancel, saving]);
 
   const actOptions =
     actSel && !FUNCS.some((f) => f.id === actSel)
@@ -464,7 +467,8 @@ function KeyDialog({
     <div
       className="km-modal-backdrop"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onCancel();
+        /* 保存中点背板不关闭（同 Esc）：别把在途保存的输入一起取消掉 */
+        if (!saving && e.target === e.currentTarget) onCancel();
       }}
     >
       <div className="km-modal" role="dialog" aria-modal="true" aria-label={`按键 ${cap} 设置`}>
@@ -610,18 +614,21 @@ function ShiftDialog({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
+        /* 保存中不许关：关掉就会连刚填的值一起丢，失败后还得重打 */
+        if (saving) return;
         onCancel();
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onCancel]);
+  }, [onCancel, saving]);
 
   return (
     <div
       className="km-modal-backdrop"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onCancel();
+        /* 保存中点背板不关闭（同 Esc）：别把在途保存的输入一起取消掉 */
+        if (!saving && e.target === e.currentTarget) onCancel();
       }}
     >
       <div className="km-modal" role="dialog" aria-modal="true" aria-label={`Shift+${target.base} 设置`}>
@@ -782,7 +789,10 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
     [draft, mappedKeys],
   );
 
-  const persist = async (next: KeymapDraft, okMsg: string) => {
+  /* 返回是否写入成功：调用方要等这一票再关弹窗。此前 applyKey/applyShift 先
+     setEditing(null) 再 await，保存失败时弹窗已关、用户刚输入的新值一起消失，
+     只能在报错后再从头打一遍。 */
+  const persist = async (next: KeymapDraft, okMsg: string): Promise<boolean> => {
     setSaving(true);
     try {
       const fresh = await getConfig();
@@ -799,8 +809,10 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
       setDraft(next);
       ignorePropsUntil.current = Date.now() + 15000;
       notify(okMsg);
+      return true;
     } catch (e) {
       notify(`保存失败：${(e as Error).message}`);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -822,8 +834,10 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
     else delete next.map[name];
     if (idle === '__same__') delete next.map_idle[name];
     else next.map_idle[name] = idle;
-    setEditing(null);
-    await persist(next, `按键「${cap}」已保存并应用`);
+    /* 成功才关弹窗：失败时保留弹窗与用户刚填的值，可直接重试。
+       弹窗留着也才渲染得到 saving 分支（按钮 disabled + 「保存中…」）。 */
+    const ok = await persist(next, `按键「${cap}」已保存并应用`);
+    if (ok) setEditing(null);
   };
 
   const openShift = async (base: string) => {
@@ -864,8 +878,9 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
         /* 存储被禁用时忽略 */
       }
     }
-    setShiftTarget(null);
-    await persist(next, value ? `Shift+${target.base} 已保存并应用` : `Shift+${target.base} 已恢复内置`);
+    /* 同 applyKey：保存失败要保留弹窗和新值（失败先把弹窗关掉=用户输入白填） */
+    const ok = await persist(next, value ? `Shift+${target.base} 已保存并应用` : `Shift+${target.base} 已恢复内置`);
+    if (ok) setShiftTarget(null);
   };
 
   const askReset = (targetPage: PageId) => {
@@ -897,8 +912,9 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
       delete next.map.escape;
       delete next.map_idle.escape;
     }
-    setConfirmReset(null);
-    await persist(next, `已恢复「${PAGE_TITLE[targetPage]}」默认并应用`);
+    /* 与上面两处同类：失败时保留确认条，避免「提示失败但条目已消失」的假象 */
+    const ok = await persist(next, `已恢复「${PAGE_TITLE[targetPage]}」默认并应用`);
+    if (ok) setConfirmReset(null);
   };
 
   const shiftInitial = shiftTarget ? draft.shift_symbols[shiftTarget.key] || '' : '';

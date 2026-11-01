@@ -202,6 +202,54 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+/* 【挂件图格式白名单 2026-11-02】DLL 端只按文件头魔数识别 PNG/GIF/JPEG/WEBP
+   这四种（hufu-server/src/overlay.rs:251-264、hufu-tsf/src/overlaywin.rs:185-197）。
+   BMP/SVG/AVIF/ICO/TIFF 浏览器能解码、旧逻辑也照单全收，但整图写进皮肤后
+   实机挂件不会出现，且 DLL 静默失败没有任何报错。故前端在读取前做同一套
+   魔数校验，不通过就明确提示并放弃写入。 */
+type OverlayImageKind = 'png' | 'gif' | 'jpeg' | 'webp';
+
+const OVERLAY_IMAGE_MIME: Record<OverlayImageKind, string> = {
+  png: 'image/png',
+  gif: 'image/gif',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+};
+
+function sniffOverlayImage(head: Uint8Array): OverlayImageKind | null {
+  const at = (i: number) => head[i] ?? -1;
+  /* PNG: 89 50 4E 47（完整签名后随 0D 0A 1A 0A，前 4 字节足够区分） */
+  if (at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) return 'png';
+  /* GIF: 47 49 46 38（"GIF8"，87a / 89a 都命中） */
+  if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x38) return 'gif';
+  /* JPEG: FF D8 FF */
+  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return 'jpeg';
+  /* WEBP: RIFF 容器 —— 0-3 "RIFF"，8-11 "WEBP"（RIFF 头里还有 4 字节长度） */
+  if (
+    at(0) === 0x52 &&
+    at(1) === 0x49 &&
+    at(2) === 0x46 &&
+    at(3) === 0x46 &&
+    at(8) === 0x57 &&
+    at(9) === 0x45 &&
+    at(10) === 0x42 &&
+    at(11) === 0x50
+  ) {
+    return 'webp';
+  }
+  return null;
+}
+
+/** 只读文件头 16 字节做魔数判定，不整读大图。 */
+async function sniffOverlayImageFile(file: File): Promise<OverlayImageKind | null> {
+  try {
+    const head = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+    return sniffOverlayImage(head);
+  } catch {
+    return null;
+  }
+}
+
 type ImageDecoderLike = {
   tracks: {
     ready: Promise<void>;
@@ -777,14 +825,30 @@ export function BuddyPage({
       notifyRef.current('请选择图片文件');
       return;
     }
+    /* 魔数校验（与 DLL 同一白名单）：accept 已收窄，但「所有文件」入口、
+       改过扩展名的文件仍能绕过 MIME 判断，必须按文件内容兜底。 */
+    const kind = await sniffOverlayImageFile(file);
+    if (!kind) {
+      notifyRef.current(
+        '仅支持 PNG / GIF / JPEG / WEBP 挂件图（此格式 DLL 挂件不显示），已忽略所选文件',
+      );
+      return;
+    }
     if (file.size > 24 * 1024 * 1024) {
       notifyRef.current('图片文件过大（>24MB），请精简后再挂');
       return;
     }
     try {
       let dataUrl = await readFileAsDataUrl(file);
+      /* 扩展名/MIME 可能与真实内容不一致（如 .bmp 实际是 PNG）：按魔数
+         结果改写 data URL 前缀，保证下游解码与动图检测按真实格式走。 */
+      const mime = OVERLAY_IMAGE_MIME[kind];
+      if (!dataUrl.startsWith(`data:${mime};base64,`)) {
+        const comma = dataUrl.indexOf(',');
+        if (comma > 0) dataUrl = `data:${mime};base64,${dataUrl.slice(comma + 1)}`;
+      }
       let img = await loadImage(dataUrl);
-      const animated = await detectAnimated(dataUrl, file.type);
+      const animated = await detectAnimated(dataUrl, mime);
       if (dataUrl.length > 11_000_000) {
         if (animated) {
           notifyRef.current('动图超过 8MB，无法自动压缩，请精简后再挂');
@@ -1246,7 +1310,9 @@ export function BuddyPage({
             <input
               ref={fileRef}
               type="file"
-              accept="image/*"
+              /* 与 DLL 魔数白名单一致：PNG/GIF/JPEG/WEBP 四种，其余格式
+                 选进来也只会被 onFileChange 的魔数校验拒绝。 */
+              accept="image/png,image/gif,image/jpeg,image/webp,.png,.gif,.jpg,.jpeg,.webp"
               className="buddy-file-input"
               onChange={(e) => void onFileChange(e)}
             />

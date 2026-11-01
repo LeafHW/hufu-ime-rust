@@ -217,7 +217,12 @@ export const fallbackSkin: Skin = {
 
 export const fallbackBootstrap: Bootstrap = {
   about: {
-    version: '1.9.6',
+    /* 【离线版本号 2026-11-02】以前写死 '1.9.6'，实机已到 1.9.8：离线或
+       /api/about 请求失败时会显示过期版本号。构建期没有版本注入通道
+       （vite.config.ts 无 define、package.json 0.1.0 与发行版本无关），
+       最小改动是显示占位符「—」；在线时 /api/about 读 version.txt 的真值
+       会覆盖此处，不会长期停在占位符上。 */
+    version: '—',
     github: 'https://github.com/LeafHW/hufu-ime-rust',
     data_dir: 'D:\\HuFu\\数据',
     exe_dir: 'D:\\HuFu',
