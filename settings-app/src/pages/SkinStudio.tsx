@@ -869,7 +869,55 @@ export function SkinStudio({
                 </div>
               ))}
             </div>
-          ) : null}
+          ) : (
+            /* 【SSF 文字颜色下置 2026-11-01】SSF 皮肤的覆盖色（编码/首选/
+               候选/注释）从 insp 面板移到预览下方，与自有皮肤色板同位。 */
+            <div className="stage-colors">
+              <div className="sc-group">
+                <div className="sc-h">文字颜色 · 覆盖皮肤原色</div>
+                <div className="sc-grid">
+                  {([
+                    ['code_color', '编码', '编码行文字色'],
+                    ['first_color', '首选', '第一候选文字色（皮肤的高亮表达）'],
+                    ['text_color', '候选', '候选文字色'],
+                    ['annotation_color', '注释', '注释/拼音色'],
+                  ] as const).map(([key, label, tip]) => {
+                    const cur =
+                      (ssfOv[key] as string | undefined) || (ssfBase[key] as string | undefined) || '#CCCCCC';
+                    return (
+                      <div className="sc-item" key={key} title={tip}>
+                        <ColorSwatch value={cur} label={label} onChange={(v) => patchSsf({ [key]: v } as Partial<SsfOverrides>)} />
+                        <span className="lab">{label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="btn outline sm"
+                  style={{ marginTop: 8 }}
+                  onClick={() =>
+                    patchSsf(
+                      {
+                        font_pt: null,
+                        font_face: null,
+                        show_index: null,
+                        cand_y: null,
+                        code_color: null,
+                        first_color: null,
+                        text_color: null,
+                        annotation_color: null,
+                      },
+                      true,
+                    )
+                  }
+                  title="字号/字体/序号/候选高度/颜色全部还原为皮肤原值"
+                >
+                  还原皮肤原值
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="stage-cap">
             <span>
@@ -1183,53 +1231,8 @@ export function SkinStudio({
                 </div>
               </div>
             </div>
-            <div className="insp-sec">
-              <div className="insp-sec-h">
-                <Icon name="chev-down" className="icon chev" />
-                文字颜色
-                <Badge>覆盖皮肤原色</Badge>
-              </div>
-              {([
-                ['code_color', '编码', '编码行文字色'],
-                ['first_color', '首选', '第一候选文字色（皮肤的高亮表达）'],
-                ['text_color', '候选', '候选文字色'],
-                ['annotation_color', '注释', '注释/拼音色'],
-              ] as const).map(([key, lab, tip]) => {
-                const cur =
-                  (ssfOv[key] as string | undefined) || (ssfBase[key] as string | undefined) || '#CCCCCC';
-                return (
-                  <div className="row-line" key={key}>
-                    <span className="lab" title={tip}>{lab}</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                      <ColorSwatch value={cur} label={lab} onChange={(v) => patchSsf({ [key]: v } as Partial<SsfOverrides>)} />
-                      <span className="val">{cur.slice(0, 7)}</span>
-                    </div>
-                  </div>
-                );
-              })}
-              <button
-                type="button"
-                className="btn outline sm"
-                onClick={() =>
-                  patchSsf(
-                    {
-                      font_pt: null,
-                      font_face: null,
-                      show_index: null,
-                      cand_y: null,
-                      code_color: null,
-                      first_color: null,
-                      text_color: null,
-                      annotation_color: null,
-                    },
-                    true,
-                  )
-                }
-                title="字号/字体/序号/候选高度/颜色全部还原为皮肤原值"
-              >
-                还原皮肤原值
-              </button>
-            </div>
+            {/* 【SSF 文字颜色下置 2026-11-01】原「文字颜色」insp 区整体
+                移到预览下方（与自有皮肤色板同位），此处删除。 */}
             </>
             )}
 
