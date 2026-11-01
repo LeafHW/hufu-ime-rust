@@ -154,6 +154,14 @@ foreach ($b in $builds) {
     Pop-Location
     if ($code -ne 0) { throw "瘦身构建失败: cargo build $($b.args -join ' ')" }
 }
+# hufu-settings 是独立 workspace（不在 platform\windows 成员里），必须单独构建，
+# 否则打包源会留着旧 exe（端口自探测修复曾因此进不了包）。
+Push-Location 'E:\DSH-KF\hufu\platform\windows\hufu-settings'
+cmd /c 'cargo build --release 2>&1' | ForEach-Object { Write-Host "  $_" }
+$code = $LASTEXITCODE
+Pop-Location
+if ($code -ne 0) { throw '瘦身构建失败: hufu-settings' }
+
 $env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\engine\target-slim'
 Push-Location 'E:\DSH-KF\hufu\engine'
 cmd /c 'cargo build --release -p hufu-server 2>&1' | ForEach-Object { Write-Host "  $_" }
@@ -166,12 +174,18 @@ $copies = @(
     @('E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf.dll')),
     @('E:\DSH-KF\hufu\platform\windows\target-slim\i686-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf32.dll')),
     @('E:\DSH-KF\hufu\engine\target-slim\release\hufu-server.exe', (Join-Path $SRC 'hufu-server.exe')),
-    @('E:\DSH-KF\hufu\platform\windows\target-slim\release\hufu-tsf-smoke.exe', (Join-Path $SRC 'hufu-tsf-smoke.exe'))
+    @('E:\DSH-KF\hufu\platform\windows\target-slim\release\hufu-tsf-smoke.exe', (Join-Path $SRC 'hufu-tsf-smoke.exe')),
+    @('E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe', (Join-Path $SRC 'hufu-settings.exe'))
 )
 foreach ($c in $copies) {
     if (Test-Path $c[0]) { Copy-Item $c[0] $c[1] -Force; [void](Check $true "同步 $($c[1].Split([char]92)[-1])") }
     else { [void](Check $false "源缺失 $($c[0])"); throw "构建产物缺失：$($c[0])" }
 }
+
+# 【2026-11-02】version.txt = 安装包唯一版本源（server /api/about 与检查更新都读它）。
+# 之前没人写，打包源里一直是 1.9.0 → 新装用户检查更新永远报「有新版本」。
+Set-Content -Path (Join-Path $SRC 'version.txt') -Value $Version -NoNewline -Encoding ascii
+[void](Check $true "写入 version.txt = $Version")
 
 # 清理垃圾
 Get-ChildItem $SRC -Filter '*.old*' -EA SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal'; Remove-Item $_.FullName -Force -EA SilentlyContinue }
