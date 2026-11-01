@@ -811,6 +811,40 @@ export function SkinStudio({
             )}
           </div>
 
+          {/* 【颜色区下置 2026-11-01】色板网格放预览正下方（预览已砍到
+              44% 高）：4 列网格排整齐，取代右侧参数面板里的竖排长列表。
+              项集合与 insp 旧「颜色」区一致（窗底色/高亮底在「材质」区）。 */}
+          {!isSsf ? (
+            <div className="stage-colors">
+              <div className="sc-h">颜色 · 点击色块修改（保存后生效）</div>
+              <div className="sc-grid">
+                {([
+                  'back_color', 'hilited_candidate_back_color',
+                  'border_color', 'candidate_back_color',
+                  'preedit_back_color', 'text_color',
+                  'hilited_text_color', 'candidate_text_color',
+                  'hilited_candidate_text_color', 'label_color',
+                  'hilited_label_color', 'hilited_candidate_label_color',
+                  'comment_text_color', 'hilited_comment_text_color',
+                  'shadow_color', 'capsule_back_color', 'capsule_text_color',
+                  'hilited_back_color',
+                ] as const).map((key) => {
+                  const cur =
+                    (skin?.colors?.[key] as string | undefined) ||
+                    (fallbackSkin.colors as unknown as Record<string, string>)[key] ||
+                    '#00000000';
+                  return (
+                    <div className="sc-item" key={key} title={`skin.colors.${key}`}>
+                      <ColorSwatch value={cur} label={COLOR_LABELS[key] || key} onChange={(v) => patchColors(key, v)} />
+                      <span className="lab">{COLOR_LABELS[key] || key}</span>
+                      <span className="val">{cur.slice(0, 7)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
           <div className="stage-cap">
             <span>
               <b>{shortName(shownSkin?.name || currentMeta?.name || '—')}</b> · {isSsf ? '位图皮肤' : '矢量皮肤'} · {horizontal ? '横排预览' : '预览'}
@@ -941,21 +975,12 @@ export function SkinStudio({
 
             {!isSsf && (
             <>
+            {/* 【颜色区下置 2026-11-01】原竖排「颜色」区整体移到预览下方的
+                网格（stage-colors）；此处不再重复。 */}
             <div className="insp-sec">
               <div className="insp-sec-h">
                 <Icon name="chev-down" className="icon chev" />
                 材质
-              </div>
-              <div className="row-line">
-                <span className="lab">窗底色</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <ColorSwatch
-                    value={skin?.colors?.back_color || '#1B1D22'}
-                    label="窗底色"
-                    onChange={(v) => patchColors('back_color', v)}
-                  />
-                  <span className="val">{(skin?.colors?.back_color || '#1B1D22').slice(0, 7)}</span>
-                </div>
               </div>
               <div className="row-line">
                 <span className="lab">整体透明度</span>
@@ -972,17 +997,6 @@ export function SkinStudio({
                   title="skin.material.hilite_on"
                   onChange={(v) => patchMaterial('hilite_on', v)}
                 />
-              </div>
-              <div className="row-line">
-                <span className="lab">高亮色</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <ColorSwatch
-                    value={highlight}
-                    label="高亮色"
-                    onChange={(v) => patchColors('hilited_candidate_back_color', v)}
-                  />
-                  <span className="val">{highlight.slice(0, 7)}</span>
-                </div>
               </div>
               <div className="row-line">
                 <span className="lab">高亮透明度</span>
@@ -1002,49 +1016,8 @@ export function SkinStudio({
               </div>
             </div>
 
-            {/* 【颜色补全 2026-11-01】自有皮肤此前只有窗底色/高亮色两个
-                取色器，其余颜色字段（边框/候选文字/注释/序号/编码色等）
-                无 UI 可调。此处按 COLOR_LABELS 全量补齐；窗底色与高亮底
-                已在上方「材质」区（带透明度联动），不重复列出。 */}
-            <div className="insp-sec">
-              <div className="insp-sec-h">
-                <Icon name="chev-down" className="icon chev" />
-                颜色
-                <Badge>全部可调</Badge>
-              </div>
-              {([
-                'border_color',
-                'candidate_back_color',
-                'preedit_back_color',
-                'text_color',
-                'hilited_text_color',
-                'candidate_text_color',
-                'hilited_candidate_text_color',
-                'label_color',
-                'hilited_label_color',
-                'hilited_candidate_label_color',
-                'comment_text_color',
-                'hilited_comment_text_color',
-                'hilited_back_color',
-                'shadow_color',
-                'capsule_back_color',
-                'capsule_text_color',
-              ] as const).map((key) => {
-                const cur =
-                  (skin?.colors?.[key] as string | undefined) ||
-                  (fallbackSkin.colors as unknown as Record<string, string>)[key] ||
-                  '#00000000';
-                return (
-                  <div className="row-line" key={key}>
-                    <span className="lab" title={`skin.colors.${key}`}>{COLOR_LABELS[key] || key}</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                      <ColorSwatch value={cur} label={COLOR_LABELS[key] || key} onChange={(v) => patchColors(key, v)} />
-                      <span className="val">{cur.slice(0, 9)}</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            {/* 【颜色区下置 2026-11-01】原竖排「颜色」区整体移到预览下方的
+                4 列网格（stage-colors，18 项含窗底色/高亮底），此处删除。 */}
 
             <div className="insp-sec">
               <div className="insp-sec-h">
@@ -1240,11 +1213,16 @@ export function SkinStudio({
                 颜色角色
                 <Badge>{Object.keys(shownSkin?.colors || {}).length || 21}</Badge>
               </div>
-              <div className="color-grid">
-                {Object.entries(shownSkin?.colors || {}).map(([key, value]) => (
-                  <ColorSwatch key={key} value={value} label={COLOR_LABELS[key] || key} />
-                ))}
-              </div>
+              {/* 【颜色区下置 2026-11-01】自有皮肤的可调色板已上移到预览
+                  下方网格，此处只读色块墙对其冗余——仅 SSF（无编辑色板）
+                  保留总览；weasel 配色互导两种皮肤都保留。 */}
+              {isSsf ? (
+                <div className="color-grid">
+                  {Object.entries(shownSkin?.colors || {}).map(([key, value]) => (
+                    <ColorSwatch key={key} value={value} label={COLOR_LABELS[key] || key} />
+                  ))}
+                </div>
+              ) : null}
               <button type="button" className="link-more" disabled={weaselBusy} onClick={() => weaselRef.current?.click()}>
                 {weaselBusy ? '导入中…' : 'weasel 配色互导 →'}
               </button>

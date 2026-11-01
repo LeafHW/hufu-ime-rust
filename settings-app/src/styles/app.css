@@ -350,12 +350,19 @@
   .tool{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--text2);height:26px;padding:0 7px;border-radius:6px}
   .tool .icon{width:13px;height:13px}
   .stage{
-    flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;
+    flex:0 0 44%;min-height:190px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;
     background:
       radial-gradient(620px 420px at 18% 16%,rgba(231,183,92,.30),transparent 62%),
       radial-gradient(540px 420px at 86% 84%,rgba(94,140,126,.30),transparent 62%),
       linear-gradient(150deg,#262b34 0%,#14171c 52%,#1e1a1c 100%);
   }
+  /* 【颜色区下置 2026-11-01】预览砍到 44% 高，色板网格放预览下面（卡内下段） */
+  .stage-colors{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--line);padding:8px 12px 10px;background:var(--surface)}
+  .stage-colors .sc-h{display:flex;align-items:center;font-size:12px;font-weight:600;color:var(--text2);margin:2px 0 8px}
+  .stage-colors .sc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px 12px}
+  .stage-colors .sc-item{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;color:var(--text2)}
+  .stage-colors .sc-item .lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .stage-colors .sc-item .val{margin-left:auto;color:var(--text3);font-size:11px}
   .stage:before{
     content:"";position:absolute;width:540px;height:540px;left:-10%;top:-18%;border-radius:50%;
     background:radial-gradient(circle,rgba(255,206,130,.28),transparent 64%);filter:blur(28px);
