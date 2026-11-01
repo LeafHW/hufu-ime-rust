@@ -182,6 +182,25 @@ foreach ($c in $copies) {
     else { [void](Check $false "源缺失 $($c[0])"); throw "构建产物缺失：$($c[0])" }
 }
 
+# ── 图标嵌入（2026-11-02）──────────────────────────────────────────
+# cargo 产物永远裸（无图标资源）；copies 覆盖会把 staging 里手工嵌过的
+# 图标版 exe 洗回裸版（1.9.8 二轮重打曾中招：target-slim 被重编后图标
+# 丢失）。现统一在复制后对 hufu-server.exe / hufu-settings.exe 嵌图标
+# （整数资源 ID 方案，embed-icon.py，PrivateExtractIconsW 验收口径）。
+$embedPy = Join-Path $PSScriptRoot 'embed-icon.py'
+$icoPath  = 'E:\DSH-KF\hufu\platform\windows\hufu-tsf\assets\hufu.ico'
+if ((Test-Path $embedPy) -and (Test-Path $icoPath)) {
+    foreach ($exeName in @('hufu-server.exe', 'hufu-settings.exe')) {
+        $exePath = Join-Path $SRC $exeName
+        if (Test-Path $exePath) {
+            cmd /c "python -X utf8 `"$embedPy`" `"$exePath`" `"$icoPath`" 2>&1" | ForEach-Object { Write-Host "  $_" }
+            if ($LASTEXITCODE -eq 0) { [void](Check $true "$exeName 嵌入图标") } else { [void](Check $false "$exeName 嵌图标失败（python 退出码 $LASTEXITCODE）") }
+        }
+    }
+} else {
+    [void](Check $false 'embed-icon.py 或 hufu.ico 缺失，跳过图标嵌入')
+}
+
 # 【2026-11-02】version.txt = 安装包唯一版本源（server /api/about 与检查更新都读它）。
 # 之前没人写，打包源里一直是 1.9.0 → 新装用户检查更新永远报「有新版本」。
 Set-Content -Path (Join-Path $SRC 'version.txt') -Value $Version -NoNewline -Encoding ascii
