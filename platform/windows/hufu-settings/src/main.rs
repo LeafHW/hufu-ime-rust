@@ -315,10 +315,14 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
             KillTimer(hwnd, 2);
             // [P0-2b] React 已就绪：解除启动超时看护
             KillTimer(hwnd, 3);
-            (*app).shown = true;
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = UpdateWindow(hwnd);
-            (*app).log("window shown after React ready");
+            // 【2026-11-02 白闪根治 v1】不立即显示：再等 100ms 让合成器把
+            // WebView2 首帧真正提交上屏（React ready ≠ 首帧已上屏），显示
+            // 时用户看到的第一眼就是已渲染页面而非白色表面。前端配合：
+            // win:ready 本身等两帧 + 80ms 才发（Shell.tsx），两级合计约
+            // 180ms。不加深色遮罩（v2 方案已否决）：遮罩色无法跟随浅色
+            // 主题，会在浅色界面下引入「黑→白」二次闪变。
+            SetTimer(hwnd, 4, 100, null());
+            (*app).log("win:ready received; reveal scheduled in 100ms");
         }
         "win:drag" => {
             ReleaseCapture();
@@ -823,6 +827,19 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TIMER => {
+            if wparam == 4 {
+                // 【2026-11-02 白闪根治 v1】win:ready 后 100ms 揭示：
+                // 此时 WebView2 首帧已提交，直接显示不会露白。
+                KillTimer(hwnd, 4);
+                let app = app_ptr(hwnd);
+                if !app.is_null() && !(*app).shown {
+                    (*app).shown = true;
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = UpdateWindow(hwnd);
+                    (*app).log("window shown after React ready (+100ms first frame)");
+                }
+                return 0;
+            }
             if wparam == 2 {
                 KillTimer(hwnd, 2);
                 // [P0-2b] 首帧揭示完成：解除启动超时看护
@@ -1049,6 +1066,10 @@ struct CliArgs {
     log: PathBuf,
     auto_close_secs: Option<u32>,
     dpi: Option<u32>,
+    /// `--theme light|dark|system`：追加到设置页 URL 的 ?theme= 参数
+    /// （前端 RT-13 已支持，一次性生效不写回 localStorage）。主要用于
+    /// 启动白闪/主题验证探针（flash-probe.ps1），正常启动不传。
+    theme: Option<String>,
 }
 
 fn parse_args(exe_dir: &Path) -> CliArgs {
@@ -1063,6 +1084,7 @@ fn parse_args(exe_dir: &Path) -> CliArgs {
         user_data,
         auto_close_secs: None,
         dpi: None,
+        theme: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1usize;
@@ -1087,6 +1109,13 @@ fn parse_args(exe_dir: &Path) -> CliArgs {
             }
             "--dpi" if i + 1 < argv.len() => {
                 args.dpi = argv[i + 1].parse::<u32>().ok().filter(|d| (72..=480).contains(d));
+                i += 2;
+            }
+            "--theme" if i + 1 < argv.len() => {
+                let v = argv[i + 1].clone();
+                if v == "light" || v == "dark" || v == "system" {
+                    args.theme = Some(v);
+                }
                 i += 2;
             }
             _ => i += 1,
@@ -1316,6 +1345,14 @@ unsafe fn real_main() -> i32 {
     // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
     // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
     resolve_url(&mut args);
+    // 【--theme】追加到最终 URL（默认与显式 URL 都已含 query，用 & 拼；
+    // 防御性判断避免重复追加）。
+    if let Some(theme) = args.theme.clone() {
+        if !args.url.contains("theme=") {
+            let sep = if args.url.contains('?') { '&' } else { '?' };
+            args.url = format!("{}{sep}theme={theme}", args.url);
+        }
+    }
     log_line(&args.log, &format!("target URL: {}", args.url));
 
     // [P0-2c 2026-11-01] 单实例互斥：命名互斥体占名，二次启动（连按

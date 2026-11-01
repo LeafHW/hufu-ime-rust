@@ -109,12 +109,23 @@ export function TitleBar({
       }
     ).chrome?.webview;
     if (!webview?.postMessage) return;
-    const send = () => webview.postMessage?.('win:ready');
-    const raf = requestAnimationFrame(() => requestAnimationFrame(send));
-    const t = window.setTimeout(send, 120);
+    /* 【2026-11-02】只发一次 ready，且等两帧 + 80ms：让合成器先出首帧，
+       壳侧收到 ready 再推迟 100ms 显示窗口，避免露出 WebView2 空白表面。 */
+    let sent = false;
+    const send = () => {
+      if (sent) return;
+      sent = true;
+      webview.postMessage?.('win:ready');
+    };
+    let inner = 0;
+    const raf = requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        inner = window.setTimeout(send, 80);
+      }),
+    );
     return () => {
       cancelAnimationFrame(raf);
-      window.clearTimeout(t);
+      window.clearTimeout(inner);
     };
   }, []);
 
