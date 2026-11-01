@@ -850,3 +850,6 @@ body.light .about-hero img {
 /* 【模型真名 2026-11-01】整句模型页：实际文件名显示 */
 .sentence-path-note{color:var(--muted,#888);font-size:12px}
 .sentence-resolved code.is-active{color:var(--accent,#e7b75c)}
+/* 【概览检查更新 2026-11-01】发现新版时该行高亮 */
+.act-row.has-update{border-color:var(--accent,#e7b75c)}
+.act-row.has-update .act-main b{color:var(--accent,#e7b75c)}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
 import { syncNow } from '../api';
+import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
@@ -35,6 +36,18 @@ export function Overview({
   navigate: (r: Route, sub?: string) => void;
 }) {
   const [syncing, setSyncing] = useState(false);
+  /* 【检查更新 2026-11-01】概览行与关于页同款：真实调 /api/update/check；
+     有更新时该行变「直接下载」，无 exe 资产回退下载页。 */
+  const [upd, setUpd] = useState<UpdateState>({ kind: 'idle' });
+  const onCheckUpdateRow = async () => {
+    if (upd.kind === 'checking') return;
+    if (upd.kind === 'update') {
+      window.open(upd.downloadUrl || upd.pageUrl, '_blank', 'noopener');
+      return;
+    }
+    setUpd({ kind: 'checking' });
+    setUpd(await fetchUpdateCheck(data.about.github));
+  };
   const [query, setQuery] = useState(() => {
     try {
       return new URLSearchParams(location.search).get('q') || '';
@@ -335,10 +348,22 @@ export function Overview({
             <div className="act-main"><b>打开码表目录</b><span>当前方案的码表根目录</span></div>
             <Icon name="chev" className="icon sm chev" />
           </div>
-          <div className="act-row" onClick={() => window.open(data.about.github, '_blank', 'noopener')}>
+          <div
+            className={`act-row${upd.kind === 'update' ? ' has-update' : ''}`}
+            onClick={() => void onCheckUpdateRow()}
+          >
             <div className="act-ico"><Icon name="refresh" /></div>
-            <div className="act-main"><b>检查更新</b><span>当前 v{data.about.version}</span></div>
-            <Icon name="chev" className="icon sm chev" />
+            <div className="act-main">
+              <b>{upd.kind === 'update' ? `发现新版本 v${upd.latest}` : '检查更新'}</b>
+              <span>
+                {upd.kind === 'idle' && `当前 v${data.about.version} · 点击检查`}
+                {upd.kind === 'checking' && '检查中…'}
+                {upd.kind === 'latest' && `已是最新（v${upd.current}）`}
+                {upd.kind === 'update' && (upd.downloadUrl ? '点击直接下载安装包' : '点击打开下载页')}
+                {upd.kind === 'error' && `检查失败：${upd.msg}`}
+              </span>
+            </div>
+            <Icon name={upd.kind === 'update' ? 'arrow' : 'chev'} className="icon sm chev" />
           </div>
           <div className="side-tip">
             <b>小提示</b>

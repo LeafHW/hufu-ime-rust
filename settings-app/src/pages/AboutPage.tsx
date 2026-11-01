@@ -1,31 +1,14 @@
 import { useState } from 'react';
 import type { About } from '../types';
-import { getJson } from '../api';
+import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
 import { PageHead } from '../components/ui';
-
-type UpdateState =
-  | { kind: 'idle' }
-  | { kind: 'checking' }
-  | { kind: 'latest'; current: string }
-  | { kind: 'update'; latest: string; downloadUrl: string | null; pageUrl: string }
-  | { kind: 'error'; msg: string };
 
 export function AboutPage({ about }: { about: About }) {
   const [upd, setUpd] = useState<UpdateState>({ kind: 'idle' });
 
   const checkUpdate = async () => {
     setUpd({ kind: 'checking' });
-    try {
-      const r = (await getJson<{ ok: boolean; current: string; latest?: string; has_update?: boolean; page_url?: string; download_url?: string | null; error?: string }>('/api/update/check')) as {
-        ok: boolean; current: string; latest?: string; has_update?: boolean; page_url?: string; download_url?: string | null; error?: string;
-      };
-      if (!r.ok) setUpd({ kind: 'error', msg: r.error || '检查失败' });
-      else if (r.has_update)
-        setUpd({ kind: 'update', latest: r.latest || '?', downloadUrl: r.download_url || null, pageUrl: r.page_url || about.github });
-      else setUpd({ kind: 'latest', current: r.current });
-    } catch (e) {
-      setUpd({ kind: 'error', msg: (e as Error).message });
-    }
+    setUpd(await fetchUpdateCheck(about.github));
   };
 
   return (
