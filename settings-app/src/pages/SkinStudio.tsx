@@ -80,6 +80,8 @@ export function SkinStudio({
   const [ab, setAb] = useState(false);
   const [bg, setBg] = useState('wall');
   const [search, setSearch] = useState('');
+  /* 【皮肤列表分页签 2026-11-01】矢量/位图分组切换；初始跟当前皮肤类型。 */
+  const [listTab, setListTab] = useState<'json' | 'ssf'>(data.skins.current_kind === 'ssf' ? 'ssf' : 'json');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -268,6 +270,8 @@ export function SkinStudio({
   /* 卡片点选=仅加载进编辑器/预览（P0-1：切换当前皮肤走 makeCurrent → api.selectSkin） */
   const applySkin = async (meta: SkinMeta) => {
     setSelectedId(meta.id);
+    /* 选中皮肤时列表页签联动到对应组，避免选中项落在隐藏页签里。 */
+    setListTab(meta.kind === 'ssf' ? 'ssf' : 'json');
     setRealFailed(false);
     setPreviewVer((v) => v + 1);
     setHorizontal(meta.kind === 'json' ? data.skin?.layout?.horizontal === true : false);
@@ -612,6 +616,30 @@ export function SkinStudio({
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
+          {/* 【皮肤列表分页签 2026-11-01】矢量与 .ssf 原本同栏竖排，位图
+              在底部要滚动才能点到；改为顶部两页签一键切换组。 */}
+          <div className="seg sk-kind-seg" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={listTab === 'json'}
+              className={`sg${listTab === 'json' ? ' on' : ''}`}
+              onClick={() => setListTab('json')}
+            >
+              矢量 {jsonSkins.length}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={listTab === 'ssf'}
+              className={`sg${listTab === 'ssf' ? ' on' : ''}`}
+              onClick={() => setListTab('ssf')}
+            >
+              位图 .ssf {ssfSkins.length}
+            </button>
+          </div>
+          {listTab === 'json' && (
+            <>
           <div className="list-label">
             <span>矢量皮肤</span>
             <span>{jsonSkins.length}</span>
@@ -651,6 +679,10 @@ export function SkinStudio({
               </div>
             );
           })}
+            </>
+          )}
+          {listTab === 'ssf' && (
+            <>
           <div className="list-label" style={{ marginTop: 6 }}>
             <span>位图皮肤 (.ssf)</span>
             <span>{ssfSkins.length}</span>
@@ -690,6 +722,8 @@ export function SkinStudio({
               </div>
             );
           })}
+            </>
+          )}
           <div className="import-tile" role="button" tabIndex={0} onClick={() => fileRef.current?.click()} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileRef.current?.click(); } }}>
             <Icon name="plus" />
             <span>
