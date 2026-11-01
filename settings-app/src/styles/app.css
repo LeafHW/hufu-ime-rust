@@ -406,7 +406,9 @@
   .row-line{display:flex;align-items:center;justify-content:space-between;min-height:28px;gap:8px}
   .row-line .lab{font-size:13px;color:var(--text2);white-space:nowrap}
   .row-line .val{font-size:12px;color:var(--text2);font-variant-numeric:tabular-nums}
-  .swatch{width:20px;height:20px;border-radius:5px;border:1px solid rgba(255,255,255,.16);flex:none}
+  .swatch{width:20px;height:20px;border-radius:5px;border:1px solid rgba(255,255,255,.16);flex:none;position:relative;background:repeating-conic-gradient(#3c4046 0% 25%,#2a2d32 0% 50%) 0 0/8px 8px}
+  /* 【棋盘底纹 2026-11-01】透明色透出棋盘，不再视觉消失 */
+  .swatch .sw-fill{position:absolute;inset:0;border-radius:4px}
   .slider{width:96px;height:4px;border-radius:4px;background:var(--line2);position:relative;flex:none}
   .slider i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:linear-gradient(90deg,#b4863b,var(--gold))}
   .slider b{position:absolute;top:50%;width:11px;height:11px;border-radius:50%;background:#f7dfad;border:2px solid #8a6427;

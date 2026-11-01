@@ -45,13 +45,18 @@ function ColorSwatch({
 }) {
   if (!onChange) {
     return (
-      <span className="swatch" title={`${label} ${value}`} style={{ background: value }}>
-        <span className="sr-only">{label}</span>
+      <span className="swatch" title={`${label} ${value}`}>
+        {/* 【棋盘底纹 2026-11-01】半透明/全透明色（alpha<FF）直接铺色会
+            视觉消失，与实色块并排像「大小不一」——棋盘底+覆盖色层透出。 */}
+        <span className="sw-fill" style={{ background: value }}>
+          <span className="sr-only">{label}</span>
+        </span>
       </span>
     );
   }
   return (
-    <span className="swatch edit" title={`${label} ${value}（点击修改）`} style={{ background: value }}>
+    <span className="swatch edit" title={`${label} ${value}（点击修改）`}>
+      <span className="sw-fill" style={{ background: value }} />
       {/* server 一律存 8 位 #RRGGBBAA（hufu-skin lib.rs:25）；取色器只吃 6 位：
           显示取前 6 位、保存拼回原 alpha（丢 alpha 会让半透明底色变全不透明）。 */}
       <input
