@@ -64,7 +64,7 @@ git -c credential.helper= push \
 ## 说明
 
 - **数据**：万句基准 99.73%（纯 ngram）；叠加 Qwen3 神经重排可达 99.9%。
-- **打赏**：站点 `#donate` 区块使用 `assets/img/donate-alipay.png`（支付宝扫码），与设置页「打赏支持」的二维码同源。
+- **打赏**：站点 `#donate` 区块内联支付宝二维码（base64，源文件 `assets/img/donate-alipay.png`，与设置页「打赏支持」的二维码同源），避免慢网下二维码空白。
 
 - 本站代码随虎符项目以 GPL-3.0-or-later 发布；字体为 OFL 1.1；截图与 Logo 版权归虎符项目。
 - 页面会读取 `api.github.com` 获取最新版本；如网络受限，会使用静态兜底。
