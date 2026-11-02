@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
 </p>
 
-> **macOS 版正在开发中。** IMK 前端骨架已落地（[`platform/macos`](platform/macos/README.md)），尚未发布安装包；Windows 版可直接安装使用。
+> **macOS 版正在开发中（预计 11 月 20 日前后上线）。** IMK 前端骨架已落地（[`platform/macos`](platform/macos/README.md)），尚未发布安装包；Windows 版可直接安装使用。
 
 虎符（HuFu）是一款以 **虎码** 为主码的跨平台中文输入法，名字取自古代调兵信物「虎符」。目标是在 **虎爪输入法（TigerClaw）** 与 **Rime（虎码配置）** 的基础上，做成「统一 Rust 引擎 + 多平台前端 + 图形化设置」的产品级输入法。
 
@@ -23,7 +23,7 @@
 | :--- | :--- | :--- |
 | Windows 10/11 | ✅ 稳定 | TSF 前端；exe 安装包，已在实机验证 |
 | Linux（fcitx5） | ✅ 可用 | 由社区协作者维护；安装见 [`platform/linux`](platform/linux/README.md) |
-| macOS | 🚧 开发中 | IMK 骨架已落地，待 Mac 实机迭代；暂无安装包 |
+| macOS | 🚧 开发中 | IMK 骨架已落地，待 Mac 实机迭代；预计 11 月 20 日前后上线，暂无安装包 |
 
 ## 界面预览
 
@@ -65,19 +65,20 @@
 ### Linux（fcitx5）
 
 ```sh
-platform/linux/install.sh   # 构建 + 码表装配 + systemd user 服务 + 系统级 addon（中途要 sudo）
-fcitx5 -r -d                # 重启 fcitx5
-fcitx5-configtool           # 输入法 → 添加「虎符」
+platform/linux/install.sh -umt  # 用户级 一键全量安装
+fcitx5 -r -d       # 重启 fcitx5（或以发行版的方式）
+fcitx5-configtool  # 手动添加「虎符」（或以发行版的方式）
 ```
 
-默认数据**随仓库自带**（`assets/`，模型除外），`--from <目录>`
-可换外部码表源；设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`。
+- 默认数据 **随仓库自带**（`assets/`）
+- 模型与主题不随 `-s/-u` 安装，分别用 `-m`、`-t` 显式独立安装
+- 设置页在应用菜单「虎符设置」或 `http://127.0.0.1:4390/`
 
-安装 / 卸载 / 功能与作者声明见 **[platform/linux/README.md](platform/linux/README.md)**。
+Linux 详见 [platform/linux/README.md](platform/linux/README.md)
 
 ### macOS
 
-macOS 版正在开发中，暂无安装包。IMK 前端骨架、构建方式与当前限制见
+macOS 版正在开发中（预计 11 月 20 日前后上线），暂无安装包。IMK 前端骨架、构建方式与当前限制见
 [platform/macos/README.md](platform/macos/README.md)；欢迎 Mac 开发者参与。
 
 从源码构建、Windows 系统注册与注意事项详见 [docs/build.md](docs/build.md)；
