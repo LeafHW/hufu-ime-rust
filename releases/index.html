@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>虎符更新日志 · 最新版与历史版本下载</title>
+<meta name="description" content="虎符输入法更新日志：自动同步 GitHub Releases，查看最新版本、完整更新说明与历史版本下载。">
+<link rel="canonical" href="https://www.hufuime.top/releases/">
+<meta name="theme-color" content="#f6f1e6">
+<meta property="og:type" content="website">
+<meta property="og:title" content="虎符更新日志 · 最新版与历史版本下载">
+<meta property="og:description" content="最新版本、完整更新说明与历史版本下载。页面直接读取 GitHub Releases。">
+<meta property="og:url" content="https://www.hufuime.top/releases/">
+<meta property="og:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261103b">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="虎符更新日志 · 最新版与历史版本下载">
+<meta name="twitter:description" content="最新版本、完整更新说明与历史版本下载。页面直接读取 GitHub Releases。">
+<meta name="twitter:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261103b">
+<link rel="icon" href="../assets/img/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="../assets/img/apple-touch-icon.png">
+<link rel="preload" href="../assets/fonts/noto-serif-sc-subset.woff2?v=20261103c" as="font" type="font/woff2" crossorigin>
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem('hufu-theme');
+    if (t !== 'light' && t !== 'dark') {
+      t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+})();
+</script>
+<link rel="stylesheet" href="./releases.css?v=20261103a">
+<script defer src="./releases.js?v=20261103a"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "CollectionPage",
+  "name": "虎符更新日志",
+  "url": "https://www.hufuime.top/releases/",
+  "description": "虎符输入法最新版本、更新说明与历史版本下载，数据来自 GitHub Releases。",
+  "isPartOf": { "@type": "WebSite", "name": "虎符 HuFu", "url": "https://www.hufuime.top/" }
+}
+</script>
+</head>
+<body>
+<svg class="icon-sprite" aria-hidden="true" width="0" height="0">
+  <symbol id="i-github" viewBox="0 0 24 24"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.47-1.1-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.89 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.56 9.56 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z" fill="currentColor"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 15.4A8.5 8.5 0 0 1 8.6 4 8.6 8.6 0 1 0 20 15.4Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4.5 20.5h15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m0 0-5.5-5.5M19 12l-5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8.5 8.5M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<header class="site-head">
+  <div class="shell head-inner">
+    <a class="brand" href="../" aria-label="虎符 HuFu 官网">
+      <span class="brand-mark"><img src="../assets/img/logo-128.png" alt="" width="34" height="34"></span>
+      <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
+    </a>
+    <nav class="head-nav" aria-label="站内导航">
+      <a href="../">官网</a>
+      <a href="../#download">下载</a>
+      <a href="./" aria-current="page">更新日志</a>
+    </nav>
+    <div class="head-actions">
+      <a class="icon-btn" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener" aria-label="在 GitHub 上查看虎符">
+        <svg class="ico"><use href="#i-github"></use></svg>
+      </a>
+      <button class="icon-btn theme-toggle" type="button" data-theme-toggle aria-label="切换深浅色" title="切换深浅色">
+        <svg class="ico ico-sun"><use href="#i-sun"></use></svg>
+        <svg class="ico ico-moon"><use href="#i-moon"></use></svg>
+      </button>
+      <a class="btn btn-sm" href="#latest"><span>下载最新版</span><svg class="ico"><use href="#i-download"></use></svg></a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="hero-grid" aria-hidden="true"></div>
+    <div class="hero-mark" aria-hidden="true">符</div>
+    <div class="shell hero-inner">
+      <p class="kicker"><span class="kicker-dot"></span> RELEASES / 更新日志</p>
+      <h1>每次更新，<br><span>都写在这里。</span></h1>
+      <p class="hero-lede">最新版本、完整更新说明与历史版本下载。页面直接读取 GitHub Releases——发布新版本后刷新本页，就能看到。</p>
+      <div class="hero-actions">
+        <a class="btn btn-lg" href="#latest"><span>下载最新版</span><svg class="ico"><use href="#i-download"></use></svg></a>
+        <a class="btn btn-ghost btn-lg" href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" rel="noopener"><svg class="ico"><use href="#i-github"></use></svg><span>GitHub Releases</span></a>
+        <button class="text-btn" type="button" data-copy><svg class="ico"><use href="#i-copy"></use></svg><span>复制页面链接</span></button>
+      </div>
+      <div class="hero-status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="load-state">正在从 GitHub 读取版本…</span>
+        <span class="status-sep">·</span>
+        <span id="last-sync"></span>
+        <button class="text-btn small" type="button" data-refresh><svg class="ico"><use href="#i-refresh"></use></svg><span>刷新</span></button>
+      </div>
+    </div>
+  </section>
+
+  <section class="latest-section" id="latest" aria-label="最新版本">
+    <div class="shell">
+      <div id="latest-slot" aria-live="polite" aria-busy="true">
+        <article class="latest-card is-skeleton" aria-hidden="true">
+          <div class="skeleton-line w20"></div>
+          <div class="skeleton-line w60 tall"></div>
+          <div class="skeleton-grid">
+            <div>
+              <div class="skeleton-line w90"></div>
+              <div class="skeleton-line w80"></div>
+              <div class="skeleton-line w70"></div>
+              <div class="skeleton-line w85"></div>
+              <div class="skeleton-line w50"></div>
+            </div>
+            <div class="skeleton-side">
+              <div class="skeleton-line w80"></div>
+              <div class="skeleton-line w100 tall"></div>
+              <div class="skeleton-line w70"></div>
+            </div>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="history-section" id="history" aria-labelledby="history-title">
+    <div class="shell">
+      <header class="history-head">
+        <div>
+          <p class="kicker"><span class="kicker-dot"></span> ARCHIVE / 历史版本</p>
+          <h2 id="history-title">历史版本</h2>
+        </div>
+        <p class="history-sub">所有正式版与预发布版。点开版本可看完整更新说明。</p>
+        <span class="history-count" id="history-count"></span>
+      </header>
+      <div class="release-list" id="release-list" aria-busy="true">
+        <div class="release-row is-skeleton" aria-hidden="true"><div class="skeleton-line w25"></div><div class="skeleton-line w70 tall"></div><div class="skeleton-line w50"></div></div>
+        <div class="release-row is-skeleton" aria-hidden="true"><div class="skeleton-line w20"></div><div class="skeleton-line w60 tall"></div><div class="skeleton-line w45"></div></div>
+        <div class="release-row is-skeleton" aria-hidden="true"><div class="skeleton-line w30"></div><div class="skeleton-line w65 tall"></div><div class="skeleton-line w40"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <noscript>
+    <div class="shell"><div class="notice">这个页面需要 JavaScript 才能读取 GitHub Releases。你也可以直接打开 <a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" rel="noopener">GitHub Releases</a> 查看最新版本与历史版本。</div></div>
+  </noscript>
+</main>
+
+<footer class="site-foot">
+  <div class="shell foot-inner">
+    <div class="foot-brand">
+      <a class="brand" href="../" aria-label="虎符 HuFu 官网">
+        <span class="brand-mark"><img src="../assets/img/logo-128.png" alt="" width="32" height="32"></span>
+        <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
+      </a>
+      <p>更新日志由 GitHub Releases 驱动。</p>
+    </div>
+    <nav class="foot-links" aria-label="页脚导航">
+      <a href="../">官网</a>
+      <a href="../#download">下载</a>
+      <a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" rel="noopener">GitHub Releases</a>
+      <a href="../#faq">问答</a>
+    </nav>
+    <p class="foot-copy">© 2026 LeafHW · 虎符 HuFu</p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -4,6 +4,8 @@
 
 **<https://www.hufuime.top/>**
 
+更新日志（自动同步 GitHub Releases）：**<https://www.hufuime.top/releases/>**
+
 ## 本地预览
 
 ```sh
