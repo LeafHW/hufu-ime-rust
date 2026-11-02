@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/design/hufu-icon-new-256.png" width="96" alt="虎符 HuFu">
+  <img src="docs/design/hufu-icon-q-256.png" width="96" alt="虎符 HuFu">
 </p>
 
 <h1 align="center">虎符 HuFu</h1>
@@ -45,7 +45,8 @@
 - **繁简与注解**：OpenCC 简繁 + emoji 候选变体，拼音/拆分/Unicode 注释，双拼反查
 - **皮肤**：JSON 皮肤 + 毛玻璃等材质，兼容导入 weasel/squirrel 配色
 - **图形设置**：本地 Web UI 全图形化，不碰 yaml/lua；用户词管理、数据快照导入导出
-- **数据自主**：用户词、配置与调整日志本地保存，支持全量快照导出/导入与 WebDAV 同步
+- **数据自主**：用户词、配置与调整日志本地保存，支持全量快照导出/导入
+- **云同步**：WebDAV（坚果云等）双向同步，可按方案勾选同步内容；支持口令加密与回收站恢复
 - **按键音效**：4 类按键音，音量可调
 
 功能明细详见 [docs/features.md](docs/features.md)。
