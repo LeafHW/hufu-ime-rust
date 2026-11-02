@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102g") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102h") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -4576,5 +4576,109 @@ h2 {
   .flow-line i,
   .medal-spark {
     display: none;
+  }
+}
+
+/* donation */
+.donate {
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+
+.donate-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(280px, 0.92fr);
+  gap: clamp(36px, 6vw, 90px);
+  align-items: center;
+}
+
+.donate-copy h2 {
+  margin: 18px 0 20px;
+  font-size: clamp(36px, 4.4vw, 64px);
+  line-height: 1.16;
+  letter-spacing: -0.03em;
+}
+
+.donate-copy .lede {
+  max-width: 48ch;
+}
+
+.donate-fine {
+  margin-top: 20px;
+  font-size: 13px;
+  color: var(--faint);
+}
+
+.donate-card {
+  justify-self: end;
+  width: min(100%, 320px);
+  margin: 0;
+  padding: 24px 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.donate-qr {
+  width: 200px;
+  height: 200px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06), 0 8px 24px -12px rgba(0, 0, 0, 0.25);
+}
+
+.donate-qr img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.donate-card figcaption {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.donate-card figcaption strong {
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+}
+
+@media (max-width: 980px) {
+  .donate-grid {
+    grid-template-columns: 1fr;
+    gap: 34px;
+  }
+
+  .donate-card {
+    justify-self: start;
+  }
+}
+
+@media (max-width: 620px) {
+  .donate-copy h2 {
+    font-size: clamp(32px, 9vw, 44px);
+  }
+
+  .donate-card {
+    width: 100%;
+    padding: 20px;
+  }
+
+  .donate-qr {
+    width: 200px;
+    height: 200px;
   }
 }
