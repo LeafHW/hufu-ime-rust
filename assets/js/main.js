@@ -197,9 +197,9 @@
   var heroStage = $('.hero-stage');
   var demoVisible = true;
   var demoSkinFlip = false;
-  var DEMO_CODE = 'lksg rvm nae gj';
-  var DEMO_PREFILL = '让中文，';
-  var DEMO_SENTENCE = '让中文，落笔成句。';
+  var DEMO_CODE = 'syfdgvwlkuvnagj';
+  var DEMO_PREFILL = '';
+  var DEMO_SENTENCE = '让中文，落指成句。';
 
   if (candidate && candItems.length) {
     candItems.forEach(function (li, i) { li.style.setProperty('--n', String(i)); });

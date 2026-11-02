@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102b") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102c") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -952,6 +952,8 @@ h2 {
   background: radial-gradient(circle at 34% 28%, #fffaee, #f3e3c3 58%, #e4c78f 100%);
   border: 1px solid rgba(139, 91, 36, 0.34);
   box-shadow: 0 22px 50px -22px rgba(51, 36, 12, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  display: grid;
+  place-items: center;
   transform: translate3d(calc(var(--mx) * 8px), calc(var(--my) * 8px), 0) rotate(4deg);
   transition: transform 0.4s var(--ease);
   animation: medalIn 1.2s 0.5s var(--ease-out) both;
@@ -959,54 +961,26 @@ h2 {
 
 .medal-ring {
   position: absolute;
+  z-index: 2;
   inset: 8px;
   border: 1px dashed rgba(139, 91, 36, 0.42);
   border-radius: 50%;
   animation: spin 46s linear infinite;
 }
 
-.medal-half {
-  position: absolute;
-  top: 12px;
-  width: 63px;
-  height: 126px;
-  overflow: hidden;
-  filter: drop-shadow(0 4px 8px rgba(60, 40, 10, 0.18));
-  transition: transform 0.8s var(--ease-out);
-}
-
-.medal-left {
-  left: 12px;
-  animation: joinLeft 1.15s 0.95s var(--ease-out) both;
-}
-
-.medal-right {
-  left: 75px;
-  animation: joinRight 1.15s 0.95s var(--ease-out) both;
-}
-
-.medal-half img {
+.medal-icon {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 126px;
   height: 126px;
-}
-
-.medal-right img {
-  margin-left: -63px;
-}
-
-.medal-seam {
-  position: absolute;
-  top: 18px;
-  bottom: 18px;
-  left: 50%;
-  width: 1px;
-  background: linear-gradient(transparent, rgba(139, 91, 36, 0.5), transparent);
-  opacity: 0.55;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 8px rgba(60, 40, 10, 0.18));
 }
 
 .medal-spark {
   position: absolute;
+  z-index: 3;
   top: 50%;
   left: 50%;
   width: 8px;
@@ -1019,13 +993,6 @@ h2 {
   animation: spark 3.6s 1.5s ease-in-out infinite;
 }
 
-.medal:hover .medal-left {
-  transform: translateX(-6px);
-}
-
-.medal:hover .medal-right {
-  transform: translateX(6px);
-}
 
 /* editor window */
 .editor {
