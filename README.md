@@ -52,10 +52,14 @@ git -c credential.helper= push \
   "https://x-access-token:$(cat ../gh-token.txt)@github.com/LeafHW/hufu-ime-rust.git" gh-pages
 ```
 
-首次发布后到仓库 **Settings → Pages** 确认：
+推送 `gh-pages` 分支后，GitHub Pages 通常会自动创建（本仓 2026-11-02 实测：推送后自动变为 `building → built`）。
+如未自动发布，到仓库 **Settings → Pages** 选择：
 
 - Source: **Deploy from a branch**
 - Branch: **gh-pages** / **/(root)**
+
+> 注：用 fine-grained PAT 调 `POST /repos/{owner}/{repo}/pages` 会返回 403（缺 Pages 权限）；实际不需要调这个 API，推送 `gh-pages` 即可触发。
+> 线上已验证：`status=built`、`https_enforced=true`、`custom_404=true`，仓库首页 Website 已指向该地址。
 
 ## 说明
 
