@@ -15,7 +15,7 @@
 | 繁简与注解 | OpenCC txt 对照（简↔繁、emoji 注），候选滤镜链：前 3 候选自动追加繁体（⚑繁）与 emoji（😊）变体，设置界面开关+方向可选 |
 | 用户数据   | 用户词四态（加/隐/权/序）、追加式调整日志、按时间戳导出      |
 | 云同步     | WebDAV（坚果云等）双向同步；按方案勾选同步内容；支持口令端到端加密与回收站恢复 |
-| 皮肤       | JSON 皮肤：19 个颜色角色 + 布局参数 + **材质**（纯色/半透明/毛玻璃磨砂/玻璃边框），Windows 用 DWM Acrylic/Mica + Direct2D，macOS 用 NSVisualEffectView；兼容导入 weasel/squirrel 配色 |
+| 皮肤       | JSON 皮肤（19 个颜色角色 + 布局参数 + **材质**：纯色/半透明/毛玻璃磨砂/玻璃边框，Windows 用 DWM Acrylic/Mica + Direct2D，macOS 用 NSVisualEffectView）+ **.ssf 皮肤（搜狗主流格式）**；兼容导入 weasel/squirrel 配色 |
 | 设置界面   | 本地 Web UI（daemon 托管），全图形化：方案/候选/键位/整句权重/皮肤编辑器/用户词管理/导入导出。**不碰 yaml/lua** |
 | 中英切换   | Shift / Ctrl+Space / Caps / 跟随系统；中文态英文标点；大小写保留混输 |
 | 音效       | 4 类按键音 + 音量（可选）：引擎按键即出标签（key/select/commit/page），DLL waveOut 播放（管道取 base64 音频，音量 0–100，**任意声道/位深 PCM**），设置界面开关+试听；默认音源 TigerClaw sounds（KeyNormal/KeySpace/KeyPop/KeyFunc） |
