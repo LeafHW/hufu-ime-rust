@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102l") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102m") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -3361,6 +3361,7 @@ h2 {
 }
 
 .footer-license {
+  display: block;
   margin-top: 18px;
   font-family: var(--mono);
   font-size: 9px;
