@@ -852,7 +852,7 @@ h2 {
   stroke-linecap: round;
   stroke-dasharray: 700;
   stroke-dashoffset: 700;
-  animation: brushDraw 1.2s 0.9s var(--ease-out) forwards;
+  animation: brushDraw 0.9s 0.5s var(--ease-out) forwards;
   filter: drop-shadow(0 1px 0 rgba(168, 116, 31, 0.18));
 }
 
@@ -924,8 +924,8 @@ h2 {
 .hero-reveal {
   opacity: 0;
   transform: translateY(18px);
-  animation: rise 0.95s var(--ease-out) forwards;
-  animation-delay: calc(0.08s + var(--i, 0) * 0.09s);
+  animation: rise 0.7s var(--ease-out) forwards;
+  animation-delay: calc(0.05s + var(--i, 0) * 0.06s);
 }
 
 .hero-stage {
@@ -956,7 +956,7 @@ h2 {
   place-items: center;
   transform: translate3d(calc(var(--mx) * 8px), calc(var(--my) * 8px), 0) rotate(4deg);
   transition: transform 0.4s var(--ease);
-  animation: medalIn 1.2s 0.5s var(--ease-out) both;
+  animation: medalIn 0.9s 0.3s var(--ease-out) both;
 }
 
 .medal-ring {
@@ -3748,8 +3748,8 @@ h2 {
 .js [data-reveal] {
   opacity: 0;
   transform: translateY(26px);
-  transition: opacity 0.85s var(--ease-out), transform 0.85s var(--ease-out);
-  transition-delay: calc(var(--d, 0) * 90ms);
+  transition: opacity 0.6s var(--ease-out), transform 0.6s var(--ease-out);
+  transition-delay: calc(var(--d, 0) * 60ms);
 }
 
 .js [data-reveal].is-in {
@@ -4683,4 +4683,11 @@ h2 {
     width: 200px;
     height: 200px;
   }
+}
+
+/* 【2026-11-03 动效减负】标签页隐藏时暂停全部 CSS 动画（main.js 切 body.site-hidden）。 */
+body.site-hidden *,
+body.site-hidden *::before,
+body.site-hidden *::after {
+  animation-play-state: paused !important;
 }

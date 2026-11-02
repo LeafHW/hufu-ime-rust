@@ -7,6 +7,9 @@
   var root = document.documentElement;
   var body = document.body;
   var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  /* 低端机/省流量：跳过 View Transition 整页截图（主题切换仍即时生效）。 */
+  var weakDevice = (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
+    !!(navigator.connection && navigator.connection.saveData);
   var $ = function (sel, ctx) { return (ctx || document).querySelector(sel); };
   var $$ = function (sel, ctx) { return Array.prototype.slice.call((ctx || document).querySelectorAll(sel)); };
   var sleep = function (ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); };
@@ -48,7 +51,7 @@
   if (themeToggle) {
     themeToggle.addEventListener('click', function () {
       var next = currentTheme() === 'dark' ? 'light' : 'dark';
-      if (!reduceMotion && document.startViewTransition) {
+      if (!reduceMotion && !weakDevice && document.startViewTransition) {
         document.startViewTransition(function () { setTheme(next); });
       } else {
         setTheme(next);
@@ -186,6 +189,33 @@
     }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
     revealEls.forEach(function (el) { revealObserver.observe(el); });
   }
+
+  /* ---------- 装饰动画离屏暂停 ---------- */
+  // 页面有 13 个 infinite 动画（脉冲/旋转/漂浮/跑马灯等）。只让视口内
+  // 的持续跑：滚出视口即 animation-play-state:paused，减少合成器常驻。
+  if (!reduceMotion && 'IntersectionObserver' in window) {
+    var decoEls = [];
+    $$('*').forEach(function (el) {
+      var cs = window.getComputedStyle(el);
+      var names = cs.animationName || '';
+      var counts = cs.animationIterationCount || '';
+      if (names && names !== 'none' && counts.indexOf('infinite') >= 0) decoEls.push(el);
+    });
+    if (decoEls.length) {
+      var decoObs = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          entry.target.style.animationPlayState = entry.isIntersecting ? 'running' : 'paused';
+        });
+      }, { rootMargin: '120px 0px' });
+      decoEls.forEach(function (el) {
+        el.style.animationPlayState = 'paused';
+        decoObs.observe(el);
+      });
+    }
+  }
+  document.addEventListener('visibilitychange', function () {
+    document.body.classList.toggle('site-hidden', document.hidden);
+  });
 
   /* ---------- Hero typing demo ---------- */
   var demoText = $('[data-demo-text]');
