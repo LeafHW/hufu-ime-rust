@@ -601,6 +601,7 @@
   var exeLinks = $$('[data-exe-link]');
   var exeVersions = $$('[data-exe-version]');
   var exeSizes = $$('[data-exe-size]');
+  var exeMeta = $$('[data-exe-meta]');
   var zipLink = $('[data-zip-link]');
 
   function formatMB(bytes) {
@@ -636,6 +637,7 @@
       exeLinks.forEach(function (a) { a.setAttribute('href', exe.browser_download_url); });
       exeSizes.forEach(function (el) { el.textContent = formatMB(exe.size); });
       exeVersions.forEach(function (el) { el.textContent = version; });
+      exeMeta.forEach(function (el) { el.textContent = exe.name + ' · ' + formatMB(exe.size); });
     }
     if (zip && zipLink) {
       zipLink.hidden = false;
