@@ -197,7 +197,7 @@
   var heroStage = $('.hero-stage');
   var demoVisible = true;
   var demoSkinFlip = false;
-  var DEMO_CODE = 'syfdgvwlkuvnagj';
+  var DEMO_CODE = 'syfdgvwihuvnagj';
   var DEMO_PREFILL = '';
   var DEMO_SENTENCE = '让中文收指成句';
 
@@ -341,6 +341,67 @@
       candidate.classList.add('is-open');
     }
     setActiveCandidate(0);
+  }
+
+  /* ---------- Code strip typewriter ---------- */
+  var codeTypeEls = $$('[data-code-type]');
+
+  function prepareCode(el) {
+    var textEl = el.querySelector('[data-code-text]');
+    if (!textEl) return;
+    var full = textEl.textContent;
+    textEl.setAttribute('data-full', full);
+    if (reduceMotion) {
+      el.classList.add('is-typed');
+      return;
+    }
+    textEl.textContent = '';
+  }
+
+  function typeCode(el) {
+    if (!el || el.getAttribute('data-typed') === '1') return;
+    var textEl = el.querySelector('[data-code-text]');
+    if (!textEl) return;
+    var full = textEl.getAttribute('data-full') || textEl.textContent;
+    textEl.setAttribute('data-full', full);
+    if (reduceMotion) {
+      textEl.textContent = full;
+      el.classList.add('is-typed');
+      return;
+    }
+    el.setAttribute('data-typed', '1');
+    el.classList.add('is-typing');
+    textEl.textContent = '';
+    var i = 0;
+    var timer = setInterval(function () {
+      i += 1;
+      textEl.textContent = full.slice(0, i);
+      if (i >= full.length) {
+        clearInterval(timer);
+        el.classList.remove('is-typing');
+        el.classList.add('is-typed');
+      }
+    }, 76);
+  }
+
+  codeTypeEls.forEach(prepareCode);
+  var heroCode = $('[data-code-type="hero"]');
+  if (heroCode) setTimeout(function () { typeCode(heroCode); }, 240);
+  var featureCode = $('[data-code-type="feature"]');
+  if (featureCode) {
+    if ('IntersectionObserver' in window) {
+      var codeObserver = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            typeCode(entry.target);
+            codeObserver.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.35 });
+      codeObserver.observe(featureCode);
+    } else {
+      typeCode(featureCode);
+    }
   }
 
   /* ---------- Stats counters ---------- */

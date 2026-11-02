@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102e") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102f") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -1373,6 +1373,7 @@ h2 {
 .code-full {
   display: inline-flex;
   align-items: center;
+  min-width: 15.5ch;
   padding: 7px 10px;
   border: 1px solid var(--line-2);
   border-bottom-width: 2px;
@@ -1751,7 +1752,10 @@ h2 {
 }
 
 .stream-code {
+  display: inline-flex;
   flex: none;
+  align-items: center;
+  min-width: 14.5ch;
   padding: 8px 9px;
   border: 1px solid var(--line-2);
   border-bottom-width: 2px;
@@ -1763,6 +1767,24 @@ h2 {
   line-height: 1;
   color: var(--ink-2);
   white-space: nowrap;
+}
+
+.code-caret {
+  display: inline-block;
+  width: 1px;
+  height: 11px;
+  margin-left: 2px;
+  background: var(--gold);
+  animation: codeCaret 0.9s steps(1) infinite;
+}
+
+.is-typed .code-caret {
+  display: none;
+}
+
+@keyframes codeCaret {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
 }
 
 .stream-line {
