@@ -54,4 +54,4 @@ fcitx5 -r -d && fcitx5-configtool   # 重启后在配置工具添加「虎符」
 
 ## macOS 前端
 
-尚未开始开发（仅有骨架代码）。结构见 [platform/macos/README.md](../platform/macos/README.md)。
+开发中（IMK 骨架已落地，待 Mac 实机迭代；暂无安装包）。结构见 [platform/macos/README.md](../platform/macos/README.md)。

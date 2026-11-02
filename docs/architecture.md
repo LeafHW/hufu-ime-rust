@@ -33,7 +33,7 @@ hufu/
 ├── engine/          Rust workspace（核心引擎，全平台共享）
 ├── platform/windows Windows TSF 输入法前端
 ├── platform/linux   Linux fcitx5 前端（Rust staticlib + C++ 薄壳 + CMake）
-├── platform/macos   macOS InputMethodKit 前端（尚未开始开发，仅有骨架代码）
+├── platform/macos   macOS InputMethodKit 前端（开发中，IMK 骨架已落地）
 ├── settings-ui/     设置 Web UI（由 hufu-server 托管）
 ├── assets/          码表与数据资源（多方案码表/注释/拆分/反查/音效）
 └── docs/            架构与调研文档
@@ -126,6 +126,7 @@ hufu-engine Session::process_key()
 
 ## 8. macOS 前端（platform/macos）
 
+- **状态**：开发中（IMK 骨架已落地，待 Mac 实机迭代；暂无安装包）。
 - `HuFuIME`：InputMethodKit（`IMKInputController` 子类 + `IMKServer`），
   候选窗 `NSPanel` + `NSVisualEffectView`；连接 daemon Unix socket。
 - 工程为 SPM 包 + bundle 组装脚本（Info.plist：tsInputMethodCharacterIconKey 等），

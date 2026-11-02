@@ -1,5 +1,7 @@
 # hufu mac — macOS InputMethodKit 前端
 
+> **状态：开发中（未发布）。** 当前为 IMK 前端骨架，需在 Mac 上实机编译迭代；暂无安装包。
+
 薄壳架构（与 Windows TSF 前端一致）：输入法进程只做事件转发与绘制，
 引擎在 `hufu-server` 守护进程里。
 
@@ -9,6 +11,15 @@
       → setMarkedText 组段（inline 编码）+ insertText 上屏
       → CandidatePanel（NSVisualEffectView 材质随皮肤 JSON）
 ```
+
+## 当前进度
+
+- [x] IMKInputController 骨架（键码映射 / EngineClient / 组段 / 上屏）
+- [x] CandidatePanel（NSVisualEffectView 四材质）
+- [x] Unix socket 帧协议（与 Windows 管道一致）
+- [ ] Mac 实机编译与输入法注册
+- [ ] 候选窗定位 / 多屏 / 输入源图标
+- [ ] 安装包与发行
 
 ## 文件
 
