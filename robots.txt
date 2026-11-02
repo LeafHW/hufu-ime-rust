@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://leafhw.github.io/hufu-ime-rust/sitemap.xml

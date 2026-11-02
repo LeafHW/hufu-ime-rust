@@ -1,0 +1,24 @@
+{
+  "name": "虎符 HuFu",
+  "short_name": "虎符",
+  "description": "以虎码为核心的跨平台中文输入法",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f1e6",
+  "theme_color": "#f6f1e6",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "./assets/img/icon-tile-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./assets/img/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}
