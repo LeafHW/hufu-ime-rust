@@ -199,7 +199,7 @@
   var demoSkinFlip = false;
   var DEMO_CODE = 'syfdgvwlkuvnagj';
   var DEMO_PREFILL = '';
-  var DEMO_SENTENCE = '让中文，落指成句。';
+  var DEMO_SENTENCE = '让中文收指成句';
 
   if (candidate && candItems.length) {
     candItems.forEach(function (li, i) { li.style.setProperty('--n', String(i)); });
@@ -334,6 +334,7 @@
   });
 
   if (reduceMotion && demoText) {
+    demoText.textContent = DEMO_SENTENCE;
     if (candCode) candCode.textContent = DEMO_CODE;
     if (candidate) {
       candidate.classList.remove('is-hidden', 'is-typing', 'is-committing');

@@ -34,7 +34,7 @@ hufu-site/
 
 - **文案与数据**：来自仓库 README、`docs/features.md`、`docs/status.md` 与 v1.9.8 发布说明。
 - **截图**：设置页使用当前版本「概览（Ctrl+K 搜索）/ 云同步 / 键位编辑」截图（来自 `hufu/settings-app/screenshots/`），皮肤与整句截图来自 `docs/design/` 等；已转 WebP，仅作界面示意。
-- **首页候选窗动画**：用 HTML/CSS 复刻真实候选窗（编码 `syfdgvwlkuvnagj` → 整句「让中文，落指成句。」），不是视频；页面内已标注“网页示意”。
+- **首页候选窗动画**：用 HTML/CSS 复刻真实候选窗（编码 `syfdgvwlkuvnagj` → 整句「让中文收指成句」），不是视频；页面内已标注“网页示意”。
 - **下载信息**：页面加载后从 GitHub Releases API 读取最新版本号、日期、exe 直链与大小；API 不可用时回落到静态 v1.9.8 链接，不影响访问。
 - **字体**：Noto Serif SC 子集（仅包含页面用到的字符），SIL Open Font License 1.1，授权全文见 `assets/fonts/LICENSE.txt`。
 
