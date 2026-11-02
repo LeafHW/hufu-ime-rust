@@ -549,7 +549,7 @@
     if (!data || !data.tag_name) return;
     var tag = data.tag_name;
     var version = tag.replace(/^v/i, '');
-    releaseVersion.forEach(function (el) { el.textContent = version; });
+    releaseVersion.forEach(function (el) { el.textContent = tag; });
     exeVersions.forEach(function (el) { el.textContent = version; });
     var date = formatDate(data.published_at);
     if (date) releaseDate.forEach(function (el) { el.textContent = date; });
