@@ -2,7 +2,7 @@
 name = "tigirl-tsf-bench"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license.workspace = true
 description = "TSF Tigirl sentence bench: foreground SendInput track + private-desktop OnKeyDown track"
 
 [[bin]]

@@ -2,6 +2,7 @@
 name = "hufu-settings"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 build = "build.rs"
 description = "HuFu settings window host (Win32 + WebView2, no MSVC / no WinRT)"
 
