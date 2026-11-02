@@ -2,7 +2,7 @@
 
 虎符输入法（[LeafHW/hufu-ime-rust](https://github.com/LeafHW/hufu-ime-rust)）的静态官网，部署在 GitHub Pages：
 
-**<https://leafhw.github.io/hufu-ime-rust/>**
+**<https://www.hufuime.top/>**
 
 ## 本地预览
 
