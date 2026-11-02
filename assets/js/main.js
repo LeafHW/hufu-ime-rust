@@ -197,6 +197,9 @@
   var heroStage = $('.hero-stage');
   var demoVisible = true;
   var demoSkinFlip = false;
+  var DEMO_CODE = 'lksg rvm nae gj';
+  var DEMO_PREFILL = '让中文，';
+  var DEMO_SENTENCE = '让中文，落笔成句。';
 
   if (candidate && candItems.length) {
     candItems.forEach(function (li, i) { li.style.setProperty('--n', String(i)); });
@@ -209,8 +212,8 @@
   }
 
   function resetDemo() {
-    if (demoText) demoText.textContent = '';
-    if (demoEditor) demoEditor.classList.remove('is-typing');
+    if (demoText) demoText.textContent = DEMO_PREFILL;
+    if (demoEditor) demoEditor.classList.add('is-typing');
     if (candidate) {
       candidate.classList.add('is-hidden');
       candidate.classList.remove('is-open', 'is-committing', 'is-typing');
@@ -232,10 +235,12 @@
   async function demoCycle() {
     if (demoFirst) {
       demoFirst = false;
+      if (demoText) demoText.textContent = DEMO_PREFILL;
+      if (demoEditor) demoEditor.classList.add('is-typing');
       showCandidates();
-      if (candCode) candCode.textContent = 'tuja';
+      if (candCode) candCode.textContent = DEMO_CODE;
       setActiveCandidate(0);
-      await sleep(2100);
+      await sleep(2300);
     } else {
       resetDemo();
       if (candidate) {
@@ -244,13 +249,16 @@
       }
       await sleep(260);
 
-      var code = 'tuja';
+      var code = DEMO_CODE;
       for (var i = 0; i < code.length; i++) {
         if (!demoVisible || document.hidden) return;
         if (candCode) candCode.textContent += code[i];
-        var key = candKeys[i];
+        var key = null;
+        for (var k = 0; k < candKeys.length; k++) {
+          if (candKeys[k].getAttribute('data-code-key') === code[i]) { key = candKeys[k]; break; }
+        }
         if (key) key.classList.add('is-pressed');
-        await sleep(155);
+        await sleep(code[i] === ' ' ? 70 : 105);
       }
 
       await sleep(180);
@@ -275,7 +283,7 @@
 
     if (candidate) candidate.classList.add('is-hidden');
     if (demoText) {
-      demoText.textContent = '我们';
+      demoText.textContent = DEMO_SENTENCE;
       demoText.classList.remove('flash');
       void demoText.offsetWidth;
       demoText.classList.add('flash');
@@ -287,8 +295,8 @@
 
     demoSkinFlip = !demoSkinFlip;
     if (candidate) candidate.classList.toggle('skin-hupo', demoSkinFlip);
-    if (demoText) demoText.textContent = '';
-    if (demoEditor) demoEditor.classList.remove('is-typing');
+    if (demoText) demoText.textContent = DEMO_PREFILL;
+    if (demoEditor) demoEditor.classList.add('is-typing');
     if (candidate) {
       candidate.classList.add('is-hidden');
       candidate.classList.remove('is-committing', 'is-open');
@@ -326,7 +334,7 @@
   });
 
   if (reduceMotion && demoText) {
-    if (candCode) candCode.textContent = 'tuja';
+    if (candCode) candCode.textContent = DEMO_CODE;
     if (candidate) {
       candidate.classList.remove('is-hidden', 'is-typing', 'is-committing');
       candidate.classList.add('is-open');

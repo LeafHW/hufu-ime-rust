@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261102b") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -1200,7 +1200,9 @@ h2 {
 }
 
 .cand-code {
-  font-size: 12px;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
 
 .cand-code::after {
@@ -1248,15 +1250,25 @@ h2 {
 }
 
 .cand-word {
-  font-size: 17px;
+  font-size: 16.5px;
   font-weight: 500;
   letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 
 .cand-py {
   font-size: 10.5px;
   color: var(--cand-muted);
   letter-spacing: 0.02em;
+}
+
+.cand-tag {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  color: var(--cand-muted);
+  white-space: nowrap;
 }
 
 .cand-list li.is-active {
@@ -1267,7 +1279,8 @@ h2 {
 }
 
 .cand-list li.is-active .cand-num,
-.cand-list li.is-active .cand-py {
+.cand-list li.is-active .cand-py,
+.cand-list li.is-active .cand-tag {
   color: var(--cand-hl-fg);
   opacity: 0.62;
 }
@@ -1775,13 +1788,14 @@ h2 {
 
 .stream-word {
   font-family: var(--serif);
-  font-size: 25px;
+  font-size: 22px;
   font-weight: 600;
-  line-height: 1;
+  line-height: 1.15;
   color: var(--ink);
   background: var(--gold-soft);
   border-radius: 7px;
   padding: 3px 9px 5px;
+  white-space: nowrap;
 }
 
 .stream-badge {
@@ -3042,6 +3056,68 @@ h2 {
   height: 13px;
 }
 
+/* keymap block (inside settings) */
+.keymap-block {
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  align-items: center;
+  gap: clamp(36px, 5vw, 64px);
+  margin-top: 96px;
+  padding-top: 72px;
+  border-top: 1px solid var(--line);
+}
+
+.keymap-copy h3 {
+  margin: 20px 0 16px;
+  font-family: var(--serif);
+  font-size: clamp(30px, 3.4vw, 44px);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.keymap-copy > p:not(.kicker) {
+  max-width: 38ch;
+  font-size: 13.5px;
+  line-height: 1.9;
+  color: var(--muted);
+}
+
+.keymap-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 22px;
+}
+
+.keymap-frame {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--bg-2);
+  box-shadow: var(--shadow);
+}
+
+.keymap-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.keymap-frame figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
 /* ---------- FAQ ---------- */
 .faq {
   border-top: 1px solid var(--line);
@@ -3684,6 +3760,14 @@ h2 {
     display: none;
   }
 
+  .medal {
+    display: none;
+  }
+
+  .chip-c {
+    display: none;
+  }
+
   .dl-card {
     grid-template-columns: minmax(0, 1fr) 300px;
   }
@@ -3714,7 +3798,7 @@ h2 {
   }
 
   .hero-stage {
-    min-height: 600px;
+    min-height: 480px;
     margin-top: 18px;
   }
 
@@ -3761,6 +3845,13 @@ h2 {
   .split {
     grid-template-columns: 1fr;
     gap: 34px;
+  }
+
+  .keymap-block {
+    grid-template-columns: 1fr;
+    gap: 30px;
+    margin-top: 64px;
+    padding-top: 48px;
   }
 
   .split-reverse .figure-frame {
@@ -4008,8 +4099,10 @@ h2 {
   }
 
   .hero-stage {
-    min-height: 540px;
-    margin-top: 28px;
+    min-height: 460px;
+    margin-top: 22px;
+    align-items: flex-start;
+    padding-top: 10px;
   }
 
   .editor {
@@ -4323,6 +4416,30 @@ h2 {
   .dl-foot {
     font-size: 8.5px;
     text-align: center;
+  }
+
+  .stream {
+    gap: 8px;
+  }
+
+  .stream-word {
+    font-size: 19px;
+  }
+
+  .stream-line {
+    display: none;
+  }
+
+  .stream-badge {
+    display: none;
+  }
+
+  .keymap-copy > p:not(.kicker) {
+    font-size: 12.5px;
+  }
+
+  .keymap-frame figcaption {
+    font-size: 8.5px;
   }
 
   .faq-grid {

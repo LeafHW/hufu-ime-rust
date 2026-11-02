@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>虎符 HuFu · 以虎码为核心的跨平台中文输入法</title>
-<meta name="description" content="虎符 HuFu 是一款以虎码为核心的跨平台中文输入法：虎码整句、三端同源、19 套矢量皮肤与 .ssf 导入、WebDAV 云同步。Windows / Linux 可用，macOS 开发中。免费、开源、无广告。">
-<meta name="keywords" content="虎符,虎码,输入法,HuFu,中文输入法,Rime,fcitx5,TSF,开源输入法">
+<meta name="description" content="虎符 HuFu 是一款以虎码为核心的跨平台中文输入法：虎码整句（万句基准 99.73%，叠加神经重排可达 99.9%）、三端同源、全键盘自定义、19 套矢量皮肤与 .ssf 导入、WebDAV 云同步。Windows / Linux 可用，macOS 开发中。免费、开源、无广告。">
+<meta name="keywords" content="虎符,虎码,输入法,HuFu,中文输入法,Rime,fcitx5,TSF,开源输入法,全键盘自定义">
 <meta name="author" content="LeafHW">
 <meta name="theme-color" content="#f6f1e6" id="meta-theme-color">
 <link rel="canonical" href="https://leafhw.github.io/hufu-ime-rust/">
@@ -13,21 +13,21 @@
 <meta property="og:site_name" content="虎符 HuFu">
 <meta property="og:locale" content="zh_CN">
 <meta property="og:title" content="虎符 HuFu · 让中文，落笔成句">
-<meta property="og:description" content="以虎码为核心的跨平台中文输入法。虎码整句、三端同源、19 套皮肤、WebDAV 云同步。免费开源，无广告。">
+<meta property="og:description" content="以虎码为核心的跨平台中文输入法。虎码整句 99.73%，重排可达 99.9%；全键盘自定义、三端同源、19 套皮肤、WebDAV 云同步。免费开源，无广告。">
 <meta property="og:url" content="https://leafhw.github.io/hufu-ime-rust/">
-<meta property="og:image" content="https://leafhw.github.io/hufu-ime-rust/assets/img/og.jpg">
+<meta property="og:image" content="https://leafhw.github.io/hufu-ime-rust/assets/img/og.jpg?v=20261102b">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="虎符 HuFu · 让中文，落笔成句">
-<meta name="twitter:description" content="以虎码为核心的跨平台中文输入法。免费、开源、无广告。">
-<meta name="twitter:image" content="https://leafhw.github.io/hufu-ime-rust/assets/img/og.jpg">
+<meta name="twitter:description" content="以虎码为核心的跨平台中文输入法。虎码整句 99.73%，重排可达 99.9%；全键盘自定义。免费、开源、无广告。">
+<meta name="twitter:image" content="https://leafhw.github.io/hufu-ime-rust/assets/img/og.jpg?v=20261102b">
 <link rel="icon" href="./assets/img/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="icon" href="./assets/img/favicon-64.png" sizes="64x64" type="image/png">
 <link rel="apple-touch-icon" href="./assets/img/apple-touch-icon.png">
 <link rel="manifest" href="./site.webmanifest">
-<link rel="preload" href="./assets/fonts/noto-serif-sc-subset.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="./assets/css/main.css">
+<link rel="preload" href="./assets/fonts/noto-serif-sc-subset.woff2?v=20261102b" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./assets/css/main.css?v=20261102b">
 <script>
   (function () {
     var root = document.documentElement;
@@ -51,7 +51,7 @@
   "operatingSystem": "Windows 10, Windows 11, Linux",
   "softwareVersion": "1.9.8",
   "inLanguage": "zh-CN",
-  "description": "以虎码为核心的跨平台中文输入法，支持虎码整句、多方案、19 套矢量皮肤、.ssf 导入与 WebDAV 云同步。",
+  "description": "以虎码为核心的跨平台中文输入法，支持虎码整句（99.73%，重排可达 99.9%）、全键盘自定义、多方案、19 套矢量皮肤、.ssf 导入与 WebDAV 云同步。",
   "url": "https://leafhw.github.io/hufu-ime-rust/",
   "downloadUrl": "https://github.com/LeafHW/hufu-ime-rust/releases/latest",
   "codeRepository": "https://github.com/LeafHW/hufu-ime-rust",
@@ -153,7 +153,7 @@
       <div class="hero-copy">
         <p class="eyebrow hero-reveal"><span class="status-dot"></span> <span data-release-version>v1.9.8</span> · 虎码整句 · 开源免费</p>
         <h1 class="hero-reveal" style="--i:1">让中文，<br><span class="mark">落笔成句。<svg class="brush" viewBox="0 0 600 24" preserveAspectRatio="none" aria-hidden="true"><path d="M5 16C96 8 206 6 312 9c95 2.6 178 2.4 283-2" /></svg></span></h1>
-        <p class="lede hero-reveal" style="--i:2">虎符是一款以 <strong>虎码</strong> 为核心的跨平台中文输入法。<span class="nowrap">整句、字词、单字</span>三种节奏，Windows / Linux / macOS 三端同源。</p>
+        <p class="lede hero-reveal" style="--i:2">虎符是一款以 <strong>虎码</strong> 为核心的跨平台中文输入法。就算不用整句，它也是<span class="nowrap">第一梯队</span>的定长输入方案；<span class="nowrap">整句、字词、单字</span>三种节奏，Windows / Linux / macOS 三端同源。</p>
         <div class="hero-actions hero-reveal" style="--i:3">
           <a class="btn btn-primary" href="#download" data-hero-download>
             <span>下载虎符</span>
@@ -181,39 +181,39 @@
           <span class="medal-spark"></span>
         </div>
 
-        <div class="float-chip chip-a"><span class="status-dot"></span>整句 · 99.50%</div>
+        <div class="float-chip chip-a"><span class="status-dot"></span>整句 · 99.73%</div>
         <div class="float-chip chip-b"><b>p50</b> 6ms</div>
         <div class="float-chip chip-c"><b>19</b><span>套皮肤</span></div>
 
-        <div class="editor" aria-hidden="true">
+        <div class="editor is-typing" aria-hidden="true">
           <div class="editor-bar">
             <span class="win-dots"><i></i><i></i><i></i></span>
             <span class="editor-title">未命名 · 记事本</span>
             <span class="ime-badge"><img src="./assets/img/logo-64.png" alt="" width="16" height="16">虎符</span>
           </div>
           <div class="editor-body">
-            <p class="editor-line"><span data-demo-text></span><span class="caret"></span></p>
+            <p class="editor-line"><span data-demo-text>让中文，</span><span class="caret"></span></p>
             <p class="editor-placeholder" data-demo-placeholder>用虎码，把想说的话一次打完。</p>
           </div>
           <div class="editor-status"><span>UTF-8</span><span>Ln 1, Col 1</span><span>中文 · 全角</span></div>
         </div>
 
         <div class="candidate" data-candidate aria-hidden="true">
-          <div class="cand-head"><span class="cand-code" data-cand-code>tuja</span><span class="cand-page">第 1 / 2 页</span></div>
+          <div class="cand-head"><span class="cand-code" data-cand-code>lksg rvm nae gj</span><span class="cand-page">第 1 / 2 页</span></div>
           <ol class="cand-list" data-cand-list>
-            <li class="is-active" data-cand-item><span class="cand-num">1.</span><span class="cand-word">我们</span><span class="cand-py">wǒ men</span></li>
-            <li data-cand-item><span class="cand-num">2.</span><span class="cand-word">我</span><span class="cand-py">wǒ</span></li>
-            <li data-cand-item><span class="cand-num">3.</span><span class="cand-word">我军</span><span class="cand-py">wǒ jūn</span></li>
-            <li data-cand-item><span class="cand-num">4.</span><span class="cand-word">War</span><span class="cand-py">wɔːr</span></li>
+            <li class="is-active" data-cand-item><span class="cand-num">1.</span><span class="cand-word">让中文，落笔成句。</span><span class="cand-tag">整句</span></li>
+            <li data-cand-item><span class="cand-num">2.</span><span class="cand-word">让中文落笔成句</span><span class="cand-tag">无标点</span></li>
+            <li data-cand-item><span class="cand-num">3.</span><span class="cand-word">让中文，落笔成句</span><span class="cand-tag">句末</span></li>
+            <li data-cand-item><span class="cand-num">4.</span><span class="cand-word">让中文，落笔成句！</span><span class="cand-tag">感叹</span></li>
           </ol>
           <div class="cand-foot"><span class="cand-mode">虎整句 · 整句</span><span class="cand-hint">↑↓ 选择 · 空格上屏</span></div>
           <span class="cand-caret" aria-hidden="true"></span>
         </div>
 
         <div class="code-keys" aria-hidden="true">
-          <kbd data-code-key="t">t</kbd><kbd data-code-key="u">u</kbd><kbd data-code-key="j">j</kbd><kbd data-code-key="a">a</kbd>
+          <kbd data-code-key="l">l</kbd><kbd data-code-key="k">k</kbd><kbd data-code-key="s">s</kbd><kbd data-code-key="g">g</kbd>
         </div>
-        <p class="sr-only">演示：输入 tuja，候选窗显示「我们、我、我军、War」，按空格把「我们」上屏。真实候选窗由输入法渲染，此处为网页示意。</p>
+        <p class="sr-only">演示：输入「落笔成句」的全码 lksg rvm nae gj，候选窗给出整句「让中文，落笔成句。」并上屏。真实候选窗由输入法渲染，此处为网页示意。</p>
       </div>
     </div>
 
@@ -251,10 +251,10 @@
           <p>27 个码元、最长 4 码。整句 / 字词 / 单字多方案，停顿后异步重排 top-5，下一次按键即刻生效。</p>
           <div class="mode-pills" aria-hidden="true"><span class="is-on">整句</span><span>字词</span><span>单字</span><span class="mode-note">beam search</span></div>
           <div class="stream" aria-hidden="true">
-            <span class="stream-keys"><kbd>t</kbd><kbd>u</kbd><kbd>j</kbd><kbd>a</kbd></span>
+            <span class="stream-keys"><kbd>l</kbd><kbd>k</kbd><kbd>s</kbd><kbd>g</kbd></span>
             <span class="stream-line"><i></i></span>
-            <span class="stream-word">我们</span>
-            <span class="stream-badge">置信 0.92</span>
+            <span class="stream-word">让中文，落笔成句。</span>
+            <span class="stream-badge">置信 0.97</span>
           </div>
         </article>
 
@@ -272,7 +272,7 @@
         <article class="bento-card" data-reveal>
           <div class="bento-top"><span class="tag">候选交互</span><svg class="ico"><use href="#i-keyboard"></use></svg></div>
           <h3>顺手，才打得快。</h3>
-          <p>数字 / 分号 / 引号选重，滚轮缩放，拖动移位，置顶与软删。</p>
+          <p>数字 / 分号 / 引号选重，滚轮缩放，拖动移位，置顶与软删；整块键盘都能改。</p>
           <div class="keys-mini" aria-hidden="true"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>;</kbd><kbd>'</kbd><span>选重</span></div>
         </article>
 
@@ -306,11 +306,11 @@
       </div>
 
       <div class="stats" data-reveal>
-        <div class="stat"><strong><span data-count="99.50" data-decimals="2">99.50</span><i>%</i></strong><span>万句基准准率<em>1 万句 · 逐字全码</em></span></div>
+        <div class="stat"><strong><span data-count="99.73" data-decimals="2">99.73</span><i>%</i></strong><span>万句基准准率<em>1 万句 · 纯 ngram</em></span></div>
         <div class="stat"><strong><span data-count="6" data-decimals="0">6</span><i>ms</i></strong><span>组句触达 p50<em>本机引擎实测</em></span></div>
         <div class="stat"><strong><span data-count="246" data-decimals="0">246</span><i>k</i></strong><span>虎码字词条<em>import 闭包</em></span></div>
         <div class="stat"><strong><span data-count="19" data-decimals="0">19</span><i>套</i></strong><span>矢量皮肤<em>兼容 .ssf</em></span></div>
-        <p class="stats-note">数据来自 v1.9.8 随包资源与基准报告 · 口径见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">docs/status.md</a></p>
+        <p class="stats-note">纯 ngram 99.73%；叠加 Qwen3 神经重排可达 99.9%。数据来自 v1.9.8 随包资源与基准报告 · 口径见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">docs/status.md</a></p>
       </div>
     </div>
   </section>
@@ -377,11 +377,11 @@
 
       <div class="shot-row">
         <figure class="shot" data-reveal>
-          <button class="shot-btn" type="button" data-lightbox data-caption="设置 · 概览：真实候选窗试打">
-            <img src="./assets/img/overview-light.webp" data-theme-img data-light="./assets/img/overview-light.webp" data-dark="./assets/img/overview-dark.webp" width="1800" height="1145" alt="虎符设置概览页，右侧是真实候选窗试打区" loading="lazy" decoding="async">
+          <button class="shot-btn" type="button" data-lightbox data-caption="设置 · 概览：Ctrl+K 搜索直达">
+            <img src="./assets/img/overview-current.webp" width="1280" height="800" alt="虎符设置概览页，顶部是设置搜索，展示当前方案、皮肤与云同步" loading="lazy" decoding="async">
             <span class="shot-zoom"><svg class="ico"><use href="#i-arrow-up-right"></use></svg></span>
           </button>
-          <figcaption><b>概览</b><span>真实候选窗，边打边看</span></figcaption>
+          <figcaption><b>概览</b><span>Ctrl+K 搜索直达</span></figcaption>
         </figure>
         <figure class="shot" data-reveal>
           <button class="shot-btn" type="button" data-lightbox data-caption="皮肤工作室：19 套矢量皮肤">
@@ -408,18 +408,32 @@
         <h2>不碰 yaml，<br>也能调到顺手。</h2>
         <p class="lede">本地 Web UI，全图形化十页：方案、候选、键位、整句权重、皮肤工作室、用户词、云同步…… 改完即生效，不用重启。</p>
         <ul class="tick-list">
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>真实候选窗试打</b>：字体、行高、高亮就是输入法真正渲染的那一个。</span></li>
+          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>全局搜索</b>：Ctrl+K 输入关键词，直接跳到对应设置项。</span></li>
           <li><svg class="ico"><use href="#i-check"></use></svg><span><b>改皮肤 ≤2.5s 跟随</b>：换皮、调圆角、拖动挂件，所见即所得。</span></li>
           <li><svg class="ico"><use href="#i-check"></use></svg><span><b>导入导出 JSON</b>：整机配置、用户词与调整日志都能带走。</span></li>
+          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>全键盘自定义</b>：主键盘 / 小键盘 / Shift+符号，点键录制与冲突检测。</span></li>
         </ul>
         <a class="text-link" href="https://github.com/LeafHW/hufu-ime-rust/tree/master/docs" target="_blank" rel="noopener">设置与构建文档 <svg class="ico"><use href="#i-arrow-right"></use></svg></a>
       </div>
       <figure class="figure-frame figure-settings" data-reveal>
         <div class="figure-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>LIVE PREVIEW</span><span class="figure-bar-tag">Ctrl + Alt + H</span></div>
         <div class="figure-img">
-          <img data-theme-img data-light="./assets/img/overview-light.webp" data-dark="./assets/img/overview-dark.webp" src="./assets/img/overview-light.webp" width="1800" height="1145" alt="虎符设置概览页，展示当前方案、皮肤、云同步与真实候选窗试打" loading="lazy" decoding="async">
+          <img src="./assets/img/overview-current.webp" width="1280" height="800" alt="虎符设置概览页，顶部是设置搜索，展示当前方案、皮肤与云同步" loading="lazy" decoding="async">
         </div>
-        <figcaption><span>设置 · 概览</span><span>浅色 / 深色随系统</span></figcaption>
+        <figcaption><span>设置 · 概览</span><span>Ctrl+K 搜索直达</span></figcaption>
+      </figure>
+    </div>
+
+    <div class="shell keymap-block" data-reveal>
+      <div class="keymap-copy">
+        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> KEYMAP / 键位</p>
+        <h3>整块键盘，<br>都能改。</h3>
+        <p>主键盘、小键盘、Shift+符号三套映射；点任意键帽录制新功能，冲突检测会直接标出重复分配。Esc / Ctrl / Alt / Win / NumLock 固定不可映射。</p>
+        <div class="keymap-badges"><span class="tag">全键盘两态映射</span><span class="tag">按键录制</span><span class="tag">冲突检测</span></div>
+      </div>
+      <figure class="keymap-frame">
+        <img src="./assets/img/keymap-current.webp" width="1280" height="800" alt="虎符键位编辑页，全键盘两态映射、按键录制与冲突检测" loading="lazy" decoding="async">
+        <figcaption><span>键位编辑 · 全键盘</span><span>0 键自定义 · 无冲突</span></figcaption>
       </figure>
     </div>
   </section>
@@ -429,7 +443,7 @@
       <figure class="figure-frame figure-sync" data-reveal>
         <div class="figure-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>LIVE PREVIEW</span><span class="figure-bar-tag">WebDAV</span></div>
         <div class="figure-img">
-          <img data-theme-img data-light="./assets/img/sync-light.webp" data-dark="./assets/img/sync-dark.webp" src="./assets/img/sync-light.webp" width="1800" height="1145" alt="虎符云同步设置页，展示 WebDAV 连接状态、同步方案与合符图标" loading="lazy" decoding="async">
+          <img src="./assets/img/sync-current.webp" width="1280" height="800" alt="虎符云同步设置页，展示合符图标、WebDAV 连接状态与同步方案" loading="lazy" decoding="async">
         </div>
         <figcaption><span>云同步 · 合符</span><span>数据只经你自己的网盘</span></figcaption>
       </figure>
@@ -646,6 +660,6 @@ fcitx5 -r -d</code></pre>
   <button class="lb-nav lb-next" type="button" data-lb-next aria-label="下一张"><svg class="ico"><use href="#i-arrow-right"></use></svg></button>
 </dialog>
 
-<script src="./assets/js/main.js" defer></script>
+<script src="./assets/js/main.js?v=20261102b" defer></script>
 </body>
 </html>
