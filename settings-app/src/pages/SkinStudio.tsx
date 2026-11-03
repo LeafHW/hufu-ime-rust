@@ -1156,7 +1156,7 @@ export function SkinStudio({
                 </button>
               </div>
               <div className="row-line">
-                <span className="lab" title="开：第 1 候选按其比例放大、其余候选按其比例缩小；关：全页同一字号（默认）">首选放大 / 其余缩小</span>
+                <span className="lab" title="开：高亮候选按其比例放大、其余候选缩小（想让它跟着光标移动，去「动效」页打开「高亮跟随放大」）；关：全页同一字号（默认）">高亮区放大 / 其余缩小</span>
                 <Switch
                   on={pcf}
                   title="appearance.per_cand_font"

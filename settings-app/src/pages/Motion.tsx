@@ -445,7 +445,7 @@ export function MotionPage({
           <MotionCard
             eyebrow="FOLLOW"
             title="高亮跟随放大"
-            desc="选中项放大、其余候选缩小，强调跟着光标走。比例沿用皮肤页的「首选放大 / 其余缩小」；关掉则维持原来的「第 1 候选放大」。"
+            desc="选中项放大、其余候选缩小，强调跟着光标走。比例沿用皮肤页的「高亮区放大 / 其余缩小」；关掉则维持原来的「第 1 候选放大」。"
             on={hl}
             onToggle={toggleHl}
             note={

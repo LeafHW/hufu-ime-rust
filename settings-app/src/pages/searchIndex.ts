@@ -81,7 +81,7 @@ export const SEARCH_ITEMS: SearchItem[] = [
   // 皮肤 → 工作台细节
   { title: '候选窗外观', desc: '字体、字号、圆角、透明度、阴影、间距、布局', route: 'skin', group: '外观', icon: 'palette', keys: '候选窗 外观 候选字号 候选字体 候选高度 候选间距 首选字号比例 其余字号比例 前导序号 字重 整体透明度 高亮透明度 阴影 布局 竖排 皮肤' },
   { title: '候选窗动效', desc: '动效总开关、动效速度、选重暂留、出现/收起', route: 'motion', group: '外观', icon: 'play', keys: '候选窗 动效 动画 速度 选重 暂留 高亮 开关 节奏 收起 出现' },
-  { title: '高亮跟随放大', desc: '字号强调跟随当前选中项；高亮候选放大、其余缩小', route: 'motion', group: '外观', icon: 'spark', keys: '高亮 跟随 放大 缩小 字号 强调 选中 首选放大 其余缩小 逐候选' },
+  { title: '高亮跟随放大', desc: '字号强调跟随当前选中项；高亮候选放大、其余缩小', route: 'motion', group: '外观', icon: 'spark', keys: '高亮 跟随 放大 缩小 字号 强调 选中 高亮区放大 首选放大 其余缩小 逐候选' },
   { title: '候选宽度与序号', desc: '候选窗总宽、序号开关、序号显示种类（数字/中文/罗马）', route: 'skin', group: '外观', icon: 'palette', keys: '候选宽度 宽度 序号 开关 显示 数字 中文 罗马 标签 label_style 自适应' },
   { title: '皮肤恢复出厂与列表', desc: '搜索皮肤、恢复出厂、删除 .ssf', route: 'skin', group: '外观', icon: 'palette', keys: '皮肤 列表 搜索 恢复 出厂 删除 ssf 当前 导入' },
 
