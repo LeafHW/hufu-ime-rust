@@ -519,7 +519,7 @@ export function MotionPage({
             onToggle={toggleHl}
             note={
               <>
-                只对矢量皮肤生效 · 当前比例{' '}
+                矢量皮肤按比例换字号 · 位图皮肤（.ssf）跟随高亮行高 · 当前比例{' '}
                 <b>
                   {Math.round(scales.first * 100)}% / {Math.round(scales.other * 100)}%
                 </b>{' '}
