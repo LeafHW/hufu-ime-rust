@@ -357,6 +357,45 @@
     } catch (e) {}
   }
 
+  // 同源快照：秒开，不依赖 GitHub 可达性（国内常态）
+  function loadSnapshot() {
+    return fetch('./cache.json', { cache: 'no-store' })
+      .then(function (res) {
+        if (!res.ok) throw new Error('snapshot unavailable');
+        return res.json();
+      })
+      .then(function (payload) {
+        var data = payload && payload.data ? payload.data : payload;
+        if (!Array.isArray(data) || !data.length) throw new Error('snapshot empty');
+        render(data);
+        var when = payload && payload.time ? formatDate(payload.time) : '';
+        setStatus(when ? '本地快照 · 更新于 ' + when : '本地快照', '本地快照');
+        return true;
+      });
+  }
+
+  // GitHub API：只在后台刷新；失败静默（不覆盖已渲染快照、不报「不可达」）
+  function refreshFromGitHub() {
+    var controller = window.AbortController ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, 12000) : null;
+    return fetch(API, {
+      headers: { 'Accept': 'application/vnd.github+json' },
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined
+    }).then(function (res) {
+      if (timer) clearTimeout(timer);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (data) {
+      writeCache(data);
+      render(data);
+      return true;
+    }).catch(function () {
+      if (timer) clearTimeout(timer);
+      return false;
+    });
+  }
+
   function load(force) {
     if (loading) return;
     var cached = force ? null : readCache();
@@ -366,45 +405,22 @@
     }
 
     setBusy(true);
-    if (!cached) setStatus('正在从 GitHub 读取版本…');
+    if (!cached) setStatus('正在读取版本…');
 
-    var controller = window.AbortController ? new AbortController() : null;
-    var timer = controller ? setTimeout(function () { controller.abort(); }, 12000) : null;
-
-    fetch(API, {
-      headers: { 'Accept': 'application/vnd.github+json' },
-      cache: 'no-store',
-      signal: controller ? controller.signal : undefined
-    }).then(function (res) {
-      if (timer) clearTimeout(timer);
-      if (res.status === 403) throw new Error('GitHub API 触发了访问频率限制。');
-      if (!res.ok) throw new Error('GitHub API 返回了 HTTP ' + res.status + '。');
-      return res.json();
-    }).then(function (data) {
-      writeCache(data);
-      render(data);
-      setBusy(false);
-    }).catch(function (err) {
-      if (timer) clearTimeout(timer);
-      setBusy(false);
-      // Fallback: the site hosts the most recent snapshot, so the page still
-      // works on networks where api.github.com is blocked or rate-limited.
-      fetch('./cache.json', { cache: 'no-store' }).then(function (res) {
-        if (!res.ok) throw new Error('snapshot unavailable');
-        return res.json();
-      }).then(function (payload) {
-        var data = payload && payload.data ? payload.data : payload;
-        render(data);
-        var when = payload && payload.time ? formatDate(payload.time) : '';
-        setStatus('GitHub API 不可达 · 显示最近同步快照', when ? '快照 ' + when : '最近同步');
-      }).catch(function () {
+    loadSnapshot().catch(function () { return false; }).then(function (ok) {
+      return refreshFromGitHub().then(function (synced) {
+        setBusy(false);
+        if (synced || ok) return;
         if (cached) {
-          render(cached);
-          setStatus('GitHub API 不可达 · 显示上次缓存', '显示缓存版本');
+          try { render(cached); } catch (e) {}
+          setStatus('本地快照不可用 · 显示缓存版本', '显示缓存版本');
           return;
         }
-        renderError(err && err.name === 'AbortError' ? '请求 GitHub 超时。' : (err && err.message) || '网络请求失败。');
+        renderError('网络受限，且本地快照不可用。');
       });
+    }).catch(function () {
+      setBusy(false);
+      renderError('网络受限，且本地快照不可用。');
     });
   }
 
