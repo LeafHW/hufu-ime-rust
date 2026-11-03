@@ -78,13 +78,15 @@ Write-Step "版本 $Tag · $ExeName · $SizeMB MB · sha256 $($Sha256.Substring(
 # 1. 推代码与 tag 到 Gitee 镜像仓（失败不阻断）
 # ---------------------------------------------------------------------------
 if (-not $SkipPush) {
-    Write-Step "推送 master + tags 到 Gitee"
+    Write-Step "推送当前分支 + tags 到 Gitee"
     if ($DryRun) {
         Write-Host "  (DryRun) 跳过实际 push"
     } else {
         $env:GIT_TERMINAL_PROMPT = '0'
         $remote = "https://${Owner}:$Token@gitee.com/$Owner/$Repo.git"
-        $out = & git -C $RepoDir -c credential.helper= -c http.extraheader= push $remote master --tags 2>&1
+        # 推「当前分支」到 Gitee 默认分支 master：本机 master 常落后工作分支
+        # （2026-11-03 实测落后 210 个提交），推本地 master 会把镜像打回旧版。
+        $out = & git -C $RepoDir -c credential.helper= -c http.extraheader= push $remote HEAD:refs/heads/master --tags 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "push 完成"
         } else {
