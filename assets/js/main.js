@@ -703,7 +703,7 @@
     }
   }
 
-  function loadRelease() {
+  function loadFromGitHub() {
     var cached = null;
     try {
       cached = JSON.parse(sessionStorage.getItem('hufu-release-v1') || 'null');
@@ -728,6 +728,45 @@
     }).catch(function () {
       if (timer) clearTimeout(timer);
       /* keep static fallback */
+    });
+  }
+
+  /* 清单驱动：./update.json 由发版脚本生成（同源、约 1 KB、不占 GitHub API 配额）。
+     清单不可达时才回退 GitHub API（loadFromGitHub）。 */
+  function applyManifest(m) {
+    if (!m || !m.latest) return false;
+    var version = String(m.latest).replace(/^v/i, '');
+    var src = (m.sources && m.sources[0]) || {};
+    releaseVersion.forEach(function (el) { el.textContent = 'v' + version; });
+    exeVersions.forEach(function (el) { el.textContent = version; });
+    if (m.date) releaseDate.forEach(function (el) { el.textContent = m.date; });
+    if (src.url) exeLinks.forEach(function (a) { a.setAttribute('href', src.url); });
+    if (m.size) {
+      exeSizes.forEach(function (el) { el.textContent = formatMB(m.size); });
+      exeMeta.forEach(function (el) {
+        el.textContent = 'HuFuSetup-' + version + '.exe · ' + formatMB(m.size) + ' · 国内加速';
+      });
+    }
+    return true;
+  }
+
+  function loadRelease() {
+    var cached = null;
+    try {
+      cached = JSON.parse(sessionStorage.getItem('hufu-manifest-v1') || 'null');
+    } catch (e) {}
+    if (cached && cached.time && Date.now() - cached.time < 10 * 60 * 1000 && cached.data) {
+      if (applyManifest(cached.data)) return;
+    }
+    if (!window.fetch) return;
+    fetch('./update.json', { cache: 'no-store' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (m) {
+      if (!applyManifest(m)) throw new Error('清单格式无效');
+      try { sessionStorage.setItem('hufu-manifest-v1', JSON.stringify({ time: Date.now(), data: m })); } catch (e) {}
+    }).catch(function () {
+      loadFromGitHub();
     });
   }
 

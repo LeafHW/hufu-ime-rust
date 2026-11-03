@@ -188,6 +188,13 @@
     return { exe: exe, zip: zip };
   }
 
+  // 国内加速：按 tag + 文件名推导 Gitee 直链（发版脚本同频上传；没传成时回退 GitHub 原链）
+  function giteeUrl(tag, name) {
+    var v = String(tag || '').replace(/^v/i, '');
+    if (!v || !name) return '';
+    return 'https://gitee.com/leafyin/hufu-ime-rust/releases/download/v' + encodeURIComponent(v) + '/' + encodeURIComponent(name);
+  }
+
   function assetLink(asset, label) {
     if (!asset) return '';
     var url = safeUrl(asset.browser_download_url);
@@ -205,8 +212,9 @@
     var notes = markdown(release.body || '');
     var releaseUrl = safeUrl(release.html_url) || 'https://github.com/LeafHW/hufu-ime-rust/releases';
 
+    var primaryUrl = (exe && giteeUrl(release.tag_name, exe.name)) || (exe && safeUrl(exe.browser_download_url)) || releaseUrl;
     var primary = exe
-      ? '<a class="dl-main" href="' + escapeHTML(safeUrl(exe.browser_download_url) || releaseUrl) + '" target="_blank" rel="noopener"><span class="dl-main-icon">↓</span><span class="dl-main-copy"><b>Windows 安装包</b><em>' + escapeHTML(exe.name) + ' · ' + escapeHTML(formatSize(exe.size)) + '</em></span><span class="dl-main-arrow">↗</span></a>'
+      ? '<a class="dl-main" href="' + escapeHTML(primaryUrl) + '" target="_blank" rel="noopener"><span class="dl-main-icon">↓</span><span class="dl-main-copy"><b>Windows 安装包</b><em>' + escapeHTML(exe.name) + ' · ' + escapeHTML(formatSize(exe.size)) + ' · 国内加速</em></span><span class="dl-main-arrow">↗</span></a>'
       : '<a class="dl-main" href="' + escapeHTML(releaseUrl) + '" target="_blank" rel="noopener"><span class="dl-main-icon">↗</span><span class="dl-main-copy"><b>打开 GitHub 下载页</b><em>查看本次发布的所有文件</em></span><span class="dl-main-arrow">↗</span></a>';
 
     var sub = zip
@@ -228,7 +236,7 @@
           primary +
           sub +
           '<a class="dl-all" href="' + escapeHTML(releaseUrl) + '" target="_blank" rel="noopener">在 GitHub 查看全部文件 ↗</a>' +
-          '<p class="dl-note">Windows 10/11 · 旧版原地升级，码表、设置与学习记录保留。<br>安装包来自 GitHub Releases，下载链接随发布自动更新。</p>' +
+          '<p class="dl-note">Windows 10/11 · 旧版原地升级，码表、设置与学习记录保留。<br>安装包由 Gitee 国内加速分发，GitHub Releases 为备用源。</p>' +
         '</aside>' +
       '</div>' +
     '</article>';
@@ -317,9 +325,10 @@
         '<div class="error-card">' +
           '<p class="kicker"><span class="kicker-dot"></span> RELEASES / TEMPORARILY UNAVAILABLE</p>' +
           '<h2>暂时读不到最新版本。</h2>' +
-          '<p>' + escapeHTML(text) + ' 你仍然可以直接打开 GitHub Releases 查看最新版本与历史版本。</p>' +
+          '<p>' + escapeHTML(text) + ' 你仍然可以直接打开 Gitee 或 GitHub 的版本页查看最新版本与历史版本。</p>' +
           '<div class="error-actions">' +
-            '<a class="btn" href="https://github.com/LeafHW/hufu-ime-rust/releases/latest" target="_blank" rel="noopener">打开 GitHub 最新版本 ↗</a>' +
+            '<a class="btn" href="https://gitee.com/leafyin/hufu-ime-rust/releases" target="_blank" rel="noopener">打开 Gitee 下载页 ↗</a>' +
+            '<a class="btn btn-ghost" href="https://github.com/LeafHW/hufu-ime-rust/releases/latest" target="_blank" rel="noopener">GitHub（备用）</a>' +
             '<button class="btn btn-ghost" type="button" data-retry>重试</button>' +
           '</div>' +
         '</div>';
