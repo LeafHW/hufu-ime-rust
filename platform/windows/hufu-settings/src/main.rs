@@ -447,7 +447,7 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
                     (*app).frame_bg = bg;
                     (*app).frame_side = side;
                 }
-                apply_window_theme(hwnd, parts[2] != "light");
+                apply_window_theme(hwnd, parts[2] != "light", parse_hex_color(parts[0]));
                 RedrawWindow(hwnd, null(), 0, 0x0001 | 0x0020 | 0x0080);
                 (*app).log(&format!("frame theme: {rest}"));
             }
@@ -1064,6 +1064,76 @@ unsafe extern "system" fn wndproc(
                 }
             }
             0
+        }
+        WM_NCCALCSIZE => {
+            /* 【2026-11-03】顶部不再保留系统 7px 拉伸边框：把客户区顶边抬到
+               窗口顶，标题栏自绘一直铺到边。否则主题切换时 DWM 会按系统
+               深浅色把这条边框单独渐变（用户实锤「上面那条线不跟着扩散」）。
+               必须用 NCCALCSIZE 传入的「新窗口矩形」顶边，不能用
+               GetWindowRect：从最大化还原时后者还是旧坐标，客户区会被
+               算成负 top、比窗口还高。最大化窗口顶边在屏幕外，用显示器
+               工作区顶边兜底。 */
+            let mut win_top = 0i32;
+            let reuse = wparam != 0 && lparam != 0;
+            if reuse {
+                let p = lparam as *const NCCALCSIZE_PARAMS;
+                win_top = (*p).rgrc[0].top;
+            }
+            let res = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if reuse {
+                let mut top = win_top;
+                let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if mon != 0 {
+                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                    if GetMonitorInfoW(mon, &mut mi) != 0 && top < mi.rcWork.top {
+                        top = mi.rcWork.top;
+                    }
+                }
+                let p = lparam as *mut NCCALCSIZE_PARAMS;
+                (*p).rgrc[0].top = top;
+            }
+            res
+        }
+        WM_NCHITTEST => {
+            /* 顶边框去掉后补回上边/四角的缩放手势（5px 命中区）。 */
+            if IsZoomed(hwnd) == 0 {
+                let mut wr = RECT::default();
+                if GetWindowRect(hwnd, &mut wr) != 0 {
+                    let x = ((lparam as u32) & 0xFFFF) as i16 as i32;
+                    let y = (((lparam as u32) >> 16) & 0xFFFF) as i16 as i32;
+                    let e = 5;
+                    let left = x < wr.left + e;
+                    let right = x >= wr.right - e;
+                    let top = y < wr.top + e;
+                    let bottom = y >= wr.bottom - e;
+                    if top && left {
+                        return HTTOPLEFT;
+                    }
+                    if top && right {
+                        return HTTOPRIGHT;
+                    }
+                    if bottom && left {
+                        return HTBOTTOMLEFT;
+                    }
+                    if bottom && right {
+                        return HTBOTTOMRIGHT;
+                    }
+                    if top {
+                        return HTTOP;
+                    }
+                    if bottom {
+                        return HTBOTTOM;
+                    }
+                    if left {
+                        return HTLEFT;
+                    }
+                    if right {
+                        return HTRIGHT;
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_NCPAINT => {
             /* 【2026-11-03 浅色黑边】接管非客户区绘制：默认由系统按「深色标题栏」
@@ -1819,7 +1889,7 @@ unsafe fn real_main() -> i32 {
     // Keep the window hidden until the React shell has navigated/rendered.
     // Showing it immediately is what produced the big blank block before the
     // UI appeared (white before, black after the dark-brush fix).
-    apply_window_theme(hwnd, true);
+    apply_window_theme(hwnd, true, None);
     (*app).log("window created (hidden until NavigationCompleted); title=\"虎符设置\"");
 
     if let Some(secs) = args.auto_close_secs {

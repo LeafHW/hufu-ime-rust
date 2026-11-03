@@ -33,7 +33,9 @@
   body.light .window{border-color:rgba(80,60,20,.12)}
   /* ── titlebar ── */
   .titlebar{
-    height:46px; flex:none; display:flex; align-items:center; gap:10px; padding:0 8px 0 22px;
+    /* 【2026-11-03】客户区上提到窗口顶（壳去掉了顶部 7px 系统边框），
+       这里补 7px 上内边距/高度，内容绝对位置不变；标题栏背景一直铺到窗边。 */
+    height:53px; flex:none; display:flex; align-items:center; gap:10px; padding:7px 8px 0 22px;
     user-select:none; cursor:default;
     background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,0));
     border-bottom:1px solid var(--line); position:relative; z-index:5;
