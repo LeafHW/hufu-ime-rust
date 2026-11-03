@@ -5,31 +5,11 @@ import { deleteSsfSkin, loadSkin, loadFonts, loadSsfSettings, saveSsfSettings, r
 import type { SsfOverrides } from '../api';
 import { useDirtyGuard } from '../dirtyGuard';
 import { Candidate } from '../components/Candidate';
+import { useBodyLight } from '../hooks';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
-
-/** 跟随 body.light 的响应式浅色状态：预览背景默认值跟着主题走
-    （深色主题→「深色」、浅色主题→「浅色」），用户手动选过就按选择。 */
-function useBodyLight(): boolean {
-  const [light, setLight] = useState(
-    typeof document !== 'undefined' && document.body.classList.contains('light'),
-  );
-  useEffect(() => {
-    const sync = () => setLight(document.body.classList.contains('light'));
-    sync();
-    const mo = new MutationObserver(sync);
-    mo.observe(document.body, { attributes: true, attributeFilter: ['class'] });
-    const mq = window.matchMedia('(prefers-color-scheme: light)');
-    mq.addEventListener?.('change', sync);
-    return () => {
-      mo.disconnect();
-      mq.removeEventListener?.('change', sync);
-    };
-  }, []);
-  return light;
-}
 
 const COLOR_LABELS: Record<string, string> = {
   back_color: '窗底色',

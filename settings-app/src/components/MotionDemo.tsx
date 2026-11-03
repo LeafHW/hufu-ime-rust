@@ -1,11 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
+import type { SkinTokens } from '../skinTokens';
+
+const ROWS = ['我们', '我', '我军'];
+const ROW_H = 28;
 
 /**
- * 【2026-11-03】动效预览（原皮肤页 M5 演示，迁到「动效」页）：
- * 固定内部 token fast=80ms 的高亮滑动演示，只受全局动效开关/速度影响，
- * 不向皮肤暴露任何参数。点「播放」走一遍：选中从第 1 项滑到第 2 项再回位。
+ * 【动效预览】高亮滑动演示：固定内部节奏 fast=80ms（只受总开关/速度影响），
+ * 外观跟「动效」页其它演示一致——用当前皮肤的真实配色画一只迷你候选窗，
+ * 高亮底块在候选之间滑过去，而不是设置页自己的米色小控件。
  */
-export function MotionDemo({ speed, enabled }: { speed: number; enabled: boolean }) {
+export function MotionDemo({
+  tokens,
+  speed,
+  enabled,
+}: {
+  tokens: SkinTokens;
+  speed: number;
+  enabled: boolean;
+}) {
   const [sel, setSel] = useState(0);
   const [playing, setPlaying] = useState(false);
   const timers = useRef<number[]>([]);
@@ -25,19 +37,57 @@ export function MotionDemo({ speed, enabled }: { speed: number; enabled: boolean
       }, 780),
     );
   };
-  const dur = enabled ? Math.max(0, 80 / Math.max(0.05, speed)) : 0;
+  const dur = enabled ? Math.max(16, Math.round(80 / Math.max(0.05, speed))) : 0;
+  const gap = tokens.gap;
   return (
     <div className="motion-demo">
-      <div className="md-rows" role="img" aria-label="候选窗高亮滑动预览">
-        <div
-          className="md-pill"
-          style={{ transform: `translateY(${sel * 26}px)`, transitionDuration: `${Math.round(dur)}ms` }}
-        />
-        {['我们', '我', '我军'].map((t, i) => (
-          <div key={t} className={`md-row${sel === i ? ' on' : ''}`}>
-            {i + 1}. {t}
-          </div>
-        ))}
+      <div
+        className="md-cand"
+        style={{
+          background: tokens.bg,
+          borderColor: tokens.border,
+          borderRadius: tokens.radius + 2,
+          fontFamily: tokens.face,
+        }}
+      >
+        <div className="md-pre" style={{ color: tokens.preedit, fontSize: Math.max(10, tokens.font - 4) }}>
+          tuja
+        </div>
+        <div className="md-rows" style={{ gap }}>
+          <span
+            className="md-pill"
+            style={{
+              height: ROW_H,
+              borderRadius: Math.max(4, tokens.radius - 2),
+              background: tokens.hlBg,
+              transform: `translateY(${sel * (ROW_H + gap)}px)`,
+              transitionDuration: `${dur}ms`,
+            }}
+          />
+          {ROWS.map((t, i) => {
+            const on = i === sel;
+            return (
+              <div
+                key={t}
+                className={`md-row${on ? ' on' : ''}`}
+                style={{
+                  height: ROW_H,
+                  lineHeight: `${ROW_H}px`,
+                  borderRadius: Math.max(4, tokens.radius - 2),
+                  color: on ? tokens.hlText : tokens.text,
+                  fontSize: Math.round(tokens.font * 0.84),
+                  padding: `0 ${Math.max(8, tokens.rowPad + 4)}px`,
+                  transitionDuration: `${Math.round(dur * 0.7)}ms`,
+                }}
+              >
+                <span className="md-idx" style={{ color: on ? tokens.hlText : tokens.label }}>
+                  {i + 1}.
+                </span>
+                {t}
+              </div>
+            );
+          })}
+        </div>
       </div>
       <button type="button" className="btn sm outline" onClick={play} disabled={playing}>
         {playing ? '播放中…' : '播放'}

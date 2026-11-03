@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useScreenActive } from '../hooks';
 import type { Bootstrap, Config, EngineState } from '../types';
 import { useDirtyGuard } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
@@ -417,6 +418,10 @@ export function SentencePage({
   data: Bootstrap;
   notify: (msg: string) => void;
 }) {
+  /* 【2026-11-03 审计】状态/配置轮询只在「整句模型」页可见时跑：
+     页面常驻挂载，隐藏页不该每 4s/8s 打服务器。 */
+  const screenActive = useScreenActive('sentence');
+
   const [sentence, setSentence] = useState<SentenceCfg>(() => normalizeSentence(data.config.sentence));
   const [remote, setRemote] = useState<EngineState>(data.state);
   const [dirty, setDirty] = useState(false);
@@ -527,14 +532,19 @@ export function SentencePage({
         /* 保持上次状态 */
       }
     };
-    const timer = window.setInterval(tick, 4000);
+    if (!screenActive) return;
+    tick();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void tick();
+    }, 4000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [screenActive]);
 
   /* 配置轮询：只在本页无未应用改动时跟随外部变化。 */
   useEffect(() => {
+    if (!screenActive) return;
     const timer = window.setInterval(async () => {
-      if (dirtyRef.current || savingRef.current) return;
+      if (document.hidden || dirtyRef.current || savingRef.current) return;
       try {
         const cfg = await fetchConfig();
         const next = normalizeSentence(cfg.sentence);
@@ -551,7 +561,7 @@ export function SentencePage({
       }
     }, 8000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [screenActive]);
 
   /* 全量应用当前草稿：先读服务端最新整包（保留别处改动），再整包 POST。 */
   const persistSentence = async (

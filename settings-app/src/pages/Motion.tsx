@@ -1,79 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Bootstrap, Route, Skin } from '../types';
-import { fallbackSkin } from '../types';
+import type { Bootstrap, Route } from '../types';
 import { MotionDemo } from '../components/MotionDemo';
+import { skinTokens, withAlpha, type SkinTokens } from '../skinTokens';
+import { useScreenActive } from '../hooks';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
 import '../styles/motion.css';
-
-/* ── 小工具 ───────────────────────────────────────────────────────────── */
-
-function withAlpha(hex: string | undefined, a: number, fallback = '#14161a'): string {
-  const h = (hex || '').replace('#', '');
-  if (h.length !== 6 && h.length !== 8) return fallback;
-  const r = parseInt(h.slice(0, 2), 16);
-  const g = parseInt(h.slice(2, 4), 16);
-  const b = parseInt(h.slice(4, 6), 16);
-  const alpha = h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1;
-  return `rgba(${r},${g},${b},${(alpha * a).toFixed(3)})`;
-}
-
-/** 演示用的候选窗配色：跟着用户当前皮肤走，看起来就是自己那只候选窗。 */
-type Tokens = {
-  bg: string;
-  border: string;
-  text: string;
-  comment: string;
-  label: string;
-  preedit: string;
-  hlBg: string;
-  hlText: string;
-  radius: number;
-  face: string;
-  font: number;
-  rowPad: number;
-  gap: number;
-};
-
-function tokensOf(skin: Skin | null | undefined): Tokens {
-  const s = skin || fallbackSkin;
-  const c = s.colors || {};
-  const l = s.layout || {};
-  const m = s.material || {};
-  const master = Number.isFinite(Number(m.master_alpha)) ? Number(m.master_alpha) : 0.94;
-  const hilite = Number.isFinite(Number(m.hilite_alpha)) ? Number(m.hilite_alpha) : 1;
-  const font = Math.min(19, Math.max(13, Number(l.font_point) || 16));
-  return {
-    bg: withAlpha(c.back_color, master, 'rgba(20,22,26,.94)'),
-    border: withAlpha(c.border_color, 0.55, 'rgba(255,255,255,.12)'),
-    text: c.candidate_text_color || '#ECE9E2',
-    comment: c.comment_text_color || '#8D8980',
-    label: c.label_color || '#8D8980',
-    preedit: c.text_color || c.hilited_text_color || '#E7B75C',
-    hlBg: withAlpha(c.hilited_candidate_back_color || '#E7B75C', hilite, 'rgba(231,183,92,.9)'),
-    hlText: c.hilited_candidate_text_color || '#1A1408',
-    radius: Math.min(14, Number(l.corner_radius) || 9),
-    face: l.font_face || '"Segoe UI Variable Text","Microsoft YaHei UI",sans-serif',
-    font,
-    rowPad: 4,
-    gap: Math.max(3, Math.min(10, Number(l.candidate_spacing) || 5)),
-  };
-}
-
-/** 只有当前屏是「动效」页时才让演示循环跑：所有页面常驻挂载，
-    不做这个门会让演示定时器在别的页面后台空转（白耗 CPU）。 */
-function useScreenActive(screen: string): boolean {
-  const [active, setActive] = useState(
-    typeof document !== 'undefined' && document.body.dataset.screen === screen,
-  );
-  useEffect(() => {
-    const sync = () => setActive(document.body.dataset.screen === screen);
-    sync();
-    const mo = new MutationObserver(sync);
-    mo.observe(document.body, { attributes: true, attributeFilter: ['data-screen'] });
-    return () => mo.disconnect();
-  }, [screen]);
-  return active;
-}
 
 /** 系统「减少动画」探测器：与引擎同一个系统口径。 */
 function useReducedMotion(): boolean {
@@ -122,7 +53,7 @@ function MiniCand({
   style,
   flash,
 }: {
-  tokens: Tokens;
+  tokens: SkinTokens;
   rows?: { t: string; cmt: string }[];
   sel?: number;
   /** 逐候选字号比例：开=选中/首选放大、其余缩小。 */
@@ -199,7 +130,7 @@ function FollowDemo({
   durMs,
   playing,
 }: {
-  tokens: Tokens;
+  tokens: SkinTokens;
   scales: { first: number; other: number; enabled: boolean };
   durMs: number;
   playing: boolean;
@@ -220,7 +151,7 @@ function FollowDemo({
 }
 
 /** 出现 / 收起：每轮重挂载窗口，重播「淡入上浮」；不留下长时间空舞台。 */
-function RevealDemo({ tokens, durMs, active }: { tokens: Tokens; durMs: number; active: boolean }) {
+function RevealDemo({ tokens, durMs, active }: { tokens: SkinTokens; durMs: number; active: boolean }) {
   const [tick, setTick] = useState(0);
   useEffect(() => {
     if (!active) return;
@@ -241,7 +172,7 @@ function RevealDemo({ tokens, durMs, active }: { tokens: Tokens; durMs: number; 
 }
 
 /** 选重暂留：选中那一刻高亮闪一下；开启时窗口多停留一会儿并有一圈余辉。 */
-function LingerDemo({ tokens, durMs, linger, active }: { tokens: Tokens; durMs: number; linger: boolean; active: boolean }) {
+function LingerDemo({ tokens, durMs, linger, active }: { tokens: SkinTokens; durMs: number; linger: boolean; active: boolean }) {
   const [sel, setSel] = useState(0);
   const [flash, setFlash] = useState(false);
   const [holding, setHolding] = useState(false);
@@ -350,7 +281,7 @@ export function MotionPage({
   const app = data.config.appearance || {};
   const reduced = useReducedMotion();
   const screenActive = useScreenActive('motion');
-  const tokens = useMemo(() => tokensOf(data.skin), [data.skin]);
+  const tokens = useMemo(() => skinTokens(data.skin), [data.skin]);
 
   const [anim, setAnim] = useState(app.anim !== false);
   const [flash, setFlash] = useState(app.anim_flash !== false);
@@ -547,7 +478,7 @@ export function MotionPage({
             foot={<span className="mo-hint">固定内部节奏 fast = 80ms，不随皮肤参数变化。</span>}
           >
             <div className="mo-stage mo-stage-slide">
-              <MotionDemo speed={speed} enabled={animates} />
+              <MotionDemo tokens={tokens} speed={speed} enabled={animates} />
             </div>
           </MotionCard>
 

@@ -6,9 +6,24 @@ import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
+import { useBodyLight } from '../hooks';
 import { SEARCH_ITEMS } from './searchIndex';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
+
+/** 把颜色往浅纸上混：t=0 原色、t=1 纯浅色。浅色主题的皮肤缩略图用它提亮，
+    避免把深色皮肤原样画出来变成一块黑。 */
+function tintToLight(hex: string, t: number, light = '#f7f2e8'): string {
+  const parse = (h: string) => {
+    const v = h.replace('#', '');
+    if (v.length !== 6) return null;
+    return [parseInt(v.slice(0, 2), 16), parseInt(v.slice(2, 4), 16), parseInt(v.slice(4, 6), 16)];
+  };
+  const a = parse(hex) || [42, 46, 54];
+  const b = parse(light) || [247, 242, 232];
+  const m = (i: number) => Math.round(a[i] * (1 - t) + b[i] * t);
+  return `rgb(${m(0)}, ${m(1)}, ${m(2)})`;
+}
 
 /** 中文长词按“字符顺序子序列”兜底：候选字号可命中“候选窗…字号”。 */
 function isSubsequence(needle: string, hay: string): boolean {
@@ -69,6 +84,7 @@ export function Overview({
   const [helpOpen, setHelpOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
+  const light = useBodyLight();
   const skin = data.skin || fallbackSkin;
   const currentMeta = data.skins.skins.find((s) => s.id === data.skins.current);
   const skinName = shortName(data.skin?.name || currentMeta?.name || '墨言');
@@ -139,6 +155,7 @@ export function Overview({
   const files = data.syncSchemes.schemes.filter((s) => s.selected).reduce((a, b) => a + b.files, 0);
   const colorCount = Object.keys(skin.colors || {}).length;
   const highlight = skin.colors?.hilited_candidate_back_color || '#E7B75C';
+  const back = skin.colors?.back_color || '#2a2e36';
 
   const syncLabel = !sync.configured
     ? '未配置'
@@ -240,7 +257,9 @@ export function Overview({
             <span
               className="swatch-mini"
               style={{
-                background: `linear-gradient(135deg, ${skin.colors?.back_color || '#2a2e36'}, #15171b 58%, ${highlight})`,
+                background: light
+                  ? `linear-gradient(135deg, ${tintToLight(back, 0.46)}, ${tintToLight(back, 0.76)} 58%, ${tintToLight(highlight, 0.3)})`
+                  : `linear-gradient(135deg, ${back}, #15171b 58%, ${highlight})`,
               }}
             />
             {skinName}

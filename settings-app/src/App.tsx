@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { loadBootstrap } from './api';
 import { PAGE_TITLE, requestWindowClose, Sidebar, TitleBar } from './components/Shell';
 import { Toast } from './components/ui';
@@ -80,9 +81,28 @@ function normalizeBootstrap(b: Bootstrap): Bootstrap {
 }
 
 export default function App() {
-  /** 当前页（侧栏高亮/标题跟随它）。页面全部常驻挂载，换页只切 display：
-      不卸载 = 各页未保存的草稿不会丢，切换也没有重建成本。 */
+  /** 当前页（侧栏高亮/标题跟随它）。页面首访挂载后一直保留（切 display）：
+      已访问页不卸载 = 草稿不丢、切页没有重建成本；未访问页等首次点击/空闲预挂载。 */
   const [view, setView] = useState<Route>(readRoute);
+  /** 【2026-11-03 启动提速】页面首访才挂载：首帧只渲染当前页（概览常驻，
+      Ctrl+K 的搜索监听依赖它）；其余页在首帧后用 requestIdleCallback
+      一页一页预挂载，既不让启动阻塞，又保证切页时已经就绪。 */
+  const [mountedPages, setMountedPages] = useState<Set<Route>>(() => {
+    const first = readRoute();
+    const set = new Set<Route>(['overview']);
+    set.add(first);
+    return set;
+  });
+  const mountedPagesRef = useRef<Set<Route>>(mountedPages);
+  const ensureMounted = useCallback((r: Route) => {
+    if (mountedPagesRef.current.has(r)) return;
+    const next = new Set(mountedPagesRef.current);
+    next.add(r);
+    mountedPagesRef.current = next;
+    /* 新页要在 View Transition 拍「新快照」前完成布局：同步提交，避免
+       快照抓到空页、转场结束后内容才蹦出来。 */
+    flushSync(() => setMountedPages(next));
+  }, []);
   const [data, setData] = useState<Bootstrap>(fallbackBootstrap);
   /* RT-13：?theme= 参数只一次性生效，不写回 localStorage；
      skipPersist 在「当前主题来自 URL 参数」期间保持 true。 */
@@ -140,13 +160,23 @@ export default function App() {
     };
   }, []);
 
+  const lastSig = useRef('');
   const refresh = useCallback(async () => {
     const seq = ++loadSeq.current;
     inFlight.current = true;
     try {
       const next = normalizeBootstrap(await loadBootstrap());
-      /* 只有最新一轮的响应能覆盖 state；旧轮次直接丢弃。 */
-      if (mounted.current && seq === loadSeq.current) setData(next);
+      /* 只有最新一轮的响应能覆盖 state；旧轮次直接丢弃。
+         【2026-11-03】数据没变就不 setData：每 10s 轮询过去会换新对象，
+         把 12 个 memo 页面全部重渲染一遍（切页/动画期间偶发掉帧的根因）。
+         序列化对比约 0.3ms，远小于整树重渲染。 */
+      if (mounted.current && seq === loadSeq.current) {
+        const sig = JSON.stringify(next);
+        if (sig !== lastSig.current) {
+          lastSig.current = sig;
+          setData(next);
+        }
+      }
       return next;
     } finally {
       /* 旧轮次不放闸：它可能晚于新一轮启动，提前清标记会让两轮叠加。 */
@@ -177,8 +207,37 @@ export default function App() {
     };
   }, [refresh]);
 
+  /* 首帧后按空闲分批预挂载其余页：启动不被 12 页整树渲染拖慢，
+     用户真正点过去时（通常 >1s）已经挂载好，切页仍然零成本。 */
+  useEffect(() => {
+    const order: Route[] = ['skin', 'motion', 'input', 'schemes', 'sync', 'data', 'keymap', 'buddy', 'sentence', 'about', 'donate'];
+    let i = 0;
+    let cancelled = false;
+    const idle = (cb: () => void) => {
+      const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+      if (typeof ric === 'function') ric(cb, { timeout: 700 });
+      else window.setTimeout(cb, 120);
+    };
+    const step = () => {
+      if (cancelled) return;
+      /* 转场进行中不挂载新页：别在动画帧里插一段重渲染。 */
+      if (vtBusy.current || phaseRef.current !== 'idle') {
+        idle(step);
+        return;
+      }
+      while (i < order.length && mountedPagesRef.current.has(order[i])) i++;
+      if (i >= order.length) return;
+      ensureMounted(order[i++]);
+      idle(step);
+    };
+    idle(step);
+    return () => {
+      cancelled = true;
+    };
+  }, [ensureMounted]);
+
   /* 首帧直接把当前页显示出来（CSS 靠 body[data-screen] 决定哪一节 display:block）；
-     全部页面常驻挂载，深链 #skin 不需要再滚动定位。 */
+     深链页在 mounted 初始集合里，不需要再滚动定位。 */
   useLayoutEffect(() => {
     const r = shownRef.current;
     document.body.dataset.screen = r;
@@ -188,6 +247,7 @@ export default function App() {
 
   /** 换页的 DOM 落点：切显示哪一节 + 回到页顶（切换后从页头开始，和侧栏选中一致）。 */
   const swapTo = useCallback((r: Route) => {
+    ensureMounted(r);
     shownRef.current = r;
     document.body.dataset.screen = r;
     const m = mainRef.current;
@@ -199,7 +259,7 @@ export default function App() {
         window.dispatchEvent(new CustomEvent('hufu:focus-search')),
       );
     }
-  }, []);
+  }, [ensureMounted]);
 
   /** 退回方案（内核不支持 View Transitions）：旧页先退场，换页后再入场。 */
   const commitRoute = useCallback((r: Route, animate = true) => {
@@ -511,40 +571,40 @@ export default function App() {
         />
         <main className="main" ref={mainRef}>
           <section className="screen" id="s-overview">
-            <OverviewView data={data} notify={notify} navigate={navigate} />
+            {mountedPages.has('overview') ? <OverviewView data={data} notify={notify} navigate={navigate} /> : null}
           </section>
           <section className="screen" id="s-schemes">
-            <SchemesView data={data} notify={notify} />
+            {mountedPages.has('schemes') ? <SchemesView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-input">
-            <InputView data={data} notify={notify} />
+            {mountedPages.has('input') ? <InputView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-keymap">
-            <KeymapView data={data} notify={notify} />
+            {mountedPages.has('keymap') ? <KeymapView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-skin">
-            <SkinView data={data} notify={notify} refresh={refresh} navigate={navigate} />
+            {mountedPages.has('skin') ? <SkinView data={data} notify={notify} refresh={refresh} navigate={navigate} /> : null}
           </section>
           <section className="screen" id="s-motion">
-            <MotionView data={data} notify={notify} navigate={navigate} />
+            {mountedPages.has('motion') ? <MotionView data={data} notify={notify} navigate={navigate} /> : null}
           </section>
           <section className="screen" id="s-buddy">
-            <BuddyView data={data} notify={notify} />
+            {mountedPages.has('buddy') ? <BuddyView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-sentence">
-            <SentenceView data={data} notify={notify} />
+            {mountedPages.has('sentence') ? <SentenceView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-data">
-            <DataView data={data} notify={notify} />
+            {mountedPages.has('data') ? <DataView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-sync">
-            <SyncView data={data} notify={notify} />
+            {mountedPages.has('sync') ? <SyncView data={data} notify={notify} /> : null}
           </section>
           <section className="screen" id="s-about">
-            <AboutView about={data.about} />
+            {mountedPages.has('about') ? <AboutView about={data.about} /> : null}
           </section>
           <section className="screen" id="s-donate">
-            <DonateView />
+            {mountedPages.has('donate') ? <DonateView /> : null}
           </section>
         </main>
       </div>
