@@ -213,6 +213,60 @@ if ($DryRun) {
     [IO.File]::WriteAllText($SiteManifestPath, $Json, $Utf8NoBom)
     Write-Ok "已写入（记得随站点一起提交发布）"
 
+    # 更新日志页快照：页面已改为「本地快照优先」，这里每次发版刷新，
+    # 保证国内（GitHub API 不可达）也能看到最新版本与历史。
+    # 抓取失败就保留旧快照——页面本来就能正常渲染。
+    Write-Step "刷新站点更新日志快照（releases/cache.json）"
+    $CachePath = Join-Path $SiteRepoDir 'releases\cache.json'
+    $tmpRel = Join-Path $env:TEMP 'hufu-gh-releases.json'
+    $ghFile2 = 'E:\DSH-KF\gh-token.txt'
+    $gh2 = if (Test-Path $ghFile2) { (Get-Content $ghFile2 -Raw).Trim() } else { '' }
+    $curlArgs2 = @('-sS', '--max-time', '60', '-H', 'Accept: application/vnd.github+json',
+                   '-o', $tmpRel,
+                   'https://api.github.com/repos/LeafHW/hufu-ime-rust/releases?per_page=100')
+    if ($gh2) { $curlArgs2 = @('-sS', '--max-time', '60', '-H', 'Accept: application/vnd.github+json', '-H', "Authorization: Bearer $gh2", '-o', $tmpRel, 'https://api.github.com/repos/LeafHW/hufu-ime-rust/releases?per_page=100') }
+    $r2 = Invoke-Native 'curl.exe' $curlArgs2
+    try {
+        # PS5.1 Get-Content 默认按 ANSI 解码，UTF-8 的 JSON 会乱码 → 解析失败
+        $raw = Get-Content $tmpRel -Raw -Encoding UTF8
+        if ($raw -and $raw.TrimStart().StartsWith('[')) {
+            # 只保留页面用得到的字段与最近 12 版：GitHub 完整 payload 近 400 KB，
+            # 国内首屏加载会明显变慢（2026-11-04 实测 390 KB → 52 KB）。
+            $rel = $raw | ConvertFrom-Json
+            $rows = @()
+            foreach ($r in ($rel | Select-Object -First 12)) {
+                $assets = @()
+                foreach ($a in @($r.assets)) {
+                    $assets += [ordered]@{
+                        name                 = $a.name
+                        size                 = $a.size
+                        browser_download_url = $a.browser_download_url
+                    }
+                }
+                $rows += [ordered]@{
+                    id           = $r.id
+                    tag_name     = $r.tag_name
+                    name         = $r.name
+                    body         = $r.body
+                    published_at = $r.published_at
+                    created_at   = $r.created_at
+                    prerelease   = $r.prerelease
+                    html_url     = $r.html_url
+                    draft        = $r.draft
+                    assets       = @($assets)
+                }
+            }
+            $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+            $wrapped = ([ordered]@{ time = $stamp; data = @($rows) } | ConvertTo-Json -Depth 8 -Compress)
+            [IO.File]::WriteAllText($CachePath, $wrapped, $Utf8NoBom)
+            Write-Ok ("快照已刷新（{0} 版，{1:N0} KB）" -f $rows.Count, ((Get-Item $CachePath).Length / 1KB))
+        } else {
+            Write-Warn2 "快照刷新跳过（GitHub API 不可达或返回非数组），保留旧快照"
+        }
+    } catch {
+        Write-Warn2 "快照刷新异常（保留旧快照）：$($_.Exception.Message)"
+    }
+
     Write-Step "推送清单到 $UpdatesRepo"
     # 注意：必须用 curl.exe + --data-urlencode。PowerShell 的 Invoke-RestMethod
     # 走表单编码会把 base64 里的 "+" 变成空格，Gitee 直接回 406（实测）。
@@ -250,10 +304,10 @@ if ($DryRun) {
         } elseif (-not (Test-Path (Join-Path $SiteRepoDir '.git'))) {
             Write-Warn2 "站点工作树不是 git 仓库，跳过推送"
         } else {
-            & git -C $SiteRepoDir add update.json | Out-Null
-            $diff = & git -C $SiteRepoDir status --porcelain -- update.json
+            & git -C $SiteRepoDir add update.json releases/cache.json | Out-Null
+            $diff = & git -C $SiteRepoDir status --porcelain -- update.json releases/cache.json
             if ($diff) {
-                & git -C $SiteRepoDir commit -m "chore: update.json $Tag" -- update.json | Out-Null
+                & git -C $SiteRepoDir commit -m "chore: update.json + releases snapshot $Tag" -- update.json releases/cache.json | Out-Null
                 $pushR = Invoke-Native 'git' @('-C', $SiteRepoDir, '-c', 'credential.helper=', 'push', "https://LeafHW:$gh@github.com/LeafHW/hufu-ime-rust.git", 'gh-pages')
                 if ($pushR.Code -eq 0) {
                     Write-Ok "站点已推送（Pages 约 1 分钟生效）"
