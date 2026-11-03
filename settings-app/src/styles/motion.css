@@ -1,0 +1,115 @@
+/* ── 动效页（2026-11-03）────────────────────────────────────────────── */
+.mo-wrap{display:flex;flex-direction:column;gap:14px;padding-bottom:10px}
+.mo-eyebrow{
+  font:600 10px/1.2 Consolas,'Cascadia Mono',ui-monospace,monospace;letter-spacing:.2em;
+  color:var(--gold);opacity:.9;margin-bottom:7px;text-transform:uppercase;
+}
+.mo-card .mo-eyebrow{margin-bottom:5px}
+
+/* hero --------------------------------------------------------------- */
+.mo-hero{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(330px,.92fr);gap:26px;padding:22px 24px}
+.mo-hero-l h2{font-size:22px;margin:0 0 9px;font-weight:650;display:flex;align-items:center;gap:10px;letter-spacing:.01em}
+.mo-hero-l p{margin:0;max-width:560px;font-size:13px;line-height:1.8;color:var(--text2)}
+.mo-hero-switch{display:flex;align-items:center;gap:11px;margin-top:17px;font-size:12.5px;color:var(--text2)}
+.mo-hero-r{
+  display:flex;flex-direction:column;justify-content:center;gap:7px;
+  padding-left:26px;border-left:1px solid var(--line);
+}
+.mo-speed-head{display:flex;align-items:baseline;justify-content:space-between;font-size:13px;color:var(--text2)}
+.mo-speed-head b{font-size:15px;color:var(--text);font-variant-numeric:tabular-nums;font-weight:650}
+.mo-speed-scale{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--text3)}
+.mo-speed-scale i{flex:1;height:1px;background:linear-gradient(90deg,transparent,var(--line2) 35%,var(--line2) 65%,transparent)}
+.mo-rhythm{margin-top:9px;display:flex;flex-direction:column;gap:6px}
+.mo-rhythm-row{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--text3)}
+.mo-rhythm-ms{width:46px;text-align:right;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.mo-rhythm-tag{width:12px;opacity:.75}
+.mo-rhythm-track{position:relative;flex:1;height:3px;border-radius:2px;background:var(--line);overflow:hidden}
+.mo-rhythm-track i{position:absolute;left:0;top:0;bottom:0;width:24%;border-radius:2px;
+  background:linear-gradient(90deg,var(--gold3),var(--gold2));opacity:.7}
+.mo-rhythm-track i.run{animation:moSweep linear infinite}
+@keyframes moSweep{from{transform:translateX(-115%)}to{transform:translateX(430%)}}
+
+/* cards -------------------------------------------------------------- */
+.mo-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.mo-card{padding:18px 18px 13px;display:flex;flex-direction:column;gap:11px;min-height:250px}
+.mo-card.off{background:linear-gradient(180deg,rgba(255,255,255,.012),transparent 60%),var(--surface)}
+.mo-card.muted .mo-stage{opacity:.6}
+.mo-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.mo-card-copy h3{margin:0 0 6px;font-size:15.5px;font-weight:650;display:flex;align-items:center;gap:8px;letter-spacing:.01em}
+.mo-card-copy p{margin:0;font-size:12.5px;line-height:1.72;color:var(--text2);max-width:520px}
+.mo-note-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px;color:var(--text3);margin-top:-3px}
+.mo-note-line b{color:var(--gold2);font-weight:600;font-variant-numeric:tabular-nums}
+.mo-note-line .link-more{margin:0}
+.mo-card-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:auto;font-size:11.5px;color:var(--text3);min-height:18px}
+.mo-hint{line-height:1.5}
+.mo-live{font:600 10px/1 Consolas,ui-monospace,monospace;letter-spacing:.14em;padding:4px 8px;border-radius:999px;
+  border:1px solid var(--line2);color:var(--text3);flex:none}
+.mo-live.on{color:var(--gold);border-color:rgba(231,183,92,.45);background:var(--gold-soft)}
+
+/* stage -------------------------------------------------------------- */
+.mo-stage{
+  flex:1;min-height:136px;border-radius:10px;border:1px solid var(--line);
+  background:
+    radial-gradient(130% 150% at 50% -10%,rgba(231,183,92,.075),transparent 62%),
+    var(--bg);
+  display:flex;align-items:center;justify-content:center;padding:13px;overflow:hidden;position:relative;
+}
+body.light .mo-stage{background:
+    radial-gradient(130% 150% at 50% -10%,rgba(168,116,26,.07),transparent 62%),#f7f3ea}
+.mo-stage-slide .motion-demo{flex-direction:column;gap:10px}
+
+/* 迷你候选窗（颜色来自当前皮肤） */
+.mo-cand{min-width:152px;max-width:100%;padding:7px 8px 8px;
+  box-shadow:0 12px 30px rgba(0,0,0,.22),0 0 0 1px rgba(255,255,255,.03) inset}
+.mo-pre{
+  padding:0 3px 4px;margin-bottom:4px;border-bottom:1px solid rgba(255,255,255,.1);
+  letter-spacing:.05em;line-height:1.3;
+}
+body.light .mo-pre{border-bottom-color:rgba(0,0,0,.08)}
+.mo-rows{display:flex;flex-direction:column}
+.mo-row{display:flex;align-items:baseline;gap:6px;white-space:nowrap;line-height:1.3}
+.mo-idx{font-variant-numeric:tabular-nums;opacity:.85}
+.mo-word{font-weight:520}
+.mo-cmt{font-size:.62em;opacity:.8;letter-spacing:.01em;margin-left:2px}
+.mo-row.flash{animation:moFlash .52s ease-out}
+@keyframes moFlash{
+  0%{box-shadow:0 0 0 0 rgba(231,183,92,.5)}
+  100%{box-shadow:0 0 0 9px rgba(231,183,92,0)}
+}
+.mo-linger{position:relative}
+.mo-linger-tag{
+  position:absolute;right:-7px;top:-9px;padding:2px 7px;border-radius:999px;
+  font-size:10px;letter-spacing:.1em;color:var(--gold2);
+  background:var(--surface);border:1px solid rgba(231,183,92,.42);
+  box-shadow:0 4px 12px rgba(0,0,0,.22);pointer-events:none;
+}
+
+/* tip ---------------------------------------------------------------- */
+.mo-tip{display:grid;grid-template-columns:190px minmax(0,1fr);gap:22px;padding:18px 22px;align-items:start}
+.mo-tip h3{margin:0;font-size:14.5px;font-weight:650}
+.mo-tip-list{margin:0;padding-left:17px;display:flex;flex-direction:column;gap:6px;
+  font-size:12.5px;line-height:1.75;color:var(--text2)}
+.mo-tip-list::marker{color:var(--gold)}
+.mo-tip-list li::marker{color:var(--gold)}
+
+@media (max-width:1120px){
+  .mo-hero{grid-template-columns:1fr;gap:18px}
+  .mo-hero-r{padding-left:0;border-left:0;border-top:1px solid var(--line);padding-top:16px}
+  .mo-grid{grid-template-columns:1fr}
+  .mo-tip{grid-template-columns:1fr;gap:10px}
+}
+
+@media (prefers-reduced-motion: reduce){
+  .mo-rhythm-track i,
+  .mo-row.flash{animation:none!important}
+}
+
+/* 出现/收起：每轮重挂载由 key 触发，只播一次 */
+.mo-reveal{animation:moRevealIn .24s cubic-bezier(.2,.8,.2,1) both}
+@keyframes moRevealIn{from{opacity:0;transform:translateY(9px) scale(.985)}to{opacity:1;transform:none}}
+/* 选重暂留的余辉 */
+.mo-linger.holding .mo-cand{animation:moHold .55s ease-out}
+@keyframes moHold{
+  0%{box-shadow:0 0 0 0 rgba(231,183,92,.45),0 12px 30px rgba(0,0,0,.22)}
+  100%{box-shadow:0 0 0 13px rgba(231,183,92,0),0 12px 30px rgba(0,0,0,.22)}
+}

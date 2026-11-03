@@ -699,6 +699,12 @@ pub struct AppearanceSection {
     /// 范围 0.50~1.00，设置页 5% 步进；默认 0.70（其余缩小到七成）。
     #[serde(default = "default_other_font_scale")]
     pub other_font_scale: f32,
+    /// 【动效·高亮跟随放大 2026-11-03】逐候选字号改为跟随当前选中项：
+    /// true=高亮候选用 first_font_scale、其余用 other_font_scale；
+    /// false=旧行为（钉第 1 候选）。默认 false=老配置零差异；两档比例
+    /// 与「首选放大/其余缩小」共用。只做静态映射，不做逐帧字号插值。
+    #[serde(default)]
+    pub hl_font_scale: bool,
     // 【特效退役 2026-09-22】commit_fx / stamp_font_scale（上屏特效）
     // 字段删除——旧配置文件多余键 serde 自动忽略（同 二十四修 口径）。
     /// 【SSF 皮肤 2026-12】当前皮肤类型："json"（参数化 JSON 皮肤）或
@@ -736,6 +742,7 @@ impl Default for AppearanceSection {
             per_cand_font: false,
             first_font_scale: default_first_font_scale(),
             other_font_scale: default_other_font_scale(),
+            hl_font_scale: false,
             skin_kind: default_skin_kind(),
         }
     }
@@ -890,10 +897,13 @@ mod tests {
     }
 
     /// 【逐候选字号 2026-10】开关/比例默认值 + 往返 + 旧配置缺键取默认。
+    /// 【高亮跟随放大 2026-11-03】hl_font_scale 同口径：默认 false、
+    /// 设为 true 后 JSON 往返保持、老 JSON（无此键）反序列化得 false。
     #[test]
     fn per_cand_font_defaults_and_roundtrip() {
         let cfg = Config::default();
         assert_eq!(cfg.appearance.per_cand_font, false, "默认关（升级零差异）");
+        assert_eq!(cfg.appearance.hl_font_scale, false, "默认关（升级零差异）");
         assert_eq!(cfg.appearance.first_font_scale, 1.00);
         assert_eq!(cfg.appearance.other_font_scale, 0.70);
 
@@ -902,18 +912,25 @@ mod tests {
         let p = dir.join("config.json");
         let mut cfg = Config::default();
         cfg.appearance.per_cand_font = true;
+        cfg.appearance.hl_font_scale = true;
         cfg.appearance.first_font_scale = 1.35;
         cfg.appearance.other_font_scale = 0.85;
         cfg.save(&p).unwrap();
         let cfg2 = Config::load(&p).unwrap();
         assert!(cfg2.appearance.per_cand_font);
+        assert!(cfg2.appearance.hl_font_scale);
         assert_eq!(cfg2.appearance.first_font_scale, 1.35);
         assert_eq!(cfg2.appearance.other_font_scale, 0.85);
+        // JSON 往返（不落盘形态）同样保持高亮开关
+        let js = serde_json::to_string(&cfg).unwrap();
+        let cfg_rt: Config = serde_json::from_str(&js).unwrap();
+        assert!(cfg_rt.appearance.hl_font_scale);
 
         // 旧 config.json（appearance 无这三个键）→ 开关关、比例取默认
         let legacy = r#"{"appearance": {"skin": "hufu-moyan", "font_size": 17.6}}"#;
         let cfg3: Config = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg3.appearance.per_cand_font, false);
+        assert_eq!(cfg3.appearance.hl_font_scale, false);
         assert_eq!(cfg3.appearance.first_font_scale, 1.00);
         assert_eq!(cfg3.appearance.other_font_scale, 0.70);
         let _ = std::fs::remove_dir_all(&dir);

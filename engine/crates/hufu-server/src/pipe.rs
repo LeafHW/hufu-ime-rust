@@ -556,12 +556,17 @@ pub fn dispatch(
             // 【逐候选字号 2026-10】全局（跨皮肤）候选字号阶梯：开关 + 两个
             // 比例。注入皮肤对象 layout（DLL 侧 layout_f/双形态读法直接消费，
             // 与 font_point 同通道）；比例是「×基准字号」的纯倍数，不进皮肤
-            // 文件、不受滚轮 scale_geometry 影响。三项都必须进指纹——漏一项
-            // 就是「改设置拿 same:true 永不生效」。
-            let (pcf_on, pcf_k1, pcf_k2) = {
+            // 文件、不受滚轮 scale_geometry 影响。四项（per_cand_font /
+            // hl_font_scale / 两比例）都必须进指纹——漏一项就是「改设置拿
+            // same:true 永不生效」。
+            // 【高亮跟随放大 2026-11-03】hl_font_scale：true=两档比例改为
+            // 跟随当前高亮项（高亮=first、其余=rest）；false=旧行为（钉
+            // 第 1 候选）。与 pcf 共用两档比例，必须同注入、同进指纹。
+            let (pcf_on, hl_on, pcf_k1, pcf_k2) = {
                 let a = &host.engine.config.appearance;
                 (
                     a.per_cand_font,
+                    a.hl_font_scale,
                     // 首选比例下限放宽到 0.5：虎娘新版权实测「首选=0.90×、
                     // 其余=0.667×」，要精确复刻就必须允许首选小于 1。
                     a.first_font_scale.clamp(0.5, 2.0),
@@ -579,10 +584,11 @@ pub fn dispatch(
                     return;
                 };
                 l.insert("per_cand_font".into(), serde_json::json!(pcf_on));
+                l.insert("hl_font_scale".into(), serde_json::json!(hl_on));
                 l.insert("cand_first_scale".into(), serde_json::json!(pcf_k1));
                 l.insert("cand_rest_scale".into(), serde_json::json!(pcf_k2));
             };
-            let pcf_fp = format!("|{pcf_on}|{pcf_k1:.3}|{pcf_k2:.3}");
+            let pcf_fp = format!("|{pcf_on}|{hl_on}|{pcf_k1:.3}|{pcf_k2:.3}");
             // 【SSF 皮肤 2026-12】kind=ssf → 位图皮肤：只传 cache_dir 路径
             // + 指纹（11MB 挂件教训：绝不内嵌大图字节），DLL 按需读盘。
             // anim 系列注入字段与 JSON 皮肤同形状（皮肤对象顶层）；
@@ -595,7 +601,8 @@ pub fn dispatch(
                     let anim_speed = host.engine.config.appearance.anim_speed;
                     let anim_flash = host.engine.config.appearance.anim_flash;
                     // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
-                    // 字段全部参与——DLL have_fp 命中即 {"same":true} 微载荷。
+                    // 字段全部参与（pcf_fp 含 per_cand_font/hl_font_scale/
+                    // 两比例）——DLL have_fp 命中即 {"same":true} 微载荷。
                     let fp = format!(
                         "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}{pcf_fp}",
                         host.engine.config.schema.current

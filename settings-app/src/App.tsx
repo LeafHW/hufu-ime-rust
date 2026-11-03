@@ -6,6 +6,7 @@ import { AboutPage } from './pages/AboutPage';
 import { DonatePage } from './pages/DonatePage';
 import { Overview } from './pages/Overview';
 import { SkinStudio } from './pages/SkinStudio';
+import { MotionPage } from './pages/Motion';
 import { Sync } from './pages/Sync';
 import { SchemesPage } from './pages/Schemes';
 import { DataPage } from './pages/Data';
@@ -17,7 +18,7 @@ import { fallbackBootstrap, type Bootstrap, type Route, type ThemeMode } from '.
 import { getDirtyPages, subscribeDirty } from './dirtyGuard';
 import './styles/app.css';
 
-const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
+const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'motion', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
 
 /* 【2026-11-03】页面全部常驻挂载，切页只改 body[data-screen]。
    用 memo 包一层：切页/轮询引起的 App state 变化不再把 11 个页面整树重渲染，
@@ -28,6 +29,7 @@ const SchemesView = memo(SchemesPage);
 const InputView = memo(InputPage);
 const KeymapView = memo(KeymapPage);
 const SkinView = memo(SkinStudio);
+const MotionView = memo(MotionPage);
 const BuddyView = memo(BuddyPage);
 const SentenceView = memo(SentencePage);
 const DataView = memo(DataPage);
@@ -521,7 +523,10 @@ export default function App() {
             <KeymapView data={data} notify={notify} />
           </section>
           <section className="screen" id="s-skin">
-            <SkinView data={data} notify={notify} refresh={refresh} />
+            <SkinView data={data} notify={notify} refresh={refresh} navigate={navigate} />
+          </section>
+          <section className="screen" id="s-motion">
+            <MotionView data={data} notify={notify} navigate={navigate} />
           </section>
           <section className="screen" id="s-buddy">
             <BuddyView data={data} notify={notify} />

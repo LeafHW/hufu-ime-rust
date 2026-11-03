@@ -9,6 +9,7 @@ export const PAGE_TITLE: Record<Route, string> = {
   input: '输入',
   keymap: '键位编辑',
   skin: '皮肤工作室',
+  motion: '动效',
   buddy: '候选挂件',
   sentence: '整句模型',
   data: '数据与备份',
@@ -30,6 +31,7 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
     label: '外观',
     items: [
       { key: 'skin', label: '皮肤', icon: 'palette' },
+      { key: 'motion', label: '动效', icon: 'play' },
       { key: 'buddy', label: '挂件', icon: 'image' },
     ],
   },

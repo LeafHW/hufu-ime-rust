@@ -4,6 +4,7 @@ export type Route =
   | 'input'
   | 'keymap'
   | 'skin'
+  | 'motion'
   | 'buddy'
   | 'sentence'
   | 'data'
@@ -43,6 +44,8 @@ export interface Config {
     per_cand_font?: boolean;
     first_font_scale?: number;
     other_font_scale?: number;
+    /** 【2026-11-03】高亮跟随放大：逐候选字号跟随当前选中项（默认 false=旧行为）。 */
+    hl_font_scale?: boolean;
     skin?: string;
     skin_kind?: string;
     status_capsule?: boolean;
@@ -242,6 +245,7 @@ export const fallbackBootstrap: Bootstrap = {
       per_cand_font: true,
       first_font_scale: 1,
       other_font_scale: 0.7,
+      hl_font_scale: false,
       skin: 'hufu-moyan',
       skin_kind: 'json',
     },

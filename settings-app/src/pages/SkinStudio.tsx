@@ -10,48 +10,25 @@ import { Badge, PageHead, Slider, Switch } from '../components/ui';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
 
-/* 【2026-11-03 M5·动效预览】固定内部 token（fast 80ms）演示高亮滑动，
-   只受全局动效开关/速度影响——不向皮肤暴露任何参数。 */
-function MotionDemo({ speed, enabled }: { speed: number; enabled: boolean }) {
-  const [sel, setSel] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const timers = useRef<number[]>([]);
-  const clear = () => {
-    timers.current.forEach((t) => window.clearTimeout(t));
-    timers.current = [];
-  };
-  useEffect(() => clear, []);
-  const play = () => {
-    clear();
-    setPlaying(true);
-    setSel(0);
-    timers.current.push(window.setTimeout(() => setSel(1), 120));
-    timers.current.push(
-      window.setTimeout(() => {
-        setSel(0);
-        setPlaying(false);
-      }, 740),
-    );
-  };
-  const dur = enabled ? Math.max(0, 80 / Math.max(0.05, speed)) : 0;
-  return (
-    <div className="motion-demo">
-      <div className="md-rows" role="img" aria-label="候选窗高亮滑动预览">
-        <div
-          className="md-pill"
-          style={{ transform: `translateY(${sel * 26}px)`, transitionDuration: `${Math.round(dur)}ms` }}
-        />
-        {['我们', '我', '我军'].map((t, i) => (
-          <div key={t} className={`md-row${sel === i ? ' on' : ''}`}>
-            {i + 1}. {t}
-          </div>
-        ))}
-      </div>
-      <button type="button" className="btn sm outline" onClick={play} disabled={playing}>
-        {playing ? '播放中…' : '播放'}
-      </button>
-    </div>
+/** 跟随 body.light 的响应式浅色状态：预览背景默认值跟着主题走
+    （深色主题→「深色」、浅色主题→「浅色」），用户手动选过就按选择。 */
+function useBodyLight(): boolean {
+  const [light, setLight] = useState(
+    typeof document !== 'undefined' && document.body.classList.contains('light'),
   );
+  useEffect(() => {
+    const sync = () => setLight(document.body.classList.contains('light'));
+    sync();
+    const mo = new MutationObserver(sync);
+    mo.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    const mq = window.matchMedia('(prefers-color-scheme: light)');
+    mq.addEventListener?.('change', sync);
+    return () => {
+      mo.disconnect();
+      mq.removeEventListener?.('change', sync);
+    };
+  }, []);
+  return light;
 }
 
 const COLOR_LABELS: Record<string, string> = {
@@ -118,27 +95,33 @@ export function SkinStudio({
   data,
   notify,
   refresh,
+  navigate,
 }: {
   data: Bootstrap;
   notify: (msg: string) => void;
   refresh: () => Promise<Bootstrap>;
+  /** 跳到「动效」页（动效开关已统一收在那里）。 */
+  navigate: (r: import('../types').Route) => void;
 }) {
   const [selectedId, setSelectedId] = useState(data.skins.current);
   const [skin, setSkin] = useState<Skin | null>(data.skin);
   const [original, setOriginal] = useState<Skin | null>(data.skin);
   const [ab, setAb] = useState(false);
-  const [bg, setBg] = useState('wall');
+  /* 【2026-11-03】预览背景去掉「棋盘」，默认跟主题；用户手动选过记住本次会话。 */
+  const [bgChoice, setBgChoice] = useState<'dark' | 'light' | 'wall' | null>(null);
+  const lightTheme = useBodyLight();
+  const bg = bgChoice ?? (lightTheme ? 'light' : 'dark');
   const [search, setSearch] = useState('');
   /* 【皮肤列表分页签 2026-11-01】矢量/位图分组切换；初始跟当前皮肤类型。 */
   const [listTab, setListTab] = useState<'json' | 'ssf'>(data.skins.current_kind === 'ssf' ? 'ssf' : 'json');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [anim, setAnim] = useState(data.config.appearance?.anim !== false);
-  const [flash, setFlash] = useState(data.config.appearance?.anim_flash !== false);
-  /* 逐候选字号/动效速度：乐观值 + 防抖写（/api/config 读-改-写）。 */
+  /* 逐候选字号：乐观值 + 防抖写（/api/config 读-改-写）。
+     动效开关/速度/动效预览已迁到「动效」页，这里只留皮肤相关的字号强调。 */
   const [pcf, setPcf] = useState(data.config.appearance?.per_cand_font === true);
-  const [animPct, setAnimPct] = useState<number | null>(null);
+  /* 【2026-11-03】序号开关是全局 candidates.show_index（SSF 另有 per-skin 覆盖）。 */
+  const [showIndex, setShowIndex] = useState(data.config.candidates?.show_index !== false);
   const [firstPct, setFirstPct] = useState<number | null>(null);
   const [otherPct, setOtherPct] = useState<number | null>(null);
   const cfgDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -231,6 +214,10 @@ export function SkinStudio({
   const realCurrentMeta = data.skins.skins.find((s) => s.id === data.skins.current);
   const isSsf = currentMeta?.kind === 'ssf';
   const shownSkin = ab ? original : skin;
+  useEffect(() => {
+    setShowIndex(data.config.candidates?.show_index !== false);
+  }, [data.config.candidates?.show_index]);
+
   /* 逐候选字号（预览）：config 真值 + 乐观值合成。 */
   const pcfScales = {
     enabled: pcf,
@@ -438,13 +425,28 @@ export function SkinStudio({
     }
   };
 
+  /* 全局候选设置（candidates.*）的读-改-写：开关粒度小，失败回滚即可。 */
+  const writeCandidates = async (patch: Record<string, unknown>): Promise<void> => {
+    const r = await fetch('/api/config', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`读取配置失败（${r.status}）`);
+    const fresh = (await r.json()) as Record<string, unknown>;
+    const candidates = { ...(fresh.candidates as Record<string, unknown> | undefined), ...patch };
+    const p = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...fresh, candidates }),
+    });
+    const body = (await p.json().catch(() => ({}))) as { error?: string };
+    if (!p.ok) throw new Error(body.error || `保存失败（${p.status}）`);
+    await refresh();
+  };
+
   /* 滑杆防抖写：拖动过程中只在停手 400ms 后写一次（writeAppearance
      本身是读-改-写，避免拖动逐帧打 /api/config）。 */
   const scheduleCfg = (patch: Record<string, unknown>) => {
     if (cfgDebounce.current) clearTimeout(cfgDebounce.current);
     cfgDebounce.current = setTimeout(() => {
       void writeAppearance(patch).catch((e) => {
-        setAnimPct(null);
         setFirstPct(null);
         setOtherPct(null);
         setPcf(data.config.appearance?.per_cand_font === true);
@@ -522,6 +524,10 @@ export function SkinStudio({
           corner_radius: skin.layout.corner_radius ?? fresh.layout.corner_radius,
           candidate_spacing: skin.layout.candidate_spacing ?? fresh.layout.candidate_spacing,
           horizontal: skin.layout.horizontal ?? fresh.layout.horizontal,
+          /* 【2026-11-03】新增两个布局项必须同步进白名单，否则又是「UI 能改、
+             保存被丢弃」的假设置：候选窗总宽（0=自适应）与序号显示种类。 */
+          width: skin.layout.width ?? fresh.layout.width,
+          label_style: skin.layout.label_style ?? fresh.layout.label_style,
         },
       };
       await saveSkin(merged, { select: false });
@@ -865,7 +871,6 @@ export function SkinStudio({
             <div className="seg">
               {(
                 [
-                  ['board', '棋盘'],
                   ['dark', '深色'],
                   ['light', '浅色'],
                   ['wall', '壁纸'],
@@ -875,7 +880,7 @@ export function SkinStudio({
                   key={key}
                   type="button"
                   className={`sg${bg === key ? ' on' : ''}`}
-                  onClick={() => setBg(key)}
+                  onClick={() => setBgChoice(key)}
                 >
                   {label}
                 </button>
@@ -966,7 +971,17 @@ export function SkinStudio({
               <div className="skin-empty">读取皮肤中…</div>
             ) : (
               <div className="cand-wrap">
-                <Candidate skin={shownSkin} size="lg" ab={ab} fontScales={pcfScales} />
+                <Candidate
+                  skin={shownSkin}
+                  size="lg"
+                  ab={ab}
+                  fontScales={pcfScales}
+                  width={
+                    Number(skin?.layout?.width) > 0
+                      ? Math.min(300, Math.max(150, Math.round(Number(skin?.layout?.width))))
+                      : undefined
+                  }
+                />
               </div>
             )}
           </div>
@@ -1141,30 +1156,13 @@ export function SkinStudio({
                 <Icon name="chev-down" className="icon chev" />
                 全局 · 候选窗
               </div>
-              <div className="row-line"><span className="lab">候选窗动效</span><Switch on={anim} title="appearance.anim" onChange={(v) => { setAnim(v); void writeAppearance({ anim: v }).catch((e) => { setAnim(!v); notify(`保存失败：${(e as Error).message}`); }); }} /></div>
-              <div className="row-line"><span className="lab">选重暂留</span><Switch on={flash} title="appearance.anim_flash" onChange={(v) => { setFlash(v); void writeAppearance({ anim_flash: v }).catch((e) => { setFlash(!v); notify(`保存失败：${(e as Error).message}`); }); }} /></div>
+              {/* 【2026-11-03】候选窗动效总开关/速度/选重暂留/动效预览统一迁到「动效」页；
+                  皮肤页只保留与皮肤本身相关的字号强调。 */}
               <div className="row-line">
-                <span className="lab">动效速度</span>
-                <Slider
-                  value={animPct ?? Math.round((data.config.appearance?.anim_speed ?? 1) * 100)}
-                  min={0}
-                  max={200}
-                  step={5}
-                  width={104}
-                  label="动效速度"
-                  onChange={(v) => {
-                    setAnimPct(v);
-                    scheduleCfg({ anim_speed: v / 100 });
-                  }}
-                />
-                <span className="val">{(animPct ?? Math.round((data.config.appearance?.anim_speed ?? 1) * 100))}%</span>
-              </div>
-              <div className="row-line">
-                <span className="lab" title="固定内部节奏（fast 80ms），仅随上面的动效开关/速度变化">动效预览</span>
-                <MotionDemo
-                  speed={(animPct ?? Math.round((data.config.appearance?.anim_speed ?? 1) * 100)) / 100}
-                  enabled={anim}
-                />
+                <span className="lab" title="候选窗动效、动效速度、选重暂留、高亮跟随放大都在「动效」页">动效设置</span>
+                <button type="button" className="link-more" onClick={() => navigate('motion')}>
+                  去「动效」页调整 →
+                </button>
               </div>
               <div className="row-line">
                 <span className="lab" title="开：第 1 候选按其比例放大、其余候选按其比例缩小；关：全页同一字号（默认）">首选放大 / 其余缩小</span>
@@ -1330,6 +1328,61 @@ export function SkinStudio({
                     label="候选间距"
                   />
                   <span className="val">{Number(skin?.layout?.candidate_spacing) || 6} px</span>
+                </div>
+              </div>
+              <div className="row-line">
+                <span className="lab" title="候选窗总宽（px）；0=按候选内容自适应">候选宽度</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Slider
+                    value={Math.round(Number(skin?.layout?.width) || 0)}
+                    min={0}
+                    max={600}
+                    step={10}
+                    width={70}
+                    onChange={(v) => patchLayout('width', v)}
+                    label="候选宽度"
+                    suffix="px"
+                  />
+                  <span className="val">
+                    {Number(skin?.layout?.width) > 0 ? `${Math.round(Number(skin?.layout?.width))} px` : '自适应'}
+                  </span>
+                </div>
+              </div>
+              <div className="row-line">
+                <span className="lab" title="候选词前是否显示序号（全局设置，矢量皮肤共用；SSF 可在其专属设置里覆盖）">序号开关</span>
+                <Switch
+                  on={showIndex}
+                  title="candidates.show_index"
+                  onChange={(v) => {
+                    setShowIndex(v);
+                    void writeCandidates({ show_index: v }).catch((e) => {
+                      setShowIndex(!v);
+                      notify(`保存失败：${(e as Error).message}`);
+                    });
+                  }}
+                />
+              </div>
+              <div className="row-line">
+                <span className="lab" title="序号的字形样式：阿拉伯数字 / 中文数字 / 罗马数字；需要先打开上面的「序号开关」">序号显示种类</span>
+                <div className="seg" style={{ opacity: showIndex ? 1 : 0.45 }}>
+                  {(
+                    [
+                      ['digit', '数字'],
+                      ['zh', '中文'],
+                      ['roman', '罗马'],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`sg${(skin?.layout?.label_style || 'digit') === key ? ' on' : ''}`}
+                      disabled={!showIndex}
+                      title={showIndex ? `序号显示为${label}` : '先打开「序号开关」'}
+                      onClick={() => patchLayout('label_style', key)}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
             </div>

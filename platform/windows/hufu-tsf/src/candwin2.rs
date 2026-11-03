@@ -3965,7 +3965,19 @@ impl CandidateWindowV2 {
             .or_else(|| skin.get("layout").and_then(|l| l.get("per_cand_font")))
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
-        let (k_first, k_rest) = if pcf_on {
+        // 【高亮跟随放大 2026-11-03】hl_font_scale=true：两档字号跟随当前
+        // 高亮项（高亮=first、其余=rest），不再钉第 1 候选。只做静态映射
+        // ——切换瞬间换档，不做逐帧字号补间（2026-10-29 卡顿教训全撤）；
+        // 高亮胶囊自身的滑动动效走 hl_anim，与此无关。默认 false=老配置/
+        // 老皮肤逐像素不变。
+        let hl_on = skin
+            .pointer("/skin/layout/hl_font_scale")
+            .or_else(|| skin.get("layout").and_then(|l| l.get("hl_font_scale")))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        // 任一开关开 → 两档比例参与（只开高亮模式也能用 first/other 比例）；
+        // 都关 → k_first=k_rest=1.0，下游逐像素等价的旧行为。
+        let (k_first, k_rest) = if pcf_on || hl_on {
             (
                 layout_f(skin, "cand_first_scale", 1.0).clamp(0.5, 2.0),
                 layout_f(skin, "cand_rest_scale", 1.0).clamp(0.5, 1.0),
@@ -3973,9 +3985,17 @@ impl CandidateWindowV2 {
         } else {
             (1.0, 1.0)
         };
-        // 【逐候选字号 2026-10】放大钉首选(i==0)/其余缩小。用户拍板
+        // 【高亮跟随放大 2026-11-03】放大档所属下标：hl 模式=当前选中项
+        //（selected 是本渲染函数的参数，钳位防越界/空页）；否则=第 1 候选
+        //（旧行为）。下方 k_of / 字宽 / 行槽 / 光学补偿 / 字体档全部同源。
+        let big_i = if hl_on {
+            selected.min(cands.len().saturating_sub(1))
+        } else {
+            0
+        };
+        // 【逐候选字号 2026-10】放大行=big_i、其余缩小。用户拍板
         // 回退 2026-10-29：放大跟随选中+换槽缓动实测卡顿，全撤。
-        let k_of = |i: usize| if i == 0 { k_first } else { k_rest };
+        let k_of = |i: usize| if i == big_i { k_first } else { k_rest };
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 6.0);
@@ -4398,9 +4418,10 @@ impl CandidateWindowV2 {
             let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
             let mut diff_ws: Vec<(f32, f32)> = Vec::new();
             for (i, (t, c)) in cands.iter().enumerate() {
-                // 【逐候选字号 2026-10】首选(i==0)用大字号字面宽度，其余小档
+                // 【逐候选字号 2026-10】放大行(big_i)用大字号字面宽度，
+                // 其余小档；hl 模式下 big_i=当前高亮项（2026-11-03）。
                 let (tf_i, tfs_i): (&Option<IDWriteTextFormat>, &Option<IDWriteTextFormat>) =
-                    if i == 0 {
+                    if i == big_i {
                         (&tf_first, &tf_first_small)
                     } else {
                         (&tf, &tf_small)
@@ -4695,7 +4716,9 @@ impl CandidateWindowV2 {
         let row_hs: Vec<f32> = (0..cands.len().min(10))
             .map(|i| {
                 if ssf.is_some() {
-                    (if i == 0 { row_user_first } else { row_user }).max(1.0)
+                    // 【高亮跟随放大 2026-11-03】放大行 big_i（hl 模式=选中
+                    // 项、否则=第 1 候选）：SSF 源域行槽同源跟随。
+                    (if i == big_i { row_user_first } else { row_user }).max(1.0)
                 } else {
                     let k = k_of(i);
                     let lh = em * k + layout_f(skin, "line_spacing", 3.0) + 5.0;
@@ -5931,12 +5954,12 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
-                            // 【逐候选字号】首选光学补偿走 dy_first
-                            let dy_i = if i == 0 { dy_first } else { dy };
+                            // 【逐候选字号】放大行(big_i)光学补偿走 dy_first
+                            let dy_i = if i == big_i { dy_first } else { dy };
                             let (tf_i, tfs_i): (
                                 &Option<IDWriteTextFormat>,
                                 &Option<IDWriteTextFormat>,
-                            ) = if i == 0 {
+                            ) = if i == big_i {
                                 (&tf_first, &tf_first_small)
                             } else {
                                 (&tf, &tf_small)
@@ -6146,12 +6169,12 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
-                            // 【逐候选字号】首选光学补偿走 dy_first
-                            let dy_i = if i == 0 { dy_first } else { dy };
+                            // 【逐候选字号】放大行(big_i)光学补偿走 dy_first
+                            let dy_i = if i == big_i { dy_first } else { dy };
                             let (tf_i, tfs_i): (
                                 &Option<IDWriteTextFormat>,
                                 &Option<IDWriteTextFormat>,
-                            ) = if i == 0 {
+                            ) = if i == big_i {
                                 (&tf_first, &tf_first_small)
                             } else {
                                 (&tf, &tf_small)

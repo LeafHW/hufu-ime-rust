@@ -1013,6 +1013,7 @@ html.anim-paused .sync-face.is-joined:after{animation-play-state:paused!importan
 /* 概览/关于/打赏等页面按路由各自成节（滚动旅程撤掉后 about/donate 不再共用 #s-other） */
 body[data-screen="about"] #s-about{display:block}
 body[data-screen="donate"] #s-donate{display:block}
+body[data-screen="motion"] #s-motion{display:block}
 
 /* 【2026-11-03 可访问性】全局尊重系统“减少动画”（此前只覆盖同步页） */
 @media (prefers-reduced-motion: reduce){
@@ -1032,3 +1033,52 @@ body[data-screen="donate"] #s-donate{display:block}
 .os-list {
   overscroll-behavior: contain;
 }
+
+/* 【2026-11-03 浅色主题】矢量/位图皮肤缩略图：深色模式下是暗色渐变小块，
+   浅色模式下如果还沿用深色底，整列会变成一排黑方块（用户截图实锤）。
+   这里按主题给浅色镜面：暖米/青灰/藕紫/纸黄，保持与皮肤分组色的对应关系。 */
+body.light .skin-thumb{
+  background:linear-gradient(135deg,#f7f1e4,#ece1cc 62%,#dcc9a6);
+  border-color:rgba(120,90,40,.16);
+  box-shadow:0 1px 2px rgba(90,70,30,.08) inset;
+}
+body.light .skin-thumb:after{background:#b8862f;box-shadow:0 0 0 1px rgba(184,134,47,.18)}
+body.light .skin-thumb.t2{background:linear-gradient(135deg,#eaf1ec,#dbe7df 60%,#c3d5c9)}
+body.light .skin-thumb.t2:after{background:#5f8b76}
+body.light .skin-thumb.t3{background:linear-gradient(135deg,#efeaf7,#e3dcf0 60%,#cdc3e4)}
+body.light .skin-thumb.t3:after{background:#7b68b8}
+body.light .skin-thumb.ssf{background:linear-gradient(135deg,#f8efdc,#eee0c4 60%,#e0c89e)}
+body.light .skin-thumb.ssf:after{background:#a8741a}
+
+/* ── 【2026-11-03】滑杆单击精确输入：浮动输入气泡 ─────────────────────
+   单击滑杆（按下后不移动就松手）弹出，拖动仍按原逻辑调值；
+   输入框吃掉按键，避免 Ctrl+K/空格触发页面级快捷键。 */
+.slider{cursor:pointer}
+.slider.editing{z-index:40}
+.slider-edit{
+  position:absolute;left:50%;bottom:calc(100% + 10px);transform:translateX(-50%);
+  display:flex;align-items:center;gap:2px;padding:4px 8px;z-index:70;white-space:nowrap;
+  background:var(--surface);border:1px solid rgba(231,183,92,.55);border-radius:7px;
+  box-shadow:0 12px 28px rgba(0,0,0,.4),0 0 0 1px rgba(0,0,0,.18);
+  cursor:default;
+}
+.slider-edit:after{
+  content:"";position:absolute;left:50%;top:100%;transform:translateX(-50%);
+  border:5px solid transparent;border-top-color:rgba(231,183,92,.55);
+}
+.slider-edit input{
+  width:54px;padding:0;border:0;outline:none;background:transparent;color:var(--text);
+  font:600 12.5px/1.25 Consolas,'Cascadia Mono',ui-monospace,monospace;text-align:right;
+  font-variant-numeric:tabular-nums;
+}
+.slider-edit em{font-style:normal;font-size:11px;color:var(--text3);margin-left:1px}
+body.light .slider-edit{box-shadow:0 12px 28px rgba(60,45,20,.2),0 0 0 1px rgba(90,70,30,.12)}
+
+/* 【2026-11-03】分段控件选中态在浅色下此前几乎看不出来（surface2≈bg），
+   加金色细描边，让「预览背景/序号显示种类」一眼看出选中项。 */
+.seg .sg.on{box-shadow:0 0 0 1px rgba(231,183,92,.35) inset}
+body.light .seg .sg.on{box-shadow:0 0 0 1px rgba(168,116,26,.4) inset;background:#fffdf7}
+/* 皮肤列表的分组页签另有金底高亮，保持原样（此处 specificity 更低，不会覆盖） */
+
+/* 滑杆：拖动时不选中文字/不触发触屏滚动 */
+.slider{user-select:none;touch-action:none}
