@@ -4704,3 +4704,26 @@ body.site-hidden *::before,
 body.site-hidden *::after {
   animation-play-state: paused !important;
 }
+
+/* ─────────────────────────────────────────────────────────────
+   【2026-11-03】主题切换：从明暗按钮做圆形扩散（与设置页同款）
+   View Transition root 层实现。注意 VT 伪元素选择器不能写成
+   `html.theme-vt ::view-transition-new(root)`（带空格），那样会静默
+   匹配不到、退回默认 250ms 交叉淡入（设置页踩过这个坑）。
+   ───────────────────────────────────────────────────────────── */
+html.theme-vt::view-transition-old(root),
+html.theme-vt::view-transition-new(root){
+  animation: none;
+  mix-blend-mode: normal;
+}
+html.theme-vt::view-transition-new(root){
+  z-index: 2;
+  clip-path: circle(0px at var(--theme-x, 90vw) var(--theme-y, 2.5rem));
+  animation: themeReveal .56s cubic-bezier(.33,.68,.3,1) forwards;
+}
+@keyframes themeReveal{
+  to{ clip-path: circle(var(--theme-r, 120vmax) at var(--theme-x, 90vw) var(--theme-y, 2.5rem)); }
+}
+@media (prefers-reduced-motion: reduce){
+  html.theme-vt::view-transition-new(root){ animation: none !important; clip-path: none !important; }
+}

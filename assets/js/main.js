@@ -48,14 +48,41 @@
 
   applyTheme(currentTheme());
 
+  /* ---------- Theme switch: circular reveal from the toggle ----------
+     与设置页同一套：View Transition root 层 + clip-path 圆扩散。
+     半径按按钮中心到四角的最远距离算，避免用 120vmax 提前铺满。 */
+  var themeVtBusy = false;
+  function themeReveal(fromButton) {
+    var r = fromButton.getBoundingClientRect();
+    var x = r.left + r.width / 2;
+    var y = r.top + r.height / 2;
+    var far = Math.max(
+      Math.sqrt(x * x + y * y),
+      Math.sqrt((window.innerWidth - x) * (window.innerWidth - x) + y * y),
+      Math.sqrt(x * x + (window.innerHeight - y) * (window.innerHeight - y)),
+      Math.sqrt((window.innerWidth - x) * (window.innerWidth - x) + (window.innerHeight - y) * (window.innerHeight - y))
+    ) + 28;
+    root.style.setProperty('--theme-x', x.toFixed(1) + 'px');
+    root.style.setProperty('--theme-y', y.toFixed(1) + 'px');
+    root.style.setProperty('--theme-r', far.toFixed(1) + 'px');
+  }
+
   if (themeToggle) {
     themeToggle.addEventListener('click', function () {
       var next = currentTheme() === 'dark' ? 'light' : 'dark';
-      if (!reduceMotion && !weakDevice && document.startViewTransition) {
-        document.startViewTransition(function () { setTheme(next); });
-      } else {
+      if (reduceMotion || weakDevice || !document.startViewTransition || themeVtBusy) {
         setTheme(next);
+        return;
       }
+      themeVtBusy = true;
+      themeReveal(themeToggle);
+      root.classList.add('theme-vt');
+      var vt = document.startViewTransition(function () { setTheme(next); });
+      var done = function () {
+        themeVtBusy = false;
+        root.classList.remove('theme-vt');
+      };
+      vt.finished.then(done, done);
     });
   }
 
