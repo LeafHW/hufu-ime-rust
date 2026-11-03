@@ -447,7 +447,10 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
                     (*app).frame_bg = bg;
                     (*app).frame_side = side;
                 }
-                apply_window_theme(hwnd, parts[2] != "light", parse_hex_color(parts[0]));
+                /* 描边不再跟主题色：1px DWM 描边在主题切换时会立刻换成新色，
+                   页面圆扩散还没铺到窗边，就先出现一圈白/黑边把窗口包住。
+                   统一设 NONE，让页面自己的 .window 边框（会跟着扩散被裁）负责边缘。 */
+                apply_window_theme(hwnd, parts[2] != "light", None);
                 RedrawWindow(hwnd, null(), 0, 0x0001 | 0x0020 | 0x0080);
                 (*app).log(&format!("frame theme: {rest}"));
             }
