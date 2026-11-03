@@ -23,6 +23,8 @@ param(
 
     [switch]$SkipPush,
 
+    [switch]$PushCode,
+
     [switch]$PublishSite,
 
     [switch]$DryRun,
@@ -94,15 +96,22 @@ Write-Step "版本 $Tag · $ExeName · $SizeMB MB · sha256 $($Sha256.Substring(
 # 1. 推代码与 tag 到 Gitee 镜像仓（失败不阻断）
 # ---------------------------------------------------------------------------
 if (-not $SkipPush) {
-    Write-Step "推送当前分支 + tags 到 Gitee"
+    Write-Step "推送 tags 到 Gitee"
     if ($DryRun) {
         Write-Host "  (DryRun) 跳过实际 push"
     } else {
         $env:GIT_TERMINAL_PROMPT = '0'
         $remote = "https://${Owner}:$Token@gitee.com/$Owner/$Repo.git"
-        # 推「当前分支」到 Gitee 默认分支 master：本机 master 常落后工作分支
-        # （2026-11-03 实测落后 210 个提交），推本地 master 会把镜像打回旧版。
-        $r = Invoke-Native 'git' @('-C', $RepoDir, '-c', 'credential.helper=', '-c', 'http.extraheader=', 'push', $remote, 'HEAD:refs/heads/master', '--tags')
+        # 默认只推 tags：Release / 附件 / 清单都不依赖分支。
+        # Gitee master 与工作分支历史上已分叉（2026-11-04 实测：Gitee master 带 3 个
+        # GitHub-master 的文档提交，不在工作分支上），整仓镜像必须显式 -PushCode，
+        # 且只能 force 覆盖，否则永远 non-fast-forward。
+        $pushArgs = @('-C', $RepoDir, '-c', 'credential.helper=', '-c', 'http.extraheader=', 'push', $remote, '--tags', "+refs/tags/$Tag")
+        if ($PushCode) {
+            Write-Warn2 "PushCode：强制把当前分支覆盖到 Gitee master"
+            $pushArgs += '+HEAD:refs/heads/master'
+        }
+        $r = Invoke-Native 'git' $pushArgs
         if ($r.Code -eq 0) {
             Write-Ok "push 完成"
         } else {
@@ -121,6 +130,10 @@ try {
 } catch {
     $Release = $null
 }
+# Gitee 对「tag 存在但 release 不存在」会返回 HTTP 200 + 正文 null，
+# PowerShell 可能拿到空对象 → 必须校验 id，否则后面 attach_files 拼出
+# /releases//attach_files 直接 405（2026-11-04 v1.9.9.1 实测）。
+if ($Release -and -not $Release.id) { $Release = $null }
 
 if (-not $Release) {
     if ($DryRun) {
