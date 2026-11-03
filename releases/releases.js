@@ -2,7 +2,7 @@
   'use strict';
 
   var API = 'https://api.github.com/repos/LeafHW/hufu-ime-rust/releases?per_page=100';
-  var CACHE_KEY = 'hufu-releases-v1';
+  var CACHE_KEY = 'hufu-releases-v2';
   var CACHE_TTL = 30 * 60 * 1000;
 
   var latestSlot = document.getElementById('latest-slot');
@@ -378,10 +378,6 @@
     }).catch(function (err) {
       if (timer) clearTimeout(timer);
       setBusy(false);
-      if (cached) {
-        setStatus('GitHub 暂时不可达，显示上次缓存', '显示缓存版本');
-        return;
-      }
       // Fallback: the site hosts the most recent snapshot, so the page still
       // works on networks where api.github.com is blocked or rate-limited.
       fetch('./cache.json', { cache: 'no-store' }).then(function (res) {
@@ -393,6 +389,11 @@
         var when = payload && payload.time ? formatDate(payload.time) : '';
         setStatus('GitHub API 不可达 · 显示最近同步快照', when ? '快照 ' + when : '最近同步');
       }).catch(function () {
+        if (cached) {
+          render(cached);
+          setStatus('GitHub API 不可达 · 显示上次缓存', '显示缓存版本');
+          return;
+        }
         renderError(err && err.name === 'AbortError' ? '请求 GitHub 超时。' : (err && err.message) || '网络请求失败。');
       });
     });
