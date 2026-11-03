@@ -327,6 +327,17 @@ extern "system" fn hufu_test_pad_dump() -> i32 {
 
 /// 测试钩子：按【当前生产皮肤】渲染候选窗一帧——离屏回读像素写 BMP
 /// + 可选保持显示（hold_ms>0 时窗口停留供实机观察）。皮肤载荷经 ipc
+/// 【2026-11-03 视觉验收】打开加词/加权窗（mode=1 加权），供截图自验。
+#[no_mangle]
+extern "system" fn hufu_test_addword(mode: u32) -> i32 {
+    if mode == 1 {
+        crate::addword::open_weight();
+    } else {
+        crate::addword::open();
+    }
+    1
+}
+
 /// 从 hufu-server 拉当前选中皮肤（SSF/JSON 双形态原样），不改材质不覆
 /// 盖任何字段——与真实打字路径同一条 show() 代码。BMP 落
 /// %TEMP%\hufu-skin-dump.bmp（32bpp BI_RGB，行自底向上）。返回 1=通。
@@ -416,6 +427,12 @@ extern "system" fn hufu_test_skin_dump(hold_ms: u32) -> i32 {
     // 实时框左缘 1-2px 竖笔画疑为编码字符越窗，空串对照可分离。
     let dump_code = std::env::var("HUFU_SKIN_DUMP_CODE").unwrap_or_else(|_| "jd".to_string());
     w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
+    // 【2026-11-03 M4 自验】HUFU_LAYOUT_STATS=1 时同窗同内容再渲一帧：
+    // 第二帧应全部命中文本布局/测量缓存（trace 里 created 不变、hit 增加）。
+    // 仅取证环境生效，生产路径零影响。
+    if std::env::var("HUFU_LAYOUT_STATS").is_ok() {
+        w.show(&cands, &dump_code, &skin, Some(&anchor), 0);
+    }
     // 【出图提速 2026-10-16】readback 模式下 size_anim/chrome_override
     // 在 show() 内即被清（首帧=稳态帧，无动效插值）——900ms 长等是
     // BMP 头错位时期的误判残留。

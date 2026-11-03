@@ -10,6 +10,50 @@ import { Badge, PageHead, Slider, Switch } from '../components/ui';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
 
+/* 【2026-11-03 M5·动效预览】固定内部 token（fast 80ms）演示高亮滑动，
+   只受全局动效开关/速度影响——不向皮肤暴露任何参数。 */
+function MotionDemo({ speed, enabled }: { speed: number; enabled: boolean }) {
+  const [sel, setSel] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const timers = useRef<number[]>([]);
+  const clear = () => {
+    timers.current.forEach((t) => window.clearTimeout(t));
+    timers.current = [];
+  };
+  useEffect(() => clear, []);
+  const play = () => {
+    clear();
+    setPlaying(true);
+    setSel(0);
+    timers.current.push(window.setTimeout(() => setSel(1), 120));
+    timers.current.push(
+      window.setTimeout(() => {
+        setSel(0);
+        setPlaying(false);
+      }, 740),
+    );
+  };
+  const dur = enabled ? Math.max(0, 80 / Math.max(0.05, speed)) : 0;
+  return (
+    <div className="motion-demo">
+      <div className="md-rows" role="img" aria-label="候选窗高亮滑动预览">
+        <div
+          className="md-pill"
+          style={{ transform: `translateY(${sel * 26}px)`, transitionDuration: `${Math.round(dur)}ms` }}
+        />
+        {['我们', '我', '我军'].map((t, i) => (
+          <div key={t} className={`md-row${sel === i ? ' on' : ''}`}>
+            {i + 1}. {t}
+          </div>
+        ))}
+      </div>
+      <button type="button" className="btn sm outline" onClick={play} disabled={playing}>
+        {playing ? '播放中…' : '播放'}
+      </button>
+    </div>
+  );
+}
+
 const COLOR_LABELS: Record<string, string> = {
   back_color: '窗底色',
   border_color: '边框',
@@ -1114,6 +1158,13 @@ export function SkinStudio({
                   }}
                 />
                 <span className="val">{(animPct ?? Math.round((data.config.appearance?.anim_speed ?? 1) * 100))}%</span>
+              </div>
+              <div className="row-line">
+                <span className="lab" title="固定内部节奏（fast 80ms），仅随上面的动效开关/速度变化">动效预览</span>
+                <MotionDemo
+                  speed={(animPct ?? Math.round((data.config.appearance?.anim_speed ?? 1) * 100)) / 100}
+                  enabled={anim}
+                />
               </div>
               <div className="row-line">
                 <span className="lab" title="开：第 1 候选按其比例放大、其余候选按其比例缩小；关：全页同一字号（默认）">首选放大 / 其余缩小</span>

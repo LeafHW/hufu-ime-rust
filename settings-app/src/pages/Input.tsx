@@ -438,6 +438,41 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
     }
   };
   const [tab, setTab] = useState<InputTab>(tabFromHash);
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  const [tabInk, setTabInk] = useState({ x: 0, w: 0 });
+  const [slideDir, setSlideDir] = useState(0);
+  const slideTimer = useRef(0);
+  const TAB_ORDER: InputTab[] = ['switch', 'input', 'candidates', 'sound', 'advanced'];
+  const switchTab = (key: InputTab) => {
+    if (key === tab) return;
+    const from = TAB_ORDER.indexOf(tab);
+    const to = TAB_ORDER.indexOf(key);
+    setSlideDir(to > from ? 1 : -1);
+    setTab(key);
+    try {
+      history.replaceState(null, '', `#input/${key}`);
+    } catch {
+      /* file:// */
+    }
+    window.clearTimeout(slideTimer.current);
+    slideTimer.current = window.setTimeout(() => setSlideDir(0), 380);
+  };
+  useEffect(() => () => window.clearTimeout(slideTimer.current), []);
+  useEffect(() => {
+    const root = tabsRef.current;
+    if (!root) return;
+    const sync = () => {
+      const active = root.querySelector<HTMLElement>('.ip-tab.on');
+      if (!active) return;
+      const rr = root.getBoundingClientRect();
+      const ar = active.getBoundingClientRect();
+      setTabInk({ x: ar.left - rr.left + root.scrollLeft, w: ar.width });
+    };
+    sync();
+    const ro = new ResizeObserver(sync);
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [tab]);
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(saved), [draft, saved]);
   useEffect(() => {
@@ -801,7 +836,26 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
         </span>
       </div>
 
-      <div className="ip-tabs" role="tablist" aria-label="输入设置分类">
+      <div
+        className="ip-tabs"
+        role="tablist"
+        aria-label="输入设置分类"
+        ref={tabsRef}
+        onKeyDown={(e) => {
+          const i = TAB_ORDER.indexOf(tab);
+          if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+            e.preventDefault();
+            const n = e.key === 'ArrowRight' ? (i + 1) % TAB_ORDER.length : (i - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+            switchTab(TAB_ORDER[n]);
+          } else if (e.key === 'Home') {
+            e.preventDefault();
+            switchTab(TAB_ORDER[0]);
+          } else if (e.key === 'End') {
+            e.preventDefault();
+            switchTab(TAB_ORDER[TAB_ORDER.length - 1]);
+          }
+        }}
+      >
         {([
           ['switch', '切换', '中英切换与 Caps'],
           ['input', '编码', '编码、上屏与混输'],
@@ -816,21 +870,23 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
             aria-selected={tab === key}
             className={`ip-tab${tab === key ? ' on' : ''}`}
             title={hint}
-            onClick={() => {
-              setTab(key);
-              try {
-                history.replaceState(null, '', `#input/${key}`);
-              } catch {
-                /* file:// */
-              }
-            }}
+            onClick={() => switchTab(key)}
           >
             {label}
           </button>
         ))}
+        <span
+          className="ip-tab-ink"
+          aria-hidden="true"
+          style={{ transform: `translateX(${tabInk.x}px)`, width: tabInk.w }}
+        />
       </div>
 
-      <div className="ip-grid" data-tab={tab}>
+      <div
+        className="ip-grid"
+        data-tab={tab}
+        data-slide={slideDir === 1 ? 'right' : slideDir === -1 ? 'left' : undefined}
+      >
         <div className="ip-col">
           <Card
             category="switch"

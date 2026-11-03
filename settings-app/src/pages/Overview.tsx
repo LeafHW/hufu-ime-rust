@@ -10,6 +10,17 @@ import { SEARCH_ITEMS } from './searchIndex';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
 
+/** 中文长词按“字符顺序子序列”兜底：候选字号可命中“候选窗…字号”。 */
+function isSubsequence(needle: string, hay: string): boolean {
+  let i = 0;
+  for (const ch of hay) {
+    if (ch === needle[i]) i += 1;
+    if (i === needle.length) return true;
+  }
+  return needle.length === 0;
+}
+
+
 
 
 function formatTime(ts: number): string {
@@ -76,10 +87,21 @@ export function Overview({
   };
 
   const results = query.trim()
-    ? SEARCH_ITEMS.filter((item) => {
-        const q = query.trim().toLowerCase();
-        return `${item.title} ${item.desc} ${item.group} ${item.keys}`.toLowerCase().includes(q);
-      })
+    ? (() => {
+        const qRaw = query.trim().toLowerCase();
+        const tokens = qRaw.split(/\s+/).filter(Boolean);
+        const compact = qRaw.replace(/[\s·:：/、，,。.\-—]+/g, '');
+        const hit = (t: string, hay: string) => {
+          if (hay.includes(t)) return true;
+          if (t.length >= 3 && /[㐀-鿿]/.test(t)) return isSubsequence(t, hay);
+          return false;
+        };
+        return SEARCH_ITEMS.filter((item) => {
+          const hay = `${item.title} ${item.desc} ${item.group} ${item.keys}`.toLowerCase();
+          if (tokens.every((t) => hit(t, hay))) return true;
+          return hay.replace(/[\s·:：/、，,。.\-—]+/g, '').includes(compact);
+        });
+      })()
     : SEARCH_ITEMS.slice(0, 6);
 
   const focusSearch = () => {
@@ -285,7 +307,7 @@ export function Overview({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && results[0]) navigate(results[0].route);
+                if (e.key === 'Enter' && results[0]) navigate(results[0].route, results[0].sub);
                 if (e.key === 'Escape') setQuery('');
               }}
               placeholder="搜索：中英切换、候选数、键位、皮肤、整句、同步…"

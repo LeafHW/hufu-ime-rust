@@ -156,12 +156,16 @@ fn write_response(stream: &mut TcpStream, resp: &Response) {
 }
 
 /// 阻塞运行；handler 返回 Response。
-pub fn serve<F>(addr: &str, handler: Arc<F>) -> std::io::Result<()>
+/// 【2026-11-02 P2】改为接**已 bind 的 listener**：调用方在端口探测时
+/// 一次 bind 成功就把监听器交进来，消除“探测 bind→drop→serve 再 bind”
+/// 的 TOCTOU，也避免探测成功但真正 bind 失败时的静默必败。
+pub fn serve<F>(listener: TcpListener, handler: Arc<F>) -> std::io::Result<()>
 where
     F: Fn(&Request) -> Response + Send + Sync + 'static,
 {
-    let listener = TcpListener::bind(addr)?;
-    eprintln!("HuFu server listening on http://{addr}");
+    if let Ok(addr) = listener.local_addr() {
+        eprintln!("HuFu server listening on http://{addr}");
+    }
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,

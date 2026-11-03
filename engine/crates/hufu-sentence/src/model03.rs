@@ -121,6 +121,15 @@ impl FivegramModel {
         if index_stride == 0 || vocab_offset + vocab_bytes > d.len() {
             return Err(bad("词表区间"));
         }
+        // 【P0-3 2026-11-03】vocab_count 只从头部读、未与 vocab_bytes
+        // 关联：畸形/截断模型可声明 0xFFFFFFFF → with_capacity 申请约
+        // 20~40GB → handle_alloc_error abort 整个 server（输入法中断）。
+        // 每条词表记录至少 2B 长度 + 2×qbytes 概率，按字节区间封顶。
+        let min_entry = 2usize + 2 * qbytes;
+        let max_vocab = (vocab_bytes / min_entry).min(1_000_000).max(1);
+        if vocab_count == 0 || vocab_count > max_vocab {
+            return Err(bad("词表数量越界"));
+        }
         let mut dirs: [Vec<Bucket>; 4] = Default::default();
         let mut quant: [Quant; 5] = [Quant { pmin: 0.0, pstep: 0.0, bmin: 0.0, bstep: 0.0 }; 5];
         for o in 0..4 {
@@ -134,10 +143,18 @@ impl FivegramModel {
                 let p = dir_off + b * BUCKET_META;
                 // p+0..16 是格式里的 blocks_offset：当前实现靠 index_offset/index_count/block_count
                 // 定位，用不到，故不读进结构体（字段已删，格式说明见文件头）。
+                let io = rd_u64(d, p + 16);
+                let ic = rd_u32(d, p + 24) as usize;
+                let bc = rd_u32(d, p + 28) as usize;
+                // 【P0-3 补充】计数不得超过文件本身，防止后续按
+                // index_count/block_count 做无界分配。
+                if io as usize > d.len() || ic > d.len() || bc > d.len() {
+                    return Err(bad("bucket 计数越界"));
+                }
                 v.push(Bucket {
-                    index_offset: rd_u64(d, p + 16),
-                    index_count: rd_u32(d, p + 24),
-                    block_count: rd_u32(d, p + 28),
+                    index_offset: io,
+                    index_count: ic as u32,
+                    block_count: bc as u32,
                 });
                 let _ = rec;
             }

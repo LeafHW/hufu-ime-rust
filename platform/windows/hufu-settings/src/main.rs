@@ -47,6 +47,16 @@ extern "system" {
 extern "system" {
     fn CreateSolidBrush(color: u32) -> isize;
 }
+#[link(name = "user32")]
+extern "system" {
+    fn SetFocus(hwnd: HWND) -> HWND;
+    fn SetActiveWindow(hwnd: HWND) -> HWND;
+    fn keybd_event(bvk: u8, bscan: u8, dwflags: u32, dwextrainfo: usize);
+    fn GetForegroundWindow() -> HWND;
+}
+
+const WM_ACTIVATE_MSG: u32 = 0x0006;
+const KEYEVENTF_KEYUP: u32 = 0x0002;
 
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
@@ -117,11 +127,33 @@ const IID_MSG_HANDLER: GUID = GUID {
     data4: [0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2],
 };
 
+// fdb5ab74-af33-4854-84f0-0a631deb5eba (ICoreWebView2Settings3)
+const IID_SETTINGS3: GUID = GUID {
+    data1: 0xfdb5_ab74,
+    data2: 0xaf33,
+    data3: 0x4854,
+    data4: [0x84, 0xf0, 0x0a, 0x63, 0x1d, 0xeb, 0x5e, 0xba],
+};
+
 /// Read function pointer `index` out of the object's vtable.
 unsafe fn com_fn<T>(this: *mut c_void, index: usize) -> T {
     let vtbl = *(this as *mut *const *const c_void);
     let fp = *vtbl.add(index);
     std::mem::transmute_copy(&fp)
+}
+
+/// IUnknown::QueryInterface（vtable 0）。
+unsafe fn com_query_interface(this: *mut c_void, iid: &GUID, out: *mut *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT =
+        com_fn(this, 0);
+    f(this, iid, out)
+}
+
+/// ICoreWebView2::get_Settings（vtable 3）。
+unsafe fn wv_get_settings(webview: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+        com_fn(webview, 3);
+    f(webview, out)
 }
 
 unsafe fn com_add_ref(this: *mut c_void) -> u32 {
@@ -173,6 +205,12 @@ unsafe fn controller_put_is_visible(controller: *mut c_void, visible: i32) -> HR
 unsafe fn controller_put_bounds(controller: *mut c_void, bounds: RECT) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, RECT) -> HRESULT = com_fn(controller, 6);
     f(controller, bounds)
+}
+
+/// ICoreWebView2Controller::MoveFocus（vtable 12）；reason 0=Programmatic。
+unsafe fn controller_move_focus(controller: *mut c_void, reason: i32) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT = com_fn(controller, 12);
+    f(controller, reason)
 }
 
 unsafe fn controller_close(controller: *mut c_void) -> HRESULT {
@@ -527,6 +565,36 @@ unsafe extern "system" fn handler_invoke(
             (*app).webview = webview;
             (*app).log("ICoreWebView2 acquired");
 
+            // 设置页自己的 Ctrl+K / F5 等快捷键不能被 WebView2 浏览器层吞掉。
+            // Settings3 追加方法：QueryInterface 后 put_AreBrowserAcceleratorKeysEnabled。
+            let mut settings: *mut c_void = null_mut();
+            let hr_set = wv_get_settings(webview, &mut settings);
+            if hr_set >= 0 && !settings.is_null() {
+                let mut s3: *mut c_void = null_mut();
+                let hr_q = com_query_interface(settings, &IID_SETTINGS3, &mut s3);
+                if hr_q >= 0 && !s3.is_null() {
+                    let f: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT =
+                        com_fn(s3, 24);
+                    let hr_acc = f(s3, 0);
+                    (*app).log(&format!(
+                        "put_AreBrowserAcceleratorKeysEnabled(FALSE) -> hr=0x{:08X}",
+                        hr_acc as u32
+                    ));
+                    com_release(s3);
+                } else {
+                    (*app).log(&format!(
+                        "Settings3 QI failed hr=0x{:08X} (browser accelerators stay default)",
+                        hr_q as u32
+                    ));
+                }
+                com_release(settings);
+            } else {
+                (*app).log(&format!(
+                    "get_Settings failed hr=0x{:08X}",
+                    hr_set as u32
+                ));
+            }
+
             let msg_handler = handler_new(KIND_MSG, IID_MSG_HANDLER, app);
             let mut msg_token: i64 = 0;
             let hr_msg = wv_add_web_message_received(webview, msg_handler, &mut msg_token);
@@ -664,6 +732,10 @@ struct App {
     error_mode: bool,
     /// [P0-2a] 本次 NavigationCompleted 属于错误页自身的导航。
     error_nav_pending: bool,
+    /// 【2026-11-03 修】前台/焦点补偿 timer 6 的已重试次数：最多 5 次
+    ///（约 600ms），否则窗口抢不到前台时会每 120ms 无限重试并反复
+    /// 合成 Alt 按键，干扰用户其他窗口。
+    focus_retry: u32,
 }
 
 impl App {
@@ -776,9 +848,7 @@ document.getElementById('close').onclick=function(){{
     let w = wide(&html);
     let hr = wv_navigate_to_string((*app).webview, w.as_ptr());
     (*app).log(&format!("NavigateToString(error page) -> hr=0x{:08X}", hr as u32));
-    ShowWindow((*app).hwnd, SW_SHOW);
-    let _ = UpdateWindow((*app).hwnd);
-    let _ = SetForegroundWindow((*app).hwnd);
+    activate_and_focus(app);
 }
 
 unsafe fn app_ptr(hwnd: HWND) -> *mut App {
@@ -808,6 +878,86 @@ unsafe fn resize_webview(app: *mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// Focus / activation
+// ---------------------------------------------------------------------------
+
+/// 键盘焦点真正落到 WebView2 文档：只 SetForegroundWindow 会让窗口在前，
+/// 但 DOM 收不到 keydown（用户需先点一下的根因）。Programmatic MoveFocus
+/// 把焦点交给 controller；WM_ACTIVATE 时再补一次。
+unsafe fn focus_webview(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    let a = &*app;
+    let _ = SetFocus(a.hwnd);
+    if !a.controller.is_null() {
+        let hr = controller_move_focus(a.controller, 0);
+        a.log(&format!("MoveFocus(Programmatic) -> hr=0x{:08X}", hr as u32));
+    }
+}
+
+/// 从后台进程拉窗口到前台。先直接 SetForegroundWindow；只有系统真的
+/// 拒绝时才合成 Alt 按抬解锁。旧实现无条件发 Alt，会在首次 Ctrl+K 前
+/// 留下菜单/输入态，表现为第一次按键无效并伴随系统提示音。
+unsafe fn ensure_foreground(hwnd: HWND) -> bool {
+    if GetForegroundWindow() == hwnd {
+        return true;
+    }
+    let _ = SetForegroundWindow(hwnd);
+    if GetForegroundWindow() == hwnd {
+        return true;
+    }
+    keybd_event(0x12, 0, 0, 0); // VK_MENU down
+    let ret = SetForegroundWindow(hwnd);
+    keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+    let _ = ret;
+    GetForegroundWindow() == hwnd
+}
+
+unsafe fn activate_and_focus(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    let hwnd = (*app).hwnd;
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = UpdateWindow(hwnd);
+    let fg = ensure_foreground(hwnd);
+    let _ = SetActiveWindow(hwnd);
+    focus_webview(app);
+    (*app).log(&format!(
+        "activate/focus: foreground={fg} fgHwnd=0x{:X} focus=0x{:X}",
+        GetForegroundWindow() as usize,
+        SetFocus(hwnd) as usize
+    ));
+    // 前台权/渲染焦点可能在首帧后才稳定：分几次补，不依赖用户第一下按键。
+    (*app).focus_retry = 0;
+    SetTimer(hwnd, 6, 120, null());
+}
+
+unsafe fn retry_foreground_and_focus(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    let hwnd = (*app).hwnd;
+    if GetForegroundWindow() != hwnd {
+        ensure_foreground(hwnd);
+    }
+    let _ = SetActiveWindow(hwnd);
+    focus_webview(app);
+    (*app).focus_retry = (*app).focus_retry.saturating_add(1);
+    // 最多重试 5 次（约 600ms）；成功或超限都必须停表，否则每 120ms
+    // 抢一次前台 + 合成 Alt，会持续打扰用户已切换到的其他窗口。
+    if GetForegroundWindow() == hwnd || (*app).focus_retry >= 5 {
+        KillTimer(hwnd, 6);
+        if GetForegroundWindow() == hwnd {
+            (*app).log("foreground/focus retry succeeded");
+        } else {
+            (*app).log("foreground/focus retry gave up after 5 tries");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
 
@@ -818,6 +968,16 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ACTIVATE_MSG => {
+            // Alt-Tab / 任务栏 / 二次 Ctrl+Alt+H 激活时，把键盘焦点交还文档。
+            if (wparam & 0xFFFF) != 0 {
+                let app = app_ptr(hwnd);
+                if !app.is_null() {
+                    focus_webview(app);
+                }
+            }
+            0
+        }
         WM_SIZE => {
             let app = app_ptr(hwnd);
             if !app.is_null() {
@@ -834,21 +994,34 @@ unsafe extern "system" fn wndproc(
                 let app = app_ptr(hwnd);
                 if !app.is_null() && !(*app).shown {
                     (*app).shown = true;
-                    let _ = ShowWindow(hwnd, SW_SHOW);
-                    let _ = UpdateWindow(hwnd);
+                    activate_and_focus(app);
+                    SetTimer(hwnd, 5, 90, null());
                     (*app).log("window shown after React ready (+100ms first frame)");
                 }
+                return 0;
+            }
+            if wparam == 6 {
+                let app = app_ptr(hwnd);
+                retry_foreground_and_focus(app);
+                return 0;
+            }
+            if wparam == 5 {
+                // 揭示后再补一次焦点：首帧定时器/导航完成时 DOM 可能还没
+                // 准备好接收 keyboard focus。
+                KillTimer(hwnd, 5);
+                let app = app_ptr(hwnd);
+                focus_webview(app);
                 return 0;
             }
             if wparam == 2 {
                 KillTimer(hwnd, 2);
                 // [P0-2b] 首帧揭示完成：解除启动超时看护
                 KillTimer(hwnd, 3);
-                ShowWindow(hwnd, SW_SHOW);
-                UpdateWindow(hwnd);
                 let app = app_ptr(hwnd);
                 if !app.is_null() {
                     (*app).shown = true;
+                    activate_and_focus(app);
+                    SetTimer(hwnd, 5, 90, null());
                     (*app).log("window shown after navigation/paint");
                 }
             } else if wparam == 3 {
@@ -1045,10 +1218,11 @@ fn exe_dir() -> PathBuf {
 // 17890+（本机实测 17890），双击快捷方式 = Navigate 到没人监听的端口 = 白屏；
 // 托盘入口用 server 实际端口所以正常。
 //
-// 口径：候选端口按序探测「GET /api/about」，响应体含 `hufu-ime-rust` 或
-// `"version"` 才认定是虎符 server，首个命中即最终端口。单端口 300ms
-// 连接/读写超时，总预算 1.5s（正常情况首个候选几毫秒命中）。探测在创建窗口
-// 之前完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
+// 口径：候选端口按序探测「GET /api/about」，响应体必须同时含 `github`、
+// `hufu-ime-rust`、`exe_dir` 三个形状特征才认定是虎符 server（旧口径
+// 只要 `"version"` 就把别家本地服务认成虎符）。单端口 300ms 连接/读写
+// 超时，总预算 1.5s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
+// 完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
 const PROBE_PORT_TIMEOUT: Duration = Duration::from_millis(300);
@@ -1060,7 +1234,7 @@ fn default_url(port: u16) -> String {
 
 struct CliArgs {
     url: String,
-    /// `--url` 是否显式给出（显式且可连通时尊重用户；否则回退端口探测）
+    /// `--url` 是否显式给出（命中虎符特征或非候选端口才保留；否则回退探测）
     url_explicit: bool,
     user_data: PathBuf,
     log: PathBuf,
@@ -1162,7 +1336,7 @@ enum ProbeHit {
 }
 
 /// 探测 host:port 是否是虎符 server：HTTP/1.0 + `GET /api/about`，读完响应
-/// 体后判定（含 `hufu-ime-rust` 或 `"version"`）。
+/// 体后判定（只认 `github` + `exe_dir` 形状；`"version"` 子串会把别家服务误认成虎符）。
 fn probe_hufu_http(host: &str, port: u16, timeout: Duration) -> ProbeHit {
     let Ok(mut addrs) = (host, port).to_socket_addrs() else {
         return ProbeHit::Dead;
@@ -1181,7 +1355,16 @@ fn probe_hufu_http(host: &str, port: u16, timeout: Duration) -> ProbeHit {
     }
     let mut resp = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
+    let deadline = Instant::now() + timeout;
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(left.min(timeout)));
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -1200,7 +1383,7 @@ fn probe_hufu_http(host: &str, port: u16, timeout: Duration) -> ProbeHit {
     if !text.starts_with("HTTP/") {
         return ProbeHit::OtherHttp; // 端口有人监听但说的不是 HTTP
     }
-    if text.contains("hufu-ime-rust") || text.contains("\"version\"") {
+    if text.contains("\"github\"") && text.contains("hufu-ime-rust") && text.contains("\"exe_dir\"") {
         ProbeHit::Hufu
     } else {
         ProbeHit::OtherHttp
@@ -1218,39 +1401,45 @@ fn probe_slice(deadline: Instant) -> Option<Duration> {
 }
 
 /// 决定最终设置页 URL：
-///   * `--url` 显式给出且可连通（TCP 连得上）→ 尊重它：托盘/脚本按 server
-///     实际端口传参走这条；
+///   * `--url` 显式给出且命中虎符特征，或落在非候选端口（开发用 Vite 等）
+///     → 保留：托盘/脚本按 server 实际端口传参走这条；
 ///   * 否则按 PROBE_PORTS 探测首个虎符 server，命中即用该端口；
 ///   * 「连上但 300ms 无响应」的端口在剩余预算内各重试一次（瞬时慢不误杀）；
-///   * 全程未命中 → 保持解析出来的 URL 不动，失败原因写进 hufu-settings.log。
+///   * 全程未命中 → 回退到探测到的无监听端口，绝不导航到已知外来 HTTP 服务。
 fn resolve_url(args: &mut CliArgs) {
     let deadline = Instant::now() + PROBE_TOTAL_BUDGET;
     if args.url_explicit {
         let explicit = args.url.clone();
-        let explicit_hit = split_http_host_port(&explicit)
-            .and_then(|(host, port)| probe_slice(deadline).map(|t| probe_hufu_http(&host, port, t)));
-        match explicit_hit {
-            Some(ProbeHit::Dead) | None => log_line(
-                &args.log,
-                &format!("explicit --url unreachable: {explicit}；回退候选端口探测"),
-            ),
-            Some(hit) => {
-                let note = if matches!(hit, ProbeHit::Hufu) {
-                    ""
-                } else {
-                    "（非虎符特征/暂无响应，按用户指定保留）"
-                };
-                log_line(
-                    &args.log,
-                    &format!("explicit --url reachable{note}；尊重：{explicit}"),
-                );
-                return;
-            }
+        let parsed = split_http_host_port(&explicit);
+        let hit = parsed
+            .as_ref()
+            .and_then(|(host, port)| probe_slice(deadline).map(|t| probe_hufu_http(host, *port, t)));
+        let is_hufu = matches!(&hit, Some(ProbeHit::Hufu));
+        let candidate_port = parsed
+            .as_ref()
+            .map(|(_, p)| *p)
+            .filter(|p| PROBE_PORTS.contains(p));
+        let dev_keep = candidate_port.is_none()
+            && matches!(&hit, Some(ProbeHit::OtherHttp) | Some(ProbeHit::TcpOnly));
+        if is_hufu || dev_keep {
+            let note = if is_hufu {
+                ""
+            } else {
+                "（非虎符特征，非候选端口，按用户指定保留）"
+            };
+            log_line(&args.log, &format!("explicit --url kept{note}：{explicit}"));
+            return;
         }
+        log_line(
+            &args.log,
+            &format!("explicit --url 非虎符/不可达，回退候选端口探测：{explicit}"),
+        );
     }
+
     let mut tried: Vec<String> = Vec::new();
     let mut slow: Vec<u16> = Vec::new();
     let mut hit_port: Option<u16> = None;
+    let mut dead_port: Option<u16> = None;
     for port in PROBE_PORTS {
         let Some(timeout) = probe_slice(deadline) else {
             tried.push("总预算耗尽".to_string());
@@ -1266,7 +1455,15 @@ fn resolve_url(args: &mut CliArgs) {
                 slow.push(port);
             }
             ProbeHit::OtherHttp => tried.push(format!("{port}=别家 HTTP")),
-            ProbeHit::Dead => tried.push(format!("{port}=无监听")),
+            ProbeHit::Dead => {
+                tried.push(format!("{port}=无监听"));
+                // 只记首个无监听候选（4390 优先）：错误页「重试」指回
+                // 4390，用户随后启动 server 即可恢复；记最后一个会把
+                // 重试指到 27890，起服务后也连不上。
+                if dead_port.is_none() {
+                    dead_port = Some(port);
+                }
+            }
         }
     }
     // 首轮没命中：给「连上但超时」的端口一次重试（server 偶发慢于 300ms）
@@ -1292,10 +1489,16 @@ fn resolve_url(args: &mut CliArgs) {
         );
         return;
     }
+    // 【2026-11-02 P1】没有虎符 server 时不要回退到 4390：4390 可能被别家
+    // HTTP 服务占着（探测结果 OtherHttp），导航过去就是打开外来页面。
+    // 优先用探测到「无监听」的候选端口（必然白屏/错误页，但安全）；
+    // 全候选都被别家占时用 4391（不在候选表内，仍不指向已知外来服务）。
+    let fallback_port = dead_port.unwrap_or_else(|| DEFAULT_PORT.saturating_add(1));
+    args.url = default_url(fallback_port);
     log_line(
         &args.log,
         &format!(
-            "port probe missed [{}]；保持原 URL（双击快捷方式可能白屏）：{}",
+            "port probe missed [{}]；回退无监听端口 {fallback_port}（不导航到非虎符服务）：{}",
             tried.join(", "),
             args.url
         ),
@@ -1342,19 +1545,6 @@ unsafe fn real_main() -> i32 {
         &args.log,
         &format!("user data dir: {}", user_data.display()),
     );
-    // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
-    // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
-    resolve_url(&mut args);
-    // 【--theme】追加到最终 URL（默认与显式 URL 都已含 query，用 & 拼；
-    // 防御性判断避免重复追加）。
-    if let Some(theme) = args.theme.clone() {
-        if !args.url.contains("theme=") {
-            let sep = if args.url.contains('?') { '&' } else { '?' };
-            args.url = format!("{}{sep}theme={theme}", args.url);
-        }
-    }
-    log_line(&args.log, &format!("target URL: {}", args.url));
-
     // [P0-2c 2026-11-01] 单实例互斥：命名互斥体占名，二次启动（连按
     // Ctrl+Alt+H / 托盘连点）激活已有窗口后直接退出——旧版会在首窗
     // 1.5s 隐身期内再 spawn 隐形进程（验收 D-2/P0-2）。互斥体先于窗口
@@ -1385,6 +1575,19 @@ unsafe fn real_main() -> i32 {
             return 0;
         }
     }
+
+    // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
+    // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
+    resolve_url(&mut args);
+    // 【--theme】追加到最终 URL（默认与显式 URL 都已含 query，用 & 拼；
+    // 防御性判断避免重复追加）。
+    if let Some(theme) = args.theme.clone() {
+        if !args.url.contains("theme=") {
+            let sep = if args.url.contains('?') { '&' } else { '?' };
+            args.url = format!("{}{sep}theme={theme}", args.url);
+        }
+    }
+    log_line(&args.log, &format!("target URL: {}", args.url));
 
     // Per-Monitor V2: the window is sized in DIPs and WebView2 follows the
     // monitor scale. `--dpi` is a dev-only override for high-DPI screenshots.
@@ -1509,6 +1712,7 @@ unsafe fn real_main() -> i32 {
         shown: false,
         error_mode: false,
         error_nav_pending: false,
+        focus_retry: 0,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 

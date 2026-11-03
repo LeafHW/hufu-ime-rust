@@ -173,6 +173,19 @@ fn default_data_dir() -> PathBuf {
     }
 }
 
+/// 【2026-11-02 P2】一次 bind 成功就返回监听器（不 drop 再 bind）。
+/// 首选端口被系统保留/占用时按固定候选顺序回退；全失败返回 None，
+/// 主循环稍后重试（管道服务不受影响）。
+fn bind_http_listener(preferred: u16) -> Option<(u16, std::net::TcpListener)> {
+    for cand in [preferred, 17890, 17891, 17892, 17893, 17894, 27890] {
+        match std::net::TcpListener::bind(("127.0.0.1", cand)) {
+            Ok(l) => return Some((cand, l)),
+            Err(e) => eprintln!("HTTP 候选端口 {cand} 不可用: {e}"),
+        }
+    }
+    None
+}
+
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
@@ -289,18 +302,13 @@ fn main() {
     // 会把 4390 圈进去（用户实测排除段 4324-4423 命中 4390），bind 报
     // WSAEACCES(10013)。旧实现 HTTP 失败即 exit(1) → 管道线程随进程一起死，
     // 输入法整个打不了字（重装/重启后必现，见 21:04 事故）。
-    // 现在先探测可用端口再 serve；候选端口都在保留段之外。
-    let mut chosen_port = port;
-    for cand in [port, 17890, 17891, 17892, 17893, 17894, 27890] {
-        match std::net::TcpListener::bind(("127.0.0.1", cand)) {
-            Ok(l) => {
-                drop(l);
-                chosen_port = cand;
-                break;
-            }
-            Err(e) => eprintln!("HTTP 候选端口 {cand} 不可用: {e}"),
-        }
-    }
+    // 【2026-11-02 P2】一次 bind 成功就保留 listener 直接交给 serve
+    // （不再 drop 后二次 bind，消 TOCTOU）；全失败时先跑管道，主循环 5s
+    // 重探，HTTP 恢复后设置页自动可用。
+    let (chosen_port, mut listener) = match bind_http_listener(port) {
+        Some((p, l)) => (p, Some(l)),
+        None => (port, None),
+    };
     if chosen_port != port {
         eprintln!("HTTP 端口 {port} 不可用（系统保留/占用），改用 {chosen_port}");
     }
@@ -818,17 +826,33 @@ fn main() {
         });
     }
 
-    let handler = {
+    let handler = Arc::new({
         let shared = shared.clone();
         move |req: &Request| -> Response { route(&shared, req) }
-    };
-    if let Err(e) = http::serve(&addr, Arc::new(handler)) {
-        // 【2026-11】不退出：管道（打字）不依赖 HTTP，设置页连不上只是开不了
-        // 设置窗口；exit 会让 DLL 连不上管道 → 整个输入法打不了字。
-        eprintln!("HTTP 服务失败: {e}（继续提供输入法管道服务；设置界面不可用）");
-        loop {
-            std::thread::park();
+    });
+    // 【2026-11-02 P2】listener 已 bind 直接 serve（TOCTOU 消除）；serve 失败
+    // 或全端口不可用 → 5s 后重探重试，管道/打字线程不受影响。
+    loop {
+        if listener.is_none() {
+            match bind_http_listener(port) {
+                Some((p, l)) => {
+                    platform::set_http_port(p);
+                    eprintln!("HTTP 端口 {p} 可用，开始服务");
+                    listener = Some(l);
+                }
+                None => {
+                    eprintln!("HTTP 无可用端口，5s 后重试（输入法管道继续）");
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            }
         }
+        if let Some(l) = listener.take() {
+            if let Err(e) = http::serve(l, handler.clone()) {
+                eprintln!("HTTP 服务失败: {e}（5s 后重试；输入法管道继续）");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 
@@ -1299,17 +1323,15 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
         // helper 失败 → 落到 PS 驱动（降级链）
     }
     let ps1 = std::env::temp_dir().join(format!("hufu-ssf-render-drv-{stamp}.ps1"));
+    // 【P0-1 2026-11-03】所有变量改走进程环境（cmd.env），不再把
+    // 用户可控的皮肤 id / 临时路径内插进 PowerShell 单引号串——旧实现
+    // `if ('{rid}' ...)` 对 `'` 无防护，本机任意网页 GET 即可注入
+    // 任意 PowerShell 命令（审计 PoC 已执行）。
     let body = format!(
-        r#"$env:HUFU_SKIN_DUMP = '{out}'
-$env:HUFU_SKIN_DUMP_V2 = '1'
-$env:HUFU_TSF_SMOKE = '1'
-if ('{rid}' -ne '') {{ $env:HUFU_SKIN_DUMP_ID = '{rid}' }}
-$cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
+        r#"$cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
 try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
 try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
 "#,
-        out = out.display(),
-        rid = query_id.unwrap_or(""),
         dll = dll,
     );
     if std::fs::write(&ps1, {
@@ -1327,9 +1349,16 @@ try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
         #[cfg(windows)]
         use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1)
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&ps1)
+            .env("HUFU_SKIN_DUMP", &out)
+            .env("HUFU_SKIN_DUMP_V2", "1")
+            .env("HUFU_TSF_SMOKE", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        if let Some(id) = query_id {
+            cmd.env("HUFU_SKIN_DUMP_ID", id);
+        }
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
         let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
@@ -1442,6 +1471,41 @@ fn newer_than(a: &str, b: &str) -> bool {
     false
 }
 
+/// 【P0-1 2026-11-03】本机请求判定：跨源 Origin 必须是 loopback，Host 必须
+/// 是本机名（防 DNS rebinding）。POST/DELETE 与会执行子进程的
+/// `GET /api/skin/ssf-render` 共用。
+fn request_is_local(req: &Request) -> bool {
+    if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
+        let local = origin.starts_with("http://127.0.0.1:")
+            || origin.starts_with("http://localhost:")
+            || origin.starts_with("http://[::1]:");
+        if !local {
+            return false;
+        }
+    }
+    if let Some(h) = req.headers.get("host").filter(|h| !h.is_empty()) {
+        let h = h.to_lowercase();
+        let local_host =
+            h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]");
+        if !local_host {
+            return false;
+        }
+    }
+    true
+}
+
+/// 皮肤 id 白名单：只用于拼缓存目录名（中文皮肤 id 必须可用），拒绝
+/// 路径分隔符/控制字符/上跳，长度封顶。`鲸鱼娘` 通过，
+/// `../config`、`a'b`、`x\n...` 拒绝。
+fn valid_skin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.contains("..")
+        && !id
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\' || c == '\0')
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
     // DELETE /api/skin）拒绝跨源网页：
@@ -1452,21 +1516,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 同时防 DNS rebinding（外域域名解析到 127.0.0.1 的请求 Host
     // 不是本机名）。
     if req.method == "POST" || req.method == "DELETE" {
-        if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
-            let local = origin.starts_with("http://127.0.0.1:")
-                || origin.starts_with("http://localhost:")
-                || origin.starts_with("http://[::1]:");
-            if !local {
-                return Response::err(403, "跨源请求被拒绝");
-            }
-        }
-        if let Some(h) = req.headers.get("host").filter(|h| !h.is_empty()) {
-            let h = h.to_lowercase();
-            let local_host =
-                h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]");
-            if !local_host {
-                return Response::err(403, "非法 Host");
-            }
+        if !request_is_local(req) {
+            return Response::err(403, "跨源请求被拒绝");
         }
     }
     // 【新设置页 2026-10-31】静态资源先于 Host 锁分发；GET only。
@@ -1593,7 +1644,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 锁（PS 退出 0 但 DLL 拉皮肤死等，BMP 永不落盘的根因）。
     // ?id= 渲染指定 ssf 皮肤（设置页编辑中的那个）。
     if req.method == "GET" && req.path == "/api/skin/ssf-render" {
+        // 【P0-1 2026-11-03】该 GET 会拉起 PowerShell/渲染子进程，同样
+        // 做本机来源校验；id 先过白名单（只用于缓存目录名）。
+        if !request_is_local(req) {
+            return Response::err(403, "跨源请求被拒绝");
+        }
         let rid = req.query.get("id").cloned();
+        if let Some(id) = rid.as_deref() {
+            if !valid_skin_id(id) {
+                return Response::err(400, "非法皮肤 id");
+            }
+        }
         return ssf_render_inner(rid.as_deref());
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3956,10 +4017,9 @@ mod next_ui_tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        // Grab a free loopback port, then hand it to the real HTTP loop.
-        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
+        // Grab a free loopback port, keep the listener, then hand it to the real HTTP loop.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let addr = listener.local_addr().unwrap().to_string();
 
         let handler = Arc::new(|req: &http::Request| -> http::Response {
             if req.method == "GET" {
@@ -3969,9 +4029,8 @@ mod next_ui_tests {
             }
             http::Response::err(404, "not found")
         });
-        let server_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = http::serve(&server_addr, handler);
+            let _ = http::serve(listener, handler);
         });
 
         let mut stream = None;

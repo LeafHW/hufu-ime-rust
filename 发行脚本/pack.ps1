@@ -188,7 +188,7 @@ foreach ($c in $copies) {
 # 丢失）。现统一在复制后对 hufu-server.exe / hufu-settings.exe 嵌图标
 # （整数资源 ID 方案，embed-icon.py，PrivateExtractIconsW 验收口径）。
 $embedPy = Join-Path $PSScriptRoot 'embed-icon.py'
-$icoPath  = 'E:\DSH-KF\hufu\platform\windows\hufu-tsf\assets\hufu.ico'
+$icoPath  = 'E:\DSH-KF\hufu\platform\windows\install\hufu-current.ico'
 if ((Test-Path $embedPy) -and (Test-Path $icoPath)) {
     foreach ($exeName in @('hufu-server.exe', 'hufu-settings.exe')) {
         $exePath = Join-Path $SRC $exeName

@@ -7,7 +7,7 @@ if errorlevel 1 (
   timeout /t 2 /nobreak >nul
 )
 if exist "%~dp0hufu-settings.exe" (
-  start "" "%~dp0hufu-settings.exe" --url "http://127.0.0.1:4390/next?shell=1"
+  start "" "%~dp0hufu-settings.exe"
   exit /b 0
 )
 set "BROWSER="

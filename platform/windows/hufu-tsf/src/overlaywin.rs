@@ -572,6 +572,9 @@ struct OverlayWin {
     /// DIB 资源(尺寸变化重建)
     dc: isize,
     hbm: isize,
+    /// 建 DIB 时 SelectObject 换出的旧对象（DeleteObject 前必须换回，
+    /// 否则位图仍被 DC 选中 → 删除必失败，审计 P0-4）。
+    old: isize,
     bits: isize,
     dib_w: i32,
     dib_h: i32,
@@ -740,6 +743,7 @@ impl OverlayWin {
             hwnd: hwnd.0 as isize,
             dc: 0,
             hbm: 0,
+            old: 0,
             bits: 0,
             dib_w: 0,
             dib_h: 0,
@@ -760,6 +764,12 @@ impl OverlayWin {
     fn drop_dib(&mut self) {
         unsafe {
             if self.hbm != 0 {
+                // 【P0-4 2026-11-03】先把建 DIB 时换出的旧对象选回 DC，
+                // 否则位图仍在 DC 里选中 → DeleteObject 必失败（漏句柄）。
+                if self.dc != 0 && self.old != 0 {
+                    let _ = SelectObject(HDC(self.dc as *mut _), HGDIOBJ(self.old as *mut _));
+                    self.old = 0;
+                }
                 let _ = DeleteObject(HGDIOBJ(self.hbm as *mut _));
                 self.hbm = 0;
             }
@@ -831,6 +841,7 @@ impl OverlayWin {
             }
             self.dc = dc.0 as isize;
             self.hbm = hbm.0 as isize;
+            self.old = old.0 as isize;
             self.bits = bits as isize;
             self.dib_w = w;
             self.dib_h = h;
@@ -1141,7 +1152,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
             if entry.hide_at.is_none() {
                 let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
                 let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-                let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
+                ov_hide_animated(HWND(ov.hwnd as *mut _));
                 entry.shown = false;
                 entry.timer_armed = false;
                 entry.hide_at = None;
@@ -1170,7 +1181,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         if let Some(ov) = entry.ov.as_mut() {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-            let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
+            ov_hide_animated(HWND(ov.hwnd as *mut _));
         }
         entry.shown = false;
         entry.timer_armed = false;
@@ -1294,6 +1305,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         entry.last_rect = None; // 强制 SWP 落位/显示
     }
     // 位置/尺寸/显示
+    let was_shown = entry.shown;
     if entry.last_rect != Some((x, y, cw, ch)) || !entry.shown {
         // 【右键菜单 z 序保护 2026-10-16】菜单窗存活期不抢 TOPMOST
         //（同 candwin2::swp_z_guard——挂件帧钟若在菜单开时重落位，同样
@@ -1309,6 +1321,9 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         );
         entry.last_rect = Some((x, y, cw, ch));
         entry.shown = true;
+        if !was_shown {
+            ov_fade_in(ov_h);
+        }
     }
     // 上屏成功：补拍钟退役（未臂时 KillTimer 无害）
     let _ = KillTimer(ov_h, OVERLAY_RESYNC_TIMER_ID);
@@ -1444,6 +1459,17 @@ unsafe fn arm_hide(entry: &mut OverlayEntry, ov_hwnd: HWND, delay: u32) {
     let _ = SetTimer(ov_hwnd, OVERLAY_HIDE_TIMER_ID, span.saturating_add(span / 2).max(16), None);
 }
 
+/// 【2026-11-03 第三批】挂件 120ms 淡入/淡出。
+/// 【2026-11-03 发版前修】原实现直接调 AnimateWindow：它同步阻塞 120ms
+/// 且会泵消息，而所有调用点都在 OVERLAYS 全局锁内（hide_for /
+/// sync_tail_locked）→ 每次收词卡顿 ≤120ms，并存在重入锁死风险。
+/// v1.9.9 先退化为瞬切（ShowWindow），淡入淡出等移出锁后再上。
+unsafe fn ov_fade_in(_h: HWND) {}
+
+unsafe fn ov_hide_animated(h: HWND) {
+    let _ = ShowWindow(h, SW_HIDE);
+}
+
 /// 隐藏同步(WM_APP_HIDE_CAND 处理器内调用)。
 /// hide_delay_ms=0(默认):候选窗一收立即收,干净利落;
 /// >0:挂件原地停留该时长——期间候选窗重现(sync_for)则撤销收窗,
@@ -1464,7 +1490,7 @@ pub unsafe fn hide_for(cand: HWND) {
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
             let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-            let _ = ShowWindow(HWND(ov.hwnd as *mut _), SW_HIDE);
+            ov_hide_animated(HWND(ov.hwnd as *mut _));
         }
         entry.shown = false;
         entry.timer_armed = false;

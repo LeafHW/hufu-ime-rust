@@ -1005,8 +1005,8 @@ fn make_glyph_icon(ch: &str) -> isize {
             let _ = DeleteDC(hdc);
             return 0;
         }
-        let _ = SelectObject(hdc, HGDIOBJ(dib.0));
-        let _ = SelectObject(hdc, HGDIOBJ(hf.0));
+        let old_bmp = SelectObject(hdc, HGDIOBJ(dib.0));
+        let old_font = SelectObject(hdc, HGDIOBJ(hf.0));
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(0x00FF_FF_FF));
         let ws: Vec<u16> = ch.encode_utf16().collect();
@@ -1019,6 +1019,11 @@ fn make_glyph_icon(ch: &str) -> isize {
         for i in 0..(S * S) as usize {
             cov[i] = (bits as *const u8).add(i * 4).read_volatile() as f32 / 255.0;
         }
+        // 【P0-4 2026-11-03】先换出再删：DeleteObject 对仍被 DC 选中的
+        // 位图/字体必失败——每次模式切换漏 1 DIB + 1 HFONT，长会话耗尽
+        // GDI 句柄后语言栏图标不再更新。
+        let _ = SelectObject(hdc, old_font);
+        let _ = SelectObject(hdc, old_bmp);
         let _ = DeleteObject(HGDIOBJ(dib.0));
         let _ = DeleteObject(HGDIOBJ(hf.0));
         let _ = DeleteDC(hdc);

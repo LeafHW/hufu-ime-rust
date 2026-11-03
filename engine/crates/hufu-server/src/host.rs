@@ -213,6 +213,21 @@ pub struct Host {
     pub addword_ph: bool,
 }
 
+/// 备份坏配置（优先 rename；失败退回 copy），返回备份路径。
+/// 【P0-2 2026-11-03】启动兜底用：config.json 损坏或方案目录缺失时，
+/// 不能让 server 直接 exit(1)——先保住用户原文件再以默认配置启动。
+fn backup_config_file(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let bak = path.with_file_name(format!("config.json.bak-{stamp}"));
+    if std::fs::rename(path, &bak).is_err() {
+        let _ = std::fs::copy(path, &bak);
+    }
+    bak
+}
+
 impl Host {
     pub fn new(data_dir: &Path) -> std::io::Result<Host> {
         // 【性能插桩】启动阶段毫秒戳（diag/startup-trace.txt；常开开销≈0）
@@ -230,14 +245,50 @@ impl Host {
             }
         };
         let config_path = data_dir.join("config.json");
-        let config = if config_path.exists() {
-            let c = Config::load(&config_path)?;
-            mark("config", &t0);
-            c
+        let (mut config, mut recovered) = if config_path.exists() {
+            match Config::load(&config_path) {
+                Ok(c) => {
+                    mark("config", &t0);
+                    (c, false)
+                }
+                Err(e) => {
+                    // 【P0-2 2026-11-03】坏 config 不能让输入法整体瘫痪：
+                    // 保留原文件为 .bak，用默认配置继续启动。
+                    let bak = backup_config_file(&config_path);
+                    eprintln!(
+                        "config.json 装载失败（{e}），已备份为 {}，改用默认配置启动",
+                        bak.display()
+                    );
+                    (Config::default(), true)
+                }
+            }
         } else {
-            Config::default()
+            (Config::default(), false)
         };
-        let engine = Engine::new(data_dir, config)?;
+        let engine = match Engine::new(data_dir, config.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                // 【P0-2 2026-11-03】方案目录被删/损坏时，旧实现让
+                // Host::new 返回错误 → main exit(1) → 打不了字且只能手改
+                // config.json。这里备份现场后按默认方案重试一次。
+                if !config_path.exists() {
+                    return Err(e);
+                }
+                let bak = backup_config_file(&config_path);
+                eprintln!(
+                    "引擎初始化失败（{e}），已备份配置为 {}，改用默认方案重试",
+                    bak.display()
+                );
+                config = Config::default();
+                recovered = true;
+                Engine::new(data_dir, config.clone())?
+            }
+        };
+        if recovered {
+            if let Err(e) = config.save(&config_path) {
+                eprintln!("默认配置写入失败（可忽略，不影响本次启动）: {e}");
+            }
+        }
         mark("engine(含词典)", &t0);
         let mut host = Host {
             candidate_export: Default::default(),
@@ -1059,11 +1110,35 @@ impl Host {
         // （注释表数据不变但 split/reverse 换文件；无需换主码表）
         let assets_changed = cfg.reverse.scheme != self.engine.config.reverse.scheme
             || cfg.candidates.split_scheme != self.engine.config.candidates.split_scheme;
+        // 【P0-2 2026-11-03】先验证新方案可装载，再落盘：旧实现先 save
+        // 再 switch_schema，方案目录被删/损坏时磁盘配置已坏，server 重启
+        // exit(1)，输入法整体不可用且无法通过设置页恢复。
+        if schema_changed {
+            if cfg.schema.current.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "方案名为空",
+                ));
+            }
+            let target =
+                Engine::resolve_data_sub(&self.data_dir, &cfg.schema.dir).join(&cfg.schema.current);
+            if let Err(e) = hufu_dict::schema::Schema::load(&target) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("方案「{}」无法装载，配置未保存: {e}", cfg.schema.current),
+                ));
+            }
+        }
+        let old_config = self.engine.config.clone();
         cfg.save(&self.config_path)?;
         self.engine.config = cfg;
         if schema_changed {
             let name = self.engine.config.schema.current.clone();
             if let Err(e) = self.engine.switch_schema(&name) {
+                // 竞态兜底（验证后目录恰好被删）：回写旧配置，别把磁盘
+                // 留在「保存成功但方案装不上」的坏状态。
+                self.engine.config = old_config.clone();
+                let _ = old_config.save(&self.config_path);
                 return Err(e);
             }
             self.session.clear();

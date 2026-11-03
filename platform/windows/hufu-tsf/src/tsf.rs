@@ -865,6 +865,11 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         let km: ITfKeystrokeMgr = tm.cast()?;
         // 把「自己」注册为前景按键接收器
         let sink: ITfKeyEventSink = unsafe { self.cast()? };
+        // 【2026-11-02 P1】留一份 sink 给 poll_tick 的延迟补挂兜底：poll 只有
+        // SharedRef，拿不到 &self；本线程读写，不跨线程。
+        TIP_SINK.with(|s| *s.borrow_mut() = Some(sink.clone()));
+        DEFER_TRY_MS.with(|c| c.set(0));
+        DEFER_FAIL_AT.with(|c| c.set(0));
         unsafe {
             // 【游戏宿主·E7 定稿 2026-10-06·子类化流派】游戏宿主（全屏
             // 弹出形态/名单命中）**不挂 TSF 键 sink**——挂载即武装 CUAS
@@ -1133,6 +1138,10 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         SINK_ADVISED.with(|c| c.set(false));
         DEFER_ADVISE.with(|c| c.set(false));
         DEFER_SOFT.with(|c| c.set(false));
+        // 【2026-11-02 P1】清掉 poll 兜底持有的 sink 克隆，避免跨激活残留。
+        TIP_SINK.with(|s| *s.borrow_mut() = None);
+        DEFER_TRY_MS.with(|c| c.set(0));
+        DEFER_FAIL_AT.with(|c| c.set(0));
         // 上报失活（托盘侧 700ms 防抖后隐藏图标）
         let _ = crate::ipc::call(&serde_json::json!({"op": "ime", "active": false}));
         // 【六十修】引擎侧会话一并清零（与 ime_switch_abort 同款）：
@@ -1348,35 +1357,10 @@ impl ITfThreadMgrEventSink_Impl for HuFuTs_Impl {
         // 【2026-11 准入制·补挂】Activate 时因"无文档焦点"没挂 sink；
         // 现在出现了真正的文档焦点（用户点进了输入框）→ 补挂。
         // 游戏画像（反作弊/全屏/游戏输入栈）仍然否决——宁可那个进程里打不了字。
-        if !SINK_ADVISED.with(|c| c.get()) && DEFER_ADVISE.with(|c| c.get()) && pdimfocus.is_some() {
-            let soft = DEFER_SOFT.with(|c| c.get());
-            // 【第三道保险】硬画像复检：全屏窗口再次出现/反作弊/名单命中 → 不补挂。
-            // （软判定进程只有在"窗口化 + 真可编辑"时才允许虎符接手）
-            if game_hard_veto() {
-                crate::tsf::trace("focus: 延迟补挂被硬画像/全屏保险拦下（保持惰性）");
-            } else if soft && !caret_evidence(&self.shared) {
-                crate::tsf::trace("focus: 软判定无编辑证据 → 保持惰性（等下次焦点）");
-            } else if let (Some(tm), tid) = (thread_tm(), thread_tid()) {
-                if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
-                    let sink: ITfKeyEventSink = unsafe { self.cast()? };
-                    match unsafe { km.AdviseKeyEventSink(tid, &sink, BOOL(1)) } {
-                        Ok(_) => {
-                            SINK_ADVISED.with(|c| c.set(true));
-                            DEFER_ADVISE.with(|c| c.set(false));
-                            DEFER_SOFT.with(|c| c.set(false));
-                            crate::tsf::trace(if soft {
-                                "focus: 软判定补挂成功（已验可编辑）→ sink advised ok"
-                            } else {
-                                "focus: 延迟挂载 → sink advised ok"
-                            });
-                        }
-                        Err(e) => crate::tsf::trace(&format!(
-                            "focus: 延迟挂载失败 0x{:08X}（等下次焦点重试）",
-                            e.code().0
-                        )),
-                    }
-                }
-            }
+        // 【2026-11-02 P1】同一 helper 由 poll_tick 每 500ms 兜底：宿主有焦点
+        // 却不发 OnSetFocus（或焦点事件被吞）时，不再永久不挂 sink。
+        if pdimfocus.is_some() {
+            let _ = try_advise_deferred(&self.shared, false);
         }
         // 【E6·虎娘同款·进场拆链】游戏宿主的键处理不再依赖任何 TSF 文
         // 档判据（dim 启发式在记分板/加载 overlay 上误判=00:19 实锤死
@@ -7428,7 +7412,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                     .or_else(|| g.skin.get("anim_flash"))
                     .and_then(|x| x.as_bool())
                     .unwrap_or(true);
-                let flash_ok = anim_on && anim_flash_on;
+                let flash_ok =
+                    anim_on && anim_flash_on && crate::candwin2::system_anim_allowed();
                 let flash: Vec<(String, String)> = state
                     .get("candidates")
                     .and_then(|v| v.as_array())
@@ -7456,11 +7441,15 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                     let caret_f = g.caret;
                     if let Some(c) = g.cand2.as_mut() {
                         c.show(&flash, "", &skin_f, caret_f.as_ref(), sel_flash);
-                        // 【二十七修·闪帧提速定稿】用户拍板 0.15s（320ms→
-                        // 200ms→150ms 递减实测）：高亮滑向选重项的前段已
-                        // 够看清「高亮移过去」，150ms 收场更利落；新 show
-                        // 到来自动取消（candwin2 show 头 KillTimer）。
-                        c.hide_later(150);
+                        // 【2026-11-03 M6·token 统一】选重确认总时长从
+                        // 230ms（80ms 滑动 + 150ms 暂留）收为 180ms
+                        // （fast 80ms 滑动 + slow-fast 100ms 暂留）——高亮
+                        // 仍看清移过去，收场更利落；新 show 到来会自动取消
+                        // （candwin2 show 头 KillTimer）。
+                        c.hide_later(
+                            crate::candwin2::MOTION_SLOW_MS
+                                .saturating_sub(crate::candwin2::MOTION_FAST_MS),
+                        );
                         flash_frame_rendered = true;
                     }
                     // tick 复渲染读 shared.last_show——同步为闪帧（否则
@@ -8993,6 +8982,71 @@ fn caret_evidence(shared: &SharedRef) -> bool {
     )
 }
 
+/// 【2026-11-02 P1】延迟挂载补挂（OnSetFocus / poll_tick 共用）。
+/// Activate 时无文档焦点 → 只设 DEFER_ADVISE；宿主有焦点却不发焦点事件
+///（或事件被吞）时 OnSetFocus 永不到来 ⇒ 该进程永久不挂 sink。poll 每
+/// 500ms 用本函数复查 TSM 焦点并补挂；判据与 OnSetFocus 完全一致：
+/// 硬画像复检 + 软判定 caret_evidence(fail-closed)。from_poll=true 时
+/// 失败静默（成功才 trace），避免 110ms 轮询刷日志。
+fn try_advise_deferred(shared: &SharedRef, from_poll: bool) -> bool {
+    if SINK_ADVISED.with(|c| c.get()) || !DEFER_ADVISE.with(|c| c.get()) {
+        return false;
+    }
+    let soft = DEFER_SOFT.with(|c| c.get());
+    // 【第三道保险】硬画像复检：全屏窗口再次出现/反作弊/名单命中 → 不补挂。
+    if game_hard_veto() {
+        if !from_poll {
+            crate::tsf::trace("focus: 延迟补挂被硬画像/全屏保险拦下（保持惰性）");
+        }
+        return false;
+    }
+    let Some(tm) = thread_tm() else {
+        return false;
+    };
+    // poll 路径必须看到 TSM 文档焦点才补挂；OnSetFocus 已由调用方确认焦点出现。
+    if from_poll && unsafe { tm.GetFocus() }.is_err() {
+        return false;
+    }
+    // 软判定的进程（游戏输入栈）只有拿到"真可编辑"正面证据才允许接手。
+    if soft && !caret_evidence(shared) {
+        if !from_poll {
+            crate::tsf::trace("focus: 软判定无编辑证据 → 保持惰性（等下次焦点）");
+        }
+        return false;
+    }
+    let tid = thread_tid();
+    let Some(sink) = TIP_SINK.with(|s| s.borrow().clone()) else {
+        return false;
+    };
+    let Ok(km) = tm.cast::<ITfKeystrokeMgr>() else {
+        return false;
+    };
+    match unsafe { km.AdviseKeyEventSink(tid, &sink, BOOL(1)) } {
+        Ok(_) => {
+            SINK_ADVISED.with(|c| c.set(true));
+            DEFER_ADVISE.with(|c| c.set(false));
+            DEFER_SOFT.with(|c| c.set(false));
+            crate::tsf::trace(if soft {
+                "focus: 软判定补挂成功（已验可编辑）→ sink advised ok"
+            } else {
+                "focus: 延迟挂载 → sink advised ok（poll/焦点兜底）"
+            });
+            true
+        }
+        Err(e) => {
+            let now = raw_fs_cache_now_ms();
+            if !from_poll || now.saturating_sub(DEFER_FAIL_AT.with(|c| c.get())) >= 5000 {
+                DEFER_FAIL_AT.with(|c| c.set(now));
+                crate::tsf::trace(&format!(
+                    "focus: 延迟挂载失败 0x{:08X}（继续等下次焦点/poll 重试）",
+                    e.code().0
+                ));
+            }
+            false
+        }
+    }
+}
+
 /// Original candidate rendering uses D2D or the server-owned window.
 /// The independent candidate_ui publisher exposes host-readable candidates.
 /// BeginUIElement's FALSE means the host may draw; it never stops notifications
@@ -9608,6 +9662,14 @@ thread_local! {
     /// 【2026-11 软判定】本次延迟来自"游戏输入栈 + 无文本焦点"的软否决：
     /// 补挂前必须拿到可编辑证据（GetSelection 成功），且进程内无全屏窗口。
     static DEFER_SOFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 【2026-11-02 P1】本线程 TIP 的 ITfKeyEventSink 克隆。Activate 时存入，
+    /// poll_tick 在延迟挂载态拿它补挂——poll 线程只有 SharedRef，拿不到 &self。
+    /// 只在本线程（TSF UI 线程）读写，COM 指针不跨线程。
+    static TIP_SINK: std::cell::RefCell<Option<ITfKeyEventSink>> =
+        const { std::cell::RefCell::new(None) };
+    /// 延迟挂载 poll 复查节流（500ms）与失败 trace 节流（5s）。
+    static DEFER_TRY_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DEFER_FAIL_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// 游戏宿主模式（Activate 期名单/形态命中）：进场拆 IME 链 + 子类
     /// 化游戏窗（E7），永不挂 TSF 键 sink。
     /// 【2026-11 安全阀】改为 opt-in（见 game_takeover_enabled）——默认命中
@@ -10691,14 +10753,22 @@ fn poll_tick() {
     // 里刷新，钩子装上后没有周期调用者 → 急停文件建了也不生效。这里挂到
     // 已有的 poll 节拍（约 110ms，内部还有 1s 节流），文件 IO 仍不在 LL 回调里。
     // 延迟挂载兜底：Activate 时无文档焦点 → 等 OnSetFocus；宿主有可编辑焦点
-    // 却不发焦点事件（或焦点不经 msctf）就永远挂不上 ⇒ 该进程完全打不出中文。
-    // poll 每拍复查：一旦 TSM 报出文档焦点，就按与 OnSetFocus 相同的判据补挂。
+    // 却不发焦点事件（或焦点事件被吞）就永远挂不上 ⇒ 该进程完全打不出中文。
+    // poll 每 500ms 复查：TSM 一旦报出文档焦点，就按与 OnSetFocus 相同的
+    // 判据补挂（try_advise_deferred；硬画像复检 + 软判定 caret_evidence）。
     {
         let sp = POLL_SHARED_TL.with(|s| s.borrow().clone());
         if let Some(shared) = sp {
             {
                 let g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 caps_snap_refresh(&g);
+            }
+            if DEFER_ADVISE.with(|c| c.get()) && !SINK_ADVISED.with(|c| c.get()) {
+                let now = raw_fs_cache_now_ms();
+                if now.saturating_sub(DEFER_TRY_MS.with(|c| c.get())) >= 500 {
+                    DEFER_TRY_MS.with(|c| c.set(now));
+                    let _ = try_advise_deferred(&shared, true);
+                }
             }
         }
     }

@@ -26,6 +26,25 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
 use windows_core::PCWSTR;
 
+// ── 【2026-11-03 M4·静态内容缓存】布局缓存统计与文本哈希 ──
+// 只用于诊断（trace + HUFU_LAYOUT_STATS=1 时每帧一条），正常路径零输出。
+static LAYOUT_CREATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAYOUT_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEASURE_CREATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MEASURE_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn fnv_u16(ws: &[u16]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in ws {
+        h ^= c as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 // ── DWM accent（未公开 API，Win10 1803+ 全系统 IME 通用做法）──
 
 // （旧 TrackPopupMenu 裸 FFI 块已随免激活自绘菜单退役删除——菜单不再
@@ -1222,6 +1241,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         crate::tsf::tl_cand_put_back(Some(c));
                     }
                     let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                    anim_boost_disarm(hwnd);
                     let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                     // 【三十六修】主分支同款：HIDE_LATER 延迟收窗钟一并杀
                     let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
@@ -1270,6 +1290,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     }
                 }
                 let _ = KillTimer(hwnd, FADE_TIMER_ID);
+                anim_boost_disarm(hwnd);
                 let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                 let _ = KillTimer(hwnd, HIDE_LATER_TIMER_ID);
                 // 【六十修】看门狗随藏同杀
@@ -1346,6 +1367,11 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         //（不 return：落到底部 DefWindowProcW 走完原生销毁链）
         0x0082 => unsafe {
             crate::overlaywin::destroy_for(hwnd);
+        },
+        // 【2026-11-03 系统动画设置】WM_SETTINGCHANGE：动画效果开关/远程
+        // 会话变化 → 失效缓存，下一个 show() 立即按新状态瞬跳或恢复。
+        0x001A => {
+            invalidate_system_anim_cache();
         }
         _ => {}
     }
@@ -1481,7 +1507,7 @@ pub(crate) struct SsfRuntime {
 
 /// 测量/渲染帧快照（spec 随帧 clone，重 mutable 状态留 self.ssf）。
 pub(crate) struct SsfFrame {
-    pub(crate) spec: crate::ssfwin::SsfSkinSpec,
+    pub(crate) spec: std::sync::Arc<crate::ssfwin::SsfSkinSpec>,
     pub(crate) bitmap: std::sync::Arc<crate::ssfwin::SsfBitmap>,
     pub(crate) layout: crate::ssfwin::SsfVariantLayout,
     pub(crate) scale: f32,
@@ -1902,14 +1928,47 @@ impl CandidateWindowV2 {
                 crate::tsf::trace("ssf: 载荷非 ssf 形态 → 切回 JSON 矢量渲染");
             }
             *self.ssf.borrow_mut() = None; // 切回 JSON：释放（进程解码缓存留 LRU）
+            self.ssf_spec_cache = None;
             return None;
         }
-        let spec = match crate::ssfwin::SsfSkinSpec::parse(skin) {
-            Some(s) => s,
-            None => {
-                crate::tsf::trace("ssf: 载荷解析失败 → 回退矢量（缺 cache_dir/fp？）");
-                *self.ssf.borrow_mut() = None;
-                return None;
+        // 【2026-11-03 M4】解析缓存：fp+cache_dir 不变时复用 Arc<SsfSkinSpec>，
+        // 免去每帧 serde/INI 重建（换皮才重新 parse）。
+        let cache_dir_key = skin
+            .pointer("/skin/cache_dir")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let fp_key = skin
+            .pointer("/skin/fp")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let spec_cache_key = (cache_dir_key, fp_key);
+        let spec = if !spec_cache_key.0.is_empty() && !spec_cache_key.1.is_empty() {
+            match &self.ssf_spec_cache {
+                Some((k, s)) if *k == spec_cache_key => std::sync::Arc::clone(s),
+                _ => match crate::ssfwin::SsfSkinSpec::parse(skin) {
+                    Some(s) => {
+                        let arc = std::sync::Arc::new(s);
+                        self.ssf_spec_cache = Some((spec_cache_key, std::sync::Arc::clone(&arc)));
+                        arc
+                    }
+                    None => {
+                        crate::tsf::trace("ssf: 载荷解析失败 → 回退矢量（缺 cache_dir/fp？）");
+                        *self.ssf.borrow_mut() = None;
+                        self.ssf_spec_cache = None;
+                        return None;
+                    }
+                },
+            }
+        } else {
+            match crate::ssfwin::SsfSkinSpec::parse(skin) {
+                Some(s) => std::sync::Arc::new(s),
+                None => {
+                    crate::tsf::trace("ssf: 载荷解析失败 → 回退矢量（缺 cache_dir/fp？）");
+                    *self.ssf.borrow_mut() = None;
+                    return None;
+                }
             }
         };
         let layout = match spec.choose(vertical, has_code, has_candidates) {
@@ -2168,6 +2227,10 @@ pub struct CandidateWindowV2 {
     offscreen: Option<windows::Win32::Graphics::Direct2D::ID2D1Bitmap1>,
     ulw_dc: isize,
     ulw_hbm: isize,
+    /// 建 DIB 时 SelectObject 换出的旧对象：DeleteObject 前必须先换回，
+    /// 否则「对象仍被 DC 选中」→ DeleteObject 必失败，尺寸每变一次漏
+    /// 一套 DIB+DC（审计 P0-4 H1 族，2026-11-03 修）。
+    ulw_old: isize,
     ulw_bits: isize,
     ulw_w: i32,
     ulw_h: i32,
@@ -2241,6 +2304,18 @@ pub struct CandidateWindowV2 {
         (u32, u32, u32, u32, (i32, i32), u32, u32),
         (ID2D1CommandList, ID2D1Effect),
     )>,
+    /// 【2026-11-03 M4·静态内容缓存】DirectWrite 文本布局按（文本哈希、长度、
+    /// 字体格式指针、宽、高）缓存——动画帧（高亮滑动/尺寸形变）内容不变，
+    /// 旧实现每帧对每个候选/注释重新 CreateTextLayout；命中后直接
+    /// DrawTextLayout。字体格式重建时清空（指针可能复用，防错配）。
+    pub(crate) text_layout_cache:
+        Option<std::collections::HashMap<(u64, u32, usize, u32, u32), IDWriteTextLayout>>,
+    /// 同上，measure 路径的实测宽度缓存（文本哈希、长度、字体格式指针、行高）。
+    pub(crate) text_measure_cache: Option<std::collections::HashMap<(u64, u32, usize, u32), f32>>,
+    /// 【2026-11-03 M4】SSF 皮肤描述解析缓存（fp+cache_dir 不变时零重复
+    /// serde/INI 解析；变体选择与取图仍每帧走轻量路径）。
+    pub(crate) ssf_spec_cache:
+        Option<((String, String), std::sync::Arc<crate::ssfwin::SsfSkinSpec>)>,
     /// 【毛玻璃退役 2026-09-11】glass_raw/glass_cache（抓屏+自绘模糊）
     /// 已随毛玻璃整链删除。accent 幂等键残留清理用。
     pub(crate) acrylic_last: std::cell::Cell<u64>,
@@ -2588,9 +2663,8 @@ impl CandidateWindowV2 {
     /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
     /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
     pub fn new() -> Option<CandidateWindowV2> {
-        // 【七十修】进程时钟精度 1ms（动画 tick 5ms 生效前提）——候选窗
-        // 首次创建时一次性提升（DllMain 内调不安全：loader lock）。
-        raise_timer_resolution_once();
+        // 【2026-11-03 功耗】不再在进程启动永久 timeBeginPeriod(1)——
+        // 动画驱动起臂/收臂时成对 begin/end（见 anim_boost_arm/disarm）。
         // 【特效退役 2026-09-22】ensure_thread(上屏特效线程预热)撤除
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
@@ -2677,6 +2751,7 @@ impl CandidateWindowV2 {
                 offscreen: None,
                 ulw_dc: 0,
                 ulw_hbm: 0,
+                ulw_old: 0,
                 ulw_bits: 0,
                 ulw_w: 0,
                 ulw_h: 0,
@@ -2697,6 +2772,9 @@ impl CandidateWindowV2 {
                 tf_cache: None,
                 dy_cache: None,
                 shadow_cache: None,
+                text_layout_cache: None,
+                text_measure_cache: None,
+                ssf_spec_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
@@ -2861,6 +2939,7 @@ impl CandidateWindowV2 {
                 offscreen: None,
                 ulw_dc: 0,
                 ulw_hbm: 0,
+                ulw_old: 0,
                 ulw_bits: 0,
                 ulw_w: 0,
                 ulw_h: 0,
@@ -2881,6 +2960,9 @@ impl CandidateWindowV2 {
                 tf_cache: None,
                 dy_cache: None,
                 shadow_cache: None,
+                text_layout_cache: None,
+                text_measure_cache: None,
+                ssf_spec_cache: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
@@ -3036,6 +3118,15 @@ impl CandidateWindowV2 {
         // 2) DIB（尺寸变化重建；top-down 32bpp，premultiplied 直传）
         if self.ulw_hbm == 0 || self.ulw_w != w || self.ulw_h != h {
             if self.ulw_hbm != 0 {
+                // 【P0-4 2026-11-03】DIB 仍被 DC 选中时 DeleteObject 必失败
+                //（每个尺寸变化漏 1 DIB + 1 DC）→ 先换回建位图时的旧对象。
+                if self.ulw_dc != 0 && self.ulw_old != 0 {
+                    let _ = SelectObject(
+                        HDC(self.ulw_dc as *mut _),
+                        HGDIOBJ(self.ulw_old as *mut _),
+                    );
+                    self.ulw_old = 0;
+                }
                 let _ = DeleteObject(HGDIOBJ(self.ulw_hbm as *mut _));
                 self.ulw_hbm = 0;
             }
@@ -3090,6 +3181,7 @@ impl CandidateWindowV2 {
             }
             self.ulw_hbm = hbm.0 as isize;
             self.ulw_dc = dc.0 as isize;
+            self.ulw_old = old.0 as isize;
             self.ulw_w = w;
             self.ulw_h = h;
             self.ulw_bits = bits as isize;
@@ -3678,7 +3770,9 @@ impl CandidateWindowV2 {
             .pointer("/skin/anim")
             .or_else(|| skin.get("anim"))
             .and_then(|x| x.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(true)
+            // 【2026-11-03】系统「动画效果」关闭 / 远程桌面 → 等价 anim=false。
+            && system_anim_allowed();
         let anim_spd = skin
             .pointer("/skin/anim_speed")
             .or_else(|| skin.get("anim_speed"))
@@ -3693,14 +3787,20 @@ impl CandidateWindowV2 {
         // ②动画帧位图=缓动尺寸逐帧 ULW，无拉伸残影。若实测直角再现
         // 再回退瞬跳（用户拍板）。
         self.anim_on.set(anim_on);
-        let anim_spd = if anim_on { anim_spd } else { 0.0 };
+        let mut anim_spd = if anim_on { anim_spd } else { 0.0 };
+        // 【2026-11-03 第三批·电源自适应】省电模式/低电量（<30%）时
+        // 动效整体降速 45%（仍保留反馈，不硬关）；RDP 已由系统动画门瞬跳。
+        if anim_spd > 0.01 && power_saver_active() {
+            anim_spd *= 0.55;
+        }
         self.anim_spd.set(anim_spd);
         // 【透明度渐变退役·二十四修】半透面板+深色底下任何 alpha
         // 过渡都「变深/透底」（用户三度否决）——fade 全链已删。
         // 【四十五修·基准再提速 2026-10-29】皮肤缺省档同步提速：尺寸
         // 形变 150→110ms、高亮滑动 100→80ms（「基准速度再快一些」；
         // pos_ms 只管 chase/辅助路径不动）。
-        self.size_ms = (layout_f(skin, "size_ms", 110.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.size_ms =
+            (layout_f(skin, "size_ms", MOTION_BASE_MS as f32).clamp(0.0, 600.0) * anim_spd) as u32;
         self.pos_ms = (layout_f(skin, "pos_ms", 75.0).clamp(0.0, 600.0) * anim_spd) as u32;
         // 【六修·虎娘对齐】形变退役 → 【七修修订】形变保留（用户实测
         // 要的是去回弹不是去形变；线性化已根除回弹），默认开，
@@ -3726,7 +3826,8 @@ impl CandidateWindowV2 {
         // 【高亮滑动 2026-10-09】胶囊滑动时长（二十七修定稿 100ms——
         // 收场钟 150ms 不变：滑动先播完，留一拍确认再收；皮肤 hl_ms
         // 可调，0=瞬跳）。
-        self.hl_ms = (layout_f(skin, "hl_ms", 80.0).clamp(0.0, 600.0) * anim_spd) as u32;
+        self.hl_ms = (layout_f(skin, "hl_ms", MOTION_FAST_MS as f32).clamp(0.0, 600.0) * anim_spd)
+            as u32;
         // 【注释常显 2026-11 用户拍板】默认 0：注释列首帧即全展开——
         // 候选窗出现即最终形态，不再「停手 200ms 后展宽」二次形变
         //（二十五修自认的「候选慢半拍」观感主源；QQ 形变期 Y 抖动的
@@ -3957,6 +4058,14 @@ impl CandidateWindowV2 {
         let tf_cache_in = self.tf_cache.clone();
         let dy_cache_in = self.dy_cache.clone();
         let shadow_cache_in = self.shadow_cache.clone();
+        // 【2026-11-03 M4】静态内容缓存：块前取块后存（同一 show 作用域，
+        // measure/draw 两个分支都能用；字体格式重建时清空防指针错配）。
+        let layout_cache =
+            std::cell::RefCell::new(self.text_layout_cache.take().unwrap_or_default());
+        let measure_cache =
+            std::cell::RefCell::new(self.text_measure_cache.take().unwrap_or_default());
+        // 布局缓存创建用 DWrite 工厂（draw 分支作用域里没有 `dwrite` 局部）。
+        let dwrite_factory = self.dwrite.clone();
         let cand_spacing = layout_f(skin, "candidate_spacing", 6.0);
         let hilite_pad = layout_f(skin, "hilite_padding", 4.0);
         // 【皮肤元素自查 2026-09-08】对照 weasel 语义激活三个死参数：
@@ -4225,6 +4334,13 @@ impl CandidateWindowV2 {
                 ));
             }
 
+            // 【2026-11-03 M4】字体格式重建 → 清静态布局/测量缓存
+            //（旧格式释放后指针可能被复用，防错配旧布局）。
+            if !tf_hit {
+                layout_cache.borrow_mut().clear();
+                measure_cache.borrow_mut().clear();
+            }
+
             // 【放大滑动 v2·回退 2026-10-29】插值字号整体删除（用户拍板：
             // 卡顿，放大钉回首选）。
 
@@ -4234,10 +4350,31 @@ impl CandidateWindowV2 {
                 }
                 if let Some(tf) = tf {
                     let w: Vec<u16> = s.encode_utf16().collect();
-                    if let Ok(l) = dwrite.CreateTextLayout(&w, tf, 4096.0, line_h.max(8.0)) {
+                    let line_px = line_h.max(8.0);
+                    let key = (
+                        fnv_u16(&w),
+                        w.len() as u32,
+                        tf.as_raw() as usize,
+                        line_px.to_bits(),
+                    );
+                    {
+                        let c = measure_cache.borrow();
+                        if let Some(v) = c.get(&key) {
+                            MEASURE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return *v;
+                        }
+                    }
+                    if let Ok(l) = dwrite.CreateTextLayout(&w, tf, 4096.0, line_px) {
                         let mut m = DWRITE_TEXT_METRICS::default();
                         if l.GetMetrics(&mut m).is_ok() {
-                            return m.width.ceil();
+                            let v = m.width.ceil();
+                            let mut c = measure_cache.borrow_mut();
+                            if c.len() > 512 {
+                                c.clear();
+                            }
+                            c.insert(key, v);
+                            MEASURE_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return v;
                         }
                     }
                 }
@@ -5524,27 +5661,50 @@ impl CandidateWindowV2 {
                         if ws.is_empty() {
                             return;
                         }
-                        let rect = D2D_RECT_F {
-                            left: x,
-                            top: y,
-                            right: x + w,
-                            bottom: y + h,
-                        };
-                        let _ = ctx.DrawText(
-                            &ws,
-                            tf,
-                            &rect,
-                            brush,
-                            // 【彩色 emoji 2026-10-17 用户实锤】候选里的 emoji
-                            // 之前渲染成单色符号（上屏到应用里却是彩色表情）：
-                            // D2D 默认走字形单色描边，必须显式开
-                            // ENABLE_COLOR_FONT 才渲染 COLR 彩色字形
-                            //（Segoe UI Emoji）；DirectWrite 系统字体回退
-                            // 自会把 emoji 码点指到该字体，此处只差这面旗。
-                            // 普通中文/ASCII 字体无彩色表，零影响零成本。
-                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-                            DWRITE_MEASURING_MODE_NATURAL,
+                        // 【2026-11-03 M4】布局缓存：动画帧（高亮滑动/尺寸形变）
+                        // 文本内容与宽高不变 → 直接复用 IDWriteTextLayout，
+                        // 省掉每帧 per-candidate 的 CreateTextLayout。
+                        let key = (
+                            fnv_u16(&ws),
+                            ws.len() as u32,
+                            tf.as_raw() as usize,
+                            w.to_bits(),
+                            h.to_bits(),
                         );
+                        let mut need_create = false;
+                        {
+                            let c = layout_cache.borrow();
+                            if c.contains_key(&key) {
+                                LAYOUT_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                need_create = true;
+                            }
+                        }
+                        if need_create {
+                            if let Some(factory) = dwrite_factory.as_ref() {
+                                if let Ok(l) =
+                                    factory.CreateTextLayout(&ws, tf, w.max(1.0), h.max(1.0))
+                                {
+                                    let mut c = layout_cache.borrow_mut();
+                                    if c.len() > 512 {
+                                        c.clear();
+                                    }
+                                    c.insert(key, l);
+                                    LAYOUT_CREATED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        let c = layout_cache.borrow();
+                        if let Some(layout) = c.get(&key) {
+                            let _ = ctx.DrawTextLayout(
+                                D2D_POINT_2F { x, y },
+                                layout,
+                                brush,
+                                // 【彩色 emoji】ENABLE_COLOR_FONT 保留（见原 DrawText 注释）。
+                                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                            );
+                        }
                     }
                 };
 
@@ -7140,6 +7300,20 @@ impl CandidateWindowV2 {
             if let Some(v) = shadow_cache_out {
                 self.shadow_cache = Some(v);
             }
+            // 【2026-11-03 M4】静态布局/测量缓存换回（RefCell::replace：
+            // 闭包仍持 &layout_cache 时也能取走，无需 move）。
+            self.text_layout_cache = Some(layout_cache.replace(Default::default()));
+            self.text_measure_cache = Some(measure_cache.replace(Default::default()));
+            if crate::tsf::trace_on() && std::env::var("HUFU_LAYOUT_STATS").is_ok() {
+                use std::sync::atomic::Ordering;
+                crate::tsf::trace(&format!(
+                    "cw2 layout: created={} hit={} measure={} mhit={}",
+                    LAYOUT_CREATED.load(Ordering::Relaxed),
+                    LAYOUT_HIT.load(Ordering::Relaxed),
+                    MEASURE_CREATED.load(Ordering::Relaxed),
+                    MEASURE_HIT.load(Ordering::Relaxed),
+                ));
+            }
             // 内容坐标 → 窗口坐标（内容在阴影边距内侧；高 DPI 下边距同乘 scale）
             // 【拖拽防闪 2026-09-08】拖拽中（鼠标按住移动）本线程与 wndproc
             // 的 WM_MOUSEMOVE 并发 SetWindowPos 同一窗口——两处位置打架
@@ -7856,23 +8030,117 @@ pub const IME_WATCHDOG_TIMER_ID: usize = 0x4846_5553; // 'HuFc'
 pub const HIDE_LATER_TIMER_ID: usize = 0x4846_5552; // 'HuFb'
 /// 【七十修·动效帧率】动画 tick 周期。原 15ms：SetTimer 实际 ~15.6ms
 /// → 动画 ~64fps——60Hz 屏（16.7ms/帧）恰每帧 1 步无感；240Hz 屏
-///（4.2ms/帧）每 3.7 帧才 1 步=高刷用户必见跳帧。降至 5ms + 进程
-/// 时钟精度 timeBeginPeriod(1)（候选窗创建时一次性，见 new()）→
-/// 动画 ~150-200fps，高刷观感对齐；60Hz 无感不退化。动画窗外
-/// timer 自动 Kill，常驻开销为零。
-pub const FADE_TICK_MS: u32 = 5;
-/// 提升系统定时器粒度到 1ms（SetTimer(5) 实际生效的前提）。进程内
-/// 一次（OnceLock）；winmm 直连 FFI（免 Cargo feature）。
-fn raise_timer_resolution_once() {
-    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    DONE.get_or_init(|| unsafe {
-        #[link(name = "winmm")]
-        extern "system" {
-            fn timeBeginPeriod(ms: u32) -> u32;
-        }
-        let _ = timeBeginPeriod(1);
-    });
+///（4.2ms/帧）每 3.7 帧才 1 步=高刷用户必见跳帧。曾降至 5ms + 进程
+/// 时钟精度 timeBeginPeriod(1)。
+/// 【2026-11-03 帧截止】固定 5ms tick 在 60Hz 屏上被「帧门 >= ceil(16.7)=17」
+/// 量化成 20ms/帧（实际 50fps）。改为按窗口所在显示器帧距自适应：
+/// 60Hz→17ms / 144Hz→7ms / 240Hz→5ms（4..20ms），每 tick 至多一帧；
+/// 帧门用「周期-2ms」容差吸收 timer 抖动，60Hz 不再掉到 50fps。
+pub const FADE_TICK_MIN_MS: u32 = 4;
+pub const FADE_TICK_MAX_MS: u32 = 20;
+
+/// 【2026-11-03 M5·内部动效 token】统一节奏，**不向皮肤开放**：
+/// fast = 高亮胶囊/开关等即时反馈；base = 逐键跟随/尺寸形变；
+/// slow = 选重确认总时长（高亮滑动 fast + 暂留 slow-fast）。
+pub const MOTION_FAST_MS: u32 = 80;
+pub const MOTION_BASE_MS: u32 = 110;
+pub const MOTION_SLOW_MS: u32 = 180;
+
+/// 本窗动画 tick 周期（= 所在显示器帧距，4..20ms；查询失败兜底 60Hz）。
+fn anim_tick_ms(hwnd: HWND) -> u32 {
+    (morph_frame_interval_ms(hwnd) as u32).clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS)
 }
+
+/// 【2026-11-03 可访问性/省电】系统动画许可：
+/// - Windows 设置「动画效果」关闭（SPI_GETCLIENTAREAANIMATION=0）；
+/// - 远程桌面会话（SM_REMOTESESSION）——RDP 下逐帧 SWP/重绘代价高。
+/// 缓存 2s；WM_SETTINGCHANGE 会立即失效重读。查询失败按允许处理。
+static SYSTEM_ANIM_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0); // 0=未知 1=允许 2=禁止
+static SYSTEM_ANIM_CHECK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn invalidate_system_anim_cache() {
+    SYSTEM_ANIM_STATE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SYSTEM_ANIM_CHECK_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn system_anim_allowed() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = SYSTEM_ANIM_CHECK_MS.load(Ordering::Relaxed);
+    let mut state = SYSTEM_ANIM_STATE.load(Ordering::Relaxed);
+    if state == 0 || now.saturating_sub(last) > 2000 {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            #[link_name = "SystemParametersInfoW"]
+            fn sys_param_info_w(
+                action: u32,
+                param: u32,
+                pv: *mut core::ffi::c_void,
+                winini: u32,
+            ) -> i32;
+        }
+        // SM_REMOTESESSION；SPI_GETCLIENTAREAANIMATION=0x1042。
+        let rdp = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+        let mut enabled: i32 = 1;
+        let ok = unsafe {
+            sys_param_info_w(0x1042, 0, &mut enabled as *mut i32 as *mut core::ffi::c_void, 0)
+        } != 0;
+        let allow = ok && enabled != 0 && !rdp;
+        let new_state: u8 = if allow { 1 } else { 2 };
+        if state != new_state && crate::tsf::trace_on() {
+            crate::tsf::trace(&format!(
+                "cw2: 系统动画许可={allow}（spi_ok={ok} enabled={enabled} rdp={rdp}）"
+            ));
+        }
+        SYSTEM_ANIM_STATE.store(new_state, Ordering::Relaxed);
+        SYSTEM_ANIM_CHECK_MS.store(now, Ordering::Relaxed);
+        state = new_state;
+    }
+    state == 1
+}
+
+/// 【2026-11-03 第三批】省电/低电量判定（只读系统状态，2s 缓存）。
+fn power_saver_active() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[repr(C)]
+    struct Sps {
+        ac: u8,
+        flag: u8,
+        percent: u8,
+        saver: u8,
+        life: u32,
+        full: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemPowerStatus(s: *mut Sps) -> i32;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST_VAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // 以进程启动为基准的 ms 缓存。
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && t.saturating_sub(last) < 2000 {
+        return LAST_VAL.load(Ordering::Relaxed);
+    }
+    let mut s = Sps { ac: 255, flag: 0, percent: 255, saver: 0, life: 0, full: 0 };
+    let ok = unsafe { GetSystemPowerStatus(&mut s) } != 0;
+    let v = ok && (s.saver != 0 || (s.ac == 0 && s.percent != 255 && s.percent < 30));
+    LAST.store(t, Ordering::Relaxed);
+    LAST_VAL.store(v, Ordering::Relaxed);
+    v
+}
+/// 动画驱动活跃期才把系统定时器粒度提到 1ms（见 anim_boost_arm /
+/// anim_boost_disarm）：进程常驻不再长期改全局精度（旧实现 new() 里
+/// 一次 timeBeginPeriod(1) 到进程退出才释放，伤续航）。
+/// winmm 事件在岗时 SetTimer 退化为 100ms 看门狗（见 anim_tick_arm）。
+pub const FADE_WATCHDOG_MS: u32 = 100;
 // ============================================================================
 // 【五十三修·动效高频驱动】WM_TIMER 投递颗粒 12~31ms 抖动（消息队列
 // 合并 + 闲时投递策略），48ms 入场只剩 3 帧=「一顿一顿」（用户实锤，
@@ -7889,11 +8157,19 @@ fn raise_timer_resolution_once() {
 // ============================================================================
 /// 动效高频 tick 消息（wndproc 消费 → fade_tick_shared）。
 pub const WM_APP_ANIM: u32 = 0x4941; // "A"
-///（截止 GetTickCount64 ms, 注册 hwnd 列表）
-static ANIM_BOOST: std::sync::Mutex<(u64, Vec<isize>)> =
+///（截止 GetTickCount64 ms, 注册 (hwnd, tick 周期 ms) 列表）
+static ANIM_BOOST: std::sync::Mutex<(u64, Vec<(isize, u32)>)> =
     std::sync::Mutex::new((0, Vec::new()));
 static ANIM_BOOST_EVENT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// 当前 winmm 周期事件的周期（0=未启动）。多窗不同刷新率时取最小周期；
+/// 周期变化必须重建事件（timeSetEvent 不支持改周期）。
+static ANIM_BOOST_PERIOD: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// 本进程是否已把系统定时器粒度提到 1ms（timeBeginPeriod 配对计数）。
+/// 只在 winmm 事件生命周期内为 true；事件被 kill/过期即 timeEndPeriod 归还。
+static ANIM_BOOST_RES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -7909,6 +8185,8 @@ unsafe extern "system" {
         event_type: u32,
     ) -> u32;
     fn timeKillEvent(id: u32) -> u32;
+    fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
 }
 
 /// winmm 回调（winmm 工作线程）：过期自杀；否则向全部注册窗投递
@@ -7929,46 +8207,113 @@ unsafe extern "system" fn anim_boost_cb(_id: u32, _m: u32, _u: usize, _a: usize,
     };
     if expired {
         let ev = ANIM_BOOST_EVENT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        ANIM_BOOST_PERIOD.store(0, std::sync::atomic::Ordering::Relaxed);
         if ev != 0 {
             unsafe { let _ = timeKillEvent(ev as u32); }
         }
+        if ANIM_BOOST_RES.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            unsafe { let _ = timeEndPeriod(1); }
+        }
         return;
     }
-    for h in post {
+    for &(h, _tick) in post.iter() {
         unsafe {
             let _ = PostMessageW(HWND(h as *mut core::ffi::c_void), WM_APP_ANIM, WPARAM(0), LPARAM(0));
         }
     }
 }
 
-/// 起臂动效高频驱动：注册本窗 + 刷新截止 + 无事件则启周期回调。
-/// 幂等（重复调用=刷新截止）。失败静默退化为纯 SetTimer 路径。
-fn anim_boost_arm(hwnd: HWND) {
-    raise_timer_resolution_once();
-    let mut g = match ANIM_BOOST.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
+/// 起臂动效高频驱动：注册本窗 + 刷新截止 + 按最小周期启/重建周期回调。
+/// 幂等（重复调用=刷新截止）。返回 false = winmm 不可用，调用方保留
+/// SetTimer 兜底路径。
+fn anim_boost_arm(hwnd: HWND, tick_ms: u32) -> bool {
+    let tick_ms = tick_ms.clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS);
+    let min_period = {
+        let mut g = match ANIM_BOOST.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        g.0 = unsafe { GetTickCount64() } + 400;
+        let h = hwnd.0 as isize;
+        match g.1.iter_mut().find(|(x, _)| *x == h) {
+            Some(slot) => slot.1 = tick_ms,
+            None => g.1.push((h, tick_ms)),
+        }
+        g.1.iter().map(|(_, ms)| *ms).min().unwrap_or(tick_ms)
     };
-    g.0 = unsafe { GetTickCount64() } + 400;
-    let h = hwnd.0 as isize;
-    if !g.1.contains(&h) {
-        g.1.push(h);
+    let cur = ANIM_BOOST_PERIOD.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != 0 && cur != min_period {
+        // 高刷窗加入/离开 → 事件周期跟随最小帧距；旧事件先杀再建。
+        let ev = ANIM_BOOST_EVENT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        ANIM_BOOST_PERIOD.store(0, std::sync::atomic::Ordering::Relaxed);
+        if ev != 0 {
+            unsafe { let _ = timeKillEvent(ev as u32); }
+        }
     }
     if ANIM_BOOST_EVENT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        // TIME_PERIODIC=1；分辨率 1ms（timeBeginPeriod(1) 已提）。
-        let id = unsafe { timeSetEvent(FADE_TICK_MS, 1, Some(anim_boost_cb), 0, 1) };
-        if id != 0 {
-            ANIM_BOOST_EVENT.store(id as usize, std::sync::atomic::Ordering::Relaxed);
+        // TIME_PERIODIC=1。1ms 粒度只在事件在岗期间提升，事件收臂归还。
+        if !ANIM_BOOST_RES.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            unsafe { let _ = timeBeginPeriod(1); }
         }
+        let id = unsafe { timeSetEvent(min_period, 1, Some(anim_boost_cb), 0, 1) };
+        if id == 0 {
+            if ANIM_BOOST_RES.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                unsafe { let _ = timeEndPeriod(1); }
+            }
+            return false;
+        }
+        ANIM_BOOST_EVENT.store(id as usize, std::sync::atomic::Ordering::Relaxed);
+        ANIM_BOOST_PERIOD.store(min_period, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// 收臂：注销本窗；没有窗口在动画 → 杀 winmm 事件、归还定时器精度。
+/// anim_done 的 tick 末尾调用（与 anim_boost_arm 严格配对）。
+fn anim_boost_disarm(hwnd: HWND) {
+    let empty = {
+        let mut g = match ANIM_BOOST.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let h = hwnd.0 as isize;
+        g.1.retain(|(x, _)| *x != h);
+        if g.1.is_empty() {
+            g.0 = 0;
+            true
+        } else {
+            false
+        }
+    };
+    if !empty {
+        return;
+    }
+    let ev = ANIM_BOOST_EVENT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    ANIM_BOOST_PERIOD.store(0, std::sync::atomic::Ordering::Relaxed);
+    if ev != 0 {
+        unsafe { let _ = timeKillEvent(ev as u32); }
+    }
+    if ANIM_BOOST_RES.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        unsafe { let _ = timeEndPeriod(1); }
     }
 }
 
-/// 动效 tick 起臂统一入口：SetTimer 兜底 + winmm 高频驱动双路。
+/// 动效 tick 起臂统一入口：SetTimer 兜底 + winmm 按帧距驱动双路。
+/// 两路同周期（不再固定 5ms），每帧最多多一个幂等 tick；winmm 事件
+/// 400ms 自限到期后 SetTimer 继续供帧（freq 模态保活依赖它）。
 fn anim_tick_arm(hwnd: HWND) {
+    let tick = anim_tick_ms(hwnd);
     unsafe {
-        let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_TICK_MS, None);
+        if anim_boost_arm(hwnd, tick) {
+            // 高频驱动在岗：SetTimer 退化为 100ms 看门狗——事件若被系统
+            // 回收/到期，下一次看门狗 tick 会重新起臂，动画不断帧；收臂
+            // （anim_done）时一并 kill。
+            let _ = SetTimer(hwnd, FADE_TIMER_ID, FADE_WATCHDOG_MS, None);
+        } else {
+            // winmm 不可用：SetTimer 直接按帧距兜底。
+            let _ = SetTimer(hwnd, FADE_TIMER_ID, tick, None);
+        }
     }
-    anim_boost_arm(hwnd);
 }
 /// 【四十六修·多标签宿主】按「谁的 cand2 拥有本 tick 的 hwnd」选
 /// Shared：Win11 记事本等每个标签/窗口独立线程的宿主里，标签 2+
@@ -8313,7 +8658,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 let render_ok = finished || {
                     let now = std::time::Instant::now();
                     if now.duration_since(c.size_anim_last_render.get()).as_millis()
-                        >= morph_frame_interval_ms(hwnd)
+                        >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
                     {
                         c.size_anim_last_render.set(now);
                         true
@@ -8424,7 +8769,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 let render_ok = {
                     let now = std::time::Instant::now();
                     if now.duration_since(c.hl_anim_last_render.get()).as_millis()
-                        >= morph_frame_interval_ms(hwnd)
+                        >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
                     {
                         c.hl_anim_last_render.set(now);
                         true
@@ -8441,6 +8786,10 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         }
         if anim_done {
             let _ = KillTimer(hwnd, FADE_TIMER_ID);
+            anim_boost_disarm(hwnd);
+        } else {
+            // tick 保活：刷新 winmm 截止（freq 模态等长动画不因 400ms 自限断帧）
+            let _ = anim_boost_arm(hwnd, anim_tick_ms(hwnd));
         }
         crate::tsf::tl_cand_put_back(tl);
         return;
@@ -8480,8 +8829,11 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             // 驱动下 1-3ms 突发连渲染；高刷屏按其实际刷新率足帧。
             let render_ok = finished || {
                 let now = std::time::Instant::now();
+                // 【2026-11-03 帧截止】tick 已是帧距；门限=周期-2ms 容差，
+                // 每帧放行一帧（旧 >=ceil(16.7)=17ms 与 5ms tick 把 60Hz
+                // 量化成 20ms/帧=实际 50fps）。
                 if now.duration_since(c.size_anim_last_render.get()).as_millis()
-                    >= morph_frame_interval_ms(hwnd)
+                    >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
                 {
                     c.size_anim_last_render.set(now);
                     true
@@ -8635,7 +8987,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             let render_ok = {
                 let now = std::time::Instant::now();
                 if now.duration_since(c.hl_anim_last_render.get()).as_millis()
-                    >= morph_frame_interval_ms(hwnd)
+                    >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
                 {
                     c.hl_anim_last_render.set(now);
                     true
@@ -8718,7 +9070,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 let render_ok = {
                     let now = std::time::Instant::now();
                     if now.duration_since(c.size_anim_last_render.get()).as_millis()
-                        >= morph_frame_interval_ms(hwnd)
+                        >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
                     {
                         c.size_anim_last_render.set(now);
                         true
@@ -8742,6 +9094,10 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     crate::overlaywin::sync_for(hwnd, &skin);
     if anim_done {
         let _ = KillTimer(hwnd, FADE_TIMER_ID);
+        anim_boost_disarm(hwnd);
+    } else {
+        // tick 保活：刷新 winmm 截止（freq 模态等长动画不因 400ms 自限断帧）
+        let _ = anim_boost_arm(hwnd, anim_tick_ms(hwnd));
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
     g.cand2_busy = false;

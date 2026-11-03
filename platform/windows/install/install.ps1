@@ -500,7 +500,7 @@ try {
     $ws = New-Object -ComObject WScript.Shell
     $lnk = $ws.CreateShortcut((Join-Path $sm 'HuFu 虎符输入法设置.lnk'))
     $lnk.TargetPath = (Join-Path $inst 'hufu-settings.exe')
-    $lnk.Arguments = '--url "http://127.0.0.1:4390/next?shell=1"'
+    $lnk.Arguments = ''
     $lnk.WorkingDirectory = $inst
     $lnk.IconLocation = $icon
     $lnk.Save()

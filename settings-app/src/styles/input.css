@@ -475,3 +475,34 @@ body.light .ip-code {
     gap: 11px;
   }
 }
+
+/* ── 2026-11-03 输入页横向页签：滑动墨条 + 内容横向入场 ───────────── */
+.ip-tabs{
+  position:relative;
+  flex-wrap:nowrap;
+  overflow-x:auto;
+  overflow-y:hidden;
+  scrollbar-width:none;
+  padding-bottom:1px;
+}
+.ip-tabs::-webkit-scrollbar{display:none}
+.ip-tab{
+  flex:none;
+  border-bottom:0!important;
+  border-radius:8px 8px 0 0;
+}
+.ip-tab.on{
+  background:linear-gradient(180deg,rgba(231,183,92,.08),transparent)!important;
+}
+.ip-tab-ink{
+  position:absolute;left:0;bottom:0;height:2px;border-radius:2px;
+  background:linear-gradient(90deg,var(--gold3),var(--gold2));
+  box-shadow:0 0 9px rgba(231,183,92,.45);
+  pointer-events:none;
+  transition:transform .32s cubic-bezier(.2,.8,.2,1),width .32s cubic-bezier(.2,.8,.2,1);
+  will-change:transform,width;
+}
+.ip-grid[data-slide="right"]{animation:ipSlideFromRight .34s cubic-bezier(.2,.8,.2,1)}
+.ip-grid[data-slide="left"]{animation:ipSlideFromLeft .34s cubic-bezier(.2,.8,.2,1)}
+@keyframes ipSlideFromRight{from{opacity:.08;transform:translateX(44px)}to{opacity:1;transform:none}}
+@keyframes ipSlideFromLeft{from{opacity:.08;transform:translateX(-44px)}to{opacity:1;transform:none}}

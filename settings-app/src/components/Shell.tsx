@@ -24,7 +24,6 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
       { key: 'overview', label: '概览', icon: 'home' },
       { key: 'schemes', label: '方案', icon: 'grid' },
       { key: 'input', label: '输入', icon: 'keyboard' },
-      { key: 'keymap', label: '键位', icon: 'keyboard' },
     ],
   },
   {
@@ -38,6 +37,7 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
     label: '进阶',
     items: [
       { key: 'sentence', label: '整句模型', icon: 'spark' },
+      { key: 'keymap', label: '键位', icon: 'keyboard' },
       { key: 'data', label: '数据与备份', icon: 'db' },
       { key: 'sync', label: '云同步', icon: 'cloud' },
     ],

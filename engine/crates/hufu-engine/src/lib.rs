@@ -5759,7 +5759,12 @@ impl Engine {
         if base.is_empty() || raw.len() <= base.len() {
             return raw.clone();
         }
-        let tail = &raw[base.len()..];
+        // 【P1 2026-11-03】编码字母表含非 ASCII 时 base.len() 是字节数、
+        // 可能落在多字节字符中间；旧实现直接切片会 UTF-8 边界 panic
+        //（state() 每帧调用 → server 进程崩）。越界/非边界一律原样返回。
+        let Some(tail) = raw.get(base.len()..) else {
+            return raw.clone();
+        };
         let mut chars = tail.chars();
         let lock_c = match (chars.next(), chars.next()) {
             (Some(c), None) => c,

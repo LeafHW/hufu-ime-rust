@@ -200,11 +200,47 @@ fn process_is_elevated() -> bool {
     }
 }
 
+/// 【2026-11-02 P1 附带】命名管道是否已存在（不区分能否打开）。
+/// `ensure_server` 只在 pipe=fail 时被调用；若 pipe 存在但连接失败
+///（ACL/繁忙/服务端挂起），盲目再拉一个 server 会变成“每宿主一个
+/// server”的风暴（本次 TSF 单测在沙箱里实测 20+ 个）。存在即不拉，
+/// 30s 后由正常重试/用户重启解决。
+fn server_pipe_present() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+    }
+    // 【P0-5 2026-11-03】raw string 里的 `\0` 是字面「反斜杠+0」，不是
+    // NUL 结尾：WaitNamedPipeW 读到未终止缓冲区（UB），实测 err=161
+    // (ERROR_BAD_PATHNAME) → 旧判据「非 2 即存在」恒真 → ensure_server
+    // 永不拉起（server 被杀后输入法永久打不了字）。这里显式补 NUL。
+    let mut name: Vec<u16> = r"\\.\pipe\hufu-ime".encode_utf16().collect();
+    name.push(0);
+    let ok = unsafe { WaitNamedPipeW(name.as_ptr(), 0) };
+    if ok != 0 {
+        return true;
+    }
+    // 只把明确的「管道对象存在」错误当成存在；未知错误保守放行去拉起
+    // （宁可多拉一次由单实例互斥兜底，也不要像旧版那样永久不再拉起）。
+    match std::io::Error::last_os_error().raw_os_error().unwrap_or(0) {
+        // 5=拒绝访问 / 121=信号超时 / 231=实例全忙：管道对象存在
+        5 | 121 | 231 => true,
+        // 2=ERROR_FILE_NOT_FOUND：确实没有管道
+        2 => false,
+        _ => false,
+    }
+}
+
 fn ensure_server() -> bool {
     // 【2026-11 安全阀】提权宿主不拉起 server（详见 process_is_elevated）：
     // 宁可在提权进程里打字失败，也不留一个普通权限杀不掉的常驻 server。
     if process_is_elevated() {
         crate::tsf::trace("ipc: 提权宿主 → 不拉起 server（防高 IL 常驻进程）");
+        return false;
+    }
+    // 【2026-11-02】pipe 已经存在但连接失败（ACL/繁忙）→ 不再无限拉起。
+    if server_pipe_present() {
+        crate::tsf::trace("ipc: server pipe 已存在（连接失败可能是 ACL/忙）→ 不重复拉起");
         return false;
     }
     use std::sync::atomic::{AtomicU64, Ordering};

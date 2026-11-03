@@ -8,7 +8,10 @@
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL,
+    BeginPaint, CLEARTYPE_QUALITY, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush,
+    DEFAULT_CHARSET, DeleteObject, EndPaint, FW_BOLD, FW_NORMAL, FillRect,
+    GetStockObject, GetTextExtentPoint32W, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, NULL_PEN, PAINTSTRUCT,
+    PS_SOLID, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TextOutW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -23,38 +26,170 @@ const ID_POS: i32 = 103;
 const ID_PH: i32 = 104;
 const ID_OK: i32 = 1001;
 const ID_CANCEL: i32 = 1002;
-
-// 预览动态项 id 段（CTLCOLOR 按段分色；GWLP_USERDATA 存文字 COLORREF）
+/// 自绘预览区辅助 id（仅用于 WM_CTLCOLORSTATIC 选底色/字色）。
+const ID_PV_TITLE: i32 = 105;
+const ID_PV_MSG: i32 = 106;
+const ID_PV_HEAD_CUR: i32 = 1990;
+const ID_PV_HEAD_AFT: i32 = 2190;
+// 预览项 id 段（CTLCOLOR 按段分色；子控件仍在用）
 const ID_CUR_BASE: i32 = 2000; // 现有项
 const ID_AFT_BASE: i32 = 2200; // 加入后普通项
 const ID_AFT_PH: i32 = 2400; // 加入后占位项（③④… 用标签色压暗）
 const ID_AFT_NEW: i32 = 2600; // 加入后新词高亮项
+
+// 预览动态项 id 段已退役（2026-11-03 重绘：预览改为父窗口自绘，
+// 不再创建 STATIC 子控件）。保留 ID_EN_UPDATE。
 const ID_EN_UPDATE: u32 = 0x400; // EN_UPDATE（0x200 是 EN_KILLFOCUS！）
 
 const CLASS: PCWSTR = w!("HuFuAddWord");
-// 【整体加大 20% 2026-10-08】原布局 396/16/364/284 按 1.2 倍放大
-//（用户反馈加词框偏小，对齐虎爪弹窗观感）——原值注释在侧便于对照。
-const WIN_W: i32 = 475; // 396
-const PV_X: i32 = 19; // 16
-const PV_W: i32 = 437; // 364 预览排版宽（候选流）
-const EDIT_W: i32 = 341; // 284 输入框宽（收窄，不再通栏）
-/// 行几何（同批 1.2 倍）：首行 y、行距、标签高、编辑框下沉/高。
-const ROW_Y0: i32 = 17; // 14
-const ROW_PITCH: i32 = 74; // 62
-const LBL_W: i32 = 396; // 330
-const LBL_H: i32 = 29; // 24
-const EDIT_DY: i32 = 31; // 26
-const EDIT_H: i32 = 40; // 33
-/// 三行编辑框之后的占位符勾选行 y（ROW_Y0+3*ROW_PITCH+EDIT_DY+EDIT_H
-/// 之上留 6px）与预览表头/预览起始 y。
-const PH_ROW_Y: i32 = 242;
-const PV_TITLE_Y: i32 = 276; // 原 202
-const PV_START_Y: i32 = 306; // 原 228
-/// 按钮几何（1.2 倍）。
-const BTN_OK_X: i32 = 259; // 216
-const BTN_CANCEL_X: i32 = 373; // 311
-const BTN_W: i32 = 98; // 82
-const BTN_H: i32 = 41; // 34
+
+// 【2026-11-03 视觉重做】无边框卡片式弹窗：520 宽、24 边距、
+// 字段=标签+圆角输入卡、预览=真实候选皮肤卡片、底部主/次按钮。
+const WIN_W: i32 = 520;
+const M: i32 = 24;
+const CONTENT_W: i32 = WIN_W - M * 2; // 472
+const PV_X: i32 = M + 24;
+const PV_W: i32 = CONTENT_W - 48;
+/// 字段卡：首行 y、行距、卡高、编辑框内缩/高。
+const ROW_Y0: i32 = 84;
+const ROW_PITCH: i32 = 84;
+const CARD_H: i32 = 44;
+const EDIT_INSET: i32 = 12;
+const EDIT_H: i32 = 30;
+const EDIT_W: i32 = CONTENT_W - EDIT_INSET * 2;
+const EDIT_DY: i32 = (CARD_H - EDIT_H) / 2;
+const LBL_H: i32 = 20;
+const LBL_W: i32 = 300;
+/// 占位符开关（自绘 toggle）。
+const TOGGLE_Y: i32 = 340;
+const TOGGLE_W: i32 = 190;
+const TOGGLE_H: i32 = 32;
+/// 加词：预览卡 + 底栏。
+const PREVIEW_Y: i32 = 384;
+const PREVIEW_TITLE_Y: i32 = PREVIEW_Y + 14;
+const PREVIEW_ITEMS_Y: i32 = PREVIEW_Y + 72;
+const PV_START_Y: i32 = PREVIEW_ITEMS_Y;
+const CLIENT_H: i32 = 680;
+/// 加权：权重刻度 + 预览卡 + 底栏。
+const SCALE_Y: i32 = 252;
+const SCALE_H: i32 = 80;
+const W_PREVIEW_Y: i32 = 348;
+const W_CLIENT_H: i32 = 604;
+/// 按钮几何（右对齐）。
+const BTN_W: i32 = 108;
+const BTN_H: i32 = 40;
+const BTN_GAP: i32 = 12;
+const BTN_OK_X: i32 = M + CONTENT_W - BTN_W;
+const BTN_CANCEL_X: i32 = BTN_OK_X - BTN_GAP - BTN_W;
+
+// ── 2026-11-03 视觉重做：固定 UI 调色板（GDI COLORREF=0x00BBGGRR）──
+const DARK_BG: u32 = 0x17_13_12; // #121317
+const DARK_CARD: u32 = 0x23_1D_1B; // #1B1D23
+const DARK_BORDER: u32 = 0x37_2E_2B; // #2B2E37
+const DARK_TEXT: u32 = 0xDE_E9_ED; // #EDE9DE
+const DARK_MUTED: u32 = 0x8A_95_9A; // #9A958A
+const DARK_ACCENT: u32 = 0x5C_B7_E7; // #E7B75C（无皮肤时的默认金）
+const DARK_FG: u32 = 0x08_14_1A; // #1A1408
+// 【2026-11-03 浅色模式】跟随 Windows“应用模式”的整套主题色。
+// COLORREF = 0x00BBGGRR；浅色值同样按 BGR 书写。
+#[derive(Clone, Copy)]
+struct Theme {
+    light: bool,
+    bg: u32,
+    card: u32,
+    border: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+    accent_fg: u32,
+    chip_bg: u32,
+    chip_fg: u32,
+    preview: u32,
+}
+const THEME_DARK: Theme = Theme {
+    light: false,
+    bg: DARK_BG,
+    card: DARK_CARD,
+    border: DARK_BORDER,
+    text: DARK_TEXT,
+    muted: DARK_MUTED,
+    accent: DARK_ACCENT,
+    accent_fg: DARK_FG,
+    chip_bg: 0x17_2F_3B, // #3B2F17 深金底
+    chip_fg: 0x9A_D7_F3, // #F3D79A 浅金字
+    preview: 0x27_20_1E,  // #1E2027
+};
+const THEME_LIGHT: Theme = Theme {
+    light: true,
+    bg: 0xE9_F1_F4,     // #F4F1E9
+    card: 0xFF_FF_FF,
+    border: 0xC6_D6_DE,  // #DED6C6
+    text: 0x1D_26_2B,    // #2B261D
+    muted: 0x68_76_7D,   // #7D7668
+    accent: 0x22_7A_B0,  // #B07A22
+    accent_fg: 0xED_F9_FF, // #FFF9ED
+    chip_bg: 0xBE_E4_F5, // #F5E4BE
+    chip_fg: 0x10_4A_6B, // #6B4A10
+    preview: 0xED_F6_FA, // #FAF6ED
+};
+
+static THEME_IS_LIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static THEME_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn theme() -> Theme {
+    if THEME_IS_LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+        THEME_LIGHT
+    } else {
+        THEME_DARK
+    }
+}
+
+/// Windows 设置 → 个性化 → 颜色 → “应用模式”（浅色=1）。读不到默认深色。
+fn read_system_light() -> bool {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            vtype: *mut u32,
+            data: *mut core::ffi::c_void,
+            cb: *mut u32,
+        ) -> i32;
+    }
+    let sub: Vec<u16> = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize".encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = "AppsUseLightTheme".encode_utf16().chain([0]).collect();
+    let mut v: u32 = 0;
+    let mut ty: u32 = 0;
+    let mut cb: u32 = 4;
+    let ret = unsafe {
+        RegGetValueW(
+            -2147483647isize, /* HKEY_CURRENT_USER */
+            sub.as_ptr(),
+            name.as_ptr(),
+            0x10, /* RRF_RT_REG_DWORD */
+            &mut ty,
+            &mut v as *mut u32 as *mut core::ffi::c_void,
+            &mut cb,
+        )
+    };
+    ret == 0 && v == 1
+}
+
+fn refresh_theme() {
+    use std::sync::atomic::Ordering;
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = THEME_LAST_MS.load(Ordering::Relaxed);
+    if last != 0 && t.saturating_sub(last) < 1500 {
+        return;
+    }
+    THEME_LAST_MS.store(t, Ordering::Relaxed);
+    THEME_IS_LIGHT.store(read_system_light(), Ordering::Relaxed);
+}
+
 
 /// 带圈数字（占位符）：1-20 → ①…⑳（U+2460+），21-35 → ㉑…㉟，
 /// 36-50 → ㊱…㊿；越界 None（选重位超 50 不补位）。
@@ -72,6 +207,7 @@ fn circled_num(n: usize) -> Option<String> {
 }
 
 /// 皮肤数据（每次弹窗拉取，指纹没变走 same:true 微载荷；失败回退深色系）
+#[allow(dead_code)]
 struct Skin {
     bg: u32,
     text: u32,
@@ -80,30 +216,104 @@ struct Skin {
     // 预览着色已收敛为 NEW_RED（新词）/text（其余）/label（表头），
     // 高亮底块不再参与弹窗渲染。
     font_face: Vec<u16>, // UTF-16 含 null
-    font_pt: i32,
-    label_pt: i32,
     cand_spacing: i32,
     /// 【加词窗跟皮肤 2026-10-18·B】服务端皮肤指纹（op:"skin" 顶层
     /// fp）——下次弹窗 have_fp 命中即免重建；变了=换皮/改色/改字号，
     /// 字体刷子全套重建（弹窗线程每弹必拉，换皮即时生效）。
+    /// 皮肤高亮色（新词胶囊/主按钮取它；缺失回退 DARK_ACCENT）。
+    accent: u32,
     fp: String,
 }
 static SKIN: std::sync::Mutex<Option<Skin>> = std::sync::Mutex::new(None);
 static BG_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-// 【三十四修·死代码删除】HILITE_BRUSH（建后无消费，wndproc 只用
-// BG_BRUSH）已删。
+static FIELD_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+/// 候选预览内层（真实皮肤底）/新词胶囊（皮肤高亮色）。
+static SKIN_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static ACCENT_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+/// 新词胶囊底 / 预览内层 / 主题刷缓存。
+static CHIP_BRUSH: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static BRUSH_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2); // 2=未建
+
+unsafe fn reset_brushes() {
+    use std::sync::atomic::Ordering;
+    for slot in [
+        &BG_BRUSH,
+        &FIELD_BRUSH,
+        &SKIN_BRUSH,
+        &ACCENT_BRUSH,
+        &CHIP_BRUSH,
+    ] {
+        if let Some(b) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = DeleteObject(HGDIOBJ(b as *mut core::ffi::c_void));
+        }
+    }
+    BRUSH_THEME.store(2, Ordering::Relaxed);
+}
+
+unsafe fn ensure_brushes(th: &Theme) {
+    use std::sync::atomic::Ordering;
+    let want: u8 = if th.light { 1 } else { 0 };
+    if BRUSH_THEME.load(Ordering::Relaxed) == want {
+        return;
+    }
+    // 【P2-2 2026-11-03】主题切换时旧刷子必须先释放，否则每换一次
+    // 深浅色漏 5 个 GDI 刷子（加词窗关闭期间切主题必然走到这里）。
+    reset_brushes();
+    let mk = |c: u32| CreateSolidBrush(COLORREF(c)).0 as usize;
+    *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(mk(th.bg));
+    *FIELD_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(mk(th.card));
+    *SKIN_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(mk(th.preview));
+    *ACCENT_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(mk(th.accent));
+    *CHIP_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(mk(th.chip_bg));
+    BRUSH_THEME.store(want, Ordering::Relaxed);
+}
+
+fn refresh_theme_now() {
+    THEME_LAST_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    refresh_theme();
+}
+
+unsafe fn apply_theme_to_edits(hwnd: HWND, th: &Theme) {
+    for id in [ID_WORD, ID_CODE, ID_POS] {
+        if let Ok(h) = GetDlgItem(hwnd, id) {
+            let _ = SendMessageW(
+                h,
+                0x0443, /* EM_SETBKGNDCOLOR */
+                WPARAM(0),
+                LPARAM(th.card as isize),
+            );
+            set_rich_text_color(h, th.text);
+        }
+    }
+}
+
 static FONT_MAIN: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 static FONT_LABEL: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-/// 新词专用：加粗+下划线（红色由 CTLCOLOR 分段着色）
+/// 新词专用：加粗+下划线（预览新词胶囊用）
 static FONT_NEW: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-/// 新词红（COLORREF 0x00BBGGRR：R255 G80 B80）
-const NEW_RED: u32 = 0x50_50_FF;
-/// 预览动态控件（刷新时销毁重建）
+/// 固定 UI 字体（不跟皮肤字号，保证弹窗排版稳定）。
+static FONT_TITLE: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static FONT_UI: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static FONT_UI_BOLD: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static FONT_SMALL: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static UI_FONTS_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 占位符开关（自绘 toggle；替代旧 BS_AUTOCHECKBOX + BM_GETCHECK）。
+static PH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 当前聚焦字段（画焦点描边）。
+static FOCUS_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 预览动态 STATIC 子控件（仍由 refresh_preview 创建/销毁）。
 static ITEMS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+/// 新词胶囊（父窗口自绘，STATIC 以 NULL_BRUSH 透明叠字）。
+static NEW_CHIP_RECTS: std::sync::Mutex<Vec<(i32, i32, i32, i32)>> = std::sync::Mutex::new(Vec::new());
 
 fn parse_hex(s: &str) -> Option<u32> {
     let t = s.trim().trim_start_matches('#');
-    if t.len() < 6 {
+    // 【P1 2026-11-03】非 ASCII（中文/emoji）按字节切 [0..2] 会 panic
+    // 在 WndProc 跨 FFI 边界 = 宿主崩溃。颜色串只可能是 ASCII 十六进制。
+    if t.len() < 6 || !t.is_ascii() {
         return None;
     }
     let r = u32::from_str_radix(&t[0..2], 16).ok()?;
@@ -138,6 +348,15 @@ fn lum(c: u32) -> f32 {
 /// 【加词窗跟皮肤 2026-10-18·A】SSF 面板不透明区平均色（COLORREF）。
 /// 帧=BGRA 预乘；只统计 alpha≥128 的像素（装饰皮大片透明边不算），
 /// 不透明覆盖 <2% 视为无效（整图几乎全透明，回退默认色）。
+/// 强调底上的文字色：深底白字、浅底深字。
+fn contrast_fg(bg: u32) -> u32 {
+    if lum(bg) > 0.55 {
+        DARK_FG
+    } else {
+        0x00_F2_F2_F2
+    }
+}
+
 fn avg_opaque_rgb(b: &crate::ssfwin::SsfBitmap) -> Option<u32> {
     let frame = b.frames.first()?;
     let px = (b.width as usize) * (b.height as usize);
@@ -239,7 +458,7 @@ fn ph_remember_hkcu(on: bool) {
         fn RegCloseKey(key: isize) -> i32;
     }
     unsafe {
-        let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
+    let sub: Vec<u16> = r"Software\HuFu".encode_utf16().chain([0]).collect();
         let name: Vec<u16> = "addword_ph".encode_utf16().chain([0]).collect();
         let mut hkey: isize = 0;
         if RegCreateKeyExW(
@@ -296,7 +515,7 @@ fn ph_recall_hkcu() -> bool {
         fn RegCloseKey(key: isize) -> i32;
     }
     unsafe {
-        let sub: Vec<u16> = "Software\\HuFu".encode_utf16().chain([0]).collect();
+    let sub: Vec<u16> = r"Software\HuFu".encode_utf16().chain([0]).collect();
         let name: Vec<u16> = "addword_ph".encode_utf16().chain([0]).collect();
         let mut hkey: isize = 0;
         if RegOpenKeyExW(
@@ -332,6 +551,9 @@ fn ph_recall_hkcu() -> bool {
 /// 零重建（一次管道往返，ms 级），变了=字体/刷子/Skin 全套重建。
 /// IPC 失败：已有缓存沿用（比打回默认色好），首次失败才走默认深色系。
 fn load_skin() {
+    unsafe { ensure_ui_fonts() };
+    refresh_theme_now();
+    unsafe { ensure_brushes(&theme()) };
     let mut g = SKIN.lock().unwrap_or_else(|p| p.into_inner());
     let mut req = serde_json::json!({"op": "skin"});
     if let Some(fp) = g.as_ref().map(|s| s.fp.as_str()) {
@@ -368,14 +590,6 @@ fn load_skin() {
         .and_then(|x| x.as_str())
         .unwrap_or("Microsoft YaHei UI")
         .to_string();
-    let font_pt = sk
-        .pointer("/layout/font_point")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(16.0) as i32;
-    let label_pt = sk
-        .pointer("/layout/label_font_point")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(12.0) as i32;
     let cand_spacing = sk
         .pointer("/layout/candidate_spacing")
         .and_then(|x| x.as_f64())
@@ -410,17 +624,22 @@ fn load_skin() {
             label_c = if lb > 0.5 { 0x3A_3A_3A } else { 0xC8_C8_C8 };
         }
     }
+    // 强调色：优先皮肤高亮底，其次 SSF display.first_color，最后默认金。
+    let accent = get_color("hilited_candidate_back_color")
+        .or_else(|| get_color("hilited_back_color"))
+        .or_else(|| get_color("hilited_text_color"))
+        .or_else(|| {
+            sk.pointer("/display/first_color")
+                .and_then(|x| x.as_str())
+                .and_then(parse_hex)
+        })
+        .unwrap_or(DARK_ACCENT);
     let s = Skin {
-        // 窗口底色提亮 20%：候选窗小面积用原底色可以，整窗大面积
-        // 直接用会死黑（用户反馈），向白混一档。
         bg,
         text: text_c,
         label: label_c,
+        accent,
         font_face: utf16z(&face),
-        // 字号比皮肤候选窗大两档再 ×1.2（弹窗阅读距离远；用户两轮
-        // 要求加大，2026-10-08 随窗口整体放大 20%）
-        font_pt: (((font_pt + 6) as f32 * 1.2).round() as i32).max(20),
-        label_pt: (((label_pt + 5) as f32 * 1.2).round() as i32).max(16),
         cand_spacing: cand_spacing.max(2),
         fp,
     };
@@ -444,19 +663,20 @@ fn load_skin() {
                 face_ptr,
             )
         };
+        // 预览用固定 18/13px（皮肤字号只用在候选窗；弹窗预览要能一屏装下）
         *FONT_MAIN.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(mk_font(s.font_pt, FW_NORMAL.0 as i32).0 as usize);
+            Some(mk_font(18, FW_NORMAL.0 as i32).0 as usize);
         *FONT_LABEL.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(mk_font(s.label_pt, FW_NORMAL.0 as i32).0 as usize);
+            Some(mk_font(13, FW_NORMAL.0 as i32).0 as usize);
         // 新词：加粗 + 下划线
         let bold_underline = CreateFontW(
-            -s.font_pt,
+            -18,
             0,
             0,
             0,
             FW_BOLD.0 as i32,
             0,
-            1, // underline
+            0, // underline（新词用强调底色，不用下划线）
             0,
             DEFAULT_CHARSET.0 as u32,
             0,
@@ -466,10 +686,46 @@ fn load_skin() {
             PCWSTR(s.font_face.as_ptr()),
         );
         *FONT_NEW.lock().unwrap_or_else(|p| p.into_inner()) = Some(bold_underline.0 as usize);
-        *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(CreateSolidBrush(COLORREF(s.bg)).0 as usize);
+        // 窗口底/输入卡底：固定深色 UI，不随皮肤（候选预览卡内才用皮肤色）。
+
     }
     *g = Some(s);
+}
+
+/// 固定 UI 字体（只建一次；与皮肤字号解耦，保证弹窗排版稳定）。
+unsafe fn ensure_ui_fonts() {
+    use std::sync::atomic::Ordering;
+    if UI_FONTS_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let face = utf16z("Microsoft YaHei UI");
+    let mk = |px: i32, weight: i32| {
+        CreateFontW(
+            -px,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            CLEARTYPE_QUALITY.0 as u32,
+            0,
+            PCWSTR(face.as_ptr()),
+        )
+    };
+    *FONT_TITLE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(mk(23, FW_BOLD.0 as i32).0 as usize);
+    *FONT_UI.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(mk(15, FW_NORMAL.0 as i32).0 as usize);
+    *FONT_UI_BOLD.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(mk(15, FW_BOLD.0 as i32).0 as usize);
+    *FONT_SMALL.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(mk(12, FW_NORMAL.0 as i32).0 as usize);
+    UI_FONTS_READY.store(true, Ordering::Relaxed);
 }
 
 /// 窗模式：false=加词（三框+预览），true=加权（词+权重两框）。
@@ -761,7 +1017,7 @@ fn open_common() {
         let hmod = GetModuleHandleW(None).unwrap_or_default();
         let hinst = HINSTANCE(hmod.0);
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -780,12 +1036,15 @@ fn open_common() {
         } else {
             "虎符 · 加词".encode_utf16().chain([0]).collect()
         };
-        let h = outer_h(if is_weight_mode() { 240 } else { 360 }); // 200/300×1.2
+        // 无边框卡片窗（2026-11-03 视觉重做）：自绘标题栏/底栏，
+        // WS_POPUP 不占系统 caption；高度=客户区（outer_h 恒等）。
+        let client_h = if is_weight_mode() { W_CLIENT_H } else { CLIENT_H };
+        let h = outer_h(client_h);
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+            WS_EX_TOPMOST,
             CLASS,
             PCWSTR(title.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            WS_POPUP | WS_SYSMENU,
             (sw - WIN_W) / 2,
             (sh - h) / 2,
             WIN_W,
@@ -812,6 +1071,14 @@ fn open_common() {
         ADDWORD_TID.store(my_tid, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // 【2026-11-03 第三批】加词/加权窗 120ms 混合入场（系统关动画/RDP 瞬显）。
+        if crate::candwin2::system_anim_allowed() {
+            let _ = windows::Win32::UI::WindowsAndMessaging::AnimateWindow(
+                hwnd,
+                120,
+                windows::Win32::UI::WindowsAndMessaging::AW_BLEND,
+            );
+        }
         // 【六修 2026-09-12】AttachThreadInput 抢前台——此前裸调
         // SetForegroundWindow 被系统前台锁定静默拒绝（跨线程输入队
         // 列：小窗线程≠前台线程），trace 实锤小窗从未成为前台：键全
@@ -862,9 +1129,15 @@ fn open_common() {
                 let foc = 
                     windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
                 ;
-                // 【编码/选重位对换 2026-10-08】Tab 环与行序同步：
-                // 词→选重位→编码→词（注释「词→编码→选重」同步更正）
-                let order = [ID_WORD, ID_POS, ID_CODE];
+                // 【编码/选重位对换 2026-10-08】Tab 环与行序同步。
+                // 【2026-11-03】加入占位符 toggle 与主/次按钮——旧环只
+                // 在三框内循环，键盘用户永远到不了开关/确定（全键盘可达）。
+                let mut order = vec![ID_WORD, ID_POS, ID_CODE];
+                if !is_weight_mode() {
+                    order.push(ID_PH);
+                }
+                order.push(ID_OK);
+                order.push(ID_CANCEL);
                 let cur = order.iter().position(|i| {
                     matches!(
                          GetDlgItem(hwnd, *i) ,
@@ -878,13 +1151,44 @@ fn open_common() {
                     }
                     let shift = ( GetKeyState(0x10)  as u16 & 0x8000) != 0;
                     let n = order.len();
-                    let next = if shift { (c + n - 1) % n } else { (c + 1) % n };
-                    if let Ok(h) = GetDlgItem(hwnd, order[next]) {
-                        let _ = 
-                            windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h)
-                        ;
+                    let step = if shift { n - 1 } else { 1 };
+                    // 跳过禁用控件（词/编码空时“确定”不可聚焦），
+                    // 保证键盘用户 Tab 始终能走到下一个可用控件。
+                    let mut moved = false;
+                    for k in 1..=n {
+                        let idx = (c + step * k) % n;
+                        if let Ok(h) = GetDlgItem(hwnd, order[idx]) {
+                            if windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(h).as_bool() {
+                                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h);
+                                moved = true;
+                                break;
+                            }
+                        }
+                    }
+                    if moved {
                         continue;
                     }
+                }
+            }
+            // 【2026-11-03】无系统对话框模板：显式接管 Enter/Esc，
+            // 保证 owner-draw 按钮下键盘确定/取消仍然可用。
+            if msg.message == WM_KEYDOWN {
+                match msg.wParam.0 as u16 {
+                    0x0D => {
+                        // 确定不可用（词/编码为空）时不关闭，避免静默丢输入。
+                        let ok = GetDlgItem(hwnd, ID_OK)
+                            .map(|h| windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(h).as_bool())
+                            .unwrap_or(false);
+                        if ok {
+                            let _ = SendMessageW(hwnd, WM_COMMAND, WPARAM(ID_OK as usize), LPARAM(0));
+                        }
+                        continue;
+                    }
+                    0x1B => {
+                        let _ = DestroyWindow(hwnd);
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             if !IsDialogMessageW(hwnd, &mut msg).as_bool() {
@@ -900,17 +1204,9 @@ fn open_common() {
     });
 }
 
-/// client 高 → 外框高。
+/// client 高 → 外框高（无边框 WS_POPUP：恒等）。
 unsafe fn outer_h(client_h: i32) -> i32 {
-    let mut rc = RECT {
-        left: 0,
-        top: 0,
-        right: WIN_W,
-        bottom: client_h,
-    };
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    let _ = AdjustWindowRect(&mut rc, style, false);
-    rc.bottom - rc.top
+    client_h
 }
 
 unsafe fn create_child(
@@ -993,26 +1289,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // 反查；不建选重位）；加词模式=原有三框
             let rows: Vec<(&str, i32, u32)> = if is_weight_mode() {
                 vec![
-                    ("词（要加权的字或词）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
-                    (
-                        "权重（留空=1000）",
-                        ID_CODE,
-                        WS_TABSTOP.0 | 0x80u32 | 0x2000u32,
-                    ),
+                    ("词", ID_WORD, WS_TABSTOP.0 | 0x80u32),
+                    ("权重", ID_CODE, WS_TABSTOP.0 | 0x80u32 | 0x2000u32),
                 ]
             } else {
-                // 【编码/选重位对换 2026-10-08】行序改为 词→选重位→编码
-                //（用户流程拍板：打词→选重位→少数情况才改编码，配合
-                // 编码框自动反查预填）。id 不变（ID_CODE/ID_POS），仅
-                // 行位与 Tab 序对换。
+                // 行序保持 词→选重位→编码（用户流程拍板），仅标签精简。
                 vec![
-                    ("词（要打出的内容）", ID_WORD, WS_TABSTOP.0 | 0x80u32),
-                    (
-                        "选重位（第几选，留空=首选）",
-                        ID_POS,
-                        WS_TABSTOP.0 | 0x80u32 | 0x2000u32,
-                    ),
-                    ("编码（打什么出它）", ID_CODE, WS_TABSTOP.0 | 0x80u32),
+                    ("词", ID_WORD, WS_TABSTOP.0 | 0x80u32),
+                    ("选重位", ID_POS, WS_TABSTOP.0 | 0x80u32 | 0x2000u32),
+                    ("编码", ID_CODE, WS_TABSTOP.0 | 0x80u32),
                 ]
             };
             // 【T4 根治·词框 RichEdit v2 2026-10-07】词框用 RichEdit50W
@@ -1040,13 +1325,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     PCWSTR(lbl_txt.as_ptr()),
                     WINDOW_EX_STYLE(0),
                     0,
-                    PV_X,
-                    y,
+                    M,
+                    y - 26,
                     LBL_W,
                     LBL_H,
                     if *id == ID_WORD { AW_LIVE_LABEL } else { 0 },
                 );
-                set_item_font(lbl, true);
+                set_ui_font(lbl, true);
                 // 【三框统一 RichEdit 2026-10-07】外观/行为一致；词框
                 // TSF 原生通道。RichEdit 不认 ES_NUMBER——选重位/权重
                 // 框数字过滤改在 EN_UPDATE 里做。创建失败回退 EDIT。
@@ -1054,9 +1339,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     hwnd,
                     w!("RICHEDIT50W"),
                     w!(""),
-                    WS_EX_CLIENTEDGE,
+                    WINDOW_EX_STYLE(0),
                     *extra,
-                    PV_X,
+                    M + EDIT_INSET,
                     y + EDIT_DY,
                     EDIT_W,
                     EDIT_H,
@@ -1074,9 +1359,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             hwnd,
                             w!("EDIT"),
                             w!(""),
-                            WS_EX_CLIENTEDGE,
+                            WINDOW_EX_STYLE(0),
                             *extra,
-                            PV_X,
+                            M + EDIT_INSET,
                             y + EDIT_DY,
                             EDIT_W,
                             EDIT_H,
@@ -1093,16 +1378,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         hwnd,
                         w!("EDIT"),
                         w!(""),
-                        WS_EX_CLIENTEDGE,
+                        WINDOW_EX_STYLE(0),
                         *extra,
-                        PV_X,
+                        M + EDIT_INSET,
                         y + EDIT_DY,
                         EDIT_W,
                         EDIT_H,
                         *id,
                     );
                 }
-                set_item_font(ed, false);
+                set_ui_font(ed, false);
+                // 无边框输入框：左右留白 10px；RichEdit 另设背景色。
+                let _ = SendMessageW(
+                    ed,
+                    0x00D3, /* EM_SETMARGINS */
+                    WPARAM(3),
+                    LPARAM(0x000A_000A),
+                );
+                let _ = SendMessageW(
+                    ed,
+                    0x0443, /* EM_SETBKGNDCOLOR */
+                    WPARAM(0),
+                    LPARAM(theme().card as isize),
+                );
+                set_rich_text_color(ed, theme().text);
                 // 【EDIT 免 IME·分字段 2026-09-10】只有编码框（打什么出
                 // 它，纯字母）与选重位/权重框（纯数字）断开输入上下文——
                 // 在这些框打 jav/123 若唤起输入法会先出候选不上字母。
@@ -1167,68 +1466,68 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     crate::tsf::trace("addword 预填（右键调频菜单·加词）");
                 }
             }
+            // ── 2026-11-03 视觉重做：自绘 toggle / 预览标题 / 主次按钮 ──
+            PH_ON.store(
+                if !is_weight_mode() { ph_recall() } else { false },
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if !is_weight_mode() {
-                // 【占位符勾选 2026-10-08】选重位超出该码现有候选数时，
-                // 用带圈数字 ③④… 补空位使词恰落第 N 位（用户例：d 码
-                // 现有「中 哪个」，加「是」选 4 位 → 中 哪个 ③ 是）。
-                let ph_txt = mk("占位符（选重位超出时用 ③ ④ … 补齐空位）");
-                let chb = create_child(
+                // BS_OWNERDRAW=0x0B；空格/点击仍走 WM_COMMAND(BN_CLICKED)。
+                let _ = create_child(
                     hwnd,
                     w!("BUTTON"),
-                    PCWSTR(ph_txt.as_ptr()),
+                    w!(""),
                     WINDOW_EX_STYLE(0),
-                    WS_TABSTOP.0 | 0x3u32, // BS_AUTOCHECKBOX=0x3！曾误传
-                    // 0x2=BS_CHECKBOX（手动状态型：点击不自动打勾）——
-                    // 「点不动」四轮反馈的绝对根因：BN_CLICKED 每击必
-                    // 发，但盒子视觉恒空、BM_GETCHECK 恒 0，勾选逻辑
-                    // 从未真正生效过
-                    PV_X,
-                    PH_ROW_Y,
-                    LBL_W,
-                    LBL_H,
+                    WS_TABSTOP.0 | 0x0B,
+                    M,
+                    TOGGLE_Y,
+                    TOGGLE_W,
+                    TOGGLE_H,
                     ID_PH,
                 );
-                set_item_font(chb, true);
-                // 【占位符记忆 2026-10-09】回读上次勾选态（BM_SETCHECK
-                // 0x00F1）——开过就一直开，关过就一直关。
-                if ph_recall() {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                        chb,
-                        0x00F1, /* BM_SETCHECK */
-                        WPARAM(1),
-                        LPARAM(0),
-                    );
-                }
-                let t1 = mk("该编码候选（实时，第 N 选参考）：");
-                let pt = create_child(
-                    hwnd,
-                    w!("STATIC"),
-                    PCWSTR(t1.as_ptr()),
-                    WINDOW_EX_STYLE(0),
-                    0,
-                    PV_X,
-                    PV_TITLE_Y,
-                    408, // 340×1.2
-                    26,  // 22×1.2
-                    0,
-                );
-                set_item_font(pt, true);
             }
-            for (label, id) in [("确定", ID_OK), ("取消", ID_CANCEL)] {
-                let btxt = mk(label);
-                let btn = create_child(
+            let pv_title_txt = mk(if is_weight_mode() {
+                "效果预览"
+            } else {
+                "候选预览"
+            });
+            let pv_title = create_child(
+                hwnd,
+                w!("STATIC"),
+                PCWSTR(pv_title_txt.as_ptr()),
+                WINDOW_EX_STYLE(0),
+                0,
+                M + 16,
+                if is_weight_mode() {
+                    W_PREVIEW_Y + 14
+                } else {
+                    PREVIEW_TITLE_Y
+                },
+                220,
+                22,
+                ID_PV_TITLE,
+            );
+            set_ui_font(pv_title, true);
+            // 主/次按钮（owner-draw，Enter/Esc 仍走 IDOK/IDCANCEL）。
+            let btn_y = (if is_weight_mode() {
+                W_CLIENT_H
+            } else {
+                CLIENT_H
+            }) - 24
+                - BTN_H;
+            for (_label, id) in [("确定", ID_OK), ("取消", ID_CANCEL)] {
+                let _ = create_child(
                     hwnd,
                     w!("BUTTON"),
-                    PCWSTR(btxt.as_ptr()),
+                    w!(""),
                     WINDOW_EX_STYLE(0),
-                    WS_TABSTOP.0,
+                    WS_TABSTOP.0 | 0x0B,
                     if id == ID_OK { BTN_OK_X } else { BTN_CANCEL_X },
-                    PH_ROW_Y + 70, // 初始位（refresh_preview 钉底重排）
+                    btn_y,
                     BTN_W,
                     BTN_H,
                     id,
                 );
-                set_item_font(btn, false);
             }
             if !first_edit.0.is_null() {
                 let _ = SetFocus(first_edit);
@@ -1236,6 +1535,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 //（WM_CREATE 时窗口未激活 SetFocus 无效）。
                 *FIRST_EDIT.lock().unwrap_or_else(|p| p.into_inner()) = Some(first_edit.0 as isize);
             }
+            FOCUS_ID.store(ID_WORD, std::sync::atomic::Ordering::Relaxed);
+            apply_theme_to_edits(hwnd, &theme());
+            refresh_preview(hwnd);
             LRESULT(0)
         }
         WM_ERASEBKGND => {
@@ -1253,44 +1555,104 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint_scene(hwnd, hdc);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lp.0 as *const DrawItem);
+            paint_item(dis);
+            LRESULT(1)
+        }
+        WM_SIZE => {
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                let rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, 18, 18);
+                let _ = SetWindowRgn(hwnd, rgn, true);
+            }
+            LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            // 顶部 68px 可拖拽；关闭 × 区域留给 WM_LBUTTONUP。
+            let sx = (lp.0 & 0xffff) as i16 as i32;
+            let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let cx = sx - wr.left;
+            let cy = sy - wr.top;
+            if cy < 68 {
+                if (WIN_W - 46..=WIN_W - 14).contains(&cx) && (12..=44).contains(&cy) {
+                    return LRESULT(HTCLIENT as isize);
+                }
+                return LRESULT(HTCAPTION as isize);
+            }
+            LRESULT(HTCLIENT as isize)
+        }
+        WM_LBUTTONUP => {
+            let x = (lp.0 & 0xffff) as i16 as i32;
+            let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+            if (WIN_W - 46..=WIN_W - 14).contains(&x) && (12..=44).contains(&y) {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        m if m == windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+            || m == windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED =>
+        {
+            // 系统浅色/深色切换：立刻重读并刷新窗口（无需重开）。
+            refresh_theme_now();
+            reset_brushes();
+            let th = theme();
+            ensure_brushes(&th);
+            apply_theme_to_edits(hwnd, &th);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+            LRESULT(0)
+        }
         WM_CTLCOLORSTATIC => {
             let ctrl = HWND(lp.0 as _);
             let cid = GetWindowLongPtrW(ctrl, GWLP_ID) as i32;
-            let sc = SKIN.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(c) = sc.as_ref() else {
-                return DefWindowProcW(hwnd, msg, wp, lp);
-            };
+            unsafe { ensure_brushes(&theme()) };
+            let th = theme();
             let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as _);
-            // 新词项：红色（字体已加粗带下划线）；其余按段取皮肤色。
-            //（ID_CUR_BASE=2000 < ID_AFT_BASE=2200 < ID_AFT_NEW=2600，
-            // 单条 `>= ID_CUR_BASE` 即覆盖两个普通段）
-            let fg: u32 = if cid >= ID_AFT_NEW {
-                NEW_RED
+            let (fg, bg, brush) = if cid >= ID_AFT_NEW {
+                // 胶囊由父窗口自绘；文字控件返回空刷子保持透明，露出圆角底。
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                (th.chip_fg, th.preview, Some(GetStockObject(NULL_BRUSH).0 as usize))
+            } else if cid == ID_PV_HEAD_CUR || cid == ID_PV_HEAD_AFT {
+                // 【P2-4 2026-11-03】头部判定必须放在 `>= ID_CUR_BASE`
+                // 之前：ID_PV_HEAD_AFT=2190 也是 >=2000，旧顺序会把它
+                // 当普通候选（"加入后"标题恒亮一档）。
+                (th.muted, th.preview, *SKIN_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
             } else if cid >= ID_AFT_PH {
-                // 【占位符 2026-10-08】占位项 ③④…：标签色压暗（区别
-                // 于真候选；序号+词同段同色）
-                c.label
+                // 占位项 ③④…：标签色压暗（与真候选区分）
+                (th.muted, th.preview, *SKIN_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
             } else if cid >= ID_CUR_BASE {
-                c.text
+                (th.text, th.preview, *SKIN_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
+            } else if cid == ID_PV_TITLE {
+                (th.text, th.card, *FIELD_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
+            } else if cid == ID_PV_MSG {
+                (th.muted, th.preview, *SKIN_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
             } else {
-                c.label
+                (th.muted, th.bg, *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()))
             };
             let _ = windows::Win32::Graphics::Gdi::SetTextColor(hdc, COLORREF(fg));
-            let _ = windows::Win32::Graphics::Gdi::SetBkColor(hdc, COLORREF(c.bg));
-            if let Some(b) = *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) {
+            let _ = windows::Win32::Graphics::Gdi::SetBkColor(hdc, COLORREF(bg));
+            if let Some(b) = brush {
                 return LRESULT(b as isize);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CTLCOLOREDIT => {
-            let sc = SKIN.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(c) = sc.as_ref() {
-                let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as _);
-                let _ = windows::Win32::Graphics::Gdi::SetTextColor(hdc, COLORREF(c.text));
-                let _ = windows::Win32::Graphics::Gdi::SetBkColor(hdc, COLORREF(c.bg));
-                if let Some(b) = *BG_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) {
-                    return LRESULT(b as isize);
-                }
+            unsafe { ensure_brushes(&theme()) };
+            let th = theme();
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as _);
+            let _ = windows::Win32::Graphics::Gdi::SetTextColor(hdc, COLORREF(th.text));
+            let _ = windows::Win32::Graphics::Gdi::SetBkColor(hdc, COLORREF(th.card));
+            if let Some(b) = *FIELD_BRUSH.lock().unwrap_or_else(|p| p.into_inner()) {
+                return LRESULT(b as isize);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -1331,6 +1693,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COMMAND => {
             let id = (wp.0 as u32 & 0xFFFF) as i32;
             let notif = (wp.0 as u32 >> 16) as u32;
+            // 输入框焦点 → 卡片描边高亮（EN_SETFOCUS=0x100 / EN_KILLFOCUS=0x200）
+            if notif == 0x0100 && (id == ID_WORD || id == ID_CODE || id == ID_POS) {
+                FOCUS_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
+            } else if notif == 0x0200
+                && FOCUS_ID.load(std::sync::atomic::Ordering::Relaxed) == id
+            {
+                FOCUS_ID.store(0, std::sync::atomic::Ordering::Relaxed);
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
+            }
             // 【Tab 到编码框光标置尾 2026-10-09】EN_SETFOCUS(0x0100) 时
             // EM_SETSEL(尾,尾)：Tab 进编码框光标落在自动编码之后——
             // 不满意直接退格改，不用先按 End/点框尾（用户规格）。
@@ -1516,24 +1888,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // 【占位符勾选 2026-10-08】勾/去勾即时重排预览（BN_CLICKED=0）
             if id == ID_PH && notif == 0 {
-                let checked = match GetDlgItem(hwnd, ID_PH) {
-                    Ok(h) => {
-                        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                            h,
-                            0x00F0, /* BM_GETCHECK */
-                            WPARAM(0),
-                            LPARAM(0),
-                        )
-                        .0 as i32
-                            == 1
-                    }
-                    Err(_) => false,
-                };
-                crate::tsf::trace(&format!("addword: 占位符勾选事件 checked={checked}"));
-                // 【占位符记忆 2026-10-09】用户定调：这次开了下次进来还
-                // 开着，关了下下次也保持关——写 HKCU\Software\HuFu\
-                // addword_ph（REG_DWORD），对话框构建时回读。REG 支路
-                // 失败静默（记忆是锦上添花，不能阻塞勾选主流程）。
+                let checked = !PH_ON.load(std::sync::atomic::Ordering::Relaxed);
+                PH_ON.store(checked, std::sync::atomic::Ordering::Relaxed);
+                crate::tsf::trace(&format!("addword: 占位符 toggle={checked}"));
                 ph_remember(checked);
                 unsafe { refresh_preview(hwnd) };
                 return LRESULT(0);
@@ -1566,6 +1923,430 @@ unsafe fn set_item_font(h: HWND, is_label: bool) {
     if let Some(f) = *store {
         let _ = SendMessageW(h, WM_SETFONT, WPARAM(f), LPARAM(1));
     }
+}
+
+/// 固定 UI 字体（标签/输入框/按钮）。
+unsafe fn set_ui_font(h: HWND, bold: bool) {
+    let store = if bold {
+        FONT_UI_BOLD.lock().unwrap_or_else(|p| p.into_inner())
+    } else {
+        FONT_UI.lock().unwrap_or_else(|p| p.into_inner())
+    };
+    if let Some(f) = *store {
+        let _ = SendMessageW(h, WM_SETFONT, WPARAM(f), LPARAM(1));
+    }
+}
+
+/// ── 2026-11-03 视觉重做：GDI 自绘基础 ──
+unsafe fn ui_font(bold: bool) -> Option<usize> {
+    let g = if bold {
+        FONT_UI_BOLD.lock().unwrap_or_else(|p| p.into_inner())
+    } else {
+        FONT_UI.lock().unwrap_or_else(|p| p.into_inner())
+    };
+    *g
+}
+
+unsafe fn title_font() -> Option<usize> {
+    *FONT_TITLE.lock().unwrap_or_else(|p| p.into_inner())
+}
+unsafe fn small_font() -> Option<usize> {
+    *FONT_SMALL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 用指定字体画一行文字，返回显示宽（px）。
+unsafe fn draw_text(
+    hdc: HDC,
+    s: &str,
+    x: i32,
+    y: i32,
+    font: Option<usize>,
+    color: u32,
+) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let old = match font {
+        Some(f) => SelectObject(hdc, HGDIOBJ(f as *mut core::ffi::c_void)),
+        None => HGDIOBJ::default(),
+    };
+    let _ = SetTextColor(hdc, COLORREF(color));
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let t = utf16z(s);
+    let _ = TextOutW(hdc, x, y, &t[..t.len() - 1]);
+    let mut sz = windows::Win32::Foundation::SIZE::default();
+    let w = if GetTextExtentPoint32W(hdc, &t[..t.len() - 1], &mut sz).as_bool() {
+        sz.cx
+    } else {
+        0
+    };
+    if !old.0.is_null() {
+        SelectObject(hdc, old);
+    }
+    w
+}
+
+unsafe fn measure_ui_w(hdc: HDC, s: &str, font: Option<usize>) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let old = match font {
+        Some(f) => SelectObject(hdc, HGDIOBJ(f as *mut core::ffi::c_void)),
+        None => HGDIOBJ::default(),
+    };
+    let t = utf16z(s);
+    let mut sz = windows::Win32::Foundation::SIZE::default();
+    let w = if GetTextExtentPoint32W(hdc, &t[..t.len() - 1], &mut sz).as_bool() {
+        sz.cx
+    } else {
+        0
+    };
+    if !old.0.is_null() {
+        SelectObject(hdc, old);
+    }
+    w
+}
+
+unsafe fn draw_text_center(
+    hdc: HDC,
+    s: &str,
+    left: i32,
+    top: i32,
+    w: i32,
+    h: i32,
+    font: Option<usize>,
+    px: i32,
+    color: u32,
+) {
+    let tw = measure_ui_w(hdc, s, font);
+    let _ = draw_text(hdc, s, left + (w - tw).max(0) / 2, top + (h - px).max(0) / 2 - 1, font, color);
+}
+
+unsafe fn draw_text_right(
+    hdc: HDC,
+    s: &str,
+    right: i32,
+    y: i32,
+    font: Option<usize>,
+    color: u32,
+) {
+    let tw = measure_ui_w(hdc, s, font);
+    let _ = draw_text(hdc, s, right - tw, y, font, color);
+}
+
+/// 圆角矩形填充+1px 描边（fill=0 表示不填；border=0 表示不描边）。
+unsafe fn round_box(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    fill: u32,
+    border: u32,
+) {
+    let br = if fill != 0 {
+        CreateSolidBrush(COLORREF(fill))
+    } else {
+        HBRUSH(GetStockObject(NULL_BRUSH).0)
+    };
+    let pen = if border != 0 {
+        CreatePen(PS_SOLID, 1, COLORREF(border))
+    } else {
+        windows::Win32::Graphics::Gdi::HPEN(GetStockObject(NULL_PEN).0)
+    };
+    let ob = SelectObject(hdc, HGDIOBJ(br.0));
+    let op = SelectObject(hdc, HGDIOBJ(pen.0));
+    let _ = RoundRect(hdc, x, y, x + w, y + h, r, r);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    if fill != 0 {
+        let _ = DeleteObject(HGDIOBJ(br.0));
+    }
+    if border != 0 {
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+unsafe fn hline(hdc: HDC, x1: i32, x2: i32, y: i32, color: u32) {
+    let br = CreateSolidBrush(COLORREF(color));
+    let rc = RECT { left: x1, top: y, right: x2, bottom: y + 1 };
+    let _ = FillRect(hdc, &rc, br);
+    let _ = DeleteObject(HGDIOBJ(br.0));
+}
+
+unsafe fn weight_now(hwnd: HWND) -> i64 {
+    let mut n = 0i64;
+    if let Ok(h) = GetDlgItem(hwnd, if is_weight_mode() { ID_CODE } else { ID_POS }) {
+        let len = GetWindowTextLengthW(h);
+        if len > 0 {
+            let mut b = vec![0u16; len as usize + 1];
+            let g = GetWindowTextW(h, &mut b);
+            n = String::from_utf16_lossy(&b[..g.max(0) as usize])
+                .trim()
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+    n
+}
+
+unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
+    let mut rc = RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_err() {
+        return;
+    }
+    let (cw, ch) = (rc.right, rc.bottom);
+    let th = theme();
+    unsafe { ensure_brushes(&th) };
+    let (accent, pv_bg, pv_label) = (th.accent, th.preview, th.muted);
+    let weight = is_weight_mode();
+    // 底
+    let bg = CreateSolidBrush(COLORREF(th.bg));
+    let _ = FillRect(hdc, &rc, bg);
+    let _ = DeleteObject(HGDIOBJ(bg.0));
+    // 抬头强调条 + 标题/副标题
+    let bar = CreateSolidBrush(COLORREF(accent));
+    let _ = FillRect(hdc, &RECT { left: M, top: 22, right: M + 3, bottom: 42 }, bar);
+    let _ = DeleteObject(HGDIOBJ(bar.0));
+    let _ = draw_text(hdc, if weight { "加权" } else { "加词" }, M + 12, 14, title_font(), th.text);
+    let _ = draw_text(
+        hdc,
+        if weight { "调整已有词的候选优先级" } else { "把新词放进候选顺序" },
+        M + 12,
+        44,
+        small_font(),
+        th.muted,
+    );
+    // 关闭 ×（点击热区 WIN_W-44..WIN_W-16, y 12..44）
+    let _ = draw_text(hdc, "×", WIN_W - 42, 12, title_font(), th.muted);
+    hline(hdc, M, WIN_W - M, 67, th.border);
+
+    // 字段卡
+    let focus = FOCUS_ID.load(std::sync::atomic::Ordering::Relaxed);
+    let n_rows = if weight { 2 } else { 3 };
+    for i in 0..n_rows {
+        let y = ROW_Y0 + i * ROW_PITCH;
+        let id = if i == 0 {
+            ID_WORD
+        } else if weight {
+            ID_CODE
+        } else if i == 1 {
+            ID_POS
+        } else {
+            ID_CODE
+        };
+        let border = if focus == id { accent } else { th.border };
+        round_box(hdc, M, y, CONTENT_W, CARD_H, 10, th.card, border);
+    }
+    // 字段右侧提示
+    let hint_y = |i: i32| ROW_Y0 + i * ROW_PITCH - 22;
+    let hint_x_right = M + CONTENT_W;
+    let hints: [&str; 3] = if weight {
+        ["中文 / 英文均可", "缺省 1000，越大越靠前", ""]
+    } else {
+        ["中文 / 英文均可", "留空 = 首选", "自动跟随词，可手改"]
+    };
+    for (i, h) in hints.iter().enumerate() {
+        if h.is_empty() {
+            continue;
+        }
+        draw_text_right(hdc, h, hint_x_right, hint_y(i as i32), small_font(), th.muted);
+    }
+    if !weight {
+        // 占位符开关（按钮本身自绘）+ 说明
+        let _ = draw_text(
+            hdc,
+            "选重位超过现有候选时，用 ③ ④ … 补齐前序空位",
+            M + TOGGLE_W + 14,
+            TOGGLE_Y + 8,
+            small_font(),
+            th.muted,
+        );
+    }
+
+    // 预览卡
+    let footer_top = ch - 80;
+    let pv_y = if weight { W_PREVIEW_Y } else { PREVIEW_Y };
+    let pv_bottom = footer_top - 12;
+    let pv_h = (pv_bottom - pv_y).max(80);
+    round_box(hdc, M, pv_y, CONTENT_W, pv_h, 12, th.card, th.border);
+    // 预览内层（真实皮肤底）
+    let body_y = pv_y + 44;
+    let body_h = (pv_bottom - body_y - 12).max(40);
+    round_box(hdc, M + 12, body_y, CONTENT_W - 24, body_h, 8, pv_bg, th.border);
+    if weight {
+        // 右对齐图例
+        let _ = draw_text_right(hdc, "权重越高，越靠前", M + CONTENT_W - 16, pv_y + 16, small_font(), th.muted);
+        // 简单效果示意：词 → 前部
+        let wtext = weight_word(hwnd);
+        let w = if wtext.is_empty() { "（输入要加权的词）" } else { wtext.as_str() };
+        let _ = draw_text(hdc, w, M + 28, body_y + 18, ui_font(true), th.text);
+        let _ = draw_text(hdc, "→", M + 28 + measure_ui_w(hdc, w, ui_font(true)) + 10, body_y + 18, ui_font(false), accent);
+        let _ = draw_text(hdc, "候选前部", M + 28 + measure_ui_w(hdc, w, ui_font(true)) + 42, body_y + 18, ui_font(false), th.muted);
+        let _ = draw_text(hdc, "确定后自动反查编码，并按权重排到候选前部。", M + 28, body_y + 48, small_font(), pv_label);
+    } else {
+        let _ = draw_text_right(hdc, "现有 → 加入后", M + CONTENT_W - 16, pv_y + 16, small_font(), th.muted);
+        // 新词胶囊：父窗口先画圆角底，STATIC 文字以 NULL_BRUSH 透明叠上。
+        let rects = NEW_CHIP_RECTS.lock().unwrap_or_else(|p| p.into_inner());
+        for (cx, cy, cw, chh) in rects.iter() {
+            round_box(hdc, *cx, *cy, *cw, *chh, (*chh / 2).max(4), th.chip_bg, 0);
+        }
+    }
+
+    // 加权刻度
+    if weight {
+        round_box(hdc, M, SCALE_Y, CONTENT_W, SCALE_H, 12, th.card, th.border);
+        let wv = weight_now(hwnd);
+        let _ = draw_text(hdc, "权重", M + 16, SCALE_Y + 10, small_font(), th.muted);
+        let val = if wv == 0 { "1000（默认）".to_string() } else { format!("{wv}") };
+        let _ = draw_text_right(hdc, &val, M + CONTENT_W - 16, SCALE_Y + 8, ui_font(true), accent);
+        let tx1 = M + 16;
+        let tx2 = M + CONTENT_W - 16;
+        let ty = SCALE_Y + 46;
+        let track = CreateSolidBrush(COLORREF(th.border));
+        let _ = FillRect(hdc, &RECT { left: tx1, top: ty, right: tx2, bottom: ty + 6 }, track);
+        let _ = DeleteObject(HGDIOBJ(track.0));
+        let v = if wv <= 0 { 1000 } else { wv.clamp(0, 3000) };
+        let mx = tx1 + ((tx2 - tx1) as f32 * (v as f32 / 3000.0)) as i32;
+        let fill = CreateSolidBrush(COLORREF(accent));
+        let _ = FillRect(hdc, &RECT { left: tx1, top: ty, right: mx.max(tx1 + 2), bottom: ty + 6 }, fill);
+        let _ = DeleteObject(HGDIOBJ(fill.0));
+        round_box(hdc, mx - 6, ty - 5, 12, 16, 5, accent, accent);
+        let _ = draw_text(hdc, "低", tx1, SCALE_Y + 60, small_font(), th.muted);
+        let _ = draw_text_center(hdc, "1000 · 默认", tx1, SCALE_Y + 60, tx2 - tx1, 16, small_font(), 12, th.muted);
+        let _ = draw_text_right(hdc, "高", tx2, SCALE_Y + 60, small_font(), th.muted);
+    }
+
+    // 底栏
+    hline(hdc, M, WIN_W - M, footer_top, th.border);
+    // 两行键盘提示（单行会与右侧按钮重叠）：开关/确定/取消都可全键盘。
+    if weight {
+        let _ = draw_text(hdc, "Tab 切换", M, ch - 44, small_font(), th.muted);
+        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 24, small_font(), th.muted);
+    } else {
+        let _ = draw_text(hdc, "Tab 切换 · 空格 勾选占位符", M, ch - 44, small_font(), th.muted);
+        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 24, small_font(), th.muted);
+    }
+    // 外框
+    round_box(hdc, 0, 0, cw, ch, 14, 0, th.border);
+}
+
+unsafe fn weight_word(hwnd: HWND) -> String {
+    if let Ok(h) = GetDlgItem(hwnd, ID_WORD) {
+        let n = GetWindowTextLengthW(h);
+        if n > 0 {
+            let mut b = vec![0u16; n as usize + 1];
+            let g = GetWindowTextW(h, &mut b);
+            return String::from_utf16_lossy(&b[..g.max(0) as usize]);
+        }
+    }
+    String::new()
+}
+
+/// WM_DRAWITEM 的 DRAWITEMSTRUCT 本地镜像（避免额外 windows feature）。
+#[repr(C)]
+struct DrawItem {
+    ctl_type: u32,
+    ctl_id: u32,
+    item_id: u32,
+    item_action: u32,
+    item_state: u32,
+    hwnd_item: isize,
+    hdc: HDC,
+    rc_item: RECT,
+    item_data: usize,
+}
+
+/// WM_DRAWITEM：主/次按钮 + 占位符 toggle。
+unsafe fn paint_item(dis: &DrawItem) {
+    let hdc = dis.hdc;
+    let rc = dis.rc_item;
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    let selected = dis.item_state & 1 != 0; // ODS_SELECTED
+    let disabled = dis.item_state & 4 != 0; // ODS_DISABLED
+    let focused = dis.item_state & 16 != 0; // ODS_FOCUS
+    let th = theme();
+    unsafe { ensure_brushes(&th) };
+    let accent = th.accent;
+    match dis.ctl_id as i32 {
+        ID_OK => {
+            let fill = if disabled {
+                th.border
+            } else {
+                accent
+            };
+            round_box(hdc, rc.left, rc.top, w, h, 9, fill, fill);
+            let fg = if disabled { th.muted } else { contrast_fg(accent) };
+            draw_text_center(hdc, "确定", rc.left, rc.top, w, h, ui_font(true), 15, fg);
+            if focused && !disabled {
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 7, 0, th.accent_fg);
+            }
+        }
+        ID_CANCEL => {
+            let fill = if selected { th.border } else { th.card };
+            round_box(hdc, rc.left, rc.top, w, h, 9, fill, th.border);
+            draw_text_center(hdc, "取消", rc.left, rc.top, w, h, ui_font(false), 15, th.text);
+            if focused {
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 7, 0, accent);
+            }
+        }
+        ID_PH => {
+            let on = PH_ON.load(std::sync::atomic::Ordering::Relaxed);
+            if on {
+                round_box(hdc, rc.left, rc.top, w, h, 16, th.card, accent);
+                let bx = rc.left + 10;
+                let by = rc.top + (h - 16) / 2;
+                round_box(hdc, bx, by, 16, 16, 4, accent, accent);
+                let _ = draw_text_center(hdc, "✓", bx, by - 1, 16, 16, small_font(), 12, th.accent_fg);
+            } else {
+                round_box(hdc, rc.left, rc.top, w, h, 16, th.card, th.border);
+                let bx = rc.left + 10;
+                let by = rc.top + (h - 16) / 2;
+                round_box(hdc, bx, by, 16, 16, 4, th.bg, th.border);
+            }
+            let fg = if on { th.text } else { th.muted };
+            let _ = draw_text(hdc, "占位符补位", rc.left + 36, rc.top + (h - 15) / 2 - 1, ui_font(false), fg);
+            if focused {
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 14, 0, accent);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// RichEdit 文字颜色（WM_CTLCOLOREDIT 只管背景，字色需 CHARFORMAT）。
+unsafe fn set_rich_text_color(h: HWND, color: u32) {
+    #[repr(C)]
+    struct CharFormatW {
+        cb_size: u32,
+        mask: u32,
+        effects: u32,
+        height: i32,
+        offset: i32,
+        text_color: u32,
+        charset: u8,
+        pitch: u8,
+        face: [u16; 32],
+    }
+    let mut cf = CharFormatW {
+        cb_size: std::mem::size_of::<CharFormatW>() as u32,
+        mask: 0x4000_0000, // CFM_COLOR
+        effects: 0,
+        height: 0,
+        offset: 0,
+        text_color: color,
+        charset: 0,
+        pitch: 0,
+        face: [0; 32],
+    };
+    let _ = SendMessageW(
+        h,
+        0x0444, /* EM_SETCHARFORMAT */
+        WPARAM(4), /* SCF_ALL */
+        LPARAM(&mut cf as *mut _ as isize),
+    );
 }
 
 /// 新词项字体（加粗+下划线）。
@@ -1620,6 +2401,33 @@ unsafe fn measure_w(s: &str, font_usize: usize) -> Option<i32> {
     }
 }
 
+/// 按宽度裁剪长候选（末尾加 …）；避免单个超长词撑出预览卡。
+fn fit_text(
+    mw: &dyn Fn(&str, Option<usize>, i32) -> i32,
+    s: &str,
+    font: Option<usize>,
+    em: i32,
+    max_w: i32,
+) -> (String, i32) {
+    let full = mw(s, font, em);
+    if full <= max_w {
+        return (s.to_string(), full);
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        let test = format!("{out}{ch}…");
+        if mw(&test, font, em) > max_w {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        out.push('…');
+    }
+    let w = mw(&out, font, em);
+    (out, w)
+}
+
 /// 预览一行候选项：序号(label 色) + 词(text 色) 流式排列换行。
 /// 返回排版后的下一行 y。new_idx=加入后行中新词下标（高亮块）。
 /// 【占位符 2026-10-08】ph_start..ph_end 段为占位项（③④…），用
@@ -1635,18 +2443,9 @@ unsafe fn draw_items(
     ph_start: usize,
     ph_end: usize,
 ) -> i32 {
-    let em = SKIN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map(|s| s.font_pt)
-        .unwrap_or(16);
-    let lem = SKIN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map(|s| s.label_pt)
-        .unwrap_or(12);
+    // 预览固定字号（与 FONT_MAIN/FONT_LABEL 一致）：18/13px。
+    let em = 18;
+    let lem = 13;
     let spacing = SKIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1681,8 +2480,8 @@ unsafe fn draw_items(
         PV_X,
         y0,
         head_w + 2,
-        line_h,
-        0,
+        lem + 4,
+        id_base - 10,
     );
     set_item_font(h, true);
     ITEMS
@@ -1690,18 +2489,44 @@ unsafe fn draw_items(
         .unwrap_or_else(|p| p.into_inner())
         .push(h.0 as isize);
 
-    let mut x = PV_X + head_w;
-    let mut y = y0;
+    // 分组标题单独占一行，候选从下一行起排（视觉分层更清楚）。
+    let mut x = PV_X;
+    let mut y = y0 + 20;
     let right = PV_X + PV_W;
     for (i, t) in texts.iter().enumerate() {
         let label = format!("{}.", i + 1);
         let is_new = new_idx == Some(i);
         let lw = mw(&label, label_font, lem) + 2;
-        let tw = mw(t, if is_new { new_font } else { main_font }, em) + 2;
-        let need = lw + tw + spacing;
+        let tf = if is_new { new_font } else { main_font };
+        // 单个候选超过整行可用宽 → 先裁成 …，防横向出血。
+        // 先按字符数硬上限（防 GDI 测量/裁剪在极长串上的边界问题），
+        // 再按像素宽精裁；两层都保留末尾 …。
+        let t_short: String = if t.chars().count() > 16 {
+            let mut q: String = t.chars().take(16).collect();
+            q.push('…');
+            q
+        } else {
+            t.clone()
+        };
+        let max_line = (right - PV_X).max(80);
+        let (mut disp, mut tw) = fit_text(&mw, &t_short, tf, em, max_line - lw - spacing - 18);
+        if tw < 0 { tw = 0; }
+        let mut sw = tw + 12; // STATIC 宽度留 12px，防 … 被裁掉
+        // 新词胶囊左右各伸 4px，预留额外 gap，避免被相邻 STATIC 底色盖住。
+        let extra = if is_new { 12 } else { 0 };
+        let mut need = lw + sw + spacing + extra;
         if x + need > right {
-            x = PV_X + 17; // 续行缩进（14×1.2）
+            x = PV_X; // 续行/换行从内容左缘起
             y += line_h;
+        }
+        // 换行后仍超宽（label+长词）→ 按当前行剩余宽再裁一次。
+        let avail = right - x - lw - 2;
+        if sw > avail {
+            let fit = fit_text(&mw, &disp, tf, em, (avail - 12).max(20));
+            disp = fit.0;
+            tw = fit.1;
+            sw = tw + 12;
+            need = lw + sw + spacing + extra;
         }
         let base = if is_new {
             ID_AFT_NEW
@@ -1712,6 +2537,12 @@ unsafe fn draw_items(
         };
         // 序号（新词行用高亮 id 段着色）
         let lbl_txt = utf16z(&label);
+        let label_h = if is_new { em + 6 } else { lem + 4 };
+        let label_y = if is_new {
+            y + (line_h - em - 6) / 2
+        } else {
+            y + (line_h - lem - 4)
+        };
         let hl = create_child(
             hwnd,
             w!("STATIC"),
@@ -1719,9 +2550,9 @@ unsafe fn draw_items(
             WINDOW_EX_STYLE(0),
             0x80,
             x,
-            y + (line_h - lem - 4),
+            label_y,
             lw,
-            lem + 4,
+            label_h,
             base, // 【三十四修】旧 `if is_new { base } else { base }` 恒等式简化
         );
         set_item_font(hl, true);
@@ -1729,8 +2560,8 @@ unsafe fn draw_items(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(hl.0 as isize);
-        // 词（新词用加粗+下划线字体；宽=实测，不再按估算硬裁吞尾字）
-        let w_txt = utf16z(t);
+        // 词（新词用加粗字体；超长已按宽度裁成 …）
+        let w_txt = utf16z(&disp);
         let wd = create_child(
             hwnd,
             w!("STATIC"),
@@ -1739,7 +2570,7 @@ unsafe fn draw_items(
             0x80,
             x + lw,
             y + (line_h - em - 6) / 2,
-            tw,
+            sw,
             em + 6,
             base + 1,
         );
@@ -1752,6 +2583,15 @@ unsafe fn draw_items(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(wd.0 as isize);
+        if is_new {
+            let chip_x = (x - 4).max(PV_X);
+            let chip_y = y + (line_h - em - 6) / 2 - 3;
+            let chip_w = (lw + sw + 8).min(right - chip_x);
+            NEW_CHIP_RECTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((chip_x, chip_y, chip_w, em + 12));
+        }
         x += need;
         // 【三十四修·死代码删除】cid 计数器（`cid += 2; let _ = cid;`
         // 只写不读）已删。
@@ -1761,6 +2601,7 @@ unsafe fn draw_items(
 
 /// 清空旧预览项。
 unsafe fn clear_items() {
+    NEW_CHIP_RECTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
     let mut g = ITEMS.lock().unwrap_or_else(|p| p.into_inner());
     for h in g.iter() {
         let _ = DestroyWindow(HWND(*h as *mut _));
@@ -1782,99 +2623,48 @@ unsafe fn refresh_preview(hwnd: HWND) {
         let n = GetWindowTextW(h, &mut buf);
         String::from_utf16_lossy(&buf[..n.max(0) as usize])
     };
-    // 【加权模式 2026-09-06】单行提示：确定后 server 反查最优码并
-    // 以用户词 weight 提权（词将排到候选前部）
-    if is_weight_mode() {
-        clear_items();
-        let word = read_box(ID_WORD).trim().to_string();
-        let wv: i64 = read_box(ID_CODE).trim().parse().unwrap_or(1000);
-        let wv = if read_box(ID_CODE).trim().is_empty() {
-            1000
-        } else {
-            wv
-        };
-        let msg = if word.is_empty() {
-            "输入词后确定：编码自动反查，该词将提到候选前部。".to_string()
-        } else {
-            format!("『{word}』权重 {wv}：确定后提到候选前部。")
-        };
-        let em = SKIN
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .map(|s| s.font_pt)
-            .unwrap_or(16);
-        let t = utf16z(&msg);
-        // 【SS_NOPREFIX 2026-11】msg 含用户词（& 直通不吞）；宽=PV_W 通栏，
-        // 长词由 STATIC 自身裁剪（表头提示语，与候选行不同路）。
-        let h = create_child(
-            hwnd,
-            w!("STATIC"),
-            PCWSTR(t.as_ptr()),
-            WINDOW_EX_STYLE(0),
-            0x80,
-            PV_X,
-            187, // 156×1.2（加权两行底 162 下留白）
-            PV_W,
-            em + 10,
-            0,
-        );
-        set_item_font(h, false);
-        ITEMS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(h.0 as isize);
-        let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
-        return;
-    }
-    let code = read_box(ID_CODE).trim().to_string();
     let word = read_box(ID_WORD).trim().to_string();
+    let code = read_box(ID_CODE).trim().to_string();
     let pos: usize = read_box(ID_POS).trim().parse().unwrap_or(0);
-    // 【占位符 2026-10-08】勾选态（BM_GETCHECK；加权模式无此框恒 false）
-    let ph_on = match GetDlgItem(hwnd, ID_PH) {
-        Ok(h) => {
-            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                h,
-                0x00F0, /* BM_GETCHECK */
-                WPARAM(0),
-                LPARAM(0),
-            )
-            .0 as i32
-                == 1 /* BST_CHECKED */
-        }
-        Err(_) => false,
-    };
-
+    let ph_on = PH_ON.load(std::sync::atomic::Ordering::Relaxed);
     let line_h = SKIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .map(|s| s.font_pt + 17)
-        .unwrap_or(41);
+        .map(|_| 30)
+        .unwrap_or(30);
 
     clear_items();
     let mut y = PV_START_Y;
     let mut old_len_for_hint = 0usize;
-    if code.is_empty() {
-        // 占位提示
-        let t = utf16z("（输入编码后显示该码候选）");
+
+    let mk_msg = |text: &str, yy: i32| {
+        let t = utf16z(text);
         let h = create_child(
             hwnd,
             w!("STATIC"),
             PCWSTR(t.as_ptr()),
             WINDOW_EX_STYLE(0),
-            0,
+            0x80 | 0x4000, /* SS_ENDELLIPSIS */
             PV_X,
-            y,
+            yy,
             PV_W,
             line_h,
-            0,
+            ID_PV_MSG,
         );
-        set_item_font(h, true);
-        ITEMS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(h.0 as isize);
+        if !h.0.is_null() {
+            set_ui_font(h, false);
+            ITEMS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(h.0 as isize);
+        }
+    };
+
+    if is_weight_mode() {
+        // 加权模式：效果示意全部由 paint_scene 自绘，不建预览子项。
+    } else if code.is_empty() {
+        mk_msg("输入编码后显示该码候选", y);
         y += line_h;
     } else {
         match code_preview(&code) {
@@ -1884,14 +2674,8 @@ unsafe fn refresh_preview(hwnd: HWND) {
                 } else {
                     texts.clone()
                 };
-                y = draw_items(hwnd, y, "现有：", &cur, None, ID_CUR_BASE, line_h, 0, 0);
+                y = draw_items(hwnd, y, "现有", &cur, None, ID_CUR_BASE, line_h, 0, 0);
                 if !word.is_empty() {
-                    // 与 server add / Schema 插入同规则模拟。
-                    // 【占位符补位 2026-10-08】勾选且 pos-1 超出现有数
-                    // 时，用带圈数字 ③④… 补满空位使词恰落第 N 位（用户
-                    // 例：d 码现有「中 哪个」+加「是」选 4 位 →
-                    // 中 哪个 ③ 是；选 5 位 → 中 哪个 ③ ④ 是）。占位段
-                    // 传给 draw_items 用标签色压暗（ID_AFT_PH 段）。
                     let mut sim: Vec<String> =
                         texts.iter().filter(|t| **t != word).cloned().collect();
                     let old_len = sim.len();
@@ -1905,13 +2689,6 @@ unsafe fn refresh_preview(hwnd: HWND) {
                         }
                         ph_end = sim.len();
                     }
-                    // 【占位符位加词=替换 2026-10-09】第 pos 位现有候选
-                    // 恰是占位词（带圈数字）→ 原位替换（server
-                    // /api/user_word/add 同规则：先 {删除}占位词再
-                    // {添加}pN，其余候选不动）；非占位位照旧插入后移。
-                    // 【判定口径·用户拍板 2026-10-09】纯形态判定，与
-                    // server 同规则：带圈数字即占位符，码表来源同样
-                    // 替换（占位符码表方案导入即用）。
                     let idx = if pos >= 1 {
                         (pos as usize - 1).min(sim.len())
                     } else {
@@ -1936,17 +2713,14 @@ unsafe fn refresh_preview(hwnd: HWND) {
                     } else {
                         sim.insert(idx, word.clone());
                     }
-                    // 【预演取证 2026-10-09】用户报「词跑第2位、占位符在
-                    // 第4位」——纸面推演全部正确，落此痕下次实测直接对账。
                     crate::tsf::trace(&format!(
                         "addword 预演: ph={ph_on} pos={pos} old_len={old_len} idx={idx} → {}",
                         sim.join("·")
                     ));
-                    // 「现有」与「加入后」隔开一行距，视觉分组
                     y = draw_items(
                         hwnd,
-                        y + line_h / 2 + 4,
-                        "加入后：",
+                        y + line_h / 2,
+                        "加入后",
                         &sim,
                         Some(idx),
                         ID_AFT_BASE,
@@ -1957,64 +2731,28 @@ unsafe fn refresh_preview(hwnd: HWND) {
                 }
             }
             None => {
-                let t = utf16z("（查询失败）");
-                let h = create_child(
-                    hwnd,
-                    w!("STATIC"),
-                    PCWSTR(t.as_ptr()),
-                    WINDOW_EX_STYLE(0),
-                    0,
-                    PV_X,
-                    y,
-                    PV_W,
-                    line_h,
-                    0,
-                );
-                set_item_font(h, true);
-                ITEMS
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(h.0 as isize);
+                mk_msg("（查询失败）", y);
                 y += line_h;
             }
         }
     }
 
-    // 【占位符勾选反馈 2026-10-08 v2】勾选后无论预览内容是否变化都补
-    // 一行状态说明（勾选必可见反馈——空码/空词/候选已够时预览不变，
-    // 用户以为「点不动」的根因）。放预览区末尾，任何状态都画。
     if ph_on {
         let hint = if pos == 0 {
-            "☑ 占位符已开：填选重位 N（N 超出现有候选数+1）后预览即补 ③ ④ …"
+            "占位符已开：填选重位后自动补 ③ ④ …"
         } else if pos >= 1 && pos - 1 <= old_len_for_hint {
-            "☑ 占位符已开：现有候选已够排到该位，本次不补位"
+            "占位符已开：现有候选已够该位"
         } else {
-            "☑ 占位符已开：第 ③ 位起已按带圈数字补齐空位"
+            "占位符已开：已按 ③ ④ … 补齐前序空位"
         };
-        let t = utf16z(hint);
-        let h = create_child(
-            hwnd,
-            w!("STATIC"),
-            PCWSTR(t.as_ptr()),
-            WINDOW_EX_STYLE(0),
-            0,
-            PV_X,
-            y + 6,
-            PV_W,
-            line_h,
-            0,
-        );
-        set_item_font(h, true);
-        ITEMS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(h.0 as isize);
-        y += line_h + 6;
+        mk_msg(hint, y + 2);
+        y += line_h + 4;
     }
 
-    // 自适应：按钮钉底、窗口随高
-    let btn_y = y + 12;
-    let client_h = btn_y + BTN_H + 17;
+    // 窗口高度：固定布局为下限；预览内容多时向下长（底栏随之下移）。
+    let min_h = if is_weight_mode() { W_CLIENT_H } else { CLIENT_H };
+    let client_h = min_h.max(y + 124);
+    let btn_y = client_h - 24 - BTN_H;
     for (id, dx) in [(ID_OK, BTN_OK_X), (ID_CANCEL, BTN_CANCEL_X)] {
         if let Ok(ch) = GetDlgItem(hwnd, id) {
             let _ = SetWindowPos(
@@ -2037,33 +2775,84 @@ unsafe fn refresh_preview(hwnd: HWND) {
         outer_h(client_h),
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
+    // 确定可用性：词必填；加词模式编码必填。
+    let ok = !word.is_empty() && (is_weight_mode() || !code.is_empty());
+    if let Ok(h) = GetDlgItem(hwnd, ID_OK) {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h, ok);
+    }
     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
 }
 
-/// 【2026-11-02 端口回退】server 的 HTTP 端口不恒是 4390：Windows 的
-/// Hyper-V/WSL 动态端口保留会把 4390 圈进保留段（用户实机排除段
-/// 4324-4423），server 侧已改为按 [4390, 17890…17894, 27890] 探测后
-/// 服务（见 hufu-server main.rs 「端口被系统保留的修复」）。加词框三条
-/// HTTP（候选预览 / 自动填码 / 提交）原先裸写 4390，server 一换端口就
-/// 整条失效：词框没有预览、没有自动编码、点「添加」毫无反应。
-/// 这里按 server 同款候选顺序探测一次并缓存（只缓存成功值，server 后起
-/// 时下次调用仍会重试）。
-fn http_port() -> u16 {
-    use std::sync::OnceLock;
-    static PORT: OnceLock<u16> = OnceLock::new();
-    if let Some(p) = PORT.get() {
-        return *p;
+/// 【2026-11-02 P2】server 端口探测/缓存：
+///  - 只缓存**命中 /api/about 虎符特征**的端口（纯 TCP 可达会把别家服务当虎符）；
+///  - 缓存命中后 HTTP 失败（server 换端口/重启/被别家占）→ reset_http_port()
+///    清缓存，下次调用重新探测；
+///  - 无服务时 1s 负缓存，避免词框每键都扫 7 个端口。
+const ADDWORD_HTTP_CANDS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
+static ADDWORD_HTTP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static ADDWORD_HTTP_LAST_PROBE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn probe_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 端口的 /api/about 是否确实是虎符 server（github + exe_dir 形状）。
+/// 只做 TCP connect 会把别家本地服务当虎符，把加词请求发错地方。
+fn probe_hufu_about(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(
+        &addr,
+        std::time::Duration::from_millis(150),
+    ) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_millis(300)));
+    let req = "GET /api/about HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
     }
-    const CANDS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
-    for p in CANDS {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
-        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok()
-        {
-            let _ = PORT.set(p);
+    let mut resp = String::new();
+    let mut s = s.take(16 * 1024);
+    let _ = s.read_to_string(&mut resp);
+    resp.contains("\"github\"") && resp.contains("hufu-ime-rust") && resp.contains("\"exe_dir\"")
+}
+
+fn http_port() -> u16 {
+    use std::sync::atomic::Ordering;
+    let cached = ADDWORD_HTTP_PORT.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let now = probe_now_ms();
+    let last = ADDWORD_HTTP_LAST_PROBE_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1000 {
+        return 4390;
+    }
+    ADDWORD_HTTP_LAST_PROBE_MS.store(now, Ordering::Relaxed);
+    for p in ADDWORD_HTTP_CANDS {
+        if probe_hufu_about(p) {
+            ADDWORD_HTTP_PORT.store(p, Ordering::Relaxed);
             return p;
         }
     }
     4390
+}
+
+/// 清缓存端口。之前有缓存（server 换端口）→ 同时清负缓存，立刻重探；
+/// 无缓存时保留 1s 负缓存，避免没有 server 时每键扫端口。
+fn reset_http_port() {
+    use std::sync::atomic::Ordering;
+    let had = ADDWORD_HTTP_PORT.swap(0, Ordering::Relaxed);
+    if had != 0 {
+        ADDWORD_HTTP_LAST_PROBE_MS.store(0, Ordering::Relaxed);
+    }
 }
 
 /// GET /api/code_preview?code=xxx → 候选文本列表。
@@ -2082,16 +2871,35 @@ fn code_preview(code: &str) -> Option<Vec<String>> {
     let req = format!(
         "GET /api/code_preview?code={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     );
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", http_port())).ok()?;
+    let port = http_port();
+    let mut s = match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(_) => {
+            reset_http_port();
+            return None;
+        }
+    };
     // 【读超时 2026-09-11】与 http_post_json 同款：实时预览路径在
     // EN_UPDATE 每键触发，server 卡住会冻结加词窗 UI。
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-    s.write_all(req.as_bytes()).ok()?;
+    if s.write_all(req.as_bytes()).is_err() {
+        reset_http_port();
+        return None;
+    }
     let mut resp = String::new();
     let _ = s.read_to_string(&mut resp);
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b)?;
-    let v: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
+    let Some((_, body)) = resp.split_once("\r\n\r\n") else {
+        reset_http_port();
+        return None;
+    };
+    let v: serde_json::Value = match serde_json::from_str(body.trim_start()) {
+        Ok(v) => v,
+        Err(_) => {
+            reset_http_port();
+            return None;
+        }
+    };
     v.get("texts").and_then(|t| t.as_array()).map(|a| {
         a.iter()
             .filter_map(|x| x.as_str().map(|s| s.to_string()))
@@ -2116,15 +2924,34 @@ fn word_code(text: &str) -> Option<String> {
     let req = format!(
         "GET /api/word_code?text={enc} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     );
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", http_port())).ok()?;
+    let port = http_port();
+    let mut s = match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(_) => {
+            reset_http_port();
+            return None;
+        }
+    };
     // 读超时同 code_preview：预填路径在词框 EN_UPDATE 每键触发。
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-    s.write_all(req.as_bytes()).ok()?;
+    if s.write_all(req.as_bytes()).is_err() {
+        reset_http_port();
+        return None;
+    }
     let mut resp = String::new();
     let _ = s.read_to_string(&mut resp);
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b)?;
-    let v: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
+    let Some((_, body)) = resp.split_once("\r\n\r\n") else {
+        reset_http_port();
+        return None;
+    };
+    let v: serde_json::Value = match serde_json::from_str(body.trim_start()) {
+        Ok(v) => v,
+        Err(_) => {
+            reset_http_port();
+            return None;
+        }
+    };
     v.get("code")
         .and_then(|c| c.as_str())
         .filter(|c| !c.is_empty())
@@ -2180,19 +3007,7 @@ unsafe fn submit(hwnd: HWND) {
     // 【占位符补位提交 2026-10-08】勾选且 pos-1 超出现有候选数时，
     // 先按序提交带圈数字占位词条（③@p3、④@p4…——server {添加}pN
     // 时序回放逐条落位），词最后落在恰好的第 N 位。与预览同规则。
-    let ph_on = match GetDlgItem(hwnd, ID_PH) {
-        Ok(h) => {
-            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                h,
-                0x00F0, /* BM_GETCHECK */
-                WPARAM(0),
-                LPARAM(0),
-            )
-            .0 as i32
-                == 1
-        }
-        Err(_) => false,
-    };
+    let ph_on = PH_ON.load(std::sync::atomic::Ordering::Relaxed);
     if ph_on && pos_num >= 2 {
         let existing = code_preview(&code)
             .map(|texts| texts.iter().filter(|t| **t != word).count())
@@ -2217,7 +3032,7 @@ unsafe fn submit(hwnd: HWND) {
     }
 }
 
-/// 裸 HTTP POST 127.0.0.1:4390 /api/user_word/weight。
+/// 裸 HTTP POST 127.0.0.1:<server 端口> /api/user_word/weight。
 /// 【JSON 安全 2026-09-11】旧手拼 esc 只转义 \ 和 "——词里带换行/
 /// 制表符等控制字符会拼出非法 JSON（server 端解析 400，加词静默
 /// 失败）。改 serde_json 正规序列化。
@@ -2244,6 +3059,7 @@ fn http_post_json(path: &str, body: &str) -> bool {
         Ok(s) => s,
         Err(e) => {
             crate::tsf::trace(&format!("addword tcp connect err: {e}"));
+            reset_http_port();
             return false;
         }
     };
@@ -2253,11 +3069,16 @@ fn http_post_json(path: &str, body: &str) -> bool {
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     if let Err(e) = s.write_all(req.as_bytes()) {
         crate::tsf::trace(&format!("addword tcp write err: {e}"));
+        reset_http_port();
         return false;
     }
     let mut resp = String::new();
     let _ = s.read_to_string(&mut resp);
-    resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200")
+    let ok = resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200");
+    if !ok {
+        reset_http_port();
+    }
+    ok
 }
 
 #[cfg(test)]

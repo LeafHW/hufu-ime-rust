@@ -5,6 +5,8 @@
     --gold:#e7b75c; --gold2:#f3c877; --gold3:#a8741a; --gold-soft:rgba(231,183,92,.12);
     --red:#e06a5a; --green:#63c08d; --blue:#6aa6ff;
     --shadow:0 22px 70px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.04);
+    /* 【2026-11-03 M5】内部动效 token（与候选窗 MOTION_* 同节奏；不对外/皮肤开放） */
+    --motion-fast:.08s; --motion-base:.12s; --motion-slow:.18s;
   }
   body.light{
     --bg:#f5f2ea; --bg2:#efe9dd; --surface:#fffdf8; --surface2:#f3efe5;
@@ -186,7 +188,7 @@
   .status-card .sc-icon{color:var(--text3);opacity:.7}
   .status-card .sc-value{font-size:19px;font-weight:650;display:flex;align-items:center;gap:9px;margin-top:-2px}
   .status-card .sc-sub{font-size:13px;color:var(--text2)}
-  .status-card.clickable{cursor:pointer;transition:border-color .16s ease,background .16s ease,transform .16s ease}
+  .status-card.clickable{cursor:pointer;transition:border-color var(--motion-base) ease,background var(--motion-base) ease,transform var(--motion-base) ease}
   .status-card.clickable:hover{border-color:rgba(231,183,92,.34);background:linear-gradient(180deg,rgba(231,183,92,.045),transparent 72%),var(--surface);transform:translateY(-1px)}
   .status-card.clickable:active{transform:translateY(0)}
   .status-card.clickable:focus-visible{outline:2px solid rgba(231,183,92,.65);outline-offset:2px}
@@ -426,8 +428,9 @@
   .switch:focus-visible{box-shadow:0 0 0 2px var(--bg),0 0 0 4px rgba(231,183,92,.55)}
   .switch:after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
     background:#f7f3ea;box-shadow:0 1px 3px rgba(0,0,0,.40),0 1px 0 rgba(255,255,255,.55) inset;
-    transition:left .18s cubic-bezier(.2,.8,.2,1),background .18s ease}
-  .switch.on:after{left:18px;background:#fffaf0}
+    /* 只动合成属性（旧版 transition:left 每帧触发布局） */
+    transition:transform var(--motion-base) cubic-bezier(.2,.8,.2,1),background var(--motion-base) ease;transform:translateX(0)}
+  .switch.on:after{transform:translateX(16px);background:#fffaf0}
   .color-grid{display:grid;grid-template-columns:repeat(11,1fr);gap:5px;margin-top:7px}
   .color-grid .swatch{width:100%;height:16px;border-radius:4px}
   .link-more{font-size:12px;color:var(--gold2);margin-top:8px;display:inline-block}
@@ -494,19 +497,17 @@
   .sync-face.is-glow .sync-flash{animation:syncFlash 1.1s ease-out}
   .sync-face.is-glow .sync-ring{opacity:.85}
   .sync-face.is-glow .sync-tally{filter:drop-shadow(0 10px 22px rgba(0,0,0,.42)) drop-shadow(0 0 13px rgba(231,183,92,.42))}
-  /* 合符终态：辉光呼吸 + 圈环常转 + 轻微浮动 */
+  /* 合符终态：辉光呼吸 + 圈环常转（长期停留只保留 2 个无限动画；
+     脉冲/浮动原为 4 个，CPU 常驻成本高，2026-11-03 收敛） */
   .sync-face.is-joined .sync-halo{opacity:1;animation:syncHalo 4.2s ease-in-out infinite}
   .sync-face.is-joined .sync-ring{opacity:1;animation:syncSpin 8s linear infinite}
-  .sync-face.is-joined:after{opacity:1;animation:syncPulse 3.4s ease-out infinite}
+  .sync-face.is-joined:after{opacity:.35}
   .sync-face.is-joined .sync-tally{
-    filter:drop-shadow(0 10px 22px rgba(0,0,0,.42)) drop-shadow(0 0 13px rgba(231,183,92,.42));
-    animation:syncFloat 5.2s ease-in-out infinite}
-  @keyframes syncFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+    filter:drop-shadow(0 10px 22px rgba(0,0,0,.42)) drop-shadow(0 0 13px rgba(231,183,92,.42))}
   @keyframes syncHalo{0%,100%{opacity:.65;transform:scale(.96)}50%{opacity:1;transform:scale(1.04)}}
   @keyframes syncHaloGlow{0%{opacity:0;transform:scale(.86)}45%{opacity:1;transform:scale(1.06)}100%{opacity:.9;transform:scale(1)}}
   @keyframes syncFlash{0%{opacity:0;transform:scale(.7)}30%{opacity:1}100%{opacity:0;transform:scale(1.22)}}
   @keyframes syncSpin{to{transform:rotate(360deg)}}
-  @keyframes syncPulse{0%{transform:scale(.92);opacity:.55}80%,100%{transform:scale(1.12);opacity:0}}
 
   /* 已配置但连接/同步异常：辉光转琥珀、圈环停转（"看起来在连其实没连上"不可接受） */
   .sync-face.is-trouble .sync-halo{
@@ -640,7 +641,7 @@ body[data-screen="other"] #s-other{display:block}
 .cand.ab{outline:1.5px dashed var(--gold2);outline-offset:3px}
 .toast{position:absolute;right:18px;bottom:16px;z-index:60;max-width:380px;padding:10px 14px;border-radius:8px;
   background:var(--surface);border:1px solid var(--line2);color:var(--text);font-size:13.5px;
-  box-shadow:var(--shadow);opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none}
+  box-shadow:var(--shadow);opacity:0;transform:translateY(8px);transition:opacity var(--motion-base),transform var(--motion-base);pointer-events:none}
 .toast.show{opacity:1;transform:none}
 .dot.red{background:var(--red);box-shadow:0 0 8px rgba(224,106,90,.55)}
 .dot.muted{background:var(--text3);box-shadow:none}
@@ -947,3 +948,178 @@ body.light .about-hero img {
 /* 【概览检查更新 2026-11-01】发现新版时该行高亮 */
 .act-row.has-update{border-color:var(--accent,#e7b75c)}
 .act-row.has-update .act-main b{color:var(--accent,#e7b75c)}
+
+/* 【2026-11-03 M5】动效预览：固定内部 token，不对皮肤开放 */
+.motion-demo{display:flex;align-items:center;gap:8px}
+.md-rows{position:relative;width:176px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--bg2)}
+.md-row{position:relative;z-index:1;height:26px;line-height:26px;padding:0 8px;font-size:13px;color:var(--text2);border-radius:6px}
+.md-row.on{color:var(--text)}
+.md-pill{position:absolute;left:4px;right:4px;top:4px;height:26px;z-index:0;border-radius:6px;background:var(--gold-soft);border:1px solid rgba(231,183,92,.35);transition-property:transform;transition-timing-function:cubic-bezier(.2,.8,.2,1);will-change:transform}
+
+/* 【2026-11-03 动效减负】窗口隐藏/最小化时暂停常驻动画（App.tsx 切 html.anim-paused） */
+html.anim-paused .sync-halo,
+html.anim-paused .sync-ring,
+html.anim-paused .sync-face.is-joined:after{animation-play-state:paused!important}
+
+/* 【2026-11-03 第三批】页面切换 120ms 入场（只动合成属性；reduced 由下方全局兜底） */
+@keyframes screenIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+body[data-screen] :is(#s-overview,#s-skin,#s-sync,#s-schemes,#s-input,#s-keymap,#s-sentence,#s-buddy,#s-data,#s-other){
+  animation:screenIn var(--motion-base) cubic-bezier(.2,.8,.2,1) both;
+}
+
+/* 【2026-11-03 可访问性】全局尊重系统“减少动画”（此前只覆盖同步页） */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms!important;
+    animation-iteration-count:1!important;
+    transition-duration:.001ms!important;
+    scroll-behavior:auto!important;
+  }
+}
+
+/* ── 2026-11-03 滚动旅程：所有页面纵向串联，滚动进入下一站 ───────────── */
+.main.journey{
+  scroll-snap-type:y proximity;
+  scroll-behavior:smooth;
+  scroll-padding-top:8px;
+  padding-bottom:72px;
+  overscroll-behavior:contain;
+}
+.main.journey .screen{
+  display:block!important;
+  height:auto;
+  min-height:calc(100vh - 128px);
+  padding:10px 0 64px;
+  scroll-snap-align:start;
+  scroll-margin-top:0;
+}
+.main.journey .screen + .screen{
+  margin-top:6px;
+  border-top:1px solid var(--line);
+  padding-top:34px;
+}
+.main.journey .screen:last-child{padding-bottom:96px}
+.screen-inner{position:relative;z-index:1;min-width:0}
+
+/* 顶部金色进度条 */
+.journey-progress{
+  position:sticky;top:-26px;z-index:26;height:2px;margin:-26px -32px 20px;
+  background:transparent;pointer-events:none;
+}
+.journey-progress i{
+  display:block;height:100%;transform-origin:0 50%;
+  background:linear-gradient(90deg,var(--gold3),var(--gold2));
+  box-shadow:0 0 12px rgba(231,183,92,.45);
+}
+
+/* 右侧旅程轨 */
+.journey-rail{
+  position:fixed;right:14px;top:50%;transform:translateY(-50%);z-index:35;
+  display:flex;flex-direction:column;align-items:flex-end;gap:5px;
+}
+.jr-dot{
+  height:16px;min-width:26px;padding:0 3px;border:0;background:transparent;
+  display:flex;align-items:center;justify-content:flex-end;position:relative;
+  color:transparent;cursor:pointer;
+}
+.jr-dot:before{
+  content:"";width:5px;height:5px;border-radius:50%;background:var(--line2);
+  transition:width .3s cubic-bezier(.2,.8,.2,1),height .3s,background .3s,border-radius .3s;
+}
+.jr-dot.on:before{width:18px;border-radius:3px;background:var(--gold);box-shadow:0 0 10px rgba(231,183,92,.45)}
+.jr-dot:hover:before{background:var(--gold2)}
+.jr-dot span{
+  position:absolute;right:24px;font:600 10px/1 var(--mono,ui-monospace,Consolas,monospace);
+  letter-spacing:.08em;color:var(--text3);opacity:0;transform:translateX(5px);
+  transition:opacity .18s ease,transform .18s ease;white-space:nowrap;
+}
+.jr-dot:hover span,.jr-dot.on span{opacity:1;transform:none}
+.jr-dot.on span{color:var(--gold2)}
+
+/* 元素入场：页面进入视口时直属内容快速错峰上浮 */
+.main.journey .screen .screen-inner > *{
+  opacity:0;transform:translateY(18px);
+  transition:opacity .4s ease,transform .44s cubic-bezier(.2,.8,.2,1);
+}
+.main.journey .screen.in .screen-inner > *{opacity:1;transform:none}
+.main.journey .screen.in .screen-inner > *:nth-child(1){transition-delay:0ms}
+.main.journey .screen.in .screen-inner > *:nth-child(2){transition-delay:40ms}
+.main.journey .screen.in .screen-inner > *:nth-child(3){transition-delay:80ms}
+.main.journey .screen.in .screen-inner > *:nth-child(4){transition-delay:120ms}
+.main.journey .screen.in .screen-inner > *:nth-child(5){transition-delay:160ms}
+.main.journey .screen.in .screen-inner > *:nth-child(6){transition-delay:200ms}
+.main.journey .screen.in .screen-inner > *:nth-child(7){transition-delay:240ms}
+.main.journey .screen.in .screen-inner > *:nth-child(n+8){transition-delay:280ms}
+
+@media (max-width:900px){
+  .journey-rail{right:5px}
+  .jr-dot span{display:none}
+  .journey-hint{left:50%}
+  .main.journey .screen{min-height:calc(100vh - 110px)}
+}
+
+@media (prefers-reduced-motion: reduce){
+  .main.journey{scroll-behavior:auto;scroll-snap-type:none}
+  .main.journey .screen .screen-inner > *{opacity:1!important;transform:none!important;transition:none!important}
+  .journey-hint i{animation:none}
+}
+
+/* 旅程细节：底部“下一站”提示 + 侧轨收进窗口内 */
+.shell{position:relative}
+.journey-rail{position:absolute;right:12px;top:50%;transform:translateY(-50%)}
+.main.journey .screen{position:relative}
+.main.journey .screen:not(:last-child):after{
+  content:"下一站 · " attr(data-next) "  ↓";
+  position:absolute;left:50%;bottom:18px;transform:translateX(-50%);
+  font-size:11.5px;letter-spacing:.12em;color:var(--text3);
+  opacity:.62;pointer-events:none;white-space:nowrap;
+}
+.main.journey .screen.in:not(:last-child):after{animation:nextNudge 2.4s ease-in-out infinite}
+@keyframes nextNudge{0%,100%{transform:translateX(-50%) translateY(0);opacity:.5}50%{transform:translateX(-50%) translateY(3px);opacity:.85}}
+@media (prefers-reduced-motion: reduce){.main.journey .screen.in:not(:last-child):after{animation:none}}
+
+/* 右侧让出旅程轨，避免轨点压住卡片/开关 */
+.main.journey{padding-right:54px}
+@media (max-width:1180px){.main.journey{padding-right:34px}}
+
+/* 卡片级入场：页面进入视口时卡片再错峰一次，形成“快速挨个上来”的层次 */
+.main.journey .screen.in .card,
+.main.journey .screen.in .ip-card{
+  animation:cardRise .42s cubic-bezier(.2,.8,.2,1) both;
+}
+.main.journey .screen.in .card:nth-child(2),
+.main.journey .screen.in .ip-card:nth-child(2){animation-delay:45ms}
+.main.journey .screen.in .card:nth-child(3),
+.main.journey .screen.in .ip-card:nth-child(3){animation-delay:90ms}
+.main.journey .screen.in .card:nth-child(4),
+.main.journey .screen.in .ip-card:nth-child(4){animation-delay:135ms}
+.main.journey .screen.in .card:nth-child(5),
+.main.journey .screen.in .ip-card:nth-child(5){animation-delay:180ms}
+.main.journey .screen.in .card:nth-child(n+6),
+.main.journey .screen.in .ip-card:nth-child(n+6){animation-delay:220ms}
+@keyframes cardRise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){
+  .main.journey .screen.in .card,.main.journey .screen.in .ip-card{animation:none!important}
+}
+
+/* 皮肤页是工作台而不是长表单：固定一屏高度，列表/预览/检查器各自内部滚动，
+   避免把整页拉伸成几千像素、把后面几站推得很远。 */
+.main.journey #s-skin{
+  display:flex!important;
+  flex-direction:column;
+  height:calc(100vh - 110px);
+  min-height:540px;
+  padding-bottom:52px;
+}
+.main.journey #s-skin .screen-inner{
+  display:flex;
+  flex-direction:column;
+  flex:1;
+  min-height:0;
+}
+.main.journey #s-skin .studio{
+  flex:1;
+  height:auto;
+  min-height:0;
+}
+.main.journey #s-skin .skin-head{flex:none}
