@@ -6,6 +6,7 @@ import type { SsfOverrides } from '../api';
 import { useDirtyGuard } from '../dirtyGuard';
 import { Candidate } from '../components/Candidate';
 import { useBodyLight } from '../hooks';
+import { skinSwatch } from '../skinSwatch';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
 
@@ -756,16 +757,26 @@ export function SkinStudio({
             <span>矢量皮肤</span>
             <span>{jsonSkins.length}</span>
           </div>
-          {jsonSkins.map((meta, i) => {
+          {jsonSkins.map((meta) => {
             const active = selectedId === meta.id;
             const current = data.skins.current === meta.id;
+            const pal = skinSwatch(meta.swatch, meta.accent, lightTheme);
             return (
               <div
                 key={meta.id}
                 className={`skin-item${active ? ' on' : ''}`}
                 onClick={() => applySkin(meta)}
               >
-                <div className={`skin-thumb${i % 3 === 1 ? ' t2' : i % 3 === 2 ? ' t3' : ''}`} />
+                <div
+                  className="skin-thumb"
+                  style={
+                    {
+                      background: pal.background,
+                      borderColor: pal.border,
+                      '--sw-bar': pal.bar,
+                    } as React.CSSProperties
+                  }
+                />
                 <div className="skin-meta">
                   <b>{shortName(meta.name)}</b>
                   <span>{current ? '当前 · ' : ''}矢量皮肤</span>

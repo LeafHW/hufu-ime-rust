@@ -61,6 +61,9 @@ export interface SkinMeta {
   kind: 'json' | 'ssf';
   preview?: boolean;
   author?: string;
+  /** 列表/概览共用的皮肤代表色（服务端 /api/skins 返回；SSF 无此字段）。 */
+  swatch?: string;
+  accent?: string;
 }
 
 export interface SkinList {

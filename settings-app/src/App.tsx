@@ -117,6 +117,8 @@ export default function App() {
   const skipPersist = useRef<boolean>(themeParam !== null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
+  /** 【2026-11-03】主题切换的 VT 序号：连点切换时只让最后一次负责收尾清理。 */
+  const themeVtSeq = useRef(0);
   const [dirtyPages, setDirtyPages] = useState(() => getDirtyPages());
   /* 关窗确认弹层（P0）：脏数据存在时不直接发 win:close。 */
   const [closeConfirm, setCloseConfirm] = useState(false);
@@ -429,6 +431,9 @@ export default function App() {
         theme === 'light' ||
         (theme === 'system' && window.matchMedia('(prefers-color-scheme: light)').matches);
       document.body.classList.toggle('light', light);
+      /* 【2026-11-03】html.light 也要跟着切：index.html 的首帧脚本只加不减，
+         深色下残留 html.light 会让根背景/圆角缝仍是浅色。 */
+      document.documentElement.classList.toggle('light', light);
       /* 【2026-11-03 浅色黑边】把解析后的主题色同步给窗壳：
          窗口那圈 7px 非客户区边框由壳绘制，浅色主题必须跟着变浅，
          否则圆角处会露出系统深色窗框（黑边）。 */
@@ -456,9 +461,51 @@ export default function App() {
     return () => mq.removeEventListener?.('change', onSystem);
   }, [theme]);
 
+  /* 【2026-11-03】主题切换动效：以侧栏 LOGO 为圆心，新主题从那里圆形扩散
+     铺满整窗（LOGO 底正好是黑/白两色，深浅切换都顺）。
+     页面切换的 VT 正在跑时直接瞬切，避免两套 View Transition 打架；
+     系统「减少动画」时也不做。 */
   const onTheme = (m: ThemeMode) => {
     skipPersist.current = false;
-    setTheme(m);
+    if (m === theme) return;
+    const doc = document as VtDoc;
+    if (
+      reducedMotion() ||
+      typeof doc.startViewTransition !== 'function' ||
+      vtBusy.current
+    ) {
+      setTheme(m);
+      return;
+    }
+    const root = document.documentElement;
+    const logo = document.querySelector('.brand img') as HTMLElement | null;
+    const rect = logo?.getBoundingClientRect();
+    const x = Math.round(rect ? rect.left + rect.width / 2 : 68);
+    const y = Math.round(rect ? rect.top + rect.height / 2 : 82);
+    root.style.setProperty('--theme-x', `${x}px`);
+    root.style.setProperty('--theme-y', `${y}px`);
+    /* 圆要刚好盖到最远角：半径写死 160vmax 会在 40% 进度就铺满，
+       看起来像瞬切；按实际距离算，整段动画的扩散才看得见。 */
+    const far = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y),
+    );
+    root.style.setProperty('--theme-r', `${Math.ceil(far + 28)}px`);
+    root.classList.add('theme-vt');
+    const seq = ++themeVtSeq.current;
+    try {
+      const vt = doc.startViewTransition(() => {
+        flushSync(() => setTheme(m));
+      });
+      Promise.resolve(vt.finished)
+        .catch(() => {})
+        .finally(() => {
+          if (themeVtSeq.current === seq) root.classList.remove('theme-vt');
+        });
+    } catch {
+      if (themeVtSeq.current === seq) root.classList.remove('theme-vt');
+      setTheme(m);
+    }
   };
 
   /* OV-B1：订阅全局脏状态 —— 关窗（beforeunload）统一拦截。 */

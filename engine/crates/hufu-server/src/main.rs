@@ -1975,11 +1975,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // name 回退文件名。
             let cur = host.engine.config.appearance.skin.clone();
             let cur_kind = host.engine.config.appearance.skin_kind.clone();
+            /* 【2026-11-03 图标一致性】JSON 皮肤列表带两个代表色：设置页概览
+               「当前皮肤」和皮肤列表缩略图共用同一套配色，避免两处图标不一样。 */
             let mut list: Vec<serde_json::Value> = host
-                .list_skins()
+                .list_skins_with_palette()
                 .into_iter()
-                .map(|(id, name)| {
-                    serde_json::json!({"id": id, "kind": "json", "name": name})
+                .map(|(id, name, swatch, accent)| {
+                    serde_json::json!({
+                        "id": id, "kind": "json", "name": name,
+                        "swatch": swatch, "accent": accent,
+                    })
                 })
                 .collect();
             for e in host.list_ssf_skins() {

@@ -7,23 +7,10 @@ import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import { useBodyLight } from '../hooks';
+import { skinSwatch } from '../skinSwatch';
 import { SEARCH_ITEMS } from './searchIndex';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
-
-/** 把颜色往浅纸上混：t=0 原色、t=1 纯浅色。浅色主题的皮肤缩略图用它提亮，
-    避免把深色皮肤原样画出来变成一块黑。 */
-function tintToLight(hex: string, t: number, light = '#f7f2e8'): string {
-  const parse = (h: string) => {
-    const v = h.replace('#', '');
-    if (v.length !== 6) return null;
-    return [parseInt(v.slice(0, 2), 16), parseInt(v.slice(2, 4), 16), parseInt(v.slice(4, 6), 16)];
-  };
-  const a = parse(hex) || [42, 46, 54];
-  const b = parse(light) || [247, 242, 232];
-  const m = (i: number) => Math.round(a[i] * (1 - t) + b[i] * t);
-  return `rgb(${m(0)}, ${m(1)}, ${m(2)})`;
-}
 
 /** 中文长词按“字符顺序子序列”兜底：候选字号可命中“候选窗…字号”。 */
 function isSubsequence(needle: string, hay: string): boolean {
@@ -34,9 +21,6 @@ function isSubsequence(needle: string, hay: string): boolean {
   }
   return needle.length === 0;
 }
-
-
-
 
 function formatTime(ts: number): string {
   if (!ts) return '尚未同步';
@@ -156,6 +140,9 @@ export function Overview({
   const colorCount = Object.keys(skin.colors || {}).length;
   const highlight = skin.colors?.hilited_candidate_back_color || '#E7B75C';
   const back = skin.colors?.back_color || '#2a2e36';
+  /* 【2026-11-03】与皮肤列表缩略图共用服务端给的代表色，保证两处图标一致。 */
+  const curMeta = data.skins.skins.find((m) => m.id === data.skins.current);
+  const pal = skinSwatch(curMeta?.swatch ?? back, curMeta?.accent ?? highlight, light);
 
   const syncLabel = !sync.configured
     ? '未配置'
@@ -256,11 +243,13 @@ export function Overview({
           <div className="sc-value">
             <span
               className="swatch-mini"
-              style={{
-                background: light
-                  ? `linear-gradient(135deg, ${tintToLight(back, 0.46)}, ${tintToLight(back, 0.76)} 58%, ${tintToLight(highlight, 0.3)})`
-                  : `linear-gradient(135deg, ${back}, #15171b 58%, ${highlight})`,
-              }}
+              style={
+                {
+                  background: pal.background,
+                  borderColor: pal.border,
+                  '--sw-bar': pal.bar,
+                } as React.CSSProperties
+              }
             />
             {skinName}
           </div>

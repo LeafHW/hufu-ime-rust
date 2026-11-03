@@ -1195,6 +1195,52 @@ impl Host {
         let _ = self.engine.config.save(&self.config_path);
     }
 
+    /// JSON 皮肤列表 + 两个代表色（列表缩略图/概览当前皮肤共用一套配色）：
+    /// (id, name, back_color, hilited_candidate_back_color)。只读文件、不写盘；
+    /// 解析失败回退默认色（与列表展示的「损坏皮肤」一致，不让图标消失）。
+    pub fn list_skins_with_palette(&self) -> Vec<(String, String, String, String)> {
+        fn hex(c: [u8; 4]) -> String {
+            format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+        }
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.skins_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "json").unwrap_or(false) {
+                    let id = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    match hufu_skin::Skin::load(&p) {
+                        Ok(s) => out.push((
+                            id,
+                            s.name.clone(),
+                            hex(s.colors.back_color.0),
+                            hex(s.colors.hilited_candidate_back_color.0),
+                        )),
+                        Err(_) => out.push((
+                            id.clone(),
+                            id,
+                            "#2E323A".into(),
+                            "#E7B75C".into(),
+                        )),
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push((
+                "hufu-default".into(),
+                "迷雾（内置）".into(),
+                "#202022".into(),
+                "#E7B75C".into(),
+            ));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn list_skins(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(self.skins_dir()) {

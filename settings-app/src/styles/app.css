@@ -200,7 +200,7 @@
   .status-card.skin .sc-value{font-size:18px}
   .swatch-mini{width:34px;height:24px;border-radius:6px;border:1px solid rgba(255,255,255,.12);
     background:linear-gradient(135deg,#2a2e36,#15171b 58%,#3a3021);position:relative;overflow:hidden;flex:none}
-  .swatch-mini:after{content:"";position:absolute;left:5px;right:5px;bottom:5px;height:4px;border-radius:2px;background:var(--gold)}
+  .swatch-mini:after{content:"";position:absolute;left:5px;right:5px;bottom:5px;height:4px;border-radius:2px;background:var(--sw-bar,var(--gold))}
   .overview-body{display:grid;grid-template-columns:1.62fr 1fr;gap:16px;height:470px;margin-top:16px}
   /* ── overview settings search ── */
   .overview-search{padding:20px 22px 13px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
@@ -327,7 +327,7 @@
   .skin-item.on{background:var(--gold-soft);border-color:rgba(231,183,92,.25)}
   .skin-thumb{width:34px;height:34px;border-radius:7px;flex:none;border:1px solid rgba(255,255,255,.12);
     background:linear-gradient(135deg,#2e323a,#15171b 62%,#3c3120);position:relative;overflow:hidden}
-  .skin-thumb:after{content:"";position:absolute;left:6px;right:6px;bottom:6px;height:3px;border-radius:2px;background:var(--gold)}
+  .skin-thumb:after{content:"";position:absolute;left:6px;right:6px;bottom:6px;height:3px;border-radius:2px;background:var(--sw-bar,var(--gold))}
   .skin-thumb.t2{background:linear-gradient(135deg,#243a37,#15201f 60%,#4f6b5f)}
   .skin-thumb.t2:after{background:#9fc7b4}
   .skin-thumb.t3{background:linear-gradient(135deg,#2b2f45,#161825 60%,#49406b)}
@@ -1046,7 +1046,7 @@ body.light .skin-thumb{
   border-color:rgba(120,90,40,.16);
   box-shadow:0 1px 2px rgba(90,70,30,.08) inset;
 }
-body.light .skin-thumb:after{background:#b8862f;box-shadow:0 0 0 1px rgba(184,134,47,.18)}
+body.light .skin-thumb:after{background:var(--sw-bar,#b8862f);box-shadow:0 0 0 1px rgba(184,134,47,.18)}
 body.light .skin-thumb.t2{background:linear-gradient(135deg,#eaf1ec,#dbe7df 60%,#c3d5c9)}
 body.light .skin-thumb.t2:after{background:#5f8b76}
 body.light .skin-thumb.t3{background:linear-gradient(135deg,#efeaf7,#e3dcf0 60%,#cdc3e4)}
@@ -1099,4 +1099,35 @@ body.light .sync-face.is-trouble .sync-tally{
 }
 body.light .sync-halo{
   background:radial-gradient(circle at 50% 45%,rgba(214,166,80,.28),rgba(231,183,92,.06) 44%,transparent 66%);
+}
+
+/* 概览「当前皮肤」缩略图：浅色下边框也别用白色透明 */
+body.light .swatch-mini{border-color:rgba(120,90,40,.18)}
+
+/* ── 【2026-11-03】主题切换：以侧栏 LOGO 为圆心圆形扩散 ─────────────────
+   View Transition root 层实现；切换期间先摘掉页面转场的命名元素，
+   让标题栏/侧栏/页面一起进 root 快照，否则它们会各自淡入淡出。 */
+html.theme-vt .main,
+html.theme-vt .titlebar,
+html.theme-vt .sidebar{view-transition-name:none}
+html.theme-vt::view-transition-old(root),
+html.theme-vt::view-transition-new(root){animation:none;mix-blend-mode:normal}
+html.theme-vt::view-transition-new(root){
+  z-index:2;
+  clip-path:circle(0px at var(--theme-x,68px) var(--theme-y,80px));
+  animation:themeReveal .56s cubic-bezier(.33,.68,.3,1) forwards;
+}
+@keyframes themeReveal{
+  to{clip-path:circle(var(--theme-r,1400px) at var(--theme-x,68px) var(--theme-y,80px))}
+}
+/* LOGO 同时亮一下，像光源 */
+html.theme-vt .brand img{animation:themeLogoPulse .56s cubic-bezier(.2,.8,.2,1)}
+@keyframes themeLogoPulse{
+  0%{transform:scale(1);box-shadow:0 0 0 0 rgba(231,183,92,0)}
+  35%{transform:scale(1.05);box-shadow:0 0 0 7px rgba(231,183,92,.22)}
+  100%{transform:scale(1);box-shadow:0 0 0 16px rgba(231,183,92,0)}
+}
+@media (prefers-reduced-motion: reduce){
+  html.theme-vt::view-transition-new(root){animation:none!important;clip-path:none!important}
+  html.theme-vt .brand img{animation:none!important}
 }
