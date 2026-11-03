@@ -367,6 +367,22 @@ export default function App() {
         theme === 'light' ||
         (theme === 'system' && window.matchMedia('(prefers-color-scheme: light)').matches);
       document.body.classList.toggle('light', light);
+      /* 【2026-11-03 浅色黑边】把解析后的主题色同步给窗壳：
+         窗口那圈 7px 非客户区边框由壳绘制，浅色主题必须跟着变浅，
+         否则圆角处会露出系统深色窗框（黑边）。 */
+      const webview = (
+        window as unknown as {
+          chrome?: { webview?: { postMessage?: (msg: string) => void } };
+        }
+      ).chrome?.webview;
+      if (document.body.classList.contains('webview') && webview?.postMessage) {
+        const cs = getComputedStyle(document.body);
+        const bg = cs.getPropertyValue('--bg').trim();
+        const side = cs.getPropertyValue('--bg2').trim();
+        if (bg && side) {
+          webview.postMessage(`win:theme:${bg}:${side}:${light ? 'light' : 'dark'}`);
+        }
+      }
     };
     apply();
     if (!skipPersist.current) localStorage.setItem('hufu.theme', theme);

@@ -46,6 +46,8 @@ extern "system" {
 #[link(name = "gdi32")]
 extern "system" {
     fn CreateSolidBrush(color: u32) -> isize;
+    fn FillRect(hdc: isize, rc: *const RECT, brush: isize) -> i32;
+    fn DeleteObject(obj: isize) -> i32;
 }
 #[link(name = "user32")]
 extern "system" {
@@ -332,6 +334,69 @@ unsafe fn snap_window(hwnd: HWND, zone: &str) {
     );
 }
 
+/// 【2026-11-03 浅色黑边】`#rrggbb` -> Win32 COLORREF（0x00BBGGRR）。
+fn parse_hex_color(text: &str) -> Option<u32> {
+    let t = text.trim().trim_start_matches('#');
+    if t.len() != 6 {
+        return None;
+    }
+    let r = u32::from_str_radix(&t[0..2], 16).ok()?;
+    let g = u32::from_str_radix(&t[2..4], 16).ok()?;
+    let b = u32::from_str_radix(&t[4..6], 16).ok()?;
+    Some((b << 16) | (g << 8) | r)
+}
+
+/// 【2026-11-03 浅色黑边】用页面同色重绘 7px 非客户区（拉伸）边框。
+///
+/// 窗口是 WS_POPUP|WS_THICKFRAME：客户区比窗口小 7px，这圈边框默认由系统
+/// 按窗口深色/浅色标志绘制。此前壳无条件 dark=1，浅色主题下就是一圈黑边，
+/// 圆角处也被黑边吃掉。这里直接接管 WM_NCPAINT：
+///   上 / 右 / 下 = 页面底色（--bg）
+///   左          = 侧栏底色（--bg2，标题栏以下）
+/// 于是边框与内容同色、视觉上等于内容铺满整窗，只剩 DWM 的圆角外轮廓。
+unsafe fn paint_window_frame(app: *mut App) {
+    let a = &*app;
+    let mut wr = RECT::default();
+    if GetWindowRect(a.hwnd, &mut wr) == 0 {
+        return;
+    }
+    let mut cr = RECT::default();
+    if GetClientRect(a.hwnd, &mut cr) == 0 {
+        return;
+    }
+    let mut org = POINT { x: 0, y: 0 };
+    if ClientToScreen(a.hwnd, &mut org) == 0 {
+        return;
+    }
+    let in_left = (org.x - wr.left).max(0);
+    let in_top = (org.y - wr.top).max(0);
+    let in_right = (wr.right - (org.x + cr.width())).max(0);
+    let in_bottom = (wr.bottom - (org.y + cr.height())).max(0);
+    if in_left == 0 && in_top == 0 && in_right == 0 && in_bottom == 0 {
+        return;
+    }
+    let hdc = GetWindowDC(a.hwnd);
+    if hdc == 0 {
+        return;
+    }
+    let bg = CreateSolidBrush(a.frame_bg);
+    let side = CreateSolidBrush(a.frame_side);
+    let w = wr.width();
+    let h = wr.height();
+    let top = RECT { left: 0, top: 0, right: w, bottom: in_top };
+    let _ = FillRect(hdc, &top, bg);
+    let right = RECT { left: w - in_right, top: 0, right: w, bottom: h };
+    let _ = FillRect(hdc, &right, bg);
+    let bottom = RECT { left: 0, top: h - in_bottom, right: w, bottom: h };
+    let _ = FillRect(hdc, &bottom, bg);
+    /* 左侧从标题栏下沿开始才是侧栏底色，顶部那条仍属标题栏 */
+    let left = RECT { left: 0, top: in_top, right: in_left, bottom: h };
+    let _ = FillRect(hdc, &left, side);
+    let _ = DeleteObject(bg);
+    let _ = DeleteObject(side);
+    let _ = ReleaseDC(a.hwnd, hdc);
+}
+
 unsafe fn handle_window_message(app: *mut App, msg: &str) {
     let hwnd = (*app).hwnd;
     (*app).log(&format!("web message: {msg}"));
@@ -368,6 +433,24 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
         }
         other if other.starts_with("win:snap-") => {
             snap_window(hwnd, &other["win:snap-".len()..]);
+        }
+        other if other.starts_with("win:theme:") => {
+            /* 形如 win:theme:#f5f2ea:#efe9dd:light —— 页面解析后的主题色。
+               壳据此：①按主题设置 DWM 深色标志（窗框/描边跟主题）；
+               ②用同色重绘 7px 非客户区边框；③重画边框。 */
+            let rest = &other["win:theme:".len()..];
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() >= 3 {
+                if let (Some(bg), Some(side)) =
+                    (parse_hex_color(parts[0]), parse_hex_color(parts[1]))
+                {
+                    (*app).frame_bg = bg;
+                    (*app).frame_side = side;
+                }
+                apply_window_theme(hwnd, parts[2] != "light");
+                RedrawWindow(hwnd, null(), 0, 0x0001 | 0x0020 | 0x0080);
+                (*app).log(&format!("frame theme: {rest}"));
+            }
         }
         _ => {}
     }
@@ -736,6 +819,10 @@ struct App {
     ///（约 600ms），否则窗口抢不到前台时会每 120ms 无限重试并反复
     /// 合成 Alt 按键，干扰用户其他窗口。
     focus_retry: u32,
+    /// 【2026-11-03 浅色黑边】7px 非客户区边框的填充色（COLORREF 0x00BBGGRR）：
+    /// 页面底色 / 侧栏底色，由页面 win:theme 消息同步；默认按深色主题。
+    frame_bg: u32,
+    frame_side: u32,
 }
 
 impl App {
@@ -977,6 +1064,17 @@ unsafe extern "system" fn wndproc(
                 }
             }
             0
+        }
+        WM_NCPAINT => {
+            /* 【2026-11-03 浅色黑边】接管非客户区绘制：默认由系统按「深色标题栏」
+               把 7px 拉伸边框画成深灰，浅色主题下就是一圈黑边。这里改用页面
+               同色填充（上/右/下=页面底色，左=侧栏底色），只剩 DWM 圆角外轮廓。 */
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                paint_window_frame(app);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SIZE => {
             let app = app_ptr(hwnd);
@@ -1713,13 +1811,15 @@ unsafe fn real_main() -> i32 {
         error_mode: false,
         error_nav_pending: false,
         focus_retry: 0,
+        frame_bg: 0x0017_1413,   // #131417 (dark --bg)
+        frame_side: 0x001c_1817, // #17181c (dark --bg2)
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 
     // Keep the window hidden until the React shell has navigated/rendered.
     // Showing it immediately is what produced the big blank block before the
     // UI appeared (white before, black after the dark-brush fix).
-    set_dark_titlebar(hwnd);
+    apply_window_theme(hwnd, true);
     (*app).log("window created (hidden until NavigationCompleted); title=\"虎符设置\"");
 
     if let Some(secs) = args.auto_close_secs {
