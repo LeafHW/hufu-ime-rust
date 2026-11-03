@@ -961,11 +961,58 @@ html.anim-paused .sync-halo,
 html.anim-paused .sync-ring,
 html.anim-paused .sync-face.is-joined:after{animation-play-state:paused!important}
 
-/* 【2026-11-03 第三批】页面切换 120ms 入场（只动合成属性；reduced 由下方全局兜底） */
-@keyframes screenIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-body[data-screen] :is(#s-overview,#s-skin,#s-sync,#s-schemes,#s-input,#s-keymap,#s-sentence,#s-buddy,#s-data,#s-other){
-  animation:screenIn var(--motion-base) cubic-bezier(.2,.8,.2,1) both;
+/* ── 2026-11-03 页间转场：侧栏点击后旧页淡出、新页淡入 ────────────────
+   2026-11-03 晚：撤掉滚动旅程（滚动 + snap + 嵌套滚动区不跟手），回到
+   「一次只显示一页」。页面全部常驻挂载，换页只切 display + 播转场。
+   主路径是 View Transitions（App.tsx）：只给内容区命名，侧栏/标题栏即时更新；
+   旧页快照留在屏上盖住新页布局，两者交叉淡化，没有空白帧。
+     退场 70ms → 停顿 70ms → 入场 180ms（缓出曲线）。
+   不支持 View Transitions 时退回 Web Animations「先退后进」，用下面
+   .nav-out / .nav-in 两个类做合成提示与防误触。
+   系统「减少动画」时 App 直接换页，不排队。 */
+.main{view-transition-name:hufu-page}
+/* 标题栏/侧栏单独命名 + 不做动画：切页时立即换到新状态，
+   否则它们会被根快照的默认 250ms 交叉淡化 → 标题出现「两行字叠在一起」的重影。 */
+.titlebar{view-transition-name:hufu-title}
+.sidebar{view-transition-name:hufu-sidebar}
+::view-transition-old(hufu-title),
+::view-transition-old(hufu-sidebar){animation:none!important;opacity:0!important}
+::view-transition-new(hufu-title),
+::view-transition-new(hufu-sidebar){animation:none!important;opacity:1!important}
+::view-transition-group(hufu-page){animation-duration:250ms;animation-timing-function:cubic-bezier(.2,.7,.2,1)}
+/* 先「淡出到背景」再「淡入」：两个快照的可见区间不重叠，避免两页文字叠出重影 */
+::view-transition-old(hufu-page){animation:vtPageOut 70ms cubic-bezier(.4,0,.95,.55) both}
+::view-transition-new(hufu-page){animation:vtPageIn 180ms cubic-bezier(.16,.84,.3,1) 70ms both}
+@keyframes vtPageOut{from{opacity:1;transform:none}to{opacity:0;transform:translateY(-4px) scale(.9995)}}
+@keyframes vtPageIn{from{opacity:0;transform:translateY(10px) scale(.999)}to{opacity:1;transform:none}}
+
+.main.nav-out > .screen,
+.main.nav-in > .screen{will-change:opacity,transform}
+.main.nav-out > .screen{pointer-events:none}
+
+@media (prefers-reduced-motion: reduce){
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*){animation:none!important}
 }
+
+/* 标题栏页名跟随转场轻微淡入（key 变更才重播，见 Shell.tsx） */
+@keyframes pageTitleIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.tb-page{animation:pageTitleIn .22s cubic-bezier(.2,.7,.2,1)}
+
+/* 侧栏选中态：金条从中间展开、文字色渐变，切页不再硬跳 */
+.nav-item{transition:color var(--motion-base) ease,background var(--motion-base) ease}
+.nav-item:before{
+  content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;
+  background:var(--gold);opacity:0;transform:scaleY(.3);transform-origin:50% 50%;
+  transition:opacity var(--motion-base) ease,transform var(--motion-slow) cubic-bezier(.2,.8,.2,1);
+}
+.nav-item.on:before{opacity:1;transform:none}
+.nav-item .icon{transition:color var(--motion-base) ease,opacity var(--motion-base) ease}
+
+/* 概览/关于/打赏等页面按路由各自成节（滚动旅程撤掉后 about/donate 不再共用 #s-other） */
+body[data-screen="about"] #s-about{display:block}
+body[data-screen="donate"] #s-donate{display:block}
 
 /* 【2026-11-03 可访问性】全局尊重系统“减少动画”（此前只覆盖同步页） */
 @media (prefers-reduced-motion: reduce){
@@ -977,149 +1024,11 @@ body[data-screen] :is(#s-overview,#s-skin,#s-sync,#s-schemes,#s-input,#s-keymap,
   }
 }
 
-/* ── 2026-11-03 滚动旅程：所有页面纵向串联，滚动进入下一站 ───────────── */
-.main.journey{
-  scroll-snap-type:y proximity;
-  scroll-behavior:smooth;
-  scroll-padding-top:8px;
-  padding-bottom:72px;
-  overscroll-behavior:contain;
+/* 内部滚轮区到边界后不再把主页面卷走（2026-11-03 滚动审计：
+   inspector 到底后 main 一次 +3000px）。 */
+.skin-list,
+.insp-body,
+.buddy-insp-body,
+.os-list {
+  overscroll-behavior: contain;
 }
-.main.journey .screen{
-  display:block!important;
-  height:auto;
-  min-height:calc(100vh - 128px);
-  padding:10px 0 64px;
-  scroll-snap-align:start;
-  scroll-margin-top:0;
-}
-.main.journey .screen + .screen{
-  margin-top:6px;
-  border-top:1px solid var(--line);
-  padding-top:34px;
-}
-.main.journey .screen:last-child{padding-bottom:96px}
-.screen-inner{position:relative;z-index:1;min-width:0}
-
-/* 顶部金色进度条 */
-.journey-progress{
-  position:sticky;top:-26px;z-index:26;height:2px;margin:-26px -32px 20px;
-  background:transparent;pointer-events:none;
-}
-.journey-progress i{
-  display:block;height:100%;transform-origin:0 50%;
-  background:linear-gradient(90deg,var(--gold3),var(--gold2));
-  box-shadow:0 0 12px rgba(231,183,92,.45);
-}
-
-/* 右侧旅程轨 */
-.journey-rail{
-  position:fixed;right:14px;top:50%;transform:translateY(-50%);z-index:35;
-  display:flex;flex-direction:column;align-items:flex-end;gap:5px;
-}
-.jr-dot{
-  height:16px;min-width:26px;padding:0 3px;border:0;background:transparent;
-  display:flex;align-items:center;justify-content:flex-end;position:relative;
-  color:transparent;cursor:pointer;
-}
-.jr-dot:before{
-  content:"";width:5px;height:5px;border-radius:50%;background:var(--line2);
-  transition:width .3s cubic-bezier(.2,.8,.2,1),height .3s,background .3s,border-radius .3s;
-}
-.jr-dot.on:before{width:18px;border-radius:3px;background:var(--gold);box-shadow:0 0 10px rgba(231,183,92,.45)}
-.jr-dot:hover:before{background:var(--gold2)}
-.jr-dot span{
-  position:absolute;right:24px;font:600 10px/1 var(--mono,ui-monospace,Consolas,monospace);
-  letter-spacing:.08em;color:var(--text3);opacity:0;transform:translateX(5px);
-  transition:opacity .18s ease,transform .18s ease;white-space:nowrap;
-}
-.jr-dot:hover span,.jr-dot.on span{opacity:1;transform:none}
-.jr-dot.on span{color:var(--gold2)}
-
-/* 元素入场：页面进入视口时直属内容快速错峰上浮 */
-.main.journey .screen .screen-inner > *{
-  opacity:0;transform:translateY(18px);
-  transition:opacity .4s ease,transform .44s cubic-bezier(.2,.8,.2,1);
-}
-.main.journey .screen.in .screen-inner > *{opacity:1;transform:none}
-.main.journey .screen.in .screen-inner > *:nth-child(1){transition-delay:0ms}
-.main.journey .screen.in .screen-inner > *:nth-child(2){transition-delay:40ms}
-.main.journey .screen.in .screen-inner > *:nth-child(3){transition-delay:80ms}
-.main.journey .screen.in .screen-inner > *:nth-child(4){transition-delay:120ms}
-.main.journey .screen.in .screen-inner > *:nth-child(5){transition-delay:160ms}
-.main.journey .screen.in .screen-inner > *:nth-child(6){transition-delay:200ms}
-.main.journey .screen.in .screen-inner > *:nth-child(7){transition-delay:240ms}
-.main.journey .screen.in .screen-inner > *:nth-child(n+8){transition-delay:280ms}
-
-@media (max-width:900px){
-  .journey-rail{right:5px}
-  .jr-dot span{display:none}
-  .journey-hint{left:50%}
-  .main.journey .screen{min-height:calc(100vh - 110px)}
-}
-
-@media (prefers-reduced-motion: reduce){
-  .main.journey{scroll-behavior:auto;scroll-snap-type:none}
-  .main.journey .screen .screen-inner > *{opacity:1!important;transform:none!important;transition:none!important}
-  .journey-hint i{animation:none}
-}
-
-/* 旅程细节：底部“下一站”提示 + 侧轨收进窗口内 */
-.shell{position:relative}
-.journey-rail{position:absolute;right:12px;top:50%;transform:translateY(-50%)}
-.main.journey .screen{position:relative}
-.main.journey .screen:not(:last-child):after{
-  content:"下一站 · " attr(data-next) "  ↓";
-  position:absolute;left:50%;bottom:18px;transform:translateX(-50%);
-  font-size:11.5px;letter-spacing:.12em;color:var(--text3);
-  opacity:.62;pointer-events:none;white-space:nowrap;
-}
-.main.journey .screen.in:not(:last-child):after{animation:nextNudge 2.4s ease-in-out infinite}
-@keyframes nextNudge{0%,100%{transform:translateX(-50%) translateY(0);opacity:.5}50%{transform:translateX(-50%) translateY(3px);opacity:.85}}
-@media (prefers-reduced-motion: reduce){.main.journey .screen.in:not(:last-child):after{animation:none}}
-
-/* 右侧让出旅程轨，避免轨点压住卡片/开关 */
-.main.journey{padding-right:54px}
-@media (max-width:1180px){.main.journey{padding-right:34px}}
-
-/* 卡片级入场：页面进入视口时卡片再错峰一次，形成“快速挨个上来”的层次 */
-.main.journey .screen.in .card,
-.main.journey .screen.in .ip-card{
-  animation:cardRise .42s cubic-bezier(.2,.8,.2,1) both;
-}
-.main.journey .screen.in .card:nth-child(2),
-.main.journey .screen.in .ip-card:nth-child(2){animation-delay:45ms}
-.main.journey .screen.in .card:nth-child(3),
-.main.journey .screen.in .ip-card:nth-child(3){animation-delay:90ms}
-.main.journey .screen.in .card:nth-child(4),
-.main.journey .screen.in .ip-card:nth-child(4){animation-delay:135ms}
-.main.journey .screen.in .card:nth-child(5),
-.main.journey .screen.in .ip-card:nth-child(5){animation-delay:180ms}
-.main.journey .screen.in .card:nth-child(n+6),
-.main.journey .screen.in .ip-card:nth-child(n+6){animation-delay:220ms}
-@keyframes cardRise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion: reduce){
-  .main.journey .screen.in .card,.main.journey .screen.in .ip-card{animation:none!important}
-}
-
-/* 皮肤页是工作台而不是长表单：固定一屏高度，列表/预览/检查器各自内部滚动，
-   避免把整页拉伸成几千像素、把后面几站推得很远。 */
-.main.journey #s-skin{
-  display:flex!important;
-  flex-direction:column;
-  height:calc(100vh - 110px);
-  min-height:540px;
-  padding-bottom:52px;
-}
-.main.journey #s-skin .screen-inner{
-  display:flex;
-  flex-direction:column;
-  flex:1;
-  min-height:0;
-}
-.main.journey #s-skin .studio{
-  flex:1;
-  height:auto;
-  min-height:0;
-}
-.main.journey #s-skin .skin-head{flex:none}

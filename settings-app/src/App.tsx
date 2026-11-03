@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { loadBootstrap } from './api';
 import { PAGE_TITLE, requestWindowClose, Sidebar, TitleBar } from './components/Shell';
 import { Toast } from './components/ui';
@@ -14,17 +14,51 @@ import { KeymapPage } from './pages/Keymap';
 import { SentencePage } from './pages/Sentence';
 import { BuddyPage } from './pages/Buddy';
 import { fallbackBootstrap, type Bootstrap, type Route, type ThemeMode } from './types';
-import { getDirtyPages, resetDirty, subscribeDirty } from './dirtyGuard';
+import { getDirtyPages, subscribeDirty } from './dirtyGuard';
 import './styles/app.css';
 
 const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
-/** 页面向下滚动的完整旅程顺序（与侧栏一致，最后到打赏）。 */
-const JOURNEY: Route[] = ['overview', 'schemes', 'input', 'skin', 'buddy', 'sentence', 'keymap', 'data', 'sync', 'about', 'donate'];
+
+/* 【2026-11-03】页面全部常驻挂载，切页只改 body[data-screen]。
+   用 memo 包一层：切页/轮询引起的 App state 变化不再把 11 个页面整树重渲染，
+   切页时主线程只剩「新页首次布局」，转场起点更快（memo 依赖 props 引用稳定：
+   notify / navigate / refresh 已 useCallback，data 只在轮询返回时换新对象）。 */
+const OverviewView = memo(Overview);
+const SchemesView = memo(SchemesPage);
+const InputView = memo(InputPage);
+const KeymapView = memo(KeymapPage);
+const SkinView = memo(SkinStudio);
+const BuddyView = memo(BuddyPage);
+const SentenceView = memo(SentencePage);
+const DataView = memo(DataPage);
+const SyncView = memo(Sync);
+const AboutView = memo(AboutPage);
+const DonateView = memo(DonatePage);
+
+/* 【2026-11-03】页间转场时序：
+   主路径 = View Transitions（::view-transition-old/new(hufu-page) 的 CSS 动画，
+   时长写在 styles/app.css，和这里只是注释级对应）；退回路径 = Web Animations
+   的「先退后进」。只动 opacity/transform，全程走合成器；
+   系统「减少动画」时直接换页、不排队。 */
+const PAGE_OUT_MS = 90;
+const PAGE_IN_MS = 220;
+const PAGE_EASE = 'cubic-bezier(.2,.7,.2,1)';
+const PAGE_OUT_EASE = 'cubic-bezier(.4,0,.9,.4)';
+
+type VtDoc = Document & {
+  startViewTransition?: (cb: () => void) => { ready?: Promise<unknown>; finished?: Promise<unknown> };
+};
+const supportsViewTransition = () =>
+  typeof (document as VtDoc).startViewTransition === 'function';
 
 function readRoute(): Route {
-  const h = (location.hash || '').replace('#', '').replace(/^\//, '').split('/')[0];
+  const h = (location.hash || '').replace('#', '').replace(/^\/?/, '').split('/')[0];
   return (ROUTES as string[]).includes(h) ? (h as Route) : 'overview';
 }
+
+const reducedMotion = () =>
+  typeof window !== 'undefined' &&
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
 
 declare global {
   interface Window {
@@ -44,7 +78,8 @@ function normalizeBootstrap(b: Bootstrap): Bootstrap {
 }
 
 export default function App() {
-  /** 侧栏/标题跟随滚动位置；页面常驻挂载，不再区分「当前路由」与「当前站点」。 */
+  /** 当前页（侧栏高亮/标题跟随它）。页面全部常驻挂载，换页只切 display：
+      不卸载 = 各页未保存的草稿不会丢，切换也没有重建成本。 */
   const [view, setView] = useState<Route>(readRoute);
   const [data, setData] = useState<Bootstrap>(fallbackBootstrap);
   /* RT-13：?theme= 参数只一次性生效，不写回 localStorage；
@@ -60,17 +95,34 @@ export default function App() {
   const skipPersist = useRef<boolean>(themeParam !== null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
-  const [navConfirm, setNavConfirm] = useState<{ to: Route; sub?: string } | null>(null);
   const [dirtyPages, setDirtyPages] = useState(() => getDirtyPages());
   /* 关窗确认弹层（P0）：脏数据存在时不直接发 win:close。 */
   const [closeConfirm, setCloseConfirm] = useState(false);
-  /* 【2026-11-02】放弃修改后常驻挂载的页面不会卸载，dirty 与本地编辑会赖着；
-     用 epoch 变更 <main> 的 key 让全部页面重挂载（等于回到服务端快照）。 */
-  const [epoch, setEpoch] = useState(0);
+
   const mainRef = useRef<HTMLElement | null>(null);
-  /** 主动导航/深链期间锁住滚动高亮，避免长距离平滑滚动时标题在中间页闪烁。 */
-  const navLockUntil = useRef(0);
-  const [scrollProgress, setScrollProgress] = useState(0);
+  /** 真正显示的页（DOM 的 body[data-screen] 跟随它），与 view 解耦是为了先退场再换页。 */
+  const shownRef = useRef<Route>(readRoute());
+  /** 连点导航时以最后一次点击为目标。 */
+  const targetRef = useRef<Route>(readRoute());
+  const outGuard = useRef(0);
+  /** 当前在跑的那条转场动画（退场/入场共用一条，切页时先取消再接力）。 */
+  const animRef = useRef<Animation | null>(null);
+  /** idle=静止，out=旧页正在退场，in=新页正在入场。 */
+  const phaseRef = useRef<'idle' | 'out' | 'in'>('idle');
+  /** View Transition 进行中：此时再点导航只记目标，等这一轮结束接力。 */
+  const vtBusy = useRef(false);
+  /** Ctrl+K 从别的页回概览：等新页真正显示出来再聚焦搜索框（隐藏时 focus 无效）。 */
+  const focusSearchPending = useRef(false);
+
+  /* 卸载时掐掉可能在跑的转场动画（StrictMode 开发期会双挂载）。 */
+  useEffect(
+    () => () => {
+      animRef.current?.cancel();
+      animRef.current = null;
+      window.clearTimeout(outGuard.current);
+    },
+    [],
+  );
 
   /* 全局轮询（P1）：
      - loadSeq 单调递增，只让「最新一轮」的响应落库，慢响应不会覆盖新数据；
@@ -123,18 +175,189 @@ export default function App() {
     };
   }, [refresh]);
 
-  useEffect(() => {
-    const onHash = () => {
-      const r = readRoute();
-      setView(r);
-      requestAnimationFrame(() => scrollToRoute(r));
-    };
-    window.addEventListener('hashchange', onHash);
-    return () => window.removeEventListener('hashchange', onHash);
+  /* 首帧直接把当前页显示出来（CSS 靠 body[data-screen] 决定哪一节 display:block）；
+     全部页面常驻挂载，深链 #skin 不需要再滚动定位。 */
+  useLayoutEffect(() => {
+    const r = shownRef.current;
+    document.body.dataset.screen = r;
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** 换页的 DOM 落点：切显示哪一节 + 回到页顶（切换后从页头开始，和侧栏选中一致）。 */
+  const swapTo = useCallback((r: Route) => {
+    shownRef.current = r;
+    document.body.dataset.screen = r;
+    const m = mainRef.current;
+    if (m) m.scrollTop = 0;
+    /* 新页这时才 display:block，聚焦/滚动到搜索框才有意义。 */
+    if (focusSearchPending.current) {
+      focusSearchPending.current = false;
+      requestAnimationFrame(() =>
+        window.dispatchEvent(new CustomEvent('hufu:focus-search')),
+      );
+    }
+  }, []);
+
+  /** 退回方案（内核不支持 View Transitions）：旧页先退场，换页后再入场。 */
+  const commitRoute = useCallback((r: Route, animate = true) => {
+    const m = mainRef.current;
+    swapTo(r);
+    /* 旧页马上 display:none：同一任务内取消退场动画，不会闪回 */
+    animRef.current?.cancel();
+    animRef.current = null;
+    phaseRef.current = 'idle';
+    window.clearTimeout(outGuard.current);
+    m?.classList.remove('nav-out');
+    if (!m) return;
+    const el = document.getElementById(`s-${r}`);
+    if (!animate || reducedMotion() || !el || typeof el.animate !== 'function') {
+      m.classList.remove('nav-in');
+      return;
+    }
+    const a = el.animate(
+      [
+        { opacity: 0, transform: 'translate3d(0,12px,0) scale(.998)' },
+        { opacity: 1, transform: 'none' },
+      ],
+      { duration: PAGE_IN_MS, easing: PAGE_EASE },
+    );
+    animRef.current = a;
+    phaseRef.current = 'in';
+    m.classList.add('nav-in');
+    a.onfinish = () => {
+      if (animRef.current === a) {
+        animRef.current = null;
+        phaseRef.current = 'idle';
+        m.classList.remove('nav-in');
+      }
+    };
+  }, [swapTo]);
+
+  /** View Transitions 主路径：旧页快照继续留在屏上，新页在快照后面完成布局与绘制，
+      然后「快退快进」地淡出淡入（伪元素动画写在 styles/app.css）。
+      转场期间来的点击只记目标，当前转场结束后接力，避免半路截断闪跳。 */
+  const runVt = useCallback(
+    (r: Route) => {
+      const doc = document as VtDoc;
+      const start = doc.startViewTransition;
+      if (typeof start !== 'function') {
+        commitRoute(r, true);
+        return;
+      }
+      let vt: { ready?: Promise<unknown>; finished?: Promise<unknown> };
+      try {
+        vtBusy.current = true;
+        vt = start.call(doc, () => swapTo(r));
+      } catch {
+        vtBusy.current = false;
+        commitRoute(r, true);
+        return;
+      }
+      vt.ready?.catch(() => {});
+      Promise.resolve(vt.finished)
+        .catch(() => {})
+        .then(() => {
+          vtBusy.current = false;
+          if (focusSearchPending.current) {
+            focusSearchPending.current = false;
+            window.dispatchEvent(new CustomEvent('hufu:focus-search'));
+          }
+          const next = targetRef.current;
+          if (next === shownRef.current) return;
+          runVt(next);
+        });
+    },
+    [commitRoute, swapTo],
+  );
+
+  /** 换页主入口：优先 View Transitions，不支持时退回 Web Animations「先退后进」。 */
+  const go = useCallback(
+    (r: Route) => {
+      const m = mainRef.current;
+      const prev = shownRef.current;
+      if (r === targetRef.current) return;
+      targetRef.current = r;
+      setView(r); // 侧栏高亮 / 标题栏立刻响应点击
+      if (!m || reducedMotion()) {
+        commitRoute(r, false);
+        return;
+      }
+      if (supportsViewTransition()) {
+        if (vtBusy.current) return; // 这一轮结束后由 runVt 接力
+        /* 掐掉退回路径可能还在跑的动画，避免两套转场叠加 */
+        animRef.current?.cancel();
+        animRef.current = null;
+        window.clearTimeout(outGuard.current);
+        m.classList.remove('nav-in', 'nav-out');
+        phaseRef.current = 'idle';
+        runVt(r);
+        return;
+      }
+
+      const cur = document.getElementById(`s-${prev}`);
+      if (!cur || typeof cur.animate !== 'function') {
+        commitRoute(r, false);
+        return;
+      }
+      /* 退场途中又点回当前页：撤掉退场，从当前透明度淡回。 */
+      if (r === prev) {
+        const cs = getComputedStyle(cur);
+        animRef.current?.cancel();
+        animRef.current = null;
+        window.clearTimeout(outGuard.current);
+        phaseRef.current = 'in';
+        m.classList.remove('nav-out');
+        m.classList.add('nav-in');
+        const back = cur.animate(
+          [{ opacity: cs.opacity, transform: cs.transform }, { opacity: 1, transform: 'none' }],
+          { duration: 160, easing: PAGE_EASE },
+        );
+        animRef.current = back;
+        back.onfinish = () => {
+          if (animRef.current === back) {
+            animRef.current = null;
+            phaseRef.current = 'idle';
+            m.classList.remove('nav-in');
+          }
+        };
+        return;
+      }
+      if (phaseRef.current === 'out') return;
+      /* 正常换页：先取当前透明度/变换再取消可能在跑的入场，保证从眼前这一刻接上。 */
+      const cs = getComputedStyle(cur);
+      animRef.current?.cancel();
+      animRef.current = null;
+      phaseRef.current = 'out';
+      m.classList.remove('nav-in');
+      m.classList.add('nav-out');
+      const a = cur.animate(
+        [
+          { opacity: cs.opacity, transform: cs.transform },
+          { opacity: 0, transform: 'translate3d(0,-6px,0) scale(.998)' },
+        ],
+        { duration: PAGE_OUT_MS, easing: PAGE_OUT_EASE, fill: 'forwards' },
+      );
+      animRef.current = a;
+      const commit = () => {
+        window.clearTimeout(outGuard.current);
+        if (phaseRef.current !== 'out') return;
+        commitRoute(targetRef.current, true);
+      };
+      a.onfinish = commit;
+      /* 兜底：窗口隐藏时帧可能不推进，onfinish 不保证按时到。 */
+      outGuard.current = window.setTimeout(commit, PAGE_OUT_MS + 200);
+    },
+    [commitRoute, runVt],
+  );
+
   useEffect(() => {
-    document.body.dataset.screen = view === 'about' || view === 'donate' ? 'other' : view;
+    const onHash = () => go(readRoute());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, [go]);
+
+  useEffect(() => {
     document.title = `${PAGE_TITLE[view]} · 虎符设置`;
   }, [view]);
 
@@ -160,7 +383,7 @@ export default function App() {
     setTheme(m);
   };
 
-  /* OV-B1：订阅全局脏状态 —— 关窗（beforeunload）与切路由统一拦截。 */
+  /* OV-B1：订阅全局脏状态 —— 关窗（beforeunload）统一拦截。 */
   useEffect(() => subscribeDirty(() => setDirtyPages(getDirtyPages())), []);
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -196,145 +419,64 @@ export default function App() {
      有脏数据 → 弹确认（复用导航确认弹层样式）；无脏数据 / 已确认 → 交给壳关窗。 */
   const onRequestClose = () => {
     if (getDirtyPages().length) {
-      setNavConfirm(null);
       setCloseConfirm(true);
       return;
     }
     requestWindowClose();
   };
 
-  const scrollToRoute = (r: Route, smooth = true) => {
-    const m = mainRef.current;
-    const el = document.getElementById(`s-${r}`);
-    if (!m || !el) return;
-    const top = el.getBoundingClientRect().top - m.getBoundingClientRect().top + m.scrollTop;
-    m.scrollTo({ top: Math.max(0, top - 8), behavior: smooth ? 'smooth' : 'auto' });
-  };
-
-  /* 滚动旅程：滚动位置决定侧栏/标题高亮（页面常驻，不写路由状态）。 */
-  useEffect(() => {
-    const m = mainRef.current;
-    if (!m) return;
-    let raf = 0;
-    const onScroll = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        const probe = m.scrollTop + Math.min(180, m.clientHeight * 0.24);
-        let cur: Route = JOURNEY[0];
-        for (const r of JOURNEY) {
-          const el = document.getElementById(`s-${r}`);
-          if (!el) continue;
-          const top = el.getBoundingClientRect().top - m.getBoundingClientRect().top + m.scrollTop;
-          if (top <= probe) cur = r;
-        }
-        if (Date.now() >= navLockUntil.current) setView(cur);
-        const max = Math.max(1, m.scrollHeight - m.clientHeight);
-        setScrollProgress(Math.min(1, Math.max(0, m.scrollTop / max)));
-      });
-    };
-    m.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
-
-    /* 元素入场：页面进入视口时给直属内容加 .in（CSS 统一做 stagger）。 */
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) e.target.classList.add('in');
-        }
-      },
-      { root: m, threshold: 0.06, rootMargin: '0px 0px -6% 0px' },
-    );
-    m.querySelectorAll('.screen').forEach((el) => io.observe(el));
-    return () => {
-      m.removeEventListener('scroll', onScroll);
-      if (raf) cancelAnimationFrame(raf);
-      io.disconnect();
-    };
-  }, [epoch]);
-
-  const doNavigate = (r: Route, sub?: string) => {
-    const target = sub ? `${r}/${sub}` : r;
-    try {
-      history.replaceState(null, '', `#${target}`);
-    } catch {
-      /* file:// */
-    }
-    navLockUntil.current = Date.now() + 1100;
-    setView(r);
-    requestAnimationFrame(() => scrollToRoute(r));
-    window.dispatchEvent(new Event('hashchange'));
-  };
-
-  const navigate = (r: Route, sub?: string): boolean => {
-    if (navConfirm) return false;
-    // 【2026-11-03】旅程模式所有页面常驻挂载：站间导航只是滚动，不卸载
-    // 页面、不丢任何未保存内容，因此不再弹「放弃修改并离开」。
-    // 旧逻辑会让 Ctrl+K（内部 navigate('overview')）在任意脏页时直接弹
-    // 丢弃确认，搜索完全不可用；脏数据守卫只保留在关窗路径。
-    doNavigate(r, sub);
-    return true;
-  };
-
-  /* 深链 #skin/#donate 首屏落到对应站点。页面全部挂载后图片/字体/折叠区
-     会继续改变高度，单次 rAF 可能被后续布局挤回上一页，这里做几次短重试。 */
-  useEffect(() => {
-    const r = readRoute();
-    if (r === 'overview') return;
-    navLockUntil.current = Date.now() + 1700;
-    let tries = 0;
-    let cancelled = false;
-    let timer = 0;
-    const tick = () => {
-      if (cancelled) return;
-      scrollToRoute(r, false);
-      tries += 1;
-      if (tries < 4) timer = window.setTimeout(tick, 260);
-    };
-    timer = window.setTimeout(tick, 120);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const navigate = useCallback(
+    (r: Route, sub?: string): boolean => {
+      const target = sub ? `${r}/${sub}` : r;
+      try {
+        history.replaceState(null, '', `#${target}`);
+      } catch {
+        /* file:// */
+      }
+      go(r);
+      /* replaceState 不触发 hashchange：输入页/同步页靠它同步页签与引导层。 */
+      window.dispatchEvent(new Event('hashchange'));
+      return true;
+    },
+    [go],
+  );
 
   /* Ctrl+K 全局聚焦搜索（原先只挂在概览页，其余页面无反应）。 */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
-        // 无论当前滚到哪一站，Ctrl+K 都回到概览并聚焦搜索框；页面常驻
-        // 挂载，聚焦事件不需要等滚动动画完成。
+        if (shownRef.current === 'overview') {
+          window.dispatchEvent(new CustomEvent('hufu:focus-search'));
+          return;
+        }
+        focusSearchPending.current = true;
         navigate('overview');
-        window.dispatchEvent(new CustomEvent('hufu:focus-search'));
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navConfirm]);
+  }, [navigate]);
 
-  /* 导航 / 关窗确认弹层：Esc 取消。 */
+  /* 关窗确认弹层：Esc 取消。 */
   useEffect(() => {
-    if (!navConfirm && !closeConfirm) return;
+    if (!closeConfirm) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        /* 只关最上层：关窗确认优先，其次导航确认。 */
-        if (closeConfirm) setCloseConfirm(false);
-        else setNavConfirm(null);
+        setCloseConfirm(false);
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [navConfirm, closeConfirm]);
+  }, [closeConfirm]);
 
-  const notify = (msg: string) => {
+  /* 引用稳定：下面 11 个 memo 页面组件靠它跳过无关重渲染。 */
+  const notify = useCallback((msg: string) => {
     setToast(msg);
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 2600);
-  };
+  }, []);
 
   return (
     <div className="window">
@@ -349,112 +491,45 @@ export default function App() {
           onTheme={onTheme}
           online={data.online}
         />
-        <main className="main journey" key={epoch} ref={mainRef}>
-          <div className="journey-progress" aria-hidden="true">
-            <i style={{ transform: `scaleX(${scrollProgress})` }} />
-          </div>
-          <section className="screen" id="s-overview" data-next="方案">
-            <div className="screen-inner"><Overview data={data} notify={notify} navigate={navigate} /></div>
+        <main className="main" ref={mainRef}>
+          <section className="screen" id="s-overview">
+            <OverviewView data={data} notify={notify} navigate={navigate} />
           </section>
-          <section className="screen" id="s-schemes" data-next="输入">
-            <div className="screen-inner"><SchemesPage data={data} notify={notify} /></div>
+          <section className="screen" id="s-schemes">
+            <SchemesView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-input" data-next="皮肤工作室">
-            <div className="screen-inner"><InputPage data={data} notify={notify} /></div>
+          <section className="screen" id="s-input">
+            <InputView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-skin" data-next="候选挂件">
-            <div className="screen-inner"><SkinStudio data={data} notify={notify} refresh={refresh} /></div>
+          <section className="screen" id="s-keymap">
+            <KeymapView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-buddy" data-next="整句模型">
-            <div className="screen-inner"><BuddyPage data={data} notify={notify} /></div>
+          <section className="screen" id="s-skin">
+            <SkinView data={data} notify={notify} refresh={refresh} />
           </section>
-          <section className="screen" id="s-sentence" data-next="键位编辑">
-            <div className="screen-inner"><SentencePage data={data} notify={notify} /></div>
+          <section className="screen" id="s-buddy">
+            <BuddyView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-keymap" data-next="数据与备份">
-            <div className="screen-inner"><KeymapPage data={data} notify={notify} /></div>
+          <section className="screen" id="s-sentence">
+            <SentenceView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-data" data-next="云同步">
-            <div className="screen-inner"><DataPage data={data} notify={notify} /></div>
+          <section className="screen" id="s-data">
+            <DataView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-sync" data-next="关于">
-            <div className="screen-inner"><Sync data={data} notify={notify} /></div>
+          <section className="screen" id="s-sync">
+            <SyncView data={data} notify={notify} />
           </section>
-          <section className="screen" id="s-about" data-next="打赏支持">
-            <div className="screen-inner"><AboutPage about={data.about} /></div>
+          <section className="screen" id="s-about">
+            <AboutView about={data.about} />
           </section>
           <section className="screen" id="s-donate">
-            <div className="screen-inner"><DonatePage /></div>
+            <DonateView />
           </section>
         </main>
-        <nav className="journey-rail" aria-label="页面旅程">
-          {JOURNEY.map((r, i) => (
-            <button
-              key={r}
-              type="button"
-              className={`jr-dot${view === r ? ' on' : ''}`}
-              title={PAGE_TITLE[r]}
-              aria-label={`${String(i + 1).padStart(2, '0')} ${PAGE_TITLE[r]}`}
-              aria-current={view === r ? 'true' : undefined}
-              onClick={() => navigate(r)}
-            >
-              <span>{String(i + 1).padStart(2, '0')}</span>
-            </button>
-          ))}
-        </nav>
-
       </div>
       <Toast message={toast} />
 
-      {navConfirm ? (
-        <div
-          className="help-sheet"
-          role="dialog"
-          aria-modal="true"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) setNavConfirm(null);
-          }}
-        >
-          <div className="card help-card" style={{ maxWidth: 460 }}>
-            <div className="help-head">
-              <div>
-                <h3>有未保存的修改</h3>
-                <div className="sub">离开后这些改动会被丢弃（各页保存前只存在本页内存里）</div>
-              </div>
-            </div>
-            <div className="help-body">
-              <p style={{ margin: 0 }}>
-                {dirtyPages.map((d) => d.label).join('、')} 有未保存的修改。
-                要放弃修改并离开吗？
-              </p>
-            </div>
-            <div className="help-foot">
-              <span />
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button type="button" className="btn ghost" onClick={() => setNavConfirm(null)}>
-                  留在本页
-                </button>
-                <button
-                  type="button"
-                  className="btn primary"
-                  onClick={() => {
-                    const target = navConfirm;
-                    setNavConfirm(null);
-                    /* 真正丢弃：清脏表并重挂载页面（常驻挂载的 Overview/Skin/Sync 不会自动卸载）。 */
-                    resetDirty();
-                    setEpoch((v) => v + 1);
-                    if (target) doNavigate(target.to, target.sub);
-                  }}
-                >
-                  放弃修改并离开
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {/* 关窗确认（P0）：样式/文案沿用上面的导航确认弹层，避免壳内关窗丢改动。 */}
+      {/* 关窗确认（P0）：样式/文案沿用导航确认弹层，避免壳内关窗丢改动。 */}
       {closeConfirm ? (
         <div
           className="help-sheet"

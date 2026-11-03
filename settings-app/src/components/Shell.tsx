@@ -181,7 +181,8 @@ export function TitleBar({
     <div className="titlebar" onMouseDown={onBarMouseDown} onDoubleClick={onDoubleClick}>
       <div className="tb-title">虎符设置</div>
       <div className="tb-sep" />
-      <div className="tb-page" style={{ display: 'inline' }}>{title}</div>
+      {/* key 跟着页名变：切页时重播淡入（styles/app.css 的 pageTitleIn） */}
+      <div className="tb-page" key={title} style={{ display: 'inline' }}>{title}</div>
       <div className="tb-spacer" />
       <div className="win-btns no-drag">
         <button type="button" className="win-btn" aria-label="最小化" title="最小化" onClick={() => postWindow('minimize')}>
