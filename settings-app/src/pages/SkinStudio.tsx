@@ -509,6 +509,8 @@ export function SkinStudio({
              保存被丢弃」的假设置：候选窗总宽（0=自适应）与序号显示种类。 */
           width: skin.layout.width ?? fresh.layout.width,
           label_style: skin.layout.label_style ?? fresh.layout.label_style,
+          /* 【2026-11-04】边框厚度必须有 UI+白名单成对，否则又是「能拖不落盘」的假设置。 */
+          border_width: skin.layout.border_width ?? fresh.layout.border_width,
         },
       };
       await saveSkin(merged, { select: false });
@@ -1170,7 +1172,7 @@ export function SkinStudio({
                 />
               </div>
               <div className="row-line">
-                <span className="lab">　首选比例</span>
+                <span className="lab">　高亮区比例</span>
                 <Slider
                   disabled={!pcf}
                   value={firstPct ?? Math.round((data.config.appearance?.first_font_scale ?? 1) * 100)}
@@ -1178,7 +1180,7 @@ export function SkinStudio({
                   max={200}
                   step={5}
                   width={104}
-                  label="首选字号比例"
+                  label="高亮区字号比例"
                   onChange={(v) => {
                     setFirstPct(v);
                     scheduleCfg({ first_font_scale: v / 100 });
@@ -1304,6 +1306,21 @@ export function SkinStudio({
                     label="圆角"
                   />
                   <span className="val">{Number(skin?.layout?.corner_radius) || 10} px</span>
+                </div>
+              </div>
+              <div className="row-line">
+                <span className="lab" title="候选窗边框厚度（px）；0=不画边框。改完自动保存，候选窗即时生效">边框厚度</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Slider
+                    value={Number(skin?.layout?.border_width ?? 1)}
+                    min={0}
+                    max={6}
+                    step={0.5}
+                    width={70}
+                    onChange={(v) => patchLayout('border_width', v)}
+                    label="边框厚度"
+                  />
+                  <span className="val">{Number(skin?.layout?.border_width ?? 1)} px</span>
                 </div>
               </div>
               <div className="row-line">
