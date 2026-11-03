@@ -156,11 +156,27 @@ foreach ($b in $builds) {
 }
 # hufu-settings 是独立 workspace（不在 platform\windows 成员里），必须单独构建，
 # 否则打包源会留着旧 exe（端口自探测修复曾因此进不了包）。
+# 【2026-11-04 事故】上面为 TSF 设的 CARGO_TARGET_DIR 还指着
+# platform\windows\target-slim：cargo 会把 hufu-settings 产物也写进
+# target-slim\release，而下面复制的是本 crate 的 target\release（旧 exe）。
+# v1.9.9.1 因此把「黑边修复」发丢了——构建前必须清掉/恢复该环境变量。
 Push-Location 'E:\DSH-KF\hufu\platform\windows\hufu-settings'
+$savedTargetDir = $env:CARGO_TARGET_DIR
+Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 cmd /c 'cargo build --release 2>&1' | ForEach-Object { Write-Host "  $_" }
 $code = $LASTEXITCODE
+if ($savedTargetDir) { $env:CARGO_TARGET_DIR = $savedTargetDir }
 Pop-Location
 if ($code -ne 0) { throw '瘦身构建失败: hufu-settings' }
+# 新鲜度门禁：exe 不能比 src 旧，否则就是构建目录/缓存错位——宁可停发，不再发旧 exe。
+$settingsExe = 'E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe'
+$settingsSrcNewest = (Get-ChildItem 'E:\DSH-KF\hufu\platform\windows\hufu-settings\src' -Recurse -File |
+    Measure-Object -Property LastWriteTime -Maximum).Maximum
+if (-not (Test-Path $settingsExe)) { throw "hufu-settings.exe 不存在：$settingsExe" }
+$settingsExeTime = (Get-Item $settingsExe).LastWriteTime
+if ($settingsExeTime -lt $settingsSrcNewest) {
+    throw "hufu-settings.exe 比源码旧（exe=$settingsExeTime，src=$settingsSrcNewest）——构建目录/缓存错位，禁止打包旧 exe"
+}
 
 $env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\engine\target-slim'
 Push-Location 'E:\DSH-KF\hufu\engine'
