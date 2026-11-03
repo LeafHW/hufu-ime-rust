@@ -1780,8 +1780,62 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     agent_b = agent_b.tls_connector(std::sync::Arc::new(c));
                 }
             }
-            let resp = agent_b
-                .build()
+            let agent = agent_b.build();
+
+            // 【更新源 2026-11-03】国内直连 GitHub 只有几十 KB/s，
+            // 先读自建清单（Gitee raw 免登录、实测 2 MB/s、不占 GitHub 的
+            // 60 次/小时限流）；清单不可达再退回 GitHub API（原逻辑）。
+            // 清单格式：latest/min/page_url/sha256/size/sources[]。
+            let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
+                "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
+            });
+            let manifest = agent
+                .get(&manifest_url)
+                .set("User-Agent", "hufu-ime-update-check")
+                .call()
+                .ok()
+                .and_then(|r| r.into_string().ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            if let Some(m) = manifest.as_ref() {
+                let latest = m
+                    .get("latest")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches('v');
+                if !latest.is_empty() {
+                    let page = m
+                        .get("page_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("https://www.hufuime.top/releases/");
+                    let sources = m
+                        .get("sources")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    // 首选源 = sources[0]（当前是 Gitee 直链）
+                    let download_url = sources
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.get("url"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string());
+                    let cur_ver = current.split_whitespace().next().unwrap_or("");
+                    return Response::json(&serde_json::json!({
+                        "ok": true,
+                        "current": current,
+                        "latest": latest,
+                        "has_update": newer_than(latest, cur_ver),
+                        "page_url": page,
+                        "download_url": download_url,
+                        "sha256": m.get("sha256").cloned().unwrap_or(serde_json::Value::Null),
+                        "size": m.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                        "sources": sources,
+                        "source": "manifest",
+                    }));
+                }
+            }
+
+            let resp = agent
                 .get("https://api.github.com/repos/LeafHW/hufu-ime-rust/releases/latest")
                 .set("User-Agent", "hufu-ime-update-check")
                 .set("Accept", "application/vnd.github+json")

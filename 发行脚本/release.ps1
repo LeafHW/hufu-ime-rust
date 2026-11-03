@@ -9,7 +9,9 @@
 # 铁律全文：E:\DSH-KF\hufu\发行脚本\发行铁律.md
 param(
     [Parameter(Mandatory = $true)][string]$Version,
-    [switch]$VerifyOnly
+    [switch]$VerifyOnly,
+    # 发完包后自动同步到 Gitee（附件 + 更新清单 + 站点）；失败只告警不阻断发行
+    [switch]$NoGitee
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -67,3 +69,23 @@ Write-Host '—— [2/2] exe 发行线（build-setup.ps1 -Engine rust）——' 
 if ($LASTEXITCODE -ne 0) { Write-Host '✗ exe 线失败，发行中止' -ForegroundColor Red; exit 1 }
 
 Verify '打包后'
+
+# ── 3) 附加：同步到 Gitee（附件 + 更新清单 + 站点）──────────────────────────
+# 发行结果已经由 Verify 决定；这一段失败只告警，绝不影响「发行是否成功」。
+# 2026-11-03：国内直连 GitHub 只有几十 KB/s，Gitee 实测 2 MB/s。
+if (-not $NoGitee) {
+    Write-Host '—— [附加] 同步到 Gitee：Release 附件 + 更新清单 + 站点 ——' -ForegroundColor Cyan
+    $pub = Join-Path $PSScriptRoot 'publish-gitee.ps1'
+    if (Test-Path $pub) {
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pub -Version $Version -PublishSite
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host '  [警告] Gitee 同步非零退出；发行本身已完成，可稍后单独重跑 publish-gitee.ps1' -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  [警告] Gitee 同步异常（不影响发行）：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host '  [警告] 找不到 publish-gitee.ps1，跳过 Gitee 同步' -ForegroundColor Yellow
+    }
+}
