@@ -50,7 +50,7 @@ function Fail([string]$msg) { Write-Host "✗ $msg" -ForegroundColor Red; exit 1
 function Ok([string]$msg)   { Write-Host "OK $msg" -ForegroundColor Green }
 
 # ── 1) 输入校验 ────────────────────────────────────────────────────────────
-if ($Version -notmatch '^\d+\.\d+\.\d+$') { Fail("版本号格式应为 x.y.z，收到：$Version") }
+if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { Fail("版本号格式应为 x.y.z 或 x.y.z.w，收到：$Version") }
 
 $needFromPkg = @(
     'hufu-server.exe','hufu-tsf-smoke.exe','hufu-settings.exe','WebView2Loader.dll',
@@ -196,7 +196,11 @@ Ok("staging 完成：$($dataFiles.Count) 个数据文件，共 ${stagedMB}MB（�
 # ── 4) 编译 ───────────────────────────────────────────────────────────────
 if ($SkipCompile) { Ok('SkipCompile：staging 与 inc 已生成，未编译'); exit 0 }
 
-$isccArgs = @("/DSetupVersion=$Version", "/DDistDir=$DistDir")
+# Inno 的 VersionInfoVersion 只接受 1-4 段数字：3 段补 .0，4 段原样
+# （2026-11-04 v1.9.9.1 起支持 4 段版本号，iss 里旧的 SetupVersion+".0" 会变 5 段）
+$verParts = @($Version.Split('.'))
+$ver4 = ((@($verParts) + @('0', '0', '0'))[0..3]) -join '.'
+$isccArgs = @("/DSetupVersion=$Version", "/DSetupVersion4=$ver4", "/DDistDir=$DistDir")
 if ($Engine -eq 'rust') { $isccArgs += '/DRUST_ENGINE=1' }
 & $iscc @isccArgs (Join-Path $setupRoot 'hufu-setup.iss') | Tee-Object -Variable isccOut
 if ($LASTEXITCODE -ne 0) { Fail("iscc 编译失败（退出码 $LASTEXITCODE）") }

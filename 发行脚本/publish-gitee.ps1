@@ -46,6 +46,22 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 
+# PS5.1 坑：脚本 $ErrorActionPreference='Stop' 时，把原生命令的 stderr 用 2>&1
+# 捕获会抛 NativeCommandError（git 的 "remote: ..." 横幅就是 stderr）。
+# 统一走这个 helper：调用期间临时切 Continue，返回输出与退出码。
+function Invoke-Native {
+    param([string]$Exe, [string[]]$ArgList)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @ArgList 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return [pscustomobject]@{ Output = @($out); Code = $code }
+}
+
 $Version = $Version.Trim().TrimStart('v', 'V')
 $Tag = "v$Version"
 
@@ -86,11 +102,11 @@ if (-not $SkipPush) {
         $remote = "https://${Owner}:$Token@gitee.com/$Owner/$Repo.git"
         # 推「当前分支」到 Gitee 默认分支 master：本机 master 常落后工作分支
         # （2026-11-03 实测落后 210 个提交），推本地 master 会把镜像打回旧版。
-        $out = & git -C $RepoDir -c credential.helper= -c http.extraheader= push $remote HEAD:refs/heads/master --tags 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $r = Invoke-Native 'git' @('-C', $RepoDir, '-c', 'credential.helper=', '-c', 'http.extraheader=', 'push', $remote, 'HEAD:refs/heads/master', '--tags')
+        if ($r.Code -eq 0) {
             Write-Ok "push 完成"
         } else {
-            Write-Warn2 "push 失败（不阻断发版）：$($out | Select-Object -Last 3 | Out-String)"
+            Write-Warn2 "push 失败（不阻断发版）：$($r.Output | Select-Object -Last 3 | Out-String)"
         }
     }
 }
@@ -139,8 +155,9 @@ if ($ExistingNames -contains $ExeName) {
 } else {
     Write-Step "上传附件 $ExeName"
     $attachUrl = "$Api/$Repo/releases/$($Release.id)/attach_files"
-    $resp = & curl.exe -sS --max-time 600 -X POST $attachUrl -F "access_token=$Token" -F "file=@$ExePath" 2>&1
-    if ($LASTEXITCODE -eq 0 -and $resp -match '"browser_download_url"') {
+    $r = Invoke-Native 'curl.exe' @('-sS', '--max-time', '600', '-X', 'POST', $attachUrl, '-F', "access_token=$Token", '-F', "file=@$ExePath")
+    $resp = ($r.Output -join "`n")
+    if ($r.Code -eq 0 -and $resp -match '"browser_download_url"') {
         Write-Ok "附件上传成功"
     } else {
         Write-Warn2 "附件上传失败（不阻断发版）：$resp"
@@ -202,8 +219,9 @@ if ($DryRun) {
         '-d', 'branch=master'
     )
     if ($sha) { $curlArgs += @('--data-urlencode', "sha=$sha") }
-    $resp = & curl.exe @curlArgs 2>&1
-    if ($LASTEXITCODE -eq 0 -and (($resp -join "`n") -match '"sha"')) {
+    $r = Invoke-Native 'curl.exe' $curlArgs
+    $resp = ($r.Output -join "`n")
+    if ($r.Code -eq 0 -and ($resp -match '"sha"')) {
         Write-Ok "清单已推送（$method）"
     } else {
         Write-Warn2 "清单推送失败（不阻断发版）：$resp"
@@ -223,11 +241,11 @@ if ($DryRun) {
             $diff = & git -C $SiteRepoDir status --porcelain -- update.json
             if ($diff) {
                 & git -C $SiteRepoDir commit -m "chore: update.json $Tag" -- update.json | Out-Null
-                $pushOut = & git -C $SiteRepoDir -c credential.helper= push "https://LeafHW:$gh@github.com/LeafHW/hufu-ime-rust.git" gh-pages 2>&1
-                if ($LASTEXITCODE -eq 0) {
+                $pushR = Invoke-Native 'git' @('-C', $SiteRepoDir, '-c', 'credential.helper=', 'push', "https://LeafHW:$gh@github.com/LeafHW/hufu-ime-rust.git", 'gh-pages')
+                if ($pushR.Code -eq 0) {
                     Write-Ok "站点已推送（Pages 约 1 分钟生效）"
                 } else {
-                    Write-Warn2 "站点推送失败（不阻断发版）：$($pushOut | Select-Object -Last 2 | Out-String)"
+                    Write-Warn2 "站点推送失败（不阻断发版）：$($pushR.Output | Select-Object -Last 2 | Out-String)"
                 }
             } else {
                 Write-Ok "站点清单无变化，跳过提交"
