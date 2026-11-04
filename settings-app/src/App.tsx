@@ -530,6 +530,29 @@ export default function App() {
     };
   }, []);
 
+  /* P0-1（2026-11-04）：Alt+F4 / 任务栏「关闭窗口」/ 系统菜单关闭在壳侧先
+     ExecuteScript 问 __hufuCanClose；为 false 时**不销毁窗口**，改发
+     win:close-dirty，让页面走这里同一套未保存确认弹层。用户点「放弃修改
+     并关闭」→ requestWindowClose() → 壳侧 win:close → 真正销毁。 */
+  useEffect(() => {
+    const webview = (
+      window as unknown as {
+        chrome?: {
+          webview?: {
+            addEventListener?: (type: string, cb: (e: MessageEvent) => void) => void;
+            removeEventListener?: (type: string, cb: (e: MessageEvent) => void) => void;
+          };
+        };
+      }
+    ).chrome?.webview;
+    if (!webview?.addEventListener) return;
+    const onShellMessage = (e: MessageEvent) => {
+      if (e.data === 'win:close-dirty') setCloseConfirm(true);
+    };
+    webview.addEventListener('message', onShellMessage);
+    return () => webview.removeEventListener?.('message', onShellMessage);
+  }, []);
+
   /* 动效减负：窗口隐藏/最小化时暂停常驻 CSS 动画（同步页辉光/圈环等），
      避免后台常驻动画持续占用合成器。 */
   useEffect(() => {

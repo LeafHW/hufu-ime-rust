@@ -5,7 +5,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
 import '../styles/input.css';
 
-import { fetchWithTimeout } from '../api';
+import { fetchWithTimeout, updateConfig } from '../api';
 /**
  * 输入页 —— 对应旧 settings-ui「输入与候选」页。
  *
@@ -598,7 +598,8 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
         enabled: merged.clipboard.enabled,
         whitelist: parseList(merged.clipboard.whitelist),
       });
-      await postConfig(base);
+      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
+      await updateConfig(base);
 
       const applied: InputDraft = {
         ...merged,

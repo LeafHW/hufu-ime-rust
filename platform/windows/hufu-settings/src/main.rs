@@ -59,6 +59,14 @@ extern "system" {
 
 const WM_ACTIVATE_MSG: u32 = 0x0006;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
+// 【P0-1 2026-11-04】会话结束消息（win32.rs 未收录，本文件只用到这两个）：
+// WM_QUERYENDSESSION 必须同步答复，不能在这里跑异步脚本；
+// WM_ENDSESSION 只是「已决定关机」的通知（进程随后被杀）。
+const WM_QUERYENDSESSION: u32 = 0x0011;
+const WM_ENDSESSION: u32 = 0x0016;
+/// 关窗询问页面的超时（毫秒）：渲染进程忙/挂死时不能卡住用户关窗，
+/// 超时按「可关」处理并记日志（正常本机往返仅个位数毫秒）。
+const CLOSE_QUERY_TIMEOUT_MS: u64 = 400;
 
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
@@ -397,6 +405,70 @@ unsafe fn paint_window_frame(app: *mut App) {
     let _ = ReleaseDC(a.hwnd, hdc);
 }
 
+/// 【P0-1 2026-11-04】真正销毁窗口的唯一出口：关闭 WebView2 controller 再
+/// DestroyWindow。所有「确认可关」的路径（页面无脏数据 / 页面确认放弃 /
+/// 询问超时 / 用户第二次坚持关闭）都汇到这里，避免各处重复关闭逻辑。
+unsafe fn destroy_now(app: *mut App, reason: &str) {
+    if app.is_null() {
+        return;
+    }
+    let hwnd = (*app).hwnd;
+    (*app).close_state = 2;
+    (*app).close_deadline = None;
+    KillTimer(hwnd, 7);
+    (*app).log(&format!("CLOSE: destroying window ({reason})"));
+    if !(*app).controller.is_null() {
+        let hr = controller_close((*app).controller);
+        (*app).log(&format!("controller Close -> hr=0x{:08X}", hr as u32));
+    }
+    DestroyWindow(hwnd);
+}
+
+/// 【P0-1 2026-11-04】WM_CLOSE 守卫：先问页面 window.__hufuCanClose()
+/// （settings-app 的 App.tsx 已暴露；false=有未保存修改）。
+/// 选择「异步单次询问 + 400ms 超时」而不是同步阻塞：本机 ExecuteScript
+/// 往返个位数毫秒，无脏数据时用户感知不到延迟；渲染进程卡住/脚本失败
+/// 一律按可关处理并记日志（不能把用户困在窗口里）。
+unsafe fn request_close_guarded(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    if (*app).close_state == 2 {
+        return; // 已在销毁流程，等 WM_DESTROY
+    }
+    if (*app).close_state == 1 {
+        (*app).log("WM_CLOSE while quit query in flight; ignored (waiting for page)");
+        return;
+    }
+    // 没有可询问的页面（启动失败 / 尚无 WebView / 还没导航成功）：直接关。
+    if (*app).webview.is_null() || !(*app).nav_ok || (*app).failed {
+        destroy_now(app, "no live page to ask");
+        return;
+    }
+    // 注意：已有脏提示也不强制关窗（重复 Alt+F4 只重新询问一遍，绝不
+    // 静默丢数据）；真正关闭由页面的「放弃修改并关闭」按钮发 win:close。
+    (*app).close_state = 1;
+    (*app).close_deadline = Some(Instant::now() + Duration::from_millis(CLOSE_QUERY_TIMEOUT_MS));
+    SetTimer((*app).hwnd, 7, 30, null());
+    // 表达式约定：页面无守卫（错误页/旧页面）→ '1'（可关）；守卫抛异常
+    // → '1'（可关）；只有明确 false 才 '0'（不关，转页面确认）。
+    let js = wide(
+        "(function(){try{return (window.__hufuCanClose ? (window.__hufuCanClose() ? '1' : '0') : '1');}catch(e){return '1';}})()",
+    );
+    let handler = handler_new(KIND_CLOSE_QUERY, IID_SCRIPT_HANDLER, app);
+    let hr = wv_execute_script((*app).webview, js.as_ptr(), handler);
+    (*app).log(&format!(
+        "close guard: ExecuteScript(__hufuCanClose) -> hr=0x{:08X}",
+        hr as u32
+    ));
+    if hr < 0 {
+        (*app).close_state = 0;
+        (*app).close_deadline = None;
+        KillTimer((*app).hwnd, 7);
+        destroy_now(app, "ExecuteScript call failed; treat as closable");
+    }
+}
+
 unsafe fn handle_window_message(app: *mut App, msg: &str) {
     let hwnd = (*app).hwnd;
     (*app).log(&format!("web message: {msg}"));
@@ -412,7 +484,10 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
             }
         }
         "win:close" => {
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            // 【P0-1 2026-11-04】页面主动请求关闭：此时页面自己的未保存
+            // 确认已经走完（或无脏数据），直接销毁。旧实现再 PostMessage
+            // WM_CLOSE，会和新的「先问页面」守卫叠加成二次确认/死循环。
+            destroy_now(app, "page requested close via win:close");
         }
         "win:ready" => {
             KillTimer(hwnd, 2);
@@ -495,6 +570,8 @@ const KIND_CONTROLLER: u32 = 2;
 const KIND_NAV: u32 = 3;
 const KIND_SCRIPT: u32 = 4;
 const KIND_MSG: u32 = 5;
+/// 【P0-1 2026-11-04】关窗询问页面的 ExecuteScript 回调（结果 '1'/'0'）。
+const KIND_CLOSE_QUERY: u32 = 6;
 
 #[repr(C)]
 struct Handler {
@@ -786,6 +863,45 @@ unsafe extern "system" fn handler_invoke(
                 (*app).log(&format!("DOM evidence: {short}"));
             }
         }
+        KIND_CLOSE_QUERY => {
+            // 【P0-1 2026-11-04】关窗询问结果。ExecuteScript 返回 JSON 文本，
+            // 我们的表达式返回 JS 字符串 '1'/'0'，故 p2 形如 "\"1\""。
+            let hr = p1 as i32;
+            if (*app).close_state != 1 {
+                // 超时/其它路径已处理过：不要再 DestroyWindow 一次。
+                return S_OK;
+            }
+            (*app).close_state = 0;
+            (*app).close_deadline = None;
+            KillTimer((*app).hwnd, 7);
+            let can = if hr < 0 {
+                (*app).log(&format!(
+                    "close guard: ExecuteScript failed hr=0x{:08X}; treat as closable",
+                    hr as u32
+                ));
+                true
+            } else {
+                let raw = from_wide_ptr(p2 as *const u16);
+                let v = raw.trim().trim_matches('"');
+                (*app).log(&format!("close guard: page answer = {raw}"));
+                v != "0"
+            };
+            if can {
+                destroy_now(app, "page has no unsaved changes");
+            } else {
+                // 不销毁：把「有人要关窗」交给页面，由既有脏数据确认弹层
+                // 决定（用户点「放弃修改并关闭」→ 页面发 win:close → 直接关；
+                // 点「留在本页」→ 什么也不发生，下次 WM_CLOSE 重新询问）。
+                (*app).close_dirty_at = Some(Instant::now());
+                (*app).log(
+                    "close guard: page has unsaved changes; posted win:close-dirty (window NOT destroyed)",
+                );
+                if !(*app).webview.is_null() {
+                    let w = wide("win:close-dirty");
+                    let _ = wv_post_message_string((*app).webview, w.as_ptr());
+                }
+            }
+        }
         KIND_MSG => {
             if let Some(msg) = msg_args_try_string(p2) {
                 handle_window_message(app, &msg);
@@ -826,6 +942,15 @@ struct App {
     /// 页面底色 / 侧栏底色，由页面 win:theme 消息同步；默认按深色主题。
     frame_bg: u32,
     frame_side: u32,
+    /// 【P0-1 2026-11-04】关窗守卫状态：0=空闲、1=已发 ExecuteScript 等页面
+    /// 应答、2=正在销毁（防止渲染回调/重复消息再走一次关闭）。
+    close_state: u8,
+    /// 询问超时时刻（close_state=1 时有效）。
+    close_deadline: Option<Instant>,
+    /// 上次提示「页面有未保存修改」的时刻（仅日志取证用：系统关机时记录
+    /// 用户此前是否已被提示过）。关窗守卫不据此强制关闭——重复关闭请求
+    /// 只会重新询问页面，绝不静默丢数据。
+    close_dirty_at: Option<Instant>,
 }
 
 impl App {
@@ -1158,6 +1283,29 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TIMER => {
+            if wparam == 7 {
+                // 【P0-1 2026-11-04】关窗询问超时看护：页面 400ms 内没回
+                // ExecuteScript（渲染进程忙/挂死）→ 按可关处理，不能把
+                // 用户困在窗口里。正常本机往返 <10ms，这条几乎不会走。
+                let app = app_ptr(hwnd);
+                let expired = !app.is_null()
+                    && (*app).close_state == 1
+                    && (*app)
+                        .close_deadline
+                        .map(|d| Instant::now() >= d)
+                        .unwrap_or(true);
+                if expired {
+                    (*app).log(&format!(
+                        "close guard: page did not answer in {CLOSE_QUERY_TIMEOUT_MS}ms; treat as closable"
+                    ));
+                    (*app).close_state = 0;
+                    (*app).close_deadline = None;
+                    destroy_now(app, "quit query timeout");
+                } else if app.is_null() || (*app).close_state != 1 {
+                    KillTimer(hwnd, 7);
+                }
+                return 0;
+            }
             if wparam == 4 {
                 // 【2026-11-02 白闪根治 v1】win:ready 后 100ms 揭示：
                 // 此时 WebView2 首帧已提交，直接显示不会露白。
@@ -1211,7 +1359,14 @@ unsafe extern "system" fn wndproc(
                 }
             } else {
                 KillTimer(hwnd, 1);
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                // 【P0-1 2026-11-04】--auto-close 是自动化/截图用的「到点强制
+                // 退出」，不再走 WM_CLOSE（否则脏数据页面会打断自动化并
+                // 卡住），直接销毁。
+                let app = app_ptr(hwnd);
+                if !app.is_null() {
+                    (*app).log("auto-close timer fired; destroying window");
+                }
+                destroy_now(app, "auto-close timer");
             }
             0
         }
@@ -1239,17 +1394,39 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        WM_CLOSE => {
+        WM_QUERYENDSESSION => {
+            // 【P0-1 2026-11-04】系统关机/注销。这里必须同步返回，不能跑
+            // 异步 ExecuteScript，也不应阻止关机（Windows 超时后会强杀，
+            // 拦关机对用户是恶劣体验）。明确放行并记录关窗状态与脏数据
+            // 提示历史，供事后日志取证；页面脏数据在关机场景由用户自理。
             let app = app_ptr(hwnd);
             if !app.is_null() {
-                let a = &*app;
-                a.log("WM_CLOSE received; closing WebView2 controller");
-                if !a.controller.is_null() {
-                    let hr = controller_close(a.controller);
-                    a.log(&format!("controller Close -> hr=0x{:08X}", hr as u32));
-                }
+                (*app).log(&format!(
+                    "WM_QUERYENDSESSION lParam=0x{:X}: allow shutdown/logoff (close_state={}, dirty_notified={})",
+                    lparam,
+                    (*app).close_state,
+                    (*app).close_dirty_at.is_some()
+                ));
             }
-            DestroyWindow(hwnd);
+            1
+        }
+        WM_ENDSESSION => {
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                (*app).log(&format!(
+                    "WM_ENDSESSION end={} lParam=0x{:X}: session ending; process may be terminated by OS",
+                    wparam, lparam
+                ));
+            }
+            0
+        }
+        WM_CLOSE => {
+            // 【P0-1 2026-11-04】不再直接 DestroyWindow：Alt+F4 / 任务栏
+            // 「关闭窗口」/ 系统菜单关闭都会走这里，必须先问页面有没有
+            // 未保存修改（window.__hufuCanClose）。自绘 ✕ 走页面自己的
+            // 确认后发 win:close（见 handle_window_message），不经过本分支，
+            // 因此不会二次确认。
+            request_close_guarded(app_ptr(hwnd));
             0
         }
         WM_DESTROY => {
@@ -1886,6 +2063,9 @@ unsafe fn real_main() -> i32 {
         focus_retry: 0,
         frame_bg: 0x0017_1413,   // #131417 (dark --bg)
         frame_side: 0x001c_1817, // #17181c (dark --bg2)
+        close_state: 0,
+        close_deadline: None,
+        close_dirty_at: None,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 

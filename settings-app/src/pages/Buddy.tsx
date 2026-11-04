@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import type { Bootstrap } from '../types';
 import { useDirtyGuard } from '../dirtyGuard';
+import { fetchWithTimeout } from '../api';
 import { Candidate } from '../components/Candidate';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead, Slider, Switch } from '../components/ui';
@@ -262,7 +263,7 @@ async function detectAnimated(dataUrl: string, mime: string): Promise<boolean> {
   const ctor = (window as unknown as { ImageDecoder?: ImageDecoderCtor }).ImageDecoder;
   if (!ctor) return mime === 'image/gif' || mime === 'image/apng';
   try {
-    const buf = await (await fetch(dataUrl)).arrayBuffer();
+    const buf = await (await fetchWithTimeout(dataUrl)).arrayBuffer();
     const dec = new ctor({ data: buf, type: mime || 'image/gif' });
     await dec.tracks.ready;
     return (dec.tracks.selectedTrack?.frameCount ?? 1) > 1;
@@ -553,7 +554,7 @@ export function BuddyPage({
     try {
       let ov: OverlayCfg;
       if (kind === 'ssf') {
-        const r = await fetch(`/api/skin/ssf-settings?id=${encodeURIComponent(id)}`, {
+        const r = await fetchWithTimeout(`/api/skin/ssf-settings?id=${encodeURIComponent(id)}`, {
           cache: 'no-store',
         });
         let body: SsfPayload & { error?: string } = {};
@@ -565,7 +566,7 @@ export function BuddyPage({
         if (!r.ok) throw new Error(body.error || `读取独立皮肤设置失败（${r.status}）`);
         ov = normalizeOverlay(body.overrides?.overlay);
       } else {
-        const r = await fetch(`/api/skin?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
+        const r = await fetchWithTimeout(`/api/skin?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
         let body: Record<string, unknown> = {};
         try {
           body = (await r.json()) as Record<string, unknown>;
@@ -699,7 +700,7 @@ export function BuddyPage({
   const persistOne = async (target: OverlayCfg) => {
     if (lastSavedRef.current === target) return;
     if (mode === 'ssf') {
-      const r = await fetch(`/api/skin/ssf-settings?id=${encodeURIComponent(skinId)}`, {
+      const r = await fetchWithTimeout(`/api/skin/ssf-settings?id=${encodeURIComponent(skinId)}`, {
         cache: 'no-store',
       });
       let cur: SsfPayload & { error?: string } = {};
@@ -710,7 +711,7 @@ export function BuddyPage({
       }
       if (!r.ok) throw new Error(cur.error || `读取独立皮肤设置失败（${r.status}）`);
       const overrides = { ...(cur.overrides || {}), overlay: target };
-      const p = await fetch('/api/skin/ssf-settings', {
+      const p = await fetchWithTimeout('/api/skin/ssf-settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: skinId, overrides }),
@@ -723,7 +724,7 @@ export function BuddyPage({
       }
       if (!p.ok) throw new Error(body.error || `保存失败（${p.status}）`);
     } else {
-      const r = await fetch(`/api/skin?id=${encodeURIComponent(skinId)}`, { cache: 'no-store' });
+      const r = await fetchWithTimeout(`/api/skin?id=${encodeURIComponent(skinId)}`, { cache: 'no-store' });
       let skin: Record<string, unknown> = {};
       try {
         skin = (await r.json()) as Record<string, unknown>;
@@ -736,7 +737,7 @@ export function BuddyPage({
       if ((skin as { id?: unknown }).id !== skinId) {
         throw new Error(`皮肤「${skinId}」读取异常：服务器返回了别的皮肤（可能文件已损坏）`);
       }
-      const p = await fetch('/api/skin', {
+      const p = await fetchWithTimeout('/api/skin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         /* select:false —— 挂件改动即存不再顺带切换当前皮肤。 */
@@ -902,7 +903,7 @@ export function BuddyPage({
     notifyRef.current('挂件图片已删除（重新「选择图片…」可再挂）');
     if (old.length >= 1024) {
       try {
-        const r = await fetch('/api/skin/overlay-purge', {
+        const r = await fetchWithTimeout('/api/skin/overlay-purge', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ image: old }),

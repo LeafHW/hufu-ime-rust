@@ -215,3 +215,70 @@ export async function loadSsfSettings(id: string): Promise<SsfSettingsResp> {
 export async function saveSsfSettings(id: string, overrides: SsfOverrides): Promise<void> {
   await postJson('/api/skin/ssf-settings', { id, overrides });
 }
+
+/* ── 【P1-15 2026-11-04】配置写入统一入口 ──────────────────────────────
+   后端 /api/config 现在返回 rev（每次写入自增），POST 带 rev 不符即 409，
+   不再允许「读旧快照 → 整份写回」静默洗掉别人刚保存的配置。
+   updateConfig 的语义：
+     1. GET 最新配置 + rev；
+     2. 深度合并 patch（对象递归、数组/标量整体替换）；
+     3. 带 rev POST；
+     4. 409（其他页面/窗口已改）→ 询问用户：确定=按最新 rev 重新应用
+        本次修改；取消=放弃本次修改。绝不静默覆盖别人的写入。
+   同一窗口内的写入串行化（单飞链）：快速连点开关、多个常驻页面同时写
+   都不会互相覆盖（沿用动效页原有写队列思路，收敛成全局唯一入口）。 */
+type JsonDict = Record<string, unknown>;
+
+function isPlainDict(v: unknown): v is JsonDict {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** 深度合并：patch 里的对象递归合并，数组/标量整体替换。 */
+function deepMerge(base: JsonDict, patch: JsonDict): JsonDict {
+  const out: JsonDict = { ...base };
+  for (const [k, v] of Object.entries(patch)) {
+    out[k] = isPlainDict(v) && isPlainDict(out[k]) ? deepMerge(out[k] as JsonDict, v) : v;
+  }
+  return out;
+}
+
+let configWriteChain: Promise<unknown> = Promise.resolve();
+
+/** 统一配置写入：成功后返回合并后的配置快照；失败抛错（409 用户取消也抛错）。 */
+export function updateConfig(patch: JsonDict): Promise<Config> {
+  const run = () => writeConfigOnce(patch);
+  const p = configWriteChain.then(run, run);
+  // 链本身吞错，避免一次失败卡死后续写入（错误仍抛给各自调用方）
+  configWriteChain = p.catch(() => undefined);
+  return p;
+}
+
+async function writeConfigOnce(patch: JsonDict): Promise<Config> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const fresh = (await getJson<Config & { rev?: number }>('/api/config')) as Config & {
+      rev?: number;
+    };
+    const rev = typeof fresh.rev === 'number' ? fresh.rev : undefined;
+    const merged = deepMerge(fresh as unknown as JsonDict, patch);
+    const body: JsonDict = { ...merged };
+    if (rev !== undefined) body.rev = rev;
+    const r = await fetchWithTimeout('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const respBody = (await r.json().catch(() => ({}))) as { error?: string };
+    if (r.status === 409) {
+      const retry = window.confirm(
+        '其他页面/窗口已修改并保存了配置。\n\n' +
+          '点「确定」：按最新配置重新应用本次修改（推荐）\n' +
+          '点「取消」：放弃本次修改（当前页面保持原样）',
+      );
+      if (!retry) throw new Error('配置已被其他页面修改，本次修改未保存');
+      continue; // 重新 GET 最新 rev，再把本次 patch 合并上去
+    }
+    if (!r.ok) throw new Error(respBody.error || `保存失败（${r.status}）`);
+    return merged as unknown as Config;
+  }
+  throw new Error('配置已被其他页面持续修改，保存失败（请稍后重试）');
+}

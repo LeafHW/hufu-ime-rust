@@ -231,7 +231,7 @@ export function DataPage({ data, notify }: { data: Bootstrap; notify: (msg: stri
     if (exporting) return;
     setExporting(true);
     try {
-      const r = await fetch('/api/settings_export', { cache: 'no-store' });
+      const r = await fetchWithTimeout('/api/settings_export', { cache: 'no-store' });
       if (!r.ok) {
         const body = await readBody(r);
         throw new Error(httpError(body, '/api/settings_export', r.status));
@@ -365,6 +365,26 @@ export function DataPage({ data, notify }: { data: Bootstrap; notify: (msg: stri
       notify(`已打开${label}`);
     } catch (e) {
       fail(`打开${label}失败：${errText(e)}`);
+    } finally {
+      setOpening('');
+    }
+  };
+
+  /* 【P2-19 2026-11-04】码表根目录必须走受控 kind：旧版传 name="." 会被
+     后端 /api/open_schema_dir 的「路径分隔符/.. 拒绝」规则拦成 400（按钮
+     必失败）。/api/open_dir{kind:"schema"} 返回的就是码表基目录。 */
+  const openSchemaRoot = async () => {
+    if (opening !== '') return;
+    setOpening('__root__');
+    try {
+      const r = await postJson<OpenDirResponse>('/api/open_dir', { kind: 'schema' });
+      setStatus({
+        tone: 'ok',
+        text: `已在资源管理器打开码表根目录${r.path ? `：${r.path}` : ''}`,
+      });
+      notify('已打开码表根目录');
+    } catch (e) {
+      fail(`打开码表根目录失败：${errText(e)}`);
     } finally {
       setOpening('');
     }
@@ -645,7 +665,7 @@ export function DataPage({ data, notify }: { data: Bootstrap; notify: (msg: stri
                     type="button"
                     className="btn sm ghost"
                     disabled={opening !== ''}
-                    onClick={() => void openSchemaDir('.', '码表根目录')}
+                    onClick={() => void openSchemaRoot()}
                   >
                     <Icon name="folder" />
                     打开根目录

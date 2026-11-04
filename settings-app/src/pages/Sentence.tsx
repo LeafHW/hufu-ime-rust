@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useScreenActive } from '../hooks';
+import { fetchWithTimeout, getJson, updateConfig } from '../api';
 import type { Bootstrap, Config, EngineState } from '../types';
 import { useDirtyGuard } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
@@ -251,31 +252,15 @@ function normalizeSentence(raw: unknown): SentenceCfg {
 }
 
 async function fetchConfig(): Promise<Config> {
-  const r = await fetch('/api/config', { cache: 'no-store' });
-  if (!r.ok) throw new Error(`读取配置失败（${r.status}）`);
-  return (await r.json()) as Config;
+  return getJson<Config>('/api/config');
 }
 
 async function fetchState(): Promise<EngineState> {
-  const r = await fetch('/api/state', { cache: 'no-store' });
-  if (!r.ok) throw new Error(`读取状态失败（${r.status}）`);
-  return (await r.json()) as EngineState;
+  return getJson<EngineState>('/api/state');
 }
 
-async function postConfig(cfg: Config): Promise<void> {
-  const r = await fetch('/api/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(cfg),
-  });
-  let body: { error?: string } = {};
-  try {
-    body = (await r.json()) as { error?: string };
-  } catch {
-    /* 非 JSON 错误体 */
-  }
-  if (!r.ok) throw new Error(body.error || `保存失败（${r.status}）`);
-}
+/* 【P1-15 2026-11-04】配置写入统一走 api.updateConfig（GET→深度合并→
+   带 rev POST；409 时提示其他页面已改）。本页只改 sentence 节。 */
 
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
@@ -446,7 +431,7 @@ export function SentencePage({
   }>({ model_dir: '', ngram_candidates: [], ngram_active: null, rerank_model: null });
   useEffect(() => {
     let alive = true;
-    fetch('/api/sentence/models')
+    fetchWithTimeout('/api/sentence/models', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : null))
       .then((d: typeof models | null) => {
         if (alive && d) setModels(d);
@@ -572,12 +557,7 @@ export function SentencePage({
     setLocal(nextSentence);
     markDirty(true);
     try {
-      const next = await queueConfig(async () => {
-        const fresh = await fetchConfig();
-        const cfg: Config = { ...fresh, sentence: nextSentence };
-        await postConfig(cfg);
-        return cfg;
-      });
+      const next = await queueConfig(async () => updateConfig({ sentence: nextSentence }));
       serverCfgRef.current = next;
       lastPolledRef.current = JSON.stringify(nextSentence);
       if (sentenceRef.current === nextSentence) markDirty(false);
@@ -624,9 +604,8 @@ export function SentencePage({
       const { cfg, nextServer } = await queueConfig(async () => {
         const fresh = await fetchConfig();
         const serverSentence = updater(normalizeSentence(fresh.sentence));
-        const next: Config = { ...fresh, sentence: serverSentence };
-        await postConfig(next);
-        return { cfg: next, nextServer: serverSentence };
+        const cfg = await updateConfig({ sentence: serverSentence });
+        return { cfg, nextServer: serverSentence };
       });
       serverCfgRef.current = cfg;
       lastPolledRef.current = JSON.stringify(nextServer);
@@ -721,7 +700,7 @@ export function SentencePage({
           notifyRef.current('参数已保存，但模型重载未在时限内确认；本次试验可能仍用旧权重');
         }
       }
-      const r = await fetch('/api/sentence_test', {
+      const r = await fetchWithTimeout('/api/sentence_test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ raw }),
@@ -761,7 +740,7 @@ export function SentencePage({
      旧的 open_schema_dir 传绝对路径用法已被路径穿越封堵（400）。 */
   const openModelDir = async () => {
     try {
-      const r = await fetch('/api/open_dir', {
+      const r = await fetchWithTimeout('/api/open_dir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ kind: 'model' }),

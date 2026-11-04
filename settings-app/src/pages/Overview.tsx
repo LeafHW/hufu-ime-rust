@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
-import { syncNow } from '../api';
+import { fetchWithTimeout, syncNow } from '../api';
 import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
@@ -74,7 +74,7 @@ export function Overview({
   const skinName = shortName(data.skin?.name || currentMeta?.name || '墨言');
   const openSchemaRoot = async () => {
     try {
-      const r = await fetch('/api/open_dir', {
+      const r = await fetchWithTimeout('/api/open_dir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ kind: 'schema' }),

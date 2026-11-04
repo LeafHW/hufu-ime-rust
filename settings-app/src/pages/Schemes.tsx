@@ -5,7 +5,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import '../styles/schemes.css';
 
-import { fetchWithTimeout } from '../api';
+import { fetchWithTimeout, updateConfig } from '../api';
 /* ────────────────────────────────────────────────────────────────────────────
  * 方案页（真实读写）——数据源全部来自 hufu-server：
  *   GET  /api/schemas          码表目录下的方案名（实时列目录）
@@ -391,7 +391,8 @@ export function SchemesPage({ data, notify }: { data: Bootstrap; notify: (msg: s
           split_scheme: form.splitScheme,
         },
       };
-      await postJson<{ ok?: boolean }>('/api/config', next);
+      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
+      await updateConfig(next);
       markDirty(false);
       const fresh = await getJson<RawConfig>('/api/config');
       applyConfig(fresh);

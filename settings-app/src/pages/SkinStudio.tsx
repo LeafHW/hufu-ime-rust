@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Bootstrap, Skin, SkinMeta } from '../types';
 import { fallbackSkin } from '../types';
-import { deleteSsfSkin, loadSkin, loadFonts, loadSsfSettings, saveSsfSettings, resetSkin, saveSkin, selectSkin as selectSkinApi } from '../api';
+import { deleteSsfSkin, fetchWithTimeout, loadSkin, loadFonts, loadSsfSettings, saveSsfSettings, resetSkin, saveSkin, selectSkin as selectSkinApi, updateConfig } from '../api';
 import type { SsfOverrides } from '../api';
 import { useDirtyGuard } from '../dirtyGuard';
 import { Candidate } from '../components/Candidate';
@@ -278,10 +278,10 @@ export function SkinStudio({
       const run = async () => {
         setTrialBusy(true);
         try {
-          await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          await fetchWithTimeout('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
           let state: Record<string, unknown> = {};
           for (const ch of trialRaw) {
-            const r = await fetch('/api/key', {
+            const r = await fetchWithTimeout('/api/key', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ op: 'key', key: ch }),
@@ -305,7 +305,7 @@ export function SkinStudio({
             v: String(previewVer),
           });
           setTrialUrl(`/api/skin/preview_frame?${q.toString()}`);
-          await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          await fetchWithTimeout('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         } catch {
           if (seq === trialSeq.current) setTrialUrl('');
         } finally {
@@ -372,7 +372,8 @@ export function SkinStudio({
     }
   };
 
-  /* 假状态清理③：候选窗动效/选重暂留接真实配置（读-改-写 /api/config）。
+  /* 假状态清理③：候选窗动效/选重暂留接真实配置（P1-15 起统一走
+     updateConfig：GET→深度合并→带 rev POST；409 由它提示其他页面已改）。
      写请求在途时的新写不丢弃，合并进 pending 队列，完成后重放
      （快速连切开关曾出现第二个静默丢失、UI 与服务器脱钩）。 */
   const writeAppearance = async (patch: Record<string, unknown>): Promise<void> => {
@@ -383,17 +384,7 @@ export function SkinStudio({
     cfgBusyRef.current = true;
     setCfgBusy(true);
     try {
-      const r = await fetch('/api/config', { cache: 'no-store' });
-      if (!r.ok) throw new Error(`读取配置失败（${r.status}）`);
-      const fresh = (await r.json()) as Record<string, unknown>;
-      const appearance = { ...(fresh.appearance as Record<string, unknown> | undefined), ...patch };
-      const p = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...fresh, appearance }),
-      });
-      const body = (await p.json().catch(() => ({}))) as { error?: string };
-      if (!p.ok) throw new Error(body.error || `保存失败（${p.status}）`);
+      await updateConfig({ appearance: patch });
       await refresh();
     } finally {
       cfgBusyRef.current = false;
@@ -406,19 +397,9 @@ export function SkinStudio({
     }
   };
 
-  /* 全局候选设置（candidates.*）的读-改-写：开关粒度小，失败回滚即可。 */
+  /* 全局候选设置（candidates.*）：走 updateConfig（同上，带 rev / 409 提示）。 */
   const writeCandidates = async (patch: Record<string, unknown>): Promise<void> => {
-    const r = await fetch('/api/config', { cache: 'no-store' });
-    if (!r.ok) throw new Error(`读取配置失败（${r.status}）`);
-    const fresh = (await r.json()) as Record<string, unknown>;
-    const candidates = { ...(fresh.candidates as Record<string, unknown> | undefined), ...patch };
-    const p = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...fresh, candidates }),
-    });
-    const body = (await p.json().catch(() => ({}))) as { error?: string };
-    if (!p.ok) throw new Error(body.error || `保存失败（${p.status}）`);
+    await updateConfig({ candidates: patch });
     await refresh();
   };
 
@@ -599,7 +580,7 @@ export function SkinStudio({
     setImporting(true);
     try {
       const buf = await file.arrayBuffer();
-      const r = await fetch(`/api/skin/import_ssf?name=${encodeURIComponent(file.name)}`, {
+      const r = await fetchWithTimeout(`/api/skin/import_ssf?name=${encodeURIComponent(file.name)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,
@@ -632,7 +613,7 @@ export function SkinStudio({
         colors = value as Record<string, unknown>;
         id = key;
       }
-      const r = await fetch('/api/weasel_import', {
+      const r = await fetchWithTimeout('/api/weasel_import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, colors }),

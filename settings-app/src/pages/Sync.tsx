@@ -672,7 +672,7 @@ export function Sync({ data, notify }: { data: Bootstrap; notify: (msg: string) 
             <span
               onClick={async () => {
                 try {
-                  const r = await fetch('/api/sync/backup', { cache: 'no-store' });
+                  const r = await fetchWithTimeout('/api/sync/backup', { cache: 'no-store' });
                   if (!r.ok) throw new Error(String(r.status));
                   const b = (await r.json()) as { path?: string; rounds?: string[] | number };
                   const n = Array.isArray(b.rounds) ? b.rounds.length : (b.rounds ?? 0);

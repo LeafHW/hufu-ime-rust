@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
+import { updateConfig } from '../api';
 import { MotionDemo } from '../components/MotionDemo';
 import { skinTokens, withAlpha, type SkinTokens } from '../skinTokens';
 import { useScreenActive } from '../hooks';
@@ -334,7 +335,9 @@ export function MotionPage({
   useEffect(() => setFlash(app.anim_flash !== false), [app.anim_flash]);
   useEffect(() => setHl(app.hl_font_scale === true), [app.hl_font_scale]);
 
-  /* 读-改-写 /api/config：单飞 + 合并排队，开关连点不互相覆盖。 */
+  /* 配置写入统一走 updateConfig（P1-15）：GET→深度合并→带 rev POST，
+     409 由它提示「其他页面已改」。这里保留「单飞 + 合并排队」：同一时刻
+     只发一个写请求，连点开关的后续改动合并成一次补写，避免来回跳变。 */
   const writing = useRef(false);
   const queued = useRef<Record<string, unknown> | null>(null);
   const writeAppearance = useCallback(async (patch: Record<string, unknown>): Promise<void> => {
@@ -346,17 +349,7 @@ export function MotionPage({
     let current: Record<string, unknown> | null = patch;
     try {
       while (current) {
-        const r = await fetch('/api/config', { cache: 'no-store' });
-        if (!r.ok) throw new Error(`读取配置失败（${r.status}）`);
-        const fresh = (await r.json()) as Record<string, unknown>;
-        const appearance = { ...(fresh.appearance as Record<string, unknown> | undefined), ...current };
-        const p = await fetch('/api/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...fresh, appearance }),
-        });
-        const body = (await p.json().catch(() => ({}))) as { error?: string };
-        if (!p.ok) throw new Error(body.error || `保存失败（${p.status}）`);
+        await updateConfig({ appearance: current });
         current = queued.current;
         queued.current = null;
       }

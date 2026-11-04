@@ -4,7 +4,7 @@ import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
 import '../styles/keymap.css';
 
-import { fetchWithTimeout } from '../api';
+import { fetchWithTimeout, updateConfig } from '../api';
 /**
  * 键位编辑器 —— 对应旧 settings-ui「自定义按键（全键盘 · 两态映射）」窗口。
  *
@@ -805,7 +805,8 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
         shift_symbols: next.shift_symbols,
         shift_letters_always: next.shift_letters_always,
       };
-      await postConfig(base);
+      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
+      await updateConfig(base);
       setDraft(next);
       ignorePropsUntil.current = Date.now() + 15000;
       notify(okMsg);
