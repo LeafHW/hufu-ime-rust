@@ -1,0 +1,6 @@
+# 【P2-28 2026-11-04】打包依赖入仓资格：Jun Da 字频白名单
+# 根 .gitignore:35 排除了 发行脚本/hanzi_db.csv → 干净 clone 打包时 pack.ps1:323
+# 直接 throw（只能靠本机 E:\DSH-KF\语料\ 副本）。子目录 .gitignore 反忽略，
+# 让「除 dist 之外的打包依赖」随仓可复现。
+# 体积：546,552 B（约 534KB），zlib/gzip 后约 200KB —— 一次性成本，不再随版本变。
+!hanzi_db.csv

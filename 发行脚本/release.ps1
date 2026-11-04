@@ -1,7 +1,10 @@
 ﻿# release.ps1 — 虎符唯一发行入口（2026-10-18 立此存照）
 # ============================================================================
 # 用法：powershell -ExecutionPolicy Bypass -File release.ps1 -Version x.y.z
-# 可选：-VerifyOnly x.y.z（只校验该版双产物+哈希，不重新打包）
+# 可选：-VerifyOnly（只校验该版双产物，不重新打包）——校验内容不只看「在不在」：
+#       版本号（zip 内 version.txt = exe 版本资源 = 本版号）、关键指纹
+#       （zip 内 install.ps1 与仓内单一事实源 SHA256 一致）、体积、SHA256。
+# 可选：-SkipChangelogCheck（应急：允许更新日志顶部不是本版本；默认=失败）
 #
 # 【为什么存在】v1.8.7 事故：打包只跑 pack.ps1 出了 zip、漏了 exe 发行
 # 线。「完整发行=zip+exe 缺一不可」从此不再依赖执行者记忆——本脚本一次
@@ -11,7 +14,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [switch]$VerifyOnly,
     # 发完包后自动同步到 Gitee（附件 + 更新清单 + 站点）；失败只告警不阻断发行
-    [switch]$NoGitee
+    [switch]$NoGitee,
+    # 【P2-27】应急开关：日志顶部不含本版本时默认直接失败（护栏，不是提示）
+    [switch]$SkipChangelogCheck
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -21,25 +26,85 @@ $exe  = Join-Path $rel "HuFuSetup-$Version.exe"
 $pack = 'E:\DSH-KF\hufu\发行脚本\pack.ps1'
 $setup= 'E:\DSH-KF\hufu\platform\windows\setup\build-setup.ps1'
 
-function Verify([string]$tag) {
-    Write-Host "`n—— 双产物核验（$tag）——" -ForegroundColor Cyan
-    $ok = $true
-    foreach ($f in @($zip, $exe)) {
-        if (Test-Path $f) {
-            $h = (Get-FileHash $f -Algorithm SHA256).Hash
-            Write-Host ("  [PASS] {0}  {1:N1} MB  SHA256 {2}" -f (Split-Path $f -Leaf), ((Get-Item $f).Length/1MB), $h)
-        } else {
-            Write-Host ("  [FAIL] 缺产物：{0}" -f $f) -ForegroundColor Red
-            $ok = $false
-        }
-    }
-    if (-not $ok) {
-        Write-Host '════ 发行未完成（zip + exe 缺一不可）════' -ForegroundColor Red
-        exit 1
-    }
-    Write-Host '════ 发行完成：双产物齐 ════' -ForegroundColor Green
+# 【P2-27 2026-11-04】核验升级：原来 -VerifyOnly 只查「文件在不在 + 哈希」，
+# 版本号写错、zip 里装的是上一版、装了个空壳 exe 都验不出来（护栏只是提示）。
+# 现在逐项判死：任何一项不过 → exit 1（非零退出，CI/人工都挡得住）。
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$script:verifyFail = 0
+function VCheck($ok, [string]$what) {
+    if ($ok) { Write-Host ("  [PASS] " + $what) -ForegroundColor Green }
+    else { $script:verifyFail++; Write-Host ("  [FAIL] " + $what) -ForegroundColor Red }
+    $ok
 }
 
+function Verify([string]$tag) {
+    Write-Host "`n—— 双产物核验（$tag）——" -ForegroundColor Cyan
+    $script:verifyFail = 0
+    $zipVer = ''
+    # ── 1) zip 线 ──
+    if (-not (Test-Path $zip)) {
+        [void](VCheck $false "缺产物：$zip")
+    } else {
+        $zi = Get-Item $zip
+        $zh = (Get-FileHash $zip -Algorithm SHA256).Hash
+        [void](VCheck ($zi.Length -gt 10MB) ("{0}  {1:N1} MB  SHA256 {2}" -f $zi.Name, ($zi.Length/1MB), $zh))
+        try {
+            $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
+            $names = @($za.Entries | ForEach-Object { $_.FullName })
+            foreach ($need in @('hufu-server.exe','hufu_tsf.dll','install.ps1','hufu-render-helper.exe')) {
+                [void](VCheck ($names -contains $need) "zip 内 $need")
+            }
+            $ve = $za.Entries | Where-Object { $_.FullName -eq 'version.txt' } | Select-Object -First 1
+            if ($ve) {
+                $sr = New-Object System.IO.StreamReader($ve.Open()); $zipVer = $sr.ReadToEnd().Trim(); $sr.Close()
+            }
+            [void](VCheck ($zipVer -eq $Version) "zip 内 version.txt = '$zipVer'（应为 $Version）")
+            # 关键指纹：zip 内 install.ps1 必须与仓内单一事实源逐字节一致（漂移检出）
+            $repoInst = 'E:\DSH-KF\hufu\platform\windows\install\install.ps1'
+            $ie = $za.Entries | Where-Object { $_.FullName -eq 'install.ps1' } | Select-Object -First 1
+            if ((Test-Path $repoInst) -and $ie) {
+                $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("hufu-verify-" + [guid]::NewGuid().ToString('N') + ".ps1")
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($ie, $tmp, $true)
+                $h1 = (Get-FileHash $tmp -Algorithm SHA256).Hash
+                $h2 = (Get-FileHash $repoInst -Algorithm SHA256).Hash
+                Remove-Item $tmp -Force -EA SilentlyContinue
+                [void](VCheck ($h1 -eq $h2) "zip 内 install.ps1 = 仓内单一事实源（SHA256 $($h1.Substring(0,12))…）")
+            } else {
+                Write-Host '  [SKIP] 仓内 install.ps1 不在（他机校验）——跳过脚本指纹比对' -ForegroundColor Yellow
+            }
+            $za.Dispose()
+        } catch {
+            [void](VCheck $false "zip 打不开/条目异常：$($_.Exception.Message)")
+        }
+    }
+    # ── 2) exe 线 ──
+    if (-not (Test-Path $exe)) {
+        [void](VCheck $false "缺产物：$exe")
+    } else {
+        $ei = Get-Item $exe
+        $eh = (Get-FileHash $exe -Algorithm SHA256).Hash
+        [void](VCheck ($ei.Length -gt 10MB) ("{0}  {1:N1} MB  SHA256 {2}" -f $ei.Name, ($ei.Length/1MB), $eh))
+        $pv = ([string]$ei.VersionInfo.ProductVersion).Trim()
+        [void](VCheck ($pv -eq $Version -or $pv -eq "$Version.0") "安装包版本资源 = '$pv'（应为 $Version）")
+        if ($zipVer) { [void](VCheck ($pv -eq $zipVer -or $pv -eq "$zipVer.0") "双产物同版：zip version.txt='$zipVer' / exe='$pv'") }
+        # 侧车哈希（打包机若写了 *.sha256，必须与实测一致）
+        $sc = "$exe.sha256"
+        if (Test-Path $sc) {
+            $want = (((Get-Content $sc -TotalCount 1) -split '\s+')[0]).Trim().ToUpper()
+            [void](VCheck ($want -eq $eh) "SHA256 侧车一致（$(Split-Path $sc -Leaf)）")
+        }
+    }
+    if ($script:verifyFail -gt 0) {
+        Write-Host ("════ 发行未完成：$($script:verifyFail) 项核验未过（zip + exe 缺一不可）════") -ForegroundColor Red
+        exit 1
+    }
+    Write-Host '════ 核验全绿：双产物齐 + 版本号/指纹一致 ════' -ForegroundColor Green
+}
+
+if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+    Write-Host "✗ 版本号格式应为 x.y.z 或 x.y.z.w，收到：$Version" -ForegroundColor Red
+    exit 1
+}
 if ($VerifyOnly) { Verify '仅校验'; exit 0 }
 
 # ── 1) zip 线（pack.ps1 红线不改，原样调用） ──
@@ -53,7 +118,14 @@ if (Test-Path $changelog) {
     $first = (Get-Content $changelog -TotalCount 1 -Encoding UTF8)
     Write-Host "  已同步，当前最新条目：$first"
     if ($first -notmatch [regex]::Escape($Version)) {
-        Write-Host "  [警告] 日志顶部条目不含本版本 $Version——是否忘了写更新日志？" -ForegroundColor Yellow
+        # 【P2-27 2026-11-04】护栏从「提示」改成「失败」：v1.8.7 曾整版漏写随包
+        # 更新日志，黄字警告没人看见就发出去了。默认直接非零退出。
+        if (-not $SkipChangelogCheck) {
+            Write-Host "  [FAIL] 日志顶部条目不含本版本 $Version——先写更新日志再发行（v1.8.7 事故防线）" -ForegroundColor Red
+            Write-Host "         修法：在 $changelog 顶部加一行「$(Get-Date -Format 'yyyy-MM-dd')  v$Version …」，或应急加 -SkipChangelogCheck" -ForegroundColor Yellow
+            exit 1
+        }
+        Write-Host "  [警告] 日志顶部条目不含本版本 $Version——已按 -SkipChangelogCheck 放行（应急，发行报告需说明）" -ForegroundColor Yellow
     }
 } else {
     Write-Host '  [警告] 仓内无更新日志主副本，沿用打包源现有版' -ForegroundColor Yellow

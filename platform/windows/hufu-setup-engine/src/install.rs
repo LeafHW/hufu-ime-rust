@@ -856,6 +856,23 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
     let _ = acl::grant_all_app_packages(&sysdll, false);
     // install.ps1 L102
     out.line("OK DLL → SystemIME");
+    // 【P1-13 2026-11-04】渲染小助手随 DLL 同道进 SystemIME：server 侧
+    // /next 实时框只探测 D:\HuFu\ 与 C:\Windows\SystemIME\HuFu\ 两处
+    // （hufu-server/src/main.rs ssf_render_inner）。缺它回退 PowerShell
+    // 驱动（2~3s 出图）。属提速件：拷贝失败只播报，不中止安装。
+    let helper_src = inst.join("hufu-render-helper.exe");
+    let helper_dst = sysdir.join("hufu-render-helper.exe");
+    if !helper_src.exists() {
+        out.line("· 未找到 hufu-render-helper.exe（实时框回退 PowerShell 驱动，功能不受影响）");
+    } else if copy_dll_with_old_fallback(out, &helper_src, &helper_dst, false) {
+        let _ = acl::grant_all_app_packages(&helper_dst, false);
+        out.line("OK 渲染小助手 → SystemIME");
+    } else {
+        out.line(&format!(
+            "· 渲染小助手未就位：{}（实时框回退 PowerShell 驱动，功能不受影响）",
+            path_str(&helper_dst)
+        ));
+    }
 
     // install.ps1 L103-129：── 32 位宿主支持（WoW64：跟打器等 32 位进程）──
     // 32 位进程 COM 查找：HKCU（无重定向）失败后回退 HKLM 32 位视图（WOW6432Node）→

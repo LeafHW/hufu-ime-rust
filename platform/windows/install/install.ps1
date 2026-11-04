@@ -100,6 +100,23 @@ if ($PhaseElevated) {
     icacls $sysdir /grant 'ALL APPLICATION PACKAGES:(OI)(CI)RX' | Out-Null
     icacls $sysdll /grant 'ALL APPLICATION PACKAGES:RX' | Out-Null
     Write-Host 'OK DLL → SystemIME'
+    # 【P1-13 2026-11-04】渲染小助手与 DLL 同道进 SystemIME：server 侧
+    # /next 实时框只探测 C:\Windows\SystemIME\HuFu\hufu-render-helper.exe
+    # （hufu-server/src/main.rs ssf_render_inner）；缺它回退 PowerShell 驱动
+    # （2~3s 出图，用户实锤「生效慢」）。属提速件：缺失只提示不中断安装。
+    $sysHelper = Join-Path $sysdir 'hufu-render-helper.exe'
+    $helperSrc = Join-Path $inst 'hufu-render-helper.exe'
+    if (Test-Path $helperSrc) {
+        try {
+            Copy-Item $helperSrc $sysHelper -Force
+            icacls $sysHelper /grant 'ALL APPLICATION PACKAGES:RX' | Out-Null
+            Write-Host 'OK 渲染小助手 → SystemIME'
+        } catch {
+            Write-Host "（渲染小助手拷贝失败：$($_.Exception.Message)——实时框将回退 PowerShell 驱动）" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host '（未找到 hufu-render-helper.exe——实时框将回退 PowerShell 驱动）' -ForegroundColor Yellow
+    }
     # ── 32 位宿主支持（WoW64：跟打器等 32 位进程）──
     # 32 位进程无法加载 x64 COM DLL；COM 查找顺序 HKCU（无重定向）
     # 失败后回退 HKLM 32 位视图（WOW6432Node）→ 命中 32 位 DLL。

@@ -110,6 +110,9 @@ Source: "staging\hufu_tsf.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-tsf-smoke.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\TigerClaw.Sentence.Native.dll"; DestDir: "{app}"; Flags: ignoreversion
+; 【P1-13 2026-11-04】渲染小助手随包落地；进 PEFiles 后同时享受
+; 「腾位」与「断流终检」（被 server 拉起的实例会锁文件，升级需先腾位）
+Source: "staging\hufu-render-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; 【0 PowerShell 2026-10-21】Rust 轨不再安装任何 .ps1：安装/卸载/开机清理
 ; 全由 hufu-setup-engine 承担（zip 绿色包另有一套脚本，那条线不受影响）。
 #ifndef RUST_ENGINE
@@ -141,7 +144,7 @@ Source: "staging\hufu-files-upgrade.lst"; DestDir: "{tmp}"; Flags: deleteafterin
 const
   CLSID = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}';
   PROFILEGUID = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}';
-  PEFiles = 'hufu-server.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,TigerClaw.Sentence.Native.dll';
+  PEFiles = 'hufu-server.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,TigerClaw.Sentence.Native.dll,hufu-render-helper.exe';
 
 var
   UpgradeMode: Boolean;

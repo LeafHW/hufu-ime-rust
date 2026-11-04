@@ -1,4 +1,4 @@
-﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel)
+﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel, [switch]$PreflightOnly)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
@@ -32,9 +32,14 @@ $zipName = if ($NoModel) { "HuFu虎符输入法-v$Version-无模型.zip" } else 
 $zip = "$REL\$zipName"
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $report = @()
+# 【P1-16 2026-11-04】核验失败计数器：任何一处 Check 失败都累加 $script:failN，
+# 收尾统一判死并销毁产物。此前大量哨兵写成 [void](Check ...)，只打红字不进
+# $all —— 出厂哨兵/皮肤挂件/小包任一项失败，正式 zip 照样落盘发布；末段
+# 小包核验失败甚至只打黄字「产物保留供人工检查」。
+$script:failN = 0
 function Check($ok, [string]$what) {
     $script:report += "$(if ($ok) {'[PASS]'} else {'[FAIL]'}) $what"
-    if (-not $ok) { Write-Host "[FAIL] $what" -ForegroundColor Red } else { Write-Host "[PASS] $what" -ForegroundColor Green }
+    if (-not $ok) { $script:failN++; Write-Host "[FAIL] $what" -ForegroundColor Red } else { Write-Host "[PASS] $what" -ForegroundColor Green }
     $ok
 }
 
@@ -129,6 +134,52 @@ foreach ($bf in @('卸载.bat', '安装.bat', '设置.bat')) {
     if ($lfOnly -gt 0) { throw "$bf 有 $lfOnly 个 LF-only 行尾：cmd 会解析碎行（转 CRLF）" }
 }
 
+# ── 0b) 设置页 dist 强制重建 + 指纹（2026-11-04 · P1-11）──────────────
+# 事故链：settings-app/dist 被 .gitignore:5 排除（干净 clone 里根本没有），
+# release.ps1/pack.ps1 也从未 npm run build；hufu-server/build.rs 只把「cargo
+# 编译那一瞬间磁盘上存在的 dist」include_str! 进 exe —— 干净 clone 出包
+# NEXT_INDEX 为空，/next 404、设置页回落 278KB 旧页。修法：server 编译前
+# 无条件重建 dist（缺 npm/缺 node_modules/构建非 0 一律停发），编译后按
+# 资产名 + index.html 全文做内嵌校验（等价 /api/about 的 ui_build 口径）。
+$appDir  = 'E:\DSH-KF\hufu\settings-app'
+$distDir = Join-Path $appDir 'dist'
+if (-not (Test-Path (Join-Path $appDir 'package.json'))) { throw "设置页源码缺失：$appDir" }
+if (-not (Test-Path (Join-Path $appDir 'node_modules'))) {
+    throw "settings-app 缺 node_modules（$appDir）——先 npm ci 再打包（dist 必须本地重建，不能靠仓库现成产物）"
+}
+$npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
+if (-not $npmCmd) { throw '找不到 npm（Node.js 未装或不在 PATH）——设置页 dist 无法重建，禁止出包' }
+Write-Host '—— 设置页构建（npm run build）——'
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'   # npm 把进度写 stderr，Stop 模式下会被当异常抛出
+Push-Location $appDir
+& $npmCmd.Source run build 2>&1 | ForEach-Object { Write-Host "  $_" }
+$distExit = $LASTEXITCODE
+Pop-Location
+$ErrorActionPreference = $prevEap
+if ($distExit -ne 0) { throw "设置页构建失败（npm run build 退出码 $distExit）——禁止出包" }
+$distIndex = Join-Path $distDir 'index.html'
+if (-not (Test-Path $distIndex)) { throw "设置页构建产物缺失：$distIndex" }
+$distIndexText = [System.IO.File]::ReadAllText($distIndex, [System.Text.Encoding]::UTF8)
+if ($distIndexText.Length -lt 1000) { throw "dist/index.html 体积异常（$($distIndexText.Length) 字符）" }
+# 资产名核验：index.html 引用的 /assets/* 必须逐个落在 dist\assets
+$distAssets = @([regex]::Matches($distIndexText, '(?:src|href)="/assets/([^"]+)"') |
+    ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+if ($distAssets.Count -lt 2) { throw "dist/index.html 资产引用异常（$($distAssets.Count) 个；应含 js+css）" }
+foreach ($a in $distAssets) {
+    if (-not (Test-Path (Join-Path $distDir ("assets\" + $a)))) { throw "dist 资产缺失：assets\$a（index.html 引用但磁盘没有）" }
+}
+# ui_build = /api/about 同口径（main.rs ui_build_fp）：sha256(内嵌 index.html) 前 16 hex
+$uiBuild = (Get-FileHash $distIndex -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
+Write-Host "  · ui_build（/api/about 口径）= $uiBuild；资产：$($distAssets -join ', ')" -ForegroundColor Cyan
+if ($PreflightOnly) {
+    [void](Check $true "设置页 dist 重建（资产 $($distAssets.Count) 个，ui_build=$uiBuild）")
+    if (Test-Path $LOGD) { $report | Out-File "$LOGD\preflight-$stamp-OK.txt" -Encoding UTF8 }
+    Write-Host '★ 仅前置（-PreflightOnly）：脚本断言 + 设置页 dist 重建通过；未构建、未打包' -ForegroundColor Cyan
+    exit 0
+}
+
 # ── 1) 同步最新二进制 ──
 # 【2026-09-07 发布瘦身】打包专用瘦身构建：独立 target-slim 目录 +
 # profile 环境变量覆盖（DEBUG=0/STRIP=symbols——DLL 11.8→0.84MB，
@@ -180,18 +231,24 @@ if ($settingsExeTime -lt $settingsSrcNewest) {
 
 $env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\engine\target-slim'
 Push-Location 'E:\DSH-KF\hufu\engine'
-cmd /c 'cargo build --release -p hufu-server 2>&1' | ForEach-Object { Write-Host "  $_" }
+# 【P1-13 2026-11-04】hufu-render-helper（SSF 实时框出图小助手）与本线
+# 一起构建：此前 pack/setup 都不复制它，server 侧只能用 PowerShell+Add-Type
+# 回退驱动（2~3s 出图，用户实锤「生效慢」）。单 crate、零外部依赖，增量秒级。
+cmd /c 'cargo build --release -p hufu-server -p hufu-render-helper 2>&1' | ForEach-Object { Write-Host "  $_" }
 $code = $LASTEXITCODE
 Pop-Location
 Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_PROFILE_RELEASE_DEBUG, Env:CARGO_PROFILE_RELEASE_STRIP
-if ($code -ne 0) { throw '瘦身构建失败: hufu-server' }
+if ($code -ne 0) { throw '瘦身构建失败: hufu-server / hufu-render-helper' }
 Write-Host '  [OK] 瘦身构建完成'
 $copies = @(
     @('E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf.dll')),
     @('E:\DSH-KF\hufu\platform\windows\target-slim\i686-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf32.dll')),
     @('E:\DSH-KF\hufu\engine\target-slim\release\hufu-server.exe', (Join-Path $SRC 'hufu-server.exe')),
     @('E:\DSH-KF\hufu\platform\windows\target-slim\release\hufu-tsf-smoke.exe', (Join-Path $SRC 'hufu-tsf-smoke.exe')),
-    @('E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe', (Join-Path $SRC 'hufu-settings.exe'))
+    @('E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe', (Join-Path $SRC 'hufu-settings.exe')),
+    # 【P1-13】server 侧探测 C:\Windows\SystemIME\HuFu\hufu-render-helper.exe
+    # （main.rs ssf_render_inner），安装器负责拷进 SystemIME；zip 里必须带。
+    @('E:\DSH-KF\hufu\engine\target-slim\release\hufu-render-helper.exe', (Join-Path $SRC 'hufu-render-helper.exe'))
 )
 foreach ($c in $copies) {
     if (Test-Path $c[0]) { Copy-Item $c[0] $c[1] -Force; [void](Check $true "同步 $($c[1].Split([char]92)[-1])") }
@@ -215,6 +272,22 @@ if ((Test-Path $embedPy) -and (Test-Path $icoPath)) {
     }
 } else {
     [void](Check $false 'embed-icon.py 或 hufu.ico 缺失，跳过图标嵌入')
+}
+
+# 【P1-11 门禁 · exe 内嵌校验 2026-11-04】此刻 hufu-server.exe 已定型（复制
+# + 图标重写完毕）：把本轮 dist/index.html 全文当子串在 exe 里查，命中即证明
+# cargo 编译期 include_str! 嵌进去的就是这份（等价 /api/about 的 ui_build 与
+# 仓库 dist 同口径）。旧 exe / 旧 dist 的资产名不同，必然漏。
+$srvPkg = Join-Path $SRC 'hufu-server.exe'
+$srvProbe = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($srvPkg))
+[void](Check ($srvProbe.IndexOf($distIndexText, [StringComparison]::Ordinal) -ge 0) "hufu-server.exe 内嵌设置页 = 本轮 dist/index.html（ui_build=$uiBuild）")
+foreach ($a in $distAssets) {
+    [void](Check ($srvProbe.IndexOf($a, [StringComparison]::Ordinal) -ge 0) "hufu-server.exe 内嵌资产名 $a")
+}
+$srvProbe = $null
+if ($script:failN -gt 0) {
+    if (Test-Path $LOGD) { $report | Out-File "$LOGD\pack-$stamp-FAIL.txt" -Encoding UTF8 }
+    throw '设置页 dist 未进入 hufu-server.exe（内嵌校验失败）——禁止出包'
 }
 
 # 【2026-11-02】version.txt = 安装包唯一版本源（server /api/about 与检查更新都读它）。
@@ -439,11 +512,6 @@ $cfgChk = Get-Content "$SRC\数据\config.json" -Raw -Encoding UTF8 | ConvertFro
 # 用户定稿）——出厂 config 若显式写值必须与代码默认一致；曾带旧值 Switch
 # 出包把默认盖回跟随（config 序列化值优先于代码默认）。
 [void](Check ($cfgChk.general.caps_action -eq 'Caps') 'config 出厂哨兵: general.caps_action=Caps（锁定大写）')
-# 【皮肤出厂哨兵 2026-10-02b】默认皮肤 hilite_on 必须为 true（用户
-# 拍板：高亮默认开）。曾随 config 同路泄漏——live 验证「关」效果时
-# 设置页写回 chenwu/moyan 皮肤，真机镜像又带回包。
-$skinChk = Get-Content "$SRC\数据\皮肤\hufu-chenwu.json" -Raw -Encoding UTF8 | ConvertFrom-Json
-[void](Check ($skinChk.material.hilite_on -eq $true) '皮肤出厂哨兵: 默认皮肤 hufu-chenwu hilite_on=true')
 $left = @(Get-ChildItem "$SRC" -Recurse -Filter 'user-adjust.log' -File -EA SilentlyContinue)
 if ($left.Count -gt 0) { throw "学习数据剔除失败：仍存在 $($left.Count) 个 user-adjust.log" }
 
@@ -496,6 +564,13 @@ if ($liveSkin -and (Test-Path $liveSkin)) {
 } else {
     Write-Host '  [跳过] 真机未安装——沿用打包源现有皮肤镜像' -ForegroundColor Yellow
 }
+
+# 【皮肤出厂哨兵 2026-10-02b】【P2-26 2026-11-04 移动】默认皮肤 hilite_on 必须
+# 为 true（用户拍板：高亮默认开）。原位置在 1b) 码表段、1c) 真机皮肤镜像**之前**
+# ——镜像会整目录覆盖 数据\皮肤\hufu-chenwu.json，哨兵查完就作废（前半秒的通过
+# 毫无意义）。移到镜像合并之后，才是真正的出厂值。
+$skinChk = Get-Content "$SRC\数据\皮肤\hufu-chenwu.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+[void](Check ($skinChk.material.hilite_on -eq $true) '皮肤出厂哨兵: 默认皮肤 hufu-chenwu hilite_on=true')
 
 # ── 2) 停服压缩 ──
 # 【2026-09-07 腾位断链法】此前「杀 6 轮」不可靠：ctfmon 被系统秒拉、
@@ -677,6 +752,10 @@ foreach ($n in @('hufu_tsf.dll','hufu_tsf32.dll','hufu-server.exe','hufu-tsf-smo
     $all = (Check ($arc.Entries.FullName -contains $n) "包内 $n") -and $all
 }
 $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '数据[/\\]config\.json$' })) '包内 数据\config.json') -and $all
+# 【P1-13】渲染小助手体积门禁：0 字节/占位件也算「在包」，server 会静默回退
+# PowerShell 驱动（用户只感到慢）。release 产物实测 ~355KB。
+$eRh = $arc.Entries | Where-Object { $_.FullName -eq 'hufu-render-helper.exe' } | Select-Object -First 1
+$all = (Check ($null -ne $eRh -and $eRh.Length -gt 50000) "渲染小助手 hufu-render-helper.exe（$(if ($eRh) { [math]::Round($eRh.Length/1KB,0) } else { 0 })KB > 50KB）") -and $all
 # 【2026-10-18 反查瘦身】全局资源：拼音反查只发全拼基表（码列空格
 # 分隔音节）；自然码/小鹤双拼装载期规则派生，实表不得在包内。
 $all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\]全拼\.txt$' }).Count -eq 1) '拼音反查 全拼基表') -and $all
@@ -817,12 +896,24 @@ foreach ($n in @('hufu_tsf.dll','hufu-server.exe')) {
 $sv.Dispose()
 $sz = Get-Item $szip
 $svAll = (Check ($sz.Length -lt 60MB) "小包体积 $([math]::Round($sz.Length/1MB,2))MB < 60MB") -and $svAll
-if (-not $svAll) {
-    Write-Host "✗ 无模型小包核验未全绿（产物保留供人工检查）: $szip" -ForegroundColor Yellow
-} else {
+# 【P1-16 2026-11-04】不再「黄字保留产物」：失败已由 Check 计入 $failN，
+# 收尾闸会销毁产物并 throw（退出码非 0）。此处只报成功一行。
+if ($svAll) {
     Write-Host "★ 无模型小包: $szip（$([math]::Round($sz.Length/1MB,2))MB）" -ForegroundColor Cyan
 }
 } # end if (-not $NoModel)
+
+# ── 8) 收尾闸：全量核验失败数（P1-16）────────────────────────────────
+# 任何一项 Check 失败（含所有 [void](Check ...) 哨兵）都在 $script:failN 累计；
+# 走到这里仍非 0 = 皮囊没过，一律销毁产物 + throw（非 0 退出），不留「带病
+# 落盘」的正式 zip。此前 FAIL 只打红字，正式包照样发布。
+if ($script:failN -gt 0) {
+    $dead = @($zip, $szip) | Where-Object { $_ -and (Test-Path $_) }
+    foreach ($d in $dead) { Remove-Item $d -Force -EA SilentlyContinue }
+    $report += "核验失败 $($script:failN) 项 → 产物已销毁：$(($dead | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')"
+    if (Test-Path $LOGD) { $report | Out-File "$LOGD\pack-$stamp-FAIL.txt" -Encoding UTF8 }
+    throw "核验失败 $($script:failN) 项：产物已销毁（报告 日志\pack-$stamp-FAIL.txt）"
+}
 
 $report | Out-File "$LOGD\pack-$stamp-OK.txt" -Encoding UTF8
 

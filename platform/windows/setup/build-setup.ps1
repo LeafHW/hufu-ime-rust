@@ -55,6 +55,11 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { Fail("版本号格式应为 
 $needFromPkg = @(
     'hufu-server.exe','hufu-tsf-smoke.exe','hufu-settings.exe','WebView2Loader.dll',
     'hufu_tsf.dll','hufu_tsf32.dll',
+    # 【P1-13 2026-11-04】SSF 实时框出图小助手：server 侧只探测
+    # D:\HuFu\ 与 C:\Windows\SystemIME\HuFu\ 两处；exe 轨由
+    # hufu-setup-engine 在提权阶段与 DLL 同事务拷进 SystemIME。
+    # 打包源缺它 = Fail（此前两份复制清单都没有它，发出去的包装不上）。
+    'hufu-render-helper.exe',
     'TigerClaw.Sentence.Native.dll','install.ps1','uninstall.ps1','设置.bat',
     '更新日志.txt','图标.ico'
 )
@@ -80,6 +85,13 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 
 # 程序文件（进卸载日志）
 foreach ($f in $needFromPkg) { Copy-Item (Join-Path $PkgSource $f) $staging -Force }
+# 【P1-13 门禁】渲染小助手必须真实落地且体积合理（0 字节/占位件 = server
+# 静默回退 PowerShell 驱动，用户只感到慢）。release 产物实测 ~355KB。
+$stagedHelper = Join-Path $staging 'hufu-render-helper.exe'
+if (-not (Test-Path $stagedHelper)) { Fail('staging 缺 hufu-render-helper.exe（P1-13：打包源未带渲染小助手）') }
+$helperLen = (Get-Item $stagedHelper).Length
+if ($helperLen -lt 50000) { Fail("hufu-render-helper.exe 体积异常：$helperLen B（< 50KB）") }
+Ok("渲染小助手已入 staging：$([math]::Round($helperLen/1KB,0))KB")
 if (Test-Path "$PkgSource\licenses") { Copy-Item "$PkgSource\licenses" "$staging\licenses" -Recurse -Force }
 if (Test-Path "$PkgSource\使用说明.txt") { Remove-Item "$staging\使用说明.txt" -Force -ErrorAction SilentlyContinue }
 Copy-Item $readmeSetup.FullName "$staging\使用说明.txt" -Force

@@ -4,7 +4,9 @@
 
 # 虎符输入法 · Linux 安装
 #
-# 系统级：fcitx5 addon（/usr/lib/fcitx5/libhufu.so + /usr/share/fcitx5/{addon,inputmethod}/hufu.conf）
+# 系统级：fcitx5 addon（落点与 hufu-addon/CMakeLists.txt 同口径：FCITX_INSTALL_ADDONDIR
+#         优先，否则 GNUInstallDirs 的 libdir → /usr/lib/fcitx5 或 /usr/lib64/fcitx5）
+#         + /usr/share/fcitx5/{addon,inputmethod}/hufu.conf
 # 用户级：hufu-server（~/.local/bin）+ 数据（~/.local/share/hufu）+ systemd user 服务 + 设置入口
 #
 # 默认数据/资源来源 = 仓库 assets/（自足，无需外部下载；模型除外）；
@@ -46,6 +48,37 @@ DATA_DIR="$HUFU_ROOT/数据"
 # $XDG_DATA 下面。XDG_BIN_HOME 不是规范变量（systemd 不认），设了才用，属于零成本兼容。
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 BUILD_DIR="$ROOT/platform/linux/build"
+
+# ── fcitx5 addon 落点：与 hufu-addon/CMakeLists.txt:47-55 同一口径 ──────────
+# 此前这里（以及下面的 --no-system 提示）硬编码 /usr/lib/fcitx5，而 CMake 侧
+# 早已跟随 FCITX_INSTALL_ADDONDIR / GNUInstallDirs 自适应：lib64 发行版
+# （Fedora/openSUSE/Arch 多架构）会把 .so 装进 /usr/lib64/fcitx5 —— fcitx5
+# 根本不扫描那个硬编码目录，表现为「装完输入法列表里没有虎符」。
+# 解析顺序：① 环境变量 FCITX_INSTALL_ADDONDIR（发行版真值，与 CMake 同源）
+#          ② 构建目录里 CMake 生成的 cmake_install.cmake 里本次真实 DESTINATION
+#          ③ 都拿不到时按 GNUInstallDirs 惯例推断（/usr/lib64 存在且 /usr/lib 不存在）
+resolve_addon_dir() {
+    if [[ -n "${FCITX_INSTALL_ADDONDIR:-}" ]]; then
+        printf '%s\n' "$FCITX_INSTALL_ADDONDIR"
+        return 0
+    fi
+    local ci="$BUILD_DIR/cmake_install.cmake" dest=""
+    if [[ -f "$ci" ]]; then
+        dest="$(sed -n 's/.*DESTINATION "\([^"]*\/fcitx5\)".*/\1/p' "$ci" | head -1)"
+        if [[ -n "$dest" ]]; then
+            dest="$(printf '%s' "$dest" | sed 's/\${CMAKE_INSTALL_PREFIX}//')"   # 去掉前缀变量
+            if [[ "$dest" == /* ]]; then dest="/usr$dest"; fi   # 本仓库固定 -DCMAKE_INSTALL_PREFIX=/usr
+            printf '%s\n' "$dest"
+            return 0
+        fi
+    fi
+    if [[ -d /usr/lib64/fcitx5 && ! -d /usr/lib/fcitx5 ]]; then
+        printf '/usr/lib64/fcitx5\n'
+    else
+        printf '/usr/lib/fcitx5\n'
+    fi
+}
+ADDON_DIR="$(resolve_addon_dir)"
 
 # 防呆：整个脚本不要用 sudo 跑——用户级部分会装进 /root（systemd user 服务
 # 也会因 root 无用户会话被跳过）。系统级 addon 由脚本内部单独调 sudo。
@@ -418,8 +451,8 @@ install_user() {
 
 # ── 5) 系统级安装（fcitx5 addon） ──────────────────────────────────────────
 install_system() {
-    say '⑥ 安装 fcitx5 addon（需要 sudo）'
-    run sudo install -Dm755 "$ADDON_SO" /usr/lib/fcitx5/libhufu.so
+    say "⑥ 安装 fcitx5 addon（需要 sudo）→ $ADDON_DIR"
+    run sudo install -Dm755 "$ADDON_SO" "$ADDON_DIR/libhufu.so"
     run sudo install -Dm644 "$ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf" \
         /usr/share/fcitx5/addon/hufu.conf
     run sudo install -Dm644 "$ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf" \
@@ -434,7 +467,7 @@ install_system() {
         || die '/usr/share/fcitx5/addon/hufu.conf 内容异常'
     grep -q '^\[InputMethod\]' /usr/share/fcitx5/inputmethod/hufu.conf \
         || die '/usr/share/fcitx5/inputmethod/hufu.conf 内容异常（被覆盖？）'
-    ok '/usr/lib/fcitx5/libhufu.so + /usr/share/fcitx5/{addon,inputmethod}/hufu.conf'
+    ok "$ADDON_DIR/libhufu.so + /usr/share/fcitx5/{addon,inputmethod}/hufu.conf"
 }
 
 # ── 装后校验：按台账逐项核对落盘文件 ──────────────────────────────────────
@@ -524,7 +557,7 @@ if [[ "$NO_SYSTEM" == 0 ]]; then
     install_system
 else
     say '⑥ 跳过系统级 addon 安装（--no-system）'
-    echo "  之后执行：sudo install -Dm755 $ADDON_SO /usr/lib/fcitx5/libhufu.so"
+    echo "  之后执行：sudo install -Dm755 $ADDON_SO $ADDON_DIR/libhufu.so"
     echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.addon.conf /usr/share/fcitx5/addon/hufu.conf"
     echo "            sudo install -Dm644 $ROOT/platform/linux/hufu-addon/conf/hufu.inputmethod.conf /usr/share/fcitx5/inputmethod/hufu.conf"
 fi
