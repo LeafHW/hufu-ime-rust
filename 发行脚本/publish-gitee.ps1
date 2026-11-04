@@ -1,4 +1,4 @@
-﻿# publish-gitee.ps1 - 把发版产物同步到 Gitee（镜像仓 Release 附件 + 更新清单）
+# publish-gitee.ps1 - 把发版产物同步到 Gitee（镜像仓 Release 附件 + 更新清单）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File E:\DSH-KF\hufu\发行脚本\publish-gitee.ps1 -Version 1.9.9
@@ -144,7 +144,7 @@ if (-not $Release) {
         access_token     = $Token
         tag_name         = $Tag
         name             = "HuFu 虎符输入法 $Tag"
-        body             = "国内加速分发（镜像自 GitHub Releases）。安装包见下方附件。`n`n整句模型（约 525 MB，可选）在 ModelScope 单独下载（国内直连、免登录）：`nhttps://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false"
+        body             = "国内加速分发（镜像自 GitHub Releases）。安装包见下方附件。`n`n整句模型（约 525 MB，可选）在 ModelScope 单独下载（国内直连、免登录）：[点此下载 模型.rar](https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false)`n`n模型仓库页：[ModelScope · hufu-ime](https://www.modelscope.cn/models/leafyin/hufu-ime)"
         target_commitish = 'master'
     }
     $Release = Invoke-RestMethod -Method Post -Uri "$Api/$Repo/releases" -Body $body -TimeoutSec 60
