@@ -47,8 +47,11 @@
 .mo-live.on{color:var(--gold);border-color:rgba(231,183,92,.45);background:var(--gold-soft)}
 
 /* stage -------------------------------------------------------------- */
+/* 【2026-11-04】高度钉死：演示内容（迷你候选窗行高随字号切换）不再参与卡片的
+   高度计算，避免每轮演示把 grid 行高/整页内容顶动造成说明卡子像素级抖动。
+   高度由 Motion.tsx 实测一次后通过 --mo-stage-h 下发（换皮肤/字号会重量）。 */
 .mo-stage{
-  flex:1;min-height:136px;border-radius:10px;border:1px solid var(--line);
+  flex:none;height:var(--mo-stage-h,200px);border-radius:10px;border:1px solid var(--line);
   background:
     radial-gradient(130% 150% at 50% -10%,rgba(231,183,92,.075),transparent 62%),
     var(--bg);

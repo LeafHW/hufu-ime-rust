@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
 import { MotionDemo } from '../components/MotionDemo';
 import { skinTokens, withAlpha, type SkinTokens } from '../skinTokens';
@@ -283,6 +283,46 @@ export function MotionPage({
   const screenActive = useScreenActive('motion');
   const tokens = useMemo(() => skinTokens(data.skin), [data.skin]);
 
+  /* 【2026-11-04 抖动修复】演示舞台固定高度。
+     原来 .mo-stage 用 flex:1 跟随演示内容，而演示里的迷你候选窗每 1.5~2.3 秒
+     切换选中项时行高会以子像素级变化（LayoutUnit 1/64px），把 grid 行高、
+     整页内容高度一起带着抖——滚到底看说明卡时，整段文字每轮都重采样一次，
+     肉眼就是「几秒抖一下」。现在测量一次演示内容的最大高度，把舞台钉成固定
+     px（换皮肤/换字号时按 tokens 重量一次），舞台内部怎么动都不再回流到卡片。 */
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [stageH, setStageH] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    /* 页面常驻挂载、非当前页是 display:none —— 隐藏时所有 rect 都是 0，
+       量不出高度；等 useScreenActive 变 true（真正可见）再量，且只在
+       可见态测量，避免「先量小、后量大」的一次跳变。 */
+    if (!screenActive) return;
+    const root = wrapRef.current;
+    if (!root) return;
+    const measure = () => {
+      let max = 0;
+      root.querySelectorAll<HTMLElement>('.mo-stage > *').forEach((el) => {
+        const h = el.getBoundingClientRect().height;
+        if (h > max) max = h;
+      });
+      if (max > 0) {
+        /* 13px 上下内边距 + 1px 取整余量，避免最大演示窗贴边被裁。 */
+        const next = Math.ceil(max) + 28;
+        setStageH((prev) => (prev === next ? prev : next));
+      }
+    };
+    measure();
+    /* 字体未就绪时行高会算小，字体落定后再量一次（只补一次，不做周期监听）。 */
+    const t = window.setTimeout(measure, 150);
+    let alive = true;
+    void document.fonts?.ready.then(() => {
+      if (alive) measure();
+    });
+    return () => {
+      alive = false;
+      window.clearTimeout(t);
+    };
+  }, [tokens, screenActive]);
+
   const [anim, setAnim] = useState(app.anim !== false);
   const [flash, setFlash] = useState(app.anim_flash !== false);
   const [hl, setHl] = useState(app.hl_font_scale === true);
@@ -384,7 +424,11 @@ export function MotionPage({
           </>
         }
       />
-      <div className="mo-wrap">
+      <div
+        className="mo-wrap"
+        ref={wrapRef}
+        style={stageH ? ({ '--mo-stage-h': `${stageH}px` } as React.CSSProperties) : undefined}
+      >
         <section className="card mo-hero">
           <div className="mo-hero-l">
             <div className="mo-eyebrow">MASTER</div>
