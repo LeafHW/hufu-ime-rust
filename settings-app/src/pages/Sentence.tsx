@@ -914,13 +914,13 @@ export function SentencePage({
                   <li>
                     从{' '}
                     <a
-                      href="https://github.com/LeafHW/hufu-ime-rust/releases/tag/%E6%A8%A1%E5%9E%8B"
+                      href="https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false"
                       target="_blank"
                       rel="noreferrer"
                     >
-                      GitHub 模型发布页
+                      ModelScope 模型下载页
                     </a>{' '}
-                    下载 模型.7z；
+                    下载 模型.rar（约 525 MB，国内直连、免登录）；
                   </li>
                   <li>解压后把「模型」文件夹整个复制到安装目录（与程序同级）；</li>
                   <li>切换到「虎整句」方案，模型随切换自动加载，无需重启。</li>
