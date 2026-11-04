@@ -213,6 +213,35 @@ fn write_http_port_file(port: u16) {
 #[cfg(not(windows))]
 fn write_http_port_file(_port: u16) {}
 
+/// 【2026-11-05 支持取证】启动/退出原因落盘到 %LOCALAPPDATA%\HuFu\server-start.log。
+/// GUI 子系统没有控制台，用户反馈「hufu-server 闪一下就没了」时这是唯一能拿到
+/// 原因的地方（单实例让路 / 数据目录不可写 / 引擎初始化失败 / 端口绑定结果）。
+fn log_startup(msg: &str) {
+    #[cfg(windows)]
+    {
+        let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let dir = base.join("HuFu");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("server-start.log");
+        if std::fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+            let _ = std::fs::rename(&path, dir.join("server-start.old.log"));
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{ts}] pid={} {msg}", std::process::id());
+        }
+    }
+}
+
+/// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
+const BUILD_TAG: &str = "2026-11-05b";
+
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
@@ -242,8 +271,14 @@ fn main() {
             _ => {}
         }
     }
+    log_startup(&format!(
+        "start build={BUILD_TAG} exe={:?} data={:?} port_arg={port}",
+        std::env::current_exe().ok(),
+        data_dir
+    ));
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!("数据目录不可创建: {e}");
+        log_startup(&format!("exit: data dir create failed: {e}"));
         std::process::exit(1);
     }
     // 【渲染缓存 2026-10-16】ssf-render 锁前分发拿不到 Host——数据目录
@@ -260,6 +295,7 @@ fn main() {
     #[cfg(windows)]
     if sys_win::already_running() {
         eprintln!("hufu-server 已在运行（命名互斥体命中），本实例退出");
+        log_startup("exit: already running (single-instance mutex)");
         std::process::exit(0);
     }
     #[cfg(unix)]
@@ -295,6 +331,7 @@ fn main() {
         Ok(h) => h,
         Err(e) => {
             eprintln!("引擎初始化失败: {e}");
+            log_startup(&format!("exit: engine init failed: {e}"));
             std::process::exit(1);
         }
     };
@@ -339,6 +376,7 @@ fn main() {
     if chosen_port != port {
         eprintln!("HTTP 端口 {port} 不可用（系统保留/占用），改用 {chosen_port}");
     }
+    log_startup(&format!("http listening on 127.0.0.1:{chosen_port} (preferred {port})"));
     let addr = format!("127.0.0.1:{chosen_port}");
     platform::set_http_port(chosen_port);
     write_http_port_file(chosen_port);
@@ -1233,6 +1271,11 @@ fn ssf_render_endpoint() -> Response {
 static RENDER_WARM_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn warm_render_cache_throttled() {
+    // 没有渲染小助手就整体跳过：旧实现会对每个 ssf 皮肤各拉一次 PowerShell
+    // 降级驱动，开机时满屏 PowerShell 进程（用户实锤）。
+    if render_helper_path().is_none() {
+        return;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1296,6 +1339,62 @@ fn render_fingerprint(dir: &std::path::Path, with_config: bool) -> u64 {
     h.finish()
 }
 
+/// 安装目录里的同名文件（server 与 helper/dll 同目录是最常见布局）。
+fn exe_sibling(name: &str) -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .map(|d| d.join(name))
+        .filter(|p| p.is_file())
+}
+
+/// 渲染用 TSF DLL：安装目录优先（hufu_tsf_render.dll 专供渲染、可热替换），
+/// 再回落 SystemIME 与旧默认 D:\HuFu。旧实现把 D:\HuFu 写死——装到别的
+/// 盘/目录的机器会直接找不到 DLL/helper，进而触发已废弃的 PowerShell 链。
+fn find_tsf_dll() -> Option<String> {
+    for name in ["hufu_tsf_render.dll", "hufu_tsf.dll"] {
+        if let Some(p) = exe_sibling(name) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    [
+        r"C:\Windows\SystemIME\HuFu\hufu_tsf.dll",
+        r"D:\HuFu\hufu_tsf.dll",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).is_file())
+    .map(|s| s.to_string())
+}
+
+/// 渲染小助手（**唯一**渲染路径，不再回退 PowerShell——作者明令禁止）。
+static RENDER_HELPER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn render_helper_path() -> Option<&'static std::path::PathBuf> {
+    RENDER_HELPER
+        .get_or_init(|| {
+            if let Some(p) = exe_sibling("hufu-render-helper.exe") {
+                return Some(p);
+            }
+            [
+                r"C:\Windows\SystemIME\HuFu\hufu-render-helper.exe",
+                r"D:\HuFu\hufu-render-helper.exe",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
+        })
+        .as_ref()
+}
+
+fn log_render_helper_missing() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "实时预览不可用：安装目录/SystemIME 均无 hufu-render-helper.exe（不再回退 PowerShell，符合产品要求）"
+        );
+    }
+}
+
 fn ssf_render_inner(query_id: Option<&str>) -> Response {
     // 【渲染缓存 2026-10-16】命中直返（皮肤/设置/上位未变时零渲染）。
     // None（当前上位）→ 读 config 定位皮肤目录 + config 内容进指纹；
@@ -1328,16 +1427,9 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
     }
     // 渲染专用副本优先（hufu_tsf_render.dll 不被 TSF 进程加载，可随时
     // 替换更新；hufu_tsf.dll 是注册输入法本体，被 explorer/QQ 等全进程
-    // 持有，拷不进去——只做兜底）。
-    let dll = [
-        "D:\\HuFu\\hufu_tsf_render.dll",
-        "D:\\HuFu\\hufu_tsf.dll",
-        "C:\\Windows\\SystemIME\\HuFu\\hufu_tsf.dll",
-    ]
-    .iter()
-    .find(|p| std::path::Path::new(p).is_file())
-    .map(|s| s.to_string());
-    let Some(dll) = dll else {
+    // 持有，拷不进去——只做兜底）。候选按「安装目录 → SystemIME → 旧默认
+    // D:\HuFu」顺序解析。
+    let Some(dll) = find_tsf_dll() else {
         return Response::err(404, "未找到 hufu_tsf.dll");
     };
     let stamp = std::time::SystemTime::now()
@@ -1345,87 +1437,38 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}.bmp"));
-    // 【提速 2026-10-16】优先 hufu-render-helper.exe（原生进程直调
-    // dump 导出，亚秒出图）；缺它回退 PowerShell 驱动（Add-Type 编译
-    // 1-2s + dump，总 2-3s——用户实锤「生效慢/要等一下才看到」）。
-    let helper = ["D:\\HuFu\\hufu-render-helper.exe", "C:\\Windows\\SystemIME\\HuFu\\hufu-render-helper.exe"]
-        .iter()
-        .find(|p| std::path::Path::new(p).is_file())
-        .map(|s| s.to_string());
-    if let Some(helper) = helper {
-        let ok = {
-            let mut cmd = std::process::Command::new(&helper);
-            cmd.arg(&out).arg(&dll);
-            if let Some(id) = query_id {
-                cmd.env("HUFU_SKIN_DUMP_ID", id);
-            }
-            cmd.env("HUFU_SKIN_DUMP_V2", "1")
-                .env("HUFU_TSF_SMOKE", "1")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            cmd.status().map(|s| s.success()).unwrap_or(false)
-        };
-        if ok && out.is_file() {
-            return match std::fs::read(&out) {
-                Ok(b) => {
-                    let _ = std::fs::remove_file(&out);
-                    store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
-                    Response { status: 200, content_type: "image/bmp".into(), body: b }
-                }
-                Err(_) => Response::err(500, "渲染输出读取失败"),
-            };
-        }
-        // helper 失败 → 落到 PS 驱动（降级链）
-    }
-    let ps1 = std::env::temp_dir().join(format!("hufu-ssf-render-drv-{stamp}.ps1"));
-    // 【P0-1 2026-11-03】所有变量改走进程环境（cmd.env），不再把
-    // 用户可控的皮肤 id / 临时路径内插进 PowerShell 单引号串——旧实现
-    // `if ('{rid}' ...)` 对 `'` 无防护，本机任意网页 GET 即可注入
-    // 任意 PowerShell 命令（审计 PoC 已执行）。
-    let body = format!(
-        r#"$cs = 'using System; using System.Runtime.InteropServices; public static class D {{ [DllImport(@"{dll}", CallingConvention=CallingConvention.StdCall)] public static extern int hufu_test_skin_dump(uint hold_ms); }}'
-try {{ Add-Type -TypeDefinition $cs -ErrorAction Stop }} catch {{ exit 2 }}
-try {{ $null = [D]::hufu_test_skin_dump(0) }} catch {{ exit 3 }}
-"#,
-        dll = dll,
-    );
-    if std::fs::write(&ps1, {
-        // PS5.1 无 BOM 按 ANSI 读——皮肤 id 是中文（鲸鱼娘），乱码=
-        // skin_for_render 404。带 BOM 写。
-        let mut b = vec![0xEF, 0xBB, 0xBF];
-        b.extend_from_slice(body.as_bytes());
-        b
-    })
-    .is_err()
-    {
-        return Response::err(500, "驱动脚本写入失败");
-    }
-    {
-        #[cfg(windows)]
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&ps1)
-            .env("HUFU_SKIN_DUMP", &out)
-            .env("HUFU_SKIN_DUMP_V2", "1")
-            .env("HUFU_TSF_SMOKE", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+    // 【2026-11-05 去 PowerShell】实时预览只走原生 hufu-render-helper.exe。
+    // 旧实现 helper 缺失/失败会回退「写 .ps1 + powershell.exe」驱动：开机
+    // 预热全部 ssf 皮肤时每个皮肤一个 PowerShell 进程（用户实锤），且与
+    // 「产品运行时绝不拉起 PowerShell」的既定要求冲突。现在缺 helper 直接
+    // 501、预热直接跳过，绝不再拉起 PowerShell。
+    let Some(helper) = render_helper_path() else {
+        log_render_helper_missing();
+        return Response::err(
+            501,
+            "实时预览不可用：安装目录缺少 hufu-render-helper.exe（重新运行安装程序即可）",
+        );
+    };
+    let ok = {
+        let mut cmd = std::process::Command::new(helper);
+        cmd.arg(&out).arg(&dll);
         if let Some(id) = query_id {
             cmd.env("HUFU_SKIN_DUMP_ID", id);
         }
+        cmd.env("HUFU_SKIN_DUMP_V2", "1")
+            .env("HUFU_TSF_SMOKE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
-        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
-        let _ = std::fs::remove_file(&ps1);
-        if !ok || !out.is_file() {
-            return Response::err(500, "渲染失败");
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    };
+    if !ok || !out.is_file() {
+        let _ = std::fs::remove_file(&out);
+        return Response::err(500, "渲染失败（hufu-render-helper 未产出图像）");
     }
     match std::fs::read(&out) {
         Ok(b) => {
@@ -1963,6 +2006,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({
                 "version": version,
                 "github": "https://github.com/LeafHW/hufu-ime-rust",
+                "build": BUILD_TAG,
                 "exe_dir": exe_dir.to_string_lossy(),
                 "data_dir": host.data_dir.to_string_lossy(),
                 // 【C-1】内嵌新版设置页 index.html 指纹（sha256 前 16 hex）

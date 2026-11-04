@@ -1664,6 +1664,9 @@ fn exe_dir() -> PathBuf {
 // 只要 `"version"` 就把别家本地服务认成虎符）。单端口 300ms 连接/读写
 // 超时，总预算 1.5s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
 // 完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
+/// 构建标记：同版本号重打包时用来区分新旧包（与 server 的 /api/about 同值）。
+const BUILD_TAG: &str = "2026-11-05b";
+
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
 const PROBE_PORT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -2140,8 +2143,9 @@ unsafe fn real_main() -> i32 {
     log_line(
         &args.log,
         &format!(
-            "=== hufu-settings start (pid {}) ===",
-            std::process::id()
+            "=== hufu-settings start (pid {}, build {}) ===",
+            std::process::id(),
+            BUILD_TAG
         ),
     );
     log_line(
