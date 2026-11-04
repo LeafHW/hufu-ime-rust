@@ -381,8 +381,32 @@ static PIPE_BG: std::sync::Mutex<Chan> = std::sync::Mutex::new(Chan {
     buf: Vec::new(),
 });
 
+/// 【P1-6 2026-11-04】连接失败退避截止（unix ms；0=无退避）。
+/// 病灶：server 缺席时每次 connect_pipe 都要走 CreateFileW 失败 →
+/// ensure_server（首遇）→ WaitNamedPipeW(150ms) ×2，单次调用最坏
+/// ~450ms 全在调用线程（键路径=宿主 UI 线程；ssf 坏皮取图=每帧一次）。
+/// 失败后 400ms 内直接返回 None：拉起窗口本就 >300ms，迟到的 server
+/// 最多晚 400ms 被感知（下一键立即重连）。
+static CONN_DOWN_UNTIL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// 退避时长：400ms（>WaitNamedPipe 单轮 150ms，<人眼可感的 server 迟到）
+const CONN_BACKOFF_MS: u64 = 400;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 建立新连接（含 server 缺席拉起逻辑——与旧版一致）。
 unsafe fn connect_pipe() -> Option<std::fs::File> {
+    // 【P1-6】退避窗口内零等待返回（不 CreateFile/不等待）
+    let now = now_ms();
+    let down_until = CONN_DOWN_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now < down_until {
+        return None;
+    }
     let name: Vec<u16> = PIPE.encode_utf16().chain([0]).collect();
     let mut tries = 0u32;
     let mut wait_ms: u32 = 150;
@@ -399,6 +423,7 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
             0,
         );
         if h != INVALID {
+            CONN_DOWN_UNTIL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
             return Some(std::fs::File::from_raw_handle(h as RawHandle));
         }
         let err = unsafe { GetLastError() };
@@ -416,6 +441,11 @@ unsafe fn connect_pipe() -> Option<std::fs::File> {
             }
         }
         if WaitNamedPipeW(name.as_ptr(), wait_ms) == 0 || tries >= max_tries {
+            // 【P1-6】整轮失败 → 进入 400ms 退避，避免每键/每帧重付等待
+            CONN_DOWN_UNTIL_MS.store(
+                now_ms() + CONN_BACKOFF_MS,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             return None;
         }
         tries += 1;

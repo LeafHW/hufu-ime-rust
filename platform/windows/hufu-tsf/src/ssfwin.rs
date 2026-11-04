@@ -265,6 +265,95 @@ fn cache_tick() -> u64 {
     CACHE_TICK.fetch_add(1, Ordering::Relaxed)
 }
 
+// ============================================================================
+// 【P1-6 2026-11-04】载图失败负缓存（按皮肤指纹）
+// ============================================================================
+//
+// 病灶：坏/缺图 .ssf 每渲染帧都重走「读盘失败 → 管道取图」——读盘是
+// 同步 CreateFile，管道路径是 connect_pipe(150ms×2 等待) + call_on 的
+// 150ms 响应上限，最坏一帧 ~450ms **全阻塞在 TSF/宿主 UI 线程**；每键
+// 一帧 × 每帧一次 = 打字卡成幻灯片。
+//
+// 方案：以 (cache_dir, 归一图名, 皮肤指纹 fp) 为键缓存失败结果，TTL 8s
+// （落在任务要求的 5~30s 区间）。语义与正向缓存一致：fp 变（换皮/重存
+// 皮肤）→ 键不同 → 立即重试，天然满足「或直到换皮」。TTL 只是坏皮在
+// 同一代次内的复检间隔，到期后放一次重试，仍失败再续 8s。
+//
+// 不缓存 normalize 失败的输入（参数错误是确定性的，且失败在 O(1) 内，
+// 走缓存无收益）；只缓存真正的 I/O/解码/管道失败。
+pub(crate) const NEG_TTL: std::time::Duration = std::time::Duration::from_secs(8);
+/// 负缓存条目上限（坏皮按图名索引；正常皮肤恒 0 条）。
+const NEG_LIMIT: usize = 64;
+
+struct NegEntry {
+    /// 缓存失败原因（原样回给调用方，日志与降级语义不变）
+    reason: String,
+    at: Instant,
+}
+
+static NEG_CACHE: Mutex<Option<HashMap<(PathBuf, String, String), NegEntry>>> =
+    Mutex::new(None);
+/// 观测计数：负缓存命中次数（测试/诊断用；原子量避免额外锁）
+static NEG_HITS: AtomicU64 = AtomicU64::new(0);
+
+fn with_neg<R>(f: impl FnOnce(&mut HashMap<(PathBuf, String, String), NegEntry>) -> R) -> R {
+    let mut g = NEG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+/// 负缓存命中 → 返回上次失败原因；过期条目顺手清掉（同 fp 换皮即不同键）。
+fn neg_lookup(cache_dir: &Path, name: &str, fp: &str) -> Option<String> {
+    let now = Instant::now();
+    let hit = with_neg(|c| {
+        let k = (cache_dir.to_path_buf(), name.to_string(), fp.to_string());
+        match c.get(&k) {
+            Some(e) if now.duration_since(e.at) < NEG_TTL => Some(e.reason.clone()),
+            Some(_) => {
+                c.remove(&k);
+                None
+            }
+            None => None,
+        }
+    });
+    if hit.is_some() {
+        NEG_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    hit
+}
+
+fn neg_store(cache_dir: &Path, name: &str, fp: &str, reason: &str) {
+    let now = Instant::now();
+    with_neg(|c| {
+        // 先清过期条目再决定是否要驱逐（表极小，O(n) 可接受）
+        c.retain(|_, e| now.duration_since(e.at) < NEG_TTL);
+        if c.len() >= NEG_LIMIT {
+            if let Some(k) = c.keys().next().cloned() {
+                c.remove(&k);
+            }
+        }
+        c.insert(
+            (cache_dir.to_path_buf(), name.to_string(), fp.to_string()),
+            NegEntry {
+                reason: format!("{}（负缓存 {}s 内不重试）", reason, NEG_TTL.as_secs()),
+                at: now,
+            },
+        );
+    });
+}
+
+/// 载图成功 → 清同键负缓存（同 fp 下文件补齐的极端场景自愈）。
+fn neg_clear(cache_dir: &Path, name: &str, fp: &str) {
+    with_neg(|c| {
+        c.remove(&(cache_dir.to_path_buf(), name.to_string(), fp.to_string()));
+    });
+}
+
+/// 负缓存命中计数（测试钩子；生产零消费）。
+#[cfg(test)]
+pub fn neg_cache_hits() -> u64 {
+    NEG_HITS.load(Ordering::Relaxed)
+}
+
 /// 【UWP/开始菜单 2026-10-18】AppContainer 宿主读盘被拒时的兜底取图：
 /// 经管道向 server 请求（op ssf_image → b64 → 内存解码，sound op 同形）。
 /// id = cache_dir 末段；图名已经 normalize_image_name 消毒（server 侧
@@ -311,7 +400,23 @@ fn normalize_image_name(name: &str) -> Result<String, String> {
 /// 皮肤或跳过该 Scheme 变体（降级矩阵见设计方案 §4.6）。
 pub fn load_bitmap(cache_dir: &Path, fp: &str, image: &str) -> Result<Arc<SsfBitmap>, String> {
     let name = normalize_image_name(image)?;
-    let key = (cache_dir.to_path_buf(), name.clone());
+    // 【P1-6】负缓存闸门：同 (目录,图名,指纹) 的失败 8s 内直接返回上次
+    // 原因——坏皮每帧重试读盘+管道（最坏 ~450ms/帧，全在宿主 UI 线程）
+    // 是「坏皮肤打字卡死」的主因；换皮 fp 变即换键，立即重试。
+    if let Some(reason) = neg_lookup(cache_dir, &name, fp) {
+        return Err(reason);
+    }
+    let r = load_bitmap_uncached(cache_dir, fp, &name);
+    match &r {
+        Ok(_) => neg_clear(cache_dir, &name, fp),
+        Err(e) => neg_store(cache_dir, &name, fp, e),
+    }
+    r
+}
+
+/// 正向缓存/解码本体（不含负缓存；归一图名由外层给）。
+fn load_bitmap_uncached(cache_dir: &Path, fp: &str, name: &str) -> Result<Arc<SsfBitmap>, String> {
+    let key = (cache_dir.to_path_buf(), name.to_string());
     // ① 快路径：命中且 fp 未变
     {
         let hit = with_cache(|cache| {
@@ -330,14 +435,14 @@ pub fn load_bitmap(cache_dir: &Path, fp: &str, image: &str) -> Result<Arc<SsfBit
         }
     }
     // ② 解码（锁外读盘+解码，不阻塞其它窗口取图）
-    let path = cache_dir.join(&name);
+    let path = cache_dir.join(name);
     // 【UWP/开始菜单 2026-10-18】AppContainer 宿主（开始菜单搜索/设置/
     // 商店应用）拒读数据目录——实测管道连通而磁盘读图被拒（act-*.txt
     // pipe=ok）→ 读盘失败时经管道向 server 取图（sound op 同形：b64
     // 过管道、内存解码零落盘）。普通应用读盘成功，零管道流量。
     let data = match std::fs::read(&path) {
         Ok(d) => d,
-        Err(fs_err) => match fetch_image_via_pipe(cache_dir, &name) {
+        Err(fs_err) => match fetch_image_via_pipe(cache_dir, name) {
             Ok(d) => d,
             Err(pipe_err) => {
                 return Err(format!("读图失败 {}: {fs_err}；管道取图亦败: {pipe_err}", path.display()))
@@ -1671,5 +1776,50 @@ mod tests {
         }
         assert!(!cache.touch(0, 2, 2), "oldest evicted");
         assert!(cache.touch(8, 2, 2), "newest present");
+    }
+
+    // ── 【P1-6 2026-11-04】载图失败负缓存 ──
+
+    /// 同 (目录,图名,指纹) 失败 → TTL 内直接命中（不再读盘/走管道）；
+    /// 换皮 fp 变、换图名、TTL 到期 → 均放行重试。
+    #[test]
+    fn neg_cache_blocks_and_expires() {
+        let dir = PathBuf::from(r"C:\__hufu_neg_cache_test__");
+        let fp = "fp-a";
+        neg_store(&dir, "missing.png", fp, "读图失败");
+        // ① 命中：原因带「负缓存」标记（调用方日志既有降级语义不变）
+        let hit = neg_lookup(&dir, "missing.png", fp).expect("neg hit");
+        assert!(hit.contains("负缓存"), "reason: {hit}");
+        // ② 换皮（fp 变）= 不同键 → 不命中（=「直到换皮」语义）
+        assert!(neg_lookup(&dir, "missing.png", "fp-b").is_none());
+        // ③ 不同图名 → 不命中（局部坏图不连坐整皮其它图）
+        assert!(neg_lookup(&dir, "other.png", fp).is_none());
+        // ④ 拨到 TTL 之前 → 到期不命中且过期条目被清理
+        with_neg(|c| {
+            let k = (dir.clone(), "missing.png".to_string(), fp.to_string());
+            c.get_mut(&k).unwrap().at =
+                Instant::now() - (NEG_TTL + std::time::Duration::from_secs(1));
+        });
+        assert!(neg_lookup(&dir, "missing.png", fp).is_none());
+        neg_clear(&dir, "missing.png", fp);
+    }
+
+    /// 包装层短路：负缓存命中时 load_bitmap 立即 Err——不触盘、不碰管道
+    /// （坏皮每帧 ~450ms 阻塞被切断的直接证据），命中计数增长。
+    #[test]
+    fn load_bitmap_negative_cache_short_circuits() {
+        let dir = PathBuf::from(r"C:\__hufu_neg_cache_test2__");
+        neg_store(&dir, "a.png", "fp-z", "管道取图亦败");
+        let before = neg_cache_hits();
+        let t0 = Instant::now();
+        let r = load_bitmap(&dir, "fp-z", "a.png");
+        let dt = t0.elapsed();
+        assert!(r.is_err(), "must Err");
+        assert!(neg_cache_hits() > before, "hit counter incremented");
+        assert!(
+            dt < std::time::Duration::from_millis(100),
+            "no IO/pipe wait expected, took {dt:?}"
+        );
+        neg_clear(&dir, "a.png", "fp-z");
     }
 }

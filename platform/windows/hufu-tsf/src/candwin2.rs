@@ -1746,6 +1746,40 @@ mod diff_hl_tests {
     }
 }
 
+#[cfg(test)]
+mod create_fail_tests {
+    use super::*;
+
+    /// 【P1-7】失败路径必须销毁 HWND（旧版 `?` 直接返回=每次调用漏一个
+    /// 窗口句柄），且失败缓存 2s 内不再建窗（不重复付设备初始化）。
+    #[test]
+    fn create_fail_destroys_hwnd_and_throttles() {
+        // 注入：窗口建好后、设备初始化前失败
+        std::env::set_var("HUFU_TEST_CW2_CREATE_FAIL", "1");
+        test_create_fail_reset();
+        let attempts0 = CREATE_WINDOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        let w = CandidateWindowV2::new();
+        assert!(w.is_none(), "注入失败应返回 None");
+        let attempts1 = CREATE_WINDOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(attempts1, attempts0 + 1, "第一次应真的建了窗");
+        let h = LAST_FAIL_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(h != 0, "失败路径应记录被销毁的 HWND");
+        // 销毁后句柄不再是窗口（IsWindow 在已销毁句柄上返回 FALSE）
+        assert!(
+            !unsafe { IsWindow(HWND(h as *mut _)) }.as_bool(),
+            "HWND 必须已销毁（旧版泄漏在这）"
+        );
+        // 失败缓存：第二次调用不再建窗
+        let w2 = CandidateWindowV2::new();
+        assert!(w2.is_none(), "缓存窗口内应直接 None");
+        let attempts2 = CREATE_WINDOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(attempts2, attempts1, "缓存窗口内不得再建窗");
+        // 清理：恢复环境与缓存，避免影响同进程其它测试
+        std::env::remove_var("HUFU_TEST_CW2_CREATE_FAIL");
+        test_create_fail_reset();
+    }
+}
+
 fn probe_default_cand_font(dwrite: &IDWriteFactory) -> String {
     /// 常见霞鹜版本名（中文名在前——FindFamilyName 精确匹配）
     const CANDS: &[&str] = &[
@@ -1944,6 +1978,17 @@ impl CandidateWindowV2 {
             .unwrap_or("")
             .to_string();
         let spec_cache_key = (cache_dir_key, fp_key);
+        // 【P1-6 负缓存门】同皮载图失败后 8s 内不再重走「解析→挑变体→
+        // 读盘→管道取图」（坏皮每帧一次，最坏 ~450ms 阻塞宿主线程）。
+        // 换皮（fp 变）或 TTL 到期即解除，由 ssfwin::load_bitmap 的负
+        // 缓存兜第二层（同帧内多次取图也只失败一次）。
+        let fp_now = spec_cache_key.1.clone();
+        if let Some((f, t)) = &self.ssf_fail {
+            if *f == fp_now && t.elapsed() < crate::ssfwin::NEG_TTL {
+                return None;
+            }
+            self.ssf_fail = None; // 换皮/到期：放一次重试
+        }
         let spec = if !spec_cache_key.0.is_empty() && !spec_cache_key.1.is_empty() {
             match &self.ssf_spec_cache {
                 Some((k, s)) if *k == spec_cache_key => std::sync::Arc::clone(s),
@@ -1996,6 +2041,9 @@ impl CandidateWindowV2 {
                     crate::tsf::trace(&format!("ssf: 载图失败回退矢量：{e}"));
                 }
                 *self.ssf.borrow_mut() = None;
+                // 【P1-6】记失败闸门：同 fp 8s 内本窗直接走矢量降级，
+                // 不再每帧尝试（换皮/到期自动解除）。
+                self.ssf_fail = Some((fp_now.clone(), std::time::Instant::now()));
                 return None;
             }
         };
@@ -2316,6 +2364,25 @@ pub struct CandidateWindowV2 {
     /// serde/INI 解析；变体选择与取图仍每帧走轻量路径）。
     pub(crate) ssf_spec_cache:
         Option<((String, String), std::sync::Arc<crate::ssfwin::SsfSkinSpec>)>,
+    /// 【P1-6 2026-11-04】本窗 ssf 载图失败闸门 (皮肤指纹 fp, 失败时刻)：
+    /// 坏/缺图皮肤每渲染帧都会「解析→挑变体→读盘→管道取图」，最坏一帧
+    /// ~450ms 全在宿主线程（见 ssfwin 负缓存注释）。同 fp 8s 内直接跳过
+    /// 整个 ssf 准备走 JSON 矢量降级；换皮 fp 变即解除重试。
+    pub(crate) ssf_fail: Option<(String, std::time::Instant)>,
+    /// 【P0-2 2026-11-04】D3D11 设备（GetDeviceRemovedReason 诊断 + 恢复
+    /// 链重建时释放旧引用）。new()/new_owned() 均填充。
+    d3d: Option<ID3D11Device>,
+    /// 设备重建成功累计次数（诊断/测试取证）。
+    pub(crate) recover_count: u32,
+    /// 最近一次重建尝试时刻（1s 节流：连续失败帧不得每帧重建设备）。
+    last_recover_at: Option<std::time::Instant>,
+    /// 设备丢失后连续恢复失败次数（≥3 只记一次日志，防刷屏）。
+    recover_fail_streak: u32,
+    /// 恢复重入门：重建成功后的重绘递归深度上限 1（防恢复链自激）。
+    in_recover: bool,
+    /// 死窗节流截止：恢复失败 → 收窗，窗口期内 show() 直接返回；
+    /// 到期放一次窗口+设备重建（revive_window），成功即自愈。
+    dead_until: Option<std::time::Instant>,
     /// 【毛玻璃退役 2026-09-11】glass_raw/glass_cache（抓屏+自绘模糊）
     /// 已随毛玻璃整链删除。accent 幂等键残留清理用。
     pub(crate) acrylic_last: std::cell::Cell<u64>,
@@ -2637,6 +2704,151 @@ fn read_diag_stage() -> u32 {
 /// 【二十四修·死码清理】capture_screen_rgba（自绘毛玻璃抓屏）随毛玻璃
 /// 整链退役删除——全仓库零调用。
 
+// ============================================================================
+// 【P1-7 2026-11-04】建窗失败缓存
+// ============================================================================
+//
+// 病灶：new()/new_owned() 在 CreateWindowExW 之后才做设备初始化（D3D11
+// → D2D → DComp），旧实现任一步失败就 `?`/return —— 已建 HWND 不销毁，
+// **每次调用漏一个窗口句柄**；且失败没有记忆，下一帧 show 立刻重试整条
+// 管道（设备初始化 ms 级 + 可能的驱动卡顿）。
+//
+// 方案：两条失败出口统一 DestroyWindow + 记时刻；2s 内 new()/new_owned()
+// 直接返回 None（调用方回退 v1/server 代画，行为与「初始化失败」一致）。
+// 2s 后放一次重试（GPU 驱动恢复/临时资源紧张可自愈），绝不每键重建。
+const CREATE_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+static CREATE_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+/// 观测：实际执行 CreateWindowExW 的次数（失败缓存命中时不增）。
+static CREATE_WINDOW_ATTEMPTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// 测试注入验证用：最近一次失败路径被销毁的 HWND。
+static LAST_FAIL_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+fn create_fail_recent() -> bool {
+    let g = CREATE_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner());
+    g.is_some_and(|t| t.elapsed() < CREATE_FAIL_TTL)
+}
+
+fn note_create_fail(hwnd: Option<HWND>) {
+    *CREATE_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    if let Some(h) = hwnd {
+        LAST_FAIL_HWND.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        crate::tsf::trace(&format!(
+            "cw2: 建窗失败 → DestroyWindow({}) + 失败缓存 {}s",
+            h.0 as isize,
+            CREATE_FAIL_TTL.as_secs()
+        ));
+    } else {
+        crate::tsf::trace(&format!(
+            "cw2: CreateWindowExW 失败 → 失败缓存 {}s",
+            CREATE_FAIL_TTL.as_secs()
+        ));
+    }
+}
+
+/// 测试专用：清失败缓存与观测计数（生产零消费）。
+#[cfg(test)]
+fn test_create_fail_reset() {
+    *CREATE_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    LAST_FAIL_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ============================================================================
+// 【P0-2 2026-11-04】D2D 设备丢失检测与恢复
+// ============================================================================
+//
+// 病灶：渲染段两处 `let _ = ctx.EndDraw(None, None)`（主帧 + SSF 圆角重铺）
+// 把 HRESULT 丢弃；设备丢失（D2DERR_RECREATE_TARGET=0x8899000C，驱动重置/
+// TDR/GPU 掉卡）后 BeginDraw/EndDraw 持续失败，窗口停止更新=白屏/卡死，
+// 全文件没有任何 GetDeviceRemovedReason/重建路径。
+//
+// 方案（检测→重建→重绘）：
+//   1) EndDraw 结果必须检查：HRESULT 失败或 D2DERR_RECREATE_TARGET 即视为
+//      设备失效 → 跳过本帧回读/Present（设备已死，继续用只会连环失败），
+//      跳出渲染段；
+//   2) recover_device()：1s 节流 → ① 原窗上重建 D3D11→DXGI→D2D(→DComp)
+//      设备并清空全部设备相关缓存（swapchain/离屏位图/命令列表/SSF 位图）；
+//      ② 原窗失败（DComp target 也坏了）→ revive_window() 销毁 HWND 并
+//      重建窗口+设备（窗口创建失败一起走同一失败出口）；
+//   3) 重建成功 → 递归 show() 重绘本帧（in_recover 门限深度 1，绝不递归
+//      两次）；连续失败 → 收窗 + dead_until 2s：窗口期内 show() 直接返回，
+//      到期放一次重试 = 自愈且**绝不每帧重建**；
+//   4) 测试注入 HUFU_TEST_D2D_LOST=1：首次 EndDraw 强制走丢失分支，证明
+//      恢复链真的执行（trace + hufu_test_d2d_stats 计数）。
+/// D2DERR_RECREATE_TARGET（d2derr.h；windows crate 未导出常量）
+const D2DERR_RECREATE_TARGET: u32 = 0x8899_000C;
+/// 恢复失败后的收窗/重试节流窗口
+const RECOVER_BACKOFF_MS: u64 = 2000;
+/// 两次设备重建尝试的最小间隔（防连续失败帧重建风暴）
+const RECOVER_MIN_INTERVAL_MS: u64 = 1000;
+
+/// 观测：D2D 设备丢失命中次数（真实 + 注入）
+static D2D_LOST_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// 观测：设备重建成功累计次数
+static D2D_RECOVER_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// 测试注入：HUFU_TEST_D2D_LOST=1 时**首次** EndDraw 强制按设备丢失处理。
+/// OnceLock 缓存 env 读取（每帧调用零开销）；只触发一次（AtomicBool swap）。
+fn test_inject_d2d_lost() -> bool {
+    static ARMED: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+        std::sync::OnceLock::new();
+    let a = ARMED.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("HUFU_TEST_D2D_LOST").as_deref() == Ok("1"),
+        )
+    });
+    a.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 测试钩子：D2D 恢复链计数（低 16 位=丢失命中，高 16 位=重建成功）。
+/// 供 e2e 驱动（PowerShell Add-Type / smoke）读取，证明恢复链真的执行。
+#[no_mangle]
+pub extern "system" fn hufu_test_d2d_stats() -> i32 {
+    let lost = D2D_LOST_COUNT.load(std::sync::atomic::Ordering::Relaxed).min(0xFFFF);
+    let ok = D2D_RECOVER_COUNT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .min(0xFFFF);
+    ((ok << 16) | lost) as i32
+}
+
+/// 建候选窗 HWND（类注册幂等；恢复链重建窗口与 new() 同款式样）。
+unsafe fn create_cand2_hwnd(ex: u32, owner: HWND) -> Option<HWND> {
+    let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(cand2_wndproc),
+        hCursor: LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW)
+            .unwrap_or(HCURSOR(std::ptr::null_mut())),
+        lpszClassName: PCWSTR(class.as_ptr()),
+        hbrBackground: HBRUSH(std::ptr::null_mut()),
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wc);
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE(ex),
+        PCWSTR(class.as_ptr()),
+        PCWSTR::null(),
+        WINDOW_STYLE(WS_POPUP.0),
+        0,
+        0,
+        10,
+        10,
+        owner,
+        HMENU(std::ptr::null_mut()),
+        HINSTANCE(std::ptr::null_mut()),
+        None,
+    )
+    .unwrap_or_default();
+    if hwnd.0.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
+}
+
 impl CandidateWindowV2 {
     /// 【WPS 抑制放宽探针 2026-09-12】有历史位置即可先按旧位显示
     /// （tsf.rs 首帧抑制判定用——WPS 每键重组段的即时出候选）。
@@ -2663,6 +2875,13 @@ impl CandidateWindowV2 {
     /// 常规宿主：DComp 直通窗全功能路径（硬件 D3D + swapchain + 动效）。
     /// 打包宿主（owner 有值）用 new_owned 的 ULW 软件路径。
     pub fn new() -> Option<CandidateWindowV2> {
+        // 【P1-7 2026-11-04】建窗失败缓存：设备初始化失败后 2s 内直接
+        // 返回 None。旧实现失败即 `?`/return，已建 HWND 不销毁（每次调用
+        // 漏一个）且下一次 show 立刻重试整条 D3D/D2D/DComp 初始化。
+        if create_fail_recent() {
+            crate::tsf::trace("cw2 new: 失败缓存窗口内跳过建窗");
+            return None;
+        }
         // 【2026-11-03 功耗】不再在进程启动永久 timeBeginPeriod(1)——
         // 动画驱动起臂/收臂时成对 begin/end（见 anim_boost_arm/disarm）。
         // 【特效退役 2026-09-22】ensure_thread(上屏特效线程预热)撤除
@@ -2698,47 +2917,60 @@ impl CandidateWindowV2 {
                 None,
             )
             .unwrap_or_default();
+            CREATE_WINDOW_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if hwnd.0.is_null() {
+                note_create_fail(None);
                 return None;
             }
 
-            // D3D11 设备（硬件 → WARP 兜底），必须 BGRA 供 D2D 互操作
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            for dt in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-                let ok = D3D11CreateDevice(
-                    None,
-                    dt,
-                    HMODULE(std::ptr::null_mut()),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )
-                .is_ok();
-                if ok && device.is_some() {
-                    break;
-                }
-            }
-            let device = device?;
-            let _ = context; // 无需常驻 D3D 上下文，D2D 自管
+            // 【P1-7】设备管线包进闭包：任一步失败（原 `?`）→ 统一
+            // DestroyWindow + 失败缓存，绝不让 HWND 泄漏。
+            let built = (|| -> Option<CandidateWindowV2> {
+                    // 【P1-7 测试注入】HUFU_TEST_CW2_CREATE_FAIL=1 → 模拟
+                    // 设备初始化失败，验证失败路径确实销毁 HWND（回归证据）。
+                    if std::env::var("HUFU_TEST_CW2_CREATE_FAIL").as_deref() == Ok("1") {
+                        crate::tsf::trace("cw2 new: [TEST] 注入设备初始化失败");
+                        return None;
+                    }
+                    // D3D11 设备（硬件 → WARP 兜底），必须 BGRA 供 D2D 互操作
+                    let mut device: Option<ID3D11Device> = None;
+                    let mut context: Option<ID3D11DeviceContext> = None;
+                    for dt in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+                        let ok = D3D11CreateDevice(
+                            None,
+                            dt,
+                            HMODULE(std::ptr::null_mut()),
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                            None,
+                            D3D11_SDK_VERSION,
+                            Some(&mut device),
+                            None,
+                            Some(&mut context),
+                        )
+                        .is_ok();
+                        if ok && device.is_some() {
+                            break;
+                        }
+                    }
+                    let device = device?;
+                    let _ = context; // 无需常驻 D3D 上下文，D2D 自管
 
-            let dxgi_dev: IDXGIDevice = device.cast().ok()?;
-            let _factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
-            let factory2d: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None).ok()?;
-            let d2d_dev: ID2D1Device = factory2d.CreateDevice(&dxgi_dev).ok()?;
-            let ctx: ID2D1DeviceContext = d2d_dev
-                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-                .ok()?;
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_dev).ok()?;
-            let target = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
-            let visual = dcomp.CreateVisual().ok()?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+                    let dxgi_dev: IDXGIDevice = device.cast().ok()?;
+                    let _factory: IDXGIFactory2 = CreateDXGIFactory1().ok()?;
+                    let factory2d: ID2D1Factory1 =
+                        D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None).ok()?;
+                    let d2d_dev: ID2D1Device = factory2d.CreateDevice(&dxgi_dev).ok()?;
+                    let ctx: ID2D1DeviceContext = d2d_dev
+                        .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
+                        .ok()?;
+                    let dcomp: IDCompositionDevice =
+                        DCompositionCreateDevice(&dxgi_dev).ok()?;
+                    let target = dcomp.CreateTargetForHwnd(hwnd, BOOL(1)).ok()?;
+                    let visual = dcomp.CreateVisual().ok()?;
+                    let dwrite: IDWriteFactory =
+                        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
 
-            Some(CandidateWindowV2 {
+                    Some(CandidateWindowV2 {
                 hwnd,
                 ctx: Some(ctx),
                 swapchain: None,
@@ -2775,6 +3007,13 @@ impl CandidateWindowV2 {
                 text_layout_cache: None,
                 text_measure_cache: None,
                 ssf_spec_cache: None,
+                ssf_fail: None,
+                d3d: Some(device.clone()),
+                recover_count: 0,
+                last_recover_at: None,
+                recover_fail_streak: 0,
+                in_recover: false,
+                dead_until: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
@@ -2812,6 +3051,14 @@ impl CandidateWindowV2 {
                 freq_del: std::cell::RefCell::new(None),
                 ssf: std::cell::RefCell::new(None),
             })
+            })();
+            if built.is_none() {
+                // 【P1-7】失败路径统一销毁 HWND（旧版在这里 `?` 直接
+                // 返回，每次调用漏一个窗口句柄）+ 记失败时刻（2s 节流）。
+                let _ = DestroyWindow(hwnd);
+                note_create_fail(Some(hwnd));
+            }
+            built
         }
     }
 
@@ -2830,6 +3077,12 @@ impl CandidateWindowV2 {
     /// 卡死也只卡孤儿线程，主线程返回 None 回退 server 代画；③ 窗口
     /// 无 WS_EX_NOREDIRECTIONBITMAP（ULW 需要 redirection surface）。
     pub fn new_owned(owner: Option<HWND>) -> Option<CandidateWindowV2> {
+        // 【P1-7】同一失败缓存门：owned 模式设备初始化失败/超时同样
+        // 会漏窗 + 下一帧重试，2s 内直接回退（调用方走 server 代画）。
+        if create_fail_recent() {
+            crate::tsf::trace("cw2 new_owned: 失败缓存窗口内跳过建窗");
+            return None;
+        }
         unsafe {
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -2863,13 +3116,15 @@ impl CandidateWindowV2 {
                 None,
             )
             .unwrap_or_default();
+            CREATE_WINDOW_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if hwnd.0.is_null() {
+                note_create_fail(None);
                 return None;
             }
 
             // ── 设备管线：工作线程初始化（卡死守护）──
             let (tx, rx) = std::sync::mpsc::channel::<
-                Option<(ID2D1DeviceContext, IDWriteFactory, IDXGIDevice)>,
+                Option<(ID2D1DeviceContext, IDWriteFactory, IDXGIDevice, ID3D11Device)>,
             >();
             std::thread::spawn(move || {
                 // COM：本线程自初始化（宿主 STA 环境里 spawn 的线程默认无）
@@ -2908,20 +3163,25 @@ impl CandidateWindowV2 {
                         .ok()?;
                     let dwrite: IDWriteFactory =
                         DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
-                    Some((ctx, dwrite, dxgi_dev))
+                    Some((ctx, dwrite, dxgi_dev, device))
                 })();
                 let _ = tx.send(r);
             });
-            let (ctx, dwrite, dxgi_dev) =
+            let (ctx, dwrite, dxgi_dev, device) =
                 match rx.recv_timeout(std::time::Duration::from_millis(2500)) {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         crate::tsf::diag_note("cw2 owned: WARP 管线初始化失败 → 回退");
+                        // 【P1-7】失败即销毁刚建的 HWND + 记失败时刻
+                        let _ = DestroyWindow(hwnd);
+                        note_create_fail(Some(hwnd));
                         return None;
                     }
                     Err(_) => {
                         // 超时：工作线程卡在驱动调用（孤儿线程泄漏一枚）
                         crate::tsf::diag_note("cw2 owned: 设备初始化 2.5s 超时（沙盒卡死）→ 回退");
+                        let _ = DestroyWindow(hwnd);
+                        note_create_fail(Some(hwnd));
                         return None;
                     }
                 };
@@ -2963,6 +3223,13 @@ impl CandidateWindowV2 {
                 text_layout_cache: None,
                 text_measure_cache: None,
                 ssf_spec_cache: None,
+                ssf_fail: None,
+                d3d: Some(device.clone()),
+                recover_count: 0,
+                last_recover_at: None,
+                recover_fail_streak: 0,
+                in_recover: false,
+                dead_until: None,
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
@@ -3351,8 +3618,7 @@ impl CandidateWindowV2 {
     unsafe fn create_chain_from_ctx(
         &mut self,
         desc: &DXGI_SWAP_CHAIN_DESC1,
-    ) -> Option<IDXGISwapChain1> {
-        // 用 new() 时存下的 DXGI 设备（ID2D1Device QI 不出 IDXGIDevice）；
+    ) -> Option<IDXGISwapChain1> {        // 用 new() 时存下的 DXGI 设备（ID2D1Device QI 不出 IDXGIDevice）；
         // factory 必须与设备同源（device→adapter→GetParent），否则 INVALID_CALL
         let dxgi_dev: IDXGIDevice = self.dxgi.clone()?;
         let adapter: IDXGIAdapter = match dxgi_dev.GetAdapter() {
@@ -3380,6 +3646,220 @@ impl CandidateWindowV2 {
             })
             .ok()
     }
+
+    /// 【P0-2】重建设备管线（原窗）。ULW 只走 WARP（沙盒口径同
+    /// new_owned），DComp 路径先硬件后 WARP。失败返回 false（调用方换窗）。
+    unsafe fn rebuild_device(&mut self) -> bool {
+        let hwnd = self.hwnd;
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // 【P0-2】重建前先拆旧绑定：
+        //  - D2D 目标（旧设备）与交换链/离屏位图引用；
+        //  - DComp target/visual/device：一个 HWND 同时只能挂一个
+        //    composition target，旧 device 未释放时 CreateTargetForHwnd
+        //    会失败（e2e 实测：不拆则「原窗重建」直接走换窗兜底）。
+        unsafe {
+            if let Some(ctx) = &self.ctx {
+                ctx.SetTarget(None);
+            }
+        }
+        self.swapchain = None;
+        self.offscreen = None;
+        self.visual = None;
+        self.target = None;
+        self.dcomp = None;
+        let drivers: &[windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE] = if self.ulw {
+            &[D3D_DRIVER_TYPE_WARP]
+        } else {
+            &[D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP]
+        };
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        for dt in drivers.iter().copied() {
+            device = None;
+            context = None;
+            let ok = D3D11CreateDevice(
+                None,
+                dt,
+                HMODULE(std::ptr::null_mut()),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .is_ok();
+            if ok && device.is_some() {
+                break;
+            }
+        }
+        let Some(device) = device else { return false };
+        let _ = context;
+        let Ok(dxgi_dev) = device.cast::<IDXGIDevice>() else {
+            return false;
+        };
+        let factory2d: windows::core::Result<ID2D1Factory1> =
+            D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None);
+        let Ok(factory2d) = factory2d else { return false };
+        let Ok(d2d_dev) = factory2d.CreateDevice(&dxgi_dev) else {
+            return false;
+        };
+        let Ok(ctx) = d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) else {
+            return false;
+        };
+        // DComp 仅 DComp 路径需要；target 必须绑当前 hwnd（新 DComp 设备）
+        let mut dcomp = None;
+        let mut target = None;
+        let mut visual = None;
+        if !self.ulw {
+            let dc: IDCompositionDevice = match DCompositionCreateDevice(&dxgi_dev) {
+                Ok(dc) => dc,
+                Err(_) => return false,
+            };
+            let Ok(t) = dc.CreateTargetForHwnd(hwnd, BOOL(1)) else {
+                return false;
+            };
+            let Ok(v) = dc.CreateVisual() else {
+                return false;
+            };
+            dcomp = Some(dc);
+            target = Some(t);
+            visual = Some(v);
+        }
+        self.d3d = Some(device);
+        self.dxgi = Some(dxgi_dev);
+        self.ctx = Some(ctx);
+        self.dcomp = dcomp;
+        self.target = target;
+        self.visual = visual;
+        true
+    }
+
+    /// 【P0-2】设备重建后清空一切「绑旧设备」的资源缓存（否则新设备上
+    /// 复用旧资源=连环失败）：交换链/离屏位图/命令列表/SSF 设备位图等。
+    fn reset_after_device_rebuild(&mut self) {
+        unsafe {
+            if let Some(ctx) = &self.ctx {
+                ctx.SetTarget(None);
+            }
+        }
+        self.swapchain = None;
+        self.offscreen = None;
+        self.size = (0, 0);
+        self.shadow_cache = None;
+        self.text_layout_cache = None;
+        self.text_measure_cache = None;
+        *self.ssf.borrow_mut() = None;
+        self.ssf_spec_cache = None;
+        self.ssf_fail = None;
+        self.ulw_round = 0.0;
+        self.last_pixels = None;
+        self.last_size = (0, 0);
+    }
+
+    /// 【P0-2】原窗设备重建失败 → 销毁窗口并重建 HWND+设备（保留 owner
+    /// 链；样式按 ulw 分叉，与 new/new_owned 同款）。失败则 hwnd 归零，
+    /// 由 dead_until 节流等待下次重试——绝不每帧重建。
+    unsafe fn revive_window(&mut self) -> bool {
+        let old = self.hwnd;
+        let owner = if old.0.is_null() {
+            HWND(std::ptr::null_mut())
+        } else {
+            HWND(GetWindowLongPtrW(old, GWLP_HWNDPARENT) as *mut _)
+        };
+        if !old.0.is_null() {
+            let _ = DestroyWindow(old);
+        }
+        self.hwnd = HWND(std::ptr::null_mut());
+        let ex = if self.ulw {
+            WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0
+        } else {
+            WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_NOREDIRECTIONBITMAP.0
+        };
+        let Some(hwnd) = create_cand2_hwnd(ex, owner) else {
+            return false;
+        };
+        self.hwnd = hwnd;
+        if !self.rebuild_device() {
+            let _ = DestroyWindow(hwnd);
+            self.hwnd = HWND(std::ptr::null_mut());
+            return false;
+        }
+        self.reset_after_device_rebuild();
+        true
+    }
+
+    /// 【P0-2】设备丢失恢复入口：1s 节流 → 原窗重建 → 失败换窗重建。
+    unsafe fn recover_device(&mut self) -> bool {
+        if self
+            .last_recover_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(RECOVER_MIN_INTERVAL_MS))
+        {
+            return false;
+        }
+        self.last_recover_at = Some(std::time::Instant::now());
+        if self.rebuild_device() {
+            self.reset_after_device_rebuild();
+            D2D_RECOVER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        crate::tsf::trace("cw2: 原窗设备重建失败 → 销毁并重建窗口（HWND+设备）");
+        if self.revive_window() {
+            D2D_RECOVER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// 【P0-2】渲染段检测到设备失效后的收口：重建成功→递归重绘一帧；
+    /// 失败→收窗 + 2s 死窗节流（窗口期内 show 直接返回，绝不每帧重建）。
+    fn handle_render_device_loss(
+        &mut self,
+        code: u32,
+        cands: &[(String, String)],
+        raw: &str,
+        skin: &Value,
+        anchor: Option<&RECT>,
+        selected: usize,
+    ) {
+        if self.in_recover {
+            crate::tsf::trace(&format!(
+                "cw2: [P0-2] 重绘帧再次设备失效 0x{code:08X} → 放弃本帧（防恢复链自激）"
+            ));
+            self.hide_now();
+            self.dead_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(RECOVER_BACKOFF_MS));
+            return;
+        }
+        self.in_recover = true;
+        let ok = unsafe { self.recover_device() };
+        if ok {
+            self.recover_count += 1;
+            self.recover_fail_streak = 0;
+            crate::tsf::trace(&format!(
+                "cw2: D2D 设备丢失 0x{code:08X} → 重建成功（第 {} 次）→ 重绘本帧",
+                self.recover_count
+            ));
+            // in_recover 保持 true：重绘帧若再失效走上面的放弃分支，
+            // 递归深度恒为 1。
+            self.show(cands, raw, skin, anchor, selected);
+        } else {
+            self.recover_fail_streak += 1;
+            if self.recover_fail_streak <= 3 {
+                crate::tsf::trace(&format!(
+                    "cw2: D2D 设备丢失 0x{code:08X} → 重建失败（连续 {}）→ 收窗 {}ms 后重试",
+                    self.recover_fail_streak, RECOVER_BACKOFF_MS
+                ));
+            }
+            self.hide_now();
+            self.dead_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(RECOVER_BACKOFF_MS));
+        }
+        self.in_recover = false;
+    }
+
     /// 渲染并显示。anchor=插入点屏幕矩形：候选窗优先悬于其上方。selected=高亮行（页内 0 起）。
     /// 【高亮滑动 2026-10-09】高亮胶囊矩形插值：hl_anim 在身 → 从起点
     /// 矩形 ease-out（起步快收尾缓）滑到目标；到点即清。恒记录本帧
@@ -3504,6 +3984,35 @@ impl CandidateWindowV2 {
         if crate::candidate_ui::host_draws() {
             self.hide();
             return;
+        }
+        // 【P0-2 2026-11-04】死窗门：设备丢失且窗口/设备重建也失败时，
+        // dead_until 窗口内 show 直接返回（绝不每帧重建）；到期放一次
+        // revive_window（销毁旧窗→建新窗→重建设备），成功即自愈。
+        if self.hwnd.0.is_null() || self.dead_until.is_some() {
+            if self
+                .dead_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+            {
+                return;
+            }
+            self.dead_until = None;
+            // 窗口还在（上次恢复失败只收了窗）→ 先试原窗设备重建；
+            // 窗口已销毁（revive 也失败过）→ 直接重建窗口+设备。
+            let ok = unsafe {
+                if self.hwnd.0.is_null() {
+                    self.revive_window()
+                } else {
+                    self.recover_device()
+                }
+            };
+            if !ok {
+                self.dead_until = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(RECOVER_BACKOFF_MS),
+                );
+                return;
+            }
+            crate::tsf::trace("cw2: 死窗到期 → 窗口+设备重建成功，恢复渲染");
         }
         // 【T8 用户铁律·框内永不画编码 2026-10-07 终局二】show() 咽喉
         // 一刀：显示用 raw 恒空——**所有车道**（打字/上屏/调频刷新/
@@ -5037,7 +5546,9 @@ impl CandidateWindowV2 {
         };
         // 【二十四修·动效大瘦身】入场/退场动画退役——bx/by 恒 0（稳态）。
         let (bx, by) = (0.0f32, 0.0f32);
-        {
+        // 【P0-2】设备失效码（渲染段 EndDraw 检查后写入；出块统一恢复）
+        let mut d2d_end_err: Option<u32> = None;
+        'render: {
             // 【零位移配套】缓冲按实际窗口（含收窄轴向的缓动值——收窄帧
             // 窗口=缓动≥目标；grow-only 下不触发重建，宽缓冲沿用）。
             let (buf_w, buf_h) = match self.size_anim {
@@ -6441,8 +6952,34 @@ impl CandidateWindowV2 {
                     ctx.PopAxisAlignedClip();
                 }
 
-                let _ = ctx.EndDraw(None, None);
+                // 【P0-2 2026-11-04】EndDraw 返回值不再丢弃：设备丢失
+                // （D2DERR_RECREATE_TARGET）或任意 HRESULT 失败都视为
+                // 设备级失效——本帧已不可信，跳过回读/Present 出块恢复。
+                let end_res = ctx.EndDraw(None, None);
                 ctx.SetTarget(None);
+                let forced_lost = test_inject_d2d_lost();
+                let mut end_fail: Option<u32> = match &end_res {
+                    Err(e) => Some(e.code().0 as u32),
+                    Ok(()) => None,
+                };
+                if forced_lost {
+                    crate::tsf::trace("cw2: [TEST] 注入 D2D 设备丢失（首次 EndDraw）");
+                    end_fail = Some(D2DERR_RECREATE_TARGET);
+                }
+                if let Some(code) = end_fail {
+                    let removed = self
+                        .d3d
+                        .as_ref()
+                        .and_then(|d| d.GetDeviceRemovedReason().err())
+                        .map(|e| e.code().0 as u32);
+                    crate::tsf::trace(&format!(
+                        "cw2: EndDraw 失败 0x{code:08X}（RECREATE_TARGET={}）dev_removed_reason={removed:?} → 跳过 present，准备重建",
+                        code == D2DERR_RECREATE_TARGET
+                    ));
+                    D2D_LOST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    d2d_end_err = Some(code);
+                    break 'render;
+                }
 
                 // 测试回读：EndDraw 后目标位图已非活动，拷到 CPU 位图取整帧 BGRA
                 if self.readback {
@@ -6624,7 +7161,20 @@ impl CandidateWindowV2 {
                                                 windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_LINEAR,
                                                 None, None,
                                             );
-                                            let _ = ctx.EndDraw(None, None);
+                                            // 【P0-2】圆角重铺的第二个 EndDraw 同样不能丢
+                                            let end2 = ctx.EndDraw(None, None);
+                                            if let Err(e) = end2 {
+                                                let code = e.code().0 as u32;
+                                                crate::tsf::trace(&format!(
+                                                    "cw2: 圆角重铺 EndDraw 失败 0x{code:08X} → 跳过 present，准备重建"
+                                                ));
+                                                D2D_LOST_COUNT.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                d2d_end_err = Some(code);
+                                                break 'render;
+                                            }
                                         }
                                     }
                                 }
@@ -6642,6 +7192,14 @@ impl CandidateWindowV2 {
                 }
             }
         } // 渲染段结束（测量→布局→绘制→Present）
+
+        // 【P0-2】设备失效收口：重建设备+缓存后递归重绘本帧；重建失败则
+        // 收窗 + 2s 死窗节流（show 早退，绝不每帧重建）。本帧跳过读回/
+        // Present 已由 break 'render 完成。
+        if let Some(code) = d2d_end_err {
+            self.handle_render_device_loss(code, &cands, _raw_req, skin, anchor, selected);
+            return;
+        }
 
         // 定位：优先插入点下方，出屏翻到上方；锚点丢失沿用上次位置。
         // **组段内单调过滤**（跟打器类异步布局应用的跳动终结者）：

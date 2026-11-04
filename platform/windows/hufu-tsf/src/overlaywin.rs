@@ -47,6 +47,15 @@ static OVERLAYS: Mutex<Vec<OverlayEntry>> = Mutex::new(Vec::new());
 pub(crate) const OVERLAY_TIMER_ID: usize = 0x4F56; // "OV"
 /// 延时消失钟 id（hide_delay_ms>0 时挂短钟，到点收窗）
 pub(crate) const OVERLAY_HIDE_TIMER_ID: usize = 0x4F48; // "OH"
+/// 【P2-33 2026-11-04】120ms 淡入/淡出钟：~16ms 一拍改 ULW 的
+/// SourceConstantAlpha。旧实现用 AnimateWindow 同步阻塞 120ms 且在本
+/// 全局锁内（hide_for/sync_tail_locked）→ 每次收词卡顿/重入锁死风险；
+/// 现由本钟驱动，锁只包住单帧 ULW 推帧（亚毫秒），动画本身不占锁。
+pub(crate) const OVERLAY_FADE_TIMER_ID: usize = 0x4F44; // "OD"
+/// 淡入淡出时长（任务口径 120ms）
+const OVERLAY_FADE_MS: u32 = 120;
+/// 淡入淡出帧间隔（约 60Hz；120ms ≈ 8 帧）
+const OVERLAY_FADE_STEP_MS: u32 = 16;
 /// 【补拍钟 2026-11】首帧解码未就绪时的 30ms 自查钟：就绪即上屏——
 /// 旧实现「首帧未就绪直接 return、等下一次 sync」=挂件永远慢一拍
 ///（导入后要点一两下才出 / 一搜就走的宿主永远赶不上的病根）。
@@ -578,6 +587,20 @@ struct OverlayWin {
     bits: isize,
     dib_w: i32,
     dib_h: i32,
+    /// 【P2-33】当前推上屏的整体不透明度（ULW SourceConstantAlpha）。
+    /// 淡入淡出钟逐拍写它并重推当前帧；稳态=cfg.alpha。
+    alpha_cur: u8,
+}
+
+/// 【P2-33】淡入/淡出动画状态（定时器驱动，锁内不做睡眠/阻塞等）。
+struct FadeAnim {
+    start: std::time::Instant,
+    from: u8,
+    to: u8,
+    /// true=淡出到 0 后 SW_HIDE；false=淡入完成后转稳态
+    hide_when_done: bool,
+    /// 参与淡变的帧号（淡出期间 frame_idx 已被重置为 0，必须钉住当时那帧）
+    frame_idx: usize,
 }
 
 struct OverlayEntry {
@@ -605,6 +628,8 @@ struct OverlayEntry {
     hide_at: Option<std::time::Instant>,
     /// 补拍钟封顶时刻（None=未在补拍期；解码失败 3s 后停臂）
     retry_until: Option<std::time::Instant>,
+    /// 【P2-33】淡入淡出状态（None=稳态；由 OVERLAY_FADE_TIMER_ID 驱动）
+    fade: Option<FadeAnim>,
 }
 
 impl OverlayWin {
@@ -747,6 +772,7 @@ impl OverlayWin {
             bits: 0,
             dib_w: 0,
             dib_h: 0,
+            alpha_cur: 255,
         })
     }
 
@@ -755,6 +781,7 @@ impl OverlayWin {
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_TIMER_ID);
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
             let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
+            let _ = KillTimer(HWND(self.hwnd as *mut _), OVERLAY_FADE_TIMER_ID);
             let _ = DestroyWindow(HWND(self.hwnd as *mut _));
             self.hwnd = 0;
         }
@@ -869,10 +896,11 @@ impl OverlayWin {
         }
         drop(frames);
         // ULW:像素级 alpha;整体不透明度走 SourceConstantAlpha
+        // 【P2-33】用 alpha_cur（淡入淡出钟逐拍改写）而非固定 cfg.alpha
         let blend = BLENDFUNCTION {
             BlendOp: 0, // AC_SRC_OVER
             BlendFlags: 0,
-            SourceConstantAlpha: cfg.alpha,
+            SourceConstantAlpha: self.alpha_cur,
             AlphaFormat: 1, // AC_SRC_ALPHA(预乘)
         };
         let pt = POINT { x: 0, y: 0 };
@@ -923,7 +951,8 @@ unsafe extern "system" fn overlay_wndproc(
             let _ = KillTimer(hwnd, OVERLAY_TIMER_ID);
             let _ = KillTimer(hwnd, OVERLAY_HIDE_TIMER_ID);
             let _ = KillTimer(hwnd, OVERLAY_RESYNC_TIMER_ID);
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            // 【P2-33】淡出收窗（120ms，钟驱动；到 0 由 fade_tick SW_HIDE）
+            start_hide(entry, hwnd);
             entry.shown = false;
             entry.drawn = None;
             entry.timer_armed = false;
@@ -964,12 +993,14 @@ unsafe extern "system" fn overlay_wndproc(
             }
             _ => {
                 entry.hide_at = None;
-                if let Some(ov) = entry.ov.as_mut() {
-                    let h = HWND(ov.hwnd as *mut _);
+                let ov_hwnd = entry.ov.as_ref().map(|o| o.hwnd);
+                if let Some(hwnd_i) = ov_hwnd {
+                    let h = HWND(hwnd_i as *mut _);
                     let _ = KillTimer(h, OVERLAY_TIMER_ID);
                     let _ = KillTimer(h, OVERLAY_HIDE_TIMER_ID);
                     let _ = KillTimer(h, OVERLAY_RESYNC_TIMER_ID);
-                    let _ = ShowWindow(h, SW_HIDE);
+                    // 【P2-33】到点淡出（120ms，钟驱动）而非硬切
+                    start_hide(entry, h);
                 }
                 entry.shown = false;
                 entry.timer_armed = false;
@@ -983,6 +1014,11 @@ unsafe extern "system" fn overlay_wndproc(
     if msg == 0x0113 && wparam.0 as usize == OVERLAY_TIMER_ID {
         // WM_TIMER:动图下一帧
         advance_frame(hwnd);
+        return LRESULT(0);
+    }
+    if msg == 0x0113 && wparam.0 as usize == OVERLAY_FADE_TIMER_ID {
+        // 【P2-33】120ms 淡入/淡出：每拍改整体 alpha 并重推当前帧
+        fade_tick(hwnd);
         return LRESULT(0);
     }
     if msg == 0x0113 && wparam.0 as usize == OVERLAY_RESYNC_TIMER_ID {
@@ -1092,6 +1128,7 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
                 last_rect: None,
                 hide_at: None,
                 retry_until: None,
+                fade: None,
             });
             list.len() - 1
         }
@@ -1148,11 +1185,14 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
     // 候选窗不可见 → 兄弟窗必藏(自愈所有漏网隐藏路径);
     // 延时消失期(hide_at 有值)例外:挂件原地呼吸,由 hide 钟到点收窗
     if !IsWindowVisible(cand).as_bool() {
-        if let Some(ov) = entry.ov.as_ref() {
+        // 【P2-33】取句柄后立刻释放 ov 借用，再交给淡出（锁内不阻塞）
+        let ov_hwnd = entry.ov.as_ref().map(|o| o.hwnd);
+        if let Some(hwnd_i) = ov_hwnd {
             if entry.hide_at.is_none() {
-                let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
-                let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-                ov_hide_animated(HWND(ov.hwnd as *mut _));
+                let h = HWND(hwnd_i as *mut _);
+                let _ = KillTimer(h, OVERLAY_TIMER_ID);
+                let _ = KillTimer(h, OVERLAY_RESYNC_TIMER_ID);
+                start_hide(entry, h);
                 entry.shown = false;
                 entry.timer_armed = false;
                 entry.hide_at = None;
@@ -1178,10 +1218,12 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         }
     }
     let Some(cfg) = entry.cfg.clone() else {
-        if let Some(ov) = entry.ov.as_mut() {
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-            ov_hide_animated(HWND(ov.hwnd as *mut _));
+        let ov_hwnd = entry.ov.as_ref().map(|o| o.hwnd);
+        if let Some(hwnd_i) = ov_hwnd {
+            let h = HWND(hwnd_i as *mut _);
+            let _ = KillTimer(h, OVERLAY_TIMER_ID);
+            let _ = KillTimer(h, OVERLAY_RESYNC_TIMER_ID);
+            start_hide(entry, h);
         }
         entry.shown = false;
         entry.timer_armed = false;
@@ -1262,6 +1304,22 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
     };
     let Some(ov) = entry.ov.as_mut() else { return };
     let ov_h = HWND(ov.hwnd as *mut _);
+    // 【P2-33】隐藏→显示过渡：首帧以 alpha=0 上屏（下面 push 用
+    // ov.alpha_cur），随后由 120ms 钟逐拍抬到 cfg.alpha。稳态则把
+    // alpha 钉回配置值（换皮改透明度/淡出残留后自愈）。
+    let fade_in_frame = !entry.shown;
+    if fade_in_frame {
+        // 淡出途中被重新唤起（候选窗又出现）时从当前 alpha 接着淡入，
+        // 不先闪一帧全透明；全新显示则从 0 起。
+        let from = if entry.fade.as_ref().is_some_and(|f| f.hide_when_done) {
+            ov.alpha_cur
+        } else {
+            0
+        };
+        ov.alpha_cur = from;
+    } else if entry.fade.is_none() {
+        ov.alpha_cur = cfg.alpha;
+    }
 
     // ── 布局:候选窗窗口矩形 → 内容盒(内缩阴影物理边距)→ 贴图矩形 ──
     let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
@@ -1303,6 +1361,13 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         }
         entry.drawn = Some(key);
         entry.last_rect = None; // 强制 SWP 落位/显示
+    } else if fade_in_frame {
+        // 内容没变（隐藏前的老帧）也要重推一次：把 alpha=0 落到屏上，
+        // 否则 SWP 显示的是上一段淡出后的残留 alpha（直接半透明闪出）。
+        let idx = entry.frame_idx;
+        if !ov.push_frame(&dec, idx, &cfg) {
+            return;
+        }
     }
     // 位置/尺寸/显示
     let was_shown = entry.shown;
@@ -1322,7 +1387,15 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         entry.last_rect = Some((x, y, cw, ch));
         entry.shown = true;
         if !was_shown {
-            ov_fade_in(ov_h);
+            // 【P2-33】120ms 淡入：只写状态+挂钟，绝不在锁内睡眠/AnimateWindow
+            entry.fade = Some(FadeAnim {
+                start: std::time::Instant::now(),
+                from: ov.alpha_cur,
+                to: cfg.alpha,
+                hide_when_done: false,
+                frame_idx: entry.frame_idx,
+            });
+            let _ = SetTimer(ov_h, OVERLAY_FADE_TIMER_ID, OVERLAY_FADE_STEP_MS, None);
         }
     }
     // 上屏成功：补拍钟退役（未臂时 KillTimer 无害）
@@ -1459,15 +1532,99 @@ unsafe fn arm_hide(entry: &mut OverlayEntry, ov_hwnd: HWND, delay: u32) {
     let _ = SetTimer(ov_hwnd, OVERLAY_HIDE_TIMER_ID, span.saturating_add(span / 2).max(16), None);
 }
 
-/// 【2026-11-03 第三批】挂件 120ms 淡入/淡出。
-/// 【2026-11-03 发版前修】原实现直接调 AnimateWindow：它同步阻塞 120ms
-/// 且会泵消息，而所有调用点都在 OVERLAYS 全局锁内（hide_for /
-/// sync_tail_locked）→ 每次收词卡顿 ≤120ms，并存在重入锁死风险。
-/// v1.9.9 先退化为瞬切（ShowWindow），淡入淡出等移出锁后再上。
-unsafe fn ov_fade_in(_h: HWND) {}
+/// 【P2-33 2026-11-04】挂件 120ms 淡入/淡出（定时器驱动，锁内零阻塞）。
+///
+/// 旧实现（v1.9.8 前）直接 AnimateWindow：同步阻塞 120ms 且内部泵消息，
+/// 而全部调用点都在 OVERLAYS 全局锁内（hide_for / sync_tail_locked）——
+/// 每次收词卡 120ms，且泵消息可能重入锁（死锁风险）。v1.9.9 退化成瞬切。
+///
+/// 现方案：渐变状态写进 OverlayEntry.fade，OVERLAY_FADE_TIMER_ID（~16ms
+/// 一拍）在消息泵里逐拍改 ULW 的 SourceConstantAlpha 并重推「当前帧」。
+/// 锁只在每个定时器回调里包住单帧 ULW 上屏（亚毫秒，与既有 sync 推帧
+/// 同量级），不跨 120ms；淡出完成后回调里才 SW_HIDE。
+/// hit-test 铁律不变：窗口始终 WS_EX_LAYERED|TRANSPARENT +
+/// WM_NCHITTEST→HTTRANSPARENT，淡变只改整体 alpha，不新增可点区域、
+/// 不阻挡下层操作。
+fn fade_alpha_at(from: u8, to: u8, p: f32) -> u8 {
+    // ease-out（起步快收尾缓），与候选窗既有动效曲线同款
+    let e = 1.0 - (1.0 - p.clamp(0.0, 1.0)).powi(3);
+    (from as f32 + (to as f32 - from as f32) * e)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
 
-unsafe fn ov_hide_animated(h: HWND) {
-    let _ = ShowWindow(h, SW_HIDE);
+/// 起臂淡出（当前 alpha → 0，完成后 SW_HIDE）。返回 false=已不可见
+/// （调用方直接 SW_HIDE 兜底，不挂空钟）。
+unsafe fn start_fade_out(entry: &mut OverlayEntry, h: HWND) -> bool {
+    let from = entry.ov.as_ref().map(|o| o.alpha_cur).unwrap_or(0);
+    if from == 0 {
+        return false;
+    }
+    entry.fade = Some(FadeAnim {
+        start: std::time::Instant::now(),
+        from,
+        to: 0,
+        hide_when_done: true,
+        frame_idx: entry.frame_idx,
+    });
+    let _ = SetTimer(h, OVERLAY_FADE_TIMER_ID, OVERLAY_FADE_STEP_MS, None);
+    true
+}
+
+/// 收窗统一入口：能淡出就淡出（120ms，锁内零阻塞），否则直接隐藏。
+/// 【铁律】淡出期窗仍在屏上但 alpha 递减，hit-test 语义不变（穿透）；
+/// 到 0 才 SW_HIDE，用户看不到硬切。
+unsafe fn start_hide(entry: &mut OverlayEntry, h: HWND) {
+    if !start_fade_out(entry, h) {
+        let _ = ShowWindow(h, SW_HIDE);
+        if let Some(ov) = entry.ov.as_mut() {
+            ov.alpha_cur = 0;
+        }
+    }
+}
+
+/// 淡入淡出钟回调（overlay_wndproc WM_TIMER）。
+unsafe fn fade_tick(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = list
+        .iter_mut()
+        .find(|e| e.ov.as_ref().is_some_and(|o| o.hwnd == key))
+    else {
+        let _ = KillTimer(hwnd, OVERLAY_FADE_TIMER_ID);
+        return;
+    };
+    let Some(f) = entry.fade.as_ref() else {
+        let _ = KillTimer(hwnd, OVERLAY_FADE_TIMER_ID);
+        return;
+    };
+    let p = (f.start.elapsed().as_millis() as f32 / OVERLAY_FADE_MS as f32).clamp(0.0, 1.0);
+    let a = fade_alpha_at(f.from, f.to, p);
+    let done = p >= 1.0;
+    let hide_when_done = f.hide_when_done;
+    let frame = f.frame_idx;
+    let dec = entry.decoded.clone();
+    let cfg = entry.cfg.clone();
+    if let Some(ov) = entry.ov.as_mut() {
+        ov.alpha_cur = a;
+        // 逐拍重推当前帧（只改 BLENDFUNCTION 的整体 alpha，像素不变）
+        if let (Some(dec), Some(cfg)) = (dec.as_ref(), cfg.as_ref()) {
+            if !done || !hide_when_done {
+                let _ = ov.push_frame(dec, frame, cfg);
+            }
+        }
+    }
+    if done {
+        entry.fade = None;
+        let _ = KillTimer(hwnd, OVERLAY_FADE_TIMER_ID);
+        if hide_when_done {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            entry.drawn = None;
+            if let Some(ov) = entry.ov.as_mut() {
+                ov.alpha_cur = 0;
+            }
+        }
+    }
 }
 
 /// 隐藏同步(WM_APP_HIDE_CAND 处理器内调用)。
@@ -1486,11 +1643,15 @@ pub unsafe fn hide_for(cand: HWND) {
             }
             return;
         }
-        if let Some(ov) = entry.ov.as_mut() {
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_TIMER_ID);
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_HIDE_TIMER_ID);
-            let _ = KillTimer(HWND(ov.hwnd as *mut _), OVERLAY_RESYNC_TIMER_ID);
-            ov_hide_animated(HWND(ov.hwnd as *mut _));
+        // 【P2-33】收窗：能淡出就 120ms 淡出（钟驱动，锁内不阻塞）；
+        // 句柄先取出再释放 ov 借用，才能把 &mut entry 交给 start_hide。
+        let ov_hwnd = entry.ov.as_ref().map(|o| o.hwnd);
+        if let Some(hwnd_i) = ov_hwnd {
+            let h = HWND(hwnd_i as *mut _);
+            let _ = KillTimer(h, OVERLAY_TIMER_ID);
+            let _ = KillTimer(h, OVERLAY_HIDE_TIMER_ID);
+            let _ = KillTimer(h, OVERLAY_RESYNC_TIMER_ID);
+            start_hide(entry, h);
         }
         entry.shown = false;
         entry.timer_armed = false;

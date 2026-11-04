@@ -1231,6 +1231,157 @@ impl ITfTextInputProcessorEx_Impl for HuFuTs_Impl {
     }
 }
 
+// ============================================================================
+// 【P0-4 2026-11-04】组段态 KeyDown 管道失败降级（丢键修复）
+// ============================================================================
+//
+// 病灶：TestKeyDown 已声明「这个键我吞了」——组段中（composing=true）任意
+// 键都预吞（见 dispatch 的 want 判定），信任 TestDown 的宿主（CUAS/PS 桥
+// 接类）拿到 TRUE 后就不把键交给应用。随后 KeyDown 里 ipc::key_request
+// 因 server 断线/超时返回 None 而 `return BOOL(0)`：键既不进候选也不进文
+// 档，**静默蒸发**。用户看到的是「打着打着全键盘失效」（八十四修大写字
+// 母 / keys-5008 数字同型事故；本项是它们未覆盖的组段态版本）。
+//
+// 取舍（不重写 IPC、不扩异步队列）：在失败点做一次性本地降级——
+//   1) 把本地已知的 preedit（g.preedit_last，即用户眼前那段字）提交进
+//      文档（Op::Commit，既有 TSF 编辑会话通道）；
+//   2) 当前键若是可打印字符，同一次提交里本地直插；
+//   3) 清本地组段态（composing=false、composition=None、raw/preedit 清空、
+//      候选窗收）——后续键 TestDown 走空态判定（多数放行），用户恢复打字。
+// 代价：若 server 实际已处理该键而只是响应超时（>2s 阻塞），本降级可能
+// 造成该字符重复一次。相对「整段键盘蒸发」这是可接受的一侧；若 server
+// 只是断线（常见情形），则零重复。功能键（Esc/退格/方向键）无字符可降
+// 级：只清组段态、键仍吞（TestDown 已吞，交还宿主也回不来）。
+#[derive(Debug, PartialEq, Eq)]
+enum KeyPipeFailAction {
+    /// 空态/Test 阶段：原样交还宿主（TestDown 已放行，不构成丢键）
+    PassThrough,
+    /// 组段态：提交 text（preedit + 当前字符）并清组段
+    Degrade(String),
+    /// 组段态但无字可提交（功能键）：只清组段态，键保持吞掉
+    ClearOnly,
+}
+
+fn key_pipe_fail_action(
+    test_only: bool,
+    composing: bool,
+    preedit: &str,
+    ch: Option<char>,
+) -> KeyPipeFailAction {
+    if test_only || !composing {
+        return KeyPipeFailAction::PassThrough;
+    }
+    match ch {
+        Some(c) => {
+            let mut text = String::with_capacity(preedit.len() + 4);
+            text.push_str(preedit);
+            text.push(c);
+            KeyPipeFailAction::Degrade(text)
+        }
+        None if !preedit.is_empty() => KeyPipeFailAction::Degrade(preedit.to_string()),
+        None => KeyPipeFailAction::ClearOnly,
+    }
+}
+
+/// 当前键的可打印字符（本地直插降级用）。只认字母/数字/空格：标点与符号
+/// 的键位随键盘布局变化，猜错比丢一个键更糟（且这类键多由宿主快捷键语义
+/// 承接），有歧义时退化为 ClearOnly。
+fn key_char_for_degrade(vk: usize, shift: bool) -> Option<char> {
+    match vk {
+        // VK_A..VK_Z
+        0x41..=0x5A => {
+            let c = (b'a' + (vk - 0x41) as u8) as char;
+            Some(if shift { c.to_ascii_uppercase() } else { c })
+        }
+        // VK_0..VK_9（shift=US 布局上排符号）
+        0x30..=0x39 => {
+            const SHIFTED: [char; 10] = [')', '!', '@', '#', '$', '%', '^', '&', '*', '('];
+            if shift {
+                Some(SHIFTED[vk - 0x30])
+            } else {
+                Some((b'0' + (vk - 0x30) as u8) as char)
+            }
+        }
+        // VK_SPACE
+        0x20 => Some(' '),
+        _ => None,
+    }
+}
+
+/// 观测：组段态降级次数（诊断/回归取证）。
+static PIPE_FAIL_DEGRADE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+mod pipe_fail_tests {
+    use super::*;
+
+    /// 空态/Test 阶段不能降级（TestDown 空态本就放行，吞键才会真丢字）。
+    #[test]
+    fn idle_or_test_passes_through() {
+        assert_eq!(
+            key_pipe_fail_action(false, false, "", Some('a')),
+            KeyPipeFailAction::PassThrough
+        );
+        // 空态即使已有 preedit 缓存残留也不拦（composing 才是吞键判据）
+        assert_eq!(
+            key_pipe_fail_action(false, false, "ni", Some('a')),
+            KeyPipeFailAction::PassThrough
+        );
+        assert_eq!(
+            key_pipe_fail_action(true, true, "ni", Some('a')),
+            KeyPipeFailAction::PassThrough
+        );
+    }
+
+    /// 组段态：preedit + 本键字符一次性提交（用户至少看到自己敲的字）。
+    #[test]
+    fn composing_degrades_with_preedit_and_char() {
+        assert_eq!(
+            key_pipe_fail_action(false, true, "ni", Some('h')),
+            KeyPipeFailAction::Degrade("nih".to_string())
+        );
+        // 无 preedit（刚开组段首键）→ 只提交本键字符
+        assert_eq!(
+            key_pipe_fail_action(false, true, "", Some('a')),
+            KeyPipeFailAction::Degrade("a".to_string())
+        );
+        // 有 preedit 但本键不可打印（如 Esc）→ 提交已显示内容
+        assert_eq!(
+            key_pipe_fail_action(false, true, "nih", None),
+            KeyPipeFailAction::Degrade("nih".to_string())
+        );
+    }
+
+    /// 组段态功能键且无 preedit：只清组段态（键仍吞，交还宿主也回不来）。
+    #[test]
+    fn composing_function_key_clears_only() {
+        assert_eq!(
+            key_pipe_fail_action(false, true, "", None),
+            KeyPipeFailAction::ClearOnly
+        );
+    }
+
+    /// 本地直插字符映射：字母（shift 大写）、数字（shift 符号）、空格；
+    /// 其余键位不猜（返回 None → ClearOnly），避免插错标点。
+    #[test]
+    fn key_char_mapping_is_conservative() {
+        assert_eq!(key_char_for_degrade(0x41, false), Some('a'));
+        assert_eq!(key_char_for_degrade(0x41, true), Some('A'));
+        assert_eq!(key_char_for_degrade(0x5A, false), Some('z'));
+        assert_eq!(key_char_for_degrade(0x31, false), Some('1'));
+        assert_eq!(key_char_for_degrade(0x31, true), Some('!'));
+        assert_eq!(key_char_for_degrade(0x30, true), Some(')'));
+        assert_eq!(key_char_for_degrade(0x20, false), Some(' '));
+        // 空格 shift 仍是空格（避免被当成不可打印而丢）
+        assert_eq!(key_char_for_degrade(0x20, true), Some(' '));
+        // 标点/功能键不猜
+        assert_eq!(key_char_for_degrade(0x1B, false), None);
+        assert_eq!(key_char_for_degrade(0x08, false), None);
+        assert_eq!(key_char_for_degrade(0xBA, false), None);
+    }
+}
+
 impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
         // 【焦点残留】本进程键盘 sink 失去前台（切到别的应用打字、
@@ -3222,6 +3373,69 @@ impl HuFuTs_Impl {
     ///   TestDown 清除（组合保护）、TestUp 仍存活才发 server 切换。
     /// - CapsLock / Ctrl+Space 模式键：Test 阶段（Down 或 Up）直发
     ///   server，规范宿主的后续成对事件由 80ms 同键去重挡双发。
+    /// 【P0-4】KeyDown 管道失败降级入口（语义与取舍见文件头 P0-4 注释）。
+    fn key_pipe_fail_degrade(
+        &self,
+        vk: usize,
+        m_shift: bool,
+        m_ctrl: bool,
+        m_alt: bool,
+        test_only: bool,
+    ) -> BOOL {
+        let (composing, chinese, preedit) = {
+            let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (g.composing, g.chinese, g.preedit_last.clone())
+        };
+        let ch = if !m_ctrl && !m_alt {
+            key_char_for_degrade(vk, m_shift)
+        } else {
+            None
+        };
+        match key_pipe_fail_action(test_only, composing && chinese, &preedit, ch) {
+            KeyPipeFailAction::PassThrough => BOOL(0),
+            KeyPipeFailAction::ClearOnly => {
+                crate::tsf::trace(&format!(
+                    "pipe-fail: 组段态功能键 vk=0x{vk:X} 管道失败 → 只清组段态（TestDown 已吞，交还宿主也回不来）"
+                ));
+                self.clear_local_composition_after_pipe_fail();
+                BOOL(1)
+            }
+            KeyPipeFailAction::Degrade(text) => {
+                PIPE_FAIL_DEGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::tsf::trace(&format!(
+                    "pipe-fail: vk=0x{vk:X} 管道失败 → 降级提交 {} 字（preedit+本键）并清组段",
+                    text.chars().count()
+                ));
+                // 提交走既有 TSF 编辑会话（与正常上屏同通道）；提交失败
+                // 也继续清本地态——宁可少字，不可继续吞键。
+                let _ = run_session(&self.shared, Op::Commit(text), None);
+                self.clear_local_composition_after_pipe_fail();
+                BOOL(1)
+            }
+        }
+    }
+
+    /// 【P0-4】清本地组段态：后续键回到空态判定（不再预吞），候选窗收起
+    /// （server 已失联，屏幕上不残留陈旧候选）。
+    fn clear_local_composition_after_pipe_fail(&self) {
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let had = g.composing || g.composition.is_some() || !g.raw_last.is_empty();
+        g.composition = None;
+        g.composing = false;
+        g.raw_last.clear();
+        g.preedit_last.clear();
+        g.digit_tail.clear();
+        if let Some(c) = g.cand2.as_mut() {
+            c.hide_now();
+        }
+        drop(g);
+        if had {
+            crate::tsf::trace(
+                "pipe-fail: 本地组段态已清（composing=false）→ 后续键走空态直通，不再吞键",
+            );
+        }
+    }
+
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
         // （游戏宿主不挂本 sink——dispatch 仅普通宿主可达；游戏键流在
         // 子类化 WndProc 的 game_engine_key 里，见 E7。）
@@ -3859,7 +4073,11 @@ impl HuFuTs_Impl {
             line_end,
             digit_tail.as_deref(),
         ) else {
-            return BOOL(0);
+            // 【P0-4 组段态丢键 2026-11-04】管道失败不能一律 BOOL(0)：
+            // TestDown 已声明吞键（组段中任意键）时，交还宿主=宿主早已
+            // 丢弃的键彻底蒸发。走一次性本地降级（提交 preedit+本键字符
+            // 并清组段态），取舍与副作用见 key_pipe_fail_degrade 注释。
+            return self.key_pipe_fail_degrade(wparam, m_shift, m_ctrl, m_alt, test_only);
         };
         if g_first_key_probe() {
             diag_note(&format!("lat: KEY后 name={name} consumed={consumed}"));
