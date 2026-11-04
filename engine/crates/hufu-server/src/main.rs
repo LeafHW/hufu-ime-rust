@@ -240,7 +240,7 @@ fn log_startup(msg: &str) {
 }
 
 /// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
-const BUILD_TAG: &str = "2026-11-05b";
+const BUILD_TAG: &str = "2026-11-05c";
 
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
@@ -874,9 +874,11 @@ fn main() {
                     None => false,
                 };
                 if !opened {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &url])
-                        .spawn();
+                    // 【零解释器铁律 2026-11-05】末级兜底原为 `cmd /C start`
+                    // （拉起 cmd.exe 解释器，违反运行时零解释器铁律，见
+                    // AGENTS.md）。改 ShellExecuteW 直开系统默认浏览器，
+                    // 零子进程、行为与资源管理器双击一致。
+                    sys_win::open_url_default(&url);
                 }
             }
         });
@@ -3559,6 +3561,27 @@ mod sys_win {
                 let _ = SetProcessDpiAwareness(2);
             }
         }
+    }
+
+    /// 用系统默认关联程序打开 URL（零解释器：直调 ShellExecuteW，不拉
+    /// cmd/powershell 子进程——运行时零解释器铁律，AGENTS.md 2026-11-05）。
+    /// 返回值 >32 表示成功（ShellExecuteW 惯例）。
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            verb: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    pub fn open_url_default(url: &str) -> bool {
+        const SW_SHOWNORMAL: i32 = 1;
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { ShellExecuteW(0, verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) > 32 }
     }
 
     // ── 设置窗口（Chromium --app）居中参数 ──

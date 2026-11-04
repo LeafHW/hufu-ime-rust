@@ -756,6 +756,34 @@ $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '数�
 # PowerShell 驱动（用户只感到慢）。release 产物实测 ~355KB。
 $eRh = $arc.Entries | Where-Object { $_.FullName -eq 'hufu-render-helper.exe' } | Select-Object -First 1
 $all = (Check ($null -ne $eRh -and $eRh.Length -gt 50000) "渲染小助手 hufu-render-helper.exe（$(if ($eRh) { [math]::Round($eRh.Length/1KB,0) } else { 0 })KB > 50KB）") -and $all
+# 【零解释器门禁 2026-11-05 用户铁律】产品运行时二进制任何路径不得拉起
+# PowerShell/cmd 解释器。二进制级查 powershell/pwsh 调用特征（cmd.exe
+# 裸串为 Rust std 处理 .bat 参数的内建字符串、无法从产物中消除，故不在
+# 二进制级查它，由源码级门禁兜住）。检出即 FAIL 阻断发版。
+$ziBins = @('hufu-server.exe','hufu-settings.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-render-helper.exe')
+foreach ($zin in $ziBins) {
+    $e = $arc.Entries | Where-Object { $_.FullName -eq $zin } | Select-Object -First 1
+    $bad = $null
+    if ($e) {
+        $ms = New-Object IO.MemoryStream
+        $e.Open().CopyTo($ms)
+        $txt = [Text.Encoding]::ASCII.GetString($ms.ToArray()).ToLowerInvariant()
+        foreach ($pat in @('powershell.exe','pwsh.exe','powershell -command')) {
+            if ($txt.Contains($pat)) { $bad = $pat; break }
+        }
+    } else { $bad = '包内缺失' }
+    $all = (Check ($null -eq $bad) "零解释器 zip内 $zin$(if ($bad) { "：检出 $bad" })") -and $all
+}
+# 源码级：运行时 crate 不得 spawn cmd/powershell 解释器（含变量间接——
+# 一律写明豁免名单注释才允许）。当前豁免：无。
+$ziSrcDirs = @('E:\DSH-KF\hufu\engine\crates\hufu-server\src','E:\DSH-KF\hufu\platform\windows\hufu-tsf\src','E:\DSH-KF\hufu\platform\windows\hufu-settings\src','E:\DSH-KF\hufu\engine\crates\hufu-render-helper\src')
+$ziHits = @()
+foreach ($d in $ziSrcDirs) {
+    if (Test-Path $d) {
+        $ziHits += @(Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\("(cmd|powershell|pwsh)' | ForEach-Object { "$(Split-Path $_.Path -Leaf):$($_.LineNumber)" })
+    }
+}
+$all = (Check ($ziHits.Count -eq 0) "零解释器 源码无 cmd/powershell spawn$(if ($ziHits.Count) { "：$($ziHits -join '; ')" })") -and $all
 # 【2026-10-18 反查瘦身】全局资源：拼音反查只发全拼基表（码列空格
 # 分隔音节）；自然码/小鹤双拼装载期规则派生，实表不得在包内。
 $all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\]全拼\.txt$' }).Count -eq 1) '拼音反查 全拼基表') -and $all
