@@ -23,7 +23,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
@@ -483,6 +485,24 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
                 ShowWindow(hwnd, SW_MAXIMIZE);
             }
         }
+        "win:retry" => {
+            // 【2026-11-05】错误页「重试」：重新探测真实端口再导航，不再跳旧地址
+            if (*app)
+                .last_recover
+                .map(|t| t.elapsed() < Duration::from_millis(1200))
+                .unwrap_or(false)
+            {
+                (*app).log("manual retry debounced (previous probe just ran)");
+                return;
+            }
+            (*app).log("manual retry requested from error page");
+            if !recover_once(app, true) {
+                (*app).log("manual retry: still no live hufu port; keep auto-retrying");
+                arm_recover_timer(app);
+            } else {
+                KillTimer(hwnd, 8);
+            }
+        }
         "win:close" => {
             // 【P0-1 2026-11-04】页面主动请求关闭：此时页面自己的未保存
             // 确认已经走完（或无脏数据），直接销毁。旧实现再 PostMessage
@@ -829,7 +849,7 @@ unsafe extern "system" fn handler_invoke(
                     app,
                     "无法打开虎符设置页",
                     &format!(
-                        "hufu-server 可能未启动或端口被占用。\n导航失败（WebErrorStatus={web_err}）。\n\n点「重试」重新连接；也可关闭后从托盘/开始菜单重新打开。"
+                        "设置页需要的本地服务没有响应（可能还在启动，或被安全软件拦截）。\n导航失败（WebErrorStatus={web_err}）。\n\n程序正在自动重试，通常几秒内会自己恢复；也可以点「重试」立即重连。"
                     ),
                 );
                 return S_OK;
@@ -951,6 +971,11 @@ struct App {
     /// 用户此前是否已被提示过）。关窗守卫不据此强制关闭——重复关闭请求
     /// 只会重新询问页面，绝不静默丢数据。
     close_dirty_at: Option<Instant>,
+    /// 【2026-11-05】错误页自动恢复：已自动重探次数（每 2s 一次，最多 30 次）。
+    recover_retry: u32,
+    /// 【2026-11-05】上一次恢复探测的时刻：手动重试/自动重试去重，避免
+    /// 连点「重试」时把 UI 线程连续堵在 7 个候选端口的超时上。
+    last_recover: Option<Instant>,
 }
 
 impl App {
@@ -1048,7 +1073,10 @@ button:hover{{background:#3a3123}}
 </div></div>
 <script>
 var TARGET={url_js};
-document.getElementById('retry').onclick=function(){{location.href=TARGET}};
+document.getElementById('retry').onclick=function(){{
+  if(window.chrome&&window.chrome.webview){{window.chrome.webview.postMessage('win:retry')}}
+  else{{location.href=TARGET}}
+}};
 document.getElementById('close').onclick=function(){{
   if(window.chrome&&window.chrome.webview){{window.chrome.webview.postMessage('win:close')}}
   else{{window.close()}}
@@ -1064,6 +1092,65 @@ document.getElementById('close').onclick=function(){{
     let hr = wv_navigate_to_string((*app).webview, w.as_ptr());
     (*app).log(&format!("NavigateToString(error page) -> hr=0x{:08X}", hr as u32));
     activate_and_focus(app);
+    // 【2026-11-05】停在错误页期间每 2s 重新探测一次：server 稍后才起来
+    // （自启慢/刚被拉起/被输入法自愈拉起）时窗口会自己恢复，用户不用动。
+    arm_recover_timer(app);
+}
+
+/// 【2026-11-05】错误页恢复：重新探测真实端口（握手文件 + 候选表），命中就
+/// 把窗口导航过去。绝不再用旧 URL 死磕——旧 URL 是探测失败后的占位端口。
+unsafe fn recover_once(app: *mut App, manual: bool) -> bool {
+    if app.is_null() || !(*app).error_mode || (*app).webview.is_null() {
+        return false;
+    }
+    (*app).last_recover = Some(Instant::now());
+    let Some(port) = resolve_live_port(&(*app).log_path) else {
+        return false;
+    };
+    let text = default_url(port);
+    (*app).url_text = text.clone();
+    (*app).url = wide(&text);
+    (*app).log(&format!(
+        "{} retry: live port 127.0.0.1:{port} found; navigating {text}",
+        if manual { "manual" } else { "auto" }
+    ));
+    // 先退出错误态再导航：万一这次仍失败，导航回调会重新出错误页并重新起表
+    (*app).error_mode = false;
+    (*app).error_nav_pending = false;
+    let _ = wv_navigate((*app).webview, (*app).url.as_ptr());
+    true
+}
+
+unsafe fn arm_recover_timer(app: *mut App) {
+    if app.is_null() {
+        return;
+    }
+    (*app).recover_retry = 0;
+    KillTimer((*app).hwnd, 8);
+    SetTimer((*app).hwnd, 8, 2000, null());
+}
+
+unsafe fn recover_tick(app: *mut App) {
+    if app.is_null() || !(*app).error_mode {
+        return;
+    }
+    // 手动重试刚跑过：这次跳过，别把 UI 再堵一遍
+    if (*app)
+        .last_recover
+        .map(|t| t.elapsed() < Duration::from_millis(1500))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    (*app).recover_retry = (*app).recover_retry.saturating_add(1);
+    if recover_once(app, false) {
+        KillTimer((*app).hwnd, 8);
+        return;
+    }
+    if (*app).recover_retry >= 30 {
+        (*app).log("auto-retry gave up after 30 attempts (60s); waiting for manual retry");
+        KillTimer((*app).hwnd, 8);
+    }
 }
 
 unsafe fn app_ptr(hwnd: HWND) -> *mut App {
@@ -1283,6 +1370,12 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TIMER => {
+            if wparam == 8 {
+                // 【2026-11-05】错误页自动恢复：每 2s 重新探测端口，命中即导航
+                let app = app_ptr(hwnd);
+                recover_tick(app);
+                return 0;
+            }
             if wparam == 7 {
                 // 【P0-1 2026-11-04】关窗询问超时看护：页面 400ms 内没回
                 // ExecuteScript（渲染进程忙/挂死）→ 按可关处理，不能把
@@ -1573,12 +1666,94 @@ fn exe_dir() -> PathBuf {
 // 完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
-const PROBE_PORT_TIMEOUT: Duration = Duration::from_millis(300);
-const PROBE_TOTAL_BUDGET: Duration = Duration::from_millis(1500);
+const PROBE_PORT_TIMEOUT: Duration = Duration::from_millis(250);
+/// 候选表全扫一遍的预算：7 个候选 × 250ms 也能走完（旧值 1.5s 只够 5 个，
+/// 27890 这个兜底端口冷启动时永远轮不到）。
+const PROBE_TOTAL_BUDGET: Duration = Duration::from_millis(2000);
+/// 探测全失败后：拉起 server 并等它把 HTTP 端口监听起来的时长。
+/// 冷启动 Host::new（配置/码表装载）在慢机器上要几秒，旧实现 1.5s 就判死。
+const SERVER_READY_WAIT_MS: u64 = 5000;
 
 fn default_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/next?shell=1")
 }
+
+// ---------------------------------------------------------------------------
+// 【2026-11-05 设置页连不上根治】端口握手 + 自愈
+// ---------------------------------------------------------------------------
+// 事故：4390 被系统保留（WinNAT/Hyper-V 排除段，每次开机都会重排）或被别家
+// 程序占用时，hufu-server 会退到 17890…；设置壳原来只能按固定候选表「猜」
+// 端口，探测失败后把猜到的端口写进错误页，而「重试」只是 location.href
+// 跳同一个猜错的地址 —— server 后来起来了也永远连不上，用户视角就是
+// 「重启了也打不开设置」。
+// 现在的三层修复：
+//   1) server 把实际监听端口落到 %LOCALAPPDATA%\HuFu\http_port.txt，壳优先读；
+//   2) 探测全失败时壳自己按安装目录拉起 hufu-server.exe，再等它就绪；
+//   3) 停在错误页时每 2s 自动重新探测，连上就自动进页面（重试按钮同样走重探）。
+fn port_file_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|base| base.join("HuFu").join("http_port.txt"))
+}
+
+fn read_port_file() -> Option<u16> {
+    let path = port_file_path()?;
+    let text = fs::read_to_string(path).ok()?;
+    text.lines().next()?.trim().parse::<u16>().ok()
+}
+
+/// 单端口快速判定：只认 /api/about 的虎符特征（别家 HTTP 不算）。
+fn probe_fast(port: u16, timeout: Duration) -> bool {
+    matches!(
+        probe_hufu_http("127.0.0.1", port, timeout),
+        ProbeHit::Hufu
+    )
+}
+
+/// 重新解析真实可用端口（不拉起 server）：握手文件 → 候选表。
+/// 错误页的「重试」和自动恢复都走这里，不再用旧 URL 死磕。
+fn resolve_live_port(log: &Path) -> Option<u16> {
+    if let Some(port) = read_port_file() {
+        if probe_fast(port, Duration::from_millis(150)) {
+            log_line(log, &format!("port file hit hufu server 127.0.0.1:{port}"));
+            return Some(port);
+        }
+        log_line(
+            log,
+            &format!("port file says {port} but nothing answers there (stale), scanning candidates"),
+        );
+    }
+    for port in PROBE_PORTS {
+        if probe_fast(port, Duration::from_millis(120)) {
+            log_line(log, &format!("candidate probe hit hufu server 127.0.0.1:{port}"));
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// 按安装目录拉起 hufu-server.exe（设置壳以前只会导航，服务没起来就只能报错）。
+/// 正常安装时壳就在安装根目录，同目录的 hufu-server.exe 必然存在；server 自带
+/// 命名互斥体，重复拉起不会出现双实例。返回是否确实发起了启动。
+fn try_launch_server(exe_dir: &Path) -> bool {
+    let mut candidates = vec![exe_dir.join("hufu-server.exe")];
+    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(base.join("HuFu").join("hufu-server.exe"));
+    }
+    for exe in candidates {
+        if !exe.is_file() {
+            continue;
+        }
+        let mut cmd = Command::new(&exe);
+        // 即使是 GUI 子系统也显式禁用控制台：任何机器上都不许闪黑窗
+        cmd.creation_flags(0x0800_0000);
+        if cmd.spawn().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 
 struct CliArgs {
     url: String,
@@ -1749,34 +1924,68 @@ fn probe_slice(deadline: Instant) -> Option<Duration> {
 }
 
 /// 决定最终设置页 URL：
-///   * `--url` 显式给出且命中虎符特征，或落在非候选端口（开发用 Vite 等）
-///     → 保留：托盘/脚本按 server 实际端口传参走这条；
+///   * `--url` 显式给出且落在非候选端口（开发用 Vite 等）→ 按用户指定保留；
+///   * server 落盘的握手端口（http_port.txt）优先；
+///   * 显式候选端口（托盘传的就是 server 实际端口）命中即保留；
 ///   * 否则按 PROBE_PORTS 探测首个虎符 server，命中即用该端口；
-///   * 「连上但 300ms 无响应」的端口在剩余预算内各重试一次（瞬时慢不误杀）；
-///   * 全程未命中 → 回退到探测到的无监听端口，绝不导航到已知外来 HTTP 服务。
-fn resolve_url(args: &mut CliArgs) {
+///   * 全程未命中 → 自己拉起 server 并等它就绪；仍不行才回退到无监听端口
+///     （错误页会自动重试，手动「重试」也会重新探测而不是死磕旧地址）。
+fn resolve_url(args: &mut CliArgs, exe_dir: &Path) {
     let deadline = Instant::now() + PROBE_TOTAL_BUDGET;
+
+    // 1) 非候选端口的显式 --url（Vite/自定义）优先，绝不被握手文件覆盖
     if args.url_explicit {
         let explicit = args.url.clone();
         let parsed = split_http_host_port(&explicit);
-        let hit = parsed
+        let is_candidate = parsed
             .as_ref()
-            .and_then(|(host, port)| probe_slice(deadline).map(|t| probe_hufu_http(host, *port, t)));
-        let is_hufu = matches!(&hit, Some(ProbeHit::Hufu));
-        let candidate_port = parsed
-            .as_ref()
-            .map(|(_, p)| *p)
-            .filter(|p| PROBE_PORTS.contains(p));
-        let dev_keep = candidate_port.is_none()
-            && matches!(&hit, Some(ProbeHit::OtherHttp) | Some(ProbeHit::TcpOnly));
-        if is_hufu || dev_keep {
-            let note = if is_hufu {
-                ""
-            } else {
-                "（非虎符特征，非候选端口，按用户指定保留）"
-            };
-            log_line(&args.log, &format!("explicit --url kept{note}：{explicit}"));
+            .map(|(_, p)| PROBE_PORTS.contains(p))
+            .unwrap_or(false);
+        if !is_candidate {
+            let hit = parsed.as_ref().and_then(|(host, port)| {
+                probe_slice(deadline).map(|t| probe_hufu_http(host, *port, t))
+            });
+            if matches!(
+                hit,
+                Some(ProbeHit::Hufu) | Some(ProbeHit::OtherHttp) | Some(ProbeHit::TcpOnly)
+            ) {
+                log_line(&args.log, &format!("explicit --url kept：{explicit}"));
+                return;
+            }
+            log_line(
+                &args.log,
+                &format!("explicit --url 不可达，回退端口探测：{explicit}"),
+            );
+        }
+    }
+
+    // 2) server 自己写的真实端口（2026-11-05）：这是「端口总在变」的正解
+    if let Some(port) = read_port_file() {
+        if probe_fast(port, PROBE_PORT_TIMEOUT) {
+            args.url = default_url(port);
+            log_line(
+                &args.log,
+                &format!(
+                    "port file hit hufu server 127.0.0.1:{port}；target URL：{}",
+                    args.url
+                ),
+            );
             return;
+        }
+        log_line(
+            &args.log,
+            &format!("port file says {port} but nothing answers there (stale), keep probing"),
+        );
+    }
+
+    // 3) 显式候选端口：托盘按 server 实际端口传参，命中即保留原 URL
+    if args.url_explicit {
+        let explicit = args.url.clone();
+        if let Some((_, port)) = split_http_host_port(&explicit) {
+            if PROBE_PORTS.contains(&port) && probe_fast(port, PROBE_PORT_TIMEOUT) {
+                log_line(&args.log, &format!("explicit --url kept：{explicit}"));
+                return;
+            }
         }
         log_line(
             &args.log,
@@ -1837,8 +2046,58 @@ fn resolve_url(args: &mut CliArgs) {
         );
         return;
     }
-    // 【2026-11-02 P1】没有虎符 server 时不要回退到 4390：4390 可能被别家
-    // HTTP 服务占着（探测结果 OtherHttp），导航过去就是打开外来页面。
+    // 5) 全都没命中：自己把 server 拉起来，再等它把 HTTP 端口监听起来。
+    //    冷启动 Host::new 慢、开机自启被杀软禁用、用户还没打字导致 TSF 自愈
+    //    没触发 —— 这三类就是「重启也打不开设置」的常见来源。
+    let launched = try_launch_server(exe_dir);
+    log_line(
+        &args.log,
+        if launched {
+            "no hufu server answered; spawned hufu-server.exe and waiting for HTTP ready"
+        } else {
+            "no hufu server answered; hufu-server.exe not found in install dir / LOCALAPPDATA\\HuFu"
+        },
+    );
+    if launched {
+        let wait_until = Instant::now() + Duration::from_millis(SERVER_READY_WAIT_MS);
+        while Instant::now() < wait_until {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(port) = read_port_file() {
+                if probe_fast(port, PROBE_PORT_TIMEOUT) {
+                    args.url = default_url(port);
+                    log_line(
+                        &args.log,
+                        &format!(
+                            "server became ready on 127.0.0.1:{port} while waiting；target URL：{}",
+                            args.url
+                        ),
+                    );
+                    return;
+                }
+            }
+            for port in PROBE_PORTS {
+                if probe_fast(port, Duration::from_millis(150)) {
+                    args.url = default_url(port);
+                    log_line(
+                        &args.log,
+                        &format!(
+                            "server became ready on 127.0.0.1:{port} while waiting；target URL：{}",
+                            args.url
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        log_line(
+            &args.log,
+            &format!("server still not ready after {SERVER_READY_WAIT_MS}ms; showing error page (auto-retry keeps running)"),
+        );
+    }
+
+    // 6) 仍未就绪：回退到探测到的无监听端口（错误页会自动重试 + 手动重试会重新探测）
+    // 没有虎符 server 时不要回退到 4390：4390 可能被别家 HTTP 服务占着
+    // （探测结果 OtherHttp），导航过去就是打开外来页面。
     // 优先用探测到「无监听」的候选端口（必然白屏/错误页，但安全）；
     // 全候选都被别家占时用 4391（不在候选表内，仍不指向已知外来服务）。
     let fallback_port = dead_port.unwrap_or_else(|| DEFAULT_PORT.saturating_add(1));
@@ -1926,7 +2185,8 @@ unsafe fn real_main() -> i32 {
 
     // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
     // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
-    resolve_url(&mut args);
+    // 【2026-11-05】探测全失败时会先拉起 hufu-server 并等它就绪（最多 5s）。
+    resolve_url(&mut args, &exe_dir);
     // 【--theme】追加到最终 URL（默认与显式 URL 都已含 query，用 & 拼；
     // 防御性判断避免重复追加）。
     if let Some(theme) = args.theme.clone() {
@@ -2066,6 +2326,8 @@ unsafe fn real_main() -> i32 {
         close_state: 0,
         close_deadline: None,
         close_dirty_at: None,
+        recover_retry: 0,
+        last_recover: None,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 

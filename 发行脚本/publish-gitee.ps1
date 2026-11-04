@@ -1,4 +1,4 @@
-# publish-gitee.ps1 - 把发版产物同步到 Gitee（镜像仓 Release 附件 + 更新清单）
+﻿# publish-gitee.ps1 - 把发版产物同步到 Gitee（镜像仓 Release 附件 + 更新清单）
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File E:\DSH-KF\hufu\发行脚本\publish-gitee.ps1 -Version 1.9.9

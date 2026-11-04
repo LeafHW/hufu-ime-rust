@@ -186,6 +186,33 @@ fn bind_http_listener(preferred: u16) -> Option<(u16, std::net::TcpListener)> {
     None
 }
 
+/// 【设置页端口握手 2026-11-05】把实际监听端口写到
+/// `%LOCALAPPDATA%\HuFu\http_port.txt`：设置壳（hufu-settings.exe）原来只能按
+/// 固定候选表猜端口，4390 被系统保留/被别家占用时 server 换到 17890，
+/// 壳探不到就停在一个"猜出来的端口"上，点多少次重试都连不上。
+/// 落盘后壳优先读这个文件，端口怎么变都能找到；壳侧仍会用 /api/about 复核，
+/// 文件过期/伪造不会导致连错服务。
+#[cfg(windows)]
+fn write_http_port_file(port: u16) {
+    let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let dir = base.join("HuFu");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("http_port.txt");
+    // 写临时文件再改名：壳可能正在读，读到半个端口号会解析失败
+    let tmp = dir.join("http_port.txt.tmp");
+    let body = format!("{port}\r\n");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        return;
+    }
+    // 改名失败（杀软/占用）退回直接写——单行小文件，最坏是壳读空一次
+    let _ = std::fs::write(&path, body.as_bytes());
+}
+
+#[cfg(not(windows))]
+fn write_http_port_file(_port: u16) {}
+
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
     {
@@ -314,6 +341,7 @@ fn main() {
     }
     let addr = format!("127.0.0.1:{chosen_port}");
     platform::set_http_port(chosen_port);
+    write_http_port_file(chosen_port);
 
     // 前端 IPC 独立线程（Windows 命名管道 `\\.\pipe\hufu-ime`，Unix
     // `$XDG_RUNTIME_DIR/hufu-ime.sock`）——非 Windows 此前未启动 unix 分支。
@@ -837,6 +865,7 @@ fn main() {
             match bind_http_listener(port) {
                 Some((p, l)) => {
                     platform::set_http_port(p);
+                    write_http_port_file(p);
                     eprintln!("HTTP 端口 {p} 可用，开始服务");
                     listener = Some(l);
                 }
