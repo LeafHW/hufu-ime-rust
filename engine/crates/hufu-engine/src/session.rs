@@ -70,6 +70,11 @@ pub struct Session {
     /// 复位回中文。仅中文态有意义；切英文态时强制清零（英文态 Caps
     /// 恒透传系统，见引擎 Caps 段）。
     pub caps_lock: bool,
+    /// 【pending-dot 2026-11】数字后延迟点态（raw=="." 且本旗=真）。
+    /// 旧实现用 `raw == "."` 当哨兵，与「`.` 起段编码」（快符 .zd 类）
+    /// 撞车——`.zd` 永远打不出。本旗只由「数字尾按 .」置位，编码起段
+    /// 的 "." 保持 false；任何按键处理完后复位（sentinel 分支/clear）。
+    pub dot_session: bool,
 }
 
 impl Session {
@@ -93,6 +98,7 @@ impl Session {
             line_end_hint: false,
             rerank_applied_key: String::new(),
             caps_lock: false,
+            dot_session: false,
         }
     }
 
@@ -109,6 +115,7 @@ impl Session {
         self.early_suspended = false;
         self.pending_commit = None;
         self.pending_back = None;
+        self.dot_session = false;
     }
 
     pub fn is_idle(&self) -> bool {

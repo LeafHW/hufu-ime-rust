@@ -371,6 +371,25 @@ impl GgufFile {
         self.path.is_some()
     }
 
+    /// 【装载期校验 2026-11 / P1-5】张量整块字节数（rows × row_bytes，
+    /// checked）。坏头部 rows 乘法溢出 → None（装载期就拒，不留到前向）。
+    pub fn tensor_nbytes(&self, info: &TensorInfo) -> Option<u64> {
+        let rows = info.shape.get(1).copied().unwrap_or(1) as u64;
+        let row_bytes = Self::row_bytes(info) as u64;
+        rows.checked_mul(row_bytes)
+    }
+
+    /// 数据段物理总长（常驻 = data.len()；懒模式 = mmap 覆盖区长度）。
+    /// 装载期张量越界校验用；无 mmap 的流式路径 → None（跳过物理界检查）。
+    pub fn data_span(&self) -> Option<u64> {
+        if !self.data.is_empty() {
+            return Some(self.data.len() as u64);
+        }
+        self.map
+            .as_ref()
+            .map(|m| (m.len() as u64).saturating_sub(self.data_start))
+    }
+
     /// 读张量行 [p0, p0+pn) 的原始字节（懒模式从磁盘 seek_read）
     pub fn raw_rows(&self, info: &TensorInfo, p0: usize, pn: usize) -> std::io::Result<Vec<u8>> {
         let row_bytes = Self::row_bytes(info);
@@ -581,5 +600,24 @@ impl GgufFile {
             return None;
         }
         Some(out)
+    }
+}
+
+/// 【单测夹具 2026-11】手工构造张量表（不依赖真实 GGUF 文件）：
+/// 只填装载校验会看的字段（名字/形状/dtype/offset），数据段为空。
+#[cfg(test)]
+impl GgufFile {
+    pub(crate) fn fixture(tensors: Vec<TensorInfo>) -> GgufFile {
+        GgufFile {
+            meta: HashMap::new(),
+            tensors: tensors
+                .into_iter()
+                .map(|t| (t.name.clone(), t))
+                .collect(),
+            data_start: 0,
+            data: Vec::new(),
+            path: None,
+            map: None,
+        }
     }
 }

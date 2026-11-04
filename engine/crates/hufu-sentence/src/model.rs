@@ -122,6 +122,18 @@ impl NgramModel {
                 "非 TCSKNM02/04 模型文件（魔数不符）",
             ));
         };
+        // 【坏模型健壮性 2026-11】头长校验必须最先做：旧实现紧接魔数
+        // 就 rd_i64(@24)，小于 104 字节的截断文件会切片刻 panic → 装载
+        // 线程死亡 / 后台互斥中毒级联。截断 = 明确 Err 降级。
+        if data_ref.len() < 104 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "ngram 文件过短（{} 字节 < 104 字节头）——文件截断或非模型",
+                    data_ref.len()
+                ),
+            ));
+        }
         let index_stride = rd_i64(data_ref, 24) as usize;
         let uni_count = rd_i64(data_ref, 32) as usize;
         let uni_off = rd_i64(data_ref, 40) as usize;
@@ -205,6 +217,11 @@ impl NgramModel {
 
     /// unigram 概率（线性域；未收录回退到首条）。
     pub fn unigram_prob(&self, cp: u32) -> f32 {
+        // 【坏模型健壮性 2026-11】uni_count=0 的坏文件：idx 回退 0 会读
+        // uni_off..+8（可能越界）——直接给回退概率。
+        if self.uni_count == 0 {
+            return 1e-7;
+        }
         let idx = match self.uni_pos.get(&cp) {
             Some(i) => *i,
             None => 0,
@@ -283,7 +300,17 @@ impl NgramModel {
                 return None;
             }
             let succ = rd_i32(&self.data, off + 12) as usize;
-            off += 16 + succ * rec;
+            // 【坏模型健壮性 2026-11】坏 succ_count 可指天：跨记录步进
+            // 用 checked（旧实现裸乘加，usize 溢出回绕后可再次「入界」，
+            // 后续 rd_i32 仍可能越界）。溢出/越界 = 该上下文不存在。
+            let step = match succ.checked_mul(rec).and_then(|n| n.checked_add(16)) {
+                Some(n) => n,
+                None => return None,
+            };
+            off = match off.checked_add(step) {
+                Some(v) => v,
+                None => return None,
+            };
         }
         None
     }
@@ -371,8 +398,22 @@ impl NgramModel {
             w as i64,
         ) {
             Some((succ_off, _lambda, succ)) => {
-                // succ 有序 → 二分（bigram succ 平均 317 条，p90 超 1172）
+                // 【坏模型健壮性 2026-11 / P1-3】与 ctx_lookup 同款界检：
+                // 坏文件 succ_count 可指天，旧实现直接二分 succ_cp →
+                // 越界 panic（坏模型把整句解码线程打死的主因）。超界
+                // = 该 bigram 视为未观测。
                 let rec = self.succ_rec_size();
+                let end = match succ
+                    .checked_mul(rec)
+                    .and_then(|n| n.checked_add(succ_off))
+                {
+                    Some(e) => e,
+                    None => return false,
+                };
+                if end > self.data.len() {
+                    return false;
+                }
+                // succ 有序 → 二分（bigram succ 平均 317 条，p90 超 1172）
                 let (mut lo, mut hi) = (0usize, succ);
                 while lo < hi {
                     let mid = (lo + hi) / 2;
@@ -414,6 +455,11 @@ mod tests {
     /// bigram ctx 我 → 们 p=0.6 λ=0.4
     /// trigram ctx (我,们) → 是 p=0.7 λ=0.3
     pub(crate) fn tiny_model() -> NgramModel {
+        NgramModel::from_bytes(tiny_model_bytes()).unwrap()
+    }
+
+    /// 微型模型原始字节（坏模型用例就地改写字段用）。
+    pub(crate) fn tiny_model_bytes() -> Vec<u8> {
         let mut uni = vec![
             (0u32, 1e-7f32),
             (EOS, 0.002),
@@ -474,7 +520,7 @@ mod tests {
         patch(&mut d, 80, &1i32.to_le_bytes()); // tri_index_count
         patch(&mut d, 88, &(tri_block_off as i64).to_le_bytes());
         patch(&mut d, 96, &(tri_index_off as i64).to_le_bytes());
-        NgramModel::from_bytes(d).unwrap()
+        d
     }
 
     #[test]
@@ -497,5 +543,39 @@ mod tests {
         assert!((p - 0.76).abs() < 1e-5, "P(是|我们)={p}");
         assert!(m.has_bigram('我' as u32, '们' as u32));
         assert!(!m.has_bigram('们' as u32, '我' as u32));
+    }
+
+    /// 【P1-3】截断文件（不足 104 字节头）：明确 Err，不 panic。旧实现
+    /// 紧接魔数就 rd_i64(@24)，切片刻 panic → 装载线程死亡。
+    #[test]
+    fn truncated_file_rejected() {
+        let err = match NgramModel::from_bytes(MAGIC.to_vec()) {
+            Ok(_) => panic!("8 字节文件不应装载成功"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("过短"), "错误信息应说明截断: {err}");
+        let mut d = MAGIC.to_vec();
+        d.extend_from_slice(&[0u8; 40]);
+        assert!(NgramModel::from_bytes(d).is_err(), "40 字节截断应 Err");
+    }
+
+    /// 【P1-3】坏模型：succ_count 指天时 find_ctx / has_bigram /
+    /// bigram_prob 不得越界 panic（旧 has_bigram 缺界检，坏模型能把
+    /// 整句解码线程打死）。
+    #[test]
+    fn corrupt_succ_count_survives() {
+        let mut d = tiny_model_bytes();
+        let bi_block = rd_i64(&d, 56) as usize;
+        // 记录头 {key:i64, λ:f32, succ:i32}：key 改小迫使逐记录步进，
+        // succ 改 i32::MAX 让步进越界/溢出
+        d[bi_block..bi_block + 8].copy_from_slice(&0i64.to_le_bytes());
+        d[bi_block + 12..bi_block + 16].copy_from_slice(&i32::MAX.to_le_bytes());
+        let m = NgramModel::from_bytes(d).expect("头部合法 → 装载不 panic");
+        assert!(
+            !m.has_bigram('我' as u32, '们' as u32),
+            "坏 succ 应视为未观测"
+        );
+        let p = m.bigram_prob('我' as u32, '们' as u32);
+        assert!(p > 0.0 && p.is_finite(), "回退 unigram 概率: {p}");
     }
 }

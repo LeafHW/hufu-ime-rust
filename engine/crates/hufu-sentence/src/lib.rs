@@ -1125,7 +1125,10 @@ impl SentenceEngine {
     }
 
     fn decode_cached(&self, raw: &str) -> Arc<SentenceDecode> {
-        let mut cache = self.cache.lock().unwrap();
+        // 【锁中毒不放大 2026-11 / P1-3】缓存锁 unwrap 会把一次解码
+        // panic（坏模型等）升级成「此后每次解码都 panic」——整句功能
+        // 永久哑火。中毒 = 取回内部数据继续用（缓存只是加速层）。
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((prev_raw, prev_out, _full)) = cache.last.as_ref() {
             if prev_raw == raw {
                 return prev_out.clone();
@@ -1238,7 +1241,9 @@ impl SentenceEngine {
     pub fn decode_full(&self, raw: &str) -> Arc<SentenceDecode> {
         static GATE_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let gate_dbg = *GATE_DBG.get_or_init(|| std::env::var("HUFU_GATE_DEBUG").is_ok());
-        let mut cache = self.cache.lock().unwrap();
+        // 【锁中毒不放大 2026-11 / P1-3】同 decode_cached：提交门控这条
+        // 路径也不得因一次 panic 永久 panic。
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((prev_raw, prev_out, full)) = cache.last.as_ref() {
             if prev_raw == raw && *full {
                 return prev_out.clone();
@@ -1629,5 +1634,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 【P1-3】缓存锁被 panic 毒化后仍可解码：旧实现 lock().unwrap()
+    /// 会把一次解码 panic 升级成「此后每次解码都 panic」——整句功能永久
+    /// 哑火。中毒 = 取回内部数据继续用（缓存只是加速层）。
+    #[test]
+    fn poisoned_cache_lock_recovers() {
+        let e = engine_with_weights(tiny_dict(), SentenceWeights::default());
+        // 制造中毒：持锁时 panic
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = e.cache.lock().unwrap();
+            panic!("poison");
+        }));
+        assert!(poisoned.is_err(), "应捕获到 panic");
+        assert!(e.cache.lock().is_err(), "锁应处于中毒态");
+        // 解码不 panic（中毒 = 取回内部数据继续用）
+        let out = e.decode_to_strings("a");
+        assert!(!out.is_empty(), "中毒后仍可解码: {out:?}");
+        // 提交档（decode_full）同样不因中毒 panic
+        let full = e.decode_full("ab");
+        assert!(!full.hits.is_empty(), "中毒后 decode_full 仍可用");
     }
 }

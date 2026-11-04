@@ -70,7 +70,21 @@ impl Reranker {
     }
 
     /// 候选平均 logprob：ctx 为前文；每候选一次前向
+    /// 【不 panic 兜底 2026-11 / P1-5】前向异常（权重/内存等极端态）不再
+    /// 让重排线程 panic 死亡：兜住后返回全 0 分 → 上层保持原候选序。
     pub fn score(&self, ctx: &str, cands: &[String]) -> Vec<f64> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.score_inner(ctx, cands)
+        })) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("hufu-rerank: 打分过程 panic（模型/权重异常），本轮保持原序");
+                vec![0.0; cands.len()]
+            }
+        }
+    }
+
+    fn score_inner(&self, ctx: &str, cands: &[String]) -> Vec<f64> {
         let eot = self.tok.eot;
         let ctx_ids = self.tok.encode(ctx);
         let mut ids = vec![eot];

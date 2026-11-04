@@ -154,6 +154,119 @@ pub struct Qwen3 {
     pub cfg: Cfg,
 }
 
+/// 【必需张量清单 2026-11 / P1-5】逐层权重 + 期望形状（GGUF 序：
+/// shape[0]=内维/列，shape[1]=行；0 表示该维任意，仅 token_embd 的词表
+/// 维用）。形状由 Cfg 元数据推出——与 forward_hidden 里 matmul_w 的
+/// (n=shape[1], k=shape[0]) 约定一一对应。
+pub(crate) fn required_tensor_shapes(cfg: &Cfg) -> Vec<(String, Vec<usize>)> {
+    let h = cfg.hidden;
+    let inter = cfg.inter;
+    let hd = cfg.head_dim;
+    let q = cfg.heads * hd;
+    let kv = cfg.kv_heads * hd;
+    let mut v: Vec<(String, Vec<usize>)> = vec![
+        ("token_embd.weight".into(), vec![h, 0]), // 0 = 词表大小任意
+        ("output_norm.weight".into(), vec![h]),
+    ];
+    for li in 0..cfg.layers {
+        let p = |n: &str| format!("blk.{li}.{n}");
+        v.push((p("attn_norm.weight"), vec![h]));
+        v.push((p("attn_q.weight"), vec![h, q]));
+        v.push((p("attn_k.weight"), vec![h, kv]));
+        v.push((p("attn_v.weight"), vec![h, kv]));
+        v.push((p("attn_output.weight"), vec![q, h]));
+        v.push((p("attn_q_norm.weight"), vec![hd]));
+        v.push((p("attn_k_norm.weight"), vec![hd]));
+        v.push((p("ffn_norm.weight"), vec![h]));
+        v.push((p("ffn_gate.weight"), vec![h, inter]));
+        v.push((p("ffn_up.weight"), vec![h, inter]));
+        v.push((p("ffn_down.weight"), vec![inter, h]));
+    }
+    v
+}
+
+/// 【装载校验 2026-11 / P1-5】必需张量 + 维度 + dtype + 物理界，一次
+/// 全查并一次性报出**全部**问题（便于用户换模型/修文件定位）。
+/// 旧实现只校验 token_embd.weight：缺层权重时前向 `tensors[name]`
+/// 直接 panic，或维度不符读到错位权重 → 候选静默乱序。
+pub(crate) fn validate_weights(g: &GgufFile, cfg: &Cfg) -> Result<(), String> {
+    if cfg.hidden == 0
+        || cfg.inter == 0
+        || cfg.layers == 0
+        || cfg.heads == 0
+        || cfg.kv_heads == 0
+        || cfg.head_dim == 0
+    {
+        return Err(format!(
+            "模型元数据维度非法（hidden={} inter={} layers={} heads={} kv_heads={} head_dim={}）",
+            cfg.hidden, cfg.inter, cfg.layers, cfg.heads, cfg.kv_heads, cfg.head_dim
+        ));
+    }
+    if cfg.heads % cfg.kv_heads != 0 {
+        return Err(format!(
+            "GQA 头数不整除：heads={} kv_heads={}",
+            cfg.heads, cfg.kv_heads
+        ));
+    }
+    let span = g.data_span();
+    let mut problems: Vec<String> = Vec::new();
+    for (name, expect) in required_tensor_shapes(cfg) {
+        let Some(info) = g.tensors.get(&name) else {
+            problems.push(format!("缺张量 {name}"));
+            continue;
+        };
+        // dtype：反量化只支持 q8_0 / F32 / F16（Other = 未知量化，读了是垃圾）
+        if matches!(info.dtype, GgmlDType::Other(_)) {
+            problems.push(format!(
+                "张量 {name} 量化类型不支持：{:?}（仅 q8_0/F32/F16）",
+                info.dtype
+            ));
+            continue;
+        }
+        if info.shape.len() != expect.len() {
+            problems.push(format!(
+                "张量 {name} 维度数不符：期望 {expect:?}，实际 {:?}",
+                info.shape
+            ));
+            continue;
+        }
+        let mut dim_bad = false;
+        for (i, e) in expect.iter().enumerate() {
+            if *e != 0 && info.shape[i] != *e {
+                dim_bad = true;
+            }
+        }
+        if dim_bad {
+            problems.push(format!(
+                "张量 {name} 维度不符：期望 {expect:?}，实际 {:?}",
+                info.shape
+            ));
+            continue;
+        }
+        if let Some(span) = span {
+            match g.tensor_nbytes(info) {
+                Some(n) => match info.offset.checked_add(n) {
+                    Some(end) if end <= span => {}
+                    _ => problems.push(format!(
+                        "张量 {name} 越界：offset={} 字节数={n} 数据段={span}",
+                        info.offset
+                    )),
+                },
+                None => problems.push(format!("张量 {name} 尺寸溢出")),
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "重排模型（GGUF）权重校验失败（{} 项）：{}",
+            problems.len(),
+            problems.join("；")
+        ))
+    }
+}
+
 struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
@@ -181,10 +294,11 @@ impl Qwen3 {
             rope_theta: g.md_f64("qwen3.rope.freq_base", 1_000_000.0),
             eps: g.md_f64("qwen3.attention.layer_norm_rms_epsilon", 1e-6),
         };
-        match g.tensors.get("token_embd.weight") {
-            Some(t) if t.dtype.is_q8_0() || t.dtype == GgmlDType::F32 => {}
-            _ => return Err("模型缺 token_embd.weight 或类型不支持".into()),
-        }
+        // 【必需张量校验 2026-11 / P1-5】旧实现只校验 token_embd.weight：
+        // 缺层权重/维度不符会在**首句重排**时 HashMap 索引 panic（线程
+        // 死亡）或读到错位权重（候选静默乱序）。装载期一次性验完，失败
+        // 给明确错误（缺哪个张量/期望与实际维度）而不是 panic。
+        validate_weights(&g, &cfg)?;
         Ok(Self { g, cfg })
     }
 
@@ -533,4 +647,106 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     let r = _mm_add_ps(r, _mm_movehl_ps(r, r));
     let r = _mm_add_ss(r, _mm_shuffle_ps(r, r, 1));
     _mm_cvtss_f32(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::TensorInfo;
+
+    fn cfg_small() -> Cfg {
+        Cfg {
+            hidden: 8,
+            inter: 16,
+            layers: 2,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 2,
+            rope_theta: 1_000_000.0,
+            eps: 1e-6,
+        }
+    }
+
+    /// 按必需清单造齐全部张量（q8_0，offset 0，无数据段）。
+    fn fixture_all(cfg: &Cfg) -> Vec<TensorInfo> {
+        required_tensor_shapes(cfg)
+            .into_iter()
+            .map(|(name, shape)| TensorInfo {
+                name,
+                shape,
+                dtype: GgmlDType::Q8_0,
+                offset: 0,
+            })
+            .collect()
+    }
+
+    /// 【P1-5】清单齐全 → 校验通过（证明清单与 forward 的取用一致）。
+    #[test]
+    fn validate_accepts_complete_manifest() {
+        let cfg = cfg_small();
+        let g = GgufFile::fixture(fixture_all(&cfg));
+        if let Err(e) = validate_weights(&g, &cfg) {
+            panic!("齐全清单应通过校验: {e}");
+        }
+    }
+
+    /// 【P1-5】缺层权重 → 明确错误点名该张量（旧实现首句重排 panic）。
+    #[test]
+    fn validate_reports_missing_tensor() {
+        let cfg = cfg_small();
+        let mut ts = fixture_all(&cfg);
+        ts.retain(|t| t.name != "blk.1.attn_q.weight");
+        let g = GgufFile::fixture(ts);
+        let err = validate_weights(&g, &cfg).expect_err("缺张量应报错");
+        assert!(
+            err.contains("blk.1.attn_q.weight"),
+            "错误信息应点名缺的张量: {err}"
+        );
+    }
+
+    /// 【P1-5】维度不符 → 明确错误（期望/实际都给出）。
+    #[test]
+    fn validate_reports_dim_mismatch() {
+        let cfg = cfg_small();
+        let mut ts = fixture_all(&cfg);
+        for t in ts.iter_mut() {
+            if t.name == "blk.0.ffn_gate.weight" {
+                t.shape = vec![cfg.hidden, cfg.inter + 1];
+            }
+        }
+        let g = GgufFile::fixture(ts);
+        let err = validate_weights(&g, &cfg).expect_err("维度不符应报错");
+        assert!(
+            err.contains("blk.0.ffn_gate.weight") && err.contains("维度不符"),
+            "错误信息应含张量名与维度: {err}"
+        );
+    }
+
+    /// 【P1-5】未知量化类型 → 装载期拒绝（读了是垃圾权重）。
+    #[test]
+    fn validate_rejects_unsupported_dtype() {
+        let cfg = cfg_small();
+        let mut ts = fixture_all(&cfg);
+        for t in ts.iter_mut() {
+            if t.name == "blk.0.attn_norm.weight" {
+                t.dtype = GgmlDType::Other(7);
+            }
+        }
+        let g = GgufFile::fixture(ts);
+        let err = validate_weights(&g, &cfg).expect_err("未知量化应报错");
+        assert!(err.contains("量化类型不支持"), "{err}");
+    }
+
+    /// 【P1-5】清单覆盖每一层全部 11 个张量（防后人漏层）。
+    #[test]
+    fn required_manifest_covers_every_layer() {
+        let cfg = cfg_small();
+        let names: Vec<String> = required_tensor_shapes(&cfg)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names.len(), 2 + cfg.layers * 11);
+        assert!(names.iter().any(|n| n == "blk.1.ffn_down.weight"));
+        assert!(names.iter().any(|n| n == "token_embd.weight"));
+    }
 }
