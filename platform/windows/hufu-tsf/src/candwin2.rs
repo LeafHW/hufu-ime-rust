@@ -1585,6 +1585,26 @@ pub(crate) fn fs_step_at(elapsed_ms: u32, dur_ms: u32) -> u8 {
     ((elapsed_ms / step_ms).min(FS_STEPS as u32)) as u8
 }
 
+/// 【SSF 字号补间 2026-11-04】SSF 行槽逐行插值：源域行高在「其余档」
+/// 与「放大档」两档实测行高之间按 k 线性插值。
+/// 线性 ⇒ 一程补间内 Σ行高 = h_first + (n-1)·h_rest 恒守恒 —— 旧版
+/// `row_src_first + (n-1)·row_src_rest` 的窗口高/底图九宫公式继续成立
+/// （旧放大行往小、新放大行往大，两者插值参数 t 与 1−t 相加为 1）。
+pub(crate) fn fs_row_h_interp(
+    k: f32,
+    k_rest: f32,
+    k_first: f32,
+    h_rest: f32,
+    h_first: f32,
+) -> f32 {
+    let d = k_first - k_rest;
+    if d.abs() < 1e-4 {
+        return h_rest.max(1.0);
+    }
+    let t = ((k - k_rest) / d).clamp(0.0, 1.0);
+    (h_rest + (h_first - h_rest) * t).max(1.0)
+}
+
 /// 补间状态（时间基准；tick 只在步界推进并复渲染）。
 #[derive(Clone, Debug)]
 pub(crate) struct FsAnim {
@@ -1622,8 +1642,6 @@ pub(crate) struct FsCtx {
     pub cands_len: usize,
     pub anim_on: bool,
     pub sys_anim: bool,
-    /// SSF 位图皮肤：中间档行槽需源域换算，本期不做 → snap
-    pub ssf: bool,
     /// 调频/删词模态
     pub freq_modal: bool,
     /// 反查/命令提示行（编码行被提示串占用）
@@ -1641,7 +1659,6 @@ pub(crate) fn fs_plan(c: &FsCtx) -> Option<FsPlan> {
         || !c.enabled
         || !c.anim_on
         || !c.sys_anim
-        || c.ssf
         || c.freq_modal
         || c.hint_line
         || !c.same_page
@@ -1710,7 +1727,6 @@ mod fs_anim_tests {
             cands_len: 5,
             anim_on: true,
             sys_anim: true,
-            ssf: false,
             freq_modal: false,
             hint_line: false,
             k_first: 1.3,
@@ -1772,7 +1788,6 @@ mod fs_anim_tests {
             |c: &mut FsCtx| c.enabled = false,
             |c: &mut FsCtx| c.anim_on = false,
             |c: &mut FsCtx| c.sys_anim = false,
-            |c: &mut FsCtx| c.ssf = true,
             |c: &mut FsCtx| c.freq_modal = true,
             |c: &mut FsCtx| c.hint_line = true,
             |c: &mut FsCtx| c.same_page = false,
@@ -1849,6 +1864,31 @@ mod fs_anim_tests {
         ] {
             assert_eq!(fs_step_at(t, 140), want, "t={t} dur=140");
         }
+    }
+
+    /// 【SSF 字号补间】行槽逐行线性插值：两端点精确、中间档单调；
+    /// 交换对偶（旧放大行往小 + 新放大行往大）总高守恒=窗口高/底图
+    /// 九宫槽不逐帧抖动；k_first==k_rest 时恒为 rest（逐像素等价）。
+    #[test]
+    fn ssf_row_slot_interpolates_and_conserves() {
+        let (kr, kf) = (0.8f32, 1.35f32);
+        let (hr, hf) = (28.0f32, 44.0f32);
+        assert!((fs_row_h_interp(kr, kr, kf, hr, hf) - hr).abs() < 1e-4);
+        assert!((fs_row_h_interp(kf, kr, kf, hr, hf) - hf).abs() < 1e-4);
+        let k1 = kr + (kf - kr) / 3.0;
+        let k2 = kr + (kf - kr) * 2.0 / 3.0;
+        let h1 = fs_row_h_interp(k1, kr, kf, hr, hf);
+        let h2 = fs_row_h_interp(k2, kr, kf, hr, hf);
+        assert!((h1 - (hr + (hf - hr) / 3.0)).abs() < 1e-4);
+        assert!((h2 - (hr + (hf - hr) * 2.0 / 3.0)).abs() < 1e-4);
+        assert!(hr < h1 && h1 < h2 && h2 < hf);
+        for s in 1..=3u8 {
+            let p = s as f32 / 3.0;
+            let old = fs_row_h_interp(kr + (kf - kr) * (1.0 - p), kr, kf, hr, hf);
+            let new = fs_row_h_interp(kr + (kf - kr) * p, kr, kf, hr, hf);
+            assert!((old + new - (hr + hf)).abs() < 1e-3, "step {s}");
+        }
+        assert!((fs_row_h_interp(1.0, 1.0, 1.0, 20.0, 20.0) - 20.0).abs() < 1e-4);
     }
 }
 
@@ -4922,7 +4962,6 @@ impl CandidateWindowV2 {
                 cands_len: cands.len(),
                 anim_on: self.anim_on.get(),
                 sys_anim: system_anim_allowed(),
-                ssf: ssf.is_some(),
                 freq_modal: freq_view.is_some(),
                 hint_line: _raw_req.contains('〔'),
                 k_first,
@@ -5723,9 +5762,11 @@ impl CandidateWindowV2 {
         let row_hs: Vec<f32> = (0..cands.len().min(10))
             .map(|i| {
                 if ssf.is_some() {
-                    // 【高亮跟随放大 2026-11-03】放大行 big_i（hl 模式=选中
-                    // 项、否则=第 1 候选）：SSF 源域行槽同源跟随。
-                    (if i == big_i { row_user_first } else { row_user }).max(1.0)
+                    // 【SSF 字号补间 2026-11-04】SSF 行槽=源域行高×scale。
+                    // 静态时 big_i 行取 row_user_first、其余 row_user；补间
+                    // 期逐行 k 在两档实测行高间线性插值（线性保证一程内
+                    // 总行高守恒 → 窗口高/底图九宫不抖，见 fs_row_h_interp）。
+                    fs_row_h_interp(k_of(i), k_rest, k_first, row_user, row_user_first)
                 } else {
                     let k = k_of(i);
                     let lh = em * k + layout_f(skin, "line_spacing", 3.0) + 5.0;
@@ -5875,34 +5916,36 @@ impl CandidateWindowV2 {
         };
         let height = match &ssf {
             Some(f) => {
-                let sc = f.scale;
-                // 【逐候选字号 2026-10】行槽分首选/其余两值（源画布域）：
-                // 编码槽仍用基准行（编码行不缩放，间距不动）。
-                let row_src = row_user / sc;
-                let row_src_first = (row_user_first / sc).max(1.0);
-                let row_src_rest = row_src.max(1.0);
-                let n = cands.len().min(10) as f32;
+                let sc = f.scale.max(0.01);
+                // 【SSF 字号补间 2026-11-04】窗口高（=底图九宫目标槽）改为
+                // 按**本帧逐行实际行槽**求和：竖排=Σ行槽+(n−1)·源行距，
+                // 横排=单行 max 行槽。行槽已按逐行 k 插值（row_hs），
+                // 静态两档下与旧公式逐像素等价（一个放大行 + n−1 其余行）；
+                // 补间期两端行一涨一缩、总高守恒（见 fs_row_h_interp）。
+                let rows_src: Vec<f32> = row_hs.iter().map(|h| (h / sc).max(1.0)).collect();
+                let n = rows_src.len() as f32;
                 let cand_bottom = f.layout.candidates.bottom.max(0) as f32;
                 let lsp = f.spec.display.line_spacing.max(0.0);
                 let y0_src = ssf_y0_src.unwrap_or(0.0);
-                let y_end = y0_src
-                    + if n <= 0.0 {
-                        cand_bottom
-                    } else if horizontal {
-                        row_src_first.max(row_src_rest) + cand_bottom
-                    } else {
-                        row_src_first
-                            + ((n - 1.0).max(0.0)) * row_src_rest
-                            + ((n - 1.0).max(0.0)) * lsp
-                            + cand_bottom
-                    };
+                let cand_slot = if n <= 0.0 {
+                    cand_bottom
+                } else if horizontal {
+                    // 横排=单行槽（与渲染循环的 row_h_max 同源，含 rest 基准
+                    // 行；k_first<k_rest 的异常配置下也不会内容高于窗口）
+                    (row_h_max / sc).max(1.0) + cand_bottom
+                } else {
+                    rows_src.iter().sum::<f32>() + ((n - 1.0).max(0.0)) * lsp + cand_bottom
+                };
+                let y_end = y0_src + cand_slot;
                 let v = (f.layout.min_height(f.bitmap.height).max(y_end) * sc)
                     .max(1.0);
                 crate::tsf::trace(&format!(
-                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} row_src={:.0}/{:.0} 编码={}）",
+                    "ssfgeo: y0_src={:.0} y_end={:.0} 硬底={:.0} → h={:.1}（横排={} 行槽源首/最大={:.1}/{:.1} 行数={} 编码={}）",
                     y0_src, y_end,
                     f.layout.min_height(f.bitmap.height), v, horizontal,
-                    row_src_first, row_src_rest,
+                    rows_src.first().copied().unwrap_or(0.0),
+                    rows_src.iter().cloned().fold(0.0f32, f32::max),
+                    rows_src.len(),
                     !raw.is_empty()
                 ));
                 v

@@ -928,11 +928,57 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
             "material": { "kind": "solid", "hilite_on": true }
         }
     });
+    // 【SSF 字号补间取证 2026-11-04】HUFU_FS_SSF_ID=<皮肤 id> → 经管道向
+    // server 取该 .ssf 的完整渲染载荷（op skin_for_render，无副作用），
+    // 注入与默认皮肤同口径的补间开关后渲染；不切用户当前皮肤、不改配置。
+    let ssf_id = std::env::var("HUFU_FS_SSF_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(id) = &ssf_id {
+        match crate::ipc::call(&serde_json::json!({"op": "skin_for_render", "id": id})) {
+            Some(mut resp) if resp.get("skin").is_some() => {
+                // 注意：无 per-skin overrides 时 payload 没有 /skin/layout ——
+                // 必须新建而不是 pointer_mut 命中即插。
+                if let Some(o) = resp
+                    .pointer_mut("/skin")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    let lay = o
+                        .entry("layout")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(l) = lay.as_object_mut() {
+                        l.insert("hl_font_scale".into(), serde_json::json!(true));
+                        l.insert("cand_first_scale".into(), serde_json::json!(1.35));
+                        l.insert("cand_rest_scale".into(), serde_json::json!(0.8));
+                        l.insert("hl_ms".into(), serde_json::json!(0.0));
+                    }
+                }
+                if let Some(o) = resp.as_object_mut() {
+                    o.insert("anim".into(), serde_json::json!(true));
+                    o.insert("anim_speed".into(), serde_json::json!(1.0));
+                }
+                skin = resp;
+                eprintln!(
+                    "fs-frames: SSF 皮肤 id={id} kind={:?} cache_dir={:?} hl_font_scale={:?} first={:?} rest={:?}",
+                    skin.pointer("/skin/kind").and_then(|v| v.as_str()),
+                    skin.pointer("/skin/cache_dir").and_then(|v| v.as_str()),
+                    skin.pointer("/skin/layout/hl_font_scale"),
+                    skin.pointer("/skin/layout/cand_first_scale"),
+                    skin.pointer("/skin/layout/cand_rest_scale")
+                );
+            }
+            _ => {
+                eprintln!("fs-frames: skin_for_render 失败（id={id}）→ 回退内联 JSON 皮肤");
+            }
+        }
+    }
     // 方向可切换：HUFU_FS_HORIZONTAL=1 → 横排（默认竖排）。两方向走同一
     // 逐行 k 渲染路径，离屏帧可对照。
     if std::env::var("HUFU_FS_HORIZONTAL").as_deref() == Ok("1") {
-        if let Some(l) = skin.pointer_mut("/skin/layout").and_then(|v| v.as_object_mut()) {
-            l.insert("horizontal".into(), serde_json::json!(true));
+        for path in ["/skin/layout", "/layout"] {
+            if let Some(l) = skin.pointer_mut(path).and_then(|v| v.as_object_mut()) {
+                l.insert("horizontal".into(), serde_json::json!(true));
+            }
         }
     }
     let cands = vec![
