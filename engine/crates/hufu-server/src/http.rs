@@ -64,17 +64,37 @@ fn status_text(code: u16) -> &'static str {
     }
 }
 
+/// 【审计 P2-E 2026-11-05】带总量上限的按行读：超限即断连（None）。
+/// 防超长请求行/header 单行灌爆内存（read_line 本身无上限）。
+fn read_line_bounded(reader: &mut BufReader<TcpStream>, limit: usize) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .ok()?;
+    if buf.len() > limit {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 【审计 P2-E 2026-11-05】单请求护栏：
+/// - 请求行 ≤ 8KB、header ≤ 128 行 × 16KB、body ≤ 16MiB（此前声明多大
+///   预分配多大——声明 4GB 即 vec![0u8; 4GB]，本机恶意网页/进程可内存
+///   耗尽打崩输入法）；settings_import 全量导出含皮肤实测远小于 16MiB。
+/// - 每次底层读 15s 超时（此前慢连接可无限占住每连接一线程）。
+/// 任一超限：断连（None），不回 413——攻击者不配得到响应。
 fn read_request(stream: &mut TcpStream) -> Option<Request> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
+    let line = read_line_bounded(&mut reader, 8 * 1024)?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     let mut headers = HashMap::new();
-    loop {
-        let mut h = String::new();
-        reader.read_line(&mut h).ok()?;
+    for _ in 0..128 {
+        let h = read_line_bounded(&mut reader, 16 * 1024)?;
         let h = h.trim_end();
         if h.is_empty() {
             break;
@@ -87,6 +107,10 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    const MAX_BODY: usize = 16 * 1024 * 1024;
+    if len > MAX_BODY {
+        return None;
+    }
     let mut body = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut body).ok()?;

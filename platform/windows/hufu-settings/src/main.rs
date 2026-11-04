@@ -1661,11 +1661,11 @@ fn exe_dir() -> PathBuf {
 //
 // 口径：候选端口按序探测「GET /api/about」，响应体必须同时含 `github`、
 // `hufu-ime-rust`、`exe_dir` 三个形状特征才认定是虎符 server（旧口径
-// 只要 `"version"` 就把别家本地服务认成虎符）。单端口 300ms 连接/读写
-// 超时，总预算 1.5s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
-// 完成（此时还没进消息循环），最坏多花约 1.5s 启动时间。
+// 只要 `"version"` 就把别家本地服务认成虎符）。单端口 250ms 连接/读写
+// 超时，总预算 2s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
+// 完成（此时还没进消息循环），最坏多花约 2s 启动时间。
 /// 构建标记：同版本号重打包时用来区分新旧包（与 server 的 /api/about 同值）。
-const BUILD_TAG: &str = "2026-11-05c";
+const BUILD_TAG: &str = "2026-11-05d";
 
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
@@ -1739,15 +1739,15 @@ fn resolve_live_port(log: &Path) -> Option<u16> {
 /// 正常安装时壳就在安装根目录，同目录的 hufu-server.exe 必然存在；server 自带
 /// 命名互斥体，重复拉起不会出现双实例。返回是否确实发起了启动。
 fn try_launch_server(exe_dir: &Path) -> bool {
-    let mut candidates = vec![exe_dir.join("hufu-server.exe")];
-    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-        candidates.push(base.join("HuFu").join("hufu-server.exe"));
-    }
+    // 【审计 P3 2026-11-05】拉起候选只保留同目录（%LOCALAPPDATA%\HuFu\
+    // hufu-server.exe 不是任何已知安装布局——server 装安装目录或
+    // D:\HuFu，该路径只多付一次 stat；is_file 兜底下无害，直接删净）。
+    let candidates = vec![exe_dir.join("hufu-server.exe")];
     for exe in candidates {
         if !exe.is_file() {
             continue;
         }
-        let mut cmd = Command::new(&exe);
+        let mut cmd = Command::new(&exe); // zi-ok: exe=同目录 hufu-server.exe（非解释器）
         // 即使是 GUI 子系统也显式禁用控制台：任何机器上都不许闪黑窗
         cmd.creation_flags(0x0800_0000);
         if cmd.spawn().is_ok() {
@@ -2188,8 +2188,9 @@ unsafe fn real_main() -> i32 {
     }
 
     // [P0 白屏修复 2026-11-02] 建窗/导航前把端口定死：快捷方式不再写死
-    // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 1.5s。
-    // 【2026-11-05】探测全失败时会先拉起 hufu-server 并等它就绪（最多 5s）。
+    // 4390（见 resolve_url）。探测只在这个线程、建窗之前跑，总预算 2s。
+    // 【2026-11-05】探测全失败时会先拉起 hufu-server 并等它就绪（墙钟
+    // 5s；单轮最坏 ~2.6s 且 while 只在轮首查墙钟，实测最坏 ~7.6s 有界）。
     resolve_url(&mut args, &exe_dir);
     // 【--theme】追加到最终 URL（默认与显式 URL 都已含 query，用 & 拼；
     // 防御性判断避免重复追加）。

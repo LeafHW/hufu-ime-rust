@@ -471,7 +471,7 @@ pub fn open_settings() {
                     "http://127.0.0.1:{}/next?shell=1",
                     crate::platform::http_port()
                 );
-                let mut c = std::process::Command::new(shell);
+                let mut c = std::process::Command::new(shell); // zi-ok: shell=ShellExecuteW 回退链首选项路径（非解释器）
                 c.arg("--url").arg(url);
                 match c.spawn() {
                     Ok(_) => return,

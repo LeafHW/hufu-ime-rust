@@ -6650,7 +6650,24 @@ impl CandidateWindowV2 {
                 let b_label = mkbrush(&ctx, text_alpha(color_f(skin, "label_color", "#C9C9C9FF")));
                 let b_raw = mkbrush(
                     &ctx,
-                    text_alpha(color_f(skin, "hilited_text_color", "#E8E8EAFF")),
+                    text_alpha({
+                        // 【P1-4 2026-11-05】SSF 投影下发 code_color（源 =
+                        // skin.ini 的 pinyin_color）——此前编码行笔刷只读
+                        // hilited_text_color，code_color 全链路（解析→下发→
+                        // 渲染）无消费端：设置页 SkinStudio「编码行文字色」
+                        // 承诺落空，白框皮肤编码行过淡。优先消费 code_color；
+                        // JSON 皮肤无此键，回退旧语义 hilited_text_color
+                        // （出厂 JSON 皮肤行为不变）。
+                        let has_code = skin
+                            .pointer("/skin/colors/code_color")
+                            .or_else(|| skin.pointer("/colors/code_color"))
+                            .is_some_and(|x| x.as_str().is_some());
+                        if has_code {
+                            color_f(skin, "code_color", "#E8E8EAFF")
+                        } else {
+                            color_f(skin, "hilited_text_color", "#E8E8EAFF")
+                        }
+                    }),
                 );
                 // 编码区背景（preedit_back_color；alpha=0 的皮肤不画）
                 // 【反查灰条修复 2026-09-11】判定必须用皮肤自带 alpha——

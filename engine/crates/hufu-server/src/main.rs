@@ -240,7 +240,7 @@ fn log_startup(msg: &str) {
 }
 
 /// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
-const BUILD_TAG: &str = "2026-11-05c";
+const BUILD_TAG: &str = "2026-11-05d";
 
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
@@ -373,13 +373,23 @@ fn main() {
         Some((p, l)) => (p, Some(l)),
         None => (port, None),
     };
-    if chosen_port != port {
-        eprintln!("HTTP 端口 {port} 不可用（系统保留/占用），改用 {chosen_port}");
+    if listener.is_some() {
+        if chosen_port != port {
+            eprintln!("HTTP 端口 {port} 不可用（系统保留/占用），改用 {chosen_port}");
+        }
+        log_startup(&format!("http listening on 127.0.0.1:{chosen_port} (preferred {port})"));
+        write_http_port_file(chosen_port);
+    } else {
+        // 【审计 P2-A 2026-11-05】全候选 bind 失败 → 管道模式：此前仍打
+        // "listening"（假成功）且把未监听的首选口写进端口文件，恰在排查
+        // 「连不上」时误导支持方向。现如实记 FAILED 且不写端口文件（壳
+        // 按无文件处理直接候选表探测，不被死端口带偏）。
+        log_startup(&format!(
+            "http bind FAILED (all candidates, preferred {port}); pipe-only, retry 5s"
+        ));
     }
-    log_startup(&format!("http listening on 127.0.0.1:{chosen_port} (preferred {port})"));
     let addr = format!("127.0.0.1:{chosen_port}");
     platform::set_http_port(chosen_port);
-    write_http_port_file(chosen_port);
 
     // 前端 IPC 独立线程（Windows 命名管道 `\\.\pipe\hufu-ime`，Unix
     // `$XDG_RUNTIME_DIR/hufu-ime.sock`）——非 Windows 此前未启动 unix 分支。
@@ -785,6 +795,17 @@ fn main() {
             }
         });
         std::thread::spawn(move || {
+            // 【审计 P3 2026-11-05】MSDN：调用 ShellExecuteW 前应初始化
+            // COM——个别默认浏览器/Shell 扩展走 COM/DDE 路径，未初始化
+            // 可能 SE_ERR_DDEFAIL。APARTMENTTHREADED|DISABLE_OLE1DDE=
+            // 0x2|0x4；S_FALSE(1) 也算已初始化，hr<0 才记日志。线程常
+            // 驻，不配 CoUninitialize。
+            unsafe {
+                let hr = sys_win::co_init_apartment();
+                if hr < 0 {
+                    eprintln!("CoInitializeEx hr={hr:#x}（open-url 仍继续）");
+                }
+            }
             // 常驻循环：每次托盘信号都开窗口（旧版一次性线程导致第二次进不去）
             while open_rx.recv().is_ok() {
                 // 【设置窗唯一性 2026-10-10】已开（枚举得到标题窗）先弹到
@@ -802,7 +823,7 @@ fn main() {
                     .map(|d| d.join("hufu-settings.exe"))
                     .filter(|p| p.is_file())
                 {
-                    let mut c = std::process::Command::new(shell);
+                    let mut c = std::process::Command::new(shell); // zi-ok: shell=ShellExecuteW 回退链首选项路径（非解释器）
                     c.arg("--url").arg(url.clone());
                     match c.spawn() {
                         Ok(child) => {
@@ -864,7 +885,7 @@ fn main() {
                 .find(|p| std::path::Path::new(p).exists());
                 let opened = match &browser {
                     Some(exe) => {
-                        let mut c = std::process::Command::new(exe);
+                        let mut c = std::process::Command::new(exe); // zi-ok: exe=卸载器等受控绝对路径（非解释器）
                         c.arg(&app_arg).arg(&size_arg).arg(&pos_arg);
                         for a in &extra_args {
                             c.arg(a);
@@ -878,7 +899,11 @@ fn main() {
                     // （拉起 cmd.exe 解释器，违反运行时零解释器铁律，见
                     // AGENTS.md）。改 ShellExecuteW 直开系统默认浏览器，
                     // 零子进程、行为与资源管理器双击一致。
-                    sys_win::open_url_default(&url);
+                    // 【审计 P3 2026-11-05】返回值落取证（此前静默丢弃，
+                    // 末级兜底失败无线索）。
+                    if !sys_win::open_url_default(&url) {
+                        eprintln!("open_url_default 末级兜底失败（{url}）");
+                    }
                 }
             }
         });
@@ -907,6 +932,11 @@ fn main() {
                     platform::set_http_port(p);
                     write_http_port_file(p);
                     eprintln!("HTTP 端口 {p} 可用，开始服务");
+                    // 【审计 P2-A 2026-11-05】恢复路径也落取证日志（此前只
+                    // eprintln，GUI 子系统不可见，日志缺恢复事件）。
+                    log_startup(&format!(
+                        "http recovered: listening on 127.0.0.1:{p} (preferred {port})"
+                    ));
                     listener = Some(l);
                 }
                 None => {
@@ -1244,18 +1274,36 @@ pub fn sound_pack_list(data_dir: &std::path::Path) -> Vec<String> {
 }
 
 /// 预览图 Content-Type（按扩展名；未知回 octet-stream 让浏览器下载判定）。
-fn image_content_type(p: &std::path::Path) -> &'static str {
+/// 【审计 P3 2026-11-05】扩展名只做初筛，内容魔数终判：伪图片（改了
+/// 扩展名的任意文件）不再被当 image/* 下发浏览器 <img>/GDI+ 解码——
+/// 攻击面落系统解码器的通道被掐断。魔数不识别一律 octet-stream。
+fn image_content_type(p: &std::path::Path, body: &[u8]) -> &'static str {
+    let sniffed = if body.len() >= 8 && body[..8] == *b"\x89PNG\r\n\x1a\n" {
+        Some("image/png")
+    } else if body.len() >= 3 && body[..3] == *b"\xff\xd8\xff" {
+        Some("image/jpeg")
+    } else if body.len() >= 6 && (body[..6] == *b"GIF87a" || body[..6] == *b"GIF89a") {
+        Some("image/gif")
+    } else if body.len() >= 2 && body[..2] == *b"BM" {
+        Some("image/bmp")
+    } else if body.len() >= 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    };
+    if let Some(ct) = sniffed {
+        return ct;
+    }
     match p
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        Some("webp") => "image/webp",
+        // 扩展名声称图片但魔数不匹配 → octet-stream（浏览器不渲染）
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") | Some("webp") => {
+            "application/octet-stream"
+        }
         _ => "application/octet-stream",
     }
 }
@@ -1359,8 +1407,14 @@ fn find_tsf_dll() -> Option<String> {
             return Some(p.to_string_lossy().into_owned());
         }
     }
+    // 【审计 P3 2026-11-05】兜底候选补回 render 副本（2026-11-05b 收窄时
+    // 丢失）：server 与 render.dll 不同目录的混合布局下退到被 TSF 进程
+    // 锁住的 hufu_tsf.dll 仍可渲染，但失去热替换；每个目录先 render 后正
+    // 本，与 exe_sibling 优先序一致。
     [
+        r"C:\Windows\SystemIME\HuFu\hufu_tsf_render.dll",
         r"C:\Windows\SystemIME\HuFu\hufu_tsf.dll",
+        r"D:\HuFu\hufu_tsf_render.dll",
         r"D:\HuFu\hufu_tsf.dll",
     ]
     .iter()
@@ -1369,23 +1423,28 @@ fn find_tsf_dll() -> Option<String> {
 }
 
 /// 渲染小助手（**唯一**渲染路径，不再回退 PowerShell——作者明令禁止）。
-static RENDER_HELPER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+/// 【审计 P3 2026-11-05】只缓存命中：旧 OnceLock<Option> 会把「缺失」
+/// 永久缓存——补装 helper 不重启 server 时预热/实时预览一直 501。改为
+/// 命中才缓存，miss 每次重探（代价 ≤3 次 stat）。
+static RENDER_HELPER_HIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-fn render_helper_path() -> Option<&'static std::path::PathBuf> {
-    RENDER_HELPER
-        .get_or_init(|| {
-            if let Some(p) = exe_sibling("hufu-render-helper.exe") {
-                return Some(p);
-            }
-            [
-                r"C:\Windows\SystemIME\HuFu\hufu-render-helper.exe",
-                r"D:\HuFu\hufu-render-helper.exe",
-            ]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .find(|p| p.is_file())
-        })
-        .as_ref()
+fn render_helper_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = RENDER_HELPER_HIT.get() {
+        return Some(p.clone());
+    }
+    let found = exe_sibling("hufu-render-helper.exe").or_else(|| {
+        [
+            r"C:\Windows\SystemIME\HuFu\hufu-render-helper.exe",
+            r"D:\HuFu\hufu-render-helper.exe",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    });
+    if let Some(ref p) = found {
+        let _ = RENDER_HELPER_HIT.set(p.clone());
+    }
+    found
 }
 
 fn log_render_helper_missing() {
@@ -1434,11 +1493,13 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
     let Some(dll) = find_tsf_dll() else {
         return Response::err(404, "未找到 hufu_tsf.dll");
     };
+    // 【审计 P3 2026-11-05】文件名掺进程 id：纯毫秒时间戳可被同机进程
+    // 抢注竞态覆盖（本地攻击者本就有 TEMP 写权，此处仅消除可预测性）。
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}.bmp"));
+    let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}-{}.bmp", std::process::id()));
     // 【2026-11-05 去 PowerShell】实时预览只走原生 hufu-render-helper.exe。
     // 旧实现 helper 缺失/失败会回退「写 .ps1 + powershell.exe」驱动：开机
     // 预热全部 ssf 皮肤时每个皮肤一个 PowerShell 进程（用户实锤），且与
@@ -1452,7 +1513,7 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
         );
     };
     let ok = {
-        let mut cmd = std::process::Command::new(helper);
+        let mut cmd = std::process::Command::new(helper); // zi-ok: helper=同目录 hufu-render-helper.exe（非解释器）
         cmd.arg(&out).arg(&dll);
         if let Some(id) = query_id {
             cmd.env("HUFU_SKIN_DUMP_ID", id);
@@ -1691,6 +1752,148 @@ fn update_check_inner() -> Response {
     }
 }
 
+/// 【审计 P2-D 2026-11-05】校验式下载安装包（锁前分发，不持 Host 锁）。
+/// 此前前端 `window.open(download_url)` 直接下载即提示运行——清单里的
+/// sha256 有传无验，更新源（Gitee）账号失陷 = 供应链直通。现由 server
+/// 中转：拉清单 → 下载 → sha256 比对 → 通过才落「下载」文件夹。浏览器
+/// fetch 直连更新源会被 CORS 拦（Gitee 附件无 ACAO 头），故必须 server 代下。
+/// 单飞闸：同一时刻只允许一个下载任务（每连接一线程，重复点击 409）。
+fn update_download_inner() -> Response {
+    use sha2::{Digest, Sha256};
+    static DOWNLOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DOWNLOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Response::err(409, "已有下载任务进行中，请稍候");
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DOWNLOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _g = Guard;
+
+    let fail = |status: u16, msg: String| -> Response {
+        Response::err(status, &msg)
+    };
+    // 1) 清单（与 update_check_inner 同源同口径：Gitee 自建清单优先）
+    let mut agent_b = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(600))
+        .timeout_connect(std::time::Duration::from_secs(8));
+    #[cfg(windows)]
+    {
+        if let Ok(c) = ureq::native_tls::TlsConnector::new() {
+            agent_b = agent_b.tls_connector(std::sync::Arc::new(c));
+        }
+    }
+    let agent = agent_b.build();
+    let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
+        "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
+    });
+    let manifest = agent
+        .get(&manifest_url)
+        .set("User-Agent", "hufu-ime-update-download")
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let Some(m) = manifest else {
+        return fail(502, "更新清单不可达".into());
+    };
+    let url = m
+        .get("sources")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+    let Some(url) = url else {
+        return fail(502, "清单未提供下载地址".into());
+    };
+    // 2) sha256 必须存在（防供应链：无哈希即拒绝下载，不静默降级）
+    let Some(sha_expect) = m
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+    else {
+        return fail(409, "清单未提供 sha256，已拒绝下载（防供应链）".into());
+    };
+    // 3) 下载（上限 64MiB：安装包 ~26MB；清单被篡改塞巨包时在此截断）
+    let resp = match agent.get(&url).set("User-Agent", "hufu-ime-update-download").call() {
+        Ok(r) => r,
+        Err(e) => return fail(502, format!("下载失败：{e}")),
+    };
+    let mut body: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024);
+    let mut reader = resp.into_reader();
+    use std::io::Read;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                body.extend_from_slice(&chunk[..n]);
+                if body.len() > 64 * 1024 * 1024 {
+                    return fail(502, "安装包超上限（64MiB），已中止".into());
+                }
+            }
+            Err(e) => return fail(502, format!("下载中断：{e}")),
+        }
+    }
+    if body.len() < 1024 {
+        return fail(502, "下载内容异常（过小，疑似错误页）".into());
+    }
+    // 4) 哈希校验（大小写不敏感；不符即弃，绝不落盘）
+    let mut h = Sha256::new();
+    h.update(&body);
+    let sha_got = format!("{:x}", h.finalize());
+    if sha_got != sha_expect {
+        return fail(
+            409,
+            format!("sha256 不符，已拒绝保存（期望 {sha_expect}，实际 {sha_got}）"),
+        );
+    }
+    // 5) 落「下载」文件夹：SHGetKnownFolderPath(FOLDERID_Downloads)，
+    //    失败回退 %USERPROFILE%\Downloads。
+    let dl_dir = unsafe { sys_win::known_downloads_dir() }
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|p| std::path::PathBuf::from(p).join("Downloads"))
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+    let _ = std::fs::create_dir_all(&dl_dir);
+    // 文件名 = URL 尾段，只保留安全字符（无路径分隔、必须 .exe 结尾）
+    let name = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let safe = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect::<String>();
+    let fname = if safe.to_ascii_lowercase().ends_with(".exe") && safe.len() < 100 {
+        safe
+    } else {
+        "HuFuSetup.exe".to_string()
+    };
+    let dest = dl_dir.join(&fname);
+    let tmp = dl_dir.join(format!(".{fname}.part"));
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        return fail(500, format!("写入下载目录失败：{e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return fail(500, format!("保存失败（目标可能被占用）：{e}"));
+    }
+    Response::json(&serde_json::json!({
+        "ok": true,
+        "path": dest.to_string_lossy(),
+        "size": body.len(),
+        "sha256": sha_got,
+    }))
+}
+
 /// 【检查更新 2026-11-01】语义化版本比较：a 是否严格大于 b（"1.9.10" > "1.9.9"）。
 /// 任一段解析失败按 0 处理；长度不齐缺段按 0。
 fn newer_than(a: &str, b: &str) -> bool {
@@ -1711,6 +1914,28 @@ fn newer_than(a: &str, b: &str) -> bool {
     false
 }
 
+/// 【审计 P2-C 2026-11-05】Host 头精确本机判定：剥端口后与 loopback
+/// 精确等值。此前 `starts_with("127.0.0.1")` 前缀匹配可被
+/// `127.0.0.1.evil.com` / `localhost.evil.com`（A 记录指回本机）绕过
+/// ——该形态下浏览器视为同源，全部 GET 读端点可达。
+fn host_is_local(h: &str) -> bool {
+    let h = h.trim().to_lowercase();
+    // 剥端口：IPv6 字面量带方括号（[::1]:4390），IPv4/主机名用最后一个
+    // 冒号且其后必须全数字（防误剥）。
+    let host = if h.starts_with('[') {
+        match h.find(']') {
+            Some(i) => &h[..=i],
+            None => return false,
+        }
+    } else {
+        match h.rfind(':') {
+            Some(i) if !h[i + 1..].is_empty() && h[i + 1..].bytes().all(|b| b.is_ascii_digit()) => &h[..i],
+            _ => h.as_str(),
+        }
+    };
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
+}
+
 /// 【P0-1 2026-11-03】本机请求判定：跨源 Origin 必须是 loopback，Host 必须
 /// 是本机名（防 DNS rebinding）。POST/DELETE 与会执行子进程的
 /// `GET /api/skin/ssf-render` 共用。
@@ -1724,10 +1949,7 @@ fn request_is_local(req: &Request) -> bool {
         }
     }
     if let Some(h) = req.headers.get("host").filter(|h| !h.is_empty()) {
-        let h = h.to_lowercase();
-        let local_host =
-            h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]");
-        if !local_host {
+        if !host_is_local(h) {
             return false;
         }
     }
@@ -1755,7 +1977,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 杀 server（/api/shutdown 无鉴权审计项）由此封死；Host 白名单
     // 同时防 DNS rebinding（外域域名解析到 127.0.0.1 的请求 Host
     // 不是本机名）。
-    if req.method == "POST" || req.method == "DELETE" {
+    if req.method == "POST" || req.method == "DELETE" || req.path.starts_with("/api/") {
+        // 【审计 P2-C 2026-11-05】闸门扩大到全部 /api/*（含 GET）：此前
+        // GET /api/config、/api/export（全部用户词）等读端点无源校验，
+        // 配合 Host 前缀绕过（127.0.0.1.evil.com）可被同源网页读取。
+        // 页面与静态资产（/、/next、/assets）不在此列，浏览器直开不受影响。
         if !request_is_local(req) {
             return Response::err(403, "跨源请求被拒绝");
         }
@@ -1906,6 +2132,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             return Response::err(403, "跨源请求被拒绝");
         }
         return update_check_inner();
+    }
+    // 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256 比对后才
+    // 落「下载」文件夹（同锁前分发——长下载绝不持 Host 锁）。
+    if req.method == "GET" && req.path == "/api/update/download" {
+        if !request_is_local(req) {
+            return Response::err(403, "跨源请求被拒绝");
+        }
+        return update_download_inner();
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
@@ -2265,6 +2499,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .get("id")
                 .cloned()
                 .unwrap_or_else(|| host.engine.config.appearance.skin.clone());
+            // 【审计 P2-B 2026-11-05】id 拼 skins_dir 前必须过闸（此前仅
+            // ssf-render 一处校验，此处 ?id=..\.. 可穿越读任意 .json）。
+            if !valid_skin_id(&id) {
+                return Response::err(400, "非法皮肤 id");
+            }
             let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {
@@ -2350,8 +2589,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 推进（DLL 立即重拉生效）。
         ("GET", "/api/skin/ssf-settings") => {
             let id = req.query.get("id").cloned().unwrap_or_default();
-            if id.is_empty() {
-                return Response::err(400, "缺少 id");
+            if !crate::ssf::valid_id(&id) {
+                return Response::err(400, "非法皮肤 id");
             }
             let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
             if !cache_dir.exists() {
@@ -2375,8 +2614,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         ("POST", "/api/skin/ssf-settings") => {
             let v = req.json();
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            if id.is_empty() {
-                return Response::err(400, "缺少 id");
+            // 【审计 P2-B 2026-11-05】join(&id) 前过闸（此前可向任意已
+            // 存在目录写 overrides.json）。
+            if !crate::ssf::valid_id(&id) {
+                return Response::err(400, "非法皮肤 id");
             }
             let Some(ovv) = v.get("overrides") else {
                 return Response::err(400, "缺少 overrides");
@@ -2451,6 +2692,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Ok(s) => s,
                 Err(e) => return Response::err(400, &format!("皮肤无效: {e}")),
             };
+            // 【审计 P2-B 2026-11-05】skin.id 落盘前过闸（此前 id 含 ..\
+            // 可任意路径写 .json——全端点里唯一的穿越写面）。
+            if !valid_skin_id(&skin.id) {
+                return Response::err(400, "非法皮肤 id");
+            }
             let p = host.skins_dir().join(format!("{}.json", skin.id));
             match skin.save(&p) {
                 Ok(()) => {
@@ -2561,7 +2807,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Some(p) => match std::fs::read(&p) {
                     Ok(b) => Response {
                         status: 200,
-                        content_type: image_content_type(&p),
+                        content_type: image_content_type(&p, &b),
                         body: b,
                     },
                     Err(_) => Response::err(404, "预览图读取失败"),
@@ -2583,8 +2829,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .get("id")
                 .cloned()
                 .unwrap_or_else(|| host.engine.config.appearance.skin.clone());
-            if id.is_empty() {
-                return Response::err(400, "缺少 id");
+            // 【审计 P2-B 2026-11-05】同 GET /api/skin：拼路径前过闸。
+            if !valid_skin_id(&id) {
+                return Response::err(400, "非法皮肤 id");
             }
             let path = host.skins_dir().join(format!("{id}.json"));
             let raw = match std::fs::read(&path) {
@@ -2706,7 +2953,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Some(p) => match std::fs::read(&p) {
                     Ok(b) => Response {
                         status: 200,
-                        content_type: image_content_type(&p),
+                        content_type: image_content_type(&p, &b),
                         body: b,
                     },
                     Err(_) => Response::err(404, "图片读取失败"),
@@ -3250,8 +3497,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             cfg.sentence = host.engine.config.sentence.clone();
             let mut skins_applied = 0usize;
             if let Some(skins) = v.get("skins").and_then(|x| x.as_object()) {
-                let dir = host.skins_dir();
-                let _ = std::fs::create_dir_all(&dir);
+                // 【P1-20 2026-11-05】两阶段：先全部校验+序列化（内存），
+                // 再统一落盘——坏包导入不再产生「第 N 张坏、前 N-1 张已
+                // 落盘」的半写混合状态（坏皮肤跳过、好的全量导入语义不
+                // 变；仅磁盘级写错误仍逐张计数）。
+                let mut staged: Vec<(std::path::PathBuf, String)> = Vec::new();
                 for (id, sv) in skins {
                     if id.is_empty()
                         || !id
@@ -3260,15 +3510,19 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     {
                         continue; // 非法 id 跳过
                     }
-                    // 结构校验（Skin serde 通过才落盘——坏皮肤不写入）
+                    // 结构校验（Skin serde 通过才进暂存——坏皮肤不写入）
                     if serde_json::from_value::<hufu_skin::Skin>(sv.clone()).is_err() {
                         continue;
                     }
-                    let p = dir.join(format!("{id}.json"));
                     if let Ok(txt) = serde_json::to_string(sv) {
-                        if std::fs::write(&p, txt).is_ok() {
-                            skins_applied += 1;
-                        }
+                        staged.push((host.skins_dir().join(format!("{id}.json")), txt));
+                    }
+                }
+                let dir = host.skins_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                for (p, txt) in staged {
+                    if std::fs::write(&p, txt).is_ok() {
+                        skins_applied += 1;
                     }
                 }
             }
@@ -3281,8 +3535,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let mut ssf_skins_applied = 0usize;
             let mut ssf_settings_applied = 0usize;
             if bundle_ver == Some(3) {
+                // 【P1-20 2026-11-05】.ssf 与 overrides 同款两阶段：先全部
+                // parse/serde 校验暂存（内存），再统一落盘/建缓存。
                 let dir = host.ssf_skins_dir();
                 let _ = std::fs::create_dir_all(&dir);
+                let mut staged_ssf: Vec<(String, Vec<u8>)> = Vec::new();
                 if let Some(m) = v.get("ssf_skins").and_then(|x| x.as_object()) {
                     for (id, ent) in m {
                         if !crate::ssf::valid_id(id) {
@@ -3294,15 +3551,19 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         let Ok(bytes) = b64::decode(b64) else {
                             continue;
                         };
-                        // 解析校验（坏皮/超预算不落盘）
+                        // 解析校验（坏皮/超预算不进暂存）
                         if hufu_skin::ssf::parse(&bytes).is_err() {
                             continue;
                         }
-                        if std::fs::write(dir.join(format!("{id}.ssf")), &bytes).is_ok() {
-                            ssf_skins_applied += 1;
-                        }
+                        staged_ssf.push((id.clone(), bytes));
                     }
                 }
+                for (id, bytes) in staged_ssf {
+                    if std::fs::write(dir.join(format!("{id}.ssf")), &bytes).is_ok() {
+                        ssf_skins_applied += 1;
+                    }
+                }
+                let mut staged_ov: Vec<(String, serde_json::Value)> = Vec::new();
                 if let Some(m) = v.get("ssf_settings").and_then(|x| x.as_object()) {
                     for (id, ov) in m {
                         if !crate::ssf::valid_id(id) {
@@ -3312,14 +3573,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         if serde_json::from_value::<crate::ssf::SsfOverrides>(ov.clone()).is_err() {
                             continue;
                         }
-                        // 缓存就绪（缺则解包建目录——含刚落盘的用户皮肤
-                        // 与官方自带；失败跳过该皮肤设置）
-                        if let Ok(b) = crate::ssf::bundle_for(&host.data_dir, id) {
-                            let ov_text = serde_json::to_string(ov).unwrap_or_default();
-                            if std::fs::write(b.cache_dir.join("overrides.json"), ov_text).is_ok()
-                            {
-                                ssf_settings_applied += 1;
-                            }
+                        staged_ov.push((id.clone(), ov.clone()));
+                    }
+                }
+                for (id, ov) in staged_ov {
+                    // 缓存就绪（缺则解包建目录——含刚落盘的用户皮肤
+                    // 与官方自带；失败跳过该皮肤设置）
+                    if let Ok(b) = crate::ssf::bundle_for(&host.data_dir, &id) {
+                        let ov_text = serde_json::to_string(&ov).unwrap_or_default();
+                        if std::fs::write(b.cache_dir.join("overrides.json"), ov_text).is_ok() {
+                            ssf_settings_applied += 1;
                         }
                     }
                 }
@@ -3563,9 +3826,9 @@ mod sys_win {
         }
     }
 
-    /// 用系统默认关联程序打开 URL（零解释器：直调 ShellExecuteW，不拉
-    /// cmd/powershell 子进程——运行时零解释器铁律，AGENTS.md 2026-11-05）。
-    /// 返回值 >32 表示成功（ShellExecuteW 惯例）。
+    // 用系统默认关联程序打开 URL（零解释器：直调 ShellExecuteW，不拉
+    // cmd/powershell 子进程——运行时零解释器铁律，AGENTS.md 2026-11-05）。
+    // 返回值 >32 表示成功（ShellExecuteW 惯例）。
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteW(
@@ -3581,7 +3844,61 @@ mod sys_win {
         const SW_SHOWNORMAL: i32 = 1;
         let verb: Vec<u16> = "open\0".encode_utf16().collect();
         let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { ShellExecuteW(0, verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) > 32 }
+        let r = unsafe {
+            ShellExecuteW(0, verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        if r <= 32 {
+            // ShellExecuteW 惯例：<=31 为错误码（27=SE_ERR_DDEFAIL 等），
+            // 落 stderr 供末级兜底失败排查。
+            eprintln!("ShellExecuteW 失败码 {r}（{url}）");
+        }
+        r > 32
+    }
+
+    // 【审计 P3 2026-11-05】MSDN：ShellExecuteW 前应初始化 COM（个别
+    // 浏览器/Shell 扩展走 COM/DDE 路径）。APARTMENTTHREADED|DISABLE_OLE1DDE。
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(pvreserved: *mut core::ffi::c_void, dwcoinit: u32) -> i32;
+    }
+    pub unsafe fn co_init_apartment() -> i32 {
+        CoInitializeEx(std::ptr::null_mut(), 0x2 | 0x4)
+    }
+
+    // 【审计 P2-D 2026-11-05】真实「下载」文件夹（FOLDERID_Downloads），
+    // 校验式更新下载的落盘位置。GUID = {374DE290-123F-4565-9164-39C4925E467B}。
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const u8,
+            flags: u32,
+            token: isize,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+    }
+    /// 返回「下载」文件夹；失败返回 None（调用方回退 %USERPROFILE%\Downloads）。
+    pub unsafe fn known_downloads_dir() -> Option<std::path::PathBuf> {
+        const FOLDERID_DOWNLOADS: [u8; 16] = [
+            0x90, 0xE2, 0x4D, 0x37, 0x3F, 0x12, 0x65, 0x45, 0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B,
+        ];
+        let mut p: *mut u16 = std::ptr::null_mut();
+        if SHGetKnownFolderPath(FOLDERID_DOWNLOADS.as_ptr(), 0, 0, &mut p) < 0 {
+            return None;
+        }
+        if p.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16(std::slice::from_raw_parts(p, len)).ok();
+        CoTaskMemFree(p as *mut core::ffi::c_void);
+        s.map(std::path::PathBuf::from)
     }
 
     // ── 设置窗口（Chromium --app）居中参数 ──

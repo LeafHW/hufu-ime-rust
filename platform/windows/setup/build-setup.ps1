@@ -78,6 +78,13 @@ $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
 if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
 if (-not (Test-Path $iscc)) { Fail('未找到 ISCC.exe（Inno Setup 6）——先安装 Inno Setup 6') }
 if (-not (Test-Path (Join-Path $setupRoot 'lang\ChineseSimplified.isl'))) { Fail('缺少 lang\ChineseSimplified.isl') }
+# 【审计 P2-H 2026-11-05】iss 必须 UTF-8 BOM：无 BOM 时部分 Inno 版本/
+# 其他机器按 ANSI 解析中文 → 安装界面乱码。7ecdbef 曾被编辑器剥掉 BOM
+#（本机 6.7.3 恰好容忍），此处编译前硬校验防回归。
+$issBytes = [System.IO.File]::ReadAllBytes((Join-Path $setupRoot 'hufu-setup.iss'))
+if ($issBytes.Length -lt 3 -or $issBytes[0] -ne 0xEF -or $issBytes[1] -ne 0xBB -or $issBytes[2] -ne 0xBF) {
+    Fail('hufu-setup.iss 缺 UTF-8 BOM（其他机器 Inno 会把中文按 ANSI 解析出乱码）——先补 EF BB BF 再编译')
+}
 
 # ── 2) staging 重建 ───────────────────────────────────────────────────────
 if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }

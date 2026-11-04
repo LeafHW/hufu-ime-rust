@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { About } from '../types';
-import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
+import { fetchUpdateCheck, verifiedDownloadUpdate, type UpdateState } from '../updateCheck';
 import { PageHead } from '../components/ui';
 
 export function AboutPage({ about }: { about: About }) {
@@ -34,10 +34,12 @@ export function AboutPage({ about }: { about: About }) {
                 <button
                   type="button"
                   className="btn"
-                  onClick={() => window.open(upd.downloadUrl || upd.pageUrl, '_blank', 'noopener')}
-                  title={upd.downloadUrl ? '浏览器直接下载安装包' : '未找到安装包，打开下载页'}
+                  /* 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256
+                     比对，通过才落「下载」文件夹；端点不可用回退浏览器直开。 */
+                  onClick={() => verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, (m) => console.info('[update]', m))}
+                  title={upd.downloadUrl ? '下载并校验安装包（sha256 通过才保存）' : '未找到安装包，打开下载页'}
                 >
-                  {upd.downloadUrl ? '直接下载安装包' : '打开下载页'}
+                  {upd.downloadUrl ? '下载安装包（自动校验）' : '打开下载页'}
                 </button>
               </>
             )}

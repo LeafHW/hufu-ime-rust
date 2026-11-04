@@ -997,9 +997,15 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
             let Some(shared) = SHARED.get() else {
                 return Err("同步模块未初始化".into());
             };
-            let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
-            let full =
-                serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
+            // 【P1-19 2026-11-05】归并/备份/解析移出 Host 锁：此前
+            // sanitize + three_way_merge + backup_config（文件复制）+
+            // from_value 全程持锁跑——纯计算与磁盘复制白占打字关键区。
+            // 现在锁内只取快照；apply 前二次取锁校验快照未变（变了 =
+            // 同步期间用户改过配置，本轮放弃，下轮以新 full 重新归并）。
+            let full = {
+                let h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?
+            };
             let mut local_san = full.clone();
             sanitize_config(&mut local_san);
             let base = s.last_config.clone().unwrap_or_else(|| local_san.clone());
@@ -1009,13 +1015,18 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                 backup_config(&data_dir);
                 let cfg: hufu_config::Config = serde_json::from_value(merged)
                     .map_err(|e| format!("归并配置无法解析：{e}"))?;
-                let (need_sentence, teardown) = h
-                    .apply_config(cfg)
-                    .map_err(|e| format!("应用配置失败：{e}"))?;
-                if need_sentence {
-                    crate::reload_sentence_bg(teardown, true);
+                let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                let full2 =
+                    serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
+                if full2 == full {
+                    let (need_sentence, teardown) = h
+                        .apply_config(cfg)
+                        .map_err(|e| format!("应用配置失败：{e}"))?;
+                    if need_sentence {
+                        crate::reload_sentence_bg(teardown, true);
+                    }
+                    cfg_changed = true;
                 }
-                cfg_changed = true;
             }
         }
     }

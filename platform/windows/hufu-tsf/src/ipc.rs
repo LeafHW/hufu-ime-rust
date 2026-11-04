@@ -231,11 +231,58 @@ fn server_pipe_present() -> bool {
     }
 }
 
+/// 【审计 P3 2026-11-05】当前进程是否 AppContainer 沙箱（TokenIsAppContainer）。
+/// 开始菜单/UWP 等宿主运行在 AppContainer：非 elevated 会穿过提权闸门，
+/// 但 CreateProcessW(env=null) 继承受限 token，受限 server 建的管道 ACL
+/// 可能拒普通进程——「server 缺席 + AppContainer 首拉」窗口的理论风险。
+/// 与提权闸门同款：跳过拉起，由正常进程（explorer 等）负责拉 server。
+fn process_is_appcontainer() -> bool {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_APPCONTAINER_CLASS: i32 = 29;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut t: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 {
+            return false;
+        }
+        let mut is_ac: u32 = 0;
+        let mut ret = 0u32;
+        let ok = GetTokenInformation(
+            t,
+            TOKEN_APPCONTAINER_CLASS,
+            &mut is_ac as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(t);
+        ok != 0 && is_ac != 0
+    }
+}
+
 fn ensure_server() -> bool {
     // 【2026-11 安全阀】提权宿主不拉起 server（详见 process_is_elevated）：
     // 宁可在提权进程里打字失败，也不留一个普通权限杀不掉的常驻 server。
     if process_is_elevated() {
         crate::tsf::trace("ipc: 提权宿主 → 不拉起 server（防高 IL 常驻进程）");
+        return false;
+    }
+    // 【审计 P3 2026-11-05】AppContainer 宿主同款跳过（防受限 token server）。
+    if process_is_appcontainer() {
+        crate::tsf::trace("ipc: AppContainer 宿主 → 不拉起 server（防受限 token server）");
         return false;
     }
     // 【2026-11-02】pipe 已经存在但连接失败（ACL/繁忙）→ 不再无限拉起。
@@ -579,11 +626,28 @@ fn call_on(
             }
             if wait_response(resp_timeout).is_none() {
                 // 超时/断线：弃连接（防响应错位）走降级
+                // 【审计 P2-F 2026-11-05】响应超时 =「server 活着但 dispatch
+                // 挂死/全局锁被长操作占住」——此前该场景不设退避（退避
+                // 只在 CreateFileW 失败路径），管道对象还在，下一键重连成
+                // 功后再等满全额超时（键通道 2s、poll 每拍 150ms），挂死
+                // 期间宿主 UI 持续卡。挂死窗口设 200ms 短退避（低于连接
+                // 失败的 400ms：挂死可能自愈，且本次已付全价等待）。
+                CONN_DOWN_UNTIL_MS.store(
+                    now_ms() + 200,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 *file = None;
                 return None;
             }
             let mut head = [0u8; 4];
             if !read_full_timeout(f, &mut head, raw_pipe, body_timeout.max(500)) {
+                // 【审计 P2-F 2026-11-05】读不满同款：分片后挂死/断线，
+                // 设短退避再弃连接（管道真断时下轮 connect 失败会覆盖为
+                // 400ms 正常退避，两值取后写者，无冲突）。
+                CONN_DOWN_UNTIL_MS.store(
+                    now_ms() + 200,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 *file = None;
                 return None;
             }

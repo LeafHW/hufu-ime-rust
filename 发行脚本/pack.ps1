@@ -774,16 +774,30 @@ foreach ($zin in $ziBins) {
     } else { $bad = '包内缺失' }
     $all = (Check ($null -eq $bad) "零解释器 zip内 $zin$(if ($bad) { "：检出 $bad" })") -and $all
 }
-# 源码级：运行时 crate 不得 spawn cmd/powershell 解释器（含变量间接——
-# 一律写明豁免名单注释才允许）。当前豁免：无。
-$ziSrcDirs = @('E:\DSH-KF\hufu\engine\crates\hufu-server\src','E:\DSH-KF\hufu\platform\windows\hufu-tsf\src','E:\DSH-KF\hufu\platform\windows\hufu-settings\src','E:\DSH-KF\hufu\engine\crates\hufu-render-helper\src')
-$ziHits = @()
+# 源码级：运行时 crate 不得 spawn cmd/powershell 解释器。
+# 【审计 P3 2026-11-05 门禁强化】①字面量解释器首参直接 FAIL；②变量间接
+# spawn（首参非字面量）逐一列出，无 zi-ok: 豁免注释即 FAIL——豁免注释
+# 写在 Command::new 同一行，注明目标是什么、为何非解释器；③源码目录从
+# $PSScriptRoot 推导（硬编码绝对路径在仓挪位后静默空转），目录缺失即 FAIL。
+$ziRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$ziSrcDirs = @(
+    (Join-Path $ziRoot 'engine\crates\hufu-server\src'),
+    (Join-Path $ziRoot 'engine\crates\hufu-render-helper\src'),
+    (Join-Path $ziRoot 'platform\windows\hufu-tsf\src'),
+    (Join-Path $ziRoot 'platform\windows\hufu-settings\src')
+)
+$ziHits = @(); $ziIndirect = @()
 foreach ($d in $ziSrcDirs) {
-    if (Test-Path $d) {
-        $ziHits += @(Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\("(cmd|powershell|pwsh)' | ForEach-Object { "$(Split-Path $_.Path -Leaf):$($_.LineNumber)" })
+    if (-not (Test-Path $d)) { Fail("零解释器 源码目录不存在：$d（门禁不能空转，先修路径）") }
+    foreach ($m in (Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\\"(cmd|powershell|pwsh)')) {
+        $ziHits += "$((Split-Path $m.Path -Leaf)):$($m.LineNumber)"
+    }
+    foreach ($m in (Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\((?!")')) {
+        if ($m.Line -notmatch 'zi-ok:') { $ziIndirect += "$((Split-Path $m.Path -Leaf)):$($m.LineNumber)" }
     }
 }
-$all = (Check ($ziHits.Count -eq 0) "零解释器 源码无 cmd/powershell spawn$(if ($ziHits.Count) { "：$($ziHits -join '; ')" })") -and $all
+$all = (Check ($ziHits.Count -eq 0) "零解释器 源码无 cmd/powershell 字面量 spawn$(if ($ziHits.Count) { "：$($ziHits -join '; ')" })") -and $all
+$all = (Check ($ziIndirect.Count -eq 0) "零解释器 变量间接 spawn 全部带 zi-ok 豁免$(if ($ziIndirect.Count) { "：$($ziIndirect -join '; ')（漏豁免注释）" })") -and $all
 # 【2026-10-18 反查瘦身】全局资源：拼音反查只发全拼基表（码列空格
 # 分隔音节）；自然码/小鹤双拼装载期规则派生，实表不得在包内。
 $all = (Check (@($arc.Entries | Where-Object { $_.FullName -match '拼音反查[/\\]全拼\.txt$' }).Count -eq 1) '拼音反查 全拼基表') -and $all

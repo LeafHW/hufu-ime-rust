@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
 import { fetchWithTimeout, syncNow } from '../api';
-import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
+import { fetchUpdateCheck, verifiedDownloadUpdate, type UpdateState } from '../updateCheck';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
@@ -52,7 +52,9 @@ export function Overview({
   const onCheckUpdateRow = async () => {
     if (upd.kind === 'checking') return;
     if (upd.kind === 'update') {
-      window.open(upd.downloadUrl || upd.pageUrl, '_blank', 'noopener');
+      /* 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256 比对，
+         通过才落「下载」文件夹；端点不可用回退浏览器直开。 */
+      await verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, notify);
       return;
     }
     setUpd({ kind: 'checking' });
