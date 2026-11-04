@@ -45,43 +45,55 @@ const CLASS: PCWSTR = w!("HuFuAddWord");
 
 // 【2026-11-03 视觉重做】无边框卡片式弹窗：24 边距、
 // 字段=标签+圆角输入卡、预览=真实候选皮肤卡片、底部主/次按钮。
-// 【2026-11-04 字号放大】正文 15→17、小字 12→14、标题 23→26、预览 18→20；
-// 窗口 520→560、加词高 680→720、加权高 604→640；全部固定像素、不做 DPI
-// 缩放，几何常量按放大后的字体行高（GDI 实测 cell：26→34 / 17→23|24 /
-// 14→20 / 20→27）同步重排。
-const WIN_W: i32 = 560;
+// 【2026-11-04 字号放大·二档】标题 26→29、正文 17→20、小字 14→15、预览
+// 20→22、预览标签 14→15（选型理由见 ensure_ui_fonts 注释）。全部固定像素、
+// 不做 DPI 缩放；几何常量按 GDI 实测 cell（29→39 / 20→27 / 15→20 /
+// 22→30 / 15→20）重排，并把**输入框文字改为卡内垂直居中**：
+//   RichEdit 单行文本从控件顶边开始画 —— 控件若按 (CARD_H-EDIT_H)/2 居中，
+//   文本仍贴顶（旧版 50 卡内 36 控件、文字只占顶部 23px，实测偏上 7px）。
+//   现在控件高 = 行盒 cell + 6（光标/选区余量），控件 y 用「行盒」居中：
+//   EDIT_DY = (CARD_H - EDIT_CELL)/2。
+const WIN_W: i32 = 592;
 const M: i32 = 24;
-const CONTENT_W: i32 = WIN_W - M * 2; // 512
+const CONTENT_W: i32 = WIN_W - M * 2; // 544
 const PV_X: i32 = M + 24;
 const PV_W: i32 = CONTENT_W - 48;
 /// 字段卡：首行 y、行距、卡高、编辑框内缩/高。
-const ROW_Y0: i32 = 110;
-const ROW_PITCH: i32 = 90;
-const CARD_H: i32 = 50;
+const ROW_Y0: i32 = 120;
+const ROW_PITCH: i32 = 100;
+const CARD_H: i32 = 56;
 const EDIT_INSET: i32 = 12;
-const EDIT_H: i32 = 36;
-const EDIT_W: i32 = CONTENT_W - EDIT_INSET * 2;
-const EDIT_DY: i32 = (CARD_H - EDIT_H) / 2;
-const LBL_H: i32 = 26;
-const LBL_W: i32 = 340;
+/// 20px 输入字体的行盒高（GDI 实测 cell=27）。
+const EDIT_CELL: i32 = 27;
+const EDIT_H: i32 = EDIT_CELL + 6; // 33：行盒 + 光标/选区余量
+const EDIT_W: i32 = CONTENT_W - EDIT_INSET * 2; // 520
+/// 让**行盒**在卡内居中（不是 (CARD_H-EDIT_H)/2）。
+const EDIT_DY: i32 = (CARD_H - EDIT_CELL) / 2;
+const LBL_H: i32 = 30;
+const LBL_W: i32 = 380;
 /// 占位符开关（自绘 toggle）。
-const TOGGLE_Y: i32 = 376;
-const TOGGLE_W: i32 = 176;
-const TOGGLE_H: i32 = 38;
+const TOGGLE_Y: i32 = 420;
+const TOGGLE_W: i32 = 190;
+const TOGGLE_H: i32 = 44;
 /// 加词：预览卡 + 底栏。
-const PREVIEW_Y: i32 = 426;
+const PREVIEW_Y: i32 = 476;
 const PREVIEW_TITLE_Y: i32 = PREVIEW_Y + 12;
 const PREVIEW_ITEMS_Y: i32 = PREVIEW_Y + 80;
 const PV_START_Y: i32 = PREVIEW_ITEMS_Y;
-const CLIENT_H: i32 = 720;
+const CLIENT_H: i32 = 800;
 /// 加权：权重刻度 + 预览卡 + 底栏。
-const SCALE_Y: i32 = 290;
-const SCALE_H: i32 = 88;
-const W_PREVIEW_Y: i32 = 392;
-const W_CLIENT_H: i32 = 640;
+const SCALE_Y: i32 = 318;
+const SCALE_H: i32 = 96;
+const W_PREVIEW_Y: i32 = 428;
+const W_CLIENT_H: i32 = 708;
+/// 预览行：22px 字体 cell=30、15px 序号 cell=20；行高 38。
+/// 胶囊与文字盒都按此行盒居中（新词「1.词」不再贴行首顶端）。
+const PV_CELL: i32 = 30;
+const PV_LABEL_CELL: i32 = 20;
+const PV_LINE_H: i32 = 38;
 /// 按钮几何（右对齐）。
-const BTN_W: i32 = 116;
-const BTN_H: i32 = 46;
+const BTN_W: i32 = 124;
+const BTN_H: i32 = 50;
 const BTN_GAP: i32 = 12;
 const BTN_OK_X: i32 = M + CONTENT_W - BTN_W;
 const BTN_CANCEL_X: i32 = BTN_OK_X - BTN_GAP - BTN_W;
@@ -667,15 +679,15 @@ fn load_skin() {
                 face_ptr,
             )
         };
-        // 预览用固定 20/14px（皮肤字号只用在候选窗；弹窗预览要能一屏装下）
-        // 【2026-11-04 字号放大】18/13 → 20/14（cell 27/20）。
+        // 预览用固定 22/15px（皮肤字号只用在候选窗；弹窗预览要能一屏装下）
+        // 【2026-11-04 字号放大·二档】20/14 → 22/15（cell 30/20）。
         *FONT_MAIN.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(mk_font(20, FW_NORMAL.0 as i32).0 as usize);
+            Some(mk_font(22, FW_NORMAL.0 as i32).0 as usize);
         *FONT_LABEL.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(mk_font(14, FW_NORMAL.0 as i32).0 as usize);
+            Some(mk_font(15, FW_NORMAL.0 as i32).0 as usize);
         // 新词：加粗 + 下划线
         let bold_underline = CreateFontW(
-            -20,
+            -22,
             0,
             0,
             0,
@@ -722,16 +734,18 @@ unsafe fn ensure_ui_fonts() {
             PCWSTR(face.as_ptr()),
         )
     };
-    // 【2026-11-04 字号放大】标题 23→26、正文 15→17、小字 12→14。
-    // GDI 实测 cell 高：26→34、17→23（粗体 24）、14→20——排版常量按此重排。
+    // 【2026-11-04 字号放大·二档】标题 26→29、正文 17→20、小字 14→15。
+    // 选型：20px（cell 27）比旧 17px 明显大一级，卡高 56 时行盒上下各 ~14px
+    // 留白；21px 会让占位符说明（15px 时 328px 宽）与 toggle 并排顶到右缘，
+    // 故正文取 20、小字 15、标题 29（cell 39）。
     *FONT_TITLE.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(mk(26, FW_BOLD.0 as i32).0 as usize);
+        Some(mk(29, FW_BOLD.0 as i32).0 as usize);
     *FONT_UI.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(mk(17, FW_NORMAL.0 as i32).0 as usize);
+        Some(mk(20, FW_NORMAL.0 as i32).0 as usize);
     *FONT_UI_BOLD.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(mk(17, FW_BOLD.0 as i32).0 as usize);
+        Some(mk(20, FW_BOLD.0 as i32).0 as usize);
     *FONT_SMALL.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(mk(14, FW_NORMAL.0 as i32).0 as usize);
+        Some(mk(15, FW_NORMAL.0 as i32).0 as usize);
     UI_FONTS_READY.store(true, Ordering::Relaxed);
 }
 
@@ -1326,8 +1340,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let lbl_txt = mk(label);
                 // 【词框实时编码 2026-10-07】词行标签给 id：EDIT 回退模式
                 // 下把编码尾巴显示在标签上（RichEdit 模式框内内联显示）。
-                // 【2026-11-04】标签上移量 26→30：17px 粗体 cell 高 24，
-                // LBL_H=26，标签底与卡片顶留 4px。
+                // 【2026-11-04】标签上移量 30→34：20px 粗体 cell 高 27，
+                // LBL_H=30，标签底与卡片顶留 4px。
                 let lbl = create_child(
                     hwnd,
                     w!("STATIC"),
@@ -1335,7 +1349,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WINDOW_EX_STYLE(0),
                     0,
                     M,
-                    y - 30,
+                    y - 34,
                     LBL_W,
                     LBL_H,
                     if *id == ID_WORD { AW_LIVE_LABEL } else { 0 },
@@ -1512,8 +1526,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else {
                     PREVIEW_TITLE_Y
                 },
-                260,
-                26,
+                300,
+                30,
                 ID_PV_TITLE,
             );
             set_ui_font(pv_title, true);
@@ -1585,15 +1599,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_NCHITTEST => {
-            // 顶部 68px 可拖拽；关闭 × 区域留给 WM_LBUTTONUP。
+            // 顶部 78px（到分隔线）可拖拽；关闭 × 区域留给 WM_LBUTTONUP。
             let sx = (lp.0 & 0xffff) as i16 as i32;
             let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let cx = sx - wr.left;
             let cy = sy - wr.top;
-            if cy < 68 {
-                if (WIN_W - 46..=WIN_W - 14).contains(&cx) && (10..=48).contains(&cy) {
+            if cy < 78 {
+                if (WIN_W - 46..=WIN_W - 14).contains(&cx) && (8..=52).contains(&cy) {
                     return LRESULT(HTCLIENT as isize);
                 }
                 return LRESULT(HTCAPTION as isize);
@@ -1603,7 +1617,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONUP => {
             let x = (lp.0 & 0xffff) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
-            if (WIN_W - 46..=WIN_W - 14).contains(&x) && (10..=48).contains(&y) {
+            if (WIN_W - 46..=WIN_W - 14).contains(&x) && (8..=52).contains(&y) {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -2131,23 +2145,23 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
     let _ = FillRect(hdc, &rc, bg);
     let _ = DeleteObject(HGDIOBJ(bg.0));
     // 抬头强调条 + 标题/副标题
-    // 【2026-11-04】标题 26px（cell 34）y=10；副标题 14px（cell 20）y=46；
-    // 分隔线 74——三段各留 2~8px 不重叠。
+    // 【2026-11-04·二档】标题 29px（cell 39）y=9；副标题 15px（cell 20）y=50；
+    // 分隔线 78——三段不重叠（9+39=48 < 50，50+20=70 < 78）。
     let bar = CreateSolidBrush(COLORREF(accent));
-    let _ = FillRect(hdc, &RECT { left: M, top: 20, right: M + 3, bottom: 46 }, bar);
+    let _ = FillRect(hdc, &RECT { left: M, top: 20, right: M + 3, bottom: 54 }, bar);
     let _ = DeleteObject(HGDIOBJ(bar.0));
-    let _ = draw_text(hdc, if weight { "加权" } else { "加词" }, M + 12, 10, title_font(), th.text);
+    let _ = draw_text(hdc, if weight { "加权" } else { "加词" }, M + 12, 9, title_font(), th.text);
     let _ = draw_text(
         hdc,
         if weight { "调整已有词的候选优先级" } else { "把新词放进候选顺序" },
         M + 12,
-        46,
+        50,
         small_font(),
         th.muted,
     );
-    // 关闭 ×（点击热区 WIN_W-46..WIN_W-14, y 10..48）
-    let _ = draw_text(hdc, "×", WIN_W - 42, 10, title_font(), th.muted);
-    hline(hdc, M, WIN_W - M, 74, th.border);
+    // 关闭 ×（点击热区 WIN_W-46..WIN_W-14, y 10..52）
+    let _ = draw_text(hdc, "×", WIN_W - 42, 8, title_font(), th.muted);
+    hline(hdc, M, WIN_W - M, 78, th.border);
 
     // 字段卡
     let focus = FOCUS_ID.load(std::sync::atomic::Ordering::Relaxed);
@@ -2166,7 +2180,8 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
         let border = if focus == id { accent } else { th.border };
         round_box(hdc, M, y, CONTENT_W, CARD_H, 10, th.card, border);
     }
-    // 字段右侧提示（14px，cell 20；与粗体标签基线对齐）
+    // 字段右侧提示（15px，cell 20；与 20px 粗体标签基线对齐：标签盒顶 y-34
+    // + 基线约 22 = y-12，提示顶 y-28 + 基线约 16 = y-12）
     let hint_y = |i: i32| ROW_Y0 + i * ROW_PITCH - 28;
     let hint_x_right = M + CONTENT_W;
     let hints: [&str; 3] = if weight {
@@ -2181,35 +2196,35 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
         draw_text_right(hdc, h, hint_x_right, hint_y(i as i32), small_font(), th.muted);
     }
     if !weight {
-        // 占位符开关（按钮本身自绘）+ 说明（14px；右侧说明宽 307px，
-        // TOGGLE_W 放大会顶到右边缘，故 toggle 宽 176 时说明左缘 212）
+        // 占位符开关（按钮本身自绘）+ 说明（15px，实测 328px 宽；
+        // toggle 190 + 12 间距后右缘 554 < 内容右缘 568）
         let _ = draw_text(
             hdc,
             "选重位超过现有候选时，用 ③ ④ … 补齐前序空位",
             M + TOGGLE_W + 12,
-            TOGGLE_Y + 9,
+            TOGGLE_Y + 12,
             small_font(),
             th.muted,
         );
     }
 
     // 预览卡
-    let footer_top = ch - 80;
+    let footer_top = ch - 88;
     let pv_y = if weight { W_PREVIEW_Y } else { PREVIEW_Y };
     let pv_bottom = footer_top - 12;
     let pv_h = (pv_bottom - pv_y).max(80);
     round_box(hdc, M, pv_y, CONTENT_W, pv_h, 12, th.card, th.border);
-    // 预览内层（真实皮肤底）——标题行 17px 粗体 cell 24 + 12 上边距，
-    // 内层顶从 pv_y+52 起（原 +44）。
-    let body_y = pv_y + 52;
+    // 预览内层（真实皮肤底）——标题行 20px 粗体 cell 27 + 12 上边距，
+    // 内层顶从 pv_y+56 起。
+    let body_y = pv_y + 56;
     let body_h = (pv_bottom - body_y - 12).max(40);
     round_box(hdc, M + 12, body_y, CONTENT_W - 24, body_h, 8, pv_bg, th.border);
     if weight {
         // 右对齐图例
         let _ = draw_text_right(hdc, "权重越高，越靠前", M + CONTENT_W - 16, pv_y + 15, small_font(), th.muted);
         // 简单效果示意：词 → 前部
-        // 【2026-11-04】字号放大后长词会横穿预览卡右缘：先按像素宽裁成 …
-        //（右侧给「→ 候选前部」留位），再画。
+        // 【2026-11-04·二档】示意块（词行 cell 27 + 8 + 说明 cell 20 = 55）
+        // 在内层里垂直居中；长词先按像素宽裁成 …（右侧给「→ 候选前部」留位）。
         let wtext = weight_word(hwnd);
         let raw = if wtext.is_empty() { "（输入要加权的词）" } else { wtext.as_str() };
         let mw = |s: &str, f: Option<usize>, em: i32| -> i32 {
@@ -2218,13 +2233,14 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
                 None => text_w(s, em),
             }
         };
-        let (wd, _) = fit_text(&mw, raw, ui_font(true), 17, (CONTENT_W - 168).max(80));
+        let (wd, _) = fit_text(&mw, raw, ui_font(true), 20, (CONTENT_W - 168).max(80));
         let w = wd.as_str();
         let ww = measure_ui_w(hdc, w, ui_font(true));
-        let _ = draw_text(hdc, w, M + 28, body_y + 16, ui_font(true), th.text);
-        let _ = draw_text(hdc, "→", M + 28 + ww + 10, body_y + 16, ui_font(false), accent);
-        let _ = draw_text(hdc, "候选前部", M + 28 + ww + 42, body_y + 16, ui_font(false), th.muted);
-        let _ = draw_text(hdc, "确定后自动反查编码，并按权重排到候选前部。", M + 28, body_y + 52, small_font(), pv_label);
+        let wy = body_y + ((body_h - 55) / 2).max(8);
+        let _ = draw_text(hdc, w, M + 28, wy, ui_font(true), th.text);
+        let _ = draw_text(hdc, "→", M + 28 + ww + 10, wy, ui_font(false), accent);
+        let _ = draw_text(hdc, "候选前部", M + 28 + ww + 42, wy, ui_font(false), th.muted);
+        let _ = draw_text(hdc, "确定后自动反查编码，并按权重排到候选前部。", M + 28, wy + 35, small_font(), pv_label);
     } else {
         let _ = draw_text_right(hdc, "现有 → 加入后", M + CONTENT_W - 16, pv_y + 15, small_font(), th.muted);
         // 新词胶囊：父窗口先画圆角底，STATIC 文字以 NULL_BRUSH 透明叠上。
@@ -2238,12 +2254,12 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
     if weight {
         round_box(hdc, M, SCALE_Y, CONTENT_W, SCALE_H, 12, th.card, th.border);
         let wv = weight_now(hwnd);
-        let _ = draw_text(hdc, "权重", M + 16, SCALE_Y + 10, small_font(), th.muted);
+        let _ = draw_text(hdc, "权重", M + 16, SCALE_Y + 12, small_font(), th.muted);
         let val = if wv == 0 { "1000（默认）".to_string() } else { format!("{wv}") };
-        let _ = draw_text_right(hdc, &val, M + CONTENT_W - 16, SCALE_Y + 8, ui_font(true), accent);
+        let _ = draw_text_right(hdc, &val, M + CONTENT_W - 16, SCALE_Y + 10, ui_font(true), accent);
         let tx1 = M + 16;
         let tx2 = M + CONTENT_W - 16;
-        let ty = SCALE_Y + 48;
+        let ty = SCALE_Y + 52;
         let track = CreateSolidBrush(COLORREF(th.border));
         let _ = FillRect(hdc, &RECT { left: tx1, top: ty, right: tx2, bottom: ty + 6 }, track);
         let _ = DeleteObject(HGDIOBJ(track.0));
@@ -2253,20 +2269,20 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
         let _ = FillRect(hdc, &RECT { left: tx1, top: ty, right: mx.max(tx1 + 2), bottom: ty + 6 }, fill);
         let _ = DeleteObject(HGDIOBJ(fill.0));
         round_box(hdc, mx - 6, ty - 5, 12, 16, 5, accent, accent);
-        let _ = draw_text(hdc, "低", tx1, SCALE_Y + 62, small_font(), th.muted);
-        let _ = draw_text_center(hdc, "1000 · 默认", tx1, SCALE_Y + 62, tx2 - tx1, 20, small_font(), 20, th.muted);
-        let _ = draw_text_right(hdc, "高", tx2, SCALE_Y + 62, small_font(), th.muted);
+        let _ = draw_text(hdc, "低", tx1, SCALE_Y + 66, small_font(), th.muted);
+        let _ = draw_text_center(hdc, "1000 · 默认", tx1, SCALE_Y + 66, tx2 - tx1, 20, small_font(), 20, th.muted);
+        let _ = draw_text_right(hdc, "高", tx2, SCALE_Y + 66, small_font(), th.muted);
     }
 
     // 底栏
     hline(hdc, M, WIN_W - M, footer_top, th.border);
     // 两行键盘提示（单行会与右侧按钮重叠）：开关/确定/取消都可全键盘。
     if weight {
-        let _ = draw_text(hdc, "Tab 切换", M, ch - 44, small_font(), th.muted);
-        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 24, small_font(), th.muted);
+        let _ = draw_text(hdc, "Tab 切换", M, ch - 48, small_font(), th.muted);
+        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 26, small_font(), th.muted);
     } else {
-        let _ = draw_text(hdc, "Tab 切换 · 空格 勾选占位符", M, ch - 44, small_font(), th.muted);
-        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 24, small_font(), th.muted);
+        let _ = draw_text(hdc, "Tab 切换 · 空格 勾选占位符", M, ch - 48, small_font(), th.muted);
+        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 26, small_font(), th.muted);
     }
     // 外框
     round_box(hdc, 0, 0, cw, ch, 14, 0, th.border);
@@ -2331,40 +2347,40 @@ unsafe fn paint_item(dis: &DrawItem) {
             } else {
                 accent
             };
-            round_box(hdc, rc.left, rc.top, w, h, 10, fill, fill);
+            round_box(hdc, rc.left, rc.top, w, h, 12, fill, fill);
             let fg = if disabled { th.muted } else { contrast_fg(accent) };
-            // 17px 粗体 cell 高 24（居中用实测行高，别用旧的 15）
-            draw_text_center(hdc, "确定", rc.left, rc.top, w, h, ui_font(true), 24, fg);
+            // 20px 粗体 cell 高 27（居中用实测行高）
+            draw_text_center(hdc, "确定", rc.left, rc.top, w, h, ui_font(true), 27, fg);
             if focused && !disabled {
-                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 8, 0, th.accent_fg);
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 9, 0, th.accent_fg);
             }
         }
         ID_CANCEL => {
             let fill = if selected { th.border } else { th.card };
-            round_box(hdc, rc.left, rc.top, w, h, 10, fill, th.border);
-            draw_text_center(hdc, "取消", rc.left, rc.top, w, h, ui_font(false), 23, th.text);
+            round_box(hdc, rc.left, rc.top, w, h, 12, fill, th.border);
+            draw_text_center(hdc, "取消", rc.left, rc.top, w, h, ui_font(false), 27, th.text);
             if focused {
-                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 8, 0, accent);
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 9, 0, accent);
             }
         }
         ID_PH => {
             let on = PH_ON.load(std::sync::atomic::Ordering::Relaxed);
             if on {
-                round_box(hdc, rc.left, rc.top, w, h, 19, th.card, accent);
-                let bx = rc.left + 10;
-                let by = rc.top + (h - 20) / 2;
-                round_box(hdc, bx, by, 20, 20, 5, accent, accent);
-                let _ = draw_text_center(hdc, "✓", bx, by, 20, 20, small_font(), 20, th.accent_fg);
+                round_box(hdc, rc.left, rc.top, w, h, 22, th.card, accent);
+                let bx = rc.left + 12;
+                let by = rc.top + (h - 22) / 2;
+                round_box(hdc, bx, by, 22, 22, 5, accent, accent);
+                let _ = draw_text_center(hdc, "✓", bx, by, 22, 22, small_font(), 20, th.accent_fg);
             } else {
-                round_box(hdc, rc.left, rc.top, w, h, 19, th.card, th.border);
-                let bx = rc.left + 10;
-                let by = rc.top + (h - 20) / 2;
-                round_box(hdc, bx, by, 20, 20, 5, th.bg, th.border);
+                round_box(hdc, rc.left, rc.top, w, h, 22, th.card, th.border);
+                let bx = rc.left + 12;
+                let by = rc.top + (h - 22) / 2;
+                round_box(hdc, bx, by, 22, 22, 5, th.bg, th.border);
             }
             let fg = if on { th.text } else { th.muted };
-            let _ = draw_text(hdc, "占位符补位", rc.left + 40, rc.top + (h - 23) / 2, ui_font(false), fg);
+            let _ = draw_text(hdc, "占位符补位", rc.left + 46, rc.top + (h - 27) / 2, ui_font(false), fg);
             if focused {
-                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 17, 0, accent);
+                round_box(hdc, rc.left + 3, rc.top + 3, w - 6, h - 6, 19, 0, accent);
             }
         }
         _ => {}
@@ -2498,9 +2514,9 @@ unsafe fn draw_items(
     ph_start: usize,
     ph_end: usize,
 ) -> i32 {
-    // 预览固定字号（与 FONT_MAIN/FONT_LABEL 一致）：20/14px（cell 27/20）。
-    let em = 20;
-    let lem = 14;
+    // 预览固定字号（与 FONT_MAIN/FONT_LABEL 一致）：22/15px（cell 30/20）。
+    let em = 22;
+    let lem = 15;
     let spacing = SKIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2521,7 +2537,8 @@ unsafe fn draw_items(
             None => text_w(s, em),
         }
     };
-    // 行首标签（「现有：」/「加入后：」）
+    // 行首标签（「现有：」/「加入后：」）——盒高=15px 行盒 cell 20，
+    // 在标题行 25px 带内垂直居中。
     let head_txt = utf16z(head);
     let head_w = mw(head, label_font, lem) + 4;
     // 【SS_NOPREFIX=0x80】词含 & 时 STATIC 默认把它当加速键前缀吞掉
@@ -2533,9 +2550,9 @@ unsafe fn draw_items(
         WINDOW_EX_STYLE(0),
         0x80,
         PV_X,
-        y0,
+        y0 + (lem + 10 - PV_LABEL_CELL) / 2,
         head_w + 2,
-        lem + 6,
+        PV_LABEL_CELL,
         id_base - 10,
     );
     set_item_font(h, true);
@@ -2545,7 +2562,7 @@ unsafe fn draw_items(
         .push(h.0 as isize);
 
     // 分组标题单独占一行，候选从下一行起排（视觉分层更清楚）。
-    // 14px cell 20 → 标题行占 24px。
+    // 15px cell 20 → 标题行占 25px。
     let mut x = PV_X;
     let mut y = y0 + lem + 10;
     let right = PV_X + PV_W;
@@ -2593,13 +2610,12 @@ unsafe fn draw_items(
         };
         // 序号（新词行用高亮 id 段着色）
         let lbl_txt = utf16z(&label);
-        // 20px cell 27 → 词盒高 em+8（28）；14px cell 20 → 序号盒高 lem+6（20）
-        let label_h = if is_new { em + 8 } else { lem + 6 };
-        let label_y = if is_new {
-            y + (line_h - em - 8) / 2
-        } else {
-            y + (line_h - lem - 6) / 2
-        };
+        // 【2026-11-04·二档·垂直居中】词盒 = 22px 行盒（cell 30）在行内居中；
+        // 序号盒按**基线对齐**下移 (30-24)-(20-16)=8px（YaHei 上伸≈0.8×cell，
+        // 两字体基线差 = 24-16）。
+        let word_top = y + (line_h - PV_CELL) / 2;
+        let label_h = PV_LABEL_CELL;
+        let label_y = word_top + 8;
         let hl = create_child(
             hwnd,
             w!("STATIC"),
@@ -2626,9 +2642,9 @@ unsafe fn draw_items(
             WINDOW_EX_STYLE(0),
             0x80,
             x + lw,
-            y + (line_h - em - 8) / 2,
+            word_top,
             sw,
-            em + 8,
+            PV_CELL,
             base + 1,
         );
         if is_new {
@@ -2641,13 +2657,13 @@ unsafe fn draw_items(
             .unwrap_or_else(|p| p.into_inner())
             .push(wd.0 as isize);
         if is_new {
+            // 胶囊 = 整行高度（38），文字盒已在行内居中 → 文字在胶囊内居中。
             let chip_x = (x - 4).max(PV_X);
-            let chip_y = y + (line_h - em - 8) / 2 - 3;
             let chip_w = (lw + sw + 8).min(right - chip_x);
             NEW_CHIP_RECTS
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push((chip_x, chip_y, chip_w, em + 14));
+                .push((chip_x, y, chip_w, line_h));
         }
         x += need;
         // 【三十四修·死代码删除】cid 计数器（`cid += 2; let _ = cid;`
@@ -2684,8 +2700,8 @@ unsafe fn refresh_preview(hwnd: HWND) {
     let code = read_box(ID_CODE).trim().to_string();
     let pos: usize = read_box(ID_POS).trim().parse().unwrap_or(0);
     let ph_on = PH_ON.load(std::sync::atomic::Ordering::Relaxed);
-    // 【2026-11-04】预览行高 30→34：20px cell 27 + 7px 行距（旧 18px cell 24 + 6）。
-    let line_h = 34;
+    // 【2026-11-04·二档】预览行高 = PV_LINE_H（38）：22px cell 30 + 8px 行距。
+    let line_h = PV_LINE_H;
 
     clear_items();
     let mut y = PV_START_Y;
@@ -2804,7 +2820,7 @@ unsafe fn refresh_preview(hwnd: HWND) {
 
     // 窗口高度：固定布局为下限；预览内容多时向下长（底栏随之下移）。
     let min_h = if is_weight_mode() { W_CLIENT_H } else { CLIENT_H };
-    let client_h = min_h.max(y + 124);
+    let client_h = min_h.max(y + 118);
     let btn_y = client_h - 24 - BTN_H;
     for (id, dx) in [(ID_OK, BTN_OK_X), (ID_CANCEL, BTN_CANCEL_X)] {
         if let Ok(ch) = GetDlgItem(hwnd, id) {
