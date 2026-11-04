@@ -4,6 +4,14 @@
 //!        -BackupDiff，2026-10-21 为「exe 安装包完全 0 PowerShell」移植）
 //! 公共参数：--log <path>（引擎日志；install-elevated 默认 %TEMP%\hufu-install-elevated.log）
 
+// 【重启闪终端修复 2026-11-05】GUI 子系统：RunOnce(HuFuPostBoot) 由
+// userinit 在登录时直接执行——console 子系统会被分配新控制台，终端
+// 窗口闪现一下（postboot 幂等秒退）。旧 ps1 轨的 -WindowStyle Hidden
+// 同样闪黑框，是历史已知症状；Rust 化时漏设子系统，此修复补齐。
+// 输出全部走 --log 文件；从终端手动调试时 main 开头 AttachConsole(-1)
+// 挂回父控制台，println 照常工作。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod acl;
 mod backupdiff;
 mod common;
@@ -20,6 +28,16 @@ use common::Out;
 use std::path::PathBuf;
 
 fn main() {
+    // 挂回父控制台（ATTACH_PARENT_PROCESS=-1）：终端手动跑时输出照常；
+    // 双击/RunOnce 启动（无控制台父进程）返回失败，忽略即可。
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(pid: isize) -> i32;
+        }
+        AttachConsole(-1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("用法: hufu-setup-engine <install|install-elevated|uninstall|postboot|purge-data|backup-diff> [--no-hklm] [--user-only] [--log <path>] [--manifest <f> --src <d> --dst <d> --backup <d>]");
