@@ -861,6 +861,20 @@ fn main() {
 static HOST_HANDLE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Host>>> =
     std::sync::OnceLock::new();
 
+/// 【P1-15 2026-11-04】配置版本号（CAS）。每次 POST /api/config 写入成功自增。
+/// route() 持 Host 锁期间读/比对/自增天然串行；仍用原子量是为了未来锁外
+/// 读取不引入锁序问题。初始 1——首次 GET 拿到的 rev 就是 1，第一次写回
+/// 时客户端带 1 与服务端一致，不会误报冲突。
+static CONFIG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn config_rev() -> u64 {
+    CONFIG_REV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_config_rev() -> u64 {
+    CONFIG_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// 【卡死修复 2026-09-11】切方案/重载码表/改配置路径经此入口重建整句：
 /// 旧 setup_sentence 在持锁状态同步载 546MB ngram（秒级~10s），期间
 /// 全机按键/轮询阻塞。现统一为：独立线程短锁决策——门控不满足
@@ -913,6 +927,19 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
     std::thread::Builder::new()
         .name("hufu-ngram-load".into())
         .spawn(move || {
+            // 【坏模型健壮性 2026-11 / P1-3】装载线程 panic（坏模型/解码器
+            // 内部越界）会把 NGRAM_LOAD_BUSY / NGRAM_LOAD_PENDING 永久打满
+            // → 此后整句模型**永不重载**。守卫 Drop 兜底复位两个闸门 +
+            // catch_unwind 兜住 body：panic 后落诊断，且下次触发仍可装载。
+            struct LoadBusyGuard;
+            impl Drop for LoadBusyGuard {
+                fn drop(&mut self) {
+                    NGRAM_LOAD_BUSY.store(false, Ordering::SeqCst);
+                    NGRAM_LOAD_PENDING.store(false, Ordering::SeqCst);
+                }
+            }
+            let _busy_guard = LoadBusyGuard;
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let mut first = true;
             loop {
                 let resupplement = if first { resupplement } else { true };
@@ -1020,6 +1047,10 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                 eprintln!("整句模型装载：排队中的重载请求，补跑一轮");
             }
             NGRAM_LOAD_BUSY.store(false, Ordering::SeqCst);
+            }));
+            if body.is_err() {
+                eprintln!("整句模型装载线程 panic（已兜底，闸门已复位，可再次触发重载）");
+            }
         })
         .ok();
 }
@@ -1451,6 +1482,141 @@ fn next_static(path: &str) -> Option<Response> {
         })
 }
 
+/// 【P1-8 2026-11-04】检查更新（锁前分发）：只读 exe 同目录 version.txt +
+/// 外网请求，不读 Host 状态，因此可在每连接线程里直接跑。旧实现放在
+/// Host 大锁内的 route 分支里：manifest 8s / GitHub 5s 的超时窗口内，
+/// 按键、候选轮询、设置页全部排队（用户观感=打字卡死）。
+/// 失败返回 ok:false + error（前端如实展示），不装样子。
+fn update_check_inner() -> Response {
+    // 【关于页检查更新 2026-11-01 用户需求】真实检查：请求 GitHub
+    // releases/latest 拿最新 tag，与本机版本（version.txt 同源）比对。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default();
+    let current = std::fs::read_to_string(exe_dir.join("version.txt"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}（开发版）", env!("CARGO_PKG_VERSION")));
+    // 【云同步同款 TLS 挂法】ureq2 native-tls 需显式 tls_connector
+    // （sync.rs build_agent 同款；裸 AgentBuilder 报 no TLS backend）
+    let mut agent_b = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .timeout_connect(std::time::Duration::from_secs(5));
+    #[cfg(windows)]
+    {
+        if let Ok(c) = ureq::native_tls::TlsConnector::new() {
+            agent_b = agent_b.tls_connector(std::sync::Arc::new(c));
+        }
+    }
+    let agent = agent_b.build();
+
+    // 【更新源 2026-11-03】国内直连 GitHub 只有几十 KB/s，
+    // 先读自建清单（Gitee raw 免登录、实测 2 MB/s、不占 GitHub 的
+    // 60 次/小时限流）；清单不可达再退回 GitHub API（原逻辑）。
+    // 清单格式：latest/min/page_url/sha256/size/sources[]。
+    let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
+        "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
+    });
+    let manifest = agent
+        .get(&manifest_url)
+        .set("User-Agent", "hufu-ime-update-check")
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    if let Some(m) = manifest.as_ref() {
+        let latest = m
+            .get("latest")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('v');
+        if !latest.is_empty() {
+            let page = m
+                .get("page_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://www.hufuime.top/releases/");
+            let sources = m
+                .get("sources")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            // 首选源 = sources[0]（当前是 Gitee 直链）
+            let download_url = sources
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("url"))
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
+            let cur_ver = current.split_whitespace().next().unwrap_or("");
+            return Response::json(&serde_json::json!({
+                "ok": true,
+                "current": current,
+                "latest": latest,
+                "has_update": newer_than(latest, cur_ver),
+                "page_url": page,
+                "download_url": download_url,
+                "sha256": m.get("sha256").cloned().unwrap_or(serde_json::Value::Null),
+                "size": m.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                "sources": sources,
+                "source": "manifest",
+            }));
+        }
+    }
+
+    let resp = agent
+        .get("https://api.github.com/repos/LeafHW/hufu-ime-rust/releases/latest")
+        .set("User-Agent", "hufu-ime-update-check")
+        .set("Accept", "application/vnd.github+json")
+        .call();
+    match resp {
+        Ok(r) => match r
+            .into_string()
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(v) => {
+                let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+                let page = v
+                    .get("html_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("https://github.com/LeafHW/hufu-ime-rust/releases/latest");
+                let latest = tag.trim_start_matches('v');
+                // 【直接下载 2026-11-01】从 assets 里挑 .exe 安装包直链，
+                // 前端「直接下载安装包」用；无 exe 资产时回退 page_url（进网页）。
+                let download_url = v
+                    .get("assets")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.get("browser_download_url"))
+                            .filter_map(|u| u.as_str())
+                            .find(|u| u.to_ascii_lowercase().ends_with(".exe"))
+                    })
+                    .map(|s| s.to_string());
+                // 当前版本串可能带「（开发版）」后缀，取首段空白前的纯版本
+                let cur_ver = current.split_whitespace().next().unwrap_or("");
+                let has = newer_than(latest, cur_ver);
+                Response::json(&serde_json::json!({
+                    "ok": true,
+                    "current": current,
+                    "latest": latest,
+                    "has_update": has,
+                    "page_url": page,
+                    "download_url": download_url,
+                }))
+            }
+            None => Response::json(&serde_json::json!({
+                "ok": false, "current": current, "error": "响应解析失败：GitHub 返回内容无法解析",
+            })),
+        },
+        Err(e) => Response::json(&serde_json::json!({
+            "ok": false, "current": current, "error": format!("网络请求失败：{e}"),
+        })),
+    }
+}
+
 /// 【检查更新 2026-11-01】语义化版本比较：a 是否严格大于 b（"1.9.10" > "1.9.9"）。
 /// 任一段解析失败按 0 处理；长度不齐缺段按 0。
 fn newer_than(a: &str, b: &str) -> bool {
@@ -1657,6 +1823,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         return ssf_render_inner(rid.as_deref());
     }
+    // 【P1-8 2026-11-04】检查更新要走外网（manifest 8s / GitHub 5s 超时）。
+    // 旧实现在 Host 大锁内同步请求：网络慢时整机按键、候选轮询、设置页
+    // 全部排队（用户观感=打字卡死）。与 ssf-render / sync 同款「锁前
+    // 分发」——本端点不读 host，直接在每连接线程里跑，结果直接返回。
+    if req.method == "GET" && req.path == "/api/update/check" {
+        if !request_is_local(req) {
+            return Response::err(403, "跨源请求被拒绝");
+        }
+        return update_check_inner();
+    }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
     let path = req.path.as_str();
@@ -1727,7 +1903,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Response::json(&serde_json::json!({ "state": state }))
         }
         ("GET", "/api/config") => {
-            Response::json(&serde_json::to_value(&host.engine.config).unwrap())
+            // 【P1-15 2026-11-04】配置快照带 rev（CAS 令牌）。rev 是顶层
+            // 附加字段：老前端把整个对象原样拿来合并/回存也无感（Config
+            // 反序列化忽略未知字段），新前端据此判断「读后有没有被别人写」。
+            let mut v = serde_json::to_value(&host.engine.config)
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("rev".to_string(), serde_json::json!(config_rev()));
+            }
+            Response::json(&v)
         }
         ("GET", "/api/platform") => Response::json(&serde_json::json!({
             // 平台标识（设置页据此隐藏平台无关项：Linux 不用引擎自带中英切换）
@@ -1755,132 +1939,6 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 // 【C-1】内嵌新版设置页 index.html 指纹（sha256 前 16 hex）
                 "ui_build": ui_build_fp(),
             }))
-        }
-        ("GET", "/api/update/check") => {
-            // 【关于页检查更新 2026-11-01 用户需求】真实检查：请求 GitHub
-            // releases/latest 拿最新 tag，与本机版本（version.txt 同源）比对。
-            // 失败返回 ok:false + error（前端如实展示），不装样子。
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_default();
-            let current = std::fs::read_to_string(exe_dir.join("version.txt"))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("{}（开发版）", env!("CARGO_PKG_VERSION")));
-            // 【云同步同款 TLS 挂法】ureq2 native-tls 需显式 tls_connector
-            // （sync.rs build_agent 同款；裸 AgentBuilder 报 no TLS backend）
-            let mut agent_b = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(8))
-                .timeout_connect(std::time::Duration::from_secs(5));
-            #[cfg(windows)]
-            {
-                if let Ok(c) = ureq::native_tls::TlsConnector::new() {
-                    agent_b = agent_b.tls_connector(std::sync::Arc::new(c));
-                }
-            }
-            let agent = agent_b.build();
-
-            // 【更新源 2026-11-03】国内直连 GitHub 只有几十 KB/s，
-            // 先读自建清单（Gitee raw 免登录、实测 2 MB/s、不占 GitHub 的
-            // 60 次/小时限流）；清单不可达再退回 GitHub API（原逻辑）。
-            // 清单格式：latest/min/page_url/sha256/size/sources[]。
-            let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
-                "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
-            });
-            let manifest = agent
-                .get(&manifest_url)
-                .set("User-Agent", "hufu-ime-update-check")
-                .call()
-                .ok()
-                .and_then(|r| r.into_string().ok())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-            if let Some(m) = manifest.as_ref() {
-                let latest = m
-                    .get("latest")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .trim_start_matches('v');
-                if !latest.is_empty() {
-                    let page = m
-                        .get("page_url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("https://www.hufuime.top/releases/");
-                    let sources = m
-                        .get("sources")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([]));
-                    // 首选源 = sources[0]（当前是 Gitee 直链）
-                    let download_url = sources
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|s| s.get("url"))
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.to_string());
-                    let cur_ver = current.split_whitespace().next().unwrap_or("");
-                    return Response::json(&serde_json::json!({
-                        "ok": true,
-                        "current": current,
-                        "latest": latest,
-                        "has_update": newer_than(latest, cur_ver),
-                        "page_url": page,
-                        "download_url": download_url,
-                        "sha256": m.get("sha256").cloned().unwrap_or(serde_json::Value::Null),
-                        "size": m.get("size").cloned().unwrap_or(serde_json::Value::Null),
-                        "sources": sources,
-                        "source": "manifest",
-                    }));
-                }
-            }
-
-            let resp = agent
-                .get("https://api.github.com/repos/LeafHW/hufu-ime-rust/releases/latest")
-                .set("User-Agent", "hufu-ime-update-check")
-                .set("Accept", "application/vnd.github+json")
-                .call();
-            match resp {
-                Ok(r) => match r.into_string().ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
-                    Some(v) => {
-                        let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
-                        let page = v
-                            .get("html_url")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("https://github.com/LeafHW/hufu-ime-rust/releases/latest");
-                        let latest = tag.trim_start_matches('v');
-                        // 【直接下载 2026-11-01】从 assets 里挑 .exe 安装包直链，
-                        // 前端「直接下载安装包」用；无 exe 资产时回退 page_url（进网页）。
-                        let download_url = v
-                            .get("assets")
-                            .and_then(|a| a.as_array())
-                            .and_then(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.get("browser_download_url"))
-                                    .filter_map(|u| u.as_str())
-                                    .find(|u| u.to_ascii_lowercase().ends_with(".exe"))
-                            })
-                            .map(|s| s.to_string());
-                        // 当前版本串可能带「（开发版）」后缀，取首段空白前的纯版本
-                        let cur_ver = current.split_whitespace().next().unwrap_or("");
-                        let has = newer_than(latest, cur_ver);
-                        Response::json(&serde_json::json!({
-                            "ok": true,
-                            "current": current,
-                            "latest": latest,
-                            "has_update": has,
-                            "page_url": page,
-                            "download_url": download_url,
-                        }))
-                    }
-                    None => Response::json(&serde_json::json!({
-                        "ok": false, "current": current, "error": "响应解析失败：GitHub 返回内容无法解析",
-                    })),
-                },
-                Err(e) => Response::json(&serde_json::json!({
-                    "ok": false, "current": current, "error": format!("网络请求失败：{e}"),
-                })),
-            }
         }
         ("GET", "/api/sentence/models") => {
             // 【模型真名 2026-11-01】设置页「整句模型」页显示实际装载的
@@ -1997,6 +2055,35 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         ("POST", "/api/config") => {
             let v = req.json();
+            // 【P1-15 2026-11-04】乐观并发（CAS）：
+            // - 带 rev 且与服务端不一致 → 409 + 最新配置（前端提示
+            //   「其他页面已改，重载/覆盖」）；不再静默覆盖别人的写入。
+            // - 不带 rev → 老设置页/第三方脚本，保持旧行为接受，但记日志
+            //   （否则旧客户端全挂；兼容优先）。
+            // rev 作为顶层字段不参与 Config 反序列化（Config 未开
+            // deny_unknown_fields，未知字段被忽略）。
+            if let Some(client_rev) = v.get("rev").and_then(|x| x.as_u64()) {
+                let cur = config_rev();
+                if client_rev != cur {
+                    eprintln!(
+                        "配置 CAS 冲突：客户端 rev={client_rev}，当前 rev={cur}；返回 409"
+                    );
+                    let mut latest = serde_json::to_value(&host.engine.config)
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(o) = latest.as_object_mut() {
+                        o.insert("rev".to_string(), serde_json::json!(cur));
+                    }
+                    return Response::json(&serde_json::json!({
+                        "error": "配置已被其他页面修改（请重载后再改，或确认覆盖）",
+                        "conflict": true,
+                        "rev": cur,
+                        "config": latest,
+                    }))
+                    .with_status(409);
+                }
+            } else {
+                eprintln!("配置写入未带 rev（旧客户端/脚本），按覆盖处理并放行");
+            }
             let cfg: hufu_config::Config = match serde_json::from_value(v) {
                 Ok(c) => c,
                 Err(e) => return Response::err(400, &format!("配置无效: {e}")),
@@ -2016,7 +2103,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                     // 【云同步 2026-10-28】配置变化触发同步（防抖后上传）
                     sync::notify("配置变化");
-                    Response::json(&serde_json::json!({"ok": true}))
+                    // 【P1-15】写入成功推进版本：后续带旧 rev 的写请求
+                    // 会得到 409，而不是覆盖本条刚生效的配置。
+                    let rev = bump_config_rev();
+                    Response::json(&serde_json::json!({"ok": true, "rev": rev}))
                 }
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
             }

@@ -155,11 +155,15 @@ pub fn dispatch(
         "cand_menu" => {
             let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("");
             let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            // 【P2-15 2026-11-04】page_index 缺省曾用 usize::MAX 当「无下标」
+            // 哨兵，随后 `get_page(want)`/`start + want` 直接参与算术：debug
+            // 构建溢出 panic，release 回绕成小下标 → 缺字段的菜单请求会误
+            // 命中页首候选（更糟：误置顶/误删第一个词）。改为 Option，缺省
+            // 只走 text 定位，绝不参与下标运算。
             let page_index = req
                 .get("page_index")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(usize::MAX);
+                .map(|v| v as usize);
             let page_size = host.engine.config.candidates.page_size.max(1);
             let start = host.session.page * page_size;
             // 解析目标候选：优先页内 page_index，词不符/落空则按 text
@@ -167,16 +171,18 @@ pub fn dispatch(
             // 动作第一次必『候选不在页』、重试才成功」——词被异步重排
             //（rerank 350ms 去抖/顶功推位）挪出当前页窗口时页内双落空。
             // 菜单意图是「这个词」本身：全列表按词定位，返回绝对下标。
-            let resolve = |want: usize, text: &str| -> Option<usize> {
+            let resolve = |want: Option<usize>, text: &str| -> Option<usize> {
                 let get_page = |i: usize| {
                     host.session
                         .candidates
                         .get(start + i)
                         .map(|c| c.text.as_str())
                 };
-                if let Some(t) = get_page(want) {
-                    if text.is_empty() || t == text {
-                        return Some(start + want);
+                if let Some(want) = want {
+                    if let Some(t) = get_page(want) {
+                        if text.is_empty() || t == text {
+                            return Some(start + want);
+                        }
                     }
                 }
                 if text.is_empty() {
@@ -1979,6 +1985,48 @@ mod candidate_tests {
         assert!(log.contains("{删除}dax\t到"), "删除日志: {log}");
         assert!(!log.contains("{整序}"), "无跨码整序垃圾: {log}");
         assert!(!log.contains("{添加}"), "无 pN 垃圾: {log}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 【P2-15 2026-11-04】cand_menu 缺 page_index 时不得再用 usize::MAX 参与
+    // 下标运算：debug 构建直接算术溢出 panic，release 构建 `start + MAX`
+    // 回绕成 start-1（可能落到上一页/页首）→ 菜单动作误命中别的词。
+    // 缺省必须只按 text 定位。
+    #[test]
+    fn cand_menu_missing_page_index_resolves_by_text() {
+        let root = std::env::temp_dir().join(format!("hufu-noidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(
+            root.join("码表/T/main.txt"),
+            "#hufu-dict v1 name=t\ndwx\t大\ndax\t到\ndbx\t灯\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("数据/config.json"),
+            r#"{"schema":{"dir":"码表","current":"T"},"candidates":{"page_size":5},"input":{"wildcard_enabled":true}}"#,
+        )
+        .unwrap();
+        let h = Host::new(&root.join("数据")).unwrap();
+        let host = Mutex::new(h);
+        dispatch(&host, &json!({"op":"key","key":"d"}), None);
+        dispatch(&host, &json!({"op":"key","key":"\\"}), None);
+        dispatch(&host, &json!({"op":"key","key":"x"}), None);
+        // 无 page_index：按 text 删「到」，不能 panic 也不能误删页首「大」
+        let r = dispatch(
+            &host,
+            &json!({"op":"cand_menu","action":"del","text":"到"}),
+            None,
+        );
+        assert_eq!(r["ok"], json!(true), "缺 page_index 仍应按 text 定位: {r}");
+        let texts: Vec<String> = r["state"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, ["大", "灯"], "删的是「到」而不是页首: {texts:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

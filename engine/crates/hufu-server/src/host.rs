@@ -620,7 +620,14 @@ impl Host {
                     let _ = std::fs::write(diag_dir.join("rerank-engine.txt"), "rust(fallback)");
                 }
                 let mut model: Option<hufu_rerank::Reranker> = None;
-                let mut model_failed = false;
+                // 【熔断计数 2026-11 / P1-5】旧实现 model_failed: bool —— 一次
+                // 装载失败就在进程生命周期内永久熔断（连模型换好/文件修好都
+                // 不再重试）。改为「失败冷却到点再试」：仍保留失败后不每句
+                // 重试的抗抖动语义，但冷却期（120s）过后会重新装载，并在失败
+                // 日志里带上真实原因（旧实现把 Err 吞成 `_e`）。
+                let mut model_fail_until: Option<std::time::Instant> = None;
+                const MODEL_FAIL_COOLDOWN: std::time::Duration =
+                    std::time::Duration::from_secs(120);
                 if native.is_none() {
                     // 预热：server 启动即后台加载模型并空跑一次前向（触页），
                     // 避免用户首次停顿重排等冷读盘 ~10s（体验即「重排没生效」）。
@@ -632,8 +639,13 @@ impl Host {
                                 let _ = r.score("。", &["预热".to_string()]);
                                 model = Some(r);
                             }
-                            Err(_e) => {
-                                model_failed = true;
+                            Err(e) => {
+                                eprintln!(
+                                    "神经重排：Rust 模型装载失败（{}s 后重试）: {e}",
+                                    MODEL_FAIL_COOLDOWN.as_secs()
+                                );
+                                model_fail_until =
+                                    Some(std::time::Instant::now() + MODEL_FAIL_COOLDOWN);
                             }
                         }
                     }
@@ -710,8 +722,14 @@ impl Host {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     idle_secs = 0;
-                    if model_failed {
-                        continue;
+                    // 【熔断冷却 2026-11 / P1-5】冷却未到 = 跳过（不每句重试）；
+                    // 到点自动解除，允许重新装载（换模型/修文件后无需重启）。
+                    if let Some(until) = model_fail_until {
+                        if std::time::Instant::now() < until {
+                            continue;
+                        }
+                        model_fail_until = None;
+                        eprintln!("神经重排：模型装载冷却结束，重新尝试装载");
                     }
                     if !loaded {
                         // 卸载后首任务：重载（1-3s，本句重排迟到）
@@ -767,12 +785,17 @@ impl Host {
                     let scores: Option<Vec<f64>> = if let Some(ns) = &native {
                         Some(ns.score(&cur.ctx, &cur.cands))
                     } else {
-                        if model.is_none() && !model_failed {
+                        if model.is_none() && model_fail_until.is_none() {
                             std::env::set_var("GGUF_LAZY", "1");
                             match hufu_rerank::Reranker::load(&model_path) {
                                 Ok(r) => model = Some(r),
-                                Err(_e) => {
-                                    model_failed = true;
+                                Err(e) => {
+                                    eprintln!(
+                                        "神经重排：Rust 模型装载失败（{}s 后重试）: {e}",
+                                        MODEL_FAIL_COOLDOWN.as_secs()
+                                    );
+                                    model_fail_until =
+                                        Some(std::time::Instant::now() + MODEL_FAIL_COOLDOWN);
                                     continue;
                                 }
                             }

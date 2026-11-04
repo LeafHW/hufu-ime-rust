@@ -218,6 +218,41 @@ fn fail_clear(src: &Path) {
     }
 }
 
+/// 递归清理缓存目录：只保留 `kept`（相对路径、`/` 分隔）列出的文件与
+/// manifest；目录若是任一保留条目的祖先则保留并递归，否则整棵删除。
+/// 与解包逻辑同源：kept 由 `safe_rel_path` 产出，故不含 `..`/盘符。
+fn cleanup_stale_cache(cache_dir: &Path, kept: &[String]) {
+    fn walk(dir: &Path, rel_dir: &str, kept: &[String]) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            let rel = if rel_dir.is_empty() {
+                name
+            } else {
+                format!("{rel_dir}/{name}")
+            };
+            if p.is_dir() {
+                let prefix = format!("{rel}/");
+                // 只有「某个保留文件在这个目录之下」才保留该目录
+                if kept.iter().any(|k| k.starts_with(&prefix)) {
+                    walk(&p, &rel, kept);
+                } else {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            } else {
+                if rel == MANIFEST_FILE || kept.iter().any(|k| *k == rel) {
+                    continue;
+                }
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    walk(cache_dir, "", kept);
+}
+
 fn used_images_ok(cache_dir: &Path, def: &hufu_skin::ssf::SsfDefinition) -> bool {
     def.schemes
         .used_images()
@@ -353,25 +388,14 @@ fn unbundle_bytes(
         std::fs::write(&dest, data).map_err(|e| format!("缓存写入失败（{name}）: {e}"))?;
         kept.push(rel.to_string_lossy().replace('\\', "/"));
     }
-    // 新条目集之外的旧缓存清理（换版本防残留；manifest 马上重写故跳过）
-    if let Ok(rd) = std::fs::read_dir(&cache_dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let rel = p
-                .strip_prefix(&cache_dir)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if rel == MANIFEST_FILE || kept.iter().any(|k| *k == rel) {
-                continue;
-            }
-            if p.is_dir() {
-                let _ = std::fs::remove_dir_all(&p);
-            } else {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
+    // 新条目集之外的旧缓存清理（换版本防残留；manifest 马上重写故跳过）。
+    // 【P0-3 2026-11-04】旧实现只比对 read_dir 的**顶层名字**：kept 里存的是
+    // `images/bg.png` 这类相对路径，顶层看到的是 `images` 目录名，二者永不
+    // 相等 → 带子目录的皮肤每次解包都把 images 整棵删掉；下一轮
+    // used_images_ok 看到图片没了 → 再次解包（每次加载重解，且渲染缺图）。
+    // 现按「文件相对路径精确匹配 + 目录是任一保留条目的祖先」判定，并递归
+    // 清理保留子目录里的旧版本残留文件。
+    cleanup_stale_cache(&cache_dir, &kept);
     let fp = source_fp(bytes);
     let man = Manifest {
         fp: fp.clone(),
@@ -1153,5 +1177,57 @@ mod tests {
         assert!(a.starts_with("3-") && a.len() == 18, "size-16hex: {a}");
         assert_ne!(a, b);
         assert_eq!(a, source_fp(b"abc"), "确定性");
+    }
+
+    /// 【P0-3 2026-11-04】带子目录的 .ssf：二次加载不重解包，子目录图片
+    /// 不被清；重解包时只清理非保留条目（旧版本残留 / 整个旧目录）。
+    #[test]
+    fn subdir_cache_survives_reload_and_stale_files_removed() {
+        const INI_SUBDIR: &str = "\u{feff}[General]\r\nskin_name=子目录皮\r\nskin_author=虎符测试\r\npreview_comp=preview.png\r\n\
+            [Display]\r\nfont_size=16\r\nfont_ch=微软雅黑\r\nfont_en=Segoe UI\r\n\
+            [Scheme_H1]\r\npic=images/panel.png\r\nlayout_horizontal=0,90,90\r\nlayout_vertical=0,0,0\r\n\
+            pinyin_marge=8,8,20,20\r\nzhongwen_marge=6,6,18,18\r\n";
+        let data = tmp_data_dir("subdir");
+        let png = [0x89u8, b'P', b'N', b'G', 7, 7, 7];
+        let zip = build_zip(&[
+            ("skin.ini", INI_SUBDIR.as_bytes()),
+            ("images/panel.png", &png),
+        ]);
+        let (id, _) = import_ssf(&data, &zip, Some("子目录皮.ssf")).expect("导入成功");
+        assert_eq!(id, "子目录皮");
+        let cache = ssf_cache_root(&data).join(&id);
+        assert!(
+            cache.join("images").join("panel.png").is_file(),
+            "子目录图片必须落盘（旧版清理会误删整棵 images）"
+        );
+        // 二次取用：缓存命中（不重解包 → 不走清理），图片仍在。
+        let b = bundle_for(&data, &id).expect("缓存取用");
+        assert!(b.cache_dir.join("images").join("panel.png").is_file());
+
+        // 模拟旧版本残留文件，再改源内容（尺寸变化保证缓存失效）强制重解包。
+        std::fs::write(cache.join("images").join("old.png"), b"stale").unwrap();
+        std::fs::create_dir_all(cache.join("olddir")).unwrap();
+        std::fs::write(cache.join("olddir").join("x.png"), b"x").unwrap();
+        let png2 = [0x89u8, b'P', b'N', b'G', 8, 8, 8, 8];
+        let zip2 = build_zip(&[
+            ("skin.ini", INI_SUBDIR.as_bytes()),
+            ("images/panel.png", &png2),
+        ]);
+        std::fs::write(ssf_skins_dir(&data).join(format!("{id}.ssf")), &zip2).unwrap();
+        let b2 = bundle_for(&data, &id).expect("重解包取用");
+        assert_eq!(b2.fp, source_fp(&zip2));
+        assert!(
+            b2.cache_dir.join("images").join("panel.png").is_file(),
+            "重解包后子目录图片仍在"
+        );
+        assert!(
+            !b2.cache_dir.join("images").join("old.png").exists(),
+            "保留子目录里的旧版本残留文件必须清掉"
+        );
+        assert!(
+            !b2.cache_dir.join("olddir").exists(),
+            "非保留目录必须整棵删除"
+        );
+        let _ = std::fs::remove_dir_all(&data);
     }
 }

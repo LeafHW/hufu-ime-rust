@@ -1,6 +1,10 @@
 //! Embed the built `settings-app/dist` into `hufu-server` so `/next` works
-//! without Node on the release machine. The dist directory is committed
-//! (`settings-app/dist`) and rebuilt before packaging.
+//! without Node on the release machine.
+//!
+//! 【2026-11-04 修正】`settings-app/dist` **不在 git 里**（.gitignore 排除），
+//! 也不能假定磁盘上是最新的：打包/发行必须先 `npm run build`
+//! （`发行脚本/pack.ps1` 的 0b 段强制构建 + 校验 index.html 引用的资产 +
+//! exe 内嵌逐字节比对）。本脚本只负责「把编译瞬间磁盘上的 dist 嵌进 exe」。
 //!
 //! Generates `$OUT_DIR/next_assets.rs` with `NEXT_INDEX` + a lookup table of
 //! `/assets/...` and public files. Missing dist is not a build error: `/next`
