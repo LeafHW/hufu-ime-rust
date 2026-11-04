@@ -98,6 +98,17 @@ const OFFICIAL_SKINS: &[(&str, &str)] = &[
         "hufu-yuebai.json",
         include_str!("../official-skins/hufu-yuebai.json"),
     ),
+    // 【昼夜新皮 2026-11-04】一对同构皮肤（同排版骨架、只换色温/圆角）：
+    // 夜航·银沙=极夜蓝黑+银沙字+钢青高亮；晨白·朱砂=宣纸白+墨字+朱砂强调。
+    // 与字号补间动效（fs 三档量化）完全兼容；挂件关闭。
+    (
+        "hufu-yehang.json",
+        include_str!("../official-skins/hufu-yehang.json"),
+    ),
+    (
+        "hufu-chenzhu.json",
+        include_str!("../official-skins/hufu-chenzhu.json"),
+    ),
     // 【夜莺/夜桜退役 2026-10-18 用户拍板】yeying-yuexia（夜莺·月下文羽）
     // + yozakura-yingyue（夜桜·樱月幻梦）2026-10-16 曾收编官方化——但
     // 两张动图挂件皮各内联 3.6-4.9MB（exe +8.5MB），用户实测嫌大退役：
