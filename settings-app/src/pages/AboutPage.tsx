@@ -5,6 +5,8 @@ import { PageHead } from '../components/ui';
 
 export function AboutPage({ about }: { about: About }) {
   const [upd, setUpd] = useState<UpdateState>({ kind: 'idle' });
+  const [dlBusy, setDlBusy] = useState(false);
+  const [dlMsg, setDlMsg] = useState('');
 
   const checkUpdate = async () => {
     setUpd({ kind: 'checking' });
@@ -35,12 +37,24 @@ export function AboutPage({ about }: { about: About }) {
                   type="button"
                   className="btn"
                   /* 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256
-                     比对，通过才落「下载」文件夹；端点不可用回退浏览器直开。 */
-                  onClick={() => verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, (m) => console.info('[update]', m))}
+                     比对，通过才落「下载」文件夹；端点不可用回退浏览器直开。
+                     【F4 复审修复】进度上屏（此前只 console.info，用户无感知
+                     重复点击触发 409）；下载中禁用防重复。 */
+                  disabled={dlBusy}
+                  onClick={async () => {
+                    if (dlBusy) return;
+                    setDlBusy(true);
+                    try {
+                      await verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, setDlMsg);
+                    } finally {
+                      setDlBusy(false);
+                    }
+                  }}
                   title={upd.downloadUrl ? '下载并校验安装包（sha256 通过才保存）' : '未找到安装包，打开下载页'}
                 >
-                  {upd.downloadUrl ? '下载安装包（自动校验）' : '打开下载页'}
+                  {dlBusy ? '下载中…' : upd.downloadUrl ? '下载安装包（自动校验）' : '打开下载页'}
                 </button>
+                {dlMsg && <span className="update-note err">{dlMsg}</span>}
               </>
             )}
             {upd.kind === 'latest' && <span className="update-note ok">已是最新（v{upd.current}）</span>}

@@ -272,10 +272,11 @@ pub fn spawn_runas_wait(exe: &Path, args: &str, timeout_ms: u32) -> SpawnResult 
             } else {
                 PCWSTR::from_raw(params.as_ptr())
             },
-            // SW_HIDE(0)：引擎是 console 子系统二进制，SHOWNORMAL 会让提权
-            // 子进程顶出一个可见控制台（火绒测试中观察到的"终端闪现"）。
-            // UAC 弹窗在 secure desktop 由 consent.exe 负责，与 nShow 无关。
-            // 提权段输出走 --log/默认 elevated 日志文件，隐藏不丢任何东西。
+            // SW_HIDE(0)：引擎已改 GUI 子系统（2026-11-05 重启闪终端修复），
+            // 此值防御性保留 0——未来若以 console 工具替换引擎，SHOWNORMAL
+            // 会让提权子进程顶出可见控制台。UAC 弹窗在 secure desktop 由
+            // consent.exe 负责，与 nShow 无关。提权段输出走 --log/默认
+            // elevated 日志文件，隐藏不丢任何东西。
             nShow: 0,
             ..Default::default()
         };
@@ -308,6 +309,30 @@ pub fn spawn_runas_wait(exe: &Path, args: &str, timeout_ms: u32) -> SpawnResult 
 /// explorer 传参空格路径需内层引号，本函数不加引号、arg 原样作命令行尾部：
 /// spawn_detached("explorer.exe", "\"D:\\...\\hufu-server.exe\"")。
 pub fn spawn_detached(exe: &str, arg: &str) {
+    // 【B6 复审加固 2026-11-05】裸名（explorer.exe/ctfmon.exe）作
+    // lpApplicationName 时 CreateProcessW 按当前目录补全而非走搜索路径
+    // （MSDN 语义）——安装目录若恰有同名文件会执行错文件。统一解析为
+    // %SystemRoot% 绝对路径：先 System32（ctfmon；WOW64 重定向到
+    // SysWOW64 亦有副本，安全），不存在再退 C:\Windows 根（explorer），
+    // 都没有则维持原名（CreateProcessW 自带有限搜索兜底）。
+    let resolved;
+    let exe = if !exe.contains('\\') {
+        resolved = std::env::var("SystemRoot")
+            .ok()
+            .and_then(|w| {
+                let sys32 = format!("{w}\\System32\\{exe}");
+                if std::path::Path::new(&sys32).is_file() {
+                    Some(sys32)
+                } else {
+                    let root = format!("{w}\\{exe}");
+                    std::path::Path::new(&root).is_file().then_some(root)
+                }
+            })
+            .unwrap_or_else(|| exe.to_string());
+        &resolved
+    } else {
+        exe
+    };
     unsafe {
         let exe_w = wide(exe);
         let mut cmd: Vec<u16> = Vec::new();

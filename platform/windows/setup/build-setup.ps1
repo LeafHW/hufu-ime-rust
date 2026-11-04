@@ -104,8 +104,12 @@ if (Test-Path "$PkgSource\使用说明.txt") { Remove-Item "$staging\使用说�
 Copy-Item $readmeSetup.FullName "$staging\使用说明.txt" -Force
 
 # 安装器支撑件（卸载 stub 随包；exe 体系不再安装 安装.bat——已装目录里
-# 的遗留由 iss PrepareToInstall 清除，防 zip 时代双体系误用）
-Copy-Item (Join-Path $helper '卸载-stub.bat') "$staging\卸载.bat" -Force
+# 的遗留由 iss PrepareToInstall 清除，防 zip 时代双体系误用）。
+# 【B7 复审修复 2026-11-05】rust 轨不装 .bat（iss #ifndef RUST_ENGINE 只在
+# ps1 轨装 卸载.bat），复制进 staging 属死料；zip 线另有 打包源 拷贝。
+if ($Engine -ne 'rust') {
+  Copy-Item (Join-Path $helper '卸载-stub.bat') "$staging\卸载.bat" -Force
+}
 Copy-Item (Join-Path $helper 'hufu-setup-tools.ps1') $staging -Force
 Copy-Item (Join-Path $helper 'hufu-postboot.ps1') $staging -Force
 

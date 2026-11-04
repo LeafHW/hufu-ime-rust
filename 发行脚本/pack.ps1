@@ -52,7 +52,9 @@ if (-not (Test-Path "$SRC\install.ps1")) { throw '打包源缺失（从上一版
 # 断言照常把关（防仓库侧回退/漂移）。
 $repoInst = 'E:\DSH-KF\hufu\platform\windows\install'
 if (Test-Path "$repoInst\install.ps1") {
-    foreach ($s in @('install.ps1','uninstall.ps1')) {
+    # 【B1 复审修复 2026-11-05】bat 三件套同样以仓内为单一事实源
+    # （此前只同步 ps1，修了仓内 bat 忘打包源=修复进不了 zip）。
+    foreach ($s in @('install.ps1','uninstall.ps1','卸载.bat','安装.bat','设置.bat')) {
         if (Test-Path "$repoInst\$s") {
             # 【BOM 事故修复 2026-10-09】字节级比较（SHA256）：文本比较会把
             # BOM 差异解码掉判「相同」→跳过拷贝→打包源保留无 BOM 旧件，
@@ -780,12 +782,16 @@ foreach ($zin in $ziBins) {
 # 写在 Command::new 同一行，注明目标是什么、为何非解释器；③源码目录从
 # $PSScriptRoot 推导（硬编码绝对路径在仓挪位后静默空转），目录缺失即 FAIL。
 $ziRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# 【B2 复审修复 2026-11-05】列举固定 4 个叶子 src 有盲区（新增 crate
+# 不进网）。改通配：engine\crates\*\src 与 platform\windows\*\src
+# 全部叶子 crate 的 src 递归进网，新增 crate 自动纳入；无 src 的目录
+# （install/setup 等）自然滤除。
+# 注：.rs 源码由 rustc 强制 UTF-8（非 UTF-8 直接编译失败），无需另做
+# UTF-16 扫描；本门禁与编译器共同构成双保险。
 $ziSrcDirs = @(
-    (Join-Path $ziRoot 'engine\crates\hufu-server\src'),
-    (Join-Path $ziRoot 'engine\crates\hufu-render-helper\src'),
-    (Join-Path $ziRoot 'platform\windows\hufu-tsf\src'),
-    (Join-Path $ziRoot 'platform\windows\hufu-settings\src')
-)
+    @(Get-ChildItem (Join-Path $ziRoot 'engine\crates') -Directory | ForEach-Object { Join-Path $_.FullName 'src' }),
+    @(Get-ChildItem (Join-Path $ziRoot 'platform\windows') -Directory | ForEach-Object { Join-Path $_.FullName 'src' })
+) | ForEach-Object { $_ } | Where-Object { Test-Path $_ }
 $ziHits = @(); $ziIndirect = @()
 foreach ($d in $ziSrcDirs) {
     if (-not (Test-Path $d)) { Fail("零解释器 源码目录不存在：$d（门禁不能空转，先修路径）") }

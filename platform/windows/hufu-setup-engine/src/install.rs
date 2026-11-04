@@ -797,11 +797,11 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
     out.line("==========================================");
     out.line(" 安装完成！");
     out.line("  · Win+空格 切到「HuFu 虎符输入法」");
-    out.line("  · 设置：Ctrl+Alt+H（已开则弹到最前）/ Ctrl+Shift+H 呼出到最前 / 开始菜单");
-    out.line("     搜「HuFu」或双击「设置.bat」");
+    out.line("  · 设置：Ctrl+Alt+H（已开则弹到最前）/ Ctrl+Shift+H 呼出到最前 /");
+    out.line("     开始菜单搜「HuFu」");
     out.line("  · 绿色模式：程序在本目录原地运行，不占 C 盘；");
     out.line("    不要移动/删除本文件夹（输入法依赖它）");
-    out.line("  · 卸载：运行「卸载.bat」后把本文件夹整个删除即可");
+    out.line("  · 卸载：设置 → 应用 → 安装的应用 → HuFu 虎符输入法 → 卸载");
     out.line("==========================================");
     out.line("  · 无需重启/注销；正在运行的应用重开后才加载新输入法");
     // install.ps1 L552-554：旧版目录提醒（复检存在性 + 开头算好的 $mb）
@@ -858,18 +858,19 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
     out.line("OK DLL → SystemIME");
     // 【P1-13 2026-11-04】渲染小助手随 DLL 同道进 SystemIME：server 侧
     // /next 实时框只探测 D:\HuFu\ 与 C:\Windows\SystemIME\HuFu\ 两处
-    // （hufu-server/src/main.rs ssf_render_inner）。缺它回退 PowerShell
-    // 驱动（2~3s 出图）。属提速件：拷贝失败只播报，不中止安装。
+    // （hufu-server/src/main.rs ssf_render_inner）。缺它 = server 侧实时
+    // 预览直接 501 报错（2026-11-05 已拆 PowerShell 降级链，零解释器铁律）。
+    // 属功能件：拷贝失败只播报，不中止安装。
     let helper_src = inst.join("hufu-render-helper.exe");
     let helper_dst = sysdir.join("hufu-render-helper.exe");
     if !helper_src.exists() {
-        out.line("· 未找到 hufu-render-helper.exe（实时框回退 PowerShell 驱动，功能不受影响）");
+        out.line("· 未找到 hufu-render-helper.exe（皮肤实时预览将不可用，其余功能不受影响）");
     } else if copy_dll_with_old_fallback(out, &helper_src, &helper_dst, false) {
         let _ = acl::grant_all_app_packages(&helper_dst, false);
         out.line("OK 渲染小助手 → SystemIME");
     } else {
         out.line(&format!(
-            "· 渲染小助手未就位：{}（实时框回退 PowerShell 驱动，功能不受影响）",
+            "· 渲染小助手未就位：{}（皮肤实时预览将不可用，其余功能不受影响）",
             path_str(&helper_dst)
         ));
     }

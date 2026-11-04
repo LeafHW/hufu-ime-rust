@@ -992,6 +992,11 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     // config：三方归并（base=上次收敛快照）。远端项变了且本机没动 →
     // 采纳；本机变了 → 保留；都动 → 本机胜。
     let mut cfg_changed = false;
+    // 【F2 复审修复 2026-11-05】full2 != full（同步毫秒窗口内用户手改）时本轮
+    // 放弃归并——此前只跳过 apply 却仍把本机值回写云端并推进 last_config
+    // 基线 ⇒ 远端 rcfg 未落地即被覆盖，另一设备的配置改动永久丢失。
+    // 放弃时必须同时跳过 config 回写与基线推进（云端保留旧值，下轮重归并）。
+    let mut cfg_abandoned = false;
     if let Some(rcfg) = mf.get("config").cloned() {
         if rcfg.is_object() {
             let Some(shared) = SHARED.get() else {
@@ -1026,12 +1031,17 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                         crate::reload_sentence_bg(teardown, true);
                     }
                     cfg_changed = true;
+                } else {
+                    // 快照已变：本轮放弃。云端 mf["config"] 与 last_config
+                    // 均不动（见函数头 F2 注释），下轮以新快照重新归并。
+                    cfg_abandoned = true;
                 }
             }
         }
     }
-    // 回写 config（消毒后的本机当前值）
-    {
+    // 回写 config（消毒后的本机当前值）。【F2】放弃轮不回写——云端保留
+    // 旧 config（含远端未落地的变更），否则覆盖后远端 delta 永久丢失。
+    if !cfg_abandoned {
         let Some(shared) = SHARED.get() else {
             return Err("同步模块未初始化".into());
         };
@@ -1063,6 +1073,19 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     let mut guard = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.get_or_insert_with(SyncSettings::default);
     st.local_snap = new_snap;
+    if cfg_abandoned {
+        // 【F2】放弃轮不推进归并基线：保留旧 last_config，下轮
+        // three_way_merge 的 base 仍指向上次收敛点，远端 delta
+        // （rcfg≠base）得以重新归并落地。
+        drop(guard);
+        if let Some(d) = DATA_DIR.get() {
+            prune_backups(d);
+        }
+        return Ok(format!(
+            "↑{uploaded} ↓{downloaded} 删{deleted_local} 删云端{deleted_remote} 方案{} 配置放弃(同步期间本地有改动,下轮重归并)",
+            s.selected.len()
+        ));
+    }
     let mut cfg = mf.get("config").cloned().unwrap_or(Value::Null);
     if cfg.is_null() {
         st.last_config = None;

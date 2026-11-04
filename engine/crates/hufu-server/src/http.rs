@@ -86,6 +86,13 @@ fn read_line_bounded(reader: &mut BufReader<TcpStream>, limit: usize) -> Option<
 /// - 每次底层读 15s 超时（此前慢连接可无限占住每连接一线程）。
 /// 任一超限：断连（None），不回 413——攻击者不配得到响应。
 fn read_request(stream: &mut TcpStream) -> Option<Request> {
+    // 【F5 复审修复 2026-11-05】单次读 15s 上限拦不住 slow-loris（每 ~14s
+    // 挤 1 字节可无限占线程）。加总 deadline：整个请求（行+头+体）自首读起
+    // 30s 内必须完成，任一阶段越线即断连。每轮把单次读超时收紧为
+    // min(15s, 剩余预算)，两头都封死。
+    const TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let budget = || TOTAL_DEADLINE.checked_sub(started.elapsed());
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let line = read_line_bounded(&mut reader, 8 * 1024)?;
@@ -94,6 +101,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let target = parts.next()?.to_string();
     let mut headers = HashMap::new();
     for _ in 0..128 {
+        let _ = stream.set_read_timeout(Some(budget()?));
         let h = read_line_bounded(&mut reader, 16 * 1024)?;
         let h = h.trim_end();
         if h.is_empty() {
@@ -113,6 +121,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     }
     let mut body = vec![0u8; len];
     if len > 0 {
+        let _ = stream.set_read_timeout(Some(budget()?));
         reader.read_exact(&mut body).ok()?;
     }
     let (path, query_str) = match target.split_once('?') {
@@ -167,6 +176,8 @@ fn url_decode(s: &str) -> String {
 }
 
 fn write_response(stream: &mut TcpStream, resp: &Response) {
+    // 【F5】写侧同样封时：慢读客户端可阻塞 write_all 无限占线程。
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         resp.status,

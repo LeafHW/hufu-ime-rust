@@ -52,7 +52,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 /// 单图边长上限（虎娘口径：≤8192×8192）。
 const MAX_DIM: u32 = 8192;
 /// 单帧像素上限（虎娘口径 ≤16M 像素/帧）。
-const MAX_PIXELS: u64 = 16_000_000;
+const MAX_PIXELS: u64 = 8_000_000; // 【P4 复审收紧 2026-11-05】16M px 单帧 premul 峰值 ~128MB，i686 大额分配风险；8M px（~32MB/帧）仍覆盖全尺寸皮肤图
 /// 帧数上限（虎娘口径 ≤256 帧）。
 const MAX_FRAMES: usize = 256;
 /// 全图解码内存预算：帧流总量 ≤64MB（虎娘口径，跨帧共享）。

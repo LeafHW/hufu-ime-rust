@@ -43,7 +43,16 @@ export async function verifiedDownloadUpdate(
       onProgress(`已校验并保存到「下载」文件夹：${v.path}`);
       return;
     }
-    onProgress(`校验式下载失败：${v?.error || r.status}，改用浏览器直接下载`);
+    /* 【F4 复审修复 2026-11-05】server 明确拒绝（409 单飞中/清单无哈希/
+       校验不符等）不再回退 window.open——否则每次拒绝都转浏览器无校验
+       直下，击穿校验闸且重复点击会产生双份下载。只有 404（老 server
+       无此端点）才回退保可用。 */
+    if (r.status === 404) {
+      onProgress('当前版本不支持校验式下载，改用浏览器直接下载');
+    } else {
+      onProgress(`校验式下载未完成：${v?.error || r.status}（不会重复下载，请稍候重试）`);
+      return;
+    }
   } catch {
     onProgress('校验式下载不可用，改用浏览器直接下载');
   }

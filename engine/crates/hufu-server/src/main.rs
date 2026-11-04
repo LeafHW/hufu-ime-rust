@@ -240,7 +240,7 @@ fn log_startup(msg: &str) {
 }
 
 /// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
-const BUILD_TAG: &str = "2026-11-05e";
+const BUILD_TAG: &str = "2026-11-05f";
 
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
@@ -1754,9 +1754,13 @@ fn update_check_inner() -> Response {
 
 /// 【审计 P2-D 2026-11-05】校验式下载安装包（锁前分发，不持 Host 锁）。
 /// 此前前端 `window.open(download_url)` 直接下载即提示运行——清单里的
-/// sha256 有传无验，更新源（Gitee）账号失陷 = 供应链直通。现由 server
-/// 中转：拉清单 → 下载 → sha256 比对 → 通过才落「下载」文件夹。浏览器
-/// fetch 直连更新源会被 CORS 拦（Gitee 附件无 ACAO 头），故必须 server 代下。
+/// sha256 有传无验。现由 server 中转：拉清单 → 下载 → sha256 比对 →
+/// 通过才落「下载」文件夹。浏览器 fetch 直连更新源会被 CORS 拦（Gitee
+/// 附件无 ACAO 头），故必须 server 代下。
+/// 【F7 复审校准 2026-11-05】威胁模型边界：sha256 与下载 URL 同出一份
+/// 清单，本端点防的是「清单可信而镜像/传输损坏」（静默换包/截断/错包），
+/// **不防清单本身失陷**（失陷者可给恶意 exe 配套正确哈希）——后者需
+/// 双清单交叉核对（如 GitHub+Gitee 各自的 update.json 比对），暂不做。
 /// 单飞闸：同一时刻只允许一个下载任务（每连接一线程，重复点击 409）。
 fn update_download_inner() -> Response {
     use sha2::{Digest, Sha256};
@@ -1924,7 +1928,20 @@ fn host_is_local(h: &str) -> bool {
     // 冒号且其后必须全数字（防误剥）。
     let host = if h.starts_with('[') {
         match h.find(']') {
-            Some(i) => &h[..=i],
+            Some(i) => {
+                // 【F6 复审修复】`[::1]evil` 这类 ]-后缀必须拒——
+                // 余部只能为空（无端口）或 :数字（端口）。
+                let rest = &h[i + 1..];
+                if rest.is_empty()
+                    || (rest.starts_with(':')
+                        && !rest[1..].is_empty()
+                        && rest[1..].bytes().all(|b| b.is_ascii_digit()))
+                {
+                    &h[..=i]
+                } else {
+                    return false;
+                }
+            }
             None => return false,
         }
     } else {
@@ -1945,6 +1962,17 @@ fn request_is_local(req: &Request) -> bool {
             || origin.starts_with("http://localhost:")
             || origin.starts_with("http://[::1]:");
         if !local {
+            return false;
+        }
+    }
+    // 【F3 复审修复 2026-11-05】no-cors GET（<img>/no-cors fetch/链接导航）
+    // 不带 Origin，Origin+Host 双查拦不住跨站页面。现代浏览器对这类请求也带
+    // Sec-Fetch-Site：same-origin（设置页自身）/same-site/none（地址栏/书签）
+    // 放行，cross-site 一律拒——有副作用端点（如 /api/update/download）不再
+    // 可被任意本地网页触发。无此头的老浏览器维持原双查口径（读取端点仍受
+    // CORS 保护）。
+    if let Some(sfs) = req.headers.get("sec-fetch-site").filter(|s| !s.is_empty()) {
+        if sfs != "same-origin" && sfs != "same-site" && sfs != "none" {
             return false;
         }
     }

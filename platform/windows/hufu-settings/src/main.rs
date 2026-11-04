@@ -66,6 +66,9 @@ const KEYEVENTF_KEYUP: u32 = 0x0002;
 // WM_ENDSESSION 只是「已决定关机」的通知（进程随后被杀）。
 const WM_QUERYENDSESSION: u32 = 0x0011;
 const WM_ENDSESSION: u32 = 0x0016;
+/// 【C1 复审修复 2026-11-05】后台端口探测完成通知（WM_APP+0x50，
+/// 探测线程跨线程投递，wndproc 收割导航——探测不再堵 UI 线程）。
+const WM_PROBE_DONE_MSG: u32 = 0x8000 + 0x50;
 /// 关窗询问页面的超时（毫秒）：渲染进程忙/挂死时不能卡住用户关窗，
 /// 超时按「可关」处理并记日志（正常本机往返仅个位数毫秒）。
 const CLOSE_QUERY_TIMEOUT_MS: u64 = 400;
@@ -496,12 +499,9 @@ unsafe fn handle_window_message(app: *mut App, msg: &str) {
                 return;
             }
             (*app).log("manual retry requested from error page");
-            if !recover_once(app, true) {
-                (*app).log("manual retry: still no live hufu port; keep auto-retrying");
-                arm_recover_timer(app);
-            } else {
-                KillTimer(hwnd, 8);
-            }
+            // 【C1】后台探测，成功/失败均由 finish_recover_probe 处理
+            // （成功停表，失败重新挂自动重试表）。
+            start_recover_probe(app, true);
         }
         "win:close" => {
             // 【P0-1 2026-11-04】页面主动请求关闭：此时页面自己的未保存
@@ -976,6 +976,10 @@ struct App {
     /// 【2026-11-05】上一次恢复探测的时刻：手动重试/自动重试去重，避免
     /// 连点「重试」时把 UI 线程连续堵在 7 个候选端口的超时上。
     last_recover: Option<Instant>,
+    /// 【C1 复审修复 2026-11-05】后台探测：已发起的探测代数与该轮是否手动
+    /// （收割时只认最新代，过期结果丢弃）。
+    probe_gen: u64,
+    probe_manual: bool,
 }
 
 impl App {
@@ -1099,13 +1103,56 @@ document.getElementById('close').onclick=function(){{
 
 /// 【2026-11-05】错误页恢复：重新探测真实端口（握手文件 + 候选表），命中就
 /// 把窗口导航过去。绝不再用旧 URL 死磕——旧 URL 是探测失败后的占位端口。
-unsafe fn recover_once(app: *mut App, manual: bool) -> bool {
+/// 【C1 复审修复 2026-11-05】探测改后台线程：resolve_live_port 最坏
+/// 7×120ms≈1.4s 此前在 UI 线程同步跑，错误页期间每 2s 堵一次消息循环
+/// （拖动/重绘卡顿）。现在 UI 线程只发起（gen+1 + spawn 线程），线程探测
+/// 完 PostMessage WM_PROBE_DONE_MSG，wndproc 里 finish_recover_probe 收割。
+/// 单实例互斥体保证单 App，全局 gen/done 足够。
+static PROBE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROBE_DONE: std::sync::Mutex<Option<(u64, Option<u16>)>> = std::sync::Mutex::new(None);
+
+unsafe fn start_recover_probe(app: *mut App, manual: bool) -> bool {
     if app.is_null() || !(*app).error_mode || (*app).webview.is_null() {
         return false;
     }
     (*app).last_recover = Some(Instant::now());
-    let Some(port) = resolve_live_port(&(*app).log_path) else {
-        return false;
+    let gen = PROBE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    (*app).probe_gen = gen;
+    (*app).probe_manual = manual;
+    let log_path = (*app).log_path.clone();
+    let hwnd = (*app).hwnd;
+    std::thread::spawn(move || {
+        let r = resolve_live_port(&log_path);
+        if let Ok(mut g) = PROBE_DONE.lock() {
+            *g = Some((gen, r));
+        }
+        unsafe { PostMessageW(hwnd, WM_PROBE_DONE_MSG, 0, 0) };
+    });
+    true
+}
+
+unsafe fn finish_recover_probe(app: *mut App) {
+    if app.is_null() || !(*app).error_mode {
+        return;
+    }
+    let manual = (*app).probe_manual;
+    let taken = PROBE_DONE.lock().ok().and_then(|mut g| g.take());
+    let Some((gen, port)) = taken else {
+        return;
+    };
+    if gen != (*app).probe_gen {
+        return; // 过期探测：已被新一轮覆盖，丢弃
+    }
+    let Some(port) = port else {
+        (*app).log(if manual {
+            "manual retry: still no live hufu port; keep auto-retrying"
+        } else {
+            "auto retry: no live port yet"
+        });
+        if manual {
+            arm_recover_timer(app);
+        }
+        return;
     };
     let text = default_url(port);
     (*app).url_text = text.clone();
@@ -1118,7 +1165,7 @@ unsafe fn recover_once(app: *mut App, manual: bool) -> bool {
     (*app).error_mode = false;
     (*app).error_nav_pending = false;
     let _ = wv_navigate((*app).webview, (*app).url.as_ptr());
-    true
+    KillTimer((*app).hwnd, 8);
 }
 
 unsafe fn arm_recover_timer(app: *mut App) {
@@ -1134,19 +1181,18 @@ unsafe fn recover_tick(app: *mut App) {
     if app.is_null() || !(*app).error_mode {
         return;
     }
-    // 手动重试刚跑过：这次跳过，别把 UI 再堵一遍
+    // 上一轮探测仍在飞（最坏 ~1.4s，tick 2s）或刚发起不久：跳过本次
     if (*app)
         .last_recover
-        .map(|t| t.elapsed() < Duration::from_millis(1500))
+        .map(|t| t.elapsed() < Duration::from_millis(1800))
         .unwrap_or(false)
     {
         return;
     }
     (*app).recover_retry = (*app).recover_retry.saturating_add(1);
-    if recover_once(app, false) {
-        KillTimer((*app).hwnd, 8);
-        return;
-    }
+    // 【C1】探测在后台线程跑，tick 只发起不等待；成功导航由
+    // finish_recover_probe（WM_PROBE_DONE_MSG）负责并停表。
+    start_recover_probe(app, false);
     if (*app).recover_retry >= 30 {
         (*app).log("auto-retry gave up after 30 attempts (60s); waiting for manual retry");
         KillTimer((*app).hwnd, 8);
@@ -1368,6 +1414,12 @@ unsafe extern "system" fn wndproc(
                 sync_maximized_state(app);
             }
             0
+        }
+        WM_PROBE_DONE_MSG => {
+            // 【C1】后台端口探测完成：收割结果（过期代数丢弃），命中则导航
+            let app = app_ptr(hwnd);
+            finish_recover_probe(app);
+            return 0;
         }
         WM_TIMER => {
             if wparam == 8 {
@@ -1665,7 +1717,7 @@ fn exe_dir() -> PathBuf {
 // 超时，总预算 2s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
 // 完成（此时还没进消息循环），最坏多花约 2s 启动时间。
 /// 构建标记：同版本号重打包时用来区分新旧包（与 server 的 /api/about 同值）。
-const BUILD_TAG: &str = "2026-11-05e";
+const BUILD_TAG: &str = "2026-11-05f";
 
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];
@@ -2333,6 +2385,8 @@ unsafe fn real_main() -> i32 {
         close_dirty_at: None,
         recover_retry: 0,
         last_recover: None,
+        probe_gen: 0,
+        probe_manual: false,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 

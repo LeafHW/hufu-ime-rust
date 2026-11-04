@@ -2296,6 +2296,11 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
     put(obj, "colors", "hilited_candidate_text_color", serde_json::json!(hex(d.first_color)));
     put(obj, "colors", "hilited_candidate_label_color", serde_json::json!(hex(d.first_color)));
     put(obj, "colors", "hilited_comment_text_color", serde_json::json!(hex(d.annotation_color)));
+    // 【F1 复审修复 2026-11-05】编码行色必须进投影：b_raw 查 /skin/colors/code_color，
+    // 而此前投影只注 9 键不含此键 ⇒ 查找恒落空、恒用默认近白色，白框皮肤编码行
+    // 过淡的原 bug 未被 P1-4 修复（复审 F1）。SSF 载荷真值在顶层 display.code_color
+    // （model.rs pinyin_color 投影，缺省 0xFF333333 深色）。
+    put(obj, "colors", "code_color", serde_json::json!(hex(d.code_color)));
     v
 }
 
@@ -6661,6 +6666,9 @@ impl CandidateWindowV2 {
                         let has_code = skin
                             .pointer("/skin/colors/code_color")
                             .or_else(|| skin.pointer("/colors/code_color"))
+                            // 【F1 复审修复】SSF 原始载荷（ssf=None 矢量回退路径拿到
+                            // server skin_payload）的真值在顶层 display.code_color
+                            .or_else(|| skin.pointer("/skin/display/code_color"))
                             .is_some_and(|x| x.as_str().is_some());
                         if has_code {
                             color_f(skin, "code_color", "#E8E8EAFF")

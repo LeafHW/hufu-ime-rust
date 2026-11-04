@@ -65,7 +65,7 @@ pub fn run_uninstall(out: &mut Out, no_hklm: bool) -> i32 {
         let child = format!(r"{}\{}", UP_ROOT, lk);
         if regop::enum_value_names("HKCU", &child)
             .iter()
-            .any(|v| v == &tip)
+            .any(|v| v.eq_ignore_ascii_case(tip.as_str()))
         {
             regop::delete_value("HKCU", &child, &tip);
             out.line("OK 列表真存储 -虎符（纯减法：他人条目零触碰）");
@@ -456,7 +456,7 @@ fn up_keys_with_tip(tip: &str) -> usize {
         let child = format!(r"{}\{}", UP_ROOT, lk);
         if regop::enum_value_names("HKCU", &child)
             .iter()
-            .any(|v| v == tip)
+            .any(|v| v.eq_ignore_ascii_case(tip))
         {
             n += 1;
         }
