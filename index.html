@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>虎符 HuFu · 以虎码为核心的跨平台中文整句输入法</title>
-<meta name="description" content="虎符 HuFu 是一款以虎码为核心的跨平台中文整句输入法：虎码整句（万句基准 99.73%，叠加神经重排可达 99.9%）、三端同源、全键盘自定义、19 套矢量皮肤与 .ssf 导入、WebDAV 云同步。Windows / Linux 可用，macOS 开发中。免费、开源、无广告。">
+<meta name="description" content="虎符 HuFu 是一款以虎码为核心的跨平台中文整句输入法：虎码整句（万句基准 99.50%）、三端同源、全键盘自定义、19 套矢量皮肤与 .ssf 导入、WebDAV 云同步。Windows / Linux 可用，macOS 开发中。免费、开源、无广告。">
 <meta name="keywords" content="虎符,虎码,输入法,HuFu,中文输入法,Rime,fcitx5,TSF,开源输入法,全键盘自定义">
 <meta name="author" content="LeafHW">
 <meta name="theme-color" content="#f6f1e6" id="meta-theme-color">
@@ -13,25 +13,40 @@
 <meta property="og:site_name" content="虎符 HuFu">
 <meta property="og:locale" content="zh_CN">
 <meta property="og:title" content="虎符 HuFu · 让中文收指成句">
-<meta property="og:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句 99.73%，重排可达 99.9%；全键盘自定义、三端同源、19 套皮肤、WebDAV 云同步。免费开源，无广告。">
+<meta property="og:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句万句基准 99.50%；全键盘自定义、三端同源、19 套皮肤、WebDAV 云同步。免费开源，无广告。">
 <meta property="og:url" content="https://www.hufuime.top/">
-<meta property="og:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261103b">
+<meta property="og:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261104a">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="虎符 HuFu · 让中文收指成句">
-<meta name="twitter:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句 99.73%，重排可达 99.9%；全键盘自定义。免费、开源、无广告。">
-<meta name="twitter:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261103b">
+<meta name="twitter:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句万句基准 99.50%；全键盘自定义。免费、开源、无广告。">
+<meta name="twitter:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261104a">
 <link rel="icon" href="./assets/img/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="icon" href="./assets/img/favicon-64.png" sizes="64x64" type="image/png">
 <link rel="apple-touch-icon" href="./assets/img/apple-touch-icon.png">
 <link rel="manifest" href="./site.webmanifest">
-<link rel="preload" href="./assets/fonts/noto-serif-sc-subset.woff2?v=20261103c" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="./assets/css/main.css?v=20261103e">
+<link rel="preload" href="./assets/fonts/noto-serif-sc-subset.woff2?v=20261104a" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./assets/css/main.css?v=20261104a">
+<noscript>
+  <style>
+    /* 【P2-29 2026-11-04】JS 关闭：解除入场隐藏（[data-reveal] 默认 opacity:0，
+       此前无脚本时整页半白）。滚动动画正常时这条不生效。 */
+    .js [data-reveal] { opacity: 1 !important; transform: none !important; }
+    .hero-reveal { animation: none !important; opacity: 1 !important; transform: none !important; }
+  </style>
+</noscript>
 <script>
   (function () {
     var root = document.documentElement;
     root.classList.add('js');
+    /* 【P2-29 2026-11-04】渐进增强兜底：main.js 加载失败（404/网络/语法错误）
+       或执行期抛错时，解除 [data-reveal] 的隐藏 —— 此前 JS 一挂就是半页白。
+       正常路径下本类名永不添加，滚动入场动画不受影响。 */
+    window.addEventListener('error', function (e) {
+      var t = e && (e.target || e.srcElement);
+      if ((t && t.tagName === 'SCRIPT') || (e && e.message)) root.classList.add('reveal-fallback');
+    }, true);
     var theme = 'light';
     try {
       var saved = localStorage.getItem('hufu-theme');
@@ -50,7 +65,7 @@
   "applicationSubCategory": "Input Method Editor",
   "operatingSystem": "Windows 10, Windows 11, Linux",
   "inLanguage": "zh-CN",
-  "description": "以虎码为核心的跨平台中文整句输入法，支持虎码整句（99.73%，重排可达 99.9%）、全键盘自定义、多方案、19 套矢量皮肤、.ssf 导入与 WebDAV 云同步。",
+  "description": "以虎码为核心的跨平台中文整句输入法，支持虎码整句（万句基准 99.50%）、全键盘自定义、多方案、19 套矢量皮肤、.ssf 导入与 WebDAV 云同步。",
   "url": "https://www.hufuime.top/",
   "downloadUrl": "https://gitee.com/leafyin/hufu-ime-rust/releases",
   "codeRepository": "https://github.com/LeafHW/hufu-ime-rust",
@@ -98,7 +113,7 @@
 <header class="site-header" data-header>
   <div class="shell header-inner">
     <a class="brand" href="#top" aria-label="虎符 HuFu 首页">
-      <span class="brand-mark"><img src="./assets/img/logo-128.png" width="32" height="32" alt=""></span>
+      <span class="brand-mark"><img src="./assets/img/logo-128.webp" width="32" height="32" alt=""></span>
       <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
     </a>
     <nav class="nav" aria-label="主导航" data-nav>
@@ -180,11 +195,11 @@
       <div class="hero-stage hero-reveal" style="--i:2" data-parallax>
         <div class="medal" aria-hidden="true">
           <span class="medal-ring"></span>
-          <img class="medal-icon" src="./assets/img/logo-256.png" alt="" width="126" height="126">
+          <img class="medal-icon" src="./assets/img/logo-256.webp" alt="" width="126" height="126">
           <span class="medal-spark"></span>
         </div>
 
-        <div class="float-chip chip-a"><span class="status-dot"></span>整句 · 99.73%</div>
+        <div class="float-chip chip-a"><span class="status-dot"></span>整句 · 99.5%</div>
         <div class="float-chip chip-b"><b>p50</b> 6ms</div>
         <div class="float-chip chip-c"><b>19</b><span>套皮肤</span></div>
 
@@ -192,7 +207,7 @@
           <div class="editor-bar">
             <span class="win-dots"><i></i><i></i><i></i></span>
             <span class="editor-title">未命名 · 记事本</span>
-            <span class="ime-badge"><img src="./assets/img/logo-64.png" alt="" width="16" height="16">虎符</span>
+            <span class="ime-badge"><img src="./assets/img/logo-64.webp" alt="" width="16" height="16">虎符</span>
           </div>
           <div class="editor-body">
             <p class="editor-line"><span data-demo-text></span><span class="caret"></span></p>
@@ -309,11 +324,11 @@
       </div>
 
       <div class="stats" data-reveal>
-        <div class="stat"><strong><span data-count="99.73" data-decimals="2">99.73</span><i>%</i></strong><span>万句基准准率<em>1 万句 · 纯 ngram</em></span></div>
+        <div class="stat"><strong><span data-count="99.50" data-decimals="2">99.50</span><i>%</i></strong><span>万句基准准率<em>1 万句 · 纯 ngram</em></span></div>
         <div class="stat"><strong><span data-count="6" data-decimals="0">6</span><i>ms</i></strong><span>组句触达 p50<em>本机引擎实测</em></span></div>
         <div class="stat"><strong><span data-count="246" data-decimals="0">246</span><i>k</i></strong><span>虎码字词条<em>import 闭包</em></span></div>
         <div class="stat"><strong><span data-count="19" data-decimals="0">19</span><i>套</i></strong><span>矢量皮肤<em>兼容 .ssf</em></span></div>
-        <p class="stats-note">纯 ngram 99.73%；叠加 Qwen3 神经重排可达 99.9%。数据来自随包资源与基准报告 · 口径见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">docs/status.md</a></p>
+        <p class="stats-note">万句基准（tbench v2）准率 99.50%，纯 ngram；神经重排为可选增强（同语料 A/B 见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/benchmark-qwen-vs-ngram.md" target="_blank" rel="noopener">基准报告</a>）。数据与口径见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">docs/status.md</a></p>
       </div>
     </div>
   </section>
@@ -620,7 +635,7 @@ fcitx5 -r -d</code></pre>
   <section class="cta">
     <div class="cta-bg" aria-hidden="true"><span>虎</span></div>
     <div class="shell cta-inner" data-reveal>
-      <span class="cta-mark"><img src="./assets/img/logo-256.png" width="72" height="72" alt=""></span>
+      <span class="cta-mark"><img src="./assets/img/logo-256.webp" width="72" height="72" alt=""></span>
       <h2>把想说的话，<br>一次打完。</h2>
       <div class="cta-actions">
         <a class="btn btn-primary" href="#download"><span>下载虎符</span><svg class="ico"><use href="#i-download"></use></svg></a>
@@ -635,7 +650,7 @@ fcitx5 -r -d</code></pre>
   <div class="shell footer-top">
     <div class="footer-brand">
       <a class="brand" href="#top" aria-label="回到顶部">
-        <span class="brand-mark"><img src="./assets/img/logo-128.png" width="32" height="32" alt=""></span>
+        <span class="brand-mark"><img src="./assets/img/logo-128.webp" width="32" height="32" alt=""></span>
         <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
       </a>
       <span class="footer-license">GPL-3.0-or-later · 免费开源</span>

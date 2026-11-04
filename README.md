@@ -38,7 +38,7 @@ hufu-site/
 - **截图**：设置页「概览 / 整句模型 / 键位 / 云同步 / 皮肤工作室」均由本机当前版本实拍，每张都有 `xxx-light.webp` 与 `xxx-dark.webp` 两份；HTML 里用 `data-theme-img` + `data-light` / `data-dark` 标记，`main.js` 在切主题时同步换图。已转 WebP，仅作界面示意。
 - **首页候选窗动画**：用 HTML/CSS 复刻真实候选窗（编码 `syfdgvwihuvnagj` → 整句「让中文收指成句」），不是视频；页面内已标注“网页示意”。
 - **下载信息**：页面加载后从 GitHub Releases API 读取最新版本号、日期、exe 直链与大小；API 不可用时回落到静态 v1.9.8 链接，不影响访问。
-- **字体**：Noto Serif SC 子集（仅包含页面用到的字符），SIL Open Font License 1.1，授权全文见 `assets/fonts/LICENSE.txt`。
+- **字体**：Noto Serif SC 子集（只含站点用到的字符；2026-11-04 按全站三页 + JS 注入文案重裁，645 字，文件 273KB → 198KB（-27%）），SIL Open Font License 1.1，授权全文见 `assets/fonts/LICENSE.txt`。
 
 ## 部署
 
@@ -65,7 +65,7 @@ git -c credential.helper= push \
 
 ## 说明
 
-- **数据**：万句基准 99.73%（纯 ngram）；叠加 Qwen3 神经重排可达 99.9%。
+- **数据**：万句基准 99.50%（纯 ngram，tbench v2）；神经重排为可选增强，同语料 A/B 见仓库 `docs/benchmark-qwen-vs-ngram.md`。口径统一取仓库 `docs/status.md`，不再使用无出处的 99.9%。
 - **打赏**：站点 `#donate` 区块内联支付宝二维码（base64，源文件 `assets/img/donate-alipay.png`，与设置页「打赏支持」的二维码同源），避免慢网下二维码空白。
 
 - 本站代码随虎符项目以 GPL-3.0-or-later 发布；字体为 OFL 1.1；截图与 Logo 版权归虎符项目。

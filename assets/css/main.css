@@ -6,7 +6,7 @@
 /* ---------- Fonts ---------- */
 @font-face {
   font-family: "Noto Serif SC";
-  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261103c") format("woff2");
+  src: url("../fonts/noto-serif-sc-subset.woff2?v=20261104a") format("woff2");
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -3753,6 +3753,13 @@ h2 {
 }
 
 .js [data-reveal].is-in {
+  opacity: 1;
+  transform: none;
+}
+
+/* 【P2-29 2026-11-04】渐进增强兜底：main.js 加载/执行失败时（内联脚本会加
+   .reveal-fallback）解除入场隐藏；JS 正常时该类名不存在，动画不变。 */
+.reveal-fallback [data-reveal] {
   opacity: 1;
   transform: none;
 }
