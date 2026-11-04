@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ; HuFu 虎符输入法 · 单 exe 安装包（Inno Setup 6）
 ; ----------------------------------------------------------------------------
 ; 架构铁律（与 install.ps1 双阶段一一对齐，勿"标准化"改动）：
@@ -99,6 +99,10 @@ Type: files; Name: "{app}\install.ps1"
 Type: files; Name: "{app}\uninstall.ps1"
 Type: files; Name: "{app}\hufu-setup-tools.ps1"
 Type: files; Name: "{app}\hufu-postboot.ps1"
+; 【零脚本安装目录 2026-11-05】清 zip 时代遗留的 bat stub（卸载.bat 含
+; powershell 提权检测、设置.bat 闪 cmd 窗；正门=开始菜单快捷方式+应用与功能）
+Type: files; Name: "{app}\卸载.bat"
+Type: files; Name: "{app}\设置.bat"
 #endif
 
 [Files]
@@ -126,10 +130,15 @@ Source: "staging\hufu-setup-engine.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-setup-tools.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-postboot.ps1"; DestDir: "{app}"; Flags: ignoreversion
 #endif
-; zip 时代 卸载.bat 由构建替换为指向安装器体系的 stub（GBK）；exe 体系不
-; 安装 安装.bat（升级时清除目标目录里的遗留，见 PrepareToInstall）
+; 【零脚本安装目录 2026-11-05 用户拍板】Rust 轨（公开发布轨）安装目录
+; 不装任何脚本文件：卸载.bat stub 内含 powershell 提权检测（违运行时零
+; 解释器铁律精神），设置.bat 双击闪 cmd 窗且与开始菜单设置壳快捷方式
+; 冗余。zip 绿色包轨不受影响（保留脚本属明示行为）。升级自旧版时把
+; 遗留的两个 bat 一并清掉（同 2026-10-21 清 .ps1 的做法）。
+#ifndef RUST_ENGINE
 Source: "staging\卸载.bat"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "staging\设置.bat"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+#endif
 Source: "staging\使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "staging\更新日志.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\图标.ico"; DestDir: "{app}"; Flags: ignoreversion
