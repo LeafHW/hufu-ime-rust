@@ -1536,6 +1536,323 @@ fn diff_hl_on() -> bool {
     DIFF_HL_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ============================================================================
+// 【高亮字号补间 2026-11-04】「高亮放大 / 其余缩小」的量化补间状态机
+// ============================================================================
+//
+// 设计（用户拍板，取代 2026-10-29 逐帧插值整链回退）：
+//   · 只对**连续移动**（|Δselected|==1 且同页）补间；跨位/翻页/换页/提交/
+//     反查/命令/调频/SSF/动效关 → 一律定格（snap），1→8 之间不存在中间值；
+//   · 量化步进：96ms（anim_speed 缩放，夹 48~140ms）均分 **3 步**
+//     （1/3、2/3、3/3），只有跨过步界才重排/重绘 → 每程最多 3 次渲染，
+//     不是每帧重排（2026-10-29 卡顿的根因就是每帧全量重排）；
+//   · 可打断：新一次 ±1 移动到来时以**当前已量化到步的每行 k** 为新起点，
+//     重设目标与 t0 续跑，不排队、不从头再来；
+//   · 到点直接落 target 并清臂，不再多渲染一帧。
+/// 每程量化步数（1/3、2/3、3/3）
+pub(crate) const FS_STEPS: u8 = 3;
+/// 基准总时长 ms（受 anim_speed 缩放，夹 FS_DUR_MIN..FS_DUR_MAX）
+pub(crate) const FS_BASE_MS: f32 = 96.0;
+pub(crate) const FS_DUR_MIN_MS: u32 = 48;
+pub(crate) const FS_DUR_MAX_MS: u32 = 140;
+/// k 量化键（1/1000）——同一档四舍五入到千分位后共用字体格式
+pub(crate) fn fs_k_key(k: f32) -> u32 {
+    ((k * 1000.0).round().max(0.0) as i64).min(u32::MAX as i64) as u32
+}
+
+/// 量化取值：from→to 的第 step 步（steps 步走完恰等于 to）。
+pub(crate) fn fs_step_value(from: f32, to: f32, step: u8, steps: u8) -> f32 {
+    if steps == 0 || step >= steps {
+        return to;
+    }
+    from + (to - from) * (step as f32 / steps as f32)
+}
+
+/// 逐行量化（长度按 to；from 缺行按目标值起步=无补间）。
+pub(crate) fn fs_step_values(from: &[f32], to: &[f32], step: u8, steps: u8) -> Vec<f32> {
+    (0..to.len())
+        .map(|i| {
+            let f = from.get(i).copied().unwrap_or(to[i]);
+            fs_step_value(f, to[i], step, steps)
+        })
+        .collect()
+}
+
+/// 时间→量化步：step_ms=dur/FS_STEPS，t∈[k·step_ms,(k+1)·step_ms) → 第 k
+/// 步；≥dur → FS_STEPS（终态）。tick 只在返回值变大时重排（每程 ≤3 帧）。
+pub(crate) fn fs_step_at(elapsed_ms: u32, dur_ms: u32) -> u8 {
+    let step_ms = (dur_ms / FS_STEPS.max(1) as u32).max(1);
+    ((elapsed_ms / step_ms).min(FS_STEPS as u32)) as u8
+}
+
+/// 补间状态（时间基准；tick 只在步界推进并复渲染）。
+#[derive(Clone, Debug)]
+pub(crate) struct FsAnim {
+    pub t0: std::time::Instant,
+    pub from: Vec<f32>,
+    pub to: Vec<f32>,
+    pub dur_ms: u32,
+    /// 已落下的步（0=起臂帧=from 态；1..=FS_STEPS）
+    pub step: u8,
+    /// 本程已执行的重排次数（诊断/取证，应 ≤ FS_STEPS）
+    pub reflows: u8,
+}
+
+/// 起臂计划（纯函数输出；from=当前已量化步，to=目标档）。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FsPlan {
+    pub from: Vec<f32>,
+    pub to: Vec<f32>,
+    pub dur_ms: u32,
+}
+
+/// 起臂/重定向判定输入（全部为纯数据，便于单测）。
+pub(crate) struct FsCtx {
+    /// hl_font_scale 开 且 k_first≠k_rest（逐像素有变化）
+    pub enabled: bool,
+    /// 动效 tick 的内部复渲染（绝不起臂，只按 tick 已推进的值渲染）
+    pub internal: bool,
+    /// 上一帧窗口是否已可见：隐藏→首显那一下不补间（新组段/新会话首帧
+    /// 直接落目标档，避免「一出现就自己放大」）
+    pub was_visible: bool,
+    /// 与上一用户帧同页（每项文本/注释逐项相同）
+    pub same_page: bool,
+    pub prev_sel: Option<usize>,
+    pub selected: usize,
+    pub cands_len: usize,
+    pub anim_on: bool,
+    pub sys_anim: bool,
+    /// SSF 位图皮肤：中间档行槽需源域换算，本期不做 → snap
+    pub ssf: bool,
+    /// 调频/删词模态
+    pub freq_modal: bool,
+    /// 反查/命令提示行（编码行被提示串占用）
+    pub hint_line: bool,
+    pub k_first: f32,
+    pub k_rest: f32,
+    pub anim_spd: f32,
+    /// 当前已渲染的逐行 k（打断续跑的起点）
+    pub cur: Vec<f32>,
+}
+
+/// 判定是否起臂/重定向；None=本次直接定格（snap）。
+pub(crate) fn fs_plan(c: &FsCtx) -> Option<FsPlan> {
+    if c.internal
+        || !c.enabled
+        || !c.anim_on
+        || !c.sys_anim
+        || c.ssf
+        || c.freq_modal
+        || c.hint_line
+        || !c.same_page
+        || !c.was_visible
+        || c.cands_len <= 1
+        || c.selected >= c.cands_len
+    {
+        return None;
+    }
+    let prev = c.prev_sel?;
+    if prev >= c.cands_len {
+        return None;
+    }
+    // 连续移动才算中间值；跨多位/翻页（0↔9 等）一律定格
+    if prev.abs_diff(c.selected) != 1 {
+        return None;
+    }
+    let to: Vec<f32> = (0..c.cands_len)
+        .map(|i| if i == c.selected { c.k_first } else { c.k_rest })
+        .collect();
+    // 起点=当前已量化到步的每行值（可打断续跑）；无历史则等于目标=不起臂
+    let from: Vec<f32> = (0..c.cands_len)
+        .map(|i| c.cur.get(i).copied().unwrap_or(to[i]))
+        .collect();
+    if from == to {
+        return None;
+    }
+    let dur = ((FS_BASE_MS / c.anim_spd.max(0.01)) as u32).clamp(FS_DUR_MIN_MS, FS_DUR_MAX_MS);
+    Some(FsPlan {
+        from,
+        to,
+        dur_ms: dur,
+    })
+}
+
+/// 单档字体（正文 + 注释小字）——按 k 去重缓存，补间中最多 3 档。
+#[derive(Clone, Default)]
+pub(crate) struct FsTier {
+    pub body: Option<IDWriteTextFormat>,
+    pub small: Option<IDWriteTextFormat>,
+    /// 光学垂直补偿（该 k 档；dy 段回填）
+    pub dy: f32,
+}
+
+/// 字体档缓存：基础键（字体/正文 pt/序号 pt）不变时跨帧复用各 k 档；
+/// 换皮/字号变→基础键变→整表重建。
+#[derive(Clone, Default)]
+pub(crate) struct TfCache {
+    pub base: (String, f32, f32),
+    pub label: Option<IDWriteTextFormat>,
+    pub tiers: std::collections::HashMap<u32, FsTier>,
+}
+
+#[cfg(test)]
+mod fs_anim_tests {
+    use super::*;
+
+    fn ctx() -> FsCtx {
+        FsCtx {
+            enabled: true,
+            internal: false,
+            was_visible: true,
+            same_page: true,
+            prev_sel: Some(0),
+            selected: 1,
+            cands_len: 5,
+            anim_on: true,
+            sys_anim: true,
+            ssf: false,
+            freq_modal: false,
+            hint_line: false,
+            k_first: 1.3,
+            k_rest: 0.85,
+            anim_spd: 1.0,
+            cur: vec![1.3, 0.85, 0.85, 0.85, 0.85],
+        }
+    }
+
+    /// 3 步量化：1/3、2/3、3/3；最后一步恰等于 target（不多渲染）。
+    #[test]
+    fn quantize_three_steps_exact() {
+        let (f, t) = (1.3f32, 0.85f32);
+        let d = t - f;
+        let s1 = fs_step_value(f, t, 1, FS_STEPS);
+        let s2 = fs_step_value(f, t, 2, FS_STEPS);
+        let s3 = fs_step_value(f, t, 3, FS_STEPS);
+        assert!((s1 - (f + d / 3.0)).abs() < 1e-5);
+        assert!((s2 - (f + d * 2.0 / 3.0)).abs() < 1e-5);
+        assert_eq!(s3, t, "last step must be exactly target");
+        // 逐行：其余行保持 k_rest 不动（中间值只出现在两端行）
+        let from = vec![1.3, 0.85];
+        let to = vec![0.85, 1.3];
+        let v1 = fs_step_values(&from, &to, 1, FS_STEPS);
+        assert!((v1[0] - (1.3 - 0.45 / 3.0)).abs() < 1e-5);
+        assert!((v1[1] - (0.85 + 0.45 / 3.0)).abs() < 1e-5);
+        assert_eq!(fs_step_values(&from, &to, 3, FS_STEPS), to);
+    }
+
+    /// ±1 移动起臂：from=当前已量化值（可打断续跑），to=新目标档。
+    #[test]
+    fn pm_one_arms_from_current_step() {
+        let c = ctx();
+        let p = fs_plan(&c).expect("±1 should arm");
+        assert_eq!(p.from, c.cur);
+        assert_eq!(p.to, vec![0.85, 1.3, 0.85, 0.85, 0.85]);
+        assert!((48..=140).contains(&p.dur_ms));
+        // 打断续跑：当前值取到第 1 步的量化值 → 新起点就是它（不回到 0 帧）
+        let mut c2 = ctx();
+        c2.cur = fs_step_values(&p.from, &p.to, 1, FS_STEPS);
+        let p2 = fs_plan(&c2).expect("redirect should arm");
+        assert_eq!(p2.from, c2.cur, "redirection must start from current step");
+    }
+
+    /// 跨多位（1→8）、同页但非移动、内部复渲染、以及各关门条件 → snap。
+    #[test]
+    fn snap_on_jump_and_gates() {
+        let mut c = ctx();
+        c.selected = 4;
+        assert!(fs_plan(&c).is_none(), "|delta|>1 must snap");
+        let mut c = ctx();
+        c.prev_sel = Some(1);
+        c.selected = 1;
+        assert!(fs_plan(&c).is_none(), "same selection must snap");
+        let mut c = ctx();
+        c.internal = true;
+        assert!(fs_plan(&c).is_none(), "internal rerender must not arm");
+        for f in [
+            |c: &mut FsCtx| c.enabled = false,
+            |c: &mut FsCtx| c.anim_on = false,
+            |c: &mut FsCtx| c.sys_anim = false,
+            |c: &mut FsCtx| c.ssf = true,
+            |c: &mut FsCtx| c.freq_modal = true,
+            |c: &mut FsCtx| c.hint_line = true,
+            |c: &mut FsCtx| c.same_page = false,
+            |c: &mut FsCtx| c.was_visible = false,
+            |c: &mut FsCtx| c.cands_len = 1,
+            |c: &mut FsCtx| {
+                c.prev_sel = None;
+            },
+            |c: &mut FsCtx| {
+                c.selected = 9;
+            },
+        ] {
+            let mut cc = ctx();
+            f(&mut cc);
+            assert!(fs_plan(&cc).is_none(), "gate must snap");
+        }
+        // k_first==k_rest（逐像素等价）由 enabled=false 承担
+        let mut cc = ctx();
+        cc.k_first = 1.0;
+        cc.k_rest = 1.0;
+        cc.enabled = false;
+        assert!(fs_plan(&cc).is_none());
+    }
+
+    /// 时长=96/speed 并夹 48~140。
+    #[test]
+    fn duration_clamped_by_speed() {
+        let mut c = ctx();
+        assert_eq!(fs_plan(&c).unwrap().dur_ms, 96);
+        c.anim_spd = 2.0;
+        assert_eq!(fs_plan(&c).unwrap().dur_ms, 48);
+        c.anim_spd = 0.5;
+        assert_eq!(fs_plan(&c).unwrap().dur_ms, 140);
+        c.anim_spd = 1.7;
+        assert_eq!(fs_plan(&c).unwrap().dur_ms, 56);
+    }
+
+    /// 时钟→步：96ms 分 3 步（32ms/步），恰在 32/64/96 边界落步；
+    /// ≥96ms 即终态，再多时间也不超过 3；48/140ms 夹持档同步成立。
+    #[test]
+    fn clock_quantizes_to_three_steps() {
+        for (t, want) in [
+            (0u32, 0u8),
+            (31, 0),
+            (32, 1),
+            (63, 1),
+            (64, 2),
+            (95, 2),
+            (96, 3),
+            (5000, 3),
+        ] {
+            assert_eq!(fs_step_at(t, 96), want, "t={t} dur=96");
+        }
+        // 48ms 档（16ms/步）
+        for (t, want) in [
+            (0u32, 0u8),
+            (15, 0),
+            (16, 1),
+            (31, 1),
+            (32, 2),
+            (47, 2),
+            (48, 3),
+        ] {
+            assert_eq!(fs_step_at(t, 48), want, "t={t} dur=48");
+        }
+        // 140ms 档（46ms/步）
+        for (t, want) in [
+            (0u32, 0u8),
+            (45, 0),
+            (46, 1),
+            (92, 2),
+            (138, 3),
+            (140, 3),
+        ] {
+            assert_eq!(fs_step_at(t, 140), want, "t={t} dur=140");
+        }
+    }
+}
+
+
 /// 【同码长词差异高亮 v2·逐行配对 2026-10-29】**完全同编码**、字数≥3
 /// 的候选，对每行找「最像的同码伙伴」：两两求公共前后缀 (p,s)，有效
 /// 对须 p+s≥2 且 p+s<min(两行长)（有锚也有差异）；选 **p 最大**、次选
@@ -2330,22 +2647,11 @@ pub struct CandidateWindowV2 {
     /// 连续被 DWM cloaked（显示中但不可见）的帧数；打包宿主里
     /// DComp 直通窗可能被整体隐身 → 达阈值切换 v1 传统混合窗
     pub(crate) cloaked_streak: u32,
-    /// 【每帧开销缓存】字体格式五件套按 (face,pt,label_pt,首选比例,其余
-    /// 比例) 复用——CreateTextFormat 含系统字体匹配（百 µs 级），打字
-    /// 每键一帧 ×N 个格式是渲染路径大头；皮肤/字号/比例不变时零创建。
-    pub(crate) tf_cache: Option<(
-        (String, f32, f32, f32, f32),
-        (
-            Option<IDWriteTextFormat>,
-            Option<IDWriteTextFormat>,
-            Option<IDWriteTextFormat>,
-            Option<IDWriteTextFormat>,
-            Option<IDWriteTextFormat>,
-        ),
-    )>,
-    /// 【每帧开销缓存】光学垂直补偿 (dy_其余, dy_首选) 按 (face,pt,k_first,
-    /// k_rest) 复用——probe 每帧两次 CreateTextLayout+GetOverhangMetrics 可省。
-    pub(crate) dy_cache: Option<((String, f32, f32, f32), (f32, f32))>,
+    /// 【每帧开销缓存 2026-11-04 改造】字体档缓存：基础键（字体/正文 pt/
+    /// 序号 pt）不变时按 k 档复用——稳态 2 档（rest/first）、字号补间期
+    /// 最多 3 档（含两个中间值）；换皮/字号变→整表重建。CreateTextFormat
+    /// 含系统字体匹配（百 µs 级），是打字渲染路径的大头。
+    pub(crate) tf_cache: Option<TfCache>,
     /// 【每帧开销缓存】阴影 command list+effect 按 (w,h,radius,oy,argb)
     /// 复用——宽度不变的连续帧（同长度候选）零重建；变宽时重建。
     pub(crate) shadow_cache: Option<(
@@ -2388,6 +2694,22 @@ pub struct CandidateWindowV2 {
     pub(crate) acrylic_last: std::cell::Cell<u64>,
     /// RGN 幂等键（尺寸+半径打包；MAX=未设）
     pub(crate) rgn_last: std::cell::Cell<u64>,
+    /// 【高亮字号补间 2026-11-04】当前页每行字号比例（渲染真值）：
+    /// 稳态=目标档（选中行 k_first / 其余 k_rest）；补间期=量化到步的值。
+    /// 长度=上一次渲染页的候选数（换页/数量变时由 show 重置）。
+    pub(crate) fs_cur: std::cell::RefCell<Vec<f32>>,
+    /// 补间状态（时间基准；tick 只在步界推进 → 每程 ≤3 次重排/重绘）
+    pub(crate) fs_anim: std::cell::Cell<Option<FsAnim>>,
+    /// 上一**用户**帧的（候选列表, 高亮下标）——±1/同页判定基准；与
+    /// hl_prev 独立（hl_ms=0 或 hilite_on=false 时字号补间仍要能起臂）。
+    pub(crate) fs_prev: std::cell::Cell<Option<(Vec<(String, String)>, usize)>>,
+    /// 本程已重排次数 / 累计（诊断与离屏取证：应 ≤ FS_STEPS）
+    pub(crate) fs_reflows: std::cell::Cell<u8>,
+    pub(crate) fs_total_reflows: u32,
+    /// 最近一次补间步渲染耗时 µs（诊断：单帧耗时）
+    pub(crate) fs_last_render_us: std::cell::Cell<u32>,
+    /// 最近一程补间时长 ms（诊断）
+    pub(crate) fs_anim_dur: std::cell::Cell<u32>,
     /// 【高亮滑动 2026-10-09】高亮胶囊位移动效：Some((起点矩形 LTRB,
     /// t0, 时长 ms))。渲染时胶囊从起点矩形 ease-out 插值到目标位，完成
     /// 即清。数字/；选重闪帧与 ↑↓ 移动共用（皮肤 layout.hl_ms 默认
@@ -3002,7 +3324,6 @@ impl CandidateWindowV2 {
                 size: (0, 0),
                 cloaked_streak: 0,
                 tf_cache: None,
-                dy_cache: None,
                 shadow_cache: None,
                 text_layout_cache: None,
                 text_measure_cache: None,
@@ -3017,6 +3338,13 @@ impl CandidateWindowV2 {
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
+                fs_cur: std::cell::RefCell::new(Vec::new()),
+                fs_anim: std::cell::Cell::new(None),
+                fs_prev: std::cell::Cell::new(None),
+                fs_reflows: std::cell::Cell::new(0),
+                fs_total_reflows: 0,
+                fs_last_render_us: std::cell::Cell::new(0),
+                fs_anim_dur: std::cell::Cell::new(0),
                 hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
@@ -3218,7 +3546,6 @@ impl CandidateWindowV2 {
                 size: (0, 0),
                 cloaked_streak: 0,
                 tf_cache: None,
-                dy_cache: None,
                 shadow_cache: None,
                 text_layout_cache: None,
                 text_measure_cache: None,
@@ -3233,6 +3560,13 @@ impl CandidateWindowV2 {
                 acrylic_last: std::cell::Cell::new(u64::MAX),
                 rgn_last: std::cell::Cell::new(u64::MAX),
                 hl_anim: std::cell::Cell::new(None),
+                fs_cur: std::cell::RefCell::new(Vec::new()),
+                fs_anim: std::cell::Cell::new(None),
+                fs_prev: std::cell::Cell::new(None),
+                fs_reflows: std::cell::Cell::new(0),
+                fs_total_reflows: 0,
+                fs_last_render_us: std::cell::Cell::new(0),
+                fs_anim_dur: std::cell::Cell::new(0),
                 hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
@@ -3952,6 +4286,9 @@ impl CandidateWindowV2 {
     ///（连带重渲染圆角位图），掐掉=删词后窗不缩（空白块）+旧位图拉
     /// 伸（直角）。位置无渲染耦合，瞬跳安全（「框不挪窝」的本意）。
     pub fn snap_anims(&mut self) {
+        // 【高亮字号补间 2026-11-04】右键调频帧等瞬跳场景：字号补间同样
+        // 定格到目标档（与位置瞬跳同语义）。
+        self.fs_snap();
         if let Some((_, (tx, ty), _, _, _)) = self.pos_anim {
             self.pos_anim = None;
             self.live_pos.set((tx, ty));
@@ -3968,6 +4305,46 @@ impl CandidateWindowV2 {
                 )
             };
         }
+    }
+
+    /// 【高亮字号补间 2026-11-04】定格：补间在身时直接落目标档并清臂
+    /// （收窗/失焦/右键瞬跳/提交路径——宁可定格也不在收窗前播半截）。
+    pub(crate) fn fs_snap(&mut self) {
+        if let Some(a) = self.fs_anim.take() {
+            *self.fs_cur.borrow_mut() = a.to;
+        }
+        // 收窗/瞬跳后跨会话不再拿旧页做 ±1 比对基准（下一用户帧重建）。
+        self.fs_prev.set(None);
+    }
+
+    /// 【高亮字号补间】诊断/离屏取证快照：(当前步, 本程重排次数, 本程
+    /// 时长 ms, 最近一帧耗时 µs)。无在身补间时返回上一程统计。
+    pub(crate) fn fs_stats(&self) -> (u8, u8, u32, u32) {
+        let a = self.fs_anim.take();
+        let out = match a.as_ref() {
+            Some(x) => (x.step, x.reflows, x.dur_ms, self.fs_last_render_us.get()),
+            None => (
+                FS_STEPS,
+                self.fs_reflows.get(),
+                self.fs_anim_dur.get(),
+                self.fs_last_render_us.get(),
+            ),
+        };
+        self.fs_anim.set(a);
+        out
+    }
+
+    /// 【高亮字号补间】当前逐行 k（诊断/取证断言用）。
+    pub(crate) fn fs_cur_values(&self) -> Vec<f32> {
+        self.fs_cur.borrow().clone()
+    }
+
+    /// 【高亮字号补间】是否有补间在身（离屏取证：跨位/翻页应为 false）。
+    pub(crate) fn fs_anim_in_flight(&self) -> bool {
+        let a = self.fs_anim.take();
+        let r = a.is_some();
+        self.fs_anim.set(a);
+        r
     }
 
     pub fn show(
@@ -4502,9 +4879,107 @@ impl CandidateWindowV2 {
         } else {
             0
         };
-        // 【逐候选字号 2026-10】放大行=big_i、其余缩小。用户拍板
-        // 回退 2026-10-29：放大跟随选中+换槽缓动实测卡顿，全撤。
-        let k_of = |i: usize| if i == big_i { k_first } else { k_rest };
+        // 【高亮字号补间 2026-11-04】「高亮放大/其余缩小」量化补间起臂。
+        // 语义与取舍见文件头 FS_* 注释：只对 ±1 连续移动补间（跨位/翻页/
+        // 提交/换页/反查/调频/SSF/动效关 → 定格），起点=当前已量化到步的
+        // 每行 k（可打断续跑），tick 只按步界推进（每程 ≤3 次重排）。
+        let fs_prev = self.fs_prev.take();
+        let fs_cur_in = self.fs_cur.borrow().clone();
+        let fs_target: Vec<f32> = (0..cands.len())
+            .map(|i| if i == big_i { k_first } else { k_rest })
+            .collect();
+        let fs_same_page = fs_prev
+            .as_ref()
+            .map(|(l, _)| l.as_slice() == cands)
+            .unwrap_or(false);
+        let fs_prev_sel = fs_prev.as_ref().map(|(_, s)| *s);
+        let fs_delta_big = fs_prev_sel
+            .map(|p| p.abs_diff(selected) > 1)
+            .unwrap_or(true);
+        let fs_mode = hl_on && (k_first - k_rest).abs() > 0.005;
+        let fs_now: Vec<f32>;
+        if self.internal_rerender {
+            // 动效 tick 复渲染：只按 tick 已推进的量化值渲染，绝不起臂，
+            // 也不覆盖用户帧比对基准（fs_prev 原样放回）。
+            self.fs_prev.set(fs_prev);
+            fs_now = if fs_cur_in.len() == cands.len() {
+                fs_cur_in.clone()
+            } else {
+                fs_target.clone()
+            };
+        } else {
+            let fs_in_flight = self.fs_anim.take();
+            self.fs_prev.set(Some((cands.to_vec(), selected)));
+            let plan = fs_plan(&FsCtx {
+                enabled: fs_mode,
+                internal: false,
+                // readback（离屏转储）模式窗口恒不显示：等同「已可见」，
+                // 否则离屏取证永远起不了臂（生产路径不受影响）。
+                was_visible: was_visible || self.readback,
+                same_page: fs_same_page,
+                prev_sel: fs_prev_sel,
+                selected,
+                cands_len: cands.len(),
+                anim_on: self.anim_on.get(),
+                sys_anim: system_anim_allowed(),
+                ssf: ssf.is_some(),
+                freq_modal: freq_view.is_some(),
+                hint_line: _raw_req.contains('〔'),
+                k_first,
+                k_rest,
+                anim_spd: self.anim_spd.get(),
+                cur: fs_cur_in.clone(),
+            });
+            if let Some(p) = plan {
+                fs_now = p.from.clone();
+                self.fs_anim.set(Some(FsAnim {
+                    t0: std::time::Instant::now(),
+                    from: p.from.clone(),
+                    to: p.to.clone(),
+                    dur_ms: p.dur_ms,
+                    step: 0,
+                    reflows: 0,
+                }));
+                self.fs_reflows.set(0);
+                self.fs_anim_dur.set(p.dur_ms);
+                anim_tick_arm(self.hwnd);
+                crate::tsf::trace(&format!(
+                    "fs-anim: 起臂 dur={}ms sel {fs_prev_sel:?}→{selected} 行数={}",
+                    p.dur_ms,
+                    cands.len()
+                ));
+            } else if !fs_delta_big
+                && fs_same_page
+                && fs_in_flight.is_some()
+                && fs_cur_in.len() == cands.len()
+            {
+                // 同页非移动刷新（普通逐键/闪帧尾段）：在身补间不打断，
+                // 沿用当前已量化步；tick 继续推进剩余步。
+                self.fs_anim.set(fs_in_flight);
+                fs_now = fs_cur_in.clone();
+            } else {
+                // snap：跨位/换页/翻页/提交或任一关门条件 → 直接落目标档
+                if fs_in_flight.is_some() {
+                    crate::tsf::trace("fs-anim: snap（跨位/换页/降级）→ 清臂定格");
+                }
+                self.fs_anim.set(None);
+                fs_now = fs_target.clone();
+            }
+        }
+        // 跨位（含 1→8）：胶囊不做长距离扫过，直接落位（补间模式专属；
+        // 非补间模式保持旧 hl_anim 语义不变）。
+        if fs_mode && fs_delta_big && !self.internal_rerender && self.hl_anim.take().is_some() {
+            crate::tsf::trace("fs-anim: 跨位 → 胶囊定格（不做长距离扫动）");
+        }
+        *self.fs_cur.borrow_mut() = fs_now.clone();
+        // 【逐候选字号 2026-10】渲染真值改为逐行 k（补间中为量化中间值）；
+        // 无补间时与旧两档逐像素等价（选中行 k_first / 其余 k_rest）。
+        let k_of = |i: usize| {
+            fs_now
+                .get(i)
+                .copied()
+                .unwrap_or(if i == big_i { k_first } else { k_rest })
+        };
         let radius = layout_f(skin, "corner_radius", 8.0);
         let margin_x = layout_f(skin, "margin_x", 8.0);
         let margin_y = layout_f(skin, "margin_y", 6.0);
@@ -4585,7 +5060,6 @@ impl CandidateWindowV2 {
         // 借用，不能就地读写缓存字段）——字体三件套 / 光学 dy / 阴影
         // cl+effect，键不变则零创建。
         let tf_cache_in = self.tf_cache.clone();
-        let dy_cache_in = self.dy_cache.clone();
         let shadow_cache_in = self.shadow_cache.clone();
         // 【2026-11-03 M4】静态内容缓存：块前取块后存（同一 show 作用域，
         // measure/draw 两个分支都能用；字体格式重建时清空防指针错配）。
@@ -4681,17 +5155,9 @@ impl CandidateWindowV2 {
         // 字体与内容测宽先行（宽度取决于最长候选）
         // 【逐候选字号 2026-10】缓存键含两个比例（漏字段=拖滑杆字形不刷新，
         // 与阴影缓存键漏 radius 的旧事故同源）。
-        let mut tf_cache_out: Option<(
-            (String, f32, f32, f32, f32),
-            (
-                Option<IDWriteTextFormat>, // 正文·其余候选
-                Option<IDWriteTextFormat>, // 正文·首选
-                Option<IDWriteTextFormat>, // 序号（不随比例缩放）
-                Option<IDWriteTextFormat>, // 注释·其余
-                Option<IDWriteTextFormat>, // 注释·首选
-            ),
-        )> = None;
-        let mut dy_cache_out: Option<((String, f32, f32, f32), (f32, f32))> = None;
+        // 【高亮字号补间 2026-11-04】字体档缓存：基础键不变时按 k 档复用；
+        // 补间期最多 3 档（rest + 两端行的两个中间值），稳态 2 档。
+        let tf_cache_out: Option<TfCache>;
         let mut shadow_cache_out: Option<(
             (u32, u32, u32, u32, (i32, i32), u32, u32),
             (ID2D1CommandList, ID2D1Effect),
@@ -4703,7 +5169,17 @@ impl CandidateWindowV2 {
         } else {
             Vec::new()
         };
-        let (tf, tf_first, tf_label, tf_small, tf_first_small, cand_ws, diff_ws, geo) = unsafe {
+        let (
+            tf,
+            _tf_first,
+            tf_label,
+            tf_small,
+            _tf_first_small,
+            fs_rows,
+            cand_ws,
+            diff_ws,
+            geo,
+        ) = unsafe {
             let dwrite = match &self.dwrite {
                 Some(d) => d.clone(),
                 None => return,
@@ -4765,107 +5241,125 @@ impl CandidateWindowV2 {
                 }
                 t
             };
-            let tf;
-            let tf_first;
-            let tf_small;
-            let tf_first_small;
-            let tf_label;
             // 标签序号字体（layout.label_font_point；0/缺省回退 0.78 倍正文）
             let label_pt = layout_f(skin, "label_font_point", 0.0);
-            let tf_key = (font_face.clone(), font_pt, label_pt, k_first, k_rest);
-            // 【字体切换取证 2026-10-08】trace 开启且键变化时记录：皮肤
-            // 送来的 font_face、tf 缓存命中——真实应用内分支视角（逐帧
-            // 渲染，只在变化时落一条防刷屏）。
+            // 【高亮字号补间 2026-11-04】字体档缓存改为「基础键 + 按 k 档」：
+            // 字体族/正文 pt/序号 pt 不变 → 各 k 档跨帧复用（稳态 2 档、
+            // 补间期最多 3 档；同一皮肤一程补间只会出现 6 个固定 k 值）。
+            let tf_base = (font_face.clone(), font_pt, label_pt);
+            let tf_base_hit = tf_cache_in
+                .as_ref()
+                .map(|c| c.base == tf_base)
+                .unwrap_or(false);
+            let mut tf_tiers: std::collections::HashMap<u32, FsTier> = if tf_base_hit {
+                tf_cache_in
+                    .as_ref()
+                    .map(|c| c.tiers.clone())
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+            let mut tf_label: Option<IDWriteTextFormat> = if tf_base_hit {
+                tf_cache_in.as_ref().and_then(|c| c.label.clone())
+            } else {
+                None
+            };
+            // 【字体切换取证 2026-10-08】基础键变化时落一条 trace：皮肤送来
+            // 的 font_face、字号、缓存命中——只在变化时记录防刷屏。
             {
-                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32, f32, f32)>> =
+                static LAST_FT: std::sync::Mutex<Option<(String, f32, f32)>> =
                     std::sync::Mutex::new(None);
                 let mut lt = LAST_FT.lock().unwrap_or_else(|p| p.into_inner());
-                if lt.as_ref() != Some(&tf_key) {
-                    *lt = Some(tf_key.clone());
+                if lt.as_ref() != Some(&tf_base) {
+                    *lt = Some(tf_base.clone());
                     if crate::tsf::trace_on() {
                         crate::tsf::trace(&format!(
-                            "cw2 font: face=「{font_face}」 pt={font_pt} k=({k_first},{k_rest}) cache_hit={}",
-                            tf_cache_in
-                                .as_ref()
-                                .map(|(k, _)| *k == tf_key)
-                                .unwrap_or(false),
+                            "cw2 font: face=「{font_face}」 pt={font_pt} label_pt={label_pt} k=({k_first},{k_rest}) base_hit={tf_base_hit}"
                         ));
                     }
                 }
             }
-            // 【逐候选字号 2026-10】正文/注释各两档：其余候选=em×k_rest，
-            // 首选=em×k_first；关闭时两档同值（下面直接复用，零多余创建）。
-            let em_rest = em * k_rest;
-            let em_first = em * k_first;
-            let tf_hit = tf_cache_in
-                .as_ref()
-                .map(|(k, _)| *k == tf_key)
-                .unwrap_or(false);
-            if tf_hit {
-                let (_, v) = tf_cache_in.as_ref().unwrap();
-                tf = v.0.clone();
-                tf_first = v.1.clone();
-                tf_label = v.2.clone();
-                tf_small = v.3.clone();
-                tf_first_small = v.4.clone();
-            } else {
-                // 【雅黑兜底取证 2026-10-09】mk_tf(族名)=None 意味着系统集
-                // 拿不到该族 → 渲染雅黑——用户看到的「跟雅黑一样」若走
-                // 此路，落痕为证。
-                let mk_probe = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
-                    let r = mk_tf(fam, em);
-                    if r.is_none() && crate::tsf::trace_on() {
-                        crate::tsf::trace(&format!(
-                            "cw2 mk_tf: 「{fam}」两集皆失败 → 雅黑兜底"
-                        ));
-                    }
-                    r
-                };
-                tf = mk_probe(&font_face, em_rest)
-                    .or_else(|| mk_tf("Microsoft YaHei UI", em_rest));
-                tf_small = mk_probe(&font_face, em_rest * 0.78)
-                    .or_else(|| mk_tf("Microsoft YaHei UI", em_rest * 0.78));
-                let same = (em_first - em_rest).abs() < 0.01;
-                if same {
-                    tf_first = tf.clone();
-                    tf_first_small = tf_small.clone();
-                } else {
-                    tf_first = mk_probe(&font_face, em_first)
-                        .or_else(|| mk_tf("Microsoft YaHei UI", em_first));
-                    tf_first_small = mk_probe(&font_face, em_first * 0.78)
-                        .or_else(|| mk_tf("Microsoft YaHei UI", em_first * 0.78));
+            // 【雅黑兜底取证 2026-10-09】mk_tf(族名)=None 意味着系统集拿
+            // 不到该族 → 渲染雅黑——用户看到的「跟雅黑一样」若走此路，落痕为证。
+            let mk_probe = |fam: &str, em: f32| -> Option<IDWriteTextFormat> {
+                let r = mk_tf(fam, em);
+                if r.is_none() && crate::tsf::trace_on() {
+                    crate::tsf::trace(&format!("cw2 mk_tf: 「{fam}」两集皆失败 → 雅黑兜底"));
                 }
+                r
+            };
+            // 本帧实际出现的 k 集合（去重）：稳态 2 档；补间中最多 3 档
+            //（rest + 旧放大行往小走 + 新放大行往大走），逐行 k=fs_now。
+            let mut need_k: Vec<f32> = Vec::with_capacity(4);
+            for i in 0..cands.len() {
+                let k = k_of(i);
+                if !need_k.iter().any(|x| (x - k).abs() < 0.0001) {
+                    need_k.push(k);
+                }
+            }
+            if need_k.is_empty() {
+                need_k.push(k_rest);
+            }
+            let mut created_any = false;
+            for k in &need_k {
+                let kb = fs_k_key(*k);
+                if tf_tiers.contains_key(&kb) {
+                    continue;
+                }
+                if tf_tiers.len() > 8 {
+                    // 防御上限：正常一皮恒 ≤6 档；异常膨胀整体重建。
+                    tf_tiers.clear();
+                }
+                let emk = em * *k;
+                let body =
+                    mk_probe(&font_face, emk).or_else(|| mk_tf("Microsoft YaHei UI", emk));
+                let small = mk_probe(&font_face, emk * 0.78)
+                    .or_else(|| mk_tf("Microsoft YaHei UI", emk * 0.78));
                 // 文本垂直居中（高亮胶囊上下留白对称的关键）
-                for t in [&tf, &tf_first, &tf_small, &tf_first_small] {
+                for t in [&body, &small] {
                     if let Some(t) = t {
                         let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                     }
                 }
+                tf_tiers.insert(kb, FsTier { body, small, dy: 0.0 });
+                created_any = true;
+            }
+            if tf_label.is_none() {
+                let rest_small = tf_tiers
+                    .get(&fs_k_key(k_rest))
+                    .and_then(|t| t.small.clone());
                 tf_label = if label_pt > 0.0 {
                     mk_tf(&font_face, label_pt * 96.0 / 72.0)
                         .or_else(|| mk_tf("Microsoft YaHei UI", label_pt * 96.0 / 72.0))
-                        .or(tf_small.clone())
+                        .or(rest_small)
                 } else {
-                    tf_small.clone()
+                    rest_small
                 };
                 if let Some(t) = &tf_label {
                     let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 }
-                tf_cache_out = Some((
-                    tf_key,
-                    (
-                        tf.clone(),
-                        tf_first.clone(),
-                        tf_label.clone(),
-                        tf_small.clone(),
-                        tf_first_small.clone(),
-                    ),
-                ));
+                created_any = true;
             }
+            // 兼容别名：rest/first 两档仍被 SSF 行槽、编码定宽、注释截断、
+            // 序号兜底等旧路径消费（JSON 逐行渲染已走 fs_rows）。
+            let rest_tier = tf_tiers.get(&fs_k_key(k_rest)).cloned().unwrap_or_default();
+            let first_tier = tf_tiers
+                .get(&fs_k_key(k_first))
+                .cloned()
+                .unwrap_or_else(|| rest_tier.clone());
+            let tf = rest_tier.body;
+            let tf_small = rest_tier.small;
+            let tf_first = first_tier.body;
+            let tf_first_small = first_tier.small;
+            tf_cache_out = Some(TfCache {
+                base: tf_base,
+                label: tf_label.clone(),
+                tiers: tf_tiers.clone(),
+            });
 
-            // 【2026-11-03 M4】字体格式重建 → 清静态布局/测量缓存
+            // 【2026-11-03 M4】字体格式有新建 → 清静态布局/测量缓存
             //（旧格式释放后指针可能被复用，防错配旧布局）。
-            if !tf_hit {
+            if created_any {
                 layout_cache.borrow_mut().clear();
                 measure_cache.borrow_mut().clear();
             }
@@ -4927,13 +5421,12 @@ impl CandidateWindowV2 {
             let mut cand_ws: Vec<(f32, f32, f32)> = Vec::new();
             let mut diff_ws: Vec<(f32, f32)> = Vec::new();
             for (i, (t, c)) in cands.iter().enumerate() {
-                // 【逐候选字号 2026-10】放大行(big_i)用大字号字面宽度，
-                // 其余小档；hl 模式下 big_i=当前高亮项（2026-11-03）。
+                // 【高亮字号补间 2026-11-04】逐行取本行 k 档（稳态=选中行
+                // 放大/其余缩小；补间中=量化中间档）——测宽与绘制同源。
                 let (tf_i, tfs_i): (&Option<IDWriteTextFormat>, &Option<IDWriteTextFormat>) =
-                    if i == big_i {
-                        (&tf_first, &tf_first_small)
-                    } else {
-                        (&tf, &tf_small)
+                    match tf_tiers.get(&fs_k_key(k_of(i))) {
+                        Some(tier) => (&tier.body, &tier.small),
+                        None => (&tf, &tf_small),
                     };
                 let tw = measure(tf_i, t.as_str());
                 let cw = if c.is_empty() {
@@ -4993,7 +5486,6 @@ impl CandidateWindowV2 {
                 };
             let dy;
             let dy_first;
-            let dy_key = (font_face.clone(), font_pt, k_first, k_rest);
             // 【SSF 虎娘行槽】源域行高测量：虎娘 row=ceil(max(字号,
             // "中Mg"行高))（layoutSkin L19-20）。此处用当前 tf（用户
             // 字号）测同一串的行高——线性除回源域（=源字号行高）。
@@ -5021,31 +5513,36 @@ impl CandidateWindowV2 {
                 };
                 (base, first)
             };
-            if let Some(((kf, k1, k2, _kl), v)) = &dy_cache_in {
-                if *kf == font_face
-                    && (*k1 - k_first).abs() < 0.001
-                    && (*k2 - k_rest).abs() < 0.001
-                {
-                    dy = v.0;
-                    dy_first = v.1;
-                } else {
-                    dy = probe_dy(&probe_slack, &tf);
-                    dy_first = if (k_first - k_rest).abs() < 0.001 {
-                        dy
-                    } else {
-                        probe_dy(&probe_slack, &tf_first)
-                    };
-                    dy_cache_out = Some((dy_key, (dy, dy_first)));
+            // 【高亮字号补间 2026-11-04】逐 k 光学补偿：同一 k 档只 probe
+            // 一次（本帧最多 3 档），结果回填字体档缓存供补间后续帧复用；
+            // rest/first 两值仍留给 SSF 等旧路径。
+            let mut dy_by_k: std::collections::HashMap<u32, f32> =
+                std::collections::HashMap::new();
+            for k in &need_k {
+                let kb = fs_k_key(*k);
+                let body = tf_tiers.get(&kb).and_then(|t| t.body.clone());
+                let d = probe_dy(&probe_slack, &body);
+                if let Some(t) = tf_tiers.get_mut(&kb) {
+                    t.dy = d;
                 }
-            } else {
-                dy = probe_dy(&probe_slack, &tf);
-                dy_first = if (k_first - k_rest).abs() < 0.001 {
-                    dy
-                } else {
-                    probe_dy(&probe_slack, &tf_first)
-                };
-                dy_cache_out = Some((dy_key, (dy, dy_first)));
+                dy_by_k.insert(kb, d);
             }
+            dy = *dy_by_k.get(&fs_k_key(k_rest)).unwrap_or(&0.0);
+            dy_first = *dy_by_k.get(&fs_k_key(k_first)).unwrap_or(&dy);
+            // 逐行渲染档（正文/注释/光学补偿）：补间中每行取自己的 k 档，
+            // 稳态与旧两档逐像素等价。
+            let fs_rows: Vec<(Option<IDWriteTextFormat>, Option<IDWriteTextFormat>, f32)> =
+                (0..cands.len())
+                    .map(|i| {
+                        let kb = fs_k_key(k_of(i));
+                        let tier = tf_tiers.get(&kb);
+                        (
+                            tier.and_then(|t| t.body.clone()),
+                            tier.and_then(|t| t.small.clone()),
+                            *dy_by_k.get(&kb).unwrap_or(&0.0),
+                        )
+                    })
+                    .collect();
             // 注意：编码行定宽策略——
             // 横排：编码与候选同行（左，2026-09-05），宽度参与定宽；
             // 【2026-09-06 竖排根修】竖排同样参与定宽：此前竖排恒 0 导致
@@ -5186,6 +5683,7 @@ impl CandidateWindowV2 {
                 tf_label,
                 tf_small,
                 tf_first_small,
+                fs_rows,
                 cand_ws,
                 diff_ws,
                 (
@@ -5204,7 +5702,7 @@ impl CandidateWindowV2 {
                 ),
             )
         };
-        let (v_width, text_x, cmt_x, _cmt_w, dy, dy_first, raw_w, row_user, row_user_first) =
+        let (v_width, text_x, cmt_x, _cmt_w, dy, _dy_first, raw_w, row_user, row_user_first) =
             geo.1;
         let cmt_disp = geo.0;
         // 【SSF 虎娘行槽/文字列锚 2026-10-16】皮肤模式行槽=源行高×scale
@@ -6465,15 +6963,15 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
-                            // 【逐候选字号】放大行(big_i)光学补偿走 dy_first
-                            let dy_i = if i == big_i { dy_first } else { dy };
+                            // 【高亮字号补间 2026-11-04】本行档位/光学补偿按
+                            // 逐行 k 取（补间中每行自己的量化档）。
+                            let dy_i = fs_rows.get(i).map(|r| r.2).unwrap_or(dy);
                             let (tf_i, tfs_i): (
                                 &Option<IDWriteTextFormat>,
                                 &Option<IDWriteTextFormat>,
-                            ) = if i == big_i {
-                                (&tf_first, &tf_first_small)
-                            } else {
-                                (&tf, &tf_small)
+                            ) = match fs_rows.get(i) {
+                                Some((b, s, _)) => (b, s),
+                                None => (&tf, &tf_small),
                             };
                             // 横排单行：整行行槽 = 全页最大行槽——下面所有
                             // row_h 引用自动指向它（文字/胶囊各自居中）。
@@ -6680,15 +7178,15 @@ impl CandidateWindowV2 {
                             let k_i = k_of(i);
                             let rh_i = row_hs.get(i).copied().unwrap_or(row_h);
                             let ph_i = em * k_i + hilite_pad * 2.0;
-                            // 【逐候选字号】放大行(big_i)光学补偿走 dy_first
-                            let dy_i = if i == big_i { dy_first } else { dy };
+                            // 【高亮字号补间 2026-11-04】本行档位/光学补偿按
+                            // 逐行 k 取（补间中每行自己的量化档）。
+                            let dy_i = fs_rows.get(i).map(|r| r.2).unwrap_or(dy);
                             let (tf_i, tfs_i): (
                                 &Option<IDWriteTextFormat>,
                                 &Option<IDWriteTextFormat>,
-                            ) = if i == big_i {
-                                (&tf_first, &tf_first_small)
-                            } else {
-                                (&tf, &tf_small)
+                            ) = match fs_rows.get(i) {
+                                Some((b, s, _)) => (b, s),
+                                None => (&tf, &tf_small),
                             };
                             let row_h = rh_i;
                             let y = y_run;
@@ -7875,9 +8373,6 @@ impl CandidateWindowV2 {
             if let Some(v) = tf_cache_out {
                 self.tf_cache = Some(v);
             }
-            if let Some(v) = dy_cache_out {
-                self.dy_cache = Some(v);
-            }
             if let Some(v) = shadow_cache_out {
                 self.shadow_cache = Some(v);
             }
@@ -8489,6 +8984,9 @@ impl CandidateWindowV2 {
     }
 
     pub fn hide_now(&mut self) {
+        // 【高亮字号补间 2026-11-04】收窗即定格：提交/失焦时补间若未完成，
+        // 直接落目标档并清臂（宁可定格，也不在收窗前播半截中间帧）。
+        self.fs_snap();
         // 组段结束：作废「正向打字」单调锁——置 MAX 使下一帧必判
         // 「非增长」→ 新组段首帧自由定位（修单键接单键锁死旧位置）。
         // 粘性位置**保留**：跨组段的位置记忆，新组段首帧锚点暂不可
@@ -9388,6 +9886,49 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     };
     let mut anim_done = true;
     if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+        // 【高亮字号补间步进 2026-11-04】时间基准按步界量化：只有跨过
+        // 1/3、2/3、3/3 才推进 fs_cur 并重排一次 → 每程 ≤3 次重排/重绘。
+        // 必须放在 size/hl 复渲染分支之前：本拍若有其它动效已在渲帧，
+        // 那一帧就会用上本拍新步值（不额外多渲一帧）。
+        let mut fs_step_due = false;
+        let mut rendered_this_tick = false;
+        if let Some(mut a) = c.fs_anim.take() {
+            let elapsed = a.t0.elapsed().as_millis() as u32;
+            let target_step = fs_step_at(elapsed, a.dur_ms);
+            if target_step > a.step {
+                a.step = target_step;
+                a.reflows = a.reflows.saturating_add(1);
+                let vals = fs_step_values(&a.from, &a.to, a.step, FS_STEPS);
+                *c.fs_cur.borrow_mut() = vals;
+                c.fs_reflows.set(a.reflows);
+                fs_step_due = true;
+                if a.step >= FS_STEPS {
+                    // 到点直接落 target 并清臂，不再多渲染一帧
+                    let total = c.fs_total_reflows.saturating_add(a.reflows as u32);
+                    c.fs_total_reflows = total;
+                    c.fs_anim_dur.set(a.dur_ms);
+                    crate::tsf::diag_note(&format!(
+                        "fs-anim: 完成 dur={}ms 步数={} 重排={} 末帧={}µs 累计重排={}",
+                        a.dur_ms,
+                        FS_STEPS,
+                        a.reflows,
+                        c.fs_last_render_us.get(),
+                        total
+                    ));
+                    crate::tsf::trace(&format!(
+                        "fs-anim: 完成 dur={}ms 步={} 重排={}",
+                        a.dur_ms, FS_STEPS, a.reflows
+                    ));
+                } else {
+                    c.fs_anim.set(Some(a));
+                    anim_done = false;
+                }
+            } else {
+                // 未到步界：保持时钟存活但不重排（绝不每帧重排）
+                c.fs_anim.set(Some(a));
+                anim_done = false;
+            }
+        }
         // 【拉伸动效步进】每 tick 以当前插值尺寸整帧重绘：外壳（背景/
         // 边框/阴影）画在插值尺寸上=边缘把边框阴影「拉过去」（延伸
         // 感），内容按目标布局裁在外壳内；完成帧解除覆盖按目标渲染。
@@ -9426,6 +9967,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
+                rendered_this_tick = true;
             }
         }
         // 【三十四修·chase 步进】指数逼近（τ=35ms）+限速（2.5px/ms）：
@@ -9580,7 +10122,21 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.internal_rerender = true;
                 let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
                 c.internal_rerender = false;
+                rendered_this_tick = true;
             }
+        }
+        // 【高亮字号补间帧 2026-11-04】本拍跨过量化步界、且 size/hl 分支
+        // 本拍未渲帧 → 这里补一帧（每拍最多一次 show，避免同拍重复整帧）。
+        // 帧耗时记入 fs_last_render_us 供离屏取证打印。
+        // readback（离屏转储）模式窗口恒不显示：is_visible=false 但渲染
+        // 回读照常需要推进，故这里放行 readback。
+        if fs_step_due && !rendered_this_tick && (c.is_visible() || c.readback) {
+            let t_frame = std::time::Instant::now();
+            c.internal_rerender = true;
+            let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            c.internal_rerender = false;
+            c.fs_last_render_us
+                .set(t_frame.elapsed().as_micros().min(u32::MAX as u128) as u32);
         }
         // 【按住Ctrl调频 2026-11·tick 保活与安全兜底】
         // ① 模态动效在途（淡变/对调滑动/删除塌缩/拾起脉冲）：帧率门控

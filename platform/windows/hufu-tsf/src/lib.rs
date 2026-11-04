@@ -797,6 +797,368 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
     mask as i32
 }
 
+/// 32bpp 自底向上 BMP 落盘（与 pad/skin dump 同一字节口径）。
+fn write_bmp32(path: &std::path::Path, wq: u32, hq: u32, px: &[u8]) -> std::io::Result<()> {
+    let mut bmp: Vec<u8> = Vec::with_capacity(54 + px.len());
+    let sz = 54 + px.len() as u32;
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&sz.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(wq as i32).to_le_bytes());
+    bmp.extend_from_slice(&(hq as i32).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&(px.len() as u32).to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    let stride = (wq as usize) * 4;
+    for y in (0..hq as usize).rev() {
+        bmp.extend_from_slice(&px[y * stride..(y + 1) * stride]);
+    }
+    std::fs::write(path, &bmp)
+}
+
+/// 补间取证帧快照：(宽, 高, 墨迹像素数, 墨迹包围盒, FNV 哈希)。
+struct FsFrameShot {
+    w: u32,
+    h: u32,
+    ink: u32,
+    bbox: (i32, i32, i32, i32),
+    hash: u64,
+}
+
+fn fs_shot_frame(shared: &crate::tsf::SharedRef, dir: &std::path::Path, name: &str) -> Option<FsFrameShot> {
+    let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let c = g.cand2.as_mut()?;
+    let px = c.last_pixels.take()?;
+    let (wq, hq) = c.last_size;
+    if wq == 0 || hq == 0 || px.len() < (wq as usize * hq as usize * 4) {
+        return None;
+    }
+    let mut ink = 0u32;
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, -1i32, -1i32);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let stride = wq as usize * 4;
+    for y in 0..hq as usize {
+        for x in 0..wq as usize {
+            let p = &px[y * stride + x * 4..y * stride + x * 4 + 4];
+            hash ^= (p[0] as u64) | ((p[1] as u64) << 8) | ((p[2] as u64) << 16) | ((p[3] as u64) << 24);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+            // 「墨迹」只认深色文字像素（白底皮肤；深 = 文字/胶囊轮廓），
+            // 不认满窗不透明背景——这样量出来的就是字形覆盖率。
+            let lum = p[0] as u32 + p[1] as u32 + p[2] as u32;
+            if p[3] > 32 && lum < 384 {
+                ink += 1;
+                x0 = x0.min(x as i32);
+                y0 = y0.min(y as i32);
+                x1 = x1.max(x as i32);
+                y1 = y1.max(y as i32);
+            }
+        }
+    }
+    let bbox = if ink == 0 { (0, 0, 0, 0) } else { (x0, y0, x1, y1) };
+    if write_bmp32(&dir.join(format!("hufu-fs-{name}.bmp")), wq, hq, &px).is_err() {
+        return None;
+    }
+    Some(FsFrameShot { w: wq, h: hq, ink, bbox, hash })
+}
+
+fn fs_probe(c: &crate::candwin2::CandidateWindowV2) -> (u8, u8, u32, u32, bool, Vec<f32>) {
+    let (step, reflows, dur, us) = c.fs_stats();
+    (step, reflows, dur, us, c.fs_anim_in_flight(), c.fs_cur_values())
+}
+
+/// 【高亮字号补间 2026-11-04】离屏取证钩子：合成候选 → sel 0 稳态 →
+/// sel 1 起臂跑补间（每步抓一帧 BMP）→ sel 4（跨位）验证定格。
+/// BMP 落 HUFU_FS_DIR（缺省 E:\DSH-KF\.audit-1103\build\fs-anim）；
+/// 每帧打印尺寸/墨迹包围盒/哈希/量化步/重排次数/末帧耗时。
+/// 返回位掩码：bit0=7 帧全落盘；bit1=补间重排 ≤3 且终态 step=3；
+/// bit2=跨位定格（无在身补间且前后两帧像素一致）；
+/// bit3=存在与起止都不同的中间帧（证明真的插值，不是瞬切）。
+#[no_mangle]
+extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
+    use crate::candwin2::CandidateWindowV2;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+
+    let pump = |ms: u64| {
+        let t = std::time::Instant::now();
+        while t.elapsed().as_millis() < ms as u128 {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    let mut skin = serde_json::json!({
+        "skin": {
+            "colors": {
+                // 白底深字：离屏像素的「深色墨迹量」直接对应字形覆盖率，
+                // 便于逐帧核对中间档字号（背景不参与计数）。
+                "back_color": "#FFFFFFFF", "border_color": "#00000060",
+                "preedit_back_color": "#000000D0",
+                "text_color": "#FF202020", "candidate_text_color": "#FF202020",
+                "comment_text_color": "#FF606060", "label_color": "#FF606060",
+                "hilited_candidate_back_color": "#CC0000FF",
+                "hilited_candidate_text_color": "#FFFFFFFF",
+                "hilited_candidate_label_color": "#FFFFFFFF"
+            },
+            "layout": {
+                "font_point": 17.6, "corner_radius": 8.0,
+                "hilited_corner_radius": 6.0, "border_width": 1.0,
+                "margin_x": 10.0, "margin_y": 8.0, "line_spacing": 6.0,
+                // 高亮跟随放大：选中行 1.35×、其余 0.8×
+                "hl_font_scale": true, "cand_first_scale": 1.35,
+                "cand_rest_scale": 0.8,
+                // 关掉胶囊滑动（hl_ms=0），隔离字号补间本身的帧数/耗时
+                "hl_ms": 0.0, "horizontal": false
+            },
+            "anim": true, "anim_speed": 1.0,
+            "material": { "kind": "solid", "hilite_on": true }
+        }
+    });
+    // 方向可切换：HUFU_FS_HORIZONTAL=1 → 横排（默认竖排）。两方向走同一
+    // 逐行 k 渲染路径，离屏帧可对照。
+    if std::env::var("HUFU_FS_HORIZONTAL").as_deref() == Ok("1") {
+        if let Some(l) = skin.pointer_mut("/skin/layout").and_then(|v| v.as_object_mut()) {
+            l.insert("horizontal".into(), serde_json::json!(true));
+        }
+    }
+    let cands = vec![
+        ("你好".to_string(), String::new()),
+        ("你".to_string(), String::new()),
+        ("你们好".to_string(), String::new()),
+        ("大家好呀".to_string(), String::new()),
+        ("好".to_string(), String::new()),
+    ];
+    let anchor = RECT {
+        left: 200,
+        top: 200,
+        right: 200,
+        bottom: 224,
+    };
+    let dir = std::env::var("HUFU_FS_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"E:\DSH-KF\.audit-1103\build\fs-anim"));
+    let _ = std::fs::create_dir_all(&dir);
+    let shared = match crate::tsf::G_SHARED.get() {
+        Some(g) => g.0.clone(),
+        None => {
+            // 独立进程（PowerShell 直载 DLL）没有 TSF 激活：走一次
+            // Activate(None)——其首行即登记 G_SHARED 锚（随后因无
+            // thread mgr 返回 Err，与本测试无关）。真实 TSF 进程不走这里。
+            use windows::Win32::UI::TextServices::ITfTextInputProcessor;
+            let service: windows::core::IUnknown = crate::tsf::HuFuTs::new().into();
+            if let Ok(itf) = service.cast::<ITfTextInputProcessor>() {
+                let _ = unsafe { itf.Activate(None, 0) };
+            }
+            match crate::tsf::G_SHARED.get() {
+                Some(g) => g.0.clone(),
+                None => {
+                    eprintln!("fs-frames: G_SHARED 初始化失败");
+                    return 0;
+                }
+            }
+        }
+    };
+    let saved = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2.take()
+    };
+    let Some(mut w) = CandidateWindowV2::new() else {
+        eprintln!("fs-frames: 候选窗初始化失败");
+        return 0;
+    };
+    let hwnd = w.hwnd;
+    w.readback = true;
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.cand2 = Some(w);
+        g.skin = skin.clone();
+        g.caret = Some(anchor);
+    }
+    // 起帧：sel=0 稳态。readback（离屏转储）模式窗口恒不显示，
+    // 等可见性没有意义——直接泵消息让布局/尺寸动效收敛。
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_show = Some((cands.clone(), String::new(), 0));
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&cands, "", &skin, Some(&anchor), 0);
+        }
+    }
+    let _ = hwnd;
+    pump(200);
+
+    let mut mask = 0i32;
+    let mut frames = 0;
+    let mut shots: Vec<(String, FsFrameShot)> = Vec::new();
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&cands, "", &skin, Some(&anchor), 0);
+        }
+    }
+    pump(40);
+    if let Some(s) = fs_shot_frame(&shared, &dir, "1-start") {
+        eprintln!(
+            "fs-frames: frame=1-start {}x{} ink={} bbox={:?} hash={:016x}",
+            s.w, s.h, s.ink, s.bbox, s.hash
+        );
+        frames += 1;
+        shots.push(("1-start".into(), s));
+    }
+    // 起臂：sel 0 → 1（±1）。show 本身渲染「起点态」帧。
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_show = Some((cands.clone(), String::new(), 1));
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&cands, "", &skin, Some(&anchor), 1);
+        }
+    }
+    let mut arm = (0u8, 0u8, 0u32, 0u32, false, Vec::new());
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            arm = fs_probe(c);
+        }
+    }
+    eprintln!(
+        "fs-frames: armed step={} reflows={} dur={}ms in_flight={} vis={} cur={:?}",
+        arm.0,
+        arm.1,
+        arm.2,
+        arm.4,
+        unsafe { IsWindowVisible(hwnd).as_bool() },
+        arm.5
+    );
+    if arm.4 {
+        mask |= 2; // 起臂成功（先置位，后面重排数校验仍可清）
+    }
+    let step_ms = step_ms.max(8).min(200);
+    for (i, name) in [(1u32, "3-step1"), (2u32, "4-step2"), (3u32, "5-final")] {
+        pump((step_ms + 6) as u64);
+        let mut st = (0u8, 0u8, 0u32, 0u32, false, Vec::new());
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = g.cand2.as_mut() {
+                st = fs_probe(c);
+            }
+        }
+        match fs_shot_frame(&shared, &dir, name) {
+            Some(s) => {
+                eprintln!(
+                    "fs-frames: frame={name} (expect step>={i}) {}x{} ink={} bbox={:?} hash={:016x} step={} reflows={} dur={}ms last={}µs in_flight={} cur={:?}",
+                    s.w, s.h, s.ink, s.bbox, s.hash, st.0, st.1, st.2, st.3, st.4, st.5
+                );
+                frames += 1;
+                shots.push((name.into(), s));
+            }
+            None => {
+                eprintln!(
+                    "fs-frames: frame={name} CAPTURE-FAIL（last_pixels 空：该拍未渲染）step={} reflows={} in_flight={} cur={:?}",
+                    st.0, st.1, st.4, st.5
+                );
+            }
+        }
+        if i == 3 && st.1 >= 1 && st.1 <= 3 && st.0 == 3 {
+            mask |= 2;
+        }
+    }
+    // 跨位：sel 1 → 4（|Δ|=3）→ 必须定格（无在身补间）
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_show = Some((cands.clone(), String::new(), 4));
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&cands, "", &skin, Some(&anchor), 4);
+        }
+    }
+    let mut snap_in_flight = true;
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            snap_in_flight = c.fs_anim_in_flight();
+        }
+    }
+    pump(50);
+    let mut snap_a = None;
+    let mut snap_b = None;
+    if let Some(s) = fs_shot_frame(&shared, &dir, "6-snap") {
+        eprintln!(
+            "fs-frames: frame=6-snap {}x{} ink={} bbox={:?} hash={:016x} in_flight={snap_in_flight}",
+            s.w, s.h, s.ink, s.bbox, s.hash
+        );
+        frames += 1;
+        snap_a = Some(s.hash);
+    }
+    // 跨位定格后 80ms 内不得冒出补间帧：泵消息后检查仍无在身补间，
+    // 且本程重排计数不再增长（>3 即说明 snap 后又起臂了=bug）。
+    pump(80);
+    let (step_after, reflows_after, _d, _us, inflight_after, cur_after) = {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match g.cand2.as_mut() {
+            Some(c) => fs_probe(c),
+            None => (0, 0, 0, 0, true, Vec::new()),
+        }
+    };
+    // readback 模式下稳态不重渲染；重推一次同目标帧再抓，作为「定格后」帧。
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.last_show = Some((cands.clone(), String::new(), 4));
+        if let Some(c) = g.cand2.as_mut() {
+            c.show(&cands, "", &skin, Some(&anchor), 4);
+        }
+    }
+    if let Some(s) = fs_shot_frame(&shared, &dir, "7-snap-after") {
+        eprintln!(
+            "fs-frames: frame=7-snap-after {}x{} ink={} bbox={:?} hash={:016x} step={step_after} reflows={reflows_after} in_flight_after_80ms={inflight_after} cur={cur_after:?}",
+            s.w, s.h, s.ink, s.bbox, s.hash
+        );
+        frames += 1;
+        snap_b = Some(s.hash);
+    }
+    if !snap_in_flight && !inflight_after && reflows_after <= 3 && snap_a.is_some() && snap_a == snap_b {
+        mask |= 4;
+    }
+    if frames >= 6 {
+        mask |= 1;
+    }
+    // 中间帧必须与起止都不同（真插值，不是瞬切/单帧跳）
+    if shots.len() >= 4 {
+        let start = shots[0].1.hash;
+        let final_ = shots[3].1.hash;
+        let inter = shots[1].1.hash != start && shots[1].1.hash != final_
+            || shots[2].1.hash != start && shots[2].1.hash != final_;
+        if inter {
+            mask |= 8;
+        }
+    }
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.cand2.as_mut() {
+            c.hide();
+        }
+        g.cand2 = saved;
+    }
+    eprintln!(
+        "fs-frames: dir={} mask={mask:04b}（bit0=帧齐 bit1=重排≤3 bit2=跨位定格 bit3=有中间帧）",
+        dir.display()
+    );
+    mask
+}
+
 /// 测试钩子：拉伸动效圆角取证（慢速 sim 200%+速度）。流程：窄窗稳态 →
 /// size_ms 拉到 700ms → 宽内容触发拉伸 → 中途（≈45%）与完成各抓一帧
 /// 屏幕像素，比对「角内 3px（圆角应为阴影/桌面）vs 面板内部 vs 边缘」：
