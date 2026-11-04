@@ -68,9 +68,14 @@ OpenCC 是开源的简繁转换项目；该 `opencc/` 目录是一套 OpenCC 数
 
 ## 模型（不随仓库分发）
 
-**获取**：GitHub Releases 的「**模型文件**」发布页 ——
-<https://github.com/LeafHW/hufu-ime-rust/releases/tag/模型>（Releases 列表第 2 页；资源名 `default.7z`，约 880MB；
-每个版本 release 正文的【下载说明】块也给出该链接）。
+**获取（首选）**：ModelScope 模型仓 ——
+<https://www.modelscope.cn/models/leafyin/hufu-ime>，直链
+<https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/模型.rar?view=false>
+（资源名 `模型.rar`，550,479,428 字节 ≈ 525 MB；sha256 `ca32f77affd4f2f1d6e00f7782eb5e16a6629c27c90aee23524b2cca96c7f1fa`；
+免登录、支持 Range 断点续传，2026-11-04 实测单连接 17–20 MB/s）。
+
+**备用**：GitHub Releases 的「模型文件」发布页 ——
+<https://github.com/LeafHW/hufu-ime-rust/releases/tag/模型>（资源名 `default.7z`，495.6 MB；国内直连较慢）。
 
 **Linux 放置**：解压后把「模型」文件夹整体放到 `~/.local/share/hufu/` 下（成为
 `~/.local/share/hufu/模型/`；目录已存在时把文件夹内的文件放进去）。

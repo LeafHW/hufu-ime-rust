@@ -144,7 +144,7 @@ if (-not $Release) {
         access_token     = $Token
         tag_name         = $Tag
         name             = "HuFu 虎符输入法 $Tag"
-        body             = "国内加速分发（镜像自 GitHub Releases）。安装包见下方附件。"
+        body             = "国内加速分发（镜像自 GitHub Releases）。安装包见下方附件。`n`n整句模型（约 525 MB，可选）在 ModelScope 单独下载（国内直连、免登录）：`nhttps://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false"
         target_commitish = 'master'
     }
     $Release = Invoke-RestMethod -Method Post -Uri "$Api/$Repo/releases" -Body $body -TimeoutSec 60

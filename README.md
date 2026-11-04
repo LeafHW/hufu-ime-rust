@@ -54,7 +54,7 @@
 3. 新开一个应用，按 `Win+空格` 切到「虎符」；`Ctrl+Alt+H` 打开设置。
 
 - **绿色版**：下载 `HuFu-v<version>-no-model.zip`（约 29 MB），解压后运行 `安装.bat`。
-- **整句模型**（约 500 MB）在[「模型文件」发布页](https://github.com/LeafHW/hufu-ime-rust/releases/tag/%E6%A8%A1%E5%9E%8B)单独下载；解压后把「模型」文件夹放到安装目录，约 2 秒自动装载，无需重启。
+- **整句模型**（约 525 MB）在 [ModelScope](https://www.modelscope.cn/models/leafyin/hufu-ime) 单独下载（国内直连、免登录；[GitHub 发布页](https://github.com/LeafHW/hufu-ime-rust/releases/tag/%E6%A8%A1%E5%9E%8B)保留为备用）；解压后把「模型」文件夹放到安装目录，约 2 秒自动装载，无需重启。
 
 ### Linux（fcitx5）
 
