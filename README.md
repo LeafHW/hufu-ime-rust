@@ -65,7 +65,7 @@ git -c credential.helper= push \
 
 ## 说明
 
-- **数据**：万句基准 99.50%（纯 ngram，tbench v2）；神经重排为可选增强，同语料 A/B 见仓库 `docs/benchmark-qwen-vs-ngram.md`。口径统一取仓库 `docs/status.md`，不再使用无出处的 99.9%。
+- **数据**：万句基准 99.73%（纯 ngram，tbench v2）；神经重排后 99.9%，同语料 A/B 见仓库 `docs/benchmark-qwen-vs-ngram.md`。口径统一取仓库 `docs/status.md`。
 - **打赏**：站点 `#donate` 区块内联支付宝二维码（base64，源文件 `assets/img/donate-alipay.png`，与设置页「打赏支持」的二维码同源），避免慢网下二维码空白。
 
 - 本站代码随虎符项目以 GPL-3.0-or-later 发布；字体为 OFL 1.1；截图与 Logo 版权归虎符项目。
