@@ -54,7 +54,6 @@ export function Overview({
   const dl = useUpdateDownload();
   const dlBusy = isDownloadActive(dl.state?.phase);
   const dlDone = dl.state?.phase === 'done';
-  const dlExpired = dl.state?.phase === 'expired';
   const dlErr = dl.state?.phase === 'error' || dl.state?.phase === 'cancelled';
   const dlTotal = dl.state?.total ?? 0;
   const dlPct =
@@ -424,9 +423,8 @@ export function Overview({
                           .filter(Boolean)
                           .join(' · '))}
                 {upd.kind === 'update' && dlDone && '已下载并校验通过 · 点击查看'}
-                {upd.kind === 'update' && dlExpired && '安装包已被删除或移动 · 点击重新下载'}
                 {upd.kind === 'update' && dlErr && '上次下载未完成 · 点击重试'}
-                {upd.kind === 'update' && !dlBusy && !dlDone && !dlExpired && !dlErr &&
+                {upd.kind === 'update' && !dlBusy && !dlDone && !dlErr &&
                   (upd.downloadUrl ? '点击下载安装包（自动校验）' : '点击打开下载页')}
                 {upd.kind === 'error' && `检查失败：${upd.msg}`}
               </span>

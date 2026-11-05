@@ -1775,9 +1775,6 @@ enum DlPhase {
     Done,
     Error,
     Cancelled,
-    /// 「下载完成」但安装包已被删除/移动/被改大小：不能继续显示就绪，
-    /// 也不能给「运行安装包」这种点了才报错的按钮。
-    Expired,
 }
 
 impl DlPhase {
@@ -1790,7 +1787,6 @@ impl DlPhase {
             DlPhase::Done => "done",
             DlPhase::Error => "error",
             DlPhase::Cancelled => "cancelled",
-            DlPhase::Expired => "expired",
         }
     }
     fn active(self) -> bool {
@@ -1843,12 +1839,13 @@ fn update_dl_artifact_ok(st: &UpdateDl) -> bool {
 
 /// 快照 → JSON（调用方持锁期间构造，避免二次加锁死锁）。
 fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
-    // 【2026-11-06 用户实测】下完没装、手动删掉安装包后，状态不能一直停在
-    // 「已就绪」：快照时校验落盘产物，不在了就如实报 expired（前端给
-    // 「重新下载」而不是「运行安装包」——后者点了才报错）。
+    // 【2026-11-06 用户实测】下完没装、手动删掉安装包后，就当没下过：
+    // 快照时校验落盘产物（存在 + 大小一致），不在了直接报 idle——前端
+    // 不渲染任何下载卡片，恢复成「发现新版本 + 下载安装包」。不能一直
+    // 挂一张「已就绪 / 已不在」的卡（用户原话：删掉了就没有这个东西）。
     let artifact_ok = st.phase != DlPhase::Done || update_dl_artifact_ok(st);
     let phase = if st.phase == DlPhase::Done && !artifact_ok {
-        DlPhase::Expired
+        DlPhase::Idle
     } else {
         st.phase
     };

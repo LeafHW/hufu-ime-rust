@@ -219,15 +219,12 @@ export function UpdateDownloadCard({
   const active = isDownloadActive(phase);
   const ok = phase === 'done';
   const bad = phase === 'error';
-  const expired = phase === 'expired';
 
   const title = ok
     ? `虎符 v${st.latest || ''} 安装包已就绪`
-    : expired
-      ? '下载的安装包已不在'
-      : bad || phase === 'cancelled'
-        ? '安装包下载'
-        : `正在下载虎符 v${st.latest || ''} 安装包`;
+    : bad || phase === 'cancelled'
+      ? '安装包下载'
+      : `正在下载虎符 v${st.latest || ''} 安装包`;
 
   const sub =
     phase === 'preparing'
@@ -240,15 +237,13 @@ export function UpdateDownloadCard({
             ? `${st.file || '安装包'} · ${fmtSize(got)}`
             : phase === 'cancelled'
               ? '已取消，可重新下载'
-              : phase === 'expired'
-                ? '安装包已被删除、移动或被替换，重新下载即可'
-                : st.error || '下载失败';
+              : st.error || '下载失败';
 
   return (
-    <div className={`card upd-card${ok ? ' ok' : ''}${bad ? ' bad' : ''}${expired ? ' expired' : ''}`}>
+    <div className={`card upd-card${ok ? ' ok' : ''}${bad ? ' bad' : ''}`}>
       <div className="upd-head">
         <span className={`upd-ico${ok ? ' ok' : ''}${bad ? ' err' : ''}`}>
-          <Icon name={ok ? 'check' : bad ? 'close' : expired ? 'refresh' : 'download'} />
+          <Icon name={ok ? 'check' : bad ? 'close' : 'download'} />
         </span>
         <div className="upd-titles">
           <b>{title}</b>
@@ -280,7 +275,7 @@ export function UpdateDownloadCard({
 
       {(st.dest || st.dir) && phase !== 'error' && phase !== 'cancelled' && (
         <div className="upd-path">
-          <span>{expired ? '原位置' : '保存到'}</span>
+          <span>保存到</span>
           <code title={st.dest || st.dir}>{st.dest || st.dir}</code>
         </div>
       )}
@@ -324,7 +319,7 @@ export function UpdateDownloadCard({
             <span className="upd-hint">运行后按安装向导完成后重启即可</span>
           </>
         )}
-        {(phase === 'error' || phase === 'cancelled' || expired) && (
+        {(phase === 'error' || phase === 'cancelled') && (
           <>
             <button type="button" className="btn primary" onClick={() => void api.start()}>
               重新下载
