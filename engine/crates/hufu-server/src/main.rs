@@ -1775,6 +1775,9 @@ enum DlPhase {
     Done,
     Error,
     Cancelled,
+    /// 「下载完成」但安装包已被删除/移动/被改大小：不能继续显示就绪，
+    /// 也不能给「运行安装包」这种点了才报错的按钮。
+    Expired,
 }
 
 impl DlPhase {
@@ -1787,6 +1790,7 @@ impl DlPhase {
             DlPhase::Done => "done",
             DlPhase::Error => "error",
             DlPhase::Cancelled => "cancelled",
+            DlPhase::Expired => "expired",
         }
     }
     fn active(self) -> bool {
@@ -1825,8 +1829,29 @@ fn update_dl_lock() -> std::sync::MutexGuard<'static, UpdateDl> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+/// 落盘产物是否还在（用户在资源管理器里删掉/移走/替换过）。
+/// 只认「文件存在且大小 == 下载时字节数」；stat 一次，成本可忽略。
+fn update_dl_artifact_ok(st: &UpdateDl) -> bool {
+    if st.dest.is_empty() || st.downloaded == 0 {
+        return false;
+    }
+    match std::fs::metadata(&st.dest) {
+        Ok(m) => m.is_file() && m.len() == st.downloaded,
+        Err(_) => false,
+    }
+}
+
 /// 快照 → JSON（调用方持锁期间构造，避免二次加锁死锁）。
 fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
+    // 【2026-11-06 用户实测】下完没装、手动删掉安装包后，状态不能一直停在
+    // 「已就绪」：快照时校验落盘产物，不在了就如实报 expired（前端给
+    // 「重新下载」而不是「运行安装包」——后者点了才报错）。
+    let artifact_ok = st.phase != DlPhase::Done || update_dl_artifact_ok(st);
+    let phase = if st.phase == DlPhase::Done && !artifact_ok {
+        DlPhase::Expired
+    } else {
+        st.phase
+    };
     let elapsed_ms = match (st.started, st.ended) {
         (Some(s), Some(e)) => e.saturating_duration_since(s).as_millis() as u64,
         (Some(s), None) => s.elapsed().as_millis() as u64,
@@ -1834,7 +1859,8 @@ fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
     };
     serde_json::json!({
         "ok": true,
-        "phase": st.phase.as_str(),
+        "phase": phase.as_str(),
+        "artifact_ok": artifact_ok,
         "latest": st.latest,
         "file": st.file,
         "dest": st.dest,
@@ -1845,7 +1871,7 @@ fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
         "error": st.error,
         "sha256_expect": st.sha_expect,
         "sha256_got": st.sha_got,
-        "active": st.phase.active(),
+        "active": phase.active(),
     })
 }
 

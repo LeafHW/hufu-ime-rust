@@ -3,7 +3,7 @@ import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
 import { fetchWithTimeout, syncNow } from '../api';
 import { fetchUpdateCheck, isDownloadActive, type UpdateState } from '../updateCheck';
-import { useUpdateDownload } from '../components/UpdateDownload';
+import { UpdateDownloadCard, useUpdateDownload } from '../components/UpdateDownload';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
@@ -54,6 +54,7 @@ export function Overview({
   const dl = useUpdateDownload();
   const dlBusy = isDownloadActive(dl.state?.phase);
   const dlDone = dl.state?.phase === 'done';
+  const dlExpired = dl.state?.phase === 'expired';
   const dlErr = dl.state?.phase === 'error' || dl.state?.phase === 'cancelled';
   const dlTotal = dl.state?.total ?? 0;
   const dlPct =
@@ -61,8 +62,10 @@ export function Overview({
       ? Math.min(100, Math.round(((dl.state?.downloaded ?? 0) / dlTotal) * 100))
       : null;
   const onCheckUpdateRow = async () => {
-    if (upd.kind === 'update' && (dlBusy || dlDone)) {
-      navigate('about');
+    /* 下载中/完成：卡片就在本页，滚过去而不是跳「关于」页（用户实测
+       概览点一下被弹走 = 像没反应）。 */
+    if (dlBusy || dlDone) {
+      document.querySelector('.upd-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
     if (upd.kind === 'checking') return;
@@ -314,6 +317,10 @@ export function Overview({
         </div>
       </div>
 
+      {/* 【2026-11-06 用户实测】概览也要有完整下载体验：与关于页共用同一张
+          进度卡片（状态来自 server，切换页面不丢），不再只有一条迷你条。 */}
+      <UpdateDownloadCard api={dl} pageUrl={upd.kind === 'update' ? upd.pageUrl : data.about.github} />
+
       <div className="overview-body">
         <div className="card overview-search">
           <div className="os-head">
@@ -406,8 +413,9 @@ export function Overview({
                 {upd.kind === 'latest' && `已是最新（v${upd.current}）`}
                 {upd.kind === 'update' && dlBusy && `下载中${dlPct != null ? ` ${dlPct}%` : ''} · 点击查看进度`}
                 {upd.kind === 'update' && dlDone && '已下载并校验通过 · 点击查看'}
+                {upd.kind === 'update' && dlExpired && '安装包已被删除或移动 · 点击重新下载'}
                 {upd.kind === 'update' && dlErr && '上次下载未完成 · 点击重试'}
-                {upd.kind === 'update' && !dlBusy && !dlDone && !dlErr &&
+                {upd.kind === 'update' && !dlBusy && !dlDone && !dlExpired && !dlErr &&
                   (upd.downloadUrl ? '点击下载安装包（自动校验）' : '点击打开下载页')}
                 {upd.kind === 'error' && `检查失败：${upd.msg}`}
               </span>

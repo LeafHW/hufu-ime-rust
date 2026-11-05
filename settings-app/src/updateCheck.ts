@@ -36,7 +36,9 @@ export type DownloadPhase =
   | 'verifying'
   | 'done'
   | 'error'
-  | 'cancelled';
+  | 'cancelled'
+  /** 「下载完成」但落盘文件已被删除/移动/替换（server 快照时实查） */
+  | 'expired';
 
 export interface DownloadState {
   ok?: boolean;
@@ -57,6 +59,8 @@ export interface DownloadState {
   sha256_expect?: string;
   sha256_got?: string;
   active?: boolean;
+  /** done 态时落盘产物是否还在（false 时 phase 会报 expired） */
+  artifact_ok?: boolean;
 }
 
 export const isDownloadActive = (p?: DownloadPhase): boolean =>

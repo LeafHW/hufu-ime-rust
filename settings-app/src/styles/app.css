@@ -1145,6 +1145,7 @@ html.theme-vt .brand img{animation:themeLogoPulse .56s cubic-bezier(.2,.8,.2,1)}
 .upd-card.ok{border-color:rgba(99,192,141,.28)}
 .upd-card.ok .upd-bar i{background:linear-gradient(90deg,#3f9e6b,var(--green))}
 .upd-card.bad{border-color:rgba(224,106,90,.26)}
+.upd-card.expired{border-color:rgba(231,183,92,.30)}
 .upd-head{display:flex;align-items:center;gap:11px}
 .upd-ico{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
   background:var(--gold-soft);border:1px solid rgba(231,183,92,.24);color:var(--gold2)}

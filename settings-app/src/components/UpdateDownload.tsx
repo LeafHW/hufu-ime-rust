@@ -68,9 +68,11 @@ export function useUpdateDownload(): UpdateDownloadApi {
         });
     };
     window.addEventListener('hashchange', refresh);
+    window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', refresh);
     return () => {
       window.removeEventListener('hashchange', refresh);
+      window.removeEventListener('focus', refresh);
       document.removeEventListener('visibilitychange', refresh);
     };
   }, []);
@@ -159,6 +161,12 @@ export function useUpdateDownload(): UpdateDownloadApi {
       await openDownloaded(target);
     } catch (e) {
       setOpenError((e as Error).message);
+      /* 文件被删/移走后按钮才会报错：立刻重拉状态，让卡片翻成「已不在」 */
+      fetchDownloadState()
+        .then(setState)
+        .catch(() => {
+          /* 忽略：提示已经给出 */
+        });
     }
   }, []);
 
@@ -211,11 +219,13 @@ export function UpdateDownloadCard({
   const active = isDownloadActive(phase);
   const ok = phase === 'done';
   const bad = phase === 'error';
+  const expired = phase === 'expired';
 
-  const title =
-    phase === 'done'
-      ? `虎符 v${st.latest || ''} 安装包已就绪`
-      : phase === 'error' || phase === 'cancelled'
+  const title = ok
+    ? `虎符 v${st.latest || ''} 安装包已就绪`
+    : expired
+      ? '下载的安装包已不在'
+      : bad || phase === 'cancelled'
         ? '安装包下载'
         : `正在下载虎符 v${st.latest || ''} 安装包`;
 
@@ -230,13 +240,15 @@ export function UpdateDownloadCard({
             ? `${st.file || '安装包'} · ${fmtSize(got)}`
             : phase === 'cancelled'
               ? '已取消，可重新下载'
-              : st.error || '下载失败';
+              : phase === 'expired'
+                ? '安装包已被删除、移动或被替换，重新下载即可'
+                : st.error || '下载失败';
 
   return (
-    <div className={`card upd-card${ok ? ' ok' : ''}${bad ? ' bad' : ''}`}>
+    <div className={`card upd-card${ok ? ' ok' : ''}${bad ? ' bad' : ''}${expired ? ' expired' : ''}`}>
       <div className="upd-head">
         <span className={`upd-ico${ok ? ' ok' : ''}${bad ? ' err' : ''}`}>
-          <Icon name={ok ? 'check' : bad ? 'close' : 'download'} />
+          <Icon name={ok ? 'check' : bad ? 'close' : expired ? 'refresh' : 'download'} />
         </span>
         <div className="upd-titles">
           <b>{title}</b>
@@ -268,7 +280,7 @@ export function UpdateDownloadCard({
 
       {(st.dest || st.dir) && phase !== 'error' && phase !== 'cancelled' && (
         <div className="upd-path">
-          <span>保存到</span>
+          <span>{expired ? '原位置' : '保存到'}</span>
           <code title={st.dest || st.dir}>{st.dest || st.dir}</code>
         </div>
       )}
@@ -312,7 +324,7 @@ export function UpdateDownloadCard({
             <span className="upd-hint">运行后按安装向导完成后重启即可</span>
           </>
         )}
-        {(phase === 'error' || phase === 'cancelled') && (
+        {(phase === 'error' || phase === 'cancelled' || expired) && (
           <>
             <button type="button" className="btn primary" onClick={() => void api.start()}>
               重新下载
