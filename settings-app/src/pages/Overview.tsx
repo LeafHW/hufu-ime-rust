@@ -3,7 +3,7 @@ import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
 import { fetchWithTimeout, syncNow } from '../api';
 import { fetchUpdateCheck, isDownloadActive, type UpdateState } from '../updateCheck';
-import { UpdateDownloadCard, useUpdateDownload } from '../components/UpdateDownload';
+import { useUpdateDownload } from '../components/UpdateDownload';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
@@ -62,20 +62,25 @@ export function Overview({
       ? Math.min(100, Math.round(((dl.state?.downloaded ?? 0) / dlTotal) * 100))
       : null;
   const onCheckUpdateRow = async () => {
-    /* 下载中/完成：卡片就在本页，滚过去而不是跳「关于」页（用户实测
-       概览点一下被弹走 = 像没反应）。 */
-    if (dlBusy || dlDone) {
-      document.querySelector('.upd-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      return;
-    }
     if (upd.kind === 'checking') return;
-    if (upd.kind === 'update') {
-      await dl.start();
+    if (upd.kind !== 'update') {
+      setUpd({ kind: 'checking' });
+      setUpd(await fetchUpdateCheck(data.about.github));
       return;
     }
-    setUpd({ kind: 'checking' });
-    setUpd(await fetchUpdateCheck(data.about.github));
+    /* 下载中/完成：进度就在这一行里，点行进「关于」看详情与操作按钮；
+       首次/失败/安装包被删：直接开下（和行内文案一致）。 */
+    if (dlBusy || dlDone) {
+      navigate('about');
+      return;
+    }
+    await dl.start();
   };
+  /* 行内进度文案用的单位：这里不引组件，两个小函数就地写。 */
+  const fmtSpeed = (bps: number): string =>
+    bps > 0 ? `${(bps / 1024 / 1024).toFixed(1)} MB/s` : '';
+  const fmtEta = (sec: number): string =>
+    sec >= 60 ? `${Math.floor(sec / 60)} 分 ${Math.round(sec % 60)} 秒` : `${Math.max(1, Math.round(sec))} 秒`;
   const [query, setQuery] = useState(() => {
     try {
       return new URLSearchParams(location.search).get('q') || '';
@@ -317,10 +322,6 @@ export function Overview({
         </div>
       </div>
 
-      {/* 【2026-11-06 用户实测】概览也要有完整下载体验：与关于页共用同一张
-          进度卡片（状态来自 server，切换页面不丢），不再只有一条迷你条。 */}
-      <UpdateDownloadCard api={dl} pageUrl={upd.kind === 'update' ? upd.pageUrl : data.about.github} />
-
       <div className="overview-body">
         <div className="card overview-search">
           <div className="os-head">
@@ -411,7 +412,17 @@ export function Overview({
                 {upd.kind === 'idle' && `当前 v${data.about.version} · 点击检查`}
                 {upd.kind === 'checking' && '检查中…'}
                 {upd.kind === 'latest' && `已是最新（v${upd.current}）`}
-                {upd.kind === 'update' && dlBusy && `下载中${dlPct != null ? ` ${dlPct}%` : ''} · 点击查看进度`}
+                {upd.kind === 'update' && dlBusy &&
+                  (dl.state?.phase === 'preparing'
+                    ? '正在获取更新信息…'
+                    : dl.state?.phase === 'verifying'
+                      ? '正在校验 sha256…'
+                      : [`下载中${dlPct != null ? ` ${dlPct}%` : ''}`,
+                          fmtSpeed(dl.speed),
+                          dl.etaSec != null ? `剩余 ${fmtEta(dl.etaSec)}` : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' · '))}
                 {upd.kind === 'update' && dlDone && '已下载并校验通过 · 点击查看'}
                 {upd.kind === 'update' && dlExpired && '安装包已被删除或移动 · 点击重新下载'}
                 {upd.kind === 'update' && dlErr && '上次下载未完成 · 点击重试'}
@@ -420,7 +431,9 @@ export function Overview({
                 {upd.kind === 'error' && `检查失败：${upd.msg}`}
               </span>
               {upd.kind === 'update' && (dlBusy || dlDone) && (
-                <div className={`act-bar${dlBusy && dlPct == null ? ' indet' : ''}`}>
+                <div
+                  className={`act-bar${dlBusy && dlPct == null ? ' indet' : ''}${dlDone ? ' ok' : ''}`}
+                >
                   <i
                     style={
                       dlDone ? { width: '100%' } : dlPct == null ? undefined : { width: `${dlPct}%` }
@@ -429,7 +442,11 @@ export function Overview({
                 </div>
               )}
             </div>
-            <Icon name={upd.kind === 'update' ? 'arrow' : 'chev'} className="icon sm chev" />
+            {upd.kind === 'update' && dlBusy && dlPct != null ? (
+              <span className="act-pct">{dlPct}%</span>
+            ) : (
+              <Icon name={upd.kind === 'update' ? 'arrow' : 'chev'} className="icon sm chev" />
+            )}
           </div>
           <div className="side-tip">
             <b>小提示</b>
