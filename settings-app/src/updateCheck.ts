@@ -23,38 +23,99 @@ export async function fetchUpdateCheck(fallbackPageUrl: string): Promise<UpdateS
   }
 }
 
-/* 【审计 P2-D 2026-11-05】校验式下载：server 中转拉取 + sha256 比对通过
-   才落「下载」文件夹。此前 window.open 直接下载即提示运行——清单
-   sha256 有传无验，更新源失陷 = 供应链直通。端点不可用（老 server）时
-   回退 window.open 浏览器直下（保可用性）。 */
-export async function verifiedDownloadUpdate(
-  fallbackUrl: string,
-  onProgress: (msg: string) => void,
-): Promise<void> {
-  onProgress('正在下载并校验安装包（校验通过才会保存）…');
+/* ── 【更新下载 2026-11-06】后台任务 + 轮询快照 ────────────────────────
+   旧端点 /api/update/download 是一次阻塞请求：前端最长等 10 分钟，中间
+   只能显示一句静态文案（用户实测 v1.9.9.3：没有进度、不知道存到哪）。
+   现由 server 后台线程下载，前端 400ms 拉 /api/update/download/status：
+   百分比、已下/总量、速度、落点、完成后的运行/定位都来自真实状态。 */
+
+export type DownloadPhase =
+  | 'idle'
+  | 'preparing'
+  | 'downloading'
+  | 'verifying'
+  | 'done'
+  | 'error'
+  | 'cancelled';
+
+export interface DownloadState {
+  ok?: boolean;
+  phase: DownloadPhase;
+  /** 清单里的目标版本号（如 1.9.9.4） */
+  latest?: string;
+  /** 安装包文件名 */
+  file?: string;
+  /** 安装包完整落盘路径 */
+  dest?: string;
+  /** 下载目录（启动即有，用于「下到哪」） */
+  dir?: string;
+  /** 总字节数；0=服务器未给 Content-Length 也不在清单里（进度不确定） */
+  total?: number;
+  downloaded?: number;
+  elapsed_ms?: number;
+  error?: string;
+  sha256_expect?: string;
+  sha256_got?: string;
+  active?: boolean;
+}
+
+export const isDownloadActive = (p?: DownloadPhase): boolean =>
+  p === 'preparing' || p === 'downloading' || p === 'verifying';
+
+/** 启动下载。409（已有任务）不抛错：返回 started=false + 当前快照，前端
+ *  直接接力轮询，避免「重复点击 → 一条死文案」的旧体验。 */
+export async function startUpdateDownload(): Promise<{
+  started: boolean;
+  state: DownloadState;
+}> {
+  const r = await fetchWithTimeout(
+    '/api/update/download/start',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    20000,
+  );
+  let v: DownloadState & { error?: string } = { phase: 'idle' };
   try {
-    const r = await fetchWithTimeout(
-      '/api/update/download',
-      { cache: 'no-store' },
-      10 * 60 * 1000,
-    );
-    const v = await r.json();
-    if (v && v.ok) {
-      onProgress(`已校验并保存到「下载」文件夹：${v.path}`);
-      return;
-    }
-    /* 【F4 复审修复 2026-11-05】server 明确拒绝（409 单飞中/清单无哈希/
-       校验不符等）不再回退 window.open——否则每次拒绝都转浏览器无校验
-       直下，击穿校验闸且重复点击会产生双份下载。只有 404（老 server
-       无此端点）才回退保可用。 */
-    if (r.status === 404) {
-      onProgress('当前版本不支持校验式下载，改用浏览器直接下载');
-    } else {
-      onProgress(`校验式下载未完成：${v?.error || r.status}（不会重复下载，请稍候重试）`);
-      return;
-    }
+    v = (await r.json()) as DownloadState;
   } catch {
-    onProgress('校验式下载不可用，改用浏览器直接下载');
+    /* 非 JSON（老 server 404 页等）：按失败处理 */
   }
-  window.open(fallbackUrl, '_blank', 'noopener');
+  if (r.status === 404) {
+    throw new Error('当前 server 不支持后台下载（请先更新虎符）');
+  }
+  if (!r.ok && r.status !== 409) {
+    throw new Error(v.error || `启动下载失败（${r.status}）`);
+  }
+  return { started: r.ok, state: v };
+}
+
+export async function fetchDownloadState(): Promise<DownloadState> {
+  return await getJson<DownloadState>('/api/update/download/status');
+}
+
+export async function cancelUpdateDownload(): Promise<void> {
+  await fetchWithTimeout('/api/update/download/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+}
+
+/** 打开刚下载的安装包（installer）或在资源管理器定位（folder）。
+ *  路径由 server 自己的下载状态决定，前端不传路径。 */
+export async function openDownloaded(target: 'installer' | 'folder'): Promise<void> {
+  const r = await fetchWithTimeout(
+    '/api/update/open',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target }) },
+    30000,
+  );
+  if (!r.ok) {
+    let msg = `打开失败（${r.status}）`;
+    try {
+      const b = (await r.json()) as { error?: string };
+      if (b?.error) msg = b.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
 }

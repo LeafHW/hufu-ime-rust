@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Route } from '../types';
 import { fallbackSkin } from '../types';
 import { fetchWithTimeout, syncNow } from '../api';
-import { fetchUpdateCheck, verifiedDownloadUpdate, type UpdateState } from '../updateCheck';
+import { fetchUpdateCheck, isDownloadActive, type UpdateState } from '../updateCheck';
+import { useUpdateDownload } from '../components/UpdateDownload';
 import { useDirtyPages } from '../dirtyGuard';
 import { Icon } from '../components/Icon';
 import { Badge, PageHead } from '../components/ui';
@@ -47,14 +48,26 @@ export function Overview({
 }) {
   const [syncing, setSyncing] = useState(false);
   /* 【检查更新 2026-11-01】概览行与关于页同款：真实调 /api/update/check；
-     有更新时该行变「直接下载」，无 exe 资产回退下载页。 */
+     有更新时点击启动后台下载，行内显示迷你进度条；下载中/完成时点击
+     跳「关于」页看完整进度与「运行安装包 / 打开文件夹」。 */
   const [upd, setUpd] = useState<UpdateState>({ kind: 'idle' });
+  const dl = useUpdateDownload();
+  const dlBusy = isDownloadActive(dl.state?.phase);
+  const dlDone = dl.state?.phase === 'done';
+  const dlErr = dl.state?.phase === 'error' || dl.state?.phase === 'cancelled';
+  const dlTotal = dl.state?.total ?? 0;
+  const dlPct =
+    dlTotal > 0
+      ? Math.min(100, Math.round(((dl.state?.downloaded ?? 0) / dlTotal) * 100))
+      : null;
   const onCheckUpdateRow = async () => {
+    if (upd.kind === 'update' && (dlBusy || dlDone)) {
+      navigate('about');
+      return;
+    }
     if (upd.kind === 'checking') return;
     if (upd.kind === 'update') {
-      /* 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256 比对，
-         通过才落「下载」文件夹；端点不可用回退浏览器直开。 */
-      await verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, notify);
+      await dl.start();
       return;
     }
     setUpd({ kind: 'checking' });
@@ -384,16 +397,29 @@ export function Overview({
             className={`act-row${upd.kind === 'update' ? ' has-update' : ''}`}
             onClick={() => void onCheckUpdateRow()}
           >
-            <div className="act-ico"><Icon name="refresh" /></div>
+            <div className="act-ico"><Icon name={dlDone ? 'check' : 'refresh'} /></div>
             <div className="act-main">
               <b>{upd.kind === 'update' ? `发现新版本 v${upd.latest}` : '检查更新'}</b>
               <span>
                 {upd.kind === 'idle' && `当前 v${data.about.version} · 点击检查`}
                 {upd.kind === 'checking' && '检查中…'}
                 {upd.kind === 'latest' && `已是最新（v${upd.current}）`}
-                {upd.kind === 'update' && (upd.downloadUrl ? '点击直接下载安装包' : '点击打开下载页')}
+                {upd.kind === 'update' && dlBusy && `下载中${dlPct != null ? ` ${dlPct}%` : ''} · 点击查看进度`}
+                {upd.kind === 'update' && dlDone && '已下载并校验通过 · 点击查看'}
+                {upd.kind === 'update' && dlErr && '上次下载未完成 · 点击重试'}
+                {upd.kind === 'update' && !dlBusy && !dlDone && !dlErr &&
+                  (upd.downloadUrl ? '点击下载安装包（自动校验）' : '点击打开下载页')}
                 {upd.kind === 'error' && `检查失败：${upd.msg}`}
               </span>
+              {upd.kind === 'update' && (dlBusy || dlDone) && (
+                <div className={`act-bar${dlBusy && dlPct == null ? ' indet' : ''}`}>
+                  <i
+                    style={
+                      dlDone ? { width: '100%' } : dlPct == null ? undefined : { width: `${dlPct}%` }
+                    }
+                  />
+                </div>
+              )}
             </div>
             <Icon name={upd.kind === 'update' ? 'arrow' : 'chev'} className="icon sm chev" />
           </div>

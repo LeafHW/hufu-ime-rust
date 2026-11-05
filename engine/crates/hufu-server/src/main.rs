@@ -1752,37 +1752,223 @@ fn update_check_inner() -> Response {
     }
 }
 
-/// 【审计 P2-D 2026-11-05】校验式下载安装包（锁前分发，不持 Host 锁）。
-/// 此前前端 `window.open(download_url)` 直接下载即提示运行——清单里的
-/// sha256 有传无验。现由 server 中转：拉清单 → 下载 → sha256 比对 →
-/// 通过才落「下载」文件夹。浏览器 fetch 直连更新源会被 CORS 拦（Gitee
-/// 附件无 ACAO 头），故必须 server 代下。
-/// 【F7 复审校准 2026-11-05】威胁模型边界：sha256 与下载 URL 同出一份
-/// 清单，本端点防的是「清单可信而镜像/传输损坏」（静默换包/截断/错包），
-/// **不防清单本身失陷**（失陷者可给恶意 exe 配套正确哈希）——后者需
-/// 双清单交叉核对（如 GitHub+Gitee 各自的 update.json 比对），暂不做。
-/// 单飞闸：同一时刻只允许一个下载任务（每连接一线程，重复点击 409）。
-fn update_download_inner() -> Response {
-    use sha2::{Digest, Sha256};
-    static DOWNLOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DOWNLOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Response::err(409, "已有下载任务进行中，请稍候");
-    }
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            DOWNLOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+// ── 【更新下载 2026-11-06】进度可见 / 可取消 / 完成后打开 ────────────────
+// 用户反馈（v1.9.9.3 实测）：点「下载安装包」后界面只有一句静态「下载中…」，
+// 没有百分比、不知道存到哪、下完也只回一行文字，既不打开安装包也不开目录。
+// 根因：旧实现是一个最长 10 分钟的阻塞 GET（/api/update/download），前端在
+// 响应回来之前拿不到任何中间状态。现改为「后台任务 + 轮询快照」：
+//   POST /api/update/download/start   启动（单飞；已有任务 409 并带当前快照）
+//   GET  /api/update/download/status  快照（阶段/已下/总量/落点/耗时/错误）
+//   POST /api/update/download/cancel  取消（流式读每 64KB 检查一次）
+//   POST /api/update/open             运行安装包 / 在资源管理器定位
+// 校验闸不变：sha256 必须存在且比对通过才落盘；边下边写 .part + 增量哈希，
+// 通过后 rename 成正式文件名（写盘失败/中断/校验不符都删 .part）。
+// 状态放进程级静态：设置页关掉重开、切到别的页再回来都能接着看进度。
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum DlPhase {
+    #[default]
+    Idle,
+    Preparing,
+    Downloading,
+    Verifying,
+    Done,
+    Error,
+    Cancelled,
+}
+
+impl DlPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            DlPhase::Idle => "idle",
+            DlPhase::Preparing => "preparing",
+            DlPhase::Downloading => "downloading",
+            DlPhase::Verifying => "verifying",
+            DlPhase::Done => "done",
+            DlPhase::Error => "error",
+            DlPhase::Cancelled => "cancelled",
         }
     }
-    let _g = Guard;
+    fn active(self) -> bool {
+        matches!(
+            self,
+            DlPhase::Preparing | DlPhase::Downloading | DlPhase::Verifying
+        )
+    }
+}
 
-    let fail = |status: u16, msg: String| -> Response {
-        Response::err(status, &msg)
+#[derive(Default)]
+struct UpdateDl {
+    phase: DlPhase,
+    latest: String,
+    file: String,
+    dest: String,
+    dir: String,
+    total: u64,
+    downloaded: u64,
+    started: Option<std::time::Instant>,
+    ended: Option<std::time::Instant>,
+    error: String,
+    sha_expect: String,
+    sha_got: String,
+}
+
+static UPDATE_DL: std::sync::OnceLock<std::sync::Mutex<UpdateDl>> = std::sync::OnceLock::new();
+static UPDATE_DL_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static UPDATE_DL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn update_dl_lock() -> std::sync::MutexGuard<'static, UpdateDl> {
+    UPDATE_DL
+        .get_or_init(|| std::sync::Mutex::new(UpdateDl::default()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// 快照 → JSON（调用方持锁期间构造，避免二次加锁死锁）。
+fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
+    let elapsed_ms = match (st.started, st.ended) {
+        (Some(s), Some(e)) => e.saturating_duration_since(s).as_millis() as u64,
+        (Some(s), None) => s.elapsed().as_millis() as u64,
+        _ => 0,
     };
-    // 1) 清单（与 update_check_inner 同源同口径：Gitee 自建清单优先）
+    serde_json::json!({
+        "ok": true,
+        "phase": st.phase.as_str(),
+        "latest": st.latest,
+        "file": st.file,
+        "dest": st.dest,
+        "dir": st.dir,
+        "total": st.total,
+        "downloaded": st.downloaded,
+        "elapsed_ms": elapsed_ms,
+        "error": st.error,
+        "sha256_expect": st.sha_expect,
+        "sha256_got": st.sha_got,
+        "active": st.phase.active(),
+    })
+}
+
+fn update_dl_current() -> serde_json::Value {
+    update_dl_json(&update_dl_lock())
+}
+
+/// 进度快照的 HTTP 响应（/status、/cancel、/start 成功均回同一结构）。
+fn update_dl_response() -> Response {
+    Response::json(&update_dl_current())
+}
+
+/// 真实「下载」文件夹（FOLDERID_Downloads）；取不到回退 %USERPROFILE%\Downloads。
+fn update_download_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(d) = unsafe { sys_win::known_downloads_dir() } {
+            return d;
+        }
+    }
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Downloads"))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Downloads"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// URL 尾段 → 安全文件名：只保留 ASCII 字母数字与 `._-`，必须 .exe 结尾。
+/// 不合法一律退回 HuFuSetup.exe（绝不把 URL 里的路径分隔符带进落盘名）。
+fn update_file_name(url: &str) -> String {
+    let name = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    if safe.to_ascii_lowercase().ends_with(".exe") && safe.len() < 100 {
+        safe
+    } else {
+        "HuFuSetup.exe".to_string()
+    }
+}
+
+fn update_download_start() -> Response {
+    use std::sync::atomic::Ordering::SeqCst;
+    // 单飞：原子量先占坑。已有任务时返回 409 + 当前快照，前端据此直接接力
+    // 轮询（而不是弹一条「已在下载」的死文案）。
+    if UPDATE_DL_RUNNING.swap(true, SeqCst) {
+        let mut body = update_dl_current();
+        body["ok"] = serde_json::json!(false);
+        body["error"] = serde_json::json!("已有下载任务进行中");
+        return Response::json(&body).with_status(409);
+    }
+    UPDATE_DL_CANCEL.store(false, SeqCst);
+    let dir = update_download_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    {
+        let mut st = update_dl_lock();
+        *st = UpdateDl::default();
+        st.phase = DlPhase::Preparing;
+        st.dir = dir.to_string_lossy().to_string();
+    }
+    std::thread::spawn(update_download_worker);
+    // 立刻回快照（含下载目录）：用户点下去就能看到「保存到哪」。
+    update_dl_response()
+}
+
+fn update_download_status() -> Response {
+    update_dl_response()
+}
+
+fn update_download_cancel() -> Response {
+    use std::sync::atomic::Ordering::SeqCst;
+    if UPDATE_DL_RUNNING.load(SeqCst) {
+        UPDATE_DL_CANCEL.store(true, SeqCst);
+    }
+    update_dl_response()
+}
+
+fn update_download_worker() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let result = update_download_run();
+    let mut st = update_dl_lock();
+    st.ended = Some(std::time::Instant::now());
+    match result {
+        Ok(()) => st.phase = DlPhase::Done,
+        Err(e) => {
+            if UPDATE_DL_CANCEL.load(SeqCst) {
+                st.phase = DlPhase::Cancelled;
+                st.error = String::new();
+            } else {
+                st.phase = DlPhase::Error;
+                st.error = e;
+            }
+        }
+    }
+    UPDATE_DL_RUNNING.store(false, SeqCst);
+}
+
+/// 后台下载主体：拉清单 → 流式下载（.part + 增量 sha256）→ 校验 → 改名。
+/// 全部错误转中文短句回前端；路径内无 unwrap（worker 崩了会卡在 active，
+/// 所以这里宁可多写 match 也不 panic）。
+fn update_download_run() -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let dir = update_download_dir();
+    let cleanup = |p: &std::path::Path| {
+        let _ = std::fs::remove_file(p);
+    };
+
     let mut agent_b = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(600))
-        .timeout_connect(std::time::Duration::from_secs(8));
+        .timeout_connect(std::time::Duration::from_secs(8))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .timeout_write(std::time::Duration::from_secs(30));
     #[cfg(windows)]
     {
         if let Ok(c) = ureq::native_tls::TlsConnector::new() {
@@ -1793,109 +1979,220 @@ fn update_download_inner() -> Response {
     let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
         "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
     });
-    let manifest = agent
+    let text = agent
         .get(&manifest_url)
         .set("User-Agent", "hufu-ime-update-download")
         .call()
-        .ok()
-        .and_then(|r| r.into_string().ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let Some(m) = manifest else {
-        return fail(502, "更新清单不可达".into());
-    };
+        .map_err(|e| format!("更新清单不可达：{e}"))?
+        .into_string()
+        .map_err(|e| format!("更新清单读取失败：{e}"))?;
+    let m: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("更新清单解析失败：{e}"))?;
+    if UPDATE_DL_CANCEL.load(SeqCst) {
+        return Err("已取消".to_string());
+    }
     let url = m
         .get("sources")
         .and_then(|s| s.as_array())
         .and_then(|a| a.first())
         .and_then(|s| s.get("url"))
         .and_then(|u| u.as_str())
-        .map(|s| s.to_string());
-    let Some(url) = url else {
-        return fail(502, "清单未提供下载地址".into());
-    };
-    // 2) sha256 必须存在（防供应链：无哈希即拒绝下载，不静默降级）
-    let Some(sha_expect) = m
+        .ok_or_else(|| "更新清单未提供下载地址".to_string())?
+        .to_string();
+    // sha256 必须存在：清单可信而镜像/传输损坏由它兜住；无哈希即拒绝（不静默降级）。
+    let sha_expect = m
         .get("sha256")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_ascii_lowercase())
-    else {
-        return fail(409, "清单未提供 sha256，已拒绝下载（防供应链）".into());
-    };
-    // 3) 下载（上限 64MiB：安装包 ~26MB；清单被篡改塞巨包时在此截断）
-    let resp = match agent.get(&url).set("User-Agent", "hufu-ime-update-download").call() {
-        Ok(r) => r,
-        Err(e) => return fail(502, format!("下载失败：{e}")),
-    };
-    let mut body: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024);
+        .ok_or_else(|| "清单未提供 sha256，已拒绝下载（防供应链）".to_string())?;
+    let size_hint = m.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let latest = m
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    let fname = update_file_name(&url);
+    let dest = dir.join(&fname);
+    {
+        let mut st = update_dl_lock();
+        st.latest = latest;
+        st.file = fname.clone();
+        st.dest = dest.to_string_lossy().to_string();
+        st.dir = dir.to_string_lossy().to_string();
+        st.total = size_hint;
+        st.sha_expect = sha_expect.clone();
+    }
+
+    let resp = agent
+        .get(&url)
+        .set("User-Agent", "hufu-ime-update-download")
+        .call()
+        .map_err(|e| format!("下载失败：{e}"))?;
+    if resp.status() != 200 {
+        return Err(format!("下载失败：HTTP {}", resp.status()));
+    }
+    // 总量优先用响应头（真实字节数），缺失再用清单 size；都没有=不确定进度。
+    let clen = resp
+        .header("Content-Length")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let total = if clen > 0 { clen } else { size_hint };
+    {
+        let mut st = update_dl_lock();
+        st.total = total;
+        st.phase = DlPhase::Downloading;
+        st.started = Some(std::time::Instant::now());
+    }
+
+    let tmp = dir.join(format!(".{fname}.part"));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("无法写入下载目录：{e}"))?;
     let mut reader = resp.into_reader();
-    use std::io::Read;
-    let mut chunk = [0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut got: u64 = 0;
     loop {
-        match reader.read(&mut chunk) {
+        if UPDATE_DL_CANCEL.load(SeqCst) {
+            drop(file);
+            cleanup(&tmp);
+            return Err("已取消".to_string());
+        }
+        match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                body.extend_from_slice(&chunk[..n]);
-                if body.len() > 64 * 1024 * 1024 {
-                    return fail(502, "安装包超上限（64MiB），已中止".into());
+                if let Err(e) = file.write_all(&buf[..n]) {
+                    drop(file);
+                    cleanup(&tmp);
+                    return Err(format!("写入下载文件失败：{e}"));
                 }
+                hasher.update(&buf[..n]);
+                got += n as u64;
+                if got > 64 * 1024 * 1024 {
+                    drop(file);
+                    cleanup(&tmp);
+                    return Err("安装包超上限（64MiB），已中止".to_string());
+                }
+                update_dl_lock().downloaded = got;
             }
-            Err(e) => return fail(502, format!("下载中断：{e}")),
+            Err(e) => {
+                drop(file);
+                cleanup(&tmp);
+                return Err(format!("下载中断：{e}"));
+            }
         }
     }
-    if body.len() < 1024 {
-        return fail(502, "下载内容异常（过小，疑似错误页）".into());
+    if got < 1024 {
+        drop(file);
+        cleanup(&tmp);
+        return Err("下载内容异常（过小，疑似错误页），已丢弃".to_string());
     }
-    // 4) 哈希校验（大小写不敏感；不符即弃，绝不落盘）
-    let mut h = Sha256::new();
-    h.update(&body);
-    let sha_got = format!("{:x}", h.finalize());
+    if total > 0 && got != total {
+        drop(file);
+        cleanup(&tmp);
+        return Err(format!("下载不完整（{got}/{total} 字节），已丢弃"));
+    }
+    update_dl_lock().phase = DlPhase::Verifying;
+    let sha_got = format!("{:x}", hasher.finalize());
+    update_dl_lock().sha_got = sha_got.clone();
     if sha_got != sha_expect {
-        return fail(
-            409,
-            format!("sha256 不符，已拒绝保存（期望 {sha_expect}，实际 {sha_got}）"),
-        );
+        drop(file);
+        cleanup(&tmp);
+        return Err(format!(
+            "sha256 校验不符，已拒绝保存（期望 {sha_expect}，实际 {sha_got}）"
+        ));
     }
-    // 5) 落「下载」文件夹：SHGetKnownFolderPath(FOLDERID_Downloads)，
-    //    失败回退 %USERPROFILE%\Downloads。
-    let dl_dir = unsafe { sys_win::known_downloads_dir() }
-        .unwrap_or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .map(|p| std::path::PathBuf::from(p).join("Downloads"))
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-        });
-    let _ = std::fs::create_dir_all(&dl_dir);
-    // 文件名 = URL 尾段，只保留安全字符（无路径分隔、必须 .exe 结尾）
-    let name = url
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("");
-    let safe = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .collect::<String>();
-    let fname = if safe.to_ascii_lowercase().ends_with(".exe") && safe.len() < 100 {
-        safe
-    } else {
-        "HuFuSetup.exe".to_string()
+    let _ = file.sync_all();
+    drop(file);
+    std::fs::rename(&tmp, &dest).map_err(|e| {
+        cleanup(&tmp);
+        format!("保存失败（目标可能被占用）：{e}")
+    })?;
+    Ok(())
+}
+
+/// 打开刚下载的安装包 / 在资源管理器定位它。
+/// 路径只取 server 自己的下载状态（不接受前端传任意路径），防越权执行。
+fn update_download_open(req: &Request) -> Response {
+    let target = req
+        .json()
+        .get("target")
+        .and_then(|x| x.as_str())
+        .unwrap_or("folder")
+        .to_string();
+    let (dest, dir) = {
+        let st = update_dl_lock();
+        (st.dest.clone(), st.dir.clone())
     };
-    let dest = dl_dir.join(&fname);
-    let tmp = dl_dir.join(format!(".{fname}.part"));
-    if let Err(e) = std::fs::write(&tmp, &body) {
-        return fail(500, format!("写入下载目录失败：{e}"));
+    if dest.is_empty() {
+        return Response::err(409, "还没有下载完成的安装包");
     }
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return fail(500, format!("保存失败（目标可能被占用）：{e}"));
+    let p = std::path::PathBuf::from(&dest);
+    match target.as_str() {
+        "installer" => {
+            if !p.is_file() {
+                return Response::err(404, "安装包已不在原位置（可能被移动或删除）");
+            }
+            // 安装程序带 UAC：ShellExecute 可能阻塞到用户点「是」，放独立
+            // 线程执行，HTTP 立即返回，设置页不会卡在 15s 超时误报失败。
+            let p2 = p.clone();
+            std::thread::spawn(move || {
+                if !update_open_installer(&p2) {
+                    eprintln!("打开安装包失败：{}", p2.display());
+                }
+            });
+            Response::json(&serde_json::json!({"ok": true, "path": dest}))
+        }
+        "folder" => {
+            if p.is_file() {
+                if update_reveal(&p) {
+                    Response::json(&serde_json::json!({"ok": true, "path": dest}))
+                } else {
+                    Response::err(500, "打开资源管理器失败")
+                }
+            } else {
+                // 文件被移走但下载目录还在：退化为打开目录，别让按钮变死键。
+                let d = std::path::PathBuf::from(&dir);
+                if d.is_dir() {
+                    let _ = update_reveal(&d);
+                    Response::json(&serde_json::json!({"ok": true, "path": dir}))
+                } else {
+                    Response::err(404, "安装包已不在原位置（可能被移动或删除）")
+                }
+            }
+        }
+        _ => Response::err(400, "target 只能是 installer / folder"),
     }
-    Response::json(&serde_json::json!({
-        "ok": true,
-        "path": dest.to_string_lossy(),
-        "size": body.len(),
-        "sha256": sha_got,
-    }))
+}
+
+#[cfg(windows)]
+fn update_reveal(p: &std::path::Path) -> bool {
+    unsafe {
+        // Shell/COM 调用前初始化 APARTMENTTHREADED（重复初始化返回
+        // RPC_E_CHANGED_MODE，无害，忽略返回值）。
+        sys_win::co_init_apartment();
+    }
+    sys_win::reveal_in_explorer(p)
+}
+
+#[cfg(not(windows))]
+fn update_reveal(p: &std::path::Path) -> bool {
+    crate::platform::open_path(p);
+    true
+}
+
+#[cfg(windows)]
+fn update_open_installer(p: &std::path::Path) -> bool {
+    unsafe {
+        sys_win::co_init_apartment();
+    }
+    sys_win::open_path_default(p)
+}
+
+#[cfg(not(windows))]
+fn update_open_installer(p: &std::path::Path) -> bool {
+    crate::platform::open_path(p);
+    true
 }
 
 /// 【检查更新 2026-11-01】语义化版本比较：a 是否严格大于 b（"1.9.10" > "1.9.9"）。
@@ -1968,7 +2265,7 @@ fn request_is_local(req: &Request) -> bool {
     // 【F3 复审修复 2026-11-05】no-cors GET（<img>/no-cors fetch/链接导航）
     // 不带 Origin，Origin+Host 双查拦不住跨站页面。现代浏览器对这类请求也带
     // Sec-Fetch-Site：same-origin（设置页自身）/same-site/none（地址栏/书签）
-    // 放行，cross-site 一律拒——有副作用端点（如 /api/update/download）不再
+    // 放行，cross-site 一律拒——有副作用端点（如 /api/update/download/start）不再
     // 可被任意本地网页触发。无此头的老浏览器维持原双查口径（读取端点仍受
     // CORS 保护）。
     if let Some(sfs) = req.headers.get("sec-fetch-site").filter(|s| !s.is_empty()) {
@@ -2151,23 +2448,21 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         }
         return ssf_render_inner(rid.as_deref());
     }
-    // 【P1-8 2026-11-04】检查更新要走外网（manifest 8s / GitHub 5s 超时）。
-    // 旧实现在 Host 大锁内同步请求：网络慢时整机按键、候选轮询、设置页
-    // 全部排队（用户观感=打字卡死）。与 ssf-render / sync 同款「锁前
-    // 分发」——本端点不读 host，直接在每连接线程里跑，结果直接返回。
-    if req.method == "GET" && req.path == "/api/update/check" {
+    // 【P1-8 2026-11-04】检查更新要走外网（manifest 8s / GitHub 5s 超时），
+    // 绝不能在 Host 大锁内做；【更新下载 2026-11-06】改为后台任务 + 轮询快照，
+    // 启动/查进度/取消/打开全部锁前分发（长下载绝不持 Host 锁）。
+    if req.path.starts_with("/api/update/") {
         if !request_is_local(req) {
             return Response::err(403, "跨源请求被拒绝");
         }
-        return update_check_inner();
-    }
-    // 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256 比对后才
-    // 落「下载」文件夹（同锁前分发——长下载绝不持 Host 锁）。
-    if req.method == "GET" && req.path == "/api/update/download" {
-        if !request_is_local(req) {
-            return Response::err(403, "跨源请求被拒绝");
-        }
-        return update_download_inner();
+        return match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/api/update/check") => update_check_inner(),
+            ("POST", "/api/update/download/start") => update_download_start(),
+            ("GET", "/api/update/download/status") => update_download_status(),
+            ("POST", "/api/update/download/cancel") => update_download_cancel(),
+            ("POST", "/api/update/open") => update_download_open(req),
+            _ => Response::err(404, "not found"),
+        };
     }
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
@@ -3927,6 +4222,77 @@ mod sys_win {
         let s = String::from_utf16(std::slice::from_raw_parts(p, len)).ok();
         CoTaskMemFree(p as *mut core::ffi::c_void);
         s.map(std::path::PathBuf::from)
+    }
+
+    /// 【更新下载 2026-11-06】打开任意文件/目录（ShellExecuteW "open"）。
+    /// 零解释器：不经过 cmd/PowerShell，行为等同资源管理器双击。
+    pub fn open_path_default(p: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        const SW_SHOWNORMAL: i32 = 1;
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let r = unsafe {
+            ShellExecuteW(
+                0,
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if r <= 32 {
+            eprintln!("ShellExecuteW 失败码 {r}（{}）", p.display());
+        }
+        r > 32
+    }
+
+    // 【更新下载 2026-11-06】在资源管理器中打开父目录并选中该文件：
+    // SHParseDisplayName 拿绝对 pidl → SHOpenFolderAndSelectItems(pidl,0,..)
+    // 即「定位到该项」；失败退化为打开父目录。全程 Shell API，零子进程。
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHParseDisplayName(
+            pszname: *const u16,
+            pbc: *mut core::ffi::c_void,
+            ppidl: *mut *mut core::ffi::c_void,
+            sfgaoin: u32,
+            psfgaoout: *mut u32,
+        ) -> i32;
+        fn SHOpenFolderAndSelectItems(
+            pidlfolder: *const core::ffi::c_void,
+            cidl: u32,
+            apidl: *const *const core::ffi::c_void,
+            dwflags: u32,
+        ) -> i32;
+    }
+    pub fn reveal_in_explorer(p: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            let mut pidl: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hr = SHParseDisplayName(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut pidl,
+                0,
+                std::ptr::null_mut(),
+            );
+            if hr >= 0 && !pidl.is_null() {
+                let hr2 = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+                CoTaskMemFree(pidl as *mut core::ffi::c_void);
+                if hr2 >= 0 {
+                    return true;
+                }
+                eprintln!("SHOpenFolderAndSelectItems 失败 HRESULT={hr2:#x}");
+            } else {
+                eprintln!("SHParseDisplayName 失败 HRESULT={hr:#x}");
+            }
+            match p.parent() {
+                Some(d) => open_path_default(d),
+                None => false,
+            }
+        }
     }
 
     // ── 设置窗口（Chromium --app）居中参数 ──

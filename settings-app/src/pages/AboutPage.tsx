@@ -1,17 +1,22 @@
 import { useState } from 'react';
 import type { About } from '../types';
-import { fetchUpdateCheck, verifiedDownloadUpdate, type UpdateState } from '../updateCheck';
+import { fetchUpdateCheck, type UpdateState } from '../updateCheck';
+import { UpdateDownloadCard, useUpdateDownload } from '../components/UpdateDownload';
 import { PageHead } from '../components/ui';
 
 export function AboutPage({ about }: { about: About }) {
   const [upd, setUpd] = useState<UpdateState>({ kind: 'idle' });
-  const [dlBusy, setDlBusy] = useState(false);
-  const [dlMsg, setDlMsg] = useState('');
+  /* 【更新下载 2026-11-06】进度卡片：准备/下载/校验/完成/失败五态，
+     百分比、速度、剩余、落点、取消、运行安装包、打开文件夹都在卡片里。
+     状态来自 server 后台任务，关掉设置页重开也能接上。 */
+  const dl = useUpdateDownload();
 
   const checkUpdate = async () => {
     setUpd({ kind: 'checking' });
     setUpd(await fetchUpdateCheck(about.github));
   };
+
+  const pageUrl = upd.kind === 'update' ? upd.pageUrl : about.github;
 
   return (
     <>
@@ -30,31 +35,20 @@ export function AboutPage({ about }: { about: About }) {
             </button>
             {upd.kind === 'update' && (
               <>
-                <span className="update-note has-update">
-                  发现新版本 v{upd.latest}
-                </span>
-                <button
-                  type="button"
-                  className="btn"
+                <span className="update-note has-update">发现新版本 v{upd.latest}</span>
+                {!dl.busy && !dl.done && (
                   /* 【审计 P2-D 2026-11-05】校验式下载：server 中转 + sha256
-                     比对，通过才落「下载」文件夹；端点不可用回退浏览器直开。
-                     【F4 复审修复】进度上屏（此前只 console.info，用户无感知
-                     重复点击触发 409）；下载中禁用防重复。 */
-                  disabled={dlBusy}
-                  onClick={async () => {
-                    if (dlBusy) return;
-                    setDlBusy(true);
-                    try {
-                      await verifiedDownloadUpdate(upd.downloadUrl || upd.pageUrl, setDlMsg);
-                    } finally {
-                      setDlBusy(false);
-                    }
-                  }}
-                  title={upd.downloadUrl ? '下载并校验安装包（sha256 通过才保存）' : '未找到安装包，打开下载页'}
-                >
-                  {dlBusy ? '下载中…' : upd.downloadUrl ? '下载安装包（自动校验）' : '打开下载页'}
-                </button>
-                {dlMsg && <span className="update-note err">{dlMsg}</span>}
+                     比对通过才落「下载」文件夹；下载过程走 UpdateDownloadCard
+                     的进度条，不再是一个等 10 分钟的阻塞请求。 */
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void dl.start()}
+                    title="下载到「下载」文件夹，sha256 校验通过才算完成"
+                  >
+                    下载安装包（自动校验）
+                  </button>
+                )}
               </>
             )}
             {upd.kind === 'latest' && <span className="update-note ok">已是最新（v{upd.current}）</span>}
@@ -62,6 +56,7 @@ export function AboutPage({ about }: { about: About }) {
           </div>
         </div>
       </div>
+      <UpdateDownloadCard api={dl} pageUrl={pageUrl} />
       <div className="about-grid">
         <div className="card about-card">
           <div className="label">安装目录</div>

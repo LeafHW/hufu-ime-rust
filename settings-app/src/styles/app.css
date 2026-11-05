@@ -1138,3 +1138,48 @@ html.theme-vt .brand img{animation:themeLogoPulse .56s cubic-bezier(.2,.8,.2,1)}
   html.theme-vt::view-transition-new(root){animation:none!important;clip-path:none!important}
   html.theme-vt .brand img{animation:none!important}
 }
+
+/* ── 【2026-11-06】更新下载：进度条 / 保存位置 / 完成后动作 ─────────────
+   关于页完整卡片 + 概览行内迷你条；暗色/浅色两套。 */
+.upd-card{margin-top:16px;padding:16px 18px 14px;display:flex;flex-direction:column;gap:10px}
+.upd-card.ok{border-color:rgba(99,192,141,.28)}
+.upd-card.ok .upd-bar i{background:linear-gradient(90deg,#3f9e6b,var(--green))}
+.upd-card.bad{border-color:rgba(224,106,90,.26)}
+.upd-head{display:flex;align-items:center;gap:11px}
+.upd-ico{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
+  background:var(--gold-soft);border:1px solid rgba(231,183,92,.24);color:var(--gold2)}
+.upd-ico.ok{background:rgba(99,192,141,.10);border-color:rgba(99,192,141,.24);color:var(--green)}
+.upd-ico.err{background:rgba(224,106,90,.10);border-color:rgba(224,106,90,.26);color:var(--red)}
+.upd-ico .icon{width:17px;height:17px}
+.upd-titles{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.upd-titles b{font-size:14.5px;font-weight:600}
+.upd-titles span{font-size:12.5px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upd-pct{font:600 16px/1 inherit;color:var(--gold2);font-variant-numeric:tabular-nums;flex:none}
+.upd-bar{height:7px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden;position:relative}
+.upd-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--gold3),var(--gold2));
+  transition:width .35s cubic-bezier(.22,.7,.3,1)}
+.upd-bar.indet i{width:38%;background:linear-gradient(90deg,transparent,var(--gold2),transparent);
+  animation:updIndet 1.15s linear infinite}
+@keyframes updIndet{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}
+.upd-meta{display:flex;gap:14px;font-size:12.5px;color:var(--text3);font-variant-numeric:tabular-nums;flex-wrap:wrap}
+.upd-meta span:first-child{color:var(--text2)}
+.upd-path{display:flex;align-items:baseline;gap:8px;font-size:12.5px;color:var(--text3);min-width:0}
+.upd-path span{flex:none}
+.upd-path code{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;color:var(--text2);
+  background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:6px;padding:3px 7px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.upd-sha{font-size:11.5px;color:var(--text3);letter-spacing:.01em}
+.upd-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.upd-hint{font-size:12.5px;color:var(--text3)}
+.upd-err{font-size:12.5px;color:var(--red);word-break:break-all}
+body.light .upd-bar{background:rgba(60,45,20,.10)}
+body.light .upd-path code{background:rgba(60,45,20,.05)}
+
+/* 概览「检查更新」行：下载中/完成的行内迷你进度条 */
+.act-row .act-main{flex:1}
+.act-row .act-bar{height:4px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:3px}
+.act-row .act-bar i{display:block;height:100%;border-radius:999px;
+  background:linear-gradient(90deg,var(--gold3),var(--gold2));transition:width .35s ease}
+.act-row .act-bar.indet i{width:38%;background:linear-gradient(90deg,transparent,var(--gold2),transparent);
+  animation:updIndet 1.15s linear infinite}
+body.light .act-row .act-bar{background:rgba(60,45,20,.10)}
