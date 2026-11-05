@@ -27,7 +27,7 @@
 - 管道回归电池：lock 12/12、battery2 16/16、edge 17/17、flow 全过、设置生效性 7/7（皮肤热反映/横排/序号/延时/音效/调整日志）
 - Windows 冒烟：12 步 exit=0（COM 层 + msctf + 管道 + 候选窗 v2 四材质，横竖排各验一轮）
 - 重排端到端：`bwjdsk` → Qwen3 翻转 `[弱斗该,嫁𡀲]→[嫁𡀲,弱斗该]`，二次输入缓存即时生效
-- **万句基准（tbench v2）**：新语料 1 万句、整句虎规则逐字全码连打——准率 **99.50%**、提前上屏覆盖 ~40%、残留码长 3.5 键、触达 p50 ~6ms；各版本基准与口径见 [benchmark-latency-100.md](benchmark-latency-100.md) / [benchmark-qwen-vs-ngram.md](benchmark-qwen-vs-ngram.md)
+- **万句基准（tbench v2，NOLEARN）**：整句虎规则逐字全码连打 1 万句——纯 ngram 准率 **99.73%**（2026-10-26 万句 A/B 实测 99.740%，26 错句）；叠加 Qwen3 神经重排 **≥99.9%**（2026-11-03 错句重排实测 99.93%）；提前上屏覆盖 ~85%、残留码长 ~4.4 键、触达 p50 8~12ms。各版本基准与口径见 [benchmark-qwen-vs-ngram.md](benchmark-qwen-vs-ngram.md) / [benchmark-latency-100.md](benchmark-latency-100.md)
 
 ## 整句 A/B 压测（5 万句语料）
 
