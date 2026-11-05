@@ -397,6 +397,29 @@ export function SkinStudio({
     }
   };
 
+  /* 旧开关真源是 JSON 皮肤 layout.inline_preedit，并非全局 config 字段。
+     GET 最新皮肤后只改这一项，避免顺带提交编辑器脏值或清掉挂件；
+     select:false 不因编辑别款而切换当前皮肤。SSF 后端没有此覆盖契约。 */
+  const setInlinePreedit = async (value: boolean) => {
+    if (!skin || isSsf || loading || saving) return;
+    const id = skin.id;
+    setSaving(true);
+    try {
+      const fresh = await loadSkin(id);
+      const next: Skin = { ...fresh, layout: { ...fresh.layout, inline_preedit: value } };
+      await saveSkin(next, { select: false });
+      if (selectedIdRef.current !== id) return;
+      setOriginal((prev) => prev?.id === id ? { ...prev, layout: { ...prev.layout, inline_preedit: value } } : next);
+      setSkin((prev) => prev?.id === id ? { ...prev, layout: { ...prev.layout, inline_preedit: value } } : prev);
+      setPreviewVer((v) => v + 1);
+      notify(`编码内联已${value ? '开启' : '关闭'}并保存${id === data.skins.current ? '（下次打字生效）' : '（设为当前皮肤后生效）'}`);
+    } catch (e) {
+      notify(`编码内联保存失败：${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   /* 全局候选设置（candidates.*）：走 updateConfig（同上，带 rev / 409 提示）。 */
   const writeCandidates = async (patch: Record<string, unknown>): Promise<void> => {
     await updateConfig({ candidates: patch });
@@ -862,7 +885,8 @@ export function SkinStudio({
             </div>
             <div className="spacer" />
             <div className="tool">100%</div>
-            <div className="tool">
+            <div className="skin-layout-tools">
+            <div className="tool skin-layout-tool">
               横排
               <Switch
                 on={horizontal}
@@ -906,6 +930,30 @@ export function SkinStudio({
                   })();
                 }}
               />
+            </div>
+            <div className="tool skin-layout-tool inline-preedit-tool">
+              <span id="inline-preedit-label">编码内联</span>
+              <button
+                type="button"
+                className={`switch${(isSsf ? ssfOv.inline_preedit !== false : skin?.layout.inline_preedit !== false) ? ' on' : ''}`}
+                aria-labelledby="inline-preedit-label"
+                aria-pressed={isSsf ? ssfOv.inline_preedit !== false : skin?.layout.inline_preedit !== false}
+                disabled={(isSsf ? !selectedId : !skin) || loading || saving}
+                title="编码内联到应用：立即保存所选皮肤；开启在应用中显示编码，关闭仅在候选窗中显示"
+                onClick={() => {
+                  if (isSsf) {
+                    /* 【编码内联 2026-11-05】SSF 同款覆盖：写 overrides 的
+                       inline_preedit（server 投影 layout 同键下发，DLL 零
+                       改动）。开关类参数 immediate 立即落盘，不等防抖。 */
+                    const next = ssfOv.inline_preedit === false;
+                    patchSsf({ inline_preedit: next }, true);
+                    notify(`编码内联已${next ? '开启' : '关闭'}并保存${selectedId === data.skins.current ? '（下次打字生效）' : '（设为当前皮肤后生效）'}`);
+                  } else {
+                    void setInlinePreedit(skin?.layout.inline_preedit === false);
+                  }
+                }}
+              />
+            </div>
             </div>
             <button
               type="button"

@@ -686,6 +686,10 @@ pub struct SsfOverrides {
     /// 决定，此值整体挪动候选区起点补视觉缝隙。None=0（皮肤原布局）。
     /// DLL 侧换算：布局源域偏移 = 像素/缩放比，钳 ±500 后叠加。
     pub cand_y: Option<f32>,
+    /// 【编码内联 2026-11-05】编码是否内联到应用文本流（与 JSON 皮肤
+    /// layout.inline_preedit 同语义，DLL tsf.rs 同键消费）。false=编码
+    /// 只在候选窗编码行显示。None=内联（历史默认，DLL 缺省 true）。
+    pub inline_preedit: Option<bool>,
     /// 【挂件随独立皮肤 2026-10-16】挂件配置快照（矢量皮肤 overlay 节
     /// 整棵：enabled/image/proc/布局）。None=无挂件。payload 注入顶层
     /// overlay——DLL parse_cfg 同键读取，零新消费代码。
@@ -813,6 +817,12 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     // 那里有 scale），layout.cand_y 与 font_point 等同通道。
     if let Some(y) = ov.cand_y {
         layout.insert("cand_y".into(), serde_json::json!(y));
+    }
+    // 【编码内联 2026-11-05】投影进 layout.inline_preedit——DLL
+    // pointer("/skin/layout/inline_preedit") 同键命中，零新消费代码；
+    // 缺省不写键=保持历史内联默认。
+    if let Some(ip) = ov.inline_preedit {
+        layout.insert("inline_preedit".into(), serde_json::json!(ip));
     }
     let mut sv = serde_json::json!({
         "kind": "ssf",

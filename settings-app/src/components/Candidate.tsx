@@ -92,7 +92,7 @@ export function Candidate({
           width: 'auto',
         }}
       >
-        <span className="preedit-h" style={{ color: preeditColor, fontSize: Math.max(10, font - 4) }}>tuja</span>
+        {layout.inline_preedit === false && <span className="preedit-h" style={{ color: preeditColor, fontSize: Math.max(10, font - 4) }}>tuja</span>}
         {rows.map((row, i) => {
           const active = i === 0 && hlOn;
           const sc = scaleOf(i);
@@ -141,7 +141,7 @@ export function Candidate({
         width: width ?? (size === 'lg' ? 180 : 310),
       }}
     >
-      <div
+      {layout.inline_preedit === false && <div
         className="preedit"
         style={{
           color: preeditColor,
@@ -150,7 +150,7 @@ export function Candidate({
         }}
       >
         tuja
-      </div>
+      </div>}
       {rows.map((row, i) => {
         const active = i === 0 && hlOn;
         const sc = scaleOf(i);

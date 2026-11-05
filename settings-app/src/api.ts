@@ -192,6 +192,9 @@ export interface SsfOverrides {
   horizontal?: boolean | null;
   show_index?: boolean | null;
   cand_y?: number | null;
+  /* 【编码内联 2026-11-05】与 JSON 皮肤 layout.inline_preedit 同语义；
+     null/缺省=内联（历史默认）。 */
+  inline_preedit?: boolean | null;
   code_color?: string | null;
   first_color?: string | null;
   text_color?: string | null;

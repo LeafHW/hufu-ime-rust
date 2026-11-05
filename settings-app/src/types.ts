@@ -88,6 +88,8 @@ export interface SkinLayout {
   hilite_spacing?: number;
   hilited_corner_radius?: number;
   horizontal?: boolean;
+  /** 编码内联到应用；旧版皮肤契约，缺省 true（非 config.json 全局字段）。 */
+  inline_preedit?: boolean;
   border_width?: number;
   label_style?: string;
   label_format?: string;
