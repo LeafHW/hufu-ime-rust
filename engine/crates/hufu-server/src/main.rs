@@ -1652,7 +1652,7 @@ fn update_check_inner() -> Response {
     // 60 次/小时限流）；清单不可达再退回 GitHub API（原逻辑）。
     // 清单格式：latest/min/page_url/sha256/size/sources[]。
     let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
-        "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
+        "https://gitee.com/leafHW/hufu-updates/raw/master/update.json".to_string()
     });
     let manifest = agent
         .get(&manifest_url)
@@ -2000,7 +2000,7 @@ fn update_download_run() -> Result<(), String> {
     }
     let agent = agent_b.build();
     let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
-        "https://gitee.com/leafyin/hufu-updates/raw/master/update.json".to_string()
+        "https://gitee.com/leafHW/hufu-updates/raw/master/update.json".to_string()
     });
     let text = agent
         .get(&manifest_url)
