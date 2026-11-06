@@ -9,7 +9,7 @@
     "sources":  [
                     {
                         "name":  "Gitee",
-                        "url":  "https://gitee.com/leafyin/hufu-ime-rust/releases/download/v1.9.9.3/HuFuSetup-1.9.9.3.exe"
+                        "url":  "https://gitee.com/leafHW/hufu-ime-rust/releases/download/v1.9.9.3/HuFuSetup-1.9.9.3.exe"
                     },
                     {
                         "name":  "GitHub",
