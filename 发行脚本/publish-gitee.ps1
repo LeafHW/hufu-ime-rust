@@ -36,7 +36,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $TokenFile   = 'E:\DSH-KF\gitee-token.txt'
-$Owner       = 'leafyin'
+$Owner       = 'leafHW'
 $Repo        = 'hufu-ime-rust'
 $UpdatesRepo = 'hufu-updates'
 $SiteRepoDir = 'E:\DSH-KF\hufu-site'
