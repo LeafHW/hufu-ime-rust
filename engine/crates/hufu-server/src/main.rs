@@ -1984,6 +1984,63 @@ fn update_download_worker() {
 /// 后台下载主体：拉清单 → 多源回退（见 download_from_source）→ 校验 → 改名。
 /// 全部错误转中文短句回前端；路径内无 unwrap（worker 崩了会卡在 active，
 /// 所以这里宁可多写 match 也不 panic）。
+/// 【P3-5 修复 2026-11-07】清单失败时的 GitHub 直链源合成：取
+/// api.github latest 的 .exe 资产（browser_download_url + digest
+/// sha256 + size）拼成最小清单，交给多源下载机照常跑。digest 缺失
+/// （老资产无摘要）返回 Err——与主清单「无 sha256 拒绝」同款供应链
+/// 纪律，不静默降级。
+fn github_fallback_manifest(agent: &ureq::Agent) -> Result<serde_json::Value, String> {
+    let resp = agent
+        .get("https://api.github.com/repos/LeafHW/hufu-ime-rust/releases/latest")
+        .set("User-Agent", "hufu-ime-update-download")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("GitHub 不可达：{e}"))?
+        .into_string()
+        .map_err(|e| format!("GitHub 响应读取失败：{e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("GitHub 响应解析失败：{e}"))?;
+    let tag = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let asset = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| "GitHub 无资产列表".to_string())?
+        .iter()
+        .find(|x| {
+            x.get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .map(|u| u.to_ascii_lowercase().ends_with(".exe"))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| "GitHub 资产中无 .exe 安装包".to_string())?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let digest = asset
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    let sha = digest
+        .strip_prefix("sha256:")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .ok_or_else(|| {
+            "GitHub 资产无 sha256 摘要（供应链纪律：无哈希拒绝下载，请用浏览器直链）".to_string()
+        })?;
+    let size = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    Ok(serde_json::json!({
+        "latest": tag.trim_start_matches('v'),
+        "sha256": sha,
+        "size": size,
+        "sources": [ { "name": "GitHub", "url": url } ],
+    }))
+}
+
 fn update_download_run() -> Result<(), String> {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -2003,15 +2060,30 @@ fn update_download_run() -> Result<(), String> {
     let manifest_url = std::env::var("HUFU_UPDATE_MANIFEST").unwrap_or_else(|_| {
         "https://gitee.com/leafHW/hufu-updates/raw/master/update.json".to_string()
     });
-    let text = agent
-        .get(&manifest_url)
-        .set("User-Agent", "hufu-ime-update-download")
-        .call()
-        .map_err(|e| format!("更新清单不可达：{e}"))?
-        .into_string()
-        .map_err(|e| format!("更新清单读取失败：{e}"))?;
-    let m: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("更新清单解析失败：{e}"))?;
+    let m: serde_json::Value = (|| -> Result<serde_json::Value, String> {
+        let text = agent
+            .get(&manifest_url)
+            .set("User-Agent", "hufu-ime-update-download")
+            .call()
+            .map_err(|e| format!("更新清单不可达：{e}"))?
+            .into_string()
+            .map_err(|e| format!("更新清单读取失败：{e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("更新清单解析失败：{e}"))
+    })()
+    .or_else(|e| {
+        // 【P3-5 修复 2026-11-07】清单不可达/损坏——正是 check 走
+        // GitHub 回退分支的场景（前端能看到新版+直链，下载按钮却必败
+        // 的契约断层）。下载器同源回退 github_fallback_manifest（.exe
+        // 直链 + digest sha256 + size 合成单源清单），多源机照常跑；
+        // digest 缺失按主清单同款供应链纪律拒绝（无哈希不下载）。
+        match github_fallback_manifest(&agent) {
+            Ok(fm) => {
+                eprintln!("[update] {e}；已回退 GitHub 直链源");
+                Ok(fm)
+            }
+            Err(fe) => Err(format!("{e}；GitHub 回退亦不可用：{fe}")),
+        }
+    })?;
     if UPDATE_DL_CANCEL.load(SeqCst) {
         return Err("已取消".to_string());
     }
@@ -3818,14 +3890,28 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            match host.engine.switch_schema(&name) {
-                Ok(()) => {
-                    host.session.clear();
-                    // 【卡死修复】旧 setup_sentence 持锁同步载模型（秒级
-                    // 卡全机）——改后台重建（先拆旧防跨方案词典串扰）
-                    reload_sentence_bg(true, false);
-                    let _ = host.engine.config.save(&host.config_path);
-                    Response::json(&serde_json::json!({"ok": true, "current": name}))
+            // 【治本 2026-11-07】两段式锁：装载（MB 级读盘解析，大方案
+            // 0.05-1s）移到 Host 锁外——旧整段持锁时键路 1200ms 超时贴脸，
+            // 撞上即闪断。锁外仅取 data_dir + 方案目录名两个不可变路径；
+            // 错误文案/成功行为（session.clear + 句模型后台重建 + 落盘）
+            // 与旧实现完全一致。
+            let data_dir = host.data_dir.clone();
+            let schema_dir = host.engine.config.schema.dir.clone();
+            drop(host);
+            match hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name) {
+                Ok(prepared) => {
+                    let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                    match host.engine.apply_schema(&name, prepared) {
+                        Ok(()) => {
+                            host.session.clear();
+                            // 【卡死修复】旧 setup_sentence 持锁同步载模型（秒级
+                            // 卡全机）——改后台重建（先拆旧防跨方案词典串扰）
+                            reload_sentence_bg(true, false);
+                            let _ = host.engine.config.save(&host.config_path);
+                            Response::json(&serde_json::json!({"ok": true, "current": name}))
+                        }
+                        Err(e) => Response::err(500, &format!("切换失败: {e}")),
+                    }
                 }
                 Err(e) => Response::err(500, &format!("切换失败: {e}")),
             }
@@ -3844,9 +3930,20 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 皮肤的 overrides（字体/横排/四色/挂件快照）收进 ssf_settings
         //——官方皮肤上的用户微调也带（皮肤文件不带但设置无损）。
         ("GET", "/api/settings_export") => {
+            // 【治本 2026-11-07】两段式锁：导出主体是 MB 级读盘+解析
+            // （皮肤 JSON / ssf 包全量读 + 官方皮语义深比较），旧实现整
+            // 段持锁。锁内只取快照（config 克隆 + 目录路径），I/O 全在
+            // 锁外。皮肤清单改用自由函数 list_skins_with_palette_at
+            // （与 list_skins 同源读盘口径；其排序/空目录兜底条目对导出
+            // 无影响——导出按 Map 收编，读不到/解析失败的条目自然跳过）。
+            let config = host.engine.config.clone();
+            let data_dir = host.data_dir.clone();
+            let skins_dir = host.skins_dir();
+            let ssf_dir = host.ssf_skins_dir();
+            drop(host);
             let mut skins = serde_json::Map::new();
-            for (id, _name) in host.list_skins() {
-                let p = host.skins_dir().join(format!("{id}.json"));
+            for (id, _name, _c1, _c2) in list_skins_with_palette_at(&data_dir) {
+                let p = skins_dir.join(format!("{id}.json"));
                 // 皮肤文件内容原样收编（Skin 结构透传序列化——保留未知
                 // 字段由 Skin 自身 serde 决定；读不动的跳过不拖垮导出）
                 if let Ok(txt) = std::fs::read_to_string(&p) {
@@ -3866,11 +3963,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
             let mut ssf_skins = serde_json::Map::new();
             let mut ssf_settings = serde_json::Map::new();
-            for e in host.list_ssf_skins() {
+            for e in crate::ssf::list_ssf(&data_dir) {
                 if e.error.is_some() {
                     continue; // 坏皮不带（导入也过不了校验）
                 }
-                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&e.id);
+                let cache_dir = crate::ssf::ssf_cache_root(&data_dir).join(&e.id);
                 // 设置：overrides.json 原样（结构 SsfOverrides serde 校验
                 // 由导入端做；这里透传——未来加字段不炸旧导出/导出端）
                 if let Ok(t) = std::fs::read_to_string(cache_dir.join("overrides.json")) {
@@ -3883,7 +3980,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 // 名且字节未改」——用户导入过同名更新版 = 内容不同 =
                 // 会随导出带走（不然迁移丢皮）。
                 let file = format!("{}.ssf", e.id);
-                let p = host.ssf_skins_dir().join(&file);
+                let p = ssf_dir.join(&file);
                 if let Ok(bytes) = std::fs::read(&p) {
                     if crate::host::official_ssf_unchanged(&file, &bytes) {
                         continue;
@@ -3896,7 +3993,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let mut bundle = serde_json::json!({
                 "hufu_settings_bundle": 3,
                 "exported_at": hufu_engine::dynamic::date_string_iso(),
-                "config": host.engine.config,
+                "config": config,
                 "skins": skins,
                 "ssf_skins": ssf_skins,
                 "ssf_settings": ssf_settings,

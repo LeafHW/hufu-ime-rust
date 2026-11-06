@@ -59,6 +59,9 @@ export interface DownloadState {
   active?: boolean;
   /** done 态时落盘产物是否还在（false 时 server 直接报 idle = 当没下过） */
   artifact_ok?: boolean;
+  // 【P3 扫尾 2026-11-07】多源回退：当前第几次尝试（1 起；>1 = 已自动换过
+  // attempt-1 次下载源，换源时进度归零属正常）。老 server 无此字段 → 可选。
+  attempt?: number;
 }
 
 export const isDownloadActive = (p?: DownloadPhase): boolean =>

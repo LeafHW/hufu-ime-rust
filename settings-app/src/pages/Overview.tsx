@@ -60,6 +60,9 @@ export function Overview({
     dlTotal > 0
       ? Math.min(100, Math.round(((dl.state?.downloaded ?? 0) / dlTotal) * 100))
       : null;
+  // 【P3 扫尾 2026-11-07】多源回退：attempt>1 = 已自动换过 attempt-1 次源；
+  // 老 server 无字段时缺省 1，行内不出现提示（与关于页卡片同口径）。
+  const dlAttempt = dl.state?.attempt ?? 1;
   const onCheckUpdateRow = async () => {
     if (upd.kind === 'checking') return;
     if (upd.kind !== 'update') {
@@ -419,6 +422,8 @@ export function Overview({
                       : [`下载中${dlPct != null ? ` ${dlPct}%` : ''}`,
                           fmtSpeed(dl.speed),
                           dl.etaSec != null ? `剩余 ${fmtEta(dl.etaSec)}` : '',
+                          // 【P3 扫尾 2026-11-07】换源提示：进度归零不是 bug
+                          dlAttempt > 1 ? `已切换备用源（第 ${dlAttempt - 1} 次）` : '',
                         ]
                           .filter(Boolean)
                           .join(' · '))}

@@ -273,6 +273,13 @@ export function UpdateDownloadCard({
         </div>
       )}
 
+      {/* 【P3 扫尾 2026-11-07】多源回退提示：attempt>1 = server 已自动换过
+          attempt-1 次下载源（此时进度归零是换源重下，不是卡死/bug）；
+          老 server 无该字段或回落 1 时不显示。样式沿用 upd-hint。 */}
+      {active && st.attempt != null && st.attempt > 1 && (
+        <div className="upd-hint">网络不佳，已自动切换备用下载源（第 {st.attempt - 1} 次）</div>
+      )}
+
       {(st.dest || st.dir) && phase !== 'error' && phase !== 'cancelled' && (
         <div className="upd-path">
           <span>保存到</span>

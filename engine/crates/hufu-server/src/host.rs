@@ -1136,28 +1136,38 @@ impl Host {
         // 【P0-2 2026-11-03】先验证新方案可装载，再落盘：旧实现先 save
         // 再 switch_schema，方案目录被删/损坏时磁盘配置已坏，server 重启
         // exit(1)，输入法整体不可用且无法通过设置页恢复。
-        if schema_changed {
+        // 【治本 2026-11-07】预装载兼验证：原实现 Schema::load 验证一遍 +
+        // switch_schema 内部再装一遍（双重装载，大方案 1-2s 持锁）；装载
+        // 结果直接交 apply_schema（纯应用段零装载 IO），单遍装载。口径
+        // 与 switch_schema 完全一致（同一 load_schema_for）。
+        let prepared = if schema_changed {
             if cfg.schema.current.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "方案名为空",
                 ));
             }
-            let target =
-                Engine::resolve_data_sub(&self.data_dir, &cfg.schema.dir).join(&cfg.schema.current);
-            if let Err(e) = hufu_dict::schema::Schema::load(&target) {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!("方案「{}」无法装载，配置未保存: {e}", cfg.schema.current),
-                ));
-            }
-        }
+            Some(
+                Engine::load_schema_for(&self.data_dir, &cfg.schema.dir, &cfg.schema.current)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "方案「{}」无法装载，配置未保存: {e}",
+                                cfg.schema.current
+                            ),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let old_config = self.engine.config.clone();
         cfg.save(&self.config_path)?;
         self.engine.config = cfg;
-        if schema_changed {
+        if let Some(prepared) = prepared {
             let name = self.engine.config.schema.current.clone();
-            if let Err(e) = self.engine.switch_schema(&name) {
+            if let Err(e) = self.engine.apply_schema(&name, prepared) {
                 // 竞态兜底（验证后目录恰好被删）：回写旧配置，别把磁盘
                 // 留在「保存成功但方案装不上」的坏状态。
                 self.engine.config = old_config.clone();

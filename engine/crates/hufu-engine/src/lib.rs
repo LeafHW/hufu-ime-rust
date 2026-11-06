@@ -847,6 +847,27 @@ impl Engine {
 
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
+        // 【T2-5b 2026-11-07】同步切方案（设置页路由保持同步语义）：作废
+        // 在途后台切换——apply 端 from 守卫之外这里直接摘除，防其装载
+        // 结果晚到挤掉本次切换（装载失败也作废，语义保持）。不 join：
+        // 装载线程自然退出（不持锁，无死锁面），不阻塞本路由。
+        let _ = self.switch_pending.take();
+        // 【治本 2026-11-07】装载段抽到 load_schema_for（可在 Host 锁外
+        // 调用），应用段抽到 apply_schema——switch = prepare + apply，
+        // 行为与旧一体实现逐行等价。
+        let schema = Self::load_schema_for(&self.data_dir, &self.config.schema.dir, name)?;
+        self.apply_schema(name, schema)
+    }
+
+    /// 【治本 2026-11-07】纯装载段（不碰 self 状态，可在 Host 锁外调
+    /// 用）：空名防御 + Schema::load + 数据目录根全局个人存储表并入。
+    /// 三处共用同一口径：switch_schema、Ctrl+M 后台切换线程、server
+    /// 两段式路由 / apply_config 预装载（消双重装载）。
+    pub fn load_schema_for(
+        data_dir: &std::path::Path,
+        schema_dir: &str,
+        name: &str,
+    ) -> std::io::Result<Schema> {
         // 空名防御：dir.join("") = 码表根目录本身，Schema::load 会把
         // 所有方案子目录当一个方案读（实测挂死 30s+，Ctrl+M 卡死根源；
         // recent_pair 污染出空端时 target 即空名）。
@@ -856,21 +877,25 @@ impl Engine {
                 "empty schema name",
             ));
         }
-        // 【T2-5b 2026-11-07】同步切方案（设置页路由保持同步语义）：作废
-        // 在途后台切换——apply 端 from 守卫之外这里直接摘除，防其装载
-        // 结果晚到挤掉本次切换。不 join：装载线程自然退出（不持锁，
-        // 无死锁面），不阻塞本路由。
-        let _ = self.switch_pending.take();
-        let old = self.config.schema.current.clone();
-        let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
+        let dir = Self::resolve_data_sub(data_dir, schema_dir).join(name);
         let mut schema = Schema::load(&dir)?;
         // 【个人存储表·数据目录 2026-10-16】切方案同口径并入数据目录根
         // 的全局个人存储表（改文件后切一次方案即热生效，不必重启 server）。
         for stem in ["个人存储表", "个人存储"] {
             for ext in ["txt", "yaml"] {
-                schema.merge_personal_file(&self.data_dir.join(format!("{stem}.{ext}")));
+                schema.merge_personal_file(&data_dir.join(format!("{stem}.{ext}")));
             }
         }
+        Ok(schema)
+    }
+
+    /// 【治本 2026-11-07】应用已装载方案（switch_schema 成功路径后半
+    /// 段，零装载 IO）：schema 交换/会话学习清空/全局资源/方案名/最
+    /// 近方案对/display_raw 代际失效。锁外预载后短锁直调同样先摘除
+    /// 在途后台切换。
+    pub fn apply_schema(&mut self, name: &str, schema: Schema) -> std::io::Result<()> {
+        let _ = self.switch_pending.take();
+        let old = self.config.schema.current.clone();
         self.schema = schema;
         // 【三十六修】会话学习按 (code,text) 登记，码义随方案变——
         // 切方案即作废，防跨方案错配回放。
@@ -895,19 +920,15 @@ impl Engine {
     /// 键/选词入口原子应用。装载失败：清 pending 保留旧方案，诊断走
     /// eprintln（键路径原本无 state 错误通道，同 ensure_reverse 先例）。
     fn begin_schema_switch(&mut self, target: &str) {
-        let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(target);
         let data_dir = self.data_dir.clone();
+        let schema_dir = self.config.schema.dir.clone();
+        let target = target.to_string();
+        let target_bg = target.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Result<Schema, std::io::Error>>();
         let handle = std::thread::spawn(move || {
-            // 与 switch_schema 相同的装载段（load + 全局个人存储表并入）
-            let res = Schema::load(&dir).and_then(|mut s| {
-                for stem in ["个人存储表", "个人存储"] {
-                    for ext in ["txt", "yaml"] {
-                        s.merge_personal_file(&data_dir.join(format!("{stem}.{ext}")));
-                    }
-                }
-                Ok(s)
-            });
+            // 与 switch_schema 相同的装载段（【治本 2026-11-07】随装载段
+            // 抽出而复用 load_schema_for，单一口径）
+            let res = Self::load_schema_for(&data_dir, &schema_dir, &target_bg);
             let _ = tx.send(res); // rx 已亡（被作废）时静默丢弃，线程退出
         });
         self.switch_pending = Some(SwitchPending {

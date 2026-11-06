@@ -681,6 +681,16 @@ fn load_skin() {
         };
         // 预览用固定 22/15px（皮肤字号只用在候选窗；弹窗预览要能一屏装下）
         // 【2026-11-04 字号放大·二档】20/14 → 22/15（cell 30/20）。
+        // 【P3 扫尾 2026-11-07】换肤重建字体前先释放旧 HFONT——原实现
+        // 直接覆盖 Option，每次换肤漏 3 枚 GDI 字体句柄（刷子族同路径
+        // 已修：ensure_brushes:275 reset_brushes 先释放；字体族半边漏）。
+        // 若字体恰被某 DC 选中，DeleteObject 仅静默失败（无崩溃面），
+        // 与刷子族释放同语义。
+        for slot in [&FONT_MAIN, &FONT_LABEL, &FONT_NEW] {
+            if let Some(f) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = DeleteObject(HGDIOBJ(f as *mut core::ffi::c_void));
+            }
+        }
         *FONT_MAIN.lock().unwrap_or_else(|p| p.into_inner()) =
             Some(mk_font(22, FW_NORMAL.0 as i32).0 as usize);
         *FONT_LABEL.lock().unwrap_or_else(|p| p.into_inner()) =

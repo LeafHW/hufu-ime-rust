@@ -61,6 +61,13 @@ const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 /// 解码缓存条目上限（LRU；虎娘 ≤2 条，DLL 侧多窗口共用放宽到 8）。
 const CACHE_LIMIT: usize = 8;
+// 【P3 扫尾 2026-11-07】缓存总字节预算（跨条逐出闸）：原实现只按条数
+// （8 条）收缩，LRU 8 条 × 单条 64MB 解码预算 = 理论 512MB 帧流驻留。
+// 插入后从 LRU 尾部整条逐出直到总字节 ≤ 本预算。128MB = 单条上限
+// （MAX_DECODE_BYTES=64MB）的 2 倍：当前皮肤 + 一张备选常驻，兼顾换皮
+// 回切免重解码；被逐条目若仍被在用窗口以 Arc 持有，其内存延迟到引用
+// 归零才真正释放（账本按缓存持有口径计，暂存部分属短暂上界）。
+const CACHE_BYTES_BUDGET: u64 = 128 * 1024 * 1024;
 /// 动图每帧延迟下限（虎娘口径：最小 20ms）。
 const MIN_FRAME_DELAY_MS: u32 = 20;
 
@@ -254,6 +261,17 @@ struct CacheEntry {
 //（同 candwin2 MENU_FONT 静态模式）。
 static BITMAP_CACHE: Mutex<Option<HashMap<(PathBuf, String), CacheEntry>>> = Mutex::new(None);
 static CACHE_TICK: AtomicU64 = AtomicU64::new(0);
+// 【P3 扫尾 2026-11-07】缓存总字节账本（原子计数）：随 BITMAP_CACHE 锁内
+// insert/同 key 覆盖/LRU 逐出同步增减（with_cache 仅两处调用点：命中
+// 只摸 last_used、插入独占全部字节变更，账目无漏口）；用于跨条预算
+// 逐出闸 CACHE_BYTES_BUDGET。原子量便于未来无锁诊断读数。
+static CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 条目解码帧总字节（BGRA 帧流 Vec 实际分配口径；静态图=单帧）。
+/// 【P3 扫尾 2026-11-07】存条目时按帧 len 求和记录，不做估算。
+fn entry_bytes(e: &CacheEntry) -> u64 {
+    e.bitmap.frames.iter().map(|f| f.len() as u64).sum()
+}
 
 /// 持锁访问缓存表（首访问建表）。
 fn with_cache<R>(f: impl FnOnce(&mut HashMap<(PathBuf, String), CacheEntry>) -> R) -> R {
@@ -456,22 +474,33 @@ fn load_bitmap_uncached(cache_dir: &Path, fp: &str, name: &str) -> Result<Arc<Ss
     // ③ 回锁插入 + LRU 收缩（期间他线程先插同 key 则覆盖，二者等价：
     // 同 path 同 fp 的解码结果确定性一致）
     with_cache(|cache| {
-        cache.insert(
-            key,
-            CacheEntry {
-                fp: fp.to_string(),
-                bitmap: bmp.clone(),
-                last_used: cache_tick(),
-            },
-        );
-        while cache.len() > CACHE_LIMIT {
+        // 【P3 扫尾 2026-11-07】除原条数上限外叠加总字节预算跨条逐出：
+        // 插入后从 LRU 尾部（最久未用）整条逐出，直到条数 ≤CACHE_LIMIT
+        // 且总字节 ≤CACHE_BYTES_BUDGET。单条 ≤64MB（解码预算）< 128MB
+        // 预算，循环最迟剩 1 条时必然收敛。命中路径（① 快路径）零改动。
+        let entry = CacheEntry {
+            fp: fp.to_string(),
+            bitmap: bmp.clone(),
+            last_used: cache_tick(),
+        };
+        let add = entry_bytes(&entry);
+        if let Some(old) = cache.insert(key, entry) {
+            // 同 key 覆盖（fp 变更重存同图名）：旧条目字节先出账
+            CACHE_BYTES.fetch_sub(entry_bytes(&old), Ordering::Relaxed);
+        }
+        CACHE_BYTES.fetch_add(add, Ordering::Relaxed);
+        while cache.len() > CACHE_LIMIT
+            || CACHE_BYTES.load(Ordering::Relaxed) > CACHE_BYTES_BUDGET
+        {
             let victim = cache
                 .iter()
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(k) => {
-                    cache.remove(&k);
+                    if let Some(e) = cache.remove(&k) {
+                        CACHE_BYTES.fetch_sub(entry_bytes(&e), Ordering::Relaxed);
+                    }
                 }
                 None => break,
             }
