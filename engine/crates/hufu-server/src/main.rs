@@ -415,7 +415,10 @@ fn main() {
         let _ = std::thread::Builder::new()
             .name("hufu-reverse-warm".into())
             .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                // 【T2-4 2026-11-07】2s→6s：错峰启动盘 IO 高峰（server 起
+                // 动+词典+ngram 并发读盘），减首分把按键撞上 700ms 锁内
+                // 装表的概率；错过窗口首按反查自动懒加载兜底。
+                std::thread::sleep(std::time::Duration::from_secs(6));
                 let mut h = shared_bg.lock().unwrap_or_else(|p| p.into_inner());
                 h.engine.ensure_reverse();
             });
@@ -2381,6 +2384,54 @@ fn valid_skin_id(id: &str) -> bool {
             .any(|c| c.is_control() || c == '/' || c == '\\' || c == '\0')
 }
 
+/// 【T2-4 2026-11-07】从 Host::list_skins_with_palette 抽出的锁外版：
+/// 只依赖 data_dir，GET /api/skins 快照路径后在 Host 锁外调用（皮肤
+/// 枚举是 MB 级盘活，不能占打字关键区）。
+fn list_skins_with_palette_at(
+    data_dir: &std::path::Path,
+) -> Vec<(String, String, String, String)> {
+    fn hex(c: [u8; 4]) -> String {
+        format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+    }
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(data_dir.join("皮肤")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "json").unwrap_or(false) {
+                let id = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                match hufu_skin::Skin::load(&p) {
+                    Ok(s) => out.push((
+                        id,
+                        s.name.clone(),
+                        hex(s.colors.back_color.0),
+                        hex(s.colors.hilited_candidate_back_color.0),
+                    )),
+                    Err(_) => out.push((
+                        id.clone(),
+                        id,
+                        "#2E323A".into(),
+                        "#E7B75C".into(),
+                    )),
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push((
+            "hufu-default".into(),
+            "迷雾（内置）".into(),
+            "#202022".into(),
+            "#E7B75C".into(),
+        ));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn route(host: &Mutex<Host>, req: &Request) -> Response {
     // 【浏览器源加固 2026-09-11】所有副作用端点（POST，及 2026-12 新增
     // DELETE /api/skin）拒绝跨源网页：
@@ -2552,6 +2603,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             _ => Response::err(404, "not found"),
         };
     }
+    // 【T2-4 2026-11-07】保留锁引用：下方 guard 会遮蔽参数名，两段式
+    // 路由（drop 锁外干重活后）需要它重新取锁。
+    let host_cell: &Mutex<Host> = host;
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     let method = req.method.as_str();
     let path = req.path.as_str();
@@ -2839,10 +2893,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // name 回退文件名。
             let cur = host.engine.config.appearance.skin.clone();
             let cur_kind = host.engine.config.appearance.skin_kind.clone();
+            // 【T2-4 2026-11-07】皮肤枚举/解析（JSON 皮逐张 parse、ssf
+            // unbundle）是 MB 级盘活且只依赖 data_dir——快照后放锁，
+            // 打字帧不再被设置页拉列表牵连。
+            let data_dir = host.data_dir.clone();
+            drop(host);
             /* 【2026-11-03 图标一致性】JSON 皮肤列表带两个代表色：设置页概览
                「当前皮肤」和皮肤列表缩略图共用同一套配色，避免两处图标不一样。 */
-            let mut list: Vec<serde_json::Value> = host
-                .list_skins_with_palette()
+            let mut list: Vec<serde_json::Value> = list_skins_with_palette_at(&data_dir)
                 .into_iter()
                 .map(|(id, name, swatch, accent)| {
                     serde_json::json!({
@@ -2851,7 +2909,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     })
                 })
                 .collect();
-            for e in host.list_ssf_skins() {
+            for e in crate::ssf::list_ssf(&data_dir) {
                 let mut it = serde_json::json!({
                     "id": e.id,
                     "kind": "ssf",
@@ -2876,8 +2934,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     .iter()
                     .any(|x| x["kind"] == "ssf" && x["id"].as_str() == Some(cur.as_str()))
             {
-                let name = host
-                    .ssf_bundle(&cur)
+                let name = crate::ssf::bundle_for(&data_dir, &cur)
                     .map(|b| {
                         if b.def.name.is_empty() {
                             cur.clone()
@@ -3199,8 +3256,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 存 皮肤\{name}.ssf → 解包建缓存 → {ok, id, warnings}；不自动
         // 切换（UI 需要时另调 /api/skin/select）。
         ("POST", "/api/skin/import_ssf") => {
+            // 【T2-4 2026-11-07】解包/建缓存/写盘是 MB 级慢活且不依赖
+            // Host 状态（只需 data_dir）——移出 Host 锁，打字帧不排队。
+            let data_dir = host.data_dir.clone();
+            drop(host);
             let qname = req.query.get("name").map(|s| s.as_str());
-            match ssf::import_ssf(&host.data_dir, &req.body, qname) {
+            match ssf::import_ssf(&data_dir, &req.body, qname) {
                 Ok((id, warnings)) => Response::json(&serde_json::json!({
                     "ok": true,
                     "id": id,
@@ -3307,7 +3368,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     ]
                 });
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::candwin::render_preview(&skin, items, &raw_text, 0, scale)
+                crate::candwin::render_preview(skin, items, &raw_text, 0, scale)
             }));
             let (w, h, bgra, _margin) = match rendered {
                 Ok(v) => v,
@@ -3865,6 +3926,15 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // bundle 1=老格式（图内联）；2=资产池引用（导入前解回内联）；
             // 3=+独立皮肤（用户自弄 .ssf 落盘 + 全部 overrides 恢复）。
             let mut v = req.json();
+            // 【T2-4 2026-11-07】导入重活（JSON 解析+base64 解码+逐张写
+            // 盘+ssf 解包）除「本机 sentence 节」与目录路径外不依赖
+            // Host——开头快照后放锁，落盘完成再短锁 apply_config。
+            let local_sentence = host.engine.config.sentence.clone();
+            let schema_at_start = host.engine.config.schema.current.clone();
+            let data_dir = host.data_dir.clone();
+            let skins_dir = host.skins_dir();
+            let ssf_dir = host.ssf_skins_dir();
+            drop(host);
             let bundle_ver = v.get("hufu_settings_bundle").and_then(|x| x.as_i64());
             match bundle_ver {
                 Some(1) | Some(2) | Some(3) => {}
@@ -3911,7 +3981,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 参数：无论导出件新旧（老版本导出的旧参数/手改件），本机
             // sentence 节原样保留——新算法/新调参不因导入回退。导出端
             // 已剥 sentence，本闸是双向闸的另一半（老导出件仍带 sentence）。
-            cfg.sentence = host.engine.config.sentence.clone();
+            cfg.sentence = local_sentence;
             let mut skins_applied = 0usize;
             if let Some(skins) = v.get("skins").and_then(|x| x.as_object()) {
                 // 【P1-20 2026-11-05】两阶段：先全部校验+序列化（内存），
@@ -3932,13 +4002,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         continue;
                     }
                     if let Ok(txt) = serde_json::to_string(sv) {
-                        staged.push((host.skins_dir().join(format!("{id}.json")), txt));
+                        staged.push((skins_dir.join(format!("{id}.json")), txt));
                     }
                 }
-                let dir = host.skins_dir();
-                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::create_dir_all(&skins_dir);
                 for (p, txt) in staged {
-                    if std::fs::write(&p, txt).is_ok() {
+                    // 【防回归修复(08-reg P3-1) 2026-11-07】tmp+rename 原
+                    // 子替换：直写期间 pipe 皮肤重载会读到半截 JSON→解
+                    // 析失败把默认皮钉进 (want_ver) 缓存槽直到下次换肤。
+                    let tmp = p.with_extension("json.tmp");
+                    if std::fs::write(&tmp, txt).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
                         skins_applied += 1;
                     }
                 }
@@ -3954,7 +4027,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if bundle_ver == Some(3) {
                 // 【P1-20 2026-11-05】.ssf 与 overrides 同款两阶段：先全部
                 // parse/serde 校验暂存（内存），再统一落盘/建缓存。
-                let dir = host.ssf_skins_dir();
+                let dir = ssf_dir.clone();
                 let _ = std::fs::create_dir_all(&dir);
                 let mut staged_ssf: Vec<(String, Vec<u8>)> = Vec::new();
                 if let Some(m) = v.get("ssf_skins").and_then(|x| x.as_object()) {
@@ -3976,7 +4049,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                 }
                 for (id, bytes) in staged_ssf {
-                    if std::fs::write(dir.join(format!("{id}.ssf")), &bytes).is_ok() {
+                    // 【防回归修复(08-reg P3-3 同族) 2026-11-07】.ssf 同
+                    // 款 tmp+rename：避免并发 select/bundle_for 撞半截 zip。
+                    let final_p = dir.join(format!("{id}.ssf"));
+                    let tmp = dir.join(format!("{id}.ssf.tmp"));
+                    if std::fs::write(&tmp, &bytes).is_ok()
+                        && std::fs::rename(&tmp, &final_p).is_ok()
+                    {
                         ssf_skins_applied += 1;
                     }
                 }
@@ -3996,13 +4075,31 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 for (id, ov) in staged_ov {
                     // 缓存就绪（缺则解包建目录——含刚落盘的用户皮肤
                     // 与官方自带；失败跳过该皮肤设置）
-                    if let Ok(b) = crate::ssf::bundle_for(&host.data_dir, &id) {
+                    if let Ok(b) = crate::ssf::bundle_for(&data_dir, &id) {
                         let ov_text = serde_json::to_string(&ov).unwrap_or_default();
-                        if std::fs::write(b.cache_dir.join("overrides.json"), ov_text).is_ok() {
+                        // 【防回归修复(08-reg P3-1 同族)】overrides.json
+                        // tmp+rename 原子替换，避免并发读半截。
+                        let p = b.cache_dir.join("overrides.json");
+                        let tmp = b.cache_dir.join("overrides.json.tmp");
+                        if std::fs::write(&tmp, ov_text).is_ok()
+                            && std::fs::rename(&tmp, &p).is_ok()
+                        {
                             ssf_settings_applied += 1;
                         }
                     }
                 }
+            }
+            // 【T2-4 2026-11-07】落盘完毕，短锁应用配置（apply_config 内部
+            // schema 变更时的装载仍持锁——待引擎 prepare/apply 拆分后并
+            // 入锁外预载）。
+            let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+            // 【防回归修复(08-reg P3-2) 2026-11-07】导入落盘期间并发的
+            // 运行时改动（Ctrl+M 切方案/云恢复等）不能被整份 apply_
+            // config 吞掉——回填当前 sentence；schema 若期间被改过则
+            // 运行时值优先（与旧持锁串行版的最终状态一致）。
+            cfg.sentence = host.engine.config.sentence.clone();
+            if host.engine.config.schema.current != schema_at_start {
+                cfg.schema = host.engine.config.schema.clone();
             }
             match host.apply_config(cfg) {
                 Ok((need_sentence, teardown)) => {

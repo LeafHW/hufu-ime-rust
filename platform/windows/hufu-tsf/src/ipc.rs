@@ -416,16 +416,21 @@ fn ensure_server() -> bool {
 struct Chan {
     file: Option<std::fs::File>,
     buf: Vec<u8>,
+    /// 【T1-1 2026-11-07】新连接第一拍标记：冷启动 server（词典装载）
+    /// 首请求耗时远超稳态——第一拍保留长超时，成功收满一帧即转稳态短超时。
+    first: bool,
 }
 static PIPE_KEY: std::sync::Mutex<Chan> = std::sync::Mutex::new(Chan {
     file: None,
     buf: Vec::new(),
+    first: true,
 });
 /// 后台通道（poll/focus/音效/探测）：读上限压到 150ms——后台慢就
 /// 弃连接重来，绝不长时间占锁。
 static PIPE_BG: std::sync::Mutex<Chan> = std::sync::Mutex::new(Chan {
     file: None,
     buf: Vec::new(),
+    first: true,
 });
 
 /// 【P1-6 2026-11-04】连接失败退避截止（unix ms；0=无退避）。
@@ -509,7 +514,9 @@ pub fn call(req: &Value) -> Option<Value> {
     serde_json::to_writer(&mut frame, req).ok()?;
     let n = (frame.len() - 4) as u32;
     frame[..4].copy_from_slice(&n.to_le_bytes());
-    call_on(&PIPE_BG, &frame, 150, 150)
+    // 【T1-1 2026-11-07】后台通道首拍也保持 150/150：后台铁律是绝不
+    // 长时间占锁（poll 线程陪等会拖死通道），不享受冷启动长超时。
+    call_on(&PIPE_BG, &frame, 150, 150, 150, 150)
 }
 
 fn call_on(
@@ -517,6 +524,8 @@ fn call_on(
     frame: &[u8],
     resp_timeout: u64,
     body_timeout: u64,
+    first_resp_timeout: u64,
+    first_body_timeout: u64,
 ) -> Option<Value> {
     unsafe {
         let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -526,9 +535,19 @@ fn call_on(
                 if g.file.is_none() {
                     return None;
                 }
+                g.first = true;
             }
+            // 【T1-1 2026-11-07】稳态键路超时（防回归修正 10-reg P1：
+            // 500/500 会撞设置页切方案等剩余合法慢锁段 0.05-1s→键路闪
+            // 断强提交组段；1200/600 覆盖最坏段+余量，仍优于旧 2s 冻结。
+            // 仅新连接第一拍保留长超时（冷启动首请求）。
+            let (resp_timeout, body_timeout) = if g.first {
+                (first_resp_timeout, first_body_timeout)
+            } else {
+                (resp_timeout, body_timeout)
+            };
             // 字段拆借：file 与 buf 互不重叠可同时可变借用（body 直写复用缓冲）
-            let Chan { file, buf } = &mut *g;
+            let Chan { file, buf, first } = &mut *g;
             let f = file.as_mut().unwrap();
             // 【读超时】阻塞 read_exact 无超时——server 端 dispatch 持全局
             // Host 锁，长操作（切方案重装整句等）排队期间响应悬死，调用方
@@ -667,6 +686,9 @@ fn call_on(
                 *file = None;
                 return None;
             }
+            // 【T1-1 2026-11-07】完整帧收满=连接已验证可用，转稳态：
+            // 后续请求走短超时（挂死场景每键冻结从 2s 降到 0.5s）。
+            *first = false;
             return serde_json::from_slice(buf).ok();
         }
         None
@@ -712,9 +734,12 @@ pub fn key_request(
     let mut frame: Vec<u8> = Vec::with_capacity(body.len() + 4);
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(&body);
-    // 键通道（与后台物理分离）+ 完整超时（server 正常 <3ms；上限保留
-    // 给极端恢复场景）
-    let mut resp = match call_on(&PIPE_KEY, &frame, 2000, 1000) { Some(r)=>r, None=>{crate::candidate_ui::reset();return None;} };
+    // 键通道（与后台物理分离）。【T1-1 2026-11-07】稳态上限 1200/600
+    //（防回归修正 10-reg P1：server 正常 <3ms，500/500 会撞设置页切方
+    // 案等剩余合法慢锁段→键路闪断；1200 覆盖最坏段+余量，仍优于旧 2s
+    // 冻结。2000/1000 只保留给新连接第一拍——server 冷启动首请求需
+    // 长预算）。
+    let mut resp = match call_on(&PIPE_KEY, &frame, 1200, 600, 2000, 1000) { Some(r)=>r, None=>{crate::candidate_ui::reset();return None;} };
     // 【热路径】state 用 take 移交所有权——旧版 .cloned() 每键深拷
     // 整棵 state 子树（候选数组/编码串全在里面）
     let state = resp
@@ -755,7 +780,7 @@ pub fn key_request(
 /// 轮询用：拉当前会话态（不产生按键副作用）。供候选窗停顿期刷新
 /// （异步重排到达后主动换序，用户不必按键即可看到新首选）。
 pub fn state_request() -> Option<Value> {
-    let resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()})) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
+    let mut resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()})) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
     // 【2026-11 UI-less 异步刷新】轮询响应里带回了最新候选页（含后台重排/
     // 云候选到达后的结果）。这里无条件 publish 一次：宿主自绘（UI-less）
     // 时我们的候选窗被隐藏，渲染路径不一定走到 update_ui，靠这一行保证
@@ -763,7 +788,9 @@ pub fn state_request() -> Option<Value> {
     if let Some(state) = resp.get("state") {
         crate::candidate_ui::publish(state);
     }
-    resp.get("state").cloned()
+    // 【T3-a 2026-11-07】take 直取所有权：旧 .cloned() 全树深拷 state
+    //（候选数组/编码串全在内）；publish 之后这里是唯一读方，无需副本。
+    resp.get_mut("state").map(std::mem::take)
 }
 
 /// 测试钩子：重置引擎会话（回默认中文态；真实应用里的 Shift 切换会污染

@@ -46,6 +46,7 @@ impl Export {
         }
         let mut out =
             json!({"protocol":1,"instance":self.instance,"context":context,"version":self.version});
+        let mut menu_included = false;
         if req
             .pointer("/candidate_ui/instance")
             .and_then(Value::as_str)
@@ -53,8 +54,18 @@ impl Export {
             || req.pointer("/candidate_ui/version").and_then(Value::as_u64) != Some(self.version)
         {
             out["menu"] = json!(self.menu);
+            menu_included = true;
         }
-        if serde_json::to_vec(&out).map_or(true, |v| v.len() > 1 << 20) {
+        // 【T3 2026-11-07】原实现整帧 to_vec 量尺寸、发送侧再序列化一遍
+        // （MB 级菜单=双重序列化）；只对已附带的 menu 单独量尺寸，无
+        // menu 的帧本就只有几百字节，不需要量。
+        if menu_included
+            && self
+                .menu
+                .as_ref()
+                .and_then(|m| serde_json::to_vec(m).ok())
+                .map_or(true, |v| v.len() > 1 << 20)
+        {
             out["menu"] = Value::Null;
         }
         out

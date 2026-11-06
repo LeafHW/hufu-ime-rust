@@ -58,20 +58,78 @@ fn file_stem_lower(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 【虎爪内嵌调整行判定】{置顶}/{添加}/{删除} 引导行（装载段先抽走
+/// 再 parse——见 Schema::load big_tables 段与 TxtProbe::WithAdjust）。
+fn is_adjust_line(l: &str) -> bool {
+    let t = l.trim_start();
+    t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
+}
+
 /// 【超集副表内容识别 2026-11 用户拍板】文件**内容**是否为 ` 前缀码
 /// 表（超集单字表）：非空、解析成功、且**全部**条目的编码都以 `
 /// 开头。文件名无关（用户文件可叫任何名字）；混合表（部分 ` 部分
 /// 普通）保守按普通主码表处理。琉璃超集格式 `字\t\`code`（词前
 /// TSV）经 parse_auto 解析后 code="`code"，天然命中。
-fn is_backtick_table(path: &Path) -> bool {
+///
+/// 【T2-5a 2026-11-07】单遍探测：旧 is_backtick_table 对每个普通 .txt
+/// 全量 read+parse 探测、装载段（:417/:445 附近）再读再解析一遍（双
+/// 解析）。现在 read+parse 全程只做一次，分类结论与装载数据随枚举
+/// 一并传递：
+/// - 无内嵌调整行：过滤后 parse 与全量 parse 输入相同（无行被滤掉）
+///   → rows 直接复用，主/副表装载零二次读+解析，对外结果等价。
+/// - 含内嵌调整行（虎爪内嵌导出）：格式嗅探投票受调整行影响，语义
+///   要求「滤掉调整行后再 parse」→ 保留原文行交装载段照旧处理，另
+///   携带全量 rows 供超集分支复用（与旧超集装载的二次全量 parse 同
+///   输入同结果）。该形态是唯一保留二次 parse 的路径——语义优先，
+///   宁可少优化不可改变装载行为。
+/// - 读取失败：等价旧探测返回 false → 进主码表候选，装载段按旧
+///   read 失败 continue 语义跳过。
+enum TxtProbe {
+    /// 读取失败（装载段跳过，与旧行为一致）。
+    Unreadable,
+    /// 无内嵌调整行：rows 即装载段 parse_auto(过滤后行) 的结果。
+    Parsed {
+        backtick: bool,
+        rows: Vec<DictEntry>,
+    },
+    /// 含内嵌调整行：lines 供装载段抽调整行+过滤+重 parse；
+    /// rows（全量 parse）供超集分支复用。
+    WithAdjust {
+        backtick: bool,
+        rows: Vec<DictEntry>,
+        lines: Vec<String>,
+    },
+}
+
+/// 【T2-5a 2026-11-07】主码表候选 .txt 的探测载荷（big_tables 随行）。
+enum BigTxtData {
+    /// 无内嵌调整行的全量 parse rows（装载段直用，免二次读+解析）。
+    Rows(Vec<DictEntry>),
+    /// 含内嵌调整行：原文行（装载段抽调整行+过滤+parse 照旧三步）。
+    Lines(Vec<String>),
+}
+
+/// 【T2-5a 2026-11-07】普通 .txt 单遍探测（read+parse 各一次），分类
+/// 结论与装载数据见 [`TxtProbe`]——消除探测/装载双解析，每文件开销
+/// 减半（Ctrl+M 切方案与启动装载热路径）。
+fn probe_txt_table(path: &Path) -> TxtProbe {
     let Ok(lines) = parse::read_lines(path) else {
-        return false;
+        return TxtProbe::Unreadable;
     };
     let t = parse::parse_auto(&lines);
-    if t.rows.is_empty() {
-        return false;
+    let backtick = !t.rows.is_empty() && t.rows.iter().all(|e| e.code.starts_with('`'));
+    if lines.iter().any(|l| is_adjust_line(l)) {
+        TxtProbe::WithAdjust {
+            backtick,
+            rows: t.rows,
+            lines,
+        }
+    } else {
+        TxtProbe::Parsed {
+            backtick,
+            rows: t.rows,
+        }
     }
-    t.rows.iter().all(|e| e.code.starts_with('`'))
 }
 
 /// 【自由组合 2026-10-10】import_tables 闭包合并（BFS，防环）——
@@ -154,10 +212,14 @@ impl Schema {
         };
 
         let mut rime_dicts: Vec<PathBuf> = Vec::new();
-        let mut big_tables: Vec<PathBuf> = Vec::new();
+        // 【T2-5a 2026-11-07】探测产物随行：big 表带可选载荷（探测已得
+        // 的 rows/lines；None=探测未覆盖或读取失败，装载段现读——用户
+        // 码表晋升路径与旧行为一致）。路径仍是 retain/排序依据。
+        let mut big_tables: Vec<(PathBuf, Option<BigTxtData>)> = Vec::new();
         // 【` 引导超集码表 2026-11】独立副表：**内容**识别（非空且
-        // 全部行编码带 ` 前缀——文件名任意），见装载段与 is_backtick_table。
-        let mut super_tables: Vec<PathBuf> = Vec::new();
+        // 全部行编码带 ` 前缀——文件名任意），见装载段与 probe_txt_table；
+        // 【T2-5a 2026-11-07】探测的全量 parse rows 直接随行（免二次读+解析）。
+        let mut super_tables: Vec<(PathBuf, Vec<DictEntry>)> = Vec::new();
         // 【个人存储表 2026-10-16】隐私码表专槽（stem=个人存储表/个人
         // 存储，txt/yaml 皆认）。装载段并入 schema.personal——绝不进
         // 主码表/用户词/导出/前台调整（见 personal 字段注释）。
@@ -263,7 +325,7 @@ impl Schema {
                     schema.reverse_path = Some(path.clone());
                 } else if stem == "个人存储表" || stem == "个人存储" {
                     // 【个人存储表 2026-10-16】match 分支已收专槽；
-                    // 此处拦截防 is_backtick_table 重复解析 + 误入
+                    // 此处拦截防 probe_txt_table 重复解析 + 误入
                     // big_tables（retain 段兜底双保险）。
                 } else {
                     // 其余 txt：内容分拣——` 前缀码全量副表（超集单字，
@@ -273,10 +335,29 @@ impl Schema {
                     // 文件名（超集/超字集）——用户文件叫什么名无关。
                     // 1.2MB 副表若混进主表竞选会抢主码表位，这里就地
                     // 分流到 super_tables（独立装载，` 域直查）。
-                    if is_backtick_table(&path) {
-                        super_tables.push(path.clone());
-                    } else {
-                        big_tables.push(path.clone());
+                    // 【T2-5a 2026-11-07】单遍探测替代 is_backtick_table：
+                    // read+parse 一次完成，分类与装载数据随枚举传递，
+                    // 装载段不再重复读+解析（等价性推导见 TxtProbe 注释）。
+                    match probe_txt_table(&path) {
+                        TxtProbe::Unreadable => big_tables.push((path.clone(), None)),
+                        TxtProbe::Parsed {
+                            backtick: true,
+                            rows,
+                        }
+                        | TxtProbe::WithAdjust {
+                            backtick: true,
+                            rows,
+                            ..
+                        } => super_tables.push((path.clone(), rows)),
+                        TxtProbe::Parsed {
+                            backtick: false,
+                            rows,
+                        } => big_tables.push((path.clone(), Some(BigTxtData::Rows(rows)))),
+                        TxtProbe::WithAdjust {
+                            backtick: false,
+                            lines,
+                            ..
+                        } => big_tables.push((path.clone(), Some(BigTxtData::Lines(lines)))),
                     }
                 }
             }
@@ -298,7 +379,9 @@ impl Schema {
         for p in user_tables {
             let big = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) >= BIG_USER_TABLE_AS_MAIN;
             if big {
-                big_tables.push(p);
+                // 【T2-5a 2026-11-07】晋升路径未走探测：载荷 None，装载段
+                // 现读现解析（与旧行为一致——本分支文件不双解析）。
+                big_tables.push((p, None));
             } else {
                 duoduo_user = Some(p);
             }
@@ -397,14 +480,16 @@ impl Schema {
         // 用户词有各自的专槽（上方 stem 分发已消费）——它们虽会兜
         // 落进 big_tables（read_dir 遍历不 continue 的历史结构），但
         // 语义是专表不是主码表，不得重复进词典域。
-        big_tables.retain(|p| {
+        big_tables.retain(|(p, _)| {
             !matches!(
                 file_stem_lower(p).as_str(),
                 "快符" | "常用符号" | "一简符号" | "补充语料" | "用户调整" | "用户词"
                     | "个人存储表" | "个人存储"
             )
         });
-        big_tables.sort();
+        // 【T2-5a 2026-11-07】按路径排序（载荷不参与比较——同目录无重名
+        // 路径，与旧 Vec<PathBuf>::sort() 全序等价）。
+        big_tables.sort_by(|a, b| a.0.cmp(&b.0));
         if !big_tables.is_empty() {
             let d = dict.get_or_insert_with(|| Dict::new(&name));
             // 【虎爪码表内嵌调整 2026-09-06】虎爪导出的码表把学习记录直接
@@ -413,20 +498,35 @@ impl Schema {
             // 词条（码=「{添加}xx」非法编码，静默成死数据）。解析前抽走：
             // 词典不含死行；抽出的行进统一回放（见加载收尾）。多 txt 并
             // 存时逐个抽取（extend）。
-            for p in &big_tables {
-                let Ok(lines) = parse::read_lines(p) else {
-                    continue;
+            // 【T2-5a 2026-11-07】载荷三分支：①探测 rows 直用（无调整行，
+            // 全量 parse==过滤后 parse，输入相同结果等价）；②有调整行/
+            // ③未探测走旧三步（抽调整行→过滤→parse——嗅探投票受调整
+            // 行影响，不能用全量 parse 替代过滤后 parse）。
+            for (p, payload) in big_tables {
+                let dict_lines: Vec<String> = match payload {
+                    Some(BigTxtData::Rows(rows)) => {
+                        // 空表守卫与旧 `!t.rows.is_empty()` 同口径
+                        if !rows.is_empty() {
+                            d.merge(&Dict::from_entries(file_stem_lower(&p), rows));
+                        }
+                        continue;
+                    }
+                    Some(BigTxtData::Lines(lines)) => {
+                        embedded_adj.extend(lines.iter().filter(|l| is_adjust_line(l)).cloned());
+                        lines.into_iter().filter(|l| !is_adjust_line(l)).collect()
+                    }
+                    None => match parse::read_lines(&p) {
+                        Ok(lines) => {
+                            embedded_adj
+                                .extend(lines.iter().filter(|l| is_adjust_line(l)).cloned());
+                            lines.into_iter().filter(|l| !is_adjust_line(l)).collect()
+                        }
+                        Err(_) => continue, // 旧 read 失败 continue 跳过
+                    },
                 };
-                let is_adjust = |l: &String| {
-                    let t = l.trim_start();
-                    t.starts_with("{置顶}") || t.starts_with("{添加}") || t.starts_with("{删除}")
-                };
-                embedded_adj.extend(lines.iter().filter(|l| is_adjust(l)).cloned());
-                let dict_lines: Vec<String> =
-                    lines.into_iter().filter(|l| !is_adjust(&l)).collect();
                 let t = parse::parse_auto(&dict_lines);
                 if !t.rows.is_empty() {
-                    d.merge(&Dict::from_entries(file_stem_lower(p), t.rows));
+                    d.merge(&Dict::from_entries(file_stem_lower(&p), t.rows));
                 }
             }
         }
@@ -439,12 +539,14 @@ impl Schema {
         // super_dict；多个副表按文件名序合并。此表码全带 ` 前缀——与
         // 主码表（无 ` 编码）天然分域，引擎 ` 编码态直查此表。
         if !super_tables.is_empty() {
-            super_tables.sort();
+            // 【T2-5a 2026-11-07】rows 已随探测载荷传入（与旧装载段二次
+            // read+parse 同输入同结果）；按路径序合并不变。旧代码此处
+            // read 失败会 `?` 中止整个装载——单遍化后探测成功即必成功，
+            // 该「装载中途文件消失」竞态错误路径随二次读取一并消除。
+            super_tables.sort_by(|a, b| a.0.cmp(&b.0));
             let mut rows: Vec<DictEntry> = Vec::new();
-            for p in &super_tables {
-                let lines = parse::read_lines(p)?;
-                let t = parse::parse_auto(&lines);
-                rows.extend(t.rows);
+            for (_, r) in &super_tables {
+                rows.extend(r.iter().cloned());
             }
             schema.super_dict = std::sync::Arc::new(Dict::from_entries(
                 format!("{name}-超集"),

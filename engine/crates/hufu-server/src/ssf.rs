@@ -532,7 +532,11 @@ pub fn import_ssf(
     let p = dir.join(&fname);
     // 新导入是显式用户动作：清负缓存，强制真解一遍
     fail_clear(&p);
-    std::fs::write(&p, bytes).map_err(|e| format!("写入失败: {e}"))?;
+    // 【防回归修复(08-reg P3-3) 2026-11-07】tmp+rename 原子替换：直写
+    // 期间并发的 select 同 id 真解会撞半截 zip→一次 400+瞬时负缓存。
+    let tmp = dir.join(format!("{fname}.tmp"));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入失败: {e}"))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("落盘失败: {e}"))?;
     let b = unbundle(data_dir, &p)?;
     Ok((b.id, b.def.warnings.clone()))
 }

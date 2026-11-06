@@ -19,8 +19,10 @@ pub struct CandFrame {
     pub items: Vec<(String, String)>,
     pub raw: String,
     pub selected: usize,
-    /// 用户皮肤（与 DLL 自绘窗同一份 JSON；server 按同字段渲染）
-    pub skin: serde_json::Value,
+    /// 用户皮肤（与 DLL 自绘窗同一份 JSON；server 按同字段渲染）。
+    /// 【T1-3 2026-11-07】改 Arc 共享：动图皮皮肤 JSON 可达 MB 级，
+    /// 逐帧 Value 深克隆是代画宿主毫秒级抖动主源——缓存与帧共享同一份。
+    pub skin: std::sync::Arc<serde_json::Value>,
 }
 
 static FRAME: Mutex<Option<CandFrame>> = Mutex::new(None);
@@ -398,7 +400,7 @@ fn composite_text(
 /// 150%/200% 屏候选窗整体偏小、与 candwin2 观感不一致。全部布局
 /// 值统一乘 scale（与 candwin2 的位图×scale 同语义）。
 pub fn render_preview(
-    skin: &serde_json::Value,
+    skin: serde_json::Value,
     items: Vec<(String, String)>,
     raw: &str,
     selected: usize,
@@ -408,13 +410,13 @@ pub fn render_preview(
         items,
         raw: raw.to_string(),
         selected,
-        skin: skin.clone(),
+        skin: std::sync::Arc::new(skin),
     };
     render_frame(&frame, scale)
 }
 
 fn render_frame(f: &CandFrame, scale: f32) -> (i32, i32, Vec<u8>, i32) {
-    let skin = &f.skin;
+    let skin = &*f.skin;
     let s = scale.max(0.5).min(4.0);
 
     // ── 皮肤参数（与 candwin2 show() 同公式）──
@@ -1232,7 +1234,7 @@ mod shadow_gate_tests {
             ],
             raw: "g".to_string(),
             selected: 0,
-            skin,
+            skin: std::sync::Arc::new(skin),
         }
     }
 

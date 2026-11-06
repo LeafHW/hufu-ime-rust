@@ -473,18 +473,89 @@ pub struct Engine {
     ///（证sf+不cb）抢跑分段。分道扬镳（后续键与全部变体不一致）后
     /// 自动恢复置信上屏。
     supp_hold: std::sync::Mutex<Option<(String, Vec<String>, Vec<(String, String)>)>>,
-    /// 【修复标签 2026-09-11】user-adjust.log 写盘防抖：learn 原先每词
-    /// 开文件追加一行的写盘，改为内存累积（pending 行缓冲）+ 脏标记，
-    /// 节流落盘（距上次 ≥5s 且累积 ≥8 条才写），会话断段（process_key
-    /// 出口缓冲全空）强制 flush 兜底——频繁学习不再每词一次磁盘 IO，
-    /// 落盘行序与逐条写完全一致。
-    learn_log_pending: Vec<String>,
-    learn_log_last_flush: std::time::Instant,
+    /// 【T2-6 2026-11-07】user-adjust.log 异步批量写：行入 mpsc 通道，
+    /// 专用写线程持文件句柄合并 append（替代旧「内存缓冲+5s/8 条节流
+    /// +键线程 flush」——磁盘 IO 彻底离开按键线程；文件内容格式与行
+    /// 序不变，同一进程内保持时序）。通道满（1024）丢弃并计数：学习
+    /// 日志尽力而为。写线程懒起（首条日志才建），Engine drop 关发送
+    /// 端 + join，不丢已入队条目。
+    learn_log_tx: Option<std::sync::mpsc::SyncSender<String>>,
+    learn_log_worker: Option<std::thread::JoinHandle<()>>,
+    learn_log_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 【三十六修】会话学习保留：add_word 只写内存 user_dict，
     /// reload_user_data 按文件重建会把会话内自动调频无痕清零——
     /// learn 时登记 (code,text)→次数，reload 重建后回放（用户本会话
     /// 显式 {删除} 过的词跳过）。切方案时清空（码义随方案变）。
     session_learned: std::collections::HashMap<(String, String), u32>,
+    /// 【T2-5b 2026-11-07】Ctrl+M 后台切方案在途状态：键处理只标记
+    /// pending 立即返回（旧键内同步 Schema::load 大方案 0.1-2s 单键
+    /// 卡死），后台线程装载、键/选词入口原子应用（见
+    /// apply_pending_schema_switch）。在途时再按 Ctrl+M 忽略（不叠加
+    /// 装载）；装载失败清 pending 保留旧方案。
+    switch_pending: Option<SwitchPending>,
+    /// 【T3-b 2026-11-07】候选数据代际：任何可能改变候选序/词典的入口
+    /// （按键、选词学习、调频/删词、切方案、用户数据重载）+1——
+    /// display_raw 单槽缓存按 (raw, 代际) 失效。
+    cand_ver: u64,
+    /// 【T3-b 2026-11-07】display_raw 单槽缓存 (raw, cand_ver)→结果：
+    /// DLL ~40ms 轮询 + 同键多次 state() 不再重复 parse_locks+码表
+    /// 查询+候选重算；state(&self) 只读故用 Mutex 承载（引擎全程在
+    /// Host 锁内使用，无实际竞争）。
+    display_raw_cache: std::sync::Mutex<Option<(String, u64, String)>>,
+}
+
+/// 【T2-5b 2026-11-07】后台切方案在途状态（见 Engine::switch_pending）：
+/// from=发起时 config.schema.current（应用端守卫——期间设置页/同步
+/// 路由已切走则结果作废，防旧结果覆盖新方案）。
+struct SwitchPending {
+    from: String,
+    target: String,
+    rx: std::sync::mpsc::Receiver<Result<Schema, std::io::Error>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// 【T2-6 2026-11-07】learn 日志通道容量：满即丢弃计数（尽力而为）。
+const LEARN_LOG_CHANNEL_CAP: usize = 1024;
+
+/// 【T2-6 2026-11-07】user-adjust.log 专用写线程：持文件句柄批量
+/// append。唤醒即把通道内现存行合并成一次 write（批量合并不再需要
+/// 旧 5s/8 条节流）；句柄打开失败按批重试（与旧 flush 逐次 open 容
+/// 错同语义，失败批丢弃=尽力而为）。发送端全落（Engine drop 置
+/// None）→ recv 先排空剩余再退出：已入队条目不丢。行序=通道 FIFO=
+/// 逐条写序。
+fn learn_log_writer(
+    rx: std::sync::mpsc::Receiver<String>,
+    path: PathBuf,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::io::Write;
+    let mut file: Option<std::fs::File> = None;
+    while let Ok(first) = rx.recv() {
+        let mut buf = first;
+        // 批量合并：把此刻已在通道里的行并成一次写
+        while let Ok(more) = rx.try_recv() {
+            buf.push_str(&more);
+        }
+        if file.is_none() {
+            file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+        }
+        if let Some(f) = file.as_mut() {
+            // 【防回归修复(07-reg P3-2) 2026-11-07】写失败（外部删/改名
+            // 文件后句柄孤儿化）→弃句柄下批重开，恢复旧 ≥5s 重开的
+            // 自愈性，不再静默丢写到进程重启。
+            if f.write_all(buf.as_bytes()).is_err() {
+                file = None;
+            }
+        }
+    }
+    let n = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        eprintln!("user-adjust.log 尽力而为丢弃 {n} 条（通道满/写线程不可用）");
+    }
 }
 
 impl Engine {
@@ -580,9 +651,13 @@ impl Engine {
             pending_user_reload: false,
             pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
-            learn_log_pending: Vec::new(),
-            learn_log_last_flush: std::time::Instant::now(),
+            learn_log_tx: None,
+            learn_log_worker: None,
+            learn_log_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             session_learned: std::collections::HashMap::new(),
+            switch_pending: None,
+            cand_ver: 0,
+            display_raw_cache: std::sync::Mutex::new(None),
         };
         // 全局资源（反查/注释/拆分）大统一应用——见 apply_global_assets
         engine.apply_global_assets();
@@ -615,9 +690,13 @@ impl Engine {
             pending_user_reload: false,
             pending_config_save: false,
             supp_hold: std::sync::Mutex::new(None),
-            learn_log_pending: Vec::new(),
-            learn_log_last_flush: std::time::Instant::now(),
+            learn_log_tx: None,
+            learn_log_worker: None,
+            learn_log_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             session_learned: std::collections::HashMap::new(),
+            switch_pending: None,
+            cand_ver: 0,
+            display_raw_cache: std::sync::Mutex::new(None),
         };
         engine.apply_global_assets();
         Ok(engine)
@@ -626,6 +705,10 @@ impl Engine {
     /// 注入整句解码器。
     pub fn set_sentence_decoder(&mut self, dec: Option<Arc<dyn SentenceDecoder>>) {
         self.sentence = dec;
+        // 【防回归修复(07-reg P3-3) 2026-11-07】句模型装载/卸载改变
+        // display_raw 的可用性但不动 schema——代际失效，堵缓存理论陈
+        // 旧命中窗口（同 raw+同代际但句可用性已翻转）。
+        self.cand_ver += 1;
         // 【语料词注入 2026-09-09】解码器（重）装载后用户词+补充语料
         // 变体词图重注入——新实例 user_words 为空，/jq 热重载整句后
         // 不重注会丢词。
@@ -773,6 +856,11 @@ impl Engine {
                 "empty schema name",
             ));
         }
+        // 【T2-5b 2026-11-07】同步切方案（设置页路由保持同步语义）：作废
+        // 在途后台切换——apply 端 from 守卫之外这里直接摘除，防其装载
+        // 结果晚到挤掉本次切换。不 join：装载线程自然退出（不持锁，
+        // 无死锁面），不阻塞本路由。
+        let _ = self.switch_pending.take();
         let old = self.config.schema.current.clone();
         let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(name);
         let mut schema = Schema::load(&dir)?;
@@ -794,7 +882,102 @@ impl Engine {
         if old != name && !old.is_empty() {
             self.config.schema.recent_pair = Some((old, name.to_string()));
         }
+        // 【T3-b 2026-11-07】方案已换（词典/调整/用户词全新）——display_raw
+        // 缓存代际失效。
+        self.cand_ver += 1;
         Ok(())
+    }
+
+    /// 【T2-5b 2026-11-07】后台装载切方案（Ctrl+M 键路专用）：键处理只
+    /// 置 pending 立即返回（旧键内同步 Schema::load 0.1-2s 单键卡死），
+    /// Schema::load + 数据目录根个人存储表并入（与 switch_schema 同口径）
+    /// 在后台线程执行，结果经通道回传，apply_pending_schema_switch 在
+    /// 键/选词入口原子应用。装载失败：清 pending 保留旧方案，诊断走
+    /// eprintln（键路径原本无 state 错误通道，同 ensure_reverse 先例）。
+    fn begin_schema_switch(&mut self, target: &str) {
+        let dir = Self::resolve_data_sub(&self.data_dir, &self.config.schema.dir).join(target);
+        let data_dir = self.data_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Schema, std::io::Error>>();
+        let handle = std::thread::spawn(move || {
+            // 与 switch_schema 相同的装载段（load + 全局个人存储表并入）
+            let res = Schema::load(&dir).and_then(|mut s| {
+                for stem in ["个人存储表", "个人存储"] {
+                    for ext in ["txt", "yaml"] {
+                        s.merge_personal_file(&data_dir.join(format!("{stem}.{ext}")));
+                    }
+                }
+                Ok(s)
+            });
+            let _ = tx.send(res); // rx 已亡（被作废）时静默丢弃，线程退出
+        });
+        self.switch_pending = Some(SwitchPending {
+            from: self.config.schema.current.clone(),
+            target: target.to_string(),
+            rx,
+            handle,
+        });
+    }
+
+    /// 【T2-5b 2026-11-07】原子应用后台装载结果：装载在途（Empty）不
+    /// 打断当前键；已完成则一次性换 schema——等价 switch_schema 成功
+    /// 路径的后半段（schema 交换/会话学习清空/全局资源/方案名/最近方
+    /// 案对），组字在场时按新方案重算候选（快照不残留旧方案候选）。
+    /// from 守卫：期间设置页/同步路由已切走（current ≠ 发起时）则结果
+    /// 作废，防旧结果覆盖新方案。失败/线程夭折：清 pending 保留旧方案。
+    fn apply_pending_schema_switch(&mut self, session: &mut Session) {
+        // 先在只读借用内取结果（借用随本 match 结束），再动 self——
+        // Disconnected 分支需要 take 摘除 pending，不能在 p 借用中做。
+        enum PendingOutcome {
+            Ok(Schema),
+            Err(std::io::Error),
+            Dead,
+        }
+        let outcome = match self.switch_pending.as_ref() {
+            None => return,
+            Some(p) => match p.rx.try_recv() {
+                Ok(Ok(s)) => PendingOutcome::Ok(s),
+                Ok(Err(e)) => PendingOutcome::Err(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return, // 仍在装载
+                // 装载线程夭折（防御，理论不可达）：清 pending 保留旧方案
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => PendingOutcome::Dead,
+            },
+        };
+        let pending = self.switch_pending.take().unwrap();
+        match outcome {
+            PendingOutcome::Dead => {
+                eprintln!(
+                    "Ctrl+M 切方案线程夭折，保留旧方案 {}/{}",
+                    pending.from, pending.target
+                );
+            }
+            PendingOutcome::Err(e) => {
+                eprintln!(
+                    "Ctrl+M 切方案装载失败（保留旧方案 {}→{}）: {e}",
+                    pending.from, pending.target
+                );
+            }
+            PendingOutcome::Ok(schema) => {
+                if self.config.schema.current != pending.from {
+                    return; // 期间已有同步切方案/apply_config 接管——结果作废
+                }
+                let old = pending.from.clone();
+                let name = pending.target.clone();
+                self.schema = schema;
+                self.session_learned.clear();
+                self.apply_global_assets();
+                self.config.schema.current = name.clone();
+                if old != name && !old.is_empty() {
+                    self.config.schema.recent_pair = Some((old, name));
+                }
+                // 【T3-b 2026-11-07】方案已换——display_raw 缓存代际失效
+                self.cand_ver += 1;
+                // 【防回归修复(07-reg P3-1) 2026-11-07】对齐旧同步语义：
+                // 切方案即清组字。原实现此处 refresh_candidates 会让「用
+                // 户所见旧方案候选列表上的选重索引」落到新方案列表（装
+                // 载恰在选重键前完成的毫秒级窗口内选错词）。
+                session.clear();
+            }
+        }
     }
 
     /// 重新加载用户数据（【格式统一 2026-09-06】统一在 用户调整.txt：
@@ -840,6 +1023,8 @@ impl Engine {
         }
         // 【用户词注入整句 2026-09-06】加词后整句词图同步热更
         self.sync_sentence_user_words();
+        // 【T3-b 2026-11-07】用户词/调整整体重建——display_raw 缓存代际失效
+        self.cand_ver += 1;
     }
 
     /// 把用户词库同步进整句解码器（去重后的 code→text 列表；
@@ -1137,6 +1322,13 @@ impl Engine {
 
     /// 处理一次按键。
     pub fn process_key(&mut self, session: &mut Session, key: KeyInput) -> KeyOutcome {
+        // 【T2-5b 2026-11-07】后台切方案结果到达 → 先原子应用再处理本键
+        //（键内不再同步 Schema::load，Ctrl+M 单键卡 0.1-2s 根治；应用
+        // 语义=switch_schema 成功路径后半段，见 apply_pending_schema_switch）。
+        self.apply_pending_schema_switch(session);
+        // 【T3-b 2026-11-07】按键可能带动学习/调频等候选数据变更——
+        // display_raw 缓存按代际失效（raw 本身在缓存键里，输入变化即失效）。
+        self.cand_ver += 1;
         if !key.is_press {
             return KeyOutcome::passthrough();
         }
@@ -1157,15 +1349,9 @@ impl Engine {
             self.pending_user_reload = false;
             self.reload_user_data();
         }
-        // 【修复标签 2026-09-11】会话断段（缓冲全空/候选框消失）——
-        // user-adjust.log 防抖缓冲强制落盘：不足节流阈值（<8 条或
-        // <5s）的尾部学习记录也不丢。缓冲为空时 no-op，零额外 IO。
-        if session.raw.is_empty()
-            && session.pending_commit.is_none()
-            && session.candidates.is_empty()
-        {
-            self.learn_log_flush(true);
-        }
+        // 【T2-6 2026-11-07】旧「会话断段强制 flush user-adjust.log」兜底
+        // 撤销：日志已改异步写线程（见 learn_log_send），键路不再触盘；
+        // 已入队条目由写线程落盘 + Engine Drop 关通道 join 兜底，不丢。
         // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
         if self.config.sound.enabled && out.consumed {
             let tag = self.sound_hint.unwrap_or(if out.commit.is_some() {
@@ -1292,7 +1478,16 @@ impl Engine {
                     // 空名防御：recent_pair 可能被历史 bug 污染出空端
                     // （启动期 current="" 时的切换），空目标直接放弃。
                     if let Some(t) = target.filter(|t| !t.is_empty()) {
-                        if t != self.config.schema.current && self.switch_schema(&t).is_ok() {
+                        if t != self.config.schema.current {
+                            // 【T2-5b 2026-11-07】原因：大方案键内同步
+                            // Schema::load 0.1-2s 单键卡死。手段：后台装载
+                            //（begin_schema_switch）+ 键/选词入口原子应用，
+                            // 本键立即清组字返回快速响应。pending 在途时
+                            // 忽略新请求（不叠加装载；简单可靠——装载完成
+                            // 后按最新 config 裁决去留）。
+                            if self.switch_pending.is_none() {
+                                self.begin_schema_switch(&t);
+                            }
                             session.clear();
                             return KeyOutcome::consumed(self.state(session));
                         }
@@ -3971,6 +4166,10 @@ impl Engine {
         flash: bool,
         no_learn: bool,
     ) -> KeyOutcome {
+        // 【T2-5b/T3-b 2026-11-07】选词入口与键入口同口径：先应用在途
+        // 后台切方案，再令 display_raw 缓存代际失效（选词可带动学习）。
+        self.apply_pending_schema_switch(session);
+        self.cand_ver += 1;
         let page_size = self.config.candidates.page_size.max(1);
         let start = session.page * page_size;
         let abs = start + idx;
@@ -4412,6 +4611,8 @@ impl Engine {
     /// 按 code+word 置顶（内存 + 追加日志）。
     pub fn adjust_pin(&mut self, code: &str, word: &str) {
         self.schema.adjust.pin(code, word);
+        // 【T3-b 2026-11-07】调整数据变更——display_raw 缓存代际失效
+        self.cand_ver += 1;
         self.append_adjust_log("{置顶}", code, word, None);
     }
 
@@ -4471,6 +4672,8 @@ impl Engine {
             self.schema.adjust.add_at(&code, &new_word, Some(pos));
             self.append_adjust_log("{添加}", &code, &new_word, Some(pos));
         }
+        // 【T3-b 2026-11-07】调整数据变更——display_raw 缓存代际失效
+        self.cand_ver += 1;
         self.pending_user_reload = true;
         true
     }
@@ -4492,6 +4695,8 @@ impl Engine {
     /// 按 code+word 软删（内存 + 追加日志）。
     pub fn adjust_hide(&mut self, code: &str, word: &str) {
         self.schema.adjust.remove(code, word);
+        // 【T3-b 2026-11-07】调整数据变更——display_raw 缓存代际失效
+        self.cand_ver += 1;
         self.append_adjust_log("{删除}", code, word, None);
     }
 
@@ -4499,6 +4704,8 @@ impl Engine {
     /// 追加日志 {添加}pN——同码同词旧行先清=覆盖置顶/删除，最新操作赢）。
     pub fn adjust_place(&mut self, code: &str, word: &str, pos: usize) {
         self.schema.adjust.add_at(code, word, Some(pos));
+        // 【T3-b 2026-11-07】调整数据变更——display_raw 缓存代际失效
+        self.cand_ver += 1;
         self.append_adjust_log("{添加}", code, word, Some(pos));
     }
 
@@ -4589,6 +4796,8 @@ impl Engine {
         }
         self.schema.adjust.set_order(code, &words);
         self.rewrite_order_file(code, &words);
+        // 【T3-b 2026-11-07】调整数据变更——display_raw 缓存代际失效
+        self.cand_ver += 1;
         self.pending_user_reload = true;
     }
 
@@ -5030,6 +5239,9 @@ impl Engine {
             && cand.code.chars().count() <= 16;
         if learnable && self.config.user.auto_frequency {
             self.schema.user_dict.add_word(&cand.code, &cand.text);
+            // 【T3-b 2026-11-07】用户词变更（候选序可变）——display_raw
+            // 缓存代际失效。
+            self.cand_ver += 1;
             // 【三十六修】同步登记会话学习（reload_user_data 重建后回放，
             // 见 Engine::session_learned 注释）。
             *self
@@ -5049,37 +5261,32 @@ impl Engine {
                 "{secs}\t{}\t{}\t{:?}\n",
                 cand.code, cand.text, cand.source
             );
-            // 【修复标签 2026-09-11】原因 → 每次学习即开文件逐行追加，
-            // 连续打字下每词触发一次磁盘 IO。手段 → 行入内存缓冲累积 +
-            // 脏标记，节流条件（距上次落盘 ≥5s 且变更 ≥8 条，见
-            // learn_log_flush）满足才真正写盘；不足部分由 process_key
-            // 出口的会话断段强制 flush 兜底，行序与逐条写一致。
-            self.learn_log_pending.push(line);
-            self.learn_log_flush(false);
+            // 【T2-6 2026-11-07】行入异步通道（专用写线程批量落盘），
+            // 格式与行序不变；旧「内存缓冲+5s/8 条节流+键线程 flush」
+            // 随异步化退役——磁盘 IO 彻底离开按键线程，落盘行序仍与
+            // 逐条写完全一致。
+            self.learn_log_send(line);
         }
     }
 
-    /// 【修复标签 2026-09-11】user-adjust.log 防抖落盘。原因 → learn 每
-    /// 次调整即写盘。手段 → force=true 无条件写（会话断段兜底）；否则
-    /// 节流——距上次落盘 <5s 或变更 <8 条时跳过。缓冲为空时 no-op。
-    fn learn_log_flush(&mut self, force: bool) {
-        if self.learn_log_pending.is_empty() {
-            return;
+    /// 【T2-6 2026-11-07】learn 日志行入异步通道；写线程懒起（首条时
+    /// 建，log_adjust 关/从不学习零线程开销）。通道满（1024）或写线程
+    /// 已亡：丢弃并计数——学习日志尽力而为，不阻塞按键线程。
+    fn learn_log_send(&mut self, line: String) {
+        if self.learn_log_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_LOG_CHANNEL_CAP);
+            let dropped = std::sync::Arc::clone(&self.learn_log_dropped);
+            let path = self.data_dir.join("user-adjust.log");
+            self.learn_log_worker =
+                Some(std::thread::spawn(move || learn_log_writer(rx, path, dropped)));
+            self.learn_log_tx = Some(tx);
         }
-        if !force
-            && (self.learn_log_last_flush.elapsed().as_secs() < 5
-                || self.learn_log_pending.len() < 8)
-        {
-            return;
+        if let Some(tx) = &self.learn_log_tx {
+            if tx.try_send(line).is_err() {
+                self.learn_log_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        use std::io::Write;
-        let buf: String = std::mem::take(&mut self.learn_log_pending).concat();
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.data_dir.join("user-adjust.log"))
-            .and_then(|mut f| f.write_all(buf.as_bytes()));
-        self.learn_log_last_flush = std::time::Instant::now();
     }
 
     /// 重建候选列表（含整句模式切换）。
@@ -5941,6 +6148,34 @@ impl Engine {
         if raw.is_empty() || !self.sentence_active() {
             return raw.clone();
         }
+        // 【T3-b 2026-11-07】(raw, 调频代际 cand_ver) 单槽缓存：此后的
+        // 重活（parse_locks+码表查询+候选重算）在 DLL ~40ms 轮询/同键
+        // 多次 state() 下原本每次全量重算；现只在 raw 或候选数据变更
+        // 后的首次快照算一次（cand_ver 由键/选词/调频/切方案等入口
+        // +1，见各处 T3-b 标记）。sentence_active 每次现算（上方早退
+        // 门），配置/解码器翻转天然绕过缓存；state(&self) 只读，Mutex
+        // 承载单槽（引擎全程在 Host 锁内，无实际竞争）。
+        {
+            let ver = self.cand_ver;
+            if let Ok(slot) = self.display_raw_cache.lock() {
+                if let Some((c_raw, c_ver, out)) = slot.as_ref() {
+                    if c_raw == raw && *c_ver == ver {
+                        return out.clone();
+                    }
+                }
+            }
+            // 锁中毒（理论不可达）→ 无缓存直算，不 panic
+        }
+        let out = self.display_raw_uncached(session);
+        if let Ok(mut slot) = self.display_raw_cache.lock() {
+            *slot = Some((raw.clone(), self.cand_ver, out.clone()));
+        }
+        out
+    }
+
+    /// 【T3-b 2026-11-07】display_raw 原计算体（缓存未命中路径）。
+    fn display_raw_uncached(&self, session: &Session) -> String {
+        let raw = &session.raw;
         let parsed = self.parse_locks(raw);
         let base = &parsed.base;
         if base.is_empty() || raw.len() <= base.len() {
@@ -6223,14 +6458,54 @@ impl Engine {
             // TestDown 预吞门用；见 SessionState 字段注释）。
             switch_recent_schema: self.config.general.switch_recent_schema,
             ctrl_space_switch: self.config.general.ctrl_space_switch,
-            keymap: self.config.keymap.map.clone(),
-            keymap_idle: self.config.keymap.map_idle.clone(),
+            // 【T3-a 2026-11-07】空表/空串跳过 clone：默认配置两键位表皆
+            // 空、export_key 常空——每帧快照免逐条分配克隆（非空时照旧
+            // 克隆，字段名/类型/顺序与 JSON 输出零变化；Arc 共享需改
+            // SessionState 字段类型，超出本改动文件边界，取保守等价实现）。
+            keymap: if self.config.keymap.map.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.config.keymap.map.clone()
+            },
+            keymap_idle: if self.config.keymap.map_idle.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.config.keymap.map_idle.clone()
+            },
             caps_lock: session.caps_lock,
             // 【按住键可录 2026-11】三值透传（解析在 DLL：组合匹配 +
             // 模态入口/导出快捷键执行都在 DLL 键路）。
-            freq_key: self.config.candidates.freq_key.clone(),
-            delete_key: self.config.candidates.delete_key.clone(),
-            export_key: self.config.general.export_key.clone(),
+            freq_key: if self.config.candidates.freq_key.is_empty() {
+                String::new()
+            } else {
+                self.config.candidates.freq_key.clone()
+            },
+            delete_key: if self.config.candidates.delete_key.is_empty() {
+                String::new()
+            } else {
+                self.config.candidates.delete_key.clone()
+            },
+            export_key: if self.config.general.export_key.is_empty() {
+                String::new()
+            } else {
+                self.config.general.export_key.clone()
+            },
+        }
+    }
+}
+
+impl Drop for Engine {
+    /// 【T2-6/T2-5b 2026-11-07】收尾纪律：先关 learn 日志发送端（写线程
+    /// recv 排空已入队条目逐批落盘后退出——不丢已入队日志），再 join
+    /// 写线程与在途切方案装载线程（两线程都不持 Host/引擎锁，无死锁
+    /// 面；join 失败不 panic，尽力而为）。
+    fn drop(&mut self) {
+        self.learn_log_tx = None;
+        if let Some(h) = self.learn_log_worker.take() {
+            let _ = h.join();
+        }
+        if let Some(p) = self.switch_pending.take() {
+            let _ = p.handle.join();
         }
     }
 }

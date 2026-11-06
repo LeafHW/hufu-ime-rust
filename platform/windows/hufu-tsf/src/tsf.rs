@@ -208,6 +208,12 @@ pub struct Shared {
     /// tick 放回时代为隐藏（否则旧窗漏藏=残留阴影，概率性时序 bug）。
     pub cand2_busy: bool,
     pub pending_cand_hide: bool,
+    /// 【T3-f 2026-11-07·防回归修复(10-reg P1)】上一拍 state.keymap/
+    /// keymap_idle 原始 JSON（**每实例**字段，缺省归一 Null）。原实现
+    /// 是进程级 static × g.keymap 每实例 Shared——同进程 TSF 重激活/
+    /// 第二输入线程的新实例首帧与进程缓存全等→跳过重建→该实例
+    /// keymap 恒空表（自定义 keymap 的 F 区键/空态预判静默失效）。
+    pub keymap_last_raw: std::sync::Mutex<(serde_json::Value, serde_json::Value)>,
     /// v3（普通分层窗，打包宿主 SearchHost/UWP 专用——DComp 直通窗
     /// 被 DWM cloak，普通分层窗考古验证在 UWP 可见可跟光标）
     /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
@@ -593,6 +599,10 @@ impl Shared {
             ime_dead: false,
             cand2_busy: false,
             pending_cand_hide: false,
+            keymap_last_raw: std::sync::Mutex::new((
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )),
             cand_ui: None,
             cand_ui_id: 0,
             cand_ui_active: false,
@@ -1417,11 +1427,15 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
     ) -> Result<BOOL> {
         crate::candidate_ui::prepare(_pic);
         // 诊断：按键是否进入键盘钩（搜索框等特殊宿主排查）
-        keys_log(&format!(
-            "test vk={:#x} t={:?}",
-            wparam.0,
-            std::time::SystemTime::now()
-        ));
+        // 【T3-c 2026-11-07】先查开关再格式化：keys_log 默认关，急切
+        // format!（含 SystemTime::now）每键白付；输出内容不变。
+        if keys_log_enabled() {
+            keys_log(&format!(
+                "test vk={:#x} t={:?}",
+                wparam.0,
+                std::time::SystemTime::now()
+            ));
+        }
         let r = self.dispatch(wparam.0, true, false, lparam.0 as usize);
         Ok(r)
     }
@@ -1433,7 +1447,10 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         lparam: LPARAM,
     ) -> Result<BOOL> {
         crate::candidate_ui::prepare(_pic);
-        keys_log(&format!("testup vk={:#x}", wparam.0));
+        // 【T3-c 2026-11-07】开关前置，免急切 format!（输出不变）。
+        if keys_log_enabled() {
+            keys_log(&format!("testup vk={:#x}", wparam.0));
+        }
         Ok(self.dispatch(wparam.0, true, true, lparam.0 as usize))
     }
 
@@ -1447,13 +1464,16 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
         //（游戏宿主不挂本 sink——聊天键流在子类化 WndProc 里，见 E7）
         let r = self.dispatch(wparam.0, false, false, lparam.0 as usize);
-        keys_log(&format!(
-            "key vk={:#x} eat={} perr={} t={:?}",
-            wparam.0,
-            r.0,
-            crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst),
-            std::time::SystemTime::now()
-        ));
+        // 【T3-c 2026-11-07】开关前置，免急切 format!（输出不变）。
+        if keys_log_enabled() {
+            keys_log(&format!(
+                "key vk={:#x} eat={} perr={} t={:?}",
+                wparam.0,
+                r.0,
+                crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst),
+                std::time::SystemTime::now()
+            ));
+        }
         Ok(r)
     }
 
@@ -1466,7 +1486,10 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         crate::candidate_ui::prepare(_pic);
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
-        keys_log(&format!("keyup vk={:#x}", wparam.0));
+        // 【T3-c 2026-11-07】开关前置，免急切 format!（输出不变）。
+        if keys_log_enabled() {
+            keys_log(&format!("keyup vk={:#x}", wparam.0));
+        }
         Ok(self.dispatch(wparam.0, false, true, lparam.0 as usize))
     }
 
@@ -3278,11 +3301,17 @@ pub fn diag_note(msg: &str) {
 /// 【开关化 2026-09-11】旧实现每键 2-3 次无条件 open/append，无开关
 /// 无轮转——keys-*.txt 日增 MB 级（对照 trace 83MB 的教训）。现默认
 /// 关：HUFU_KEYS=1 开启（排障时设）；开启时常驻句柄 + 8MB 轮转。
+/// 【T3-c 2026-11-07】keys_log 开关抽出为廉价查询：调用点在 format!
+/// 之前先查——默认关，急切求值（含 SystemTime::now）每键 4 拍白付。
+pub fn keys_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HUFU_KEYS").as_deref() == Ok("1"))
+}
+
 pub fn keys_log(line: &str) {
     use std::io::Write;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
-    if !*ON.get_or_init(|| std::env::var("HUFU_KEYS").as_deref() == Ok("1")) {
+    if !keys_log_enabled() {
         return;
     }
     let mut g = FILE.lock().unwrap_or_else(|p| p.into_inner());
@@ -3305,6 +3334,40 @@ pub fn keys_log(line: &str) {
             *g = None;
         }
     }
+}
+
+/// 【T3-d 2026-11-07】HUFU_TSF_SMOKE 进程内缓存：env::var 每次调用都
+/// 分配 String+读进程环境块，而 host_may_show/show 每键都查；该旋钮
+/// 由冒烟进程启动前设定、进程内不变——OnceLock 一次即可。
+pub fn smoke_env() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("HUFU_TSF_SMOKE").as_deref() == Ok("1"))
+}
+
+/// 【T3-d 2026-11-07】HUFU_FAKE_DPI 进程内缓存：show 热路径每键查 env
+/// 的开销消除。该旋钮仅 lib.rs 测试钩子会在进程内改值（逐档伪造 DPI），
+/// 不能用 OnceLock 终身缓存——用「未初始化/值」两级，测试改值后调
+/// fake_dpi_cache_reset() 失效；生产路径 env 进程内不变，读一次后零成本。
+fn fake_dpi_cell() -> &'static std::sync::Mutex<Option<Option<f32>>> {
+    static V: std::sync::Mutex<Option<Option<f32>>> = std::sync::Mutex::new(None);
+    &V
+}
+pub fn fake_dpi_scale() -> Option<f32> {
+    let mut g = fake_dpi_cell().lock().unwrap_or_else(|p| p.into_inner());
+    if g.is_none() {
+        *g = Some(
+            std::env::var("HUFU_FAKE_DPI")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v >= 96.0 && *v <= 480.0)
+                .map(|v| v / 96.0),
+        );
+    }
+    g.as_ref().copied().flatten()
+}
+/// 测试钩子配套：进程内 set/remove HUFU_FAKE_DPI 后清缓存重读。
+pub fn fake_dpi_cache_reset() {
+    *fake_dpi_cell().lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 /// 【八十六修】模式键事件准入判定（纯逻辑，单测可测）。
@@ -3915,7 +3978,11 @@ impl HuFuTs_Impl {
             let will = want && gate_ok;
             return BOOL(will as i32);
         }
-        trace(&format!("dispatch vk=0x{wparam:X}"));
+        // 【T3-c 2026-11-07】每键必经：先查开关再格式化（trace 默认关，
+        // 急切 format! 每键白付一次分配；输出不变）。
+        if trace_on() {
+            trace(&format!("dispatch vk=0x{wparam:X}"));
+        }
         // 【六十修·实：切换热键当场收窗】Win+Space / Ctrl+Shift 是系统
         // 切走输入法的瞬间。事件路全盲（四十五修的 ActiveLanguageProfile
         // NotifySink 只收得见切回、ISV sink 被 AdviseSingleSink 恒拒），
@@ -3930,10 +3997,13 @@ impl HuFuTs_Impl {
             let win = GetKeyState(VK_LWIN.0 as i32) < 0 || GetKeyState(VK_RWIN.0 as i32) < 0;
             if win && wparam != 0x5B && wparam != 0x5C && wparam != 0x0 {
                 // 诊断：Win 按住期间的任何键（定位注入/真机的 vk 形态差）
-                crate::tsf::trace(&format!(
-                    "keyswitch diag: win按住 vk=0x{wparam:X} space? {}",
-                    wparam == 0x20
-                ));
+                // 【T3-c 2026-11-07】Win 按住期间每键都到：开关前置免急切格式化。
+                if crate::tsf::trace_on() {
+                    crate::tsf::trace(&format!(
+                        "keyswitch diag: win按住 vk=0x{wparam:X} space? {}",
+                        wparam == 0x20
+                    ));
+                }
             }
             // 【按住Ctrl调频 2026-11】模态中的 Ctrl+Shift 是**删词子模式
             // 手势**，不再当切换热键冲销（系统真切换由四十五修 lang
@@ -4082,10 +4152,13 @@ impl HuFuTs_Impl {
         if g_first_key_probe() {
             diag_note(&format!("lat: KEY后 name={name} consumed={consumed}"));
         }
-        trace(&format!(
-            "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
-            name, consumed, commit, back, digit_tail
-        ));
+        // 【T3-c 2026-11-07】每键必经：开关前置免急切格式化（输出不变）。
+        if trace_on() {
+            trace(&format!(
+                "77dbg: key={} consumed={} commit={:?} back={} digit_tail={:?}",
+                name, consumed, commit, back, digit_tail
+            ));
+        }
         // 【Caps 系统态补偿 2026-10-12 → 十六修 2026-10-13】引擎消费了
         // CapsLock 后部分宿主仍翻转系统大小写位（TSF 吞键不影响其翻
         // 转；实测：Caps 选重一次后加词编码框手输全大写）。历代修法沿
@@ -4140,37 +4213,76 @@ impl HuFuTs_Impl {
             g.esc_undo_ready = eur;
             // 【全键盘按键映射 2026-11】同帧同步 keymap 快照：F 区键
             // 路由白名单 + TestDown 空态预判放行表。
-            let km: std::collections::HashMap<String, String> = state
-                .get("keymap")
-                .and_then(|v| v.as_object())
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| {
-                            v.as_str().map(|s| (k.clone(), s.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if g.keymap != km {
-                trace(&format!("keymap 同步: {} 项", km.len()));
+            // 【T3-f 2026-11-07】与上一拍原始 JSON 全等（缺省↔Null 归一）
+            // 则跳过重建——server 稳态每键回同样两表，逐键重建纯白付；
+            // 变化拍才重建+trace+缓存原始值，口径与旧版一致。
+            // 【防回归修复(10-reg P1)】缓存落 Shared（每实例）——进程级
+            // static 会毒化同进程新实例（见字段注释）。缓存锁内只做
+            // 「比对+换出已变值」（避免嵌套借用 g：guard 借 g.keymap_
+            // last_raw 期间不可再写 g.keymap），字段赋值移出锁后。
+            let km_changed: Option<serde_json::Value> = {
+                let mut km_last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
+                let km_now = state.get("keymap");
+                let km_same = match km_now {
+                    Some(v) => v == &km_last.0,
+                    None => km_last.0.is_null(),
+                };
+                if km_same {
+                    None
+                } else {
+                    let taken = km_now.cloned().unwrap_or(serde_json::Value::Null);
+                    km_last.0 = taken.clone();
+                    Some(taken)
+                }
+            };
+            if let Some(raw) = km_changed {
+                let km: std::collections::HashMap<String, String> = raw
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if g.keymap != km {
+                    trace(&format!("keymap 同步: {} 项", km.len()));
+                }
+                g.keymap = km;
             }
-            g.keymap = km;
-            // 【两态映射 2026-11】空态专用表同帧同步。
-            let kmi: std::collections::HashMap<String, String> = state
-                .get("keymap_idle")
-                .and_then(|v| v.as_object())
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| {
-                            v.as_str().map(|s| (k.clone(), s.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if g.keymap_idle != kmi {
-                trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
+            // 【两态映射 2026-11】空态专用表同帧同步（同上：未变跳过重建）。
+            let kmi_changed: Option<serde_json::Value> = {
+                let mut km_last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
+                let kmi_now = state.get("keymap_idle");
+                let kmi_same = match kmi_now {
+                    Some(v) => v == &km_last.1,
+                    None => km_last.1.is_null(),
+                };
+                if kmi_same {
+                    None
+                } else {
+                    let taken = kmi_now.cloned().unwrap_or(serde_json::Value::Null);
+                    km_last.1 = taken.clone();
+                    Some(taken)
+                }
+            };
+            if let Some(raw) = kmi_changed {
+                let kmi: std::collections::HashMap<String, String> = raw
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if g.keymap_idle != kmi {
+                    trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
+                }
+                g.keymap_idle = kmi;
             }
-            g.keymap_idle = kmi;
             // 【Alt+修改 下线 2026-10-17】alt_symbols/alt_always 同步块与
             // LL 钩子快照刷新已随功能整体删除。
             // 【十七修·零锁快照 v2】从**本拍 state** 直读——旧版读 g.raw_last
@@ -4286,7 +4398,10 @@ impl HuFuTs_Impl {
                 .unwrap_or_else(|e| e.into_inner())
                 .skin_stale = true;
         }
-        trace(&format!("pipe back consumed={consumed}"));
+        // 【T3-c 2026-11-07】每键必经：开关前置免急切格式化（输出不变）。
+        if trace_on() {
+            trace(&format!("pipe back consumed={consumed}"));
+        }
         if !consumed {
             // 【中英失同步自愈 2026-09-11】直通键也回填模式缓存：
             // server 全局会话可能被其他进程切走（QQ 切英文→切 WPS，
@@ -10815,11 +10930,25 @@ fn fg_same_app_dir(pid: u32) -> bool {
 /// 前台=本进程，或同应用族（WPS 全家同目录：et.exe 打字会话的前台
 /// 是 wps.exe 框架窗），或 UWP 框架。在 candwin2::show 入口调用。
 ///（et.exe 是表格真实宿主，不做启动器排除。）
+// 【T3-e 2026-11-07】host_may_show 慢路径每次 6-10 syscall（GetGUIThreadInfo
+// + OpenProcess/QueryFullProcessImageNameW×2 + current_exe 等）且 show
+// 每键都调——小容量结论缓存：键=(前台 hwnd, pid)（窗口销毁/进程退出后
+// 句柄被复用会换 pid，自然失配；同 pid 竞态由 2s TTL 兜底）；容量 32
+// 满即整表清空。宁浅勿深：不做类名校验等复杂结构。
+struct MayShowEntry {
+    fg: usize,
+    pid: u32,
+    verdict: bool,
+    at: std::time::Instant,
+}
+static MAY_SHOW_CACHE: std::sync::Mutex<Vec<MayShowEntry>> = std::sync::Mutex::new(Vec::new());
+
 pub(crate) fn host_may_show() -> bool {
     // 【二十四修·冒烟豁免】hufu-tsf-smoke 自测进程设置 HUFU_TSF_SMOKE=1：
     // 前台焦点门只对生产宿主有意义（无控制台的测试进程前台判定随机
     // 翻脸——本会话实测 [12] 放行、2 秒后 [18] 全拦）。冒烟显式豁免。
-    if std::env::var("HUFU_TSF_SMOKE").as_deref() == Ok("1") {
+    // 【T3-d 2026-11-07】env 查询改进程内缓存（口径不变）。
+    if smoke_env() {
         return true;
     }
     unsafe {
@@ -10832,56 +10961,89 @@ pub(crate) fn host_may_show() -> bool {
         if pid == std::process::id() {
             return true;
         }
-        // 【WebView2 宿主放行 2026-11】Tauri/Electron(WebView2) 应用
-        //（爱跟打/花笺等，用户实锤「能打字不显候选」）：TSF DLL 载在
-        // msedgewebview2.exe 子进程，而顶层前台窗属于宿主主进程
-        //（爱跟打.exe）——前台 pid 恒不等=候选窗被本门拦死（键照吃、
-        // 文字照上，仅不显窗）。键盘焦点真值=GetGUIThreadInfo(0).
-        // hwndFocus：焦点窗在本进程=本进程就是活跃输入宿主，放行。
-        // 失焦残留收窗语义不变——焦点移走后 hwndFocus 归属即变，
-        // 照拦（双候选窗修复的前提不破）。
-        #[repr(C)]
-        struct GTI4 {
-            cb: u32,
-            flags: u32,
-            hwnd_active: windows::Win32::Foundation::HWND,
-            hwnd_focus: windows::Win32::Foundation::HWND,
-            hwnd_capture: windows::Win32::Foundation::HWND,
-            hwnd_menu_owner: windows::Win32::Foundation::HWND,
-            hwnd_move_size: windows::Win32::Foundation::HWND,
-            hwnd_caret: windows::Win32::Foundation::HWND,
-            rc_caret: windows::Win32::Foundation::RECT,
-        }
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn GetGUIThreadInfo(tid: u32, gi: *mut GTI4) -> i32;
-        }
-        let mut gi4 = GTI4 {
-            cb: std::mem::size_of::<GTI4>() as u32,
-            flags: 0,
-            hwnd_active: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            hwnd_focus: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            hwnd_capture: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            hwnd_menu_owner: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            hwnd_move_size: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            hwnd_caret: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
-            rc_caret: windows::Win32::Foundation::RECT::default(),
-        };
-        if GetGUIThreadInfo(0, &mut gi4) != 0 && !gi4.hwnd_focus.0.is_null() {
-            let mut fpid = 0u32;
-            GetWindowThreadProcessId(gi4.hwnd_focus, Some(&mut fpid));
-            if fpid == std::process::id() {
-                return true;
+        // 【T3-e 2026-11-07】结论缓存命中：同前台窗连续打字零 syscall。
+        // 【防回归修复(09-reg P2) 2026-11-07】TTL 并入 find 谓词：旧写法
+        // 恒命中最旧过期条目→过期即永久 miss（每键全价 syscall+重复
+        // push，比无缓存更差）直到 32 条满清空。
+        if let Ok(c) = MAY_SHOW_CACHE.lock() {
+            if let Some(e) = c.iter().find(|e| {
+                e.fg == fg.0 as usize
+                    && e.pid == pid
+                    && e.at.elapsed() < std::time::Duration::from_millis(2000)
+            }) {
+                return e.verdict;
             }
         }
-        if host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
-            return true;
+        let verdict = host_may_show_slow(pid);
+        if let Ok(mut c) = MAY_SHOW_CACHE.lock() {
+            c.retain(|e| !(e.fg == fg.0 as usize && e.pid == pid));
+            if c.len() >= 32 {
+                c.clear(); // 容量逐出：整表清空（浅结构，重建成本可忽略）
+            }
+            c.push(MayShowEntry {
+                fg: fg.0 as usize,
+                pid,
+                verdict,
+                at: std::time::Instant::now(),
+            });
         }
-        if fg_same_app_dir(pid) {
-            return true;
-        }
-        false
+        verdict
     }
+}
+
+/// 慢路径（缓存 miss 时）：WebView2 焦点归属 + UWP 框架族 + 同目录族
+/// 判定——原 host_may_show 尾部原样搬入，语义零改动。
+/// 【T3-e 2026-11-07】每键 6-8 syscall 只付在缓存 miss 的那一拍。
+unsafe fn host_may_show_slow(pid: u32) -> bool {
+    // 【WebView2 宿主放行 2026-11】Tauri/Electron(WebView2) 应用
+    //（爱跟打/花笺等，用户实锤「能打字不显候选」）：TSF DLL 载在
+    // msedgewebview2.exe 子进程，而顶层前台窗属于宿主主进程
+    //（爱跟打.exe）——前台 pid 恒不等=候选窗被本门拦死（键照吃、
+    // 文字照上，仅不显窗）。键盘焦点真值=GetGUIThreadInfo(0).
+    // hwndFocus：焦点窗在本进程=本进程就是活跃输入宿主，放行。
+    // 失焦残留收窗语义不变——焦点移走后 hwndFocus 归属即变，
+    // 照拦（双候选窗修复的前提不破）。
+    #[repr(C)]
+    struct GTI4 {
+        cb: u32,
+        flags: u32,
+        hwnd_active: windows::Win32::Foundation::HWND,
+        hwnd_focus: windows::Win32::Foundation::HWND,
+        hwnd_capture: windows::Win32::Foundation::HWND,
+        hwnd_menu_owner: windows::Win32::Foundation::HWND,
+        hwnd_move_size: windows::Win32::Foundation::HWND,
+        hwnd_caret: windows::Win32::Foundation::HWND,
+        rc_caret: windows::Win32::Foundation::RECT,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetGUIThreadInfo(tid: u32, gi: *mut GTI4) -> i32;
+    }
+    let mut gi4 = GTI4 {
+        cb: std::mem::size_of::<GTI4>() as u32,
+        flags: 0,
+        hwnd_active: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        hwnd_focus: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        hwnd_capture: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        hwnd_menu_owner: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        hwnd_move_size: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        hwnd_caret: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+        rc_caret: windows::Win32::Foundation::RECT::default(),
+    };
+    if GetGUIThreadInfo(0, &mut gi4) != 0 && !gi4.hwnd_focus.0.is_null() {
+        let mut fpid = 0u32;
+        GetWindowThreadProcessId(gi4.hwnd_focus, Some(&mut fpid));
+        if fpid == std::process::id() {
+            return true;
+        }
+    }
+    if host_is_uwp_family() && !host_is_searchhost() && fg_is_uwp_frame(pid) {
+        return true;
+    }
+    if fg_same_app_dir(pid) {
+        return true;
+    }
+    false
 }
 
 /// 【三十五修】收起本进程候选窗（含沉浸式两通道）——供两处复用：

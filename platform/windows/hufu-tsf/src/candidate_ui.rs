@@ -74,6 +74,13 @@ const ALL: u32 = TF_CLUIE_DOCUMENTMGR
     | TF_CLUIE_STRING
     | TF_CLUIE_PAGEINDEX
     | TF_CLUIE_CURRENTPAGE;
+// 【T3-b 2026-11-07】Menu 子树反序列化包装：借 publish_inner 已产出的
+// ext 序列化字节直取 menu 字段（serde 默认忽略其余字段），免去
+// value.clone() 整树深拷+二次遍历。
+#[derive(Deserialize)]
+struct ExtMenu {
+    menu: Option<Menu>,
+}
 #[derive(Clone)]
 struct Snapshot {
     menu: Menu,
@@ -276,9 +283,18 @@ fn publish_inner(state: &Value) {
     if token.is_empty() || ext["context"].as_str() != Some(token.as_str()) {
         return;
     }
-    if ext["protocol"].as_u64() != Some(1)
-        || serde_json::to_vec(ext).map_or(true, |x| x.len() > 1 << 20)
-    {
+    if ext["protocol"].as_u64() != Some(1) {
+        clear_menu();
+        return;
+    }
+    // 【T3-b 2026-11-07】1MB 尺寸闸与 Menu 反序列化共用同一次序列化：
+    // 旧版 to_vec 量完尺寸就丢、下面再 clone 整棵 menu 子树喂
+    // from_value（深拷+二次遍历）——字节复用后 clone 消除，闸口径不变。
+    let Ok(ext_bytes) = serde_json::to_vec(ext) else {
+        clear_menu();
+        return;
+    };
+    if ext_bytes.len() > (1 << 20) {
         clear_menu();
         return;
     }
@@ -325,9 +341,18 @@ fn publish_inner(state: &Value) {
         clear_menu();
         return;
     }
-    let Ok(menu) = serde_json::from_value::<Menu>(value.clone()) else {
-        clear_menu();
-        return;
+    // 【T3-b 2026-11-07】从已序列化的 ext 字节直取 menu 字段（serde
+    // 忽略其余字段），不再 value.clone() 深拷子树；类型不合法同样
+    // 落 None → clear_menu，与旧 from_value 口径一致。
+    let menu = match serde_json::from_slice::<ExtMenu>(&ext_bytes)
+        .ok()
+        .and_then(|w| w.menu)
+    {
+        Some(m) => m,
+        None => {
+            clear_menu();
+            return;
+        }
     };
     if !menu.valid() {
         clear_menu();

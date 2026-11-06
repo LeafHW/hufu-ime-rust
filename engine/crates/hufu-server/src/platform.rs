@@ -54,6 +54,7 @@ pub fn open_path(p: &Path) {
 }
 
 /// 越进程候选窗（Windows：server 按用户皮肤代画；其他平台：前端自绘，no-op）。
+/// 【T1-3 2026-11-07】skin 改 Arc 共享（MB 级皮肤逐帧深克隆 → 帧抖）。
 #[cfg(windows)]
 pub fn cand_show(
     items: Vec<(String, String)>,
@@ -61,7 +62,7 @@ pub fn cand_show(
     selected: usize,
     x: i32,
     y: i32,
-    skin: serde_json::Value,
+    skin: std::sync::Arc<serde_json::Value>,
 ) {
     crate::candwin::show(
         crate::candwin::CandFrame {
@@ -82,7 +83,7 @@ pub fn cand_show(
     _selected: usize,
     _x: i32,
     _y: i32,
-    _skin: serde_json::Value,
+    _skin: std::sync::Arc<serde_json::Value>,
 ) {
 }
 

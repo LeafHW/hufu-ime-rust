@@ -1711,10 +1711,6 @@ pub unsafe fn destroy_for(cand: HWND) {
 /// 与 show() 同源 DPI 口径(含 HUFU_FAKE_DPI 测试旋钮)。
 unsafe fn dpi_scale(cand: HWND) -> f32 {
     let dpi = GetDpiForWindow(cand).max(96) as f32 / 96.0;
-    std::env::var("HUFU_FAKE_DPI")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| *v >= 96.0 && *v <= 480.0)
-        .map(|v| v / 96.0)
-        .unwrap_or(dpi)
+    // 【T3-d 2026-11-07】env 查询进程内缓存（show 热路径），口径不变。
+    crate::tsf::fake_dpi_scale().unwrap_or(dpi)
 }

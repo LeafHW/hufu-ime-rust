@@ -29,6 +29,9 @@ pub fn dispatch(
     req: &serde_json::Value,
     client_exe: Option<&str>,
 ) -> serde_json::Value {
+    // 【防回归修复(10-reg P2) 2026-11-07】保留锁引用供 cand 换肤首帧
+    // 的锁外装载段重取（guard 遮蔽参数名，同 route() 的 host_cell）。
+    let host_cell: &Mutex<Host> = host;
     let mut host = host.lock().unwrap_or_else(|p| p.into_inner());
     if matches!(req["op"].as_str(), Some("focus" | "reset")) { host.candidate_export.owner.clear(); }
     match req.get("op").and_then(|o| o.as_str()).unwrap_or("") {
@@ -74,20 +77,22 @@ pub fn dispatch(
                 // 十五修覆盖式同步的教训）。截尾 32 与 host.rs 同构。
                 if let Some(dt) = diag_tail {
                     if !dt.is_empty() {
-                        let dt_chars: Vec<char> = dt.chars().collect();
-                        let tail_len = host.session.tail_context.chars().count();
-                        let tail_chars: Vec<char> = host.session.tail_context.chars().collect();
-                        let mut overlap = 0;
-                        while overlap < dt_chars.len()
-                            && overlap < tail_len
-                            && dt_chars[dt_chars.len() - 1 - overlap]
-                                == tail_chars[tail_chars.len() - 1 - overlap]
+                        // 【T3 2026-11-07】原实现每次双 Vec<char> 收集（键路
+                        // 分配），改为倒序迭代器直接比后缀。
+                        let dt_len = dt.chars().count();
+                        let mut overlap = 0usize;
+                        for (a, b) in dt
+                            .chars()
+                            .rev()
+                            .zip(host.session.tail_context.chars().rev())
                         {
+                            if a != b {
+                                break;
+                            }
                             overlap += 1;
                         }
-                        if overlap < dt_chars.len() {
-                            let add: String =
-                                dt_chars[..dt_chars.len() - overlap].iter().collect();
+                        if overlap < dt_len {
+                            let add: String = dt.chars().take(dt_len - overlap).collect();
                             host.session.tail_context.push_str(&add);
                             let cnt = host.session.tail_context.chars().count();
                             if cnt > 32 {
@@ -1017,13 +1022,16 @@ pub fn dispatch(
             // 断，server 代画链失效=沉浸宿主回默认皮）——DLL 改推
             // skin_ver（8 字节），server 端按版本自取当前皮肤文件；
             // 完整 skin 字段保留兼容（小皮肤/旧 DLL 仍可用）。
-            static LAST_SKIN: std::sync::Mutex<Option<(u64, serde_json::Value)>> =
-                std::sync::Mutex::new(None);
+            // 【T1-3 2026-11-07】缓存改 Arc<Value>：命中帧只克隆句柄（旧
+            // 实现每帧深克隆整份 Value——动图皮 13MB → 毫秒级帧抖）。
+            static LAST_SKIN: std::sync::Mutex<
+                Option<(u64, std::sync::Arc<serde_json::Value>)>,
+            > = std::sync::Mutex::new(None);
             let skin = if let Some(v) = req.get("skin") {
                 if !v.is_null() {
-                    let v = v.clone();
+                    let v = std::sync::Arc::new(v.clone());
                     if let Ok(mut c) = LAST_SKIN.lock() {
-                        *c = Some((u64::MAX, v.clone()));
+                        *c = Some((u64::MAX, std::sync::Arc::clone(&v)));
                     }
                     v
                 } else {
@@ -1037,14 +1045,24 @@ pub fn dispatch(
                     match cached {
                         Some((_, v)) => v,
                         None => {
+                            // 【防回归修复(10-reg P2) 2026-11-07】换肤首帧
+                            // 的 MB 级 Skin::load 不在 Host 锁内做（打字帧
+                            // 会全队列）——快照路径后放锁装载，装完短锁
+                            // 继续。装载期间并发换皮会把旧皮存进当前
+                            // (want_ver) 槽：版本过滤天然自愈（下一帧
+                            // miss 重装新皮）。
                             let id = host.engine.config.appearance.skin.clone();
                             let p = host.skins_dir().join(format!("{id}.json"));
-                            let v = hufu_skin::Skin::load(&p)
-                                .map(|s| serde_json::to_value(s).unwrap_or_default())
-                                .unwrap_or_default();
+                            drop(host);
+                            let v = std::sync::Arc::new(
+                                hufu_skin::Skin::load(&p)
+                                    .map(|s| serde_json::to_value(s).unwrap_or_default())
+                                    .unwrap_or_default(),
+                            );
                             if let Ok(mut c) = LAST_SKIN.lock() {
-                                *c = Some((want_ver, v.clone()));
+                                *c = Some((want_ver, std::sync::Arc::clone(&v)));
                             }
+                            host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                             v
                         }
                     }
@@ -1055,7 +1073,7 @@ pub fn dispatch(
                     .ok()
                     .and_then(|c| c.clone())
                     .map(|(_, v)| v)
-                    .unwrap_or(serde_json::Value::Null)
+                    .unwrap_or_else(|| std::sync::Arc::new(serde_json::Value::Null))
             };
 
             // 【二十九修·首显滑动】组段首帧带滑动起点（None=常规帧）

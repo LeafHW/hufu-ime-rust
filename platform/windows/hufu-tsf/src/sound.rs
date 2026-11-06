@@ -107,9 +107,14 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
 /// 4 工人并发（与最初版交叠密度一致）+ 线程恒定（连发不卡），
 /// 全忙且队列满才丢音。
 /// 播放任务：clip + 是否键音（键音可被 key_up() 截断）。
-struct Job {
-    clip: Clip,
-    is_key: bool,
+/// 【T1-2a 2026-11-07】新增两种后台任务，跑在既有播放工人线程：
+/// Fetch=按键线程 cache miss 时交接的 tag 取料（管道取+解码+入缓存，
+/// 本键静音跳过、下一键命中即有声）；WarmPool=冷缓存/invalidate 后
+/// 探明键音池成员——都不占 UI/按键线程。
+enum Job {
+    Play { clip: Clip, is_key: bool },
+    Fetch(String),
+    WarmPool,
 }
 
 /// 伪随机（splitmix64 步进）：键音随机挑 clip、随机音量抖动用。
@@ -135,19 +140,18 @@ fn rnd() -> u64 {
 /// 键音候选池：音效目录全部事件音（key/select/commit/page 皆为短促
 /// 击键声）——每次按键随机挑一个 + 音量 ±15% 抖动，杜绝「固定音」。
 fn key_pool_tags() -> Vec<String> {
-    let mut g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
-    if g.is_none() {
-        let mut v: Vec<String> = ["key", "select", "commit", "page"]
-            .iter()
-            .filter(|t| with_clip(t).is_some())
-            .map(|t| t.to_string())
-            .collect();
-        if v.is_empty() {
-            v.push("key".to_string());
+    {
+        let g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = g.as_ref() {
+            return v.clone();
         }
-        *g = Some(v);
     }
-    g.clone().unwrap()
+    // 【T1-2a 2026-11-07】冷缓存不再在按键线程连查 4 个 tag（旧实现
+    // 每查=BG 管道取料+解码，上限 150ms×4 卡按键线程）——池成员交
+    // 工人线程后台探明（warm_pool），本键先回退 "key" 立即返回；
+    // "key" 的 cache miss 同样只触发后台预取，本键静音不阻塞。
+    warm_pool_async();
+    vec!["key".to_string()]
 }
 
 /// 当前音效包名（server 键响应随行；变更即清缓存按新包重取）。
@@ -173,27 +177,37 @@ pub fn set_pack(pack: &str) {
 pub fn play(tag: &str, vol: u8, pack: &str) {
     set_pack(pack);
     let is_key = tag == "key";
-    let clip = if is_key {
+    let pick: String = if is_key {
         let tags = key_pool_tags();
-        let pick = &tags[(rnd() % tags.len() as u64) as usize];
-        let mut c = match with_clip(pick) {
-            Some(c) => c,
-            None => return,
-        };
+        tags[(rnd() % tags.len() as u64) as usize].clone()
+    } else {
+        tag.to_string()
+    };
+    // 【T1-2a 2026-11-07】cache miss 不在按键线程同步取料（旧 with_clip
+    // 持 CACHE 锁同步走 BG 管道，冷缓存最长 150ms/Tag 卡按键线程）：
+    // tag 交播放工人线程后台取（下一键命中即有声），本键静音跳过。
+    let Some(mut c) = cached_clip(&pick) else {
+        prefetch_async(&pick);
+        return;
+    };
+    if is_key {
         c.volume = vol;
         // 音量抖动 ±15%：同一 wav 也不重样
         let jitter = 85 + (rnd() % 31) as u32; // 85–115
         c.volume = ((c.volume as u32 * jitter) / 100).min(100) as u8;
-        c
     } else {
-        match with_clip(tag) {
-            Some(mut c) => {
-                c.volume = vol;
-                c
-            }
-            None => return,
-        }
+        c.volume = vol;
+    }
+    let Some(tx) = dispatch_tx() else {
+        return;
     };
+    let _ = tx.try_send(Job::Play { clip: c, is_key });
+}
+
+/// 播放调度器（懒启动）+ 8 固定播放工人组的发送端。
+/// 【T1-2a 2026-11-07】从 play() 抽出：取料（Fetch）/池预热（WarmPool）
+/// 任务投同一组工人线程，不再另起线程。
+fn dispatch_tx() -> Option<std::sync::mpsc::SyncSender<Job>> {
     static TX: Mutex<Option<std::sync::mpsc::SyncSender<Job>>> = Mutex::new(None);
     let mut g = TX.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
@@ -215,7 +229,16 @@ pub fn play(tag: &str, vol: u8, pack: &str) {
                         .name(format!("hufu-snd-{i}"))
                         .spawn(move || {
                             while let Ok(j) = wrx.recv() {
-                                play_sync(j.clip, j.is_key);
+                                match j {
+                                    Job::Play { clip, is_key } => play_sync(clip, is_key),
+                                    // 【T1-2a 2026-11-07】取料/池预热与播放
+                                    // 同池：占一路工人 ≤150ms/Tag（BG 管道
+                                    // 超时上限），其余工人照常出声。
+                                    Job::Fetch(tag) => {
+                                        let _ = fetch_clip(&tag);
+                                    }
+                                    Job::WarmPool => warm_pool(),
+                                }
                             }
                         })
                         .is_ok()
@@ -231,13 +254,17 @@ pub fn play(tag: &str, vol: u8, pack: &str) {
                 while let Ok(j) = rx.recv() {
                     for k in 0..n {
                         let idx = (next + k) % n;
-                        if wtx[idx]
-                            .try_send(Job {
-                                clip: j.clip.clone(),
-                                is_key: j.is_key,
-                            })
-                            .is_ok()
-                        {
+                        // 【T1-2a 2026-11-07】任务 enum 化后逐次构造转发
+                        //（Play 克隆重试语义与旧 struct 版一致）。
+                        let fwd = match &j {
+                            Job::Play { clip, is_key } => Job::Play {
+                                clip: clip.clone(),
+                                is_key: *is_key,
+                            },
+                            Job::Fetch(t) => Job::Fetch(t.clone()),
+                            Job::WarmPool => Job::WarmPool,
+                        };
+                        if wtx[idx].try_send(fwd).is_ok() {
                             next = (idx + 1) % n;
                             break;
                         }
@@ -246,11 +273,11 @@ pub fn play(tag: &str, vol: u8, pack: &str) {
             })
             .is_ok();
         if !ok {
-            return;
+            return None;
         }
         *g = Some(tx);
     }
-    let _ = g.as_ref().unwrap().try_send(Job { clip, is_key });
+    g.as_ref().cloned()
 }
 
 /// 同步播放（工人线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。
@@ -341,19 +368,29 @@ fn retire_handle(h: HWAVEOUT, rate: u32, channels: u16, bits: u16) {
     }
 }
 
-fn with_clip(tag: &str) -> Option<Clip> {
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(c) = map.get(tag) {
-        return Some(Clip {
-            samples: c.samples.clone(),
-            samples_per_sec: c.samples_per_sec,
-            channels: c.channels,
-            bits: c.bits,
-            volume: c.volume,
-        });
+/// 命中查询：CACHE 锁内纯 map 查（短持）。【T1-2b 2026-11-07】旧
+/// with_clip 持 CACHE 锁同步走 BG 管道（取料+解码+入缓存全在锁内）
+/// ——冷缓存时按键线程最长 150ms/Tag 卡键且其他线程查缓存全体排队；
+/// 拆成「锁内查 / 锁外取」两半，锁永不跨管道调用。
+fn cached_clip(tag: &str) -> Option<Clip> {
+    let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let c = guard.as_ref()?.get(tag)?;
+    Some(Clip {
+        samples: c.samples.clone(),
+        samples_per_sec: c.samples_per_sec,
+        channels: c.channels,
+        bits: c.bits,
+        volume: c.volume,
+    })
+}
+
+/// 取料（工人线程内调用）：管道取+base64 解码+wav 解析在锁外，插入
+/// 缓存短持锁。【T1-2b 2026-11-07】锁不跨管道调用——工人取料期间
+/// 按键线程查缓存/派播放照常，互不阻塞。
+fn fetch_clip(tag: &str) -> Option<Clip> {
+    if let Some(c) = cached_clip(tag) {
+        return Some(c); // 排队期间他人已取好：直接复用
     }
-    // 管道取
     let resp = crate::ipc::call(&serde_json::json!({"op": "sound", "tag": tag}))?;
     let data_b64 = resp.get("data").and_then(|v| v.as_str())?;
     let volume = resp.get("volume").and_then(|v| v.as_u64()).unwrap_or(50) as u8;
@@ -366,27 +403,71 @@ fn with_clip(tag: &str) -> Option<Clip> {
         bits,
         volume,
     };
-    map.insert(
-        tag.to_string(),
-        Clip {
-            samples: clip.samples.clone(),
-            samples_per_sec: clip.samples_per_sec,
-            channels: clip.channels,
-            bits: clip.bits,
-            volume: clip.volume,
-        },
-    );
+    {
+        let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(
+            tag.to_string(),
+            Clip {
+                samples: clip.samples.clone(),
+                samples_per_sec: clip.samples_per_sec,
+                channels: clip.channels,
+                bits: clip.bits,
+                volume: clip.volume,
+            },
+        );
+    }
     Some(clip)
+}
+
+/// 【T1-2a 2026-11-07】把取料任务丢给播放工人线程（队列满/线程组起不
+/// 来则丢弃——下一键 miss 会再触发，最终一致）。
+fn prefetch_async(tag: &str) {
+    if let Some(tx) = dispatch_tx() {
+        let _ = tx.try_send(Job::Fetch(tag.to_string()));
+    }
+}
+
+/// 【T1-2c 2026-11-07】后台预热键音池（开关翻转/换包 invalidate 后由
+/// 工人线程执行，不占 UI/按键线程）。
+fn warm_pool_async() {
+    if let Some(tx) = dispatch_tx() {
+        let _ = tx.try_send(Job::WarmPool);
+    }
+}
+
+/// 池成员探明（工人线程内调用）：与旧 key_pool_tags 同口径——4 个
+/// 事件 tag 逐个取料入缓存，取得到的进池；全空回退 "key"。
+/// 【T1-2c 2026-11-07】原在按键线程同步做，现整体搬到后台。
+fn warm_pool() {
+    let mut v: Vec<String> = ["key", "select", "commit", "page"]
+        .iter()
+        .filter(|t| fetch_clip(t).is_some())
+        .map(|t| t.to_string())
+        .collect();
+    if v.is_empty() {
+        v.push("key".to_string());
+    }
+    let mut g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
+    *g = Some(v);
 }
 
 /// 清空缓存（音量/文件变更后重取）。
 pub fn invalidate() {
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    *guard = None;
-    // 【P2-8 2026-11-07】键音池标签一并失效：换音效包后旧池标签可能
-    // 在新包里全部取不到 → 键音整包静默。
-    let mut tags = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
-    *tags = None;
+    {
+        let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+        // 【P2-8 2026-11-07】键音池标签一并失效：换音效包后旧池标签可能
+        // 在新包里全部取不到 → 键音整包静默。
+        let mut tags = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
+        *tags = None;
+    }
+    // 【T1-2c 2026-11-07】失效后下一键不再重付冷缓存（旧实现首键在
+    // 按键线程连查 4 tag 各 ≤150ms）：常用 tag+池成员交工人线程后台
+    // 预取，UI/按键线程零阻塞（langbar 开关翻转/换包同样受益）。
+    // 【防回归修复(09-reg P3-3) 2026-11-07】预热挪出两锁外——首启工
+    // 人线程毫秒级，不该占 CACHE/KEY_POOL_TAGS 锁（锁序单向不变）。
+    warm_pool_async();
 }
 
 /// 极简 wav 解析：RIFF→fmt→data（PCM，任意声道/位深，waveOut 按实际格式开）。

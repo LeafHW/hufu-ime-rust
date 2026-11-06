@@ -4686,12 +4686,9 @@ impl CandidateWindowV2 {
         // 【DPI 测试旋钮 2026-09-11】HUFU_FAKE_DPI=<dpi>：pad-dump/smoke
         // 取证用——100% 屏上伪造高 DPI 复现「高 DPI 阴影二次缩放」类
         // 问题（真机该值不存在，零影响）。值=目标 DPI（如 144=150%）。
-        let dpi_scale = std::env::var("HUFU_FAKE_DPI")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v >= 96.0 && *v <= 480.0)
-            .map(|v| v / 96.0)
-            .unwrap_or(dpi_scale);
+        // 【T3-d 2026-11-07】env 查询进程内缓存（show 每键都走；测试钩子
+        // 改值走 fake_dpi_cache_reset 失效），取值口径不变。
+        let dpi_scale = crate::tsf::fake_dpi_scale().unwrap_or(dpi_scale);
         // 【动效】注释展开延时。皮肤键（layout 节，缺省走代码默认）：
         // comment_delay_ms=400（0=注释常显）。时长键 size_ms/pos_ms/
         // hl_ms 见下方各自读取处。
@@ -8708,8 +8705,8 @@ impl CandidateWindowV2 {
                     // 首显滑动（100ms 位移）会打乱其可见性采样（实测
                     // 100% 档 vis=false）——冒烟进程内禁用（视觉时序特
                     // 性本就无法在冒烟里断言，实机由 trace 首显臂门覆盖）。
-                    if first_show_slide
-                        && std::env::var("HUFU_TSF_SMOKE").as_deref() != Ok("1")
+                    // 【T3-d 2026-11-07】SMOKE 旋钮改进程内缓存（口径不变）。
+                    if first_show_slide && !crate::tsf::smoke_env()
                     {
                         if let Some(unit) = first_show_unit {
                             // 【四修·时序无关】起点从目标反推：编码左端=

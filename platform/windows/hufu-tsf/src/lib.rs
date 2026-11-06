@@ -665,6 +665,9 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
     for (i, sc) in SCALES.iter().enumerate() {
         // 伪造 DPI（与阴影取证同旋钮）——env 进程内生效
         std::env::set_var("HUFU_FAKE_DPI", format!("{}", (sc * 96.0) as i32));
+        // 【T3-d 2026-11-07】DPI 旋钮已进程内缓存（show 热路径）——
+        // 逐档改值后失效缓存，下一 show 重读新档。
+        crate::tsf::fake_dpi_cache_reset();
         let Some(w) = CandidateWindowV2::new() else {
             continue;
         };
@@ -789,6 +792,8 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         }
     }
     std::env::remove_var("HUFU_FAKE_DPI");
+    // 【T3-d 2026-11-07】删值后失效缓存，恢复真机 DPI 口径。
+    crate::tsf::fake_dpi_cache_reset();
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.cand2 = saved;
