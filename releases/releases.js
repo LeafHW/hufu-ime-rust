@@ -192,7 +192,7 @@
   function giteeUrl(tag, name) {
     var v = String(tag || '').replace(/^v/i, '');
     if (!v || !name) return '';
-    return 'https://gitee.com/leafyin/hufu-ime-rust/releases/download/v' + encodeURIComponent(v) + '/' + encodeURIComponent(name);
+    return 'https://gitee.com/leafHW/hufu-ime-rust/releases/download/v' + encodeURIComponent(v) + '/' + encodeURIComponent(name);
   }
 
   function assetLink(asset, label) {
@@ -327,7 +327,7 @@
           '<h2>暂时读不到最新版本。</h2>' +
           '<p>' + escapeHTML(text) + ' 你仍然可以直接打开 Gitee 或 GitHub 的版本页查看最新版本与历史版本。</p>' +
           '<div class="error-actions">' +
-            '<a class="btn" href="https://gitee.com/leafyin/hufu-ime-rust/releases" target="_blank" rel="noopener">打开 Gitee 下载页 ↗</a>' +
+            '<a class="btn" href="https://gitee.com/leafHW/hufu-ime-rust/releases" target="_blank" rel="noopener">打开 Gitee 下载页 ↗</a>' +
             '<a class="btn btn-ghost" href="https://github.com/LeafHW/hufu-ime-rust/releases/latest" target="_blank" rel="noopener">GitHub（备用）</a>' +
             '<button class="btn btn-ghost" type="button" data-retry>重试</button>' +
           '</div>' +

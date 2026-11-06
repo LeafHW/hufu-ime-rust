@@ -3,58 +3,34 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>虎符 HuFu · 以虎码为核心的跨平台中文整句输入法</title>
+<title>虎符 HuFu · 落指之间，思绪成句</title>
 <meta name="description" content="虎符 HuFu 是一款以虎码为核心的跨平台中文整句输入法：虎码整句（万句基准 99.73%）、三端同源、全键盘自定义、19 套矢量皮肤与 .ssf 导入、WebDAV 云同步。Windows / Linux 可用，macOS 开发中。免费、开源、无广告。">
 <meta name="keywords" content="虎符,虎码,输入法,HuFu,中文输入法,Rime,fcitx5,TSF,开源输入法,全键盘自定义">
 <meta name="author" content="LeafHW">
-<meta name="theme-color" content="#f6f1e6" id="meta-theme-color">
+<meta name="theme-color" content="#faf9f6" id="meta-theme-color">
 <link rel="canonical" href="https://www.hufuime.top/">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="虎符 HuFu">
 <meta property="og:locale" content="zh_CN">
-<meta property="og:title" content="虎符 HuFu · 让中文收指成句">
+<meta property="og:title" content="虎符 HuFu · 落指之间，思绪成句">
 <meta property="og:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句万句基准 99.73%；全键盘自定义、三端同源、19 套皮肤、WebDAV 云同步。免费开源，无广告。">
 <meta property="og:url" content="https://www.hufuime.top/">
-<meta property="og:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261104a">
+<meta property="og:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261106b">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="虎符 HuFu · 让中文收指成句">
+<meta name="twitter:title" content="虎符 HuFu · 落指之间，思绪成句">
 <meta name="twitter:description" content="以虎码为核心的跨平台中文整句输入法。虎码整句万句基准 99.73%；全键盘自定义。免费、开源、无广告。">
-<meta name="twitter:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261104a">
+<meta name="twitter:image" content="https://www.hufuime.top/assets/img/og.jpg?v=20261106b">
 <link rel="icon" href="./assets/img/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="icon" href="./assets/img/favicon-64.png" sizes="64x64" type="image/png">
 <link rel="apple-touch-icon" href="./assets/img/apple-touch-icon.png">
 <link rel="manifest" href="./site.webmanifest">
-<link rel="preload" href="./assets/fonts/noto-serif-sc-subset.woff2?v=20261104a" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="./assets/css/main.css?v=20261104a">
-<noscript>
-  <style>
-    /* 【P2-29 2026-11-04】JS 关闭：解除入场隐藏（[data-reveal] 默认 opacity:0，
-       此前无脚本时整页半白）。滚动动画正常时这条不生效。 */
-    .js [data-reveal] { opacity: 1 !important; transform: none !important; }
-    .hero-reveal { animation: none !important; opacity: 1 !important; transform: none !important; }
-  </style>
-</noscript>
-<script>
-  (function () {
-    var root = document.documentElement;
-    root.classList.add('js');
-    /* 【P2-29 2026-11-04】渐进增强兜底：main.js 加载失败（404/网络/语法错误）
-       或执行期抛错时，解除 [data-reveal] 的隐藏 —— 此前 JS 一挂就是半页白。
-       正常路径下本类名永不添加，滚动入场动画不受影响。 */
-    window.addEventListener('error', function (e) {
-      var t = e && (e.target || e.srcElement);
-      if ((t && t.tagName === 'SCRIPT') || (e && e.message)) root.classList.add('reveal-fallback');
-    }, true);
-    var theme = 'light';
-    try {
-      var saved = localStorage.getItem('hufu-theme');
-      theme = saved === 'dark' || saved === 'light' ? saved : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    } catch (e) {}
-    root.setAttribute('data-theme', theme);
-  })();
-</script>
+<link rel="preload" href="./assets/fonts/hufu-editorial.woff?v=20261106b" as="font" type="font/woff" crossorigin>
+
+
+
+
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -67,633 +43,37 @@
   "inLanguage": "zh-CN",
   "description": "以虎码为核心的跨平台中文整句输入法，支持虎码整句（万句基准 99.73%）、全键盘自定义、多方案、19 套矢量皮肤、.ssf 导入与 WebDAV 云同步。",
   "url": "https://www.hufuime.top/",
-  "downloadUrl": "https://gitee.com/leafyin/hufu-ime-rust/releases",
+  "downloadUrl": "https://gitee.com/leafHW/hufu-ime-rust/releases",
   "codeRepository": "https://github.com/LeafHW/hufu-ime-rust",
   "license": "https://www.gnu.org/licenses/gpl-3.0.html",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "CNY" },
   "author": { "@type": "Person", "name": "LeafHW" }
 }
 </script>
+<link rel="stylesheet" href="./assets/css/main.css?v=20261106b">
+<script>(function(){var t='light';try{var s=localStorage.getItem('hufu-theme');if(s==='light'||s==='dark')t=s}catch(e){}document.documentElement.dataset.theme=t;window.addEventListener('error',function(){document.documentElement.classList.remove('reveal-ready','motion-ready')})})();</script>
+<noscript><style>.theme-button,.menu-button,.mode-tabs,.workspace-tabs,.replay-button,.expand-button,[data-support]{display:none!important}.os-tabs{display:none!important}.os-panel[hidden]{display:block!important;margin-top:25px;border-top:1px solid var(--line)}.workspace-image{pointer-events:none}.palette-buttons button{pointer-events:none}.desktop-nav{display:flex!important;gap:14px;flex-wrap:wrap;font-size:10px}.navigation{height:auto;min-height:80px;flex-wrap:wrap;gap:15px;padding-block:16px}.hero{padding-top:110px}</style></noscript>
 </head>
 <body>
 <a class="skip-link" href="#main">跳到正文</a>
-<div class="scroll-progress" aria-hidden="true"><i data-scroll-progress></i></div>
-
-<svg class="svg-sprite" aria-hidden="true" focusable="false">
-  <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
-  <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 4v16M6 14l6 6 6-6"/></symbol>
-  <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 20V4M6 10l6-6 6 6"/></symbol>
-  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4.5 20.5h15"/></symbol>
-  <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .6a11.4 11.4 0 0 0-3.6 22.2c.57.1.78-.25.78-.55v-2.1c-3.17.7-3.84-1.34-3.84-1.34-.52-1.32-1.27-1.67-1.27-1.67-1.04-.7.08-.69.08-.69 1.15.08 1.75 1.18 1.75 1.18 1.02 1.75 2.68 1.25 3.33.95.1-.74.4-1.25.72-1.54-2.53-.29-5.2-1.27-5.2-5.64 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.45.11-3.02 0 0 .96-.31 3.15 1.17a10.9 10.9 0 0 1 5.74 0c2.18-1.48 3.14-1.17 3.14-1.17.63 1.57.24 2.73.12 3.02.74.8 1.18 1.82 1.18 3.07 0 4.38-2.67 5.35-5.22 5.63.41.36.78 1.06.78 2.14v3.17c0 .3.2.66.79.55A11.4 11.4 0 0 0 12 .6Z"/></symbol>
-  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
-  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 14.3A8.6 8.6 0 0 1 9.7 3.5a8.6 8.6 0 1 0 10.8 10.8Z"/></symbol>
-  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
-  <symbol id="i-x" viewBox="0 0 24 24"><path d="M5 5l14 14M19 5 5 19"/></symbol>
-  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12.5 5 5L20 6.5"/></symbol>
-  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></symbol>
-  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
-  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a4.5 4.5 0 0 1-.5-9 6 6 0 0 1 11.6 1.5A3.8 3.8 0 0 1 17.5 18H7Z"/></symbol>
-  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 12.5l9 5 9-5M3 17l9 5 9-5"/></symbol>
-  <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M6 13.5h.01M9.5 13.5h5M18 13.5h.01M7 16.5h10"/></symbol>
-  <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3.5 13.6 9 19 10.6 13.6 12.2 12 17.7 10.4 12.2 5 10.6 10.4 9 12 3.5ZM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16ZM5 3l.6 1.6L7.2 5l-1.6.6L5 7.2l-.6-1.6L2.8 5l1.6-.4L5 3Z"/></symbol>
-  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M9 20.5h6M12 16.5v4"/></symbol>
-  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
-  <symbol id="i-apple" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M16.7 12.6c0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7-1.4-.1-2.6.8-3.3.8-.7 0-1.7-.8-2.9-.8-1.5 0-2.9.9-3.7 2.2-1.6 2.7-.4 6.7 1.1 8.9.7 1.1 1.6 2.3 2.8 2.2 1.1 0 1.6-.7 2.9-.7s1.7.7 2.9.7c1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.6 1.3-2.7-.1 0-2.5-1-2.5-3.3ZM14.6 5.9c.6-.8 1-1.8.9-2.9-.9 0-2 .6-2.7 1.4-.6.7-1 1.8-.9 2.8 1 .1 2-.5 2.7-1.3Z"/></symbol>
-  <symbol id="i-windows" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M3 4.8 10.6 3.8v8H3V4.8Zm9-.1 9-1.2v8.3h-9V4.7ZM3 12.9h7.6v8L3 19.9v-7Zm9 0h9v8.4l-9-1.2v-7.2Z"/></symbol>
-  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0 0 18c1.2 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.4-.7-.4-1.1 0-1 .8-1.8 1.8-1.8h2.1A4.3 4.3 0 0 0 21 11.2C21 6.7 16.9 3 12 3Z"/><path d="M7.5 11.5h.01M10 7.5h.01M14.5 7.5h.01M17.5 10h.01"/></symbol>
-  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 20 6v5.5c0 4.6-3.2 7.7-8 9.5-4.8-1.8-8-4.9-8-9.5V6l8-3Z"/><path d="m8.5 11.8 2.4 2.4 4.6-4.7"/></symbol>
-  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
-  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6"/></symbol>
-  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
-  <symbol id="i-sync" viewBox="0 0 24 24"><path d="M20 8a8 8 0 0 0-14.8-1M4 4v4h4M4 16a8 8 0 0 0 14.8 1M20 20v-4h-4"/></symbol>
-  <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6Z"/></symbol>
-  <symbol id="i-arrow-up-right" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
-</svg>
-
-<header class="site-header" data-header>
-  <div class="shell header-inner">
-    <a class="brand" href="#top" aria-label="虎符 HuFu 首页">
-      <span class="brand-mark"><img src="./assets/img/logo-128.webp" width="32" height="32" alt=""></span>
-      <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
-    </a>
-    <nav class="nav" aria-label="主导航" data-nav>
-      <a href="#features" data-nav-link>能力</a>
-      <a href="#skins" data-nav-link>皮肤</a>
-      <a href="#settings" data-nav-link>设置</a>
-      <a href="#data" data-nav-link>数据</a>
-      <a href="#download" data-nav-link>下载</a>
-      <a href="./releases/">更新日志</a>
-      <a href="#faq" data-nav-link>问答</a>
-      <a href="#donate" data-nav-link>打赏</a>
-    </nav>
-    <div class="header-actions">
-      <a class="icon-btn header-github" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener" aria-label="在 GitHub 上查看虎符">
-        <svg class="ico"><use href="#i-github"></use></svg>
-      </a>
-      <button class="icon-btn theme-toggle" type="button" data-theme-toggle aria-label="切换到深色模式" title="切换明暗">
-        <svg class="ico ico-sun"><use href="#i-sun"></use></svg>
-        <svg class="ico ico-moon"><use href="#i-moon"></use></svg>
-      </button>
-      <a class="btn btn-sm btn-ink header-dl" href="#download">下载</a>
-      <button class="icon-btn menu-toggle" type="button" data-menu-toggle aria-label="打开菜单" aria-expanded="false" aria-controls="mobile-nav">
-        <svg class="ico ico-menu"><use href="#i-menu"></use></svg>
-        <svg class="ico ico-close"><use href="#i-x"></use></svg>
-      </button>
-    </div>
-  </div>
-</header>
-
-  <div class="mobile-nav" id="mobile-nav" data-mobile-nav hidden>
-    <nav aria-label="移动导航">
-      <a href="#features">能力 <span>01</span></a>
-      <a href="#skins">皮肤 <span>02</span></a>
-      <a href="#settings">设置 <span>03</span></a>
-      <a href="#data">数据 <span>04</span></a>
-      <a href="#download">下载 <span>05</span></a>
-      <a href="./releases/">更新日志 <span>06</span></a>
-      <a href="#faq">问答 <span>07</span></a>
-      <a href="#donate">打赏 <span>08</span></a>
-    </nav>
-    <div class="mobile-nav-foot">
-      <a href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">GitHub <svg class="ico"><use href="#i-external"></use></svg></a>
-      <span>GPL-3.0-or-later · 免费开源</span>
-    </div>
-  </div>
-
-
+<svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><symbol id="arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol><symbol id="diagonal" viewBox="0 0 24 24"><path d="M6 18 18 6M6 6h12v12"/></symbol><symbol id="download-icon" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/></symbol><symbol id="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></symbol><symbol id="windows" viewBox="0 0 24 24"><path d="m3 5 8-1v8H3V5Zm10-1 8-1v9h-8V4ZM3 14h8v8l-8-1v-7Zm10 0h8v9l-8-1v-8Z" fill="currentColor" stroke="none"/></symbol><symbol id="check" viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"/></symbol><symbol id="plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="play" viewBox="0 0 24 24"><path d="m9 5 11 7L9 19V5Z"/></symbol></svg>
+<header class="header" data-header><div class="shell navigation"><a class="brand" href="#top" aria-label="虎符首页"><img src="./assets/img/logo-128.webp" width="40" height="40" alt=""><span>虎符<span class="brand-en">HUFU</span></span></a><nav class="desktop-nav" aria-label="主导航"><a href="#experience">输入体验</a><a href="#appearance">外观</a><a href="#workspace">随心设置</a><a href="./releases/">更新日志 <span>↗</span></a></nav><div class="nav-end"><button class="theme-button" type="button" data-theme-toggle aria-label="切换配色"><svg class="icon"><use href="#sun"/></svg></button><a class="nav-download" href="#download">获取虎符 <svg class="icon"><use href="#diagonal"/></svg></a><button class="menu-button" type="button" data-menu-toggle aria-label="打开菜单" aria-expanded="false" aria-controls="mobile-nav"><i></i><i></i></button></div></div><nav class="mobile-nav" id="mobile-nav" aria-label="手机导航" hidden><a href="#experience">输入体验</a><a href="#appearance">外观</a><a href="#workspace">随心设置</a><a href="#download">下载虎符</a><a href="./releases/">更新日志 ↗</a></nav></header>
 <main id="main">
-  <section class="hero" id="top">
-    <div class="hero-bg" aria-hidden="true">
-      <span class="hero-watermark">符</span>
-      <span class="hero-glow"></span>
-      <span class="hero-grid-lines"></span>
-      <span class="hero-stripes"><i></i><i></i><i></i></span>
-    </div>
-    <div class="shell hero-inner">
-      <div class="hero-copy">
-        <p class="eyebrow hero-reveal"><span class="status-dot"></span> <span data-release-version>最新版</span> · 虎码整句 · 开源免费</p>
-        <h1 class="hero-reveal" style="--i:1">让中文<br><span class="mark">收指成句<svg class="brush" viewBox="0 0 600 24" preserveAspectRatio="none" aria-hidden="true"><path d="M5 16C96 8 206 6 312 9c95 2.6 178 2.4 283-2" /></svg></span></h1>
-        <p class="lede hero-reveal" style="--i:2">虎符是一款以 <strong>虎码</strong> 为核心的跨平台中文整句输入法。就算不用整句，它也是<span class="nowrap">第一梯队</span>的定长输入方案输入平台；只要是定长方案都可使用；<span class="nowrap">整句、字词、单字</span>三种节奏，Windows / Linux / macOS 三端同源。</p>
-        <div class="hero-actions hero-reveal" style="--i:3">
-          <a class="btn btn-primary" href="#download" data-hero-download>
-            <span>下载虎符</span>
-            <svg class="ico"><use href="#i-download"></use></svg>
-          </a>
-          <a class="btn btn-ghost" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">
-            <svg class="ico"><use href="#i-github"></use></svg>
-            <span>在 GitHub 上看</span>
-          </a>
-        </div>
-        <ul class="hero-meta hero-reveal" style="--i:4">
-          <li><svg class="ico"><use href="#i-windows"></use></svg>Windows 10/11</li>
-          <li><svg class="ico"><use href="#i-terminal"></use></svg>Linux fcitx5</li>
-          <li class="is-dev"><svg class="ico"><use href="#i-apple"></use></svg>macOS 开发中</li>
-        </ul>
-        <p class="hero-fine hero-reveal" style="--i:5"><span class="dot ok"></span>数据默认留在本机 · 无账号 · 无广告</p>
-      </div>
-
-      <div class="hero-stage hero-reveal" style="--i:2" data-parallax>
-        <div class="medal" aria-hidden="true">
-          <span class="medal-ring"></span>
-          <img class="medal-icon" src="./assets/img/logo-256.webp" alt="" width="126" height="126">
-          <span class="medal-spark"></span>
-        </div>
-
-        <div class="float-chip chip-a"><span class="status-dot"></span>整句 · 99.73%</div>
-        <div class="float-chip chip-b"><b>p50</b> 6ms</div>
-        <div class="float-chip chip-c"><b>19</b><span>套皮肤</span></div>
-
-        <div class="editor is-typing" aria-hidden="true">
-          <div class="editor-bar">
-            <span class="win-dots"><i></i><i></i><i></i></span>
-            <span class="editor-title">未命名 · 记事本</span>
-            <span class="ime-badge"><img src="./assets/img/logo-64.webp" alt="" width="16" height="16">虎符</span>
-          </div>
-          <div class="editor-body">
-            <p class="editor-line"><span data-demo-text></span><span class="caret"></span></p>
-            <p class="editor-placeholder" data-demo-placeholder>用虎码，把想说的话一次打完。</p>
-          </div>
-          <div class="editor-status"><span>UTF-8</span><span>Ln 1, Col 1</span><span>中文 · 全角</span></div>
-        </div>
-
-        <div class="candidate" data-candidate aria-hidden="true">
-          <div class="cand-head"><span class="cand-code" data-cand-code>syfdgvwihuvnagj</span><span class="cand-page">第 1 / 2 页</span></div>
-          <ol class="cand-list" data-cand-list>
-            <li class="is-active" data-cand-item><span class="cand-num">1.</span><span class="cand-word">让中文收指成句</span><span class="cand-tag">整句</span></li>
-            <li data-cand-item><span class="cand-num">2.</span><span class="cand-word">让中文收指</span><span class="cand-tag">五字</span></li>
-            <li data-cand-item><span class="cand-num">3.</span><span class="cand-word">让中文</span><span class="cand-tag">三字</span></li>
-            <li data-cand-item><span class="cand-num">4.</span><span class="cand-word">让</span><span class="cand-tag">首字</span></li>
-          </ol>
-          <div class="cand-foot"><span class="cand-mode">虎整句 · 整句</span><span class="cand-hint">↑↓ 选择 · 空格上屏</span></div>
-          <span class="cand-caret" aria-hidden="true"></span>
-        </div>
-
-        <div class="code-keys" aria-hidden="true">
-          <span class="code-full" data-code-type="hero"><span data-code-text>syfdgvwihuvnagj</span><i class="code-caret"></i></span><span class="code-label">虎码 · 全码</span>
-        </div>
-        <p class="sr-only">演示：输入全码 syfdgvwihuvnagj，候选窗给出整句「让中文收指成句」并上屏。真实候选窗由输入法渲染，此处为网页示意。</p>
-      </div>
-    </div>
-
-    <div class="shell hero-foot">
-      <span class="hero-scroll"><i>↓</i> 向下看看</span>
-      <span class="hero-side-note">以符为信 · 以字为兵</span>
-      <span class="hero-version">2026</span>
-    </div>
-  </section>
-
-  <section class="story" id="story">
-    <div class="story-bg" aria-hidden="true"><span>符</span></div>
-    <div class="shell story-inner" data-reveal>
-      <p class="kicker kicker-light"><span class="tiger-bars"><i></i><i></i><i></i></span> 00 / 名字 · THE NAME</p>
-      <blockquote>虎符，古时调兵的信物。<br>今天，它调动的是<em>你指尖的中文</em>。</blockquote>
-      <div class="story-foot">
-        <p>把虎码的规则、整句的模型、三端的体验，收进同一枚符里。</p>
-        <span class="seal" aria-hidden="true">虎</span>
-      </div>
-    </div>
-  </section>
-
-  <section class="section features" id="features">
-    <div class="shell">
-      <header class="section-head" data-reveal>
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 01 / 输入 · TYPING</p>
-        <h2>不是猜你要打什么，<br>是知道你要说什么。</h2>
-        <p class="lede">以虎码整句为核心：ngram 组句与 Qwen3 神经重排协同工作。打一半，后半句已经在路上。</p>
-      </header>
-
-      <div class="bento">
-        <article class="bento-card bento-main" data-reveal>
-          <div class="bento-top"><span class="tag">虎码整句</span><svg class="ico"><use href="#i-sparkles"></use></svg></div>
-          <h3>一句话，<br>一次打完。</h3>
-          <p>27 个码元、最长 4 码。整句 / 字词 / 单字多方案，停顿后异步重排 top-5，下一次按键即刻生效。</p>
-          <div class="mode-pills" aria-hidden="true"><span class="is-on">整句</span><span>字词</span><span>单字</span><span class="mode-note">beam search</span></div>
-          <div class="stream" aria-hidden="true">
-            <span class="stream-code" data-code-type="feature"><span data-code-text>syfdgvwihuvnagj</span><i class="code-caret"></i></span>
-            <span class="stream-line"><i></i></span>
-            <span class="stream-word">让中文收指成句</span>
-            <span class="stream-badge">置信 0.97</span>
-          </div>
-        </article>
-
-        <article class="bento-card bento-platforms" data-reveal>
-          <div class="bento-top"><span class="tag">三端同源</span><svg class="ico"><use href="#i-layers"></use></svg></div>
-          <h3>一个引擎，<br>三端同源。</h3>
-          <ul class="plat-list">
-            <li><span class="dot ok"></span><b>Windows</b><em>TSF · 稳定</em></li>
-            <li><span class="dot ok"></span><b>Linux</b><em>fcitx5 · 可用</em></li>
-            <li><span class="dot dev"></span><b>macOS</b><em>IMK · 开发中</em></li>
-          </ul>
-          <p class="card-note">同一套码表、用户词与配置。</p>
-        </article>
-
-        <article class="bento-card" data-reveal>
-          <div class="bento-top"><span class="tag">候选交互</span><svg class="ico"><use href="#i-keyboard"></use></svg></div>
-          <h3>顺手，才打得快。</h3>
-          <p>数字 / 分号 / 引号选重，滚轮缩放，拖动移位，置顶与软删；整块键盘都能改。</p>
-          <div class="keys-mini" aria-hidden="true"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>;</kbd><kbd>'</kbd><span>选重</span></div>
-        </article>
-
-        <article class="bento-card" data-reveal>
-          <div class="bento-top"><span class="tag">皮肤</span><svg class="ico"><use href="#i-palette"></use></svg></div>
-          <h3>十九种脾气。</h3>
-          <p>19 套矢量皮肤、21 个颜色角色；导入 .ssf，毛玻璃与亚克力材质。</p>
-          <div class="swatches" aria-hidden="true"><i style="--c:#e7b75c"></i><i style="--c:#4aa3c7"></i><i style="--c:#7fbfa8"></i><i style="--c:#b9a0e6"></i><i style="--c:#d25843"></i></div>
-        </article>
-
-        <article class="bento-card" data-reveal>
-          <div class="bento-top"><span class="tag">数据</span><svg class="ico"><use href="#i-shield"></use></svg></div>
-          <h3>只属于你。</h3>
-          <p>默认全在本机；云同步只走你自己的 WebDAV，口令加密 + 回收站。</p>
-          <div class="lock-line" aria-hidden="true"><span></span><svg class="ico"><use href="#i-lock"></use></svg><span></span></div>
-        </article>
-
-        <article class="bento-card bento-wide" data-reveal>
-          <div class="bento-wide-copy">
-            <div class="bento-top"><span class="tag">方案生态</span><svg class="ico"><use href="#i-cpu"></use></svg></div>
-            <h3>方案随装随用。</h3>
-            <p>HuFu 原生 / Rime / 多多 / QQ五笔 / 虎整句。方案即目录，一键切换。</p>
-          </div>
-          <div class="scheme-marquee" aria-hidden="true">
-            <div class="scheme-track">
-              <span>HuFu 原生</span><span>Rime</span><span>多多</span><span>QQ五笔</span><span>虎整句</span><span>个人方案</span><span>符号</span><span>反查</span>
-              <span>HuFu 原生</span><span>Rime</span><span>多多</span><span>QQ五笔</span><span>虎整句</span><span>个人方案</span><span>符号</span><span>反查</span>
-            </div>
-          </div>
-        </article>
-      </div>
-
-      <div class="stats" data-reveal>
-        <div class="stat"><strong><span data-count="99.73" data-decimals="2">99.73</span><i>%</i></strong><span>万句基准准率<em>1 万句 · 纯 ngram</em></span></div>
-        <div class="stat"><strong><span data-count="6" data-decimals="0">6</span><i>ms</i></strong><span>组句触达 p50<em>本机引擎实测</em></span></div>
-        <div class="stat"><strong><span data-count="246" data-decimals="0">246</span><i>k</i></strong><span>虎码字词条<em>import 闭包</em></span></div>
-        <div class="stat"><strong><span data-count="19" data-decimals="0">19</span><i>套</i></strong><span>矢量皮肤<em>兼容 .ssf</em></span></div>
-        <p class="stats-note">万句基准（tbench v2）准率 99.73%，纯 ngram；神经重排后 99.9%（可选增强）（同语料 A/B 见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/benchmark-qwen-vs-ngram.md" target="_blank" rel="noopener">基准报告</a>）。数据与口径见 <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">docs/status.md</a></p>
-      </div>
-    </div>
-  </section>
-
-  <section class="section skins" id="skins">
-    <div class="shell">
-      <header class="section-head section-head--split" data-reveal>
-        <div>
-          <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 02 / 外观 · SKINS</p>
-          <h2>同一套引擎，<br>十九种脾气。</h2>
-        </div>
-        <p class="lede">候选窗不只是候选窗。19 套矢量皮肤、21 个颜色角色，也能直接导入搜狗 .ssf；毛玻璃、亚克力、纯色，随心换。</p>
-      </header>
-
-      <div class="skin-lab" data-reveal>
-        <div class="skin-stage">
-          <div class="skin-stage-head"><span>SKIN LAB</span><span data-skin-count>19 套矢量皮肤</span></div>
-          <div class="skin-window skin-moyan" data-skin-window aria-hidden="true">
-            <div class="skin-cand">
-              <div class="cand-head"><span class="cand-code">tuja</span><span class="cand-page">第 1 / 2 页</span></div>
-              <ol class="cand-list">
-                <li class="is-active"><span class="cand-num">1.</span><span class="cand-word">我们</span><span class="cand-py">wǒ men</span></li>
-                <li><span class="cand-num">2.</span><span class="cand-word">我</span><span class="cand-py">wǒ</span></li>
-                <li><span class="cand-num">3.</span><span class="cand-word">我军</span><span class="cand-py">wǒ jūn</span></li>
-                <li><span class="cand-num">4.</span><span class="cand-word">War</span><span class="cand-py">wɔːr</span></li>
-                <li><span class="cand-num">5.</span><span class="cand-word">握手</span><span class="cand-py">wò shǒu</span></li>
-              </ol>
-              <div class="cand-foot"><span class="cand-mode">虎整句 · 整句</span><span class="cand-hint">空格上屏</span></div>
-            </div>
-          </div>
-          <div class="skin-stage-foot"><span>当前 · <b data-skin-name>墨岩</b></span><span>点击切换</span></div>
-          <span class="skin-orb skin-orb-a" aria-hidden="true"></span>
-          <span class="skin-orb skin-orb-b" aria-hidden="true"></span>
-        </div>
-        <div class="skin-controls">
-          <div class="skin-controls-head">
-            <h3>挑一副顺眼的。</h3>
-            <p>点击即时预览。装好后，皮肤工作室里还有完整的 19 套与导入入口。</p>
-          </div>
-          <div class="skin-grid" role="group" aria-label="皮肤选择">
-            <button class="skin-btn is-active" type="button" data-skin="moyan" aria-pressed="true">
-              <span class="sw" style="--a:#17181c;--b:#e7b75c;--c:#f2f0ea"></span><span class="skin-btn-text"><b>墨岩</b><em>金 · 深色</em></span>
-            </button>
-            <button class="skin-btn" type="button" data-skin="canghai" aria-pressed="false">
-              <span class="sw" style="--a:#0e1a24;--b:#4aa3c7;--c:#e8f2f7"></span><span class="skin-btn-text"><b>沧海</b><em>蓝 · 深色</em></span>
-            </button>
-            <button class="skin-btn" type="button" data-skin="chenwu" aria-pressed="false">
-              <span class="sw" style="--a:#f4f2ee;--b:#cfe3ee;--c:#2a2926"></span><span class="skin-btn-text"><b>晨雾</b><em>灰 · 浅色</em></span>
-            </button>
-            <button class="skin-btn" type="button" data-skin="huguang" aria-pressed="false">
-              <span class="sw" style="--a:#0f1f1c;--b:#7fbfa8;--c:#e6f2ee"></span><span class="skin-btn-text"><b>湖光</b><em>青 · 深色</em></span>
-            </button>
-            <button class="skin-btn" type="button" data-skin="hupo" aria-pressed="false">
-              <span class="sw" style="--a:#221a10;--b:#e0a34f;--c:#f6ead8"></span><span class="skin-btn-text"><b>琥珀</b><em>琥珀 · 深色</em></span>
-            </button>
-            <button class="skin-btn" type="button" data-skin="mushan" aria-pressed="false">
-              <span class="sw" style="--a:#1b1626;--b:#b9a0e6;--c:#efe9f7"></span><span class="skin-btn-text"><b>暮山紫</b><em>紫 · 深色</em></span>
-            </button>
-          </div>
-          <p class="skin-note"><svg class="ico"><use href="#i-palette"></use></svg>兼容搜狗 / 虎娘 .ssf 皮肤 · weasel 配色互导 · 以上为网页示意</p>
-          <p class="sr-only">皮肤预览：候选窗显示“我们、我、我军、War”；点击上方按钮切换皮肤。</p>
-        </div>
-      </div>
-
-      <div class="shot-row">
-        <figure class="shot" data-reveal>
-          <button class="shot-btn" type="button" data-lightbox data-caption="设置 · 概览：Ctrl+K 搜索直达">
-            <img src="./assets/img/overview-light.webp" data-theme-img data-light="./assets/img/overview-light.webp" data-dark="./assets/img/overview-dark.webp" width="1280" height="800" alt="虎符设置概览页，顶部是设置搜索，展示当前方案、皮肤与云同步" loading="lazy" decoding="async">
-            <span class="shot-zoom"><svg class="ico"><use href="#i-arrow-up-right"></use></svg></span>
-          </button>
-          <figcaption><b>概览</b><span>Ctrl+K 搜索直达</span></figcaption>
-        </figure>
-        <figure class="shot" data-reveal>
-          <button class="shot-btn" type="button" data-lightbox data-caption="皮肤工作室：19 套矢量皮肤">
-            <img src="./assets/img/studio-light.webp?v=20261103e" data-theme-img data-light="./assets/img/studio-light.webp?v=20261103e" data-dark="./assets/img/studio-dark.webp?v=20261103e" width="1800" height="1145" alt="虎符皮肤工作室，左侧是皮肤列表，中间是候选窗预览" loading="lazy" decoding="async">
-            <span class="shot-zoom"><svg class="ico"><use href="#i-arrow-up-right"></use></svg></span>
-          </button>
-          <figcaption><b>皮肤工作室</b><span>19 套，一屏管理</span></figcaption>
-        </figure>
-        <figure class="shot" data-reveal>
-          <button class="shot-btn" type="button" data-lightbox data-caption="整句模型：权重、预设与试验">
-            <img src="./assets/img/sentence-light.webp" data-theme-img data-light="./assets/img/sentence-light.webp" data-dark="./assets/img/sentence-dark.webp" width="1280" height="800" alt="虎符整句模型设置页，包含整句开关、神经重排与预设" loading="lazy" decoding="async">
-            <span class="shot-zoom"><svg class="ico"><use href="#i-arrow-up-right"></use></svg></span>
-          </button>
-          <figcaption><b>整句模型</b><span>权重、预设与试验</span></figcaption>
-        </figure>
-      </div>
-    </div>
-  </section>
-
-  <section class="section split-section" id="settings">
-    <div class="shell split">
-      <div class="split-copy" data-reveal>
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 03 / 设置 · SETTINGS</p>
-        <h2>摒弃 yaml，<br>纯图形化设置，<br>调整顺手。</h2>
-        <p class="lede">本地 Web UI，全图形化十页：方案、候选、键位、整句权重、皮肤工作室、用户词、云同步…… 改完即生效，不用重启。</p>
-        <ul class="tick-list">
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>全局搜索</b>：Ctrl+K 输入关键词，直接跳到对应设置项。</span></li>
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>改皮肤 ≤2.5s 跟随</b>：换皮、调圆角、拖动挂件，所见即所得。</span></li>
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>导入导出 JSON</b>：整机配置、用户词与调整日志都能带走。</span></li>
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>全键盘自定义</b>：主键盘 / 小键盘 / Shift+符号，点键录制与冲突检测。</span></li>
-        </ul>
-        <a class="text-link" href="https://github.com/LeafHW/hufu-ime-rust/tree/master/docs" target="_blank" rel="noopener">设置与构建文档 <svg class="ico"><use href="#i-arrow-right"></use></svg></a>
-      </div>
-      <figure class="figure-frame figure-settings" data-reveal>
-        <div class="figure-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>LIVE PREVIEW</span><span class="figure-bar-tag">Ctrl + Alt + H</span></div>
-        <div class="figure-img">
-          <img src="./assets/img/overview-light.webp" data-theme-img data-light="./assets/img/overview-light.webp" data-dark="./assets/img/overview-dark.webp" width="1280" height="800" alt="虎符设置概览页，顶部是设置搜索，展示当前方案、皮肤与云同步" loading="lazy" decoding="async">
-        </div>
-        <figcaption><span>设置 · 概览</span><span>Ctrl+K 搜索直达</span></figcaption>
-      </figure>
-    </div>
-
-    <div class="shell keymap-block" data-reveal>
-      <div class="keymap-copy">
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> KEYMAP / 键位</p>
-        <h3>整块键盘，<br>都能改。</h3>
-        <p>主键盘、小键盘、Shift+符号三套映射；点任意键帽录制新功能，冲突检测会直接标出重复分配。Esc / Ctrl / Alt / Win / NumLock 固定不可映射。</p>
-        <div class="keymap-badges"><span class="tag">全键盘两态映射</span><span class="tag">按键录制</span><span class="tag">冲突检测</span></div>
-      </div>
-      <figure class="keymap-frame">
-        <img src="./assets/img/keymap-light.webp" data-theme-img data-light="./assets/img/keymap-light.webp" data-dark="./assets/img/keymap-dark.webp" width="1280" height="800" alt="虎符键位编辑页，全键盘两态映射、按键录制与冲突检测" loading="lazy" decoding="async">
-        <figcaption><span>键位编辑 · 全键盘</span><span>1 键自定义 · 无冲突</span></figcaption>
-      </figure>
-    </div>
-  </section>
-
-  <section class="section split-section split-section--data" id="data">
-    <div class="shell split split-reverse">
-      <figure class="figure-frame figure-sync" data-reveal>
-        <div class="figure-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>LIVE PREVIEW</span><span class="figure-bar-tag">WebDAV</span></div>
-        <div class="figure-img">
-          <img src="./assets/img/sync-light.webp" data-theme-img data-light="./assets/img/sync-light.webp" data-dark="./assets/img/sync-dark.webp" width="1280" height="800" alt="虎符云同步设置页，展示合符图标、WebDAV 连接状态与同步方案" loading="lazy" decoding="async">
-        </div>
-        <figcaption><span>云同步 · 合符</span><span>数据只经你自己的网盘</span></figcaption>
-      </figure>
-      <div class="split-copy" data-reveal>
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 04 / 数据 · DATA</p>
-        <h2>你的词，<br>只属于你。</h2>
-        <p class="lede">默认全部留在本机。需要多台同步时，虎符只连接你自己的 WebDAV（坚果云等），支持口令加密与回收站。官方不设服务器。</p>
-        <div class="flow" aria-hidden="true">
-          <span class="flow-node"><svg class="ico"><use href="#i-monitor"></use></svg><b>这台电脑</b></span>
-          <span class="flow-line"><i></i></span>
-          <span class="flow-node flow-node--lock"><svg class="ico"><use href="#i-lock"></use></svg><b>你的 WebDAV</b><em>口令加密</em></span>
-          <span class="flow-line"><i></i></span>
-          <span class="flow-node"><svg class="ico"><use href="#i-monitor"></use></svg><b>另一台</b></span>
-        </div>
-        <ul class="tick-list">
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>按方案勾选</b>：只同步你想要的那些方案与设置。</span></li>
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>端到端口令加密</b>：云端看到的只是密文。</span></li>
-          <li><svg class="ico"><use href="#i-check"></use></svg><span><b>30 天回收站</b>：误覆盖也能找回。</span></li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
-  <section class="section download" id="download">
-    <div class="shell">
-      <header class="section-head section-head--center" data-reveal>
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 05 / 下载 · DOWNLOAD</p>
-        <h2>装好后，<br>打几个字试试。</h2>
-        <p class="lede">免费、开源、无广告。Windows 直接安装；Linux 一行命令；macOS 正在路上。</p>
-      </header>
-
-      <div class="dl-card" data-reveal>
-        <div class="dl-main">
-          <div class="dl-top">
-            <span class="tag tag-live"><span class="status-dot"></span>稳定版</span>
-            <span class="dl-version"><b><span data-release-version>最新版</span></b><span class="sep">·</span><span data-release-date>以发布页为准</span></span>
-          </div>
-          <div class="os-tabs" role="tablist" aria-label="选择操作系统">
-            <button class="os-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="os-windows" id="tab-windows" data-os-tab="windows"><svg class="ico"><use href="#i-windows"></use></svg>Windows</button>
-            <button class="os-tab" type="button" role="tab" aria-selected="false" aria-controls="os-linux" id="tab-linux" data-os-tab="linux"><svg class="ico"><use href="#i-terminal"></use></svg>Linux</button>
-            <button class="os-tab" type="button" role="tab" aria-selected="false" aria-controls="os-macos" id="tab-macos" data-os-tab="macos"><svg class="ico"><use href="#i-apple"></use></svg>macOS</button>
-          </div>
-
-          <div class="os-panel" id="os-windows" role="tabpanel" aria-labelledby="tab-windows" data-os-panel="windows">
-            <a class="dl-btn" href="https://gitee.com/leafyin/hufu-ime-rust/releases" data-exe-link target="_blank" rel="noopener">
-              <svg class="ico"><use href="#i-download"></use></svg>
-              <span class="dl-btn-text"><b>下载 Windows 安装包</b><em><span data-exe-meta>打开 Gitee 最新版本页 · 约 25 MB</span></em></span>
-              <svg class="ico dl-btn-arrow"><use href="#i-arrow-right"></use></svg>
-            </a>
-            <div class="dl-links">
-              <a href="https://gitee.com/leafyin/hufu-ime-rust/releases" data-zip-link target="_blank" rel="noopener" hidden>绿色版 zip</a>
-              <a href="./releases/">更新日志 / 历史版本</a>
-              <a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" rel="noopener">GitHub 下载（备用）</a>
-              <a href="https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false" target="_blank" rel="noopener">整句模型（约 525 MB · 国内直连）</a>
-            </div>
-            <p class="dl-note">Windows 10/11 · 旧版原地升级，码表、设置与学习记录全部保留 · 国内走 Gitee 加速</p>
-            <ul class="dl-specs">
-              <li><b>系统</b>Windows 10/11</li>
-              <li><b>安装包</b>约 25 MB</li>
-              <li><b>许可</b>GPL-3.0-or-later</li>
-            </ul>
-          </div>
-
-          <div class="os-panel" id="os-linux" role="tabpanel" aria-labelledby="tab-linux" data-os-panel="linux" hidden>
-            <div class="code-block">
-              <div class="code-bar"><span>Linux · fcitx5</span><button class="copy-btn" type="button" data-copy="platform/linux/install.sh -umt"><svg class="ico"><use href="#i-copy"></use></svg><span>复制</span></button></div>
-              <pre><code>platform/linux/install.sh -umt
-fcitx5 -r -d</code></pre>
-            </div>
-            <div class="dl-links">
-              <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/platform/linux/README.md" target="_blank" rel="noopener">Linux 安装说明</a>
-              <a href="./releases/">更新日志 / 历史版本</a>
-            </div>
-            <p class="dl-note">用户级一键安装 · 模型与主题分别用 <code>-m</code>、<code>-t</code> 显式安装 · 由社区协作者维护</p>
-          </div>
-
-          <div class="os-panel" id="os-macos" role="tabpanel" aria-labelledby="tab-macos" data-os-panel="macos" hidden>
-            <div class="mac-status">
-              <span class="mac-badge"><svg class="ico"><use href="#i-apple"></use></svg></span>
-              <div><b>macOS 版开发中</b><p>IMK 前端骨架已落地，预计 11 月 20 日前后上线；暂无安装包。</p></div>
-              <span class="status-pill">开发中</span>
-            </div>
-            <div class="dl-links">
-              <a href="https://github.com/LeafHW/hufu-ime-rust/tree/master/platform/macos" target="_blank" rel="noopener">查看 IMK 前端进度</a>
-              <a href="https://github.com/LeafHW/hufu-ime-rust/issues" target="_blank" rel="noopener">参与测试与反馈</a>
-            </div>
-            <p class="dl-note">欢迎 Mac 开发者参与；发布后会在这里同步更新。</p>
-          </div>
-        </div>
-
-        <aside class="dl-side">
-          <p class="dl-side-title">三步开始</p>
-          <ol class="steps" data-os-steps="windows">
-            <li><b>01</b><span>下载安装包<em>约 25 MB，无需注册</em></span></li>
-            <li><b>02</b><span>双击安装<em>旧版原地升级，数据保留</em></span></li>
-            <li><b>03</b><span>按 Win+Space 切到「虎符」<em>Ctrl+Alt+H 设置 · Ctrl+M 切方案</em></span></li>
-          </ol>
-          <ol class="steps" data-os-steps="linux" hidden>
-            <li><b>01</b><span>跑一行安装命令<em>platform/linux/install.sh -umt</em></span></li>
-            <li><b>02</b><span>重启 fcitx5<em>fcitx5 -r -d</em></span></li>
-            <li><b>03</b><span>添加「虎符」<em>fcitx5-configtool · 用户级安装</em></span></li>
-          </ol>
-          <ol class="steps" data-os-steps="macos" hidden>
-            <li><b>01</b><span>关注开发进度<em>IMK 前端骨架已落地</em></span></li>
-            <li><b>02</b><span>等待安装包<em>预计 11 月 20 日前后</em></span></li>
-            <li><b>03</b><span>参与测试<em>欢迎 Mac 开发者</em></span></li>
-          </ol>
-          <div class="dl-model">
-            <span class="tag">可选</span>
-            <p>整句模型约 525 MB（ModelScope 国内直连，免登录），单独下载；解压到安装目录，约 2 秒自动装载。</p>
-            <a class="text-link" href="https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false" target="_blank" rel="noopener">下载模型 <svg class="ico"><use href="#i-arrow-right"></use></svg></a>
-          </div>
-        </aside>
-      </div>
-      <p class="dl-foot"><svg class="ico"><use href="#i-github"></use></svg> 从 GitHub Releases 下载 · 免费开源 · 无广告 · 无账号</p>
-    </div>
-  </section>
-
-  <section class="section faq" id="faq">
-    <div class="shell faq-grid">
-      <div class="faq-head" data-reveal>
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 06 / 问答 · FAQ</p>
-        <h2>你可能想问。</h2>
-        <p>还有问题，去 GitHub Issues 找答案，或者直接开一个。</p>
-        <a class="text-link" href="https://github.com/LeafHW/hufu-ime-rust/issues" target="_blank" rel="noopener">打开 Issues <svg class="ico"><use href="#i-arrow-right"></use></svg></a>
-      </div>
-      <div class="faq-list">
-        <details data-reveal>
-          <summary>虎符收费吗？开源吗？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>免费。代码以 GPL-3.0-or-later 开源在 <a href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">GitHub</a>，没有账号、广告或付费墙。</p></div>
-        </details>
-        <details data-reveal>
-          <summary>一定要会虎码吗？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>虎符以虎码为核心，但内置 HuFu 原生、Rime、多多、QQ五笔、虎整句等多种方案，也支持导入码表。每个方案有独立的用户词，切换不串味。</p></div>
-        </details>
-        <details data-reveal>
-          <summary>我的数据会被上传吗？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>默认不会。所有码表、用户词与设置都在本机；只有你主动开启云同步时，数据才会经端到端口令加密后写入你自己的 WebDAV。虎符官方不设服务器。</p></div>
-        </details>
-        <details data-reveal>
-          <summary>支持哪些系统？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>Windows 10/11 已稳定，Linux（fcitx5）可用，macOS（IMK）正在开发中，预计 11 月 20 日前后上线。三端共用同一套引擎、码表与配置格式。</p></div>
-        </details>
-        <details data-reveal>
-          <summary>整句模型必须下载吗？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>不必须。不装模型也能用字词与单字方案；想要整句输入时，再单独下载约 525 MB 的模型，解压到安装目录即可自动装载，无需重启。</p></div>
-        </details>
-        <details data-reveal>
-          <summary>怎么导入 .ssf 皮肤？<span class="faq-plus">+</span></summary>
-          <div class="faq-a"><p>设置 → 皮肤 → 导入 .ssf，支持搜狗主流格式与 weasel 配色互导；也可以用内置的 19 套矢量皮肤，直接调颜色、圆角、材质与阴影。</p></div>
-        </details>
-      </div>
-    </div>
-  </section>
-
-  <section class="section donate" id="donate" aria-labelledby="donate-title">
-    <div class="shell donate-grid" data-reveal>
-      <div class="donate-copy">
-        <p class="kicker"><span class="tiger-bars"><i></i><i></i><i></i></span> 07 / 打赏 · SUPPORT</p>
-        <h2 id="donate-title">如果它帮你省了时间，<br>请作者喝杯茶。</h2>
-        <p class="lede">虎符免费、开源、无广告。没有会员，也不卖词库。整句模型、云同步和十九套皮肤，都是业余时间一点点磨出来的。</p>
-        <p class="donate-fine">金额随意，心意最重要。不打赏也完全不影响使用。</p>
-      </div>
-      <figure class="donate-card">
-        <div class="donate-qr"><img src="data:image/png;base64,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" alt="虎符打赏二维码，支付宝扫码" width="343" height="348"></div>
-        <figcaption><strong>支付宝扫码</strong><span>请作者喝杯茶</span></figcaption>
-      </figure>
-    </div>
-  </section>
-
-  <section class="cta">
-    <div class="cta-bg" aria-hidden="true"><span>虎</span></div>
-    <div class="shell cta-inner" data-reveal>
-      <span class="cta-mark"><img src="./assets/img/logo-256.webp" width="72" height="72" alt=""></span>
-      <h2>把想说的话，<br>一次打完。</h2>
-      <div class="cta-actions">
-        <a class="btn btn-primary" href="#download"><span>下载虎符</span><svg class="ico"><use href="#i-download"></use></svg></a>
-        <a class="btn btn-ghost" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener"><svg class="ico"><use href="#i-github"></use></svg><span>GitHub</span></a>
-      </div>
-      <p class="cta-fine"><span data-release-version>最新版</span> · GPL-3.0-or-later · 免费无广告</p>
-    </div>
-  </section>
+<section class="hero" id="top"><div class="shell hero-layout"><div class="hero-copy"><a class="release-pill" href="./releases/"><span class="live-dot"></span><span data-release-version>开源中文输入法</span><span class="pill-sep"></span>让输入，更进一步 <span>↗</span></a><p class="eyebrow hero-eyebrow">HUFU · INPUT IN FLOW</p><h1><span>落指之间，</span><span class="hero-title-second">思绪成句<span class="period">。</span></span></h1><p class="hero-description">熟悉的虎码，自然连贯的表达。<br>把注意力留给想法，把输入交给虎符。</p><div class="hero-actions"><a class="button button-ink" href="#download">开始使用虎符 <svg class="icon"><use href="#arrow"/></svg></a><a class="text-link" href="#experience">探索输入体验 <span>↓</span></a></div><p class="hero-platforms"><span>Windows</span><i></i><span>Linux</span><i></i><span>macOS 开发中</span></p></div>
+<div class="hero-art" aria-label="虎码整句输入效果示意"><div class="art-halo"></div><svg class="flow-lines" viewBox="0 0 650 650" fill="none" aria-hidden="true"><defs><linearGradient id="flow-gradient"><stop stop-color="#b9a5dd" stop-opacity="0"/><stop offset=".4" stop-color="#a595cb" stop-opacity=".5"/><stop offset="1" stop-color="#c4b9de" stop-opacity="0"/></linearGradient></defs><path d="M-80 420C40 20 500 0 480 260S80 600 320 730"/><path d="M-60 440C60 40 520 20 500 280S100 620 340 750"/><path d="M-40 460C80 60 540 40 520 300S120 640 360 770"/><path class="flow-trace" d="M-60 440C60 40 520 20 500 280S100 620 340 750"/></svg><div class="art-corner art-corner-top"><span class="tiny-cross">+</span><span>01 — THE QUIET FLOW</span></div><span class="art-side">从字，到句。<br>从容，自在。</span>
+<div class="writing-sheet"><div class="sheet-top"><span><i></i> 一页灵感</span><svg class="icon"><use href="#diagonal"/></svg></div><div class="sheet-content"><p class="sheet-date">写给每一个，正在表达的你。</p><div class="sheet-sentence"><span data-demo-text>让中文收指成句</span><span class="typing-caret"></span></div><p class="sheet-subline">文字有章法，思绪无边界。</p><span class="sheet-rule"></span><span class="sheet-rule sheet-rule-short"></span></div><div class="sheet-bottom"><span>专注于此刻</span><span>中文 / CHINESE</span></div></div>
+<div class="hero-candidate"><div class="candidate-code"><span data-demo-code>syfdgvwihuvnagj</span><span>虎码 · 整句</span></div><div class="candidate-result"><span>01</span><b>让中文收指成句</b><span class="enter-key">↵</span></div><div class="candidate-options"><span>02 让中文收指</span><span>03 让中文</span><span>04 让</span></div></div><div class="art-bottom"><span><i class="live-dot"></i> 网页示意 · 非真实输入引擎</span><button type="button" class="replay-button" data-demo-replay aria-label="重播输入演示"><svg class="icon"><use href="#play"/></svg>重播</button></div></div></div>
+<div class="shell hero-caption"><span>为中文输入，留一份从容。</span><span>免费开源 <i>·</i> 无广告 <i>·</i> 数据默认留在本机</span><a href="#experience" aria-label="向下浏览">SCROLL TO EXPLORE <span>↓</span></a></div></section>
+<section class="introduction shell" aria-label="设计理念"><p class="eyebrow" data-reveal>熟悉的规则，更自由的表达。</p><p class="intro-statement" data-reveal>好用的输入法，<br>让你记住<span>想说的话，</span><br>忘记输入的过程。</p><div class="intro-note" data-reveal><span class="small-rule"></span><p>虎符以虎码为核心，把字形的确定性与整句的连贯感放在一起。<br>不打断思路，不替你决定。每一次落指，都顺着你的节奏。</p></div></section>
+<section class="experience ink-section" id="experience"><div class="shell"><div class="section-label"><span>01 / 输入体验</span><span>MADE FOR YOUR WORDS</span></div><div class="experience-heading"><h2 data-reveal>字字有据。<br><em>句句流畅。</em></h2><div data-reveal><p class="section-description">沿用熟悉的虎码，连续输入完整的想法。<br>想打整句，就打整句；想慢下来，一个字也刚刚好。</p><div class="mode-tabs" role="tablist" aria-label="输入方式"><button type="button" role="tab" id="mode-sentence" aria-controls="mode-preview" aria-selected="true" data-mode="sentence">整句</button><button type="button" role="tab" id="mode-phrase" aria-controls="mode-preview" aria-selected="false" tabindex="-1" data-mode="phrase">字词</button><button type="button" role="tab" id="mode-character" aria-controls="mode-preview" aria-selected="false" tabindex="-1" data-mode="character">单字</button></div></div></div><div class="input-theatre" id="mode-preview" role="tabpanel" aria-labelledby="mode-sentence" data-reveal><div class="theatre-top"><span><i class="live-dot"></i> 虎符输入法</span><span data-mode-label>整句 / 一气呵成</span></div><div class="theatre-words" data-mode-words>让中文收指成句<span class="typing-caret"></span></div><div class="theatre-bottom"><div class="theatre-code"><span>虎码编码</span><code data-mode-code>syfdgvwihuvnagj</code></div><p data-mode-description>连续输入，在候选窗中选出整句话。</p><span class="theatre-key">SPACE <svg class="icon"><use href="#arrow"/></svg></span></div><svg class="theatre-orbit" viewBox="0 0 900 320" aria-hidden="true"><ellipse cx="450" cy="160" rx="440" ry="140"/><ellipse cx="450" cy="160" rx="380" ry="108"/></svg></div><div class="metrics" data-reveal><div><strong>99.73<span>%</span></strong><p>万句基准准率<span>纯 ngram · tbench v2</span></p></div><div><strong>99.9<span>%</span></strong><p>神经重排后准率<span>可选增强</span></p></div><div><strong>6<span>ms</span></strong><p>组句触达 p50<span>本机引擎实测</span></p></div><a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/benchmark-qwen-vs-ngram.md" target="_blank" rel="noopener">数字背后的依据 <svg class="icon"><use href="#diagonal"/></svg></a></div></div></section>
+<section class="appearance section-space" id="appearance"><div class="shell"><div class="section-label"><span>02 / 看起来，也合心意</span><span>A PERSONAL EXPRESSION</span></div><div class="appearance-heading"><h2 data-reveal>你的输入法，<br>也有你的<span class="serif-italic">样子。</span></h2><p class="section-description" data-reveal>十九套矢量皮肤，多一点自己的偏爱。<br>颜色、圆角、材质与挂件，都能细细调整。<br>也支持导入熟悉的 .ssf 皮肤。</p></div><div class="skin-exhibit" data-reveal data-skin-stage="mist"><div class="skin-selection"><p class="eyebrow">挑一份，此刻的心情。</p><div class="palette-buttons" role="group" aria-label="选择皮肤预览"><button type="button" data-skin="mist" aria-pressed="true"><i style="--swatch:#d5d0e4"></i><span>晨雾</span><small>01</small></button><button type="button" data-skin="ink" aria-pressed="false"><i style="--swatch:#34343c"></i><span>墨岩</span><small>02</small></button><button type="button" data-skin="sea" aria-pressed="false"><i style="--swatch:#70a9bd"></i><span>沧海</span><small>03</small></button><button type="button" data-skin="lake" aria-pressed="false"><i style="--swatch:#92b5a7"></i><span>湖光</span><small>04</small></button><button type="button" data-skin="amber" aria-pressed="false"><i style="--swatch:#d7b17d"></i><span>琥珀</span><small>05</small></button><button type="button" data-skin="purple" aria-pressed="false"><i style="--swatch:#a594c7"></i><span>暮山紫</span><small>06</small></button></div><p class="skin-selection-note">六款外观示意 / 更多外观，在皮肤工作室里。</p></div><div class="skin-display"><span class="display-index">HUFU / THEME COLLECTION</span><span class="skin-watermark" aria-hidden="true">Aa</span><div class="skin-window" data-skin-window><div class="skin-window-code"><span>tuja</span><span>1 / 2</span></div><ol><li class="selected"><small>1</small><strong>我们</strong><span>wǒ men</span><b>↵</b></li><li><small>2</small><strong>我</strong><span>wǒ</span></li><li><small>3</small><strong>我军</strong><span>wǒ jūn</span></li><li><small>4</small><strong>握手</strong><span>wò shǒu</span></li></ol><div class="skin-window-foot"><span>虎符 · 字词</span><span>空格上屏</span></div></div><div class="display-caption"><span data-skin-name>晨雾 / MIST</span><span>为你的每一次落指。</span></div></div></div></div></section>
+<section class="workspace section-space" id="workspace"><div class="shell"><div class="section-label"><span>03 / 掌控，举重若轻</span><span>YOUR WORKSPACE, YOUR WAY</span></div><div class="workspace-heading"><h2 data-reveal>复杂的事，<br>简单地调。</h2><div data-reveal><p class="section-description">不用记配置语法，也不用翻来覆去找。<br>从方案、键位到整句模型，都在看得见的界面里。</p><p class="keyboard-hint"><kbd>Ctrl</kbd><span>+</span><kbd>K</kbd><span>搜索，直达你想要的那一项。</span></p></div></div><div class="workspace-tabs" role="tablist" aria-label="设置界面预览" data-reveal><button type="button" role="tab" id="setting-studio" aria-controls="workspace-panel" aria-selected="true" data-setting="studio"><span>01</span>皮肤工作室</button><button type="button" role="tab" id="setting-keymap" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-setting="keymap"><span>02</span>键位编辑</button><button type="button" role="tab" id="setting-sentence" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-setting="sentence"><span>03</span>整句模型</button></div><div class="workspace-frame" id="workspace-panel" role="tabpanel" aria-labelledby="setting-studio" data-reveal><div class="frame-top"><div><i></i><i></i><i></i></div><span data-setting-title>虎符设置 / 皮肤工作室</span><button class="expand-button" type="button" data-expand aria-label="放大设置界面截图"><svg class="icon"><use href="#diagonal"/></svg></button></div><button class="workspace-image" type="button" data-expand aria-label="放大皮肤工作室截图"><img src="./assets/img/studio-light.webp" data-workspace-img width="1800" height="1145" alt="虎符皮肤工作室，左侧皮肤列表，右侧候选窗预览与外观调整" loading="lazy"></button><div class="frame-caption"><span data-setting-caption>调整外观，即刻看见。</span><span>真实界面截图 <span>↗</span></span></div></div><div class="workspace-details" data-reveal><div><span>01 — 所见即所得</span><h3>把习惯，调成顺手。</h3><p>颜色、间距、圆角与挂件，一边调整，一边预览。</p></div><div><span>02 — 自由的键位</span><h3>每一键，各得其所。</h3><p>主键盘、小键盘和 Shift 符号映射，配合按键录制与冲突检测。</p></div><div><span>03 — 设置随身带走</span><h3>换台电脑，也熟悉。</h3><p>配置、用户词支持导入导出；也可通过自己的 WebDAV 同步。</p></div></div></div></section>
+<section class="privacy section-space" id="privacy"><div class="shell privacy-layout"><div class="privacy-art" data-reveal aria-hidden="true"><svg viewBox="0 0 460 400" fill="none"><defs><linearGradient id="privacy-glow" x2="1" y2="1"><stop stop-color="#ddd7ef"/><stop offset="1" stop-color="#f4f1fa"/></linearGradient></defs><circle cx="230" cy="200" r="174" stroke="currentColor" opacity=".08"/><circle cx="230" cy="200" r="130" stroke="currentColor" opacity=".13"/><circle cx="230" cy="200" r="88" fill="url(#privacy-glow)"/><path d="M198 198v-21a32 32 0 0 1 64 0v21" stroke="currentColor" stroke-width="2"/><rect x="187" y="198" width="86" height="68" rx="13" fill="#faf9ff" stroke="currentColor" stroke-width="1.5"/><circle cx="230" cy="226" r="4" fill="currentColor"/><path d="M230 230v10" stroke="currentColor" stroke-width="2"/><path d="M45 200h90m190 0h90" stroke="currentColor" opacity=".25" stroke-dasharray="3 7"/><circle cx="56" cy="200" r="5" fill="#a294bd"/><circle cx="404" cy="200" r="5" fill="#a294bd"/></svg><span class="privacy-label label-left">你的电脑</span><span class="privacy-label label-right">你的网盘</span><span class="privacy-seal">PRIVATE BY DEFAULT</span></div><div class="privacy-copy" data-reveal><p class="eyebrow">你的文字，只属于你。</p><h2>表达自由。<br>数据也自由。</h2><p class="section-description">码表、用户词与学习记录，默认留在本机。<br>需要同步时，只连接你自己的 WebDAV。<br>无需账号，没有广告，官方不设同步服务器。</p><div class="privacy-points"><span><svg class="icon"><use href="#check"/></svg>口令加密</span><span><svg class="icon"><use href="#check"/></svg>按方案同步</span><span><svg class="icon"><use href="#check"/></svg>30 天回收站</span></div></div></div></section>
+<section class="download ink-section section-space" id="download"><div class="shell"><div class="section-label"><span>04 / 从这里，开始</span><span>MAKE ROOM FOR YOUR IDEAS</span></div><div class="download-heading"><h2 data-reveal>下一个想法，<br><em>用虎符写。</em></h2><div data-reveal><p class="section-description">一款认真对待中文输入的开源工具。<br>免费使用，持续打磨。</p><a class="text-link" href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">在 GitHub 探索源码 <svg class="icon"><use href="#diagonal"/></svg></a></div></div><div class="download-layout" data-reveal><div class="download-main"><div class="os-tabs" role="tablist" aria-label="选择系统"><button type="button" role="tab" id="tab-windows" aria-controls="os-windows" aria-selected="true" data-os-tab="windows">Windows</button><button type="button" role="tab" id="tab-linux" aria-controls="os-linux" aria-selected="false" tabindex="-1" data-os-tab="linux">Linux</button><button type="button" role="tab" id="tab-macos" aria-controls="os-macos" aria-selected="false" tabindex="-1" data-os-tab="macos">macOS <span>开发中</span></button></div><div class="os-panel" role="tabpanel" id="os-windows" aria-labelledby="tab-windows" data-os-panel="windows"><div class="download-version"><span class="live-dot"></span>稳定版 <span data-release-version>以发布页为准</span><span data-release-date></span></div><a class="download-button" href="https://gitee.com/leafHW/hufu-ime-rust/releases" data-exe-link target="_blank" rel="noopener"><svg class="icon"><use href="#windows"/></svg><span><strong>下载 Windows 版</strong><small data-exe-meta>Windows 10 / 11 · 打开 Gitee 发布页</small></span><svg class="icon"><use href="#download-icon"/></svg></a><p class="download-note">无需注册。旧版可原地升级，保留码表、设置与学习记录。</p><div class="download-links"><a href="./releases/">更新日志 / 历史版本 ↗</a><a href="https://github.com/LeafHW/hufu-ime-rust/releases" target="_blank" rel="noopener">GitHub 备用下载 ↗</a></div></div><div class="os-panel" role="tabpanel" id="os-linux" aria-labelledby="tab-linux" data-os-panel="linux" hidden><p class="download-version"><span class="live-dot"></span>fcitx5 · 用户级安装</p><div class="install-code"><div><span>在项目目录执行</span><button type="button" data-copy="platform/linux/install.sh -umt&#10;fcitx5 -r -d">复制命令</button></div><pre><code>platform/linux/install.sh -umt
+fcitx5 -r -d</code></pre></div><p class="download-note">由社区协作者维护。请先阅读安装说明中的依赖和适用环境。</p><div class="download-links"><a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/platform/linux/README.md" target="_blank" rel="noopener">Linux 安装说明 ↗</a></div></div><div class="os-panel" role="tabpanel" id="os-macos" aria-labelledby="tab-macos" data-os-panel="macos" hidden><p class="download-version">macOS · 开发中</p><h3 class="mac-heading">再等一等，<br>让体验更完整一些。</h3><p class="download-note">IMK 前端正在开发，暂无可用安装包。欢迎关注进展或参与测试。</p><div class="download-links"><a href="https://github.com/LeafHW/hufu-ime-rust/tree/master/platform/macos" target="_blank" rel="noopener">查看开发进度 ↗</a></div></div></div><aside class="download-aside"><span class="eyebrow">GOOD TO KNOW</span><h3>整句模型，单独下载。</h3><p>约 525 MB，ModelScope 国内直连。<br>免登录，支持断点续传。</p><a href="https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false" target="_blank" rel="noopener">获取整句模型 <svg class="icon"><use href="#diagonal"/></svg></a><p class="model-note">解压到安装目录，约 2 秒自动装载。<br>具体配置见使用文档。</p><a class="docs-link" href="https://github.com/LeafHW/hufu-ime-rust/tree/master/docs" target="_blank" rel="noopener">使用文档 ↗</a></aside></div><div class="download-bottom"><span>GPL-3.0-or-later</span><span>开源，是另一种认真。</span><span>HUFU / OPEN SOURCE</span></div></div></section>
+<section class="faq section-space" id="faq"><div class="shell faq-layout"><div data-reveal><p class="eyebrow">A FEW THINGS TO KNOW</p><h2>你可能<br>还想知道。</h2><a class="text-link" href="https://github.com/LeafHW/hufu-ime-rust/issues" target="_blank" rel="noopener">交流与反馈 <svg class="icon"><use href="#diagonal"/></svg></a></div><div class="faq-list" data-reveal><details><summary>虎符和虎码是什么关系？<svg class="icon"><use href="#plus"/></svg></summary><p>虎码是字形编码方案，虎符是承载输入、候选交互、皮肤和设置的输入法平台。虎符以虎码为核心，也支持导入其他定长方案。</p></details><details><summary>必须使用整句输入吗？<svg class="icon"><use href="#plus"/></svg></summary><p>不必。整句、字词、单字可以按习惯选择。你可以继续使用熟悉的定长输入方式，再慢慢尝试整句。</p></details><details><summary>需要联网吗？会上传输入内容吗？<svg class="icon"><use href="#plus"/></svg></summary><p>日常输入在本机完成，数据默认留在本地。只有主动配置云同步时，才连接你自己的 WebDAV；官方不设同步服务器。</p></details><details><summary>安装或升级会影响已有数据吗？<svg class="icon"><use href="#plus"/></svg></summary><p>Windows 支持旧版原地升级，保留码表、设置与学习记录。升级前也可以先导出配置，留一份自己的备份。</p></details><details><summary>可以使用已有的皮肤和方案吗？<svg class="icon"><use href="#plus"/></svg></summary><p>支持 .ssf 皮肤，以及 HuFu 原生、Rime、多多、QQ 五笔等来源的方案。不同格式存在兼容边界，具体以使用文档为准。</p></details></div></div></section>
 </main>
-
-<footer class="footer">
-  <div class="shell footer-top">
-    <div class="footer-brand">
-      <a class="brand" href="#top" aria-label="回到顶部">
-        <span class="brand-mark"><img src="./assets/img/logo-128.webp" width="32" height="32" alt=""></span>
-        <span class="brand-type"><b>虎符</b><em>HUFU</em></span>
-      </a>
-      <span class="footer-license">GPL-3.0-or-later · 免费开源</span>
-    </div>
-    <nav class="footer-cols" aria-label="页脚导航">
-      <div>
-        <b>产品</b>
-        <a href="#features">能力</a>
-        <a href="#skins">皮肤</a>
-        <a href="#data">云同步</a>
-        <a href="#download">下载</a>
-      </div>
-      <div>
-        <b>资源</b>
-        <a href="https://github.com/LeafHW/hufu-ime-rust/tree/master/docs" target="_blank" rel="noopener">文档</a>
-        <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/dictionary-formats.md" target="_blank" rel="noopener">码表格式</a>
-        <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/docs/status.md" target="_blank" rel="noopener">进度与基准</a>
-        <a href="./releases/">更新日志</a>
-      </div>
-      <div>
-        <b>社区</b>
-        <a href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/LeafHW/hufu-ime-rust/issues" target="_blank" rel="noopener">Issues</a>
-        <a href="https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/%E6%A8%A1%E5%9E%8B.rar?view=false" target="_blank" rel="noopener">模型文件</a>
-        <a href="#donate">打赏支持</a>
-        <a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/LICENSE" target="_blank" rel="noopener">许可证</a>
-      </div>
-    </nav>
-  </div>
-  <div class="shell footer-bottom">
-    <p>© 2026 LeafHW · 虎符 HuFu</p>
-    <p>本站由 GitHub Pages 托管 <span class="sep">·</span> 界面截图为示意，实际以安装版为准 <span class="sep">·</span> <a href="./assets/fonts/LICENSE.txt" class="footer-link">字体 OFL</a></p>
-    <a class="to-top" href="#top" aria-label="回到顶部"><svg class="ico"><use href="#i-arrow-up"></use></svg></a>
-  </div>
-</footer>
-
-<dialog class="lightbox" id="lightbox" aria-label="查看截图">
-  <button class="lb-close" type="button" data-lb-close aria-label="关闭"><svg class="ico"><use href="#i-x"></use></svg></button>
-  <button class="lb-nav lb-prev" type="button" data-lb-prev aria-label="上一张"><svg class="ico"><use href="#i-arrow-right"></use></svg></button>
-  <figure><img data-lb-img alt=""><figcaption data-lb-caption></figcaption></figure>
-  <button class="lb-nav lb-next" type="button" data-lb-next aria-label="下一张"><svg class="ico"><use href="#i-arrow-right"></use></svg></button>
-</dialog>
-
-<script src="./assets/js/main.js?v=20261103f" defer></script>
-</body>
-</html>
+<footer class="footer"><div class="shell"><div class="footer-top"><a class="brand" href="#top"><img src="./assets/img/logo-128.webp" width="40" height="40" alt=""><span>虎符<span class="brand-en">HUFU</span></span></a><p>落指之间，思绪成句。</p><div><a href="https://github.com/LeafHW/hufu-ime-rust" target="_blank" rel="noopener">GitHub ↗</a><a href="./releases/">更新日志</a><button type="button" data-support>请作者喝杯茶 ↗</button></div></div><div class="footer-bottom"><span>© <span data-year>2026</span> HuFu · LeafHW & contributors</span><span>用心做输入。让表达，自然发生。</span><a href="https://github.com/LeafHW/hufu-ime-rust/blob/master/LICENSE" target="_blank" rel="noopener">GPL-3.0-or-later</a></div><div class="footer-wordmark" aria-hidden="true">HU<span>F</span>U<span class="wordmark-dot">.</span></div></div></footer>
+<dialog class="image-dialog" data-image-dialog aria-label="设置截图预览"><button type="button" class="dialog-close" data-close-dialog aria-label="关闭截图">关闭 ×</button><img data-dialog-image alt=""><p data-dialog-caption></p></dialog><dialog class="support-dialog" data-support-dialog aria-labelledby="support-title"><button type="button" class="dialog-close" data-close-dialog aria-label="关闭打赏">关闭 ×</button><p class="eyebrow">THANK YOU FOR YOUR SUPPORT</p><h2 id="support-title">谢谢你的<br>这一杯茶。</h2><p>虎符永久免费开源。你的支持，让持续打磨多一份动力。</p><img src="./assets/img/donate-alipay.png" alt="支付宝打赏二维码" width="250" height="250" loading="lazy"><span>支付宝 · 自愿支持</span></dialog>
+<script src="./assets/js/main.js?v=20261106b" defer></script>
+</body></html>
