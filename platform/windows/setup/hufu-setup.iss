@@ -1062,8 +1062,10 @@ begin
       Msg := Msg + #13#10#13#10 + ExpandConstant('{cm:UninstOldLeft}') + #13#10#13#10 + ExpandConstant('{cm:UninstRebootAsk}');
       if MsgBox(Msg, mbInformation, MB_YESNO) = IDYES then begin
         LogLine('用户选择立即重启完成清理');
+        // 【2026-11-07 黑框审查修复】shutdown.exe 是控制台程序，SW_SHOW 会
+        // 短暂弹终端窗（11-06 审查唯一实锤的可见控制台路径）→ SW_HIDE。
         Exec(ExpandConstant('{sys}\shutdown.exe'), '/r /t 0', '',
-          SW_SHOW, ewNoWait, Q);
+          SW_HIDE, ewNoWait, Q);
       end;
     end else
       SuppressibleMsgBox(Msg, mbInformation, MB_OK, IDOK);

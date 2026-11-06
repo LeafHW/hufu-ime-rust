@@ -360,25 +360,47 @@ fn start_decode(cfg: Arc<OverlayCfg>, target_h: f32) -> Arc<DecodeState> {
 }
 
 fn decode_worker(cfg: &OverlayCfg, target_h: f32, st: &DecodeState) -> Option<()> {
-    use image::AnimationDecoder;
+    use image::{AnimationDecoder, ImageDecoder};
     let bytes = &cfg.image;
     let png_magic = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     let is_gif = bytes.len() > 3 && &bytes[0..3] == b"GIF";
     let is_png = bytes.len() >= 8 && bytes[0..8] == png_magic;
+    // 【N1 2026-11-07】头信息双闸（与 ssfwin MAX_DIM/MAX_PIXELS 同款口径）：
+    // 上游仅限 10MB 字节，而 10MB 压缩图可编码超大画布（如 20000×20000），
+    // 解码器内部按全画布分配 RGBA（GB 级）→ i686 大分配直接 abort 宿主。
+    // 尺寸从头信息读取（零像素解码成本）；超限走既有「解码失败」降级。
+    const OV_MAX_DIM: u32 = 8192;
+    const OV_MAX_PIXELS: u64 = 9_000_000;
+    let dims_ok = |w: u32, h: u32| -> bool {
+        w > 0
+            && h > 0
+            && w <= OV_MAX_DIM
+            && h <= OV_MAX_DIM
+            && w as u64 * h as u64 <= OV_MAX_PIXELS
+    };
     // 流式逐帧(不再整段收集:65 帧 640x640 的中间态要 106MB 内存)
     let mut animated = false;
     let mut iter: Box<dyn Iterator<Item = (image::RgbaImage, u32)>> = if is_gif {
         animated = true;
+        let dec = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        let (w, h) = dec.dimensions();
+        if !dims_ok(w, h) {
+            crate::tsf::trace(&format!("ov: 动图尺寸超限 {w}×{h}，拒绝解码"));
+            return None;
+        }
         Box::new(
-            image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
-                .ok()?
-                .into_frames()
+            dec.into_frames()
                 .take(240)
                 .filter_map(|f| f.ok())
                 .map(frame_pair),
         )
     } else if is_png {
         let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        let (w, h) = dec.dimensions();
+        if !dims_ok(w, h) {
+            crate::tsf::trace(&format!("ov: PNG 尺寸超限 {w}×{h}，拒绝解码"));
+            return None;
+        }
         if dec.is_apng().unwrap_or(false) {
             animated = true;
             Box::new(
@@ -396,6 +418,16 @@ fn decode_worker(cfg: &OverlayCfg, target_h: f32, st: &DecodeState) -> Option<()
             )))
         }
     } else {
+        // 非动画兜底：先读头信息过闸，再全量解码
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        if !dims_ok(w, h) {
+            crate::tsf::trace(&format!("ov: 图片尺寸超限 {w}×{h}，拒绝解码"));
+            return None;
+        }
         Box::new(std::iter::once((
             image::load_from_memory(bytes).ok()?.to_rgba8(),
             0,

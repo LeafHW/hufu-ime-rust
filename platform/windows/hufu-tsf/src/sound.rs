@@ -21,6 +21,10 @@ struct Clip {
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
+/// 键音池标签缓存（原为 key_pool_tags 函数内 static；提到模块级以便
+/// invalidate() 在换音效包/音量变更时一并失效——池成员来自音效目录
+/// 实测，旧池在换包后可能整包取不到 → 键音静默）。
+static KEY_POOL_TAGS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 /// 预开 waveOut 句柄池（按格式一组 8 个，轮转使用）：
 /// 省掉每次播放的 waveOutOpen/Close（实测各 ~5-15ms，是音效迟滞主因），
 /// 8 句柄支持 8 路并行交叠（系统混音），连打音效即刻出声。
@@ -131,8 +135,7 @@ fn rnd() -> u64 {
 /// 键音候选池：音效目录全部事件音（key/select/commit/page 皆为短促
 /// 击键声）——每次按键随机挑一个 + 音量 ±15% 抖动，杜绝「固定音」。
 fn key_pool_tags() -> Vec<String> {
-    static TAGS: Mutex<Option<Vec<String>>> = Mutex::new(None);
-    let mut g = TAGS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
         let mut v: Vec<String> = ["key", "select", "commit", "page"]
             .iter()
@@ -380,6 +383,10 @@ fn with_clip(tag: &str) -> Option<Clip> {
 pub fn invalidate() {
     let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     *guard = None;
+    // 【P2-8 2026-11-07】键音池标签一并失效：换音效包后旧池标签可能
+    // 在新包里全部取不到 → 键音整包静默。
+    let mut tags = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
+    *tags = None;
 }
 
 /// 极简 wav 解析：RIFF→fmt→data（PCM，任意声道/位深，waveOut 按实际格式开）。

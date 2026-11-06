@@ -769,9 +769,13 @@ foreach ($zin in $ziBins) {
     if ($e) {
         $ms = New-Object IO.MemoryStream
         $e.Open().CopyTo($ms)
-        $txt = [Text.Encoding]::ASCII.GetString($ms.ToArray()).ToLowerInvariant()
+        $bytes = $ms.ToArray()
+        $txt = [Text.Encoding]::ASCII.GetString($bytes).ToLowerInvariant()
+        # 【审查补 2026-11-07】宽字符串以 UTF-16LE 落盘，仅 ASCII 扫描探不到
+        # ——补 Unicode 解码面（cmd.exe 仍排除：Rust std 处理 .bat 的内建串）。
+        $txt16 = [Text.Encoding]::Unicode.GetString($bytes).ToLowerInvariant()
         foreach ($pat in @('powershell.exe','pwsh.exe','powershell -command')) {
-            if ($txt.Contains($pat)) { $bad = $pat; break }
+            if ($txt.Contains($pat) -or $txt16.Contains($pat)) { $bad = $pat; break }
         }
     } else { $bad = '包内缺失' }
     $all = (Check ($null -eq $bad) "零解释器 zip内 $zin$(if ($bad) { "：检出 $bad" })") -and $all
@@ -781,7 +785,9 @@ foreach ($zin in $ziBins) {
 # spawn（首参非字面量）逐一列出，无 zi-ok: 豁免注释即 FAIL——豁免注释
 # 写在 Command::new 同一行，注明目标是什么、为何非解释器；③源码目录从
 # $PSScriptRoot 推导（硬编码绝对路径在仓挪位后静默空转），目录缺失即 FAIL。
-$ziRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$ziRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+# 【复审 N3 2026-11-07】$ScriptDir（:23 定义）带 scriptblock 通道的硬编码
+# 回退——直取 $PSScriptRoot 在 IEX/[scriptblock]::Create 调用下为空，报错误导。
 # 【B2 复审修复 2026-11-05】列举固定 4 个叶子 src 有盲区（新增 crate
 # 不进网）。改通配：engine\crates\*\src 与 platform\windows\*\src
 # 全部叶子 crate 的 src 递归进网，新增 crate 自动纳入；无 src 的目录
@@ -792,10 +798,14 @@ $ziSrcDirs = @(
     @(Get-ChildItem (Join-Path $ziRoot 'engine\crates') -Directory | ForEach-Object { Join-Path $_.FullName 'src' }),
     @(Get-ChildItem (Join-Path $ziRoot 'platform\windows') -Directory | ForEach-Object { Join-Path $_.FullName 'src' })
 ) | ForEach-Object { $_ } | Where-Object { Test-Path $_ }
+# 【B2 死守卫修复 2026-11-07】Where-Object 已滤掉不存在目录，循环内
+# Test-Path 恒真=死代码；改为循环外断言枚举数量下限（当前仓库 15 个 src），
+# 目录枚举整体失效时按 FAIL 而非空转。【复审 N1 2026-11-07】本脚本无
+# Fail() 函数（build-setup 的习惯带过来的）——改 throw，中文诊断不丢。
+if (@($ziSrcDirs).Count -lt 10) { throw "零解释器 源码目录枚举异常：仅 $(@($ziSrcDirs).Count) 个（<10），门禁不能空转" }
 $ziHits = @(); $ziIndirect = @()
 foreach ($d in $ziSrcDirs) {
-    if (-not (Test-Path $d)) { Fail("零解释器 源码目录不存在：$d（门禁不能空转，先修路径）") }
-    foreach ($m in (Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\\"(cmd|powershell|pwsh)')) {
+    foreach ($m in (Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\("(cmd|powershell|pwsh)')) {
         $ziHits += "$((Split-Path $m.Path -Leaf)):$($m.LineNumber)"
     }
     foreach ($m in (Get-ChildItem $d -Recurse -Filter *.rs | Select-String -Pattern 'Command::new\((?!")')) {

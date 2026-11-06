@@ -228,7 +228,10 @@ pub fn menu_key(vk: u32) -> bool {
             true
         }
         _ => {
-            // 其余键：关菜单（取消）放行
+            // 【P2-12 2026-11-07】其余键：关菜单（取消）后放行——函数头注释
+            // 早已承诺「打字关菜单」，原实现只放行不关，菜单常驻挡住候选。
+            drop(st);
+            menu_finish(0);
             false
         }
     }
@@ -5054,7 +5057,23 @@ impl CandidateWindowV2 {
         //    截宽按估算（CJK≈em、ASCII≈0.55em），宁可少截不可截不满。
         // ② 横排宽度封顶工作区宽（见 width 计算处 w.min(w_cap)）。
         // ③ 位置 clamp 原已有——宽度封顶后 clamp 区间不再倒置。
-        let screen_w = unsafe { GetSystemMetrics(SM_CXFULLSCREEN) }.max(200) as f32;
+        // 【P2-10 2026-11-07】封顶改「窗口所在显示器工作区」：SM_CXFULLSCREEN
+        // 是主屏工作区——副屏更窄时横排候选仍越界、更宽时过早截断。
+        // 取不到（mon 无效/查询失败）退回主屏口径，行为不差于旧版。
+        let screen_w = {
+            let mon = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+            let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if !mon.is_invalid()
+                && unsafe { GetMonitorInfoW(mon, &mut mi as *mut MONITORINFO) }.as_bool()
+                && mi.rcWork.right > mi.rcWork.left
+            {
+                (mi.rcWork.right - mi.rcWork.left) as f32
+            } else {
+                (unsafe { GetSystemMetrics(SM_CXFULLSCREEN) }) as f32
+            }
+        }
+        .max(200.0);
         // 【DPI 口径修复】need/w 全是 96-DPI 逻辑像素，此前 w_cap 直接用
         // 物理屏宽：150% 缩放时横排候选可长到 1.5×屏宽（逻辑）≈2.25×
         // （物理）——资源管理器搜索框实测候选超出屏幕的主因之一。

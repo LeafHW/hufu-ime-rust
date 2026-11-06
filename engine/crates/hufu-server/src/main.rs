@@ -1677,7 +1677,7 @@ fn update_check_inner() -> Response {
                 .get("sources")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([]));
-            // 首选源 = sources[0]（当前是 Gitee 直链）
+            // 首选源 = sources[0]（当前是 Gitee 直链；下载器内部多源回退）
             let download_url = sources
                 .as_array()
                 .and_then(|a| a.first())
@@ -1811,6 +1811,8 @@ struct UpdateDl {
     error: String,
     sha_expect: String,
     sha_got: String,
+    /// 多源回退：当前正在尝试第几个下载源（1 起；0=单源/尚未开始）。
+    attempt: usize,
 }
 
 static UPDATE_DL: std::sync::OnceLock<std::sync::Mutex<UpdateDl>> = std::sync::OnceLock::new();
@@ -1868,6 +1870,7 @@ fn update_dl_json(st: &UpdateDl) -> serde_json::Value {
         "error": st.error,
         "sha256_expect": st.sha_expect,
         "sha256_got": st.sha_got,
+        "attempt": st.attempt,
         "active": phase.active(),
     })
 }
@@ -1975,18 +1978,13 @@ fn update_download_worker() {
     UPDATE_DL_RUNNING.store(false, SeqCst);
 }
 
-/// 后台下载主体：拉清单 → 流式下载（.part + 增量 sha256）→ 校验 → 改名。
+/// 后台下载主体：拉清单 → 多源回退（见 download_from_source）→ 校验 → 改名。
 /// 全部错误转中文短句回前端；路径内无 unwrap（worker 崩了会卡在 active，
 /// 所以这里宁可多写 match 也不 panic）。
 fn update_download_run() -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Write};
     use std::sync::atomic::Ordering::SeqCst;
 
     let dir = update_download_dir();
-    let cleanup = |p: &std::path::Path| {
-        let _ = std::fs::remove_file(p);
-    };
 
     let mut agent_b = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
@@ -2014,14 +2012,22 @@ fn update_download_run() -> Result<(), String> {
     if UPDATE_DL_CANCEL.load(SeqCst) {
         return Err("已取消".to_string());
     }
-    let url = m
+    // 【多源回退 2026-11-07】清单 sources 按序全试：单源 404/网络中断/
+    // 哈希不符即换下一源（Gitee CDN 键粘死事故教训：单源=国内更新全断）；
+    // 取消/磁盘类错误不换源（见 download_from_source 的 retryable 标注）。
+    let urls: Vec<String> = m
         .get("sources")
         .and_then(|s| s.as_array())
-        .and_then(|a| a.first())
-        .and_then(|s| s.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| "更新清单未提供下载地址".to_string())?
-        .to_string();
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.get("url").and_then(|u| u.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if urls.is_empty() {
+        return Err("更新清单未提供下载地址".to_string());
+    }
     // sha256 必须存在：清单可信而镜像/传输损坏由它兜住；无哈希即拒绝（不静默降级）。
     let sha_expect = m
         .get("sha256")
@@ -2036,7 +2042,7 @@ fn update_download_run() -> Result<(), String> {
         .trim()
         .trim_start_matches('v')
         .to_string();
-    let fname = update_file_name(&url);
+    let fname = update_file_name(&urls[0]);
     let dest = dir.join(&fname);
     {
         let mut st = update_dl_lock();
@@ -2048,13 +2054,67 @@ fn update_download_run() -> Result<(), String> {
         st.sha_expect = sha_expect.clone();
     }
 
+    let mut last_err = String::new();
+    let n_sources = urls.len();
+    for (si, url) in urls.iter().enumerate() {
+        if UPDATE_DL_CANCEL.load(SeqCst) {
+            return Err("已取消".to_string());
+        }
+        if si > 0 {
+            // 换源重试：进度归零、阶段回 preparing、清上一源的失败文案；
+            // 快照带 attempt 供前端提示「正在换源」
+            let mut st = update_dl_lock();
+            st.downloaded = 0;
+            st.total = size_hint;
+            st.phase = DlPhase::Preparing;
+            st.attempt = si + 1;
+            st.error = String::new();
+        }
+        match download_from_source(&agent, url, &dir, &fname, &dest, &sha_expect, size_hint) {
+            Ok(()) => {
+                // 最终成功：清掉换源过程中留下的失败文案，避免 Done 快照带旧错
+                update_dl_lock().error = String::new();
+                return Ok(());
+            }
+            Err((msg, retryable)) => {
+                if !retryable || UPDATE_DL_CANCEL.load(SeqCst) {
+                    return Err(msg);
+                }
+                last_err = msg;
+                update_dl_lock().error =
+                    format!("下载源 {}/{} 失败：{}；改试下一源", si + 1, n_sources, last_err);
+            }
+        }
+    }
+    Err(format!("全部 {n_sources} 个下载源均失败；最后错误：{last_err}"))
+}
+
+/// 单源下载 → 校验 → 落盘。Err = (中文错误文案, 是否可换源重试)。
+/// 可换源：网络/HTTP/内容异常/哈希不符（CDN 键粘死正是靠换源绕过）；
+/// 不可换源：取消/磁盘写失败/超上限（换源不会有不同结果）。
+fn download_from_source(
+    agent: &ureq::Agent,
+    url: &str,
+    dir: &std::path::Path,
+    fname: &str,
+    dest: &std::path::Path,
+    sha_expect: &str,
+    size_hint: u64,
+) -> Result<(), (String, bool)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let cleanup = |p: &std::path::Path| {
+        let _ = std::fs::remove_file(p);
+    };
     let resp = agent
-        .get(&url)
+        .get(url)
         .set("User-Agent", "hufu-ime-update-download")
         .call()
-        .map_err(|e| format!("下载失败：{e}"))?;
+        .map_err(|e| (format!("下载失败：{e}"), true))?;
     if resp.status() != 200 {
-        return Err(format!("下载失败：HTTP {}", resp.status()));
+        return Err((format!("下载失败：HTTP {}", resp.status()), true));
     }
     // 总量优先用响应头（真实字节数），缺失再用清单 size；都没有=不确定进度。
     let clen = resp
@@ -2070,7 +2130,8 @@ fn update_download_run() -> Result<(), String> {
     }
 
     let tmp = dir.join(format!(".{fname}.part"));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("无法写入下载目录：{e}"))?;
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| (format!("无法写入下载目录：{e}"), false))?;
     let mut reader = resp.into_reader();
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -2079,7 +2140,7 @@ fn update_download_run() -> Result<(), String> {
         if UPDATE_DL_CANCEL.load(SeqCst) {
             drop(file);
             cleanup(&tmp);
-            return Err("已取消".to_string());
+            return Err(("已取消".to_string(), false));
         }
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -2087,33 +2148,36 @@ fn update_download_run() -> Result<(), String> {
                 if let Err(e) = file.write_all(&buf[..n]) {
                     drop(file);
                     cleanup(&tmp);
-                    return Err(format!("写入下载文件失败：{e}"));
+                    return Err((format!("写入下载文件失败：{e}"), false));
                 }
                 hasher.update(&buf[..n]);
                 got += n as u64;
                 if got > 64 * 1024 * 1024 {
                     drop(file);
                     cleanup(&tmp);
-                    return Err("安装包超上限（64MiB），已中止".to_string());
+                    return Err(("安装包超上限（64MiB），已中止".to_string(), false));
                 }
                 update_dl_lock().downloaded = got;
             }
             Err(e) => {
                 drop(file);
                 cleanup(&tmp);
-                return Err(format!("下载中断：{e}"));
+                return Err((format!("下载中断：{e}"), true));
             }
         }
     }
     if got < 1024 {
         drop(file);
         cleanup(&tmp);
-        return Err("下载内容异常（过小，疑似错误页），已丢弃".to_string());
+        return Err((
+            "下载内容异常（过小，疑似错误页），已丢弃".to_string(),
+            true,
+        ));
     }
     if total > 0 && got != total {
         drop(file);
         cleanup(&tmp);
-        return Err(format!("下载不完整（{got}/{total} 字节），已丢弃"));
+        return Err((format!("下载不完整（{got}/{total} 字节），已丢弃"), true));
     }
     update_dl_lock().phase = DlPhase::Verifying;
     let sha_got = format!("{:x}", hasher.finalize());
@@ -2121,15 +2185,16 @@ fn update_download_run() -> Result<(), String> {
     if sha_got != sha_expect {
         drop(file);
         cleanup(&tmp);
-        return Err(format!(
-            "sha256 校验不符，已拒绝保存（期望 {sha_expect}，实际 {sha_got}）"
+        return Err((
+            format!("sha256 校验不符，已拒绝保存（期望 {sha_expect}，实际 {sha_got}）"),
+            true,
         ));
     }
     let _ = file.sync_all();
     drop(file);
-    std::fs::rename(&tmp, &dest).map_err(|e| {
+    std::fs::rename(&tmp, dest).map_err(|e| {
         cleanup(&tmp);
-        format!("保存失败（目标可能被占用）：{e}")
+        (format!("保存失败（目标可能被占用）：{e}"), false)
     })?;
     Ok(())
 }
@@ -2891,6 +2956,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .to_string();
             if id.is_empty() {
                 return Response::err(400, "缺少 id");
+            }
+            // 【复审 P3-1 2026-11-07】id 拼 skins/ssf 目录并写回 config 前
+            // 过闸（与 GET /api/skin 等路由同款；select 的两分支此前漏闸，
+            // 穿越串可写进 appearance.skin）。
+            if !valid_skin_id(&id) {
+                return Response::err(400, "非法皮肤 id");
             }
             let kind = v
                 .get("kind")

@@ -52,7 +52,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 /// 单图边长上限（虎娘口径：≤8192×8192）。
 const MAX_DIM: u32 = 8192;
 /// 单帧像素上限（虎娘口径 ≤16M 像素/帧）。
-const MAX_PIXELS: u64 = 8_000_000; // 【P4 复审收紧 2026-11-05】16M px 单帧 premul 峰值 ~128MB，i686 大额分配风险；8M px（~32MB/帧）仍覆盖全尺寸皮肤图
+const MAX_PIXELS: u64 = 9_000_000; // 【P4 2026-11-07】8M 恰拒 4K 皮肤（3840×2160=8,294,400）整皮静默回退矢量；9M（premul 峰值 ~36MB/帧）覆盖 4K，i686 大额分配风险仍可控
 /// 帧数上限（虎娘口径 ≤256 帧）。
 const MAX_FRAMES: usize = 256;
 /// 全图解码内存预算：帧流总量 ≤64MB（虎娘口径，跨帧共享）。
@@ -197,7 +197,7 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
                 return Err(format!("图片超限 {w}×{h}（>8192×8192）"));
             }
             if w as u64 * h as u64 > MAX_PIXELS {
-                return Err(format!("单帧像素超限 {w}×{h}（>16M）"));
+                return Err(format!("单帧像素超限 {w}×{h}（>{} px）", MAX_PIXELS));
             }
             dims = (w, h);
         } else if (img.width(), img.height()) != dims {

@@ -19,7 +19,6 @@ exit /b
 echo [HuFu] 管理员模式，安装中…
 cd /d "%USERPROFILE%"
 powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0install.ps1"
-powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0install.ps1"
 if errorlevel 1 (
     echo.
     echo [HuFu] 安装失败（退出码非 0）。请截图上方向下滚动查看错误行。

@@ -599,8 +599,22 @@ pub fn logout() -> Result<String, String> {
     st.last_config = None;
     st.last_error = None;
     persist(st).map_err(|e| format!("写入同步配置失败：{e}"))?;
+    // 【P2-17 2026-11-07】logout 连 .bak 一起清：persist 在写盘前备份，
+    // 备份里仍是旧凭据明文——「退出账号」后密码留在磁盘违背用户预期。
+    // 【P3-4 2026-11-07】删失败不吞错（否则凭据明文残留还报「已清」）；
+    // 文件本就不存在（NotFound）视为已清，其余错误如实上报。
+    let mut bak_note = String::new();
+    if let Some(dir) = DATA_DIR.get() {
+        match std::fs::remove_file(settings_path(dir).with_extension("json.bak")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                bak_note = format!("；注意：凭据备份删除失败（{e}），可能仍残留于磁盘");
+            }
+        }
+    }
     invalidate_schemes_cache();
-    Ok("已退出同步帐户（云端数据保留；本机文件未动）".into())
+    Ok(format!("已退出同步帐户（云端数据保留；本机文件与凭据备份已清{bak_note}）").into())
 }
 
 /// GET /api/sync/trash：回收站列表（方案→文件名→份数+最近时间）。
