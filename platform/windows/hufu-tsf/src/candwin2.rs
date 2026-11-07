@@ -7958,7 +7958,21 @@ impl CandidateWindowV2 {
                         Some(c) => c.clone(),
                         None => return,
                     };
+                    // 【P 探针 2026-11-07】spend 分段：Present 前时刻（布局+
+                    // 绘制成本）与 Present 后时刻（vsync/队列等待成本）分列，
+                    // 由 anim_fps_probe 汇总输出——spend p95≈15ms 到底是绘制
+                    // 重还是 Present(1) 队列满阻塞，一测便知。
+                    PRESENT_SPLIT.with(|c| {
+                        let mut p = c.get();
+                        p.0 = unsafe { GetTickCount64() };
+                        c.set(p);
+                    });
                     let hr = chain.Present(1, DXGI_PRESENT(0));
+                    PRESENT_SPLIT.with(|c| {
+                        let mut p = c.get();
+                        p.1 = unsafe { GetTickCount64() };
+                        c.set(p);
+                    });
                     if hr.is_err() {
                         crate::tsf::trace(&format!("cw2: Present 失败 0x{:08X}", hr.0 as u32));
                     }
@@ -10012,6 +10026,14 @@ unsafe fn ssf_frame_tick(hwnd: HWND) {
 // 口径：ticks/s=驱动到达率；frames/s=真实渲染帧（size/hl/fs 复渲染调用）；
 // gap=相邻 tick 间隔分布；spend=本 tick 主窗处理总耗时（含 show 全量渲）。
 // trace 关闭=完全旁路（一次原子读）；每满 1s 输出一行汇总（trace 日志可控）。
+/// 【P 探针 2026-11-07】本线程最近一次 Present 前/后时刻（0=未记录）：
+/// pre=tick 起点到 Present 前（布局+绘制），post=Present 本身（vsync/
+/// 队列等待）。tick 与 show 渲染同在宿主 UI 线程，thread_local 即配对。
+thread_local! {
+    static PRESENT_SPLIT: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 mod anim_fps_probe {
     use std::sync::Mutex;
     struct Stat {
@@ -10020,8 +10042,11 @@ mod anim_fps_probe {
         frames: u32,
         gaps: Vec<u32>,
         spends: Vec<u32>,
+        /// 【P 探针】(pre, post)：本线程最近一次 Present 前/后时刻。
+        pres: Vec<(u32, u32)>,
         last_tick: u64,
     }
+    /// 【P 探针】Present 前后时刻（宿主 UI 线程 thread-local；0=未记录）。
     static STAT: Mutex<Option<Stat>> = Mutex::new(None);
     fn now_ms() -> u64 {
         unsafe { super::GetTickCount64() }
@@ -10047,6 +10072,7 @@ mod anim_fps_probe {
             frames: 0,
             gaps: Vec::new(),
             spends: Vec::new(),
+            pres: Vec::new(),
             last_tick: now,
         });
         let gap = now.saturating_sub(st.last_tick) as u32;
@@ -10070,12 +10096,27 @@ mod anim_fps_probe {
         let mut g = STAT.lock().unwrap_or_else(|e| e.into_inner());
         let Some(st) = g.as_mut() else { return };
         st.spends.push(now_ms().saturating_sub(t0) as u32);
+        // 【P 探针】取本线程 Present 分段：pre=tick 起点到 Present 前
+        //（布局+绘制），post=Present 耗时（vsync/队列等待）。
+        super::PRESENT_SPLIT.with(|c| {
+            let (pre, post) = c.get();
+            if pre >= t0 && post >= pre {
+                st.pres.push((
+                    pre.saturating_sub(t0) as u32,
+                    post.saturating_sub(pre) as u32,
+                ));
+            }
+            c.set((0, 0));
+        });
         let el = now_ms().saturating_sub(st.sec_start);
         if el >= 1000 {
             let mut gaps = std::mem::take(&mut st.gaps);
             let mut spends = std::mem::take(&mut st.spends);
+            let mut pres = std::mem::take(&mut st.pres);
+            let mut pre_v: Vec<u32> = pres.iter().map(|p| p.0).collect();
+            let mut post_v: Vec<u32> = pres.iter().map(|p| p.1).collect();
             crate::tsf::trace(&format!(
-                "cw2-animfps: sec ticks={} frames={} gap p50/p95/max={}/{}/{}ms spend p50/p95/max={}/{}/{}ms",
+                "cw2-animfps: sec ticks={} frames={} gap p50/p95/max={}/{}/{}ms spend p50/p95/max={}/{}/{}ms pre p50/p95={}/{}ms post p50/p95/max={}/{}/{}ms",
                 st.ticks,
                 st.frames,
                 pctl(&mut gaps, 0.5),
@@ -10084,6 +10125,11 @@ mod anim_fps_probe {
                 pctl(&mut spends, 0.5),
                 pctl(&mut spends, 0.95),
                 spends.last().copied().unwrap_or(0),
+                pctl(&mut pre_v, 0.5),
+                pctl(&mut pre_v, 0.95),
+                pctl(&mut post_v, 0.5),
+                pctl(&mut post_v, 0.95),
+                post_v.last().copied().unwrap_or(0),
             ));
             st.sec_start += el;
             st.ticks = 0;
