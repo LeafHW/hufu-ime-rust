@@ -2998,6 +2998,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 drop(host);
                 Some((orig_current, loaded))
             } else {
+                // 【P0 2026-11-07 恶性卡键】无方案切换（改音效/皮肤/字号
+                // 等）时锁从未释放，落入下方无条件 relock=同线程重入
+                // std::sync::Mutex（Windows SRWLock UB，实机死锁）——
+                // POST 线程持锁原地挂死，全部端点与打字键路全挂；设置页
+                // 保存失败自动重试又把连接线程堆到数千个，全系统卡顿。
+                // 修复：else 出口同样放锁，与 if 分支统一为「无锁到达」。
+                drop(host);
                 None
             };
             host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
