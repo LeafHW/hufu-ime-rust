@@ -2839,6 +2839,13 @@ pub struct CandidateWindowV2 {
     /// 后排水=「候选和文字还在自己动」（用户实锤）。封顶后 60Hz 屏
     /// 80ms 滑动 ≈5 帧可见性不变。
     pub(crate) hl_anim_last_render: std::cell::Cell<std::time::Instant>,
+    /// 【动效帧钟 2026-11-07·vsync 网格锁相】已渲帧号（帧时刻=动画
+    /// 起点+n×帧距的均匀网格，tick 只采样）。消除「tick 16ms vs vsync
+    /// 16.67ms」每帧快 0.67ms 的相位追赶——每 ~25 帧追上一个 vsync
+    /// 窗口=渲染两帧落同一拍（实测 30-33ms 双帧档 11%）＝周期性跳拍
+    /// 顿感的根因。u32::MAX=尚未起算（首个 tick 立即渲）。
+    pub(crate) hl_anim_frame: std::cell::Cell<u32>,
+    pub(crate) pos_anim_frame: std::cell::Cell<u32>,
     /// 【动效 tick 重渲染标记】动画 tick（FADE_TIMER）驱动的 show()
     /// 复渲染——不算用户键入帧：不重记高亮基准、不重置注释倒计时、
     /// 不重臂尺寸/位置动效。
@@ -2863,6 +2870,7 @@ pub struct CandidateWindowV2 {
     /// 新率）则跳过本帧渲染（完成帧除外），杀掉 1-3ms 突发连渲染
     ///（winmm 250fps 驱动下队列挤成一坨）；高刷屏不少帧。
     pub(crate) size_anim_last_render: std::cell::Cell<std::time::Instant>,
+    pub(crate) size_anim_frame: std::cell::Cell<u32>,
     /// 尺寸动效时长 ms（皮肤 layout.size_ms，默认 150，0=瞬跳）——注释
     /// 展开/收起、候选数变化等一切宽高变化都平滑过渡；连打重定目标
     /// （从当前插值位置追赶新目标，不跳变）。
@@ -3455,6 +3463,8 @@ impl CandidateWindowV2 {
                 fs_last_render_us: std::cell::Cell::new(0),
                 fs_anim_dur: std::cell::Cell::new(0),
                 hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
+                hl_anim_frame: std::cell::Cell::new(u32::MAX),
+                pos_anim_frame: std::cell::Cell::new(u32::MAX),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
                 hl_ms: 100,
@@ -3473,6 +3483,7 @@ impl CandidateWindowV2 {
                 size_ms: 90,
                 size_anim_dur: std::cell::Cell::new(90),
                 size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
+                size_anim_frame: std::cell::Cell::new(u32::MAX),
                 size_morph: false,
                 pos_anim: None,
                 chase_target: None,
@@ -3680,6 +3691,8 @@ impl CandidateWindowV2 {
                 fs_last_render_us: std::cell::Cell::new(0),
                 fs_anim_dur: std::cell::Cell::new(0),
                 hl_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
+                hl_anim_frame: std::cell::Cell::new(u32::MAX),
+                pos_anim_frame: std::cell::Cell::new(u32::MAX),
                 hl_rect: std::cell::Cell::new(None),
                 hl_prev: std::cell::Cell::new(None),
                 hl_ms: 100,
@@ -3698,6 +3711,7 @@ impl CandidateWindowV2 {
                 size_ms: 90,
                 size_anim_dur: std::cell::Cell::new(90),
                 size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
+                size_anim_frame: std::cell::Cell::new(u32::MAX),
                 size_morph: false,
                 pos_anim: None,
                 chase_target: None,
@@ -4865,6 +4879,7 @@ impl CandidateWindowV2 {
                         crate::tsf::diag_note("动效: 高亮滑动起臂");
                         self.hl_anim
                             .set(Some((fr, std::time::Instant::now(), self.hl_ms)));
+                        self.hl_anim_frame.set(u32::MAX); // 帧钟网格锁相：新程重置
                             anim_tick_arm(self.hwnd);
                     }
                 } else {
@@ -6155,6 +6170,7 @@ impl CandidateWindowV2 {
                     .clamp(24.0, self.size_ms.max(24) as f32) as u32;
                 self.size_anim_dur.set(dur.max(1));
                 self.size_anim = Some((cur, target, std::time::Instant::now()));
+                self.size_anim_frame.set(u32::MAX); // 帧钟网格锁相：新程重置
                 // 起臂帧即按当前尺寸渲染外壳（否则首帧按目标画、下一
                 // tick 又缩回=边缘/阴影跳一下）
                 self.chrome_override.set(Some(cur));
@@ -8872,6 +8888,7 @@ impl CandidateWindowV2 {
                             ((d as f32 * 2.2 / spd) as u32).clamp(60, 260)
                         };
                         self.pos_anim = Some(((lx, ly), (tx, ty), std::time::Instant::now(), dur, 0));
+                        self.pos_anim_frame.set(u32::MAX); // 帧钟网格锁相：新程重置
                         anim_tick_arm(self.hwnd);
                     } else if d > 0 {
                         self.pos_anim = None;
@@ -9030,6 +9047,7 @@ impl CandidateWindowV2 {
                 if entrance_armed {
                     if let Some((f, t, _, dur, ez)) = self.pos_anim {
                         self.pos_anim = Some((f, t, std::time::Instant::now(), dur, ez));
+                        self.pos_anim_frame.set(u32::MAX); // 帧钟网格锁相：新程重置
                         if crate::tsf::trace_on() {
                             crate::tsf::trace(&format!(
                                 "cw2: 首显时钟重锚 pos=({px},{py})→({tx},{ty}) dur={dur}"
@@ -9409,9 +9427,13 @@ pub const MOTION_FAST_MS: u32 = 80;
 pub const MOTION_BASE_MS: u32 = 110;
 pub const MOTION_SLOW_MS: u32 = 180;
 
-/// 本窗动画 tick 周期（= 所在显示器帧距，4..20ms；查询失败兜底 60Hz）。
+/// 本窗动画 tick 周期。【帧钟 2026-11-07b】tick=0.45×帧距（60Hz→7ms /
+/// 144Hz→4ms / 240Hz→4ms，钳 4..20）：tick 必须 ≤网格距一半——每网格帧
+/// 窗口内必有 ≥1 tick 落入，网格门逐帧放行；tick=0.75×帧距（12ms）与
+/// 16ms 网格的最小公倍节奏=每 24ms 才对齐一次（实测 SWP 24ms 主导=
+/// 入场滑动掉到 ~42fps，比旧版更差）。多余早到 tick 由网格门幂等吸收。
 fn anim_tick_ms(hwnd: HWND) -> u32 {
-    (morph_frame_interval_ms(hwnd) as u32).clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS)
+    ((morph_frame_interval_ms(hwnd) * 45 / 100) as u32).clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS)
 }
 
 /// 【2026-11-03 可访问性/省电】系统动画许可：
@@ -9985,6 +10007,104 @@ unsafe fn ssf_frame_tick(hwnd: HWND) {
     }
 }
 
+// =====【动效帧率实测打点 2026-11-07】=====
+// 目的：用户报「动效不满 60」——tick 驱动层历次修复后需实测真实上屏帧率。
+// 口径：ticks/s=驱动到达率；frames/s=真实渲染帧（size/hl/fs 复渲染调用）；
+// gap=相邻 tick 间隔分布；spend=本 tick 主窗处理总耗时（含 show 全量渲）。
+// trace 关闭=完全旁路（一次原子读）；每满 1s 输出一行汇总（trace 日志可控）。
+mod anim_fps_probe {
+    use std::sync::Mutex;
+    struct Stat {
+        sec_start: u64,
+        ticks: u32,
+        frames: u32,
+        gaps: Vec<u32>,
+        spends: Vec<u32>,
+        last_tick: u64,
+    }
+    static STAT: Mutex<Option<Stat>> = Mutex::new(None);
+    fn now_ms() -> u64 {
+        unsafe { super::GetTickCount64() }
+    }
+    fn pctl(v: &mut [u32], p: f64) -> u32 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        let i = ((v.len() as f64 - 1.0) * p).round() as usize;
+        v[i.min(v.len() - 1)]
+    }
+    /// tick 到达（主窗分支入口）。返回入口时刻（tick spend 计时基准）。
+    pub fn tick_in() -> Option<u64> {
+        if !crate::tsf::trace_on() {
+            return None;
+        }
+        let mut g = STAT.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        let st = g.get_or_insert_with(|| Stat {
+            sec_start: now,
+            ticks: 0,
+            frames: 0,
+            gaps: Vec::new(),
+            spends: Vec::new(),
+            last_tick: now,
+        });
+        let gap = now.saturating_sub(st.last_tick) as u32;
+        if gap > 0 && gap < 1000 {
+            st.gaps.push(gap);
+        }
+        st.last_tick = now;
+        st.ticks += 1;
+        Some(now)
+    }
+    /// 真实渲染帧（size/hl 复渲染 + fs 步进帧）。
+    pub fn frame() {
+        let mut g = STAT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(st) = g.as_mut() {
+            st.frames += 1;
+        }
+    }
+    /// 主窗分支收尾：记本 tick 总耗时；满 1s 输出汇总行。
+    pub fn tick_out(t0: Option<u64>) {
+        let Some(t0) = t0 else { return };
+        let mut g = STAT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(st) = g.as_mut() else { return };
+        st.spends.push(now_ms().saturating_sub(t0) as u32);
+        let el = now_ms().saturating_sub(st.sec_start);
+        if el >= 1000 {
+            let mut gaps = std::mem::take(&mut st.gaps);
+            let mut spends = std::mem::take(&mut st.spends);
+            crate::tsf::trace(&format!(
+                "cw2-animfps: sec ticks={} frames={} gap p50/p95/max={}/{}/{}ms spend p50/p95/max={}/{}/{}ms",
+                st.ticks,
+                st.frames,
+                pctl(&mut gaps, 0.5),
+                pctl(&mut gaps, 0.95),
+                gaps.last().copied().unwrap_or(0),
+                pctl(&mut spends, 0.5),
+                pctl(&mut spends, 0.95),
+                spends.last().copied().unwrap_or(0),
+            ));
+            st.sec_start += el;
+            st.ticks = 0;
+            st.frames = 0;
+        }
+    }
+}
+
+// =====【动效帧钟 2026-11-07·vsync 网格锁相】=====
+// 帧=动画起点（t0）起算的均匀网格（n×帧距），与 tick 到达时刻无关。
+// 每帧渲染条件=网格帧号 > 上次已渲帧号（tick 只是采样器，早到等帧、
+// 晚到最多补 1 帧）。收益：tick 周期与 vsync 的固定偏差不再累积成
+// 「每 N 帧追上一拍」的周期跳帧；帧间隔恒≈帧距（60Hz=16.7ms）。
+// 返回当前应收帧号；调用方与自己的 last_frame 字段比较。
+fn grid_frame_now(hwnd: HWND, t0: std::time::Instant) -> u32 {
+    // 精确微秒网格：morph_frame_interval_ms 的 ms 取整（floor 16.67→16）
+    // 会给网格距引入 -0.67ms/帧系统偏差，长动画漂移可见——用 µs 换算。
+    let fi_us = (morph_frame_interval_ms(hwnd) * 1000).max(1);
+    (t0.elapsed().as_micros() / fi_us) as u32
+}
+
 unsafe fn fade_tick_shared(hwnd: HWND) {
     // 【动画 tick 线程感知 2026-09-12 十七修】残留窗最终根因：小窗
     // 线程 TL 候选的动画 tick 走到这里 → take g.cand2（主线程窗）
@@ -10035,15 +10155,13 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.chrome_override.set(Some(cur));
                 }
                 c.live_size.set(cur);
-                // 【五十九修·形变帧率封顶】中间帧间隔小于「屏幕刷新
-                // 帧距」（60Hz=16.7ms / 144Hz=6.9 / 240Hz=4.2，见
-                // morph_frame_interval_ms）跳过渲染（完成帧必渲）。
+                // 【五十九修·形变帧率封顶】+【帧钟 2026-11-07 网格锁相】：
+                // 帧时刻=动画起点 n×帧距网格（见 grid_frame_now），tick 只
+                // 采样——tick 与 vsync 的固定偏差不再累积成周期跳帧。
                 let render_ok = finished || {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(c.size_anim_last_render.get()).as_millis()
-                        >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
-                    {
-                        c.size_anim_last_render.set(now);
+                    let fi = grid_frame_now(hwnd, t0);
+                    if fi != c.size_anim_frame.get() {
+                        c.size_anim_frame.set(fi);
                         true
                     } else {
                         false
@@ -10124,7 +10242,12 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 } else {
                     anim_done = false;
                     c.live_pos.set(cur);
-                    if c.is_visible() {
+                    // 【帧钟网格锁相 2026-11-07】SWP 步进按 n×帧距网格
+                    // 放行（tick 只采样）——位置动画的 SWP 频率与 vsync
+                    // 对齐，消除 16ms tick vs 16.67ms vsync 的追拍跳步。
+                    let fi = grid_frame_now(hwnd, t0);
+                    if c.is_visible() && fi != c.pos_anim_frame.get() {
+                        c.pos_anim_frame.set(fi);
                         // 【三十二修·门控】二十五修口径：trace 关时不白付
                         // format! 分配（动画期每 5ms tick 一次）。
                         if crate::tsf::trace_on() {
@@ -10147,19 +10270,21 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             //（首 tick anim_done=true 即收钟）。注释「同款」自此属实。
             if c.hl_anim.get().is_some() {
                 anim_done = false;
-                // 【hl 帧率封顶 2026-11】与 size 分支同款门（见字段注释）
-                // ——跳帧只延后插值采样，完成清臂在渲染内，至多多等一帧。
-                let render_ok = {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(c.hl_anim_last_render.get()).as_millis()
-                        >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
-                    {
-                        c.hl_anim_last_render.set(now);
-                        true
-                    } else {
-                        false
-                    }
-                };
+                // 【hl 帧率封顶 2026-11】+【帧钟网格锁相】：帧时刻=hl 起
+                // 臂点 n×帧距网格（grid_frame_now），tick 只采样。
+                let render_ok = c
+                    .hl_anim
+                    .get()
+                    .map(|(_, t0, _)| {
+                        let fi = grid_frame_now(hwnd, t0);
+                        if fi != c.hl_anim_frame.get() {
+                            c.hl_anim_frame.set(fi);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
                 if c.is_visible() && render_ok {
                     c.internal_rerender = true;
                     let _ = c.show(cands, raw, &skin, None, *sel);
@@ -10181,6 +10306,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
+    // 【动效实测打点】tick 到达（trace 关=零开销旁路）
+    let anim_t0 = anim_fps_probe::tick_in();
     let (mut cand2, last, skin, caret, alive) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【动效窗口让渡】标记持有中——TSF 线程此刻 is_none() 不新建
@@ -10254,19 +10381,15 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 c.chrome_override.set(Some(cur));
             }
             c.live_size.set(cur);
-            // 【五十九修·形变帧率封顶】中间帧间隔小于「屏幕刷新帧
-            // 距」（morph_frame_interval_ms：60Hz=16.7 / 144=6.9 /
-            // 240=4.2ms）跳过渲染（完成帧必渲）——杀 winmm 250fps
-            // 驱动下 1-3ms 突发连渲染；高刷屏按其实际刷新率足帧。
+            // 【五十九修·形变帧率封顶】+【帧钟 2026-11-07 网格锁相】：
+            // 帧时刻=动画起点 n×帧距均匀网格（grid_frame_now），tick 只
+            // 采样。旧「周期-2ms」相对门在 tick(16ms) vs vsync(16.67ms)
+            // 固定偏差下每 ~25 帧追上一拍=渲染两帧落同一 vsync 窗（实测
+            // 30-33ms 双帧档 11%，周期跳拍顿感）；网格门帧间隔恒≈帧距。
             let render_ok = finished || {
-                let now = std::time::Instant::now();
-                // 【2026-11-03 帧截止】tick 已是帧距；门限=周期-2ms 容差，
-                // 每帧放行一帧（旧 >=ceil(16.7)=17ms 与 5ms tick 把 60Hz
-                // 量化成 20ms/帧=实际 50fps）。
-                if now.duration_since(c.size_anim_last_render.get()).as_millis()
-                    >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
-                {
-                    c.size_anim_last_render.set(now);
+                let fi = grid_frame_now(hwnd, t0);
+                if fi != c.size_anim_frame.get() {
+                    c.size_anim_frame.set(fi);
                     true
                 } else {
                     false
@@ -10277,6 +10400,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                 c.internal_rerender = false;
                 rendered_this_tick = true;
+                anim_fps_probe::frame(); // 实测打点：真实渲染帧
             }
         }
         // 【三十四修·chase 步进】指数逼近（τ=35ms）+限速（2.5px/ms）：
@@ -10390,7 +10514,12 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.live_pos.set(cur);
                     // 死帧去重：坐标与上一拍相同（亚像素增量取整为0）
                     // 则不动窗不落档——尾巴只留真实位移。
-                    if c.is_visible() && cur != prev {
+                    // 【帧钟网格锁相 2026-11-07】SWP 按 n×帧距网格放行
+                    //（tick 只采样）——消除 16ms tick vs 16.67ms vsync
+                    // 相位追拍跳步（实测 SWP 间隔 30-33ms 双帧档 11%）。
+                    let fi = grid_frame_now(hwnd, t0);
+                    if c.is_visible() && cur != prev && fi != c.pos_anim_frame.get() {
+                        c.pos_anim_frame.set(fi);
                         // 【三十二修·门控】同上：tick 热路径 trace 关不分配。
                         if crate::tsf::trace_on() {
                             crate::tsf::trace(&format!("cw2: SWP动画2 cur=({},{})", cur.0, cur.1));
@@ -10412,26 +10541,28 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         // 帧（FADE_TIMER 驱动；完成在渲染内自清 → anim_done 收 timer）。
         if c.hl_anim.get().is_some() {
             anim_done = false;
-            // 【hl 帧率封顶 2026-11】与 size 分支同款门（见字段注释）：
-            // 高速选重序列里 hl_anim 全程在身，winmm 双路 ~200fps 整帧
-            // 复渲染无封顶=宿主 UI 线程渲染洪峰（键事件排队滞后、停手
-            // 后排水自动）。封顶后至多屏刷率帧，80ms 滑动 60Hz ≈5 帧。
-            let render_ok = {
-                let now = std::time::Instant::now();
-                if now.duration_since(c.hl_anim_last_render.get()).as_millis()
-                    >= anim_tick_ms(hwnd).saturating_sub(2).max(1) as u128
-                {
-                    c.hl_anim_last_render.set(now);
-                    true
-                } else {
-                    false
-                }
-            };
+            // 【hl 帧率封顶 2026-11】+【帧钟网格锁相】：帧时刻=hl 起臂点
+            // n×帧距网格（grid_frame_now），tick 只采样；封顶渲染洪峰与
+            // 周期跳拍双收。
+            let render_ok = c
+                .hl_anim
+                .get()
+                .map(|(_, t0, _)| {
+                    let fi = grid_frame_now(hwnd, t0);
+                    if fi != c.hl_anim_frame.get() {
+                        c.hl_anim_frame.set(fi);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
             if c.is_visible() && render_ok {
                 c.internal_rerender = true;
                 let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                 c.internal_rerender = false;
                 rendered_this_tick = true;
+                anim_fps_probe::frame(); // 实测打点：真实渲染帧
             }
         }
         // 【高亮字号补间帧 2026-11-04】本拍跨过量化步界、且 size/hl 分支
@@ -10444,6 +10575,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             c.internal_rerender = true;
             let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
             c.internal_rerender = false;
+            anim_fps_probe::frame(); // 实测打点：fs 步进帧
             c.fs_last_render_us
                 .set(t_frame.elapsed().as_micros().min(u32::MAX as u128) as u32);
         }
@@ -10538,6 +10670,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     // 【贴图挂件 2026-10-02】tick 内移动/形变 SWP 后同步兄弟贴图窗
     //（chase/pos_anim 走 move-only SWP 不经 show()，在此补同步）
     crate::overlaywin::sync_for(hwnd, &skin);
+    // 【动效实测打点】主窗分支收尾（spend+每秒汇总）
+    anim_fps_probe::tick_out(anim_t0);
     if anim_done {
         let _ = KillTimer(hwnd, FADE_TIMER_ID);
         anim_boost_disarm(hwnd);
