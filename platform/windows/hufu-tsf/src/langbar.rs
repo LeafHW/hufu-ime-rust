@@ -16,10 +16,9 @@ use windows::Win32::UI::TextServices::{
     ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    // 【P3 扫尾 2026-11-07】+DestroyIcon：GetIcon 双槽化后竞态落败方的
-    // 私有新图标需要销毁（图标句柄泄漏封顶修复，见 GetIcon 注释）。
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, HICON,
-    HWND_MESSAGE, ICONINFO, RegisterClassExW, SetForegroundWindow, WNDCLASSEXW,
+    // 【2026-11-07 回滚】DestroyIcon 随 GetIcon 双槽回滚移除（不再使用）。
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, HICON, HWND_MESSAGE,
+    ICONINFO, RegisterClassExW, SetForegroundWindow, WNDCLASSEXW,
 };
 use windows::core::{GUID, Interface, PCWSTR, Result, VARIANT, implement};
 
@@ -879,18 +878,14 @@ static SND_ON: AtomicBool = AtomicBool::new(false);
 // 【三十四修·死代码删除】refresh_sound_snapshot()（零调用——SND_ON
 // 实际由 refresh_schemas_cache 内 sound_state 管道同步）已删。
 
-// 【P3 扫尾 2026-11-07】GetIcon 句柄封顶双槽：中/英各持一枚进程级
-// HICON（0=未建）。原实现每次 GetIcon 现画新句柄不释放——USER 对象
-// 1 万上限，日切 200 次约 50 天逼近；双槽后泄漏封顶 2 枚。句柄按
-// 模式稳定：中↔英切换句柄必变 → 托盘按句柄值缓存像素的策略仍必
-// miss 强制重画（2026-09-11 陈旧像素复活对抗不变）；同模式重复
-// GetIcon 返回同句柄，像素本就相同，无陈旧风险。图标由
-// CreateIconIndirect 私有创建（两枚 HBITMAP 已当场 DeleteObject），
-// 非共享资源（非 LoadImage 共享/CopyIcon），DestroyIcon 语义安全。
-// 图标内容与皮肤零耦合（固定白字+黑晕纯函数），无需换肤失效路径；
-// 若未来图标随皮肤变化，必须补 invalidate（DestroyIcon 两槽+清零）。
-static ICON_ZH: AtomicIsize = AtomicIsize::new(0);
-static ICON_EN: AtomicIsize = AtomicIsize::new(0);
+// 【2026-11-07 回滚】GetIcon 双槽缓存（ICON_ZH/ICON_EN 按模式持固定
+// 句柄）实测造成「切英文再切回中文，托盘仍显示英文」：托盘按句柄值
+// 缓存像素，A→B→A 句柄复用路径上托盘不重画（1.9.9.3 无此问题；本机
+// 2026-11-07 部署 v172 后首次暴露）。回到 1.9.9.3「每次现画新句柄」：
+// 泄漏量级=每次切换一枚 32px 图标（~5KB），日切 200 次≈1MB，数十年
+// 不会触及 USER 对象上限——原「50 天逼近」评估把像素泄漏当句柄泄漏，
+// 量级算错不成立，不再保留双槽。
+
 
 impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     fn OnClick(
@@ -958,32 +953,11 @@ impl ITfLangBarItemButton_Impl for HuFuLangBar_Impl {
     fn GetIcon(&self) -> Result<HICON> {
         // 【2026-09-11 缓存对抗】托盘对第三方 IME 牌面按 HICON 句柄缓存
         // 像素：句柄值不变=像素不重画（OnUpdate/compartment 全无效，weasel
-        // 同困）。模式切换句柄必变 → 缓存必 miss → 强制重读。
-        // 【P3 扫尾 2026-11-07】原「每次现画新句柄」每切一次漏 1 枚 USER
-        // 对象（日切 200 次≈50 天逼近 1 万上限），改中/英双槽持有（见
-        // ICON_ZH/ICON_EN 注释），泄漏封顶 2 枚；DestroyIcon 仅用于并发
-        // 竞态落败方（从未发布的私有图标）。
-        let zh = is_chinese();
-        let glyph = if zh { "中" } else { "英" };
-        let slot = if zh { &ICON_ZH } else { &ICON_EN };
-        let mut h = slot.load(Ordering::Acquire);
-        if h == 0 {
-            h = make_glyph_icon(glyph);
-            if h != 0 {
-                match slot.compare_exchange(0, h, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => {}
-                    Err(winner) => {
-                        // 并发 GetIcon 落败：销毁自己刚画的私有新图标（从未
-                        // 发布），改用先到者（同模式像素确定性一致）
-                        unsafe {
-                            let _ = DestroyIcon(HICON(h as *mut _));
-                        }
-                        h = winner;
-                    }
-                }
-            }
-        }
-        Ok(HICON(h as *mut _))
+        // 同困）。每次现画新句柄 → 缓存必 miss → 强制重读。
+        // 【2026-11-07 回滚】双槽固定句柄在 A→B→A 复用路径上不触发托盘
+        // 重画（切回中文牌面仍英文，实测回归），回到每次现画。
+        let glyph = if is_chinese() { "中" } else { "英" };
+        Ok(HICON(make_glyph_icon(glyph) as *mut _))
     }
 
     fn GetText(&self) -> Result<windows::core::BSTR> {
