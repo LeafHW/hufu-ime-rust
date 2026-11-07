@@ -2908,6 +2908,18 @@ unsafe extern "system" fn caps_ll_proc(
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    // 【十八修b 2026-11-07】自家注入对（MAGIC 标记）在 LL 层整吞：
+    // keybd_event 的驱动翻转（物理位+灯）在进 LL 前已完成=注入目的
+    // 已达；键事件继续广播只会被引擎 TestDown 再消费一次（caps_lock
+    // 连翻=「灯熄后变大写英文」事故，trace 1794047271537 同毫秒双行
+    // 铁证：consumed=true 消费在前、消息层吞在后拦不住）。down 记
+    // SEEN——原消息层结算计数移此（LL 吞后消息层看不到注入对）。
+    if kb.vkCode == 0x14 && kb.dwExtraInfo == CAPS_FIXUP_MAGIC {
+        if wparam.0 == 0x0100 || wparam.0 == 0x0104 {
+            CAPS_PAIR_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return LRESULT(1);
+    }
     if kb.vkCode == 0x14 && (kb.flags & LLKHF_INJECTED).0 == 0 {
         let is_down = wparam.0 == 0x0100 || wparam.0 == 0x0104; // (SYS)KEYDOWN
         let is_up = wparam.0 == 0x0101 || wparam.0 == 0x0105; // (SYS)KEYUP
@@ -3530,6 +3542,26 @@ impl HuFuTs_Impl {
         // "enter"。 NumLock 关闭的小键盘 VK 0x60-0x69 也会以扩展形态
         // 报方向群 VK（0x23/0x24/…），由对应 VK 分支处理。
         let num_enter = wparam == 0x0D && (lparam & 0x0100_0000) != 0;
+        // 【十八修c·注入回声拦截 2026-11-07】caps_synth_flip 的
+        // keybd_event 注入对会回穿本 dispatch（LL 整吞方案依赖钩子在
+        // 场——cap 无映射的用户从不装钩子=回声穿到引擎被当真 Caps
+        // 消费，caps_lock 连翻=「灯熄后变大写英文」事故，trace
+        // 1794047769027/9036 实录回声 9ms 到站）。回声判定：距最近一
+        // 次自家注入（CAPS_PAIR_INJ_AT）<60ms 的 Caps 键=回声，直通
+        // 不递引擎。60ms 窗安全性：实测回声传播 9ms；注入时机在自家
+        // 键响应帧内，用户下一颗物理键最快 ~100ms——窗内到达的
+        // capslock 必是回声（十六修否掉的是 400ms 全键时间窗；60ms+
+        // 单键过滤零误吞面）。down/up 同拦（回声对的 up 也不进引擎）。
+        if wparam == 0x14 {
+            let now = caps_now_ms();
+            let inj_at = CAPS_PAIR_INJ_AT.load(std::sync::atomic::Ordering::Relaxed);
+            if inj_at != 0 && now.saturating_sub(inj_at) < 60 {
+                if !test_only && crate::tsf::trace_on() {
+                    crate::tsf::trace("caps: 注入回声（60ms 窗）→ 直通不递引擎");
+                }
+                return BOOL(0);
+            }
+        }
         // 【十七修·F24 虚键重映射 2026-10-13】物理 Caps 已被 LL 钩子整
         // 个拦下（组段在身时——系统大写位/灯根本未动），钩子同拍注入
         // 带 "HUFV" 标记的 F24 虚键对走正常 TSF 路。到站改姓 capslock：
@@ -4217,6 +4249,52 @@ impl HuFuTs_Impl {
                         "caps: 锁大写翻转沿物理位不一致 → 补一对对齐 {dir}（灯=状态可见）"
                     ));
                 }
+            }
+        }
+        // 【十八修·灯对账兜底 2026-11-07】翻转沿一次性对齐错过即脱钩：
+        // 在飞对子拦注入、宿主环境吞 keybd_event、以及「Shift/Ctrl+Space/
+        // 语言栏切中英一律清 caps_lock 但物理灯无人对」（英文锁大写灯亮
+        // →切中文灯仍亮；引擎 on 物理位 off 灯灭）。兜底=每键响应帧慢速
+        // 对账：物理位≠引擎 caps_lock 且【组段空】（十六修红线不动：raw
+        // 非空打字中途零注入）+ 连续 5 帧不一致（防瞬时竞态）+ 距上次
+        // 尝试 3s 节流 → caps_synth_align（内部仍有结算守卫+急停旗标）。
+        // 键响应帧天然遍布全场景：切中文后第一键即触发灭灯、锁大写灯
+        // 未亮后 3s 内第一键补亮——无需翻转沿时机。
+        {
+            use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::Relaxed};
+            static MISMATCH: AtomicI32 = AtomicI32::new(0);
+            static LAST_TRY: AtomicU64 = AtomicU64::new(0);
+            // 【域区分】物理 Caps 位在英文模式=系统大写功能（物理路自
+            // 由使用，灯=物理位天然正确，引擎 caps_lock 不同域不干预）；
+            // 仅中文模式（引擎消费 Caps）对账。切中文后残留物理位由
+            // 此收敛灭灯；英文模式物理大写不受扰。
+            let zh_now = state
+                .get("chinese")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let raw_empty = state
+                .get("raw")
+                .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
+                .unwrap_or(true);
+            let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
+            // 计数与动作分离：中文态+物理位≠引擎态即持续计数（打中文
+            // 组段非空也计数——那只是"暂不能安全注入"，不是"已一致"，
+            // 若被清零永远攒不满门槛=兜底失效）；注入动作才要求组段空。
+            if zh_now && bit_on != caps_locked_now {
+                let m = MISMATCH.fetch_add(1, Relaxed) + 1;
+                let now = caps_now_ms();
+                if m >= 5 && raw_empty && now.saturating_sub(LAST_TRY.load(Relaxed)) > 3000 {
+                    if caps_synth_align(now, caps_locked_now) {
+                        let dir = if caps_locked_now { "ON" } else { "OFF" };
+                        crate::tsf::trace(&format!(
+                            "caps: 慢速对账兜底 → 物理位补一对对齐 {dir}（灯=状态可见）"
+                        ));
+                        MISMATCH.store(0, Relaxed);
+                        LAST_TRY.store(now, Relaxed);
+                    }
+                }
+            } else {
+                MISMATCH.store(0, Relaxed);
             }
         }
         // 【Esc 双行为 2026-11】缓存引擎 esc_undo_ready（TestDown 空态
