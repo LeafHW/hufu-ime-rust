@@ -27,6 +27,7 @@ impl Request {
     }
 }
 
+#[derive(Clone)]
 pub struct Response {
     pub status: u16,
     pub content_type: &'static str,

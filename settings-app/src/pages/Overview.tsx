@@ -67,7 +67,7 @@ export function Overview({
     if (upd.kind === 'checking') return;
     if (upd.kind !== 'update') {
       setUpd({ kind: 'checking' });
-      setUpd(await fetchUpdateCheck(data.about.github));
+      setUpd(await fetchUpdateCheck(data.about.github, { fresh: true }));
       return;
     }
     /* 下载中/完成：进度就在这一行里，点行进「关于」看详情与操作按钮；

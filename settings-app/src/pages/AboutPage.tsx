@@ -13,7 +13,7 @@ export function AboutPage({ about }: { about: About }) {
 
   const checkUpdate = async () => {
     setUpd({ kind: 'checking' });
-    setUpd(await fetchUpdateCheck(about.github));
+    setUpd(await fetchUpdateCheck(about.github, { fresh: true }));
   };
 
   const pageUrl = upd.kind === 'update' ? upd.pageUrl : about.github;

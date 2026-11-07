@@ -1647,6 +1647,34 @@ fn next_static(path: &str) -> Option<Response> {
 /// Host 大锁内的 route 分支里：manifest 8s / GitHub 5s 的超时窗口内，
 /// 按键、候选轮询、设置页全部排队（用户观感=打字卡死）。
 /// 失败返回 ok:false + error（前端如实展示），不装样子。
+///
+/// 【2026-11-07 六小时核查】结果缓存：成功 60s / 失败 10s——设置页
+/// 概览+关于页打开时各查一次（每次外网 0.5-8s），无缓存时同一次浏览
+/// 反复付外网等待；外网断网时每次打开都吃满 8s 超时。?fresh=1 绕过
+/// 缓存（前端「检查更新」按钮强制真查）。
+static UPDATE_CHECK_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, bool, crate::http::Response)>>,
+> = std::sync::OnceLock::new();
+
+fn update_check(fresh: bool) -> Response {
+    let cell = UPDATE_CHECK_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None));
+    if !fresh {
+        let guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, ok, cached)) = guard.as_ref() {
+            let ttl = if *ok { 60 } else { 10 };
+            if at.elapsed().as_secs() < ttl {
+                return cached.clone();
+            }
+        }
+    }
+    let r = update_check_inner();
+    let ok = r.status == 200;
+    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some((std::time::Instant::now(), ok, r.clone()));
+    r
+}
+
 fn update_check_inner() -> Response {
     // 【关于页检查更新 2026-11-01 用户需求】真实检查：请求 GitHub
     // releases/latest 拿最新 tag，与本机版本（version.txt 同源）比对。
@@ -2689,7 +2717,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             return Response::err(403, "跨源请求被拒绝");
         }
         return match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/api/update/check") => update_check_inner(),
+            ("GET", "/api/update/check") => update_check(
+                req.query.get("fresh").map(|v| v == "1").unwrap_or(false),
+            ),
             ("POST", "/api/update/download/start") => update_download_start(),
             ("GET", "/api/update/download/status") => update_download_status(),
             ("POST", "/api/update/download/cancel") => update_download_cancel(),

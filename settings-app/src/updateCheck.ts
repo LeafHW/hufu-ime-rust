@@ -8,12 +8,18 @@ export type UpdateState =
   | { kind: 'update'; latest: string; downloadUrl: string | null; pageUrl: string }
   | { kind: 'error'; msg: string };
 
-export async function fetchUpdateCheck(fallbackPageUrl: string): Promise<UpdateState> {
+export async function fetchUpdateCheck(
+  fallbackPageUrl: string,
+  opts?: { fresh?: boolean },
+): Promise<UpdateState> {
   try {
+    /* 【2026-11-07 六小时核查】fresh=1 绕过 server 端 60s 结果缓存：
+       概览/关于页打开时自动查走缓存（0 等待），用户点「检查更新」
+       按钮强制真查外网。 */
     const r = await getJson<{
       ok: boolean; current: string; latest?: string; has_update?: boolean;
       page_url?: string; download_url?: string | null; error?: string;
-    }>('/api/update/check');
+    }>(opts?.fresh ? '/api/update/check?fresh=1' : '/api/update/check');
     if (!r.ok) return { kind: 'error', msg: r.error || '检查失败' };
     if (r.has_update)
       return { kind: 'update', latest: r.latest || '?', downloadUrl: r.download_url || null, pageUrl: r.page_url || fallbackPageUrl };
