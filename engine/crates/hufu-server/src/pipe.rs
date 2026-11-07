@@ -440,18 +440,36 @@ pub fn dispatch(
         "config_set" => {
             let v = req.get("config").cloned().unwrap_or(serde_json::Value::Null);
             match serde_json::from_value::<hufu_config::Config>(v) {
-                Ok(cfg) => match host.apply_config(cfg) {
-                    Ok((need_sentence, teardown)) => {
-                        if need_sentence {
-                            // 与 HTTP /api/config 同源（后台重建，不持锁载模型）
-                            crate::reload_sentence_bg(teardown, true);
+                Ok(cfg) => {
+                    // 【流畅度二批 2026-11-07】schema 变更段锁外预装载
+                    //（原 apply_config 锁内装载 0.05-2s 顶全机键）。
+                    let need_load = cfg.schema.current != host.engine.config.schema.current
+                        || cfg.schema.dir != host.engine.config.schema.dir;
+                    let pre = if need_load && !cfg.schema.current.is_empty() {
+                        let data_dir = host.data_dir.clone();
+                        let orig = host.engine.config.schema.current.clone();
+                        let d = cfg.schema.dir.clone();
+                        let c = cfg.schema.current.clone();
+                        drop(host);
+                        let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
+                        host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                        Some((orig, loaded))
+                    } else {
+                        None
+                    };
+                    match host.apply_config(cfg, pre) {
+                        Ok((need_sentence, teardown)) => {
+                            if need_sentence {
+                                // 与 HTTP /api/config 同源（后台重建，不持锁载模型）
+                                crate::reload_sentence_bg(teardown, true);
+                            }
+                            // 【云同步 2026-10-28】管道路径的配置变化也触发同步
+                            crate::sync::notify("配置变化");
+                            serde_json::json!({"ok": true})
                         }
-                        // 【云同步 2026-10-28】管道路径的配置变化也触发同步
-                        crate::sync::notify("配置变化");
-                        serde_json::json!({"ok": true})
+                        Err(e) => serde_json::json!({"error": format!("应用失败: {e}")}),
                     }
-                    Err(e) => serde_json::json!({"error": format!("应用失败: {e}")}),
-                },
+                }
                 Err(e) => serde_json::json!({"error": format!("配置无效: {e}")}),
             }
         }
@@ -557,7 +575,9 @@ pub fn dispatch(
             // 【独立皮肤设置 2026-10-16】SSF 时序号开关可被 per-skin 覆盖
             //（载荷 layout.show_index 同步注入——DLL 双路可读）。
             let show_index = if host.engine.config.appearance.skin_kind == "ssf" {
-                crate::ssf::SsfOverrides::load(&crate::ssf::ssf_cache_root(&host.data_dir).join(&id))
+                crate::ssf::SsfOverrides::load_cached(
+                    &crate::ssf::ssf_cache_root(&host.data_dir).join(&id),
+                )
                     .show_index
                     .unwrap_or(host.engine.config.candidates.show_index)
             } else {
@@ -607,7 +627,17 @@ pub fn dispatch(
             // 下方默认 JSON 皮路径（与 JSON 皮肤加载失败同款回退——
             // 坏皮绝不弄坏输入）。
             if host.engine.config.appearance.skin_kind == "ssf" {
-                if let Ok((sv_src, src_fp)) = crate::ssf::skin_payload(&host.data_dir, &id) {
+                // 【流畅度二批 2026-11-07】skin_payload 出锁：bundle 内存
+                // 缓存 miss 时含 MB 级 .ssf 解包（几十-上百 ms 顶键——
+                // 换皮/换版本后首次 poll 场景）；命中时零读盘，回锁后
+                // 只剩 µs 级 json 组装。与 cand op 换肤首帧出锁装载
+                //（pipe.rs 10-reg P2 先例）同款模式。
+                let data_dir = host.data_dir.clone();
+                let id_snap = id.clone();
+                drop(host);
+                let payload = crate::ssf::skin_payload(&data_dir, &id_snap);
+                host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                if let Ok((sv_src, src_fp)) = payload {
                     let anim = host.engine.config.appearance.anim;
                     let anim_speed = host.engine.config.appearance.anim_speed;
                     let anim_flash = host.engine.config.appearance.anim_flash;
@@ -890,14 +920,28 @@ pub fn dispatch(
             serde_json::json!({"schemas": names, "current": current})
         }
         // 语言栏菜单选码表（与 POST /api/schema 同逻辑：换方案 + 清
-        // 会话 + 重建整句 + 落盘——同样在已持锁内直做）
+        // 会话 + 重建整句 + 落盘）。
+        // 【流畅度二批 2026-11-07】原实现 dispatch 持锁内同步
+        // switch_schema（=锁内 Schema::load 0.05-1s+apply），期间全机
+        // 按键排队。改 /api/schema 同款两段式：锁内取路径 → drop 锁
+        // 装载 → 短锁应用。同步语义保持（本响应即最终 current；装载/
+        // 应用失败保留旧方案照常返回列表，与原 is_ok() 静默一致）。
         "set_schema" => {
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if !name.is_empty() && host.engine.switch_schema(name).is_ok() {
-                host.session.clear();
-                // 【卡死修复】后台重建整句（不持锁载 546MB 模型）
-                crate::reload_sentence_bg(true, false);
-                let _ = host.engine.config.save(&host.config_path);
+            if !name.is_empty() {
+                let data_dir = host.data_dir.clone();
+                let schema_dir = host.engine.config.schema.dir.clone();
+                drop(host);
+                let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, name);
+                host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                if let Ok(schema) = loaded {
+                    if host.engine.apply_schema(name, schema).is_ok() {
+                        host.session.clear();
+                        // 【卡死修复】后台重建整句（不持锁载 546MB 模型）
+                        crate::reload_sentence_bg(true, false);
+                        let _ = host.engine.config.save(&host.config_path);
+                    }
+                }
             }
             let dir = hufu_engine::Engine::resolve_data_sub(
                 &host.data_dir,
@@ -920,13 +964,26 @@ pub fn dispatch(
         // Linux fcitx5 托盘「重载码表」与紧急手动通道。当前方案原样
         // 重载，与 set_schema 同源逻辑，name=当前方案名。
         "reload_schema" => {
+            // 【流畅度二批 2026-11-07】同 set_schema：装载出锁两段式
+            //（原 dispatch 持锁内同步 switch_schema 0.05-1s 顶全机键）。
             let name = host.engine.config.schema.current.clone();
-            let ok = host.engine.switch_schema(&name).is_ok();
-            if ok {
-                host.session.clear();
-                // 【卡死修复】后台重建整句（重读补充语料语义）
-                crate::reload_sentence_bg(true, true);
-            }
+            let data_dir = host.data_dir.clone();
+            let schema_dir = host.engine.config.schema.dir.clone();
+            drop(host);
+            let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name);
+            host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+            let ok = match loaded {
+                Ok(schema) => {
+                    let r = host.engine.apply_schema(&name, schema).is_ok();
+                    if r {
+                        host.session.clear();
+                        // 【卡死修复】后台重建整句（重读补充语料语义）
+                        crate::reload_sentence_bg(true, true);
+                    }
+                    r
+                }
+                Err(_) => false,
+            };
             serde_json::json!({"ok": ok, "current": name})
         }
         // 语言栏右键「打开方案文件夹」：explorer 打开当前方案码表目录
@@ -956,7 +1013,15 @@ pub fn dispatch(
                 .get(&cur)
                 .cloned()
                 .unwrap_or_default();
-            match host.export_schema(None, &fmt) {
+            // 【流畅度二批 2026-11-07】导出两段式（同 HTTP /api/
+            // export_schema）：锁内快照，放锁后全表格式化写盘——旧
+            // 实现全程持锁（点一次导出全机按键排队 0.5-数秒）。
+            let plan = match host.export_snapshot(None, &fmt) {
+                Ok(p) => p,
+                Err(e) => return serde_json::json!({"error": format!("导出失败: {e}")}),
+            };
+            drop(host);
+            match crate::host::Host::export_execute(plan) {
                 Ok((path, n)) => {
                     let dir = std::path::Path::new(&path)
                         .parent()
@@ -1062,7 +1127,9 @@ pub fn dispatch(
                             if let Ok(mut c) = LAST_SKIN.lock() {
                                 *c = Some((want_ver, std::sync::Arc::clone(&v)));
                             }
-                            host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                            // 【流畅度二批 2026-11-07】此处不再 relock：本
+                            // 分支返回后 cand op 即结束，无后续 Host 读
+                            //（旧 relock 是 never-read 死赋值，白占锁）。
                             v
                         }
                     }
@@ -1268,6 +1335,13 @@ mod imp {
     /// （本机进程开 255 个静默连接占满 PIPE_UNLIMITED_INSTANCES）会让
     /// 监听线程 CreateNamedPipe 永败、合法 DLL 连不进。
     fn wait_avail(h: isize, deadline: Option<std::time::Instant>) -> bool {
+        // 【流畅度二批 2026-11-07】旧实现空闲期固定 sleep(2ms)：键帧
+        // 到达平均白等 ~1ms（最坏 2ms）才开始读——每键的单项最大确
+        // 定性浪费。改 DLL 侧 ipc.rs wait_response 已验证的分级等待
+        //（600µs 自旋→4ms 前 yield→20ms 前 1ms 短睡→之后 10ms）：
+        // 键帧（稳态 dispatch <3ms）几乎全部落在自旋/yield 段即时接
+        // 起；空转唤醒频率也从 500 次/秒降到长闲时的 100 次/秒。
+        let start = std::time::Instant::now();
         loop {
             let mut avail: u32 = 0;
             let ok = unsafe {
@@ -1290,7 +1364,18 @@ mod imp {
                 Some(d) if std::time::Instant::now() >= d => return false,
                 _ => {}
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            let el = start.elapsed();
+            if el.as_micros() < 600 {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+            } else if el.as_millis() < 4 {
+                std::thread::yield_now();
+            } else if el.as_millis() < 20 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 
@@ -1411,18 +1496,26 @@ mod imp {
                 Ok(v) => v,
                 Err(_) => serde_json::json!({"error": "服务内部错误（已恢复）"}),
             };
-            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|_| {
-                // 【Zero-length frame fix 2026-09-11】Old implementation wrote a len=0 frame on serialization failure
-                //(client interprets as disconnect) — write minimal error JSON instead
-                b"{\"error\":\"resp serialize failed\"}".to_vec()
-            });
-            if out.len() > RESP_BUF {
-                out = serde_json::json!({"error": "响应过大"})
-                    .to_string()
-                    .into_bytes();
+            // 【流畅度二批 2026-11-07】单缓冲帧写（DLL ipc.rs::call 同款）：
+            // 4B 长度占位 + to_writer 直写正文 + 回填长度——每响应 1 次
+            // 分配零拼接拷贝（旧实现 to_vec 出 body、to_vec 出头、extend
+            // 拼 frame = 3 次堆分配 + 1 次整帧 memcpy，每键都付）。
+            // 【Zero-length frame fix 2026-09-11】序列化失败写最小错误
+            // JSON 而非 len=0 帧（客户端视 0 长度为断连）。
+            let mut frame: Vec<u8> = Vec::with_capacity(512);
+            frame.extend_from_slice(&[0u8; 4]);
+            if serde_json::to_writer(&mut frame, &resp).is_err() {
+                frame.truncate(4);
+                frame.extend_from_slice(b"{\"error\":\"resp serialize failed\"}");
             }
-            let mut frame = (out.len() as u32).to_le_bytes().to_vec();
-            frame.extend_from_slice(&out);
+            if frame.len() - 4 > RESP_BUF {
+                frame.truncate(4);
+                frame.extend_from_slice(
+                    serde_json::json!({"error": "响应过大"}).to_string().as_bytes(),
+                );
+            }
+            let n = (frame.len() - 4) as u32;
+            frame[..4].copy_from_slice(&n.to_le_bytes());
             if write_all(h, &frame).is_err() {
                 break;
             }

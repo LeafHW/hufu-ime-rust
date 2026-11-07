@@ -273,25 +273,56 @@ fn source_for(data_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
     ssf.is_file().then_some(ssf)
 }
 
+/// 【流畅度二批 2026-11-07】bundle 进程内缓存：皮肤 op 每 2.5s 轮询
+/// 都要 bundle_for——旧实现命中 manifest 也得读盘+parse+逐图 stat
+///（0.3-2ms 且在 Host 锁内）。缓存键=源 (size,mtime)（源被覆盖/删除/
+/// 重导入时 mtime 必变，天然自愈无需显式失效），命中零读盘；缓存目录
+/// 被手删时 fallthrough 重走盘路径自愈。Arc 共享 definition 免深拷。
+static BUNDLE_MEM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u64, u64, std::sync::Arc<SsfBundle>)>>,
+> = std::sync::OnceLock::new();
+fn bundle_mem(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u64, std::sync::Arc<SsfBundle>)>>
+{
+    BUNDLE_MEM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// 取皮肤（缓存优先）。源未变且 manifest+used_images 齐 → 直接用缓存；
 /// 源变了 → 重解包；源文件缺失但缓存完整 → 降级用缓存（设计稿降级
 /// 矩阵「运行中被删→缓存继续用」；启动期回退由 host.heal_ssf_skin_config
 /// 负责，不走这里）。
-pub fn bundle_for(data_dir: &Path, id: &str) -> Result<SsfBundle, String> {
+pub fn bundle_for(data_dir: &Path, id: &str) -> Result<std::sync::Arc<SsfBundle>, String> {
     if !valid_id(id) {
         return Err(format!("皮肤 id 非法: {id:?}"));
+    }
+    // 【流畅度二批 2026-11-07】内存缓存快路径：源 (size,mtime) 未变且
+    // 缓存目录仍在 → 零读盘零 parse 直接回（只付 1 次 stat）。源缺失
+    // （被删）不走缓存（下面降级分支处理）。
+    let src_meta = source_for(data_dir, id).and_then(|src| {
+        std::fs::metadata(&src)
+            .ok()
+            .map(|m| (m.len(), mtime_nanos_of(&m)))
+    });
+    if let Some((size, mtime)) = src_meta.as_ref() {
+        if let Ok(map) = bundle_mem().lock() {
+            if let Some((s, t, arc)) = map.get(id) {
+                if *s == *size && *t == *mtime && arc.cache_dir.is_dir() {
+                    return Ok(std::sync::Arc::clone(arc));
+                }
+            }
+        }
     }
     let Some(src) = source_for(data_dir, id) else {
         // 源缺失：缓存降级（无 source 校验——能凑合渲染就行）
         let cache_dir = ssf_cache_root(data_dir).join(id);
         if let Some(man) = read_manifest(&cache_dir) {
             if used_images_ok(&cache_dir, &man.definition) {
-                return Ok(SsfBundle {
+                return Ok(std::sync::Arc::new(SsfBundle {
                     id: id.to_string(),
                     cache_dir,
                     def: man.definition,
                     fp: man.fp,
-                });
+                }));
             }
         }
         return Err(format!("皮肤文件不存在: {id}"));
@@ -305,12 +336,16 @@ pub fn bundle_for(data_dir: &Path, id: &str) -> Result<SsfBundle, String> {
                     && man.source.mtime == mtime
                     && used_images_ok(&cache_dir, &man.definition)
                 {
-                    return Ok(SsfBundle {
+                    let arc = std::sync::Arc::new(SsfBundle {
                         id: id.to_string(),
                         cache_dir,
                         def: man.definition,
                         fp: man.fp,
                     });
+                    if let Ok(mut map) = bundle_mem().lock() {
+                        map.insert(id.to_string(), (size, mtime, std::sync::Arc::clone(&arc)));
+                    }
+                    return Ok(arc);
                 }
             }
             // 负缓存命中（源未变且上次解包失败）→ 直接报上次的错，
@@ -318,18 +353,23 @@ pub fn bundle_for(data_dir: &Path, id: &str) -> Result<SsfBundle, String> {
             if let Some(e) = fail_cached(&src, size, mtime) {
                 return Err(e);
             }
-            unbundle(data_dir, &src)
+            let b = unbundle(data_dir, &src)?;
+            let arc = std::sync::Arc::new(b);
+            if let Ok(mut map) = bundle_mem().lock() {
+                map.insert(id.to_string(), (size, mtime, std::sync::Arc::clone(&arc)));
+            }
+            Ok(arc)
         }
         Err(_) => {
             // 源缺失：缓存降级（无 source 校验——能凑合渲染就行）
             if let Some(man) = read_manifest(&cache_dir) {
                 if used_images_ok(&cache_dir, &man.definition) {
-                    return Ok(SsfBundle {
+                    return Ok(std::sync::Arc::new(SsfBundle {
                         id: id.to_string(),
                         cache_dir,
                         def: man.definition,
                         fp: man.fp,
-                    });
+                    }));
                 }
             }
             Err(format!("皮肤文件不存在: {}", src.display()))
@@ -455,7 +495,7 @@ pub fn list_ssf(data_dir: &Path) -> Vec<SsfSkinEntry> {
                 error: None,
                 preview: thumb_source(&b.def).is_some(),
                 warnings: b.def.warnings.clone(),
-                id: b.id,
+                id: b.id.clone(),
             }),
             Err(e) => out.push(SsfSkinEntry {
                 name: id.clone(),
@@ -599,7 +639,7 @@ pub fn image_file(data_dir: &Path, id: &str, f: &str) -> Option<PathBuf> {
 pub fn mock_meta(data_dir: &Path, id: &str, horizontal: bool) -> Result<serde_json::Value, String> {
     let b = bundle_for(data_dir, id)?;
     let d = &b.def;
-    let ov = SsfOverrides::load(&b.cache_dir);
+    let ov = SsfOverrides::load_cached(&b.cache_dir);
     let horizontal = ov.horizontal.unwrap_or(horizontal);
     let lay = d
         .schemes
@@ -717,6 +757,40 @@ impl SsfOverrides {
         }
     }
 
+    /// 【流畅度二批 2026-11-07】mtime 缓存版 load：皮肤 op/预览等周期
+    /// 路径用（只付 1 次 stat；命中零读盘零 parse）。写侧（save/
+    /// tmp+rename）mtime 必变 → 天然失效，无需显式清理。
+    pub fn load_cached(cache_dir: &Path) -> Self {
+        static OV_MEM: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u64, SsfOverrides)>>,
+        > = std::sync::OnceLock::new();
+        let ov_mem = || {
+            OV_MEM.get_or_init(|| {
+                std::sync::Mutex::new(std::collections::HashMap::new())
+            })
+        };
+        let p = cache_dir.join(OVERRIDES_FILE);
+        let meta = std::fs::metadata(&p)
+            .ok()
+            .map(|m| (m.len(), mtime_nanos_of(&m)));
+        if let Some((size, mtime)) = meta.as_ref() {
+            if let Ok(map) = ov_mem().lock() {
+                if let Some((s, t, ov)) = map.get(&p) {
+                    if *s == *size && *t == *mtime {
+                        return ov.clone();
+                    }
+                }
+            }
+        }
+        let ov = Self::load(cache_dir);
+        if let Some((size, mtime)) = meta {
+            if let Ok(mut map) = ov_mem().lock() {
+                map.insert(p, (size, mtime, ov.clone()));
+            }
+        }
+        ov
+    }
+
     pub fn save(&self, cache_dir: &Path) -> Result<(), String> {
         let p = cache_dir.join(OVERRIDES_FILE);
         let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
@@ -773,7 +847,9 @@ pub fn skin_payload(data_dir: &Path, id: &str) -> Result<(serde_json::Value, Str
     // layout 注入 font_point/font_face/horizontal/show_index——DLL 侧
     // 读取路径（layout_f / horizontal_early / show_index）与 JSON 皮肤
     // 同键，零新消费代码。None 字段不注入（皮肤原值/默认值生效）。
-    let ov = SsfOverrides::load(&b.cache_dir);
+    // 【流畅度二批 2026-11-07】周期路径（皮肤 op 每 2.5s）换 mtime
+    // 缓存版：命中零读盘。
+    let ov = SsfOverrides::load_cached(&b.cache_dir);
     let code_color = ov.code_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.code_color));
     let first_color = ov.first_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.first_color));
     let text_color = ov.text_color.clone().unwrap_or_else(|| argb_to_rgba_hex(d.display.text_color));
@@ -1033,7 +1109,7 @@ mod tests {
         let data = tmp_data_dir("rehash");
         let zip = sample_zip();
         let (id, _) = import_ssf(&data, &zip, None).unwrap();
-        let fp0 = bundle_for(&data, &id).unwrap().fp;
+        let fp0 = bundle_for(&data, &id).unwrap().fp.clone();
         // 重写一个内容不同的包（同名覆盖）→ 指纹必须变
         let png2 = [9u8, 9, 9, 9];
         let zip2 = build_zip(&[
@@ -1042,7 +1118,7 @@ mod tests {
         ]);
         // 手动隔开 mtime（NTFS 100ns 粒度下连写可能同戳——改字节确保 sha 变）
         std::fs::write(ssf_skins_dir(&data).join(format!("{id}.ssf")), &zip2).unwrap();
-        let fp1 = bundle_for(&data, &id).unwrap().fp;
+        let fp1 = bundle_for(&data, &id).unwrap().fp.clone();
         assert_ne!(fp0, fp1, "内容变化 → sha 指纹变化");
         let _ = std::fs::remove_dir_all(&data);
     }

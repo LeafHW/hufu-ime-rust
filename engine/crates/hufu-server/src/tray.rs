@@ -514,17 +514,27 @@ fn schema_snapshot() -> (Vec<String>, String) {
 }
 
 /// 切换方案（与 POST /api/schema 同逻辑：换方案 + 清会话 + 重建整句 + 落盘）。
-/// pipe "set_schema" 在 dispatch 持锁内直做同逻辑（见 pipe.rs），不绕这里。
+/// pipe "set_schema" 在 dispatch 内同款两段式（见 pipe.rs）。
+/// 【流畅度二批 2026-11-07】装载段出锁：原实现持锁同步 switch_schema
+/// （装载 0.05-1s 顶全机按键）。托盘菜单点击到下一次打字通常 >1s，
+/// 装载早已完成，短锁应用零感知。
 fn switch_schema(name: &str) {
     let Some(shared) = SHARED.get() else { return };
+    let (data_dir, schema_dir) = {
+        let Ok(host) = shared.lock() else { return };
+        (host.data_dir.clone(), host.engine.config.schema.dir.clone())
+    };
+    let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, name);
     let Ok(mut host) = shared.lock() else { return };
-    if host.engine.switch_schema(name).is_ok() {
-        host.session.clear();
-        // 【卡死修复 2026-09-11】后台重建整句（旧 setup_sentence 持锁
-        // 载 546MB 模型秒级卡全机打字）。本线程持锁中——reload 内部
-        // 再 spawn 井线程等锁，无死锁。
-        crate::reload_sentence_bg(true, false);
-        let _ = host.engine.config.save(&host.config_path);
+    if let Ok(schema) = loaded {
+        if host.engine.apply_schema(name, schema).is_ok() {
+            host.session.clear();
+            // 【卡死修复 2026-09-11】后台重建整句（旧 setup_sentence 持锁
+            // 载 546MB 模型秒级卡全机打字）。本线程持锁中——reload 内部
+            // 再 spawn 井线程等锁，无死锁。
+            crate::reload_sentence_bg(true, false);
+            let _ = host.engine.config.save(&host.config_path);
+        }
     }
 }
 

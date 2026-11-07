@@ -908,11 +908,16 @@ impl Host {
     /// 导出）。当前方案用运行态（含本会话调频）；其它方案从磁盘重载
     ///（含其用户调整/用户词）。输出 数据\码表导出\<方案名> <yyyyMMdd-HHmm>.txt，
     /// 返回 (路径, 行数)。
-    pub fn export_schema(
+    /// 导出计划快照。【流畅度二批 2026-11-07】两段式：本方法在锁内
+    /// 只做参数判定+运行态克隆/路径计算（当前方案 clone 一次性几十
+    /// ms，Arc 字段共享码表）；秒级的全表格式化+写盘由 export_execute
+    /// 在调用方放锁后执行——旧实现全程持锁（设置页/托盘点一次导出
+    /// 即全机按键排队 0.5-数秒）。
+    pub fn export_snapshot(
         &self,
         name: Option<&str>,
         format: &str,
-    ) -> Result<(String, usize), String> {
+    ) -> Result<crate::host::ExportPlan, String> {
         let fmt = export_util::ExportFormat::parse(format);
         let current = self.engine.config.schema.current.clone();
         let target = name
@@ -928,14 +933,33 @@ impl Host {
             if !dir.is_dir() {
                 return Err(format!("方案目录不存在: {target}"));
             }
-            let schema = hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
             let out = self.export_out_path(&target, fmt);
-            let n = export_util::export_one(&schema, &out, fmt)?;
-            return Ok((out.to_string_lossy().into_owned(), n));
+            return Ok(crate::host::ExportPlan::Other(dir, out, fmt));
         }
         let out = self.export_out_path(&target, fmt);
-        let n = export_util::export_one(&self.engine.schema, &out, fmt)?;
-        Ok((out.to_string_lossy().into_owned(), n))
+        // 运行态快照（含会话调频/用户调整）——与旧锁内导出语义逐字一致。
+        Ok(crate::host::ExportPlan::Current(Box::new((
+            self.engine.schema.clone(),
+            out,
+            fmt,
+        ))))
+    }
+
+    /// 两段式第二段（锁外执行）：装载（其他方案）+ 全表格式化写盘。
+    pub fn export_execute(plan: crate::host::ExportPlan) -> Result<(String, usize), String> {
+        match plan {
+            crate::host::ExportPlan::Other(dir, out, fmt) => {
+                let schema =
+                    hufu_dict::Schema::load(&dir).map_err(|e| format!("方案加载失败: {e}"))?;
+                let n = export_util::export_one(&schema, &out, fmt)?;
+                Ok((out.to_string_lossy().into_owned(), n))
+            }
+            crate::host::ExportPlan::Current(boxed) => {
+                let (schema, out, fmt) = *boxed;
+                let n = export_util::export_one(&schema, &out, fmt)?;
+                Ok((out.to_string_lossy().into_owned(), n))
+            }
+        }
     }
 
     /// 导出文件路径：<安装根>\码表导出\<方案名>\<方案名> <yyyyMMdd-HHmm>.txt
@@ -1124,7 +1148,28 @@ impl Host {
     /// main::reload_sentence_bg 后台执行。teardown_old=方案变化（旧
     /// 模型词典不符，须先拆）；sentence-only 变化（权重等）保留旧模型
     /// 服务到新模型就位。
-    pub fn apply_config(&mut self, cfg: Config) -> std::io::Result<(bool, bool)> {
+    ///
+    /// 【流畅度二批 2026-11-07】pre=调用方锁外预装载的 schema：
+    /// `Some((发起时现值 current, 装载结果))`。设置页 /api/config、
+    /// settings_import、pipe config_set、云同步归并四处调用方先取快照
+    /// →放锁 load_schema_for→短锁 apply_config——消灭锁内 0.05-2s
+    /// 装载段（键路 p99 主要供给方）。窗口守卫：装载期间现值被第三方
+    /// 改走（≠发起时现值）→ 尊重第三方，本次放弃 schema 切换（cfg 的
+    /// schema 节对齐现值，其余配置照存）——不覆盖更新的切换。pre=None
+    /// 走原锁内装载（兜底，未预装载的调用方行为与旧版一致）。
+    pub fn apply_config(
+        &mut self,
+        mut cfg: Config,
+        pre: Option<(String, std::io::Result<hufu_dict::Schema>)>,
+    ) -> std::io::Result<(bool, bool)> {
+        let now_current = self.engine.config.schema.current.clone();
+        let now_dir = self.engine.config.schema.dir.clone();
+        if let Some((orig, _)) = pre.as_ref() {
+            if *orig != now_current {
+                cfg.schema.current = now_current.clone();
+                cfg.schema.dir = now_dir.clone();
+            }
+        }
         let sentence_changed = cfg.sentence != self.engine.config.sentence;
         let rerank_changed = sentence_changed;
         let schema_changed = cfg.schema.current != self.engine.config.schema.current
@@ -1147,18 +1192,30 @@ impl Host {
                     "方案名为空",
                 ));
             }
-            Some(
-                Engine::load_schema_for(&self.data_dir, &cfg.schema.dir, &cfg.schema.current)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "方案「{}」无法装载，配置未保存: {e}",
-                                cfg.schema.current
-                            ),
-                        )
-                    })?,
-            )
+            match pre {
+                // 调用方已锁外预装载：直接用（窗口守卫已保证未被弃）。
+                // 错误同样拦在落盘前（与锁内装载同文案）。
+                Some((_, Ok(s))) => Some(s),
+                Some((_, Err(e))) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("方案「{}」无法装载，配置未保存: {e}", cfg.schema.current),
+                    ))
+                }
+                // 兜底：调用方未预装载（旧路径）——锁内装载。
+                None => Some(
+                    Engine::load_schema_for(&self.data_dir, &cfg.schema.dir, &cfg.schema.current)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "方案「{}」无法装载，配置未保存: {e}",
+                                    cfg.schema.current
+                                ),
+                            )
+                        })?,
+                ),
+            }
         } else {
             None
         };
@@ -1205,7 +1262,10 @@ impl Host {
     /// 零调用；调用方直接走 crate::ssf::unbundle / host.ssf_bundle）。
 
     /// 取可用 .ssf 皮肤包（缓存优先；源缺失时降级用缓存）。
-    pub fn ssf_bundle(&self, id: &str) -> Result<crate::ssf::SsfBundle, String> {
+    pub fn ssf_bundle(
+        &self,
+        id: &str,
+    ) -> Result<std::sync::Arc<crate::ssf::SsfBundle>, String> {
         crate::ssf::bundle_for(&self.data_dir, id)
     }
 
@@ -1357,6 +1417,15 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 【流畅度二批 2026-11-07】导出计划（两段式导出的锁间载荷）：锁内
+/// export_snapshot 产出，锁外 export_execute 消费。
+pub enum ExportPlan {
+    /// 其他方案：目录 + 输出路径 + 格式（锁外磁盘装载）
+    Other(std::path::PathBuf, std::path::PathBuf, export_util::ExportFormat),
+    /// 当前方案运行态快照（含会话调频）+ 输出路径 + 格式
+    Current(Box<(hufu_dict::Schema, std::path::PathBuf, export_util::ExportFormat)>),
 }
 
 /// 导出码表辅助（host.export_schema 用）。

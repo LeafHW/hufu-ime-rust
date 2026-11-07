@@ -745,13 +745,35 @@ fn main() {
                             }
                             eprintln!("码表监视：组段迟迟未闭合，60s 到点强制全量重载");
                         }
+                        // 【流畅度二批 2026-11-07】重载装载段出锁
+                        //（原锁内 switch_schema = load 0.05-1s + apply，
+                        // 云同步落表后首键被顶）：取路径 → 放锁装载 →
+                        // 短锁应用。装载期间用户恰切方案 → apply_schema
+                        // 会写回 current=本线程快照名，属最后写入者赢
+                        //（与原同步版语义一致，窗口从"锁内串行"变为
+                        // "装载期并发"，错切面=码表监视恰在切方案瞬间
+                        // 触发重载，可接受）。
                         let ok = {
+                            let (data_dir, schema_dir) = {
+                                let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                                (h.data_dir.clone(), h.engine.config.schema.dir.clone())
+                            };
+                            let loaded = hufu_engine::Engine::load_schema_for(
+                                &data_dir,
+                                &schema_dir,
+                                &current,
+                            );
                             let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                            let r = h.engine.switch_schema(&current);
-                            if r.is_ok() {
-                                h.session.clear();
+                            match loaded {
+                                Ok(schema) => {
+                                    let r = h.engine.apply_schema(&current, schema);
+                                    if r.is_ok() {
+                                        h.session.clear();
+                                    }
+                                    r.is_ok()
+                                }
+                                Err(_) => false,
                             }
-                            r.is_ok()
                         };
                         if ok {
                             eprintln!(
@@ -2930,12 +2952,56 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             } else {
                 eprintln!("配置写入未带 rev（旧客户端/脚本），按覆盖处理并放行");
             }
+            let client_rev = v.get("rev").and_then(|x| x.as_u64());
             let cfg: hufu_config::Config = match serde_json::from_value(v) {
                 Ok(c) => c,
                 Err(e) => return Response::err(400, &format!("配置无效: {e}")),
             };
             let appearance_changed = cfg.appearance != host.engine.config.appearance;
-            match host.apply_config(cfg) {
+            // 【流畅度二批 2026-11-07】schema 变更段锁外预装载：原
+            // apply_config 锁内装载 0.05-2s 顶全机键（设置页保存/云同步
+            // 归并都走这里）。CAS 前查与解析仍在锁内；仅当整包带方案
+            // 切换时放锁装载，回锁后二次验 rev（装载窗口内他页又保存
+            // → 仍给 409，不覆盖）。
+            let need_load = cfg.schema.current != host.engine.config.schema.current
+                || cfg.schema.dir != host.engine.config.schema.dir;
+            let pre = if need_load && !cfg.schema.current.is_empty() {
+                let data_dir = host.data_dir.clone();
+                let orig_current = host.engine.config.schema.current.clone();
+                let cfg_dir = cfg.schema.dir.clone();
+                let cfg_current = cfg.schema.current.clone();
+                drop(host);
+                let loaded =
+                    hufu_engine::Engine::load_schema_for(&data_dir, &cfg_dir, &cfg_current);
+                host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                // 二次 CAS：装载窗口内他页已保存 → 409（与开头同款响应）
+                if let Some(cr) = client_rev {
+                    let cur = config_rev();
+                    if cr != cur {
+                        eprintln!(
+                            "配置 CAS 冲突（预装载后）：客户端 rev={cr}，当前 rev={cur}；返回 409"
+                        );
+                        let mut latest = serde_json::to_value(&host.engine.config)
+                            .unwrap_or(serde_json::Value::Null);
+                        if let Some(o) = latest.as_object_mut() {
+                            o.insert("rev".to_string(), serde_json::json!(cur));
+                        }
+                        return Response::json(&serde_json::json!({
+                            "error": "配置已被其他页面修改（请重载后再改，或确认覆盖）",
+                            "conflict": true,
+                            "rev": cur,
+                            "config": latest,
+                        }))
+                        .with_status(409);
+                    }
+                }
+                drop(host);
+                Some((orig_current, loaded))
+            } else {
+                None
+            };
+            host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+            match host.apply_config(cfg, pre) {
                 Ok((need_sentence, teardown)) => {
                     // 【逐候选字号 2026-10】外观节变化（开关/比例）推进皮肤
                     // 版本：DLL poll 见版本变化立即重拉载荷，免等 2.5s 轮询。
@@ -3011,7 +3077,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         if b.def.name.is_empty() {
                             cur.clone()
                         } else {
-                            b.def.name
+                            b.def.name.clone()
                         }
                     })
                     .unwrap_or_else(|_| cur.clone());
@@ -3374,16 +3440,21 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
         // 渲染公式（皮肤 JSON + GDI 文字 + 预乘 BGRA），输出 PNG 给设置页
         // 做「真机预览」；SSF 皮肤仍走 /api/skin/ssf-render。
         ("GET", "/api/skin/preview_frame") => {
-            let id = req
-                .query
-                .get("id")
-                .cloned()
-                .unwrap_or_else(|| host.engine.config.appearance.skin.clone());
+            // 【流畅度二批 2026-11-07】渲染+PNG 编码（10-40ms，scale=2
+            // 更糟）移出 Host 锁——皮肤页实时预览轮询期间打字键周期性
+            // 被顶的现行贡献源。锁内只取默认皮肤 id 与皮肤目录。
+            let (default_id, skins_dir) = {
+                let d = host.engine.config.appearance.skin.clone();
+                let s = host.skins_dir();
+                (d, s)
+            };
+            drop(host);
+            let id = req.query.get("id").cloned().unwrap_or(default_id);
             // 【审计 P2-B 2026-11-05】同 GET /api/skin：拼路径前过闸。
             if !valid_skin_id(&id) {
                 return Response::err(400, "非法皮肤 id");
             }
-            let path = host.skins_dir().join(format!("{id}.json"));
+            let path = skins_dir.join(format!("{id}.json"));
             let raw = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(_) => return Response::err(404, &format!("皮肤 {id} 不是 JSON 皮肤")),
@@ -3598,6 +3669,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 整条链路已删）。另带「默认字体」推荐：族名带「霞鹜」优先
             // （用户各机霞鹜版本名不完全一致，只按关键字匹配），没有
             // 霞鹜回微软雅黑——设置页空选/重置时自动落到它。
+            // 【流畅度二批 2026-11-07】GDI 枚举（首次 10-100ms）无 Host
+            // 依赖——放锁执行，字体页打开不再顶打字键。
+            drop(host);
             let mut families: Vec<String> = fontinfo::gdi_list_families_gb();
             let default = families
                 .iter()
@@ -3621,6 +3695,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 设置页选中即看真实字形——遍黑体/宋体/雅黑肉眼难辨的字重
             // 微差与衬线差异，一张图说清（渲染前 ensure_private_gdi_fonts
             // 已在启动时装载，文件夹字体族名直出）。
+            // 【流畅度二批 2026-11-07】GDI 样张渲染无 Host 依赖——放锁
+            // 执行（同 /api/fonts）。
+            drop(host);
             let family = req.query.get("family").cloned().unwrap_or_default();
             if family.is_empty() {
                 return Response::err(400, "family 缺失");
@@ -4186,9 +4263,12 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     }
                 }
             }
-            // 【T2-4 2026-11-07】落盘完毕，短锁应用配置（apply_config 内部
-            // schema 变更时的装载仍持锁——待引擎 prepare/apply 拆分后并
-            // 入锁外预载）。
+            // 【T2-4 2026-11-07】落盘完毕，短锁应用配置。
+            // 【流畅度二批 2026-11-07】schema 变更段锁外预装载（原
+            // apply_config 锁内装载 0.05-2s 顶全机键）：落盘期间运行
+            // 时漂移守卫仍在锁内比对；装载放锁外，装载期间再被切走
+            // 由 apply_config 的 orig 守卫兜底（现值≠发起时 → 放弃
+            // schema 切换只存其余）。
             let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
             // 【防回归修复(08-reg P3-2) 2026-11-07】导入落盘期间并发的
             // 运行时改动（Ctrl+M 切方案/云恢复等）不能被整份 apply_
@@ -4198,7 +4278,21 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if host.engine.config.schema.current != schema_at_start {
                 cfg.schema = host.engine.config.schema.clone();
             }
-            match host.apply_config(cfg) {
+            let need_load = cfg.schema.current != host.engine.config.schema.current
+                || cfg.schema.dir != host.engine.config.schema.dir;
+            let pre = if need_load && !cfg.schema.current.is_empty() {
+                let data_dir = host.data_dir.clone();
+                let orig = host.engine.config.schema.current.clone();
+                let d = cfg.schema.dir.clone();
+                let c = cfg.schema.current.clone();
+                drop(host);
+                let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
+                host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                Some((orig, loaded))
+            } else {
+                None
+            };
+            match host.apply_config(cfg, pre) {
                 Ok((need_sentence, teardown)) => {
                     if need_sentence {
                         reload_sentence_bg(teardown, true);
@@ -4375,10 +4469,17 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     "ok": true, "remembered": format, "name": target_name
                 }));
             }
-            match host.export_schema(
-                if name.is_empty() { None } else { Some(&name) },
-                &format,
-            ) {
+            // 【流畅度二批 2026-11-07】导出两段式：锁内只做快照（参数
+            // 判定+运行态 clone+路径），放锁后全表格式化写盘（0.5-数
+            // 秒）——旧实现全程持锁，点一次导出全机按键排队。
+            let plan = match host
+                .export_snapshot(if name.is_empty() { None } else { Some(&name) }, &format)
+            {
+                Ok(p) => p,
+                Err(e) => return Response::err(500, &format!("导出失败: {e}")),
+            };
+            drop(host);
+            match crate::host::Host::export_execute(plan) {
                 Ok((path, n)) => {
                     // 导出即达：文件管理器打开导出子文件夹（码表导出\<方案名>\）
                     if let Some(dir) = std::path::Path::new(&path).parent() {

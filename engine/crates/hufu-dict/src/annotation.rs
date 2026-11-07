@@ -72,7 +72,9 @@ impl AnnotationTable {
 
 /// 反查码表：`词\t码`（如小鹤双拼反查、五笔画）。
 /// 既是「码 → 词」的字典，也保留「词 → 码」用于回显主码。
-#[derive(Debug, Default)]
+/// 【流畅度二批 2026-11-07】补 Clone：导出码表两段化需要 Schema 快照
+///（Arc 字段廉价引用计数，HashMap 逐键复制，仅导出动作一次性付出）。
+#[derive(Debug, Default, Clone)]
 pub struct ReverseTable {
     /// 码 → 候选词（按行序）
     by_code: HashMap<String, Vec<String>>,

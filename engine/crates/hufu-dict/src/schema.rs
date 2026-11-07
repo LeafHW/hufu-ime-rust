@@ -10,6 +10,9 @@ use crate::user::{UserAdjust, UserDict};
 use std::path::{Path, PathBuf};
 
 /// 一个输入方案：主码表 + 符号 + 注释 + 反查 + 用户数据 + 构词规则。
+/// 【流畅度二批 2026-11-07】补 Clone：导出码表两段化——锁内快照、锁外
+/// 格式化写盘（秒级），消灭锁内全表导出。Arc 字段共享、集合字段深拷。
+#[derive(Clone)]
 pub struct Schema {
     pub name: String,
     pub dir: PathBuf,

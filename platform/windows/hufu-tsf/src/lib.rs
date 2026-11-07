@@ -677,7 +677,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
             g.cand2 = Some(w);
             g.skin = skin.clone();
             // 稳态窄窗：首显直接全尺寸（无入场动效）
-            g.last_show = Some((narrow.clone(), "nih".to_string(), 0));
+            g.last_show = Some(std::sync::Arc::new((narrow.clone(), "nih".to_string(), 0)));
             if let Some(c) = g.cand2.as_mut() {
                 c.show(&narrow, "nih", &skin, Some(&anchor), 0);
             }
@@ -707,7 +707,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
             // 冷启动重试：再窄显一次（下次 ensure_swapchain 已热）
             {
                 let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                g.last_show = Some((narrow.clone(), "nih".to_string(), 0));
+                g.last_show = Some(std::sync::Arc::new((narrow.clone(), "nih".to_string(), 0)));
                 if let Some(c) = g.cand2.as_mut() {
                     c.show(&narrow, "nih", &skin, Some(&anchor), 0);
                 }
@@ -717,7 +717,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         // 变宽起臂：换宽内容（阈值 24px 以上 → size_anim 武装）
         {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-            g.last_show = Some((wide.clone(), "nih".to_string(), 0));
+            g.last_show = Some(std::sync::Arc::new((wide.clone(), "nih".to_string(), 0)));
             if let Some(c) = g.cand2.as_mut() {
                 c.show(&wide, "nih", &skin, Some(&anchor), 0);
             }
@@ -1045,7 +1045,7 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
     // 等可见性没有意义——直接泵消息让布局/尺寸动效收敛。
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_show = Some((cands.clone(), String::new(), 0));
+        g.last_show = Some(std::sync::Arc::new((cands.clone(), String::new(), 0)));
         if let Some(c) = g.cand2.as_mut() {
             c.show(&cands, "", &skin, Some(&anchor), 0);
         }
@@ -1074,7 +1074,7 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
     // 起臂：sel 0 → 1（±1）。show 本身渲染「起点态」帧。
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_show = Some((cands.clone(), String::new(), 1));
+        g.last_show = Some(std::sync::Arc::new((cands.clone(), String::new(), 1)));
         if let Some(c) = g.cand2.as_mut() {
             c.show(&cands, "", &skin, Some(&anchor), 1);
         }
@@ -1131,7 +1131,7 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
     // 跨位：sel 1 → 4（|Δ|=3）→ 必须定格（无在身补间）
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_show = Some((cands.clone(), String::new(), 4));
+        g.last_show = Some(std::sync::Arc::new((cands.clone(), String::new(), 4)));
         if let Some(c) = g.cand2.as_mut() {
             c.show(&cands, "", &skin, Some(&anchor), 4);
         }
@@ -1167,7 +1167,7 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
     // readback 模式下稳态不重渲染；重推一次同目标帧再抓，作为「定格后」帧。
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_show = Some((cands.clone(), String::new(), 4));
+        g.last_show = Some(std::sync::Arc::new((cands.clone(), String::new(), 4)));
         if let Some(c) = g.cand2.as_mut() {
             c.show(&cands, "", &skin, Some(&anchor), 4);
         }
@@ -1284,7 +1284,7 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.cand2 = Some(w);
-        g.last_show = Some((narrow.clone(), "ni".to_string(), 0));
+        g.last_show = Some(std::sync::Arc::new((narrow.clone(), "ni".to_string(), 0)));
         g.skin = skin.clone();
         if let Some(c) = g.cand2.as_mut() {
             c.last_hide_at.set(None);
@@ -1396,7 +1396,7 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
     };
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_show = Some((wide.clone(), "nih".to_string(), 0));
+        g.last_show = Some(std::sync::Arc::new((wide.clone(), "nih".to_string(), 0)));
         g.skin = skin_slow.clone();
         if let Some(c) = g.cand2.as_mut() {
             c.show(&wide, "nih", &skin_slow, Some(&anchor), 0);

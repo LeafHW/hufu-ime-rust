@@ -507,7 +507,11 @@ pub struct Shared {
     pub last_key_ctx: Option<ITfContext>,
     /// 【滚轮缩放候选框】最近一次 show 的渲染参数（候选/编码/选中）：
     /// WM_MOUSEWHEEL 改字号后用它立即重绘（无键事件触发 update_ui）。
-    pub last_show: Option<(Vec<(String, String)>, String, usize)>,
+    /// 【流畅度二批 2026-11-07】Arc 化：动画 tick（5-20ms 周期）取此值
+    /// 的 clone 从深拷贝（候选列表逐字 String）变引用计数克隆。
+    pub last_show: Option<
+        std::sync::Arc<(Vec<(String, String)>, String, usize)>,
+    >,
     /// 【选重闪帧 2026-10-09】数字选重键上屏标记（页内下标）：引擎纯选
     /// 重路径在 state 里自带闪帧；锁+提前上屏路径（uru+3=指了指）state
     /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
@@ -587,6 +591,13 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// 【流畅度二批 2026-11-07】组段在身判定（composition 活跃三联，
+    /// 与 caps 钩子/看门狗同口径）：SSF 动图帧钟降帧等消费——组段
+    /// 在身时背景帧间隔钳 ≥66ms（≈15fps）。须持 Shared 锁调用。
+    pub fn comp_alive(&self) -> bool {
+        self.composition.is_some() || self.composing || !self.raw_last.is_empty()
+    }
+
     fn new() -> Shared {
         Shared {
             thread_mgr: None,
@@ -2009,7 +2020,7 @@ fn freq_enter(shared: &SharedRef, keys: &[usize], delete: bool) -> bool {
         let visible = g.cand2.as_ref().map(|c| c.is_visible()).unwrap_or(false);
         let has_cands = g
             .last_show
-            .as_ref()
+            .as_deref()
             .map(|(c, _, _)| !c.is_empty())
             .unwrap_or(false);
         if !visible || !has_cands {
@@ -2072,8 +2083,11 @@ fn freq_set_delete(shared: &SharedRef, on: bool) {
 /// 共享逻辑态 → 窗口渲染态 + 手动同参 show（cand_menu_refresh 同款
 /// take/show/put-back 骨架；show 全参数走让 size_anim 收放提示行）。
 fn freq_view_apply(shared: &SharedRef) {
-    let (active, del, pick, pick_text, last, skin, caret) = {
+    let (active, del, pick, pick_text, last, skin, caret, alive) = {
         let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        // 【流畅度二批 2026-11-07】组段镜像（SSF 帧钟降帧）+ last_show
+        // Arc 化（clone=引用计数）
+        let alive = g.comp_alive();
         (
             g.freq_active,
             g.freq_delete,
@@ -2082,6 +2096,7 @@ fn freq_view_apply(shared: &SharedRef) {
             g.last_show.clone(),
             g.skin.clone(),
             g.caret,
+            alive,
         )
     };
     let mut cand2 = {
@@ -2089,8 +2104,10 @@ fn freq_view_apply(shared: &SharedRef) {
         g.cand2.take()
     };
     if let Some(c) = cand2.as_mut() {
+        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+        c.comp_alive.set(alive);
         c.set_freq_view(active, del, pick, &pick_text);
-        if let Some((cands, raw, sel)) = last {
+        if let Some((cands, raw, sel)) = last.as_deref() {
             // 渲染口径与打字帧一致：inline 开=真编码不画（模态期编码行
             // 由提示行占用——T8 铁律不破）
             let inline_on = skin
@@ -2099,8 +2116,8 @@ fn freq_view_apply(shared: &SharedRef) {
                 .or_else(|| skin.get("layout").and_then(|l| l.get("inline_preedit")))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let raw_disp: String = if !inline_on { raw } else { String::new() };
-            c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+            let raw_disp: String = if !inline_on { raw.clone() } else { String::new() };
+            c.show(cands, &raw_disp, &skin, caret.as_ref(), *sel);
         }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -2126,8 +2143,10 @@ fn freq_digit(shared: &SharedRef, idx: usize) {
             g.freq_delete,
             g.freq_pick,
             g.freq_pick_text.clone(),
+            // 【流畅度二批 2026-11-07】last_show Arc 化：clone=引用计数，
+            // 内层字段经 Deref 访问
             g.last_show.clone(),
-            g.last_show.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default(),
+            g.last_show.as_deref().map(|(_, r, _)| r.clone()).unwrap_or_default(),
         )
     };
     if !active {
@@ -2141,15 +2160,17 @@ fn freq_digit(shared: &SharedRef, idx: usize) {
         freq_exit(shared);
         return;
     }
-    let Some((page, _raw, _sel)) = page else {
+    // 【流畅度二批 2026-11-07】last_show Arc 化：不再按值解构——page 即
+    // Arc 本体，候选列表经 page.0 访问（Deref）
+    let Some(page) = page else {
         return;
     };
-    if idx >= page.len().min(10) {
+    if idx >= page.0.len().min(10) {
         return; // 越界（页内没那么多候选）：无视，模态保持
     }
-    let text_j = page[idx].0.clone();
+    let text_j = page.0[idx].0.clone();
     if del {
-        let old_page = page.clone();
+        let old_page = page.0.clone();
         trace(&format!("freq: 删词 [{idx}]「{text_j}」"));
         if let Some(r) = crate::ipc::call(&serde_json::json!({
             "op": "cand_menu", "action": "del", "page_index": idx, "text": text_j, "raw": raw
@@ -2183,7 +2204,7 @@ fn freq_digit(shared: &SharedRef, idx: usize) {
         }
         Some(p) => {
             let text_i = if pick_text.is_empty() {
-                page.get(p).map(|(t, _)| t.clone()).unwrap_or_default()
+                page.0.get(p).map(|(t, _)| t.clone()).unwrap_or_default()
             } else {
                 pick_text
             };
@@ -7787,7 +7808,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                     }
                     // tick 复渲染读 shared.last_show——同步为闪帧（否则
                     // 动效 tick 拿旧组段帧把高亮拽回原位）。
-                    g.last_show = Some((flash, String::new(), sel_flash));
+                    // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
+                    g.last_show = Some(std::sync::Arc::new((flash, String::new(), sel_flash)));
                     g.rank_flash = None;
                 } else if let Some(idx) = g.rank_flash.take() {
                     // 【选重闪帧·锁路径兜底 2026-10-09】引擎 state 为空
@@ -7800,16 +7822,26 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                     } else {
                         None
                     };
-                    if let Some((lc, _, _)) = prior {
-                        let sel_flash = idx.min(lc.len() - 1);
+                    // 【流畅度二批 2026-11-07】last_show Arc 化：lc 即 Arc
+                    // 本体（filter 经 Deref 访问 .0），候选列表借 lc.0
+                    if let Some(lc) = prior {
+                        let sel_flash = idx.min(lc.0.len() - 1);
                         let skin_f = g.skin.clone();
                         let caret_f = g.caret;
+                        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                        //（alive 先取——cand2 可变借用期间不能再借 g）
+                        let alive = g.comp_alive();
                         if let Some(c) = g.cand2.as_mut() {
-                            c.show(&lc, "", &skin_f, caret_f.as_ref(), sel_flash);
+                            c.comp_alive.set(alive);
+                            c.show(&lc.0, "", &skin_f, caret_f.as_ref(), sel_flash);
                             c.hide();
                             flash_frame_rendered = true;
                         }
-                        g.last_show = Some((lc, String::new(), sel_flash));
+                        g.last_show = Some(std::sync::Arc::new((
+                            lc.0.clone(),
+                            String::new(),
+                            sel_flash,
+                        )));
                     } else if let Some(c) = g.cand2.as_mut() {
                         // 选重帧但闪帧被开关免掉：立即收窗 + 尾部渲染
                         // lanes 跳过（防旧候选复燃，见下分支注）。
@@ -8423,11 +8455,16 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                         }
                     }
                 }
+                // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                //（alive 须先取——cand2 可变借用期间不能再借 g）
+                let alive = g.comp_alive();
                 if let Some(c) = g.cand2.as_mut() {
+                    c.comp_alive.set(alive);
                     c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
                 }
             }
-            g.last_show = Some((cands.clone(), raw.clone(), sel));
+            // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
+            g.last_show = Some(std::sync::Arc::new((cands.clone(), raw.clone(), sel)));
         } else if crate::addword::in_window_thread() {
             // 【选词收窗·十八修】词框选字/删空后候选应收起（与主文档
             // 行为对齐——深度回归实测选 2 后候选窗滞留）
@@ -8959,13 +8996,19 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             }
         }
         if !content_empty {
+            // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+            //（TL 窗实例在线程局部——由 fade/expand TL tick 的取窗块刷新）
+            let alive = g.comp_alive();
             if crate::addword::in_window_thread() {
                 tl_cand_show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
             } else if crate::addword::is_open() {
                 // 【十五修】小窗开着：主线程跳过（残留窗防线二）
             } else {
                 match g.cand2.as_mut() {
-                    Some(c) => c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel),
+                    Some(c) => {
+                        c.comp_alive.set(alive);
+                        c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel)
+                    }
                     None => {}
                 }
             }
@@ -8973,7 +9016,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         // 【滚轮缩放候选框】缓存渲染参数：WM_MOUSEWHEEL 改字号后
         // 免键事件立即重绘（空帧保留旧值供退场渐隐复渲染）
         if !content_empty {
-            g.last_show = Some((cands.clone(), raw.clone(), sel));
+            // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
+            g.last_show = Some(std::sync::Arc::new((cands.clone(), raw.clone(), sel)));
         }
         // 显示完成：清除首帧抑制补显标记
         g.cand_shown_this_segment = true;
@@ -11409,7 +11453,12 @@ fn poll_tick() {
                 // 动画 tick（fade_tick TL 分支靠 last_show 复渲染）断粮，
                 // 入场/尺寸动画 armed 后一步不跑（实锤 tick取
                 // last_some=false）。先放回再按线程取窗。
-                if let Some((cands, raw2, sel)) = last {
+                // 【流畅度二批 2026-11-07】last_show Arc 化：as_deref 借用
+                // 取内层（候选/编码/选中），放回处原样还 Arc；TL 侧组段
+                // 镜像由线程内 fade/expand tick 的取窗块刷新
+                //（alive 先取——下方 cand2 可变借用期间不能再借 g）
+                let alive = g.comp_alive();
+                if let Some((cands, raw2, sel)) = last.as_deref() {
                     // 【框内不画编码·内联关闭放行 2026-10-11 用户实锤】
                     // 同 T8/内联回归修口径：皮肤重拉重绘帧的编码行也过
                     // inline_preedit 开关——开着恒空（真值留在 last_show），
@@ -11434,8 +11483,8 @@ fn poll_tick() {
                             })
                         });
                         let caret2 = anchor_rect.or(caret);
-                        tl_cand_show(&cands, &raw2_disp, &skin, caret2.as_ref(), sel);
-                        g.last_show = Some((cands, raw2, sel));
+                        tl_cand_show(cands, &raw2_disp, &skin, caret2.as_ref(), *sel);
+                        g.last_show = last;
                     } else if let Some(c) = g.cand2.as_mut() {
                         let anchor_rect = anchor.and_then(|a| {
                             let x = a.get("x").and_then(|v| v.as_i64())? as i32;
@@ -11448,11 +11497,13 @@ fn poll_tick() {
                             })
                         });
                         let caret2 = anchor_rect.or(caret);
-                        c.show(&cands, &raw2_disp, &skin, caret2.as_ref(), sel);
-                        g.last_show = Some((cands, raw2, sel));
+                        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                        c.comp_alive.set(alive);
+                        c.show(cands, &raw2_disp, &skin, caret2.as_ref(), *sel);
+                        g.last_show = last;
                     } else {
                         // 无可用窗：放回，别丢动画数据
-                        g.last_show = Some((cands, raw2, sel));
+                        g.last_show = last;
                     }
                 }
             }

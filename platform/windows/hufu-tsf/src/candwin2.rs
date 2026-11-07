@@ -473,13 +473,16 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
         // 1) 命中候选（客户端像素 → 内容逻辑坐标）
         let px = (lparam.0 as u16) as i16 as f32;
         let py = ((lparam.0 >> 16) as u16) as i16 as f32;
-        let (cands, raw, _sel) = match crate::tsf::G_SHARED.get() {
+        let last = match crate::tsf::G_SHARED.get() {
             Some(gsh) => {
                 let g = gsh.0.lock().unwrap_or_else(|e| e.into_inner());
+                // 【流畅度二批 2026-11-07】last_show Arc 化：clone 变引用
+                // 计数克隆（不再深拷贝候选列表）
                 g.last_show.clone().unwrap_or_default()
             }
             None => return,
         };
+        let (cands, raw, _sel) = (&last.0, &last.1, last.2);
         if cands.is_empty() {
             return;
         }
@@ -659,7 +662,7 @@ unsafe fn cand_menu_popup(lparam: LPARAM) {
             w: menu_w,
             h: menu_h,
             text,
-            raw,
+            raw: raw.clone(),
             idx,
             n,
         });
@@ -709,13 +712,19 @@ unsafe fn cand_menu_refresh(resp: &Value) {
             // ②同步 cand_sig_last=本帧签名——110ms 后停顿轮询看到
             //   「无变化」直接跳过（此前打架/飘/重复帧的根源=签名没
             //   同步，轮询再画一遍）。
-            let (mut cand2, skin, caret) = {
+            let (mut cand2, skin, caret, alive) = {
                 let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                g.last_show = Some((cands.clone(), raw.clone(), sel));
+                // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
+                //（tick 侧 clone 从深拷贝变引用计数克隆）
+                g.last_show = Some(std::sync::Arc::new((cands.clone(), raw.clone(), sel)));
                 g.cand_sig_last = crate::tsf::state_sig(state);
-                (g.cand2.take(), g.skin.clone(), g.caret)
+                // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                //（SSF 动图帧钟降帧用，见字段注释）
+                let alive = g.comp_alive();
+                (g.cand2.take(), g.skin.clone(), g.caret, alive)
             };
             if let Some(c) = cand2.as_mut() {
+                c.comp_alive.set(alive);
                 // 【T8 用户铁律·框内不画编码 2026-10-07 终局】调频帧
                 // 与打字帧同一渲染铁律：只画候选，编码恒不画（宽度恒
                 // 定=框无从挪动；两帧同长相=无翻脸可言）。真 raw 仍写
@@ -787,12 +796,15 @@ pub(crate) unsafe fn freq_result_refresh(
         ));
         if let Some(gsh) = crate::tsf::G_SHARED.get() {
             let shared = gsh.0.clone();
-            let (mut cand2, skin, caret, fv) = {
+            let (mut cand2, skin, caret, fv, alive) = {
                 let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                 // 新序写 last_show（110ms 轮询签名同步防打架——与
                 // cand_menu_refresh 同款铁律）；动效旧序只活在窗口侧。
-                g.last_show = Some((cands.clone(), raw.clone(), sel));
+                // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
+                g.last_show = Some(std::sync::Arc::new((cands.clone(), raw.clone(), sel)));
                 g.cand_sig_last = crate::tsf::state_sig(state);
+                // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                let alive = g.comp_alive();
                 (
                     g.cand2.take(),
                     g.skin.clone(),
@@ -803,9 +815,12 @@ pub(crate) unsafe fn freq_result_refresh(
                         g.freq_pick,
                         g.freq_pick_text.clone(),
                     ),
+                    alive,
                 )
             };
             if let Some(c) = cand2.as_mut() {
+                // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+                c.comp_alive.set(alive);
                 // 先同步模态视图（拾起环跟到新槽位/提示行换词），再臂
                 // 动效、show——单次渲染出全效果
                 c.set_freq_view(fv.0, fv.1, fv.2, &fv.3);
@@ -1129,7 +1144,7 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 if new_pt > 0.0 {
                     if let Some(gsh) = crate::tsf::G_SHARED.get() {
                         let shared = gsh.0.clone();
-                        let (mut cand2, mut last, skin, caret) = {
+                        let (mut cand2, last, skin, caret, alive) = {
                             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
                             let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
                                 l["font_point"] = serde_json::json!(new_pt);
@@ -1151,10 +1166,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                                 g.skin_stale = false;
                                 g.skin_loaded_at = std::time::Instant::now();
                             }
-                            (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret)
+                            // 【流畅度二批 2026-11-07】组段镜像：show 前刷
+                            let alive = g.comp_alive();
+                            (g.cand2.take(), g.last_show.take(), g.skin.clone(), g.caret, alive)
                         };
-                        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_mut())
+                        if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_deref())
                         {
+                            // 【流畅度二批 2026-11-07】last_show Arc 化：
+                            // as_deref 借用取内层（take/原样放回语义不变）
+                            c.comp_alive.set(alive);
                             c.show(cands, raw, &skin, caret.as_ref(), *sel);
                         }
                         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -2535,6 +2555,33 @@ fn freq_hint_fit(
     }
 }
 
+/// 【流畅度二批 2026-11-07】固定色画刷取用（每窗小缓存）：同色零
+/// CreateSolidColorBrush——键=颜色量化 [r,g,b,a]×255（≤1/255 误差
+/// 不可辨）；上限 32 超限整表清空（命中热点总在前）。仅固定色调用
+/// 点使用；插值色（freq 淡变等每帧变值）不得走此缓存。
+fn cached_brush(
+    cache: &std::cell::RefCell<std::collections::HashMap<[u32; 4], ID2D1SolidColorBrush>>,
+    ctx: &ID2D1DeviceContext,
+    c: D2D1_COLOR_F,
+) -> Option<ID2D1SolidColorBrush> {
+    let key = [
+        (c.r * 255.0) as u32,
+        (c.g * 255.0) as u32,
+        (c.b * 255.0) as u32,
+        (c.a * 255.0) as u32,
+    ];
+    let mut m = cache.borrow_mut();
+    if let Some(b) = m.get(&key) {
+        return Some(b.clone());
+    }
+    let b = unsafe { ctx.CreateSolidColorBrush(&c, None).ok()? };
+    if m.len() >= 32 {
+        m.clear();
+    }
+    m.insert(key, b.clone());
+    Some(b)
+}
+
 /// 【按住Ctrl调频·拾起环】拾起候选的强调描边：外扩 (1-pulse)·3px 的
 /// 圆角环由外向内收拢（150ms 脉冲）+ 低透强调底衬。非模态调用无效果
 ///（brush=None）。
@@ -2714,6 +2761,20 @@ pub struct CandidateWindowV2 {
         Option<std::collections::HashMap<(u64, u32, usize, u32, u32), IDWriteTextLayout>>,
     /// 同上，measure 路径的实测宽度缓存（文本哈希、长度、字体格式指针、行高）。
     pub(crate) text_measure_cache: Option<std::collections::HashMap<(u64, u32, usize, u32), f32>>,
+    /// 【流畅度二批 2026-11-07】每窗固定色画刷缓存：键=量化 [r,g,b,a]，
+    /// 值=ID2D1SolidColorBrush——每帧 5-10 支 CreateSolidColorBrush 的
+    /// 同色零重建（上限 32，超限清空——热点色总在前）。设备重建/字体
+    /// 档重建时清空。**插值色（freq 淡变/删除濒死/红闪）不走缓存**：
+    /// 每帧变值只会撑爆缓存，保持现状直建。
+    pub(crate) brush_cache: std::cell::RefCell<
+        std::collections::HashMap<[u32; 4], ID2D1SolidColorBrush>,
+    >,
+    /// 【流畅度二批 2026-11-07】组段在身镜像（composition 活跃三联，
+    /// 由持 Shared 锁的调用方在 show 前刷新）：SSF 动图帧钟降帧消费
+    /// ——组段在身时背景帧间隔钳 ≥66ms（≈15fps），组段闭合恢复原速。
+    /// 不在 show 尾直接读 Shared：update_ui 等车道持锁调 show，再锁
+    /// 即自锁；镜像经窗体 Cell 传递无锁。
+    pub(crate) comp_alive: std::cell::Cell<bool>,
     /// 【2026-11-03 M4】SSF 皮肤描述解析缓存（fp+cache_dir 不变时零重复
     /// serde/INI 解析；变体选择与取图仍每帧走轻量路径）。
     pub(crate) ssf_spec_cache:
@@ -3406,6 +3467,9 @@ impl CandidateWindowV2 {
             last_pos_anchored: std::cell::Cell::new(false),
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                // 【流畅度二批 2026-11-07】画刷缓存/组段镜像初始（见字段注释）
+                brush_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+                comp_alive: std::cell::Cell::new(false),
                 size_ms: 90,
                 size_anim_dur: std::cell::Cell::new(90),
                 size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
@@ -3628,6 +3692,9 @@ impl CandidateWindowV2 {
             last_pos_anchored: std::cell::Cell::new(false),
                         size_anim: None,
                 chrome_override: std::cell::Cell::new(None),
+                // 【流畅度二批 2026-11-07】画刷缓存/组段镜像初始（见字段注释）
+                brush_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+                comp_alive: std::cell::Cell::new(false),
                 size_ms: 90,
                 size_anim_dur: std::cell::Cell::new(90),
                 size_anim_last_render: std::cell::Cell::new(std::time::Instant::now()),
@@ -4133,6 +4200,9 @@ impl CandidateWindowV2 {
         self.shadow_cache = None;
         self.text_layout_cache = None;
         self.text_measure_cache = None;
+        // 【流畅度二批 2026-11-07】画刷绑旧设备——设备重建后一并清空，
+        // 防新 ctx 复用旧设备画刷（连环失败同 shadow_cache）
+        self.brush_cache.borrow_mut().clear();
         *self.ssf.borrow_mut() = None;
         self.ssf_spec_cache = None;
         self.ssf_fail = None;
@@ -5422,6 +5492,9 @@ impl CandidateWindowV2 {
             if created_any {
                 layout_cache.borrow_mut().clear();
                 measure_cache.borrow_mut().clear();
+                // 【流畅度二批 2026-11-07】字体档重建=换皮/字号变：画刷
+                // 缓存一并清空（旧皮颜色滞留无意义，防跨皮串色）
+                self.brush_cache.borrow_mut().clear();
             }
 
             // 【放大滑动 v2·回退 2026-10-29】插值字号整体删除（用户拍板：
@@ -6228,6 +6301,10 @@ impl CandidateWindowV2 {
                         // 重放旧 effect（旧 blur、旧 shadow_m 坐标的圆角矩形）
                         // 画进新窗口，阴影与窗体错位（用户实测「偶发阴影和
                         // 候选分离」的根因）。
+                        // 【流畅度二批 2026-11-07】形变帧标记：尺寸动画在途
+                        //（chrome_override 在身=本帧渲染尺寸 ≠ 上一用户帧
+                        // 终尺寸）——下方「复用旧阴影拉伸绘制」分支用。
+                        let shadow_morphing = self.chrome_override.get().is_some();
                         let sc_packed = ((sc.r * 255.0) as u32)
                             | (((sc.g * 255.0) as u32) << 8)
                             | (((sc.b * 255.0) as u32) << 16)
@@ -6318,21 +6395,113 @@ impl CandidateWindowV2 {
                                         return Some(());
                                     }
                                 }
+                                // 【流畅度二批 2026-11-07】形变帧复用阴影缓存：
+                                // 尺寸动画在途时 chw/chh 逐帧变→精确键必然 miss
+                                // →每帧全量重建（CreateCommandList+FillRounded
+                                // Rectangle+CreateEffect+SetValue×2，0.3-2ms/帧）。
+                                // 改为复用缓存里的旧 command list，按新旧宽高比
+                                // 拉伸 DrawImage——阴影是模糊剪影，150ms 过渡内
+                                // 缩放视觉不可辨；圆角随拉伸近似（椭圆角）。
+                                // 拉伸锚定窗口几何原点（shadow_m 边距不随比例
+                                // 放大）；不更新缓存（稳态帧仍按精确键命中/
+                                // 重建，缓存语义不变）；首次形变（缓存空或键
+                                // 其余分量不符）落回下方重建路径。
+                                if shadow_morphing {
+                                    if let Some((k, v)) = &shadow_cache_in {
+                                        if k.0 > 0
+                                            && k.1 > 0
+                                            && k.2 == sh_key.2
+                                            && k.3 == sh_key.3
+                                            && k.4 == sh_key.4
+                                            && k.5 == sh_key.5
+                                            && k.6 == sh_key.6
+                                        {
+                                            let kx = chw.max(1.0) / (k.0 as f32);
+                                            let ky = chh.max(1.0) / (k.1 as f32);
+                                            if kx.is_finite()
+                                                && ky.is_finite()
+                                                && kx > 0.0
+                                                && ky > 0.0
+                                            {
+                                                let eff_img: ID2D1Image =
+                                                    v.1.cast().ok()?;
+                                                // 几何原点（物理 px）：旧 list 的
+                                                // 圆角矩形左上角拉伸后仍落原点
+                                                //——阴影边沿跟随外壳。
+                                                let gx = (shadow_m + bx) * dpi_scale;
+                                                let gy = (shadow_m + by) * dpi_scale;
+                                                ctx.SetTransform(
+                                                    &windows::Foundation::Numerics::Matrix3x2 {
+                                                        M11: 1.0,
+                                                        M12: 0.0,
+                                                        M21: 0.0,
+                                                        M22: 1.0,
+                                                        M31: 0.0,
+                                                        M32: 0.0,
+                                                    },
+                                                );
+                                                let mask_ok = push_shadow_mask(
+                                                    &ctx, chw, chh, cw_out, ch_out, shadow_m,
+                                                    radius, dpi_scale, bx, by,
+                                                );
+                                                ctx.SetTransform(
+                                                    &windows::Foundation::Numerics::Matrix3x2 {
+                                                        M11: kx,
+                                                        M12: 0.0,
+                                                        M21: 0.0,
+                                                        M22: ky,
+                                                        M31: gx - kx * gx,
+                                                        M32: gy - ky * gy,
+                                                    },
+                                                );
+                                                // 偏移随 kx/ky 缩放（几 px 内的形变
+                                                // 期误差，模糊剪影不可辨）；口径对
+                                                // 齐命中分支（identity 下物理像素）。
+                                                let off = D2D_POINT_2F {
+                                                    x: shadow_off_x * dpi_scale,
+                                                    y: shadow_off_y * dpi_scale,
+                                                };
+                                                ctx.DrawImage(
+                                                    &eff_img,
+                                                    Some(&off as *const _),
+                                                    None,
+                                                    D2D1_INTERPOLATION_MODE_LINEAR,
+                                                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                                                );
+                                                ctx.SetTransform(
+                                                    &windows::Foundation::Numerics::Matrix3x2 {
+                                                        M11: dpi_scale,
+                                                        M12: 0.0,
+                                                        M21: 0.0,
+                                                        M22: dpi_scale,
+                                                        M31: 0.0,
+                                                        M32: 0.0,
+                                                    },
+                                                );
+                                                if mask_ok {
+                                                    ctx.PopLayer();
+                                                }
+                                                return Some(());
+                                            }
+                                        }
+                                    }
+                                }
                                 let cl = ctx.CreateCommandList().ok()?;
                                 let saved = ctx.GetTarget().ok();
                                 let cl_img: ID2D1Image = cl.cast().ok()?;
                                 ctx.SetTarget(Some(&cl_img));
-                                let wb = ctx
-                                    .CreateSolidColorBrush(
-                                        &D2D1_COLOR_F {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 1.0,
-                                        },
-                                        None,
-                                    )
-                                    .ok()?;
+                                // 【流畅度二批 2026-11-07】固定黑画刷走每窗
+                                // 缓存（重建路径本身已因形变复用而变稀）
+                                let wb = cached_brush(
+                                    &self.brush_cache,
+                                    &ctx,
+                                    D2D1_COLOR_F {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 1.0,
+                                    },
+                                )?;
                                 let rr_win = D2D1_ROUNDED_RECT {
                                     rect: D2D_RECT_F {
                                         left: shadow_m + bx,
@@ -6596,7 +6765,8 @@ impl CandidateWindowV2 {
                         }
                     }
                     if bg_c.a > 0.004 && ssf.is_none() {
-                        if let Ok(b) = ctx.CreateSolidColorBrush(&bg_c, None) {
+                        // 【流畅度二批 2026-11-07】固定底色画刷走每窗缓存
+                        if let Some(b) = cached_brush(&self.brush_cache, &ctx, bg_c) {
                             let rr = D2D1_ROUNDED_RECT {
                                 rect: D2D_RECT_F {
                                     left: bx,
@@ -6660,9 +6830,14 @@ impl CandidateWindowV2 {
                     c.a = 1.0;
                     c
                 };
+                // 【流畅度二批 2026-11-07】固定色画刷走每窗缓存：文字/
+                // 序号/注释/高亮/差异段/边框等每帧 5-10 支创建→同色零
+                // 重建。捕获字段级借用（brush_cache），与块后 put-back
+                //（self.tf_cache=…）字段不相交、无借用冲突。
+                let brush_cache_cell = &self.brush_cache;
                 let mkbrush =
                     |ctx: &ID2D1DeviceContext, c: D2D1_COLOR_F| -> Option<ID2D1SolidColorBrush> {
-                        ctx.CreateSolidColorBrush(&c, None).ok()
+                        cached_brush(brush_cache_cell, ctx, c)
                     };
                 let b_text = mkbrush(
                     &ctx,
@@ -8462,8 +8637,19 @@ impl CandidateWindowV2 {
             }
             // 【2026-11-03 M4】静态布局/测量缓存换回（RefCell::replace：
             // 闭包仍持 &layout_cache 时也能取走，无需 move）。
-            self.text_layout_cache = Some(layout_cache.replace(Default::default()));
-            self.text_measure_cache = Some(measure_cache.replace(Default::default()));
+            // 【流畅度二批 2026-11-07】put back 封顶：>1024 条直接清空
+            //——命中热点在最近条目，防长会话无上限慢泄漏（此前仅设备
+            // 重建/字体重建两处清空，正常使用只进不出）。
+            let mut lc = layout_cache.replace(Default::default());
+            if lc.len() > 1024 {
+                lc.clear();
+            }
+            self.text_layout_cache = Some(lc);
+            let mut mc = measure_cache.replace(Default::default());
+            if mc.len() > 1024 {
+                mc.clear();
+            }
+            self.text_measure_cache = Some(mc);
             if crate::tsf::trace_on() && std::env::var("HUFU_LAYOUT_STATS").is_ok() {
                 use std::sync::atomic::Ordering;
                 crate::tsf::trace(&format!(
@@ -8910,7 +9096,17 @@ impl CandidateWindowV2 {
                     .filter(|rt| rt.bitmap.is_animated())
                     .map(|rt| {
                         let (_, rem) = rt.clock.current(&rt.bitmap);
-                        rem.max(20)
+                        // 【流畅度二批 2026-11-07】SSF 动图打字期待降帧：
+                        // 组段在身（comp_alive 镜像，各 show 调用点持锁
+                        // 刷新）时帧钟目标间隔钳 ≥66ms（≈15fps）——打字
+                        // 期背景动画 15fps 视觉无感（模糊背景），低端机
+                        // 整窗重渲最高 50→15 次/秒；组段闭合恢复原速。
+                        // 静态图路径不受影响（上方 is_animated 已滤）。
+                        if self.comp_alive.get() {
+                            rem.max(66)
+                        } else {
+                            rem.max(20)
+                        }
                     });
                 match arm {
                     Some(ms) => {
@@ -9196,9 +9392,13 @@ pub const HIDE_LATER_TIMER_ID: usize = 0x4846_5552; // 'HuFb'
 ///（4.2ms/帧）每 3.7 帧才 1 步=高刷用户必见跳帧。曾降至 5ms + 进程
 /// 时钟精度 timeBeginPeriod(1)。
 /// 【2026-11-03 帧截止】固定 5ms tick 在 60Hz 屏上被「帧门 >= ceil(16.7)=17」
-/// 量化成 20ms/帧（实际 50fps）。改为按窗口所在显示器帧距自适应：
-/// 60Hz→17ms / 144Hz→7ms / 240Hz→5ms（4..20ms），每 tick 至多一帧；
-/// 帧门用「周期-2ms」容差吸收 timer 抖动，60Hz 不再掉到 50fps。
+/// 量化成 20ms/帧（实际 50fps）。改为按窗口所在显示器帧距自适应，
+/// 每 tick 至多一帧；帧门用「周期-2ms」容差吸收 timer 抖动，60Hz 不再
+/// 掉到 50fps。
+/// 【流畅度二批 2026-11-07】帧距取整 ceil→floor（60Hz→16ms /
+/// 144Hz→6ms / 240Hz→4ms，钳 4..20 不变）：tick 略快于 vsync——多出
+/// 的空 tick 由「周期-2ms」帧门幂等拦截（间隔不足直接跳过本帧渲染），
+/// 165/240Hz 不再因 ceil 量化（43/21ms 周期微顿）丢帧。
 pub const FADE_TICK_MIN_MS: u32 = 4;
 pub const FADE_TICK_MAX_MS: u32 = 20;
 
@@ -9714,12 +9914,23 @@ unsafe fn ssf_frame_tick(hwnd: HWND) {
     let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
-    let (mut cand2, last, skin, caret) = {
+    let (mut cand2, last, skin, caret, alive) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.cand2_busy = true;
-        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+        // 【流畅度二批 2026-11-07】组段镜像（帧钟降帧）+ last_show Arc
+        // 化（clone=引用计数）
+        let alive = g.comp_alive();
+        (
+            g.cand2.take(),
+            g.last_show.clone(),
+            g.skin.clone(),
+            g.caret,
+            alive,
+        )
     };
-    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_deref()) {
+        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+        c.comp_alive.set(alive);
         let act = c.ssf.borrow().as_ref().and_then(|rt| {
             if !rt.bitmap.is_animated() {
                 return None;
@@ -9736,10 +9947,13 @@ unsafe fn ssf_frame_tick(hwnd: HWND) {
             Some((idx, rem, last_frame)) => {
                 if Some(idx) == last_frame {
                     // 帧未推进：只重臂（几何动效由 FADE_TIMER 自行整帧重绘）
-                    let _ = SetTimer(hwnd, crate::ssfwin::SSF_TIMER_ID, rem.max(20), None);
+                    // 【流畅度二批 2026-11-07】组段在身：帧钟钳 ≥66ms
+                    //（≈15fps，打字期背景动画降帧；组段闭合恢复原速）
+                    let ms = if alive { rem.max(66) } else { rem.max(20) };
+                    let _ = SetTimer(hwnd, crate::ssfwin::SSF_TIMER_ID, ms, None);
                 } else if c.is_visible() {
                     c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                     c.internal_rerender = false;
                     // show 尾部已按新帧的「距下帧剩余」重臂变间隔钟
                 } else {
@@ -9793,16 +10007,22 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 gsh.0.clone()
             }
         };
-        let (mut tl, last, skin) = {
+        let (mut tl, last, skin, alive) = {
             let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            // 【流畅度二批 2026-11-07】组段镜像（SSF 帧钟降帧）+
+            // last_show Arc 化（clone=引用计数）
+            let alive = g.comp_alive();
             (
                 crate::tsf::tl_cand_take(),
                 g.last_show.clone(),
                 g.skin.clone(),
+                alive,
             )
         };
         let mut anim_done = true;
-        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last) {
+        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last.as_deref()) {
+            // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+            c.comp_alive.set(alive);
             if let Some((f, t, t0)) = c.size_anim {
                 let ms = t0.elapsed().as_millis() as u32;
                 let cur = size_ease(f, t, ms, c.size_anim_dur.get().max(1));
@@ -9831,7 +10051,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 };
                 if c.is_visible() && render_ok {
                     c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, None, sel);
+                    let _ = c.show(cands, raw, &skin, None, *sel);
                     c.internal_rerender = false;
                 }
             }
@@ -9942,7 +10162,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 };
                 if c.is_visible() && render_ok {
                     c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, None, sel);
+                    let _ = c.show(cands, raw, &skin, None, *sel);
                     c.internal_rerender = false;
                 }
             }
@@ -9961,15 +10181,20 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
     let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
-    let (mut cand2, last, skin, caret) = {
+    let (mut cand2, last, skin, caret, alive) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【动效窗口让渡】标记持有中——TSF 线程此刻 is_none() 不新建
         // 第二窗（短等放回），组段收尾挂 pending_cand_hide
         g.cand2_busy = true;
-        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+        // 【流畅度二批 2026-11-07】组段镜像（SSF 帧钟降帧）+
+        // last_show Arc 化（tick 每 5-20ms 一次的深拷贝→引用计数）
+        let alive = g.comp_alive();
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret, alive)
     };
     let mut anim_done = true;
-    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_deref()) {
+        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+        c.comp_alive.set(alive);
         // 【高亮字号补间步进 2026-11-04】时间基准按步界量化：只有跨过
         // 1/3、2/3、3/3 才推进 fs_cur 并重排一次 → 每程 ≤3 次重排/重绘。
         // 必须放在 size/hl 复渲染分支之前：本拍若有其它动效已在渲帧，
@@ -10049,7 +10274,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             };
             if c.is_visible() && render_ok {
                 c.internal_rerender = true;
-                let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                 c.internal_rerender = false;
                 rendered_this_tick = true;
             }
@@ -10204,7 +10429,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             };
             if c.is_visible() && render_ok {
                 c.internal_rerender = true;
-                let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                 c.internal_rerender = false;
                 rendered_this_tick = true;
             }
@@ -10217,7 +10442,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
         if fs_step_due && !rendered_this_tick && (c.is_visible() || c.readback) {
             let t_frame = std::time::Instant::now();
             c.internal_rerender = true;
-            let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
             c.internal_rerender = false;
             c.fs_last_render_us
                 .set(t_frame.elapsed().as_micros().min(u32::MAX as u128) as u32);
@@ -10281,7 +10506,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 *c.freq_del.borrow_mut() = None;
                 if c.is_visible() {
                     c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                     c.internal_rerender = false;
                 }
                 // 退场淡变+行收起仍需 tick
@@ -10301,7 +10526,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 };
                 if c.is_visible() && render_ok {
                     c.internal_rerender = true;
-                    let _ = c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+                    let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                     c.internal_rerender = false;
                 }
             } else if freq_modal && ctrl_physical {
@@ -10361,20 +10586,26 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
                 gsh.0.clone()
             }
         };
-        let (mut tl, last, skin) = {
+        let (mut tl, last, skin, alive) = {
             let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            // 【流畅度二批 2026-11-07】组段镜像（SSF 帧钟降帧）+
+            // last_show Arc 化（clone=引用计数）
+            let alive = g.comp_alive();
             (
                 crate::tsf::tl_cand_take(),
                 g.last_show.clone(),
                 g.skin.clone(),
+                alive,
             )
         };
-        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last) {
+        if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last.as_deref()) {
+            // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+            c.comp_alive.set(alive);
             if !c.comments_expanded {
                 c.comments_expanded = true;
                 let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
                 // 【锚点修正·二十二修】同 fade tick：anchor=None 钉 sticky
-                c.show(&cands, &raw, &skin, None, sel);
+                c.show(cands, raw, &skin, None, *sel);
             }
         }
         crate::tsf::tl_cand_put_back(tl);
@@ -10384,17 +10615,21 @@ unsafe fn expand_tick_shared(hwnd: HWND) {
     let Some(shared) = tick_shared_for_hwnd(hwnd) else {
         return;
     };
-    let (mut cand2, last, skin, caret) = {
+    let (mut cand2, last, skin, caret, alive) = {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【动效窗口让渡】同 fade_tick：持有标记 + pending 隐藏
         g.cand2_busy = true;
-        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret)
+        // 【流畅度二批 2026-11-07】组段镜像 + last_show Arc 化
+        let alive = g.comp_alive();
+        (g.cand2.take(), g.last_show.clone(), g.skin.clone(), g.caret, alive)
     };
-    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last) {
+    if let (Some(c), Some((cands, raw, sel))) = (cand2.as_mut(), last.as_deref()) {
+        // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
+        c.comp_alive.set(alive);
         if !c.comments_expanded {
             c.comments_expanded = true;
             let _ = KillTimer(hwnd, EXPAND_TIMER_ID);
-            c.show(&cands, &raw, &skin, caret.as_ref(), sel);
+            c.show(cands, raw, &skin, caret.as_ref(), *sel);
         }
     }
     let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -10507,10 +10742,13 @@ fn morph_frame_interval_ms(hwnd: HWND) -> u128 {
     g.1
 }
 
-/// 窗口最近显示器当前刷新率的帧距（ms，向上取整）。AppContainer
+/// 窗口最近显示器当前刷新率的帧距（ms，**向下取整**）。AppContainer
 ///（SearchHost/UWP）或任何查询失败 → 兜底 60Hz。5ms winmm tick 是
-/// 渲染节拍地板：144Hz 屏阈值 ~7ms → 实际每 2 tick 渲一帧（≈100fps，
-/// 不超发合成帧的前提下最平滑；240Hz 阈值 5ms → 每 tick 一帧）。
+/// 渲染节拍地板：144Hz 屏阈值 ~6ms → 实际每 2 tick 渲一帧（≈100fps，
+/// 不超发合成帧的前提下最平滑；240Hz 阈值 4ms → 每 tick 一帧）。
+/// 【流畅度二批 2026-11-07】ceil→floor：tick 周期略快于 vsync，多出
+/// 的空 tick 被「周期-2ms」帧门幂等吸收——ceil 在 165/240Hz 屏上量化
+/// 出 11/5ms 周期反而慢于帧距（43/21ms 复合周期微顿丢帧）。
 fn query_refresh_interval_ms(hwnd: HWND) -> u128 {
     unsafe {
         let mut hz: u32 = 60;
@@ -10539,7 +10777,9 @@ fn query_refresh_interval_ms(hwnd: HWND) -> u128 {
                 }
             }
         }
-        (1000.0 / hz as f32).ceil() as u128
+        // 【流畅度二批 2026-11-07】ceil→floor：tick 略快于 vsync，多出
+        // 的空 tick 由「周期-2ms」帧门幂等吸收（165/240Hz 丢帧修复）
+        (1000.0 / hz as f32).floor() as u128
     }
 }
 

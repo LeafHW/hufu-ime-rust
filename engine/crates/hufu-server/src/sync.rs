@@ -1034,12 +1034,35 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                 backup_config(&data_dir);
                 let cfg: hufu_config::Config = serde_json::from_value(merged)
                     .map_err(|e| format!("归并配置无法解析：{e}"))?;
+                // 【流畅度二批 2026-11-07】schema 变更段锁外预装载：原
+                // apply_config 锁内装载 0.05-2s 顶全机键——云同步每
+                // 2min 归并落远端方案名时可在打字中无预警触发。装载
+                // 窗口内本地配置漂移由 apply_config 的 orig 守卫兜底
+                //（现值≠发起时 → 放弃 schema 切换只存其余配置）；快照
+                // 漂移（full2≠full）走既有 abandoned 分支。
+                let need_load = cfg.schema.current != full["schema"]["current"].as_str().unwrap_or("")
+                    || cfg.schema.dir != full["schema"]["dir"].as_str().unwrap_or("");
+                let pre = if need_load && !cfg.schema.current.is_empty() {
+                    let (data_dir, orig) = {
+                        let h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            h.data_dir.clone(),
+                            h.engine.config.schema.current.clone(),
+                        )
+                    };
+                    let d = cfg.schema.dir.clone();
+                    let c = cfg.schema.current.clone();
+                    let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
+                    Some((orig, loaded))
+                } else {
+                    None
+                };
                 let mut h = shared.lock().unwrap_or_else(|p| p.into_inner());
                 let full2 =
                     serde_json::to_value(&h.engine.config).map_err(|e| e.to_string())?;
                 if full2 == full {
                     let (need_sentence, teardown) = h
-                        .apply_config(cfg)
+                        .apply_config(cfg, pre)
                         .map_err(|e| format!("应用配置失败：{e}"))?;
                     if need_sentence {
                         crate::reload_sentence_bg(teardown, true);
