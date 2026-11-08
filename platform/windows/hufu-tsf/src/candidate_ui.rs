@@ -584,7 +584,7 @@ mod tests {
             {
                 let tm: ITfThreadMgr =
                     CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).unwrap();
-                tm.Activate().unwrap();
+                // Document ownership does not require activating the user's IME.
                 let doc = tm.CreateDocumentMgr().unwrap();
                 let data = Arc::new(SnapshotCell::new(Snapshot {
                     menu: Menu {
@@ -605,7 +605,6 @@ mod tests {
                 drop(doc);
                 assert!(candidate.GetDocumentMgr().is_ok());
                 drop(candidate);
-                tm.Deactivate().unwrap();
             }
             CoUninitialize();
         }
@@ -621,127 +620,132 @@ mod tests {
             .ok()
             .unwrap();
         }
-        reset();
-        token();
-        let log = Rc::new(RefCell::new(Log::default()));
-        let mgr: ITfUIElementMgr = Manager { log: log.clone() }.into();
-        MANAGER.with(|m| *m.borrow_mut() = Some(mgr));
-        publish(&frame(1, 0));
-        let c = log.borrow().retained.clone().unwrap();
-        let agile = AgileReference::new(&c).unwrap();
-        std::thread::spawn(move || unsafe {
-            use windows::Win32::System::Com::*;
-            CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
-            {
-                let proxy = agile.resolve().unwrap();
-                assert_eq!(proxy.GetCount().unwrap(), 3);
-                assert_eq!(proxy.GetString(2).unwrap().to_string(), "𠀀é");
-            }
-            CoUninitialize();
-        })
-        .join()
-        .unwrap();
-        unsafe {
-            assert_eq!(c.GetCount().unwrap(), 3);
-            assert_eq!(c.GetSelection().unwrap(), 1);
-            let mut count = 0;
-            (c.vtable().GetPageIndex)(c.as_raw(), std::ptr::null_mut(), 0, &mut count)
-                .ok()
-                .unwrap();
-            assert_eq!(count, 2);
-            let mut pages = [0; 2];
-            c.GetPageIndex(&mut pages, &mut count).unwrap();
-            assert_eq!(pages, [0, 2]);
-            assert!(c.GetPageIndex(&mut pages[..1], &mut count).is_err());
-            assert!(
-                (c.vtable().GetPageIndex)(c.as_raw(), std::ptr::null_mut(), 1, &mut count)
+        // Agile references and retained COM objects must drop while COM is live.
+        {
+            reset();
+            token();
+            let log = Rc::new(RefCell::new(Log::default()));
+            let mgr: ITfUIElementMgr = Manager { log: log.clone() }.into();
+            MANAGER.with(|m| *m.borrow_mut() = Some(mgr));
+            publish(&frame(1, 0));
+            let c = log.borrow().retained.clone().unwrap();
+            let agile = AgileReference::new(&c).unwrap();
+            std::thread::spawn(move || unsafe {
+                use windows::Win32::System::Com::*;
+                CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+                {
+                    let proxy = agile.resolve().unwrap();
+                    assert_eq!(proxy.GetCount().unwrap(), 3);
+                    assert_eq!(proxy.GetString(2).unwrap().to_string(), "𠀀é");
+                }
+                // The closure capture otherwise drops after CoUninitialize.
+                drop(agile);
+                CoUninitialize();
+            })
+            .join()
+            .unwrap();
+            unsafe {
+                assert_eq!(c.GetCount().unwrap(), 3);
+                assert_eq!(c.GetSelection().unwrap(), 1);
+                let mut count = 0;
+                (c.vtable().GetPageIndex)(c.as_raw(), std::ptr::null_mut(), 0, &mut count)
                     .ok()
-                    .is_err()
-            );
-            assert!(c.GetPageIndex(&mut pages, std::ptr::null_mut()).is_err());
-            assert!(c.GetString(3).is_err());
-            assert_eq!(c.GetString(2).unwrap().to_string(), "𠀀é");
-            assert!(c.cast::<ITfCandidateListUIElementBehavior>().is_err());
-            c.Show(false).unwrap();
+                    .unwrap();
+                assert_eq!(count, 2);
+                let mut pages = [0; 2];
+                c.GetPageIndex(&mut pages, &mut count).unwrap();
+                assert_eq!(pages, [0, 2]);
+                assert!(c.GetPageIndex(&mut pages[..1], &mut count).is_err());
+                assert!(
+                    (c.vtable().GetPageIndex)(c.as_raw(), std::ptr::null_mut(), 1, &mut count)
+                        .ok()
+                        .is_err()
+                );
+                assert!(c.GetPageIndex(&mut pages, std::ptr::null_mut()).is_err());
+                assert!(c.GetString(3).is_err());
+                assert_eq!(c.GetString(2).unwrap().to_string(), "𠀀é");
+                assert!(c.cast::<ITfCandidateListUIElementBehavior>().is_err());
+                c.Show(false).unwrap();
+            }
+            publish(&frame(2, 1));
+            unsafe {
+                assert_eq!(c.GetCurrentPage().unwrap(), 1);
+                assert_eq!(c.GetSelection().unwrap(), 2);
+                assert_eq!(
+                    c.GetUpdatedFlags().unwrap(),
+                    TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE
+                );
+            }
+            publish(&frame(1, 0));
+            let mut same = frame(2, 1);
+            same["candidate_ui"].as_object_mut().unwrap().remove("menu");
+            publish(&same);
+            assert_eq!(log.borrow().events, vec!["begin", "update"]);
+            let mut foreign = frame(3, 0);
+            foreign["candidate_ui"]["context"] = json!("other");
+            publish(&foreign);
+            assert_eq!(log.borrow().events.len(), 2);
+            reset();
+            unsafe {
+                assert_eq!(c.GetString(2).unwrap().to_string(), "𠀀é");
+            }
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            token();
+            log.borrow_mut().reenter = true;
+            publish(&frame(1, 0));
+            assert_eq!(&log.borrow().events[3..], &["begin", "update"]);
+            log.borrow_mut().reset_update = true;
+            publish(&frame(3, 0));
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            token();
+            log.borrow_mut().reset_begin = true;
+            publish(&frame(1, 0));
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            assert!(BRIDGE.with(|b| b.borrow().active.is_none()));
+            token();
+            publish(&frame(1, 0));
+            publish(&json!({}));
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            publish(&frame(2, 0));
+            let mut bad = frame(3, 0);
+            bad["candidate_ui"]["menu"]["pages"] = json!([1, 2]);
+            publish(&bad);
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            publish(&frame(4, 0));
+            bad = frame(5, 0);
+            bad["candidate_ui"]["menu"]["texts"][0] = json!("x".repeat(1 << 20));
+            publish(&bad);
+            assert_eq!(log.borrow().events.last().unwrap(), "end");
+            reset();
+            token();
+            publish(&frame(10, 0));
+            let mut changed = frame(11, 0);
+            changed["candidate_ui"]["menu"]["texts"] = json!(["新", "乙", "𠀀é", "末"]);
+            changed["candidate_ui"]["menu"]["pages"] = json!([0, 2, 3]);
+            publish(&changed);
+            let current = log.borrow().retained.clone().unwrap();
+            unsafe {
+                assert_eq!(
+                    current.GetUpdatedFlags().unwrap(),
+                    TF_CLUIE_STRING | TF_CLUIE_COUNT | TF_CLUIE_PAGEINDEX
+                );
+            }
+            let mut restarted = frame(1, 1);
+            restarted["candidate_ui"]["instance"] = json!("server-b");
+            publish(&restarted);
+            publish(&frame(100, 0)); // retired server cannot resurrect even with a larger version
+            unsafe {
+                assert_eq!(current.GetCurrentPage().unwrap(), 1);
+            }
+            let mut empty = restarted.clone();
+            empty["candidate_ui"]["version"] = json!(2);
+            empty["candidate_ui"]["menu"] = Value::Null;
+            publish(&empty);
+            publish(&restarted);
+            assert!(BRIDGE.with(|b| b.borrow().active.is_none()));
+            reset();
+            MANAGER.with(|m| m.borrow_mut().take());
         }
-        publish(&frame(2, 1));
-        unsafe {
-            assert_eq!(c.GetCurrentPage().unwrap(), 1);
-            assert_eq!(c.GetSelection().unwrap(), 2);
-            assert_eq!(
-                c.GetUpdatedFlags().unwrap(),
-                TF_CLUIE_SELECTION | TF_CLUIE_CURRENTPAGE
-            );
-        }
-        publish(&frame(1, 0));
-        let mut same = frame(2, 1);
-        same["candidate_ui"].as_object_mut().unwrap().remove("menu");
-        publish(&same);
-        assert_eq!(log.borrow().events, vec!["begin", "update"]);
-        let mut foreign = frame(3, 0);
-        foreign["candidate_ui"]["context"] = json!("other");
-        publish(&foreign);
-        assert_eq!(log.borrow().events.len(), 2);
-        reset();
-        unsafe {
-            assert_eq!(c.GetString(2).unwrap().to_string(), "𠀀é");
-        }
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        token();
-        log.borrow_mut().reenter = true;
-        publish(&frame(1, 0));
-        assert_eq!(&log.borrow().events[3..], &["begin", "update"]);
-        log.borrow_mut().reset_update = true;
-        publish(&frame(3, 0));
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        token();
-        log.borrow_mut().reset_begin = true;
-        publish(&frame(1, 0));
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        assert!(BRIDGE.with(|b| b.borrow().active.is_none()));
-        token();
-        publish(&frame(1, 0));
-        publish(&json!({}));
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        publish(&frame(2, 0));
-        let mut bad = frame(3, 0);
-        bad["candidate_ui"]["menu"]["pages"] = json!([1, 2]);
-        publish(&bad);
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        publish(&frame(4, 0));
-        bad = frame(5, 0);
-        bad["candidate_ui"]["menu"]["texts"][0] = json!("x".repeat(1 << 20));
-        publish(&bad);
-        assert_eq!(log.borrow().events.last().unwrap(), "end");
-        reset();
-        token();
-        publish(&frame(10, 0));
-        let mut changed = frame(11, 0);
-        changed["candidate_ui"]["menu"]["texts"] = json!(["新", "乙", "𠀀é", "末"]);
-        changed["candidate_ui"]["menu"]["pages"] = json!([0, 2, 3]);
-        publish(&changed);
-        let current = log.borrow().retained.clone().unwrap();
-        unsafe {
-            assert_eq!(
-                current.GetUpdatedFlags().unwrap(),
-                TF_CLUIE_STRING | TF_CLUIE_COUNT | TF_CLUIE_PAGEINDEX
-            );
-        }
-        let mut restarted = frame(1, 1);
-        restarted["candidate_ui"]["instance"] = json!("server-b");
-        publish(&restarted);
-        publish(&frame(100, 0)); // retired server cannot resurrect even with a larger version
-        unsafe {
-            assert_eq!(current.GetCurrentPage().unwrap(), 1);
-        }
-        let mut empty = restarted.clone();
-        empty["candidate_ui"]["version"] = json!(2);
-        empty["candidate_ui"]["menu"] = Value::Null;
-        publish(&empty);
-        publish(&restarted);
-        assert!(BRIDGE.with(|b| b.borrow().active.is_none()));
-        reset();
-        MANAGER.with(|m| m.borrow_mut().take());
         unsafe {
             windows::Win32::System::Com::CoUninitialize();
         }

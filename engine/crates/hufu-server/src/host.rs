@@ -13,6 +13,13 @@ struct RerankJob {
     cands: Vec<String>,
 }
 
+/// A settings write prepares expensive resources while no Host guard is held.
+pub struct PreparedConfig {
+    original_current: String,
+    schema: Option<std::io::Result<hufu_engine::PreparedSchema>>,
+    assets: Option<hufu_engine::PreparedGlobalAssets>,
+}
+
 /// 嵌入的官方皮肤（编译期打包，数据目录损坏/清空也能恢复全套）
 /// 【用户定稿】保留 4 款定稿 + 5 款新配色（青瓷/暮山紫/沧海/柿柚/松烟）
 /// 【2026-09-08 模块级】供 install_official_skins（缺失自愈）与
@@ -600,6 +607,7 @@ impl Host {
         std::thread::Builder::new()
             .name("hufu-rerank".into())
             .spawn(move || {
+                crate::scheduling::inference_thread();
                 // 【线程自愈 2026-09-11】旧实现 panic（坏 GGUF 越界等）→
                 // rerank 线程死亡且无人重建，重排从此哑火直到重启。外层
                 // 监督循环：panic 兜住、落诊断、冷却后整线程重来（引擎随
@@ -1159,25 +1167,51 @@ impl Host {
     /// 模型词典不符，须先拆）；sentence-only 变化（权重等）保留旧模型
     /// 服务到新模型就位。
     ///
-    /// 【流畅度二批 2026-11-07】pre=调用方锁外预装载的 schema：
-    /// `Some((发起时现值 current, 装载结果))`。设置页 /api/config、
-    /// settings_import、pipe config_set、云同步归并四处调用方先取快照
-    /// →放锁 load_schema_for→短锁 apply_config——消灭锁内 0.05-2s
-    /// 装载段（键路 p99 主要供给方）。窗口守卫：装载期间现值被第三方
-    /// 改走（≠发起时现值）→ 尊重第三方，本次放弃 schema 切换（cfg 的
-    /// schema 节对齐现值，其余配置照存）——不覆盖更新的切换。pre=None
-    /// 走原锁内装载（兜底，未预装载的调用方行为与旧版一致）。
+    /// Production callers prepare the schema, global annotations and enabled
+    /// conversion dictionaries outside Host. A concurrent schema change rejects
+    /// the entire write before saving; the caller can retry its fresh snapshot.
+    /// None retains synchronous preparation for compatibility callers and tests.
+    pub fn config_needs_preparation(&self, cfg: &Config) -> bool {
+        cfg.schema.current != self.engine.config.schema.current
+            || cfg.schema.dir != self.engine.config.schema.dir
+            || cfg.reverse.scheme != self.engine.config.reverse.scheme
+            || cfg.candidates.split_scheme != self.engine.config.candidates.split_scheme
+            || cfg.opencc != self.engine.config.opencc
+    }
+
+    pub fn prepare_config(
+        data_dir: &Path,
+        original_current: String,
+        cfg: &Config,
+        schema_changed: bool,
+    ) -> PreparedConfig {
+        if schema_changed {
+            PreparedConfig {
+                original_current,
+                schema: Some(Engine::prepare_schema_for(data_dir, cfg, &cfg.schema.current)),
+                assets: None,
+            }
+        } else {
+            PreparedConfig {
+                original_current,
+                schema: None,
+                assets: Some(Engine::prepare_global_assets(data_dir, cfg)),
+            }
+        }
+    }
+
     pub fn apply_config(
         &mut self,
-        mut cfg: Config,
-        pre: Option<(String, std::io::Result<hufu_dict::Schema>)>,
+        cfg: Config,
+        mut pre: Option<PreparedConfig>,
     ) -> std::io::Result<(bool, bool)> {
         let now_current = self.engine.config.schema.current.clone();
-        let now_dir = self.engine.config.schema.dir.clone();
-        if let Some((orig, _)) = pre.as_ref() {
-            if *orig != now_current {
-                cfg.schema.current = now_current.clone();
-                cfg.schema.dir = now_dir.clone();
+        if let Some(prepared) = pre.as_ref() {
+            if prepared.original_current != now_current {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "方案在资源预载期间已变化，请重新保存配置",
+                ));
             }
         }
         let sentence_changed = cfg.sentence != self.engine.config.sentence;
@@ -1188,6 +1222,7 @@ impl Host {
         // （注释表数据不变但 split/reverse 换文件；无需换主码表）
         let assets_changed = cfg.reverse.scheme != self.engine.config.reverse.scheme
             || cfg.candidates.split_scheme != self.engine.config.candidates.split_scheme;
+        let conversions_changed = cfg.opencc != self.engine.config.opencc;
         // 【P0-2 2026-11-03】先验证新方案可装载，再落盘：旧实现先 save
         // 再 switch_schema，方案目录被删/损坏时磁盘配置已坏，server 重启
         // exit(1)，输入法整体不可用且无法通过设置页恢复。
@@ -1202,19 +1237,24 @@ impl Host {
                     "方案名为空",
                 ));
             }
-            match pre {
+            match pre.as_mut().and_then(|p| p.schema.take()) {
                 // 调用方已锁外预装载：直接用（窗口守卫已保证未被弃）。
                 // 错误同样拦在落盘前（与锁内装载同文案）。
-                Some((_, Ok(s))) => Some(s),
-                Some((_, Err(e))) => {
+                Some(Ok(s)) => Some(s),
+                Some(Err(e)) => {
                     return Err(std::io::Error::new(
                         e.kind(),
                         format!("方案「{}」无法装载，配置未保存: {e}", cfg.schema.current),
                     ))
                 }
-                // 兜底：调用方未预装载（旧路径）——锁内装载。
+                None if pre.is_some() => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
+                        "配置在预载期间已变化，请重新保存"));
+                }
+                // Compatibility callers (including standalone tests) may omit
+                // preparation. Production routes preload outside the Host lock.
                 None => Some(
-                    Engine::load_schema_for(&self.data_dir, &cfg.schema.dir, &cfg.schema.current)
+                    Engine::prepare_schema_for(&self.data_dir, &cfg, &cfg.schema.current)
                         .map_err(|e| {
                             std::io::Error::new(
                                 e.kind(),
@@ -1229,12 +1269,30 @@ impl Host {
         } else {
             None
         };
+        // Validate before persisting. Stale lock-free preloads cannot write a
+        // configuration whose dictionary/assets belong to another selection.
+        if prepared.as_ref().is_some_and(|p| !p.matches(&self.data_dir, &cfg)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "方案资源预载已过期"));
+        }
+        let assets = if prepared.is_none() && (assets_changed || conversions_changed) {
+            match pre.as_mut().and_then(|p| p.assets.take()) {
+                Some(assets) => Some(assets),
+                None if pre.is_some() => return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock, "全局资源在预载期间已变化，请重新保存")),
+                None => Some(Engine::prepare_global_assets(&self.data_dir, &cfg)),
+            }
+        } else {
+            None
+        };
+        if assets.as_ref().is_some_and(|p| !p.matches(&self.data_dir, &cfg)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "全局资源预载已过期"));
+        }
         let old_config = self.engine.config.clone();
         cfg.save(&self.config_path)?;
         self.engine.config = cfg;
         if let Some(prepared) = prepared {
             let name = self.engine.config.schema.current.clone();
-            if let Err(e) = self.engine.apply_schema(&name, prepared) {
+            if let Err(e) = self.engine.apply_prepared_schema(&name, prepared) {
                 // 竞态兜底（验证后目录恰好被删）：回写旧配置，别把磁盘
                 // 留在「保存成功但方案装不上」的坏状态。
                 self.engine.config = old_config.clone();
@@ -1242,9 +1300,13 @@ impl Host {
                 return Err(e);
             }
             self.session.clear();
-        } else if assets_changed {
-            self.engine.apply_global_assets();
-            self.session.clear();
+        } else if let Some(assets) = assets {
+            // Already validated against the exact configuration assigned above.
+            let applied = self.engine.apply_prepared_global_assets(assets);
+            debug_assert!(applied);
+            if assets_changed {
+                self.session.clear();
+            }
         }
         if rerank_changed {
             self.setup_rerank();

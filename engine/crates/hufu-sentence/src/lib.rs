@@ -111,7 +111,7 @@ pub struct SentenceEngine {
     /// 的独立 Seg，rank=1：长句只放行 rank1 段，用户词须以并列首选
     /// 身份进入；排序仍由 ngram 主导）。RwLock 热更新：引擎 reload
     /// 用户数据后 set_user_words 同步，无需重建 ngram。码表原序不动。
-    user_words: std::sync::RwLock<Vec<(String, String)>>,
+    user_words: std::sync::RwLock<UserWordIndex>,
     /// 【两段式分级解码 2026-10-28】即时档开关（HUFU_TWO_STAGE=0 关）：
     /// miss（缓存无法增量）解码用 `quick_beam` 上限出首候选，提交前
     /// 引擎经 SentenceDecoder::decode_rich_full 强制全量档兜底（见
@@ -124,16 +124,50 @@ pub struct SentenceEngine {
     quick_beam: usize,
 }
 
+/// Injection order is significant when otherwise equal paths meet the beam.
+/// Index exact codes, then visit matching words in their original order.
+#[derive(Default)]
+struct UserWordIndex {
+    words: Vec<(String, String)>,
+    by_code: HashMap<String, Vec<usize>>,
+}
+
+impl UserWordIndex {
+    fn new(words: Vec<(String, String)>) -> Self {
+        let mut by_code: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, (code, _)) in words.iter().enumerate() {
+            if (1..=16).contains(&code.chars().count()) {
+                by_code.entry(code.clone()).or_default().push(i);
+            }
+        }
+        Self { words, by_code }
+    }
+
+    fn matches(&self, tail: &str) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        for (length, (at, ch)) in tail.char_indices().take(16).enumerate() {
+            if let Some(indices) = self.by_code.get(&tail[..at + ch.len_utf8()]) {
+                found.extend(indices.iter().map(|&i| (i, length + 1)));
+            }
+        }
+        found.sort_unstable_by_key(|&(i, _)| i);
+        found
+    }
+}
+
 impl SentenceEngine {
     /// 热更新用户词表（code, text）。清空传空即可。
     pub fn set_user_words(&self, words: Vec<(String, String)>) {
+        let index = UserWordIndex::new(words);
+        // Decode takes cache -> user_words. Use the same order so no decode can
+        // mix old/new injection tables or publish an old cached result afterward.
+        let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         {
             let mut g = self.user_words.write().unwrap_or_else(|p| p.into_inner());
-            *g = words;
+            *g = index;
         }
         // 解码缓存失效：last/prefix 桶是旧词图的结果，不含新词
         // 解码入口允许中毒锁恢复，这里也必须失效其旧词图缓存。
-        let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         *c = EngineCache::default();
     }
 }
@@ -432,7 +466,7 @@ impl SentenceEngine {
             weights,
             blocked,
             cache: Mutex::new(EngineCache::default()),
-            user_words: std::sync::RwLock::new(Vec::new()),
+            user_words: std::sync::RwLock::new(UserWordIndex::default()),
             two_stage: two_stage_enabled(),
             quick_beam: quick_beam_value(),
         }
@@ -660,21 +694,15 @@ impl SentenceEngine {
             // 码表段同规则。码表已有同码同词时跳过（去重）。
             {
                 let uw = self.user_words.read().unwrap_or_else(|p| p.into_inner());
-                if !uw.is_empty() {
+                if !uw.words.is_empty() {
                     // 【修复 segs O(n²) 2026-09-11】同上：复用尾串切片，
                     // 不再每个 pos 重建 tail_s 整串（O(n-pos)×n）。
                     let tail_s: &str = tail;
-                    for (code, text) in uw.iter() {
-                        let cl = code.chars().count();
+                    for (index, cl) in uw.matches(tail_s) {
+                        let (_code, text) = &uw.words[index];
                         // 【码长放宽 2026-09-09】原 cl>4 一刀切拒收——虎码
                         // 词组编码变体（语料注入：蚩奼 sfcbtrq=7 码）与
                         // /jc 长词用户词全被丢。放宽到 16（4字×4码上限）。
-                        if cl == 0 || pos + cl > n || cl > 16 || cl > tail_s.chars().count() {
-                            continue;
-                        }
-                        if !tail_s.starts_with(code.as_str()) {
-                            continue;
-                        }
                         let end = pos + cl;
                         // 同位段去重（码表已含该词）
                         let dup = segs[pos].iter().any(|s| {
@@ -1320,6 +1348,24 @@ impl SentenceDecoder for SentenceEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_word_index_preserves_scan_order_and_unicode_boundaries() {
+        let words: Vec<(String, String)> = [
+            ("abc", "长码"), ("a", "短码"), ("ab", "中码"),
+            ("ab", "同码"), ("", "空码"), ("甲乙", "非ASCII"),
+            ("甲", "单字码"), ("abcdefghijklmnopq", "超过十六码"),
+            ("abcdefghijklmnop", "十六码"), ("ab", "中码"),
+        ].into_iter().map(|(c, w)| (c.into(), w.into())).collect();
+        let index = UserWordIndex::new(words.clone());
+        for tail in ["", "a", "abcd", "甲乙丙", "甲", "abcdefghijklmnopq", "z"] {
+            let slow: Vec<_> = words.iter().enumerate().filter_map(|(i, (code, _))| {
+                let n = code.chars().count();
+                ((1..=16).contains(&n) && tail.starts_with(code)).then_some((i, n))
+            }).collect();
+            assert_eq!(index.matches(tail), slow, "tail={tail}");
+        }
+    }
     use hufu_dict::entry::DictEntry;
     use hufu_dict::freq;
     use hufu_dict::supplement::Supplement;

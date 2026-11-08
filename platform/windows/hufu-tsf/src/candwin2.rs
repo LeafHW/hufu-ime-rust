@@ -8,6 +8,7 @@
 //! - 初始化失败时上层回退 v1（GDI 分层窗口）
 
 use serde_json::Value;
+use crate::skin_snapshot::clone_render_skin;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -1150,13 +1151,15 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         let shared = gsh.0.clone();
                         let (mut cand2, last, skin, caret, alive) = {
                             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
-                            let patched = if let Some(l) = g.skin.pointer_mut("/skin/layout") {
+                            // 主动滚轮编辑采用 COW；在途绘制仍持有原快照。
+                            let skin_mut = std::sync::Arc::make_mut(&mut g.skin);
+                            let patched = if let Some(l) = skin_mut.pointer_mut("/skin/layout") {
                                 l["font_point"] = serde_json::json!(new_pt);
                                 if let Some(lb) = new_lb {
                                     l["label_font_point"] = serde_json::json!(lb);
                                 }
                                 true
-                            } else if let Some(l) = g.skin.get_mut("layout") {
+                            } else if let Some(l) = skin_mut.get_mut("layout") {
                                 l["font_point"] = serde_json::json!(new_pt);
                                 if let Some(lb) = new_lb {
                                     l["label_font_point"] = serde_json::json!(lb);
@@ -1338,6 +1341,12 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 自定义 posted 消息不会像 WM_TIMER 自动合并。先释放待处理
             // 标记，渲染期间最多允许再排一拍，慢 Present 后不追过期消息。
             anim_tick_post_complete(hwnd);
+            // posted 消息优先于硬件输入。慢 Present 时即使只积一拍，
+            // 也可能始终有下一拍排在键消息前；有输入待处理就让出本拍。
+            // 下一 tick 仍按当前时间推进，时长/曲线/帧距不变。
+            if unsafe { GetQueueStatus(QS_INPUT) } >> 16 != 0 {
+                return LRESULT(0);
+            }
             unsafe { fade_tick_shared(hwnd) };
             return LRESULT(0);
         }
@@ -2269,7 +2278,9 @@ pub(crate) fn ssf_project_skin(skin: &Value, f: &SsfFrame) -> Value {
             .as_object_mut()
             .map(|m| m.insert(key.to_string(), val));
     }
-    let mut v = skin.clone();
+    // 投影只改绘制配置；overlay 及预设图片可能有十几MB，不能每帧复制。
+    // 挂件同步仍读取 show 收到的原始快照。
+    let mut v = clone_render_skin(skin);
     let d = &f.spec.display;
     let s = f.scale;
     let hex = |c: [u8; 4]| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
@@ -4339,6 +4350,7 @@ impl CandidateWindowV2 {
         skin: &Value,
         anchor: Option<&RECT>,
         selected: usize,
+        first_unit: Option<f64>,
     ) {
         if self.in_recover {
             crate::tsf::trace(&format!(
@@ -4360,7 +4372,7 @@ impl CandidateWindowV2 {
             ));
             // in_recover 保持 true：重绘帧若再失效走上面的放弃分支，
             // 递归深度恒为 1。
-            self.show(cands, raw, skin, anchor, selected);
+            self.show_with_first_unit(cands, raw, skin, anchor, selected, first_unit);
         } else {
             self.recover_fail_streak += 1;
             if self.recover_fail_streak <= 3 {
@@ -4536,6 +4548,18 @@ impl CandidateWindowV2 {
         skin: &Value,
         anchor: Option<&RECT>,
         selected: usize,
+    ) {
+        self.show_with_first_unit(cands, _raw_req, skin, anchor, selected, None);
+    }
+
+    pub fn show_with_first_unit(
+        &mut self,
+        cands: &[(String, String)],
+        _raw_req: &str,
+        skin: &Value,
+        anchor: Option<&RECT>,
+        selected: usize,
+        first_unit: Option<f64>,
     ) {
         // 【2026-11 UI-less 接管】宿主声明自绘（pbShow=FALSE 且非"假自绘"游戏）
         // → 不再弹自家候选窗，避免双层候选/错位。所有车道都经 show()，
@@ -4884,7 +4908,7 @@ impl CandidateWindowV2 {
         let skin_value = |key: &str| -> Option<&serde_json::Value> {
             skin.get(key).or_else(|| skin.get("skin").and_then(|s| s.get(key)))
         };
-        let first_show_unit = skin_value("first_show_unit").and_then(|v| v.as_f64());
+        let first_show_unit = first_unit.or_else(|| skin_value("first_show_unit").and_then(|v| v.as_f64()));
         let first_show_slide = skin_value("first_show_slide")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
@@ -5011,6 +5035,7 @@ impl CandidateWindowV2 {
             !raw.is_empty() || freq_view.is_some(),
             !cands.is_empty(),
         );
+        let source_skin = skin;
         let skin_proj: Value;
         let skin: &Value = match &ssf {
             Some(f) => {
@@ -8045,7 +8070,7 @@ impl CandidateWindowV2 {
         // 收窗 + 2s 死窗节流（show 早退，绝不每帧重建）。本帧跳过读回/
         // Present 已由 break 'render 完成。
         if let Some(code) = d2d_end_err {
-            self.handle_render_device_loss(code, &cands, _raw_req, skin, anchor, selected);
+            self.handle_render_device_loss(code, &cands, _raw_req, source_skin, anchor, selected, first_unit);
             return;
         }
 
@@ -9148,7 +9173,7 @@ impl CandidateWindowV2 {
             //（overlaywin 只读本窗最终矩形，不碰候选窗几何）。
             //（readback/转储：不同步——转储皮肤剥了 overlay，且进程即退）
             if !self.readback {
-                crate::overlaywin::sync_for(self.hwnd, skin);
+                crate::overlaywin::sync_for(self.hwnd, source_skin);
             }
             if sp_ok.is_err() {
                 crate::tsf::trace(&format!(

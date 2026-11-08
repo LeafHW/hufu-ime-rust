@@ -12,6 +12,9 @@ const SENT_PHRASE_FRONT_FLOOR: f64 = -12.0;
 pub mod dynamic;
 pub mod punct;
 pub mod session;
+mod assets;
+
+pub use assets::{PreparedGlobalAssets, PreparedSchema};
 
 pub use punct::PairState;
 pub use session::{EarlyHistory, Session};
@@ -469,12 +472,12 @@ pub struct Engine {
     /// config 后置位；host 在 process_key 出口读旗落盘（重启保留）。
     pub pending_config_save: bool,
     /// 【语料前缀挂起 2026-09-09】补充语料词编码变体（排序去重，懒建
-    /// +指纹失效）：full 是任一变体真前缀且剩余码 ≤ 挂起余量时压制
+    /// +方案/显式词图更新时失效）：full 是任一变体真前缀且剩余码 ≤ 挂起余量时压制
     /// 提前上屏——用户显式加权的词（如「蚩奼」sfcbtrq 简码 sfccbtrq
     /// 全码）应等后续键辨析走语料路径，而不是被高置信单字路径
     ///（证sf+不cb）抢跑分段。分道扬镳（后续键与全部变体不一致）后
     /// 自动恢复置信上屏。
-    supp_hold: std::sync::Mutex<Option<(String, Vec<String>, Vec<(String, String)>)>>,
+    supp_hold: std::sync::Mutex<Option<Arc<SupplementCache>>>,
     /// 【T2-6 2026-11-07】user-adjust.log 异步批量写：行入 mpsc 通道，
     /// 专用写线程持文件句柄合并 append（替代旧「内存缓冲+5s/8 条节流
     /// +键线程 flush」——磁盘 IO 彻底离开按键线程；文件内容格式与行
@@ -506,13 +509,19 @@ pub struct Engine {
     display_raw_cache: std::sync::Mutex<Option<(String, u64, String)>>,
 }
 
+struct SupplementCache {
+    codes: Vec<String>,
+    pairs: Vec<(String, String)>,
+}
+
 /// 【T2-5b 2026-11-07】后台切方案在途状态（见 Engine::switch_pending）：
 /// from=发起时 config.schema.current（应用端守卫——期间设置页/同步
 /// 路由已切走则结果作废，防旧结果覆盖新方案）。
 struct SwitchPending {
     from: String,
     target: String,
-    rx: std::sync::mpsc::Receiver<Result<Schema, std::io::Error>>,
+    rx: std::sync::mpsc::Receiver<Result<PreparedSchema, std::io::Error>>,
+    retired: std::sync::mpsc::Sender<Result<Schema, PreparedSchema>>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -717,11 +726,16 @@ impl Engine {
         // 【语料词注入 2026-09-09】解码器（重）装载后用户词+补充语料
         // 变体词图重注入——新实例 user_words 为空，/jq 热重载整句后
         // 不重注会丢词。
-        self.sync_sentence_user_words();
+        self.inject_sentence_user_words();
     }
 
     pub fn sentence_decoder(&self) -> Option<&Arc<dyn SentenceDecoder>> {
         self.sentence.as_ref()
+    }
+
+    /// Guard lock-free resource preparation against same-path reloads and A/B/A.
+    pub fn resource_generation(&self) -> u64 {
+        self.rerank_generation
     }
 
     /// 【2026-09-06 大统一】全局资源应用：反查 / 拼音注释 / unicode
@@ -733,65 +747,9 @@ impl Engine {
     /// - 拆分：candidates.split_scheme（数据\拆分\<名>.拆分；空=关）。
     /// 【性能】反查保持懒加载：只设路径，真正装载见 ensure_reverse。
     pub fn apply_global_assets(&mut self) {
-        // 反查
-        let scheme = self.config.reverse.scheme.trim().to_string();
-        let global_rev = if scheme.is_empty() {
-            None
-        } else {
-            Some(self.data_dir.join("拼音反查").join(format!("{scheme}.txt")))
-        };
-        if let Some(p) = global_rev {
-            if p.exists() {
-                self.schema.reverse = None;
-                self.schema.reverse_path = Some(p);
-                self.schema.reverse_rule = None;
-            } else if let Some(rule) = hufu_dict::ShuangpinRule::from_scheme(&scheme) {
-                // 【反查瘦身 2026-10-18】自然码/小鹤双拼表不随包发行：
-                // scheme 命中派生名单且全局同名 txt 缺席时，改挂全拼
-                // 基表（码列空格分隔音节）+ 装载期逐音节编码。用户自带
-                // 同名 txt 在场永远优先（上一分支，旧包/定制兼容）。
-                let base = self.data_dir.join("拼音反查").join("全拼.txt");
-                if base.exists() {
-                    self.schema.reverse = None;
-                    self.schema.reverse_path = Some(base);
-                    self.schema.reverse_rule = Some(rule);
-                }
-                // 基表也缺失：保持 Schema::load 的方案目录探测（旧包回退）
-            }
-            // 全局文件缺失且非派生名单：保持 Schema::load 的方案目录探测（旧包回退）
-        } else {
-            // scheme 空 = 明确关闭反查
-            self.schema.reverse = None;
-            self.schema.reverse_path = None;
-            self.schema.reverse_rule = None;
-        }
-        // 拼音注释（全局优先，回退方案目录探测结果）
-        let py = self.data_dir.join("注释").join("拼音.注释");
-        if py.exists() {
-            if let Ok(t) = hufu_dict::AnnotationTable::load(&py) {
-                self.schema.pinyin = Some(t);
-            }
-        }
-        // unicode 注释
-        let uc = self.data_dir.join("注释").join("unicode.注释");
-        if uc.exists() {
-            if let Ok(t) = hufu_dict::AnnotationTable::load(&uc) {
-                self.schema.unicode_block = Some(t);
-            }
-        }
-        // 拆分（split_scheme 空=关）
-        let ss = self.config.candidates.split_scheme.trim().to_string();
-        if ss.is_empty() {
-            self.schema.split = None;
-        } else {
-            let p = self.data_dir.join("拆分").join(format!("{ss}.拆分"));
-            if p.exists() {
-                if let Ok(t) = hufu_dict::AnnotationTable::load(&p) {
-                    self.schema.split = Some(t);
-                }
-            }
-            // 文件缺失：保持方案目录探测（旧包回退）
-        }
+        let prepared = Self::prepare_global_assets(&self.data_dir, &self.config);
+        let applied = self.apply_prepared_global_assets(prepared);
+        debug_assert!(applied);
     }
 
     /// 【性能】反查表按需装载：Schema::load 只记路径（冷启动省 ~700ms
@@ -807,10 +765,7 @@ impl Engine {
         let t0 = std::time::Instant::now();
         // 【反查瘦身 2026-10-18】带规则 = reverse_path 指向全拼基表，
         // 装载期逐音节编码派生（356,907 行毫秒级，0 跳过）。
-        let loaded = match self.schema.reverse_rule {
-            Some(rule) => ReverseTable::load_derived(&p, &rule),
-            None => ReverseTable::load(&p),
-        };
+        let loaded = Self::prepare_reverse_table(&p, self.schema.reverse_rule);
         match loaded {
             Ok(rt) => {
                 eprintln!(
@@ -822,6 +777,14 @@ impl Engine {
                 self.schema.reverse_path = None;
             }
             Err(e) => eprintln!("反查表 {} 装载失败: {e}", p.display()),
+        }
+    }
+
+    /// Read/derive a reverse table without holding an Engine or Host lock.
+    pub fn prepare_reverse_table(path: &Path, rule: Option<hufu_dict::ShuangpinRule>) -> std::io::Result<ReverseTable> {
+        match rule {
+            Some(rule) => ReverseTable::load_derived(path, &rule),
+            None => ReverseTable::load(path),
         }
     }
 
@@ -866,8 +829,8 @@ impl Engine {
         // 【治本 2026-11-07】装载段抽到 load_schema_for（可在 Host 锁外
         // 调用），应用段抽到 apply_schema——switch = prepare + apply，
         // 行为与旧一体实现逐行等价。
-        let schema = Self::load_schema_for(&self.data_dir, &self.config.schema.dir, name)?;
-        self.apply_schema(name, schema)
+        let prepared = Self::prepare_schema_for(&self.data_dir, &self.config, name)?;
+        self.apply_prepared_schema(name, prepared)
     }
 
     /// 【治本 2026-11-07】纯装载段（不碰 self 状态，可在 Host 锁外调
@@ -901,14 +864,14 @@ impl Engine {
     }
 
     /// 【治本 2026-11-07】应用已装载方案（switch_schema 成功路径后半
-    /// 段，零装载 IO）：schema 交换/会话学习清空/全局资源/方案名/最
-    /// 近方案对/display_raw 代际失效。锁外预载后短锁直调同样先摘除
-    /// 在途后台切换。
+    /// 段）。兼容入口仍同步准备全局资源；锁敏感调用方应使用
+    /// prepare_schema_for + apply_prepared_schema，覆盖附加资源装载。
     pub fn apply_schema(&mut self, name: &str, schema: Schema) -> std::io::Result<()> {
         let _ = self.switch_pending.take();
         self.rerank_generation = self.rerank_generation.wrapping_add(1);
         let old = self.config.schema.current.clone();
         self.schema = schema;
+        self.invalidate_supplement_cache();
         // 【三十六修】会话学习按 (code,text) 登记，码义随方案变——
         // 切方案即作废，防跨方案错配回放。
         self.session_learned.clear();
@@ -933,20 +896,29 @@ impl Engine {
     /// eprintln（键路径原本无 state 错误通道，同 ensure_reverse 先例）。
     fn begin_schema_switch(&mut self, target: &str) {
         let data_dir = self.data_dir.clone();
-        let schema_dir = self.config.schema.dir.clone();
+        let config = self.config.clone();
         let target = target.to_string();
         let target_bg = target.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Schema, std::io::Error>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<PreparedSchema, std::io::Error>>();
+        let (retired, reclaim) = std::sync::mpsc::channel::<Result<Schema, PreparedSchema>>();
         let handle = std::thread::spawn(move || {
             // 与 switch_schema 相同的装载段（【治本 2026-11-07】随装载段
             // 抽出而复用 load_schema_for，单一口径）
-            let res = Self::load_schema_for(&data_dir, &schema_dir, &target_bg);
-            let _ = tx.send(res); // rx 已亡（被作废）时静默丢弃，线程退出
+            let res = Self::prepare_schema_for(&data_dir, &config, &target_bg);
+            let ready = res.is_ok();
+            if tx.send(res).is_ok() && ready {
+                // Reuse this worker for old/cancelled large schema destruction.
+                // Cancelling/dropping SwitchPending disconnects reclaim as well.
+                if let Ok(old) = reclaim.recv() {
+                    drop(old);
+                }
+            }
         });
         self.switch_pending = Some(SwitchPending {
             from: self.config.schema.current.clone(),
             target: target.to_string(),
             rx,
+            retired,
             handle,
         });
     }
@@ -961,7 +933,7 @@ impl Engine {
         // 先在只读借用内取结果（借用随本 match 结束），再动 self——
         // Disconnected 分支需要 take 摘除 pending，不能在 p 借用中做。
         enum PendingOutcome {
-            Ok(Schema),
+            Ok(PreparedSchema),
             Err(std::io::Error),
             Dead,
         }
@@ -989,22 +961,19 @@ impl Engine {
                     pending.from, pending.target
                 );
             }
-            PendingOutcome::Ok(schema) => {
+            PendingOutcome::Ok(prepared) => {
                 if self.config.schema.current != pending.from {
+                    let _ = pending.retired.send(Err(prepared));
                     return; // 期间已有同步切方案/apply_config 接管——结果作废
                 }
-                self.rerank_generation = self.rerank_generation.wrapping_add(1);
-                let old = pending.from.clone();
                 let name = pending.target.clone();
-                self.schema = schema;
-                self.session_learned.clear();
-                self.apply_global_assets();
-                self.config.schema.current = name.clone();
-                if old != name && !old.is_empty() {
-                    self.config.schema.recent_pair = Some((old, name));
+                if !prepared.matches(&self.data_dir, &self.config) {
+                    let _ = pending.retired.send(Err(prepared));
+                    self.begin_schema_switch(&name);
+                    return;
                 }
-                // 【T3-b 2026-11-07】方案已换——display_raw 缓存代际失效
-                self.cand_ver += 1;
+                let old = self.install_prepared_schema(&name, prepared);
+                let _ = pending.retired.send(Ok(old));
                 // 【防回归修复(07-reg P3-1) 2026-11-07】对齐旧同步语义：
                 // 切方案即清组字。原实现此处 refresh_candidates 会让「用
                 // 户所见旧方案候选列表上的选重索引」落到新方案列表（装
@@ -1068,6 +1037,13 @@ impl Engine {
     /// 一并注入 rank1 段——语料词在打字中途即登顶候选（此前靠 supp_
     /// bonus 终点翻盘太晚），与挂起护栏互补。
     pub fn sync_sentence_user_words(&self) {
+        // This is the explicit word-graph update boundary (reload/new decoder).
+        // Rebuild here, never fingerprint and deep-clone all pairs per key.
+        self.invalidate_supplement_cache();
+        self.inject_sentence_user_words();
+    }
+
+    fn inject_sentence_user_words(&self) {
         if let Some(dec) = &self.sentence {
             let mut seen = std::collections::HashSet::new();
             let mut words: Vec<(String, String)> = self
@@ -1089,11 +1065,12 @@ impl Engine {
                     words.push(e);
                 }
             }
-            for (code, word) in self.supp_pairs() {
+            let supplement = self.supplement_cache();
+            for (code, word) in &supplement.pairs {
                 // 码表已有同码同词段（beam 内去重）也注入无害，但去重
                 // 省 beam 展开；单字语料不注入（码表本身有，挂起已够）
                 if word.chars().count() >= 2 && seen.insert((code.clone(), word.clone())) {
-                    words.push((code, word));
+                    words.push((code.clone(), word.clone()));
                 }
             }
             dec.set_user_words(&words);
@@ -3316,38 +3293,34 @@ impl Engine {
     /// 合，如 蚩sfc+奼btrq=sfcbtrq）与全码（sfcc+btrq=sfccbtrq）全部
     /// 路径。双用途：①挂起判定（codes 排序前缀探测）；②整句词图注
     /// 入（rank1 段——语料词从打字中途就登顶候选，而非终点才翻盘）。
-    /// 指纹（方案名+语料全词+码表规模）变化即重建——/jq 热加词下一
-    /// 键生效。
-    fn supp_pairs(&self) -> Vec<(String, String)> {
-        let mut fp = String::with_capacity(64);
-        fp.push_str(&self.config.schema.current);
-        fp.push('\u{1}');
-        let supp = &self.schema.supplement.entries;
-        fp.push_str(&supp.len().to_string());
-        fp.push('\u{1}');
-        for e in supp {
-            fp.push_str(&e.word);
-            fp.push('\u{2}');
-            fp.push_str(&e.weight.to_string());
-            fp.push('\u{3}');
-        }
-        fp.push('\u{1}');
-        fp.push_str(&self.schema.dict.entries.len().to_string());
+    /// 切方案和 sync_sentence_user_words 显式失效；直接修改公开 schema
+    /// 的调用方也须调用 invalidate_supplement_cache（和候选缓存一样）。
+    fn supplement_cache(&self) -> Arc<SupplementCache> {
         let mut guard = self.supp_hold.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((old_fp, _, pairs)) = guard.as_ref() {
-            if *old_fp == fp {
-                return pairs.clone();
-            }
+        if let Some(cache) = guard.as_ref() {
+            return Arc::clone(cache);
         }
+        let cache = Arc::new(Self::build_supplement_cache(&self.schema));
+        *guard = Some(Arc::clone(&cache));
+        cache
+    }
+
+    /// Invalidate after directly replacing supplement contents or the main dict.
+    /// Production schema/word-graph application paths already call this.
+    pub fn invalidate_supplement_cache(&self) {
+        *self.supp_hold.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    fn build_supplement_cache(schema: &Schema) -> SupplementCache {
         let mut pairs: Vec<(String, String)> = Vec::new();
-        for e in supp {
+        for e in &schema.supplement.entries {
             let chars: Vec<char> = e.word.chars().collect();
             if chars.is_empty() || chars.len() > 4 {
                 continue;
             }
             let mut combos: Vec<String> = vec![String::new()];
             for ch in chars {
-                let codes = self.schema.dict.codes_of(&ch.to_string());
+                let codes = schema.dict.codes_of(&ch.to_string());
                 if codes.is_empty() {
                     combos.clear();
                     break;
@@ -3372,8 +3345,7 @@ impl Engine {
         let mut codes: Vec<String> = pairs.iter().map(|(c, _)| c.clone()).collect();
         codes.sort();
         codes.dedup();
-        *guard = Some((fp, codes, pairs.clone()));
-        pairs
+        SupplementCache { codes, pairs }
     }
 
     /// full（已打全编码）是否被语料挂起：是任一变体真前缀（变体更
@@ -3383,11 +3355,8 @@ impl Engine {
         if self.schema.supplement.entries.is_empty() || full.is_empty() {
             return false;
         }
-        let _ = self.supp_pairs(); // 确保缓存已按当前指纹构建
-        let guard = self.supp_hold.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((_, codes, _)) = guard.as_ref() else {
-            return false;
-        };
+        let cache = self.supplement_cache();
+        let codes = &cache.codes;
         let pos = codes.partition_point(|v| v.as_str() < full);
         if let Some(v) = codes.get(pos) {
             if v.len() > full.len() && v.starts_with(full) {
@@ -5113,8 +5082,12 @@ impl Engine {
     /// 带 ST 表时 t2s 无数据）：只记一条诊断日志（数据目录 diag/opencc.log），
     /// 调用方保持原字不转换——不 panic、不弹错、不影响打字。
     fn log_opencc_missing(&self, to_traditional: bool) {
+        Self::log_opencc_missing_at(&self.data_dir, to_traditional);
+    }
+
+    fn log_opencc_missing_at(data_dir: &Path, to_traditional: bool) {
         use std::io::Write;
-        let dir = crate::diag_dir(&self.data_dir);
+        let dir = crate::diag_dir(data_dir);
         let _ = std::fs::create_dir_all(&dir);
         let (need, way) = if to_traditional {
             ("STPhrases/STCharacters", "简→繁")
@@ -6554,7 +6527,10 @@ impl Drop for Engine {
             let _ = h.join();
         }
         if let Some(p) = self.switch_pending.take() {
-            let _ = p.handle.join();
+            let SwitchPending { handle, retired, rx, .. } = p;
+            drop(retired);
+            drop(rx);
+            let _ = handle.join();
         }
     }
 }
@@ -6757,7 +6733,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("补充语料.txt"), "蚩奼 1000\n").unwrap();
-        let engine = Engine::with_schema_dir(&dir, Config::default()).unwrap();
+        let mut engine = Engine::with_schema_dir(&dir, Config::default()).unwrap();
         assert!(!engine.supp_hold_blocks("sf"), "sf 距语料词还剩 5 键，不挂");
         assert!(engine.supp_hold_blocks("sfc"), "sfc=蚩段完成+奼 btrq 将至（剩4），挂");
         assert!(engine.supp_hold_blocks("sfcb"), "sfcb=用户场景（剩 trq 3），挂");
@@ -6765,6 +6741,12 @@ mod tests {
         assert!(!engine.supp_hold_blocks("sfcbtrq"), "=简码变体全长，正常组句不挂");
         assert!(engine.supp_hold_blocks("sfcc"), "sfcc 剩 btrq 4，挂");
         assert!(!engine.supp_hold_blocks("sfcbx"), "分道扬镳（x 与全部变体不一致），恢复上屏");
+        // Same-sized edits must invalidate on the explicit graph-update boundary;
+        // a length/pointer-only cache key would keep the old word here.
+        engine.schema.supplement.entries[0].word = "不证".into();
+        engine.sync_sentence_user_words();
+        assert!(!engine.supp_hold_blocks("sfc"));
+        assert!(engine.supp_hold_blocks("cb"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8326,6 +8308,18 @@ mod tests {
         let got = sink.lock().unwrap().clone();
         assert!(got.contains(&("fj".into(), "行".into())), "用户词同步: {got:?}");
         assert!(got.contains(&("xx".into(), "测试词".into())), "全部词条: {got:?}");
+
+        // Sentence reload may replace the public supplement directly. Its
+        // explicit invalidation must make the next decoder receive fresh words,
+        // even though set_sentence_decoder reuses an already prepared cache.
+        eng.schema.supplement.entries = vec![hufu_dict::supplement::SupplementEntry {
+            word: "啊就".into(),
+            weight: 1.0,
+        }];
+        eng.invalidate_supplement_cache();
+        eng.set_sentence_decoder(Some(Arc::new(Rec(sink.clone()))));
+        let got = sink.lock().unwrap().clone();
+        assert!(got.iter().any(|(_, word)| word == "啊就"), "新语料重注入: {got:?}");
     }
 
     // 【2026-09-06 批次】/ 双档（直出/命名空间）、` 顶屏带·、/jq 加权

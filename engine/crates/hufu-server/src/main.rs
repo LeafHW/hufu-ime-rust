@@ -21,6 +21,8 @@ mod http;
 mod overlay;
 mod pipe;
 mod platform;
+mod scheduling;
+mod skin_files;
 mod ssf;
 mod sync;
 mod trainer;
@@ -40,6 +42,8 @@ struct SchemaWatchTarget {
     current: String,
     dir: PathBuf,
     config_rev: u64,
+    config: hufu_config::Config,
+    resource_generation: u64,
 }
 
 impl SchemaWatchTarget {
@@ -52,16 +56,59 @@ impl SchemaWatchTarget {
                 &host.data_dir, &host.engine.config.schema.dir,
             ).join(&host.engine.config.schema.current),
             config_rev: config_rev(),
+            config: host.engine.config.clone(),
+            resource_generation: host.engine.resource_generation(),
         }
     }
 
     fn is_current(&self, host: &Host) -> bool {
         !host.engine.schema_switch_pending()
             && self.config_rev == config_rev()
+            && self.resource_generation == host.engine.resource_generation()
             && self.data_dir == host.data_dir
             && self.schema_dir == host.engine.config.schema.dir
             && self.current == host.engine.config.schema.current
             && self.dir == host.engine.schema.dir
+    }
+}
+
+/// A reverse-table warmup is useful only for the exact schema/configuration
+/// that requested it. Disk parsing never owns the input Host mutex.
+struct ReverseWarmTarget {
+    path: PathBuf,
+    rule: Option<hufu_dict::ShuangpinRule>,
+    schema_dir: PathBuf,
+    config_rev: u64,
+    resource_generation: u64,
+}
+
+impl ReverseWarmTarget {
+    fn capture(host: &Host) -> Option<Self> {
+        if host.engine.schema.reverse.is_some() {
+            return None;
+        }
+        Some(Self {
+            path: host.engine.schema.reverse_path.clone()?,
+            rule: host.engine.schema.reverse_rule,
+            schema_dir: host.engine.schema.dir.clone(),
+            config_rev: config_rev(),
+            resource_generation: host.engine.resource_generation(),
+        })
+    }
+
+    fn apply(self, host: &mut Host, table: hufu_dict::annotation::ReverseTable) -> bool {
+        if self.config_rev != config_rev()
+            || self.resource_generation != host.engine.resource_generation()
+            || self.schema_dir != host.engine.schema.dir
+            || host.engine.schema.reverse.is_some()
+            || host.engine.schema.reverse_path.as_ref() != Some(&self.path)
+            || host.engine.schema.reverse_rule != self.rule
+        {
+            return false;
+        }
+        host.engine.schema.reverse = Some(table);
+        host.engine.schema.reverse_path = None;
+        true
     }
 }
 
@@ -85,7 +132,7 @@ fn schema_watch_changed_files(
 fn apply_schema_watch_reload(
     host: &mut Host,
     target: &SchemaWatchTarget,
-    schema: hufu_dict::Schema,
+    schema: hufu_engine::PreparedSchema,
 ) -> std::io::Result<bool> {
     apply_preloaded_schema(host, target, &target.current, schema)
 }
@@ -96,15 +143,15 @@ fn apply_preloaded_schema(
     host: &mut Host,
     target: &SchemaWatchTarget,
     name: &str,
-    schema: hufu_dict::Schema,
+    schema: hufu_engine::PreparedSchema,
 ) -> std::io::Result<bool> {
     let expected_dir = hufu_engine::Engine::resolve_data_sub(
         &target.data_dir, &target.schema_dir,
     ).join(name);
-    if !target.is_current(host) || schema.dir != expected_dir {
+    if !target.is_current(host) || schema.schema.dir != expected_dir {
         return Ok(false);
     }
-    host.engine.apply_schema(name, schema)?;
+    host.engine.apply_prepared_schema(name, schema)?;
     host.session.clear();
     Ok(true)
 }
@@ -149,7 +196,7 @@ fn attach_console_for_dev(force: bool, dev_attach: bool) {
 }
 
 /// 【重排防死机·进程级写死 2026-10-12】见 main() 调用点注释（作者令：
-/// 亲和性半核掩码 + BelowNormal，长期有效）。零依赖直声明（与
+/// 亲和性半核掩码 + 输入/后台分级调度）。零依赖直声明（与
 /// attach_console_for_dev 同风格）。结果落 diag\anti-freeze.log 一行
 /// （取证生命线——出事时先看这两项是否真的生效）。
 #[cfg(windows)]
@@ -194,16 +241,11 @@ fn anti_freeze_guards(data_dir: &std::path::Path) {
         } else {
             mask_line = "affinity SKIP (query fail)".into();
         }
-        // 2) 优先级 AboveNormal（2026-11-08 高负载卡键修复）：按键路径
-        //    =宿主 UI 线程同步等本进程响应（ipc 稳态上限 1200ms），进程
-        //    级 BelowNormal 会在整机高负载时把按键响应排到一切 Normal
-        //    进程之后（用户实测"跑点东西打字就卡"）。提级 AboveNormal
-        //    只越过普通负载进程、仍低于 High/Realtime 关键进程；推理打
-        //    分失控风险不回退——专用池仍有每线程 BelowNormal + EcoQoS
-        //    + 打字让键 + 半核亲和四重独立抑制（rerank/model.rs:70-76）。
-        const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
-        if SetPriorityClass(h, ABOVE_NORMAL_PRIORITY_CLASS) != 0 {
-            prio_line = "priority ok AboveNormal".into();
+        // Input pipe threads are explicitly +2 (base 10), preserving the
+        // previous AboveNormal response priority. Keeping the process Normal
+        // avoids promoting HTTP/model I/O and restores rerank pool -1 to base 7.
+        if SetPriorityClass(h, scheduling::PROCESS_PRIORITY_CLASS) != 0 {
+            prio_line = "priority ok Normal; input threads Highest (base 10)".into();
         } else {
             prio_line = format!("priority FAIL (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
@@ -404,9 +446,9 @@ fn main() {
     // 1) 亲和性锁最低半数逻辑核（16 线程机=掩码 0xFF/255）——重排
     //    脉冲振幅封顶一半；native llama.cpp 线程池（FFI 无线程数
     //    参数）同样被进程亲和性兜住。
-    // 2) 进程优先级 BelowNormal——推理让位前台（新线程继承进程级，
-    //    native 线程一并降级；纯 Rust 池另有每线程 BelowNormal+
-    //    EcoQoS，见 hufu-rerank/model.rs）。
+    // 2) Normal process + dedicated input threads +2: input retains base 10,
+    //    background work stays at 8, Rust pool -1 is 7. Native internal threads
+    //    are not assumed to inherit the Rust pool's EcoQoS or foreground yield.
     // 失败（权限/容器）不阻断启动——仅记录，守护脚本/用户可补。
     #[cfg(windows)]
     anti_freeze_guards(&data_dir);
@@ -502,8 +544,19 @@ fn main() {
                 // 动+词典+ngram 并发读盘），减首分把按键撞上 700ms 锁内
                 // 装表的概率；错过窗口首按反查自动懒加载兜底。
                 std::thread::sleep(std::time::Duration::from_secs(6));
-                let mut h = shared_bg.lock().unwrap_or_else(|p| p.into_inner());
-                h.engine.ensure_reverse();
+                let target = {
+                    let h = shared_bg.lock().unwrap_or_else(|p| p.into_inner());
+                    ReverseWarmTarget::capture(&h)
+                };
+                if let Some(target) = target {
+                    match hufu_engine::Engine::prepare_reverse_table(&target.path, target.rule) {
+                        Ok(table) => {
+                            let mut h = shared_bg.lock().unwrap_or_else(|p| p.into_inner());
+                            target.apply(&mut h, table);
+                        }
+                        Err(e) => eprintln!("反查表后台预热失败: {e}"),
+                    }
+                }
             });
     }
 
@@ -827,9 +880,9 @@ fn main() {
                         // 期间用户切方案或保存设置，旧结果作废并下一轮
                         // 重新观察，不能回切旧方案或清空新方案的组字。
                         let ok = {
-                            let loaded = hufu_engine::Engine::load_schema_for(
+                            let loaded = hufu_engine::Engine::prepare_schema_for(
                                 &target.data_dir,
-                                &target.schema_dir,
+                                &target.config,
                                 current,
                             );
                             let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
@@ -1153,7 +1206,10 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                     if resupplement {
                         let p = h.engine.schema.dir.join("补充语料.txt");
                         match hufu_dict::supplement::Supplement::load(&p) {
-                            Ok(s) => h.engine.schema.supplement = s,
+                            Ok(s) => {
+                                h.engine.schema.supplement = s;
+                                h.engine.invalidate_supplement_cache();
+                            }
                             Err(e) => eprintln!("补充语料重读失败: {e}"),
                         }
                     }
@@ -1233,9 +1289,8 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                         {
                             h.engine
                                 .set_sentence_decoder(Some(std::sync::Arc::new(dec)));
-                            // 【用户词注入 2026-09-06】装载后即注入
-                            //（/jc 加词参与整句词图）
-                            h.engine.sync_sentence_user_words();
+                            // set_sentence_decoder also installs the prepared
+                            // user-word snapshot; do not rebuild it twice here.
                             eprintln!(
                                 "整句引擎已加载（后台 {:.1}s）: {}",
                                 t0.elapsed().as_secs_f32(),
@@ -2783,6 +2838,16 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             return Response::err(403, "跨源请求被拒绝");
         }
     }
+    // File edits serialize independently of Host. In particular overlay-purge
+    // drops Host while scanning files; a concurrent save/font wheel waits here
+    // before it can hold the engine lock, preserving edit order without key lag.
+    let _skin_edit = if (req.method == "POST" || req.method == "DELETE")
+        && (req.path.starts_with("/api/skin") || req.path == "/api/settings_import")
+    {
+        Some(skin_files::edit_lock())
+    } else {
+        None
+    };
     if req.path.starts_with("/api/trainer/") {
         return trainer::route(host, req);
     }
@@ -3209,14 +3274,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // → 仍给 409，不覆盖）。
             let need_load = cfg.schema.current != host.engine.config.schema.current
                 || cfg.schema.dir != host.engine.config.schema.dir;
-            let pre = if need_load && !cfg.schema.current.is_empty() {
+            let pre = if host.config_needs_preparation(&cfg) {
                 let data_dir = host.data_dir.clone();
                 let orig_current = host.engine.config.schema.current.clone();
-                let cfg_dir = cfg.schema.dir.clone();
-                let cfg_current = cfg.schema.current.clone();
                 drop(host);
-                let loaded =
-                    hufu_engine::Engine::load_schema_for(&data_dir, &cfg_dir, &cfg_current);
+                let loaded = Host::prepare_config(&data_dir, orig_current, &cfg, need_load);
                 host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                 // 二次 CAS：装载窗口内他页已保存 → 409（与开头同款响应）
                 if let Some(cr) = client_rev {
@@ -3239,7 +3301,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         .with_status(409);
                     }
                 }
-                Some((orig_current, loaded))
+                Some(loaded)
             } else {
                 None
             };
@@ -3356,6 +3418,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 return Response::err(400, "非法皮肤 id");
             }
             let p = host.skins_dir().join(format!("{id}.json"));
+            drop(host);
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {
                     // 【id 不变量】返回体 id 强制=请求 id（文件名）。皮肤
@@ -3589,23 +3652,25 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             if !img.starts_with("data:") || img.len() < 1024 {
                 return Response::err(400, "image 缺失或过小（只清扫 ≥1KB 的贴图 data-URL）");
             }
+            let data_dir = host.data_dir.clone();
+            drop(host);
             let mut vector = Vec::new();
-            for (id, name) in host.list_skins() {
-                let p = host.skins_dir().join(format!("{id}.json"));
+            for (id, name, _, _) in list_skins_with_palette_at(&data_dir) {
+                let p = data_dir.join("皮肤").join(format!("{id}.json"));
                 let Ok(txt) = std::fs::read_to_string(&p) else { continue };
                 let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
                 let n = overlay_purge::purge_widget_image(&mut val, &img);
                 if n > 0 {
                     if let Ok(t) = serde_json::to_string_pretty(&val) {
-                        if std::fs::write(&p, t).is_ok() {
+                        if skin_files::write_atomic(&p, t.as_bytes()).is_ok() {
                             vector.push(serde_json::json!({ "skin": id, "name": name, "count": n }));
                         }
                     }
                 }
             }
             let mut ssf = Vec::new();
-            for e in host.list_ssf_skins() {
-                let p = crate::ssf::ssf_cache_root(&host.data_dir)
+            for e in crate::ssf::list_ssf(&data_dir) {
+                let p = crate::ssf::ssf_cache_root(&data_dir)
                     .join(&e.id)
                     .join("overrides.json");
                 let Ok(txt) = std::fs::read_to_string(&p) else { continue };
@@ -3613,13 +3678,14 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 let n = overlay_purge::purge_widget_image(&mut val, &img);
                 if n > 0 {
                     if let Ok(t) = serde_json::to_string_pretty(&val) {
-                        if std::fs::write(&p, t).is_ok() {
+                        if skin_files::write_atomic(&p, t.as_bytes()).is_ok() {
                             ssf.push(serde_json::json!({ "skin": e.id, "name": e.name, "count": n }));
                         }
                     }
                 }
             }
             if !vector.is_empty() || !ssf.is_empty() {
+                let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                 host.skin_ver += 1; // DLL poll 发现皮肤版本变化即重拉
             }
             Response::json(&serde_json::json!({ "ok": true, "vector": vector, "ssf": ssf }))
@@ -3863,6 +3929,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 .unwrap_or("")
                 .to_string();
             let dec = host.engine.sentence_decoder().cloned();
+            drop(host);
             match dec {
                 Some(d) => {
                     let cands = d.decode(&raw);
@@ -4218,10 +4285,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 错误文案/成功行为（session.clear + 句模型后台重建 + 落盘）
             // 与旧实现完全一致。
             let data_dir = host.data_dir.clone();
-            let schema_dir = host.engine.config.schema.dir.clone();
+            let config = host.engine.config.clone();
             let target = SchemaWatchTarget::capture(&host);
             drop(host);
-            match hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name) {
+            match hufu_engine::Engine::prepare_schema_for(&data_dir, &config, &name) {
                 Ok(prepared) => {
                     let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                     match apply_preloaded_schema(&mut host, &target, &name, prepared) {
@@ -4517,8 +4584,8 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 【流畅度二批 2026-11-07】schema 变更段锁外预装载（原
             // apply_config 锁内装载 0.05-2s 顶全机键）：落盘期间运行
             // 时漂移守卫仍在锁内比对；装载放锁外，装载期间再被切走
-            // 由 apply_config 的 orig 守卫兜底（现值≠发起时 → 放弃
-            // schema 切换只存其余）。
+            // Prepared-resource drift rejects the configuration write before
+            // persistence; it cannot silently apply resources for an old schema.
             let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
             // 【防回归修复(08-reg P3-2) 2026-11-07】导入落盘期间并发的
             // 运行时改动（Ctrl+M 切方案/云恢复等）不能被整份 apply_
@@ -4530,15 +4597,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
             let need_load = cfg.schema.current != host.engine.config.schema.current
                 || cfg.schema.dir != host.engine.config.schema.dir;
-            let pre = if need_load && !cfg.schema.current.is_empty() {
+            let pre = if host.config_needs_preparation(&cfg) {
                 let data_dir = host.data_dir.clone();
                 let orig = host.engine.config.schema.current.clone();
-                let d = cfg.schema.dir.clone();
-                let c = cfg.schema.current.clone();
                 drop(host);
-                let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
+                let loaded = Host::prepare_config(&data_dir, orig, &cfg, need_load);
                 host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
-                Some((orig, loaded))
+                Some(loaded)
             } else {
                 None
             };
@@ -5709,6 +5774,111 @@ mod config_route_tests {
         cfg
     }
 
+    fn latency_fixture(tag: &str) -> (PathBuf, Host) {
+        let root = std::env::temp_dir().join(format!("hufu-latency-{tag}-{}", std::process::id()));
+        let data = root.join("数据");
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["A", "B"] {
+            let dir = root.join("码表").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("main.txt"), format!("#hufu-dict v1 name={name}\na\t后\n")).unwrap();
+        }
+        std::fs::write(data.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "schema": { "dir": "码表", "current": "A" },
+            "input": { "auto_push": false, "auto_select_unique": false },
+            "sentence": { "enabled": false, "rerank": { "enabled": false } },
+            "user": { "auto_frequency": false, "log_adjust": false }
+        })).unwrap()).unwrap();
+        let host = Host::new(&data).unwrap();
+        (root, host)
+    }
+
+    #[test]
+    fn settings_commit_uses_prepared_schema_and_conversion_without_reading_again() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let (root, mut host) = latency_fixture("prepared-config");
+        let conversion = host.data_dir.join("转换词典");
+        std::fs::create_dir_all(&conversion).unwrap();
+        std::fs::write(conversion.join("STCharacters.txt"), "后\t後\n").unwrap();
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.current = "B".into();
+        cfg.opencc.enabled = true;
+        let prepared = Host::prepare_config(&host.data_dir, "A".into(), &cfg, true);
+        std::fs::remove_dir_all(root.join("码表/B")).unwrap();
+        std::fs::remove_dir_all(conversion).unwrap();
+        host.apply_config(cfg, Some(prepared)).unwrap();
+        assert_eq!(host.engine.config.schema.current, "B");
+        let out = host.process_key(parse_key(&serde_json::json!({"key":"a"})).unwrap());
+        assert_eq!(out["state"]["candidates"][0]["text"], "後");
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reverse_warmup_rejects_stale_generation_and_does_not_replace_a_ready_table() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let (root, mut host) = latency_fixture("reverse-warm");
+        let path = host.data_dir.join("reverse-test.txt");
+        std::fs::write(&path, "后\thou\n").unwrap();
+        host.engine.schema.reverse = None;
+        host.engine.schema.reverse_path = Some(path.clone());
+        host.engine.schema.reverse_rule = None;
+        let target = ReverseWarmTarget::capture(&host).unwrap();
+        let table = hufu_engine::Engine::prepare_reverse_table(&path, None).unwrap();
+        bump_config_rev();
+        assert!(!target.apply(&mut host, table));
+        let target = ReverseWarmTarget::capture(&host).unwrap();
+        let table = hufu_engine::Engine::prepare_reverse_table(&path, None).unwrap();
+        host.engine.set_sentence_decoder(None); // resource-generation change
+        assert!(!target.apply(&mut host, table));
+        let target = ReverseWarmTarget::capture(&host).unwrap();
+        let table = hufu_engine::Engine::prepare_reverse_table(&path, None).unwrap();
+        assert!(target.apply(&mut host, table));
+        assert!(host.engine.schema.reverse.is_some());
+        assert!(host.engine.schema.reverse_path.is_none());
+        assert!(ReverseWarmTarget::capture(&host).is_none());
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sentence_preview_releases_host_while_decoder_is_busy() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        struct BlockingDecoder {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl hufu_engine::SentenceDecoder for BlockingDecoder {
+            fn decode_rich(&self, _: &str) -> Arc<hufu_engine::SentenceDecode> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
+                Arc::new(hufu_engine::SentenceDecode {
+                    hits: Vec::new(), truncated: false, early_hits: Vec::new(), early_truncated: false,
+                })
+            }
+        }
+        let (root, mut host) = latency_fixture("preview-lock");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        host.engine.set_sentence_decoder(Some(Arc::new(BlockingDecoder {
+            entered: entered_tx, release: Mutex::new(release_rx),
+        })));
+        let host = Arc::new(Mutex::new(host));
+        let serving = host.clone();
+        let worker = std::thread::spawn(move || route(&serving, &Request {
+            method: "POST".into(), path: "/api/sentence_test".into(),
+            query: Default::default(), body: br#"{"raw":"abc"}"#.to_vec(),
+            headers: [("host".into(), "127.0.0.1:4390".into())].into_iter().collect(),
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let available = host.try_lock().is_ok();
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().status, 200);
+        assert!(available, "settings preview must not block unrelated input behind Host");
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Real HTTP parsing, route locking, config persistence and pipe mutations;
     /// no tray, global pipe listener, keyboard injection or installed user data.
     #[test]
@@ -5936,8 +6106,8 @@ mod config_route_tests {
         let mut host = Host::new(&data).unwrap();
         let preload = |host: &Host| {
             let target = SchemaWatchTarget::capture(host);
-            let schema = hufu_engine::Engine::load_schema_for(
-                &target.data_dir, &target.schema_dir, &target.current,
+            let schema = hufu_engine::Engine::prepare_schema_for(
+                &target.data_dir, &target.config, &target.current,
             ).unwrap();
             (target, schema)
         };
@@ -6015,9 +6185,15 @@ mod config_route_tests {
         // dictionary, rather than disabling automatic reload to avoid races.
         let target = SchemaWatchTarget::capture(&host);
         std::fs::write(target.dir.join("main.txt"), "#hufu-dict v1 name=A\na\t重载成功\n").unwrap();
-        let loaded = hufu_engine::Engine::load_schema_for(&target.data_dir, &target.schema_dir, &target.current).unwrap();
+        let loaded = hufu_engine::Engine::prepare_schema_for(&target.data_dir, &target.config, &target.current).unwrap();
+        let (stale_target, stale_loaded) = preload(&host);
         assert!(apply_schema_watch_reload(&mut host, &target, loaded).unwrap());
         assert_eq!(host.session.raw, "");
+        host.session.raw = "a".into();
+        assert!(!apply_schema_watch_reload(&mut host, &stale_target, stale_loaded).unwrap(),
+            "a same-name reload invalidates older prepared resources even without a config save");
+        assert_eq!(host.session.raw, "a");
+        host.session.clear();
         host.process_key(parse_key(&serde_json::json!({"key": "a"})).unwrap());
         assert_chinese_commit(&host.process_key(parse_key(&serde_json::json!({"key": "space"})).unwrap()), "重载成功");
         let _ = std::fs::remove_dir_all(root);
@@ -6045,7 +6221,7 @@ mod config_route_tests {
         let mut host = Host::new(&data).unwrap();
         let prepare = |host: &Host, name: &str| {
             let target = SchemaWatchTarget::capture(host);
-            let loaded = hufu_engine::Engine::load_schema_for(&target.data_dir, &target.schema_dir, name).unwrap();
+            let loaded = hufu_engine::Engine::prepare_schema_for(&target.data_dir, &target.config, name).unwrap();
             (target, loaded)
         };
         // HTTP and pipe now share this commit boundary. Reproduce the old race

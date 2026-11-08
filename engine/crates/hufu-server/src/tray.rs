@@ -648,6 +648,8 @@ fn schema_snapshot() -> (Vec<String>, String) {
         return (Vec::new(), String::new());
     };
     let dir = hufu_engine::Engine::resolve_data_sub(&host.data_dir, &host.engine.config.schema.dir);
+    let current = host.engine.config.schema.current.clone();
+    drop(host);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -659,7 +661,7 @@ fn schema_snapshot() -> (Vec<String>, String) {
         .unwrap_or_default();
     names.sort();
     names.truncate(SCHEMA_MAX);
-    (names, host.engine.config.schema.current.clone())
+    (names, current)
 }
 
 /// 切换方案（与 POST /api/schema 同逻辑：换方案 + 清会话 + 重建整句 + 落盘）。
@@ -669,15 +671,14 @@ fn schema_snapshot() -> (Vec<String>, String) {
 /// 装载早已完成，短锁应用零感知。
 fn switch_schema(name: &str) {
     let Some(shared) = SHARED.get() else { return };
-    let (data_dir, schema_dir) = {
+    let target = {
         let Ok(host) = shared.lock() else { return };
-        (host.data_dir.clone(), host.engine.config.schema.dir.clone())
+        crate::SchemaWatchTarget::capture(&host)
     };
-    let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, name);
+    let loaded = hufu_engine::Engine::prepare_schema_for(&target.data_dir, &target.config, name);
     let Ok(mut host) = shared.lock() else { return };
     if let Ok(schema) = loaded {
-        if host.engine.apply_schema(name, schema).is_ok() {
-            host.session.clear();
+        if matches!(crate::apply_preloaded_schema(&mut host, &target, name, schema), Ok(true)) {
             // 【卡死修复 2026-09-11】后台重建整句（旧 setup_sentence 持锁
             // 载 546MB 模型秒级卡全机打字）。本线程持锁中——reload 内部
             // 再 spawn 井线程等锁，无死锁。
