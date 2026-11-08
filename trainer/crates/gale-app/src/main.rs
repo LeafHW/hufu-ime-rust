@@ -86,6 +86,8 @@ fn heatmap_vk(vk: u32) -> Option<u8> {
 /// 后，把发射点换绑即可，main.rs 这边的解码可原样退役。
 const AUX_PREFIX: char = '\u{e000}';
 const AUX_REGISTER: &str = "online_register";
+const AUX_REGISTER_CODE: &str = "online_reg_code";
+const AUX_REGISTER_SUBMIT: &str = "online_reg_submit";
 const AUX_AUTO_NEXT: &str = "online_auto_next";
 const AUX_SINGLE_SHUFFLE: &str = "single_shuffle";
 const AUX_SINGLE_SEG_PLUS: &str = "single_seg+5";
@@ -94,7 +96,12 @@ const AUX_SHOW_FULL: &str = "show_full_analysis";
 const AUX_SHOW_HEATMAP: &str = "show_heatmap";
 
 enum AuxAction {
+    /// 登录卡 ↔ 注册卡切换（原整改2c"开站点注册页"已由应用内注册卡取代）。
     OnlineRegister,
+    /// 注册卡"发送验证码"（RegisterSendCode，60s 客户端冷却）。
+    OnlineRegisterCode,
+    /// 注册卡"注册并登录"（Register，worker 内成功后自动登录）。
+    OnlineRegisterSubmit,
     OnlineAutoNext,
     SingleShuffle,
     SingleSeg(i32),
@@ -109,6 +116,8 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
     let cmd = s.strip_prefix(AUX_PREFIX)?;
     Some(match cmd {
         AUX_REGISTER => AuxAction::OnlineRegister,
+        AUX_REGISTER_CODE => AuxAction::OnlineRegisterCode,
+        AUX_REGISTER_SUBMIT => AuxAction::OnlineRegisterSubmit,
         AUX_AUTO_NEXT => AuxAction::OnlineAutoNext,
         AUX_SINGLE_SHUFFLE => AuxAction::SingleShuffle,
         AUX_SINGLE_SEG_PLUS => AuxAction::SingleSeg(5),
@@ -390,6 +399,9 @@ struct App {
     /// 整改2b：自动下一段开关（online.json）+ 结算后自动取文的到期时刻
     online_auto_next: bool,
     auto_next_at: Option<u64>,
+    /// 注册卡"发送验证码"重发冷却截止时刻（ms，0=空闲；主循环每秒折算
+    /// model.online_code_wait 供注册卡按钮显示剩余秒）。
+    reg_code_until: u64,
     /// 整改2a：当前会话正文是否来自在线文（自动下一段的判据）
     online_article_current: bool,
     /// 整改6：Ctrl+滚轮字号防抖落盘时刻（800ms）
@@ -552,6 +564,7 @@ fn run() -> Result<(), String> {
         tsf_broken: !host_ctf_ok,
         online_auto_next: OnlinePrefs::load(&dir.join("online.json")).auto_next,
         auto_next_at: None,
+        reg_code_until: 0,
         online_article_current: false,
         font_save_due: None,
         qq_scan_at: 0,
@@ -596,6 +609,19 @@ fn run() -> Result<(), String> {
         }
         let now = app.ms();
         let seconds = app.clock.elapsed().as_secs_f64();
+        // 注册卡"发送验证码"60s 冷却：每秒折算剩余秒刷新按钮禁用态显示。
+        let code_wait = app
+            .reg_code_until
+            .checked_sub(now)
+            .map(|ms| ((ms + 999) / 1000) as u16)
+            .unwrap_or(0);
+        if code_wait == 0 {
+            app.reg_code_until = 0;
+        }
+        if app.model.online_code_wait != code_wait {
+            app.model.online_code_wait = code_wait;
+            gale_win::window::request_frame();
+        }
         if app.capture_fields() {
             gale_win::window::request_frame();
         }
@@ -901,6 +927,7 @@ fn run() -> Result<(), String> {
         let need_timer = animate
             || app.sess.phase == Phase::Typing
             || app.online_pending > 0
+            || app.reg_code_until > 0
             || app.analyzing
             || app.qq_busy
             || app.font_save_due.is_some()
@@ -1188,21 +1215,61 @@ impl App {
     fn run_aux(&mut self, aux: AuxAction) {
         match aux {
             AuxAction::OnlineRegister => {
-                // 整改2c：注册/账号入口（默认站首页；URL 实查结论见 wenlai.rs）
-                let url = gale_core::wenlai::register_url_for(&self.cfg.wenlai_domain);
-                let wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
-                unsafe {
-                    let r = windows::Win32::UI::Shell::ShellExecuteW(
-                        self.win.hwnd(),
-                        windows::core::w!("open"),
-                        windows::core::PCWSTR(wide.as_ptr()),
-                        None,
-                        None,
-                        SW_SHOWNORMAL,
-                    );
-                    if r.0 as isize <= 32 {
-                        self.toast("无法打开注册页面，请检查默认浏览器");
-                    }
+                // 登录卡 ↔ 注册卡切换（原整改2c开站点入口退役：晴站注册
+                // API 已实装 /api/auth/register*，见 wenlai.rs 与 online.rs）。
+                self.model.online_register_mode = !self.model.online_register_mode;
+                self.model.modal_epoch += 1; // 编辑控件集不同，强制重建
+                self.model.online_status = if self.model.online_register_mode {
+                    "填写用户名、密码与邮箱验证码注册".into()
+                } else {
+                    "登录后收起此页，可按分类、难度取文。".into()
+                };
+            }
+            AuxAction::OnlineRegisterCode => {
+                let now = self.ms();
+                if self.reg_code_until > now {
+                    self.toast("验证码已发送，请稍候再试");
+                    return;
+                }
+                let email = self.model.field("reg_email").trim().to_string();
+                if email.is_empty() || !email.contains('@') {
+                    self.toast("请输入正确的邮箱地址");
+                    return;
+                }
+                self.submit_online(OnlineCommand::RegisterSendCode { email });
+            }
+            AuxAction::OnlineRegisterSubmit => {
+                let username = self.model.field("username");
+                let password = self.model.field("password");
+                let email = self.model.field("reg_email").trim().to_string();
+                let code = self.model.field("reg_code").trim().to_string();
+                if username.trim().is_empty() {
+                    self.toast("请输入用户名");
+                    return;
+                }
+                if password.is_empty() {
+                    self.toast("请输入密码");
+                    return;
+                }
+                if email.is_empty() || !email.contains('@') {
+                    self.toast("请输入正确的邮箱地址");
+                    return;
+                }
+                if code.is_empty() {
+                    self.toast("请输入邮箱验证码");
+                    return;
+                }
+                self.cfg.wenlai_username = username.clone();
+                self.submit_online(OnlineCommand::Register {
+                    username,
+                    password,
+                    email,
+                    code,
+                });
+                // 与 OnlineLogin 同口径：密码提交后立即从输入框清除。
+                self.model.fields.insert("password".into(), String::new());
+                if let Some(e) = self.edits.get("password") {
+                    e.set_text("");
                 }
             }
             AuxAction::OnlineAutoNext => {
@@ -1802,7 +1869,10 @@ impl App {
         }
         let identity_change = matches!(
             &c,
-            OnlineCommand::Login { .. } | OnlineCommand::Logout | OnlineCommand::SetServer { .. }
+            OnlineCommand::Login { .. }
+                | OnlineCommand::Logout
+                | OnlineCommand::SetServer { .. }
+                | OnlineCommand::Register { .. }
         );
         match self
             .online
@@ -1853,6 +1923,7 @@ impl App {
                     self.model.online_authenticated = true;
                     self.model.online_expired = false;
                     self.model.online_login_expanded = false;
+                    self.model.online_register_mode = false;
                     self.model.online_account = a.display_name.clone();
                     if self.model.modal == Modal::Online {
                         self.model.modal_epoch += 1;
@@ -1956,6 +2027,12 @@ impl App {
                         self.model.modal_epoch += 1;
                     }
                     self.model.online_status = "已退出登录".into();
+                }
+                Ok(OnlinePayload::CodeSent) => {
+                    // 验证码已发出：启动 60 秒重发冷却（主循环每秒刷新剩余秒）。
+                    self.reg_code_until = self.ms() + 60_000;
+                    self.model.online_status = "验证码已发送，请查收邮箱".into();
+                    self.toast("验证码已发送，请查收邮箱");
                 }
                 Ok(OnlinePayload::Warning(e)) | Err(e) => {
                     self.model.online_status = e.clone();

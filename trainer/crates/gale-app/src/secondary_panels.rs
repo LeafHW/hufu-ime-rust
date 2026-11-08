@@ -1780,82 +1780,154 @@ fn draw_online(
         t,
     );
     if m.online_login_expanded {
-        for (yy, height) in [(153., 28.), (205., 28.), (311., 30.)] {
-            round(
+        // 展开区二态：登录卡 / 注册卡（aux "online_register" 切换；注册走
+        // /api/auth/register/sendCode + /api/auth/register，成功后自动登录）。
+        if m.online_register_mode {
+            // 注册卡：用户名/密码（与登录卡共用输入框 id，来回切换保留已填
+            // 内容）+ 邮箱 + 验证码（右侧挂"发送验证码"，60s 冷却禁用显示
+            // 剩余秒，倒计时由主循环按秒刷新 model.online_code_wait）。
+            for (yy, height, bw) in [
+                (153., 28., left - 30.),
+                (205., 28., left - 30.),
+                (257., 28., left - 30.),
+                (309., 28., left - 30. - 92.),
+            ] {
+                round(f, x + 15., y + yy - 1., bw, height + 2., 5., p.bg2, Some(p.line2));
+            }
+            for (yy, label) in [
+                (137., "用户名"),
+                (189., "密码 · 不保存"),
+                (241., "邮箱"),
+                (293., "验证码 · 邮箱收取"),
+            ] {
+                text(f, x + 16., y + yy, 8.5, label, p.muted);
+            }
+            let send_label;
+            let send_action = if m.online_code_wait > 0 {
+                send_label = format!("重发 {}s", m.online_code_wait);
+                Action::None
+            } else {
+                send_label = "发送验证码".into();
+                crate::aux_marker("online_reg_code")
+            };
+            action(
                 f,
-                x + 15.,
-                y + yy - 1.,
-                left - 30.,
-                height + 2.,
-                5.,
-                p.bg2,
-                Some(p.line2),
+                hs,
+                x + left - 101.,
+                y + 306.,
+                86.,
+                &send_label,
+                send_action,
+                t,
+                false,
+            );
+            action(
+                f,
+                hs,
+                x + 16.,
+                y + 353.,
+                iw - 8.,
+                "注册并登录",
+                crate::aux_marker("online_reg_submit"),
+                t,
+                true,
+            );
+            link(
+                f,
+                hs,
+                x + 16.,
+                y + 394.,
+                64.,
+                "‹ 返回登录",
+                crate::aux_marker("online_register"),
+                t,
+            );
+            paragraph(
+                f,
+                x + 16.,
+                y + 424.,
+                iw - 8.,
+                60.,
+                9.,
+                20.,
+                "验证码 60 秒内只能获取一次；\n注册成功后将自动登录。",
+                p.muted,
+            );
+        } else {
+            for (yy, height) in [(153., 28.), (205., 28.), (311., 30.)] {
+                round(
+                    f,
+                    x + 15.,
+                    y + yy - 1.,
+                    left - 30.,
+                    height + 2.,
+                    5.,
+                    p.bg2,
+                    Some(p.line2),
+                );
+            }
+            for (yy, label) in [
+                (137., "用户名"),
+                (189., "密码 · 不保存"),
+                (293., "服务地址 · 仅 HTTPS"),
+            ] {
+                text(f, x + 16., y + yy, 8.5, label, p.muted);
+            }
+            action(
+                f,
+                hs,
+                x + 16.,
+                y + 245.,
+                (iw - 20.) / 2.,
+                "登录",
+                Action::OnlineLogin,
+                t,
+                true,
+            );
+            action(
+                f,
+                hs,
+                x + 22. + (iw - 20.) / 2.,
+                y + 245.,
+                (iw - 20.) / 2.,
+                "退出登录",
+                Action::OnlineLogout,
+                t,
+                false,
+            );
+            action(
+                f,
+                hs,
+                x + 16.,
+                y + 353.,
+                iw - 8.,
+                "应用服务地址",
+                Action::OnlineServer,
+                t,
+                false,
+            );
+            paragraph(
+                f,
+                x + 16.,
+                y + 405.,
+                iw - 8.,
+                90.,
+                9.,
+                20.,
+                "登录后收起此页，可按分类、难度取文。\n切换服务后需要重新登录。",
+                p.muted,
+            );
+            link(
+                f,
+                hs,
+                x + 16.,
+                y + 452.,
+                120.,
+                "没有账号？注册",
+                crate::aux_marker("online_register"),
+                t,
             );
         }
-        for (yy, label) in [
-            (137., "用户名"),
-            (189., "密码 · 不保存"),
-            (293., "服务地址 · 仅 HTTPS"),
-        ] {
-            text(f, x + 16., y + yy, 8.5, label, p.muted);
-        }
-        // 整改2c：登录行三键（登录 | 注册账号 | 退出登录）——注册走
-        // U+E000 标记动作，main.rs aux 解码后 ShellExecuteW 开站点账号入口
-        action(
-            f,
-            hs,
-            x + 16.,
-            y + 245.,
-            (iw - 20.) / 3.,
-            "登录",
-            Action::OnlineLogin,
-            t,
-            true,
-        );
-        action(
-            f,
-            hs,
-            x + 22. + (iw - 20.) / 3.,
-            y + 245.,
-            (iw - 20.) / 3.,
-            "注册账号",
-            crate::aux_marker("online_register"),
-            t,
-            false,
-        );
-        action(
-            f,
-            hs,
-            x + 28. + (iw - 20.) / 3. * 2.,
-            y + 245.,
-            (iw - 20.) / 3.,
-            "退出登录",
-            Action::OnlineLogout,
-            t,
-            false,
-        );
-        action(
-            f,
-            hs,
-            x + 16.,
-            y + 353.,
-            iw - 8.,
-            "应用服务地址",
-            Action::OnlineServer,
-            t,
-            false,
-        );
-        paragraph(
-            f,
-            x + 16.,
-            y + 405.,
-            iw - 8.,
-            90.,
-            9.,
-            20.,
-            "登录后收起此页，可按分类、难度取文。\n切换服务后需要重新登录。",
-            p.muted,
-        );
     } else {
         if m.online_expired {
             round(
@@ -2952,9 +3024,18 @@ pub fn fields(m: &Model, x: f32, y: f32, pw: f32, ph: f32) -> Vec<FieldSpec> {
         Modal::Online => {
             let side = online_side(pw);
             if m.online_login_expanded {
-                add("username", x + 16., y + 153., side - 32., 28., false, false);
-                add("password", x + 16., y + 205., side - 32., 28., false, true);
-                add("server", x + 16., y + 311., side - 32., 30., false, false);
+                if m.online_register_mode {
+                    // 注册卡：用户名/密码与登录卡共用 id（切换保留已填内容）；
+                    // 验证码输入框右侧留 92px 给"发送验证码"按钮。
+                    add("username", x + 16., y + 153., side - 32., 28., false, false);
+                    add("password", x + 16., y + 205., side - 32., 28., false, true);
+                    add("reg_email", x + 16., y + 257., side - 32., 28., false, false);
+                    add("reg_code", x + 16., y + 309., side - 124., 28., false, false);
+                } else {
+                    add("username", x + 16., y + 153., side - 32., 28., false, false);
+                    add("password", x + 16., y + 205., side - 32., 28., false, true);
+                    add("server", x + 16., y + 311., side - 32., 30., false, false);
+                }
             } else if m.online_authenticated && !m.online_expired {
                 add(
                     "online_chars",
@@ -3069,6 +3150,78 @@ mod tests {
             assert!(raw.w > 100. && rw > raw.w * 2.);
             assert!(raw.y + raw.h < 598.);
         }
+    }
+
+    #[test]
+    fn register_card_fields_and_hits_match_layout() {
+        let cfg = Config::default();
+        let t = crate::ui::theme("墨玉");
+        for pw in [640., 880.] {
+            let side = online_side(pw);
+            let mut m = Model::default();
+            m.modal = Modal::Online;
+            m.online_login_expanded = true;
+            m.online_register_mode = true;
+            // 字段集：用户名/密码共用 + 邮箱 + 验证码（窄 92px 让位发码按钮）
+            let fs = fields(&m, 0., 0., pw, 660.);
+            let ids: Vec<&str> = fs.iter().map(|z| z.id).collect();
+            assert_eq!(ids, vec!["username", "password", "reg_email", "reg_code"]);
+            let code = fs.iter().find(|z| z.id == "reg_code").unwrap();
+            assert_eq!(code.w, side - 124.);
+            assert!(code.x + code.w < 16. + side - 15.); // 不压右侧发码按钮
+            // 发码按钮可点；倒计时中禁用（无 hit）；注册/返回动作命中
+            let mut f = Frame::new(pw, 660.);
+            let mut hs = Vec::new();
+            draw_online(&mut f, &mut hs, &m, &cfg, &t, 0., 0., pw, 660.);
+            let btn_x = 0. + side - 101. + 20.;
+            let btn_y = 306. + 16.;
+            assert!(matches!(
+                crate::modals::hit(&hs, btn_x, btn_y),
+                Some(Action::Theme(_))
+            ));
+            assert!(matches!(
+                crate::modals::hit(&hs, 40., 353. + 16.),
+                Some(Action::Theme(_))
+            ));
+            assert!(matches!(
+                crate::modals::hit(&hs, 40., 394. + 10.),
+                Some(Action::Theme(_))
+            ));
+            // 冷却中：发码按钮不再可点
+            m.online_code_wait = 59;
+            let mut f = Frame::new(pw, 660.);
+            let mut hs = Vec::new();
+            draw_online(&mut f, &mut hs, &m, &cfg, &t, 0., 0., pw, 660.);
+            assert_eq!(crate::modals::hit(&hs, btn_x, btn_y), None);
+        }
+    }
+
+    #[test]
+    fn login_card_shows_register_entry_link() {
+        let cfg = Config::default();
+        let t = crate::ui::theme("墨玉");
+        let mut m = Model::default();
+        m.modal = Modal::Online;
+        m.online_login_expanded = true;
+        let fs = fields(&m, 0., 0., 880., 660.);
+        let ids: Vec<&str> = fs.iter().map(|z| z.id).collect();
+        assert_eq!(ids, vec!["username", "password", "server"]);
+        let mut f = Frame::new(880., 660.);
+        let mut hs = Vec::new();
+        draw_online(&mut f, &mut hs, &m, &cfg, &t, 0., 0., 880., 660.);
+        // 底部"没有账号？注册"链接 → aux 注册切换；登录键仍在原位
+        assert!(matches!(
+            crate::modals::hit(&hs, 40., 452. + 10.),
+            Some(Action::Theme(_))
+        ));
+        assert_eq!(
+            crate::modals::hit(&hs, 40., 245. + 16.),
+            Some(Action::OnlineLogin)
+        );
+        assert_eq!(
+            crate::modals::hit(&hs, 200., 245. + 16.),
+            Some(Action::OnlineLogout)
+        );
     }
 
     #[test]

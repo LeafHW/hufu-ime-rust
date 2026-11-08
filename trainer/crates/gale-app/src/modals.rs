@@ -154,6 +154,11 @@ pub struct Model {
     pub online_strict: bool,
     pub online_busy: bool,
     pub online_login_expanded: bool,
+    /// 注册卡模式（展开的登录区二态：登录卡 / 注册卡，aux "online_register" 切换）。
+    pub online_register_mode: bool,
+    /// 注册验证码重发冷却剩余秒数（>0 时"发送验证码"按钮禁用并显示剩余秒；
+    /// 由主循环按 reg_code_until 截止时刻每秒刷新）。
+    pub online_code_wait: u16,
     pub online_authenticated: bool,
     pub online_expired: bool,
     pub online_account: String,

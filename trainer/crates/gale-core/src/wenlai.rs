@@ -409,6 +409,60 @@ impl<T: HttpTransport> WenlaiHttpClient<T> {
         Ok(())
     }
 
+    /// POST /api/auth/register/sendCode，body `{"email"}`（注册邮箱验证码；
+    /// 逆向报告 §4.2：无图片码，60 秒冷却由服务端判，命中时 code!=200，
+    /// msg 透传给调用方展示）。
+    pub fn register_send_code(&mut self, email: &str) -> GaleResult<()> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(crate::GaleError::Msg("请输入邮箱地址".into()));
+        }
+        let body = self
+            .post_json("/api/auth/register/sendCode", json!({ "email": email }))
+            .map_err(crate::GaleError::Msg)?;
+        parse_envelope(&body)
+            .map_err(crate::GaleError::Msg)
+            .map(|_| ())
+    }
+
+    /// POST /api/auth/register `{username,password,email,code}`（publicKey 为
+    /// 赛文加密可选项，不做赛文加密就不传）→ 注册成功后自动走现有 login 换取
+    /// token（注册响应 data 是否直接返回 token 未确认，保守一律重登），
+    /// 返回与 login 同型的账号。
+    pub fn register(
+        &mut self,
+        username: &str,
+        password: &str,
+        email: &str,
+        code: &str,
+    ) -> GaleResult<WenlaiAccount> {
+        if username.trim().is_empty()
+            || password.is_empty()
+            || email.trim().is_empty()
+            || code.trim().is_empty()
+        {
+            return Err(crate::GaleError::Msg(
+                "请填写用户名、密码、邮箱和验证码".into(),
+            ));
+        }
+        // 注册属换号操作：先清旧会话（注册请求不应携带旧账号 Bearer）。
+        self.logout();
+        let body = self
+            .post_json(
+                "/api/auth/register",
+                json!({
+                    "username": username.trim(),
+                    "password": password,
+                    "email": email.trim(),
+                    "code": code.trim(),
+                }),
+            )
+            .map_err(crate::GaleError::Msg)?;
+        // 业务失败（code!=200）时 msg 透传（"用户名已被注册"/"验证码错误"等）。
+        parse_envelope(&body).map_err(crate::GaleError::Msg)?;
+        self.login(username.trim(), password)
+    }
+
     pub fn bookshelf(&self) -> Result<Vec<ShelfBook>, String> {
         let body = self.get_idempotent("/api/userBookConfig/list")?;
         let data = parse_envelope(&body)?;
@@ -1296,6 +1350,86 @@ mod tests {
         let body: Value = serde_json::from_str(reqs[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["username"], "山君");
         assert_eq!(body["password"], "pw");
+    }
+
+    // ── 注册（晴站 /api/auth/register*，逆向报告 §4.2/§4.3）──
+
+    #[test]
+    fn client_register_send_code_ok() {
+        let t = ScriptableMockTransport::new();
+        t.push(200, r#"{"code":200,"msg":"发送成功","data":null}"#);
+        let mut c = WenlaiHttpClient::new("https://qingfawen.fcxxz.com/", t);
+        c.register_send_code("  leaf@example.com  ").unwrap();
+        let reqs = c.transport.requests();
+        assert_eq!(reqs[0].method, HttpMethod::Post);
+        assert_eq!(
+            reqs[0].url,
+            "https://qingfawen.fcxxz.com/api/auth/register/sendCode"
+        );
+        let body: Value = serde_json::from_str(reqs[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["email"], "leaf@example.com"); // 前后空白被裁掉
+    }
+
+    #[test]
+    fn client_register_send_code_cooldown_msg_passthrough() {
+        let t = ScriptableMockTransport::new();
+        t.push(
+            200,
+            r#"{"code":429,"msg":"发送过于频繁，请60秒后再试","data":null}"#,
+        );
+        let mut c = WenlaiHttpClient::new("https://x.com", t);
+        let err = c.register_send_code("a@b.com").unwrap_err().to_string();
+        assert!(err.contains("发送过于频繁"), "{err}");
+        assert!(err.contains("60秒"), "{err}");
+        // 空邮箱客户端先拦
+        let t2 = ScriptableMockTransport::new();
+        let mut c2 = WenlaiHttpClient::new("https://x.com", t2);
+        assert!(c2.register_send_code("   ").is_err());
+        assert!(c2.transport.requests().is_empty());
+    }
+
+    #[test]
+    fn client_register_automatically_logs_in() {
+        let t = ScriptableMockTransport::new();
+        t.push(200, r#"{"code":200,"msg":"注册成功","data":{}}"#) // 注册响应 data 无 token
+            .push(200, LOGIN_RESP); // 保守：自动走 login 拿凭据
+        let mut c = WenlaiHttpClient::new("https://x.com", t);
+        let acc = c
+            .register("山君", "pw", "leaf@example.com", "482913")
+            .unwrap();
+        assert_eq!(acc.jwt_token, "jwt-abc");
+        assert_eq!(acc.username, "山君");
+        assert_eq!(acc.user_id, 26);
+        assert!(c.account().is_some());
+        let reqs = c.transport.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].url.ends_with("/api/auth/register"));
+        let body: Value = serde_json::from_str(reqs[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["username"], "山君");
+        assert_eq!(body["password"], "pw");
+        assert_eq!(body["email"], "leaf@example.com");
+        assert_eq!(body["code"], "482913");
+        assert!(body.get("publicKey").is_none()); // 不做赛文加密不传
+        assert!(reqs[1].url.ends_with("/api/auth/login"));
+    }
+
+    #[test]
+    fn client_register_failure_passthrough_and_no_autologin() {
+        let t = ScriptableMockTransport::new();
+        t.push(200, r#"{"code":400,"msg":"用户名已被注册","data":null}"#);
+        let mut c = WenlaiHttpClient::new("https://x.com", t);
+        let err = c
+            .register("山君", "pw", "a@b.com", "000000")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("用户名已被注册"), "{err}");
+        assert!(c.account().is_none()); // 失败不留半截会话
+        assert_eq!(c.transport.requests().len(), 1); // 不触发自动登录
+        // 客户端先拦空字段
+        let t2 = ScriptableMockTransport::new();
+        let mut c2 = WenlaiHttpClient::new("https://x.com", t2);
+        assert!(c2.register(" ", "pw", "a@b.com", "1").is_err());
+        assert!(c2.transport.requests().is_empty());
     }
 
     #[test]

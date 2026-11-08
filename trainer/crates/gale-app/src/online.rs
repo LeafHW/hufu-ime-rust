@@ -98,12 +98,23 @@ pub enum OnlineCommand {
     Categories,
     Bookshelf,
     CurrentUser,
+    /// 注册第一步：POST /api/auth/register/sendCode（60s 服务端冷却，
+    /// 错误 msg 透传）；成功回 CodeSent，UI 侧启动 60 秒重发冷却。
+    RegisterSendCode { email: String },
+    /// 注册第二步：POST /api/auth/register（core 内成功后自动 login 拿
+    /// token），成功按 Login 同型回 Account 并落盘凭据。
+    Register {
+        username: String,
+        password: String,
+        email: String,
+        code: String,
+    },
 }
 
 impl Drop for OnlineCommand {
     fn drop(&mut self) {
         // Also covers rejected submissions, superseded logins, and queued work at shutdown.
-        if let Self::Login { password, .. } = self {
+        if let Self::Login { password, .. } | Self::Register { password, .. } = self {
             unsafe {
                 clear_secret(password.as_bytes_mut());
             }
@@ -119,6 +130,8 @@ pub enum OnlinePayload {
     Bookshelf(Vec<ShelfBook>),
     ServerChanged(String),
     LoggedOut,
+    /// 注册验证码已发出（UI 侧据此启动 60 秒重发冷却并提示查收邮箱）。
+    CodeSent,
     /// 操作已成功，但凭据落盘失败等非致命状态需要明示。
     Warning(String),
 }
@@ -276,6 +289,36 @@ impl OnlineWorker {
                         OnlineCommand::CurrentUser => client.current_user().map(|_| {
                             OnlinePayload::Account(client.account().map(AccountSummary::from))
                         }),
+                        OnlineCommand::RegisterSendCode { email } => client
+                            .register_send_code(email.trim())
+                            .map(|_| OnlinePayload::CodeSent)
+                            .map_err(|e| e.to_string()),
+                        OnlineCommand::Register {
+                            username,
+                            password,
+                            email,
+                            code,
+                        } => {
+                            // Mirrors Login: a failed register must not restore the
+                            // previous account next launch; the password is dropped
+                            // right after use and never included in a result/log.
+                            remove_credentials = true;
+                            let r = client
+                                .register(username, password, email.trim(), code.trim())
+                                .map_err(|e| e.to_string());
+                            unsafe {
+                                clear_secret(password.as_bytes_mut());
+                            }
+                            match r {
+                                Ok(account) => {
+                                    persist = Some(account.clone());
+                                    Ok(OnlinePayload::Account(Some(AccountSummary::from(
+                                        &account,
+                                    ))))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                     };
                     // Credentials must not be written by an invalidated login after logout/server change.
                     if env.epoch != worker_epoch.load(Ordering::Acquire) {
@@ -393,7 +436,10 @@ impl OnlineWorker {
         self.next_id = next_id;
         let epoch = if matches!(
             &command,
-            OnlineCommand::Login { .. } | OnlineCommand::Logout | OnlineCommand::SetServer { .. }
+            OnlineCommand::Login { .. }
+                | OnlineCommand::Logout
+                | OnlineCommand::SetServer { .. }
+                | OnlineCommand::Register { .. }
         ) {
             // Only epoch change, deletion and final rename hold this lock. DPAPI and
             // writing ciphertext to a temporary file happen entirely on the worker.
@@ -1062,6 +1108,85 @@ mod tests {
             .iter()
             .any(|r| matches!(&r.result, Ok(OnlinePayload::Account(Some(_))))));
         assert!(results.iter().any(|r| r.result.is_err()));
+        assert!(!path.exists());
+        drop(worker);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn register_flow_sends_code_then_persists_autologin() {
+        let dir = test_dir("register");
+        let path = dir.join("online-auth.dpapi");
+        let transport = Arc::new(wenlai::ScriptableMockTransport::new());
+        transport
+            .push(200, r#"{"code":200,"msg":"发送成功","data":null}"#)
+            .push(200, r#"{"code":200,"msg":"注册成功","data":{}}"#)
+            .push(
+                200,
+                r#"{"code":200,"data":{"token":"reg-token","userId":9,"username":"新用户","displayName":"新用户"}}"#,
+            );
+        let mut worker = OnlineWorker::spawn_with_transport(
+            dir.clone(),
+            DEFAULT_SERVER,
+            ScriptTransport(transport),
+        )
+        .unwrap();
+        // 第一步：发码 → CodeSent
+        worker
+            .submit(OnlineCommand::RegisterSendCode {
+                email: " leaf@example.com ".into(),
+            })
+            .unwrap();
+        let results = drain_until_idle(&worker);
+        assert!(results
+            .iter()
+            .any(|r| matches!(&r.result, Ok(OnlinePayload::CodeSent))));
+        // 第二步：注册 → 自动登录 → Account(Some) + 凭据落盘
+        worker
+            .submit(OnlineCommand::Register {
+                username: "新用户".into(),
+                password: "one-use-secret".into(),
+                email: "leaf@example.com".into(),
+                code: "482913".into(),
+            })
+            .unwrap();
+        let results = drain_until_idle(&worker);
+        assert!(results.iter().any(|r| matches!(
+            &r.result,
+            Ok(OnlinePayload::Account(Some(a))) if a.username == "新用户" && a.user_id == 9
+        )));
+        assert!(path.exists());
+        drop(worker);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn failed_register_keeps_server_msg_and_no_credentials() {
+        let dir = test_dir("register-failed");
+        let path = dir.join("online-auth.dpapi");
+        let transport = Arc::new(wenlai::ScriptableMockTransport::new());
+        transport.push(200, r#"{"code":400,"msg":"用户名已被注册","data":null}"#);
+        let mut worker = OnlineWorker::spawn_with_transport(
+            dir.clone(),
+            DEFAULT_SERVER,
+            ScriptTransport(transport),
+        )
+        .unwrap();
+        worker
+            .submit(OnlineCommand::Register {
+                username: "新用户".into(),
+                password: "bad".into(),
+                email: "a@b.com".into(),
+                code: "000000".into(),
+            })
+            .unwrap();
+        let results = drain_until_idle(&worker);
+        assert!(results
+            .iter()
+            .any(|r| matches!(&r.result, Err(e) if e.contains("用户名已被注册"))));
+        assert!(!results
+            .iter()
+            .any(|r| matches!(&r.result, Ok(OnlinePayload::Account(Some(_))))));
         assert!(!path.exists());
         drop(worker);
         let _ = std::fs::remove_dir(&dir);
